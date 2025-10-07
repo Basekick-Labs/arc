@@ -1,0 +1,81 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Data and logs
+data/
+logs/
+*.db
+*.db-shm
+*.db-wal
+*.duckdb
+*.parquet
+*.log
+
+# MinIO storage
+minio-data/
+minio.pid
+
+# Benchmark results
+benchmarks/results/
+query_benchmark_*.json
+query_benchmark_*.txt
+*_benchmark_*.md
+disk_benchmark.json
+mem_benchmark.json
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Local configuration overrides
+arc.local.conf
+config.local.toml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Docker
+docker-compose.override.yml

@@ -1,0 +1,51 @@
+# Arc Core - Minimal Production Dependencies
+
+# High-performance data processing
+polars==0.20.2
+pyarrow==21.0.0
+numpy==1.26.2
+
+# Fast async I/O
+aiofiles==23.2.1
+
+# API framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+gunicorn==21.2.0
+slowapi==0.1.9  # Rate limiting
+
+# Storage and query engine
+boto3==1.34.0
+aiobotocore
+s3fs==2024.6.1
+google-cloud-storage==2.10.0
+duckdb==1.3.2
+croniter==2.0.1
+minio==7.1.0
+
+# Config and validation
+toml==0.10.2
+pyyaml==6.0.1
+pydantic==2.5.0
+python-dotenv==1.0.0
+
+# Performance monitoring
+psutil==5.9.6
+
+# HTTP
+python-multipart==0.0.6
+httpx==0.25.2
+
+# Binary protocols
+msgpack==1.0.7
+
+# JSON processing
+jsonpath-ng==1.6.1
+
+# Database clients for exporters
+influxdb==5.3.1
+influxdb-client==1.38.0
+psycopg2-binary==2.9.9
+
+# SQL parsing
+sqlparse==0.4.4

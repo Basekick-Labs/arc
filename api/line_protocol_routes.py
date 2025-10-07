@@ -1,0 +1,396 @@
+"""
+InfluxDB Line Protocol Write API
+
+Provides InfluxDB-compatible write endpoints for Telegraf and other clients.
+Supports both InfluxDB 1.x and 2.x API formats.
+"""
+
+from fastapi import APIRouter, HTTPException, Request, Query, Header
+from fastapi.responses import Response
+from typing import Optional, List, Dict, Any
+import logging
+import gzip
+from datetime import datetime
+from ingest.line_protocol_parser import LineProtocolParser
+from ingest.parquet_buffer import ParquetBuffer
+from api.database import ConnectionManager
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(tags=["line-protocol"])
+
+# Global buffer instance (initialized on startup)
+parquet_buffer: Optional[ParquetBuffer] = None
+
+
+def merge_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Merge records with the same measurement, tags, and timestamp.
+
+    This handles cases where Telegraf sends multiple line protocol lines
+    for the same metric with different field sets.
+
+    Example:
+        system,host=server load1=5.0 1234567890
+        system,host=server uptime=12345 1234567890
+
+    Gets merged into one record with both fields.
+    """
+    # Common tag field names in Telegraf metrics
+    KNOWN_TAG_FIELDS = {
+        'host', 'environment', 'cpu', 'device', 'fstype', 'mode', 'path',
+        'interface', 'database', 'org', 'bucket', 'region', 'datacenter',
+        'cluster', 'server', 'service', 'name', 'container', 'pod',
+        'namespace', 'deployment', 'node'
+    }
+
+    # Group by (measurement, time, tags)
+    merged: Dict[tuple, Dict[str, Any]] = {}
+
+    for record in records:
+        # Create unique key from measurement, time, and known tags
+        measurement = record.get('measurement')
+        time = record.get('time')
+
+        # Extract only known tag fields for grouping
+        tag_keys = []
+        for key, value in sorted(record.items()):
+            if key in KNOWN_TAG_FIELDS and isinstance(value, str):
+                tag_keys.append((key, value))
+
+        key = (measurement, str(time), tuple(tag_keys))
+
+        if key in merged:
+            # Merge all fields from this record into existing
+            for k, v in record.items():
+                if k not in ('measurement', 'time') and v is not None:
+                    # Overwrite: last value wins (shouldn't happen in practice)
+                    merged[key][k] = v
+        else:
+            merged[key] = record.copy()
+
+    return list(merged.values())
+
+
+def decode_body(body: bytes, content_encoding: Optional[str] = None) -> str:
+    """
+    Decode request body, handling gzip compression if present.
+
+    Telegraf sends gzip-compressed data by default.
+
+    Args:
+        body: Raw request body bytes
+        content_encoding: Content-Encoding header value
+
+    Returns:
+        Decoded UTF-8 string
+    """
+    try:
+        # Check if body is gzip compressed
+        # Gzip magic number: 0x1f 0x8b
+        if len(body) >= 2 and body[0] == 0x1f and body[1] == 0x8b:
+            logger.debug("Detected gzip-compressed request body")
+            body = gzip.decompress(body)
+        elif content_encoding and 'gzip' in content_encoding.lower():
+            logger.debug("Content-Encoding indicates gzip compression")
+            body = gzip.decompress(body)
+
+        # Decode to UTF-8
+        return body.decode('utf-8')
+    except gzip.BadGzipFile as e:
+        logger.error(f"Invalid gzip data: {e}")
+        raise HTTPException(status_code=400, detail="Invalid gzip compression")
+    except UnicodeDecodeError as e:
+        logger.error(f"Failed to decode request body: {e}")
+        raise HTTPException(status_code=400, detail="Invalid UTF-8 encoding")
+
+
+def init_parquet_buffer(storage_backend, config: dict = None):
+    """
+    Initialize the global Parquet buffer
+
+    Args:
+        storage_backend: Storage backend instance
+        config: Configuration dict with buffer settings
+    """
+    global parquet_buffer
+
+    config = config or {}
+    parquet_buffer = ParquetBuffer(
+        storage_backend=storage_backend,
+        max_buffer_size=config.get('max_buffer_size', 10000),
+        max_buffer_age_seconds=config.get('max_buffer_age_seconds', 60),
+        compression=config.get('compression', 'snappy')
+    )
+
+    logger.info("ParquetBuffer initialized for line protocol writes")
+    return parquet_buffer
+
+
+@router.post("/api/v1/write")
+async def write_v1(
+    request: Request,
+    db: Optional[str] = Query(None, description="Database name (used as measurement prefix)"),
+    rp: Optional[str] = Query(None, description="Retention policy (ignored for compatibility)"),
+    precision: Optional[str] = Query('ns', description="Timestamp precision (ns, u, ms, s)"),
+    content_encoding: Optional[str] = Header(None, alias="Content-Encoding"),
+):
+    """
+    InfluxDB 1.x compatible write endpoint
+
+    Accepts Line Protocol format in request body (gzip compressed or plain text).
+
+    Example:
+        POST /api/v1/write?db=telegraf
+        cpu,host=server01 usage_idle=90.5 1609459200000000000
+    """
+    if not parquet_buffer:
+        raise HTTPException(status_code=503, detail="Write service not initialized")
+
+    try:
+        # Read and decode body (handles gzip)
+        body = await request.body()
+        lines = decode_body(body, content_encoding)
+
+        if not lines.strip():
+            raise HTTPException(status_code=400, detail="Empty request body")
+
+        # Parse line protocol
+        records = LineProtocolParser.parse_batch(lines)
+
+        if not records:
+            raise HTTPException(status_code=400, detail="No valid records in request")
+
+        # Debug: log first parsed record
+        if records:
+            logger.debug(f"First parsed record - measurement: {records[0].get('measurement')}, tags: {list(records[0].get('tags', {}).keys())[:3]}")
+
+        # Convert to flat format for Parquet
+        flat_records = []
+        for record in records:
+            flat = LineProtocolParser.to_flat_dict(record)
+
+            # Add database name as a tag if provided
+            if db:
+                flat['database'] = db
+
+            flat_records.append(flat)
+
+        # Merge records with same measurement+tags+timestamp
+        merged_records = merge_records(flat_records)
+
+        # Write to buffer
+        await parquet_buffer.write(merged_records)
+
+        # Return success - InfluxDB 1.x returns 204 No Content with empty body
+        return Response(status_code=204)
+
+    except Exception as e:
+        logger.error(f"Write error: {e}")
+        raise HTTPException(status_code=500, detail=f"Write failed: {str(e)}")
+
+
+@router.post("/api/v2/write")
+async def write_v2(
+    request: Request,
+    org: Optional[str] = Query(None, description="Organization name"),
+    bucket: str = Query(..., description="Bucket name (required)"),
+    precision: Optional[str] = Query('ns', description="Timestamp precision (ns, us, ms, s)"),
+    authorization: Optional[str] = Header(None, description="Token for auth (optional)"),
+    content_encoding: Optional[str] = Header(None, alias="Content-Encoding"),
+):
+    """
+    InfluxDB 2.x compatible write endpoint
+
+    Accepts Line Protocol format in request body (gzip compressed or plain text).
+
+    Example:
+        POST /api/v2/write?org=myorg&bucket=mybucket
+        Authorization: Token my-token
+        cpu,host=server01 usage_idle=90.5 1609459200000000000
+    """
+    if not parquet_buffer:
+        raise HTTPException(status_code=503, detail="Write service not initialized")
+
+    try:
+        # Read and decode body (handles gzip)
+        body = await request.body()
+        lines = decode_body(body, content_encoding)
+
+        if not lines.strip():
+            raise HTTPException(status_code=400, detail="Empty request body")
+
+        # Parse line protocol
+        records = LineProtocolParser.parse_batch(lines)
+
+        if not records:
+            raise HTTPException(status_code=400, detail="No valid records in request")
+
+        # Convert to flat format for Parquet
+        flat_records = []
+        for record in records:
+            flat = LineProtocolParser.to_flat_dict(record)
+
+            # Add metadata as tags
+            if org:
+                flat['org'] = org
+            if bucket:
+                flat['bucket'] = bucket
+
+            flat_records.append(flat)
+
+        # Merge records with same measurement+tags+timestamp
+        merged_records = merge_records(flat_records)
+
+        # Write to buffer
+        await parquet_buffer.write(merged_records)
+
+        # Return success - InfluxDB 2.x returns 204 No Content with empty body
+        return Response(status_code=204)
+
+    except Exception as e:
+        logger.error(f"Write error: {e}")
+        raise HTTPException(status_code=500, detail=f"Write failed: {str(e)}")
+
+
+@router.post("/write")
+async def write_simple(
+    request: Request,
+    content_encoding: Optional[str] = Header(None, alias="Content-Encoding")
+):
+    """
+    Simple write endpoint (no query parameters)
+
+    Accepts Line Protocol format in request body (gzip compressed or plain text).
+    Useful for quick testing and simple integrations.
+
+    Example:
+        POST /write
+        cpu,host=server01 usage_idle=90.5 1609459200000000000
+    """
+    if not parquet_buffer:
+        raise HTTPException(status_code=503, detail="Write service not initialized")
+
+    try:
+        # Read and decode body (handles gzip)
+        body = await request.body()
+        lines = decode_body(body, content_encoding)
+
+        if not lines.strip():
+            raise HTTPException(status_code=400, detail="Empty request body")
+
+        # Parse line protocol
+        records = LineProtocolParser.parse_batch(lines)
+
+        if not records:
+            raise HTTPException(status_code=400, detail="No valid records in request")
+
+        # Convert to flat format
+        flat_records = [LineProtocolParser.to_flat_dict(r) for r in records]
+
+        # Merge records with same measurement+tags+timestamp
+        merged_records = merge_records(flat_records)
+
+        # Write to buffer
+        await parquet_buffer.write(merged_records)
+
+        # Return success - InfluxDB 1.x returns 204 No Content with empty body
+        return Response(status_code=204)
+
+    except Exception as e:
+        logger.error(f"Write error: {e}")
+        raise HTTPException(status_code=500, detail=f"Write failed: {str(e)}")
+
+
+@router.post("/api/v1/query")
+async def influxdb_query_v1(request: Request):
+    """
+    InfluxDB 1.x query endpoint for database creation (compatibility only)
+
+    Telegraf tries to create databases - we accept but ignore this.
+    """
+    body = await request.body()
+    query = body.decode('utf-8') if body else ""
+
+    # Check if it's a CREATE DATABASE query
+    if "CREATE DATABASE" in query.upper():
+        # Return success without actually creating anything
+        # Arc doesn't need database pre-creation
+        return Response(status_code=200, content='{"results":[{"statement_id":0}]}', media_type="application/json")
+
+    # For other queries, return not implemented
+    raise HTTPException(status_code=501, detail="Query endpoint not implemented - use /query for SQL queries")
+
+
+@router.get("/write/health")
+async def write_health():
+    """Health check for write endpoint"""
+    if not parquet_buffer:
+        raise HTTPException(status_code=503, detail="Write service not initialized")
+
+    stats = parquet_buffer.get_stats()
+
+    return {
+        "status": "healthy",
+        "service": "line_protocol_writer",
+        "stats": stats
+    }
+
+
+@router.get("/write/stats")
+async def write_stats():
+    """Get write statistics"""
+    if not parquet_buffer:
+        raise HTTPException(status_code=503, detail="Write service not initialized")
+
+    stats = parquet_buffer.get_stats()
+
+    return {
+        "status": "success",
+        "buffer_stats": stats,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+@router.post("/write/flush")
+async def flush_buffer(measurement: Optional[str] = Query(None, description="Specific measurement to flush")):
+    """
+    Manually flush buffer to storage
+
+    Useful for testing or forcing immediate persistence.
+    """
+    if not parquet_buffer:
+        raise HTTPException(status_code=503, detail="Write service not initialized")
+
+    try:
+        if measurement:
+            await parquet_buffer.flush_measurement_sync(measurement)
+            return {
+                "status": "success",
+                "message": f"Flushed buffer for measurement: {measurement}"
+            }
+        else:
+            await parquet_buffer.flush_all()
+            return {
+                "status": "success",
+                "message": "Flushed all buffers"
+            }
+
+    except Exception as e:
+        logger.error(f"Flush error: {e}")
+        raise HTTPException(status_code=500, detail=f"Flush failed: {str(e)}")
+
+
+# Startup/shutdown handlers
+async def start_parquet_buffer():
+    """Start the parquet buffer background tasks"""
+    if parquet_buffer:
+        await parquet_buffer.start()
+        logger.info("Line protocol write service started")
+
+
+async def stop_parquet_buffer():
+    """Stop the parquet buffer and flush remaining data"""
+    if parquet_buffer:
+        await parquet_buffer.stop()
+        logger.info("Line protocol write service stopped")
