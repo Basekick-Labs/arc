@@ -1,9 +1,17 @@
-# Arc Core
+<p align="center">
+  <img src="assets/arc_logo.jpg" alt="Arc Logo" width="400"/>
+</p>
 
-[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Performance](https://img.shields.io/badge/Throughput-1.89M%20RPS-brightgreen.svg)](https://github.com/basekick-labs/arc-core)
+<h1 align="center">Arc Core</h1>
 
-High-performance time-series data warehouse built on DuckDB, Parquet, and MinIO.
+<p align="center">
+  <a href="https://www.gnu.org/licenses/agpl-3.0"><img src="https://img.shields.io/badge/License-AGPL%203.0-blue.svg" alt="License: AGPL-3.0"/></a>
+  <a href="https://github.com/basekick-labs/arc-core"><img src="https://img.shields.io/badge/Throughput-1.89M%20RPS-brightgreen.svg" alt="Performance"/></a>
+</p>
+
+<p align="center">
+  High-performance time-series data warehouse built on DuckDB, Parquet, and MinIO.
+</p>
 
 > **⚠️ Alpha Release - Technical Preview**
 > Arc Core is currently in active development and evolving rapidly. While the system is stable and functional, it is **not recommended for production workloads** at this time. We are continuously improving performance, adding features, and refining the API. Use in development and testing environments only.
