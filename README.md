@@ -7,6 +7,7 @@
 <p align="center">
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img src="https://img.shields.io/badge/License-AGPL%203.0-blue.svg" alt="License: AGPL-3.0"/></a>
   <a href="https://github.com/basekick-labs/arc-core"><img src="https://img.shields.io/badge/Throughput-1.89M%20RPS-brightgreen.svg" alt="Performance"/></a>
+  <a href="https://discord.gg/nxnWfUxsdm"><img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2?logo=discord&logoColor=white" alt="Discord"/></a>
 </p>
 
 <p align="center">
@@ -19,6 +20,8 @@
 ## Features
 
 - **High-Performance Ingestion**: MessagePack binary protocol (recommended), InfluxDB Line Protocol (drop-in replacement), JSON
+- **Write-Ahead Log (WAL)**: Optional durability feature for zero data loss (disabled by default) - [Learn More](docs/WAL.md)
+- **Automatic File Compaction**: Merges small Parquet files into larger ones for 10-50x faster queries (enabled by default) - [Learn More](docs/COMPACTION.md)
 - **DuckDB Query Engine**: Fast analytical queries with SQL
 - **Distributed Storage with MinIO**: S3-compatible object storage for unlimited scale and cost-effective data management (recommended). Also supports local disk, AWS S3, and GCS
 - **Data Import**: Import data from InfluxDB, TimescaleDB, HTTP endpoints
@@ -491,6 +494,170 @@ response = requests.post(
 )
 ```
 
+## Write-Ahead Log (WAL) - Durability Feature
+
+Arc includes an optional Write-Ahead Log (WAL) for applications requiring **zero data loss** on system crashes. WAL is **disabled by default** to maximize throughput.
+
+### When to Enable WAL
+
+Enable WAL if you need:
+- ✅ **Zero data loss** on crashes
+- ✅ **Regulatory compliance** (finance, healthcare)
+- ✅ **Guaranteed durability** for critical data
+
+Keep WAL disabled if you:
+- ⚡ **Prioritize maximum throughput** (1.89M records/sec)
+- 💰 **Can tolerate 0-5 seconds data loss** on rare crashes
+- 🔄 **Have upstream retry logic** (Kafka, message queues)
+
+### Performance Impact
+
+| Configuration | Throughput | Data Loss Risk |
+|--------------|-----------|----------------|
+| **WAL Disabled (default)** | 1.93M rec/s | 0-5 seconds |
+| **WAL async** | 1.60M rec/s (-17%) | <1 second |
+| **WAL fdatasync** | 1.56M rec/s (-19%) | Near-zero |
+| **WAL fsync** | 1.61M rec/s (-17%) | Zero |
+
+### Enable WAL
+
+Edit `.env` file:
+
+```bash
+# Enable Write-Ahead Log for durability
+WAL_ENABLED=true
+WAL_SYNC_MODE=fdatasync     # Recommended: balanced mode
+WAL_DIR=./data/wal
+WAL_MAX_SIZE_MB=100
+WAL_MAX_AGE_SECONDS=3600
+```
+
+### Monitor WAL
+
+Check WAL status via API:
+
+```bash
+# Get WAL status
+curl http://localhost:8000/api/wal/status
+
+# Get detailed statistics
+curl http://localhost:8000/api/wal/stats
+
+# List WAL files
+curl http://localhost:8000/api/wal/files
+
+# Health check
+curl http://localhost:8000/api/wal/health
+
+# Cleanup old recovered files
+curl -X POST http://localhost:8000/api/wal/cleanup
+```
+
+**📖 For complete WAL documentation, see [docs/WAL.md](docs/WAL.md)**
+
+## File Compaction - Query Optimization
+
+Arc automatically **compacts small Parquet files into larger ones** to dramatically improve query performance. During high-throughput ingestion, Arc creates many small files (50-100MB). Compaction merges these into optimized 512MB files, reducing file count by 100x and improving query speed by 10-50x.
+
+### Why Compaction Matters
+
+**The Small File Problem:**
+- High-throughput ingestion creates 100+ small files per hour
+- DuckDB must open every file for queries → slow query performance
+- Example: 1000 files × 5ms open time = 5 seconds just to start querying
+
+**After Compaction:**
+- 1000 small files → 10 large files (100x reduction)
+- Query time: 5 seconds → 0.05 seconds (100x faster)
+- Better compression (ZSTD vs Snappy)
+- Improved DuckDB parallel scanning
+
+### How It Works
+
+Compaction runs automatically on a schedule (default: every hour at :05):
+
+1. **Scans** for completed hourly partitions (e.g., `2025/10/08/14/`)
+2. **Locks** partition to prevent concurrent compaction
+3. **Downloads** all small files for that partition
+4. **Merges** using DuckDB into optimized 512MB files
+5. **Uploads** compacted files with `.compacted` suffix
+6. **Deletes** old small files from storage
+7. **Cleanup** temp files and releases lock
+
+### Configuration
+
+Compaction is **enabled by default** in [arc.conf](arc.conf):
+
+```toml
+[compaction]
+enabled = true
+min_age_hours = 1         # Wait 1 hour before compacting (let hour complete)
+min_files = 10            # Only compact if ≥10 files exist
+target_file_size_mb = 512 # Target size for compacted files
+schedule = "5 * * * *"    # Cron schedule: every hour at :05
+max_concurrent_jobs = 2   # Run 2 compactions in parallel
+compression = "zstd"      # Better compression than snappy
+compression_level = 3     # Balance compression vs speed
+```
+
+### Monitoring Compaction
+
+Check compaction status via API:
+
+```bash
+# Get current status
+curl http://localhost:8000/api/compaction/status
+
+# Get detailed statistics
+curl http://localhost:8000/api/compaction/stats
+
+# List eligible partitions
+curl http://localhost:8000/api/compaction/candidates
+
+# Manually trigger compaction
+curl -X POST http://localhost:8000/api/compaction/trigger
+
+# View active jobs
+curl http://localhost:8000/api/compaction/jobs
+
+# View job history
+curl http://localhost:8000/api/compaction/history
+```
+
+### Reducing File Count at Source
+
+**Best practice**: Reduce file generation by increasing buffer size before they're written:
+
+```toml
+[ingestion]
+buffer_size = 200000        # Up from 50,000 (4x fewer files)
+buffer_age_seconds = 10     # Up from 5 (2x fewer files)
+```
+
+**Impact**:
+- **Files generated**: 2,000/hour → 250/hour (8x reduction)
+- **Compaction time**: 150s → 20s (7x faster)
+- **Memory usage**: +300MB per worker (~12GB total on 42 workers)
+- **Query freshness**: 5s → 10s delay
+
+This is the **most effective optimization** - fewer files means faster compaction AND faster queries.
+
+### When to Disable Compaction
+
+Compaction should remain enabled for production, but you might disable it:
+- **Testing**: When you want to see raw ingestion files
+- **Low write volume**: If you write <10 files per hour
+- **Development**: When iterating on ingestion code
+
+To disable, edit [arc.conf](arc.conf):
+
+```toml
+[compaction]
+enabled = false
+```
+
+**📖 For complete compaction documentation, see [docs/COMPACTION.md](docs/COMPACTION.md)**
+
 ## Architecture Overview
 
 ```
@@ -759,6 +926,15 @@ sudo journalctl -u arc-api -f
 - `GET /cache/health` - Cache health status
 - `POST /cache/clear` - Clear query cache
 
+### Compaction Management
+
+- `GET /api/compaction/status` - Current compaction status
+- `GET /api/compaction/stats` - Detailed statistics
+- `GET /api/compaction/candidates` - List eligible partitions
+- `POST /api/compaction/trigger` - Manually trigger compaction
+- `GET /api/compaction/jobs` - View active jobs
+- `GET /api/compaction/history` - View job history
+
 ### Interactive API Documentation
 
 Arc Core includes auto-generated API documentation:
@@ -805,7 +981,8 @@ We offer dual licensing and commercial support options.
 
 ## Support
 
-- **Community Support**: [GitHub Issues](https://github.com/basekick-labs/arc-core/issues)
+- **Discord Community**: [Join our Discord](https://discord.gg/nxnWfUxsdm) - Get help, share feedback, and connect with other Arc users
+- **GitHub Issues**: [Report bugs and request features](https://github.com/basekick-labs/arc-core/issues)
 - **Enterprise Support**: enterprise[at]basekick[dot]net
 - **General Inquiries**: support[at]basekick[dot]net
 
