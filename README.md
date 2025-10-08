@@ -352,13 +352,13 @@ if response.status_code == 204:
 
 ```bash
 # InfluxDB 1.x compatible endpoint
-curl -X POST "http://localhost:8000/write/line?db=mydb" \
+curl -X POST "http://localhost:8000/api/v1/write?db=mydb" \
   -H "Authorization: Bearer $ARC_TOKEN" \
   -H "Content-Type: text/plain" \
   --data-binary "cpu,host=server01 value=0.64 1633024800000000000"
 
 # Multiple measurements
-curl -X POST "http://localhost:8000/write/line?db=metrics" \
+curl -X POST "http://localhost:8000/api/v1/write?db=metrics" \
   -H "Authorization: Bearer $ARC_TOKEN" \
   -H "Content-Type: text/plain" \
   --data-binary "cpu,host=server01,region=us-west value=0.64 1633024800000000000
