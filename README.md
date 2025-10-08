@@ -231,29 +231,63 @@ curl http://localhost:8000/health
 
 #### Ingest Data (MessagePack - Recommended)
 
-**MessagePack binary protocol offers 3x faster ingestion** with zero-copy PyArrow processing:
+**MessagePack binary protocol offers 7.9x faster ingestion** with zero-copy PyArrow processing:
 
 ```python
 import msgpack
 import requests
 from datetime import datetime
+import os
 
-# Prepare data in MessagePack format
+# Get or create API token
+token = os.getenv("ARC_TOKEN")
+if not token:
+    from api.auth import AuthManager
+    auth = AuthManager(db_path='./data/historian.db')
+    token = auth.create_token(name='my-app', description='My application')
+    print(f"Created token: {token}")
+    print(f"Save it: export ARC_TOKEN='{token}'")
+
+# Prepare data in MessagePack binary format
+# Uses batch format with measurement-based schema
 data = {
-    "database": "metrics",
-    "table": "cpu_usage",
-    "records": [
+    "batch": [
         {
-            "timestamp": int(datetime.now().timestamp() * 1e9),  # nanoseconds
-            "host": "server01",
-            "cpu": 0.64,
-            "memory": 0.82
+            "m": "cpu",                                      # measurement name
+            "t": int(datetime.now().timestamp() * 1000),    # timestamp (milliseconds)
+            "h": "server01",                                 # host tag (optional)
+            "tags": {                                        # additional tags (optional)
+                "region": "us-east",
+                "dc": "aws"
+            },
+            "fields": {                                      # metric values (required)
+                "usage_idle": 95.0,
+                "usage_user": 3.2,
+                "usage_system": 1.8
+            }
         },
         {
-            "timestamp": int(datetime.now().timestamp() * 1e9),
-            "host": "server02",
-            "cpu": 0.45,
-            "memory": 0.71
+            "m": "cpu",
+            "t": int(datetime.now().timestamp() * 1000),
+            "h": "server02",
+            "tags": {
+                "region": "us-west",
+                "dc": "gcp"
+            },
+            "fields": {
+                "usage_idle": 85.0,
+                "usage_user": 10.5,
+                "usage_system": 4.5
+            }
+        },
+        {
+            "m": "mem",
+            "t": int(datetime.now().timestamp() * 1000),
+            "h": "server01",
+            "fields": {
+                "used_percent": 45.2,
+                "available": 8192
+            }
         }
     ]
 }
@@ -267,28 +301,37 @@ response = requests.post(
     },
     data=msgpack.packb(data)
 )
-print(response.json())
+
+# Check response (returns 204 No Content on success)
+if response.status_code == 204:
+    print(f"✓ Successfully wrote {len(data['batch'])} measurements!")
+else:
+    print(f"✗ Error {response.status_code}: {response.text}")
 ```
 
-**Batch ingestion** (for high throughput):
+**Batch ingestion** (for high throughput - 1.89M RPS):
 
 ```python
-# Send 10,000 records at once
-records = [
+# Generate 10,000 measurements for high-throughput ingestion
+batch = [
     {
-        "timestamp": int(datetime.now().timestamp() * 1e9),
-        "sensor_id": f"sensor_{i}",
-        "temperature": 20 + (i % 10),
-        "humidity": 60 + (i % 20)
+        "m": "sensor_data",                             # measurement name
+        "t": int(datetime.now().timestamp() * 1000),   # timestamp (milliseconds)
+        "h": f"sensor_{i % 100}",                       # host/sensor ID
+        "tags": {
+            "location": f"zone_{i % 10}",
+            "type": "temperature"
+        },
+        "fields": {
+            "temperature": 20 + (i % 10),
+            "humidity": 60 + (i % 20),
+            "pressure": 1013 + (i % 5)
+        }
     }
     for i in range(10000)
 ]
 
-data = {
-    "database": "iot",
-    "table": "sensors",
-    "records": records
-}
+data = {"batch": batch}
 
 response = requests.post(
     "http://localhost:8000/write/v2/msgpack",
@@ -298,6 +341,9 @@ response = requests.post(
     },
     data=msgpack.packb(data)
 )
+
+if response.status_code == 204:
+    print(f"✓ Wrote 10,000 measurements successfully!")
 ```
 
 #### Ingest Data (Line Protocol - InfluxDB Compatibility)
@@ -338,36 +384,111 @@ disk,host=server01,region=us-west used=120.5,total=500.0 1633024800000000000"
 ```
 
 #### Query Data
+
+**Basic query** (Python):
+
+```python
+import requests
+import os
+
+token = os.getenv("ARC_TOKEN")  # Your API token
+
+# Simple query
+response = requests.post(
+    "http://localhost:8000/query",
+    headers={
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    },
+    json={
+        "sql": "SELECT * FROM cpu WHERE host = 'server01' ORDER BY time DESC LIMIT 10",
+        "format": "json"
+    }
+)
+
+data = response.json()
+print(f"Rows: {len(data['data'])}")
+for row in data['data']:
+    print(row)
+```
+
+**Using curl**:
+
 ```bash
 curl -X POST http://localhost:8000/query \
   -H "Authorization: Bearer $ARC_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "database": "mydb",
-    "query": "SELECT * FROM cpu_usage WHERE host = '\''server01'\'' ORDER BY timestamp DESC LIMIT 100"
+    "sql": "SELECT * FROM cpu WHERE host = '\''server01'\'' LIMIT 10",
+    "format": "json"
   }'
 ```
 
 **Advanced queries with DuckDB SQL**:
 
-```bash
-# Aggregations
-curl -X POST http://localhost:8000/query \
-  -H "Authorization: Bearer $ARC_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "database": "metrics",
-    "query": "SELECT host, AVG(cpu) as avg_cpu, MAX(memory) as max_memory FROM cpu_usage WHERE timestamp > now() - INTERVAL 1 HOUR GROUP BY host"
-  }'
+```python
+# Time-series aggregation
+response = requests.post(
+    "http://localhost:8000/query",
+    headers={"Authorization": f"Bearer {token}"},
+    json={
+        "sql": """
+            SELECT
+                time_bucket(INTERVAL '5 minutes', time) as bucket,
+                host,
+                AVG(usage_idle) as avg_idle,
+                MAX(usage_user) as max_user
+            FROM cpu
+            WHERE time > now() - INTERVAL '1 hour'
+            GROUP BY bucket, host
+            ORDER BY bucket DESC
+        """,
+        "format": "json"
+    }
+)
 
-# Time-series analysis
-curl -X POST http://localhost:8000/query \
-  -H "Authorization: Bearer $ARC_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "database": "iot",
-    "query": "SELECT time_bucket(INTERVAL '\''5 minutes'\'', timestamp) as bucket, AVG(temperature) as avg_temp FROM sensors GROUP BY bucket ORDER BY bucket"
-  }'
+# Window functions
+response = requests.post(
+    "http://localhost:8000/query",
+    headers={"Authorization": f"Bearer {token}"},
+    json={
+        "sql": """
+            SELECT
+                timestamp,
+                host,
+                usage_idle,
+                AVG(usage_idle) OVER (
+                    PARTITION BY host
+                    ORDER BY timestamp
+                    ROWS BETWEEN 5 PRECEDING AND CURRENT ROW
+                ) as moving_avg
+            FROM cpu
+            ORDER BY timestamp DESC
+            LIMIT 100
+        """,
+        "format": "json"
+    }
+)
+
+# Join multiple measurements
+response = requests.post(
+    "http://localhost:8000/query",
+    headers={"Authorization": f"Bearer {token}"},
+    json={
+        "sql": """
+            SELECT
+                c.timestamp,
+                c.host,
+                c.usage_idle as cpu_idle,
+                m.used_percent as mem_used
+            FROM cpu c
+            JOIN mem m ON c.timestamp = m.timestamp AND c.host = m.host
+            WHERE c.timestamp > now() - INTERVAL '10 minutes'
+            ORDER BY c.timestamp DESC
+        """,
+        "format": "json"
+    }
+)
 ```
 
 ## Architecture Overview

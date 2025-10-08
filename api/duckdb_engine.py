@@ -378,8 +378,13 @@ class DuckDBEngine:
         def replace_simple_table(match):
             table = match.group(1)
 
-            # Use default historian bucket (hardcoded for now)
-            bucket = "historian"
+            # Use actual bucket from storage backend
+            backend = self.minio_backend or self.s3_backend or self.ceph_backend or self.gcs_backend
+            if backend:
+                bucket = backend.bucket
+            else:
+                bucket = "arc"  # Fallback
+
             s3_path = f"s3://{bucket}/{table}/**/*.parquet"
             logger.info(f"Converting simple table reference '{table}' to {s3_path}")
             return f"FROM read_parquet('{s3_path}', union_by_name=true)"
