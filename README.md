@@ -942,6 +942,54 @@ Arc Core includes auto-generated API documentation:
 - **ReDoc**: `http://localhost:8000/redoc`
 - **OpenAPI JSON**: `http://localhost:8000/openapi.json`
 
+## Integrations
+
+### Apache Superset - Interactive Dashboards
+
+Create interactive dashboards and visualizations for your Arc data using Apache Superset:
+
+**Quick Start:**
+```bash
+# Install the Arc dialect
+pip install arc-superset-dialect
+
+# Or use Docker with Arc pre-configured
+git clone https://github.com/basekick-labs/arc-superset-dialect.git
+cd arc-superset-dialect
+docker build -t superset-arc .
+docker run -d -p 8088:8088 superset-arc
+```
+
+**Connect to Arc:**
+1. Access Superset at `http://localhost:8088` (admin/admin)
+2. Add database connection: `arc://YOUR_API_KEY@localhost:8000/default`
+3. Start building dashboards with SQL queries
+
+**Example Dashboard Queries:**
+```sql
+-- Time-series CPU usage
+SELECT
+    time_bucket(INTERVAL '5 minutes', timestamp) as time,
+    host,
+    AVG(usage_idle) as avg_idle
+FROM cpu
+WHERE timestamp > NOW() - INTERVAL 6 HOUR
+GROUP BY time, host
+ORDER BY time DESC;
+
+-- Correlate CPU and Memory
+SELECT c.timestamp, c.host, c.usage_idle, m.used_percent
+FROM cpu c
+JOIN mem m ON c.timestamp = m.timestamp AND c.host = m.host
+WHERE c.timestamp > NOW() - INTERVAL 1 HOUR
+LIMIT 1000;
+```
+
+**Learn More:**
+- 📦 [Arc Superset Dialect Repository](https://github.com/basekick-labs/arc-superset-dialect)
+- 📚 [Integration Guide](https://github.com/basekick-labs/arc-superset-dialect#readme)
+- 🐍 [PyPI Package](https://pypi.org/project/arc-superset-dialect/) (once published)
+
 ## Roadmap
 
 Arc Core is under active development. Current focus areas:
