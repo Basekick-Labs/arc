@@ -1,11 +1,12 @@
 import json
 import aiofiles
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 
 class StateManager:
-    def __init__(self, state_file: Path = Path("historian_state.json")):
+    def __init__(self, state_file: Path = Path("arc_state.json")):
         self.state_file = state_file
         
     async def get_last_export(self, measurement: str) -> Optional[datetime]:
@@ -41,10 +42,22 @@ class StateManager:
 
 class SQLiteStateManager:
     """State manager backed by SQLite for centralized tracking.
-    Stores last export timestamps per measurement in /tmp/historian.db (cli_export_state table).
+    Stores last export timestamps per measurement in the Arc database (cli_export_state table).
     """
-    def __init__(self, db_path: str = "/tmp/historian.db"):
+    def __init__(self, db_path: str = None):
         import sqlite3
+        # Get default db path if not specified
+        if db_path is None:
+            # Try to import config, fallback to environment variable
+            try:
+                import sys
+                sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+                from api.config import get_db_path
+                db_path = get_db_path()
+            except ImportError:
+                # Fallback if running outside of main app
+                db_path = os.getenv('DB_PATH', './data/arc.db')
+
         self.db_path = db_path
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()

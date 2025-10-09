@@ -268,8 +268,8 @@ def get_sqlite_pool() -> SQLiteConnectionPool:
     global _sqlite_pool
     if _sqlite_pool is None:
         # Default database path, should be configured via environment or config
-        import os
-        db_path = os.getenv('HISTORIAN_DB_PATH', '/app/data/historian.db')
+        from .config import get_db_path
+        db_path = get_db_path()
         _sqlite_pool = SQLiteConnectionPool(db_path)
     return _sqlite_pool
 

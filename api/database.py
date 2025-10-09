@@ -6,14 +6,15 @@ from typing import List, Dict, Optional, Any
 import logging
 from datetime import datetime
 from .connection_pool import get_sqlite_pool, initialize_pools
+from .config import get_db_path
 
 logger = logging.getLogger(__name__)
 
 class ConnectionManager:
-    def __init__(self, db_path: str = "/tmp/historian.db"):
-        self.db_path = db_path
+    def __init__(self, db_path: str = None):
+        self.db_path = db_path or get_db_path()
         # Initialize connection pools
-        initialize_pools(db_path)
+        initialize_pools(self.db_path)
         self._init_database()
     
     def _init_database(self):

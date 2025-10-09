@@ -54,7 +54,7 @@ Arc Core implements token-based authentication:
 # Docker deployment
 docker exec -it arc-api python3 -c "
 from api.auth import AuthManager
-auth = AuthManager(db_path='/data/historian.db')
+auth = AuthManager(db_path='/data/arc.db')
 token = auth.create_token('admin', description='Admin token')
 print(f'Token: {token}')
 "
@@ -93,7 +93,7 @@ CORS_ORIGINS=http://localhost:3000  # Allowed origins (comma-separated)
 # Secrets (NEVER commit to version control)
 MINIO_ACCESS_KEY=your-access-key
 MINIO_SECRET_KEY=your-secret-key
-DB_PATH=/data/historian.db
+DB_PATH=/data/arc.db
 ```
 
 ### 3. File Permissions
@@ -105,7 +105,7 @@ Protect sensitive configuration files:
 chmod 600 .env
 
 # Set permissions on database
-chmod 600 /data/historian.db
+chmod 600 /data/arc.db
 
 # Ensure config files are not world-readable
 chmod 640 *.conf
@@ -174,15 +174,15 @@ export MINIO_SECRET_KEY=$SECRET
 SQLCIPHER_KEY=your-encryption-key
 
 # Restrict database access
-chown arc:arc /data/historian.db
-chmod 600 /data/historian.db
+chown arc:arc /data/arc.db
+chmod 600 /data/arc.db
 ```
 
 **Regular Backups:**
 
 ```bash
 # Backup database regularly
-sqlite3 /data/historian.db ".backup /backups/historian-$(date +%Y%m%d).db"
+sqlite3 /data/arc.db ".backup /backups/arc-$(date +%Y%m%d).db"
 ```
 
 ### 7. MinIO Security
