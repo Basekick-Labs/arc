@@ -20,12 +20,14 @@
 ## Features
 
 - **High-Performance Ingestion**: MessagePack binary protocol (recommended), InfluxDB Line Protocol (drop-in replacement), JSON
+- **Multi-Database Architecture**: Organize data by environment, tenant, or application with database namespaces - [Learn More](#multi-database-architecture)
 - **Write-Ahead Log (WAL)**: Optional durability feature for zero data loss (disabled by default) - [Learn More](docs/WAL.md)
 - **Automatic File Compaction**: Merges small Parquet files into larger ones for 10-50x faster queries (enabled by default) - [Learn More](docs/COMPACTION.md)
-- **DuckDB Query Engine**: Fast analytical queries with SQL
+- **DuckDB Query Engine**: Fast analytical queries with SQL, cross-database joins, and advanced analytics
 - **Distributed Storage with MinIO**: S3-compatible object storage for unlimited scale and cost-effective data management (recommended). Also supports local disk, AWS S3, and GCS
 - **Data Import**: Import data from InfluxDB, TimescaleDB, HTTP endpoints
 - **Query Caching**: Configurable result caching for improved performance
+- **Apache Superset Integration**: Native dialect for BI dashboards with multi-database schema support
 - **Production Ready**: Docker deployment with health checks and monitoring
 
 ## Performance Benchmark 🚀
@@ -141,6 +143,7 @@ endpoint = "http://minio:9000"
 access_key = "minioadmin"
 secret_key = "minioadmin123"
 bucket = "arc"
+database = "default"  # Database namespace
 use_ssl = false
 
 # For AWS S3
@@ -148,6 +151,7 @@ use_ssl = false
 # backend = "s3"
 # [storage.s3]
 # bucket = "arc-data"
+# database = "default"
 # region = "us-east-1"
 
 # For Google Cloud Storage
@@ -155,6 +159,7 @@ use_ssl = false
 # backend = "gcs"
 # [storage.gcs]
 # bucket = "arc-data"
+# database = "default"
 # project_id = "my-project"
 ```
 
@@ -179,6 +184,7 @@ MINIO_ENDPOINT=minio:9000
 MINIO_ACCESS_KEY=minioadmin
 MINIO_SECRET_KEY=minioadmin123
 MINIO_BUCKET=arc
+MINIO_DATABASE=default  # Database namespace
 
 # Cache
 QUERY_CACHE_ENABLED=true
@@ -200,7 +206,7 @@ After starting Arc Core, create an admin token for API access:
 # Docker deployment
 docker exec -it arc-api python3 -c "
 from api.auth import AuthManager
-auth = AuthManager(db_path='/data/historian.db')
+auth = AuthManager(db_path='/data/arc.db')
 token = auth.create_token('my-admin', description='Admin token')
 print(f'Admin Token: {token}')
 "
@@ -210,7 +216,7 @@ cd /path/to/arc-core
 source venv/bin/activate
 python3 -c "
 from api.auth import AuthManager
-auth = AuthManager()
+auth = AuthManager(db_path='./data/arc.db')
 token = auth.create_token('my-admin', description='Admin token')
 print(f'Admin Token: {token}')
 "
@@ -246,7 +252,7 @@ import os
 token = os.getenv("ARC_TOKEN")
 if not token:
     from api.auth import AuthManager
-    auth = AuthManager(db_path='./data/historian.db')
+    auth = AuthManager(db_path='./data/arc.db')
     token = auth.create_token(name='my-app', description='My application')
     print(f"Created token: {token}")
     print(f"Save it: export ARC_TOKEN='{token}'")
@@ -300,7 +306,8 @@ response = requests.post(
     "http://localhost:8000/write/v2/msgpack",
     headers={
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/msgpack"
+        "Content-Type": "application/msgpack",
+        "x-arc-database": "default"  # Optional: specify database (default: "default")
     },
     data=msgpack.packb(data)
 )
@@ -310,6 +317,17 @@ if response.status_code == 204:
     print(f"✓ Successfully wrote {len(data['batch'])} measurements!")
 else:
     print(f"✗ Error {response.status_code}: {response.text}")
+
+# Write to different database
+response = requests.post(
+    "http://localhost:8000/write/v2/msgpack",
+    headers={
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/msgpack",
+        "x-arc-database": "production"  # Write to production database
+    },
+    data=msgpack.packb(data)
+)
 ```
 
 **Batch ingestion** (for high throughput - 1.89M RPS):
@@ -493,6 +511,240 @@ response = requests.post(
     }
 )
 ```
+
+## Multi-Database Architecture
+
+Arc supports multiple databases (namespaces) within a single instance, allowing you to organize and isolate data by environment, tenant, or application.
+
+### Storage Structure
+
+Data is organized as: `{bucket}/{database}/{measurement}/{year}/{month}/{day}/{hour}/file.parquet`
+
+```
+arc/                           # MinIO bucket
+├── default/                   # Default database
+│   ├── cpu/2025/01/15/14/    # CPU metrics
+│   ├── mem/2025/01/15/14/    # Memory metrics
+│   └── disk/2025/01/15/14/   # Disk metrics
+├── production/                # Production database
+│   ├── cpu/2025/01/15/14/
+│   └── mem/2025/01/15/14/
+└── staging/                   # Staging database
+    ├── cpu/2025/01/15/14/
+    └── mem/2025/01/15/14/
+```
+
+### Configuration
+
+Configure the database in `arc.conf`:
+
+```toml
+[storage.minio]
+endpoint = "http://localhost:9000"
+access_key = "minioadmin"
+secret_key = "minioadmin"
+bucket = "arc"
+database = "default"  # Database namespace
+```
+
+Or via environment variable:
+```bash
+export MINIO_DATABASE="production"
+```
+
+### Writing to Specific Databases
+
+**MessagePack Protocol:**
+```python
+import msgpack
+import requests
+
+token = "your-token-here"
+
+data = {
+    "batch": [
+        {
+            "m": "cpu",
+            "t": int(datetime.now().timestamp() * 1000),
+            "h": "server01",
+            "fields": {"usage_idle": 95.0}
+        }
+    ]
+}
+
+# Write to production database
+response = requests.post(
+    "http://localhost:8000/write/v2/msgpack",
+    headers={
+        "x-api-key": token,
+        "Content-Type": "application/msgpack",
+        "x-arc-database": "production"  # Specify database
+    },
+    data=msgpack.packb(data)
+)
+
+# Write to staging database
+response = requests.post(
+    "http://localhost:8000/write/v2/msgpack",
+    headers={
+        "x-api-key": token,
+        "Content-Type": "application/msgpack",
+        "x-arc-database": "staging"  # Different database
+    },
+    data=msgpack.packb(data)
+)
+```
+
+**Line Protocol:**
+```bash
+# Write to default database (uses configured database)
+curl -X POST http://localhost:8000/write \
+  -H "x-api-key: $ARC_TOKEN" \
+  -d 'cpu,host=server01 usage_idle=95.0'
+
+# Write to specific database
+curl -X POST http://localhost:8000/write \
+  -H "x-api-key: $ARC_TOKEN" \
+  -H "x-arc-database: production" \
+  -d 'cpu,host=server01 usage_idle=95.0'
+```
+
+### Querying Across Databases
+
+**Show Available Databases:**
+```sql
+SHOW DATABASES;
+-- Output:
+-- default
+-- production
+-- staging
+```
+
+**Show Tables in Current Database:**
+```sql
+SHOW TABLES;
+-- Output:
+-- database | table_name | storage_path | file_count | total_size_mb
+-- default  | cpu        | s3://arc/default/cpu/ | 150 | 75.2
+-- default  | mem        | s3://arc/default/mem/ | 120 | 52.1
+```
+
+**Query Specific Database:**
+```python
+# Query production database
+response = requests.post(
+    "http://localhost:8000/query",
+    headers={"Authorization": f"Bearer {token}"},
+    json={
+        "sql": "SELECT * FROM production.cpu WHERE timestamp > NOW() - INTERVAL 1 HOUR",
+        "format": "json"
+    }
+)
+
+# Query default database (no prefix needed)
+response = requests.post(
+    "http://localhost:8000/query",
+    headers={"Authorization": f"Bearer {token}"},
+    json={
+        "sql": "SELECT * FROM cpu WHERE timestamp > NOW() - INTERVAL 1 HOUR",
+        "format": "json"
+    }
+)
+```
+
+**Cross-Database Queries:**
+```python
+# Compare production vs staging metrics
+response = requests.post(
+    "http://localhost:8000/query",
+    headers={"Authorization": f"Bearer {token}"},
+    json={
+        "sql": """
+            SELECT
+                p.timestamp,
+                p.host,
+                p.usage_idle as prod_cpu,
+                s.usage_idle as staging_cpu,
+                (p.usage_idle - s.usage_idle) as diff
+            FROM production.cpu p
+            JOIN staging.cpu s
+                ON p.timestamp = s.timestamp
+                AND p.host = s.host
+            WHERE p.timestamp > NOW() - INTERVAL 1 HOUR
+            ORDER BY p.timestamp DESC
+            LIMIT 100
+        """,
+        "format": "json"
+    }
+)
+```
+
+### Use Cases
+
+**Environment Separation:**
+```toml
+# Production instance
+database = "production"
+
+# Staging instance
+database = "staging"
+
+# Development instance
+database = "dev"
+```
+
+**Multi-Tenant Architecture:**
+```python
+# Write tenant-specific data
+headers = {
+    "x-api-key": token,
+    "x-arc-database": f"tenant_{tenant_id}"
+}
+```
+
+**Data Lifecycle Management:**
+```python
+# Hot data (frequent queries)
+database = "hot"
+
+# Warm data (occasional queries)
+database = "warm"
+
+# Cold data (archival)
+database = "cold"
+```
+
+### Apache Superset Integration
+
+In Superset, Arc databases appear as **schemas**:
+
+1. Install the Arc Superset dialect:
+   ```bash
+   pip install arc-superset-dialect
+   ```
+
+2. Connect to Arc:
+   ```
+   arc://your-token@localhost:8000/default
+   ```
+
+3. View databases as schemas in the Superset UI:
+   ```
+   Schema: default
+     ├── cpu
+     ├── mem
+     └── disk
+
+   Schema: production
+     ├── cpu
+     └── mem
+
+   Schema: staging
+     ├── cpu
+     └── mem
+   ```
+
+For more details, see the [Multi-Database Migration Plan](DATABASE_MIGRATION_PLAN.md).
 
 ## Write-Ahead Log (WAL) - Durability Feature
 

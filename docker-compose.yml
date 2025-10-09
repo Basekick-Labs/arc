@@ -51,7 +51,7 @@ services:
       MINIO_USE_SSL: "false"
 
       # Database
-      DB_PATH: /data/historian.db
+      DB_PATH: /data/arc.db
 
       # Performance
       QUERY_CACHE_ENABLED: "true"

@@ -227,6 +227,10 @@ class DuckDBEngine:
         if self._is_show_tables_query(sql):
             return await self._execute_show_tables_legacy(sql)
 
+        # Check for SHOW DATABASES command
+        if self._is_show_databases_query(sql):
+            return await self._execute_show_databases_legacy(sql)
+
         # Use connection pool for query execution
         result = await self.connection_pool.execute_async(
             converted_sql,
@@ -256,6 +260,27 @@ class DuckDBEngine:
                 "row_count": 0,
                 "execution_time_ms": round(execution_time * 1000, 2)
             }
+
+    async def _execute_show_databases_legacy(self, sql: str) -> Dict[str, Any]:
+        """Legacy handler for SHOW DATABASES using old connection"""
+        start_time = time.time()
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, self._handle_show_databases_sync)
+            execution_time = time.time() - start_time
+            result["execution_time_ms"] = round(execution_time * 1000, 2)
+            return result
+        except Exception as e:
+            execution_time = time.time() - start_time
+            logger.error(f"SHOW DATABASES failed in {execution_time:.3f}s: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "data": [],
+                "columns": [],
+                "row_count": 0,
+                "execution_time_ms": round(execution_time * 1000, 2)
+            }
     
     # Iceberg support removed; this stub remains to avoid API import breakages if referenced accidentally
     async def query_iceberg_table(self, *args, **kwargs) -> Dict[str, Any]:
@@ -273,6 +298,10 @@ class DuckDBEngine:
             # Check for SHOW TABLES command
             if self._is_show_tables_query(sql):
                 return self._handle_show_tables_sync(sql)
+
+            # Check for SHOW DATABASES command
+            if self._is_show_databases_query(sql):
+                return self._handle_show_databases_sync()
 
             # Convert database.table syntax to S3 paths
             converted_sql = self._convert_sql_to_s3_paths(sql)
@@ -322,7 +351,12 @@ class DuckDBEngine:
             raise Exception(f"DuckDB execution failed: {e}")
     
     def _convert_sql_to_s3_paths(self, sql: str) -> str:
-        """Convert database.table references to S3 paths"""
+        """Convert database.table references to S3 paths
+
+        Storage path structure: {bucket}/{database}/{measurement}/{partitions}/file.parquet
+        - Simple reference (cpu) -> current database
+        - Qualified reference (production.cpu) -> specified database
+        """
         import re
 
         # First, handle database.table references
@@ -332,62 +366,63 @@ class DuckDBEngine:
             database = match.group(1)
             table = match.group(2)
 
-            # Find storage connection that matches the database (prefix)
+            # Find storage connection that matches the database
             storage_conn = None
-            for conn in self.connection_manager.get_storage_connections():
-                if conn.get('prefix', '').rstrip('/') == database:
-                    storage_conn = conn
-                    break
+            if self.connection_manager:
+                for conn in self.connection_manager.get_storage_connections():
+                    if conn.get('database', 'default') == database:
+                        storage_conn = conn
+                        break
 
-            if not storage_conn:
-                logger.error(f"No storage connection found for database: {database}")
-                return match.group(0)  # Return original if no match
+            # Use backend if storage_conn not found
+            backend = self.minio_backend or self.s3_backend or self.ceph_backend or self.gcs_backend
+            if not backend:
+                logger.error(f"No storage backend available for database: {database}")
+                return match.group(0)
 
-            # Build storage path for the table based on backend
-            prefix = storage_conn.get('prefix', '').strip()
+            bucket = storage_conn.get('bucket') if storage_conn else backend.bucket
+            backend_type = storage_conn.get('backend') if storage_conn else (
+                'gcs' if self.gcs_backend else 's3'
+            )
 
-            if storage_conn.get('backend') == 'gcs':
+            if backend_type == 'gcs':
                 # Use native gs:// URLs with DuckDB GCS support
-                if self.gcs_backend:
-                    bucket = storage_conn.get('bucket', '')
-                    if prefix:
-                        gs_path = f"gs://{bucket}/{prefix.rstrip('/')}/{table}/**/*.parquet"
-                    else:
-                        gs_path = f"gs://{bucket}/{table}/**/*.parquet"
-
-                    logger.info(f"Using native GCS path for DuckDB: {gs_path}")
-                    return f"FROM read_parquet('{gs_path}', union_by_name=true)"
-                else:
-                    logger.error("GCS backend not initialized")
-                    return match.group(0)
+                gs_path = f"gs://{bucket}/{database}/{table}/**/*.parquet"
+                logger.info(f"Using native GCS path for DuckDB: {gs_path}")
+                return f"FROM read_parquet('{gs_path}', union_by_name=true)"
             else:
                 # Use S3-compatible path for MinIO/S3/Ceph
-                if prefix:
-                    s3_path = f"s3://{storage_conn['bucket']}/{prefix.rstrip('/')}/{table}/**/*.parquet"
-                else:
-                    s3_path = f"s3://{storage_conn['bucket']}/{table}/**/*.parquet"
-
+                s3_path = f"s3://{bucket}/{database}/{table}/**/*.parquet"
+                logger.info(f"Converting {database}.{table} to {s3_path}")
                 return f"FROM read_parquet('{s3_path}', union_by_name=true)"
 
         converted = re.sub(pattern_db_table, replace_db_table, sql, flags=re.IGNORECASE)
 
-        # Second, handle simple table names (FROM table_name) using default bucket
+        # Second, handle simple table names (FROM table_name) using current database
         # Only match if not already converted (no read_parquet in the match context)
         pattern_simple = r'FROM\s+(?!read_parquet|information_schema|pg_)(\w+)(?!\s*\()'
 
         def replace_simple_table(match):
             table = match.group(1)
 
-            # Use actual bucket from storage backend
+            # Use actual backend and its database
             backend = self.minio_backend or self.s3_backend or self.ceph_backend or self.gcs_backend
             if backend:
                 bucket = backend.bucket
+                database = backend.database
             else:
-                bucket = "arc"  # Fallback
+                bucket = "arc"
+                database = "default"
 
-            s3_path = f"s3://{bucket}/{table}/**/*.parquet"
-            logger.info(f"Converting simple table reference '{table}' to {s3_path}")
-            return f"FROM read_parquet('{s3_path}', union_by_name=true)"
+            # Build path with database namespace
+            if self.gcs_backend:
+                gs_path = f"gs://{bucket}/{database}/{table}/**/*.parquet"
+                logger.info(f"Converting simple table '{table}' to {gs_path}")
+                return f"FROM read_parquet('{gs_path}', union_by_name=true)"
+            else:
+                s3_path = f"s3://{bucket}/{database}/{table}/**/*.parquet"
+                logger.info(f"Converting simple table '{table}' to {s3_path}")
+                return f"FROM read_parquet('{s3_path}', union_by_name=true)"
 
         converted = re.sub(pattern_simple, replace_simple_table, converted, flags=re.IGNORECASE)
         return converted
@@ -399,8 +434,19 @@ class DuckDBEngine:
         pattern = r'^\s*SHOW\s+TABLES(?:\s+FROM\s+(\w+))?\s*;?\s*$'
         return bool(re.match(pattern, sql.strip(), re.IGNORECASE))
 
+    def _is_show_databases_query(self, sql: str) -> bool:
+        """Check if query is a SHOW DATABASES command"""
+        import re
+        pattern = r'^\s*SHOW\s+DATABASES\s*;?\s*$'
+        return bool(re.match(pattern, sql.strip(), re.IGNORECASE))
+
     def _handle_show_tables_sync(self, sql: str) -> Dict[str, Any]:
-        """Handle SHOW TABLES command"""
+        """Handle SHOW TABLES command
+
+        Storage path structure: {bucket}/{database}/{measurement}/{year}/{month}/{day}/{hour}/file.parquet
+        - Database is the namespace (default, production, staging, etc.)
+        - Measurement is the table name (cpu, mem, disk, etc.)
+        """
         import re
 
         # Extract database name if specified
@@ -416,13 +462,10 @@ class DuckDBEngine:
                 "row_count": 0
             }
 
-        database = match.group(1)
-        logger.info(f"Showing tables for database: {database if database else 'all'}")
+        database_filter = match.group(1)
+        logger.info(f"Showing tables for database: {database_filter if database_filter else 'current database'}")
 
         try:
-            # Get all storage connections
-            storage_conns = self.connection_manager.get_storage_connections() if self.connection_manager else []
-
             # Find storage backend
             backend = self.minio_backend or self.s3_backend or self.ceph_backend or self.gcs_backend
             if not backend:
@@ -433,59 +476,70 @@ class DuckDBEngine:
                     "row_count": 0
                 }
 
-            # List all objects
-            objects = backend.list_objects()
+            # Determine which database to query
+            target_database = database_filter if database_filter else backend.database
 
-            # Parse objects to find tables
+            # If querying a different database than backend's default, use S3 directly
+            if database_filter and database_filter != backend.database:
+                # Scan specific database using S3 client directly
+                objects = []
+                try:
+                    paginator = backend.s3_client.get_paginator('list_objects_v2')
+                    for page in paginator.paginate(
+                        Bucket=backend.bucket,
+                        Prefix=f"{target_database}/",  # Specific database prefix
+                        MaxKeys=10000
+                    ):
+                        if 'Contents' in page:
+                            for obj in page['Contents']:
+                                key = obj['Key']
+                                # Remove database prefix for consistent parsing
+                                if key.startswith(f"{target_database}/"):
+                                    relative_key = key[len(f"{target_database}/"):]
+                                    objects.append(relative_key)
+                except Exception as e:
+                    logger.error(f"Failed to list objects for database {target_database}: {e}")
+                    return {
+                        "success": False,
+                        "error": f"Failed to access database {target_database}: {str(e)}",
+                        "data": [],
+                        "columns": ["database", "table_name", "storage_path", "file_count", "total_size_mb"],
+                        "row_count": 0
+                    }
+            else:
+                # Use backend's list_objects for current database
+                objects = backend.list_objects(prefix="", max_keys=10000)
+                target_database = backend.database
+
+            # Parse objects to find measurements (tables)
+            # Path structure: measurement/year/month/day/hour/file.parquet
             tables = {}
             for obj_key in objects:
                 parts = obj_key.split('/')
 
-                # Expected format: prefix/table/.../*.parquet or database/table/.../*.parquet
-                if len(parts) >= 2:
-                    # Check if first part matches a storage connection prefix
-                    db_name = None
-                    table_name = None
+                # Expected format: measurement/year/month/... (database is already filtered)
+                if len(parts) >= 1:
+                    measurement = parts[0]  # First part is measurement name
 
-                    for conn in storage_conns:
-                        prefix = conn.get('prefix', '').strip().rstrip('/')
-                        if prefix and obj_key.startswith(prefix + '/'):
-                            db_name = prefix
-                            remaining = obj_key[len(prefix)+1:]
-                            table_parts = remaining.split('/')
-                            if table_parts:
-                                table_name = table_parts[0]
-                            break
-
-                    # If no prefix matched, use first part as database
-                    if not db_name:
-                        db_name = parts[0]
-                        table_name = parts[1] if len(parts) > 1 else parts[0]
-
-                    # Filter by database if specified
-                    if database and db_name != database:
+                    # Skip year/partition directories (numeric names)
+                    if measurement.isdigit():
                         continue
 
                     # Track table info
-                    table_key = f"{db_name}.{table_name}"
+                    table_key = f"{target_database}.{measurement}"
                     if table_key not in tables:
                         tables[table_key] = {
-                            "database": db_name,
-                            "table_name": table_name,
+                            "database": target_database,
+                            "table_name": measurement,
                             "file_count": 0,
                             "total_size": 0,
-                            "storage_path": f"s3://{backend.bucket}/{db_name}/{table_name}/"
+                            "storage_path": f"s3://{backend.bucket}/{target_database}/{measurement}/"
                         }
 
                     # Count files and size if it's a parquet file
                     if obj_key.endswith('.parquet'):
                         tables[table_key]["file_count"] += 1
-                        # Get object size if available
-                        try:
-                            obj_info = backend.client.stat_object(backend.bucket, obj_key)
-                            tables[table_key]["total_size"] += obj_info.size
-                        except:
-                            pass
+                        # Note: Size calculation would require additional backend call
 
             # Format results
             data = []
@@ -515,21 +569,99 @@ class DuckDBEngine:
                 "row_count": 0
             }
 
-    async def get_measurements(self) -> List[str]:
-        """Get list of available measurements"""
+    def _handle_show_databases_sync(self) -> Dict[str, Any]:
+        """Handle SHOW DATABASES command
+
+        Returns all unique database namespaces found in storage by scanning the bucket
+        """
         try:
-            backend = self.minio_backend or self.s3_backend or self.ceph_backend
+            databases = set()
+
+            # Get the backend (regardless of connection manager)
+            backend = self.minio_backend or self.s3_backend or self.ceph_backend or self.gcs_backend
+
+            if backend:
+                # Scan the bucket root to find all database directories
+                # Storage structure: {bucket}/{database}/{measurement}/{partitions}
+                # We need to list all top-level prefixes in the bucket
+
+                # Use S3 client directly to scan bucket root (bypass database prefix logic)
+                try:
+                    paginator = backend.s3_client.get_paginator('list_objects_v2')
+
+                    # List objects in bucket root (no prefix)
+                    for page in paginator.paginate(
+                        Bucket=backend.bucket,
+                        Prefix="",  # No prefix - scan entire bucket
+                        Delimiter="/",  # Get top-level "directories" only
+                        MaxKeys=1000
+                    ):
+                        # CommonPrefixes contains the top-level directories (databases)
+                        if 'CommonPrefixes' in page:
+                            for prefix_info in page['CommonPrefixes']:
+                                prefix = prefix_info['Prefix']
+                                # Remove trailing slash
+                                database = prefix.rstrip('/')
+                                if database and not database.isdigit():
+                                    databases.add(database)
+
+                except Exception as e:
+                    logger.error(f"Failed to scan bucket for databases: {e}")
+                    # Fallback: return current backend's database
+                    databases.add(backend.database)
+
+                # If no databases found, return at least "default"
+                if not databases:
+                    databases.add("default")
+            else:
+                # No backend available, return default
+                databases.add("default")
+
+            # Format results
+            data = [[db] for db in sorted(databases)]
+
+            logger.info(f"SHOW DATABASES found: {sorted(databases)}")
+
+            return {
+                "success": True,
+                "data": data,
+                "columns": ["database"],
+                "row_count": len(data)
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to show databases: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "data": [],
+                "columns": [],
+                "row_count": 0
+            }
+
+    async def get_measurements(self) -> List[str]:
+        """Get list of available measurements (tables) in current database
+
+        Storage path structure: {bucket}/{database}/{measurement}/{partitions}/file.parquet
+        Backend's list_objects() returns paths relative to database (already scoped)
+        """
+        try:
+            backend = self.minio_backend or self.s3_backend or self.ceph_backend or self.gcs_backend
             if not backend:
                 return []
 
-            objects = backend.list_objects()
+            # Backend already scopes to its database
+            objects = backend.list_objects(prefix="", max_keys=10000)
             measurements = set()
 
             for obj_key in objects:
                 parts = obj_key.split('/')
-                if len(parts) >= 2:
-                    measurement = parts[1]  # Assuming prefix/measurement/...
-                    measurements.add(measurement)
+                # Path format: measurement/year/month/... (database is already filtered)
+                if len(parts) >= 1:
+                    measurement = parts[0]  # First part is measurement name
+                    # Skip numeric directories (year partitions)
+                    if not measurement.isdigit():
+                        measurements.add(measurement)
 
             return sorted(list(measurements))
 

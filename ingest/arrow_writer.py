@@ -152,6 +152,7 @@ class ArrowParquetBuffer:
     Buffered Arrow/Parquet writer with automatic flushing.
 
     Similar to ParquetBuffer but uses Direct Arrow writes.
+    Optionally includes Write-Ahead Log (WAL) for durability.
     """
 
     def __init__(
@@ -159,7 +160,9 @@ class ArrowParquetBuffer:
         storage_backend,
         max_buffer_size: int = 10000,
         max_buffer_age_seconds: int = 60,
-        compression: str = 'snappy'
+        compression: str = 'snappy',
+        wal_enabled: bool = False,
+        wal_config: Dict[str, Any] = None
     ):
         """
         Initialize Arrow buffer
@@ -169,6 +172,8 @@ class ArrowParquetBuffer:
             max_buffer_size: Max records before flush
             max_buffer_age_seconds: Max seconds before flush
             compression: Parquet compression
+            wal_enabled: Enable Write-Ahead Log for durability
+            wal_config: WAL configuration dict
         """
         self.storage_backend = storage_backend
         self.max_buffer_size = max_buffer_size
@@ -182,6 +187,19 @@ class ArrowParquetBuffer:
         self.buffers: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         self.buffer_start_times: Dict[str, datetime] = {}
 
+        # WAL (optional)
+        self.wal_enabled = wal_enabled
+        self.wal_writer = None
+        if wal_enabled and wal_config:
+            from storage.wal import WALWriter
+            self.wal_writer = WALWriter(
+                wal_dir=wal_config.get('wal_dir', './data/wal'),
+                worker_id=wal_config.get('worker_id', 0),
+                sync_mode=wal_config.get('sync_mode', 'fdatasync'),
+                max_size_bytes=wal_config.get('max_size_mb', 100) * 1024 * 1024,
+                max_age_seconds=wal_config.get('max_age_seconds', 3600)
+            )
+
         # Metrics
         self.total_records_buffered = 0
         self.total_records_written = 0
@@ -194,10 +212,11 @@ class ArrowParquetBuffer:
         self._running = False
         self._lock = asyncio.Lock()
 
+        wal_status = "enabled" if wal_enabled else "disabled"
         logger.info(
             f"ArrowParquetBuffer initialized: "
             f"max_size={max_buffer_size}, max_age={max_buffer_age_seconds}s, "
-            f"compression={compression}"
+            f"compression={compression}, WAL={wal_status}"
         )
 
     async def start(self):
@@ -233,18 +252,30 @@ class ArrowParquetBuffer:
 
         # Flush all remaining buffers
         await self.flush_all()
+
+        # Close WAL writer
+        if self.wal_writer:
+            self.wal_writer.close()
+
         logger.info(
             f"ArrowParquetBuffer stopped. Total records written: {self.total_records_written}"
         )
 
     async def write(self, records: List[Dict[str, Any]]):
-        """Add records to buffer"""
+        """Add records to buffer (with optional WAL)"""
         import asyncio
         from datetime import datetime, timezone
         from collections import defaultdict
 
         if not records:
             return
+
+        # Write to WAL first (if enabled) - BEFORE buffering
+        if self.wal_enabled and self.wal_writer:
+            loop = asyncio.get_event_loop()
+            success = await loop.run_in_executor(None, self.wal_writer.append, records)
+            if not success:
+                logger.error("WAL append failed, records may be lost on crash")
 
         async with self._lock:
             # Group records by measurement
@@ -330,7 +361,17 @@ class ArrowParquetBuffer:
                 # PHASE 2: Hour-level partitioning
                 date_partition = datetime.now().strftime('%Y/%m/%d/%H')
 
+            # Check if records have a database override
+            database_override = None
+            if records and '_database' in records[0]:
+                database_override = records[0]['_database']
+                # Remove _database from all records before writing to parquet
+                for record in records:
+                    record.pop('_database', None)
+
             filename = f"{measurement}_{timestamp_str}_{len(records)}.parquet"
+            # Path is always measurement/date_partition/filename
+            # Storage backend adds database prefix
             remote_path = f"{measurement}/{date_partition}/{filename}"
 
             # Write to temporary file using Direct Arrow
@@ -342,8 +383,8 @@ class ArrowParquetBuffer:
                 success = self.writer.write_parquet(records, tmp_path, measurement)
 
                 if success:
-                    # Upload to storage
-                    await self.storage_backend.upload_file(tmp_path, remote_path)
+                    # Upload to storage (with optional database override)
+                    await self.storage_backend.upload_file(tmp_path, remote_path, database_override=database_override)
 
                     self.total_records_written += len(records)
                     self.total_flushes += 1
@@ -379,7 +420,7 @@ class ArrowParquetBuffer:
                     await self._flush_measurement(measurement)
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get buffer statistics"""
+        """Get buffer statistics (including WAL if enabled)"""
         from datetime import datetime, timezone
 
         oldest_age = None
@@ -388,7 +429,7 @@ class ArrowParquetBuffer:
             oldest = min(self.buffer_start_times.values())
             oldest_age = (now - oldest).total_seconds()
 
-        return {
+        stats = {
             'total_records_buffered': self.total_records_buffered,
             'total_records_written': self.total_records_written,
             'total_flushes': self.total_flushes,
@@ -398,5 +439,12 @@ class ArrowParquetBuffer:
                 for measurement, records in self.buffers.items()
             },
             'oldest_buffer_age_seconds': oldest_age,
-            'writer_type': 'Direct Arrow (zero-copy)'
+            'writer_type': 'Direct Arrow (zero-copy)',
+            'wal_enabled': self.wal_enabled
         }
+
+        # Add WAL stats if enabled
+        if self.wal_enabled and self.wal_writer:
+            stats['wal'] = self.wal_writer.get_stats()
+
+        return stats

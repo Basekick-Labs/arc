@@ -134,6 +134,7 @@ async def write_v1(
     rp: Optional[str] = Query(None, description="Retention policy (ignored for compatibility)"),
     precision: Optional[str] = Query('ns', description="Timestamp precision (ns, u, ms, s)"),
     content_encoding: Optional[str] = Header(None, alias="Content-Encoding"),
+    x_arc_database: Optional[str] = Header(None, alias="x-arc-database"),
 ):
     """
     InfluxDB 1.x compatible write endpoint
@@ -174,6 +175,10 @@ async def write_v1(
             if db:
                 flat['database'] = db
 
+            # Inject Arc database if specified via header
+            if x_arc_database:
+                flat['_database'] = x_arc_database
+
             flat_records.append(flat)
 
         # Merge records with same measurement+tags+timestamp
@@ -198,6 +203,7 @@ async def write_v2(
     precision: Optional[str] = Query('ns', description="Timestamp precision (ns, us, ms, s)"),
     authorization: Optional[str] = Header(None, description="Token for auth (optional)"),
     content_encoding: Optional[str] = Header(None, alias="Content-Encoding"),
+    x_arc_database: Optional[str] = Header(None, alias="x-arc-database"),
 ):
     """
     InfluxDB 2.x compatible write endpoint
@@ -237,6 +243,10 @@ async def write_v2(
             if bucket:
                 flat['bucket'] = bucket
 
+            # Inject Arc database if specified via header
+            if x_arc_database:
+                flat['_database'] = x_arc_database
+
             flat_records.append(flat)
 
         # Merge records with same measurement+tags+timestamp
@@ -256,7 +266,8 @@ async def write_v2(
 @router.post("/write")
 async def write_simple(
     request: Request,
-    content_encoding: Optional[str] = Header(None, alias="Content-Encoding")
+    content_encoding: Optional[str] = Header(None, alias="Content-Encoding"),
+    x_arc_database: Optional[str] = Header(None, alias="x-arc-database"),
 ):
     """
     Simple write endpoint (no query parameters)
@@ -286,7 +297,15 @@ async def write_simple(
             raise HTTPException(status_code=400, detail="No valid records in request")
 
         # Convert to flat format
-        flat_records = [LineProtocolParser.to_flat_dict(r) for r in records]
+        flat_records = []
+        for record in records:
+            flat = LineProtocolParser.to_flat_dict(record)
+
+            # Inject Arc database if specified via header
+            if x_arc_database:
+                flat['_database'] = x_arc_database
+
+            flat_records.append(flat)
 
         # Merge records with same measurement+tags+timestamp
         merged_records = merge_records(flat_records)

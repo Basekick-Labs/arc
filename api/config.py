@@ -16,10 +16,10 @@ def get_db_path() -> str:
 
     # Check if running in Docker (presence of /.dockerenv)
     if os.path.exists("/.dockerenv"):
-        return "/app/data/historian.db"
+        return "/app/data/arc.db"
 
     # Native execution - use current directory
-    return "./data/historian.db"
+    return "./data/arc.db"
 
 
 def get_log_dir() -> str:

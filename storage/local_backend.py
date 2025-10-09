@@ -8,25 +8,32 @@ import duckdb
 logger = logging.getLogger(__name__)
 
 class LocalBackend:
-    """Local disk storage backend for maximum write performance testing"""
+    """Local disk storage backend for maximum write performance testing
 
-    def __init__(self, base_path: str = None, bucket: str = None, prefix: str = ""):
+    Files are organized by database:
+    {base_path}/{database}/{measurement}/{year}/{month}/{day}/{hour}/file.parquet
+    """
+
+    def __init__(self, base_path: str = None, bucket: str = None, database: str = "default"):
         # Support both base_path and bucket for backward compatibility
         path = base_path or bucket
         if not path:
             raise ValueError("Either base_path or bucket must be provided")
 
         self.base_path = Path(path)
-        self.prefix = prefix.rstrip('/') + '/' if prefix else ''
+        self.database = database
 
         # Create base directory if it doesn't exist
         self.base_path.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Local storage backend initialized at {self.base_path}")
+        logger.info(f"Local storage backend initialized at {self.base_path} for database '{self.database}'")
 
     async def upload_file(self, local_path: Path, key: str) -> bool:
-        """Copy file to local storage location asynchronously"""
+        """Copy file to local storage location asynchronously
+
+        Files are stored under: {base_path}/{database}/{key}
+        """
         try:
-            dest_path = self.base_path / self.prefix / key
+            dest_path = self.base_path / self.database / key
             dest_path.parent.mkdir(parents=True, exist_ok=True)
 
             # Read and write file asynchronously
@@ -77,11 +84,14 @@ class LocalBackend:
         return success_count
 
     def get_s3_path(self, measurement: str, year: int, month: int, day: int, hour: int = None) -> str:
-        """Generate local path (compatible with DuckDB local file reading)"""
+        """Generate local path (compatible with DuckDB local file reading)
+
+        Path structure: {base_path}/{database}/{measurement}_{year}_{month}_{day}_{hour}.parquet
+        """
         if hour is not None:
-            return f"{self.base_path}/{measurement}_{year}_{month:02d}_{day:02d}_{hour:02d}.parquet"
+            return f"{self.base_path}/{self.database}/{measurement}_{year}_{month:02d}_{day:02d}_{hour:02d}.parquet"
         else:
-            return f"{self.base_path}/{measurement}_{year}_{month:02d}_*.parquet"
+            return f"{self.base_path}/{self.database}/{measurement}_{year}_{month:02d}_*.parquet"
 
     def list_objects(self) -> List[str]:
         """List all parquet files in the base path"""

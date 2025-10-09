@@ -11,12 +11,12 @@ import duckdb
 logger = logging.getLogger(__name__)
 
 class S3Backend:
-    def __init__(self, bucket: str, region: str = "us-east-1", prefix: str = "historian/", 
+    def __init__(self, bucket: str, region: str = "us-east-1", database: str = "default",
                  access_key: str = None, secret_key: str = None, use_directory_bucket: bool = False,
                  availability_zone: str = None):
         self.bucket = bucket
         self.region = region
-        self.prefix = prefix.rstrip('/') + '/' if prefix.strip() else ''
+        self.database = database
         self.use_directory_bucket = use_directory_bucket
         self.availability_zone = availability_zone or f"{region}a"
         
@@ -94,7 +94,7 @@ class S3Backend:
     async def upload_file(self, local_path: Path, s3_key: str) -> bool:
         """Upload single file to S3 asynchronously"""
         try:
-            full_key = f"{self.prefix}{s3_key}"
+            full_key = f"{self.database}/{s3_key}"
             
             # Read file asynchronously
             async with aiofiles.open(local_path, 'rb') as f:
@@ -145,7 +145,7 @@ class S3Backend:
             s3_key = str(relative_path)
             
             logger.info(f"Uploading {file_path} as {s3_key}")
-            logger.info(f"Upload key: {s3_key} -> full key: {self.prefix}{s3_key}")
+            logger.info(f"Upload key: {s3_key} -> full key: {self.database}/{s3_key}")
             
             task = self.upload_file(file_path, s3_key)
             tasks.append(task)
@@ -167,7 +167,7 @@ class S3Backend:
     async def list_files(self, measurement: str) -> List[str]:
         """List files in S3 for a measurement"""
         try:
-            prefix = f"{self.prefix}{measurement}/"
+            prefix = f"{self.database}/{measurement}/"
             
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
@@ -228,9 +228,9 @@ class S3Backend:
             raise
     
     def list_objects(self, prefix: str = "") -> List[str]:
-        """List objects in S3 bucket (matches MinIO backend interface)"""
+        """List objects in S3 bucket with database scope"""
         try:
-            full_prefix = f"{self.prefix}{prefix}"
+            full_prefix = f"{self.database}/{prefix}" if prefix else self.database
             response = self.s3_client.list_objects_v2(
                 Bucket=self.bucket,
                 Prefix=full_prefix
@@ -247,8 +247,11 @@ class S3Backend:
             return []
     
     def get_s3_path(self, measurement: str, year: int, month: int, day: int, hour: int = None) -> str:
-        """Generate S3 path for querying"""
+        """Generate S3 path for querying with database scope
+
+        Path structure: {bucket}/{database}/{measurement}/{year}/{month}/{day}/{hour}/file.parquet
+        """
         if hour is not None:
-            return f"s3://{self.s3_path_bucket}/{self.prefix}{measurement}/{year}/{month:02d}/{day:02d}_{hour:02d}.parquet"
+            return f"s3://{self.s3_path_bucket}/{self.database}/{measurement}/{year}/{month:02d}/{day:02d}_{hour:02d}.parquet"
         else:
-            return f"s3://{self.s3_path_bucket}/{self.prefix}{measurement}/{year}/{month:02d}/*.parquet"
+            return f"s3://{self.s3_path_bucket}/{self.database}/{measurement}/{year}/{month:02d}/*.parquet"

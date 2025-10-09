@@ -681,7 +681,7 @@ class ExportScheduler:
                         access_key=storage_conn['access_key'],
                         secret_key=storage_conn['secret_key'],
                         bucket=storage_conn['bucket'],
-                        prefix=storage_conn.get('prefix', '')
+                        database=storage_conn.get('database', 'default')
                     )
                 elif storage_conn['backend'] == 'ceph':
                     from storage.ceph_backend import CephBackend
@@ -691,13 +691,13 @@ class ExportScheduler:
                         secret_key=storage_conn['secret_key'],
                         bucket=storage_conn['bucket'],
                         region=storage_conn.get('region', 'us-east-1'),
-                        prefix=storage_conn.get('prefix', '')
+                        database=storage_conn.get('database', 'default')
                     )
                 elif storage_conn['backend'] == 'gcs':
                     from storage.gcs_backend import GCSBackend
                     storage_backend = GCSBackend(
                         bucket=storage_conn['bucket'],
-                        prefix=storage_conn.get('prefix', ''),
+                        database=storage_conn.get('database', 'default'),
                         project_id=storage_conn.get('project_id'),
                         credentials_json=storage_conn.get('credentials_json'),
                         credentials_file=storage_conn.get('credentials_file'),
@@ -709,7 +709,7 @@ class ExportScheduler:
                     storage_backend = S3Backend(
                         bucket=storage_conn['bucket'],
                         region=storage_conn.get('region', 'us-east-1'),
-                        prefix=storage_conn.get('prefix', 'historian/'),
+                        database=storage_conn.get('database', 'default'),
                         access_key=storage_conn.get('access_key'),
                         secret_key=storage_conn.get('secret_key'),
                         use_directory_bucket=storage_conn.get('use_directory_bucket', False),

@@ -10,9 +10,10 @@ import duckdb
 logger = logging.getLogger(__name__)
 
 class MinIOBackend:
-    def __init__(self, endpoint_url: str, access_key: str, secret_key: str, bucket: str, prefix: str = ""):
+    def __init__(self, endpoint_url: str, access_key: str, secret_key: str, bucket: str, database: str = "default"):
         self.bucket = bucket
-        self.prefix = prefix.rstrip('/') + '/' if prefix else ''
+        self.database = database
+        # Storage path: {bucket}/{database}/{measurement}/{year}/{month}/{day}/{hour}/file.parquet
         
         # Configure S3 client for MinIO
         self.s3_client = boto3.client(
@@ -55,11 +56,21 @@ class MinIOBackend:
                 logger.error(f"Failed to set MinIO S3 credentials: {fallback_error}")
                 raise
     
-    async def upload_file(self, local_path: Path, s3_key: str) -> bool:
-        """Upload single file to MinIO asynchronously"""
+    async def upload_file(self, local_path: Path, s3_key: str, database_override: str = None) -> bool:
+        """Upload single file to MinIO asynchronously
+
+        Args:
+            local_path: Path to local file
+            s3_key: S3 key (relative path without database prefix)
+            database_override: Optional database name to override the instance's database
+        """
         try:
-            full_key = f"{self.prefix}{s3_key}"
-            logger.info(f"Upload key: {s3_key} -> full key: {full_key}")
+            # Use override database if provided, otherwise use instance database
+            db = database_override if database_override is not None else self.database
+
+            # Add database prefix to the key
+            full_key = f"{db}/{s3_key}"
+            logger.info(f"Upload key: {s3_key} -> full key: {full_key} (database: {db})")
             
             # Read file asynchronously
             async with aiofiles.open(local_path, 'rb') as f:
@@ -133,32 +144,99 @@ class MinIOBackend:
         return success_count
     
     def get_s3_path(self, measurement: str, year: int, month: int, day: int, hour: int = None) -> str:
-        """Generate S3 path for flattened structure"""
+        """Generate S3 path with database prefix"""
         if hour is not None:
-            return f"s3://{self.bucket}/{measurement}_{year}_{month:02d}_{day:02d}_{hour:02d}.parquet"
+            return f"s3://{self.bucket}/{self.database}/{measurement}/{year}/{month:02d}/{day:02d}/{hour:02d}/*.parquet"
         else:
-            return f"s3://{self.bucket}/{measurement}_{year}_{month:02d}_*.parquet"
+            return f"s3://{self.bucket}/{self.database}/{measurement}/{year}/{month:02d}/*/*.parquet"
     
-    def list_objects(self) -> List[str]:
-        """List all objects in the bucket to discover structure"""
+    def list_objects(self, prefix: str = "", max_keys: int = 1000) -> List[str]:
+        """
+        List objects in the bucket within the current database
+
+        Args:
+            prefix: Filter by prefix within database (e.g., 'cpu/')
+            max_keys: Maximum number of keys to return
+
+        Returns:
+            List of object keys (relative to database)
+        """
         try:
             objects = []
+            # Prepend database to prefix: database/prefix
+            full_prefix = f"{self.database}/{prefix}" if prefix else f"{self.database}/"
+
             paginator = self.s3_client.get_paginator('list_objects_v2')
-            
-            # List all objects in bucket
-            for page in paginator.paginate(Bucket=self.bucket):
+
+            # List objects with prefix filter
+            for page in paginator.paginate(
+                Bucket=self.bucket,
+                Prefix=full_prefix,
+                MaxKeys=max_keys
+            ):
                 if 'Contents' in page:
                     for obj in page['Contents']:
+                        # Remove the database prefix to return relative keys
                         key = obj['Key']
+                        db_prefix = f"{self.database}/"
+                        if key.startswith(db_prefix):
+                            key = key[len(db_prefix):]
                         objects.append(key)
-            
-            logger.info(f"Found {len(objects)} objects in bucket")
-            logger.info(f"Sample objects: {objects[:5]}")
+
+                # Stop if we've reached max_keys
+                if len(objects) >= max_keys:
+                    break
+
+            logger.debug(f"Found {len(objects)} objects in database '{self.database}' with prefix '{prefix}'")
             return objects
-            
+
         except Exception as e:
             logger.error(f"Failed to list objects: {e}")
             return []
+
+    def download_file(self, s3_key: str, local_path: str):
+        """
+        Download file from MinIO to local path
+
+        Args:
+            s3_key: S3 object key (relative to database)
+            local_path: Local file path to save to
+        """
+        try:
+            full_key = f"{self.database}/{s3_key}"
+
+            self.s3_client.download_file(
+                Bucket=self.bucket,
+                Key=full_key,
+                Filename=local_path
+            )
+
+            logger.debug(f"Downloaded {full_key} to {local_path}")
+
+        except Exception as e:
+            logger.error(f"Failed to download {s3_key}: {e}")
+            raise
+
+    def delete_file(self, s3_key: str):
+        """
+        Delete file from MinIO
+
+        Args:
+            s3_key: S3 object key to delete (relative to database)
+        """
+        try:
+            full_key = f"{self.database}/{s3_key}"
+
+            self.s3_client.delete_object(
+                Bucket=self.bucket,
+                Key=full_key
+            )
+
+            logger.debug(f"Deleted {full_key} from database '{self.database}'")
+
+        except Exception as e:
+            logger.error(f"Failed to delete {s3_key}: {e}")
+            raise
     
     async def configure_duckdb_s3(self, duckdb_conn):
         """Configure DuckDB for MinIO S3 access"""

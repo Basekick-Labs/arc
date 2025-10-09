@@ -76,14 +76,33 @@ class ArcConfig:
                 "buffer_age_seconds": 60,
                 "compression": "snappy",
             },
+            "wal": {
+                "enabled": False,
+                "dir": "./data/wal",
+                "sync_mode": "fdatasync",
+                "max_size_mb": 100,
+                "max_age_seconds": 3600,
+            },
+            "compaction": {
+                "enabled": True,
+                "min_age_hours": 1,
+                "min_files": 10,
+                "target_file_size_mb": 512,
+                "schedule": "5 * * * *",
+                "max_concurrent_jobs": 2,
+                "lock_ttl_hours": 2,
+                "temp_dir": "./data/compaction",
+                "compression": "zstd",
+                "compression_level": 3,
+            },
             "storage": {
                 "backend": "minio",
+                "database": "default",
                 "minio": {
                     "endpoint": "http://minio:9000",
                     "access_key": "minioadmin",
                     "secret_key": "minioadmin123",
                     "bucket": "arc",
-                    "prefix": "",
                     "use_ssl": False,
                 },
             },
@@ -151,8 +170,28 @@ class ArcConfig:
             "WRITE_BUFFER_AGE": ("ingestion", "buffer_age_seconds", int),
             "WRITE_COMPRESSION": ("ingestion", "compression"),
 
+            # Write-Ahead Log (WAL)
+            "WAL_ENABLED": ("wal", "enabled", lambda x: x.lower() == "true"),
+            "WAL_DIR": ("wal", "dir"),
+            "WAL_SYNC_MODE": ("wal", "sync_mode"),
+            "WAL_MAX_SIZE_MB": ("wal", "max_size_mb", int),
+            "WAL_MAX_AGE_SECONDS": ("wal", "max_age_seconds", int),
+
+            # Compaction
+            "COMPACTION_ENABLED": ("compaction", "enabled", lambda x: x.lower() == "true"),
+            "COMPACTION_MIN_AGE_HOURS": ("compaction", "min_age_hours", int),
+            "COMPACTION_MIN_FILES": ("compaction", "min_files", int),
+            "COMPACTION_TARGET_FILE_SIZE_MB": ("compaction", "target_file_size_mb", int),
+            "COMPACTION_SCHEDULE": ("compaction", "schedule"),
+            "COMPACTION_MAX_CONCURRENT_JOBS": ("compaction", "max_concurrent_jobs", int),
+            "COMPACTION_LOCK_TTL_HOURS": ("compaction", "lock_ttl_hours", int),
+            "COMPACTION_TEMP_DIR": ("compaction", "temp_dir"),
+            "COMPACTION_COMPRESSION": ("compaction", "compression"),
+            "COMPACTION_COMPRESSION_LEVEL": ("compaction", "compression_level", int),
+
             # Storage
             "STORAGE_BACKEND": ("storage", "backend"),
+            "STORAGE_DATABASE": ("storage", "database"),
             "MINIO_ENDPOINT": ("storage", "minio", "endpoint"),
             "MINIO_ACCESS_KEY": ("storage", "minio", "access_key"),
             "MINIO_SECRET_KEY": ("storage", "minio", "secret_key"),
@@ -231,6 +270,14 @@ class ArcConfig:
     def get_storage_config(self) -> Dict[str, Any]:
         """Get storage configuration"""
         return self.config.get("storage", {})
+
+    def get_wal_config(self) -> Dict[str, Any]:
+        """Get Write-Ahead Log (WAL) configuration"""
+        return self.config.get("wal", {})
+
+    def get_compaction_config(self) -> Dict[str, Any]:
+        """Get compaction configuration"""
+        return self.config.get("compaction", {})
 
     def dump(self) -> Dict[str, Any]:
         """Get complete configuration (for debugging)"""

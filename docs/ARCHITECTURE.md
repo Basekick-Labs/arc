@@ -7,7 +7,10 @@ This document explains Arc's internal architecture, data flow, and design decisi
 - [High-Level Overview](#high-level-overview)
 - [Data Flow](#data-flow)
 - [Buffering System](#buffering-system)
+- [Write-Ahead Log (WAL)](#write-ahead-log-wal)
 - [Storage Layout](#storage-layout)
+- [Multi-Database Architecture](#multi-database-architecture)
+- [Compaction System](#compaction-system)
 - [Schema Management](#schema-management)
 - [Query Engine](#query-engine)
 - [Durability and Data Loss](#durability-and-data-loss)
@@ -21,7 +24,10 @@ Arc is a time-series data warehouse optimized for high-throughput ingestion and 
 - **MessagePack binary protocol** for high-performance writes (1.89M records/sec)
 - **InfluxDB Line Protocol** for drop-in compatibility with existing workloads
 - **In-memory buffering** for batching writes
+- **Write-Ahead Log (WAL)** for optional zero data loss durability
 - **Parquet files** for columnar storage
+- **Automatic compaction** for query performance optimization
+- **Multi-database architecture** for data isolation and multi-tenancy
 - **DuckDB** for analytical queries
 - **S3-compatible storage** (MinIO, AWS S3, GCS) for scalability
 
@@ -40,6 +46,11 @@ Arc is a time-series data warehouse optimized for high-throughput ingestion and 
 │         └─────────┬───────────┘                              │
 │                   ▼                                          │
 │         ┌─────────────────────┐                             │
+│         │  WAL (Optional)     │  ← Zero data loss           │
+│         │  (Per-worker file)  │     (fdatasync/fsync)       │
+│         └─────────┬───────────┘                             │
+│                   ▼                                          │
+│         ┌─────────────────────┐                             │
 │         │  In-Memory Buffers  │  ← Per-measurement          │
 │         │  (50K records/5s)   │                             │
 │         └─────────┬───────────┘                             │
@@ -51,7 +62,14 @@ Arc is a time-series data warehouse optimized for high-throughput ingestion and 
 │                   ▼                                          │
 │         ┌─────────────────────┐                             │
 │         │  Storage Backend    │  ← MinIO/S3/GCS             │
+│         │  Multi-Database     │     {db}/{measurement}/...  │
 │         │  (Hour Partitions)  │                             │
+│         └─────────┬───────────┘                             │
+│                   │                                          │
+│                   ▼                                          │
+│         ┌─────────────────────┐                             │
+│         │  Compaction System  │  ← Merges small files       │
+│         │  (Cron: 5 * * * *)  │     Optimizes queries       │
 │         └─────────────────────┘                             │
 │                                                              │
 │         ┌─────────────────────┐                             │
@@ -166,31 +184,112 @@ If a flush fails (network error, S3 unavailable):
 2. If buffer exceeds 2× size limit, **records are dropped** (prevents memory exhaustion)
 3. Error is logged with `total_errors` metric
 
+## Write-Ahead Log (WAL)
+
+Arc includes an **optional Write-Ahead Log** for zero data loss guarantees. When enabled, data is persisted to disk before being acknowledged to clients.
+
+### WAL Architecture
+
+```
+Write Request → WAL Append → HTTP 202 → Buffer → Parquet → S3
+                    ↓                                        ↓
+                Durable                                 Durable
+              (on disk)                              (permanent)
+```
+
+**Per-Worker WAL Files:**
+```
+./data/wal/
+├── worker-1-20251008_140530.wal
+├── worker-2-20251008_140530.wal
+├── worker-3-20251008_140530.wal
+└── worker-4-20251008_140530.wal
+```
+
+Each Gunicorn worker has its own WAL file to avoid lock contention, enabling parallel writes.
+
+### WAL Configuration
+
+```env
+# Enable WAL with balanced durability
+WAL_ENABLED=true
+WAL_DIR=./data/wal
+WAL_SYNC_MODE=fdatasync        # Recommended (near-zero data loss)
+WAL_MAX_SIZE_MB=100            # Rotate at 100MB
+WAL_MAX_AGE_SECONDS=3600       # Rotate after 1 hour
+```
+
+**Sync Modes:**
+- `fsync`: Full metadata sync - zero data loss (~1.61M rec/s, -17% throughput)
+- `fdatasync`: Data-only sync - near-zero data loss (~1.56M rec/s, -19% throughput)
+- `async`: OS buffer cache - <1s data loss risk (~1.60M rec/s, -17% throughput)
+
+### WAL Recovery
+
+On startup, Arc automatically recovers from WAL files:
+
+```
+2025-10-08 14:30:00 [INFO] WAL recovery started: 4 files
+2025-10-08 14:30:01 [INFO] Recovering WAL: worker-1-20251008_143000.wal
+2025-10-08 14:30:01 [INFO] WAL read complete: 1000 entries, 5242880 bytes
+2025-10-08 14:30:05 [INFO] WAL recovery complete: 4000 batches, 200000 entries
+2025-10-08 14:30:05 [INFO] WAL archived: worker-1-20251008_143000.wal.recovered
+```
+
+**Recovery features:**
+- Parallel recovery across workers
+- Checksum verification (CRC32)
+- Corrupted entries are skipped and logged
+- Automatic cleanup of old recovered files (24 hours)
+
+### WAL Trade-offs
+
+**Enable WAL if:**
+- ✅ Zero data loss is required
+- ✅ Regulated industry (finance, healthcare)
+- ✅ Can accept 19% throughput reduction
+
+**Disable WAL if:**
+- ⚡ Maximum throughput is priority (1.93M rec/s)
+- 💰 Can tolerate 0-5s data loss risk
+- 🔄 Have upstream retry/queue mechanisms
+
+See [docs/WAL.md](docs/WAL.md) for complete documentation.
+
 ## Storage Layout
 
 ### Directory Structure
 
-Arc uses **hour-level time partitioning** for optimal query performance:
+Arc uses **multi-database architecture** with **hour-level time partitioning** for optimal query performance:
 
 ```
 s3://arc/
-├── cpu/
-│   ├── 2025/
-│   │   ├── 10/
-│   │   │   ├── 08/
-│   │   │   │   ├── 14/
-│   │   │   │   │   ├── cpu_20251008_140530_50000.parquet
-│   │   │   │   │   ├── cpu_20251008_141045_50000.parquet
-│   │   │   │   │   └── cpu_20251008_142310_50000.parquet
-│   │   │   │   └── 15/
-│   │   │   │       └── cpu_20251008_150102_50000.parquet
-├── memory/
-│   └── 2025/10/08/14/*.parquet
-├── disk/
-│   └── 2025/10/08/14/*.parquet
-└── http_logs/
-    └── 2025/10/08/14/*.parquet
+├── default/                          ← Database namespace
+│   ├── cpu/                          ← Measurement (table)
+│   │   ├── 2025/                     ← Year partition
+│   │   │   ├── 10/                   ← Month partition
+│   │   │   │   ├── 08/               ← Day partition
+│   │   │   │   │   ├── 14/           ← Hour partition
+│   │   │   │   │   │   ├── cpu_20251008_140530_50000.parquet
+│   │   │   │   │   │   ├── cpu_20251008_141045_50000.parquet
+│   │   │   │   │   │   └── cpu_20251008_142310_50000.parquet
+│   │   │   │   │   └── 15/
+│   │   │   │   │       └── cpu_20251008_150102_50000.parquet
+│   ├── memory/
+│   │   └── 2025/10/08/14/*.parquet
+│   └── disk/
+│       └── 2025/10/08/14/*.parquet
+├── production/                       ← Another database
+│   ├── cpu/
+│   │   └── 2025/10/08/14/*.parquet
+│   └── memory/
+│       └── 2025/10/08/14/*.parquet
+└── benchmark/                        ← Testing database
+    ├── cpu/
+    └── disk/
 ```
+
+**Path format:** `{bucket}/{database}/{measurement}/{year}/{month}/{day}/{hour}/{file}.parquet`
 
 ### File Naming Convention
 
@@ -223,6 +322,204 @@ Arc supports multiple backends with identical API:
 | **S3 Express** | Ultra-low latency (<10ms) | `S3_USE_DIRECTORY_BUCKET=true` |
 | **GCS** | Google Cloud | `STORAGE_BACKEND=gcs` |
 | **Local** | Testing only | `STORAGE_BACKEND=local` |
+
+## Multi-Database Architecture
+
+Arc supports **multiple databases** (namespaces) within a single instance for data isolation and multi-tenancy.
+
+### Database Isolation
+
+Each database is a separate namespace with its own measurements and data:
+
+```sql
+-- Write to specific database via HTTP header
+POST /write/v2/msgpack
+Headers:
+  x-arc-database: production
+
+-- Query specific database
+SELECT * FROM production.cpu WHERE time > now() - INTERVAL '1 hour'
+
+-- Query different database
+SELECT * FROM staging.cpu WHERE time > now() - INTERVAL '1 hour'
+
+-- Show all databases
+SHOW DATABASES
+-- Returns: default, production, staging, benchmark
+
+-- Show tables in specific database
+SHOW TABLES FROM production
+-- Returns: cpu, memory, disk
+```
+
+### Database Benefits
+
+**Multi-Tenancy:**
+```
+production/    ← Customer A data
+staging/       ← Testing environment
+development/   ← Development environment
+```
+
+**Environment Isolation:**
+```
+prod/          ← Production metrics (critical)
+test/          ← Testing data (can be deleted)
+benchmark/     ← Performance testing (temporary)
+```
+
+**Cost Tracking:**
+- Each database has independent storage costs
+- Query costs can be tracked per-database
+- Easy to analyze per-tenant usage
+
+### Database Routing
+
+**Write Path:**
+```python
+# Default database (no header)
+POST /write/v2/msgpack → default/cpu/...
+
+# Explicit database (x-arc-database header)
+POST /write/v2/msgpack
+x-arc-database: production → production/cpu/...
+```
+
+**Query Path:**
+```sql
+-- Explicit database.table syntax
+SELECT * FROM production.cpu
+
+-- SHOW TABLES with database filter
+SHOW TABLES FROM production
+
+-- Cross-database queries
+SELECT
+  p.time,
+  p.usage as prod_usage,
+  s.usage as staging_usage
+FROM production.cpu p
+JOIN staging.cpu s ON p.time = s.time
+```
+
+### Superset Integration
+
+Arc databases are exposed as **schemas** in Apache Superset:
+
+1. Connect to Arc using `arc://` connection string
+2. Superset calls `SHOW DATABASES` → sees all databases
+3. User selects schema (e.g., "production")
+4. Superset calls `SHOW TABLES FROM production` → shows measurements
+5. Queries are database-scoped automatically
+
+See [arc-superset-dialect](https://github.com/basekick-labs/arc-superset-dialect) for details.
+
+## Compaction System
+
+Arc includes an **automatic compaction system** that merges small Parquet files into larger, optimized files for faster queries.
+
+### The Small File Problem
+
+At 1.93M records/sec with 5-second flush interval:
+```
+→ 9.65M records every 5 seconds
+→ ~12 files per minute per measurement
+→ ~720 files per hour per measurement
+→ ~17,280 files per day per measurement
+```
+
+**Impact on queries:**
+- 🐌 Slow queries (DuckDB must open/scan hundreds of files)
+- 💸 High S3 costs (more API calls)
+- 📊 Poor compression (small files compress less efficiently)
+
+### Compaction Process
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  1. Scheduler (Cron: "5 * * * *")                       │
+│     Wakes up every hour at :05                          │
+└──────────────────┬──────────────────────────────────────┘
+                   ▼
+┌─────────────────────────────────────────────────────────┐
+│  2. Find Candidates                                      │
+│     - Partitions older than 1 hour                      │
+│     - At least 10 files in partition                    │
+│     - Not already compacted                             │
+└──────────────────┬──────────────────────────────────────┘
+                   ▼
+┌─────────────────────────────────────────────────────────┐
+│  3. For each partition:                                  │
+│     a. Acquire SQLite lock (prevents concurrent)        │
+│     b. Download small files to temp directory           │
+│     c. Merge using DuckDB (sorted by time)              │
+│     d. Upload compacted file (ZSTD compression)         │
+│     e. Delete old small files                           │
+│     f. Release lock                                     │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Before compaction:**
+```
+default/cpu/2025/10/08/14/
+├── cpu_20251008_140001_5000.parquet  (5MB)
+├── cpu_20251008_140006_5000.parquet  (5MB)
+├── ... (720 files)
+Total: 720 files × 5MB = 3.6GB
+```
+
+**After compaction:**
+```
+default/cpu/2025/10/08/14/
+└── cpu_20251008_14_compacted.parquet  (512MB, ZSTD)
+
+1 file, 85% compression → Query speed: 37× faster!
+```
+
+### Compaction Configuration
+
+```toml
+[compaction]
+enabled = true
+min_age_hours = 1              # Don't compact current hour
+min_files = 10                 # Minimum files to trigger compaction
+target_file_size_mb = 512      # Target compacted file size
+schedule = "5 * * * *"         # Every hour at :05
+max_concurrent_jobs = 2        # Parallel compaction jobs
+compression = "zstd"           # Better compression than Snappy
+compression_level = 3          # Balanced speed vs size
+```
+
+### Compaction Features
+
+**Per-Database:**
+- Each database is compacted independently
+- Compaction jobs are scoped to database namespace
+- Locks include database prefix (parallel across databases)
+
+**Crash-Safe:**
+- SQLite-based distributed locking
+- Locks expire after 2 hours (automatic recovery)
+- Failed jobs are logged and retried next cycle
+
+**Query-Friendly:**
+- Queries work during compaction (non-blocking)
+- Late-arriving data creates side-files (seamless for DuckDB)
+- Compacted files include time-ordering for better compression
+
+**Monitoring:**
+```bash
+# Check compaction status
+GET /api/compaction/status
+
+# View recent jobs
+GET /api/compaction/stats
+
+# Manually trigger compaction
+POST /api/compaction/trigger
+```
+
+See [docs/COMPACTION.md](docs/COMPACTION.md) for complete documentation.
 
 ## Schema Management
 
@@ -390,11 +687,15 @@ async def write_with_redundancy(data):
     )
 ```
 
+**Implemented improvements:**
+- ✅ Write-Ahead Log (WAL) for zero data loss
+- ✅ Multi-database architecture for data isolation
+- ✅ Automatic compaction for query optimization
+
 **Future improvements** (roadmap):
-- [ ] Write-Ahead Log (WAL) to local disk
-- [ ] Synchronous write mode (`durability=strict`)
 - [ ] Native clustering with replication
 - [ ] Kafka/Pulsar integration for guaranteed delivery
+- [ ] Real-time streaming queries
 
 ## Performance Tuning
 
@@ -499,15 +800,21 @@ Before deploying Arc to production:
 
 ## Future Architecture
 
-Planned improvements for future releases:
+### Implemented Features (Current Release)
 
-- **Write-Ahead Log (WAL)**: Persist data to disk before buffering
-- **Compaction**: Merge small files into larger ones
+- ✅ **Write-Ahead Log (WAL)**: Optional zero data loss with fdatasync/fsync
+- ✅ **Multi-Database Architecture**: Data isolation and multi-tenancy support
+- ✅ **Automatic Compaction**: Merge small files for 37× faster queries
+
+### Planned Improvements (Roadmap)
+
 - **Clustering**: Multi-node deployments with load balancing
 - **Hot/Cold tiering**: SSD for recent data, S3 Glacier for archives
 - **Materialized views**: Pre-aggregated queries for dashboards
 - **Secondary indexes**: Faster non-time queries
-- **Streaming queries**: Real-time aggregations
+- **Streaming queries**: Real-time aggregations with subscriptions
+- **Native replication**: Multi-region data redundancy
+- **Query federation**: Cross-instance distributed queries
 
 ---
 

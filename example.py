@@ -1,20 +1,25 @@
 """
-Complete Arc example: Write data, then query it
+Complete Arc example: Write data, then query it (with multi-database support)
 """
 import msgpack
 import requests
 from datetime import datetime
 import os
 
+# Configuration
+DATABASE = os.getenv("ARC_DATABASE", "default")  # Database to use (default, production, staging, etc.)
+
 # Get or create API token
 token = os.getenv("ARC_TOKEN")
 if not token:
     from api.auth import AuthManager
-    auth = AuthManager(db_path='./data/historian.db')
+    auth = AuthManager(db_path='./data/arc.db')
     token = auth.create_token(name='example', description='Complete example')
     print(f"✓ Token created: {token}")
     print(f"  Save it: export ARC_TOKEN='{token}'")
     print()
+
+print(f"Using database: {DATABASE}")
 
 print("=" * 60)
 print("STEP 1: Writing data...")
@@ -46,12 +51,13 @@ data = {
     ]
 }
 
-# Write via MessagePack
+# Write via MessagePack (with database specification)
 response = requests.post(
     "http://localhost:8000/write/v2/msgpack",
     headers={
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/msgpack"
+        "Content-Type": "application/msgpack",
+        "x-arc-database": DATABASE  # Specify which database to write to
     },
     data=msgpack.packb(data)
 )
@@ -121,8 +127,25 @@ if data.get('success'):
     for row in data['data']:
         print(f"   {row}")
 
-# Query 4: List all measurements
-print("\n4. Show all measurements (tables):")
+# Query 4: Show databases
+print("\n4. Show all databases:")
+response = requests.post(
+    "http://localhost:8000/query",
+    headers={"Authorization": f"Bearer {token}"},
+    json={
+        "sql": "SHOW DATABASES",
+        "format": "json"
+    }
+)
+
+data = response.json()
+if data.get('success'):
+    print(f"   ✓ Found {data['row_count']} databases")
+    for row in data['data']:
+        print(f"   - {row[0]}")
+
+# Query 5: List all measurements in current database
+print("\n5. Show all measurements (tables) in current database:")
 response = requests.post(
     "http://localhost:8000/query",
     headers={"Authorization": f"Bearer {token}"},
@@ -136,9 +159,35 @@ data = response.json()
 if data.get('success'):
     print(f"   ✓ Found {data['row_count']} tables")
     for row in data['data']:
-        print(f"   - {row[0]}")
+        # SHOW TABLES returns: database, table_name, storage_path, file_count, total_size_mb
+        if len(row) >= 2:
+            print(f"   - Database: {row[0]}, Table: {row[1]}")
+
+# Query 6: Cross-database query example (if multiple databases exist)
+print("\n6. Example: Query specific database:")
+print("   (Syntax: SELECT * FROM database.table)")
+response = requests.post(
+    "http://localhost:8000/query",
+    headers={"Authorization": f"Bearer {token}"},
+    json={
+        "sql": f"SELECT * FROM {DATABASE}.cpu LIMIT 5",
+        "format": "json"
+    }
+)
+
+data = response.json()
+if data.get('success'):
+    print(f"   ✓ Found {data['row_count']} rows from {DATABASE}.cpu")
+    for row in data['data'][:3]:
+        print(f"   {row}")
 
 print()
 print("=" * 60)
 print("✓ Example complete!")
 print("=" * 60)
+print()
+print("Tips:")
+print("  - Use different databases: export ARC_DATABASE=production")
+print("  - Query across databases: SELECT * FROM production.cpu")
+print("  - List databases: SHOW DATABASES")
+print("  - List tables: SHOW TABLES")

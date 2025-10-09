@@ -161,6 +161,13 @@ class ParquetBuffer:
         del self.buffer_start_times[measurement]
 
         try:
+            # Check if records have a database override
+            database_override = None
+            if records and '_database' in records[0]:
+                database_override = records[0]['_database']
+                # Remove _database from all records before writing to parquet
+                records = [{k: v for k, v in record.items() if k != '_database'} for record in records]
+
             # Convert to DataFrame
             df = pl.DataFrame(records)
 
@@ -179,6 +186,7 @@ class ParquetBuffer:
             filename = f"{measurement}_{timestamp_str}_{len(records)}.parquet"
 
             # Partition path by date and hour (PHASE 2: Hour-level partitioning)
+            # Storage backend will add database prefix
             date_partition = min_time.strftime('%Y/%m/%d/%H')
             remote_path = f"{measurement}/{date_partition}/{filename}"
 
@@ -195,8 +203,8 @@ class ParquetBuffer:
                     use_pyarrow=True  # Better Parquet writer
                 )
 
-                # Upload to storage
-                await self.storage_backend.upload_file(tmp_path, remote_path)
+                # Upload to storage (with optional database override)
+                await self.storage_backend.upload_file(tmp_path, remote_path, database_override=database_override)
 
                 self.total_records_written += len(records)
                 self.total_flushes += 1

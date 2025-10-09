@@ -332,11 +332,11 @@ async def export_http_json_data(
         # Create storage backend
         from storage.minio_backend import MinIOBackend
         storage = MinIOBackend(
-            endpoint=storage_conn['endpoint'],
+            endpoint_url=storage_conn['endpoint'],
             access_key=storage_conn['access_key'],
             secret_key=storage_conn['secret_key'],
             bucket=storage_conn['bucket'],
-            secure=storage_conn.get('ssl', False)
+            database=storage_conn.get('database', 'default')
         )
 
         # Export to temporary local file first

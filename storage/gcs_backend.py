@@ -13,12 +13,12 @@ import logging
 logger = logging.getLogger(__name__)
 
 class GCSBackend:
-    def __init__(self, bucket: str, prefix: str = "historian/", 
+    def __init__(self, bucket: str, database: str = "default",
                  project_id: str = None, credentials_json: str = None,
-                 credentials_file: str = None, hmac_key_id: str = None, 
+                 credentials_file: str = None, hmac_key_id: str = None,
                  hmac_secret: str = None):
         self.bucket_name = bucket
-        self.prefix = prefix.rstrip('/') + '/' if prefix.strip() else ''
+        self.database = database
         self.project_id = project_id
         
         # Store credentials for DuckDB configuration
@@ -30,8 +30,8 @@ class GCSBackend:
         # Initialize GCS client
         self.client = self._initialize_client()
         self.bucket = self.client.bucket(self.bucket_name)
-        
-        logger.info(f"GCS Backend initialized: gs://{self.bucket_name}/{self.prefix}")
+
+        logger.info(f"GCS Backend initialized: gs://{self.bucket_name}/{self.database}")
     
     def _initialize_client(self):
         """Initialize GCS client with proper authentication"""
@@ -77,14 +77,14 @@ class GCSBackend:
                     "success": False,
                     "error": f"Bucket '{self.bucket_name}' does not exist or is not accessible"
                 }
-            
+
             # Try to list objects (with limit to avoid large responses)
-            blobs = list(self.client.list_blobs(self.bucket_name, prefix=self.prefix, max_results=1))
-            
+            blobs = list(self.client.list_blobs(self.bucket_name, prefix=f"{self.database}/", max_results=1))
+
             return {
                 "success": True,
                 "bucket": self.bucket_name,
-                "prefix": self.prefix,
+                "database": self.database,
                 "project": self.client.project,
                 "message": f"Successfully connected to GCS bucket gs://{self.bucket_name}"
             }
@@ -99,12 +99,12 @@ class GCSBackend:
     async def upload_file(self, local_path: Path, remote_path: str) -> bool:
         """Upload a file to GCS"""
         try:
-            blob_name = f"{self.prefix}{remote_path}"
+            blob_name = f"{self.database}/{remote_path}"
             blob = self.bucket.blob(blob_name)
-            
+
             # Upload file
             blob.upload_from_filename(str(local_path))
-            
+
             logger.debug(f"Uploaded {local_path} to gs://{self.bucket_name}/{blob_name}")
             return True
             
@@ -150,7 +150,7 @@ class GCSBackend:
             gcs_key = str(relative_path)
             
             logger.info(f"Uploading {file_path} as {gcs_key}")
-            logger.info(f"Upload key: {gcs_key} -> full key: {self.prefix}{gcs_key}")
+            logger.info(f"Upload key: {gcs_key} -> full key: {self.database}/{gcs_key}")
             
             task = self.upload_file(file_path, gcs_key)
             tasks.append(task)
@@ -172,16 +172,16 @@ class GCSBackend:
     async def download_file(self, remote_path: str, local_path: Path) -> bool:
         """Download a file from GCS"""
         try:
-            blob_name = f"{self.prefix}{remote_path}"
+            blob_name = f"{self.database}/{remote_path}"
             blob = self.bucket.blob(blob_name)
-            
+
             if not blob.exists():
                 logger.warning(f"File gs://{self.bucket_name}/{blob_name} does not exist")
                 return False
-            
+
             # Download file
             blob.download_to_filename(str(local_path))
-            
+
             logger.debug(f"Downloaded gs://{self.bucket_name}/{blob_name} to {local_path}")
             return True
             
@@ -192,21 +192,22 @@ class GCSBackend:
     async def list_files(self, path: str = "", pattern: str = "*") -> List[str]:
         """List files in GCS with optional pattern matching"""
         try:
-            prefix = f"{self.prefix}{path}".rstrip('/')
+            prefix = f"{self.database}/{path}".rstrip('/')
             if prefix and not prefix.endswith('/'):
                 prefix += '/'
-            
+
             blobs = self.client.list_blobs(self.bucket_name, prefix=prefix)
-            
+
             files = []
+            db_prefix = f"{self.database}/"
             for blob in blobs:
-                # Remove the prefix to get relative path
-                relative_path = blob.name[len(self.prefix):] if blob.name.startswith(self.prefix) else blob.name
-                
+                # Remove the database prefix to get relative path
+                relative_path = blob.name[len(db_prefix):] if blob.name.startswith(db_prefix) else blob.name
+
                 # Simple pattern matching (basic wildcard support)
                 if pattern == "*" or pattern in relative_path:
                     files.append(relative_path)
-            
+
             return sorted(files)
             
         except Exception as e:
@@ -216,9 +217,9 @@ class GCSBackend:
     async def delete_file(self, remote_path: str) -> bool:
         """Delete a file from GCS"""
         try:
-            blob_name = f"{self.prefix}{remote_path}"
+            blob_name = f"{self.database}/{remote_path}"
             blob = self.bucket.blob(blob_name)
-            
+
             if blob.exists():
                 blob.delete()
                 logger.debug(f"Deleted gs://{self.bucket_name}/{blob_name}")
@@ -234,17 +235,17 @@ class GCSBackend:
     def get_s3_compatible_config(self) -> Dict[str, str]:
         """
         Get DuckDB configuration for GCS access.
-        Note: DuckDB doesn't have native GCS support, but we can use HTTPFS 
+        Note: DuckDB doesn't have native GCS support, but we can use HTTPFS
         with signed URLs or export to S3-compatible interface if available.
         """
         logger.warning("DuckDB doesn't have native GCS support. Consider using GCS's S3-compatible interface or signed URLs.")
-        
+
         # For now, return empty config - this would need to be implemented
         # based on specific requirements (signed URLs, S3-compatible interface, etc.)
         return {
             "provider": "gcs",
             "bucket": self.bucket_name,
-            "prefix": self.prefix,
+            "database": self.database,
             "project_id": self.project_id or self.client.project,
             "note": "GCS access via DuckDB requires additional configuration"
         }
@@ -253,9 +254,9 @@ class GCSBackend:
         """Generate a signed URL for accessing a GCS object via HTTPS"""
         try:
             from datetime import timedelta
-            blob_name = f"{self.prefix}{blob_path}"
+            blob_name = f"{self.database}/{blob_path}"
             blob = self.bucket.blob(blob_name)
-            
+
             # Generate signed URL valid for specified time
             signed_url = blob.generate_signed_url(
                 expiration=timedelta(minutes=expiration_minutes),
@@ -333,14 +334,17 @@ class GCSBackend:
         """
         Get a DuckDB-compatible URL pattern for querying GCS data.
         Returns native gs:// URLs that work with DuckDB's GCS support.
+        Path structure: gs://{bucket}/{database}/{measurement}/{year}/{month}/{day}/{hour}/file.parquet
         """
         # Use native gs:// URLs with DuckDB's GCS support
-        gs_url = f"gs://{self.bucket_name}/{self.prefix}{path_pattern}"
+        gs_url = f"gs://{self.bucket_name}/{self.database}/{path_pattern}"
         return f"'{gs_url}'"
     
     def get_gs_url(self, path: str = "") -> str:
-        """Get the GCS URL for a path"""
-        return f"gs://{self.bucket_name}/{self.prefix}{path}".rstrip('/')
-    
+        """Get the GCS URL for a path within the database"""
+        if path:
+            return f"gs://{self.bucket_name}/{self.database}/{path}".rstrip('/')
+        return f"gs://{self.bucket_name}/{self.database}".rstrip('/')
+
     def __str__(self):
-        return f"GCSBackend(bucket=gs://{self.bucket_name}, prefix={self.prefix})"
+        return f"GCSBackend(bucket=gs://{self.bucket_name}, database={self.database})"

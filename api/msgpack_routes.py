@@ -28,21 +28,41 @@ def init_arrow_buffer(storage_backend, config: dict = None):
 
     Args:
         storage_backend: Storage backend instance
-        config: Configuration dict with buffer settings
+        config: Configuration dict with buffer settings (including WAL config)
     """
     global arrow_buffer
 
     config = config or {}
+
+    # Get WAL configuration from config
+    wal_enabled = config.get('wal_enabled', False)
+    wal_config = config.get('wal_config')
+
+    # Prepare WAL config dict if enabled
+    wal_init_config = None
+    if wal_enabled and wal_config:
+        import os
+        worker_id = os.getpid()  # Use process ID as worker ID
+        wal_init_config = {
+            'wal_dir': wal_config.get('dir', './data/wal'),
+            'worker_id': worker_id,
+            'sync_mode': wal_config.get('sync_mode', 'fdatasync'),
+            'max_size_mb': wal_config.get('max_size_mb', 100),
+            'max_age_seconds': wal_config.get('max_age_seconds', 3600)
+        }
+
     arrow_buffer = ArrowParquetBuffer(
         storage_backend=storage_backend,
         max_buffer_size=config.get('max_buffer_size', 10000),
         max_buffer_age_seconds=config.get('max_buffer_age_seconds', 60),
-        compression=config.get('compression', 'snappy')
+        compression=config.get('compression', 'snappy'),
+        wal_enabled=wal_enabled,
+        wal_config=wal_init_config
     )
 
     logger.info(
         "ArrowParquetBuffer initialized for MessagePack binary protocol "
-        f"(Direct Arrow, zero-copy)"
+        f"(Direct Arrow, zero-copy, WAL={'enabled' if wal_enabled else 'disabled'})"
     )
     return arrow_buffer
 
@@ -64,6 +84,7 @@ async def stop_arrow_buffer():
 async def write_msgpack(
     request: Request,
     content_encoding: Optional[str] = Header(None, alias="Content-Encoding"),
+    x_arc_database: Optional[str] = Header(None, alias="x-arc-database"),
 ):
     """
     Arc Binary Protocol v2 - MessagePack Write Endpoint
@@ -134,6 +155,11 @@ async def write_msgpack(
 
         if not records:
             raise HTTPException(status_code=400, detail="No records in payload")
+
+        # Inject database into records if specified via header
+        if x_arc_database:
+            for record in records:
+                record['_database'] = x_arc_database
 
         # Write to Arrow buffer (Direct Arrow/Parquet, no DataFrame)
         if arrow_buffer is None:

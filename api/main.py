@@ -59,6 +59,8 @@ from api.line_protocol_routes import router as line_protocol_router
 from api.line_protocol_routes import init_parquet_buffer, start_parquet_buffer, stop_parquet_buffer
 from api.msgpack_routes import router as msgpack_router
 from api.msgpack_routes import init_arrow_buffer, start_arrow_buffer, stop_arrow_buffer
+from api.wal_routes import router as wal_router
+from api.compaction_routes import router as compaction_router, init_compaction
 from api.query_cache import init_query_cache, get_query_cache
 
 # Setup structured logging
@@ -157,6 +159,8 @@ app.middleware("http")(AuthMiddleware(auth_manager, enabled=AUTH_ENABLED, allowl
 app.include_router(http_json_router)
 app.include_router(line_protocol_router)
 app.include_router(msgpack_router)
+app.include_router(wal_router)
+app.include_router(compaction_router)
 
 # Global query engine, connection manager, and scheduler
 query_engine: Optional[DuckDBEngine] = None
@@ -181,7 +185,7 @@ async def reinitialize_query_engine():
         s3_backend = S3Backend(
             bucket=active_storage['bucket'],
             region=active_storage.get('region', 'us-east-1'),
-            prefix=active_storage.get('prefix', ''),
+            database=active_storage.get('database', 'default'),
             access_key=active_storage.get('access_key'),
             secret_key=active_storage.get('secret_key'),
             use_directory_bucket=active_storage.get('use_directory_bucket', False),
@@ -200,7 +204,7 @@ async def reinitialize_query_engine():
             access_key=active_storage['access_key'],
             secret_key=active_storage['secret_key'],
             bucket=active_storage['bucket'],
-            prefix=active_storage.get('prefix', '')
+            database=active_storage.get('database', 'default')
         )
         query_engine = DuckDBEngine(
             storage_backend="minio",
@@ -216,7 +220,7 @@ async def reinitialize_query_engine():
             secret_key=active_storage['secret_key'],
             bucket=active_storage['bucket'],
             region=active_storage.get('region', 'us-east-1'),
-            prefix=active_storage.get('prefix', '')
+            database=active_storage.get('database', 'default')
         )
         query_engine = DuckDBEngine(
             storage_backend="ceph",
@@ -228,7 +232,7 @@ async def reinitialize_query_engine():
         from storage.gcs_backend import GCSBackend
         gcs_backend = GCSBackend(
             bucket=active_storage['bucket'],
-            prefix=active_storage.get('prefix', ''),
+            database=active_storage.get('database', 'default'),
             project_id=active_storage.get('project_id'),
             credentials_json=active_storage.get('credentials_json'),
             credentials_file=active_storage.get('credentials_file'),
@@ -252,7 +256,7 @@ async def reinitialize_query_engine():
         from storage.local_backend import LocalBackend
         local_backend = LocalBackend(
             bucket=active_storage["bucket"],
-            prefix=active_storage.get('prefix', '')
+            database=active_storage.get('database', 'default')
         )
         query_engine = DuckDBEngine(
             storage_backend="local",
@@ -291,7 +295,7 @@ async def startup_event():
                     'access_key': os.getenv('MINIO_ACCESS_KEY', 'minioadmin'),
                     'secret_key': os.getenv('MINIO_SECRET_KEY', 'minioadmin'),
                     'bucket': os.getenv('MINIO_BUCKET', 'historian'),
-                    'prefix': os.getenv('MINIO_PREFIX', ''),
+                    'database': os.getenv('STORAGE_DATABASE', 'default'),
                     'is_active': True
                 }
                 logger.info(f"Creating storage connection: {connection_config['name']} at {connection_config['endpoint']}")
@@ -301,11 +305,17 @@ async def startup_event():
 
                 # Refresh active_storage after creating
                 active_storage = connection_manager.get_active_storage_connection()
-                logger.info(f"Active storage after creation: {active_storage is not None}")
             except Exception as e:
-                import traceback
-                logger.error(f"Failed to auto-create MinIO connection: {e}")
-                logger.error(f"Traceback: {traceback.format_exc()}")
+                # Race condition: another worker already created the connection
+                # This is expected in multi-worker setups
+                if "UNIQUE constraint failed" in str(e):
+                    logger.debug("MinIO connection already created by another worker")
+                    # Refresh active_storage - should exist now
+                    active_storage = connection_manager.get_active_storage_connection()
+                else:
+                    import traceback
+                    logger.error(f"Failed to auto-create MinIO connection: {e}")
+                    logger.error(f"Traceback: {traceback.format_exc()}")
         else:
             logger.warning(f"Cannot auto-create storage: backend={storage_backend_env}, has_endpoint={bool(os.getenv('MINIO_ENDPOINT'))}")
 
@@ -335,7 +345,7 @@ async def startup_event():
             storage_backend = S3Backend(
                 bucket=active_storage['bucket'],
                 region=active_storage.get('region', 'us-east-1'),
-                prefix=active_storage.get('prefix', ''),
+                database=active_storage.get('database', 'default'),
                 access_key=active_storage.get('access_key'),
                 secret_key=active_storage.get('secret_key')
             )
@@ -346,13 +356,13 @@ async def startup_event():
                 access_key=active_storage['access_key'],
                 secret_key=active_storage['secret_key'],
                 bucket=active_storage['bucket'],
-                prefix=active_storage.get('prefix', '')
+                database=active_storage.get('database', 'default')
             )
         elif active_storage['backend'] == 'gcs':
             from storage.gcs_backend import GCSBackend
             storage_backend = GCSBackend(
                 bucket=active_storage['bucket'],
-                prefix=active_storage.get('prefix', ''),
+                database=active_storage.get('database', 'default'),
                 project_id=active_storage.get('project_id'),
                 credentials_json=active_storage.get('credentials_json'),
                 credentials_file=active_storage.get('credentials_file'),
@@ -367,22 +377,29 @@ async def startup_event():
                 secret_key=active_storage['secret_key'],
                 bucket=active_storage['bucket'],
                 region=active_storage.get('region', 'us-east-1'),
-                prefix=active_storage.get('prefix', '')
+                database=active_storage.get('database', 'default')
             )
         elif active_storage['backend'] == 'local':
             from storage.local_backend import LocalBackend
             storage_backend = LocalBackend(
                 bucket=active_storage["bucket"],
-                prefix=active_storage.get('prefix', '')
+                database=active_storage.get('database', 'default')
             )
 
         if storage_backend:
+            # Get WAL configuration from config loader
+            from config_loader import get_config
+            arc_config = get_config()
+            wal_config = arc_config.get_wal_config()
+
             # Initialize parquet buffer with configuration
             # Optimized for high throughput: larger buffers, reduce flush overhead
             buffer_config = {
                 'max_buffer_size': int(os.getenv('WRITE_BUFFER_SIZE', '50000')),  # Larger = less flush overhead
                 'max_buffer_age_seconds': int(os.getenv('WRITE_BUFFER_AGE', '5')),  # Fast timeout to avoid blocking
-                'compression': os.getenv('WRITE_COMPRESSION', 'snappy')
+                'compression': os.getenv('WRITE_COMPRESSION', 'snappy'),
+                'wal_enabled': wal_config.get('enabled', False),
+                'wal_config': wal_config
             }
             init_parquet_buffer(storage_backend, buffer_config)
             await start_parquet_buffer()
@@ -392,6 +409,50 @@ async def startup_event():
             init_arrow_buffer(storage_backend, buffer_config)
             await start_arrow_buffer()
             logger.info("MessagePack binary protocol write service initialized (Direct Arrow)")
+
+            # Initialize compaction
+            compaction_config = arc_config.get_compaction_config()
+            if compaction_config.get('enabled', True):
+                from api.database import CompactionLock
+                from storage.compaction import CompactionManager
+                from storage.compaction_scheduler import CompactionScheduler
+
+                # Initialize compaction lock
+                compaction_lock = CompactionLock()
+
+                # Initialize compaction manager
+                compaction_manager = CompactionManager(
+                    storage_backend=storage_backend,
+                    lock_manager=compaction_lock,
+                    database=getattr(storage_backend, 'database', 'default'),
+                    min_age_hours=compaction_config.get('min_age_hours', 1),
+                    min_files=compaction_config.get('min_files', 10),
+                    target_size_mb=compaction_config.get('target_file_size_mb', 512),
+                    max_concurrent=compaction_config.get('max_concurrent_jobs', 2)
+                )
+
+                # Initialize compaction scheduler
+                compaction_scheduler = CompactionScheduler(
+                    compaction_manager=compaction_manager,
+                    schedule=compaction_config.get('schedule', '5 * * * *'),
+                    enabled=True
+                )
+
+                # Register with API routes
+                init_compaction(compaction_manager, compaction_scheduler)
+
+                # Start scheduler
+                await compaction_scheduler.start()
+
+                logger.info(
+                    f"Compaction initialized: "
+                    f"schedule='{compaction_config.get('schedule')}', "
+                    f"min_files={compaction_config.get('min_files')}, "
+                    f"target_size={compaction_config.get('target_file_size_mb')}MB"
+                )
+            else:
+                logger.info("Compaction is disabled")
+
     else:
         logger.warning("No active storage backend - line protocol writes disabled")
     logger.info("Metrics collection started")
@@ -408,15 +469,26 @@ async def startup_event():
     if AUTH_ENABLED:
         initial_token = auth_manager.ensure_initial_token()
         if initial_token:
-            logger.warning("=" * 70)
-            logger.warning("FIRST RUN - INITIAL ADMIN TOKEN GENERATED")
-            logger.warning("=" * 70)
-            logger.warning(f"Initial admin API token: {initial_token}")
-            logger.warning("=" * 70)
-            logger.warning("SAVE THIS TOKEN! It will not be shown again.")
-            logger.warning("Use this token to login to the web UI or API.")
-            logger.warning("You can create additional tokens after logging in.")
-            logger.warning("=" * 70)
+            # ANSI color codes for terminal output
+            CYAN = '\033[96m'
+            YELLOW = '\033[93m'
+            BOLD = '\033[1m'
+            RESET = '\033[0m'
+
+            # Print colorized token message to console (bypasses structured logging)
+            import sys
+            print(f"\n{CYAN}{'=' * 70}{RESET}", file=sys.stderr)
+            print(f"{CYAN}{BOLD}FIRST RUN - INITIAL ADMIN TOKEN GENERATED{RESET}", file=sys.stderr)
+            print(f"{CYAN}{'=' * 70}{RESET}", file=sys.stderr)
+            print(f"{YELLOW}{BOLD}Initial admin API token: {initial_token}{RESET}", file=sys.stderr)
+            print(f"{CYAN}{'=' * 70}{RESET}", file=sys.stderr)
+            print(f"{CYAN}SAVE THIS TOKEN! It will not be shown again.{RESET}", file=sys.stderr)
+            print(f"{CYAN}Use this token to login to the web UI or API.{RESET}", file=sys.stderr)
+            print(f"{CYAN}You can create additional tokens after logging in.{RESET}", file=sys.stderr)
+            print(f"{CYAN}{'=' * 70}{RESET}\n", file=sys.stderr)
+
+            # Also log to structured logs
+            logger.warning(f"Initial admin API token generated: {initial_token[:8]}...")
         else:
             logger.info("Auth is ENABLED; endpoints require a valid API token")
     else:
@@ -444,6 +516,15 @@ async def shutdown_event():
     # Stop MessagePack Arrow buffer
     await stop_arrow_buffer()
     logger.info("MessagePack binary protocol write service stopped")
+
+    # Stop compaction scheduler
+    try:
+        from api.compaction_routes import compaction_scheduler
+        if compaction_scheduler:
+            await compaction_scheduler.stop()
+            logger.info("Compaction scheduler stopped")
+    except Exception as e:
+        logger.warning(f"Could not stop compaction scheduler: {e}")
 
 
 @app.get("/health", response_model=HealthResponse)

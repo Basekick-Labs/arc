@@ -1,7 +1,8 @@
 import sqlite3
 import json
+import os
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import logging
 from datetime import datetime
 from .connection_pool import get_sqlite_pool, initialize_pools
@@ -53,7 +54,7 @@ class ConnectionManager:
                         access_key TEXT,        -- For S3/MinIO (optional for GCS)
                         secret_key TEXT,        -- For S3/MinIO (optional for GCS)
                         bucket TEXT NOT NULL,
-                        prefix TEXT DEFAULT '',
+                        database TEXT DEFAULT 'default',
                         region TEXT DEFAULT 'us-east-1',
                         ssl BOOLEAN DEFAULT FALSE,
                         use_directory_bucket BOOLEAN DEFAULT FALSE,  -- For S3 Directory Buckets
@@ -112,8 +113,30 @@ class ConnectionManager:
                     cursor.execute('ALTER TABLE influx_connections ADD COLUMN database TEXT')
                 except sqlite3.OperationalError:
                     pass  # Column already exists
-                
-                
+
+                # Migrate from 'prefix' to 'database' column
+                try:
+                    # Check if 'prefix' column exists
+                    cursor.execute("PRAGMA table_info(storage_connections)")
+                    columns = [row[1] for row in cursor.fetchall()]
+
+                    if 'prefix' in columns and 'database' not in columns:
+                        # Add database column and copy values from prefix
+                        cursor.execute('ALTER TABLE storage_connections ADD COLUMN database TEXT DEFAULT "default"')
+                        # Update database column with prefix values (remove trailing slashes)
+                        cursor.execute('''UPDATE storage_connections
+                                         SET database = CASE
+                                             WHEN prefix = '' OR prefix IS NULL THEN 'default'
+                                             ELSE TRIM(prefix, '/')
+                                         END''')
+                        logger.info("Migrated 'prefix' column to 'database' column in storage_connections")
+                    elif 'database' not in columns:
+                        # Just add the database column if it doesn't exist
+                        cursor.execute('ALTER TABLE storage_connections ADD COLUMN database TEXT DEFAULT "default"')
+                except sqlite3.OperationalError as e:
+                    logger.warning(f"Storage connections database column migration: {e}")
+                    pass  # Column already exists or other error
+
                 conn.commit()
                 
             logger.info(f"Database initialized at {self.db_path}")
@@ -174,8 +197,8 @@ class ConnectionManager:
                 cursor.execute('UPDATE storage_connections SET is_active = FALSE')
             
             cursor.execute('''
-                INSERT INTO storage_connections 
-                (name, backend, endpoint, access_key, secret_key, bucket, prefix, region, ssl, 
+                INSERT INTO storage_connections
+                (name, backend, endpoint, access_key, secret_key, bucket, database, region, ssl,
                  use_directory_bucket, availability_zone, project_id, credentials_json, credentials_file,
                  hmac_key_id, hmac_secret, is_active)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -186,7 +209,7 @@ class ConnectionManager:
                 connection_data.get('access_key'),  # Optional for GCS
                 connection_data.get('secret_key'),  # Optional for GCS
                 connection_data['bucket'],
-                connection_data.get('prefix', ''),
+                connection_data.get('database', 'default'),
                 connection_data.get('region', 'us-east-1'),
                 connection_data.get('ssl', False),
                 connection_data.get('use_directory_bucket', False),
@@ -503,7 +526,7 @@ class ConnectionManager:
                 from storage.gcs_backend import GCSBackend
                 gcs_backend = GCSBackend(
                     bucket=connection_data['bucket'],
-                    prefix=connection_data.get('prefix', ''),
+                    database=connection_data.get('database', 'default'),
                     project_id=connection_data.get('project_id'),
                     credentials_json=connection_data.get('credentials_json'),
                     credentials_file=connection_data.get('credentials_file'),
@@ -653,7 +676,7 @@ class ConnectionManager:
             cursor.execute('''
                 UPDATE storage_connections SET
                 name = ?, backend = ?, endpoint = ?, access_key = ?, secret_key = ?,
-                bucket = ?, prefix = ?, region = ?, ssl = ?, use_directory_bucket = ?,
+                bucket = ?, database = ?, region = ?, ssl = ?, use_directory_bucket = ?,
                 availability_zone = ?, is_active = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
             ''', (
@@ -663,7 +686,7 @@ class ConnectionManager:
                 connection_data['access_key'],
                 connection_data['secret_key'],
                 connection_data['bucket'],
-                connection_data.get('prefix', ''),
+                connection_data.get('database', 'default'),
                 connection_data.get('region', 'us-east-1'),
                 connection_data.get('ssl', False),
                 connection_data.get('use_directory_bucket', False),
@@ -702,4 +725,219 @@ class ConnectionManager:
     def count_distinct_measurements(self) -> int:
         """Count distinct measurements across export jobs."""
         return len(self.get_existing_measurements())
-    
+
+
+class CompactionLock:
+    """
+    Manages locks for compaction jobs using SQLite.
+    Prevents concurrent compaction of the same partition.
+    """
+
+    def __init__(self, db_path: str = None):
+        """
+        Initialize compaction lock manager
+
+        Args:
+            db_path: Path to SQLite database (defaults to arc.db from config)
+        """
+        if db_path is None:
+            from api.config import get_db_path
+            db_path = get_db_path()
+
+        self.db_path = db_path
+        self._init_table()
+
+    def _init_table(self):
+        """Initialize compaction_locks table"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS compaction_locks (
+                    partition_path TEXT PRIMARY KEY,
+                    worker_id INTEGER NOT NULL,
+                    locked_at TIMESTAMP NOT NULL,
+                    expires_at TIMESTAMP NOT NULL
+                )
+            ''')
+
+            conn.commit()
+            conn.close()
+
+            logger.debug("Compaction locks table initialized")
+
+        except Exception as e:
+            logger.error(f"Failed to initialize compaction_locks table: {e}")
+            raise
+
+    def acquire_lock(self, partition_path: str, ttl_hours: int = 2) -> bool:
+        """
+        Try to acquire lock for a partition
+
+        Args:
+            partition_path: Partition path (e.g., 'cpu/2025/10/08/14')
+            ttl_hours: Lock time-to-live in hours (for crash recovery)
+
+        Returns:
+            True if lock acquired, False otherwise
+        """
+        from datetime import timedelta
+
+        worker_id = os.getpid()
+        now = datetime.now()
+        expires = now + timedelta(hours=ttl_hours)
+
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            # Try to insert lock
+            cursor.execute('''
+                INSERT INTO compaction_locks
+                (partition_path, worker_id, locked_at, expires_at)
+                VALUES (?, ?, ?, ?)
+            ''', (partition_path, worker_id, now, expires))
+
+            conn.commit()
+            conn.close()
+
+            logger.debug(f"Acquired lock for {partition_path} (worker {worker_id})")
+            return True
+
+        except sqlite3.IntegrityError:
+            # Lock already exists, check if expired
+            conn.close()
+            return self._check_and_steal_expired(partition_path, worker_id, ttl_hours)
+
+        except Exception as e:
+            logger.error(f"Failed to acquire lock for {partition_path}: {e}")
+            return False
+
+    def _check_and_steal_expired(
+        self,
+        partition_path: str,
+        worker_id: int,
+        ttl_hours: int
+    ) -> bool:
+        """
+        Check if existing lock is expired and steal it if so
+
+        Args:
+            partition_path: Partition path
+            worker_id: Current worker ID
+            ttl_hours: TTL for new lock
+
+        Returns:
+            True if lock stolen and acquired
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            # Delete expired locks
+            cursor.execute('''
+                DELETE FROM compaction_locks
+                WHERE partition_path = ?
+                AND expires_at < ?
+            ''', (partition_path, datetime.now()))
+
+            deleted = cursor.rowcount
+            conn.commit()
+            conn.close()
+
+            if deleted > 0:
+                logger.info(
+                    f"Stole expired lock for {partition_path}, retrying acquisition"
+                )
+                # Expired lock removed, try to acquire again
+                return self.acquire_lock(partition_path, ttl_hours)
+
+            # Lock not expired
+            logger.debug(f"Lock for {partition_path} is held by another worker")
+            return False
+
+        except Exception as e:
+            logger.error(f"Failed to check/steal expired lock for {partition_path}: {e}")
+            return False
+
+    def release_lock(self, partition_path: str):
+        """
+        Release lock for a partition
+
+        Args:
+            partition_path: Partition path
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                DELETE FROM compaction_locks
+                WHERE partition_path = ?
+            ''', (partition_path,))
+
+            conn.commit()
+            conn.close()
+
+            logger.debug(f"Released lock for {partition_path}")
+
+        except Exception as e:
+            logger.error(f"Failed to release lock for {partition_path}: {e}")
+
+    def get_active_locks(self) -> List[Dict[str, Any]]:
+        """
+        Get all active locks
+
+        Returns:
+            List of lock info dicts
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                SELECT * FROM compaction_locks
+                WHERE expires_at > ?
+                ORDER BY locked_at DESC
+            ''', (datetime.now(),))
+
+            locks = [dict(row) for row in cursor.fetchall()]
+
+            conn.close()
+            return locks
+
+        except Exception as e:
+            logger.error(f"Failed to get active locks: {e}")
+            return []
+
+    def cleanup_expired_locks(self) -> int:
+        """
+        Cleanup all expired locks
+
+        Returns:
+            Number of locks cleaned up
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                DELETE FROM compaction_locks
+                WHERE expires_at < ?
+            ''', (datetime.now(),))
+
+            deleted = cursor.rowcount
+            conn.commit()
+            conn.close()
+
+            if deleted > 0:
+                logger.info(f"Cleaned up {deleted} expired compaction locks")
+
+            return deleted
+
+        except Exception as e:
+            logger.error(f"Failed to cleanup expired locks: {e}")
+            return 0
+

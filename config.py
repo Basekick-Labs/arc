@@ -20,7 +20,7 @@ class StorageConfig(BaseModel):
     backend: str = "local"  # local, s3, minio
     s3_bucket: str = ""
     s3_region: str = "us-east-1"
-    s3_prefix: str = "arc/"
+    database: str = "default"
     # MinIO specific
     minio_endpoint: str = "http://localhost:9000"
     minio_access_key: str = ""
@@ -80,7 +80,7 @@ class ArcConfig(BaseModel):
                 backend=os.getenv("STORAGE_BACKEND", "local"),
                 s3_bucket=os.getenv("S3_BUCKET", ""),
                 s3_region=os.getenv("S3_REGION", "us-east-1"),
-                s3_prefix=os.getenv("S3_PREFIX", "arc/"),
+                database=os.getenv("STORAGE_DATABASE", "default"),
                 minio_endpoint=os.getenv("MINIO_ENDPOINT", "http://localhost:9000"),
                 minio_access_key=os.getenv("MINIO_ACCESS_KEY", ""),
                 minio_secret_key=os.getenv("MINIO_SECRET_KEY", ""),
