@@ -234,12 +234,20 @@ case "$MODE" in
                 MC_BIN="$SCRIPT_DIR/mc"
             fi
 
-            $MC_BIN alias set arc-local http://localhost:9000 minioadmin minioadmin > /dev/null 2>&1
+            if ! $MC_BIN alias set arc-local http://localhost:9000 minioadmin minioadmin > /dev/null 2>&1; then
+                echo -e "${RED}✗ Failed to configure mc client${NC}"
+                echo "Check if mc is installed: which mc"
+                exit 1
+            fi
+
             $MC_BIN mb arc-local/arc --ignore-existing > /dev/null 2>&1 || true
             echo -e "${GREEN}✓ MinIO configured (bucket: arc)${NC}"
         else
             echo -e "${GREEN}✓ MinIO is already running${NC}"
         fi
+
+        echo ""
+        echo -e "${YELLOW}Detecting system configuration...${NC}"
 
         # Auto-detect CPU cores BEFORE sourcing .env
         # Use 1.5-2x cores for I/O-bound workloads (MinIO writes)
@@ -260,15 +268,26 @@ case "$MODE" in
         # Export WORKERS before sourcing .env so it won't be overridden
         export WORKERS
 
+        echo -e "${GREEN}✓ Detected $CORES CPU cores${NC}"
+        echo -e "${GREEN}✓ Using $WORKERS workers (3x cores for I/O optimization)${NC}"
+
         # Start Arc Core
         echo ""
         echo -e "${GREEN}Starting Arc Core API (native mode)...${NC}"
-        echo -e "${GREEN}Auto-detected $WORKERS CPU cores${NC}"
 
         # Load and export environment variables
+        echo -e "${YELLOW}Loading environment configuration...${NC}"
         set -a
         source .env
         set +a
+        echo -e "${GREEN}✓ Environment loaded${NC}"
+
+        # Check if gunicorn is available
+        if ! command -v gunicorn &> /dev/null; then
+            echo -e "${RED}✗ gunicorn not found in virtual environment${NC}"
+            echo "Try: pip install -r requirements.txt"
+            exit 1
+        fi
 
         echo ""
         echo -e "${GREEN}═══════════════════════════════════════${NC}"
@@ -283,14 +302,19 @@ case "$MODE" in
         echo -e "${GREEN}═══════════════════════════════════════${NC}"
         echo ""
 
-        gunicorn -w ${WORKERS} -b ${HOST:-0.0.0.0}:${PORT:-8000} \
+        # Start gunicorn with explicit error handling
+        if ! gunicorn -w ${WORKERS} -b ${HOST:-0.0.0.0}:${PORT:-8000} \
             -k uvicorn.workers.UvicornWorker \
             --timeout ${TIMEOUT:-300} \
             --graceful-timeout 30 \
             --access-logfile /dev/null \
             --error-logfile - \
             --log-level warning \
-            api.main:app
+            api.main:app; then
+            echo -e "${RED}✗ Arc Core failed to start${NC}"
+            echo "Check that all dependencies are installed: pip install -r requirements.txt"
+            exit 1
+        fi
         ;;
 
     stop)
