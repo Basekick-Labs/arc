@@ -104,12 +104,50 @@ case "$MODE" in
             exit 1
         fi
 
+        # Check for build tools on Linux (required for psutil compilation)
+        if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+            echo -e "${YELLOW}Checking system dependencies...${NC}"
+            MISSING_DEPS=()
+
+            if ! command -v gcc &> /dev/null; then
+                MISSING_DEPS+=("gcc")
+            fi
+
+            # Check for python3-dev headers
+            if ! $PYTHON_BIN -c "import sysconfig; print(sysconfig.get_config_var('INCLUDEPY'))" 2>/dev/null | xargs test -d 2>/dev/null; then
+                MISSING_DEPS+=("python3-dev")
+            fi
+
+            if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
+                echo -e "${RED}✗ Missing system dependencies: ${MISSING_DEPS[*]}${NC}"
+                echo ""
+                echo "Install with:"
+                echo -e "${YELLOW}  sudo apt-get update && sudo apt-get install -y gcc python3-dev${NC}"
+                echo ""
+                echo "Or on RHEL/Amazon Linux:"
+                echo -e "${YELLOW}  sudo yum install -y gcc python3-devel${NC}"
+                exit 1
+            fi
+
+            echo -e "${GREEN}✓ System dependencies installed${NC}"
+        fi
+
         cd "$SCRIPT_DIR"
 
         # Create virtual environment if it doesn't exist
         if [ ! -d "venv" ]; then
             echo -e "${YELLOW}Creating virtual environment with $PYTHON_BIN...${NC}"
-            $PYTHON_BIN -m venv venv
+            if ! $PYTHON_BIN -m venv venv; then
+                echo -e "${RED}✗ Failed to create virtual environment${NC}"
+                exit 1
+            fi
+        fi
+
+        # Verify venv was created
+        if [ ! -f "venv/bin/activate" ]; then
+            echo -e "${RED}✗ Virtual environment activation script not found${NC}"
+            echo "venv directory exists but activate script is missing"
+            exit 1
         fi
 
         # Activate and install dependencies

@@ -102,6 +102,8 @@ class ParquetBuffer:
         if not records:
             return
 
+        measurements_to_flush = []
+
         async with self._lock:
             # Group records by measurement
             by_measurement = defaultdict(list)
@@ -120,7 +122,11 @@ class ParquetBuffer:
                 # Check if buffer should be flushed
                 if len(self.buffers[measurement]) >= self.max_buffer_size:
                     logger.debug(f"Buffer for '{measurement}' reached size limit, flushing")
-                    await self._flush_measurement(measurement)
+                    measurements_to_flush.append(measurement)
+
+        # Flush outside the lock to avoid blocking other writers
+        for measurement in measurements_to_flush:
+            await self.flush_measurement_sync(measurement)
 
     async def _periodic_flush(self):
         """Background task that periodically flushes old buffers"""
