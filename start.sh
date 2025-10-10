@@ -80,9 +80,27 @@ case "$MODE" in
         echo -e "${GREEN}Starting Arc Core natively...${NC}"
         echo ""
 
-        # Check Python
-        if ! command -v python3.11 &> /dev/null; then
-            echo -e "${RED}Error: Python 3.11 is not installed${NC}"
+        # Check Python version (>= 3.9 required)
+        PYTHON_BIN=""
+        for py_cmd in python3.13 python3.12 python3.11 python3.10 python3.9 python3; do
+            if command -v $py_cmd &> /dev/null; then
+                # Get version
+                PY_VERSION=$($py_cmd -c 'import sys; print(".".join(map(str, sys.version_info[:2])))')
+                PY_MAJOR=$(echo $PY_VERSION | cut -d. -f1)
+                PY_MINOR=$(echo $PY_VERSION | cut -d. -f2)
+
+                # Check if >= 3.9
+                if [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -ge 9 ]; then
+                    PYTHON_BIN=$py_cmd
+                    echo -e "${GREEN}✓ Found Python $PY_VERSION at $(which $py_cmd)${NC}"
+                    break
+                fi
+            fi
+        done
+
+        if [ -z "$PYTHON_BIN" ]; then
+            echo -e "${RED}Error: Python 3.9 or higher is required${NC}"
+            echo "Please install Python 3.9+ from https://www.python.org/downloads/"
             exit 1
         fi
 
@@ -90,8 +108,8 @@ case "$MODE" in
 
         # Create virtual environment if it doesn't exist
         if [ ! -d "venv" ]; then
-            echo -e "${YELLOW}Creating virtual environment...${NC}"
-            python3.11 -m venv venv
+            echo -e "${YELLOW}Creating virtual environment with $PYTHON_BIN...${NC}"
+            $PYTHON_BIN -m venv venv
         fi
 
         # Activate and install dependencies
