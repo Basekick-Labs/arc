@@ -102,7 +102,7 @@ class ParquetBuffer:
         if not records:
             return
 
-        measurements_to_flush = []
+        records_to_flush = []
 
         async with self._lock:
             # Group records by measurement
@@ -122,17 +122,23 @@ class ParquetBuffer:
                 # Check if buffer should be flushed
                 if len(self.buffers[measurement]) >= self.max_buffer_size:
                     logger.debug(f"Buffer for '{measurement}' reached size limit, flushing")
-                    measurements_to_flush.append(measurement)
+                    # Extract records to flush while holding lock
+                    buffer_records = self.buffers[measurement]
+                    self.buffers[measurement] = []
+                    del self.buffer_start_times[measurement]
+                    records_to_flush.append((measurement, buffer_records))
 
         # Flush outside the lock to avoid blocking other writers
-        for measurement in measurements_to_flush:
-            await self.flush_measurement_sync(measurement)
+        for measurement, buffer_records in records_to_flush:
+            await self._flush_records(measurement, buffer_records)
 
     async def _periodic_flush(self):
         """Background task that periodically flushes old buffers"""
         while self._running:
             try:
                 await asyncio.sleep(5)  # Check every 5 seconds
+
+                records_to_flush = []
 
                 async with self._lock:
                     now = datetime.now(timezone.utc)
@@ -145,7 +151,15 @@ class ParquetBuffer:
 
                     for measurement in measurements_to_flush:
                         logger.debug(f"Buffer for '{measurement}' reached age limit, flushing")
-                        await self._flush_measurement(measurement)
+                        if self.buffers[measurement]:
+                            buffer_records = self.buffers[measurement]
+                            self.buffers[measurement] = []
+                            del self.buffer_start_times[measurement]
+                            records_to_flush.append((measurement, buffer_records))
+
+                # Flush outside the lock
+                for measurement, buffer_records in records_to_flush:
+                    await self._flush_records(measurement, buffer_records)
 
             except asyncio.CancelledError:
                 break
@@ -153,18 +167,14 @@ class ParquetBuffer:
                 logger.error(f"Error in periodic flush: {e}")
                 await asyncio.sleep(5)
 
-    async def _flush_measurement(self, measurement: str):
+    async def _flush_records(self, measurement: str, records: List[Dict[str, Any]]):
         """
-        Flush buffer for a specific measurement
+        Flush records to Parquet without holding lock
 
-        This method should be called while holding self._lock
+        This method is called with records already extracted from the buffer
         """
-        if measurement not in self.buffers or not self.buffers[measurement]:
+        if not records:
             return
-
-        records = self.buffers[measurement]
-        self.buffers[measurement] = []
-        del self.buffer_start_times[measurement]
 
         try:
             # Check if records have a database override
@@ -225,20 +235,53 @@ class ParquetBuffer:
         except Exception as e:
             logger.error(f"Failed to flush measurement '{measurement}': {e}")
             self.total_errors += 1
-            # Re-add records to buffer on error (with limit to prevent infinite growth)
-            if len(self.buffers[measurement]) < self.max_buffer_size * 2:
-                self.buffers[measurement].extend(records)
-                logger.warning(f"Re-added {len(records)} records to buffer after error")
-            else:
-                logger.error(f"Dropping {len(records)} records due to persistent errors")
+
+            # Re-add records to buffer on error (acquire lock to do so safely)
+            async with self._lock:
+                # Only re-add if buffer isn't already too large (prevent infinite growth)
+                if len(self.buffers[measurement]) < self.max_buffer_size * 2:
+                    self.buffers[measurement].extend(records)
+                    # Reset start time for this measurement
+                    if measurement not in self.buffer_start_times:
+                        self.buffer_start_times[measurement] = datetime.now(timezone.utc)
+                    logger.warning(f"Re-added {len(records)} records to buffer after flush error")
+                else:
+                    logger.error(f"Dropping {len(records)} records - buffer for '{measurement}' already at capacity ({len(self.buffers[measurement])} records)")
+                    logger.error(f"This may indicate persistent storage issues. Check MinIO/S3 connectivity.")
+
+    async def _flush_measurement(self, measurement: str):
+        """
+        Flush buffer for a specific measurement
+
+        This method should be called while holding self._lock
+        """
+        if measurement not in self.buffers or not self.buffers[measurement]:
+            return
+
+        records = self.buffers[measurement]
+        self.buffers[measurement] = []
+        del self.buffer_start_times[measurement]
+
+        # Release lock before actual flush
+        await self._flush_records(measurement, records)
 
     async def flush_all(self):
         """Flush all measurement buffers"""
+        records_to_flush = []
+
         async with self._lock:
             measurements = list(self.buffers.keys())
             for measurement in measurements:
                 if self.buffers[measurement]:
-                    await self._flush_measurement(measurement)
+                    buffer_records = self.buffers[measurement]
+                    self.buffers[measurement] = []
+                    if measurement in self.buffer_start_times:
+                        del self.buffer_start_times[measurement]
+                    records_to_flush.append((measurement, buffer_records))
+
+        # Flush outside the lock
+        for measurement, buffer_records in records_to_flush:
+            await self._flush_records(measurement, buffer_records)
 
     async def flush_measurement_sync(self, measurement: str):
         """Explicitly flush a specific measurement (with lock)"""
