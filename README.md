@@ -32,15 +32,16 @@
 
 ## Performance Benchmark 🚀
 
-**Arc achieves 1.89M records/sec with MessagePack binary protocol!**
+**Arc achieves 1.95M records/sec with MessagePack binary protocol!**
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| **Throughput** | **1.89M records/sec** | MessagePack binary protocol |
-| **p50 Latency** | **21ms** | Median response time |
-| **p95 Latency** | **204ms** | 95th percentile |
-| **Success Rate** | **99.9998%** | Production-grade reliability |
-| **vs Line Protocol** | **7.9x faster** | 240K → 1.89M RPS |
+| **Throughput** | **1.95M records/sec** | MessagePack binary protocol |
+| **p50 Latency** | **18.21ms** | Median response time |
+| **p95 Latency** | **184.60ms** | 95th percentile |
+| **p99 Latency** | **395.12ms** | 99th percentile |
+| **Success Rate** | **99.9999%** | Production-grade reliability |
+| **vs Line Protocol** | **7.9x faster** | 240K → 1.95M RPS |
 
 *Tested on Apple M3 Max (14 cores), native deployment with MinIO*
 

@@ -116,6 +116,24 @@ case "$MODE" in
         if ! command -v minio &> /dev/null; then
             echo -e "${YELLOW}MinIO binary not found. Installing...${NC}"
 
+            # Detect architecture
+            ARCH=$(uname -m)
+            case "$ARCH" in
+                x86_64)
+                    MINIO_ARCH="amd64"
+                    ;;
+                aarch64|arm64)
+                    MINIO_ARCH="arm64"
+                    ;;
+                *)
+                    echo -e "${RED}Unsupported architecture: $ARCH${NC}"
+                    echo "Supported: x86_64, aarch64, arm64"
+                    exit 1
+                    ;;
+            esac
+
+            echo -e "${YELLOW}Detected architecture: $ARCH (using $MINIO_ARCH)${NC}"
+
             # Detect OS and install MinIO
             if [[ "$OSTYPE" == "darwin"* ]]; then
                 # macOS
@@ -125,28 +143,55 @@ case "$MODE" in
                 else
                     echo -e "${RED}Homebrew not found. Please install from https://brew.sh${NC}"
                     echo "Or download MinIO manually:"
-                    echo "  wget https://dl.min.io/server/minio/release/darwin-amd64/minio"
+                    echo "  wget https://dl.min.io/server/minio/release/darwin-${MINIO_ARCH}/minio"
                     echo "  chmod +x minio"
                     echo "  sudo mv minio /usr/local/bin/"
                     exit 1
                 fi
-            elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+            elif [[ "$OSTYPE" == "linux-gnu"* ]] || [[ "$OSTYPE" == "linux"* ]]; then
                 # Linux
-                echo -e "${YELLOW}Installing MinIO binary...${NC}"
-                wget -q https://dl.min.io/server/minio/release/linux-amd64/minio -O /tmp/minio
-                chmod +x /tmp/minio
-                sudo mv /tmp/minio /usr/local/bin/ 2>/dev/null || mv /tmp/minio "$SCRIPT_DIR/minio"
+                echo -e "${YELLOW}Installing MinIO binary for linux-${MINIO_ARCH}...${NC}"
 
-                # Install mc (MinIO client)
-                wget -q https://dl.min.io/client/mc/release/linux-amd64/mc -O /tmp/mc
+                # Download MinIO server
+                MINIO_URL="https://dl.min.io/server/minio/release/linux-${MINIO_ARCH}/minio"
+                if ! wget -q "$MINIO_URL" -O /tmp/minio; then
+                    echo -e "${RED}Failed to download MinIO from $MINIO_URL${NC}"
+                    exit 1
+                fi
+                chmod +x /tmp/minio
+
+                # Try to install system-wide, fallback to local
+                if sudo mv /tmp/minio /usr/local/bin/minio 2>/dev/null; then
+                    echo -e "${GREEN}✓ MinIO installed to /usr/local/bin/minio${NC}"
+                else
+                    mv /tmp/minio "$SCRIPT_DIR/minio"
+                    echo -e "${GREEN}✓ MinIO installed to $SCRIPT_DIR/minio${NC}"
+                    export PATH="$SCRIPT_DIR:$PATH"
+                fi
+
+                # Download mc (MinIO client)
+                echo -e "${YELLOW}Installing MinIO client (mc) for linux-${MINIO_ARCH}...${NC}"
+                MC_URL="https://dl.min.io/client/mc/release/linux-${MINIO_ARCH}/mc"
+                if ! wget -q "$MC_URL" -O /tmp/mc; then
+                    echo -e "${RED}Failed to download mc from $MC_URL${NC}"
+                    exit 1
+                fi
                 chmod +x /tmp/mc
-                sudo mv /tmp/mc /usr/local/bin/ 2>/dev/null || mv /tmp/mc "$SCRIPT_DIR/mc"
+
+                # Try to install system-wide, fallback to local
+                if sudo mv /tmp/mc /usr/local/bin/mc 2>/dev/null; then
+                    echo -e "${GREEN}✓ mc installed to /usr/local/bin/mc${NC}"
+                else
+                    mv /tmp/mc "$SCRIPT_DIR/mc"
+                    echo -e "${GREEN}✓ mc installed to $SCRIPT_DIR/mc${NC}"
+                    export PATH="$SCRIPT_DIR:$PATH"
+                fi
             else
                 echo -e "${RED}Unsupported OS: $OSTYPE${NC}"
                 exit 1
             fi
 
-            echo -e "${GREEN}✓ MinIO installed${NC}"
+            echo -e "${GREEN}✓ MinIO installation complete${NC}"
         fi
 
         # Check if MinIO is running
