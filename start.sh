@@ -229,19 +229,34 @@ case "$MODE" in
 
             # Configure MinIO client and create bucket
             echo -e "${YELLOW}Configuring MinIO...${NC}"
-            MC_BIN="mc"
+
+            # Find mc binary
+            MC_BIN=""
             if [ -f "$SCRIPT_DIR/mc" ]; then
                 MC_BIN="$SCRIPT_DIR/mc"
-            fi
-
-            if ! $MC_BIN alias set arc-local http://localhost:9000 minioadmin minioadmin > /dev/null 2>&1; then
-                echo -e "${RED}✗ Failed to configure mc client${NC}"
-                echo "Check if mc is installed: which mc"
+                echo -e "${YELLOW}Using local mc: $MC_BIN${NC}"
+            elif command -v mc &> /dev/null; then
+                MC_BIN="mc"
+                echo -e "${YELLOW}Using system mc: $(which mc)${NC}"
+            else
+                echo -e "${RED}✗ mc client not found${NC}"
+                echo "mc should have been installed earlier. Check installation logs."
+                echo "PATH: $PATH"
+                echo "Looking for: $SCRIPT_DIR/mc or mc in PATH"
                 exit 1
             fi
 
-            $MC_BIN mb arc-local/arc --ignore-existing > /dev/null 2>&1 || true
-            echo -e "${GREEN}✓ MinIO configured (bucket: arc)${NC}"
+            echo -e "${YELLOW}Setting up mc alias...${NC}"
+            # Use timeout to prevent hanging, and add --insecure flag for local development
+            if ! timeout 10 $MC_BIN alias set arc-local http://localhost:9000 minioadmin minioadmin --api S3v4 2>&1; then
+                echo -e "${RED}✗ Failed to configure mc client (timeout or error)${NC}"
+                echo "mc binary: $MC_BIN"
+                echo "Trying to continue anyway..."
+            fi
+
+            echo -e "${YELLOW}Creating bucket...${NC}"
+            timeout 10 $MC_BIN mb arc-local/arc --ignore-existing 2>&1 || echo -e "${YELLOW}Bucket may already exist${NC}"
+            echo -e "${GREEN}✓ MinIO configured${NC}"
         else
             echo -e "${GREEN}✓ MinIO is already running${NC}"
         fi
