@@ -14,7 +14,6 @@ import polars as pl
 from collections import defaultdict
 import tempfile
 import os
-from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +34,7 @@ class ParquetBuffer:
         storage_backend,
         max_buffer_size: int = 10000,
         max_buffer_age_seconds: int = 60,
-        compression: str = 'snappy',
-        max_workers: int = 8
+        compression: str = 'snappy'
     ):
         """
         Initialize buffer
@@ -46,7 +44,6 @@ class ParquetBuffer:
             max_buffer_size: Max records per measurement before flush
             max_buffer_age_seconds: Max seconds before flush
             compression: Parquet compression (snappy, gzip, zstd)
-            max_workers: Thread pool size for Parquet writes (releases GIL)
         """
         self.storage_backend = storage_backend
         self.max_buffer_size = max_buffer_size
@@ -67,9 +64,6 @@ class ParquetBuffer:
         self._flush_task: Optional[asyncio.Task] = None
         self._running = False
         self._lock = asyncio.Lock()
-
-        # Thread pool for CPU-bound Parquet writes (releases GIL)
-        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="parquet-writer")
 
     async def start(self):
         """Start background flush task"""
@@ -96,10 +90,6 @@ class ParquetBuffer:
 
         # Flush all remaining buffers
         await self.flush_all()
-
-        # Shutdown thread pool
-        self._executor.shutdown(wait=True)
-
         logger.info(f"ParquetBuffer stopped. Total records written: {self.total_records_written}")
 
     async def write(self, records: List[Dict[str, Any]]):
@@ -177,55 +167,6 @@ class ParquetBuffer:
                 logger.error(f"Error in periodic flush: {e}")
                 await asyncio.sleep(5)
 
-    def _write_parquet_sync(self, records: List[Dict[str, Any]], measurement: str) -> tuple[str, str, int]:
-        """
-        Synchronous Parquet write (runs in thread pool to release GIL)
-
-        Returns: (tmp_path, remote_path, database_override or None)
-        """
-        # Check if records have a database override
-        database_override = None
-        if records and '_database' in records[0]:
-            database_override = records[0]['_database']
-            # Remove _database from all records before writing to parquet
-            records = [{k: v for k, v in record.items() if k != '_database'} for record in records]
-
-        # Convert to DataFrame
-        df = pl.DataFrame(records)
-
-        # Ensure time column is datetime
-        if 'time' in df.columns:
-            df = df.with_columns(pl.col('time').cast(pl.Datetime))
-
-        # Sort by time
-        df = df.sort('time')
-
-        # Generate filename with timestamp range
-        min_time = df['time'].min()
-        max_time = df['time'].max()
-
-        timestamp_str = min_time.strftime('%Y%m%d_%H%M%S')
-        filename = f"{measurement}_{timestamp_str}_{len(records)}.parquet"
-
-        # Partition path by date and hour (PHASE 2: Hour-level partitioning)
-        # Storage backend will add database prefix
-        date_partition = min_time.strftime('%Y/%m/%d/%H')
-        remote_path = f"{measurement}/{date_partition}/{filename}"
-
-        # Write to temporary file
-        with tempfile.NamedTemporaryFile(mode='wb', suffix='.parquet', delete=False) as tmp_file:
-            tmp_path = tmp_file.name
-
-        # Write Parquet file with statistics enabled (PHASE 1 OPTIMIZATION)
-        df.write_parquet(
-            tmp_path,
-            compression=self.compression,
-            statistics=True,  # Enable min/max stats for query pruning
-            use_pyarrow=True  # Better Parquet writer
-        )
-
-        return tmp_path, remote_path, database_override
-
     async def _flush_records(self, measurement: str, records: List[Dict[str, Any]]):
         """
         Flush records to Parquet without holding lock
@@ -236,16 +177,48 @@ class ParquetBuffer:
             return
 
         try:
-            # Run CPU-bound Parquet write in thread pool (releases GIL)
-            loop = asyncio.get_event_loop()
-            tmp_path, remote_path, database_override = await loop.run_in_executor(
-                self._executor,
-                self._write_parquet_sync,
-                records,
-                measurement
-            )
+            # Check if records have a database override
+            database_override = None
+            if records and '_database' in records[0]:
+                database_override = records[0]['_database']
+                # Remove _database from all records before writing to parquet
+                records = [{k: v for k, v in record.items() if k != '_database'} for record in records]
+
+            # Convert to DataFrame
+            df = pl.DataFrame(records)
+
+            # Ensure time column is datetime
+            if 'time' in df.columns:
+                df = df.with_columns(pl.col('time').cast(pl.Datetime))
+
+            # Sort by time
+            df = df.sort('time')
+
+            # Generate filename with timestamp range
+            min_time = df['time'].min()
+            max_time = df['time'].max()
+
+            timestamp_str = min_time.strftime('%Y%m%d_%H%M%S')
+            filename = f"{measurement}_{timestamp_str}_{len(records)}.parquet"
+
+            # Partition path by date and hour (PHASE 2: Hour-level partitioning)
+            # Storage backend will add database prefix
+            date_partition = min_time.strftime('%Y/%m/%d/%H')
+            remote_path = f"{measurement}/{date_partition}/{filename}"
+
+            # Write to temporary file
+            with tempfile.NamedTemporaryFile(mode='wb', suffix='.parquet', delete=False) as tmp_file:
+                tmp_path = tmp_file.name
 
             try:
+                # Write Parquet file with statistics enabled (PHASE 1 OPTIMIZATION)
+                df.write_parquet(
+                    tmp_path,
+                    compression=self.compression,
+                    statistics=True,  # Enable min/max stats for query pruning
+                    use_pyarrow=True  # Better Parquet writer
+                )
+
                 # Upload to storage (with optional database override)
                 await self.storage_backend.upload_file(tmp_path, remote_path, database_override=database_override)
 
