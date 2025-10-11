@@ -8,7 +8,7 @@ import logging
 import asyncio
 from datetime import datetime
 from typing import Optional
-from croniter import croniter
+from utils.cron_parser import CronExpression
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ class CompactionScheduler:
 
         # Validate cron schedule
         try:
-            croniter(schedule)
+            CronExpression(schedule)
         except Exception as e:
             raise ValueError(f"Invalid cron schedule '{schedule}': {e}")
 
@@ -87,13 +87,13 @@ class CompactionScheduler:
         """
         Main scheduler loop - waits for next scheduled time and triggers compaction
         """
-        cron = croniter(self.schedule, datetime.now())
+        cron = CronExpression(self.schedule)
 
         while self._running:
             try:
                 # Calculate next run time
-                next_run = cron.get_next(datetime)
                 now = datetime.now()
+                next_run = cron.next_execution_time(now)
                 wait_seconds = (next_run - now).total_seconds()
 
                 logger.info(
@@ -148,8 +148,8 @@ class CompactionScheduler:
         Returns:
             Next run datetime
         """
-        cron = croniter(self.schedule, datetime.now())
-        return cron.get_next(datetime)
+        cron = CronExpression(self.schedule)
+        return cron.next_execution_time(datetime.now())
 
     def get_status(self) -> dict:
         """

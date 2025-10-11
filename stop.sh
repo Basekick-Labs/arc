@@ -37,8 +37,13 @@ if [ -f "docker-compose.yml" ]; then
 
             # Remove Arc images
             echo -e "${RED}Removing Arc Docker images...${NC}"
-            docker images | grep -E "arc-core|arc-api" | awk '{print $3}' | xargs -r docker rmi -f 2>/dev/null || true
-            echo -e "${GREEN}✓ Arc Docker images removed${NC}"
+            ARC_IMAGES=$(docker images | grep -E "arc-core|arc-api" | awk '{print $3}')
+            if [ -n "$ARC_IMAGES" ]; then
+                echo "$ARC_IMAGES" | xargs docker rmi -f 2>/dev/null || true
+                echo -e "${GREEN}✓ Arc Docker images removed${NC}"
+            else
+                echo "No Arc images to remove"
+            fi
         else
             echo -e "${YELLOW}Stopping Docker containers...${NC}"
             docker-compose down
@@ -62,10 +67,21 @@ else
     echo -e "${YELLOW}Found Arc processes: $ARC_PIDS${NC}"
     echo -e "${YELLOW}Stopping Arc processes...${NC}"
     for PID in $ARC_PIDS; do
-        echo "  Killing process $PID"
-        kill -15 $PID 2>/dev/null || kill -9 $PID 2>/dev/null || true
+        echo "  Sending SIGTERM to process $PID"
+        kill -15 $PID 2>/dev/null || true
     done
-    sleep 2
+
+    # Wait for graceful shutdown
+    sleep 3
+
+    # Force kill if still running
+    for PID in $ARC_PIDS; do
+        if kill -0 $PID 2>/dev/null; then
+            echo "  Force killing process $PID"
+            kill -9 $PID 2>/dev/null || true
+        fi
+    done
+
     echo -e "${GREEN}✓ Arc processes stopped${NC}"
 fi
 
@@ -94,6 +110,24 @@ fi
 # Clean up native mode files if requested
 if [ "$MODE" = "clean" ]; then
     echo ""
+    echo -e "${RED}════════════════════════════════════════${NC}"
+    echo -e "${RED}WARNING: This will remove ALL Arc data!${NC}"
+    echo -e "${RED}════════════════════════════════════════${NC}"
+    echo ""
+    echo "The following will be deleted:"
+    [ -d "$SCRIPT_DIR/data" ] && echo "  • Data directory ($SCRIPT_DIR/data)"
+    [ -d "$SCRIPT_DIR/minio-data" ] && echo "  • MinIO data ($SCRIPT_DIR/minio-data)"
+    [ -d "$SCRIPT_DIR/logs" ] && echo "  • Logs ($SCRIPT_DIR/logs)"
+    [ -d "/tmp/arc-data" ] && echo "  • Temp data (/tmp/arc-data)"
+    [ -d "$SCRIPT_DIR/venv" ] && echo "  • Python virtual environment (optional)"
+    echo ""
+    read -p "Continue with cleanup? (y/n): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Cleanup cancelled"
+        exit 0
+    fi
+    echo ""
     echo -e "${RED}Cleaning native mode data...${NC}"
 
     # Remove databases
@@ -117,8 +151,18 @@ if [ "$MODE" = "clean" ]; then
         echo -e "${GREEN}✓ Logs removed${NC}"
     fi
 
+    # Remove temp data
+    if [ -d "/tmp/arc-data" ]; then
+        echo -e "${YELLOW}Removing temp data...${NC}"
+        rm -rf /tmp/arc-data
+        echo -e "${GREEN}✓ Temp data removed${NC}"
+    fi
+
     # Remove PID files
     rm -f "$SCRIPT_DIR/minio.pid" 2>/dev/null || true
+
+    # Remove installation log
+    rm -f /tmp/arc_install.log 2>/dev/null || true
 
     # Remove virtual environment
     if [ -d "$SCRIPT_DIR/venv" ]; then

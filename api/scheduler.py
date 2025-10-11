@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import logging
 import asyncio
-from croniter import croniter
+from utils.cron_parser import CronExpression
 import threading
 import time
 from api.config import get_db_path
@@ -272,7 +272,7 @@ class ExportScheduler:
         if not cron_expr:
             raise ValueError("cron_schedule is required")
         try:
-            _ = croniter(cron_expr, datetime.now())
+            _ = CronExpression(cron_expr)
         except Exception:
             raise ValueError("Invalid cron_schedule expression")
 
@@ -503,8 +503,8 @@ class ExportScheduler:
     def _should_run_job(self, job: Dict, current_time: datetime) -> bool:
         """Check if job should run based on cron schedule"""
         try:
-            cron = croniter(job['cron_schedule'], current_time - timedelta(minutes=1))
-            next_run = cron.get_next(datetime)
+            cron = CronExpression(job['cron_schedule'])
+            next_run = cron.next_execution_time(current_time - timedelta(minutes=1))
             
             # Job should run if next scheduled time is within the last minute
             return abs((next_run - current_time).total_seconds()) < 60

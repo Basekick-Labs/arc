@@ -151,10 +151,22 @@ case "$MODE" in
         fi
 
         # Activate and install dependencies
-        echo -e "${YELLOW}Installing dependencies...${NC}"
+        echo -e "${YELLOW}Installing dependencies (this may take a few minutes)...${NC}"
         source venv/bin/activate
-        pip install --upgrade pip > /dev/null
-        pip install -r requirements.txt > /dev/null
+
+        # Upgrade pip quietly
+        pip install --upgrade pip --quiet 2>&1 | grep -v "WARNING" || true
+
+        # Install requirements with suppressed compilation warnings
+        # Note: psycopg2-binary may show warnings on Python 3.13+ (safe to ignore)
+        echo -e "${YELLOW}Installing packages...${NC}"
+        if pip install -r requirements.txt --quiet 2>&1 | tee /tmp/arc_install.log | grep -E "(ERROR|Failed)" ; then
+            echo -e "${RED}✗ Dependency installation failed${NC}"
+            echo "Check logs: cat /tmp/arc_install.log"
+            exit 1
+        fi
+
+        echo -e "${GREEN}✓ Dependencies installed${NC}"
 
         # Create .env if it doesn't exist
         if [ ! -f ".env" ]; then
@@ -303,15 +315,25 @@ case "$MODE" in
             fi
 
             echo -e "${YELLOW}Setting up mc alias...${NC}"
-            # Use timeout to prevent hanging, and add --insecure flag for local development
-            if ! timeout 10 $MC_BIN alias set arc-local http://localhost:9000 minioadmin minioadmin --api S3v4 2>&1; then
-                echo -e "${RED}✗ Failed to configure mc client (timeout or error)${NC}"
-                echo "mc binary: $MC_BIN"
-                echo "Trying to continue anyway..."
+            # Run with background timeout (works on macOS and Linux)
+            ( $MC_BIN alias set arc-local http://localhost:9000 minioadmin minioadmin --api S3v4 2>&1 ) &
+            MC_PID=$!
+            sleep 5
+            if kill -0 $MC_PID 2>/dev/null; then
+                kill $MC_PID 2>/dev/null || true
+                echo -e "${YELLOW}⚠️  mc alias setup took too long, continuing anyway...${NC}"
+            else
+                wait $MC_PID 2>/dev/null
+                echo -e "${GREEN}✓ mc alias configured${NC}"
             fi
 
-            echo -e "${YELLOW}Creating bucket...${NC}"
-            timeout 10 $MC_BIN mb arc-local/arc --ignore-existing 2>&1 || echo -e "${YELLOW}Bucket may already exist${NC}"
+            echo -e "${YELLOW}Creating bucket 'arc'...${NC}"
+            if $MC_BIN mb arc-local/arc --ignore-existing 2>&1 | grep -v "already"; then
+                echo -e "${GREEN}✓ Bucket 'arc' created${NC}"
+            else
+                echo -e "${GREEN}✓ Bucket 'arc' already exists${NC}"
+            fi
+
             echo -e "${GREEN}✓ MinIO configured${NC}"
         else
             echo -e "${GREEN}✓ MinIO is already running${NC}"
