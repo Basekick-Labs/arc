@@ -31,6 +31,9 @@ class MessagePackDecoder:
         """
         Decode MessagePack binary data to list of records.
 
+        OPTIMIZATION: Uses streaming unpacker to avoid materializing
+        large intermediate objects in memory.
+
         Args:
             data: MessagePack binary payload
 
@@ -38,22 +41,30 @@ class MessagePackDecoder:
             List of flat dictionaries suitable for Arrow/Parquet
         """
         try:
-            # Unpack MessagePack binary
-            obj = msgpack.unpackb(data, raw=False)
+            # Use streaming unpacker for lower memory usage
+            # Avoids creating large intermediate Python objects
+            unpacker = msgpack.Unpacker(raw=False, max_buffer_size=100_000_000)
+            unpacker.feed(data)
 
-            # Handle batch vs single
-            if isinstance(obj, dict):
-                if 'batch' in obj:
-                    # Batch format
-                    records = self._decode_batch(obj['batch'])
+            records = []
+
+            # Stream records one at a time
+            for obj in unpacker:
+                # Handle batch vs single
+                if isinstance(obj, dict):
+                    if 'batch' in obj:
+                        # Batch format - process each item in batch
+                        for item in obj['batch']:
+                            records.append(self._decode_single(item))
+                    else:
+                        # Single measurement
+                        records.append(self._decode_single(obj))
+                elif isinstance(obj, list):
+                    # Array of measurements
+                    for item in obj:
+                        records.append(self._decode_single(item))
                 else:
-                    # Single measurement
-                    records = [self._decode_single(obj)]
-            elif isinstance(obj, list):
-                # Array of measurements
-                records = [self._decode_single(item) for item in obj]
-            else:
-                raise ValueError(f"Invalid MessagePack format: {type(obj)}")
+                    raise ValueError(f"Invalid MessagePack format: {type(obj)}")
 
             self.total_decoded += len(records)
             return records

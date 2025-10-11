@@ -184,8 +184,15 @@ class ParquetBuffer:
                 # Remove _database from all records before writing to parquet
                 records = [{k: v for k, v in record.items() if k != '_database'} for record in records]
 
-            # Convert to DataFrame
-            df = pl.DataFrame(records)
+            # OPTIMIZATION: Convert to columnar format before DataFrame
+            # This is more efficient than passing list[dict] to Polars
+            columns = defaultdict(list)
+            for record in records:
+                for key, value in record.items():
+                    columns[key].append(value)
+
+            # Convert to DataFrame from columnar format (more efficient)
+            df = pl.DataFrame(columns)
 
             # Ensure time column is datetime
             if 'time' in df.columns:

@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img src="https://img.shields.io/badge/License-AGPL%203.0-blue.svg" alt="License: AGPL-3.0"/></a>
-  <a href="https://github.com/basekick-labs/arc-core"><img src="https://img.shields.io/badge/Throughput-1.89M%20RPS-brightgreen.svg" alt="Performance"/></a>
+  <a href="https://github.com/basekick-labs/arc-core"><img src="https://img.shields.io/badge/Throughput-2.01M%20RPS-brightgreen.svg" alt="Performance"/></a>
   <a href="https://discord.gg/nxnWfUxsdm"><img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2?logo=discord&logoColor=white" alt="Discord"/></a>
 </p>
 
@@ -32,18 +32,19 @@
 
 ## Performance Benchmark 🚀
 
-**Arc achieves 1.95M records/sec with MessagePack binary protocol!**
+**Arc achieves 2.01M records/sec with MessagePack binary protocol!**
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| **Throughput** | **1.95M records/sec** | MessagePack binary protocol |
-| **p50 Latency** | **18.21ms** | Median response time |
-| **p95 Latency** | **184.60ms** | 95th percentile |
-| **p99 Latency** | **395.12ms** | 99th percentile |
-| **Success Rate** | **99.9999%** | Production-grade reliability |
-| **vs Line Protocol** | **7.9x faster** | 240K → 1.95M RPS |
+| **Throughput** | **2.01M records/sec** | MessagePack binary protocol |
+| **p50 Latency** | **16.62ms** | Median response time (-8.7% improvement) |
+| **p95 Latency** | **147.12ms** | 95th percentile (-20.3% improvement) |
+| **p99 Latency** | **317.53ms** | 99th percentile (-19.6% improvement) |
+| **Success Rate** | **100%** | Production-grade reliability |
+| **vs Line Protocol** | **8.4x faster** | 240K → 2.01M RPS |
 
 *Tested on Apple M3 Max (14 cores), native deployment with MinIO*
+*Optimizations: MessagePack streaming decoder, columnar Polars construction*
 
 **🎯 Optimal Configuration:**
 - **Workers:** 3x CPU cores (e.g., 14 cores = 42 workers)
@@ -53,7 +54,7 @@
 
 ## Quick Start (Native - Recommended for Maximum Performance)
 
-**Native deployment delivers 1.89M RPS vs 570K RPS in Docker (2.4x faster).**
+**Native deployment delivers 2.01M RPS vs 570K RPS in Docker (3.5x faster).**
 
 ```bash
 # One-command start (auto-installs MinIO, auto-detects CPU cores)
@@ -92,7 +93,7 @@ docker-compose logs -f arc-api
 docker-compose down
 ```
 
-**Note:** Docker mode achieves ~570K RPS. For maximum performance (1.89M RPS), use native deployment.
+**Note:** Docker mode achieves ~570K RPS. For maximum performance (2.01M RPS), use native deployment.
 
 ## Remote Deployment
 
@@ -331,7 +332,7 @@ response = requests.post(
 )
 ```
 
-**Batch ingestion** (for high throughput - 1.89M RPS):
+**Batch ingestion** (for high throughput - 2.01M RPS):
 
 ```python
 # Generate 10,000 measurements for high-throughput ingestion
@@ -759,7 +760,7 @@ Enable WAL if you need:
 - ✅ **Guaranteed durability** for critical data
 
 Keep WAL disabled if you:
-- ⚡ **Prioritize maximum throughput** (1.89M records/sec)
+- ⚡ **Prioritize maximum throughput** (2.01M records/sec)
 - 💰 **Can tolerate 0-5 seconds data loss** on rare crashes
 - 🔄 **Have upstream retry logic** (Kafka, message queues)
 
@@ -767,10 +768,10 @@ Keep WAL disabled if you:
 
 | Configuration | Throughput | Data Loss Risk |
 |--------------|-----------|----------------|
-| **WAL Disabled (default)** | 1.93M rec/s | 0-5 seconds |
-| **WAL async** | 1.60M rec/s (-17%) | <1 second |
-| **WAL fdatasync** | 1.56M rec/s (-19%) | Near-zero |
-| **WAL fsync** | 1.61M rec/s (-17%) | Zero |
+| **WAL Disabled (default)** | 2.01M rec/s | 0-5 seconds |
+| **WAL async** | 1.67M rec/s (-17%) | <1 second |
+| **WAL fdatasync** | 1.63M rec/s (-19%) | Near-zero |
+| **WAL fsync** | 1.67M rec/s (-17%) | Zero |
 
 ### Enable WAL
 

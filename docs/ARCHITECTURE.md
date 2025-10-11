@@ -21,7 +21,7 @@ This document explains Arc's internal architecture, data flow, and design decisi
 Arc is a time-series data warehouse optimized for high-throughput ingestion and fast analytical queries. It combines:
 
 - **FastAPI** for HTTP API (with Gunicorn/Uvicorn workers)
-- **MessagePack binary protocol** for high-performance writes (1.89M records/sec)
+- **MessagePack binary protocol** for high-performance writes (2.01M records/sec)
 - **InfluxDB Line Protocol** for drop-in compatibility with existing workloads
 - **In-memory buffering** for batching writes
 - **Write-Ahead Log (WAL)** for optional zero data loss durability
@@ -110,8 +110,8 @@ Arc is a time-series data warehouse optimized for high-throughput ingestion and 
 7. **HTTP Response** returns 204 No Content
 
 **Throughput:**
-- **MessagePack (preferred):** 1.89M records/sec
-- **Line Protocol (InfluxDB compat):** ~240K records/sec (7.9× slower)
+- **MessagePack (preferred):** 2.01M records/sec
+- **Line Protocol (InfluxDB compat):** ~240K records/sec (8.4× slower)
 
 ### Read Path
 
