@@ -10,6 +10,7 @@ from fastapi.responses import Response
 from typing import Optional, List, Dict, Any
 import logging
 import gzip
+import asyncio
 from datetime import datetime
 from ingest.line_protocol_parser import LineProtocolParser
 from ingest.parquet_buffer import ParquetBuffer
@@ -72,11 +73,17 @@ def merge_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return list(merged.values())
 
 
-def decode_body(body: bytes, content_encoding: Optional[str] = None) -> str:
+def _decompress_gzip_sync(body: bytes) -> bytes:
+    """Synchronous gzip decompression (runs in thread pool)"""
+    return gzip.decompress(body)
+
+
+async def decode_body(body: bytes, content_encoding: Optional[str] = None) -> str:
     """
     Decode request body, handling gzip compression if present.
 
     Telegraf sends gzip-compressed data by default.
+    OPTIMIZATION: Gzip decompression runs in thread pool to release GIL.
 
     Args:
         body: Raw request body bytes
@@ -88,12 +95,18 @@ def decode_body(body: bytes, content_encoding: Optional[str] = None) -> str:
     try:
         # Check if body is gzip compressed
         # Gzip magic number: 0x1f 0x8b
+        is_gzipped = False
         if len(body) >= 2 and body[0] == 0x1f and body[1] == 0x8b:
             logger.debug("Detected gzip-compressed request body")
-            body = gzip.decompress(body)
+            is_gzipped = True
         elif content_encoding and 'gzip' in content_encoding.lower():
             logger.debug("Content-Encoding indicates gzip compression")
-            body = gzip.decompress(body)
+            is_gzipped = True
+
+        # OPTIMIZATION: Decompress in thread pool to avoid blocking event loop
+        if is_gzipped:
+            loop = asyncio.get_event_loop()
+            body = await loop.run_in_executor(None, _decompress_gzip_sync, body)
 
         # Decode to UTF-8
         return body.decode('utf-8')
@@ -151,7 +164,7 @@ async def write_v1(
     try:
         # Read and decode body (handles gzip)
         body = await request.body()
-        lines = decode_body(body, content_encoding)
+        lines = await decode_body(body, content_encoding)
 
         if not lines.strip():
             raise HTTPException(status_code=400, detail="Empty request body")
@@ -221,7 +234,7 @@ async def write_v2(
     try:
         # Read and decode body (handles gzip)
         body = await request.body()
-        lines = decode_body(body, content_encoding)
+        lines = await decode_body(body, content_encoding)
 
         if not lines.strip():
             raise HTTPException(status_code=400, detail="Empty request body")
@@ -285,7 +298,7 @@ async def write_simple(
     try:
         # Read and decode body (handles gzip)
         body = await request.body()
-        lines = decode_body(body, content_encoding)
+        lines = await decode_body(body, content_encoding)
 
         if not lines.strip():
             raise HTTPException(status_code=400, detail="Empty request body")

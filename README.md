@@ -1002,11 +1002,14 @@ Arc Core has been benchmarked using [ClickBench](https://github.com/ClickHouse/C
 - **Success Rate**: 43/43 queries (100%)
 
 **Hardware: Apple M3 Max** (14 cores ARM, 36GB RAM)
-- **Cold Run Total**: 23.86s (sum of 43 queries, first execution)
-- **Hot Run Average**: 0.52s (average per query after caching)
-- **Aggregate Performance**: ~4.2M rows/sec cold, ~192M rows/sec hot (across all queries)
+- **Cold Run Total**: 22.64s (sum of 43 queries, first execution)
+- **With Query Cache**: 16.87s (60s TTL caching enabled, 1.34x speedup)
+- **Cache Hit Performance**: 3-20ms per query (sub-second for all cached queries)
+- **Cache Hit Rate**: 51% of queries benefit from caching (22/43 queries)
+- **Aggregate Performance**: ~4.4M rows/sec cold, ~5.9M rows/sec cached
 - **Storage**: Local NVMe SSD
 - **Success Rate**: 43/43 queries (100%)
+- **Optimizations**: DuckDB pool (early connection release), async gzip decompression
 
 ### Key Performance Characteristics
 
@@ -1017,21 +1020,22 @@ Arc Core has been benchmarked using [ClickBench](https://github.com/ClickHouse/C
 
 ### Fastest Queries (M3 Max)
 
-| Query | Time (avg) | Description |
-|-------|-----------|-------------|
-| Q1 | 0.021s | Simple aggregation |
-| Q8 | 0.034s | String parsing |
-| Q27 | 0.086s | Complex grouping |
-| Q41 | 0.048s | URL parsing |
-| Q42 | 0.044s | Multi-column filter |
+| Query | Time | Description |
+|-------|------|-------------|
+| Q1 | 0.043s | Simple COUNT(*) aggregation |
+| Q7 | 0.036s | MIN/MAX on date column |
+| Q8 | 0.039s | GROUP BY with filter |
+| Q20 | 0.047s | Point lookup by UserID |
+| Q42 | 0.043s | Multi-column aggregation |
 
 ### Most Complex Queries
 
-| Query | Time (avg) | Description |
-|-------|-----------|-------------|
-| Q29 | 7.97s | Heavy string operations |
-| Q19 | 1.69s | Multiple joins |
-| Q33 | 1.86s | Complex aggregations |
+| Query | Time | Description |
+|-------|------|-------------|
+| Q29 | 8.09s | REGEXP_REPLACE with heavy string operations |
+| Q19 | 1.69s | Timestamp conversion with GROUP BY |
+| Q33 | 1.28s | Complex multi-column aggregations |
+| Q23 | 1.10s | String matching with LIKE patterns |
 
 **Benchmark Configuration**:
 - Dataset: 100M rows, 14GB Parquet (ClickBench hits.parquet)

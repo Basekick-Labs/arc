@@ -366,6 +366,10 @@ class DuckDBConnectionPool:
             wait_time = 0.0
 
         # Execute query
+        result = None
+        columns = None
+        exec_time = 0.0
+
         try:
             loop = asyncio.get_event_loop()
             start_exec = time.time()
@@ -375,30 +379,6 @@ class DuckDBConnectionPool:
             exec_time = time.time() - start_exec
             self.execution_times.append(exec_time)
             self.total_queries_executed += 1
-
-            # Serialize data for JSON
-            serialized_data = []
-            for row in result:
-                serialized_row = []
-                for value in row:
-                    if hasattr(value, 'isoformat'):
-                        serialized_row.append(value.isoformat())
-                    elif isinstance(value, (int, float, str, bool)) or value is None:
-                        serialized_row.append(value)
-                    else:
-                        serialized_row.append(str(value))
-                serialized_data.append(serialized_row)
-
-            logger.info(f"Query executed: {len(result)} rows in {exec_time:.3f}s (wait: {wait_time:.3f}s)")
-
-            return {
-                "success": True,
-                "data": serialized_data,
-                "columns": columns,
-                "row_count": len(result),
-                "execution_time_ms": round(exec_time * 1000, 2),
-                "wait_time_ms": round(wait_time * 1000, 2)
-            }
 
         except Exception as e:
             self.total_queries_failed += 1
@@ -412,7 +392,33 @@ class DuckDBConnectionPool:
             }
 
         finally:
+            # OPTIMIZATION: Return connection ASAP (before serialization)
+            # This allows other queries to use the connection while we serialize
             self.return_connection(conn)
+
+        # Serialize data for JSON AFTER releasing connection
+        serialized_data = []
+        for row in result:
+            serialized_row = []
+            for value in row:
+                if hasattr(value, 'isoformat'):
+                    serialized_row.append(value.isoformat())
+                elif isinstance(value, (int, float, str, bool)) or value is None:
+                    serialized_row.append(value)
+                else:
+                    serialized_row.append(str(value))
+            serialized_data.append(serialized_row)
+
+        logger.info(f"Query executed: {len(result)} rows in {exec_time:.3f}s (wait: {wait_time:.3f}s)")
+
+        return {
+            "success": True,
+            "data": serialized_data,
+            "columns": columns,
+            "row_count": len(result),
+            "execution_time_ms": round(exec_time * 1000, 2),
+            "wait_time_ms": round(wait_time * 1000, 2)
+        }
 
     def get_metrics(self) -> PoolMetrics:
         """Get current pool metrics"""
