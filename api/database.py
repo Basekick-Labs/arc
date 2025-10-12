@@ -22,7 +22,13 @@ class ConnectionManager:
         try:
             with get_sqlite_pool().get_connection() as conn:
                 cursor = conn.cursor()
-                
+
+                # Enable WAL mode for better concurrency (multiple readers, one writer)
+                # This eliminates most database lock issues with 42 workers
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA busy_timeout=5000")  # Wait up to 5s for locks
+                logger.info("SQLite WAL mode enabled for concurrent access")
+
                 # Create connections table
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS influx_connections (
@@ -50,11 +56,12 @@ class ConnectionManager:
                     CREATE TABLE IF NOT EXISTS storage_connections (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         name TEXT UNIQUE NOT NULL,
-                        backend TEXT NOT NULL,  -- 'minio', 's3', 'ceph', or 'gcs'
+                        backend TEXT NOT NULL,  -- 'local', 'minio', 's3', 'ceph', or 'gcs'
                         endpoint TEXT,          -- For MinIO/Ceph
                         access_key TEXT,        -- For S3/MinIO (optional for GCS)
                         secret_key TEXT,        -- For S3/MinIO (optional for GCS)
-                        bucket TEXT NOT NULL,
+                        bucket TEXT,            -- For object storage (nullable for local)
+                        base_path TEXT,         -- For local filesystem storage
                         database TEXT DEFAULT 'default',
                         region TEXT DEFAULT 'us-east-1',
                         ssl BOOLEAN DEFAULT FALSE,
@@ -98,6 +105,12 @@ class ConnectionManager:
                 except sqlite3.OperationalError:
                     pass  # Column already exists
                 
+                # Add base_path column for local filesystem storage
+                try:
+                    cursor.execute('ALTER TABLE storage_connections ADD COLUMN base_path TEXT')
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+
                 # Add HMAC key columns for GCS DuckDB support
                 try:
                     cursor.execute('ALTER TABLE storage_connections ADD COLUMN hmac_key_id TEXT')
@@ -199,17 +212,18 @@ class ConnectionManager:
             
             cursor.execute('''
                 INSERT INTO storage_connections
-                (name, backend, endpoint, access_key, secret_key, bucket, database, region, ssl,
+                (name, backend, endpoint, access_key, secret_key, bucket, base_path, database, region, ssl,
                  use_directory_bucket, availability_zone, project_id, credentials_json, credentials_file,
                  hmac_key_id, hmac_secret, is_active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 connection_data['name'],
                 connection_data['backend'],
                 connection_data.get('endpoint'),
-                connection_data.get('access_key'),  # Optional for GCS
-                connection_data.get('secret_key'),  # Optional for GCS
-                connection_data['bucket'],
+                connection_data.get('access_key'),  # Optional for GCS & local
+                connection_data.get('secret_key'),  # Optional for GCS & local
+                connection_data.get('bucket'),      # For object storage (S3/MinIO/GCS)
+                connection_data.get('base_path'),   # For local filesystem
                 connection_data.get('database', 'default'),
                 connection_data.get('region', 'us-east-1'),
                 connection_data.get('ssl', False),

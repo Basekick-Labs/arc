@@ -38,15 +38,15 @@
 
 | Storage Backend | Throughput | p50 Latency | p95 Latency | p99 Latency | Notes |
 |----------------|------------|-------------|-------------|-------------|-------|
-| **Local NVMe** | **2.08M RPS** | **14.2ms** | **126ms** | **287ms** | Direct filesystem (fastest) |
+| **Local NVMe** | **2.08M RPS** | **13.4ms** | **136ms** | **280ms** | Direct filesystem (fastest) |
 | **MinIO** | **2.01M RPS** | **16.6ms** | **147ms** | **318ms** | S3-compatible object storage |
 | **Line Protocol** | **240K RPS** | N/A | N/A | N/A | InfluxDB compatibility mode |
 
 **Performance Improvements (Local vs MinIO):**
 - Throughput: +3.5% (2.08M vs 2.01M RPS)
-- p50 Latency: -14.4% (14.2ms vs 16.6ms)
-- p95 Latency: -14.0% (126ms vs 147ms)
-- p99 Latency: -9.5% (287ms vs 318ms)
+- p50 Latency: -19.3% (13.4ms vs 16.6ms)
+- p95 Latency: -7.5% (136ms vs 147ms)
+- p99 Latency: -12.0% (280ms vs 318ms)
 
 *Tested on Apple M3 Max (14 cores), native deployment*
 *MessagePack binary protocol with streaming decoder and columnar Polars construction*
@@ -56,6 +56,10 @@
 - **Deployment:** Native mode (3.5x faster than Docker)
 - **Storage:** Local filesystem for maximum performance, MinIO for distributed deployments
 - **Protocol:** MessagePack binary (`/write/v2/msgpack`)
+- **Performance Stack:**
+  - `uvloop`: 2-4x faster event loop (Cython-based C implementation)
+  - `httptools`: 40% faster HTTP parser
+  - `orjson`: 20-50% faster JSON serialization (Rust + SIMD)
 
 ## Quick Start (Native - Recommended for Maximum Performance)
 
@@ -856,9 +860,10 @@ Arc automatically **compacts small Parquet files into larger ones** to dramatica
 - Example: 1000 files × 5ms open time = 5 seconds just to start querying
 
 **After Compaction:**
-- 1000 small files → 10 large files (100x reduction)
+- **2,704 files → 3 files (901x reduction)** - Real production test results
+- **80.4% compression ratio** (3.7 GB → 724 MB with ZSTD)
 - Query time: 5 seconds → 0.05 seconds (100x faster)
-- Better compression (ZSTD vs Snappy)
+- Better compression (ZSTD vs Snappy during writes)
 - Improved DuckDB parallel scanning
 
 ### How It Works

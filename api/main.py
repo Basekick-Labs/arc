@@ -18,7 +18,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from fastapi import FastAPI, HTTPException, Query, Body, BackgroundTasks, Request
 import json
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, ORJSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, List, Dict, Any
 import asyncio
@@ -80,6 +80,7 @@ app = FastAPI(
     title="Arc Query API",
     version="1.0.0",
     description="A comprehensive data pipeline solution for time-series data management",
+    default_response_class=ORJSONResponse,  # 20-50% faster JSON serialization (Rust + SIMD)
     responses={
         400: {"model": ErrorResponse, "description": "Bad Request"},
         404: {"model": ErrorResponse, "description": "Not Found"},
@@ -273,48 +274,95 @@ async def startup_event():
     """Initialize query engine on startup"""
     global query_engine
 
+    # Load config to check desired backend
+    from config_loader import get_config
+    arc_config = get_config()
+    storage_config = arc_config.get_storage_config()
+    desired_backend = storage_config.get('backend', os.getenv('STORAGE_BACKEND', 'minio'))
+
     # Get active storage connection from database
     active_storage = connection_manager.get_active_storage_connection()
 
-    # Auto-create storage connection from environment if none exists
+    # Check if active storage backend matches config
+    if active_storage and active_storage['backend'] != desired_backend:
+        logger.warning(f"Storage backend mismatch: config={desired_backend}, active={active_storage['backend']}")
+        logger.info(f"Deactivating old {active_storage['backend']} connection and creating {desired_backend} connection")
+
+        # Deactivate all storage connections
+        try:
+            import sqlite3
+            conn = sqlite3.connect(connection_manager.db_path)
+            cursor = conn.cursor()
+            cursor.execute('UPDATE storage_connections SET is_active = FALSE')
+            conn.commit()
+            conn.close()
+            logger.info(f"Deactivated all storage connections")
+        except Exception as e:
+            logger.error(f"Failed to deactivate storage connections: {e}")
+
+        active_storage = None
+
+    # Auto-create storage connection from config if none exists or backend changed
     if not active_storage:
-        # Load from config first, then fallback to env
-        from config_loader import get_config
-        arc_config = get_config()
-        storage_config = arc_config.get_storage_config()
-        storage_backend_env = storage_config.get('backend', os.getenv('STORAGE_BACKEND', 'minio'))
+        logger.info(f"No active storage - checking config/env: backend={desired_backend}")
 
-        logger.info(f"No active storage - checking config/env: backend={storage_backend_env}")
-
-        if storage_backend_env == 'local':
+        if desired_backend == 'local':
             logger.info("Auto-creating local filesystem storage connection from config")
-            try:
-                local_config = storage_config.get('local', {})
-                connection_config = {
-                    'name': 'default-local',
-                    'backend': 'local',
-                    'base_path': local_config.get('base_path', './data/arc'),
-                    'database': local_config.get('database', 'default'),
-                    'is_active': True
-                }
-                logger.info(f"Creating local storage connection: {connection_config['name']} at {connection_config['base_path']}")
 
-                connection_id = connection_manager.add_storage_connection(connection_config)
-                logger.info(f"✅ Auto-created local storage connection (id={connection_id})")
+            # Retry logic for database lock contention (multiple workers starting simultaneously)
+            max_retries = 5
+            retry_delay = 0.5  # seconds
 
-                # Refresh active_storage after creating
-                active_storage = connection_manager.get_active_storage_connection()
-            except Exception as e:
-                # Race condition: another worker already created the connection
-                if "UNIQUE constraint failed" in str(e):
-                    logger.debug("Local storage connection already created by another worker")
+            for attempt in range(max_retries):
+                try:
+                    local_config = storage_config.get('local', {})
+                    connection_config = {
+                        'name': 'default-local',
+                        'backend': 'local',
+                        'base_path': local_config.get('base_path', './data/arc'),
+                        'database': local_config.get('database', 'default'),
+                        'is_active': True
+                    }
+
+                    if attempt == 0:
+                        logger.info(f"Creating local storage connection: {connection_config['name']} at {connection_config['base_path']}")
+
+                    connection_id = connection_manager.add_storage_connection(connection_config)
+                    logger.info(f"✅ Auto-created local storage connection (id={connection_id})")
+
+                    # Refresh active_storage after creating
                     active_storage = connection_manager.get_active_storage_connection()
-                else:
-                    import traceback
-                    logger.error(f"Failed to auto-create local storage connection: {e}")
-                    logger.error(f"Traceback: {traceback.format_exc()}")
+                    break  # Success, exit retry loop
 
-        elif storage_backend_env == 'minio' and os.getenv('MINIO_ENDPOINT'):
+                except Exception as e:
+                    # Race condition: another worker already created the connection
+                    if "UNIQUE constraint failed" in str(e):
+                        logger.debug("Local storage connection already created by another worker")
+                        active_storage = connection_manager.get_active_storage_connection()
+                        break  # Success (connection exists), exit retry loop
+
+                    # Database locked: retry with backoff
+                    elif "database is locked" in str(e):
+                        if attempt < max_retries - 1:
+                            import time
+                            wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
+                            logger.debug(f"Database locked, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                            time.sleep(wait_time)
+                        else:
+                            # Final attempt failed
+                            import traceback
+                            logger.error(f"Failed to auto-create local storage connection after {max_retries} attempts: {e}")
+                            logger.error(f"Traceback: {traceback.format_exc()}")
+                            # Try to get connection anyway (another worker may have created it)
+                            active_storage = connection_manager.get_active_storage_connection()
+                    else:
+                        # Other error
+                        import traceback
+                        logger.error(f"Failed to auto-create local storage connection: {e}")
+                        logger.error(f"Traceback: {traceback.format_exc()}")
+                        break
+
+        elif desired_backend == 'minio' and os.getenv('MINIO_ENDPOINT'):
             logger.info("Auto-creating MinIO connection from environment variables")
             try:
                 # Ensure endpoint has http:// or https:// prefix
@@ -351,7 +399,7 @@ async def startup_event():
                     logger.error(f"Failed to auto-create MinIO connection: {e}")
                     logger.error(f"Traceback: {traceback.format_exc()}")
         else:
-            logger.warning(f"Cannot auto-create storage: backend={storage_backend_env}, has_endpoint={bool(os.getenv('MINIO_ENDPOINT'))}")
+            logger.warning(f"Cannot auto-create storage: backend={desired_backend}, has_endpoint={bool(os.getenv('MINIO_ENDPOINT'))}")
 
     await reinitialize_query_engine()
     
@@ -1057,7 +1105,6 @@ async def execute_sql(request: Request, query: QueryRequest):
 
         if not result["success"]:
             error_msg = result.get("error", "Unknown error")
-            # Check if it's a large result warning
             if result.get("large_result_warning"):
                 raise HTTPException(status_code=413, detail=error_msg)
             else:
@@ -1094,7 +1141,6 @@ async def execute_sql(request: Request, query: QueryRequest):
         logger.error("Query timed out after 5 minutes")
         raise HTTPException(status_code=408, detail="Query timed out after 5 minutes")
     except HTTPException:
-        # Re-raise HTTP exceptions (like our 413 for large results)
         raise
     except Exception as e:
         logger.error(f"Query execution error: {e}")

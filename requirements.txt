@@ -14,6 +14,11 @@ uvicorn[standard]==0.37.0
 gunicorn==23.0.0
 slowapi==0.1.9  # Rate limiting
 
+# Performance optimizations
+uvloop==0.21.0  # 2-4x faster event loop (Cython-based)
+httptools==0.6.4  # 40% faster HTTP parser
+orjson==3.10.13  # 20-50% faster JSON serialization (Rust + SIMD)
+
 # Storage and query engine
 # Note: boto3, aiobotocore, and botocore versions must be compatible
 boto3

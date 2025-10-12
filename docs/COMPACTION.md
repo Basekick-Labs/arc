@@ -49,15 +49,25 @@ At 1.93M records/sec with 5-second flush interval:
 
 ### After Compaction
 
+**Real Production Test Results:**
 ```
-Before: 720 small files × 5MB = 3.6GB (720 files)
-After:  1 compacted file       = 512MB (1 file, ~85% compression)
+Before: 2,704 small files (Snappy) = 3.7 GB
+After:  3 compacted files (ZSTD)   = 724 MB
+
+Compression: 80.4% space savings
+File reduction: 901x fewer files (2,704 → 3)
+Compaction time: 5 seconds
 ```
+
+**Per-Measurement Breakdown:**
+- **mem**: 888 files → 1 file, 1,213 MB → 239 MB (80.3% compression)
+- **disk**: 906 files → 1 file, 1,237 MB → 242 MB (80.4% compression)
+- **cpu**: 910 files → 1 file, 1,246 MB → 243 MB (80.5% compression)
 
 **Query Performance:**
 - 🚀 **10-50x faster** - Single file scan vs hundreds
-- 💰 **90% fewer API calls** - Massive cost reduction
-- 📦 **Better compression** - More data = better compression ratios
+- 💰 **99% fewer API calls** - Massive cost reduction (2,704 → 3 LIST operations)
+- 📦 **80.4% compression** - ZSTD compaction vs Snappy writes
 - 🎯 **Effective pruning** - DuckDB can skip entire files
 
 ## How It Works
@@ -690,14 +700,28 @@ API calls: 2 (S3 LIST + GET operations)
 
 ### Storage Savings
 
-Typical compression ratios with ZSTD:
+**Measured compression ratios from production testing:**
 
 ```
-Small files (Snappy):    100 files × 5MB = 500MB
-Compacted file (ZSTD):   1 file = 75MB
+Test: High-volume ingestion (3 measurements: cpu, mem, disk)
 
-Savings: 85% storage reduction
+Before compaction (Snappy):  2,704 files = 3.7 GB
+After compaction (ZSTD):     3 files     = 724 MB
+
+Space savings: 80.4% compression ratio
+File reduction: 901x fewer files
+
+Per-measurement breakdown:
+- mem:  888 files (1,213 MB) → 1 file (239 MB) = 80.3% compression
+- disk: 906 files (1,237 MB) → 1 file (242 MB) = 80.4% compression
+- cpu:  910 files (1,246 MB) → 1 file (243 MB) = 80.5% compression
 ```
+
+**Why such high compression?**
+- ZSTD (compaction) vs Snappy (writes): ZSTD achieves 2-3x better compression
+- Larger blocks: More data = better compression dictionary learning
+- Sorted data: Time-ordered data compresses extremely well
+- Columnar format: Parquet's columnar layout + compression = optimal efficiency
 
 ## Troubleshooting
 

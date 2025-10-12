@@ -375,16 +375,20 @@ class DuckDBEngine:
                         storage_conn = conn
                         break
 
-            # Use backend if storage_conn not found
-            backend = self.minio_backend or self.s3_backend or self.ceph_backend or self.gcs_backend
+            # Use backend (local, minio, s3, etc.)
+            backend = self.local_backend or self.minio_backend or self.s3_backend or self.ceph_backend or self.gcs_backend
             if not backend:
                 logger.error(f"No storage backend available for database: {database}")
                 return match.group(0)
 
-            bucket = storage_conn.get('bucket') if storage_conn else backend.bucket
-            backend_type = storage_conn.get('backend') if storage_conn else (
-                'local' if self.local_backend else ('gcs' if self.gcs_backend else 's3')
-            )
+            # Determine bucket/base_path and backend type
+            if storage_conn:
+                bucket = storage_conn.get('bucket') or storage_conn.get('base_path')
+                backend_type = storage_conn.get('backend')
+            else:
+                # No specific connection for this database - use default backend settings
+                bucket = getattr(backend, 'bucket', None) or getattr(backend, 'base_path', 'arc')
+                backend_type = 'local' if self.local_backend else ('gcs' if self.gcs_backend else 's3')
 
             if backend_type == 'local' or self.storage_backend == 'local':
                 # Use direct filesystem path for local backend
@@ -584,15 +588,27 @@ class DuckDBEngine:
     def _handle_show_databases_sync(self) -> Dict[str, Any]:
         """Handle SHOW DATABASES command
 
-        Returns all unique database namespaces found in storage by scanning the bucket
+        Returns all unique database namespaces found in storage by scanning the bucket/filesystem
         """
         try:
             databases = set()
 
             # Get the backend (regardless of connection manager)
-            backend = self.minio_backend or self.s3_backend or self.ceph_backend or self.gcs_backend
+            backend = self.local_backend or self.minio_backend or self.s3_backend or self.ceph_backend or self.gcs_backend
 
-            if backend:
+            if self.local_backend:
+                # Local filesystem: scan base_path for database directories
+                from pathlib import Path
+                base_path = Path(self.local_backend.base_path)
+
+                if base_path.exists():
+                    for item in base_path.iterdir():
+                        if item.is_dir() and not item.name.startswith('.'):
+                            databases.add(item.name)
+
+                logger.info(f"Local filesystem databases: {sorted(databases)}")
+
+            elif backend:
                 # Scan the bucket root to find all database directories
                 # Storage structure: {bucket}/{database}/{measurement}/{partitions}
                 # We need to list all top-level prefixes in the bucket
