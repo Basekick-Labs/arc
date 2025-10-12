@@ -316,10 +316,27 @@ def init_query_cache(
     """
     global _query_cache
 
-    # Check if caching is disabled
-    cache_enabled = os.getenv("QUERY_CACHE_ENABLED", "true").lower() == "true"
+    # Check if caching is disabled - check config file first, then env var
+    cache_enabled = True
+    try:
+        from config_loader import get_config
+        arc_config = get_config()
+        cache_config = arc_config.config.get('query_cache', {})
+        cache_enabled = cache_config.get('enabled', True)
+
+        # Read TTL, max_size, max_result_size_mb from config if not provided
+        if ttl_seconds is None:
+            ttl_seconds = cache_config.get('ttl_seconds', None)
+        if max_size is None:
+            max_size = cache_config.get('max_size', None)
+        if max_result_size_mb is None:
+            max_result_size_mb = cache_config.get('max_result_size_mb', None)
+    except Exception:
+        # Fallback to environment variable if config not available
+        cache_enabled = os.getenv("QUERY_CACHE_ENABLED", "true").lower() == "true"
+
     if not cache_enabled:
-        logger.info("Query cache DISABLED by environment variable")
+        logger.info("Query cache DISABLED by configuration")
         return None
 
     _query_cache = QueryCache(
