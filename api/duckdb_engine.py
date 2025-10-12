@@ -8,8 +8,9 @@ from api.duckdb_pool import DuckDBConnectionPool, QueryPriority
 logger = logging.getLogger(__name__)
 
 class DuckDBEngine:
-    def __init__(self, storage_backend: str = "local", minio_backend=None, s3_backend=None, ceph_backend=None, gcs_backend=None, connection_manager=None):
+    def __init__(self, storage_backend: str = "local", local_backend=None, minio_backend=None, s3_backend=None, ceph_backend=None, gcs_backend=None, connection_manager=None):
         self.storage_backend = storage_backend
+        self.local_backend = local_backend
         self.minio_backend = minio_backend
         self.s3_backend = s3_backend
         self.ceph_backend = ceph_backend
@@ -382,10 +383,16 @@ class DuckDBEngine:
 
             bucket = storage_conn.get('bucket') if storage_conn else backend.bucket
             backend_type = storage_conn.get('backend') if storage_conn else (
-                'gcs' if self.gcs_backend else 's3'
+                'local' if self.local_backend else ('gcs' if self.gcs_backend else 's3')
             )
 
-            if backend_type == 'gcs':
+            if backend_type == 'local' or self.storage_backend == 'local':
+                # Use direct filesystem path for local backend
+                base_path = self.local_backend.base_path if self.local_backend else bucket
+                local_path = f"{base_path}/{database}/{table}/**/*.parquet"
+                logger.info(f"Using local filesystem path for DuckDB: {local_path}")
+                return f"FROM read_parquet('{local_path}', union_by_name=true)"
+            elif backend_type == 'gcs':
                 # Use native gs:// URLs with DuckDB GCS support
                 gs_path = f"gs://{bucket}/{database}/{table}/**/*.parquet"
                 logger.info(f"Using native GCS path for DuckDB: {gs_path}")
@@ -406,16 +413,21 @@ class DuckDBEngine:
             table = match.group(1)
 
             # Use actual backend and its database
-            backend = self.minio_backend or self.s3_backend or self.ceph_backend or self.gcs_backend
+            backend = self.local_backend or self.minio_backend or self.s3_backend or self.ceph_backend or self.gcs_backend
             if backend:
-                bucket = backend.bucket
+                bucket = getattr(backend, 'bucket', None) or getattr(backend, 'base_path', 'arc')
                 database = backend.database
             else:
                 bucket = "arc"
                 database = "default"
 
             # Build path with database namespace
-            if self.gcs_backend:
+            if self.local_backend or self.storage_backend == 'local':
+                base_path = self.local_backend.base_path if self.local_backend else bucket
+                local_path = f"{base_path}/{database}/{table}/**/*.parquet"
+                logger.info(f"Converting simple table '{table}' to {local_path}")
+                return f"FROM read_parquet('{local_path}', union_by_name=true)"
+            elif self.gcs_backend:
                 gs_path = f"gs://{bucket}/{database}/{table}/**/*.parquet"
                 logger.info(f"Converting simple table '{table}' to {gs_path}")
                 return f"FROM read_parquet('{gs_path}', union_by_name=true)"

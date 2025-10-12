@@ -98,6 +98,10 @@ class ArcConfig:
             "storage": {
                 "backend": "minio",
                 "database": "default",
+                "local": {
+                    "base_path": "./data/arc",
+                    "database": "default",
+                },
                 "minio": {
                     "endpoint": "http://minio:9000",
                     "access_key": "minioadmin",
@@ -192,6 +196,12 @@ class ArcConfig:
             # Storage
             "STORAGE_BACKEND": ("storage", "backend"),
             "STORAGE_DATABASE": ("storage", "database"),
+
+            # Local filesystem storage
+            "STORAGE_LOCAL_BASE_PATH": ("storage", "local", "base_path"),
+            "STORAGE_LOCAL_DATABASE": ("storage", "local", "database"),
+
+            # MinIO storage
             "MINIO_ENDPOINT": ("storage", "minio", "endpoint"),
             "MINIO_ACCESS_KEY": ("storage", "minio", "access_key"),
             "MINIO_SECRET_KEY": ("storage", "minio", "secret_key"),

@@ -255,11 +255,12 @@ async def reinitialize_query_engine():
     elif active_storage and active_storage['backend'] == 'local':
         from storage.local_backend import LocalBackend
         local_backend = LocalBackend(
-            bucket=active_storage["bucket"],
+            base_path=active_storage.get("base_path", "./data/arc"),
             database=active_storage.get('database', 'default')
         )
         query_engine = DuckDBEngine(
             storage_backend="local",
+            local_backend=local_backend,
             connection_manager=connection_manager
         )
 
@@ -277,10 +278,43 @@ async def startup_event():
 
     # Auto-create storage connection from environment if none exists
     if not active_storage:
-        storage_backend_env = os.getenv('STORAGE_BACKEND', 'minio')
-        logger.info(f"No active storage - checking env: STORAGE_BACKEND={storage_backend_env}, MINIO_ENDPOINT={os.getenv('MINIO_ENDPOINT')}")
+        # Load from config first, then fallback to env
+        from config_loader import get_config
+        arc_config = get_config()
+        storage_config = arc_config.get_storage_config()
+        storage_backend_env = storage_config.get('backend', os.getenv('STORAGE_BACKEND', 'minio'))
 
-        if storage_backend_env == 'minio' and os.getenv('MINIO_ENDPOINT'):
+        logger.info(f"No active storage - checking config/env: backend={storage_backend_env}")
+
+        if storage_backend_env == 'local':
+            logger.info("Auto-creating local filesystem storage connection from config")
+            try:
+                local_config = storage_config.get('local', {})
+                connection_config = {
+                    'name': 'default-local',
+                    'backend': 'local',
+                    'base_path': local_config.get('base_path', './data/arc'),
+                    'database': local_config.get('database', 'default'),
+                    'is_active': True
+                }
+                logger.info(f"Creating local storage connection: {connection_config['name']} at {connection_config['base_path']}")
+
+                connection_id = connection_manager.add_storage_connection(connection_config)
+                logger.info(f"✅ Auto-created local storage connection (id={connection_id})")
+
+                # Refresh active_storage after creating
+                active_storage = connection_manager.get_active_storage_connection()
+            except Exception as e:
+                # Race condition: another worker already created the connection
+                if "UNIQUE constraint failed" in str(e):
+                    logger.debug("Local storage connection already created by another worker")
+                    active_storage = connection_manager.get_active_storage_connection()
+                else:
+                    import traceback
+                    logger.error(f"Failed to auto-create local storage connection: {e}")
+                    logger.error(f"Traceback: {traceback.format_exc()}")
+
+        elif storage_backend_env == 'minio' and os.getenv('MINIO_ENDPOINT'):
             logger.info("Auto-creating MinIO connection from environment variables")
             try:
                 # Ensure endpoint has http:// or https:// prefix
@@ -382,7 +416,7 @@ async def startup_event():
         elif active_storage['backend'] == 'local':
             from storage.local_backend import LocalBackend
             storage_backend = LocalBackend(
-                bucket=active_storage["bucket"],
+                base_path=active_storage.get("base_path", "./data/arc"),
                 database=active_storage.get('database', 'default')
             )
 

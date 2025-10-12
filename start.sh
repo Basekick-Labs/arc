@@ -178,10 +178,25 @@ case "$MODE" in
         fi
 
         # Create directories
-        mkdir -p data logs /tmp/arc-data "$SCRIPT_DIR/minio-data"
+        mkdir -p data logs /tmp/arc-data
 
-        # Check if MinIO binary is available
-        if ! command -v minio &> /dev/null; then
+        # Check storage backend from arc.conf
+        STORAGE_BACKEND="minio"  # default
+        if [ -f "arc.conf" ]; then
+            # Extract backend value from arc.conf (handles both quoted and unquoted values)
+            STORAGE_BACKEND=$(grep -E "^\s*backend\s*=" arc.conf | head -1 | sed -E 's/.*=\s*"?([^"]+)"?.*/\1/' | tr -d ' ')
+        fi
+        # Allow environment variable override
+        STORAGE_BACKEND="${STORAGE_BACKEND:-${STORAGE_BACKEND}}"
+
+        echo -e "${YELLOW}Storage backend: $STORAGE_BACKEND${NC}"
+
+        # Only setup MinIO if using minio backend
+        if [ "$STORAGE_BACKEND" = "minio" ]; then
+            mkdir -p "$SCRIPT_DIR/minio-data"
+
+            # Check if MinIO binary is available
+            if ! command -v minio &> /dev/null; then
             echo -e "${YELLOW}MinIO binary not found. Installing...${NC}"
 
             # Detect architecture
@@ -337,6 +352,9 @@ case "$MODE" in
             echo -e "${GREEN}✓ MinIO configured${NC}"
         else
             echo -e "${GREEN}✓ MinIO is already running${NC}"
+        fi
+        else
+            echo -e "${GREEN}✓ Skipping MinIO (using $STORAGE_BACKEND backend)${NC}"
         fi
 
         echo ""

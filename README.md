@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  High-performance time-series data warehouse built on DuckDB, Parquet, and MinIO.
+  High-performance time-series data warehouse built on DuckDB and Parquet with flexible storage options.
 </p>
 
 > **⚠️ Alpha Release - Technical Preview**
@@ -24,7 +24,7 @@
 - **Write-Ahead Log (WAL)**: Optional durability feature for zero data loss (disabled by default) - [Learn More](docs/WAL.md)
 - **Automatic File Compaction**: Merges small Parquet files into larger ones for 10-50x faster queries (enabled by default) - [Learn More](docs/COMPACTION.md)
 - **DuckDB Query Engine**: Fast analytical queries with SQL, cross-database joins, and advanced analytics
-- **Distributed Storage with MinIO**: S3-compatible object storage for unlimited scale and cost-effective data management (recommended). Also supports local disk, AWS S3, and GCS
+- **Flexible Storage Options**: Local filesystem (fastest), MinIO (distributed), AWS S3/R2 (cloud), or Google Cloud Storage
 - **Data Import**: Import data from InfluxDB, TimescaleDB, HTTP endpoints
 - **Query Caching**: Configurable result caching for improved performance
 - **Apache Superset Integration**: Native dialect for BI dashboards with multi-database schema support
@@ -32,24 +32,29 @@
 
 ## Performance Benchmark 🚀
 
-**Arc achieves 2.01M records/sec with MessagePack binary protocol!**
+**Arc achieves 2.08M records/sec with local NVMe storage!**
 
-| Metric | Value | Notes |
-|--------|-------|-------|
-| **Throughput** | **2.01M records/sec** | MessagePack binary protocol |
-| **p50 Latency** | **16.62ms** | Median response time (-8.7% improvement) |
-| **p95 Latency** | **147.12ms** | 95th percentile (-20.3% improvement) |
-| **p99 Latency** | **317.53ms** | 99th percentile (-19.6% improvement) |
-| **Success Rate** | **100%** | Production-grade reliability |
-| **vs Line Protocol** | **8.4x faster** | 240K → 2.01M RPS |
+### Write Performance Comparison
 
-*Tested on Apple M3 Max (14 cores), native deployment with MinIO*
-*Optimizations: MessagePack streaming decoder, columnar Polars construction*
+| Storage Backend | Throughput | p50 Latency | p95 Latency | p99 Latency | Notes |
+|----------------|------------|-------------|-------------|-------------|-------|
+| **Local NVMe** | **2.08M RPS** | **14.2ms** | **126ms** | **287ms** | Direct filesystem (fastest) |
+| **MinIO** | **2.01M RPS** | **16.6ms** | **147ms** | **318ms** | S3-compatible object storage |
+| **Line Protocol** | **240K RPS** | N/A | N/A | N/A | InfluxDB compatibility mode |
+
+**Performance Improvements (Local vs MinIO):**
+- Throughput: +3.5% (2.08M vs 2.01M RPS)
+- p50 Latency: -14.4% (14.2ms vs 16.6ms)
+- p95 Latency: -14.0% (126ms vs 147ms)
+- p99 Latency: -9.5% (287ms vs 318ms)
+
+*Tested on Apple M3 Max (14 cores), native deployment*
+*MessagePack binary protocol with streaming decoder and columnar Polars construction*
 
 **🎯 Optimal Configuration:**
 - **Workers:** 3x CPU cores (e.g., 14 cores = 42 workers)
-- **Deployment:** Native mode (2.4x faster than Docker)
-- **Storage:** MinIO native (not containerized)
+- **Deployment:** Native mode (3.5x faster than Docker)
+- **Storage:** Local filesystem for maximum performance, MinIO for distributed deployments
 - **Protocol:** MessagePack binary (`/write/v2/msgpack`)
 
 ## Quick Start (Native - Recommended for Maximum Performance)
@@ -136,39 +141,65 @@ default_token = ""  # Leave empty to auto-generate
 enabled = true
 ttl_seconds = 60
 
-# Storage Backend (MinIO recommended)
+# Storage Backend Configuration
 [storage]
-backend = "minio"
+backend = "local"  # Options: local, minio, s3, gcs, ceph
 
-[storage.minio]
-endpoint = "http://minio:9000"
-access_key = "minioadmin"
-secret_key = "minioadmin123"
-bucket = "arc"
-database = "default"  # Database namespace
-use_ssl = false
+# Option 1: Local Filesystem (fastest, single-node)
+[storage.local]
+base_path = "./data/arc"      # Or "/mnt/nvme/arc-data" for dedicated storage
+database = "default"
 
-# For AWS S3
+# Option 2: MinIO (recommended for distributed deployments)
+# [storage]
+# backend = "minio"
+# [storage.minio]
+# endpoint = "http://minio:9000"
+# access_key = "minioadmin"
+# secret_key = "minioadmin123"
+# bucket = "arc"
+# database = "default"
+# use_ssl = false
+
+# Option 3: AWS S3 / Cloudflare R2
 # [storage]
 # backend = "s3"
 # [storage.s3]
 # bucket = "arc-data"
 # database = "default"
 # region = "us-east-1"
+# access_key = "YOUR_ACCESS_KEY"
+# secret_key = "YOUR_SECRET_KEY"
 
-# For Google Cloud Storage
+# Option 4: Google Cloud Storage
 # [storage]
 # backend = "gcs"
 # [storage.gcs]
 # bucket = "arc-data"
 # database = "default"
 # project_id = "my-project"
+# credentials_file = "/path/to/service-account.json"
 ```
 
 **Configuration Priority** (highest to lowest):
 1. Environment variables (e.g., `ARC_WORKERS=16`)
 2. `arc.conf` file
 3. Built-in defaults
+
+### Storage Backend Selection Guide
+
+| Backend | Performance | Use Case | Pros | Cons |
+|---------|-------------|----------|------|------|
+| **Local** | ⚡ Fastest (2.08M RPS) | Single-node, development, edge | Direct I/O, no overhead, simple setup | No distribution, single point of failure |
+| **MinIO** | 🚀 Fast (2.01M RPS) | Distributed, multi-tenant | S3-compatible, scalable, cost-effective | Requires MinIO service, slight overhead |
+| **AWS S3** | ☁️ Cloud-native | Production, unlimited scale | Fully managed, 99.999999999% durability | Network latency, costs |
+| **GCS** | ☁️ Cloud-native | Google Cloud deployments | Integrated with GCP, global CDN | Network latency, costs |
+
+**Recommendation:**
+- **Development/Testing**: Local filesystem (`backend = "local"`)
+- **Production (single-node)**: Local filesystem with NVMe storage
+- **Production (distributed)**: MinIO or AWS S3/R2
+- **Cloud deployments**: AWS S3, Cloudflare R2, or Google Cloud Storage
 
 ### Environment Variable Overrides
 
@@ -180,13 +211,17 @@ ARC_HOST=0.0.0.0
 ARC_PORT=8000
 ARC_WORKERS=8
 
-# Storage
-STORAGE_BACKEND=minio
-MINIO_ENDPOINT=minio:9000
-MINIO_ACCESS_KEY=minioadmin
-MINIO_SECRET_KEY=minioadmin123
-MINIO_BUCKET=arc
-MINIO_DATABASE=default  # Database namespace
+# Storage - Local Filesystem
+STORAGE_BACKEND=local
+STORAGE_LOCAL_BASE_PATH=/data/arc
+STORAGE_LOCAL_DATABASE=default
+
+# Storage - MinIO (alternative)
+# STORAGE_BACKEND=minio
+# MINIO_ENDPOINT=minio:9000
+# MINIO_ACCESS_KEY=minioadmin
+# MINIO_SECRET_KEY=minioadmin123
+# MINIO_BUCKET=arc
 
 # Cache
 QUERY_CACHE_ENABLED=true

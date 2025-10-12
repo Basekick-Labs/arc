@@ -27,13 +27,20 @@ class LocalBackend:
         self.base_path.mkdir(parents=True, exist_ok=True)
         logger.info(f"Local storage backend initialized at {self.base_path} for database '{self.database}'")
 
-    async def upload_file(self, local_path: Path, key: str) -> bool:
+    async def upload_file(self, local_path: Path, key: str, database_override: str = None) -> bool:
         """Copy file to local storage location asynchronously
 
         Files are stored under: {base_path}/{database}/{key}
+
+        Args:
+            local_path: Path to the source file
+            key: Destination key/path relative to database directory
+            database_override: Optional database name to use instead of self.database
         """
         try:
-            dest_path = self.base_path / self.database / key
+            # Use override database if provided, otherwise use default
+            database = database_override or self.database
+            dest_path = self.base_path / database / key
             dest_path.parent.mkdir(parents=True, exist_ok=True)
 
             # Read and write file asynchronously
@@ -93,20 +100,117 @@ class LocalBackend:
         else:
             return f"{self.base_path}/{self.database}/{measurement}_{year}_{month:02d}_*.parquet"
 
-    def list_objects(self) -> List[str]:
-        """List all parquet files in the base path"""
+    def list_objects(self, prefix: str = "", max_keys: int = 1000) -> List[str]:
+        """List parquet files in the base path with optional prefix filter
+
+        This method follows the same pattern as MinIO/S3 backends:
+        1. Searches within the database directory
+        2. Applies optional prefix filter within the database
+        3. Returns paths relative to the database (not base_path)
+
+        Args:
+            prefix: Optional prefix to filter results within database (e.g., "cpu/")
+            max_keys: Maximum number of keys to return (for compatibility with S3 backends)
+
+        Returns:
+            List of relative paths to parquet files (relative to database, not base_path)
+        """
         try:
             objects = []
-            for file_path in self.base_path.rglob("*.parquet"):
-                relative_path = str(file_path.relative_to(self.base_path))
-                objects.append(relative_path)
 
-            logger.info(f"Found {len(objects)} parquet files in local storage")
+            # Build search path: base_path/database/prefix
+            # This matches MinIO behavior: database prefix is automatically added
+            full_prefix = f"{self.database}/{prefix}" if prefix else f"{self.database}/"
+            search_path = self.base_path / full_prefix
+
+            if not search_path.exists():
+                logger.debug(f"Search path does not exist: {search_path}")
+                return []
+
+            # Find all parquet files under the search path
+            for file_path in search_path.rglob("*.parquet"):
+                # Get relative path from base_path
+                relative_to_base = str(file_path.relative_to(self.base_path))
+
+                # Strip database prefix (like MinIO does)
+                db_prefix = f"{self.database}/"
+                if relative_to_base.startswith(db_prefix):
+                    relative_to_db = relative_to_base[len(db_prefix):]
+                    objects.append(relative_to_db)
+
+                # Respect max_keys limit
+                if len(objects) >= max_keys:
+                    break
+
+            logger.debug(f"Found {len(objects)} parquet files in database '{self.database}' with prefix '{prefix}'")
             return objects
 
         except Exception as e:
             logger.error(f"Failed to list objects: {e}")
             return []
+
+    def download_file(self, key: str, local_path: str):
+        """
+        'Download' file from storage to local path.
+
+        For local backend, files are already on the filesystem.
+        This method creates a symlink instead of copying to save I/O.
+
+        Args:
+            key: Storage key (relative to database)
+            local_path: Destination path for the file
+        """
+        try:
+            # Build source path: base_path/database/key
+            source_path = self.base_path / self.database / key
+
+            if not source_path.exists():
+                raise FileNotFoundError(f"Source file not found: {source_path}")
+
+            # Convert local_path to Path object
+            dest_path = Path(local_path)
+
+            # If destination already exists and points to source, we're done
+            if dest_path.exists():
+                if dest_path.resolve() == source_path.resolve():
+                    logger.debug(f"File already accessible at: {dest_path}")
+                    return
+                # Remove existing symlink/file
+                dest_path.unlink()
+
+            # Ensure destination directory exists
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Create symlink instead of copying (much faster!)
+            dest_path.symlink_to(source_path.resolve())
+            logger.debug(f"Created symlink {dest_path} -> {source_path}")
+
+        except Exception as e:
+            logger.error(f"Failed to create symlink for {key}: {e}")
+            raise
+
+    def delete_file(self, key: str):
+        """
+        Delete file from local storage
+
+        Args:
+            key: Storage key (relative to database)
+        """
+        try:
+            # Build file path: base_path/database/key
+            file_path = self.base_path / self.database / key
+
+            if not file_path.exists():
+                logger.warning(f"File to delete not found: {file_path}")
+                return
+
+            # Delete file
+            file_path.unlink()
+            logger.debug(f"Deleted file: {file_path}")
+
+        except Exception as e:
+            logger.error(f"Failed to delete {key}: {e}")
+            raise
 
     async def configure_duckdb_s3(self, duckdb_conn):
         """Configure DuckDB for local file access (no special config needed)"""
