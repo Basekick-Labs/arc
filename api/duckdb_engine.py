@@ -483,7 +483,7 @@ class DuckDBEngine:
 
         try:
             # Find storage backend
-            backend = self.minio_backend or self.s3_backend or self.ceph_backend or self.gcs_backend
+            backend = self.local_backend or self.minio_backend or self.s3_backend or self.ceph_backend or self.gcs_backend
             if not backend:
                 return {
                     "success": True,
@@ -495,8 +495,27 @@ class DuckDBEngine:
             # Determine which database to query
             target_database = database_filter if database_filter else backend.database
 
+            # Handle local filesystem backend differently
+            if self.local_backend:
+                from pathlib import Path
+                base_path = Path(self.local_backend.base_path)
+                database_path = base_path / target_database
+
+                objects = []
+                if database_path.exists():
+                    # Walk the database directory to find measurement directories
+                    for measurement_dir in database_path.iterdir():
+                        if measurement_dir.is_dir() and not measurement_dir.name.startswith('.'):
+                            # This is a measurement directory, find all parquet files
+                            for file_path in measurement_dir.rglob('*.parquet'):
+                                # Make path relative to database dir
+                                relative_path = file_path.relative_to(database_path)
+                                objects.append(str(relative_path))
+
+                logger.info(f"Local filesystem found {len(objects)} files for database {target_database}")
+
             # If querying a different database than backend's default, use S3 directly
-            if database_filter and database_filter != backend.database:
+            elif database_filter and database_filter != backend.database:
                 # Scan specific database using S3 client directly
                 objects = []
                 try:
@@ -544,12 +563,18 @@ class DuckDBEngine:
                     # Track table info
                     table_key = f"{target_database}.{measurement}"
                     if table_key not in tables:
+                        # Determine storage path based on backend type
+                        if self.local_backend:
+                            storage_path = f"{self.local_backend.base_path}/{target_database}/{measurement}/"
+                        else:
+                            storage_path = f"s3://{backend.bucket}/{target_database}/{measurement}/"
+
                         tables[table_key] = {
                             "database": target_database,
                             "table_name": measurement,
                             "file_count": 0,
                             "total_size": 0,
-                            "storage_path": f"s3://{backend.bucket}/{target_database}/{measurement}/"
+                            "storage_path": storage_path
                         }
 
                     # Count files and size if it's a parquet file
