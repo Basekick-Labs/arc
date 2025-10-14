@@ -34,7 +34,7 @@ This document explains Arc's automatic compaction system, how it works, and how 
 Arc's high-performance ingestion creates many small files:
 
 ```
-At 1.93M records/sec with 5-second flush interval:
+At 2.11M records/sec with 5-second flush interval:
 → 9.65M records every 5 seconds
 → ~12 files per minute per measurement
 → ~720 files per hour per measurement
