@@ -221,16 +221,16 @@ class DuckDBEngine:
         Returns:
             Dict with success, data, columns, row_count, execution_time_ms, wait_time_ms
         """
-        # Convert SQL for S3 paths
-        converted_sql = self._convert_sql_to_s3_paths(sql)
-
-        # Check for SHOW TABLES command (uses old connection)
+        # Check for SHOW TABLES command BEFORE rewriting SQL (uses old connection)
         if self._is_show_tables_query(sql):
             return await self._execute_show_tables_legacy(sql)
 
-        # Check for SHOW DATABASES command
+        # Check for SHOW DATABASES command BEFORE rewriting SQL
         if self._is_show_databases_query(sql):
             return await self._execute_show_databases_legacy(sql)
+
+        # Convert SQL for S3 paths (only for regular queries)
+        converted_sql = self._convert_sql_to_s3_paths(sql)
 
         # Use connection pool for query execution
         result = await self.connection_pool.execute_async(
