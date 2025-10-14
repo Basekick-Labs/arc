@@ -22,6 +22,7 @@ from queue import Queue, Empty, Full
 from threading import Lock, RLock
 from typing import Dict, Optional, Any, List, Callable
 import duckdb
+import pyarrow as pa
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +125,31 @@ class DuckDBConnection:
                 self.stats.current_query = None
 
                 return result, columns
+
+            except Exception as e:
+                self.stats.failed_queries += 1
+                self.stats.current_query = None
+                raise e
+
+    def execute_arrow(self, sql: str) -> Any:
+        """Execute query and return Arrow table (columnar format)"""
+        with self.lock:
+            if not self.stats.is_healthy:
+                raise RuntimeError(f"Connection {self.stats.connection_id} is unhealthy")
+
+            self.stats.current_query = sql[:100]  # Store first 100 chars
+            start_time = time.time()
+
+            try:
+                arrow_table = self.conn.execute(sql).fetch_arrow_table()
+
+                execution_time = time.time() - start_time
+                self.stats.total_queries += 1
+                self.stats.total_execution_time += execution_time
+                self.stats.last_used = time.time()
+                self.stats.current_query = None
+
+                return arrow_table
 
             except Exception as e:
                 self.stats.failed_queries += 1
@@ -416,6 +442,134 @@ class DuckDBConnectionPool:
             "data": serialized_data,
             "columns": columns,
             "row_count": len(result),
+            "execution_time_ms": round(exec_time * 1000, 2),
+            "wait_time_ms": round(wait_time * 1000, 2)
+        }
+
+    async def execute_arrow_async(
+        self,
+        sql: str,
+        priority: QueryPriority = QueryPriority.NORMAL,
+        timeout: float = 300.0
+    ) -> Dict[str, Any]:
+        """
+        Execute query asynchronously and return Apache Arrow table (columnar format).
+
+        Args:
+            sql: SQL query to execute
+            priority: Query priority level
+            timeout: Max seconds for query execution (including queue time)
+
+        Returns:
+            Dict with success, arrow_table (bytes), schema, row_count, execution_time_ms, wait_time_ms
+        """
+        query = QueuedQuery(
+            sql=sql,
+            priority=priority,
+            submitted_at=time.time(),
+            timeout=timeout
+        )
+
+        # Try to get connection immediately
+        conn = self.get_connection(timeout=0.1)
+
+        if conn is None:
+            # Pool exhausted, add to queue
+            with self.queue_lock:
+                if len(self.query_queue) >= self.max_queue_size:
+                    self.total_queries_failed += 1
+                    logger.error(f"Query queue full ({self.max_queue_size}), rejecting query")
+                    return {
+                        "success": False,
+                        "error": "Query queue full - system under heavy load",
+                        "arrow_table": None,
+                        "row_count": 0
+                    }
+
+                # Add to priority queue
+                self.query_queue.append(query)
+                self.total_queries_queued += 1
+                logger.info(f"Query queued (priority={priority.name}, queue_depth={len(self.query_queue)})")
+
+            # Wait for connection with timeout
+            start_wait = time.time()
+            while (time.time() - start_wait) < timeout:
+                conn = self.get_connection(timeout=1.0)
+                if conn:
+                    break
+
+                # Check if query expired
+                if query.is_expired():
+                    with self.queue_lock:
+                        try:
+                            self.query_queue.remove(query)
+                        except ValueError:
+                            pass
+                    self.total_queries_timeout += 1
+                    logger.warning(f"Query {query.query_id} timed out in queue")
+                    return {
+                        "success": False,
+                        "error": f"Query timeout ({timeout}s) - consider reducing query complexity",
+                        "arrow_table": None,
+                        "row_count": 0
+                    }
+
+            if conn is None:
+                self.total_queries_timeout += 1
+                return {
+                    "success": False,
+                    "error": "Timeout waiting for database connection",
+                    "arrow_table": None,
+                    "row_count": 0
+                }
+
+            wait_time = time.time() - start_wait
+            self.wait_times.append(wait_time)
+        else:
+            wait_time = 0.0
+
+        # Execute query
+        arrow_table = None
+        exec_time = 0.0
+
+        try:
+            loop = asyncio.get_event_loop()
+            start_exec = time.time()
+
+            arrow_table = await loop.run_in_executor(None, conn.execute_arrow, sql)
+
+            exec_time = time.time() - start_exec
+            self.execution_times.append(exec_time)
+            self.total_queries_executed += 1
+
+        except Exception as e:
+            self.total_queries_failed += 1
+            logger.error(f"Arrow query execution failed: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "arrow_table": None,
+                "row_count": 0
+            }
+
+        finally:
+            # OPTIMIZATION: Return connection ASAP (before serialization)
+            # This allows other queries to use the connection while we serialize
+            self.return_connection(conn)
+
+        # Serialize Arrow table to IPC format AFTER releasing connection
+        sink = pa.BufferOutputStream()
+        writer = pa.ipc.new_stream(sink, arrow_table.schema)
+        writer.write_table(arrow_table)
+        writer.close()
+        arrow_bytes = sink.getvalue().to_pybytes()
+
+        logger.info(f"Arrow query executed: {len(arrow_table)} rows in {exec_time:.3f}s (wait: {wait_time:.3f}s)")
+
+        return {
+            "success": True,
+            "arrow_table": arrow_bytes,
+            "row_count": len(arrow_table),
             "execution_time_ms": round(exec_time * 1000, 2),
             "wait_time_ms": round(wait_time * 1000, 2)
         }

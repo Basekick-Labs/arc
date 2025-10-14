@@ -1146,6 +1146,63 @@ async def execute_sql(request: Request, query: QueryRequest):
         logger.error(f"Query execution error: {e}")
         raise HTTPException(status_code=500, detail=f"Query execution failed: {str(e)}")
 
+@app.post("/query/arrow")
+async def execute_sql_arrow(request: Request, query: QueryRequest):
+    """Execute SQL query and return Apache Arrow IPC stream (columnar format)
+
+    This endpoint returns data in Apache Arrow IPC format for zero-copy columnar processing.
+    Perfect for analytics tools and data pipelines that support Arrow.
+
+    Response format: application/vnd.apache.arrow.stream
+    """
+    if not query_engine:
+        raise HTTPException(status_code=500, detail="Query engine not initialized")
+
+    try:
+        from fastapi.responses import Response
+
+        # Execute query with Arrow format
+        result = await asyncio.wait_for(
+            query_engine.execute_query_arrow(query.sql),
+            timeout=300.0
+        )
+
+        # Log query execution
+        log_query_execution(
+            logger,
+            sql=query.sql,
+            duration_ms=result.get("execution_time_ms", 0.0),
+            row_count=result.get("row_count", 0),
+            success=result["success"],
+            query_format="arrow",
+            limit=None
+        )
+
+        if not result["success"]:
+            error_msg = result.get("error", "Unknown error")
+            raise HTTPException(status_code=400, detail=error_msg)
+
+        # Return Arrow IPC stream as binary response
+        # Note: Schema is embedded in the Arrow IPC stream, no need to send separately
+        return Response(
+            content=result["arrow_table"],
+            media_type="application/vnd.apache.arrow.stream",
+            headers={
+                "X-Row-Count": str(result.get("row_count", 0)),
+                "X-Execution-Time-Ms": str(result.get("execution_time_ms", 0)),
+                "X-Wait-Time-Ms": str(result.get("wait_time_ms", 0))
+            }
+        )
+
+    except asyncio.TimeoutError:
+        logger.error("Arrow query timed out after 5 minutes")
+        raise HTTPException(status_code=408, detail="Query timed out after 5 minutes")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Arrow query execution error: {e}")
+        raise HTTPException(status_code=500, detail=f"Arrow query execution failed: {str(e)}")
+
 @app.get("/measurements")
 async def list_measurements():
     """List available measurements"""
