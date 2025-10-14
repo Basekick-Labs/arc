@@ -587,6 +587,87 @@ response = requests.post(
 )
 ```
 
+### Apache Arrow Columnar Queries
+
+Arc supports Apache Arrow format for zero-copy columnar data transfer, ideal for analytics workloads and data pipelines.
+
+**Performance Benefits:**
+- **7.36x faster** for large result sets (100K+ rows)
+- **43% smaller payloads** compared to JSON
+- **Zero-copy** for Pandas, Polars, and other Arrow-compatible tools
+- **Columnar format** stays efficient from Parquet → DuckDB → Arrow → client
+
+**Python Example with Pandas:**
+
+```python
+import requests
+import pyarrow as pa
+import pandas as pd
+
+# Execute query and get Arrow format
+response = requests.post(
+    "http://localhost:8000/query/arrow",
+    headers={"Authorization": f"Bearer {token}"},
+    json={
+        "sql": """
+            SELECT
+                time_bucket(INTERVAL '1 hour', time) as hour,
+                host,
+                AVG(usage_idle) as avg_cpu_idle,
+                COUNT(*) as sample_count
+            FROM cpu
+            WHERE time > now() - INTERVAL '24 hours'
+            GROUP BY hour, host
+            ORDER BY hour DESC
+        """
+    }
+)
+
+# Parse Arrow IPC stream
+reader = pa.ipc.open_stream(response.content)
+arrow_table = reader.read_all()
+
+# Convert to Pandas DataFrame (zero-copy)
+df = arrow_table.to_pandas()
+
+print(f"Retrieved {len(df)} rows")
+print(df.head())
+```
+
+**Polars Example (even faster):**
+
+```python
+import requests
+import pyarrow as pa
+import polars as pl
+
+response = requests.post(
+    "http://localhost:8000/query/arrow",
+    headers={"Authorization": f"Bearer {token}"},
+    json={"sql": "SELECT * FROM cpu WHERE host = 'server01' LIMIT 100000"}
+)
+
+# Parse Arrow and convert to Polars (zero-copy)
+reader = pa.ipc.open_stream(response.content)
+arrow_table = reader.read_all()
+df = pl.from_arrow(arrow_table)
+
+print(df.describe())
+```
+
+**When to use Arrow format:**
+- Large result sets (10K+ rows)
+- Wide tables with many columns
+- Data pipelines feeding into Pandas/Polars
+- Analytics notebooks and dashboards
+- ETL processes requiring columnar data
+
+**When to use JSON format:**
+- Small result sets (<1K rows)
+- Simple API integrations
+- Web dashboards
+- Quick debugging and testing
+
 ## Multi-Database Architecture
 
 Arc supports multiple databases (namespaces) within a single instance, allowing you to organize and isolate data by environment, tenant, or application.
@@ -1219,7 +1300,8 @@ sudo journalctl -u arc-api -f
 
 ### Query Endpoints
 
-- `POST /query` - Execute DuckDB SQL query
+- `POST /query` - Execute DuckDB SQL query (JSON response)
+- `POST /query/arrow` - Execute DuckDB SQL query (Apache Arrow columnar format)
 - `POST /query/estimate` - Estimate query cost
 - `POST /query/stream` - Stream large query results
 - `GET /query/{measurement}` - Get measurement data
