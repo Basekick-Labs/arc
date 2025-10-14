@@ -14,7 +14,7 @@
   High-performance time-series data warehouse built on DuckDB and Parquet with flexible storage options.
 </p>
 
-> **⚠️ Alpha Release - Technical Preview**
+> **Alpha Release - Technical Preview**
 > Arc Core is currently in active development and evolving rapidly. While the system is stable and functional, it is **not recommended for production workloads** at this time. We are continuously improving performance, adding features, and refining the API. Use in development and testing environments only.
 
 ## Features
@@ -30,7 +30,7 @@
 - **Apache Superset Integration**: Native dialect for BI dashboards with multi-database schema support
 - **Production Ready**: Docker deployment with health checks and monitoring
 
-## Performance Benchmark 🚀
+## Performance Benchmark
 
 **Arc achieves 2.32M records/sec with columnar MessagePack format!**
 
@@ -42,7 +42,7 @@
 | **MessagePack Row** | **908K RPS** | **136.86ms** | **851.71ms** | **1542ms** | Legacy format with conversion overhead |
 | **Line Protocol** | **240K RPS** | N/A | N/A | N/A | InfluxDB compatibility mode |
 
-**🔥 Columnar Format Advantages:**
+**Columnar Format Advantages:**
 - **2.55x faster throughput** vs row format (2.32M vs 908K RPS)
 - **20x lower p50 latency** (6.75ms vs 136.86ms)
 - **21x lower p95 latency** (39.46ms vs 851.71ms)
@@ -60,13 +60,13 @@
 | **MinIO** | **~2.0M RPS** | S3-compatible object storage |
 
 **Why is columnar format so much faster?**
-1. ✅ **Zero conversion overhead** - No flatten tags/fields, no row→column conversion
-2. ✅ **Better batching** - 1000 records in one columnar structure vs 1000 individual dicts
-3. ✅ **Smaller wire payload** - Field names sent once instead of repeated per-record
-4. ✅ **More efficient memory** - Arrays are more compact than list of dicts
-5. ✅ **Less lock contention** - Fewer buffer operations per batch
+1. **Zero conversion overhead** - No flatten tags/fields, no row→column conversion
+2. **Better batching** - 1000 records in one columnar structure vs 1000 individual dicts
+3. **Smaller wire payload** - Field names sent once instead of repeated per-record
+4. **More efficient memory** - Arrays are more compact than list of dicts
+5. **Less lock contention** - Fewer buffer operations per batch
 
-**🎯 Optimal Configuration:**
+**Optimal Configuration:**
 - **Format:** MessagePack columnar (2.55x faster than row format)
 - **Workers:** ~30x CPU cores for I/O-bound workloads (e.g., 14 cores = 400 workers)
 - **Deployment:** Native mode (3.5x faster than Docker)
@@ -213,10 +213,10 @@ database = "default"
 
 | Backend | Performance | Use Case | Pros | Cons |
 |---------|-------------|----------|------|------|
-| **Local** | ⚡ Fastest (2.08M RPS) | Single-node, development, edge | Direct I/O, no overhead, simple setup | No distribution, single point of failure |
-| **MinIO** | 🚀 Fast (2.01M RPS) | Distributed, multi-tenant | S3-compatible, scalable, cost-effective | Requires MinIO service, slight overhead |
-| **AWS S3** | ☁️ Cloud-native | Production, unlimited scale | Fully managed, 99.999999999% durability | Network latency, costs |
-| **GCS** | ☁️ Cloud-native | Google Cloud deployments | Integrated with GCP, global CDN | Network latency, costs |
+| **Local** | Fastest (2.32M RPS) | Single-node, development, edge | Direct I/O, no overhead, simple setup | No distribution, single point of failure |
+| **MinIO** | Fast (~2.0M RPS) | Distributed, multi-tenant | S3-compatible, scalable, cost-effective | Requires MinIO service, slight overhead |
+| **AWS S3** | Cloud-native | Production, unlimited scale | Fully managed, 99.999999999% durability | Network latency, costs |
+| **GCS** | Cloud-native | Google Cloud deployments | Integrated with GCP, global CDN | Network latency, costs |
 
 **Recommendation:**
 - **Development/Testing**: Local filesystem (`backend = "local"`)
@@ -349,9 +349,9 @@ response = requests.post(
 
 # Check response (returns 204 No Content on success)
 if response.status_code == 204:
-    print(f"✓ Successfully wrote {len(data['columns']['time'])} records!")
+    print(f"Successfully wrote {len(data['columns']['time'])} records!")
 else:
-    print(f"✗ Error {response.status_code}: {response.text}")
+    print(f"Error {response.status_code}: {response.text}")
 ```
 
 **High-throughput batch ingestion** (columnar format - 2.32M RPS):
@@ -384,11 +384,11 @@ response = requests.post(
 )
 
 if response.status_code == 204:
-    print(f"✓ Wrote 10,000 records successfully at 2.32M RPS!")
+    print(f"Wrote 10,000 records successfully at 2.32M RPS!")
 ```
 
 <details>
-<summary><b>📜 Row Format (Legacy - 2.55x slower, kept for compatibility)</b></summary>
+<summary><b>Row Format (Legacy - 2.55x slower, kept for compatibility)</b></summary>
 
 **Only use row format if you cannot generate columnar data client-side:**
 
@@ -438,7 +438,7 @@ response = requests.post(
 )
 ```
 
-**⚠️ Performance Warning**: Row format has 20-26x higher latency and 2.55x lower throughput than columnar format. Use columnar format whenever possible.
+**Performance Warning**: Row format has 20-26x higher latency and 2.55x lower throughput than columnar format. Use columnar format whenever possible.
 
 </details>
 
@@ -830,14 +830,14 @@ Arc includes an optional Write-Ahead Log (WAL) for applications requiring **zero
 ### When to Enable WAL
 
 Enable WAL if you need:
-- ✅ **Zero data loss** on crashes
-- ✅ **Regulatory compliance** (finance, healthcare)
-- ✅ **Guaranteed durability** for critical data
+- **Zero data loss** on crashes
+- **Regulatory compliance** (finance, healthcare)
+- **Guaranteed durability** for critical data
 
 Keep WAL disabled if you:
-- ⚡ **Prioritize maximum throughput** (2.01M records/sec)
-- 💰 **Can tolerate 0-5 seconds data loss** on rare crashes
-- 🔄 **Have upstream retry logic** (Kafka, message queues)
+- **Prioritize maximum throughput** (2.01M records/sec)
+- **Can tolerate 0-5 seconds data loss** on rare crashes
+- **Have upstream retry logic** (Kafka, message queues)
 
 ### Performance Impact
 
@@ -882,7 +882,7 @@ curl http://localhost:8000/api/wal/health
 curl -X POST http://localhost:8000/api/wal/cleanup
 ```
 
-**📖 For complete WAL documentation, see [docs/WAL.md](docs/WAL.md)**
+**For complete WAL documentation, see [docs/WAL.md](docs/WAL.md)**
 
 ## File Compaction - Query Optimization
 
@@ -986,14 +986,16 @@ To disable, edit [arc.conf](arc.conf):
 enabled = false
 ```
 
-**📖 For complete compaction documentation, see [docs/COMPACTION.md](docs/COMPACTION.md)**
+**For complete compaction documentation, see [docs/COMPACTION.md](docs/COMPACTION.md)**
 
 ## Architecture Overview
+
+Arc's architecture is optimized for high-throughput time-series ingestion with **MessagePack columnar format** as the recommended ingestion path, delivering 2.32M records/sec with zero-copy passthrough to Parquet.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                     Client Applications                      │
-│  (Telegraf, Python, Go, JavaScript, curl, etc.)             │
+│  (Python, Go, JavaScript, Telegraf, curl, etc.)             │
 └──────────────────┬──────────────────────────────────────────┘
                    │
                    │ HTTP/HTTPS
@@ -1001,8 +1003,9 @@ enabled = false
 ┌─────────────────────────────────────────────────────────────┐
 │                   Arc API Layer (FastAPI)                    │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │ Line Protocol│  │  MessagePack │  │  Query Engine    │  │
-│  │   Endpoint   │  │   Binary API │  │   (DuckDB)       │  │
+│  │  MessagePack │  │ Line Protocol│  │  Query Engine    │  │
+│  │Columnar (REC)│  │   (Legacy)   │  │   (DuckDB)       │  │
+│  │ 2.32M RPS    │  │  240K RPS    │  │                  │  │
 │  └──────────────┘  └──────────────┘  └──────────────────┘  │
 └──────────────────┬──────────────────────────────────────────┘
                    │
@@ -1011,32 +1014,41 @@ enabled = false
 ┌─────────────────────────────────────────────────────────────┐
 │              Buffering & Processing Layer                    │
 │  ┌──────────────────────────────────────────────────────┐  │
-│  │  ParquetBuffer (Line Protocol)                       │  │
-│  │  - Batches records by measurement                    │  │
-│  │  - Polars DataFrame → Parquet                        │  │
-│  │  - Snappy compression                                │  │
+│  │  ArrowParquetBuffer (MessagePack Columnar)           │  │
+│  │  RECOMMENDED - Zero-copy passthrough                 │  │
+│  │  - Client sends columnar data                        │  │
+│  │  - Direct PyArrow RecordBatch → Parquet              │  │
+│  │  - No row→column conversion (2.55x faster)           │  │
+│  │  - Minimal memory overhead                           │  │
+│  │  - Throughput: 2.32M RPS                             │  │
 │  └──────────────────────────────────────────────────────┘  │
 │  ┌──────────────────────────────────────────────────────┐  │
-│  │  ArrowParquetBuffer (MessagePack Binary)             │  │
-│  │  - Zero-copy PyArrow RecordBatch                     │  │
-│  │  - Direct Parquet writes (3x faster)                 │  │
-│  │  - Columnar from start                               │  │
+│  │  ParquetBuffer (Line Protocol / MessagePack Row)     │  │
+│  │  LEGACY - For compatibility                          │  │
+│  │  - Flattens tags/fields                              │  │
+│  │  - Row→column conversion                             │  │
+│  │  - Polars DataFrame → Parquet                        │  │
+│  │  - Throughput: 240K-908K RPS                         │  │
 │  └──────────────────────────────────────────────────────┘  │
 └──────────────────┬──────────────────────────────────────────┘
                    │
-                   │ Parquet Files
+                   │ Parquet Files (columnar format)
                    ▼
 ┌─────────────────────────────────────────────────────────────┐
 │              Storage Backend (Pluggable)                     │
 │  ┌────────────────────────────────────────────────────────┐ │
-│  │  MinIO (Recommended - S3-compatible)                   │ │
-│  │  ✓ Unlimited scale          ✓ Distributed             │ │
-│  │  ✓ Cost-effective           ✓ Self-hosted             │ │
-│  │  ✓ High availability        ✓ Erasure coding          │ │
-│  │  ✓ Multi-tenant             ✓ Object versioning       │ │
+│  │  Local NVMe (Fastest - 2.32M RPS)                     │ │
+│  │  • Direct I/O, minimal overhead                       │ │
+│  │  • Best for single-node, development, edge            │ │
+│  └────────────────────────────────────────────────────────┘ │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │  MinIO (Recommended for Production - ~2.0M RPS)       │ │
+│  │  • S3-compatible, distributed, scalable               │ │
+│  │  • High availability, erasure coding                  │ │
+│  │  • Multi-tenant, object versioning                    │ │
 │  └────────────────────────────────────────────────────────┘ │
 │                                                              │
-│  Alternative backends: Local Disk, AWS S3, Google Cloud     │
+│  Alternative backends: AWS S3/R2, Google Cloud Storage      │
 └─────────────────────────────────────────────────────────────┘
                    │
                    │ Query Path (Direct Parquet reads)
@@ -1047,8 +1059,26 @@ enabled = false
 │  - Columnar execution engine                                │
 │  - Query cache for common queries                           │
 │  - Full SQL interface (Postgres-compatible)                 │
+│  - Zero-copy aggregations on columnar data                  │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### Ingestion Flow (Columnar Format - Recommended)
+
+1. **Client generates columnar data**: `{m: "cpu", columns: {time: [...], host: [...], val: [...]}}`
+2. **MessagePack serialization**: Binary encoding (10-30% smaller than JSON)
+3. **Arc receives columnar batch**: No parsing overhead, validates array lengths
+4. **Zero-copy passthrough**: Direct PyArrow RecordBatch creation
+5. **Buffering**: In-memory columnar batches (minimal overhead)
+6. **Parquet writes**: Direct columnar → Parquet (no conversion)
+7. **Storage**: Write to local NVMe or MinIO (2.32M RPS sustained)
+
+**Key Advantages:**
+- **2.55x faster throughput** vs row format (2.32M vs 908K RPS)
+- **20-26x lower latency** (p50: 6.75ms vs 136ms)
+- **Zero conversion overhead** - No flatten, no row→column conversion
+- **Better compression** - Field names sent once, not per-record
+- **More efficient memory** - Arrays more compact than list of dicts
 
 ### Why MinIO?
 
@@ -1320,9 +1350,9 @@ LIMIT 1000;
 ```
 
 **Learn More:**
-- 📦 [Arc Superset Dialect Repository](https://github.com/basekick-labs/arc-superset-dialect)
-- 📚 [Integration Guide](https://github.com/basekick-labs/arc-superset-dialect#readme)
-- 🐍 [PyPI Package](https://pypi.org/project/arc-superset-dialect/) (once published)
+- [Arc Superset Dialect Repository](https://github.com/basekick-labs/arc-superset-dialect)
+- [Integration Guide](https://github.com/basekick-labs/arc-superset-dialect#readme)
+- [PyPI Package](https://pypi.org/project/arc-superset-dialect/) (once published)
 
 ## Roadmap
 
@@ -1341,10 +1371,10 @@ We welcome feedback and feature requests as we work toward a stable 1.0 release.
 Arc Core is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
 
 This means:
-- ✅ **Free to use** - Use Arc Core for any purpose
-- ✅ **Free to modify** - Modify the source code as needed
-- ✅ **Free to distribute** - Share your modifications with others
-- ⚠️ **Share modifications** - If you modify Arc and run it as a service, you must share your changes under AGPL-3.0
+- **Free to use** - Use Arc Core for any purpose
+- **Free to modify** - Modify the source code as needed
+- **Free to distribute** - Share your modifications with others
+- **Share modifications** - If you modify Arc and run it as a service, you must share your changes under AGPL-3.0
 
 ### Why AGPL?
 
