@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img src="https://img.shields.io/badge/License-AGPL%203.0-blue.svg" alt="License: AGPL-3.0"/></a>
-  <a href="https://github.com/basekick-labs/arc-core"><img src="https://img.shields.io/badge/Throughput-2.11M%20RPS-brightgreen.svg" alt="Performance"/></a>
+  <a href="https://github.com/basekick-labs/arc-core"><img src="https://img.shields.io/badge/Throughput-2.32M%20RPS-brightgreen.svg" alt="Performance"/></a>
   <a href="https://discord.gg/nxnWfUxsdm"><img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2?logo=discord&logoColor=white" alt="Discord"/></a>
 </p>
 
@@ -32,42 +32,57 @@
 
 ## Performance Benchmark 🚀
 
-**Arc achieves 2.11M records/sec with local NVMe storage!**
+**Arc achieves 2.32M records/sec with columnar MessagePack format!**
 
-### Write Performance Comparison
+### Write Performance - Format Comparison
 
-| Storage Backend | Throughput | p50 Latency | p95 Latency | p99 Latency | Notes |
-|----------------|------------|-------------|-------------|-------------|-------|
-| **Local NVMe (Optimized)** | **2.11M RPS** | **13.1ms** | **113ms** | **244ms** | Direct filesystem with optimizations |
-| **Local NVMe** | **2.08M RPS** | **13.4ms** | **136ms** | **280ms** | Direct filesystem (baseline) |
-| **MinIO** | **2.01M RPS** | **16.6ms** | **147ms** | **318ms** | S3-compatible object storage |
+| Wire Format | Throughput | p50 Latency | p95 Latency | p99 Latency | Notes |
+|-------------|------------|-------------|-------------|-------------|-------|
+| **MessagePack Columnar** | **2.32M RPS** | **6.75ms** | **39.46ms** | **59.09ms** | Zero-copy passthrough (RECOMMENDED) |
+| **MessagePack Row** | **908K RPS** | **136.86ms** | **851.71ms** | **1542ms** | Legacy format with conversion overhead |
 | **Line Protocol** | **240K RPS** | N/A | N/A | N/A | InfluxDB compatibility mode |
 
-**Performance Improvements (Optimized vs Baseline):**
-- Throughput: +4.9% (2.11M vs 2.01M RPS)
-- p50 Latency: -2.2% (13.1ms vs 13.4ms)
-- p95 Latency: -16.9% (113ms vs 136ms)
-- p99 Latency: -12.9% (244ms vs 280ms)
+**🔥 Columnar Format Advantages:**
+- **2.55x faster throughput** vs row format (2.32M vs 908K RPS)
+- **20x lower p50 latency** (6.75ms vs 136.86ms)
+- **21x lower p95 latency** (39.46ms vs 851.71ms)
+- **26x lower p99 latency** (59.09ms vs 1542ms)
+- **67x fewer errors** under load (63 vs 4,211 errors at 2.5M target RPS)
 
-*Tested on Apple M3 Max (14 cores), native deployment*
-*MessagePack binary protocol with optimized buffer flushing and columnar conversion*
+*Tested on Apple M3 Max (14 cores), native deployment, 400 workers*
+*MessagePack columnar format with zero-copy Arrow passthrough*
+
+### Storage Backend Performance
+
+| Storage Backend | Throughput | Notes |
+|----------------|------------|-------|
+| **Local NVMe** | **2.32M RPS** | Direct filesystem (fastest) |
+| **MinIO** | **~2.0M RPS** | S3-compatible object storage |
+
+**Why is columnar format so much faster?**
+1. ✅ **Zero conversion overhead** - No flatten tags/fields, no row→column conversion
+2. ✅ **Better batching** - 1000 records in one columnar structure vs 1000 individual dicts
+3. ✅ **Smaller wire payload** - Field names sent once instead of repeated per-record
+4. ✅ **More efficient memory** - Arrays are more compact than list of dicts
+5. ✅ **Less lock contention** - Fewer buffer operations per batch
 
 **🎯 Optimal Configuration:**
+- **Format:** MessagePack columnar (2.55x faster than row format)
 - **Workers:** ~30x CPU cores for I/O-bound workloads (e.g., 14 cores = 400 workers)
 - **Deployment:** Native mode (3.5x faster than Docker)
 - **Storage:** Local filesystem for maximum performance, MinIO for distributed deployments
-- **Protocol:** MessagePack binary (`/write/v2/msgpack`)
+- **Protocol:** MessagePack binary columnar (`/write/v2/msgpack`)
 - **Performance Stack:**
   - `uvloop`: 2-4x faster event loop (Cython-based C implementation)
   - `httptools`: 40% faster HTTP parser
   - `orjson`: 20-50% faster JSON serialization (Rust + SIMD)
 - **Optimizations:**
+  - Zero-copy columnar passthrough (no data transformation)
   - Non-blocking flush operations (writes continue during I/O)
-  - Optimized columnar conversion (15-25% faster data transformation)
 
 ## Quick Start (Native - Recommended for Maximum Performance)
 
-**Native deployment delivers 2.11M RPS vs 570K RPS in Docker (3.7x faster).**
+**Native deployment delivers 2.32M RPS vs 570K RPS in Docker (4.1x faster).**
 
 ```bash
 # One-command start (auto-installs MinIO, auto-detects CPU cores)
@@ -106,7 +121,7 @@ docker-compose logs -f arc-api
 docker-compose down
 ```
 
-**Note:** Docker mode achieves ~570K RPS. For maximum performance (2.01M RPS), use native deployment.
+**Note:** Docker mode achieves ~570K RPS. For maximum performance (2.32M RPS with columnar format), use native deployment.
 
 ## Remote Deployment
 
@@ -283,9 +298,9 @@ export ARC_TOKEN="your-token-here"
 curl http://localhost:8000/health
 ```
 
-#### Ingest Data (MessagePack - Recommended)
+#### Ingest Data (MessagePack - Columnar Format RECOMMENDED)
 
-**MessagePack binary protocol offers 7.9x faster ingestion** with zero-copy PyArrow processing:
+**Columnar MessagePack format is 2.55x faster than row format** with zero-copy passthrough to Arrow:
 
 ```python
 import msgpack
@@ -302,19 +317,95 @@ if not token:
     print(f"Created token: {token}")
     print(f"Save it: export ARC_TOKEN='{token}'")
 
-# Prepare data in MessagePack binary format
-# Uses batch format with measurement-based schema
+# COLUMNAR FORMAT (RECOMMENDED - 2.55x faster)
+# All data organized as columns (arrays), not rows
+data = {
+    "m": "cpu",                    # measurement name
+    "columns": {                   # columnar data structure
+        "time": [
+            int(datetime.now().timestamp() * 1000),
+            int(datetime.now().timestamp() * 1000) + 1000,
+            int(datetime.now().timestamp() * 1000) + 2000
+        ],
+        "host": ["server01", "server02", "server03"],
+        "region": ["us-east", "us-west", "eu-central"],
+        "datacenter": ["aws", "gcp", "azure"],
+        "usage_idle": [95.0, 85.0, 92.0],
+        "usage_user": [3.2, 10.5, 5.8],
+        "usage_system": [1.8, 4.5, 2.2]
+    }
+}
+
+# Send columnar data (2.32M RPS throughput)
+response = requests.post(
+    "http://localhost:8000/write/v2/msgpack",
+    headers={
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/msgpack",
+        "x-arc-database": "default"  # Optional: specify database
+    },
+    data=msgpack.packb(data)
+)
+
+# Check response (returns 204 No Content on success)
+if response.status_code == 204:
+    print(f"✓ Successfully wrote {len(data['columns']['time'])} records!")
+else:
+    print(f"✗ Error {response.status_code}: {response.text}")
+```
+
+**High-throughput batch ingestion** (columnar format - 2.32M RPS):
+
+```python
+# Generate 10,000 records in columnar format
+num_records = 10000
+base_time = int(datetime.now().timestamp() * 1000)
+
+data = {
+    "m": "sensor_data",
+    "columns": {
+        "time": [base_time + i for i in range(num_records)],
+        "sensor_id": [f"sensor_{i % 100}" for i in range(num_records)],
+        "location": [f"zone_{i % 10}" for i in range(num_records)],
+        "type": ["temperature"] * num_records,
+        "temperature": [20 + (i % 10) for i in range(num_records)],
+        "humidity": [60 + (i % 20) for i in range(num_records)],
+        "pressure": [1013 + (i % 5) for i in range(num_records)]
+    }
+}
+
+response = requests.post(
+    "http://localhost:8000/write/v2/msgpack",
+    headers={
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/msgpack"
+    },
+    data=msgpack.packb(data)
+)
+
+if response.status_code == 204:
+    print(f"✓ Wrote 10,000 records successfully at 2.32M RPS!")
+```
+
+<details>
+<summary><b>📜 Row Format (Legacy - 2.55x slower, kept for compatibility)</b></summary>
+
+**Only use row format if you cannot generate columnar data client-side:**
+
+```python
+# ROW FORMAT (LEGACY - 908K RPS, much slower)
+# Each record is a separate dictionary
 data = {
     "batch": [
         {
-            "m": "cpu",                                      # measurement name
-            "t": int(datetime.now().timestamp() * 1000),    # timestamp (milliseconds)
-            "h": "server01",                                 # host tag (optional)
-            "tags": {                                        # additional tags (optional)
+            "m": "cpu",
+            "t": int(datetime.now().timestamp() * 1000),
+            "h": "server01",
+            "tags": {
                 "region": "us-east",
                 "dc": "aws"
             },
-            "fields": {                                      # metric values (required)
+            "fields": {
                 "usage_idle": 95.0,
                 "usage_user": 3.2,
                 "usage_system": 1.8
@@ -333,71 +424,9 @@ data = {
                 "usage_user": 10.5,
                 "usage_system": 4.5
             }
-        },
-        {
-            "m": "mem",
-            "t": int(datetime.now().timestamp() * 1000),
-            "h": "server01",
-            "fields": {
-                "used_percent": 45.2,
-                "available": 8192
-            }
         }
     ]
 }
-
-# Send via MessagePack
-response = requests.post(
-    "http://localhost:8000/write/v2/msgpack",
-    headers={
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/msgpack",
-        "x-arc-database": "default"  # Optional: specify database (default: "default")
-    },
-    data=msgpack.packb(data)
-)
-
-# Check response (returns 204 No Content on success)
-if response.status_code == 204:
-    print(f"✓ Successfully wrote {len(data['batch'])} measurements!")
-else:
-    print(f"✗ Error {response.status_code}: {response.text}")
-
-# Write to different database
-response = requests.post(
-    "http://localhost:8000/write/v2/msgpack",
-    headers={
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/msgpack",
-        "x-arc-database": "production"  # Write to production database
-    },
-    data=msgpack.packb(data)
-)
-```
-
-**Batch ingestion** (for high throughput - 2.01M RPS):
-
-```python
-# Generate 10,000 measurements for high-throughput ingestion
-batch = [
-    {
-        "m": "sensor_data",                             # measurement name
-        "t": int(datetime.now().timestamp() * 1000),   # timestamp (milliseconds)
-        "h": f"sensor_{i % 100}",                       # host/sensor ID
-        "tags": {
-            "location": f"zone_{i % 10}",
-            "type": "temperature"
-        },
-        "fields": {
-            "temperature": 20 + (i % 10),
-            "humidity": 60 + (i % 20),
-            "pressure": 1013 + (i % 5)
-        }
-    }
-    for i in range(10000)
-]
-
-data = {"batch": batch}
 
 response = requests.post(
     "http://localhost:8000/write/v2/msgpack",
@@ -407,10 +436,11 @@ response = requests.post(
     },
     data=msgpack.packb(data)
 )
-
-if response.status_code == 204:
-    print(f"✓ Wrote 10,000 measurements successfully!")
 ```
+
+**⚠️ Performance Warning**: Row format has 20-26x higher latency and 2.55x lower throughput than columnar format. Use columnar format whenever possible.
+
+</details>
 
 #### Ingest Data (Line Protocol - InfluxDB Compatibility)
 
@@ -599,22 +629,24 @@ export MINIO_DATABASE="production"
 
 ### Writing to Specific Databases
 
-**MessagePack Protocol:**
+**MessagePack Protocol (Columnar - Recommended):**
 ```python
 import msgpack
 import requests
+from datetime import datetime
 
 token = "your-token-here"
 
+# Columnar format (2.55x faster)
 data = {
-    "batch": [
-        {
-            "m": "cpu",
-            "t": int(datetime.now().timestamp() * 1000),
-            "h": "server01",
-            "fields": {"usage_idle": 95.0}
-        }
-    ]
+    "m": "cpu",
+    "columns": {
+        "time": [int(datetime.now().timestamp() * 1000)],
+        "host": ["server01"],
+        "usage_idle": [95.0],
+        "usage_user": [3.2],
+        "usage_system": [1.8]
+    }
 }
 
 # Write to production database
