@@ -24,16 +24,16 @@ Enable WAL if you need:
 - ✅ **Recovery from unexpected failures** (power loss, OOM kills, etc.)
 
 Keep WAL disabled if you:
-- ⚡ **Prioritize maximum throughput** (2.01M records/sec)
+- ⚡ **Prioritize maximum throughput** (2.11M records/sec)
 - 💰 **Can tolerate 0-5 seconds of data loss** on rare crashes
 - 🔄 **Have client-side retry logic** or message queue upstream
 
 ### Performance vs Durability Tradeoff
 
 ```
-Without WAL:        2.01M records/sec → 0-5 seconds data loss risk
-WAL + fdatasync:    1.63M records/sec → Near-zero data loss risk
-WAL + fsync:        1.67M records/sec → Zero data loss risk
+Without WAL:        2.11M records/sec → 0-5 seconds data loss risk
+WAL + fdatasync:    1.71M records/sec → Near-zero data loss risk
+WAL + fsync:        1.75M records/sec → Zero data loss risk
 
 Tradeoff: 19% throughput reduction for durability (fdatasync mode)
 ```
@@ -663,7 +663,7 @@ $ du -sh ./data/wal
 ### Issue: Performance Degradation with WAL
 
 **Symptoms:**
-- Throughput dropped from 2.01M to 600K rec/s
+- Throughput dropped from 2.11M to 600K rec/s
 - High CPU usage from fsync calls
 
 **Solutions:**

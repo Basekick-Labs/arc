@@ -391,7 +391,7 @@ Data Partition C → Arc Worker 3 (has local copy)
 
 **Performance**:
 - ClickBench: 45-60s (target with optimizations)
-- Throughput: 1.7-2.2M rows/sec
+- Throughput: 2.0-2.2M rows/sec
 - Latency: P95 < 500ms
 
 **Use Cases**:
