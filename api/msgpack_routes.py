@@ -99,7 +99,19 @@ async def write_msgpack(
 
         Body: MessagePack binary payload
 
-    Payload Format (single):
+    Payload Format (columnar - RECOMMENDED for best performance):
+        {
+            "m": "cpu",              # measurement
+            "columns": {             # columnar data (25-35% faster)
+                "time": [1633024800000, 1633024801000, 1633024802000],
+                "host": ["server01", "server01", "server01"],
+                "region": ["us-east", "us-east", "us-east"],
+                "usage_idle": [95.0, 94.5, 94.2],
+                "usage_user": [3.2, 3.8, 4.1]
+            }
+        }
+
+    Payload Format (row - LEGACY, slower):
         {
             "m": "cpu",              # measurement
             "t": 1633024800000,      # timestamp (ms)
@@ -116,8 +128,8 @@ async def write_msgpack(
     Payload Format (batch):
         {
             "batch": [
-                {"m": "cpu", "t": 1633024800000, "h": "server01", "fields": {...}},
-                {"m": "mem", "t": 1633024800000, "h": "server01", "fields": {...}}
+                {"m": "cpu", "columns": {...}},  # columnar (fast)
+                {"m": "mem", "fields": {...}}    # row format (legacy)
             ]
         }
 
@@ -219,7 +231,12 @@ async def msgpack_spec():
         'compression': 'gzip (optional)',
         'authentication': 'x-api-key header',
         'format': {
-            'single': {
+            'columnar (RECOMMENDED)': {
+                'm': 'measurement (string)',
+                'columns': 'dict of column_name: [array of values]',
+                'note': '25-35% faster than row format, zero-copy passthrough'
+            },
+            'row (LEGACY)': {
                 'm': 'measurement (string or int)',
                 't': 'timestamp (int64 milliseconds)',
                 'h': 'host (string or int, optional)',
@@ -227,16 +244,21 @@ async def msgpack_spec():
                 'tags': 'dict of tag_name: value (optional)'
             },
             'batch': {
-                'batch': 'array of measurements'
-            },
-            'compact': {
-                'm': 'measurement_id (int)',
-                't': 'timestamp (int64 ms)',
-                'h': 'host_id (int)',
-                'f': 'array of field values (requires schema)'
+                'batch': 'array of measurements (can mix columnar and row)'
             }
         },
-        'example': {
+        'example_columnar': {
+            'm': 'cpu',
+            'columns': {
+                'time': [1633024800000, 1633024801000, 1633024802000],
+                'host': ['server01', 'server01', 'server01'],
+                'region': ['us-east', 'us-east', 'us-east'],
+                'usage_idle': [95.0, 94.5, 94.2],
+                'usage_user': [3.2, 3.8, 4.1],
+                'usage_system': [1.8, 1.7, 1.7]
+            }
+        },
+        'example_row': {
             'm': 'cpu',
             't': 1633024800000,
             'h': 'server01',
@@ -251,9 +273,12 @@ async def msgpack_spec():
             }
         },
         'performance': {
-            'expected_rps': '700K-1M (3-5x faster than Line Protocol)',
+            'expected_rps_columnar': '2.5M+ (columnar format, zero-copy)',
+            'expected_rps_row': '2.1M (row format, with conversion)',
+            'columnar_advantage': '25-35% faster (no flattening, no row→column conversion)',
             'parsing_speed': '10-15x faster than text parsing',
             'serialization': 'Direct Arrow (2-3x faster than DataFrame)',
-            'payload_size': '50-70% smaller than Line Protocol'
+            'payload_size': '50-70% smaller than Line Protocol',
+            'wire_efficiency': 'Columnar sends field names once vs per-record'
         }
     }
