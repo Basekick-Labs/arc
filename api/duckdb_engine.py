@@ -241,6 +241,28 @@ class DuckDBEngine:
 
         return result
 
+    async def execute_query_arrow(self, sql: str, priority: QueryPriority = QueryPriority.NORMAL) -> Dict[str, Any]:
+        """Execute SQL query and return Apache Arrow table (columnar format)
+
+        Args:
+            sql: SQL query to execute
+            priority: Query priority (LOW, NORMAL, HIGH, CRITICAL)
+
+        Returns:
+            Dict with success, arrow_table (bytes), schema, row_count, execution_time_ms, wait_time_ms
+        """
+        # Convert SQL for S3 paths
+        converted_sql = self._convert_sql_to_s3_paths(sql)
+
+        # Use connection pool for Arrow query execution
+        result = await self.connection_pool.execute_arrow_async(
+            converted_sql,
+            priority=priority,
+            timeout=300.0
+        )
+
+        return result
+
     async def _execute_show_tables_legacy(self, sql: str) -> Dict[str, Any]:
         """Legacy handler for SHOW TABLES using old connection"""
         start_time = time.time()
