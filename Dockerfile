@@ -45,6 +45,7 @@ COPY --chown=arc:arc api/ ./api/
 COPY --chown=arc:arc ingest/ ./ingest/
 COPY --chown=arc:arc storage/ ./storage/
 COPY --chown=arc:arc exporter/ ./exporter/
+COPY --chown=arc:arc utils/ ./utils/
 COPY --chown=arc:arc config.py config_loader.py ./
 COPY --chown=arc:arc entrypoint.sh ./
 
