@@ -100,7 +100,7 @@ class DuckDBConnection:
         if configure_fn:
             try:
                 configure_fn(self.conn)
-                logger.info(f"Connection {connection_id} configured successfully")
+                logger.debug(f"Connection {connection_id} configured successfully")
             except Exception as e:
                 logger.error(f"Failed to configure connection {connection_id}: {e}")
                 self.stats.is_healthy = False
@@ -248,7 +248,7 @@ class DuckDBConnectionPool:
         # Start background health checker
         self._health_check_task = None
 
-        logger.info(f"DuckDB connection pool initialized: {pool_size} connections, max queue: {max_queue_size}")
+        logger.debug(f"DuckDB connection pool initialized: {pool_size} connections, max queue: {max_queue_size}")
 
     def _initialize_pool(self):
         """Create initial pool of connections"""
@@ -257,7 +257,7 @@ class DuckDBConnectionPool:
                 conn = DuckDBConnection(connection_id=i, configure_fn=self.configure_fn)
                 self.connections.append(conn)
                 self.pool.put(conn)
-                logger.info(f"Created DuckDB connection {i+1}/{self.pool_size}")
+                logger.debug(f"Created DuckDB connection {i+1}/{self.pool_size}")
             except Exception as e:
                 logger.error(f"Failed to create DuckDB connection {i}: {e}")
                 raise

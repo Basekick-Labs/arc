@@ -27,7 +27,7 @@ class ConnectionManager:
                 # This eliminates most database lock issues with 42 workers
                 cursor.execute("PRAGMA journal_mode=WAL")
                 cursor.execute("PRAGMA busy_timeout=5000")  # Wait up to 5s for locks
-                logger.info("SQLite WAL mode enabled for concurrent access")
+                logger.debug("SQLite WAL mode enabled for concurrent access")
 
                 # Create connections table
                 cursor.execute('''
@@ -152,9 +152,9 @@ class ConnectionManager:
                     pass  # Column already exists or other error
 
                 conn.commit()
-                
-            logger.info(f"Database initialized at {self.db_path}")
-            
+
+            logger.debug(f"Database initialized at {self.db_path}")
+
         except Exception as e:
             logger.error(f"Failed to initialize database: {e}")
             raise

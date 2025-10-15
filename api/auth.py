@@ -78,6 +78,7 @@ class AuthManager:
     def verify_token(self, token: str) -> Optional[Dict]:
         """Verify a token and return token info if valid (with caching)"""
         if not token:
+            logger.debug("Authentication failed: No token provided")
             return None
 
         token_hash = self._hash_token(token)
@@ -97,57 +98,66 @@ class AuthManager:
             self._cache_misses += 1
 
         # Cache miss - query database
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute(
-                "SELECT * FROM api_tokens WHERE token_hash = ? AND enabled = 1",
-                (token_hash,)
-            )
-            row = cursor.fetchone()
-
-            if row:
-                # Check token expiration if expires_at is set
-                try:
-                    expires_at_value = row['expires_at'] if 'expires_at' in row.keys() else None
-                except (KeyError, IndexError):
-                    expires_at_value = None
-
-                if expires_at_value:
-                    try:
-                        # Handle both datetime objects and ISO strings
-                        if isinstance(expires_at_value, str):
-                            expires_at = datetime.fromisoformat(expires_at_value.replace('Z', '+00:00'))
-                        else:
-                            expires_at = expires_at_value
-
-                        if datetime.now() > expires_at:
-                            logger.warning(f"Token {row['name']} has expired")
-                            return None
-                    except Exception as e:
-                        logger.error(f"Error checking token expiration: {e}")
-                        return None
-
-                # Update last used timestamp
-                conn.execute(
-                    "UPDATE api_tokens SET last_used_at = ? WHERE id = ?",
-                    (datetime.now(), row['id'])
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(
+                    "SELECT * FROM api_tokens WHERE token_hash = ? AND enabled = 1",
+                    (token_hash,)
                 )
-                conn.commit()
+                row = cursor.fetchone()
 
-                token_info = {
-                    'id': row['id'],
-                    'name': row['name'],
-                    'description': row['description'],
-                    'created_at': row['created_at'],
-                    'last_used_at': row['last_used_at']
-                }
+                if row:
+                    # Check token expiration if expires_at is set
+                    try:
+                        expires_at_value = row['expires_at'] if 'expires_at' in row.keys() else None
+                    except (KeyError, IndexError):
+                        expires_at_value = None
 
-                # Store in cache
-                with self._cache_lock:
-                    self._cache[token_hash] = (token_info, current_time + self.cache_ttl)
+                    if expires_at_value:
+                        try:
+                            # Handle both datetime objects and ISO strings
+                            if isinstance(expires_at_value, str):
+                                expires_at = datetime.fromisoformat(expires_at_value.replace('Z', '+00:00'))
+                            else:
+                                expires_at = expires_at_value
 
-                return token_info
+                            if datetime.now() > expires_at:
+                                logger.warning(f"Authentication failed: Token '{row['name']}' has expired")
+                                return None
+                        except Exception as e:
+                            logger.error(f"Error checking token expiration: {e}")
+                            return None
 
+                    # Update last used timestamp
+                    conn.execute(
+                        "UPDATE api_tokens SET last_used_at = ? WHERE id = ?",
+                        (datetime.now(), row['id'])
+                    )
+                    conn.commit()
+
+                    token_info = {
+                        'id': row['id'],
+                        'name': row['name'],
+                        'description': row['description'],
+                        'created_at': row['created_at'],
+                        'last_used_at': row['last_used_at']
+                    }
+
+                    # Store in cache
+                    with self._cache_lock:
+                        self._cache[token_hash] = (token_info, current_time + self.cache_ttl)
+
+                    return token_info
+                else:
+                    logger.warning(f"Authentication failed: Invalid token (hash: {token_hash[:8]}...)")
+                    return None
+
+        except sqlite3.OperationalError as e:
+            logger.error(f"Database error during token verification: {e} (db_path: {self.db_path})")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error during token verification: {e}", exc_info=True)
             return None
 
     def list_tokens(self) -> list:

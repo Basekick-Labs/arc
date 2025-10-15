@@ -126,7 +126,7 @@ async def value_error_handler(request, exc):
 
 # Configure CORS origins from environment
 ALLOWED_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000,https://localhost:3000,https://onedrive.live.com,https://*.officeapps.live.com,https://excel.officeapps.live.com").split(",")
-logger.info(f"CORS allowed origins: {ALLOWED_ORIGINS}")
+logger.debug(f"CORS allowed origins: {ALLOWED_ORIGINS}")
 
 # Add request ID middleware first
 app.add_middleware(RequestIdMiddleware)
@@ -157,7 +157,7 @@ auth_manager = AuthManager(cache_ttl=AUTH_CACHE_TTL)
 default_token = _auth_config.get("default_token") or os.getenv("DEFAULT_API_TOKEN")
 if default_token:
     auth_manager.ensure_seed_token(default_token, name="default")
-    logger.info("Using DEFAULT_API_TOKEN from configuration")
+    logger.debug("Using DEFAULT_API_TOKEN from configuration")
 
 app.middleware("http")(AuthMiddleware(auth_manager, enabled=AUTH_ENABLED, allowlist=AUTH_ALLOWLIST))
 
@@ -175,17 +175,32 @@ export_scheduler = ExportScheduler()
 metrics_collector = get_metrics_collector()
 logs_manager = get_logs_manager()
 
-async def reinitialize_query_engine():
-    """Reinitialize query engine with current active storage connection"""
+# Primary worker detection (for log reduction in multi-worker setups)
+_primary_worker_lock_fd = None
+_is_primary_worker = False
+
+async def reinitialize_query_engine(verbose: bool = True):
+    """Reinitialize query engine with current active storage connection
+
+    Args:
+        verbose: If True, log at INFO level. If False, log at DEBUG level (reduces multi-worker noise)
+    """
     global query_engine
-    
+
+    # Helper to conditionally log
+    def log_reinit(message, level='info'):
+        if verbose:
+            getattr(logger, level)(message)
+        else:
+            logger.debug(f"[Worker {os.getpid()}] {message}")
+
     # Close existing connections
     if query_engine:
         query_engine.close()
-    
+
     # Get active storage connection
     active_storage = connection_manager.get_active_storage_connection()
-    
+
     if active_storage and active_storage['backend'] == 's3':
         from storage.s3_backend import S3Backend
         s3_backend = S3Backend(
@@ -202,7 +217,7 @@ async def reinitialize_query_engine():
             s3_backend=s3_backend,
             connection_manager=connection_manager
         )
-        logger.info(f"Query engines reinitialized with S3 backend: {active_storage['bucket']}")
+        log_reinit(f"Query engines reinitialized with S3 backend: {active_storage['bucket']}")
     elif active_storage and active_storage['backend'] == 'minio':
         from storage.minio_backend import MinIOBackend
         minio_backend = MinIOBackend(
@@ -217,7 +232,7 @@ async def reinitialize_query_engine():
             minio_backend=minio_backend,
             connection_manager=connection_manager
         )
-        logger.info(f"Query engines reinitialized with MinIO backend: {active_storage['bucket']}")
+        log_reinit(f"Query engines reinitialized with MinIO backend: {active_storage['bucket']}")
     elif active_storage and active_storage['backend'] == 'ceph':
         from storage.ceph_backend import CephBackend
         ceph_backend = CephBackend(
@@ -233,7 +248,7 @@ async def reinitialize_query_engine():
             ceph_backend=ceph_backend,
             connection_manager=connection_manager
         )
-        logger.info(f"Query engines reinitialized with Ceph backend: {active_storage['bucket']}")
+        log_reinit(f"Query engines reinitialized with Ceph backend: {active_storage['bucket']}")
     elif active_storage and active_storage['backend'] == 'gcs':
         from storage.gcs_backend import GCSBackend
         gcs_backend = GCSBackend(
@@ -245,18 +260,18 @@ async def reinitialize_query_engine():
             hmac_key_id=active_storage.get('hmac_key_id'),
             hmac_secret=active_storage.get('hmac_secret')
         )
-        
+
         # Initialize DuckDB engines with GCS support via signed URLs
         query_engine = DuckDBEngine(
             storage_backend="gcs",
             gcs_backend=gcs_backend,
             connection_manager=connection_manager
         )
-        logger.info(f"Query engines initialized with GCS backend: gs://{active_storage['bucket']} (using native DuckDB GCS support)")
+        log_reinit(f"Query engines initialized with GCS backend: gs://{active_storage['bucket']} (using native DuckDB GCS support)")
         if active_storage.get('hmac_key_id'):
-            logger.info("GCS queries will use native gs:// access with HMAC authentication")
+            log_reinit("GCS queries will use native gs:// access with HMAC authentication")
         else:
-            logger.info("GCS queries will use service account authentication")
+            log_reinit("GCS queries will use service account authentication")
 
     elif active_storage and active_storage['backend'] == 'local':
         from storage.local_backend import LocalBackend
@@ -277,7 +292,37 @@ async def reinitialize_query_engine():
 @app.on_event("startup")
 async def startup_event():
     """Initialize query engine on startup"""
-    global query_engine
+    global query_engine, _primary_worker_lock_fd, _is_primary_worker
+
+    # Detect if we should log verbosely (first worker only in multi-worker setup)
+    # This reduces log noise when running with many workers (e.g. 42 workers)
+    # Use a simple file-based marker to identify the primary worker
+    import fcntl
+    import tempfile
+
+    primary_worker_lock_file = os.path.join(tempfile.gettempdir(), 'arc_primary_worker.lock')
+    is_verbose = False
+
+    try:
+        # Try to acquire exclusive lock (only first worker succeeds)
+        lock_fd = os.open(primary_worker_lock_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        is_verbose = True
+        _is_primary_worker = True
+        _primary_worker_lock_fd = lock_fd
+        logger.info(f"This worker (PID {os.getpid()}) is the primary worker (verbose logging enabled)")
+    except (IOError, OSError):
+        # Lock already held by another worker
+        is_verbose = False
+        _is_primary_worker = False
+        logger.debug(f"Worker {os.getpid()} is a secondary worker (reduced logging)")
+
+    # Helper to log only from first worker
+    def log_startup(message, level='info'):
+        if is_verbose:
+            getattr(logger, level)(message)
+        else:
+            logger.debug(f"[Worker {os.getpid()}] {message}")
 
     # Load config to check desired backend
     from config_loader import get_config
@@ -291,7 +336,7 @@ async def startup_event():
     # Check if active storage backend matches config
     if active_storage and active_storage['backend'] != desired_backend:
         logger.warning(f"Storage backend mismatch: config={desired_backend}, active={active_storage['backend']}")
-        logger.info(f"Deactivating old {active_storage['backend']} connection and creating {desired_backend} connection")
+        log_startup(f"Deactivating old {active_storage['backend']} connection and creating {desired_backend} connection")
 
         # Deactivate all storage connections
         try:
@@ -301,7 +346,7 @@ async def startup_event():
             cursor.execute('UPDATE storage_connections SET is_active = FALSE')
             conn.commit()
             conn.close()
-            logger.info(f"Deactivated all storage connections")
+            log_startup(f"Deactivated all storage connections")
         except Exception as e:
             logger.error(f"Failed to deactivate storage connections: {e}")
 
@@ -309,10 +354,10 @@ async def startup_event():
 
     # Auto-create storage connection from config if none exists or backend changed
     if not active_storage:
-        logger.info(f"No active storage - checking config/env: backend={desired_backend}")
+        log_startup(f"No active storage - checking config/env: backend={desired_backend}")
 
         if desired_backend == 'local':
-            logger.info("Auto-creating local filesystem storage connection from config")
+            log_startup("Auto-creating local filesystem storage connection from config")
 
             # Retry logic for database lock contention (multiple workers starting simultaneously)
             max_retries = 5
@@ -330,10 +375,10 @@ async def startup_event():
                     }
 
                     if attempt == 0:
-                        logger.info(f"Creating local storage connection: {connection_config['name']} at {connection_config['base_path']}")
+                        log_startup(f"Creating local storage connection: {connection_config['name']} at {connection_config['base_path']}")
 
                     connection_id = connection_manager.add_storage_connection(connection_config)
-                    logger.info(f"✅ Auto-created local storage connection (id={connection_id})")
+                    log_startup(f"✅ Auto-created local storage connection (id={connection_id})")
 
                     # Refresh active_storage after creating
                     active_storage = connection_manager.get_active_storage_connection()
@@ -368,7 +413,7 @@ async def startup_event():
                         break
 
         elif desired_backend == 'minio' and os.getenv('MINIO_ENDPOINT'):
-            logger.info("Auto-creating MinIO connection from environment variables")
+            log_startup("Auto-creating MinIO connection from environment variables")
             try:
                 # Ensure endpoint has http:// or https:// prefix
                 minio_endpoint = os.getenv('MINIO_ENDPOINT', 'minio:9000')
@@ -385,10 +430,10 @@ async def startup_event():
                     'database': os.getenv('STORAGE_DATABASE', 'default'),
                     'is_active': True
                 }
-                logger.info(f"Creating storage connection: {connection_config['name']} at {connection_config['endpoint']}")
+                log_startup(f"Creating storage connection: {connection_config['name']} at {connection_config['endpoint']}")
 
                 connection_id = connection_manager.add_storage_connection(connection_config)
-                logger.info(f"✅ Auto-created MinIO storage connection (id={connection_id})")
+                log_startup(f"✅ Auto-created MinIO storage connection (id={connection_id})")
 
                 # Refresh active_storage after creating
                 active_storage = connection_manager.get_active_storage_connection()
@@ -406,14 +451,14 @@ async def startup_event():
         else:
             logger.warning(f"Cannot auto-create storage: backend={desired_backend}, has_endpoint={bool(os.getenv('MINIO_ENDPOINT'))}")
 
-    await reinitialize_query_engine()
-    
+    await reinitialize_query_engine(verbose=is_verbose)
+
     # Logging moved to individual backend initialization above
-    
+
     # Start the export scheduler
     export_scheduler.start_scheduler()
-    logger.info("Export scheduler started")
-    
+    log_startup("Export scheduler started")
+
     # Initialize and start metrics collection
     metrics_collector.set_dependencies(
         connection_manager=connection_manager,
@@ -490,14 +535,14 @@ async def startup_event():
             }
             init_parquet_buffer(storage_backend, buffer_config)
             await start_parquet_buffer()
-            logger.info("Line protocol write service initialized")
+            log_startup("Line protocol write service initialized")
 
             # Initialize Arrow buffer for MessagePack binary protocol
             init_arrow_buffer(storage_backend, buffer_config)
             await start_arrow_buffer()
-            logger.info("MessagePack binary protocol write service initialized (Direct Arrow)")
+            log_startup("MessagePack binary protocol write service initialized (Direct Arrow)")
 
-            # Initialize compaction
+            # Initialize compaction (only from first worker to avoid duplicate scheduler instances)
             compaction_config = arc_config.get_compaction_config()
             if compaction_config.get('enabled', True):
                 from api.database import CompactionLock
@@ -518,39 +563,42 @@ async def startup_event():
                     max_concurrent=compaction_config.get('max_concurrent_jobs', 2)
                 )
 
-                # Initialize compaction scheduler
+                # Initialize compaction scheduler (only run from first worker)
                 compaction_scheduler = CompactionScheduler(
                     compaction_manager=compaction_manager,
                     schedule=compaction_config.get('schedule', '5 * * * *'),
-                    enabled=True
+                    enabled=is_verbose  # Only enable on first worker
                 )
 
-                # Register with API routes
+                # Register with API routes (all workers need this for manual triggers)
                 init_compaction(compaction_manager, compaction_scheduler)
 
-                # Start scheduler
+                # Start scheduler (only runs if enabled=True, i.e., first worker only)
                 await compaction_scheduler.start()
 
-                logger.info(
-                    f"Compaction initialized: "
-                    f"schedule='{compaction_config.get('schedule')}', "
-                    f"min_files={compaction_config.get('min_files')}, "
-                    f"target_size={compaction_config.get('target_file_size_mb')}MB"
-                )
+                if is_verbose:
+                    log_startup(
+                        f"Compaction scheduler started: "
+                        f"schedule='{compaction_config.get('schedule')}', "
+                        f"min_files={compaction_config.get('min_files')}, "
+                        f"target_size={compaction_config.get('target_file_size_mb')}MB"
+                    )
+                else:
+                    logger.debug(f"[Worker {os.getpid()}] Compaction manager initialized (scheduler disabled on this worker)")
             else:
-                logger.info("Compaction is disabled")
+                log_startup("Compaction is disabled")
 
     else:
         logger.warning("No active storage backend - line protocol writes disabled")
-    logger.info("Metrics collection started")
+    log_startup("Metrics collection started")
 
     # Initialize query cache
     init_query_cache()
     query_cache = get_query_cache()
     if query_cache:
-        logger.info(f"Query cache initialized: TTL={query_cache.ttl_seconds}s, MaxSize={query_cache.max_size}")
+        log_startup(f"Query cache initialized: TTL={query_cache.ttl_seconds}s, MaxSize={query_cache.max_size}")
     else:
-        logger.info("Query cache disabled")
+        log_startup("Query cache disabled")
 
     # Check for first run and generate initial token if needed
     if AUTH_ENABLED:
@@ -574,10 +622,11 @@ async def startup_event():
             print(f"{CYAN}You can create additional tokens after logging in.{RESET}", file=sys.stderr)
             print(f"{CYAN}{'=' * 70}{RESET}\n", file=sys.stderr)
 
-            # Also log to structured logs
-            logger.warning(f"Initial admin API token generated: {initial_token[:8]}...")
+            # Also log to structured logs (only from first worker)
+            if is_verbose:
+                logger.warning(f"Initial admin API token generated: {initial_token[:8]}...")
         else:
-            logger.info("Auth is ENABLED; endpoints require a valid API token")
+            log_startup("Auth is ENABLED; endpoints require a valid API token")
     else:
         logger.warning("Auth is DISABLED; endpoints are open (NOT RECOMMENDED for production)")
 
@@ -585,9 +634,21 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
+    global _primary_worker_lock_fd, _is_primary_worker
+
+    # Release primary worker lock if we own it
+    if _is_primary_worker and _primary_worker_lock_fd is not None:
+        try:
+            import fcntl
+            fcntl.flock(_primary_worker_lock_fd, fcntl.LOCK_UN)
+            os.close(_primary_worker_lock_fd)
+            logger.info(f"Primary worker (PID {os.getpid()}) releasing lock")
+        except Exception as e:
+            logger.debug(f"Error releasing primary worker lock: {e}")
+
     if query_engine:
         query_engine.close()
-    
+
     # Stop the export scheduler
     export_scheduler.stop_scheduler()
     logger.info("Export scheduler stopped")

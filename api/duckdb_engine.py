@@ -30,14 +30,14 @@ class DuckDBEngine:
                 self.conn.execute("LOAD httpfs")
                 self.conn.execute("INSTALL aws")
                 self.conn.execute("LOAD aws")
-                logger.info("DuckDB httpfs and aws extensions loaded")
+                logger.debug("DuckDB httpfs and aws extensions loaded")
             except Exception as e:
                 logger.warning(f"Failed to load httpfs extension: {e}")
                 # Try enabling autoloading as fallback
                 try:
                     self.conn.execute("SET autoinstall_known_extensions=1")
                     self.conn.execute("SET autoload_known_extensions=1")
-                    logger.info("DuckDB extension autoloading enabled")
+                    logger.debug("DuckDB extension autoloading enabled")
                 except Exception as e2:
                     logger.error(f"Failed to enable autoloading: {e2}")
             
@@ -59,7 +59,7 @@ class DuckDBEngine:
             )
             self.connection_pool.start_health_checks()
 
-            logger.info(f"DuckDB engine initialized with connection pool (size={pool_size}, max_queue={max_queue_size})")
+            logger.debug(f"DuckDB engine initialized with connection pool (size={pool_size}, max_queue={max_queue_size})")
 
         except ImportError:
             logger.error("DuckDB not installed. Run: pip install duckdb")
@@ -79,7 +79,7 @@ class DuckDBEngine:
 
             # Use DuckDB default settings (no custom tuning)
             # For ClickBench compliance: databases should use default settings
-            logger.info("DuckDB using default settings (no custom tuning)")
+            logger.debug("DuckDB using default settings (no custom tuning)")
 
             # Apply S3/MinIO/Ceph/GCS configuration
             if self.minio_backend:
@@ -148,7 +148,7 @@ class DuckDBEngine:
                 self.conn.execute(f"SET s3_secret_access_key='{self.minio_backend.s3_client._request_signer._credentials.secret_key}'")
                 self.conn.execute("SET s3_use_ssl=false")
                 self.conn.execute("SET s3_url_style='path'")
-                logger.info("MinIO S3 configuration applied to DuckDB (sync)")
+                logger.debug("MinIO S3 configuration applied to DuckDB (sync)")
             elif self.ceph_backend:
                 # Configure Ceph settings directly
                 endpoint_host = self.ceph_backend.endpoint_url.replace('http://', '').replace('https://', '')
@@ -157,7 +157,7 @@ class DuckDBEngine:
                 self.conn.execute(f"SET s3_secret_access_key='{self.ceph_backend._secret_key}'")
                 self.conn.execute("SET s3_use_ssl=false")
                 self.conn.execute("SET s3_url_style='path'")
-                logger.info("Ceph S3 configuration applied to DuckDB (sync)")
+                logger.debug("Ceph S3 configuration applied to DuckDB (sync)")
             elif self.s3_backend:
                 # Configure S3 using DuckDB SECRET system
                 if self.s3_backend.use_directory_bucket:
@@ -172,7 +172,7 @@ class DuckDBEngine:
                             ENDPOINT '{endpoint}'
                         )
                     """)
-                    logger.info(f"DuckDB S3 Express SECRET created (endpoint: {endpoint})")
+                    logger.debug(f"DuckDB S3 Express SECRET created (endpoint: {endpoint})")
                 else:
                     # Standard S3 configuration
                     self.conn.execute(f"""
@@ -183,10 +183,10 @@ class DuckDBEngine:
                             REGION '{self.s3_backend.region}'
                         )
                     """)
-                    logger.info("DuckDB S3 SECRET created")
-                
-                logger.info(f"Directory bucket settings: use_directory_bucket={self.s3_backend.use_directory_bucket}, availability_zone={self.s3_backend.availability_zone}")
-                logger.info("AWS S3 configuration applied to DuckDB (sync)")
+                    logger.debug("DuckDB S3 SECRET created")
+
+                logger.debug(f"Directory bucket settings: use_directory_bucket={self.s3_backend.use_directory_bucket}, availability_zone={self.s3_backend.availability_zone}")
+                logger.debug("AWS S3 configuration applied to DuckDB (sync)")
         except Exception as e:
             logger.error(f"Sync S3 configuration failed: {e}")
             # Log current S3 settings for debugging
@@ -204,8 +204,8 @@ class DuckDBEngine:
                 if not self.gcs_backend.configure_duckdb(self.conn):
                     logger.error("Failed to configure DuckDB for GCS access")
                     return
-                
-                logger.info("GCS configuration applied to DuckDB (sync) - using signed URLs for access")
+
+                logger.debug("GCS configuration applied to DuckDB (sync) - using signed URLs for access")
             
         except Exception as e:
             logger.error(f"Sync GCS configuration failed: {e}")
