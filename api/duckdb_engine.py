@@ -468,8 +468,8 @@ class DuckDBEngine:
     def _is_show_tables_query(self, sql: str) -> bool:
         """Check if query is a SHOW TABLES command"""
         import re
-        # Match SHOW TABLES or SHOW TABLES FROM database
-        pattern = r'^\s*SHOW\s+TABLES(?:\s+FROM\s+(\w+))?\s*;?\s*$'
+        # Match SHOW TABLES or SHOW TABLES FROM database (allow hyphens in database names)
+        pattern = r'^\s*SHOW\s+TABLES(?:\s+FROM\s+([\w-]+))?\s*;?\s*$'
         return bool(re.match(pattern, sql.strip(), re.IGNORECASE))
 
     def _is_show_databases_query(self, sql: str) -> bool:
@@ -487,8 +487,8 @@ class DuckDBEngine:
         """
         import re
 
-        # Extract database name if specified
-        pattern = r'^\s*SHOW\s+TABLES(?:\s+FROM\s+(\w+))?\s*;?\s*$'
+        # Extract database name if specified (allow hyphens in database names)
+        pattern = r'^\s*SHOW\s+TABLES(?:\s+FROM\s+([\w-]+))?\s*;?\s*$'
         match = re.match(pattern, sql.strip(), re.IGNORECASE)
 
         if not match:

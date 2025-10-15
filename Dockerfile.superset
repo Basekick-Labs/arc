@@ -1,0 +1,15 @@
+FROM apache/superset:latest
+
+USER root
+
+# Copy initialization script
+COPY superset_init.sh /app/docker/docker-init.sh
+RUN chmod +x /app/docker/docker-init.sh
+
+USER superset
+
+# Install Arc Superset dialect from PyPI (as superset user to install in venv)
+RUN pip install --no-cache-dir arc-superset-dialect
+
+# Use our custom initialization script
+CMD ["/app/docker/docker-init.sh"]

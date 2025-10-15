@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  superset:
+    build:
+      context: .
+      dockerfile: Dockerfile.superset
+    container_name: superset
+    restart: unless-stopped
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-your-secret-key-change-me}
+    volumes:
+      - superset-data:/app/superset_home
+    networks:
+      - traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.superset.rule=Host(`viz.basekick.net`)"
+      - "traefik.http.routers.superset.entrypoints=websecure"
+      - "traefik.http.routers.superset.tls=true"
+      - "traefik.http.routers.superset.tls.certresolver=letsencrypt"
+      - "traefik.http.services.superset.loadbalancer.server.port=8088"
+      # HTTP to HTTPS redirect
+      - "traefik.http.routers.superset-http.rule=Host(`viz.basekick.net`)"
+      - "traefik.http.routers.superset-http.entrypoints=web"
+      - "traefik.http.routers.superset-http.middlewares=redirect-to-https"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+
+networks:
+  traefik:
+    external: true
+
+volumes:
+  superset-data:
+    driver: local
