@@ -1630,11 +1630,6 @@ async def get_application_logs(
 @app.get("/avro/schemas")
 async def get_avro_schemas(request: Request):
     """Get all Avro schemas (requires authentication)"""
-    # Verify API key
-    auth_header = request.headers.get("x-api-key")
-    if not auth_header or not auth_manager.verify_api_key(auth_header):
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-
     try:
         schemas = connection_manager.get_avro_schemas()
         return {"schemas": schemas}
@@ -1644,11 +1639,6 @@ async def get_avro_schemas(request: Request):
 @app.post("/avro/schemas")
 async def create_avro_schema(schema_data: dict, request: Request):
     """Create new Avro schema (requires authentication)"""
-    # Verify API key
-    auth_header = request.headers.get("x-api-key")
-    if not auth_header or not auth_manager.verify_api_key(auth_header):
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-
     try:
         # Validate required fields
         required_fields = ['topic_pattern', 'schema_name', 'schema_json']
@@ -1673,11 +1663,6 @@ async def create_avro_schema(schema_data: dict, request: Request):
 @app.get("/avro/schemas/{schema_id}")
 async def get_avro_schema(schema_id: int, request: Request):
     """Get specific Avro schema by ID (requires authentication)"""
-    # Verify API key
-    auth_header = request.headers.get("x-api-key")
-    if not auth_header or not auth_manager.verify_api_key(auth_header):
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-
     try:
         schemas = connection_manager.get_avro_schemas()
         schema = next((s for s in schemas if s['id'] == schema_id), None)
@@ -1709,11 +1694,6 @@ async def get_avro_schema_for_topic(topic_name: str):
 @app.put("/avro/schemas/{schema_id}")
 async def update_avro_schema(schema_id: int, schema_data: dict, request: Request):
     """Update existing Avro schema (requires authentication)"""
-    # Verify API key
-    auth_header = request.headers.get("x-api-key")
-    if not auth_header or not auth_manager.verify_api_key(auth_header):
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-
     try:
         # Validate required fields
         required_fields = ['topic_pattern', 'schema_name', 'schema_json']
@@ -1741,11 +1721,6 @@ async def update_avro_schema(schema_id: int, schema_data: dict, request: Request
 @app.delete("/avro/schemas/{schema_id}")
 async def delete_avro_schema(schema_id: int, request: Request):
     """Delete Avro schema (requires authentication)"""
-    # Verify API key
-    auth_header = request.headers.get("x-api-key")
-    if not auth_header or not auth_manager.verify_api_key(auth_header):
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-
     try:
         success = connection_manager.delete_avro_schema(schema_id)
         if not success:
