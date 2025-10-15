@@ -1,80 +1,28 @@
 version: '3.8'
 
 services:
-  # MinIO - S3-compatible object storage
-  minio:
-    image: minio/minio:latest
-    container_name: arc-minio
-    network_mode: "host"
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    volumes:
-      - minio-data:/data
-    command: server /data --console-address ":9001"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # MinIO client - Create bucket on startup
-  minio-init:
-    image: minio/mc:latest
-    container_name: arc-minio-init
-    network_mode: "host"
-    depends_on:
-      minio:
-        condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set myminio http://localhost:9000 minioadmin minioadmin;
-      mc mb myminio/arc --ignore-existing;
-      mc anonymous set public myminio/arc;
-      echo 'MinIO initialized successfully';
-      "
-
-  # Arc API Server
+# Arc API Server
   arc-api:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: arc-api
-    network_mode: "host"
+    container_name: arc
     environment:
       # Storage configuration
-      STORAGE_BACKEND: minio
-      MINIO_ENDPOINT: http://localhost:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-      MINIO_BUCKET: arc
-      MINIO_USE_SSL: "false"
-
+      STORAGE_BACKEND: local
+      LOCAL_STORAGE_PATH: /data/arc/
       # Database
       DB_PATH: /data/arc.db
-
       # Performance
       QUERY_CACHE_ENABLED: "true"
       QUERY_CACHE_TTL: "60"
       # WORKERS auto-detected from CPU cores (set explicitly to override)
-
-      # Features
-      INFLUX_ENABLED: "false"
-      GCS_ENABLED: "false"
-
       # Logging
       LOG_LEVEL: INFO
-
-      # Wait for dependencies
-      WAIT_FOR_MINIO: http://localhost:9000
+      WAL_ENABLED: "false"
     volumes:
       - arc-data:/data
       - arc-logs:/app/logs
-    depends_on:
-      minio:
-        condition: service_healthy
-      minio-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -84,8 +32,6 @@ services:
     restart: unless-stopped
 
 volumes:
-  minio-data:
-    driver: local
   arc-data:
     driver: local
   arc-logs:
