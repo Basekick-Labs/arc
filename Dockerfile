@@ -62,12 +62,8 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Default environment variables
-ENV PYTHONUNBUFFERED=1 \
-    STORAGE_BACKEND=minio \
-    QUERY_CACHE_ENABLED=true \
-    LOG_LEVEL=INFO \
-    WORKERS=4
+# Python environment
+ENV PYTHONUNBUFFERED=1
 
 # Entrypoint
 ENTRYPOINT ["./entrypoint.sh"]
