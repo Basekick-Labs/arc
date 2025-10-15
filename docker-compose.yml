@@ -10,7 +10,7 @@ services:
     environment:
       # Storage configuration
       STORAGE_BACKEND: local
-      LOCAL_STORAGE_PATH: /data/arc/
+      LOCAL_STORAGE_PATH: /app/data/arc/
       # Database
       DB_PATH: /data/arc.db
       # Performance
@@ -21,7 +21,8 @@ services:
       LOG_LEVEL: INFO
       WAL_ENABLED: "false"
     volumes:
-      - arc-data:/data
+      - arc-db:/data
+      - arc-data:/app/data
       - arc-logs:/app/logs
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -32,6 +33,8 @@ services:
     restart: unless-stopped
 
 volumes:
+  arc-db:
+    driver: local
   arc-data:
     driver: local
   arc-logs:
