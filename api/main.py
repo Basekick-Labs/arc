@@ -141,18 +141,23 @@ app.add_middleware(
 )
 
 # Auth setup (must be defined early)
-AUTH_ENABLED = os.getenv("AUTH_ENABLED", "true").lower() == "true"  # Default to enabled
-AUTH_ALLOWLIST = [p.strip() for p in os.getenv(
-    "AUTH_ALLOWLIST",
+from config_loader import get_config
+_arc_config = get_config()
+_auth_config = _arc_config.get_auth_config()
+
+AUTH_ENABLED = _auth_config.get("enabled", True)  # Default to enabled
+AUTH_ALLOWLIST = [p.strip() for p in _auth_config.get(
+    "allowlist",
     "/health,/ready,/docs,/openapi.json,/auth/verify"  # Basic health endpoints only
 ).split(",") if p.strip()]
-auth_manager = AuthManager()
+AUTH_CACHE_TTL = _auth_config.get("cache_ttl", 30)  # Default: 30 seconds
+auth_manager = AuthManager(cache_ttl=AUTH_CACHE_TTL)
 
-# Handle seed token from environment or generate initial token
-default_token = os.getenv("DEFAULT_API_TOKEN")
+# Handle seed token from config or environment
+default_token = _auth_config.get("default_token") or os.getenv("DEFAULT_API_TOKEN")
 if default_token:
     auth_manager.ensure_seed_token(default_token, name="default")
-    logger.info("Using DEFAULT_API_TOKEN from environment")
+    logger.info("Using DEFAULT_API_TOKEN from configuration")
 
 app.middleware("http")(AuthMiddleware(auth_manager, enabled=AUTH_ENABLED, allowlist=AUTH_ALLOWLIST))
 
@@ -820,6 +825,27 @@ async def rotate_token_endpoint(token_id: int, request: Request):
     raise HTTPException(status_code=500, detail="Failed to rotate token")
 
 
+@app.get("/auth/cache/stats")
+async def get_auth_cache_stats(request: Request):
+    """Get authentication cache statistics (requires authentication)"""
+    if not auth_manager.verify_request_header(request.headers):
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    stats = auth_manager.get_cache_stats()
+    return stats
+
+
+@app.post("/auth/cache/invalidate")
+async def invalidate_auth_cache(request: Request):
+    """Invalidate the authentication cache (requires authentication)"""
+    if not auth_manager.verify_request_header(request.headers):
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    auth_manager.invalidate_cache()
+    return {
+        "message": "Authentication cache invalidated successfully",
+        "cache_ttl_seconds": AUTH_CACHE_TTL
+    }
 
 
 

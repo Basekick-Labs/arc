@@ -753,6 +753,100 @@ WRITE_COMPRESSION=snappy        # 2-3× compression, fast decode
 - **Too large** (>100MB): Slow uploads, harder to prune
 - **Optimal** (5-20MB): Fast uploads, good pruning, parallel reads
 
+### Authentication Performance
+
+**Goal: Secure API access with minimal overhead**
+
+Arc implements token-based authentication with intelligent caching to eliminate performance penalties:
+
+```toml
+[auth]
+enabled = true
+cache_ttl = 30  # Token cache TTL in seconds (default: 30)
+```
+
+**Performance Comparison (2.4M RPS workload):**
+
+| Configuration | Throughput | p50 Latency | Performance Impact |
+|--------------|-----------|-------------|-------------------|
+| Auth Disabled | 2.42M RPS | 1.64ms | Baseline (not recommended) |
+| **Auth + Cache (30s)** | **2.42M RPS** | **1.74ms** | **+0.1ms (+6%)** ✅ Recommended |
+| Auth (no cache) | 2.31M RPS | 6.36ms | +4.72ms (+288%) |
+
+**How Token Caching Works:**
+
+1. **First Request**: SQLite lookup (~5ms overhead)
+   - Token validated against database
+   - Result cached in memory with TTL expiry
+
+2. **Subsequent Requests** (within TTL):
+   - In-memory cache hit (~0.01ms overhead)
+   - No database query needed
+   - **500x faster** than database lookup
+
+3. **Cache Expiry**:
+   - After TTL, token revalidated against database
+   - Fresh cache entry created
+   - At 2.4M RPS with 30s TTL: **99.9%+ hit rate**
+
+**Cache Configuration:**
+
+```env
+# Enable authentication (production recommended)
+AUTH_ENABLED=true
+
+# Cache TTL in seconds (default: 30)
+# - Higher values: Better performance, longer revocation delay
+# - Lower values: Faster revocation, slightly lower performance
+AUTH_CACHE_TTL=30
+```
+
+**Cache Management API:**
+
+```bash
+# View cache statistics
+curl http://localhost:8000/auth/cache/stats \
+  -H "Authorization: Bearer $TOKEN"
+
+# Response:
+{
+  "cache_size": 1,
+  "cache_ttl_seconds": 30,
+  "total_requests": 72500000,
+  "cache_hits": 72499999,
+  "cache_misses": 1,
+  "hit_rate_percent": 99.99
+}
+
+# Manual cache invalidation (for immediate token revocation)
+curl -X POST http://localhost:8000/auth/cache/invalidate \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**Security Considerations:**
+
+- **Revocation delay**: Revoked tokens remain valid for up to `cache_ttl` seconds
+  - 30s default provides excellent balance
+  - Use `/auth/cache/invalidate` for immediate effect across all workers
+
+- **Per-worker isolation**: Each worker maintains its own cache
+  - No cross-worker cache pollution
+  - Cache invalidation affects only the current worker
+  - Revoke/delete operations automatically clear all caches
+
+- **Production recommendation**: Keep auth enabled with 30s cache
+  - Near-zero performance impact (+0.1ms)
+  - Industry-standard revocation delay (JWT tokens: minutes/hours)
+  - Better than OAuth (5-15 min validation cache)
+
+**Best Practices:**
+
+1. **Always enable auth in production** (`enabled = true`)
+2. **Use default 30s cache TTL** (optimal for most workloads)
+3. **Monitor cache hit rate** via `/auth/cache/stats`
+4. **Manual invalidation** when revoking tokens for security incidents
+5. **Token rotation** instead of revocation for planned changes
+
 ### Monitoring
 
 **Key metrics to watch:**

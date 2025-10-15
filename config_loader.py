@@ -60,6 +60,7 @@ class ArcConfig:
                 "enabled": True,
                 "default_token": "",
                 "allowlist": "/health,/ready,/docs,/openapi.json,/auth/verify",
+                "cache_ttl": 30,  # Token cache TTL in seconds
             },
             "query_cache": {
                 "enabled": True,
@@ -158,6 +159,7 @@ class ArcConfig:
             "AUTH_ENABLED": ("auth", "enabled", lambda x: x.lower() == "true"),
             "DEFAULT_API_TOKEN": ("auth", "default_token"),
             "AUTH_ALLOWLIST": ("auth", "allowlist"),
+            "AUTH_CACHE_TTL": ("auth", "cache_ttl", int),
 
             # Query Cache
             "QUERY_CACHE_ENABLED": ("query_cache", "enabled", lambda x: x.lower() == "true"),
@@ -276,6 +278,10 @@ class ArcConfig:
     def get_cache_config(self) -> Dict[str, Any]:
         """Get query cache configuration"""
         return self.config.get("query_cache", {})
+
+    def get_auth_config(self) -> Dict[str, Any]:
+        """Get authentication configuration"""
+        return self.config.get("auth", {})
 
     def get_storage_config(self) -> Dict[str, Any]:
         """Get storage configuration"""

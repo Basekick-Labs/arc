@@ -6,9 +6,11 @@ import hashlib
 import os
 import secrets
 import sqlite3
+import time
 from datetime import datetime
 from typing import Optional, Dict
 import logging
+import threading
 
 from fastapi import HTTPException, Request
 from api.config import get_db_path
@@ -17,10 +19,22 @@ logger = logging.getLogger(__name__)
 
 
 class AuthManager:
-    """Simple token-based authentication manager"""
+    """Simple token-based authentication manager with in-memory cache"""
 
-    def __init__(self, db_path: str = None):
+    def __init__(self, db_path: str = None, cache_ttl: int = 30):
+        """
+        Initialize AuthManager
+
+        Args:
+            db_path: Path to SQLite database
+            cache_ttl: Cache TTL in seconds (default: 30s)
+        """
         self.db_path = db_path or get_db_path()
+        self.cache_ttl = cache_ttl
+        self._cache = {}  # token_hash -> (token_info, expiry_time)
+        self._cache_lock = threading.Lock()
+        self._cache_hits = 0
+        self._cache_misses = 0
         self._init_db()
 
     def _init_db(self):
@@ -62,12 +76,27 @@ class AuthManager:
                 raise ValueError(f"Token with name '{name}' already exists")
 
     def verify_token(self, token: str) -> Optional[Dict]:
-        """Verify a token and return token info if valid"""
+        """Verify a token and return token info if valid (with caching)"""
         if not token:
             return None
 
         token_hash = self._hash_token(token)
+        current_time = time.time()
 
+        # Check cache first
+        with self._cache_lock:
+            if token_hash in self._cache:
+                token_info, expiry_time = self._cache[token_hash]
+                if current_time < expiry_time:
+                    self._cache_hits += 1
+                    return token_info
+                else:
+                    # Cache expired, remove it
+                    del self._cache[token_hash]
+
+            self._cache_misses += 1
+
+        # Cache miss - query database
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(
@@ -78,7 +107,6 @@ class AuthManager:
 
             if row:
                 # Check token expiration if expires_at is set
-                # Note: sqlite3.Row doesn't have .get(), check if column exists
                 try:
                     expires_at_value = row['expires_at'] if 'expires_at' in row.keys() else None
                 except (KeyError, IndexError):
@@ -97,7 +125,6 @@ class AuthManager:
                             return None
                     except Exception as e:
                         logger.error(f"Error checking token expiration: {e}")
-                        # If we can't parse the expiration, treat as expired for safety
                         return None
 
                 # Update last used timestamp
@@ -107,13 +134,19 @@ class AuthManager:
                 )
                 conn.commit()
 
-                return {
+                token_info = {
                     'id': row['id'],
                     'name': row['name'],
                     'description': row['description'],
                     'created_at': row['created_at'],
                     'last_used_at': row['last_used_at']
                 }
+
+                # Store in cache
+                with self._cache_lock:
+                    self._cache[token_hash] = (token_info, current_time + self.cache_ttl)
+
+                return token_info
 
             return None
 
@@ -127,24 +160,58 @@ class AuthManager:
             return [dict(row) for row in cursor.fetchall()]
 
     def revoke_token(self, name: str) -> bool:
-        """Revoke (disable) a token"""
+        """Revoke (disable) a token and invalidate cache"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
                 "UPDATE api_tokens SET enabled = 0 WHERE name = ?",
                 (name,)
             )
             conn.commit()
-            return cursor.rowcount > 0
+            success = cursor.rowcount > 0
+
+        # Invalidate entire cache when revoking to ensure immediate effect
+        if success:
+            self.invalidate_cache()
+
+        return success
 
     def delete_token(self, name: str) -> bool:
-        """Delete a token permanently"""
+        """Delete a token permanently and invalidate cache"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
                 "DELETE FROM api_tokens WHERE name = ?",
                 (name,)
             )
             conn.commit()
-            return cursor.rowcount > 0
+            success = cursor.rowcount > 0
+
+        # Invalidate cache when deleting
+        if success:
+            self.invalidate_cache()
+
+        return success
+
+    def invalidate_cache(self):
+        """Clear the entire token cache"""
+        with self._cache_lock:
+            cleared_count = len(self._cache)
+            self._cache.clear()
+            logger.info(f"Token cache invalidated: cleared {cleared_count} entries")
+
+    def get_cache_stats(self) -> Dict:
+        """Get cache statistics"""
+        with self._cache_lock:
+            total_requests = self._cache_hits + self._cache_misses
+            hit_rate = (self._cache_hits / total_requests * 100) if total_requests > 0 else 0
+
+            return {
+                "cache_size": len(self._cache),
+                "cache_ttl_seconds": self.cache_ttl,
+                "total_requests": total_requests,
+                "cache_hits": self._cache_hits,
+                "cache_misses": self._cache_misses,
+                "hit_rate_percent": round(hit_rate, 2)
+            }
 
     def ensure_seed_token(self, token: str, name: str = "default") -> bool:
         """Ensure a seed token exists (for initial setup)"""

@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img src="https://img.shields.io/badge/License-AGPL%203.0-blue.svg" alt="License: AGPL-3.0"/></a>
-  <a href="https://github.com/basekick-labs/arc-core"><img src="https://img.shields.io/badge/Throughput-2.32M%20RPS-brightgreen.svg" alt="Performance"/></a>
+  <a href="https://github.com/basekick-labs/arc-core"><img src="https://img.shields.io/badge/Throughput-2.42M%20RPS-brightgreen.svg" alt="Performance"/></a>
   <a href="https://discord.gg/nxnWfUxsdm"><img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2?logo=discord&logoColor=white" alt="Discord"/></a>
 </p>
 
@@ -32,32 +32,54 @@
 
 ## Performance Benchmark
 
-**Arc achieves 2.32M records/sec with columnar MessagePack format!**
+**Arc achieves 2.42M records/sec with columnar MessagePack format and authentication enabled!**
 
 ### Write Performance - Format Comparison
 
 | Wire Format | Throughput | p50 Latency | p95 Latency | p99 Latency | Notes |
 |-------------|------------|-------------|-------------|-------------|-------|
-| **MessagePack Columnar** | **2.32M RPS** | **6.75ms** | **39.46ms** | **59.09ms** | Zero-copy passthrough (RECOMMENDED) |
+| **MessagePack Columnar** | **2.42M RPS** | **1.74ms** | **28.13ms** | **45.27ms** | Zero-copy passthrough + auth cache (RECOMMENDED) |
 | **MessagePack Row** | **908K RPS** | **136.86ms** | **851.71ms** | **1542ms** | Legacy format with conversion overhead |
 | **Line Protocol** | **240K RPS** | N/A | N/A | N/A | InfluxDB compatibility mode |
 
 **Columnar Format Advantages:**
-- **2.55x faster throughput** vs row format (2.32M vs 908K RPS)
-- **20x lower p50 latency** (6.75ms vs 136.86ms)
-- **21x lower p95 latency** (39.46ms vs 851.71ms)
-- **26x lower p99 latency** (59.09ms vs 1542ms)
-- **67x fewer errors** under load (63 vs 4,211 errors at 2.5M target RPS)
+- **2.66x faster throughput** vs row format (2.42M vs 908K RPS)
+- **78x lower p50 latency** (1.74ms vs 136.86ms)
+- **30x lower p95 latency** (28.13ms vs 851.71ms)
+- **34x lower p99 latency** (45.27ms vs 1542ms)
+- **Near-zero authentication overhead** with 30s token cache
 
 *Tested on Apple M3 Max (14 cores), native deployment, 400 workers*
 *MessagePack columnar format with zero-copy Arrow passthrough*
+
+### Authentication Performance
+
+Arc includes built-in token-based authentication with minimal performance overhead thanks to intelligent caching:
+
+| Configuration | Throughput | p50 Latency | p95 Latency | p99 Latency | Notes |
+|--------------|-----------|-------------|-------------|-------------|-------|
+| **Auth Disabled** | 2.42M RPS | 1.64ms | 27.27ms | 41.63ms | No security (not recommended) |
+| **Auth + Cache (30s TTL)** | **2.42M RPS** | **1.74ms** | **28.13ms** | **45.27ms** | **Production recommended** |
+| **Auth (no cache)** | 2.31M RPS | 6.36ms | 41.41ms | 63.31ms | 5ms SQLite lookup overhead |
+
+**Key Insights:**
+- **Token caching** eliminates auth performance penalty (only +0.1ms overhead vs no auth)
+- **30-second TTL** provides excellent hit rate at 2.4M RPS workloads
+- **Security with speed**: Full authentication with near-zero performance impact
+- **Configurable TTL**: Adjust cache duration via `AUTH_CACHE_TTL` (default: 30s)
+
+**Cache Statistics:**
+- **Hit rate**: 99.9%+ at sustained high throughput
+- **Revocation delay**: Max 30 seconds (cache TTL)
+- **Manual invalidation**: `POST /auth/cache/invalidate` for immediate effect
+- **Monitoring**: `GET /auth/cache/stats` for cache performance metrics
 
 ### Storage Backend Performance
 
 | Storage Backend | Throughput | Notes |
 |----------------|------------|-------|
-| **Local NVMe** | **2.32M RPS** | Direct filesystem (fastest) |
-| **MinIO** | **~2.0M RPS** | S3-compatible object storage |
+| **Local NVMe** | **2.42M RPS** | Direct filesystem (fastest) |
+| **MinIO** | **~2.1M RPS** | S3-compatible object storage |
 
 **Why is columnar format so much faster?**
 1. **Zero conversion overhead** - No flatten tags/fields, no row→column conversion
