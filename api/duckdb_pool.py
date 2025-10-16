@@ -435,13 +435,15 @@ class DuckDBConnectionPool:
             }
 
         finally:
+            # CRITICAL: Reset connection state BEFORE returning to pool
+            # This prevents race condition where another query grabs connection
+            # before state is cleared
+            if conn:
+                conn.reset_state()
+
             # OPTIMIZATION: Return connection ASAP (before serialization)
             # This allows other queries to use the connection while we serialize
             self.return_connection(conn)
-
-            # CRITICAL: Reset connection state to clear DuckDB result cache
-            if conn:
-                conn.reset_state()
 
         # Serialize data for JSON AFTER releasing connection
         serialized_data = []
@@ -574,14 +576,15 @@ class DuckDBConnectionPool:
             }
 
         finally:
+            # CRITICAL: Reset connection state BEFORE returning to pool
+            # This prevents race condition where another query grabs connection
+            # before state is cleared
+            if conn:
+                conn.reset_state()
+
             # OPTIMIZATION: Return connection ASAP (before serialization)
             # This allows other queries to use the connection while we serialize
             self.return_connection(conn)
-
-            # CRITICAL: Reset connection state to clear DuckDB result cache
-            # DuckDB caches query results internally, causing memory accumulation
-            if conn:
-                conn.reset_state()
 
         # Serialize Arrow table to IPC format AFTER releasing connection
         try:
