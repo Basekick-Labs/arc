@@ -251,7 +251,15 @@ class DuckDBEngine:
         Returns:
             Dict with success, arrow_table (bytes), schema, row_count, execution_time_ms, wait_time_ms
         """
-        # Convert SQL for S3 paths
+        # Check for SHOW TABLES command BEFORE rewriting SQL
+        if self._is_show_tables_query(sql):
+            return await self._execute_show_tables_arrow(sql)
+
+        # Check for SHOW DATABASES command BEFORE rewriting SQL
+        if self._is_show_databases_query(sql):
+            return await self._execute_show_databases_arrow(sql)
+
+        # Convert SQL for S3 paths (only for regular queries)
         converted_sql = self._convert_sql_to_s3_paths(sql)
 
         # Use connection pool for Arrow query execution
@@ -713,6 +721,277 @@ class DuckDBEngine:
                 "columns": [],
                 "row_count": 0
             }
+
+    async def _execute_show_databases_arrow(self, sql: str) -> Dict[str, Any]:
+        """Native Arrow handler for SHOW DATABASES command"""
+        start_time = time.time()
+        try:
+            import pyarrow as pa
+            import io
+
+            # Get databases list (reuse sync logic)
+            loop = asyncio.get_event_loop()
+            databases = await loop.run_in_executor(None, self._get_databases_list)
+
+            # Create Arrow table from databases list
+            # Schema: [database: string]
+            database_array = pa.array(sorted(databases), type=pa.string())
+            arrow_table = pa.Table.from_arrays([database_array], names=["database"])
+
+            # Serialize to Arrow IPC format (stream)
+            sink = io.BytesIO()
+            with pa.ipc.new_stream(sink, arrow_table.schema) as writer:
+                writer.write_table(arrow_table)
+
+            arrow_bytes = sink.getvalue()
+            execution_time = time.time() - start_time
+
+            logger.info(f"SHOW DATABASES (Arrow) completed in {execution_time:.3f}s: {len(databases)} databases")
+
+            return {
+                "success": True,
+                "arrow_table": arrow_bytes,
+                "row_count": len(databases),
+                "execution_time_ms": round(execution_time * 1000, 2),
+                "wait_time_ms": 0.0
+            }
+
+        except Exception as e:
+            execution_time = time.time() - start_time
+            logger.error(f"SHOW DATABASES (Arrow) failed in {execution_time:.3f}s: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "arrow_table": b"",
+                "row_count": 0,
+                "execution_time_ms": round(execution_time * 1000, 2),
+                "wait_time_ms": 0.0
+            }
+
+    async def _execute_show_tables_arrow(self, sql: str) -> Dict[str, Any]:
+        """Native Arrow handler for SHOW TABLES command"""
+        start_time = time.time()
+        try:
+            import pyarrow as pa
+            import io
+            import re
+
+            # Extract database name if specified
+            pattern = r'^\s*SHOW\s+TABLES(?:\s+FROM\s+([\w-]+))?\s*;?\s*$'
+            match = re.match(pattern, sql.strip(), re.IGNORECASE)
+
+            if not match:
+                return {
+                    "success": False,
+                    "error": "Invalid SHOW TABLES syntax",
+                    "arrow_table": b"",
+                    "row_count": 0,
+                    "execution_time_ms": 0.0,
+                    "wait_time_ms": 0.0
+                }
+
+            database_filter = match.group(1)
+
+            # Get tables list (reuse sync logic)
+            loop = asyncio.get_event_loop()
+            tables_data = await loop.run_in_executor(None, self._get_tables_list, database_filter)
+
+            # Create Arrow table from tables data
+            # Schema: [database: string, table_name: string, storage_path: string, file_count: int64, total_size_mb: float64]
+            if not tables_data:
+                # Empty result - need empty arrays for each field
+                arrow_table = pa.Table.from_arrays(
+                    [
+                        pa.array([], type=pa.string()),
+                        pa.array([], type=pa.string()),
+                        pa.array([], type=pa.string()),
+                        pa.array([], type=pa.int64()),
+                        pa.array([], type=pa.float64())
+                    ],
+                    names=["database", "table_name", "storage_path", "file_count", "total_size_mb"]
+                )
+            else:
+                # Extract columns
+                databases = [t["database"] for t in tables_data]
+                table_names = [t["table_name"] for t in tables_data]
+                storage_paths = [t["storage_path"] for t in tables_data]
+                file_counts = [t["file_count"] for t in tables_data]
+                total_sizes = [round(t["total_size"] / (1024 * 1024), 2) for t in tables_data]
+
+                arrow_table = pa.Table.from_arrays(
+                    [
+                        pa.array(databases, type=pa.string()),
+                        pa.array(table_names, type=pa.string()),
+                        pa.array(storage_paths, type=pa.string()),
+                        pa.array(file_counts, type=pa.int64()),
+                        pa.array(total_sizes, type=pa.float64())
+                    ],
+                    names=["database", "table_name", "storage_path", "file_count", "total_size_mb"]
+                )
+
+            # Serialize to Arrow IPC format (stream)
+            sink = io.BytesIO()
+            with pa.ipc.new_stream(sink, arrow_table.schema) as writer:
+                writer.write_table(arrow_table)
+
+            arrow_bytes = sink.getvalue()
+            execution_time = time.time() - start_time
+
+            logger.info(f"SHOW TABLES (Arrow) completed in {execution_time:.3f}s: {len(tables_data)} tables")
+
+            return {
+                "success": True,
+                "arrow_table": arrow_bytes,
+                "row_count": len(tables_data),
+                "execution_time_ms": round(execution_time * 1000, 2),
+                "wait_time_ms": 0.0
+            }
+
+        except Exception as e:
+            execution_time = time.time() - start_time
+            logger.error(f"SHOW TABLES (Arrow) failed in {execution_time:.3f}s: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "arrow_table": b"",
+                "row_count": 0,
+                "execution_time_ms": round(execution_time * 1000, 2),
+                "wait_time_ms": 0.0
+            }
+
+    def _get_databases_list(self) -> set:
+        """Get list of databases from storage (synchronous helper)"""
+        databases = set()
+
+        # Get the backend
+        backend = self.local_backend or self.minio_backend or self.s3_backend or self.ceph_backend or self.gcs_backend
+
+        if self.local_backend:
+            # Local filesystem: scan base_path for database directories
+            from pathlib import Path
+            base_path = Path(self.local_backend.base_path)
+
+            if base_path.exists():
+                for item in base_path.iterdir():
+                    if item.is_dir() and not item.name.startswith('.'):
+                        databases.add(item.name)
+
+            logger.info(f"Local filesystem databases: {sorted(databases)}")
+
+        elif backend:
+            # Scan the bucket root to find all database directories
+            try:
+                paginator = backend.s3_client.get_paginator('list_objects_v2')
+
+                for page in paginator.paginate(
+                    Bucket=backend.bucket,
+                    Prefix="",
+                    Delimiter="/",
+                    MaxKeys=1000
+                ):
+                    if 'CommonPrefixes' in page:
+                        for prefix_info in page['CommonPrefixes']:
+                            prefix = prefix_info['Prefix']
+                            database = prefix.rstrip('/')
+                            if database and not database.isdigit():
+                                databases.add(database)
+
+            except Exception as e:
+                logger.error(f"Failed to scan bucket for databases: {e}")
+                databases.add(backend.database)
+
+            if not databases:
+                databases.add("default")
+        else:
+            databases.add("default")
+
+        return databases
+
+    def _get_tables_list(self, database_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get list of tables from storage (synchronous helper)"""
+        try:
+            backend = self.local_backend or self.minio_backend or self.s3_backend or self.ceph_backend or self.gcs_backend
+            if not backend:
+                return []
+
+            # Determine which database to query
+            target_database = database_filter if database_filter else backend.database
+
+            # Handle local filesystem backend
+            if self.local_backend:
+                from pathlib import Path
+                base_path = Path(self.local_backend.base_path)
+                database_path = base_path / target_database
+
+                objects = []
+                if database_path.exists():
+                    for measurement_dir in database_path.iterdir():
+                        if measurement_dir.is_dir() and not measurement_dir.name.startswith('.'):
+                            for file_path in measurement_dir.rglob('*.parquet'):
+                                relative_path = file_path.relative_to(database_path)
+                                objects.append(str(relative_path))
+
+                logger.info(f"Local filesystem found {len(objects)} files for database {target_database}")
+
+            # If querying a different database, use S3 directly
+            elif database_filter and database_filter != backend.database:
+                objects = []
+                try:
+                    paginator = backend.s3_client.get_paginator('list_objects_v2')
+                    for page in paginator.paginate(
+                        Bucket=backend.bucket,
+                        Prefix=f"{target_database}/",
+                        MaxKeys=10000
+                    ):
+                        if 'Contents' in page:
+                            for obj in page['Contents']:
+                                key = obj['Key']
+                                if key.startswith(f"{target_database}/"):
+                                    relative_key = key[len(f"{target_database}/"):]
+                                    objects.append(relative_key)
+                except Exception as e:
+                    logger.error(f"Failed to list objects for database {target_database}: {e}")
+                    return []
+            else:
+                # Use backend's list_objects for current database
+                objects = backend.list_objects(prefix="", max_keys=10000)
+                target_database = backend.database
+
+            # Parse objects to find measurements (tables)
+            tables = {}
+            for obj_key in objects:
+                parts = obj_key.split('/')
+
+                if len(parts) >= 1:
+                    measurement = parts[0]
+
+                    # Skip year/partition directories
+                    if measurement.isdigit():
+                        continue
+
+                    table_key = f"{target_database}.{measurement}"
+                    if table_key not in tables:
+                        if self.local_backend:
+                            storage_path = f"{self.local_backend.base_path}/{target_database}/{measurement}/"
+                        else:
+                            storage_path = f"s3://{backend.bucket}/{target_database}/{measurement}/"
+
+                        tables[table_key] = {
+                            "database": target_database,
+                            "table_name": measurement,
+                            "file_count": 0,
+                            "total_size": 0,
+                            "storage_path": storage_path
+                        }
+
+                    if obj_key.endswith('.parquet'):
+                        tables[table_key]["file_count"] += 1
+
+            return sorted(tables.values(), key=lambda x: (x["database"], x["table_name"]))
+
+        except Exception as e:
+            logger.error(f"Failed to get tables list: {e}")
+            return []
 
     async def get_measurements(self) -> List[str]:
         """Get list of available measurements (tables) in current database
