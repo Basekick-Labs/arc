@@ -179,8 +179,36 @@ class CompactionJob:
         def _compact():
             con = duckdb.connect(':memory:')
 
-            # Read all Parquet files
-            file_pattern = str(temp_dir / "*.parquet")
+            # Validate each file first and filter out corrupted ones
+            valid_files = []
+            for file_path in local_files:
+                try:
+                    # Try to read file metadata to validate it
+                    con.execute(f"SELECT COUNT(*) FROM read_parquet('{file_path}')").fetchone()
+                    valid_files.append(file_path)
+                except Exception as e:
+                    logger.error(f"Skipping corrupted file {file_path.name}: {e}")
+                    # Move corrupted file to quarantine
+                    try:
+                        quarantine_dir = temp_dir / "quarantine"
+                        quarantine_dir.mkdir(exist_ok=True)
+                        corrupted_path = quarantine_dir / file_path.name
+                        file_path.rename(corrupted_path)
+                        logger.info(f"Moved corrupted file to quarantine: {corrupted_path}")
+                    except Exception as move_error:
+                        logger.warning(f"Failed to quarantine corrupted file: {move_error}")
+
+            if not valid_files:
+                raise ValueError(f"No valid parquet files found in {temp_dir}")
+
+            logger.info(f"Validated {len(valid_files)}/{len(local_files)} files for compaction")
+
+            # Build file list for read_parquet
+            if len(valid_files) == 1:
+                file_pattern = str(valid_files[0])
+            else:
+                # Use glob pattern but only valid files remain
+                file_pattern = str(temp_dir / "*.parquet")
 
             # Write compacted file with optimized settings
             # Use union_by_name=true to handle schema evolution (missing columns filled with NULL)
@@ -298,9 +326,14 @@ class CompactionManager:
         self.total_files_compacted = 0
         self.total_bytes_saved = 0
 
+        # Lock for storage backend database switching
+        # Multiple concurrent jobs share the same storage_backend instance
+        # and need to serialize access when changing its database property
+        self._storage_lock = asyncio.Lock()
+
     async def find_candidates(self) -> List[Dict[str, Any]]:
         """
-        Find partitions that are candidates for compaction
+        Find partitions that are candidates for compaction across ALL databases
 
         Returns:
             List of candidate partitions with metadata
@@ -310,12 +343,12 @@ class CompactionManager:
 
         logger.info("Scanning for compaction candidates...")
 
-        # List all measurements
+        # List all measurements across all databases
         measurements = await self._list_measurements()
 
-        for measurement in measurements:
+        for database, measurement in measurements:
             # List all hour partitions for this measurement
-            partitions = await self._list_partitions(measurement, cutoff_time)
+            partitions = await self._list_partitions(database, measurement, cutoff_time)
 
             for partition_info in partitions:
                 partition_path = partition_info['path']
@@ -328,6 +361,7 @@ class CompactionManager:
 
                     if not has_compacted:
                         candidates.append({
+                            'database': database,
                             'measurement': measurement,
                             'partition_path': partition_path,
                             'file_count': len(files),
@@ -335,7 +369,7 @@ class CompactionManager:
                         })
 
                         logger.info(
-                            f"Candidate: {partition_path} ({len(files)} files)"
+                            f"Candidate: {database}/{partition_path} ({len(files)} files)"
                         )
 
         logger.info(f"Found {len(candidates)} compaction candidates")
@@ -343,6 +377,7 @@ class CompactionManager:
 
     async def compact_partition(
         self,
+        database: str,
         measurement: str,
         partition_path: str,
         files: List[str]
@@ -351,6 +386,7 @@ class CompactionManager:
         Compact a single partition
 
         Args:
+            database: Database name
             measurement: Measurement name
             partition_path: Partition path (relative to database)
             files: List of files to compact (relative to database)
@@ -358,27 +394,44 @@ class CompactionManager:
         Returns:
             True if successful
         """
+        # Lock key includes database to avoid conflicts
+        lock_key = f"{database}/{partition_path}"
+
         # Try to acquire lock
-        if not self.lock_manager.acquire_lock(partition_path):
-            logger.info(f"Partition {partition_path} already locked, skipping")
+        if not self.lock_manager.acquire_lock(lock_key):
+            logger.info(f"Partition {lock_key} already locked, skipping")
             return False
 
         try:
-            # Create and run job
-            job = CompactionJob(
-                measurement=measurement,
-                partition_path=partition_path,
-                files=files,
-                storage_backend=self.storage_backend,
-                database=self.database,
-                target_size_mb=self.target_size_mb
-            )
+            # Acquire storage backend lock to safely modify database property
+            # Multiple concurrent jobs share the same storage_backend instance
+            async with self._storage_lock:
+                # Temporarily override the database for this job
+                original_database = getattr(self.storage_backend, 'database', None)
 
-            self.active_jobs[job.job_id] = job
+                # Set database for this operation
+                if hasattr(self.storage_backend, 'database'):
+                    self.storage_backend.database = database
 
-            success = await job.run()
+                # Create and run job
+                job = CompactionJob(
+                    measurement=measurement,
+                    partition_path=partition_path,
+                    files=files,
+                    storage_backend=self.storage_backend,
+                    database=database,
+                    target_size_mb=self.target_size_mb
+                )
 
-            # Update metrics
+                self.active_jobs[job.job_id] = job
+
+                success = await job.run()
+
+                # Restore original database
+                if original_database and hasattr(self.storage_backend, 'database'):
+                    self.storage_backend.database = original_database
+
+            # Update metrics (outside lock)
             if success:
                 self.total_jobs_completed += 1
                 self.total_files_compacted += job.files_compacted
@@ -394,11 +447,11 @@ class CompactionManager:
 
         finally:
             # Always release lock
-            self.lock_manager.release_lock(partition_path)
+            self.lock_manager.release_lock(lock_key)
 
     async def run_compaction_cycle(self):
         """
-        Run one compaction cycle - find and compact eligible partitions
+        Run one compaction cycle - find and compact eligible partitions across ALL databases
         """
         logger.info("Starting compaction cycle")
 
@@ -415,6 +468,7 @@ class CompactionManager:
         async def _compact_with_limit(candidate):
             async with semaphore:
                 return await self.compact_partition(
+                    candidate['database'],
                     candidate['measurement'],
                     candidate['partition_path'],
                     candidate['files']
@@ -433,13 +487,10 @@ class CompactionManager:
 
     async def _list_measurements(self) -> List[str]:
         """
-        List all measurements in storage within the current database.
-
-        The storage backend already scopes operations to the database,
-        so we list objects without database prefix.
+        List all measurements across ALL databases in storage.
 
         Returns:
-            List of measurement names
+            List of tuples (database, measurement)
         """
         loop = asyncio.get_event_loop()
 
@@ -447,23 +498,62 @@ class CompactionManager:
             measurements = []
 
             try:
-                # List objects in the current database (prefix='')
-                # Storage backend automatically prepends database prefix
-                objects = self.storage_backend.list_objects(prefix='', max_keys=10000)
+                # Check if storage backend is local or S3
+                if hasattr(self.storage_backend, 'base_path'):
+                    # Local filesystem - scan all database directories
+                    from pathlib import Path
+                    base_path = Path(self.storage_backend.base_path)
 
-                for obj in objects:
-                    # Extract measurement from path: 'measurement/2025/10/08/14/file.parquet'
-                    # Note: database prefix is already removed by storage backend
-                    parts = obj.split('/')
-                    if len(parts) >= 5:
-                        measurement = parts[0]
-                        if measurement not in measurements:
-                            measurements.append(measurement)
+                    if base_path.exists():
+                        for db_dir in base_path.iterdir():
+                            if db_dir.is_dir() and not db_dir.name.startswith('.'):
+                                database = db_dir.name
+                                # Scan for measurements in this database
+                                for meas_dir in db_dir.iterdir():
+                                    if meas_dir.is_dir() and not meas_dir.name.startswith('.'):
+                                        measurement = meas_dir.name
+                                        measurements.append((database, measurement))
 
-                logger.info(f"Found {len(measurements)} measurements in database '{self.database}': {measurements}")
+                    logger.info(f"Found {len(measurements)} measurements across all databases: {measurements}")
+
+                elif hasattr(self.storage_backend, 's3_client'):
+                    # S3-based storage - scan all databases in bucket root
+                    bucket = self.storage_backend.bucket
+                    paginator = self.storage_backend.s3_client.get_paginator('list_objects_v2')
+
+                    # List all objects in bucket (no prefix)
+                    for page in paginator.paginate(Bucket=bucket, Prefix='', MaxKeys=10000):
+                        if 'Contents' in page:
+                            for obj in page['Contents']:
+                                key = obj['Key']
+                                parts = key.split('/')
+                                # Path structure: database/measurement/year/month/day/hour/file.parquet
+                                if len(parts) >= 6:
+                                    database = parts[0]
+                                    measurement = parts[1]
+
+                                    # Skip numeric directories (year partitions)
+                                    if not measurement.isdigit():
+                                        db_meas = (database, measurement)
+                                        if db_meas not in measurements:
+                                            measurements.append(db_meas)
+
+                    logger.info(f"Found {len(measurements)} measurements across all databases: {measurements}")
+
+                else:
+                    # Fallback to original behavior for current database only
+                    objects = self.storage_backend.list_objects(prefix='', max_keys=10000)
+                    for obj in objects:
+                        parts = obj.split('/')
+                        if len(parts) >= 5:
+                            measurement = parts[0]
+                            if (self.database, measurement) not in measurements:
+                                measurements.append((self.database, measurement))
+
+                    logger.info(f"Found {len(measurements)} measurements in database '{self.database}': {measurements}")
 
             except Exception as e:
-                logger.error(f"Failed to list measurements in database '{self.database}': {e}")
+                logger.error(f"Failed to list measurements: {e}")
 
             return measurements
 
@@ -471,6 +561,7 @@ class CompactionManager:
 
     async def _list_partitions(
         self,
+        database: str,
         measurement: str,
         cutoff_time: datetime
     ) -> List[Dict[str, Any]]:
@@ -478,9 +569,9 @@ class CompactionManager:
         List hour partitions for a measurement older than cutoff_time.
 
         Storage path structure: {database}/{measurement}/{year}/{month}/{day}/{hour}/file.parquet
-        Storage backend returns keys relative to database: {measurement}/{year}/{month}/{day}/{hour}/file.parquet
 
         Args:
+            database: Database name (e.g., 'systems')
             measurement: Measurement name (e.g., 'cpu')
             cutoff_time: Only return partitions older than this time
 
@@ -493,16 +584,44 @@ class CompactionManager:
             partitions = {}
 
             try:
-                # List all files for this measurement
-                # Storage backend already handles database prefix
-                prefix = f"{measurement}/"
-                objects = self.storage_backend.list_objects(prefix=prefix, max_keys=100000)
+                # List all files for this database/measurement
+                # Check if storage backend is local or S3
+                if hasattr(self.storage_backend, 'base_path'):
+                    # Local filesystem
+                    from pathlib import Path
+                    base_path = Path(self.storage_backend.base_path)
+                    db_meas_path = base_path / database / measurement
 
-                logger.debug(f"Found {len(objects)} objects for measurement '{measurement}' in database '{self.database}'")
+                    objects = []
+                    if db_meas_path.exists():
+                        for file_path in db_meas_path.rglob('*.parquet'):
+                            relative = file_path.relative_to(base_path / database)
+                            objects.append(str(relative))
+
+                elif hasattr(self.storage_backend, 's3_client'):
+                    # S3-based storage
+                    bucket = self.storage_backend.bucket
+                    prefix = f"{database}/{measurement}/"
+                    paginator = self.storage_backend.s3_client.get_paginator('list_objects_v2')
+
+                    objects = []
+                    for page in paginator.paginate(Bucket=bucket, Prefix=prefix, MaxKeys=100000):
+                        if 'Contents' in page:
+                            for obj in page['Contents']:
+                                key = obj['Key']
+                                # Remove database prefix
+                                if key.startswith(f"{database}/"):
+                                    relative_key = key[len(f"{database}/"):]
+                                    objects.append(relative_key)
+                else:
+                    # Fallback - use storage backend's list_objects (assumes current database)
+                    prefix = f"{measurement}/"
+                    objects = self.storage_backend.list_objects(prefix=prefix, max_keys=100000)
+
+                logger.debug(f"Found {len(objects)} objects for {database}/{measurement}")
 
                 for obj in objects:
                     # Parse path: measurement/year/month/day/hour/file.parquet
-                    # (database prefix already removed by storage backend)
                     parts = obj.split('/')
                     if len(parts) >= 5:
                         # Extract time components
@@ -525,6 +644,7 @@ class CompactionManager:
                                 if partition_path not in partitions:
                                     partitions[partition_path] = []
 
+                                # Add file path (relative to database, storage backend handles prefix)
                                 partitions[partition_path].append(obj)
 
                         except ValueError:
@@ -533,14 +653,13 @@ class CompactionManager:
                             continue
 
                 logger.info(
-                    f"Found {len(partitions)} partitions for measurement '{measurement}' "
-                    f"in database '{self.database}' older than {cutoff_time}"
+                    f"Found {len(partitions)} partitions for {database}/{measurement} "
+                    f"older than {cutoff_time}"
                 )
 
             except Exception as e:
                 logger.error(
-                    f"Failed to list partitions for measurement '{measurement}' "
-                    f"in database '{self.database}': {e}"
+                    f"Failed to list partitions for {database}/{measurement}: {e}"
                 )
 
             # Convert to list of dicts
