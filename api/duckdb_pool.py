@@ -177,6 +177,23 @@ class DuckDBConnection:
         except Exception as e:
             logger.error(f"Error closing connection {self.stats.connection_id}: {e}")
 
+    def reset_state(self):
+        """
+        Reset connection state between queries.
+
+        DuckDB caches query results internally. This method clears that cache
+        to prevent memory accumulation across requests.
+        """
+        try:
+            # Execute a harmless query to clear the result cache
+            # This forces DuckDB to release cached result sets
+            self.conn.execute("SELECT NULL").fetchall()
+            self.stats.last_used = time.time()
+        except Exception as e:
+            # Don't raise - connection may be unhealthy
+            # This is best-effort cleanup
+            logger.debug(f"Connection {self.stats.connection_id} reset failed: {e}")
+
 
 class DuckDBConnectionPool:
     """
@@ -422,6 +439,10 @@ class DuckDBConnectionPool:
             # This allows other queries to use the connection while we serialize
             self.return_connection(conn)
 
+            # CRITICAL: Reset connection state to clear DuckDB result cache
+            if conn:
+                conn.reset_state()
+
         # Serialize data for JSON AFTER releasing connection
         serialized_data = []
         for row in result:
@@ -557,22 +578,50 @@ class DuckDBConnectionPool:
             # This allows other queries to use the connection while we serialize
             self.return_connection(conn)
 
+            # CRITICAL: Reset connection state to clear DuckDB result cache
+            # DuckDB caches query results internally, causing memory accumulation
+            if conn:
+                conn.reset_state()
+
         # Serialize Arrow table to IPC format AFTER releasing connection
-        sink = pa.BufferOutputStream()
-        writer = pa.ipc.new_stream(sink, arrow_table.schema)
-        writer.write_table(arrow_table)
-        writer.close()
-        arrow_bytes = sink.getvalue().to_pybytes()
+        try:
+            sink = pa.BufferOutputStream()
+            writer = pa.ipc.new_stream(sink, arrow_table.schema)
+            writer.write_table(arrow_table)
+            writer.close()
+            arrow_bytes = sink.getvalue().to_pybytes()
 
-        logger.info(f"Arrow query executed: {len(arrow_table)} rows in {exec_time:.3f}s (wait: {wait_time:.3f}s)")
+            logger.info(f"Arrow query executed: {len(arrow_table)} rows in {exec_time:.3f}s (wait: {wait_time:.3f}s)")
 
-        return {
-            "success": True,
-            "arrow_table": arrow_bytes,
-            "row_count": len(arrow_table),
-            "execution_time_ms": round(exec_time * 1000, 2),
-            "wait_time_ms": round(wait_time * 1000, 2)
-        }
+            return {
+                "success": True,
+                "arrow_table": arrow_bytes,
+                "row_count": len(arrow_table),
+                "execution_time_ms": round(exec_time * 1000, 2),
+                "wait_time_ms": round(wait_time * 1000, 2)
+            }
+        finally:
+            # CRITICAL: Explicit cleanup of Arrow objects
+            # This prevents memory accumulation across queries
+            if 'sink' in locals() and hasattr(sink, 'release'):
+                try:
+                    sink.release()
+                except Exception:
+                    pass
+
+            # Force garbage collection of large Arrow objects
+            # Important for Gunicorn workers where GC may be delayed
+            try:
+                import gc
+                if 'writer' in locals():
+                    del writer
+                if 'sink' in locals():
+                    del sink
+                if 'arrow_table' in locals():
+                    del arrow_table
+                gc.collect()
+            except Exception as e:
+                logger.debug(f"Arrow cleanup error: {e}")
 
     def get_metrics(self) -> PoolMetrics:
         """Get current pool metrics"""
