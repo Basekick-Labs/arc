@@ -302,6 +302,7 @@ async def startup_event():
 
     primary_worker_lock_file = os.path.join(tempfile.gettempdir(), 'arc_primary_worker.lock')
     is_verbose = False
+    lock_fd = None
 
     try:
         # Try to acquire exclusive lock (only first worker succeeds)
@@ -312,7 +313,12 @@ async def startup_event():
         _primary_worker_lock_fd = lock_fd
         logger.info(f"This worker (PID {os.getpid()}) is the primary worker (verbose logging enabled)")
     except (IOError, OSError):
-        # Lock already held by another worker
+        # Lock already held by another worker - close the file descriptor
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except:
+                pass
         is_verbose = False
         _is_primary_worker = False
         logger.debug(f"Worker {os.getpid()} is a secondary worker (reduced logging)")
@@ -564,10 +570,12 @@ async def startup_event():
                 )
 
                 # Initialize compaction scheduler (only run from first worker)
+                # Scheduler enabled if this is the primary worker (compaction already enabled if we're here)
+                scheduler_enabled = is_verbose
                 compaction_scheduler = CompactionScheduler(
                     compaction_manager=compaction_manager,
                     schedule=compaction_config.get('schedule', '5 * * * *'),
-                    enabled=is_verbose  # Only enable on first worker
+                    enabled=scheduler_enabled
                 )
 
                 # Register with API routes (all workers need this for manual triggers)
@@ -576,15 +584,17 @@ async def startup_event():
                 # Start scheduler (only runs if enabled=True, i.e., first worker only)
                 await compaction_scheduler.start()
 
-                if is_verbose:
+                if scheduler_enabled:
                     log_startup(
                         f"Compaction scheduler started: "
                         f"schedule='{compaction_config.get('schedule')}', "
                         f"min_files={compaction_config.get('min_files')}, "
                         f"target_size={compaction_config.get('target_file_size_mb')}MB"
                     )
+                elif is_verbose:
+                    log_startup("Compaction scheduler disabled in configuration")
                 else:
-                    logger.debug(f"[Worker {os.getpid()}] Compaction manager initialized (scheduler disabled on this worker)")
+                    logger.debug(f"[Worker {os.getpid()}] Compaction enabled, scheduler running on primary worker")
             else:
                 log_startup("Compaction is disabled")
 

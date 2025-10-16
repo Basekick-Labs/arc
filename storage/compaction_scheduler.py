@@ -31,7 +31,7 @@ class CompactionScheduler:
         Args:
             compaction_manager: CompactionManager instance
             schedule: Cron schedule string (minute hour day month weekday)
-            enabled: Enable automatic scheduling
+            enabled: Enable automatic scheduling (True for primary worker, False for secondary workers)
         """
         self.compaction_manager = compaction_manager
         self.schedule = schedule
@@ -47,15 +47,25 @@ class CompactionScheduler:
         self._running = False
         self._task: Optional[asyncio.Task] = None
 
-        logger.info(
-            f"Compaction scheduler initialized: "
-            f"schedule='{schedule}', enabled={enabled}"
-        )
+        # Log appropriately based on whether this is primary or secondary worker
+        if enabled:
+            logger.info(
+                f"Compaction scheduler initialized: "
+                f"schedule='{schedule}', role=primary_worker"
+            )
+        else:
+            logger.debug(
+                f"Compaction scheduler initialized: "
+                f"schedule='{schedule}', role=secondary_worker (scheduler runs on primary only)"
+            )
 
     async def start(self):
         """Start the compaction scheduler"""
         if not self.enabled:
-            logger.info("Compaction scheduler is disabled")
+            logger.debug(
+                "Compaction enabled, scheduler delegated to primary worker "
+                "(this is a secondary worker in multi-worker setup)"
+            )
             return
 
         if self._running:

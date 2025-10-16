@@ -908,7 +908,12 @@ class DuckDBEngine:
         return databases
 
     def _get_tables_list(self, database_filter: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get list of tables from storage (synchronous helper)"""
+        """Get list of tables from storage (synchronous helper)
+
+        Args:
+            database_filter: If specified, only return tables from this database.
+                           If None, return tables from the backend's current database.
+        """
         try:
             backend = self.local_backend or self.minio_backend or self.s3_backend or self.ceph_backend or self.gcs_backend
             if not backend:
@@ -916,6 +921,7 @@ class DuckDBEngine:
 
             # Determine which database to query
             target_database = database_filter if database_filter else backend.database
+            logger.info(f"Getting tables list for database: {target_database}")
 
             # Handle local filesystem backend
             if self.local_backend:
@@ -933,8 +939,9 @@ class DuckDBEngine:
 
                 logger.info(f"Local filesystem found {len(objects)} files for database {target_database}")
 
-            # If querying a different database, use S3 directly
+            # S3-compatible backends (MinIO, S3, Ceph, GCS)
             elif database_filter and database_filter != backend.database:
+                # Specific database requested (different from backend's default)
                 objects = []
                 try:
                     paginator = backend.s3_client.get_paginator('list_objects_v2')
@@ -949,16 +956,16 @@ class DuckDBEngine:
                                 if key.startswith(f"{target_database}/"):
                                     relative_key = key[len(f"{target_database}/"):]
                                     objects.append(relative_key)
+                    logger.info(f"S3 backend found {len(objects)} files for database {target_database}")
                 except Exception as e:
                     logger.error(f"Failed to list objects for database {target_database}: {e}")
                     return []
             else:
                 # Use backend's list_objects for current database
                 objects = backend.list_objects(prefix="", max_keys=10000)
-                target_database = backend.database
 
             # Parse objects to find measurements (tables)
-            tables = {}
+            tables_dict = {}
             for obj_key in objects:
                 parts = obj_key.split('/')
 
@@ -969,14 +976,15 @@ class DuckDBEngine:
                     if measurement.isdigit():
                         continue
 
-                    table_key = f"{target_database}.{measurement}"
-                    if table_key not in tables:
+                    # Track unique measurements
+                    if measurement not in tables_dict:
+                        # Create table entry
                         if self.local_backend:
                             storage_path = f"{self.local_backend.base_path}/{target_database}/{measurement}/"
                         else:
                             storage_path = f"s3://{backend.bucket}/{target_database}/{measurement}/"
 
-                        tables[table_key] = {
+                        tables_dict[measurement] = {
                             "database": target_database,
                             "table_name": measurement,
                             "file_count": 0,
@@ -984,10 +992,13 @@ class DuckDBEngine:
                             "storage_path": storage_path
                         }
 
+                    # Count parquet files
                     if obj_key.endswith('.parquet'):
-                        tables[table_key]["file_count"] += 1
+                        tables_dict[measurement]["file_count"] += 1
 
-            return sorted(tables.values(), key=lambda x: (x["database"], x["table_name"]))
+            tables = list(tables_dict.values())
+            logger.info(f"Found {len(tables)} tables in database {target_database}")
+            return sorted(tables, key=lambda x: x["table_name"])
 
         except Exception as e:
             logger.error(f"Failed to get tables list: {e}")
