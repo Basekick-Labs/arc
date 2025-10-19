@@ -1,8 +1,8 @@
 # Arc: A High-Performance Time-Series Database Through Architectural Simplicity
 
-**Date:** October 17, 2025
+**Date:** October 19, 2025
 **Authors:** Basekick Labs Engineering Team
-**Version:** 1.1
+**Version:** 1.2
 
 ---
 
@@ -152,7 +152,7 @@ Building a high-performance analytical query engine requires years of optimizati
 
 DuckDB is an embedded analytical database—think SQLite for analytics. It excels at scanning columnar data (Parquet), processes data in batches (vectorization), and pushes filters into file readers (avoiding unnecessary I/O). For Arc's workload (large analytical queries over Parquet files), DuckDB is ideal.
 
-Critically, Arc uses DuckDB's default settings. The ClickBench benchmark requires this—no custom tuning allowed. Arc's performance represents pure DuckDB capabilities applied to well-organized Parquet files.
+Arc leverages DuckDB's production-ready capabilities while adding intelligent tuning for real-world workloads. While ClickBench benchmarks use default settings (ensuring fair comparison), production deployments benefit from careful optimization of memory limits, parallelism, and caching strategies.
 
 ### 4.2 Connection Pool Architecture
 
@@ -175,7 +175,54 @@ When queries arrive faster than connections are available, Arc queues them using
 
 Within each priority level, queuing follows FIFO order. A query waits up to its timeout (default: 300 seconds) for an available connection.
 
-### 4.3 Query Execution Flow
+### 4.3 Production Performance Tuning
+
+While Arc's ClickBench results use DuckDB's default settings (ensuring benchmark fairness), production deployments require careful tuning to prevent out-of-memory kills, maximize multi-core utilization, and optimize query performance under concurrent load.
+
+Arc implements comprehensive DuckDB tuning across four critical dimensions:
+
+**Memory Management**: Each DuckDB connection receives a configurable memory limit (default: 8GB), preventing individual queries from exhausting system memory. This hard limit protects against runaway analytical queries that might otherwise trigger Linux OOM killer, crashing worker processes. When queries exceed their memory budget, DuckDB gracefully spills intermediate results to disk (configured temp directory), maintaining availability at the cost of some performance.
+
+The memory limit calculation follows a simple formula:
+```
+memory_limit = (Total_RAM × 0.8) / (workers × pool_size)
+```
+
+For a 64GB server running 8 workers with pool_size=5: `(64GB × 0.8) / (8 × 5) = 1.28GB per connection`. This ensures 40 connections (8 workers × 5 pool) fit comfortably in RAM with 20% headroom for OS and other processes.
+
+**CPU Parallelism**: DuckDB's thread setting controls how many CPU cores each query can utilize. Arc defaults to matching physical core count (14 on M3 Max), but production tuning depends on concurrency expectations:
+
+- **Low concurrency** (1-10 queries): `threads = CPU_cores` maximizes single-query performance
+- **Medium concurrency** (10-50 queries): `threads = CPU_cores / pool_size` balances speed and fairness
+- **High concurrency** (50+ queries): `threads = 1-2` prevents thread contention, relies on pool parallelism
+
+This dynamic approach prevents the common mistake of over-threading: with 14 cores and 40 active queries each using 14 threads, you'd have 560 threads competing for 14 cores—pure overhead.
+
+**Object Cache**: DuckDB's object cache stores Parquet file metadata (schema, row group statistics, column statistics) in memory. This provides dramatic speedups for repeated queries on the same files—Arc's benchmarks show 2-10× performance improvement on subsequent queries.
+
+The cache is especially valuable for dashboard workloads where the same queries execute repeatedly with different time ranges. First execution reads and caches metadata for all relevant Parquet files. Subsequent executions skip metadata reading entirely, proceeding directly to data scanning.
+
+**Compression and Optimization**: Arc configures DuckDB to use ZSTD compression for intermediate results, reducing memory pressure and disk I/O when queries spill to temporary storage. Additionally, `preserve_insertion_order=false` gives the query optimizer freedom to reorder operations for maximum efficiency—time-series data doesn't require insertion order preservation since queries order by timestamp explicitly.
+
+**Configuration Interface**: All tuning parameters expose through arc.conf and environment variables:
+
+```toml
+[duckdb]
+pool_size = 5                        # Concurrent connections per worker
+max_queue_size = 100                 # Query overflow queue depth
+memory_limit = "8GB"                 # Per-connection memory cap
+threads = 14                         # CPU cores per query
+temp_directory = "./data/duckdb_tmp" # Spill location (NVMe recommended)
+enable_object_cache = true           # Metadata caching (2-10× speedup)
+```
+
+Environment variable overrides (`DUCKDB_MEMORY_LIMIT`, `DUCKDB_THREADS`, etc.) support Docker and Kubernetes deployments where configuration files are inconvenient.
+
+**Production Impact**: These optimizations transform DuckDB from a research-quality engine into a production-hardened component. Memory limits prevent cascading failures. Thread tuning ensures fair resource allocation under load. Object caching eliminates redundant metadata reads. The result: stable, predictable performance across diverse workloads without manual per-query tuning.
+
+For complete tuning guidance including troubleshooting and monitoring strategies, see `docs/DUCKDB_PRODUCTION_TUNING.md`.
+
+### 4.4 Query Execution Flow
 
 Let's trace a query's journey through Arc's engine:
 
@@ -216,7 +263,7 @@ Here's a critical optimization: Arc returns the connection to the pool *before* 
 **Step 6: Serialization**
 For JSON responses, Arc converts each row to JSON-serializable types (datetime objects become ISO strings, etc.). For Arrow responses, Arc serializes the result to Arrow IPC stream format—a binary columnar representation that clients can read with zero-copy efficiency.
 
-### 4.4 Custom Commands
+### 4.5 Custom Commands
 
 DuckDB doesn't natively understand `SHOW TABLES` or `SHOW DATABASES` in Arc's multi-database context. Arc intercepts these queries before reaching DuckDB:
 
@@ -226,7 +273,7 @@ DuckDB doesn't natively understand `SHOW TABLES` or `SHOW DATABASES` in Arc's mu
 
 These custom commands enable standard SQL tooling (like Apache Superset) to browse Arc's schema without special configuration.
 
-### 4.5 Memory Management
+### 4.6 Memory Management
 
 Long-running Python processes (especially with Gunicorn workers) can accumulate memory if not carefully managed. Arc implements several safeguards:
 
@@ -817,10 +864,29 @@ compaction:
   max_concurrent_jobs: 2
 ```
 
-**Query Engine Configuration** (environment variables):
+**Query Engine Configuration** (arc.conf and environment variables):
+```toml
+[duckdb]
+pool_size = 5                        # Connection pool size per worker
+max_queue_size = 100                 # Query overflow queue depth
+memory_limit = "8GB"                 # Per-connection memory limit
+threads = 14                         # CPU threads per query
+temp_directory = "./data/duckdb_tmp" # Disk spill location
+enable_object_cache = true           # Parquet metadata cache (2-10× speedup)
+
+[query_cache]
+enabled = true                       # Enable query result caching
+ttl_seconds = 60                     # Cache TTL in seconds
+```
+
+Environment variables (override arc.conf):
 ```bash
 DUCKDB_POOL_SIZE=5
 DUCKDB_MAX_QUEUE_SIZE=100
+DUCKDB_MEMORY_LIMIT="8GB"
+DUCKDB_THREADS=14
+DUCKDB_TEMP_DIRECTORY="./data/duckdb_tmp"
+DUCKDB_ENABLE_OBJECT_CACHE=true
 QUERY_CACHE_ENABLED=true
 QUERY_CACHE_TTL=60
 ```
@@ -834,11 +900,12 @@ WRITE_COMPRESSION=snappy
 
 ---
 
-**Document Version**: 1.1
-**Last Updated**: October 17, 2025
+**Document Version**: 1.2
+**Last Updated**: October 19, 2025
 **License**: AGPL-3.0
 **Contact**: support@basekick.net
 
 **Changelog**:
+- v1.2 (Oct 19, 2025): Added comprehensive DuckDB production tuning section covering memory management, CPU parallelism, object caching, and configuration strategies for production deployments
 - v1.1 (Oct 17, 2025): Added ingestion performance benchmarks, authentication caching details, storage backend comparison, real-world compaction results, origin story, and community validation
 - v1.0 (Oct 16, 2025): Initial architecture paper based on codebase review

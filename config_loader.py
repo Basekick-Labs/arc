@@ -71,9 +71,6 @@ class ArcConfig:
             "duckdb": {
                 "pool_size": 5,
                 "max_queue_size": 100,
-                "memory_limit": "8GB",
-                "threads": 14,
-                "temp_directory": "./data/duckdb_tmp",
                 "enable_object_cache": True,
             },
             "ingestion": {
@@ -174,9 +171,6 @@ class ArcConfig:
             # DuckDB
             "DUCKDB_POOL_SIZE": ("duckdb", "pool_size", int),
             "DUCKDB_MAX_QUEUE_SIZE": ("duckdb", "max_queue_size", int),
-            "DUCKDB_MEMORY_LIMIT": ("duckdb", "memory_limit"),
-            "DUCKDB_THREADS": ("duckdb", "threads", int),
-            "DUCKDB_TEMP_DIRECTORY": ("duckdb", "temp_directory"),
             "DUCKDB_ENABLE_OBJECT_CACHE": ("duckdb", "enable_object_cache", lambda x: x.lower() == "true"),
 
             # Ingestion
