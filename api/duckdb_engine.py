@@ -8,7 +8,7 @@ from api.duckdb_pool import DuckDBConnectionPool, QueryPriority
 logger = logging.getLogger(__name__)
 
 class DuckDBEngine:
-    def __init__(self, storage_backend: str = "local", local_backend=None, minio_backend=None, s3_backend=None, ceph_backend=None, gcs_backend=None, connection_manager=None):
+    def __init__(self, storage_backend: str = "local", local_backend=None, minio_backend=None, s3_backend=None, ceph_backend=None, gcs_backend=None, connection_manager=None, config=None):
         self.storage_backend = storage_backend
         self.local_backend = local_backend
         self.minio_backend = minio_backend
@@ -17,13 +17,30 @@ class DuckDBEngine:
         self.gcs_backend = gcs_backend
         self.connection_manager = connection_manager
 
+        # Load DuckDB configuration from config or environment variables
+        if config:
+            self.memory_limit = config.get("duckdb", "memory_limit", default="8GB")
+            self.threads = config.get("duckdb", "threads", default=14)
+            self.temp_directory = config.get("duckdb", "temp_directory", default="./data/duckdb_tmp")
+            self.enable_object_cache = config.get("duckdb", "enable_object_cache", default=True)
+            pool_size = config.get("duckdb", "pool_size", default=5)
+            max_queue_size = config.get("duckdb", "max_queue_size", default=100)
+        else:
+            # Fallback to environment variables
+            self.memory_limit = os.getenv('DUCKDB_MEMORY_LIMIT', '8GB')
+            self.threads = int(os.getenv('DUCKDB_THREADS', '14'))
+            self.temp_directory = os.getenv('DUCKDB_TEMP_DIRECTORY', './data/duckdb_tmp')
+            self.enable_object_cache = os.getenv('DUCKDB_ENABLE_OBJECT_CACHE', 'true').lower() == 'true'
+            pool_size = int(os.getenv('DUCKDB_POOL_SIZE', '5'))
+            max_queue_size = int(os.getenv('DUCKDB_MAX_QUEUE_SIZE', '100'))
+
         try:
             import duckdb
             self.duckdb = duckdb
 
             # Create DuckDB connection for initialization (will be replaced by pool)
             self.conn = duckdb.connect()
-            
+
             # Install and load extensions for S3 access
             try:
                 self.conn.execute("INSTALL httpfs")
@@ -40,7 +57,7 @@ class DuckDBEngine:
                     logger.debug("DuckDB extension autoloading enabled")
                 except Exception as e2:
                     logger.error(f"Failed to enable autoloading: {e2}")
-            
+
             # Configure for S3/MinIO/Ceph/GCS if available (sync for immediate use)
             if minio_backend or s3_backend or ceph_backend:
                 self._configure_s3_sync()
@@ -48,9 +65,6 @@ class DuckDBEngine:
                 self._configure_gcs_sync()
 
             # Initialize connection pool
-            pool_size = int(os.getenv('DUCKDB_POOL_SIZE', '5'))
-            max_queue_size = int(os.getenv('DUCKDB_MAX_QUEUE_SIZE', '100'))
-
             self.connection_pool = DuckDBConnectionPool(
                 pool_size=pool_size,
                 max_queue_size=max_queue_size,
@@ -59,7 +73,7 @@ class DuckDBEngine:
             )
             self.connection_pool.start_health_checks()
 
-            logger.debug(f"DuckDB engine initialized with connection pool (size={pool_size}, max_queue={max_queue_size})")
+            logger.info(f"DuckDB engine initialized: pool_size={pool_size}, memory_limit={self.memory_limit}, threads={self.threads}, object_cache={self.enable_object_cache}")
 
         except ImportError:
             logger.error("DuckDB not installed. Run: pip install duckdb")
@@ -71,15 +85,38 @@ class DuckDBEngine:
     def _configure_connection(self, conn):
         """Configure a single DuckDB connection for the pool"""
         try:
-            # Install and load extensions
+            # Production-optimized DuckDB settings (BEFORE loading extensions)
+            # Memory Management (prevent OOM on large queries)
+            conn.execute(f"SET memory_limit='{self.memory_limit}'")
+            conn.execute(f"SET max_memory='{self.memory_limit}'")
+            conn.execute(f"SET temp_directory='{self.temp_directory}'")
+
+            # Parallelism (maximize multi-core performance)
+            conn.execute(f"SET threads={self.threads}")
+            conn.execute(f"SET enable_object_cache={'true' if self.enable_object_cache else 'false'}")
+
+            # Query Optimization
+            conn.execute("SET force_compression='zstd'")     # Use ZSTD for intermediate results
+            conn.execute("SET preserve_insertion_order=false")  # Allow query optimizer flexibility
+
+            # Performance Tuning
+            # Note: experimental_parallel_csv was removed in newer DuckDB versions
+            # Note: prefer_range_joins was removed in newer DuckDB versions (now automatic)
+
+            # Additional performance settings
+            try:
+                # These settings may not exist in all DuckDB versions
+                conn.execute("SET enable_profiling=false")  # Disable profiling overhead in production
+            except Exception as e:
+                logger.debug(f"Optional DuckDB setting not available: {e}")
+
+            # Install and load extensions (AFTER settings)
             conn.execute("INSTALL httpfs")
             conn.execute("LOAD httpfs")
             conn.execute("INSTALL aws")
             conn.execute("LOAD aws")
 
-            # Use DuckDB default settings (no custom tuning)
-            # For ClickBench compliance: databases should use default settings
-            logger.debug("DuckDB using default settings (no custom tuning)")
+            logger.debug(f"DuckDB production tuning applied: memory={self.memory_limit}, threads={self.threads}, object_cache={self.enable_object_cache}")
 
             # Apply S3/MinIO/Ceph/GCS configuration
             if self.minio_backend:
