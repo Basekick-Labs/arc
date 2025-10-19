@@ -18,7 +18,7 @@
 Arc has two separate write paths with different performance characteristics:
 
 ### Path 1: Line Protocol (Text-based)
-**Endpoint**: `/api/v1/write`, `/api/v2/write`, `/write`
+**Endpoint**: `/api/v1/write`, `/api/v1/write/influxdb`, `/write`
 
 **Format**: InfluxDB Line Protocol (text)
 ```
@@ -34,7 +34,7 @@ gzip bytes → decompress (async) → Line Protocol text
 **Use Case**: InfluxDB/Telegraf compatibility
 
 ### Path 2: Binary Protocol (MessagePack)
-**Endpoint**: `/write/v2/msgpack`, `/api/v2/msgpack`
+**Endpoint**: `/write/v1/msgpack`, `/api/v1/msgpack`
 
 **Format**: MessagePack binary
 ```python
@@ -301,7 +301,7 @@ python benchmarks/write_memory_test.py
 
 ```bash
 # Run write benchmark
-curl -X POST http://localhost:8000/write/v2/msgpack \
+curl -X POST http://localhost:8000/write/v1/msgpack \
   -H "Content-Type: application/msgpack" \
   -H "x-api-key: $ARC_TOKEN" \
   --data-binary @payload_50k.msgpack \

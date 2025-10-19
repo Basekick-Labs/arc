@@ -79,20 +79,20 @@ async def stop_arrow_buffer():
         await arrow_buffer.stop()
 
 
-@router.post("/write/v2/msgpack")
-@router.post("/api/v2/msgpack")
+@router.post("/write/v1/msgpack")
+@router.post("/api/v1/msgpack")
 async def write_msgpack(
     request: Request,
     content_encoding: Optional[str] = Header(None, alias="Content-Encoding"),
     x_arc_database: Optional[str] = Header(None, alias="x-arc-database"),
 ):
     """
-    Arc Binary Protocol v2 - MessagePack Write Endpoint
+    Arc Binary Protocol - MessagePack Write Endpoint
 
     High-performance binary write using MessagePack + Direct Arrow/Parquet.
 
     Request:
-        POST /write/v2/msgpack
+        POST /write/v1/msgpack
         Content-Type: application/msgpack
         Content-Encoding: gzip (optional)
         x-api-key: <token>
@@ -200,7 +200,7 @@ async def write_msgpack(
         raise HTTPException(status_code=500, detail=f"Internal error: {error_msg}")
 
 
-@router.get("/write/v2/msgpack/stats")
+@router.get("/write/v1/msgpack/stats")
 async def msgpack_stats():
     """
     Get MessagePack endpoint statistics
@@ -215,7 +215,7 @@ async def msgpack_stats():
     return stats
 
 
-@router.get("/write/v2/msgpack/spec")
+@router.get("/write/v1/msgpack/spec")
 async def msgpack_spec():
     """
     Get MessagePack binary protocol specification
@@ -226,7 +226,7 @@ async def msgpack_spec():
     return {
         'version': '2.0',
         'protocol': 'MessagePack',
-        'endpoint': '/write/v2/msgpack',
+        'endpoint': '/write/v1/msgpack',
         'content_type': 'application/msgpack',
         'compression': 'gzip (optional)',
         'authentication': 'x-api-key header',

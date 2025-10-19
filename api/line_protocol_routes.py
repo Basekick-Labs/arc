@@ -208,8 +208,8 @@ async def write_v1(
         raise HTTPException(status_code=500, detail=f"Write failed: {str(e)}")
 
 
-@router.post("/api/v2/write")
-async def write_v2(
+@router.post("/api/v1/write/influxdb")
+async def write_influxdb(
     request: Request,
     org: Optional[str] = Query(None, description="Organization name"),
     bucket: str = Query(..., description="Bucket name (required)"),
@@ -219,12 +219,12 @@ async def write_v2(
     x_arc_database: Optional[str] = Header(None, alias="x-arc-database"),
 ):
     """
-    InfluxDB 2.x compatible write endpoint
+    InfluxDB compatible write endpoint (Line Protocol)
 
     Accepts Line Protocol format in request body (gzip compressed or plain text).
 
     Example:
-        POST /api/v2/write?org=myorg&bucket=mybucket
+        POST /api/v1/write/influxdb?org=myorg&bucket=mybucket
         Authorization: Token my-token
         cpu,host=server01 usage_idle=90.5 1609459200000000000
     """

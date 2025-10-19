@@ -93,7 +93,7 @@ Arc includes built-in token-based authentication with minimal performance overhe
 - **Workers:** ~30x CPU cores for I/O-bound workloads (e.g., 14 cores = 400 workers)
 - **Deployment:** Native mode (3.5x faster than Docker)
 - **Storage:** Local filesystem for maximum performance, MinIO for distributed deployments
-- **Protocol:** MessagePack binary columnar (`/write/v2/msgpack`)
+- **Protocol:** MessagePack binary columnar (`/write/v1/msgpack`)
 - **Performance Stack:**
   - `uvloop`: 2-4x faster event loop (Cython-based C implementation)
   - `httptools`: 40% faster HTTP parser
@@ -360,7 +360,7 @@ data = {
 
 # Send columnar data (2.32M RPS throughput)
 response = requests.post(
-    "http://localhost:8000/write/v2/msgpack",
+    "http://localhost:8000/write/v1/msgpack",
     headers={
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/msgpack",
@@ -397,7 +397,7 @@ data = {
 }
 
 response = requests.post(
-    "http://localhost:8000/write/v2/msgpack",
+    "http://localhost:8000/write/v1/msgpack",
     headers={
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/msgpack"
@@ -451,7 +451,7 @@ data = {
 }
 
 response = requests.post(
-    "http://localhost:8000/write/v2/msgpack",
+    "http://localhost:8000/write/v1/msgpack",
     headers={
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/msgpack"
@@ -754,7 +754,7 @@ data = {
 
 # Write to production database
 response = requests.post(
-    "http://localhost:8000/write/v2/msgpack",
+    "http://localhost:8000/write/v1/msgpack",
     headers={
         "x-api-key": token,
         "Content-Type": "application/msgpack",
@@ -765,7 +765,7 @@ response = requests.post(
 
 # Write to staging database
 response = requests.post(
-    "http://localhost:8000/write/v2/msgpack",
+    "http://localhost:8000/write/v1/msgpack",
     headers={
         "x-api-key": token,
         "Content-Type": "application/msgpack",
@@ -1306,15 +1306,15 @@ sudo journalctl -u arc-api -f
 ### Data Ingestion Endpoints
 
 **MessagePack Binary Protocol** (Recommended - 3x faster):
-- `POST /write/v2/msgpack` - Write data via MessagePack
-- `POST /api/v2/msgpack` - Alternative endpoint
-- `GET /write/v2/msgpack/stats` - Get ingestion statistics
-- `GET /write/v2/msgpack/spec` - Get protocol specification
+- `POST /write/v1/msgpack` - Write data via MessagePack
+- `POST /api/v1/msgpack` - Alternative endpoint
+- `GET /write/v1/msgpack/stats` - Get ingestion statistics
+- `GET /write/v1/msgpack/spec` - Get protocol specification
 
 **Line Protocol** (InfluxDB compatibility):
 - `POST /write` - InfluxDB 1.x compatible write
 - `POST /api/v1/write` - InfluxDB 1.x API format
-- `POST /api/v2/write` - InfluxDB 2.x API format
+- `POST /api/v1/write/influxdb` - InfluxDB 2.x API format
 - `POST /api/v1/query` - InfluxDB 1.x query format
 - `GET /write/health` - Write endpoint health check
 - `GET /write/stats` - Write statistics

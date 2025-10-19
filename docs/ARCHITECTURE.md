@@ -334,7 +334,7 @@ Each database is a separate namespace with its own measurements and data:
 
 ```sql
 -- Write to specific database via HTTP header
-POST /write/v2/msgpack
+POST /write/v1/msgpack
 Headers:
   x-arc-database: production
 
@@ -379,10 +379,10 @@ benchmark/     ← Performance testing (temporary)
 **Write Path:**
 ```python
 # Default database (no header)
-POST /write/v2/msgpack → default/cpu/...
+POST /write/v1/msgpack → default/cpu/...
 
 # Explicit database (x-arc-database header)
-POST /write/v2/msgpack
+POST /write/v1/msgpack
 x-arc-database: production → production/cpu/...
 ```
 

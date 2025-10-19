@@ -108,7 +108,7 @@ WAL records include database information when the `x-arc-database` header is use
 
 ```python
 # Write to specific database
-POST /write/v2/msgpack
+POST /write/v1/msgpack
 Headers:
   x-arc-database: production
 

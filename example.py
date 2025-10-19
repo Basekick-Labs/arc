@@ -53,7 +53,7 @@ data = {
 
 # Write via MessagePack (with database specification)
 response = requests.post(
-    "http://localhost:8000/write/v2/msgpack",
+    "http://localhost:8000/write/v1/msgpack",
     headers={
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/msgpack",
