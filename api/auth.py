@@ -197,11 +197,27 @@ class AuthManager:
         return success
 
     def delete_token(self, name: str) -> bool:
-        """Delete a token permanently and invalidate cache"""
+        """Delete a token permanently by name and invalidate cache"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
                 "DELETE FROM api_tokens WHERE name = ?",
                 (name,)
+            )
+            conn.commit()
+            success = cursor.rowcount > 0
+
+        # Invalidate cache when deleting
+        if success:
+            self.invalidate_cache()
+
+        return success
+
+    def delete_token_by_id(self, token_id: int) -> bool:
+        """Delete a token permanently by ID and invalidate cache"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "DELETE FROM api_tokens WHERE id = ?",
+                (token_id,)
             )
             conn.commit()
             success = cursor.rowcount > 0

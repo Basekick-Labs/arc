@@ -829,10 +829,9 @@ async def create_token(token_request: TokenCreateRequest, request: Request):
         expires_at=token_request.expires_at
     )
 
-    # Get the token info to return
-    # We need to find it - it's the most recently created one
+    # Get the token info to return - find by name
     tokens = auth_manager.list_tokens()
-    token_info = tokens[0] if tokens else None
+    token_info = next((t for t in tokens if t["name"] == token_request.name), None)
 
     if token_info:
         token_info["token"] = new_token  # Include actual token only on creation
@@ -872,7 +871,7 @@ async def delete_token(token_id: int, request: Request):
     if not auth_manager.verify_request_header(request.headers):
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    if auth_manager.delete_token(token_id):
+    if auth_manager.delete_token_by_id(token_id):
         return {"message": "Token deleted successfully", "token_id": token_id}
     raise HTTPException(status_code=404, detail="Token not found")
 
