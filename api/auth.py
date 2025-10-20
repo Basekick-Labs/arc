@@ -57,7 +57,7 @@ class AuthManager:
         """Hash a token for storage"""
         return hashlib.sha256(token.encode()).hexdigest()
 
-    def create_token(self, name: str, description: str = None) -> str:
+    def create_token(self, name: str, description: str = None, expires_at: datetime = None) -> str:
         """Create a new API token"""
         # Generate secure random token
         token = secrets.token_urlsafe(32)
@@ -65,10 +65,21 @@ class AuthManager:
 
         with sqlite3.connect(self.db_path) as conn:
             try:
-                conn.execute(
-                    "INSERT INTO api_tokens (name, token_hash, description) VALUES (?, ?, ?)",
-                    (name, token_hash, description)
-                )
+                # Check if expires_at column exists, if not, ignore it
+                cursor = conn.execute("PRAGMA table_info(api_tokens)")
+                columns = [row[1] for row in cursor.fetchall()]
+                has_expires_at = 'expires_at' in columns
+
+                if has_expires_at and expires_at is not None:
+                    conn.execute(
+                        "INSERT INTO api_tokens (name, token_hash, description, expires_at) VALUES (?, ?, ?, ?)",
+                        (name, token_hash, description, expires_at)
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO api_tokens (name, token_hash, description) VALUES (?, ?, ?)",
+                        (name, token_hash, description)
+                    )
                 conn.commit()
                 logger.info(f"Created API token: {name}")
                 return token
