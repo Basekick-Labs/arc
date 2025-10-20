@@ -228,6 +228,41 @@ class AuthManager:
 
         return success
 
+    def get_token_info(self, token_id: int) -> Optional[Dict]:
+        """Get token info by ID (without revealing the token value)"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                "SELECT id, name, description, created_at, last_used_at, enabled FROM api_tokens WHERE id = ?",
+                (token_id,)
+            )
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+            return None
+
+    def rotate_token(self, token_id: int) -> Optional[str]:
+        """Rotate a token - generate new token value while keeping metadata"""
+        # Generate new secure random token
+        new_token = secrets.token_urlsafe(32)
+        new_token_hash = self._hash_token(new_token)
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "UPDATE api_tokens SET token_hash = ? WHERE id = ?",
+                (new_token_hash, token_id)
+            )
+            conn.commit()
+            success = cursor.rowcount > 0
+
+        # Invalidate cache when rotating to ensure old token stops working immediately
+        if success:
+            self.invalidate_cache()
+            logger.info(f"Rotated token ID: {token_id}")
+            return new_token
+
+        return None
+
     def invalidate_cache(self):
         """Clear the entire token cache"""
         with self._cache_lock:
