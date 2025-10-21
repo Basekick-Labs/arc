@@ -10,7 +10,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/compaction", tags=["compaction"])
+router = APIRouter(prefix="/api/v1/compaction", tags=["compaction"])
 
 # Global references (initialized at startup)
 compaction_manager = None

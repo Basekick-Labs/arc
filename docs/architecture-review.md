@@ -464,13 +464,13 @@ arrow_bytes = sink.getvalue().to_pybytes()
 - Token-based API authentication
 - LRU cache with configurable TTL (default: 30s)
 - Seed token support from config/environment
-- Token management endpoints (/auth/tokens)
+- Token management endpoints (/api/v1/auth/tokens)
 - Token rotation capability
 - Allowlist for public endpoints
 
 **Default Allowlist:**
 ```python
-/health, /ready, /docs, /openapi.json, /auth/verify
+/health, /ready, /docs, /openapi.json, /api/v1/auth/verify
 ```
 
 **Primary Worker Detection:**
@@ -493,16 +493,16 @@ arrow_bytes = sink.getvalue().to_pybytes()
 
 **Core Query Endpoints:**
 ```
-POST /query                - SQL query (JSON response)
-POST /query/arrow          - SQL query (Arrow IPC response)
-POST /query/estimate       - Estimate query cost
-POST /query/stream         - Stream results as CSV
-GET  /query/{measurement}  - Query by measurement name
+POST /api/v1/query                - SQL query (JSON response)
+POST /api/v1/api/v1/query/arrow          - SQL query (Arrow IPC response)
+POST /api/v1/query/estimate       - Estimate query cost
+POST /api/v1/query/stream         - Stream results as CSV
+GET  /api/v1/query/{measurement}  - Query by measurement name
 ```
 
 **Arrow vs JSON Response:**
 
-| Feature | /query (JSON) | /query/arrow |
+| Feature | /api/v1/query (JSON) | /api/v1/query/arrow |
 |---------|--------------|--------------|
 | Format | JSON arrays | Apache Arrow IPC stream |
 | Performance | Baseline | 28-75% faster |
@@ -517,9 +517,9 @@ GET  /metrics                     - System metrics
 GET  /metrics/query-pool          - DuckDB pool metrics
 GET  /cache/stats                 - Query cache statistics
 POST /cache/clear                 - Invalidate query cache
-GET  /auth/tokens                 - List API tokens
-POST /auth/tokens                 - Create API token
-DELETE /auth/tokens/{id}          - Delete API token
+GET  /api/v1/auth/tokens                 - List API tokens
+POST /api/v1/auth/tokens                 - Create API token
+DELETE /api/v1/auth/tokens/{id}          - Delete API token
 GET  /connections/storage         - List storage connections
 POST /connections/storage         - Add storage connection
 GET  /jobs                        - List export jobs

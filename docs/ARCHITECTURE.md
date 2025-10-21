@@ -334,7 +334,7 @@ Each database is a separate namespace with its own measurements and data:
 
 ```sql
 -- Write to specific database via HTTP header
-POST /write/v1/msgpack
+POST /api/v1/write/msgpack
 Headers:
   x-arc-database: production
 
@@ -379,10 +379,10 @@ benchmark/     ← Performance testing (temporary)
 **Write Path:**
 ```python
 # Default database (no header)
-POST /write/v1/msgpack → default/cpu/...
+POST /api/v1/write/msgpack → default/cpu/...
 
 # Explicit database (x-arc-database header)
-POST /write/v1/msgpack
+POST /api/v1/write/msgpack
 x-arc-database: production → production/cpu/...
 ```
 
@@ -805,7 +805,7 @@ AUTH_CACHE_TTL=30
 
 ```bash
 # View cache statistics
-curl http://localhost:8000/auth/cache/stats \
+curl http://localhost:8000/api/v1/auth/cache/stats \
   -H "Authorization: Bearer $TOKEN"
 
 # Response:
@@ -819,7 +819,7 @@ curl http://localhost:8000/auth/cache/stats \
 }
 
 # Manual cache invalidation (for immediate token revocation)
-curl -X POST http://localhost:8000/auth/cache/invalidate \
+curl -X POST http://localhost:8000/api/v1/auth/cache/invalidate \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -827,7 +827,7 @@ curl -X POST http://localhost:8000/auth/cache/invalidate \
 
 - **Revocation delay**: Revoked tokens remain valid for up to `cache_ttl` seconds
   - 30s default provides excellent balance
-  - Use `/auth/cache/invalidate` for immediate effect across all workers
+  - Use `/api/v1/auth/cache/invalidate` for immediate effect across all workers
 
 - **Per-worker isolation**: Each worker maintains its own cache
   - No cross-worker cache pollution
@@ -843,7 +843,7 @@ curl -X POST http://localhost:8000/auth/cache/invalidate \
 
 1. **Always enable auth in production** (`enabled = true`)
 2. **Use default 30s cache TTL** (optimal for most workloads)
-3. **Monitor cache hit rate** via `/auth/cache/stats`
+3. **Monitor cache hit rate** via `/api/v1/auth/cache/stats`
 4. **Manual invalidation** when revoking tokens for security incidents
 5. **Token rotation** instead of revocation for planned changes
 

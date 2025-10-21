@@ -276,7 +276,7 @@ async def write_influxdb(
         raise HTTPException(status_code=500, detail=f"Write failed: {str(e)}")
 
 
-@router.post("/write")
+@router.post("/api/v1/write/line-protocol")
 async def write_simple(
     request: Request,
     content_encoding: Optional[str] = Header(None, alias="Content-Encoding"),
@@ -354,7 +354,7 @@ async def influxdb_query_v1(request: Request):
     raise HTTPException(status_code=501, detail="Query endpoint not implemented - use /query for SQL queries")
 
 
-@router.get("/write/health")
+@router.get("/api/v1/write/health")
 async def write_health():
     """Health check for write endpoint"""
     if not parquet_buffer:
@@ -369,7 +369,7 @@ async def write_health():
     }
 
 
-@router.get("/write/stats")
+@router.get("/api/v1/write/stats")
 async def write_stats():
     """Get write statistics"""
     if not parquet_buffer:
@@ -384,7 +384,7 @@ async def write_stats():
     }
 
 
-@router.post("/write/flush")
+@router.post("/api/v1/write/flush")
 async def flush_buffer(measurement: Optional[str] = Query(None, description="Specific measurement to flush")):
     """
     Manually flush buffer to storage

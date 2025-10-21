@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import List, Dict, Any
 from datetime import datetime
 import logging
+import hashlib
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,81 @@ class ArrowParquetWriter:
         """
         self.compression = compression.upper()
 
+    def _compute_row_hash(self, row: Dict[str, Any], measurement: str) -> str:
+        """
+        Compute SHA256 hash for a row to enable delete operations.
+
+        Uses time + measurement + sorted tags (non-field columns) to create
+        a unique identifier that matches the delete_routes.py logic.
+
+        Args:
+            row: Dictionary containing row data
+            measurement: Measurement name
+
+        Returns:
+            SHA256 hash string
+        """
+        # Create stable hash from row data (matches delete_routes.py logic)
+        hash_parts = [
+            str(row.get('time', '')),
+            str(measurement)
+        ]
+
+        # Add all non-field columns (tags) sorted by key
+        # Fields are typically numeric measurements, tags are string labels
+        for key in sorted(row.keys()):
+            if key not in ['time', 'measurement', 'fields']:
+                # This is a tag or other metadata
+                value = row.get(key, '')
+                hash_parts.append(f"{key}={value}")
+
+        hash_str = '|'.join(hash_parts)
+        return hashlib.sha256(hash_str.encode()).hexdigest()
+
+    def _add_row_hashes_to_records(self, records: List[Dict[str, Any]], measurement: str) -> List[Dict[str, Any]]:
+        """
+        Add _row_hash column to each record for delete support.
+
+        Args:
+            records: List of record dictionaries
+            measurement: Measurement name
+
+        Returns:
+            Records with _row_hash added
+        """
+        for record in records:
+            record['_row_hash'] = self._compute_row_hash(record, measurement)
+        return records
+
+    def _add_row_hashes_to_columns(self, columns: Dict[str, List], measurement: str) -> Dict[str, List]:
+        """
+        Add _row_hash column to columnar data for delete support.
+
+        Args:
+            columns: Columnar data dictionary
+            measurement: Measurement name
+
+        Returns:
+            Columns with _row_hash added
+        """
+        # Get number of rows
+        if not columns:
+            return columns
+
+        num_rows = len(next(iter(columns.values())))
+
+        # Compute hash for each row
+        row_hashes = []
+        for i in range(num_rows):
+            # Reconstruct row from columns
+            row = {key: values[i] for key, values in columns.items()}
+            row_hash = self._compute_row_hash(row, measurement)
+            row_hashes.append(row_hash)
+
+        # Add _row_hash column
+        columns['_row_hash'] = row_hashes
+        return columns
+
     def write_parquet(
         self,
         records: List[Dict[str, Any]],
@@ -61,8 +138,11 @@ class ArrowParquetWriter:
             return False
 
         try:
+            # Add row hashes for delete support
+            records_with_hash = self._add_row_hashes_to_records(records, measurement)
+
             # Convert records to columnar format (dict of arrays)
-            columns = self._records_to_columns(records)
+            columns = self._records_to_columns(records_with_hash)
 
             # Infer Arrow schema from first record
             schema = self._infer_schema(columns)
@@ -84,7 +164,7 @@ class ArrowParquetWriter:
 
             logger.debug(
                 f"Wrote {len(records)} records for '{measurement}' to {output_path} "
-                f"(compression={self.compression})"
+                f"(compression={self.compression}, with _row_hash)"
             )
             return True
 
@@ -140,11 +220,14 @@ class ArrowParquetWriter:
             return False
 
         try:
+            # Add row hashes for delete support
+            columns_with_hash = self._add_row_hashes_to_columns(columns, measurement)
+
             # Infer Arrow schema from column data
-            schema = self._infer_schema(columns)
+            schema = self._infer_schema(columns_with_hash)
 
             # Create Arrow RecordBatch (zero-copy columnar structure)
-            record_batch = pa.RecordBatch.from_pydict(columns, schema=schema)
+            record_batch = pa.RecordBatch.from_pydict(columns_with_hash, schema=schema)
 
             # Create Arrow Table from RecordBatch
             table = pa.Table.from_batches([record_batch])
@@ -160,7 +243,7 @@ class ArrowParquetWriter:
 
             logger.debug(
                 f"Wrote columnar data for '{measurement}' to {output_path} "
-                f"(compression={self.compression}, passthrough=true)"
+                f"(compression={self.compression}, passthrough=true, with _row_hash)"
             )
             return True
 

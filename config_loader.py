@@ -73,6 +73,13 @@ class ArcConfig:
                 "max_queue_size": 100,
                 "enable_object_cache": True,
             },
+            "delete": {
+                "enabled": False,
+                "confirmation_threshold": 10000,
+                "max_rows_per_delete": 1000000,
+                "tombstone_retention_days": 30,
+                "audit_enabled": True,
+            },
             "ingestion": {
                 "buffer_size": 10000,
                 "buffer_age_seconds": 60,
@@ -172,6 +179,13 @@ class ArcConfig:
             "DUCKDB_POOL_SIZE": ("duckdb", "pool_size", int),
             "DUCKDB_MAX_QUEUE_SIZE": ("duckdb", "max_queue_size", int),
             "DUCKDB_ENABLE_OBJECT_CACHE": ("duckdb", "enable_object_cache", lambda x: x.lower() == "true"),
+
+            # Delete Operations
+            "DELETE_ENABLED": ("delete", "enabled", lambda x: x.lower() == "true"),
+            "DELETE_CONFIRMATION_THRESHOLD": ("delete", "confirmation_threshold", int),
+            "DELETE_MAX_ROWS": ("delete", "max_rows_per_delete", int),
+            "DELETE_TOMBSTONE_RETENTION_DAYS": ("delete", "tombstone_retention_days", int),
+            "DELETE_AUDIT_ENABLED": ("delete", "audit_enabled", lambda x: x.lower() == "true"),
 
             # Ingestion
             "WRITE_BUFFER_SIZE": ("ingestion", "buffer_size", int),

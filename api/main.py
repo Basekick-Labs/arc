@@ -61,6 +61,7 @@ from api.msgpack_routes import router as msgpack_router
 from api.msgpack_routes import init_arrow_buffer, start_arrow_buffer, stop_arrow_buffer
 from api.wal_routes import router as wal_router
 from api.compaction_routes import router as compaction_router, init_compaction
+from api.delete_routes import router as delete_router
 from api.query_cache import init_query_cache, get_query_cache
 
 # Setup structured logging
@@ -148,7 +149,7 @@ _auth_config = _arc_config.get_auth_config()
 AUTH_ENABLED = _auth_config.get("enabled", True)  # Default to enabled
 AUTH_ALLOWLIST = [p.strip() for p in _auth_config.get(
     "allowlist",
-    "/health,/ready,/docs,/openapi.json,/auth/verify"  # Basic health endpoints only
+    "/health,/ready,/docs,/openapi.json,/api/v1/auth/verify"  # Basic health endpoints only
 ).split(",") if p.strip()]
 AUTH_CACHE_TTL = _auth_config.get("cache_ttl", 30)  # Default: 30 seconds
 auth_manager = AuthManager(cache_ttl=AUTH_CACHE_TTL)
@@ -167,6 +168,7 @@ app.include_router(line_protocol_router)
 app.include_router(msgpack_router)
 app.include_router(wal_router)
 app.include_router(compaction_router)
+app.include_router(delete_router)
 
 # Global query engine, connection manager, and scheduler
 query_engine: Optional[DuckDBEngine] = None
@@ -780,7 +782,7 @@ async def root():
         "health": "/health"
     }
 
-@app.get("/auth/verify")
+@app.get("/api/v1/auth/verify")
 async def auth_verify(request: Request):
     """Verify if the provided token is valid"""
     if auth_manager.verify_request_header(request.headers):
@@ -792,7 +794,7 @@ async def auth_verify(request: Request):
 
 # Token management endpoints (require authentication)
 
-@app.get("/auth/tokens", response_model=TokenListResponse)
+@app.get("/api/v1/auth/tokens", response_model=TokenListResponse)
 async def list_tokens(request: Request):
     """List all API tokens (requires authentication)"""
     if not auth_manager.verify_request_header(request.headers):
@@ -802,7 +804,7 @@ async def list_tokens(request: Request):
     return {"tokens": tokens, "count": len(tokens)}
 
 
-@app.get("/auth/tokens/{token_id}", response_model=TokenResponse)
+@app.get("/api/v1/auth/tokens/{token_id}", response_model=TokenResponse)
 async def get_token(token_id: int, request: Request):
     """Get details about a specific token (requires authentication)"""
     if not auth_manager.verify_request_header(request.headers):
@@ -815,18 +817,19 @@ async def get_token(token_id: int, request: Request):
     return token_info
 
 
-@app.post("/auth/tokens", response_model=TokenResponse)
+@app.post("/api/v1/auth/tokens", response_model=TokenResponse)
 @limiter.limit("10/minute")  # Rate limit: 10 token creations per minute
 async def create_token(token_request: TokenCreateRequest, request: Request):
     """Create a new API token (requires authentication)"""
     if not auth_manager.verify_request_header(request.headers):
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    # Create the token (permissions handled by auth manager)
+    # Create the token with permissions
     new_token = auth_manager.create_token(
         name=token_request.name,
         description=token_request.description,
-        expires_at=token_request.expires_at
+        expires_at=token_request.expires_at,
+        permissions=token_request.permissions
     )
 
     # Get the token info to return - find by name
@@ -835,23 +838,27 @@ async def create_token(token_request: TokenCreateRequest, request: Request):
 
     if token_info:
         token_info["token"] = new_token  # Include actual token only on creation
+        # Convert permissions string to list for response
+        if "permissions" in token_info and isinstance(token_info["permissions"], str):
+            token_info["permissions"] = token_info["permissions"].split(',')
         return token_info
 
     raise HTTPException(status_code=500, detail="Failed to create token")
 
 
-@app.patch("/auth/tokens/{token_id}", response_model=TokenResponse)
+@app.patch("/api/v1/auth/tokens/{token_id}", response_model=TokenResponse)
 async def update_token(token_id: int, token_request: TokenUpdateRequest, request: Request):
     """Update token metadata (requires authentication)"""
     if not auth_manager.verify_request_header(request.headers):
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    # Update the token
+    # Update the token with permissions
     updated = auth_manager.update_token(
         token_id=token_id,
         name=token_request.name,
         description=token_request.description,
-        expires_at=token_request.expires_at
+        expires_at=token_request.expires_at,
+        permissions=token_request.permissions
     )
 
     if not updated:
@@ -860,12 +867,15 @@ async def update_token(token_id: int, token_request: TokenUpdateRequest, request
     # Return updated token info
     token_info = auth_manager.get_token_info(token_id)
     if token_info:
+        # Convert permissions string to list for response
+        if "permissions" in token_info and isinstance(token_info["permissions"], str):
+            token_info["permissions"] = token_info["permissions"].split(',')
         return token_info
 
     raise HTTPException(status_code=500, detail="Failed to retrieve updated token")
 
 
-@app.delete("/auth/tokens/{token_id}")
+@app.delete("/api/v1/auth/tokens/{token_id}")
 async def delete_token(token_id: int, request: Request):
     """Delete an API token (requires authentication)"""
     if not auth_manager.verify_request_header(request.headers):
@@ -876,7 +886,7 @@ async def delete_token(token_id: int, request: Request):
     raise HTTPException(status_code=404, detail="Token not found")
 
 
-@app.post("/auth/tokens/{token_id}/rotate", response_model=TokenResponse)
+@app.post("/api/v1/auth/tokens/{token_id}/rotate", response_model=TokenResponse)
 async def rotate_token_endpoint(token_id: int, request: Request):
     """Rotate a token - generates new token value while keeping metadata (requires authentication)"""
     if not auth_manager.verify_request_header(request.headers):
@@ -895,7 +905,7 @@ async def rotate_token_endpoint(token_id: int, request: Request):
     raise HTTPException(status_code=500, detail="Failed to rotate token")
 
 
-@app.get("/auth/cache/stats")
+@app.get("/api/v1/auth/cache/stats")
 async def get_auth_cache_stats(request: Request):
     """Get authentication cache statistics (requires authentication)"""
     if not auth_manager.verify_request_header(request.headers):
@@ -905,7 +915,7 @@ async def get_auth_cache_stats(request: Request):
     return stats
 
 
-@app.post("/auth/cache/invalidate")
+@app.post("/api/v1/auth/cache/invalidate")
 async def invalidate_auth_cache(request: Request):
     """Invalidate the authentication cache (requires authentication)"""
     if not auth_manager.verify_request_header(request.headers):
@@ -920,7 +930,7 @@ async def invalidate_auth_cache(request: Request):
 
 
 
-@app.post("/setup/default-connections")
+@app.post("/api/v1/setup/default-connections")
 async def setup_default_connections():
     """Create default connections for quick startup"""
     try:
@@ -1023,7 +1033,7 @@ async def setup_default_connections():
         logger.error(f"Setup default connections failed: {e}")
         raise HTTPException(status_code=500, detail=f"Setup failed: {str(e)}")
 
-@app.post("/query/estimate")
+@app.post("/api/v1/query/estimate")
 async def estimate_query(query: QueryRequest):
     """Get query execution estimate (row count and warnings)"""
     if not query_engine:
@@ -1088,7 +1098,7 @@ async def estimate_query(query: QueryRequest):
             "warning_level": "error"
         }
 
-@app.post("/query/stream")
+@app.post("/api/v1/query/stream")
 async def execute_sql_stream(query: QueryRequest):
     """Execute SQL query and stream results as CSV for large datasets"""
     if not query_engine:
@@ -1149,7 +1159,7 @@ async def execute_sql_stream(query: QueryRequest):
         logger.error(f"Query execution failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Query execution failed: {str(e)}")
 
-@app.post("/query", response_model=QueryResponse)
+@app.post("/api/v1/query", response_model=QueryResponse)
 async def execute_sql(request: Request, query: QueryRequest):
     """Execute SQL query with caching and comprehensive validation"""
     if not query_engine:
@@ -1242,7 +1252,7 @@ async def execute_sql(request: Request, query: QueryRequest):
         logger.error(f"Query execution error: {e}")
         raise HTTPException(status_code=500, detail=f"Query execution failed: {str(e)}")
 
-@app.post("/query/arrow")
+@app.post("/api/v1/query/arrow")
 async def execute_sql_arrow(request: Request, query: QueryRequest):
     """Execute SQL query and return Apache Arrow IPC stream (columnar format)
 
@@ -1299,7 +1309,7 @@ async def execute_sql_arrow(request: Request, query: QueryRequest):
         logger.error(f"Arrow query execution error: {e}")
         raise HTTPException(status_code=500, detail=f"Arrow query execution failed: {str(e)}")
 
-@app.get("/measurements")
+@app.get("/api/v1/measurements")
 async def list_measurements():
     """List available measurements"""
     if not query_engine:
@@ -1308,7 +1318,7 @@ async def list_measurements():
     measurements = await query_engine.get_measurements()
     return {"measurements": measurements}
 
-@app.get("/query/{measurement}")
+@app.get("/api/v1/query/{measurement}")
 async def query_measurement(
     measurement: str,
     start_time: Optional[str] = Query(None, description="Start time (ISO format)"),
@@ -1340,7 +1350,7 @@ async def query_measurement(
     
     return result
 
-@app.get("/query/{measurement}/csv")
+@app.get("/api/v1/query/{measurement}/csv")
 async def query_measurement_csv(
     measurement: str,
     start_time: Optional[str] = Query(None),
@@ -1393,11 +1403,11 @@ async def query_measurement_csv(
     )
 
 
-@app.get("/connections/datasource")
+@app.get("/api/v1/connections/datasource")
 async def get_datasource_connections():
     return connection_manager.get_influx_connections()
 
-@app.post("/connections/datasource")
+@app.post("/api/v1/connections/datasource")
 async def add_datasource_connection(connection_data: dict):
     if connection_data.get('version') == 'http_json':
         # Route HTTP JSON connections to the HTTP JSON handler
@@ -1409,7 +1419,7 @@ async def add_datasource_connection(connection_data: dict):
         source_type = "TimescaleDB" if connection_data.get('version') == 'timescale' else "InfluxDB"
         return {"id": connection_id, "message": f"{source_type} connection added successfully"}
 
-@app.delete("/connections/datasource/{connection_id}")
+@app.delete("/api/v1/connections/datasource/{connection_id}")
 async def delete_datasource_connection(connection_id: int, connection_version: str = None):
     try:
         if connection_version == 'http_json':
@@ -1429,30 +1439,30 @@ async def delete_datasource_connection(connection_id: int, connection_version: s
         raise HTTPException(status_code=500, detail=str(e))
 
 # Legacy endpoints for backward compatibility
-@app.get("/connections/influx")
+@app.get("/api/v1/connections/influx")
 async def get_influx_connections():
     return connection_manager.get_influx_connections()
 
-@app.post("/connections/influx")
+@app.post("/api/v1/connections/influx")
 async def add_influx_connection(connection_data: dict):
     connection_id = connection_manager.add_influx_connection(connection_data)
     return {"id": connection_id, "message": "Data source connection added successfully"}
 
-@app.get("/connections/storage")
+@app.get("/api/v1/connections/storage")
 async def get_storage_connections():
     return connection_manager.get_storage_connections()
 
-@app.post("/connections/storage")
+@app.post("/api/v1/connections/storage")
 async def add_storage_connection(connection_data: dict):
     connection_id = connection_manager.add_storage_connection(connection_data)
     return {"id": connection_id, "message": "Storage connection added successfully"}
 
 # HTTP JSON Endpoints (Legacy - consider deprecating)
-@app.get("/connections/http_json")
+@app.get("/api/v1/connections/http_json")
 async def get_http_json_connections():
     return connection_manager.get_http_json_connections()
 
-@app.post("/connections/{connection_type}/{connection_id}/activate")
+@app.post("/api/v1/connections/{connection_type}/{connection_id}/activate")
 async def activate_connection(connection_type: str, connection_id: int):
     global query_engine
     
@@ -1465,7 +1475,7 @@ async def activate_connection(connection_type: str, connection_id: int):
     else:
         raise HTTPException(status_code=400, detail="Failed to activate connection")
 
-@app.delete("/connections/{connection_type}/{connection_id}")
+@app.delete("/api/v1/connections/{connection_type}/{connection_id}")
 async def delete_connection(connection_type: str, connection_id: int):
     success = connection_manager.delete_connection(connection_type, connection_id)
     if success:
@@ -1473,7 +1483,7 @@ async def delete_connection(connection_type: str, connection_id: int):
     else:
         raise HTTPException(status_code=400, detail="Failed to delete connection")
 
-@app.put("/connections/datasource/{connection_id}")
+@app.put("/api/v1/connections/datasource/{connection_id}")
 async def update_datasource_connection(connection_id: int, connection_data: dict):
     if connection_data.get('version') == 'http_json':
         # Route HTTP JSON connections to the HTTP JSON handler
@@ -1492,7 +1502,7 @@ async def update_datasource_connection(connection_id: int, connection_data: dict
             raise HTTPException(status_code=400, detail="Failed to update data source connection")
 
 # Legacy endpoint
-@app.put("/connections/influx/{connection_id}")
+@app.put("/api/v1/connections/influx/{connection_id}")
 async def update_influx_connection(connection_id: int, connection_data: dict):
     success = connection_manager.update_influx_connection(connection_id, connection_data)
     if success:
@@ -1500,7 +1510,7 @@ async def update_influx_connection(connection_id: int, connection_data: dict):
     else:
         raise HTTPException(status_code=400, detail="Failed to update data source connection")
 
-@app.put("/connections/storage/{connection_id}")
+@app.put("/api/v1/connections/storage/{connection_id}")
 async def update_storage_connection(connection_id: int, connection_data: dict):
     success = connection_manager.update_storage_connection(connection_id, connection_data)
     if success:
@@ -1508,7 +1518,7 @@ async def update_storage_connection(connection_id: int, connection_data: dict):
     else:
         raise HTTPException(status_code=400, detail="Failed to update storage connection")
 
-@app.post("/connections/{connection_type}/test")
+@app.post("/api/v1/connections/{connection_type}/test")
 async def test_connection(connection_type: str, connection_data: dict):
     try:
         logger.info(f"Testing {connection_type} connection: {connection_data.get('name', 'unnamed')}")
@@ -1532,16 +1542,16 @@ async def test_connection(connection_type: str, connection_data: dict):
 
 
 # Export Job Management Endpoints
-@app.get("/jobs")
+@app.get("/api/v1/jobs")
 async def get_export_jobs():
     return export_scheduler.get_jobs()
 
-@app.post("/jobs")
+@app.post("/api/v1/jobs")
 async def create_export_job(job_config: dict):
     job_id = export_scheduler.create_job(job_config)
     return {"id": job_id, "message": "Export job created successfully"}
 
-@app.put("/jobs/{job_id}")
+@app.put("/api/v1/jobs/{job_id}")
 async def update_export_job(job_id: int, job_config: dict):
     success = export_scheduler.update_job(job_id, job_config)
     if success:
@@ -1549,7 +1559,7 @@ async def update_export_job(job_id: int, job_config: dict):
     else:
         raise HTTPException(status_code=400, detail="Failed to update export job")
 
-@app.delete("/jobs/{job_id}")
+@app.delete("/api/v1/jobs/{job_id}")
 async def delete_export_job(job_id: int):
     success = export_scheduler.delete_job(job_id)
     if success:
@@ -1557,11 +1567,11 @@ async def delete_export_job(job_id: int):
     else:
         raise HTTPException(status_code=400, detail="Failed to delete export job")
 
-@app.get("/jobs/{job_id}/executions")
+@app.get("/api/v1/jobs/{job_id}/executions")
 async def get_job_executions(job_id: int, limit: int = 50):
     return export_scheduler.get_job_executions(job_id, limit)
 
-@app.get("/monitoring/jobs")
+@app.get("/api/v1/monitoring/jobs")
 async def get_job_monitoring():
     """Get real-time job monitoring data"""
     try:
@@ -1595,7 +1605,7 @@ async def get_job_monitoring():
         logger.error(f"Failed to get monitoring data: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get monitoring data: {str(e)}")
 
-@app.post("/jobs/{job_id}/cancel")
+@app.post("/api/v1/jobs/{job_id}/cancel")
 async def cancel_job(job_id: int):
     try:
         success = export_scheduler.cancel_job(job_id)
@@ -1607,7 +1617,7 @@ async def cancel_job(job_id: int):
         logger.error(f"Failed to cancel job {job_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to cancel job: {str(e)}")
 
-@app.post("/jobs/{job_id}/run")
+@app.post("/api/v1/jobs/{job_id}/run")
 async def run_job_now(job_id: int):
     try:
         # Get job details
@@ -1640,12 +1650,12 @@ async def run_job_now(job_id: int):
         raise HTTPException(status_code=500, detail=f"Failed to trigger job: {str(e)}")
 
 # Monitoring Endpoints
-@app.get("/metrics")
+@app.get("/api/v1/metrics")
 async def get_current_metrics():
     """Get current system metrics"""
     return metrics_collector.get_current_metrics()
 
-@app.get("/metrics/timeseries/{metric_type}")
+@app.get("/api/v1/metrics/timeseries/{metric_type}")
 async def get_metrics_timeseries(
     metric_type: str,
     duration_minutes: int = Query(default=30, ge=1, le=1440, description="Duration in minutes")
@@ -1660,7 +1670,7 @@ async def get_metrics_timeseries(
         "data": metrics_collector.get_time_series(metric_type, duration_minutes)
     }
 
-@app.get("/metrics/endpoints")
+@app.get("/api/v1/metrics/endpoints")
 async def get_endpoint_metrics():
     """Get API endpoint usage statistics"""
     return {
@@ -1668,7 +1678,7 @@ async def get_endpoint_metrics():
         "endpoint_stats": metrics_collector.get_endpoint_stats()
     }
 
-@app.get("/metrics/query-pool")
+@app.get("/api/v1/metrics/query-pool")
 async def get_query_pool_metrics():
     """Get DuckDB connection pool metrics"""
     if not query_engine:
@@ -1683,7 +1693,7 @@ async def get_query_pool_metrics():
         "connections": connection_stats
     }
 
-@app.get("/metrics/memory")
+@app.get("/api/v1/metrics/memory")
 async def get_memory_metrics():
     """
     Get detailed memory profiling for the Arc API process
@@ -1697,7 +1707,7 @@ async def get_memory_metrics():
     """
     return get_memory_profile()
 
-@app.get("/logs")
+@app.get("/api/v1/logs")
 async def get_application_logs(
     limit: int = Query(default=100, ge=1, le=1000, description="Maximum number of log entries to return"),
     level: Optional[str] = Query(default=None, description="Filter by log level (INFO, WARNING, ERROR, DEBUG)"),
@@ -1723,7 +1733,7 @@ async def get_application_logs(
 
 # Avro Schema Management Endpoints
 
-@app.get("/avro/schemas")
+@app.get("/api/v1/avro/schemas")
 async def get_avro_schemas(request: Request):
     """Get all Avro schemas (requires authentication)"""
     try:
@@ -1732,7 +1742,7 @@ async def get_avro_schemas(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get Avro schemas: {e}")
 
-@app.post("/avro/schemas")
+@app.post("/api/v1/avro/schemas")
 async def create_avro_schema(schema_data: dict, request: Request):
     """Create new Avro schema (requires authentication)"""
     try:
@@ -1756,7 +1766,7 @@ async def create_avro_schema(schema_data: dict, request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create Avro schema: {e}")
 
-@app.get("/avro/schemas/{schema_id}")
+@app.get("/api/v1/avro/schemas/{schema_id}")
 async def get_avro_schema(schema_id: int, request: Request):
     """Get specific Avro schema by ID (requires authentication)"""
     try:
@@ -1772,7 +1782,7 @@ async def get_avro_schema(schema_id: int, request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get Avro schema: {e}")
 
-@app.get("/avro/schemas/topic/{topic_name}")
+@app.get("/api/v1/avro/schemas/topic/{topic_name}")
 async def get_avro_schema_for_topic(topic_name: str):
     """Get the best matching Avro schema for a topic (public endpoint for system use)"""
     try:
@@ -1787,7 +1797,7 @@ async def get_avro_schema_for_topic(topic_name: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get Avro schema for topic: {e}")
 
-@app.put("/avro/schemas/{schema_id}")
+@app.put("/api/v1/avro/schemas/{schema_id}")
 async def update_avro_schema(schema_id: int, schema_data: dict, request: Request):
     """Update existing Avro schema (requires authentication)"""
     try:
@@ -1814,7 +1824,7 @@ async def update_avro_schema(schema_id: int, schema_data: dict, request: Request
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update Avro schema: {e}")
 
-@app.delete("/avro/schemas/{schema_id}")
+@app.delete("/api/v1/avro/schemas/{schema_id}")
 async def delete_avro_schema(schema_id: int, request: Request):
     """Delete Avro schema (requires authentication)"""
     try:
@@ -1832,7 +1842,7 @@ async def delete_avro_schema(schema_id: int, request: Request):
 # QUERY CACHE MANAGEMENT ENDPOINTS
 # =====================================================
 
-@app.get("/cache/stats")
+@app.get("/api/v1/cache/stats")
 async def get_cache_stats():
     """
     Get query cache statistics and performance metrics
@@ -1850,7 +1860,7 @@ async def get_cache_stats():
 
     return query_cache.stats()
 
-@app.get("/cache/health")
+@app.get("/api/v1/cache/health")
 async def get_cache_health():
     """
     Health check for query cache
@@ -1871,7 +1881,7 @@ async def get_cache_health():
 
     return query_cache.health_check()
 
-@app.post("/cache/clear")
+@app.post("/api/v1/cache/clear")
 async def clear_cache():
     """
     Clear all cached query results

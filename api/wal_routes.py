@@ -12,7 +12,7 @@ import os
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(tags=["wal"], prefix="/api/wal")
+router = APIRouter(tags=["wal"], prefix="/api/v1/wal")
 
 
 def get_wal_stats_from_buffer() -> Dict[str, Any]:
