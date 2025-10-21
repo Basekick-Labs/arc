@@ -20,6 +20,7 @@
 ## Features
 
 - **High-Performance Ingestion**: MessagePack binary protocol (recommended), InfluxDB Line Protocol (drop-in replacement), JSON
+- **VSCode Extension**: Full-featured database manager with query editor, notebooks, CSV import, and alerting - [Install Now](https://marketplace.visualstudio.com/items?itemName=basekick-labs.arc-db-manager)
 - **Multi-Database Architecture**: Organize data by environment, tenant, or application with database namespaces - [Learn More](#multi-database-architecture)
 - **Write-Ahead Log (WAL)**: Optional durability feature for zero data loss (disabled by default) - [Learn More](docs/WAL.md)
 - **Automatic File Compaction**: Merges small Parquet files into larger ones for 10-50x faster queries (enabled by default) - [Learn More](docs/COMPACTION.md)
@@ -279,6 +280,47 @@ LOG_LEVEL=INFO
 **Legacy Support**: `.env` files are still supported for backward compatibility, but `arc.conf` is recommended.
 
 ## Getting Started
+
+### VSCode Extension - The Easiest Way to Get Started
+
+**Arc Database Manager** for VS Code provides a complete development toolkit with visual database exploration, query execution, and data management - no command line required!
+
+<p align="center">
+  <a href="https://marketplace.visualstudio.com/items?itemName=basekick-labs.arc-db-manager">
+    <img src="https://img.shields.io/badge/VSCode-Arc%20DB%20Manager-blue?logo=visual-studio-code&logoColor=white" alt="VSCode Extension"/>
+  </a>
+  <a href="https://marketplace.visualstudio.com/items?itemName=basekick-labs.arc-db-manager">
+    <img src="https://img.shields.io/visual-studio-marketplace/v/basekick-labs.arc-db-manager?label=version" alt="Version"/>
+  </a>
+  <a href="https://marketplace.visualstudio.com/items?itemName=basekick-labs.arc-db-manager">
+    <img src="https://img.shields.io/visual-studio-marketplace/i/basekick-labs.arc-db-manager?label=installs" alt="Installs"/>
+  </a>
+</p>
+
+#### Key Features:
+
+- **Visual Connection Management** - Connect to multiple Arc servers with saved connections
+- **SQL Query Editor** - IntelliSense auto-completion for tables, columns, and DuckDB functions
+- **Arc Notebooks** - Mix SQL and Markdown in `.arcnb` files with parameterized queries
+- **Schema Explorer** - Browse databases and tables with right-click context menus
+- **CSV Import Wizard** - Import CSV files with auto-detection and batch processing
+- **Alerting System** - Create alerts with desktop notifications
+- **Auto-Visualizations** - Automatic chart generation for time-series data
+- **Query History** - Automatic logging of all queries with saved favorites
+- **Dark Mode** - Automatic theme adaptation
+
+#### Quick Install:
+
+1. Open VS Code
+2. Search for **"Arc Database Manager"** in Extensions marketplace
+3. Click Install
+4. Connect to your Arc server and start querying!
+
+**→ [Install from VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=basekick-labs.arc-db-manager)**
+
+**→ [View Extension Documentation](https://github.com/basekick-labs/vscode-extension)**
+
+---
 
 ### 1. Get Your Admin Token
 
