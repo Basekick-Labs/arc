@@ -281,7 +281,7 @@ Long-running Python processes (especially with Gunicorn workers) can accumulate 
 
 **Explicit Arrow Cleanup**: After serializing Arrow responses, Arc explicitly deletes the Arrow table, buffer, and writer objects, then triggers garbage collection. Python's GC might delay cleanup otherwise, causing memory spikes.
 
-**Pool Metrics**: Arc exposes connection pool metrics (`/metrics/query-pool`) showing active connections, queue depth, and average wait/execution times. This helps operators identify memory or performance issues.
+**Pool Metrics**: Arc exposes connection pool metrics (`/api/v1/metrics/query-pool`) showing active connections, queue depth, and average wait/execution times. This helps operators identify memory or performance issues.
 
 ## 5. API Layer: Modern Interfaces for Diverse Clients
 
@@ -309,7 +309,7 @@ This caching strategy eliminates authentication as a performance bottleneck. Pro
 | **Auth + Cache (30s TTL)** | **2.42M RPS** | **1.74ms** | **28.13ms** | **45.27ms** |
 | Auth (no cache) | 2.31M RPS | 6.36ms | 41.41ms | 63.31ms |
 
-Token caching achieves 99.9%+ hit rate at sustained high throughput, adding only 0.1ms overhead versus no authentication. The cache accepts a 30-second revocation delay—deleted tokens remain valid until cache expiry. For immediate revocation, administrators can manually invalidate the cache via `POST /auth/cache/invalidate`.
+Token caching achieves 99.9%+ hit rate at sustained high throughput, adding only 0.1ms overhead versus no authentication. The cache accepts a 30-second revocation delay—deleted tokens remain valid until cache expiry. For immediate revocation, administrators can manually invalidate the cache via `POST /api/v1/auth/cache/invalidate`.
 
 **4. Request Size Middleware**: Rejects POST/PUT/PATCH requests exceeding 100MB (configurable). This prevents memory exhaustion from malicious large uploads.
 
@@ -341,7 +341,7 @@ This pattern reduces log volume from 42× messages to 1× while maintaining full
 
 Arc supports two response formats for queries, serving different client needs:
 
-**JSON Format** (`POST /query`):
+**JSON Format** (`POST /api/v1/query`):
 ```json
 {
   "success": true,
@@ -357,7 +357,7 @@ Arc supports two response formats for queries, serving different client needs:
 
 This format works universally—web browsers, curl, any HTTP client. Data representation is simple (nested arrays), and JSON parsers exist everywhere.
 
-**Arrow Format** (`POST /query/arrow`):
+**Arrow Format** (`POST /api/v1/query/arrow`):
 ```
 [Binary Apache Arrow IPC Stream]
 Headers:
@@ -667,9 +667,9 @@ Arc's flexibility enables diverse deployment patterns:
 
 Production systems require visibility. Arc provides multiple monitoring endpoints:
 
-**System Metrics** (`/metrics`): CPU usage, memory consumption, disk I/O, network stats. Collected every 30 seconds, retained for 24 hours.
+**System Metrics** (`/api/v1/metrics`): CPU usage, memory consumption, disk I/O, network stats. Collected every 30 seconds, retained for 24 hours.
 
-**Connection Pool Metrics** (`/metrics/query-pool`): Pool size, active/idle connections, queue depth, average wait/execution times. Critical for understanding query performance under load.
+**Connection Pool Metrics** (`/api/v1/metrics/query-pool`): Pool size, active/idle connections, queue depth, average wait/execution times. Critical for understanding query performance under load.
 
 **Cache Metrics** (`/cache/stats`): Hit rate, cache size, eviction count. Low hit rates suggest TTL tuning or workload unsuitability for caching.
 

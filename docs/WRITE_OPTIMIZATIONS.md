@@ -301,7 +301,7 @@ python benchmarks/write_memory_test.py
 
 ```bash
 # Run write benchmark
-curl -X POST http://localhost:8000/write/v1/msgpack \
+curl -X POST http://localhost:8000/api/v1/write/msgpack \
   -H "Content-Type: application/msgpack" \
   -H "x-api-key: $ARC_TOKEN" \
   --data-binary @payload_50k.msgpack \
@@ -317,7 +317,7 @@ curl -X POST http://localhost:8000/write/v1/msgpack \
 for i in {1..42}; do
   (
     for j in {1..100}; do
-      curl -X POST http://localhost:8000/write \
+      curl -X POST http://localhost:8000/api/v1/write/line-protocol \
         -H "Content-Encoding: gzip" \
         --data-binary @telegraf_metrics.gz
     done

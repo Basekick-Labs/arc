@@ -79,8 +79,7 @@ async def stop_arrow_buffer():
         await arrow_buffer.stop()
 
 
-@router.post("/write/v1/msgpack")
-@router.post("/api/v1/msgpack")
+@router.post("/api/v1/write/msgpack")
 async def write_msgpack(
     request: Request,
     content_encoding: Optional[str] = Header(None, alias="Content-Encoding"),
@@ -200,7 +199,7 @@ async def write_msgpack(
         raise HTTPException(status_code=500, detail=f"Internal error: {error_msg}")
 
 
-@router.get("/write/v1/msgpack/stats")
+@router.get("/api/v1/write/msgpack/stats")
 async def msgpack_stats():
     """
     Get MessagePack endpoint statistics
@@ -215,7 +214,7 @@ async def msgpack_stats():
     return stats
 
 
-@router.get("/write/v1/msgpack/spec")
+@router.get("/api/v1/write/msgpack/spec")
 async def msgpack_spec():
     """
     Get MessagePack binary protocol specification
@@ -226,7 +225,7 @@ async def msgpack_spec():
     return {
         'version': '2.0',
         'protocol': 'MessagePack',
-        'endpoint': '/write/v1/msgpack',
+        'endpoint': '/api/v1/write/msgpack',
         'content_type': 'application/msgpack',
         'compression': 'gzip (optional)',
         'authentication': 'x-api-key header',

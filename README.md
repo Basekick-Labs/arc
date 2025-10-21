@@ -72,8 +72,8 @@ Arc includes built-in token-based authentication with minimal performance overhe
 **Cache Statistics:**
 - **Hit rate**: 99.9%+ at sustained high throughput
 - **Revocation delay**: Max 30 seconds (cache TTL)
-- **Manual invalidation**: `POST /auth/cache/invalidate` for immediate effect
-- **Monitoring**: `GET /auth/cache/stats` for cache performance metrics
+- **Manual invalidation**: `POST /api/v1/auth/cache/invalidate` for immediate effect
+- **Monitoring**: `GET /api/v1/auth/cache/stats` for cache performance metrics
 
 ### Storage Backend Performance
 
@@ -94,7 +94,7 @@ Arc includes built-in token-based authentication with minimal performance overhe
 - **Workers:** ~30x CPU cores for I/O-bound workloads (e.g., 14 cores = 400 workers)
 - **Deployment:** Native mode (3.5x faster than Docker)
 - **Storage:** Local filesystem for maximum performance, MinIO for distributed deployments
-- **Protocol:** MessagePack binary columnar (`/write/v1/msgpack`)
+- **Protocol:** MessagePack binary columnar (`/api/v1/write/msgpack`)
 - **Performance Stack:**
   - `uvloop`: 2-4x faster event loop (Cython-based C implementation)
   - `httptools`: 40% faster HTTP parser
@@ -402,7 +402,7 @@ data = {
 
 # Send columnar data (2.32M RPS throughput)
 response = requests.post(
-    "http://localhost:8000/write/v1/msgpack",
+    "http://localhost:8000/api/v1/write/msgpack",
     headers={
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/msgpack",
@@ -439,7 +439,7 @@ data = {
 }
 
 response = requests.post(
-    "http://localhost:8000/write/v1/msgpack",
+    "http://localhost:8000/api/v1/write/msgpack",
     headers={
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/msgpack"
@@ -493,7 +493,7 @@ data = {
 }
 
 response = requests.post(
-    "http://localhost:8000/write/v1/msgpack",
+    "http://localhost:8000/api/v1/write/msgpack",
     headers={
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/msgpack"
@@ -555,7 +555,7 @@ token = os.getenv("ARC_TOKEN")  # Your API token
 
 # Simple query
 response = requests.post(
-    "http://localhost:8000/query",
+    "http://localhost:8000/api/v1/query",
     headers={
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
@@ -575,7 +575,7 @@ for row in data['data']:
 **Using curl**:
 
 ```bash
-curl -X POST http://localhost:8000/query \
+curl -X POST http://localhost:8000/api/v1/query \
   -H "Authorization: Bearer $ARC_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -589,7 +589,7 @@ curl -X POST http://localhost:8000/query \
 ```python
 # Time-series aggregation
 response = requests.post(
-    "http://localhost:8000/query",
+    "http://localhost:8000/api/v1/query",
     headers={"Authorization": f"Bearer {token}"},
     json={
         "sql": """
@@ -609,7 +609,7 @@ response = requests.post(
 
 # Window functions
 response = requests.post(
-    "http://localhost:8000/query",
+    "http://localhost:8000/api/v1/query",
     headers={"Authorization": f"Bearer {token}"},
     json={
         "sql": """
@@ -632,7 +632,7 @@ response = requests.post(
 
 # Join multiple measurements
 response = requests.post(
-    "http://localhost:8000/query",
+    "http://localhost:8000/api/v1/query",
     headers={"Authorization": f"Bearer {token}"},
     json={
         "sql": """
@@ -670,7 +670,7 @@ import pandas as pd
 
 # Execute query and get Arrow format
 response = requests.post(
-    "http://localhost:8000/query/arrow",
+    "http://localhost:8000/api/v1/query/arrow",
     headers={"Authorization": f"Bearer {token}"},
     json={
         "sql": """
@@ -706,7 +706,7 @@ import pyarrow as pa
 import polars as pl
 
 response = requests.post(
-    "http://localhost:8000/query/arrow",
+    "http://localhost:8000/api/v1/query/arrow",
     headers={"Authorization": f"Bearer {token}"},
     json={"sql": "SELECT * FROM cpu WHERE host = 'server01' LIMIT 100000"}
 )
@@ -796,7 +796,7 @@ data = {
 
 # Write to production database
 response = requests.post(
-    "http://localhost:8000/write/v1/msgpack",
+    "http://localhost:8000/api/v1/write/msgpack",
     headers={
         "x-api-key": token,
         "Content-Type": "application/msgpack",
@@ -807,7 +807,7 @@ response = requests.post(
 
 # Write to staging database
 response = requests.post(
-    "http://localhost:8000/write/v1/msgpack",
+    "http://localhost:8000/api/v1/write/msgpack",
     headers={
         "x-api-key": token,
         "Content-Type": "application/msgpack",
@@ -820,12 +820,12 @@ response = requests.post(
 **Line Protocol:**
 ```bash
 # Write to default database (uses configured database)
-curl -X POST http://localhost:8000/write \
+curl -X POST http://localhost:8000/api/v1/write/line-protocol \
   -H "x-api-key: $ARC_TOKEN" \
   -d 'cpu,host=server01 usage_idle=95.0'
 
 # Write to specific database
-curl -X POST http://localhost:8000/write \
+curl -X POST http://localhost:8000/api/v1/write/line-protocol \
   -H "x-api-key: $ARC_TOKEN" \
   -H "x-arc-database: production" \
   -d 'cpu,host=server01 usage_idle=95.0'
@@ -855,7 +855,7 @@ SHOW TABLES;
 ```python
 # Query production database
 response = requests.post(
-    "http://localhost:8000/query",
+    "http://localhost:8000/api/v1/query",
     headers={"Authorization": f"Bearer {token}"},
     json={
         "sql": "SELECT * FROM production.cpu WHERE timestamp > NOW() - INTERVAL 1 HOUR",
@@ -865,7 +865,7 @@ response = requests.post(
 
 # Query default database (no prefix needed)
 response = requests.post(
-    "http://localhost:8000/query",
+    "http://localhost:8000/api/v1/query",
     headers={"Authorization": f"Bearer {token}"},
     json={
         "sql": "SELECT * FROM cpu WHERE timestamp > NOW() - INTERVAL 1 HOUR",
@@ -878,7 +878,7 @@ response = requests.post(
 ```python
 # Compare production vs staging metrics
 response = requests.post(
-    "http://localhost:8000/query",
+    "http://localhost:8000/api/v1/query",
     headers={"Authorization": f"Bearer {token}"},
     json={
         "sql": """

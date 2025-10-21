@@ -62,7 +62,7 @@ This document provides comprehensive documentation of Arc's performance benchmar
 Arc uses the **stateless table engine** approach (allowed by ClickBench):
 1. Download the 14GB hits.parquet file
 2. Copy directly to Arc's storage directory: `data/arc/clickbench/hits/`
-3. Query via Arc's HTTP API: `POST /query` with SQL
+3. Query via Arc's HTTP API: `POST /api/v1/query` with SQL
 
 This is the correct approach for systems like Arc and DuckDB that can query Parquet files directly without ingestion.
 
@@ -73,7 +73,7 @@ This is the correct approach for systems like Arc and DuckDB that can query Parq
 **The benchmark makes HTTP requests:**
 ```python
 response = requests.post(
-    f"http://localhost:8000/query",
+    f"http://localhost:8000/api/v1/query",
     headers={"x-api-key": token, "Content-Type": "application/json"},
     json={"sql": query_sql, "format": "json"},
     timeout=300

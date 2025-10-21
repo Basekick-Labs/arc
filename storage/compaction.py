@@ -114,6 +114,9 @@ class CompactionJob:
             # Delete old files from storage
             await self._delete_old_files()
 
+            # Clean up old tombstone files (past retention period)
+            await self._cleanup_old_tombstones()
+
             # Cleanup temp directory
             self._cleanup_temp(temp_dir)
 
@@ -156,9 +159,112 @@ class CompactionJob:
             str(local_path)
         )
 
+    async def _download_tombstones(self, temp_dir: Path) -> Optional[Path]:
+        """
+        Download tombstone files for this measurement if they exist.
+        Merges all tombstone files into a single file for efficient filtering.
+
+        Args:
+            temp_dir: Temporary directory for downloads
+
+        Returns:
+            Path to merged tombstone file, or None if no tombstones exist
+        """
+        try:
+            # Build path to .deletes directory
+            deletes_prefix = f"{self.measurement}/.deletes/"
+
+            # List tombstone files
+            tombstone_keys = []
+
+            if hasattr(self.storage_backend, 'base_path'):
+                # Local filesystem
+                deletes_dir = Path(self.storage_backend.base_path) / self.database / self.measurement / ".deletes"
+                if deletes_dir.exists():
+                    for tombstone_file in deletes_dir.glob("delete_*.parquet"):
+                        # Create relative path for consistency
+                        relative = tombstone_file.relative_to(Path(self.storage_backend.base_path) / self.database)
+                        tombstone_keys.append(str(relative))
+            elif hasattr(self.storage_backend, 's3_client'):
+                # S3-compatible backends
+                full_prefix = f"{self.database}/{deletes_prefix}"
+                paginator = self.storage_backend.s3_client.get_paginator('list_objects_v2')
+
+                for page in paginator.paginate(Bucket=self.storage_backend.bucket, Prefix=full_prefix):
+                    if 'Contents' in page:
+                        for obj in page['Contents']:
+                            key = obj['Key']
+                            if key.endswith('.parquet') and '/delete_' in key:
+                                # Remove database prefix for consistency
+                                if key.startswith(f"{self.database}/"):
+                                    relative_key = key[len(f"{self.database}/"):]
+                                    tombstone_keys.append(relative_key)
+            else:
+                # Fallback - use storage backend's list_objects
+                objects = self.storage_backend.list_objects(prefix=deletes_prefix, max_keys=1000)
+                tombstone_keys = [obj for obj in objects if obj.endswith('.parquet') and '/delete_' in obj]
+
+            if not tombstone_keys:
+                logger.debug(f"No tombstone files found for {self.measurement}")
+                return None
+
+            logger.info(f"Found {len(tombstone_keys)} tombstone files for {self.measurement}")
+
+            # Download all tombstone files
+            tombstone_dir = temp_dir / "tombstones"
+            tombstone_dir.mkdir(exist_ok=True)
+
+            for key in tombstone_keys:
+                local_path = tombstone_dir / Path(key).name
+                await self._download_file(key, local_path)
+
+            # Merge all tombstone files into one for efficient filtering
+            merged_file = temp_dir / "tombstones_merged.parquet"
+            await self._merge_tombstone_files(tombstone_dir, merged_file)
+
+            return merged_file
+
+        except Exception as e:
+            logger.warning(f"Failed to download tombstones for {self.measurement}: {e}")
+            return None
+
+    async def _merge_tombstone_files(self, tombstone_dir: Path, output_file: Path):
+        """
+        Merge multiple tombstone files into a single file.
+
+        Args:
+            tombstone_dir: Directory containing tombstone files
+            output_file: Path for merged output file
+        """
+        import duckdb
+
+        loop = asyncio.get_event_loop()
+
+        def _merge():
+            con = duckdb.connect(':memory:')
+
+            # Read all tombstone files and merge
+            tombstone_pattern = str(tombstone_dir / "delete_*.parquet")
+
+            con.execute(f"""
+                COPY (
+                    SELECT DISTINCT _hash, time, _deleted_at, _deleted_by, database, measurement
+                    FROM read_parquet('{tombstone_pattern}', union_by_name=true)
+                ) TO '{output_file}' (
+                    FORMAT PARQUET,
+                    COMPRESSION ZSTD
+                )
+            """)
+
+            con.close()
+
+        await loop.run_in_executor(None, _merge)
+        logger.debug(f"Merged tombstone files to {output_file}")
+
     async def _compact_files(self, local_files: List[Path], temp_dir: Path) -> Path:
         """
-        Compact multiple Parquet files into one using DuckDB
+        Compact multiple Parquet files into one using DuckDB.
+        Also filters out deleted rows based on tombstone files.
 
         Args:
             local_files: List of local Parquet file paths
@@ -172,6 +278,9 @@ class CompactionJob:
         # Generate output filename
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         output_file = temp_dir / f"{self.measurement}_{timestamp}_compacted.parquet"
+
+        # Check for tombstone files and download them if they exist
+        tombstone_file = await self._download_tombstones(temp_dir)
 
         # Use DuckDB to read all files and write compacted file
         loop = asyncio.get_event_loop()
@@ -210,12 +319,39 @@ class CompactionJob:
                 # Use glob pattern but only valid files remain
                 file_pattern = str(temp_dir / "*.parquet")
 
+            # Build SQL query with tombstone filtering if tombstones exist
+            if tombstone_file and tombstone_file.exists():
+                logger.info(f"Applying tombstone filter during compaction using {tombstone_file}")
+
+                # Query with DuckDB's ANTI JOIN to filter out deleted rows
+                # ANTI JOIN is more efficient than NOT IN for large datasets
+                sql_query = f"""
+                    SELECT main_data.*
+                    FROM read_parquet('{file_pattern}', union_by_name=true) AS main_data
+                    ANTI JOIN (
+                        SELECT _hash
+                        FROM read_parquet('{tombstone_file}', union_by_name=true)
+                    ) AS tombstones
+                    ON main_data._row_hash = tombstones._hash
+                    ORDER BY time
+                """
+
+                # Count rows before and after for metrics
+                total_rows = con.execute(f"SELECT COUNT(*) FROM read_parquet('{file_pattern}', union_by_name=true)").fetchone()[0]
+                filtered_rows = con.execute(f"SELECT COUNT(*) FROM ({sql_query})").fetchone()[0]
+                deleted_count = total_rows - filtered_rows
+
+                if deleted_count > 0:
+                    logger.info(f"Filtering out {deleted_count} deleted rows during compaction ({total_rows} → {filtered_rows})")
+            else:
+                # No tombstones, standard compaction
+                sql_query = f"SELECT * FROM read_parquet('{file_pattern}', union_by_name=true) ORDER BY time"
+
             # Write compacted file with optimized settings
             # Use union_by_name=true to handle schema evolution (missing columns filled with NULL)
             con.execute(f"""
                 COPY (
-                    SELECT * FROM read_parquet('{file_pattern}', union_by_name=true)
-                    ORDER BY time  -- Important: keep time-ordering
+                    {sql_query}
                 ) TO '{output_file}' (
                     FORMAT PARQUET,
                     COMPRESSION ZSTD,
@@ -249,6 +385,94 @@ class CompactionJob:
                 logger.debug(f"Deleted old file: {file_key}")
             except Exception as e:
                 logger.warning(f"Failed to delete old file {file_key}: {e}")
+
+    async def _cleanup_old_tombstones(self):
+        """
+        Clean up tombstone files older than the retention period.
+
+        Reads delete configuration and removes tombstone files past their retention period.
+        This is safe because tombstoned rows have already been physically removed during compaction.
+        """
+        try:
+            # Import config loader to get retention period
+            from config_loader import get_config
+            config = get_config()
+
+            # Check if deletes are enabled
+            if not config.get("delete", "enabled", default=False):
+                return
+
+            # Get tombstone retention period (default 30 days)
+            retention_days = config.get("delete", "tombstone_retention_days", default=30)
+            cutoff_time = datetime.utcnow() - timedelta(days=retention_days)
+
+            logger.info(f"Cleaning up tombstones older than {retention_days} days (cutoff: {cutoff_time})")
+
+            # Build path to .deletes directory
+            deletes_prefix = f"{self.measurement}/.deletes/"
+
+            # List tombstone files
+            tombstone_files = []
+
+            if hasattr(self.storage_backend, 'base_path'):
+                # Local filesystem
+                deletes_dir = Path(self.storage_backend.base_path) / self.database / self.measurement / ".deletes"
+                if deletes_dir.exists():
+                    for tombstone_file in deletes_dir.glob("delete_*.parquet"):
+                        # Check file modification time
+                        mtime = datetime.fromtimestamp(tombstone_file.stat().st_mtime)
+                        if mtime < cutoff_time:
+                            relative = tombstone_file.relative_to(Path(self.storage_backend.base_path) / self.database)
+                            tombstone_files.append(str(relative))
+            elif hasattr(self.storage_backend, 's3_client'):
+                # S3-compatible backends
+                full_prefix = f"{self.database}/{deletes_prefix}"
+                paginator = self.storage_backend.s3_client.get_paginator('list_objects_v2')
+
+                for page in paginator.paginate(Bucket=self.storage_backend.bucket, Prefix=full_prefix):
+                    if 'Contents' in page:
+                        for obj in page['Contents']:
+                            key = obj['Key']
+                            if key.endswith('.parquet') and '/delete_' in key:
+                                # Check last modified time
+                                last_modified = obj['LastModified']
+                                # Make cutoff_time timezone-aware for comparison
+                                if last_modified.replace(tzinfo=None) < cutoff_time:
+                                    # Remove database prefix for consistency
+                                    if key.startswith(f"{self.database}/"):
+                                        relative_key = key[len(f"{self.database}/"):]
+                                        tombstone_files.append(relative_key)
+            else:
+                # Fallback - use storage backend's list_objects
+                # Note: This fallback doesn't have modification time info, skip cleanup
+                logger.debug("Tombstone cleanup not supported for this storage backend")
+                return
+
+            if not tombstone_files:
+                logger.debug(f"No old tombstone files to clean up for {self.measurement}")
+                return
+
+            # Delete old tombstone files
+            loop = asyncio.get_event_loop()
+            deleted_count = 0
+
+            for file_key in tombstone_files:
+                try:
+                    await loop.run_in_executor(
+                        None,
+                        self.storage_backend.delete_file,
+                        file_key
+                    )
+                    deleted_count += 1
+                    logger.debug(f"Deleted old tombstone: {file_key}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete old tombstone {file_key}: {e}")
+
+            if deleted_count > 0:
+                logger.info(f"Cleaned up {deleted_count} old tombstone files for {self.measurement}")
+
+        except Exception as e:
+            logger.warning(f"Failed to cleanup old tombstones for {self.measurement}: {e}")
 
     def _cleanup_temp(self, temp_dir: Path):
         """Cleanup temporary directory"""

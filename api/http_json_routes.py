@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import asyncio
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/http-json", tags=["http-json"])
+router = APIRouter(prefix="/api/v1/http-json", tags=["http-json"])
 
 
 @router.post("/connections")

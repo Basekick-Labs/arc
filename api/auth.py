@@ -51,26 +51,86 @@ class AuthManager:
                     enabled INTEGER DEFAULT 1
                 )
             """)
+
+            # Add permissions column if it doesn't exist (migration)
+            cursor = conn.execute("PRAGMA table_info(api_tokens)")
+            columns = [row[1] for row in cursor.fetchall()]
+            if 'permissions' not in columns:
+                try:
+                    conn.execute("ALTER TABLE api_tokens ADD COLUMN permissions TEXT DEFAULT 'read,write'")
+                    logger.info("Added permissions column to api_tokens table")
+                except sqlite3.OperationalError as e:
+                    # Column might already exist from a race condition
+                    if "duplicate column" not in str(e).lower():
+                        raise
+
             conn.commit()
 
     def _hash_token(self, token: str) -> str:
         """Hash a token for storage"""
         return hashlib.sha256(token.encode()).hexdigest()
 
-    def create_token(self, name: str, description: str = None, expires_at: datetime = None) -> str:
-        """Create a new API token"""
+    def has_permission(self, token_info: Dict, permission: str) -> bool:
+        """
+        Check if a token has a specific permission
+
+        Args:
+            token_info: Token info dict from verify_token
+            permission: Permission to check (read, write, delete, admin)
+
+        Returns:
+            True if token has the permission
+        """
+        if not token_info:
+            return False
+
+        permissions = token_info.get('permissions', [])
+
+        # Admin permission grants all permissions
+        if 'admin' in permissions:
+            return True
+
+        # Check specific permission
+        return permission in permissions
+
+    def create_token(self, name: str, description: str = None, expires_at: datetime = None, permissions: str = "read,write") -> str:
+        """
+        Create a new API token
+
+        Args:
+            name: Token name (unique identifier)
+            description: Optional description
+            expires_at: Optional expiration datetime
+            permissions: Comma-separated permissions (default: "read,write")
+                        Available: read, write, delete, admin
+
+        Returns:
+            The generated token string (save this - it's not stored!)
+        """
         # Generate secure random token
         token = secrets.token_urlsafe(32)
         token_hash = self._hash_token(token)
 
         with sqlite3.connect(self.db_path) as conn:
             try:
-                # Check if expires_at column exists, if not, ignore it
+                # Check what columns exist
                 cursor = conn.execute("PRAGMA table_info(api_tokens)")
                 columns = [row[1] for row in cursor.fetchall()]
                 has_expires_at = 'expires_at' in columns
+                has_permissions = 'permissions' in columns
 
-                if has_expires_at and expires_at is not None:
+                # Build INSERT query based on available columns
+                if has_expires_at and has_permissions and expires_at is not None:
+                    conn.execute(
+                        "INSERT INTO api_tokens (name, token_hash, description, expires_at, permissions) VALUES (?, ?, ?, ?, ?)",
+                        (name, token_hash, description, expires_at, permissions)
+                    )
+                elif has_permissions:
+                    conn.execute(
+                        "INSERT INTO api_tokens (name, token_hash, description, permissions) VALUES (?, ?, ?, ?)",
+                        (name, token_hash, description, permissions)
+                    )
+                elif has_expires_at and expires_at is not None:
                     conn.execute(
                         "INSERT INTO api_tokens (name, token_hash, description, expires_at) VALUES (?, ?, ?, ?)",
                         (name, token_hash, description, expires_at)
@@ -81,7 +141,7 @@ class AuthManager:
                         (name, token_hash, description)
                     )
                 conn.commit()
-                logger.info(f"Created API token: {name}")
+                logger.info(f"Created API token: {name} with permissions: {permissions}")
                 return token
             except sqlite3.IntegrityError:
                 raise ValueError(f"Token with name '{name}' already exists")
@@ -147,12 +207,19 @@ class AuthManager:
                     )
                     conn.commit()
 
+                    # Get permissions if column exists
+                    try:
+                        permissions = row['permissions'] if 'permissions' in row.keys() else 'read,write'
+                    except (KeyError, IndexError):
+                        permissions = 'read,write'
+
                     token_info = {
                         'id': row['id'],
                         'name': row['name'],
                         'description': row['description'],
                         'created_at': row['created_at'],
-                        'last_used_at': row['last_used_at']
+                        'last_used_at': row['last_used_at'],
+                        'permissions': permissions.split(',') if permissions else []
                     }
 
                     # Store in cache
@@ -175,10 +242,32 @@ class AuthManager:
         """List all API tokens (without revealing actual tokens)"""
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
-            cursor = conn.execute(
-                "SELECT id, name, description, created_at, last_used_at, enabled FROM api_tokens"
-            )
-            return [dict(row) for row in cursor.fetchall()]
+
+            # Check if permissions column exists
+            cursor = conn.execute("PRAGMA table_info(api_tokens)")
+            columns = [row[1] for row in cursor.fetchall()]
+            has_permissions = 'permissions' in columns
+
+            if has_permissions:
+                cursor = conn.execute(
+                    "SELECT id, name, description, created_at, last_used_at, enabled, permissions FROM api_tokens"
+                )
+            else:
+                cursor = conn.execute(
+                    "SELECT id, name, description, created_at, last_used_at, enabled FROM api_tokens"
+                )
+
+            tokens = []
+            for row in cursor.fetchall():
+                token_dict = dict(row)
+                # Convert permissions string to list if it exists
+                if 'permissions' in token_dict and token_dict['permissions']:
+                    token_dict['permissions'] = token_dict['permissions'].split(',')
+                elif 'permissions' not in token_dict:
+                    token_dict['permissions'] = ['read', 'write']  # Default
+                tokens.append(token_dict)
+
+            return tokens
 
     def revoke_token(self, name: str) -> bool:
         """Revoke (disable) a token and invalidate cache"""
@@ -212,6 +301,67 @@ class AuthManager:
 
         return success
 
+    def update_token(self, token_id: int, name: str = None, description: str = None, expires_at: datetime = None, permissions: str = None) -> bool:
+        """
+        Update token metadata
+
+        Args:
+            token_id: Token ID to update
+            name: New name (optional)
+            description: New description (optional)
+            expires_at: New expiration date (optional)
+            permissions: New permissions (optional)
+
+        Returns:
+            True if updated successfully
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            # Check what columns exist
+            cursor = conn.execute("PRAGMA table_info(api_tokens)")
+            columns = [row[1] for row in cursor.fetchall()]
+            has_expires_at = 'expires_at' in columns
+            has_permissions = 'permissions' in columns
+
+            # Build UPDATE query dynamically based on provided fields
+            updates = []
+            values = []
+
+            if name is not None:
+                updates.append("name = ?")
+                values.append(name)
+
+            if description is not None:
+                updates.append("description = ?")
+                values.append(description)
+
+            if expires_at is not None and has_expires_at:
+                updates.append("expires_at = ?")
+                values.append(expires_at)
+
+            if permissions is not None and has_permissions:
+                updates.append("permissions = ?")
+                values.append(permissions)
+
+            if not updates:
+                # Nothing to update
+                return False
+
+            # Add token_id for WHERE clause
+            values.append(token_id)
+
+            # Execute update
+            sql = f"UPDATE api_tokens SET {', '.join(updates)} WHERE id = ?"
+            cursor = conn.execute(sql, values)
+            conn.commit()
+            success = cursor.rowcount > 0
+
+        # Invalidate cache when updating
+        if success:
+            self.invalidate_cache()
+            logger.info(f"Updated token ID: {token_id}")
+
+        return success
+
     def delete_token_by_id(self, token_id: int) -> bool:
         """Delete a token permanently by ID and invalidate cache"""
         with sqlite3.connect(self.db_path) as conn:
@@ -232,13 +382,32 @@ class AuthManager:
         """Get token info by ID (without revealing the token value)"""
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
-            cursor = conn.execute(
-                "SELECT id, name, description, created_at, last_used_at, enabled FROM api_tokens WHERE id = ?",
-                (token_id,)
-            )
+
+            # Check if permissions column exists
+            cursor = conn.execute("PRAGMA table_info(api_tokens)")
+            columns = [row[1] for row in cursor.fetchall()]
+            has_permissions = 'permissions' in columns
+
+            if has_permissions:
+                cursor = conn.execute(
+                    "SELECT id, name, description, created_at, last_used_at, enabled, permissions FROM api_tokens WHERE id = ?",
+                    (token_id,)
+                )
+            else:
+                cursor = conn.execute(
+                    "SELECT id, name, description, created_at, last_used_at, enabled FROM api_tokens WHERE id = ?",
+                    (token_id,)
+                )
+
             row = cursor.fetchone()
             if row:
-                return dict(row)
+                token_dict = dict(row)
+                # Convert permissions string to list if it exists
+                if 'permissions' in token_dict and token_dict['permissions']:
+                    token_dict['permissions'] = token_dict['permissions'].split(',')
+                elif 'permissions' not in token_dict:
+                    token_dict['permissions'] = ['read', 'write']  # Default
+                return token_dict
             return None
 
     def rotate_token(self, token_id: int) -> Optional[str]:
@@ -322,12 +491,13 @@ class AuthManager:
                 # Tokens already exist, no need to create initial token
                 return None
 
-            # First run - create initial admin token
+            # First run - create initial admin token with all permissions
             logger.info("First run detected - creating initial admin token")
             try:
                 token = self.create_token(
                     name="admin",
-                    description="Initial admin token (auto-generated on first run)"
+                    description="Initial admin token (auto-generated on first run)",
+                    permissions="read,write,delete,admin"
                 )
                 return token
             except ValueError as e:
@@ -396,8 +566,9 @@ class AuthMiddleware:
                 content={"error": "Unauthorized", "detail": "Invalid or missing API token"}
             )
 
-        # Attach token info to request state
+        # Attach token info to request state (both names for compatibility)
         request.state.token_info = token_info
+        request.state.token_data = token_info  # For delete_routes.py compatibility
 
         return await call_next(request)
 

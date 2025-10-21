@@ -357,12 +357,37 @@ class APIConfigResponse(BaseModel):
     supported_influx_versions: List[str]
     supported_storage_backends: List[str]
 # Token Management Models
-# Simple Token Models (No RBAC - Enterprise feature)
+# Simple Token Models with Permissions
 class TokenCreateRequest(BaseModel):
     """Create token request model"""
     name: str = Field(..., min_length=1, max_length=100, description="Token name")
     description: Optional[str] = Field(default=None, max_length=500, description="Token description")
     expires_at: Optional[datetime] = Field(default=None, description="Token expiration date (optional)")
+    permissions: str = Field(
+        default="read,write",
+        description="Comma-separated permissions: read, write, delete, admin (default: read,write)"
+    )
+
+    @field_validator('permissions')
+    @classmethod
+    def validate_permissions(cls, v):
+        """Validate permissions format and values"""
+        if not v:
+            return "read,write"
+
+        # Split and clean permissions
+        perms = [p.strip().lower() for p in v.split(',')]
+
+        # Valid permission values
+        valid_perms = {'read', 'write', 'delete', 'admin'}
+
+        # Check all permissions are valid
+        for perm in perms:
+            if perm not in valid_perms:
+                raise ValueError(f"Invalid permission '{perm}'. Valid permissions: {', '.join(valid_perms)}")
+
+        # Return cleaned permissions
+        return ','.join(perms)
 
 
 class TokenUpdateRequest(BaseModel):
@@ -370,6 +395,31 @@ class TokenUpdateRequest(BaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=100, description="Token name")
     description: Optional[str] = Field(default=None, max_length=500, description="Token description")
     expires_at: Optional[datetime] = Field(default=None, description="Token expiration date")
+    permissions: Optional[str] = Field(
+        default=None,
+        description="Comma-separated permissions: read, write, delete, admin"
+    )
+
+    @field_validator('permissions')
+    @classmethod
+    def validate_permissions(cls, v):
+        """Validate permissions format and values"""
+        if v is None:
+            return None
+
+        # Split and clean permissions
+        perms = [p.strip().lower() for p in v.split(',')]
+
+        # Valid permission values
+        valid_perms = {'read', 'write', 'delete', 'admin'}
+
+        # Check all permissions are valid
+        for perm in perms:
+            if perm not in valid_perms:
+                raise ValueError(f"Invalid permission '{perm}'. Valid permissions: {', '.join(valid_perms)}")
+
+        # Return cleaned permissions
+        return ','.join(perms)
 
 
 class TokenResponse(BaseModel):
@@ -380,6 +430,7 @@ class TokenResponse(BaseModel):
     created_at: str
     last_used_at: Optional[str] = None
     enabled: bool = True
+    permissions: List[str] = Field(default_factory=lambda: ["read", "write"], description="List of permissions")
     token: Optional[str] = Field(default=None, description="Actual token (only returned on creation)")
 
 
