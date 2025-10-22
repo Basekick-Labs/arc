@@ -334,26 +334,6 @@ async def write_simple(
         raise HTTPException(status_code=500, detail=f"Write failed: {str(e)}")
 
 
-@router.post("/api/v1/query")
-async def influxdb_query_v1(request: Request):
-    """
-    InfluxDB 1.x query endpoint for database creation (compatibility only)
-
-    Telegraf tries to create databases - we accept but ignore this.
-    """
-    body = await request.body()
-    query = body.decode('utf-8') if body else ""
-
-    # Check if it's a CREATE DATABASE query
-    if "CREATE DATABASE" in query.upper():
-        # Return success without actually creating anything
-        # Arc doesn't need database pre-creation
-        return Response(status_code=200, content='{"results":[{"statement_id":0}]}', media_type="application/json")
-
-    # For other queries, return not implemented
-    raise HTTPException(status_code=501, detail="Query endpoint not implemented - use /query for SQL queries")
-
-
 @router.get("/api/v1/write/health")
 async def write_health():
     """Health check for write endpoint"""
