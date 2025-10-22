@@ -763,28 +763,43 @@ class CompactionLock:
         self._init_table()
 
     def _init_table(self):
-        """Initialize compaction_locks table"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+        """Initialize compaction_locks table with retry logic for concurrent workers"""
+        max_retries = 5
+        retry_delay = 0.1  # 100ms
 
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS compaction_locks (
-                    partition_path TEXT PRIMARY KEY,
-                    worker_id INTEGER NOT NULL,
-                    locked_at TIMESTAMP NOT NULL,
-                    expires_at TIMESTAMP NOT NULL
-                )
-            ''')
+        for attempt in range(max_retries):
+            try:
+                # Use timeout to handle concurrent access from multiple workers
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
 
-            conn.commit()
-            conn.close()
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS compaction_locks (
+                        partition_path TEXT PRIMARY KEY,
+                        worker_id INTEGER NOT NULL,
+                        locked_at TIMESTAMP NOT NULL,
+                        expires_at TIMESTAMP NOT NULL
+                    )
+                ''')
 
-            logger.debug("Compaction locks table initialized")
+                conn.commit()
+                conn.close()
 
-        except Exception as e:
-            logger.error(f"Failed to initialize compaction_locks table: {e}")
-            raise
+                logger.debug("Compaction locks table initialized")
+                return
+
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    logger.debug(f"Database locked during init, retrying ({attempt + 1}/{max_retries})...")
+                    import time
+                    time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+                    continue
+                else:
+                    logger.error(f"Failed to initialize compaction_locks table after {attempt + 1} attempts: {e}")
+                    raise
+            except Exception as e:
+                logger.error(f"Failed to initialize compaction_locks table: {e}")
+                raise
 
     def acquire_lock(self, partition_path: str, ttl_hours: int = 2) -> bool:
         """

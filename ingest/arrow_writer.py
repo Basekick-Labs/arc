@@ -138,11 +138,15 @@ class ArrowParquetWriter:
             return False
 
         try:
-            # Add row hashes for delete support
-            records_with_hash = self._add_row_hashes_to_records(records, measurement)
+            # NOTE: Removed _row_hash computation - DELETE operations disabled
+            # This was causing 700K RPS loss (2.4M → 1.7M) due to:
+            #   - 2.5M SHA256 hashes per second
+            #   - Destroying zero-copy columnar passthrough
+            #   - Reconstructing rows from columns
+            # records_with_hash = self._add_row_hashes_to_records(records, measurement)
 
             # Convert records to columnar format (dict of arrays)
-            columns = self._records_to_columns(records_with_hash)
+            columns = self._records_to_columns(records)
 
             # Infer Arrow schema from first record
             schema = self._infer_schema(columns)
@@ -220,14 +224,18 @@ class ArrowParquetWriter:
             return False
 
         try:
-            # Add row hashes for delete support
-            columns_with_hash = self._add_row_hashes_to_columns(columns, measurement)
+            # NOTE: Removed _row_hash computation - DELETE operations disabled
+            # This was causing 700K RPS loss (2.4M → 1.7M) due to:
+            #   - 2.5M SHA256 hashes per second
+            #   - Destroying zero-copy columnar passthrough
+            #   - Reconstructing rows from columns
+            # columns_with_hash = self._add_row_hashes_to_columns(columns, measurement)
 
             # Infer Arrow schema from column data
-            schema = self._infer_schema(columns_with_hash)
+            schema = self._infer_schema(columns)
 
             # Create Arrow RecordBatch (zero-copy columnar structure)
-            record_batch = pa.RecordBatch.from_pydict(columns_with_hash, schema=schema)
+            record_batch = pa.RecordBatch.from_pydict(columns, schema=schema)
 
             # Create Arrow Table from RecordBatch
             table = pa.Table.from_batches([record_batch])

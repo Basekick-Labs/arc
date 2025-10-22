@@ -61,7 +61,8 @@ from api.msgpack_routes import router as msgpack_router
 from api.msgpack_routes import init_arrow_buffer, start_arrow_buffer, stop_arrow_buffer
 from api.wal_routes import router as wal_router
 from api.compaction_routes import router as compaction_router, init_compaction
-from api.delete_routes import router as delete_router
+# DELETE operations temporarily disabled for performance testing
+# from api.delete_routes import router as delete_router
 from api.query_cache import init_query_cache, get_query_cache
 
 # Setup structured logging
@@ -168,7 +169,8 @@ app.include_router(line_protocol_router)
 app.include_router(msgpack_router)
 app.include_router(wal_router)
 app.include_router(compaction_router)
-app.include_router(delete_router)
+# DELETE operations temporarily disabled for performance testing
+# app.include_router(delete_router)
 
 # Global query engine, connection manager, and scheduler
 query_engine: Optional[DuckDBEngine] = None
