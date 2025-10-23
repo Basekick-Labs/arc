@@ -25,6 +25,7 @@
 - **Retention Policies**: Time-based data lifecycle management with manual execution (automatic scheduling in enterprise edition) - [Learn More](docs/retention_policies.md)
 - **Write-Ahead Log (WAL)**: Optional durability feature for zero data loss (disabled by default) - [Learn More](docs/WAL.md)
 - **Automatic File Compaction**: Merges small Parquet files into larger ones for 10-50x faster queries (enabled by default) - [Learn More](docs/COMPACTION.md)
+- **Delete Operations**: GDPR-ready precise deletion with zero overhead on writes/queries (disabled by default) - [Learn More](docs/DELETE.md)
 - **DuckDB Query Engine**: Fast analytical queries with SQL, cross-database joins, and advanced analytics
 - **Flexible Storage Options**: Local filesystem (fastest), MinIO (distributed), AWS S3/R2 (cloud), or Google Cloud Storage
 - **Data Import**: Import data from InfluxDB, TimescaleDB, HTTP endpoints
@@ -1485,6 +1486,22 @@ See [Retention Policies Documentation](docs/retention_policies.md) for complete 
 - `GET /api/v1/avro/schemas` - List all schemas
 - `GET /api/v1/avro/schemas/{schema_id}` - Get schema by ID
 - `GET /api/v1/avro/schemas/topic/{topic_name}` - Get schema by topic
+
+### Delete Operations
+
+**Note**: Disabled by default. Set `delete.enabled=true` in `arc.conf` to enable.
+
+- `POST /api/v1/delete` - Delete data matching WHERE clause (supports dry-run)
+- `GET /api/v1/delete/config` - Get delete configuration and limits
+
+**Key Features**:
+- **Zero overhead on writes/queries**: Deleted data physically removed via file rewrites
+- **Precise deletion**: Delete any rows matching a SQL WHERE clause
+- **GDPR compliance**: Remove specific user data permanently
+- **Safety mechanisms**: Dry-run mode, confirmation thresholds, row limits
+- **Use cases**: GDPR requests, error cleanup, decommissioning hosts/sensors
+
+See [DELETE.md](docs/DELETE.md) for detailed documentation.
 
 ### Interactive API Documentation
 
