@@ -22,6 +22,7 @@
 - **High-Performance Ingestion**: MessagePack binary protocol (recommended), InfluxDB Line Protocol (drop-in replacement), JSON
 - **VSCode Extension**: Full-featured database manager with query editor, notebooks, CSV import, and alerting - [Install Now](https://marketplace.visualstudio.com/items?itemName=basekick-labs.arc-db-manager)
 - **Multi-Database Architecture**: Organize data by environment, tenant, or application with database namespaces - [Learn More](#multi-database-architecture)
+- **Retention Policies**: Time-based data lifecycle management with manual execution (automatic scheduling in enterprise edition) - [Learn More](docs/retention_policies.md)
 - **Write-Ahead Log (WAL)**: Optional durability feature for zero data loss (disabled by default) - [Learn More](docs/WAL.md)
 - **Automatic File Compaction**: Merges small Parquet files into larger ones for 10-50x faster queries (enabled by default) - [Learn More](docs/COMPACTION.md)
 - **DuckDB Query Engine**: Fast analytical queries with SQL, cross-database joins, and advanced analytics
@@ -1343,107 +1344,147 @@ sudo journalctl -u arc-api -f
 - `GET /redoc` - ReDoc documentation
 - `GET /openapi.json` - OpenAPI specification
 
-**Note**: All other endpoints require Bearer token authentication.
+**Note**: All other endpoints require token authentication via `x-api-key` header.
 
-### Data Ingestion Endpoints
+### Data Ingestion
 
-**MessagePack Binary Protocol** (Recommended - 3x faster):
-- `POST /write/v1/msgpack` - Write data via MessagePack
-- `POST /api/v1/msgpack` - Alternative endpoint
-- `GET /write/v1/msgpack/stats` - Get ingestion statistics
-- `GET /write/v1/msgpack/spec` - Get protocol specification
+**MessagePack Binary Protocol** (Recommended - 2.66x faster):
+- `POST /api/v1/write/msgpack` - Write data via MessagePack columnar format
+- `GET /api/v1/write/msgpack/stats` - Get ingestion statistics
+- `GET /api/v1/write/msgpack/spec` - Get protocol specification
 
 **Line Protocol** (InfluxDB compatibility):
-- `POST /write` - InfluxDB 1.x compatible write
-- `POST /api/v1/write` - InfluxDB 1.x API format
+- `POST /api/v1/write` - InfluxDB 1.x compatible write
 - `POST /api/v1/write/influxdb` - InfluxDB 2.x API format
-- `POST /api/v1/query` - InfluxDB 1.x query format
-- `GET /write/health` - Write endpoint health check
-- `GET /write/stats` - Write statistics
-- `POST /write/flush` - Force flush write buffer
+- `POST /api/v1/write/line-protocol` - Line protocol endpoint
+- `POST /api/v1/write/flush` - Force flush write buffer
+- `GET /api/v1/write/health` - Write endpoint health check
+- `GET /api/v1/write/stats` - Write statistics
 
 ### Query Endpoints
 
-- `POST /query` - Execute DuckDB SQL query (JSON response)
-- `POST /query/arrow` - Execute DuckDB SQL query (Apache Arrow columnar format)
-- `POST /query/estimate` - Estimate query cost
-- `POST /query/stream` - Stream large query results
-- `GET /query/{measurement}` - Get measurement data
-- `GET /query/{measurement}/csv` - Export measurement as CSV
-- `GET /measurements` - List all measurements/tables
+- `POST /api/v1/query` - Execute DuckDB SQL query (JSON response)
+- `POST /api/v1/query/arrow` - Execute query (Apache Arrow IPC format)
+- `POST /api/v1/query/estimate` - Estimate query cost
+- `POST /api/v1/query/stream` - Stream large query results (CSV)
+- `GET /api/v1/query/{measurement}` - Get measurement data
+- `GET /api/v1/query/{measurement}/csv` - Export measurement as CSV
+- `GET /api/v1/measurements` - List all measurements/tables
 
-### Authentication
+### Authentication & Security
 
-- `GET /auth/verify` - Verify token validity
-- `GET /auth/tokens` - List all tokens
-- `POST /auth/tokens` - Create new token
-- `GET /auth/tokens/{id}` - Get token details
-- `PATCH /auth/tokens/{id}` - Update token
-- `DELETE /auth/tokens/{id}` - Delete token
-- `POST /auth/tokens/{id}/rotate` - Rotate token (generate new)
+- `GET /api/v1/auth/verify` - Verify token validity
+- `GET /api/v1/auth/tokens` - List all tokens
+- `POST /api/v1/auth/tokens` - Create new token
+- `GET /api/v1/auth/tokens/{token_id}` - Get token details
+- `PATCH /api/v1/auth/tokens/{token_id}` - Update token
+- `DELETE /api/v1/auth/tokens/{token_id}` - Delete token
+- `POST /api/v1/auth/tokens/{token_id}/rotate` - Rotate token (generate new)
+- `GET /api/v1/auth/cache/stats` - Authentication cache statistics
+- `POST /api/v1/auth/cache/invalidate` - Invalidate auth cache
 
-### Health & Monitoring
+### Monitoring & Metrics
 
 - `GET /health` - Service health check
 - `GET /ready` - Readiness probe
-- `GET /metrics` - Prometheus metrics
-- `GET /metrics/timeseries/{type}` - Time-series metrics
-- `GET /metrics/endpoints` - Endpoint statistics
-- `GET /metrics/query-pool` - Query pool status
-- `GET /metrics/memory` - Memory profile
-- `GET /logs` - Application logs
+- `GET /api/v1/metrics` - Prometheus metrics
+- `GET /api/v1/metrics/timeseries/{metric_type}` - Time-series metrics
+- `GET /api/v1/metrics/endpoints` - Endpoint statistics
+- `GET /api/v1/metrics/query-pool` - Query pool status
+- `GET /api/v1/metrics/memory` - Memory profile
+- `GET /api/v1/logs` - Application logs
 
 ### Connection Management
 
+**Data Source Connections**:
+- `GET /api/v1/connections/datasource` - List data source connections
+- `POST /api/v1/connections/datasource` - Create connection
+- `GET /api/v1/connections/datasource/{connection_id}` - Get connection details
+
 **InfluxDB Connections**:
-- `GET /connections/influx` - List InfluxDB connections
-- `POST /connections/influx` - Create InfluxDB connection
-- `PUT /connections/influx/{id}` - Update connection
-- `DELETE /connections/{type}/{id}` - Delete connection
-- `POST /connections/{type}/{id}/activate` - Activate connection
-- `POST /connections/{type}/test` - Test connection
+- `GET /api/v1/connections/influx` - List InfluxDB connections
+- `POST /api/v1/connections/influx` - Create InfluxDB connection
+- `GET /api/v1/connections/influx/{connection_id}` - Get connection details
 
 **Storage Connections**:
-- `GET /connections/storage` - List storage backends
-- `POST /connections/storage` - Create storage connection
-- `PUT /connections/storage/{id}` - Update storage connection
+- `GET /api/v1/connections/storage` - List storage backends
+- `POST /api/v1/connections/storage` - Create storage connection
+- `GET /api/v1/connections/storage/{connection_id}` - Get storage details
+
+**HTTP/JSON Connections**:
+- `GET /api/v1/connections/http_json` - List HTTP/JSON connections
+- `POST /api/v1/connections/http_json` - Create HTTP/JSON connection
+
+**Connection Operations**:
+- `POST /api/v1/connections/{connection_type}/test` - Test connection
+- `POST /api/v1/connections/{connection_type}/{connection_id}/activate` - Activate connection
+- `DELETE /api/v1/connections/{connection_type}/{connection_id}` - Delete connection
+
+**Setup**:
+- `POST /api/v1/setup/default-connections` - Create default connections
+
+### Retention Policies
+
+- `GET /api/v1/retention` - List all retention policies
+- `POST /api/v1/retention` - Create retention policy
+- `GET /api/v1/retention/{id}` - Get policy details
+- `PUT /api/v1/retention/{id}` - Update policy
+- `DELETE /api/v1/retention/{id}` - Delete policy
+- `POST /api/v1/retention/{id}/execute` - Execute policy (manual trigger with dry-run support)
+- `GET /api/v1/retention/{id}/executions` - Get execution history
+
+See [Retention Policies Documentation](docs/retention_policies.md) for complete guide.
 
 ### Export Jobs
 
-- `GET /jobs` - List all export jobs
-- `POST /jobs` - Create new export job
-- `PUT /jobs/{id}` - Update job configuration
-- `DELETE /jobs/{id}` - Delete job
-- `GET /jobs/{id}/executions` - Get job execution history
-- `POST /jobs/{id}/run` - Run job immediately
-- `POST /jobs/{id}/cancel` - Cancel running job
-- `GET /monitoring/jobs` - Monitor job status
+- `GET /api/v1/jobs` - List all export jobs
+- `POST /api/v1/jobs` - Create new export job
+- `PUT /api/v1/jobs/{job_id}` - Update job configuration
+- `DELETE /api/v1/jobs/{job_id}` - Delete job
+- `GET /api/v1/jobs/{job_id}/executions` - Get job execution history
+- `POST /api/v1/jobs/{job_id}/run` - Run job immediately
+- `POST /api/v1/jobs/{job_id}/cancel` - Cancel running job
+- `GET /api/v1/monitoring/jobs` - Monitor job status
 
 ### HTTP/JSON Export
 
-- `POST /api/http-json/connections` - Create HTTP/JSON connection
-- `GET /api/http-json/connections` - List connections
-- `GET /api/http-json/connections/{id}` - Get connection details
-- `PUT /api/http-json/connections/{id}` - Update connection
-- `DELETE /api/http-json/connections/{id}` - Delete connection
-- `POST /api/http-json/connections/{id}/test` - Test connection
-- `POST /api/http-json/connections/{id}/discover-schema` - Discover schema
-- `POST /api/http-json/export` - Export data via HTTP
+- `GET /api/v1/http-json/connections` - List HTTP/JSON connections
+- `POST /api/v1/http-json/connections` - Create HTTP/JSON connection
+- `GET /api/v1/http-json/connections/{connection_id}` - Get connection details
+- `POST /api/v1/http-json/connections/{connection_id}/test` - Test connection
+- `POST /api/v1/http-json/connections/{connection_id}/activate` - Activate connection
+- `POST /api/v1/http-json/connections/{connection_id}/discover-schema` - Discover schema
+- `POST /api/v1/http-json/export` - Export data via HTTP
 
 ### Cache Management
 
-- `GET /cache/stats` - Cache statistics
-- `GET /cache/health` - Cache health status
-- `POST /cache/clear` - Clear query cache
+- `GET /api/v1/cache/stats` - Cache statistics
+- `GET /api/v1/cache/health` - Cache health status
+- `POST /api/v1/cache/clear` - Clear query cache
 
 ### Compaction Management
 
-- `GET /api/compaction/status` - Current compaction status
-- `GET /api/compaction/stats` - Detailed statistics
-- `GET /api/compaction/candidates` - List eligible partitions
-- `POST /api/compaction/trigger` - Manually trigger compaction
-- `GET /api/compaction/jobs` - View active jobs
-- `GET /api/compaction/history` - View job history
+- `GET /api/v1/compaction/status` - Current compaction status
+- `GET /api/v1/compaction/stats` - Detailed statistics
+- `GET /api/v1/compaction/candidates` - List eligible partitions
+- `POST /api/v1/compaction/trigger` - Manually trigger compaction
+- `GET /api/v1/compaction/jobs` - View active jobs
+- `GET /api/v1/compaction/history` - View job history
+
+### Write-Ahead Log (WAL)
+
+- `GET /api/v1/wal/status` - WAL status and configuration
+- `GET /api/v1/wal/stats` - WAL statistics
+- `GET /api/v1/wal/health` - WAL health check
+- `GET /api/v1/wal/files` - List WAL files
+- `POST /api/v1/wal/cleanup` - Clean up old WAL files
+- `GET /api/v1/wal/recovery/history` - Recovery history
+
+### Avro Schema Registry
+
+- `GET /api/v1/avro/schemas` - List all schemas
+- `GET /api/v1/avro/schemas/{schema_id}` - Get schema by ID
+- `GET /api/v1/avro/schemas/topic/{topic_name}` - Get schema by topic
 
 ### Interactive API Documentation
 
