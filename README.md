@@ -22,6 +22,7 @@
 - **High-Performance Ingestion**: MessagePack binary protocol (recommended), InfluxDB Line Protocol (drop-in replacement), JSON
 - **VSCode Extension**: Full-featured database manager with query editor, notebooks, CSV import, and alerting - [Install Now](https://marketplace.visualstudio.com/items?itemName=basekick-labs.arc-db-manager)
 - **Multi-Database Architecture**: Organize data by environment, tenant, or application with database namespaces - [Learn More](#multi-database-architecture)
+- **Retention Policies**: Time-based data lifecycle management with manual execution (automatic scheduling in enterprise edition) - [Learn More](docs/retention_policies.md)
 - **Write-Ahead Log (WAL)**: Optional durability feature for zero data loss (disabled by default) - [Learn More](docs/WAL.md)
 - **Automatic File Compaction**: Merges small Parquet files into larger ones for 10-50x faster queries (enabled by default) - [Learn More](docs/COMPACTION.md)
 - **DuckDB Query Engine**: Fast analytical queries with SQL, cross-database joins, and advanced analytics
@@ -1407,6 +1408,18 @@ sudo journalctl -u arc-api -f
 - `GET /connections/storage` - List storage backends
 - `POST /connections/storage` - Create storage connection
 - `PUT /connections/storage/{id}` - Update storage connection
+
+### Retention Policies
+
+- `GET /api/v1/retention` - List all retention policies
+- `POST /api/v1/retention` - Create retention policy
+- `GET /api/v1/retention/{id}` - Get policy details
+- `PUT /api/v1/retention/{id}` - Update policy
+- `DELETE /api/v1/retention/{id}` - Delete policy
+- `POST /api/v1/retention/{id}/execute` - Execute policy (manual trigger with dry-run support)
+- `GET /api/v1/retention/{id}/executions` - Get execution history
+
+See [Retention Policies Documentation](docs/retention_policies.md) for complete guide.
 
 ### Export Jobs
 
