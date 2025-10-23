@@ -61,7 +61,12 @@ from api.msgpack_routes import router as msgpack_router
 from api.msgpack_routes import init_arrow_buffer, start_arrow_buffer, stop_arrow_buffer
 from api.wal_routes import router as wal_router
 from api.compaction_routes import router as compaction_router, init_compaction
+<<<<<<< HEAD
 from api.delete_routes import router as delete_router  # Rewrite-based DELETE (zero overhead on writes/queries)
+=======
+# DELETE operations temporarily disabled for performance testing
+# from api.delete_routes import router as delete_router
+>>>>>>> 00377a145b8e98c258d75bc770764f88a2143a35
 from api.retention_routes import router as retention_router
 from api.query_cache import init_query_cache, get_query_cache
 
@@ -169,8 +174,14 @@ app.include_router(line_protocol_router)
 app.include_router(msgpack_router)
 app.include_router(wal_router)
 app.include_router(compaction_router)
+<<<<<<< HEAD
 app.include_router(delete_router)  # Rewrite-based DELETE (zero overhead on writes/queries)
 app.include_router(retention_router)
+=======
+app.include_router(retention_router)
+# DELETE operations temporarily disabled for performance testing
+# app.include_router(delete_router)
+>>>>>>> 00377a145b8e98c258d75bc770764f88a2143a35
 
 # Global query engine, connection manager, and scheduler
 query_engine: Optional[DuckDBEngine] = None
