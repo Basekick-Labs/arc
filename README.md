@@ -24,6 +24,7 @@
 - **Multi-Database Architecture**: Organize data by environment, tenant, or application with database namespaces - [Learn More](#multi-database-architecture)
 - **Write-Ahead Log (WAL)**: Optional durability feature for zero data loss (disabled by default) - [Learn More](docs/WAL.md)
 - **Automatic File Compaction**: Merges small Parquet files into larger ones for 10-50x faster queries (enabled by default) - [Learn More](docs/COMPACTION.md)
+- **Delete Operations**: GDPR-ready precise deletion with zero overhead on writes/queries (disabled by default) - [Learn More](docs/DELETE.md)
 - **DuckDB Query Engine**: Fast analytical queries with SQL, cross-database joins, and advanced analytics
 - **Flexible Storage Options**: Local filesystem (fastest), MinIO (distributed), AWS S3/R2 (cloud), or Google Cloud Storage
 - **Data Import**: Import data from InfluxDB, TimescaleDB, HTTP endpoints
@@ -1444,6 +1445,22 @@ sudo journalctl -u arc-api -f
 - `POST /api/compaction/trigger` - Manually trigger compaction
 - `GET /api/compaction/jobs` - View active jobs
 - `GET /api/compaction/history` - View job history
+
+### Delete Operations
+
+**Note**: Disabled by default. Set `delete.enabled=true` in `arc.conf` to enable.
+
+- `POST /api/v1/delete` - Delete data matching WHERE clause (supports dry-run)
+- `GET /api/v1/delete/config` - Get delete configuration and limits
+
+**Key Features**:
+- **Zero overhead on writes/queries**: Deleted data physically removed via file rewrites
+- **Precise deletion**: Delete any rows matching a SQL WHERE clause
+- **GDPR compliance**: Remove specific user data permanently
+- **Safety mechanisms**: Dry-run mode, confirmation thresholds, row limits
+- **Use cases**: GDPR requests, error cleanup, decommissioning hosts/sensors
+
+See [DELETE.md](docs/DELETE.md) for detailed documentation.
 
 ### Interactive API Documentation
 
