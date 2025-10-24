@@ -533,13 +533,14 @@ async def startup_event():
             from config_loader import get_config
             arc_config = get_config()
             wal_config = arc_config.get_wal_config()
+            ingestion_config = arc_config.get_ingestion_config()
 
             # Initialize parquet buffer with configuration
             # Optimized for high throughput: larger buffers, reduce flush overhead
             buffer_config = {
-                'max_buffer_size': int(os.getenv('WRITE_BUFFER_SIZE', '50000')),  # Larger = less flush overhead
-                'max_buffer_age_seconds': int(os.getenv('WRITE_BUFFER_AGE', '5')),  # Fast timeout to avoid blocking
-                'compression': os.getenv('WRITE_COMPRESSION', 'snappy'),
+                'max_buffer_size': int(os.getenv('WRITE_BUFFER_SIZE', ingestion_config.get('buffer_size', 10000))),
+                'max_buffer_age_seconds': int(os.getenv('WRITE_BUFFER_AGE', ingestion_config.get('buffer_age_seconds', 60))),
+                'compression': os.getenv('WRITE_COMPRESSION', ingestion_config.get('compression', 'snappy')),
                 'wal_enabled': wal_config.get('enabled', False),
                 'wal_config': wal_config
             }

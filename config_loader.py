@@ -311,6 +311,10 @@ class ArcConfig:
         """Get compaction configuration"""
         return self.config.get("compaction", {})
 
+    def get_ingestion_config(self) -> Dict[str, Any]:
+        """Get data ingestion configuration"""
+        return self.config.get("ingestion", {})
+
     def dump(self) -> Dict[str, Any]:
         """Get complete configuration (for debugging)"""
         return self.config.copy()
