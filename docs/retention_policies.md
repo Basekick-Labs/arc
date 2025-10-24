@@ -138,7 +138,7 @@ GET /api/v1/retention/{policy_id}/executions?limit=50
 
 ### Physical File Deletion
 
-Retention policies work by **physically deleting Parquet files** from storage. Unlike row-level deletion (which uses tombstones), retention:
+Retention policies work by **physically deleting Parquet files** from storage. Unlike row-level deletion (which rewrites files), retention:
 
 1. **Scans Parquet files** in the measurement directory
 2. **Reads file metadata** to find the maximum timestamp in each file
@@ -360,7 +360,7 @@ curl http://localhost:8000/api/v1/retention/1/executions \
 
 Retention policies are designed for **zero impact** on normal operations:
 
-- **Write performance:** No overhead (no hashing, no tombstones)
+- **Write performance:** No overhead (physical file deletion only)
 - **Query performance:** No overhead (deleted files don't exist)
 - **Execution time:** ~1-2ms per Parquet file analyzed
 - **Deletion:** Instant (os.unlink)
