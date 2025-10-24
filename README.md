@@ -22,10 +22,11 @@
 - **High-Performance Ingestion**: MessagePack binary protocol (recommended), InfluxDB Line Protocol (drop-in replacement), JSON
 - **VSCode Extension**: Full-featured database manager with query editor, notebooks, CSV import, and alerting - [Install Now](https://marketplace.visualstudio.com/items?itemName=basekick-labs.arc-db-manager)
 - **Multi-Database Architecture**: Organize data by environment, tenant, or application with database namespaces - [Learn More](#multi-database-architecture)
-- **Retention Policies**: Time-based data lifecycle management with manual execution (automatic scheduling in enterprise edition) - [Learn More](docs/retention_policies.md)
+- **Continuous Queries**: Manual downsampling and aggregation for materialized views (automatic scheduling in enterprise edition) - [Learn More](docs/CONTINUOUS_QUERIES.md)
+- **Retention Policies**: Time-based data lifecycle management with manual execution (automatic scheduling in enterprise edition) - [Learn More](docs/RETENTION_POLICIES.md)
 - **Write-Ahead Log (WAL)**: Optional durability feature for zero data loss (disabled by default) - [Learn More](docs/WAL.md)
 - **Automatic File Compaction**: Merges small Parquet files into larger ones for 10-50x faster queries (enabled by default) - [Learn More](docs/COMPACTION.md)
-- **Delete Operations**: GDPR-ready precise deletion with zero overhead on writes/queries (disabled by default) - [Learn More](docs/DELETE.md)
+- **Delete Operations**: GDPR-ready precise deletion with zero overhead on writes/queries using rewrite-based approach - [Learn More](docs/DELETE.md)
 - **DuckDB Query Engine**: Fast analytical queries with SQL, cross-database joins, and advanced analytics
 - **Flexible Storage Options**: Local filesystem (fastest), MinIO (distributed), AWS S3/R2 (cloud), or Google Cloud Storage
 - **Data Import**: Import data from InfluxDB, TimescaleDB, HTTP endpoints
@@ -1434,7 +1435,25 @@ sudo journalctl -u arc-api -f
 - `POST /api/v1/retention/{id}/execute` - Execute policy (manual trigger with dry-run support)
 - `GET /api/v1/retention/{id}/executions` - Get execution history
 
-See [Retention Policies Documentation](docs/retention_policies.md) for complete guide.
+See [Retention Policies Documentation](docs/RETENTION_POLICIES.md) for complete guide.
+
+### Continuous Queries
+
+- `GET /api/v1/continuous_queries` - List all continuous queries
+- `POST /api/v1/continuous_queries` - Create continuous query
+- `GET /api/v1/continuous_queries/{id}` - Get query details
+- `PUT /api/v1/continuous_queries/{id}` - Update query
+- `DELETE /api/v1/continuous_queries/{id}` - Delete query
+- `POST /api/v1/continuous_queries/{id}/execute` - Execute query manually (with dry-run support)
+- `GET /api/v1/continuous_queries/{id}/executions` - Get execution history
+
+**Use Cases:**
+- **Downsampling**: Aggregate high-resolution data (10s → 1m → 1h → 1d retention tiers)
+- **Materialized Views**: Pre-compute aggregations for faster dashboard queries
+- **Summary Tables**: Create daily/hourly summaries for long-term analysis
+- **Storage Optimization**: Reduce storage by aggregating old data
+
+See [Continuous Queries Documentation](docs/CONTINUOUS_QUERIES.md) for complete guide with SQL examples.
 
 ### Export Jobs
 
