@@ -315,6 +315,10 @@ class ArcConfig:
         """Get data ingestion configuration"""
         return self.config.get("ingestion", {})
 
+    def get_telemetry_config(self) -> Dict[str, Any]:
+        """Get telemetry configuration"""
+        return self.config.get("telemetry", {})
+
     def dump(self) -> Dict[str, Any]:
         """Get complete configuration (for debugging)"""
         return self.config.copy()

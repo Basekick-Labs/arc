@@ -65,6 +65,7 @@ from api.delete_routes import router as delete_router  # Rewrite-based DELETE (z
 from api.retention_routes import router as retention_router
 from api.continuous_query_routes import router as continuous_query_router
 from api.query_cache import init_query_cache, get_query_cache
+from telemetry import TelemetryCollector, TelemetrySender
 
 # Setup structured logging
 setup_logging(
@@ -180,6 +181,7 @@ connection_manager = ConnectionManager(db_path=get_db_path())
 export_scheduler = ExportScheduler()
 metrics_collector = get_metrics_collector()
 logs_manager = get_logs_manager()
+telemetry_sender: Optional[TelemetrySender] = None
 
 # Primary worker detection (for log reduction in multi-worker setups)
 _primary_worker_lock_fd = None
@@ -617,6 +619,34 @@ async def startup_event():
     else:
         log_startup("Query cache disabled")
 
+    # Initialize telemetry (only on primary worker to avoid duplicate sends)
+    global telemetry_sender
+    if is_verbose and _is_primary_worker:
+        try:
+            telemetry_config = arc_config.get_telemetry_config()
+            telemetry_enabled = telemetry_config.get('enabled', True)
+            telemetry_endpoint = telemetry_config.get('endpoint', 'https://telemetry.basekick.net/api/v1/telemetry')
+            telemetry_interval = telemetry_config.get('interval_hours', 24)
+
+            if telemetry_enabled:
+                storage_config = arc_config.get_storage_config()
+                data_dir = storage_config.get('local', {}).get('base_path', './data/arc')
+
+                telemetry_collector = TelemetryCollector(data_dir=data_dir)
+                telemetry_sender = TelemetrySender(
+                    collector=telemetry_collector,
+                    endpoint=telemetry_endpoint,
+                    interval_hours=telemetry_interval,
+                    enabled=True
+                )
+                telemetry_sender.start()
+                log_startup(f"Telemetry enabled: sending to {telemetry_endpoint} every {telemetry_interval}h")
+                log_startup(f"Instance ID: {telemetry_collector.instance_id[:8]}... (to disable: set telemetry.enabled=false in arc.conf)")
+            else:
+                log_startup("Telemetry disabled by configuration")
+        except Exception as e:
+            logger.warning(f"Failed to initialize telemetry: {e}")
+
     # Check for first run and generate initial token if needed
     if AUTH_ENABLED:
         initial_token = auth_manager.ensure_initial_token()
@@ -651,7 +681,7 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
-    global _primary_worker_lock_fd, _is_primary_worker
+    global _primary_worker_lock_fd, _is_primary_worker, telemetry_sender
 
     # Release primary worker lock if we own it
     if _is_primary_worker and _primary_worker_lock_fd is not None:
@@ -665,6 +695,14 @@ async def shutdown_event():
 
     if query_engine:
         query_engine.close()
+
+    # Stop telemetry sender
+    if telemetry_sender:
+        try:
+            await telemetry_sender.stop()
+            logger.info("Telemetry sender stopped")
+        except Exception as e:
+            logger.warning(f"Error stopping telemetry sender: {e}")
 
     # Stop the export scheduler
     export_scheduler.stop_scheduler()
