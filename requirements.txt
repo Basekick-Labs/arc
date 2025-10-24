@@ -20,10 +20,9 @@ httptools==0.6.4  # 40% faster HTTP parser
 orjson==3.10.13  # 20-50% faster JSON serialization (Rust + SIMD)
 
 # Storage and query engine
-# Note: boto3, aiobotocore, and botocore versions must be compatible with s3fs
-boto3==1.35.81
-botocore==1.35.81
-aiobotocore==2.16.1
+# Note: boto3, aiobotocore, and botocore versions must be compatible
+boto3
+aiobotocore
 s3fs==2024.12.0
 google-cloud-storage==3.4.1
 duckdb==1.4.1
