@@ -472,9 +472,13 @@ class ArrowParquetBuffer:
                     del self.buffer_start_times[measurement]
 
         # OPTIMIZATION: Flush outside lock - allows concurrent writes during flush
-        # OPTIMIZATION: Batched writes - write all measurements to single file
+        # OPTIMIZATION: Parallel flushes - flush multiple measurements concurrently
         if records_to_flush:
-            await self._flush_batched(records_to_flush)
+            flush_tasks = [
+                self._flush_records(measurement, flush_records)
+                for measurement, flush_records in records_to_flush.items()
+            ]
+            await asyncio.gather(*flush_tasks, return_exceptions=True)
 
     async def _periodic_flush(self):
         """Background task that periodically flushes old buffers"""
@@ -506,9 +510,13 @@ class ArrowParquetBuffer:
                             del self.buffer_start_times[measurement]
 
                 # OPTIMIZATION: Flush outside lock - allows concurrent writes
-                # OPTIMIZATION: Batched writes - write all measurements to single file
+                # OPTIMIZATION: Parallel flushes - flush multiple measurements concurrently
                 if records_to_flush:
-                    await self._flush_batched(records_to_flush)
+                    flush_tasks = [
+                        self._flush_records(measurement, flush_records)
+                        for measurement, flush_records in records_to_flush.items()
+                    ]
+                    await asyncio.gather(*flush_tasks, return_exceptions=True)
 
             except asyncio.CancelledError:
                 break
