@@ -472,8 +472,9 @@ class ArrowParquetBuffer:
                     del self.buffer_start_times[measurement]
 
         # OPTIMIZATION: Flush outside lock - allows concurrent writes during flush
-        for measurement, flush_records in records_to_flush.items():
-            await self._flush_records(measurement, flush_records)
+        # OPTIMIZATION: Batched writes - write all measurements to single file
+        if records_to_flush:
+            await self._flush_batched(records_to_flush)
 
     async def _periodic_flush(self):
         """Background task that periodically flushes old buffers"""
@@ -505,8 +506,9 @@ class ArrowParquetBuffer:
                             del self.buffer_start_times[measurement]
 
                 # OPTIMIZATION: Flush outside lock - allows concurrent writes
-                for measurement, flush_records in records_to_flush.items():
-                    await self._flush_records(measurement, flush_records)
+                # OPTIMIZATION: Batched writes - write all measurements to single file
+                if records_to_flush:
+                    await self._flush_batched(records_to_flush)
 
             except asyncio.CancelledError:
                 break
@@ -537,6 +539,7 @@ class ArrowParquetBuffer:
         OPTIMIZATION: Supports both row format and columnar format.
         Columnar format bypasses row→column conversion (25-35% faster).
         """
+        import asyncio
         import tempfile
         import os
         from datetime import datetime
@@ -569,8 +572,15 @@ class ArrowParquetBuffer:
                     tmp_path = Path(tmp_file.name)
 
                 try:
-                    # Use Direct Arrow writer with columnar data (zero-copy)
-                    success = self.writer.write_parquet_columnar(columns, tmp_path, measurement)
+                    # OPTIMIZATION: Run PyArrow write in executor to avoid blocking event loop
+                    loop = asyncio.get_event_loop()
+                    success = await loop.run_in_executor(
+                        None,
+                        self.writer.write_parquet_columnar,
+                        columns,
+                        tmp_path,
+                        measurement
+                    )
 
                     if success:
                         await self.storage_backend.upload_file(tmp_path, remote_path, database_override=database_override)
@@ -628,8 +638,15 @@ class ArrowParquetBuffer:
                 tmp_path = Path(tmp_file.name)
 
             try:
-                # Use Direct Arrow writer (bypasses DataFrame)
-                success = self.writer.write_parquet(records, tmp_path, measurement)
+                # OPTIMIZATION: Run PyArrow write in executor to avoid blocking event loop
+                loop = asyncio.get_event_loop()
+                success = await loop.run_in_executor(
+                    None,
+                    self.writer.write_parquet,
+                    records,
+                    tmp_path,
+                    measurement
+                )
 
                 if success:
                     # Upload to storage (with optional database override)
@@ -679,8 +696,13 @@ class ArrowParquetBuffer:
                         del self.buffer_start_times[measurement]
 
         # Flush outside lock
-        for measurement, flush_records in records_to_flush.items():
-            await self._flush_records(measurement, flush_records)
+        # OPTIMIZATION: Parallel flushes - flush all measurements concurrently
+        if records_to_flush:
+            flush_tasks = [
+                self._flush_records(measurement, flush_records)
+                for measurement, flush_records in records_to_flush.items()
+            ]
+            await asyncio.gather(*flush_tasks, return_exceptions=True)
 
     def _merge_columnar_records(self, records: List[Dict[str, Any]]) -> Dict[str, List]:
         """
