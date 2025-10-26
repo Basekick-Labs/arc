@@ -1250,11 +1250,13 @@ Arc Core has been benchmarked using [ClickBench](https://github.com/ClickHouse/C
 ### ClickBench Results
 
 **Hardware: AWS c6a.4xlarge** (16 vCPU AMD EPYC 7R13, 32GB RAM, 500GB gp2)
-- **Cold Run Total**: 35.18s (sum of 43 queries, first execution)
-- **Hot Run Average**: 0.81s (average per query after caching)
-- **Aggregate Performance**: ~2.8M rows/sec cold, ~123M rows/sec hot (across all queries)
-- **Storage**: MinIO (S3-compatible)
+- **Cold Run Total**: 120.25s (sum of 43 queries, first execution with proper cache flushing)
+- **Warm Run Total**: 35.70s (sum of 43 queries, best of 3 runs)
+- **Cold/Warm Ratio**: 3.37x (proper cache flushing verification)
+- **Storage**: 13.76 GB Parquet (Snappy compression)
 - **Success Rate**: 43/43 queries (100%)
+- **vs QuestDB**: 1.80x faster cold, 1.20x faster warm
+- **vs TimescaleDB**: 9.39x faster cold, 12.39x faster warm
 
 **Hardware: Apple M3 Max** (14 cores ARM, 36GB RAM)
 - **Cold Run Total**: 22.64s (sum of 43 queries, first execution)
@@ -1298,7 +1300,7 @@ Arc Core has been benchmarked using [ClickBench](https://github.com/ClickHouse/C
 - Caching: Disabled for benchmark compliance
 - Tuning: None (default DuckDB settings)
 
-See full results and methodology at [ClickBench Results](https://github.com/ClickHouse/ClickBench) (Arc submission pending).
+See full results and methodology at [ClickBench Results](https://benchmark.clickhouse.com) and [Arc's ClickBench repository](https://github.com/Basekick-Labs/ClickBench/tree/main/arc).
 
 ## Docker Services
 
