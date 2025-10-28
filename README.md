@@ -6,12 +6,12 @@
 
 <p align="center">
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img src="https://img.shields.io/badge/License-AGPL%203.0-blue.svg" alt="License: AGPL-3.0"/></a>
-  <a href="https://github.com/basekick-labs/arc-core"><img src="https://img.shields.io/badge/Throughput-2.42M%20RPS-brightgreen.svg" alt="Performance"/></a>
+  <a href="https://github.com/basekick-labs/arc-core"><img src="https://img.shields.io/badge/Throughput-2.4M%20RPS-brightgreen.svg" alt="Performance"/></a>
   <a href="https://discord.gg/nxnWfUxsdm"><img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2?logo=discord&logoColor=white" alt="Discord"/></a>
 </p>
 
 <p align="center">
-  Complete observability database: 2.45M metrics/sec + 955K logs/sec + 944K traces/sec + 938K events/sec. One endpoint. One protocol.
+  High-performance time-series database. 2.4M metrics/sec + 950K logs/sec + 940K traces/sec + 940K events/sec. One endpoint, one protocol. DuckDB + Parquet + Arrow. AGPL-3.0
 </p>
 
 > **Alpha Release - Technical Preview**
@@ -19,29 +19,29 @@
 
 ## Features
 
-- **Universal Ingestion**: One endpoint for metrics (2.45M/sec), logs (955K/sec), IoT data, and events - MessagePack columnar protocol
-- **High-Performance Protocols**: MessagePack binary (recommended), InfluxDB Line Protocol (drop-in replacement), JSON
-- **VSCode Extension**: Full-featured database manager with query editor, notebooks, CSV import, and alerting - [Install Now](https://marketplace.visualstudio.com/items?itemName=basekick-labs.arc-db-manager)
+- **High-Throughput Ingestion**: One endpoint for any timestamped columnar data - metrics, logs, traces, events, IoT sensors, analytics
+- **Unified Protocol**: MessagePack columnar format (2.4M/sec) or InfluxDB Line Protocol (240K/sec) for compatibility
+- **Columnar Storage**: Parquet files with compression (3-5x compression ratios), optimized for analytical queries
+- **DuckDB Query Engine**: Fast SQL analytics with window functions, joins, aggregations, and time-series operations
+- **Flexible Storage**: Local filesystem, MinIO, AWS S3/R2, Google Cloud Storage, or any S3-compatible backend
 - **Multi-Database Architecture**: Organize data by environment, tenant, or application with database namespaces - [Learn More](#multi-database-architecture)
-- **Continuous Queries**: Manual downsampling and aggregation for materialized views (automatic scheduling in enterprise edition) - [Learn More](docs/CONTINUOUS_QUERIES.md)
-- **Retention Policies**: Time-based data lifecycle management with manual execution (automatic scheduling in enterprise edition) - [Learn More](docs/RETENTION_POLICIES.md)
-- **Write-Ahead Log (WAL)**: Optional durability feature for zero data loss (disabled by default) - [Learn More](docs/WAL.md)
-- **Automatic File Compaction**: Merges small Parquet files into larger ones for 10-50x faster queries (enabled by default) - [Learn More](docs/COMPACTION.md)
-- **Delete Operations**: GDPR-ready precise deletion with zero overhead on writes/queries using rewrite-based approach - [Learn More](docs/DELETE.md)
-- **DuckDB Query Engine**: Fast analytical queries with SQL, cross-database joins, and advanced analytics
-- **Flexible Storage Options**: Local filesystem (fastest), MinIO (distributed), AWS S3/R2 (cloud), or Google Cloud Storage
-- **Data Import**: Import data from InfluxDB, TimescaleDB, HTTP endpoints
-- **Query Caching**: Configurable result caching for improved performance
-- **Apache Superset Integration**: Native dialect for BI dashboards with multi-database schema support
-- **Production Ready**: Docker deployment with health checks and monitoring
+- **VSCode Extension**: Full-featured database manager with query editor, notebooks, CSV import, and alerting - [Install Now](https://marketplace.visualstudio.com/items?itemName=basekick-labs.arc-db-manager)
+- **Continuous Queries**: Downsampling and materialized views for long-term data aggregation - [Learn More](docs/CONTINUOUS_QUERIES.md)
+- **Retention Policies**: Time-based data lifecycle management with automatic cleanup - [Learn More](docs/RETENTION_POLICIES.md)
+- **Automatic File Compaction**: Merges small files into optimized 512MB files for 10-50x faster queries - [Learn More](docs/COMPACTION.md)
+- **Write-Ahead Log (WAL)**: Optional durability feature for zero data loss (disabled by default for max throughput) - [Learn More](docs/WAL.md)
+- **Delete Operations**: GDPR-compliant precise deletion with zero overhead on writes/queries - [Learn More](docs/DELETE.md)
+- **Query Caching**: Configurable result caching for repeated analytical queries
+- **Apache Superset Integration**: Native dialect for BI dashboards and visualizations
+- **Production Ready**: Docker and native deployment with health checks and monitoring
 
 ## Performance Benchmarks
 
-Arc is a **universal time-series database** that ingests metrics, logs, IoT data, and events through a unified MessagePack columnar protocol.
+Arc ingests any timestamped columnar data through a unified MessagePack protocol - metrics, logs, traces, events, IoT sensors, or analytics.
 
-### Complete Observability Performance
+### Four Data Types, One Platform
 
-Arc is the **only** unified observability database with near-million RPS across all four pillars:
+Near-million RPS performance across all data types:
 
 | Data Type | Throughput | What it tracks | Latency (p99) |
 |-----------|------------|----------------|---------------|
@@ -54,7 +54,7 @@ Arc is the **only** unified observability database with near-million RPS across 
 
 **Total Capacity**: **~5.3 million records/sec** combined throughput
 
-**One endpoint. One protocol. Four pillars. Complete observability.**
+**One endpoint. One protocol. Any timestamped data.**
 
 ### Write Performance - Format Comparison
 
