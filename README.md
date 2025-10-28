@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  Universal time-series database: 2.45M metrics/sec + 955K logs/sec. One endpoint. One protocol. DuckDB + Parquet + Arrow.
+  Complete observability database: 2.45M metrics/sec + 955K logs/sec + 944K traces/sec + 938K events/sec. One endpoint. One protocol.
 </p>
 
 > **Alpha Release - Technical Preview**
@@ -39,16 +39,22 @@
 
 Arc is a **universal time-series database** that ingests metrics, logs, IoT data, and events through a unified MessagePack columnar protocol.
 
-### Unified Ingestion Performance
+### Complete Observability Performance
 
-| Data Type | Throughput | Use Case | Latency (p99) |
-|-----------|------------|----------|---------------|
-| **Metrics** | **2.45M/sec** | System metrics, IoT sensors, business events | 18-45ms |
-| **Logs** | **955K/sec** | Application logs, access logs, audit logs | 48ms - 1.8s* |
+Arc is the **only** unified observability database with near-million RPS across all four pillars:
 
-*Log latency is tunable based on batch size: 1K logs (48ms) for real-time alerts, 20K logs (1.8s) for maximum throughput
+| Data Type | Throughput | What it tracks | Latency (p99) |
+|-----------|------------|----------------|---------------|
+| **Metrics** | **2.45M/sec** | System state, IoT sensors, measurements | 18-45ms |
+| **Logs** | **955K/sec** | Application events, access logs, audit trails | 48ms - 1.8s* |
+| **Traces** | **944K/sec** | Request flows, distributed tracing, spans | 105ms - 2.1s* |
+| **Events** | **938K/sec** | State changes, deployments, incidents | 413ms - 2.0s* |
 
-**One endpoint. One protocol. Multiple data types.**
+*Latency is tunable based on batch size: smaller batches = lower latency, larger batches = higher throughput
+
+**Total Capacity**: **~5.3 million records/sec** combined throughput
+
+**One endpoint. One protocol. Four pillars. Complete observability.**
 
 ### Write Performance - Format Comparison
 
@@ -104,6 +110,109 @@ Arc also handles **high-volume log ingestion** using the same MessagePack column
 - [Log Ingestion Documentation](docs/LOG_INGESTION.md) - Complete guide to using Arc for logs
 - [Load Testing Guide](docs/LOAD_TESTING.md) - Benchmark your Arc instance
 - [Synthetic Logs Load Test Script](scripts/synthetic_logs_load_test.py) - Ready-to-use load testing tool
+
+### Distributed Traces Ingestion Performance
+
+Arc completes the observability triangle with **high-performance distributed tracing**:
+
+| Batch Size | Throughput | p50 Latency | p99 Latency | Use Case |
+|------------|------------|-------------|-------------|----------|
+| **20,000 spans** | **944K spans/sec** | 162.2ms | 2093.7ms | Maximum throughput |
+| **5,000 spans** | **99K spans/sec** | 32.8ms | 105.9ms | Low latency tracing |
+
+**Trace Schema Example** (columnar format):
+```python
+{
+    "m": "distributed_traces",
+    "columns": {
+        "time": [timestamp1, timestamp2, ...],
+        "trace_id": ["abc123", "abc123", ...],      # Links related spans
+        "span_id": ["span-001", "span-002", ...],
+        "parent_span_id": ["", "span-001", ...],    # Parent-child relationships
+        "service_name": ["api-gateway", "auth-service", ...],
+        "operation_name": ["POST /orders", "verify_token", ...],
+        "span_kind": ["server", "client", ...],     # OpenTelemetry standard
+        "duration_ns": [250000000, 15000000, ...],  # Nanoseconds
+        "status_code": [200, 200, ...],
+        "error": [false, false, ...]
+    }
+}
+```
+
+**Comparison with Other Tracing Systems:**
+- **9x faster** than Jaeger (944K vs ~100K spans/sec)
+- **9-18x faster** than Tempo (944K vs ~50-100K spans/sec)
+- **9x faster** than SigNoz (944K vs ~100K spans/sec)
+- **Unified storage** with metrics and logs for complete correlation
+
+**What makes Arc unique for traces:**
+- Same MessagePack columnar protocol as metrics/logs
+- Correlate traces with metrics and logs via SQL joins
+- OpenTelemetry-compatible span model
+- Parent-child span relationships preserved
+- 60 million spans in 60 seconds with zero errors
+
+**Learn More:**
+- [Traces Ingestion Documentation](docs/TRACES_INGESTION.md) - Complete guide to distributed tracing with Arc
+- [Load Testing Guide](docs/LOAD_TESTING.md) - Benchmark traces ingestion
+- [Synthetic Traces Load Test Script](scripts/synthetic_traces_load_test.py) - Test distributed tracing performance
+
+### Events Ingestion Performance
+
+Arc completes the observability suite with **events** - the fourth pillar that answers "What changed?":
+
+| Batch Size | Throughput | p50 Latency | p99 Latency | Use Case |
+|------------|------------|-------------|-------------|----------|
+| **20,000 events** | **938K events/sec** | 154.8ms | 2010.5ms | Maximum throughput |
+| **10,000 events** | **489K events/sec** | 26.0ms | 413.1ms | Balanced performance |
+
+**Event Schema Example** (columnar format):
+```python
+{
+    "m": "system_events",
+    "columns": {
+        "time": [timestamp1, timestamp2, ...],
+        "event_type": ["deployment_started", "user_signup", ...],
+        "event_category": ["infrastructure", "business", "security", "application"],
+        "severity": ["info", "warning", "error", "critical"],
+        "source": ["kubernetes", "app-backend", ...],
+        "user_id": ["user-123", "", ...],
+        "resource_id": ["deployment-456", "order-789", ...],
+        "metadata": ['{"version":"v1.2.3"}', '{"plan":"premium"}', ...],  # JSON
+        "duration_ms": [0, 5000, ...],
+        "success": [true, false, ...],
+        "amount": [0.0, 29.99, ...]  # For business events
+    }
+}
+```
+
+**Event Categories:**
+- **Infrastructure**: Deployments, scaling, failovers, config changes
+- **Business**: Signups, payments, subscriptions, orders
+- **Security**: Auth attempts, rate limits, violations
+- **Application**: Jobs, circuit breakers, health checks
+
+**Why Events Matter:**
+
+Events provide **root cause analysis** by correlating with other telemetry:
+
+```sql
+-- "Why did CPU spike at 14:32?"
+-- Answer: Deployment started at 14:32!
+SELECT
+    e.time, e.event_type, m.value as cpu
+FROM system_events e
+JOIN cpu_metrics m ON m.time BETWEEN e.time AND e.time + e.duration_ms
+WHERE e.event_category = 'infrastructure'
+    AND m.value > 80;
+```
+
+**60 million events in 60 seconds** with zero errors. Complete observability: Metrics + Logs + Traces + Events.
+
+**Learn More:**
+- [Events Ingestion Documentation](docs/EVENTS_INGESTION.md) - Complete guide to events with Arc
+- [Load Testing Guide](docs/LOAD_TESTING.md) - Benchmark events ingestion
+- [Synthetic Events Load Test Script](scripts/synthetic_events_load_test.py) - Test events performance
 
 ### Authentication Performance
 

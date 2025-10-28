@@ -7,6 +7,7 @@ Arc includes comprehensive load testing tools to benchmark ingestion performance
 - [Overview](#overview)
 - [Metrics Load Testing](#metrics-load-testing)
 - [Logs Load Testing](#logs-load-testing)
+- [Traces Load Testing](#traces-load-testing)
 - [Understanding Results](#understanding-results)
 - [Performance Tuning](#performance-tuning)
 - [Hardware Monitoring](#hardware-monitoring)
@@ -16,12 +17,13 @@ Arc includes comprehensive load testing tools to benchmark ingestion performance
 
 ## Overview
 
-Arc provides two specialized load testing scripts:
+Arc provides three specialized load testing scripts for complete observability testing:
 
 1. **[`scripts/metrics_load_test.py`](../scripts/metrics_load_test.py)** - For testing metrics ingestion (2.45M+ metrics/sec)
 2. **[`scripts/synthetic_logs_load_test.py`](../scripts/synthetic_logs_load_test.py)** - For testing log ingestion (955K+ logs/sec)
+3. **[`scripts/synthetic_traces_load_test.py`](../scripts/synthetic_traces_load_test.py)** - For testing distributed traces (944K+ spans/sec)
 
-Both scripts:
+All scripts:
 - Pre-generate and compress data in memory for minimal overhead
 - Use async workers with connection pooling
 - Provide real-time RPS and latency monitoring
@@ -340,6 +342,172 @@ Arc achieved **955,179 logs/second** using this script:
 - **955K logs/sec** sustained
 - **60 million logs** in 60 seconds
 - **p99 latency**: 1827ms
+- **Zero errors**
+
+---
+
+## Traces Load Testing
+
+### Script Location
+
+[`scripts/synthetic_traces_load_test.py`](../scripts/synthetic_traces_load_test.py)
+
+### Features
+
+- Pre-generates realistic distributed traces with span hierarchies
+- 20 simulated microservices with realistic operation names
+- Parent-child span relationships (30% of spans have parents)
+- OpenTelemetry-compliant span kinds (server, client, internal, producer, consumer)
+- Realistic duration distribution (1ms-500ms based on operation type)
+- HTTP metadata for server/client spans
+- 5% error rate with increased latency for failures
+
+### Basic Usage
+
+```bash
+# Test with 100K spans/sec for 30 seconds
+./scripts/synthetic_traces_load_test.py \
+    --token YOUR_API_TOKEN \
+    --database traces \
+    --rps 100000 \
+    --duration 30
+
+# High-throughput test - 944K spans/sec
+./scripts/synthetic_traces_load_test.py \
+    --token YOUR_API_TOKEN \
+    --database traces \
+    --rps 1000000 \
+    --duration 60 \
+    --batch-size 20000 \
+    --workers 600
+```
+
+### Command-Line Options
+
+```
+Required:
+  --token TOKEN          API authentication token
+
+Optional:
+  --database NAME        Database name (default: traces)
+  --rps RPS              Target spans per second (default: 100000)
+  --duration SECONDS     Test duration in seconds (default: 30)
+  --batch-size SIZE      Spans per batch (default: 1000)
+  --workers NUM          Concurrent workers (default: auto-calculated)
+  --num-services NUM     Number of simulated services (default: 20)
+```
+
+### Example Output
+
+```
+🔄 Pre-generating 500 trace batches (10,000,000 spans)
+  Progress: 500/500 (3 batches/sec)
+✅ Pre-generation complete!
+   Time taken: 146.1s
+   Total batches: 500
+   Total spans: 10,000,000
+   Avg compressed size: 506.9 KB
+   Total size: 247.5 MB
+
+================================================================================
+Arc Synthetic Traces Load Test - MessagePack Columnar Format
+================================================================================
+Target RPS:      1,000,000 spans/sec
+Batch Size:      20,000 spans/batch
+Duration:        60s
+Database:        traces
+Services:        20
+Pre-generated:   500 batches in memory
+Protocol:        MessagePack + Direct Arrow/Parquet
+Arc URL:         http://localhost:8000/api/v1/write/msgpack
+================================================================================
+
+[   5.0s] RPS: 1200000 (target: 1000000) | Total:    6,000,000 | Errors:      0
+[  10.0s] RPS:  800000 (target: 1000000) | Total:   10,000,000 | Errors:      0
+[  15.0s] RPS: 1000000 (target: 1000000) | Total:   15,000,000 | Errors:      0
+...
+[  60.0s] RPS: 1000000 (target: 1000000) | Total:   60,000,000 | Errors:      0
+
+================================================================================
+Test Complete
+================================================================================
+Duration:        63.5s
+Total Sent:      60,000,000 spans
+Total Errors:    0
+Success Rate:    100.00%
+Actual RPS:      944,253 spans/sec
+Target RPS:      1,000,000 spans/sec
+Achievement:     94.4%
+
+Latency Percentiles (ms):
+  p50:  162.15
+  p95:  1861.69
+  p99:  2093.71
+  p999: 2103.43
+================================================================================
+```
+
+### Trace Data Schema
+
+The script generates OpenTelemetry-compatible traces:
+
+```python
+{
+    "m": "distributed_traces",
+    "columns": {
+        "time": [timestamp],                          # millisecond timestamps
+        "trace_id": ["abc123"],                       # groups related spans
+        "span_id": ["span-001"],                      # unique span ID
+        "parent_span_id": [""],                       # parent span (empty = root)
+        "service_name": ["api-gateway"],
+        "operation_name": ["POST /orders"],
+        "span_kind": ["server"],                      # server, client, internal, producer, consumer
+        "duration_ns": [250000000],                   # duration in nanoseconds
+        "status_code": [200],
+        "http_method": ["POST"],
+        "environment": ["production"],
+        "region": ["us-east-1"],
+        "error": [false]
+    }
+}
+```
+
+**Simulated Services:**
+- api-gateway, auth-service, user-service
+- product-service, order-service, payment-service
+- inventory-service, notification-service, email-service
+- database-service, cache-service, queue-service
+- And more...
+
+**Span Hierarchy Example:**
+30% of spans have a parent, creating realistic trace trees:
+```
+api-gateway (root span)
+├── auth-service (child of root)
+├── order-service (child of root)
+│   ├── inventory-service (child of order-service)
+│   └── payment-service (child of order-service)
+└── notification-service (child of root)
+```
+
+### Peak Performance
+
+Arc achieved **944,253 spans/second** using this script:
+
+```bash
+./scripts/synthetic_traces_load_test.py \
+    --token YOUR_TOKEN \
+    --database traces \
+    --rps 1000000 \
+    --duration 60 \
+    --batch-size 20000 \
+    --workers 600
+```
+
+**Results:**
+- **944K spans/sec** sustained
+- **60 million spans** in 60 seconds
+- **p99 latency**: 2093ms
 - **Zero errors**
 
 ---
