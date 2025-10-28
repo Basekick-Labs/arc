@@ -30,15 +30,16 @@ class SQLiteConnectionPool:
     def _create_connection(self) -> Optional[sqlite3.Connection]:
         """Create a new SQLite connection with optimizations"""
         try:
+            # Use longer timeout for initial connection (handles multi-worker startup contention)
             conn = sqlite3.connect(
                 self.db_path,
                 check_same_thread=False,  # Allow use across threads
-                timeout=self.timeout
+                timeout=60.0  # Longer timeout for startup race conditions
             )
             # Enable WAL mode for better concurrency
             conn.execute("PRAGMA journal_mode=WAL")
-            # Set busy timeout
-            conn.execute(f"PRAGMA busy_timeout={self.timeout * 1000}")
+            # Set busy timeout (in milliseconds)
+            conn.execute(f"PRAGMA busy_timeout={60000}")  # 60 seconds
             # Increase cache size
             conn.execute("PRAGMA cache_size=10000")
             conn.row_factory = sqlite3.Row  # Enable dict-like access
