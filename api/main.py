@@ -31,9 +31,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from .models import (
-    InfluxDBConnectionCreate, InfluxDBConnectionResponse,
     StorageConnectionCreate, StorageConnectionResponse,
-    ExportJobCreate, ExportJobResponse,
     QueryRequest, QueryResponse,
     ConnectionTestRequest, ConnectionTestResponse,
     HealthResponse, ReadinessResponse,
@@ -44,8 +42,7 @@ from .models import (
 from config import ArcConfig
 from api.duckdb_engine import DuckDBEngine
 from api.config import get_db_path
-from api.database import ConnectionManager
-from api.scheduler import ExportScheduler
+from api.storage_manager import StorageManager
 from storage.s3_backend import S3Backend
 from api.logging_config import (
     setup_logging, get_logger, RequestIdMiddleware,
@@ -54,7 +51,6 @@ from api.logging_config import (
 from api.monitoring import get_metrics_collector, get_memory_profile
 from api.logs_endpoint import get_logs_manager
 from api.auth import AuthManager, AuthMiddleware
-from api.http_json_routes import router as http_json_router
 from api.line_protocol_routes import router as line_protocol_router
 from api.line_protocol_routes import init_parquet_buffer, start_parquet_buffer, stop_parquet_buffer
 from api.msgpack_routes import router as msgpack_router
@@ -166,7 +162,6 @@ if default_token:
 app.middleware("http")(AuthMiddleware(auth_manager, enabled=AUTH_ENABLED, allowlist=AUTH_ALLOWLIST))
 
 # Include routers
-app.include_router(http_json_router)
 app.include_router(line_protocol_router)
 app.include_router(msgpack_router)
 app.include_router(wal_router)
@@ -175,10 +170,9 @@ app.include_router(delete_router)  # Rewrite-based DELETE (zero overhead on writ
 app.include_router(retention_router)
 app.include_router(continuous_query_router)
 
-# Global query engine, connection manager, and scheduler
+# Global query engine and storage manager
 query_engine: Optional[DuckDBEngine] = None
-connection_manager = ConnectionManager(db_path=get_db_path())
-export_scheduler = ExportScheduler()
+storage_manager = StorageManager(db_path=get_db_path())
 metrics_collector = get_metrics_collector()
 logs_manager = get_logs_manager()
 telemetry_sender: Optional[TelemetrySender] = None
@@ -207,7 +201,7 @@ async def reinitialize_query_engine(verbose: bool = True):
         query_engine.close()
 
     # Get active storage connection
-    active_storage = connection_manager.get_active_storage_connection()
+    active_storage = storage_manager.get_active_storage_connection()
 
     if active_storage and active_storage['backend'] == 's3':
         from storage.s3_backend import S3Backend
@@ -222,8 +216,7 @@ async def reinitialize_query_engine(verbose: bool = True):
         )
         query_engine = DuckDBEngine(
             storage_backend="s3",
-            s3_backend=s3_backend,
-            connection_manager=connection_manager
+            s3_backend=s3_backend
         )
         log_reinit(f"Query engines reinitialized with S3 backend: {active_storage['bucket']}")
     elif active_storage and active_storage['backend'] == 'minio':
@@ -238,7 +231,6 @@ async def reinitialize_query_engine(verbose: bool = True):
         query_engine = DuckDBEngine(
             storage_backend="minio",
             minio_backend=minio_backend,
-            connection_manager=connection_manager
         )
         log_reinit(f"Query engines reinitialized with MinIO backend: {active_storage['bucket']}")
     elif active_storage and active_storage['backend'] == 'ceph':
@@ -254,7 +246,6 @@ async def reinitialize_query_engine(verbose: bool = True):
         query_engine = DuckDBEngine(
             storage_backend="ceph",
             ceph_backend=ceph_backend,
-            connection_manager=connection_manager
         )
         log_reinit(f"Query engines reinitialized with Ceph backend: {active_storage['bucket']}")
     elif active_storage and active_storage['backend'] == 'gcs':
@@ -273,7 +264,6 @@ async def reinitialize_query_engine(verbose: bool = True):
         query_engine = DuckDBEngine(
             storage_backend="gcs",
             gcs_backend=gcs_backend,
-            connection_manager=connection_manager
         )
         log_reinit(f"Query engines initialized with GCS backend: gs://{active_storage['bucket']} (using native DuckDB GCS support)")
         if active_storage.get('hmac_key_id'):
@@ -289,8 +279,7 @@ async def reinitialize_query_engine(verbose: bool = True):
         )
         query_engine = DuckDBEngine(
             storage_backend="local",
-            local_backend=local_backend,
-            connection_manager=connection_manager
+            local_backend=local_backend
         )
 
 
@@ -345,7 +334,7 @@ async def startup_event():
     desired_backend = storage_config.get('backend', os.getenv('STORAGE_BACKEND', 'minio'))
 
     # Get active storage connection from database
-    active_storage = connection_manager.get_active_storage_connection()
+    active_storage = storage_manager.get_active_storage_connection()
 
     # Check if active storage backend matches config
     if active_storage and active_storage['backend'] != desired_backend:
@@ -355,7 +344,7 @@ async def startup_event():
         # Deactivate all storage connections
         try:
             import sqlite3
-            conn = sqlite3.connect(connection_manager.db_path)
+            conn = sqlite3.connect(storage_manager.db_path)
             cursor = conn.cursor()
             cursor.execute('UPDATE storage_connections SET is_active = FALSE')
             conn.commit()
@@ -391,18 +380,18 @@ async def startup_event():
                     if attempt == 0:
                         log_startup(f"Creating local storage connection: {connection_config['name']} at {connection_config['base_path']}")
 
-                    connection_id = connection_manager.add_storage_connection(connection_config)
+                    connection_id = storage_manager.add_storage_connection(connection_config)
                     log_startup(f"✅ Auto-created local storage connection (id={connection_id})")
 
                     # Refresh active_storage after creating
-                    active_storage = connection_manager.get_active_storage_connection()
+                    active_storage = storage_manager.get_active_storage_connection()
                     break  # Success, exit retry loop
 
                 except Exception as e:
                     # Race condition: another worker already created the connection
                     if "UNIQUE constraint failed" in str(e):
                         logger.debug("Local storage connection already created by another worker")
-                        active_storage = connection_manager.get_active_storage_connection()
+                        active_storage = storage_manager.get_active_storage_connection()
                         break  # Success (connection exists), exit retry loop
 
                     # Database locked: retry with backoff
@@ -418,7 +407,7 @@ async def startup_event():
                             logger.error(f"Failed to auto-create local storage connection after {max_retries} attempts: {e}")
                             logger.error(f"Traceback: {traceback.format_exc()}")
                             # Try to get connection anyway (another worker may have created it)
-                            active_storage = connection_manager.get_active_storage_connection()
+                            active_storage = storage_manager.get_active_storage_connection()
                     else:
                         # Other error
                         import traceback
@@ -446,18 +435,18 @@ async def startup_event():
                 }
                 log_startup(f"Creating storage connection: {connection_config['name']} at {connection_config['endpoint']}")
 
-                connection_id = connection_manager.add_storage_connection(connection_config)
+                connection_id = storage_manager.add_storage_connection(connection_config)
                 log_startup(f"✅ Auto-created MinIO storage connection (id={connection_id})")
 
                 # Refresh active_storage after creating
-                active_storage = connection_manager.get_active_storage_connection()
+                active_storage = storage_manager.get_active_storage_connection()
             except Exception as e:
                 # Race condition: another worker already created the connection
                 # This is expected in multi-worker setups
                 if "UNIQUE constraint failed" in str(e):
                     logger.debug("MinIO connection already created by another worker")
                     # Refresh active_storage - should exist now
-                    active_storage = connection_manager.get_active_storage_connection()
+                    active_storage = storage_manager.get_active_storage_connection()
                 else:
                     import traceback
                     logger.error(f"Failed to auto-create MinIO connection: {e}")
@@ -469,14 +458,12 @@ async def startup_event():
 
     # Logging moved to individual backend initialization above
 
-    # Start the export scheduler
-    export_scheduler.start_scheduler()
-    log_startup("Export scheduler started")
+    # REMOVED: Export scheduler (moved to external importers)
+    # export_scheduler.start_scheduler()
+    # log_startup("Export scheduler started")
 
     # Initialize and start metrics collection
     metrics_collector.set_dependencies(
-        connection_manager=connection_manager,
-        export_scheduler=export_scheduler,
         query_engine=query_engine
     )
     metrics_collector.start_collection()
@@ -560,7 +547,7 @@ async def startup_event():
             # Initialize compaction (only from first worker to avoid duplicate scheduler instances)
             compaction_config = arc_config.get_compaction_config()
             if compaction_config.get('enabled', True):
-                from api.database import CompactionLock
+                from api.compaction_lock import CompactionLock
                 from storage.compaction import CompactionManager
                 from storage.compaction_scheduler import CompactionScheduler
 
@@ -704,9 +691,9 @@ async def shutdown_event():
         except Exception as e:
             logger.warning(f"Error stopping telemetry sender: {e}")
 
-    # Stop the export scheduler
-    export_scheduler.stop_scheduler()
-    logger.info("Export scheduler stopped")
+    # REMOVED: Export scheduler (moved to external importers)
+    # export_scheduler.stop_scheduler()
+    # logger.info("Export scheduler stopped")
     
     # Stop metrics collection
     metrics_collector.stop_collection()
@@ -755,8 +742,7 @@ async def readiness_check():
         # Check database connectivity (SQLite should always be available)
         try:
             # Test if we can access the database
-            influx_connections = connection_manager.get_influx_connections()
-            storage_connections = connection_manager.get_storage_connections()
+            storage_connections = storage_manager.get_storage_connections()
             checks["database"] = True
             status_details["database_error"] = None
         except Exception as db_error:
@@ -766,35 +752,26 @@ async def readiness_check():
         # Check if API server is functional
         checks["api_server"] = True  # If we're executing this, the API is running
         
-        # Check scheduler
-        try:
-            checks["scheduler"] = export_scheduler.is_running()
-            status_details["scheduler_error"] = None
-        except Exception as sched_error:
-            checks["scheduler"] = False
-            status_details["scheduler_error"] = str(sched_error)
-        
+        # REMOVED: Scheduler check (moved to external importers)
+        # checks["scheduler"] = False
+
         # Get connection status (these can be None for fresh deployments)
-        active_influx = connection_manager.get_active_influx_connection()
-        active_storage = connection_manager.get_active_storage_connection()
+        active_storage = storage_manager.get_active_storage_connection()
         
         # Service is ready if core components are working
         # Connections can be configured later via the UI
-        core_ready = checks["database"] and checks["api_server"] and checks["scheduler"]
+        core_ready = checks["database"] and checks["api_server"]
         
         details = {
-            "active_influx_connection": active_influx is not None,
             "active_storage_connection": active_storage is not None,
             "query_engine_initialized": query_engine is not None,
-            "scheduler_running": checks["scheduler"],
-            "total_influx_connections": len(connection_manager.get_influx_connections()) if checks["database"] else 0,
-            "total_storage_connections": len(connection_manager.get_storage_connections()) if checks["database"] else 0
+            "total_storage_connections": len(storage_manager.get_storage_connections()) if checks["database"] else 0
         }
         
         # Add any errors to details
         details.update({k: v for k, v in status_details.items() if v is not None})
         
-        message = "Service ready for configuration" if core_ready and not (active_influx and active_storage) else "Service fully operational" if core_ready else "Service not ready"
+        message = "Service ready for configuration" if core_ready and not active_storage else "Service fully operational" if core_ready else "Service not ready"
         
         return ReadinessResponse(
             status="ready" if core_ready else "not_ready",
@@ -970,111 +947,6 @@ async def invalidate_auth_cache(request: Request):
         "cache_ttl_seconds": AUTH_CACHE_TTL
     }
 
-
-
-
-@app.post("/api/v1/setup/default-connections")
-async def setup_default_connections():
-    """Create default connections for quick startup"""
-    try:
-        results = {"influx": None, "storage": None}
-        
-        # Check if connections already exist
-        existing_influx = connection_manager.get_influx_connections()
-        existing_storage = connection_manager.get_storage_connections()
-        
-        if existing_influx:
-            results["influx"] = {"status": "exists", "count": len(existing_influx)}
-        else:
-            # Create default data source connection based on environment
-            data_source = os.getenv("DATA_SOURCE", "influx")
-            
-            if data_source == "timescale":
-                influx_config = {
-                    "name": "Default TimescaleDB",
-                    "version": "timescale",
-                    "host": os.getenv("TIMESCALE_HOST", "timescaledb"),
-                    "port": int(os.getenv("TIMESCALE_PORT", "5432")),
-                    "database_name": os.getenv("TIMESCALE_DATABASE", "postgres"),
-                    "username": os.getenv("TIMESCALE_USERNAME", "postgres"),
-                    "password": os.getenv("TIMESCALE_PASSWORD", "password"),
-                    "ssl": False
-                }
-            else:
-                influx_config = {
-                    "name": "Default InfluxDB",
-                    "version": "1x",
-                    "host": os.getenv("INFLUX_HOST", "influxdb"),
-                    "port": int(os.getenv("INFLUX_PORT", "8086")),
-                    "database_name": os.getenv("INFLUX_DATABASE", "historian_test"),
-                    "username": os.getenv("INFLUX_USER", "historian"),
-                    "password": os.getenv("INFLUX_PASSWORD", "historian123"),
-                    "ssl": False
-                }
-            
-            influx_id = connection_manager.create_influx_connection(influx_config)
-            connection_manager.set_active_connection("influx", influx_id)
-            results["influx"] = {"status": "created", "id": influx_id}
-        
-        if existing_storage:
-            results["storage"] = {"status": "exists", "count": len(existing_storage)}
-        else:
-            # Create default storage connection based on environment
-            storage_backend = os.getenv("STORAGE_BACKEND", "minio")
-            
-            if storage_backend == "minio":
-                storage_config = {
-                    "name": "Default MinIO",
-                    "backend": "minio",
-                    "endpoint": os.getenv("MINIO_ENDPOINT", "http://minio:9000"),
-                    "access_key": os.getenv("MINIO_ACCESS_KEY", "minioadmin"),
-                    "secret_key": os.getenv("MINIO_SECRET_KEY", "minioadmin123"),
-                    "bucket": os.getenv("MINIO_BUCKET", "historian"),
-                    "ssl": False
-                }
-            elif storage_backend == "ceph":
-                storage_config = {
-                    "name": "Default Ceph",
-                    "backend": "ceph",
-                    "endpoint": os.getenv("CEPH_ENDPOINT", "http://ceph-demo:7480"),
-                    "access_key": os.getenv("CEPH_ACCESS_KEY", "demo"),
-                    "secret_key": os.getenv("CEPH_SECRET_KEY", "demo"),
-                    "bucket": os.getenv("CEPH_BUCKET", "historian"),
-                    "region": os.getenv("CEPH_REGION", "us-east-1"),
-                    "ssl": False
-                }
-
-            else:
-                storage_config = {
-                    "name": "Default S3",
-                    "backend": "s3",
-                    "access_key": os.getenv("AWS_ACCESS_KEY_ID", ""),
-                    "secret_key": os.getenv("AWS_SECRET_ACCESS_KEY", ""),
-                    "bucket": os.getenv("S3_BUCKET", "historian"),
-                    "region": os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
-                    "ssl": True
-                }
-            
-            storage_id = connection_manager.create_storage_connection(storage_config)
-            connection_manager.set_active_connection("storage", storage_id)
-            results["storage"] = {"status": "created", "id": storage_id}
-        
-        # Reinitialize query engine with new connections
-        await reinitialize_query_engine()
-        
-        return {
-            "message": "Default connections setup completed",
-            "results": results,
-            "next_steps": [
-                "Visit the UI to verify connections",
-                "Create export jobs to start data pipeline",
-                "Use /ready endpoint to check full system status"
-            ]
-        }
-        
-    except Exception as e:
-        logger.error(f"Setup default connections failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Setup failed: {str(e)}")
 
 @app.post("/api/v1/query/estimate")
 async def estimate_query(query: QueryRequest):
@@ -1446,252 +1318,6 @@ async def query_measurement_csv(
     )
 
 
-@app.get("/api/v1/connections/datasource")
-async def get_datasource_connections():
-    return connection_manager.get_influx_connections()
-
-@app.post("/api/v1/connections/datasource")
-async def add_datasource_connection(connection_data: dict):
-    if connection_data.get('version') == 'http_json':
-        # Route HTTP JSON connections to the HTTP JSON handler
-        connection_id = connection_manager.add_http_json_connection(connection_data)
-        return {"id": connection_id, "message": "HTTP JSON connection added successfully"}
-    else:
-        # Route other connections to InfluxDB handler
-        connection_id = connection_manager.add_influx_connection(connection_data)
-        source_type = "TimescaleDB" if connection_data.get('version') == 'timescale' else "InfluxDB"
-        return {"id": connection_id, "message": f"{source_type} connection added successfully"}
-
-@app.delete("/api/v1/connections/datasource/{connection_id}")
-async def delete_datasource_connection(connection_id: int, connection_version: str = None):
-    try:
-        if connection_version == 'http_json':
-            # Route HTTP JSON connections to the HTTP JSON handler
-            success = connection_manager.delete_http_json_connection(connection_id)
-            if not success:
-                raise HTTPException(status_code=404, detail="HTTP JSON connection not found")
-            return {"message": "HTTP JSON connection deleted successfully"}
-        else:
-            # Route other connections to InfluxDB handler
-            success = connection_manager.delete_influx_connection(connection_id)
-            if not success:
-                raise HTTPException(status_code=404, detail="Data source connection not found")
-            return {"message": "Data source connection deleted successfully"}
-    except Exception as e:
-        logger.error(f"Failed to delete datasource connection: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Legacy endpoints for backward compatibility
-@app.get("/api/v1/connections/influx")
-async def get_influx_connections():
-    return connection_manager.get_influx_connections()
-
-@app.post("/api/v1/connections/influx")
-async def add_influx_connection(connection_data: dict):
-    connection_id = connection_manager.add_influx_connection(connection_data)
-    return {"id": connection_id, "message": "Data source connection added successfully"}
-
-@app.get("/api/v1/connections/storage")
-async def get_storage_connections():
-    return connection_manager.get_storage_connections()
-
-@app.post("/api/v1/connections/storage")
-async def add_storage_connection(connection_data: dict):
-    connection_id = connection_manager.add_storage_connection(connection_data)
-    return {"id": connection_id, "message": "Storage connection added successfully"}
-
-# HTTP JSON Endpoints (Legacy - consider deprecating)
-@app.get("/api/v1/connections/http_json")
-async def get_http_json_connections():
-    return connection_manager.get_http_json_connections()
-
-@app.post("/api/v1/connections/{connection_type}/{connection_id}/activate")
-async def activate_connection(connection_type: str, connection_id: int):
-    global query_engine
-    
-    success = connection_manager.set_active_connection(connection_type, connection_id)
-    if success:
-        # Reinitialize query engine if storage connection changed
-        if connection_type == "storage":
-            await reinitialize_query_engine()
-        return {"message": f"{connection_type.title()} connection activated"}
-    else:
-        raise HTTPException(status_code=400, detail="Failed to activate connection")
-
-@app.delete("/api/v1/connections/{connection_type}/{connection_id}")
-async def delete_connection(connection_type: str, connection_id: int):
-    success = connection_manager.delete_connection(connection_type, connection_id)
-    if success:
-        return {"message": f"{connection_type.title()} connection deleted"}
-    else:
-        raise HTTPException(status_code=400, detail="Failed to delete connection")
-
-@app.put("/api/v1/connections/datasource/{connection_id}")
-async def update_datasource_connection(connection_id: int, connection_data: dict):
-    if connection_data.get('version') == 'http_json':
-        # Route HTTP JSON connections to the HTTP JSON handler
-        success = connection_manager.update_http_json_connection(connection_id, connection_data)
-        if success:
-            return {"message": "HTTP JSON connection updated successfully"}
-        else:
-            raise HTTPException(status_code=400, detail="Failed to update HTTP JSON connection")
-    else:
-        # Route other connections to InfluxDB handler
-        success = connection_manager.update_influx_connection(connection_id, connection_data)
-        if success:
-            source_type = "TimescaleDB" if connection_data.get('version') == 'timescale' else "InfluxDB"
-            return {"message": f"{source_type} connection updated successfully"}
-        else:
-            raise HTTPException(status_code=400, detail="Failed to update data source connection")
-
-# Legacy endpoint
-@app.put("/api/v1/connections/influx/{connection_id}")
-async def update_influx_connection(connection_id: int, connection_data: dict):
-    success = connection_manager.update_influx_connection(connection_id, connection_data)
-    if success:
-        return {"message": "Data source connection updated successfully"}
-    else:
-        raise HTTPException(status_code=400, detail="Failed to update data source connection")
-
-@app.put("/api/v1/connections/storage/{connection_id}")
-async def update_storage_connection(connection_id: int, connection_data: dict):
-    success = connection_manager.update_storage_connection(connection_id, connection_data)
-    if success:
-        return {"message": "Storage connection updated successfully"}
-    else:
-        raise HTTPException(status_code=400, detail="Failed to update storage connection")
-
-@app.post("/api/v1/connections/{connection_type}/test")
-async def test_connection(connection_type: str, connection_data: dict):
-    try:
-        logger.info(f"Testing {connection_type} connection: {connection_data.get('name', 'unnamed')}")
-        
-        if connection_type in ["influx", "datasource"]:
-            result = connection_manager.test_influx_connection(connection_data)
-            source_type = "TimescaleDB" if connection_data.get('version') == 'timescale' else "InfluxDB"
-            logger.info(f"{source_type} test result: {result}")
-            return result
-        elif connection_type == "storage":
-            result = connection_manager.test_storage_connection(connection_data)
-            logger.info(f"Storage test result: {result}")
-            return result
-        else:
-            raise HTTPException(status_code=400, detail="Unknown connection type")
-            
-    except Exception as e:
-        logger.error(f"Connection test error: {e}")
-        raise HTTPException(status_code=500, detail=f"Test failed: {str(e)}")
-
-
-
-# Export Job Management Endpoints
-@app.get("/api/v1/jobs")
-async def get_export_jobs():
-    return export_scheduler.get_jobs()
-
-@app.post("/api/v1/jobs")
-async def create_export_job(job_config: dict):
-    job_id = export_scheduler.create_job(job_config)
-    return {"id": job_id, "message": "Export job created successfully"}
-
-@app.put("/api/v1/jobs/{job_id}")
-async def update_export_job(job_id: int, job_config: dict):
-    success = export_scheduler.update_job(job_id, job_config)
-    if success:
-        return {"message": "Export job updated successfully"}
-    else:
-        raise HTTPException(status_code=400, detail="Failed to update export job")
-
-@app.delete("/api/v1/jobs/{job_id}")
-async def delete_export_job(job_id: int):
-    success = export_scheduler.delete_job(job_id)
-    if success:
-        return {"message": "Export job deleted successfully"}
-    else:
-        raise HTTPException(status_code=400, detail="Failed to delete export job")
-
-@app.get("/api/v1/jobs/{job_id}/executions")
-async def get_job_executions(job_id: int, limit: int = 50):
-    return export_scheduler.get_job_executions(job_id, limit)
-
-@app.get("/api/v1/monitoring/jobs")
-async def get_job_monitoring():
-    """Get real-time job monitoring data"""
-    try:
-        jobs = export_scheduler.get_jobs()
-        executions = []
-        
-        # Get recent executions for all jobs
-        for job in jobs:
-            job_executions = export_scheduler.get_job_executions(job['id'], 20)
-            for execution in job_executions:
-                execution['job_name'] = job['name']
-                execution['job_type'] = job['job_type']
-                execution['measurement'] = job.get('measurement')
-                executions.append(execution)
-        
-        # Sort by most recent
-        executions.sort(key=lambda x: x['created_at'], reverse=True)
-        
-        return {
-            "jobs": jobs,
-            "recent_executions": executions[:50],
-            "stats": {
-                "total_jobs": len(jobs),
-                "active_jobs": len([j for j in jobs if j['is_active']]),
-                "running_jobs": len([e for e in executions if e['status'] == 'running']),
-                "failed_jobs": len([e for e in executions if e['status'] == 'failed'])
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Failed to get monitoring data: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get monitoring data: {str(e)}")
-
-@app.post("/api/v1/jobs/{job_id}/cancel")
-async def cancel_job(job_id: int):
-    try:
-        success = export_scheduler.cancel_job(job_id)
-        if success:
-            return {"message": f"Job {job_id} cancelled successfully"}
-        else:
-            raise HTTPException(status_code=400, detail="Failed to cancel job")
-    except Exception as e:
-        logger.error(f"Failed to cancel job {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to cancel job: {str(e)}")
-
-@app.post("/api/v1/jobs/{job_id}/run")
-async def run_job_now(job_id: int):
-    try:
-        # Get job details
-        jobs = export_scheduler.get_jobs()
-        job = next((j for j in jobs if j['id'] == job_id), None)
-        
-        if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
-        
-        if not job['is_active']:
-            raise HTTPException(status_code=400, detail="Job is not active")
-        
-        # Execute the job asynchronously (non-blocking)
-        logger.info(f"Starting execution for job: {job['name']}")
-        
-        # Start job in background without awaiting
-        import asyncio
-        asyncio.create_task(export_scheduler.execute_job_now(job))
-        
-        return {
-            "message": f"Job '{job['name']}' execution started in background",
-            "job_id": job_id,
-            "status": "triggered"
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to trigger job {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to trigger job: {str(e)}")
-
 # Monitoring Endpoints
 @app.get("/api/v1/metrics")
 async def get_current_metrics():
@@ -1773,113 +1399,6 @@ async def get_application_logs(
             "since_minutes": since_minutes
         }
     }
-
-# Avro Schema Management Endpoints
-
-@app.get("/api/v1/avro/schemas")
-async def get_avro_schemas(request: Request):
-    """Get all Avro schemas (requires authentication)"""
-    try:
-        schemas = connection_manager.get_avro_schemas()
-        return {"schemas": schemas}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get Avro schemas: {e}")
-
-@app.post("/api/v1/avro/schemas")
-async def create_avro_schema(schema_data: dict, request: Request):
-    """Create new Avro schema (requires authentication)"""
-    try:
-        # Validate required fields
-        required_fields = ['topic_pattern', 'schema_name', 'schema_json']
-        for field in required_fields:
-            if field not in schema_data:
-                raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
-
-        # Validate JSON schema format
-        import json
-        try:
-            json.loads(schema_data['schema_json'])
-        except json.JSONDecodeError:
-            raise HTTPException(status_code=400, detail="Invalid JSON in schema_json field")
-
-        schema_id = connection_manager.add_avro_schema(schema_data)
-        return {"message": "Avro schema created", "schema_id": schema_id}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to create Avro schema: {e}")
-
-@app.get("/api/v1/avro/schemas/{schema_id}")
-async def get_avro_schema(schema_id: int, request: Request):
-    """Get specific Avro schema by ID (requires authentication)"""
-    try:
-        schemas = connection_manager.get_avro_schemas()
-        schema = next((s for s in schemas if s['id'] == schema_id), None)
-
-        if not schema:
-            raise HTTPException(status_code=404, detail="Avro schema not found")
-
-        return schema
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get Avro schema: {e}")
-
-@app.get("/api/v1/avro/schemas/topic/{topic_name}")
-async def get_avro_schema_for_topic(topic_name: str):
-    """Get the best matching Avro schema for a topic (public endpoint for system use)"""
-    try:
-        schema = connection_manager.get_avro_schema_for_topic(topic_name)
-
-        if not schema:
-            raise HTTPException(status_code=404, detail=f"No Avro schema found for topic '{topic_name}'")
-
-        return schema
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get Avro schema for topic: {e}")
-
-@app.put("/api/v1/avro/schemas/{schema_id}")
-async def update_avro_schema(schema_id: int, schema_data: dict, request: Request):
-    """Update existing Avro schema (requires authentication)"""
-    try:
-        # Validate required fields
-        required_fields = ['topic_pattern', 'schema_name', 'schema_json']
-        for field in required_fields:
-            if field not in schema_data:
-                raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
-
-        # Validate JSON schema format
-        import json
-        try:
-            json.loads(schema_data['schema_json'])
-        except json.JSONDecodeError:
-            raise HTTPException(status_code=400, detail="Invalid JSON in schema_json field")
-
-        success = connection_manager.update_avro_schema(schema_id, schema_data)
-        if not success:
-            raise HTTPException(status_code=404, detail="Avro schema not found")
-
-        return {"message": "Avro schema updated", "schema_id": schema_id}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to update Avro schema: {e}")
-
-@app.delete("/api/v1/avro/schemas/{schema_id}")
-async def delete_avro_schema(schema_id: int, request: Request):
-    """Delete Avro schema (requires authentication)"""
-    try:
-        success = connection_manager.delete_avro_schema(schema_id)
-        if not success:
-            raise HTTPException(status_code=404, detail="Avro schema not found")
-
-        return {"message": "Avro schema deleted", "schema_id": schema_id}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to delete Avro schema: {e}")
 
 # =====================================================
 # QUERY CACHE MANAGEMENT ENDPOINTS

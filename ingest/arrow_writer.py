@@ -1,37 +1,15 @@
-"""
-Direct Arrow/Parquet Writer
-
-High-performance writer that bypasses Pandas DataFrame for zero-copy writes.
-Uses PyArrow directly for 2-3x faster serialization.
-
-Performance Optimizations:
-1. Flush outside lock: Extract records under lock, flush outside (no write blocking)
-2. Optimized columnar conversion: List comprehension + direct dict access (15-25% faster)
-"""
-
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pathlib import Path
 from typing import List, Dict, Any
 from datetime import datetime
 import logging
-import hashlib
 import json
 
 logger = logging.getLogger(__name__)
 
 
 class ArrowParquetWriter:
-    """
-    Direct Arrow → Parquet writer without DataFrame intermediate step.
-
-    Benefits:
-    - Zero-copy writes (no DataFrame allocation)
-    - 2-3x faster serialization
-    - Lower memory usage
-    - Columnar from start
-    """
-
     def __init__(self, compression: str = 'snappy'):
         """
         Initialize writer
@@ -40,81 +18,6 @@ class ArrowParquetWriter:
             compression: Parquet compression (snappy, gzip, zstd)
         """
         self.compression = compression.upper()
-
-    def _compute_row_hash(self, row: Dict[str, Any], measurement: str) -> str:
-        """
-        Compute SHA256 hash for a row to enable delete operations.
-
-        Uses time + measurement + sorted tags (non-field columns) to create
-        a unique identifier that matches the delete_routes.py logic.
-
-        Args:
-            row: Dictionary containing row data
-            measurement: Measurement name
-
-        Returns:
-            SHA256 hash string
-        """
-        # Create stable hash from row data (matches delete_routes.py logic)
-        hash_parts = [
-            str(row.get('time', '')),
-            str(measurement)
-        ]
-
-        # Add all non-field columns (tags) sorted by key
-        # Fields are typically numeric measurements, tags are string labels
-        for key in sorted(row.keys()):
-            if key not in ['time', 'measurement', 'fields']:
-                # This is a tag or other metadata
-                value = row.get(key, '')
-                hash_parts.append(f"{key}={value}")
-
-        hash_str = '|'.join(hash_parts)
-        return hashlib.sha256(hash_str.encode()).hexdigest()
-
-    def _add_row_hashes_to_records(self, records: List[Dict[str, Any]], measurement: str) -> List[Dict[str, Any]]:
-        """
-        Add _row_hash column to each record for delete support.
-
-        Args:
-            records: List of record dictionaries
-            measurement: Measurement name
-
-        Returns:
-            Records with _row_hash added
-        """
-        for record in records:
-            record['_row_hash'] = self._compute_row_hash(record, measurement)
-        return records
-
-    def _add_row_hashes_to_columns(self, columns: Dict[str, List], measurement: str) -> Dict[str, List]:
-        """
-        Add _row_hash column to columnar data for delete support.
-
-        Args:
-            columns: Columnar data dictionary
-            measurement: Measurement name
-
-        Returns:
-            Columns with _row_hash added
-        """
-        # Get number of rows
-        if not columns:
-            return columns
-
-        num_rows = len(next(iter(columns.values())))
-
-        # Compute hash for each row
-        row_hashes = []
-        for i in range(num_rows):
-            # Reconstruct row from columns
-            row = {key: values[i] for key, values in columns.items()}
-            row_hash = self._compute_row_hash(row, measurement)
-            row_hashes.append(row_hash)
-
-        # Add _row_hash column
-        columns['_row_hash'] = row_hashes
-        return columns
 
     def write_parquet(
         self,
@@ -138,13 +41,6 @@ class ArrowParquetWriter:
             return False
 
         try:
-            # NOTE: Removed _row_hash computation - DELETE operations disabled
-            # This was causing 700K RPS loss (2.4M → 1.7M) due to:
-            #   - 2.5M SHA256 hashes per second
-            #   - Destroying zero-copy columnar passthrough
-            #   - Reconstructing rows from columns
-            # records_with_hash = self._add_row_hashes_to_records(records, measurement)
-
             # Convert records to columnar format (dict of arrays)
             columns = self._records_to_columns(records)
 
@@ -168,7 +64,7 @@ class ArrowParquetWriter:
 
             logger.debug(
                 f"Wrote {len(records)} records for '{measurement}' to {output_path} "
-                f"(compression={self.compression}, with _row_hash)"
+                f"(compression={self.compression})"
             )
             return True
 
@@ -251,7 +147,7 @@ class ArrowParquetWriter:
 
             logger.debug(
                 f"Wrote columnar data for '{measurement}' to {output_path} "
-                f"(compression={self.compression}, passthrough=true, with _row_hash)"
+                f"(compression={self.compression}, passthrough=true)"
             )
             return True
 

@@ -185,24 +185,7 @@ def log_database_operation(logger: logging.Logger, operation: str,
         }
     )
 
-def log_export_job(logger: logging.Logger, job_id: int, job_name: str,
-                  status: str, records_processed: int = None, 
-                  duration_ms: float = None, **kwargs):
-    """Log export job execution with structured data"""
-    extra_data = {
-        "event_type": "export_job",
-        "job_id": job_id,
-        "job_name": job_name,
-        "status": status,
-        **kwargs
-    }
-    
-    if records_processed is not None:
-        extra_data["records_processed"] = records_processed
-    if duration_ms is not None:
-        extra_data["duration_ms"] = duration_ms
-    
-    logger.info(f"Export job {status}", extra=extra_data)
+# REMOVED: log_export_job (moved to external importers)
 
 def log_query_execution(logger: logging.Logger, sql: str, duration_ms: float,
                        row_count: int, success: bool, **kwargs):

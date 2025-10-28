@@ -14,7 +14,6 @@ import asyncio
 from datetime import datetime
 from ingest.line_protocol_parser import LineProtocolParser
 from ingest.parquet_buffer import ParquetBuffer
-from api.database import ConnectionManager
 
 logger = logging.getLogger(__name__)
 
