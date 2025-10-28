@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  High-performance time-series data warehouse built on DuckDB and Parquet with flexible storage options.
+  Universal time-series database: 2.45M metrics/sec + 955K logs/sec. One endpoint. One protocol. DuckDB + Parquet + Arrow.
 </p>
 
 > **Alpha Release - Technical Preview**
@@ -19,7 +19,8 @@
 
 ## Features
 
-- **High-Performance Ingestion**: MessagePack binary protocol (recommended), InfluxDB Line Protocol (drop-in replacement), JSON
+- **Universal Ingestion**: One endpoint for metrics (2.45M/sec), logs (955K/sec), IoT data, and events - MessagePack columnar protocol
+- **High-Performance Protocols**: MessagePack binary (recommended), InfluxDB Line Protocol (drop-in replacement), JSON
 - **VSCode Extension**: Full-featured database manager with query editor, notebooks, CSV import, and alerting - [Install Now](https://marketplace.visualstudio.com/items?itemName=basekick-labs.arc-db-manager)
 - **Multi-Database Architecture**: Organize data by environment, tenant, or application with database namespaces - [Learn More](#multi-database-architecture)
 - **Continuous Queries**: Manual downsampling and aggregation for materialized views (automatic scheduling in enterprise edition) - [Learn More](docs/CONTINUOUS_QUERIES.md)
@@ -34,9 +35,20 @@
 - **Apache Superset Integration**: Native dialect for BI dashboards with multi-database schema support
 - **Production Ready**: Docker deployment with health checks and monitoring
 
-## Performance Benchmark
+## Performance Benchmarks
 
-**Arc achieves 2.42M records/sec with columnar MessagePack format and authentication enabled!**
+Arc is a **universal time-series database** that ingests metrics, logs, IoT data, and events through a unified MessagePack columnar protocol.
+
+### Unified Ingestion Performance
+
+| Data Type | Throughput | Use Case | Latency (p99) |
+|-----------|------------|----------|---------------|
+| **Metrics** | **2.45M/sec** | System metrics, IoT sensors, business events | 18-45ms |
+| **Logs** | **955K/sec** | Application logs, access logs, audit logs | 48ms - 1.8s* |
+
+*Log latency is tunable based on batch size: 1K logs (48ms) for real-time alerts, 20K logs (1.8s) for maximum throughput
+
+**One endpoint. One protocol. Multiple data types.**
 
 ### Write Performance - Format Comparison
 
@@ -55,6 +67,43 @@
 
 *Tested on Apple M3 Max (14 cores), native deployment, 400 workers*
 *MessagePack columnar format with zero-copy Arrow passthrough*
+
+### Log Ingestion Performance
+
+Arc also handles **high-volume log ingestion** using the same MessagePack columnar protocol:
+
+| Batch Size | Throughput | p50 Latency | p99 Latency | Use Case |
+|------------|------------|-------------|-------------|----------|
+| **20,000 logs** | **955K logs/sec** | 113.9ms | 1827ms | Batch processing, data backfill |
+| **10,000 logs** | **197K logs/sec** | 40.3ms | 367ms | Production logging |
+| **5,000 logs** | **100K logs/sec** | 12.8ms | 163ms | Interactive dashboards |
+| **1,000 logs** | **45K logs/sec** | 5.9ms | 48ms | Real-time alerting |
+
+**Log Schema Example** (columnar format):
+```python
+{
+    "m": "application_logs",
+    "columns": {
+        "time": [timestamp1, timestamp2, ...],
+        "level": ["INFO", "ERROR", ...],
+        "service": ["api-server", "worker", ...],
+        "message": ["Request processed", ...],
+        "status_code": [200, 500, ...],
+        "response_time_ms": [145, 203, ...]
+    }
+}
+```
+
+**Comparison with Other Log Systems:**
+- **45x faster** than Loki (955K vs 21K logs/sec)
+- **48x faster** than Elasticsearch (955K vs 20K logs/sec)
+- **17x faster** than SigNoz/ClickHouse (955K vs 55K logs/sec)
+- **Competitive** with VictoriaLogs (specialized logs-only system)
+
+**Learn More:**
+- [Log Ingestion Documentation](docs/LOG_INGESTION.md) - Complete guide to using Arc for logs
+- [Load Testing Guide](docs/LOAD_TESTING.md) - Benchmark your Arc instance
+- [Synthetic Logs Load Test Script](scripts/synthetic_logs_load_test.py) - Ready-to-use load testing tool
 
 ### Authentication Performance
 
