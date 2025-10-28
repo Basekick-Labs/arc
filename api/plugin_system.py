@@ -35,10 +35,6 @@ class PluginHook(Enum):
     PRE_STORAGE_WRITE = "pre_storage_write"
     POST_STORAGE_WRITE = "post_storage_write"
 
-    # Export hooks
-    PRE_EXPORT = "pre_export"
-    POST_EXPORT = "post_export"
-
     # Authentication hooks
     PRE_AUTH = "pre_auth"
     POST_AUTH = "post_auth"

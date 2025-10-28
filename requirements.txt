@@ -47,10 +47,8 @@ msgpack==1.1.2
 # JSON processing
 jsonpath-ng==1.7.0
 
-# Database clients for exporters
-influxdb==5.3.1
-influxdb-client==1.38.0
-psycopg2-binary==2.9.11
-
 # SQL parsing
 sqlparse==0.5.3
+
+# REMOVED: Database clients for importers/exporters (moved to external tools)
+# influxdb, influxdb-client, psycopg2-binary, kafka-python

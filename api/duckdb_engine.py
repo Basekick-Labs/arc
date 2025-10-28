@@ -1,9 +1,8 @@
 import asyncio
 import logging
-from typing import Dict, List, Any, Optional, Set
+from typing import Dict, List, Any, Optional
 import time
 import os
-from pathlib import Path
 from api.duckdb_pool import DuckDBConnectionPool, QueryPriority
 
 logger = logging.getLogger(__name__)
@@ -138,113 +137,6 @@ class DuckDBEngine:
             logger.debug(f"Could not check delete config: {e}")
             return False
 
-    def _load_tombstone_hashes(self, database: str, measurement: str) -> Set[str]:
-        """Load deleted row hashes from tombstone files for a measurement
-
-        Args:
-            database: Database name
-            measurement: Measurement (table) name
-
-        Returns:
-            Set of SHA256 hashes for deleted rows
-        """
-        try:
-            backend = self.local_backend or self.minio_backend or self.s3_backend or self.ceph_backend or self.gcs_backend
-            if not backend:
-                return set()
-
-            tombstone_hashes = set()
-
-            # Path to .deletes subdirectory
-            if self.local_backend:
-                # Local filesystem
-                deletes_path = Path(self.local_backend.base_path) / database / measurement / ".deletes"
-
-                if deletes_path.exists() and deletes_path.is_dir():
-                    # Read all tombstone parquet files
-                    for tombstone_file in deletes_path.glob("delete_*.parquet"):
-                        try:
-                            import pyarrow.parquet as pq
-                            table = pq.read_table(str(tombstone_file))
-
-                            # Extract _hash column
-                            if '_hash' in table.column_names:
-                                hashes = table.column('_hash').to_pylist()
-                                tombstone_hashes.update(hashes)
-                                logger.debug(f"Loaded {len(hashes)} tombstone hashes from {tombstone_file.name}")
-                        except Exception as e:
-                            logger.warning(f"Failed to read tombstone file {tombstone_file}: {e}")
-            else:
-                # S3-compatible backends (MinIO, S3, Ceph, GCS)
-                deletes_prefix = f"{database}/{measurement}/.deletes/"
-
-                try:
-                    # List tombstone files in .deletes/ directory
-                    tombstone_files = []
-                    paginator = backend.s3_client.get_paginator('list_objects_v2')
-                    for page in paginator.paginate(Bucket=backend.bucket, Prefix=deletes_prefix):
-                        if 'Contents' in page:
-                            for obj in page['Contents']:
-                                key = obj['Key']
-                                if key.endswith('.parquet') and '/delete_' in key:
-                                    tombstone_files.append(key)
-
-                    # Read each tombstone file
-                    for key in tombstone_files:
-                        try:
-                            import pyarrow.parquet as pq
-                            import io
-
-                            # Download file from S3
-                            response = backend.s3_client.get_object(Bucket=backend.bucket, Key=key)
-                            file_bytes = response['Body'].read()
-
-                            # Read Parquet from bytes
-                            table = pq.read_table(io.BytesIO(file_bytes))
-
-                            # Extract _hash column
-                            if '_hash' in table.column_names:
-                                hashes = table.column('_hash').to_pylist()
-                                tombstone_hashes.update(hashes)
-                                logger.debug(f"Loaded {len(hashes)} tombstone hashes from {key}")
-                        except Exception as e:
-                            logger.warning(f"Failed to read tombstone file {key}: {e}")
-
-                except Exception as e:
-                    logger.warning(f"Failed to list tombstone files for {database}.{measurement}: {e}")
-
-            if tombstone_hashes:
-                logger.info(f"Loaded {len(tombstone_hashes)} total tombstone hashes for {database}.{measurement}")
-
-            return tombstone_hashes
-
-        except Exception as e:
-            logger.error(f"Failed to load tombstone hashes: {e}")
-            return set()
-
-    def _compute_row_hash(self, time_value: str, tags: Dict[str, str]) -> str:
-        """Compute SHA256 hash for a row (matches delete_routes.py logic)
-
-        Args:
-            time_value: Timestamp value
-            tags: Dictionary of tag key-value pairs
-
-        Returns:
-            SHA256 hash string
-        """
-        import hashlib
-        import json
-
-        # Create deterministic identifier: time + sorted tags
-        identifier = {
-            'time': time_value,
-            'tags': dict(sorted(tags.items()))
-        }
-
-        # Hash the JSON representation
-        identifier_json = json.dumps(identifier, sort_keys=True)
-        return hashlib.sha256(identifier_json.encode('utf-8')).hexdigest()
-
     async def _configure_s3(self):
         """Configure DuckDB for S3/MinIO access"""
         try:
@@ -352,10 +244,6 @@ class DuckDBEngine:
         # Convert SQL for S3 paths (only for regular queries)
         converted_sql = self._convert_sql_to_s3_paths(sql)
 
-        # Apply tombstone filtering if deletes are enabled
-        if self._is_delete_enabled():
-            converted_sql = await self._apply_tombstone_filter(converted_sql, sql)
-
         # Use connection pool for query execution
         result = await self.connection_pool.execute_async(
             converted_sql,
@@ -385,10 +273,6 @@ class DuckDBEngine:
 
         # Convert SQL for S3 paths (only for regular queries)
         converted_sql = self._convert_sql_to_s3_paths(sql)
-
-        # Apply tombstone filtering if deletes are enabled
-        if self._is_delete_enabled():
-            converted_sql = await self._apply_tombstone_filter(converted_sql, sql)
 
         # Use connection pool for Arrow query execution
         result = await self.connection_pool.execute_arrow_async(
@@ -450,113 +334,6 @@ class DuckDBEngine:
             "columns": [],
             "row_count": 0,
         }
-    
-    async def _apply_tombstone_filter(self, converted_sql: str, original_sql: str) -> str:
-        """Apply tombstone filtering to exclude deleted rows
-
-        This method checks for tombstone files and applies an anti-join to filter out
-        deleted rows. It computes row hashes at query time to match against tombstones.
-
-        Args:
-            converted_sql: SQL with S3 paths already converted
-            original_sql: Original SQL query (for parsing database/table)
-
-        Returns:
-            Modified SQL with tombstone filtering applied
-        """
-        try:
-            import re
-
-            # Extract database and measurement from original SQL
-            # Pattern: FROM database.table OR FROM table
-            db_table_pattern = r'FROM\s+(?:(\w+)\.)?(\w+)'
-            match = re.search(db_table_pattern, original_sql, re.IGNORECASE)
-
-            if not match:
-                # No table reference found, return unchanged
-                return converted_sql
-
-            database = match.group(1)  # May be None for simple table references
-            measurement = match.group(2)
-
-            # If no database specified, use backend's default database
-            if not database:
-                backend = self.local_backend or self.minio_backend or self.s3_backend or self.ceph_backend or self.gcs_backend
-                if backend:
-                    database = backend.database
-                else:
-                    database = "default"
-
-            # Check if tombstone directory exists
-            backend = self.local_backend or self.minio_backend or self.s3_backend or self.ceph_backend or self.gcs_backend
-            if not backend:
-                return converted_sql
-
-            # Build path to .deletes directory
-            tombstone_path = None
-            tombstone_exists = False
-
-            if self.local_backend:
-                # Local filesystem
-                deletes_dir = Path(self.local_backend.base_path) / database / measurement / ".deletes"
-                if deletes_dir.exists() and any(deletes_dir.glob("delete_*.parquet")):
-                    tombstone_path = str(deletes_dir / "delete_*.parquet")
-                    tombstone_exists = True
-            else:
-                # S3-compatible backends
-                deletes_prefix = f"{database}/{measurement}/.deletes/"
-
-                try:
-                    # Check if any tombstone files exist
-                    response = backend.s3_client.list_objects_v2(
-                        Bucket=backend.bucket,
-                        Prefix=deletes_prefix,
-                        MaxKeys=1
-                    )
-
-                    if 'Contents' in response and len(response['Contents']) > 0:
-                        # Tombstones exist
-                        tombstone_path = f"s3://{backend.bucket}/{deletes_prefix}delete_*.parquet"
-                        tombstone_exists = True
-                except Exception as e:
-                    logger.debug(f"Error checking for tombstones: {e}")
-
-            if not tombstone_exists or not tombstone_path:
-                # No tombstones found
-                logger.debug(f"No tombstones found for {database}.{measurement}, skipping filter")
-                return converted_sql
-
-            # Apply tombstone filter using DuckDB's ANTI JOIN
-            # The tombstone files contain _hash column with row hashes
-            # The data files now contain _row_hash column (added during write)
-            # ANTI JOIN returns rows from left table with no match in right table
-
-            # NOTE: Old data written before DELETE feature may not have _row_hash column
-            # In that case, tombstone filtering won't work for that data (fail open)
-            # Users should re-write old data or wait for compaction to add the column
-
-            filtered_sql = f"""
-            SELECT main_data.*
-            FROM (
-                {converted_sql}
-            ) AS main_data
-            ANTI JOIN (
-                SELECT _hash
-                FROM read_parquet('{tombstone_path}', union_by_name=true)
-            ) AS tombstones
-            ON main_data._row_hash = tombstones._hash
-            """
-
-            logger.info(f"Applied tombstone filter for {database}.{measurement} using path: {tombstone_path}")
-            return filtered_sql
-
-        except Exception as e:
-            logger.warning(f"Failed to apply tombstone filter (data may not have _row_hash column): {e}")
-            # If filtering fails, return original query (fail open for reads)
-            # This happens when old data doesn't have _row_hash column yet
-            # Tombstone filtering will work after compaction adds the column
-            return converted_sql
-
     def _execute_sync(self, sql: str) -> Dict[str, Any]:
         """Synchronous query execution"""
         try:
