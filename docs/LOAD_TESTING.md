@@ -17,11 +17,18 @@ Arc includes comprehensive load testing tools to benchmark ingestion performance
 
 ## Overview
 
-Arc provides three specialized load testing scripts for complete observability testing:
+Arc provides load testing scripts for all four observability data types, plus a unified demo scenario:
+
+### Performance Testing Scripts
 
 1. **[`scripts/metrics_load_test.py`](../scripts/metrics_load_test.py)** - For testing metrics ingestion (2.45M+ metrics/sec)
 2. **[`scripts/synthetic_logs_load_test.py`](../scripts/synthetic_logs_load_test.py)** - For testing log ingestion (955K+ logs/sec)
 3. **[`scripts/synthetic_traces_load_test.py`](../scripts/synthetic_traces_load_test.py)** - For testing distributed traces (944K+ spans/sec)
+4. **[`scripts/synthetic_events_load_test.py`](../scripts/synthetic_events_load_test.py)** - For testing events ingestion (938K+ events/sec)
+
+### Demo Scenario
+
+5. **[`scripts/demo_scenario_marketing_campaign.py`](../scripts/demo_scenario_marketing_campaign.py)** - Unified demo with all four data types showing a realistic marketing campaign impact scenario
 
 All scripts:
 - Pre-generate and compress data in memory for minimal overhead
@@ -826,11 +833,170 @@ Based on Arc's tested performance:
 
 - [Metrics Load Test Script](../scripts/metrics_load_test.py)
 - [Logs Load Test Script](../scripts/synthetic_logs_load_test.py)
+- [Traces Load Test Script](../scripts/synthetic_traces_load_test.py)
+- [Events Load Test Script](../scripts/synthetic_events_load_test.py)
+- [Demo Scenario Script](../scripts/demo_scenario_marketing_campaign.py)
 - [Log Ingestion Documentation](./LOG_INGESTION.md)
+- [Traces Ingestion Documentation](./TRACES_INGESTION.md)
+- [Events Ingestion Documentation](./EVENTS_INGESTION.md)
 - [Performance Benchmarks](./BENCHMARKS.md)
 - [Architecture Documentation](./ARCHITECTURE.md)
 
 ---
 
-**Last Updated**: October 28, 2025
+## Demo Scenario: Marketing Campaign
+
+The [`demo_scenario_marketing_campaign.py`](../scripts/demo_scenario_marketing_campaign.py) script generates a realistic unified observability scenario showing how a marketing campaign impacts your system across all four data types.
+
+### What It Generates
+
+**Timeline**: 90 minutes total (30 min before, 30 min during, 30 min after campaign)
+
+**Data Generated**:
+- **4 Events**: Campaign start/end, autoscaling, database alert
+- **180 Metrics**: CPU and memory for 5 hosts (20-second intervals)
+- **5,000 Logs**: Application logs with realistic error distribution
+- **1,000 Traces**: ~3,000 spans showing latency impact
+
+**Scenario Story**:
+1. **T-30min**: Normal baseline (20-30% CPU, minimal errors, 45ms avg latency)
+2. **T=0**: Marketing campaign starts (event: `marketing_campaign_started`)
+3. **T+5min**: System auto-scales (event: `autoscale_triggered`)
+4. **T+10min**: Database connection pool exhausted (event: `alert_triggered`)
+5. **T+0 to T+30min**: High load period (75-95% CPU, 10% error rate, 2.4s avg latency)
+6. **T+30min**: Campaign ends (event: `marketing_campaign_ended`)
+7. **T+30 to T+60min**: System recovers to normal
+
+### Usage
+
+```bash
+# Basic usage
+./scripts/demo_scenario_marketing_campaign.py \
+    --token YOUR_API_TOKEN \
+    --database demo
+
+# Custom campaign start time
+./scripts/demo_scenario_marketing_campaign.py \
+    --token YOUR_API_TOKEN \
+    --database demo \
+    --campaign-time 1730246400000  # Unix timestamp in milliseconds
+
+# Different Arc server
+./scripts/demo_scenario_marketing_campaign.py \
+    --url http://arc-server:8000 \
+    --token YOUR_API_TOKEN \
+    --database production_demo
+```
+
+### Sample Output
+
+```
+🎬 Arc Demo Scenario: Marketing Campaign Impact
+============================================================
+📅 Campaign start time: 2024-10-30 10:00:00
+⏱️  Timeline: 30 min before → 30 min during → 30 min after
+🎯 Target: http://localhost:8000
+💾 Database: demo
+
+🔄 Generating scenario data...
+  ✅ Events: 4
+  ✅ Metrics: 180
+  ✅ Logs: 5000
+  ✅ Traces: 3000 spans
+
+📤 Sending events...
+  ✅ Events sent
+📤 Sending metrics...
+  ✅ Metrics sent (180 points)
+📤 Sending logs...
+  ✅ Logs sent (5000 entries)
+📤 Sending traces...
+  ✅ Traces sent (3000 spans)
+
+✨ Scenario complete!
+
+🔍 Try these queries to explore the data:
+
+1. Find events during CPU spikes:
+   SELECT e.time, e.event_type, m.value FROM system_events e
+   JOIN system_metrics m ON m.time BETWEEN e.time AND e.time + 300000
+   WHERE m.metric = 'cpu_usage' AND m.value > 80;
+```
+
+### Correlation Queries
+
+After running the demo scenario, you can explore the data with these queries:
+
+#### Find What Triggered the CPU Spike
+
+```sql
+-- What events happened when CPU spiked?
+SELECT
+    e.time,
+    e.event_type,
+    e.metadata,
+    m.value as cpu_value
+FROM system_events e
+JOIN system_metrics m
+    ON m.time BETWEEN e.time AND e.time + 300000
+    AND m.metric = 'cpu_usage'
+    AND m.value > 80
+WHERE e.event_category = 'business'
+ORDER BY e.time DESC;
+```
+
+#### Show Errors During Campaign
+
+```sql
+-- Show me errors during the campaign
+SELECT
+    e.time as campaign_start,
+    l.time as log_time,
+    l.level,
+    l.message,
+    l.service
+FROM system_events e
+JOIN application_logs l
+    ON l.time BETWEEN e.time AND e.time + e.duration_ms
+    AND l.level = 'ERROR'
+WHERE e.event_type = 'marketing_campaign_started'
+ORDER BY l.time DESC;
+```
+
+#### Compare Latency Before/During/After
+
+```sql
+-- How did latency change during the campaign?
+SELECT
+    CASE
+        WHEN t.time < e.time THEN 'before_campaign'
+        WHEN t.time BETWEEN e.time AND e.time + 1800000 THEN 'during_campaign'
+        ELSE 'after_campaign'
+    END as phase,
+    COUNT(*) as request_count,
+    AVG(t.duration_ns / 1000000.0) as avg_latency_ms,
+    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY t.duration_ns / 1000000.0) as p95_latency_ms
+FROM distributed_traces t
+CROSS JOIN system_events e
+WHERE e.event_type = 'marketing_campaign_started'
+    AND t.service_name = 'api-gateway'
+GROUP BY phase
+ORDER BY phase;
+```
+
+### Use Cases
+
+**Demo & Sales**: Show unified observability in action with a relatable scenario
+
+**Training**: Teach teams how to correlate metrics, logs, traces, and events
+
+**Testing**: Validate Arc's correlation queries work correctly
+
+**Blog Posts**: Generate realistic data for documentation examples
+
+**Proof of Concept**: Demonstrate Arc's capabilities to stakeholders
+
+---
+
+**Last Updated**: October 30, 2025
 **Arc Version**: Latest main branch
