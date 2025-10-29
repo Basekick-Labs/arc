@@ -160,10 +160,16 @@ class ArrowParquetWriter:
         Infer Arrow schema from column data.
 
         Handles:
-        - Timestamps (datetime → timestamp[ms])
+        - Timestamps (datetime → timestamp[us] - microsecond precision)
         - Integers (int64)
         - Floats (float64)
         - Strings (utf8)
+
+        Note: Microsecond precision is the industry standard for observability:
+        - Sufficient for distributed tracing (sub-millisecond spans)
+        - Compatible with most databases and tools
+        - No storage overhead vs milliseconds (both 64-bit)
+        - DuckDB native format (no conversion needed)
         """
         fields = []
 
@@ -175,8 +181,9 @@ class ArrowParquetWriter:
                 # All None, default to string
                 arrow_type = pa.string()
             elif isinstance(sample, datetime):
-                # Timestamp with millisecond precision
-                arrow_type = pa.timestamp('ms')
+                # Timestamp with microsecond precision (us = 10^-6 seconds)
+                # Industry standard for observability and time series databases
+                arrow_type = pa.timestamp('us')
             elif isinstance(sample, bool):
                 arrow_type = pa.bool_()
             elif isinstance(sample, int):
@@ -509,7 +516,20 @@ class ArrowParquetBuffer:
                     if isinstance(record['time'], str):
                         record['time'] = datetime.fromisoformat(record['time'].replace('Z', '+00:00'))
                     elif isinstance(record['time'], (int, float)):
-                        record['time'] = datetime.fromtimestamp(record['time'] / 1000)  # Assume ms
+                        # Auto-detect timestamp unit based on magnitude:
+                        # - Less than 1e10: seconds (e.g., 1730246400)
+                        # - Between 1e10 and 1e13: milliseconds (e.g., 1730246400000)
+                        # - Greater than 1e13: microseconds (e.g., 1730246400000000)
+                        timestamp_val = record['time']
+                        if timestamp_val < 1e10:
+                            # Seconds
+                            record['time'] = datetime.fromtimestamp(timestamp_val)
+                        elif timestamp_val < 1e13:
+                            # Milliseconds
+                            record['time'] = datetime.fromtimestamp(timestamp_val / 1000)
+                        else:
+                            # Microseconds
+                            record['time'] = datetime.fromtimestamp(timestamp_val / 1000000)
 
             # Get time range for filename
             times = [r['time'] for r in records if 'time' in r]

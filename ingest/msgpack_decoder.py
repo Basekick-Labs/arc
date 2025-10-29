@@ -147,10 +147,19 @@ class MessagePackDecoder:
         if 'time' in columns:
             time_col = columns['time']
             if time_col and isinstance(time_col[0], (int, float)):
-                columns['time'] = [
-                    datetime.fromtimestamp(t / 1000, tz=timezone.utc)
-                    for t in time_col
-                ]
+                # Auto-detect timestamp unit based on magnitude (same as arrow_writer)
+                def convert_timestamp(t):
+                    if t < 1e10:
+                        # Seconds
+                        return datetime.fromtimestamp(t, tz=timezone.utc)
+                    elif t < 1e13:
+                        # Milliseconds (default for msgpack API)
+                        return datetime.fromtimestamp(t / 1000, tz=timezone.utc)
+                    else:
+                        # Microseconds
+                        return datetime.fromtimestamp(t / 1000000, tz=timezone.utc)
+
+                columns['time'] = [convert_timestamp(t) for t in time_col]
 
         # Return columnar record marker
         return {
@@ -176,14 +185,22 @@ class MessagePackDecoder:
         if isinstance(measurement, int):
             measurement = f"measurement_{measurement}"  # TODO: lookup from registry
 
-        # Extract timestamp (milliseconds)
-        timestamp_ms = obj.get('t')
-        if timestamp_ms is None:
-            # Use current time if not provided
-            timestamp_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        # Extract timestamp (default: milliseconds for backwards compatibility)
+        timestamp_val = obj.get('t')
+        if timestamp_val is None:
+            # Use current time if not provided (generate as milliseconds for compatibility)
+            timestamp_val = int(datetime.now(timezone.utc).timestamp() * 1000)
 
-        # Convert to datetime
-        timestamp = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+        # Convert to datetime with auto-detection
+        if timestamp_val < 1e10:
+            # Seconds
+            timestamp = datetime.fromtimestamp(timestamp_val, tz=timezone.utc)
+        elif timestamp_val < 1e13:
+            # Milliseconds (default for msgpack API)
+            timestamp = datetime.fromtimestamp(timestamp_val / 1000, tz=timezone.utc)
+        else:
+            # Microseconds
+            timestamp = datetime.fromtimestamp(timestamp_val / 1000000, tz=timezone.utc)
 
         # Extract host
         host = obj.get('h', 'unknown')
