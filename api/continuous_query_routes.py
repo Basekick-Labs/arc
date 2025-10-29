@@ -669,34 +669,29 @@ async def execute_continuous_query(
                 for row in data:
                     record = dict(zip(columns, row))
 
-                    # Ensure time is in milliseconds (arrow_writer expects ms, not microseconds)
+                    # Convert time to datetime (arrow_writer will store as timestamp[us])
                     # OPTIMIZATION: When continuous queries use epoch_us() in SQL, time arrives as integer microseconds
-                    time_milliseconds = None
                     if 'time' in record:
                         time_val = record['time']
                         if isinstance(time_val, (int, float)):
-                            # Integer time - determine format by magnitude
-                            if time_val < 1_000_000_000_000:  # Less than 1T = seconds or milliseconds
-                                if time_val < 10_000_000_000:  # Less than 10B = seconds (e.g., 1729780800)
-                                    time_milliseconds = int(time_val * 1_000)
-                                else:  # Between 10B and 1T = milliseconds
-                                    time_milliseconds = int(time_val)
-                            else:
-                                # Greater than 1T = microseconds (e.g., 1729780800000000)
-                                time_milliseconds = int(time_val / 1_000)
-                        elif isinstance(time_val, datetime):
-                            time_milliseconds = int(time_val.timestamp() * 1_000)
+                            # Integer time - determine format by magnitude and convert to datetime
+                            if time_val < 1e10:  # Less than 10B = seconds (e.g., 1729780800)
+                                record['time'] = datetime.fromtimestamp(time_val, tz=timezone.utc)
+                            elif time_val < 1e13:  # Between 10B and 1T = milliseconds
+                                record['time'] = datetime.fromtimestamp(time_val / 1_000, tz=timezone.utc)
+                            else:  # Greater than 1T = microseconds (e.g., 1729780800000000)
+                                record['time'] = datetime.fromtimestamp(time_val / 1_000_000, tz=timezone.utc)
                         elif isinstance(time_val, str):
                             # LEGACY: Parse timestamp string from DuckDB (less efficient)
                             # Recommend using epoch_us() in queries instead
                             from dateutil import parser
-                            dt = parser.parse(time_val)
-                            time_milliseconds = int(dt.timestamp() * 1_000)
-
-                        record['time'] = time_milliseconds
+                            record['time'] = parser.parse(time_val)
+                        # elif isinstance(time_val, datetime): already correct, keep as-is
 
                     # Create flat record (arrow_writer expects flat dictionaries, not nested tags/fields)
-                    final_time = record.get('time', int(datetime.utcnow().timestamp() * 1_000))
+                    final_time = record.get('time')
+                    if not isinstance(final_time, datetime):
+                        final_time = datetime.utcnow().replace(tzinfo=timezone.utc)
 
                     flat_record = {
                         'measurement': query['destination_measurement'],
