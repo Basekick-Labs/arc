@@ -390,7 +390,9 @@ class ArrowParquetBuffer:
 
         while self._running:
             try:
-                await asyncio.sleep(5)
+                # Check every 1 second for more responsive flushing
+                # (reduces latency from buffer age to actual flush)
+                await asyncio.sleep(1)
 
                 # OPTIMIZATION: Extract aged measurements outside lock
                 records_to_flush = {}

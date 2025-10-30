@@ -47,6 +47,7 @@ COPY --chown=arc:arc storage/ ./storage/
 COPY --chown=arc:arc utils/ ./utils/
 COPY --chown=arc:arc telemetry/ ./telemetry/
 COPY --chown=arc:arc config.py config_loader.py ./
+COPY --chown=arc:arc arc.conf ./
 COPY --chown=arc:arc entrypoint.sh ./
 
 # Make entrypoint executable
