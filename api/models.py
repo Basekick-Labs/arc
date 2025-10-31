@@ -293,11 +293,15 @@ class QueryRequest(BaseModel):
     @field_validator('sql')
     @classmethod
     def validate_sql(cls, v):
-        # Basic SQL injection prevention
+        # Basic SQL injection prevention using word boundaries
+        # This prevents false positives like "drop_in" or "update_time" column names
         dangerous_keywords = ['DROP', 'DELETE', 'INSERT', 'UPDATE', 'ALTER', 'CREATE', 'TRUNCATE']
         sql_upper = v.upper()
         for keyword in dangerous_keywords:
-            if keyword in sql_upper:
+            # Use word boundaries to match only standalone keywords
+            # \b ensures we match whole words, not substrings
+            pattern = r'\b' + keyword + r'\b'
+            if re.search(pattern, sql_upper):
                 raise ValueError(f'SQL keyword "{keyword}" is not allowed')
         return v
 

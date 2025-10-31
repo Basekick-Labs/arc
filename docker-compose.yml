@@ -10,7 +10,7 @@ services:
     environment:
       # Storage configuration
       STORAGE_BACKEND: local
-      LOCAL_STORAGE_PATH: /app/data/arc/
+      STORAGE_LOCAL_BASE_PATH: /app/data/arc/
       # Database
       DB_PATH: /data/arc.db
       # Performance
