@@ -354,6 +354,57 @@ class MetricsCollector:
         """Get request count by endpoint"""
         return dict(self.requests_by_endpoint)
 
+    def health_check(self) -> Dict[str, Any]:
+        """
+        Health check for metrics collection
+
+        Returns status of metrics collection including error rates and warnings.
+        This allows monitoring systems to detect when metrics collection is failing.
+
+        Returns:
+            Dict with health status, error counts, and warnings
+        """
+        is_healthy = True
+        warnings = []
+
+        # Check if collection thread is running
+        if not (self._collection_thread and self._collection_thread.is_alive()):
+            is_healthy = False
+            warnings.append("Metrics collection thread is not running")
+
+        # Check for sustained failures
+        if self.metrics_collection_errors > 0:
+            if self.metrics_collection_errors >= 10:
+                is_healthy = False
+                warnings.append(
+                    f"CRITICAL: Metrics collection has failed {self.metrics_collection_errors} times consecutively"
+                )
+            elif self.metrics_collection_errors >= 3:
+                warnings.append(
+                    f"WARNING: Metrics collection has failed {self.metrics_collection_errors} times consecutively"
+                )
+
+        # Check if samples are being collected
+        samples_count = len(self.system_metrics)
+        if samples_count == 0 and self._collection_thread and self._collection_thread.is_alive():
+            warnings.append("No metrics samples collected yet (collection may have just started)")
+
+        # Calculate time since last error
+        time_since_last_error = None
+        if self.last_collection_error_time:
+            time_since_last_error = (datetime.now() - self.last_collection_error_time).total_seconds()
+
+        return {
+            "healthy": is_healthy,
+            "collection_running": self._collection_thread and self._collection_thread.is_alive(),
+            "consecutive_errors": self.metrics_collection_errors,
+            "last_error": self.last_collection_error,
+            "last_error_time": self.last_collection_error_time.isoformat() if self.last_collection_error_time else None,
+            "time_since_last_error_seconds": time_since_last_error,
+            "samples_collected": samples_count,
+            "warnings": warnings
+        }
+
 # Global metrics collector instance
 metrics_collector = MetricsCollector()
 
