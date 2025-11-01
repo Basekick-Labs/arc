@@ -96,18 +96,38 @@ class GCSBackend:
                 "error": f"Connection failed: {str(e)}"
             }
     
-    async def upload_file(self, local_path: Path, remote_path: str) -> bool:
-        """Upload a file to GCS"""
+    async def upload_file(self, local_path: Path, remote_path: str, timeout: int = 300) -> bool:
+        """Upload a file to GCS with timeout
+
+        Args:
+            local_path: Local file path to upload
+            remote_path: Remote path within GCS bucket
+            timeout: Upload timeout in seconds (default: 300s / 5 minutes)
+
+        Returns:
+            True if upload succeeded, False otherwise
+        """
         try:
             blob_name = f"{self.database}/{remote_path}"
             blob = self.bucket.blob(blob_name)
 
-            # Upload file
-            blob.upload_from_filename(str(local_path))
+            # Upload file in executor with timeout to prevent hanging
+            loop = asyncio.get_event_loop()
+            await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    blob.upload_from_filename,
+                    str(local_path)
+                ),
+                timeout=timeout
+            )
 
             logger.debug(f"Uploaded {local_path} to gs://{self.bucket_name}/{blob_name}")
             return True
-            
+
+        except asyncio.TimeoutError:
+            logger.error(f"Upload timeout after {timeout}s: {local_path}")
+            return False
         except Exception as e:
             logger.error(f"Failed to upload {local_path} to GCS: {e}")
             return False
@@ -169,8 +189,17 @@ class GCSBackend:
         
         return success_count
     
-    async def download_file(self, remote_path: str, local_path: Path) -> bool:
-        """Download a file from GCS"""
+    async def download_file(self, remote_path: str, local_path: Path, timeout: int = 300) -> bool:
+        """Download a file from GCS with timeout
+
+        Args:
+            remote_path: Remote path within GCS bucket
+            local_path: Local file path to download to
+            timeout: Download timeout in seconds (default: 300s / 5 minutes)
+
+        Returns:
+            True if download succeeded, False otherwise
+        """
         try:
             blob_name = f"{self.database}/{remote_path}"
             blob = self.bucket.blob(blob_name)
@@ -179,12 +208,23 @@ class GCSBackend:
                 logger.warning(f"File gs://{self.bucket_name}/{blob_name} does not exist")
                 return False
 
-            # Download file
-            blob.download_to_filename(str(local_path))
+            # Download file in executor with timeout to prevent hanging
+            loop = asyncio.get_event_loop()
+            await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    blob.download_to_filename,
+                    str(local_path)
+                ),
+                timeout=timeout
+            )
 
             logger.debug(f"Downloaded gs://{self.bucket_name}/{blob_name} to {local_path}")
             return True
-            
+
+        except asyncio.TimeoutError:
+            logger.error(f"Download timeout after {timeout}s: {remote_path}")
+            return False
         except Exception as e:
             logger.error(f"Failed to download {remote_path} from GCS: {e}")
             return False
