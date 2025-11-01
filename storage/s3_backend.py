@@ -91,30 +91,46 @@ class S3Backend:
                 logger.error(f"Failed to set S3 credentials: {fallback_error}")
                 raise
         
-    async def upload_file(self, local_path: Path, s3_key: str) -> bool:
-        """Upload single file to S3 asynchronously"""
+    async def upload_file(self, local_path: Path, s3_key: str, timeout: int = 300) -> bool:
+        """
+        Upload single file to S3 asynchronously with timeout
+
+        Args:
+            local_path: Local file path to upload
+            s3_key: S3 object key
+            timeout: Upload timeout in seconds (default: 300s / 5 minutes)
+
+        Returns:
+            True if upload succeeded, False otherwise
+        """
         try:
             full_key = f"{self.database}/{s3_key}"
-            
+
             # Read file asynchronously
             async with aiofiles.open(local_path, 'rb') as f:
                 file_data = await f.read()
-            
-            # Upload to S3 in executor
+
+            # Upload to S3 in executor with timeout
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None,
-                lambda: self.s3_client.put_object(
-                    Bucket=self.bucket,
-                    Key=full_key,
-                    Body=file_data,
-                    ContentType='application/octet-stream'
-                )
+            await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: self.s3_client.put_object(
+                        Bucket=self.bucket,
+                        Key=full_key,
+                        Body=file_data,
+                        ContentType='application/octet-stream'
+                    )
+                ),
+                timeout=timeout
             )
-            
+
             logger.info(f"Uploaded {local_path} to s3://{self.bucket}/{full_key}")
             return True
-            
+
+        except asyncio.TimeoutError:
+            logger.error(f"Upload timeout after {timeout}s: {local_path}")
+            return False
         except Exception as e:
             logger.error(f"Failed to upload {local_path}: {e}")
             return False

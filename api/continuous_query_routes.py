@@ -113,49 +113,48 @@ class ContinuousQueryManager:
     def _init_tables(self):
         """Initialize continuous query tables"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
 
-            # Continuous queries table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS continuous_queries (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT UNIQUE NOT NULL,
-                    description TEXT,
-                    database TEXT NOT NULL,
-                    source_measurement TEXT NOT NULL,
-                    destination_measurement TEXT NOT NULL,
-                    query TEXT NOT NULL,
-                    interval TEXT NOT NULL,
-                    retention_days INTEGER,
-                    delete_source_after_days INTEGER,
-                    is_active BOOLEAN DEFAULT TRUE,
-                    last_processed_time TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
+                # Continuous queries table
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS continuous_queries (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT UNIQUE NOT NULL,
+                        description TEXT,
+                        database TEXT NOT NULL,
+                        source_measurement TEXT NOT NULL,
+                        destination_measurement TEXT NOT NULL,
+                        query TEXT NOT NULL,
+                        interval TEXT NOT NULL,
+                        retention_days INTEGER,
+                        delete_source_after_days INTEGER,
+                        is_active BOOLEAN DEFAULT TRUE,
+                        last_processed_time TIMESTAMP,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
 
-            # Continuous query execution history
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS continuous_query_executions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    query_id INTEGER NOT NULL,
-                    execution_id TEXT NOT NULL,
-                    execution_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    status TEXT NOT NULL,
-                    start_time TIMESTAMP NOT NULL,
-                    end_time TIMESTAMP NOT NULL,
-                    records_read INTEGER,
-                    records_written INTEGER DEFAULT 0,
-                    execution_duration_seconds FLOAT,
-                    error_message TEXT,
-                    FOREIGN KEY (query_id) REFERENCES continuous_queries (id)
-                )
-            ''')
+                # Continuous query execution history
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS continuous_query_executions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        query_id INTEGER NOT NULL,
+                        execution_id TEXT NOT NULL,
+                        execution_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        status TEXT NOT NULL,
+                        start_time TIMESTAMP NOT NULL,
+                        end_time TIMESTAMP NOT NULL,
+                        records_read INTEGER,
+                        records_written INTEGER DEFAULT 0,
+                        execution_duration_seconds FLOAT,
+                        error_message TEXT,
+                        FOREIGN KEY (query_id) REFERENCES continuous_queries (id)
+                    )
+                ''')
 
-            conn.commit()
-            conn.close()
+                conn.commit()
             logger.info("Continuous query tables initialized")
 
         except Exception as e:
@@ -165,30 +164,29 @@ class ContinuousQueryManager:
     def create_query(self, cq: ContinuousQueryRequest) -> int:
         """Create new continuous query"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
 
-            cursor.execute('''
-                INSERT INTO continuous_queries
-                (name, description, database, source_measurement, destination_measurement,
-                 query, interval, retention_days, delete_source_after_days, is_active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                cq.name,
-                cq.description,
-                cq.database,
-                cq.source_measurement,
-                cq.destination_measurement,
-                cq.query,
-                cq.interval,
-                cq.retention_days,
-                cq.delete_source_after_days,
-                cq.is_active
-            ))
+                cursor.execute('''
+                    INSERT INTO continuous_queries
+                    (name, description, database, source_measurement, destination_measurement,
+                     query, interval, retention_days, delete_source_after_days, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    cq.name,
+                    cq.description,
+                    cq.database,
+                    cq.source_measurement,
+                    cq.destination_measurement,
+                    cq.query,
+                    cq.interval,
+                    cq.retention_days,
+                    cq.delete_source_after_days,
+                    cq.is_active
+                ))
 
-            query_id = cursor.lastrowid
-            conn.commit()
-            conn.close()
+                query_id = cursor.lastrowid
+                conn.commit()
 
             logger.info(f"Created continuous query: {cq.name} (ID: {query_id})")
             return query_id
@@ -204,50 +202,49 @@ class ContinuousQueryManager:
     def get_queries(self, database: Optional[str] = None, is_active: Optional[bool] = None) -> List[Dict]:
         """Get continuous queries with optional filters"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
 
-            # Build query with filters
-            where_clauses = []
-            params = []
+                # Build query with filters
+                where_clauses = []
+                params = []
 
-            if database:
-                where_clauses.append("cq.database = ?")
-                params.append(database)
+                if database:
+                    where_clauses.append("cq.database = ?")
+                    params.append(database)
 
-            if is_active is not None:
-                where_clauses.append("cq.is_active = ?")
-                params.append(is_active)
+                if is_active is not None:
+                    where_clauses.append("cq.is_active = ?")
+                    params.append(is_active)
 
-            where_sql = ""
-            if where_clauses:
-                where_sql = "WHERE " + " AND ".join(where_clauses)
+                where_sql = ""
+                if where_clauses:
+                    where_sql = "WHERE " + " AND ".join(where_clauses)
 
-            query_sql = f'''
-                SELECT
-                    cq.*,
-                    cqe.execution_time as last_execution_time,
-                    cqe.status as last_execution_status,
-                    cqe.records_written as last_records_written
-                FROM continuous_queries cq
-                LEFT JOIN (
-                    SELECT query_id, execution_time, status, records_written
-                    FROM continuous_query_executions
-                    WHERE id IN (
-                        SELECT MAX(id)
+                query_sql = f'''
+                    SELECT
+                        cq.*,
+                        cqe.execution_time as last_execution_time,
+                        cqe.status as last_execution_status,
+                        cqe.records_written as last_records_written
+                    FROM continuous_queries cq
+                    LEFT JOIN (
+                        SELECT query_id, execution_time, status, records_written
                         FROM continuous_query_executions
-                        GROUP BY query_id
-                    )
-                ) cqe ON cq.id = cqe.query_id
-                {where_sql}
-                ORDER BY cq.created_at DESC
-            '''
+                        WHERE id IN (
+                            SELECT MAX(id)
+                            FROM continuous_query_executions
+                            GROUP BY query_id
+                        )
+                    ) cqe ON cq.id = cqe.query_id
+                    {where_sql}
+                    ORDER BY cq.created_at DESC
+                '''
 
-            cursor.execute(query_sql, params)
+                cursor.execute(query_sql, params)
+                queries = [dict(row) for row in cursor.fetchall()]
 
-            queries = [dict(row) for row in cursor.fetchall()]
-            conn.close()
             return queries
 
         except Exception as e:
@@ -257,31 +254,30 @@ class ContinuousQueryManager:
     def get_query(self, query_id: int) -> Optional[Dict]:
         """Get single continuous query by ID"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
 
-            cursor.execute('''
-                SELECT
-                    cq.*,
-                    cqe.execution_time as last_execution_time,
-                    cqe.status as last_execution_status,
-                    cqe.records_written as last_records_written
-                FROM continuous_queries cq
-                LEFT JOIN (
-                    SELECT query_id, execution_time, status, records_written
-                    FROM continuous_query_executions
-                    WHERE id IN (
-                        SELECT MAX(id)
+                cursor.execute('''
+                    SELECT
+                        cq.*,
+                        cqe.execution_time as last_execution_time,
+                        cqe.status as last_execution_status,
+                        cqe.records_written as last_records_written
+                    FROM continuous_queries cq
+                    LEFT JOIN (
+                        SELECT query_id, execution_time, status, records_written
                         FROM continuous_query_executions
-                        GROUP BY query_id
-                    )
-                ) cqe ON cq.id = cqe.query_id
-                WHERE cq.id = ?
-            ''', (query_id,))
+                        WHERE id IN (
+                            SELECT MAX(id)
+                            FROM continuous_query_executions
+                            GROUP BY query_id
+                        )
+                    ) cqe ON cq.id = cqe.query_id
+                    WHERE cq.id = ?
+                ''', (query_id,))
 
-            row = cursor.fetchone()
-            conn.close()
+                row = cursor.fetchone()
 
             if row:
                 return dict(row)
@@ -294,32 +290,31 @@ class ContinuousQueryManager:
     def update_query(self, query_id: int, cq: ContinuousQueryRequest) -> bool:
         """Update existing continuous query"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
 
-            cursor.execute('''
-                UPDATE continuous_queries SET
-                name = ?, description = ?, database = ?, source_measurement = ?,
-                destination_measurement = ?, query = ?, interval = ?, retention_days = ?,
-                delete_source_after_days = ?, is_active = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            ''', (
-                cq.name,
-                cq.description,
-                cq.database,
-                cq.source_measurement,
-                cq.destination_measurement,
-                cq.query,
-                cq.interval,
-                cq.retention_days,
-                cq.delete_source_after_days,
-                cq.is_active,
-                query_id
-            ))
+                cursor.execute('''
+                    UPDATE continuous_queries SET
+                    name = ?, description = ?, database = ?, source_measurement = ?,
+                    destination_measurement = ?, query = ?, interval = ?, retention_days = ?,
+                    delete_source_after_days = ?, is_active = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                ''', (
+                    cq.name,
+                    cq.description,
+                    cq.database,
+                    cq.source_measurement,
+                    cq.destination_measurement,
+                    cq.query,
+                    cq.interval,
+                    cq.retention_days,
+                    cq.delete_source_after_days,
+                    cq.is_active,
+                    query_id
+                ))
 
-            rows_affected = cursor.rowcount
-            conn.commit()
-            conn.close()
+                rows_affected = cursor.rowcount
+                conn.commit()
 
             if rows_affected == 0:
                 return False
@@ -334,18 +329,17 @@ class ContinuousQueryManager:
     def delete_query(self, query_id: int) -> bool:
         """Delete continuous query"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
 
-            # Delete execution history first
-            cursor.execute('DELETE FROM continuous_query_executions WHERE query_id = ?', (query_id,))
+                # Delete execution history first
+                cursor.execute('DELETE FROM continuous_query_executions WHERE query_id = ?', (query_id,))
 
-            # Delete query
-            cursor.execute('DELETE FROM continuous_queries WHERE id = ?', (query_id,))
+                # Delete query
+                cursor.execute('DELETE FROM continuous_queries WHERE id = ?', (query_id,))
 
-            rows_affected = cursor.rowcount
-            conn.commit()
-            conn.close()
+                rows_affected = cursor.rowcount
+                conn.commit()
 
             if rows_affected == 0:
                 return False
@@ -360,19 +354,19 @@ class ContinuousQueryManager:
     def get_executions(self, query_id: int, limit: int = 50) -> List[Dict]:
         """Get execution history for a query"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
 
-            cursor.execute('''
-                SELECT * FROM continuous_query_executions
-                WHERE query_id = ?
-                ORDER BY execution_time DESC
-                LIMIT ?
-            ''', (query_id, limit))
+                cursor.execute('''
+                    SELECT * FROM continuous_query_executions
+                    WHERE query_id = ?
+                    ORDER BY execution_time DESC
+                    LIMIT ?
+                ''', (query_id, limit))
 
-            executions = [dict(row) for row in cursor.fetchall()]
-            conn.close()
+                executions = [dict(row) for row in cursor.fetchall()]
+
             return executions
 
         except Exception as e:
@@ -393,28 +387,27 @@ class ContinuousQueryManager:
     ):
         """Record continuous query execution"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
 
-            cursor.execute('''
-                INSERT INTO continuous_query_executions
-                (query_id, execution_id, status, start_time, end_time, records_read,
-                 records_written, execution_duration_seconds, error_message)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                query_id,
-                execution_id,
-                status,
-                start_time.isoformat(),
-                end_time.isoformat(),
-                records_read,
-                records_written,
-                execution_duration,
-                error_message
-            ))
+                cursor.execute('''
+                    INSERT INTO continuous_query_executions
+                    (query_id, execution_id, status, start_time, end_time, records_read,
+                     records_written, execution_duration_seconds, error_message)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    query_id,
+                    execution_id,
+                    status,
+                    start_time.isoformat(),
+                    end_time.isoformat(),
+                    records_read,
+                    records_written,
+                    execution_duration,
+                    error_message
+                ))
 
-            conn.commit()
-            conn.close()
+                conn.commit()
 
         except Exception as e:
             logger.error(f"Failed to record execution: {e}")
@@ -422,17 +415,16 @@ class ContinuousQueryManager:
     def update_last_processed_time(self, query_id: int, processed_time: datetime):
         """Update last processed time for a continuous query"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
 
-            cursor.execute('''
-                UPDATE continuous_queries
-                SET last_processed_time = ?
-                WHERE id = ?
-            ''', (processed_time.isoformat(), query_id))
+                cursor.execute('''
+                    UPDATE continuous_queries
+                    SET last_processed_time = ?
+                    WHERE id = ?
+                ''', (processed_time.isoformat(), query_id))
 
-            conn.commit()
-            conn.close()
+                conn.commit()
 
         except Exception as e:
             logger.error(f"Failed to update last processed time: {e}")

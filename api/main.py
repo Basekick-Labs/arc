@@ -540,9 +540,13 @@ async def startup_event():
             log_startup("Line protocol write service initialized")
 
             # Initialize Arrow buffer for MessagePack binary protocol
-            init_arrow_buffer(storage_backend, buffer_config)
-            await start_arrow_buffer()
-            log_startup("MessagePack binary protocol write service initialized (Direct Arrow)")
+            try:
+                init_arrow_buffer(storage_backend, buffer_config)
+                await start_arrow_buffer()
+                log_startup("MessagePack binary protocol write service initialized (Direct Arrow)")
+            except Exception as e:
+                logger.error(f"Failed to start Arrow buffer: {e}")
+                # Continue startup - other services may still work
 
             # Initialize compaction (only from first worker to avoid duplicate scheduler instances)
             compaction_config = arc_config.get_compaction_config()
@@ -578,19 +582,23 @@ async def startup_event():
                 init_compaction(compaction_manager, compaction_scheduler)
 
                 # Start scheduler (only runs if enabled=True, i.e., first worker only)
-                await compaction_scheduler.start()
+                try:
+                    await compaction_scheduler.start()
 
-                if scheduler_enabled:
-                    log_startup(
-                        f"Compaction scheduler started: "
-                        f"schedule='{compaction_config.get('schedule')}', "
-                        f"min_files={compaction_config.get('min_files')}, "
-                        f"target_size={compaction_config.get('target_file_size_mb')}MB"
-                    )
-                elif is_verbose:
-                    log_startup("Compaction scheduler disabled in configuration")
-                else:
-                    logger.debug(f"[Worker {os.getpid()}] Compaction enabled, scheduler running on primary worker")
+                    if scheduler_enabled:
+                        log_startup(
+                            f"Compaction scheduler started: "
+                            f"schedule='{compaction_config.get('schedule')}', "
+                            f"min_files={compaction_config.get('min_files')}, "
+                            f"target_size={compaction_config.get('target_file_size_mb')}MB"
+                        )
+                    elif is_verbose:
+                        log_startup("Compaction scheduler disabled in configuration")
+                    else:
+                        logger.debug(f"[Worker {os.getpid()}] Compaction enabled, scheduler running on primary worker")
+                except Exception as e:
+                    logger.error(f"Failed to start compaction scheduler: {e}")
+                    # Continue startup - compaction can still be triggered manually
             else:
                 log_startup("Compaction is disabled")
 

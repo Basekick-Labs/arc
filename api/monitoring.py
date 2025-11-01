@@ -68,16 +68,21 @@ class MetricsCollector:
     def __init__(self, retention_minutes: int = 60, sample_interval_seconds: int = 10):
         self.retention_minutes = retention_minutes
         self.sample_interval_seconds = sample_interval_seconds
-        
+
         # Metric storage (using deque for efficient rotation)
         self.system_metrics: deque = deque(maxlen=retention_minutes * 6)  # 10-second intervals
         self.api_metrics: deque = deque(maxlen=retention_minutes * 6)
         self.application_metrics: deque = deque(maxlen=retention_minutes * 6)
-        
+
         # API request tracking
         self.request_counter = 0
         self.error_counter = 0
         self.response_times = deque(maxlen=1000)  # Last 1000 requests
+
+        # Metrics collection error tracking
+        self.metrics_collection_errors = 0
+        self.last_collection_error = None
+        self.last_collection_error_time = None
         self.active_requests = 0
         self.requests_by_endpoint = defaultdict(int)
         self.request_times = deque(maxlen=1000)  # For requests per minute calculation
@@ -132,10 +137,28 @@ class MetricsCollector:
                 # Collect API metrics
                 api_metrics = self._collect_api_metrics(now)
                 self.api_metrics.append(api_metrics)
-                
+
+                # Reset error counter on successful collection
+                if self.metrics_collection_errors > 0:
+                    logger.info(f"Metrics collection recovered after {self.metrics_collection_errors} errors")
+                    self.metrics_collection_errors = 0
+
             except Exception as e:
-                logger.error(f"Error collecting metrics: {e}")
-            
+                # Track metrics collection errors
+                self.metrics_collection_errors += 1
+                self.last_collection_error = str(e)
+                self.last_collection_error_time = now
+
+                # Log error with context
+                logger.error(f"Error collecting metrics: {e} (total errors: {self.metrics_collection_errors})")
+
+                # Alert if sustained failures (10+ errors in a row)
+                if self.metrics_collection_errors >= 10:
+                    logger.critical(
+                        f"ALERT: Metrics collection failing continuously! "
+                        f"Errors: {self.metrics_collection_errors}, Last error: {self.last_collection_error}"
+                    )
+
             # Wait for next collection cycle
             self._stop_event.wait(self.sample_interval_seconds)
     
