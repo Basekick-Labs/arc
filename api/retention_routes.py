@@ -100,42 +100,41 @@ class RetentionPolicyManager:
     def _init_tables(self):
         """Initialize retention policy tables"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
 
-            # Retention policies table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS retention_policies (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT UNIQUE NOT NULL,
-                    database TEXT NOT NULL,
-                    measurement TEXT,
-                    retention_days INTEGER NOT NULL,
-                    buffer_days INTEGER DEFAULT 7,
-                    is_active BOOLEAN DEFAULT TRUE,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
+                # Retention policies table
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS retention_policies (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT UNIQUE NOT NULL,
+                        database TEXT NOT NULL,
+                        measurement TEXT,
+                        retention_days INTEGER NOT NULL,
+                        buffer_days INTEGER DEFAULT 7,
+                        is_active BOOLEAN DEFAULT TRUE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
 
-            # Retention policy execution history
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS retention_executions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    policy_id INTEGER NOT NULL,
-                    execution_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    status TEXT NOT NULL,
-                    deleted_count INTEGER DEFAULT 0,
-                    cutoff_date TIMESTAMP,
-                    execution_duration_ms FLOAT,
-                    error_message TEXT,
-                    FOREIGN KEY (policy_id) REFERENCES retention_policies (id)
-                )
-            ''')
+                # Retention policy execution history
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS retention_executions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        policy_id INTEGER NOT NULL,
+                        execution_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        status TEXT NOT NULL,
+                        deleted_count INTEGER DEFAULT 0,
+                        cutoff_date TIMESTAMP,
+                        execution_duration_ms FLOAT,
+                        error_message TEXT,
+                        FOREIGN KEY (policy_id) REFERENCES retention_policies (id)
+                    )
+                ''')
 
-            conn.commit()
-            conn.close()
-            logger.info("Retention policy tables initialized")
+                conn.commit()
+                logger.info("Retention policy tables initialized")
 
         except Exception as e:
             logger.error(f"Failed to initialize retention tables: {e}")
@@ -144,28 +143,27 @@ class RetentionPolicyManager:
     def create_policy(self, policy: RetentionPolicyRequest) -> int:
         """Create new retention policy"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
 
-            cursor.execute('''
-                INSERT INTO retention_policies
-                (name, database, measurement, retention_days, buffer_days, is_active)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (
-                policy.name,
-                policy.database,
-                policy.measurement,
-                policy.retention_days,
-                policy.buffer_days,
-                policy.is_active
-            ))
+                cursor.execute('''
+                    INSERT INTO retention_policies
+                    (name, database, measurement, retention_days, buffer_days, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (
+                    policy.name,
+                    policy.database,
+                    policy.measurement,
+                    policy.retention_days,
+                    policy.buffer_days,
+                    policy.is_active
+                ))
 
-            policy_id = cursor.lastrowid
-            conn.commit()
-            conn.close()
+                policy_id = cursor.lastrowid
+                conn.commit()
 
-            logger.info(f"Created retention policy: {policy.name} (ID: {policy_id})")
-            return policy_id
+                logger.info(f"Created retention policy: {policy.name} (ID: {policy_id})")
+                return policy_id
 
         except sqlite3.IntegrityError as e:
             if "UNIQUE constraint" in str(e):
@@ -178,32 +176,31 @@ class RetentionPolicyManager:
     def get_policies(self) -> List[Dict]:
         """Get all retention policies"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
 
-            cursor.execute('''
-                SELECT
-                    rp.*,
-                    re.execution_time as last_execution_time,
-                    re.status as last_execution_status,
-                    re.deleted_count as last_deleted_count
-                FROM retention_policies rp
-                LEFT JOIN (
-                    SELECT policy_id, execution_time, status, deleted_count
-                    FROM retention_executions
-                    WHERE id IN (
-                        SELECT MAX(id)
+                cursor.execute('''
+                    SELECT
+                        rp.*,
+                        re.execution_time as last_execution_time,
+                        re.status as last_execution_status,
+                        re.deleted_count as last_deleted_count
+                    FROM retention_policies rp
+                    LEFT JOIN (
+                        SELECT policy_id, execution_time, status, deleted_count
                         FROM retention_executions
-                        GROUP BY policy_id
-                    )
-                ) re ON rp.id = re.policy_id
-                ORDER BY rp.created_at DESC
-            ''')
+                        WHERE id IN (
+                            SELECT MAX(id)
+                            FROM retention_executions
+                            GROUP BY policy_id
+                        )
+                    ) re ON rp.id = re.policy_id
+                    ORDER BY rp.created_at DESC
+                ''')
 
-            policies = [dict(row) for row in cursor.fetchall()]
-            conn.close()
-            return policies
+                policies = [dict(row) for row in cursor.fetchall()]
+                return policies
 
         except Exception as e:
             logger.error(f"Failed to get retention policies: {e}")
@@ -212,35 +209,34 @@ class RetentionPolicyManager:
     def get_policy(self, policy_id: int) -> Optional[Dict]:
         """Get single retention policy by ID"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
 
-            cursor.execute('''
-                SELECT
-                    rp.*,
-                    re.execution_time as last_execution_time,
-                    re.status as last_execution_status,
-                    re.deleted_count as last_deleted_count
-                FROM retention_policies rp
-                LEFT JOIN (
-                    SELECT policy_id, execution_time, status, deleted_count
-                    FROM retention_executions
-                    WHERE id IN (
-                        SELECT MAX(id)
+                cursor.execute('''
+                    SELECT
+                        rp.*,
+                        re.execution_time as last_execution_time,
+                        re.status as last_execution_status,
+                        re.deleted_count as last_deleted_count
+                    FROM retention_policies rp
+                    LEFT JOIN (
+                        SELECT policy_id, execution_time, status, deleted_count
                         FROM retention_executions
-                        GROUP BY policy_id
-                    )
-                ) re ON rp.id = re.policy_id
-                WHERE rp.id = ?
-            ''', (policy_id,))
+                        WHERE id IN (
+                            SELECT MAX(id)
+                            FROM retention_executions
+                            GROUP BY policy_id
+                        )
+                    ) re ON rp.id = re.policy_id
+                    WHERE rp.id = ?
+                ''', (policy_id,))
 
-            row = cursor.fetchone()
-            conn.close()
+                row = cursor.fetchone()
 
-            if row:
-                return dict(row)
-            return None
+                if row:
+                    return dict(row)
+                return None
 
         except Exception as e:
             logger.error(f"Failed to get retention policy {policy_id}: {e}")
@@ -249,33 +245,32 @@ class RetentionPolicyManager:
     def update_policy(self, policy_id: int, policy: RetentionPolicyRequest) -> bool:
         """Update existing retention policy"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
 
-            cursor.execute('''
-                UPDATE retention_policies SET
-                name = ?, database = ?, measurement = ?, retention_days = ?,
-                buffer_days = ?, is_active = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            ''', (
-                policy.name,
-                policy.database,
-                policy.measurement,
-                policy.retention_days,
-                policy.buffer_days,
-                policy.is_active,
-                policy_id
-            ))
+                cursor.execute('''
+                    UPDATE retention_policies SET
+                    name = ?, database = ?, measurement = ?, retention_days = ?,
+                    buffer_days = ?, is_active = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                ''', (
+                    policy.name,
+                    policy.database,
+                    policy.measurement,
+                    policy.retention_days,
+                    policy.buffer_days,
+                    policy.is_active,
+                    policy_id
+                ))
 
-            rows_affected = cursor.rowcount
-            conn.commit()
-            conn.close()
+                rows_affected = cursor.rowcount
+                conn.commit()
 
-            if rows_affected == 0:
-                return False
+                if rows_affected == 0:
+                    return False
 
-            logger.info(f"Updated retention policy {policy_id}")
-            return True
+                logger.info(f"Updated retention policy {policy_id}")
+                return True
 
         except Exception as e:
             logger.error(f"Failed to update retention policy: {e}")
@@ -284,24 +279,23 @@ class RetentionPolicyManager:
     def delete_policy(self, policy_id: int) -> bool:
         """Delete retention policy"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
 
-            # Delete execution history first
-            cursor.execute('DELETE FROM retention_executions WHERE policy_id = ?', (policy_id,))
+                # Delete execution history first
+                cursor.execute('DELETE FROM retention_executions WHERE policy_id = ?', (policy_id,))
 
-            # Delete policy
-            cursor.execute('DELETE FROM retention_policies WHERE id = ?', (policy_id,))
+                # Delete policy
+                cursor.execute('DELETE FROM retention_policies WHERE id = ?', (policy_id,))
 
-            rows_affected = cursor.rowcount
-            conn.commit()
-            conn.close()
+                rows_affected = cursor.rowcount
+                conn.commit()
 
-            if rows_affected == 0:
-                return False
+                if rows_affected == 0:
+                    return False
 
-            logger.info(f"Deleted retention policy {policy_id}")
-            return True
+                logger.info(f"Deleted retention policy {policy_id}")
+                return True
 
         except Exception as e:
             logger.error(f"Failed to delete retention policy: {e}")
@@ -310,20 +304,19 @@ class RetentionPolicyManager:
     def get_executions(self, policy_id: int, limit: int = 50) -> List[Dict]:
         """Get execution history for a policy"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
 
-            cursor.execute('''
-                SELECT * FROM retention_executions
-                WHERE policy_id = ?
-                ORDER BY execution_time DESC
-                LIMIT ?
-            ''', (policy_id, limit))
+                cursor.execute('''
+                    SELECT * FROM retention_executions
+                    WHERE policy_id = ?
+                    ORDER BY execution_time DESC
+                    LIMIT ?
+                ''', (policy_id, limit))
 
-            executions = [dict(row) for row in cursor.fetchall()]
-            conn.close()
-            return executions
+                executions = [dict(row) for row in cursor.fetchall()]
+                return executions
 
         except Exception as e:
             logger.error(f"Failed to get executions for policy {policy_id}: {e}")
@@ -332,20 +325,19 @@ class RetentionPolicyManager:
     def record_execution_start(self, policy_id: int, cutoff_date: datetime) -> int:
         """Record retention execution start"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
 
-            cursor.execute('''
-                INSERT INTO retention_executions
-                (policy_id, execution_time, status, cutoff_date)
-                VALUES (?, CURRENT_TIMESTAMP, 'running', ?)
-            ''', (policy_id, cutoff_date.isoformat()))
+                cursor.execute('''
+                    INSERT INTO retention_executions
+                    (policy_id, execution_time, status, cutoff_date)
+                    VALUES (?, CURRENT_TIMESTAMP, 'running', ?)
+                ''', (policy_id, cutoff_date.isoformat()))
 
-            execution_id = cursor.lastrowid
-            conn.commit()
-            conn.close()
+                execution_id = cursor.lastrowid
+                conn.commit()
 
-            return execution_id
+                return execution_id
 
         except Exception as e:
             logger.error(f"Failed to record execution start: {e}")
@@ -361,20 +353,19 @@ class RetentionPolicyManager:
     ):
         """Record retention execution completion"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
 
-            cursor.execute('''
-                UPDATE retention_executions SET
-                status = ?,
-                deleted_count = ?,
-                execution_duration_ms = ?,
-                error_message = ?
-                WHERE id = ?
-            ''', (status, deleted_count, execution_duration_ms, error_message, execution_id))
+                cursor.execute('''
+                    UPDATE retention_executions SET
+                    status = ?,
+                    deleted_count = ?,
+                    execution_duration_ms = ?,
+                    error_message = ?
+                    WHERE id = ?
+                ''', (status, deleted_count, execution_duration_ms, error_message, execution_id))
 
-            conn.commit()
-            conn.close()
+                conn.commit()
 
         except Exception as e:
             logger.error(f"Failed to record execution complete: {e}")

@@ -10,6 +10,7 @@ from fastapi.responses import Response
 from typing import Optional
 import logging
 import gzip
+import io
 from ingest.msgpack_decoder import MessagePackDecoder
 from ingest.arrow_writer import ArrowParquetBuffer
 
@@ -152,7 +153,30 @@ async def write_msgpack(
         # Decompress if gzip encoded
         if content_encoding and content_encoding.lower() == 'gzip':
             try:
-                payload = gzip.decompress(payload)
+                # Security: Limit decompressed size to prevent DoS attacks
+                # A 1MB compressed payload could decompress to 100MB+
+                MAX_DECOMPRESSED_SIZE = 100 * 1024 * 1024  # 100MB limit
+
+                # Decompress with size check
+                decompressor = gzip.GzipFile(fileobj=io.BytesIO(payload))
+                decompressed_chunks = []
+                total_size = 0
+
+                while True:
+                    chunk = decompressor.read(8192)  # Read in 8KB chunks
+                    if not chunk:
+                        break
+                    total_size += len(chunk)
+                    if total_size > MAX_DECOMPRESSED_SIZE:
+                        raise ValueError(f"Decompressed payload exceeds {MAX_DECOMPRESSED_SIZE / (1024*1024):.0f}MB limit")
+                    decompressed_chunks.append(chunk)
+
+                payload = b''.join(decompressed_chunks)
+                logger.debug(f"Decompressed {len(payload)} bytes from gzip")
+
+            except ValueError as e:
+                logger.error(f"Decompressed payload too large: {e}")
+                raise HTTPException(status_code=413, detail=str(e))
             except Exception as e:
                 logger.error(f"Failed to decompress gzip payload: {e}")
                 raise HTTPException(status_code=400, detail=f"Invalid gzip compression: {e}")

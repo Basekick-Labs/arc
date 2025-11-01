@@ -298,13 +298,21 @@ class DuckDBConnectionPool:
                 if not conn.health_check():
                     # Try to recreate connection
                     try:
+                        # Close connection BEFORE acquiring lock to prevent deadlock
+                        old_conn_id = conn.stats.connection_id
                         conn.close()
-                        conn = DuckDBConnection(
-                            connection_id=conn.stats.connection_id,
+
+                        # Create new connection
+                        new_conn = DuckDBConnection(
+                            connection_id=old_conn_id,
                             configure_fn=self.configure_fn
                         )
+
+                        # NOW acquire lock for state update
                         with self.pool_lock:
-                            self.connections[conn.stats.connection_id] = conn
+                            self.connections[new_conn.stats.connection_id] = new_conn
+
+                        return new_conn
                     except Exception as e:
                         logger.error(f"Failed to recreate connection: {e}")
                         self.pool.put(conn)  # Return to pool anyway

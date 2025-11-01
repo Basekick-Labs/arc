@@ -56,13 +56,17 @@ class MinIOBackend:
                 logger.error(f"Failed to set MinIO S3 credentials: {fallback_error}")
                 raise
     
-    async def upload_file(self, local_path: Path, s3_key: str, database_override: str = None) -> bool:
-        """Upload single file to MinIO asynchronously
+    async def upload_file(self, local_path: Path, s3_key: str, database_override: str = None, timeout: int = 300) -> bool:
+        """Upload single file to MinIO asynchronously with timeout
 
         Args:
             local_path: Path to local file
             s3_key: S3 key (relative path without database prefix)
             database_override: Optional database name to override the instance's database
+            timeout: Upload timeout in seconds (default: 300s / 5 minutes)
+
+        Returns:
+            True if upload succeeded, False otherwise
         """
         try:
             # Use override database if provided, otherwise use instance database
@@ -71,26 +75,32 @@ class MinIOBackend:
             # Add database prefix to the key
             full_key = f"{db}/{s3_key}"
             logger.info(f"Upload key: {s3_key} -> full key: {full_key} (database: {db})")
-            
+
             # Read file asynchronously
             async with aiofiles.open(local_path, 'rb') as f:
                 file_data = await f.read()
-            
-            # Upload to MinIO in executor
+
+            # Upload to MinIO in executor with timeout
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None,
-                lambda: self.s3_client.put_object(
-                    Bucket=self.bucket,
-                    Key=full_key,
-                    Body=file_data,
-                    ContentType='application/octet-stream'
-                )
+            await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: self.s3_client.put_object(
+                        Bucket=self.bucket,
+                        Key=full_key,
+                        Body=file_data,
+                        ContentType='application/octet-stream'
+                    )
+                ),
+                timeout=timeout
             )
-            
+
             logger.info(f"Uploaded {local_path} to minio://{self.bucket}/{full_key}")
             return True
-            
+
+        except asyncio.TimeoutError:
+            logger.error(f"Upload timeout after {timeout}s: {local_path}")
+            return False
         except Exception as e:
             logger.error(f"Failed to upload {local_path}: {e}")
             return False
