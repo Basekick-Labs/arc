@@ -7,6 +7,19 @@ from datetime import datetime
 from enum import Enum
 import re
 
+# Pre-compiled regex patterns for performance (Issue #15)
+# Compiling patterns once at module load prevents repeated compilation on every request
+HOSTNAME_PATTERN = re.compile(r'^[a-zA-Z0-9.-]+$')
+BUCKET_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9.-]+$')
+TIME_DURATION_PATTERN = re.compile(r'^\d+[mhd]$')
+SQL_DANGEROUS_KEYWORDS = ['DROP', 'DELETE', 'INSERT', 'UPDATE', 'ALTER', 'CREATE', 'TRUNCATE']
+# Pre-compile SQL keyword patterns with word boundaries and case-insensitive flag
+# This avoids calling .upper() on large SQL strings which can be expensive
+SQL_KEYWORD_PATTERNS = {
+    keyword: re.compile(r'\b' + keyword + r'\b', re.IGNORECASE)
+    for keyword in SQL_DANGEROUS_KEYWORDS
+}
+
 class InfluxVersionEnum(str, Enum):
     v1x = "1x"
     v2x = "2x"
@@ -47,8 +60,8 @@ class InfluxDBConnectionBase(BaseModel):
     @field_validator('host')
     @classmethod
     def validate_host(cls, v):
-        # Basic hostname/IP validation
-        if not re.match(r'^[a-zA-Z0-9.-]+$', v):
+        # Basic hostname/IP validation using pre-compiled pattern
+        if not HOSTNAME_PATTERN.match(v):
             raise ValueError('Invalid hostname format')
         return v
 
@@ -117,8 +130,8 @@ class StorageConnectionBase(BaseModel):
     @field_validator('bucket')
     @classmethod
     def validate_bucket_name(cls, v):
-        # Basic bucket name validation
-        if not re.match(r'^[a-zA-Z0-9.-]+$', v):
+        # Basic bucket name validation using pre-compiled pattern
+        if not BUCKET_NAME_PATTERN.match(v):
             raise ValueError('Invalid bucket name format')
         return v
 
@@ -237,8 +250,8 @@ class ExportJobBase(BaseModel):
     @field_validator('chunk_size', 'overlap_buffer')
     @classmethod
     def validate_time_duration(cls, v):
-        # Validate time duration format (e.g., 1h, 30m, 1d)
-        if not re.match(r'^\d+[mhd]$', v):
+        # Validate time duration format using pre-compiled pattern (e.g., 1h, 30m, 1d)
+        if not TIME_DURATION_PATTERN.match(v):
             raise ValueError('Time duration must be in format: number + unit (m/h/d)')
         return v
 
@@ -293,15 +306,12 @@ class QueryRequest(BaseModel):
     @field_validator('sql')
     @classmethod
     def validate_sql(cls, v):
-        # Basic SQL injection prevention using word boundaries
+        # Basic SQL injection prevention using pre-compiled patterns with word boundaries
         # This prevents false positives like "drop_in" or "update_time" column names
-        dangerous_keywords = ['DROP', 'DELETE', 'INSERT', 'UPDATE', 'ALTER', 'CREATE', 'TRUNCATE']
-        sql_upper = v.upper()
-        for keyword in dangerous_keywords:
-            # Use word boundaries to match only standalone keywords
-            # \b ensures we match whole words, not substrings
-            pattern = r'\b' + keyword + r'\b'
-            if re.search(pattern, sql_upper):
+        # Optimization: Use case-insensitive regex to avoid .upper() on large SQL strings
+        for keyword in SQL_DANGEROUS_KEYWORDS:
+            # Use pre-compiled patterns for performance
+            if SQL_KEYWORD_PATTERNS[keyword].search(v):
                 raise ValueError(f'SQL keyword "{keyword}" is not allowed')
         return v
 

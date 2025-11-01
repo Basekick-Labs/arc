@@ -39,7 +39,10 @@ class AuthManager:
         self._cache_hits = 0
         self._cache_misses = 0
         self._cache_evictions = 0
+        self._cleanup_running = False
+        self._cleanup_thread = None
         self._init_db()
+        self._start_cleanup_thread()
 
     def _init_db(self):
         """Initialize authentication database"""
@@ -73,6 +76,60 @@ class AuthManager:
     def _hash_token(self, token: str) -> str:
         """Hash a token for storage"""
         return hashlib.sha256(token.encode()).hexdigest()
+
+    def _start_cleanup_thread(self):
+        """Start background thread to periodically clean expired cache entries (Issue #12)"""
+        self._cleanup_running = True
+        self._cleanup_thread = threading.Thread(
+            target=self._cleanup_expired_cache,
+            daemon=True,
+            name="auth-cache-cleanup"
+        )
+        self._cleanup_thread.start()
+        logger.debug("Started cache cleanup thread")
+
+    def _cleanup_expired_cache(self):
+        """
+        Background task to remove expired cache entries periodically.
+        Runs every cache_ttl seconds to prevent unbounded memory growth.
+        (Fix for Issue #12: Missing cleanup in AuthManager cache)
+        """
+        import time
+
+        # Run cleanup every cache_ttl seconds (or minimum 10 seconds)
+        cleanup_interval = max(self.cache_ttl, 10)
+
+        while self._cleanup_running:
+            try:
+                time.sleep(cleanup_interval)
+
+                current_time = time.time()
+                expired_count = 0
+
+                with self._cache_lock:
+                    # Find and remove expired entries
+                    expired_keys = [
+                        key for key, (_, expiry_time) in self._cache.items()
+                        if current_time >= expiry_time
+                    ]
+
+                    for key in expired_keys:
+                        del self._cache[key]
+                        expired_count += 1
+
+                if expired_count > 0:
+                    logger.debug(f"Cleaned up {expired_count} expired cache entries")
+
+            except Exception as e:
+                logger.error(f"Error in cache cleanup thread: {e}", exc_info=True)
+                # Continue running despite errors
+
+    def stop_cleanup_thread(self):
+        """Stop the background cleanup thread gracefully"""
+        self._cleanup_running = False
+        if self._cleanup_thread and self._cleanup_thread.is_alive():
+            self._cleanup_thread.join(timeout=5)
+            logger.debug("Stopped cache cleanup thread")
 
     def has_permission(self, token_info: Dict, permission: str) -> bool:
         """
@@ -466,7 +523,8 @@ class AuthManager:
                 "cache_hits": self._cache_hits,
                 "cache_misses": self._cache_misses,
                 "cache_evictions": self._cache_evictions,
-                "hit_rate_percent": round(hit_rate, 2)
+                "hit_rate_percent": round(hit_rate, 2),
+                "cleanup_thread_running": self._cleanup_running and (self._cleanup_thread and self._cleanup_thread.is_alive())
             }
 
     def ensure_seed_token(self, token: str, name: str = "default") -> bool:
