@@ -11,6 +11,7 @@ from typing import Optional, List, Dict, Any
 import logging
 import gzip
 import asyncio
+import os
 from datetime import datetime
 from ingest.line_protocol_parser import LineProtocolParser
 from ingest.parquet_buffer import ParquetBuffer
@@ -21,6 +22,10 @@ router = APIRouter(tags=["line-protocol"])
 
 # Global buffer instance (initialized on startup)
 parquet_buffer: Optional[ParquetBuffer] = None
+
+# Security: Maximum decompressed payload size (default 500MB)
+# This prevents gzip bomb DoS attacks (e.g., 100MB gzip -> 10GB decompressed)
+MAX_DECOMPRESSED_SIZE_BYTES = int(os.getenv("MAX_DECOMPRESSED_SIZE_MB", "500")) * 1024 * 1024
 
 
 def merge_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -84,12 +89,17 @@ async def decode_body(body: bytes, content_encoding: Optional[str] = None) -> st
     Telegraf sends gzip-compressed data by default.
     OPTIMIZATION: Gzip decompression runs in thread pool to release GIL.
 
+    Security: Enforces MAX_DECOMPRESSED_SIZE_BYTES limit to prevent gzip bomb DoS attacks.
+
     Args:
         body: Raw request body bytes
         content_encoding: Content-Encoding header value
 
     Returns:
         Decoded UTF-8 string
+
+    Raises:
+        HTTPException: If payload exceeds size limit or has invalid encoding
     """
     try:
         # Check if body is gzip compressed
@@ -105,7 +115,31 @@ async def decode_body(body: bytes, content_encoding: Optional[str] = None) -> st
         # OPTIMIZATION: Decompress in thread pool to avoid blocking event loop
         if is_gzipped:
             loop = asyncio.get_event_loop()
-            body = await loop.run_in_executor(None, _decompress_gzip_sync, body)
+            decompressed = await loop.run_in_executor(None, _decompress_gzip_sync, body)
+
+            # SECURITY: Check decompressed size to prevent gzip bomb DoS
+            if len(decompressed) > MAX_DECOMPRESSED_SIZE_BYTES:
+                size_mb = len(decompressed) / (1024 * 1024)
+                max_mb = MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024)
+                logger.error(
+                    f"Decompressed payload too large: {size_mb:.1f}MB exceeds limit of {max_mb:.0f}MB"
+                )
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Decompressed payload size ({size_mb:.1f}MB) exceeds maximum allowed ({max_mb:.0f}MB)"
+                )
+
+            body = decompressed
+        else:
+            # SECURITY: Check raw payload size for non-compressed requests
+            if len(body) > MAX_DECOMPRESSED_SIZE_BYTES:
+                size_mb = len(body) / (1024 * 1024)
+                max_mb = MAX_DECOMPRESSED_SIZE_BYTES / (1024 * 1024)
+                logger.error(f"Payload too large: {size_mb:.1f}MB exceeds limit of {max_mb:.0f}MB")
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Payload size ({size_mb:.1f}MB) exceeds maximum allowed ({max_mb:.0f}MB)"
+                )
 
         # Decode to UTF-8
         return body.decode('utf-8')

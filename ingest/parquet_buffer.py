@@ -245,15 +245,36 @@ class ParquetBuffer:
 
             # Re-add records to buffer on error (acquire lock to do so safely)
             async with self._lock:
-                # Only re-add if buffer isn't already too large (prevent infinite growth)
-                if len(self.buffers[measurement]) < self.max_buffer_size * 2:
-                    self.buffers[measurement].extend(records)
+                # Strict limit check - calculate available space BEFORE adding
+                buffer_records = self.buffers[measurement]
+                max_capacity = self.max_buffer_size * 2
+                available_space = max_capacity - len(buffer_records)
+
+                if available_space >= len(records):
+                    # Enough space to re-add all records
+                    buffer_records.extend(records)
                     # Reset start time for this measurement
                     if measurement not in self.buffer_start_times:
                         self.buffer_start_times[measurement] = datetime.now(timezone.utc)
-                    logger.warning(f"Re-added {len(records)} records to buffer after flush error")
+                    logger.warning(
+                        f"Re-added {len(records)} records to buffer after flush error "
+                        f"(buffer at {len(buffer_records)}/{max_capacity})"
+                    )
+                elif available_space > 0:
+                    # Partial space available - add what we can, drop the rest
+                    buffer_records.extend(records[:available_space])
+                    dropped = len(records) - available_space
+                    logger.error(
+                        f"Dropped {dropped} of {len(records)} records due to buffer overflow "
+                        f"(buffer at capacity: {len(buffer_records)}/{max_capacity})"
+                    )
+                    logger.error(f"This may indicate persistent storage issues. Check MinIO/S3 connectivity.")
                 else:
-                    logger.error(f"Dropping {len(records)} records - buffer for '{measurement}' already at capacity ({len(self.buffers[measurement])} records)")
+                    # No space available - drop all records
+                    logger.error(
+                        f"Dropping {len(records)} records - buffer for '{measurement}' already at capacity "
+                        f"({len(buffer_records)}/{max_capacity} records)"
+                    )
                     logger.error(f"This may indicate persistent storage issues. Check MinIO/S3 connectivity.")
 
     async def _flush_measurement(self, measurement: str):
