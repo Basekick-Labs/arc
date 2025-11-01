@@ -13,9 +13,10 @@ HOSTNAME_PATTERN = re.compile(r'^[a-zA-Z0-9.-]+$')
 BUCKET_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9.-]+$')
 TIME_DURATION_PATTERN = re.compile(r'^\d+[mhd]$')
 SQL_DANGEROUS_KEYWORDS = ['DROP', 'DELETE', 'INSERT', 'UPDATE', 'ALTER', 'CREATE', 'TRUNCATE']
-# Pre-compile SQL keyword patterns with word boundaries
+# Pre-compile SQL keyword patterns with word boundaries and case-insensitive flag
+# This avoids calling .upper() on large SQL strings which can be expensive
 SQL_KEYWORD_PATTERNS = {
-    keyword: re.compile(r'\b' + keyword + r'\b')
+    keyword: re.compile(r'\b' + keyword + r'\b', re.IGNORECASE)
     for keyword in SQL_DANGEROUS_KEYWORDS
 }
 
@@ -307,10 +308,10 @@ class QueryRequest(BaseModel):
     def validate_sql(cls, v):
         # Basic SQL injection prevention using pre-compiled patterns with word boundaries
         # This prevents false positives like "drop_in" or "update_time" column names
-        sql_upper = v.upper()
+        # Optimization: Use case-insensitive regex to avoid .upper() on large SQL strings
         for keyword in SQL_DANGEROUS_KEYWORDS:
             # Use pre-compiled patterns for performance
-            if SQL_KEYWORD_PATTERNS[keyword].search(sql_upper):
+            if SQL_KEYWORD_PATTERNS[keyword].search(v):
                 raise ValueError(f'SQL keyword "{keyword}" is not allowed')
         return v
 
