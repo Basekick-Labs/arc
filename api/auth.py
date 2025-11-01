@@ -21,20 +21,24 @@ logger = logging.getLogger(__name__)
 class AuthManager:
     """Simple token-based authentication manager with in-memory cache"""
 
-    def __init__(self, db_path: str = None, cache_ttl: int = 30):
+    def __init__(self, db_path: str = None, cache_ttl: int = 30, max_cache_size: int = 1000):
         """
         Initialize AuthManager
 
         Args:
             db_path: Path to SQLite database
             cache_ttl: Cache TTL in seconds (default: 30s)
+            max_cache_size: Maximum number of cached tokens (default: 1000)
         """
+        from collections import OrderedDict
         self.db_path = db_path or get_db_path()
         self.cache_ttl = cache_ttl
-        self._cache = {}  # token_hash -> (token_info, expiry_time)
+        self.max_cache_size = max_cache_size
+        self._cache = OrderedDict()  # token_hash -> (token_info, expiry_time), LRU order
         self._cache_lock = threading.Lock()
         self._cache_hits = 0
         self._cache_misses = 0
+        self._cache_evictions = 0
         self._init_db()
 
     def _init_db(self):
@@ -161,6 +165,8 @@ class AuthManager:
                 token_info, expiry_time = self._cache[token_hash]
                 if current_time < expiry_time:
                     self._cache_hits += 1
+                    # Move to end (most recently used)
+                    self._cache.move_to_end(token_hash)
                     return token_info
                 else:
                     # Cache expired, remove it
@@ -222,8 +228,14 @@ class AuthManager:
                         'permissions': permissions.split(',') if permissions else []
                     }
 
-                    # Store in cache
+                    # Store in cache with LRU eviction
                     with self._cache_lock:
+                        # Evict oldest entry if cache is full
+                        if len(self._cache) >= self.max_cache_size and token_hash not in self._cache:
+                            # Remove oldest (first item in OrderedDict)
+                            self._cache.popitem(last=False)
+                            self._cache_evictions += 1
+
                         self._cache[token_hash] = (token_info, current_time + self.cache_ttl)
 
                     return token_info
@@ -447,10 +459,13 @@ class AuthManager:
 
             return {
                 "cache_size": len(self._cache),
+                "max_cache_size": self.max_cache_size,
                 "cache_ttl_seconds": self.cache_ttl,
+                "utilization_percent": round(len(self._cache) / self.max_cache_size * 100, 1),
                 "total_requests": total_requests,
                 "cache_hits": self._cache_hits,
                 "cache_misses": self._cache_misses,
+                "cache_evictions": self._cache_evictions,
                 "hit_rate_percent": round(hit_rate, 2)
             }
 

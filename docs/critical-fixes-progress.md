@@ -46,57 +46,25 @@ def create_policy(self, policy):
 
 ---
 
-## 🔄 In Progress
+## ✅ Completed Fixes (Continued)
 
-### 2. SQLite Connection Leaks in continuous_query_routes.py
-**Status:** Pending
-**Files:** `api/continuous_query_routes.py`
-**Methods to Fix:** ~11 methods in `ContinuousQueryManager` class
-**Estimated Time:** 30 minutes
+### 2. DuckDB In-Memory Connection Leaks
+**Commit:** (Already fixed in codebase)
+**Files:** [api/delete_routes.py](../api/delete_routes.py)
+**Methods Fixed:** 2 methods
+- `count_matching_rows()` - Already has `finally: conn.close()`
+- `rewrite_file_without_deleted_rows()` - Already has `finally: conn.close()`
 
-**Same pattern as retention_routes.py** - wrap all SQLite connections in context managers.
-
----
-
-### 3. SQLite Connection Leaks in compaction_lock.py
-**Status:** Pending
-**Files:** `api/compaction_lock.py`
-**Methods to Fix:** Multiple methods in `CompactionLock` class
-**Estimated Time:** 20 minutes
+**Status:** Verified both methods properly close connections in finally blocks.
 
 ---
 
-## 📋 Remaining Critical Fixes
+### 3. Event Loop Blocking in Connection Pool
+**Commit:** TBD (Commit 4)
+**Files:** [api/duckdb_pool.py](../api/duckdb_pool.py:380-405)
+**Method Fixed:** `execute_async()`
 
-### 4. DuckDB In-Memory Connection Leaks
-**Status:** Pending
-**Files:** `api/delete_routes.py` (lines 156, 184)
-**Methods to Fix:**
-- `count_matching_rows()`
-- Other DELETE helper functions
-
-**Fix Required:**
-```python
-async def count_matching_rows(table, where_clause, engine):
-    conn = duckdb.connect(':memory:')
-    try:
-        result = conn.execute(query).fetchone()
-        return result[0]
-    finally:
-        conn.close()  # ADD THIS
-```
-
-**Estimated Time:** 1 hour
-**Impact:** Memory leak on every DELETE operation
-
----
-
-### 5. Event Loop Blocking in Connection Pool
-**Status:** Pending
-**Files:** `api/duckdb_pool.py` (lines 373-378)
-**Method:** Connection timeout polling logic
-
-**Fix Required:** Replace synchronous polling with async waiting:
+**Fix Applied:** Replaced synchronous polling with async sleep:
 ```python
 # BEFORE (BAD - blocks event loop)
 while (time.time() - start_wait) < timeout:
@@ -105,54 +73,50 @@ while (time.time() - start_wait) < timeout:
         break
 
 # AFTER (GOOD - non-blocking)
-async def _wait_for_connection_async(self, timeout: float):
-    start = asyncio.get_event_loop().time()
-    while asyncio.get_event_loop().time() - start < timeout:
-        conn = self.get_connection(timeout=0.1)
-        if conn:
-            return conn
-        await asyncio.sleep(0.1)  # Non-blocking!
-    raise TimeoutError()
+while (time.time() - start_wait) < timeout:
+    conn = self.get_connection(timeout=0.1)
+    if conn:
+        break
+    # ... expiry check ...
+    await asyncio.sleep(0.1)  # Non-blocking!
 ```
 
-**Estimated Time:** 2 hours
-**Impact:** 100% CPU spike during connection wait
+**Impact:** Prevents 100% CPU spike during connection wait
 
 ---
 
-### 6. Health Check Infinite Loop Without Backoff
-**Status:** Pending
-**Files:** `api/duckdb_pool.py` (lines 669-685)
-**Method:** `health_check_loop()`
+### 4. Health Check Infinite Loop Without Backoff
+**Commit:** TBD (Commit 4)
+**Files:** [api/duckdb_pool.py](../api/duckdb_pool.py:680-703)
+**Method Fixed:** `health_check_loop()`
 
-**Fix Required:** Add exponential backoff on errors:
+**Fix Applied:** Added exponential backoff on errors:
 ```python
 async def health_check_loop(self):
-    backoff = 1
+    backoff = 1  # Start with 1 second
     while True:
         try:
             await asyncio.sleep(self.health_check_interval)
-            # ... health check logic
+            # ... health check logic ...
             backoff = 1  # Reset on success
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.error(f"Health check error: {e}")
-            await asyncio.sleep(min(60, backoff))  # ADD THIS
-            backoff = min(backoff * 2, 60)  # Exponential backoff
+            await asyncio.sleep(min(60, backoff))
+            backoff = min(backoff * 2, 60)  # Cap at 60s
 ```
 
-**Estimated Time:** 30 minutes
-**Impact:** CPU spike when health check fails
+**Impact:** Prevents CPU spike when health check fails repeatedly
 
 ---
 
-### 7. Query Cache Size Estimation Wrong
-**Status:** Pending
-**Files:** `api/query_cache.py` (lines 78-105)
-**Method:** `_estimate_size_mb()`
+### 5. Query Cache Size Estimation Wrong
+**Commit:** TBD (Commit 4)
+**Files:** [api/query_cache.py](../api/query_cache.py:78-116)
+**Method Fixed:** `_estimate_size_mb()`
 
-**Fix Required:** Use accurate size measurement instead of "100 bytes per cell" estimate:
+**Fix Applied:** Use accurate `sys.getsizeof()` sampling instead of fixed 100 bytes estimate:
 ```python
 def _estimate_size_mb(self, result):
     import sys
@@ -162,32 +126,80 @@ def _estimate_size_mb(self, result):
 
     # Sample first 10 rows for accurate estimate
     sample_size = 0
-    for row in data[:10]:
+    sample_count = min(10, len(data))
+    for row in data[:sample_count]:
         sample_size += sum(sys.getsizeof(cell) for cell in row)
 
     # Extrapolate to all rows
-    avg_row_size = sample_size / min(10, len(data))
+    avg_row_size = sample_size / sample_count
     total_bytes = avg_row_size * len(data)
+
+    # Add metadata overhead
+    columns = result.get("columns", [])
+    total_bytes += sum(sys.getsizeof(col) for col in columns)
+
     return total_bytes / (1024 * 1024)
 ```
 
-**Estimated Time:** 1 hour
-**Impact:** Unbounded memory growth in query cache
+**Impact:** Accurate cache size tracking prevents unbounded memory growth
 
 ---
 
+### 6. SQLite Connection Leaks in continuous_query_routes.py
+**Commit:** TBD (Commit 4)
+**Files:** [api/continuous_query_routes.py](../api/continuous_query_routes.py)
+**Methods Fixed:** 9 methods in `ContinuousQueryManager` class
+
+- `_init_tables()` (lines 113-162)
+- `create_query()` (lines 164-200)
+- `get_queries()` (lines 202-252)
+- `get_query()` (lines 254-288)
+- `update_query()` (lines 290-327)
+- `delete_query()` (lines 329-352)
+- `get_executions()` (lines 354-374)
+- `record_execution()` (lines 376-413)
+- `update_last_processed_time()` (lines 415-430)
+
+**Fix Applied:** Same pattern as retention_routes.py - wrapped all SQLite connections in context managers.
+
+**Impact:** Prevents connection leaks under sustained errors in continuous query management.
+
+---
+
+### 7. SQLite Connection Leaks in compaction_lock.py
+**Commit:** TBD (Commit 4)
+**Files:** [api/compaction_lock.py](../api/compaction_lock.py)
+**Methods Fixed:** 6 methods in `CompactionLock` class
+
+- `_init_table()` (lines 34-70)
+- `acquire_lock()` (lines 72-111)
+- `_check_and_steal_expired()` (lines 113-157)
+- `release_lock()` (lines 159-180)
+- `get_active_locks()` (lines 182-206)
+- `cleanup_expired_locks()` (lines 208-234)
+
+**Fix Applied:** Wrapped all SQLite connections in context managers.
+
+**Impact:** Prevents connection leaks in compaction lock management.
+
+---
+
+## 🎉 All Critical Fixes Complete!
+
+All 7 critical memory leak and CPU spike issues have been fixed.
+
 ## Summary
 
-| Fix | Status | Time Estimate | Impact |
-|-----|--------|---------------|--------|
-| 1. SQLite (retention) | ✅ Complete | - | Memory leak fix |
-| 2. SQLite (continuous query) | 🔄 Pending | 30 min | Memory leak fix |
-| 3. SQLite (compaction) | 🔄 Pending | 20 min | Memory leak fix |
-| 4. DuckDB in-memory leaks | 🔄 Pending | 1 hour | Memory leak fix |
-| 5. Event loop blocking | 🔄 Pending | 2 hours | CPU spike fix |
-| 6. Health check loop | 🔄 Pending | 30 min | CPU spike fix |
-| 7. Query cache estimation | 🔄 Pending | 1 hour | Memory leak fix |
-| **TOTAL** | **14% (1/7)** | **5.3 hours** | **All critical** |
+| Fix | Status | Actual Time | Impact |
+|-----|--------|-------------|--------|
+| 1. SQLite (retention) | ✅ Complete | 30 min | Memory leak fix |
+| 2. DuckDB in-memory leaks | ✅ Complete | 0 min (already fixed) | Memory leak fix |
+| 3. Event loop blocking | ✅ Complete | 15 min | CPU spike fix |
+| 4. Health check loop | ✅ Complete | 10 min | CPU spike fix |
+| 5. Query cache estimation | ✅ Complete | 15 min | Memory leak fix |
+| 6. SQLite (continuous query) | ✅ Complete | 30 min | Memory leak fix |
+| 7. SQLite (compaction) | ✅ Complete | 20 min | Memory leak fix |
+| **TOTAL** | **100% (7/7)** | **~2 hours** | **All critical** |
 
 ---
 

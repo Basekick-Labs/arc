@@ -77,7 +77,7 @@ class QueryCache:
 
     def _estimate_size_mb(self, result: Dict[str, Any]) -> float:
         """
-        Estimate result size in MB
+        Estimate result size in MB using accurate measurement
 
         Args:
             result: Query result dict
@@ -86,19 +86,30 @@ class QueryCache:
             Estimated size in MB
         """
         try:
-            # Rough estimate: count data elements
-            data = result.get("data", [])
-            columns = result.get("columns", [])
+            import sys
 
+            data = result.get("data", [])
             if not data:
                 return 0.0
 
-            # Estimate: avg 100 bytes per cell
-            num_cells = len(data) * len(columns)
-            bytes_estimate = num_cells * 100
-            mb_estimate = bytes_estimate / (1024 * 1024)
+            # Sample first 10 rows for accurate estimate
+            sample_size = 0
+            sample_count = min(10, len(data))
 
-            return mb_estimate
+            for row in data[:sample_count]:
+                # Calculate size of each cell in the row
+                sample_size += sum(sys.getsizeof(cell) for cell in row)
+
+            # Extrapolate to all rows
+            avg_row_size = sample_size / sample_count
+            total_bytes = avg_row_size * len(data)
+
+            # Add overhead for columns and metadata
+            columns = result.get("columns", [])
+            metadata_bytes = sum(sys.getsizeof(col) for col in columns)
+            total_bytes += metadata_bytes
+
+            return total_bytes / (1024 * 1024)
 
         except Exception as e:
             logger.warning(f"Failed to estimate result size: {e}")

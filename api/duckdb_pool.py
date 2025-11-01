@@ -377,10 +377,10 @@ class DuckDBConnectionPool:
                 self.total_queries_queued += 1
                 logger.info(f"Query queued (priority={priority.name}, queue_depth={len(self.query_queue)})")
 
-            # Wait for connection with timeout
+            # Wait for connection with timeout (non-blocking with asyncio.sleep)
             start_wait = time.time()
             while (time.time() - start_wait) < timeout:
-                conn = self.get_connection(timeout=1.0)
+                conn = self.get_connection(timeout=0.1)
                 if conn:
                     break
 
@@ -400,6 +400,9 @@ class DuckDBConnectionPool:
                         "columns": [],
                         "row_count": 0
                     }
+
+                # Non-blocking wait before retry
+                await asyncio.sleep(0.1)
 
             if conn is None:
                 self.total_queries_timeout += 1
@@ -676,6 +679,7 @@ class DuckDBConnectionPool:
 
     async def health_check_loop(self):
         """Background task to periodically check connection health"""
+        backoff = 1  # Start with 1 second backoff
         while True:
             try:
                 await asyncio.sleep(self.health_check_interval)
@@ -686,11 +690,17 @@ class DuckDBConnectionPool:
                         if not conn.health_check():
                             logger.warning(f"Connection {conn.stats.connection_id} failed health check")
 
+                # Reset backoff on successful check
+                backoff = 1
+
             except asyncio.CancelledError:
                 logger.info("Health check loop cancelled")
                 break
             except Exception as e:
                 logger.error(f"Health check error: {e}")
+                # Exponential backoff on errors to prevent CPU spike
+                await asyncio.sleep(min(60, backoff))
+                backoff = min(backoff * 2, 60)  # Cap at 60 seconds
 
     def start_health_checks(self):
         """Start background health checking"""
