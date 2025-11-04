@@ -452,9 +452,25 @@ class DuckDBConnectionPool:
             if conn:
                 conn.reset_state()
 
-            # OPTIMIZATION: Return connection ASAP (before serialization)
-            # This allows other queries to use the connection while we serialize
-            self.return_connection(conn)
+            # CRITICAL FIX: For large result sets, close and recreate connection
+            # DuckDB holds onto memory internally even after result is deleted
+            # Closing the connection forces DuckDB to free all cached data
+            should_reset_conn = result is not None and len(result) > 5000
+
+            if should_reset_conn and conn:
+                try:
+                    logger.info(f"Large query ({len(result)} rows) - closing connection to release DuckDB memory")
+                    conn.close()
+                    # Return None to pool - will be recreated on next get_connection()
+                    self.return_connection(None)
+                except Exception as e:
+                    logger.warning(f"Error closing connection after large query: {e}")
+                    # Fall back to normal return
+                    self.return_connection(conn)
+            else:
+                # OPTIMIZATION: Return connection ASAP (before serialization)
+                # This allows other queries to use the connection while we serialize
+                self.return_connection(conn)
 
         # Serialize data for JSON AFTER releasing connection
         # MEMORY FIX: Explicitly track row count before serialization
