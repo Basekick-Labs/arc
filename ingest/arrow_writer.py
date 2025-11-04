@@ -240,6 +240,7 @@ class ArrowParquetBuffer:
         from collections import defaultdict
         self.buffers: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         self.buffer_start_times: Dict[str, datetime] = {}
+        self.buffer_retry_counts: Dict[str, int] = defaultdict(int)  # Track retry attempts per measurement
 
         # WAL (optional)
         self.wal_enabled = wal_enabled
@@ -499,6 +500,11 @@ class ArrowParquetBuffer:
                         await self.storage_backend.upload_file(tmp_path, remote_path, database_override=database_override)
                         self.total_records_written += num_records
                         self.total_flushes += 1
+
+                        # Reset retry counter on successful flush
+                        if measurement in self.buffer_retry_counts:
+                            self.buffer_retry_counts[measurement] = 0
+
                         logger.info(
                             f"Flushed {num_records} records for '{measurement}' to {remote_path} "
                             f"(Columnar passthrough)"
@@ -581,6 +587,10 @@ class ArrowParquetBuffer:
                     self.total_records_written += len(records)
                     self.total_flushes += 1
 
+                    # Reset retry counter on successful flush
+                    if measurement in self.buffer_retry_counts:
+                        self.buffer_retry_counts[measurement] = 0
+
                     logger.info(
                         f"Flushed {len(records)} records for '{measurement}' to {remote_path} "
                         f"(Direct Arrow)"
@@ -594,17 +604,43 @@ class ArrowParquetBuffer:
         except Exception as e:
             logger.error(f"Failed to flush Arrow measurement '{measurement}': {e}")
             self.total_errors += 1
-            # Re-add records to buffer on error (need lock)
+
+            # MEMORY LEAK FIX: Implement retry limits to prevent unbounded accumulation
+            # Previous behavior: retry until buffer hits 2x max_size (could accumulate indefinitely)
+            # New behavior: limit retries per measurement, drop on persistent failures
+            MAX_RETRIES = 3  # Maximum retry attempts before dropping
+
             async with self._lock:
-                if len(self.buffers[measurement]) < self.max_buffer_size * 2:
+                retry_count = self.buffer_retry_counts[measurement]
+
+                if retry_count < MAX_RETRIES and len(self.buffers[measurement]) < self.max_buffer_size * 2:
+                    # Re-add records to buffer for retry
                     self.buffers[measurement].extend(records)
+                    self.buffer_retry_counts[measurement] += 1
+
                     # Restore start time if needed
                     if measurement not in self.buffer_start_times:
                         from datetime import datetime, timezone
                         self.buffer_start_times[measurement] = datetime.now(timezone.utc)
-                    logger.warning(f"Re-added {len(records)} records to Arrow buffer after error")
+
+                    logger.warning(
+                        f"Re-added {len(records)} records to Arrow buffer after error "
+                        f"(retry {retry_count + 1}/{MAX_RETRIES})"
+                    )
                 else:
-                    logger.error(f"Dropping {len(records)} records due to persistent errors")
+                    # Drop records after max retries or buffer too full
+                    reason = "max retries exceeded" if retry_count >= MAX_RETRIES else "buffer full"
+                    logger.error(
+                        f"Dropping {len(records)} records for '{measurement}' ({reason}). "
+                        f"Retry count: {retry_count}, Buffer size: {len(self.buffers[measurement])}"
+                    )
+                    # Reset retry counter after dropping
+                    self.buffer_retry_counts[measurement] = 0
+
+                    # Force garbage collection to free dropped records
+                    import gc
+                    del records
+                    gc.collect()
 
     async def flush_all(self):
         """Flush all measurement buffers"""
@@ -678,6 +714,11 @@ class ArrowParquetBuffer:
             'current_buffer_sizes': {
                 measurement: len(records)
                 for measurement, records in self.buffers.items()
+            },
+            'retry_counts': {
+                measurement: count
+                for measurement, count in self.buffer_retry_counts.items()
+                if count > 0  # Only show measurements with active retries
             },
             'oldest_buffer_age_seconds': oldest_age,
             'writer_type': 'Direct Arrow (zero-copy)',
