@@ -1155,8 +1155,8 @@ async def execute_sql(request: Request, query: QueryRequest):
         elif row_count > 10000:
             warning_message = f"Moderate result: {row_count:,} rows returned. Consider using 'LIMIT' if you don't need all rows."
 
-        # Return structured response - no truncation, user gets full control
-        return QueryResponse(
+        # Extract data for response before potential cleanup
+        response_data = QueryResponse(
             success=True,
             columns=result.get("columns", []),
             data=result.get("data", []),
@@ -1165,6 +1165,18 @@ async def execute_sql(request: Request, query: QueryRequest):
             timestamp=datetime.now(),
             error=warning_message  # Use error field for educational warnings
         )
+
+        # MEMORY FIX: If result wasn't cached, explicitly delete it to free memory
+        # The response_data now holds the data, so we can safely delete the intermediate result
+        if not (query_cache and cached):
+            del result
+            # For large results, suggest garbage collection to free memory immediately
+            if row_count > 10000:
+                import gc
+                gc.collect()
+                logger.debug(f"Triggered garbage collection after {row_count:,} row query")
+
+        return response_data
 
     except asyncio.TimeoutError:
         logger.error("Query timed out after 5 minutes")

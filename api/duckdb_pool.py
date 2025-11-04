@@ -457,6 +457,9 @@ class DuckDBConnectionPool:
             self.return_connection(conn)
 
         # Serialize data for JSON AFTER releasing connection
+        # MEMORY FIX: Explicitly track row count before serialization
+        row_count = len(result)
+
         serialized_data = []
         for row in result:
             serialized_row = []
@@ -469,13 +472,17 @@ class DuckDBConnectionPool:
                     serialized_row.append(str(value))
             serialized_data.append(serialized_row)
 
-        logger.info(f"Query executed: {len(result)} rows in {exec_time:.3f}s (wait: {wait_time:.3f}s)")
+        # MEMORY FIX: Explicitly delete the DuckDB result object to free memory
+        # The result object may hold references to large data structures
+        del result
+
+        logger.info(f"Query executed: {row_count} rows in {exec_time:.3f}s (wait: {wait_time:.3f}s)")
 
         return {
             "success": True,
             "data": serialized_data,
             "columns": columns,
-            "row_count": len(result),
+            "row_count": row_count,
             "execution_time_ms": round(exec_time * 1000, 2),
             "wait_time_ms": round(wait_time * 1000, 2)
         }
