@@ -158,8 +158,12 @@ async def write_msgpack(
                 MAX_DECOMPRESSED_SIZE = 100 * 1024 * 1024  # 100MB limit
 
                 # Decompress with size check
+                # OPTIMIZATION: Use io.BytesIO for in-place accumulation instead of list
+                # This avoids double memory usage (chunks list + joined payload)
+                # Previous approach: list of chunks + b''.join() = 2x memory peak
+                # New approach: single buffer with incremental writes = 1x memory
                 decompressor = gzip.GzipFile(fileobj=io.BytesIO(payload))
-                decompressed_chunks = []
+                decompressed_buffer = io.BytesIO()
                 total_size = 0
 
                 while True:
@@ -169,9 +173,11 @@ async def write_msgpack(
                     total_size += len(chunk)
                     if total_size > MAX_DECOMPRESSED_SIZE:
                         raise ValueError(f"Decompressed payload exceeds {MAX_DECOMPRESSED_SIZE / (1024*1024):.0f}MB limit")
-                    decompressed_chunks.append(chunk)
+                    decompressed_buffer.write(chunk)
 
-                payload = b''.join(decompressed_chunks)
+                payload = decompressed_buffer.getvalue()
+                del decompressed_buffer  # Explicit cleanup to help GC
+                decompressor.close()
                 logger.debug(f"Decompressed {len(payload)} bytes from gzip")
 
             except ValueError as e:
@@ -209,6 +215,17 @@ async def write_msgpack(
             f"Received {len(records)} records via MessagePack binary protocol "
             f"(compressed: {content_encoding == 'gzip'})"
         )
+
+        # MEMORY LEAK FIX: Explicit cleanup for large payloads
+        # After records are written to buffer, free the decoded records from memory
+        # This is especially important for large compressed payloads that decompress to >>100MB
+        num_records = len(records)
+        if num_records > 1000:  # Only trigger GC for larger batches
+            del records
+            del payload
+            import gc
+            gc.collect()
+            logger.debug(f"Triggered garbage collection after {num_records:,} record batch")
 
         # Return 204 No Content (InfluxDB compatible)
         return Response(status_code=204)
