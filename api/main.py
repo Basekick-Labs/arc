@@ -1166,15 +1166,16 @@ async def execute_sql(request: Request, query: QueryRequest):
             error=warning_message  # Use error field for educational warnings
         )
 
-        # MEMORY FIX: If result wasn't cached, explicitly delete it to free memory
-        # The response_data now holds the data, so we can safely delete the intermediate result
+        # CRITICAL MEMORY FIX: Aggressively free memory after large queries
+        # DuckDB and Python both hold onto memory - force release
         if not (query_cache and cached):
             del result
-            # For large results, suggest garbage collection to free memory immediately
-            if row_count > 10000:
+            # LOWERED THRESHOLD: Trigger GC for queries >5000 rows (was 10000)
+            # DuckDB memory doesn't release without explicit GC
+            if row_count > 5000:
                 import gc
                 gc.collect()
-                logger.debug(f"Triggered garbage collection after {row_count:,} row query")
+                logger.info(f"Forced garbage collection after {row_count:,} row query to release DuckDB memory")
 
         return response_data
 
