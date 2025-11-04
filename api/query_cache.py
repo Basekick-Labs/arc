@@ -30,7 +30,8 @@ class QueryCache:
         self,
         ttl_seconds: int = None,
         max_size: int = None,
-        max_result_size_mb: int = None
+        max_result_size_mb: int = None,
+        max_total_cache_mb: int = None
     ):
         """
         Initialize query cache
@@ -39,14 +40,19 @@ class QueryCache:
             ttl_seconds: Cache TTL in seconds (default: 60, from env QUERY_CACHE_TTL)
             max_size: Maximum number of cached queries (default: 100, from env QUERY_CACHE_MAX_SIZE)
             max_result_size_mb: Max size of individual result to cache in MB (default: 10)
+            max_total_cache_mb: Max total cache size in MB (default: 200)
         """
         self.ttl_seconds = ttl_seconds or int(os.getenv("QUERY_CACHE_TTL", "60"))
         self.max_size = max_size or int(os.getenv("QUERY_CACHE_MAX_SIZE", "100"))
         self.max_result_size_mb = max_result_size_mb or int(os.getenv("QUERY_CACHE_MAX_RESULT_MB", "10"))
+        self.max_total_cache_mb = max_total_cache_mb or int(os.getenv("QUERY_CACHE_MAX_TOTAL_MB", "200"))
 
         # Use OrderedDict for LRU eviction
         self.cache: OrderedDict[str, Tuple[Dict[str, Any], datetime]] = OrderedDict()
         self.lock = threading.RLock()
+
+        # Track total cache size
+        self.current_cache_size_mb = 0.0
 
         # Metrics
         self.hits = 0
@@ -54,10 +60,85 @@ class QueryCache:
         self.evictions = 0
         self.expirations = 0
 
+        # Background cleanup thread
+        self._cleanup_running = False
+        self._cleanup_thread = None
+
         logger.info(
             f"Query cache initialized: TTL={self.ttl_seconds}s, "
-            f"MaxSize={self.max_size}, MaxResultSize={self.max_result_size_mb}MB"
+            f"MaxSize={self.max_size}, MaxResultSize={self.max_result_size_mb}MB, "
+            f"MaxTotalCache={self.max_total_cache_mb}MB"
         )
+
+        # Start background cleanup
+        self._start_cleanup_thread()
+
+    def _start_cleanup_thread(self):
+        """Start background thread to clean expired entries"""
+        self._cleanup_running = True
+        self._cleanup_thread = threading.Thread(
+            target=self._cleanup_expired,
+            daemon=True,
+            name="query-cache-cleanup"
+        )
+        self._cleanup_thread.start()
+        logger.debug("Started query cache cleanup thread")
+
+    def _cleanup_expired(self):
+        """
+        Background task to remove expired cache entries.
+        Runs every ttl_seconds/2 to ensure memory is actually released.
+        """
+        import time
+        import gc
+
+        # Run cleanup at half the TTL interval (more aggressive)
+        cleanup_interval = max(self.ttl_seconds // 2, 10)
+
+        while self._cleanup_running:
+            try:
+                time.sleep(cleanup_interval)
+
+                current_time = datetime.now()
+                expired_count = 0
+                freed_mb = 0.0
+
+                with self.lock:
+                    # Find expired entries
+                    expired_keys = []
+                    for key, (cached_data, cached_at) in list(self.cache.items()):
+                        age_seconds = (current_time - cached_at).total_seconds()
+                        if age_seconds >= self.ttl_seconds:
+                            expired_keys.append(key)
+                            # Track size for metrics
+                            freed_mb += self._estimate_size_mb(cached_data)
+
+                    # Remove expired entries
+                    for key in expired_keys:
+                        del self.cache[key]
+                        expired_count += 1
+                        self.expirations += 1
+
+                    # Update total cache size
+                    self.current_cache_size_mb -= freed_mb
+
+                if expired_count > 0:
+                    logger.info(
+                        f"Cache cleanup: removed {expired_count} expired entries, "
+                        f"freed {freed_mb:.1f}MB"
+                    )
+                    # Force GC to actually release the memory
+                    gc.collect()
+
+            except Exception as e:
+                logger.error(f"Error in cache cleanup thread: {e}", exc_info=True)
+
+    def stop_cleanup_thread(self):
+        """Stop the background cleanup thread gracefully"""
+        self._cleanup_running = False
+        if self._cleanup_thread and self._cleanup_thread.is_alive():
+            self._cleanup_thread.join(timeout=5)
+            logger.debug("Stopped cache cleanup thread")
 
     def _make_key(self, sql: str, limit: int) -> str:
         """
@@ -189,19 +270,43 @@ class QueryCache:
         key = self._make_key(sql, limit)
 
         with self.lock:
-            # Evict oldest if cache is full
+            # Check if total cache size would exceed limit
+            # Evict entries until we have space
+            while (self.current_cache_size_mb + size_mb > self.max_total_cache_mb and
+                   len(self.cache) > 0 and key not in self.cache):
+                # Remove oldest entry
+                oldest_key, (oldest_data, _) = self.cache.popitem(last=False)
+                oldest_size = self._estimate_size_mb(oldest_data)
+                self.current_cache_size_mb -= oldest_size
+                self.evictions += 1
+                logger.debug(
+                    f"Cache EVICT: Total size limit ({self.max_total_cache_mb}MB), "
+                    f"freed {oldest_size:.1f}MB"
+                )
+
+            # Evict oldest if cache entry count is full
             if len(self.cache) >= self.max_size and key not in self.cache:
                 # Remove oldest (first item in OrderedDict)
-                oldest_key, _ = self.cache.popitem(last=False)
+                oldest_key, (oldest_data, _) = self.cache.popitem(last=False)
+                oldest_size = self._estimate_size_mb(oldest_data)
+                self.current_cache_size_mb -= oldest_size
                 self.evictions += 1
-                logger.debug(f"Cache EVICT: Removed oldest entry (full at {self.max_size})")
+                logger.debug(f"Cache EVICT: Entry count limit ({self.max_size})")
+
+            # If updating existing entry, subtract old size first
+            if key in self.cache:
+                old_data, _ = self.cache[key]
+                old_size = self._estimate_size_mb(old_data)
+                self.current_cache_size_mb -= old_size
 
             # Store result
             self.cache[key] = (result, datetime.now())
+            self.current_cache_size_mb += size_mb
 
             logger.debug(
                 f"Cache SET: rows={result.get('row_count', 0)}, "
-                f"size={size_mb:.2f}MB, sql={sql[:50]}"
+                f"size={size_mb:.2f}MB, total={self.current_cache_size_mb:.1f}MB, "
+                f"sql={sql[:50]}"
             )
 
             return True
