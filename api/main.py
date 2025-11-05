@@ -529,9 +529,23 @@ async def startup_event():
             # Initialize parquet buffer with configuration
             # Optimized for high throughput: larger buffers, reduce flush overhead
             buffer_config = {
-                'max_buffer_size': int(os.getenv('WRITE_BUFFER_SIZE', ingestion_config.get('buffer_size', 10000))),
-                'max_buffer_age_seconds': int(os.getenv('WRITE_BUFFER_AGE', ingestion_config.get('buffer_age_seconds', 60))),
-                'compression': os.getenv('WRITE_COMPRESSION', ingestion_config.get('compression', 'snappy')),
+                # New consistent env var names (BUFFER_SIZE, BUFFER_AGE_SECONDS, COMPRESSION)
+                # with fallback to legacy names (WRITE_BUFFER_SIZE, WRITE_BUFFER_AGE, WRITE_COMPRESSION)
+                'max_buffer_size': int(
+                    os.getenv('BUFFER_SIZE') or
+                    os.getenv('WRITE_BUFFER_SIZE') or
+                    ingestion_config.get('buffer_size', 10000)
+                ),
+                'max_buffer_age_seconds': int(
+                    os.getenv('BUFFER_AGE_SECONDS') or
+                    os.getenv('WRITE_BUFFER_AGE') or
+                    ingestion_config.get('buffer_age_seconds', 60)
+                ),
+                'compression': (
+                    os.getenv('COMPRESSION') or
+                    os.getenv('WRITE_COMPRESSION') or
+                    ingestion_config.get('compression', 'snappy')
+                ),
                 'wal_enabled': wal_config.get('enabled', False),
                 'wal_config': wal_config
             }
