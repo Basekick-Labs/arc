@@ -188,6 +188,11 @@ class ArcConfig:
             "DELETE_AUDIT_ENABLED": ("delete", "audit_enabled", lambda x: x.lower() == "true"),
 
             # Ingestion
+            # New consistent naming (matches arc.conf keys)
+            "BUFFER_SIZE": ("ingestion", "buffer_size", int),
+            "BUFFER_AGE_SECONDS": ("ingestion", "buffer_age_seconds", int),
+            "COMPRESSION": ("ingestion", "compression"),
+            # Legacy support (old inconsistent names)
             "WRITE_BUFFER_SIZE": ("ingestion", "buffer_size", int),
             "WRITE_BUFFER_AGE": ("ingestion", "buffer_age_seconds", int),
             "WRITE_COMPRESSION": ("ingestion", "compression"),
