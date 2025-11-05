@@ -360,23 +360,45 @@ class CompactionManager:
                 partition_path = partition_info['path']
                 files = partition_info['files']
 
-                # Check if meets criteria
-                if len(files) >= self.min_files:
-                    # Check if already compacted (has *_compacted.parquet file)
-                    has_compacted = any('_compacted.parquet' in f for f in files)
+                # Separate compacted and uncompacted files
+                compacted_files = [f for f in files if '_compacted.parquet' in f]
+                uncompacted_files = [f for f in files if '_compacted.parquet' not in f]
 
-                    if not has_compacted:
-                        candidates.append({
-                            'database': database,
-                            'measurement': measurement,
-                            'partition_path': partition_path,
-                            'file_count': len(files),
-                            'files': files
-                        })
+                # Check if meets criteria for compaction
+                # Case 1: No compacted files yet, and has enough total files
+                # Case 2: Has compacted files, but also has many new uncompacted files
+                should_compact = False
+                files_to_compact = []
 
-                        logger.info(
-                            f"Candidate: {database}/{partition_path} ({len(files)} files)"
-                        )
+                if not compacted_files and len(files) >= self.min_files:
+                    # First time compaction - compact all files
+                    should_compact = True
+                    files_to_compact = files
+                    logger.debug(
+                        f"{database}/{partition_path}: First compaction - {len(files)} files"
+                    )
+                elif compacted_files and len(uncompacted_files) >= self.min_files:
+                    # Re-compaction - has compacted files + many new uncompacted files
+                    # Compact ALL files (compacted + uncompacted) into new larger compacted file
+                    should_compact = True
+                    files_to_compact = files
+                    logger.info(
+                        f"{database}/{partition_path}: Re-compaction - "
+                        f"{len(compacted_files)} compacted + {len(uncompacted_files)} uncompacted files"
+                    )
+
+                if should_compact:
+                    candidates.append({
+                        'database': database,
+                        'measurement': measurement,
+                        'partition_path': partition_path,
+                        'file_count': len(files_to_compact),
+                        'files': files_to_compact
+                    })
+
+                    logger.info(
+                        f"Candidate: {database}/{partition_path} ({len(files_to_compact)} files)"
+                    )
 
         logger.info(f"Found {len(candidates)} compaction candidates")
         return candidates
