@@ -292,6 +292,30 @@ class DuckDBConnectionPool:
         try:
             conn = self.pool.get(timeout=timeout)
 
+            # Handle None (connection was closed by large query cleanup)
+            if conn is None:
+                logger.debug("Got None from pool, creating new connection")
+                # Find first closed connection slot or create new one
+                with self.pool_lock:
+                    for i, existing_conn in enumerate(self.connections):
+                        if not existing_conn.stats.is_healthy:
+                            # Reuse this slot
+                            try:
+                                new_conn = DuckDBConnection(
+                                    connection_id=i,
+                                    configure_fn=self.configure_fn
+                                )
+                                self.connections[i] = new_conn
+                                logger.info(f"Recreated connection {i} to replace closed connection")
+                                return new_conn
+                            except Exception as e:
+                                logger.error(f"Failed to recreate connection {i}: {e}")
+                                return None
+
+                # If all connections are healthy but we got None, something is wrong
+                logger.error("Got None from pool but no closed connections found")
+                return None
+
             # Verify connection health
             if not conn.stats.is_healthy:
                 logger.warning(f"Got unhealthy connection {conn.stats.connection_id}, attempting recovery")
@@ -312,6 +336,7 @@ class DuckDBConnectionPool:
                         with self.pool_lock:
                             self.connections[new_conn.stats.connection_id] = new_conn
 
+                        logger.info(f"Recreated unhealthy connection {old_conn_id}")
                         return new_conn
                     except Exception as e:
                         logger.error(f"Failed to recreate connection: {e}")
@@ -324,8 +349,14 @@ class DuckDBConnectionPool:
             logger.warning(f"Connection pool exhausted (timeout: {timeout}s)")
             return None
 
-    def return_connection(self, conn: DuckDBConnection):
-        """Return a connection to the pool"""
+    def return_connection(self, conn: Optional[DuckDBConnection]):
+        """
+        Return a connection to the pool.
+
+        Args:
+            conn: Connection to return, or None if connection was closed
+                  (None signals that a new connection should be created on next get)
+        """
         try:
             self.pool.put_nowait(conn)
         except Full:
@@ -710,6 +741,13 @@ class DuckDBConnectionPool:
 
                 with self.pool_lock:
                     for conn in self.connections:
+                        # Skip health check for connections that are already marked unhealthy
+                        # They will be recreated on next get_connection() call
+                        if not conn.stats.is_healthy:
+                            logger.debug(f"Skipping health check for closed connection {conn.stats.connection_id}")
+                            continue
+
+                        # Check if connection is still healthy
                         if not conn.health_check():
                             logger.warning(f"Connection {conn.stats.connection_id} failed health check")
 
