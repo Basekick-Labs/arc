@@ -628,6 +628,19 @@ async def startup_event():
     else:
         log_startup("Query cache disabled")
 
+    # Log delete operations configuration
+    delete_enabled = arc_config.get("delete", "enabled", default=False)
+    if delete_enabled:
+        confirmation_threshold = arc_config.get("delete", "confirmation_threshold", default=10000)
+        max_rows = arc_config.get("delete", "max_rows_per_delete", default=1000000)
+        log_startup(
+            f"Delete operations: ENABLED "
+            f"(confirmation_threshold={confirmation_threshold}, "
+            f"max_rows={max_rows})"
+        )
+    else:
+        log_startup("Delete operations: DISABLED (set delete.enabled=true in arc.conf to enable)")
+
     # Initialize telemetry (only on primary worker to avoid duplicate sends)
     global telemetry_sender
     if is_verbose and _is_primary_worker:
