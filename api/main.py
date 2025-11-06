@@ -568,11 +568,34 @@ async def startup_event():
                 from api.compaction_lock import CompactionLock
                 from storage.compaction import CompactionManager
                 from storage.compaction_scheduler import CompactionScheduler
+                from storage.daily_compaction import DailyCompaction
 
                 # Initialize compaction lock
                 compaction_lock = CompactionLock()
 
-                # Initialize compaction manager
+                # Initialize compaction tiers
+                tiers = []
+
+                # Daily compaction tier (if enabled)
+                daily_config = arc_config.config.get('compaction', {}).get('daily', {})
+                if daily_config.get('enabled', True):
+                    daily_tier = DailyCompaction(
+                        storage_backend=storage_backend,
+                        min_age_hours=daily_config.get('min_age_hours', 24),
+                        min_files=daily_config.get('min_files', 12),
+                        target_size_mb=daily_config.get('target_file_size_mb', 2048),
+                        enabled=True
+                    )
+                    tiers.append(daily_tier)
+                    log_startup(
+                        f"Daily compaction tier enabled: "
+                        f"min_age_hours={daily_config.get('min_age_hours', 24)}, "
+                        f"min_files={daily_config.get('min_files', 12)}, "
+                        f"target_size={daily_config.get('target_file_size_mb', 2048)}MB, "
+                        f"schedule='{daily_config.get('schedule', '0 3 * * *')}'"
+                    )
+
+                # Initialize compaction manager with tiers
                 compaction_manager = CompactionManager(
                     storage_backend=storage_backend,
                     lock_manager=compaction_lock,
@@ -580,10 +603,11 @@ async def startup_event():
                     min_age_hours=compaction_config.get('min_age_hours', 1),
                     min_files=compaction_config.get('min_files', 10),
                     target_size_mb=compaction_config.get('target_file_size_mb', 512),
-                    max_concurrent=compaction_config.get('max_concurrent_jobs', 2)
+                    max_concurrent=compaction_config.get('max_concurrent_jobs', 2),
+                    tiers=tiers
                 )
 
-                # Initialize compaction scheduler (only run from first worker)
+                # Initialize hourly compaction scheduler (only run from first worker)
                 # Scheduler enabled if this is the primary worker (compaction already enabled if we're here)
                 scheduler_enabled = is_verbose
                 compaction_scheduler = CompactionScheduler(
@@ -592,16 +616,25 @@ async def startup_event():
                     enabled=scheduler_enabled
                 )
 
+                # Initialize daily compaction scheduler (if daily tier enabled)
+                daily_scheduler = None
+                if daily_config.get('enabled', True):
+                    daily_scheduler = CompactionScheduler(
+                        compaction_manager=compaction_manager,
+                        schedule=daily_config.get('schedule', '0 3 * * *'),
+                        enabled=scheduler_enabled
+                    )
+
                 # Register with API routes (all workers need this for manual triggers)
                 init_compaction(compaction_manager, compaction_scheduler)
 
-                # Start scheduler (only runs if enabled=True, i.e., first worker only)
+                # Start hourly scheduler (only runs if enabled=True, i.e., first worker only)
                 try:
                     await compaction_scheduler.start()
 
                     if scheduler_enabled:
                         log_startup(
-                            f"Compaction scheduler started: "
+                            f"Hourly compaction scheduler started: "
                             f"schedule='{compaction_config.get('schedule')}', "
                             f"min_files={compaction_config.get('min_files')}, "
                             f"target_size={compaction_config.get('target_file_size_mb')}MB"
@@ -611,8 +644,20 @@ async def startup_event():
                     else:
                         logger.debug(f"[Worker {os.getpid()}] Compaction enabled, scheduler running on primary worker")
                 except Exception as e:
-                    logger.error(f"Failed to start compaction scheduler: {e}")
+                    logger.error(f"Failed to start hourly compaction scheduler: {e}")
                     # Continue startup - compaction can still be triggered manually
+
+                # Start daily scheduler (if enabled)
+                if daily_scheduler and scheduler_enabled:
+                    try:
+                        await daily_scheduler.start()
+                        log_startup(
+                            f"Daily compaction scheduler started: "
+                            f"schedule='{daily_config.get('schedule', '0 3 * * *')}'"
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to start daily compaction scheduler: {e}")
+                        # Continue startup - daily compaction can still be triggered manually
             else:
                 log_startup("Compaction is disabled")
 

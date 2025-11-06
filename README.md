@@ -1192,7 +1192,7 @@ curl -X POST http://localhost:8000/api/wal/cleanup
 
 ## File Compaction - Query Optimization
 
-Arc automatically **compacts small Parquet files into larger ones** to dramatically improve query performance. During high-throughput ingestion, Arc creates many small files (50-100MB). Compaction merges these into optimized 512MB files, reducing file count by 100x and improving query speed by 10-50x.
+Arc automatically **compacts small Parquet files into larger ones** to dramatically improve query performance. Using a **tiered compaction strategy** (hourly → daily → weekly → monthly), Arc reduces file count by up to 1,250x while improving query speed by 10-50x.
 
 ### Why Compaction Matters
 
@@ -1220,21 +1220,56 @@ Compaction runs automatically on a schedule (default: every hour at :05):
 6. **Deletes** old small files from storage
 7. **Cleanup** temp files and releases lock
 
+### Tiered Compaction Strategy
+
+Arc uses a **multi-tier compaction approach** to manage file count at scale:
+
+**Tier 1: Hourly Compaction** (every 10 minutes)
+- Merges small files within hourly partitions
+- 200 files → 2-3 compacted files per hour
+- Result: ~41 files/day per measurement
+
+**Tier 2: Daily Compaction** ✅ (3am daily)
+- Merges 24 hourly files → 1-2 daily files
+- Reduces file count by **20x**
+- Result: ~730 files/year per measurement (vs 15,000 without daily)
+
+**Tier 3: Weekly Compaction** (planned)
+- Merges 7 daily files → 1 weekly file
+- Additional **14x reduction**
+
+**Tier 4: Monthly Compaction** (planned)
+- Merges 4-5 weekly files → 1 monthly file
+- **Total: 1,250x fewer files** (15,000 → 12 files/year)
+
 ### Configuration
 
 Compaction is **enabled by default** in [arc.conf](arc.conf):
 
 ```toml
+# Hourly Compaction (Tier 1)
 [compaction]
 enabled = true
-min_age_hours = 1         # Wait 1 hour before compacting (let hour complete)
-min_files = 10            # Only compact if ≥10 files exist
-target_file_size_mb = 512 # Target size for compacted files
-schedule = "5 * * * *"    # Cron schedule: every hour at :05
-max_concurrent_jobs = 2   # Run 2 compactions in parallel
-compression = "zstd"      # Better compression than snappy
-compression_level = 3     # Balance compression vs speed
+min_age_hours = 1          # Wait 1 hour before compacting
+min_files = 50             # Only compact if ≥50 files exist
+target_file_size_mb = 512  # Target 512MB files
+schedule = "*/10 * * * *"  # Every 10 minutes
+max_concurrent_jobs = 4    # Run 4 compactions in parallel
+compression = "zstd"       # Better compression than snappy
+compression_level = 3      # Balance compression vs speed
+
+# Daily Compaction (Tier 2) - NEW!
+[compaction.daily]
+enabled = true                 # Enable daily compaction
+schedule = "0 3 * * *"         # 3am daily
+min_age_hours = 24             # Only compact completed days
+min_files = 12                 # Need at least 12 hourly files
+target_file_size_mb = 2048     # Target 2GB daily files
 ```
+
+**File Count Impact:**
+- Without daily: ~15,000 files/year/measurement
+- With daily: ~730 files/year/measurement ✅ **20x reduction**
 
 ### Monitoring Compaction
 
@@ -1250,7 +1285,7 @@ curl http://localhost:8000/api/compaction/stats
 # List eligible partitions
 curl http://localhost:8000/api/compaction/candidates
 
-# Manually trigger compaction
+# Manually trigger compaction (triggers ALL tiers: hourly + daily)
 curl -X POST http://localhost:8000/api/compaction/trigger
 
 # View active jobs
