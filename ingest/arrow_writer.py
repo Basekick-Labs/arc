@@ -422,6 +422,16 @@ class ArrowParquetBuffer:
                 if buffer_key not in self.buffer_start_times:
                     self.buffer_start_times[buffer_key] = datetime.now(timezone.utc)
 
+                # DEBUG: Log incoming records to trace h01 data loss
+                if measurement in ['mem', 'processes']:
+                    incoming_hosts = set()
+                    for r in buffer_records:
+                        if r.get('_columnar') and 'columns' in r and 'host' in r['columns']:
+                            incoming_hosts.update(r['columns']['host'])
+                        elif 'tags' in r and 'host' in r['tags']:
+                            incoming_hosts.add(r['tags']['host'])
+                    logger.info(f"[ADAPTIVE_FLUSH] Receiving {len(buffer_records)} batches for '{database}/{measurement}' from hosts: {incoming_hosts}")
+
                 self.buffers[buffer_key].extend(buffer_records)
 
                 # Count records (columnar vs row)
@@ -448,7 +458,15 @@ class ArrowParquetBuffer:
 
                 if is_low_volume:
                     # Flush immediately for low-volume measurements
-                    logger.debug(f"Arrow buffer for '{database}/{measurement}' is low-volume, flushing immediately")
+                    # DEBUG: Log buffer contents to trace h01 data loss issue
+                    hosts_in_buffer = set()
+                    for r in self.buffers[buffer_key]:
+                        if r.get('_columnar') and 'columns' in r and 'host' in r['columns']:
+                            hosts_in_buffer.update(r['columns']['host'])
+                        elif 'tags' in r and 'host' in r['tags']:
+                            hosts_in_buffer.add(r['tags']['host'])
+
+                    logger.info(f"[ADAPTIVE_FLUSH] Arrow buffer for '{database}/{measurement}' is low-volume, flushing {len(self.buffers[buffer_key])} batches with hosts: {hosts_in_buffer}")
                     records_to_flush[buffer_key] = self.buffers[buffer_key]
                     self.buffers[buffer_key] = []
                     del self.buffer_start_times[buffer_key]

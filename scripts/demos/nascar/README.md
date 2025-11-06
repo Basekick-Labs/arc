@@ -24,36 +24,65 @@ This scenario demonstrates Arc's ability to:
 
 ## Usage
 
-### Basic Usage (Full Race - 40 Cars)
+This script pre-generates NASCAR telemetry data and then sends it to Arc at a controlled rate to test ingestion performance.
+
+### Basic Usage (NASCAR Baseline - 612k msg/sec)
 
 ```bash
 python3 nascar_telemetry.py \
   --token YOUR_ARC_TOKEN \
   --url http://localhost:8000 \
-  --database nascar_telemetry
+  --database nascar_telemetry \
+  --rate 612000 \
+  --duration 60
 ```
 
-This will generate **612,000 messages/second** (15,300 per car × 40 cars).
+This will generate **612,000 messages/second** - the real NASCAR baseline.
+
+### Full Race Simulation (3 Hours)
+
+```bash
+# Generate and stream an entire 3-hour NASCAR race
+python3 nascar_telemetry.py \
+  --token YOUR_ARC_TOKEN \
+  --full-race \
+  --rate 612000 \
+  --workers 300
+```
+
+This will:
+- Pre-generate **10,800 batches** (1 per second for 3 hours)
+- Stream **~108 million messages** total
+- Simulate a complete NASCAR race with realistic telemetry
+- Take approximately **3 hours** to stream at 612k msg/sec
+
+### Test Arc's Maximum Capacity (2.4M msg/sec)
+
+```bash
+# Test at 2.4M messages/second (Arc's rated capacity)
+python3 nascar_telemetry.py \
+  --token YOUR_ARC_TOKEN \
+  --rate 2400000 \
+  --duration 300 \
+  --workers 500
+```
 
 ### Custom Configuration
 
 ```bash
-# Test with fewer cars (e.g., 10 cars = 153k msg/sec)
+# Smaller test (300k msg/sec, 30 seconds)
 python3 nascar_telemetry.py \
   --token YOUR_ARC_TOKEN \
-  --cars 10 \
-  --rate 15300
+  --rate 300000 \
+  --duration 30 \
+  --batch-size 5000
 
-# Run for a specific duration (5 minutes)
+# Large batch size for maximum throughput
 python3 nascar_telemetry.py \
   --token YOUR_ARC_TOKEN \
-  --duration 300
-
-# Increase message rate to test Arc's limits (2.4M msg/sec)
-python3 nascar_telemetry.py \
-  --token YOUR_ARC_TOKEN \
-  --cars 40 \
-  --rate 60000
+  --rate 1200000 \
+  --batch-size 20000 \
+  --pregenerate-batches 1000
 ```
 
 ### Command-Line Arguments
@@ -62,8 +91,12 @@ python3 nascar_telemetry.py \
 - `--token` - Arc API token (required)
 - `--database` - Database name (default: `nascar_telemetry`)
 - `--cars` - Number of cars in the race (default: `40`)
-- `--rate` - Messages per second per car (default: `15300`)
-- `--duration` - Duration in seconds (default: continuous, use Ctrl+C to stop)
+- `--rate` - **Total messages per second** across all cars (default: `612000`)
+- `--duration` - Duration in seconds (default: `60`)
+- `--batch-size` - Messages per batch (default: `10000`)
+- `--pregenerate-batches` - Number of batches to pre-generate (default: `500`)
+- `--workers` - Number of concurrent workers (default: `300`, use `500+` for max throughput)
+- `--full-race` - Generate and stream a full 3-hour NASCAR race (auto-calculates duration and batches)
 
 ## Data Schema
 
@@ -146,11 +179,14 @@ SELECT
     time,
     speed_mph,
     rpm,
-    throttle_position
+    throttle_position,
+    fuel_level,
+    lap
 FROM nascar_telemetry.engine_telemetry
 WHERE car_number = 24
-  AND time > now() - INTERVAL '5 minutes'
-ORDER BY time DESC;
+  AND time >= now() - INTERVAL '5 minutes'
+ORDER BY time DESC
+LIMIT 1000;
 ```
 
 ### 3. Manufacturer Performance Comparison
@@ -158,11 +194,13 @@ ORDER BY time DESC;
 ```sql
 SELECT
     manufacturer,
+    COUNT(*) as samples,
     AVG(rpm) as avg_rpm,
     AVG(speed_mph) as avg_speed,
-    AVG(throttle_position) as avg_throttle
+    AVG(throttle_position) as avg_throttle,
+    MAX(speed_mph) as max_speed
 FROM nascar_telemetry.engine_telemetry
-WHERE time > now() - INTERVAL '1 minute'
+WHERE time >= now() - INTERVAL '1 minute'
 GROUP BY manufacturer
 ORDER BY avg_speed DESC;
 ```
@@ -172,12 +210,15 @@ ORDER BY avg_speed DESC;
 ```sql
 SELECT
     car_number,
+    ANY_VALUE(driver) as driver,
     lap,
-    (lf_temp_f + rf_temp_f + lr_temp_f + rr_temp_f) / 4 as avg_tire_temp,
-    (lf_pressure_psi + rf_pressure_psi + lr_pressure_psi + rr_pressure_psi) / 4 as avg_tire_pressure
+    ROUND(AVG((lf_temp_f + rf_temp_f + lr_temp_f + rr_temp_f) / 4.0), 1) as avg_tire_temp,
+    ROUND(AVG((lf_pressure_psi + rf_pressure_psi + lr_pressure_psi + rr_pressure_psi) / 4.0), 1) as avg_tire_pressure,
+    MAX(lf_temp_f) as hottest_tire_temp
 FROM nascar_telemetry.tire_telemetry
 WHERE car_number = 24
-  AND time > now() - INTERVAL '10 minutes'
+  AND time >= now() - INTERVAL '10 minutes'
+GROUP BY car_number, lap
 ORDER BY lap DESC
 LIMIT 50;
 ```
@@ -188,13 +229,13 @@ LIMIT 50;
 SELECT
     car_number,
     driver,
-    team,
     MAX(lateral_g) as max_lateral_g,
-    AVG(ABS(lateral_g)) as avg_lateral_g,
-    MAX(longitudinal_g) as max_longitudinal_g
+    ROUND(AVG(ABS(lateral_g)), 2) as avg_lateral_g,
+    MAX(longitudinal_g) as max_longitudinal_g,
+    MAX(brake_pressure_psi) as max_brake_pressure
 FROM nascar_telemetry.chassis_telemetry
-WHERE time > now() - INTERVAL '5 minutes'
-GROUP BY car_number, driver, team
+WHERE time >= now() - INTERVAL '5 minutes'
+GROUP BY car_number, driver
 ORDER BY max_lateral_g DESC
 LIMIT 10;
 ```
@@ -204,16 +245,18 @@ LIMIT 10;
 ```sql
 SELECT
     car_number,
-    driver,
-    team,
-    lap,
-    AVG(fuel_level) as avg_fuel_level,
-    MIN(fuel_level) as min_fuel_level
+    ANY_VALUE(driver) as driver,
+    ANY_VALUE(team) as team,
+    MAX(lap) as current_lap,
+    ROUND(AVG(fuel_level), 2) as avg_fuel_level,
+    ROUND(MIN(fuel_level), 2) as min_fuel_level,
+    ROUND(MAX(fuel_level), 2) as max_fuel_level,
+    COUNT(*) as samples
 FROM nascar_telemetry.engine_telemetry
-WHERE time > now() - INTERVAL '2 minutes'
-GROUP BY car_number, driver, team, lap
-HAVING avg_fuel_level < 5.0
-ORDER BY avg_fuel_level ASC;
+WHERE time >= now() - INTERVAL '2 minutes'
+GROUP BY car_number
+ORDER BY avg_fuel_level ASC
+LIMIT 10;
 ```
 
 ### 7. Team Comparison Dashboard
@@ -222,29 +265,31 @@ ORDER BY avg_fuel_level ASC;
 SELECT
     team,
     COUNT(DISTINCT car_number) as cars,
-    AVG(speed_mph) as avg_speed,
-    MAX(speed_mph) as max_speed,
-    AVG(rpm) as avg_rpm
+    ROUND(AVG(speed_mph), 1) as avg_speed,
+    ROUND(MAX(speed_mph), 1) as max_speed,
+    ROUND(AVG(rpm), 0) as avg_rpm,
+    COUNT(*) as samples
 FROM nascar_telemetry.engine_telemetry
-WHERE time > now() - INTERVAL '30 seconds'
+WHERE time >= now() - INTERVAL '30 seconds'
 GROUP BY team
 ORDER BY avg_speed DESC;
 ```
 
-### 8. Brake Usage Analysis
+### 8. Brake Usage Analysis (Heavy Braking Events)
 
 ```sql
 SELECT
     car_number,
     driver,
-    COUNT(*) as brake_applications,
-    AVG(brake_pressure_psi) as avg_brake_pressure,
-    MAX(brake_pressure_psi) as max_brake_pressure
+    COUNT(*) as heavy_brake_events,
+    ROUND(AVG(brake_pressure_psi), 0) as avg_brake_pressure,
+    MAX(brake_pressure_psi) as max_brake_pressure,
+    ROUND(AVG(ABS(steering_angle_deg)), 1) as avg_steering_angle
 FROM nascar_telemetry.chassis_telemetry
-WHERE time > now() - INTERVAL '1 minute'
-  AND brake_pressure_psi > 100
+WHERE time >= now() - INTERVAL '1 minute'
+  AND brake_pressure_psi > 500
 GROUP BY car_number, driver
-ORDER BY brake_applications DESC
+ORDER BY heavy_brake_events DESC
 LIMIT 10;
 ```
 
@@ -276,25 +321,29 @@ LIMIT 10;
 
 ## Performance Benchmarking
 
-Use this demo to benchmark Arc's performance:
+Use this demo to benchmark Arc's performance at different load levels:
 
 ```bash
 # Baseline NASCAR load (612k msg/sec)
-python3 nascar_telemetry.py --token $TOKEN --duration 300
+python3 nascar_telemetry.py --token $ARC_TOKEN --rate 612000 --duration 300 --workers 300
 
 # 2x NASCAR load (1.2M msg/sec)
-python3 nascar_telemetry.py --token $TOKEN --cars 40 --rate 30600
+python3 nascar_telemetry.py --token $ARC_TOKEN --rate 1200000 --duration 300 --workers 400
 
 # 4x NASCAR load (2.4M msg/sec - Arc's rated capacity)
-python3 nascar_telemetry.py --token $TOKEN --cars 40 --rate 60000
+python3 nascar_telemetry.py --token $ARC_TOKEN --rate 2400000 --duration 300 --workers 500
+
+# Stress test beyond rated capacity (3M msg/sec)
+python3 nascar_telemetry.py --token $ARC_TOKEN --rate 3000000 --duration 60 --workers 600
 ```
 
 Monitor Arc's performance metrics during the test:
-- Message ingestion rate
-- Write latency
+- Message ingestion rate (actual vs. target)
+- Write latency (P50, P95, P99)
 - Query response time
 - Memory usage
 - Disk I/O
+- CPU utilization
 
 ## Use Case: Blog Post Demo
 
