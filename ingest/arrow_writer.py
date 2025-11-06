@@ -216,7 +216,8 @@ class ArrowParquetBuffer:
         max_buffer_age_seconds: int = 60,
         compression: str = 'snappy',
         wal_enabled: bool = False,
-        wal_config: Dict[str, Any] = None
+        wal_config: Dict[str, Any] = None,
+        low_volume_threshold: int = 60
     ):
         """
         Initialize Arrow buffer
@@ -228,10 +229,12 @@ class ArrowParquetBuffer:
             compression: Parquet compression
             wal_enabled: Enable Write-Ahead Log for durability
             wal_config: WAL configuration dict
+            low_volume_threshold: Records/minute threshold for immediate flush (default: 60)
         """
         self.storage_backend = storage_backend
         self.max_buffer_size = max_buffer_size
         self.max_buffer_age_seconds = max_buffer_age_seconds
+        self.low_volume_threshold = low_volume_threshold
 
         # Arrow writer
         self.writer = ArrowParquetWriter(compression=compression)
@@ -241,6 +244,10 @@ class ArrowParquetBuffer:
         self.buffers: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         self.buffer_start_times: Dict[str, datetime] = {}
         self.buffer_retry_counts: Dict[str, int] = defaultdict(int)  # Track retry attempts per measurement
+
+        # Adaptive flush: Track measurement volume to detect low-volume measurements
+        # Low-volume measurements flush immediately to prevent data loss in multi-worker setups
+        self.measurement_stats: Dict[tuple, Dict[str, Any]] = {}  # {buffer_key: {'records': N, 'window_start': timestamp}}
 
         # WAL (optional)
         self.wal_enabled = wal_enabled
@@ -271,8 +278,65 @@ class ArrowParquetBuffer:
         logger.info(
             f"ArrowParquetBuffer initialized: "
             f"max_size={max_buffer_size}, max_age={max_buffer_age_seconds}s, "
-            f"compression={compression}, WAL={wal_status}"
+            f"compression={compression}, WAL={wal_status}, "
+            f"low_volume_threshold={low_volume_threshold} rec/min"
         )
+
+    def _update_measurement_stats(self, buffer_key: tuple, record_count: int):
+        """
+        Update measurement statistics with 5-minute rolling window
+
+        Args:
+            buffer_key: Tuple of (database, measurement)
+            record_count: Number of records being added
+        """
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+
+        if buffer_key not in self.measurement_stats:
+            self.measurement_stats[buffer_key] = {
+                'records': record_count,
+                'window_start': now
+            }
+        else:
+            stats = self.measurement_stats[buffer_key]
+
+            # Reset window every 5 minutes for fresh stats
+            if (now - stats['window_start']).total_seconds() > 300:
+                stats['records'] = record_count
+                stats['window_start'] = now
+            else:
+                stats['records'] += record_count
+
+    def _is_low_volume(self, buffer_key: tuple) -> bool:
+        """
+        Detect if a measurement is low-volume based on recent history
+
+        Low-volume measurements flush immediately to prevent data loss
+        in multi-worker deployments where records scatter across workers.
+
+        Args:
+            buffer_key: Tuple of (database, measurement)
+
+        Returns:
+            True if measurement is low-volume (< threshold records/min)
+        """
+        from datetime import datetime, timezone
+
+        if buffer_key not in self.measurement_stats:
+            # First write - assume low volume until proven otherwise
+            return True
+
+        stats = self.measurement_stats[buffer_key]
+        now = datetime.now(timezone.utc)
+        elapsed_minutes = (now - stats['window_start']).total_seconds() / 60
+
+        if elapsed_minutes < 0.1:  # Less than 6 seconds of data
+            return True  # Too early to tell, assume low volume
+
+        records_per_minute = stats['records'] / elapsed_minutes
+        return records_per_minute < self.low_volume_threshold
 
     async def start(self):
         """Start background flush task"""
@@ -367,6 +431,9 @@ class ArrowParquetBuffer:
                 )
                 self.total_records_buffered += num_records
 
+                # Update measurement statistics for adaptive flush
+                self._update_measurement_stats(buffer_key, num_records)
+
                 # Check if buffer should be flushed
                 # For columnar, count total rows across all columnar batches
                 buffer_size = sum(
@@ -374,9 +441,20 @@ class ArrowParquetBuffer:
                     for r in self.buffers[buffer_key]
                 )
 
-                if buffer_size >= self.max_buffer_size:
+                # ADAPTIVE FLUSH: Check if this is a low-volume measurement
+                # Low-volume measurements flush immediately to prevent data loss
+                # in multi-worker deployments where records scatter across workers
+                is_low_volume = self._is_low_volume(buffer_key)
+
+                if is_low_volume:
+                    # Flush immediately for low-volume measurements
+                    logger.debug(f"Arrow buffer for '{database}/{measurement}' is low-volume, flushing immediately")
+                    records_to_flush[buffer_key] = self.buffers[buffer_key]
+                    self.buffers[buffer_key] = []
+                    del self.buffer_start_times[buffer_key]
+                elif buffer_size >= self.max_buffer_size:
+                    # Normal high-volume flush when buffer size threshold reached
                     logger.debug(f"Arrow buffer for '{database}/{measurement}' reached size limit, flushing")
-                    # Extract records while holding lock
                     records_to_flush[buffer_key] = self.buffers[buffer_key]
                     self.buffers[buffer_key] = []
                     del self.buffer_start_times[buffer_key]
