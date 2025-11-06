@@ -2,7 +2,11 @@
 Compaction Module for Arc Core
 
 Merges small Parquet files into larger files to improve query performance.
-Uses time-based compaction strategy - compacts hourly partitions after they complete.
+Supports tiered compaction strategy:
+- Hourly compaction (default): Compacts files within hourly partitions
+- Daily compaction (tier 2): Compacts hourly files into daily files
+- Weekly compaction (tier 3, future): Compacts daily files into weekly files
+- Monthly compaction (tier 4, future): Compacts weekly files into monthly files
 
 Storage Structure:
 - Full path: {bucket}/{database}/{measurement}/{year}/{month}/{day}/{hour}/file.parquet
@@ -290,6 +294,7 @@ class CompactionJob:
 class CompactionManager:
     """
     Manages compaction jobs across all measurements.
+    Supports both hourly compaction (default) and tiered compaction (daily, weekly, monthly).
     """
 
     def __init__(
@@ -300,7 +305,8 @@ class CompactionManager:
         min_age_hours: int = 1,
         min_files: int = 10,
         target_size_mb: int = 512,
-        max_concurrent: int = 2
+        max_concurrent: int = 2,
+        tiers: Optional[List] = None
     ):
         """
         Initialize compaction manager
@@ -313,6 +319,7 @@ class CompactionManager:
             min_files: Only compact partitions with at least this many files
             target_size_mb: Target size for compacted files
             max_concurrent: Max concurrent compaction jobs
+            tiers: List of CompactionTier instances for tiered compaction (optional)
         """
         self.storage_backend = storage_backend
         self.lock_manager = lock_manager
@@ -321,6 +328,17 @@ class CompactionManager:
         self.min_files = min_files
         self.target_size_mb = target_size_mb
         self.max_concurrent = max_concurrent
+
+        # Tiered compaction support
+        self.tiers = tiers or []
+        if self.tiers:
+            enabled_tiers = [tier.get_tier_name() for tier in self.tiers if tier.enabled]
+            logger.info(
+                f"Compaction manager initialized with {len(enabled_tiers)} tier(s): "
+                f"{', '.join(enabled_tiers)}"
+            )
+        else:
+            logger.info("Compaction manager initialized (hourly compaction only)")
 
         # Active jobs
         self.active_jobs: Dict[str, CompactionJob] = {}
@@ -339,7 +357,8 @@ class CompactionManager:
 
     async def find_candidates(self) -> List[Dict[str, Any]]:
         """
-        Find partitions that are candidates for compaction across ALL databases
+        Find partitions that are candidates for compaction across ALL databases.
+        Includes both hourly compaction and tiered compaction candidates.
 
         Returns:
             List of candidate partitions with metadata
@@ -353,54 +372,88 @@ class CompactionManager:
         measurements = await self._list_measurements()
 
         for database, measurement in measurements:
-            # List all hour partitions for this measurement
-            partitions = await self._list_partitions(database, measurement, cutoff_time)
+            # 1. Hourly compaction candidates (default behavior)
+            hourly_candidates = await self._find_hourly_candidates(
+                database, measurement, cutoff_time
+            )
+            candidates.extend(hourly_candidates)
 
-            for partition_info in partitions:
-                partition_path = partition_info['path']
-                files = partition_info['files']
-
-                # Separate compacted and uncompacted files
-                compacted_files = [f for f in files if '_compacted.parquet' in f]
-                uncompacted_files = [f for f in files if '_compacted.parquet' not in f]
-
-                # Check if meets criteria for compaction
-                # Case 1: No compacted files yet, and has enough total files
-                # Case 2: Has compacted files, but also has many new uncompacted files
-                should_compact = False
-                files_to_compact = []
-
-                if not compacted_files and len(files) >= self.min_files:
-                    # First time compaction - compact all files
-                    should_compact = True
-                    files_to_compact = files
-                    logger.debug(
-                        f"{database}/{partition_path}: First compaction - {len(files)} files"
-                    )
-                elif compacted_files and len(uncompacted_files) >= self.min_files:
-                    # Re-compaction - has compacted files + many new uncompacted files
-                    # Compact ALL files (compacted + uncompacted) into new larger compacted file
-                    should_compact = True
-                    files_to_compact = files
-                    logger.info(
-                        f"{database}/{partition_path}: Re-compaction - "
-                        f"{len(compacted_files)} compacted + {len(uncompacted_files)} uncompacted files"
-                    )
-
-                if should_compact:
-                    candidates.append({
-                        'database': database,
-                        'measurement': measurement,
-                        'partition_path': partition_path,
-                        'file_count': len(files_to_compact),
-                        'files': files_to_compact
-                    })
-
-                    logger.info(
-                        f"Candidate: {database}/{partition_path} ({len(files_to_compact)} files)"
-                    )
+            # 2. Tiered compaction candidates (daily, weekly, monthly)
+            for tier in self.tiers:
+                if tier.enabled:
+                    tier_candidates = await tier.find_candidates(database, measurement)
+                    candidates.extend(tier_candidates)
 
         logger.info(f"Found {len(candidates)} compaction candidates")
+        return candidates
+
+    async def _find_hourly_candidates(
+        self,
+        database: str,
+        measurement: str,
+        cutoff_time: datetime
+    ) -> List[Dict[str, Any]]:
+        """
+        Find hourly partition candidates for compaction.
+
+        Args:
+            database: Database name
+            measurement: Measurement name
+            cutoff_time: Only return partitions older than this time
+
+        Returns:
+            List of hourly candidates
+        """
+        candidates = []
+
+        # List all hour partitions for this measurement
+        partitions = await self._list_partitions(database, measurement, cutoff_time)
+
+        for partition_info in partitions:
+            partition_path = partition_info['path']
+            files = partition_info['files']
+
+            # Separate compacted and uncompacted files
+            compacted_files = [f for f in files if '_compacted.parquet' in f]
+            uncompacted_files = [f for f in files if '_compacted.parquet' not in f]
+
+            # Check if meets criteria for compaction
+            # Case 1: No compacted files yet, and has enough total files
+            # Case 2: Has compacted files, but also has many new uncompacted files
+            should_compact = False
+            files_to_compact = []
+
+            if not compacted_files and len(files) >= self.min_files:
+                # First time compaction - compact all files
+                should_compact = True
+                files_to_compact = files
+                logger.debug(
+                    f"{database}/{partition_path}: First compaction - {len(files)} files"
+                )
+            elif compacted_files and len(uncompacted_files) >= self.min_files:
+                # Re-compaction - has compacted files + many new uncompacted files
+                # Compact ALL files (compacted + uncompacted) into new larger compacted file
+                should_compact = True
+                files_to_compact = files
+                logger.info(
+                    f"{database}/{partition_path}: Re-compaction - "
+                    f"{len(compacted_files)} compacted + {len(uncompacted_files)} uncompacted files"
+                )
+
+            if should_compact:
+                candidates.append({
+                    'database': database,
+                    'measurement': measurement,
+                    'partition_path': partition_path,
+                    'file_count': len(files_to_compact),
+                    'files': files_to_compact,
+                    'tier': 'hourly'
+                })
+
+                logger.info(
+                    f"Candidate: {database}/{partition_path} ({len(files_to_compact)} files)"
+                )
+
         return candidates
 
     async def compact_partition(
@@ -713,8 +766,8 @@ class CompactionManager:
         return await loop.run_in_executor(None, _list)
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get compaction statistics"""
-        return {
+        """Get compaction statistics including tier stats"""
+        stats = {
             'database': self.database,
             'total_jobs_completed': self.total_jobs_completed,
             'total_jobs_failed': self.total_jobs_failed,
@@ -724,3 +777,9 @@ class CompactionManager:
             'active_jobs': len(self.active_jobs),
             'recent_jobs': self.job_history[-10:]  # Last 10 jobs
         }
+
+        # Add tier statistics if tiers are enabled
+        if self.tiers:
+            stats['tiers'] = [tier.get_stats() for tier in self.tiers]
+
+        return stats
