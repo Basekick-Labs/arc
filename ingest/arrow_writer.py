@@ -467,13 +467,13 @@ class ArrowParquetBuffer:
                             hosts_in_buffer.add(r['tags']['host'])
 
                     logger.info(f"[ADAPTIVE_FLUSH] Arrow buffer for '{database}/{measurement}' is low-volume, flushing {len(self.buffers[buffer_key])} batches with hosts: {hosts_in_buffer}")
-                    records_to_flush[buffer_key] = list(self.buffers[buffer_key])  # CRITICAL FIX: Copy list to prevent race condition!
+                    records_to_flush[buffer_key] = self.buffers[buffer_key][:]  # Slice copy is faster than list()
                     self.buffers[buffer_key] = []
                     del self.buffer_start_times[buffer_key]
                 elif buffer_size >= self.max_buffer_size:
                     # Normal high-volume flush when buffer size threshold reached
                     logger.debug(f"Arrow buffer for '{database}/{measurement}' reached size limit, flushing")
-                    records_to_flush[buffer_key] = list(self.buffers[buffer_key])  # CRITICAL FIX: Copy list to prevent race condition!
+                    records_to_flush[buffer_key] = self.buffers[buffer_key][:]  # Slice copy is faster than list()
                     self.buffers[buffer_key] = []
                     del self.buffer_start_times[buffer_key]
 
@@ -514,7 +514,7 @@ class ArrowParquetBuffer:
                         database, measurement = buffer_key
                         logger.debug(f"Arrow buffer for '{database}/{measurement}' reached age limit, flushing")
                         if self.buffers[buffer_key]:
-                            records_to_flush[buffer_key] = list(self.buffers[buffer_key])  # CRITICAL FIX: Copy list to prevent race condition!
+                            records_to_flush[buffer_key] = self.buffers[buffer_key][:]  # Slice copy is faster than list()
                             self.buffers[buffer_key] = []
                             del self.buffer_start_times[buffer_key]
 
@@ -765,7 +765,7 @@ class ArrowParquetBuffer:
         async with self._lock:
             for buffer_key in list(self.buffers.keys()):
                 if self.buffers[buffer_key]:
-                    records_to_flush[buffer_key] = list(self.buffers[buffer_key])  # CRITICAL FIX: Copy list to prevent race condition!
+                    records_to_flush[buffer_key] = self.buffers[buffer_key][:]  # Slice copy is faster than list()
                     self.buffers[buffer_key] = []
                     if buffer_key in self.buffer_start_times:
                         del self.buffer_start_times[buffer_key]
