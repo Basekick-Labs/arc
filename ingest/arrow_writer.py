@@ -586,7 +586,11 @@ class ArrowParquetBuffer:
                 # Database already provided via buffer_key tuple
                 database_override = database
 
-                filename = f"{measurement}_{timestamp_str}_{num_records}.parquet"
+                # CRITICAL FIX: Add UUID suffix to prevent filename collisions in multi-worker deployments
+                # Multiple workers can flush data with the same timestamp simultaneously, causing overwrites
+                import uuid
+                unique_id = str(uuid.uuid4())[:8]
+                filename = f"{measurement}_{timestamp_str}_{num_records}_{unique_id}.parquet"
                 remote_path = f"{measurement}/{date_partition}/{filename}"
 
                 # Write columnar data directly to Parquet
@@ -666,7 +670,10 @@ class ArrowParquetBuffer:
             for record in records:
                 record.pop('_database', None)
 
-            filename = f"{measurement}_{timestamp_str}_{len(records)}.parquet"
+            # CRITICAL FIX: Add UUID suffix to prevent filename collisions in multi-worker deployments
+            import uuid
+            unique_id = str(uuid.uuid4())[:8]
+            filename = f"{measurement}_{timestamp_str}_{len(records)}_{unique_id}.parquet"
             # Path is always measurement/date_partition/filename
             # Storage backend adds database prefix
             remote_path = f"{measurement}/{date_partition}/{filename}"
