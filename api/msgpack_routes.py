@@ -58,7 +58,8 @@ def init_arrow_buffer(storage_backend, config: dict = None):
         max_buffer_age_seconds=config.get('max_buffer_age_seconds', 60),
         compression=config.get('compression', 'snappy'),
         wal_enabled=wal_enabled,
-        wal_config=wal_init_config
+        wal_config=wal_init_config,
+        low_volume_threshold=config.get('low_volume_threshold', 60)
     )
 
     logger.info(
