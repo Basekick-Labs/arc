@@ -341,23 +341,29 @@ class ArrowParquetBuffer:
         records_to_flush = {}
 
         async with self._lock:
-            # Group records by measurement
-            by_measurement = defaultdict(list)
+            # Group records by (database, measurement) tuple to prevent data mixing
+            # CRITICAL FIX: Concurrent writes to different databases for the same measurement
+            # were being mixed in a single buffer, causing data loss
+            by_buffer_key = defaultdict(list)
             for record in records:
                 measurement = record.get('measurement', 'unknown')
-                by_measurement[measurement].append(record)
+                database = record.get('_database', self.storage_backend.database)
+                buffer_key = (database, measurement)
+                by_buffer_key[buffer_key].append(record)
 
-            # Add to buffers and identify measurements that need flushing
-            for measurement, measurement_records in by_measurement.items():
-                if measurement not in self.buffer_start_times:
-                    self.buffer_start_times[measurement] = datetime.now(timezone.utc)
+            # Add to buffers and identify buffers that need flushing
+            for buffer_key, buffer_records in by_buffer_key.items():
+                database, measurement = buffer_key
 
-                self.buffers[measurement].extend(measurement_records)
+                if buffer_key not in self.buffer_start_times:
+                    self.buffer_start_times[buffer_key] = datetime.now(timezone.utc)
+
+                self.buffers[buffer_key].extend(buffer_records)
 
                 # Count records (columnar vs row)
                 num_records = sum(
                     len(r['columns']['time']) if r.get('_columnar') else 1
-                    for r in measurement_records
+                    for r in buffer_records
                 )
                 self.total_records_buffered += num_records
 
@@ -365,22 +371,22 @@ class ArrowParquetBuffer:
                 # For columnar, count total rows across all columnar batches
                 buffer_size = sum(
                     len(r['columns']['time']) if r.get('_columnar') else 1
-                    for r in self.buffers[measurement]
+                    for r in self.buffers[buffer_key]
                 )
 
                 if buffer_size >= self.max_buffer_size:
-                    logger.debug(f"Arrow buffer for '{measurement}' reached size limit, flushing")
+                    logger.debug(f"Arrow buffer for '{database}/{measurement}' reached size limit, flushing")
                     # Extract records while holding lock
-                    records_to_flush[measurement] = self.buffers[measurement]
-                    self.buffers[measurement] = []
-                    del self.buffer_start_times[measurement]
+                    records_to_flush[buffer_key] = self.buffers[buffer_key]
+                    self.buffers[buffer_key] = []
+                    del self.buffer_start_times[buffer_key]
 
         # OPTIMIZATION: Flush outside lock - allows concurrent writes during flush
         # OPTIMIZATION: Parallel flushes - flush multiple measurements concurrently
         if records_to_flush:
             flush_tasks = [
-                self._flush_records(measurement, flush_records)
-                for measurement, flush_records in records_to_flush.items()
+                self._flush_records(buffer_key, flush_records)
+                for buffer_key, flush_records in records_to_flush.items()
             ]
             await asyncio.gather(*flush_tasks, return_exceptions=True)
 
@@ -400,27 +406,28 @@ class ArrowParquetBuffer:
 
                 async with self._lock:
                     now = datetime.now(timezone.utc)
-                    measurements_to_flush = []
+                    buffer_keys_to_flush = []
 
-                    for measurement, start_time in self.buffer_start_times.items():
+                    for buffer_key, start_time in self.buffer_start_times.items():
                         age_seconds = (now - start_time).total_seconds()
                         if age_seconds >= self.max_buffer_age_seconds:
-                            measurements_to_flush.append(measurement)
+                            buffer_keys_to_flush.append(buffer_key)
 
                     # Extract records while holding lock
-                    for measurement in measurements_to_flush:
-                        logger.debug(f"Arrow buffer for '{measurement}' reached age limit, flushing")
-                        if self.buffers[measurement]:
-                            records_to_flush[measurement] = self.buffers[measurement]
-                            self.buffers[measurement] = []
-                            del self.buffer_start_times[measurement]
+                    for buffer_key in buffer_keys_to_flush:
+                        database, measurement = buffer_key
+                        logger.debug(f"Arrow buffer for '{database}/{measurement}' reached age limit, flushing")
+                        if self.buffers[buffer_key]:
+                            records_to_flush[buffer_key] = self.buffers[buffer_key]
+                            self.buffers[buffer_key] = []
+                            del self.buffer_start_times[buffer_key]
 
                 # OPTIMIZATION: Flush outside lock - allows concurrent writes
                 # OPTIMIZATION: Parallel flushes - flush multiple measurements concurrently
                 if records_to_flush:
                     flush_tasks = [
-                        self._flush_records(measurement, flush_records)
-                        for measurement, flush_records in records_to_flush.items()
+                        self._flush_records(buffer_key, flush_records)
+                        for buffer_key, flush_records in records_to_flush.items()
                     ]
                     await asyncio.gather(*flush_tasks, return_exceptions=True)
 
@@ -430,29 +437,34 @@ class ArrowParquetBuffer:
                 logger.error(f"Error in Arrow periodic flush: {e}")
                 await asyncio.sleep(5)
 
-    async def _flush_measurement(self, measurement: str):
+    async def _flush_measurement(self, buffer_key: tuple):
         """
-        Flush buffer for a specific measurement using Direct Arrow.
+        Flush buffer for a specific (database, measurement) tuple using Direct Arrow.
         Extracts records from buffer under lock, then flushes.
         """
         async with self._lock:
-            if measurement not in self.buffers or not self.buffers[measurement]:
+            if buffer_key not in self.buffers or not self.buffers[buffer_key]:
                 return
 
-            records = self.buffers[measurement]
-            self.buffers[measurement] = []
-            del self.buffer_start_times[measurement]
+            records = self.buffers[buffer_key]
+            self.buffers[buffer_key] = []
+            del self.buffer_start_times[buffer_key]
 
         # Flush outside lock
-        await self._flush_records(measurement, records)
+        await self._flush_records(buffer_key, records)
 
-    async def _flush_records(self, measurement: str, records: List[Dict[str, Any]]):
+    async def _flush_records(self, buffer_key: tuple, records: List[Dict[str, Any]]):
         """
         Flush records to Parquet (does not touch buffers, safe to call outside lock).
+
+        Args:
+            buffer_key: Tuple of (database, measurement)
+            records: List of records to flush
 
         OPTIMIZATION: Supports both row format and columnar format.
         Columnar format bypasses row→column conversion (25-35% faster).
         """
+        database, measurement = buffer_key
         import asyncio
         import tempfile
         import os
@@ -475,8 +487,8 @@ class ArrowParquetBuffer:
                 timestamp_str = min_time.strftime('%Y%m%d_%H%M%S')
                 date_partition = min_time.strftime('%Y/%m/%d/%H')
 
-                # Check for database override
-                database_override = records[0].get('_database')
+                # Database already provided via buffer_key tuple
+                database_override = database
 
                 filename = f"{measurement}_{timestamp_str}_{num_records}.parquet"
                 remote_path = f"{measurement}/{date_partition}/{filename}"
@@ -552,13 +564,11 @@ class ArrowParquetBuffer:
                 # PHASE 2: Hour-level partitioning
                 date_partition = datetime.now().strftime('%Y/%m/%d/%H')
 
-            # Check if records have a database override
-            database_override = None
-            if records and '_database' in records[0]:
-                database_override = records[0]['_database']
-                # Remove _database from all records before writing to parquet
-                for record in records:
-                    record.pop('_database', None)
+            # Database already provided via buffer_key tuple
+            # Remove _database from all records before writing to parquet
+            database_override = database
+            for record in records:
+                record.pop('_database', None)
 
             filename = f"{measurement}_{timestamp_str}_{len(records)}.parquet"
             # Path is always measurement/date_partition/filename
@@ -607,21 +617,21 @@ class ArrowParquetBuffer:
 
             # MEMORY LEAK FIX: Implement retry limits to prevent unbounded accumulation
             # Previous behavior: retry until buffer hits 2x max_size (could accumulate indefinitely)
-            # New behavior: limit retries per measurement, drop on persistent failures
+            # New behavior: limit retries per buffer, drop on persistent failures
             MAX_RETRIES = 3  # Maximum retry attempts before dropping
 
             async with self._lock:
-                retry_count = self.buffer_retry_counts[measurement]
+                retry_count = self.buffer_retry_counts[buffer_key]
 
-                if retry_count < MAX_RETRIES and len(self.buffers[measurement]) < self.max_buffer_size * 2:
+                if retry_count < MAX_RETRIES and len(self.buffers[buffer_key]) < self.max_buffer_size * 2:
                     # Re-add records to buffer for retry
-                    self.buffers[measurement].extend(records)
-                    self.buffer_retry_counts[measurement] += 1
+                    self.buffers[buffer_key].extend(records)
+                    self.buffer_retry_counts[buffer_key] += 1
 
                     # Restore start time if needed
-                    if measurement not in self.buffer_start_times:
+                    if buffer_key not in self.buffer_start_times:
                         from datetime import datetime, timezone
-                        self.buffer_start_times[measurement] = datetime.now(timezone.utc)
+                        self.buffer_start_times[buffer_key] = datetime.now(timezone.utc)
 
                     logger.warning(
                         f"Re-added {len(records)} records to Arrow buffer after error "
@@ -631,11 +641,11 @@ class ArrowParquetBuffer:
                     # Drop records after max retries or buffer too full
                     reason = "max retries exceeded" if retry_count >= MAX_RETRIES else "buffer full"
                     logger.error(
-                        f"Dropping {len(records)} records for '{measurement}' ({reason}). "
-                        f"Retry count: {retry_count}, Buffer size: {len(self.buffers[measurement])}"
+                        f"Dropping {len(records)} records for '{database}/{measurement}' ({reason}). "
+                        f"Retry count: {retry_count}, Buffer size: {len(self.buffers[buffer_key])}"
                     )
                     # Reset retry counter after dropping
-                    self.buffer_retry_counts[measurement] = 0
+                    self.buffer_retry_counts[buffer_key] = 0
 
                     # Force garbage collection to free dropped records
                     import gc
@@ -643,26 +653,26 @@ class ArrowParquetBuffer:
                     gc.collect()
 
     async def flush_all(self):
-        """Flush all measurement buffers"""
+        """Flush all (database, measurement) buffers"""
         import asyncio
 
         # OPTIMIZATION: Extract all records outside lock
         records_to_flush = {}
 
         async with self._lock:
-            for measurement in list(self.buffers.keys()):
-                if self.buffers[measurement]:
-                    records_to_flush[measurement] = self.buffers[measurement]
-                    self.buffers[measurement] = []
-                    if measurement in self.buffer_start_times:
-                        del self.buffer_start_times[measurement]
+            for buffer_key in list(self.buffers.keys()):
+                if self.buffers[buffer_key]:
+                    records_to_flush[buffer_key] = self.buffers[buffer_key]
+                    self.buffers[buffer_key] = []
+                    if buffer_key in self.buffer_start_times:
+                        del self.buffer_start_times[buffer_key]
 
         # Flush outside lock
-        # OPTIMIZATION: Parallel flushes - flush all measurements concurrently
+        # OPTIMIZATION: Parallel flushes - flush all buffers concurrently
         if records_to_flush:
             flush_tasks = [
-                self._flush_records(measurement, flush_records)
-                for measurement, flush_records in records_to_flush.items()
+                self._flush_records(buffer_key, flush_records)
+                for buffer_key, flush_records in records_to_flush.items()
             ]
             await asyncio.gather(*flush_tasks, return_exceptions=True)
 
