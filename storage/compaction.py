@@ -351,8 +351,14 @@ class CompactionManager:
         self.total_bytes_saved = 0
 
         # Lock for storage backend database switching
-        # Multiple concurrent jobs share the same storage_backend instance
-        # and need to serialize access when changing its database property
+        # CRITICAL: Multiple concurrent jobs share the same storage_backend instance.
+        # The storage backend's `database` property is modified per-job to support
+        # multi-database compaction. This lock serializes jobs to prevent race conditions
+        # where Job A's file operations might use Job B's database value.
+        #
+        # NOTE: This effectively limits compaction to 1 job at a time, regardless of
+        # max_concurrent setting. This is a necessary trade-off until storage backends
+        # support database-as-parameter instead of mutable state.
         self._storage_lock = asyncio.Lock()
 
     async def find_candidates(self) -> List[Dict[str, Any]]:
@@ -484,17 +490,21 @@ class CompactionManager:
             return False
 
         try:
-            # Acquire storage backend lock to safely modify database property
-            # Multiple concurrent jobs share the same storage_backend instance
-            async with self._storage_lock:
-                # Temporarily override the database for this job
-                original_database = getattr(self.storage_backend, 'database', None)
+            # CRITICAL FIX: Do NOT modify shared storage_backend.database property!
+            # Multiple concurrent jobs would race and corrupt each other's database context.
+            # Instead, we temporarily set the database ONLY for this specific job instance.
 
+            # Save original database value
+            original_database = getattr(self.storage_backend, 'database', None)
+
+            # Acquire lock to safely modify database property for the ENTIRE job duration
+            async with self._storage_lock:
                 # Set database for this operation
                 if hasattr(self.storage_backend, 'database'):
                     self.storage_backend.database = database
 
                 # Create and run job
+                # IMPORTANT: job.run() must complete INSIDE the lock to prevent race conditions
                 job = CompactionJob(
                     measurement=measurement,
                     partition_path=partition_path,
@@ -506,10 +516,11 @@ class CompactionManager:
 
                 self.active_jobs[job.job_id] = job
 
+                # Run job with database property locked
                 success = await job.run()
 
-                # Restore original database
-                if original_database and hasattr(self.storage_backend, 'database'):
+                # Restore original database before releasing lock
+                if hasattr(self.storage_backend, 'database'):
                     self.storage_backend.database = original_database
 
             # Update metrics (outside lock)
