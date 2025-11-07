@@ -37,7 +37,8 @@ class CompactionJob:
         files: List[str],
         storage_backend,
         database: str = "default",
-        target_size_mb: int = 512
+        target_size_mb: int = 512,
+        tier: str = "hourly"
     ):
         """
         Initialize compaction job
@@ -49,6 +50,7 @@ class CompactionJob:
             storage_backend: Storage backend instance
             database: Database namespace
             target_size_mb: Target size for compacted file
+            tier: Compaction tier name (e.g., 'hourly', 'daily', 'weekly')
         """
         self.measurement = measurement
         self.partition_path = partition_path
@@ -56,6 +58,7 @@ class CompactionJob:
         self.storage_backend = storage_backend
         self.database = database
         self.target_size_mb = target_size_mb
+        self.tier = tier
 
         # Job metadata
         self.job_id = f"{partition_path.replace('/', '_')}_{int(datetime.now().timestamp())}"
@@ -173,9 +176,12 @@ class CompactionJob:
         """
         import duckdb
 
-        # Generate output filename
+        # Generate output filename with tier-specific suffix
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_file = temp_dir / f"{self.measurement}_{timestamp}_compacted.parquet"
+        # For hourly tier, use 'compacted' for backward compatibility
+        # For other tiers (daily, weekly, monthly), use the tier name
+        suffix = "compacted" if self.tier == "hourly" else self.tier
+        output_file = temp_dir / f"{self.measurement}_{timestamp}_{suffix}.parquet"
 
         # Use DuckDB to read all files and write compacted file
         loop = asyncio.get_event_loop()
@@ -467,7 +473,8 @@ class CompactionManager:
         database: str,
         measurement: str,
         partition_path: str,
-        files: List[str]
+        files: List[str],
+        tier: str = "hourly"
     ) -> bool:
         """
         Compact a single partition
@@ -477,6 +484,7 @@ class CompactionManager:
             measurement: Measurement name
             partition_path: Partition path (relative to database)
             files: List of files to compact (relative to database)
+            tier: Compaction tier name (default: 'hourly')
 
         Returns:
             True if successful
@@ -511,7 +519,8 @@ class CompactionManager:
                     files=files,
                     storage_backend=self.storage_backend,
                     database=database,
-                    target_size_mb=self.target_size_mb
+                    target_size_mb=self.target_size_mb,
+                    tier=tier
                 )
 
                 self.active_jobs[job.job_id] = job
@@ -563,7 +572,8 @@ class CompactionManager:
                     candidate['database'],
                     candidate['measurement'],
                     candidate['partition_path'],
-                    candidate['files']
+                    candidate['files'],
+                    candidate.get('tier', 'hourly')  # Default to hourly for backward compatibility
                 )
 
         tasks = [_compact_with_limit(c) for c in candidates]
