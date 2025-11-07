@@ -729,7 +729,7 @@ class CompactionManager:
                 for obj in objects:
                     # Parse path: measurement/year/month/day/hour/file.parquet
                     parts = obj.split('/')
-                    if len(parts) >= 5:
+                    if len(parts) >= 6:  # Must have at least 6 parts for hour-level files
                         # Extract time components
                         meas, year, month, day, hour = parts[0], parts[1], parts[2], parts[3], parts[4]
 
@@ -737,10 +737,19 @@ class CompactionManager:
                         if meas != measurement:
                             continue
 
+                        # Validate hour is a valid hour (00-23), not a filename
+                        # This filters out day-level files from daily compaction
+                        try:
+                            hour_int = int(hour)
+                            if hour_int < 0 or hour_int > 23:
+                                continue  # Not a valid hour, skip (likely a daily compacted file)
+                        except ValueError:
+                            continue  # Not a number, skip (likely a filename)
+
                         # Check if partition is old enough
                         try:
                             partition_time = datetime(
-                                int(year), int(month), int(day), int(hour)
+                                int(year), int(month), int(day), hour_int
                             )
 
                             if partition_time < cutoff_time:
@@ -754,8 +763,7 @@ class CompactionManager:
                                 partitions[partition_path].append(obj)
 
                         except ValueError:
-                            # Invalid date/time in path, skip
-                            logger.warning(f"Invalid partition path format: {obj}")
+                            # Invalid date/time in path, skip silently
                             continue
 
                 logger.info(
