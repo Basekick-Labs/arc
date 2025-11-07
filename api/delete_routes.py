@@ -155,6 +155,9 @@ async def find_affected_files(
                 # We'll use DuckDB to filter the table
                 matching_count = await count_matching_rows(table, where_clause, engine)
 
+                # Explicitly free table memory
+                del table
+
                 if matching_count > 0:
                     affected_files.append((parquet_file, matching_count))
                     logger.info(f"File {parquet_file.name} has {matching_count} matching rows")
@@ -179,6 +182,7 @@ async def count_matching_rows(table: pa.Table, where_clause: str, engine) -> int
     Uses DuckDB for reliable SQL evaluation.
     """
     import duckdb
+    import gc
 
     # Create temp DuckDB connection
     conn = duckdb.connect(':memory:')
@@ -191,7 +195,12 @@ async def count_matching_rows(table: pa.Table, where_clause: str, engine) -> int
         query = f"SELECT COUNT(*) as count FROM temp_table WHERE {where_clause}"
         result = conn.execute(query).fetchone()
 
-        return result[0] if result else 0
+        count = result[0] if result else 0
+
+        # Unregister table to free memory
+        conn.unregister('temp_table')
+
+        return count
 
     except Exception as e:
         logger.error(f"Error counting matching rows: {e}")
@@ -200,7 +209,12 @@ async def count_matching_rows(table: pa.Table, where_clause: str, engine) -> int
             detail=f"Invalid WHERE clause: {str(e)}"
         )
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except:
+            pass
+        # Force garbage collection to free Arrow memory
+        gc.collect()
 
 
 async def rewrite_file_without_deleted_rows(
@@ -214,6 +228,7 @@ async def rewrite_file_without_deleted_rows(
     Returns (rows_before, rows_after, new_file_path).
     """
     import duckdb
+    import gc
 
     # Read original file
     table = pq.read_table(file_path)
@@ -221,6 +236,7 @@ async def rewrite_file_without_deleted_rows(
 
     # Create temp DuckDB connection
     conn = duckdb.connect(':memory:')
+    temp_file = None
 
     try:
         # Register Arrow table
@@ -231,6 +247,11 @@ async def rewrite_file_without_deleted_rows(
         result = conn.execute(query).fetch_arrow_table()
 
         rows_after = result.num_rows
+
+        # Unregister table to free memory before writing
+        conn.unregister('temp_table')
+        del table  # Explicitly delete original table
+        gc.collect()  # Force GC before allocating more memory for write
 
         # Write to temporary file
         temp_dir = file_path.parent / '.tmp'
@@ -245,15 +266,30 @@ async def rewrite_file_without_deleted_rows(
             compression='snappy'
         )
 
+        # Explicitly delete result table and force GC
+        del result
+        gc.collect()
+
         logger.info(f"Rewrote {file_path.name}: {rows_before} -> {rows_after} rows")
 
         return rows_before, rows_after, temp_file
 
     except Exception as e:
         logger.error(f"Error rewriting file {file_path}: {e}")
+        # Clean up temp file if created
+        if temp_file and temp_file.exists():
+            try:
+                os.unlink(temp_file)
+            except:
+                pass
         raise
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except:
+            pass
+        # Force garbage collection to free Arrow/DuckDB memory
+        gc.collect()
 
 
 @router.post("/api/v1/delete", response_model=DeleteResponse)
@@ -381,6 +417,8 @@ async def delete_data(request: DeleteRequest, req: Request):
         rewritten_count = 0
         processed_files = []
 
+        import gc
+
         for file_path, expected_delete_count in affected_files:
             try:
                 # Rewrite file without deleted rows
@@ -407,8 +445,14 @@ async def delete_data(request: DeleteRequest, req: Request):
 
                 logger.info(f"Processed {file_path.name}: deleted {deleted_in_file} rows")
 
+                # Force garbage collection between files to free memory
+                # This is critical for processing many large files
+                gc.collect()
+
             except Exception as e:
                 logger.error(f"Failed to rewrite {file_path}: {e}")
+                # Force GC even on error to free any partially allocated memory
+                gc.collect()
                 # Continue processing other files
                 continue
 
