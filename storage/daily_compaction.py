@@ -153,8 +153,21 @@ class DailyCompaction(CompactionTier):
             return False
 
         # Separate daily-compacted files from hourly files
-        daily_compacted_files = [f for f in files if self.is_compacted_file(Path(f).name)]
-        hourly_files = [f for f in files if not self.is_compacted_file(Path(f).name)]
+        # Note: Use path depth to distinguish, not just filename suffix
+        # - Daily files: measurement/year/month/day/file.parquet (5 parts)
+        # - Hourly files: measurement/year/month/day/hour/file.parquet (6 parts)
+        # This handles transition period where old daily files used '_compacted.parquet'
+        daily_compacted_files = []
+        hourly_files = []
+
+        for f in files:
+            parts = f.split('/')
+            if len(parts) == 5:
+                # Day-level file = daily compacted file (regardless of suffix)
+                daily_compacted_files.append(f)
+            else:
+                # Hour-level file = hourly file
+                hourly_files.append(f)
 
         # Case 1: No daily compacted file yet, and has enough total files
         if not daily_compacted_files and len(files) >= self.min_files:
