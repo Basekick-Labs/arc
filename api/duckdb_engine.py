@@ -81,7 +81,16 @@ class DuckDBEngine:
             enable_cache = os.getenv('DUCKDB_ENABLE_OBJECT_CACHE', 'true').lower() == 'true'
             conn.execute(f"SET enable_object_cache={'true' if enable_cache else 'false'}")
 
-            logger.debug(f"DuckDB configured with object_cache={enable_cache}")
+            # Performance optimizations: Enable parallelism and set memory limits
+            # threads=0 means auto-detect CPU cores
+            threads = int(os.getenv('DUCKDB_THREADS', '0'))
+            conn.execute(f"SET threads={threads}")
+
+            # Set memory limit (default 4GB, can be overridden via env var)
+            memory_limit = os.getenv('DUCKDB_MEMORY_LIMIT', '4GB')
+            conn.execute(f"SET memory_limit='{memory_limit}'")
+
+            logger.debug(f"DuckDB configured with object_cache={enable_cache}, threads={threads if threads > 0 else 'auto'}, memory_limit={memory_limit}")
 
             # Apply S3/MinIO/Ceph/GCS configuration
             if self.minio_backend:
