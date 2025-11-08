@@ -5,6 +5,7 @@ import logging
 import json
 import sys
 import os
+import re
 from datetime import datetime
 from typing import Dict, Any, Optional
 import uuid
@@ -16,23 +17,29 @@ request_id_context: ContextVar[Optional[str]] = ContextVar('request_id', default
 
 class StructuredFormatter(logging.Formatter):
     """Custom formatter for structured JSON logging"""
-    
+
+    # ANSI color code pattern
+    ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*m')
+
     def __init__(self, service_name: str = "historian-api", include_trace: bool = False):
         super().__init__()
         self.service_name = service_name
         self.include_trace = include_trace
-    
+
     def format(self, record: logging.LogRecord) -> str:
         """Format log record as structured JSON"""
         # Get request ID from context if available
         request_id = request_id_context.get()
-        
+
+        # Strip ANSI color codes from message for JSON output
+        message = self.ANSI_ESCAPE.sub('', record.getMessage())
+
         # Base log structure
         log_entry = {
             "timestamp": datetime.utcfromtimestamp(record.created).isoformat() + "Z",
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": message,
             "service": self.service_name,
         }
         

@@ -3,6 +3,7 @@ import logging
 from typing import Dict, List, Any, Optional
 import time
 import os
+import multiprocessing
 from api.duckdb_pool import DuckDBConnectionPool, QueryPriority
 
 logger = logging.getLogger(__name__)
@@ -82,20 +83,30 @@ class DuckDBEngine:
             conn.execute(f"SET enable_object_cache={'true' if enable_cache else 'false'}")
 
             # Performance optimizations: Enable parallelism and set memory limits
-            # threads=-1 or not setting it means auto-detect CPU cores
-            # threads=0 is invalid (DuckDB requires at least 1)
-            threads_env = os.getenv('DUCKDB_THREADS', 'auto')
-            if threads_env != 'auto':
+            # By default, use all available CPU cores for parallel query execution
+            # Set DUCKDB_THREADS=1 to disable parallelism (single-threaded)
+            # Set DUCKDB_THREADS=4 to use exactly 4 threads
+            threads_env = os.getenv('DUCKDB_THREADS')
+            if threads_env:
                 threads = int(threads_env)
-                if threads > 0:
-                    conn.execute(f"SET threads={threads}")
-            # If 'auto' or invalid, don't set (DuckDB auto-detects by default)
+            else:
+                # Default: use all available CPU cores
+                threads = multiprocessing.cpu_count()
+
+            conn.execute(f"SET threads={threads}")
 
             # Set memory limit (default 4GB, can be overridden via env var)
             memory_limit = os.getenv('DUCKDB_MEMORY_LIMIT', '4GB')
             conn.execute(f"SET memory_limit='{memory_limit}'")
 
-            logger.debug(f"DuckDB configured with object_cache={enable_cache}, threads={threads_env}, memory_limit={memory_limit}")
+            # Log configuration prominently
+            logger.info(
+                f"\033[1;36mDuckDB Performance Config:\033[0m "
+                f"\033[1;32mthreads={threads}\033[0m "
+                f"(available_cores={multiprocessing.cpu_count()}), "
+                f"\033[1;33mmemory_limit={memory_limit}\033[0m, "
+                f"object_cache={enable_cache}"
+            )
 
             # Apply S3/MinIO/Ceph/GCS configuration
             if self.minio_backend:
