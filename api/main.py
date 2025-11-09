@@ -320,6 +320,20 @@ async def startup_event():
         _is_primary_worker = False
         logger.debug(f"Worker {os.getpid()} is a secondary worker (reduced logging)")
 
+    # Run startup migration (only primary worker does the migration)
+    if _is_primary_worker:
+        from api.startup_migration import run_startup_migration
+        from api.config import set_db_path
+
+        try:
+            logger.info("Running startup migration for compute/storage separation...")
+            migrated_db_path = run_startup_migration()
+            set_db_path(migrated_db_path)
+            logger.info(f"✅ Startup migration complete. Database at: {migrated_db_path}")
+        except Exception as e:
+            logger.error(f"Startup migration failed: {e}")
+            # Continue anyway - migration is best-effort
+
     # Helper to log only from first worker
     def log_startup(message, level='info'):
         if is_verbose:
