@@ -147,19 +147,27 @@ class MessagePackDecoder:
         if 'time' in columns:
             time_col = columns['time']
             if time_col and isinstance(time_col[0], (int, float)):
-                # Auto-detect timestamp unit based on magnitude (same as arrow_writer)
-                def convert_timestamp(t):
-                    if t < 1e10:
-                        # Seconds
-                        return datetime.fromtimestamp(t, tz=timezone.utc)
-                    elif t < 1e13:
-                        # Milliseconds (default for msgpack API)
-                        return datetime.fromtimestamp(t / 1000, tz=timezone.utc)
-                    else:
-                        # Microseconds
-                        return datetime.fromtimestamp(t / 1000000, tz=timezone.utc)
+                # OPTIMIZATION: Pre-allocate result list for better performance
+                # Avoids repeated list reallocations during comprehension
+                num_times = len(time_col)
+                converted_times = [None] * num_times  # Pre-allocate
 
-                columns['time'] = [convert_timestamp(t) for t in time_col]
+                # Auto-detect timestamp unit from first value
+                first_val = time_col[0]
+                if first_val < 1e10:
+                    # Seconds - batch convert
+                    for i, t in enumerate(time_col):
+                        converted_times[i] = datetime.fromtimestamp(t, tz=timezone.utc)
+                elif first_val < 1e13:
+                    # Milliseconds (default for msgpack API) - batch convert
+                    for i, t in enumerate(time_col):
+                        converted_times[i] = datetime.fromtimestamp(t / 1000, tz=timezone.utc)
+                else:
+                    # Microseconds - batch convert
+                    for i, t in enumerate(time_col):
+                        converted_times[i] = datetime.fromtimestamp(t / 1000000, tz=timezone.utc)
+
+                columns['time'] = converted_times
 
         # Return columnar record marker
         return {
