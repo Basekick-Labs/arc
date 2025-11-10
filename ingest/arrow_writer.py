@@ -272,12 +272,11 @@ class ArrowParquetWriter:
                 # Industry standard for observability and time series databases
                 arrow_type = pa.timestamp('us')
             elif col_name == 'time' and isinstance(sample, int):
-                # OPTIMIZATION: Keep integer timestamps as int64 (not timestamp type)
-                # This avoids DuckDB datetime conversion on query (3-4x faster serialization)
-                # - Storage: int64 microseconds (8 bytes, same as timestamp)
-                # - Query: DuckDB returns int (no isoformat() needed)
-                # - Benefit: SELECT * queries 3-4x faster for large result sets
-                arrow_type = pa.int64()
+                # Store integer timestamps as timestamp type (not int64)
+                # IMPORTANT: Must use timestamp type for DuckDB time functions
+                # (DATE_TRUNC, time comparisons, etc. don't work with BIGINT)
+                # Trade-off: Slower JSON serialization but queries work correctly
+                arrow_type = pa.timestamp('us')
             elif isinstance(sample, bool):
                 arrow_type = pa.bool_()
             elif isinstance(sample, int):
