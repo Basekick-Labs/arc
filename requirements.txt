@@ -4,6 +4,7 @@
 polars==1.34.0
 pyarrow==21.0.0
 numpy==2.3.3
+pytz==2024.2  # Required by DuckDB for timezone-aware timestamps in existing Parquet files
 
 # Fast async I/O
 aiofiles==25.1.0
