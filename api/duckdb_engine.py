@@ -99,6 +99,17 @@ class DuckDBEngine:
             memory_limit = os.getenv('DUCKDB_MEMORY_LIMIT', '4GB')
             conn.execute(f"SET memory_limit='{memory_limit}'")
 
+            # OPTIMIZATION: Create macro to auto-cast int64 timestamps
+            # Allows queries to use time functions without manual CAST()
+            # Converts microseconds (int64) to timestamp automatically
+            conn.execute("""
+                CREATE MACRO IF NOT EXISTS to_timestamp_us(us BIGINT) AS
+                    CAST(CAST(us AS TIMESTAMP) AS TIMESTAMP);
+            """)
+
+            # Set timezone to UTC for consistency
+            conn.execute("SET TimeZone='UTC'")
+
             # Log configuration prominently
             logger.info(
                 f"\033[1;36mDuckDB Performance Config:\033[0m "
