@@ -272,13 +272,11 @@ class ArrowParquetWriter:
                 # Industry standard for observability and time series databases
                 arrow_type = pa.timestamp('us')
             elif col_name == 'time' and isinstance(sample, int):
-                # PERFORMANCE: Store as int64 for 3-4x faster JSON queries
-                # Storage: int64 microseconds since epoch (UTC)
-                # Queries must cast to timestamp for time functions:
-                #   - Old: DATE_TRUNC('minute', time)
-                #   - New: DATE_TRUNC('minute', CAST(time AS TIMESTAMP))
-                # Trade-off: Queries need updates but get 3-4x speedup
-                arrow_type = pa.int64()
+                # Store timestamps as pa.timestamp for query simplicity
+                # Assumes int values are microseconds since epoch (standard for observability)
+                # Trade-off: Simpler queries > marginal performance gains
+                # Users can write normal SQL: WHERE time > '2025-01-01'
+                arrow_type = pa.timestamp('us')
             elif isinstance(sample, bool):
                 arrow_type = pa.bool_()
             elif isinstance(sample, int):
