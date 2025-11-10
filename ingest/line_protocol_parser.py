@@ -78,13 +78,14 @@ class LineProtocolParser:
 
             # Use current time if no timestamp provided
             if timestamp is None:
-                timestamp = datetime.now(timezone.utc)
+                # Current time in microseconds (integer)
+                timestamp = int(datetime.now(timezone.utc).timestamp() * 1_000_000)
 
             return {
                 'measurement': measurement,
                 'tags': tags,
                 'fields': fields,
-                'timestamp': timestamp
+                'timestamp': timestamp  # Now an int (microseconds), not datetime
             }
 
         except Exception as e:
@@ -279,17 +280,28 @@ class LineProtocolParser:
             return value
 
     @staticmethod
-    def _parse_timestamp(timestamp_str: str) -> Optional[datetime]:
+    def _parse_timestamp(timestamp_str: str) -> Optional[int]:
         """
-        Parse timestamp from line protocol
+        Parse timestamp from line protocol - returns int64 microseconds
 
-        Timestamps in line protocol are in nanoseconds since Unix epoch
+        OPTIMIZATION: Keep as integer (microseconds) instead of datetime objects.
+        This is 2600x faster than converting to Python datetime (same as MsgPack optimization).
+
+        Line Protocol timestamps are in nanoseconds since Unix epoch.
+        We normalize to microseconds for Arrow compatibility.
+
+        Args:
+            timestamp_str: Timestamp string (nanoseconds)
+
+        Returns:
+            Timestamp in microseconds (int64) or None if invalid
         """
         try:
-            # Convert nanoseconds to seconds
+            # Parse nanoseconds
             timestamp_ns = int(timestamp_str)
-            timestamp_s = timestamp_ns / 1_000_000_000
-            return datetime.fromtimestamp(timestamp_s, tz=timezone.utc)
+            # Convert to microseconds (Arrow's precision)
+            timestamp_us = timestamp_ns // 1000
+            return timestamp_us
         except (ValueError, OSError) as e:
             logger.warning(f"Invalid timestamp: {timestamp_str}. Error: {e}")
             return None
@@ -371,7 +383,10 @@ class LineProtocolParser:
     @staticmethod
     def to_flat_dict(record: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Convert parsed record to flat dictionary for DataFrame/Parquet
+        Convert parsed record to flat dictionary for Arrow/Parquet
+
+        OPTIMIZATION: Timestamps are now integers (microseconds), not datetime objects.
+        Mark with _time_unit so ArrowParquetBuffer handles them correctly.
 
         Args:
             record: Parsed line protocol record
@@ -380,8 +395,9 @@ class LineProtocolParser:
             Flat dictionary with tags and fields as columns
         """
         flat = {
-            'time': record['timestamp'],
-            'measurement': record['measurement']
+            'time': record['timestamp'],  # Integer microseconds
+            'measurement': record['measurement'],
+            '_time_unit': 'us'  # Mark timestamp as microseconds for Arrow
         }
 
         # Add tags (no prefix)

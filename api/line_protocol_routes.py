@@ -14,14 +14,15 @@ import asyncio
 import os
 from datetime import datetime
 from ingest.line_protocol_parser import LineProtocolParser
-from ingest.parquet_buffer import ParquetBuffer
+from ingest.arrow_writer import ArrowParquetBuffer
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["line-protocol"])
 
 # Global buffer instance (initialized on startup)
-parquet_buffer: Optional[ParquetBuffer] = None
+# OPTIMIZATION: Use ArrowParquetBuffer (same as MsgPack) for better performance
+arrow_buffer: Optional[ArrowParquetBuffer] = None
 
 # Security: Maximum decompressed payload size (default 500MB)
 # This prevents gzip bomb DoS attacks (e.g., 100MB gzip -> 10GB decompressed)
@@ -153,24 +154,32 @@ async def decode_body(body: bytes, content_encoding: Optional[str] = None) -> st
 
 def init_parquet_buffer(storage_backend, config: dict = None):
     """
-    Initialize the global Parquet buffer
+    Initialize the global Arrow Parquet buffer
 
     Args:
         storage_backend: Storage backend instance
         config: Configuration dict with buffer settings
     """
-    global parquet_buffer
+    global arrow_buffer
 
     config = config or {}
-    parquet_buffer = ParquetBuffer(
+
+    # OPTIMIZATION: Use ArrowParquetBuffer for schema caching and better performance
+    # Same buffer used by MsgPack endpoint (2.45M RPS tested)
+    arrow_buffer = ArrowParquetBuffer(
         storage_backend=storage_backend,
-        max_buffer_size=config.get('max_buffer_size', 10000),
-        max_buffer_age_seconds=config.get('max_buffer_age_seconds', 60),
-        compression=config.get('compression', 'snappy')
+        buffer_size=config.get('buffer_size', 10000),
+        buffer_age_seconds=config.get('buffer_age_seconds', 60),
+        compression=config.get('compression', 'lz4')  # LZ4 for better performance
     )
 
-    logger.info("ParquetBuffer initialized for line protocol writes")
-    return parquet_buffer
+    logger.info(
+        f"ArrowParquetBuffer initialized for Line Protocol writes "
+        f"(buffer_size={arrow_buffer.buffer_size}, "
+        f"buffer_age={arrow_buffer.buffer_age_seconds}s, "
+        f"compression={arrow_buffer.compression})"
+    )
+    return arrow_buffer
 
 
 @router.post("/api/v1/write")
@@ -191,7 +200,7 @@ async def write_v1(
         POST /api/v1/write?db=telegraf
         cpu,host=server01 usage_idle=90.5 1609459200000000000
     """
-    if not parquet_buffer:
+    if not arrow_buffer:
         raise HTTPException(status_code=503, detail="Write service not initialized")
 
     try:
@@ -230,8 +239,8 @@ async def write_v1(
         # Merge records with same measurement+tags+timestamp
         merged_records = merge_records(flat_records)
 
-        # Write to buffer
-        await parquet_buffer.write(merged_records)
+        # Write to buffer (ArrowParquetBuffer)
+        await arrow_buffer.write(merged_records)
 
         # Return success - InfluxDB 1.x returns 204 No Content with empty body
         return Response(status_code=204)
@@ -261,7 +270,7 @@ async def write_influxdb(
         Authorization: Token my-token
         cpu,host=server01 usage_idle=90.5 1609459200000000000
     """
-    if not parquet_buffer:
+    if not arrow_buffer:
         raise HTTPException(status_code=503, detail="Write service not initialized")
 
     try:
@@ -298,8 +307,8 @@ async def write_influxdb(
         # Merge records with same measurement+tags+timestamp
         merged_records = merge_records(flat_records)
 
-        # Write to buffer
-        await parquet_buffer.write(merged_records)
+        # Write to buffer (ArrowParquetBuffer)
+        await arrow_buffer.write(merged_records)
 
         # Return success - InfluxDB 2.x returns 204 No Content with empty body
         return Response(status_code=204)
@@ -325,7 +334,7 @@ async def write_simple(
         POST /write
         cpu,host=server01 usage_idle=90.5 1609459200000000000
     """
-    if not parquet_buffer:
+    if not arrow_buffer:
         raise HTTPException(status_code=503, detail="Write service not initialized")
 
     try:
@@ -356,8 +365,8 @@ async def write_simple(
         # Merge records with same measurement+tags+timestamp
         merged_records = merge_records(flat_records)
 
-        # Write to buffer
-        await parquet_buffer.write(merged_records)
+        # Write to buffer (ArrowParquetBuffer)
+        await arrow_buffer.write(merged_records)
 
         # Return success - InfluxDB 1.x returns 204 No Content with empty body
         return Response(status_code=204)
@@ -370,10 +379,10 @@ async def write_simple(
 @router.get("/api/v1/write/health")
 async def write_health():
     """Health check for write endpoint"""
-    if not parquet_buffer:
+    if not arrow_buffer:
         raise HTTPException(status_code=503, detail="Write service not initialized")
 
-    stats = parquet_buffer.get_stats()
+    stats = arrow_buffer.get_stats()
 
     return {
         "status": "healthy",
@@ -385,10 +394,10 @@ async def write_health():
 @router.get("/api/v1/write/stats")
 async def write_stats():
     """Get write statistics"""
-    if not parquet_buffer:
+    if not arrow_buffer:
         raise HTTPException(status_code=503, detail="Write service not initialized")
 
-    stats = parquet_buffer.get_stats()
+    stats = arrow_buffer.get_stats()
 
     return {
         "status": "success",
@@ -404,18 +413,18 @@ async def flush_buffer(measurement: Optional[str] = Query(None, description="Spe
 
     Useful for testing or forcing immediate persistence.
     """
-    if not parquet_buffer:
+    if not arrow_buffer:
         raise HTTPException(status_code=503, detail="Write service not initialized")
 
     try:
         if measurement:
-            await parquet_buffer.flush_measurement_sync(measurement)
+            await arrow_buffer.flush_measurement(measurement)
             return {
                 "status": "success",
                 "message": f"Flushed buffer for measurement: {measurement}"
             }
         else:
-            await parquet_buffer.flush_all()
+            await arrow_buffer.flush_all()
             return {
                 "status": "success",
                 "message": "Flushed all buffers"
@@ -428,14 +437,14 @@ async def flush_buffer(measurement: Optional[str] = Query(None, description="Spe
 
 # Startup/shutdown handlers
 async def start_parquet_buffer():
-    """Start the parquet buffer background tasks"""
-    if parquet_buffer:
-        await parquet_buffer.start()
+    """Start the Arrow buffer background tasks"""
+    if arrow_buffer:
+        await arrow_buffer.start()
         logger.info("Line protocol write service started")
 
 
 async def stop_parquet_buffer():
-    """Stop the parquet buffer and flush remaining data"""
-    if parquet_buffer:
-        await parquet_buffer.stop()
+    """Stop the Arrow buffer and flush remaining data"""
+    if arrow_buffer:
+        await arrow_buffer.stop()
         logger.info("Line protocol write service stopped")
