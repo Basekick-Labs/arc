@@ -95,9 +95,11 @@ class DuckDBEngine:
 
             conn.execute(f"SET threads={threads}")
 
-            # Set memory limit (default 4GB, can be overridden via env var)
-            memory_limit = os.getenv('DUCKDB_MEMORY_LIMIT', '4GB')
-            conn.execute(f"SET memory_limit='{memory_limit}'")
+            # Set memory limit for DuckDB (only if explicitly configured)
+            # No default: Let DuckDB use unlimited memory with garbage collection cleanup
+            memory_limit = os.getenv('DUCKDB_MEMORY_LIMIT')
+            if memory_limit:
+                conn.execute(f"SET memory_limit='{memory_limit}'")
 
             # OPTIMIZATION: Create macro to auto-cast int64 timestamps
             # Allows queries to use time functions without manual CAST()
