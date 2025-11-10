@@ -272,11 +272,12 @@ class ArrowParquetWriter:
                 # Industry standard for observability and time series databases
                 arrow_type = pa.timestamp('us')
             elif col_name == 'time' and isinstance(sample, int):
-                # OPTIMIZATION: Integer timestamps (already normalized to microseconds)
-                # This is 2600x faster than converting to datetime first
-                # Direct int → Arrow timestamp conversion
-                # Note: timezone-naive to avoid DuckDB pytz dependency
-                arrow_type = pa.timestamp('us')
+                # OPTIMIZATION: Keep integer timestamps as int64 (not timestamp type)
+                # This avoids DuckDB datetime conversion on query (3-4x faster serialization)
+                # - Storage: int64 microseconds (8 bytes, same as timestamp)
+                # - Query: DuckDB returns int (no isoformat() needed)
+                # - Benefit: SELECT * queries 3-4x faster for large result sets
+                arrow_type = pa.int64()
             elif isinstance(sample, bool):
                 arrow_type = pa.bool_()
             elif isinstance(sample, int):

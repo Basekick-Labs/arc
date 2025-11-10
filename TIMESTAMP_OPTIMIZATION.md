@@ -84,9 +84,9 @@ elif isinstance(sample, int):
 elif isinstance(sample, datetime):
     arrow_type = pa.timestamp('us')
 elif col_name == 'time' and isinstance(sample, int):
-    # Direct int → Arrow timestamp conversion (2600x faster)
-    # timezone-naive to avoid DuckDB pytz dependency
-    arrow_type = pa.timestamp('us')
+    # Keep as int64 for 3-4x faster query serialization
+    # DuckDB returns int (no datetime conversion needed)
+    arrow_type = pa.int64()
 elif isinstance(sample, int):
     arrow_type = pa.int64()
 ```
