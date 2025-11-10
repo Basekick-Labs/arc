@@ -83,7 +83,7 @@ class ArcConfig:
             "ingestion": {
                 "buffer_size": 10000,
                 "buffer_age_seconds": 60,
-                "compression": "snappy",
+                "compression": "lz4",  # LZ4 is faster than snappy with similar compression
             },
             "wal": {
                 "enabled": False,
