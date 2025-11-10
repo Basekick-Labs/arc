@@ -23,8 +23,8 @@ parquet_buffer = ParquetBuffer(
 from ingest.arrow_writer import ArrowParquetBuffer
 arrow_buffer = ArrowParquetBuffer(
     storage_backend=storage_backend,
-    buffer_size=config.get('buffer_size', 10000),
-    buffer_age_seconds=config.get('buffer_age_seconds', 60),
+    max_buffer_size=config.get('buffer_size', 10000),
+    max_buffer_age_seconds=config.get('buffer_age_seconds', 60),
     compression='lz4'  # Faster than snappy
 )
 ```

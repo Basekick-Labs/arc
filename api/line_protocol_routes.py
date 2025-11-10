@@ -168,16 +168,16 @@ def init_parquet_buffer(storage_backend, config: dict = None):
     # Same buffer used by MsgPack endpoint (2.45M RPS tested)
     arrow_buffer = ArrowParquetBuffer(
         storage_backend=storage_backend,
-        buffer_size=config.get('buffer_size', 10000),
-        buffer_age_seconds=config.get('buffer_age_seconds', 60),
+        max_buffer_size=config.get('buffer_size', 10000),
+        max_buffer_age_seconds=config.get('buffer_age_seconds', 60),
         compression=config.get('compression', 'lz4')  # LZ4 for better performance
     )
 
     logger.info(
         f"ArrowParquetBuffer initialized for Line Protocol writes "
-        f"(buffer_size={arrow_buffer.buffer_size}, "
-        f"buffer_age={arrow_buffer.buffer_age_seconds}s, "
-        f"compression={arrow_buffer.compression})"
+        f"(max_buffer_size={arrow_buffer.max_buffer_size}, "
+        f"max_buffer_age={arrow_buffer.max_buffer_age_seconds}s, "
+        f"compression={arrow_buffer.writer.compression})"
     )
     return arrow_buffer
 
