@@ -411,7 +411,7 @@ class DuckDBEngine:
                     serialized_row = list(row)
                     for i in timestamp_cols:
                         val = serialized_row[i]
-                        if val is not None and isinstance(val, dt_type):
+                        if val is not None:  # Skip isinstance check - we already know it's a timestamp column
                             serialized_row[i] = val.isoformat()
                     serialized_data.append(serialized_row)
             else:
