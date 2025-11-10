@@ -275,7 +275,8 @@ class ArrowParquetWriter:
                 # OPTIMIZATION: Integer timestamps (already normalized to microseconds)
                 # This is 2600x faster than converting to datetime first
                 # Direct int → Arrow timestamp conversion
-                arrow_type = pa.timestamp('us', tz='UTC')
+                # Note: timezone-naive to avoid DuckDB pytz dependency
+                arrow_type = pa.timestamp('us')
             elif isinstance(sample, bool):
                 arrow_type = pa.bool_()
             elif isinstance(sample, int):
