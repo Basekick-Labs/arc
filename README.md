@@ -6,12 +6,12 @@
 
 <p align="center">
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img src="https://img.shields.io/badge/License-AGPL%203.0-blue.svg" alt="License: AGPL-3.0"/></a>
-  <a href="https://github.com/basekick-labs/arc-core"><img src="https://img.shields.io/badge/Throughput-2.9M%20RPS-brightgreen.svg" alt="Performance"/></a>
+  <a href="https://github.com/basekick-labs/arc-core"><img src="https://img.shields.io/badge/Throughput-6.57M%20RPS-brightgreen.svg" alt="Performance"/></a>
   <a href="https://discord.gg/nxnWfUxsdm"><img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2?logo=discord&logoColor=white" alt="Discord"/></a>
 </p>
 
 <p align="center">
-  High-performance time-series database. 2.9M metrics/sec + 968K logs/sec + 981K events/sec + 784K traces/sec. One endpoint, one protocol. DuckDB + Parquet + Arrow. AGPL-3.0
+  High-performance time-series database. 6.57M combined records/sec (metrics + logs + events + traces simultaneously). One endpoint, one protocol. DuckDB + Parquet + Arrow. AGPL-3.0
 </p>
 
 > **Alpha Release - Technical Preview**
@@ -39,20 +39,60 @@
 
 Arc ingests any timestamped columnar data through a unified MessagePack protocol - metrics, logs, traces, events, IoT sensors, or analytics.
 
-### Four Data Types, One Platform
+## Write Performance
 
-Near-million RPS performance across all data types:
+### Unified Ingestion - All Data Types Simultaneously
 
-| Data Type | Throughput | What it tracks | Latency (p99) |
-|-----------|------------|----------------|---------------|
-| **Metrics** | **2.91M/sec** | System state, IoT sensors, measurements | 29ms |
-| **Logs** | **968K/sec** | Application events, access logs, audit trails | 58ms |
-| **Events** | **981K/sec** | State changes, deployments, incidents | 55ms |
-| **Traces** | **784K/sec** | Request flows, distributed tracing, spans | 64ms |
+Arc handles **6.57 million records/sec combined throughput** across all four observability data types ingesting simultaneously on a single node.
 
-**Total Capacity**: **~5.6 million records/sec** combined throughput
+**Unified Test Results** (all data types running together):
 
-*All tested with batch_size=1000 on Apple M3 Max (14 cores, 36GB RAM)*
+| Data Type | Throughput | % of Individual Peak | CPU Share |
+|-----------|------------|---------------------|-----------|
+| **Metrics** | **1.98M/sec** | 68% | Primary workload |
+| **Logs** | **1.55M/sec** | 160% | Better CPU sharing |
+| **Traces** | **1.50M/sec** | 191% | Better CPU sharing |
+| **Events** | **1.54M/sec** | 157% | Better CPU sharing |
+| **TOTAL** | **6.57M/sec** | **117% of theoretical** | 100% CPU utilization |
+
+**Test Configuration:**
+- **Hardware**: Apple M3 Max (14 cores, 36GB RAM)
+- **Duration**: 61 seconds
+- **Total Records**: 402 million records
+- **Success Rate**: 100% (zero errors)
+- **CPU**: 100% utilization - pure compute efficiency
+- **Batch Size**: 1,000 records per batch
+- **Workers**: 500 per data type (2,000 total concurrent workers)
+
+### Why This Matters: Linear Scalability
+
+The bottleneck is **CPU compute**, not memory, disk I/O, or lock contention. Arc hit the hardware ceiling with every CPU cycle doing useful work and no architectural bottlenecks.
+
+**This means Arc scales linearly with cores:**
+
+| Hardware | Cores | Estimated Throughput |
+|----------|-------|---------------------|
+| Apple M3 Max | 14 cores | 6.57M records/sec (tested) |
+| AWS c6a.4xlarge | 16 cores | ~7.5M records/sec |
+| AWS c6a.8xlarge | 32 cores | ~15M records/sec |
+| AWS c6a.16xlarge | 64 cores | ~30M records/sec |
+
+**Production Recommendation**: Target 50-60% CPU utilization (~3-4M combined records/sec on M3 Max) to maintain headroom for traffic spikes and operational overhead.
+
+### Individual Data Type Performance
+
+When tested separately with optimized configurations:
+
+| Data Type | Throughput | p50 Latency | p99 Latency | What it tracks |
+|-----------|------------|-------------|-------------|----------------|
+| **Metrics** | **2.91M/sec** | 1.76ms | 29ms | System state, IoT sensors, measurements |
+| **Logs** | **968K/sec** | 7.68ms | 58ms | Application events, access logs, audit trails |
+| **Events** | **981K/sec** | 3.34ms | 55ms | State changes, deployments, incidents |
+| **Traces** | **784K/sec** | 2.61ms | 64ms | Request flows, distributed tracing, spans |
+
+**Total Individual Capacity**: 5.6M records/sec (theoretical maximum if run separately)
+
+*All with sub-100ms p99 latency - production-ready performance*
 
 **Performance Philosophy:** Arc prioritizes **production-ready latency** over maximum throughput. All benchmarks use batch_size=1000 to ensure sub-100ms p99 latency across all data types. Larger batches can achieve 15-20% higher throughput but with 10-30x worse latency, making them unsuitable for real-time observability.
 
