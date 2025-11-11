@@ -341,7 +341,8 @@ async def run_load_test(
             print(
                 f"[{elapsed:6.1f}s] RPS: {int(current_rps):>7} (target: {target_rps}) | "
                 f"Total: {tester.total_sent:>12,} | Errors: {tester.total_errors:>6} | "
-                f"Latency (ms) - p50: {p50:>6.1f} p95: {p95:>6.1f} p99: {p99:>6.1f}"
+                f"Latency (ms) - p50: {p50:>6.1f} p95: {p95:>6.1f} p99: {p99:>6.1f}",
+                flush=True
             )
 
             last_sent = tester.total_sent

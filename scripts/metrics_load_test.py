@@ -81,8 +81,8 @@ class PreGeneratedMessagePackDataPool:
             # Serialize with MessagePack (binary)
             payload_binary = msgpack.packb(payload_dict)
 
-            # Pre-compress with gzip
-            payload_compressed = gzip.compress(payload_binary)
+            # Pre-compress with gzip (fast compression)
+            payload_compressed = gzip.compress(payload_binary, compresslevel=1)
 
             self.batches.append(payload_compressed)
 
@@ -237,8 +237,10 @@ async def run_load_test(
         connector_limit = num_workers + 50
     elif num_workers <= 300:
         connector_limit = 200  # Share connections among workers
+    elif num_workers <= 600:
+        connector_limit = 400  # Balance between connections and OS limits
     else:
-        connector_limit = 256  # Cap at 256 for very high worker counts
+        connector_limit = 500  # Cap at 500 to avoid OS file descriptor limits
 
     connector = aiohttp.TCPConnector(
         limit=connector_limit,

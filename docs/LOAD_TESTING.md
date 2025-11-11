@@ -17,14 +17,23 @@ Arc includes comprehensive load testing tools to benchmark ingestion performance
 
 ## Overview
 
-Arc provides load testing scripts for all four observability data types, plus a unified demo scenario:
+Arc provides load testing scripts for all four observability data types, plus a unified demo scenario.
+
+### Performance Philosophy
+
+**Arc prioritizes production-ready latency over maximum throughput.** All benchmarks use `batch_size=1000` to ensure sub-100ms p99 latency across all data types. While larger batches (10K-20K) can achieve 15-20% higher throughput, they result in 10-30x worse latency, making them unsuitable for real-time observability workloads.
+
+**Recommended Configuration:**
+- **batch_size=1000** for all production workloads
+- Sub-100ms p99 latency for real-time dashboards, alerting, and debugging
+- Consistent configuration across metrics, logs, traces, and events
 
 ### Performance Testing Scripts
 
-1. **[`scripts/metrics_load_test.py`](../scripts/metrics_load_test.py)** - For testing metrics ingestion (2.45M+ metrics/sec)
-2. **[`scripts/synthetic_logs_load_test.py`](../scripts/synthetic_logs_load_test.py)** - For testing log ingestion (955K+ logs/sec)
-3. **[`scripts/synthetic_traces_load_test.py`](../scripts/synthetic_traces_load_test.py)** - For testing distributed traces (944K+ spans/sec)
-4. **[`scripts/synthetic_events_load_test.py`](../scripts/synthetic_events_load_test.py)** - For testing events ingestion (938K+ events/sec)
+1. **[`scripts/metrics_load_test.py`](../scripts/metrics_load_test.py)** - Metrics ingestion (2.91M metrics/sec, 29ms p99)
+2. **[`scripts/synthetic_logs_load_test.py`](../scripts/synthetic_logs_load_test.py)** - Log ingestion (968K logs/sec, 58ms p99)
+3. **[`scripts/synthetic_traces_load_test.py`](../scripts/synthetic_traces_load_test.py)** - Distributed traces (784K spans/sec, 64ms p99)
+4. **[`scripts/synthetic_events_load_test.py`](../scripts/synthetic_events_load_test.py)** - Events ingestion (981K events/sec, 55ms p99)
 
 ### Demo Scenario
 
@@ -62,13 +71,13 @@ All scripts:
     --rps 500000 \
     --duration 30
 
-# High-throughput test - 2.45M metrics/sec (world record!)
+# High-throughput test - 2.91M metrics/sec
 ./scripts/metrics_load_test.py \
     --token YOUR_API_TOKEN \
-    --rps 2500000 \
+    --rps 3000000 \
     --duration 60 \
     --batch-size 1000 \
-    --workers 600 \
+    --workers 500 \
     --columnar
 ```
 
@@ -173,23 +182,26 @@ The script generates realistic metrics with these fields:
 
 ### World Record Performance
 
-Arc achieved **2.45 million metrics/second** using this script:
+Arc achieved **2.91 million metrics/second** using this script:
 
 ```bash
 ./scripts/metrics_load_test.py \
     --token YOUR_TOKEN \
-    --rps 2500000 \
+    --rps 3000000 \
     --duration 60 \
     --batch-size 1000 \
-    --workers 600 \
+    --workers 500 \
     --columnar
 ```
 
 **Results:**
-- **2.45M metrics/sec** sustained
-- **p99 latency**: ~18ms
-- **Zero errors**
-- **Hardware**: 14-core system, 36GB RAM
+- **2.91M metrics/sec** sustained (97.1% of 3M target)
+- **p50 latency**: 1.76ms
+- **p95 latency**: 13.28ms
+- **p99 latency**: 29.03ms
+- **Zero errors** over 60 seconds
+- **Hardware**: Apple M3 Max (14 cores), 36GB RAM
+- **Configuration**: batch_size=1000, workers=500, gzip compression level 1
 
 ---
 
@@ -217,14 +229,14 @@ Arc achieved **2.45 million metrics/second** using this script:
     --rps 50000 \
     --duration 30
 
-# High-throughput test - 955K logs/sec
+# High-throughput test - 968K logs/sec
 ./scripts/synthetic_logs_load_test.py \
     --token YOUR_API_TOKEN \
     --database logs \
     --rps 1000000 \
     --duration 60 \
-    --batch-size 20000 \
-    --workers 600
+    --batch-size 1000 \
+    --workers 400
 ```
 
 ### Command-Line Options
@@ -246,24 +258,19 @@ Optional:
 ### Example Output
 
 ```
-🔄 Pre-generating 500 log batches (10,000,000 log entries)
-  Progress: 100/500 (3 batches/sec)
-  Progress: 200/500 (3 batches/sec)
-  Progress: 300/500 (3 batches/sec)
-  Progress: 400/500 (3 batches/sec)
-  Progress: 500/500 (3 batches/sec)
+🔄 Pre-generating 500 log batches (500,000 log entries)
 ✅ Pre-generation complete!
-   Time taken: 154.4s
+   Time taken: 5.2s
    Total batches: 500
-   Total log entries: 10,000,000
-   Avg compressed size: 478.0 KB
-   Total size: 233.4 MB
+   Total log entries: 500,000
+   Avg compressed size: 47.8 KB
+   Total size: 23.4 MB
 
 ================================================================================
 Arc Synthetic Logs Load Test - MessagePack Columnar Format
 ================================================================================
 Target RPS:      1,000,000 logs/sec
-Batch Size:      20,000 logs/batch
+Batch Size:      1,000 logs/batch
 Duration:        60s
 Database:        logs
 Services:        50
@@ -272,34 +279,31 @@ Protocol:        MessagePack + Direct Arrow/Parquet
 Arc URL:         http://localhost:8000
 ================================================================================
 
-Starting 600 workers...
-Connection pool: 256 connections for 600 workers
-Warming up connection pool...
-✅ Connection pool warmed up
+Starting 400 workers...
 
-[   5.0s] RPS: 2400000 (target: 1000000) | Total:   12,000,000 | Errors:      0 | Latency (ms) - p50: 1162.7 p95: 1827.4 p99: 1833.7
-[  10.0s] RPS:       0 (target: 1000000) | Total:   12,000,000 | Errors:      0 | Latency (ms) - p50: 1162.7 p95: 1827.4 p99: 1833.7
-[  15.0s] RPS: 2400000 (target: 1000000) | Total:   24,000,000 | Errors:      0 | Latency (ms) - p50:  451.3 p95: 1515.7 p99: 1832.6
-[  20.0s] RPS:       0 (target: 1000000) | Total:   24,000,000 | Errors:      0 | Latency (ms) - p50:  451.3 p95: 1515.7 p99: 1832.6
-[  25.0s] RPS:  692000 (target: 1000000) | Total:   27,460,000 | Errors:      0 | Latency (ms) - p50:  347.2 p95: 1502.4 p99: 1832.4
-[  30.0s] RPS: 1708000 (target: 1000000) | Total:   36,000,000 | Errors:      0 | Latency (ms) - p50:  254.8 p95: 1490.9 p99: 1831.2
+[   5.0s] RPS: 1000000 (target: 1000000) | Total:    5,000,000 | Errors:      0 | Latency (ms) - p50:   14.5 p95:   53.6 p99:   64.3
+[  10.0s] RPS:  994800 (target: 1000000) | Total:    9,974,000 | Errors:      0 | Latency (ms) - p50:   14.3 p95:   49.2 p99:   61.9
+[  15.0s] RPS:  906800 (target: 1000000) | Total:   14,508,000 | Errors:      0 | Latency (ms) - p50:   12.7 p95:   46.6 p99:   62.3
+[  20.0s] RPS:  998400 (target: 1000000) | Total:   19,500,000 | Errors:      0 | Latency (ms) - p50:   11.9 p95:   46.7 p99:   64.8
+[  25.0s] RPS: 1000000 (target: 1000000) | Total:   24,500,000 | Errors:      0 | Latency (ms) - p50:    9.4 p95:   42.7 p99:   61.6
+[  30.0s] RPS:  973800 (target: 1000000) | Total:   29,369,000 | Errors:      0 | Latency (ms) - p50:    9.2 p95:   41.6 p99:   61.2
 
 ================================================================================
 Test Complete
 ================================================================================
-Duration:        62.8s
-Total Sent:      60,000,000 log entries
+Duration:        60.5s
+Total Sent:      58,548,000 log entries
 Total Errors:    0
 Success Rate:    100.00%
-Actual RPS:      955,179 logs/sec
+Actual RPS:      967,989 logs/sec
 Target RPS:      1,000,000 logs/sec
-Achievement:     95.5%
+Achievement:     96.8%
 
 Latency Percentiles (ms):
-  p50:  113.90
-  p95:  1406.35
-  p99:  1827.42
-  p999: 1836.07
+  p50:  7.68
+  p95:  37.74
+  p99:  58.35
+  p999: 88.11
 ================================================================================
 ```
 
@@ -346,10 +350,12 @@ Arc achieved **955,179 logs/second** using this script:
 ```
 
 **Results:**
-- **955K logs/sec** sustained
-- **60 million logs** in 60 seconds
-- **p99 latency**: 1827ms
-- **Zero errors**
+- **968K logs/sec** sustained (96.8% of 1M target)
+- **58.5 million logs** in 60 seconds
+- **p50 latency**: 7.68ms
+- **p99 latency**: 58.35ms
+- **Zero errors** over 60 seconds
+- **Configuration**: batch_size=1000, workers=400
 
 ---
 
@@ -379,14 +385,14 @@ Arc achieved **955,179 logs/second** using this script:
     --rps 100000 \
     --duration 30
 
-# High-throughput test - 944K spans/sec
+# High-throughput test - 784K spans/sec
 ./scripts/synthetic_traces_load_test.py \
     --token YOUR_API_TOKEN \
     --database traces \
-    --rps 1000000 \
+    --rps 800000 \
     --duration 60 \
-    --batch-size 20000 \
-    --workers 600
+    --batch-size 1000 \
+    --workers 500
 ```
 
 ### Command-Line Options
@@ -407,20 +413,26 @@ Optional:
 ### Example Output
 
 ```
-🔄 Pre-generating 500 trace batches (10,000,000 spans)
-  Progress: 500/500 (3 batches/sec)
+🔄 Pre-generating 500 trace batches (500,000 spans)
+  Progress: 100/500 (144 batches/sec)
+  Progress: 200/500 (145 batches/sec)
+  Progress: 300/500 (146 batches/sec)
+  Progress: 400/500 (146 batches/sec)
+  Progress: 500/500 (147 batches/sec)
 ✅ Pre-generation complete!
-   Time taken: 146.1s
+   Time taken: 3.4s
    Total batches: 500
-   Total spans: 10,000,000
-   Avg compressed size: 506.9 KB
-   Total size: 247.5 MB
+   Total spans: 500,000
+   Avg compressed size: 28.8 KB
+   Total size: 14.1 MB
+
+Starting 500 workers...
 
 ================================================================================
 Arc Synthetic Traces Load Test - MessagePack Columnar Format
 ================================================================================
-Target RPS:      1,000,000 spans/sec
-Batch Size:      20,000 spans/batch
+Target RPS:      800,000 spans/sec
+Batch Size:      1,000 spans/batch
 Duration:        60s
 Database:        traces
 Services:        20
@@ -429,30 +441,47 @@ Protocol:        MessagePack + Direct Arrow/Parquet
 Arc URL:         http://localhost:8000/api/v1/write/msgpack
 ================================================================================
 
-[   5.0s] RPS: 1200000 (target: 1000000) | Total:    6,000,000 | Errors:      0
-[  10.0s] RPS:  800000 (target: 1000000) | Total:   10,000,000 | Errors:      0
-[  15.0s] RPS: 1000000 (target: 1000000) | Total:   15,000,000 | Errors:      0
-...
-[  60.0s] RPS: 1000000 (target: 1000000) | Total:   60,000,000 | Errors:      0
+[   5.0s] RPS:   800000 (target: 800000) | Total:    4,000,000 | Errors:      0 | Latency (ms) - p50:   27.9 p95:   68.7 p99:   92.5
+[  10.0s] RPS:   800000 (target: 800000) | Total:    8,000,000 | Errors:      0 | Latency (ms) - p50:   17.2 p95:   63.6 p99:   84.0
+[  15.0s] RPS:   798000 (target: 800000) | Total:   11,990,000 | Errors:      0 | Latency (ms) - p50:    9.4 p95:   58.0 p99:   75.7
+[  20.0s] RPS:   791000 (target: 800000) | Total:   15,945,000 | Errors:      0 | Latency (ms) - p50:    6.9 p95:   54.2 p99:   73.8
+[  25.0s] RPS:   748400 (target: 800000) | Total:   19,687,000 | Errors:      0 | Latency (ms) - p50:    6.1 p95:   50.4 p99:   71.3
+[  30.0s] RPS:   791800 (target: 800000) | Total:   23,646,000 | Errors:      0 | Latency (ms) - p50:    5.2 p95:   48.4 p99:   70.1
 
 ================================================================================
 Test Complete
 ================================================================================
-Duration:        63.5s
-Total Sent:      60,000,000 spans
+Duration:        60.6s
+Total Sent:      47,505,000 spans
 Total Errors:    0
 Success Rate:    100.00%
-Actual RPS:      944,253 spans/sec
-Target RPS:      1,000,000 spans/sec
-Achievement:     94.4%
+Actual RPS:      783,762 spans/sec
+Target RPS:      800,000 spans/sec
+Achievement:     98.0%
 
 Latency Percentiles (ms):
-  p50:  162.15
-  p95:  1861.69
-  p99:  2093.71
-  p999: 2103.43
+  p50:  2.61
+  p95:  39.86
+  p99:  63.56
+  p999: 92.48
 ================================================================================
 ```
+
+### Performance Trade-offs
+
+Arc's trace benchmarks prioritize **production-ready latency** over maximum throughput:
+
+| Configuration | Throughput | p50 Latency | p99 Latency | Production Ready? |
+|---------------|------------|-------------|-------------|-------------------|
+| **batch_size=1000** (recommended) | **784K spans/sec** | **2.61ms** | **63.56ms** | ✅ Yes - sub-100ms p99 |
+| batch_size=5000 | 99K spans/sec | 32.8ms | 105.9ms | ⚠️ Marginal |
+| batch_size=20000 | 944K spans/sec | 162ms | 2093ms | ❌ No - 2+ second p99 |
+
+**Why 1K batches?** Real-time tracing requires low latency. While 20K batches achieve 20% higher throughput (944K), they have:
+- **62x worse p50 latency** (162ms vs 2.61ms)
+- **33x worse p99 latency** (2093ms vs 63.56ms)
+
+For production observability, sub-100ms latency is critical for debugging, alerting, and real-time dashboards.
 
 ### Trace Data Schema
 
@@ -577,7 +606,7 @@ Should always be **0%** for valid tests. If you see errors:
 | 100K | 500 | 10 | < 10ms |
 | 500K | 1,000 | 50 | < 20ms |
 | 1M | 1,000 | 100 | < 30ms |
-| 2.45M | 1,000 | 600 | < 40ms |
+| 2.91M | 1,000 | 500 | < 30ms |
 
 **For Logs:**
 
@@ -661,11 +690,23 @@ done
 - Disk Write: 50-100 MB/s
 - Network: Depends on batch size and compression
 
-**At 955K logs/sec:**
-- CPU: 80-90% (peak bursts)
-- Memory: 12-15 GB
+**At 968K logs/sec:**
+- CPU: 35-45% (across all cores)
+- Memory: 12-16 GB
 - Disk Write: 40-80 MB/s
-- Network: 200-500 MB/s (bursty)
+- Network: 150-300 MB/s (steady)
+
+**At 981K events/sec:**
+- CPU: 30-40% (across all cores)
+- Memory: 10-14 GB
+- Disk Write: 30-60 MB/s
+- Network: 100-200 MB/s (steady)
+
+**At 784K traces/sec:**
+- CPU: 35-45% (across all cores)
+- Memory: 12-16 GB
+- Disk Write: 35-70 MB/s
+- Network: 120-250 MB/s (steady)
 
 ---
 
@@ -799,10 +840,10 @@ Based on Arc's tested performance:
 **Metrics Ingestion:**
 - **Single node**: 100K-500K metrics/sec (typical production)
 - **Optimized**: 1M-2M metrics/sec (with tuning)
-- **World record**: 2.45M metrics/sec (14-core, 600 workers)
+- **World record**: 2.91M metrics/sec (14-core, 500 workers, batch_size=1000)
 
 **Logs Ingestion:**
-- **Small batches (1K)**: 45K logs/sec, p99 < 50ms
+- **Optimized (1K batches)**: 968K logs/sec, p50: 7.68ms, p99: 58.35ms
 - **Medium batches (5K)**: 100K logs/sec, p99 < 200ms
 - **Large batches (10K)**: 200K logs/sec, p99 < 400ms
 - **Huge batches (20K)**: 955K logs/sec, p99 < 2s
@@ -815,17 +856,19 @@ Based on Arc's tested performance:
 - Disk: SSD required
 - Network: 1 Gbps
 
-**For 2.45M metrics/sec:**
+**For 2.91M metrics/sec:**
 - CPU: 14+ cores
-- RAM: 16+ GB
+- RAM: 36+ GB
 - Disk: NVMe SSD
 - Network: 10 Gbps
+- Configuration: 500 workers, batch_size=1000, pregenerate=2000
 
-**For 955K logs/sec:**
+**For 968K logs/sec:**
 - CPU: 14+ cores
 - RAM: 16+ GB
 - Disk: NVMe SSD
 - Network: 10 Gbps
+- Configuration: 400 workers, batch_size=1000
 
 ---
 

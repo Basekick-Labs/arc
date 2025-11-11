@@ -345,6 +345,13 @@ async def worker(
     errors = 0
     latencies = []
 
+    # Initialize stats immediately so monitor can see it
+    stats[worker_id] = {
+        "batches": 0,
+        "errors": 0,
+        "latencies": []
+    }
+
     while time.time() - start_time < duration:
         success = await send_batch(session, url, token, database, data_pool, latencies)
 
@@ -353,13 +360,14 @@ async def worker(
         else:
             errors += 1
 
-        await asyncio.sleep(interval)
+        # Update stats continuously for monitoring
+        stats[worker_id] = {
+            "batches": batches_sent,
+            "errors": errors,
+            "latencies": latencies.copy()
+        }
 
-    stats[worker_id] = {
-        "batches": batches_sent,
-        "errors": errors,
-        "latencies": latencies
-    }
+        await asyncio.sleep(interval)
 
 
 async def monitor(stats: dict, batch_size: int, target_rps: int, start_time: float, duration: int):
@@ -392,7 +400,7 @@ async def monitor(stats: dict, batch_size: int, target_rps: int, start_time: flo
 
             print(f"[{elapsed:6.1f}s] RPS: {current_rps:8.0f} (target: {target_rps}) | "
                   f"Total: {total_records:12,} | Errors: {total_errors:6} | "
-                  f"Latency (ms) - p50: {p50:6.1f} p95: {p95:6.1f} p99: {p99:6.1f}")
+                  f"Latency (ms) - p50: {p50:6.1f} p95: {p95:6.1f} p99: {p99:6.1f}", flush=True)
 
 
 async def run_load_test(

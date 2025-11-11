@@ -6,12 +6,12 @@
 
 <p align="center">
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img src="https://img.shields.io/badge/License-AGPL%203.0-blue.svg" alt="License: AGPL-3.0"/></a>
-  <a href="https://github.com/basekick-labs/arc-core"><img src="https://img.shields.io/badge/Throughput-2.4M%20RPS-brightgreen.svg" alt="Performance"/></a>
+  <a href="https://github.com/basekick-labs/arc-core"><img src="https://img.shields.io/badge/Throughput-2.9M%20RPS-brightgreen.svg" alt="Performance"/></a>
   <a href="https://discord.gg/nxnWfUxsdm"><img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2?logo=discord&logoColor=white" alt="Discord"/></a>
 </p>
 
 <p align="center">
-  High-performance time-series database. 2.4M metrics/sec + 950K logs/sec + 940K traces/sec + 940K events/sec. One endpoint, one protocol. DuckDB + Parquet + Arrow. AGPL-3.0
+  High-performance time-series database. 2.9M metrics/sec + 968K logs/sec + 981K events/sec + 784K traces/sec. One endpoint, one protocol. DuckDB + Parquet + Arrow. AGPL-3.0
 </p>
 
 > **Alpha Release - Technical Preview**
@@ -45,14 +45,16 @@ Near-million RPS performance across all data types:
 
 | Data Type | Throughput | What it tracks | Latency (p99) |
 |-----------|------------|----------------|---------------|
-| **Metrics** | **2.45M/sec** | System state, IoT sensors, measurements | 18-45ms |
-| **Logs** | **955K/sec** | Application events, access logs, audit trails | 48ms - 1.8s* |
-| **Traces** | **944K/sec** | Request flows, distributed tracing, spans | 105ms - 2.1s* |
-| **Events** | **938K/sec** | State changes, deployments, incidents | 413ms - 2.0s* |
+| **Metrics** | **2.91M/sec** | System state, IoT sensors, measurements | 29ms |
+| **Logs** | **968K/sec** | Application events, access logs, audit trails | 58ms |
+| **Events** | **981K/sec** | State changes, deployments, incidents | 55ms |
+| **Traces** | **784K/sec** | Request flows, distributed tracing, spans | 64ms |
 
-*Latency is tunable based on batch size: smaller batches = lower latency, larger batches = higher throughput
+**Total Capacity**: **~5.6 million records/sec** combined throughput
 
-**Total Capacity**: **~5.3 million records/sec** combined throughput
+*All tested with batch_size=1000 on Apple M3 Max (14 cores, 36GB RAM)*
+
+**Performance Philosophy:** Arc prioritizes **production-ready latency** over maximum throughput. All benchmarks use batch_size=1000 to ensure sub-100ms p99 latency across all data types. Larger batches can achieve 15-20% higher throughput but with 10-30x worse latency, making them unsuitable for real-time observability.
 
 **One endpoint. One protocol. Any timestamped data.**
 
@@ -60,19 +62,19 @@ Near-million RPS performance across all data types:
 
 | Wire Format | Throughput | p50 Latency | p95 Latency | p99 Latency | Notes |
 |-------------|------------|-------------|-------------|-------------|-------|
-| **MessagePack Columnar** | **2.42M RPS** | **1.74ms** | **28.13ms** | **45.27ms** | Zero-copy passthrough + auth cache (RECOMMENDED) |
+| **MessagePack Columnar** | **2.91M RPS** | **1.76ms** | **13.28ms** | **29.03ms** | Zero-copy passthrough + optimized connection pooling (RECOMMENDED) |
 | **MessagePack Row** | **908K RPS** | **136.86ms** | **851.71ms** | **1542ms** | Legacy format with conversion overhead |
 | **Line Protocol** | **240K RPS** | N/A | N/A | N/A | InfluxDB compatibility mode |
 
 **Columnar Format Advantages:**
-- **2.66x faster throughput** vs row format (2.42M vs 908K RPS)
-- **78x lower p50 latency** (1.74ms vs 136.86ms)
-- **30x lower p95 latency** (28.13ms vs 851.71ms)
-- **34x lower p99 latency** (45.27ms vs 1542ms)
-- **Near-zero authentication overhead** with 30s token cache
+- **3.2x faster throughput** vs row format (2.91M vs 908K RPS)
+- **77x lower p50 latency** (1.76ms vs 136.86ms)
+- **64x lower p95 latency** (13.28ms vs 851.71ms)
+- **53x lower p99 latency** (29.03ms vs 1542ms)
+- **Optimized connection pooling** with balanced concurrency
 
-*Tested on Apple M3 Max (14 cores), native deployment, 400 workers*
-*MessagePack columnar format with zero-copy Arrow passthrough*
+*Tested on Apple M3 Max (14 cores), native deployment, 500 workers, batch_size=1000*
+*MessagePack columnar format with zero-copy Arrow passthrough + gzip compression level 1*
 
 ### Log Ingestion Performance
 
@@ -80,10 +82,10 @@ Arc also handles **high-volume log ingestion** using the same MessagePack column
 
 | Batch Size | Throughput | p50 Latency | p99 Latency | Use Case |
 |------------|------------|-------------|-------------|----------|
-| **20,000 logs** | **955K logs/sec** | 113.9ms | 1827ms | Batch processing, data backfill |
-| **10,000 logs** | **197K logs/sec** | 40.3ms | 367ms | Production logging |
+| **1,000 logs** | **968K logs/sec** | 7.68ms | 58.35ms | High-throughput production logging |
 | **5,000 logs** | **100K logs/sec** | 12.8ms | 163ms | Interactive dashboards |
-| **1,000 logs** | **45K logs/sec** | 5.9ms | 48ms | Real-time alerting |
+| **10,000 logs** | **197K logs/sec** | 40.3ms | 367ms | Batch processing |
+| **20,000 logs** | **955K logs/sec** | 113.9ms | 1827ms | Data backfill, huge batches |
 
 **Log Schema Example** (columnar format):
 ```python
@@ -117,8 +119,11 @@ Arc completes the observability triangle with **high-performance distributed tra
 
 | Batch Size | Throughput | p50 Latency | p99 Latency | Use Case |
 |------------|------------|-------------|-------------|----------|
-| **20,000 spans** | **944K spans/sec** | 162.2ms | 2093.7ms | Maximum throughput |
-| **5,000 spans** | **99K spans/sec** | 32.8ms | 105.9ms | Low latency tracing |
+| **1,000 spans** | **784K spans/sec** | 2.61ms | 63.56ms | **Production-optimized** (recommended) |
+| **5,000 spans** | **99K spans/sec** | 32.8ms | 105.9ms | Balanced performance |
+| **20,000 spans** | **944K spans/sec** | 162ms | 2093ms | Maximum throughput (high latency) |
+
+**Why 1K batch size?** We optimized for **production readiness over raw throughput**. While 20K batches achieve 20% higher throughput (944K), they have **33x worse p99 latency** (2.1s vs 63ms). For real-time observability, sub-100ms latency is critical.
 
 **Trace Schema Example** (columnar format):
 ```python
@@ -140,9 +145,9 @@ Arc completes the observability triangle with **high-performance distributed tra
 ```
 
 **Comparison with Other Tracing Systems:**
-- **9x faster** than Jaeger (944K vs ~100K spans/sec)
-- **9-18x faster** than Tempo (944K vs ~50-100K spans/sec)
-- **9x faster** than SigNoz (944K vs ~100K spans/sec)
+- **8x faster** than Jaeger (784K vs ~100K spans/sec)
+- **8-16x faster** than Tempo (784K vs ~50-100K spans/sec)
+- **8x faster** than SigNoz (784K vs ~100K spans/sec)
 - **Unified storage** with metrics and logs for complete correlation
 
 **What makes Arc unique for traces:**
@@ -150,7 +155,8 @@ Arc completes the observability triangle with **high-performance distributed tra
 - Correlate traces with metrics and logs via SQL joins
 - OpenTelemetry-compatible span model
 - Parent-child span relationships preserved
-- 60 million spans in 60 seconds with zero errors
+- 47.5 million spans in 60 seconds with zero errors
+- **Exceptional latency**: 2.61ms p50, 63.56ms p99
 
 **Learn More:**
 - [Traces Ingestion Documentation](docs/TRACES_INGESTION.md) - Complete guide to distributed tracing with Arc
@@ -163,7 +169,7 @@ Arc completes the observability suite with **events** - the fourth pillar that a
 
 | Batch Size | Throughput | p50 Latency | p99 Latency | Use Case |
 |------------|------------|-------------|-------------|----------|
-| **20,000 events** | **938K events/sec** | 154.8ms | 2010.5ms | Maximum throughput |
+| **1,000 events** | **981K events/sec** | 3.34ms | 55.45ms | High-throughput production events |
 | **10,000 events** | **489K events/sec** | 26.0ms | 413.1ms | Balanced performance |
 
 **Event Schema Example** (columnar format):
