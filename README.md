@@ -68,14 +68,7 @@ Arc handles **6.57 million records/sec combined throughput** across all four obs
 
 The bottleneck is **CPU compute**, not memory, disk I/O, or lock contention. Arc hit the hardware ceiling with every CPU cycle doing useful work and no architectural bottlenecks.
 
-**This means Arc scales linearly with cores:**
-
-| Hardware | Cores | Estimated Throughput |
-|----------|-------|---------------------|
-| Apple M3 Max | 14 cores | 6.57M records/sec (tested) |
-| AWS c6a.4xlarge | 16 cores | ~7.5M records/sec |
-| AWS c6a.8xlarge | 32 cores | ~15M records/sec |
-| AWS c6a.16xlarge | 64 cores | ~30M records/sec |
+**This means Arc scales linearly with cores.** The 6.57M records/sec on 14 cores translates to ~469K records/sec per core. Doubling cores should roughly double throughput, assuming comparable CPU performance and fast storage (NVMe SSD).
 
 **Production Recommendation**: Target 50-60% CPU utilization (~3-4M combined records/sec on M3 Max) to maintain headroom for traffic spikes and operational overhead.
 
@@ -443,8 +436,8 @@ database = "default"
 
 | Backend | Performance | Use Case | Pros | Cons |
 |---------|-------------|----------|------|------|
-| **Local** | Fastest (2.32M RPS) | Single-node, development, edge | Direct I/O, no overhead, simple setup | No distribution, single point of failure |
-| **MinIO** | Fast (~2.0M RPS) | Distributed, multi-tenant | S3-compatible, scalable, cost-effective | Requires MinIO service, slight overhead |
+| **Local** | Fastest (6.57M RPS unified) | Single-node, development, edge | Direct I/O, no overhead, simple setup | No distribution, single point of failure |
+| **MinIO** | Fast (~5-6M RPS estimated) | Distributed, multi-tenant | S3-compatible, scalable, cost-effective | Requires MinIO service, slight overhead |
 | **AWS S3** | Cloud-native | Production, unlimited scale | Fully managed, 99.999999999% durability | Network latency, costs |
 | **GCS** | Cloud-native | Google Cloud deployments | Integrated with GCP, global CDN | Network latency, costs |
 
@@ -1377,7 +1370,7 @@ enabled = false
 
 ## Architecture Overview
 
-Arc's architecture is optimized for high-throughput time-series ingestion with **MessagePack columnar format** as the recommended ingestion path, delivering 2.32M records/sec with zero-copy passthrough to Parquet.
+Arc's architecture is optimized for high-throughput time-series ingestion with **MessagePack columnar format** as the recommended ingestion path, delivering 6.57M records/sec unified (metrics + logs + traces + events simultaneously) with zero-copy passthrough to Parquet.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -1392,7 +1385,7 @@ Arc's architecture is optimized for high-throughput time-series ingestion with *
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
 │  │  MessagePack │  │ Line Protocol│  │  Query Engine    │  │
 │  │Columnar (REC)│  │   (Legacy)   │  │   (DuckDB)       │  │
-│  │ 2.32M RPS    │  │  240K RPS    │  │                  │  │
+│  │ 6.57M RPS    │  │  240K RPS    │  │                  │  │
 │  └──────────────┘  └──────────────┘  └──────────────────┘  │
 └──────────────────┬──────────────────────────────────────────┘
                    │
@@ -1458,11 +1451,12 @@ Arc's architecture is optimized for high-throughput time-series ingestion with *
 4. **Zero-copy passthrough**: Direct PyArrow RecordBatch creation
 5. **Buffering**: In-memory columnar batches (minimal overhead)
 6. **Parquet writes**: Direct columnar → Parquet (no conversion)
-7. **Storage**: Write to local NVMe or MinIO (2.32M RPS sustained)
+7. **Storage**: Write to local NVMe or MinIO (6.57M RPS unified sustained)
 
 **Key Advantages:**
-- **2.55x faster throughput** vs row format (2.32M vs 908K RPS)
-- **20-26x lower latency** (p50: 6.75ms vs 136ms)
+- **3.2x faster throughput** vs row format (2.91M vs 908K RPS)
+- **77x lower p50 latency** (1.76ms vs 136.86ms)
+- **53x lower p99 latency** (29.03ms vs 1542ms)
 - **Zero conversion overhead** - No flatten, no row→column conversion
 - **Better compression** - Field names sent once, not per-record
 - **More efficient memory** - Arrays more compact than list of dicts
