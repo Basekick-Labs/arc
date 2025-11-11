@@ -20,7 +20,7 @@
 ## Features
 
 - **High-Throughput Ingestion**: One endpoint for any timestamped columnar data - metrics, logs, traces, events, IoT sensors, analytics
-- **Unified Protocol**: MessagePack columnar format (2.4M/sec) or InfluxDB Line Protocol (240K/sec) for compatibility
+- **Unified Protocol**: MessagePack columnar format (6.57M/sec unified) or InfluxDB Line Protocol (240K/sec) for compatibility
 - **Columnar Storage**: Parquet files with compression (3-5x compression ratios), optimized for analytical queries
 - **DuckDB Query Engine**: Fast SQL analytics with window functions, joins, aggregations, and time-series operations
 - **Flexible Storage**: Local filesystem, MinIO, AWS S3/R2, Google Cloud Storage, or any S3-compatible backend
