@@ -186,6 +186,18 @@ jobs:
           cp config.py config_loader.py arc.conf requirements.txt arc-${VERSION}/
           cp README.md LICENSE arc-${VERSION}/
 
+          # PRE-BUILD VIRTUAL ENVIRONMENT (Bundle all dependencies)
+          echo "Building virtual environment with dependencies..."
+          cd arc-${VERSION}
+          python3 -m venv venv
+          source venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          deactivate
+          cd ..
+
+          echo "Virtual environment built successfully"
+
           # Create debian control structure
           mkdir -p arc-${VERSION}/DEBIAN
 
@@ -195,32 +207,46 @@ jobs:
           Section: database
           Priority: optional
           Architecture: amd64
-          Depends: python3 (>= 3.13), python3-pip, python3-venv
+          Depends: python3 (>= 3.13)
           Maintainer: Basekick Labs <contact@basekick.com>
           Description: Arc - High-Performance Time-Series Data Warehouse
            Arc is a high-performance time-series database optimized for
            observability data ingestion and querying.
+           .
+           This package includes all Python dependencies pre-installed in a
+           virtual environment for fast deployment.
           EOF
 
           # Create installation directories
           mkdir -p arc-${VERSION}/usr/local/bin
           mkdir -p arc-${VERSION}/opt/arc
 
-          # Move app files to /opt/arc
-          mv arc-${VERSION}/{api,ingest,storage,utils,telemetry,*.py,*.conf,requirements.txt} arc-${VERSION}/opt/arc/
+          # Move app files to /opt/arc (including pre-built venv)
+          mv arc-${VERSION}/{api,ingest,storage,utils,telemetry,*.py,*.conf,requirements.txt,venv} arc-${VERSION}/opt/arc/
           mv arc-${VERSION}/{README.md,LICENSE} arc-${VERSION}/opt/arc/
 
-          # Create startup wrapper
+          # Create startup wrapper that uses pre-built venv
           cat > arc-${VERSION}/usr/local/bin/arc << 'WRAPPER'
           #!/bin/bash
+          set -e
+
+          # Check Python version
+          python3 -c "import sys; assert sys.version_info >= (3, 13)" || {
+            echo "Error: Python 3.13+ required"
+            exit 1
+          }
+
           cd /opt/arc
+
+          # Use pre-built virtual environment
           if [ ! -d "venv" ]; then
-            python3 -m venv venv
-            source venv/bin/activate
-            pip install -r requirements.txt
-          else
-            source venv/bin/activate
+            echo "Error: Virtual environment not found. Package may be corrupted."
+            exit 1
           fi
+
+          source venv/bin/activate
+
+          # Start Arc
           exec python -m uvicorn api.main:app --host 0.0.0.0 --port 8000
           WRAPPER
 
@@ -264,11 +290,25 @@ jobs:
           # Create RPM build structure
           mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
 
-          # Create source tarball
+          # Create source directory with pre-built venv
           mkdir -p arc-${VERSION}
           cp -r api/ ingest/ storage/ utils/ telemetry/ arc-${VERSION}/
           cp config.py config_loader.py arc.conf requirements.txt arc-${VERSION}/
           cp README.md LICENSE arc-${VERSION}/
+
+          # PRE-BUILD VIRTUAL ENVIRONMENT (Bundle all dependencies)
+          echo "Building virtual environment with dependencies..."
+          cd arc-${VERSION}
+          python3 -m venv venv
+          source venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          deactivate
+          cd ..
+
+          echo "Virtual environment built successfully"
+
+          # Create source tarball with pre-built venv
           tar -czf ~/rpmbuild/SOURCES/arc-${VERSION}.tar.gz arc-${VERSION}
 
           # Create RPM spec file
@@ -283,37 +323,50 @@ jobs:
           BuildArch:      x86_64
 
           Requires:       python3 >= 3.13
-          Requires:       python3-pip
 
           %description
           Arc is a high-performance time-series database optimized for
           observability data ingestion and querying.
 
+          This package includes all Python dependencies pre-installed in a
+          virtual environment for fast deployment.
+
           %prep
           %setup -q
 
           %build
-          # Nothing to build - pure Python
+          # Nothing to build - pre-built venv included
 
           %install
           rm -rf %{buildroot}
           mkdir -p %{buildroot}/opt/arc
           mkdir -p %{buildroot}/usr/local/bin
 
-          # Install application files
+          # Install application files with pre-built venv
           cp -r * %{buildroot}/opt/arc/
 
-          # Create startup script
+          # Create startup script that uses pre-built venv
           cat > %{buildroot}/usr/local/bin/arc << 'WRAPPER'
           #!/bin/bash
+          set -e
+
+          # Check Python version
+          python3 -c "import sys; assert sys.version_info >= (3, 13)" || {
+            echo "Error: Python 3.13+ required"
+            exit 1
+          }
+
           cd /opt/arc
+
+          # Use pre-built virtual environment
           if [ ! -d "venv" ]; then
-            python3 -m venv venv
-            source venv/bin/activate
-            pip install -r requirements.txt
-          else
-            source venv/bin/activate
+            echo "Error: Virtual environment not found. Package may be corrupted."
+            exit 1
           fi
+
+          source venv/bin/activate
+
+          # Start Arc
           exec python -m uvicorn api.main:app --host 0.0.0.0 --port 8000
           WRAPPER
 
@@ -329,6 +382,7 @@ jobs:
           - Security fixes: SQL injection, path traversal, auth bypass
           - New feature: DESCRIBE command support
           - Upgraded to bcrypt token hashing
+          - Includes pre-built virtual environment with all dependencies
           EOF
 
           # Build RPM
