@@ -188,9 +188,13 @@ jobs:
           echo "Installing dependencies..."
           cd arc-${VERSION}
 
-          # Install Python 3.9 to match Rocky Linux 9 (oldest supported version)
-          # This ensures binary wheels are compatible with Python 3.9+
-          sudo apt-get install -y python3.9 python3.9-dev python3-pip
+          # Add deadsnakes PPA for Python 3.9 (needed for Rocky Linux 9 compatibility)
+          sudo add-apt-repository -y ppa:deadsnakes/ppa
+          sudo apt-get update
+          sudo apt-get install -y python3.9 python3.9-dev python3.9-distutils
+
+          # Install pip for Python 3.9
+          curl -sS https://bootstrap.pypa.io/get-pip.py | sudo python3.9
 
           # Check Python 3.9 version
           python3.9 --version
@@ -339,9 +343,13 @@ jobs:
           echo "Installing dependencies..."
           cd arc-${VERSION}
 
-          # Install Python 3.9 to match Rocky Linux 9 (oldest supported version)
-          # This ensures binary wheels are compatible with Python 3.9+
-          sudo apt-get install -y python3.9 python3.9-dev python3-pip
+          # Add deadsnakes PPA for Python 3.9 (needed for Rocky Linux 9 compatibility)
+          sudo add-apt-repository -y ppa:deadsnakes/ppa
+          sudo apt-get update
+          sudo apt-get install -y python3.9 python3.9-dev python3.9-distutils
+
+          # Install pip for Python 3.9
+          curl -sS https://bootstrap.pypa.io/get-pip.py | sudo python3.9
 
           # Check Python 3.9 version
           python3.9 --version
