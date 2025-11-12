@@ -192,8 +192,10 @@ jobs:
           python3 --version
 
           # Install dependencies to a local directory we'll bundle
+          # Use --only-binary to ensure we get precompiled wheels (not source)
+          # This ensures C extensions like pydantic_core work correctly
           mkdir -p python-packages
-          pip3 install --target=python-packages -r requirements.txt
+          pip3 install --only-binary=:all: --target=python-packages -r requirements.txt
 
           cd ..
 
@@ -331,8 +333,10 @@ jobs:
           python3 --version
 
           # Install dependencies to a local directory we'll bundle
+          # Use --only-binary to ensure we get precompiled wheels (not source)
+          # This ensures C extensions like pydantic_core work correctly
           mkdir -p python-packages
-          pip3 install --target=python-packages -r requirements.txt
+          pip3 install --only-binary=:all: --target=python-packages -r requirements.txt
 
           cd ..
 
@@ -533,6 +537,104 @@ jobs:
             dist/*.sha256
           retention-days: 7
 
+  # Test Debian package on Ubuntu
+  test-debian:
+    name: Test Debian Package (Ubuntu 24.04)
+    runs-on: ubuntu-latest
+    needs: [prepare, debian-build]
+    container:
+      image: ubuntu:24.04
+    steps:
+      - name: Download Debian package
+        uses: actions/download-artifact@v4
+        with:
+          name: arc-debian-${{ needs.prepare.outputs.version }}
+
+      - name: Install package
+        run: |
+          apt-get update
+          apt-get install -y python3 curl
+          dpkg -i arc_${{ needs.prepare.outputs.version }}_amd64.deb || true
+          apt-get install -f -y
+
+      - name: Test installation
+        run: |
+          # Check if binary exists
+          test -f /usr/local/bin/arc
+
+          # Check if files are installed
+          test -d /opt/arc
+          test -d /opt/arc/python-packages
+
+      - name: Test startup
+        run: |
+          # Start Arc in background
+          /usr/local/bin/arc &
+          ARC_PID=$!
+
+          # Wait for startup (max 30 seconds)
+          echo "Waiting for Arc to start..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8000/health > /dev/null 2>&1; then
+              echo "Arc started successfully!"
+              kill $ARC_PID
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "Arc failed to start within 30 seconds"
+          kill $ARC_PID || true
+          exit 1
+
+  # Test RPM package on Rocky Linux
+  test-rpm:
+    name: Test RPM Package (Rocky Linux 9)
+    runs-on: ubuntu-latest
+    needs: [prepare, rpm-build]
+    container:
+      image: rockylinux:9
+    steps:
+      - name: Download RPM package
+        uses: actions/download-artifact@v4
+        with:
+          name: arc-rpm-${{ needs.prepare.outputs.version }}
+
+      - name: Install package
+        run: |
+          dnf install -y python3 curl
+          rpm -ivh arc-${{ needs.prepare.outputs.version }}-1.*.rpm
+
+      - name: Test installation
+        run: |
+          # Check if binary exists
+          test -f /usr/local/bin/arc
+
+          # Check if files are installed
+          test -d /opt/arc
+          test -d /opt/arc/python-packages
+
+      - name: Test startup
+        run: |
+          # Start Arc in background
+          /usr/local/bin/arc &
+          ARC_PID=$!
+
+          # Wait for startup (max 30 seconds)
+          echo "Waiting for Arc to start..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8000/health > /dev/null 2>&1; then
+              echo "Arc started successfully!"
+              kill $ARC_PID
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "Arc failed to start within 30 seconds"
+          kill $ARC_PID || true
+          exit 1
+
   # Run smoke tests on built artifacts
   smoke-test:
     name: Smoke Test
@@ -581,7 +683,7 @@ jobs:
   create-draft-release:
     name: Create Draft Release
     runs-on: ubuntu-latest
-    needs: [prepare, docker-merge, debian-build, rpm-build, tarball-build, smoke-test]
+    needs: [prepare, docker-merge, debian-build, rpm-build, tarball-build, test-debian, test-rpm, smoke-test]
     permissions:
       contents: write
     steps:
