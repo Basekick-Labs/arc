@@ -605,7 +605,7 @@ jobs:
   test-helm:
     name: Test Helm Chart
     runs-on: ubuntu-latest
-    needs: [prepare, helm-package]
+    needs: [prepare, helm-package, docker-merge]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
