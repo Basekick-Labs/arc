@@ -190,8 +190,19 @@ jobs:
           # PRE-BUILD VIRTUAL ENVIRONMENT (Bundle all dependencies)
           echo "Building virtual environment with dependencies..."
           cd arc-${VERSION}
-          python3 -m venv venv
+
+          # Verify Python 3.13 is available (setup-python adds to PATH)
+          which python3
+          python3 --version
+
+          # Create venv with Python 3.13 explicitly
+          # actions/setup-python puts the Python in PATH, use 'python' not 'python3'
+          python -m venv venv
           source venv/bin/activate
+
+          # Verify venv Python version
+          python --version
+
           pip install --upgrade pip
           pip install -r requirements.txt
           deactivate
@@ -341,8 +352,19 @@ jobs:
           # PRE-BUILD VIRTUAL ENVIRONMENT (Bundle all dependencies)
           echo "Building virtual environment with dependencies..."
           cd arc-${VERSION}
-          python3 -m venv venv
+
+          # Verify Python 3.13 is available (setup-python adds to PATH)
+          which python3
+          python3 --version
+
+          # Create venv with Python 3.13 explicitly
+          # actions/setup-python puts the Python in PATH, use 'python' not 'python3'
+          python -m venv venv
           source venv/bin/activate
+
+          # Verify venv Python version
+          python --version
+
           pip install --upgrade pip
           pip install -r requirements.txt
           deactivate
