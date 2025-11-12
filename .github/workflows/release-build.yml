@@ -584,18 +584,25 @@ jobs:
           /usr/local/bin/arc &
           ARC_PID=$!
 
-          # Wait for startup (max 90 seconds - startup can be slow in containers)
+          # Wait for startup (max 120 seconds - startup can be slow in containers)
           echo "Waiting for Arc to start..."
-          for i in {1..90}; do
+          for i in {1..120}; do
             if curl -s http://localhost:8000/health > /dev/null 2>&1; then
-              echo "Arc started successfully in $i seconds!"
+              echo "✅ Arc started successfully in $i seconds!"
+              sleep 2  # Give logs time to flush
               kill $ARC_PID
               exit 0
+            fi
+            # Print progress every 10 seconds
+            if [ $((i % 10)) -eq 0 ]; then
+              echo "Still waiting... ${i}s elapsed"
             fi
             sleep 1
           done
 
-          echo "Arc failed to start within 90 seconds"
+          echo "❌ Arc failed to start within 120 seconds"
+          echo "Waiting 5 seconds for logs to flush..."
+          sleep 5
           kill $ARC_PID || true
           exit 1
 
@@ -639,18 +646,25 @@ jobs:
           /usr/local/bin/arc &
           ARC_PID=$!
 
-          # Wait for startup (max 90 seconds - startup can be slow in containers)
+          # Wait for startup (max 120 seconds - startup can be slow in containers)
           echo "Waiting for Arc to start..."
-          for i in {1..90}; do
+          for i in {1..120}; do
             if curl -s http://localhost:8000/health > /dev/null 2>&1; then
-              echo "Arc started successfully in $i seconds!"
+              echo "✅ Arc started successfully in $i seconds!"
+              sleep 2  # Give logs time to flush
               kill $ARC_PID
               exit 0
+            fi
+            # Print progress every 10 seconds
+            if [ $((i % 10)) -eq 0 ]; then
+              echo "Still waiting... ${i}s elapsed"
             fi
             sleep 1
           done
 
-          echo "Arc failed to start within 90 seconds"
+          echo "❌ Arc failed to start within 120 seconds"
+          echo "Waiting 5 seconds for logs to flush..."
+          sleep 5
           kill $ARC_PID || true
           exit 1
 
