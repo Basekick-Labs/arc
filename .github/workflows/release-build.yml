@@ -207,14 +207,14 @@ jobs:
           Section: database
           Priority: optional
           Architecture: amd64
-          Depends: python3 (>= 3.13)
+          Depends: python3 (>= 3.10)
           Maintainer: Basekick Labs <contact@basekick.com>
           Description: Arc - High-Performance Time-Series Data Warehouse
            Arc is a high-performance time-series database optimized for
            observability data ingestion and querying.
            .
-           This package includes all Python dependencies pre-installed in a
-           virtual environment for fast deployment.
+           This package includes Python 3.13 and all dependencies pre-installed
+           in a virtual environment for fast deployment.
           EOF
 
           # Create installation directories
@@ -322,14 +322,14 @@ jobs:
           Source0:        arc-${VERSION}.tar.gz
           BuildArch:      x86_64
 
-          Requires:       python3 >= 3.13
+          Requires:       python3 >= 3.10
 
           %description
           Arc is a high-performance time-series database optimized for
           observability data ingestion and querying.
 
-          This package includes all Python dependencies pre-installed in a
-          virtual environment for fast deployment.
+          This package includes Python 3.13 and all dependencies pre-installed
+          in a virtual environment for fast deployment.
 
           %prep
           %setup -q
