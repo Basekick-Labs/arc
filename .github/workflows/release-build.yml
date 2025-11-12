@@ -574,6 +574,20 @@ jobs:
           cd dist
           sha256sum arc-${VERSION}.tgz > arc-${VERSION}.tgz.sha256
 
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push Helm chart to OCI registry
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+
+          # Push to GHCR OCI registry
+          helm push dist/arc-${VERSION}.tgz oci://ghcr.io/basekick-labs
+
       - name: Upload Helm chart
         uses: actions/upload-artifact@v4
         with:
@@ -901,6 +915,12 @@ jobs:
           ```
           ### Kubernetes (Helm)
 
+          **OCI Registry (Recommended):**
+          ```
+          helm install arc oci://ghcr.io/basekick-labs/arc --version 25.11.1
+          ```
+
+          **GitHub Release:**
           ```
           helm install arc https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc-25.11.1.tgz
           ```
