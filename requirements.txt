@@ -51,5 +51,8 @@ jsonpath-ng==1.7.0
 # SQL parsing
 sqlparse==0.5.3
 
+# Security
+bcrypt==4.2.1  # Secure password/token hashing
+
 # REMOVED: Database clients for importers/exporters (moved to external tools)
 # influxdb, influxdb-client, psycopg2-binary, kafka-python

@@ -121,42 +121,68 @@ class DuckDBEngine:
                 f"object_cache={enable_cache}"
             )
 
-            # Apply S3/MinIO/Ceph/GCS configuration
+            # Apply S3/MinIO/Ceph/GCS configuration (with SQL injection protection)
             if self.minio_backend:
                 endpoint_host = self.minio_backend.s3_client._endpoint.host.replace('http://', '').replace('https://', '')
-                conn.execute(f"SET s3_endpoint='{endpoint_host}'")
-                conn.execute(f"SET s3_access_key_id='{self.minio_backend.s3_client._request_signer._credentials.access_key}'")
-                conn.execute(f"SET s3_secret_access_key='{self.minio_backend.s3_client._request_signer._credentials.secret_key}'")
+                access_key = self.minio_backend.s3_client._request_signer._credentials.access_key
+                secret_key = self.minio_backend.s3_client._request_signer._credentials.secret_key
+
+                # Sanitize all values to prevent SQL injection
+                endpoint_host_safe = self._sanitize_sql_string(endpoint_host)
+                access_key_safe = self._sanitize_sql_string(access_key)
+                secret_key_safe = self._sanitize_sql_string(secret_key)
+
+                conn.execute(f"SET s3_endpoint='{endpoint_host_safe}'")
+                conn.execute(f"SET s3_access_key_id='{access_key_safe}'")
+                conn.execute(f"SET s3_secret_access_key='{secret_key_safe}'")
                 conn.execute("SET s3_use_ssl=false")
                 conn.execute("SET s3_url_style='path'")
+                logger.debug("MinIO S3 configuration applied to DuckDB")
+
             elif self.ceph_backend:
                 endpoint_host = self.ceph_backend.endpoint_url.replace('http://', '').replace('https://', '')
-                conn.execute(f"SET s3_endpoint='{endpoint_host}'")
-                conn.execute(f"SET s3_access_key_id='{self.ceph_backend._access_key}'")
-                conn.execute(f"SET s3_secret_access_key='{self.ceph_backend._secret_key}'")
+
+                # Sanitize all values to prevent SQL injection
+                endpoint_host_safe = self._sanitize_sql_string(endpoint_host)
+                access_key_safe = self._sanitize_sql_string(self.ceph_backend._access_key)
+                secret_key_safe = self._sanitize_sql_string(self.ceph_backend._secret_key)
+
+                conn.execute(f"SET s3_endpoint='{endpoint_host_safe}'")
+                conn.execute(f"SET s3_access_key_id='{access_key_safe}'")
+                conn.execute(f"SET s3_secret_access_key='{secret_key_safe}'")
                 conn.execute("SET s3_use_ssl=false")
                 conn.execute("SET s3_url_style='path'")
+                logger.debug("Ceph S3 configuration applied to DuckDB")
+
             elif self.s3_backend:
+                # Sanitize all values to prevent SQL injection
+                access_key_safe = self._sanitize_sql_string(self.s3_backend._access_key)
+                secret_key_safe = self._sanitize_sql_string(self.s3_backend._secret_key)
+                region_safe = self._sanitize_sql_string(self.s3_backend.region)
+
                 if self.s3_backend.use_directory_bucket:
                     endpoint = f"s3express-{self.s3_backend.availability_zone}.{self.s3_backend.region}.amazonaws.com"
+                    endpoint_safe = self._sanitize_sql_string(endpoint)
                     conn.execute(f"""
                         CREATE SECRET (
                             TYPE s3,
-                            KEY_ID '{self.s3_backend._access_key}',
-                            SECRET '{self.s3_backend._secret_key}',
-                            REGION '{self.s3_backend.region}',
-                            ENDPOINT '{endpoint}'
+                            KEY_ID '{access_key_safe}',
+                            SECRET '{secret_key_safe}',
+                            REGION '{region_safe}',
+                            ENDPOINT '{endpoint_safe}'
                         )
                     """)
                 else:
                     conn.execute(f"""
                         CREATE SECRET (
                             TYPE s3,
-                            KEY_ID '{self.s3_backend._access_key}',
-                            SECRET '{self.s3_backend._secret_key}',
-                            REGION '{self.s3_backend.region}'
+                            KEY_ID '{access_key_safe}',
+                            SECRET '{secret_key_safe}',
+                            REGION '{region_safe}'
                         )
                     """)
+                logger.debug("AWS S3 configuration applied to DuckDB")
+
             elif self.gcs_backend:
                 if not self.gcs_backend.configure_duckdb(conn):
                     logger.error("Failed to configure DuckDB for GCS access")
@@ -164,6 +190,32 @@ class DuckDBEngine:
         except Exception as e:
             logger.error(f"Connection configuration failed: {e}")
             raise
+
+    def _sanitize_sql_string(self, value: str) -> str:
+        """
+        Sanitize a string value for use in SQL by escaping single quotes.
+        This prevents SQL injection in SET commands where parameterization isn't available.
+
+        Args:
+            value: String value to sanitize
+
+        Returns:
+            Sanitized string safe for SQL interpolation
+
+        Raises:
+            ValueError: If value contains dangerous characters
+        """
+        if not value:
+            raise ValueError("Value cannot be empty")
+
+        # Check for dangerous characters that could break out of quotes
+        dangerous_chars = [';', '\x00', '\n', '\r']
+        for char in dangerous_chars:
+            if char in value:
+                raise ValueError(f"Invalid character in value: {repr(char)}")
+
+        # Escape single quotes by doubling them (SQL standard)
+        return value.replace("'", "''")
 
     def _is_delete_enabled(self) -> bool:
         """Check if delete operations are enabled in configuration"""
@@ -188,49 +240,71 @@ class DuckDBEngine:
             logger.warning(f"S3 configuration failed: {e}")
     
     def _configure_s3_sync(self):
-        """Synchronous S3/MinIO configuration for immediate use"""
+        """Synchronous S3/MinIO configuration for immediate use (with SQL injection protection)"""
         try:
             if self.minio_backend:
                 # Configure MinIO settings directly
                 endpoint_host = self.minio_backend.s3_client._endpoint.host.replace('http://', '').replace('https://', '')
-                self.conn.execute(f"SET s3_endpoint='{endpoint_host}'")
-                self.conn.execute(f"SET s3_access_key_id='{self.minio_backend.s3_client._request_signer._credentials.access_key}'")
-                self.conn.execute(f"SET s3_secret_access_key='{self.minio_backend.s3_client._request_signer._credentials.secret_key}'")
+                access_key = self.minio_backend.s3_client._request_signer._credentials.access_key
+                secret_key = self.minio_backend.s3_client._request_signer._credentials.secret_key
+
+                # Sanitize all values to prevent SQL injection
+                endpoint_host_safe = self._sanitize_sql_string(endpoint_host)
+                access_key_safe = self._sanitize_sql_string(access_key)
+                secret_key_safe = self._sanitize_sql_string(secret_key)
+
+                self.conn.execute(f"SET s3_endpoint='{endpoint_host_safe}'")
+                self.conn.execute(f"SET s3_access_key_id='{access_key_safe}'")
+                self.conn.execute(f"SET s3_secret_access_key='{secret_key_safe}'")
                 self.conn.execute("SET s3_use_ssl=false")
                 self.conn.execute("SET s3_url_style='path'")
                 logger.debug("MinIO S3 configuration applied to DuckDB (sync)")
+
             elif self.ceph_backend:
                 # Configure Ceph settings directly
                 endpoint_host = self.ceph_backend.endpoint_url.replace('http://', '').replace('https://', '')
-                self.conn.execute(f"SET s3_endpoint='{endpoint_host}'")
-                self.conn.execute(f"SET s3_access_key_id='{self.ceph_backend._access_key}'")
-                self.conn.execute(f"SET s3_secret_access_key='{self.ceph_backend._secret_key}'")
+
+                # Sanitize all values to prevent SQL injection
+                endpoint_host_safe = self._sanitize_sql_string(endpoint_host)
+                access_key_safe = self._sanitize_sql_string(self.ceph_backend._access_key)
+                secret_key_safe = self._sanitize_sql_string(self.ceph_backend._secret_key)
+
+                self.conn.execute(f"SET s3_endpoint='{endpoint_host_safe}'")
+                self.conn.execute(f"SET s3_access_key_id='{access_key_safe}'")
+                self.conn.execute(f"SET s3_secret_access_key='{secret_key_safe}'")
                 self.conn.execute("SET s3_use_ssl=false")
                 self.conn.execute("SET s3_url_style='path'")
                 logger.debug("Ceph S3 configuration applied to DuckDB (sync)")
+
             elif self.s3_backend:
+                # Sanitize all values to prevent SQL injection
+                access_key_safe = self._sanitize_sql_string(self.s3_backend._access_key)
+                secret_key_safe = self._sanitize_sql_string(self.s3_backend._secret_key)
+                region_safe = self._sanitize_sql_string(self.s3_backend.region)
+
                 # Configure S3 using DuckDB SECRET system
                 if self.s3_backend.use_directory_bucket:
                     # S3 Express One Zone configuration
                     endpoint = f"s3express-{self.s3_backend.availability_zone}.{self.s3_backend.region}.amazonaws.com"
+                    endpoint_safe = self._sanitize_sql_string(endpoint)
                     self.conn.execute(f"""
                         CREATE SECRET (
                             TYPE s3,
-                            KEY_ID '{self.s3_backend._access_key}',
-                            SECRET '{self.s3_backend._secret_key}',
-                            REGION '{self.s3_backend.region}',
-                            ENDPOINT '{endpoint}'
+                            KEY_ID '{access_key_safe}',
+                            SECRET '{secret_key_safe}',
+                            REGION '{region_safe}',
+                            ENDPOINT '{endpoint_safe}'
                         )
                     """)
-                    logger.debug(f"DuckDB S3 Express SECRET created (endpoint: {endpoint})")
+                    logger.debug("DuckDB S3 Express SECRET created")
                 else:
                     # Standard S3 configuration
                     self.conn.execute(f"""
                         CREATE SECRET (
                             TYPE s3,
-                            KEY_ID '{self.s3_backend._access_key}',
-                            SECRET '{self.s3_backend._secret_key}',
-                            REGION '{self.s3_backend.region}'
+                            KEY_ID '{access_key_safe}',
+                            SECRET '{secret_key_safe}',
+                            REGION '{region_safe}'
                         )
                     """)
                     logger.debug("DuckDB S3 SECRET created")
@@ -279,6 +353,10 @@ class DuckDBEngine:
         if self._is_show_databases_query(sql):
             return await self._execute_show_databases_legacy(sql)
 
+        # Check for DESCRIBE command BEFORE rewriting SQL
+        if self._is_describe_query(sql):
+            return await self._execute_describe_legacy(sql)
+
         # Convert SQL for S3 paths (only for regular queries)
         converted_sql = self._convert_sql_to_s3_paths(sql)
 
@@ -308,6 +386,10 @@ class DuckDBEngine:
         # Check for SHOW DATABASES command BEFORE rewriting SQL
         if self._is_show_databases_query(sql):
             return await self._execute_show_databases_arrow(sql)
+
+        # Check for DESCRIBE command BEFORE rewriting SQL
+        if self._is_describe_query(sql):
+            return await self._execute_describe_arrow(sql)
 
         # Convert SQL for S3 paths (only for regular queries)
         converted_sql = self._convert_sql_to_s3_paths(sql)
@@ -362,7 +444,82 @@ class DuckDBEngine:
                 "row_count": 0,
                 "execution_time_ms": round(execution_time * 1000, 2)
             }
-    
+
+    async def _execute_describe_legacy(self, sql: str) -> Dict[str, Any]:
+        """Legacy handler for DESCRIBE command - optimized for speed"""
+        start_time = time.time()
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, self._handle_describe_sync, sql)
+            execution_time = time.time() - start_time
+            result["execution_time_ms"] = round(execution_time * 1000, 2)
+            return result
+        except Exception as e:
+            execution_time = time.time() - start_time
+            logger.error(f"DESCRIBE failed in {execution_time:.3f}s: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "data": [],
+                "columns": [],
+                "row_count": 0,
+                "execution_time_ms": round(execution_time * 1000, 2)
+            }
+
+    async def _execute_describe_arrow(self, sql: str) -> Dict[str, Any]:
+        """Arrow handler for DESCRIBE command - optimized for speed"""
+        start_time = time.time()
+        try:
+            import pyarrow as pa
+            import io
+
+            # Get schema from Parquet file (fast - no data read)
+            loop = asyncio.get_event_loop()
+            schema_info = await loop.run_in_executor(None, self._get_table_schema, sql)
+
+            if not schema_info:
+                raise Exception("Table not found or no data available")
+
+            # Create Arrow table with schema information
+            column_names = pa.array([col["name"] for col in schema_info], type=pa.string())
+            column_types = pa.array([col["type"] for col in schema_info], type=pa.string())
+            nullables = pa.array([col["nullable"] for col in schema_info], type=pa.string())
+
+            arrow_table = pa.Table.from_arrays(
+                [column_names, column_types, nullables],
+                names=["column_name", "column_type", "null"]
+            )
+
+            # Serialize to Arrow IPC format
+            sink = io.BytesIO()
+            with pa.ipc.new_stream(sink, arrow_table.schema) as writer:
+                writer.write_table(arrow_table)
+
+            arrow_bytes = sink.getvalue()
+            execution_time = time.time() - start_time
+
+            logger.info(f"DESCRIBE (Arrow) completed in {execution_time:.3f}s: {len(schema_info)} columns")
+
+            return {
+                "success": True,
+                "arrow_table": arrow_bytes,
+                "row_count": len(schema_info),
+                "execution_time_ms": round(execution_time * 1000, 2),
+                "wait_time_ms": 0.0
+            }
+
+        except Exception as e:
+            execution_time = time.time() - start_time
+            logger.error(f"DESCRIBE (Arrow) failed in {execution_time:.3f}s: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "arrow_table": b"",
+                "row_count": 0,
+                "execution_time_ms": round(execution_time * 1000, 2),
+                "wait_time_ms": 0.0
+            }
+
     # Iceberg support removed; this stub remains to avoid API import breakages if referenced accidentally
     async def query_iceberg_table(self, *args, **kwargs) -> Dict[str, Any]:
         return {
@@ -545,6 +702,15 @@ class DuckDBEngine:
         import re
         pattern = r'^\s*SHOW\s+DATABASES\s*;?\s*$'
         return bool(re.match(pattern, sql.strip(), re.IGNORECASE))
+
+    def _is_describe_query(self, sql: str) -> bool:
+        """Check if query is a DESCRIBE command"""
+        import re
+        # Remove SQL comments (VSCode extension adds "-- SQL\n")
+        cleaned_sql = re.sub(r'--.*?(\n|$)', '', sql, flags=re.MULTILINE).strip()
+        # Match: DESCRIBE table or DESCRIBE database.table or DESC table
+        pattern = r'^\s*(?:DESCRIBE|DESC)\s+([\w_-]+(?:\.[\w_-]+)?)\s*;?\s*$'
+        return bool(re.match(pattern, cleaned_sql, re.IGNORECASE))
 
     def _handle_show_tables_sync(self, sql: str) -> Dict[str, Any]:
         """Handle SHOW TABLES command
@@ -827,6 +993,148 @@ class DuckDBEngine:
                 "execution_time_ms": round(execution_time * 1000, 2),
                 "wait_time_ms": 0.0
             }
+
+    def _handle_describe_sync(self, sql: str) -> Dict[str, Any]:
+        """Handle DESCRIBE command synchronously - optimized for speed"""
+        try:
+            schema_info = self._get_table_schema(sql)
+
+            if not schema_info:
+                return {
+                    "success": False,
+                    "error": "Table not found or no data available",
+                    "data": [],
+                    "columns": [],
+                    "row_count": 0
+                }
+
+            # Format as rows for JSON response
+            data = [[col["name"], col["type"], col["nullable"]] for col in schema_info]
+
+            return {
+                "success": True,
+                "data": data,
+                "columns": ["column_name", "column_type", "null"],
+                "row_count": len(schema_info)
+            }
+
+        except Exception as e:
+            logger.error(f"DESCRIBE handler error: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "data": [],
+                "columns": [],
+                "row_count": 0
+            }
+
+    def _get_table_schema(self, sql: str) -> List[Dict[str, Any]]:
+        """Get schema from Parquet file - OPTIMIZED for speed (metadata only, no data read)"""
+        import re
+
+        # Remove SQL comments (VSCode extension adds "-- SQL\n")
+        cleaned_sql = re.sub(r'--.*?(\n|$)', '', sql, flags=re.MULTILINE).strip()
+
+        # Parse table name from DESCRIBE statement
+        pattern = r'^\s*(?:DESCRIBE|DESC)\s+([\w_-]+)(?:\.([\w_-]+))?\s*;?\s*$'
+        match = re.match(pattern, cleaned_sql, re.IGNORECASE)
+
+        if not match:
+            raise Exception("Invalid DESCRIBE syntax")
+
+        # Extract database and measurement
+        if match.group(2):
+            database = match.group(1)
+            measurement = match.group(2)
+        else:
+            database = 'default'
+            measurement = match.group(1)
+
+        # Find a Parquet file
+        parquet_file = self._find_parquet_file(database, measurement)
+
+        if not parquet_file:
+            raise Exception(f"No data found for table '{measurement}' in database '{database}'")
+
+        # Read ONLY schema from Parquet (no data read - very fast!)
+        try:
+            import pyarrow.parquet as pq
+            # read_schema() is much faster than read_table() - only reads metadata
+            schema = pq.read_schema(parquet_file)
+
+            # Convert schema to list of dicts
+            schema_info = []
+            for field in schema:
+                schema_info.append({
+                    "name": field.name,
+                    "type": str(field.type),
+                    "nullable": "YES" if field.nullable else "NO"
+                })
+
+            return schema_info
+
+        except Exception as e:
+            logger.error(f"Failed to read Parquet schema from {parquet_file}: {e}")
+            raise Exception(f"Failed to read table schema: {e}")
+
+    def _find_parquet_file(self, database: str, measurement: str) -> Optional[str]:
+        """Find first Parquet file for table - OPTIMIZED to return quickly"""
+        try:
+            if self.storage_backend == "local":
+                import os
+                base_path = self.local_backend.base_path if self.local_backend else "./data"
+                measurement_path = os.path.join(base_path, database, measurement)
+
+                if not os.path.exists(measurement_path):
+                    return None
+
+                # Find first .parquet file (stop at first match for speed)
+                for root, dirs, files in os.walk(measurement_path):
+                    for file in files:
+                        if file.endswith('.parquet'):
+                            return os.path.join(root, file)
+
+            elif self.storage_backend in ["s3", "minio", "ceph"]:
+                backend = self.s3_backend or self.minio_backend or self.ceph_backend
+                if backend:
+                    bucket = backend.bucket
+                    prefix = f"{database}/{measurement}/"
+
+                    import boto3
+                    s3_client = boto3.client('s3',
+                        endpoint_url=getattr(backend, 'endpoint_url', None),
+                        aws_access_key_id=backend._access_key,
+                        aws_secret_access_key=backend._secret_key
+                    )
+
+                    # MaxKeys=1 for speed - we only need one file
+                    response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
+
+                    if 'Contents' in response:
+                        for obj in response['Contents']:
+                            if obj['Key'].endswith('.parquet'):
+                                return f"s3://{bucket}/{obj['Key']}"
+
+            elif self.storage_backend == "gcs":
+                if self.gcs_backend:
+                    bucket = self.gcs_backend.bucket
+                    prefix = f"{database}/{measurement}/"
+
+                    from google.cloud import storage
+                    client = storage.Client()
+                    bucket_obj = client.bucket(bucket)
+                    # max_results=1 for speed
+                    blobs = bucket_obj.list_blobs(prefix=prefix, max_results=1)
+
+                    for blob in blobs:
+                        if blob.name.endswith('.parquet'):
+                            return f"gs://{bucket}/{blob.name}"
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Error finding Parquet file for {database}.{measurement}: {e}")
+            return None
 
     async def _execute_show_tables_arrow(self, sql: str) -> Dict[str, Any]:
         """Native Arrow handler for SHOW TABLES command"""
