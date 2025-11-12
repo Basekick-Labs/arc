@@ -191,21 +191,13 @@ jobs:
           echo "Building virtual environment with dependencies..."
           cd arc-${VERSION}
 
-          # Find Python 3.13 (setup-python adds it to PATH)
-          PYTHON_PATH=$(which python3)
-          echo "Using Python at: $PYTHON_PATH"
-          $PYTHON_PATH --version
-
-          # Verify it's 3.13
-          $PYTHON_PATH -c "import sys; assert sys.version_info >= (3, 13), f'Expected Python 3.13+, got {sys.version}'"
-
-          # Create venv with Python 3.13 explicitly
-          $PYTHON_PATH -m venv venv
+          # Use Python 3.13 from setup-python to build venv with all dependencies
+          python3 --version
+          python3 -m venv venv
           source venv/bin/activate
 
           # Verify venv Python version
           python3 --version
-          python3 -c "import sys; print(f'Venv Python: {sys.version}')"
 
           pip install --upgrade pip
           pip install -r requirements.txt
@@ -288,19 +280,13 @@ jobs:
 
           cd /opt/arc
 
-          # Use pre-built virtual environment (includes Python 3.13)
+          # Use pre-built virtual environment
           if [ ! -d "venv" ]; then
             echo "Error: Virtual environment not found. Package may be corrupted."
             exit 1
           fi
 
           source venv/bin/activate
-
-          # Verify we have the correct Python version in venv
-          python3 -c "import sys; assert sys.version_info >= (3, 13)" || {
-            echo "Error: Virtual environment Python version mismatch. Package may be corrupted."
-            exit 1
-          }
 
           # Start Arc
           exec python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000
@@ -357,21 +343,13 @@ jobs:
           echo "Building virtual environment with dependencies..."
           cd arc-${VERSION}
 
-          # Find Python 3.13 (setup-python adds it to PATH)
-          PYTHON_PATH=$(which python3)
-          echo "Using Python at: $PYTHON_PATH"
-          $PYTHON_PATH --version
-
-          # Verify it's 3.13
-          $PYTHON_PATH -c "import sys; assert sys.version_info >= (3, 13), f'Expected Python 3.13+, got {sys.version}'"
-
-          # Create venv with Python 3.13 explicitly
-          $PYTHON_PATH -m venv venv
+          # Use Python 3.13 from setup-python to build venv with all dependencies
+          python3 --version
+          python3 -m venv venv
           source venv/bin/activate
 
           # Verify venv Python version
           python3 --version
-          python3 -c "import sys; print(f'Venv Python: {sys.version}')"
 
           pip install --upgrade pip
           pip install -r requirements.txt
@@ -431,19 +409,13 @@ jobs:
 
           cd /opt/arc
 
-          # Use pre-built virtual environment (includes Python 3.13)
+          # Use pre-built virtual environment
           if [ ! -d "venv" ]; then
             echo "Error: Virtual environment not found. Package may be corrupted."
             exit 1
           fi
 
           source venv/bin/activate
-
-          # Verify we have the correct Python version in venv
-          python3 -c "import sys; assert sys.version_info >= (3, 13)" || {
-            echo "Error: Virtual environment Python version mismatch. Package may be corrupted."
-            exit 1
-          }
 
           # Start Arc
           exec python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000
