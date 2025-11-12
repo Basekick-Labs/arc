@@ -169,10 +169,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential devscripts debhelper dh-python python3-all python3-setuptools
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
+      # Don't set up Python - use system Python to create venv with --system-site-packages
 
       - name: Build Debian package
         run: |
@@ -187,27 +184,20 @@ jobs:
           cp README.md LICENSE arc-${VERSION}/
           cp packaging/arc.service arc-${VERSION}/
 
-          # PRE-BUILD VIRTUAL ENVIRONMENT (Bundle all dependencies)
-          echo "Building virtual environment with dependencies..."
+          # Install dependencies directly (no venv - simpler approach)
+          echo "Installing dependencies..."
           cd arc-${VERSION}
 
-          # Use Python 3.13 from setup-python to build venv with all dependencies
+          # Check system Python version
           python3 --version
 
-          # Create venv with --copies to copy Python binary instead of symlinking
-          # This makes the venv relocatable and not dependent on GitHub Actions paths
-          python3 -m venv --copies venv
-          source venv/bin/activate
+          # Install dependencies to a local directory we'll bundle
+          mkdir -p python-packages
+          pip3 install --target=python-packages -r requirements.txt
 
-          # Verify venv Python version
-          python3 --version
-
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          deactivate
           cd ..
 
-          echo "Virtual environment built successfully"
+          echo "Dependencies installed successfully"
 
           # Create debian control structure
           mkdir -p arc-${VERSION}/DEBIAN
@@ -260,8 +250,7 @@ jobs:
            Arc is a high-performance time-series database optimized for
            observability data ingestion and querying.
            .
-           This package includes Python 3.13 and all dependencies pre-installed
-           in a virtual environment for fast deployment.
+           This package includes all Python dependencies bundled for offline installation.
           EOF
 
           # Create installation directories
@@ -269,29 +258,24 @@ jobs:
           mkdir -p arc-${VERSION}/opt/arc
           mkdir -p arc-${VERSION}/etc/systemd/system
 
-          # Move app files to /opt/arc (including pre-built venv)
-          mv arc-${VERSION}/{api,ingest,storage,utils,telemetry,*.py,*.conf,requirements.txt,venv} arc-${VERSION}/opt/arc/
+          # Move app files to /opt/arc (including bundled Python packages)
+          mv arc-${VERSION}/{api,ingest,storage,utils,telemetry,*.py,*.conf,requirements.txt,python-packages} arc-${VERSION}/opt/arc/
           mv arc-${VERSION}/{README.md,LICENSE} arc-${VERSION}/opt/arc/
 
           # Install systemd service file
           mv arc-${VERSION}/arc.service arc-${VERSION}/etc/systemd/system/
 
-          # Create startup wrapper that uses pre-built venv
+          # Create startup wrapper that uses system Python with bundled packages
           cat > arc-${VERSION}/usr/local/bin/arc << 'WRAPPER'
           #!/bin/bash
           set -e
 
           cd /opt/arc
 
-          # Use pre-built virtual environment
-          if [ ! -d "venv" ]; then
-            echo "Error: Virtual environment not found. Package may be corrupted."
-            exit 1
-          fi
+          # Add bundled Python packages to PYTHONPATH
+          export PYTHONPATH="/opt/arc/python-packages:$PYTHONPATH"
 
-          source venv/bin/activate
-
-          # Start Arc
+          # Start Arc using system Python
           exec python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000
           WRAPPER
 
@@ -323,10 +307,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y rpm
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
+      # Don't set up Python - use system Python to create venv with --system-site-packages
 
       - name: Build RPM package
         run: |
@@ -342,27 +323,20 @@ jobs:
           cp README.md LICENSE arc-${VERSION}/
           cp packaging/arc.service arc-${VERSION}/
 
-          # PRE-BUILD VIRTUAL ENVIRONMENT (Bundle all dependencies)
-          echo "Building virtual environment with dependencies..."
+          # Install dependencies directly (no venv - simpler approach)
+          echo "Installing dependencies..."
           cd arc-${VERSION}
 
-          # Use Python 3.13 from setup-python to build venv with all dependencies
+          # Check system Python version
           python3 --version
 
-          # Create venv with --copies to copy Python binary instead of symlinking
-          # This makes the venv relocatable and not dependent on GitHub Actions paths
-          python3 -m venv --copies venv
-          source venv/bin/activate
+          # Install dependencies to a local directory we'll bundle
+          mkdir -p python-packages
+          pip3 install --target=python-packages -r requirements.txt
 
-          # Verify venv Python version
-          python3 --version
-
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          deactivate
           cd ..
 
-          echo "Virtual environment built successfully"
+          echo "Dependencies installed successfully"
 
           # Create source tarball with pre-built venv
           tar -czf ~/rpmbuild/SOURCES/arc-${VERSION}.tar.gz arc-${VERSION}
@@ -387,14 +361,13 @@ jobs:
           Arc is a high-performance time-series database optimized for
           observability data ingestion and querying.
 
-          This package includes Python 3.13 and all dependencies pre-installed
-          in a virtual environment for fast deployment.
+          This package includes all Python dependencies bundled for offline installation.
 
           %prep
           %setup -q
 
           %build
-          # Nothing to build - pre-built venv included
+          # Nothing to build - dependencies pre-installed
 
           %install
           rm -rf %{buildroot}
@@ -402,28 +375,23 @@ jobs:
           mkdir -p %{buildroot}/usr/local/bin
           mkdir -p %{buildroot}/etc/systemd/system
 
-          # Install application files with pre-built venv
-          cp -r api ingest storage utils telemetry *.py *.conf requirements.txt venv README.md LICENSE %{buildroot}/opt/arc/
+          # Install application files with bundled Python packages
+          cp -r api ingest storage utils telemetry *.py *.conf requirements.txt python-packages README.md LICENSE %{buildroot}/opt/arc/
 
           # Install systemd service
           cp arc.service %{buildroot}/etc/systemd/system/
 
-          # Create startup script that uses pre-built venv
+          # Create startup script that uses system Python with bundled packages
           cat > %{buildroot}/usr/local/bin/arc << 'WRAPPER'
           #!/bin/bash
           set -e
 
           cd /opt/arc
 
-          # Use pre-built virtual environment
-          if [ ! -d "venv" ]; then
-            echo "Error: Virtual environment not found. Package may be corrupted."
-            exit 1
-          fi
+          # Add bundled Python packages to PYTHONPATH
+          export PYTHONPATH="/opt/arc/python-packages:$PYTHONPATH"
 
-          source venv/bin/activate
-
-          # Start Arc
+          # Start Arc using system Python
           exec python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000
           WRAPPER
 
@@ -488,10 +456,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
+      # Don't set up Python - use system Python to create venv with --system-site-packages
 
       - name: Install dependencies
         run: |
