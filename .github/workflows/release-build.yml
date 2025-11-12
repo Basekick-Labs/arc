@@ -580,29 +580,50 @@ jobs:
           export DB_PATH=/tmp/arc-data/arc.db
           export STORAGE_BACKEND=local
 
-          # Start Arc in background
-          /usr/local/bin/arc &
+          # Start Arc in background and capture output
+          echo "Starting Arc..."
+          /usr/local/bin/arc > /tmp/arc.log 2>&1 &
           ARC_PID=$!
+          echo "Arc PID: $ARC_PID"
 
-          # Wait for startup (max 120 seconds - startup can be slow in containers)
-          echo "Waiting for Arc to start..."
-          for i in {1..120}; do
+          # Wait a moment for Arc to start
+          sleep 5
+
+          # Check if process is still running
+          if ! kill -0 $ARC_PID 2>/dev/null; then
+            echo "❌ Arc process died immediately!"
+            cat /tmp/arc.log
+            exit 1
+          fi
+
+          # Wait for health endpoint (max 60 seconds)
+          echo "Waiting for /health endpoint..."
+          for i in {1..60}; do
             if curl -s http://localhost:8000/health > /dev/null 2>&1; then
               echo "✅ Arc started successfully in $i seconds!"
-              sleep 2  # Give logs time to flush
               kill $ARC_PID
               exit 0
             fi
-            # Print progress every 10 seconds
-            if [ $((i % 10)) -eq 0 ]; then
-              echo "Still waiting... ${i}s elapsed"
+
+            # Check if process is still alive
+            if ! kill -0 $ARC_PID 2>/dev/null; then
+              echo "❌ Arc process died during startup!"
+              echo "=== Arc logs ==="
+              cat /tmp/arc.log
+              exit 1
             fi
+
+            if [ $i -eq 30 ]; then
+              echo "30 seconds elapsed, checking logs..."
+              tail -20 /tmp/arc.log
+            fi
+
             sleep 1
           done
 
-          echo "❌ Arc failed to start within 120 seconds"
-          echo "Waiting 5 seconds for logs to flush..."
-          sleep 5
+          echo "❌ Arc failed to respond to /health within 60 seconds"
+          echo "=== Final Arc logs ==="
+          tail -50 /tmp/arc.log
           kill $ARC_PID || true
           exit 1
 
@@ -642,29 +663,50 @@ jobs:
           export DB_PATH=/tmp/arc-data/arc.db
           export STORAGE_BACKEND=local
 
-          # Start Arc in background
-          /usr/local/bin/arc &
+          # Start Arc in background and capture output
+          echo "Starting Arc..."
+          /usr/local/bin/arc > /tmp/arc.log 2>&1 &
           ARC_PID=$!
+          echo "Arc PID: $ARC_PID"
 
-          # Wait for startup (max 120 seconds - startup can be slow in containers)
-          echo "Waiting for Arc to start..."
-          for i in {1..120}; do
+          # Wait a moment for Arc to start
+          sleep 5
+
+          # Check if process is still running
+          if ! kill -0 $ARC_PID 2>/dev/null; then
+            echo "❌ Arc process died immediately!"
+            cat /tmp/arc.log
+            exit 1
+          fi
+
+          # Wait for health endpoint (max 60 seconds)
+          echo "Waiting for /health endpoint..."
+          for i in {1..60}; do
             if curl -s http://localhost:8000/health > /dev/null 2>&1; then
               echo "✅ Arc started successfully in $i seconds!"
-              sleep 2  # Give logs time to flush
               kill $ARC_PID
               exit 0
             fi
-            # Print progress every 10 seconds
-            if [ $((i % 10)) -eq 0 ]; then
-              echo "Still waiting... ${i}s elapsed"
+
+            # Check if process is still alive
+            if ! kill -0 $ARC_PID 2>/dev/null; then
+              echo "❌ Arc process died during startup!"
+              echo "=== Arc logs ==="
+              cat /tmp/arc.log
+              exit 1
             fi
+
+            if [ $i -eq 30 ]; then
+              echo "30 seconds elapsed, checking logs..."
+              tail -20 /tmp/arc.log
+            fi
+
             sleep 1
           done
 
-          echo "❌ Arc failed to start within 120 seconds"
-          echo "Waiting 5 seconds for logs to flush..."
-          sleep 5
+          echo "❌ Arc failed to respond to /health within 60 seconds"
+          echo "=== Final Arc logs ==="
+          tail -50 /tmp/arc.log
           kill $ARC_PID || true
           exit 1
 
