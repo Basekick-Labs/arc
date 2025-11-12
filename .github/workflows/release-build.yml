@@ -271,21 +271,21 @@ jobs:
           #!/bin/bash
           set -e
 
-          # Check Python version
-          python3 -c "import sys; assert sys.version_info >= (3, 13)" || {
-            echo "Error: Python 3.13+ required"
-            exit 1
-          }
-
           cd /opt/arc
 
-          # Use pre-built virtual environment
+          # Use pre-built virtual environment (includes Python 3.13)
           if [ ! -d "venv" ]; then
             echo "Error: Virtual environment not found. Package may be corrupted."
             exit 1
           fi
 
           source venv/bin/activate
+
+          # Verify we have the correct Python version in venv
+          python -c "import sys; assert sys.version_info >= (3, 13)" || {
+            echo "Error: Virtual environment Python version mismatch. Package may be corrupted."
+            exit 1
+          }
 
           # Start Arc
           exec python -m uvicorn api.main:app --host 0.0.0.0 --port 8000
@@ -396,21 +396,21 @@ jobs:
           #!/bin/bash
           set -e
 
-          # Check Python version
-          python3 -c "import sys; assert sys.version_info >= (3, 13)" || {
-            echo "Error: Python 3.13+ required"
-            exit 1
-          }
-
           cd /opt/arc
 
-          # Use pre-built virtual environment
+          # Use pre-built virtual environment (includes Python 3.13)
           if [ ! -d "venv" ]; then
             echo "Error: Virtual environment not found. Package may be corrupted."
             exit 1
           fi
 
           source venv/bin/activate
+
+          # Verify we have the correct Python version in venv
+          python -c "import sys; assert sys.version_info >= (3, 13)" || {
+            echo "Error: Virtual environment Python version mismatch. Package may be corrupted."
+            exit 1
+          }
 
           # Start Arc
           exec python -m uvicorn api.main:app --host 0.0.0.0 --port 8000
