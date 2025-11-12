@@ -923,9 +923,34 @@ jobs:
           ```
           ### Kubernetes (Helm)
 
-          ```
+          **Install directly from GitHub release:**
+          ```bash
           helm install arc https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc-25.11.1.tgz
           ```
+
+          **Or download and install:**
+          ```bash
+          # Download the Helm chart
+          wget https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc-25.11.1.tgz
+
+          # Install with default settings
+          helm install arc arc-25.11.1.tgz
+
+          # Or customize your installation
+          helm install arc arc-25.11.1.tgz \
+            --set persistence.size=20Gi \
+            --set resources.limits.memory=4Gi
+          ```
+
+          **Configuration options:**
+          - `image.repository` - Docker image repository (default: ghcr.io/basekick-labs/arc)
+          - `image.tag` - Image tag (default: chart appVersion)
+          - `persistence.enabled` - Enable persistent storage (default: true)
+          - `persistence.size` - PVC size (default: 10Gi)
+          - `arc.storageBackend` - Storage backend: local, s3, minio (default: local)
+          - `arc.dbPath` - Database path (default: /data/arc.db)
+
+          See `values.yaml` in the chart for all configuration options.
 
           ## Features
           ### High-Performance Ingestion
