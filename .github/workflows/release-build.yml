@@ -188,14 +188,18 @@ jobs:
           echo "Installing dependencies..."
           cd arc-${VERSION}
 
-          # Check system Python version
-          python3 --version
+          # Install Python 3.9 to match Rocky Linux 9 (oldest supported version)
+          # This ensures binary wheels are compatible with Python 3.9+
+          sudo apt-get install -y python3.9 python3.9-dev python3-pip
 
-          # Install dependencies to a local directory we'll bundle
+          # Check Python 3.9 version
+          python3.9 --version
+
+          # Install dependencies using Python 3.9 to ensure wheel compatibility
           # Use --only-binary to ensure we get precompiled wheels (not source)
           # This ensures C extensions like pydantic_core work correctly
           mkdir -p python-packages
-          pip3 install --only-binary=:all: --target=python-packages -r requirements.txt
+          python3.9 -m pip install --only-binary=:all: --target=python-packages -r requirements.txt
 
           cd ..
 
@@ -335,14 +339,18 @@ jobs:
           echo "Installing dependencies..."
           cd arc-${VERSION}
 
-          # Check system Python version
-          python3 --version
+          # Install Python 3.9 to match Rocky Linux 9 (oldest supported version)
+          # This ensures binary wheels are compatible with Python 3.9+
+          sudo apt-get install -y python3.9 python3.9-dev python3-pip
 
-          # Install dependencies to a local directory we'll bundle
+          # Check Python 3.9 version
+          python3.9 --version
+
+          # Install dependencies using Python 3.9 to ensure wheel compatibility
           # Use --only-binary to ensure we get precompiled wheels (not source)
           # This ensures C extensions like pydantic_core work correctly
           mkdir -p python-packages
-          pip3 install --only-binary=:all: --target=python-packages -r requirements.txt
+          python3.9 -m pip install --only-binary=:all: --target=python-packages -r requirements.txt
 
           cd ..
 
@@ -587,9 +595,9 @@ jobs:
           /usr/local/bin/arc &
           ARC_PID=$!
 
-          # Wait for startup (max 30 seconds)
+          # Wait for startup (max 60 seconds - startup can be slow in containers)
           echo "Waiting for Arc to start..."
-          for i in {1..30}; do
+          for i in {1..60}; do
             if curl -s http://localhost:8000/health > /dev/null 2>&1; then
               echo "Arc started successfully!"
               kill $ARC_PID
@@ -598,7 +606,7 @@ jobs:
             sleep 1
           done
 
-          echo "Arc failed to start within 30 seconds"
+          echo "Arc failed to start within 60 seconds"
           kill $ARC_PID || true
           exit 1
 
@@ -641,9 +649,9 @@ jobs:
           /usr/local/bin/arc &
           ARC_PID=$!
 
-          # Wait for startup (max 30 seconds)
+          # Wait for startup (max 60 seconds - startup can be slow in containers)
           echo "Waiting for Arc to start..."
-          for i in {1..30}; do
+          for i in {1..60}; do
             if curl -s http://localhost:8000/health > /dev/null 2>&1; then
               echo "Arc started successfully!"
               kill $ARC_PID
@@ -652,7 +660,7 @@ jobs:
             sleep 1
           done
 
-          echo "Arc failed to start within 30 seconds"
+          echo "Arc failed to start within 60 seconds"
           kill $ARC_PID || true
           exit 1
 
