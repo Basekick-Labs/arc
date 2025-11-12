@@ -172,15 +172,63 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.13'
 
       - name: Build Debian package
         run: |
-          # Create debian directory structure
-          mkdir -p debian
+          VERSION=${{ needs.prepare.outputs.version }}
 
-          # Build package (script to be created next)
-          bash packaging/build-deb.sh ${{ needs.prepare.outputs.version }}
+          # Create package directory
+          mkdir -p arc-${VERSION}
+
+          # Copy application files
+          cp -r api/ ingest/ storage/ utils/ telemetry/ arc-${VERSION}/
+          cp config.py config_loader.py arc.conf requirements.txt arc-${VERSION}/
+          cp README.md LICENSE arc-${VERSION}/
+
+          # Create debian control structure
+          mkdir -p arc-${VERSION}/DEBIAN
+
+          cat > arc-${VERSION}/DEBIAN/control << EOF
+          Package: arc
+          Version: ${VERSION}
+          Section: database
+          Priority: optional
+          Architecture: amd64
+          Depends: python3 (>= 3.13), python3-pip, python3-venv
+          Maintainer: Basekick Labs <contact@basekick.com>
+          Description: Arc - High-Performance Time-Series Data Warehouse
+           Arc is a high-performance time-series database optimized for
+           observability data ingestion and querying.
+          EOF
+
+          # Create installation directories
+          mkdir -p arc-${VERSION}/usr/local/bin
+          mkdir -p arc-${VERSION}/opt/arc
+
+          # Move app files to /opt/arc
+          mv arc-${VERSION}/{api,ingest,storage,utils,telemetry,*.py,*.conf,requirements.txt} arc-${VERSION}/opt/arc/
+          mv arc-${VERSION}/{README.md,LICENSE} arc-${VERSION}/opt/arc/
+
+          # Create startup wrapper
+          cat > arc-${VERSION}/usr/local/bin/arc << 'WRAPPER'
+          #!/bin/bash
+          cd /opt/arc
+          if [ ! -d "venv" ]; then
+            python3 -m venv venv
+            source venv/bin/activate
+            pip install -r requirements.txt
+          else
+            source venv/bin/activate
+          fi
+          exec python -m uvicorn api.main:app --host 0.0.0.0 --port 8000
+          WRAPPER
+
+          chmod +x arc-${VERSION}/usr/local/bin/arc
+
+          # Build .deb package
+          dpkg-deb --build arc-${VERSION}
+          mv arc-${VERSION}.deb arc_${VERSION}_amd64.deb
 
       - name: Upload Debian package
         uses: actions/upload-artifact@v4
@@ -188,8 +236,113 @@ jobs:
           name: arc-debian-${{ needs.prepare.outputs.version }}
           path: |
             *.deb
-            *.dsc
-            *.tar.xz
+          retention-days: 7
+
+  # Build RPM packages for RedHat/Fedora/CentOS
+  rpm-build:
+    name: Build RPM Package
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install RPM build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Build RPM package
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+
+          # Create RPM build structure
+          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+
+          # Create source tarball
+          mkdir -p arc-${VERSION}
+          cp -r api/ ingest/ storage/ utils/ telemetry/ arc-${VERSION}/
+          cp config.py config_loader.py arc.conf requirements.txt arc-${VERSION}/
+          cp README.md LICENSE arc-${VERSION}/
+          tar -czf ~/rpmbuild/SOURCES/arc-${VERSION}.tar.gz arc-${VERSION}
+
+          # Create RPM spec file
+          cat > ~/rpmbuild/SPECS/arc.spec << EOF
+          Name:           arc
+          Version:        ${VERSION}
+          Release:        1%{?dist}
+          Summary:        High-Performance Time-Series Data Warehouse
+          License:        AGPLv3
+          URL:            https://github.com/Basekick-Labs/arc
+          Source0:        arc-${VERSION}.tar.gz
+          BuildArch:      x86_64
+
+          Requires:       python3 >= 3.13
+          Requires:       python3-pip
+
+          %description
+          Arc is a high-performance time-series database optimized for
+          observability data ingestion and querying.
+
+          %prep
+          %setup -q
+
+          %build
+          # Nothing to build - pure Python
+
+          %install
+          rm -rf %{buildroot}
+          mkdir -p %{buildroot}/opt/arc
+          mkdir -p %{buildroot}/usr/local/bin
+
+          # Install application files
+          cp -r * %{buildroot}/opt/arc/
+
+          # Create startup script
+          cat > %{buildroot}/usr/local/bin/arc << 'WRAPPER'
+          #!/bin/bash
+          cd /opt/arc
+          if [ ! -d "venv" ]; then
+            python3 -m venv venv
+            source venv/bin/activate
+            pip install -r requirements.txt
+          else
+            source venv/bin/activate
+          fi
+          exec python -m uvicorn api.main:app --host 0.0.0.0 --port 8000
+          WRAPPER
+
+          chmod +x %{buildroot}/usr/local/bin/arc
+
+          %files
+          /opt/arc/*
+          /usr/local/bin/arc
+
+          %changelog
+          * $(date "+%a %b %d %Y") Basekick Labs <contact@basekick.com> - ${VERSION}-1
+          - Release ${VERSION}
+          - Security fixes: SQL injection, path traversal, auth bypass
+          - New feature: DESCRIBE command support
+          - Upgraded to bcrypt token hashing
+          EOF
+
+          # Build RPM
+          rpmbuild -ba ~/rpmbuild/SPECS/arc.spec
+
+          # Copy RPM to current directory
+          cp ~/rpmbuild/RPMS/x86_64/arc-${VERSION}-1.*.rpm .
+
+      - name: Upload RPM package
+        uses: actions/upload-artifact@v4
+        with:
+          name: arc-rpm-${{ needs.prepare.outputs.version }}
+          path: |
+            *.rpm
           retention-days: 7
 
   # Build universal tarball
@@ -204,7 +357,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.13'
 
       - name: Install dependencies
         run: |
@@ -245,8 +398,8 @@ jobs:
           set -e
 
           # Check Python version
-          python3 -c "import sys; assert sys.version_info >= (3, 11)" || {
-            echo "Error: Python 3.11+ required"
+          python3 -c "import sys; assert sys.version_info >= (3, 13)" || {
+            echo "Error: Python 3.13+ required"
             exit 1
           }
 
@@ -285,7 +438,7 @@ jobs:
   smoke-test:
     name: Smoke Test
     runs-on: ubuntu-latest
-    needs: [docker-build, tarball-build]
+    needs: [tarball-build]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -329,7 +482,7 @@ jobs:
   create-draft-release:
     name: Create Draft Release
     runs-on: ubuntu-latest
-    needs: [prepare, docker-merge, debian-build, tarball-build, smoke-test]
+    needs: [prepare, docker-merge, tarball-build, smoke-test]
     permissions:
       contents: write
     steps:
