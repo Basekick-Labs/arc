@@ -252,7 +252,7 @@ jobs:
           Section: database
           Priority: optional
           Architecture: amd64
-          Depends: python3 (>= 3.10)
+          Depends: python3 (>= 3.9)
           Maintainer: Basekick Labs <contact@basekick.com>
           Description: Arc - High-Performance Time-Series Data Warehouse
            Arc is a high-performance time-series database optimized for
@@ -362,7 +362,7 @@ jobs:
           Source0:        arc-${VERSION}.tar.gz
           BuildArch:      x86_64
 
-          Requires:       python3 >= 3.10
+          Requires:       python3 >= 3.9
 
           # Disable automatic dependency detection since we bundle everything in venv
           AutoReqProv:    no
@@ -578,6 +578,11 @@ jobs:
 
       - name: Test startup
         run: |
+          # Create data directory and set environment variables
+          mkdir -p /tmp/arc-data
+          export DB_PATH=/tmp/arc-data/arc.db
+          export STORAGE_BACKEND=local
+
           # Start Arc in background
           /usr/local/bin/arc &
           ARC_PID=$!
@@ -627,6 +632,11 @@ jobs:
 
       - name: Test startup
         run: |
+          # Create data directory and set environment variables
+          mkdir -p /tmp/arc-data
+          export DB_PATH=/tmp/arc-data/arc.db
+          export STORAGE_BACKEND=local
+
           # Start Arc in background
           /usr/local/bin/arc &
           ARC_PID=$!
