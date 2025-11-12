@@ -217,13 +217,17 @@ jobs:
           # Set ownership
           chown -R arc:arc /opt/arc
 
-          # Reload systemd and enable service
-          systemctl daemon-reload
-          systemctl enable arc.service || true
-
-          echo "Arc installed successfully!"
-          echo "Start with: sudo systemctl start arc"
-          echo "View logs with: sudo journalctl -u arc -f"
+          # Reload systemd and enable service (only if systemctl is available)
+          if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload
+            systemctl enable arc.service || true
+            echo "Arc installed successfully!"
+            echo "Start with: sudo systemctl start arc"
+            echo "View logs with: sudo journalctl -u arc -f"
+          else
+            echo "Arc installed successfully!"
+            echo "Note: systemd not available. Start manually with: /usr/local/bin/arc"
+          fi
           POSTINST
 
           chmod +x arc-${VERSION}/DEBIAN/postinst
@@ -233,9 +237,11 @@ jobs:
           #!/bin/bash
           set -e
 
-          # Stop service if running
-          systemctl stop arc.service || true
-          systemctl disable arc.service || true
+          # Stop service if running (only if systemctl is available)
+          if command -v systemctl >/dev/null 2>&1; then
+            systemctl stop arc.service || true
+            systemctl disable arc.service || true
+          fi
           PRERM
 
           chmod +x arc-${VERSION}/DEBIAN/prerm
@@ -415,13 +421,17 @@ jobs:
           # Set ownership
           chown -R arc:arc /opt/arc
 
-          # Reload systemd and enable service
-          systemctl daemon-reload
-          systemctl enable arc.service || true
-
-          echo "Arc installed successfully!"
-          echo "Start with: sudo systemctl start arc"
-          echo "View logs with: sudo journalctl -u arc -f"
+          # Reload systemd and enable service (only if systemctl is available)
+          if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload
+            systemctl enable arc.service || true
+            echo "Arc installed successfully!"
+            echo "Start with: sudo systemctl start arc"
+            echo "View logs with: sudo journalctl -u arc -f"
+          else
+            echo "Arc installed successfully!"
+            echo "Note: systemd not available. Start manually with: /usr/local/bin/arc"
+          fi
 
           %preun
           # Stop service before uninstall
@@ -602,7 +612,8 @@ jobs:
 
       - name: Install package
         run: |
-          dnf install -y python3 curl
+          # Install curl (allow erasing conflicting packages) and python3
+          dnf install -y --allowerasing curl python3
           rpm -ivh arc-${{ needs.prepare.outputs.version }}-1.*.rpm
 
       - name: Test installation
