@@ -185,6 +185,7 @@ jobs:
           cp -r api/ ingest/ storage/ utils/ telemetry/ arc-${VERSION}/
           cp config.py config_loader.py arc.conf requirements.txt arc-${VERSION}/
           cp README.md LICENSE arc-${VERSION}/
+          cp packaging/arc.service arc-${VERSION}/
 
           # PRE-BUILD VIRTUAL ENVIRONMENT (Bundle all dependencies)
           echo "Building virtual environment with dependencies..."
@@ -200,6 +201,42 @@ jobs:
 
           # Create debian control structure
           mkdir -p arc-${VERSION}/DEBIAN
+
+          # Create postinst script (runs after package installation)
+          cat > arc-${VERSION}/DEBIAN/postinst << 'POSTINST'
+          #!/bin/bash
+          set -e
+
+          # Create arc user if it doesn't exist
+          if ! id -u arc > /dev/null 2>&1; then
+            useradd --system --home-dir /opt/arc --no-create-home --shell /bin/false arc
+          fi
+
+          # Set ownership
+          chown -R arc:arc /opt/arc
+
+          # Reload systemd and enable service
+          systemctl daemon-reload
+          systemctl enable arc.service || true
+
+          echo "Arc installed successfully!"
+          echo "Start with: sudo systemctl start arc"
+          echo "View logs with: sudo journalctl -u arc -f"
+          POSTINST
+
+          chmod +x arc-${VERSION}/DEBIAN/postinst
+
+          # Create prerm script (runs before package removal)
+          cat > arc-${VERSION}/DEBIAN/prerm << 'PRERM'
+          #!/bin/bash
+          set -e
+
+          # Stop service if running
+          systemctl stop arc.service || true
+          systemctl disable arc.service || true
+          PRERM
+
+          chmod +x arc-${VERSION}/DEBIAN/prerm
 
           cat > arc-${VERSION}/DEBIAN/control << EOF
           Package: arc
@@ -220,10 +257,14 @@ jobs:
           # Create installation directories
           mkdir -p arc-${VERSION}/usr/local/bin
           mkdir -p arc-${VERSION}/opt/arc
+          mkdir -p arc-${VERSION}/etc/systemd/system
 
           # Move app files to /opt/arc (including pre-built venv)
           mv arc-${VERSION}/{api,ingest,storage,utils,telemetry,*.py,*.conf,requirements.txt,venv} arc-${VERSION}/opt/arc/
           mv arc-${VERSION}/{README.md,LICENSE} arc-${VERSION}/opt/arc/
+
+          # Install systemd service file
+          mv arc-${VERSION}/arc.service arc-${VERSION}/etc/systemd/system/
 
           # Create startup wrapper that uses pre-built venv
           cat > arc-${VERSION}/usr/local/bin/arc << 'WRAPPER'
@@ -295,6 +336,7 @@ jobs:
           cp -r api/ ingest/ storage/ utils/ telemetry/ arc-${VERSION}/
           cp config.py config_loader.py arc.conf requirements.txt arc-${VERSION}/
           cp README.md LICENSE arc-${VERSION}/
+          cp packaging/arc.service arc-${VERSION}/
 
           # PRE-BUILD VIRTUAL ENVIRONMENT (Bundle all dependencies)
           echo "Building virtual environment with dependencies..."
@@ -341,9 +383,13 @@ jobs:
           rm -rf %{buildroot}
           mkdir -p %{buildroot}/opt/arc
           mkdir -p %{buildroot}/usr/local/bin
+          mkdir -p %{buildroot}/etc/systemd/system
 
           # Install application files with pre-built venv
-          cp -r * %{buildroot}/opt/arc/
+          cp -r api ingest storage utils telemetry *.py *.conf requirements.txt venv README.md LICENSE %{buildroot}/opt/arc/
+
+          # Install systemd service
+          cp arc.service %{buildroot}/etc/systemd/system/
 
           # Create startup script that uses pre-built venv
           cat > %{buildroot}/usr/local/bin/arc << 'WRAPPER'
@@ -375,6 +421,29 @@ jobs:
           %files
           /opt/arc/*
           /usr/local/bin/arc
+          /etc/systemd/system/arc.service
+
+          %post
+          # Create arc user if it doesn't exist
+          if ! id -u arc > /dev/null 2>&1; then
+            useradd --system --home-dir /opt/arc --no-create-home --shell /sbin/nologin arc
+          fi
+
+          # Set ownership
+          chown -R arc:arc /opt/arc
+
+          # Reload systemd and enable service
+          systemctl daemon-reload
+          systemctl enable arc.service || true
+
+          echo "Arc installed successfully!"
+          echo "Start with: sudo systemctl start arc"
+          echo "View logs with: sudo journalctl -u arc -f"
+
+          %preun
+          # Stop service before uninstall
+          systemctl stop arc.service || true
+          systemctl disable arc.service || true
 
           %changelog
           * $(date "+%a %b %d %Y") Basekick Labs <contact@basekick.com> - ${VERSION}-1
