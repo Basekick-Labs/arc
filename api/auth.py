@@ -12,10 +12,19 @@ from typing import Optional, Dict
 import logging
 import threading
 
+try:
+    import bcrypt
+    HAS_BCRYPT = True
+except ImportError:
+    HAS_BCRYPT = False
+
 from fastapi import HTTPException, Request
 from api.config import get_db_path
 
 logger = logging.getLogger(__name__)
+
+if not HAS_BCRYPT:
+    logger.warning("⚠️  bcrypt not available - using SHA256 for token hashing (less secure). Install bcrypt for better security.")
 
 
 class AuthManager:
@@ -74,8 +83,33 @@ class AuthManager:
             conn.commit()
 
     def _hash_token(self, token: str) -> str:
-        """Hash a token for storage"""
-        return hashlib.sha256(token.encode()).hexdigest()
+        """
+        Hash a token for secure storage.
+        Uses bcrypt if available (recommended), falls back to SHA256.
+        """
+        if HAS_BCRYPT:
+            # Use bcrypt with automatic salt generation (work factor=12)
+            return bcrypt.hashpw(token.encode(), bcrypt.gensalt(rounds=12)).decode()
+        else:
+            # Fallback to SHA256 (less secure, but better than plaintext)
+            return hashlib.sha256(token.encode()).hexdigest()
+
+    def _verify_token_hash(self, token: str, token_hash: str) -> bool:
+        """
+        Verify a token against its stored hash.
+        Handles both bcrypt and SHA256 hashes for backward compatibility.
+        """
+        # Detect hash type (bcrypt hashes start with $2b$)
+        if token_hash.startswith('$2'):
+            # Bcrypt hash
+            if HAS_BCRYPT:
+                return bcrypt.checkpw(token.encode(), token_hash.encode())
+            else:
+                logger.error("Token uses bcrypt but bcrypt is not installed")
+                return False
+        else:
+            # SHA256 hash (legacy)
+            return token_hash == hashlib.sha256(token.encode()).hexdigest()
 
     def _start_cleanup_thread(self):
         """Start background thread to periodically clean expired cache entries (Issue #12)"""
@@ -213,33 +247,41 @@ class AuthManager:
             logger.debug("Authentication failed: No token provided")
             return None
 
-        token_hash = self._hash_token(token)
+        # Use SHA256 for cache key (fast lookup)
+        cache_key = hashlib.sha256(token.encode()).hexdigest()
         current_time = time.time()
 
         # Check cache first
         with self._cache_lock:
-            if token_hash in self._cache:
-                token_info, expiry_time = self._cache[token_hash]
+            if cache_key in self._cache:
+                token_info, expiry_time = self._cache[cache_key]
                 if current_time < expiry_time:
                     self._cache_hits += 1
                     # Move to end (most recently used)
-                    self._cache.move_to_end(token_hash)
+                    self._cache.move_to_end(cache_key)
                     return token_info
                 else:
                     # Cache expired, remove it
-                    del self._cache[token_hash]
+                    del self._cache[cache_key]
 
             self._cache_misses += 1
 
-        # Cache miss - query database
+        # Cache miss - query database and verify with bcrypt/SHA256
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
+                # Fetch all enabled tokens (small number, fast)
                 cursor = conn.execute(
-                    "SELECT * FROM api_tokens WHERE token_hash = ? AND enabled = 1",
-                    (token_hash,)
+                    "SELECT * FROM api_tokens WHERE enabled = 1"
                 )
-                row = cursor.fetchone()
+                rows = cursor.fetchall()
+
+                # Find matching token by verifying hash
+                row = None
+                for r in rows:
+                    if self._verify_token_hash(token, r['token_hash']):
+                        row = r
+                        break
 
                 if row:
                     # Check token expiration if expires_at is set
@@ -288,16 +330,16 @@ class AuthManager:
                     # Store in cache with LRU eviction
                     with self._cache_lock:
                         # Evict oldest entry if cache is full
-                        if len(self._cache) >= self.max_cache_size and token_hash not in self._cache:
+                        if len(self._cache) >= self.max_cache_size and cache_key not in self._cache:
                             # Remove oldest (first item in OrderedDict)
                             self._cache.popitem(last=False)
                             self._cache_evictions += 1
 
-                        self._cache[token_hash] = (token_info, current_time + self.cache_ttl)
+                        self._cache[cache_key] = (token_info, current_time + self.cache_ttl)
 
                     return token_info
                 else:
-                    logger.warning(f"Authentication failed: Invalid token (hash: {token_hash[:8]}...)")
+                    logger.warning(f"Authentication failed: Invalid token")
                     return None
 
         except sqlite3.OperationalError as e:
@@ -609,9 +651,32 @@ class AuthMiddleware:
         self.enabled = enabled
         self.allowlist = allowlist or []
 
+    def _is_path_allowlisted(self, request_path: str) -> bool:
+        """
+        Check if path is allowlisted using exact matching.
+        Prevents bypass via path prefix matching (e.g., /docs matching /docs-secret).
+
+        Args:
+            request_path: The request path to check
+
+        Returns:
+            True if path is allowlisted, False otherwise
+        """
+        for allowed_path in self.allowlist:
+            # Support wildcards for flexible matching
+            if allowed_path.endswith('*'):
+                # Prefix match for wildcards (e.g., "/api/v1/auth/*")
+                if request_path.startswith(allowed_path[:-1]):
+                    return True
+            else:
+                # Exact match for non-wildcards
+                if request_path == allowed_path:
+                    return True
+        return False
+
     async def __call__(self, request: Request, call_next):
-        # Skip auth for allowlisted paths
-        if not self.enabled or any(request.url.path.startswith(path) for path in self.allowlist):
+        # Skip auth for allowlisted paths (exact match to prevent bypass)
+        if not self.enabled or self._is_path_allowlisted(request.url.path):
             return await call_next(request)
 
         # Extract token from Authorization header or x-api-key header

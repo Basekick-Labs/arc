@@ -20,12 +20,43 @@ class LocalBackend:
         if not path:
             raise ValueError("Either base_path or bucket must be provided")
 
-        self.base_path = Path(path)
+        self.base_path = Path(path).resolve()  # Resolve to absolute path
         self.database = database
 
         # Create base directory if it doesn't exist
         self.base_path.mkdir(parents=True, exist_ok=True)
         logger.info(f"Local storage backend initialized at {self.base_path} for database '{self.database}'")
+
+    def _validate_safe_path(self, key: str, database: str) -> Path:
+        """
+        Validate that the constructed path stays within the base directory.
+        This prevents path traversal attacks using ../ or absolute paths.
+
+        Args:
+            key: The key/path relative to database directory
+            database: The database name
+
+        Returns:
+            Resolved absolute path that's safe to use
+
+        Raises:
+            ValueError: If path traversal is detected
+        """
+        # Construct the target path
+        target = self.base_path / database / key
+
+        # Resolve to absolute path (resolves .. and symlinks)
+        resolved = target.resolve()
+
+        # Check that resolved path is still under base_path
+        try:
+            resolved.relative_to(self.base_path)
+        except ValueError:
+            raise ValueError(
+                f"Path traversal detected: '{key}' attempts to escape base directory"
+            )
+
+        return resolved
 
     async def upload_file(self, local_path: Path, key: str, database_override: str = None) -> bool:
         """Copy file to local storage location asynchronously
@@ -40,7 +71,9 @@ class LocalBackend:
         try:
             # Use override database if provided, otherwise use default
             database = database_override or self.database
-            dest_path = self.base_path / database / key
+
+            # Validate path to prevent traversal attacks
+            dest_path = self._validate_safe_path(key, database)
             dest_path.parent.mkdir(parents=True, exist_ok=True)
 
             # Read and write file asynchronously
@@ -161,8 +194,8 @@ class LocalBackend:
             local_path: Destination path for the file
         """
         try:
-            # Build source path: base_path/database/key
-            source_path = self.base_path / self.database / key
+            # Validate source path to prevent traversal attacks
+            source_path = self._validate_safe_path(key, self.database)
 
             if not source_path.exists():
                 raise FileNotFoundError(f"Source file not found: {source_path}")

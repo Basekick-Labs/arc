@@ -176,6 +176,55 @@ async def find_affected_files(
     return affected_files
 
 
+def validate_where_clause(where_clause: str) -> None:
+    """
+    Validate WHERE clause for SQL injection by using DuckDB's parser.
+    This prevents SQL injection by ensuring the WHERE clause is valid SQL
+    without dangerous operations.
+
+    Args:
+        where_clause: The WHERE clause to validate
+
+    Raises:
+        HTTPException: If the WHERE clause is invalid or dangerous
+    """
+    import duckdb
+
+    if not where_clause or not where_clause.strip():
+        raise HTTPException(status_code=400, detail="WHERE clause cannot be empty")
+
+    # Check for obvious SQL injection patterns
+    dangerous_keywords = [
+        ';',  # Statement terminator
+        '--',  # SQL comment
+        '/*',  # Multi-line comment
+        'DROP', 'DELETE', 'INSERT', 'UPDATE',  # DML/DDL (not allowed in WHERE)
+        'EXEC', 'EXECUTE',  # Command execution
+        'xp_', 'sp_',  # SQL Server stored procedures
+    ]
+
+    where_upper = where_clause.upper()
+    for keyword in dangerous_keywords:
+        if keyword in where_upper:
+            raise HTTPException(
+                status_code=400,
+                detail=f"WHERE clause contains forbidden keyword: {keyword}"
+            )
+
+    # Use DuckDB's parser to validate the WHERE clause syntax
+    # This ensures it's valid SQL before we use it
+    try:
+        conn = duckdb.connect(':memory:')
+        # Try to parse the WHERE clause in a safe context
+        conn.execute(f"EXPLAIN SELECT 1 WHERE {where_clause}")
+        conn.close()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid WHERE clause syntax: {str(e)}"
+        )
+
+
 async def count_matching_rows(table: pa.Table, where_clause: str, engine) -> int:
     """
     Count rows in Arrow table that match WHERE clause.
@@ -184,6 +233,9 @@ async def count_matching_rows(table: pa.Table, where_clause: str, engine) -> int
     import duckdb
     import gc
 
+    # Validate WHERE clause to prevent SQL injection
+    validate_where_clause(where_clause)
+
     # Create temp DuckDB connection
     conn = duckdb.connect(':memory:')
 
@@ -191,7 +243,7 @@ async def count_matching_rows(table: pa.Table, where_clause: str, engine) -> int
         # Register Arrow table
         conn.register('temp_table', table)
 
-        # Execute count query
+        # Execute count query (where_clause is validated above)
         query = f"SELECT COUNT(*) as count FROM temp_table WHERE {where_clause}"
         result = conn.execute(query).fetchone()
 
@@ -230,6 +282,9 @@ async def rewrite_file_without_deleted_rows(
     import duckdb
     import gc
 
+    # Validate WHERE clause to prevent SQL injection
+    validate_where_clause(where_clause)
+
     # Read original file
     table = pq.read_table(file_path)
     rows_before = table.num_rows
@@ -243,6 +298,7 @@ async def rewrite_file_without_deleted_rows(
         conn.register('temp_table', table)
 
         # Query to get rows that DON'T match (inverse of WHERE clause)
+        # where_clause is validated above
         query = f"SELECT * FROM temp_table WHERE NOT ({where_clause})"
         result = conn.execute(query).fetch_arrow_table()
 

@@ -112,11 +112,11 @@ class ArcConfig:
                     "database": "default",
                 },
                 "minio": {
-                    "endpoint": "http://minio:9000",
-                    "access_key": "minioadmin",
-                    "secret_key": "minioadmin123",
-                    "bucket": "arc",
-                    "use_ssl": False,
+                    "endpoint": os.getenv("MINIO_ENDPOINT", "http://minio:9000"),
+                    "access_key": os.getenv("MINIO_ACCESS_KEY", ""),  # No default - must be configured
+                    "secret_key": os.getenv("MINIO_SECRET_KEY", ""),  # No default - must be configured
+                    "bucket": os.getenv("MINIO_BUCKET", "arc"),
+                    "use_ssl": os.getenv("MINIO_USE_SSL", "false").lower() == "true",
                 },
             },
             "logging": {
@@ -305,8 +305,23 @@ class ArcConfig:
         return self.config.get("auth", {})
 
     def get_storage_config(self) -> Dict[str, Any]:
-        """Get storage configuration"""
-        return self.config.get("storage", {})
+        """Get storage configuration with security validation"""
+        storage_config = self.config.get("storage", {})
+
+        # Validate MinIO/S3/Ceph credentials if those backends are selected
+        backend = storage_config.get("backend", "local")
+        if backend in ["minio", "s3", "ceph"]:
+            backend_config = storage_config.get(backend, {})
+            access_key = backend_config.get("access_key", "")
+            secret_key = backend_config.get("secret_key", "")
+
+            if not access_key or not secret_key:
+                logger.warning(
+                    f"⚠️  SECURITY WARNING: {backend.upper()} backend selected but credentials not configured! "
+                    f"Set {backend.upper()}_ACCESS_KEY and {backend.upper()}_SECRET_KEY environment variables."
+                )
+
+        return storage_config
 
     def get_wal_config(self) -> Dict[str, Any]:
         """Get Write-Ahead Log (WAL) configuration"""
