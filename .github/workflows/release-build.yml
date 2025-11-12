@@ -605,7 +605,7 @@ jobs:
   create-draft-release:
     name: Create Draft Release
     runs-on: ubuntu-latest
-    needs: [prepare, docker-merge, tarball-build, smoke-test]
+    needs: [prepare, docker-merge, debian-build, rpm-build, tarball-build, smoke-test]
     permissions:
       contents: write
     steps:
@@ -625,90 +625,125 @@ jobs:
           VERSION=${{ needs.prepare.outputs.version }}
 
           # Generate changelog
-          cat > release-notes.md << EOF
-          # Arc ${VERSION}
+          cat > release-notes.md << 'EOF'
+          # Welcome to our very first release 👯
 
-          ## 🔒 Security Improvements
+          One database for metrics, logs, traces, and events.
+          Query all your observability data with SQL. Built on DuckDB + Parquet. 6.57M records/sec unified ingestion.
 
-          ### Critical Fixes
-          - **SQL Injection Protection**: Sanitized all SQL inputs in DuckDB engine and delete operations
-          - **Hardcoded Credentials Removed**: MinIO/S3 credentials now require explicit configuration
-          - **Path Traversal Protection**: Added validation to prevent directory traversal attacks
-          - **Authentication Bypass Fixed**: Changed from prefix to exact path matching in auth middleware
-          - **Token Security**: Upgraded from SHA256 to bcrypt (work factor 12) for token hashing
+          ## Quick Start
+          ### Docker
 
-          ### Performance Impact
-          - Query overhead: ~1.6ms per query (10-16% increase - acceptable)
-          - Ingestion impact: <1% (security checks not in hot path)
-          - Token auth: ~50-100ms first verification, then cached
+          ```
+          docker run -d \
+            -p 8000:8000 \
+            -e STORAGE_BACKEND=local \
+            -e DB_PATH=/data/arc.db \
+            -v arc-data:/data \
+            ghcr.io/basekick-labs/arc:25.11.1
+          ```
+          ### Debian / Ubuntu
 
-          ## ✨ New Features
+          ```
+          wget https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc_25.11.1_amd64.deb
+          sudo dpkg -i arc_25.11.1_amd64.deb
+          sudo systemctl start arc
+          ```
+          ### RHEL/CentOS/Fedora
+          ```
+          wget https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc-25.11.1-1.x86_64.rpm
+          sudo rpm -i arc-25.11.1-1.x86_64.rpm
+          sudo systemctl start arc
+          ```
 
-          ### DESCRIBE Command Support
-          - Fast schema introspection for tables
-          - Supports \`DESCRIBE table\`, \`DESCRIBE database.table\`, and \`DESC\` syntax
-          - Reads only Parquet metadata (no data loaded)
-          - Sub-10ms response times
+          ## Features
+          ### High-Performance Ingestion
 
-          ## 📦 Installation
+          - 6.57M records/sec unified: Ingest metrics, logs, traces, and events simultaneously through one endpoint
+          - MessagePack columnar protocol: Zero-copy ingestion optimized for throughput
+          - InfluxDB Line Protocol: 240K records/sec for Telegraf compatibility and easy migration
 
-          ### Docker (Recommended)
-          \`\`\`bash
-          docker pull ghcr.io/basekick-labs/arc:${VERSION}
-          docker run -p 8000:8000 -v arc-data:/app/data ghcr.io/basekick-labs/arc:${VERSION}
-          \`\`\`
+          ### Query & Analytics
 
-          ### Debian/Ubuntu
-          \`\`\`bash
-          wget https://github.com/Basekick-Labs/arc/releases/download/v${VERSION}/arc_${VERSION}_amd64.deb
-          sudo dpkg -i arc_${VERSION}_amd64.deb
-          \`\`\`
+          - DuckDB SQL engine: Full analytical SQL with window functions, CTEs, joins, and aggregations
+          - Cross-database queries: Join metrics, logs, and traces in a single SQL query
+          - Query caching: Configurable result caching for repeated analytical queries
+          - Apache Arrow format: Zero-copy columnar data transfer for Pandas/Polars pipelines
 
-          ### Universal Tarball
-          \`\`\`bash
-          wget https://github.com/Basekick-Labs/arc/releases/download/v${VERSION}/arc-${VERSION}-linux-x86_64.tar.gz
-          tar -xzf arc-${VERSION}-linux-x86_64.tar.gz
-          cd arc-${VERSION}-linux-x86_64
-          ./start-arc.sh
-          \`\`\`
+          ### Storage & Scalability
 
-          ## 🔄 Upgrading from Previous Versions
+          - Columnar Parquet storage: 3-5x compression ratios, optimized for analytical queries
+          - Flexible backends: Local filesystem, MinIO, AWS S3/R2, Google Cloud Storage, or any S3-compatible storage
+          - Multi-database architecture: Organize data by environment, tenant, or application with database namespaces
+          - Automatic compaction: Merges small files into optimized 512MB files for 10-50x faster queries
 
-          ### Important: Set Storage Credentials
-          If using MinIO/S3/Ceph, you **must** set environment variables:
-          \`\`\`bash
-          export MINIO_ACCESS_KEY="your-access-key"
-          export MINIO_SECRET_KEY="your-secret-key"
-          \`\`\`
+          ### Data Management
 
-          ### New Dependencies
-          - \`bcrypt==4.2.1\` added for secure token hashing
+          - Retention policies: Time-based data lifecycle management with automatic cleanup
+          - Continuous queries: Downsampling and materialized views for long-term data aggregation
+          - GDPR-compliant deletion: Precise deletion with zero overhead on writes/queries
+          - Write-Ahead Log (WAL): Optional durability feature for zero data loss (disabled by default for max throughput)
 
-          Run:
-          \`\`\`bash
-          pip install -r requirements.txt
-          \`\`\`
+          ### Integrations & Tools
 
-          ### Backward Compatibility
-          - Existing SHA256 tokens continue to work
-          - New tokens automatically use bcrypt
-          - No migration required
+          - VSCode Extension: Full-featured database manager with query editor, notebooks, CSV import, and alerting - [Install Now](https://marketplace.visualstudio.com/items?itemName=basekick-labs.arc-db-manager)
+          - Apache Superset: Native dialect for BI dashboards and visualizations
+          - Grafana: Native Data Source
+          - Prometheus: Ingest via Telegraf bridge (native remote write coming Q1 2026)
+          - OpenTelemetry: Ingest via OTEL Collector (native receivers coming Q1 2026)
+          - Telegraf Arc output plugin (In progress)
 
-          ## 📊 Benchmarks
+          ### Operations & Monitoring
 
-          - **DESCRIBE queries**: <10ms (P99) for schema introspection
-          - **Write throughput**: 2.9M rows/sec (columnar MessagePack)
-          - **Query latency**: <10ms (P99) for time-range queries
-          - **Security overhead**: <2ms per query
+          - Health checks: /health and /ready endpoints for orchestration
+          - Prometheus metrics: Export operational metrics for monitoring
+          - Authentication: Token-based API authentication with cache for performance
+          - Production ready: Docker, native deployment, and systemd service management
 
-          ## 🔗 Links
 
-          - [Security Fixes Documentation](https://github.com/Basekick-Labs/arc/blob/release/25.11.1/SECURITY_FIXES.md)
-          - [Documentation](https://github.com/Basekick-Labs/arc/tree/main/docs)
+          ## Performance
+          Unified Ingestion Benchmark (Apple M3 Max, 14 cores):
+
+          Metrics: 2.91M/sec
+          Logs: 1.55M/sec
+          Traces: 1.50M/sec
+          Events: 1.54M/sec
+          Total: 6.57M records/sec (all data types simultaneously)
+
+          ClickBench Results (AWS c6a.4xlarge, 100M rows):
+
+          - Cold run: 120.25s
+          - Warm run: 35.70s
+          - 12.4x faster than TimescaleDB
+          - 1.2x faster than QuestDB (Combined and Cold Run)
+
+          ##  Known Issues
+
+          - High Availability and clustering not yet implemented (coming Q1 2026)
+          - Native Prometheus remote write endpoint in development
+          - Native OTLP receivers in development
+          - Some edge cases in compaction with very large files (>5GB)
+
+          [Report issues →](https://github.com/basekick-labs/arc/issues)
 
           ---
 
-          **Note**: This is a DRAFT release. Once tested and approved, publish to make it official.
+          ## Roadmap
+
+          **Q1 2026:**
+          - Arc Cloud managed hosting
+          - Read Replicas
+          - Enhanced authentication (RBAC, SSO)
+
+          [View full roadmap →](https://github.com/basekick-labs/arc/issues)
+
+          ---
+
+          ## 💬 Community
+
+          - **Discord**: [Join community](https://discord.gg/nxnWfUxsdm)
+          - **GitHub**: [Report issues](https://github.com/basekick-labs/arc/issues)
+          - **Website**: [basekick.net](https://basekick.net)
           EOF
 
           cat release-notes.md
@@ -723,6 +758,7 @@ jobs:
           body_path: release-notes.md
           files: |
             release-artifacts/**/*.deb
+            release-artifacts/**/*.rpm
             release-artifacts/**/*.tar.gz
             release-artifacts/**/*.sha256
           fail_on_unmatched_files: false
