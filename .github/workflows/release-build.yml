@@ -188,22 +188,12 @@ jobs:
           echo "Installing dependencies..."
           cd arc-${VERSION}
 
-          # Add deadsnakes PPA for Python 3.9 (needed for Rocky Linux 9 compatibility)
-          sudo add-apt-repository -y ppa:deadsnakes/ppa
-          sudo apt-get update
-          sudo apt-get install -y python3.9 python3.9-dev python3.9-distutils
+          # Use system Python (3.12 on Ubuntu 24.04) to install dependencies
+          python3 --version
 
-          # Install pip for Python 3.9
-          curl -sS https://bootstrap.pypa.io/get-pip.py | sudo python3.9
-
-          # Check Python 3.9 version
-          python3.9 --version
-
-          # Install dependencies using Python 3.9 to ensure wheel compatibility
-          # Use --only-binary to ensure we get precompiled wheels (not source)
-          # This ensures C extensions like pydantic_core work correctly
+          # Install dependencies to a local directory we'll bundle
           mkdir -p python-packages
-          python3.9 -m pip install --only-binary=:all: --target=python-packages -r requirements.txt
+          pip3 install --target=python-packages -r requirements.txt
 
           cd ..
 
@@ -260,7 +250,7 @@ jobs:
           Section: database
           Priority: optional
           Architecture: amd64
-          Depends: python3 (>= 3.9)
+          Depends: python3 (>= 3.11)
           Maintainer: Basekick Labs <contact@basekick.com>
           Description: Arc - High-Performance Time-Series Data Warehouse
            Arc is a high-performance time-series database optimized for
@@ -311,7 +301,8 @@ jobs:
 
   # Build RPM packages for RedHat/Fedora/CentOS
   rpm-build:
-    name: Build RPM Package
+    name: Build RPM Package (Disabled)
+    if: false  # Disabled - focusing on Debian/Docker
     runs-on: ubuntu-latest
     needs: prepare
     steps:
@@ -343,22 +334,12 @@ jobs:
           echo "Installing dependencies..."
           cd arc-${VERSION}
 
-          # Add deadsnakes PPA for Python 3.9 (needed for Rocky Linux 9 compatibility)
-          sudo add-apt-repository -y ppa:deadsnakes/ppa
-          sudo apt-get update
-          sudo apt-get install -y python3.9 python3.9-dev python3.9-distutils
+          # Use system Python (3.12 on Ubuntu 24.04) to install dependencies
+          python3 --version
 
-          # Install pip for Python 3.9
-          curl -sS https://bootstrap.pypa.io/get-pip.py | sudo python3.9
-
-          # Check Python 3.9 version
-          python3.9 --version
-
-          # Install dependencies using Python 3.9 to ensure wheel compatibility
-          # Use --only-binary to ensure we get precompiled wheels (not source)
-          # This ensures C extensions like pydantic_core work correctly
+          # Install dependencies to a local directory we'll bundle
           mkdir -p python-packages
-          python3.9 -m pip install --only-binary=:all: --target=python-packages -r requirements.txt
+          pip3 install --target=python-packages -r requirements.txt
 
           cd ..
 
@@ -620,7 +601,8 @@ jobs:
 
   # Test RPM package on Rocky Linux
   test-rpm:
-    name: Test RPM Package (Rocky Linux 9)
+    name: Test RPM Package (Disabled)
+    if: false  # Disabled - focusing on Debian/Docker
     runs-on: ubuntu-latest
     needs: [prepare, rpm-build]
     container:
@@ -720,7 +702,7 @@ jobs:
   create-draft-release:
     name: Create Draft Release
     runs-on: ubuntu-latest
-    needs: [prepare, docker-merge, debian-build, rpm-build, tarball-build, test-debian, test-rpm, smoke-test]
+    needs: [prepare, docker-merge, debian-build, tarball-build, test-debian, smoke-test]
     permissions:
       contents: write
     steps:
@@ -762,12 +744,6 @@ jobs:
           ```
           wget https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc_25.11.1_amd64.deb
           sudo dpkg -i arc_25.11.1_amd64.deb
-          sudo systemctl start arc
-          ```
-          ### RHEL/CentOS/Fedora
-          ```
-          wget https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc-25.11.1-1.x86_64.rpm
-          sudo rpm -i arc-25.11.1-1.x86_64.rpm
           sudo systemctl start arc
           ```
 
@@ -873,7 +849,6 @@ jobs:
           body_path: release-notes.md
           files: |
             release-artifacts/**/*.deb
-            release-artifacts/**/*.rpm
             release-artifacts/**/*.tar.gz
             release-artifacts/**/*.sha256
           fail_on_unmatched_files: false
