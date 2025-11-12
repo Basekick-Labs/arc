@@ -598,7 +598,7 @@ jobs:
 
           # Wait for health endpoint (max 60 seconds)
           echo "Waiting for /health endpoint..."
-          for i in {1..60}; do
+          for i in $(seq 1 60); do
             if curl -s http://localhost:8000/health > /dev/null 2>&1; then
               echo "✅ Arc started successfully in $i seconds!"
               kill $ARC_PID
@@ -681,7 +681,7 @@ jobs:
 
           # Wait for health endpoint (max 60 seconds)
           echo "Waiting for /health endpoint..."
-          for i in {1..60}; do
+          for i in $(seq 1 60); do
             if curl -s http://localhost:8000/health > /dev/null 2>&1; then
               echo "✅ Arc started successfully in $i seconds!"
               kill $ARC_PID
