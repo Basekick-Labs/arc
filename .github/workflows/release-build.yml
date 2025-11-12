@@ -584,18 +584,18 @@ jobs:
           /usr/local/bin/arc &
           ARC_PID=$!
 
-          # Wait for startup (max 60 seconds - startup can be slow in containers)
+          # Wait for startup (max 90 seconds - startup can be slow in containers)
           echo "Waiting for Arc to start..."
-          for i in {1..60}; do
+          for i in {1..90}; do
             if curl -s http://localhost:8000/health > /dev/null 2>&1; then
-              echo "Arc started successfully!"
+              echo "Arc started successfully in $i seconds!"
               kill $ARC_PID
               exit 0
             fi
             sleep 1
           done
 
-          echo "Arc failed to start within 60 seconds"
+          echo "Arc failed to start within 90 seconds"
           kill $ARC_PID || true
           exit 1
 
@@ -639,18 +639,18 @@ jobs:
           /usr/local/bin/arc &
           ARC_PID=$!
 
-          # Wait for startup (max 60 seconds - startup can be slow in containers)
+          # Wait for startup (max 90 seconds - startup can be slow in containers)
           echo "Waiting for Arc to start..."
-          for i in {1..60}; do
+          for i in {1..90}; do
             if curl -s http://localhost:8000/health > /dev/null 2>&1; then
-              echo "Arc started successfully!"
+              echo "Arc started successfully in $i seconds!"
               kill $ARC_PID
               exit 0
             fi
             sleep 1
           done
 
-          echo "Arc failed to start within 60 seconds"
+          echo "Arc failed to start within 90 seconds"
           kill $ARC_PID || true
           exit 1
 
