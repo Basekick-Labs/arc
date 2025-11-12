@@ -293,13 +293,13 @@ jobs:
           source venv/bin/activate
 
           # Verify we have the correct Python version in venv
-          python -c "import sys; assert sys.version_info >= (3, 13)" || {
+          python3 -c "import sys; assert sys.version_info >= (3, 13)" || {
             echo "Error: Virtual environment Python version mismatch. Package may be corrupted."
             exit 1
           }
 
           # Start Arc
-          exec python -m uvicorn api.main:app --host 0.0.0.0 --port 8000
+          exec python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000
           WRAPPER
 
           chmod +x arc-${VERSION}/usr/local/bin/arc
@@ -429,13 +429,13 @@ jobs:
           source venv/bin/activate
 
           # Verify we have the correct Python version in venv
-          python -c "import sys; assert sys.version_info >= (3, 13)" || {
+          python3 -c "import sys; assert sys.version_info >= (3, 13)" || {
             echo "Error: Virtual environment Python version mismatch. Package may be corrupted."
             exit 1
           }
 
           # Start Arc
-          exec python -m uvicorn api.main:app --host 0.0.0.0 --port 8000
+          exec python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000
           WRAPPER
 
           chmod +x %{buildroot}/usr/local/bin/arc
