@@ -157,7 +157,8 @@ jobs:
 
   # Build Debian/Ubuntu packages
   debian-build:
-    name: Build Debian Package
+    name: Build Debian Package (Disabled)
+    if: false  # Disabled - focusing on Docker/Helm
     runs-on: ubuntu-latest
     needs: prepare
     steps:
@@ -544,9 +545,112 @@ jobs:
             dist/*.sha256
           retention-days: 7
 
+  # Package Helm chart
+  helm-package:
+    name: Package Helm Chart
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: '3.13.0'
+
+      - name: Package Helm chart
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+
+          # Update Chart.yaml version
+          sed -i "s/^version:.*/version: ${VERSION}/" helm/arc/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" helm/arc/Chart.yaml
+
+          # Package the chart
+          helm package helm/arc --destination dist/
+
+          # Create checksum
+          cd dist
+          sha256sum arc-${VERSION}.tgz > arc-${VERSION}.tgz.sha256
+
+      - name: Upload Helm chart
+        uses: actions/upload-artifact@v4
+        with:
+          name: arc-helm-${{ needs.prepare.outputs.version }}
+          path: |
+            dist/*.tgz
+            dist/*.tgz.sha256
+          retention-days: 7
+
+  # Test Helm chart installation
+  test-helm:
+    name: Test Helm Chart
+    runs-on: ubuntu-latest
+    needs: [prepare, helm-package]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Helm chart
+        uses: actions/download-artifact@v4
+        with:
+          name: arc-helm-${{ needs.prepare.outputs.version }}
+          path: dist/
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: '3.13.0'
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: arc-test
+
+      - name: Test Helm chart
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+
+          # Install the chart
+          helm install arc-test dist/arc-${VERSION}.tgz \
+            --set image.repository=ghcr.io/basekick-labs/arc \
+            --set image.tag=${VERSION} \
+            --set persistence.enabled=false \
+            --wait --timeout=2m
+
+          # Check if deployment is ready
+          kubectl rollout status deployment/arc-test --timeout=2m
+
+          # Check if pod is running
+          kubectl get pods -l app.kubernetes.io/name=arc
+
+          # Port forward and test health endpoint
+          kubectl port-forward svc/arc-test 8000:8000 &
+          PF_PID=$!
+          sleep 5
+
+          # Test health endpoint
+          if curl -s http://localhost:8000/health > /dev/null 2>&1; then
+            echo "✅ Helm chart deployed successfully and Arc is healthy!"
+          else
+            echo "❌ Arc health check failed"
+            kubectl logs -l app.kubernetes.io/name=arc --tail=50
+            exit 1
+          fi
+
+          kill $PF_PID || true
+
+          # Cleanup
+          helm uninstall arc-test
+
   # Test Debian package on Ubuntu
   test-debian:
-    name: Test Debian Package (Ubuntu 24.04)
+    name: Test Debian Package (Disabled)
+    if: false  # Disabled - focusing on Docker/Helm
     runs-on: ubuntu-latest
     needs: [prepare, debian-build]
     container:
@@ -758,7 +862,7 @@ jobs:
   create-draft-release:
     name: Create Draft Release
     runs-on: ubuntu-latest
-    needs: [prepare, docker-merge, debian-build, tarball-build, test-debian, smoke-test]
+    needs: [prepare, docker-merge, helm-package, test-helm, tarball-build, smoke-test]
     permissions:
       contents: write
     steps:
@@ -795,12 +899,10 @@ jobs:
             -v arc-data:/data \
             ghcr.io/basekick-labs/arc:25.11.1
           ```
-          ### Debian / Ubuntu
+          ### Kubernetes (Helm)
 
           ```
-          wget https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc_25.11.1_amd64.deb
-          sudo dpkg -i arc_25.11.1_amd64.deb
-          sudo systemctl start arc
+          helm install arc https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc-25.11.1.tgz
           ```
 
           ## Features
@@ -904,7 +1006,7 @@ jobs:
           name: Arc ${{ needs.prepare.outputs.version }}
           body_path: release-notes.md
           files: |
-            release-artifacts/**/*.deb
+            release-artifacts/**/*.tgz
             release-artifacts/**/*.tar.gz
             release-artifacts/**/*.sha256
           fail_on_unmatched_files: false
