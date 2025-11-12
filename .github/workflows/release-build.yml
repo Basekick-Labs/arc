@@ -396,6 +396,9 @@ jobs:
 
           Requires:       python3 >= 3.10
 
+          # Disable automatic dependency detection since we bundle everything in venv
+          AutoReqProv:    no
+
           %description
           Arc is a high-performance time-series database optimized for
           observability data ingestion and querying.
