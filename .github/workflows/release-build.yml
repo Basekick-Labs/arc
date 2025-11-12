@@ -157,7 +157,8 @@ jobs:
 
   # Build Debian/Ubuntu packages
   debian-build:
-    name: Build Debian Package
+    name: Build Debian Package (Disabled)
+    if: false  # Disabled - focusing on Docker/Helm
     runs-on: ubuntu-latest
     needs: prepare
     steps:
@@ -169,10 +170,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential devscripts debhelper dh-python python3-all python3-setuptools
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
+      # Don't set up Python - use system Python to create venv with --system-site-packages
 
       - name: Build Debian package
         run: |
@@ -187,17 +185,20 @@ jobs:
           cp README.md LICENSE arc-${VERSION}/
           cp packaging/arc.service arc-${VERSION}/
 
-          # PRE-BUILD VIRTUAL ENVIRONMENT (Bundle all dependencies)
-          echo "Building virtual environment with dependencies..."
+          # Install dependencies directly (no venv - simpler approach)
+          echo "Installing dependencies..."
           cd arc-${VERSION}
-          python3 -m venv venv
-          source venv/bin/activate
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          deactivate
+
+          # Use system Python (3.12 on Ubuntu 24.04) to install dependencies
+          python3 --version
+
+          # Install dependencies to a local directory we'll bundle
+          mkdir -p python-packages
+          pip3 install --target=python-packages -r requirements.txt
+
           cd ..
 
-          echo "Virtual environment built successfully"
+          echo "Dependencies installed successfully"
 
           # Create debian control structure
           mkdir -p arc-${VERSION}/DEBIAN
@@ -215,13 +216,17 @@ jobs:
           # Set ownership
           chown -R arc:arc /opt/arc
 
-          # Reload systemd and enable service
-          systemctl daemon-reload
-          systemctl enable arc.service || true
-
-          echo "Arc installed successfully!"
-          echo "Start with: sudo systemctl start arc"
-          echo "View logs with: sudo journalctl -u arc -f"
+          # Reload systemd and enable service (only if systemctl is available)
+          if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload
+            systemctl enable arc.service || true
+            echo "Arc installed successfully!"
+            echo "Start with: sudo systemctl start arc"
+            echo "View logs with: sudo journalctl -u arc -f"
+          else
+            echo "Arc installed successfully!"
+            echo "Note: systemd not available. Start manually with: /usr/local/bin/arc"
+          fi
           POSTINST
 
           chmod +x arc-${VERSION}/DEBIAN/postinst
@@ -231,9 +236,11 @@ jobs:
           #!/bin/bash
           set -e
 
-          # Stop service if running
-          systemctl stop arc.service || true
-          systemctl disable arc.service || true
+          # Stop service if running (only if systemctl is available)
+          if command -v systemctl >/dev/null 2>&1; then
+            systemctl stop arc.service || true
+            systemctl disable arc.service || true
+          fi
           PRERM
 
           chmod +x arc-${VERSION}/DEBIAN/prerm
@@ -244,14 +251,13 @@ jobs:
           Section: database
           Priority: optional
           Architecture: amd64
-          Depends: python3 (>= 3.10)
+          Depends: python3 (>= 3.11)
           Maintainer: Basekick Labs <contact@basekick.com>
           Description: Arc - High-Performance Time-Series Data Warehouse
            Arc is a high-performance time-series database optimized for
            observability data ingestion and querying.
            .
-           This package includes Python 3.13 and all dependencies pre-installed
-           in a virtual environment for fast deployment.
+           This package includes all Python dependencies bundled for offline installation.
           EOF
 
           # Create installation directories
@@ -259,36 +265,25 @@ jobs:
           mkdir -p arc-${VERSION}/opt/arc
           mkdir -p arc-${VERSION}/etc/systemd/system
 
-          # Move app files to /opt/arc (including pre-built venv)
-          mv arc-${VERSION}/{api,ingest,storage,utils,telemetry,*.py,*.conf,requirements.txt,venv} arc-${VERSION}/opt/arc/
+          # Move app files to /opt/arc (including bundled Python packages)
+          mv arc-${VERSION}/{api,ingest,storage,utils,telemetry,*.py,*.conf,requirements.txt,python-packages} arc-${VERSION}/opt/arc/
           mv arc-${VERSION}/{README.md,LICENSE} arc-${VERSION}/opt/arc/
 
           # Install systemd service file
           mv arc-${VERSION}/arc.service arc-${VERSION}/etc/systemd/system/
 
-          # Create startup wrapper that uses pre-built venv
+          # Create startup wrapper that uses system Python with bundled packages
           cat > arc-${VERSION}/usr/local/bin/arc << 'WRAPPER'
           #!/bin/bash
           set -e
 
           cd /opt/arc
 
-          # Use pre-built virtual environment (includes Python 3.13)
-          if [ ! -d "venv" ]; then
-            echo "Error: Virtual environment not found. Package may be corrupted."
-            exit 1
-          fi
+          # Add bundled Python packages to PYTHONPATH
+          export PYTHONPATH="/opt/arc/python-packages:$PYTHONPATH"
 
-          source venv/bin/activate
-
-          # Verify we have the correct Python version in venv
-          python -c "import sys; assert sys.version_info >= (3, 13)" || {
-            echo "Error: Virtual environment Python version mismatch. Package may be corrupted."
-            exit 1
-          }
-
-          # Start Arc
-          exec python -m uvicorn api.main:app --host 0.0.0.0 --port 8000
+          # Start Arc using system Python
+          exec python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000
           WRAPPER
 
           chmod +x arc-${VERSION}/usr/local/bin/arc
@@ -307,7 +302,8 @@ jobs:
 
   # Build RPM packages for RedHat/Fedora/CentOS
   rpm-build:
-    name: Build RPM Package
+    name: Build RPM Package (Disabled)
+    if: false  # Disabled - focusing on Debian/Docker
     runs-on: ubuntu-latest
     needs: prepare
     steps:
@@ -319,10 +315,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y rpm
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
+      # Don't set up Python - use system Python to create venv with --system-site-packages
 
       - name: Build RPM package
         run: |
@@ -338,17 +331,20 @@ jobs:
           cp README.md LICENSE arc-${VERSION}/
           cp packaging/arc.service arc-${VERSION}/
 
-          # PRE-BUILD VIRTUAL ENVIRONMENT (Bundle all dependencies)
-          echo "Building virtual environment with dependencies..."
+          # Install dependencies directly (no venv - simpler approach)
+          echo "Installing dependencies..."
           cd arc-${VERSION}
-          python3 -m venv venv
-          source venv/bin/activate
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          deactivate
+
+          # Use system Python (3.12 on Ubuntu 24.04) to install dependencies
+          python3 --version
+
+          # Install dependencies to a local directory we'll bundle
+          mkdir -p python-packages
+          pip3 install --target=python-packages -r requirements.txt
+
           cd ..
 
-          echo "Virtual environment built successfully"
+          echo "Dependencies installed successfully"
 
           # Create source tarball with pre-built venv
           tar -czf ~/rpmbuild/SOURCES/arc-${VERSION}.tar.gz arc-${VERSION}
@@ -364,20 +360,22 @@ jobs:
           Source0:        arc-${VERSION}.tar.gz
           BuildArch:      x86_64
 
-          Requires:       python3 >= 3.10
+          Requires:       python3 >= 3.9
+
+          # Disable automatic dependency detection since we bundle everything in venv
+          AutoReqProv:    no
 
           %description
           Arc is a high-performance time-series database optimized for
           observability data ingestion and querying.
 
-          This package includes Python 3.13 and all dependencies pre-installed
-          in a virtual environment for fast deployment.
+          This package includes all Python dependencies bundled for offline installation.
 
           %prep
           %setup -q
 
           %build
-          # Nothing to build - pre-built venv included
+          # Nothing to build - dependencies pre-installed
 
           %install
           rm -rf %{buildroot}
@@ -385,35 +383,24 @@ jobs:
           mkdir -p %{buildroot}/usr/local/bin
           mkdir -p %{buildroot}/etc/systemd/system
 
-          # Install application files with pre-built venv
-          cp -r api ingest storage utils telemetry *.py *.conf requirements.txt venv README.md LICENSE %{buildroot}/opt/arc/
+          # Install application files with bundled Python packages
+          cp -r api ingest storage utils telemetry *.py *.conf requirements.txt python-packages README.md LICENSE %{buildroot}/opt/arc/
 
           # Install systemd service
           cp arc.service %{buildroot}/etc/systemd/system/
 
-          # Create startup script that uses pre-built venv
+          # Create startup script that uses system Python with bundled packages
           cat > %{buildroot}/usr/local/bin/arc << 'WRAPPER'
           #!/bin/bash
           set -e
 
           cd /opt/arc
 
-          # Use pre-built virtual environment (includes Python 3.13)
-          if [ ! -d "venv" ]; then
-            echo "Error: Virtual environment not found. Package may be corrupted."
-            exit 1
-          fi
+          # Add bundled Python packages to PYTHONPATH
+          export PYTHONPATH="/opt/arc/python-packages:$PYTHONPATH"
 
-          source venv/bin/activate
-
-          # Verify we have the correct Python version in venv
-          python -c "import sys; assert sys.version_info >= (3, 13)" || {
-            echo "Error: Virtual environment Python version mismatch. Package may be corrupted."
-            exit 1
-          }
-
-          # Start Arc
-          exec python -m uvicorn api.main:app --host 0.0.0.0 --port 8000
+          # Start Arc using system Python
+          exec python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000
           WRAPPER
 
           chmod +x %{buildroot}/usr/local/bin/arc
@@ -432,13 +419,17 @@ jobs:
           # Set ownership
           chown -R arc:arc /opt/arc
 
-          # Reload systemd and enable service
-          systemctl daemon-reload
-          systemctl enable arc.service || true
-
-          echo "Arc installed successfully!"
-          echo "Start with: sudo systemctl start arc"
-          echo "View logs with: sudo journalctl -u arc -f"
+          # Reload systemd and enable service (only if systemctl is available)
+          if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload
+            systemctl enable arc.service || true
+            echo "Arc installed successfully!"
+            echo "Start with: sudo systemctl start arc"
+            echo "View logs with: sudo journalctl -u arc -f"
+          else
+            echo "Arc installed successfully!"
+            echo "Note: systemd not available. Start manually with: /usr/local/bin/arc"
+          fi
 
           %preun
           # Stop service before uninstall
@@ -477,10 +468,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
+      # Don't set up Python - use system Python to create venv with --system-site-packages
 
       - name: Install dependencies
         run: |
@@ -557,6 +545,289 @@ jobs:
             dist/*.sha256
           retention-days: 7
 
+  # Package Helm chart
+  helm-package:
+    name: Package Helm Chart
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: '3.13.0'
+
+      - name: Package Helm chart
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+
+          # Update Chart.yaml version
+          sed -i "s/^version:.*/version: ${VERSION}/" helm/arc/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" helm/arc/Chart.yaml
+
+          # Package the chart
+          helm package helm/arc --destination dist/
+
+          # Create checksum
+          cd dist
+          sha256sum arc-${VERSION}.tgz > arc-${VERSION}.tgz.sha256
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push Helm chart to OCI registry
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+
+          # Push to GHCR OCI registry
+          helm push dist/arc-${VERSION}.tgz oci://ghcr.io/basekick-labs
+
+      - name: Upload Helm chart
+        uses: actions/upload-artifact@v4
+        with:
+          name: arc-helm-${{ needs.prepare.outputs.version }}
+          path: |
+            dist/*.tgz
+            dist/*.tgz.sha256
+          retention-days: 7
+
+  # Test Helm chart installation
+  test-helm:
+    name: Test Helm Chart
+    runs-on: ubuntu-latest
+    needs: [prepare, helm-package]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Helm chart
+        uses: actions/download-artifact@v4
+        with:
+          name: arc-helm-${{ needs.prepare.outputs.version }}
+          path: dist/
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: '3.13.0'
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: arc-test
+
+      - name: Test Helm chart
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+
+          # Install the chart
+          helm install arc-test dist/arc-${VERSION}.tgz \
+            --set image.repository=ghcr.io/basekick-labs/arc \
+            --set image.tag=${VERSION} \
+            --set persistence.enabled=false \
+            --wait --timeout=2m
+
+          # Check if deployment is ready
+          kubectl rollout status deployment/arc-test --timeout=2m
+
+          # Check if pod is running
+          kubectl get pods -l app.kubernetes.io/name=arc
+
+          # Port forward and test health endpoint
+          kubectl port-forward svc/arc-test 8000:8000 &
+          PF_PID=$!
+          sleep 5
+
+          # Test health endpoint
+          if curl -s http://localhost:8000/health > /dev/null 2>&1; then
+            echo "✅ Helm chart deployed successfully and Arc is healthy!"
+          else
+            echo "❌ Arc health check failed"
+            kubectl logs -l app.kubernetes.io/name=arc --tail=50
+            exit 1
+          fi
+
+          kill $PF_PID || true
+
+          # Cleanup
+          helm uninstall arc-test
+
+  # Test Debian package on Ubuntu
+  test-debian:
+    name: Test Debian Package (Disabled)
+    if: false  # Disabled - focusing on Docker/Helm
+    runs-on: ubuntu-latest
+    needs: [prepare, debian-build]
+    container:
+      image: ubuntu:24.04
+    steps:
+      - name: Download Debian package
+        uses: actions/download-artifact@v4
+        with:
+          name: arc-debian-${{ needs.prepare.outputs.version }}
+
+      - name: Install package
+        run: |
+          apt-get update
+          apt-get install -y python3 curl
+          dpkg -i arc_${{ needs.prepare.outputs.version }}_amd64.deb || true
+          apt-get install -f -y
+
+      - name: Test installation
+        run: |
+          # Check if binary exists
+          test -f /usr/local/bin/arc
+
+          # Check if files are installed
+          test -d /opt/arc
+          test -d /opt/arc/python-packages
+
+      - name: Test startup
+        run: |
+          # Create data directory and set environment variables
+          mkdir -p /tmp/arc-data
+          export DB_PATH=/tmp/arc-data/arc.db
+          export STORAGE_BACKEND=local
+
+          # Start Arc in background and capture output
+          echo "Starting Arc..."
+          /usr/local/bin/arc > /tmp/arc.log 2>&1 &
+          ARC_PID=$!
+          echo "Arc PID: $ARC_PID"
+
+          # Wait a moment for Arc to start
+          sleep 5
+
+          # Check if process is still running
+          if ! kill -0 $ARC_PID 2>/dev/null; then
+            echo "❌ Arc process died immediately!"
+            cat /tmp/arc.log
+            exit 1
+          fi
+
+          # Wait for health endpoint (max 60 seconds)
+          echo "Waiting for /health endpoint..."
+          for i in $(seq 1 60); do
+            if curl -s http://localhost:8000/health > /dev/null 2>&1; then
+              echo "✅ Arc started successfully in $i seconds!"
+              kill $ARC_PID
+              exit 0
+            fi
+
+            # Check if process is still alive
+            if ! kill -0 $ARC_PID 2>/dev/null; then
+              echo "❌ Arc process died during startup!"
+              echo "=== Arc logs ==="
+              cat /tmp/arc.log
+              exit 1
+            fi
+
+            if [ $i -eq 30 ]; then
+              echo "30 seconds elapsed, checking logs..."
+              tail -20 /tmp/arc.log
+            fi
+
+            sleep 1
+          done
+
+          echo "❌ Arc failed to respond to /health within 60 seconds"
+          echo "=== Final Arc logs ==="
+          tail -50 /tmp/arc.log
+          kill $ARC_PID || true
+          exit 1
+
+  # Test RPM package on Rocky Linux
+  test-rpm:
+    name: Test RPM Package (Disabled)
+    if: false  # Disabled - focusing on Debian/Docker
+    runs-on: ubuntu-latest
+    needs: [prepare, rpm-build]
+    container:
+      image: rockylinux:9
+    steps:
+      - name: Download RPM package
+        uses: actions/download-artifact@v4
+        with:
+          name: arc-rpm-${{ needs.prepare.outputs.version }}
+
+      - name: Install package
+        run: |
+          # Install curl (allow erasing conflicting packages) and python3
+          dnf install -y --allowerasing curl python3
+          rpm -ivh arc-${{ needs.prepare.outputs.version }}-1.*.rpm
+
+      - name: Test installation
+        run: |
+          # Check if binary exists
+          test -f /usr/local/bin/arc
+
+          # Check if files are installed
+          test -d /opt/arc
+          test -d /opt/arc/python-packages
+
+      - name: Test startup
+        run: |
+          # Create data directory and set environment variables
+          mkdir -p /tmp/arc-data
+          export DB_PATH=/tmp/arc-data/arc.db
+          export STORAGE_BACKEND=local
+
+          # Start Arc in background and capture output
+          echo "Starting Arc..."
+          /usr/local/bin/arc > /tmp/arc.log 2>&1 &
+          ARC_PID=$!
+          echo "Arc PID: $ARC_PID"
+
+          # Wait a moment for Arc to start
+          sleep 5
+
+          # Check if process is still running
+          if ! kill -0 $ARC_PID 2>/dev/null; then
+            echo "❌ Arc process died immediately!"
+            cat /tmp/arc.log
+            exit 1
+          fi
+
+          # Wait for health endpoint (max 60 seconds)
+          echo "Waiting for /health endpoint..."
+          for i in $(seq 1 60); do
+            if curl -s http://localhost:8000/health > /dev/null 2>&1; then
+              echo "✅ Arc started successfully in $i seconds!"
+              kill $ARC_PID
+              exit 0
+            fi
+
+            # Check if process is still alive
+            if ! kill -0 $ARC_PID 2>/dev/null; then
+              echo "❌ Arc process died during startup!"
+              echo "=== Arc logs ==="
+              cat /tmp/arc.log
+              exit 1
+            fi
+
+            if [ $i -eq 30 ]; then
+              echo "30 seconds elapsed, checking logs..."
+              tail -20 /tmp/arc.log
+            fi
+
+            sleep 1
+          done
+
+          echo "❌ Arc failed to respond to /health within 60 seconds"
+          echo "=== Final Arc logs ==="
+          tail -50 /tmp/arc.log
+          kill $ARC_PID || true
+          exit 1
+
   # Run smoke tests on built artifacts
   smoke-test:
     name: Smoke Test
@@ -605,7 +876,7 @@ jobs:
   create-draft-release:
     name: Create Draft Release
     runs-on: ubuntu-latest
-    needs: [prepare, docker-merge, debian-build, rpm-build, tarball-build, smoke-test]
+    needs: [prepare, docker-merge, helm-package, test-helm, tarball-build, smoke-test]
     permissions:
       contents: write
     steps:
@@ -642,18 +913,16 @@ jobs:
             -v arc-data:/data \
             ghcr.io/basekick-labs/arc:25.11.1
           ```
-          ### Debian / Ubuntu
+          ### Kubernetes (Helm)
 
+          **OCI Registry (Recommended):**
           ```
-          wget https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc_25.11.1_amd64.deb
-          sudo dpkg -i arc_25.11.1_amd64.deb
-          sudo systemctl start arc
+          helm install arc oci://ghcr.io/basekick-labs/arc --version 25.11.1
           ```
-          ### RHEL/CentOS/Fedora
+
+          **GitHub Release:**
           ```
-          wget https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc-25.11.1-1.x86_64.rpm
-          sudo rpm -i arc-25.11.1-1.x86_64.rpm
-          sudo systemctl start arc
+          helm install arc https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc-25.11.1.tgz
           ```
 
           ## Features
@@ -757,8 +1026,7 @@ jobs:
           name: Arc ${{ needs.prepare.outputs.version }}
           body_path: release-notes.md
           files: |
-            release-artifacts/**/*.deb
-            release-artifacts/**/*.rpm
+            release-artifacts/**/*.tgz
             release-artifacts/**/*.tar.gz
             release-artifacts/**/*.sha256
           fail_on_unmatched_files: false
