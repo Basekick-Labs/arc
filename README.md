@@ -330,6 +330,33 @@ MinIO Console at `http://localhost:9001` (minioadmin/minioadmin)
 
 ## Quick Start (Docker)
 
+Run Arc with a single command:
+
+```bash
+docker run -d \
+  -p 8000:8000 \
+  -e STORAGE_BACKEND=local \
+  -e STORAGE_LOCAL_BASE_PATH=/data/arc \
+  -e DB_PATH=/data/arc.db \
+  -v arc-data:/data \
+  ghcr.io/basekick-labs/arc:25.11.1
+```
+
+Arc API will be available at `http://localhost:8000`
+
+**Check health:**
+```bash
+curl http://localhost:8000/health
+```
+
+**What's persisted:**
+- `/data/arc/` - Parquet files (your ingested data)
+- `/data/arc.db` - SQLite database (auth tokens, metadata)
+
+### Docker Compose (Development)
+
+For development with MinIO object storage:
+
 ```bash
 # Start Arc Core with MinIO
 docker-compose up -d
@@ -343,8 +370,6 @@ docker-compose logs -f arc-api
 # Stop
 docker-compose down
 ```
-
-**Note:** Docker mode achieves ~570K RPS. For maximum performance (2.32M RPS with columnar format), use native deployment.
 
 ## Remote Deployment
 
