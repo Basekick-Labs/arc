@@ -2,7 +2,22 @@
   <img src="assets/arc_logo.jpg" alt="Arc Logo" width="400"/>
 </p>
 
-<h1 align="center">Arc Core</h1>
+<h1 align="center">Arc</h1>
+
+<h3 align="center">One database for metrics, logs, traces, and events</h3>
+
+<p align="center">
+Query all your observability data with SQL. No more copying timestamps between Grafana dashboards.<br/>
+Built on DuckDB + Parquet. 6.57M records/sec. AGPL-3.0 open source.
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick Start</a> •
+  <a href="#why-arc">Why Arc</a> •
+  <a href="https://basekick.net">Website</a> •
+  <a href="https://basekick.net/docs">Documentation</a> •
+  <a href="https://discord.gg/nxnWfUxsdm">Discord</a>
+</p>
 
 <p align="center">
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img src="https://img.shields.io/badge/License-AGPL%203.0-blue.svg" alt="License: AGPL-3.0"/></a>
@@ -10,9 +25,47 @@
   <a href="https://discord.gg/nxnWfUxsdm"><img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2?logo=discord&logoColor=white" alt="Discord"/></a>
 </p>
 
-<p align="center">
-  High-performance time-series database. 6.57M combined records/sec (metrics + logs + events + traces simultaneously). One endpoint, one protocol. DuckDB + Parquet + Arrow. AGPL-3.0
-</p>
+---
+
+## The Problem
+
+You're running Prometheus for metrics. Loki for logs. Tempo for traces.
+
+Three systems. Three query languages. When production breaks at 3am, you're copying timestamps between dashboards trying to figure out what happened.
+
+**Arc solves this: one SQL query across all your observability data.**
+```sql
+-- Find every error log, slow trace, and CPU spike
+-- during your last deployment
+WITH deploy AS (
+  SELECT time FROM events
+  WHERE event_type = 'deployment_started'
+  ORDER BY time DESC LIMIT 1
+)
+SELECT
+  m.cpu_usage,
+  l.error_count,
+  t.p99_latency
+FROM metrics m
+JOIN logs l USING (timestamp, service)
+JOIN traces t USING (timestamp, service)
+CROSS JOIN deploy d
+WHERE m.timestamp BETWEEN d.time AND d.time + INTERVAL '30 minutes'
+ORDER BY timestamp DESC;
+```
+
+**Try this in Datadog. We'll wait.**
+
+---
+
+## Why Arc
+
+- **One Query Language**: SQL across metrics, logs, traces, and events
+- **No Data Silos**: Join your metrics with logs, correlate traces with events
+- **6.57M Records/Sec**: Ingest all observability data types simultaneously
+- **DuckDB Powered**: Full analytical SQL with window functions and CTEs
+- **Parquet Storage**: 3-5x compression, optimized for analytical queries
+- **Open Source**: AGPL-3.0, no vendor lock-in
 
 ## Features
 
