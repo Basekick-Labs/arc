@@ -98,6 +98,7 @@ Deploy Arc to Kubernetes with Helm:
 
 ```bash
 helm install arc https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc-25.11.1.tgz
+kubectl port-forward svc/arc 8000:8000
 ```
 
 **Customize your installation:**
