@@ -67,6 +67,51 @@ ORDER BY timestamp DESC;
 - **Parquet Storage**: 3-5x compression, optimized for analytical queries
 - **Open Source**: AGPL-3.0, no vendor lock-in
 
+## Quick Start
+
+### Docker (Recommended)
+
+Run Arc with a single command:
+
+```bash
+docker run -d \
+  -p 8000:8000 \
+  -e STORAGE_BACKEND=local \
+  -e DB_PATH=/data/arc.db \
+  -v arc-data:/data \
+  ghcr.io/basekick-labs/arc:25.11.1
+```
+
+Arc API will be available at `http://localhost:8000`
+
+**Check health:**
+```bash
+curl http://localhost:8000/health
+```
+
+### Kubernetes (Helm)
+
+Deploy Arc to Kubernetes with Helm:
+
+```bash
+helm install arc https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc-25.11.1.tgz
+```
+
+**Customize your installation:**
+```bash
+helm install arc https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc-25.11.1.tgz \
+  --set persistence.size=20Gi \
+  --set resources.limits.memory=4Gi
+```
+
+**Key configuration options:**
+- `persistence.enabled` - Enable persistent storage (default: true)
+- `persistence.size` - PVC size (default: 10Gi)
+- `arc.storageBackend` - Storage backend: local, s3, minio (default: local)
+- `resources.limits.memory` - Memory limit (default: unset)
+
+See the [Helm chart values.yaml](helm/arc/values.yaml) for all configuration options.
+
 ## Features
 
 - **High-Throughput Ingestion**: One endpoint for any timestamped columnar data - metrics, logs, traces, events, IoT sensors, analytics
@@ -353,50 +398,7 @@ Arc includes built-in token-based authentication with minimal performance overhe
   - Zero-copy columnar passthrough (no data transformation)
   - Non-blocking flush operations (writes continue during I/O)
 
-## Quick Start
-
-### Docker (Recommended)
-
-Run Arc with a single command:
-
-```bash
-docker run -d \
-  -p 8000:8000 \
-  -e STORAGE_BACKEND=local \
-  -e DB_PATH=/data/arc.db \
-  -v arc-data:/data \
-  ghcr.io/basekick-labs/arc:25.11.1
-```
-
-Arc API will be available at `http://localhost:8000`
-
-**Check health:**
-```bash
-curl http://localhost:8000/health
-```
-
-### Kubernetes (Helm)
-
-Deploy Arc to Kubernetes with Helm:
-
-```bash
-helm install arc https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc-25.11.1.tgz
-```
-
-**Customize your installation:**
-```bash
-helm install arc https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc-25.11.1.tgz \
-  --set persistence.size=20Gi \
-  --set resources.limits.memory=4Gi
-```
-
-**Key configuration options:**
-- `persistence.enabled` - Enable persistent storage (default: true)
-- `persistence.size` - PVC size (default: 10Gi)
-- `arc.storageBackend` - Storage backend: local, s3, minio (default: local)
-- `resources.limits.memory` - Memory limit (default: unset)
-
-See the [Helm chart values.yaml](helm/arc/values.yaml) for all configuration options.
+## Additional Deployment Options
 
 ### Docker Compose (Development)
 
