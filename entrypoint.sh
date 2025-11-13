@@ -25,9 +25,8 @@ PORT=${PORT:-8000}
 TIMEOUT=${TIMEOUT:-300}
 LOG_LEVEL=${LOG_LEVEL:-info}
 
-# Ensure data directories exist with correct permissions
+# Ensure data directories exist
 mkdir -p /app/data/arc
-chmod 755 /app/data
 
 # Wait for dependencies (optional)
 if [ ! -z "$WAIT_FOR_DB" ]; then
