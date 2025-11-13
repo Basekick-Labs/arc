@@ -893,9 +893,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download all artifacts
+      - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: |
+            arc-tarball-*
+            arc-helm-*
+          merge-multiple: true
           path: ./release-artifacts
 
       - name: Generate release notes
