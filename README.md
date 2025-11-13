@@ -1950,7 +1950,3 @@ We offer dual licensing and commercial support options.
 - **GitHub Issues**: [Report bugs and request features](https://github.com/basekick-labs/arc-core/issues)
 - **Enterprise Support**: enterprise[at]basekick[dot]net
 - **General Inquiries**: support[at]basekick[dot]net
-
-## Disclaimer
-
-**Arc Core is provided "as-is" in alpha state.** While we use it extensively for development and testing, it is not yet production-ready. Features and APIs may change without notice. Always back up your data and test thoroughly in non-production environments before considering any production deployment.
