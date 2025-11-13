@@ -14,9 +14,6 @@
   High-performance time-series database. 6.57M combined records/sec (metrics + logs + events + traces simultaneously). One endpoint, one protocol. DuckDB + Parquet + Arrow. AGPL-3.0
 </p>
 
-> **Alpha Release - Technical Preview**
-> Arc Core is currently in active development and evolving rapidly. While the system is stable and functional, it is **not recommended for production workloads** at this time. We are continuously improving performance, adding features, and refining the API. Use in development and testing environments only.
-
 ## Features
 
 - **High-Throughput Ingestion**: One endpoint for any timestamped columnar data - metrics, logs, traces, events, IoT sensors, analytics
@@ -303,7 +300,70 @@ Arc includes built-in token-based authentication with minimal performance overhe
   - Zero-copy columnar passthrough (no data transformation)
   - Non-blocking flush operations (writes continue during I/O)
 
-## Quick Start (Native - Recommended for Maximum Performance)
+## Quick Start
+
+### Docker (Recommended)
+
+Run Arc with a single command:
+
+```bash
+docker run -d \
+  -p 8000:8000 \
+  -e STORAGE_BACKEND=local \
+  -e DB_PATH=/data/arc.db \
+  -v arc-data:/data \
+  ghcr.io/basekick-labs/arc:25.11.1
+```
+
+Arc API will be available at `http://localhost:8000`
+
+**Check health:**
+```bash
+curl http://localhost:8000/health
+```
+
+### Kubernetes (Helm)
+
+Deploy Arc to Kubernetes with Helm:
+
+```bash
+helm install arc https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc-25.11.1.tgz
+```
+
+**Customize your installation:**
+```bash
+helm install arc https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc-25.11.1.tgz \
+  --set persistence.size=20Gi \
+  --set resources.limits.memory=4Gi
+```
+
+**Key configuration options:**
+- `persistence.enabled` - Enable persistent storage (default: true)
+- `persistence.size` - PVC size (default: 10Gi)
+- `arc.storageBackend` - Storage backend: local, s3, minio (default: local)
+- `resources.limits.memory` - Memory limit (default: unset)
+
+See the [Helm chart values.yaml](helm/arc/values.yaml) for all configuration options.
+
+### Docker Compose (Development)
+
+For development with MinIO object storage:
+
+```bash
+# Start Arc Core with MinIO
+docker-compose up -d
+
+# Check status
+docker-compose ps
+
+# View logs
+docker-compose logs -f arc-api
+
+# Stop
+docker-compose down
+```
+
+### Native Deployment (Maximum Performance)
 
 **Native deployment delivers 2.32M RPS vs 570K RPS in Docker (4.1x faster).**
 
@@ -327,24 +387,6 @@ brew install minio/stable/minio minio/stable/mc  # macOS
 
 Arc API will be available at `http://localhost:8000`
 MinIO Console at `http://localhost:9001` (minioadmin/minioadmin)
-
-## Quick Start (Docker)
-
-```bash
-# Start Arc Core with MinIO
-docker-compose up -d
-
-# Check status
-docker-compose ps
-
-# View logs
-docker-compose logs -f arc-api
-
-# Stop
-docker-compose down
-```
-
-**Note:** Docker mode achieves ~570K RPS. For maximum performance (2.32M RPS with columnar format), use native deployment.
 
 ## Remote Deployment
 
