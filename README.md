@@ -77,9 +77,7 @@ Run Arc with a single command:
 docker run -d \
   -p 8000:8000 \
   -e STORAGE_BACKEND=local \
-  -e STORAGE_LOCAL_BASE_PATH=/data/arc \
-  -e DB_PATH=/data/arc.db \
-  -v arc-data:/data \
+  -v arc-data:/app/data \
   ghcr.io/basekick-labs/arc:25.11.1
 ```
 
@@ -90,9 +88,9 @@ Arc API will be available at `http://localhost:8000`
 curl http://localhost:8000/health
 ```
 
-**What's persisted:**
-- `/data/arc/` - Parquet files (your ingested data)
-- `/data/arc.db` - SQLite database (auth tokens, metadata)
+**What's persisted in the `arc-data` volume:**
+- `/app/data/arc/` - Parquet files (your ingested data)
+- `/app/data/arc.db` - SQLite database (auth tokens, metadata)
 
 ### Kubernetes (Helm)
 
