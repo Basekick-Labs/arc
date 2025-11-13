@@ -1,0 +1,1074 @@
+name: Release Build
+
+on:
+  push:
+    branches:
+      - 'release/*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 25.11.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  REGISTRY_GHCR: ghcr.io
+  REGISTRY_DOCKERHUB: docker.io
+  IMAGE_NAME: basekick-labs/arc
+
+jobs:
+  # Extract version from branch name or input
+  prepare:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      short_version: ${{ steps.version.outputs.short_version }}
+    steps:
+      - name: Extract version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            # Extract from branch name: release/25.11.1 -> 25.11.1
+            VERSION="${GITHUB_REF#refs/heads/release/}"
+          fi
+
+          # Validate version format (YY.MM.PATCH)
+          if ! [[ "$VERSION" =~ ^[0-9]{2}\.[0-9]{1,2}\.[0-9]+$ ]]; then
+            echo "::error::Invalid version format: $VERSION (expected: YY.MM.PATCH)"
+            exit 1
+          fi
+
+          # Extract short version (25.11)
+          SHORT_VERSION="${VERSION%.*}"
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "short_version=$SHORT_VERSION" >> $GITHUB_OUTPUT
+          echo "📦 Building version: $VERSION" >> $GITHUB_STEP_SUMMARY
+
+  # Build and test Docker multi-arch images
+  docker-build:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    needs: prepare
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        platform:
+          - linux/amd64
+          - linux/arm64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_GHCR }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ needs.prepare.outputs.version }}
+            type=raw,value=${{ needs.prepare.outputs.short_version }}
+            type=raw,value=latest
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ needs.prepare.outputs.version }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ strategy.job-index }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Merge multi-arch manifests
+  docker-merge:
+    name: Merge Docker Manifests
+    runs-on: ubuntu-latest
+    needs: [prepare, docker-build]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          merge-multiple: true
+          path: /tmp/digests
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_GHCR }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          # Create multi-arch manifest
+          docker buildx imagetools create \
+            -t ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }} \
+            -t ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.short_version }} \
+            $(printf '${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+          echo "✅ Multi-arch manifest created and pushed" >> $GITHUB_STEP_SUMMARY
+          echo "Tags: ${{ needs.prepare.outputs.version }}, ${{ needs.prepare.outputs.short_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "Note: :latest tag will be added when release is published" >> $GITHUB_STEP_SUMMARY
+
+  # Build Debian/Ubuntu packages
+  debian-build:
+    name: Build Debian Package (Disabled)
+    if: false  # Disabled - focusing on Docker/Helm
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential devscripts debhelper dh-python python3-all python3-setuptools
+
+      # Don't set up Python - use system Python to create venv with --system-site-packages
+
+      - name: Build Debian package
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+
+          # Create package directory
+          mkdir -p arc-${VERSION}
+
+          # Copy application files
+          cp -r api/ ingest/ storage/ utils/ telemetry/ arc-${VERSION}/
+          cp config.py config_loader.py arc.conf requirements.txt arc-${VERSION}/
+          cp README.md LICENSE arc-${VERSION}/
+          cp packaging/arc.service arc-${VERSION}/
+
+          # Install dependencies directly (no venv - simpler approach)
+          echo "Installing dependencies..."
+          cd arc-${VERSION}
+
+          # Use system Python (3.12 on Ubuntu 24.04) to install dependencies
+          python3 --version
+
+          # Install dependencies to a local directory we'll bundle
+          mkdir -p python-packages
+          pip3 install --target=python-packages -r requirements.txt
+
+          cd ..
+
+          echo "Dependencies installed successfully"
+
+          # Create debian control structure
+          mkdir -p arc-${VERSION}/DEBIAN
+
+          # Create postinst script (runs after package installation)
+          cat > arc-${VERSION}/DEBIAN/postinst << 'POSTINST'
+          #!/bin/bash
+          set -e
+
+          # Create arc user if it doesn't exist
+          if ! id -u arc > /dev/null 2>&1; then
+            useradd --system --home-dir /opt/arc --no-create-home --shell /bin/false arc
+          fi
+
+          # Set ownership
+          chown -R arc:arc /opt/arc
+
+          # Reload systemd and enable service (only if systemctl is available)
+          if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload
+            systemctl enable arc.service || true
+            echo "Arc installed successfully!"
+            echo "Start with: sudo systemctl start arc"
+            echo "View logs with: sudo journalctl -u arc -f"
+          else
+            echo "Arc installed successfully!"
+            echo "Note: systemd not available. Start manually with: /usr/local/bin/arc"
+          fi
+          POSTINST
+
+          chmod +x arc-${VERSION}/DEBIAN/postinst
+
+          # Create prerm script (runs before package removal)
+          cat > arc-${VERSION}/DEBIAN/prerm << 'PRERM'
+          #!/bin/bash
+          set -e
+
+          # Stop service if running (only if systemctl is available)
+          if command -v systemctl >/dev/null 2>&1; then
+            systemctl stop arc.service || true
+            systemctl disable arc.service || true
+          fi
+          PRERM
+
+          chmod +x arc-${VERSION}/DEBIAN/prerm
+
+          cat > arc-${VERSION}/DEBIAN/control << EOF
+          Package: arc
+          Version: ${VERSION}
+          Section: database
+          Priority: optional
+          Architecture: amd64
+          Depends: python3 (>= 3.11)
+          Maintainer: Basekick Labs <contact@basekick.com>
+          Description: Arc - High-Performance Time-Series Data Warehouse
+           Arc is a high-performance time-series database optimized for
+           observability data ingestion and querying.
+           .
+           This package includes all Python dependencies bundled for offline installation.
+          EOF
+
+          # Create installation directories
+          mkdir -p arc-${VERSION}/usr/local/bin
+          mkdir -p arc-${VERSION}/opt/arc
+          mkdir -p arc-${VERSION}/etc/systemd/system
+
+          # Move app files to /opt/arc (including bundled Python packages)
+          mv arc-${VERSION}/{api,ingest,storage,utils,telemetry,*.py,*.conf,requirements.txt,python-packages} arc-${VERSION}/opt/arc/
+          mv arc-${VERSION}/{README.md,LICENSE} arc-${VERSION}/opt/arc/
+
+          # Install systemd service file
+          mv arc-${VERSION}/arc.service arc-${VERSION}/etc/systemd/system/
+
+          # Create startup wrapper that uses system Python with bundled packages
+          cat > arc-${VERSION}/usr/local/bin/arc << 'WRAPPER'
+          #!/bin/bash
+          set -e
+
+          cd /opt/arc
+
+          # Add bundled Python packages to PYTHONPATH
+          export PYTHONPATH="/opt/arc/python-packages:$PYTHONPATH"
+
+          # Start Arc using system Python
+          exec python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000
+          WRAPPER
+
+          chmod +x arc-${VERSION}/usr/local/bin/arc
+
+          # Build .deb package
+          dpkg-deb --build arc-${VERSION}
+          mv arc-${VERSION}.deb arc_${VERSION}_amd64.deb
+
+      - name: Upload Debian package
+        uses: actions/upload-artifact@v4
+        with:
+          name: arc-debian-${{ needs.prepare.outputs.version }}
+          path: |
+            *.deb
+          retention-days: 7
+
+  # Build RPM packages for RedHat/Fedora/CentOS
+  rpm-build:
+    name: Build RPM Package (Disabled)
+    if: false  # Disabled - focusing on Debian/Docker
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install RPM build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm
+
+      # Don't set up Python - use system Python to create venv with --system-site-packages
+
+      - name: Build RPM package
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+
+          # Create RPM build structure
+          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+
+          # Create source directory with pre-built venv
+          mkdir -p arc-${VERSION}
+          cp -r api/ ingest/ storage/ utils/ telemetry/ arc-${VERSION}/
+          cp config.py config_loader.py arc.conf requirements.txt arc-${VERSION}/
+          cp README.md LICENSE arc-${VERSION}/
+          cp packaging/arc.service arc-${VERSION}/
+
+          # Install dependencies directly (no venv - simpler approach)
+          echo "Installing dependencies..."
+          cd arc-${VERSION}
+
+          # Use system Python (3.12 on Ubuntu 24.04) to install dependencies
+          python3 --version
+
+          # Install dependencies to a local directory we'll bundle
+          mkdir -p python-packages
+          pip3 install --target=python-packages -r requirements.txt
+
+          cd ..
+
+          echo "Dependencies installed successfully"
+
+          # Create source tarball with pre-built venv
+          tar -czf ~/rpmbuild/SOURCES/arc-${VERSION}.tar.gz arc-${VERSION}
+
+          # Create RPM spec file
+          cat > ~/rpmbuild/SPECS/arc.spec << EOF
+          Name:           arc
+          Version:        ${VERSION}
+          Release:        1%{?dist}
+          Summary:        High-Performance Time-Series Data Warehouse
+          License:        AGPLv3
+          URL:            https://github.com/Basekick-Labs/arc
+          Source0:        arc-${VERSION}.tar.gz
+          BuildArch:      x86_64
+
+          Requires:       python3 >= 3.9
+
+          # Disable automatic dependency detection since we bundle everything in venv
+          AutoReqProv:    no
+
+          %description
+          Arc is a high-performance time-series database optimized for
+          observability data ingestion and querying.
+
+          This package includes all Python dependencies bundled for offline installation.
+
+          %prep
+          %setup -q
+
+          %build
+          # Nothing to build - dependencies pre-installed
+
+          %install
+          rm -rf %{buildroot}
+          mkdir -p %{buildroot}/opt/arc
+          mkdir -p %{buildroot}/usr/local/bin
+          mkdir -p %{buildroot}/etc/systemd/system
+
+          # Install application files with bundled Python packages
+          cp -r api ingest storage utils telemetry *.py *.conf requirements.txt python-packages README.md LICENSE %{buildroot}/opt/arc/
+
+          # Install systemd service
+          cp arc.service %{buildroot}/etc/systemd/system/
+
+          # Create startup script that uses system Python with bundled packages
+          cat > %{buildroot}/usr/local/bin/arc << 'WRAPPER'
+          #!/bin/bash
+          set -e
+
+          cd /opt/arc
+
+          # Add bundled Python packages to PYTHONPATH
+          export PYTHONPATH="/opt/arc/python-packages:$PYTHONPATH"
+
+          # Start Arc using system Python
+          exec python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000
+          WRAPPER
+
+          chmod +x %{buildroot}/usr/local/bin/arc
+
+          %files
+          /opt/arc/*
+          /usr/local/bin/arc
+          /etc/systemd/system/arc.service
+
+          %post
+          # Create arc user if it doesn't exist
+          if ! id -u arc > /dev/null 2>&1; then
+            useradd --system --home-dir /opt/arc --no-create-home --shell /sbin/nologin arc
+          fi
+
+          # Set ownership
+          chown -R arc:arc /opt/arc
+
+          # Reload systemd and enable service (only if systemctl is available)
+          if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload
+            systemctl enable arc.service || true
+            echo "Arc installed successfully!"
+            echo "Start with: sudo systemctl start arc"
+            echo "View logs with: sudo journalctl -u arc -f"
+          else
+            echo "Arc installed successfully!"
+            echo "Note: systemd not available. Start manually with: /usr/local/bin/arc"
+          fi
+
+          %preun
+          # Stop service before uninstall
+          systemctl stop arc.service || true
+          systemctl disable arc.service || true
+
+          %changelog
+          * $(date "+%a %b %d %Y") Basekick Labs <contact@basekick.com> - ${VERSION}-1
+          - Release ${VERSION}
+          - Security fixes: SQL injection, path traversal, auth bypass
+          - New feature: DESCRIBE command support
+          - Upgraded to bcrypt token hashing
+          - Includes pre-built virtual environment with all dependencies
+          EOF
+
+          # Build RPM
+          rpmbuild -ba ~/rpmbuild/SPECS/arc.spec
+
+          # Copy RPM to current directory
+          cp ~/rpmbuild/RPMS/x86_64/arc-${VERSION}-1.*.rpm .
+
+      - name: Upload RPM package
+        uses: actions/upload-artifact@v4
+        with:
+          name: arc-rpm-${{ needs.prepare.outputs.version }}
+          path: |
+            *.rpm
+          retention-days: 7
+
+  # Build universal tarball
+  tarball-build:
+    name: Build Universal Tarball
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Don't set up Python - use system Python to create venv with --system-site-packages
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Create tarball
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+          ARCHIVE_NAME="arc-${VERSION}-linux-x86_64"
+
+          # Create distribution directory
+          mkdir -p dist/${ARCHIVE_NAME}
+
+          # Copy application files
+          cp -r api/ ingest/ storage/ utils/ telemetry/ dist/${ARCHIVE_NAME}/
+          cp config.py config_loader.py arc.conf requirements.txt dist/${ARCHIVE_NAME}/
+          cp README.md LICENSE dist/${ARCHIVE_NAME}/
+
+          # Copy documentation
+          mkdir -p dist/${ARCHIVE_NAME}/docs
+          cp -r docs/* dist/${ARCHIVE_NAME}/docs/ 2>/dev/null || echo "No docs directory"
+
+          # PRE-BUILD VIRTUAL ENVIRONMENT (Bundle dependencies)
+          echo "Building virtual environment with all dependencies..."
+          cd dist/${ARCHIVE_NAME}
+          python3 -m venv venv
+          source venv/bin/activate
+          pip install --upgrade pip --quiet
+          pip install -r requirements.txt --quiet
+          deactivate
+          cd ../..
+          echo "Virtual environment built successfully"
+
+          # Create startup script
+          cat > dist/${ARCHIVE_NAME}/start-arc.sh << 'EOF'
+          #!/bin/bash
+          set -e
+
+          # Check Python version
+          python3 -c "import sys; assert sys.version_info >= (3, 13)" || {
+            echo "Error: Python 3.13+ required"
+            exit 1
+          }
+
+          # Activate pre-built virtual environment
+          source venv/bin/activate
+
+          # Start Arc
+          echo "Starting Arc..."
+          echo "API endpoint: http://localhost:8000"
+          echo "Health check: http://localhost:8000/health"
+          echo ""
+          python -m uvicorn api.main:app --host 0.0.0.0 --port 8000
+          EOF
+
+          chmod +x dist/${ARCHIVE_NAME}/start-arc.sh
+
+          # Create tarball
+          cd dist
+          tar -czf ${ARCHIVE_NAME}.tar.gz ${ARCHIVE_NAME}
+
+          # Create checksum
+          sha256sum ${ARCHIVE_NAME}.tar.gz > ${ARCHIVE_NAME}.tar.gz.sha256
+
+          echo "📦 Created: ${ARCHIVE_NAME}.tar.gz" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: arc-tarball-${{ needs.prepare.outputs.version }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          retention-days: 7
+
+  # Package Helm chart
+  helm-package:
+    name: Package Helm Chart
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: '3.13.0'
+
+      - name: Package Helm chart
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+
+          # Update Chart.yaml version
+          sed -i "s/^version:.*/version: ${VERSION}/" helm/arc/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" helm/arc/Chart.yaml
+
+          # Package the chart
+          helm package helm/arc --destination dist/
+
+          # Create checksum
+          cd dist
+          sha256sum arc-${VERSION}.tgz > arc-${VERSION}.tgz.sha256
+
+      - name: Upload Helm chart
+        uses: actions/upload-artifact@v4
+        with:
+          name: arc-helm-${{ needs.prepare.outputs.version }}
+          path: |
+            dist/*.tgz
+            dist/*.tgz.sha256
+          retention-days: 7
+
+  # Test Helm chart installation
+  test-helm:
+    name: Test Helm Chart
+    runs-on: ubuntu-latest
+    needs: [prepare, helm-package]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Helm chart
+        uses: actions/download-artifact@v4
+        with:
+          name: arc-helm-${{ needs.prepare.outputs.version }}
+          path: dist/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image for testing
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: local/arc:${{ needs.prepare.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: '3.13.0'
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: arc-test
+
+      - name: Load image into kind
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+          kind load docker-image local/arc:${VERSION} --name arc-test
+
+      - name: Test Helm chart
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+
+          # Install the chart with local image
+          helm install arc-test dist/arc-${VERSION}.tgz \
+            --set image.repository=local/arc \
+            --set image.tag=${VERSION} \
+            --set image.pullPolicy=Never \
+            --set persistence.enabled=false \
+            --wait --timeout=2m
+
+          # Check if deployment is ready
+          kubectl rollout status deployment/arc-test --timeout=2m
+
+          # Check if pod is running
+          kubectl get pods -l app.kubernetes.io/name=arc
+
+          # Port forward and test health endpoint
+          kubectl port-forward svc/arc-test 8000:8000 &
+          PF_PID=$!
+          sleep 5
+
+          # Test health endpoint
+          if curl -s http://localhost:8000/health > /dev/null 2>&1; then
+            echo "✅ Helm chart deployed successfully and Arc is healthy!"
+          else
+            echo "❌ Arc health check failed"
+            kubectl logs -l app.kubernetes.io/name=arc --tail=50
+            exit 1
+          fi
+
+          kill $PF_PID || true
+
+          # Cleanup
+          helm uninstall arc-test
+
+  # Test Debian package on Ubuntu
+  test-debian:
+    name: Test Debian Package (Disabled)
+    if: false  # Disabled - focusing on Docker/Helm
+    runs-on: ubuntu-latest
+    needs: [prepare, debian-build]
+    container:
+      image: ubuntu:24.04
+    steps:
+      - name: Download Debian package
+        uses: actions/download-artifact@v4
+        with:
+          name: arc-debian-${{ needs.prepare.outputs.version }}
+
+      - name: Install package
+        run: |
+          apt-get update
+          apt-get install -y python3 curl
+          dpkg -i arc_${{ needs.prepare.outputs.version }}_amd64.deb || true
+          apt-get install -f -y
+
+      - name: Test installation
+        run: |
+          # Check if binary exists
+          test -f /usr/local/bin/arc
+
+          # Check if files are installed
+          test -d /opt/arc
+          test -d /opt/arc/python-packages
+
+      - name: Test startup
+        run: |
+          # Create data directory and set environment variables
+          mkdir -p /tmp/arc-data
+          export DB_PATH=/tmp/arc-data/arc.db
+          export STORAGE_BACKEND=local
+
+          # Start Arc in background and capture output
+          echo "Starting Arc..."
+          /usr/local/bin/arc > /tmp/arc.log 2>&1 &
+          ARC_PID=$!
+          echo "Arc PID: $ARC_PID"
+
+          # Wait a moment for Arc to start
+          sleep 5
+
+          # Check if process is still running
+          if ! kill -0 $ARC_PID 2>/dev/null; then
+            echo "❌ Arc process died immediately!"
+            cat /tmp/arc.log
+            exit 1
+          fi
+
+          # Wait for health endpoint (max 60 seconds)
+          echo "Waiting for /health endpoint..."
+          for i in $(seq 1 60); do
+            if curl -s http://localhost:8000/health > /dev/null 2>&1; then
+              echo "✅ Arc started successfully in $i seconds!"
+              kill $ARC_PID
+              exit 0
+            fi
+
+            # Check if process is still alive
+            if ! kill -0 $ARC_PID 2>/dev/null; then
+              echo "❌ Arc process died during startup!"
+              echo "=== Arc logs ==="
+              cat /tmp/arc.log
+              exit 1
+            fi
+
+            if [ $i -eq 30 ]; then
+              echo "30 seconds elapsed, checking logs..."
+              tail -20 /tmp/arc.log
+            fi
+
+            sleep 1
+          done
+
+          echo "❌ Arc failed to respond to /health within 60 seconds"
+          echo "=== Final Arc logs ==="
+          tail -50 /tmp/arc.log
+          kill $ARC_PID || true
+          exit 1
+
+  # Test RPM package on Rocky Linux
+  test-rpm:
+    name: Test RPM Package (Disabled)
+    if: false  # Disabled - focusing on Debian/Docker
+    runs-on: ubuntu-latest
+    needs: [prepare, rpm-build]
+    container:
+      image: rockylinux:9
+    steps:
+      - name: Download RPM package
+        uses: actions/download-artifact@v4
+        with:
+          name: arc-rpm-${{ needs.prepare.outputs.version }}
+
+      - name: Install package
+        run: |
+          # Install curl (allow erasing conflicting packages) and python3
+          dnf install -y --allowerasing curl python3
+          rpm -ivh arc-${{ needs.prepare.outputs.version }}-1.*.rpm
+
+      - name: Test installation
+        run: |
+          # Check if binary exists
+          test -f /usr/local/bin/arc
+
+          # Check if files are installed
+          test -d /opt/arc
+          test -d /opt/arc/python-packages
+
+      - name: Test startup
+        run: |
+          # Create data directory and set environment variables
+          mkdir -p /tmp/arc-data
+          export DB_PATH=/tmp/arc-data/arc.db
+          export STORAGE_BACKEND=local
+
+          # Start Arc in background and capture output
+          echo "Starting Arc..."
+          /usr/local/bin/arc > /tmp/arc.log 2>&1 &
+          ARC_PID=$!
+          echo "Arc PID: $ARC_PID"
+
+          # Wait a moment for Arc to start
+          sleep 5
+
+          # Check if process is still running
+          if ! kill -0 $ARC_PID 2>/dev/null; then
+            echo "❌ Arc process died immediately!"
+            cat /tmp/arc.log
+            exit 1
+          fi
+
+          # Wait for health endpoint (max 60 seconds)
+          echo "Waiting for /health endpoint..."
+          for i in $(seq 1 60); do
+            if curl -s http://localhost:8000/health > /dev/null 2>&1; then
+              echo "✅ Arc started successfully in $i seconds!"
+              kill $ARC_PID
+              exit 0
+            fi
+
+            # Check if process is still alive
+            if ! kill -0 $ARC_PID 2>/dev/null; then
+              echo "❌ Arc process died during startup!"
+              echo "=== Arc logs ==="
+              cat /tmp/arc.log
+              exit 1
+            fi
+
+            if [ $i -eq 30 ]; then
+              echo "30 seconds elapsed, checking logs..."
+              tail -20 /tmp/arc.log
+            fi
+
+            sleep 1
+          done
+
+          echo "❌ Arc failed to respond to /health within 60 seconds"
+          echo "=== Final Arc logs ==="
+          tail -50 /tmp/arc.log
+          kill $ARC_PID || true
+          exit 1
+
+  # Run smoke tests on built artifacts
+  smoke-test:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+    needs: [tarball-build]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download tarball
+        uses: actions/download-artifact@v4
+        with:
+          pattern: arc-tarball-*
+          merge-multiple: true
+          path: ./artifacts
+
+      - name: Test tarball extraction
+        run: |
+          ls -la artifacts/
+
+          # Extract tarball
+          TARBALL=$(find artifacts -name "arc-*.tar.gz" -type f | head -1)
+          echo "Testing tarball: $TARBALL"
+          tar -xzf "$TARBALL" -C artifacts/
+
+          # Find extracted directory
+          EXTRACTED_DIR=$(find artifacts -maxdepth 1 -type d -name "arc-*" | head -1)
+          echo "Extracted directory: $EXTRACTED_DIR"
+
+          # Verify files exist
+          test -f "$EXTRACTED_DIR/start-arc.sh"
+          test -f "$EXTRACTED_DIR/requirements.txt"
+          test -f "$EXTRACTED_DIR/arc.conf"
+          test -d "$EXTRACTED_DIR/api"
+          test -d "$EXTRACTED_DIR/venv"
+
+          echo "✅ Tarball structure verified (includes pre-built venv)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Test Docker image (if available)
+        run: |
+          # Docker smoke test (basic health check)
+          # Will be implemented when images are actually pushed
+          echo "⏭️ Docker smoke test (deferred to publish)" >> $GITHUB_STEP_SUMMARY
+
+  # Create draft release
+  create-draft-release:
+    name: Create Draft Release
+    runs-on: ubuntu-latest
+    needs: [prepare, docker-merge, helm-package, test-helm, tarball-build, smoke-test]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./release-artifacts
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+
+          # Generate changelog
+          cat > release-notes.md << 'EOF'
+          # Welcome to our very first release 👯
+
+          One database for metrics, logs, traces, and events.
+          Query all your observability data with SQL. Built on DuckDB + Parquet. 6.57M records/sec unified ingestion.
+
+          ## Quick Start
+          ### Docker
+
+          ```
+          docker run -d \
+            -p 8000:8000 \
+            -e STORAGE_BACKEND=local \
+            -e DB_PATH=/data/arc.db \
+            -v arc-data:/data \
+            ghcr.io/basekick-labs/arc:25.11.1
+          ```
+          ### Kubernetes (Helm)
+
+          **Install directly from GitHub release:**
+          ```bash
+          helm install arc https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc-25.11.1.tgz
+          ```
+
+          **Or download and install:**
+          ```bash
+          # Download the Helm chart
+          wget https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc-25.11.1.tgz
+
+          # Install with default settings
+          helm install arc arc-25.11.1.tgz
+
+          # Or customize your installation
+          helm install arc arc-25.11.1.tgz \
+            --set persistence.size=20Gi \
+            --set resources.limits.memory=4Gi
+          ```
+
+          **Configuration options:**
+          - `image.repository` - Docker image repository (default: ghcr.io/basekick-labs/arc)
+          - `image.tag` - Image tag (default: chart appVersion)
+          - `persistence.enabled` - Enable persistent storage (default: true)
+          - `persistence.size` - PVC size (default: 10Gi)
+          - `arc.storageBackend` - Storage backend: local, s3, minio (default: local)
+          - `arc.dbPath` - Database path (default: /data/arc.db)
+
+          See `values.yaml` in the chart for all configuration options.
+
+          ## Features
+          ### High-Performance Ingestion
+
+          - 6.57M records/sec unified: Ingest metrics, logs, traces, and events simultaneously through one endpoint
+          - MessagePack columnar protocol: Zero-copy ingestion optimized for throughput
+          - InfluxDB Line Protocol: 240K records/sec for Telegraf compatibility and easy migration
+
+          ### Query & Analytics
+
+          - DuckDB SQL engine: Full analytical SQL with window functions, CTEs, joins, and aggregations
+          - Cross-database queries: Join metrics, logs, and traces in a single SQL query
+          - Query caching: Configurable result caching for repeated analytical queries
+          - Apache Arrow format: Zero-copy columnar data transfer for Pandas/Polars pipelines
+
+          ### Storage & Scalability
+
+          - Columnar Parquet storage: 3-5x compression ratios, optimized for analytical queries
+          - Flexible backends: Local filesystem, MinIO, AWS S3/R2, Google Cloud Storage, or any S3-compatible storage
+          - Multi-database architecture: Organize data by environment, tenant, or application with database namespaces
+          - Automatic compaction: Merges small files into optimized 512MB files for 10-50x faster queries
+
+          ### Data Management
+
+          - Retention policies: Time-based data lifecycle management with automatic cleanup
+          - Continuous queries: Downsampling and materialized views for long-term data aggregation
+          - GDPR-compliant deletion: Precise deletion with zero overhead on writes/queries
+          - Write-Ahead Log (WAL): Optional durability feature for zero data loss (disabled by default for max throughput)
+
+          ### Integrations & Tools
+
+          - VSCode Extension: Full-featured database manager with query editor, notebooks, CSV import, and alerting - [Install Now](https://marketplace.visualstudio.com/items?itemName=basekick-labs.arc-db-manager)
+          - Apache Superset: Native dialect for BI dashboards and visualizations
+          - Grafana: Native Data Source
+          - Prometheus: Ingest via Telegraf bridge (native remote write coming Q1 2026)
+          - OpenTelemetry: Ingest via OTEL Collector (native receivers coming Q1 2026)
+          - Telegraf Arc output plugin (In progress)
+
+          ### Operations & Monitoring
+
+          - Health checks: /health and /ready endpoints for orchestration
+          - Prometheus metrics: Export operational metrics for monitoring
+          - Authentication: Token-based API authentication with cache for performance
+          - Production ready: Docker, native deployment, and systemd service management
+
+
+          ## Performance
+          Unified Ingestion Benchmark (Apple M3 Max, 14 cores):
+
+          Metrics: 2.91M/sec
+          Logs: 1.55M/sec
+          Traces: 1.50M/sec
+          Events: 1.54M/sec
+          Total: 6.57M records/sec (all data types simultaneously)
+
+          ClickBench Results (AWS c6a.4xlarge, 100M rows):
+
+          - Cold run: 120.25s
+          - Warm run: 35.70s
+          - 12.4x faster than TimescaleDB
+          - 1.2x faster than QuestDB (Combined and Cold Run)
+
+          ##  Known Issues
+
+          - High Availability and clustering not yet implemented (coming Q1 2026)
+          - Native Prometheus remote write endpoint in development
+          - Native OTLP receivers in development
+          - Some edge cases in compaction with very large files (>5GB)
+
+          [Report issues →](https://github.com/basekick-labs/arc/issues)
+
+          ---
+
+          ## Roadmap
+
+          **Q1 2026:**
+          - Arc Cloud managed hosting
+          - Read Replicas
+          - Enhanced authentication (RBAC, SSO)
+
+          [View full roadmap →](https://github.com/basekick-labs/arc/issues)
+
+          ---
+
+          ## 💬 Community
+
+          - **Discord**: [Join community](https://discord.gg/nxnWfUxsdm)
+          - **GitHub**: [Report issues](https://github.com/basekick-labs/arc/issues)
+          - **Website**: [basekick.net](https://basekick.net)
+          EOF
+
+          cat release-notes.md
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v1
+        with:
+          draft: true
+          prerelease: false
+          tag_name: v${{ needs.prepare.outputs.version }}
+          name: Arc ${{ needs.prepare.outputs.version }}
+          body_path: release-notes.md
+          files: |
+            release-artifacts/**/*.tgz
+            release-artifacts/**/*.tar.gz
+            release-artifacts/**/*.sha256
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        run: |
+          echo "## 🎉 Draft Release Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Version: **${{ needs.prepare.outputs.version }}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Download artifacts and test locally" >> $GITHUB_STEP_SUMMARY
+          echo "2. Review release notes" >> $GITHUB_STEP_SUMMARY
+          echo "3. Publish release when ready" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🔗 [View Draft Release](https://github.com/${{ github.repository }}/releases)" >> $GITHUB_STEP_SUMMARY
