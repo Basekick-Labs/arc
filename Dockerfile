@@ -34,8 +34,8 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # Create app user (non-root for security)
 RUN useradd -m -u 1000 arc && \
-    mkdir -p /app /data && \
-    chown -R arc:arc /app /data
+    mkdir -p /app/data && \
+    chown -R arc:arc /app
 
 # Set working directory
 WORKDIR /app
@@ -55,6 +55,9 @@ RUN chmod +x entrypoint.sh
 
 # Switch to non-root user
 USER arc
+
+# Declare volume for data persistence
+VOLUME ["/app/data"]
 
 # Expose API port
 EXPOSE 8000
