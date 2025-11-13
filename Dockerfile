@@ -1,6 +1,9 @@
 # Arc Core - Production Docker Image
 # Multi-stage build for minimal image size
 
+# Build argument for version
+ARG VERSION=dev
+
 FROM python:3.13-slim AS builder
 
 # Install build dependencies
@@ -21,6 +24,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Production stage
 FROM python:3.13-slim
+
+# Re-declare VERSION arg for this stage
+ARG VERSION=dev
 
 # Install runtime dependencies only
 RUN apt-get update && apt-get install -y \
@@ -49,6 +55,9 @@ COPY --chown=arc:arc telemetry/ ./telemetry/
 COPY --chown=arc:arc config.py config_loader.py ./
 COPY --chown=arc:arc arc.conf ./
 COPY --chown=arc:arc entrypoint.sh ./
+
+# Create VERSION file
+RUN echo "${VERSION}" > VERSION && chown arc:arc VERSION
 
 # Make entrypoint executable
 RUN chmod +x entrypoint.sh
