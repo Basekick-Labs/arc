@@ -72,7 +72,9 @@ resources:
 arc:
   # Storage backend: local, s3, gcs
   storageBackend: local
-  # Database path (for local storage)
+  # Local storage base path (where Parquet files are stored)
+  storageLocalBasePath: /data/arc
+  # Database path (SQLite for auth/metadata)
   dbPath: /data/arc.db
   # Environment variables
   env: []

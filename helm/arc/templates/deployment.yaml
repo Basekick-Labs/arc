@@ -43,6 +43,8 @@ spec:
         env:
         - name: STORAGE_BACKEND
           value: {{ .Values.arc.storageBackend | quote }}
+        - name: STORAGE_LOCAL_BASE_PATH
+          value: {{ .Values.arc.storageLocalBasePath | quote }}
         - name: DB_PATH
           value: {{ .Values.arc.dbPath | quote }}
         {{- with .Values.arc.env }}
