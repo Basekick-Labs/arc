@@ -2,7 +2,22 @@
   <img src="assets/arc_logo.jpg" alt="Arc Logo" width="400"/>
 </p>
 
-<h1 align="center">Arc Core</h1>
+<h1 align="center">Arc</h1>
+
+<h3 align="center">One database for metrics, logs, traces, and events</h3>
+
+<p align="center">
+Query all your observability data with SQL. No more copying timestamps between Grafana dashboards.<br/>
+Built on DuckDB + Parquet. 6.57M records/sec. AGPL-3.0 open source.
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick Start</a> •
+  <a href="#why-arc">Why Arc</a> •
+  <a href="https://basekick.net">Website</a> •
+  <a href="https://basekick.net/docs">Documentation</a> •
+  <a href="https://discord.gg/nxnWfUxsdm">Discord</a>
+</p>
 
 <p align="center">
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img src="https://img.shields.io/badge/License-AGPL%203.0-blue.svg" alt="License: AGPL-3.0"/></a>
@@ -10,12 +25,47 @@
   <a href="https://discord.gg/nxnWfUxsdm"><img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2?logo=discord&logoColor=white" alt="Discord"/></a>
 </p>
 
-<p align="center">
-  High-performance time-series database. 6.57M combined records/sec (metrics + logs + events + traces simultaneously). One endpoint, one protocol. DuckDB + Parquet + Arrow. AGPL-3.0
-</p>
+---
 
-> **Alpha Release - Technical Preview**
-> Arc Core is currently in active development and evolving rapidly. While the system is stable and functional, it is **not recommended for production workloads** at this time. We are continuously improving performance, adding features, and refining the API. Use in development and testing environments only.
+## The Problem
+
+You're running Prometheus for metrics. Loki for logs. Tempo for traces.
+
+Three systems. Three query languages. When production breaks at 3am, you're copying timestamps between dashboards trying to figure out what happened.
+
+**Arc solves this: one SQL query across all your observability data.**
+```sql
+-- Find every error log, slow trace, and CPU spike
+-- during your last deployment
+WITH deploy AS (
+  SELECT time FROM events
+  WHERE event_type = 'deployment_started'
+  ORDER BY time DESC LIMIT 1
+)
+SELECT
+  m.cpu_usage,
+  l.error_count,
+  t.p99_latency
+FROM metrics m
+JOIN logs l USING (timestamp, service)
+JOIN traces t USING (timestamp, service)
+CROSS JOIN deploy d
+WHERE m.timestamp BETWEEN d.time AND d.time + INTERVAL '30 minutes'
+ORDER BY timestamp DESC;
+```
+
+**Try this in Datadog. We'll wait.**
+
+---
+
+## Why Arc
+
+- **One Query Language**: SQL across metrics, logs, traces, and events
+- **No Data Silos**: Join your metrics with logs, correlate traces with events
+- **6.57M Records/Sec**: Ingest all observability data types simultaneously
+- **DuckDB Powered**: Full analytical SQL with window functions and CTEs
+- **Parquet Storage**: 3-5x compression, optimized for analytical queries
+- **Open Source**: AGPL-3.0, no vendor lock-in
 
 ## Features
 
@@ -303,7 +353,70 @@ Arc includes built-in token-based authentication with minimal performance overhe
   - Zero-copy columnar passthrough (no data transformation)
   - Non-blocking flush operations (writes continue during I/O)
 
-## Quick Start (Native - Recommended for Maximum Performance)
+## Quick Start
+
+### Docker (Recommended)
+
+Run Arc with a single command:
+
+```bash
+docker run -d \
+  -p 8000:8000 \
+  -e STORAGE_BACKEND=local \
+  -e DB_PATH=/data/arc.db \
+  -v arc-data:/data \
+  ghcr.io/basekick-labs/arc:25.11.1
+```
+
+Arc API will be available at `http://localhost:8000`
+
+**Check health:**
+```bash
+curl http://localhost:8000/health
+```
+
+### Kubernetes (Helm)
+
+Deploy Arc to Kubernetes with Helm:
+
+```bash
+helm install arc https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc-25.11.1.tgz
+```
+
+**Customize your installation:**
+```bash
+helm install arc https://github.com/Basekick-Labs/arc/releases/download/v25.11.1/arc-25.11.1.tgz \
+  --set persistence.size=20Gi \
+  --set resources.limits.memory=4Gi
+```
+
+**Key configuration options:**
+- `persistence.enabled` - Enable persistent storage (default: true)
+- `persistence.size` - PVC size (default: 10Gi)
+- `arc.storageBackend` - Storage backend: local, s3, minio (default: local)
+- `resources.limits.memory` - Memory limit (default: unset)
+
+See the [Helm chart values.yaml](helm/arc/values.yaml) for all configuration options.
+
+### Docker Compose (Development)
+
+For development with MinIO object storage:
+
+```bash
+# Start Arc Core with MinIO
+docker-compose up -d
+
+# Check status
+docker-compose ps
+
+# View logs
+docker-compose logs -f arc-api
+
+# Stop
+docker-compose down
+```
+
+### Native Deployment (Maximum Performance)
 
 **Native deployment delivers 2.32M RPS vs 570K RPS in Docker (4.1x faster).**
 
@@ -327,24 +440,6 @@ brew install minio/stable/minio minio/stable/mc  # macOS
 
 Arc API will be available at `http://localhost:8000`
 MinIO Console at `http://localhost:9001` (minioadmin/minioadmin)
-
-## Quick Start (Docker)
-
-```bash
-# Start Arc Core with MinIO
-docker-compose up -d
-
-# Check status
-docker-compose ps
-
-# View logs
-docker-compose logs -f arc-api
-
-# Stop
-docker-compose down
-```
-
-**Note:** Docker mode achieves ~570K RPS. For maximum performance (2.32M RPS with columnar format), use native deployment.
 
 ## Remote Deployment
 
@@ -1855,7 +1950,3 @@ We offer dual licensing and commercial support options.
 - **GitHub Issues**: [Report bugs and request features](https://github.com/basekick-labs/arc-core/issues)
 - **Enterprise Support**: enterprise[at]basekick[dot]net
 - **General Inquiries**: support[at]basekick[dot]net
-
-## Disclaimer
-
-**Arc Core is provided "as-is" in alpha state.** While we use it extensively for development and testing, it is not yet production-ready. Features and APIs may change without notice. Always back up your data and test thoroughly in non-production environments before considering any production deployment.
