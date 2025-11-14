@@ -15,7 +15,7 @@ Built on DuckDB + Parquet. 6.57M records/sec. AGPL-3.0 open source.
   <a href="#quick-start">Quick Start</a> •
   <a href="#why-arc">Why Arc</a> •
   <a href="https://basekick.net">Website</a> •
-  <a href="https://basekick.net/docs">Documentation</a> •
+  <a href="https://docs.basekick.net">Documentation</a> •
   <a href="https://discord.gg/nxnWfUxsdm">Discord</a>
 </p>
 
@@ -812,16 +812,18 @@ response = requests.post(
 **For drop-in replacement of InfluxDB** - compatible with Telegraf and InfluxDB clients:
 
 ```bash
-# InfluxDB 1.x compatible endpoint
-curl -X POST "http://localhost:8000/api/v1/write?db=mydb" \
+# Line Protocol endpoint
+curl -X POST http://localhost:8000/api/v1/write/line-protocol \
   -H "Authorization: Bearer $ARC_TOKEN" \
   -H "Content-Type: text/plain" \
+  -H "x-arc-database: default" \
   --data-binary "cpu,host=server01 value=0.64 1633024800000000000"
 
 # Multiple measurements
-curl -X POST "http://localhost:8000/api/v1/write?db=metrics" \
+curl -X POST http://localhost:8000/api/v1/write/line-protocol \
   -H "Authorization: Bearer $ARC_TOKEN" \
   -H "Content-Type: text/plain" \
+  -H "x-arc-database: default" \
   --data-binary "cpu,host=server01,region=us-west value=0.64 1633024800000000000
 memory,host=server01,region=us-west used=8.2,total=16.0 1633024800000000000
 disk,host=server01,region=us-west used=120.5,total=500.0 1633024800000000000"
@@ -879,6 +881,7 @@ for row in data['data']:
 curl -X POST http://localhost:8000/api/v1/query \
   -H "Authorization: Bearer $ARC_TOKEN" \
   -H "Content-Type: application/json" \
+  -H "x-arc-database: default" \
   -d '{
     "sql": "SELECT * FROM cpu WHERE host = '\''server01'\'' LIMIT 10",
     "format": "json"
