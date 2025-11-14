@@ -35,23 +35,24 @@ Three systems. Three query languages. When production breaks at 3am, you're copy
 
 **Arc solves this: one SQL query across all your observability data.**
 ```sql
--- Find every error log, slow trace, and CPU spike
--- during your last deployment
+-- What happened after that deployment?
 WITH deploy AS (
-  SELECT time FROM events
+  SELECT time FROM prod.events
   WHERE event_type = 'deployment_started'
-  ORDER BY time DESC LIMIT 1
+  LIMIT 1
 )
 SELECT
+  m.timestamp,
+  m.service,
   m.cpu_usage,
   l.error_count,
   t.p99_latency
-FROM metrics m
-JOIN logs l USING (timestamp, service)
-JOIN traces t USING (timestamp, service)
+FROM prod.metrics m
+JOIN prod.logs l USING (timestamp, service)
+JOIN prod.traces t USING (timestamp, service)
 CROSS JOIN deploy d
 WHERE m.timestamp BETWEEN d.time AND d.time + INTERVAL '30 minutes'
-ORDER BY timestamp DESC;
+ORDER BY m.timestamp DESC;
 ```
 
 **Try this in Datadog. We'll wait.**
