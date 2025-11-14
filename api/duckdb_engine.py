@@ -5,6 +5,7 @@ import time
 import os
 import multiprocessing
 from api.duckdb_pool import DuckDBConnectionPool, QueryPriority
+from api.partition_pruner import PartitionPruner
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,10 @@ class DuckDBEngine:
         self.ceph_backend = ceph_backend
         self.gcs_backend = gcs_backend
         self.connection_manager = connection_manager
+
+        # Initialize partition pruner for file-level optimization
+        self.partition_pruner = PartitionPruner()
+        self.current_sql = None  # Store original SQL for pruning context
 
         try:
             import duckdb
@@ -607,6 +612,9 @@ class DuckDBEngine:
         """
         import re
 
+        # Store original SQL for partition pruning
+        self.current_sql = sql
+
         # First, handle database.table references
         pattern_db_table = r'FROM\s+(\w+)\.(\w+)'
 
@@ -641,18 +649,64 @@ class DuckDBEngine:
                 # Use direct filesystem path for local backend
                 base_path = self.local_backend.base_path if self.local_backend else bucket
                 local_path = f"{base_path}/{database}/{table}/**/*.parquet"
-                logger.info(f"Using local filesystem path for DuckDB: {local_path}")
-                return f"FROM read_parquet('{local_path}', union_by_name=true)"
+
+                # Apply partition pruning if enabled
+                optimized_path, was_optimized = self.partition_pruner.optimize_table_path(
+                    local_path, self.current_sql or ''
+                )
+
+                if was_optimized:
+                    if isinstance(optimized_path, list):
+                        # Multiple paths - use DuckDB array syntax
+                        paths_str = "[" + ", ".join(f"'{p}'" for p in optimized_path) + "]"
+                        logger.info(f"✨ Partition pruning: Using {len(optimized_path)} targeted paths")
+                        return f"FROM read_parquet({paths_str}, union_by_name=true)"
+                    else:
+                        logger.info(f"✨ Partition pruning: Using optimized path: {optimized_path}")
+                        return f"FROM read_parquet('{optimized_path}', union_by_name=true)"
+                else:
+                    logger.info(f"Using local filesystem path for DuckDB: {local_path}")
+                    return f"FROM read_parquet('{local_path}', union_by_name=true)"
             elif backend_type == 'gcs':
                 # Use native gs:// URLs with DuckDB GCS support
                 gs_path = f"gs://{bucket}/{database}/{table}/**/*.parquet"
-                logger.info(f"Using native GCS path for DuckDB: {gs_path}")
-                return f"FROM read_parquet('{gs_path}', union_by_name=true)"
+
+                # Apply partition pruning if enabled
+                optimized_path, was_optimized = self.partition_pruner.optimize_table_path(
+                    gs_path, self.current_sql or ''
+                )
+
+                if was_optimized:
+                    if isinstance(optimized_path, list):
+                        paths_str = "[" + ", ".join(f"'{p}'" for p in optimized_path) + "]"
+                        logger.info(f"✨ Partition pruning: Using {len(optimized_path)} targeted GCS paths")
+                        return f"FROM read_parquet({paths_str}, union_by_name=true)"
+                    else:
+                        logger.info(f"✨ Partition pruning: Using optimized GCS path: {optimized_path}")
+                        return f"FROM read_parquet('{optimized_path}', union_by_name=true)"
+                else:
+                    logger.info(f"Using native GCS path for DuckDB: {gs_path}")
+                    return f"FROM read_parquet('{gs_path}', union_by_name=true)"
             else:
                 # Use S3-compatible path for MinIO/S3/Ceph
                 s3_path = f"s3://{bucket}/{database}/{table}/**/*.parquet"
-                logger.info(f"Converting {database}.{table} to {s3_path}")
-                return f"FROM read_parquet('{s3_path}', union_by_name=true)"
+
+                # Apply partition pruning if enabled
+                optimized_path, was_optimized = self.partition_pruner.optimize_table_path(
+                    s3_path, self.current_sql or ''
+                )
+
+                if was_optimized:
+                    if isinstance(optimized_path, list):
+                        paths_str = "[" + ", ".join(f"'{p}'" for p in optimized_path) + "]"
+                        logger.info(f"✨ Partition pruning: Using {len(optimized_path)} targeted S3 paths")
+                        return f"FROM read_parquet({paths_str}, union_by_name=true)"
+                    else:
+                        logger.info(f"✨ Partition pruning: Using optimized S3 path: {optimized_path}")
+                        return f"FROM read_parquet('{optimized_path}', union_by_name=true)"
+                else:
+                    logger.info(f"Converting {database}.{table} to {s3_path}")
+                    return f"FROM read_parquet('{s3_path}', union_by_name=true)"
 
         converted = re.sub(pattern_db_table, replace_db_table, sql, flags=re.IGNORECASE)
 
@@ -676,16 +730,63 @@ class DuckDBEngine:
             if self.local_backend or self.storage_backend == 'local':
                 base_path = self.local_backend.base_path if self.local_backend else bucket
                 local_path = f"{base_path}/{database}/{table}/**/*.parquet"
-                logger.info(f"Converting simple table '{table}' to {local_path}")
-                return f"FROM read_parquet('{local_path}', union_by_name=true)"
+
+                # Apply partition pruning if enabled
+                optimized_path, was_optimized = self.partition_pruner.optimize_table_path(
+                    local_path, self.current_sql or ''
+                )
+
+                if was_optimized:
+                    if isinstance(optimized_path, list):
+                        paths_str = "[" + ", ".join(f"'{p}'" for p in optimized_path) + "]"
+                        logger.info(f"✨ Partition pruning: Using {len(optimized_path)} targeted paths for '{table}'")
+                        return f"FROM read_parquet({paths_str}, union_by_name=true)"
+                    else:
+                        logger.info(f"✨ Partition pruning: Using optimized path for '{table}': {optimized_path}")
+                        return f"FROM read_parquet('{optimized_path}', union_by_name=true)"
+                else:
+                    logger.info(f"Converting simple table '{table}' to {local_path}")
+                    return f"FROM read_parquet('{local_path}', union_by_name=true)"
+
             elif self.gcs_backend:
                 gs_path = f"gs://{bucket}/{database}/{table}/**/*.parquet"
-                logger.info(f"Converting simple table '{table}' to {gs_path}")
-                return f"FROM read_parquet('{gs_path}', union_by_name=true)"
+
+                # Apply partition pruning if enabled
+                optimized_path, was_optimized = self.partition_pruner.optimize_table_path(
+                    gs_path, self.current_sql or ''
+                )
+
+                if was_optimized:
+                    if isinstance(optimized_path, list):
+                        paths_str = "[" + ", ".join(f"'{p}'" for p in optimized_path) + "]"
+                        logger.info(f"✨ Partition pruning: Using {len(optimized_path)} targeted GCS paths for '{table}'")
+                        return f"FROM read_parquet({paths_str}, union_by_name=true)"
+                    else:
+                        logger.info(f"✨ Partition pruning: Using optimized GCS path for '{table}': {optimized_path}")
+                        return f"FROM read_parquet('{optimized_path}', union_by_name=true)"
+                else:
+                    logger.info(f"Converting simple table '{table}' to {gs_path}")
+                    return f"FROM read_parquet('{gs_path}', union_by_name=true)"
+
             else:
                 s3_path = f"s3://{bucket}/{database}/{table}/**/*.parquet"
-                logger.info(f"Converting simple table '{table}' to {s3_path}")
-                return f"FROM read_parquet('{s3_path}', union_by_name=true)"
+
+                # Apply partition pruning if enabled
+                optimized_path, was_optimized = self.partition_pruner.optimize_table_path(
+                    s3_path, self.current_sql or ''
+                )
+
+                if was_optimized:
+                    if isinstance(optimized_path, list):
+                        paths_str = "[" + ", ".join(f"'{p}'" for p in optimized_path) + "]"
+                        logger.info(f"✨ Partition pruning: Using {len(optimized_path)} targeted S3 paths for '{table}'")
+                        return f"FROM read_parquet({paths_str}, union_by_name=true)"
+                    else:
+                        logger.info(f"✨ Partition pruning: Using optimized S3 path for '{table}': {optimized_path}")
+                        return f"FROM read_parquet('{optimized_path}', union_by_name=true)"
+                else:
+                    logger.info(f"Converting simple table '{table}' to {s3_path}")
+                    return f"FROM read_parquet('{s3_path}', union_by_name=true)"
 
         converted = re.sub(pattern_simple, replace_simple_table, converted, flags=re.IGNORECASE)
         return converted

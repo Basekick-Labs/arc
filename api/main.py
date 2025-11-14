@@ -1214,8 +1214,7 @@ async def execute_sql(request: Request, query: QueryRequest):
             duration_ms=result.get("execution_time_ms", 0.0),
             row_count=result.get("row_count", 0),
             success=result["success"],
-            query_format=query.format,
-            limit=query.limit
+            query_format=query.format
         )
 
         if not result["success"]:
@@ -1302,8 +1301,7 @@ async def execute_sql_arrow(request: Request, query: QueryRequest):
             duration_ms=result.get("execution_time_ms", 0.0),
             row_count=result.get("row_count", 0),
             success=result["success"],
-            query_format="arrow",
-            limit=None
+            query_format="arrow"
         )
 
         if not result["success"]:
