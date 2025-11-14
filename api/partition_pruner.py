@@ -21,8 +21,17 @@ import logging
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Set
 from pathlib import Path
+import glob as glob_module
 
 logger = logging.getLogger(__name__)
+
+# Try importing statistics filter
+try:
+    from api.parquet_stats_filter import ParquetStatsFilter
+    STATS_FILTER_AVAILABLE = True
+except ImportError:
+    STATS_FILTER_AVAILABLE = False
+    logger.debug("Statistics filtering not available")
 
 
 class PartitionPruner:
@@ -33,13 +42,18 @@ class PartitionPruner:
     Example: default/cpu/2024/03/15/14/cpu_20240315_140000_1000.parquet
     """
 
-    def __init__(self):
+    def __init__(self, enable_statistics_filtering: bool = True):
         self.enabled = True
+        self.enable_statistics_filtering = enable_statistics_filtering and STATS_FILTER_AVAILABLE
+        self.stats_filter = ParquetStatsFilter() if self.enable_statistics_filtering else None
         self.stats = {
             'queries_optimized': 0,
             'files_pruned': 0,
             'files_scanned': 0
         }
+
+        if enable_statistics_filtering and not STATS_FILTER_AVAILABLE:
+            logger.warning("Statistics filtering requested but not available (missing dependencies)")
 
     def extract_time_range(self, sql: str) -> Optional[Tuple[datetime, datetime]]:
         """
@@ -210,6 +224,91 @@ class PartitionPruner:
 
         return paths
 
+    def expand_glob_patterns(self, glob_patterns: List[str]) -> List[str]:
+        """
+        Expand glob patterns to individual file paths
+
+        Args:
+            glob_patterns: List of glob patterns (e.g., ['s3://bucket/db/cpu/2024/03/15/00/*.parquet'])
+
+        Returns:
+            List of individual file paths
+        """
+        all_files = []
+
+        for pattern in glob_patterns:
+            # Handle different storage backends
+            if pattern.startswith('s3://') or pattern.startswith('gs://'):
+                # For remote storage, we'll need to use DuckDB's glob function
+                # For now, keep the glob pattern as-is and let DuckDB handle it
+                # Statistics filtering will work on a per-partition basis
+                logger.debug(f"Remote glob pattern: {pattern}")
+                all_files.append(pattern)
+            else:
+                # Local filesystem - expand glob
+                try:
+                    expanded = glob_module.glob(pattern, recursive=True)
+                    all_files.extend(expanded)
+                    logger.debug(f"Expanded {pattern} to {len(expanded)} files")
+                except Exception as e:
+                    logger.warning(f"Failed to expand glob {pattern}: {e}")
+                    all_files.append(pattern)
+
+        return all_files
+
+    def apply_statistics_filtering(
+        self,
+        partition_paths: List[str],
+        time_range: Tuple[datetime, datetime]
+    ) -> List[str]:
+        """
+        Apply statistics-based filtering to partition paths
+
+        Args:
+            partition_paths: List of partition paths (may contain globs)
+            time_range: (start_time, end_time) tuple
+
+        Returns:
+            Filtered list of file paths
+        """
+        if not self.enable_statistics_filtering or not self.stats_filter:
+            logger.debug("Statistics filtering disabled")
+            return partition_paths
+
+        # For local files, expand globs and filter
+        # For remote (S3/GCS), keep globs (DuckDB will handle enumeration)
+        has_remote = any(p.startswith(('s3://', 'gs://')) for p in partition_paths)
+
+        if has_remote:
+            # Can't easily enumerate S3/GCS files without credentials here
+            # Statistics filtering will be less effective for remote storage
+            # TODO: Consider integrating with storage backend for remote file listing
+            logger.info("Statistics filtering skipped for remote storage (not yet implemented)")
+            return partition_paths
+
+        # Expand local glob patterns to individual files
+        all_files = []
+        for pattern in partition_paths:
+            try:
+                expanded = glob_module.glob(pattern, recursive=True)
+                all_files.extend(expanded)
+            except Exception as e:
+                logger.warning(f"Failed to expand glob {pattern}: {e}")
+                # Don't add pattern on error, let it be handled gracefully
+
+        if not all_files:
+            logger.debug("No files found after expanding globs - returning empty list for graceful handling")
+            return []
+
+        # Apply statistics filtering
+        filtered_files = self.stats_filter.filter_files(all_files, time_range)
+
+        if not filtered_files:
+            logger.debug("No files match time range after statistics filtering - returning empty list")
+            return []
+
+        return filtered_files
+
     def optimize_table_path(
         self,
         original_path: str,
@@ -237,9 +336,10 @@ class PartitionPruner:
         # Parse original path to extract components
         # Format: {protocol}://{bucket}/{database}/{measurement}/**/*.parquet
         # or: {base_path}/{database}/{measurement}/**/*.parquet
+        # Match paths ending with /{database}/{measurement}/**/*.parquet
 
         path_match = re.match(
-            r'((?:s3|gs)://[^/]+|[^/]+)/([^/]+)/([^/]+)/\*\*/\*\.parquet',
+            r'(.+)/([^/]+)/([^/]+)/\*\*/\*\.parquet$',
             original_path
         )
 
@@ -251,14 +351,33 @@ class PartitionPruner:
         database = path_match.group(2)
         measurement = path_match.group(3)
 
+        logger.debug(f"Parsed path: base={base_path}, database={database}, measurement={measurement}")
+
         # Generate optimized partition paths
         partition_paths = self.generate_partition_paths(
             base_path, database, measurement, time_range
         )
 
+        # Apply statistics-based filtering if enabled
+        if self.enable_statistics_filtering:
+            filtered_paths = self.apply_statistics_filtering(partition_paths, time_range)
+            if filtered_paths:
+                partition_paths = filtered_paths
+            elif filtered_paths == []:
+                # No files found - fall back to original path for graceful empty result
+                logger.info(
+                    f"⚠️ Partition pruning: No files found for time range "
+                    f"{time_range[0]} to {time_range[1]}, using fallback"
+                )
+                return original_path, False
+
         # For DuckDB, we can use a list of paths or a combined glob
         # Using array syntax: ['path1', 'path2', ...]
-        if len(partition_paths) == 1:
+        if len(partition_paths) == 0:
+            # No files found, fall back to original for graceful empty result
+            logger.info(f"⚠️ Partition pruning: No partitions found, using fallback")
+            return original_path, False
+        elif len(partition_paths) == 1:
             optimized = partition_paths[0]
         else:
             # DuckDB supports arrays of paths
