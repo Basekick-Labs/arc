@@ -229,6 +229,7 @@ class CompactionJob:
 
             # Write compacted file with optimized settings
             # Use union_by_name=true to handle schema evolution (missing columns filled with NULL)
+            # CRITICAL: Enable WRITE_STATISTICS for partition pruning compatibility
             con.execute(f"""
                 COPY (
                     {sql_query}
@@ -236,7 +237,8 @@ class CompactionJob:
                     FORMAT PARQUET,
                     COMPRESSION ZSTD,
                     COMPRESSION_LEVEL 3,
-                    ROW_GROUP_SIZE 122880  -- ~120K rows per row group
+                    ROW_GROUP_SIZE 122880,  -- ~120K rows per row group
+                    WRITE_STATISTICS true   -- Enable statistics for partition pruning/filtering
                 )
             """)
 
