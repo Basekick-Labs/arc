@@ -21,7 +21,7 @@ Example:
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional, Tuple, Dict
 from pathlib import Path
 import re
@@ -156,7 +156,8 @@ class ParquetStatsFilter:
         if isinstance(value, int):
             try:
                 # Parquet INT64 timestamps are typically microseconds
-                return datetime.fromtimestamp(value / 1_000_000)
+                # IMPORTANT: Use UTC to match query time parsing
+                return datetime.fromtimestamp(value / 1_000_000, tz=timezone.utc).replace(tzinfo=None)
             except:
                 pass
 
