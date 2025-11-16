@@ -200,6 +200,7 @@ class PartitionPruner:
         start_time, end_time = time_range
 
         paths = []
+        days_covered = set()
         current = start_time.replace(minute=0, second=0, microsecond=0)
 
         # Generate hour-by-hour paths
@@ -209,14 +210,25 @@ class PartitionPruner:
             day = current.strftime('%d')
             hour = current.strftime('%H')
 
-            # Build path for this hour partition
+            # Track which days we're covering (for daily compacted files)
+            day_key = (year, month, day)
+            days_covered.add(day_key)
+
+            # Build path for this hour partition (hourly compacted files)
             path = f"{base_path}/{database}/{measurement}/{year}/{month}/{day}/{hour}/*.parquet"
             paths.append(path)
 
             current += timedelta(hours=1)
 
+        # Add day-level paths for daily compacted files
+        # Daily compacted files are stored at /year/month/day/*.parquet (not in hour subdirs)
+        for year, month, day in sorted(days_covered):
+            day_path = f"{base_path}/{database}/{measurement}/{year}/{month}/{day}/*.parquet"
+            paths.append(day_path)
+
         logger.info(
-            f"Partition pruning: Generated {len(paths)} hour partitions "
+            f"Partition pruning: Generated {len(paths)} paths "
+            f"({len(paths) - len(days_covered)} hourly + {len(days_covered)} daily) "
             f"for range {start_time} to {end_time}"
         )
 
