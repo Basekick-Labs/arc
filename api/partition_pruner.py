@@ -224,6 +224,34 @@ class PartitionPruner:
 
         return paths
 
+    def _filter_existing_paths(self, paths: List[str]) -> List[str]:
+        """
+        Filter out paths that don't have any matching files
+
+        This is critical for local filesystem because DuckDB read_parquet()
+        fails if ANY path in the array doesn't exist, even if other paths do.
+
+        Args:
+            paths: List of glob patterns
+
+        Returns:
+            List of paths that have at least one matching file
+        """
+        import glob as glob_module
+
+        existing_paths = []
+        for pattern in paths:
+            # Check if this glob pattern matches any files
+            matches = glob_module.glob(pattern)
+            if matches:
+                existing_paths.append(pattern)
+                logger.debug(f"Path exists: {pattern} ({len(matches)} files)")
+            else:
+                logger.debug(f"Path skipped (no files): {pattern}")
+
+        logger.info(f"Filtered {len(paths)} paths → {len(existing_paths)} existing paths")
+        return existing_paths
+
     def expand_glob_patterns(self, glob_patterns: List[str]) -> List[str]:
         """
         Expand glob patterns to individual file paths
@@ -360,6 +388,20 @@ class PartitionPruner:
         partition_paths = self.generate_partition_paths(
             base_path, database, measurement, time_range
         )
+
+        # Filter out non-existent paths for local storage
+        # DuckDB read_parquet() fails if ANY path in array doesn't exist
+        if base_path.startswith('/') or base_path.startswith('./'):
+            # Local filesystem - filter out non-existent paths
+            partition_paths = self._filter_existing_paths(partition_paths)
+
+            if len(partition_paths) == 0:
+                # No partitions exist for this time range - fall back to original for empty result
+                logger.info(
+                    f"⚠️ Partition pruning: No data exists for time range "
+                    f"{time_range[0]} to {time_range[1]}, using fallback"
+                )
+                return original_path, False
 
         # Apply statistics-based filtering if enabled
         if self.enable_statistics_filtering:
