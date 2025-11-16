@@ -43,7 +43,7 @@ class PartitionPruner:
     """
 
     def __init__(self, enable_statistics_filtering: bool = False):
-        self.enabled = True
+        self.enabled = False
         self.enable_statistics_filtering = enable_statistics_filtering and STATS_FILTER_AVAILABLE
         self.stats_filter = ParquetStatsFilter() if self.enable_statistics_filtering else None
         self.stats = {
