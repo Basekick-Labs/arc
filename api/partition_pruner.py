@@ -43,7 +43,7 @@ class PartitionPruner:
     """
 
     def __init__(self, enable_statistics_filtering: bool = True):
-        self.enabled = False  # DISABLED: Still has issues with data gaps - needs more investigation
+        self.enabled = True  # ENABLED: Testing timezone fix for data gaps
         self.enable_statistics_filtering = enable_statistics_filtering and STATS_FILTER_AVAILABLE
         self.stats_filter = ParquetStatsFilter() if self.enable_statistics_filtering else None
         self.stats = {
