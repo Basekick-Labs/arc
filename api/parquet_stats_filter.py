@@ -156,8 +156,7 @@ class ParquetStatsFilter:
         if isinstance(value, int):
             try:
                 # Parquet INT64 timestamps are typically microseconds
-                # IMPORTANT: Use UTC to match query time parsing
-                return datetime.fromtimestamp(value / 1_000_000, tz=timezone.utc).replace(tzinfo=None)
+                return datetime.fromtimestamp(value / 1_000_000)
             except:
                 pass
 
@@ -220,10 +219,10 @@ class ParquetStatsFilter:
             if file_max >= query_start and file_min <= query_end:
                 filtered_files.append(file_path)
                 self.stats['files_included'] += 1
-                logger.debug(f"Including {Path(file_path).name} (overlaps: {file_min} to {file_max})")
+                logger.info(f"✅ Including {Path(file_path).name} (file: {file_min} to {file_max}, query: {query_start} to {query_end})")
             else:
                 self.stats['files_skipped'] += 1
-                logger.debug(f"Skipping {Path(file_path).name} (no overlap: {file_min} to {file_max})")
+                logger.warning(f"❌ Skipping {Path(file_path).name} (file: {file_min} to {file_max}, query: {query_start} to {query_end})")
 
         reduction = len(file_paths) - len(filtered_files)
         if reduction > 0:

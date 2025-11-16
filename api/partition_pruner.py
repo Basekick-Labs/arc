@@ -42,7 +42,7 @@ class PartitionPruner:
     Example: default/cpu/2024/03/15/14/cpu_20240315_140000_1000.parquet
     """
 
-    def __init__(self, enable_statistics_filtering: bool = True):
+    def __init__(self, enable_statistics_filtering: bool = False):
         self.enabled = True
         self.enable_statistics_filtering = enable_statistics_filtering and STATS_FILTER_AVAILABLE
         self.stats_filter = ParquetStatsFilter() if self.enable_statistics_filtering else None
@@ -291,14 +291,17 @@ class PartitionPruner:
         for pattern in partition_paths:
             try:
                 expanded = glob_module.glob(pattern, recursive=True)
+                logger.info(f"Glob {pattern} expanded to {len(expanded)} files")
                 all_files.extend(expanded)
             except Exception as e:
                 logger.warning(f"Failed to expand glob {pattern}: {e}")
                 # Don't add pattern on error, let it be handled gracefully
 
         if not all_files:
-            logger.debug("No files found after expanding globs - returning empty list for graceful handling")
+            logger.warning(f"⚠️ No files found after expanding {len(partition_paths)} globs - returning empty list")
             return []
+
+        logger.info(f"Total files after glob expansion: {len(all_files)}")
 
         # Apply statistics filtering
         filtered_files = self.stats_filter.filter_files(all_files, time_range)
