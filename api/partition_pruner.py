@@ -42,7 +42,7 @@ class PartitionPruner:
     Example: default/cpu/2024/03/15/14/cpu_20240315_140000_1000.parquet
     """
 
-    def __init__(self, enable_statistics_filtering: bool = False):
+    def __init__(self, enable_statistics_filtering: bool = True):
         self.enabled = False  # DISABLED: Still has issues with data gaps - needs more investigation
         self.enable_statistics_filtering = enable_statistics_filtering and STATS_FILTER_AVAILABLE
         self.stats_filter = ParquetStatsFilter() if self.enable_statistics_filtering else None
