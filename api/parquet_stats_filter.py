@@ -156,7 +156,8 @@ class ParquetStatsFilter:
         if isinstance(value, int):
             try:
                 # Parquet INT64 timestamps are typically microseconds
-                return datetime.fromtimestamp(value / 1_000_000)
+                # IMPORTANT: Use UTC timezone to avoid system timezone issues
+                return datetime.fromtimestamp(value / 1_000_000, tz=timezone.utc).replace(tzinfo=None)
             except:
                 pass
 
