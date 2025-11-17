@@ -180,14 +180,9 @@ async def find_affected_files(
 
         for parquet_file in parquet_files:
             try:
-                # Read Parquet file
-                table = pq.read_table(parquet_file)
-
-                # Evaluate WHERE clause using DuckDB (most reliable)
-                matching_count = await count_matching_rows(table, where_clause, engine)
-
-                # Explicitly free table memory
-                del table
+                # Use DuckDB to count directly from Parquet file without loading into memory
+                # This is MUCH more memory efficient for large files
+                matching_count = await count_matching_rows_from_file(str(parquet_file), where_clause)
 
                 if matching_count > 0:
                     affected_files.append((parquet_file, matching_count))
@@ -279,14 +274,9 @@ async def find_affected_files(
                 else:
                     cloud_url = file_path
 
-                # Read Parquet file from cloud
-                table = pq.read_table(cloud_url)
-
-                # Evaluate WHERE clause
-                matching_count = await count_matching_rows(table, where_clause, engine)
-
-                # Explicitly free table memory
-                del table
+                # Use DuckDB to count directly from cloud file without downloading
+                # This is MUCH more memory efficient for large files
+                matching_count = await count_matching_rows_from_file(cloud_url, where_clause)
 
                 if matching_count > 0:
                     # Store cloud path as string (not Path object)
@@ -335,24 +325,73 @@ def validate_where_clause(where_clause: str) -> None:
                 detail=f"WHERE clause contains forbidden keyword: {keyword}"
             )
 
-    # Use DuckDB's parser to validate the WHERE clause syntax
-    # This ensures it's valid SQL before we use it
-    try:
-        conn = duckdb.connect(':memory:')
-        # Try to parse the WHERE clause in a safe context
-        conn.execute(f"EXPLAIN SELECT 1 WHERE {where_clause}")
-        conn.close()
-    except Exception as e:
+    # Basic syntax validation - don't use DuckDB parser since we don't have schema yet
+    # The actual WHERE clause will be validated when we execute it against real Parquet files
+    # Just ensure it doesn't contain obviously malformed SQL
+    if where_clause.count("'") % 2 != 0:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid WHERE clause syntax: {str(e)}"
+            detail="WHERE clause has unmatched quotes"
         )
+
+    if where_clause.count("(") != where_clause.count(")"):
+        raise HTTPException(
+            status_code=400,
+            detail="WHERE clause has unmatched parentheses"
+        )
+
+
+async def count_matching_rows_from_file(file_path: str, where_clause: str) -> int:
+    """
+    Count rows in Parquet file that match WHERE clause.
+    Uses DuckDB to query file directly without loading into memory - MUCH more efficient.
+
+    Args:
+        file_path: Path to Parquet file (local or S3/GCS URL)
+        where_clause: WHERE clause to filter rows
+
+    Returns:
+        Number of matching rows
+    """
+    import duckdb
+    import gc
+
+    # Validate WHERE clause to prevent SQL injection
+    validate_where_clause(where_clause)
+
+    # Create temp DuckDB connection
+    conn = duckdb.connect(':memory:')
+
+    try:
+        # Query Parquet file directly - DuckDB streams data, doesn't load it all into memory
+        query = f"SELECT COUNT(*) as count FROM read_parquet('{file_path}') WHERE {where_clause}"
+        result = conn.execute(query).fetchone()
+
+        count = result[0] if result else 0
+
+        return count
+
+    except Exception as e:
+        logger.error(f"Error counting matching rows from {file_path}: {e}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid WHERE clause or file read error: {str(e)}"
+        )
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
+        # Force garbage collection
+        gc.collect()
 
 
 async def count_matching_rows(table: pa.Table, where_clause: str, engine) -> int:
     """
     Count rows in Arrow table that match WHERE clause.
     Uses DuckDB for reliable SQL evaluation.
+
+    WARNING: This loads the entire table into memory. For large files, use count_matching_rows_from_file instead.
     """
     import duckdb
     import gc
