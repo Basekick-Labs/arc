@@ -615,8 +615,23 @@ class DuckDBEngine:
         # Store original SQL for partition pruning
         self.current_sql = sql
 
+        # Extract CTE names to avoid rewriting them
+        # Match: WITH cte_name AS (...), other_cte AS (...)
+        cte_pattern = r'\bWITH\s+(?:RECURSIVE\s+)?(\w+)\s+AS\s*\('
+        cte_names = set(re.findall(cte_pattern, sql, re.IGNORECASE))
+
+        # Also match additional CTEs after commas: ...), cte_name AS (...)
+        additional_cte_pattern = r',\s*(\w+)\s+AS\s*\('
+        cte_names.update(re.findall(additional_cte_pattern, sql, re.IGNORECASE))
+
+        if cte_names:
+            logger.debug(f"Detected CTEs in query, will not rewrite: {cte_names}")
+
         # First, handle database.table references
-        pattern_db_table = r'FROM\s+(\w+)\.(\w+)'
+        # Allow database/table names that start with digits (e.g., 3am.logs)
+        # Note: \w+ matches [a-zA-Z0-9_] but standard regex \w cannot START with digit
+        # So we explicitly use [a-zA-Z0-9_]+ which allows digit at start
+        pattern_db_table = r'FROM\s+([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)'
 
         def replace_db_table(match):
             database = match.group(1)
@@ -710,12 +725,40 @@ class DuckDBEngine:
 
         converted = re.sub(pattern_db_table, replace_db_table, sql, flags=re.IGNORECASE)
 
+        # Also handle JOIN database.table references
+        # Same pattern as FROM but with JOIN keyword
+        pattern_join_db_table = r'((?:LEFT|RIGHT|INNER|OUTER|CROSS)?\s*JOIN)\s+([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)'
+
+        def replace_join_db_table(match):
+            join_type = match.group(1)
+            database = match.group(2)
+            table = match.group(3)
+
+            # Call the same replace_db_table function but create a fake match object
+            fake_match = type('Match', (), {
+                'group': lambda _, n: database if n == 1 else (table if n == 2 else f"{database}.{table}")
+            })()
+
+            result = replace_db_table(fake_match)
+            # Replace "FROM" with the JOIN type
+            return result.replace('FROM', join_type, 1)
+
+        converted = re.sub(pattern_join_db_table, replace_join_db_table, converted, flags=re.IGNORECASE)
+
         # Second, handle simple table names (FROM table_name) using current database
-        # Only match if not already converted (no read_parquet in the match context)
-        pattern_simple = r'FROM\s+(?!read_parquet|information_schema|pg_)(\w+)(?!\s*\()'
+        # Only match table names that are NOT part of database.table (which was already handled)
+        # Match: FROM table_name WHERE ...
+        # Don't match: FROM database.table or FROM read_parquet(...)
+        # Allow table names starting with digits (e.g., 3am)
+        pattern_simple = r'\bFROM\s+(?!read_parquet|information_schema|pg_)([a-zA-Z0-9_]+)\b(?!\s*\.|\s*\()'
 
         def replace_simple_table(match):
             table = match.group(1)
+
+            # Skip CTE names - they are not physical tables
+            if table.lower() in {name.lower() for name in cte_names}:
+                logger.debug(f"Skipping CTE '{table}' from table rewriting")
+                return match.group(0)  # Return original "FROM table"
 
             # Use actual backend and its database
             backend = self.local_backend or self.minio_backend or self.s3_backend or self.ceph_backend or self.gcs_backend
@@ -789,6 +832,43 @@ class DuckDBEngine:
                     return f"FROM read_parquet('{s3_path}', union_by_name=true)"
 
         converted = re.sub(pattern_simple, replace_simple_table, converted, flags=re.IGNORECASE)
+
+        # Also handle JOIN clauses (LEFT JOIN, INNER JOIN, etc.)
+        # Don't match if table name is part of database.table or followed by opening paren
+        # Allow table names starting with digits
+        pattern_join = r'((?:LEFT|RIGHT|INNER|OUTER|CROSS)?\s*JOIN)\s+(?!read_parquet|information_schema|pg_)([a-zA-Z0-9_]+)\b(?!\s*\.|\s*\()'
+
+        def replace_join_table(match):
+            join_type = match.group(1)  # e.g., "LEFT JOIN"
+            table = match.group(2)
+
+            # Skip CTE names
+            if table.lower() in {name.lower() for name in cte_names}:
+                logger.debug(f"Skipping CTE '{table}' in JOIN from table rewriting")
+                return match.group(0)  # Return original "JOIN table"
+
+            # Convert to read_parquet (same logic as FROM)
+            backend = self.local_backend or self.minio_backend or self.s3_backend or self.ceph_backend or self.gcs_backend
+            if backend:
+                database = backend.database
+                if self.local_backend or self.storage_backend == 'local':
+                    base_path = self.local_backend.base_path if self.local_backend else 'arc'
+                    local_path = f"{base_path}/{database}/{table}/**/*.parquet"
+                    optimized_path, was_optimized = self.partition_pruner.optimize_table_path(
+                        local_path, self.current_sql or ''
+                    )
+                    if was_optimized:
+                        if isinstance(optimized_path, list):
+                            paths_str = "[" + ", ".join(f"'{p}'" for p in optimized_path) + "]"
+                            return f"{join_type} read_parquet({paths_str}, union_by_name=true)"
+                        else:
+                            return f"{join_type} read_parquet('{optimized_path}', union_by_name=true)"
+                    else:
+                        return f"{join_type} read_parquet('{local_path}', union_by_name=true)"
+
+            return match.group(0)
+
+        converted = re.sub(pattern_join, replace_join_table, converted, flags=re.IGNORECASE)
         return converted
     
     def _is_show_tables_query(self, sql: str) -> bool:
