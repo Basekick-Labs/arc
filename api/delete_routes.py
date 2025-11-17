@@ -21,9 +21,10 @@ import logging
 import time
 import os
 import tempfile
+import asyncio
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Union
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 import pyarrow as pa
@@ -31,6 +32,7 @@ import pyarrow.parquet as pq
 import pyarrow.compute as pc
 
 from config_loader import get_config
+from api.partition_pruner import PartitionPruner
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -45,6 +47,9 @@ def get_query_engine():
         from api.main import query_engine
         _query_engine = query_engine
     return _query_engine
+
+# Initialize partition pruner for optimizing file scans
+_partition_pruner = PartitionPruner(enable_statistics_filtering=False)  # Don't need stats for delete
 
 # Initialize config
 config = get_config()
@@ -125,6 +130,8 @@ async def find_affected_files(
     """
     Find Parquet files that contain rows matching the WHERE clause.
 
+    Uses partition pruning when time filters are present in WHERE clause.
+
     Returns list of (file_path, matching_row_count) tuples.
     """
     # Get storage backend
@@ -134,6 +141,9 @@ async def find_affected_files(
 
     affected_files = []
 
+    # Try to extract time range for partition pruning optimization
+    time_range = _partition_pruner.extract_time_range(f"SELECT * FROM table WHERE {where_clause}")
+
     # For local storage
     if hasattr(storage, 'base_path'):
         base_path = Path(storage.base_path) / database / measurement
@@ -142,9 +152,31 @@ async def find_affected_files(
             logger.warning(f"No data directory found for {database}/{measurement}")
             return []
 
-        # Find all Parquet files
-        parquet_files = list(base_path.rglob("*.parquet"))
-        logger.info(f"Scanning {len(parquet_files)} parquet files in {base_path}")
+        # Use partition pruning if time range found
+        if time_range:
+            logger.info(f"Partition pruning: Using time range {time_range[0]} to {time_range[1]}")
+            partition_paths = _partition_pruner.generate_partition_paths(
+                str(base_path),
+                "",  # Already in measurement path
+                "",
+                time_range
+            )
+
+            # Expand glob patterns to individual files
+            parquet_files = []
+            import glob as glob_module
+            for pattern in partition_paths:
+                # Adjust pattern since base_path already includes database/measurement
+                adjusted_pattern = pattern.replace(f"{base_path}///", str(base_path) + "/")
+                adjusted_pattern = adjusted_pattern.replace(f"{base_path}//", str(base_path) + "/")
+                files = glob_module.glob(adjusted_pattern)
+                parquet_files.extend([Path(f) for f in files])
+
+            logger.info(f"Partition pruning: Narrowed to {len(parquet_files)} files (from potential thousands)")
+        else:
+            # Fall back to full scan if no time filter
+            parquet_files = list(base_path.rglob("*.parquet"))
+            logger.info(f"No time filter found, scanning all {len(parquet_files)} parquet files")
 
         for parquet_file in parquet_files:
             try:
@@ -152,7 +184,6 @@ async def find_affected_files(
                 table = pq.read_table(parquet_file)
 
                 # Evaluate WHERE clause using DuckDB (most reliable)
-                # We'll use DuckDB to filter the table
                 matching_count = await count_matching_rows(table, where_clause, engine)
 
                 # Explicitly free table memory
@@ -167,11 +198,104 @@ async def find_affected_files(
                 continue
 
     else:
-        # Cloud storage
-        raise NotImplementedError(
-            "DELETE operations for cloud storage (S3/MinIO/GCS/Ceph) not yet implemented. "
-            "Currently only local storage is supported."
-        )
+        # Cloud storage (S3, MinIO, GCS, Ceph)
+        logger.info(f"Using cloud storage backend for DELETE operation")
+
+        # Build measurement path
+        measurement_path = f"{database}/{measurement}"
+
+        # Use partition pruning if time range found
+        if time_range:
+            logger.info(f"Partition pruning: Using time range {time_range[0]} to {time_range[1]}")
+            partition_paths = _partition_pruner.generate_partition_paths(
+                "",  # Cloud storage uses prefix-based paths
+                database,
+                measurement,
+                time_range
+            )
+
+            # List files matching partition patterns from cloud storage
+            parquet_files = []
+            for pattern in partition_paths:
+                # Convert local-style glob to cloud prefix pattern
+                # Example: default/cpu/2025/11/17/14/*.parquet -> default/cpu/2025/11/17/14/
+                prefix = pattern.replace("*.parquet", "").lstrip("/")
+
+                try:
+                    if hasattr(storage, 'list_files'):
+                        # Async list_files (GCS, S3)
+                        files = await storage.list_files(path=prefix, pattern="*.parquet")
+                    elif hasattr(storage, 'list_objects'):
+                        # MinIO
+                        objects = storage.client.list_objects(
+                            storage.bucket_name,
+                            prefix=prefix,
+                            recursive=False
+                        )
+                        files = [obj.object_name for obj in objects if obj.object_name.endswith('.parquet')]
+                    else:
+                        raise Exception(f"Storage backend does not support file listing")
+
+                    parquet_files.extend(files)
+                except Exception as e:
+                    logger.warning(f"Failed to list files with prefix {prefix}: {e}")
+                    continue
+
+            logger.info(f"Partition pruning: Narrowed to {len(parquet_files)} cloud files")
+        else:
+            # Fall back to listing all files in measurement
+            logger.info(f"No time filter found, listing all files in {measurement_path}")
+
+            try:
+                if hasattr(storage, 'list_files'):
+                    # Async list_files (GCS, S3)
+                    parquet_files = await storage.list_files(path=measurement_path, pattern="*.parquet")
+                elif hasattr(storage, 'list_objects'):
+                    # MinIO
+                    objects = storage.client.list_objects(
+                        storage.bucket_name,
+                        prefix=f"{measurement_path}/",
+                        recursive=True
+                    )
+                    parquet_files = [obj.object_name for obj in objects if obj.object_name.endswith('.parquet')]
+                else:
+                    raise Exception(f"Storage backend does not support file listing")
+
+                logger.info(f"Listed {len(parquet_files)} cloud parquet files")
+            except Exception as e:
+                logger.error(f"Failed to list cloud files: {e}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to list cloud storage files: {str(e)}"
+                )
+
+        # Process cloud files
+        for file_path in parquet_files:
+            try:
+                # Build full cloud path
+                if hasattr(storage, 'bucket_name'):
+                    # MinIO/S3/GCS
+                    cloud_url = f"s3://{storage.bucket_name}/{file_path}"
+                else:
+                    cloud_url = file_path
+
+                # Read Parquet file from cloud
+                table = pq.read_table(cloud_url)
+
+                # Evaluate WHERE clause
+                matching_count = await count_matching_rows(table, where_clause, engine)
+
+                # Explicitly free table memory
+                del table
+
+                if matching_count > 0:
+                    # Store cloud path as string (not Path object)
+                    affected_files.append((file_path, matching_count))
+                    logger.info(f"Cloud file {file_path} has {matching_count} matching rows")
+
+            except Exception as e:
+                logger.error(f"Error processing cloud file {file_path}: {e}")
+                continue
 
     return affected_files
 
@@ -270,12 +394,15 @@ async def count_matching_rows(table: pa.Table, where_clause: str, engine) -> int
 
 
 async def rewrite_file_without_deleted_rows(
-    file_path: Path,
+    file_path,  # Can be Path (local) or str (cloud)
     where_clause: str,
-    engine
-) -> Tuple[int, int, Path]:
+    engine,
+    storage_backend=None
+) -> Tuple[int, int, any]:
     """
     Rewrite a Parquet file, excluding rows that match the WHERE clause.
+
+    Supports both local and cloud storage.
 
     Returns (rows_before, rows_after, new_file_path).
     """
@@ -285,8 +412,21 @@ async def rewrite_file_without_deleted_rows(
     # Validate WHERE clause to prevent SQL injection
     validate_where_clause(where_clause)
 
+    is_cloud = not isinstance(file_path, Path)
+
     # Read original file
-    table = pq.read_table(file_path)
+    if is_cloud:
+        # Cloud storage - build S3/GCS URL
+        if hasattr(storage_backend, 'bucket_name'):
+            cloud_url = f"s3://{storage_backend.bucket_name}/{file_path}"
+        else:
+            cloud_url = file_path
+        table = pq.read_table(cloud_url)
+        logger.info(f"Read cloud file {file_path}")
+    else:
+        # Local storage
+        table = pq.read_table(file_path)
+
     rows_before = table.num_rows
 
     # Create temp DuckDB connection
@@ -309,33 +449,53 @@ async def rewrite_file_without_deleted_rows(
         del table  # Explicitly delete original table
         gc.collect()  # Force GC before allocating more memory for write
 
-        # Write to temporary file
-        temp_dir = file_path.parent / '.tmp'
-        temp_dir.mkdir(exist_ok=True)
+        if is_cloud:
+            # Cloud storage - write to temp local file, then upload
+            import tempfile
+            temp_local_file = tempfile.NamedTemporaryFile(delete=False, suffix='.parquet')
+            temp_file = temp_local_file.name
+            temp_local_file.close()
 
-        temp_file = temp_dir / f"{file_path.stem}_new{file_path.suffix}"
+            # Write filtered table to local temp file
+            pq.write_table(
+                result,
+                temp_file,
+                compression='snappy'
+            )
 
-        # Write filtered table to temp file
-        pq.write_table(
-            result,
-            temp_file,
-            compression='snappy'
-        )
+            logger.info(f"Wrote temp file {temp_file} for cloud upload: {rows_before} -> {rows_after} rows")
+
+        else:
+            # Local storage - write to temp directory
+            temp_dir = file_path.parent / '.tmp'
+            temp_dir.mkdir(exist_ok=True)
+
+            temp_file = temp_dir / f"{file_path.stem}_new{file_path.suffix}"
+
+            # Write filtered table to temp file
+            pq.write_table(
+                result,
+                temp_file,
+                compression='snappy'
+            )
+
+            logger.info(f"Rewrote local file {file_path.name}: {rows_before} -> {rows_after} rows")
 
         # Explicitly delete result table and force GC
         del result
         gc.collect()
-
-        logger.info(f"Rewrote {file_path.name}: {rows_before} -> {rows_after} rows")
 
         return rows_before, rows_after, temp_file
 
     except Exception as e:
         logger.error(f"Error rewriting file {file_path}: {e}")
         # Clean up temp file if created
-        if temp_file and temp_file.exists():
+        if temp_file:
             try:
-                os.unlink(temp_file)
+                if is_cloud:
+                    os.unlink(temp_file)
+                elif temp_file.exists():
+                    os.unlink(temp_file)
             except:
                 pass
         raise
@@ -455,7 +615,7 @@ async def delete_data(request: DeleteRequest, req: Request):
         # If dry_run, just return stats
         if request.dry_run:
             execution_time = (time.perf_counter() - start_time) * 1000
-            file_names = [f.name for f, _ in affected_files]
+            file_names = [f.name if isinstance(f, Path) else f for f, _ in affected_files]
 
             return DeleteResponse(
                 deleted_count=total_to_delete,
@@ -469,6 +629,10 @@ async def delete_data(request: DeleteRequest, req: Request):
         # Execute actual deletion (rewrite files)
         logger.info(f"Rewriting {len(affected_files)} files to remove {total_to_delete} rows")
 
+        # Get storage backend for cloud operations
+        storage = engine.local_backend or engine.minio_backend or engine.s3_backend or engine.gcs_backend or engine.ceph_backend
+        is_cloud_storage = not hasattr(storage, 'base_path')
+
         total_deleted = 0
         rewritten_count = 0
         processed_files = []
@@ -481,25 +645,69 @@ async def delete_data(request: DeleteRequest, req: Request):
                 rows_before, rows_after, temp_file = await rewrite_file_without_deleted_rows(
                     file_path,
                     request.where,
-                    engine
+                    engine,
+                    storage_backend=storage
                 )
 
                 deleted_in_file = rows_before - rows_after
                 total_deleted += deleted_in_file
 
-                # If no rows left, delete the entire file
-                if rows_after == 0:
-                    logger.info(f"All rows deleted from {file_path.name}, removing file")
-                    os.unlink(file_path)
-                    os.unlink(temp_file)  # Clean up empty temp file
+                # Handle file replacement based on storage type
+                if is_cloud_storage:
+                    # Cloud storage replacement
+                    if rows_after == 0:
+                        # Delete the cloud file entirely
+                        logger.info(f"All rows deleted from cloud file {file_path}, removing")
+                        if hasattr(storage, 'delete_file'):
+                            if asyncio.iscoroutinefunction(storage.delete_file):
+                                await storage.delete_file(file_path)
+                            else:
+                                storage.delete_file(file_path)
+                        # Clean up local temp file
+                        os.unlink(temp_file)
+                    else:
+                        # Upload new file to replace old one
+                        logger.info(f"Uploading rewritten file to cloud: {file_path}")
+
+                        # Read temp file and upload
+                        with open(temp_file, 'rb') as f:
+                            file_data = f.read()
+
+                        if hasattr(storage, 'upload_file'):
+                            # GCS/S3 async upload
+                            await storage.upload_file(file_path, file_data)
+                        elif hasattr(storage, 'put_object'):
+                            # MinIO upload
+                            from io import BytesIO
+                            storage.client.put_object(
+                                storage.bucket_name,
+                                file_path,
+                                BytesIO(file_data),
+                                length=len(file_data)
+                            )
+                        else:
+                            raise Exception("Cloud storage backend does not support file upload")
+
+                        # Clean up local temp file
+                        os.unlink(temp_file)
+
+                    file_display_name = file_path if isinstance(file_path, str) else file_path.name
                 else:
-                    # Atomic replace: rename temp file to original
-                    os.replace(temp_file, file_path)
+                    # Local storage replacement
+                    if rows_after == 0:
+                        logger.info(f"All rows deleted from {file_path.name}, removing file")
+                        os.unlink(file_path)
+                        os.unlink(temp_file)  # Clean up empty temp file
+                    else:
+                        # Atomic replace: rename temp file to original
+                        os.replace(temp_file, file_path)
+
+                    file_display_name = file_path.name
 
                 rewritten_count += 1
-                processed_files.append(file_path.name)
+                processed_files.append(file_display_name)
 
-                logger.info(f"Processed {file_path.name}: deleted {deleted_in_file} rows")
+                logger.info(f"Processed {file_display_name}: deleted {deleted_in_file} rows")
 
                 # Force garbage collection between files to free memory
                 # This is critical for processing many large files
