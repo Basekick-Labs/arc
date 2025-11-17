@@ -634,6 +634,9 @@ async def execute_continuous_query(
             raise HTTPException(status_code=503, detail="Query engine not initialized")
 
         # Execute aggregation query
+        # Partition pruning is automatically applied by the query engine when time filters are present
+        # The SQL query already contains start_time and end_time, which enables efficient scanning
+        logger.info(f"Executing aggregation query with partition pruning: {sql_query[:200]}...")
         result = await engine.execute_query(sql_query)
 
         if not result.get('success'):

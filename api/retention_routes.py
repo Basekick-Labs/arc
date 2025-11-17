@@ -8,6 +8,7 @@ Automatic execution is reserved for enterprise edition.
 import logging
 import time
 import sqlite3
+import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -384,11 +385,14 @@ async def _delete_old_parquet_files(
     """
     Delete Parquet files where ALL rows are older than cutoff_date.
 
+    Uses partition pruning to efficiently identify files to delete.
+
     Returns the number of rows deleted.
     """
     import os
     from pathlib import Path
     import pyarrow.parquet as pq
+    from api.partition_pruner import PartitionPruner
 
     # Get storage backend from engine
     storage = engine.local_backend or engine.minio_backend or engine.s3_backend or engine.gcs_backend or engine.ceph_backend
@@ -406,9 +410,31 @@ async def _delete_old_parquet_files(
             logger.warning(f"No data directory found for {database}/{measurement}")
             return 0
 
-        # Find all Parquet files
-        parquet_files = list(base_path.rglob("*.parquet"))
-        logger.info(f"Found {len(parquet_files)} parquet files in {base_path}")
+        # Use partition pruning to find files that might contain old data
+        # Generate paths for files BEFORE cutoff date
+        # Start from a reasonable point in the past (e.g., 10 years ago)
+        from datetime import datetime, timedelta
+        start_date = datetime(2015, 1, 1)  # Reasonable start for time-series data
+
+        pruner = PartitionPruner(enable_statistics_filtering=False)
+        partition_paths = pruner.generate_partition_paths(
+            str(base_path),
+            "",  # Database already in base_path
+            "",  # Measurement already in base_path
+            (start_date, cutoff_date)
+        )
+
+        # Expand glob patterns to individual files
+        parquet_files = []
+        import glob as glob_module
+        for pattern in partition_paths:
+            # Adjust pattern since base_path already includes database/measurement
+            adjusted_pattern = pattern.replace(f"{base_path}///", str(base_path) + "/")
+            adjusted_pattern = adjusted_pattern.replace(f"{base_path}//", str(base_path) + "/")
+            files = glob_module.glob(adjusted_pattern)
+            parquet_files.extend([Path(f) for f in files])
+
+        logger.info(f"Partition pruning: Found {len(parquet_files)} files to check (before cutoff: {cutoff_date})")
 
         files_to_delete = []
 
@@ -462,11 +488,115 @@ async def _delete_old_parquet_files(
 
     else:
         # Cloud storage (S3, MinIO, GCS, Ceph)
-        # TODO: Implement cloud storage deletion
-        raise NotImplementedError(
-            "Retention policies for cloud storage (S3/MinIO/GCS/Ceph) not yet implemented. "
-            "Currently only local storage is supported."
+        # Use partition pruning to find files that might contain old data
+        from datetime import datetime, timedelta
+        from api.partition_pruner import PartitionPruner
+
+        start_date = datetime(2015, 1, 1)  # Reasonable start for time-series data
+
+        pruner = PartitionPruner(enable_statistics_filtering=False)
+        partition_paths = pruner.generate_partition_paths(
+            "",  # Cloud storage uses prefix-based paths
+            database,
+            measurement,
+            (start_date, cutoff_date)
         )
+
+        logger.info(f"Partition pruning: Scanning {len(partition_paths)} partition paths for cloud storage")
+
+        # List files matching partition patterns from cloud storage
+        parquet_files = []
+        for pattern in partition_paths:
+            # Convert local-style glob to cloud prefix pattern
+            # Example: default/cpu/2025/11/17/14/*.parquet -> default/cpu/2025/11/17/14/
+            prefix = pattern.replace("*.parquet", "").lstrip("/")
+
+            try:
+                if hasattr(storage, 'list_files'):
+                    # Async list_files (GCS, S3)
+                    files = await storage.list_files(path=prefix, pattern="*.parquet")
+                elif hasattr(storage, 'list_objects'):
+                    # MinIO
+                    objects = storage.client.list_objects(
+                        storage.bucket_name,
+                        prefix=prefix,
+                        recursive=False
+                    )
+                    files = [obj.object_name for obj in objects if obj.object_name.endswith('.parquet')]
+                else:
+                    raise Exception(f"Storage backend does not support file listing")
+
+                parquet_files.extend(files)
+            except Exception as e:
+                logger.warning(f"Failed to list files with prefix {prefix}: {e}")
+                continue
+
+        logger.info(f"Partition pruning: Found {len(parquet_files)} cloud files to check")
+
+        # Process cloud files
+        files_to_delete = []
+
+        for file_path in parquet_files:
+            try:
+                # Build full cloud path
+                if hasattr(storage, 'bucket_name'):
+                    # MinIO/S3/GCS
+                    cloud_url = f"s3://{storage.bucket_name}/{file_path}"
+                else:
+                    cloud_url = file_path
+
+                # Read Parquet metadata
+                table = pq.read_table(cloud_url)
+
+                if 'time' not in table.column_names:
+                    logger.warning(f"Skipping {file_path} - no 'time' column")
+                    continue
+
+                # Get time column
+                time_col = table.column('time')
+
+                # Convert to datetime (Arc stores time as microseconds since epoch)
+                import pyarrow.compute as pc
+
+                # Get max time in file
+                max_time_micros = pc.max(time_col).as_py()
+
+                if max_time_micros is None:
+                    continue
+
+                # Convert microseconds to datetime
+                max_time = datetime.fromtimestamp(max_time_micros / 1_000_000)
+
+                # If ALL rows in this file are older than cutoff, mark for deletion
+                if max_time < cutoff_date:
+                    file_row_count = table.num_rows
+                    files_to_delete.append((file_path, file_row_count))
+                    logger.info(f"Marking cloud file for deletion: {file_path} (max_time: {max_time}, rows: {file_row_count})")
+
+            except Exception as e:
+                logger.error(f"Error processing cloud file {file_path}: {e}")
+                continue
+
+        # Delete marked cloud files
+        for file_path, row_count in files_to_delete:
+            try:
+                logger.info(f"Deleting cloud file {file_path}")
+                if hasattr(storage, 'delete_file'):
+                    if asyncio.iscoroutinefunction(storage.delete_file):
+                        await storage.delete_file(file_path)
+                    else:
+                        storage.delete_file(file_path)
+                elif hasattr(storage, 'remove_object'):
+                    # MinIO
+                    storage.client.remove_object(storage.bucket_name, file_path)
+                else:
+                    raise Exception("Cloud storage backend does not support file deletion")
+
+                deleted_count += row_count
+            except Exception as e:
+                logger.error(f"Failed to delete cloud file {file_path}: {e}")
+
+        logger.info(f"Deleted {len(files_to_delete)} cloud files, {deleted_count} total rows")
 
     return deleted_count
 
