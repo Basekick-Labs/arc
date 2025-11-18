@@ -4,11 +4,11 @@
 
 <h1 align="center">Arc</h1>
 
-<h3 align="center">One database for metrics, logs, traces, and events</h3>
+<h3 align="center">High-Performance Time-Series Database for Industrial IoT</h3>
 
 <p align="center">
-Query all your observability data with SQL. No more copying timestamps between Grafana dashboards.<br/>
-Built on DuckDB + Parquet. 6.57M records/sec. AGPL-3.0 open source.
+Built for billion-record sensor workloads. Racing telemetry, smart cities, mining sensors, medical devices.<br/>
+6.86M records/sec ingestion. DuckDB SQL. Portable Parquet storage. AGPL-3.0 open source.
 </p>
 
 <p align="center">
@@ -21,7 +21,7 @@ Built on DuckDB + Parquet. 6.57M records/sec. AGPL-3.0 open source.
 
 <p align="center">
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img src="https://img.shields.io/badge/License-AGPL%203.0-blue.svg" alt="License: AGPL-3.0"/></a>
-  <a href="https://github.com/basekick-labs/arc-core"><img src="https://img.shields.io/badge/Throughput-6.57M%20RPS-brightgreen.svg" alt="Performance"/></a>
+  <a href="https://github.com/basekick-labs/arc-core"><img src="https://img.shields.io/badge/Throughput-6.86M%20RPS-brightgreen.svg" alt="Performance"/></a>
   <a href="https://discord.gg/nxnWfUxsdm"><img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2?logo=discord&logoColor=white" alt="Discord"/></a>
 </p>
 
@@ -29,44 +29,43 @@ Built on DuckDB + Parquet. 6.57M records/sec. AGPL-3.0 open source.
 
 ## The Problem
 
-You're running Prometheus for metrics. Loki for logs. Tempo for traces.
+Industrial IoT generates massive data. Racing telemetry pushes 100M+ sensor readings per race. Smart cities monitor billions of infrastructure events daily. Mining operations track equipment telemetry at unprecedented scale.
 
-Three systems. Three query languages. When production breaks at 3am, you're copying timestamps between dashboards trying to figure out what happened.
+Traditional time-series databases can't keep up. They're slow, expensive, and lock your data in proprietary formats.
 
-**Arc solves this: one SQL query across all your observability data.**
+**Arc solves this: 6.86M records/sec ingestion, sub-second queries on billions of rows, portable Parquet files you own.**
+
 ```sql
--- What happened after that deployment?
-WITH deploy AS (
-  SELECT time FROM prod.events
-  WHERE event_type = 'deployment_started'
-  LIMIT 1
-)
+-- Analyze equipment anomalies across facilities
 SELECT
-  m.timestamp,
-  m.service,
-  m.cpu_usage,
-  l.error_count,
-  t.p99_latency
-FROM prod.metrics m
-JOIN prod.logs l USING (timestamp, service)
-JOIN prod.traces t USING (timestamp, service)
-CROSS JOIN deploy d
-WHERE m.timestamp BETWEEN d.time AND d.time + INTERVAL '30 minutes'
-ORDER BY m.timestamp DESC;
+  device_id,
+  facility_name,
+  AVG(temperature) OVER (
+    PARTITION BY device_id
+    ORDER BY timestamp
+    ROWS BETWEEN 10 PRECEDING AND CURRENT ROW
+  ) as temp_moving_avg,
+  MAX(pressure) as peak_pressure,
+  STDDEV(vibration) as vibration_variance
+FROM iot_sensors
+WHERE timestamp > NOW() - INTERVAL '24 hours'
+  AND facility_id IN ('mining_site_42', 'plant_7')
+GROUP BY device_id, facility_name, timestamp
+HAVING MAX(pressure) > 850 OR STDDEV(vibration) > 2.5;
 ```
 
-**Try this in Datadog. We'll wait.**
+**Standard DuckDB SQL. Window functions, CTEs, joins. No proprietary query language.**
 
 ---
 
 ## Why Arc
 
-- **One Query Language**: SQL across metrics, logs, traces, and events
-- **No Data Silos**: Join your metrics with logs, correlate traces with events
-- **6.57M Records/Sec**: Ingest all observability data types simultaneously
-- **DuckDB Powered**: Full analytical SQL with window functions and CTEs
-- **Parquet Storage**: 3-5x compression, optimized for analytical queries
-- **Open Source**: AGPL-3.0, no vendor lock-in
+- **Built for Scale**: 6.86M records/sec sustained throughput for sensor data
+- **DuckDB SQL**: Full analytical SQL with window functions, CTEs, and complex joins
+- **Portable Parquet**: 3-5x compression, query with any tool, no vendor lock-in
+- **Fast Queries**: Sub-second queries on billions of sensor readings
+- **Simple to Operate**: Docker/Kubernetes, runs at the edge or in the cloud
+- **Open Source**: AGPL-3.0, your data in standard formats you own
 
 ## Quick Start
 
@@ -119,8 +118,8 @@ See the [Helm chart values.yaml](helm/arc/values.yaml) for all configuration opt
 
 ## Features
 
-- **High-Throughput Ingestion**: One endpoint for any timestamped columnar data - metrics, logs, traces, events, IoT sensors, analytics
-- **Unified Protocol**: MessagePack columnar format (6.57M/sec unified) or InfluxDB Line Protocol (240K/sec) for compatibility
+- **High-Throughput Ingestion**: 6.86M records/sec for sensor data, racing telemetry, smart city events, mining equipment data
+- **Unified Protocol**: MessagePack columnar format (12x faster) or InfluxDB Line Protocol for compatibility
 - **Columnar Storage**: Parquet files with compression (3-5x compression ratios), optimized for analytical queries
 - **DuckDB Query Engine**: Fast SQL analytics with window functions, joins, aggregations, and time-series operations
 - **Flexible Storage**: Local filesystem, MinIO, AWS S3/R2, Google Cloud Storage, or any S3-compatible backend
@@ -137,13 +136,13 @@ See the [Helm chart values.yaml](helm/arc/values.yaml) for all configuration opt
 
 ## Performance Benchmarks
 
-Arc ingests any timestamped columnar data through a unified MessagePack protocol - metrics, logs, traces, events, IoT sensors, or analytics.
+Arc ingests sensor data, racing telemetry, smart city events, mining equipment metrics, and medical device readings through a unified MessagePack columnar protocol.
 
 ## Write Performance
 
-### Unified Ingestion - All Data Types Simultaneously
+### High-Throughput Sensor Ingestion
 
-Arc handles **6.57 million records/sec combined throughput** across all four observability data types ingesting simultaneously on a single node.
+Arc handles **6.86 million records/sec sustained throughput** for Industrial IoT workloads on a single node.
 
 **Unified Test Results** (all data types running together):
 
