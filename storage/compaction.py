@@ -358,45 +358,16 @@ class CompactionManager:
         self.total_files_compacted = 0
         self.total_bytes_saved = 0
 
-        # Per-measurement locks for storage backend database switching
+        # Lock for storage backend database switching
         # CRITICAL: Multiple concurrent jobs share the same storage_backend instance.
         # The storage backend's `database` property is modified per-job to support
-        # multi-database compaction.
+        # multi-database compaction. This lock serializes jobs to prevent race conditions
+        # where Job A's file operations might use Job B's database value.
         #
-        # OPTIMIZATION: Instead of one global lock (serializing ALL jobs), we use
-        # per-measurement locks. This allows parallel compaction of different measurements
-        # while still preventing race conditions within the same measurement.
-        #
-        # Key: (database, measurement) tuple
-        # Value: asyncio.Lock() for that specific measurement
-        #
-        # Example: cpu and memory can compact in parallel, but two cpu partitions are serialized
-        self._measurement_locks: Dict[tuple, asyncio.Lock] = {}
-        self._locks_lock = asyncio.Lock()  # Lock to protect _measurement_locks dict itself
-
-    async def _get_measurement_lock(self, database: str, measurement: str) -> asyncio.Lock:
-        """
-        Get or create a lock for a specific (database, measurement) tuple.
-
-        This allows parallel compaction of different measurements while serializing
-        jobs for the same measurement to prevent storage backend race conditions.
-
-        Args:
-            database: Database name
-            measurement: Measurement name
-
-        Returns:
-            asyncio.Lock for this specific measurement
-        """
-        lock_key = (database, measurement)
-
-        # Thread-safe lock acquisition
-        async with self._locks_lock:
-            if lock_key not in self._measurement_locks:
-                self._measurement_locks[lock_key] = asyncio.Lock()
-                logger.debug(f"Created new lock for {database}/{measurement}")
-
-            return self._measurement_locks[lock_key]
+        # NOTE: This effectively limits compaction to 1 job at a time, regardless of
+        # max_concurrent setting. This is a necessary trade-off until storage backends
+        # support database-as-parameter instead of mutable state.
+        self._storage_lock = asyncio.Lock()
 
     async def find_candidates(self) -> List[Dict[str, Any]]:
         """
@@ -529,22 +500,18 @@ class CompactionManager:
             return False
 
         try:
-            # OPTIMIZATION: Per-measurement locking for parallel compaction
-            # Multiple measurements can compact in parallel (cpu + memory simultaneously)
-            # But jobs for the same measurement are serialized (prevent database property race)
+            # CRITICAL FIX: Do NOT modify shared storage_backend.database property!
+            # Multiple concurrent jobs would race and corrupt each other's database context.
+            # Instead, we temporarily set the database ONLY for this specific job instance.
 
             # Save original database value
             original_database = getattr(self.storage_backend, 'database', None)
 
-            # Get the lock for this specific measurement
-            measurement_lock = await self._get_measurement_lock(database, measurement)
-
-            # Acquire per-measurement lock to safely modify database property
-            async with measurement_lock:
+            # Acquire lock to safely modify database property for the ENTIRE job duration
+            async with self._storage_lock:
                 # Set database for this operation
                 if hasattr(self.storage_backend, 'database'):
                     self.storage_backend.database = database
-                    logger.debug(f"Set storage backend database to '{database}' for {measurement}")
 
                 # Create and run job
                 # IMPORTANT: job.run() must complete INSIDE the lock to prevent race conditions
@@ -560,25 +527,12 @@ class CompactionManager:
 
                 self.active_jobs[job.job_id] = job
 
-                # Log concurrent compaction activity
-                active_measurements = set(
-                    (j.database, j.measurement)
-                    for j in self.active_jobs.values()
-                )
-                if len(active_measurements) > 1:
-                    logger.info(
-                        f"⚡ Parallel compaction: {len(active_measurements)} measurements "
-                        f"running concurrently: {active_measurements}"
-                    )
-
-                # Run job with database property locked for this measurement
+                # Run job with database property locked
                 success = await job.run()
 
                 # Restore original database before releasing lock
                 if hasattr(self.storage_backend, 'database'):
                     self.storage_backend.database = original_database
-                    logger.debug(f"Restored storage backend database to '{original_database}'")
-
 
             # Update metrics (outside lock)
             if success:
