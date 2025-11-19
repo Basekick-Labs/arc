@@ -440,7 +440,15 @@ class ArrowParquetBuffer:
             by_buffer_key = defaultdict(list)
             for record in records:
                 measurement = record.get('measurement', 'unknown')
-                database = record.get('_database', self.storage_backend.database)
+
+                # Extract database from correct location based on format
+                if record.get('_columnar'):
+                    # For columnar format, _database is inside columns dict (as array)
+                    database = record.get('columns', {}).get('_database', [self.storage_backend.database])[0]
+                else:
+                    # For row format, _database is at top level
+                    database = record.get('_database', self.storage_backend.database)
+
                 buffer_key = (database, measurement)
                 by_buffer_key[buffer_key].append(record)
 
@@ -475,13 +483,12 @@ class ArrowParquetBuffer:
                     del self.buffer_start_times[buffer_key]
 
         # OPTIMIZATION: Flush outside lock - allows concurrent writes during flush
-        # OPTIMIZATION: Parallel flushes - flush multiple measurements concurrently
+        # OPTIMIZATION: Fire-and-forget flush - don't block write on flush completion
+        # This prevents p999 latency spikes when large flushes happen
         if records_to_flush:
-            flush_tasks = [
-                self._flush_records(buffer_key, flush_records)
-                for buffer_key, flush_records in records_to_flush.items()
-            ]
-            await asyncio.gather(*flush_tasks, return_exceptions=True)
+            for buffer_key, flush_records in records_to_flush.items():
+                # Create background task without awaiting
+                asyncio.create_task(self._flush_records(buffer_key, flush_records))
 
     async def _periodic_flush(self):
         """Background task that periodically flushes old buffers"""
@@ -516,13 +523,11 @@ class ArrowParquetBuffer:
                             del self.buffer_start_times[buffer_key]
 
                 # OPTIMIZATION: Flush outside lock - allows concurrent writes
-                # OPTIMIZATION: Parallel flushes - flush multiple measurements concurrently
+                # OPTIMIZATION: Fire-and-forget flush - don't block periodic task on flush completion
                 if records_to_flush:
-                    flush_tasks = [
-                        self._flush_records(buffer_key, flush_records)
-                        for buffer_key, flush_records in records_to_flush.items()
-                    ]
-                    await asyncio.gather(*flush_tasks, return_exceptions=True)
+                    for buffer_key, flush_records in records_to_flush.items():
+                        # Create background task without awaiting
+                        asyncio.create_task(self._flush_records(buffer_key, flush_records))
 
             except asyncio.CancelledError:
                 break
@@ -572,6 +577,9 @@ class ArrowParquetBuffer:
                 # Merge multiple columnar batches into single columnar dict
                 columns = self._merge_columnar_records(records)
                 num_records = len(columns['time'])
+
+                # Remove _database column before writing to Parquet (metadata, not data)
+                columns.pop('_database', None)
 
                 # Get time range for filename
                 times = columns['time']

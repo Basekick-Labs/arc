@@ -198,9 +198,16 @@ async def write_msgpack(
             raise HTTPException(status_code=400, detail="No records in payload")
 
         # Inject database into records if specified via header
+        # OPTIMIZATION: For columnar format, inject as array column instead of looping
         if x_arc_database:
             for record in records:
-                record['_database'] = x_arc_database
+                if record.get('_columnar'):
+                    # Columnar format - inject as array column (avoids loop overhead)
+                    num_records = len(record['columns']['time'])
+                    record['columns']['_database'] = [x_arc_database] * num_records
+                else:
+                    # Row format - inject as scalar
+                    record['_database'] = x_arc_database
 
         # Write to Arrow buffer (Direct Arrow/Parquet, no DataFrame)
         if arrow_buffer is None:
@@ -216,16 +223,17 @@ async def write_msgpack(
             f"(compressed: {content_encoding == 'gzip'})"
         )
 
-        # MEMORY LEAK FIX: Explicit cleanup for large payloads
-        # After records are written to buffer, free the decoded records from memory
-        # This is especially important for large compressed payloads that decompress to >>100MB
+        # OPTIMIZATION: Trust Python's automatic GC instead of forcing it
+        # Explicit gc.collect() is expensive and can cause 10-50ms pauses
+        # Python's generational GC will clean up automatically when needed
+        # Only force GC for extremely large batches (>100K records)
         num_records = len(records)
-        if num_records > 1000:  # Only trigger GC for larger batches
+        if num_records > 100000:
             del records
             del payload
             import gc
             gc.collect()
-            logger.debug(f"Triggered garbage collection after {num_records:,} record batch")
+            logger.debug(f"Triggered GC for very large batch: {num_records:,} records")
 
         # Return 204 No Content (InfluxDB compatible)
         return Response(status_code=204)

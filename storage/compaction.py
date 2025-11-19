@@ -94,15 +94,28 @@ class CompactionJob:
             temp_dir.mkdir(parents=True, exist_ok=True)
 
             local_files = []
+            skipped_files = 0
             for file_key in self.files:
                 local_path = temp_dir / Path(file_key).name
-                await self._download_file(file_key, local_path)
-                local_files.append(local_path)
-                self.bytes_before += local_path.stat().st_size
+                downloaded = await self._download_file(file_key, local_path)
+                if downloaded:
+                    local_files.append(local_path)
+                    self.bytes_before += local_path.stat().st_size
+                else:
+                    skipped_files += 1
+
+            if not local_files:
+                logger.info(
+                    f"Compaction job {self.job_id}: All {len(self.files)} files already compacted, skipping"
+                )
+                self.status = "completed"
+                self.completed_at = datetime.now()
+                return True
 
             logger.info(
                 f"Downloaded {len(local_files)} files "
                 f"({self.bytes_before / 1024 / 1024:.1f} MB)"
+                + (f", skipped {skipped_files} already-compacted files" if skipped_files > 0 else "")
             )
 
             # Compact using DuckDB
@@ -153,15 +166,25 @@ class CompactionJob:
             logger.error(f"Compaction job {self.job_id} failed: {e}", exc_info=True)
             return False
 
-    async def _download_file(self, file_key: str, local_path: Path):
-        """Download file from storage backend"""
+    async def _download_file(self, file_key: str, local_path: Path) -> bool:
+        """Download file from storage backend
+
+        Returns:
+            True if file was downloaded, False if file doesn't exist (already compacted)
+        """
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None,
-            self.storage_backend.download_file,
-            file_key,
-            str(local_path)
-        )
+        try:
+            await loop.run_in_executor(
+                None,
+                self.storage_backend.download_file,
+                file_key,
+                str(local_path)
+            )
+            return True
+        except FileNotFoundError:
+            # File was already compacted by another job, skip it
+            logger.debug(f"File {file_key} not found (already compacted), skipping")
+            return False
 
     async def _compact_files(self, local_files: List[Path], temp_dir: Path) -> Path:
         """

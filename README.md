@@ -192,21 +192,22 @@ When tested separately with optimized configurations:
 
 ### Write Performance - Format Comparison
 
-| Wire Format | Throughput | p50 Latency | p95 Latency | p99 Latency | Notes |
-|-------------|------------|-------------|-------------|-------------|-------|
-| **MessagePack Columnar** | **2.91M RPS** | **1.76ms** | **13.28ms** | **29.03ms** | Zero-copy passthrough + optimized connection pooling (RECOMMENDED) |
-| **MessagePack Row** | **908K RPS** | **136.86ms** | **851.71ms** | **1542ms** | Legacy format with conversion overhead |
-| **Line Protocol** | **240K RPS** | N/A | N/A | N/A | InfluxDB compatibility mode |
+| Wire Format | Throughput | p50 Latency | p95 Latency | p99 Latency | p999 Latency | Notes |
+|-------------|------------|-------------|-------------|-------------|--------------|-------|
+| **MessagePack Columnar** | **4.21M RPS** | **2.05ms** | **9.22ms** | **14.39ms** | **43.50ms** | Zero-copy passthrough + optimized buffering (RECOMMENDED) |
+| **MessagePack Row** | **908K RPS** | **136.86ms** | **851.71ms** | **1542ms** | N/A | Legacy format with conversion overhead |
+| **Line Protocol** | **240K RPS** | N/A | N/A | N/A | N/A | InfluxDB compatibility mode |
 
 **Columnar Format Advantages:**
-- **3.2x faster throughput** vs row format (2.91M vs 908K RPS)
-- **77x lower p50 latency** (1.76ms vs 136.86ms)
-- **64x lower p95 latency** (13.28ms vs 851.71ms)
-- **53x lower p99 latency** (29.03ms vs 1542ms)
-- **Optimized connection pooling** with balanced concurrency
+- **4.6x faster throughput** vs row format (4.21M vs 908K RPS)
+- **67x lower p50 latency** (2.05ms vs 136.86ms)
+- **92x lower p95 latency** (9.22ms vs 851.71ms)
+- **107x lower p99 latency** (14.39ms vs 1542ms)
+- **Consistent tail latency** (p999: 43.50ms)
+- **Direct Arrow conversion** with zero-copy columnar passthrough
 
-*Tested on Apple M3 Max (14 cores), native deployment, 500 workers, batch_size=1000*
-*MessagePack columnar format with zero-copy Arrow passthrough + gzip compression level 1*
+*Tested on Apple M3 Max (14 cores), native deployment, 100 workers, batch_size=1000*
+*MessagePack columnar format with zero-copy Arrow passthrough*
 
 ### Log Ingestion Performance
 

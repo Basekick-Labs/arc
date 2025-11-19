@@ -194,7 +194,8 @@ async def run_load_test(
     num_hosts: int,
     workers: int = None,
     database: str = "default",
-    columnar: bool = False
+    columnar: bool = False,
+    throttle: bool = False
 ):
     """Run pre-generated MessagePack load test"""
 
@@ -271,8 +272,21 @@ async def run_load_test(
 
         # Start workers
         start_time = time.time()
+
+        # THROTTLED vs WIDE-OPEN mode
+        if throttle:
+            # THROTTLED: Divide target RPS among workers for controlled sustained load
+            worker_rps = target_rps // num_workers
+            mode_desc = f"THROTTLED (each worker: {worker_rps:,} RPS)"
+        else:
+            # WIDE-OPEN: Each worker tries full target RPS (max throughput discovery)
+            worker_rps = target_rps
+            mode_desc = f"WIDE-OPEN (each worker: {worker_rps:,} RPS - max throughput test)"
+
+        print(f"Mode: {mode_desc}\n")
+
         workers = [
-            asyncio.create_task(tester.worker(session, target_rps // num_workers, duration))
+            asyncio.create_task(tester.worker(session, worker_rps, duration))
             for _ in range(num_workers)
         ]
 
@@ -343,6 +357,7 @@ if __name__ == "__main__":
     parser.add_argument("--hosts", type=int, default=1000, help="Number of unique hosts")
     parser.add_argument("--workers", type=int, default=None, help="Number of concurrent workers (default: auto)")
     parser.add_argument("--columnar", action="store_true", help="Use columnar format (25-35%% faster, RECOMMENDED)")
+    parser.add_argument("--throttle", action="store_true", help="Divide target RPS among workers (controlled test)")
 
     args = parser.parse_args()
 
@@ -356,5 +371,6 @@ if __name__ == "__main__":
         num_hosts=args.hosts,
         workers=args.workers,
         database=args.database,
-        columnar=args.columnar
+        columnar=args.columnar,
+        throttle=args.throttle
     ))
