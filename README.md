@@ -167,7 +167,7 @@ Arc handles **6.86 million records/sec sustained throughput** for Industrial IoT
 
 The bottleneck is **CPU compute**, not memory, disk I/O, or lock contention. Arc hit the hardware ceiling with every CPU cycle doing useful work and no architectural bottlenecks.
 
-**This means Arc scales linearly with cores.** The 6.57M records/sec on 14 cores translates to ~469K records/sec per core. Doubling cores should roughly double throughput, assuming comparable CPU performance and fast storage (NVMe SSD).
+**This means Arc scales linearly with cores.** The 6.57M records/sec on 14 cores translates to ~469K records/sec per core. Doubling cores should roughly double throughput, assuming comparable CPU performance and fast storage (NVMe SSD). The downside of ingesting so much is that the latency of ingestion in p999 is around 250ms. We found in 4.21M more acceptable and stable latency numbers. See below.
 
 **Production Recommendation**: Target 50-60% CPU utilization (~3-4M combined records/sec on M3 Max) to maintain headroom for traffic spikes and operational overhead.
 
@@ -177,7 +177,7 @@ When tested separately with optimized configurations:
 
 | Data Type | Throughput | p50 Latency | p99 Latency | What it tracks |
 |-----------|------------|-------------|-------------|----------------|
-| **Metrics** | **2.91M/sec** | 1.76ms | 29ms | System state, IoT sensors, measurements |
+| **Metrics** | **4.21M/sec** | 2.05ms | 14.39ms | System state, IoT sensors, measurements |
 | **Logs** | **968K/sec** | 7.68ms | 58ms | Application events, access logs, audit trails |
 | **Events** | **981K/sec** | 3.34ms | 55ms | State changes, deployments, incidents |
 | **Traces** | **784K/sec** | 2.61ms | 64ms | Request flows, distributed tracing, spans |
