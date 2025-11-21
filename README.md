@@ -8,7 +8,7 @@
 
 <p align="center">
 Built for billion-record sensor workloads. Racing telemetry, smart cities, mining sensors, medical devices.<br/>
-6.86M records/sec ingestion. DuckDB SQL. Portable Parquet storage. AGPL-3.0 open source.
+4.21M records/sec ingestion. DuckDB SQL. Portable Parquet storage. Apache Arrow. AGPL-3.0 open source.
 </p>
 
 <p align="center">
