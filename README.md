@@ -33,7 +33,7 @@ Industrial IoT generates massive data. Racing telemetry pushes 100M+ sensor read
 
 Traditional time-series databases can't keep up. They're slow, expensive, and lock your data in proprietary formats.
 
-**Arc solves this: 6.86M records/sec ingestion, sub-second queries on billions of rows, portable Parquet files you own.**
+**Arc solves this: 4.21M records/sec ingestion, sub-second queries on billions of rows, portable Parquet files you own.**
 
 ```sql
 -- Analyze equipment anomalies across facilities
