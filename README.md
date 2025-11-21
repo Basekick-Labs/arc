@@ -60,7 +60,7 @@ HAVING MAX(pressure) > 850 OR STDDEV(vibration) > 2.5;
 
 ## Why Arc
 
-- **Built for Scale**: 6.86M records/sec sustained throughput for sensor data
+- **Built for Scale**: 4.21M records/sec sustained throughput for sensor data
 - **DuckDB SQL**: Full analytical SQL with window functions, CTEs, and complex joins
 - **Portable Parquet**: 3-5x compression, query with any tool, no vendor lock-in
 - **Fast Queries**: Sub-second queries on billions of sensor readings
