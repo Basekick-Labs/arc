@@ -145,8 +145,8 @@ class SimpleDuckDBPool:
             # CRITICAL: Always return and clean connection
             if conn is not None:
                 try:
-                    # Test if connection is still valid
-                    # If the connection is closed, this will raise an exception
+                    # Reset connection state (clears DuckDB internal caches)
+                    # Use a simple query to clear any cached results
                     result = conn.execute("SELECT 1").fetchall()
                     del result
 
@@ -158,31 +158,15 @@ class SimpleDuckDBPool:
                     if collected > 100:
                         logger.debug(f"Connection cleanup: collected {collected} objects")
 
-                    # Connection is valid, return to pool
-                    self.pool.put(conn)
-
                 except Exception as e:
-                    # Connection is invalid/closed - create a fresh one
-                    logger.warning(f"Connection invalid during cleanup ({e}), creating fresh connection")
-                    try:
-                        # Close the bad connection properly
-                        conn.close()
-                    except Exception:
-                        pass
+                    # If cleanup fails, connection may be closed - don't return it to pool
+                    logger.warning(f"Connection cleanup failed ({e}) - connection not returned to pool")
+                    conn = None  # Mark as invalid so we don't return it
 
-                    # Create and return a fresh connection to the pool
-                    fresh_conn = duckdb.connect()
-
-                    # Apply configuration if provided
-                    if self.configure_fn:
-                        try:
-                            self.configure_fn(fresh_conn)
-                        except Exception as config_error:
-                            logger.error(f"Failed to configure fresh connection: {config_error}")
-                            fresh_conn.close()
-                            raise
-
-                    self.pool.put(fresh_conn)
+                finally:
+                    # Always return connection to pool (if still valid)
+                    if conn is not None:
+                        self.pool.put(conn)
 
     def get_metrics(self) -> Dict[str, Any]:
         """
