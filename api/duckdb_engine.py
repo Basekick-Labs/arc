@@ -566,8 +566,13 @@ class DuckDBEngine:
                     logger.debug(f"Could not estimate row count: {e}")
             
             # Execute the actual query
-            result = self.conn.execute(converted_sql).fetchall()
-            columns = [desc[0] for desc in self.conn.description]
+            cursor = self.conn.execute(converted_sql)
+            result = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+
+            # CRITICAL: Close cursor to release DuckDB internal buffers
+            cursor.close()
+            del cursor
 
             # OPTIMIZATION: Convert data types for JSON serialization
             # Pre-detect timestamp columns (2-5x faster than hasattr() on every cell)
