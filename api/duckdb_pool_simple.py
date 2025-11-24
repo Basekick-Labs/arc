@@ -142,40 +142,10 @@ class SimpleDuckDBPool:
             raise
 
         finally:
-            # CRITICAL: Always return and clean connection
+            # CRITICAL: Always return connection to pool
+            # DuckDB connections are stateless - no need to test or reset
             if conn is not None:
-                try:
-                    # Reset connection state (clears DuckDB internal caches)
-                    # Use a simple query to clear any cached results
-                    result = conn.execute("SELECT 1").fetchall()
-                    del result
-
-                    # Connection is valid, return to pool
-                    self.pool.put(conn)
-
-                except Exception as e:
-                    # Connection is closed/invalid - create a fresh one
-                    logger.warning(f"Connection invalid during cleanup ({e}), creating fresh connection")
-                    try:
-                        # Close the bad connection properly
-                        conn.close()
-                    except Exception:
-                        pass
-
-                    # Create and return a fresh connection to the pool
-                    fresh_conn = duckdb.connect()
-
-                    # Apply configuration if provided
-                    if self.configure_fn:
-                        try:
-                            self.configure_fn(fresh_conn)
-                        except Exception as config_error:
-                            logger.error(f"Failed to configure fresh connection: {config_error}")
-                            fresh_conn.close()
-                            # Don't raise - just log and skip returning this connection
-                            return
-
-                    self.pool.put(fresh_conn)
+                self.pool.put(conn)
 
     def get_metrics(self) -> Dict[str, Any]:
         """
