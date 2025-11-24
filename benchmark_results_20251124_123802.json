@@ -1,0 +1,58 @@
+[
+  {
+    "test": "Sequential",
+    "total_queries": 50,
+    "successful": 38,
+    "failed": 12,
+    "duration_sec": 248.79,
+    "throughput_qps": 0.2,
+    "latency_p50_ms": 659.63,
+    "latency_p95_ms": 5679.98,
+    "latency_p99_ms": 5892.88,
+    "avg_exec_time_ms": 1737.5,
+    "memory_delta_mb": -9.56,
+    "success_rate": 76.0
+  },
+  {
+    "test": "Parallel",
+    "total_queries": 50,
+    "successful": 27,
+    "failed": 23,
+    "duration_sec": 37.02,
+    "throughput_qps": 1.35,
+    "latency_p50_ms": 736.21,
+    "latency_p95_ms": 9141.79,
+    "latency_p99_ms": 12045.39,
+    "avg_exec_time_ms": 1895.73,
+    "memory_delta_mb": 1.06,
+    "success_rate": 54.0
+  },
+  {
+    "test": "Parallel",
+    "total_queries": 50,
+    "successful": 34,
+    "failed": 16,
+    "duration_sec": 35.43,
+    "throughput_qps": 1.41,
+    "latency_p50_ms": 969.08,
+    "latency_p95_ms": 5873.35,
+    "latency_p99_ms": 6170.52,
+    "avg_exec_time_ms": 1900.67,
+    "memory_delta_mb": -4.62,
+    "success_rate": 68.0
+  },
+  {
+    "test": "Burst",
+    "total_queries": 45,
+    "successful": 32,
+    "failed": 13,
+    "duration_sec": 48.34,
+    "throughput_qps": 0.93,
+    "latency_p50_ms": 807.12,
+    "latency_p95_ms": 6686.08,
+    "latency_p99_ms": 6708.44,
+    "avg_exec_time_ms": 2260.45,
+    "memory_delta_mb": -1.56,
+    "success_rate": 71.1
+  }
+]

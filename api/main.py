@@ -25,6 +25,7 @@ import asyncio
 from datetime import datetime
 import logging
 import os
+import time
 import base64
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -1251,16 +1252,31 @@ async def execute_sql(request: Request, query: QueryRequest):
             error=warning_message  # Use error field for educational warnings
         )
 
-        # CRITICAL MEMORY FIX: Aggressively free memory after large queries
-        # DuckDB and Python both hold onto memory - force release
-        if not (query_cache and cached):
-            del result
-            # LOWERED THRESHOLD: Trigger GC for queries >5000 rows (was 10000)
-            # DuckDB memory doesn't release without explicit GC
-            if row_count > 5000:
-                import gc
+        # CRITICAL MEMORY FIX: Aggressively free memory after ALL queries
+        # Small queries accumulate over time causing memory leaks in long-running services
+        del result  # Always delete result dict to free references
+
+        import gc
+        # Trigger GC based on query size OR periodically for small queries
+        if row_count > 1000:
+            # Large queries: immediate GC to release DuckDB memory
+            gc.collect()
+            logger.debug(f"Garbage collection after {row_count:,} row query")
+        elif not hasattr(app.state, '_query_counter'):
+            # Initialize query counter on first query
+            app.state._query_counter = 0
+            app.state._last_gc_time = time.time()
+        else:
+            # Small queries: GC every 100 queries OR every 60 seconds
+            app.state._query_counter += 1
+            current_time = time.time()
+            time_since_gc = current_time - app.state._last_gc_time
+
+            if app.state._query_counter >= 100 or time_since_gc >= 60:
                 gc.collect()
-                logger.info(f"Forced garbage collection after {row_count:,} row query to release DuckDB memory")
+                logger.debug(f"Periodic garbage collection: {app.state._query_counter} queries, {time_since_gc:.1f}s since last GC")
+                app.state._query_counter = 0
+                app.state._last_gc_time = current_time
 
         return response_data
 
@@ -1308,15 +1324,40 @@ async def execute_sql_arrow(request: Request, query: QueryRequest):
             error_msg = result.get("error", "Unknown error")
             raise HTTPException(status_code=400, detail=error_msg)
 
+        # Extract response before cleanup
+        arrow_bytes = result["arrow_table"]
+        row_count = result.get("row_count", 0)
+        exec_time = result.get("execution_time_ms", 0)
+        wait_time = result.get("wait_time_ms", 0)
+
+        # CRITICAL MEMORY FIX: Free Arrow result memory
+        del result
+        import gc
+        if row_count > 1000:
+            gc.collect()
+            logger.debug(f"Garbage collection after {row_count:,} row Arrow query")
+        elif not hasattr(app.state, '_arrow_query_counter'):
+            app.state._arrow_query_counter = 0
+            app.state._last_arrow_gc_time = time.time()
+        else:
+            app.state._arrow_query_counter += 1
+            current_time = time.time()
+            time_since_gc = current_time - app.state._last_arrow_gc_time
+            if app.state._arrow_query_counter >= 100 or time_since_gc >= 60:
+                gc.collect()
+                logger.debug(f"Periodic GC (Arrow): {app.state._arrow_query_counter} queries, {time_since_gc:.1f}s")
+                app.state._arrow_query_counter = 0
+                app.state._last_arrow_gc_time = current_time
+
         # Return Arrow IPC stream as binary response
         # Note: Schema is embedded in the Arrow IPC stream, no need to send separately
         return Response(
-            content=result["arrow_table"],
+            content=arrow_bytes,
             media_type="application/vnd.apache.arrow.stream",
             headers={
-                "X-Row-Count": str(result.get("row_count", 0)),
-                "X-Execution-Time-Ms": str(result.get("execution_time_ms", 0)),
-                "X-Wait-Time-Ms": str(result.get("wait_time_ms", 0))
+                "X-Row-Count": str(row_count),
+                "X-Execution-Time-Ms": str(exec_time),
+                "X-Wait-Time-Ms": str(wait_time)
             }
         )
 

@@ -4,7 +4,7 @@ from typing import Dict, List, Any, Optional
 import time
 import os
 import multiprocessing
-from api.duckdb_pool import DuckDBConnectionPool, QueryPriority
+from api.duckdb_pool_simple import SimpleDuckDBPool
 from api.partition_pruner import PartitionPruner
 
 logger = logging.getLogger(__name__)
@@ -53,19 +53,15 @@ class DuckDBEngine:
             elif gcs_backend:
                 self._configure_gcs_sync()
 
-            # Initialize connection pool
+            # Initialize simplified connection pool (with aggressive memory cleanup)
             pool_size = int(os.getenv('DUCKDB_POOL_SIZE', '5'))
-            max_queue_size = int(os.getenv('DUCKDB_MAX_QUEUE_SIZE', '100'))
 
-            self.connection_pool = DuckDBConnectionPool(
+            self.connection_pool = SimpleDuckDBPool(
                 pool_size=pool_size,
-                max_queue_size=max_queue_size,
-                health_check_interval=60,
                 configure_fn=self._configure_connection
             )
-            self.connection_pool.start_health_checks()
 
-            logger.debug(f"DuckDB engine initialized with connection pool (size={pool_size}, max_queue={max_queue_size})")
+            logger.info(f"DuckDB engine initialized with simplified connection pool (size={pool_size})")
 
         except ImportError:
             logger.error("DuckDB not installed. Run: pip install duckdb")
@@ -339,13 +335,12 @@ class DuckDBEngine:
         except Exception as e:
             logger.error(f"Sync GCS configuration failed: {e}")
     
-    async def execute_query(self, sql: str, limit: int = None, priority: QueryPriority = QueryPriority.NORMAL) -> Dict[str, Any]:
-        """Execute SQL query using DuckDB connection pool
+    async def execute_query(self, sql: str, limit: int = None) -> Dict[str, Any]:
+        """Execute SQL query using simplified DuckDB connection pool
 
         Args:
             sql: SQL query to execute
             limit: Row limit (deprecated, use LIMIT in SQL)
-            priority: Query priority (LOW, NORMAL, HIGH, CRITICAL)
 
         Returns:
             Dict with success, data, columns, row_count, execution_time_ms, wait_time_ms
@@ -365,21 +360,52 @@ class DuckDBEngine:
         # Convert SQL for S3 paths (only for regular queries)
         converted_sql = self._convert_sql_to_s3_paths(sql)
 
-        # Use connection pool for query execution
-        result = await self.connection_pool.execute_async(
-            converted_sql,
-            priority=priority,
-            timeout=300.0
-        )
+        # Use simplified connection pool (with automatic cleanup)
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, self._execute_with_pool, converted_sql)
 
         return result
 
-    async def execute_query_arrow(self, sql: str, priority: QueryPriority = QueryPriority.NORMAL) -> Dict[str, Any]:
+    def _execute_with_pool(self, sql: str) -> Dict[str, Any]:
+        """Execute query using connection pool (sync wrapper for async)"""
+        start_time = time.time()
+        try:
+            with self.connection_pool.get_connection(timeout=5.0) as conn:
+                # Execute query
+                query_start = time.time()
+                rows = conn.execute(sql).fetchall()
+                columns = [desc[0] for desc in conn.description] if conn.description else []
+                query_time = time.time() - query_start
+
+                total_time = time.time() - start_time
+
+                return {
+                    "success": True,
+                    "data": [list(row) for row in rows],
+                    "columns": columns,
+                    "row_count": len(rows),
+                    "execution_time_ms": round(query_time * 1000, 2),
+                    "wait_time_ms": round((total_time - query_time) * 1000, 2)
+                }
+        except TimeoutError as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "execution_time_ms": round((time.time() - start_time) * 1000, 2)
+            }
+        except Exception as e:
+            logger.error(f"Query execution failed: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "execution_time_ms": round((time.time() - start_time) * 1000, 2)
+            }
+
+    async def execute_query_arrow(self, sql: str) -> Dict[str, Any]:
         """Execute SQL query and return Apache Arrow table (columnar format)
 
         Args:
             sql: SQL query to execute
-            priority: Query priority (LOW, NORMAL, HIGH, CRITICAL)
 
         Returns:
             Dict with success, arrow_table (bytes), schema, row_count, execution_time_ms, wait_time_ms
@@ -399,14 +425,52 @@ class DuckDBEngine:
         # Convert SQL for S3 paths (only for regular queries)
         converted_sql = self._convert_sql_to_s3_paths(sql)
 
-        # Use connection pool for Arrow query execution
-        result = await self.connection_pool.execute_arrow_async(
-            converted_sql,
-            priority=priority,
-            timeout=300.0
-        )
+        # Use simplified connection pool (with automatic cleanup)
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, self._execute_arrow_with_pool, converted_sql)
 
         return result
+
+    def _execute_arrow_with_pool(self, sql: str) -> Dict[str, Any]:
+        """Execute Arrow query using connection pool (sync wrapper for async)"""
+        import pyarrow as pa
+        start_time = time.time()
+        try:
+            with self.connection_pool.get_connection(timeout=5.0) as conn:
+                # Execute query and get Arrow table
+                query_start = time.time()
+                arrow_table = conn.execute(sql).fetch_arrow_table()
+                query_time = time.time() - query_start
+
+                # Serialize to IPC format
+                sink = pa.BufferOutputStream()
+                writer = pa.ipc.new_stream(sink, arrow_table.schema)
+                writer.write_table(arrow_table)
+                writer.close()
+                arrow_bytes = sink.getvalue().to_pybytes()
+
+                total_time = time.time() - start_time
+
+                return {
+                    "success": True,
+                    "arrow_table": arrow_bytes,
+                    "row_count": len(arrow_table),
+                    "execution_time_ms": round(query_time * 1000, 2),
+                    "wait_time_ms": round((total_time - query_time) * 1000, 2)
+                }
+        except TimeoutError as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "execution_time_ms": round((time.time() - start_time) * 1000, 2)
+            }
+        except Exception as e:
+            logger.error(f"Arrow query execution failed: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "execution_time_ms": round((time.time() - start_time) * 1000, 2)
+            }
 
     async def _execute_show_tables_legacy(self, sql: str) -> Dict[str, Any]:
         """Legacy handler for SHOW TABLES using old connection"""
@@ -1642,15 +1706,15 @@ class DuckDBEngine:
             }
         return {}
 
-    def get_connection_stats(self) -> List[Dict[str, Any]]:
-        """Get per-connection statistics"""
+    def get_connection_stats(self) -> Dict[str, Any]:
+        """Get connection pool metrics"""
         if hasattr(self, 'connection_pool'):
-            return self.connection_pool.get_connection_stats()
-        return []
+            return self.connection_pool.get_metrics()
+        return {}
 
     def close(self):
         """Cleanup"""
         if hasattr(self, 'connection_pool'):
-            self.connection_pool.close()
+            self.connection_pool.close_all()
         if hasattr(self, 'conn'):
             self.conn.close()

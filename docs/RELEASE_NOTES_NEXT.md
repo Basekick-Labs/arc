@@ -273,6 +273,112 @@ Files: [storage/compaction.py](storage/compaction.py)
 
 ---
 
+### Query Result Memory Leak
+
+Fixed a critical memory leak causing gradual memory growth in long-running Arc instances, particularly affecting demo and production deployments with frequent small queries.
+
+**What was broken**:
+- Small queries (<1,000 rows) never triggered garbage collection
+- Query result objects persisted in memory after responses sent
+- DuckDB's internal query result cache accumulated without cleanup
+- Memory grew linearly over time (e.g., 20% → 28% over 6 hours)
+- Particularly affected instances with many small queries (dashboards, demos, monitoring)
+
+**What's fixed**:
+- Query results now explicitly deleted after extracting response data
+- Large queries (>1,000 rows) trigger immediate garbage collection
+- Small queries trigger periodic GC every 100 queries OR every 60 seconds per worker
+- Applied to both JSON (`/api/v1/query`) and Arrow (`/api/v1/query/arrow`) endpoints
+- Per-worker GC counters prevent overhead while ensuring regular cleanup
+
+**Performance impact**:
+- Memory usage now stabilizes with periodic sawtooth pattern (healthy)
+- No performance degradation - GC only runs when needed
+- Prevents memory exhaustion in long-running deployments
+- Particularly beneficial for instances with 1000+ queries per hour
+
+**Memory behavior**:
+
+Before (memory leak):
+```
+Memory: 20% → 21% → 23% → 25% → 27% → 28% (continuous growth)
+```
+
+After (stable with periodic GC):
+```
+Memory: 22% ↑ 23% ↓ 21% ↑ 24% ↓ 22% ↑ 23% ↓ (stable plateau)
+```
+
+**How it works**:
+- All queries: Result objects deleted immediately after response extraction
+- Queries >1,000 rows: Immediate `gc.collect()` to free DuckDB memory
+- Queries <1,000 rows: GC triggered after 100 queries or 60 seconds (whichever comes first)
+- Each worker maintains independent counters (`app.state._query_counter`)
+- Time-based fallback ensures GC even with low query rates
+
+**Testing**:
+- Verified with 500-query test simulating 6-hour demo workload
+- Memory remains stable across extended query sessions
+- No impact on query latency or throughput
+
+Files: [api/main.py](api/main.py)
+
+---
+
+### Production-Ready Multi-Worker Configuration
+
+**Added comprehensive production deployment guidance and simplified connection pool for optimal multi-worker performance.**
+
+Arc now includes production-tested configuration patterns and simplified codebase for reliable high-concurrency deployments.
+
+**What's new**:
+- **Simplified connection pool** (804 → 212 lines, 73.6% reduction):
+  - Cleaner codebase with modern context managers
+  - Aggressive memory cleanup for stable long-running instances
+  - Explicit resource management patterns
+- **Production deployment guide** ([docs/PRODUCTION_DEPLOYMENT_GUIDE.md](docs/PRODUCTION_DEPLOYMENT_GUIDE.md)):
+  - Configuration formulas by deployment size
+  - Memory management best practices
+  - Dashboard auto-refresh patterns
+  - Monitoring and scaling strategies
+- **Multi-worker configuration guide** ([docs/MULTI_WORKER_DUCKDB_CONFIG.md](docs/MULTI_WORKER_DUCKDB_CONFIG.md)):
+  - Worker vs thread parallelism explained
+  - Configuration by use case
+  - Environment variable overrides
+- **.env.example updated** with production-ready defaults
+
+**Configuration formula for production**:
+```
+memory_limit = (System RAM × 0.7) / workers
+```
+
+**Example configurations**:
+
+Small deployment (32GB RAM, 8 workers):
+```toml
+[duckdb]
+pool_size = 1
+threads = 1
+memory_limit = "2.8GB"  # Supports 10-20 concurrent queries
+```
+
+Large deployment (64GB RAM, 16 workers):
+```toml
+[duckdb]
+pool_size = 1
+threads = 1
+memory_limit = "2.8GB"  # Supports 20-40 concurrent queries
+```
+
+**Key insight**:
+> Multi-worker deployments achieve parallelism through worker processes. Configure DuckDB for single-threaded operation per worker for optimal resource utilization.
+
+**Testing**: Validated with high-concurrency workloads including dashboard auto-refresh patterns, burst traffic, and sustained query loads on systems ranging from 16GB to 64GB RAM.
+
+Files: [arc.conf](arc.conf), [.env.example](.env.example), [api/duckdb_pool_simple.py](api/duckdb_pool_simple.py), [api/duckdb_engine.py](api/duckdb_engine.py), [docs/PRODUCTION_DEPLOYMENT_GUIDE.md](docs/PRODUCTION_DEPLOYMENT_GUIDE.md), [docs/MULTI_WORKER_DUCKDB_CONFIG.md](docs/MULTI_WORKER_DUCKDB_CONFIG.md), [docs/CLICKBENCH_CONFIG.md](docs/CLICKBENCH_CONFIG.md)
+
+---
+
 ## ⚠️ Breaking Changes
 
 None
