@@ -150,23 +150,32 @@ class SimpleDuckDBPool:
                     result = conn.execute("SELECT 1").fetchall()
                     del result
 
-                    # Force aggressive garbage collection to release memory
-                    # This is critical for preventing memory leaks from DuckDB result sets
-                    collected = gc.collect()
-
-                    # Log GC only for significant collections (reduces log noise)
-                    if collected > 100:
-                        logger.debug(f"Connection cleanup: collected {collected} objects")
+                    # Connection is valid, return to pool
+                    self.pool.put(conn)
 
                 except Exception as e:
-                    # If cleanup fails, connection may be closed - don't return it to pool
-                    logger.warning(f"Connection cleanup failed ({e}) - connection not returned to pool")
-                    conn = None  # Mark as invalid so we don't return it
+                    # Connection is closed/invalid - create a fresh one
+                    logger.warning(f"Connection invalid during cleanup ({e}), creating fresh connection")
+                    try:
+                        # Close the bad connection properly
+                        conn.close()
+                    except Exception:
+                        pass
 
-                finally:
-                    # Always return connection to pool (if still valid)
-                    if conn is not None:
-                        self.pool.put(conn)
+                    # Create and return a fresh connection to the pool
+                    fresh_conn = duckdb.connect()
+
+                    # Apply configuration if provided
+                    if self.configure_fn:
+                        try:
+                            self.configure_fn(fresh_conn)
+                        except Exception as config_error:
+                            logger.error(f"Failed to configure fresh connection: {config_error}")
+                            fresh_conn.close()
+                            # Don't raise - just log and skip returning this connection
+                            return
+
+                    self.pool.put(fresh_conn)
 
     def get_metrics(self) -> Dict[str, Any]:
         """
