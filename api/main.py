@@ -74,12 +74,25 @@ setup_logging(
 
 logger = get_logger(__name__)
 
+# Load version from VERSION file
+def get_version() -> str:
+    """Load Arc version from VERSION file"""
+    version_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "VERSION")
+    try:
+        with open(version_file, "r") as f:
+            return f.read().strip()
+    except Exception as e:
+        logger.warning(f"Could not read VERSION file: {e}, defaulting to 'dev'")
+        return "dev"
+
+ARC_VERSION = get_version()
+
 # Initialize rate limiter
 limiter = Limiter(key_func=get_remote_address, default_limits=["100/minute"])
 
 app = FastAPI(
     title="Arc Query API",
-    version="1.0.0",
+    version=ARC_VERSION,
     description="A comprehensive data pipeline solution for time-series data management",
     default_response_class=ORJSONResponse,  # 20-50% faster JSON serialization (Rust + SIMD)
     responses={
@@ -818,7 +831,7 @@ async def health_check():
     return HealthResponse(
         status="healthy",
         service="Arc by Basekick Labs",
-        version="1.0.0",
+        version=ARC_VERSION,
         timestamp=datetime.now()
     )
 
