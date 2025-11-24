@@ -145,8 +145,8 @@ class SimpleDuckDBPool:
             # CRITICAL: Always return and clean connection
             if conn is not None:
                 try:
-                    # Reset connection state (clears DuckDB internal caches)
-                    # Use a simple query to clear any cached results
+                    # Test if connection is still valid
+                    # If the connection is closed, this will raise an exception
                     result = conn.execute("SELECT 1").fetchall()
                     del result
 
@@ -158,13 +158,21 @@ class SimpleDuckDBPool:
                     if collected > 100:
                         logger.debug(f"Connection cleanup: collected {collected} objects")
 
-                except Exception as e:
-                    # If cleanup fails, log but don't crash
-                    logger.debug(f"Connection cleanup warning: {e}")
-
-                finally:
-                    # Always return connection to pool
+                    # Connection is valid, return to pool
                     self.pool.put(conn)
+
+                except Exception as e:
+                    # Connection is invalid/closed - create a fresh one
+                    logger.warning(f"Connection invalid during cleanup ({e}), creating fresh connection")
+                    try:
+                        # Close the bad connection properly
+                        conn.close()
+                    except Exception:
+                        pass
+
+                    # Create and return a fresh connection to the pool
+                    fresh_conn = duckdb.connect(self.db_path)
+                    self.pool.put(fresh_conn)
 
     def get_metrics(self) -> Dict[str, Any]:
         """
