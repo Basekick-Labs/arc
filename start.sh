@@ -372,15 +372,20 @@ case "$MODE" in
             CORES=4
         fi
 
-        # For I/O-bound workloads, use more workers than cores
-        # 3x cores provides optimal throughput without context switching overhead
-        WORKERS=$((CORES * 3))
+        # Worker count formula based on workload type:
+        # - Default: CORES * 3 (optimized for high-throughput ingestion, 4M+ RPS)
+        # - Query-heavy (analytics): CORES * 1 (CPU-bound, DuckDB computation)
+        # - Memory-constrained: CORES * 2 (lower memory footprint)
+        # Override with: export ARC_WORKER_MULTIPLIER=2 before running start.sh
+
+        WORKER_MULTIPLIER=${ARC_WORKER_MULTIPLIER:-3}
+        WORKERS=$((CORES * WORKER_MULTIPLIER))
 
         # Export WORKERS before sourcing .env so it won't be overridden
         export WORKERS
 
         echo -e "${GREEN}✓ Detected $CORES CPU cores${NC}"
-        echo -e "${GREEN}✓ Using $WORKERS workers (3x cores for I/O optimization)${NC}"
+        echo -e "${GREEN}✓ Using $WORKERS workers (${WORKER_MULTIPLIER}x cores for workload optimization)${NC}"
 
         # Start Arc Core
         echo ""

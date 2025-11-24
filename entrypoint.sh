@@ -54,6 +54,8 @@ case "$1" in
             --log-level $LOG_LEVEL \
             --access-logfile - \
             --error-logfile - \
+            --max-requests 1000 \
+            --max-requests-jitter 100 \
             api.main:app
         ;;
 

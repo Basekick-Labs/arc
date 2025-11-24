@@ -537,6 +537,10 @@ class DuckDBConnectionPool:
         # The result object may hold references to large data structures
         del result
 
+        # AGGRESSIVE GC: Force immediate garbage collection to release memory
+        import gc
+        gc.collect()
+
         logger.info(f"Query executed: {row_count} rows in {exec_time:.3f}s (wait: {wait_time:.3f}s)")
 
         return {
