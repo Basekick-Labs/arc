@@ -377,13 +377,20 @@ class DuckDBEngine:
                 columns = [desc[0] for desc in conn.description] if conn.description else []
                 query_time = time.time() - query_start
 
+                # Convert rows to list immediately
+                data = [list(row) for row in rows]
+                row_count = len(data)
+
+                # CRITICAL: Delete rows reference immediately to free DuckDB result memory
+                del rows
+
                 total_time = time.time() - start_time
 
                 return {
                     "success": True,
-                    "data": [list(row) for row in rows],
+                    "data": data,
                     "columns": columns,
-                    "row_count": len(rows),
+                    "row_count": row_count,
                     "execution_time_ms": round(query_time * 1000, 2),
                     "wait_time_ms": round((total_time - query_time) * 1000, 2)
                 }

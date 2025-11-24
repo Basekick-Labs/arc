@@ -1254,42 +1254,58 @@ async def execute_sql(request: Request, query: QueryRequest):
         elif row_count > 10000:
             warning_message = f"Moderate result: {row_count:,} rows returned. Consider using 'LIMIT' if you don't need all rows."
 
-        # Extract data for response before potential cleanup
+        # Build response object
         response_data = QueryResponse(
             success=True,
             columns=result.get("columns", []),
             data=result.get("data", []),
-            row_count=result.get("row_count", 0),
+            row_count=row_count,
             execution_time_ms=result.get("execution_time_ms", 0.0),
             timestamp=datetime.now(),
-            error=warning_message  # Use error field for educational warnings
+            error=warning_message
         )
 
-        # CRITICAL MEMORY FIX: Aggressively free memory after ALL queries
-        # Small queries accumulate over time causing memory leaks in long-running services
-        del result  # Always delete result dict to free references
+        # CRITICAL MEMORY FIX: Aggressively free memory BEFORE returning
+        # Delete result dict immediately - the data is now owned by response_data
+        del result
 
+        # Trigger aggressive garbage collection based on query size
         import gc
-        # Trigger GC based on query size OR periodically for small queries
-        if row_count > 1000:
-            # Large queries: immediate GC to release DuckDB memory
-            gc.collect()
-            logger.debug(f"Garbage collection after {row_count:,} row query")
-        elif not hasattr(app.state, '_query_counter'):
-            # Initialize query counter on first query
+
+        # Track GC invocations for monitoring
+        if not hasattr(app.state, '_query_counter'):
             app.state._query_counter = 0
             app.state._last_gc_time = time.time()
+
+        # Determine if we should run GC now
+        should_gc = False
+        gc_reason = ""
+
+        if row_count > 1000:
+            # Large queries: ALWAYS run immediate GC
+            should_gc = True
+            gc_reason = f"large query ({row_count:,} rows)"
         else:
-            # Small queries: GC every 100 queries OR every 60 seconds
+            # Small queries: GC every 50 queries OR every 30 seconds
             app.state._query_counter += 1
             current_time = time.time()
             time_since_gc = current_time - app.state._last_gc_time
 
-            if app.state._query_counter >= 100 or time_since_gc >= 60:
-                gc.collect()
-                logger.debug(f"Periodic garbage collection: {app.state._query_counter} queries, {time_since_gc:.1f}s since last GC")
+            if app.state._query_counter >= 50:
+                should_gc = True
+                gc_reason = f"periodic (50 queries)"
                 app.state._query_counter = 0
                 app.state._last_gc_time = current_time
+            elif time_since_gc >= 30:
+                should_gc = True
+                gc_reason = f"periodic ({time_since_gc:.1f}s elapsed)"
+                app.state._query_counter = 0
+                app.state._last_gc_time = current_time
+
+        if should_gc:
+            # Run full GC cycle to reclaim memory
+            collected = gc.collect()
+            logger.info(f"Garbage collection: {gc_reason}, collected {collected} objects")
 
         return response_data
 

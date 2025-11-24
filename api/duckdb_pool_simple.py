@@ -146,11 +146,17 @@ class SimpleDuckDBPool:
             if conn is not None:
                 try:
                     # Reset connection state (clears DuckDB internal caches)
-                    conn.execute("SELECT NULL").fetchall()
+                    # Use a simple query to clear any cached results
+                    result = conn.execute("SELECT 1").fetchall()
+                    del result
 
-                    # Force garbage collection to release memory
-                    # This is critical for preventing memory leaks
-                    gc.collect()
+                    # Force aggressive garbage collection to release memory
+                    # This is critical for preventing memory leaks from DuckDB result sets
+                    collected = gc.collect()
+
+                    # Log GC only for significant collections (reduces log noise)
+                    if collected > 100:
+                        logger.debug(f"Connection cleanup: collected {collected} objects")
 
                 except Exception as e:
                     # If cleanup fails, log but don't crash
