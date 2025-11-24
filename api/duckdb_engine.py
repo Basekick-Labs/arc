@@ -373,16 +373,21 @@ class DuckDBEngine:
             with self.connection_pool.get_connection(timeout=5.0) as conn:
                 # Execute query
                 query_start = time.time()
-                rows = conn.execute(sql).fetchall()
-                columns = [desc[0] for desc in conn.description] if conn.description else []
+
+                # CRITICAL: Keep reference to cursor to close it properly
+                cursor = conn.execute(sql)
+                rows = cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description] if cursor.description else []
                 query_time = time.time() - query_start
 
                 # Convert rows to list immediately
                 data = [list(row) for row in rows]
                 row_count = len(data)
 
-                # CRITICAL: Delete rows reference immediately to free DuckDB result memory
+                # CRITICAL: Delete ALL references to free DuckDB memory
                 del rows
+                cursor.close()  # Close cursor to release DuckDB internal buffers
+                del cursor
 
                 total_time = time.time() - start_time
 
