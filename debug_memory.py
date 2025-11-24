@@ -46,11 +46,13 @@ def test_duckdb_cursor_leak():
     print(f"Memory after (no close): {mem_after_no_close:.1f} MB")
     print(f"Growth: {mem_after_no_close - mem_before:.1f} MB")
 
-    # Reset
+    # Close the connection properly
     conn.close()
+    del conn
     gc.collect()
     time.sleep(1)
 
+    # Create new connection
     conn = duckdb.connect(':memory:')
     conn.execute("CREATE TABLE test AS SELECT range as x FROM range(10000)")
 
@@ -101,14 +103,12 @@ def test_fastapi_response_leak():
     mem_before = measure_memory()
     print(f"Memory before: {mem_before:.1f} MB")
 
-    responses = []
-
     print("Creating 100 response objects with 100 rows each...")
-    for i in range(100):
+    for _ in range(100):
         # Simulate query result
         result = {
             "columns": ["col1", "col2", "col3"],
-            "data": [[i, i*2, i*3] for _ in range(100)],
+            "data": [[1, 2, 3] for _ in range(100)],
             "row_count": 100
         }
 
@@ -121,8 +121,9 @@ def test_fastapi_response_leak():
         )
 
         # Simulate what happens in production - response is returned
-        # but we keep creating new ones
+        # We explicitly delete everything to simulate end of request
         del result
+        del response
 
     mem_after = measure_memory()
     print(f"Memory after: {mem_after:.1f} MB")
@@ -140,6 +141,22 @@ def test_fastapi_response_leak():
     else:
         print("⚠ GC freed nothing - objects are still referenced somewhere")
 
+    # Additional test: Check if it's just Python's memory allocator
+    print("\nTrying malloc_trim()...")
+    try:
+        import ctypes
+        import platform
+        if platform.system() == 'Linux':
+            libc = ctypes.CDLL('libc.so.6')
+            libc.malloc_trim(0)
+            mem_after_trim = measure_memory()
+            print(f"Memory after malloc_trim: {mem_after_trim:.1f} MB")
+            print(f"Memory freed by malloc_trim: {mem_after_gc - mem_after_trim:.1f} MB")
+        else:
+            print("malloc_trim not available on this platform")
+    except Exception as e:
+        print(f"malloc_trim failed: {e}")
+
 def test_tracemalloc():
     """Use tracemalloc to find where allocations happen"""
     print("\n" + "="*60)
@@ -155,14 +172,18 @@ def test_tracemalloc():
     snapshot1 = tracemalloc.take_snapshot()
 
     # Execute query 10 times
-    for i in range(10):
-        cursor = conn.execute("SELECT * FROM test")
-        result = cursor.fetchall()
-        data = [list(row) for row in result]
-        del result
-        cursor.close()
-        del cursor
-        del data
+    for _ in range(10):
+        try:
+            cursor = conn.execute("SELECT * FROM test")
+            result = cursor.fetchall()
+            data = [list(row) for row in result]
+            del result
+            cursor.close()
+            del cursor
+            del data
+        except Exception as e:
+            print(f"Error during query: {e}")
+            break
 
     snapshot2 = tracemalloc.take_snapshot()
 
@@ -174,6 +195,7 @@ def test_tracemalloc():
 
     tracemalloc.stop()
     conn.close()
+    del conn
 
 def main():
     print("="*60)
