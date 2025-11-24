@@ -42,10 +42,11 @@ class QueryCache:
             max_result_size_mb: Max size of individual result to cache in MB (default: 10)
             max_total_cache_mb: Max total cache size in MB (default: 200)
         """
-        self.ttl_seconds = ttl_seconds or int(os.getenv("QUERY_CACHE_TTL", "60"))
-        self.max_size = max_size or int(os.getenv("QUERY_CACHE_MAX_SIZE", "100"))
-        self.max_result_size_mb = max_result_size_mb or int(os.getenv("QUERY_CACHE_MAX_RESULT_MB", "10"))
-        self.max_total_cache_mb = max_total_cache_mb or int(os.getenv("QUERY_CACHE_MAX_TOTAL_MB", "200"))
+        # CRITICAL: Reduced defaults for memory-constrained deployments
+        self.ttl_seconds = ttl_seconds or int(os.getenv("QUERY_CACHE_TTL", "30"))  # Was 60s, now 30s
+        self.max_size = max_size or int(os.getenv("QUERY_CACHE_MAX_SIZE", "50"))  # Was 100, now 50
+        self.max_result_size_mb = max_result_size_mb or int(os.getenv("QUERY_CACHE_MAX_RESULT_MB", "5"))  # Was 10MB, now 5MB
+        self.max_total_cache_mb = max_total_cache_mb or int(os.getenv("QUERY_CACHE_MAX_TOTAL_MB", "100"))  # Was 200MB, now 100MB
 
         # Use OrderedDict for LRU eviction
         self.cache: OrderedDict[str, Tuple[Dict[str, Any], datetime]] = OrderedDict()
@@ -87,13 +88,13 @@ class QueryCache:
     def _cleanup_expired(self):
         """
         Background task to remove expired cache entries.
-        Runs every ttl_seconds/2 to ensure memory is actually released.
+        Runs every 10 seconds for aggressive memory cleanup.
         """
         import time
         import gc
 
-        # Run cleanup at half the TTL interval (more aggressive)
-        cleanup_interval = max(self.ttl_seconds // 2, 10)
+        # CRITICAL: Run cleanup every 10 seconds for aggressive memory management
+        cleanup_interval = 10
 
         while self._cleanup_running:
             try:
@@ -115,6 +116,9 @@ class QueryCache:
 
                     # Remove expired entries
                     for key in expired_keys:
+                        # CRITICAL: Delete data reference first
+                        cached_data, _ = self.cache[key]
+                        del cached_data
                         del self.cache[key]
                         expired_count += 1
                         self.expirations += 1
@@ -125,10 +129,11 @@ class QueryCache:
                 if expired_count > 0:
                     logger.info(
                         f"Cache cleanup: removed {expired_count} expired entries, "
-                        f"freed {freed_mb:.1f}MB"
+                        f"freed {freed_mb:.1f}MB, cache size now {self.current_cache_size_mb:.1f}MB"
                     )
-                    # Force GC to actually release the memory
-                    gc.collect()
+                    # Force aggressive GC to actually release the memory
+                    collected = gc.collect()
+                    logger.info(f"Cache cleanup GC: collected {collected} objects")
 
             except Exception as e:
                 logger.error(f"Error in cache cleanup thread: {e}", exc_info=True)
@@ -277,6 +282,8 @@ class QueryCache:
                 # Remove oldest entry
                 oldest_key, (oldest_data, _) = self.cache.popitem(last=False)
                 oldest_size = self._estimate_size_mb(oldest_data)
+                # CRITICAL: Delete data reference to free memory
+                del oldest_data
                 self.current_cache_size_mb -= oldest_size
                 self.evictions += 1
                 logger.debug(
@@ -289,6 +296,8 @@ class QueryCache:
                 # Remove oldest (first item in OrderedDict)
                 oldest_key, (oldest_data, _) = self.cache.popitem(last=False)
                 oldest_size = self._estimate_size_mb(oldest_data)
+                # CRITICAL: Delete data reference to free memory
+                del oldest_data
                 self.current_cache_size_mb -= oldest_size
                 self.evictions += 1
                 logger.debug(f"Cache EVICT: Entry count limit ({self.max_size})")
