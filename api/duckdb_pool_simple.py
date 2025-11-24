@@ -171,7 +171,17 @@ class SimpleDuckDBPool:
                         pass
 
                     # Create and return a fresh connection to the pool
-                    fresh_conn = duckdb.connect(self.db_path)
+                    fresh_conn = duckdb.connect()
+
+                    # Apply configuration if provided
+                    if self.configure_fn:
+                        try:
+                            self.configure_fn(fresh_conn)
+                        except Exception as config_error:
+                            logger.error(f"Failed to configure fresh connection: {config_error}")
+                            fresh_conn.close()
+                            raise
+
                     self.pool.put(fresh_conn)
 
     def get_metrics(self) -> Dict[str, Any]:
