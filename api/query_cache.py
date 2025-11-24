@@ -133,7 +133,19 @@ class QueryCache:
                     )
                     # Force aggressive GC to actually release the memory
                     collected = gc.collect()
-                    logger.info(f"Cache cleanup GC: collected {collected} objects")
+
+                    # CRITICAL: Force Python to return memory to OS
+                    try:
+                        import ctypes
+                        import platform
+                        if platform.system() == 'Linux':
+                            libc = ctypes.CDLL('libc.so.6')
+                            libc.malloc_trim(0)
+                            logger.info(f"Cache cleanup GC: collected {collected} objects, returned memory to OS")
+                        else:
+                            logger.info(f"Cache cleanup GC: collected {collected} objects")
+                    except Exception:
+                        logger.info(f"Cache cleanup GC: collected {collected} objects")
 
             except Exception as e:
                 logger.error(f"Error in cache cleanup thread: {e}", exc_info=True)

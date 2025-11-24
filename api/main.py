@@ -1305,7 +1305,22 @@ async def execute_sql(request: Request, query: QueryRequest):
         if should_gc:
             # Run full GC cycle to reclaim memory
             collected = gc.collect()
-            logger.info(f"Garbage collection: {gc_reason}, collected {collected} objects")
+
+            # CRITICAL: Force Python to return memory to OS (Linux only)
+            # Python's memory allocator keeps freed memory in arenas for reuse
+            # This causes RSS to keep growing even when objects are freed
+            try:
+                import ctypes
+                import platform
+                if platform.system() == 'Linux':
+                    # Call malloc_trim(0) to return freed memory to OS
+                    libc = ctypes.CDLL('libc.so.6')
+                    freed = libc.malloc_trim(0)
+                    logger.info(f"Garbage collection: {gc_reason}, collected {collected} objects, malloc_trim freed memory")
+                else:
+                    logger.info(f"Garbage collection: {gc_reason}, collected {collected} objects")
+            except Exception as e:
+                logger.info(f"Garbage collection: {gc_reason}, collected {collected} objects (malloc_trim unavailable)")
 
         return response_data
 
