@@ -1,0 +1,37 @@
+[project]
+name = "arc"
+version = "0.1.0"
+description = "High-Performance Time-Series Database for Industrial IoT"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "aiobotocore>=2.25.2",
+    "aiofiles==25.1.0",
+    "bcrypt==4.2.1",
+    "boto3>=1.40.70",
+    "duckdb==1.4.1",
+    "fastapi==0.119.0",
+    "google-cloud-storage==3.4.1",
+    "gunicorn==23.0.0",
+    "httptools==0.6.4",
+    "httpx==0.28.1",
+    "jsonpath-ng==1.7.0",
+    "minio==7.2.18",
+    "msgpack==1.1.2",
+    "numpy==2.3.3",
+    "orjson==3.10.13",
+    "polars==1.34.0",
+    "psutil==7.1.0",
+    "pyarrow==21.0.0",
+    "pydantic==2.12.0",
+    "python-dotenv==1.1.1",
+    "python-multipart==0.0.6",
+    "pytz==2024.2",
+    "pyyaml==6.0.2",
+    "s3fs==2024.12.0",
+    "slowapi==0.1.9",
+    "sqlparse==0.5.3",
+    "toml==0.10.2",
+    "uvicorn[standard]==0.37.0",
+    "uvloop==0.21.0",
+]
