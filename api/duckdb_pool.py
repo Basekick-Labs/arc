@@ -292,30 +292,6 @@ class DuckDBConnectionPool:
         try:
             conn = self.pool.get(timeout=timeout)
 
-            # Handle None (connection was closed by large query cleanup)
-            if conn is None:
-                logger.debug("Got None from pool, creating new connection")
-                # Find first closed connection slot or create new one
-                with self.pool_lock:
-                    for i, existing_conn in enumerate(self.connections):
-                        if not existing_conn.stats.is_healthy:
-                            # Reuse this slot
-                            try:
-                                new_conn = DuckDBConnection(
-                                    connection_id=i,
-                                    configure_fn=self.configure_fn
-                                )
-                                self.connections[i] = new_conn
-                                logger.info(f"Recreated connection {i} to replace closed connection")
-                                return new_conn
-                            except Exception as e:
-                                logger.error(f"Failed to recreate connection {i}: {e}")
-                                return None
-
-                # If all connections are healthy but we got None, something is wrong
-                logger.error("Got None from pool but no closed connections found")
-                return None
-
             # Verify connection health
             if not conn.stats.is_healthy:
                 logger.warning(f"Got unhealthy connection {conn.stats.connection_id}, attempting recovery")
@@ -349,13 +325,12 @@ class DuckDBConnectionPool:
             logger.warning(f"Connection pool exhausted (timeout: {timeout}s)")
             return None
 
-    def return_connection(self, conn: Optional[DuckDBConnection]):
+    def return_connection(self, conn: DuckDBConnection):
         """
         Return a connection to the pool.
 
         Args:
-            conn: Connection to return, or None if connection was closed
-                  (None signals that a new connection should be created on next get)
+            conn: Connection to return (must not be None)
         """
         try:
             self.pool.put_nowait(conn)
@@ -490,12 +465,31 @@ class DuckDBConnectionPool:
 
             if should_reset_conn and conn:
                 try:
-                    logger.info(f"Large query ({len(result)} rows) - closing connection to release DuckDB memory")
+                    logger.info(f"Large query ({len(result)} rows) - closing and recreating connection to release DuckDB memory")
+                    old_conn_id = conn.stats.connection_id
                     conn.close()
-                    # Return None to pool - will be recreated on next get_connection()
-                    self.return_connection(None)
+
+                    # Recreate connection immediately (don't put None in pool to avoid deadlock)
+                    try:
+                        new_conn = DuckDBConnection(
+                            connection_id=old_conn_id,
+                            configure_fn=self.configure_fn
+                        )
+                        # Update connections list
+                        with self.pool_lock:
+                            self.connections[old_conn_id] = new_conn
+                        # Return new connection to pool
+                        self.return_connection(new_conn)
+                        logger.debug(f"Recreated connection {old_conn_id} after large query")
+                    except Exception as e:
+                        logger.error(f"Failed to recreate connection {old_conn_id} after large query: {e}")
+                        # Mark old connection slot as unhealthy
+                        with self.pool_lock:
+                            self.connections[old_conn_id].stats.is_healthy = False
+                        # Put unhealthy connection back - it will be fixed on next get
+                        self.return_connection(self.connections[old_conn_id])
                 except Exception as e:
-                    logger.warning(f"Error closing connection after large query: {e}")
+                    logger.warning(f"Error handling large query connection reset: {e}")
                     # Fall back to normal return
                     self.return_connection(conn)
             else:
