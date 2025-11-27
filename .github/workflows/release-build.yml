@@ -369,7 +369,6 @@ jobs:
           URL:            https://github.com/basekick-labs/arc
           Source0:        arc-${VERSION}.tar.gz
           Source1:        arc.service
-          BuildArch:      ${ARCH}
 
           %description
           Arc is a high-performance time-series database built on DuckDB,
@@ -422,7 +421,7 @@ jobs:
           EOF
 
           # Build RPM
-          rpmbuild -ba ~/rpmbuild/SPECS/arc.spec
+          rpmbuild -ba --target ${ARCH} ~/rpmbuild/SPECS/arc.spec
 
           # Copy to current directory
           cp ~/rpmbuild/RPMS/${ARCH}/arc-${VERSION}-1.*.rpm .
