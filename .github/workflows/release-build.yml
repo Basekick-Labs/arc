@@ -145,11 +145,9 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 0
         run: |
           VERSION=${{ needs.prepare.outputs.version }}
 
-          # Build without CGO for static binary (no Arrow support in packages)
           go build -v \
             -ldflags="-s -w -X main.Version=${VERSION}" \
             -o arc-${{ matrix.suffix }} \
