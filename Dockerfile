@@ -8,13 +8,6 @@ FROM golang:1.25-bookworm AS builder
 
 WORKDIR /build
 
-# Install build dependencies for DuckDB with Arrow support
-RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
-    make \
-    && rm -rf /var/lib/apt/lists/*
-
 # Copy go mod files first for better layer caching
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify
@@ -22,9 +15,9 @@ RUN go mod download && go mod verify
 # Copy source code
 COPY . .
 
-# Build with Arrow support
+# Build
 ARG VERSION
-RUN CGO_ENABLED=1 go build -v -tags=duckdb_arrow \
+RUN go build -v \
     -ldflags="-s -w -X main.Version=${VERSION}" \
     -o arc ./cmd/arc
 
