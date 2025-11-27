@@ -1,8 +1,16 @@
 # Arc
 
-High-performance time-series database built on DuckDB. Go implementation.
+[![Ingestion](https://img.shields.io/badge/ingestion-9.47M%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
+[![Query](https://img.shields.io/badge/query-2.88M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
+[![Go](https://img.shields.io/badge/go-1.25+-00ADD8?logo=go)](https://go.dev)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
-[Documentation](https://docs.basekick.net/arc)
+[![Docs](https://img.shields.io/badge/docs-basekick.net-blue?logo=gitbook)](https://docs.basekick.net/arc)
+[![Website](https://img.shields.io/badge/website-basekick.net-orange?logo=firefox)](https://basekick.net)
+[![Discord](https://img.shields.io/badge/discord-join-7289da?logo=discord)](https://discord.gg/nxnWfUxsdm)
+[![GitHub](https://img.shields.io/github/stars/basekick-labs/arc?style=social)](https://github.com/basekick-labs/arc)
+
+High-performance time-series database built on DuckDB. Go implementation.
 
 ---
 
@@ -100,24 +108,45 @@ curl http://localhost:8000/health
 
 ## Installation
 
-### Pre-built Binaries (Coming Soon)
+### Docker
 
-- Linux (amd64, arm64)
-- macOS (amd64, arm64)
-- Windows (amd64)
+```bash
+docker run -d \
+  -p 8000:8000 \
+  -v arc-data:/app/data \
+  ghcr.io/basekick-labs/arc:latest
+```
 
-### Container Images
+### Debian/Ubuntu
 
-Coming soon.
+```bash
+wget https://github.com/basekick-labs/arc/releases/latest/download/arc_amd64.deb
+sudo dpkg -i arc_amd64.deb
+sudo systemctl enable arc && sudo systemctl start arc
+```
+
+### RHEL/Fedora
+
+```bash
+wget https://github.com/basekick-labs/arc/releases/latest/download/arc.x86_64.rpm
+sudo rpm -i arc.x86_64.rpm
+sudo systemctl enable arc && sudo systemctl start arc
+```
+
+### Kubernetes (Helm)
+
+```bash
+helm install arc https://github.com/basekick-labs/arc/releases/latest/download/arc.tgz
+```
 
 ### Build from Source
 
 ```bash
-# Prerequisites: Go 1.22+
+# Prerequisites: Go 1.25+
 
 # Clone and build
-git clone https://github.com/basekick-labs/arc-go.git
-cd arc-go
+git clone https://github.com/basekick-labs/arc.git
+cd arc
 make build
 
 # Run
@@ -176,7 +205,7 @@ See [arc.toml](./arc.toml) for complete configuration reference.
 ## Project Structure
 
 ```
-arc-go/
+arc/
 ├── cmd/arc/           # Application entry point
 ├── internal/
 │   ├── api/           # HTTP handlers (Fiber)
