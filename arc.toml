@@ -1,0 +1,168 @@
+# =============================================================================
+# Arc Configuration
+# =============================================================================
+# Arc is a high-performance time-series database built on DuckDB and Parquet.
+# This file configures all aspects of the Arc server.
+
+# -----------------------------------------------------------------------------
+# Server Configuration
+# -----------------------------------------------------------------------------
+# HTTP server settings for the Arc API
+[server]
+# Port to listen on for HTTP requests
+port = 8000
+
+# -----------------------------------------------------------------------------
+# Logging Configuration
+# -----------------------------------------------------------------------------
+# Controls log output format and verbosity
+[log]
+# Log level: debug, info, warn, error, fatal, panic
+level = "info"
+# Output format: "json" for structured logs, "console" for human-readable
+format = "console"
+
+# -----------------------------------------------------------------------------
+# Database Configuration (DuckDB)
+# -----------------------------------------------------------------------------
+# DuckDB connection pool and resource settings
+#
+# AUTO-DETECTION: If these values are not set (commented out), Arc will
+# automatically configure optimal defaults based on your system:
+#   - max_connections: 2x CPU cores (min 4, max 64)
+#   - memory_limit: ~50% of estimated system memory (1GB-32GB)
+#   - thread_count: Number of CPU cores
+#
+# You can also override via environment variables:
+#   - ARC_DATABASE_MAX_CONNECTIONS
+#   - ARC_DATABASE_MEMORY_LIMIT
+#   - ARC_DATABASE_THREAD_COUNT
+#
+[database]
+# Maximum number of connections in the pool
+# Each connection can execute one query at a time
+# Default: 2x CPU cores (e.g., 28 on a 14-core machine)
+# max_connections = 28
+
+# Memory limit for DuckDB operations
+# Format: "2GB", "512MB", etc.
+# Default: ~50% of estimated system memory based on CPU cores
+# memory_limit = "8GB"
+
+# Number of threads DuckDB can use for query execution
+# Default: Number of CPU cores
+# thread_count = 14
+
+# Enable Write-Ahead Logging for crash recovery
+# Currently disabled - Arc uses Parquet files as the source of truth
+enable_wal = false
+
+# -----------------------------------------------------------------------------
+# Storage Configuration
+# -----------------------------------------------------------------------------
+# Where and how Arc stores Parquet files
+[storage]
+# Storage backend: "local" or "s3"
+backend = "local"
+
+# Local filesystem path for data storage (when backend = "local")
+local_path = "./data/arc"
+
+# S3/MinIO configuration (when backend = "s3")
+s3_bucket = "arc-test"
+s3_region = "us-east-1"
+s3_endpoint = "http://localhost:9000"  # MinIO or S3-compatible endpoint
+
+# SECURITY WARNING: These are demo credentials for local MinIO development only!
+# For production, use environment variables: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+# Or use IAM roles (recommended for AWS deployments)
+s3_access_key = "minioadmin"
+s3_secret_key = "minioadmin"
+
+# SECURITY: Set to true for production! Only false for local MinIO without TLS
+s3_use_ssl = false                      # Default: true. Only false for local dev with non-TLS MinIO
+s3_path_style = true                    # Required for MinIO, false for AWS S3
+
+# -----------------------------------------------------------------------------
+# Ingestion Configuration
+# -----------------------------------------------------------------------------
+# Controls how incoming data is buffered and written to Parquet files.
+#
+# Data is flushed to disk when EITHER condition is met:
+#   1. Buffer reaches max_buffer_size records
+#   2. Buffer age exceeds max_buffer_age_ms
+#
+# This ensures both high throughput (batch large writes) and low latency
+# (don't wait forever for small streams).
+#
+[ingest]
+# Maximum records to buffer per measurement before flushing to Parquet
+# Higher = better write throughput, but more memory usage
+# Default: 50000
+max_buffer_size = 50000
+
+# Maximum age of buffered data in milliseconds before forcing a flush
+# Lower = fresher data on disk, but more small files
+# Default: 5000 (5 seconds)
+max_buffer_age_ms = 5000
+
+# -----------------------------------------------------------------------------
+# Compaction Configuration
+# -----------------------------------------------------------------------------
+# Automatic merging of small Parquet files into larger ones
+[compaction]
+# Enable/disable automatic compaction
+enabled = true
+
+# Enable hourly compaction job
+hourly_enabled = true
+
+# Minimum age in hours before files are eligible for compaction
+hourly_min_age_hours = 0
+
+# Minimum number of files required to trigger compaction
+hourly_min_files = 5
+
+# -----------------------------------------------------------------------------
+# Authentication Configuration
+# -----------------------------------------------------------------------------
+# API authentication settings
+[auth]
+# Enable/disable authentication
+# When enabled, requests must include a valid token in the Authorization header
+# Public endpoints (/health, /ready, /metrics) are always accessible
+enabled = true
+
+# -----------------------------------------------------------------------------
+# Delete Configuration
+# -----------------------------------------------------------------------------
+# Settings for DELETE operations on time-series data
+[delete]
+# Enable/disable delete functionality
+enabled = true
+
+# Row count threshold requiring explicit confirmation
+# Deletes affecting more rows than this require "confirm": true in request
+confirmation_threshold = 10000
+
+# Maximum rows that can be deleted in a single operation
+# Prevents accidental deletion of entire datasets
+max_rows_per_delete = 1000000
+
+# -----------------------------------------------------------------------------
+# Retention Policy Configuration
+# -----------------------------------------------------------------------------
+# Automatic data expiration based on age
+[retention]
+# Enable/disable retention policy enforcement
+# Policies are defined per-database via the API
+enabled = true
+
+# -----------------------------------------------------------------------------
+# Continuous Query Configuration
+# -----------------------------------------------------------------------------
+# Scheduled queries that run automatically (e.g., for downsampling)
+[continuous_query]
+# Enable/disable continuous query execution
+# Queries are defined via the API
+enabled = true

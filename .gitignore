@@ -1,81 +1,79 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
+# Binaries
+arc
+arc-*
+*.exe
+*.dll
 *.so
-.Python
-venv/
-env/
-ENV/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
+*.dylib
 
-# Data and logs
-data/
-logs/
-*.db
-*.db-shm
-*.db-wal
-*.duckdb
-*.parquet
-*.log
+# Test binary, built with `go test -c`
+*.test
 
-# MinIO storage
-minio-data/
-minio.pid
+# Output of the go coverage tool
+*.out
+coverage.out
+coverage.html
 
-# Benchmark results
-benchmarks/results/
-query_benchmark_*.json
-query_benchmark_*.txt
-*_benchmark_*.md
-disk_benchmark.json
-mem_benchmark.json
+# Profiling
+profiles/
+*.pprof
+*.prof
+*.trace
 
-# Environment variables
-.env
-.env.local
-.env.*.local
+# Build output
+/dist/
+/bin/
+/out/
 
-# Local configuration overrides
-arc.local.conf
-config.local.toml
+# Dependency directories
+vendor/
 
-# IDE
-.vscode/
+# Go workspace file
+go.work
+go.work.sum
+
+# IDE and editors
 .idea/
+.vscode/
 *.swp
 *.swo
-*.sublime-project
-*.sublime-workspace
+*~
+
+# Claude Code
+.claude/
 
 # OS
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
+ehthumbs.db
 
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
+# Data directories
+data/
+*.db
+*.duckdb
+*.parquet
+*.wal
 
-# Docker
-docker-compose.override.yml
+# Logs
+*.log
+logs/
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+
+# Package artifacts (generated during CI)
+*.deb
+*.rpm
+*.tgz
+*.tar.gz
+*.sha256

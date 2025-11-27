@@ -1,83 +1,72 @@
-# Arc Core - Production Docker Image
+# Arc - High-Performance Time-Series Database (Go)
 # Multi-stage build for minimal image size
 
-# Build argument for version
 ARG VERSION=dev
 
-FROM python:3.13-slim AS builder
+# Build stage
+FROM golang:1.22-bookworm AS builder
 
-# Install build dependencies
+WORKDIR /build
+
+# Install build dependencies for DuckDB with Arrow support
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
     make \
-    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Create virtual environment
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
+# Copy go mod files first for better layer caching
+COPY go.mod go.sum ./
+RUN go mod download && go mod verify
 
-# Copy requirements and install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy source code
+COPY . .
+
+# Build with Arrow support
+ARG VERSION
+RUN CGO_ENABLED=1 go build -v -tags=duckdb_arrow \
+    -ldflags="-s -w -X main.Version=${VERSION}" \
+    -o arc ./cmd/arc
 
 # Production stage
-FROM python:3.13-slim
+FROM debian:bookworm-slim
 
-# Re-declare VERSION arg for this stage
-ARG VERSION=dev
+ARG VERSION
 
-# Install runtime dependencies only
+# Install runtime dependencies
 RUN apt-get update && apt-get install -y \
-    libpq5 \
+    ca-certificates \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy virtual environment from builder
-COPY --from=builder /opt/venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
-# Create app user (non-root for security)
+# Create non-root user
 RUN useradd -m -u 1000 arc && \
     mkdir -p /app/data && \
     chown -R arc:arc /app
 
-# Set working directory
 WORKDIR /app
 
-# Copy application code
-COPY --chown=arc:arc api/ ./api/
-COPY --chown=arc:arc ingest/ ./ingest/
-COPY --chown=arc:arc storage/ ./storage/
-COPY --chown=arc:arc utils/ ./utils/
-COPY --chown=arc:arc telemetry/ ./telemetry/
-COPY --chown=arc:arc config.py config_loader.py ./
-COPY --chown=arc:arc arc.conf ./
-COPY --chown=arc:arc entrypoint.sh ./
+# Copy binary from builder
+COPY --from=builder --chown=arc:arc /build/arc .
+
+# Copy default config
+COPY --chown=arc:arc arc.toml .
 
 # Create VERSION file
 RUN echo "${VERSION}" > VERSION && chown arc:arc VERSION
 
-# Make entrypoint executable
-RUN chmod +x entrypoint.sh
-
 # Switch to non-root user
 USER arc
 
-# Declare volume for data persistence
+# Data volume
 VOLUME ["/app/data"]
 
 # Expose API port
 EXPOSE 8000
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Python environment
-ENV PYTHONUNBUFFERED=1
-
-# Entrypoint
-ENTRYPOINT ["./entrypoint.sh"]
-CMD ["api"]
+# Run Arc
+ENTRYPOINT ["./arc"]
