@@ -125,6 +125,15 @@ func (am *AuthManager) initDB() error {
 		return fmt.Errorf("failed to create index: %w", err)
 	}
 
+	// Migration: add expires_at column if it doesn't exist (for databases created by Python)
+	_, err = am.db.Exec(`ALTER TABLE api_tokens ADD COLUMN expires_at TIMESTAMP`)
+	if err != nil {
+		// Ignore "duplicate column" error - column already exists
+		if !strings.Contains(err.Error(), "duplicate column") {
+			am.logger.Debug().Err(err).Msg("expires_at column already exists or migration failed")
+		}
+	}
+
 	return nil
 }
 
