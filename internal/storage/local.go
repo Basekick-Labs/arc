@@ -80,7 +80,25 @@ func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) erro
 	// Write to temporary file with cryptographically random name (prevents TOCTOU attacks)
 	tmpFile, err := os.CreateTemp(dir, ".arc-*.tmp")
 	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
+		// Directory might have been deleted externally - invalidate cache and retry
+		if os.IsNotExist(err) {
+			b.dirMu.Lock()
+			delete(b.dirCache, dir)
+			if err := os.MkdirAll(dir, 0700); err != nil {
+				b.dirMu.Unlock()
+				return fmt.Errorf("failed to create directory: %w", err)
+			}
+			b.dirCache[dir] = true
+			b.dirMu.Unlock()
+
+			// Retry CreateTemp
+			tmpFile, err = os.CreateTemp(dir, ".arc-*.tmp")
+			if err != nil {
+				return fmt.Errorf("failed to create temp file: %w", err)
+			}
+		} else {
+			return fmt.Errorf("failed to create temp file: %w", err)
+		}
 	}
 	tmpPath := tmpFile.Name()
 

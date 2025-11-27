@@ -1143,6 +1143,11 @@ func (b *ArrowBuffer) convertColumnsToTyped(columns map[string][]interface{}) (m
 						arr[i] = int64(val)
 					case uint64:
 						arr[i] = int64(val)
+					// Handle float types (stream may send float when schema inferred int)
+					case float32:
+						arr[i] = int64(val)
+					case float64:
+						arr[i] = int64(val)
 					default:
 						return nil, 0, fmt.Errorf("unexpected type in int column '%s': %T", name, val)
 					}
