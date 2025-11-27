@@ -118,43 +118,43 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # Build Go binaries for all platforms using Docker (for CGO cross-compilation)
+  # Build Go binaries using native runners (CGO required for SQLite)
   build-binaries:
     name: Build Binaries
-    runs-on: ubuntu-latest
     needs: prepare
     strategy:
       matrix:
         include:
-          - platform: linux/amd64
+          - runner: ubuntu-latest
             suffix: linux-amd64
-          - platform: linux/arm64
+          - runner: ubuntu-24.04-arm
             suffix: linux-arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build binary in Docker
+      - name: Build binary
+        env:
+          CGO_ENABLED: 1
         run: |
           VERSION=${{ needs.prepare.outputs.version }}
 
-          # Build using Docker to handle CGO cross-compilation
-          docker buildx build \
-            --platform ${{ matrix.platform }} \
-            --build-arg VERSION=${VERSION} \
-            --target builder \
-            --output type=local,dest=./out \
-            .
+          go build -ldflags "-s -w -X main.Version=${VERSION}" \
+            -o arc-${{ matrix.suffix }} \
+            ./cmd/arc
 
-          # Extract the binary
-          cp ./out/build/arc arc-${{ matrix.suffix }}
           chmod +x arc-${{ matrix.suffix }}
+
+          # Show binary info
+          file arc-${{ matrix.suffix }}
+          ls -lh arc-${{ matrix.suffix }}
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
