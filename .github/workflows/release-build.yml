@@ -467,14 +467,15 @@ jobs:
       - name: Create manifest list and push
         working-directory: /tmp/digests
         run: |
-          # Create multi-arch manifest
+          # Create multi-arch manifest with version, short_version, and latest tags
           docker buildx imagetools create \
             -t ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }} \
             -t ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.short_version }} \
+            -t ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:latest \
             $(printf '${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
 
           echo "✅ Multi-arch manifest created and pushed" >> $GITHUB_STEP_SUMMARY
-          echo "Tags: ${{ needs.prepare.outputs.version }}, ${{ needs.prepare.outputs.short_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "Tags: ${{ needs.prepare.outputs.version }}, ${{ needs.prepare.outputs.short_version }}, latest" >> $GITHUB_STEP_SUMMARY
 
   # Package Helm chart
   helm-package:
