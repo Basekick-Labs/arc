@@ -1189,6 +1189,27 @@ func (b *ArrowBuffer) convertColumnsToTyped(columns map[string][]interface{}) (m
 						arr[i] = float64(val)
 					case float64:
 						arr[i] = val
+					// Handle integer types (msgpack may send int when value is whole number)
+					case int:
+						arr[i] = float64(val)
+					case int8:
+						arr[i] = float64(val)
+					case int16:
+						arr[i] = float64(val)
+					case int32:
+						arr[i] = float64(val)
+					case int64:
+						arr[i] = float64(val)
+					case uint:
+						arr[i] = float64(val)
+					case uint8:
+						arr[i] = float64(val)
+					case uint16:
+						arr[i] = float64(val)
+					case uint32:
+						arr[i] = float64(val)
+					case uint64:
+						arr[i] = float64(val)
 					default:
 						return nil, 0, fmt.Errorf("unexpected type in float column '%s': %T", name, val)
 					}
