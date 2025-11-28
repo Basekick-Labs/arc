@@ -77,3 +77,5 @@ temp/
 *.tgz
 *.tar.gz
 *.sha256
+
+docs/progress/2025-11-28-6month-product-roadmap.md
