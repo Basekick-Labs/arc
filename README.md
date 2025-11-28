@@ -43,7 +43,7 @@ SELECT
   ) as temp_moving_avg,
   MAX(pressure) as peak_pressure,
   STDDEV(vibration) as vibration_variance
-FROM iot_sensors
+FROM data.iot_sensors
 WHERE timestamp > NOW() - INTERVAL '24 hours'
   AND facility_id IN ('mining_site_42', 'plant_7')
 GROUP BY device_id, facility_name, timestamp
