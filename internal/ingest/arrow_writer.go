@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -722,6 +724,7 @@ type bufferShard struct {
 	buffers            map[string][]interface{}
 	bufferStartTimes   map[string]time.Time
 	bufferRecordCounts map[string]int
+	bufferSchemas      map[string]string // Column signature for schema evolution detection
 	mu                 sync.RWMutex
 }
 
@@ -780,6 +783,19 @@ type ArrowBuffer struct {
 	logger zerolog.Logger
 }
 
+// getColumnSignature returns a sorted string of column names for schema comparison.
+// Used to detect schema evolution when columns appear/disappear between batches.
+func getColumnSignature(columns map[string]interface{}) string {
+	names := make([]string, 0, len(columns))
+	for name := range columns {
+		if len(name) > 0 && name[0] != '_' { // Skip internal columns
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return strings.Join(names, ",")
+}
+
 // getShard returns the shard for a given buffer key using FNV-1a hash
 func (b *ArrowBuffer) getShard(bufferKey string) *bufferShard {
 	// FNV-1a hash (fast, good distribution)
@@ -818,6 +834,7 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 			buffers:            make(map[string][]interface{}),
 			bufferStartTimes:   make(map[string]time.Time),
 			bufferRecordCounts: make(map[string]int),
+			bufferSchemas:      make(map[string]string),
 		}
 	}
 
@@ -964,6 +981,9 @@ func (b *ArrowBuffer) writeColumnar(ctx context.Context, database string, record
 		return fmt.Errorf("failed to convert columns: %w", err)
 	}
 
+	// Get column signature for schema evolution detection
+	newSignature := getColumnSignature(typedColumns)
+
 	// OPTIMIZATION: Get shard for this buffer key (lock sharding)
 	shard := b.getShard(bufferKey)
 
@@ -974,10 +994,31 @@ func (b *ArrowBuffer) writeColumnar(ctx context.Context, database string, record
 
 	shard.mu.Lock()
 
+	// Schema evolution detection: flush buffer if columns changed
+	if existingSignature, exists := shard.bufferSchemas[bufferKey]; exists {
+		if existingSignature != newSignature {
+			// Schema changed - flush existing buffer first to avoid column mismatch
+			b.logger.Debug().
+				Str("buffer_key", bufferKey).
+				Str("old_schema", existingSignature).
+				Str("new_schema", newSignature).
+				Msg("Schema evolution detected, flushing buffer")
+
+			if err := b.flushBufferLocked(ctx, shard, bufferKey, database, record.Measurement); err != nil {
+				b.logger.Error().Err(err).
+					Str("buffer_key", bufferKey).
+					Msg("Failed to flush buffer on schema change")
+				// Continue anyway - the buffer is cleared by flushBufferLocked
+			}
+			// Buffer is now empty, will be re-initialized below
+		}
+	}
+
 	// Initialize buffer and record count if needed
 	if _, exists := shard.buffers[bufferKey]; !exists {
 		shard.bufferStartTimes[bufferKey] = time.Now()
 		shard.bufferRecordCounts[bufferKey] = 0
+		shard.bufferSchemas[bufferKey] = newSignature // Store schema for evolution detection
 	}
 
 	// Add typed columns to buffer (already converted via zero-copy fast paths)
@@ -997,6 +1038,7 @@ func (b *ArrowBuffer) writeColumnar(ctx context.Context, database string, record
 		shard.buffers[bufferKey] = nil
 		delete(shard.bufferStartTimes, bufferKey)
 		delete(shard.bufferRecordCounts, bufferKey)
+		delete(shard.bufferSchemas, bufferKey)
 
 		shouldFlush = true
 
@@ -1511,6 +1553,7 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 	delete(shard.buffers, bufferKey)
 	delete(shard.bufferStartTimes, bufferKey)
 	delete(shard.bufferRecordCounts, bufferKey)
+	delete(shard.bufferSchemas, bufferKey)
 
 	// Release lock before expensive operations
 	shard.mu.Unlock()
