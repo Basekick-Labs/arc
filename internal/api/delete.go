@@ -337,53 +337,46 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 func (h *DeleteHandler) findAffectedFiles(ctx context.Context, database, measurement, whereClause string) ([]affectedFile, error) {
 	var affected []affectedFile
 
-	// Get base path from storage backend
-	basePath := h.getStorageBasePath()
-	if basePath == "" {
-		return nil, fmt.Errorf("unable to determine storage base path")
-	}
-
-	measurementPath := filepath.Join(basePath, database, measurement)
-
-	// Check if measurement exists
-	if _, err := os.Stat(measurementPath); os.IsNotExist(err) {
-		h.logger.Warn().Str("path", measurementPath).Msg("No data directory found for measurement")
-		return affected, nil
-	}
-
-	// Walk the directory to find all parquet files
-	var parquetFiles []string
-	err := filepath.Walk(measurementPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil // Continue on error
-		}
-		if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".parquet") {
-			parquetFiles = append(parquetFiles, path)
-		}
-		return nil
-	})
+	// Use storage backend's List method to find parquet files
+	prefix := fmt.Sprintf("%s/%s/", database, measurement)
+	files, err := h.storage.List(ctx, prefix)
 	if err != nil {
-		return nil, fmt.Errorf("failed to walk directory: %w", err)
+		return nil, fmt.Errorf("failed to list files: %w", err)
+	}
+
+	// Filter for parquet files
+	var parquetFiles []string
+	for _, f := range files {
+		if strings.HasSuffix(strings.ToLower(f), ".parquet") {
+			parquetFiles = append(parquetFiles, f)
+		}
+	}
+
+	if len(parquetFiles) == 0 {
+		h.logger.Warn().Str("prefix", prefix).Msg("No parquet files found for measurement")
+		return affected, nil
 	}
 
 	h.logger.Info().Int("file_count", len(parquetFiles)).Msg("Scanning parquet files for matching rows")
 
 	// Check each file for matching rows
-	for _, filePath := range parquetFiles {
-		matchCount, err := h.countMatchingRowsInFile(ctx, filePath, whereClause)
+	for _, relativePath := range parquetFiles {
+		// Convert to DuckDB-compatible path
+		queryPath := h.getQueryPath(relativePath)
+
+		matchCount, err := h.countMatchingRowsInFile(ctx, queryPath, whereClause)
 		if err != nil {
-			h.logger.Warn().Err(err).Str("file", filePath).Msg("Failed to count matching rows, skipping file")
+			h.logger.Warn().Err(err).Str("file", relativePath).Msg("Failed to count matching rows, skipping file")
 			continue
 		}
 
 		if matchCount > 0 {
-			relPath, _ := filepath.Rel(basePath, filePath)
 			affected = append(affected, affectedFile{
-				path:         filePath,
+				path:         queryPath,
 				matchCount:   matchCount,
-				relativePath: relPath,
+				relativePath: relativePath,
 			})
-			h.logger.Debug().Str("file", filepath.Base(filePath)).Int64("matches", matchCount).Msg("Found matching rows")
+			h.logger.Debug().Str("file", filepath.Base(relativePath)).Int64("matches", matchCount).Msg("Found matching rows")
 		}
 	}
 
@@ -408,7 +401,9 @@ func (h *DeleteHandler) countMatchingRowsInFile(ctx context.Context, filePath, w
 }
 
 // rewriteFileWithoutDeletedRows rewrites a Parquet file excluding rows that match the WHERE clause
-func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, filePath, relativePath, whereClause string) (int64, error) {
+// For local storage: uses atomic rename
+// For S3: downloads, processes locally, then uploads
+func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, queryPath, relativePath, whereClause string) (int64, error) {
 	// Use the shared DuckDB connection to avoid memory retention from temporary connections
 	db := h.db.DB()
 
@@ -416,13 +411,13 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, fileP
 	var rowsBefore, rowsAfter int64
 
 	// Count total rows
-	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM read_parquet('%s')", filePath)
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM read_parquet('%s')", queryPath)
 	if err := db.QueryRowContext(ctx, countQuery).Scan(&rowsBefore); err != nil {
 		return 0, fmt.Errorf("failed to count rows: %w", err)
 	}
 
 	// Count rows after filtering out deleted rows
-	afterQuery := fmt.Sprintf("SELECT COUNT(*) FROM read_parquet('%s') WHERE NOT (%s)", filePath, whereClause)
+	afterQuery := fmt.Sprintf("SELECT COUNT(*) FROM read_parquet('%s') WHERE NOT (%s)", queryPath, whereClause)
 	if err := db.QueryRowContext(ctx, afterQuery).Scan(&rowsAfter); err != nil {
 		return 0, fmt.Errorf("failed to count remaining rows: %w", err)
 	}
@@ -431,12 +426,26 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, fileP
 
 	// If all rows would be deleted, just delete the file
 	if rowsAfter == 0 {
-		h.logger.Info().Str("file", filepath.Base(filePath)).Int64("deleted", deleted).Msg("All rows deleted, removing file")
-		if err := os.Remove(filePath); err != nil {
+		h.logger.Info().Str("file", filepath.Base(relativePath)).Int64("deleted", deleted).Msg("All rows deleted, removing file")
+		if err := h.storage.Delete(ctx, relativePath); err != nil {
 			return 0, fmt.Errorf("failed to delete file: %w", err)
 		}
 		return deleted, nil
 	}
+
+	// For S3, we need to write to a temp file locally, then upload
+	if h.isS3Backend() {
+		return h.rewriteS3File(ctx, queryPath, relativePath, whereClause, rowsBefore, rowsAfter)
+	}
+
+	// Local storage: use atomic rename strategy
+	return h.rewriteLocalFile(ctx, queryPath, relativePath, whereClause, rowsBefore, rowsAfter)
+}
+
+// rewriteLocalFile handles file rewrite for local storage using atomic rename
+func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, relativePath, whereClause string, rowsBefore, rowsAfter int64) (int64, error) {
+	db := h.db.DB()
+	deleted := rowsBefore - rowsAfter
 
 	// Create temp file for the rewritten data
 	dir := filepath.Dir(filePath)
@@ -482,19 +491,83 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, fileP
 	return deleted, nil
 }
 
-// getStorageBasePath returns the base path for storage
+// rewriteS3File handles file rewrite for S3 storage
+// DuckDB can read from S3 directly, then we write to a temp file and upload
+func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath, whereClause string, rowsBefore, rowsAfter int64) (int64, error) {
+	db := h.db.DB()
+	deleted := rowsBefore - rowsAfter
+
+	// Create temp file locally for the rewritten data
+	tempFile, err := os.CreateTemp("", "arc-delete-*.parquet")
+	if err != nil {
+		return 0, fmt.Errorf("failed to create temp file: %w", err)
+	}
+	tempPath := tempFile.Name()
+	tempFile.Close()
+	defer os.Remove(tempPath)
+
+	// DuckDB reads from S3 and writes to local temp file
+	copyQuery := fmt.Sprintf(`
+		COPY (
+			SELECT * FROM read_parquet('%s') WHERE NOT (%s)
+		) TO '%s' (
+			FORMAT PARQUET,
+			COMPRESSION ZSTD,
+			COMPRESSION_LEVEL 3
+		)
+	`, s3Path, whereClause, tempPath)
+
+	if _, err := db.ExecContext(ctx, copyQuery); err != nil {
+		return 0, fmt.Errorf("failed to write filtered data: %w", err)
+	}
+
+	// Read the temp file and upload to S3
+	data, err := os.ReadFile(tempPath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read temp file: %w", err)
+	}
+
+	// Upload back to S3 (overwrites the original)
+	if err := h.storage.Write(ctx, relativePath, data); err != nil {
+		return 0, fmt.Errorf("failed to upload rewritten file to S3: %w", err)
+	}
+
+	h.logger.Info().
+		Str("file", filepath.Base(relativePath)).
+		Int64("rows_before", rowsBefore).
+		Int64("rows_after", rowsAfter).
+		Int64("deleted", deleted).
+		Msg("Rewrote S3 file")
+
+	return deleted, nil
+}
+
+// getStorageBasePath returns the base path for local storage (empty for S3)
 func (h *DeleteHandler) getStorageBasePath() string {
 	switch backend := h.storage.(type) {
 	case *storage.LocalBackend:
 		return backend.GetBasePath()
-	case *storage.S3Backend:
-		// For S3, we need different handling
-		// TODO: Implement S3 delete support
-		h.logger.Warn().Msg("Delete not fully supported for S3 backend yet")
-		return ""
 	default:
-		return "./data/arc"
+		return ""
 	}
+}
+
+// getQueryPath converts a storage-relative path to a DuckDB-compatible path
+func (h *DeleteHandler) getQueryPath(relativePath string) string {
+	switch backend := h.storage.(type) {
+	case *storage.LocalBackend:
+		return filepath.Join(backend.GetBasePath(), relativePath)
+	case *storage.S3Backend:
+		return fmt.Sprintf("s3://%s/%s", backend.GetBucket(), relativePath)
+	default:
+		return relativePath
+	}
+}
+
+// isS3Backend returns true if the storage backend is S3
+func (h *DeleteHandler) isS3Backend() bool {
+	_, ok := h.storage.(*storage.S3Backend)
+	return ok
 }
 
 // extractTimeRange extracts time range from WHERE clause for partition pruning (future optimization)

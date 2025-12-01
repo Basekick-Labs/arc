@@ -66,6 +66,13 @@ func main() {
 		MemoryLimit:    cfg.Database.MemoryLimit,
 		ThreadCount:    cfg.Database.ThreadCount,
 		EnableWAL:      cfg.Database.EnableWAL,
+		// S3 configuration for httpfs extension (enables DuckDB to query S3 directly)
+		S3Region:    cfg.Storage.S3Region,
+		S3AccessKey: cfg.Storage.S3AccessKey,
+		S3SecretKey: cfg.Storage.S3SecretKey,
+		S3Endpoint:  cfg.Storage.S3Endpoint,
+		S3UseSSL:    cfg.Storage.S3UseSSL,
+		S3PathStyle: cfg.Storage.S3PathStyle,
 	}
 
 	db, err := database.New(dbConfig, logger.Get("database"))
@@ -138,8 +145,29 @@ func main() {
 			Str("endpoint", cfg.Storage.S3Endpoint).
 			Msg("Storage backend initialized")
 
+	case "azure", "azblob":
+		azureConfig := &storage.AzureBlobConfig{
+			ConnectionString:   cfg.Storage.AzureConnectionString,
+			AccountName:        cfg.Storage.AzureAccountName,
+			AccountKey:         cfg.Storage.AzureAccountKey,
+			SASToken:           cfg.Storage.AzureSASToken,
+			ContainerName:      cfg.Storage.AzureContainer,
+			Endpoint:           cfg.Storage.AzureEndpoint,
+			UseManagedIdentity: cfg.Storage.AzureUseManagedIdentity,
+		}
+		storageBackend, err = storage.NewAzureBlobBackend(azureConfig, logger.Get("storage"))
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to initialize Azure Blob Storage backend")
+		}
+		shutdownCoordinator.Register("storage", storageBackend, shutdown.PriorityStorage)
+		log.Info().
+			Str("backend", cfg.Storage.Backend).
+			Str("container", cfg.Storage.AzureContainer).
+			Str("account", cfg.Storage.AzureAccountName).
+			Msg("Storage backend initialized")
+
 	default:
-		log.Fatal().Str("backend", cfg.Storage.Backend).Msg("Unsupported storage backend (use 'local', 's3', or 'minio')")
+		log.Fatal().Str("backend", cfg.Storage.Backend).Msg("Unsupported storage backend (use 'local', 's3', 'minio', 'azure', or 'azblob')")
 	}
 
 	// Initialize WAL (if enabled)

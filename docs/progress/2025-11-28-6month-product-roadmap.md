@@ -66,15 +66,15 @@ Arc is a high-performance time-series database targeting IoT/Industrial, Smart C
 ## Month 1: January 2026 (v26.01)
 ### Theme: **Cloud Beta Foundation**
 
-**OSS Features:**
-- [ ] Complete S3 delete operations (currently skipped with warning)
-- [ ] Implement S3-compatible SHOW/LIST commands (pagination-based)
-- [ ] S3 retention policy execution support
-- [ ] S3 continuous query support
-- [ ] Azure Blob Storage backend (customer requested)
-  - Connection string / SAS token authentication
-  - Delete, SHOW/LIST, retention, CQ support (parity with S3)
-- [ ] Arrow writer: handle row-to-columnar conversion edge case
+**OSS Features:** ✅ **COMPLETED December 1, 2025** (ahead of schedule!)
+- [x] Complete S3 delete operations (currently skipped with warning)
+- [x] Implement S3-compatible SHOW/LIST commands (pagination-based)
+- [x] S3 retention policy execution support
+- [x] S3 continuous query support
+- [x] Azure Blob Storage backend (customer requested)
+  - [x] Connection string / SAS token / Managed Identity authentication
+  - [x] Delete, SHOW/LIST, retention, CQ support (parity with S3)
+- [x] Arrow writer: handle row-to-columnar conversion edge case
 
 **Cloud/Enterprise Features:**
 - [ ] Basic RBAC: reader/writer roles (beyond current token auth)
@@ -84,7 +84,7 @@ Arc is a high-performance time-series database targeting IoT/Industrial, Smart C
 
 **Why Now**: S3 completion for OSS + RBAC/deployment for Cloud Beta.
 
-**Estimated Effort**: High
+**Estimated Effort**: ~~High~~ OSS features done early, Cloud features remain
 
 ---
 
@@ -229,7 +229,8 @@ If customer demand exists, H2 2026 focuses on:
 ## Cloud Beta Checklist (Q1 2026)
 
 Must-have for beta launch (January):
-- [ ] S3 backend complete (delete, SHOW, retention, CQ)
+- [x] S3 backend complete (delete, SHOW, retention, CQ) ✅ **Done Dec 1, 2025**
+- [x] Azure Blob Storage backend ✅ **Done Dec 1, 2025** (bonus!)
 - [ ] Basic RBAC (reader/writer roles)
 - [ ] Container deployment architecture
 - [ ] Instance health metrics
@@ -245,7 +246,8 @@ Nice-to-have for beta (Feb-March):
 
 | Item | Priority | Notes |
 |------|----------|-------|
-| S3 backend gaps | High | Month 1 focus |
+| ~~S3 backend gaps~~ | ~~High~~ | ✅ **Resolved Dec 1, 2025** |
+| ~~Arrow writer row-to-columnar~~ | ~~High~~ | ✅ **Resolved Dec 1, 2025** |
 | Large file refactoring (arrow_writer.go) | Medium | As features touch these files |
 | Additional integration tests | Medium | Add with each new feature |
 

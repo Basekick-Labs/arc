@@ -51,6 +51,14 @@ type StorageConfig struct {
 	S3SecretKey string // AWS secret key (or use AWS_SECRET_ACCESS_KEY env var)
 	S3UseSSL    bool   // Use HTTPS for S3 connections
 	S3PathStyle bool   // Use path-style addressing (required for MinIO)
+	// Azure Blob Storage configuration
+	AzureConnectionString  string // Connection string (simplest auth method)
+	AzureAccountName       string // Storage account name
+	AzureAccountKey        string // Storage account key
+	AzureSASToken          string // SAS token for scoped access
+	AzureContainer         string // Container name
+	AzureEndpoint          string // Custom endpoint (for Azurite testing)
+	AzureUseManagedIdentity bool   // Use managed identity (Azure-hosted deployments)
 }
 
 type IngestConfig struct {
@@ -180,6 +188,14 @@ func Load() (*Config, error) {
 			S3SecretKey: v.GetString("storage.s3_secret_key"),
 			S3UseSSL:    v.GetBool("storage.s3_use_ssl"),
 			S3PathStyle: v.GetBool("storage.s3_path_style"),
+			// Azure Blob Storage
+			AzureConnectionString:   v.GetString("storage.azure_connection_string"),
+			AzureAccountName:        v.GetString("storage.azure_account_name"),
+			AzureAccountKey:         v.GetString("storage.azure_account_key"),
+			AzureSASToken:           v.GetString("storage.azure_sas_token"),
+			AzureContainer:          v.GetString("storage.azure_container"),
+			AzureEndpoint:           v.GetString("storage.azure_endpoint"),
+			AzureUseManagedIdentity: v.GetBool("storage.azure_use_managed_identity"),
 		},
 		Ingest: IngestConfig{
 			MaxBufferSize:   v.GetInt("ingest.max_buffer_size"),
