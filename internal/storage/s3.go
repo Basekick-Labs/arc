@@ -477,3 +477,88 @@ func (b *S3Backend) ConfigJSON() string {
 	data, _ := json.Marshal(config)
 	return string(data)
 }
+
+// ListDirectories lists immediate subdirectories at a prefix.
+// Implements the DirectoryLister interface.
+// Uses S3's delimiter feature to efficiently list only "directories" (common prefixes).
+func (b *S3Backend) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
+	// Ensure prefix ends with / for proper directory listing (unless empty)
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix = prefix + "/"
+	}
+
+	var dirs []string
+	var continuationToken *string
+
+	for {
+		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(b.bucket),
+			Prefix:            aws.String(prefix),
+			Delimiter:         aws.String("/"),
+			ContinuationToken: continuationToken,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to list S3 directories: %w", err)
+		}
+
+		// CommonPrefixes contains the "directories"
+		for _, cp := range result.CommonPrefixes {
+			if cp.Prefix != nil {
+				// Extract directory name from the prefix
+				// e.g., "mydb/cpu/" -> "cpu"
+				dir := strings.TrimPrefix(*cp.Prefix, prefix)
+				dir = strings.TrimSuffix(dir, "/")
+				if dir != "" && !strings.HasPrefix(dir, ".") {
+					dirs = append(dirs, dir)
+				}
+			}
+		}
+
+		if result.IsTruncated == nil || !*result.IsTruncated {
+			break
+		}
+		continuationToken = result.NextContinuationToken
+	}
+
+	return dirs, nil
+}
+
+// ListObjects lists objects with their metadata at a prefix.
+// Implements the ObjectLister interface.
+func (b *S3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error) {
+	var objects []ObjectInfo
+	var continuationToken *string
+
+	for {
+		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(b.bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: continuationToken,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to list S3 objects: %w", err)
+		}
+
+		for _, obj := range result.Contents {
+			if obj.Key != nil {
+				info := ObjectInfo{
+					Path: *obj.Key,
+				}
+				if obj.Size != nil {
+					info.Size = *obj.Size
+				}
+				if obj.LastModified != nil {
+					info.LastModified = *obj.LastModified
+				}
+				objects = append(objects, info)
+			}
+		}
+
+		if result.IsTruncated == nil || !*result.IsTruncated {
+			break
+		}
+		continuationToken = result.NextContinuationToken
+	}
+
+	return objects, nil
+}

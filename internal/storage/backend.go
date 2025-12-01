@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"io"
+	"time"
 )
 
 // Backend defines the interface for storage backends (local, S3, MinIO)
@@ -38,4 +39,29 @@ type Backend interface {
 	// ConfigJSON returns the configuration as JSON for subprocess recreation
 	// Used for subprocess serialization
 	ConfigJSON() string
+}
+
+// DirectoryLister lists immediate subdirectories at a prefix.
+// This is useful for SHOW DATABASES/TABLES commands.
+type DirectoryLister interface {
+	ListDirectories(ctx context.Context, prefix string) ([]string, error)
+}
+
+// BatchDeleter supports efficient batch deletion of multiple objects.
+// Implementations should handle batching internally (e.g., S3 supports up to 1000 objects per batch).
+type BatchDeleter interface {
+	DeleteBatch(ctx context.Context, paths []string) error
+}
+
+// ObjectInfo provides metadata about a storage object.
+type ObjectInfo struct {
+	Path         string
+	Size         int64
+	LastModified time.Time
+}
+
+// ObjectLister lists objects with their metadata.
+// This is useful for retention policies that need to check file ages.
+type ObjectLister interface {
+	ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error)
 }

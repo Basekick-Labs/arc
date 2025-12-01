@@ -368,6 +368,103 @@ func (b *LocalBackend) ConfigJSON() string {
 	return string(data)
 }
 
+// ListDirectories lists immediate subdirectories at a prefix.
+// Implements the DirectoryLister interface.
+func (b *LocalBackend) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
+	// Validate and sanitize the prefix to prevent path traversal
+	searchPath, err := b.validatePath(prefix)
+	if err != nil {
+		return nil, fmt.Errorf("invalid prefix: %w", err)
+	}
+
+	entries, err := os.ReadDir(searchPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []string{}, nil
+		}
+		return nil, fmt.Errorf("failed to read directory: %w", err)
+	}
+
+	var dirs []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			// Skip hidden directories
+			if strings.HasPrefix(entry.Name(), ".") {
+				continue
+			}
+			dirs = append(dirs, entry.Name())
+		}
+	}
+
+	return dirs, nil
+}
+
+// DeleteBatch deletes multiple objects at the specified paths.
+// Implements the BatchDeleter interface.
+func (b *LocalBackend) DeleteBatch(ctx context.Context, paths []string) error {
+	var lastErr error
+	for _, path := range paths {
+		if err := b.Delete(ctx, path); err != nil {
+			lastErr = err
+			b.logger.Error().Err(err).Str("path", path).Msg("Failed to delete file in batch")
+		}
+	}
+	return lastErr
+}
+
+// ListObjects lists objects with their metadata at a prefix.
+// Implements the ObjectLister interface.
+func (b *LocalBackend) ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error) {
+	// Validate and sanitize the prefix to prevent path traversal
+	searchPath, err := b.validatePath(prefix)
+	if err != nil {
+		return nil, fmt.Errorf("invalid prefix: %w", err)
+	}
+
+	var results []ObjectInfo
+
+	err = filepath.Walk(searchPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+
+		// Skip directories
+		if info.IsDir() {
+			return nil
+		}
+
+		// Skip hidden files
+		if strings.HasPrefix(info.Name(), ".") {
+			return nil
+		}
+
+		// Get relative path from base
+		relPath, err := filepath.Rel(b.basePath, path)
+		if err != nil {
+			return err
+		}
+
+		results = append(results, ObjectInfo{
+			Path:         relPath,
+			Size:         info.Size(),
+			LastModified: info.ModTime(),
+		})
+		return nil
+	})
+
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []ObjectInfo{}, nil
+		}
+		return nil, fmt.Errorf("failed to list objects: %w", err)
+	}
+
+	return results, nil
+}
+
 // sanitizePath removes any potentially dangerous path components
 func sanitizePath(path string) string {
 	// Remove leading slashes

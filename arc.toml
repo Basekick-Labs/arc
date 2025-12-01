@@ -69,15 +69,15 @@ backend = "local"
 local_path = "./data/arc"
 
 # S3/MinIO configuration (when backend = "s3")
-s3_bucket = "arc-test"
-s3_region = "us-east-1"
-s3_endpoint = "http://localhost:9000"  # MinIO or S3-compatible endpoint
+s3_bucket = "arc-testing"
+s3_region = "us-east-2"
+#s3_endpoint = "s3://arn:aws:s3express:us-east-2:083710314845:accesspoint/arc-testing--use2-az1--xa-s3"  # MinIO or S3-compatible endpoint
 
-# SECURITY WARNING: These are demo credentials for local MinIO development only!
-# For production, use environment variables: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+# SECURITY WARNING: Never commit credentials!
+# For production, use environment variables: ARC_STORAGE_S3_ACCESS_KEY, ARC_STORAGE_S3_SECRET_KEY
 # Or use IAM roles (recommended for AWS deployments)
-s3_access_key = "minioadmin"
-s3_secret_key = "minioadmin"
+# s3_access_key = ""
+# s3_secret_key = ""
 
 # SECURITY: Set to true for production! Only false for local MinIO without TLS
 s3_use_ssl = false                      # Default: true. Only false for local dev with non-TLS MinIO

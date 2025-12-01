@@ -903,6 +903,92 @@ func (b *ArrowBuffer) columnarToWALRecords(database string, record *models.Colum
 	return records
 }
 
+// rowsToColumnar converts a slice of row-format Records into a ColumnarRecord.
+// This enables the MessagePack handler to accept row-format data and convert it
+// to the columnar format expected by the Arrow writer.
+//
+// The conversion:
+// - _time column: populated from Record.Timestamp (microseconds) or Record.Time
+// - Tag columns: prefixed with "tag_" to distinguish from fields
+// - Field columns: stored directly by field name
+func (b *ArrowBuffer) rowsToColumnar(measurement string, rows []*models.Record) *models.ColumnarRecord {
+	if len(rows) == 0 {
+		return &models.ColumnarRecord{
+			Measurement: measurement,
+			Columnar:    true,
+			Columns:     make(map[string][]interface{}),
+		}
+	}
+
+	// Pre-allocate columns map - estimate based on first record
+	firstRow := rows[0]
+	estimatedCols := 1 + len(firstRow.Tags) + len(firstRow.Fields) // _time + tags + fields
+	columns := make(map[string][]interface{}, estimatedCols)
+
+	// Initialize _time column
+	columns["_time"] = make([]interface{}, 0, len(rows))
+
+	// First pass: collect all unique column names across all rows
+	// This handles schema variations where different rows may have different fields/tags
+	allTags := make(map[string]struct{})
+	allFields := make(map[string]struct{})
+	for _, row := range rows {
+		for tag := range row.Tags {
+			allTags[tag] = struct{}{}
+		}
+		for field := range row.Fields {
+			allFields[field] = struct{}{}
+		}
+	}
+
+	// Initialize columns for all tags and fields
+	for tag := range allTags {
+		columns["tag_"+tag] = make([]interface{}, 0, len(rows))
+	}
+	for field := range allFields {
+		columns[field] = make([]interface{}, 0, len(rows))
+	}
+
+	// Second pass: populate columns with values
+	for _, row := range rows {
+		// Handle timestamp: prefer Timestamp (microseconds) if set, otherwise convert Time
+		var timestamp int64
+		if row.Timestamp != 0 {
+			timestamp = row.Timestamp
+		} else if !row.Time.IsZero() {
+			timestamp = row.Time.UnixMicro()
+		} else {
+			// Use current time if no timestamp provided
+			timestamp = time.Now().UnixMicro()
+		}
+		columns["_time"] = append(columns["_time"], timestamp)
+
+		// Add tag values (nil for missing tags to maintain column alignment)
+		for tag := range allTags {
+			if val, ok := row.Tags[tag]; ok {
+				columns["tag_"+tag] = append(columns["tag_"+tag], val)
+			} else {
+				columns["tag_"+tag] = append(columns["tag_"+tag], nil)
+			}
+		}
+
+		// Add field values (nil for missing fields to maintain column alignment)
+		for field := range allFields {
+			if val, ok := row.Fields[field]; ok {
+				columns[field] = append(columns[field], val)
+			} else {
+				columns[field] = append(columns[field], nil)
+			}
+		}
+	}
+
+	return &models.ColumnarRecord{
+		Measurement: measurement,
+		Columnar:    true,
+		Columns:     columns,
+	}
+}
+
 // Write adds records to the buffer (for MessagePack handler)
 func (b *ArrowBuffer) Write(ctx context.Context, database string, records interface{}) error {
 	// Handle batch of records (from MessagePack decoder)
@@ -910,6 +996,9 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 	if !ok {
 		return fmt.Errorf("expected []interface{}, got %T", records)
 	}
+
+	// Group row records by measurement for efficient batch conversion
+	rowRecordsByMeasurement := make(map[string][]*models.Record)
 
 	for _, record := range recordList {
 		switch r := record.(type) {
@@ -920,10 +1009,20 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 				return err
 			}
 		case *models.Record:
-			// TODO: Implement row format handling (convert to columnar first)
-			b.logger.Warn().Msg("Row format not yet implemented, skipping")
+			// Group row records by measurement for batch conversion
+			rowRecordsByMeasurement[r.Measurement] = append(rowRecordsByMeasurement[r.Measurement], r)
 		default:
 			b.logger.Warn().Interface("type", fmt.Sprintf("%T", record)).Msg("Unknown record type")
+		}
+	}
+
+	// Convert grouped row records to columnar format and write
+	for measurement, rowRecords := range rowRecordsByMeasurement {
+		columnar := b.rowsToColumnar(measurement, rowRecords)
+		if err := b.writeColumnar(ctx, database, columnar); err != nil {
+			b.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to write converted row records")
+			b.totalErrors.Add(1)
+			return err
 		}
 	}
 

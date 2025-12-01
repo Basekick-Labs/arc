@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -492,34 +493,26 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 	columns := []string{"database"}
 	data := make([][]interface{}, 0)
 
-	// Get base path from storage backend
-	basePath := h.getStorageBasePath()
-	if basePath == "" {
-		return c.JSON(QueryResponse{
-			Success:         true,
-			Columns:         columns,
-			Data:            data,
-			RowCount:        0,
-			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
-			Timestamp:       time.Now().UTC().Format(time.RFC3339),
-		})
+	ctx := context.Background()
+
+	// Use DirectoryLister interface if available, otherwise fall back to List
+	var databases []string
+	var err error
+
+	if lister, ok := h.storage.(storage.DirectoryLister); ok {
+		databases, err = lister.ListDirectories(ctx, "")
+	} else {
+		// Fall back to List and extract unique top-level directories
+		files, listErr := h.storage.List(ctx, "")
+		if listErr != nil {
+			err = listErr
+		} else {
+			databases = h.extractTopLevelDirs(files)
+		}
 	}
 
-	// Scan for database directories
-	entries, err := os.ReadDir(basePath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			// No data directory yet, return empty result
-			return c.JSON(QueryResponse{
-				Success:         true,
-				Columns:         columns,
-				Data:            data,
-				RowCount:        0,
-				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
-				Timestamp:       time.Now().UTC().Format(time.RFC3339),
-			})
-		}
-		h.logger.Error().Err(err).Str("path", basePath).Msg("Failed to read storage directory")
+		h.logger.Error().Err(err).Msg("Failed to list databases")
 		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
 			Error:           "Failed to read storage: " + err.Error(),
@@ -528,24 +521,25 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 		})
 	}
 
-	databases := make([]string, 0)
-	for _, entry := range entries {
-		if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") && !strings.HasPrefix(entry.Name(), "_") {
-			databases = append(databases, entry.Name())
+	// Filter out hidden directories
+	filtered := make([]string, 0)
+	for _, db := range databases {
+		if !strings.HasPrefix(db, ".") && !strings.HasPrefix(db, "_") {
+			filtered = append(filtered, db)
 		}
 	}
 
 	// Sort alphabetically
-	sort.Strings(databases)
+	sort.Strings(filtered)
 
-	for _, db := range databases {
+	for _, db := range filtered {
 		data = append(data, []interface{}{db})
 	}
 
 	executionTime := float64(time.Since(start).Milliseconds())
 
 	h.logger.Info().
-		Int("database_count", len(databases)).
+		Int("database_count", len(filtered)).
 		Float64("execution_time_ms", executionTime).
 		Msg("SHOW DATABASES completed")
 
@@ -566,36 +560,27 @@ func (h *QueryHandler) handleShowTables(c *fiber.Ctx, start time.Time, database 
 	columns := []string{"database", "table_name", "storage_path", "file_count", "total_size_mb"}
 	data := make([][]interface{}, 0)
 
-	// Get base path from storage backend
-	basePath := h.getStorageBasePath()
-	if basePath == "" {
-		return c.JSON(QueryResponse{
-			Success:         true,
-			Columns:         columns,
-			Data:            data,
-			RowCount:        0,
-			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
-			Timestamp:       time.Now().UTC().Format(time.RFC3339),
-		})
+	ctx := context.Background()
+
+	// Use DirectoryLister interface if available, otherwise fall back to List
+	var tables []string
+	var err error
+
+	prefix := database + "/"
+	if lister, ok := h.storage.(storage.DirectoryLister); ok {
+		tables, err = lister.ListDirectories(ctx, prefix)
+	} else {
+		// Fall back to List and extract table names
+		files, listErr := h.storage.List(ctx, prefix)
+		if listErr != nil {
+			err = listErr
+		} else {
+			tables = h.extractTableNames(files, database)
+		}
 	}
 
-	dbPath := filepath.Join(basePath, database)
-
-	// Scan for table/measurement directories
-	entries, err := os.ReadDir(dbPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			// Database doesn't exist yet, return empty result
-			return c.JSON(QueryResponse{
-				Success:         true,
-				Columns:         columns,
-				Data:            data,
-				RowCount:        0,
-				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
-				Timestamp:       time.Now().UTC().Format(time.RFC3339),
-			})
-		}
-		h.logger.Error().Err(err).Str("path", dbPath).Msg("Failed to read database directory")
+		h.logger.Error().Err(err).Str("database", database).Msg("Failed to list tables")
 		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
 			Error:           "Failed to read database: " + err.Error(),
@@ -604,18 +589,25 @@ func (h *QueryHandler) handleShowTables(c *fiber.Ctx, start time.Time, database 
 		})
 	}
 
-	tables := make([]string, 0)
-	for _, entry := range entries {
-		if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") && !strings.HasPrefix(entry.Name(), "_") {
-			tables = append(tables, entry.Name())
+	// Filter out hidden tables
+	filtered := make([]string, 0)
+	for _, table := range tables {
+		if !strings.HasPrefix(table, ".") && !strings.HasPrefix(table, "_") {
+			filtered = append(filtered, table)
 		}
 	}
 
 	// Sort alphabetically
-	sort.Strings(tables)
+	sort.Strings(filtered)
 
-	for _, table := range tables {
-		tablePath := filepath.Join(dbPath, table)
+	for _, table := range filtered {
+		// Get table stats - for S3 use prefix path, for local use filesystem path
+		var tablePath string
+		if basePath := h.getStorageBasePath(); basePath != "" {
+			tablePath = filepath.Join(basePath, database, table)
+		} else {
+			tablePath = database + "/" + table + "/"
+		}
 		fileCount, totalSize := h.getTableStats(tablePath)
 
 		// Format storage path for display
@@ -634,7 +626,7 @@ func (h *QueryHandler) handleShowTables(c *fiber.Ctx, start time.Time, database 
 
 	h.logger.Info().
 		Str("database", database).
-		Int("table_count", len(tables)).
+		Int("table_count", len(filtered)).
 		Float64("execution_time_ms", executionTime).
 		Msg("SHOW TABLES completed")
 
@@ -648,39 +640,99 @@ func (h *QueryHandler) handleShowTables(c *fiber.Ctx, start time.Time, database 
 	})
 }
 
-// getStorageBasePath returns the base path for storage
+// extractTableNames extracts unique table names from file paths within a database
+func (h *QueryHandler) extractTableNames(files []string, database string) []string {
+	seen := make(map[string]bool)
+	var tables []string
+	prefix := database + "/"
+
+	for _, f := range files {
+		if !strings.HasPrefix(f, prefix) {
+			continue
+		}
+		// Remove database prefix and get table name
+		remaining := strings.TrimPrefix(f, prefix)
+		parts := strings.SplitN(remaining, "/", 2)
+		if len(parts) > 0 && parts[0] != "" {
+			table := parts[0]
+			if !seen[table] {
+				seen[table] = true
+				tables = append(tables, table)
+			}
+		}
+	}
+
+	return tables
+}
+
+// getStorageBasePath returns the base path for local storage (empty for S3)
 func (h *QueryHandler) getStorageBasePath() string {
 	switch backend := h.storage.(type) {
 	case *storage.LocalBackend:
 		return backend.GetBasePath()
-	case *storage.S3Backend:
-		// For S3, we can't easily scan directories
-		// Return empty to indicate we need different handling
-		// TODO: Implement S3 listing via the backend
-		h.logger.Warn().Msg("SHOW commands not fully supported for S3 backend yet")
-		return ""
 	default:
-		return "./data/arc"
+		return ""
 	}
 }
 
-// getTableStats returns file count and total size for a table directory
+// extractTopLevelDirs extracts unique top-level directory names from file paths
+func (h *QueryHandler) extractTopLevelDirs(files []string) []string {
+	seen := make(map[string]bool)
+	var dirs []string
+
+	for _, f := range files {
+		parts := strings.SplitN(f, "/", 2)
+		if len(parts) > 0 && parts[0] != "" {
+			dir := parts[0]
+			if !seen[dir] {
+				seen[dir] = true
+				dirs = append(dirs, dir)
+			}
+		}
+	}
+
+	return dirs
+}
+
+// getTableStats returns file count and total size for a table
+// Works with both local filesystem and S3 backends
 func (h *QueryHandler) getTableStats(tablePath string) (int, int64) {
 	var fileCount int
 	var totalSize int64
 
-	_ = filepath.WalkDir(tablePath, func(path string, d os.DirEntry, err error) error {
+	// For local backend, use filesystem walk
+	if basePath := h.getStorageBasePath(); basePath != "" {
+		_ = filepath.WalkDir(tablePath, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil // Continue on error
+			}
+			if !d.IsDir() && strings.HasSuffix(strings.ToLower(d.Name()), ".parquet") {
+				fileCount++
+				if info, err := d.Info(); err == nil {
+					totalSize += info.Size()
+				}
+			}
+			return nil
+		})
+		return fileCount, totalSize
+	}
+
+	// For S3 and other backends, use ObjectLister if available
+	if lister, ok := h.storage.(storage.ObjectLister); ok {
+		ctx := context.Background()
+		objects, err := lister.ListObjects(ctx, tablePath)
 		if err != nil {
-			return nil // Continue on error
+			h.logger.Warn().Err(err).Str("path", tablePath).Msg("Failed to list objects for stats")
+			return 0, 0
 		}
-		if !d.IsDir() && strings.HasSuffix(strings.ToLower(d.Name()), ".parquet") {
-			fileCount++
-			if info, err := d.Info(); err == nil {
-				totalSize += info.Size()
+
+		for _, obj := range objects {
+			if strings.HasSuffix(strings.ToLower(obj.Path), ".parquet") {
+				fileCount++
+				totalSize += obj.Size
 			}
 		}
-		return nil
-	})
+	}
 
 	return fileCount, totalSize
 }

@@ -204,6 +204,22 @@ func createStorageBackendFromConfig(config *SubprocessJobConfig, logger zerolog.
 			// Credentials come from environment variables
 		}, logger)
 
+	case "azure":
+		var azureConfig struct {
+			Container   string `json:"container"`
+			AccountName string `json:"account_name"`
+			Endpoint    string `json:"endpoint"`
+		}
+		if err := json.Unmarshal([]byte(config.StorageConfig), &azureConfig); err != nil {
+			return nil, fmt.Errorf("failed to parse Azure storage config: %w", err)
+		}
+		return storage.NewAzureBlobBackend(&storage.AzureBlobConfig{
+			ContainerName:      azureConfig.Container,
+			AccountName:        azureConfig.AccountName,
+			Endpoint:           azureConfig.Endpoint,
+			UseManagedIdentity: true, // Use default credential chain in subprocess
+		}, logger)
+
 	default:
 		return nil, fmt.Errorf("unsupported storage type: %s", config.StorageType)
 	}
