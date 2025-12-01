@@ -28,6 +28,7 @@ type TimeSeriesCollector struct {
 	system      *TimeSeriesBuffer // System metrics (CPU, memory, goroutines)
 	application *TimeSeriesBuffer // Application metrics (ingest, query counts)
 	api         *TimeSeriesBuffer // API metrics (HTTP requests, latency)
+	interval    time.Duration     // Collection interval
 	stopCh      chan struct{}
 	wg          sync.WaitGroup
 }
@@ -37,13 +38,25 @@ var (
 	tsOnce      sync.Once
 )
 
-// GetTimeSeriesCollector returns the singleton time-series collector
+// InitTimeSeriesCollector initializes the singleton collector with configuration.
+// Must be called before GetTimeSeriesCollector. If not called, defaults are used.
+func InitTimeSeriesCollector(retentionMinutes, intervalSeconds int) {
+	tsOnce.Do(func() {
+		// Calculate buffer size based on retention and interval
+		bufferSize := (retentionMinutes * 60) / intervalSeconds
+		interval := time.Duration(intervalSeconds) * time.Second
+
+		tsCollector = NewTimeSeriesCollector(bufferSize, interval)
+		tsCollector.Start()
+	})
+}
+
+// GetTimeSeriesCollector returns the singleton time-series collector.
+// If InitTimeSeriesCollector was not called, uses defaults (30 min retention, 5 sec interval).
 func GetTimeSeriesCollector() *TimeSeriesCollector {
 	tsOnce.Do(func() {
-		tsCollector = NewTimeSeriesCollector(
-			1800,          // 30 minutes of 1-second samples
-			time.Second,   // Collect every second
-		)
+		// Default: 30 minutes retention, 5 second interval = 360 points
+		tsCollector = NewTimeSeriesCollector(360, 5*time.Second)
 		tsCollector.Start()
 	})
 	return tsCollector
@@ -55,6 +68,7 @@ func NewTimeSeriesCollector(bufferSize int, interval time.Duration) *TimeSeriesC
 		system:      NewTimeSeriesBuffer(bufferSize, interval),
 		application: NewTimeSeriesBuffer(bufferSize, interval),
 		api:         NewTimeSeriesBuffer(bufferSize, interval),
+		interval:    interval,
 		stopCh:      make(chan struct{}),
 	}
 }
@@ -73,7 +87,7 @@ func (c *TimeSeriesCollector) Start() {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		ticker := time.NewTicker(time.Second)
+		ticker := time.NewTicker(c.interval)
 		defer ticker.Stop()
 
 		for {
@@ -105,13 +119,15 @@ func (c *TimeSeriesCollector) collect() {
 	c.system.Add(TimeSeriesPoint{
 		Timestamp: now,
 		Values: map[string]interface{}{
-			"goroutines":           runtime.NumGoroutine(),
-			"memory_alloc_mb":      float64(memStats.Alloc) / 1024 / 1024,
-			"memory_heap_mb":       float64(memStats.HeapAlloc) / 1024 / 1024,
-			"memory_sys_mb":        float64(memStats.Sys) / 1024 / 1024,
-			"gc_cycles":            memStats.NumGC,
-			"gc_pause_ns":          memStats.PauseNs[(memStats.NumGC+255)%256],
-			"cpu_cgo_calls":        runtime.NumCgoCall(),
+			"goroutines":         runtime.NumGoroutine(),
+			"memory_alloc_mb":    float64(memStats.Alloc) / 1024 / 1024,
+			"memory_heap_mb":     float64(memStats.HeapAlloc) / 1024 / 1024,
+			"memory_sys_mb":      float64(memStats.Sys) / 1024 / 1024,
+			"memory_stack_mb":    float64(memStats.StackInuse) / 1024 / 1024,
+			"memory_gc_sys_mb":   float64(memStats.GCSys) / 1024 / 1024,
+			"gc_cycles":          memStats.NumGC,
+			"gc_pause_ns":        memStats.PauseNs[(memStats.NumGC+255)%256],
+			"cpu_cgo_calls":      runtime.NumCgoCall(),
 		},
 	})
 
@@ -119,13 +135,38 @@ func (c *TimeSeriesCollector) collect() {
 	c.application.Add(TimeSeriesPoint{
 		Timestamp: now,
 		Values: map[string]interface{}{
-			"ingest_records_total":  m.ingestRecordsTotal.Load(),
-			"ingest_bytes_total":    m.ingestBytesTotal.Load(),
-			"query_requests_total":  m.queryRequestsTotal.Load(),
-			"query_rows_total":      m.queryRowsTotal.Load(),
-			"buffer_queue_depth":    m.bufferQueueDepth.Load(),
-			"storage_writes_total":  m.storageWritesTotal.Load(),
-			"compaction_jobs_total": m.compactionJobsTotal.Load(),
+			// Ingestion totals
+			"ingest_records_total":       m.ingestRecordsTotal.Load(),
+			"ingest_bytes_total":         m.ingestBytesTotal.Load(),
+			"ingest_batches_total":       m.ingestBatchesTotal.Load(),
+			"ingest_errors_total":        m.ingestErrorsTotal.Load(),
+			// MessagePack specific
+			"msgpack_requests_total":     m.msgpackRequestsTotal.Load(),
+			"msgpack_records_total":      m.msgpackRecordsTotal.Load(),
+			"msgpack_bytes_total":        m.msgpackBytesTotal.Load(),
+			// Line Protocol specific
+			"lineprotocol_requests_total": m.lineprotocolRequestsTotal.Load(),
+			"lineprotocol_records_total":  m.lineprotocolRecordsTotal.Load(),
+			"lineprotocol_bytes_total":    m.lineprotocolBytesTotal.Load(),
+			// Query
+			"query_requests_total":       m.queryRequestsTotal.Load(),
+			"query_rows_total":           m.queryRowsTotal.Load(),
+			// Buffer
+			"buffer_queue_depth":         m.bufferQueueDepth.Load(),
+			"buffer_flushes_total":       m.bufferFlushesTotal.Load(),
+			"buffer_errors_total":        m.bufferErrorsTotal.Load(),
+			// Storage
+			"storage_writes_total":       m.storageWritesTotal.Load(),
+			"storage_write_bytes_total":  m.storageWriteBytesTotal.Load(),
+			"storage_reads_total":        m.storageReadsTotal.Load(),
+			"storage_read_bytes_total":   m.storageReadBytesTotal.Load(),
+			"storage_errors_total":       m.storageErrorsTotal.Load(),
+			// Compaction
+			"compaction_jobs_total":      m.compactionJobsTotal.Load(),
+			"compaction_jobs_success":    m.compactionJobsSuccess.Load(),
+			"compaction_jobs_failed":     m.compactionJobsFailed.Load(),
+			"compaction_bytes_read":      m.compactionBytesRead.Load(),
+			"compaction_bytes_written":   m.compactionBytesWritten.Load(),
 		},
 	})
 
@@ -140,6 +181,12 @@ func (c *TimeSeriesCollector) collect() {
 			"query_latency_avg_us":  calculateAvgLatency(m.queryLatencySum.Load(), m.queryLatencyCount.Load()),
 			"db_connections_open":   m.dbConnectionsOpen.Load(),
 			"db_connections_in_use": m.dbConnectionsInUse.Load(),
+			"db_queries_total":      m.dbQueriesTotal.Load(),
+			"db_query_errors_total": m.dbQueryErrorsTotal.Load(),
+			"auth_requests_total":   m.authRequestsTotal.Load(),
+			"auth_cache_hits":       m.authCacheHits.Load(),
+			"auth_cache_misses":     m.authCacheMisses.Load(),
+			"auth_failures_total":   m.authFailuresTotal.Load(),
 		},
 	})
 }

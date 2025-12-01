@@ -23,6 +23,7 @@ type Config struct {
 	Delete          DeleteConfig
 	Retention       RetentionConfig
 	ContinuousQuery ContinuousQueryConfig
+	Metrics         MetricsConfig
 }
 
 type ServerConfig struct {
@@ -121,6 +122,11 @@ type RetentionConfig struct {
 type ContinuousQueryConfig struct {
 	Enabled bool   // Enable continuous query management (default: true for CRUD, execution is manual)
 	DBPath  string // SQLite database path for storing queries
+}
+
+type MetricsConfig struct {
+	TimeseriesRetentionMinutes int // Retention period for timeseries data in minutes (default: 30, max: 1440)
+	TimeseriesIntervalSeconds  int // Collection interval in seconds (default: 5)
 }
 
 // Load loads configuration from environment and config file
@@ -236,6 +242,10 @@ func Load() (*Config, error) {
 			Enabled: v.GetBool("continuous_query.enabled"),
 			DBPath:  v.GetString("continuous_query.db_path"),
 		},
+		Metrics: MetricsConfig{
+			TimeseriesRetentionMinutes: v.GetInt("metrics.timeseries_retention_minutes"),
+			TimeseriesIntervalSeconds:  v.GetInt("metrics.timeseries_interval_seconds"),
+		},
 	}
 
 	return cfg, nil
@@ -319,8 +329,12 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("retention.db_path", "./data/arc.db")  // Shared SQLite DB with auth
 
 	// Continuous query defaults
-	v.SetDefault("continuous_query.enabled", true)             // Enable CQ management by default
-	v.SetDefault("continuous_query.db_path", "./data/arc.db")  // Shared SQLite DB with auth
+	v.SetDefault("continuous_query.enabled", true)            // Enable CQ management by default
+	v.SetDefault("continuous_query.db_path", "./data/arc.db") // Shared SQLite DB with auth
+
+	// Metrics defaults
+	v.SetDefault("metrics.timeseries_retention_minutes", 30) // 30 minutes retention
+	v.SetDefault("metrics.timeseries_interval_seconds", 5)   // Collect every 5 seconds
 }
 
 func getDefaultThreadCount() int {

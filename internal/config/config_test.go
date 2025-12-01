@@ -123,3 +123,62 @@ func TestLoad_EnvOverride(t *testing.T) {
 		t.Errorf("Database.ThreadCount = %d, want 8 (from env)", cfg.Database.ThreadCount)
 	}
 }
+
+func TestLoad_MetricsDefaults(t *testing.T) {
+	// Create a temp dir without config file to test defaults
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	// Verify metrics defaults
+	if cfg.Metrics.TimeseriesRetentionMinutes != 30 {
+		t.Errorf("Metrics.TimeseriesRetentionMinutes = %d, want 30", cfg.Metrics.TimeseriesRetentionMinutes)
+	}
+	if cfg.Metrics.TimeseriesIntervalSeconds != 5 {
+		t.Errorf("Metrics.TimeseriesIntervalSeconds = %d, want 5", cfg.Metrics.TimeseriesIntervalSeconds)
+	}
+}
+
+func TestLoad_MetricsEnvOverride(t *testing.T) {
+	// Create a temp dir without config file
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	// Set env vars to override
+	os.Setenv("ARC_METRICS_TIMESERIES_RETENTION_MINUTES", "60")
+	os.Setenv("ARC_METRICS_TIMESERIES_INTERVAL_SECONDS", "10")
+	defer func() {
+		os.Unsetenv("ARC_METRICS_TIMESERIES_RETENTION_MINUTES")
+		os.Unsetenv("ARC_METRICS_TIMESERIES_INTERVAL_SECONDS")
+	}()
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Metrics.TimeseriesRetentionMinutes != 60 {
+		t.Errorf("Metrics.TimeseriesRetentionMinutes = %d, want 60 (from env)", cfg.Metrics.TimeseriesRetentionMinutes)
+	}
+	if cfg.Metrics.TimeseriesIntervalSeconds != 10 {
+		t.Errorf("Metrics.TimeseriesIntervalSeconds = %d, want 10 (from env)", cfg.Metrics.TimeseriesIntervalSeconds)
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
 
@@ -117,8 +118,13 @@ func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) erro
 	// Atomic rename
 	if err := os.Rename(tmpPath, fullPath); err != nil {
 		os.Remove(tmpPath) // Clean up temp file on error
+		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to rename temp file: %w", err)
 	}
+
+	// Record metrics
+	metrics.Get().IncStorageWrites()
+	metrics.Get().IncStorageWriteBytes(int64(len(data)))
 
 	b.logger.Debug().
 		Str("path", path).
@@ -165,8 +171,13 @@ func (b *LocalBackend) WriteReader(ctx context.Context, path string, reader io.R
 	// Atomic rename
 	if err := os.Rename(tmpPath, fullPath); err != nil {
 		os.Remove(tmpPath) // Clean up temp file on error
+		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to rename temp file: %w", err)
 	}
+
+	// Record metrics
+	metrics.Get().IncStorageWrites()
+	metrics.Get().IncStorageWriteBytes(written)
 
 	b.logger.Debug().
 		Str("path", path).
@@ -187,10 +198,16 @@ func (b *LocalBackend) Read(ctx context.Context, path string) ([]byte, error) {
 	data, err := os.ReadFile(fullPath)
 	if err != nil {
 		if os.IsNotExist(err) {
+			metrics.Get().IncStorageErrors()
 			return nil, fmt.Errorf("file not found: %s", path)
 		}
+		metrics.Get().IncStorageErrors()
 		return nil, fmt.Errorf("failed to read file: %w", err)
 	}
+
+	// Record metrics
+	metrics.Get().IncStorageReads()
+	metrics.Get().IncStorageReadBytes(int64(len(data)))
 
 	return data, nil
 }
@@ -205,6 +222,7 @@ func (b *LocalBackend) ReadTo(ctx context.Context, path string, writer io.Writer
 
 	file, err := os.Open(fullPath)
 	if err != nil {
+		metrics.Get().IncStorageErrors()
 		if os.IsNotExist(err) {
 			return fmt.Errorf("file not found: %s", path)
 		}
@@ -212,10 +230,15 @@ func (b *LocalBackend) ReadTo(ctx context.Context, path string, writer io.Writer
 	}
 	defer file.Close()
 
-	_, err = io.Copy(writer, file)
+	bytesRead, err := io.Copy(writer, file)
 	if err != nil {
+		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to copy file data: %w", err)
 	}
+
+	// Record metrics
+	metrics.Get().IncStorageReads()
+	metrics.Get().IncStorageReadBytes(bytesRead)
 
 	return nil
 }
