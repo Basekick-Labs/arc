@@ -47,6 +47,16 @@ func main() {
 	// Initialize metrics collector
 	metrics.Init(logger.Get("metrics"))
 
+	// Initialize timeseries collector with config
+	metrics.InitTimeSeriesCollector(
+		cfg.Metrics.TimeseriesRetentionMinutes,
+		cfg.Metrics.TimeseriesIntervalSeconds,
+	)
+	log.Info().
+		Int("retention_minutes", cfg.Metrics.TimeseriesRetentionMinutes).
+		Int("interval_seconds", cfg.Metrics.TimeseriesIntervalSeconds).
+		Msg("Timeseries metrics collector initialized")
+
 	// Initialize shutdown coordinator
 	shutdownCoordinator := shutdown.New(30*time.Second, logger.Get("shutdown"))
 

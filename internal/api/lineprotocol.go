@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 
 	"github.com/basekick-labs/arc/internal/ingest"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/gofiber/fiber/v2"
 	"github.com/klauspost/compress/gzip"
 	"github.com/rs/zerolog"
@@ -163,6 +164,7 @@ func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string) error {
 		err := h.buffer.WriteColumnarDirect(c.Context(), database, measurement, columns)
 		if err != nil {
 			h.totalErrors.Add(1)
+			metrics.Get().IncIngestErrors()
 			h.logger.Error().
 				Err(err).
 				Str("database", database).
@@ -174,6 +176,15 @@ func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string) error {
 			})
 		}
 	}
+
+	// Record global metrics
+	m := metrics.Get()
+	m.IncLineProtocolRequests()
+	m.IncLineProtocolRecords(int64(len(records)))
+	m.IncLineProtocolBytes(int64(len(body)))
+	m.IncIngestRecords(int64(len(records)))
+	m.IncIngestBytes(int64(len(body)))
+	m.IncIngestBatches()
 
 	// InfluxDB returns 204 No Content on success
 	return c.SendStatus(fiber.StatusNoContent)

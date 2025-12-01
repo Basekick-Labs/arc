@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/basekick-labs/arc/internal/ingest"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/gofiber/fiber/v2"
 	"github.com/klauspost/compress/gzip"
 	"github.com/rs/zerolog"
@@ -151,10 +152,20 @@ func (h *MsgPackHandler) writeMsgPack(c *fiber.Ctx) error {
 
 	if err := h.arrowBuffer.Write(ctx, database, records); err != nil {
 		h.logger.Error().Err(err).Msg("Failed to write to Arrow buffer")
+		metrics.Get().IncIngestErrors()
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to write records",
 		})
 	}
+
+	// Record metrics
+	m := metrics.Get()
+	m.IncMsgPackRequests()
+	m.IncMsgPackRecords(int64(recordCount))
+	m.IncMsgPackBytes(int64(len(payload)))
+	m.IncIngestRecords(int64(recordCount))
+	m.IncIngestBytes(int64(len(payload)))
+	m.IncIngestBatches()
 
 	// Return 204 No Content (InfluxDB compatible)
 	return c.SendStatus(fiber.StatusNoContent)

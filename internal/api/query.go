@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/database"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/pruning"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
@@ -178,10 +179,13 @@ func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 // executeQuery handles POST /api/v1/query - returns JSON response
 func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 	start := time.Now()
+	m := metrics.Get()
+	m.IncQueryRequests()
 
 	// Parse request body
 	var req QueryRequest
 	if err := c.BodyParser(&req); err != nil {
+		m.IncQueryErrors()
 		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
 			Success:   false,
 			Error:     "Invalid request body: " + err.Error(),
@@ -191,6 +195,7 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 
 	// Validate SQL
 	if strings.TrimSpace(req.SQL) == "" {
+		m.IncQueryErrors()
 		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
 			Success:   false,
 			Error:     "SQL query is required",
@@ -199,6 +204,7 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 	}
 
 	if len(req.SQL) > 10000 {
+		m.IncQueryErrors()
 		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
 			Success:   false,
 			Error:     "SQL query exceeds maximum length (10000 characters)",
@@ -208,6 +214,7 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 
 	// Check for dangerous SQL patterns
 	if err := h.validateSQL(req.SQL); err != nil {
+		m.IncQueryErrors()
 		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
 			Success:   false,
 			Error:     err.Error(),
@@ -240,6 +247,7 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 	// Execute query
 	rows, err := h.db.Query(convertedSQL)
 	if err != nil {
+		m.IncQueryErrors()
 		h.logger.Error().Err(err).Str("sql", req.SQL).Msg("Query execution failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
@@ -253,6 +261,7 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 	// Get column names
 	columns, err := rows.Columns()
 	if err != nil {
+		m.IncQueryErrors()
 		h.logger.Error().Err(err).Msg("Failed to get column names")
 		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
@@ -294,6 +303,11 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 	}
 
 	executionTime := float64(time.Since(start).Milliseconds())
+
+	// Record success metrics
+	m.IncQuerySuccess()
+	m.IncQueryRows(int64(rowCount))
+	m.RecordQueryLatency(time.Since(start).Microseconds())
 
 	h.logger.Info().
 		Int("row_count", rowCount).
@@ -925,9 +939,12 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 // queryMeasurement handles GET /api/v1/query/:measurement - query a specific measurement
 func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	start := time.Now()
+	m := metrics.Get()
+	m.IncQueryRequests()
 
 	measurement := c.Params("measurement")
 	if measurement == "" {
+		m.IncQueryErrors()
 		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
 			Success:   false,
 			Error:     "Measurement name is required",
@@ -944,6 +961,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 
 	// Validate database and measurement names (prevent SQL injection via identifiers)
 	if err := validateIdentifier(database); err != nil {
+		m.IncQueryErrors()
 		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
 			Success:   false,
 			Error:     "Invalid database name: " + err.Error(),
@@ -951,6 +969,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		})
 	}
 	if err := validateIdentifier(measurement); err != nil {
+		m.IncQueryErrors()
 		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
 			Success:   false,
 			Error:     "Invalid measurement name: " + err.Error(),
@@ -961,6 +980,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	// Validate limit and offset as integers
 	limit, err := strconv.Atoi(limitStr)
 	if err != nil || limit < 0 || limit > 1000000 {
+		m.IncQueryErrors()
 		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
 			Success:   false,
 			Error:     "Invalid limit: must be a positive integer up to 1000000",
@@ -969,6 +989,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	}
 	offset, err := strconv.Atoi(offsetStr)
 	if err != nil || offset < 0 {
+		m.IncQueryErrors()
 		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
 			Success:   false,
 			Error:     "Invalid offset: must be a non-negative integer",
@@ -978,6 +999,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 
 	// Validate ORDER BY clause
 	if err := validateOrderByClause(orderBy); err != nil {
+		m.IncQueryErrors()
 		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
 			Success:   false,
 			Error:     "Invalid order_by: " + err.Error(),
@@ -988,6 +1010,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	// Validate WHERE clause if provided
 	if where != "" {
 		if err := validateWhereClauseQuery(where); err != nil {
+			m.IncQueryErrors()
 			return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
 				Success:   false,
 				Error:     "Invalid where clause: " + err.Error(),
@@ -1017,6 +1040,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	// Execute query
 	rows, err := h.db.Query(convertedSQL)
 	if err != nil {
+		m.IncQueryErrors()
 		h.logger.Error().Err(err).Str("sql", sql).Msg("Measurement query failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
@@ -1030,6 +1054,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	// Get column names
 	columns, err := rows.Columns()
 	if err != nil {
+		m.IncQueryErrors()
 		h.logger.Error().Err(err).Msg("Failed to get column names in measurement query")
 		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
@@ -1065,6 +1090,11 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	}
 
 	executionTime := float64(time.Since(start).Milliseconds())
+
+	// Record success metrics
+	m.IncQuerySuccess()
+	m.IncQueryRows(int64(rowCount))
+	m.RecordQueryLatency(time.Since(start).Microseconds())
 
 	h.logger.Info().
 		Str("measurement", measurement).
