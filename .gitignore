@@ -79,3 +79,5 @@ temp/
 *.sha256
 
 docs/progress/2025-11-28-6month-product-roadmap.md
+RELEASE_NOTES_2026.01.1.md
+arc.toml

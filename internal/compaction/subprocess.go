@@ -124,17 +124,22 @@ func RunJobInSubprocess(ctx context.Context, config *SubprocessJobConfig, logger
 		return nil, fmt.Errorf("failed to get executable path: %w", err)
 	}
 
-	// Build command: arc compact --job '<json>'
-	cmd := exec.CommandContext(ctx, execPath, "compact", "--job", string(configJSON))
+	// Build command: arc compact --job-stdin
+	// Pass config via stdin to avoid "argument list too long" errors with many files
+	cmd := exec.CommandContext(ctx, execPath, "compact", "--job-stdin")
+
+	// Pass config via stdin
+	cmd.Stdin = bytes.NewReader(configJSON)
 
 	// Capture stdout and stderr separately
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	logger.Debug().
+	logger.Info().
 		Str("partition", config.PartitionPath).
 		Int("files", len(config.Files)).
+		Int("config_size_kb", len(configJSON)/1024).
 		Msg("Starting compaction subprocess")
 
 	// Run subprocess

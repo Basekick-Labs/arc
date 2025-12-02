@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -494,19 +495,33 @@ func main() {
 // ensuring DuckDB memory is fully released when the subprocess exits.
 func runCompactSubcommand(args []string) {
 	fs := flag.NewFlagSet("compact", flag.ExitOnError)
-	jobJSON := fs.String("job", "", "Job configuration as JSON")
+	jobJSON := fs.String("job", "", "Job configuration as JSON (deprecated, use --job-stdin)")
+	jobStdin := fs.Bool("job-stdin", false, "Read job configuration from stdin")
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to parse flags: %v\n", err)
 		os.Exit(1)
 	}
 
-	if *jobJSON == "" {
-		fmt.Fprintln(os.Stderr, "error: --job flag required")
+	var configData []byte
+	var err error
+
+	if *jobStdin {
+		// Read config from stdin (preferred - avoids argument list too long errors)
+		configData, err = io.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to read config from stdin: %v\n", err)
+			os.Exit(1)
+		}
+	} else if *jobJSON != "" {
+		// Legacy: read from command line argument
+		configData = []byte(*jobJSON)
+	} else {
+		fmt.Fprintln(os.Stderr, "error: --job-stdin or --job flag required")
 		os.Exit(1)
 	}
 
 	var cfg compaction.SubprocessJobConfig
-	if err := json.Unmarshal([]byte(*jobJSON), &cfg); err != nil {
+	if err := json.Unmarshal(configData, &cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "error: invalid job config: %v\n", err)
 		os.Exit(1)
 	}
