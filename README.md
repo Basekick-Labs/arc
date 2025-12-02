@@ -1,3 +1,5 @@
+<img width="940" height="788" alt="arc" src="https://github.com/user-attachments/assets/4801a460-3f4c-4ccc-b7d9-a00cb4d1d94a" />
+
 # Arc
 
 [![Ingestion](https://img.shields.io/badge/ingestion-9.47M%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
