@@ -1,4 +1,4 @@
-<img width="940" height="788" alt="arc" src="https://github.com/user-attachments/assets/4801a460-3f4c-4ccc-b7d9-a00cb4d1d94a" />
+<img width="940" height="217" alt="github_logo" src="https://github.com/user-attachments/assets/8d2587f3-abff-4224-a206-6f394608b831" />
 
 # Arc
 
