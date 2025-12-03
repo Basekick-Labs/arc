@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 	"strings"
 
@@ -31,6 +32,10 @@ type ServerConfig struct {
 	Port         int
 	ReadTimeout  int
 	WriteTimeout int
+	// TLS Configuration
+	TLSEnabled  bool   // Enable HTTPS/TLS
+	TLSCertFile string // Path to TLS certificate file (PEM format)
+	TLSKeyFile  string // Path to TLS private key file (PEM format)
 }
 
 type DatabaseConfig struct {
@@ -171,6 +176,9 @@ func Load() (*Config, error) {
 			Port:         v.GetInt("server.port"),
 			ReadTimeout:  v.GetInt("server.read_timeout"),
 			WriteTimeout: v.GetInt("server.write_timeout"),
+			TLSEnabled:   v.GetBool("server.tls_enabled"),
+			TLSCertFile:  v.GetString("server.tls_cert_file"),
+			TLSKeyFile:   v.GetString("server.tls_key_file"),
 		},
 		Database: DatabaseConfig{
 			MaxConnections: v.GetInt("database.max_connections"),
@@ -273,6 +281,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("server.port", 8000)
 	v.SetDefault("server.read_timeout", 30)
 	v.SetDefault("server.write_timeout", 30)
+	// TLS defaults - disabled by default for backward compatibility
+	v.SetDefault("server.tls_enabled", false)
+	v.SetDefault("server.tls_cert_file", "")
+	v.SetDefault("server.tls_key_file", "")
 
 	// Database defaults - dynamically calculated based on system resources
 	v.SetDefault("database.max_connections", getDefaultMaxConnections())
@@ -393,4 +405,45 @@ func getDefaultMemoryLimit() string {
 		return "32GB" // Cap at 32GB by default
 	}
 	return fmt.Sprintf("%dGB", targetMemGB)
+}
+
+// ValidateTLS validates TLS configuration when TLS is enabled.
+// Returns nil if TLS is disabled or if configuration is valid.
+func (cfg *ServerConfig) ValidateTLS() error {
+	if !cfg.TLSEnabled {
+		return nil
+	}
+
+	if cfg.TLSCertFile == "" {
+		return fmt.Errorf("TLS enabled but server.tls_cert_file not specified")
+	}
+	if cfg.TLSKeyFile == "" {
+		return fmt.Errorf("TLS enabled but server.tls_key_file not specified")
+	}
+
+	// Verify cert file exists and is accessible
+	certInfo, err := os.Stat(cfg.TLSCertFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("TLS certificate file not found: %s", cfg.TLSCertFile)
+		}
+		return fmt.Errorf("cannot access TLS certificate file %s: %w", cfg.TLSCertFile, err)
+	}
+	if certInfo.IsDir() {
+		return fmt.Errorf("TLS certificate path is a directory, not a file: %s", cfg.TLSCertFile)
+	}
+
+	// Verify key file exists and is accessible
+	keyInfo, err := os.Stat(cfg.TLSKeyFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("TLS key file not found: %s", cfg.TLSKeyFile)
+		}
+		return fmt.Errorf("cannot access TLS key file %s: %w", cfg.TLSKeyFile, err)
+	}
+	if keyInfo.IsDir() {
+		return fmt.Errorf("TLS key path is a directory, not a file: %s", cfg.TLSKeyFile)
+	}
+
+	return nil
 }

@@ -2,7 +2,9 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -180,5 +182,200 @@ func TestLoad_MetricsEnvOverride(t *testing.T) {
 	}
 	if cfg.Metrics.TimeseriesIntervalSeconds != 10 {
 		t.Errorf("Metrics.TimeseriesIntervalSeconds = %d, want 10 (from env)", cfg.Metrics.TimeseriesIntervalSeconds)
+	}
+}
+
+// TLS Configuration Tests
+
+func TestServerConfig_ValidateTLS_Disabled(t *testing.T) {
+	cfg := &ServerConfig{TLSEnabled: false}
+	if err := cfg.ValidateTLS(); err != nil {
+		t.Errorf("ValidateTLS() with TLS disabled should not error: %v", err)
+	}
+}
+
+func TestServerConfig_ValidateTLS_MissingCertFile(t *testing.T) {
+	cfg := &ServerConfig{
+		TLSEnabled:  true,
+		TLSCertFile: "",
+		TLSKeyFile:  "/some/key.pem",
+	}
+	err := cfg.ValidateTLS()
+	if err == nil {
+		t.Error("ValidateTLS() should error when cert file is empty")
+	}
+	if !strings.Contains(err.Error(), "tls_cert_file") {
+		t.Errorf("Error should mention tls_cert_file: %v", err)
+	}
+}
+
+func TestServerConfig_ValidateTLS_MissingKeyFile(t *testing.T) {
+	cfg := &ServerConfig{
+		TLSEnabled:  true,
+		TLSCertFile: "/some/cert.pem",
+		TLSKeyFile:  "",
+	}
+	err := cfg.ValidateTLS()
+	if err == nil {
+		t.Error("ValidateTLS() should error when key file is empty")
+	}
+	if !strings.Contains(err.Error(), "tls_key_file") {
+		t.Errorf("Error should mention tls_key_file: %v", err)
+	}
+}
+
+func TestServerConfig_ValidateTLS_CertFileNotFound(t *testing.T) {
+	cfg := &ServerConfig{
+		TLSEnabled:  true,
+		TLSCertFile: "/nonexistent/path/cert.pem",
+		TLSKeyFile:  "/nonexistent/path/key.pem",
+	}
+	err := cfg.ValidateTLS()
+	if err == nil {
+		t.Error("ValidateTLS() should error when cert file doesn't exist")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("Error should mention file not found: %v", err)
+	}
+}
+
+func TestServerConfig_ValidateTLS_KeyFileNotFound(t *testing.T) {
+	// Create a temp cert file but not key file
+	tmpDir, err := os.MkdirTemp("", "arc-tls-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	certPath := filepath.Join(tmpDir, "cert.pem")
+	if err := os.WriteFile(certPath, []byte("fake cert"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &ServerConfig{
+		TLSEnabled:  true,
+		TLSCertFile: certPath,
+		TLSKeyFile:  "/nonexistent/key.pem",
+	}
+	err = cfg.ValidateTLS()
+	if err == nil {
+		t.Error("ValidateTLS() should error when key file doesn't exist")
+	}
+	if !strings.Contains(err.Error(), "key file not found") {
+		t.Errorf("Error should mention key file not found: %v", err)
+	}
+}
+
+func TestServerConfig_ValidateTLS_CertIsDirectory(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-tls-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cfg := &ServerConfig{
+		TLSEnabled:  true,
+		TLSCertFile: tmpDir, // Directory, not a file
+		TLSKeyFile:  "/some/key.pem",
+	}
+	err = cfg.ValidateTLS()
+	if err == nil {
+		t.Error("ValidateTLS() should error when cert path is a directory")
+	}
+	if !strings.Contains(err.Error(), "directory") {
+		t.Errorf("Error should mention directory: %v", err)
+	}
+}
+
+func TestServerConfig_ValidateTLS_ValidFiles(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-tls-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	certPath := filepath.Join(tmpDir, "cert.pem")
+	keyPath := filepath.Join(tmpDir, "key.pem")
+
+	if err := os.WriteFile(certPath, []byte("fake cert"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, []byte("fake key"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &ServerConfig{
+		TLSEnabled:  true,
+		TLSCertFile: certPath,
+		TLSKeyFile:  keyPath,
+	}
+	err = cfg.ValidateTLS()
+	if err != nil {
+		t.Errorf("ValidateTLS() should not error with valid files: %v", err)
+	}
+}
+
+func TestLoad_TLSDefaults(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	// Verify TLS defaults
+	if cfg.Server.TLSEnabled != false {
+		t.Error("Server.TLSEnabled should default to false")
+	}
+	if cfg.Server.TLSCertFile != "" {
+		t.Errorf("Server.TLSCertFile should default to empty, got %s", cfg.Server.TLSCertFile)
+	}
+	if cfg.Server.TLSKeyFile != "" {
+		t.Errorf("Server.TLSKeyFile should default to empty, got %s", cfg.Server.TLSKeyFile)
+	}
+}
+
+func TestLoad_TLSEnvOverride(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	// Set env vars to enable TLS
+	os.Setenv("ARC_SERVER_TLS_ENABLED", "true")
+	os.Setenv("ARC_SERVER_TLS_CERT_FILE", "/path/to/cert.pem")
+	os.Setenv("ARC_SERVER_TLS_KEY_FILE", "/path/to/key.pem")
+	defer func() {
+		os.Unsetenv("ARC_SERVER_TLS_ENABLED")
+		os.Unsetenv("ARC_SERVER_TLS_CERT_FILE")
+		os.Unsetenv("ARC_SERVER_TLS_KEY_FILE")
+	}()
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if !cfg.Server.TLSEnabled {
+		t.Error("Server.TLSEnabled should be true from env")
+	}
+	if cfg.Server.TLSCertFile != "/path/to/cert.pem" {
+		t.Errorf("Server.TLSCertFile = %s, want /path/to/cert.pem", cfg.Server.TLSCertFile)
+	}
+	if cfg.Server.TLSKeyFile != "/path/to/key.pem" {
+		t.Errorf("Server.TLSKeyFile = %s, want /path/to/key.pem", cfg.Server.TLSKeyFile)
 	}
 }

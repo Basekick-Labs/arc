@@ -41,6 +41,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Validate TLS configuration before starting
+	if err := cfg.Server.ValidateTLS(); err != nil {
+		fmt.Fprintf(os.Stderr, "TLS configuration error: %v\n", err)
+		os.Exit(1)
+	}
+
 	// Setup logger
 	logger.Setup(cfg.Log.Level, cfg.Log.Format)
 	log.Info().Str("version", Version).Msg("Starting Arc...")
@@ -381,6 +387,9 @@ func main() {
 		WriteTimeout:    30 * time.Second,
 		IdleTimeout:     120 * time.Second,
 		ShutdownTimeout: 30 * time.Second,
+		TLSEnabled:      cfg.Server.TLSEnabled,
+		TLSCertFile:     cfg.Server.TLSCertFile,
+		TLSKeyFile:      cfg.Server.TLSKeyFile,
 	}
 
 	server := api.NewServer(serverConfig, logger.Get("server"))
@@ -472,10 +481,15 @@ func main() {
 		log.Fatal().Err(err).Msg("Failed to start HTTP server")
 	}
 
+	protocol := "HTTP"
+	if cfg.Server.TLSEnabled {
+		protocol = "HTTPS"
+	}
 	log.Info().
 		Int("port", cfg.Server.Port).
+		Str("protocol", protocol).
 		Str("version", Version).
-		Msg("Arc is ready! HTTP server started")
+		Msg("Arc is ready!")
 
 	// Wait for shutdown signal
 	sig := shutdownCoordinator.WaitForSignal()
