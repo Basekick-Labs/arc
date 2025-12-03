@@ -9,8 +9,28 @@
 # -----------------------------------------------------------------------------
 # HTTP server settings for the Arc API
 [server]
-# Port to listen on for HTTP requests
+# Port to listen on for HTTP/HTTPS requests
 port = 8000
+
+# TLS/HTTPS Configuration
+# Enable native HTTPS support without requiring a reverse proxy
+# Environment variables: ARC_SERVER_TLS_ENABLED, ARC_SERVER_TLS_CERT_FILE, ARC_SERVER_TLS_KEY_FILE
+#
+# Example with Let's Encrypt:
+#   tls_enabled = true
+#   tls_cert_file = "/etc/letsencrypt/live/example.com/fullchain.pem"
+#   tls_key_file = "/etc/letsencrypt/live/example.com/privkey.pem"
+#
+# Example with self-signed certificate (development only):
+#   tls_enabled = true
+#   tls_cert_file = "./certs/server.crt"
+#   tls_key_file = "./certs/server.key"
+#
+# IMPORTANT: Ensure key file has restricted permissions (chmod 600)
+# Default: false (plain HTTP)
+tls_enabled = false
+# tls_cert_file = ""
+# tls_key_file = ""
 
 # -----------------------------------------------------------------------------
 # Logging Configuration
@@ -131,7 +151,7 @@ hourly_min_files = 5
 # Enable/disable authentication
 # When enabled, requests must include a valid token in the Authorization header
 # Public endpoints (/health, /ready, /metrics) are always accessible
-enabled = true
+enabled = false
 
 # -----------------------------------------------------------------------------
 # Delete Configuration

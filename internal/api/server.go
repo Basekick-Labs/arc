@@ -21,9 +21,12 @@ import (
 
 // Server represents the HTTP API server
 type Server struct {
-	app    *fiber.App
-	logger zerolog.Logger
-	port   int
+	app        *fiber.App
+	logger     zerolog.Logger
+	port       int
+	tlsEnabled bool
+	tlsCert    string
+	tlsKey     string
 }
 
 // ServerConfig holds server configuration
@@ -33,6 +36,10 @@ type ServerConfig struct {
 	WriteTimeout    time.Duration
 	IdleTimeout     time.Duration
 	ShutdownTimeout time.Duration
+	// TLS Configuration
+	TLSEnabled  bool
+	TLSCertFile string
+	TLSKeyFile  string
 }
 
 // DefaultServerConfig returns default server configuration
@@ -77,8 +84,8 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 		AllowHeaders: "Origin,Content-Type,Accept,Authorization,x-api-key,x-arc-database,Content-Encoding",
 	}))
 
-	// Security headers middleware
-	app.Use(securityHeaders())
+	// Security headers middleware (pass TLS flag for HSTS)
+	app.Use(securityHeaders(config.TLSEnabled))
 
 	// NOTE: Compression middleware is disabled to allow manual decompression in handlers
 	// This prevents double-decompression issues with gzip-compressed MessagePack payloads
@@ -91,9 +98,12 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	app.Use(requestLogger(logger))
 
 	return &Server{
-		app:    app,
-		logger: logger.With().Str("component", "api-server").Logger(),
-		port:   config.Port,
+		app:        app,
+		logger:     logger.With().Str("component", "api-server").Logger(),
+		port:       config.Port,
+		tlsEnabled: config.TLSEnabled,
+		tlsCert:    config.TLSCertFile,
+		tlsKey:     config.TLSKeyFile,
 	}
 }
 
@@ -337,14 +347,33 @@ var startTime = time.Now()
 
 // Start starts the HTTP server
 func (s *Server) Start() error {
+	protocol := "HTTP"
+	if s.tlsEnabled {
+		protocol = "HTTPS"
+	}
+
 	s.logger.Info().
 		Int("port", s.port).
-		Msg("Starting Arc HTTP server")
+		Bool("tls_enabled", s.tlsEnabled).
+		Str("protocol", protocol).
+		Msg("Starting Arc server")
 
 	// Start server in goroutine
 	go func() {
 		addr := fmt.Sprintf(":%d", s.port)
-		if err := s.app.Listen(addr); err != nil {
+		var err error
+
+		if s.tlsEnabled {
+			s.logger.Info().
+				Str("cert_file", s.tlsCert).
+				Str("key_file", s.tlsKey).
+				Msg("TLS enabled - starting HTTPS server")
+			err = s.app.ListenTLS(addr, s.tlsCert, s.tlsKey)
+		} else {
+			err = s.app.Listen(addr)
+		}
+
+		if err != nil {
 			s.logger.Fatal().Err(err).Msg("Failed to start server")
 		}
 	}()
@@ -478,7 +507,7 @@ func customErrorHandler(logger zerolog.Logger) fiber.ErrorHandler {
 }
 
 // securityHeaders adds security headers to all responses
-func securityHeaders() fiber.Handler {
+func securityHeaders(tlsEnabled bool) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		// Prevent clickjacking - deny framing from any origin
 		c.Set("X-Frame-Options", "DENY")
@@ -499,8 +528,12 @@ func securityHeaders() fiber.Handler {
 		// Note: API-only service, so restrictive CSP is appropriate
 		c.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
 
-		// Note: HSTS (Strict-Transport-Security) should be set by reverse proxy/load balancer
-		// when TLS is terminated there, not by the application
+		// HSTS - Only set when TLS is enabled (native TLS termination)
+		// max-age=31536000 = 1 year, includeSubDomains for comprehensive protection
+		// Note: When TLS is terminated by a reverse proxy, HSTS should be set there instead
+		if tlsEnabled {
+			c.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
 
 		return c.Next()
 	}
