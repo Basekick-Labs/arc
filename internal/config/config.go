@@ -28,10 +28,11 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Host         string
-	Port         int
-	ReadTimeout  int
-	WriteTimeout int
+	Host           string
+	Port           int
+	ReadTimeout    int
+	WriteTimeout   int
+	MaxPayloadSize int64 // Maximum request payload size in bytes (applies to both compressed and decompressed)
 	// TLS Configuration
 	TLSEnabled  bool   // Enable HTTPS/TLS
 	TLSCertFile string // Path to TLS certificate file (PEM format)
@@ -169,16 +170,23 @@ func Load() (*Config, error) {
 		// Config file not found is OK, use defaults
 	}
 
+	// Parse max payload size
+	maxPayloadSize, err := ParseSize(v.GetString("server.max_payload_size"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid server.max_payload_size: %w", err)
+	}
+
 	// Build config from Viper (which includes defaults + env vars)
 	cfg := &Config{
 		Server: ServerConfig{
-			Host:         v.GetString("server.host"),
-			Port:         v.GetInt("server.port"),
-			ReadTimeout:  v.GetInt("server.read_timeout"),
-			WriteTimeout: v.GetInt("server.write_timeout"),
-			TLSEnabled:   v.GetBool("server.tls_enabled"),
-			TLSCertFile:  v.GetString("server.tls_cert_file"),
-			TLSKeyFile:   v.GetString("server.tls_key_file"),
+			Host:           v.GetString("server.host"),
+			Port:           v.GetInt("server.port"),
+			ReadTimeout:    v.GetInt("server.read_timeout"),
+			WriteTimeout:   v.GetInt("server.write_timeout"),
+			MaxPayloadSize: maxPayloadSize,
+			TLSEnabled:     v.GetBool("server.tls_enabled"),
+			TLSCertFile:    v.GetString("server.tls_cert_file"),
+			TLSKeyFile:     v.GetString("server.tls_key_file"),
 		},
 		Database: DatabaseConfig{
 			MaxConnections: v.GetInt("database.max_connections"),
@@ -281,6 +289,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("server.port", 8000)
 	v.SetDefault("server.read_timeout", 30)
 	v.SetDefault("server.write_timeout", 30)
+	// Max payload size default - 1GB
+	v.SetDefault("server.max_payload_size", "1GB")
 	// TLS defaults - disabled by default for backward compatibility
 	v.SetDefault("server.tls_enabled", false)
 	v.SetDefault("server.tls_cert_file", "")
@@ -446,4 +456,62 @@ func (cfg *ServerConfig) ValidateTLS() error {
 	}
 
 	return nil
+}
+
+// ParseSize parses a human-readable size string (e.g., "1GB", "500MB", "100KB") to bytes.
+// Supports: B, KB, MB, GB (case-insensitive).
+// Returns the size in bytes or an error if the format is invalid.
+func ParseSize(sizeStr string) (int64, error) {
+	sizeStr = strings.TrimSpace(strings.ToUpper(sizeStr))
+	if sizeStr == "" {
+		return 0, fmt.Errorf("empty size string")
+	}
+
+	// Define multipliers (order matters: check longer suffixes first)
+	type unitInfo struct {
+		suffix     string
+		multiplier int64
+	}
+	units := []unitInfo{
+		{"GB", 1024 * 1024 * 1024},
+		{"MB", 1024 * 1024},
+		{"KB", 1024},
+		{"B", 1},
+	}
+
+	// Try each suffix from longest to shortest
+	for _, unit := range units {
+		if strings.HasSuffix(sizeStr, unit.suffix) {
+			numStr := strings.TrimSuffix(sizeStr, unit.suffix)
+			numStr = strings.TrimSpace(numStr)
+
+			// Ensure the remaining string is a valid number (no trailing non-numeric chars)
+			var num float64
+			var trailing string
+			n, _ := fmt.Sscanf(numStr, "%f%s", &num, &trailing)
+			if n == 0 {
+				return 0, fmt.Errorf("invalid size number: %s", numStr)
+			}
+			if trailing != "" {
+				// There's extra text after the number - likely an unrecognized unit like "T" in "1TB"
+				return 0, fmt.Errorf("invalid size format: %s (use e.g., '1GB', '500MB', '100KB')", sizeStr)
+			}
+			if num < 0 {
+				return 0, fmt.Errorf("size cannot be negative: %s", sizeStr)
+			}
+			return int64(num * float64(unit.multiplier)), nil
+		}
+	}
+
+	// Try parsing as plain number (bytes)
+	var num int64
+	var trailing string
+	n, _ := fmt.Sscanf(sizeStr, "%d%s", &num, &trailing)
+	if n == 0 || trailing != "" {
+		return 0, fmt.Errorf("invalid size format: %s (use e.g., '1GB', '500MB', '100KB')", sizeStr)
+	}
+	if num < 0 {
+		return 0, fmt.Errorf("size cannot be negative: %s", sizeStr)
+	}
+	return num, nil
 }

@@ -379,3 +379,153 @@ func TestLoad_TLSEnvOverride(t *testing.T) {
 		t.Errorf("Server.TLSKeyFile = %s, want /path/to/key.pem", cfg.Server.TLSKeyFile)
 	}
 }
+
+// ParseSize Tests
+
+func TestParseSize_ValidSizes(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected int64
+	}{
+		// Bytes
+		{"100B", 100},
+		{"1024B", 1024},
+		// Kilobytes
+		{"1KB", 1024},
+		{"100KB", 100 * 1024},
+		{"512KB", 512 * 1024},
+		// Megabytes
+		{"1MB", 1024 * 1024},
+		{"100MB", 100 * 1024 * 1024},
+		{"512MB", 512 * 1024 * 1024},
+		// Gigabytes
+		{"1GB", 1024 * 1024 * 1024},
+		{"2GB", 2 * 1024 * 1024 * 1024},
+		// Case insensitivity
+		{"1gb", 1024 * 1024 * 1024},
+		{"1Gb", 1024 * 1024 * 1024},
+		{"100mb", 100 * 1024 * 1024},
+		{"100Mb", 100 * 1024 * 1024},
+		// With spaces
+		{" 1GB ", 1024 * 1024 * 1024},
+		{"100 MB", 100 * 1024 * 1024},
+		// Fractional values
+		{"1.5GB", int64(1.5 * 1024 * 1024 * 1024)},
+		{"0.5MB", int64(0.5 * 1024 * 1024)},
+		// Plain numbers (bytes)
+		{"1024", 1024},
+		{"1048576", 1048576},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			result, err := ParseSize(tt.input)
+			if err != nil {
+				t.Errorf("ParseSize(%q) error = %v", tt.input, err)
+				return
+			}
+			if result != tt.expected {
+				t.Errorf("ParseSize(%q) = %d, want %d", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestParseSize_InvalidSizes(t *testing.T) {
+	tests := []struct {
+		input string
+		desc  string
+	}{
+		{"", "empty string"},
+		{"   ", "whitespace only"},
+		{"-1GB", "negative size"},
+		{"-100MB", "negative size"},
+		{"1TB", "unsupported unit"},
+		{"1PB", "unsupported unit"},
+		{"abc", "non-numeric"},
+		{"GB", "no number"},
+		{"MB100", "reversed format"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			_, err := ParseSize(tt.input)
+			if err == nil {
+				t.Errorf("ParseSize(%q) should error for %s", tt.input, tt.desc)
+			}
+		})
+	}
+}
+
+func TestLoad_MaxPayloadSizeDefault(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	// Default should be 1GB
+	expectedSize := int64(1024 * 1024 * 1024)
+	if cfg.Server.MaxPayloadSize != expectedSize {
+		t.Errorf("Server.MaxPayloadSize = %d, want %d (1GB)", cfg.Server.MaxPayloadSize, expectedSize)
+	}
+}
+
+func TestLoad_MaxPayloadSizeEnvOverride(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	// Set env var to 2GB
+	os.Setenv("ARC_SERVER_MAX_PAYLOAD_SIZE", "2GB")
+	defer os.Unsetenv("ARC_SERVER_MAX_PAYLOAD_SIZE")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	expectedSize := int64(2 * 1024 * 1024 * 1024)
+	if cfg.Server.MaxPayloadSize != expectedSize {
+		t.Errorf("Server.MaxPayloadSize = %d, want %d (2GB)", cfg.Server.MaxPayloadSize, expectedSize)
+	}
+}
+
+func TestLoad_MaxPayloadSizeInvalid(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	// Set env var to invalid value
+	os.Setenv("ARC_SERVER_MAX_PAYLOAD_SIZE", "invalid")
+	defer os.Unsetenv("ARC_SERVER_MAX_PAYLOAD_SIZE")
+
+	_, err = Load()
+	if err == nil {
+		t.Error("Load() should error with invalid max_payload_size")
+	}
+	if !strings.Contains(err.Error(), "max_payload_size") {
+		t.Errorf("Error should mention max_payload_size: %v", err)
+	}
+}

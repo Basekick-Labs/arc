@@ -387,6 +387,7 @@ func main() {
 		WriteTimeout:    30 * time.Second,
 		IdleTimeout:     120 * time.Second,
 		ShutdownTimeout: 30 * time.Second,
+		MaxPayloadSize:  cfg.Server.MaxPayloadSize,
 		TLSEnabled:      cfg.Server.TLSEnabled,
 		TLSCertFile:     cfg.Server.TLSCertFile,
 		TLSKeyFile:      cfg.Server.TLSKeyFile,
@@ -412,7 +413,7 @@ func main() {
 	}
 
 	// Register MessagePack handler with Arrow buffer
-	msgpackHandler := api.NewMsgPackHandler(logger.Get("msgpack"), arrowBuffer)
+	msgpackHandler := api.NewMsgPackHandler(logger.Get("msgpack"), arrowBuffer, server.GetMaxPayloadSize())
 	msgpackHandler.RegisterRoutes(server.GetApp())
 
 	// Register Line Protocol handler

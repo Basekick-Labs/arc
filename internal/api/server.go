@@ -21,12 +21,13 @@ import (
 
 // Server represents the HTTP API server
 type Server struct {
-	app        *fiber.App
-	logger     zerolog.Logger
-	port       int
-	tlsEnabled bool
-	tlsCert    string
-	tlsKey     string
+	app            *fiber.App
+	logger         zerolog.Logger
+	port           int
+	maxPayloadSize int64
+	tlsEnabled     bool
+	tlsCert        string
+	tlsKey         string
 }
 
 // ServerConfig holds server configuration
@@ -36,6 +37,7 @@ type ServerConfig struct {
 	WriteTimeout    time.Duration
 	IdleTimeout     time.Duration
 	ShutdownTimeout time.Duration
+	MaxPayloadSize  int64 // Maximum request payload size in bytes
 	// TLS Configuration
 	TLSEnabled  bool
 	TLSCertFile string
@@ -50,6 +52,7 @@ func DefaultServerConfig() *ServerConfig {
 		WriteTimeout:    30 * time.Second,
 		IdleTimeout:     120 * time.Second,
 		ShutdownTimeout: 30 * time.Second,
+		MaxPayloadSize:  1024 * 1024 * 1024, // 1GB default
 	}
 }
 
@@ -98,12 +101,13 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	app.Use(requestLogger(logger))
 
 	return &Server{
-		app:        app,
-		logger:     logger.With().Str("component", "api-server").Logger(),
-		port:       config.Port,
-		tlsEnabled: config.TLSEnabled,
-		tlsCert:    config.TLSCertFile,
-		tlsKey:     config.TLSKeyFile,
+		app:            app,
+		logger:         logger.With().Str("component", "api-server").Logger(),
+		port:           config.Port,
+		maxPayloadSize: config.MaxPayloadSize,
+		tlsEnabled:     config.TLSEnabled,
+		tlsCert:        config.TLSCertFile,
+		tlsKey:         config.TLSKeyFile,
 	}
 }
 
@@ -412,6 +416,11 @@ func (s *Server) WaitForShutdown(shutdownTimeout time.Duration) {
 // GetApp returns the underlying Fiber app (for registering custom routes)
 func (s *Server) GetApp() *fiber.App {
 	return s.app
+}
+
+// GetMaxPayloadSize returns the configured maximum payload size in bytes
+func (s *Server) GetMaxPayloadSize() int64 {
+	return s.maxPayloadSize
 }
 
 // logsHandler returns recent application logs
