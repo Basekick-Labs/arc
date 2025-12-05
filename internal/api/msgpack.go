@@ -49,17 +49,19 @@ func (pb *PooledBuffer) Release() {
 
 // MsgPackHandler handles MessagePack binary protocol endpoints
 type MsgPackHandler struct {
-	decoder     *ingest.MessagePackDecoder
-	arrowBuffer *ingest.ArrowBuffer
-	logger      zerolog.Logger
+	decoder        *ingest.MessagePackDecoder
+	arrowBuffer    *ingest.ArrowBuffer
+	logger         zerolog.Logger
+	maxPayloadSize int64 // Maximum payload size in bytes (applies to both compressed and decompressed)
 }
 
 // NewMsgPackHandler creates a new MessagePack handler
-func NewMsgPackHandler(logger zerolog.Logger, arrowBuffer *ingest.ArrowBuffer) *MsgPackHandler {
+func NewMsgPackHandler(logger zerolog.Logger, arrowBuffer *ingest.ArrowBuffer, maxPayloadSize int64) *MsgPackHandler {
 	return &MsgPackHandler{
-		decoder:     ingest.NewMessagePackDecoder(logger),
-		arrowBuffer: arrowBuffer,
-		logger:      logger.With().Str("component", "msgpack-handler").Logger(),
+		decoder:        ingest.NewMessagePackDecoder(logger),
+		arrowBuffer:    arrowBuffer,
+		logger:         logger.With().Str("component", "msgpack-handler").Logger(),
+		maxPayloadSize: maxPayloadSize,
 	}
 }
 
@@ -84,10 +86,9 @@ func (h *MsgPackHandler) writeMsgPack(c *fiber.Ctx) error {
 		})
 	}
 
-	const maxPayloadSize = 100 * 1024 * 1024 // 100MB
-	if len(payload) > maxPayloadSize {
+	if int64(len(payload)) > h.maxPayloadSize {
 		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
-			"error": "Payload too large (max 100MB)",
+			"error": fmt.Sprintf("Payload too large (max %s). Consider batching into smaller requests.", formatBytes(h.maxPayloadSize)),
 		})
 	}
 
@@ -175,8 +176,8 @@ func (h *MsgPackHandler) writeMsgPack(c *fiber.Ctx) error {
 // Uses sync.Pool for gzip reader and output buffer to minimize allocations
 // ZERO-COPY: Returns a PooledBuffer that caller MUST Release() after use
 func (h *MsgPackHandler) decompressGzip(data []byte) (*PooledBuffer, error) {
-	const maxDecompressedSize = 100 * 1024 * 1024 // 100MB
-	const readChunkSize = 32 * 1024               // 32KB chunks
+	maxDecompressedSize := h.maxPayloadSize
+	const readChunkSize = 32 * 1024 // 32KB chunks
 
 	// Get pooled gzip reader or create new one
 	var reader *gzip.Reader
@@ -229,10 +230,10 @@ func (h *MsgPackHandler) decompressGzip(data []byte) (*PooledBuffer, error) {
 	gzipReaderPool.Put(reader)
 
 	// Check size limit
-	if len(buf) > maxDecompressedSize {
+	if int64(len(buf)) > maxDecompressedSize {
 		*bufPtr = (*bufPtr)[:0]
 		decompressBufferPool.Put(bufPtr)
-		return nil, fmt.Errorf("decompressed payload exceeds 100MB limit")
+		return nil, fmt.Errorf("decompressed payload exceeds %s limit", formatBytes(maxDecompressedSize))
 	}
 
 	// Update the pooled buffer pointer with potentially grown buffer
@@ -323,4 +324,33 @@ func (h *MsgPackHandler) msgPackSpec(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(spec)
+}
+
+// formatBytes formats a byte count into a human-readable string (e.g., "1GB", "500MB")
+func formatBytes(bytes int64) string {
+	const (
+		gb = 1024 * 1024 * 1024
+		mb = 1024 * 1024
+		kb = 1024
+	)
+
+	switch {
+	case bytes >= gb:
+		if bytes%gb == 0 {
+			return fmt.Sprintf("%dGB", bytes/gb)
+		}
+		return fmt.Sprintf("%.1fGB", float64(bytes)/float64(gb))
+	case bytes >= mb:
+		if bytes%mb == 0 {
+			return fmt.Sprintf("%dMB", bytes/mb)
+		}
+		return fmt.Sprintf("%.1fMB", float64(bytes)/float64(mb))
+	case bytes >= kb:
+		if bytes%kb == 0 {
+			return fmt.Sprintf("%dKB", bytes/kb)
+		}
+		return fmt.Sprintf("%.1fKB", float64(bytes)/float64(kb))
+	default:
+		return fmt.Sprintf("%dB", bytes)
+	}
 }
