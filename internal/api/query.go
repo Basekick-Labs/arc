@@ -28,15 +28,19 @@ var (
 
 // Pre-compiled regex patterns for SQL-to-storage-path conversion
 // These are compiled once at package init rather than on every query
+// Note: We use 4 separate patterns instead of combined patterns because
+// benchmarks showed simpler patterns execute faster despite more passes.
 var (
 	// Pattern for database.table references (e.g., FROM mydb.mytable)
 	patternDBTable = regexp.MustCompile(`(?i)\bFROM\s+([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\b`)
 	// Pattern for simple table references (FROM table_name)
 	patternSimpleTable = regexp.MustCompile(`(?i)\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]*)\b`)
 	// Pattern for database.table in JOIN clauses (e.g., JOIN mydb.mytable)
-	patternJoinDBTable = regexp.MustCompile(`(?i)\bJOIN\s+([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\b`)
+	// Includes LATERAL JOIN support: "LATERAL JOIN", "JOIN LATERAL", "CROSS JOIN LATERAL"
+	patternJoinDBTable = regexp.MustCompile(`(?i)\b(?:(?:LEFT|RIGHT|INNER|OUTER|CROSS|NATURAL)?\s*)?(?:LATERAL\s+)?JOIN\s+(?:LATERAL\s+)?([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\b`)
 	// Pattern for simple table in JOIN clauses (JOIN table_name)
-	patternJoinSimpleTable = regexp.MustCompile(`(?i)\bJOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)\b`)
+	// Includes LATERAL JOIN support: "LATERAL JOIN", "JOIN LATERAL", "CROSS JOIN LATERAL"
+	patternJoinSimpleTable = regexp.MustCompile(`(?i)\b(?:(?:LEFT|RIGHT|INNER|OUTER|CROSS|NATURAL)?\s*)?(?:LATERAL\s+)?JOIN\s+(?:LATERAL\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b`)
 	// Pattern to extract CTE names from WITH clauses
 	// Matches: WITH name AS, WITH RECURSIVE name AS, and comma-separated CTEs
 	patternCTENames = regexp.MustCompile(`(?i)\bWITH\s+(?:RECURSIVE\s+)?(\w+)\s+AS\s*\(|,\s*(\w+)\s+AS\s*\(`)
@@ -58,6 +62,167 @@ func extractCTENames(sql string) map[string]bool {
 		}
 	}
 	return cteNames
+}
+
+// stringMask holds a placeholder and the original string content it replaced
+type stringMask struct {
+	placeholder string
+	original    string
+}
+
+// sqlFeatures contains flags for what features are present in a SQL string
+type sqlFeatures struct {
+	hasQuotes      bool // single or double quotes
+	hasDashComment bool // -- comment
+	hasBlockComment bool // /* comment */
+}
+
+// scanSQLFeatures scans SQL once to detect presence of quotes and comments.
+// This avoids multiple strings.Contains calls.
+func scanSQLFeatures(sql string) sqlFeatures {
+	var f sqlFeatures
+	for i := 0; i < len(sql); i++ {
+		ch := sql[i]
+		if ch == '\'' || ch == '"' {
+			f.hasQuotes = true
+		} else if ch == '-' && i+1 < len(sql) && sql[i+1] == '-' {
+			f.hasDashComment = true
+		} else if ch == '/' && i+1 < len(sql) && sql[i+1] == '*' {
+			f.hasBlockComment = true
+		}
+		// Early exit if we found everything
+		if f.hasQuotes && f.hasDashComment && f.hasBlockComment {
+			break
+		}
+	}
+	return f
+}
+
+// maskStringLiterals replaces string literals with placeholders to prevent regex from matching inside them.
+// Handles both single-quoted ('...') and double-quoted ("...") strings, including escaped quotes.
+// Returns the masked SQL and a slice of masks for later restoration.
+func maskStringLiterals(sql string, hasQuotes bool) (string, []stringMask) {
+	// Fast path: if no quotes, return original string (avoids allocation)
+	if !hasQuotes {
+		return sql, nil
+	}
+
+	var masks []stringMask
+	var result strings.Builder
+	result.Grow(len(sql))
+
+	i := 0
+	maskIndex := 0
+
+	for i < len(sql) {
+		ch := sql[i]
+
+		// Check for string literal start (single or double quote)
+		if ch == '\'' || ch == '"' {
+			quote := ch
+			start := i
+			i++ // Move past opening quote
+
+			// Find the closing quote, handling escaped quotes
+			for i < len(sql) {
+				if sql[i] == quote {
+					// Check if it's an escaped quote ('' or "")
+					if i+1 < len(sql) && sql[i+1] == quote {
+						i += 2 // Skip escaped quote
+						continue
+					}
+					// Also handle backslash escaping (\' or \")
+					if i > 0 && sql[i-1] == '\\' {
+						i++
+						continue
+					}
+					break // Found closing quote
+				}
+				i++
+			}
+
+			// Include the closing quote if found
+			if i < len(sql) {
+				i++
+			}
+
+			// Extract the full string literal and create a placeholder
+			original := sql[start:i]
+			placeholder := fmt.Sprintf("__STR_%d__", maskIndex)
+			masks = append(masks, stringMask{placeholder: placeholder, original: original})
+			result.WriteString(placeholder)
+			maskIndex++
+		} else {
+			result.WriteByte(ch)
+			i++
+		}
+	}
+
+	return result.String(), masks
+}
+
+// unmaskStringLiterals restores the original string literals from their placeholders.
+func unmaskStringLiterals(sql string, masks []stringMask) string {
+	result := sql
+	for _, mask := range masks {
+		result = strings.Replace(result, mask.placeholder, mask.original, 1)
+	}
+	return result
+}
+
+// stripSQLComments removes SQL comments from the query.
+// Handles: -- single line comments and /* multi-line comments */
+// This must be called AFTER string masking to avoid stripping comments inside strings.
+func stripSQLComments(sql string, hasComments bool) string {
+	// Fast path: if no comment markers, return original string (avoids allocation)
+	if !hasComments {
+		return sql
+	}
+
+	var result strings.Builder
+	result.Grow(len(sql))
+
+	i := 0
+	for i < len(sql) {
+		// Check for single-line comment (--)
+		if i+1 < len(sql) && sql[i] == '-' && sql[i+1] == '-' {
+			// Skip until end of line or end of string
+			for i < len(sql) && sql[i] != '\n' {
+				i++
+			}
+			// Keep the newline if present
+			if i < len(sql) {
+				result.WriteByte('\n')
+				i++
+			}
+			continue
+		}
+
+		// Check for multi-line comment (/* ... */)
+		if i+1 < len(sql) && sql[i] == '/' && sql[i+1] == '*' {
+			i += 2 // Skip /*
+			// Skip until closing */
+			for i+1 < len(sql) {
+				if sql[i] == '*' && sql[i+1] == '/' {
+					i += 2 // Skip */
+					break
+				}
+				i++
+			}
+			// If we reached end without finding */, skip remaining
+			if i+1 >= len(sql) {
+				i = len(sql)
+			}
+			// Add a space to prevent token concatenation
+			result.WriteByte(' ')
+			continue
+		}
+
+		result.WriteByte(sql[i])
+		i++
+	}
+
+	return result.String()
 }
 
 // QueryHandler handles SQL query endpoints
@@ -366,8 +531,20 @@ func (h *QueryHandler) validateSQL(sql string) error {
 // Converts: JOIN database.measurement -> JOIN read_parquet('path/**/*.parquet')
 // Converts: JOIN measurement -> JOIN read_parquet('path/**/*.parquet')
 // CTE names are extracted and excluded from conversion to avoid replacing virtual table references.
+// String literals and comments are protected from regex matching.
 func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 	originalSQL := sql
+
+	// Single pass to detect features (replaces 3 separate strings.Contains calls)
+	features := scanSQLFeatures(sql)
+
+	// Phase 1: Mask string literals to prevent regex from matching inside them
+	// e.g., WHERE msg = 'SELECT * FROM mydb.cpu' should not convert the string content
+	sql, masks := maskStringLiterals(sql, features.hasQuotes)
+
+	// Phase 2: Strip SQL comments (after masking to preserve comments inside strings)
+	// e.g., "-- FROM mydb.cpu" should not be converted
+	sql = stripSQLComments(sql, features.hasDashComment || features.hasBlockComment)
 
 	// Extract CTE names to avoid converting them to storage paths
 	cteNames := extractCTENames(sql)
@@ -410,7 +587,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 		return "FROM read_parquet('" + path + "', union_by_name=true)"
 	})
 
-	// Handle JOIN database.table references
+	// Handle JOIN database.table references (includes LATERAL JOIN)
 	sql = patternJoinDBTable.ReplaceAllStringFunc(sql, func(match string) string {
 		parts := patternJoinDBTable.FindStringSubmatch(match)
 		if len(parts) < 3 {
@@ -468,7 +645,6 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 		}
 
 		// Check if followed by a dot (database.table already handled) or parenthesis (function call)
-		// We look at the original match position in the modified sql
 		idx := strings.Index(strings.ToLower(sql), strings.ToLower(match))
 		if idx >= 0 {
 			afterMatch := sql[idx+len(match):]
@@ -507,7 +683,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 		return "FROM read_parquet('" + path + "', union_by_name=true)"
 	})
 
-	// Handle JOIN simple_table references
+	// Handle JOIN simple_table references (includes LATERAL JOIN)
 	sql = patternJoinSimpleTable.ReplaceAllStringFunc(sql, func(match string) string {
 		parts := patternJoinSimpleTable.FindStringSubmatch(match)
 		if len(parts) < 2 {
@@ -564,6 +740,9 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 
 		return "JOIN read_parquet('" + path + "', union_by_name=true)"
 	})
+
+	// Restore original string literals
+	sql = unmaskStringLiterals(sql, masks)
 
 	return sql
 }
