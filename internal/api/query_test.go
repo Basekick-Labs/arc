@@ -1,8 +1,211 @@
 package api
 
 import (
+	"context"
+	"io"
+	"strings"
 	"testing"
+
+	"github.com/basekick-labs/arc/internal/pruning"
+	"github.com/rs/zerolog"
 )
+
+func TestExtractCTENames(t *testing.T) {
+	tests := []struct {
+		name     string
+		sql      string
+		expected []string
+	}{
+		{
+			name:     "single CTE",
+			sql:      "WITH campaign AS (SELECT * FROM events) SELECT * FROM campaign",
+			expected: []string{"campaign"},
+		},
+		{
+			name:     "multiple CTEs",
+			sql:      "WITH cte1 AS (SELECT 1), cte2 AS (SELECT 2) SELECT * FROM cte1 JOIN cte2",
+			expected: []string{"cte1", "cte2"},
+		},
+		{
+			name:     "recursive CTE",
+			sql:      "WITH RECURSIVE tree AS (SELECT * FROM nodes) SELECT * FROM tree",
+			expected: []string{"tree"},
+		},
+		{
+			name:     "CTE with underscore",
+			sql:      "WITH user_data AS (SELECT * FROM users) SELECT * FROM user_data",
+			expected: []string{"user_data"},
+		},
+		{
+			name:     "no CTE",
+			sql:      "SELECT * FROM mydb.cpu",
+			expected: []string{},
+		},
+		{
+			name:     "case insensitive WITH",
+			sql:      "with MyData AS (SELECT 1) SELECT * FROM mydata",
+			expected: []string{"mydata"},
+		},
+		{
+			name:     "case insensitive RECURSIVE",
+			sql:      "WITH recursive myTree AS (SELECT 1) SELECT * FROM mytree",
+			expected: []string{"mytree"},
+		},
+		{
+			name:     "three CTEs",
+			sql:      "WITH a AS (SELECT 1), b AS (SELECT 2), c AS (SELECT 3) SELECT * FROM a, b, c",
+			expected: []string{"a", "b", "c"},
+		},
+		{
+			name:     "CTE with complex inner query",
+			sql:      "WITH hourly_avg AS (SELECT host, AVG(value) as avg_val FROM mydb.cpu WHERE time > '2024-01-01' GROUP BY host) SELECT * FROM hourly_avg",
+			expected: []string{"hourly_avg"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := extractCTENames(tt.sql)
+			if len(result) != len(tt.expected) {
+				t.Errorf("extractCTENames(%q) returned %d names, expected %d",
+					tt.sql, len(result), len(tt.expected))
+				return
+			}
+			for _, name := range tt.expected {
+				if !result[name] {
+					t.Errorf("extractCTENames(%q) missing expected name %q", tt.sql, name)
+				}
+			}
+		})
+	}
+}
+
+func TestConvertSQLWithCTE(t *testing.T) {
+	// Create a minimal QueryHandler for testing
+	h := &QueryHandler{
+		storage: &mockLocalBackend{basePath: "./data"},
+		pruner:  pruning.NewPartitionPruner(zerolog.Nop()),
+		logger:  zerolog.Nop(),
+	}
+
+	tests := []struct {
+		name             string
+		inputSQL         string
+		shouldContain    []string // Substrings that SHOULD be in the result
+		shouldNotContain []string // Substrings that should NOT be in the result
+	}{
+		{
+			name:     "CTE name not converted to path",
+			inputSQL: "WITH campaign AS (SELECT * FROM mydb.events WHERE type = 'campaign') SELECT * FROM campaign WHERE time > '2024-01-01'",
+			shouldContain: []string{
+				"read_parquet('./data/mydb/events/**/*.parquet'", // physical table converted
+				"FROM campaign WHERE",                            // CTE reference preserved
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/default/campaign/", // CTE should NOT be converted to path
+			},
+		},
+		{
+			name:     "multiple CTEs not converted",
+			inputSQL: "WITH a AS (SELECT * FROM mydb.t1), b AS (SELECT * FROM mydb.t2) SELECT * FROM a JOIN b ON a.id = b.id",
+			shouldContain: []string{
+				"read_parquet('./data/mydb/t1/**/*.parquet'", // t1 converted
+				"read_parquet('./data/mydb/t2/**/*.parquet'", // t2 converted
+				"FROM a JOIN b",                               // CTE references preserved
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/default/a/",
+				"read_parquet('./data/default/b/",
+			},
+		},
+		{
+			name:     "simple query without CTE still works",
+			inputSQL: "SELECT * FROM mydb.cpu WHERE time > '2024-01-01'",
+			shouldContain: []string{
+				"read_parquet('./data/mydb/cpu/**/*.parquet'",
+			},
+			shouldNotContain: []string{},
+		},
+		{
+			name:     "JOIN with database.table converted",
+			inputSQL: "SELECT * FROM mydb.cpu JOIN mydb.memory ON cpu.host = memory.host",
+			shouldContain: []string{
+				"read_parquet('./data/mydb/cpu/**/*.parquet'",
+				"read_parquet('./data/mydb/memory/**/*.parquet'",
+			},
+			shouldNotContain: []string{},
+		},
+		{
+			name:     "recursive CTE not converted",
+			inputSQL: "WITH RECURSIVE tree AS (SELECT * FROM mydb.nodes WHERE parent IS NULL UNION ALL SELECT * FROM mydb.nodes n JOIN tree t ON n.parent = t.id) SELECT * FROM tree",
+			shouldContain: []string{
+				"read_parquet('./data/mydb/nodes/**/*.parquet'",
+				"FROM tree", // Final SELECT FROM tree should be preserved
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/default/tree/",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := h.convertSQLToStoragePaths(tt.inputSQL)
+
+			for _, substr := range tt.shouldContain {
+				if !strings.Contains(result, substr) {
+					t.Errorf("Result should contain %q but doesn't.\nInput: %s\nResult: %s",
+						substr, tt.inputSQL, result)
+				}
+			}
+
+			for _, substr := range tt.shouldNotContain {
+				if strings.Contains(result, substr) {
+					t.Errorf("Result should NOT contain %q but does.\nInput: %s\nResult: %s",
+						substr, tt.inputSQL, result)
+				}
+			}
+		})
+	}
+}
+
+func TestJoinClausePatterns(t *testing.T) {
+	tests := []struct {
+		name        string
+		sql         string
+		shouldMatch bool
+		database    string
+		table       string
+	}{
+		{name: "basic JOIN", sql: "SELECT * FROM a JOIN mydb.cpu ON 1=1", shouldMatch: true, database: "mydb", table: "cpu"},
+		{name: "LEFT JOIN", sql: "SELECT * FROM a LEFT JOIN mydb.cpu ON 1=1", shouldMatch: true, database: "mydb", table: "cpu"},
+		{name: "RIGHT JOIN", sql: "SELECT * FROM a RIGHT JOIN mydb.cpu ON 1=1", shouldMatch: true, database: "mydb", table: "cpu"},
+		{name: "INNER JOIN", sql: "SELECT * FROM a INNER JOIN mydb.cpu ON 1=1", shouldMatch: true, database: "mydb", table: "cpu"},
+		{name: "no JOIN", sql: "SELECT * FROM mydb.cpu", shouldMatch: false, database: "", table: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			matches := patternJoinDBTable.FindStringSubmatch(tt.sql)
+			matched := matches != nil
+			if matched != tt.shouldMatch {
+				t.Errorf("patternJoinDBTable for %q: matched=%v, want %v", tt.sql, matched, tt.shouldMatch)
+			}
+			if matched && tt.shouldMatch {
+				if len(matches) < 3 {
+					t.Errorf("expected at least 3 groups, got %d", len(matches))
+				} else {
+					if matches[1] != tt.database {
+						t.Errorf("database = %q, want %q", matches[1], tt.database)
+					}
+					if matches[2] != tt.table {
+						t.Errorf("table = %q, want %q", matches[2], tt.table)
+					}
+				}
+			}
+		})
+	}
+}
 
 func TestValidateIdentifier(t *testing.T) {
 	tests := []struct {
@@ -359,3 +562,68 @@ func BenchmarkDangerousSQLCheck(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkConvertSQLToStoragePaths benchmarks the SQL-to-storage-path conversion
+// This is used to measure the baseline before adding CTE support
+func BenchmarkConvertSQLToStoragePaths(b *testing.B) {
+	// Create a minimal QueryHandler for benchmarking
+	h := &QueryHandler{
+		storage: &mockLocalBackend{basePath: "./data"},
+		pruner:  pruning.NewPartitionPruner(zerolog.Nop()),
+		logger:  zerolog.Nop(),
+	}
+
+	testCases := []struct {
+		name string
+		sql  string
+	}{
+		{
+			name: "simple_select",
+			sql:  "SELECT * FROM mydb.cpu WHERE time > 1609459200000000",
+		},
+		{
+			name: "with_join",
+			sql:  "SELECT * FROM mydb.cpu JOIN mydb.memory ON cpu.host = memory.host WHERE time > 1609459200000000",
+		},
+		{
+			name: "with_single_cte",
+			sql:  "WITH campaign AS (SELECT * FROM mydb.events WHERE type = 'campaign') SELECT * FROM campaign WHERE time > 1609459200000000",
+		},
+		{
+			name: "with_multiple_ctes",
+			sql:  "WITH cte1 AS (SELECT * FROM mydb.events), cte2 AS (SELECT * FROM mydb.stats) SELECT * FROM cte1 JOIN cte2 ON cte1.id = cte2.event_id",
+		},
+		{
+			name: "complex_query",
+			sql:  "WITH hourly_avg AS (SELECT host, AVG(value) as avg_val FROM mydb.cpu WHERE time BETWEEN '2024-01-01' AND '2024-01-02' GROUP BY host) SELECT * FROM hourly_avg WHERE avg_val > 50 ORDER BY avg_val DESC",
+		},
+	}
+
+	for _, tc := range testCases {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				h.convertSQLToStoragePaths(tc.sql)
+			}
+		})
+	}
+}
+
+// mockLocalBackend is a minimal mock for benchmarking that implements storage.Backend
+type mockLocalBackend struct {
+	basePath string
+}
+
+func (m *mockLocalBackend) GetBasePath() string                                            { return m.basePath }
+func (m *mockLocalBackend) Write(ctx context.Context, path string, data []byte) error      { return nil }
+func (m *mockLocalBackend) WriteReader(ctx context.Context, path string, r io.Reader, size int64) error {
+	return nil
+}
+func (m *mockLocalBackend) Read(ctx context.Context, path string) ([]byte, error)          { return nil, nil }
+func (m *mockLocalBackend) ReadTo(ctx context.Context, path string, w io.Writer) error     { return nil }
+func (m *mockLocalBackend) List(ctx context.Context, prefix string) ([]string, error)      { return nil, nil }
+func (m *mockLocalBackend) Delete(ctx context.Context, path string) error                  { return nil }
+func (m *mockLocalBackend) Exists(ctx context.Context, path string) (bool, error)          { return false, nil }
+func (m *mockLocalBackend) Close() error                                                   { return nil }
+func (m *mockLocalBackend) Type() string                                                   { return "mock" }
+func (m *mockLocalBackend) ConfigJSON() string                                             { return "{}" }

@@ -521,12 +521,19 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	// Build path pattern for source measurement
 	measurementPath := filepath.Join(basePath, cq.Database, cq.SourceMeasurement, "**", "*.parquet")
 
+	// Extract CTE names to avoid replacing them with read_parquet paths
+	cteNames := extractCTENames(query)
+
 	// Wrap query to read from parquet files
 	// Replace measurement name in query with read_parquet
 	// Use word boundary regex to avoid replacing partial matches (e.g., "cpu" in "cpu_user")
-	readParquetExpr := fmt.Sprintf("read_parquet('%s', union_by_name=true)", measurementPath)
-	measurementPattern := regexp.MustCompile(`\bFROM\s+` + regexp.QuoteMeta(cq.SourceMeasurement) + `\b`)
-	wrappedQuery := measurementPattern.ReplaceAllString(query, "FROM "+readParquetExpr)
+	// Skip if the source measurement name matches a CTE name (it's a virtual table reference)
+	wrappedQuery := query
+	if !cteNames[strings.ToLower(cq.SourceMeasurement)] {
+		readParquetExpr := fmt.Sprintf("read_parquet('%s', union_by_name=true)", measurementPath)
+		measurementPattern := regexp.MustCompile(`\bFROM\s+` + regexp.QuoteMeta(cq.SourceMeasurement) + `\b`)
+		wrappedQuery = measurementPattern.ReplaceAllString(query, "FROM "+readParquetExpr)
+	}
 
 	h.logger.Debug().Str("query", wrappedQuery).Msg("Executing wrapped query")
 
