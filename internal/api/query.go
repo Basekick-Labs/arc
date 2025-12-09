@@ -33,7 +33,32 @@ var (
 	patternDBTable = regexp.MustCompile(`(?i)\bFROM\s+([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\b`)
 	// Pattern for simple table references (FROM table_name)
 	patternSimpleTable = regexp.MustCompile(`(?i)\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]*)\b`)
+	// Pattern for database.table in JOIN clauses (e.g., JOIN mydb.mytable)
+	patternJoinDBTable = regexp.MustCompile(`(?i)\bJOIN\s+([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\b`)
+	// Pattern for simple table in JOIN clauses (JOIN table_name)
+	patternJoinSimpleTable = regexp.MustCompile(`(?i)\bJOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)\b`)
+	// Pattern to extract CTE names from WITH clauses
+	// Matches: WITH name AS, WITH RECURSIVE name AS, and comma-separated CTEs
+	patternCTENames = regexp.MustCompile(`(?i)\bWITH\s+(?:RECURSIVE\s+)?(\w+)\s+AS\s*\(|,\s*(\w+)\s+AS\s*\(`)
 )
+
+// extractCTENames extracts CTE names from a SQL query's WITH clause.
+// Returns a set of lowercase CTE names for efficient lookup.
+func extractCTENames(sql string) map[string]bool {
+	cteNames := make(map[string]bool)
+	matches := patternCTENames.FindAllStringSubmatch(sql, -1)
+	for _, match := range matches {
+		// match[1] is from "WITH name AS" or "WITH RECURSIVE name AS"
+		// match[2] is from ", name AS"
+		if match[1] != "" {
+			cteNames[strings.ToLower(match[1])] = true
+		}
+		if match[2] != "" {
+			cteNames[strings.ToLower(match[2])] = true
+		}
+	}
+	return cteNames
+}
 
 // QueryHandler handles SQL query endpoints
 type QueryHandler struct {
@@ -338,9 +363,16 @@ func (h *QueryHandler) validateSQL(sql string) error {
 // convertSQLToStoragePaths converts table references to storage paths
 // Converts: FROM database.measurement -> FROM read_parquet('path/**/*.parquet')
 // Converts: FROM measurement -> FROM read_parquet('path/**/*.parquet')
+// Converts: JOIN database.measurement -> JOIN read_parquet('path/**/*.parquet')
+// Converts: JOIN measurement -> JOIN read_parquet('path/**/*.parquet')
+// CTE names are extracted and excluded from conversion to avoid replacing virtual table references.
 func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 	originalSQL := sql
 
+	// Extract CTE names to avoid converting them to storage paths
+	cteNames := extractCTENames(sql)
+
+	// Handle FROM database.table references
 	sql = patternDBTable.ReplaceAllStringFunc(sql, func(match string) string {
 		parts := patternDBTable.FindStringSubmatch(match)
 		if len(parts) < 3 {
@@ -378,12 +410,54 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 		return "FROM read_parquet('" + path + "', union_by_name=true)"
 	})
 
+	// Handle JOIN database.table references
+	sql = patternJoinDBTable.ReplaceAllStringFunc(sql, func(match string) string {
+		parts := patternJoinDBTable.FindStringSubmatch(match)
+		if len(parts) < 3 {
+			return match
+		}
+		database := parts[1]
+		table := parts[2]
+
+		// Generate storage path based on backend type
+		path := h.getStoragePath(database, table)
+
+		// Apply partition pruning
+		optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(path, originalSQL)
+
+		if wasOptimized {
+			if pathList, ok := optimizedPath.([]string); ok {
+				pathsStr := "["
+				for i, p := range pathList {
+					if i > 0 {
+						pathsStr += ", "
+					}
+					pathsStr += "'" + p + "'"
+				}
+				pathsStr += "]"
+				h.logger.Info().Int("partition_count", len(pathList)).Msg("Partition pruning: Using targeted paths for JOIN")
+				return "JOIN read_parquet(" + pathsStr + ", union_by_name=true)"
+			} else if pathStr, ok := optimizedPath.(string); ok {
+				h.logger.Info().Str("optimized_path", pathStr).Msg("Partition pruning: Using optimized path for JOIN")
+				return "JOIN read_parquet('" + pathStr + "', union_by_name=true)"
+			}
+		}
+
+		return "JOIN read_parquet('" + path + "', union_by_name=true)"
+	})
+
+	// Handle FROM simple_table references
 	sql = patternSimpleTable.ReplaceAllStringFunc(sql, func(match string) string {
 		parts := patternSimpleTable.FindStringSubmatch(match)
 		if len(parts) < 2 {
 			return match
 		}
 		table := strings.ToLower(parts[1])
+
+		// Skip if this is a CTE name - CTEs are virtual tables, not physical storage
+		if cteNames[table] {
+			return match
+		}
 
 		// Skip already converted read_parquet, system tables, etc.
 		skipPrefixes := []string{"read_parquet", "information_schema", "pg_", "duckdb_"}
@@ -431,6 +505,64 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 		}
 
 		return "FROM read_parquet('" + path + "', union_by_name=true)"
+	})
+
+	// Handle JOIN simple_table references
+	sql = patternJoinSimpleTable.ReplaceAllStringFunc(sql, func(match string) string {
+		parts := patternJoinSimpleTable.FindStringSubmatch(match)
+		if len(parts) < 2 {
+			return match
+		}
+		table := strings.ToLower(parts[1])
+
+		// Skip if this is a CTE name - CTEs are virtual tables, not physical storage
+		if cteNames[table] {
+			return match
+		}
+
+		// Skip already converted read_parquet, system tables, etc.
+		skipPrefixes := []string{"read_parquet", "information_schema", "pg_", "duckdb_"}
+		for _, prefix := range skipPrefixes {
+			if strings.HasPrefix(table, prefix) {
+				return match
+			}
+		}
+
+		// Check if followed by a dot or parenthesis
+		idx := strings.Index(strings.ToLower(sql), strings.ToLower(match))
+		if idx >= 0 {
+			afterMatch := sql[idx+len(match):]
+			afterMatch = strings.TrimLeft(afterMatch, " \t")
+			if len(afterMatch) > 0 && (afterMatch[0] == '.' || afterMatch[0] == '(') {
+				return match
+			}
+		}
+
+		// Use default database
+		path := h.getStoragePath("default", parts[1])
+
+		// Apply partition pruning
+		optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(path, originalSQL)
+
+		if wasOptimized {
+			if pathList, ok := optimizedPath.([]string); ok {
+				pathsStr := "["
+				for i, p := range pathList {
+					if i > 0 {
+						pathsStr += ", "
+					}
+					pathsStr += "'" + p + "'"
+				}
+				pathsStr += "]"
+				h.logger.Info().Int("partition_count", len(pathList)).Msg("Partition pruning: Using targeted paths for JOIN")
+				return "JOIN read_parquet(" + pathsStr + ", union_by_name=true)"
+			} else if pathStr, ok := optimizedPath.(string); ok {
+				h.logger.Info().Str("optimized_path", pathStr).Msg("Partition pruning: Using optimized path for JOIN")
+				return "JOIN read_parquet('" + pathStr + "', union_by_name=true)"
+			}
+		}
+
+		return "JOIN read_parquet('" + path + "', union_by_name=true)"
 	})
 
 	return sql
