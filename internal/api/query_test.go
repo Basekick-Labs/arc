@@ -80,6 +80,148 @@ func TestExtractCTENames(t *testing.T) {
 	}
 }
 
+func TestMaskStringLiterals(t *testing.T) {
+	tests := []struct {
+		name           string
+		input          string
+		expectedMasked string
+		expectedMasks  int
+	}{
+		{
+			name:           "single quoted string",
+			input:          "SELECT * FROM t WHERE x = 'hello'",
+			expectedMasked: "SELECT * FROM t WHERE x = __STR_0__",
+			expectedMasks:  1,
+		},
+		{
+			name:           "double quoted string",
+			input:          `SELECT * FROM t WHERE x = "hello"`,
+			expectedMasked: "SELECT * FROM t WHERE x = __STR_0__",
+			expectedMasks:  1,
+		},
+		{
+			name:           "multiple strings",
+			input:          "SELECT * FROM t WHERE x = 'hello' AND y = 'world'",
+			expectedMasked: "SELECT * FROM t WHERE x = __STR_0__ AND y = __STR_1__",
+			expectedMasks:  2,
+		},
+		{
+			name:           "string with FROM keyword",
+			input:          "SELECT * FROM logs WHERE msg = 'SELECT * FROM mydb.cpu'",
+			expectedMasked: "SELECT * FROM logs WHERE msg = __STR_0__",
+			expectedMasks:  1,
+		},
+		{
+			name:           "escaped single quote",
+			input:          "SELECT * FROM t WHERE x = 'it''s ok'",
+			expectedMasked: "SELECT * FROM t WHERE x = __STR_0__",
+			expectedMasks:  1,
+		},
+		{
+			name:           "no strings",
+			input:          "SELECT * FROM mydb.cpu WHERE time > 1234",
+			expectedMasked: "SELECT * FROM mydb.cpu WHERE time > 1234",
+			expectedMasks:  0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			features := scanSQLFeatures(tt.input)
+			masked, masks := maskStringLiterals(tt.input, features.hasQuotes)
+			if masked != tt.expectedMasked {
+				t.Errorf("maskStringLiterals() masked = %q, want %q", masked, tt.expectedMasked)
+			}
+			if len(masks) != tt.expectedMasks {
+				t.Errorf("maskStringLiterals() masks count = %d, want %d", len(masks), tt.expectedMasks)
+			}
+		})
+	}
+}
+
+func TestUnmaskStringLiterals(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		masks    []stringMask
+		expected string
+	}{
+		{
+			name:     "restore single string",
+			input:    "SELECT * FROM t WHERE x = __STR_0__",
+			masks:    []stringMask{{placeholder: "__STR_0__", original: "'hello'"}},
+			expected: "SELECT * FROM t WHERE x = 'hello'",
+		},
+		{
+			name:  "restore multiple strings",
+			input: "SELECT * FROM t WHERE x = __STR_0__ AND y = __STR_1__",
+			masks: []stringMask{
+				{placeholder: "__STR_0__", original: "'hello'"},
+				{placeholder: "__STR_1__", original: "'world'"},
+			},
+			expected: "SELECT * FROM t WHERE x = 'hello' AND y = 'world'",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := unmaskStringLiterals(tt.input, tt.masks)
+			if result != tt.expected {
+				t.Errorf("unmaskStringLiterals() = %q, want %q", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestStripSQLComments(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "single line comment at end",
+			input:    "SELECT * FROM mydb.cpu -- this is a comment",
+			expected: "SELECT * FROM mydb.cpu ",
+		},
+		{
+			name:     "single line comment with newline",
+			input:    "SELECT * FROM mydb.cpu -- comment\nWHERE time > 1234",
+			expected: "SELECT * FROM mydb.cpu \nWHERE time > 1234",
+		},
+		{
+			name:     "multi-line comment",
+			input:    "SELECT * FROM mydb.cpu /* comment */ WHERE time > 1234",
+			expected: "SELECT * FROM mydb.cpu   WHERE time > 1234",
+		},
+		{
+			name:     "multi-line comment spanning lines",
+			input:    "SELECT * /* start\nend */ FROM mydb.cpu",
+			expected: "SELECT *   FROM mydb.cpu",
+		},
+		{
+			name:     "no comments",
+			input:    "SELECT * FROM mydb.cpu WHERE time > 1234",
+			expected: "SELECT * FROM mydb.cpu WHERE time > 1234",
+		},
+		{
+			name:     "comment with table reference",
+			input:    "SELECT * FROM mydb.cpu -- also query mydb.memory\nWHERE time > 1234",
+			expected: "SELECT * FROM mydb.cpu \nWHERE time > 1234",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			features := scanSQLFeatures(tt.input)
+			result := stripSQLComments(tt.input, features.hasDashComment || features.hasBlockComment)
+			if result != tt.expected {
+				t.Errorf("stripSQLComments() = %q, want %q", result, tt.expected)
+			}
+		})
+	}
+}
+
 func TestConvertSQLWithCTE(t *testing.T) {
 	// Create a minimal QueryHandler for testing
 	h := &QueryHandler{
@@ -146,6 +288,130 @@ func TestConvertSQLWithCTE(t *testing.T) {
 				"read_parquet('./data/default/tree/",
 			},
 		},
+		// String literal protection tests
+		{
+			name:     "string literal containing FROM not converted",
+			inputSQL: "SELECT * FROM mydb.logs WHERE message = 'SELECT * FROM mydb.cpu'",
+			shouldContain: []string{
+				"read_parquet('./data/mydb/logs/**/*.parquet'", // logs table converted
+				"'SELECT * FROM mydb.cpu'",                      // string literal preserved
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/mydb/cpu/", // cpu inside string should NOT be converted
+			},
+		},
+		{
+			name:     "string literal with LIKE pattern",
+			inputSQL: "SELECT * FROM mydb.logs WHERE error LIKE '%FROM mydb.%'",
+			shouldContain: []string{
+				"read_parquet('./data/mydb/logs/**/*.parquet'",
+				"'%FROM mydb.%'", // LIKE pattern preserved
+			},
+			shouldNotContain: []string{},
+		},
+		{
+			name:     "multiple string literals",
+			inputSQL: "SELECT * FROM mydb.data WHERE x = 'FROM mydb.a' AND y = 'FROM mydb.b'",
+			shouldContain: []string{
+				"read_parquet('./data/mydb/data/**/*.parquet'",
+				"'FROM mydb.a'",
+				"'FROM mydb.b'",
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/mydb/a/",
+				"read_parquet('./data/mydb/b/",
+			},
+		},
+		// Comment protection tests
+		{
+			name:     "single line comment not converted",
+			inputSQL: "SELECT * FROM mydb.cpu -- this references mydb.memory\nWHERE time > 1234",
+			shouldContain: []string{
+				"read_parquet('./data/mydb/cpu/**/*.parquet'",
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/mydb/memory/", // comment content should not be converted
+			},
+		},
+		{
+			name:     "multi-line comment not converted",
+			inputSQL: "SELECT * FROM mydb.cpu /* also query mydb.memory */ WHERE time > 1234",
+			shouldContain: []string{
+				"read_parquet('./data/mydb/cpu/**/*.parquet'",
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/mydb/memory/", // comment content should not be converted
+			},
+		},
+		// Combined: string with comment-like content
+		{
+			name:     "string literal with comment-like content",
+			inputSQL: "SELECT * FROM mydb.logs WHERE msg = 'use -- for comments'",
+			shouldContain: []string{
+				"read_parquet('./data/mydb/logs/**/*.parquet'",
+				"'use -- for comments'", // string preserved even with -- inside
+			},
+			shouldNotContain: []string{},
+		},
+		// LATERAL JOIN support
+		{
+			name:     "LATERAL JOIN with database.table",
+			inputSQL: "SELECT * FROM mydb.events e LATERAL JOIN mydb.stats s ON s.event_id = e.id",
+			shouldContain: []string{
+				"read_parquet('./data/mydb/events/**/*.parquet'",
+				"read_parquet('./data/mydb/stats/**/*.parquet'",
+			},
+			shouldNotContain: []string{},
+		},
+		{
+			name:     "CROSS JOIN LATERAL",
+			inputSQL: "SELECT * FROM mydb.events CROSS JOIN LATERAL mydb.related",
+			shouldContain: []string{
+				"read_parquet('./data/mydb/events/**/*.parquet'",
+				"read_parquet('./data/mydb/related/**/*.parquet'",
+			},
+			shouldNotContain: []string{},
+		},
+		// Deep subquery
+		{
+			name:     "nested subqueries",
+			inputSQL: "SELECT * FROM (SELECT * FROM (SELECT * FROM mydb.cpu) t1) t2",
+			shouldContain: []string{
+				"read_parquet('./data/mydb/cpu/**/*.parquet'",
+			},
+			shouldNotContain: []string{},
+		},
+		// UNION queries
+		{
+			name:     "UNION of two tables",
+			inputSQL: "SELECT * FROM mydb.cpu UNION ALL SELECT * FROM mydb.memory",
+			shouldContain: []string{
+				"read_parquet('./data/mydb/cpu/**/*.parquet'",
+				"read_parquet('./data/mydb/memory/**/*.parquet'",
+			},
+			shouldNotContain: []string{},
+		},
+		// Table alias with AS
+		{
+			name:     "table with AS alias",
+			inputSQL: "SELECT c.host FROM mydb.cpu AS c WHERE c.value > 50",
+			shouldContain: []string{
+				"read_parquet('./data/mydb/cpu/**/*.parquet'",
+			},
+			shouldNotContain: []string{},
+		},
+		// JSON string containing table reference
+		{
+			name:     "JSON string with table reference",
+			inputSQL: `SELECT * FROM mydb.data WHERE json_col = '{"table": "mydb.cpu"}'`,
+			shouldContain: []string{
+				"read_parquet('./data/mydb/data/**/*.parquet'",
+				`'{"table": "mydb.cpu"}'`, // JSON string preserved
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/mydb/cpu/", // should not convert inside JSON
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -181,11 +447,13 @@ func TestJoinClausePatterns(t *testing.T) {
 		{name: "LEFT JOIN", sql: "SELECT * FROM a LEFT JOIN mydb.cpu ON 1=1", shouldMatch: true, database: "mydb", table: "cpu"},
 		{name: "RIGHT JOIN", sql: "SELECT * FROM a RIGHT JOIN mydb.cpu ON 1=1", shouldMatch: true, database: "mydb", table: "cpu"},
 		{name: "INNER JOIN", sql: "SELECT * FROM a INNER JOIN mydb.cpu ON 1=1", shouldMatch: true, database: "mydb", table: "cpu"},
+		{name: "LATERAL JOIN", sql: "SELECT * FROM a LATERAL JOIN mydb.cpu ON 1=1", shouldMatch: true, database: "mydb", table: "cpu"},
 		{name: "no JOIN", sql: "SELECT * FROM mydb.cpu", shouldMatch: false, database: "", table: ""},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// Using patternJoinDBTable which captures: database, table
 			matches := patternJoinDBTable.FindStringSubmatch(tt.sql)
 			matched := matches != nil
 			if matched != tt.shouldMatch {
@@ -455,14 +723,15 @@ func TestDBTablePattern(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// patternDBTable captures: database (group 1), table (group 2)
 			matches := patternDBTable.FindStringSubmatch(tt.sql)
 			matched := matches != nil
 			if matched != tt.shouldMatch {
 				t.Errorf("patternDBTable for %q: matched=%v, want %v", tt.sql, matched, tt.shouldMatch)
 			}
-			if matched {
+			if matched && tt.shouldMatch {
 				if len(matches) < 3 {
-					t.Errorf("expected at least 3 groups, got %d", len(matches))
+					t.Errorf("expected at least 3 groups (full match + 2 captures), got %d", len(matches))
 				} else {
 					if matches[1] != tt.database {
 						t.Errorf("database = %q, want %q", matches[1], tt.database)
@@ -596,6 +865,11 @@ func BenchmarkConvertSQLToStoragePaths(b *testing.B) {
 		{
 			name: "complex_query",
 			sql:  "WITH hourly_avg AS (SELECT host, AVG(value) as avg_val FROM mydb.cpu WHERE time BETWEEN '2024-01-01' AND '2024-01-02' GROUP BY host) SELECT * FROM hourly_avg WHERE avg_val > 50 ORDER BY avg_val DESC",
+		},
+		// Benchmark without string literals (fast path)
+		{
+			name: "no_string_literals",
+			sql:  "SELECT host, AVG(value) as avg_val FROM mydb.cpu WHERE time > 1704067200000000 AND time < 1704153600000000 GROUP BY host ORDER BY avg_val DESC LIMIT 100",
 		},
 	}
 
