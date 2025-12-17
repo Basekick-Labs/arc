@@ -1,15 +1,110 @@
 package pruning
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
 )
+
+// globCacheEntry represents a cached glob result with expiration
+type globCacheEntry struct {
+	matches   []string
+	expiresAt time.Time
+}
+
+// globCache provides a TTL cache for filepath.Glob results
+// This avoids expensive filesystem operations for repeated queries
+type globCache struct {
+	mu      sync.RWMutex
+	entries map[string]globCacheEntry
+	ttl     time.Duration
+	hits    atomic.Int64
+	misses  atomic.Int64
+}
+
+// newGlobCache creates a new glob cache with the specified TTL
+func newGlobCache(ttl time.Duration) *globCache {
+	return &globCache{
+		entries: make(map[string]globCacheEntry),
+		ttl:     ttl,
+	}
+}
+
+// get retrieves a cached glob result if it exists and hasn't expired
+func (c *globCache) get(pattern string) ([]string, bool) {
+	c.mu.RLock()
+	entry, ok := c.entries[pattern]
+	c.mu.RUnlock()
+
+	if !ok {
+		c.misses.Add(1)
+		return nil, false
+	}
+
+	if time.Now().After(entry.expiresAt) {
+		c.misses.Add(1)
+		return nil, false
+	}
+
+	c.hits.Add(1)
+	// Return a copy to prevent mutation of cached data
+	result := make([]string, len(entry.matches))
+	copy(result, entry.matches)
+	return result, true
+}
+
+// set stores a glob result in the cache
+func (c *globCache) set(pattern string, matches []string) {
+	// Make a copy to prevent external mutation
+	cached := make([]string, len(matches))
+	copy(cached, matches)
+
+	c.mu.Lock()
+	c.entries[pattern] = globCacheEntry{
+		matches:   cached,
+		expiresAt: time.Now().Add(c.ttl),
+	}
+	c.mu.Unlock()
+}
+
+// invalidate removes all entries from the cache
+func (c *globCache) invalidate() {
+	c.mu.Lock()
+	c.entries = make(map[string]globCacheEntry)
+	c.mu.Unlock()
+}
+
+// cleanup removes expired entries from the cache
+func (c *globCache) cleanup() int {
+	now := time.Now()
+	removed := 0
+
+	c.mu.Lock()
+	for pattern, entry := range c.entries {
+		if now.After(entry.expiresAt) {
+			delete(c.entries, pattern)
+			removed++
+		}
+	}
+	c.mu.Unlock()
+
+	return removed
+}
+
+// stats returns cache statistics
+func (c *globCache) stats() (hits, misses int64, size int) {
+	c.mu.RLock()
+	size = len(c.entries)
+	c.mu.RUnlock()
+	return c.hits.Load(), c.misses.Load(), size
+}
 
 // Pre-compiled regex patterns for time range extraction
 // These are compiled once at package init rather than on every query
@@ -40,6 +135,107 @@ var (
 	storagePathPattern = regexp.MustCompile(`(.+)/([^/]+)/([^/]+)/\*\*/\*\.parquet$`)
 )
 
+// GlobCacheTTL is the default TTL for glob result caching (30 seconds)
+const GlobCacheTTL = 30 * time.Second
+
+// PartitionCacheTTL is the default TTL for partition path caching (60 seconds)
+const PartitionCacheTTL = 60 * time.Second
+
+// partitionCacheEntry represents a cached partition path result
+type partitionCacheEntry struct {
+	result    interface{} // string or []string
+	optimized bool
+	expiresAt time.Time
+}
+
+// partitionCache provides a TTL cache for OptimizeTablePath results
+// This avoids repeated partition calculations for the same queries
+type partitionCache struct {
+	mu      sync.RWMutex
+	entries map[string]partitionCacheEntry
+	ttl     time.Duration
+	hits    atomic.Int64
+	misses  atomic.Int64
+}
+
+// newPartitionCache creates a new partition cache with the specified TTL
+func newPartitionCache(ttl time.Duration) *partitionCache {
+	return &partitionCache{
+		entries: make(map[string]partitionCacheEntry),
+		ttl:     ttl,
+	}
+}
+
+// cacheKey generates a cache key from the original path and SQL query
+func (c *partitionCache) cacheKey(originalPath, sql string) string {
+	// Use hash of SQL to avoid storing full query text
+	h := fmt.Sprintf("%s:%x", originalPath, sha256.Sum256([]byte(sql)))
+	return h
+}
+
+// get retrieves a cached partition result
+func (c *partitionCache) get(key string) (interface{}, bool, bool) {
+	c.mu.RLock()
+	entry, ok := c.entries[key]
+	c.mu.RUnlock()
+
+	if !ok {
+		c.misses.Add(1)
+		return nil, false, false
+	}
+
+	if time.Now().After(entry.expiresAt) {
+		c.misses.Add(1)
+		return nil, false, false
+	}
+
+	c.hits.Add(1)
+	return entry.result, entry.optimized, true
+}
+
+// set stores a partition result in the cache
+func (c *partitionCache) set(key string, result interface{}, optimized bool) {
+	c.mu.Lock()
+	c.entries[key] = partitionCacheEntry{
+		result:    result,
+		optimized: optimized,
+		expiresAt: time.Now().Add(c.ttl),
+	}
+	c.mu.Unlock()
+}
+
+// invalidate removes all entries from the cache
+func (c *partitionCache) invalidate() {
+	c.mu.Lock()
+	c.entries = make(map[string]partitionCacheEntry)
+	c.mu.Unlock()
+}
+
+// cleanup removes expired entries from the cache
+func (c *partitionCache) cleanup() int {
+	now := time.Now()
+	removed := 0
+
+	c.mu.Lock()
+	for key, entry := range c.entries {
+		if now.After(entry.expiresAt) {
+			delete(c.entries, key)
+			removed++
+		}
+	}
+	c.mu.Unlock()
+
+	return removed
+}
+
+// stats returns cache statistics
+func (c *partitionCache) stats() (hits, misses int64, size int) {
+	c.mu.RLock()
+	size = len(c.entries)
+	c.mu.RUnlock()
+	return c.hits.Load(), c.misses.Load(), size
+}
+
 // PartitionPruner provides file-level partition pruning to skip reading Parquet files
 // that don't match the query's WHERE clause predicates.
 //
@@ -53,9 +249,11 @@ var (
 //	After: Read only 24 hour partitions (1 day)
 //	Result: 365x fewer files, 10-100x faster
 type PartitionPruner struct {
-	enabled bool
-	logger  zerolog.Logger
-	stats   PrunerStats
+	enabled        bool
+	logger         zerolog.Logger
+	stats          PrunerStats
+	globCache      *globCache
+	partitionCache *partitionCache
 }
 
 // PrunerStats tracks partition pruning statistics using atomic counters for thread-safety
@@ -74,9 +272,11 @@ type TimeRange struct {
 // NewPartitionPruner creates a new partition pruner
 func NewPartitionPruner(logger zerolog.Logger) *PartitionPruner {
 	return &PartitionPruner{
-		enabled: true,
-		logger:  logger.With().Str("component", "partition-pruner").Logger(),
-		stats:   PrunerStats{},
+		enabled:        true,
+		logger:         logger.With().Str("component", "partition-pruner").Logger(),
+		stats:          PrunerStats{},
+		globCache:      newGlobCache(GlobCacheTTL),
+		partitionCache: newPartitionCache(PartitionCacheTTL),
 	}
 }
 
@@ -217,10 +417,19 @@ func (p *PartitionPruner) OptimizeTablePath(originalPath, sql string) (interface
 		return originalPath, false
 	}
 
+	// Check partition cache first
+	cacheKey := p.partitionCache.cacheKey(originalPath, sql)
+	if result, optimized, ok := p.partitionCache.get(cacheKey); ok {
+		p.logger.Debug().Msg("Using cached partition paths")
+		return result, optimized
+	}
+
 	// Extract time range from query
 	timeRange := p.ExtractTimeRange(sql)
 	if timeRange == nil {
 		p.logger.Debug().Msg("No time range found in query, skipping partition pruning")
+		// Cache negative result too
+		p.partitionCache.set(cacheKey, originalPath, false)
 		return originalPath, false
 	}
 
@@ -230,6 +439,7 @@ func (p *PartitionPruner) OptimizeTablePath(originalPath, sql string) (interface
 
 	if len(matches) < 4 {
 		p.logger.Debug().Str("path", originalPath).Msg("Path format not recognized")
+		p.partitionCache.set(cacheKey, originalPath, false)
 		return originalPath, false
 	}
 
@@ -248,30 +458,36 @@ func (p *PartitionPruner) OptimizeTablePath(originalPath, sql string) (interface
 
 	if len(partitionPaths) == 0 {
 		p.logger.Info().Msg("No partitions found, using fallback")
+		p.partitionCache.set(cacheKey, originalPath, false)
 		return originalPath, false
 	}
 
 	// Filter out non-existent paths for local storage
 	if strings.HasPrefix(basePath, "/") || strings.HasPrefix(basePath, ".") {
-		partitionPaths = filterExistingPaths(partitionPaths, p.logger)
+		partitionPaths = p.filterExistingPaths(partitionPaths)
 		if len(partitionPaths) == 0 {
 			p.logger.Info().Msg("No data exists for time range, using fallback")
+			p.partitionCache.set(cacheKey, originalPath, false)
 			return originalPath, false
 		}
 	}
 
+	var result interface{}
 	if len(partitionPaths) == 1 {
 		p.logger.Info().
 			Str("optimized_path", partitionPaths[0]).
 			Msg("Using single optimized path")
-		return partitionPaths[0], true
+		result = partitionPaths[0]
+	} else {
+		p.logger.Info().
+			Int("partition_count", len(partitionPaths)).
+			Msg("Using multiple partition paths")
+		result = partitionPaths
 	}
 
-	p.logger.Info().
-		Int("partition_count", len(partitionPaths)).
-		Msg("Using multiple partition paths")
-
-	return partitionPaths, true
+	// Cache the result
+	p.partitionCache.set(cacheKey, result, true)
+	return result, true
 }
 
 // StatsSnapshot holds a point-in-time snapshot of pruner statistics
@@ -320,30 +536,117 @@ func parseDateTime(timeStr string) (time.Time, error) {
 }
 
 // filterExistingPaths filters out paths that don't have any matching files
-func filterExistingPaths(paths []string, logger zerolog.Logger) []string {
+// Uses a TTL cache to avoid repeated expensive filesystem operations
+func (p *PartitionPruner) filterExistingPaths(paths []string) []string {
 	existingPaths := []string{}
 
 	for _, pattern := range paths {
-		matches, err := filepath.Glob(pattern)
-		if err != nil {
-			logger.Debug().Err(err).Str("pattern", pattern).Msg("Glob failed")
+		// Check cache first
+		if matches, ok := p.globCache.get(pattern); ok {
+			if len(matches) > 0 {
+				existingPaths = append(existingPaths, pattern)
+				p.logger.Debug().Str("pattern", pattern).Int("files", len(matches)).Msg("Path exists (cached)")
+			}
 			continue
 		}
 
+		// Cache miss - perform actual glob
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			p.logger.Debug().Err(err).Str("pattern", pattern).Msg("Glob failed")
+			continue
+		}
+
+		// Cache the result (even empty results to avoid repeated globs)
+		p.globCache.set(pattern, matches)
+
 		if len(matches) > 0 {
 			existingPaths = append(existingPaths, pattern)
-			logger.Debug().Str("pattern", pattern).Int("files", len(matches)).Msg("Path exists")
+			p.logger.Debug().Str("pattern", pattern).Int("files", len(matches)).Msg("Path exists")
 		} else {
-			logger.Debug().Str("pattern", pattern).Msg("Path skipped (no files)")
+			p.logger.Debug().Str("pattern", pattern).Msg("Path skipped (no files)")
 		}
 	}
 
-	logger.Info().
+	p.logger.Info().
 		Int("original_count", len(paths)).
 		Int("existing_count", len(existingPaths)).
 		Msg("Filtered existing paths")
 
 	return existingPaths
+}
+
+// InvalidateGlobCache clears the glob cache
+// Call this after compaction or when new partitions are created
+func (p *PartitionPruner) InvalidateGlobCache() {
+	p.globCache.invalidate()
+	p.logger.Info().Msg("Glob cache invalidated")
+}
+
+// InvalidatePartitionCache clears the partition path cache
+// Call this after compaction or when new partitions are created
+func (p *PartitionPruner) InvalidatePartitionCache() {
+	p.partitionCache.invalidate()
+	p.logger.Info().Msg("Partition cache invalidated")
+}
+
+// InvalidateAllCaches clears both glob and partition caches
+// Call this after compaction or when new partitions are created
+func (p *PartitionPruner) InvalidateAllCaches() {
+	p.globCache.invalidate()
+	p.partitionCache.invalidate()
+	p.logger.Info().Msg("All caches invalidated")
+}
+
+// CleanupGlobCache removes expired entries from the glob cache
+func (p *PartitionPruner) CleanupGlobCache() int {
+	removed := p.globCache.cleanup()
+	if removed > 0 {
+		p.logger.Debug().Int("removed", removed).Msg("Cleaned up expired glob cache entries")
+	}
+	return removed
+}
+
+// GetGlobCacheStats returns glob cache statistics
+func (p *PartitionPruner) GetGlobCacheStats() map[string]interface{} {
+	hits, misses, size := p.globCache.stats()
+	total := hits + misses
+	hitRate := float64(0)
+	if total > 0 {
+		hitRate = float64(hits) / float64(total) * 100
+	}
+	return map[string]interface{}{
+		"cache_size":       size,
+		"cache_hits":       hits,
+		"cache_misses":     misses,
+		"hit_rate_percent": hitRate,
+		"ttl_seconds":      p.globCache.ttl.Seconds(),
+	}
+}
+
+// GetPartitionCacheStats returns partition cache statistics
+func (p *PartitionPruner) GetPartitionCacheStats() map[string]interface{} {
+	hits, misses, size := p.partitionCache.stats()
+	total := hits + misses
+	hitRate := float64(0)
+	if total > 0 {
+		hitRate = float64(hits) / float64(total) * 100
+	}
+	return map[string]interface{}{
+		"cache_size":       size,
+		"cache_hits":       hits,
+		"cache_misses":     misses,
+		"hit_rate_percent": hitRate,
+		"ttl_seconds":      p.partitionCache.ttl.Seconds(),
+	}
+}
+
+// GetAllCacheStats returns combined statistics for all caches
+func (p *PartitionPruner) GetAllCacheStats() map[string]interface{} {
+	return map[string]interface{}{
+		"glob_cache":      p.GetGlobCacheStats(),
+		"partition_cache": p.GetPartitionCacheStats(),
+	}
 }
 
 // min returns the minimum of two integers

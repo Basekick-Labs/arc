@@ -3,6 +3,7 @@ package auth
 import (
 	"strings"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -65,6 +66,9 @@ func NewMiddleware(config MiddlewareConfig) fiber.Handler {
 			return c.Next()
 		}
 
+		// Track auth request
+		metrics.Get().IncAuthRequests()
+
 		// Extract token from headers (in order of precedence)
 		// 1. Authorization: Bearer <token>
 		// 2. Authorization: <token> (plain token)
@@ -86,6 +90,7 @@ func NewMiddleware(config MiddlewareConfig) fiber.Handler {
 
 		// No token provided
 		if token == "" {
+			metrics.Get().IncAuthFailures()
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 				"success": false,
 				"error":   "Authentication required",
@@ -95,6 +100,7 @@ func NewMiddleware(config MiddlewareConfig) fiber.Handler {
 		// Verify token
 		tokenInfo := config.AuthManager.VerifyToken(token)
 		if tokenInfo == nil {
+			metrics.Get().IncAuthFailures()
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 				"success": false,
 				"error":   "Invalid or expired token",
