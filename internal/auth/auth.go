@@ -12,8 +12,10 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 	"golang.org/x/crypto/bcrypt"
 
@@ -45,11 +47,11 @@ type AuthManager struct {
 	cacheTTL     time.Duration
 	maxCacheSize int
 
-	cache      map[string]cacheEntry // cache key (sha256 of token) -> cached info
-	cacheMu    sync.RWMutex
-	cacheHits  int64
-	cacheMisses int64
-	cacheEvictions int64
+	cache          map[string]cacheEntry // cache key (sha256 of token) -> cached info
+	cacheMu        sync.RWMutex
+	cacheHits      atomic.Int64
+	cacheMisses    atomic.Int64
+	cacheEvictions atomic.Int64
 
 	cleanupDone chan struct{}
 	logger      zerolog.Logger
@@ -134,7 +136,47 @@ func (am *AuthManager) initDB() error {
 		}
 	}
 
+	// Migration: add token_prefix column for O(1) token lookup optimization
+	// token_prefix stores first 16 chars of SHA256(token) for fast filtering
+	_, err = am.db.Exec(`ALTER TABLE api_tokens ADD COLUMN token_prefix TEXT`)
+	if err != nil {
+		if !strings.Contains(err.Error(), "duplicate column") {
+			am.logger.Debug().Err(err).Msg("token_prefix column already exists or migration failed")
+		}
+	}
+
+	// Create index on token_prefix for fast lookups
+	_, err = am.db.Exec(`CREATE INDEX IF NOT EXISTS idx_api_tokens_prefix ON api_tokens(token_prefix)`)
+	if err != nil {
+		am.logger.Debug().Err(err).Msg("Failed to create token_prefix index")
+	}
+
+	// Backfill token_prefix for existing tokens that don't have it
+	// This is a one-time migration that will be skipped if all tokens have prefixes
+	am.backfillTokenPrefixes()
+
 	return nil
+}
+
+// backfillTokenPrefixes populates token_prefix for tokens that don't have it
+// This handles migration from older versions where token_prefix didn't exist
+func (am *AuthManager) backfillTokenPrefixes() {
+	// Check if there are any tokens without prefix
+	var count int
+	err := am.db.QueryRow(`SELECT COUNT(*) FROM api_tokens WHERE token_prefix IS NULL OR token_prefix = ''`).Scan(&count)
+	if err != nil || count == 0 {
+		return // No migration needed
+	}
+
+	am.logger.Info().Int("count", count).Msg("Backfilling token_prefix for existing tokens")
+
+	// For existing tokens, we can't compute the prefix from the bcrypt hash
+	// We'll need to mark them with a special value that forces full scan
+	// When tokens are rotated or new tokens created, they'll get proper prefixes
+	_, err = am.db.Exec(`UPDATE api_tokens SET token_prefix = '__legacy__' WHERE token_prefix IS NULL OR token_prefix = ''`)
+	if err != nil {
+		am.logger.Error().Err(err).Msg("Failed to backfill token_prefix")
+	}
 }
 
 // cleanupLoop runs periodic cache cleanup
@@ -202,6 +244,13 @@ func cacheKey(token string) string {
 	return hex.EncodeToString(h[:])
 }
 
+// tokenPrefix generates a prefix for fast token lookup (first 16 chars of SHA256)
+// This enables O(1) database lookup instead of O(n) full table scan
+func tokenPrefix(token string) string {
+	h := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(h[:])[:16]
+}
+
 // generateToken creates a secure random token
 func generateToken() (string, error) {
 	bytes := make([]byte, 32)
@@ -223,6 +272,9 @@ func (am *AuthManager) CreateToken(name, description, permissions string, expire
 		return "", fmt.Errorf("failed to hash token: %w", err)
 	}
 
+	// Generate prefix for O(1) lookup optimization
+	prefix := tokenPrefix(token)
+
 	if permissions == "" {
 		permissions = "read,write"
 	}
@@ -233,9 +285,9 @@ func (am *AuthManager) CreateToken(name, description, permissions string, expire
 	}
 
 	_, err = am.db.Exec(`
-		INSERT INTO api_tokens (name, token_hash, description, permissions, expires_at)
-		VALUES (?, ?, ?, ?, ?)
-	`, name, hash, description, permissions, expiresAtVal)
+		INSERT INTO api_tokens (name, token_hash, token_prefix, description, permissions, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, name, hash, prefix, description, permissions, expiresAtVal)
 
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
@@ -265,22 +317,25 @@ func (am *AuthManager) VerifyToken(token string) *TokenInfo {
 	am.cacheMu.RLock()
 	if entry, ok := am.cache[key]; ok && now.Before(entry.expiresAt) {
 		am.cacheMu.RUnlock()
-		am.cacheMu.Lock()
-		am.cacheHits++
-		am.cacheMu.Unlock()
+		am.cacheHits.Add(1)
+		metrics.Get().IncAuthCacheHit()
 		return entry.info
 	}
 	am.cacheMu.RUnlock()
 
-	am.cacheMu.Lock()
-	am.cacheMisses++
-	am.cacheMu.Unlock()
+	am.cacheMisses.Add(1)
+	metrics.Get().IncAuthCacheMiss()
 
-	// Query database for all enabled tokens
+	// Generate prefix for optimized lookup
+	prefix := tokenPrefix(token)
+
+	// Query database using token_prefix index for O(1) lookup
+	// Fallback to full scan for legacy tokens (prefix = '__legacy__')
 	rows, err := am.db.Query(`
 		SELECT id, name, token_hash, description, permissions, created_at, last_used_at, expires_at, enabled
-		FROM api_tokens WHERE enabled = 1
-	`)
+		FROM api_tokens
+		WHERE enabled = 1 AND (token_prefix = ? OR token_prefix = '__legacy__')
+	`, prefix)
 	if err != nil {
 		am.logger.Error().Err(err).Msg("Failed to query tokens")
 		return nil
@@ -288,6 +343,7 @@ func (am *AuthManager) VerifyToken(token string) *TokenInfo {
 	defer rows.Close()
 
 	// Find matching token by verifying hash
+	// With prefix index, this typically checks only 1-2 tokens instead of all
 	for rows.Next() {
 		var (
 			id          int64
@@ -354,7 +410,7 @@ func (am *AuthManager) VerifyToken(token string) *TokenInfo {
 			}
 			if oldestKey != "" {
 				delete(am.cache, oldestKey)
-				am.cacheEvictions++
+				am.cacheEvictions.Add(1)
 			}
 		}
 		am.cache[key] = cacheEntry{
@@ -569,7 +625,10 @@ func (am *AuthManager) RotateToken(id int64) (string, error) {
 		return "", fmt.Errorf("failed to hash token: %w", err)
 	}
 
-	result, err := am.db.Exec("UPDATE api_tokens SET token_hash = ? WHERE id = ?", hash, id)
+	// Generate new prefix for O(1) lookup optimization
+	prefix := tokenPrefix(token)
+
+	result, err := am.db.Exec("UPDATE api_tokens SET token_hash = ?, token_prefix = ? WHERE id = ?", hash, prefix, id)
 	if err != nil {
 		return "", err
 	}
@@ -623,23 +682,27 @@ func (am *AuthManager) InvalidateCache() {
 // GetCacheStats returns cache statistics
 func (am *AuthManager) GetCacheStats() map[string]interface{} {
 	am.cacheMu.RLock()
-	defer am.cacheMu.RUnlock()
+	cacheSize := len(am.cache)
+	am.cacheMu.RUnlock()
 
-	total := am.cacheHits + am.cacheMisses
+	hits := am.cacheHits.Load()
+	misses := am.cacheMisses.Load()
+	evictions := am.cacheEvictions.Load()
+	total := hits + misses
 	hitRate := float64(0)
 	if total > 0 {
-		hitRate = float64(am.cacheHits) / float64(total) * 100
+		hitRate = float64(hits) / float64(total) * 100
 	}
 
 	return map[string]interface{}{
-		"cache_size":          len(am.cache),
+		"cache_size":          cacheSize,
 		"max_cache_size":      am.maxCacheSize,
 		"cache_ttl_seconds":   am.cacheTTL.Seconds(),
-		"utilization_percent": float64(len(am.cache)) / float64(am.maxCacheSize) * 100,
+		"utilization_percent": float64(cacheSize) / float64(am.maxCacheSize) * 100,
 		"total_requests":      total,
-		"cache_hits":          am.cacheHits,
-		"cache_misses":        am.cacheMisses,
-		"cache_evictions":     am.cacheEvictions,
+		"cache_hits":          hits,
+		"cache_misses":        misses,
+		"cache_evictions":     evictions,
 		"hit_rate_percent":    hitRate,
 	}
 }
