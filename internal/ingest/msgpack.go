@@ -57,9 +57,9 @@ func (d *MessagePackDecoder) Decode(data []byte) (interface{}, error) {
 	case []interface{}:
 		// Array format - could be batch of records or a single array-encoded record
 		for _, item := range payload {
-			switch item.(type) {
+			switch typedItem := item.(type) {
 			case map[string]interface{}:
-				result, err := d.decodeMapPayload(item.(map[string]interface{}), nil)
+				result, err := d.decodeMapPayload(typedItem, nil)
 				if err != nil {
 					d.logger.Error().Err(err).Msg("Failed to decode array item")
 					continue
@@ -166,17 +166,6 @@ func (d *MessagePackDecoder) mapToPayload(m map[string]interface{}) *models.MsgP
 	return payload
 }
 
-// decodeItem decodes a single item (row or columnar format)
-func (d *MessagePackDecoder) decodeItem(payload *models.MsgPackPayload) (interface{}, error) {
-	// FAST PATH: Columnar format (zero-copy passthrough to Arrow)
-	if payload.Columns != nil {
-		return d.decodeColumnar(payload, nil)
-	}
-
-	// LEGACY PATH: Row format (requires flattening)
-	return d.decodeRow(payload)
-}
-
 // decodeItemWithRaw decodes a single item and passes raw bytes for zero-copy WAL
 func (d *MessagePackDecoder) decodeItemWithRaw(payload *models.MsgPackPayload, rawData []byte) (interface{}, error) {
 	// FAST PATH: Columnar format (zero-copy passthrough to Arrow and WAL)
@@ -199,7 +188,7 @@ func (d *MessagePackDecoder) decodeColumnar(payload *models.MsgPackPayload, rawD
 	}
 
 	// Validate columns exist
-	if payload.Columns == nil || len(payload.Columns) == 0 {
+	if len(payload.Columns) == 0 {
 		return nil, fmt.Errorf("columnar format requires non-empty 'columns' dict")
 	}
 

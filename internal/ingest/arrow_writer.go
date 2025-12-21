@@ -150,26 +150,6 @@ func (c *schemaLRUCache) evictLRU() {
 	c.removeEntry(c.tail)
 }
 
-// stats returns cache statistics
-func (c *schemaLRUCache) stats() map[string]interface{} {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	total := c.hits + c.misses
-	hitRate := float64(0)
-	if total > 0 {
-		hitRate = float64(c.hits) / float64(total) * 100
-	}
-
-	return map[string]interface{}{
-		"capacity":  c.capacity,
-		"size":      len(c.cache),
-		"hits":      c.hits,
-		"misses":    c.misses,
-		"hit_rate":  hitRate,
-	}
-}
-
 // ArrowWriter handles Arrow schema inference and Parquet writing
 type ArrowWriter struct {
 	compression     compress.Compression
@@ -1798,58 +1778,6 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (map[string]interface{
 				copy(merged[name].([]bool)[offset:], v)
 				offsets[name] = offset + len(v)
 			}
-		}
-	}
-
-	return merged, nil
-}
-
-// mergeBatchesRaw merges multiple raw []interface{} column batches
-// OPTIMIZATION: Pre-allocate merged arrays to avoid O(n²) append reallocations
-func (b *ArrowBuffer) mergeBatchesRaw(batches []interface{}) (map[string][]interface{}, error) {
-	if len(batches) == 0 {
-		return nil, fmt.Errorf("no batches to merge")
-	}
-
-	// If only one batch, return it directly
-	if len(batches) == 1 {
-		if cols, ok := batches[0].(map[string][]interface{}); ok {
-			return cols, nil
-		}
-		return nil, fmt.Errorf("invalid batch type: %T", batches[0])
-	}
-
-	// PHASE 1: Calculate total sizes per column
-	sizes := make(map[string]int)
-
-	for _, batch := range batches {
-		cols, ok := batch.(map[string][]interface{})
-		if !ok {
-			return nil, fmt.Errorf("invalid batch type: %T", batch)
-		}
-
-		for name, col := range cols {
-			sizes[name] += len(col)
-		}
-	}
-
-	// PHASE 2: Pre-allocate merged arrays with exact capacity
-	merged := make(map[string][]interface{}, len(sizes))
-	offsets := make(map[string]int, len(sizes))
-
-	for name, size := range sizes {
-		merged[name] = make([]interface{}, size)
-		offsets[name] = 0
-	}
-
-	// PHASE 3: Copy data without reallocation
-	for _, batch := range batches {
-		cols := batch.(map[string][]interface{}) // Already validated above
-
-		for name, col := range cols {
-			offset := offsets[name]
-			copy(merged[name][offset:], col)
-			offsets[name] = offset + len(col)
 		}
 	}
 
