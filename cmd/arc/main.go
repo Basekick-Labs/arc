@@ -442,6 +442,10 @@ func main() {
 		log.Info().Msg("Delete operations DISABLED (set delete.enabled=true in arc.toml to enable)")
 	}
 
+	// Register Databases handler
+	databasesHandler := api.NewDatabasesHandler(storageBackend, &cfg.Delete, logger.Get("databases"))
+	databasesHandler.RegisterRoutes(server.GetApp())
+
 	// Register Retention handler
 	if cfg.Retention.Enabled {
 		retentionHandler, err := api.NewRetentionHandler(storageBackend, db, &cfg.Retention, logger.Get("retention"))

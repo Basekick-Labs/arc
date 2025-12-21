@@ -412,6 +412,34 @@ func (b *LocalBackend) DeleteBatch(ctx context.Context, paths []string) error {
 	return lastErr
 }
 
+// RemoveDirectory removes an empty directory.
+// Implements the DirectoryRemover interface.
+func (b *LocalBackend) RemoveDirectory(ctx context.Context, path string) error {
+	fullPath, err := b.validatePath(path)
+	if err != nil {
+		return fmt.Errorf("invalid path: %w", err)
+	}
+
+	// os.Remove only removes empty directories
+	if err := os.Remove(fullPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil // Already removed, not an error
+		}
+		return fmt.Errorf("failed to remove directory: %w", err)
+	}
+
+	// Invalidate from directory cache
+	b.dirMu.Lock()
+	delete(b.dirCache, fullPath)
+	b.dirMu.Unlock()
+
+	b.logger.Debug().
+		Str("path", path).
+		Msg("Removed directory")
+
+	return nil
+}
+
 // ListObjects lists objects with their metadata at a prefix.
 // Implements the ObjectLister interface.
 func (b *LocalBackend) ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error) {
