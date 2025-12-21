@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -1283,11 +1284,20 @@ func (b *ArrowBuffer) convertColumnsToTyped(columns map[string][]interface{}) (m
 					case uint32:
 						arr[i] = int64(val)
 					case uint64:
+						if val > math.MaxInt64 {
+							return nil, 0, fmt.Errorf("uint64 value %d exceeds int64 max in column '%s'", val, name)
+						}
 						arr[i] = int64(val)
 					// Handle float types (stream may send float when schema inferred int)
 					case float32:
+						if val > math.MaxInt64 || val < math.MinInt64 {
+							return nil, 0, fmt.Errorf("float32 value %f exceeds int64 range in column '%s'", val, name)
+						}
 						arr[i] = int64(val)
 					case float64:
+						if val > math.MaxInt64 || val < math.MinInt64 {
+							return nil, 0, fmt.Errorf("float64 value %f exceeds int64 range in column '%s'", val, name)
+						}
 						arr[i] = int64(val)
 					default:
 						return nil, 0, fmt.Errorf("unexpected type in int column '%s': %T", name, val)
