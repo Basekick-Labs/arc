@@ -65,3 +65,10 @@ type ObjectInfo struct {
 type ObjectLister interface {
 	ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error)
 }
+
+// DirectoryRemover removes an empty directory.
+// This is used to clean up database directories after all files are deleted.
+// For object storage (S3, Azure), this is typically a no-op since directories don't exist as objects.
+type DirectoryRemover interface {
+	RemoveDirectory(ctx context.Context, path string) error
+}
