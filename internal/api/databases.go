@@ -83,26 +83,12 @@ func (h *DatabasesHandler) RegisterRoutes(app *fiber.App) {
 func (h *DatabasesHandler) handleList(c *fiber.Ctx) error {
 	ctx := context.Background()
 
-	databases, err := h.listDatabases(ctx)
+	// Optimized: Single storage call to get all databases with measurement counts
+	databaseInfos, err := h.listDatabasesWithMeasurementCounts(ctx)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to list databases")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to list databases: " + err.Error(),
-		})
-	}
-
-	// Get measurement counts for each database
-	databaseInfos := make([]DatabaseInfo, 0, len(databases))
-	for _, db := range databases {
-		measurementCount := 0
-		measurements, err := h.listMeasurements(ctx, db)
-		if err == nil {
-			measurementCount = len(measurements)
-		}
-
-		databaseInfos = append(databaseInfos, DatabaseInfo{
-			Name:             db,
-			MeasurementCount: measurementCount,
 		})
 	}
 
@@ -230,27 +216,30 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 
 	ctx := context.Background()
 
-	// Check if database exists
-	exists, err := h.databaseExists(ctx, name)
+	// Optimized: Skip separate existence check. Instead, check marker file once
+	// and list measurements in a single operation.
+	markerPath := name + "/.arc-database"
+	markerExists, err := h.storage.Exists(ctx, markerPath)
 	if err != nil {
-		h.logger.Error().Err(err).Str("database", name).Msg("Failed to check if database exists")
+		h.logger.Error().Err(err).Str("database", name).Msg("Failed to check database marker")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to check database",
 		})
 	}
 
-	if !exists {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-			"error": "Database '" + name + "' not found",
-		})
-	}
-
-	// List measurements
+	// List measurements (this also tells us if database has content)
 	measurements, err := h.listMeasurements(ctx, name)
 	if err != nil {
 		h.logger.Error().Err(err).Str("database", name).Msg("Failed to list measurements")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to list measurements: " + err.Error(),
+		})
+	}
+
+	// Database exists if it has a marker file OR has measurements
+	if !markerExists && len(measurements) == 0 {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "Database '" + name + "' not found",
 		})
 	}
 
@@ -436,6 +425,69 @@ func (h *DatabasesHandler) listDatabases(ctx context.Context) ([]string, error) 
 	return filtered, nil
 }
 
+// listDatabasesWithMeasurementCounts returns all databases with their measurement counts
+// using minimal storage calls instead of N+1 calls.
+// Strategy: Get list of databases first (1 call), then get all files (1 call) to count measurements.
+func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Context) ([]DatabaseInfo, error) {
+	// First, get list of all databases (includes empty databases with just .arc-database marker)
+	databases, err := h.listDatabases(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(databases) == 0 {
+		return []DatabaseInfo{}, nil
+	}
+
+	// Single storage call to get all files for measurement counting
+	files, err := h.storage.List(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+
+	// Build a map of database -> set of measurements from files
+	dbMeasurements := make(map[string]map[string]bool)
+
+	// Initialize all known databases (some may be empty)
+	for _, db := range databases {
+		dbMeasurements[db] = make(map[string]bool)
+	}
+
+	// Count measurements from files
+	for _, file := range files {
+		parts := strings.SplitN(file, "/", 3)
+		if len(parts) < 2 {
+			continue
+		}
+
+		db := parts[0]
+		measurement := parts[1]
+
+		// Skip if not a known database (shouldn't happen, but be safe)
+		if dbMeasurements[db] == nil {
+			continue
+		}
+
+		// Skip hidden measurements (like .arc-database marker)
+		if strings.HasPrefix(measurement, ".") || strings.HasPrefix(measurement, "_") {
+			continue
+		}
+
+		dbMeasurements[db][measurement] = true
+	}
+
+	// Convert to sorted list of DatabaseInfo
+	result := make([]DatabaseInfo, 0, len(databases))
+	for _, db := range databases {
+		result = append(result, DatabaseInfo{
+			Name:             db,
+			MeasurementCount: len(dbMeasurements[db]),
+		})
+	}
+
+	return result, nil
+}
+
 func (h *DatabasesHandler) listMeasurements(ctx context.Context, database string) ([]string, error) {
 	var measurements []string
 
@@ -468,17 +520,24 @@ func (h *DatabasesHandler) listMeasurements(ctx context.Context, database string
 }
 
 func (h *DatabasesHandler) databaseExists(ctx context.Context, name string) (bool, error) {
-	databases, err := h.listDatabases(ctx)
+	// Optimized: Check for database marker file directly instead of listing all databases.
+	// A database exists if it has a .arc-database marker file OR has any content.
+	markerPath := name + "/.arc-database"
+	exists, err := h.storage.Exists(ctx, markerPath)
 	if err != nil {
 		return false, err
 	}
-
-	for _, db := range databases {
-		if db == name {
-			return true, nil
-		}
+	if exists {
+		return true, nil
 	}
-	return false, nil
+
+	// Fallback: Check if there's any content in the database directory
+	// (for databases created before marker files were introduced)
+	files, err := h.storage.List(ctx, name+"/")
+	if err != nil {
+		return false, err
+	}
+	return len(files) > 0, nil
 }
 
 func extractTopLevelDirs(files []string) []string {

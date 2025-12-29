@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
 
 	"github.com/basekick-labs/arc/internal/config"
@@ -14,6 +16,38 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
+
+// countingBackend wraps a storage backend to count operations
+type countingBackend struct {
+	storage.Backend
+	listCalls   atomic.Int64
+	existsCalls atomic.Int64
+}
+
+func (c *countingBackend) List(ctx context.Context, prefix string) ([]string, error) {
+	c.listCalls.Add(1)
+	return c.Backend.List(ctx, prefix)
+}
+
+func (c *countingBackend) Exists(ctx context.Context, path string) (bool, error) {
+	c.existsCalls.Add(1)
+	return c.Backend.Exists(ctx, path)
+}
+
+func (c *countingBackend) ResetCounts() {
+	c.listCalls.Store(0)
+	c.existsCalls.Store(0)
+}
+
+// Also implement DirectoryLister if underlying backend supports it
+func (c *countingBackend) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
+	c.listCalls.Add(1) // Count directory listings as list calls
+	if lister, ok := c.Backend.(storage.DirectoryLister); ok {
+		return lister.ListDirectories(ctx, prefix)
+	}
+	// Fallback - should not happen in tests
+	return nil, fmt.Errorf("backend does not support ListDirectories")
+}
 
 // setupTestDatabasesHandler creates a test handler with a local storage backend
 func setupTestDatabasesHandler(t *testing.T, deleteEnabled bool) (*DatabasesHandler, *fiber.App, string) {
@@ -588,4 +622,179 @@ func TestIsValidDatabaseName(t *testing.T) {
 			}
 		})
 	}
+}
+
+// setupBenchmarkHandler creates a handler with counting backend for benchmarks
+func setupBenchmarkHandler(b *testing.B, numDatabases, measurementsPerDB int) (*DatabasesHandler, *fiber.App, *countingBackend, func()) {
+	b.Helper()
+
+	tmpDir, err := os.MkdirTemp("", "arc-databases-bench-*")
+	if err != nil {
+		b.Fatalf("failed to create temp dir: %v", err)
+	}
+
+	logger := zerolog.New(os.Stderr).Level(zerolog.Disabled)
+	backend, err := storage.NewLocalBackend(tmpDir, logger)
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		b.Fatalf("failed to create LocalBackend: %v", err)
+	}
+
+	// Wrap with counting backend
+	counting := &countingBackend{Backend: backend}
+
+	// Create test databases and measurements
+	ctx := context.Background()
+	for i := 0; i < numDatabases; i++ {
+		dbName := fmt.Sprintf("database%d", i)
+		for j := 0; j < measurementsPerDB; j++ {
+			path := fmt.Sprintf("%s/measurement%d/data.parquet", dbName, j)
+			backend.Write(ctx, path, []byte("test data"))
+		}
+	}
+
+	deleteConfig := &config.DeleteConfig{Enabled: false}
+	handler := NewDatabasesHandler(counting, deleteConfig, logger)
+
+	app := fiber.New()
+	handler.RegisterRoutes(app)
+
+	cleanup := func() {
+		backend.Close()
+		os.RemoveAll(tmpDir)
+	}
+
+	return handler, app, counting, cleanup
+}
+
+// BenchmarkDatabasesHandler_List measures storage calls for listing databases
+// This benchmark exposes the N+1 query pattern where listing N databases
+// results in N+1 storage.List() calls instead of 1-2.
+func BenchmarkDatabasesHandler_List(b *testing.B) {
+	cases := []struct {
+		name           string
+		numDBs         int
+		measurePerDB   int
+		expectedCalls  int // Expected with optimization (1 or 2 calls)
+	}{
+		{"5_databases_2_measurements", 5, 2, 2},
+		{"10_databases_3_measurements", 10, 3, 2},
+		{"20_databases_5_measurements", 20, 5, 2},
+	}
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			_, app, counting, cleanup := setupBenchmarkHandler(b, tc.numDBs, tc.measurePerDB)
+			defer cleanup()
+
+			// Reset counts before benchmark
+			counting.ResetCounts()
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				req := httptest.NewRequest("GET", "/api/v1/databases", nil)
+				resp, err := app.Test(req)
+				if err != nil {
+					b.Fatalf("Request failed: %v", err)
+				}
+				if resp.StatusCode != fiber.StatusOK {
+					b.Fatalf("Expected 200, got %d", resp.StatusCode)
+				}
+				// Drain body
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+			b.StopTimer()
+
+			// Report storage call metrics
+			totalListCalls := counting.listCalls.Load()
+			callsPerRequest := float64(totalListCalls) / float64(b.N)
+			b.ReportMetric(callsPerRequest, "list_calls/op")
+
+			// Current: N+1 calls (1 for databases + N for measurements)
+			// Expected after fix: 1-2 calls
+			expectedCurrentCalls := float64(1 + tc.numDBs) // N+1 pattern
+			if callsPerRequest > expectedCurrentCalls*1.1 {
+				b.Logf("WARNING: More storage calls than expected: %.1f vs expected %.1f", callsPerRequest, expectedCurrentCalls)
+			}
+		})
+	}
+}
+
+// BenchmarkDatabasesHandler_Exists measures storage calls for checking database existence
+// This benchmark exposes the inefficient databaseExists() that lists ALL databases
+// instead of checking if a single database marker file exists.
+func BenchmarkDatabasesHandler_Exists(b *testing.B) {
+	cases := []struct {
+		name   string
+		numDBs int
+	}{
+		{"10_databases", 10},
+		{"50_databases", 50},
+		{"100_databases", 100},
+	}
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			_, app, counting, cleanup := setupBenchmarkHandler(b, tc.numDBs, 2)
+			defer cleanup()
+
+			// Test getting a specific database (triggers databaseExists + listMeasurements)
+			targetDB := fmt.Sprintf("database%d", tc.numDBs/2)
+
+			counting.ResetCounts()
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				req := httptest.NewRequest("GET", "/api/v1/databases/"+targetDB, nil)
+				resp, err := app.Test(req)
+				if err != nil {
+					b.Fatalf("Request failed: %v", err)
+				}
+				if resp.StatusCode != fiber.StatusOK {
+					b.Fatalf("Expected 200, got %d", resp.StatusCode)
+				}
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+			b.StopTimer()
+
+			totalListCalls := counting.listCalls.Load()
+			callsPerRequest := float64(totalListCalls) / float64(b.N)
+			b.ReportMetric(callsPerRequest, "list_calls/op")
+
+			// Current: 2 calls (databaseExists lists all DBs, then listMeasurements)
+			// Expected after fix: 1 call (just listMeasurements, or 1 Exists check)
+		})
+	}
+}
+
+// BenchmarkDatabasesHandler_ListMeasurements measures redundant existence check
+func BenchmarkDatabasesHandler_ListMeasurements(b *testing.B) {
+	_, app, counting, cleanup := setupBenchmarkHandler(b, 10, 5)
+	defer cleanup()
+
+	counting.ResetCounts()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		req := httptest.NewRequest("GET", "/api/v1/databases/database5/measurements", nil)
+		resp, err := app.Test(req)
+		if err != nil {
+			b.Fatalf("Request failed: %v", err)
+		}
+		if resp.StatusCode != fiber.StatusOK {
+			b.Fatalf("Expected 200, got %d", resp.StatusCode)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	b.StopTimer()
+
+	totalListCalls := counting.listCalls.Load()
+	callsPerRequest := float64(totalListCalls) / float64(b.N)
+	b.ReportMetric(callsPerRequest, "list_calls/op")
+
+	// Current: 2 calls (databaseExists + listMeasurements)
+	// Expected after fix: 1 call
 }

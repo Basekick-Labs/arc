@@ -44,6 +44,9 @@ var (
 	// Pattern to extract CTE names from WITH clauses
 	// Matches: WITH name AS, WITH RECURSIVE name AS, and comma-separated CTEs
 	patternCTENames = regexp.MustCompile(`(?i)\bWITH\s+(?:RECURSIVE\s+)?(\w+)\s+AS\s*\(|,\s*(\w+)\s+AS\s*\(`)
+
+	// skipPrefixes are table name prefixes that should not be converted to storage paths
+	skipPrefixes = []string{"read_parquet", "information_schema", "pg_", "duckdb_"}
 )
 
 // extractCTENames extracts CTE names from a SQL query's WITH clause.
@@ -555,36 +558,8 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 		if len(parts) < 3 {
 			return match
 		}
-		database := parts[1]
-		table := parts[2]
-
-		// Generate storage path based on backend type
-		path := h.getStoragePath(database, table)
-
-		// Apply partition pruning
-		optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(path, originalSQL)
-
-		if wasOptimized {
-			// Check if it's a list of paths or a single path
-			if pathList, ok := optimizedPath.([]string); ok {
-				// Multiple paths - use DuckDB array syntax
-				pathsStr := "["
-				for i, p := range pathList {
-					if i > 0 {
-						pathsStr += ", "
-					}
-					pathsStr += "'" + p + "'"
-				}
-				pathsStr += "]"
-				h.logger.Info().Int("partition_count", len(pathList)).Msg("Partition pruning: Using targeted paths")
-				return "FROM read_parquet(" + pathsStr + ", union_by_name=true)"
-			} else if pathStr, ok := optimizedPath.(string); ok {
-				h.logger.Info().Str("optimized_path", pathStr).Msg("Partition pruning: Using optimized path")
-				return "FROM read_parquet('" + pathStr + "', union_by_name=true)"
-			}
-		}
-
-		return "FROM read_parquet('" + path + "', union_by_name=true)"
+		path := h.getStoragePath(parts[1], parts[2])
+		return h.buildReadParquetExpr(path, originalSQL, "FROM")
 	})
 
 	// Handle JOIN database.table references (includes LATERAL JOIN)
@@ -593,34 +568,8 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 		if len(parts) < 3 {
 			return match
 		}
-		database := parts[1]
-		table := parts[2]
-
-		// Generate storage path based on backend type
-		path := h.getStoragePath(database, table)
-
-		// Apply partition pruning
-		optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(path, originalSQL)
-
-		if wasOptimized {
-			if pathList, ok := optimizedPath.([]string); ok {
-				pathsStr := "["
-				for i, p := range pathList {
-					if i > 0 {
-						pathsStr += ", "
-					}
-					pathsStr += "'" + p + "'"
-				}
-				pathsStr += "]"
-				h.logger.Info().Int("partition_count", len(pathList)).Msg("Partition pruning: Using targeted paths for JOIN")
-				return "JOIN read_parquet(" + pathsStr + ", union_by_name=true)"
-			} else if pathStr, ok := optimizedPath.(string); ok {
-				h.logger.Info().Str("optimized_path", pathStr).Msg("Partition pruning: Using optimized path for JOIN")
-				return "JOIN read_parquet('" + pathStr + "', union_by_name=true)"
-			}
-		}
-
-		return "JOIN read_parquet('" + path + "', union_by_name=true)"
+		path := h.getStoragePath(parts[1], parts[2])
+		return h.buildReadParquetExpr(path, originalSQL, "JOIN")
 	})
 
 	// Handle FROM simple_table references
@@ -637,11 +586,8 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 		}
 
 		// Skip already converted read_parquet, system tables, etc.
-		skipPrefixes := []string{"read_parquet", "information_schema", "pg_", "duckdb_"}
-		for _, prefix := range skipPrefixes {
-			if strings.HasPrefix(table, prefix) {
-				return match
-			}
+		if shouldSkipTableConversion(table) {
+			return match
 		}
 
 		// Check if followed by a dot (database.table already handled) or parenthesis (function call)
@@ -654,33 +600,8 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 			}
 		}
 
-		// Use default database
 		path := h.getStoragePath("default", parts[1])
-
-		// Apply partition pruning
-		optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(path, originalSQL)
-
-		if wasOptimized {
-			// Check if it's a list of paths or a single path
-			if pathList, ok := optimizedPath.([]string); ok {
-				// Multiple paths - use DuckDB array syntax
-				pathsStr := "["
-				for i, p := range pathList {
-					if i > 0 {
-						pathsStr += ", "
-					}
-					pathsStr += "'" + p + "'"
-				}
-				pathsStr += "]"
-				h.logger.Info().Int("partition_count", len(pathList)).Msg("Partition pruning: Using targeted paths")
-				return "FROM read_parquet(" + pathsStr + ", union_by_name=true)"
-			} else if pathStr, ok := optimizedPath.(string); ok {
-				h.logger.Info().Str("optimized_path", pathStr).Msg("Partition pruning: Using optimized path")
-				return "FROM read_parquet('" + pathStr + "', union_by_name=true)"
-			}
-		}
-
-		return "FROM read_parquet('" + path + "', union_by_name=true)"
+		return h.buildReadParquetExpr(path, originalSQL, "FROM")
 	})
 
 	// Handle JOIN simple_table references (includes LATERAL JOIN)
@@ -697,11 +618,8 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 		}
 
 		// Skip already converted read_parquet, system tables, etc.
-		skipPrefixes := []string{"read_parquet", "information_schema", "pg_", "duckdb_"}
-		for _, prefix := range skipPrefixes {
-			if strings.HasPrefix(table, prefix) {
-				return match
-			}
+		if shouldSkipTableConversion(table) {
+			return match
 		}
 
 		// Check if followed by a dot or parenthesis
@@ -714,31 +632,8 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 			}
 		}
 
-		// Use default database
 		path := h.getStoragePath("default", parts[1])
-
-		// Apply partition pruning
-		optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(path, originalSQL)
-
-		if wasOptimized {
-			if pathList, ok := optimizedPath.([]string); ok {
-				pathsStr := "["
-				for i, p := range pathList {
-					if i > 0 {
-						pathsStr += ", "
-					}
-					pathsStr += "'" + p + "'"
-				}
-				pathsStr += "]"
-				h.logger.Info().Int("partition_count", len(pathList)).Msg("Partition pruning: Using targeted paths for JOIN")
-				return "JOIN read_parquet(" + pathsStr + ", union_by_name=true)"
-			} else if pathStr, ok := optimizedPath.(string); ok {
-				h.logger.Info().Str("optimized_path", pathStr).Msg("Partition pruning: Using optimized path for JOIN")
-				return "JOIN read_parquet('" + pathStr + "', union_by_name=true)"
-			}
-		}
-
-		return "JOIN read_parquet('" + path + "', union_by_name=true)"
+		return h.buildReadParquetExpr(path, originalSQL, "JOIN")
 	})
 
 	// Restore original string literals
@@ -759,6 +654,48 @@ func (h *QueryHandler) getStoragePath(database, table string) string {
 		// Fallback to local path
 		return "./data/" + database + "/" + table + "/**/*.parquet"
 	}
+}
+
+// buildReadParquetExpr builds a read_parquet expression with optional partition pruning.
+// keyword is "FROM" or "JOIN" to prepend to the result.
+func (h *QueryHandler) buildReadParquetExpr(path, originalSQL, keyword string) string {
+	// Apply partition pruning
+	optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(path, originalSQL)
+
+	if wasOptimized {
+		// Check if it's a list of paths or a single path
+		if pathList, ok := optimizedPath.([]string); ok {
+			// Multiple paths - use DuckDB array syntax
+			var pathsStr strings.Builder
+			pathsStr.WriteString("[")
+			for i, p := range pathList {
+				if i > 0 {
+					pathsStr.WriteString(", ")
+				}
+				pathsStr.WriteString("'")
+				pathsStr.WriteString(p)
+				pathsStr.WriteString("'")
+			}
+			pathsStr.WriteString("]")
+			h.logger.Info().Int("partition_count", len(pathList)).Str("keyword", keyword).Msg("Partition pruning: Using targeted paths")
+			return keyword + " read_parquet(" + pathsStr.String() + ", union_by_name=true)"
+		} else if pathStr, ok := optimizedPath.(string); ok {
+			h.logger.Info().Str("optimized_path", pathStr).Str("keyword", keyword).Msg("Partition pruning: Using optimized path")
+			return keyword + " read_parquet('" + pathStr + "', union_by_name=true)"
+		}
+	}
+
+	return keyword + " read_parquet('" + path + "', union_by_name=true)"
+}
+
+// shouldSkipTableConversion returns true if the table name should not be converted to a storage path
+func shouldSkipTableConversion(table string) bool {
+	for _, prefix := range skipPrefixes {
+		if strings.HasPrefix(table, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // convertValue converts database values to JSON-serializable types
