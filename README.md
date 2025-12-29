@@ -1,6 +1,6 @@
 # Arc
 
-[![Ingestion](https://img.shields.io/badge/ingestion-9.47M%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
+[![Ingestion](https://img.shields.io/badge/ingestion-10.1M%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
 [![Query](https://img.shields.io/badge/query-2.88M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
 [![Go](https://img.shields.io/badge/go-1.25+-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
@@ -29,7 +29,7 @@ Industrial IoT generates massive data at scale:
 
 Traditional time-series databases can't keep up. They're slow, expensive, and lock your data in proprietary formats.
 
-**Arc solves this: 9.47M records/sec ingestion, sub-second queries on billions of rows, portable Parquet files you own.**
+**Arc solves this: 10.1M records/sec ingestion, sub-second queries on billions of rows, portable Parquet files you own.**
 
 ```sql
 -- Analyze equipment anomalies across facilities
@@ -62,7 +62,7 @@ Benchmarked on Apple MacBook Pro M3 Max (14 cores, 36GB RAM, 1TB NVMe).
 
 | Protocol | Throughput | p50 Latency | p99 Latency |
 |----------|------------|-------------|-------------|
-| MessagePack Columnar | **9.47M rec/s** | 8.40ms | 42.29ms |
+| MessagePack Columnar | **10.1M rec/s** | 3.09ms | 6.73ms |
 | Line Protocol | 1.92M rec/s | 49.53ms | 108.53ms |
 
 ### Query
@@ -76,7 +76,7 @@ Benchmarked on Apple MacBook Pro M3 Max (14 cores, 36GB RAM, 1TB NVMe).
 
 | Metric | Go | Python | Improvement |
 |--------|-----|--------|-------------|
-| Ingestion | 9.47M rec/s | 4.21M rec/s | **125% faster** |
+| Ingestion | 10.1M rec/s | 4.21M rec/s | **140% faster** |
 | Memory | Stable | 372MB leak/500 queries | **No leaks** |
 | Deployment | Single binary | Multi-worker processes | **Simpler** |
 
