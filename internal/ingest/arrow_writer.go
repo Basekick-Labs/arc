@@ -192,6 +192,140 @@ func NewArrowWriter(cfg *config.IngestConfig, logger zerolog.Logger) *ArrowWrite
 	}
 }
 
+// =============================================================================
+// Type Conversion Helpers - Consolidated from duplicate implementations
+// =============================================================================
+
+// toInt64 converts any numeric type to int64
+// Returns (value, ok) where ok is false if conversion failed
+func toInt64(v interface{}) (int64, bool) {
+	switch val := v.(type) {
+	case int:
+		return int64(val), true
+	case int8:
+		return int64(val), true
+	case int16:
+		return int64(val), true
+	case int32:
+		return int64(val), true
+	case int64:
+		return val, true
+	case uint:
+		// On 64-bit systems, uint can exceed MaxInt64
+		if uint64(val) > math.MaxInt64 {
+			return 0, false
+		}
+		return int64(val), true
+	case uint8:
+		return int64(val), true
+	case uint16:
+		return int64(val), true
+	case uint32:
+		return int64(val), true
+	case uint64:
+		if val > math.MaxInt64 {
+			return 0, false
+		}
+		return int64(val), true
+	case float32:
+		// Bounds check required before conversion to int64
+		if val > float32(math.MaxInt64) || val < float32(math.MinInt64) {
+			return 0, false
+		}
+		return int64(val), true
+	case float64:
+		// Bounds check required before conversion to int64
+		if val > float64(math.MaxInt64) || val < float64(math.MinInt64) {
+			return 0, false
+		}
+		return int64(val), true
+	default:
+		return 0, false
+	}
+}
+
+// toFloat64 converts any numeric type to float64
+// Returns (value, ok) where ok is false if conversion failed
+func toFloat64(v interface{}) (float64, bool) {
+	switch val := v.(type) {
+	case float32:
+		return float64(val), true
+	case float64:
+		return val, true
+	case int:
+		return float64(val), true
+	case int8:
+		return float64(val), true
+	case int16:
+		return float64(val), true
+	case int32:
+		return float64(val), true
+	case int64:
+		return float64(val), true
+	case uint:
+		return float64(val), true
+	case uint8:
+		return float64(val), true
+	case uint16:
+		return float64(val), true
+	case uint32:
+		return float64(val), true
+	case uint64:
+		return float64(val), true
+	default:
+		return 0, false
+	}
+}
+
+// firstNonNil returns the first non-nil value from a slice
+// Returns nil if the slice is empty or all values are nil
+func firstNonNil(col []interface{}) interface{} {
+	for _, v := range col {
+		if v != nil {
+			return v
+		}
+	}
+	return nil
+}
+
+// inferArrowType determines the Arrow data type from a Go value
+// Special handling for "time" column which uses Timestamp type
+func inferArrowType(colName string, firstVal interface{}) (arrow.DataType, error) {
+	if colName == "time" {
+		return arrow.FixedWidthTypes.Timestamp_us, nil
+	}
+
+	switch firstVal.(type) {
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return arrow.PrimitiveTypes.Int64, nil
+	case float32, float64:
+		return arrow.PrimitiveTypes.Float64, nil
+	case string:
+		return arrow.BinaryTypes.String, nil
+	case bool:
+		return arrow.FixedWidthTypes.Boolean, nil
+	default:
+		return nil, fmt.Errorf("unsupported type: %T", firstVal)
+	}
+}
+
+// sortColumnsTimeFirst sorts column names with "time" first, then alphabetical
+func sortColumnsTimeFirst(colNames []string) {
+	sort.Slice(colNames, func(i, j int) bool {
+		if colNames[i] == "time" {
+			return true
+		}
+		if colNames[j] == "time" {
+			return false
+		}
+		return colNames[i] < colNames[j]
+	})
+}
+
+// =============================================================================
+// Schema Inference
+// =============================================================================
+
 // getSchema gets or infers Arrow schema for columnar data (LRU cached per measurement)
 func (w *ArrowWriter) getSchema(measurement string, columns map[string]interface{}) (*arrow.Schema, error) {
 	// Create cache key from column names and types
@@ -452,24 +586,11 @@ func (w *ArrowWriter) buildArrayFromInterface(mem memory.Allocator, field arrow.
 				builder.AppendNull()
 				continue
 			}
-			switch val := v.(type) {
-			case int64:
-				builder.Append(val)
-			case int:
-				builder.Append(int64(val))
-			case int32:
-				builder.Append(int64(val))
-			case uint64:
-				builder.Append(int64(val))
-			case uint:
-				builder.Append(int64(val))
-			case uint32:
-				builder.Append(int64(val))
-			case float64:
-				builder.Append(int64(val))
-			default:
+			val, ok := toInt64(v)
+			if !ok {
 				return nil, fmt.Errorf("cannot convert %T to int64", v)
 			}
+			builder.Append(val)
 		}
 		return builder.NewArray(), nil
 
@@ -482,20 +603,11 @@ func (w *ArrowWriter) buildArrayFromInterface(mem memory.Allocator, field arrow.
 				builder.AppendNull()
 				continue
 			}
-			switch val := v.(type) {
-			case int64:
-				builder.Append(arrow.Timestamp(val))
-			case int:
-				builder.Append(arrow.Timestamp(val))
-			case int32:
-				builder.Append(arrow.Timestamp(val))
-			case uint64:
-				builder.Append(arrow.Timestamp(val))
-			case float64:
-				builder.Append(arrow.Timestamp(int64(val)))
-			default:
+			val, ok := toInt64(v)
+			if !ok {
 				return nil, fmt.Errorf("cannot convert %T to timestamp", v)
 			}
+			builder.Append(arrow.Timestamp(val))
 		}
 		return builder.NewArray(), nil
 
@@ -508,18 +620,11 @@ func (w *ArrowWriter) buildArrayFromInterface(mem memory.Allocator, field arrow.
 				builder.AppendNull()
 				continue
 			}
-			switch val := v.(type) {
-			case float64:
-				builder.Append(val)
-			case float32:
-				builder.Append(float64(val))
-			case int64:
-				builder.Append(float64(val))
-			case int:
-				builder.Append(float64(val))
-			default:
+			val, ok := toFloat64(v)
+			if !ok {
 				return nil, fmt.Errorf("cannot convert %T to float64", v)
 			}
+			builder.Append(val)
 		}
 		return builder.NewArray(), nil
 
@@ -578,19 +683,8 @@ func (w *ArrowWriter) getSchemaFromInterface(measurement string, columns map[str
 		colNames = append(colNames, name)
 	}
 
-	// Sort: time first, then alphabetical
-	for i := 0; i < len(colNames); i++ {
-		for j := i + 1; j < len(colNames); j++ {
-			swapI := colNames[i]
-			swapJ := colNames[j]
-			if swapI == "time" {
-				continue
-			}
-			if swapJ == "time" || swapJ < swapI {
-				colNames[i], colNames[j] = colNames[j], colNames[i]
-			}
-		}
-	}
+	// Sort: time first, then alphabetical (O(n log n) vs O(n²) bubble sort)
+	sortColumnsTimeFirst(colNames)
 
 	for _, name := range colNames {
 		col := columns[name]
@@ -599,34 +693,15 @@ func (w *ArrowWriter) getSchemaFromInterface(measurement string, columns map[str
 		}
 
 		// Find first non-nil value for type inference
-		var firstVal interface{}
-		for _, v := range col {
-			if v != nil {
-				firstVal = v
-				break
-			}
-		}
+		firstVal := firstNonNil(col)
 		if firstVal == nil {
 			continue // Skip all-nil columns
 		}
 
-		// Infer Arrow type
-		var arrowType arrow.DataType
-		if name == "time" {
-			arrowType = arrow.FixedWidthTypes.Timestamp_us
-		} else {
-			switch firstVal.(type) {
-			case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
-				arrowType = arrow.PrimitiveTypes.Int64
-			case float32, float64:
-				arrowType = arrow.PrimitiveTypes.Float64
-			case string:
-				arrowType = arrow.BinaryTypes.String
-			case bool:
-				arrowType = arrow.FixedWidthTypes.Boolean
-			default:
-				return nil, fmt.Errorf("unsupported type for column %s: %T", name, firstVal)
-			}
+		// Infer Arrow type using consolidated helper
+		arrowType, err := inferArrowType(name, firstVal)
+		if err != nil {
+			return nil, fmt.Errorf("column %s: %w", name, err)
 		}
 
 		fields = append(fields, arrow.Field{Name: name, Type: arrowType, Nullable: true})
@@ -1193,14 +1268,7 @@ func (b *ArrowBuffer) convertColumnsToTyped(columns map[string][]interface{}) (m
 		}
 
 		// Infer type from first non-nil value
-		var firstVal interface{}
-		for _, v := range col {
-			if v != nil {
-				firstVal = v
-				break
-			}
-		}
-
+		firstVal := firstNonNil(col)
 		if firstVal == nil {
 			continue // Skip all-nil columns
 		}
@@ -1238,50 +1306,17 @@ func (b *ArrowBuffer) convertColumnsToTyped(columns map[string][]interface{}) (m
 					}
 				}
 			} else {
-				// Fallback: Mixed types - use type switch
+				// Fallback: Mixed types - use consolidated toInt64 helper
 				for i, v := range col {
 					if v == nil {
 						arr[i] = 0
 						continue
 					}
-					switch val := v.(type) {
-					case int:
-						arr[i] = int64(val)
-					case int8:
-						arr[i] = int64(val)
-					case int16:
-						arr[i] = int64(val)
-					case int32:
-						arr[i] = int64(val)
-					case int64:
-						arr[i] = val
-					case uint:
-						arr[i] = int64(val)
-					case uint8:
-						arr[i] = int64(val)
-					case uint16:
-						arr[i] = int64(val)
-					case uint32:
-						arr[i] = int64(val)
-					case uint64:
-						if val > math.MaxInt64 {
-							return nil, 0, fmt.Errorf("uint64 value %d exceeds int64 max in column '%s'", val, name)
-						}
-						arr[i] = int64(val)
-					// Handle float types (stream may send float when schema inferred int)
-					case float32:
-						if val > math.MaxInt64 || val < math.MinInt64 {
-							return nil, 0, fmt.Errorf("float32 value %f exceeds int64 range in column '%s'", val, name)
-						}
-						arr[i] = int64(val)
-					case float64:
-						if val > math.MaxInt64 || val < math.MinInt64 {
-							return nil, 0, fmt.Errorf("float64 value %f exceeds int64 range in column '%s'", val, name)
-						}
-						arr[i] = int64(val)
-					default:
-						return nil, 0, fmt.Errorf("unexpected type in int column '%s': %T", name, val)
+					val, ok := toInt64(v)
+					if !ok {
+						return nil, 0, fmt.Errorf("cannot convert %T to int64 in column '%s'", v, name)
 					}
+					arr[i] = val
 				}
 			}
 			typed[name] = arr
@@ -1314,41 +1349,17 @@ func (b *ArrowBuffer) convertColumnsToTyped(columns map[string][]interface{}) (m
 					}
 				}
 			} else {
-				// Fallback: Mixed types
+				// Fallback: Mixed types - use consolidated toFloat64 helper
 				for i, v := range col {
 					if v == nil {
 						arr[i] = 0.0
 						continue
 					}
-					switch val := v.(type) {
-					case float32:
-						arr[i] = float64(val)
-					case float64:
-						arr[i] = val
-					// Handle integer types (msgpack may send int when value is whole number)
-					case int:
-						arr[i] = float64(val)
-					case int8:
-						arr[i] = float64(val)
-					case int16:
-						arr[i] = float64(val)
-					case int32:
-						arr[i] = float64(val)
-					case int64:
-						arr[i] = float64(val)
-					case uint:
-						arr[i] = float64(val)
-					case uint8:
-						arr[i] = float64(val)
-					case uint16:
-						arr[i] = float64(val)
-					case uint32:
-						arr[i] = float64(val)
-					case uint64:
-						arr[i] = float64(val)
-					default:
-						return nil, 0, fmt.Errorf("unexpected type in float column '%s': %T", name, val)
+					val, ok := toFloat64(v)
+					if !ok {
+						return nil, 0, fmt.Errorf("cannot convert %T to float64 in column '%s'", v, name)
 					}
+					arr[i] = val
 				}
 			}
 			typed[name] = arr

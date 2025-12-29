@@ -384,35 +384,19 @@ func (d *MessagePackDecoder) extractCompactFields(f interface{}) map[string]inte
 }
 
 // normalizeTimestamps converts time column to microseconds IN-PLACE
-// OPTIMIZATION: Modifies values in-place to avoid allocating a new []interface{} slice
+// OPTIMIZATION: Single-pass algorithm that handles both type conversion and normalization
+// Modifies values in-place to avoid allocating a new []interface{} slice
 // This reduces GC pressure significantly under high load (6M+ RPS)
-// OPTIMIZATION 2: Detect type once and use tight loop for homogeneous int64 columns
 func (d *MessagePackDecoder) normalizeTimestamps(columns map[string][]interface{}) error {
 	timeCol, exists := columns["time"]
 	if !exists || len(timeCol) == 0 {
 		return nil
 	}
 
-	// Detect unit from first value
-	firstVal, ok := timeCol[0].(int64)
+	// Detect unit from first value using consolidated helper
+	firstVal, ok := toInt64Timestamp(timeCol[0])
 	if !ok {
-		// Try to convert to int64
-		switch v := timeCol[0].(type) {
-		case int:
-			firstVal = int64(v)
-		case int32:
-			firstVal = int64(v)
-		case uint:
-			firstVal = int64(v)
-		case uint32:
-			firstVal = int64(v)
-		case uint64:
-			firstVal = int64(v)
-		case float64:
-			firstVal = int64(v)
-		default:
-			return fmt.Errorf("invalid timestamp type in columnar format: %T", timeCol[0])
-		}
+		return fmt.Errorf("invalid timestamp type in columnar format: %T", timeCol[0])
 	}
 
 	// Determine multiplier based on detected unit
@@ -428,65 +412,58 @@ func (d *MessagePackDecoder) normalizeTimestamps(columns map[string][]interface{
 		multiplier = 1
 	}
 
-	// FAST PATH: If first element is int64, try tight loop without type switch
-	// This is the common case for well-formed columnar data and avoids
-	// the overhead of 12-way type switch per element
-	if _, isInt64 := timeCol[0].(int64); isInt64 {
-		// Check if all elements are int64 (common case)
-		allInt64 := true
-		for _, val := range timeCol {
-			if _, ok := val.(int64); !ok {
-				allInt64 = false
-				break
-			}
-		}
-
-		if allInt64 {
-			// HOT PATH: All int64 - tight loop without type switch
-			for i, val := range timeCol {
-				timeCol[i] = val.(int64) * multiplier
-			}
-			return nil
-		}
-	}
-
-	// SLOW PATH: Mixed types - use type switch (fallback)
+	// SINGLE-PASS: Convert and normalize in one iteration
+	// For homogeneous int64 columns (common case), the type assertion is very fast
+	// For mixed types, we fall back to the helper on first non-int64 value
 	for i, val := range timeCol {
-		var ts int64
-		switch v := val.(type) {
-		case int:
-			ts = int64(v)
-		case int8:
-			ts = int64(v)
-		case int16:
-			ts = int64(v)
-		case int32:
-			ts = int64(v)
-		case int64:
-			ts = v
-		case uint:
-			ts = int64(v)
-		case uint8:
-			ts = int64(v)
-		case uint16:
-			ts = int64(v)
-		case uint32:
-			ts = int64(v)
-		case uint64:
-			ts = int64(v)
-		case float32:
-			ts = int64(v)
-		case float64:
-			ts = int64(v)
-		default:
+		// Fast path: direct int64 assertion (most common case)
+		if ts, ok := val.(int64); ok {
+			timeCol[i] = ts * multiplier
+			continue
+		}
+
+		// Slow path: use helper for other numeric types
+		ts, ok := toInt64Timestamp(val)
+		if !ok {
 			return fmt.Errorf("invalid timestamp type at index %d: %T", i, val)
 		}
-
-		// Modify in-place - no new allocation
 		timeCol[i] = ts * multiplier
 	}
 
 	return nil
+}
+
+// toInt64Timestamp converts any numeric type to int64 for timestamp normalization
+// Optimized version that only handles types commonly seen in timestamp columns
+func toInt64Timestamp(v interface{}) (int64, bool) {
+	switch val := v.(type) {
+	case int64:
+		return val, true
+	case int:
+		return int64(val), true
+	case int32:
+		return int64(val), true
+	case uint:
+		return int64(val), true
+	case uint32:
+		return int64(val), true
+	case uint64:
+		return int64(val), true
+	case float64:
+		return int64(val), true
+	case float32:
+		return int64(val), true
+	case int8:
+		return int64(val), true
+	case int16:
+		return int64(val), true
+	case uint8:
+		return int64(val), true
+	case uint16:
+		return int64(val), true
+	default:
+		return 0, false
+	}
 }
 
 // GetStats returns decoder statistics
