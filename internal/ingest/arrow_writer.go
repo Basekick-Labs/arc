@@ -1606,6 +1606,147 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 		return
 	}
 
+	// Check partition strategy: data_time vs ingestion_time
+	if b.config.PartitionBy == "data_time" {
+		// Use data timestamp for partitioning
+		if err := b.flushWithDataTimePartitioning(ctx, bufferKey, database, measurement, merged, recordCount, startTime); err != nil {
+			b.logger.Error().
+				Err(err).
+				Str("buffer_key", bufferKey).
+				Msg("Failed to flush with data_time partitioning, falling back to ingestion_time")
+
+			// Fallback to ingestion_time on error
+			b.flushWithIngestionTimePartitioning(ctx, bufferKey, database, measurement, merged, recordCount, startTime)
+		}
+	} else {
+		// Default: use ingestion_time partitioning
+		b.flushWithIngestionTimePartitioning(ctx, bufferKey, database, measurement, merged, recordCount, startTime)
+	}
+}
+
+// flushWithDataTimePartitioning partitions data by data timestamps (optimized with sorting and splitting)
+func (b *ArrowBuffer) flushWithDataTimePartitioning(ctx context.Context, bufferKey, database, measurement string, merged map[string]interface{}, recordCount int, startTime time.Time) error {
+	// Extract time range to check if we need splitting
+	minTime, maxTime, err := extractTimeRange(merged)
+	if err != nil {
+		return fmt.Errorf("failed to extract time range: %w", err)
+	}
+
+	// Log warning if data is significantly old or in the future
+	now := time.Now().UTC()
+	if minTime.Before(now.AddDate(0, 0, -7)) {
+		b.logger.Warn().
+			Time("data_time", minTime).
+			Str("buffer_key", bufferKey).
+			Msg("Data timestamp is >7 days old - possible backfill or clock skew")
+	} else if minTime.After(now.Add(time.Hour)) {
+		b.logger.Warn().
+			Time("data_time", minTime).
+			Str("buffer_key", bufferKey).
+			Msg("Data timestamp is >1 hour in future - possible clock skew")
+	}
+
+	// OPTIMIZATION: If batch spans single hour, skip splitting but still sort
+	if maxTime.Sub(minTime) < time.Hour {
+		// Single hour - sort and write one file
+		// IMPORTANT: Must sort to ensure data is ordered within Parquet file
+		sorted, err := sortColumnsByTime(merged)
+		if err != nil {
+			return fmt.Errorf("failed to sort columns: %w", err)
+		}
+
+		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted)
+		if err != nil {
+			return fmt.Errorf("failed to write Parquet: %w", err)
+		}
+
+		storagePath := b.generateStoragePath(database, measurement, minTime)
+
+		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
+			return fmt.Errorf("failed to write to storage: %w", err)
+		}
+
+		flushDuration := time.Since(startTime)
+
+		b.totalRecordsWritten.Add(int64(recordCount))
+		b.totalFlushes.Add(1)
+
+		b.logger.Info().
+			Str("buffer_key", bufferKey).
+			Str("storage_path", storagePath).
+			Int("records", recordCount).
+			Int("size_bytes", len(parquetData)).
+			Dur("flush_duration", flushDuration).
+			Msg("Async flush completed (single hour, data_time)")
+
+		return nil
+	}
+
+	// Multiple hours - sort and split by hour boundaries
+	sorted, err := sortColumnsByTime(merged)
+	if err != nil {
+		return fmt.Errorf("failed to sort columns: %w", err)
+	}
+
+	times := sorted["time"].([]int64)
+	boundaries, err := findHourBoundaries(times)
+	if err != nil {
+		return fmt.Errorf("failed to find hour boundaries: %w", err)
+	}
+
+	splits := splitColumnsByBoundaries(sorted, boundaries)
+
+	b.logger.Info().
+		Str("buffer_key", bufferKey).
+		Int("num_splits", len(splits)).
+		Int("total_records", recordCount).
+		Msg("Splitting batch across multiple hour partitions")
+
+	// Write one file per hour
+	totalWritten := 0
+	for _, boundary := range boundaries {
+		columns := splits[boundary.hourKey]
+
+		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, columns)
+		if err != nil {
+			return fmt.Errorf("failed to write Parquet for hour %s: %w", boundary.hourKey, err)
+		}
+
+		storagePath := b.generateStoragePath(database, measurement, boundary.minTime)
+
+		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
+			return fmt.Errorf("failed to write to storage for hour %s: %w", boundary.hourKey, err)
+		}
+
+		splitRecordCount := boundary.endIdx - boundary.startIdx
+		totalWritten += splitRecordCount
+
+		b.logger.Info().
+			Str("buffer_key", bufferKey).
+			Str("storage_path", storagePath).
+			Str("hour_key", boundary.hourKey).
+			Int("records", splitRecordCount).
+			Int("size_bytes", len(parquetData)).
+			Msg("Wrote hour partition")
+	}
+
+	flushDuration := time.Since(startTime)
+
+	b.totalRecordsWritten.Add(int64(totalWritten))
+	b.totalFlushes.Add(int64(len(boundaries)))
+
+	b.logger.Info().
+		Str("buffer_key", bufferKey).
+		Int("num_files", len(boundaries)).
+		Int("total_records", totalWritten).
+		Dur("flush_duration", flushDuration).
+		Msg("Async flush completed (multi-hour split, data_time)")
+
+	return nil
+}
+
+// flushWithIngestionTimePartitioning uses ingestion time for partitioning (legacy behavior)
+func (b *ArrowBuffer) flushWithIngestionTimePartitioning(ctx context.Context, bufferKey, database, measurement string, merged map[string]interface{}, recordCount int, startTime time.Time) {
 	// Write merged columns to Parquet (uses optimized typed path)
 	parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, merged)
 	if err != nil {
@@ -1618,8 +1759,8 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 		return
 	}
 
-	// Generate storage path: database/measurement/YYYYMMDD/HHmmss_uuid.parquet
-	storagePath := b.generateStoragePath(database, measurement)
+	// Generate storage path using ingestion time
+	storagePath := b.generateStoragePath(database, measurement, time.Now().UTC())
 
 	// Write to storage
 	if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
@@ -1645,7 +1786,7 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 		Int("records", recordCount).
 		Int("size_bytes", len(parquetData)).
 		Dur("flush_duration", flushDuration).
-		Msg("Async flush completed successfully")
+		Msg("Async flush completed (ingestion_time)")
 }
 
 // flushBufferLocked writes buffered data to Parquet and storage (synchronous version for periodic flush)
@@ -1679,19 +1820,162 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 		return fmt.Errorf("failed to merge batches: %w", err)
 	}
 
+	// Check partition strategy: data_time vs ingestion_time
+	if b.config.PartitionBy == "data_time" {
+		// Use data timestamp for partitioning
+		if err := b.flushBufferLockedDataTime(ctx, bufferKey, database, measurement, merged, recordCount); err != nil {
+			b.logger.Error().
+				Err(err).
+				Str("buffer_key", bufferKey).
+				Msg("Failed to flush with data_time partitioning, falling back to ingestion_time")
+
+			// Fallback to ingestion_time on error
+			if err := b.flushBufferLockedIngestionTime(ctx, bufferKey, database, measurement, merged, recordCount); err != nil {
+				shard.mu.Lock() // Re-acquire lock for caller
+				return err
+			}
+		}
+	} else {
+		// Default: use ingestion_time partitioning
+		if err := b.flushBufferLockedIngestionTime(ctx, bufferKey, database, measurement, merged, recordCount); err != nil {
+			shard.mu.Lock() // Re-acquire lock for caller
+			return err
+		}
+	}
+
+	// Re-acquire lock for caller
+	shard.mu.Lock()
+	return nil
+}
+
+// flushBufferLockedDataTime flushes with data_time partitioning
+func (b *ArrowBuffer) flushBufferLockedDataTime(ctx context.Context, bufferKey, database, measurement string, merged map[string]interface{}, recordCount int) error {
+	// Extract time range to check if we need splitting
+	minTime, maxTime, err := extractTimeRange(merged)
+	if err != nil {
+		return fmt.Errorf("failed to extract time range: %w", err)
+	}
+
+	// Log warning if data is significantly old or in the future
+	now := time.Now().UTC()
+	if minTime.Before(now.AddDate(0, 0, -7)) {
+		b.logger.Warn().
+			Time("data_time", minTime).
+			Str("buffer_key", bufferKey).
+			Msg("Data timestamp is >7 days old - possible backfill or clock skew")
+	} else if minTime.After(now.Add(time.Hour)) {
+		b.logger.Warn().
+			Time("data_time", minTime).
+			Str("buffer_key", bufferKey).
+			Msg("Data timestamp is >1 hour in future - possible clock skew")
+	}
+
+	// OPTIMIZATION: If batch spans single hour, skip splitting but still sort
+	if maxTime.Sub(minTime) < time.Hour {
+		// Single hour - sort and write one file
+		// IMPORTANT: Must sort to ensure data is ordered within Parquet file
+		sorted, err := sortColumnsByTime(merged)
+		if err != nil {
+			return fmt.Errorf("failed to sort columns: %w", err)
+		}
+
+		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted)
+		if err != nil {
+			return fmt.Errorf("failed to write Parquet: %w", err)
+		}
+
+		storagePath := b.generateStoragePath(database, measurement, minTime)
+
+		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
+			return fmt.Errorf("failed to write to storage: %w", err)
+		}
+
+		b.totalRecordsWritten.Add(int64(recordCount))
+		b.totalFlushes.Add(1)
+
+		b.logger.Info().
+			Str("buffer_key", bufferKey).
+			Str("storage_path", storagePath).
+			Int("records", recordCount).
+			Int("size_bytes", len(parquetData)).
+			Msg("Periodic flush completed (single hour, data_time)")
+
+		return nil
+	}
+
+	// Multiple hours - sort and split by hour boundaries
+	sorted, err := sortColumnsByTime(merged)
+	if err != nil {
+		return fmt.Errorf("failed to sort columns: %w", err)
+	}
+
+	times := sorted["time"].([]int64)
+	boundaries, err := findHourBoundaries(times)
+	if err != nil {
+		return fmt.Errorf("failed to find hour boundaries: %w", err)
+	}
+
+	splits := splitColumnsByBoundaries(sorted, boundaries)
+
+	b.logger.Info().
+		Str("buffer_key", bufferKey).
+		Int("num_splits", len(splits)).
+		Int("total_records", recordCount).
+		Msg("Splitting batch across multiple hour partitions")
+
+	// Write one file per hour
+	totalWritten := 0
+	for _, boundary := range boundaries {
+		columns := splits[boundary.hourKey]
+
+		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, columns)
+		if err != nil {
+			return fmt.Errorf("failed to write Parquet for hour %s: %w", boundary.hourKey, err)
+		}
+
+		storagePath := b.generateStoragePath(database, measurement, boundary.minTime)
+
+		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
+			return fmt.Errorf("failed to write to storage for hour %s: %w", boundary.hourKey, err)
+		}
+
+		splitRecordCount := boundary.endIdx - boundary.startIdx
+		totalWritten += splitRecordCount
+
+		b.logger.Info().
+			Str("buffer_key", bufferKey).
+			Str("storage_path", storagePath).
+			Str("hour_key", boundary.hourKey).
+			Int("records", splitRecordCount).
+			Int("size_bytes", len(parquetData)).
+			Msg("Wrote hour partition")
+	}
+
+	b.totalRecordsWritten.Add(int64(totalWritten))
+	b.totalFlushes.Add(int64(len(boundaries)))
+
+	b.logger.Info().
+		Str("buffer_key", bufferKey).
+		Int("num_files", len(boundaries)).
+		Int("total_records", totalWritten).
+		Msg("Periodic flush completed (multi-hour split, data_time)")
+
+	return nil
+}
+
+// flushBufferLockedIngestionTime flushes with ingestion_time partitioning
+func (b *ArrowBuffer) flushBufferLockedIngestionTime(ctx context.Context, bufferKey, database, measurement string, merged map[string]interface{}, recordCount int) error {
 	// Write merged columns to Parquet (uses optimized typed path)
 	parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, merged)
 	if err != nil {
-		shard.mu.Lock() // Re-acquire lock for caller
 		return fmt.Errorf("failed to write Parquet: %w", err)
 	}
 
-	// Generate storage path: database/measurement/YYYYMMDD/HHmmss_uuid.parquet
-	storagePath := b.generateStoragePath(database, measurement)
+	// Generate storage path using ingestion time
+	storagePath := b.generateStoragePath(database, measurement, time.Now().UTC())
 
 	// Write to storage
 	if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
-		shard.mu.Lock() // Re-acquire lock for caller
 		return fmt.Errorf("failed to write to storage: %w", err)
 	}
 
@@ -1704,10 +1988,8 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 		Str("storage_path", storagePath).
 		Int("records", recordCount).
 		Int("size_bytes", len(parquetData)).
-		Msg("Periodic flush completed")
+		Msg("Periodic flush completed (ingestion_time)")
 
-	// Re-acquire lock for caller
-	shard.mu.Lock()
 	return nil
 }
 
@@ -1809,6 +2091,198 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (map[string]interface{
 	return merged, nil
 }
 
+// hourBoundary represents a time partition boundary
+type hourBoundary struct {
+	startIdx int       // Start index in sorted array
+	endIdx   int       // End index (exclusive)
+	hourKey  string    // YYYYMMDDHH
+	minTime  time.Time // First timestamp in partition
+}
+
+// sortColumnsByTime sorts all columns by the time column in-place
+// Returns the sorted columns and any error encountered
+func sortColumnsByTime(columns map[string]interface{}) (map[string]interface{}, error) {
+	// Extract time column
+	timeCol, ok := columns["time"]
+	if !ok {
+		return nil, fmt.Errorf("time column not found")
+	}
+
+	times, ok := timeCol.([]int64)
+	if !ok {
+		return nil, fmt.Errorf("time column must be []int64, got %T", timeCol)
+	}
+
+	n := len(times)
+	if n == 0 {
+		return columns, nil
+	}
+
+	// Create permutation indices [0, 1, 2, ..., n-1]
+	indices := make([]int, n)
+	for i := range indices {
+		indices[i] = i
+	}
+
+	// Sort indices by time values
+	sort.Slice(indices, func(i, j int) bool {
+		return times[indices[i]] < times[indices[j]]
+	})
+
+	// Apply permutation to all columns
+	result := make(map[string]interface{}, len(columns))
+	for colName, colData := range columns {
+		result[colName] = applyPermutation(colData, indices)
+	}
+
+	return result, nil
+}
+
+// applyPermutation reorders a column according to permutation indices
+func applyPermutation(colData interface{}, indices []int) interface{} {
+	switch col := colData.(type) {
+	case []int64:
+		result := make([]int64, len(indices))
+		for i, idx := range indices {
+			result[i] = col[idx]
+		}
+		return result
+
+	case []float64:
+		result := make([]float64, len(indices))
+		for i, idx := range indices {
+			result[i] = col[idx]
+		}
+		return result
+
+	case []string:
+		result := make([]string, len(indices))
+		for i, idx := range indices {
+			result[i] = col[idx]
+		}
+		return result
+
+	case []bool:
+		result := make([]bool, len(indices))
+		for i, idx := range indices {
+			result[i] = col[idx]
+		}
+		return result
+
+	default:
+		return colData // Unknown type, return as-is
+	}
+}
+
+// findHourBoundaries finds hour partition boundaries using binary search on sorted times
+// Assumes times is already sorted in ascending order
+func findHourBoundaries(times []int64) ([]hourBoundary, error) {
+	if len(times) == 0 {
+		return nil, fmt.Errorf("empty time column")
+	}
+
+	var boundaries []hourBoundary
+
+	startIdx := 0
+	for startIdx < len(times) {
+		// Current hour
+		currentTime := time.UnixMicro(times[startIdx]).UTC()
+		currentHour := currentTime.Truncate(time.Hour)
+		hourKey := currentTime.Format("2006010215") // YYYYMMDDHH
+
+		// Find first index where time >= next hour
+		nextHour := currentHour.Add(time.Hour)
+		nextHourMicros := nextHour.UnixMicro()
+
+		// Binary search for transition point
+		endIdx := sort.Search(len(times)-startIdx, func(i int) bool {
+			return times[startIdx+i] >= nextHourMicros
+		}) + startIdx
+
+		// If no transition found, all remaining times are in current hour
+		if endIdx == startIdx {
+			endIdx = len(times)
+		}
+
+		boundaries = append(boundaries, hourBoundary{
+			startIdx: startIdx,
+			endIdx:   endIdx,
+			hourKey:  hourKey,
+			minTime:  currentTime,
+		})
+
+		startIdx = endIdx
+	}
+
+	return boundaries, nil
+}
+
+// splitColumnsByBoundaries creates separate column maps for each hour boundary
+// Uses Go slice operations (cheap, no data copy)
+func splitColumnsByBoundaries(columns map[string]interface{}, boundaries []hourBoundary) map[string]map[string]interface{} {
+	result := make(map[string]map[string]interface{}, len(boundaries))
+
+	for _, boundary := range boundaries {
+		splitCols := make(map[string]interface{}, len(columns))
+
+		for colName, colData := range columns {
+			splitCols[colName] = sliceColumn(colData, boundary.startIdx, boundary.endIdx)
+		}
+
+		result[boundary.hourKey] = splitCols
+	}
+
+	return result
+}
+
+// sliceColumn extracts a range from a typed column using Go slicing
+// Go slices are lightweight (24 bytes: pointer + len + cap), no data copy
+func sliceColumn(colData interface{}, start, end int) interface{} {
+	switch col := colData.(type) {
+	case []int64:
+		return col[start:end]
+	case []float64:
+		return col[start:end]
+	case []string:
+		return col[start:end]
+	case []bool:
+		return col[start:end]
+	default:
+		return colData
+	}
+}
+
+// extractTimeRange extracts min and max timestamps from columnar data
+// Returns (minTime, maxTime, error)
+func extractTimeRange(columns map[string]interface{}) (time.Time, time.Time, error) {
+	timeCol, ok := columns["time"]
+	if !ok {
+		return time.Time{}, time.Time{}, fmt.Errorf("time column not found")
+	}
+
+	times, ok := timeCol.([]int64)
+	if !ok {
+		return time.Time{}, time.Time{}, fmt.Errorf("time column must be []int64, got %T", timeCol)
+	}
+
+	if len(times) == 0 {
+		return time.Time{}, time.Time{}, fmt.Errorf("empty time column")
+	}
+
+	// Find min and max
+	minTs, maxTs := times[0], times[0]
+	for _, ts := range times {
+		if ts < minTs {
+			minTs = ts
+		}
+		if ts > maxTs {
+			maxTs = ts
+		}
+	}
+
+	return time.UnixMicro(minTs), time.UnixMicro(maxTs), nil
+}
+
 // generateStoragePath creates a hierarchical storage path for partition pruning
 // Format: {database}/{measurement}/{YYYY}/{MM}/{DD}/{HH}/{measurement}_{timestamp}_{nanos}.parquet
 //
@@ -1816,16 +2290,16 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (map[string]interface{
 // - Query all of November: read_parquet('s3://bucket/db/cpu/2025/11/*/*/*.parquet')
 // - Query specific day: read_parquet('s3://bucket/db/cpu/2025/11/25/*/*.parquet')
 // - Query specific hour: read_parquet('s3://bucket/db/cpu/2025/11/25/16/*.parquet')
-func (b *ArrowBuffer) generateStoragePath(database, measurement string) string {
-	now := time.Now().UTC()
-
+func (b *ArrowBuffer) generateStoragePath(database, measurement string, partitionTime time.Time) string {
 	// Hierarchical partitioning: year/month/day/hour
-	year := now.Format("2006")
-	month := now.Format("01")
-	day := now.Format("02")
-	hour := now.Format("15")
+	year := partitionTime.Format("2006")
+	month := partitionTime.Format("01")
+	day := partitionTime.Format("02")
+	hour := partitionTime.Format("15")
 
 	// Filename includes measurement, timestamp, and nanos for uniqueness
+	// Use current time for filename to avoid collisions
+	now := time.Now().UTC()
 	timestamp := now.Format("20060102_150405")
 	nanos := now.UnixNano() % 1_000_000_000
 

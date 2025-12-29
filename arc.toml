@@ -126,6 +126,29 @@ max_buffer_size = 50000
 # Default: 5000 (5 seconds)
 max_buffer_age_ms = 5000
 
+# Partitioning strategy for organizing data on disk
+# Options:
+#   - "ingestion_time" (default): Files organized by when data arrives at Arc
+#   - "data_time": Files organized by timestamps in the data itself
+#
+# Use "data_time" when:
+#   - Backfilling historical data
+#   - Importing datasets with past timestamps
+#   - Data arrives with significant delays
+#   - You need accurate time-based partition pruning for queries
+#
+# Use "ingestion_time" when:
+#   - Real-time streaming with minimal delay
+#   - Data timestamps closely match arrival time
+#   - You want simpler file organization
+#
+# PERFORMANCE: When using "data_time", batches spanning multiple hours are
+# automatically sorted and split for optimal query performance (~7ms for 100K records).
+#
+# See docs/time-based-partitioning.md for detailed examples and migration guide.
+# Default: "ingestion_time"
+partition_by = "ingestion_time"
+
 # -----------------------------------------------------------------------------
 # Compaction Configuration
 # -----------------------------------------------------------------------------
