@@ -211,6 +211,10 @@ func toInt64(v interface{}) (int64, bool) {
 	case int64:
 		return val, true
 	case uint:
+		// On 64-bit systems, uint can exceed MaxInt64
+		if uint64(val) > math.MaxInt64 {
+			return 0, false
+		}
 		return int64(val), true
 	case uint8:
 		return int64(val), true
@@ -224,12 +228,14 @@ func toInt64(v interface{}) (int64, bool) {
 		}
 		return int64(val), true
 	case float32:
-		if val > math.MaxInt64 || val < math.MinInt64 {
+		// Bounds check required before conversion to int64
+		if val > float32(math.MaxInt64) || val < float32(math.MinInt64) {
 			return 0, false
 		}
 		return int64(val), true
 	case float64:
-		if val > math.MaxInt64 || val < math.MinInt64 {
+		// Bounds check required before conversion to int64
+		if val > float64(math.MaxInt64) || val < float64(math.MinInt64) {
 			return 0, false
 		}
 		return int64(val), true
