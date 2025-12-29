@@ -46,26 +46,8 @@ func (h *AuthHandler) RegisterRoutes(app *fiber.App) {
 
 // verifyToken handles GET /api/v1/auth/verify
 func (h *AuthHandler) verifyToken(c *fiber.Ctx) error {
-	// Try to get token from headers (in order of precedence)
-	// 1. Authorization: Bearer <token>
-	// 2. Authorization: <token> (plain token)
-	// 3. x-api-key: <token> (Telegraf Arc plugin compatibility)
-	var token string
-
-	authHeader := c.Get("Authorization")
-	if authHeader != "" {
-		// Remove "Bearer " prefix if present
-		if len(authHeader) > 7 && authHeader[:7] == "Bearer " {
-			token = authHeader[7:]
-		} else {
-			token = authHeader
-		}
-	}
-
-	// Fallback to x-api-key header (Telegraf Arc plugin uses this)
-	if token == "" {
-		token = c.Get("x-api-key")
-	}
+	// Extract token from request headers
+	token := auth.ExtractTokenFromRequest(c)
 
 	if token == "" {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{

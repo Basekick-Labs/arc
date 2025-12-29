@@ -69,24 +69,8 @@ func NewMiddleware(config MiddlewareConfig) fiber.Handler {
 		// Track auth request
 		metrics.Get().IncAuthRequests()
 
-		// Extract token from headers (in order of precedence)
-		// 1. Authorization: Bearer <token>
-		// 2. Authorization: <token> (plain token)
-		// 3. x-api-key: <token> (Telegraf Arc plugin compatibility)
-		var token string
-
-		authHeader := c.Get("Authorization")
-		if strings.HasPrefix(authHeader, "Bearer ") {
-			token = strings.TrimPrefix(authHeader, "Bearer ")
-		} else if authHeader != "" {
-			// Also accept plain token (for curl convenience)
-			token = authHeader
-		}
-
-		// Fallback to x-api-key header (Telegraf Arc plugin uses this)
-		if token == "" {
-			token = c.Get("x-api-key")
-		}
+		// Extract token from request
+		token := ExtractTokenFromRequest(c)
 
 		// No token provided
 		if token == "" {
@@ -172,4 +156,17 @@ func GetTokenInfo(c *fiber.Ctx) *TokenInfo {
 		return info
 	}
 	return nil
+}
+
+// ExtractTokenFromRequest extracts auth token from Fiber request headers.
+// Checks in order: Authorization Bearer, Authorization plain, x-api-key.
+func ExtractTokenFromRequest(c *fiber.Ctx) string {
+	authHeader := c.Get("Authorization")
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		return strings.TrimPrefix(authHeader, "Bearer ")
+	}
+	if authHeader != "" {
+		return authHeader
+	}
+	return c.Get("x-api-key")
 }
