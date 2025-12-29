@@ -344,11 +344,14 @@ func (h *DeleteHandler) findAffectedFiles(ctx context.Context, database, measure
 		return nil, fmt.Errorf("failed to list files: %w", err)
 	}
 
-	// Filter for parquet files
-	var parquetFiles []string
+	// Filter for parquet files and convert to query paths
+	var parquetFiles []fileInfo
 	for _, f := range files {
 		if strings.HasSuffix(strings.ToLower(f), ".parquet") {
-			parquetFiles = append(parquetFiles, f)
+			parquetFiles = append(parquetFiles, fileInfo{
+				queryPath:    h.getQueryPath(f),
+				relativePath: f,
+			})
 		}
 	}
 
@@ -359,45 +362,129 @@ func (h *DeleteHandler) findAffectedFiles(ctx context.Context, database, measure
 
 	h.logger.Info().Int("file_count", len(parquetFiles)).Msg("Scanning parquet files for matching rows")
 
-	// Check each file for matching rows
-	for _, relativePath := range parquetFiles {
-		// Convert to DuckDB-compatible path
-		queryPath := h.getQueryPath(relativePath)
-
-		matchCount, err := h.countMatchingRowsInFile(ctx, queryPath, whereClause)
-		if err != nil {
-			h.logger.Warn().Err(err).Str("file", relativePath).Msg("Failed to count matching rows, skipping file")
-			continue
-		}
-
-		if matchCount > 0 {
-			affected = append(affected, affectedFile{
-				path:         queryPath,
-				matchCount:   matchCount,
-				relativePath: relativePath,
-			})
-			h.logger.Debug().Str("file", filepath.Base(relativePath)).Int64("matches", matchCount).Msg("Found matching rows")
-		}
+	// Optimized: Use batch query to count matching rows across all files in one query
+	// This replaces N individual queries with a single query using read_parquet with file list
+	affected, err = h.countMatchingRowsInFiles(ctx, parquetFiles, whereClause)
+	if err != nil {
+		// Fallback to individual queries if batch fails (e.g., schema mismatch)
+		h.logger.Warn().Err(err).Msg("Batch count failed, falling back to individual queries")
+		return h.countMatchingRowsIndividually(ctx, parquetFiles, whereClause)
 	}
 
 	return affected, nil
 }
 
-// countMatchingRowsInFile counts rows that match the WHERE clause in a Parquet file
-func (h *DeleteHandler) countMatchingRowsInFile(ctx context.Context, filePath, whereClause string) (int64, error) {
-	// Use the shared DuckDB connection to avoid memory retention from temporary connections
-	db := h.db.DB()
+// fileInfo holds query and relative paths for a parquet file
+type fileInfo struct {
+	queryPath    string
+	relativePath string
+}
 
-	// Query the parquet file directly
-	query := fmt.Sprintf("SELECT COUNT(*) FROM read_parquet('%s') WHERE %s", filePath, whereClause)
-
-	var count int64
-	err := db.QueryRowContext(ctx, query).Scan(&count)
-	if err != nil {
-		return 0, fmt.Errorf("failed to count rows: %w", err)
+// countMatchingRowsInFiles counts matching rows across multiple files in a single query
+func (h *DeleteHandler) countMatchingRowsInFiles(ctx context.Context, files []fileInfo, whereClause string) ([]affectedFile, error) {
+	if len(files) == 0 {
+		return nil, nil
 	}
 
-	return count, nil
+	db := h.db.DB()
+
+	// Build array of file paths for DuckDB
+	var pathList strings.Builder
+	pathList.WriteString("[")
+	for i, f := range files {
+		if i > 0 {
+			pathList.WriteString(", ")
+		}
+		pathList.WriteString("'")
+		pathList.WriteString(f.queryPath)
+		pathList.WriteString("'")
+	}
+	pathList.WriteString("]")
+
+	// Single query to get counts per file using filename column
+	query := fmt.Sprintf(`
+		SELECT filename, COUNT(*) as match_count
+		FROM read_parquet(%s, filename=true, union_by_name=true)
+		WHERE %s
+		GROUP BY filename
+		HAVING COUNT(*) > 0`,
+		pathList.String(), whereClause)
+
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("batch count query failed: %w", err)
+	}
+	defer rows.Close()
+
+	// Build map of query path -> relative path for lookup
+	pathMap := make(map[string]string)
+	for _, f := range files {
+		pathMap[f.queryPath] = f.relativePath
+	}
+
+	var affected []affectedFile
+	for rows.Next() {
+		var filename string
+		var count int64
+		if err := rows.Scan(&filename, &count); err != nil {
+			return nil, fmt.Errorf("failed to scan row: %w", err)
+		}
+
+		relativePath, ok := pathMap[filename]
+		if !ok {
+			// Try to find by suffix match (DuckDB may return absolute paths)
+			for qp, rp := range pathMap {
+				if strings.HasSuffix(filename, filepath.Base(qp)) {
+					relativePath = rp
+					ok = true
+					break
+				}
+			}
+		}
+		if !ok {
+			h.logger.Warn().Str("filename", filename).Msg("Could not map filename to relative path")
+			continue
+		}
+
+		affected = append(affected, affectedFile{
+			path:         filename,
+			matchCount:   count,
+			relativePath: relativePath,
+		})
+		h.logger.Debug().Str("file", filepath.Base(relativePath)).Int64("matches", count).Msg("Found matching rows")
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating rows: %w", err)
+	}
+
+	return affected, nil
+}
+
+// countMatchingRowsIndividually is the fallback when batch query fails
+func (h *DeleteHandler) countMatchingRowsIndividually(ctx context.Context, files []fileInfo, whereClause string) ([]affectedFile, error) {
+	var affected []affectedFile
+	db := h.db.DB()
+
+	for _, f := range files {
+		query := fmt.Sprintf("SELECT COUNT(*) FROM read_parquet('%s') WHERE %s", f.queryPath, whereClause)
+		var count int64
+		if err := db.QueryRowContext(ctx, query).Scan(&count); err != nil {
+			h.logger.Warn().Err(err).Str("file", f.relativePath).Msg("Failed to count matching rows, skipping file")
+			continue
+		}
+
+		if count > 0 {
+			affected = append(affected, affectedFile{
+				path:         f.queryPath,
+				matchCount:   count,
+				relativePath: f.relativePath,
+			})
+			h.logger.Debug().Str("file", filepath.Base(f.relativePath)).Int64("matches", count).Msg("Found matching rows")
+		}
+	}
+
+	return affected, nil
 }
 
 // rewriteFileWithoutDeletedRows rewrites a Parquet file excluding rows that match the WHERE clause
@@ -407,19 +494,18 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 	// Use the shared DuckDB connection to avoid memory retention from temporary connections
 	db := h.db.DB()
 
-	// First, count rows before and after
+	// Optimized: Single query to count both total rows and rows to keep
+	// Uses COUNT(*) FILTER to get conditional count in one scan
 	var rowsBefore, rowsAfter int64
+	countQuery := fmt.Sprintf(`
+		SELECT
+			COUNT(*) as total,
+			COUNT(*) FILTER (WHERE NOT (%s)) as remaining
+		FROM read_parquet('%s')`,
+		whereClause, queryPath)
 
-	// Count total rows
-	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM read_parquet('%s')", queryPath)
-	if err := db.QueryRowContext(ctx, countQuery).Scan(&rowsBefore); err != nil {
+	if err := db.QueryRowContext(ctx, countQuery).Scan(&rowsBefore, &rowsAfter); err != nil {
 		return 0, fmt.Errorf("failed to count rows: %w", err)
-	}
-
-	// Count rows after filtering out deleted rows
-	afterQuery := fmt.Sprintf("SELECT COUNT(*) FROM read_parquet('%s') WHERE NOT (%s)", queryPath, whereClause)
-	if err := db.QueryRowContext(ctx, afterQuery).Scan(&rowsAfter); err != nil {
-		return 0, fmt.Errorf("failed to count remaining rows: %w", err)
 	}
 
 	deleted := rowsBefore - rowsAfter
