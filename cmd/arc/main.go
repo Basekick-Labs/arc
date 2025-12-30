@@ -310,18 +310,28 @@ func main() {
 		// Create lock manager
 		lockManager := compaction.NewLockManager()
 
+		// Parse sort keys from ingest config for compaction
+		// Compaction needs to maintain the same sort order as ingested files
+		sortKeysConfig, defaultSortKeys, err := config.ParseSortKeys(cfg.Ingest)
+		if err != nil {
+			log.Warn().Err(err).Msg("Invalid sort keys config for compaction, using defaults")
+			sortKeysConfig = make(map[string][]string)
+			defaultSortKeys = []string{"time"}
+		}
+
 		// Create compaction manager (discovers all databases dynamically)
 		// Compaction jobs run in subprocesses for memory isolation
 		compactionManager = compaction.NewManager(&compaction.ManagerConfig{
-			StorageBackend: storageBackend,
-			LockManager:    lockManager,
-			MaxConcurrent:  cfg.Compaction.MaxConcurrent,
-			Tiers:          tiers,
-			Logger:         logger.Get("compaction"),
+			StorageBackend:  storageBackend,
+			LockManager:     lockManager,
+			MaxConcurrent:   cfg.Compaction.MaxConcurrent,
+			SortKeysConfig:  sortKeysConfig,
+			DefaultSortKeys: defaultSortKeys,
+			Tiers:           tiers,
+			Logger:          logger.Get("compaction"),
 		})
 
 		// Create and start scheduler (using hourly schedule by default)
-		var err error
 		compactionScheduler, err = compaction.NewScheduler(&compaction.SchedulerConfig{
 			Manager:  compactionManager,
 			Schedule: cfg.Compaction.HourlySchedule,
@@ -558,3 +568,4 @@ func runCompactSubcommand(args []string) {
 		os.Exit(1)
 	}
 }
+

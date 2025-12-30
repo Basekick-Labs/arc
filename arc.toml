@@ -149,6 +149,53 @@ max_buffer_age_ms = 5000
 # Default: "ingestion_time"
 partition_by = "ingestion_time"
 
+# Secondary sort keys for improved compression and query performance
+# Format: "measurement:column1,column2,time"
+#
+# BENEFITS:
+#   - 30-50% smaller files (better compression when similar values grouped)
+#   - 10-100x faster queries on sort key columns (data clustering + row group pruning)
+#   - Enables dictionary encoding and RLE compression to work optimally
+#
+# EXAMPLES:
+#   IoT sensors: sort by sensor_id first, then time
+#     sort_keys = ["temperature:tag_sensor_id,time", "humidity:tag_sensor_id,time"]
+#
+#   Multi-tenant: sort by tenant, service, then time
+#     sort_keys = ["metrics:tag_tenant_id,tag_service,time"]
+#
+#   Infrastructure: sort by host, metric name, then time
+#     sort_keys = ["cpu:tag_host,tag_metric,time", "memory:tag_host,tag_metric,time"]
+#
+# HOW IT WORKS:
+#   - Data within each Parquet file is sorted by these columns in order
+#   - Groups all data for same sensor/host/tenant together
+#   - Dramatically improves compression (similar values adjacent)
+#   - Faster queries with WHERE clauses on sort key columns
+#
+# PERFORMANCE COST:
+#   - Adds ~35% to sort time (e.g., 7ms → 10ms for 100K records)
+#   - Trade-off: slightly slower writes for much smaller files + faster queries
+#
+# Default: [] (empty, use default_sort_keys for all measurements)
+sort_keys = []
+
+# Default sort keys for measurements not specified in sort_keys
+# Format: comma-separated list of column names
+#
+# EXAMPLES:
+#   Time-only (default): "time"
+#   Host then time: "tag_host,time"
+#   Multi-column: "tag_region,tag_host,time"
+#
+# IMPORTANT:
+#   - Must include "time" column for proper time-based partitioning
+#   - Columns must exist in the data or flush will fall back to time-only
+#   - Applied to ALL measurements not explicitly configured in sort_keys
+#
+# Default: "time"
+default_sort_keys = "time"
+
 # -----------------------------------------------------------------------------
 # Compaction Configuration
 # -----------------------------------------------------------------------------

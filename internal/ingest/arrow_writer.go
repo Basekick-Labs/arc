@@ -830,6 +830,10 @@ type ArrowBuffer struct {
 	flushQueue   chan flushTask
 	flushWorkers int
 
+	// Sort key configuration (for multi-column sorting)
+	sortKeysConfig  map[string][]string // measurement -> sort keys
+	defaultSortKeys []string            // default sort keys
+
 	// Metrics (using atomic operations to avoid lock contention)
 	totalRecordsBuffered atomic.Int64
 	totalRecordsWritten  atomic.Int64
@@ -864,6 +868,18 @@ func (b *ArrowBuffer) getShard(bufferKey string) *bufferShard {
 	return b.shards[hash%b.shardCount]
 }
 
+
+// getSortKeys returns sort keys for a measurement
+func (b *ArrowBuffer) getSortKeys(measurement string) []string {
+	// Check measurement-specific config
+	if keys, exists := b.sortKeysConfig[measurement]; exists {
+		return keys
+	}
+
+	// Use default (e.g., ["time"])
+	return b.defaultSortKeys
+}
+
 // NewArrowBuffer creates a new Arrow buffer with automatic flushing
 func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger zerolog.Logger) *ArrowBuffer {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -884,6 +900,14 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		shardCount = 32 // Fallback if not configured
 	}
 
+	// Parse sort keys config using shared function
+	sortKeysConfig, defaultSortKeys, err := config.ParseSortKeys(*cfg)
+	if err != nil {
+		logger.Warn().Err(err).Msg("Invalid sort keys config, using defaults")
+		sortKeysConfig = make(map[string][]string)
+		defaultSortKeys = []string{"time"}
+	}
+
 	buffer := &ArrowBuffer{
 		config:       cfg,
 		storage:      storage,
@@ -895,6 +919,8 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		flushTimer:   time.NewTicker(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
 		flushQueue:   make(chan flushTask, queueSize),
 		flushWorkers: flushWorkers,
+		sortKeysConfig:  sortKeysConfig,
+		defaultSortKeys: defaultSortKeys,
 		logger:       logger.With().Str("component", "arrow-buffer").Logger(),
 	}
 
@@ -1203,10 +1229,11 @@ func (b *ArrowBuffer) writeColumnar(ctx context.Context, database string, record
 		recordsToFlush = make([]interface{}, len(shard.buffers[bufferKey]))
 		copy(recordsToFlush, shard.buffers[bufferKey])
 
-		// Clear buffer immediately
+		// Clear buffer immediately, but KEEP the start time
+		// This allows age-based flush to catch any remaining data after size flushes
 		shard.buffers[bufferKey] = nil
-		delete(shard.bufferStartTimes, bufferKey)
-		delete(shard.bufferRecordCounts, bufferKey)
+		// NOTE: Keep bufferStartTimes[bufferKey] - don't delete it!
+		shard.bufferRecordCounts[bufferKey] = 0
 		delete(shard.bufferSchemas, bufferKey)
 
 		shouldFlush = true
@@ -1646,13 +1673,26 @@ func (b *ArrowBuffer) flushWithDataTimePartitioning(ctx context.Context, bufferK
 			Msg("Data timestamp is >1 hour in future - possible clock skew")
 	}
 
+	// Get sort keys for this measurement
+	sortKeys := b.getSortKeys(measurement)
+
 	// OPTIMIZATION: If batch spans single hour, skip splitting but still sort
 	if maxTime.Sub(minTime) < time.Hour {
 		// Single hour - sort and write one file
 		// IMPORTANT: Must sort to ensure data is ordered within Parquet file
-		sorted, err := sortColumnsByTime(merged)
+		sorted, err := sortColumnsByKeys(merged, sortKeys)
 		if err != nil {
+			b.logger.Warn().
+				Err(err).
+				Str("measurement", measurement).
+				Strs("sort_keys", sortKeys).
+				Msg("Failed to sort by configured keys, falling back to time-only")
+
+			// Fallback to time-only sorting
+			sorted, err = sortColumnsByTime(merged)
+			if err != nil {
 			return fmt.Errorf("failed to sort columns: %w", err)
+		}
 		}
 
 		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted)
@@ -1677,15 +1717,26 @@ func (b *ArrowBuffer) flushWithDataTimePartitioning(ctx context.Context, bufferK
 			Int("records", recordCount).
 			Int("size_bytes", len(parquetData)).
 			Dur("flush_duration", flushDuration).
+			Strs("sort_keys", sortKeys).
 			Msg("Async flush completed (single hour, data_time)")
 
 		return nil
 	}
 
 	// Multiple hours - sort and split by hour boundaries
-	sorted, err := sortColumnsByTime(merged)
+	sorted, err := sortColumnsByKeys(merged, sortKeys)
 	if err != nil {
+		b.logger.Warn().
+			Err(err).
+			Str("measurement", measurement).
+			Strs("sort_keys", sortKeys).
+			Msg("Failed to sort by configured keys, falling back to time-only")
+
+		// Fallback to time-only sorting
+		sorted, err = sortColumnsByTime(merged)
+		if err != nil {
 		return fmt.Errorf("failed to sort columns: %w", err)
+	}
 	}
 
 	times := sorted["time"].([]int64)
@@ -1870,13 +1921,26 @@ func (b *ArrowBuffer) flushBufferLockedDataTime(ctx context.Context, bufferKey, 
 			Msg("Data timestamp is >1 hour in future - possible clock skew")
 	}
 
+	// Get sort keys for this measurement
+	sortKeys := b.getSortKeys(measurement)
+
 	// OPTIMIZATION: If batch spans single hour, skip splitting but still sort
 	if maxTime.Sub(minTime) < time.Hour {
 		// Single hour - sort and write one file
 		// IMPORTANT: Must sort to ensure data is ordered within Parquet file
-		sorted, err := sortColumnsByTime(merged)
+		sorted, err := sortColumnsByKeys(merged, sortKeys)
 		if err != nil {
+			b.logger.Warn().
+				Err(err).
+				Str("measurement", measurement).
+				Strs("sort_keys", sortKeys).
+				Msg("Failed to sort by configured keys, falling back to time-only")
+
+			// Fallback to time-only sorting
+			sorted, err = sortColumnsByTime(merged)
+			if err != nil {
 			return fmt.Errorf("failed to sort columns: %w", err)
+		}
 		}
 
 		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted)
@@ -1898,15 +1962,26 @@ func (b *ArrowBuffer) flushBufferLockedDataTime(ctx context.Context, bufferKey, 
 			Str("storage_path", storagePath).
 			Int("records", recordCount).
 			Int("size_bytes", len(parquetData)).
+			Strs("sort_keys", sortKeys).
 			Msg("Periodic flush completed (single hour, data_time)")
 
 		return nil
 	}
 
 	// Multiple hours - sort and split by hour boundaries
-	sorted, err := sortColumnsByTime(merged)
+	sorted, err := sortColumnsByKeys(merged, sortKeys)
 	if err != nil {
+		b.logger.Warn().
+			Err(err).
+			Str("measurement", measurement).
+			Strs("sort_keys", sortKeys).
+			Msg("Failed to sort by configured keys, falling back to time-only")
+
+		// Fallback to time-only sorting
+		sorted, err = sortColumnsByTime(merged)
+		if err != nil {
 		return fmt.Errorf("failed to sort columns: %w", err)
+	}
 	}
 
 	times := sorted["time"].([]int64)
@@ -2102,18 +2177,42 @@ type hourBoundary struct {
 // sortColumnsByTime sorts all columns by the time column in-place
 // Returns the sorted columns and any error encountered
 func sortColumnsByTime(columns map[string]interface{}) (map[string]interface{}, error) {
-	// Extract time column
-	timeCol, ok := columns["time"]
-	if !ok {
-		return nil, fmt.Errorf("time column not found")
+	// Delegate to multi-key sort with just "time" key
+	return sortColumnsByKeys(columns, []string{"time"})
+}
+
+// sortColumnsByKeys sorts columns by multiple keys (e.g., sensor_id, then time)
+// Returns the sorted columns and any error encountered
+func sortColumnsByKeys(columns map[string]interface{}, sortKeys []string) (map[string]interface{}, error) {
+	if len(sortKeys) == 0 {
+		return nil, fmt.Errorf("no sort keys provided")
 	}
 
-	times, ok := timeCol.([]int64)
-	if !ok {
-		return nil, fmt.Errorf("time column must be []int64, got %T", timeCol)
+	// Validate all sort keys exist
+	for _, key := range sortKeys {
+		if _, exists := columns[key]; !exists {
+			return nil, fmt.Errorf("sort key column not found: %s", key)
+	}
 	}
 
-	n := len(times)
+	// Get first column to determine row count
+	var n int
+	for _, col := range columns {
+		switch c := col.(type) {
+		case []int64:
+			n = len(c)
+		case []float64:
+			n = len(c)
+		case []string:
+			n = len(c)
+		case []bool:
+			n = len(c)
+		}
+		if n > 0 {
+			break
+		}
+	}
+
 	if n == 0 {
 		return columns, nil
 	}
@@ -2124,9 +2223,9 @@ func sortColumnsByTime(columns map[string]interface{}) (map[string]interface{}, 
 		indices[i] = i
 	}
 
-	// Sort indices by time values
+	// Multi-key sort comparator
 	sort.Slice(indices, func(i, j int) bool {
-		return times[indices[i]] < times[indices[j]]
+		return compareMultiKey(columns, sortKeys, indices[i], indices[j])
 	})
 
 	// Apply permutation to all columns
@@ -2136,6 +2235,52 @@ func sortColumnsByTime(columns map[string]interface{}) (map[string]interface{}, 
 	}
 
 	return result, nil
+}
+
+// compareMultiKey compares two rows by multiple sort keys
+// Returns true if row i < row j according to sort keys
+func compareMultiKey(columns map[string]interface{}, sortKeys []string, i, j int) bool {
+	for _, key := range sortKeys {
+		col := columns[key]
+
+		switch c := col.(type) {
+		case []int64:
+			if c[i] < c[j] {
+				return true
+			}
+			if c[i] > c[j] {
+				return false
+			}
+			// Equal, continue to next key
+
+		case []float64:
+			if c[i] < c[j] {
+				return true
+			}
+			if c[i] > c[j] {
+				return false
+			}
+
+		case []string:
+			if c[i] < c[j] {
+				return true
+			}
+			if c[i] > c[j] {
+				return false
+			}
+
+		case []bool:
+			if !c[i] && c[j] { // false < true
+				return true
+			}
+			if c[i] && !c[j] {
+				return false
+			}
+		}
+	}
+
+	// All keys equal
+	return false
 }
 
 // applyPermutation reorders a column according to permutation indices

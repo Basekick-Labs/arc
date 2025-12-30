@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -534,3 +535,197 @@ func BenchmarkFindHourBoundaries(b *testing.B) {
 		_, _ = findHourBoundaries(times)
 	}
 }
+
+// TestSortColumnsByKeys tests multi-key sorting
+func TestSortColumnsByKeys(t *testing.T) {
+	tests := []struct {
+		name          string
+		columns       map[string]interface{}
+		sortKeys      []string
+		wantOrder     []int // Expected row order after sort
+		wantError     bool
+		errorContains string
+	}{
+		{
+			name: "sort by sensor_id then time",
+			columns: map[string]interface{}{
+				"tag_sensor_id": []string{"B", "A", "B", "A"},
+				"time":          []int64{2000, 1000, 1000, 2000},
+				"value":         []float64{20.0, 10.0, 30.0, 40.0},
+			},
+			sortKeys: []string{"tag_sensor_id", "time"},
+			// Expected order: A,1000,10.0 -> A,2000,40.0 -> B,1000,30.0 -> B,2000,20.0
+			wantOrder: []int{1, 3, 2, 0},
+		},
+		{
+			name: "sort by time only (single key)",
+			columns: map[string]interface{}{
+				"tag_sensor_id": []string{"B", "A", "C"},
+				"time":          []int64{3000, 1000, 2000},
+				"value":         []float64{3.0, 1.0, 2.0},
+			},
+			sortKeys:  []string{"time"},
+			wantOrder: []int{1, 2, 0}, // 1000, 2000, 3000
+		},
+		{
+			name: "sort by int64 column then time",
+			columns: map[string]interface{}{
+				"device_id": []int64{2, 1, 2, 1},
+				"time":      []int64{4000, 3000, 2000, 1000},
+				"value":     []float64{4.0, 3.0, 2.0, 1.0},
+			},
+			sortKeys:  []string{"device_id", "time"},
+			wantOrder: []int{3, 1, 2, 0}, // device_id=1,time=1000 -> 1,3000 -> 2,2000 -> 2,4000
+		},
+		{
+			name: "sort by float64 column",
+			columns: map[string]interface{}{
+				"priority": []float64{3.5, 1.2, 2.7},
+				"time":     []int64{1000, 2000, 3000},
+			},
+			sortKeys:  []string{"priority", "time"},
+			wantOrder: []int{1, 2, 0}, // 1.2, 2.7, 3.5
+		},
+		{
+			name: "sort by bool column then time",
+			columns: map[string]interface{}{
+				"active": []bool{true, false, true, false},
+				"time":   []int64{4000, 3000, 2000, 1000},
+			},
+			sortKeys:  []string{"active", "time"},
+			wantOrder: []int{3, 1, 2, 0}, // false,1000 -> false,3000 -> true,2000 -> true,4000
+		},
+		{
+			name: "three-key sort",
+			columns: map[string]interface{}{
+				"region": []string{"US", "EU", "US", "EU"},
+				"host":   []string{"host1", "host1", "host2", "host2"},
+				"time":   []int64{2000, 1000, 4000, 3000},
+			},
+			sortKeys:  []string{"region", "host", "time"},
+			wantOrder: []int{1, 3, 0, 2}, // EU,host1,1000 -> EU,host2,3000 -> US,host1,2000 -> US,host2,4000
+		},
+		{
+			name: "missing sort key column",
+			columns: map[string]interface{}{
+				"time":  []int64{1000, 2000},
+				"value": []float64{1.0, 2.0},
+			},
+			sortKeys:      []string{"nonexistent", "time"},
+			wantError:     true,
+			errorContains: "sort key column not found",
+		},
+		{
+			name: "no sort keys provided",
+			columns: map[string]interface{}{
+				"time": []int64{1000, 2000},
+			},
+			sortKeys:      []string{},
+			wantError:     true,
+			errorContains: "no sort keys provided",
+		},
+		{
+			name: "empty data",
+			columns: map[string]interface{}{
+				"time":  []int64{},
+				"value": []float64{},
+			},
+			sortKeys:  []string{"time"},
+			wantOrder: []int{}, // No change, empty
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sorted, err := sortColumnsByKeys(tt.columns, tt.sortKeys)
+
+			if tt.wantError {
+				if err == nil {
+					t.Errorf("sortColumnsByKeys() expected error but got none")
+					return
+				}
+				if tt.errorContains != "" && !strings.Contains(err.Error(), tt.errorContains) {
+					t.Errorf("sortColumnsByKeys() error = %v, want error containing %q", err, tt.errorContains)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("sortColumnsByKeys() unexpected error: %v", err)
+				return
+			}
+
+			// Verify sort order by checking all columns
+			if len(tt.wantOrder) > 0 {
+				// Check that data is in expected order
+				for colName, colData := range sorted {
+					switch col := colData.(type) {
+					case []int64:
+						for i, expectedIdx := range tt.wantOrder {
+							originalCol := tt.columns[colName].([]int64)
+							if col[i] != originalCol[expectedIdx] {
+								t.Errorf("sortColumnsByKeys() column %s[%d] = %v, want %v (original[%d])",
+									colName, i, col[i], originalCol[expectedIdx], expectedIdx)
+							}
+						}
+					case []float64:
+						for i, expectedIdx := range tt.wantOrder {
+							originalCol := tt.columns[colName].([]float64)
+							if col[i] != originalCol[expectedIdx] {
+								t.Errorf("sortColumnsByKeys() column %s[%d] = %v, want %v (original[%d])",
+									colName, i, col[i], originalCol[expectedIdx], expectedIdx)
+							}
+						}
+					case []string:
+						for i, expectedIdx := range tt.wantOrder {
+							originalCol := tt.columns[colName].([]string)
+							if col[i] != originalCol[expectedIdx] {
+								t.Errorf("sortColumnsByKeys() column %s[%d] = %v, want %v (original[%d])",
+									colName, i, col[i], originalCol[expectedIdx], expectedIdx)
+							}
+						}
+					case []bool:
+						for i, expectedIdx := range tt.wantOrder {
+							originalCol := tt.columns[colName].([]bool)
+							if col[i] != originalCol[expectedIdx] {
+								t.Errorf("sortColumnsByKeys() column %s[%d] = %v, want %v (original[%d])",
+									colName, i, col[i], originalCol[expectedIdx], expectedIdx)
+							}
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkSortColumnsByKeys benchmarks multi-key sorting performance
+func BenchmarkSortColumnsByKeys(b *testing.B) {
+	sizes := []int{100, 1000, 10000}
+
+	for _, size := range sizes {
+		b.Run("size_"+string(rune(size)), func(b *testing.B) {
+			// Create test data
+			columns := map[string]interface{}{
+				"tag_sensor_id": make([]string, size),
+				"time":          make([]int64, size),
+				"value":         make([]float64, size),
+			}
+
+			// Populate with semi-random data (deterministic for consistency)
+			for i := 0; i < size; i++ {
+				columns["tag_sensor_id"].([]string)[i] = "sensor_" + string(rune('A'+i%26))
+				columns["time"].([]int64)[i] = int64(size - i) // Reverse order
+				columns["value"].([]float64)[i] = float64(i) * 1.5
+			}
+
+			sortKeys := []string{"tag_sensor_id", "time"}
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, _ = sortColumnsByKeys(columns, sortKeys)
+			}
+		})
+	}
+}
+

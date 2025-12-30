@@ -27,6 +27,10 @@ type Manager struct {
 	MaxConcurrent int
 	TempDirectory string // Temp directory for compaction files
 
+	// Sort key configuration (from ingest config)
+	SortKeysConfig  map[string][]string // measurement -> sort keys
+	DefaultSortKeys []string            // default sort keys
+
 	// Tiers
 	Tiers []Tier
 
@@ -49,15 +53,17 @@ type Manager struct {
 
 // ManagerConfig holds configuration for creating a compaction manager
 type ManagerConfig struct {
-	StorageBackend storage.Backend
-	LockManager    *LockManager
-	MinAgeHours    int
-	MinFiles       int
-	TargetSizeMB   int
-	MaxConcurrent  int
-	TempDirectory  string // Temp directory for compaction files
-	Tiers          []Tier
-	Logger         zerolog.Logger
+	StorageBackend  storage.Backend
+	LockManager     *LockManager
+	MinAgeHours     int
+	MinFiles        int
+	TargetSizeMB    int
+	MaxConcurrent   int
+	TempDirectory   string              // Temp directory for compaction files
+	SortKeysConfig  map[string][]string // Per-measurement sort keys from ingest config
+	DefaultSortKeys []string            // Default sort keys from ingest config
+	Tiers           []Tier
+	Logger          zerolog.Logger
 }
 
 // NewManager creates a new compaction manager
@@ -79,17 +85,30 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		cfg.TempDirectory = "./data/compaction"
 	}
 
+	// Set default sort keys if not provided
+	sortKeysConfig := cfg.SortKeysConfig
+	if sortKeysConfig == nil {
+		sortKeysConfig = make(map[string][]string)
+	}
+
+	defaultSortKeys := cfg.DefaultSortKeys
+	if defaultSortKeys == nil {
+		defaultSortKeys = []string{"time"} // Default to time-only sorting
+	}
+
 	m := &Manager{
-		StorageBackend: cfg.StorageBackend,
-		LockManager:    cfg.LockManager,
-		MinAgeHours:    cfg.MinAgeHours,
-		MinFiles:       cfg.MinFiles,
-		TargetSizeMB:   cfg.TargetSizeMB,
-		MaxConcurrent:  cfg.MaxConcurrent,
-		TempDirectory:  cfg.TempDirectory,
-		Tiers:          cfg.Tiers,
-		jobHistory:     make([]map[string]interface{}, 0),
-		logger:         cfg.Logger.With().Str("component", "compaction-manager").Logger(),
+		StorageBackend:  cfg.StorageBackend,
+		LockManager:     cfg.LockManager,
+		MinAgeHours:     cfg.MinAgeHours,
+		MinFiles:        cfg.MinFiles,
+		TargetSizeMB:    cfg.TargetSizeMB,
+		MaxConcurrent:   cfg.MaxConcurrent,
+		TempDirectory:   cfg.TempDirectory,
+		SortKeysConfig:  sortKeysConfig,
+		DefaultSortKeys: defaultSortKeys,
+		Tiers:           cfg.Tiers,
+		jobHistory:      make([]map[string]interface{}, 0),
+		logger:          cfg.Logger.With().Str("component", "compaction-manager").Logger(),
 	}
 
 	// Log tier information
@@ -181,6 +200,7 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 		Tier:          candidate.Tier,
 		TargetSizeMB:  m.TargetSizeMB,
 		TempDirectory: m.TempDirectory,
+		SortKeys:      m.GetSortKeys(candidate.Measurement),
 		StorageType:   m.StorageBackend.Type(),
 		StorageConfig: m.StorageBackend.ConfigJSON(),
 	}
@@ -388,6 +408,18 @@ func (m *Manager) listMeasurements(ctx context.Context, database string) ([]stri
 		Msg("Found measurements")
 
 	return measurements, nil
+}
+
+// GetSortKeys returns sort keys for a measurement.
+// Checks measurement-specific config first, then falls back to default.
+func (m *Manager) GetSortKeys(measurement string) []string {
+	// Check measurement-specific config
+	if keys, exists := m.SortKeysConfig[measurement]; exists {
+		return keys
+	}
+
+	// Use default (e.g., ["time"])
+	return m.DefaultSortKeys
 }
 
 // Stats returns compaction statistics
