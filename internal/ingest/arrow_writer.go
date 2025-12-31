@@ -1211,7 +1211,7 @@ func (b *ArrowBuffer) writeColumnar(ctx context.Context, database string, record
 
 	// Initialize buffer and record count if needed
 	if _, exists := shard.buffers[bufferKey]; !exists {
-		shard.bufferStartTimes[bufferKey] = time.Now()
+		shard.bufferStartTimes[bufferKey] = time.Now().UTC()
 		shard.bufferRecordCounts[bufferKey] = 0
 		shard.bufferSchemas[bufferKey] = newSignature // Store schema for evolution detection
 	}
@@ -1541,7 +1541,7 @@ func (b *ArrowBuffer) periodicFlush() {
 
 // flushAgedBuffers flushes buffers that have exceeded max age
 func (b *ArrowBuffer) flushAgedBuffers() {
-	now := time.Now()
+	now := time.Now().UTC()
 	maxAge := time.Duration(b.config.MaxBufferAgeMS) * time.Millisecond
 
 	// Iterate over all shards
@@ -1723,29 +1723,39 @@ func (b *ArrowBuffer) flushWithDataTimePartitioning(ctx context.Context, bufferK
 		return nil
 	}
 
-	// Multiple hours - sort and split by hour boundaries
-	sorted, err := sortColumnsByKeys(merged, sortKeys)
-	if err != nil {
-		b.logger.Warn().
-			Err(err).
-			Str("measurement", measurement).
-			Strs("sort_keys", sortKeys).
-			Msg("Failed to sort by configured keys, falling back to time-only")
+	// Multiple hours - CRITICAL: Find hour boundaries BEFORE sorting by multiple keys
+	// because findHourBoundaries requires times to be in ascending order
 
-		// Fallback to time-only sorting
-		sorted, err = sortColumnsByTime(merged)
+	// Step 1: Sort by time only to find correct hour boundaries
+	timeSorted, err := sortColumnsByTime(merged)
 		if err != nil {
-		return fmt.Errorf("failed to sort columns: %w", err)
-	}
+		return fmt.Errorf("failed to sort by time for hour boundaries: %w", err)
 	}
 
-	times := sorted["time"].([]int64)
+	// Step 2: Find hour boundaries using time-sorted data
+	times := timeSorted["time"].([]int64)
 	boundaries, err := findHourBoundaries(times)
 	if err != nil {
 		return fmt.Errorf("failed to find hour boundaries: %w", err)
 	}
 
-	splits := splitColumnsByBoundaries(sorted, boundaries)
+	// Step 3: Split into hour partitions
+	splits := splitColumnsByBoundaries(timeSorted, boundaries)
+
+	// Step 4: Sort each hour partition by configured sort keys
+	for hourKey, hourColumns := range splits {
+		sorted, err := sortColumnsByKeys(hourColumns, sortKeys)
+		if err != nil {
+			b.logger.Warn().
+				Err(err).
+				Str("measurement", measurement).
+				Str("hour", hourKey).
+				Strs("sort_keys", sortKeys).
+				Msg("Failed to sort hour partition by configured keys, keeping time-only sort")
+			continue // Keep time-sorted data for this hour
+		}
+		splits[hourKey] = sorted
+	}
 
 	b.logger.Info().
 		Str("buffer_key", bufferKey).
@@ -1968,29 +1978,39 @@ func (b *ArrowBuffer) flushBufferLockedDataTime(ctx context.Context, bufferKey, 
 		return nil
 	}
 
-	// Multiple hours - sort and split by hour boundaries
-	sorted, err := sortColumnsByKeys(merged, sortKeys)
-	if err != nil {
-		b.logger.Warn().
-			Err(err).
-			Str("measurement", measurement).
-			Strs("sort_keys", sortKeys).
-			Msg("Failed to sort by configured keys, falling back to time-only")
+	// Multiple hours - CRITICAL: Find hour boundaries BEFORE sorting by multiple keys
+	// because findHourBoundaries requires times to be in ascending order
 
-		// Fallback to time-only sorting
-		sorted, err = sortColumnsByTime(merged)
+	// Step 1: Sort by time only to find correct hour boundaries
+	timeSorted, err := sortColumnsByTime(merged)
 		if err != nil {
-		return fmt.Errorf("failed to sort columns: %w", err)
-	}
+		return fmt.Errorf("failed to sort by time for hour boundaries: %w", err)
 	}
 
-	times := sorted["time"].([]int64)
+	// Step 2: Find hour boundaries using time-sorted data
+	times := timeSorted["time"].([]int64)
 	boundaries, err := findHourBoundaries(times)
 	if err != nil {
 		return fmt.Errorf("failed to find hour boundaries: %w", err)
 	}
 
-	splits := splitColumnsByBoundaries(sorted, boundaries)
+	// Step 3: Split into hour partitions
+	splits := splitColumnsByBoundaries(timeSorted, boundaries)
+
+	// Step 4: Sort each hour partition by configured sort keys
+	for hourKey, hourColumns := range splits {
+		sorted, err := sortColumnsByKeys(hourColumns, sortKeys)
+		if err != nil {
+			b.logger.Warn().
+				Err(err).
+				Str("measurement", measurement).
+				Str("hour", hourKey).
+				Strs("sort_keys", sortKeys).
+				Msg("Failed to sort hour partition by configured keys, keeping time-only sort")
+			continue // Keep time-sorted data for this hour
+		}
+		splits[hourKey] = sorted
+	}
 
 	b.logger.Info().
 		Str("buffer_key", bufferKey).
@@ -2425,7 +2445,7 @@ func extractTimeRange(columns map[string]interface{}) (time.Time, time.Time, err
 		}
 	}
 
-	return time.UnixMicro(minTs), time.UnixMicro(maxTs), nil
+	return time.UnixMicro(minTs).UTC(), time.UnixMicro(maxTs).UTC(), nil
 }
 
 // generateStoragePath creates a hierarchical storage path for partition pruning

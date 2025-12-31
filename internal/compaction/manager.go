@@ -276,57 +276,126 @@ func (m *Manager) RunCompactionCycle(ctx context.Context) (int64, error) {
 	cycleID := m.cycleID.Add(1)
 	m.logger.Info().Int64("cycle_id", cycleID).Msg("Starting compaction cycle")
 
-	// Find candidates
-	candidates, err := m.FindCandidates(ctx)
-	if err != nil {
-		return cycleID, err
-	}
+	// Process tiers sequentially to maintain hierarchy (hourly -> daily)
+	// This ensures lower tiers complete before higher tiers run
+	totalCandidates := 0
+	totalErrors := 0
 
-	if len(candidates) == 0 {
-		m.logger.Info().Int64("cycle_id", cycleID).Msg("No compaction candidates found")
-		return cycleID, nil
-	}
-
-	// Process candidates with concurrency limit
-	sem := make(chan struct{}, m.MaxConcurrent)
-	var wg sync.WaitGroup
-	var errCount int
-	var errMu sync.Mutex
-
-	for _, candidate := range candidates {
-		select {
-		case <-ctx.Done():
-			m.logger.Info().Int64("cycle_id", cycleID).Msg("Compaction cycle cancelled")
-			return cycleID, ctx.Err()
-		default:
+	for _, tier := range m.Tiers {
+		if !tier.IsEnabled() {
+			continue
 		}
 
-		wg.Add(1)
-		sem <- struct{}{} // Acquire semaphore
+		tierName := tier.GetTierName()
+		m.logger.Info().
+			Int64("cycle_id", cycleID).
+			Str("tier", tierName).
+			Msg("Processing tier")
 
-		go func(c Candidate) {
-			defer wg.Done()
-			defer func() { <-sem }() // Release semaphore
+		// Find candidates for this tier
+		databases, err := m.listDatabases(ctx)
+		if err != nil {
+			m.logger.Error().Err(err).Str("tier", tierName).Msg("Failed to list databases")
+			continue
+		}
 
-			if err := m.CompactPartition(ctx, c); err != nil {
+		var tierCandidates []Candidate
+		for _, database := range databases {
+			measurements, err := m.listMeasurements(ctx, database)
+			if err != nil {
 				m.logger.Error().Err(err).
-					Str("partition", c.PartitionPath).
-					Int64("cycle_id", cycleID).
-					Msg("Compaction failed")
-				errMu.Lock()
-				errCount++
-				errMu.Unlock()
+					Str("database", database).
+					Str("tier", tierName).
+					Msg("Failed to list measurements")
+				continue
 			}
-		}(candidate)
-	}
 
-	wg.Wait()
+			for _, meas := range measurements {
+				candidates, err := tier.FindCandidates(ctx, database, meas)
+				if err != nil {
+					m.logger.Error().Err(err).
+						Str("database", database).
+						Str("measurement", meas).
+						Str("tier", tierName).
+						Msg("Failed to find candidates")
+					continue
+				}
+				tierCandidates = append(tierCandidates, candidates...)
+			}
+		}
+
+		if len(tierCandidates) == 0 {
+			m.logger.Info().
+				Int64("cycle_id", cycleID).
+				Str("tier", tierName).
+				Msg("No candidates found for tier")
+			continue
+		}
+
+		m.logger.Info().
+			Int64("cycle_id", cycleID).
+			Str("tier", tierName).
+			Int("candidates", len(tierCandidates)).
+			Msg("Found candidates for tier")
+
+		// Process tier candidates with concurrency limit
+		sem := make(chan struct{}, m.MaxConcurrent)
+		var wg sync.WaitGroup
+		var errCount int
+		var errMu sync.Mutex
+
+		for _, candidate := range tierCandidates {
+			select {
+			case <-ctx.Done():
+				m.logger.Info().
+					Int64("cycle_id", cycleID).
+					Str("tier", tierName).
+					Msg("Tier processing cancelled")
+				wg.Wait() // Wait for running jobs
+				return cycleID, ctx.Err()
+			default:
+			}
+
+			wg.Add(1)
+			sem <- struct{}{} // Acquire semaphore
+
+			go func(c Candidate) {
+				defer wg.Done()
+				defer func() { <-sem }() // Release semaphore
+
+				if err := m.CompactPartition(ctx, c); err != nil {
+					m.logger.Error().Err(err).
+						Str("partition", c.PartitionPath).
+						Str("tier", tierName).
+						Int64("cycle_id", cycleID).
+						Msg("Compaction failed")
+					errMu.Lock()
+					errCount++
+					errMu.Unlock()
+				}
+			}(candidate)
+		}
+
+		// Wait for all jobs in this tier to complete before moving to next tier
+		wg.Wait()
+
+		totalCandidates += len(tierCandidates)
+		totalErrors += errCount
+
+		m.logger.Info().
+			Int64("cycle_id", cycleID).
+			Str("tier", tierName).
+			Int("total", len(tierCandidates)).
+			Int("succeeded", len(tierCandidates)-errCount).
+			Int("failed", errCount).
+			Msg("Tier processing complete")
+	}
 
 	m.logger.Info().
 		Int64("cycle_id", cycleID).
-		Int("total", len(candidates)).
-		Int("succeeded", len(candidates)-errCount).
-		Int("failed", errCount).
+		Int("total_candidates", totalCandidates).
+		Int("total_succeeded", totalCandidates-totalErrors).
+		Int("total_failed", totalErrors).
 		Msg("Compaction cycle complete")
 
 	return cycleID, nil

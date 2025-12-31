@@ -125,39 +125,46 @@ func (t *DailyTier) ShouldCompact(files []string, partitionTime time.Time) bool 
 		return false
 	}
 
-	// Separate daily-compacted files from hourly files
+	// Separate daily-compacted files from hourly-compacted files
 	// Use path depth to distinguish:
-	// - Daily files: measurement/year/month/day/file.parquet (5 parts)
-	// - Hourly files: measurement/year/month/day/hour/file.parquet (6 parts)
-	var dailyCompactedFiles, hourlyFiles []string
+	// - Daily files: database/measurement/year/month/day/file.parquet (6 parts)
+	// - Hourly files: database/measurement/year/month/day/hour/file.parquet (7 parts)
+	var dailyCompactedFiles, hourlyCompactedFiles []string
 
 	for _, f := range files {
 		parts := strings.Split(f, "/")
-		if len(parts) == 5 {
+		if len(parts) == 6 {
 			// Day-level file = daily compacted file
 			dailyCompactedFiles = append(dailyCompactedFiles, f)
-		} else {
-			// Hour-level file = hourly file
-			hourlyFiles = append(hourlyFiles, f)
+		} else if len(parts) == 7 {
+			// Hour-level file = hourly-compacted file
+			hourlyCompactedFiles = append(hourlyCompactedFiles, f)
 		}
+		// Skip files that don't match expected structure
 	}
 
-	// Case 1: No daily compacted file yet, and has enough total files
-	if len(dailyCompactedFiles) == 0 && len(files) >= t.MinFiles {
+	// Case 1: No daily compacted file yet, and has enough hourly-compacted files
+	if len(dailyCompactedFiles) == 0 && len(hourlyCompactedFiles) >= t.MinFiles {
 		t.Logger.Debug().
-			Int("file_count", len(files)).
+			Int("hourly_compacted_files", len(hourlyCompactedFiles)).
 			Msg("First time daily compaction needed")
 		return true
 	}
 
-	// Case 2: Has daily compacted file, but many new hourly files accumulated
-	if len(dailyCompactedFiles) > 0 && len(hourlyFiles) >= t.MinFiles {
+	// Case 2: Has daily compacted file, but many new hourly-compacted files accumulated
+	if len(dailyCompactedFiles) > 0 && len(hourlyCompactedFiles) >= t.MinFiles {
 		t.Logger.Debug().
 			Int("daily_files", len(dailyCompactedFiles)).
-			Int("hourly_files", len(hourlyFiles)).
+			Int("hourly_compacted_files", len(hourlyCompactedFiles)).
 			Msg("Daily re-compaction needed")
 		return true
 	}
+
+	t.Logger.Debug().
+		Int("daily_files", len(dailyCompactedFiles)).
+		Int("hourly_compacted_files", len(hourlyCompactedFiles)).
+		Int("min_files", t.MinFiles).
+		Msg("Skipping daily compaction: not enough hourly-compacted files")
 
 	return false
 }

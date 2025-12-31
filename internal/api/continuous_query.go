@@ -411,8 +411,10 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid start_time format"})
 		}
+		startTime = startTime.UTC()
 	} else if cq.LastProcessedTime != nil {
 		startTime, _ = time.Parse(time.RFC3339, *cq.LastProcessedTime)
+		startTime = startTime.UTC()
 	} else {
 		startTime = time.Now().UTC().Add(-1 * time.Hour)
 	}
@@ -422,6 +424,7 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid end_time format"})
 		}
+		endTime = endTime.UTC()
 	} else {
 		endTime = time.Now().UTC()
 	}
@@ -622,7 +625,7 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 					val = t.UnixMicro()
 				case string:
 					if parsed, err := time.Parse(time.RFC3339, t); err == nil {
-						val = parsed.UnixMicro()
+						val = parsed.UTC().UnixMicro()
 					}
 				}
 			}
