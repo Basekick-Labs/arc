@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/pruning"
 	"github.com/rs/zerolog"
 )
@@ -878,6 +879,55 @@ func BenchmarkConvertSQLToStoragePaths(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				h.convertSQLToStoragePaths(tc.sql)
+			}
+		})
+	}
+}
+
+// BenchmarkGetTransformedSQL benchmarks the cached SQL transformation
+func BenchmarkGetTransformedSQL(b *testing.B) {
+	// Create a minimal QueryHandler for benchmarking
+	h := &QueryHandler{
+		storage:    &mockLocalBackend{basePath: "./data"},
+		pruner:     pruning.NewPartitionPruner(zerolog.Nop()),
+		queryCache: database.NewQueryCache(database.QueryCacheTTL, database.DefaultQueryCacheMaxSize),
+		logger:     zerolog.Nop(),
+	}
+
+	testCases := []struct {
+		name string
+		sql  string
+	}{
+		{
+			name: "simple_select",
+			sql:  "SELECT * FROM mydb.cpu WHERE time > 1609459200000000",
+		},
+		{
+			name: "with_join",
+			sql:  "SELECT * FROM mydb.cpu JOIN mydb.memory ON cpu.host = memory.host WHERE time > 1609459200000000",
+		},
+		{
+			name: "complex_query",
+			sql:  "WITH hourly_avg AS (SELECT host, AVG(value) as avg_val FROM mydb.cpu WHERE time BETWEEN '2024-01-01' AND '2024-01-02' GROUP BY host) SELECT * FROM hourly_avg WHERE avg_val > 50 ORDER BY avg_val DESC",
+		},
+	}
+
+	for _, tc := range testCases {
+		// Benchmark cache miss (first call)
+		b.Run(tc.name+"_cache_miss", func(b *testing.B) {
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				h.queryCache.Invalidate() // Force cache miss
+				h.getTransformedSQL(tc.sql)
+			}
+		})
+
+		// Benchmark cache hit (pre-populated)
+		b.Run(tc.name+"_cache_hit", func(b *testing.B) {
+			h.getTransformedSQL(tc.sql) // Pre-populate cache
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				h.getTransformedSQL(tc.sql)
 			}
 		})
 	}

@@ -230,10 +230,11 @@ func stripSQLComments(sql string, hasComments bool) string {
 
 // QueryHandler handles SQL query endpoints
 type QueryHandler struct {
-	db      *database.DuckDB
-	storage storage.Backend
-	pruner  *pruning.PartitionPruner
-	logger  zerolog.Logger
+	db         *database.DuckDB
+	storage    storage.Backend
+	pruner     *pruning.PartitionPruner
+	queryCache *database.QueryCache
+	logger     zerolog.Logger
 }
 
 // QueryRequest represents a SQL query request
@@ -354,10 +355,11 @@ func validateWhereClauseQuery(where string) error {
 // NewQueryHandler creates a new query handler
 func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolog.Logger) *QueryHandler {
 	return &QueryHandler{
-		db:      db,
-		storage: storage,
-		pruner:  pruning.NewPartitionPruner(logger),
-		logger:  logger.With().Str("component", "query-handler").Logger(),
+		db:         db,
+		storage:    storage,
+		pruner:     pruning.NewPartitionPruner(logger),
+		queryCache: database.NewQueryCache(database.QueryCacheTTL, database.DefaultQueryCacheMaxSize),
+		logger:     logger.With().Str("component", "query-handler").Logger(),
 	}
 }
 
@@ -430,12 +432,13 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 		return h.handleShowTables(c, start, database)
 	}
 
-	// Convert SQL to storage paths
-	convertedSQL := h.convertSQLToStoragePaths(req.SQL)
+	// Convert SQL to storage paths (with caching)
+	convertedSQL, cached := h.getTransformedSQL(req.SQL)
 
 	h.logger.Debug().
 		Str("original_sql", req.SQL).
 		Str("converted_sql", convertedSQL).
+		Bool("cache_hit", cached).
 		Msg("Executing query")
 
 	// Execute query
@@ -526,6 +529,20 @@ func (h *QueryHandler) validateSQL(sql string) error {
 		}
 	}
 	return nil
+}
+
+// getTransformedSQL returns the transformed SQL with caching.
+// Returns the transformed SQL and whether it was a cache hit.
+func (h *QueryHandler) getTransformedSQL(sql string) (string, bool) {
+	// Check cache first
+	if transformed, ok := h.queryCache.Get(sql); ok {
+		return transformed, true
+	}
+
+	// Transform and cache
+	transformed := h.convertSQLToStoragePaths(sql)
+	h.queryCache.Set(sql, transformed)
+	return transformed, false
 }
 
 // convertSQLToStoragePaths converts table references to storage paths
@@ -1027,8 +1044,8 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 		})
 	}
 
-	// Convert SQL to storage paths
-	convertedSQL := h.convertSQLToStoragePaths(req.SQL)
+	// Convert SQL to storage paths (with caching)
+	convertedSQL, _ := h.getTransformedSQL(req.SQL)
 
 	// Create a COUNT(*) version of the query
 	countSQL := "SELECT COUNT(*) FROM (" + convertedSQL + ") AS t"
@@ -1328,8 +1345,8 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	sql += fmt.Sprintf(" LIMIT %d", limit)
 	sql += fmt.Sprintf(" OFFSET %d", offset)
 
-	// Convert SQL to storage paths
-	convertedSQL := h.convertSQLToStoragePaths(sql)
+	// Convert SQL to storage paths (with caching)
+	convertedSQL, _ := h.getTransformedSQL(sql)
 
 	h.logger.Debug().
 		Str("measurement", measurement).
