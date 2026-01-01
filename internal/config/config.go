@@ -74,6 +74,9 @@ type IngestConfig struct {
 	UseDictionary     bool   // Use dictionary encoding
 	WriteStatistics   bool   // Write Parquet statistics
 	DataPageVersion   string // Parquet data page version: 1.0 or 2.0
+	FlushWorkers      int    // Number of workers for async flush (default: 2x CPU, min 8, max 64)
+	FlushQueueSize    int    // Capacity of flush task queue (default: 4x workers, min 100)
+	ShardCount        int    // Number of buffer shards for lock distribution (default: 32)
 }
 
 type CacheConfig struct {
@@ -220,6 +223,9 @@ func Load() (*Config, error) {
 			UseDictionary:   v.GetBool("ingest.use_dictionary"),
 			WriteStatistics: v.GetBool("ingest.write_statistics"),
 			DataPageVersion: v.GetString("ingest.data_page_version"),
+			FlushWorkers:    v.GetInt("ingest.flush_workers"),
+			FlushQueueSize:  v.GetInt("ingest.flush_queue_size"),
+			ShardCount:      v.GetInt("ingest.shard_count"),
 		},
 		Cache: CacheConfig{
 			Enabled:    v.GetBool("cache.enabled"),
@@ -321,6 +327,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.use_dictionary", true)
 	v.SetDefault("ingest.write_statistics", true)
 	v.SetDefault("ingest.data_page_version", "2.0")
+	v.SetDefault("ingest.flush_workers", getDefaultFlushWorkers())
+	v.SetDefault("ingest.flush_queue_size", getDefaultFlushQueueSize())
+	v.SetDefault("ingest.shard_count", 32)
 
 	// Log defaults
 	v.SetDefault("log.level", "info")
@@ -415,6 +424,31 @@ func getDefaultMemoryLimit() string {
 		return "32GB" // Cap at 32GB by default
 	}
 	return fmt.Sprintf("%dGB", targetMemGB)
+}
+
+func getDefaultFlushWorkers() int {
+	// Scale flush workers with CPU cores, similar to InfluxDB's approach
+	// More workers allow higher concurrent I/O to storage
+	cores := runtime.NumCPU()
+	workers := cores * 2
+	if workers < 8 {
+		return 8 // Minimum for reasonable concurrency
+	}
+	if workers > 64 {
+		return 64 // Cap to avoid excessive resource usage
+	}
+	return workers
+}
+
+func getDefaultFlushQueueSize() int {
+	// Queue should absorb bursts without dropping tasks
+	// 4x workers provides good burst capacity
+	workers := getDefaultFlushWorkers()
+	queueSize := workers * 4
+	if queueSize < 100 {
+		return 100
+	}
+	return queueSize
 }
 
 // ValidateTLS validates TLS configuration when TLS is enabled.
