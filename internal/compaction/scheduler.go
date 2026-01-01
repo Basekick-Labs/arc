@@ -2,6 +2,7 @@ package compaction
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -11,9 +12,10 @@ import (
 
 // Scheduler schedules compaction jobs using cron-style schedules
 type Scheduler struct {
-	manager  *Manager
-	schedule string
-	enabled  bool
+	manager   *Manager
+	schedule  string
+	tierNames []string // Specific tiers to process (must be non-empty and enabled)
+	enabled   bool
 
 	cron    *cron.Cron
 	running bool
@@ -25,10 +27,11 @@ type Scheduler struct {
 
 // SchedulerConfig holds configuration for creating a compaction scheduler
 type SchedulerConfig struct {
-	Manager  *Manager
-	Schedule string // Cron schedule string (e.g., "5 * * * *" for every hour at :05)
-	Enabled  bool   // Enable automatic scheduling
-	Logger   zerolog.Logger
+	Manager   *Manager
+	Schedule  string   // Cron schedule string (e.g., "5 * * * *" for every hour at :05)
+	TierNames []string // Specific tiers to process (must be non-empty and enabled)
+	Enabled   bool     // Enable automatic scheduling
+	Logger    zerolog.Logger
 }
 
 // NewScheduler creates a new compaction scheduler
@@ -45,21 +48,27 @@ func NewScheduler(cfg *SchedulerConfig) (*Scheduler, error) {
 	}
 
 	s := &Scheduler{
-		manager:  cfg.Manager,
-		schedule: cfg.Schedule,
-		enabled:  cfg.Enabled,
-		stopCh:   make(chan struct{}),
-		logger:   cfg.Logger.With().Str("component", "compaction-scheduler").Logger(),
+		manager:   cfg.Manager,
+		schedule:  cfg.Schedule,
+		tierNames: cfg.TierNames,
+		enabled:   cfg.Enabled,
+		stopCh:    make(chan struct{}),
+		logger:    cfg.Logger.With().Str("component", "compaction-scheduler").Logger(),
 	}
 
 	if cfg.Enabled {
+		tierInfo := "all tiers"
+		if len(cfg.TierNames) > 0 {
+			tierInfo = fmt.Sprintf("tiers: %v", cfg.TierNames)
+		}
 		s.logger.Info().
 			Str("schedule", cfg.Schedule).
-			Msg("Compaction scheduler initialized (primary worker)")
+			Str("tiers", tierInfo).
+			Msg("Compaction scheduler initialized")
 	} else {
 		s.logger.Debug().
 			Str("schedule", cfg.Schedule).
-			Msg("Compaction scheduler initialized (disabled - secondary worker)")
+			Msg("Compaction scheduler disabled")
 	}
 
 	return s, nil
@@ -134,7 +143,7 @@ func (s *Scheduler) runCompaction() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	cycleID, err := s.manager.RunCompactionCycle(ctx)
+	cycleID, err := s.manager.RunCompactionCycleForTiers(ctx, s.tierNames)
 	if err != nil {
 		s.logger.Error().Err(err).Int64("cycle_id", cycleID).Msg("Scheduled compaction failed")
 		return
@@ -153,7 +162,7 @@ func (s *Scheduler) TriggerNow(ctx context.Context) (int64, error) {
 	s.logger.Info().Msg("Manual compaction trigger")
 
 	startTime := time.Now()
-	cycleID, err := s.manager.RunCompactionCycle(ctx)
+	cycleID, err := s.manager.RunCompactionCycleForTiers(ctx, s.tierNames)
 	if err != nil {
 		return cycleID, err
 	}

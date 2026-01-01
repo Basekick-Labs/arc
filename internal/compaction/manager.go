@@ -262,10 +262,23 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 	return nil
 }
 
-// RunCompactionCycle runs one compaction cycle.
+// RunCompactionCycle runs one compaction cycle for all enabled tiers.
 // Returns the cycle ID and an error if the cycle couldn't be started.
 // Returns ErrCycleAlreadyRunning if a cycle is already in progress.
 func (m *Manager) RunCompactionCycle(ctx context.Context) (int64, error) {
+	// Collect all enabled tier names
+	var tierNames []string
+	for _, tier := range m.Tiers {
+		if tier.IsEnabled() {
+			tierNames = append(tierNames, tier.GetTierName())
+		}
+	}
+	return m.RunCompactionCycleForTiers(ctx, tierNames)
+}
+
+// RunCompactionCycleForTiers runs a complete compaction cycle for specific tiers
+// tierNames must be non-empty - specify which tiers to run explicitly
+func (m *Manager) RunCompactionCycleForTiers(ctx context.Context, tierNames []string) (int64, error) {
 	// Prevent concurrent compaction cycles using atomic compare-and-swap
 	if !m.cycleRunning.CompareAndSwap(false, true) {
 		m.logger.Warn().Msg("Compaction cycle already running, skipping")
@@ -274,7 +287,23 @@ func (m *Manager) RunCompactionCycle(ctx context.Context) (int64, error) {
 	defer m.cycleRunning.Store(false)
 
 	cycleID := m.cycleID.Add(1)
-	m.logger.Info().Int64("cycle_id", cycleID).Msg("Starting compaction cycle")
+
+	// Require explicit tier names
+	if len(tierNames) == 0 {
+		m.logger.Debug().Int64("cycle_id", cycleID).Msg("No tiers specified, skipping cycle")
+		return cycleID, nil
+	}
+
+	m.logger.Info().
+		Int64("cycle_id", cycleID).
+		Strs("tiers", tierNames).
+		Msg("Starting compaction cycle for specific tiers")
+
+	// Build tier filter map for quick lookup
+	tierFilter := make(map[string]bool)
+	for _, name := range tierNames {
+		tierFilter[name] = true
+	}
 
 	// Process tiers sequentially to maintain hierarchy (hourly -> daily)
 	// This ensures lower tiers complete before higher tiers run
@@ -287,6 +316,15 @@ func (m *Manager) RunCompactionCycle(ctx context.Context) (int64, error) {
 		}
 
 		tierName := tier.GetTierName()
+
+		// Skip tier if not in filter
+		if !tierFilter[tierName] {
+			m.logger.Debug().
+				Int64("cycle_id", cycleID).
+				Str("tier", tierName).
+				Msg("Skipping tier (not in filter)")
+			continue
+		}
 		m.logger.Info().
 			Int64("cycle_id", cycleID).
 			Str("tier", tierName).

@@ -204,14 +204,17 @@ default_sort_keys = "time"
 # Enable/disable automatic compaction
 enabled = true
 
-# Enable hourly compaction job
+# Hourly tier configuration
 hourly_enabled = true
+hourly_schedule = "5 * * * *"  # Every hour at :05
+hourly_min_age_hours = 0       # Compact immediately
+hourly_min_files = 5           # Minimum files to trigger compaction
 
-# Minimum age in hours before files are eligible for compaction
-hourly_min_age_hours = 0
-
-# Minimum number of files required to trigger compaction
-hourly_min_files = 5
+# Daily tier configuration
+daily_enabled = true
+daily_schedule = "0 3 * * *"   # Daily at 3 AM UTC
+daily_min_age_hours = 24       # Only compact days older than 24 hours
+daily_min_files = 12           # Minimum 12 hourly files before compacting
 
 # -----------------------------------------------------------------------------
 # Authentication Configuration
@@ -256,3 +259,6 @@ enabled = true
 # Enable/disable continuous query execution
 # Queries are defined via the API
 enabled = true
+
+[telemetry]
+enabled = false
