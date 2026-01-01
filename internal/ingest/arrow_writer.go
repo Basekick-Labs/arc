@@ -813,9 +813,10 @@ type ArrowBuffer struct {
 	wal WALWriter
 
 	// OPTIMIZATION: Shard buffers to reduce lock contention
-	// With 32 shards, each shard handles ~1/32 of measurements
-	// This allows 32 concurrent writes to different measurements
-	shards     [32]*bufferShard
+	// Configurable via ingest.shard_count (default 32)
+	// Each shard handles ~1/N of measurements where N = shard count
+	// This allows N concurrent writes to different measurements
+	shards     []*bufferShard
 	shardCount uint32
 
 	// Background flush
@@ -867,15 +868,28 @@ func (b *ArrowBuffer) getShard(bufferKey string) *bufferShard {
 func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger zerolog.Logger) *ArrowBuffer {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// OPTIMIZATION: Worker pool size (10-20 workers optimal for I/O bound tasks)
-	flushWorkers := 16
-	queueSize := 100 // Buffered channel for burst handling
+	// Use configured values with sensible fallbacks
+	flushWorkers := cfg.FlushWorkers
+	if flushWorkers <= 0 {
+		flushWorkers = 16 // Fallback if not configured
+	}
+
+	queueSize := cfg.FlushQueueSize
+	if queueSize <= 0 {
+		queueSize = 100 // Fallback if not configured
+	}
+
+	shardCount := cfg.ShardCount
+	if shardCount <= 0 {
+		shardCount = 32 // Fallback if not configured
+	}
 
 	buffer := &ArrowBuffer{
 		config:       cfg,
 		storage:      storage,
 		writer:       NewArrowWriter(cfg, logger),
-		shardCount:   32,
+		shards:       make([]*bufferShard, shardCount),
+		shardCount:   uint32(shardCount),
 		ctx:          ctx,
 		cancel:       cancel,
 		flushTimer:   time.NewTicker(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
@@ -885,7 +899,7 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 	}
 
 	// Initialize shards
-	for i := range buffer.shards {
+	for i := 0; i < shardCount; i++ {
 		buffer.shards[i] = &bufferShard{
 			buffers:            make(map[string][]interface{}),
 			bufferStartTimes:   make(map[string]time.Time),
@@ -908,7 +922,7 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		Int("max_buffer_size", cfg.MaxBufferSize).
 		Int("max_buffer_age_ms", cfg.MaxBufferAgeMS).
 		Str("compression", cfg.Compression).
-		Int("shards", int(buffer.shardCount)).
+		Int("shards", shardCount).
 		Int("flush_workers", flushWorkers).
 		Int("queue_size", queueSize).
 		Msg("ArrowBuffer initialized with lock sharding and worker pool")

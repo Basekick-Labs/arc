@@ -53,6 +53,52 @@ func TestGetDefaultMemoryLimit(t *testing.T) {
 	}
 }
 
+func TestGetDefaultFlushWorkers(t *testing.T) {
+	cores := runtime.NumCPU()
+	expected := cores * 2
+	if expected < 8 {
+		expected = 8
+	}
+	if expected > 64 {
+		expected = 64
+	}
+
+	actual := getDefaultFlushWorkers()
+	if actual != expected {
+		t.Errorf("getDefaultFlushWorkers() = %d, want %d", actual, expected)
+	}
+}
+
+func TestGetDefaultFlushWorkers_Bounds(t *testing.T) {
+	actual := getDefaultFlushWorkers()
+	if actual < 8 {
+		t.Errorf("getDefaultFlushWorkers() = %d, should be at least 8", actual)
+	}
+	if actual > 64 {
+		t.Errorf("getDefaultFlushWorkers() = %d, should be at most 64", actual)
+	}
+}
+
+func TestGetDefaultFlushQueueSize(t *testing.T) {
+	workers := getDefaultFlushWorkers()
+	expected := workers * 4
+	if expected < 100 {
+		expected = 100
+	}
+
+	actual := getDefaultFlushQueueSize()
+	if actual != expected {
+		t.Errorf("getDefaultFlushQueueSize() = %d, want %d", actual, expected)
+	}
+}
+
+func TestGetDefaultFlushQueueSize_Bounds(t *testing.T) {
+	actual := getDefaultFlushQueueSize()
+	if actual < 100 {
+		t.Errorf("getDefaultFlushQueueSize() = %d, should be at least 100", actual)
+	}
+}
+
 func TestLoad_DefaultsFromSystem(t *testing.T) {
 	// Create a temp dir without config file to test defaults
 	tmpDir, err := os.MkdirTemp("", "arc-config-test")
@@ -85,6 +131,21 @@ func TestLoad_DefaultsFromSystem(t *testing.T) {
 	expectedMem := getDefaultMemoryLimit()
 	if cfg.Database.MemoryLimit != expectedMem {
 		t.Errorf("Database.MemoryLimit = %s, want %s", cfg.Database.MemoryLimit, expectedMem)
+	}
+
+	// Verify ingest defaults are applied
+	expectedFlushWorkers := getDefaultFlushWorkers()
+	if cfg.Ingest.FlushWorkers != expectedFlushWorkers {
+		t.Errorf("Ingest.FlushWorkers = %d, want %d", cfg.Ingest.FlushWorkers, expectedFlushWorkers)
+	}
+
+	expectedFlushQueueSize := getDefaultFlushQueueSize()
+	if cfg.Ingest.FlushQueueSize != expectedFlushQueueSize {
+		t.Errorf("Ingest.FlushQueueSize = %d, want %d", cfg.Ingest.FlushQueueSize, expectedFlushQueueSize)
+	}
+
+	if cfg.Ingest.ShardCount != 32 {
+		t.Errorf("Ingest.ShardCount = %d, want 32", cfg.Ingest.ShardCount)
 	}
 }
 
