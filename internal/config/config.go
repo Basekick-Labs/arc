@@ -77,7 +77,6 @@ type IngestConfig struct {
 	FlushWorkers      int    // Number of workers for async flush (default: 2x CPU, min 8, max 64)
 	FlushQueueSize    int    // Capacity of flush task queue (default: 4x workers, min 100)
 	ShardCount        int    // Number of buffer shards for lock distribution (default: 32)
-	PartitionBy       string // Partitioning strategy: "ingestion_time" or "data_time"
 	SortKeys          []string // Per-measurement sort keys: "measurement:col1,col2,time"
 	DefaultSortKeys   string   // Default sort keys for measurements not in SortKeys
 }
@@ -229,7 +228,6 @@ func Load() (*Config, error) {
 			FlushWorkers:    v.GetInt("ingest.flush_workers"),
 			FlushQueueSize:  v.GetInt("ingest.flush_queue_size"),
 			ShardCount:      v.GetInt("ingest.shard_count"),
-			PartitionBy:     v.GetString("ingest.partition_by"),
 			SortKeys:        v.GetStringSlice("ingest.sort_keys"),
 			DefaultSortKeys: v.GetString("ingest.default_sort_keys"),
 		},
@@ -336,7 +334,6 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.flush_workers", getDefaultFlushWorkers())
 	v.SetDefault("ingest.flush_queue_size", getDefaultFlushQueueSize())
 	v.SetDefault("ingest.shard_count", 32)
-	v.SetDefault("ingest.partition_by", "ingestion_time") // Default to legacy behavior for backward compatibility
 	v.SetDefault("ingest.sort_keys", []string{})          // No custom sort keys by default
 	v.SetDefault("ingest.default_sort_keys", "time")      // Default to time-only sorting
 

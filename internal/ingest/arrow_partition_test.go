@@ -6,84 +6,92 @@ import (
 	"time"
 )
 
-// TestExtractTimeRange tests extracting min/max timestamps from columnar data
-func TestExtractTimeRange(t *testing.T) {
+// TestGetSortKeys tests the getSortKeys function ensures time is always included
+func TestGetSortKeys(t *testing.T) {
 	tests := []struct {
-		name      string
-		columns   map[string]interface{}
-		wantMin   int64 // microseconds
-		wantMax   int64
-		wantError bool
+		name            string
+		measurement     string
+		sortKeysConfig  map[string][]string
+		defaultSortKeys []string
+		wantKeys        []string
 	}{
 		{
-			name: "simple range",
-			columns: map[string]interface{}{
-				"time":  []int64{1000, 2000, 3000},
-				"value": []float64{1.0, 2.0, 3.0},
-			},
-			wantMin:   1000,
-			wantMax:   3000,
-			wantError: false,
+			name:            "empty config defaults to time",
+			measurement:     "cpu",
+			sortKeysConfig:  map[string][]string{},
+			defaultSortKeys: []string{"time"},
+			wantKeys:        []string{"time"},
 		},
 		{
-			name: "unsorted times",
-			columns: map[string]interface{}{
-				"time":  []int64{3000, 1000, 2000},
-				"value": []float64{1.0, 2.0, 3.0},
-			},
-			wantMin:   1000,
-			wantMax:   3000,
-			wantError: false,
+			name:            "single key without time appends time",
+			measurement:     "sensor",
+			sortKeysConfig:  map[string][]string{"sensor": {"tag_id"}},
+			defaultSortKeys: []string{"time"},
+			wantKeys:        []string{"tag_id", "time"},
 		},
 		{
-			name: "single timestamp",
-			columns: map[string]interface{}{
-				"time":  []int64{5000},
-				"value": []float64{1.0},
-			},
-			wantMin:   5000,
-			wantMax:   5000,
-			wantError: false,
+			name:            "multiple keys without time appends time",
+			measurement:     "metrics",
+			sortKeysConfig:  map[string][]string{"metrics": {"tag_host", "tag_region"}},
+			defaultSortKeys: []string{"time"},
+			wantKeys:        []string{"tag_host", "tag_region", "time"},
 		},
 		{
-			name: "missing time column",
-			columns: map[string]interface{}{
-				"value": []float64{1.0, 2.0},
-			},
-			wantError: true,
+			name:            "keys with time unchanged",
+			measurement:     "temp",
+			sortKeysConfig:  map[string][]string{"temp": {"tag_sensor_id", "time"}},
+			defaultSortKeys: []string{"time"},
+			wantKeys:        []string{"tag_sensor_id", "time"},
 		},
 		{
-			name: "empty time column",
-			columns: map[string]interface{}{
-				"time":  []int64{},
-				"value": []float64{},
-			},
-			wantError: true,
+			name:            "time only unchanged",
+			measurement:     "humidity",
+			sortKeysConfig:  map[string][]string{"humidity": {"time"}},
+			defaultSortKeys: []string{"time"},
+			wantKeys:        []string{"time"},
+		},
+		{
+			name:            "time as second key unchanged",
+			measurement:     "pressure",
+			sortKeysConfig:  map[string][]string{"pressure": {"tag_location", "time"}},
+			defaultSortKeys: []string{"time"},
+			wantKeys:        []string{"tag_location", "time"},
+		},
+		{
+			name:            "unmapped measurement uses default",
+			measurement:     "unmapped",
+			sortKeysConfig:  map[string][]string{"other": {"tag_foo"}},
+			defaultSortKeys: []string{"tag_bar", "time"},
+			wantKeys:        []string{"tag_bar", "time"},
+		},
+		{
+			name:            "default without time gets time appended",
+			measurement:     "custom",
+			sortKeysConfig:  map[string][]string{},
+			defaultSortKeys: []string{"tag_device"},
+			wantKeys:        []string{"tag_device", "time"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			minTime, maxTime, err := extractTimeRange(tt.columns)
+			// Create a minimal buffer with just the fields we need
+			buffer := &ArrowBuffer{
+				sortKeysConfig:  tt.sortKeysConfig,
+				defaultSortKeys: tt.defaultSortKeys,
+			}
 
-			if tt.wantError {
-				if err == nil {
-					t.Errorf("extractTimeRange() expected error but got none")
+			got := buffer.getSortKeys(tt.measurement)
+
+			if len(got) != len(tt.wantKeys) {
+				t.Errorf("getSortKeys() returned %d keys, want %d: got %v, want %v", len(got), len(tt.wantKeys), got, tt.wantKeys)
+				return
+			}
+
+			for i, key := range got {
+				if key != tt.wantKeys[i] {
+					t.Errorf("getSortKeys()[%d] = %q, want %q", i, key, tt.wantKeys[i])
 				}
-				return
-			}
-
-			if err != nil {
-				t.Errorf("extractTimeRange() unexpected error: %v", err)
-				return
-			}
-
-			if minTime.UnixMicro() != tt.wantMin {
-				t.Errorf("extractTimeRange() minTime = %v, want %v", minTime.UnixMicro(), tt.wantMin)
-			}
-
-			if maxTime.UnixMicro() != tt.wantMax {
-				t.Errorf("extractTimeRange() maxTime = %v, want %v", maxTime.UnixMicro(), tt.wantMax)
 			}
 		})
 	}
@@ -197,196 +205,6 @@ func TestSortColumnsByTime(t *testing.T) {
 	}
 }
 
-// TestFindHourBoundaries tests finding hour partition boundaries
-func TestFindHourBoundaries(t *testing.T) {
-	// Helper to create microsecond timestamps
-	microTime := func(year, month, day, hour, min, sec int) int64 {
-		return time.Date(year, time.Month(month), day, hour, min, sec, 0, time.UTC).UnixMicro()
-	}
-
-	tests := []struct {
-		name          string
-		times         []int64
-		wantNumSplits int
-		wantHourKeys  []string
-	}{
-		{
-			name: "single hour",
-			times: []int64{
-				microTime(2024, 1, 1, 10, 0, 0),
-				microTime(2024, 1, 1, 10, 30, 0),
-				microTime(2024, 1, 1, 10, 59, 59),
-			},
-			wantNumSplits: 1,
-			wantHourKeys:  []string{"2024010110"},
-		},
-		{
-			name: "two consecutive hours",
-			times: []int64{
-				microTime(2024, 1, 1, 10, 30, 0),
-				microTime(2024, 1, 1, 10, 59, 59),
-				microTime(2024, 1, 1, 11, 0, 0),
-				microTime(2024, 1, 1, 11, 30, 0),
-			},
-			wantNumSplits: 2,
-			wantHourKeys:  []string{"2024010110", "2024010111"},
-		},
-		{
-			name: "three hours with gaps",
-			times: []int64{
-				microTime(2024, 1, 1, 10, 0, 0),
-				microTime(2024, 1, 1, 12, 0, 0),
-				microTime(2024, 1, 1, 14, 0, 0),
-			},
-			wantNumSplits: 3,
-			wantHourKeys:  []string{"2024010110", "2024010112", "2024010114"},
-		},
-		{
-			name: "hour boundary exact",
-			times: []int64{
-				microTime(2024, 1, 1, 10, 59, 59),
-				microTime(2024, 1, 1, 11, 0, 0),
-			},
-			wantNumSplits: 2,
-			wantHourKeys:  []string{"2024010110", "2024010111"},
-		},
-		{
-			name: "day boundary crossing",
-			times: []int64{
-				microTime(2024, 1, 1, 23, 30, 0),
-				microTime(2024, 1, 2, 0, 30, 0),
-			},
-			wantNumSplits: 2,
-			wantHourKeys:  []string{"2024010123", "2024010200"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			boundaries, err := findHourBoundaries(tt.times)
-			if err != nil {
-				t.Errorf("findHourBoundaries() unexpected error: %v", err)
-				return
-			}
-
-			if len(boundaries) != tt.wantNumSplits {
-				t.Errorf("findHourBoundaries() got %d boundaries, want %d", len(boundaries), tt.wantNumSplits)
-				return
-			}
-
-			for i, boundary := range boundaries {
-				if boundary.hourKey != tt.wantHourKeys[i] {
-					t.Errorf("findHourBoundaries() boundary[%d].hourKey = %v, want %v", i, boundary.hourKey, tt.wantHourKeys[i])
-				}
-
-				// Verify indices are valid
-				if boundary.startIdx < 0 || boundary.endIdx > len(tt.times) {
-					t.Errorf("findHourBoundaries() boundary[%d] invalid indices: start=%d, end=%d, len=%d",
-						i, boundary.startIdx, boundary.endIdx, len(tt.times))
-				}
-
-				if boundary.startIdx >= boundary.endIdx {
-					t.Errorf("findHourBoundaries() boundary[%d] startIdx >= endIdx: start=%d, end=%d",
-						i, boundary.startIdx, boundary.endIdx)
-				}
-			}
-
-			// Verify boundaries cover all data
-			if boundaries[0].startIdx != 0 {
-				t.Errorf("findHourBoundaries() first boundary doesn't start at 0: start=%d", boundaries[0].startIdx)
-			}
-			if boundaries[len(boundaries)-1].endIdx != len(tt.times) {
-				t.Errorf("findHourBoundaries() last boundary doesn't end at len(times): end=%d, len=%d",
-					boundaries[len(boundaries)-1].endIdx, len(tt.times))
-			}
-
-			// Verify boundaries don't overlap and have no gaps
-			for i := 1; i < len(boundaries); i++ {
-				if boundaries[i].startIdx != boundaries[i-1].endIdx {
-					t.Errorf("findHourBoundaries() gap/overlap between boundaries[%d] and boundaries[%d]: prev.end=%d, curr.start=%d",
-						i-1, i, boundaries[i-1].endIdx, boundaries[i].startIdx)
-				}
-			}
-		})
-	}
-}
-
-// TestSplitColumnsByBoundaries tests splitting columns by hour boundaries
-func TestSplitColumnsByBoundaries(t *testing.T) {
-	microTime := func(year, month, day, hour, min, sec int) int64 {
-		return time.Date(year, time.Month(month), day, hour, min, sec, 0, time.UTC).UnixMicro()
-	}
-
-	columns := map[string]interface{}{
-		"time": []int64{
-			microTime(2024, 1, 1, 10, 0, 0),
-			microTime(2024, 1, 1, 10, 30, 0),
-			microTime(2024, 1, 1, 11, 0, 0),
-			microTime(2024, 1, 1, 11, 30, 0),
-		},
-		"value": []float64{1.0, 2.0, 3.0, 4.0},
-		"name":  []string{"a", "b", "c", "d"},
-	}
-
-	times := columns["time"].([]int64)
-	boundaries, err := findHourBoundaries(times)
-	if err != nil {
-		t.Fatalf("findHourBoundaries() failed: %v", err)
-	}
-
-	splits := splitColumnsByBoundaries(columns, boundaries)
-
-	if len(splits) != 2 {
-		t.Errorf("splitColumnsByBoundaries() got %d splits, want 2", len(splits))
-		return
-	}
-
-	// Check first hour (10:00-10:59)
-	hour10 := splits["2024010110"]
-	if hour10 == nil {
-		t.Errorf("splitColumnsByBoundaries() missing split for hour 2024010110")
-		return
-	}
-
-	time10 := hour10["time"].([]int64)
-	value10 := hour10["value"].([]float64)
-	name10 := hour10["name"].([]string)
-
-	if len(time10) != 2 {
-		t.Errorf("splitColumnsByBoundaries() hour 10 has %d records, want 2", len(time10))
-	}
-
-	if value10[0] != 1.0 || value10[1] != 2.0 {
-		t.Errorf("splitColumnsByBoundaries() hour 10 values = %v, want [1.0, 2.0]", value10)
-	}
-
-	if name10[0] != "a" || name10[1] != "b" {
-		t.Errorf("splitColumnsByBoundaries() hour 10 names = %v, want [a, b]", name10)
-	}
-
-	// Check second hour (11:00-11:59)
-	hour11 := splits["2024010111"]
-	if hour11 == nil {
-		t.Errorf("splitColumnsByBoundaries() missing split for hour 2024010111")
-		return
-	}
-
-	time11 := hour11["time"].([]int64)
-	value11 := hour11["value"].([]float64)
-	name11 := hour11["name"].([]string)
-
-	if len(time11) != 2 {
-		t.Errorf("splitColumnsByBoundaries() hour 11 has %d records, want 2", len(time11))
-	}
-
-	if value11[0] != 3.0 || value11[1] != 4.0 {
-		t.Errorf("splitColumnsByBoundaries() hour 11 values = %v, want [3.0, 4.0]", value11)
-	}
-
-	if name11[0] != "c" || name11[1] != "d" {
-		t.Errorf("splitColumnsByBoundaries() hour 11 names = %v, want [c, d]", name11)
-	}
-}
 
 // TestGenerateStoragePath tests the storage path generation with data time
 func TestGenerateStoragePath(t *testing.T) {
@@ -404,6 +222,169 @@ func TestGenerateStoragePath(t *testing.T) {
 	// Should end with .parquet
 	if path[len(path)-8:] != ".parquet" {
 		t.Errorf("generateStoragePath() path doesn't end with .parquet: %v", path)
+	}
+}
+
+// TestGroupByHourWithMultiKeySort tests that groupByHour correctly handles
+// multi-hour batches with multi-key sorting where times are NOT globally sorted
+func TestGroupByHourWithMultiKeySort(t *testing.T) {
+	// Helper to create microsecond timestamps
+	microTime := func(year, month, day, hour, min, sec int) int64 {
+		return time.Date(year, time.Month(month), day, hour, min, sec, 0, time.UTC).UnixMicro()
+	}
+
+	// Create data spanning 2 hours (10:00 and 11:00) with multiple sensors
+	// When sorted by ["tag_sensor_id", "time"], times will NOT be globally sorted
+	// Example: [A@10:30, A@11:15, B@10:15, B@11:45, C@10:45, C@11:30]
+	// Times:   [10:30,   11:15,   10:15,   11:45,   10:45,   11:30] <- NOT sorted!
+	times := []int64{
+		microTime(2024, 1, 1, 10, 30, 0), // sensor_A, hour 10
+		microTime(2024, 1, 1, 11, 15, 0), // sensor_A, hour 11
+		microTime(2024, 1, 1, 10, 15, 0), // sensor_B, hour 10
+		microTime(2024, 1, 1, 11, 45, 0), // sensor_B, hour 11
+		microTime(2024, 1, 1, 10, 45, 0), // sensor_C, hour 10
+		microTime(2024, 1, 1, 11, 30, 0), // sensor_C, hour 11
+	}
+
+	// Call groupByHour
+	buckets, globalMin, globalMax, err := groupByHour(times)
+	if err != nil {
+		t.Fatalf("groupByHour() unexpected error: %v", err)
+	}
+
+	// Verify global min/max
+	expectedMin := microTime(2024, 1, 1, 10, 15, 0) // sensor_B at 10:15
+	expectedMax := microTime(2024, 1, 1, 11, 45, 0) // sensor_B at 11:45
+	if globalMin != expectedMin {
+		t.Errorf("groupByHour() globalMin = %v, want %v",
+			time.UnixMicro(globalMin), time.UnixMicro(expectedMin))
+	}
+	if globalMax != expectedMax {
+		t.Errorf("groupByHour() globalMax = %v, want %v",
+			time.UnixMicro(globalMax), time.UnixMicro(expectedMax))
+	}
+
+	// Verify we got exactly 2 hour buckets
+	if len(buckets) != 2 {
+		t.Fatalf("groupByHour() got %d buckets, want 2", len(buckets))
+	}
+
+	// Verify hour 10 bucket (2024010110)
+	hour10, exists := buckets["2024010110"]
+	if !exists {
+		t.Fatalf("groupByHour() missing bucket for hour 2024010110")
+	}
+
+	// Hour 10 should have indices 0, 2, 4 (sensors A, B, C at 10:xx)
+	expectedIndices10 := []int{0, 2, 4}
+	if len(hour10.indices) != len(expectedIndices10) {
+		t.Errorf("hour 10 got %d indices, want %d", len(hour10.indices), len(expectedIndices10))
+	}
+	for i, expectedIdx := range expectedIndices10 {
+		if hour10.indices[i] != expectedIdx {
+			t.Errorf("hour 10 indices[%d] = %d, want %d", i, hour10.indices[i], expectedIdx)
+		}
+	}
+
+	// Verify hour 10 min/max
+	if hour10.minTime != microTime(2024, 1, 1, 10, 15, 0) {
+		t.Errorf("hour 10 minTime = %v, want 10:15:00", time.UnixMicro(hour10.minTime))
+	}
+	if hour10.maxTime != microTime(2024, 1, 1, 10, 45, 0) {
+		t.Errorf("hour 10 maxTime = %v, want 10:45:00", time.UnixMicro(hour10.maxTime))
+	}
+
+	// Verify hour 11 bucket (2024010111)
+	hour11, exists := buckets["2024010111"]
+	if !exists {
+		t.Fatalf("groupByHour() missing bucket for hour 2024010111")
+	}
+
+	// Hour 11 should have indices 1, 3, 5 (sensors A, B, C at 11:xx)
+	expectedIndices11 := []int{1, 3, 5}
+	if len(hour11.indices) != len(expectedIndices11) {
+		t.Errorf("hour 11 got %d indices, want %d", len(hour11.indices), len(expectedIndices11))
+	}
+	for i, expectedIdx := range expectedIndices11 {
+		if hour11.indices[i] != expectedIdx {
+			t.Errorf("hour 11 indices[%d] = %d, want %d", i, hour11.indices[i], expectedIdx)
+		}
+	}
+
+	// Verify hour 11 min/max
+	if hour11.minTime != microTime(2024, 1, 1, 11, 15, 0) {
+		t.Errorf("hour 11 minTime = %v, want 11:15:00", time.UnixMicro(hour11.minTime))
+	}
+	if hour11.maxTime != microTime(2024, 1, 1, 11, 45, 0) {
+		t.Errorf("hour 11 maxTime = %v, want 11:45:00", time.UnixMicro(hour11.maxTime))
+	}
+}
+
+// TestSliceColumnsByIndices tests extracting rows by index list
+func TestSliceColumnsByIndices(t *testing.T) {
+	// Create sample data
+	columns := map[string]interface{}{
+		"time":           []int64{100, 200, 300, 400, 500, 600},
+		"tag_sensor_id":  []string{"A", "A", "B", "B", "C", "C"},
+		"value":          []float64{1.1, 2.2, 3.3, 4.4, 5.5, 6.6},
+		"tag_location":   []string{"room1", "room2", "room1", "room2", "room1", "room2"},
+	}
+
+	// Extract indices [0, 2, 4] (first occurrence of each sensor)
+	indices := []int{0, 2, 4}
+	result := sliceColumnsByIndices(columns, indices)
+
+	// Verify all columns were sliced
+	if len(result) != len(columns) {
+		t.Fatalf("sliceColumnsByIndices() got %d columns, want %d", len(result), len(columns))
+	}
+
+	// Verify time column
+	resultTime := result["time"].([]int64)
+	expectedTime := []int64{100, 300, 500}
+	if len(resultTime) != len(expectedTime) {
+		t.Errorf("time column length = %d, want %d", len(resultTime), len(expectedTime))
+	}
+	for i, want := range expectedTime {
+		if resultTime[i] != want {
+			t.Errorf("time[%d] = %d, want %d", i, resultTime[i], want)
+		}
+	}
+
+	// Verify sensor_id column
+	resultSensors := result["tag_sensor_id"].([]string)
+	expectedSensors := []string{"A", "B", "C"}
+	if len(resultSensors) != len(expectedSensors) {
+		t.Errorf("sensor_id column length = %d, want %d", len(resultSensors), len(expectedSensors))
+	}
+	for i, want := range expectedSensors {
+		if resultSensors[i] != want {
+			t.Errorf("sensor_id[%d] = %s, want %s", i, resultSensors[i], want)
+		}
+	}
+
+	// Verify value column
+	resultValues := result["value"].([]float64)
+	expectedValues := []float64{1.1, 3.3, 5.5}
+	if len(resultValues) != len(expectedValues) {
+		t.Errorf("value column length = %d, want %d", len(resultValues), len(expectedValues))
+	}
+	for i, want := range expectedValues {
+		if resultValues[i] != want {
+			t.Errorf("value[%d] = %f, want %f", i, resultValues[i], want)
+		}
+	}
+
+	// Verify location column
+	resultLocations := result["tag_location"].([]string)
+	expectedLocations := []string{"room1", "room1", "room1"}
+	if len(resultLocations) != len(expectedLocations) {
+		t.Errorf("location column length = %d, want %d", len(resultLocations), len(expectedLocations))
+	}
+	for i, want := range expectedLocations {
+		if resultLocations[i] != want {
+			t.Errorf("location[%d] = %s, want %s", i, resultLocations[i], want)
+		}
 	}
 }
 
@@ -515,24 +496,6 @@ func BenchmarkSortColumnsByTime(b *testing.B) {
 				_, _ = sortColumnsByTime(columns)
 			}
 		})
-	}
-}
-
-// BenchmarkFindHourBoundaries benchmarks the boundary finding performance
-func BenchmarkFindHourBoundaries(b *testing.B) {
-	// Create sorted times spanning 24 hours
-	size := 100000
-	times := make([]int64, size)
-	baseTime := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).UnixMicro()
-
-	for i := 0; i < size; i++ {
-		// Spread evenly across 24 hours
-		times[i] = baseTime + int64(i)*(24*3600*1000000)/int64(size)
-	}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = findHourBoundaries(times)
 	}
 }
 
