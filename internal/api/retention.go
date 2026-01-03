@@ -646,7 +646,7 @@ func (h *RetentionHandler) getFileMaxTimeAndRowCount(ctx context.Context, filePa
 	}
 
 	// Convert microseconds to time
-	maxTime := time.UnixMicro(maxTimeMicros)
+	maxTime := time.UnixMicro(maxTimeMicros).UTC()
 
 	return maxTime, rowCount, nil
 }

@@ -125,39 +125,46 @@ func (t *DailyTier) ShouldCompact(files []string, partitionTime time.Time) bool 
 		return false
 	}
 
-	// Separate daily-compacted files from hourly files
+	// Separate daily-compacted files from hourly-compacted files
 	// Use path depth to distinguish:
-	// - Daily files: measurement/year/month/day/file.parquet (5 parts)
-	// - Hourly files: measurement/year/month/day/hour/file.parquet (6 parts)
-	var dailyCompactedFiles, hourlyFiles []string
+	// - Daily files: database/measurement/year/month/day/file.parquet (6 parts)
+	// - Hourly files: database/measurement/year/month/day/hour/file.parquet (7 parts)
+	var dailyCompactedFiles, hourlyCompactedFiles []string
 
 	for _, f := range files {
 		parts := strings.Split(f, "/")
-		if len(parts) == 5 {
+		if len(parts) == 6 {
 			// Day-level file = daily compacted file
 			dailyCompactedFiles = append(dailyCompactedFiles, f)
-		} else {
-			// Hour-level file = hourly file
-			hourlyFiles = append(hourlyFiles, f)
+		} else if len(parts) == 7 {
+			// Hour-level file = hourly-compacted file
+			hourlyCompactedFiles = append(hourlyCompactedFiles, f)
 		}
+		// Skip files that don't match expected structure
 	}
 
-	// Case 1: No daily compacted file yet, and has enough total files
-	if len(dailyCompactedFiles) == 0 && len(files) >= t.MinFiles {
+	// Case 1: No daily compacted file yet, and has enough hourly-compacted files
+	if len(dailyCompactedFiles) == 0 && len(hourlyCompactedFiles) >= t.MinFiles {
 		t.Logger.Debug().
-			Int("file_count", len(files)).
+			Int("hourly_compacted_files", len(hourlyCompactedFiles)).
 			Msg("First time daily compaction needed")
 		return true
 	}
 
-	// Case 2: Has daily compacted file, but many new hourly files accumulated
-	if len(dailyCompactedFiles) > 0 && len(hourlyFiles) >= t.MinFiles {
+	// Case 2: Has daily compacted file, but many new hourly-compacted files accumulated
+	if len(dailyCompactedFiles) > 0 && len(hourlyCompactedFiles) >= t.MinFiles {
 		t.Logger.Debug().
 			Int("daily_files", len(dailyCompactedFiles)).
-			Int("hourly_files", len(hourlyFiles)).
+			Int("hourly_compacted_files", len(hourlyCompactedFiles)).
 			Msg("Daily re-compaction needed")
 		return true
 	}
+
+	t.Logger.Debug().
+		Int("daily_files", len(dailyCompactedFiles)).
+		Int("hourly_compacted_files", len(hourlyCompactedFiles)).
+		Int("min_files", t.MinFiles).
+		Msg("Skipping daily compaction: not enough hourly-compacted files")
 
 	return false
 }
@@ -248,9 +255,24 @@ func (t *DailyTier) listDayPartitions(ctx context.Context, database, measurement
 		partitions[partitionPath].Files = append(partitions[partitionPath].Files, obj)
 	}
 
-	// Convert map to slice
+	// Convert map to slice, filtering by newest file creation time
 	result := make([]Candidate, 0, len(partitions))
 	for _, p := range partitions {
+		// Check newest file creation time in this partition
+		newestFileTime := extractNewestFileTime(p.Files)
+
+		// Skip partition if newest file is too recent (younger than cutoff)
+		// This handles late-arriving data: if files are still being written to this partition,
+		// wait until all files are old enough before compacting
+		if !newestFileTime.IsZero() && newestFileTime.After(cutoffTime) {
+			t.Logger.Debug().
+				Str("partition", p.PartitionPath).
+				Time("newest_file", newestFileTime).
+				Time("cutoff", cutoffTime).
+				Msg("Skipping partition: has files newer than cutoff")
+			continue
+		}
+
 		result = append(result, *p)
 	}
 
@@ -262,4 +284,66 @@ func (t *DailyTier) listDayPartitions(ctx context.Context, database, measurement
 		Msg("Found day partitions")
 
 	return result, nil
+}
+
+// extractNewestFileTime extracts the newest file creation time from a list of file paths.
+// Supports two formats:
+// - Hourly files: {measurement}_{YYYYMMDD_HHMMSS}_{nanos}.parquet
+// - Daily files: {measurement}_{YYYYMMDD}_daily.parquet
+// Returns zero time if no valid timestamps found.
+func extractNewestFileTime(files []string) time.Time {
+	var newest time.Time
+
+	for _, file := range files {
+		// Extract filename from path
+		parts := strings.Split(file, "/")
+		filename := parts[len(parts)-1]
+
+		// Remove .parquet extension
+		filename = strings.TrimSuffix(filename, ".parquet")
+
+		// Check if it's a daily compacted file: measurement_YYYYMMDD_daily
+		if strings.HasSuffix(filename, "_daily") {
+			// Remove _daily suffix
+			filename = strings.TrimSuffix(filename, "_daily")
+			fileParts := strings.Split(filename, "_")
+			if len(fileParts) < 2 {
+				continue
+			}
+			// Last part is the date
+			datePart := fileParts[len(fileParts)-1]
+			// Parse date: YYYYMMDD (daily files created at midnight UTC)
+			fileTime, err := time.Parse("20060102", datePart)
+			if err != nil {
+				continue
+			}
+			if fileTime.After(newest) {
+				newest = fileTime
+			}
+			continue
+		}
+
+		// Handle hourly file: measurement_YYYYMMDD_HHMMSS_nanos
+		fileParts := strings.Split(filename, "_")
+		if len(fileParts) < 3 {
+			continue
+		}
+
+		// Get timestamp parts (second and third from end)
+		// Format: ..._YYYYMMDD_HHMMSS_nanos
+		dateTimePart := fileParts[len(fileParts)-3] + "_" + fileParts[len(fileParts)-2]
+
+		// Parse timestamp: YYYYMMDD_HHMMSS
+		fileTime, err := time.Parse("20060102_150405", dateTimePart)
+		if err != nil {
+			continue
+		}
+
+		// Keep track of newest
+		if fileTime.After(newest) {
+			newest = fileTime
+		}
+	}
+
+	return newest
 }

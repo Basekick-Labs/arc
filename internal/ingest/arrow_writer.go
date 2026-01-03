@@ -23,6 +23,11 @@ import (
 	"github.com/rs/zerolog"
 )
 
+const (
+	flushTypeAsync = "async"
+	flushTypeSync  = "sync"
+)
+
 // schemaCacheEntry holds a cached schema with LRU tracking
 type schemaCacheEntry struct {
 	schema     *arrow.Schema
@@ -830,6 +835,10 @@ type ArrowBuffer struct {
 	flushQueue   chan flushTask
 	flushWorkers int
 
+	// Sort key configuration (for multi-column sorting)
+	sortKeysConfig  map[string][]string // measurement -> sort keys
+	defaultSortKeys []string            // default sort keys
+
 	// Metrics (using atomic operations to avoid lock contention)
 	totalRecordsBuffered atomic.Int64
 	totalRecordsWritten  atomic.Int64
@@ -864,6 +873,38 @@ func (b *ArrowBuffer) getShard(bufferKey string) *bufferShard {
 	return b.shards[hash%b.shardCount]
 }
 
+// getSortKeys returns sort keys for a measurement, ensuring "time" is always included
+func (b *ArrowBuffer) getSortKeys(measurement string) []string {
+	var keys []string
+
+	// Check measurement-specific config
+	if measurementKeys, exists := b.sortKeysConfig[measurement]; exists {
+		keys = measurementKeys
+	} else {
+		// Use default
+		keys = b.defaultSortKeys
+	}
+
+	// Ensure "time" is always in the sort keys
+	hasTime := false
+	for _, key := range keys {
+		if key == "time" {
+			hasTime = true
+			break
+		}
+	}
+
+	if !hasTime && len(keys) > 0 {
+		keys = append([]string{}, keys...)
+		keys = append(keys, "time")
+	} else if len(keys) == 0 {
+		// Default to time-only
+		keys = []string{"time"}
+	}
+
+	return keys
+}
+
 // NewArrowBuffer creates a new Arrow buffer with automatic flushing
 func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger zerolog.Logger) *ArrowBuffer {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -884,18 +925,28 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		shardCount = 32 // Fallback if not configured
 	}
 
+	// Parse sort keys config using shared function
+	sortKeysConfig, defaultSortKeys, err := config.ParseSortKeys(*cfg)
+	if err != nil {
+		logger.Warn().Err(err).Msg("Invalid sort keys config, using defaults")
+		sortKeysConfig = make(map[string][]string)
+		defaultSortKeys = []string{"time"}
+	}
+
 	buffer := &ArrowBuffer{
-		config:       cfg,
-		storage:      storage,
-		writer:       NewArrowWriter(cfg, logger),
-		shards:       make([]*bufferShard, shardCount),
-		shardCount:   uint32(shardCount),
-		ctx:          ctx,
-		cancel:       cancel,
-		flushTimer:   time.NewTicker(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
-		flushQueue:   make(chan flushTask, queueSize),
-		flushWorkers: flushWorkers,
-		logger:       logger.With().Str("component", "arrow-buffer").Logger(),
+		config:          cfg,
+		storage:         storage,
+		writer:          NewArrowWriter(cfg, logger),
+		shards:          make([]*bufferShard, shardCount),
+		shardCount:      uint32(shardCount),
+		ctx:             ctx,
+		cancel:          cancel,
+		flushTimer:      time.NewTicker(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
+		flushQueue:      make(chan flushTask, queueSize),
+		flushWorkers:    flushWorkers,
+		sortKeysConfig:  sortKeysConfig,
+		defaultSortKeys: defaultSortKeys,
+		logger:          logger.With().Str("component", "arrow-buffer").Logger(),
 	}
 
 	// Initialize shards
@@ -1185,7 +1236,7 @@ func (b *ArrowBuffer) writeColumnar(ctx context.Context, database string, record
 
 	// Initialize buffer and record count if needed
 	if _, exists := shard.buffers[bufferKey]; !exists {
-		shard.bufferStartTimes[bufferKey] = time.Now()
+		shard.bufferStartTimes[bufferKey] = time.Now().UTC()
 		shard.bufferRecordCounts[bufferKey] = 0
 		shard.bufferSchemas[bufferKey] = newSignature // Store schema for evolution detection
 	}
@@ -1203,10 +1254,11 @@ func (b *ArrowBuffer) writeColumnar(ctx context.Context, database string, record
 		recordsToFlush = make([]interface{}, len(shard.buffers[bufferKey]))
 		copy(recordsToFlush, shard.buffers[bufferKey])
 
-		// Clear buffer immediately
+		// Clear buffer immediately, but KEEP the start time
+		// This allows age-based flush to catch any remaining data after size flushes
 		shard.buffers[bufferKey] = nil
-		delete(shard.bufferStartTimes, bufferKey)
-		delete(shard.bufferRecordCounts, bufferKey)
+		// NOTE: Keep bufferStartTimes[bufferKey] - don't delete it!
+		shard.bufferRecordCounts[bufferKey] = 0
 		delete(shard.bufferSchemas, bufferKey)
 
 		shouldFlush = true
@@ -1514,7 +1566,7 @@ func (b *ArrowBuffer) periodicFlush() {
 
 // flushAgedBuffers flushes buffers that have exceeded max age
 func (b *ArrowBuffer) flushAgedBuffers() {
-	now := time.Now()
+	now := time.Now().UTC()
 	maxAge := time.Duration(b.config.MaxBufferAgeMS) * time.Millisecond
 
 	// Iterate over all shards
@@ -1606,46 +1658,169 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 		return
 	}
 
-	// Write merged columns to Parquet (uses optimized typed path)
-	parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, merged)
-	if err != nil {
+	// Flush with data timestamp partitioning
+	if err := b.flushWithDataTimePartitioning(ctx, bufferKey, database, measurement, merged, recordCount, startTime); err != nil {
 		b.logger.Error().
 			Err(err).
 			Str("buffer_key", bufferKey).
-			Msg("Failed to write Parquet during async flush")
-
+			Msg("Failed to flush")
 		b.totalErrors.Add(1)
-		return
+	}
+}
+
+// flushWithDataTimePartitioning partitions data by data timestamps (async path)
+func (b *ArrowBuffer) flushWithDataTimePartitioning(ctx context.Context, bufferKey, database, measurement string, merged map[string]interface{}, recordCount int, startTime time.Time) error {
+	return b.flushPartitionedData(ctx, bufferKey, database, measurement, merged, recordCount, flushTypeAsync, startTime)
+}
+
+// flushPartitionedData is the shared core logic for partitioning and writing data by hour boundaries
+// Called by both async (flushWithDataTimePartitioning) and sync (flushBufferLockedDataTime) paths
+// Uses hash-based grouping to partition by hour, then sorts each hour independently
+func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, database, measurement string, merged map[string]interface{}, recordCount int, flushType string, startTime time.Time) error {
+	// Get sort keys for this measurement (guaranteed to include "time")
+	sortKeys := b.getSortKeys(measurement)
+
+	// Extract time column (doesn't need to be sorted yet)
+	times, ok := merged["time"].([]int64)
+	if !ok || len(times) == 0 {
+		return fmt.Errorf("no time data in batch")
 	}
 
-	// Generate storage path: database/measurement/YYYYMMDD/HHmmss_uuid.parquet
-	storagePath := b.generateStoragePath(database, measurement)
+	// OPTIMIZATION: Group by hour in a single O(n) pass
+	// This gives us: hour buckets, global min/max, per-hour min/max
+	hourBuckets, globalMin, globalMax, err := groupByHour(times)
+	if err != nil {
+		return fmt.Errorf("failed to group by hour: %w", err)
+	}
 
-	// Write to storage
-	if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
-		b.logger.Error().
-			Err(err).
+	minTime := time.UnixMicro(globalMin).UTC()
+	maxTime := time.UnixMicro(globalMax).UTC()
+
+	// Log warning if data is significantly old or in the future
+	now := time.Now().UTC()
+	if minTime.Before(now.AddDate(0, 0, -7)) {
+		b.logger.Warn().
+			Time("data_time", minTime).
+			Str("buffer_key", bufferKey).
+			Msg("Data timestamp is >7 days old - possible backfill or clock skew")
+	} else if minTime.After(now.Add(time.Hour)) {
+		b.logger.Warn().
+			Time("data_time", minTime).
+			Str("buffer_key", bufferKey).
+			Msg("Data timestamp is >1 hour in future - possible clock skew")
+	}
+
+	// OPTIMIZATION: If batch fits within single hour, skip splitting
+	// Check if min and max fall within the same hour
+	minHour := minTime.Truncate(time.Hour)
+	maxHour := maxTime.Truncate(time.Hour)
+	if minHour.Equal(maxHour) {
+		// Single hour - sort once and write one file
+		sorted, err := sortColumnsByKeys(merged, sortKeys)
+		if err != nil {
+			return fmt.Errorf("failed to sort columns by %v: %w", sortKeys, err)
+		}
+
+		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted)
+		if err != nil {
+			return fmt.Errorf("failed to write Parquet: %w", err)
+		}
+
+		storagePath := b.generateStoragePath(database, measurement, minTime)
+
+		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
+			return fmt.Errorf("failed to write to storage: %w", err)
+		}
+
+		b.totalRecordsWritten.Add(int64(recordCount))
+		b.totalFlushes.Add(1)
+
+		flushDuration := time.Since(startTime)
+		msgType := flushType + " flush"
+		switch flushType {
+		case flushTypeAsync:
+			msgType = "Async flush"
+		case flushTypeSync:
+			msgType = "Periodic flush"
+		}
+
+		b.logger.Info().
 			Str("buffer_key", bufferKey).
 			Str("storage_path", storagePath).
-			Msg("Failed to write to storage during async flush")
+			Int("records", recordCount).
+			Int("size_bytes", len(parquetData)).
+			Dur("flush_duration", flushDuration).
+			Strs("sort_keys", sortKeys).
+			Msgf("%s completed (single hour, data_time)", msgType)
 
-		b.totalErrors.Add(1)
-		return
+		return nil
 	}
 
-	flushDuration := time.Since(startTime)
+	// Multiple hours - process each hour bucket independently
+	b.logger.Info().
+		Str("buffer_key", bufferKey).
+		Int("num_hours", len(hourBuckets)).
+		Int("total_records", recordCount).
+		Msg("Splitting batch across multiple hour partitions")
 
-	// Update metrics (lock-free atomic operations!)
-	b.totalRecordsWritten.Add(int64(recordCount))
-	b.totalFlushes.Add(1)
+	// Write one file per hour
+	totalWritten := 0
+	for hourID, bucket := range hourBuckets {
+		// Extract rows for this hour using the index list
+		hourColumns := sliceColumnsByIndices(merged, bucket.indices)
+
+		// Sort this hour's data by configured sort keys
+		sorted, err := sortColumnsByKeys(hourColumns, sortKeys)
+		if err != nil {
+			return fmt.Errorf("failed to sort hour %d by %v: %w", hourID, sortKeys, err)
+		}
+
+		// Write Parquet file for this hour
+		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted)
+		if err != nil {
+			return fmt.Errorf("failed to write Parquet for hour %d: %w", hourID, err)
+		}
+
+		// Use bucket's minTime for path generation (convert hourID to time only here)
+		bucketTime := hourIDToTime(hourID)
+		storagePath := b.generateStoragePath(database, measurement, bucketTime)
+
+		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
+			return fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err)
+		}
+
+		splitRecordCount := len(bucket.indices)
+		totalWritten += splitRecordCount
+
+		b.logger.Info().
+			Str("buffer_key", bufferKey).
+			Str("storage_path", storagePath).
+			Int64("hour_id", hourID).
+			Int("records", splitRecordCount).
+			Int("size_bytes", len(parquetData)).
+			Msg("Wrote hour partition")
+	}
+
+	b.totalRecordsWritten.Add(int64(totalWritten))
+	b.totalFlushes.Add(int64(len(hourBuckets)))
+
+	flushDuration := time.Since(startTime)
+	msgType := flushType + " flush"
+	switch flushType {
+	case flushTypeAsync:
+		msgType = "Async flush"
+	case flushTypeSync:
+		msgType = "Periodic flush"
+	}
 
 	b.logger.Info().
 		Str("buffer_key", bufferKey).
-		Str("storage_path", storagePath).
-		Int("records", recordCount).
-		Int("size_bytes", len(parquetData)).
+		Int("num_files", len(hourBuckets)).
+		Int("total_records", totalWritten).
 		Dur("flush_duration", flushDuration).
-		Msg("Async flush completed successfully")
+		Msgf("%s completed (multi-hour split, data_time)", msgType)
+
+	return nil
 }
 
 // flushBufferLocked writes buffered data to Parquet and storage (synchronous version for periodic flush)
@@ -1679,36 +1854,21 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 		return fmt.Errorf("failed to merge batches: %w", err)
 	}
 
-	// Write merged columns to Parquet (uses optimized typed path)
-	parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, merged)
-	if err != nil {
+	// Flush with data timestamp partitioning
+	startTime := time.Now().UTC()
+	if err := b.flushBufferLockedDataTime(ctx, bufferKey, database, measurement, merged, recordCount, startTime); err != nil {
 		shard.mu.Lock() // Re-acquire lock for caller
-		return fmt.Errorf("failed to write Parquet: %w", err)
+		return err
 	}
-
-	// Generate storage path: database/measurement/YYYYMMDD/HHmmss_uuid.parquet
-	storagePath := b.generateStoragePath(database, measurement)
-
-	// Write to storage
-	if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
-		shard.mu.Lock() // Re-acquire lock for caller
-		return fmt.Errorf("failed to write to storage: %w", err)
-	}
-
-	// Update metrics (lock-free atomic operations!)
-	b.totalRecordsWritten.Add(int64(recordCount))
-	b.totalFlushes.Add(1)
-
-	b.logger.Info().
-		Str("buffer_key", bufferKey).
-		Str("storage_path", storagePath).
-		Int("records", recordCount).
-		Int("size_bytes", len(parquetData)).
-		Msg("Periodic flush completed")
 
 	// Re-acquire lock for caller
 	shard.mu.Lock()
 	return nil
+}
+
+// flushBufferLockedDataTime flushes with data_time partitioning (sync path)
+func (b *ArrowBuffer) flushBufferLockedDataTime(ctx context.Context, bufferKey, database, measurement string, merged map[string]interface{}, recordCount int, startTime time.Time) error {
+	return b.flushPartitionedData(ctx, bufferKey, database, measurement, merged, recordCount, flushTypeSync, startTime)
 }
 
 // mergeBatches merges multiple column batches into a single columnar structure
@@ -1809,6 +1969,317 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (map[string]interface{
 	return merged, nil
 }
 
+// hourBoundary represents a time partition boundary
+type hourBoundary struct {
+	startIdx int       // Start index in sorted array
+	endIdx   int       // End index (exclusive)
+	hourKey  string    // YYYYMMDDHH
+	minTime  time.Time // First timestamp in partition
+}
+
+// sortColumnsByTime sorts all columns by the time column in-place
+// Returns the sorted columns and any error encountered
+func sortColumnsByTime(columns map[string]interface{}) (map[string]interface{}, error) {
+	// Delegate to multi-key sort with just "time" key
+	return sortColumnsByKeys(columns, []string{"time"})
+}
+
+// sortColumnsByKeys sorts columns by multiple keys (e.g., sensor_id, then time)
+// Returns the sorted columns and any error encountered
+func sortColumnsByKeys(columns map[string]interface{}, sortKeys []string) (map[string]interface{}, error) {
+	if len(sortKeys) == 0 {
+		return nil, fmt.Errorf("no sort keys provided")
+	}
+
+	// FAST PATH: Time-only sort (most common case) - avoid multi-key overhead
+	if len(sortKeys) == 1 && sortKeys[0] == "time" {
+		return sortColumnsByTimeOnly(columns)
+	}
+
+	// Validate all sort keys exist and cache column pointers
+	cachedCols := make([]interface{}, len(sortKeys))
+	for i, key := range sortKeys {
+		col, exists := columns[key]
+		if !exists {
+			return nil, fmt.Errorf("sort key column not found: %s", key)
+		}
+		cachedCols[i] = col
+	}
+
+	// Get first column to determine row count
+	var n int
+	for _, col := range columns {
+		switch c := col.(type) {
+		case []int64:
+			n = len(c)
+		case []float64:
+			n = len(c)
+		case []string:
+			n = len(c)
+		case []bool:
+			n = len(c)
+		}
+		if n > 0 {
+			break
+		}
+	}
+
+	if n == 0 {
+		return columns, nil
+	}
+
+	// Create permutation indices [0, 1, 2, ..., n-1]
+	indices := make([]int, n)
+	for i := range indices {
+		indices[i] = i
+	}
+
+	// Multi-key sort with cached columns (no map lookups in comparator)
+	sort.Slice(indices, func(i, j int) bool {
+		return compareMultiKeyCached(cachedCols, indices[i], indices[j])
+	})
+
+	// Apply permutation to all columns
+	result := make(map[string]interface{}, len(columns))
+	for colName, colData := range columns {
+		result[colName] = applyPermutation(colData, indices)
+	}
+
+	return result, nil
+}
+
+// sortColumnsByTimeOnly is an optimized path for time-only sorting
+// Avoids the multi-key comparator overhead for the common case
+func sortColumnsByTimeOnly(columns map[string]interface{}) (map[string]interface{}, error) {
+	timeCol, exists := columns["time"]
+	if !exists {
+		return nil, fmt.Errorf("time column not found")
+	}
+
+	times, ok := timeCol.([]int64)
+	if !ok {
+		return nil, fmt.Errorf("time column is not []int64")
+	}
+
+	n := len(times)
+	if n == 0 {
+		return columns, nil
+	}
+
+	// Create permutation indices
+	indices := make([]int, n)
+	for i := range indices {
+		indices[i] = i
+	}
+
+	// Sort by time directly (no function call overhead per comparison)
+	sort.Slice(indices, func(i, j int) bool {
+		return times[indices[i]] < times[indices[j]]
+	})
+
+	// Apply permutation to all columns
+	result := make(map[string]interface{}, len(columns))
+	for colName, colData := range columns {
+		result[colName] = applyPermutation(colData, indices)
+	}
+
+	return result, nil
+}
+
+// compareMultiKeyCached compares two rows by multiple sort keys using cached column pointers
+// This avoids map lookups on every comparison (called O(n log n) times)
+func compareMultiKeyCached(cachedCols []interface{}, i, j int) bool {
+	for _, col := range cachedCols {
+		switch c := col.(type) {
+		case []int64:
+			if c[i] < c[j] {
+				return true
+			}
+			if c[i] > c[j] {
+				return false
+			}
+			// Equal, continue to next key
+
+		case []float64:
+			if c[i] < c[j] {
+				return true
+			}
+			if c[i] > c[j] {
+				return false
+			}
+
+		case []string:
+			if c[i] < c[j] {
+				return true
+			}
+			if c[i] > c[j] {
+				return false
+			}
+
+		case []bool:
+			if !c[i] && c[j] { // false < true
+				return true
+			}
+			if c[i] && !c[j] {
+				return false
+			}
+		}
+	}
+
+	// All keys equal
+	return false
+}
+
+// applyPermutation reorders a column according to permutation indices
+func applyPermutation(colData interface{}, indices []int) interface{} {
+	switch col := colData.(type) {
+	case []int64:
+		result := make([]int64, len(indices))
+		for i, idx := range indices {
+			result[i] = col[idx]
+		}
+		return result
+
+	case []float64:
+		result := make([]float64, len(indices))
+		for i, idx := range indices {
+			result[i] = col[idx]
+		}
+		return result
+
+	case []string:
+		result := make([]string, len(indices))
+		for i, idx := range indices {
+			result[i] = col[idx]
+		}
+		return result
+
+	case []bool:
+		result := make([]bool, len(indices))
+		for i, idx := range indices {
+			result[i] = col[idx]
+		}
+		return result
+
+	default:
+		return colData // Unknown type, return as-is
+	}
+}
+
+// microPerHour is the number of microseconds in one hour (3600 * 1,000,000)
+const microPerHour = int64(3600_000_000)
+
+// hourBucket represents a collection of row indices belonging to a specific hour
+// Used for hash-based grouping that doesn't require globally sorted data
+type hourBucket struct {
+	hourID  int64 // Hour identifier (microseconds / microPerHour)
+	indices []int // Row indices belonging to this hour
+	minTime int64 // Minimum timestamp in this hour (microseconds)
+	maxTime int64 // Maximum timestamp in this hour (microseconds)
+}
+
+// hourIDToTime converts an hourID back to a time.Time for path generation
+func hourIDToTime(hourID int64) time.Time {
+	return time.UnixMicro(hourID * microPerHour).UTC()
+}
+
+// groupByHour groups row indices by hour and tracks min/max times
+// Works correctly regardless of whether data is globally sorted by time
+// Returns: map of hourID -> bucket, global min time, global max time
+// Uses integer division for fast hour extraction (no time.Time allocations)
+func groupByHour(times []int64) (map[int64]*hourBucket, int64, int64, error) {
+	if len(times) == 0 {
+		return nil, 0, 0, fmt.Errorf("empty time column")
+	}
+
+	buckets := make(map[int64]*hourBucket)
+	globalMin := times[0]
+	globalMax := times[0]
+
+	// Single pass: group by hour and track min/max
+	for i, t := range times {
+		// Update global min/max
+		if t < globalMin {
+			globalMin = t
+		}
+		if t > globalMax {
+			globalMax = t
+		}
+
+		// Fast hour extraction using integer division (no time.Time allocation)
+		hourID := t / microPerHour
+
+		// Get or create bucket
+		bucket, exists := buckets[hourID]
+		if !exists {
+			bucket = &hourBucket{
+				hourID:  hourID,
+				indices: make([]int, 0, 100), // Pre-allocate some capacity
+				minTime: t,
+				maxTime: t,
+			}
+			buckets[hourID] = bucket
+		} else {
+			// Update bucket min/max
+			if t < bucket.minTime {
+				bucket.minTime = t
+			}
+			if t > bucket.maxTime {
+				bucket.maxTime = t
+			}
+		}
+
+		// Add row index to bucket
+		bucket.indices = append(bucket.indices, i)
+	}
+
+	return buckets, globalMin, globalMax, nil
+}
+
+// sliceColumnsByIndices extracts rows from all columns based on a list of indices
+// Returns a new column map with only the selected rows
+func sliceColumnsByIndices(columns map[string]interface{}, indices []int) map[string]interface{} {
+	result := make(map[string]interface{}, len(columns))
+
+	for colName, colData := range columns {
+		switch col := colData.(type) {
+		case []int64:
+			newCol := make([]int64, len(indices))
+			for i, idx := range indices {
+				newCol[i] = col[idx]
+			}
+			result[colName] = newCol
+
+		case []float64:
+			newCol := make([]float64, len(indices))
+			for i, idx := range indices {
+				newCol[i] = col[idx]
+			}
+			result[colName] = newCol
+
+		case []string:
+			newCol := make([]string, len(indices))
+			for i, idx := range indices {
+				newCol[i] = col[idx]
+			}
+			result[colName] = newCol
+
+		case []bool:
+			newCol := make([]bool, len(indices))
+			for i, idx := range indices {
+				newCol[i] = col[idx]
+			}
+			result[colName] = newCol
+
+		default:
+			// Unknown type, copy as-is
+			result[colName] = colData
+		}
+	}
+
+	return result
+}
+
 // generateStoragePath creates a hierarchical storage path for partition pruning
 // Format: {database}/{measurement}/{YYYY}/{MM}/{DD}/{HH}/{measurement}_{timestamp}_{nanos}.parquet
 //
@@ -1816,16 +2287,16 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (map[string]interface{
 // - Query all of November: read_parquet('s3://bucket/db/cpu/2025/11/*/*/*.parquet')
 // - Query specific day: read_parquet('s3://bucket/db/cpu/2025/11/25/*/*.parquet')
 // - Query specific hour: read_parquet('s3://bucket/db/cpu/2025/11/25/16/*.parquet')
-func (b *ArrowBuffer) generateStoragePath(database, measurement string) string {
-	now := time.Now().UTC()
-
+func (b *ArrowBuffer) generateStoragePath(database, measurement string, partitionTime time.Time) string {
 	// Hierarchical partitioning: year/month/day/hour
-	year := now.Format("2006")
-	month := now.Format("01")
-	day := now.Format("02")
-	hour := now.Format("15")
+	year := partitionTime.Format("2006")
+	month := partitionTime.Format("01")
+	day := partitionTime.Format("02")
+	hour := partitionTime.Format("15")
 
 	// Filename includes measurement, timestamp, and nanos for uniqueness
+	// Use current time for filename to avoid collisions
+	now := time.Now().UTC()
 	timestamp := now.Format("20060102_150405")
 	nanos := now.UnixNano() % 1_000_000_000
 

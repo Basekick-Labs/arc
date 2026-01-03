@@ -268,7 +268,7 @@ func appendValueToBuilder(builder array.Builder, val interface{}, arrowType arro
 			b.Append(arrow.Timestamp(v.UnixMicro()))
 		case string:
 			if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
-				b.Append(arrow.Timestamp(t.UnixMicro()))
+				b.Append(arrow.Timestamp(t.UTC().UnixMicro()))
 			} else {
 				b.AppendNull()
 			}

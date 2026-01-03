@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/compaction"
@@ -12,17 +13,19 @@ import (
 
 // CompactionHandler handles compaction API endpoints
 type CompactionHandler struct {
-	manager   *compaction.Manager
-	scheduler *compaction.Scheduler
-	logger    zerolog.Logger
+	manager         *compaction.Manager
+	hourlyScheduler *compaction.Scheduler
+	dailyScheduler  *compaction.Scheduler
+	logger          zerolog.Logger
 }
 
 // NewCompactionHandler creates a new compaction handler
-func NewCompactionHandler(manager *compaction.Manager, scheduler *compaction.Scheduler, logger zerolog.Logger) *CompactionHandler {
+func NewCompactionHandler(manager *compaction.Manager, hourlyScheduler, dailyScheduler *compaction.Scheduler, logger zerolog.Logger) *CompactionHandler {
 	return &CompactionHandler{
-		manager:   manager,
-		scheduler: scheduler,
-		logger:    logger.With().Str("component", "compaction-handler").Logger(),
+		manager:         manager,
+		hourlyScheduler: hourlyScheduler,
+		dailyScheduler:  dailyScheduler,
+		logger:          logger.With().Str("component", "compaction-handler").Logger(),
 	}
 }
 
@@ -40,21 +43,32 @@ func (h *CompactionHandler) RegisterRoutes(app *fiber.App) {
 
 // getStatus handles GET /api/v1/compaction/status
 func (h *CompactionHandler) getStatus(c *fiber.Ctx) error {
-	if h.scheduler == nil {
+	if h.manager == nil {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 			"error": "Compaction not initialized",
 		})
 	}
 
 	stats := h.manager.Stats()
-	return c.JSON(fiber.Map{
-		"scheduler": h.scheduler.Status(),
+	response := fiber.Map{
 		"manager": fiber.Map{
 			"active_jobs":     stats["active_jobs"],
 			"total_completed": stats["total_jobs_completed"],
 			"total_failed":    stats["total_jobs_failed"],
 		},
-	})
+	}
+
+	// Add scheduler status for each tier
+	schedulers := fiber.Map{}
+	if h.hourlyScheduler != nil {
+		schedulers["hourly"] = h.hourlyScheduler.Status()
+	}
+	if h.dailyScheduler != nil {
+		schedulers["daily"] = h.dailyScheduler.Status()
+	}
+	response["schedulers"] = schedulers
+
+	return c.JSON(response)
 }
 
 // getStats handles GET /api/v1/compaction/stats
@@ -106,14 +120,41 @@ func (h *CompactionHandler) getCandidates(c *fiber.Ctx) error {
 }
 
 // triggerCompaction handles POST /api/v1/compaction/trigger
+// Query parameter: tier=hourly,daily (optional, defaults to all enabled tiers)
 func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
-	if h.scheduler == nil || h.manager == nil {
+	if h.manager == nil {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 			"error": "Compaction not initialized",
 		})
 	}
 
-	h.logger.Info().Msg("Manual compaction triggered via API")
+	// Parse tier parameter (comma-separated list)
+	tierParam := c.Query("tier", "")
+	var tierNames []string
+
+	if tierParam != "" {
+		// Split comma-separated tiers
+		parts := strings.Split(tierParam, ",")
+		for _, part := range parts {
+			tier := strings.TrimSpace(part)
+			if tier != "" {
+				tierNames = append(tierNames, tier)
+			}
+		}
+	}
+
+	// If no tiers specified, use all enabled tiers
+	if len(tierNames) == 0 {
+		for _, tier := range h.manager.Tiers {
+			if tier.IsEnabled() {
+				tierNames = append(tierNames, tier.GetTierName())
+			}
+		}
+	}
+
+	h.logger.Info().
+		Strs("tiers", tierNames).
+		Msg("Manual compaction triggered via API")
 
 	// Check if a cycle is already running
 	if h.manager.IsCycleRunning() {
@@ -131,19 +172,29 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 		defer cancel()
 
 		start := time.Now()
-		cycleID, err := h.manager.RunCompactionCycle(ctx)
+		cycleID, err := h.manager.RunCompactionCycleForTiers(ctx, tierNames)
 		duration := time.Since(start)
 
 		if err != nil {
-			h.logger.Error().Err(err).Int64("cycle_id", cycleID).Dur("duration", duration).Msg("Manual compaction failed")
+			h.logger.Error().
+				Err(err).
+				Int64("cycle_id", cycleID).
+				Dur("duration", duration).
+				Strs("tiers", tierNames).
+				Msg("Manual compaction failed")
 		} else {
-			h.logger.Info().Int64("cycle_id", cycleID).Dur("duration", duration).Msg("Manual compaction completed")
+			h.logger.Info().
+				Int64("cycle_id", cycleID).
+				Dur("duration", duration).
+				Strs("tiers", tierNames).
+				Msg("Manual compaction completed")
 		}
 	}()
 
 	return c.JSON(fiber.Map{
 		"message":  "Compaction triggered",
 		"status":   "running",
+		"tiers":    tierNames,
 		"cycle_id": h.manager.GetCurrentCycleID() + 1, // Next cycle ID that will be assigned
 	})
 }

@@ -528,7 +528,8 @@ func parseDateTime(timeStr string) (time.Time, error) {
 
 	for _, format := range formats {
 		if t, err := time.Parse(format, timeStr); err == nil {
-			return t, nil
+			// Convert to UTC to match Arc's partition structure
+			return t.UTC(), nil
 		}
 	}
 
