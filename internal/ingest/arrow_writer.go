@@ -1693,8 +1693,8 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		return fmt.Errorf("failed to group by hour: %w", err)
 	}
 
-	minTime := time.UnixMicro(globalMin)
-	maxTime := time.UnixMicro(globalMax)
+	minTime := time.UnixMicro(globalMin).UTC()
+	maxTime := time.UnixMicro(globalMax).UTC()
 
 	// Log warning if data is significantly old or in the future
 	now := time.Now().UTC()
