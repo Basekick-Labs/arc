@@ -269,10 +269,15 @@ func TestGroupByHourWithMultiKeySort(t *testing.T) {
 		t.Fatalf("groupByHour() got %d buckets, want 2", len(buckets))
 	}
 
-	// Verify hour 10 bucket (2024010110)
-	hour10, exists := buckets["2024010110"]
+	// Calculate hourIDs using the same formula as groupByHour
+	// hourID = timestamp / microPerHour (where microPerHour = 3600_000_000)
+	hour10ID := microTime(2024, 1, 1, 10, 0, 0) / microPerHour
+	hour11ID := microTime(2024, 1, 1, 11, 0, 0) / microPerHour
+
+	// Verify hour 10 bucket
+	hour10, exists := buckets[hour10ID]
 	if !exists {
-		t.Fatalf("groupByHour() missing bucket for hour 2024010110")
+		t.Fatalf("groupByHour() missing bucket for hour 10 (ID=%d)", hour10ID)
 	}
 
 	// Hour 10 should have indices 0, 2, 4 (sensors A, B, C at 10:xx)
@@ -294,10 +299,10 @@ func TestGroupByHourWithMultiKeySort(t *testing.T) {
 		t.Errorf("hour 10 maxTime = %v, want 10:45:00", time.UnixMicro(hour10.maxTime))
 	}
 
-	// Verify hour 11 bucket (2024010111)
-	hour11, exists := buckets["2024010111"]
+	// Verify hour 11 bucket
+	hour11, exists := buckets[hour11ID]
 	if !exists {
-		t.Fatalf("groupByHour() missing bucket for hour 2024010111")
+		t.Fatalf("groupByHour() missing bucket for hour 11 (ID=%d)", hour11ID)
 	}
 
 	// Hour 11 should have indices 1, 3, 5 (sensors A, B, C at 11:xx)

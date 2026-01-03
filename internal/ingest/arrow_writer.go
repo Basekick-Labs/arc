@@ -1765,28 +1765,28 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 
 	// Write one file per hour
 	totalWritten := 0
-	for hourKey, bucket := range hourBuckets {
+	for hourID, bucket := range hourBuckets {
 		// Extract rows for this hour using the index list
 		hourColumns := sliceColumnsByIndices(merged, bucket.indices)
 
 		// Sort this hour's data by configured sort keys
 		sorted, err := sortColumnsByKeys(hourColumns, sortKeys)
 		if err != nil {
-			return fmt.Errorf("failed to sort hour %s by %v: %w", hourKey, sortKeys, err)
+			return fmt.Errorf("failed to sort hour %d by %v: %w", hourID, sortKeys, err)
 		}
 
 		// Write Parquet file for this hour
 		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted)
 		if err != nil {
-			return fmt.Errorf("failed to write Parquet for hour %s: %w", hourKey, err)
+			return fmt.Errorf("failed to write Parquet for hour %d: %w", hourID, err)
 		}
 
-		// Use bucket's minTime for path generation
-		bucketMinTime := time.UnixMicro(bucket.minTime)
-		storagePath := b.generateStoragePath(database, measurement, bucketMinTime)
+		// Use bucket's minTime for path generation (convert hourID to time only here)
+		bucketTime := hourIDToTime(hourID)
+		storagePath := b.generateStoragePath(database, measurement, bucketTime)
 
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
-			return fmt.Errorf("failed to write to storage for hour %s: %w", hourKey, err)
+			return fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err)
 		}
 
 		splitRecordCount := len(bucket.indices)
@@ -1795,7 +1795,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		b.logger.Info().
 			Str("buffer_key", bufferKey).
 			Str("storage_path", storagePath).
-			Str("hour_key", hourKey).
+			Int64("hour_id", hourID).
 			Int("records", splitRecordCount).
 			Int("size_bytes", len(parquetData)).
 			Msg("Wrote hour partition")
@@ -1991,11 +1991,19 @@ func sortColumnsByKeys(columns map[string]interface{}, sortKeys []string) (map[s
 		return nil, fmt.Errorf("no sort keys provided")
 	}
 
-	// Validate all sort keys exist
-	for _, key := range sortKeys {
-		if _, exists := columns[key]; !exists {
+	// FAST PATH: Time-only sort (most common case) - avoid multi-key overhead
+	if len(sortKeys) == 1 && sortKeys[0] == "time" {
+		return sortColumnsByTimeOnly(columns)
+	}
+
+	// Validate all sort keys exist and cache column pointers
+	cachedCols := make([]interface{}, len(sortKeys))
+	for i, key := range sortKeys {
+		col, exists := columns[key]
+		if !exists {
 			return nil, fmt.Errorf("sort key column not found: %s", key)
 		}
+		cachedCols[i] = col
 	}
 
 	// Get first column to determine row count
@@ -2026,9 +2034,9 @@ func sortColumnsByKeys(columns map[string]interface{}, sortKeys []string) (map[s
 		indices[i] = i
 	}
 
-	// Multi-key sort comparator
+	// Multi-key sort with cached columns (no map lookups in comparator)
 	sort.Slice(indices, func(i, j int) bool {
-		return compareMultiKey(columns, sortKeys, indices[i], indices[j])
+		return compareMultiKeyCached(cachedCols, indices[i], indices[j])
 	})
 
 	// Apply permutation to all columns
@@ -2040,12 +2048,48 @@ func sortColumnsByKeys(columns map[string]interface{}, sortKeys []string) (map[s
 	return result, nil
 }
 
-// compareMultiKey compares two rows by multiple sort keys
-// Returns true if row i < row j according to sort keys
-func compareMultiKey(columns map[string]interface{}, sortKeys []string, i, j int) bool {
-	for _, key := range sortKeys {
-		col := columns[key]
+// sortColumnsByTimeOnly is an optimized path for time-only sorting
+// Avoids the multi-key comparator overhead for the common case
+func sortColumnsByTimeOnly(columns map[string]interface{}) (map[string]interface{}, error) {
+	timeCol, exists := columns["time"]
+	if !exists {
+		return nil, fmt.Errorf("time column not found")
+	}
 
+	times, ok := timeCol.([]int64)
+	if !ok {
+		return nil, fmt.Errorf("time column is not []int64")
+	}
+
+	n := len(times)
+	if n == 0 {
+		return columns, nil
+	}
+
+	// Create permutation indices
+	indices := make([]int, n)
+	for i := range indices {
+		indices[i] = i
+	}
+
+	// Sort by time directly (no function call overhead per comparison)
+	sort.Slice(indices, func(i, j int) bool {
+		return times[indices[i]] < times[indices[j]]
+	})
+
+	// Apply permutation to all columns
+	result := make(map[string]interface{}, len(columns))
+	for colName, colData := range columns {
+		result[colName] = applyPermutation(colData, indices)
+	}
+
+	return result, nil
+}
+
+// compareMultiKeyCached compares two rows by multiple sort keys using cached column pointers
+// This avoids map lookups on every comparison (called O(n log n) times)
+func compareMultiKeyCached(cachedCols []interface{}, i, j int) bool {
+	for _, col := range cachedCols {
 		switch c := col.(type) {
 		case []int64:
 			if c[i] < c[j] {
@@ -2122,24 +2166,33 @@ func applyPermutation(colData interface{}, indices []int) interface{} {
 	}
 }
 
+// microPerHour is the number of microseconds in one hour (3600 * 1,000,000)
+const microPerHour = int64(3600_000_000)
+
 // hourBucket represents a collection of row indices belonging to a specific hour
 // Used for hash-based grouping that doesn't require globally sorted data
 type hourBucket struct {
-	hourKey string // YYYYMMDDHH format
-	indices []int  // Row indices belonging to this hour
-	minTime int64  // Minimum timestamp in this hour (microseconds)
-	maxTime int64  // Maximum timestamp in this hour (microseconds)
+	hourID  int64 // Hour identifier (microseconds / microPerHour)
+	indices []int // Row indices belonging to this hour
+	minTime int64 // Minimum timestamp in this hour (microseconds)
+	maxTime int64 // Maximum timestamp in this hour (microseconds)
+}
+
+// hourIDToTime converts an hourID back to a time.Time for path generation
+func hourIDToTime(hourID int64) time.Time {
+	return time.UnixMicro(hourID * microPerHour).UTC()
 }
 
 // groupByHour groups row indices by hour and tracks min/max times
 // Works correctly regardless of whether data is globally sorted by time
-// Returns: map of hourKey -> bucket, global min time, global max time
-func groupByHour(times []int64) (map[string]*hourBucket, int64, int64, error) {
+// Returns: map of hourID -> bucket, global min time, global max time
+// Uses integer division for fast hour extraction (no time.Time allocations)
+func groupByHour(times []int64) (map[int64]*hourBucket, int64, int64, error) {
 	if len(times) == 0 {
 		return nil, 0, 0, fmt.Errorf("empty time column")
 	}
 
-	buckets := make(map[string]*hourBucket)
+	buckets := make(map[int64]*hourBucket)
 	globalMin := times[0]
 	globalMax := times[0]
 
@@ -2153,20 +2206,19 @@ func groupByHour(times []int64) (map[string]*hourBucket, int64, int64, error) {
 			globalMax = t
 		}
 
-		// Determine hour key
-		hourTime := time.UnixMicro(t).UTC()
-		hourKey := hourTime.Format("2006010215") // YYYYMMDDHH
+		// Fast hour extraction using integer division (no time.Time allocation)
+		hourID := t / microPerHour
 
 		// Get or create bucket
-		bucket, exists := buckets[hourKey]
+		bucket, exists := buckets[hourID]
 		if !exists {
 			bucket = &hourBucket{
-				hourKey: hourKey,
+				hourID:  hourID,
 				indices: make([]int, 0, 100), // Pre-allocate some capacity
 				minTime: t,
 				maxTime: t,
 			}
-			buckets[hourKey] = bucket
+			buckets[hourID] = bucket
 		} else {
 			// Update bucket min/max
 			if t < bucket.minTime {
