@@ -27,6 +27,7 @@ type SubprocessJobConfig struct {
 	Tier          string   `json:"tier"`
 	TargetSizeMB  int      `json:"target_size_mb"`
 	TempDirectory string   `json:"temp_directory"`
+	SortKeys      []string `json:"sort_keys"` // Sort keys for ORDER BY in compaction
 
 	// Storage configuration
 	StorageType   string `json:"storage_type"`   // "local" or "s3"
@@ -81,6 +82,7 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 		TargetSizeMB:   config.TargetSizeMB,
 		Tier:           config.Tier,
 		TempDirectory:  config.TempDirectory,
+		SortKeys:       config.SortKeys,
 		Logger:         logger,
 		DB:             db,
 	})

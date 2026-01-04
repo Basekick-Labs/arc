@@ -21,6 +21,23 @@ func escapeSQLPath(path string) string {
 	return strings.ReplaceAll(path, "'", "''")
 }
 
+// buildOrderByClause builds an ORDER BY clause from sort keys.
+// Returns an empty string if no sort keys, or "ORDER BY col1, col2, ..." if sort keys exist.
+// Column names are quoted to handle special characters.
+func buildOrderByClause(sortKeys []string) string {
+	if len(sortKeys) == 0 {
+		return ""
+	}
+
+	var quotedKeys []string
+	for _, key := range sortKeys {
+		// Quote column names to handle special characters and reserved words
+		quotedKeys = append(quotedKeys, fmt.Sprintf(`"%s"`, key))
+	}
+
+	return fmt.Sprintf("ORDER BY %s", strings.Join(quotedKeys, ", "))
+}
+
 // JobStatus represents the status of a compaction job
 type JobStatus string
 
@@ -41,7 +58,8 @@ type Job struct {
 	Database       string
 	TargetSizeMB   int
 	Tier           string
-	TempDirectory  string // Base temp directory for compaction files
+	TempDirectory  string   // Base temp directory for compaction files
+	SortKeys       []string // Sort keys for this measurement (for ORDER BY in compaction)
 
 	// Job metadata
 	JobID       string
@@ -72,7 +90,8 @@ type JobConfig struct {
 	Database       string
 	TargetSizeMB   int
 	Tier           string
-	TempDirectory  string // Base temp directory for compaction files (default: ./data/compaction)
+	TempDirectory  string   // Base temp directory for compaction files (default: ./data/compaction)
+	SortKeys       []string // Sort keys for this measurement (for ORDER BY in compaction)
 	Logger         zerolog.Logger
 	DB             *sql.DB // Shared DuckDB connection (avoids memory retention from temp connections)
 }
@@ -93,6 +112,12 @@ func NewJob(cfg *JobConfig) *Job {
 		tempDir = "./data/compaction"
 	}
 
+	// Use default sort keys if not provided
+	sortKeys := cfg.SortKeys
+	if sortKeys == nil {
+		sortKeys = []string{"time"} // Default to time-only sorting
+	}
+
 	return &Job{
 		Measurement:    cfg.Measurement,
 		PartitionPath:  cfg.PartitionPath,
@@ -102,6 +127,7 @@ func NewJob(cfg *JobConfig) *Job {
 		TargetSizeMB:   cfg.TargetSizeMB,
 		Tier:           cfg.Tier,
 		TempDirectory:  tempDir,
+		SortKeys:       sortKeys,
 		JobID:          jobID,
 		Status:         JobStatusPending,
 		logger:         cfg.Logger.With().Str("job_id", jobID).Logger(),
@@ -385,19 +411,25 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 		fileListSQL += "]"
 	}
 
+	// Build ORDER BY clause from sort keys
+	// This ensures compacted files maintain the same sort order as ingested files
+	orderByClause := buildOrderByClause(j.SortKeys)
+
 	// Execute compaction query
 	// Uses union_by_name=true to handle schema evolution
+	// Sorts by configured keys to maintain compression benefits
 	escapedOutputFile := escapeSQLPath(outputFile)
 	query := fmt.Sprintf(`
 		COPY (
 			SELECT * FROM read_parquet(%s, union_by_name=true)
+			%s
 		) TO '%s' (
 			FORMAT PARQUET,
 			COMPRESSION ZSTD,
 			COMPRESSION_LEVEL 3,
 			ROW_GROUP_SIZE 122880
 		)
-	`, fileListSQL, escapedOutputFile)
+	`, fileListSQL, orderByClause, escapedOutputFile)
 
 	_, err := db.ExecContext(ctx, query)
 	if err != nil {
@@ -532,6 +564,7 @@ func (j *Job) Stats() map[string]interface{} {
 		"bytes_after":      j.BytesAfter,
 		"duration_seconds": j.DurationSeconds,
 		"tier":             j.Tier,
+		"sort_keys":        j.SortKeys,
 	}
 
 	if j.BytesBefore > 0 {

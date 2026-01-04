@@ -208,7 +208,7 @@ func parseLogLine(line string) LogEntry {
 		end := strings.Index(line[start:], `"`)
 		if end > 0 {
 			if t, err := time.Parse(time.RFC3339, line[start:start+end]); err == nil {
-				entry.Timestamp = t
+				entry.Timestamp = t.UTC()
 			}
 		}
 	}
