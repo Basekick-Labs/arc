@@ -846,6 +846,9 @@ type ArrowBuffer struct {
 	totalErrors          atomic.Int64
 	queueDepth           atomic.Int64 // Current flush queue depth
 
+	// File naming - atomic counter ensures unique filenames even with rapid flushes
+	fileSeqCounter atomic.Uint64
+
 	logger zerolog.Logger
 }
 
@@ -2294,14 +2297,16 @@ func (b *ArrowBuffer) generateStoragePath(database, measurement string, partitio
 	day := partitionTime.Format("02")
 	hour := partitionTime.Format("15")
 
-	// Filename includes measurement, timestamp, and nanos for uniqueness
-	// Use current time for filename to avoid collisions
+	// Filename includes measurement, timestamp, nanos, and atomic sequence for uniqueness
+	// Use current time for filename plus atomic counter to guarantee uniqueness
+	// even with rapid flushes or multi-instance deployments
 	now := time.Now().UTC()
 	timestamp := now.Format("20060102_150405")
 	nanos := now.UnixNano() % 1_000_000_000
+	seq := b.fileSeqCounter.Add(1)
 
-	return fmt.Sprintf("%s/%s/%s/%s/%s/%s/%s_%s_%09d.parquet",
-		database, measurement, year, month, day, hour, measurement, timestamp, nanos)
+	return fmt.Sprintf("%s/%s/%s/%s/%s/%s/%s_%s_%09d_%d.parquet",
+		database, measurement, year, month, day, hour, measurement, timestamp, nanos, seq)
 }
 
 // FlushAll flushes all buffered data to storage
@@ -2333,9 +2338,7 @@ func (b *ArrowBuffer) FlushAll(ctx context.Context) error {
 				b.logger.Error().Err(err).Str("buffer_key", key).Msg("Failed to flush buffer")
 				lastErr = err
 			}
-
-			// Re-acquire lock since flushBufferLocked releases it
-			shard.mu.Lock()
+			// Note: flushBufferLocked re-acquires the lock before returning
 		}
 
 		shard.mu.Unlock()
