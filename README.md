@@ -63,6 +63,7 @@ Benchmarked on Apple MacBook Pro M3 Max (14 cores, 36GB RAM, 1TB NVMe).
 | Protocol | Throughput | p50 Latency | p99 Latency |
 |----------|------------|-------------|-------------|
 | MessagePack Columnar | **10.05M rec/s** | 3.08ms | 7.08ms |
+| MessagePack + Zstd | 9.57M rec/s | 3.13ms | 8.06ms |
 | MessagePack + GZIP | 8.85M rec/s | 3.30ms | 9.32ms |
 | Line Protocol | 1.99M rec/s | 48.19ms | 100.32ms |
 
@@ -74,14 +75,6 @@ Benchmarked on Apple MacBook Pro M3 Max (14 cores, 36GB RAM, 1TB NVMe).
 | JSON | 2.0M rows/s | 25.0 MB |
 
 Full table scan: **927M rows/s** (596M records in 685ms)
-
-### vs Python Implementation
-
-| Metric | Go | Python | Improvement |
-|--------|-----|--------|-------------|
-| Ingestion | 10.1M rec/s | 4.21M rec/s | **140% faster** |
-| Memory | Stable | 372MB leak/500 queries | **No leaks** |
-| Deployment | Single binary | Multi-worker processes | **Simpler** |
 
 ---
 

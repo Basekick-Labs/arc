@@ -10,6 +10,7 @@ import (
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/gofiber/fiber/v2"
 	"github.com/klauspost/compress/gzip"
+	"github.com/klauspost/compress/zstd"
 	"github.com/rs/zerolog"
 )
 
@@ -27,6 +28,12 @@ var decompressBufferPool = sync.Pool{
 // klauspost gzip.Reader has ~32KB internal state that can be reused via Reset()
 var gzipReaderPool = sync.Pool{
 	// No New func - we create readers on-demand since gzip.NewReader requires valid data
+}
+
+// Pool for zstd decoders - zstd.Decoder is thread-safe and reusable
+// klauspost zstd is 3-5x faster than gzip for decompression
+var zstdDecoderPool = sync.Pool{
+	// No New func - we create decoders on-demand
 }
 
 // PooledBuffer wraps a decompression buffer that must be returned to pool after use
@@ -92,12 +99,36 @@ func (h *MsgPackHandler) writeMsgPack(c *fiber.Ctx) error {
 		})
 	}
 
-	// Handle gzip decompression using pooled readers
+	// Handle compression using pooled readers
 	// We use c.Request().Body() above to get raw bytes and decompress ourselves
 	// This avoids fasthttp's non-pooled gunzipData which causes high tail latency
+	// Supported: gzip (0x1f 0x8b) and zstd (0x28 0xB5 0x2F 0xFD)
 	var pooledBuf *PooledBuffer
-	wasCompressed := len(payload) >= 2 && payload[0] == 0x1f && payload[1] == 0x8b
-	if wasCompressed {
+	var compressionType string
+	isGzip := len(payload) >= 2 && payload[0] == 0x1f && payload[1] == 0x8b
+	isZstd := len(payload) >= 4 && payload[0] == 0x28 && payload[1] == 0xB5 && payload[2] == 0x2F && payload[3] == 0xFD
+
+	if isZstd {
+		compressionType = "zstd"
+		var err error
+		pooledBuf, err = h.decompressZstd(payload)
+		if err != nil {
+			h.logger.Error().Err(err).Msg("Failed to decompress zstd payload")
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": fmt.Sprintf("Invalid zstd compression: %v", err),
+			})
+		}
+		defer pooledBuf.Release()
+
+		compressedSize := len(payload)
+		payload = pooledBuf.Data
+		h.logger.Debug().
+			Int("compressed_size", compressedSize).
+			Int("decompressed_size", len(payload)).
+			Str("compression", "zstd").
+			Msg("Decompressed payload")
+	} else if isGzip {
+		compressionType = "gzip"
 		var err error
 		pooledBuf, err = h.decompressGzip(payload)
 		if err != nil {
@@ -106,8 +137,6 @@ func (h *MsgPackHandler) writeMsgPack(c *fiber.Ctx) error {
 				"error": fmt.Sprintf("Invalid gzip compression: %v", err),
 			})
 		}
-		// CRITICAL: Release pooled buffer after msgpack.Unmarshal completes
-		// msgpack.Unmarshal copies the data it needs, so this is safe
 		defer pooledBuf.Release()
 
 		compressedSize := len(payload)
@@ -115,7 +144,8 @@ func (h *MsgPackHandler) writeMsgPack(c *fiber.Ctx) error {
 		h.logger.Debug().
 			Int("compressed_size", compressedSize).
 			Int("decompressed_size", len(payload)).
-			Msg("Decompressed gzip payload")
+			Str("compression", "gzip").
+			Msg("Decompressed payload")
 	}
 
 	// Decode MessagePack
@@ -142,7 +172,7 @@ func (h *MsgPackHandler) writeMsgPack(c *fiber.Ctx) error {
 	h.logger.Debug().
 		Int("records", recordCount).
 		Str("database", database).
-		Bool("compressed", wasCompressed).
+		Str("compression", compressionType).
 		Msg("Received MessagePack write request")
 
 	// Write to Arrow buffer
@@ -247,6 +277,60 @@ func (h *MsgPackHandler) decompressGzip(data []byte) (*PooledBuffer, error) {
 	}, nil
 }
 
+// decompressZstd decompresses zstd data with size limits
+// Uses sync.Pool for zstd decoder and output buffer to minimize allocations
+// Zstd is 3-5x faster than gzip for decompression
+// ZERO-COPY: Returns a PooledBuffer that caller MUST Release() after use
+func (h *MsgPackHandler) decompressZstd(data []byte) (*PooledBuffer, error) {
+	maxDecompressedSize := h.maxPayloadSize
+
+	// Get pooled zstd decoder or create new one
+	var decoder *zstd.Decoder
+	var err error
+	if pooled := zstdDecoderPool.Get(); pooled != nil {
+		decoder = pooled.(*zstd.Decoder)
+	} else {
+		// No decoder in pool, create new one with memory limit
+		decoder, err = zstd.NewReader(nil, zstd.WithDecoderMaxMemory(uint64(maxDecompressedSize)+1024))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
+		}
+	}
+
+	// Get output buffer from pool
+	bufPtr := decompressBufferPool.Get().(*[]byte)
+	buf := (*bufPtr)[:0] // Reset length but keep capacity (256KB)
+
+	// Decompress directly into pooled buffer
+	// zstd.Decoder.DecodeAll is very fast and handles buffer growth internally
+	buf, err = decoder.DecodeAll(data, buf)
+	if err != nil {
+		zstdDecoderPool.Put(decoder)
+		*bufPtr = (*bufPtr)[:0]
+		decompressBufferPool.Put(bufPtr)
+		return nil, fmt.Errorf("failed to decompress zstd: %w", err)
+	}
+
+	// Return decoder to pool
+	zstdDecoderPool.Put(decoder)
+
+	// Check size limit
+	if int64(len(buf)) > maxDecompressedSize {
+		*bufPtr = (*bufPtr)[:0]
+		decompressBufferPool.Put(bufPtr)
+		return nil, fmt.Errorf("decompressed payload exceeds %s limit", formatBytes(maxDecompressedSize))
+	}
+
+	// Update the pooled buffer pointer with potentially grown buffer
+	*bufPtr = buf
+
+	// ZERO-COPY: Return pooled buffer directly - caller MUST call Release()
+	return &PooledBuffer{
+		Data:   buf,
+		bufPtr: bufPtr,
+	}, nil
+}
+
 // msgPackStats returns MessagePack decoder statistics
 func (h *MsgPackHandler) msgPackStats(c *fiber.Ctx) error {
 	decoderStats := h.decoder.GetStats()
@@ -265,7 +349,7 @@ func (h *MsgPackHandler) msgPackSpec(c *fiber.Ctx) error {
 		"protocol":     "MessagePack",
 		"endpoint":     "/api/v1/write/msgpack",
 		"content_type": "application/msgpack",
-		"compression":  "gzip (optional)",
+		"compression":  "gzip or zstd (optional, zstd recommended for best performance)",
 		"authentication": fiber.Map{
 			"header": "x-api-key",
 			"note":   "Authentication not yet implemented",
