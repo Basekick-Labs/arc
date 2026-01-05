@@ -250,3 +250,11 @@ Arc is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
 - If you modify Arc and run it as a service, you must share your changes under AGPL-3.0
 
 For commercial licensing, contact: **enterprise@basekick.net**
+
+---
+
+## Contributors
+
+Thanks to everyone who has contributed to Arc:
+
+- [@schotime](https://github.com/schotime) (Adam Schroder) - Data-time partitioning, compaction API triggers, UTC fixes
