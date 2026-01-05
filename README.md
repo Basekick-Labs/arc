@@ -116,23 +116,23 @@ docker run -d \
 ### Debian/Ubuntu
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v25.12.1/arc_25.12.1_amd64.deb
-sudo dpkg -i arc_25.12.1_amd64.deb
+wget https://github.com/basekick-labs/arc/releases/download/v26.01.1/arc_26.01.1_amd64.deb
+sudo dpkg -i arc_26.01.1_amd64.deb
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
 ### RHEL/Fedora
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v25.12.1/arc-25.12.1-1.x86_64.rpm
-sudo rpm -i arc-25.12.1-1.x86_64.rpm
+wget https://github.com/basekick-labs/arc/releases/download/v26.01.1/arc-26.01.1-1.x86_64.rpm
+sudo rpm -i arc-26.01.1-1.x86_64.rpm
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
 ### Kubernetes (Helm)
 
 ```bash
-helm install arc https://github.com/basekick-labs/arc/releases/download/v25.12.1/arc-25.12.1.tgz
+helm install arc https://github.com/basekick-labs/arc/releases/download/v26.01.1/arc-26.01.1.tgz
 ```
 
 ### Build from Source
