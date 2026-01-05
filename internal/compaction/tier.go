@@ -131,3 +131,49 @@ func (t *BaseTier) IsCompactedFile(tierName, filename string) bool {
 	suffix := fmt.Sprintf("_%s.parquet", tierName)
 	return len(filename) >= len(suffix) && filename[len(filename)-len(suffix):] == suffix
 }
+
+// ShouldCompactByFileSuffix determines if compaction is needed based on file classification.
+// This is a shared helper that implements the common compaction decision logic:
+//   - compactedSuffix: suffix for files already compacted at this tier (e.g., "_compacted.parquet")
+//   - isUncompactedInput: function to determine if a file is valid uncompacted input for this tier
+//
+// Returns true if:
+//   - No compacted files exist AND enough uncompacted input files are present
+//   - Compacted files exist AND enough new uncompacted input files have accumulated
+func (t *BaseTier) ShouldCompactByFileSuffix(
+	files []string,
+	compactedSuffix string,
+	isUncompactedInput func(string) bool,
+) bool {
+	if len(files) < t.MinFiles {
+		return false
+	}
+
+	var compactedFiles, uncompactedFiles []string
+	for _, f := range files {
+		if len(f) >= len(compactedSuffix) && f[len(f)-len(compactedSuffix):] == compactedSuffix {
+			compactedFiles = append(compactedFiles, f)
+		} else if isUncompactedInput(f) {
+			uncompactedFiles = append(uncompactedFiles, f)
+		}
+	}
+
+	// Case 1: No compacted files yet, and enough uncompacted files
+	if len(compactedFiles) == 0 && len(uncompactedFiles) >= t.MinFiles {
+		t.Logger.Debug().
+			Int("uncompacted_count", len(uncompactedFiles)).
+			Msg("First time compaction needed")
+		return true
+	}
+
+	// Case 2: Has compacted files, but many new uncompacted files accumulated
+	if len(compactedFiles) > 0 && len(uncompactedFiles) >= t.MinFiles {
+		t.Logger.Debug().
+			Int("compacted", len(compactedFiles)).
+			Int("uncompacted", len(uncompactedFiles)).
+			Msg("Re-compaction needed")
+		return true
+	}
+
+	return false
+}

@@ -126,8 +126,21 @@ max_buffer_size = 50000
 # Default: 5000 (5 seconds)
 max_buffer_age_ms = 5000
 
+# DATA PARTITIONING (Always Active):
+#   - Data is automatically partitioned by hour using the data's timestamp
+#   - Files are organized as: database/measurement/YYYY/MM/DD/HH/file.parquet
+#   - Sort keys are applied WITHIN each hourly partition
+#   - This enables efficient time-range queries via partition pruning
+#
+# TIMESTAMP HANDLING:
+#   - If incoming data lacks a "time" column, UTC timestamps are auto-generated
+#   - A warning is logged when timestamps are auto-generated
+#
 # Secondary sort keys for improved compression and query performance
-# Format: "measurement:column1,column2,time"
+# Format: "measurement:column1,column2"
+#
+# NOTE: The "time" column is ALWAYS appended automatically to sort keys.
+# You only need to specify ADDITIONAL columns to sort by before time.
 #
 # BENEFITS:
 #   - 30-50% smaller files (better compression when similar values grouped)
@@ -135,18 +148,18 @@ max_buffer_age_ms = 5000
 #   - Enables dictionary encoding and RLE compression to work optimally
 #
 # EXAMPLES:
-#   IoT sensors: sort by sensor_id first, then time
-#     sort_keys = ["temperature:tag_sensor_id,time", "humidity:tag_sensor_id,time"]
+#   IoT sensors: sort by sensor_id, then time (automatic)
+#     sort_keys = ["temperature:tag_sensor_id", "humidity:tag_sensor_id"]
 #
-#   Multi-tenant: sort by tenant, service, then time
-#     sort_keys = ["metrics:tag_tenant_id,tag_service,time"]
+#   Multi-tenant: sort by tenant, service, then time (automatic)
+#     sort_keys = ["metrics:tag_tenant_id,tag_service"]
 #
-#   Infrastructure: sort by host, metric name, then time
-#     sort_keys = ["cpu:tag_host,tag_metric,time", "memory:tag_host,tag_metric,time"]
+#   Infrastructure: sort by host, metric name, then time (automatic)
+#     sort_keys = ["cpu:tag_host,tag_metric", "memory:tag_host,tag_metric"]
 #
 # HOW IT WORKS:
-#   - Data within each Parquet file is sorted by these columns in order
-#   - Groups all data for same sensor/host/tenant together
+#   - Data within each hourly Parquet file is sorted by these columns
+#   - Groups all data for same sensor/host/tenant together within each hour
 #   - Dramatically improves compression (similar values adjacent)
 #   - Faster queries with WHERE clauses on sort key columns
 #
@@ -154,24 +167,24 @@ max_buffer_age_ms = 5000
 #   - Adds ~35% to sort time (e.g., 7ms → 10ms for 100K records)
 #   - Trade-off: slightly slower writes for much smaller files + faster queries
 #
-# Default: [] (empty, use default_sort_keys for all measurements)
+# Default: [] (time-only sorting for all measurements)
 sort_keys = []
 
-# Default sort keys for measurements not specified in sort_keys
-# Format: comma-separated list of column names
+# Default sort keys for measurements not specified above
+# Format: comma-separated list of additional column names (time is automatic)
 #
 # EXAMPLES:
-#   Time-only (default): "time"
-#   Host then time: "tag_host,time"
-#   Multi-column: "tag_region,tag_host,time"
+#   Time-only (default): ""
+#   Host then time: "tag_host"
+#   Multi-column: "tag_region,tag_host"
 #
-# IMPORTANT:
-#   - Must include "time" column for proper time-based partitioning
+# NOTE:
+#   - Leave empty for time-only sorting (recommended default)
 #   - Columns must exist in the data or flush will fall back to time-only
 #   - Applied to ALL measurements not explicitly configured in sort_keys
 #
-# Default: "time"
-default_sort_keys = "time"
+# Default: "" (time-only sorting)
+default_sort_keys = ""
 
 # -----------------------------------------------------------------------------
 # Compaction Configuration
@@ -238,4 +251,4 @@ enabled = true
 enabled = true
 
 [telemetry]
-enabled = false
+enabled = true

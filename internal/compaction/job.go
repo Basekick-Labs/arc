@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +20,50 @@ import (
 // This prevents SQL injection attacks from malicious filenames containing quotes.
 func escapeSQLPath(path string) string {
 	return strings.ReplaceAll(path, "'", "''")
+}
+
+// validateParquetFile checks if a file is a valid Parquet file by checking magic bytes.
+// This is a lightweight validation that doesn't load the file into memory (unlike DuckDB read_parquet).
+// Parquet files must have "PAR1" magic bytes at both the start and end of the file.
+func validateParquetFile(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+
+	// Get file size
+	stat, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat file: %w", err)
+	}
+
+	// Parquet files need at least 12 bytes (4 byte header + 4 byte footer + 4 byte metadata length)
+	if stat.Size() < 12 {
+		return fmt.Errorf("file too small to be valid parquet (%d bytes)", stat.Size())
+	}
+
+	// Check magic bytes "PAR1" at start
+	magic := make([]byte, 4)
+	if _, err := file.Read(magic); err != nil {
+		return fmt.Errorf("failed to read header: %w", err)
+	}
+	if string(magic) != "PAR1" {
+		return fmt.Errorf("invalid parquet magic header: got %q", magic)
+	}
+
+	// Check magic bytes "PAR1" at end
+	if _, err := file.Seek(-4, io.SeekEnd); err != nil {
+		return fmt.Errorf("failed to seek to footer: %w", err)
+	}
+	if _, err := file.Read(magic); err != nil {
+		return fmt.Errorf("failed to read footer: %w", err)
+	}
+	if string(magic) != "PAR1" {
+		return fmt.Errorf("invalid parquet magic footer: got %q", magic)
+	}
+
+	return nil
 }
 
 // buildOrderByClause builds an ORDER BY clause from sort keys.
@@ -174,6 +219,11 @@ func (j *Job) Run(ctx context.Context) error {
 
 	// Compact using DuckDB - this will set j.compactedFiles with only the valid files
 	compactedFile, err := j.compactFiles(ctx, downloadedFiles, tempDir)
+
+	// MEMORY OPTIMIZATION: Clear downloadedFiles slice after compaction.
+	// This allows GC to reclaim memory from the file metadata before upload/delete phases.
+	downloadedFiles = nil
+
 	if err != nil {
 		return j.fail(fmt.Errorf("failed to compact files: %w", err))
 	}
@@ -373,13 +423,13 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	}
 
 	// Validate each file first and track which ones are valid
+	// MEMORY OPTIMIZATION: Use lightweight parquet magic byte check instead of DuckDB read_parquet().
+	// DuckDB's read_parquet() loads the entire file into memory for validation, which causes
+	// massive memory consumption when validating hundreds of files. Magic byte check only reads 8 bytes.
 	var validLocalPaths []string
 	var validStorageKeys []string
 	for _, df := range files {
-		// Escape file path to prevent SQL injection from malicious filenames
-		escapedPath := escapeSQLPath(df.localPath)
-		_, err := db.ExecContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM read_parquet('%s')", escapedPath))
-		if err != nil {
+		if err := validateParquetFile(df.localPath); err != nil {
 			j.logger.Error().Err(err).Str("file", filepath.Base(df.localPath)).Msg("Skipping corrupted file")
 			continue
 		}

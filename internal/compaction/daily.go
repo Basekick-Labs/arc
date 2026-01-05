@@ -116,57 +116,18 @@ func (t *DailyTier) FindCandidates(ctx context.Context, database, measurement st
 }
 
 // ShouldCompact determines if a day partition should be compacted
+// Daily tier compacts hourly files (7 path parts) into daily files (6 path parts)
 func (t *DailyTier) ShouldCompact(files []string, partitionTime time.Time) bool {
-	if len(files) < t.MinFiles {
-		t.Logger.Debug().
-			Int("file_count", len(files)).
-			Int("min_files", t.MinFiles).
-			Msg("Skipping daily compaction: not enough files")
-		return false
-	}
-
-	// Separate daily-compacted files from hourly-compacted files
-	// Use path depth to distinguish:
-	// - Daily files: database/measurement/year/month/day/file.parquet (6 parts)
-	// - Hourly files: database/measurement/year/month/day/hour/file.parquet (7 parts)
-	var dailyCompactedFiles, hourlyCompactedFiles []string
-
-	for _, f := range files {
-		parts := strings.Split(f, "/")
-		if len(parts) == 6 {
-			// Day-level file = daily compacted file
-			dailyCompactedFiles = append(dailyCompactedFiles, f)
-		} else if len(parts) == 7 {
-			// Hour-level file = hourly-compacted file
-			hourlyCompactedFiles = append(hourlyCompactedFiles, f)
-		}
-		// Skip files that don't match expected structure
-	}
-
-	// Case 1: No daily compacted file yet, and has enough hourly-compacted files
-	if len(dailyCompactedFiles) == 0 && len(hourlyCompactedFiles) >= t.MinFiles {
-		t.Logger.Debug().
-			Int("hourly_compacted_files", len(hourlyCompactedFiles)).
-			Msg("First time daily compaction needed")
-		return true
-	}
-
-	// Case 2: Has daily compacted file, but many new hourly-compacted files accumulated
-	if len(dailyCompactedFiles) > 0 && len(hourlyCompactedFiles) >= t.MinFiles {
-		t.Logger.Debug().
-			Int("daily_files", len(dailyCompactedFiles)).
-			Int("hourly_compacted_files", len(hourlyCompactedFiles)).
-			Msg("Daily re-compaction needed")
-		return true
-	}
-
-	t.Logger.Debug().
-		Int("daily_files", len(dailyCompactedFiles)).
-		Int("hourly_compacted_files", len(hourlyCompactedFiles)).
-		Int("min_files", t.MinFiles).
-		Msg("Skipping daily compaction: not enough hourly-compacted files")
-
-	return false
+	return t.ShouldCompactByFileSuffix(
+		files,
+		"_daily.parquet",
+		func(f string) bool {
+			// Hourly files have 7 path parts: database/measurement/year/month/day/hour/file.parquet
+			// These are valid input for daily compaction
+			parts := strings.Split(f, "/")
+			return len(parts) == 7
+		},
+	)
 }
 
 // GetCompactedFilename generates the filename for a compacted file

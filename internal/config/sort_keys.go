@@ -6,10 +6,15 @@ import (
 )
 
 // ParseSortKeys parses sort key configuration from IngestConfig.
-// Format: ["measurement:col1,col2,time", ...]
+// Format: ["measurement:col1,col2", ...]
+//
+// Users only configure ADDITIONAL sort columns - the "time" column is always
+// appended automatically at the usage site (getSortKeys in arrow_writer.go).
+// This simplifies configuration: users don't need to remember to include "time".
+//
 // Returns:
 //   - map[measurement][]sortKeys: Per-measurement sort key configuration
-//   - []string: Default sort keys to use for measurements not in the map
+//   - []string: Default sort keys (additional columns before time)
 //   - error: If configuration is invalid
 func ParseSortKeys(cfg IngestConfig) (map[string][]string, []string, error) {
 	// Parse measurement-specific sort keys
@@ -43,20 +48,23 @@ func ParseSortKeys(cfg IngestConfig) (map[string][]string, []string, error) {
 		sortKeysMap[measurement] = parsedKeys
 	}
 
-	// Parse default sort keys
-	defaultKeys := strings.Split(cfg.DefaultSortKeys, ",")
-	parsedDefaultKeys := make([]string, 0, len(defaultKeys))
-	for _, key := range defaultKeys {
-		key = strings.TrimSpace(key)
-		if key != "" {
-			parsedDefaultKeys = append(parsedDefaultKeys, key)
+	// Parse default sort keys (additional columns before time)
+	// Empty string means time-only sorting (no additional columns)
+	var parsedDefaultKeys []string
+	if cfg.DefaultSortKeys != "" {
+		defaultKeys := strings.Split(cfg.DefaultSortKeys, ",")
+		parsedDefaultKeys = make([]string, 0, len(defaultKeys))
+		for _, key := range defaultKeys {
+			key = strings.TrimSpace(key)
+			if key != "" {
+				parsedDefaultKeys = append(parsedDefaultKeys, key)
+			}
 		}
 	}
 
-	// Fall back to time if default is empty
-	if len(parsedDefaultKeys) == 0 {
-		parsedDefaultKeys = []string{"time"}
-	}
+	// Note: We intentionally don't add "time" here.
+	// The "time" column is always appended at the usage site (getSortKeys).
+	// Empty parsedDefaultKeys means "time-only sorting".
 
 	return sortKeysMap, parsedDefaultKeys, nil
 }

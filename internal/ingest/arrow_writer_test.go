@@ -357,6 +357,26 @@ func TestRowsToColumnar_DifferentFieldTypes(t *testing.T) {
 	}
 }
 
+// BenchmarkGetColumnSignature benchmarks the column signature function
+func BenchmarkGetColumnSignature(b *testing.B) {
+	// Typical columnar payload columns
+	columns := map[string]interface{}{
+		"time":        nil,
+		"host":        nil,
+		"region":      nil,
+		"datacenter":  nil,
+		"usage_idle":  nil,
+		"usage_user":  nil,
+		"usage_system": nil,
+		"usage_iowait": nil,
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		getColumnSignature(columns)
+	}
+}
+
 func TestGetColumnSignature(t *testing.T) {
 	tests := []struct {
 		name     string
