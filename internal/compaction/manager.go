@@ -337,7 +337,15 @@ func (m *Manager) RunCompactionCycleForTiers(ctx context.Context, tierNames []st
 			continue
 		}
 
-		var tierCandidates []Candidate
+		// MEMORY OPTIMIZATION: Process candidates as they're found instead of accumulating all.
+		// This prevents unbounded memory growth when there are millions of files.
+		// Each measurement's candidates are processed and then eligible for GC.
+		sem := make(chan struct{}, m.MaxConcurrent)
+		var wg sync.WaitGroup
+		var tierCandidateCount int
+		var errCount int
+		var errMu sync.Mutex
+
 		for _, database := range databases {
 			measurements, err := m.listMeasurements(ctx, database)
 			if err != nil {
@@ -349,6 +357,18 @@ func (m *Manager) RunCompactionCycleForTiers(ctx context.Context, tierNames []st
 			}
 
 			for _, meas := range measurements {
+				// Check for cancellation between measurements
+				select {
+				case <-ctx.Done():
+					m.logger.Info().
+						Int64("cycle_id", cycleID).
+						Str("tier", tierName).
+						Msg("Tier processing cancelled")
+					wg.Wait()
+					return cycleID, ctx.Err()
+				default:
+				}
+
 				candidates, err := tier.FindCandidates(ctx, database, meas)
 				if err != nil {
 					m.logger.Error().Err(err).
@@ -358,11 +378,38 @@ func (m *Manager) RunCompactionCycleForTiers(ctx context.Context, tierNames []st
 						Msg("Failed to find candidates")
 					continue
 				}
-				tierCandidates = append(tierCandidates, candidates...)
+
+				// Process this measurement's candidates immediately
+				for _, candidate := range candidates {
+					tierCandidateCount++
+
+					wg.Add(1)
+					sem <- struct{}{} // Acquire semaphore
+
+					go func(c Candidate) {
+						defer wg.Done()
+						defer func() { <-sem }() // Release semaphore
+
+						if err := m.CompactPartition(ctx, c); err != nil {
+							m.logger.Error().Err(err).
+								Str("partition", c.PartitionPath).
+								Str("tier", tierName).
+								Int64("cycle_id", cycleID).
+								Msg("Compaction failed")
+							errMu.Lock()
+							errCount++
+							errMu.Unlock()
+						}
+					}(candidate)
+				}
+				// candidates slice is now eligible for GC after this iteration
 			}
 		}
 
-		if len(tierCandidates) == 0 {
+		// Wait for all jobs in this tier to complete before moving to next tier
+		wg.Wait()
+
+		if tierCandidateCount == 0 {
 			m.logger.Info().
 				Int64("cycle_id", cycleID).
 				Str("tier", tierName).
@@ -370,61 +417,14 @@ func (m *Manager) RunCompactionCycleForTiers(ctx context.Context, tierNames []st
 			continue
 		}
 
-		m.logger.Info().
-			Int64("cycle_id", cycleID).
-			Str("tier", tierName).
-			Int("candidates", len(tierCandidates)).
-			Msg("Found candidates for tier")
-
-		// Process tier candidates with concurrency limit
-		sem := make(chan struct{}, m.MaxConcurrent)
-		var wg sync.WaitGroup
-		var errCount int
-		var errMu sync.Mutex
-
-		for _, candidate := range tierCandidates {
-			select {
-			case <-ctx.Done():
-				m.logger.Info().
-					Int64("cycle_id", cycleID).
-					Str("tier", tierName).
-					Msg("Tier processing cancelled")
-				wg.Wait() // Wait for running jobs
-				return cycleID, ctx.Err()
-			default:
-			}
-
-			wg.Add(1)
-			sem <- struct{}{} // Acquire semaphore
-
-			go func(c Candidate) {
-				defer wg.Done()
-				defer func() { <-sem }() // Release semaphore
-
-				if err := m.CompactPartition(ctx, c); err != nil {
-					m.logger.Error().Err(err).
-						Str("partition", c.PartitionPath).
-						Str("tier", tierName).
-						Int64("cycle_id", cycleID).
-						Msg("Compaction failed")
-					errMu.Lock()
-					errCount++
-					errMu.Unlock()
-				}
-			}(candidate)
-		}
-
-		// Wait for all jobs in this tier to complete before moving to next tier
-		wg.Wait()
-
-		totalCandidates += len(tierCandidates)
+		totalCandidates += tierCandidateCount
 		totalErrors += errCount
 
 		m.logger.Info().
 			Int64("cycle_id", cycleID).
 			Str("tier", tierName).
-			Int("total", len(tierCandidates)).
-			Int("succeeded", len(tierCandidates)-errCount).
+			Int("total", tierCandidateCount).
+			Int("succeeded", tierCandidateCount-errCount).
 			Int("failed", errCount).
 			Msg("Tier processing complete")
 	}
@@ -451,7 +451,26 @@ func (m *Manager) GetCurrentCycleID() int64 {
 
 // listDatabases discovers all databases in storage
 func (m *Manager) listDatabases(ctx context.Context) ([]string, error) {
-	// List all top-level objects
+	// MEMORY OPTIMIZATION: Use ListDirectories instead of List to avoid loading all file paths.
+	// ListDirectories only reads top-level directory entries, not all files recursively.
+	// This reduces memory from O(millions of files) to O(number of databases).
+	if dirLister, ok := m.StorageBackend.(storage.DirectoryLister); ok {
+		dirs, err := dirLister.ListDirectories(ctx, "")
+		if err != nil {
+			return nil, err
+		}
+
+		// Filter out hidden directories and special directories
+		databases := make([]string, 0, len(dirs))
+		for _, dir := range dirs {
+			if dir != "" && !strings.HasPrefix(dir, ".") && dir != "compaction" {
+				databases = append(databases, dir)
+			}
+		}
+		return databases, nil
+	}
+
+	// Fallback for backends that don't implement DirectoryLister
 	objects, err := m.StorageBackend.List(ctx, "")
 	if err != nil {
 		return nil, err
@@ -482,7 +501,24 @@ func (m *Manager) listDatabases(ctx context.Context) ([]string, error) {
 
 // listMeasurements lists all measurements in storage for a given database
 func (m *Manager) listMeasurements(ctx context.Context, database string) ([]string, error) {
-	// List from the database prefix
+	// MEMORY OPTIMIZATION: Use ListDirectories instead of List to avoid loading all file paths.
+	// ListDirectories only reads directory entries at one level, not all files recursively.
+	// This reduces memory from O(files in database) to O(number of measurements).
+	if dirLister, ok := m.StorageBackend.(storage.DirectoryLister); ok {
+		measurements, err := dirLister.ListDirectories(ctx, database+"/")
+		if err != nil {
+			return nil, err
+		}
+
+		m.logger.Debug().
+			Str("database", database).
+			Strs("measurements", measurements).
+			Msg("Found measurements")
+
+		return measurements, nil
+	}
+
+	// Fallback for backends that don't implement DirectoryLister
 	prefix := database + "/"
 	objects, err := m.StorageBackend.List(ctx, prefix)
 	if err != nil {

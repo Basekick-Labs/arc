@@ -28,6 +28,18 @@ const (
 	flushTypeSync  = "sync"
 )
 
+// getFlushMessageType returns the human-readable flush type message for logging
+func getFlushMessageType(flushType string) string {
+	switch flushType {
+	case flushTypeAsync:
+		return "Async flush"
+	case flushTypeSync:
+		return "Periodic flush"
+	default:
+		return flushType + " flush"
+	}
+}
+
 // schemaCacheEntry holds a cached schema with LRU tracking
 type schemaCacheEntry struct {
 	schema     *arrow.Schema
@@ -873,7 +885,9 @@ func (b *ArrowBuffer) getShard(bufferKey string) *bufferShard {
 	return b.shards[hash%b.shardCount]
 }
 
-// getSortKeys returns sort keys for a measurement, ensuring "time" is always included
+// getSortKeys returns sort keys for a measurement.
+// Users configure ADDITIONAL sort columns - "time" is always appended automatically.
+// This ensures data is always sorted by time within each partition.
 func (b *ArrowBuffer) getSortKeys(measurement string) []string {
 	var keys []string
 
@@ -885,24 +899,16 @@ func (b *ArrowBuffer) getSortKeys(measurement string) []string {
 		keys = b.defaultSortKeys
 	}
 
-	// Ensure "time" is always in the sort keys
-	hasTime := false
-	for _, key := range keys {
-		if key == "time" {
-			hasTime = true
-			break
+	// Always ensure "time" is the last sort key
+	// Skip adding if already present (backwards compatibility with legacy configs)
+	for _, k := range keys {
+		if k == "time" {
+			return keys
 		}
 	}
 
-	if !hasTime && len(keys) > 0 {
-		keys = append([]string{}, keys...)
-		keys = append(keys, "time")
-	} else if len(keys) == 0 {
-		// Default to time-only
-		keys = []string{"time"}
-	}
-
-	return keys
+	// Append "time" - users configure ADDITIONAL sort keys only
+	return append(keys, "time")
 }
 
 // NewArrowBuffer creates a new Arrow buffer with automatic flushing
@@ -1118,8 +1124,8 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 		return fmt.Errorf("expected []interface{}, got %T", records)
 	}
 
-	// Group row records by measurement for efficient batch conversion
-	rowRecordsByMeasurement := make(map[string][]*models.Record)
+	// OPTIMIZATION: Lazy initialization - avoid map allocation for pure columnar writes (common path)
+	var rowRecordsByMeasurement map[string][]*models.Record
 
 	for _, record := range recordList {
 		switch r := record.(type) {
@@ -1130,6 +1136,10 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 				return err
 			}
 		case *models.Record:
+			// Lazy init: only allocate map when we actually have row records
+			if rowRecordsByMeasurement == nil {
+				rowRecordsByMeasurement = make(map[string][]*models.Record)
+			}
 			// Group row records by measurement for batch conversion
 			rowRecordsByMeasurement[r.Measurement] = append(rowRecordsByMeasurement[r.Measurement], r)
 		default:
@@ -1164,7 +1174,8 @@ func (b *ArrowBuffer) WriteColumnarDirect(ctx context.Context, database, measure
 // writeColumnar writes a columnar record to the buffer
 func (b *ArrowBuffer) writeColumnar(ctx context.Context, database string, record *models.ColumnarRecord) error {
 	// Create buffer key: database/measurement
-	bufferKey := fmt.Sprintf("%s/%s", database, record.Measurement)
+	// OPTIMIZATION: String concatenation is faster than fmt.Sprintf (no reflection)
+	bufferKey := database + "/" + record.Measurement
 
 	// WAL: Write to WAL before buffering (if enabled)
 	// This ensures data survives crashes even if not yet flushed to Parquet
@@ -1736,13 +1747,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		b.totalFlushes.Add(1)
 
 		flushDuration := time.Since(startTime)
-		msgType := flushType + " flush"
-		switch flushType {
-		case flushTypeAsync:
-			msgType = "Async flush"
-		case flushTypeSync:
-			msgType = "Periodic flush"
-		}
+		msgType := getFlushMessageType(flushType)
 
 		b.logger.Info().
 			Str("buffer_key", bufferKey).
@@ -1805,13 +1810,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	b.totalFlushes.Add(int64(len(hourBuckets)))
 
 	flushDuration := time.Since(startTime)
-	msgType := flushType + " flush"
-	switch flushType {
-	case flushTypeAsync:
-		msgType = "Async flush"
-	case flushTypeSync:
-		msgType = "Periodic flush"
-	}
+	msgType := getFlushMessageType(flushType)
 
 	b.logger.Info().
 		Str("buffer_key", bufferKey).
@@ -1828,6 +1827,10 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard, bufferKey, database, measurement string) error {
 	batches, exists := shard.buffers[bufferKey]
 	if !exists || len(batches) == 0 {
+		// Clean up stale tracking entries even if buffer is empty
+		delete(shard.bufferStartTimes, bufferKey)
+		delete(shard.bufferRecordCounts, bufferKey)
+		delete(shard.bufferSchemas, bufferKey)
 		return nil
 	}
 

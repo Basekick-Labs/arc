@@ -211,7 +211,12 @@ func (d *MessagePackDecoder) decodeColumnar(payload *models.MsgPackPayload, rawD
 	// Ensure 'time' column exists
 	timeCol, hasTime := payload.Columns["time"]
 	if !hasTime || timeCol == nil || len(timeCol) == 0 {
-		// Generate timestamps if missing
+		// Generate timestamps if missing - log warning so users know their data lacked timestamps
+		d.logger.Warn().
+			Str("measurement", measurement).
+			Int("row_count", numRecords).
+			Msg("Data missing 'time' column - generating UTC timestamps")
+
 		now := time.Now().UTC()
 		nowMicros := now.UnixMicro()
 		timeCol = make([]interface{}, numRecords)
@@ -243,6 +248,13 @@ func (d *MessagePackDecoder) decodeRow(payload *models.MsgPackPayload) (*models.
 	measurement, err := d.extractMeasurement(payload.M)
 	if err != nil {
 		return nil, err
+	}
+
+	// Log warning if timestamp is missing
+	if payload.T == nil {
+		d.logger.Warn().
+			Str("measurement", measurement).
+			Msg("Row data missing timestamp - generating UTC timestamp")
 	}
 
 	// Extract timestamp

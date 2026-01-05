@@ -117,38 +117,14 @@ func (t *HourlyTier) FindCandidates(ctx context.Context, database, measurement s
 
 // ShouldCompact determines if an hourly partition should be compacted
 func (t *HourlyTier) ShouldCompact(files []string, partitionTime time.Time) bool {
-	if len(files) < t.MinFiles {
-		return false
-	}
-
-	// Separate compacted and uncompacted files
-	var compactedFiles, uncompactedFiles []string
-	for _, f := range files {
-		if strings.Contains(f, "_compacted.parquet") {
-			compactedFiles = append(compactedFiles, f)
-		} else {
-			uncompactedFiles = append(uncompactedFiles, f)
-		}
-	}
-
-	// Case 1: No compacted files yet, and has enough total files
-	if len(compactedFiles) == 0 && len(files) >= t.MinFiles {
-		t.Logger.Debug().
-			Int("file_count", len(files)).
-			Msg("First time compaction needed")
-		return true
-	}
-
-	// Case 2: Has compacted files, but many new uncompacted files accumulated
-	if len(compactedFiles) > 0 && len(uncompactedFiles) >= t.MinFiles {
-		t.Logger.Debug().
-			Int("compacted", len(compactedFiles)).
-			Int("uncompacted", len(uncompactedFiles)).
-			Msg("Re-compaction needed")
-		return true
-	}
-
-	return false
+	return t.ShouldCompactByFileSuffix(
+		files,
+		"_compacted.parquet",
+		func(f string) bool {
+			// All non-compacted files are valid input for hourly compaction
+			return !strings.Contains(f, "_compacted.parquet")
+		},
+	)
 }
 
 // GetCompactedFilename generates the filename for a compacted file

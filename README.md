@@ -1,7 +1,7 @@
 # Arc
 
 [![Ingestion](https://img.shields.io/badge/ingestion-10.1M%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
-[![Query](https://img.shields.io/badge/query-2.88M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
+[![Query](https://img.shields.io/badge/query-5.2M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
 [![Go](https://img.shields.io/badge/go-1.25+-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
@@ -62,15 +62,18 @@ Benchmarked on Apple MacBook Pro M3 Max (14 cores, 36GB RAM, 1TB NVMe).
 
 | Protocol | Throughput | p50 Latency | p99 Latency |
 |----------|------------|-------------|-------------|
-| MessagePack Columnar | **10.1M rec/s** | 3.09ms | 6.73ms |
-| Line Protocol | 1.92M rec/s | 49.53ms | 108.53ms |
+| MessagePack Columnar | **10.05M rec/s** | 3.08ms | 7.08ms |
+| MessagePack + GZIP | 8.85M rec/s | 3.30ms | 9.32ms |
+| Line Protocol | 1.99M rec/s | 48.19ms | 100.32ms |
 
 ### Query
 
-| Format | Throughput | Response Size (50K rows) |
-|--------|------------|--------------------------|
-| Arrow IPC | **2.88M rows/s** | 1.71 MB |
-| JSON | 2.23M rows/s | 2.41 MB |
+| Format | Throughput | Response Size (500K rows) |
+|--------|------------|---------------------------|
+| Arrow IPC | **5.2M rows/s** | 8.0 MB |
+| JSON | 2.0M rows/s | 25.0 MB |
+
+Full table scan: **927M rows/s** (596M records in 685ms)
 
 ### vs Python Implementation
 

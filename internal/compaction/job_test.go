@@ -1,6 +1,8 @@
 package compaction
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -90,4 +92,93 @@ func TestEscapeSQLPath(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestValidateParquetFile tests the lightweight parquet magic byte validation
+func TestValidateParquetFile(t *testing.T) {
+	tempDir := t.TempDir()
+
+	tests := []struct {
+		name      string
+		content   []byte
+		wantError bool
+		errorMsg  string
+	}{
+		{
+			name:      "valid parquet magic bytes",
+			content:   append(append([]byte("PAR1"), make([]byte, 100)...), []byte("PAR1")...),
+			wantError: false,
+		},
+		{
+			name:      "file too small",
+			content:   []byte("PAR1PAR1"),
+			wantError: true,
+			errorMsg:  "file too small",
+		},
+		{
+			name:      "invalid header",
+			content:   append(append([]byte("XXXX"), make([]byte, 100)...), []byte("PAR1")...),
+			wantError: true,
+			errorMsg:  "invalid parquet magic header",
+		},
+		{
+			name:      "invalid footer",
+			content:   append(append([]byte("PAR1"), make([]byte, 100)...), []byte("XXXX")...),
+			wantError: true,
+			errorMsg:  "invalid parquet magic footer",
+		},
+		{
+			name:      "empty file",
+			content:   []byte{},
+			wantError: true,
+			errorMsg:  "file too small",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create temp file with test content
+			filePath := filepath.Join(tempDir, tt.name+".parquet")
+			if err := os.WriteFile(filePath, tt.content, 0644); err != nil {
+				t.Fatalf("failed to create test file: %v", err)
+			}
+
+			err := validateParquetFile(filePath)
+
+			if tt.wantError {
+				if err == nil {
+					t.Errorf("validateParquetFile() expected error containing %q, got nil", tt.errorMsg)
+				} else if tt.errorMsg != "" && !contains(err.Error(), tt.errorMsg) {
+					t.Errorf("validateParquetFile() error = %q, want error containing %q", err.Error(), tt.errorMsg)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("validateParquetFile() unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// TestValidateParquetFile_NonExistentFile tests validation of a non-existent file
+func TestValidateParquetFile_NonExistentFile(t *testing.T) {
+	err := validateParquetFile("/nonexistent/path/file.parquet")
+	if err == nil {
+		t.Error("validateParquetFile() expected error for non-existent file, got nil")
+	}
+}
+
+// contains checks if s contains substr
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
+		(len(s) > 0 && len(substr) > 0 && searchString(s, substr)))
+}
+
+func searchString(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }
