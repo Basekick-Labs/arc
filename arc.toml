@@ -214,7 +214,7 @@ daily_min_files = 12           # Minimum 12 hourly files before compacting
 # Enable/disable authentication
 # When enabled, requests must include a valid token in the Authorization header
 # Public endpoints (/health, /ready, /metrics) are always accessible
-enabled = false
+enabled = true
 
 # -----------------------------------------------------------------------------
 # Delete Configuration
