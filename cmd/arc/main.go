@@ -80,6 +80,10 @@ func main() {
 		S3Endpoint:  cfg.Storage.S3Endpoint,
 		S3UseSSL:    cfg.Storage.S3UseSSL,
 		S3PathStyle: cfg.Storage.S3PathStyle,
+		// Azure Blob Storage configuration for azure extension
+		AzureAccountName: cfg.Storage.AzureAccountName,
+		AzureAccountKey:  cfg.Storage.AzureAccountKey,
+		AzureEndpoint:    cfg.Storage.AzureEndpoint,
 	}
 
 	db, err := database.New(dbConfig, logger.Get("database"))

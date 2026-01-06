@@ -665,6 +665,10 @@ func (h *QueryHandler) getStoragePath(database, table string) string {
 	switch backend := h.storage.(type) {
 	case *storage.S3Backend:
 		return "s3://" + backend.GetBucket() + "/" + database + "/" + table + "/**/*.parquet"
+	case *storage.AzureBlobBackend:
+		// Use azure:// (Blob Storage endpoint)
+		// TODO v26.02.1: Add abfss:// (ADLS Gen2) support for better glob performance
+		return "azure://" + backend.GetContainer() + "/" + database + "/" + table + "/**/*.parquet"
 	case *storage.LocalBackend:
 		return backend.GetBasePath() + "/" + database + "/" + table + "/**/*.parquet"
 	default:

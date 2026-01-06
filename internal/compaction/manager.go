@@ -205,8 +205,16 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 		StorageConfig: m.StorageBackend.ConfigJSON(),
 	}
 
+	// Build extra environment variables for subprocess (e.g., Azure credentials)
+	var extraEnv []string
+	if azureBackend, ok := m.StorageBackend.(*storage.AzureBlobBackend); ok {
+		if key := azureBackend.GetAccountKey(); key != "" {
+			extraEnv = append(extraEnv, "AZURE_STORAGE_KEY="+key)
+		}
+	}
+
 	// Run compaction in subprocess for memory isolation
-	result, err := RunJobInSubprocess(ctx, config, m.logger)
+	result, err := RunJobInSubprocess(ctx, config, m.logger, extraEnv...)
 
 	// Update metrics
 	m.mu.Lock()

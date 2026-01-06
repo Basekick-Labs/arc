@@ -113,7 +113,8 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 // RunJobInSubprocess executes compaction in a subprocess for memory isolation.
 // The subprocess runs the same binary with the "compact" subcommand.
 // When the subprocess exits, all DuckDB memory (including jemalloc arenas) is released.
-func RunJobInSubprocess(ctx context.Context, config *SubprocessJobConfig, logger zerolog.Logger) (*SubprocessJobResult, error) {
+// extraEnv can be used to pass additional environment variables (e.g., credentials).
+func RunJobInSubprocess(ctx context.Context, config *SubprocessJobConfig, logger zerolog.Logger, extraEnv ...string) (*SubprocessJobResult, error) {
 	// Serialize config to JSON
 	configJSON, err := json.Marshal(config)
 	if err != nil {
@@ -132,6 +133,11 @@ func RunJobInSubprocess(ctx context.Context, config *SubprocessJobConfig, logger
 
 	// Pass config via stdin
 	cmd.Stdin = bytes.NewReader(configJSON)
+
+	// Set extra environment variables (e.g., Azure credentials)
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 
 	// Capture stdout and stderr separately
 	var stdout, stderr bytes.Buffer
@@ -220,11 +226,14 @@ func createStorageBackendFromConfig(config *SubprocessJobConfig, logger zerolog.
 		if err := json.Unmarshal([]byte(config.StorageConfig), &azureConfig); err != nil {
 			return nil, fmt.Errorf("failed to parse Azure storage config: %w", err)
 		}
+		// Read credentials from environment variables (set by parent process)
+		accountKey := os.Getenv("AZURE_STORAGE_KEY")
 		return storage.NewAzureBlobBackend(&storage.AzureBlobConfig{
 			ContainerName:      azureConfig.Container,
 			AccountName:        azureConfig.AccountName,
+			AccountKey:         accountKey,
 			Endpoint:           azureConfig.Endpoint,
-			UseManagedIdentity: true, // Use default credential chain in subprocess
+			UseManagedIdentity: accountKey == "", // Only use managed identity if no key provided
 		}, logger)
 
 	default:
