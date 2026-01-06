@@ -28,6 +28,7 @@ type Manager interface {
 	StartSubscription(ctx context.Context, id string) error
 	StopSubscription(ctx context.Context, id string) error
 	PauseSubscription(ctx context.Context, id string) error
+	RestartSubscription(ctx context.Context, id string) error
 	GetStats(ctx context.Context, id string) (*SubscriptionStats, error)
 	GetAllStats(ctx context.Context) ([]*SubscriptionStats, error)
 }
@@ -382,6 +383,36 @@ func (m *SubscriptionManager) PauseSubscription(ctx context.Context, id string) 
 	m.repo.UpdateStatus(ctx, id, StatusPaused, "")
 	m.logger.Info().Str("id", id).Msg("Paused MQTT subscription")
 
+	return nil
+}
+
+// RestartSubscription stops and starts a subscription
+func (m *SubscriptionManager) RestartSubscription(ctx context.Context, id string) error {
+	// Stop if running
+	m.mu.Lock()
+	subscriber, ok := m.subscribers[id]
+	if ok {
+		subscriber.Stop()
+		delete(m.subscribers, id)
+	}
+	m.mu.Unlock()
+
+	// Get subscription from DB
+	sub, err := m.repo.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if sub == nil {
+		return fmt.Errorf("subscription not found: %s", id)
+	}
+
+	// Start it
+	if err := m.startSubscriber(sub); err != nil {
+		m.repo.UpdateStatus(ctx, id, StatusError, err.Error())
+		return err
+	}
+
+	m.logger.Info().Str("id", id).Msg("Restarted MQTT subscription")
 	return nil
 }
 

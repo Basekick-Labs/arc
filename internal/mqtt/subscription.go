@@ -1,6 +1,8 @@
 package mqtt
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
@@ -196,6 +198,9 @@ func (s *Subscription) Validate() error {
 
 // SetDefaults sets default values for optional fields
 func (s *Subscription) SetDefaults() {
+	if s.ClientID == "" {
+		s.ClientID = generateClientID()
+	}
 	if s.QoS == 0 {
 		s.QoS = 1 // Default to at-least-once
 	}
@@ -214,6 +219,13 @@ func (s *Subscription) SetDefaults() {
 	if s.Status == "" {
 		s.Status = StatusStopped
 	}
+}
+
+// generateClientID creates a unique client ID for MQTT connections
+func generateClientID() string {
+	b := make([]byte, 4)
+	rand.Read(b)
+	return "arc-" + hex.EncodeToString(b)
 }
 
 // validateBrokerURL validates the MQTT broker URL format

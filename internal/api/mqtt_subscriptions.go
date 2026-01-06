@@ -44,6 +44,7 @@ func (h *MQTTSubscriptionHandler) RegisterRoutes(app *fiber.App) {
 	subs.Post("/:id/start", h.handleStart)
 	subs.Post("/:id/stop", h.handleStop)
 	subs.Post("/:id/pause", h.handlePause)
+	subs.Post("/:id/restart", h.handleRestart)
 
 	// Stats endpoint
 	subs.Get("/:id/stats", h.handleStats)
@@ -258,6 +259,27 @@ func (h *MQTTSubscriptionHandler) handlePause(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"success": true,
 		"message": "Subscription paused",
+	})
+}
+
+// handleRestart restarts a subscription (stop + start)
+func (h *MQTTSubscriptionHandler) handleRestart(c *fiber.Ctx) error {
+	id := c.Params("id")
+
+	if err := h.manager.RestartSubscription(c.Context(), id); err != nil {
+		h.logger.Error().Err(err).Str("id", id).Msg("Failed to restart subscription")
+
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"error":   "Failed to restart subscription",
+		})
+	}
+
+	h.logger.Info().Str("id", id).Msg("Restarted MQTT subscription")
+
+	return c.JSON(fiber.Map{
+		"success": true,
+		"message": "Subscription restarted",
 	})
 }
 
