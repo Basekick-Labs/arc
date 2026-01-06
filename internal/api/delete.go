@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
@@ -529,7 +528,7 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 }
 
 // rewriteLocalFile handles file rewrite for local storage using atomic rename
-func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, relativePath, whereClause string, rowsBefore, rowsAfter int64) (int64, error) {
+func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, _, whereClause string, rowsBefore, rowsAfter int64) (int64, error) {
 	db := h.db.DB()
 	deleted := rowsBefore - rowsAfter
 
@@ -628,16 +627,6 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 	return deleted, nil
 }
 
-// getStorageBasePath returns the base path for local storage (empty for S3)
-func (h *DeleteHandler) getStorageBasePath() string {
-	switch backend := h.storage.(type) {
-	case *storage.LocalBackend:
-		return backend.GetBasePath()
-	default:
-		return ""
-	}
-}
-
 // getQueryPath converts a storage-relative path to a DuckDB-compatible path
 func (h *DeleteHandler) getQueryPath(relativePath string) string {
 	switch backend := h.storage.(type) {
@@ -654,13 +643,4 @@ func (h *DeleteHandler) getQueryPath(relativePath string) string {
 func (h *DeleteHandler) isS3Backend() bool {
 	_, ok := h.storage.(*storage.S3Backend)
 	return ok
-}
-
-// extractTimeRange extracts time range from WHERE clause for partition pruning (future optimization)
-var timeRangePatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)time\s*>=\s*'([^']+)'`),
-	regexp.MustCompile(`(?i)time\s*>\s*'([^']+)'`),
-	regexp.MustCompile(`(?i)time\s*<\s*'([^']+)'`),
-	regexp.MustCompile(`(?i)time\s*<=\s*'([^']+)'`),
-	regexp.MustCompile(`(?i)time\s+BETWEEN\s+'([^']+)'\s+AND\s+'([^']+)'`),
 }

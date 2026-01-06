@@ -214,7 +214,7 @@ daily_min_files = 12           # Minimum 12 hourly files before compacting
 # Enable/disable authentication
 # When enabled, requests must include a valid token in the Authorization header
 # Public endpoints (/health, /ready, /metrics) are always accessible
-enabled = true
+enabled = false
 
 # -----------------------------------------------------------------------------
 # Delete Configuration
@@ -251,4 +251,46 @@ enabled = true
 enabled = true
 
 [telemetry]
+enabled = true
+
+# -----------------------------------------------------------------------------
+# MQTT Ingestion Configuration
+# -----------------------------------------------------------------------------
+# Subscribe to MQTT topics and ingest data directly from IoT devices and brokers.
+# Messages can be JSON or MessagePack format (auto-detected).
+#
+# SUBSCRIPTIONS ARE MANAGED VIA REST API (not this config file):
+#   POST   /api/v1/mqtt/subscriptions           - Create subscription
+#   GET    /api/v1/mqtt/subscriptions           - List all subscriptions
+#   GET    /api/v1/mqtt/subscriptions/{id}      - Get subscription details
+#   PUT    /api/v1/mqtt/subscriptions/{id}      - Update subscription
+#   DELETE /api/v1/mqtt/subscriptions/{id}      - Delete subscription
+#   POST   /api/v1/mqtt/subscriptions/{id}/start   - Start subscription
+#   POST   /api/v1/mqtt/subscriptions/{id}/stop    - Stop subscription
+#   POST   /api/v1/mqtt/subscriptions/{id}/restart - Restart subscription
+#   GET    /api/v1/mqtt/subscriptions/{id}/stats   - Get subscription stats
+#
+# EXAMPLE - Create a subscription:
+#   curl -X POST http://localhost:8000/api/v1/mqtt/subscriptions \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "name": "factory-sensors",
+#       "broker": "tcp://localhost:1883",
+#       "topics": ["sensors/#"],
+#       "database": "iot",
+#       "auto_start": true
+#     }'
+#
+# PASSWORD ENCRYPTION:
+#   Passwords are encrypted at rest using AES-256-GCM.
+#   Set ARC_ENCRYPTION_KEY environment variable (32-byte base64 key) when using credentials.
+#   Generate key: openssl rand -base64 32
+#
+# MESSAGE FORMATS SUPPORTED:
+#   - JSON (flat): {"time": 1704067200000000, "temperature": 23.5}
+#   - JSON (structured): {"measurement": "sensors", "tags": {...}, "fields": {...}}
+#   - MessagePack (columnar, fastest): {m: "sensors", columns: {...}}
+#
+[mqtt]
+# Enable MQTT subscription manager (subscriptions configured via API)
 enabled = true

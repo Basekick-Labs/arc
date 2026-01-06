@@ -17,6 +17,7 @@ import (
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/logger"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/mqtt"
 	"github.com/basekick-labs/arc/internal/shutdown"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/telemetry"
@@ -233,6 +234,52 @@ func main() {
 		arrowBuffer.SetWAL(walWriter)
 	}
 	shutdownCoordinator.Register("arrow-buffer", arrowBuffer, shutdown.PriorityBuffer)
+
+	// Initialize MQTT Subscription Manager (if enabled)
+	var mqttManager mqtt.Manager
+	if cfg.MQTT.Enabled {
+		// Get encryption key from environment (required for subscriptions with passwords)
+		encryptionKey, keyErr := mqtt.GetEncryptionKey()
+		if keyErr != nil {
+			log.Fatal().Err(keyErr).Msg("Invalid ARC_ENCRYPTION_KEY - must be 32 bytes (base64 or hex encoded)")
+		}
+		if encryptionKey == nil {
+			log.Warn().Msg("ARC_ENCRYPTION_KEY not set - MQTT subscriptions with passwords will be rejected")
+		}
+
+		// Create password encryptor (will be NilEncryptor if no key - rejects passwords)
+		encryptor, err := mqtt.NewPasswordEncryptor(encryptionKey)
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to create password encryptor")
+		}
+
+		// Create SQLite repository for MQTT subscriptions (use shared DB path from auth config)
+		mqttDBPath := cfg.Auth.DBPath
+		if mqttDBPath == "" {
+			mqttDBPath = "./data/arc.db" // Use shared SQLite database
+		}
+		mqttRepo, err := mqtt.NewSQLiteRepository(mqttDBPath, encryptionKey, logger.Get("mqtt-repo"))
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to initialize MQTT repository")
+		}
+
+		// Create subscription manager
+		mqttManager = mqtt.NewSubscriptionManager(mqttRepo, encryptor, arrowBuffer, logger.Get("mqtt"))
+
+		// Start manager (loads and starts auto_start subscriptions)
+		if err := mqttManager.Start(context.Background()); err != nil {
+			log.Warn().Err(err).Msg("Some MQTT subscriptions failed to auto-start")
+		}
+
+		// Register shutdown hook
+		shutdownCoordinator.RegisterHook("mqtt-manager", func(ctx context.Context) error {
+			return mqttManager.Shutdown(ctx)
+		}, shutdown.PriorityIngest)
+
+		log.Info().Bool("encryption_enabled", encryptionKey != nil).Msg("MQTT subscription manager enabled")
+	} else {
+		log.Debug().Msg("MQTT subscription manager is disabled")
+	}
 
 	// Initialize AuthManager (if enabled)
 	var authManager *auth.AuthManager
@@ -523,6 +570,16 @@ func main() {
 		log.Info().Str("db_path", cfg.ContinuousQuery.DBPath).Msg("Continuous queries enabled")
 	} else {
 		log.Info().Msg("Continuous queries DISABLED")
+	}
+
+	// Register MQTT handlers (always register, handlers check if manager is nil)
+	mqttHandler := api.NewMQTTHandler(mqttManager, authManager, logger.Get("mqtt-api"))
+	mqttHandler.RegisterRoutes(server.GetApp())
+
+	// Register MQTT subscription management API (if MQTT is enabled)
+	if mqttManager != nil {
+		mqttSubHandler := api.NewMQTTSubscriptionHandler(mqttManager, authManager, logger.Get("mqtt-subscriptions-api"))
+		mqttSubHandler.RegisterRoutes(server.GetApp())
 	}
 
 	// Register HTTP server shutdown hook (first to stop accepting new requests)
