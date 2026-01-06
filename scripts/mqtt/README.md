@@ -21,25 +21,25 @@ Sends test sensor data to an MQTT broker.
 
 ```bash
 # Basic usage - 10 msg/s to sensors/temperature
-go run scripts/mqtt/producer.go
+go run scripts/mqtt/producer/main.go
 
 # High throughput test - 1000 msg/s for 60 seconds
-go run scripts/mqtt/producer.go -rate 1000 -duration 60s
+go run scripts/mqtt/producer/main.go -rate 1000 -duration 60s
 
 # Send 1000 messages then stop
-go run scripts/mqtt/producer.go -count 1000
+go run scripts/mqtt/producer/main.go -count 1000
 
 # JSON format instead of MessagePack
-go run scripts/mqtt/producer.go -format json
+go run scripts/mqtt/producer/main.go -format json
 
 # Batch multiple records per message
-go run scripts/mqtt/producer.go -batch 100 -rate 100
+go run scripts/mqtt/producer/main.go -batch 100 -rate 100
 
 # Custom broker and topic
-go run scripts/mqtt/producer.go -broker tcp://broker.example.com:1883 -topic iot/sensors
+go run scripts/mqtt/producer/main.go -broker tcp://broker.example.com:1883 -topic iot/sensors
 
 # With authentication
-go run scripts/mqtt/producer.go -username user -password secret
+go run scripts/mqtt/producer/main.go -username user -password secret
 ```
 
 ### Producer Flags
@@ -65,13 +65,13 @@ Receives and displays MQTT messages (for debugging).
 
 ```bash
 # Subscribe to all sensor topics
-go run scripts/mqtt/consumer.go -topic "sensors/#"
+go run scripts/mqtt/consumer/main.go -topic "sensors/#"
 
 # Show message contents
-go run scripts/mqtt/consumer.go -topic "sensors/#" -verbose
+go run scripts/mqtt/consumer/main.go -topic "sensors/#" -verbose
 
 # Custom stats interval
-go run scripts/mqtt/consumer.go -stats 10s
+go run scripts/mqtt/consumer/main.go -stats 10s
 ```
 
 ### Consumer Flags
@@ -112,7 +112,7 @@ go run scripts/mqtt/consumer.go -stats 10s
    ```
 4. Run the producer:
    ```bash
-   go run scripts/mqtt/producer.go -count 100
+   go run scripts/mqtt/producer/main.go -count 100
    ```
 5. Query the data:
    ```bash
@@ -126,15 +126,15 @@ go run scripts/mqtt/consumer.go -stats 10s
 watch -n1 'curl -s http://localhost:8080/api/v1/mqtt/stats | jq'
 
 # Terminal 2: High-rate producer
-go run scripts/mqtt/producer.go -rate 10000 -batch 100 -duration 60s
+go run scripts/mqtt/producer/main.go -rate 10000 -batch 100 -duration 60s
 ```
 
 ### Format Compatibility Test
 
 ```bash
 # Test JSON
-go run scripts/mqtt/producer.go -format json -count 10 -verbose
+go run scripts/mqtt/producer/main.go -format json -count 10 -verbose
 
 # Test MessagePack
-go run scripts/mqtt/producer.go -format msgpack -count 10 -verbose
+go run scripts/mqtt/producer/main.go -format msgpack -count 10 -verbose
 ```
