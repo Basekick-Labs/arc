@@ -22,6 +22,7 @@ type AzureBlobBackend struct {
 	client        *azblob.Client
 	containerName string
 	accountName   string
+	accountKey    string // Stored for subprocess credential passing
 	endpoint      string
 	logger        zerolog.Logger
 }
@@ -126,6 +127,7 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 		client:        client,
 		containerName: cfg.ContainerName,
 		accountName:   cfg.AccountName,
+		accountKey:    cfg.AccountKey,
 		endpoint:      endpoint,
 		logger:        log,
 	}
@@ -325,6 +327,11 @@ func (b *AzureBlobBackend) GetContainer() string {
 // GetAccountName returns the account name
 func (b *AzureBlobBackend) GetAccountName() string {
 	return b.accountName
+}
+
+// GetAccountKey returns the account key (for subprocess credential passing)
+func (b *AzureBlobBackend) GetAccountKey() string {
+	return b.accountKey
 }
 
 // Type returns the storage type identifier

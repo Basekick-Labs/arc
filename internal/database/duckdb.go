@@ -33,6 +33,10 @@ type Config struct {
 	S3Endpoint  string // Custom endpoint for MinIO or S3-compatible services
 	S3UseSSL    bool
 	S3PathStyle bool // Use path-style addressing (required for MinIO)
+	// Azure Blob Storage configuration for azure extension
+	AzureAccountName string
+	AzureAccountKey  string
+	AzureEndpoint    string // Custom endpoint (optional)
 }
 
 // New creates a new DuckDB instance
@@ -64,6 +68,7 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 	}
 
 	s3Enabled := cfg.S3AccessKey != "" && cfg.S3SecretKey != ""
+	azureEnabled := cfg.AzureAccountName != "" && cfg.AzureAccountKey != ""
 	logger.Info().
 		Int("max_connections", cfg.MaxConnections).
 		Str("memory_limit", cfg.MemoryLimit).
@@ -71,6 +76,8 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 		Bool("wal_enabled", cfg.EnableWAL).
 		Bool("s3_enabled", s3Enabled).
 		Str("s3_region", cfg.S3Region).
+		Bool("azure_enabled", azureEnabled).
+		Str("azure_account", cfg.AzureAccountName).
 		Msg("DuckDB initialized")
 
 	return &DuckDB{
@@ -106,6 +113,13 @@ func configureDatabase(db *sql.DB, cfg *Config) error {
 	if cfg.S3AccessKey != "" && cfg.S3SecretKey != "" {
 		if err := configureS3Access(db, cfg); err != nil {
 			return fmt.Errorf("failed to configure S3 access: %w", err)
+		}
+	}
+
+	// Configure azure extension for Azure Blob Storage access if credentials are provided
+	if cfg.AzureAccountName != "" && cfg.AzureAccountKey != "" {
+		if err := configureAzureAccess(db, cfg); err != nil {
+			return fmt.Errorf("failed to configure Azure access: %w", err)
 		}
 	}
 
@@ -161,6 +175,46 @@ func configureS3Access(db *sql.DB, cfg *Config) error {
 	}
 	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_use_ssl=%s", useSSL)); err != nil {
 		return fmt.Errorf("failed to set s3_use_ssl: %w", err)
+	}
+
+	return nil
+}
+
+// configureAzureAccess sets up the azure extension for Azure Blob Storage access
+// Note: We use SET GLOBAL to ensure settings persist across all connections in the pool
+func configureAzureAccess(db *sql.DB, cfg *Config) error {
+	// Install and load the azure extension
+	if _, err := db.Exec("INSTALL azure"); err != nil {
+		return fmt.Errorf("failed to install azure: %w", err)
+	}
+	if _, err := db.Exec("LOAD azure"); err != nil {
+		return fmt.Errorf("failed to load azure: %w", err)
+	}
+
+	// Create a secret for Azure Blob Storage authentication
+	var secretSQL string
+	if cfg.AzureAccountKey != "" {
+		// Use connection string with account key
+		connStr := fmt.Sprintf("AccountName=%s;AccountKey=%s", cfg.AzureAccountName, cfg.AzureAccountKey)
+		secretSQL = fmt.Sprintf(`
+			CREATE SECRET azure_secret (
+				TYPE AZURE,
+				CONNECTION_STRING '%s'
+			)
+		`, connStr)
+	} else {
+		// Fall back to credential chain if no account key
+		secretSQL = fmt.Sprintf(`
+			CREATE SECRET azure_secret (
+				TYPE AZURE,
+				PROVIDER CREDENTIAL_CHAIN,
+				ACCOUNT_NAME '%s'
+			)
+		`, cfg.AzureAccountName)
+	}
+
+	if _, err := db.Exec(secretSQL); err != nil {
+		return fmt.Errorf("failed to create azure secret: %w", err)
 	}
 
 	return nil
