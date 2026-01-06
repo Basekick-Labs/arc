@@ -1035,9 +1035,9 @@ func (b *ArrowBuffer) columnarToWALRecords(database string, record *models.Colum
 // to the columnar format expected by the Arrow writer.
 //
 // The conversion:
-// - _time column: populated from Record.Timestamp (microseconds) or Record.Time
-// - Tag columns: prefixed with "tag_" to distinguish from fields
-// - Field columns: stored directly by field name
+// - time column: populated from Record.Timestamp (microseconds) or Record.Time
+// - Tag columns: stored directly by tag name (matches Line Protocol behavior)
+// - Field columns: stored directly by field name (conflicts get "_value" suffix)
 func (b *ArrowBuffer) rowsToColumnar(measurement string, rows []*models.Record) *models.ColumnarRecord {
 	if len(rows) == 0 {
 		return &models.ColumnarRecord{
@@ -1049,11 +1049,11 @@ func (b *ArrowBuffer) rowsToColumnar(measurement string, rows []*models.Record) 
 
 	// Pre-allocate columns map - estimate based on first record
 	firstRow := rows[0]
-	estimatedCols := 1 + len(firstRow.Tags) + len(firstRow.Fields) // _time + tags + fields
+	estimatedCols := 1 + len(firstRow.Tags) + len(firstRow.Fields) // time + tags + fields
 	columns := make(map[string][]interface{}, estimatedCols)
 
-	// Initialize _time column
-	columns["_time"] = make([]interface{}, 0, len(rows))
+	// Initialize time column
+	columns["time"] = make([]interface{}, 0, len(rows))
 
 	// First pass: collect all unique column names across all rows
 	// This handles schema variations where different rows may have different fields/tags
@@ -1069,11 +1069,17 @@ func (b *ArrowBuffer) rowsToColumnar(measurement string, rows []*models.Record) 
 	}
 
 	// Initialize columns for all tags and fields
+	// Tags are stored directly by name (matching Line Protocol behavior)
+	// Fields that conflict with tags get "_value" suffix
 	for tag := range allTags {
-		columns["tag_"+tag] = make([]interface{}, 0, len(rows))
+		columns[tag] = make([]interface{}, 0, len(rows))
 	}
 	for field := range allFields {
-		columns[field] = make([]interface{}, 0, len(rows))
+		if _, hasTag := allTags[field]; hasTag {
+			columns[field+"_value"] = make([]interface{}, 0, len(rows))
+		} else {
+			columns[field] = make([]interface{}, 0, len(rows))
+		}
 	}
 
 	// Second pass: populate columns with values
@@ -1088,23 +1094,28 @@ func (b *ArrowBuffer) rowsToColumnar(measurement string, rows []*models.Record) 
 			// Use current time if no timestamp provided
 			timestamp = time.Now().UnixMicro()
 		}
-		columns["_time"] = append(columns["_time"], timestamp)
+		columns["time"] = append(columns["time"], timestamp)
 
 		// Add tag values (nil for missing tags to maintain column alignment)
 		for tag := range allTags {
 			if val, ok := row.Tags[tag]; ok {
-				columns["tag_"+tag] = append(columns["tag_"+tag], val)
+				columns[tag] = append(columns[tag], val)
 			} else {
-				columns["tag_"+tag] = append(columns["tag_"+tag], nil)
+				columns[tag] = append(columns[tag], nil)
 			}
 		}
 
 		// Add field values (nil for missing fields to maintain column alignment)
+		// Fields that conflict with tags get "_value" suffix
 		for field := range allFields {
+			colName := field
+			if _, hasTag := allTags[field]; hasTag {
+				colName = field + "_value"
+			}
 			if val, ok := row.Fields[field]; ok {
-				columns[field] = append(columns[field], val)
+				columns[colName] = append(columns[colName], val)
 			} else {
-				columns[field] = append(columns[field], nil)
+				columns[colName] = append(columns[colName], nil)
 			}
 		}
 	}
@@ -1970,14 +1981,6 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (map[string]interface{
 	}
 
 	return merged, nil
-}
-
-// hourBoundary represents a time partition boundary
-type hourBoundary struct {
-	startIdx int       // Start index in sorted array
-	endIdx   int       // End index (exclusive)
-	hourKey  string    // YYYYMMDDHH
-	minTime  time.Time // First timestamp in partition
 }
 
 // sortColumnsByTime sorts all columns by the time column in-place

@@ -250,5 +250,12 @@ enabled = true
 # Queries are defined via the API
 enabled = true
 
+# -----------------------------------------------------------------------------
+# MQTT Ingestion Configuration
+# -----------------------------------------------------------------------------
+[mqtt]
+# Enable MQTT subscription manager (subscriptions configured via API)
+enabled = true
+
 [telemetry]
 enabled = true

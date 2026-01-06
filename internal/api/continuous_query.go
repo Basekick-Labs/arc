@@ -514,7 +514,7 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 }
 
 // executeAggregation runs the aggregation query and writes results
-func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *ContinuousQuery, query string, startTime, endTime time.Time) (int64, error) {
+func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *ContinuousQuery, query string, _, _ time.Time) (int64, error) {
 	// Get storage base path for reading source data
 	basePath := h.getStorageBasePath()
 	if basePath == "" {

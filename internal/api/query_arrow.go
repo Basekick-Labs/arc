@@ -211,7 +211,7 @@ func sqlTypeToArrowType(sqlType string) arrow.DataType {
 }
 
 // appendValueToBuilder appends a value to the appropriate Arrow builder
-func appendValueToBuilder(builder array.Builder, val interface{}, arrowType arrow.DataType) {
+func appendValueToBuilder(builder array.Builder, val interface{}, _ arrow.DataType) {
 	if val == nil {
 		builder.AppendNull()
 		return

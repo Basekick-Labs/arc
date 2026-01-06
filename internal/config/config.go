@@ -25,6 +25,7 @@ type Config struct {
 	Retention       RetentionConfig
 	ContinuousQuery ContinuousQueryConfig
 	Metrics         MetricsConfig
+	MQTT            MQTTConfig
 }
 
 type ServerConfig struct {
@@ -146,6 +147,13 @@ type ContinuousQueryConfig struct {
 type MetricsConfig struct {
 	TimeseriesRetentionMinutes int // Retention period for timeseries data in minutes (default: 30, max: 1440)
 	TimeseriesIntervalSeconds  int // Collection interval in seconds (default: 5)
+}
+
+// MQTTConfig contains MQTT feature toggle only.
+// All subscription configuration is managed via the REST API and persisted in SQLite.
+// See POST /api/v1/mqtt/subscriptions for creating subscriptions.
+type MQTTConfig struct {
+	Enabled bool // Enable MQTT subscription manager feature
 }
 
 // Load loads configuration from environment and config file
@@ -288,6 +296,9 @@ func Load() (*Config, error) {
 			TimeseriesRetentionMinutes: v.GetInt("metrics.timeseries_retention_minutes"),
 			TimeseriesIntervalSeconds:  v.GetInt("metrics.timeseries_interval_seconds"),
 		},
+		MQTT: MQTTConfig{
+			Enabled: v.GetBool("mqtt.enabled"),
+		},
 	}
 
 	return cfg, nil
@@ -388,6 +399,9 @@ func setDefaults(v *viper.Viper) {
 	// Metrics defaults
 	v.SetDefault("metrics.timeseries_retention_minutes", 30) // 30 minutes retention
 	v.SetDefault("metrics.timeseries_interval_seconds", 5)   // Collect every 5 seconds
+
+	// MQTT defaults (subscriptions are configured via REST API, stored in SQLite)
+	v.SetDefault("mqtt.enabled", false) // Feature toggle only - disabled by default
 }
 
 func getDefaultThreadCount() int {

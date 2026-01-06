@@ -83,6 +83,15 @@ type Metrics struct {
 	dbQueriesTotal        atomic.Int64
 	dbQueryErrorsTotal    atomic.Int64
 
+	// MQTT metrics
+	mqttMessagesReceived atomic.Int64
+	mqttMessagesFailed   atomic.Int64
+	mqttBytesReceived    atomic.Int64
+	mqttDecodeSuccess    atomic.Int64
+	mqttDecodeErrors     atomic.Int64
+	mqttConnected        atomic.Int64 // 1 = connected, 0 = disconnected
+	mqttReconnects       atomic.Int64
+
 	logger zerolog.Logger
 }
 
@@ -213,6 +222,21 @@ func (m *Metrics) SetDBConnectionsIdle(count int64)  { m.dbConnectionsIdle.Store
 func (m *Metrics) IncDBQueries()                     { m.dbQueriesTotal.Add(1) }
 func (m *Metrics) IncDBQueryErrors()                 { m.dbQueryErrorsTotal.Add(1) }
 
+// MQTT Metrics
+func (m *Metrics) IncMQTTMessagesReceived()          { m.mqttMessagesReceived.Add(1) }
+func (m *Metrics) IncMQTTMessagesFailed()            { m.mqttMessagesFailed.Add(1) }
+func (m *Metrics) IncMQTTBytesReceived(bytes int64)  { m.mqttBytesReceived.Add(bytes) }
+func (m *Metrics) IncMQTTDecodeSuccess()             { m.mqttDecodeSuccess.Add(1) }
+func (m *Metrics) IncMQTTDecodeErrors()              { m.mqttDecodeErrors.Add(1) }
+func (m *Metrics) SetMQTTConnected(connected bool)   {
+	if connected {
+		m.mqttConnected.Store(1)
+	} else {
+		m.mqttConnected.Store(0)
+	}
+}
+func (m *Metrics) IncMQTTReconnects()                { m.mqttReconnects.Add(1) }
+
 // Snapshot returns all metrics as a map (for JSON endpoint)
 func (m *Metrics) Snapshot() map[string]interface{} {
 	var memStats runtime.MemStats
@@ -302,6 +326,15 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"db_connections_idle":   m.dbConnectionsIdle.Load(),
 		"db_queries_total":      m.dbQueriesTotal.Load(),
 		"db_query_errors_total": m.dbQueryErrorsTotal.Load(),
+
+		// MQTT
+		"mqtt_messages_received": m.mqttMessagesReceived.Load(),
+		"mqtt_messages_failed":   m.mqttMessagesFailed.Load(),
+		"mqtt_bytes_received":    m.mqttBytesReceived.Load(),
+		"mqtt_decode_success":    m.mqttDecodeSuccess.Load(),
+		"mqtt_decode_errors":     m.mqttDecodeErrors.Load(),
+		"mqtt_connected":         m.mqttConnected.Load(),
+		"mqtt_reconnects":        m.mqttReconnects.Load(),
 	}
 }
 
@@ -484,6 +517,35 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_db_queries_total Total database queries\n"...)
 	b = append(b, "# TYPE arc_db_queries_total counter\n"...)
 	b = appendMetric(b, "arc_db_queries_total", float64(m.dbQueriesTotal.Load()))
+
+	// MQTT metrics
+	b = append(b, "# HELP arc_mqtt_messages_received_total Total MQTT messages received\n"...)
+	b = append(b, "# TYPE arc_mqtt_messages_received_total counter\n"...)
+	b = appendMetric(b, "arc_mqtt_messages_received_total", float64(m.mqttMessagesReceived.Load()))
+
+	b = append(b, "# HELP arc_mqtt_messages_failed_total Total MQTT messages that failed processing\n"...)
+	b = append(b, "# TYPE arc_mqtt_messages_failed_total counter\n"...)
+	b = appendMetric(b, "arc_mqtt_messages_failed_total", float64(m.mqttMessagesFailed.Load()))
+
+	b = append(b, "# HELP arc_mqtt_bytes_received_total Total bytes received via MQTT\n"...)
+	b = append(b, "# TYPE arc_mqtt_bytes_received_total counter\n"...)
+	b = appendMetric(b, "arc_mqtt_bytes_received_total", float64(m.mqttBytesReceived.Load()))
+
+	b = append(b, "# HELP arc_mqtt_decode_success_total Successful MQTT message decodes\n"...)
+	b = append(b, "# TYPE arc_mqtt_decode_success_total counter\n"...)
+	b = appendMetric(b, "arc_mqtt_decode_success_total", float64(m.mqttDecodeSuccess.Load()))
+
+	b = append(b, "# HELP arc_mqtt_decode_errors_total MQTT message decode errors\n"...)
+	b = append(b, "# TYPE arc_mqtt_decode_errors_total counter\n"...)
+	b = appendMetric(b, "arc_mqtt_decode_errors_total", float64(m.mqttDecodeErrors.Load()))
+
+	b = append(b, "# HELP arc_mqtt_connected MQTT connection status (1=connected, 0=disconnected)\n"...)
+	b = append(b, "# TYPE arc_mqtt_connected gauge\n"...)
+	b = appendMetric(b, "arc_mqtt_connected", float64(m.mqttConnected.Load()))
+
+	b = append(b, "# HELP arc_mqtt_reconnects_total Total MQTT reconnection attempts\n"...)
+	b = append(b, "# TYPE arc_mqtt_reconnects_total counter\n"...)
+	b = appendMetric(b, "arc_mqtt_reconnects_total", float64(m.mqttReconnects.Load()))
 
 	return string(b)
 }

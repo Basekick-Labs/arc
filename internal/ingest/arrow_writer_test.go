@@ -88,10 +88,10 @@ func TestRowsToColumnar_SingleRecord(t *testing.T) {
 		t.Error("Expected Columnar to be true")
 	}
 
-	// Verify _time column
-	timeCol, ok := result.Columns["_time"]
+	// Verify time column
+	timeCol, ok := result.Columns["time"]
 	if !ok {
-		t.Fatal("Missing _time column")
+		t.Fatal("Missing time column")
 	}
 	if len(timeCol) != 1 {
 		t.Errorf("Expected 1 time value, got %d", len(timeCol))
@@ -117,18 +117,18 @@ func TestRowsToColumnar_SingleRecord(t *testing.T) {
 		t.Errorf("Expected system 10.2, got %v", systemCol[0])
 	}
 
-	// Verify tag columns (prefixed with "tag_")
-	hostCol, ok := result.Columns["tag_host"]
+	// Verify tag columns (stored directly by name, matching Line Protocol)
+	hostCol, ok := result.Columns["host"]
 	if !ok {
-		t.Fatal("Missing 'tag_host' column")
+		t.Fatal("Missing 'host' column")
 	}
 	if hostCol[0].(string) != "server01" {
 		t.Errorf("Expected host 'server01', got %v", hostCol[0])
 	}
 
-	regionCol, ok := result.Columns["tag_region"]
+	regionCol, ok := result.Columns["region"]
 	if !ok {
-		t.Fatal("Missing 'tag_region' column")
+		t.Fatal("Missing 'region' column")
 	}
 	if regionCol[0].(string) != "us-east" {
 		t.Errorf("Expected region 'us-east', got %v", regionCol[0])
@@ -163,7 +163,7 @@ func TestRowsToColumnar_MultipleRecords(t *testing.T) {
 	result := buffer.rowsToColumnar("cpu", rows)
 
 	// Verify column lengths
-	timeCol := result.Columns["_time"]
+	timeCol := result.Columns["time"]
 	if len(timeCol) != 3 {
 		t.Errorf("Expected 3 time values, got %d", len(timeCol))
 	}
@@ -173,7 +173,7 @@ func TestRowsToColumnar_MultipleRecords(t *testing.T) {
 		t.Errorf("Expected 3 usage values, got %d", len(usageCol))
 	}
 
-	hostCol := result.Columns["tag_host"]
+	hostCol := result.Columns["host"]
 	if len(hostCol) != 3 {
 		t.Errorf("Expected 3 host values, got %d", len(hostCol))
 	}
@@ -230,12 +230,12 @@ func TestRowsToColumnar_SchemaVariation(t *testing.T) {
 		t.Error("Missing 'system' column")
 	}
 
-	// Verify all tags exist
-	if _, ok := result.Columns["tag_host"]; !ok {
-		t.Error("Missing 'tag_host' column")
+	// Verify all tags exist (stored directly by name, matching Line Protocol)
+	if _, ok := result.Columns["host"]; !ok {
+		t.Error("Missing 'host' column")
 	}
-	if _, ok := result.Columns["tag_region"]; !ok {
-		t.Error("Missing 'tag_region' column")
+	if _, ok := result.Columns["region"]; !ok {
+		t.Error("Missing 'region' column")
 	}
 
 	// Verify nil values for missing fields
@@ -256,7 +256,7 @@ func TestRowsToColumnar_SchemaVariation(t *testing.T) {
 	}
 
 	// Verify nil values for missing tags
-	hostCol := result.Columns["tag_host"]
+	hostCol := result.Columns["host"]
 	if hostCol[2] != nil {
 		t.Errorf("Row 2: expected nil host, got %v", hostCol[2])
 	}
@@ -304,7 +304,7 @@ func TestRowsToColumnar_TimestampFallback(t *testing.T) {
 	}
 
 	result := buffer.rowsToColumnar("cpu", rows)
-	timeCol := result.Columns["_time"]
+	timeCol := result.Columns["time"]
 
 	// First row: should use Timestamp directly
 	if timeCol[0].(int64) != 12345678 {
@@ -408,10 +408,10 @@ func TestGetColumnSignature(t *testing.T) {
 			name: "skips internal columns",
 			columns: map[string]interface{}{
 				"value":   nil,
-				"_time":   nil,
+				"time":    nil,
 				"_hidden": nil,
 			},
-			expected: "value",
+			expected: "time,value",
 		},
 	}
 
