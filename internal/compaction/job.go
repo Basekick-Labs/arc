@@ -252,6 +252,9 @@ func (j *Job) Run(ctx context.Context) error {
 		// Don't fail the job for deletion errors
 	}
 
+	// Cleanup empty directories (best-effort, local storage only)
+	j.cleanupEmptyDirectories(ctx)
+
 	return j.complete()
 }
 
@@ -632,4 +635,60 @@ func (j *Job) Stats() map[string]interface{} {
 	}
 
 	return stats
+}
+
+// cleanupEmptyDirectories attempts to remove empty directories after file deletion.
+// Only works with storage backends that implement DirectoryRemover (e.g., LocalBackend).
+// This is best-effort: errors are logged but don't fail the job.
+func (j *Job) cleanupEmptyDirectories(ctx context.Context) {
+	// Check if backend supports directory removal
+	remover, ok := j.StorageBackend.(storage.DirectoryRemover)
+	if !ok {
+		j.logger.Debug().Msg("Storage backend does not support directory removal, skipping cleanup")
+		return
+	}
+
+	// Collect unique directories from compacted files
+	dirs := make(map[string]struct{})
+	for _, fileKey := range j.compactedFiles {
+		dir := filepath.Dir(fileKey)
+		dirs[dir] = struct{}{}
+	}
+
+	if len(dirs) == 0 {
+		return
+	}
+
+	// Try to remove each directory and walk up the tree
+	var removed int
+	for dir := range dirs {
+		removed += j.removeDirectoryTree(ctx, remover, dir)
+	}
+
+	if removed > 0 {
+		j.logger.Info().Int("directories_removed", removed).Msg("Cleaned up empty directories")
+	}
+}
+
+// removeDirectoryTree attempts to remove a directory and its empty parents.
+// Returns the number of directories successfully removed.
+// Stops at the measurement level (database/measurement) to preserve the structure.
+func (j *Job) removeDirectoryTree(ctx context.Context, remover storage.DirectoryRemover, dir string) int {
+	// Path structure: database/measurement/YYYY/MM/DD/HH
+	// Stop at the measurement level (don't delete measurement/database dirs)
+	parts := strings.Split(dir, "/")
+	if len(parts) <= 2 {
+		return 0 // Don't remove database or measurement directories
+	}
+
+	if err := remover.RemoveDirectory(ctx, dir); err != nil {
+		j.logger.Debug().Err(err).Str("dir", dir).Msg("Could not remove directory (may not be empty)")
+		return 0 // Stop walking up if we can't remove this level
+	}
+
+	j.logger.Debug().Str("dir", dir).Msg("Removed empty directory")
+
+	// Try parent directory
+	parent := filepath.Dir(dir)
+	return 1 + j.removeDirectoryTree(ctx, remover, parent)
 }
