@@ -117,9 +117,9 @@ Fixed an issue where empty hour-level partition directories were left behind aft
 
 ## Improvements
 
-### Automatic Time Function Query Optimization
+### Automatic Time Function Query Optimization (GROUP BY Performance)
 
-Queries using `time_bucket()` and `date_trunc()` are now automatically rewritten to epoch-based arithmetic, providing **2-2.5x performance improvement** for GROUP BY queries without any code changes.
+Queries using `time_bucket()` and `date_trunc()` are now automatically rewritten to epoch-based arithmetic, providing **2-2.5x performance improvement** for GROUP BY queries without any code changes. This optimization is particularly impactful for time-series aggregation queries that group data by time intervals.
 
 **How it works:**
 - `time_bucket('1 hour', time)` → `to_timestamp((epoch(time)::BIGINT / 3600) * 3600)`
