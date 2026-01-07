@@ -83,6 +83,11 @@ func extractCTENames(sql string) map[string]bool {
 // All intervals are converted to epoch-based arithmetic for consistent ~2.5x performance improvement.
 // Handles both 2-arg and 3-arg (with origin) forms.
 func rewriteTimeBucket(sql string) string {
+	// Fast path: skip regex if keyword not present (avoids 16 allocs, 41KB per call)
+	if !strings.Contains(strings.ToLower(sql), "time_bucket") {
+		return sql
+	}
+
 	// First handle 3-argument form (with origin) - must come first to avoid partial matches
 	sql = patternTimeBucket3Args.ReplaceAllStringFunc(sql, func(match string) string {
 		parts := patternTimeBucket3Args.FindStringSubmatch(match)
@@ -142,6 +147,11 @@ func rewriteTimeBucket(sql string) string {
 // Handles: date_trunc('hour', time), date_trunc('day', time), etc.
 // Months are not converted because they have variable length.
 func rewriteDateTrunc(sql string) string {
+	// Fast path: skip regex if keyword not present (avoids 5 allocs, 2.3KB per call)
+	if !strings.Contains(strings.ToLower(sql), "date_trunc") {
+		return sql
+	}
+
 	return patternDateTrunc.ReplaceAllStringFunc(sql, func(match string) string {
 		parts := patternDateTrunc.FindStringSubmatch(match)
 		if len(parts) < 3 {
