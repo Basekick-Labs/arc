@@ -3,6 +3,7 @@ package database
 import (
 	"database/sql"
 	"fmt"
+	"runtime"
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
@@ -118,7 +119,7 @@ func configureDatabase(db *sql.DB, cfg *Config) error {
 
 	// Configure azure extension for Azure Blob Storage access if credentials are provided
 	if cfg.AzureAccountName != "" && cfg.AzureAccountKey != "" {
-		if err := configureAzureAccess(db, cfg); err != nil {
+		if err := configureAzureAccess(db, cfg, logger); err != nil {
 			return fmt.Errorf("failed to configure Azure access: %w", err)
 		}
 	}
@@ -182,13 +183,24 @@ func configureS3Access(db *sql.DB, cfg *Config) error {
 
 // configureAzureAccess sets up the azure extension for Azure Blob Storage access
 // Note: We use SET GLOBAL to ensure settings persist across all connections in the pool
-func configureAzureAccess(db *sql.DB, cfg *Config) error {
+func configureAzureAccess(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	// Install and load the azure extension
 	if _, err := db.Exec("INSTALL azure"); err != nil {
 		return fmt.Errorf("failed to install azure: %w", err)
 	}
 	if _, err := db.Exec("LOAD azure"); err != nil {
 		return fmt.Errorf("failed to load azure: %w", err)
+	}
+
+	// Set transport option to curl on Linux to resolve potential SSL certificate issues
+	if runtime.GOOS == "linux" {
+		if _, err := db.Exec("SET GLOBAL azure_transport_option_type = 'curl'"); err != nil {
+			return fmt.Errorf("failed to set azure_transport_option_type: %w", err)
+		}
+
+		logger.Info().
+			Str("azure_transport_option", "curl").
+			Msg("Azure transport option set to curl for Linux")
 	}
 
 	// Create a secret for Azure Blob Storage authentication
