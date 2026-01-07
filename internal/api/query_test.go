@@ -958,36 +958,36 @@ func TestRewriteTimeBucket(t *testing.T) {
 		input    string
 		expected string
 	}{
-		// Standard intervals (1 unit) -> date_trunc
+		// All intervals now use epoch-based arithmetic for 2.5x faster performance
 		{
 			name:     "1 hour with INTERVAL keyword",
 			input:    "SELECT time_bucket(INTERVAL '1 hour', time) AS bucket FROM cpu",
-			expected: "SELECT date_trunc('hour', time) AS bucket FROM cpu",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 3600) * 3600) AS bucket FROM cpu",
 		},
 		{
 			name:     "1 hour without INTERVAL keyword",
 			input:    "SELECT time_bucket('1 hour', time) AS bucket FROM cpu",
-			expected: "SELECT date_trunc('hour', time) AS bucket FROM cpu",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 3600) * 3600) AS bucket FROM cpu",
 		},
 		{
 			name:     "1 day",
 			input:    "SELECT time_bucket('1 day', time) AS bucket FROM cpu",
-			expected: "SELECT date_trunc('day', time) AS bucket FROM cpu",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 86400) * 86400) AS bucket FROM cpu",
 		},
 		{
 			name:     "1 minute",
 			input:    "SELECT time_bucket('1 minute', time) AS bucket FROM cpu",
-			expected: "SELECT date_trunc('minute', time) AS bucket FROM cpu",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 60) * 60) AS bucket FROM cpu",
 		},
 		{
 			name:     "1 week",
 			input:    "SELECT time_bucket('1 week', time) AS bucket FROM cpu",
-			expected: "SELECT date_trunc('week', time) AS bucket FROM cpu",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 604800) * 604800) AS bucket FROM cpu",
 		},
 		{
 			name:     "1 second",
 			input:    "SELECT time_bucket('1 second', time) AS bucket FROM cpu",
-			expected: "SELECT date_trunc('second', time) AS bucket FROM cpu",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 1) * 1) AS bucket FROM cpu",
 		},
 		// Custom intervals -> epoch arithmetic
 		{
@@ -1014,7 +1014,7 @@ func TestRewriteTimeBucket(t *testing.T) {
 		{
 			name:     "1 month stays unchanged",
 			input:    "SELECT time_bucket('1 month', time) AS bucket FROM cpu",
-			expected: "SELECT date_trunc('month', time) AS bucket FROM cpu",
+			expected: "SELECT time_bucket('1 month', time) AS bucket FROM cpu",
 		},
 		{
 			name:     "2 months stays unchanged",
@@ -1025,24 +1025,24 @@ func TestRewriteTimeBucket(t *testing.T) {
 		{
 			name:     "case insensitive TIME_BUCKET",
 			input:    "SELECT TIME_BUCKET('1 hour', time) AS bucket FROM cpu",
-			expected: "SELECT date_trunc('hour', time) AS bucket FROM cpu",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 3600) * 3600) AS bucket FROM cpu",
 		},
 		{
 			name:     "case insensitive Time_Bucket",
 			input:    "SELECT Time_Bucket('1 HOUR', time) AS bucket FROM cpu",
-			expected: "SELECT date_trunc('hour', time) AS bucket FROM cpu",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 3600) * 3600) AS bucket FROM cpu",
 		},
 		// Multiple time_bucket calls
 		{
 			name:     "multiple time_bucket calls",
 			input:    "SELECT time_bucket('1 hour', time) AS h, time_bucket('30 minutes', time) AS m FROM cpu",
-			expected: "SELECT date_trunc('hour', time) AS h, to_timestamp((epoch(time)::BIGINT / 1800) * 1800) AS m FROM cpu",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 3600) * 3600) AS h, to_timestamp((epoch(time)::BIGINT / 1800) * 1800) AS m FROM cpu",
 		},
 		// Column with expression
 		{
 			name:     "column expression",
 			input:    "SELECT time_bucket('1 hour', created_at) AS bucket FROM events",
-			expected: "SELECT date_trunc('hour', created_at) AS bucket FROM events",
+			expected: "SELECT to_timestamp((epoch(created_at)::BIGINT / 3600) * 3600) AS bucket FROM events",
 		},
 		// No time_bucket - unchanged
 		{
@@ -1054,12 +1054,12 @@ func TestRewriteTimeBucket(t *testing.T) {
 		{
 			name:     "singular hour",
 			input:    "SELECT time_bucket('1 hours', time) AS bucket FROM cpu",
-			expected: "SELECT date_trunc('hour', time) AS bucket FROM cpu",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 3600) * 3600) AS bucket FROM cpu",
 		},
 		{
 			name:     "singular day",
 			input:    "SELECT time_bucket('1 days', time) AS bucket FROM cpu",
-			expected: "SELECT date_trunc('day', time) AS bucket FROM cpu",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 86400) * 86400) AS bucket FROM cpu",
 		},
 	}
 
@@ -1164,6 +1164,92 @@ func TestParseTimeBucketOrigin(t *testing.T) {
 			if (err != nil) != tt.wantErr {
 				t.Errorf("parseTimeBucketOrigin(%q) error = %v, wantErr %v",
 					tt.input, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestRewriteDateTrunc(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		// Standard intervals converted to epoch arithmetic
+		{
+			name:     "date_trunc hour",
+			input:    "SELECT date_trunc('hour', time) AS h FROM cpu GROUP BY 1",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 3600) * 3600) AS h FROM cpu GROUP BY 1",
+		},
+		{
+			name:     "date_trunc day",
+			input:    "SELECT date_trunc('day', time) AS d FROM cpu GROUP BY 1",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 86400) * 86400) AS d FROM cpu GROUP BY 1",
+		},
+		{
+			name:     "date_trunc minute",
+			input:    "SELECT date_trunc('minute', time) AS m FROM cpu GROUP BY 1",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 60) * 60) AS m FROM cpu GROUP BY 1",
+		},
+		{
+			name:     "date_trunc second",
+			input:    "SELECT date_trunc('second', time) AS s FROM cpu GROUP BY 1",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 1) * 1) AS s FROM cpu GROUP BY 1",
+		},
+		{
+			name:     "date_trunc week",
+			input:    "SELECT date_trunc('week', time) AS w FROM cpu GROUP BY 1",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 604800) * 604800) AS w FROM cpu GROUP BY 1",
+		},
+		// Month should NOT be rewritten (variable length)
+		{
+			name:     "date_trunc month unchanged",
+			input:    "SELECT date_trunc('month', time) AS m FROM cpu GROUP BY 1",
+			expected: "SELECT date_trunc('month', time) AS m FROM cpu GROUP BY 1",
+		},
+		// Case insensitivity
+		{
+			name:     "case insensitive DATE_TRUNC",
+			input:    "SELECT DATE_TRUNC('hour', time) AS h FROM cpu GROUP BY 1",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 3600) * 3600) AS h FROM cpu GROUP BY 1",
+		},
+		{
+			name:     "case insensitive Date_Trunc",
+			input:    "SELECT Date_Trunc('DAY', time) AS d FROM cpu GROUP BY 1",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 86400) * 86400) AS d FROM cpu GROUP BY 1",
+		},
+		// Multiple date_trunc calls
+		{
+			name:     "multiple date_trunc calls",
+			input:    "SELECT date_trunc('hour', time) AS h, date_trunc('day', time) AS d FROM cpu",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 3600) * 3600) AS h, to_timestamp((epoch(time)::BIGINT / 86400) * 86400) AS d FROM cpu",
+		},
+		// Different column names
+		{
+			name:     "different column name",
+			input:    "SELECT date_trunc('hour', created_at) AS h FROM events GROUP BY 1",
+			expected: "SELECT to_timestamp((epoch(created_at)::BIGINT / 3600) * 3600) AS h FROM events GROUP BY 1",
+		},
+		// No date_trunc - unchanged
+		{
+			name:     "no date_trunc unchanged",
+			input:    "SELECT * FROM cpu WHERE time > NOW() - INTERVAL '1 hour'",
+			expected: "SELECT * FROM cpu WHERE time > NOW() - INTERVAL '1 hour'",
+		},
+		// date_trunc in WHERE clause
+		{
+			name:     "date_trunc in WHERE clause",
+			input:    "SELECT * FROM cpu WHERE date_trunc('day', time) = '2024-01-01'",
+			expected: "SELECT * FROM cpu WHERE to_timestamp((epoch(time)::BIGINT / 86400) * 86400) = '2024-01-01'",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := rewriteDateTrunc(tt.input)
+			if result != tt.expected {
+				t.Errorf("rewriteDateTrunc(%q)\n  got:      %q\n  expected: %q",
+					tt.input, result, tt.expected)
 			}
 		})
 	}
