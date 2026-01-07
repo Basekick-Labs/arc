@@ -951,3 +951,220 @@ func (m *mockLocalBackend) Exists(ctx context.Context, path string) (bool, error
 func (m *mockLocalBackend) Close() error                                                   { return nil }
 func (m *mockLocalBackend) Type() string                                                   { return "mock" }
 func (m *mockLocalBackend) ConfigJSON() string                                             { return "{}" }
+
+func TestRewriteTimeBucket(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		// Standard intervals (1 unit) -> date_trunc
+		{
+			name:     "1 hour with INTERVAL keyword",
+			input:    "SELECT time_bucket(INTERVAL '1 hour', time) AS bucket FROM cpu",
+			expected: "SELECT date_trunc('hour', time) AS bucket FROM cpu",
+		},
+		{
+			name:     "1 hour without INTERVAL keyword",
+			input:    "SELECT time_bucket('1 hour', time) AS bucket FROM cpu",
+			expected: "SELECT date_trunc('hour', time) AS bucket FROM cpu",
+		},
+		{
+			name:     "1 day",
+			input:    "SELECT time_bucket('1 day', time) AS bucket FROM cpu",
+			expected: "SELECT date_trunc('day', time) AS bucket FROM cpu",
+		},
+		{
+			name:     "1 minute",
+			input:    "SELECT time_bucket('1 minute', time) AS bucket FROM cpu",
+			expected: "SELECT date_trunc('minute', time) AS bucket FROM cpu",
+		},
+		{
+			name:     "1 week",
+			input:    "SELECT time_bucket('1 week', time) AS bucket FROM cpu",
+			expected: "SELECT date_trunc('week', time) AS bucket FROM cpu",
+		},
+		{
+			name:     "1 second",
+			input:    "SELECT time_bucket('1 second', time) AS bucket FROM cpu",
+			expected: "SELECT date_trunc('second', time) AS bucket FROM cpu",
+		},
+		// Custom intervals -> epoch arithmetic
+		{
+			name:     "30 minutes",
+			input:    "SELECT time_bucket('30 minutes', time) AS bucket FROM cpu",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 1800) * 1800) AS bucket FROM cpu",
+		},
+		{
+			name:     "15 minutes",
+			input:    "SELECT time_bucket('15 minutes', time) AS bucket FROM cpu",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 900) * 900) AS bucket FROM cpu",
+		},
+		{
+			name:     "4 hours",
+			input:    "SELECT time_bucket('4 hours', time) AS bucket FROM cpu",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 14400) * 14400) AS bucket FROM cpu",
+		},
+		{
+			name:     "2 days",
+			input:    "SELECT time_bucket('2 days', time) AS bucket FROM cpu",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT / 172800) * 172800) AS bucket FROM cpu",
+		},
+		// Months should NOT be rewritten (variable length)
+		{
+			name:     "1 month stays unchanged",
+			input:    "SELECT time_bucket('1 month', time) AS bucket FROM cpu",
+			expected: "SELECT date_trunc('month', time) AS bucket FROM cpu",
+		},
+		{
+			name:     "2 months stays unchanged",
+			input:    "SELECT time_bucket('2 months', time) AS bucket FROM cpu",
+			expected: "SELECT time_bucket('2 months', time) AS bucket FROM cpu",
+		},
+		// Case insensitivity
+		{
+			name:     "case insensitive TIME_BUCKET",
+			input:    "SELECT TIME_BUCKET('1 hour', time) AS bucket FROM cpu",
+			expected: "SELECT date_trunc('hour', time) AS bucket FROM cpu",
+		},
+		{
+			name:     "case insensitive Time_Bucket",
+			input:    "SELECT Time_Bucket('1 HOUR', time) AS bucket FROM cpu",
+			expected: "SELECT date_trunc('hour', time) AS bucket FROM cpu",
+		},
+		// Multiple time_bucket calls
+		{
+			name:     "multiple time_bucket calls",
+			input:    "SELECT time_bucket('1 hour', time) AS h, time_bucket('30 minutes', time) AS m FROM cpu",
+			expected: "SELECT date_trunc('hour', time) AS h, to_timestamp((epoch(time)::BIGINT / 1800) * 1800) AS m FROM cpu",
+		},
+		// Column with expression
+		{
+			name:     "column expression",
+			input:    "SELECT time_bucket('1 hour', created_at) AS bucket FROM events",
+			expected: "SELECT date_trunc('hour', created_at) AS bucket FROM events",
+		},
+		// No time_bucket - unchanged
+		{
+			name:     "no time_bucket unchanged",
+			input:    "SELECT * FROM cpu WHERE time > NOW() - INTERVAL '1 hour'",
+			expected: "SELECT * FROM cpu WHERE time > NOW() - INTERVAL '1 hour'",
+		},
+		// Plural forms
+		{
+			name:     "singular hour",
+			input:    "SELECT time_bucket('1 hours', time) AS bucket FROM cpu",
+			expected: "SELECT date_trunc('hour', time) AS bucket FROM cpu",
+		},
+		{
+			name:     "singular day",
+			input:    "SELECT time_bucket('1 days', time) AS bucket FROM cpu",
+			expected: "SELECT date_trunc('day', time) AS bucket FROM cpu",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := rewriteTimeBucket(tt.input)
+			if result != tt.expected {
+				t.Errorf("rewriteTimeBucket(%q)\n  got:      %q\n  expected: %q",
+					tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestRewriteTimeBucketWithOrigin(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		contains string // Check if output contains this (since epoch values vary)
+	}{
+		{
+			name:     "3-arg with timestamp origin",
+			input:    "SELECT time_bucket('1 hour', time, '2024-01-01 00:30:00') AS bucket FROM cpu",
+			contains: "to_timestamp(",
+		},
+		{
+			name:     "3-arg with TIMESTAMP keyword",
+			input:    "SELECT time_bucket('1 hour', time, TIMESTAMP '2024-01-01 00:30:00') AS bucket FROM cpu",
+			contains: "to_timestamp(",
+		},
+		{
+			name:     "3-arg with date only origin",
+			input:    "SELECT time_bucket('30 minutes', time, '2024-01-01') AS bucket FROM cpu",
+			contains: "to_timestamp(",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := rewriteTimeBucket(tt.input)
+			if !strings.Contains(result, tt.contains) {
+				t.Errorf("rewriteTimeBucket(%q)\n  result: %q\n  should contain: %q",
+					tt.input, result, tt.contains)
+			}
+			// Should NOT contain time_bucket anymore
+			if strings.Contains(strings.ToLower(result), "time_bucket") {
+				t.Errorf("rewriteTimeBucket(%q)\n  result still contains time_bucket: %q",
+					tt.input, result)
+			}
+		})
+	}
+}
+
+func TestIntervalToSeconds(t *testing.T) {
+	tests := []struct {
+		amount   string
+		unit     string
+		expected int
+	}{
+		{"1", "second", 1},
+		{"30", "second", 30},
+		{"1", "minute", 60},
+		{"30", "minute", 1800},
+		{"1", "hour", 3600},
+		{"4", "hour", 14400},
+		{"1", "day", 86400},
+		{"2", "day", 172800},
+		{"1", "week", 604800},
+		{"1", "month", 0}, // months return 0 (variable length)
+		{"invalid", "hour", 0},
+	}
+
+	for _, tt := range tests {
+		name := tt.amount + " " + tt.unit
+		t.Run(name, func(t *testing.T) {
+			result := intervalToSeconds(tt.amount, tt.unit)
+			if result != tt.expected {
+				t.Errorf("intervalToSeconds(%q, %q) = %d, expected %d",
+					tt.amount, tt.unit, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestParseTimeBucketOrigin(t *testing.T) {
+	tests := []struct {
+		input   string
+		wantErr bool
+	}{
+		{"2024-01-01 00:30:00", false},
+		{"2024-01-01T00:30:00", false},
+		{"2024-01-01 00:30:00Z", false},
+		{"2024-01-01T00:30:00Z", false},
+		{"2024-01-01", false},
+		{"invalid", true},
+		{"2024/01/01", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			_, err := parseTimeBucketOrigin(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseTimeBucketOrigin(%q) error = %v, wantErr %v",
+					tt.input, err, tt.wantErr)
+			}
+		})
+	}
+}

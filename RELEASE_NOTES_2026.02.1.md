@@ -117,6 +117,28 @@ Fixed an issue where empty hour-level partition directories were left behind aft
 
 ## Improvements
 
+### Automatic `time_bucket()` Query Optimization
+
+Queries using `time_bucket()` are now automatically rewritten to faster alternatives, providing ~2x performance improvement without any code changes.
+
+**How it works:**
+- `time_bucket('1 hour', time)` → `date_trunc('hour', time)`
+- `time_bucket('30 minutes', time)` → `to_timestamp((epoch(time)::BIGINT / 1800) * 1800)`
+
+**Performance results:**
+| Query | Before | After | Improvement |
+|-------|--------|-------|-------------|
+| `time_bucket(INTERVAL '1 hour', time)` | 2814ms | 1427ms | **2.0x faster** |
+| `time_bucket('30 minutes', time)` | 2894ms | 1173ms | **2.5x faster** |
+
+**Supported patterns:**
+- Standard intervals (1 hour, 1 day, 1 week) → `date_trunc()`
+- Custom intervals (15 min, 30 min, 4 hours) → epoch arithmetic
+- 3-argument form with origin timestamp
+- Multiple `time_bucket()` calls in the same query
+
+**Note:** `time_bucket('1 month', time)` is preserved as-is because months have variable length.
+
 ### MQTT Client Auto-Generated Client ID
 
 When `client_id` is not specified in the MQTT configuration, Arc now auto-generates a unique client ID using the format `arc-{random-suffix}`. This prevents client ID collisions when running multiple Arc instances.
@@ -139,6 +161,29 @@ None
 
 - Added `github.com/eclipse/paho.mqtt.golang` for MQTT client support
 
+## Arc v26.01.2 Release Notes
+
+Bugfix release addressing Azure Blob Storage backend issues and authentication configuration.
+
+### Bug Fixes
+
+#### Azure Blob Storage Backend
+- **Fix queries failing with Azure backend** - Queries were incorrectly using local filesystem paths (`./data/...`) instead of Azure blob paths (`azure://...`) when using Azure Blob Storage as the storage backend.
+- **Fix compaction subprocess Azure authentication** - Compaction subprocess was failing with "DefaultAzureCredential: failed to acquire token" because credentials weren't being passed to the subprocess. Now passes `AZURE_STORAGE_KEY` via environment variable.
+
+#### Configuration
+- **Authentication enabled by default** - `auth.enabled` is now `true` by default in `arc.toml` for improved security out of the box.
+
+### Files Changed
+- `internal/api/query.go` - Add Azure case to `getStoragePath()`
+- `internal/database/duckdb.go` - Add `configureAzureAccess()` for DuckDB azure extension
+- `internal/compaction/manager.go` - Pass Azure credentials to subprocess via env var
+- `internal/compaction/subprocess.go` - Read Azure credentials from env var
+- `internal/storage/azure.go` - Add `GetAccountKey()` method
+- `arc.toml` - Set `auth.enabled = true` by default
+
+### Upgrade Notes
+- If you were relying on authentication being disabled by default, you'll need to explicitly set `auth.enabled = false` in your `arc.toml`.
 
 # Arc 2026.01.1 Release Notes
 

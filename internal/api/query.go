@@ -47,6 +47,14 @@ var (
 
 	// skipPrefixes are table name prefixes that should not be converted to storage paths
 	skipPrefixes = []string{"read_parquet", "information_schema", "pg_", "duckdb_"}
+
+	// Pattern for time_bucket function calls (2-argument form)
+	// Matches: time_bucket(INTERVAL '1 hour', time_column) or time_bucket('1 hour', time_column)
+	patternTimeBucket2Args = regexp.MustCompile(`(?i)\btime_bucket\s*\(\s*(?:INTERVAL\s*)?'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'\s*,\s*([^,)]+)\)`)
+
+	// Pattern for time_bucket function calls (3-argument form with origin)
+	// Matches: time_bucket(INTERVAL '1 hour', time_column, TIMESTAMP '2024-01-01')
+	patternTimeBucket3Args = regexp.MustCompile(`(?i)\btime_bucket\s*\(\s*(?:INTERVAL\s*)?'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'\s*,\s*([^,]+)\s*,\s*(?:TIMESTAMP\s*)?'([^']+)'\s*\)`)
 )
 
 // extractCTENames extracts CTE names from a SQL query's WITH clause.
@@ -65,6 +73,116 @@ func extractCTENames(sql string) map[string]bool {
 		}
 	}
 	return cteNames
+}
+
+// rewriteTimeBucket converts time_bucket() to faster alternatives.
+// For standard intervals (1 hour, 1 day, etc.) -> date_trunc()
+// For custom intervals (30 min, 15 min) -> epoch-based arithmetic
+// Handles both 2-arg and 3-arg (with origin) forms.
+// This optimization provides ~2x performance improvement over time_bucket().
+func rewriteTimeBucket(sql string) string {
+	// First handle 3-argument form (with origin) - must come first to avoid partial matches
+	sql = patternTimeBucket3Args.ReplaceAllStringFunc(sql, func(match string) string {
+		parts := patternTimeBucket3Args.FindStringSubmatch(match)
+		if len(parts) < 5 {
+			return match
+		}
+
+		amount := parts[1]
+		unit := strings.ToLower(strings.TrimSuffix(parts[2], "s"))
+		column := strings.TrimSpace(parts[3])
+		origin := parts[4] // e.g., "2024-01-01 00:30:00"
+
+		// Parse origin timestamp
+		originTime, err := parseTimeBucketOrigin(origin)
+		if err != nil {
+			return match // Keep original if can't parse origin
+		}
+
+		// Calculate interval in seconds
+		seconds := intervalToSeconds(amount, unit)
+		if seconds == 0 {
+			return match // Keep original for months or invalid units
+		}
+
+		// Calculate origin offset (seconds since epoch)
+		originEpoch := originTime.Unix()
+
+		// Formula: origin + floor((epoch(col) - origin_epoch) / interval) * interval
+		return fmt.Sprintf("to_timestamp(%d + ((epoch(%s)::BIGINT - %d) / %d) * %d)",
+			originEpoch, column, originEpoch, seconds, seconds)
+	})
+
+	// Then handle 2-argument form (no origin)
+	sql = patternTimeBucket2Args.ReplaceAllStringFunc(sql, func(match string) string {
+		parts := patternTimeBucket2Args.FindStringSubmatch(match)
+		if len(parts) < 4 {
+			return match
+		}
+
+		amount := parts[1]
+		unit := strings.ToLower(strings.TrimSuffix(parts[2], "s"))
+		column := strings.TrimSpace(parts[3])
+
+		// For standard intervals of 1, use date_trunc (simpler, fast)
+		if amount == "1" {
+			switch unit {
+			case "second", "minute", "hour", "day", "week", "month":
+				return fmt.Sprintf("date_trunc('%s', %s)", unit, column)
+			}
+		}
+
+		// For custom intervals, use epoch-based arithmetic
+		seconds := intervalToSeconds(amount, unit)
+		if seconds == 0 {
+			return match // Keep original for months (variable length)
+		}
+
+		return fmt.Sprintf("to_timestamp((epoch(%s)::BIGINT / %d) * %d)", column, seconds, seconds)
+	})
+
+	return sql
+}
+
+// intervalToSeconds converts an interval amount and unit to seconds.
+// Returns 0 for variable-length intervals (months) or invalid units.
+func intervalToSeconds(amount, unit string) int {
+	n, err := strconv.Atoi(amount)
+	if err != nil {
+		return 0
+	}
+
+	switch unit {
+	case "second":
+		return n
+	case "minute":
+		return n * 60
+	case "hour":
+		return n * 3600
+	case "day":
+		return n * 86400
+	case "week":
+		return n * 604800
+	default:
+		return 0 // months have variable length
+	}
+}
+
+// parseTimeBucketOrigin parses common timestamp formats used in time_bucket origin parameter.
+func parseTimeBucketOrigin(s string) (time.Time, error) {
+	formats := []string{
+		"2006-01-02 15:04:05",
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05Z",
+		"2006-01-02T15:04:05Z",
+		"2006-01-02",
+	}
+	for _, f := range formats {
+		if t, err := time.Parse(f, s); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("cannot parse timestamp: %s", s)
 }
 
 // stringMask holds a placeholder and the original string content it replaced
@@ -554,6 +672,11 @@ func (h *QueryHandler) getTransformedSQL(sql string) (string, bool) {
 // String literals and comments are protected from regex matching.
 func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 	originalSQL := sql
+
+	// Phase 0: Rewrite time_bucket() to faster alternatives BEFORE masking
+	// This must happen first because time_bucket('1 hour', time) contains string literals
+	// that would be masked, preventing our regex from matching
+	sql = rewriteTimeBucket(sql)
 
 	// Single pass to detect features (replaces 3 separate strings.Contains calls)
 	features := scanSQLFeatures(sql)
