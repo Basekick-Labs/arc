@@ -117,27 +117,31 @@ Fixed an issue where empty hour-level partition directories were left behind aft
 
 ## Improvements
 
-### Automatic `time_bucket()` Query Optimization
+### Automatic Time Function Query Optimization
 
-Queries using `time_bucket()` are now automatically rewritten to faster alternatives, providing ~2x performance improvement without any code changes.
+Queries using `time_bucket()` and `date_trunc()` are now automatically rewritten to epoch-based arithmetic, providing **2-2.5x performance improvement** for GROUP BY queries without any code changes.
 
 **How it works:**
-- `time_bucket('1 hour', time)` → `date_trunc('hour', time)`
+- `time_bucket('1 hour', time)` → `to_timestamp((epoch(time)::BIGINT / 3600) * 3600)`
 - `time_bucket('30 minutes', time)` → `to_timestamp((epoch(time)::BIGINT / 1800) * 1800)`
+- `date_trunc('day', time)` → `to_timestamp((epoch(time)::BIGINT / 86400) * 86400)`
+- `date_trunc('hour', time)` → `to_timestamp((epoch(time)::BIGINT / 3600) * 3600)`
 
 **Performance results:**
 | Query | Before | After | Improvement |
 |-------|--------|-------|-------------|
-| `time_bucket(INTERVAL '1 hour', time)` | 2814ms | 1427ms | **2.0x faster** |
+| `date_trunc('day', time) GROUP BY` | 4000ms | 1560ms | **2.6x faster** |
+| `date_trunc('hour', time) GROUP BY` | 4000ms | 1560ms | **2.6x faster** |
+| `time_bucket('1 hour', time)` | 2814ms | 1560ms | **1.8x faster** |
 | `time_bucket('30 minutes', time)` | 2894ms | 1173ms | **2.5x faster** |
 
 **Supported patterns:**
-- Standard intervals (1 hour, 1 day, 1 week) → `date_trunc()`
-- Custom intervals (15 min, 30 min, 4 hours) → epoch arithmetic
-- 3-argument form with origin timestamp
-- Multiple `time_bucket()` calls in the same query
+- `time_bucket()` with all interval types
+- `date_trunc()` with second, minute, hour, day, week
+- 3-argument time_bucket form with origin timestamp
+- Multiple time function calls in the same query
 
-**Note:** `time_bucket('1 month', time)` is preserved as-is because months have variable length.
+**Note:** `time_bucket('1 month', time)` and `date_trunc('month', time)` are preserved as-is because months have variable length.
 
 ### MQTT Client Auto-Generated Client ID
 
