@@ -255,7 +255,7 @@ enabled = true
 # -----------------------------------------------------------------------------
 [mqtt]
 # Enable MQTT subscription manager (subscriptions configured via API)
-enabled = true
+enabled = false
 
 [telemetry]
 enabled = true
