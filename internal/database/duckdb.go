@@ -63,7 +63,7 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 	}
 
 	// Configure database settings (memory limit, threads)
-	if err := configureDatabase(db, cfg); err != nil {
+	if err := configureDatabase(db, cfg, logger); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to configure duckdb: %w", err)
 	}
@@ -90,13 +90,13 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 
 // buildDSN constructs the DuckDB connection string
 // NOTE: DuckDB memory_limit and threads must be set via SET commands after connection
-func buildDSN(cfg *Config) string {
+func buildDSN(_ *Config) string {
 	// In-memory database - settings applied via configureDatabase()
 	return ""
 }
 
 // configureDatabase sets DuckDB configuration after connection
-func configureDatabase(db *sql.DB, cfg *Config) error {
+func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	// Set memory limit to prevent unbounded memory growth
 	if cfg.MemoryLimit != "" {
 		if _, err := db.Exec(fmt.Sprintf("SET memory_limit='%s'", cfg.MemoryLimit)); err != nil {

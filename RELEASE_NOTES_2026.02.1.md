@@ -102,6 +102,14 @@ WHERE time > NOW() - INTERVAL '4 minutes'
 
 ## Bug Fixes
 
+### Azure Blob Storage Query SSL Certificate Errors on Linux (PR #92)
+
+Fixed SSL certificate validation errors when querying data from Azure Blob Storage on Linux. The DuckDB azure extension was failing to find CA certificates due to path resolution issues with static linking.
+
+**Fix:** On Linux, Arc now sets `azure_transport_option_type = 'curl'` which uses the system's curl library for SSL handling instead of DuckDB's built-in implementation.
+
+*Contributed by [@schotime](https://github.com/schotime)*
+
 ### Empty Directories Not Cleaned Up After Daily Compaction
 
 Fixed an issue where empty hour-level partition directories were left behind after daily compaction consolidated files into day-level partitions.
@@ -142,6 +150,8 @@ Queries using `time_bucket()` and `date_trunc()` are now automatically rewritten
 - Multiple time function calls in the same query
 
 **Note:** `time_bucket('1 month', time)` and `date_trunc('month', time)` are preserved as-is because months have variable length.
+
+**Fast-path optimization (PR #99):** Queries that don't use `time_bucket` or `date_trunc` now skip regex processing entirely via a simple `strings.Contains` check. This eliminates ~21 unnecessary allocations (~44KB) per query, providing an **8.8x speedup** for the SQL transformation step on queries without time functions.
 
 ### MQTT Client Auto-Generated Client ID
 
@@ -508,7 +518,7 @@ None
 
 Thanks to the following contributors for this release:
 
-- [@schotime](https://github.com/schotime) (Adam Schroder) - Data-time partitioning, compaction API triggers, UTC fixes
+- [@schotime](https://github.com/schotime) (Adam Schroder) - Data-time partitioning, compaction API triggers, UTC fixes, Azure SSL certificate fix
 
 ## Dependencies
 
