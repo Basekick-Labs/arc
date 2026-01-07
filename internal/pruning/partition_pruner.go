@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -130,6 +131,13 @@ var (
 
 	// Pattern for BETWEEN clause
 	betweenPattern = regexp.MustCompile(`(?i)time\s+BETWEEN\s+'([^']+)'\s+AND\s+'([^']+)'`)
+
+	// Patterns for relative time expressions (NOW() +/- INTERVAL)
+	// These capture: (1) the numeric amount, (2) the time unit, and detect +/- via separate patterns
+	relativeStartSubtractPattern = regexp.MustCompile(`(?i)time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
+	relativeStartAddPattern      = regexp.MustCompile(`(?i)time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
+	relativeEndSubtractPattern   = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
+	relativeEndAddPattern        = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
 
 	// Pattern to parse storage paths
 	storagePathPattern = regexp.MustCompile(`(.+)/([^/]+)/([^/]+)/\*\*/\*\.parquet$`)
@@ -269,6 +277,42 @@ type TimeRange struct {
 	End   time.Time
 }
 
+// evaluateRelativeTime converts a relative time expression to an absolute time.
+// amount: the numeric value (e.g., "20")
+// unit: the time unit (e.g., "days", "hours")
+// isAddition: true for NOW() + INTERVAL, false for NOW() - INTERVAL
+func evaluateRelativeTime(amount string, unit string, isAddition bool) (time.Time, error) {
+	n, err := strconv.Atoi(amount)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	// For subtraction, make n negative
+	if !isAddition {
+		n = -n
+	}
+
+	now := time.Now().UTC()
+	unit = strings.ToLower(strings.TrimSuffix(unit, "s")) // normalize: days -> day
+
+	switch unit {
+	case "second":
+		return now.Add(time.Duration(n) * time.Second), nil
+	case "minute":
+		return now.Add(time.Duration(n) * time.Minute), nil
+	case "hour":
+		return now.Add(time.Duration(n) * time.Hour), nil
+	case "day":
+		return now.AddDate(0, 0, n), nil
+	case "week":
+		return now.AddDate(0, 0, n*7), nil
+	case "month":
+		return now.AddDate(0, n, 0), nil
+	default:
+		return time.Time{}, fmt.Errorf("unknown time unit: %s", unit)
+	}
+}
+
 // NewPartitionPruner creates a new partition pruner
 func NewPartitionPruner(logger zerolog.Logger) *PartitionPruner {
 	return &PartitionPruner{
@@ -287,6 +331,9 @@ func NewPartitionPruner(logger zerolog.Logger) *PartitionPruner {
 // - time BETWEEN '2024-03-15' AND '2024-03-16'
 // - time > '2024-03-15 10:00:00'
 // - time >= '2024-03-15T10:00:00Z'
+// - time > NOW() - INTERVAL '20 days'
+// - time >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
+// - time < NOW() + INTERVAL '1 week'
 func (p *PartitionPruner) ExtractTimeRange(sql string) *TimeRange {
 	// Check if WHERE clause exists
 	if !strings.Contains(strings.ToUpper(sql), "WHERE") {
@@ -336,6 +383,46 @@ func (p *PartitionPruner) ExtractTimeRange(sql string) *TimeRange {
 					Time("start_time", t1).
 					Time("end_time", t2).
 					Msg("Found BETWEEN range")
+			}
+		}
+	}
+
+	// Try relative time patterns for start time if not found yet
+	if startTime == nil {
+		// Try NOW() - INTERVAL pattern (subtraction)
+		if match := relativeStartSubtractPattern.FindStringSubmatch(whereClause); match != nil {
+			if t, err := evaluateRelativeTime(match[1], match[2], false); err == nil {
+				startTime = &t
+				p.logger.Debug().Time("start_time", t).Str("expression", "NOW() - INTERVAL").Msg("Found relative start time")
+			}
+		}
+		// Try NOW() + INTERVAL pattern (addition)
+		if startTime == nil {
+			if match := relativeStartAddPattern.FindStringSubmatch(whereClause); match != nil {
+				if t, err := evaluateRelativeTime(match[1], match[2], true); err == nil {
+					startTime = &t
+					p.logger.Debug().Time("start_time", t).Str("expression", "NOW() + INTERVAL").Msg("Found relative start time")
+				}
+			}
+		}
+	}
+
+	// Try relative time patterns for end time if not found yet
+	if endTime == nil {
+		// Try NOW() - INTERVAL pattern (subtraction)
+		if match := relativeEndSubtractPattern.FindStringSubmatch(whereClause); match != nil {
+			if t, err := evaluateRelativeTime(match[1], match[2], false); err == nil {
+				endTime = &t
+				p.logger.Debug().Time("end_time", t).Str("expression", "NOW() - INTERVAL").Msg("Found relative end time")
+			}
+		}
+		// Try NOW() + INTERVAL pattern (addition)
+		if endTime == nil {
+			if match := relativeEndAddPattern.FindStringSubmatch(whereClause); match != nil {
+				if t, err := evaluateRelativeTime(match[1], match[2], true); err == nil {
+					endTime = &t
+					p.logger.Debug().Time("end_time", t).Str("expression", "NOW() + INTERVAL").Msg("Found relative end time")
+				}
 			}
 		}
 	}

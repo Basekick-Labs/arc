@@ -786,3 +786,238 @@ func contains(s, substr string) bool {
 	}
 	return false
 }
+
+// TestEvaluateRelativeTime tests the relative time evaluation function
+func TestEvaluateRelativeTime(t *testing.T) {
+	// Get current time for comparison (with some tolerance)
+	now := time.Now().UTC()
+
+	tests := []struct {
+		name       string
+		amount     string
+		unit       string
+		isAddition bool
+		wantDiff   time.Duration // expected difference from now (negative for past)
+		tolerance  time.Duration
+	}{
+		{
+			name:       "20 days ago",
+			amount:     "20",
+			unit:       "days",
+			isAddition: false,
+			wantDiff:   -20 * 24 * time.Hour,
+			tolerance:  time.Minute,
+		},
+		{
+			name:       "24 hours ago",
+			amount:     "24",
+			unit:       "hours",
+			isAddition: false,
+			wantDiff:   -24 * time.Hour,
+			tolerance:  time.Minute,
+		},
+		{
+			name:       "30 minutes ago",
+			amount:     "30",
+			unit:       "minutes",
+			isAddition: false,
+			wantDiff:   -30 * time.Minute,
+			tolerance:  time.Second,
+		},
+		{
+			name:       "1 week ago",
+			amount:     "1",
+			unit:       "week",
+			isAddition: false,
+			wantDiff:   -7 * 24 * time.Hour,
+			tolerance:  time.Minute,
+		},
+		{
+			name:       "1 day in future",
+			amount:     "1",
+			unit:       "day",
+			isAddition: true,
+			wantDiff:   24 * time.Hour,
+			tolerance:  time.Minute,
+		},
+		{
+			name:       "2 hours in future",
+			amount:     "2",
+			unit:       "hours",
+			isAddition: true,
+			wantDiff:   2 * time.Hour,
+			tolerance:  time.Minute,
+		},
+		{
+			name:       "singular unit - day",
+			amount:     "1",
+			unit:       "day",
+			isAddition: false,
+			wantDiff:   -24 * time.Hour,
+			tolerance:  time.Minute,
+		},
+		{
+			name:       "singular unit - hour",
+			amount:     "1",
+			unit:       "hour",
+			isAddition: false,
+			wantDiff:   -1 * time.Hour,
+			tolerance:  time.Minute,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := evaluateRelativeTime(tt.amount, tt.unit, tt.isAddition)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			// Calculate the actual difference from now
+			actualDiff := result.Sub(now)
+
+			// Check if within tolerance
+			expectedDiff := tt.wantDiff
+			diff := actualDiff - expectedDiff
+			if diff < 0 {
+				diff = -diff
+			}
+
+			if diff > tt.tolerance {
+				t.Errorf("Time difference = %v, want %v (±%v)", actualDiff, expectedDiff, tt.tolerance)
+			}
+		})
+	}
+}
+
+// TestEvaluateRelativeTimeErrors tests error cases
+func TestEvaluateRelativeTimeErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		amount string
+		unit   string
+	}{
+		{"invalid amount", "abc", "days"},
+		{"unknown unit", "10", "decades"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := evaluateRelativeTime(tt.amount, tt.unit, false)
+			if err == nil {
+				t.Error("Expected error, got nil")
+			}
+		})
+	}
+}
+
+// TestExtractTimeRangeRelative tests relative time extraction from SQL queries
+func TestExtractTimeRangeRelative(t *testing.T) {
+	logger := zerolog.Nop()
+	p := NewPartitionPruner(logger)
+	now := time.Now().UTC()
+
+	tests := []struct {
+		name          string
+		sql           string
+		expectStart   bool
+		startDaysAgo  int // approximate days from now (negative = past)
+		expectEnd     bool
+		endDaysAgo    int
+	}{
+		{
+			name:         "NOW() - INTERVAL days",
+			sql:          "SELECT * FROM cpu WHERE time > NOW() - INTERVAL '20 days'",
+			expectStart:  true,
+			startDaysAgo: -20,
+		},
+		{
+			name:         "now() lowercase",
+			sql:          "SELECT * FROM cpu WHERE time >= now() - INTERVAL '10 days'",
+			expectStart:  true,
+			startDaysAgo: -10,
+		},
+		{
+			name:         "CURRENT_TIMESTAMP",
+			sql:          "SELECT * FROM cpu WHERE time > CURRENT_TIMESTAMP - INTERVAL '7 days'",
+			expectStart:  true,
+			startDaysAgo: -7,
+		},
+		{
+			name:         "hours interval",
+			sql:          "SELECT * FROM cpu WHERE time >= NOW() - INTERVAL '24 hours'",
+			expectStart:  true,
+			startDaysAgo: -1, // 24 hours ≈ 1 day
+		},
+		{
+			name:         "end time with relative",
+			sql:          "SELECT * FROM cpu WHERE time < NOW() - INTERVAL '30 days'",
+			expectEnd:    true,
+			endDaysAgo:   -30,
+		},
+		{
+			name:         "NOW() + INTERVAL (future)",
+			sql:          "SELECT * FROM cpu WHERE time >= NOW() + INTERVAL '1 day'",
+			expectStart:  true,
+			startDaysAgo: 1,
+		},
+		{
+			name:         "week interval",
+			sql:          "SELECT * FROM cpu WHERE time > NOW() - INTERVAL '2 weeks'",
+			expectStart:  true,
+			startDaysAgo: -14,
+		},
+		{
+			name:         "mixed literal and relative",
+			sql:          "SELECT * FROM cpu WHERE time >= '2024-01-01' AND time < NOW() - INTERVAL '1 day'",
+			expectStart:  true,
+			startDaysAgo: 0, // Will match the literal '2024-01-01', not the relative
+			expectEnd:    true,
+			endDaysAgo:   -1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tr := p.ExtractTimeRange(tt.sql)
+
+			if tr == nil {
+				t.Fatal("Expected non-nil time range, got nil")
+			}
+
+			if tt.expectStart {
+				// For the mixed case, check if it's a literal date
+				if tt.name == "mixed literal and relative" {
+					// Start should be the literal 2024-01-01
+					expectedStart, _ := parseDateTime("2024-01-01")
+					if !tr.Start.Equal(expectedStart) {
+						t.Errorf("Start time = %v, want %v", tr.Start, expectedStart)
+					}
+				} else {
+					// Check that start time is approximately correct
+					expectedStart := now.AddDate(0, 0, tt.startDaysAgo)
+					diff := tr.Start.Sub(expectedStart)
+					if diff < 0 {
+						diff = -diff
+					}
+					// Allow 1 hour tolerance for day-based calculations
+					if diff > time.Hour {
+						t.Errorf("Start time = %v, want approximately %v (diff: %v)", tr.Start, expectedStart, diff)
+					}
+				}
+			}
+
+			if tt.expectEnd {
+				expectedEnd := now.AddDate(0, 0, tt.endDaysAgo)
+				diff := tr.End.Sub(expectedEnd)
+				if diff < 0 {
+					diff = -diff
+				}
+				// Allow 1 hour tolerance
+				if diff > time.Hour {
+					t.Errorf("End time = %v, want approximately %v (diff: %v)", tr.End, expectedEnd, diff)
+				}
+			}
+		})
+	}
+}
