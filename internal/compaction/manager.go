@@ -26,6 +26,7 @@ type Manager struct {
 	TargetSizeMB  int
 	MaxConcurrent int
 	TempDirectory string // Temp directory for compaction files
+	MemoryLimit   string // DuckDB memory limit for subprocess (e.g., "8GB")
 
 	// Sort key configuration (from ingest config)
 	SortKeysConfig  map[string][]string // measurement -> sort keys
@@ -60,6 +61,7 @@ type ManagerConfig struct {
 	TargetSizeMB    int
 	MaxConcurrent   int
 	TempDirectory   string              // Temp directory for compaction files
+	MemoryLimit     string              // DuckDB memory limit for subprocess (e.g., "8GB")
 	SortKeysConfig  map[string][]string // Per-measurement sort keys from ingest config
 	DefaultSortKeys []string            // Default sort keys from ingest config
 	Tiers           []Tier
@@ -104,6 +106,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		TargetSizeMB:    cfg.TargetSizeMB,
 		MaxConcurrent:   cfg.MaxConcurrent,
 		TempDirectory:   cfg.TempDirectory,
+		MemoryLimit:     cfg.MemoryLimit,
 		SortKeysConfig:  sortKeysConfig,
 		DefaultSortKeys: defaultSortKeys,
 		Tiers:           cfg.Tiers,
@@ -200,6 +203,7 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 		Tier:          candidate.Tier,
 		TargetSizeMB:  m.TargetSizeMB,
 		TempDirectory: m.TempDirectory,
+		MemoryLimit:   m.MemoryLimit,
 		SortKeys:      m.GetSortKeys(candidate.Measurement),
 		StorageType:   m.StorageBackend.Type(),
 		StorageConfig: m.StorageBackend.ConfigJSON(),
@@ -389,26 +393,41 @@ func (m *Manager) RunCompactionCycleForTiers(ctx context.Context, tierNames []st
 
 				// Process this measurement's candidates immediately
 				for _, candidate := range candidates {
-					tierCandidateCount++
+					// Split large candidates into batches to prevent DuckDB segfaults
+					// when processing too many files in a single read_parquet() call
+					batches := SplitCandidateIntoBatches(candidate)
+					if len(batches) > 1 {
+						m.logger.Info().
+							Str("partition", candidate.PartitionPath).
+							Int("total_files", len(candidate.Files)).
+							Int("batches", len(batches)).
+							Msg("Splitting large candidate into batches")
+					}
 
-					wg.Add(1)
-					sem <- struct{}{} // Acquire semaphore
+					for _, batch := range batches {
+						tierCandidateCount++
 
-					go func(c Candidate) {
-						defer wg.Done()
-						defer func() { <-sem }() // Release semaphore
+						wg.Add(1)
+						sem <- struct{}{} // Acquire semaphore
 
-						if err := m.CompactPartition(ctx, c); err != nil {
-							m.logger.Error().Err(err).
-								Str("partition", c.PartitionPath).
-								Str("tier", tierName).
-								Int64("cycle_id", cycleID).
-								Msg("Compaction failed")
-							errMu.Lock()
-							errCount++
-							errMu.Unlock()
-						}
-					}(candidate)
+						go func(c Candidate) {
+							defer wg.Done()
+							defer func() { <-sem }() // Release semaphore
+
+							if err := m.CompactPartition(ctx, c); err != nil {
+								m.logger.Error().Err(err).
+									Str("partition", c.PartitionPath).
+									Str("tier", tierName).
+									Int("batch", c.BatchNumber).
+									Int("total_batches", c.TotalBatches).
+									Int64("cycle_id", cycleID).
+									Msg("Compaction failed")
+								errMu.Lock()
+								errCount++
+								errMu.Unlock()
+							}
+						}(batch)
+					}
 				}
 				// candidates slice is now eligible for GC after this iteration
 			}

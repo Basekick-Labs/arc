@@ -10,6 +10,11 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// MaxFilesPerBatch is the maximum number of files to process in a single compaction job.
+// DuckDB can segfault when processing too many files in a single read_parquet() call.
+// This limit prevents OOM and segfaults on partitions with thousands of files.
+const MaxFilesPerBatch = 1000
+
 // Candidate represents a partition candidate for compaction
 type Candidate struct {
 	Database      string
@@ -19,6 +24,44 @@ type Candidate struct {
 	FileCount     int
 	Tier          string
 	PartitionTime time.Time
+	BatchNumber   int // Batch number when candidate is split (0 = not batched or first batch)
+	TotalBatches  int // Total number of batches for this partition (0 = not batched)
+}
+
+// SplitCandidateIntoBatches splits a candidate with many files into multiple candidates,
+// each with at most MaxFilesPerBatch files. This prevents DuckDB segfaults when processing
+// thousands of files in a single read_parquet() call.
+func SplitCandidateIntoBatches(c Candidate) []Candidate {
+	if len(c.Files) <= MaxFilesPerBatch {
+		return []Candidate{c}
+	}
+
+	// Calculate number of batches needed
+	numBatches := (len(c.Files) + MaxFilesPerBatch - 1) / MaxFilesPerBatch
+
+	batches := make([]Candidate, 0, numBatches)
+	for i := 0; i < numBatches; i++ {
+		start := i * MaxFilesPerBatch
+		end := start + MaxFilesPerBatch
+		if end > len(c.Files) {
+			end = len(c.Files)
+		}
+
+		batch := Candidate{
+			Database:      c.Database,
+			Measurement:   c.Measurement,
+			PartitionPath: c.PartitionPath,
+			Files:         c.Files[start:end],
+			FileCount:     end - start,
+			Tier:          c.Tier,
+			PartitionTime: c.PartitionTime,
+			BatchNumber:   i + 1,
+			TotalBatches:  numBatches,
+		}
+		batches = append(batches, batch)
+	}
+
+	return batches
 }
 
 // Tier defines the interface for compaction tiers (hourly, daily, weekly, monthly)

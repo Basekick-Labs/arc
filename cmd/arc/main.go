@@ -462,6 +462,7 @@ func main() {
 			StorageBackend:  storageBackend,
 			LockManager:     lockManager,
 			MaxConcurrent:   cfg.Compaction.MaxConcurrent,
+			MemoryLimit:     cfg.Database.MemoryLimit, // Use same limit as main DuckDB
 			SortKeysConfig:  sortKeysConfig,
 			DefaultSortKeys: defaultSortKeys,
 			Tiers:           tiers,

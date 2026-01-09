@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
+	"runtime/pprof"
 	"strings"
 
 	"github.com/basekick-labs/arc/internal/storage"
@@ -27,7 +29,8 @@ type SubprocessJobConfig struct {
 	Tier          string   `json:"tier"`
 	TargetSizeMB  int      `json:"target_size_mb"`
 	TempDirectory string   `json:"temp_directory"`
-	SortKeys      []string `json:"sort_keys"` // Sort keys for ORDER BY in compaction
+	SortKeys      []string `json:"sort_keys"`    // Sort keys for ORDER BY in compaction
+	MemoryLimit   string   `json:"memory_limit"` // DuckDB memory limit (e.g., "8GB")
 
 	// Storage configuration
 	StorageType   string `json:"storage_type"`   // "local" or "s3"
@@ -48,12 +51,22 @@ type SubprocessJobResult struct {
 // RunSubprocessJob is called from the subprocess to execute compaction.
 // It creates a new DuckDB connection, runs the job, and returns the result.
 // When this function returns and the subprocess exits, all DuckDB memory is released.
+//
+// Memory profiling: Set ARC_COMPACTION_PROFILE=1 to enable heap profiling.
+// Profiles are written to /tmp/arc_compaction_heap_before.pprof and /tmp/arc_compaction_heap_after.pprof
 func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error) {
 	// Setup logging to stderr (stdout is reserved for result JSON)
 	logger := zerolog.New(os.Stderr).With().Timestamp().
 		Str("component", "compaction-subprocess").
 		Str("partition", config.PartitionPath).
 		Logger()
+
+	// Check if profiling is enabled
+	profilingEnabled := os.Getenv("ARC_COMPACTION_PROFILE") == "1"
+	if profilingEnabled {
+		logger.Info().Msg("Memory profiling enabled - writing heap profiles to /tmp/")
+		logMemStats(logger, "BEFORE compaction")
+	}
 
 	logger.Info().Msg("Starting compaction subprocess")
 
@@ -71,6 +84,16 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 		return nil, fmt.Errorf("failed to open duckdb: %w", err)
 	}
 	defer db.Close()
+
+	// Set DuckDB memory limit from config.
+	// This prevents OOM on servers without swap by forcing DuckDB to spill to disk.
+	if config.MemoryLimit != "" {
+		if _, err := db.Exec(fmt.Sprintf("SET memory_limit='%s'", config.MemoryLimit)); err != nil {
+			logger.Warn().Err(err).Str("limit", config.MemoryLimit).Msg("Failed to set DuckDB memory limit")
+		} else {
+			logger.Info().Str("limit", config.MemoryLimit).Msg("DuckDB memory limit configured")
+		}
+	}
 
 	// Create and run job
 	job := NewJob(&JobConfig{
@@ -107,7 +130,48 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 		Int64("bytes_after", result.BytesAfter).
 		Msg("Compaction subprocess completed")
 
+	// Write heap profile if profiling is enabled
+	if profilingEnabled {
+		logMemStats(logger, "AFTER compaction")
+		writeHeapProfile(logger, "/tmp/arc_compaction_heap.pprof")
+	}
+
 	return result, nil
+}
+
+// logMemStats logs current memory statistics
+func logMemStats(logger zerolog.Logger, label string) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	logger.Info().
+		Str("label", label).
+		Uint64("alloc_mb", m.Alloc/1024/1024).
+		Uint64("total_alloc_mb", m.TotalAlloc/1024/1024).
+		Uint64("sys_mb", m.Sys/1024/1024).
+		Uint64("heap_alloc_mb", m.HeapAlloc/1024/1024).
+		Uint64("heap_sys_mb", m.HeapSys/1024/1024).
+		Uint64("heap_inuse_mb", m.HeapInuse/1024/1024).
+		Uint32("num_gc", m.NumGC).
+		Msg("Memory stats")
+}
+
+// writeHeapProfile writes a heap profile to the specified path
+func writeHeapProfile(logger zerolog.Logger, path string) {
+	f, err := os.Create(path)
+	if err != nil {
+		logger.Error().Err(err).Str("path", path).Msg("Failed to create heap profile")
+		return
+	}
+	defer f.Close()
+
+	// Force GC before capturing profile for accurate view
+	runtime.GC()
+
+	if err := pprof.WriteHeapProfile(f); err != nil {
+		logger.Error().Err(err).Msg("Failed to write heap profile")
+		return
+	}
+	logger.Info().Str("path", path).Msg("Heap profile written")
 }
 
 // RunJobInSubprocess executes compaction in a subprocess for memory isolation.
