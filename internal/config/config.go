@@ -26,6 +26,8 @@ type Config struct {
 	ContinuousQuery ContinuousQueryConfig
 	Metrics         MetricsConfig
 	MQTT            MQTTConfig
+	License         LicenseConfig
+	Scheduler       SchedulerConfig
 }
 
 type ServerConfig struct {
@@ -154,6 +156,19 @@ type MetricsConfig struct {
 // See POST /api/v1/mqtt/subscriptions for creating subscriptions.
 type MQTTConfig struct {
 	Enabled bool // Enable MQTT subscription manager feature
+}
+
+// LicenseConfig holds configuration for enterprise license validation
+type LicenseConfig struct {
+	Enabled bool   // Enable license validation (default: false)
+	Key     string // License key (ARC-ENT-XXXX-XXXX-XXXX-XXXX)
+}
+
+// SchedulerConfig holds configuration for automatic schedulers (Enterprise features)
+// Note: CQ and retention schedulers are automatically enabled when their respective features
+// are enabled (continuous_query.enabled, retention.enabled) AND a valid license is present.
+type SchedulerConfig struct {
+	RetentionSchedule string // Cron schedule for retention (default: "0 3 * * *" = 3am daily)
 }
 
 // Load loads configuration from environment and config file
@@ -299,6 +314,13 @@ func Load() (*Config, error) {
 		MQTT: MQTTConfig{
 			Enabled: v.GetBool("mqtt.enabled"),
 		},
+		License: LicenseConfig{
+			Enabled: v.GetBool("license.enabled"),
+			Key:     v.GetString("license.key"),
+		},
+		Scheduler: SchedulerConfig{
+			RetentionSchedule: v.GetString("scheduler.retention_schedule"),
+		},
 	}
 
 	return cfg, nil
@@ -402,6 +424,15 @@ func setDefaults(v *viper.Viper) {
 
 	// MQTT defaults (subscriptions are configured via REST API, stored in SQLite)
 	v.SetDefault("mqtt.enabled", false) // Feature toggle only - disabled by default
+
+	// License defaults (Enterprise features)
+	// Note: Server URL and validation interval are hardcoded in internal/license/client.go
+	v.SetDefault("license.enabled", false) // Disabled by default
+	v.SetDefault("license.key", "")        // Must be provided
+
+	// Scheduler defaults (Enterprise features)
+	// Note: CQ and retention schedulers are auto-enabled when their features are enabled AND license allows
+	v.SetDefault("scheduler.retention_schedule", "0 3 * * *") // 3am daily
 }
 
 func getDefaultThreadCount() int {

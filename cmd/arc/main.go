@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/api"
@@ -15,9 +16,11 @@ import (
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/ingest"
+	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/logger"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/mqtt"
+	"github.com/basekick-labs/arc/internal/scheduler"
 	"github.com/basekick-labs/arc/internal/shutdown"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/telemetry"
@@ -52,6 +55,77 @@ func main() {
 	logger.Setup(cfg.Log.Level, cfg.Log.Format)
 	log.Info().Str("version", Version).Msg("Starting Arc...")
 
+	// Validate Enterprise License early (before component initialization)
+	// This allows us to apply core limits to DuckDB and ingestion workers
+	var licenseClient *license.Client
+	if cfg.License.Key != "" {
+		log.Info().
+			Str("license_key", cfg.License.Key[:min(12, len(cfg.License.Key))]+"...").
+			Str("server_url", license.LicenseServerURL).
+			Msg("Validating enterprise license")
+
+		var err error
+		licenseClient, err = license.NewClient(&license.ClientConfig{
+			LicenseKey: cfg.License.Key,
+			Logger:     logger.Get("license"),
+		})
+		if err != nil {
+			log.Warn().Err(err).Msg("Failed to initialize license client - enterprise features disabled")
+		} else {
+			// Activate or verify license at startup
+			lic, err := licenseClient.ActivateOrVerify(context.Background())
+			if err != nil {
+				log.Warn().
+					Err(err).
+					Str("license_key", cfg.License.Key[:min(12, len(cfg.License.Key))]+"...").
+					Msg("License activation/verification failed - enterprise features disabled")
+				licenseClient = nil
+			} else {
+				log.Info().
+					Str("tier", string(lic.Tier)).
+					Str("status", lic.Status).
+					Int("days_remaining", lic.DaysRemaining).
+					Int("max_cores", lic.MaxCores).
+					Time("expires_at", lic.ExpiresAt).
+					Strs("features", lic.Features).
+					Msg("Enterprise license verified successfully")
+
+				// Apply core limits from license to config
+				// This ensures DuckDB and ingestion workers respect the license
+				if lic.MaxCores > 0 {
+					machineCores := runtime.NumCPU()
+
+					if machineCores > lic.MaxCores {
+						// Limit Go runtime to licensed cores - this is the real enforcement
+						previousGOMAXPROCS := runtime.GOMAXPROCS(lic.MaxCores)
+						log.Info().
+							Int("machine_cores", machineCores).
+							Int("licensed_cores", lic.MaxCores).
+							Int("gomaxprocs_before", previousGOMAXPROCS).
+							Int("gomaxprocs_after", lic.MaxCores).
+							Msg("License core limit applied via GOMAXPROCS")
+
+						// Also set DuckDB thread count to match
+						cfg.Database.ThreadCount = lic.MaxCores
+						log.Info().
+							Int("duckdb_threads", lic.MaxCores).
+							Msg("License core limit applied to DuckDB threads")
+
+						// Limit ingestion flush workers to licensed cores
+						if cfg.Ingest.FlushWorkers > lic.MaxCores {
+							cfg.Ingest.FlushWorkers = lic.MaxCores
+							log.Info().
+								Int("flush_workers", lic.MaxCores).
+								Msg("License core limit applied to ingestion flush workers")
+						}
+					}
+				}
+			}
+		}
+	} else {
+		log.Warn().Msg("Enterprise license not configured - enterprise features disabled")
+	}
+
 	// Initialize metrics collector
 	metrics.Init(logger.Get("metrics"))
 
@@ -69,6 +143,12 @@ func main() {
 	shutdownCoordinator := shutdown.New(30*time.Second, logger.Get("shutdown"))
 
 	// Initialize DuckDB
+	log.Info().
+		Int("thread_count", cfg.Database.ThreadCount).
+		Int("max_connections", cfg.Database.MaxConnections).
+		Str("memory_limit", cfg.Database.MemoryLimit).
+		Int("machine_cpus", runtime.NumCPU()).
+		Msg("Initializing DuckDB with database config")
 	dbConfig := &database.Config{
 		MaxConnections: cfg.Database.MaxConnections,
 		MemoryLimit:    cfg.Database.MemoryLimit,
@@ -229,6 +309,11 @@ func main() {
 	}
 
 	// Initialize Arrow buffer (optionally with WAL)
+	log.Info().
+		Int("flush_workers", cfg.Ingest.FlushWorkers).
+		Int("shard_count", cfg.Ingest.ShardCount).
+		Int("flush_queue_size", cfg.Ingest.FlushQueueSize).
+		Msg("Initializing Arrow buffer with ingestion config")
 	arrowBuffer := ingest.NewArrowBuffer(&cfg.Ingest, storageBackend, logger.Get("arrow"))
 	if walWriter != nil {
 		arrowBuffer.SetWAL(walWriter)
@@ -476,6 +561,15 @@ func main() {
 		log.Info().Msg("Telemetry is DISABLED (opt-out via ARC_TELEMETRY_ENABLED=false)")
 	}
 
+	// Start periodic license validation (if license was validated earlier)
+	if licenseClient != nil {
+		licenseClient.StartPeriodicValidation(license.ValidationInterval)
+		shutdownCoordinator.RegisterHook("license-client", func(ctx context.Context) error {
+			licenseClient.Stop()
+			return nil
+		}, shutdown.PriorityTelemetry)
+	}
+
 	// Initialize HTTP server
 	serverConfig := &api.ServerConfig{
 		Port:            cfg.Server.Port,
@@ -543,8 +637,10 @@ func main() {
 	databasesHandler.RegisterRoutes(server.GetApp())
 
 	// Register Retention handler
+	var retentionHandler *api.RetentionHandler
 	if cfg.Retention.Enabled {
-		retentionHandler, err := api.NewRetentionHandler(storageBackend, db, &cfg.Retention, logger.Get("retention"))
+		var err error
+		retentionHandler, err = api.NewRetentionHandler(storageBackend, db, &cfg.Retention, logger.Get("retention"))
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize retention handler")
 		}
@@ -558,8 +654,10 @@ func main() {
 	}
 
 	// Register Continuous Query handler
+	var cqHandler *api.ContinuousQueryHandler
 	if cfg.ContinuousQuery.Enabled {
-		cqHandler, err := api.NewContinuousQueryHandler(db, storageBackend, arrowBuffer, &cfg.ContinuousQuery, logger.Get("cq"))
+		var err error
+		cqHandler, err = api.NewContinuousQueryHandler(db, storageBackend, arrowBuffer, &cfg.ContinuousQuery, logger.Get("cq"))
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize continuous query handler")
 		}
@@ -571,6 +669,83 @@ func main() {
 	} else {
 		log.Info().Msg("Continuous queries DISABLED")
 	}
+
+	// Initialize CQ Scheduler (Enterprise feature - requires valid license)
+	// Scheduler is enabled when continuous_query.enabled=true AND license allows it
+	var cqScheduler *scheduler.CQScheduler
+	if cfg.ContinuousQuery.Enabled && cqHandler != nil {
+		if licenseClient != nil && licenseClient.CanUseCQScheduler() {
+			var err error
+			cqScheduler, err = scheduler.NewCQScheduler(&scheduler.CQSchedulerConfig{
+				CQHandler:     cqHandler,
+				LicenseClient: licenseClient,
+				Logger:        logger.Get("cq-scheduler"),
+			})
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to create CQ scheduler")
+			} else {
+				if err := cqScheduler.Start(); err != nil {
+					log.Error().Err(err).Msg("Failed to start CQ scheduler")
+				} else {
+					shutdownCoordinator.RegisterHook("cq-scheduler", func(ctx context.Context) error {
+						cqScheduler.Stop()
+						return nil
+					}, shutdown.PriorityCompaction)
+					log.Info().Int("job_count", cqScheduler.JobCount()).Msg("CQ scheduler started")
+				}
+			}
+		} else if licenseClient == nil {
+			log.Info().Msg("CQ automatic scheduling requires enterprise license")
+		} else {
+			log.Info().Msg("CQ automatic scheduling not included in license tier")
+		}
+	}
+
+	// Initialize Retention Scheduler (Enterprise feature - requires valid license)
+	// Scheduler is enabled when retention.enabled=true AND license allows it
+	var retentionScheduler *scheduler.RetentionScheduler
+	if cfg.Retention.Enabled && retentionHandler != nil {
+		if licenseClient != nil && licenseClient.CanUseRetentionScheduler() {
+			var err error
+			retentionScheduler, err = scheduler.NewRetentionScheduler(&scheduler.RetentionSchedulerConfig{
+				RetentionHandler: retentionHandler,
+				LicenseClient:    licenseClient,
+				Schedule:         cfg.Scheduler.RetentionSchedule,
+				Logger:           logger.Get("retention-scheduler"),
+			})
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to create retention scheduler")
+			} else {
+				if err := retentionScheduler.Start(); err != nil {
+					log.Error().Err(err).Msg("Failed to start retention scheduler")
+				} else {
+					shutdownCoordinator.RegisterHook("retention-scheduler", func(ctx context.Context) error {
+						retentionScheduler.Stop()
+						return nil
+					}, shutdown.PriorityCompaction)
+					log.Info().Str("schedule", cfg.Scheduler.RetentionSchedule).Msg("Retention scheduler started")
+				}
+			}
+		} else if licenseClient == nil {
+			log.Info().Msg("Retention automatic scheduling requires enterprise license")
+		} else {
+			log.Info().Msg("Retention automatic scheduling not included in license tier")
+		}
+	}
+
+	// Register Scheduler status handler (always register, shows status even if schedulers not running)
+	// Note: We must explicitly pass nil interfaces when schedulers are nil, because
+	// a nil *CQScheduler passed to an interface is not a nil interface (Go quirk)
+	var cqSchedulerInterface api.CQSchedulerInterface
+	if cqScheduler != nil {
+		cqSchedulerInterface = cqScheduler
+	}
+	var retentionSchedulerInterface api.RetentionSchedulerInterface
+	if retentionScheduler != nil {
+		retentionSchedulerInterface = retentionScheduler
+	}
+	schedulerHandler := api.NewSchedulerHandler(cqSchedulerInterface, retentionSchedulerInterface, licenseClient, logger.Get("scheduler-api"))
+	schedulerHandler.RegisterRoutes(server.GetApp())
 
 	// Register MQTT handlers (always register, handlers check if manager is nil)
 	mqttHandler := api.NewMQTTHandler(mqttManager, authManager, logger.Get("mqtt-api"))

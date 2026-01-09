@@ -813,20 +813,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 
 // getStoragePath returns the storage path for a database.table
 func (h *QueryHandler) getStoragePath(database, table string) string {
-	// Check backend type and generate appropriate path
-	switch backend := h.storage.(type) {
-	case *storage.S3Backend:
-		return "s3://" + backend.GetBucket() + "/" + database + "/" + table + "/**/*.parquet"
-	case *storage.AzureBlobBackend:
-		// Use azure:// (Blob Storage endpoint)
-		// TODO v26.02.1: Add abfss:// (ADLS Gen2) support for better glob performance
-		return "azure://" + backend.GetContainer() + "/" + database + "/" + table + "/**/*.parquet"
-	case *storage.LocalBackend:
-		return backend.GetBasePath() + "/" + database + "/" + table + "/**/*.parquet"
-	default:
-		// Fallback to local path
-		return "./data/" + database + "/" + table + "/**/*.parquet"
-	}
+	return storage.GetStoragePath(h.storage, database, table)
 }
 
 // buildReadParquetExpr builds a read_parquet expression with optional partition pruning.
@@ -1086,14 +1073,9 @@ func (h *QueryHandler) extractTableNames(files []string, database string) []stri
 	return tables
 }
 
-// getStorageBasePath returns the base path for local storage (empty for S3)
+// getStorageBasePath returns the base path for local storage (empty for cloud backends)
 func (h *QueryHandler) getStorageBasePath() string {
-	switch backend := h.storage.(type) {
-	case *storage.LocalBackend:
-		return backend.GetBasePath()
-	default:
-		return ""
-	}
+	return storage.GetLocalBasePath(h.storage, nil, "", "")
 }
 
 // extractTopLevelDirs extracts unique top-level directory names from file paths
