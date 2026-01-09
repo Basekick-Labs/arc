@@ -377,6 +377,101 @@ func (h *ContinuousQueryHandler) handleDelete(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"message": "Continuous query deleted successfully"})
 }
 
+// ExecuteCQ executes a continuous query by ID programmatically (used by scheduler)
+// Returns the execution response and any error
+func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (*ExecuteCQResponse, error) {
+	start := time.Now()
+
+	// Get query definition
+	cq, err := h.getQuery(queryID)
+	if err != nil {
+		return nil, fmt.Errorf("continuous query not found: %w", err)
+	}
+
+	if !cq.IsActive {
+		return nil, fmt.Errorf("continuous query is not active")
+	}
+
+	// Determine time range - use last processed time or default to 1 hour ago
+	var startTime, endTime time.Time
+
+	if cq.LastProcessedTime != nil {
+		startTime, _ = time.Parse(time.RFC3339, *cq.LastProcessedTime)
+		startTime = startTime.UTC()
+	} else {
+		startTime = time.Now().UTC().Add(-1 * time.Hour)
+	}
+	endTime = time.Now().UTC()
+
+	if !startTime.Before(endTime) {
+		return nil, fmt.Errorf("start_time must be before end_time")
+	}
+
+	// Replace placeholders in query
+	executedQuery := strings.ReplaceAll(cq.Query, "{start_time}", fmt.Sprintf("'%s'", startTime.Format(time.RFC3339)))
+	executedQuery = strings.ReplaceAll(executedQuery, "{end_time}", fmt.Sprintf("'%s'", endTime.Format(time.RFC3339)))
+
+	executionID := fmt.Sprintf("cq-sched-%s", uuid.New().String()[:8])
+
+	h.logger.Info().
+		Str("query_name", cq.Name).
+		Str("execution_id", executionID).
+		Time("start_time", startTime).
+		Time("end_time", endTime).
+		Msg("Executing scheduled continuous query")
+
+	// Execute the aggregation query using DuckDB
+	recordsWritten, err := h.executeAggregation(ctx, cq, executedQuery, startTime, endTime)
+	if err != nil {
+		executionDuration := time.Since(start).Seconds()
+
+		// Record failed execution
+		h.recordExecution(queryID, executionID, "failed", startTime, endTime, nil, 0, executionDuration, err.Error())
+
+		h.logger.Error().Err(err).Str("query_name", cq.Name).Msg("Scheduled continuous query execution failed")
+		return nil, fmt.Errorf("execution failed: %w", err)
+	}
+
+	executionDuration := time.Since(start).Seconds()
+
+	// Record successful execution
+	h.recordExecution(queryID, executionID, "completed", startTime, endTime, nil, recordsWritten, executionDuration, "")
+
+	// Update last processed time
+	h.updateLastProcessedTime(queryID, endTime)
+
+	h.logger.Info().
+		Str("query_name", cq.Name).
+		Int64("records_written", recordsWritten).
+		Float64("duration_seconds", executionDuration).
+		Msg("Scheduled continuous query completed")
+
+	return &ExecuteCQResponse{
+		QueryID:                queryID,
+		QueryName:              cq.Name,
+		ExecutionID:            executionID,
+		Status:                 "completed",
+		StartTime:              startTime.Format(time.RFC3339),
+		EndTime:                endTime.Format(time.RFC3339),
+		RecordsRead:            nil,
+		RecordsWritten:         recordsWritten,
+		ExecutionTimeSeconds:   executionDuration,
+		DestinationMeasurement: cq.DestinationMeasurement,
+		DryRun:                 false,
+		ExecutedAt:             time.Now().UTC().Format(time.RFC3339),
+	}, nil
+}
+
+// GetActiveCQs returns all active continuous queries (used by scheduler)
+func (h *ContinuousQueryHandler) GetActiveCQs() ([]ContinuousQuery, error) {
+	return h.getQueries("", "true")
+}
+
+// GetCQ returns a continuous query by ID (used by scheduler)
+func (h *ContinuousQueryHandler) GetCQ(queryID int64) (*ContinuousQuery, error) {
+	return h.getQuery(queryID)
+}
+
 // handleExecute executes a continuous query
 func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 	start := time.Now()
@@ -515,27 +610,22 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 
 // executeAggregation runs the aggregation query and writes results
 func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *ContinuousQuery, query string, _, _ time.Time) (int64, error) {
-	// Get storage base path for reading source data
-	basePath := h.getStorageBasePath()
-	if basePath == "" {
-		return 0, fmt.Errorf("unable to determine storage base path")
-	}
-
-	// Build path pattern for source measurement
-	measurementPath := filepath.Join(basePath, cq.Database, cq.SourceMeasurement, "**", "*.parquet")
+	// Build storage path for source measurement (supports local, S3, Azure)
+	measurementPath := storage.GetStoragePath(h.storage, cq.Database, cq.SourceMeasurement)
 
 	// Extract CTE names to avoid replacing them with read_parquet paths
 	cteNames := extractCTENames(query)
 
 	// Wrap query to read from parquet files
-	// Replace measurement name in query with read_parquet
-	// Use word boundary regex to avoid replacing partial matches (e.g., "cpu" in "cpu_user")
+	// Replace database.measurement reference in query with read_parquet
+	// Arc uses database.measurement format (e.g., FROM production.cpu)
 	// Skip if the source measurement name matches a CTE name (it's a virtual table reference)
 	wrappedQuery := query
 	if !cteNames[strings.ToLower(cq.SourceMeasurement)] {
 		readParquetExpr := fmt.Sprintf("read_parquet('%s', union_by_name=true)", measurementPath)
-		measurementPattern := regexp.MustCompile(`\bFROM\s+` + regexp.QuoteMeta(cq.SourceMeasurement) + `\b`)
-		wrappedQuery = measurementPattern.ReplaceAllString(query, "FROM "+readParquetExpr)
+		// Match FROM database.measurement (e.g., FROM production.cpu)
+		dbMeasurementPattern := regexp.MustCompile(`(?i)\bFROM\s+` + regexp.QuoteMeta(cq.Database) + `\.` + regexp.QuoteMeta(cq.SourceMeasurement) + `\b`)
+		wrappedQuery = dbMeasurementPattern.ReplaceAllString(query, "FROM "+readParquetExpr)
 	}
 
 	h.logger.Debug().Str("query", wrappedQuery).Msg("Executing wrapped query")
@@ -806,18 +896,5 @@ func (h *ContinuousQueryHandler) updateLastProcessedTime(queryID int64, processe
 
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to update last processed time")
-	}
-}
-
-// getStorageBasePath returns the base path for storage
-func (h *ContinuousQueryHandler) getStorageBasePath() string {
-	switch backend := h.storage.(type) {
-	case *storage.LocalBackend:
-		return backend.GetBasePath()
-	case *storage.S3Backend:
-		h.logger.Warn().Msg("Continuous queries not fully supported for S3 backend yet")
-		return ""
-	default:
-		return "./data/arc"
 	}
 }

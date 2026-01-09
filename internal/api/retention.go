@@ -335,6 +335,121 @@ func (h *RetentionHandler) handleDelete(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"message": "Retention policy deleted successfully"})
 }
 
+// ExecutePolicy executes a retention policy by ID programmatically (used by scheduler)
+// Returns the execution response and any error
+func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*ExecuteRetentionResponse, error) {
+	start := time.Now()
+
+	// Get policy
+	policy, err := h.getPolicy(policyID)
+	if err != nil {
+		return nil, fmt.Errorf("retention policy not found: %w", err)
+	}
+
+	if !policy.IsActive {
+		return nil, fmt.Errorf("retention policy is not active")
+	}
+
+	// Calculate cutoff date
+	cutoffDate := time.Now().UTC().AddDate(0, 0, -(policy.RetentionDays + policy.BufferDays))
+
+	h.logger.Info().
+		Str("policy", policy.Name).
+		Time("cutoff_date", cutoffDate).
+		Msg("Executing scheduled retention policy")
+
+	// Get measurements to process
+	measurements, err := h.getMeasurementsToProcess(policy)
+	if err != nil {
+		return nil, fmt.Errorf("failed to discover measurements: %w", err)
+	}
+
+	h.logger.Info().Strs("measurements", measurements).Msg("Processing measurements")
+
+	// Record execution start
+	executionID := h.recordExecutionStart(policyID, cutoffDate)
+
+	// Execute retention for each measurement
+	var totalDeleted int64
+	var totalFilesDeleted int
+
+	for _, measurement := range measurements {
+		deleted, filesDeleted, err := h.deleteOldFiles(ctx, policy.Database, measurement, cutoffDate, false)
+		if err != nil {
+			h.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to process measurement")
+			continue
+		}
+		totalDeleted += deleted
+		totalFilesDeleted += filesDeleted
+	}
+
+	executionTime := float64(time.Since(start).Milliseconds())
+
+	// Record execution completion
+	if executionID > 0 {
+		h.recordExecutionComplete(executionID, "completed", totalDeleted, executionTime, "")
+	}
+
+	h.logger.Info().
+		Int64("deleted_count", totalDeleted).
+		Int("files_deleted", totalFilesDeleted).
+		Float64("execution_time_ms", executionTime).
+		Msg("Scheduled retention policy execution completed")
+
+	return &ExecuteRetentionResponse{
+		PolicyID:             policyID,
+		PolicyName:           policy.Name,
+		DeletedCount:         totalDeleted,
+		FilesDeleted:         totalFilesDeleted,
+		ExecutionTimeMs:      executionTime,
+		DryRun:               false,
+		CutoffDate:           cutoffDate.Format(time.RFC3339),
+		AffectedMeasurements: measurements,
+	}, nil
+}
+
+// GetActivePolicies returns all active retention policies (used by scheduler)
+func (h *RetentionHandler) GetActivePolicies() ([]RetentionPolicy, error) {
+	rows, err := h.db.Query(`
+		SELECT
+			rp.id, rp.name, rp.database, rp.measurement, rp.retention_days, rp.buffer_days, rp.is_active,
+			rp.created_at, rp.updated_at,
+			re.execution_time, re.status, re.deleted_count
+		FROM retention_policies rp
+		LEFT JOIN (
+			SELECT policy_id, execution_time, status, deleted_count
+			FROM retention_executions
+			WHERE id IN (SELECT MAX(id) FROM retention_executions GROUP BY policy_id)
+		) re ON rp.id = re.policy_id
+		WHERE rp.is_active = TRUE
+		ORDER BY rp.created_at DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var policies []RetentionPolicy
+	for rows.Next() {
+		var p RetentionPolicy
+		if err := rows.Scan(
+			&p.ID, &p.Name, &p.Database, &p.Measurement, &p.RetentionDays, &p.BufferDays, &p.IsActive,
+			&p.CreatedAt, &p.UpdatedAt,
+			&p.LastExecutionTime, &p.LastExecutionStatus, &p.LastDeletedCount,
+		); err != nil {
+			continue
+		}
+		policies = append(policies, p)
+	}
+
+	return policies, nil
+}
+
+// GetPolicy returns a retention policy by ID (used by scheduler)
+func (h *RetentionHandler) GetPolicy(policyID int64) (*RetentionPolicy, error) {
+	return h.getPolicy(policyID)
+}
+
 // handleExecute executes a retention policy
 func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 	start := time.Now()
@@ -679,13 +794,5 @@ func (h *RetentionHandler) recordExecutionComplete(executionID int64, status str
 
 // getStorageBasePath returns the base path for storage
 func (h *RetentionHandler) getStorageBasePath() string {
-	switch backend := h.storage.(type) {
-	case *storage.LocalBackend:
-		return backend.GetBasePath()
-	case *storage.S3Backend:
-		h.logger.Warn().Msg("Retention not fully supported for S3 backend yet")
-		return ""
-	default:
-		return "./data/arc"
-	}
+	return storage.GetLocalBasePath(h.storage, &h.logger, "Retention", "./data/arc")
 }

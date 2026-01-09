@@ -105,6 +105,7 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	}
 	// Set thread count
 	if cfg.ThreadCount > 0 {
+		logger.Info().Int("threads", cfg.ThreadCount).Msg("Setting DuckDB thread count")
 		if _, err := db.Exec(fmt.Sprintf("SET threads=%d", cfg.ThreadCount)); err != nil {
 			return fmt.Errorf("failed to set threads: %w", err)
 		}
