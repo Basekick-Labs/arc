@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/pruning"
@@ -19,6 +20,23 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
+
+// AuthManager interface for getting token info from context
+type AuthManager interface {
+	HasPermission(tokenInfo *auth.TokenInfo, permission string) bool
+}
+
+// RBACChecker interface for RBAC permission checking
+type RBACChecker interface {
+	IsRBACEnabled() bool
+	CheckPermission(req *auth.PermissionCheckRequest) *auth.PermissionCheckResult
+}
+
+// TableReference represents a database.measurement reference extracted from SQL
+type TableReference struct {
+	Database    string
+	Measurement string
+}
 
 // Regex patterns for SHOW commands
 var (
@@ -376,11 +394,13 @@ func stripSQLComments(sql string, hasComments bool) string {
 
 // QueryHandler handles SQL query endpoints
 type QueryHandler struct {
-	db         *database.DuckDB
-	storage    storage.Backend
-	pruner     *pruning.PartitionPruner
-	queryCache *database.QueryCache
-	logger     zerolog.Logger
+	db          *database.DuckDB
+	storage     storage.Backend
+	pruner      *pruning.PartitionPruner
+	queryCache  *database.QueryCache
+	logger      zerolog.Logger
+	authManager AuthManager
+	rbacManager RBACChecker
 }
 
 // QueryRequest represents a SQL query request
@@ -501,12 +521,220 @@ func validateWhereClauseQuery(where string) error {
 // NewQueryHandler creates a new query handler
 func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolog.Logger) *QueryHandler {
 	return &QueryHandler{
-		db:         db,
-		storage:    storage,
-		pruner:     pruning.NewPartitionPruner(logger),
-		queryCache: database.NewQueryCache(database.QueryCacheTTL, database.DefaultQueryCacheMaxSize),
-		logger:     logger.With().Str("component", "query-handler").Logger(),
+		db:          db,
+		storage:     storage,
+		pruner:      pruning.NewPartitionPruner(logger),
+		queryCache:  database.NewQueryCache(database.QueryCacheTTL, database.DefaultQueryCacheMaxSize),
+		logger:      logger.With().Str("component", "query-handler").Logger(),
+		authManager: nil,
+		rbacManager: nil,
 	}
+}
+
+// SetAuthAndRBAC sets the auth and RBAC managers for permission checking
+func (h *QueryHandler) SetAuthAndRBAC(am AuthManager, rm RBACChecker) {
+	h.authManager = am
+	h.rbacManager = rm
+}
+
+// extractTableReferences extracts all database.measurement references from SQL
+// Returns a slice of TableReference structs for permission checking
+func extractTableReferences(sql string) []TableReference {
+	var refs []TableReference
+	seen := make(map[string]bool)
+
+	// Extract database.table references (FROM database.table, JOIN database.table)
+	// These take priority - we track their positions to avoid double-counting
+	dbTableMatches := patternDBTable.FindAllStringSubmatch(sql, -1)
+	for _, match := range dbTableMatches {
+		if len(match) >= 3 {
+			key := match[1] + "." + match[2]
+			if !seen[key] {
+				seen[key] = true
+				refs = append(refs, TableReference{
+					Database:    match[1],
+					Measurement: match[2],
+				})
+			}
+		}
+	}
+
+	// Also check JOIN patterns for database.table
+	joinDBMatches := patternJoinDBTable.FindAllStringSubmatch(sql, -1)
+	for _, match := range joinDBMatches {
+		if len(match) >= 3 {
+			key := match[1] + "." + match[2]
+			if !seen[key] {
+				seen[key] = true
+				refs = append(refs, TableReference{
+					Database:    match[1],
+					Measurement: match[2],
+				})
+			}
+		}
+	}
+
+	// Extract simple table references (defaults to "default" database)
+	// BUT skip tables that are part of database.table patterns we already found
+	simpleMatches := patternSimpleTable.FindAllStringSubmatchIndex(sql, -1)
+	for _, matchIdx := range simpleMatches {
+		if len(matchIdx) >= 4 {
+			tableName := sql[matchIdx[2]:matchIdx[3]]
+			table := strings.ToLower(tableName)
+
+			// Skip system tables and already-converted paths
+			if shouldSkipTableConversion(table) {
+				continue
+			}
+
+			// Check if this table name is followed by a dot (meaning it's a database name, not a table)
+			endIdx := matchIdx[3]
+			if endIdx < len(sql) && sql[endIdx] == '.' {
+				// This is actually a database name in "database.table", skip it
+				continue
+			}
+
+			key := "default." + table
+			if !seen[key] {
+				seen[key] = true
+				refs = append(refs, TableReference{
+					Database:    "default",
+					Measurement: tableName,
+				})
+			}
+		}
+	}
+
+	// Also check JOIN simple patterns
+	joinSimpleMatches := patternJoinSimpleTable.FindAllStringSubmatchIndex(sql, -1)
+	for _, matchIdx := range joinSimpleMatches {
+		if len(matchIdx) >= 4 {
+			tableName := sql[matchIdx[2]:matchIdx[3]]
+			table := strings.ToLower(tableName)
+
+			if shouldSkipTableConversion(table) {
+				continue
+			}
+
+			// Check if this table name is followed by a dot
+			endIdx := matchIdx[3]
+			if endIdx < len(sql) && sql[endIdx] == '.' {
+				continue
+			}
+
+			key := "default." + table
+			if !seen[key] {
+				seen[key] = true
+				refs = append(refs, TableReference{
+					Database:    "default",
+					Measurement: tableName,
+				})
+			}
+		}
+	}
+
+	return refs
+}
+
+// checkQueryPermissions checks RBAC permissions for all tables referenced in a query
+// Returns nil if access is allowed, or an error describing what access was denied
+func (h *QueryHandler) checkQueryPermissions(c *fiber.Ctx, sql, permission string) error {
+	// If no RBAC manager, skip permission check (handled by basic auth middleware)
+	if h.rbacManager == nil || !h.rbacManager.IsRBACEnabled() {
+		return nil
+	}
+
+	// Get token info from context
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
+		// No token info means basic auth middleware allowed it (or auth disabled)
+		return nil
+	}
+
+	// Extract table references from SQL
+	tableRefs := extractTableReferences(sql)
+	if len(tableRefs) == 0 {
+		// No tables referenced (e.g., SELECT 1+1)
+		return nil
+	}
+
+	h.logger.Debug().
+		Str("sql", sql).
+		Int("table_count", len(tableRefs)).
+		Msg("Checking RBAC permissions for query")
+
+	// Check permission for each table
+	for _, ref := range tableRefs {
+		result := h.rbacManager.CheckPermission(&auth.PermissionCheckRequest{
+			TokenInfo:   tokenInfo,
+			Database:    ref.Database,
+			Measurement: ref.Measurement,
+			Permission:  permission,
+		})
+
+		if !result.Allowed {
+			h.logger.Warn().
+				Str("database", ref.Database).
+				Str("measurement", ref.Measurement).
+				Str("permission", permission).
+				Str("reason", result.Reason).
+				Int64("token_id", tokenInfo.ID).
+				Msg("RBAC permission denied")
+			return fmt.Errorf("access denied: no %s permission for %s.%s", permission, ref.Database, ref.Measurement)
+		}
+
+		h.logger.Debug().
+			Str("database", ref.Database).
+			Str("measurement", ref.Measurement).
+			Str("permission", permission).
+			Str("source", result.Source).
+			Msg("RBAC permission granted")
+	}
+
+	return nil
+}
+
+// checkMeasurementPermission checks RBAC permission for a specific database/measurement
+// This is a simpler version for endpoints where database/measurement are known directly
+func (h *QueryHandler) checkMeasurementPermission(c *fiber.Ctx, database, measurement, permission string) error {
+	// If no RBAC manager, skip permission check (handled by basic auth middleware)
+	if h.rbacManager == nil || !h.rbacManager.IsRBACEnabled() {
+		return nil
+	}
+
+	// Get token info from context
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
+		// No token info means basic auth middleware allowed it (or auth disabled)
+		return nil
+	}
+
+	result := h.rbacManager.CheckPermission(&auth.PermissionCheckRequest{
+		TokenInfo:   tokenInfo,
+		Database:    database,
+		Measurement: measurement,
+		Permission:  permission,
+	})
+
+	if !result.Allowed {
+		h.logger.Warn().
+			Str("database", database).
+			Str("measurement", measurement).
+			Str("permission", permission).
+			Str("reason", result.Reason).
+			Int64("token_id", tokenInfo.ID).
+			Msg("RBAC permission denied")
+		return fmt.Errorf("access denied: no %s permission for %s.%s", permission, database, measurement)
+	}
+
+	h.logger.Debug().
+		Str("database", database).
+		Str("measurement", measurement).
+		Str("permission", permission).
+		Str("source", result.Source).
+		Msg("RBAC permission granted")
+
+	return nil
 }
 
 // RegisterRoutes registers query endpoints
@@ -566,6 +794,15 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 
 	// Handle SHOW DATABASES command
 	if showDatabasesPattern.MatchString(req.SQL) {
+		// Check RBAC - user needs at least some read permission to see databases
+		if err := h.checkMeasurementPermission(c, "*", "*", "read"); err != nil {
+			m.IncQueryErrors()
+			return c.Status(fiber.StatusForbidden).JSON(QueryResponse{
+				Success:   false,
+				Error:     "access denied: no read permission to list databases",
+				Timestamp: time.Now().UTC().Format(time.RFC3339),
+			})
+		}
 		return h.handleShowDatabases(c, start)
 	}
 
@@ -575,7 +812,26 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 		if len(matches) > 1 && matches[1] != "" {
 			database = matches[1]
 		}
+		// Check RBAC - user needs read permission on the specific database
+		if err := h.checkMeasurementPermission(c, database, "*", "read"); err != nil {
+			m.IncQueryErrors()
+			return c.Status(fiber.StatusForbidden).JSON(QueryResponse{
+				Success:   false,
+				Error:     fmt.Sprintf("access denied: no read permission for database '%s'", database),
+				Timestamp: time.Now().UTC().Format(time.RFC3339),
+			})
+		}
 		return h.handleShowTables(c, start, database)
+	}
+
+	// Check RBAC permissions for all tables referenced in the query
+	if err := h.checkQueryPermissions(c, req.SQL, "read"); err != nil {
+		m.IncQueryErrors()
+		return c.Status(fiber.StatusForbidden).JSON(QueryResponse{
+			Success:   false,
+			Error:     err.Error(),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
 	}
 
 	// Convert SQL to storage paths (with caching)
@@ -1472,6 +1728,16 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 				Timestamp: time.Now().UTC().Format(time.RFC3339),
 			})
 		}
+	}
+
+	// Check RBAC permissions for this database/measurement
+	if err := h.checkMeasurementPermission(c, database, measurement, "read"); err != nil {
+		m.IncQueryErrors()
+		return c.Status(fiber.StatusForbidden).JSON(QueryResponse{
+			Success:   false,
+			Error:     err.Error(),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
 	}
 
 	// Build SQL query with validated parameters

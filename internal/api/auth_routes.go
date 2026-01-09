@@ -12,6 +12,7 @@ import (
 // AuthHandler handles authentication-related endpoints
 type AuthHandler struct {
 	authManager *auth.AuthManager
+	rbacManager *auth.RBACManager
 	logger      zerolog.Logger
 }
 
@@ -21,6 +22,11 @@ func NewAuthHandler(authManager *auth.AuthManager, logger zerolog.Logger) *AuthH
 		authManager: authManager,
 		logger:      logger.With().Str("component", "auth-handler").Logger(),
 	}
+}
+
+// SetRBACManager sets the RBAC manager for token membership endpoints
+func (h *AuthHandler) SetRBACManager(rbacManager *auth.RBACManager) {
+	h.rbacManager = rbacManager
 }
 
 // RegisterRoutes registers auth-related endpoints
@@ -76,7 +82,7 @@ func (h *AuthHandler) verifyToken(c *fiber.Ctx) error {
 type CreateTokenRequest struct {
 	Name        string   `json:"name"`
 	Description string   `json:"description,omitempty"`
-	Permissions []string `json:"permissions,omitempty"`
+	Permissions *[]string `json:"permissions,omitempty"` // nil = default (read,write), empty array = no permissions (RBAC-only)
 	ExpiresIn   string   `json:"expires_in,omitempty"` // e.g., "24h", "7d", "30d"
 }
 
@@ -98,14 +104,19 @@ func (h *AuthHandler) createToken(c *fiber.Ctx) error {
 	}
 
 	// Parse permissions
+	// nil = use defaults (read,write), empty array = no permissions (RBAC-only token)
 	permissions := "read,write"
-	if len(req.Permissions) > 0 {
-		permissions = ""
-		for i, p := range req.Permissions {
-			if i > 0 {
-				permissions += ","
+	if req.Permissions != nil {
+		if len(*req.Permissions) == 0 {
+			permissions = "" // RBAC-only token with no OSS permissions
+		} else {
+			permissions = ""
+			for i, p := range *req.Permissions {
+				if i > 0 {
+					permissions += ","
+				}
+				permissions += p
 			}
-			permissions += p
 		}
 	}
 
@@ -205,10 +216,10 @@ func (h *AuthHandler) getToken(c *fiber.Ctx) error {
 
 // UpdateTokenRequest represents a token update request
 type UpdateTokenRequest struct {
-	Name        *string  `json:"name,omitempty"`
-	Description *string  `json:"description,omitempty"`
-	Permissions []string `json:"permissions,omitempty"`
-	ExpiresIn   *string  `json:"expires_in,omitempty"`
+	Name        *string   `json:"name,omitempty"`
+	Description *string   `json:"description,omitempty"`
+	Permissions *[]string `json:"permissions,omitempty"` // nil = don't change, empty array = clear permissions (RBAC-only)
+	ExpiresIn   *string   `json:"expires_in,omitempty"`
 }
 
 // updateToken handles PATCH /api/v1/auth/tokens/:id
@@ -230,14 +241,17 @@ func (h *AuthHandler) updateToken(c *fiber.Ctx) error {
 	}
 
 	// Convert permissions array to string if provided
+	// nil = don't change, empty array = clear permissions (RBAC-only token)
 	var permissions *string
-	if len(req.Permissions) > 0 {
+	if req.Permissions != nil {
 		permStr := ""
-		for i, p := range req.Permissions {
-			if i > 0 {
-				permStr += ","
+		if len(*req.Permissions) > 0 {
+			for i, p := range *req.Permissions {
+				if i > 0 {
+					permStr += ","
+				}
+				permStr += p
 			}
-			permStr += p
 		}
 		permissions = &permStr
 	}
@@ -405,5 +419,234 @@ func (h *AuthHandler) invalidateCache(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"success": true,
 		"message": "Cache invalidated successfully",
+	})
+}
+
+// RegisterTokenMembershipRoutes registers token membership endpoints (requires RBAC manager)
+func (h *AuthHandler) RegisterTokenMembershipRoutes(app *fiber.App) {
+	if h.rbacManager == nil {
+		h.logger.Warn().Msg("RBAC manager not set, skipping token membership routes")
+		return
+	}
+
+	authGroup := app.Group("/api/v1/auth")
+
+	// Token membership endpoints - require admin permission
+	authGroup.Get("/tokens/:id/teams", auth.RequireAdmin(h.authManager), h.getTokenTeams)
+	authGroup.Post("/tokens/:id/teams", auth.RequireAdmin(h.authManager), h.addTokenToTeam)
+	authGroup.Delete("/tokens/:id/teams/:team_id", auth.RequireAdmin(h.authManager), h.removeTokenFromTeam)
+	authGroup.Get("/tokens/:id/permissions", auth.RequireAdmin(h.authManager), h.getEffectivePermissions)
+}
+
+// getTokenTeams handles GET /api/v1/auth/tokens/:id/teams
+func (h *AuthHandler) getTokenTeams(c *fiber.Ctx) error {
+	if h.rbacManager == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"success": false,
+			"error":   "RBAC is not enabled",
+		})
+	}
+
+	tokenID, err := strconv.ParseInt(c.Params("id"), 10, 64)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   "Invalid token ID",
+		})
+	}
+
+	// Verify token exists
+	tokenInfo, err := h.authManager.GetTokenByID(tokenID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"error":   "Failed to get token: " + err.Error(),
+		})
+	}
+	if tokenInfo == nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"success": false,
+			"error":   "Token not found",
+		})
+	}
+
+	teams, err := h.rbacManager.GetTokenTeams(tokenID)
+	if err != nil {
+		h.logger.Error().Err(err).Int64("token_id", tokenID).Msg("Failed to get token teams")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"error":   "Failed to get token teams: " + err.Error(),
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"success": true,
+		"teams":   teams,
+		"count":   len(teams),
+	})
+}
+
+// addTokenToTeam handles POST /api/v1/auth/tokens/:id/teams
+func (h *AuthHandler) addTokenToTeam(c *fiber.Ctx) error {
+	if h.rbacManager == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"success": false,
+			"error":   "RBAC is not enabled",
+		})
+	}
+
+	if !h.rbacManager.IsRBACEnabled() {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"success": false,
+			"error":   "RBAC requires an enterprise license with the 'rbac' feature enabled",
+		})
+	}
+
+	tokenID, err := strconv.ParseInt(c.Params("id"), 10, 64)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   "Invalid token ID",
+		})
+	}
+
+	var req auth.AddTokenToTeamRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   "Invalid request body: " + err.Error(),
+		})
+	}
+
+	// Verify token exists
+	tokenInfo, err := h.authManager.GetTokenByID(tokenID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"error":   "Failed to get token: " + err.Error(),
+		})
+	}
+	if tokenInfo == nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"success": false,
+			"error":   "Token not found",
+		})
+	}
+
+	membership, err := h.rbacManager.AddTokenToTeam(tokenID, req.TeamID)
+	if err != nil {
+		status := fiber.StatusInternalServerError
+		if err.Error() == "team not found" || err.Error() == "token is already a member of this team" {
+			status = fiber.StatusBadRequest
+		}
+		return c.Status(status).JSON(fiber.Map{
+			"success": false,
+			"error":   err.Error(),
+		})
+	}
+
+	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+		"success":    true,
+		"membership": membership,
+	})
+}
+
+// removeTokenFromTeam handles DELETE /api/v1/auth/tokens/:id/teams/:team_id
+func (h *AuthHandler) removeTokenFromTeam(c *fiber.Ctx) error {
+	if h.rbacManager == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"success": false,
+			"error":   "RBAC is not enabled",
+		})
+	}
+
+	if !h.rbacManager.IsRBACEnabled() {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"success": false,
+			"error":   "RBAC requires an enterprise license with the 'rbac' feature enabled",
+		})
+	}
+
+	tokenID, err := strconv.ParseInt(c.Params("id"), 10, 64)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   "Invalid token ID",
+		})
+	}
+
+	teamID, err := strconv.ParseInt(c.Params("team_id"), 10, 64)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   "Invalid team ID",
+		})
+	}
+
+	err = h.rbacManager.RemoveTokenFromTeam(tokenID, teamID)
+	if err != nil {
+		if err.Error() == "token membership not found" {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"success": false,
+				"error":   "Token is not a member of this team",
+			})
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"error":   err.Error(),
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"success": true,
+		"message": "Token removed from team successfully",
+	})
+}
+
+// getEffectivePermissions handles GET /api/v1/auth/tokens/:id/permissions
+func (h *AuthHandler) getEffectivePermissions(c *fiber.Ctx) error {
+	if h.rbacManager == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"success": false,
+			"error":   "RBAC is not enabled",
+		})
+	}
+
+	tokenID, err := strconv.ParseInt(c.Params("id"), 10, 64)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   "Invalid token ID",
+		})
+	}
+
+	// Get token info
+	tokenInfo, err := h.authManager.GetTokenByID(tokenID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"error":   "Failed to get token: " + err.Error(),
+		})
+	}
+	if tokenInfo == nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"success": false,
+			"error":   "Token not found",
+		})
+	}
+
+	perms, err := h.rbacManager.GetEffectivePermissions(tokenID, tokenInfo)
+	if err != nil {
+		h.logger.Error().Err(err).Int64("token_id", tokenID).Msg("Failed to get effective permissions")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"error":   "Failed to get effective permissions: " + err.Error(),
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"success":     true,
+		"permissions": perms,
+		"rbac_enabled": h.rbacManager.IsRBACEnabled(),
 	})
 }

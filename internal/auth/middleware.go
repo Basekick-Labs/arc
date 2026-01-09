@@ -170,3 +170,111 @@ func ExtractTokenFromRequest(c *fiber.Ctx) string {
 	}
 	return c.Get("x-api-key")
 }
+
+// RequireResourcePermission creates middleware that checks resource-scoped permissions
+// using RBAC when enabled, with fallback to OSS token permissions.
+// The database and measurement are extracted from request headers or path.
+func RequireResourcePermission(am *AuthManager, rm *RBACManager, permission string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		tokenInfo := GetTokenInfo(c)
+		if tokenInfo == nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"success": false,
+				"error":   "Authentication required",
+			})
+		}
+
+		// Extract database from request
+		database := extractDatabase(c)
+		measurement := extractMeasurement(c)
+
+		// If no RBAC manager or RBAC not enabled, use OSS permissions
+		if rm == nil || !rm.IsRBACEnabled() {
+			if !am.HasPermission(tokenInfo, permission) {
+				return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+					"success": false,
+					"error":   "Permission denied: " + permission + " required",
+				})
+			}
+			return c.Next()
+		}
+
+		// Use RBAC permission checking
+		result := rm.CheckPermission(&PermissionCheckRequest{
+			TokenInfo:   tokenInfo,
+			Database:    database,
+			Measurement: measurement,
+			Permission:  permission,
+		})
+
+		if !result.Allowed {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+				"success": false,
+				"error":   result.Reason,
+			})
+		}
+
+		// Store permission result in context for potential audit logging
+		c.Locals("permission_result", result)
+		return c.Next()
+	}
+}
+
+// extractDatabase extracts the target database from the request.
+// Checks: x-arc-database header, path parameter, query parameter
+func extractDatabase(c *fiber.Ctx) string {
+	// Check header first
+	if db := c.Get("x-arc-database"); db != "" {
+		return db
+	}
+
+	// Check path parameter
+	if db := c.Params("database"); db != "" {
+		return db
+	}
+
+	// Check query parameter
+	if db := c.Query("database"); db != "" {
+		return db
+	}
+
+	// Default to empty (will be checked against wildcard patterns)
+	return ""
+}
+
+// extractMeasurement extracts the target measurement from the request.
+// Checks: x-arc-measurement header, path parameter, query parameter
+func extractMeasurement(c *fiber.Ctx) string {
+	// Check header first
+	if m := c.Get("x-arc-measurement"); m != "" {
+		return m
+	}
+
+	// Check path parameter
+	if m := c.Params("measurement"); m != "" {
+		return m
+	}
+
+	// Check query parameter
+	if m := c.Query("measurement"); m != "" {
+		return m
+	}
+
+	// Default to empty (will match against role's database-level permissions)
+	return ""
+}
+
+// RequireResourceRead creates middleware requiring read permission with resource context
+func RequireResourceRead(am *AuthManager, rm *RBACManager) fiber.Handler {
+	return RequireResourcePermission(am, rm, "read")
+}
+
+// RequireResourceWrite creates middleware requiring write permission with resource context
+func RequireResourceWrite(am *AuthManager, rm *RBACManager) fiber.Handler {
+	return RequireResourcePermission(am, rm, "write")
+}
+
+// RequireResourceDelete creates middleware requiring delete permission with resource context
+func RequireResourceDelete(am *AuthManager, rm *RBACManager) fiber.Handler {
+	return RequireResourcePermission(am, rm, "delete")
+}
