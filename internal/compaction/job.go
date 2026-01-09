@@ -368,7 +368,9 @@ func (j *Job) downloadFiles(ctx context.Context, tempDir string) ([]downloadedFi
 	return finalFiles, nil
 }
 
-// downloadSingleFile downloads a single file from storage
+// downloadSingleFile downloads a single file from storage using streaming to avoid memory issues.
+// MEMORY OPTIMIZATION: Uses ReadTo to stream directly to disk instead of loading entire file into memory.
+// This prevents OOM errors when compacting partitions with large files.
 func (j *Job) downloadSingleFile(ctx context.Context, tempDir string, index int, fileKey string) downloadResult {
 	// Check for cancellation
 	select {
@@ -379,21 +381,37 @@ func (j *Job) downloadSingleFile(ctx context.Context, tempDir string, index int,
 
 	localPath := filepath.Join(tempDir, filepath.Base(fileKey))
 
-	// Read file from storage
-	data, err := j.StorageBackend.Read(ctx, fileKey)
+	// Create local file for streaming
+	file, err := os.Create(localPath)
 	if err != nil {
+		return downloadResult{index: index, err: fmt.Errorf("failed to create %s: %w", localPath, err)}
+	}
+
+	// Stream directly from storage to disk - NO MEMORY ALLOCATION for file contents
+	err = j.StorageBackend.ReadTo(ctx, fileKey, file)
+	if err != nil {
+		file.Close()
+		os.Remove(localPath) // Clean up partial file
+
 		// Check if file doesn't exist (already compacted)
 		exists, checkErr := j.StorageBackend.Exists(ctx, fileKey)
 		if checkErr == nil && !exists {
 			j.logger.Debug().Str("file", fileKey).Msg("File not found (already compacted), skipping")
 			return downloadResult{index: index, skipped: true}
 		}
-		return downloadResult{index: index, err: fmt.Errorf("failed to read %s: %w", fileKey, err)}
+		return downloadResult{index: index, err: fmt.Errorf("failed to stream %s: %w", fileKey, err)}
 	}
 
-	// Write to local file
-	if err := os.WriteFile(localPath, data, 0644); err != nil {
-		return downloadResult{index: index, err: fmt.Errorf("failed to write %s: %w", localPath, err)}
+	// Get file size from disk (avoids keeping data in memory)
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return downloadResult{index: index, err: fmt.Errorf("failed to stat %s: %w", localPath, err)}
+	}
+	fileSize := info.Size()
+
+	if err := file.Close(); err != nil {
+		return downloadResult{index: index, err: fmt.Errorf("failed to close %s: %w", localPath, err)}
 	}
 
 	return downloadResult{
@@ -401,7 +419,7 @@ func (j *Job) downloadSingleFile(ctx context.Context, tempDir string, index int,
 		file: &downloadedFile{
 			storageKey: fileKey,
 			localPath:  localPath,
-			size:       int64(len(data)),
+			size:       fileSize,
 		},
 	}
 }
@@ -495,13 +513,22 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	return outputFile, nil
 }
 
-// uploadFile uploads a file to storage
+// uploadFile uploads a file to storage using streaming to avoid memory issues.
+// MEMORY OPTIMIZATION: Uses WriteReader to stream from disk instead of loading entire file into memory.
+// This prevents OOM errors when uploading large compacted files.
 func (j *Job) uploadFile(ctx context.Context, localPath, key string) error {
-	data, err := os.ReadFile(localPath)
+	file, err := os.Open(localPath)
 	if err != nil {
-		return fmt.Errorf("failed to read local file: %w", err)
+		return fmt.Errorf("failed to open local file: %w", err)
 	}
-	return j.StorageBackend.Write(ctx, key, data)
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat local file: %w", err)
+	}
+
+	return j.StorageBackend.WriteReader(ctx, key, file, info.Size())
 }
 
 // deleteOldFiles removes only the files that were actually compacted from storage.

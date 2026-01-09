@@ -123,6 +123,24 @@ Fixed an issue where empty hour-level partition directories were left behind aft
 - Only applies to local filesystem storage (S3/Azure don't have physical folders)
 - Best-effort cleanup - errors don't fail the compaction job
 
+### Compactor OOM and Segfaults with Large Datasets (Issue #102)
+
+Fixed critical memory issues in the compactor that caused OOM kills and DuckDB segfaults when compacting partitions with large datasets (2B+ rows, thousands of files).
+
+**Root causes:**
+1. **Memory loading**: Downloads and uploads loaded entire files into memory instead of streaming
+2. **DuckDB memory limit**: The subprocess wasn't using the configured `database.memory_limit`
+3. **Too many files**: DuckDB segfaults when processing 8000+ files in a single `read_parquet()` call
+
+**Fixes applied:**
+- **Streaming I/O**: Downloads now use `ReadTo()` and uploads use `WriteReader()` to stream directly to/from disk without loading files into memory
+- **Memory limit passthrough**: Compaction subprocess now applies the configured `database.memory_limit` to DuckDB
+- **File batching**: Partitions with >1000 files are automatically split into batches of 1000 files each, processed sequentially to avoid DuckDB limitations
+
+**Result:** Compaction now handles tables with billions of rows without OOM or segfaults. Query performance improved ~2x after successful compaction due to reduced file count.
+
+**Optional profiling:** Set `ARC_COMPACTION_PROFILE=1` to enable heap profiling during compaction (writes to `/tmp/arc_compaction_heap.pprof`).
+
 ## Improvements
 
 ### Automatic Time Function Query Optimization (GROUP BY Performance)
