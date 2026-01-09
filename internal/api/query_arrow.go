@@ -55,6 +55,14 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		})
 	}
 
+	// Check RBAC permissions for all tables referenced in the query
+	if err := h.checkQueryPermissions(c, req.SQL, "read"); err != nil {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"success": false,
+			"error":   err.Error(),
+		})
+	}
+
 	// Convert SQL to storage paths
 	convertedSQL := h.convertSQLToStoragePaths(req.SQL)
 

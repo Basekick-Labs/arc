@@ -65,7 +65,7 @@ func NewAuthManager(dbPath string, cacheTTL time.Duration, maxCacheSize int, log
 		return nil, fmt.Errorf("failed to create db directory: %w", err)
 	}
 
-	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
+	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=ON")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open auth database: %w", err)
 	}
@@ -155,6 +155,111 @@ func (am *AuthManager) initDB() error {
 	// This is a one-time migration that will be skipped if all tokens have prefixes
 	am.backfillTokenPrefixes()
 
+	// Initialize RBAC tables (Enterprise feature)
+	if err := am.initRBACTables(); err != nil {
+		return fmt.Errorf("failed to initialize RBAC tables: %w", err)
+	}
+
+	return nil
+}
+
+// initRBACTables creates the RBAC tables for enterprise features
+func (am *AuthManager) initRBACTables() error {
+	// Organizations table
+	_, err := am.db.Exec(`
+		CREATE TABLE IF NOT EXISTS rbac_organizations (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL UNIQUE,
+			description TEXT,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			enabled INTEGER DEFAULT 1
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create rbac_organizations table: %w", err)
+	}
+
+	// Teams table
+	_, err = am.db.Exec(`
+		CREATE TABLE IF NOT EXISTS rbac_teams (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			organization_id INTEGER NOT NULL,
+			name TEXT NOT NULL,
+			description TEXT,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			enabled INTEGER DEFAULT 1,
+			FOREIGN KEY (organization_id) REFERENCES rbac_organizations(id) ON DELETE CASCADE,
+			UNIQUE(organization_id, name)
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create rbac_teams table: %w", err)
+	}
+
+	// Roles table
+	_, err = am.db.Exec(`
+		CREATE TABLE IF NOT EXISTS rbac_roles (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			team_id INTEGER NOT NULL,
+			database_pattern TEXT NOT NULL,
+			permissions TEXT NOT NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (team_id) REFERENCES rbac_teams(id) ON DELETE CASCADE
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create rbac_roles table: %w", err)
+	}
+
+	// Measurement permissions table
+	_, err = am.db.Exec(`
+		CREATE TABLE IF NOT EXISTS rbac_measurement_permissions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			role_id INTEGER NOT NULL,
+			measurement_pattern TEXT NOT NULL,
+			permissions TEXT NOT NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (role_id) REFERENCES rbac_roles(id) ON DELETE CASCADE
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create rbac_measurement_permissions table: %w", err)
+	}
+
+	// Token memberships table
+	_, err = am.db.Exec(`
+		CREATE TABLE IF NOT EXISTS rbac_token_memberships (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			token_id INTEGER NOT NULL,
+			team_id INTEGER NOT NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (token_id) REFERENCES api_tokens(id) ON DELETE CASCADE,
+			FOREIGN KEY (team_id) REFERENCES rbac_teams(id) ON DELETE CASCADE,
+			UNIQUE(token_id, team_id)
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create rbac_token_memberships table: %w", err)
+	}
+
+	// Create indexes for performance
+	indexes := []string{
+		`CREATE INDEX IF NOT EXISTS idx_rbac_teams_org ON rbac_teams(organization_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_rbac_roles_team ON rbac_roles(team_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_rbac_measurement_perms_role ON rbac_measurement_permissions(role_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_rbac_token_memberships_token ON rbac_token_memberships(token_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_rbac_token_memberships_team ON rbac_token_memberships(team_id)`,
+	}
+
+	for _, idx := range indexes {
+		if _, err := am.db.Exec(idx); err != nil {
+			am.logger.Debug().Err(err).Str("index", idx).Msg("Failed to create RBAC index")
+		}
+	}
+
+	am.logger.Debug().Msg("RBAC tables initialized")
 	return nil
 }
 
@@ -385,9 +490,12 @@ func (am *AuthManager) VerifyToken(token string) *TokenInfo {
 			ID:          id,
 			Name:        name,
 			Description: description.String,
-			Permissions: strings.Split(permissions.String, ","),
+			Permissions: []string{}, // empty by default for RBAC-only tokens
 			CreatedAt:   createdAt,
 			Enabled:     enabled,
+		}
+		if permissions.Valid && permissions.String != "" {
+			info.Permissions = strings.Split(permissions.String, ",")
 		}
 		if lastUsedAt.Valid {
 			info.LastUsedAt = lastUsedAt.Time
@@ -471,7 +579,7 @@ func (am *AuthManager) ListTokens() ([]TokenInfo, error) {
 			ID:          id,
 			Name:        name,
 			Description: description.String,
-			Permissions: []string{"read", "write"}, // default
+			Permissions: []string{}, // empty by default for RBAC-only tokens
 			CreatedAt:   createdAt,
 			Enabled:     enabled,
 		}
@@ -519,7 +627,7 @@ func (am *AuthManager) GetTokenByID(id int64) (*TokenInfo, error) {
 		ID:          id,
 		Name:        name,
 		Description: description.String,
-		Permissions: []string{"read", "write"},
+		Permissions: []string{}, // empty by default for RBAC-only tokens
 		CreatedAt:   createdAt,
 		Enabled:     enabled,
 	}
@@ -711,4 +819,9 @@ func (am *AuthManager) GetCacheStats() map[string]interface{} {
 func (am *AuthManager) Close() error {
 	close(am.cleanupDone)
 	return am.db.Close()
+}
+
+// GetDB returns the underlying database connection for use by RBACManager
+func (am *AuthManager) GetDB() *sql.DB {
+	return am.db
 }

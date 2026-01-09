@@ -589,6 +589,7 @@ func main() {
 	server.RegisterRoutes()
 
 	// Apply auth middleware if enabled
+	var rbacManager *auth.RBACManager
 	if authManager != nil {
 		middlewareConfig := auth.DefaultMiddlewareConfig()
 		middlewareConfig.AuthManager = authManager
@@ -597,21 +598,46 @@ func main() {
 		middlewareConfig.PublicPrefixes = append(middlewareConfig.PublicPrefixes, "/metrics", "/debug/pprof")
 		server.GetApp().Use(auth.NewMiddleware(middlewareConfig))
 
+		// Initialize RBAC Manager (Enterprise feature)
+		rbacManager = auth.NewRBACManager(&auth.RBACManagerConfig{
+			DB:            authManager.GetDB(),
+			LicenseClient: licenseClient,
+			Logger:        logger.Get("rbac"),
+		})
+		if rbacManager.IsRBACEnabled() {
+			log.Info().Msg("Enterprise RBAC enabled")
+		}
+
 		// Register auth routes
 		authHandler := api.NewAuthHandler(authManager, logger.Get("auth"))
+		authHandler.SetRBACManager(rbacManager)
 		authHandler.RegisterRoutes(server.GetApp())
+		authHandler.RegisterTokenMembershipRoutes(server.GetApp())
+
+		// Register RBAC routes (Enterprise feature)
+		rbacHandler := api.NewRBACHandler(authManager, rbacManager, logger.Get("rbac"))
+		rbacHandler.RegisterRoutes(server.GetApp())
 	}
 
 	// Register MessagePack handler with Arrow buffer
 	msgpackHandler := api.NewMsgPackHandler(logger.Get("msgpack"), arrowBuffer, server.GetMaxPayloadSize())
+	if authManager != nil && rbacManager != nil {
+		msgpackHandler.SetAuthAndRBAC(authManager, rbacManager)
+	}
 	msgpackHandler.RegisterRoutes(server.GetApp())
 
 	// Register Line Protocol handler
 	lineProtocolHandler := api.NewLineProtocolHandler(arrowBuffer, logger.Get("lineprotocol"))
+	if authManager != nil && rbacManager != nil {
+		lineProtocolHandler.SetAuthAndRBAC(authManager, rbacManager)
+	}
 	lineProtocolHandler.RegisterRoutes(server.GetApp())
 
 	// Register Query handler
 	queryHandler := api.NewQueryHandler(db, storageBackend, logger.Get("query"))
+	if authManager != nil && rbacManager != nil {
+		queryHandler.SetAuthAndRBAC(authManager, rbacManager)
+	}
 	queryHandler.RegisterRoutes(server.GetApp())
 
 	// Register Compaction handler (if compaction is enabled)

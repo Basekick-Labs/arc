@@ -6,8 +6,10 @@ import (
 	"io"
 	"sync"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/gofiber/fiber/v2"
 	"github.com/klauspost/compress/gzip"
 	"github.com/klauspost/compress/zstd"
@@ -60,6 +62,10 @@ type MsgPackHandler struct {
 	arrowBuffer    *ingest.ArrowBuffer
 	logger         zerolog.Logger
 	maxPayloadSize int64 // Maximum payload size in bytes (applies to both compressed and decompressed)
+
+	// RBAC support
+	authManager AuthManager
+	rbacManager RBACChecker
 }
 
 // NewMsgPackHandler creates a new MessagePack handler
@@ -70,6 +76,80 @@ func NewMsgPackHandler(logger zerolog.Logger, arrowBuffer *ingest.ArrowBuffer, m
 		logger:         logger.With().Str("component", "msgpack-handler").Logger(),
 		maxPayloadSize: maxPayloadSize,
 	}
+}
+
+// SetAuthAndRBAC sets the auth and RBAC managers for permission checking
+func (h *MsgPackHandler) SetAuthAndRBAC(authManager AuthManager, rbacManager RBACChecker) {
+	h.authManager = authManager
+	h.rbacManager = rbacManager
+}
+
+// extractMeasurements extracts unique measurement names from decoded msgpack records
+func (h *MsgPackHandler) extractMeasurements(records interface{}) []string {
+	seen := make(map[string]struct{})
+
+	var extract func(v interface{})
+	extract = func(v interface{}) {
+		switch r := v.(type) {
+		case *models.Record:
+			if r.Measurement != "" {
+				seen[r.Measurement] = struct{}{}
+			}
+		case *models.ColumnarRecord:
+			if r.Measurement != "" {
+				seen[r.Measurement] = struct{}{}
+			}
+		case []interface{}:
+			for _, item := range r {
+				extract(item)
+			}
+		}
+	}
+
+	extract(records)
+
+	measurements := make([]string, 0, len(seen))
+	for m := range seen {
+		measurements = append(measurements, m)
+	}
+	return measurements
+}
+
+// checkWritePermissions checks if the token has write permission for the database and measurements
+func (h *MsgPackHandler) checkWritePermissions(c *fiber.Ctx, database string, measurements []string) error {
+	// Skip if RBAC is not configured or not enabled
+	if h.rbacManager == nil || !h.rbacManager.IsRBACEnabled() {
+		return nil
+	}
+
+	// Get token info from context
+	tokenInfo, ok := c.Locals("token").(*auth.TokenInfo)
+	if !ok || tokenInfo == nil {
+		return nil // No token info, let other middleware handle auth
+	}
+
+	// Check permission for each measurement
+	for _, measurement := range measurements {
+		req := &auth.PermissionCheckRequest{
+			TokenInfo:   tokenInfo,
+			Database:    database,
+			Measurement: measurement,
+			Permission:  "write",
+		}
+
+		result := h.rbacManager.CheckPermission(req)
+		if !result.Allowed {
+			h.logger.Warn().
+				Int64("token_id", tokenInfo.ID).
+				Str("database", database).
+				Str("measurement", measurement).
+				Str("reason", result.Reason).
+				Msg("RBAC denied write access")
+			return fmt.Errorf("access denied: no write permission for %s.%s", database, measurement)
+		}
+	}
+
+	return nil
 }
 
 // RegisterRoutes registers MessagePack endpoints
@@ -179,6 +259,14 @@ func (h *MsgPackHandler) writeMsgPack(c *fiber.Ctx) error {
 	ctx := c.Context()
 	if database == "" {
 		database = "default"
+	}
+
+	// Check RBAC permissions for all measurements being written
+	measurements := h.extractMeasurements(records)
+	if err := h.checkWritePermissions(c, database, measurements); err != nil {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": err.Error(),
+		})
 	}
 
 	if err := h.arrowBuffer.Write(ctx, database, records); err != nil {

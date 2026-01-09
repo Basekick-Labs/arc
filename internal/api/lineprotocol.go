@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/gofiber/fiber/v2"
@@ -24,6 +25,10 @@ type LineProtocolHandler struct {
 	parser *ingest.LineProtocolParser
 	logger zerolog.Logger
 
+	// RBAC support
+	authManager AuthManager
+	rbacManager RBACChecker
+
 	// Stats
 	totalRequests     atomic.Int64
 	totalRecords      atomic.Int64
@@ -39,6 +44,49 @@ func NewLineProtocolHandler(buffer *ingest.ArrowBuffer, logger zerolog.Logger) *
 		parser: ingest.NewLineProtocolParser(),
 		logger: logger.With().Str("component", "lineprotocol-handler").Logger(),
 	}
+}
+
+// SetAuthAndRBAC sets the auth and RBAC managers for permission checking
+func (h *LineProtocolHandler) SetAuthAndRBAC(authManager AuthManager, rbacManager RBACChecker) {
+	h.authManager = authManager
+	h.rbacManager = rbacManager
+}
+
+// checkWritePermissions checks if the token has write permission for the database and measurements
+func (h *LineProtocolHandler) checkWritePermissions(c *fiber.Ctx, database string, measurements []string) error {
+	// Skip if RBAC is not configured or not enabled
+	if h.rbacManager == nil || !h.rbacManager.IsRBACEnabled() {
+		return nil
+	}
+
+	// Get token info from context
+	tokenInfo, ok := c.Locals("token").(*auth.TokenInfo)
+	if !ok || tokenInfo == nil {
+		return nil // No token info, let other middleware handle auth
+	}
+
+	// Check permission for each measurement
+	for _, measurement := range measurements {
+		req := &auth.PermissionCheckRequest{
+			TokenInfo:   tokenInfo,
+			Database:    database,
+			Measurement: measurement,
+			Permission:  "write",
+		}
+
+		result := h.rbacManager.CheckPermission(req)
+		if !result.Allowed {
+			h.logger.Warn().
+				Int64("token_id", tokenInfo.ID).
+				Str("database", database).
+				Str("measurement", measurement).
+				Str("reason", result.Reason).
+				Msg("RBAC denied write access")
+			return fmt.Errorf("access denied: no write permission for %s.%s", database, measurement)
+		}
+	}
+
+	return nil
 }
 
 // RegisterRoutes registers Line Protocol routes
@@ -158,6 +206,18 @@ func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string) error {
 
 	// Convert to columnar format grouped by measurement
 	columnarByMeasurement := ingest.BatchToColumnar(records)
+
+	// Check RBAC permissions for all measurements being written
+	measurements := make([]string, 0, len(columnarByMeasurement))
+	for measurement := range columnarByMeasurement {
+		measurements = append(measurements, measurement)
+	}
+	if err := h.checkWritePermissions(c, database, measurements); err != nil {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": err.Error(),
+		})
+	}
 
 	// Write each measurement to the buffer
 	for measurement, columns := range columnarByMeasurement {
