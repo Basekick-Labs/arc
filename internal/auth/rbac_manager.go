@@ -916,6 +916,128 @@ func (rm *RBACManager) CheckPermission(req *PermissionCheckRequest) *PermissionC
 	return result
 }
 
+// CheckPermissionsBatch checks permissions for multiple resources in a single call.
+// This is more efficient than multiple CheckPermission calls when checking permissions
+// for the same token across multiple tables (e.g., multi-table queries).
+// It loads the token's RBAC data once and checks all permissions against it.
+func (rm *RBACManager) CheckPermissionsBatch(reqs []*PermissionCheckRequest) []*PermissionCheckResult {
+	if len(reqs) == 0 {
+		return nil
+	}
+
+	results := make([]*PermissionCheckResult, len(reqs))
+
+	// If RBAC is not enabled, use OSS token permissions only (fast path)
+	if !rm.IsRBACEnabled() {
+		for i, req := range reqs {
+			if req.TokenInfo == nil {
+				results[i] = &PermissionCheckResult{
+					Allowed: false,
+					Source:  "denied",
+					Reason:  "no token provided",
+				}
+			} else {
+				results[i] = rm.checkOSSPermission(req)
+			}
+		}
+		return results
+	}
+
+	// Group requests by token ID to batch-load RBAC data
+	type indexedReq struct {
+		index int
+		req   *PermissionCheckRequest
+	}
+	tokenGroups := make(map[int64][]indexedReq)
+
+	for i, req := range reqs {
+		if req.TokenInfo == nil {
+			results[i] = &PermissionCheckResult{
+				Allowed: false,
+				Source:  "denied",
+				Reason:  "no token provided",
+			}
+			continue
+		}
+		tokenGroups[req.TokenInfo.ID] = append(tokenGroups[req.TokenInfo.ID], indexedReq{index: i, req: req})
+	}
+
+	// Process each token's requests with single RBAC data load
+	for tokenID, indexedReqs := range tokenGroups {
+		// Load RBAC data once for all requests with this token
+		rbacData, err := rm.getTokenRBACData(tokenID)
+		if err != nil {
+			rm.logger.Error().Err(err).Int64("token_id", tokenID).Msg("Failed to get token RBAC data for batch")
+			// Fall back to OSS permissions for all requests with this token
+			for _, ir := range indexedReqs {
+				results[ir.index] = rm.checkOSSPermission(ir.req)
+			}
+			continue
+		}
+
+		// Check each permission using the loaded RBAC data
+		for _, ir := range indexedReqs {
+			req := ir.req
+
+			// Check permission result cache first
+			cacheKey := permissionCacheKey{
+				tokenID:     req.TokenInfo.ID,
+				database:    req.Database,
+				measurement: req.Measurement,
+				permission:  req.Permission,
+			}
+
+			rm.permCacheMu.RLock()
+			entry, cacheHit := rm.permCache[cacheKey]
+			if cacheHit && time.Now().Before(entry.expiresAt) {
+				rm.permCacheMu.RUnlock()
+				rm.cacheHits.Add(1)
+				results[ir.index] = entry.result
+				continue
+			}
+			rm.permCacheMu.RUnlock()
+			rm.cacheMisses.Add(1)
+
+			// Compute permission using cached RBAC data
+			var result *PermissionCheckResult
+
+			// No team memberships - use OSS permissions (backward compat)
+			if len(rbacData.teams) == 0 {
+				result = rm.checkOSSPermission(req)
+			} else if rm.checkRBACPermissionCached(req, rbacData) {
+				result = &PermissionCheckResult{
+					Allowed: true,
+					Source:  "rbac",
+				}
+			} else {
+				// RBAC denied, fall back to OSS permissions
+				ossResult := rm.checkOSSPermission(req)
+				if ossResult.Allowed {
+					result = ossResult
+				} else {
+					result = &PermissionCheckResult{
+						Allowed: false,
+						Source:  "denied",
+						Reason:  fmt.Sprintf("no permission for %s on database '%s'", req.Permission, req.Database),
+					}
+				}
+			}
+
+			// Cache the result
+			rm.permCacheMu.Lock()
+			rm.permCache[cacheKey] = &permissionCacheEntry{
+				result:    result,
+				expiresAt: time.Now().Add(rm.permCacheTTL),
+			}
+			rm.permCacheMu.Unlock()
+
+			results[ir.index] = result
+		}
+	}
+
+	return results
+}
+
 // checkPermissionUncached performs the actual permission check without caching
 func (rm *RBACManager) checkPermissionUncached(req *PermissionCheckRequest) *PermissionCheckResult {
 	// Get or load token RBAC data (cached)
