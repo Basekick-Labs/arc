@@ -52,7 +52,7 @@ func TestCreateOrganization(t *testing.T) {
 
 	t.Run("basic creation", func(t *testing.T) {
 		org, err := rm.CreateOrganization(&CreateOrganizationRequest{
-			Name:        "Acme Corp",
+			Name:        "acme-corp",
 			Description: "Test organization",
 		})
 		if err != nil {
@@ -64,8 +64,8 @@ func TestCreateOrganization(t *testing.T) {
 		if org.ID == 0 {
 			t.Error("Organization ID should not be 0")
 		}
-		if org.Name != "Acme Corp" {
-			t.Errorf("Name = %s, want %s", org.Name, "Acme Corp")
+		if org.Name != "acme-corp" {
+			t.Errorf("Name = %s, want %s", org.Name, "acme-corp")
 		}
 		if !org.Enabled {
 			t.Error("Organization should be enabled by default")
@@ -84,7 +84,7 @@ func TestCreateOrganization(t *testing.T) {
 	t.Run("duplicate name", func(t *testing.T) {
 		// First creation should succeed
 		_, err := rm.CreateOrganization(&CreateOrganizationRequest{
-			Name: "Duplicate Org",
+			Name: "duplicate-org",
 		})
 		if err != nil {
 			t.Fatalf("First CreateOrganization failed: %v", err)
@@ -92,7 +92,7 @@ func TestCreateOrganization(t *testing.T) {
 
 		// Second creation should fail
 		_, err = rm.CreateOrganization(&CreateOrganizationRequest{
-			Name: "Duplicate Org",
+			Name: "duplicate-org",
 		})
 		if err == nil {
 			t.Error("Expected error for duplicate name")
@@ -105,10 +105,13 @@ func TestGetOrganization(t *testing.T) {
 	defer cleanup()
 
 	t.Run("existing organization", func(t *testing.T) {
-		created, _ := rm.CreateOrganization(&CreateOrganizationRequest{
-			Name:        "Get Test Org",
+		created, err := rm.CreateOrganization(&CreateOrganizationRequest{
+			Name:        "get-test-org",
 			Description: "Test description",
 		})
+		if err != nil {
+			t.Fatalf("CreateOrganization failed: %v", err)
+		}
 
 		org, err := rm.GetOrganization(created.ID)
 		if err != nil {
@@ -117,8 +120,8 @@ func TestGetOrganization(t *testing.T) {
 		if org == nil {
 			t.Fatal("Organization should not be nil")
 		}
-		if org.Name != "Get Test Org" {
-			t.Errorf("Name = %s, want %s", org.Name, "Get Test Org")
+		if org.Name != "get-test-org" {
+			t.Errorf("Name = %s, want %s", org.Name, "get-test-org")
 		}
 	})
 
@@ -138,9 +141,9 @@ func TestListOrganizations(t *testing.T) {
 	defer cleanup()
 
 	// Create some organizations
-	rm.CreateOrganization(&CreateOrganizationRequest{Name: "Org A"})
-	rm.CreateOrganization(&CreateOrganizationRequest{Name: "Org B"})
-	rm.CreateOrganization(&CreateOrganizationRequest{Name: "Org C"})
+	rm.CreateOrganization(&CreateOrganizationRequest{Name: "org-a"})
+	rm.CreateOrganization(&CreateOrganizationRequest{Name: "org-b"})
+	rm.CreateOrganization(&CreateOrganizationRequest{Name: "org-c"})
 
 	orgs, err := rm.ListOrganizations()
 	if err != nil {
@@ -156,12 +159,12 @@ func TestUpdateOrganization(t *testing.T) {
 	defer cleanup()
 
 	org, _ := rm.CreateOrganization(&CreateOrganizationRequest{
-		Name:        "Update Test Org",
+		Name:        "update-test-org",
 		Description: "Original description",
 	})
 
 	t.Run("update name", func(t *testing.T) {
-		newName := "Updated Org Name"
+		newName := "updated-org-name"
 		err := rm.UpdateOrganization(org.ID, &UpdateOrganizationRequest{
 			Name: &newName,
 		})
@@ -170,8 +173,8 @@ func TestUpdateOrganization(t *testing.T) {
 		}
 
 		updated, _ := rm.GetOrganization(org.ID)
-		if updated.Name != "Updated Org Name" {
-			t.Errorf("Name = %s, want %s", updated.Name, "Updated Org Name")
+		if updated.Name != "updated-org-name" {
+			t.Errorf("Name = %s, want %s", updated.Name, "updated-org-name")
 		}
 	})
 
@@ -191,7 +194,7 @@ func TestUpdateOrganization(t *testing.T) {
 	})
 
 	t.Run("non-existent organization", func(t *testing.T) {
-		newName := "New Name"
+		newName := "new-name"
 		err := rm.UpdateOrganization(99999, &UpdateOrganizationRequest{
 			Name: &newName,
 		})
@@ -206,7 +209,7 @@ func TestDeleteOrganization(t *testing.T) {
 	defer cleanup()
 
 	org, _ := rm.CreateOrganization(&CreateOrganizationRequest{
-		Name: "Delete Test Org",
+		Name: "delete-test-org",
 	})
 
 	t.Run("delete existing", func(t *testing.T) {
@@ -237,7 +240,7 @@ func TestCreateTeam(t *testing.T) {
 	rm, _, cleanup := setupTestRBACManager(t)
 	defer cleanup()
 
-	org, _ := rm.CreateOrganization(&CreateOrganizationRequest{Name: "Team Test Org"})
+	org, _ := rm.CreateOrganization(&CreateOrganizationRequest{Name: "team-test-org"})
 
 	t.Run("basic creation", func(t *testing.T) {
 		team, err := rm.CreateTeam(org.ID, &CreateTeamRequest{
@@ -282,8 +285,8 @@ func TestTeamCascadeDelete(t *testing.T) {
 	rm, _, cleanup := setupTestRBACManager(t)
 	defer cleanup()
 
-	org, _ := rm.CreateOrganization(&CreateOrganizationRequest{Name: "Cascade Test Org"})
-	team, _ := rm.CreateTeam(org.ID, &CreateTeamRequest{Name: "Cascade Test Team"})
+	org, _ := rm.CreateOrganization(&CreateOrganizationRequest{Name: "cascade-test-org"})
+	team, _ := rm.CreateTeam(org.ID, &CreateTeamRequest{Name: "cascade-test-team"})
 
 	// Create role and verify it exists
 	role, _ := rm.CreateRole(team.ID, &CreateRoleRequest{
@@ -318,8 +321,8 @@ func TestCreateRole(t *testing.T) {
 	rm, _, cleanup := setupTestRBACManager(t)
 	defer cleanup()
 
-	org, _ := rm.CreateOrganization(&CreateOrganizationRequest{Name: "Role Test Org"})
-	team, _ := rm.CreateTeam(org.ID, &CreateTeamRequest{Name: "Role Test Team"})
+	org, _ := rm.CreateOrganization(&CreateOrganizationRequest{Name: "role-test-org"})
+	team, _ := rm.CreateTeam(org.ID, &CreateTeamRequest{Name: "role-test-team"})
 
 	t.Run("basic creation", func(t *testing.T) {
 		role, err := rm.CreateRole(team.ID, &CreateRoleRequest{
@@ -390,8 +393,8 @@ func TestTokenMembership(t *testing.T) {
 	defer cleanup()
 
 	// Create organization and team
-	org, _ := rm.CreateOrganization(&CreateOrganizationRequest{Name: "Membership Test Org"})
-	team, _ := rm.CreateTeam(org.ID, &CreateTeamRequest{Name: "Membership Test Team"})
+	org, _ := rm.CreateOrganization(&CreateOrganizationRequest{Name: "membership-test-org"})
+	team, _ := rm.CreateTeam(org.ID, &CreateTeamRequest{Name: "membership-test-team"})
 
 	// Create a token
 	token, _ := am.CreateToken("membership-test", "Test token", "read,write", nil)
