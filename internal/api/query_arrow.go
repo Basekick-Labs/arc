@@ -63,8 +63,8 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		})
 	}
 
-	// Convert SQL to storage paths
-	convertedSQL := h.convertSQLToStoragePaths(req.SQL)
+	// Convert SQL to storage paths (with caching)
+	convertedSQL, _ := h.getTransformedSQL(req.SQL)
 
 	h.logger.Debug().
 		Str("original_sql", req.SQL).
