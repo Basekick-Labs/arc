@@ -1276,11 +1276,12 @@ func (b *ArrowBuffer) writeColumnar(ctx context.Context, database string, record
 		recordsToFlush = make([]interface{}, len(shard.buffers[bufferKey]))
 		copy(recordsToFlush, shard.buffers[bufferKey])
 
-		// Clear buffer immediately, but KEEP the start time
-		// This allows age-based flush to catch any remaining data after size flushes
-		shard.buffers[bufferKey] = nil
-		// NOTE: Keep bufferStartTimes[bufferKey] - don't delete it!
-		shard.bufferRecordCounts[bufferKey] = 0
+		// Clear buffer completely so next write re-initializes bufferStartTimes
+		// Using delete() instead of = nil ensures the key doesn't exist,
+		// so the next WriteColumnar properly sets a fresh start time
+		delete(shard.buffers, bufferKey)
+		delete(shard.bufferStartTimes, bufferKey)
+		delete(shard.bufferRecordCounts, bufferKey)
 		delete(shard.bufferSchemas, bufferKey)
 
 		shouldFlush = true
