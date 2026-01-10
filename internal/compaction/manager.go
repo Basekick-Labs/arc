@@ -404,30 +404,34 @@ func (m *Manager) RunCompactionCycleForTiers(ctx context.Context, tierNames []st
 							Msg("Splitting large candidate into batches")
 					}
 
-					for _, batch := range batches {
-						tierCandidateCount++
+					tierCandidateCount += len(batches)
 
-						wg.Add(1)
-						sem <- struct{}{} // Acquire semaphore
+					wg.Add(1)
+					sem <- struct{}{} // Acquire semaphore
 
-						go func(c Candidate) {
-							defer wg.Done()
-							defer func() { <-sem }() // Release semaphore
+					// Run all batches for the same partition sequentially within a single goroutine.
+					// This prevents race conditions where batch N tries to compact files that were
+					// already deleted by batch N-1. Different partitions can still run in parallel.
+					go func(partitionBatches []Candidate, partition string) {
+						defer wg.Done()
+						defer func() { <-sem }() // Release semaphore
 
-							if err := m.CompactPartition(ctx, c); err != nil {
+						for _, batch := range partitionBatches {
+							if err := m.CompactPartition(ctx, batch); err != nil {
 								m.logger.Error().Err(err).
-									Str("partition", c.PartitionPath).
+									Str("partition", batch.PartitionPath).
 									Str("tier", tierName).
-									Int("batch", c.BatchNumber).
-									Int("total_batches", c.TotalBatches).
+									Int("batch", batch.BatchNumber).
+									Int("total_batches", batch.TotalBatches).
 									Int64("cycle_id", cycleID).
 									Msg("Compaction failed")
 								errMu.Lock()
 								errCount++
 								errMu.Unlock()
+								// Continue with next batch - don't fail entire partition
 							}
-						}(batch)
-					}
+						}
+					}(batches, candidate.PartitionPath)
 				}
 				// candidates slice is now eligible for GC after this iteration
 			}

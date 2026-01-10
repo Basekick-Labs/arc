@@ -1,7 +1,7 @@
 # Arc
 
 [![Ingestion](https://img.shields.io/badge/ingestion-10.1M%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
-[![Query](https://img.shields.io/badge/query-5.2M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
+[![Query](https://img.shields.io/badge/query-2.2M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
 [![Go](https://img.shields.io/badge/go-1.25+-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
@@ -29,7 +29,7 @@ Industrial IoT generates massive data at scale:
 
 Traditional time-series databases can't keep up. They're slow, expensive, and lock your data in proprietary formats.
 
-**Arc solves this: 10.1M records/sec ingestion, sub-second queries on billions of rows, portable Parquet files you own.**
+**Arc solves this: 12M records/sec ingestion, sub-second queries on billions of rows, portable Parquet files you own.**
 
 ```sql
 -- Analyze equipment anomalies across facilities
@@ -62,19 +62,19 @@ Benchmarked on Apple MacBook Pro M3 Max (14 cores, 36GB RAM, 1TB NVMe).
 
 | Protocol | Throughput | p50 Latency | p99 Latency |
 |----------|------------|-------------|-------------|
-| MessagePack Columnar | **10.05M rec/s** | 3.08ms | 7.08ms |
-| MessagePack + Zstd | 9.57M rec/s | 3.13ms | 8.06ms |
-| MessagePack + GZIP | 8.85M rec/s | 3.30ms | 9.32ms |
-| Line Protocol | 1.99M rec/s | 48.19ms | 100.32ms |
+| MessagePack Columnar | **11.8M rec/s** | 1.06ms | 9.94ms |
+| MessagePack + Zstd | 11.76M rec/s | 1.41ms | 22.36ms |
+| MessagePack + GZIP | 10.34M rec/s | 1.85ms | 22.70ms |
+| Line Protocol | 2.55M rec/s | 6.77ms | 20.99ms |
 
 ### Query
 
 | Format | Throughput | Response Size (500K rows) |
 |--------|------------|---------------------------|
-| Arrow IPC | **5.2M rows/s** | 8.0 MB |
-| JSON | 2.0M rows/s | 25.0 MB |
+| Arrow IPC | **2.2M rows/s** | 21.5 MB |
+| JSON | 1.0M rows/s | 47.0 MB |
 
-Full table scan: **927M rows/s** (596M records in 685ms)
+Full table scan: **~1 billion rows/s** (321M records in 329ms)
 
 ---
 
