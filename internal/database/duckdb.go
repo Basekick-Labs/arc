@@ -50,11 +50,11 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 		return nil, fmt.Errorf("failed to open duckdb: %w", err)
 	}
 
-	// Set connection pool limits
+	// Set connection pool limits optimized for query-heavy workloads
 	db.SetMaxOpenConns(cfg.MaxConnections)
-	db.SetMaxIdleConns(cfg.MaxConnections / 2)
-	db.SetConnMaxLifetime(30 * time.Minute)
-	db.SetConnMaxIdleTime(5 * time.Minute)
+	db.SetMaxIdleConns(cfg.MaxConnections) // Keep all connections idle-ready to avoid acquisition overhead
+	db.SetConnMaxLifetime(0)               // No lifetime limit - DuckDB handles connection health internally
+	db.SetConnMaxIdleTime(10 * time.Minute) // Longer idle time to reduce connection churn
 
 	// Test connection
 	if err := db.Ping(); err != nil {

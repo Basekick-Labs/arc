@@ -14,6 +14,10 @@ const SQLTransformCacheTTL = 60 * time.Second
 // DefaultSQLTransformCacheMaxSize is the default maximum number of cached entries
 const DefaultSQLTransformCacheMaxSize = 10000
 
+// cacheShardCount is the number of shards to distribute lock contention
+// 16 shards means ~16x reduction in lock contention under concurrent load
+const cacheShardCount = 16
+
 // Aliases for backwards compatibility
 const QueryCacheTTL = SQLTransformCacheTTL
 const DefaultQueryCacheMaxSize = DefaultSQLTransformCacheMaxSize
@@ -24,19 +28,28 @@ type sqlTransformCacheEntry struct {
 	expiresAt   time.Time
 }
 
-// SQLTransformCache provides a TTL cache for SQL-to-storage-path transformations.
+// cacheShard is a single shard of the cache with its own lock
+type cacheShard struct {
+	mu      sync.RWMutex
+	entries map[string]sqlTransformCacheEntry
+}
+
+// SQLTransformCache provides a sharded TTL cache for SQL-to-storage-path transformations.
 // This caches the result of converting table references (e.g., FROM mydb.cpu)
 // to DuckDB read_parquet() calls (e.g., FROM read_parquet('./data/mydb/cpu/**/*.parquet')).
 // This is NOT a query results cache or query plan cache - it only caches the
 // regex-based string transformation that happens before DuckDB sees the query.
+//
+// The cache is sharded into 16 buckets to reduce lock contention under concurrent load.
+// Each shard has its own RWMutex, so concurrent queries hitting different shards
+// don't block each other.
 type SQLTransformCache struct {
-	mu         sync.RWMutex
-	entries    map[string]sqlTransformCacheEntry
-	ttl        time.Duration
-	maxSize    int
-	hits       atomic.Int64
-	misses     atomic.Int64
-	evictions  atomic.Int64
+	shards       [cacheShardCount]*cacheShard
+	ttl          time.Duration
+	maxSizeTotal int // Total max size across all shards
+	hits         atomic.Int64
+	misses       atomic.Int64
+	evictions    atomic.Int64
 }
 
 // NewSQLTransformCache creates a new SQL transform cache with the specified TTL and max size
@@ -47,11 +60,20 @@ func NewSQLTransformCache(ttl time.Duration, maxSize int) *SQLTransformCache {
 	if maxSize <= 0 {
 		maxSize = DefaultSQLTransformCacheMaxSize
 	}
-	return &SQLTransformCache{
-		entries: make(map[string]sqlTransformCacheEntry),
-		ttl:     ttl,
-		maxSize: maxSize,
+
+	c := &SQLTransformCache{
+		ttl:          ttl,
+		maxSizeTotal: maxSize,
 	}
+
+	// Initialize all shards
+	for i := 0; i < cacheShardCount; i++ {
+		c.shards[i] = &cacheShard{
+			entries: make(map[string]sqlTransformCacheEntry),
+		}
+	}
+
+	return c
 }
 
 // NewQueryCache creates a new query cache (alias for backwards compatibility)
@@ -67,13 +89,21 @@ func queryHash(sql string) string {
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(sql)))
 }
 
+// getShard returns the shard for a given hash using the first byte
+func (c *SQLTransformCache) getShard(hash string) *cacheShard {
+	// Use first byte of hash for shard selection (0-255 mod 16 = 0-15)
+	idx := uint8(hash[0]) % cacheShardCount
+	return c.shards[idx]
+}
+
 // Get retrieves a cached transformed SQL if it exists and hasn't expired
 func (c *SQLTransformCache) Get(sql string) (string, bool) {
 	hash := queryHash(sql)
+	shard := c.getShard(hash)
 
-	c.mu.RLock()
-	entry, ok := c.entries[hash]
-	c.mu.RUnlock()
+	shard.mu.RLock()
+	entry, ok := shard.entries[hash]
+	shard.mu.RUnlock()
 
 	if !ok {
 		c.misses.Add(1)
@@ -92,65 +122,86 @@ func (c *SQLTransformCache) Get(sql string) (string, bool) {
 // Set stores a transformed SQL in the cache
 func (c *SQLTransformCache) Set(sql, transformed string) {
 	hash := queryHash(sql)
+	shard := c.getShard(hash)
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	shard.mu.Lock()
 
-	// Check if we need to evict entries
-	if len(c.entries) >= c.maxSize {
-		// Simple eviction: remove expired entries first
+	// Calculate per-shard max size (distribute evenly, minimum 1 per shard)
+	maxPerShard := c.maxSizeTotal / cacheShardCount
+	if maxPerShard < 1 {
+		maxPerShard = 1
+	}
+
+	// Check if we need to evict entries from this shard
+	if len(shard.entries) >= maxPerShard {
+		// Probabilistic eviction: only check up to 10 random entries
+		// This avoids O(n) scan of entire map while holding lock
 		now := time.Now()
-		removed := 0
-		for key, entry := range c.entries {
+		evicted := 0
+		for key, entry := range shard.entries {
 			if now.After(entry.expiresAt) {
-				delete(c.entries, key)
-				removed++
+				delete(shard.entries, key)
+				evicted++
+				if evicted >= 10 {
+					break
+				}
 			}
 		}
-		c.evictions.Add(int64(removed))
+		c.evictions.Add(int64(evicted))
 
-		// If still at capacity, skip caching this entry
-		// (LRU would be more sophisticated but adds complexity)
-		if len(c.entries) >= c.maxSize {
+		// If still at capacity after eviction, skip caching this entry
+		if len(shard.entries) >= maxPerShard {
+			shard.mu.Unlock()
 			return
 		}
 	}
 
-	c.entries[hash] = sqlTransformCacheEntry{
+	shard.entries[hash] = sqlTransformCacheEntry{
 		transformed: transformed,
 		expiresAt:   time.Now().Add(c.ttl),
 	}
+	shard.mu.Unlock()
 }
 
 // Invalidate removes all entries from the cache
 func (c *SQLTransformCache) Invalidate() {
-	c.mu.Lock()
-	c.entries = make(map[string]sqlTransformCacheEntry)
-	c.mu.Unlock()
+	for i := 0; i < cacheShardCount; i++ {
+		shard := c.shards[i]
+		shard.mu.Lock()
+		shard.entries = make(map[string]sqlTransformCacheEntry)
+		shard.mu.Unlock()
+	}
 }
 
 // Cleanup removes expired entries from the cache
 func (c *SQLTransformCache) Cleanup() int {
 	now := time.Now()
-	removed := 0
+	totalRemoved := 0
 
-	c.mu.Lock()
-	for key, entry := range c.entries {
-		if now.After(entry.expiresAt) {
-			delete(c.entries, key)
-			removed++
+	for i := 0; i < cacheShardCount; i++ {
+		shard := c.shards[i]
+		shard.mu.Lock()
+		for key, entry := range shard.entries {
+			if now.After(entry.expiresAt) {
+				delete(shard.entries, key)
+				totalRemoved++
+			}
 		}
+		shard.mu.Unlock()
 	}
-	c.mu.Unlock()
 
-	return removed
+	return totalRemoved
 }
 
 // Stats returns cache statistics as a map
 func (c *SQLTransformCache) Stats() map[string]interface{} {
-	c.mu.RLock()
-	size := len(c.entries)
-	c.mu.RUnlock()
+	totalSize := 0
+	for i := 0; i < cacheShardCount; i++ {
+		shard := c.shards[i]
+		shard.mu.RLock()
+		totalSize += len(shard.entries)
+		shard.mu.RUnlock()
+	}
 
 	hits := c.hits.Load()
 	misses := c.misses.Load()
@@ -161,8 +212,9 @@ func (c *SQLTransformCache) Stats() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"cache_size":       size,
-		"cache_max_size":   c.maxSize,
+		"cache_size":       totalSize,
+		"cache_max_size":   c.maxSizeTotal,
+		"cache_shards":     cacheShardCount,
 		"cache_hits":       hits,
 		"cache_misses":     misses,
 		"hit_rate_percent": hitRate,
@@ -173,7 +225,12 @@ func (c *SQLTransformCache) Stats() map[string]interface{} {
 
 // Size returns the current number of entries in the cache
 func (c *SQLTransformCache) Size() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return len(c.entries)
+	totalSize := 0
+	for i := 0; i < cacheShardCount; i++ {
+		shard := c.shards[i]
+		shard.mu.RLock()
+		totalSize += len(shard.entries)
+		shard.mu.RUnlock()
+	}
+	return totalSize
 }

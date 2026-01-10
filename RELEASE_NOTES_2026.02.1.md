@@ -102,6 +102,20 @@ WHERE time > NOW() - INTERVAL '4 minutes'
 
 ## Bug Fixes
 
+### Query Results Timestamp Timezone Inconsistency
+
+Fixed a bug where `time.Time` values in query results could be returned with the server's local timezone instead of UTC. This caused timestamp inconsistencies when servers were running in non-UTC timezones.
+
+**Before:** Timestamps in query results used the server's local timezone, potentially causing mismatches with stored UTC data.
+
+**After:** All timestamps in query results are now explicitly normalized to UTC via `.UTC()` before formatting, ensuring consistency regardless of server timezone.
+
+**Impact:** Users querying data will now always receive UTC timestamps. To display in local timezone, convert client-side or use DuckDB's `AT TIME ZONE` in queries:
+```sql
+SELECT time AT TIME ZONE 'America/New_York' as local_time, value
+FROM mydb.cpu
+```
+
 ### Azure Blob Storage Query SSL Certificate Errors on Linux (PR #92)
 
 Fixed SSL certificate validation errors when querying data from Azure Blob Storage on Linux. The DuckDB azure extension was failing to find CA certificates due to path resolution issues with static linking.

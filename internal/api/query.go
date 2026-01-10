@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -30,6 +31,7 @@ type AuthManager interface {
 type RBACChecker interface {
 	IsRBACEnabled() bool
 	CheckPermission(req *auth.PermissionCheckRequest) *auth.PermissionCheckResult
+	CheckPermissionsBatch(reqs []*auth.PermissionCheckRequest) []*auth.PermissionCheckResult
 }
 
 // TableReference represents a database.measurement reference extracted from SQL
@@ -77,7 +79,62 @@ var (
 	// Pattern for date_trunc function calls
 	// Matches: date_trunc('hour', time_column) or date_trunc('day', column_expr)
 	patternDateTrunc = regexp.MustCompile(`(?i)\bdate_trunc\s*\(\s*'(second|minute|hour|day|week|month)'\s*,\s*([^)]+)\)`)
+
+	// Pattern for extracting LIMIT clause value for result pre-allocation
+	patternLimit = regexp.MustCompile(`(?i)\bLIMIT\s+(\d+)\b`)
 )
+
+// Pools for reusing scan buffers to reduce allocations in row fetching.
+// Each query reuses buffers from these pools instead of allocating new slices per row.
+var (
+	// scanBufferPool holds reusable scanBuffer instances
+	scanBufferPool = sync.Pool{
+		New: func() interface{} {
+			return &scanBuffer{
+				values:    make([]interface{}, 0, 32),
+				valuePtrs: make([]interface{}, 0, 32),
+			}
+		},
+	}
+)
+
+// scanBuffer holds reusable slices for row scanning
+type scanBuffer struct {
+	values    []interface{}
+	valuePtrs []interface{}
+}
+
+// reset prepares the buffer for reuse with a specific column count
+func (b *scanBuffer) reset(numCols int) {
+	// Ensure capacity
+	if cap(b.values) < numCols {
+		b.values = make([]interface{}, numCols)
+		b.valuePtrs = make([]interface{}, numCols)
+	} else {
+		b.values = b.values[:numCols]
+		b.valuePtrs = b.valuePtrs[:numCols]
+	}
+	// Set up pointers
+	for i := range b.values {
+		b.values[i] = nil // Clear previous values
+		b.valuePtrs[i] = &b.values[i]
+	}
+}
+
+// extractLimit extracts the LIMIT value from SQL for result pre-allocation.
+// Returns defaultLimit if no LIMIT clause is found.
+func extractLimit(sql string, defaultLimit int) int {
+	if match := patternLimit.FindStringSubmatch(sql); match != nil {
+		if limit, err := strconv.Atoi(match[1]); err == nil && limit > 0 {
+			// Cap at 100k to avoid excessive pre-allocation
+			if limit > 100000 {
+				return 100000
+			}
+			return limit
+		}
+	}
+	return defaultLimit
+}
 
 // extractCTENames extracts CTE names from a SQL query's WITH clause.
 // Returns a set of lowercase CTE names for efficient lookup.
@@ -394,13 +451,20 @@ func stripSQLComments(sql string, hasComments bool) string {
 
 // QueryHandler handles SQL query endpoints
 type QueryHandler struct {
-	db          *database.DuckDB
-	storage     storage.Backend
-	pruner      *pruning.PartitionPruner
-	queryCache  *database.QueryCache
-	logger      zerolog.Logger
-	authManager AuthManager
-	rbacManager RBACChecker
+	db           *database.DuckDB
+	storage      storage.Backend
+	pruner       *pruning.PartitionPruner
+	queryCache   *database.QueryCache
+	logger       zerolog.Logger
+	authManager  AuthManager
+	rbacManager  RBACChecker
+	debugEnabled bool // Cached check for debug logging to avoid repeated level checks
+}
+
+// isDebugEnabled returns true if debug logging is enabled.
+// This is cached at handler creation to avoid repeated level checks in hot paths.
+func (h *QueryHandler) isDebugEnabled() bool {
+	return h.debugEnabled
 }
 
 // QueryRequest represents a SQL query request
@@ -520,14 +584,16 @@ func validateWhereClauseQuery(where string) error {
 
 // NewQueryHandler creates a new query handler
 func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolog.Logger) *QueryHandler {
+	handlerLogger := logger.With().Str("component", "query-handler").Logger()
 	return &QueryHandler{
-		db:          db,
-		storage:     storage,
-		pruner:      pruning.NewPartitionPruner(logger),
-		queryCache:  database.NewQueryCache(database.QueryCacheTTL, database.DefaultQueryCacheMaxSize),
-		logger:      logger.With().Str("component", "query-handler").Logger(),
-		authManager: nil,
-		rbacManager: nil,
+		db:           db,
+		storage:      storage,
+		pruner:       pruning.NewPartitionPruner(logger),
+		queryCache:   database.NewQueryCache(database.QueryCacheTTL, database.DefaultQueryCacheMaxSize),
+		logger:       handlerLogger,
+		authManager:  nil,
+		rbacManager:  nil,
+		debugEnabled: handlerLogger.GetLevel() <= zerolog.DebugLevel,
 	}
 }
 
@@ -638,6 +704,7 @@ func extractTableReferences(sql string) []TableReference {
 
 // checkQueryPermissions checks RBAC permissions for all tables referenced in a query
 // Returns nil if access is allowed, or an error describing what access was denied
+// Uses batch permission checking for efficiency when multiple tables are referenced
 func (h *QueryHandler) checkQueryPermissions(c *fiber.Ctx, sql, permission string) error {
 	// If no RBAC manager, skip permission check (handled by basic auth middleware)
 	if h.rbacManager == nil || !h.rbacManager.IsRBACEnabled() {
@@ -658,21 +725,31 @@ func (h *QueryHandler) checkQueryPermissions(c *fiber.Ctx, sql, permission strin
 		return nil
 	}
 
-	h.logger.Debug().
-		Str("sql", sql).
-		Int("table_count", len(tableRefs)).
-		Msg("Checking RBAC permissions for query")
+	if h.debugEnabled {
+		h.logger.Debug().
+			Str("sql", sql).
+			Int("table_count", len(tableRefs)).
+			Msg("Checking RBAC permissions for query")
+	}
 
-	// Check permission for each table
-	for _, ref := range tableRefs {
-		result := h.rbacManager.CheckPermission(&auth.PermissionCheckRequest{
+	// Build batch request for all table references
+	reqs := make([]*auth.PermissionCheckRequest, len(tableRefs))
+	for i, ref := range tableRefs {
+		reqs[i] = &auth.PermissionCheckRequest{
 			TokenInfo:   tokenInfo,
 			Database:    ref.Database,
 			Measurement: ref.Measurement,
 			Permission:  permission,
-		})
+		}
+	}
 
+	// Batch check all permissions (single RBAC data load for same token)
+	results := h.rbacManager.CheckPermissionsBatch(reqs)
+
+	// Check for any denials
+	for i, result := range results {
 		if !result.Allowed {
+			ref := tableRefs[i]
 			h.logger.Warn().
 				Str("database", ref.Database).
 				Str("measurement", ref.Measurement).
@@ -683,12 +760,14 @@ func (h *QueryHandler) checkQueryPermissions(c *fiber.Ctx, sql, permission strin
 			return fmt.Errorf("access denied: no %s permission for %s.%s", permission, ref.Database, ref.Measurement)
 		}
 
-		h.logger.Debug().
-			Str("database", ref.Database).
-			Str("measurement", ref.Measurement).
-			Str("permission", permission).
-			Str("source", result.Source).
-			Msg("RBAC permission granted")
+		if h.debugEnabled {
+			h.logger.Debug().
+				Str("database", tableRefs[i].Database).
+				Str("measurement", tableRefs[i].Measurement).
+				Str("permission", permission).
+				Str("source", result.Source).
+				Msg("RBAC permission granted")
+		}
 	}
 
 	return nil
@@ -749,6 +828,8 @@ func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 // executeQuery handles POST /api/v1/query - returns JSON response
 func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 	start := time.Now()
+	// Cache timestamp format once per request to avoid repeated formatting
+	timestamp := start.UTC().Format(time.RFC3339)
 	m := metrics.Get()
 	m.IncQueryRequests()
 
@@ -759,7 +840,7 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
 			Success:   false,
 			Error:     "Invalid request body: " + err.Error(),
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Timestamp: timestamp,
 		})
 	}
 
@@ -769,7 +850,7 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
 			Success:   false,
 			Error:     "SQL query is required",
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Timestamp: timestamp,
 		})
 	}
 
@@ -778,7 +859,7 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
 			Success:   false,
 			Error:     "SQL query exceeds maximum length (10000 characters)",
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Timestamp: timestamp,
 		})
 	}
 
@@ -788,7 +869,7 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
 			Success:   false,
 			Error:     err.Error(),
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Timestamp: timestamp,
 		})
 	}
 
@@ -800,7 +881,7 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusForbidden).JSON(QueryResponse{
 				Success:   false,
 				Error:     "access denied: no read permission to list databases",
-				Timestamp: time.Now().UTC().Format(time.RFC3339),
+				Timestamp: timestamp,
 			})
 		}
 		return h.handleShowDatabases(c, start)
@@ -818,7 +899,7 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusForbidden).JSON(QueryResponse{
 				Success:   false,
 				Error:     fmt.Sprintf("access denied: no read permission for database '%s'", database),
-				Timestamp: time.Now().UTC().Format(time.RFC3339),
+				Timestamp: timestamp,
 			})
 		}
 		return h.handleShowTables(c, start, database)
@@ -830,18 +911,20 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusForbidden).JSON(QueryResponse{
 			Success:   false,
 			Error:     err.Error(),
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Timestamp: timestamp,
 		})
 	}
 
 	// Convert SQL to storage paths (with caching)
 	convertedSQL, cached := h.getTransformedSQL(req.SQL)
 
-	h.logger.Debug().
-		Str("original_sql", req.SQL).
-		Str("converted_sql", convertedSQL).
-		Bool("cache_hit", cached).
-		Msg("Executing query")
+	if h.debugEnabled {
+		h.logger.Debug().
+			Str("original_sql", req.SQL).
+			Str("converted_sql", convertedSQL).
+			Bool("cache_hit", cached).
+			Msg("Executing query")
+	}
 
 	// Execute query
 	rows, err := h.db.Query(convertedSQL)
@@ -852,7 +935,7 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 			Success:         false,
 			Error:           "Query execution failed", // Don't expose database error details
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
-			Timestamp:       time.Now().UTC().Format(time.RFC3339),
+			Timestamp:       timestamp,
 		})
 	}
 	defer rows.Close()
@@ -866,30 +949,37 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 			Success:         false,
 			Error:           "Query execution failed", // Don't expose database error details
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
-			Timestamp:       time.Now().UTC().Format(time.RFC3339),
+			Timestamp:       timestamp,
 		})
 	}
 
-	// Fetch results
-	data := make([][]interface{}, 0)
+	// Fetch results with optimized memory allocation
+	// Pre-allocate based on LIMIT clause or reasonable default
+	estimatedRows := extractLimit(req.SQL, 1000)
+	data := make([][]interface{}, 0, estimatedRows)
 	rowCount := 0
+	numCols := len(columns)
+
+	// Get scan buffer from pool to avoid allocating per row
+	buf := scanBufferPool.Get().(*scanBuffer)
+	buf.reset(numCols)
+	defer func() {
+		// Clear references before returning to pool to allow GC
+		for i := range buf.values {
+			buf.values[i] = nil
+		}
+		scanBufferPool.Put(buf)
+	}()
 
 	for rows.Next() {
-		// Create slice of interface{} pointers for scanning
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
-		if err := rows.Scan(valuePtrs...); err != nil {
+		if err := rows.Scan(buf.valuePtrs...); err != nil {
 			h.logger.Error().Err(err).Msg("Failed to scan row")
 			continue
 		}
 
-		// Convert values to JSON-serializable types
-		row := make([]interface{}, len(values))
-		for i, v := range values {
+		// Convert values to JSON-serializable types (allocate only the output row)
+		row := make([]interface{}, numCols)
+		for i, v := range buf.values {
 			row[i] = h.convertValue(v)
 		}
 
@@ -919,7 +1009,7 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 		Data:            data,
 		RowCount:        rowCount,
 		ExecutionTimeMs: executionTime,
-		Timestamp:       time.Now().UTC().Format(time.RFC3339),
+		Timestamp:       timestamp,
 	})
 }
 
@@ -936,7 +1026,19 @@ func (h *QueryHandler) validateSQL(sql string) error {
 // getTransformedSQL returns the transformed SQL with caching.
 // Returns the transformed SQL and whether it was a cache hit.
 func (h *QueryHandler) getTransformedSQL(sql string) (string, bool) {
-	// Check cache first
+	// Fast path: queries already using read_parquet don't need transformation
+	sqlLower := strings.ToLower(sql)
+	if strings.Contains(sqlLower, "read_parquet") {
+		return sql, true // Return as "hit" since no work needed
+	}
+
+	// Fast path: queries without FROM or JOIN don't need table transformation
+	// (e.g., SELECT 1+1, SELECT NOW(), SHOW commands handled elsewhere)
+	if !strings.Contains(sqlLower, "from") && !strings.Contains(sqlLower, "join") {
+		return sql, true
+	}
+
+	// Check cache
 	if transformed, ok := h.queryCache.Get(sql); ok {
 		return transformed, true
 	}
@@ -1114,20 +1216,49 @@ func shouldSkipTableConversion(table string) bool {
 	return false
 }
 
-// convertValue converts database values to JSON-serializable types
+// convertValue converts database values to JSON-serializable types.
+// Type cases are ordered by frequency for time-series workloads:
+// 1. Numeric types (float64, int64) - metrics values
+// 2. string - tags, labels
+// 3. time.Time - timestamps
+// 4. sql.Null* types - sparse data
+// 5. []byte - binary data (rare)
 func (h *QueryHandler) convertValue(v interface{}) interface{} {
+	// Fast path for nil (very common in sparse data)
 	if v == nil {
 		return nil
 	}
 
+	// Type switch ordered by frequency for time-series workloads
 	switch val := v.(type) {
+	// Most common: numeric types are already JSON-serializable
+	case float64:
+		return val
+	case int64:
+		return val
+	case float32:
+		return val
+	case int32:
+		return val
+	case int:
+		return val
+	case uint64:
+		return val
+	case uint32:
+		return val
+	case uint:
+		return val
+	// Second most common: strings
+	case string:
+		return val
+	// Timestamps need formatting - always normalize to UTC for consistency
+	// Data is stored in UTC, so ensure output is always UTC regardless of server timezone
 	case time.Time:
-		return val.Format(time.RFC3339Nano)
-	case []byte:
-		return string(val)
-	case sql.NullString:
+		return val.UTC().Format(time.RFC3339Nano)
+	// Nullable types for sparse data
+	case sql.NullFloat64:
 		if val.Valid {
-			return val.String
+			return val.Float64
 		}
 		return nil
 	case sql.NullInt64:
@@ -1135,9 +1266,9 @@ func (h *QueryHandler) convertValue(v interface{}) interface{} {
 			return val.Int64
 		}
 		return nil
-	case sql.NullFloat64:
+	case sql.NullString:
 		if val.Valid {
-			return val.Float64
+			return val.String
 		}
 		return nil
 	case sql.NullBool:
@@ -1145,6 +1276,10 @@ func (h *QueryHandler) convertValue(v interface{}) interface{} {
 			return val.Bool
 		}
 		return nil
+	// Binary data (rare)
+	case []byte:
+		return string(val)
+	// Default: already JSON-serializable (bool, etc.)
 	default:
 		return val
 	}
