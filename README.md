@@ -74,7 +74,10 @@ Benchmarked on Apple MacBook Pro M3 Max (14 cores, 36GB RAM, 1TB NVMe).
 | Arrow IPC | **2.5M rows/s** | 21.5 MB |
 | JSON | 1.2M rows/s | 47.0 MB |
 
-Full table scan: **~1 billion rows/s** (321M records in 329ms)
+| Scan Type | Throughput | Time (321M rows) |
+|-----------|------------|------------------|
+| COUNT(*) | **~17 billion rows/s** | 19ms |
+| SUM(column) | **~2.8 billion rows/s** | 116ms |
 
 ---
 
