@@ -55,6 +55,17 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		})
 	}
 
+	// Extract x-arc-database header for optimized query path
+	headerDB := c.Get("x-arc-database")
+
+	// If header is set, reject cross-database syntax (db.table not allowed)
+	if headerDB != "" && hasCrossDatabaseSyntax(req.SQL) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   "Cross-database queries (db.table syntax) not allowed when x-arc-database header is set",
+		})
+	}
+
 	// Check RBAC permissions for all tables referenced in the query
 	if err := h.checkQueryPermissions(c, req.SQL, "read"); err != nil {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
@@ -64,11 +75,13 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	}
 
 	// Convert SQL to storage paths (with caching)
-	convertedSQL, _ := h.getTransformedSQL(req.SQL)
+	// If headerDB is set, uses optimized path that skips db.table regex patterns
+	convertedSQL, _ := h.getTransformedSQL(req.SQL, headerDB)
 
 	h.logger.Debug().
 		Str("original_sql", req.SQL).
 		Str("converted_sql", convertedSQL).
+		Str("header_db", headerDB).
 		Msg("Executing Arrow query")
 
 	// Execute query using standard database/sql interface

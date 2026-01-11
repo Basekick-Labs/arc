@@ -918,16 +918,16 @@ func BenchmarkGetTransformedSQL(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				h.queryCache.Invalidate() // Force cache miss
-				h.getTransformedSQL(tc.sql)
+				h.getTransformedSQL(tc.sql, "")
 			}
 		})
 
 		// Benchmark cache hit (pre-populated)
 		b.Run(tc.name+"_cache_hit", func(b *testing.B) {
-			h.getTransformedSQL(tc.sql) // Pre-populate cache
+			h.getTransformedSQL(tc.sql, "") // Pre-populate cache
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				h.getTransformedSQL(tc.sql)
+				h.getTransformedSQL(tc.sql, "")
 			}
 		})
 	}

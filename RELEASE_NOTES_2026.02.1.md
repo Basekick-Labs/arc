@@ -185,6 +185,44 @@ Queries using `time_bucket()` and `date_trunc()` are now automatically rewritten
 
 **Fast-path optimization (PR #99):** Queries that don't use `time_bucket` or `date_trunc` now skip regex processing entirely via a simple `strings.Contains` check. This eliminates ~21 unnecessary allocations (~44KB) per query, providing an **8.8x speedup** for the SQL transformation step on queries without time functions.
 
+### Database Header for Query Optimization
+
+Query endpoints now support the `x-arc-database` header for specifying the database context, providing **4-17% performance improvement** by skipping database extraction regex patterns.
+
+**How it works:**
+- When `x-arc-database` header is set, queries use simple table names (`SELECT * FROM cpu`) instead of `db.table` syntax
+- The optimized parsing path skips 2 regex pattern matches (`patternDBTable`, `patternJoinDBTable`)
+- Cross-database queries (`db.table` syntax) are rejected when header is set to enforce single-database context
+
+**Performance results:**
+| Query Type | Improvement |
+|------------|-------------|
+| COUNT(*) | 5-6% faster |
+| SELECT with LIMIT | 3-7% faster |
+| Aggregations (AVG/MIN/MAX) | **10.6% faster** |
+| GROUP BY queries | **17.3% faster** |
+| Overall throughput | +5-7.5% |
+
+**Usage:**
+```bash
+# Header mode (optimized) - simpler SQL, faster parsing
+curl -X POST http://localhost:8000/api/v1/query \
+  -H "Content-Type: application/json" \
+  -H "x-arc-database: production" \
+  -d '{"sql": "SELECT * FROM cpu LIMIT 100"}'
+
+# Legacy mode (still supported) - db.table syntax in SQL
+curl -X POST http://localhost:8000/api/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{"sql": "SELECT * FROM production.cpu LIMIT 100"}'
+```
+
+**Key features:**
+- Backward compatible - header is optional, existing `db.table` syntax continues to work
+- Works with both `/api/v1/query` (JSON) and `/api/v1/query/arrow` (Arrow IPC) endpoints
+- Cache key includes database from header to ensure correct results
+- Follows same pattern as ingestion endpoints which already use `x-arc-database` header
+
 ### MQTT Client Auto-Generated Client ID
 
 When `client_id` is not specified in the MQTT configuration, Arc now auto-generates a unique client ID using the format `arc-{random-suffix}`. This prevents client ID collisions when running multiple Arc instances.

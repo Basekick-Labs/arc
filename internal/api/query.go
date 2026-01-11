@@ -84,6 +84,13 @@ var (
 	patternLimit = regexp.MustCompile(`(?i)\bLIMIT\s+(\d+)\b`)
 )
 
+// hasCrossDatabaseSyntax returns true if SQL contains explicit database.table references.
+// Used to reject queries that use db.table syntax when x-arc-database header is set,
+// as cross-database queries are not supported in header mode.
+func hasCrossDatabaseSyntax(sql string) bool {
+	return patternDBTable.MatchString(sql) || patternJoinDBTable.MatchString(sql)
+}
+
 // Pools for reusing scan buffers to reduce allocations in row fetching.
 // Each query reuses buffers from these pools instead of allocating new slices per row.
 var (
@@ -873,6 +880,19 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 		})
 	}
 
+	// Extract x-arc-database header for optimized query path
+	headerDB := c.Get("x-arc-database")
+
+	// If header is set, reject cross-database syntax (db.table not allowed)
+	if headerDB != "" && hasCrossDatabaseSyntax(req.SQL) {
+		m.IncQueryErrors()
+		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
+			Success:   false,
+			Error:     "Cross-database queries (db.table syntax) not allowed when x-arc-database header is set",
+			Timestamp: timestamp,
+		})
+	}
+
 	// Handle SHOW DATABASES command
 	if showDatabasesPattern.MatchString(req.SQL) {
 		// Check RBAC - user needs at least some read permission to see databases
@@ -916,13 +936,15 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 	}
 
 	// Convert SQL to storage paths (with caching)
-	convertedSQL, cached := h.getTransformedSQL(req.SQL)
+	// If headerDB is set, uses optimized path that skips db.table regex patterns
+	convertedSQL, cached := h.getTransformedSQL(req.SQL, headerDB)
 
 	if h.debugEnabled {
 		h.logger.Debug().
 			Str("original_sql", req.SQL).
 			Str("converted_sql", convertedSQL).
 			Bool("cache_hit", cached).
+			Str("header_db", headerDB).
 			Msg("Executing query")
 	}
 
@@ -1024,8 +1046,9 @@ func (h *QueryHandler) validateSQL(sql string) error {
 }
 
 // getTransformedSQL returns the transformed SQL with caching.
+// If headerDB is non-empty, uses the optimized path with that database for all tables.
 // Returns the transformed SQL and whether it was a cache hit.
-func (h *QueryHandler) getTransformedSQL(sql string) (string, bool) {
+func (h *QueryHandler) getTransformedSQL(sql string, headerDB string) (string, bool) {
 	// Fast path: queries already using read_parquet don't need transformation
 	sqlLower := strings.ToLower(sql)
 	if strings.Contains(sqlLower, "read_parquet") {
@@ -1038,14 +1061,26 @@ func (h *QueryHandler) getTransformedSQL(sql string) (string, bool) {
 		return sql, true
 	}
 
+	// Build cache key - include header database if provided
+	cacheKey := sql
+	if headerDB != "" {
+		cacheKey = headerDB + ":" + sql
+	}
+
 	// Check cache
-	if transformed, ok := h.queryCache.Get(sql); ok {
+	if transformed, ok := h.queryCache.Get(cacheKey); ok {
 		return transformed, true
 	}
 
-	// Transform and cache
-	transformed := h.convertSQLToStoragePaths(sql)
-	h.queryCache.Set(sql, transformed)
+	// Transform using appropriate method
+	var transformed string
+	if headerDB != "" {
+		transformed = h.convertSQLToStoragePathsWithHeaderDB(sql, headerDB)
+	} else {
+		transformed = h.convertSQLToStoragePaths(sql)
+	}
+
+	h.queryCache.Set(cacheKey, transformed)
 	return transformed, false
 }
 
@@ -1214,6 +1249,104 @@ func shouldSkipTableConversion(table string) bool {
 		}
 	}
 	return false
+}
+
+// convertSQLToStoragePathsWithHeaderDB converts table references to storage paths using
+// the database specified in the x-arc-database header. This is an optimized path that
+// skips the database.table regex patterns since all tables use the header-specified database.
+// This provides ~50% reduction in regex operations compared to convertSQLToStoragePaths.
+func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database string) string {
+	originalSQL := sql
+
+	// Phase 0: Rewrite time functions to faster epoch-based alternatives BEFORE masking
+	sql = rewriteTimeBucket(sql)
+	sql = rewriteDateTrunc(sql)
+
+	// Single pass to detect features
+	features := scanSQLFeatures(sql)
+
+	// Phase 1: Mask string literals to prevent regex from matching inside them
+	sql, masks := maskStringLiterals(sql, features.hasQuotes)
+
+	// Phase 2: Strip SQL comments
+	sql = stripSQLComments(sql, features.hasDashComment || features.hasBlockComment)
+
+	// Extract CTE names to avoid converting them to storage paths
+	cteNames := extractCTENames(sql)
+
+	// OPTIMIZATION: Skip patternDBTable and patternJoinDBTable entirely
+	// since we know all tables use the header-specified database
+
+	// Handle FROM simple_table references - apply header database
+	sql = patternSimpleTable.ReplaceAllStringFunc(sql, func(match string) string {
+		parts := patternSimpleTable.FindStringSubmatch(match)
+		if len(parts) < 2 {
+			return match
+		}
+		table := strings.ToLower(parts[1])
+
+		// Skip if this is a CTE name
+		if cteNames[table] {
+			return match
+		}
+
+		// Skip already converted read_parquet, system tables, etc.
+		if shouldSkipTableConversion(table) {
+			return match
+		}
+
+		// Check if followed by a dot (function call like db.func()) or parenthesis
+		idx := strings.Index(strings.ToLower(sql), strings.ToLower(match))
+		if idx >= 0 {
+			afterMatch := sql[idx+len(match):]
+			afterMatch = strings.TrimLeft(afterMatch, " \t")
+			if len(afterMatch) > 0 && (afterMatch[0] == '.' || afterMatch[0] == '(') {
+				return match
+			}
+		}
+
+		// Use header database instead of "default"
+		path := h.getStoragePath(database, parts[1])
+		return h.buildReadParquetExpr(path, originalSQL, "FROM")
+	})
+
+	// Handle JOIN simple_table references - apply header database
+	sql = patternJoinSimpleTable.ReplaceAllStringFunc(sql, func(match string) string {
+		parts := patternJoinSimpleTable.FindStringSubmatch(match)
+		if len(parts) < 2 {
+			return match
+		}
+		table := strings.ToLower(parts[1])
+
+		// Skip if this is a CTE name
+		if cteNames[table] {
+			return match
+		}
+
+		// Skip already converted read_parquet, system tables, etc.
+		if shouldSkipTableConversion(table) {
+			return match
+		}
+
+		// Check if followed by a dot or parenthesis
+		idx := strings.Index(strings.ToLower(sql), strings.ToLower(match))
+		if idx >= 0 {
+			afterMatch := sql[idx+len(match):]
+			afterMatch = strings.TrimLeft(afterMatch, " \t")
+			if len(afterMatch) > 0 && (afterMatch[0] == '.' || afterMatch[0] == '(') {
+				return match
+			}
+		}
+
+		// Use header database instead of "default"
+		path := h.getStoragePath(database, parts[1])
+		return h.buildReadParquetExpr(path, originalSQL, "JOIN")
+	})
+
+	// Restore original string literals
+	sql = unmaskStringLiterals(sql, masks)
+
+	return sql
 }
 
 // convertValue converts database values to JSON-serializable types.
@@ -1573,8 +1706,11 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 		})
 	}
 
+	// Extract x-arc-database header for optimized query path
+	headerDB := c.Get("x-arc-database")
+
 	// Convert SQL to storage paths (with caching)
-	convertedSQL, _ := h.getTransformedSQL(req.SQL)
+	convertedSQL, _ := h.getTransformedSQL(req.SQL, headerDB)
 
 	// Create a COUNT(*) version of the query
 	countSQL := "SELECT COUNT(*) FROM (" + convertedSQL + ") AS t"
@@ -1885,7 +2021,8 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	sql += fmt.Sprintf(" OFFSET %d", offset)
 
 	// Convert SQL to storage paths (with caching)
-	convertedSQL, _ := h.getTransformedSQL(sql)
+	// Note: This endpoint builds its own db.measurement SQL, so no header optimization
+	convertedSQL, _ := h.getTransformedSQL(sql, "")
 
 	h.logger.Debug().
 		Str("measurement", measurement).
