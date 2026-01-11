@@ -22,12 +22,14 @@ import (
 )
 
 type Config struct {
-	Table      string
-	Iterations int
-	Host       string
-	Port       int
-	Token      string
-	Database   string
+	Table       string
+	Measurement string // Just the table name without database prefix
+	Iterations  int
+	Host        string
+	Port        int
+	Token       string
+	Database    string
+	UseHeader   bool // If true, use x-arc-database header instead of db.table syntax
 }
 
 type QueryRequest struct {
@@ -118,7 +120,10 @@ func runQuery(cfg *Config, sql string, format string, client *http.Client) (late
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-arc-database", cfg.Database)
+	// Only set header when using header mode (optimized path)
+	if cfg.UseHeader {
+		req.Header.Set("x-arc-database", cfg.Database)
+	}
 	if cfg.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+cfg.Token)
 	}
@@ -159,14 +164,24 @@ func runQuery(cfg *Config, sql string, format string, client *http.Client) (late
 func main() {
 	cfg := Config{}
 
-	flag.StringVar(&cfg.Table, "table", "production.cpu", "Table to benchmark")
+	flag.StringVar(&cfg.Measurement, "measurement", "cpu", "Measurement (table) name to benchmark")
 	flag.IntVar(&cfg.Iterations, "iterations", 5, "Number of iterations per query")
 	flag.StringVar(&cfg.Host, "host", "localhost", "Server host")
 	flag.IntVar(&cfg.Port, "port", 8000, "Server port")
 	flag.StringVar(&cfg.Database, "database", "production", "Database name")
+	flag.BoolVar(&cfg.UseHeader, "use-header", false, "Use x-arc-database header instead of db.table syntax")
 	flag.Parse()
 
 	cfg.Token = os.Getenv("ARC_TOKEN")
+
+	// Build table reference based on mode
+	// Header mode: just "cpu" (simpler, header provides database)
+	// Legacy mode: "production.cpu" (db.table syntax in SQL)
+	if cfg.UseHeader {
+		cfg.Table = cfg.Measurement
+	} else {
+		cfg.Table = fmt.Sprintf("%s.%s", cfg.Database, cfg.Measurement)
+	}
 
 	// Define benchmark queries
 	queries := []BenchmarkQuery{
@@ -225,6 +240,8 @@ func main() {
 	fmt.Println("================================================================================")
 	fmt.Printf("Target: http://%s:%d\n", cfg.Host, cfg.Port)
 	fmt.Printf("Table: %s\n", cfg.Table)
+	fmt.Printf("Database: %s\n", cfg.Database)
+	fmt.Printf("Mode: %s\n", map[bool]string{true: "Header (x-arc-database)", false: "Legacy (db.table)"}[cfg.UseHeader])
 	fmt.Printf("Iterations: %d per query\n", cfg.Iterations)
 	fmt.Println("================================================================================")
 	fmt.Println()
