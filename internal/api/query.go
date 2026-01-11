@@ -84,11 +84,72 @@ var (
 	patternLimit = regexp.MustCompile(`(?i)\bLIMIT\s+(\d+)\b`)
 )
 
-// hasCrossDatabaseSyntax returns true if SQL contains explicit database.table references.
-// Used to reject queries that use db.table syntax when x-arc-database header is set,
-// as cross-database queries are not supported in header mode.
+// isIdentChar returns true if c is a valid SQL identifier character (a-z, A-Z, 0-9, _)
+func isIdentChar(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') || c == '_'
+}
+
+// hasCrossDatabaseSyntax checks if SQL contains db.table patterns without using regex.
+// This is faster than regex-based detection for simple pattern matching.
+// Used to reject queries that use db.table syntax when x-arc-database header is set.
 func hasCrossDatabaseSyntax(sql string) bool {
-	return patternDBTable.MatchString(sql) || patternJoinDBTable.MatchString(sql)
+	sqlLower := strings.ToLower(sql)
+
+	// Check for "FROM identifier.identifier" or "JOIN identifier.identifier" patterns
+	for _, keyword := range []string{"from ", "join "} {
+		pos := 0
+		for {
+			idx := strings.Index(sqlLower[pos:], keyword)
+			if idx < 0 {
+				break
+			}
+			idx += pos + len(keyword)
+			pos = idx
+
+			// Skip whitespace after keyword
+			for idx < len(sql) && (sql[idx] == ' ' || sql[idx] == '\t' || sql[idx] == '\n') {
+				idx++
+			}
+
+			// Find first identifier (database name)
+			start := idx
+			for idx < len(sql) && isIdentChar(sql[idx]) {
+				idx++
+			}
+			if idx == start || idx >= len(sql) {
+				continue
+			}
+
+			// Check for dot followed by another identifier (table name)
+			if sql[idx] == '.' && idx+1 < len(sql) && isIdentChar(sql[idx+1]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isSingleTableQuery returns true if query has exactly one FROM and no JOINs.
+// These queries can use a faster transformation path.
+func isSingleTableQuery(sqlLower string) bool {
+	fromCount := strings.Count(sqlLower, "from ")
+	if fromCount != 1 {
+		return false
+	}
+	// Check for any JOIN type
+	if strings.Contains(sqlLower, " join ") {
+		return false
+	}
+	// Check for subquery (FROM followed by parenthesis)
+	idx := strings.Index(sqlLower, "from ")
+	if idx >= 0 {
+		rest := strings.TrimLeft(sqlLower[idx+5:], " \t\n")
+		if len(rest) > 0 && rest[0] == '(' {
+			return false
+		}
+	}
+	return true
 }
 
 // Pools for reusing scan buffers to reduce allocations in row fetching.
@@ -1251,12 +1312,68 @@ func shouldSkipTableConversion(table string) bool {
 	return false
 }
 
+// convertSingleTableQuery is a fast path for simple single-table queries.
+// It avoids regex entirely by using simple string manipulation.
+func (h *QueryHandler) convertSingleTableQuery(sql, sqlLower, database string) string {
+	// Find "FROM table" position
+	idx := strings.Index(sqlLower, "from ")
+	if idx < 0 {
+		return sql
+	}
+
+	start := idx + 5
+	// Skip whitespace after FROM
+	for start < len(sql) && (sql[start] == ' ' || sql[start] == '\t' || sql[start] == '\n') {
+		start++
+	}
+
+	// Find table name end
+	end := start
+	for end < len(sql) && isIdentChar(sql[end]) {
+		end++
+	}
+
+	if end == start {
+		return sql // No table found, return original
+	}
+
+	tableName := sql[start:end]
+	tableLower := strings.ToLower(tableName)
+
+	// Skip system tables
+	if shouldSkipTableConversion(tableLower) {
+		return sql
+	}
+
+	// Build replacement
+	path := h.getStoragePath(database, tableName)
+	replacement := h.buildReadParquetExpr(path, sql, "FROM")
+
+	return sql[:idx] + replacement + sql[end:]
+}
+
 // convertSQLToStoragePathsWithHeaderDB converts table references to storage paths using
 // the database specified in the x-arc-database header. This is an optimized path that
 // skips the database.table regex patterns since all tables use the header-specified database.
 // This provides ~50% reduction in regex operations compared to convertSQLToStoragePaths.
 func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database string) string {
 	originalSQL := sql
+	sqlLower := strings.ToLower(sql)
+
+	// FAST PATH: For simple single-table queries without special SQL features,
+	// skip all the regex machinery and use direct string manipulation
+	if isSingleTableQuery(sqlLower) && !strings.Contains(sqlLower, "with ") {
+		features := scanSQLFeatures(sql)
+		if !features.hasQuotes && !features.hasDashComment && !features.hasBlockComment {
+			// Also need to rewrite time functions if present
+			if strings.Contains(sqlLower, "time_bucket") || strings.Contains(sqlLower, "date_trunc") {
+				sql = rewriteTimeBucket(sql)
+				sql = rewriteDateTrunc(sql)
+				sqlLower = strings.ToLower(sql)
+			}
+			return h.convertSingleTableQuery(sql, sqlLower, database)
+		}
+	}
 
 	// Phase 0: Rewrite time functions to faster epoch-based alternatives BEFORE masking
 	sql = rewriteTimeBucket(sql)
@@ -1271,8 +1388,11 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database
 	// Phase 2: Strip SQL comments
 	sql = stripSQLComments(sql, features.hasDashComment || features.hasBlockComment)
 
-	// Extract CTE names to avoid converting them to storage paths
-	cteNames := extractCTENames(sql)
+	// Extract CTE names only if query has WITH clause (fast path for majority of queries)
+	var cteNames map[string]bool
+	if strings.Contains(strings.ToLower(sql), "with ") {
+		cteNames = extractCTENames(sql)
+	}
 
 	// OPTIMIZATION: Skip patternDBTable and patternJoinDBTable entirely
 	// since we know all tables use the header-specified database
