@@ -199,6 +199,26 @@ type ClusterConfig struct {
 	// Heartbeat configuration
 	HeartbeatInterval int // Heartbeat interval in seconds (default: 1)
 	HeartbeatTimeout  int // Heartbeat timeout before considering node dead (default: 5)
+
+	// Raft consensus configuration (Phase 3)
+	RaftDataDir          string // Directory for Raft data (default: ./data/raft)
+	RaftBindAddr         string // Address to bind Raft transport (default: ":9200")
+	RaftAdvertiseAddr    string // Address advertised to Raft peers (auto-detected if empty)
+	RaftBootstrap        bool   // Bootstrap a new Raft cluster (only for first node)
+	RaftElectionTimeout  int    // Election timeout in milliseconds (default: 1000)
+	RaftHeartbeatTimeout int    // Raft heartbeat timeout in milliseconds (default: 500)
+	RaftSnapshotInterval int    // Snapshot interval in seconds (default: 300)
+	RaftSnapshotThreshold int   // Number of logs before snapshot (default: 10000)
+
+	// Request routing configuration (Phase 3)
+	RouteTimeout int // Timeout for forwarded requests in milliseconds (default: 5000)
+	RouteRetries int // Number of retries for failed forwards (default: 3)
+
+	// WAL Replication configuration (Phase 3.3)
+	ReplicationEnabled     bool // Enable WAL replication to readers (default: false)
+	ReplicationLagLimit    int  // Max acceptable lag in milliseconds before health degrades (default: 5000)
+	ReplicationBufferSize  int  // Entry buffer size for replication queue (default: 10000)
+	ReplicationAckInterval int  // How often readers send acks in milliseconds (default: 100)
 }
 
 // Load loads configuration from environment and config file
@@ -356,7 +376,7 @@ func Load() (*Config, error) {
 			NodeID:              v.GetString("cluster.node_id"),
 			Role:                v.GetString("cluster.role"),
 			ClusterName:         v.GetString("cluster.cluster_name"),
-			Seeds:               v.GetStringSlice("cluster.seeds"),
+			Seeds:               parseStringSlice(v.GetString("cluster.seeds")),
 			CoordinatorAddr:     v.GetString("cluster.coordinator_addr"),
 			AdvertiseAddr:       v.GetString("cluster.advertise_addr"),
 			HealthCheckInterval: v.GetInt("cluster.health_check_interval"),
@@ -364,6 +384,23 @@ func Load() (*Config, error) {
 			UnhealthyThreshold:  v.GetInt("cluster.unhealthy_threshold"),
 			HeartbeatInterval:   v.GetInt("cluster.heartbeat_interval"),
 			HeartbeatTimeout:    v.GetInt("cluster.heartbeat_timeout"),
+			// Raft configuration
+			RaftDataDir:          v.GetString("cluster.raft_data_dir"),
+			RaftBindAddr:         v.GetString("cluster.raft_bind_addr"),
+			RaftAdvertiseAddr:    v.GetString("cluster.raft_advertise_addr"),
+			RaftBootstrap:        v.GetBool("cluster.raft_bootstrap"),
+			RaftElectionTimeout:  v.GetInt("cluster.raft_election_timeout"),
+			RaftHeartbeatTimeout: v.GetInt("cluster.raft_heartbeat_timeout"),
+			RaftSnapshotInterval: v.GetInt("cluster.raft_snapshot_interval"),
+			RaftSnapshotThreshold: v.GetInt("cluster.raft_snapshot_threshold"),
+			// Routing configuration
+			RouteTimeout: v.GetInt("cluster.route_timeout"),
+			RouteRetries: v.GetInt("cluster.route_retries"),
+			// Replication configuration
+			ReplicationEnabled:     v.GetBool("cluster.replication_enabled"),
+			ReplicationLagLimit:    v.GetInt("cluster.replication_lag_limit"),
+			ReplicationBufferSize:  v.GetInt("cluster.replication_buffer_size"),
+			ReplicationAckInterval: v.GetInt("cluster.replication_ack_interval"),
 		},
 	}
 
@@ -491,11 +528,49 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.unhealthy_threshold", 3)         // 3 failed checks
 	v.SetDefault("cluster.heartbeat_interval", 1)          // 1 second
 	v.SetDefault("cluster.heartbeat_timeout", 5)           // 5 seconds
+
+	// Raft consensus defaults (Phase 3)
+	v.SetDefault("cluster.raft_data_dir", "./data/raft")   // Raft data directory
+	v.SetDefault("cluster.raft_bind_addr", ":9200")        // Raft transport bind address
+	v.SetDefault("cluster.raft_advertise_addr", "")        // Auto-detected if empty
+	v.SetDefault("cluster.raft_bootstrap", false)          // Don't bootstrap by default
+	v.SetDefault("cluster.raft_election_timeout", 1000)    // 1 second election timeout
+	v.SetDefault("cluster.raft_heartbeat_timeout", 500)    // 500ms heartbeat timeout
+	v.SetDefault("cluster.raft_snapshot_interval", 300)    // 5 minutes snapshot interval
+	v.SetDefault("cluster.raft_snapshot_threshold", 10000) // 10k logs before snapshot
+
+	// Request routing defaults (Phase 3)
+	v.SetDefault("cluster.route_timeout", 5000)            // 5 second timeout for forwards
+	v.SetDefault("cluster.route_retries", 3)               // 3 retries for failed forwards
+
+	// WAL Replication defaults (Phase 3.3)
+	v.SetDefault("cluster.replication_enabled", false)     // Disabled by default
+	v.SetDefault("cluster.replication_lag_limit", 5000)    // 5 second lag limit
+	v.SetDefault("cluster.replication_buffer_size", 10000) // 10k entry buffer
+	v.SetDefault("cluster.replication_ack_interval", 100)  // 100ms ack interval
 }
 
 func getDefaultThreadCount() int {
 	// Use number of CPU cores for optimal parallelism
 	return runtime.NumCPU()
+}
+
+// parseStringSlice parses a comma-separated string into a slice of strings.
+// This is needed because Viper's GetStringSlice doesn't automatically parse
+// comma-separated values from environment variables.
+func parseStringSlice(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	result := make([]string, 0, len(parts))
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		if trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
 }
 
 func getDefaultMaxConnections() int {

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/pruning"
@@ -527,6 +528,9 @@ type QueryHandler struct {
 	authManager  AuthManager
 	rbacManager  RBACChecker
 	debugEnabled bool // Cached check for debug logging to avoid repeated level checks
+
+	// Cluster routing support
+	router *cluster.Router
 }
 
 // isDebugEnabled returns true if debug logging is enabled.
@@ -669,6 +673,14 @@ func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolo
 func (h *QueryHandler) SetAuthAndRBAC(am AuthManager, rm RBACChecker) {
 	h.authManager = am
 	h.rbacManager = rm
+}
+
+// SetRouter sets the cluster router for request forwarding.
+// When set, query requests from nodes that cannot handle queries will be forwarded.
+// Note: Currently writers always process queries locally (CanQuery=true).
+// This is provided for future extensibility (e.g., prefer_readers mode).
+func (h *QueryHandler) SetRouter(router *cluster.Router) {
+	h.router = router
 }
 
 // extractTableReferences extracts all database.measurement references from SQL
@@ -901,6 +913,37 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 	m := metrics.Get()
 	m.IncQueryRequests()
 
+	// Check if this request should be forwarded to a reader/writer node
+	// Compactor nodes cannot process queries locally, so they forward to readers/writers
+	if ShouldForwardQuery(h.router, c) {
+		h.logger.Debug().Msg("Forwarding query request to reader/writer node")
+
+		httpReq, err := BuildHTTPRequest(c)
+		if err != nil {
+			h.logger.Error().Err(err).Msg("Failed to build HTTP request for forwarding")
+			m.IncQueryErrors()
+			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
+				Success:   false,
+				Error:     "Failed to prepare request for forwarding",
+				Timestamp: timestamp,
+			})
+		}
+
+		resp, err := h.router.RouteQuery(c.Context(), httpReq)
+		if err == cluster.ErrLocalNodeCanHandle {
+			// Fall through to local processing
+			goto localProcessing
+		}
+		if err != nil {
+			h.logger.Error().Err(err).Msg("Failed to route query request")
+			m.IncQueryErrors()
+			return HandleRoutingError(c, err)
+		}
+
+		return CopyResponse(c, resp)
+	}
+
+localProcessing:
 	// Parse request body
 	var req QueryRequest
 	if err := c.BodyParser(&req); err != nil {

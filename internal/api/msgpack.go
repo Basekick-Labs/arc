@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/pkg/models"
@@ -66,6 +67,9 @@ type MsgPackHandler struct {
 	// RBAC support
 	authManager AuthManager
 	rbacManager RBACChecker
+
+	// Cluster routing support
+	router *cluster.Router
 }
 
 // NewMsgPackHandler creates a new MessagePack handler
@@ -82,6 +86,12 @@ func NewMsgPackHandler(logger zerolog.Logger, arrowBuffer *ingest.ArrowBuffer, m
 func (h *MsgPackHandler) SetAuthAndRBAC(authManager AuthManager, rbacManager RBACChecker) {
 	h.authManager = authManager
 	h.rbacManager = rbacManager
+}
+
+// SetRouter sets the cluster router for request forwarding.
+// When set, write requests from reader nodes will be forwarded to writer nodes.
+func (h *MsgPackHandler) SetRouter(router *cluster.Router) {
+	h.router = router
 }
 
 // extractMeasurements extracts unique measurement names from decoded msgpack records
@@ -161,6 +171,33 @@ func (h *MsgPackHandler) RegisterRoutes(app *fiber.App) {
 
 // writeMsgPack handles MessagePack binary write requests
 func (h *MsgPackHandler) writeMsgPack(c *fiber.Ctx) error {
+	// Check if this request should be forwarded to a writer node
+	// Reader nodes cannot process writes locally, so they forward to writers
+	if ShouldForwardWrite(h.router, c) {
+		h.logger.Debug().Msg("Forwarding write request to writer node")
+
+		httpReq, err := BuildHTTPRequest(c)
+		if err != nil {
+			h.logger.Error().Err(err).Msg("Failed to build HTTP request for forwarding")
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to prepare request for forwarding",
+			})
+		}
+
+		resp, err := h.router.RouteWrite(c.Context(), httpReq)
+		if err == cluster.ErrLocalNodeCanHandle {
+			// Fall through to local processing
+			goto localProcessing
+		}
+		if err != nil {
+			h.logger.Error().Err(err).Msg("Failed to route write request")
+			return HandleRoutingError(c, err)
+		}
+
+		return CopyResponse(c, resp)
+	}
+
+localProcessing:
 	// CRITICAL: Use BodyRaw() instead of Body() to avoid fasthttp's automatic gzip decompression
 	// c.Body() triggers tryDecodeBodyInOrder → gunzipData which is NOT pooled and causes high latency
 	// By using BodyRaw() we handle decompression ourselves with pooled gzip readers

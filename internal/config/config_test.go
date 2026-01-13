@@ -590,3 +590,70 @@ func TestLoad_MaxPayloadSizeInvalid(t *testing.T) {
 		t.Errorf("Error should mention max_payload_size: %v", err)
 	}
 }
+
+// Cluster Seeds Tests
+
+func TestParseStringSlice(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected []string
+	}{
+		{"empty", "", nil},
+		{"single", "host1:9100", []string{"host1:9100"}},
+		{"multiple", "host1:9100,host2:9100", []string{"host1:9100", "host2:9100"}},
+		{"with spaces", "host1:9100, host2:9100 , host3:9100", []string{"host1:9100", "host2:9100", "host3:9100"}},
+		{"trailing comma", "host1:9100,host2:9100,", []string{"host1:9100", "host2:9100"}},
+		{"leading comma", ",host1:9100,host2:9100", []string{"host1:9100", "host2:9100"}},
+		{"empty elements", "host1:9100,,host2:9100", []string{"host1:9100", "host2:9100"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := parseStringSlice(tt.input)
+			if len(result) != len(tt.expected) {
+				t.Errorf("parseStringSlice(%q) = %v (len %d), want %v (len %d)",
+					tt.input, result, len(result), tt.expected, len(tt.expected))
+				return
+			}
+			for i, v := range result {
+				if v != tt.expected[i] {
+					t.Errorf("parseStringSlice(%q)[%d] = %q, want %q", tt.input, i, v, tt.expected[i])
+				}
+			}
+		})
+	}
+}
+
+func TestLoad_ClusterSeedsEnvOverride(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	// Set env var for cluster seeds
+	os.Setenv("ARC_CLUSTER_SEEDS", "host1:9100,host2:9100,host3:9100")
+	defer os.Unsetenv("ARC_CLUSTER_SEEDS")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	expected := []string{"host1:9100", "host2:9100", "host3:9100"}
+	if len(cfg.Cluster.Seeds) != len(expected) {
+		t.Errorf("Cluster.Seeds = %v (len %d), want %v (len %d)",
+			cfg.Cluster.Seeds, len(cfg.Cluster.Seeds), expected, len(expected))
+		return
+	}
+	for i, v := range cfg.Cluster.Seeds {
+		if v != expected[i] {
+			t.Errorf("Cluster.Seeds[%d] = %q, want %q", i, v, expected[i])
+		}
+	}
+}

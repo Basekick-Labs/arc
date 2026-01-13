@@ -12,6 +12,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/api"
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/compaction"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
@@ -571,6 +572,87 @@ func main() {
 		}, shutdown.PriorityTelemetry)
 	}
 
+	// Initialize Cluster Coordinator (Enterprise feature)
+	// Clustering enables role-based node separation: writer, reader, compactor
+	var clusterCoordinator *cluster.Coordinator
+	if cfg.Cluster.Enabled {
+		if licenseClient == nil {
+			log.Warn().Msg("Clustering requires enterprise license - running in standalone mode")
+		} else {
+			lic := licenseClient.GetLicense()
+			if lic == nil || !lic.HasFeature(license.FeatureClustering) {
+				log.Warn().Msg("License does not include clustering feature - running in standalone mode")
+			} else {
+				// Determine API address for this node
+				apiAddr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
+				if cfg.Server.Host == "0.0.0.0" {
+					apiAddr = fmt.Sprintf(":%d", cfg.Server.Port)
+				}
+
+				var err error
+				clusterCoordinator, err = cluster.NewCoordinator(&cluster.CoordinatorConfig{
+					Config:        &cfg.Cluster,
+					LicenseClient: licenseClient,
+					Version:       Version,
+					APIAddress:    apiAddr,
+					Logger:        logger.Get("cluster"),
+				})
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to initialize cluster coordinator - running in standalone mode")
+				} else {
+					if err := clusterCoordinator.Start(); err != nil {
+						log.Error().Err(err).Msg("Failed to start cluster coordinator - running in standalone mode")
+						clusterCoordinator = nil
+					} else {
+						shutdownCoordinator.RegisterHook("cluster-coordinator", func(ctx context.Context) error {
+							return clusterCoordinator.Stop()
+						}, shutdown.PriorityCompaction) // Stop before compaction
+
+						localNode := clusterCoordinator.GetLocalNode()
+						capabilities := localNode.GetCapabilities()
+						log.Info().
+							Str("node_id", localNode.ID).
+							Str("role", string(localNode.Role)).
+							Str("cluster", cfg.Cluster.ClusterName).
+							Bool("can_ingest", capabilities.CanIngest).
+							Bool("can_query", capabilities.CanQuery).
+							Bool("can_compact", capabilities.CanCompact).
+							Msg("Cluster coordinator started")
+
+						// Wire up WAL replication if enabled
+						if cfg.Cluster.ReplicationEnabled && walWriter != nil {
+							clusterCoordinator.SetWAL(walWriter)
+							if err := clusterCoordinator.StartReplication(); err != nil {
+								log.Warn().Err(err).Msg("Failed to start WAL replication")
+							} else {
+								log.Info().
+									Bool("is_writer", capabilities.CanIngest).
+									Msg("WAL replication started")
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Determine node capabilities (for role-based component initialization)
+	nodeRole := cluster.RoleStandalone
+	if clusterCoordinator != nil {
+		nodeRole = clusterCoordinator.GetRole()
+	}
+	nodeCapabilities := nodeRole.GetCapabilities()
+
+	// Log node role and capabilities (useful for debugging cluster deployments)
+	if nodeRole != cluster.RoleStandalone {
+		log.Info().
+			Str("role", string(nodeRole)).
+			Bool("can_ingest", nodeCapabilities.CanIngest).
+			Bool("can_query", nodeCapabilities.CanQuery).
+			Bool("can_compact", nodeCapabilities.CanCompact).
+			Msg("Node running with cluster role")
+	}
+
 	// Initialize HTTP server
 	serverConfig := &api.ServerConfig{
 		Port:            cfg.Server.Port,
@@ -640,6 +722,19 @@ func main() {
 		queryHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}
 	queryHandler.RegisterRoutes(server.GetApp())
+
+	// Wire up cluster router to handlers for request forwarding
+	// This enables reader nodes to forward writes to writers, and
+	// compactor nodes to forward queries to readers/writers
+	if clusterCoordinator != nil {
+		router := clusterCoordinator.GetRouter()
+		if router != nil {
+			msgpackHandler.SetRouter(router)
+			lineProtocolHandler.SetRouter(router)
+			queryHandler.SetRouter(router)
+			log.Info().Msg("Cluster router wired to API handlers for request forwarding")
+		}
+	}
 
 	// Register Compaction handler (if compaction is enabled)
 	if compactionManager != nil {
@@ -773,6 +868,10 @@ func main() {
 	}
 	schedulerHandler := api.NewSchedulerHandler(cqSchedulerInterface, retentionSchedulerInterface, licenseClient, logger.Get("scheduler-api"))
 	schedulerHandler.RegisterRoutes(server.GetApp())
+
+	// Register Cluster handler (always register, shows status even if clustering not enabled)
+	clusterHandler := api.NewClusterHandler(clusterCoordinator, licenseClient, logger.Get("cluster-api"))
+	clusterHandler.RegisterRoutes(server.GetApp())
 
 	// Register MQTT handlers (always register, handlers check if manager is nil)
 	mqttHandler := api.NewMQTTHandler(mqttManager, authManager, logger.Get("mqtt-api"))

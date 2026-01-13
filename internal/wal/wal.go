@@ -54,6 +54,23 @@ type WriterConfig struct {
 	Logger        zerolog.Logger
 }
 
+// ReplicationEntry represents a WAL entry for replication.
+// This is passed to the replication hook for streaming to readers.
+type ReplicationEntry struct {
+	// Sequence is a monotonically increasing number for ordering
+	Sequence uint64
+
+	// TimestampUS is the entry timestamp in microseconds since epoch
+	TimestampUS uint64
+
+	// Payload is the raw msgpack data
+	Payload []byte
+}
+
+// ReplicationHook is called for each WAL entry before it's written locally.
+// This enables real-time streaming of entries to reader nodes.
+type ReplicationHook func(entry *ReplicationEntry)
+
 // Writer is a Write-Ahead Log writer with configurable durability
 type Writer struct {
 	config WriterConfig
@@ -73,6 +90,10 @@ type Writer struct {
 	entryChan chan walEntry
 	done      chan struct{}
 	wg        sync.WaitGroup
+
+	// Replication hook for streaming entries to readers
+	replicationHook ReplicationHook
+	sequence        uint64 // Monotonic sequence counter for replication
 
 	// Metrics (atomic for lock-free reads)
 	TotalEntries   int64
@@ -289,6 +310,22 @@ func (w *Writer) AppendRaw(payload []byte) error {
 	// Get current timestamp (microseconds since epoch)
 	timestampUS := uint64(time.Now().UnixMicro())
 
+	// Call replication hook before local write (if set)
+	// This enables real-time streaming to reader nodes
+	if w.replicationHook != nil {
+		w.mu.Lock()
+		w.sequence++
+		seq := w.sequence
+		hook := w.replicationHook
+		w.mu.Unlock()
+
+		hook(&ReplicationEntry{
+			Sequence:    seq,
+			TimestampUS: timestampUS,
+			Payload:     payload,
+		})
+	}
+
 	// Build complete entry: header + payload
 	entryData := make([]byte, WALEntryHeaderSize+len(payload))
 	binary.BigEndian.PutUint32(entryData[0:4], uint32(len(payload)))
@@ -375,4 +412,21 @@ func (w *Writer) CurrentFile() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.currentPath
+}
+
+// SetReplicationHook sets the hook function called for each WAL entry.
+// This enables cluster replication by streaming entries to reader nodes.
+// The hook is called synchronously before the entry is written locally.
+func (w *Writer) SetReplicationHook(hook ReplicationHook) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.replicationHook = hook
+	w.logger.Info().Msg("Replication hook set")
+}
+
+// CurrentSequence returns the current replication sequence number.
+func (w *Writer) CurrentSequence() uint64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.sequence
 }
