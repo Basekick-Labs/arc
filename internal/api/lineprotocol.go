@@ -174,7 +174,7 @@ func (h *LineProtocolHandler) WriteSimple(c *fiber.Ctx) error {
 func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string) error {
 	// Check if this request should be forwarded to a writer node
 	// Reader nodes cannot process writes locally, so they forward to writers
-	if ShouldForwardWrite(h.router, c) {
+	if h.router != nil && ShouldForwardWrite(h.router, c) {
 		h.logger.Debug().Msg("Forwarding Line Protocol write request to writer node")
 
 		httpReq, err := BuildHTTPRequest(c)
@@ -246,16 +246,18 @@ localProcessing:
 	// Convert to columnar format grouped by measurement
 	columnarByMeasurement := ingest.BatchToColumnar(records)
 
-	// Check RBAC permissions for all measurements being written
-	measurements := make([]string, 0, len(columnarByMeasurement))
-	for measurement := range columnarByMeasurement {
-		measurements = append(measurements, measurement)
-	}
-	if err := h.checkWritePermissions(c, database, measurements); err != nil {
-		h.totalErrors.Add(1)
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-			"error": err.Error(),
-		})
+	// Check RBAC permissions for all measurements being written (only if RBAC is enabled)
+	if h.rbacManager != nil && h.rbacManager.IsRBACEnabled() {
+		measurements := make([]string, 0, len(columnarByMeasurement))
+		for measurement := range columnarByMeasurement {
+			measurements = append(measurements, measurement)
+		}
+		if err := h.checkWritePermissions(c, database, measurements); err != nil {
+			h.totalErrors.Add(1)
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+				"error": err.Error(),
+			})
+		}
 	}
 
 	// Write each measurement to the buffer

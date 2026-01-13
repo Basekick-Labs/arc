@@ -173,7 +173,7 @@ func (h *MsgPackHandler) RegisterRoutes(app *fiber.App) {
 func (h *MsgPackHandler) writeMsgPack(c *fiber.Ctx) error {
 	// Check if this request should be forwarded to a writer node
 	// Reader nodes cannot process writes locally, so they forward to writers
-	if ShouldForwardWrite(h.router, c) {
+	if h.router != nil && ShouldForwardWrite(h.router, c) {
 		h.logger.Debug().Msg("Forwarding write request to writer node")
 
 		httpReq, err := BuildHTTPRequest(c)
@@ -298,12 +298,15 @@ localProcessing:
 		database = "default"
 	}
 
-	// Check RBAC permissions for all measurements being written
-	measurements := h.extractMeasurements(records)
-	if err := h.checkWritePermissions(c, database, measurements); err != nil {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-			"error": err.Error(),
-		})
+	// Check RBAC permissions for all measurements being written (only if RBAC is enabled)
+	// Skip measurement extraction when RBAC is disabled - it's O(n) on all records
+	if h.rbacManager != nil && h.rbacManager.IsRBACEnabled() {
+		measurements := h.extractMeasurements(records)
+		if err := h.checkWritePermissions(c, database, measurements); err != nil {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+				"error": err.Error(),
+			})
+		}
 	}
 
 	if err := h.arrowBuffer.Write(ctx, database, records); err != nil {

@@ -2073,6 +2073,19 @@ func sortColumnsByTimeOnly(columns map[string]interface{}) (map[string]interface
 		return columns, nil
 	}
 
+	// FAST PATH: Check if already sorted (common case for time-series producers)
+	// This is O(n) but much cheaper than sorting + permutation when data is in order
+	alreadySorted := true
+	for i := 1; i < n; i++ {
+		if times[i] < times[i-1] {
+			alreadySorted = false
+			break
+		}
+	}
+	if alreadySorted {
+		return columns, nil // No work needed - data is already in time order
+	}
+
 	// Create permutation indices
 	indices := make([]int, n)
 	for i := range indices {
