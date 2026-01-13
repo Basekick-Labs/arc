@@ -28,6 +28,7 @@ type Config struct {
 	MQTT            MQTTConfig
 	License         LicenseConfig
 	Scheduler       SchedulerConfig
+	Cluster         ClusterConfig
 }
 
 type ServerConfig struct {
@@ -169,6 +170,35 @@ type LicenseConfig struct {
 // are enabled (continuous_query.enabled, retention.enabled) AND a valid license is present.
 type SchedulerConfig struct {
 	RetentionSchedule string // Cron schedule for retention (default: "0 3 * * *" = 3am daily)
+}
+
+// ClusterConfig holds configuration for Arc clustering (Enterprise feature)
+// Clustering enables horizontal scaling with role-based node separation:
+// - writer: Handles ingestion, WAL, flushes to shared storage
+// - reader: Query-only node, reads from shared storage
+// - compactor: Background compaction and maintenance
+// - standalone: Single-node deployment (default, OSS-compatible)
+type ClusterConfig struct {
+	Enabled     bool   // Enable clustering mode (default: false for standalone)
+	NodeID      string // Unique node identifier (auto-generated if empty)
+	Role        string // Node role: "writer", "reader", "compactor", "standalone" (default: "standalone")
+	ClusterName string // Cluster name for identification
+
+	// Discovery configuration
+	Seeds []string // Static seed nodes for initial cluster discovery (host:port)
+
+	// Coordination
+	CoordinatorAddr string // Address to bind coordinator service (default: ":9100")
+	AdvertiseAddr   string // Address advertised to other nodes (auto-detected if empty)
+
+	// Health check configuration
+	HealthCheckInterval int // Health check interval in seconds (default: 5)
+	HealthCheckTimeout  int // Health check timeout in seconds (default: 3)
+	UnhealthyThreshold  int // Number of failed checks before marking unhealthy (default: 3)
+
+	// Heartbeat configuration
+	HeartbeatInterval int // Heartbeat interval in seconds (default: 1)
+	HeartbeatTimeout  int // Heartbeat timeout before considering node dead (default: 5)
 }
 
 // Load loads configuration from environment and config file
@@ -321,6 +351,20 @@ func Load() (*Config, error) {
 		Scheduler: SchedulerConfig{
 			RetentionSchedule: v.GetString("scheduler.retention_schedule"),
 		},
+		Cluster: ClusterConfig{
+			Enabled:             v.GetBool("cluster.enabled"),
+			NodeID:              v.GetString("cluster.node_id"),
+			Role:                v.GetString("cluster.role"),
+			ClusterName:         v.GetString("cluster.cluster_name"),
+			Seeds:               v.GetStringSlice("cluster.seeds"),
+			CoordinatorAddr:     v.GetString("cluster.coordinator_addr"),
+			AdvertiseAddr:       v.GetString("cluster.advertise_addr"),
+			HealthCheckInterval: v.GetInt("cluster.health_check_interval"),
+			HealthCheckTimeout:  v.GetInt("cluster.health_check_timeout"),
+			UnhealthyThreshold:  v.GetInt("cluster.unhealthy_threshold"),
+			HeartbeatInterval:   v.GetInt("cluster.heartbeat_interval"),
+			HeartbeatTimeout:    v.GetInt("cluster.heartbeat_timeout"),
+		},
 	}
 
 	return cfg, nil
@@ -433,6 +477,20 @@ func setDefaults(v *viper.Viper) {
 	// Scheduler defaults (Enterprise features)
 	// Note: CQ and retention schedulers are auto-enabled when their features are enabled AND license allows
 	v.SetDefault("scheduler.retention_schedule", "0 3 * * *") // 3am daily
+
+	// Cluster defaults (Enterprise feature)
+	v.SetDefault("cluster.enabled", false)                 // Disabled by default (standalone mode)
+	v.SetDefault("cluster.node_id", "")                    // Auto-generated if empty
+	v.SetDefault("cluster.role", "standalone")             // standalone, writer, reader, compactor
+	v.SetDefault("cluster.cluster_name", "arc-cluster")    // Default cluster name
+	v.SetDefault("cluster.seeds", []string{})              // No seeds by default
+	v.SetDefault("cluster.coordinator_addr", ":9100")      // Coordinator bind address
+	v.SetDefault("cluster.advertise_addr", "")             // Auto-detected if empty
+	v.SetDefault("cluster.health_check_interval", 5)       // 5 seconds
+	v.SetDefault("cluster.health_check_timeout", 3)        // 3 seconds
+	v.SetDefault("cluster.unhealthy_threshold", 3)         // 3 failed checks
+	v.SetDefault("cluster.heartbeat_interval", 1)          // 1 second
+	v.SetDefault("cluster.heartbeat_timeout", 5)           // 5 seconds
 }
 
 func getDefaultThreadCount() int {
