@@ -119,7 +119,7 @@ s3_path_style = true                    # Required for MinIO, false for AWS S3
 # Maximum records to buffer per measurement before flushing to Parquet
 # Higher = better write throughput, but more memory usage
 # Default: 50000
-max_buffer_size = 50000
+max_buffer_size = 5000000
 
 # Maximum age of buffered data in milliseconds before forcing a flush
 # Lower = fresher data on disk, but more small files
@@ -248,7 +248,7 @@ enabled = true
 [continuous_query]
 # Enable/disable continuous query execution
 # Queries are defined via the API
-enabled = true
+enabled = false
 
 # -----------------------------------------------------------------------------
 # MQTT Ingestion Configuration

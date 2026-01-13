@@ -44,34 +44,47 @@ type Config struct {
 type Stats struct {
 	totalSent   atomic.Int64
 	totalErrors atomic.Int64
-	latencies   []float64
-	latencyMu   sync.Mutex
 	running     atomic.Bool
+	// Per-worker latency slices to avoid mutex contention during test
+	workerLatencies [][]float64
+	latencyMu       sync.Mutex // Only used at end for merging
 }
 
-func (s *Stats) addLatency(ms float64) {
-	s.latencyMu.Lock()
-	s.latencies = append(s.latencies, ms)
-	s.latencyMu.Unlock()
+func (s *Stats) initWorkers(n int) {
+	s.workerLatencies = make([][]float64, n)
+	for i := range s.workerLatencies {
+		// Pre-allocate capacity to reduce allocations during test
+		s.workerLatencies[i] = make([]float64, 0, 10000)
+	}
+}
+
+func (s *Stats) addLatency(workerID int, ms float64) {
+	// Lock-free append to per-worker slice
+	s.workerLatencies[workerID] = append(s.workerLatencies[workerID], ms)
 }
 
 func (s *Stats) getPercentile(p float64) float64 {
-	s.latencyMu.Lock()
-	defer s.latencyMu.Unlock()
+	// Merge all worker latencies (only called at end of test)
+	var total int
+	for _, wl := range s.workerLatencies {
+		total += len(wl)
+	}
 
-	if len(s.latencies) == 0 {
+	if total == 0 {
 		return 0
 	}
 
-	sorted := make([]float64, len(s.latencies))
-	copy(sorted, s.latencies)
-	sort.Float64s(sorted)
-
-	idx := int(float64(len(sorted)) * p)
-	if idx >= len(sorted) {
-		idx = len(sorted) - 1
+	all := make([]float64, 0, total)
+	for _, wl := range s.workerLatencies {
+		all = append(all, wl...)
 	}
-	return sorted[idx]
+	sort.Float64s(all)
+
+	idx := int(float64(len(all)) * p)
+	if idx >= len(all) {
+		idx = len(all) - 1
+	}
+	return all[idx]
 }
 
 func generateIOTBatches(count, batchSize int, compress string, zstdLevel int) [][]byte {
@@ -370,7 +383,7 @@ func worker(id int, cfg *Config, batches [][]byte, stats *Stats, client *http.Cl
 
 		if resp.StatusCode == 204 {
 			stats.totalSent.Add(int64(cfg.BatchSize))
-			stats.addLatency(latencyMs)
+			stats.addLatency(id, latencyMs)
 		} else {
 			stats.totalErrors.Add(1)
 			if stats.totalErrors.Load() <= 3 {
@@ -481,6 +494,7 @@ func main() {
 	// Run benchmark
 	fmt.Println("Starting test...")
 	stats := &Stats{}
+	stats.initWorkers(cfg.Workers)
 	stats.running.Store(true)
 
 	var wg sync.WaitGroup

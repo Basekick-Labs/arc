@@ -11,9 +11,10 @@ import (
 )
 
 // MaxFilesPerBatch is the maximum number of files to process in a single compaction job.
-// DuckDB can segfault when processing too many files in a single read_parquet() call.
-// This limit prevents OOM and segfaults on partitions with thousands of files.
-const MaxFilesPerBatch = 1000
+// DuckDB can segfault/abort when processing too many files in a single read_parquet() call.
+// This limit prevents OOM and crashes on partitions with many large files.
+// With 1M buffer size, files are ~10-14MB each, so 30 files ≈ 300-420MB per batch.
+const MaxFilesPerBatch = 30
 
 // Candidate represents a partition candidate for compaction
 type Candidate struct {

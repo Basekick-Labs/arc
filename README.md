@@ -1,6 +1,6 @@
 # Arc
 
-[![Ingestion](https://img.shields.io/badge/ingestion-10.1M%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
+[![Ingestion](https://img.shields.io/badge/ingestion-18.6M%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
 [![Query](https://img.shields.io/badge/query-2.5M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
 [![Go](https://img.shields.io/badge/go-1.25+-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
@@ -29,7 +29,7 @@ Industrial IoT generates massive data at scale:
 
 Traditional time-series databases can't keep up. They're slow, expensive, and lock your data in proprietary formats.
 
-**Arc solves this: 12M records/sec ingestion, sub-second queries on billions of rows, portable Parquet files you own.**
+**Arc solves this: 18.6M records/sec ingestion, sub-second queries on billions of rows, portable Parquet files you own.**
 
 ```sql
 -- Analyze equipment anomalies across facilities
@@ -62,22 +62,35 @@ Benchmarked on Apple MacBook Pro M3 Max (14 cores, 36GB RAM, 1TB NVMe).
 
 | Protocol | Throughput | p50 Latency | p99 Latency |
 |----------|------------|-------------|-------------|
-| MessagePack Columnar | **11.8M rec/s** | 1.06ms | 9.94ms |
-| MessagePack + Zstd | 11.76M rec/s | 1.41ms | 22.36ms |
-| MessagePack + GZIP | 10.34M rec/s | 1.85ms | 22.70ms |
-| Line Protocol | 2.55M rec/s | 6.77ms | 20.99ms |
+| MessagePack Columnar | **18.6M rec/s** | 1.13ms | 10.67ms |
+| MessagePack + Zstd | 16.4M rec/s | 1.36ms | 11.01ms |
+| MessagePack + GZIP | 15.0M rec/s | 1.52ms | 11.78ms |
+| Line Protocol | 3.8M rec/s | 6.04ms | 41.35ms |
+
+### Compaction
+
+Automatic background compaction merges small Parquet files into optimized larger files:
+
+| Metric | Before | After | Reduction |
+|--------|--------|-------|-----------|
+| Files | 43 | 1 | 97.7% |
+| Size | 372 MB | 36 MB | **90.4%** |
+
+Benefits:
+- **10x storage reduction** via better compression and encoding
+- **Faster queries** - scan 1 file vs 43 files
+- **Lower cloud costs** - less storage, fewer API calls
 
 ### Query (January 2026)
 
-| Format | Throughput | Response Size (500K rows) |
-|--------|------------|---------------------------|
-| Arrow IPC | **2.5M rows/s** | 21.5 MB |
-| JSON | 1.2M rows/s | 47.0 MB |
+| Format | Throughput | Response Size (1M rows) |
+|--------|------------|-------------------------|
+| Arrow IPC | **2.55M rows/s** | 43 MB |
+| JSON | 1.22M rows/s | 94 MB |
 
-| Scan Type | Throughput | Time (321M rows) |
+| Scan Type | Throughput | Time (126M rows) |
 |-----------|------------|------------------|
-| COUNT(*) | **~17 billion rows/s** | 19ms |
-| SUM(column) | **~2.8 billion rows/s** | 116ms |
+| COUNT(*) | **3.7B rows/s** | 34ms |
 
 ---
 
