@@ -4,8 +4,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/basekick-labs/arc/internal/cluster"
+	"github.com/basekick-labs/arc/internal/cluster/sharding"
 	"github.com/gofiber/fiber/v2"
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -196,4 +200,165 @@ func TestHandleRoutingError(t *testing.T) {
 	resp, err := app.Test(req)
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusBadGateway, resp.StatusCode)
+}
+
+// Tests for shard routing functions
+
+func TestRouteShardedWrite_NoRouter(t *testing.T) {
+	app := fiber.New()
+	app.Post("/write", func(c *fiber.Ctx) error {
+		resp, err := RouteShardedWrite(nil, c)
+		assert.Nil(t, resp)
+		assert.Nil(t, err)
+		return c.SendString("handled locally")
+	})
+
+	req := httptest.NewRequest("POST", "/write", nil)
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, 200, resp.StatusCode)
+}
+
+func TestRouteShardedWrite_AlreadyRouted(t *testing.T) {
+	sm := sharding.NewShardMap(3)
+	localNode := &cluster.Node{ID: "local-node"}
+	router := sharding.NewShardRouter(&sharding.ShardRouterConfig{
+		ShardMap:  sm,
+		LocalNode: localNode,
+		Timeout:   5 * time.Second,
+		Logger:    zerolog.Nop(),
+	})
+
+	app := fiber.New()
+	app.Post("/write", func(c *fiber.Ctx) error {
+		resp, err := RouteShardedWrite(router, c)
+		assert.Nil(t, resp)
+		assert.Nil(t, err)
+		return c.SendString("handled locally")
+	})
+
+	req := httptest.NewRequest("POST", "/write", nil)
+	req.Header.Set(ShardRoutedHeader, "true") // Already routed
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, 200, resp.StatusCode)
+}
+
+func TestRouteShardedWrite_LocalPrimary(t *testing.T) {
+	sm := sharding.NewShardMap(3)
+	localNode := &cluster.Node{ID: "local-node"}
+	localNode.UpdateState(cluster.StateHealthy)
+
+	// Make local node primary for all shards
+	for i := 0; i < 3; i++ {
+		sm.SetPrimary(i, localNode)
+	}
+
+	router := sharding.NewShardRouter(&sharding.ShardRouterConfig{
+		ShardMap:  sm,
+		LocalNode: localNode,
+		Timeout:   5 * time.Second,
+		Logger:    zerolog.Nop(),
+	})
+
+	app := fiber.New()
+	app.Post("/write", func(c *fiber.Ctx) error {
+		resp, err := RouteShardedWrite(router, c)
+		assert.Nil(t, resp) // Should be nil (handle locally)
+		assert.Nil(t, err)
+		return c.SendString("handled locally")
+	})
+
+	req := httptest.NewRequest("POST", "/write", nil)
+	req.Header.Set("X-Arc-Database", "mydb")
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, 200, resp.StatusCode)
+}
+
+func TestRouteShardedWrite_ForwardToRemote(t *testing.T) {
+	// Create a target server to receive forwarded requests
+	targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "local-node", r.Header.Get("X-Arc-Forwarded-By"))
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"success": true}`))
+	}))
+	defer targetServer.Close()
+
+	sm := sharding.NewShardMap(3)
+	localNode := &cluster.Node{ID: "local-node"}
+	localNode.UpdateState(cluster.StateHealthy)
+
+	remoteNode := &cluster.Node{ID: "remote-node"}
+	remoteNode.APIAddress = targetServer.Listener.Addr().String()
+	remoteNode.UpdateState(cluster.StateHealthy)
+
+	// Make remote node primary for all shards
+	for i := 0; i < 3; i++ {
+		sm.SetPrimary(i, remoteNode)
+	}
+
+	router := sharding.NewShardRouter(&sharding.ShardRouterConfig{
+		ShardMap:  sm,
+		LocalNode: localNode,
+		Timeout:   5 * time.Second,
+		Logger:    zerolog.Nop(),
+	})
+
+	app := fiber.New()
+	app.Post("/api/v1/write", func(c *fiber.Ctx) error {
+		resp, err := RouteShardedWrite(router, c)
+		if err != nil {
+			return HandleShardRoutingError(c, err)
+		}
+		if resp != nil {
+			return CopyResponse(c, resp)
+		}
+		return c.SendString("handled locally")
+	})
+
+	req := httptest.NewRequest("POST", "/api/v1/write", nil)
+	req.Header.Set("X-Arc-Database", "mydb")
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, 200, resp.StatusCode)
+}
+
+func TestRouteShardedQuery_NoRouter(t *testing.T) {
+	app := fiber.New()
+	app.Post("/query", func(c *fiber.Ctx) error {
+		resp, err := RouteShardedQuery(nil, "mydb", c)
+		assert.Nil(t, resp)
+		assert.Nil(t, err)
+		return c.SendString("handled locally")
+	})
+
+	req := httptest.NewRequest("POST", "/query", nil)
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, 200, resp.StatusCode)
+}
+
+func TestHandleShardRoutingError_NoDatabaseHeader(t *testing.T) {
+	app := fiber.New()
+	app.Get("/test", func(c *fiber.Ctx) error {
+		return HandleShardRoutingError(c, sharding.ErrNoDatabaseHeader)
+	})
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, 400, resp.StatusCode)
+}
+
+func TestHandleShardRoutingError_NoShardPrimary(t *testing.T) {
+	app := fiber.New()
+	app.Get("/test", func(c *fiber.Ctx) error {
+		return HandleShardRoutingError(c, sharding.ErrNoShardPrimary)
+	})
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, 503, resp.StatusCode)
 }

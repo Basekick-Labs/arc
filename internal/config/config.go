@@ -219,6 +219,13 @@ type ClusterConfig struct {
 	ReplicationLagLimit    int  // Max acceptable lag in milliseconds before health degrades (default: 5000)
 	ReplicationBufferSize  int  // Entry buffer size for replication queue (default: 10000)
 	ReplicationAckInterval int  // How often readers send acks in milliseconds (default: 100)
+
+	// Sharding configuration (Phase 4)
+	ShardingEnabled           bool   // Enable sharding for horizontal write scaling (default: false)
+	ShardingNumShards         int    // Number of shards (default: 3)
+	ShardingShardKey          string // Shard key: "database" or "measurement" (default: "database")
+	ShardingReplicationFactor int    // Number of copies per shard (default: 3)
+	ShardingRouteTimeout      int    // Timeout for shard routing in milliseconds (default: 5000)
 }
 
 // Load loads configuration from environment and config file
@@ -401,6 +408,12 @@ func Load() (*Config, error) {
 			ReplicationLagLimit:    v.GetInt("cluster.replication_lag_limit"),
 			ReplicationBufferSize:  v.GetInt("cluster.replication_buffer_size"),
 			ReplicationAckInterval: v.GetInt("cluster.replication_ack_interval"),
+			// Sharding configuration (Phase 4)
+			ShardingEnabled:           v.GetBool("cluster.sharding_enabled"),
+			ShardingNumShards:         v.GetInt("cluster.sharding_num_shards"),
+			ShardingShardKey:          v.GetString("cluster.sharding_shard_key"),
+			ShardingReplicationFactor: v.GetInt("cluster.sharding_replication_factor"),
+			ShardingRouteTimeout:      v.GetInt("cluster.sharding_route_timeout"),
 		},
 	}
 
@@ -548,6 +561,13 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.replication_lag_limit", 5000)    // 5 second lag limit
 	v.SetDefault("cluster.replication_buffer_size", 10000) // 10k entry buffer
 	v.SetDefault("cluster.replication_ack_interval", 100)  // 100ms ack interval
+
+	// Sharding defaults (Phase 4)
+	v.SetDefault("cluster.sharding_enabled", false)            // Disabled by default
+	v.SetDefault("cluster.sharding_num_shards", 3)             // 3 shards default
+	v.SetDefault("cluster.sharding_shard_key", "database")     // Database-level sharding
+	v.SetDefault("cluster.sharding_replication_factor", 3)     // RF=3 for fault tolerance
+	v.SetDefault("cluster.sharding_route_timeout", 5000)       // 5 second timeout
 }
 
 func getDefaultThreadCount() int {
