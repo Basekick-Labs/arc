@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/gofiber/fiber/v2"
@@ -28,6 +29,9 @@ type LineProtocolHandler struct {
 	// RBAC support
 	authManager AuthManager
 	rbacManager RBACChecker
+
+	// Cluster routing support
+	router *cluster.Router
 
 	// Stats
 	totalRequests     atomic.Int64
@@ -50,6 +54,12 @@ func NewLineProtocolHandler(buffer *ingest.ArrowBuffer, logger zerolog.Logger) *
 func (h *LineProtocolHandler) SetAuthAndRBAC(authManager AuthManager, rbacManager RBACChecker) {
 	h.authManager = authManager
 	h.rbacManager = rbacManager
+}
+
+// SetRouter sets the cluster router for request forwarding.
+// When set, write requests from reader nodes will be forwarded to writer nodes.
+func (h *LineProtocolHandler) SetRouter(router *cluster.Router) {
+	h.router = router
 }
 
 // checkWritePermissions checks if the token has write permission for the database and measurements
@@ -162,6 +172,35 @@ func (h *LineProtocolHandler) WriteSimple(c *fiber.Ctx) error {
 
 // handleWrite processes Line Protocol data and writes to the Arrow buffer
 func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string) error {
+	// Check if this request should be forwarded to a writer node
+	// Reader nodes cannot process writes locally, so they forward to writers
+	if ShouldForwardWrite(h.router, c) {
+		h.logger.Debug().Msg("Forwarding Line Protocol write request to writer node")
+
+		httpReq, err := BuildHTTPRequest(c)
+		if err != nil {
+			h.logger.Error().Err(err).Msg("Failed to build HTTP request for forwarding")
+			h.totalErrors.Add(1)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to prepare request for forwarding",
+			})
+		}
+
+		resp, err := h.router.RouteWrite(c.Context(), httpReq)
+		if err == cluster.ErrLocalNodeCanHandle {
+			// Fall through to local processing
+			goto localProcessing
+		}
+		if err != nil {
+			h.logger.Error().Err(err).Msg("Failed to route write request")
+			h.totalErrors.Add(1)
+			return HandleRoutingError(c, err)
+		}
+
+		return CopyResponse(c, resp)
+	}
+
+localProcessing:
 	// Get request body
 	body := c.Body()
 	originalSize := len(body)
