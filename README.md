@@ -57,15 +57,16 @@ HAVING MAX(pressure) > 850 OR STDDEV(vibration) > 2.5;
 ## Performance
 
 Benchmarked on Apple MacBook Pro M3 Max (14 cores, 36GB RAM, 1TB NVMe).
+Test config: 12 concurrent workers, 1000-record batches, IoT sensor data.
 
 ### Ingestion
 
 | Protocol | Throughput | p50 Latency | p99 Latency |
 |----------|------------|-------------|-------------|
-| MessagePack Columnar | **18.6M rec/s** | 1.13ms | 10.67ms |
-| MessagePack + Zstd | 16.4M rec/s | 1.36ms | 11.01ms |
-| MessagePack + GZIP | 15.0M rec/s | 1.52ms | 11.78ms |
-| Line Protocol | 3.8M rec/s | 6.04ms | 41.35ms |
+| MessagePack Columnar | **18.6M rec/s** | 0.46ms | 3.68ms |
+| MessagePack + Zstd | 16.8M rec/s | 0.55ms | 3.23ms |
+| MessagePack + GZIP | 15.4M rec/s | 0.63ms | 3.17ms |
+| Line Protocol | 3.7M rec/s | 2.63ms | 10.63ms |
 
 ### Compaction
 
