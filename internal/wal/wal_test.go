@@ -2,8 +2,10 @@ package wal
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -552,5 +554,59 @@ func BenchmarkWriter_AppendRaw(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		writer.AppendRaw(payload)
+	}
+}
+
+func TestWriter_AppendRaw_PayloadTooLarge(t *testing.T) {
+	writer, tmpDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(tmpDir)
+	defer writer.Close()
+
+	// Create payload exceeding the limit
+	payload := make([]byte, MaxWALPayloadSize+1)
+
+	err := writer.AppendRaw(payload)
+	if err == nil {
+		t.Fatal("AppendRaw should fail for oversized payload")
+	}
+	if !errors.Is(err, ErrPayloadTooLarge) {
+		t.Errorf("Expected ErrPayloadTooLarge, got: %v", err)
+	}
+}
+
+func TestWriter_AppendRaw_PayloadTooLarge_ErrorMessage(t *testing.T) {
+	writer, tmpDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(tmpDir)
+	defer writer.Close()
+
+	oversizeAmount := 1000
+	payload := make([]byte, MaxWALPayloadSize+oversizeAmount)
+
+	err := writer.AppendRaw(payload)
+	if err == nil {
+		t.Fatal("Expected error for oversized payload")
+	}
+
+	// Verify error message contains useful information
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "104858600") { // MaxWALPayloadSize + 1000
+		t.Errorf("Error message should contain actual size, got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "104857600") { // MaxWALPayloadSize
+		t.Errorf("Error message should contain limit, got: %s", errMsg)
+	}
+}
+
+func TestWriter_AppendRaw_PayloadAtLimit(t *testing.T) {
+	writer, tmpDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(tmpDir)
+	defer writer.Close()
+
+	// Create payload exactly at the limit - should succeed
+	payload := make([]byte, MaxWALPayloadSize)
+
+	err := writer.AppendRaw(payload)
+	if err != nil {
+		t.Errorf("AppendRaw should succeed for payload at limit: %v", err)
 	}
 }

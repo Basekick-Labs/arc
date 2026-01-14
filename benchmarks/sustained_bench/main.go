@@ -240,6 +240,337 @@ func generateLineProtocolBatches(count, batchSize int, compress string, zstdLeve
 	return batches
 }
 
+func generateRacingBatches(count, batchSize int, compress string, zstdLevel int) [][]byte {
+	// F1/Motorsport telemetry - high-frequency car data
+	carNumbers := []string{"1", "4", "11", "14", "16", "22", "44", "55", "63", "77",
+		"10", "18", "20", "23", "24", "27", "31", "40", "81", "2"}
+	drivers := []string{"VER", "NOR", "PER", "ALO", "LEC", "TSU", "HAM", "SAI", "RUS", "BOT",
+		"GAS", "STR", "MAG", "HUL", "RIC", "ALB", "SAR", "ZHO", "PIA", "LAW"}
+
+	batches := make([][]byte, count)
+	var zstdEncoder *zstd.Encoder
+	if compress == "zstd" {
+		var err error
+		zstdEncoder, err = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(zstdLevel)))
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	for i := 0; i < count; i++ {
+		nowMicros := time.Now().UnixMicro()
+
+		times := make([]int64, batchSize)
+		carNumberVals := make([]string, batchSize)
+		driverVals := make([]string, batchSize)
+		speed := make([]float64, batchSize)    // km/h
+		engineRPM := make([]int, batchSize)    // RPM
+		throttle := make([]float64, batchSize) // % 0-100
+		brake := make([]float64, batchSize)    // % 0-100
+		steering := make([]float64, batchSize) // degrees -180 to 180
+		gear := make([]int, batchSize)         // 0-8
+
+		for j := 0; j < batchSize; j++ {
+			times[j] = nowMicros + int64(j)
+			idx := rand.Intn(len(carNumbers))
+			carNumberVals[j] = carNumbers[idx]
+			driverVals[j] = drivers[idx]
+			speed[j] = 50 + rand.Float64()*300         // 50-350 km/h
+			engineRPM[j] = 8000 + rand.Intn(7000)      // 8000-15000 RPM
+			throttle[j] = rand.Float64() * 100         // 0-100%
+			brake[j] = rand.Float64() * 100            // 0-100%
+			steering[j] = -180 + rand.Float64()*360    // -180 to 180 degrees
+			gear[j] = 1 + rand.Intn(8)                 // 1-8
+		}
+
+		payload := map[string]interface{}{
+			"m": "car_telemetry",
+			"columns": map[string]interface{}{
+				"time":       times,
+				"car_number": carNumberVals,
+				"driver":     driverVals,
+				"speed":      speed,
+				"engine_rpm": engineRPM,
+				"throttle":   throttle,
+				"brake":      brake,
+				"steering":   steering,
+				"gear":       gear,
+			},
+		}
+
+		data, err := msgpack.Marshal(payload)
+		if err != nil {
+			panic(err)
+		}
+
+		switch compress {
+		case "gzip":
+			var buf bytes.Buffer
+			w, _ := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+			w.Write(data)
+			w.Close()
+			data = buf.Bytes()
+		case "zstd":
+			data = zstdEncoder.EncodeAll(data, nil)
+		}
+
+		batches[i] = data
+
+		if (i+1)%100 == 0 {
+			fmt.Printf("  Progress: %d/%d\n", i+1, count)
+		}
+	}
+
+	return batches
+}
+
+func generateEnergyBatches(count, batchSize int, compress string, zstdLevel int) [][]byte {
+	// Wind turbine telemetry - energy/renewables sector
+	turbineIDs := make([]string, 200)
+	for i := range turbineIDs {
+		turbineIDs[i] = fmt.Sprintf("turbine_%03d", i)
+	}
+	farms := []string{"north_ridge", "coastal_1", "plains_west", "offshore_a", "hilltop"}
+
+	batches := make([][]byte, count)
+	var zstdEncoder *zstd.Encoder
+	if compress == "zstd" {
+		var err error
+		zstdEncoder, err = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(zstdLevel)))
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	for i := 0; i < count; i++ {
+		nowMicros := time.Now().UnixMicro()
+
+		times := make([]int64, batchSize)
+		turbineIDVals := make([]string, batchSize)
+		farmVals := make([]string, batchSize)
+		windSpeed := make([]float64, batchSize)     // m/s
+		windDirection := make([]float64, batchSize) // degrees
+		rotorRPM := make([]float64, batchSize)      // RPM
+		powerOutput := make([]float64, batchSize)   // kW
+		bladePitch := make([]float64, batchSize)    // degrees
+		nacelleTemp := make([]float64, batchSize)   // Celsius
+		generatorTemp := make([]float64, batchSize) // Celsius
+
+		for j := 0; j < batchSize; j++ {
+			times[j] = nowMicros + int64(j)
+			turbineIDVals[j] = turbineIDs[rand.Intn(len(turbineIDs))]
+			farmVals[j] = farms[rand.Intn(len(farms))]
+			windSpeed[j] = 2 + rand.Float64()*23          // 2-25 m/s
+			windDirection[j] = rand.Float64() * 360       // 0-360 degrees
+			rotorRPM[j] = 5 + rand.Float64()*15           // 5-20 RPM
+			powerOutput[j] = rand.Float64() * 5000        // 0-5000 kW (5MW turbine)
+			bladePitch[j] = rand.Float64() * 25           // 0-25 degrees
+			nacelleTemp[j] = 15 + rand.Float64()*45       // 15-60 C
+			generatorTemp[j] = 40 + rand.Float64()*60     // 40-100 C
+		}
+
+		payload := map[string]interface{}{
+			"m": "wind_turbine",
+			"columns": map[string]interface{}{
+				"time":           times,
+				"turbine_id":     turbineIDVals,
+				"farm":           farmVals,
+				"wind_speed":     windSpeed,
+				"wind_direction": windDirection,
+				"rotor_rpm":      rotorRPM,
+				"power_output":   powerOutput,
+				"blade_pitch":    bladePitch,
+				"nacelle_temp":   nacelleTemp,
+				"generator_temp": generatorTemp,
+			},
+		}
+
+		data, err := msgpack.Marshal(payload)
+		if err != nil {
+			panic(err)
+		}
+
+		switch compress {
+		case "gzip":
+			var buf bytes.Buffer
+			w, _ := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+			w.Write(data)
+			w.Close()
+			data = buf.Bytes()
+		case "zstd":
+			data = zstdEncoder.EncodeAll(data, nil)
+		}
+
+		batches[i] = data
+
+		if (i+1)%100 == 0 {
+			fmt.Printf("  Progress: %d/%d\n", i+1, count)
+		}
+	}
+
+	return batches
+}
+
+func generateAerospaceBatches(count, batchSize int, compress string, zstdLevel int) [][]byte {
+	// Aerospace/rocket telemetry - ultra-narrow schema for max throughput
+	// Thousands of sensors, each reporting a single value
+	sensorIDs := make([]string, 2000)
+	for i := range sensorIDs {
+		sensorIDs[i] = fmt.Sprintf("sens_%04d", i)
+	}
+
+	batches := make([][]byte, count)
+	var zstdEncoder *zstd.Encoder
+	if compress == "zstd" {
+		var err error
+		zstdEncoder, err = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(zstdLevel)))
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	for i := 0; i < count; i++ {
+		nowMicros := time.Now().UnixMicro()
+
+		times := make([]int64, batchSize)
+		sensorIDVals := make([]string, batchSize)
+		values := make([]float64, batchSize)
+
+		for j := 0; j < batchSize; j++ {
+			times[j] = nowMicros + int64(j)
+			sensorIDVals[j] = sensorIDs[rand.Intn(len(sensorIDs))]
+			values[j] = rand.Float64() * 1000 // Generic sensor reading
+		}
+
+		payload := map[string]interface{}{
+			"m": "rocket_telemetry",
+			"columns": map[string]interface{}{
+				"time":      times,
+				"sensor_id": sensorIDVals,
+				"value":     values,
+			},
+		}
+
+		data, err := msgpack.Marshal(payload)
+		if err != nil {
+			panic(err)
+		}
+
+		switch compress {
+		case "gzip":
+			var buf bytes.Buffer
+			w, _ := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+			w.Write(data)
+			w.Close()
+			data = buf.Bytes()
+		case "zstd":
+			data = zstdEncoder.EncodeAll(data, nil)
+		}
+
+		batches[i] = data
+
+		if (i+1)%100 == 0 {
+			fmt.Printf("  Progress: %d/%d\n", i+1, count)
+		}
+	}
+
+	return batches
+}
+
+func generateIndustrialBatches(count, batchSize int, compress string, zstdLevel int) [][]byte {
+	// Industrial pump telemetry - realistic fields for mining, oil & gas, manufacturing
+	pumpIDs := make([]string, 100)
+	for i := range pumpIDs {
+		pumpIDs[i] = fmt.Sprintf("pump_%03d", i)
+	}
+	facilities := []string{"mine_alpha", "mine_beta", "refinery_1", "plant_east", "plant_west"}
+	pumpTypes := []string{"centrifugal", "positive_displacement", "submersible", "diaphragm"}
+
+	batches := make([][]byte, count)
+	var zstdEncoder *zstd.Encoder
+	if compress == "zstd" {
+		var err error
+		zstdEncoder, err = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(zstdLevel)))
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	for i := 0; i < count; i++ {
+		nowMicros := time.Now().UnixMicro()
+
+		times := make([]int64, batchSize)
+		pumpIDVals := make([]string, batchSize)
+		facilityVals := make([]string, batchSize)
+		pumpTypeVals := make([]string, batchSize)
+		flowRate := make([]float64, batchSize)      // GPM
+		pressureIn := make([]float64, batchSize)    // PSI
+		pressureOut := make([]float64, batchSize)   // PSI
+		temperature := make([]float64, batchSize)   // Celsius
+		vibration := make([]float64, batchSize)     // mm/s
+		current := make([]float64, batchSize)       // Amps
+		rpm := make([]int, batchSize)               // RPM
+		power := make([]float64, batchSize)         // kW
+
+		for j := 0; j < batchSize; j++ {
+			times[j] = nowMicros + int64(j)
+			pumpIDVals[j] = pumpIDs[rand.Intn(len(pumpIDs))]
+			facilityVals[j] = facilities[rand.Intn(len(facilities))]
+			pumpTypeVals[j] = pumpTypes[rand.Intn(len(pumpTypes))]
+			flowRate[j] = 50 + rand.Float64()*450        // 50-500 GPM
+			pressureIn[j] = 10 + rand.Float64()*40       // 10-50 PSI inlet
+			pressureOut[j] = 100 + rand.Float64()*400    // 100-500 PSI outlet
+			temperature[j] = 20 + rand.Float64()*60      // 20-80 C
+			vibration[j] = rand.Float64() * 10           // 0-10 mm/s
+			current[j] = 10 + rand.Float64()*90          // 10-100 Amps
+			rpm[j] = 1000 + rand.Intn(2500)              // 1000-3500 RPM
+			power[j] = 5 + rand.Float64()*95             // 5-100 kW
+		}
+
+		payload := map[string]interface{}{
+			"m": "pump_telemetry",
+			"columns": map[string]interface{}{
+				"time":         times,
+				"pump_id":      pumpIDVals,
+				"facility":     facilityVals,
+				"pump_type":    pumpTypeVals,
+				"flow_rate":    flowRate,
+				"pressure_in":  pressureIn,
+				"pressure_out": pressureOut,
+				"temperature":  temperature,
+				"vibration":    vibration,
+				"current":      current,
+				"rpm":          rpm,
+				"power":        power,
+			},
+		}
+
+		data, err := msgpack.Marshal(payload)
+		if err != nil {
+			panic(err)
+		}
+
+		switch compress {
+		case "gzip":
+			var buf bytes.Buffer
+			w, _ := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+			w.Write(data)
+			w.Close()
+			data = buf.Bytes()
+		case "zstd":
+			data = zstdEncoder.EncodeAll(data, nil)
+		}
+
+		batches[i] = data
+
+		if (i+1)%100 == 0 {
+			fmt.Printf("  Progress: %d/%d\n", i+1, count)
+		}
+	}
+
+	return batches
+}
+
 func generateFinancialBatches(count, batchSize int, compress string, zstdLevel int) [][]byte {
 	symbols := []string{
 		"AAPL", "GOOGL", "MSFT", "AMZN", "META", "NVDA", "TSLA", "JPM", "V", "JNJ",
@@ -404,7 +735,7 @@ func main() {
 	flag.IntVar(&cfg.Pregenerate, "pregenerate", 1000, "Number of batches to pre-generate")
 	flag.StringVar(&cfg.Compress, "compress", "none", "Compression: none, gzip, zstd")
 	flag.IntVar(&cfg.ZstdLevel, "zstd-level", 3, "Zstd compression level (1-22)")
-	flag.StringVar(&cfg.DataType, "data-type", "iot", "Data type: iot, financial")
+	flag.StringVar(&cfg.DataType, "data-type", "iot", "Data type: iot, financial, industrial, aerospace, energy, racing")
 	flag.StringVar(&cfg.Protocol, "protocol", "msgpack", "Protocol: msgpack, lineprotocol")
 	flag.StringVar(&cfg.Host, "host", "localhost", "Server host")
 	flag.IntVar(&cfg.Port, "port", 8000, "Server port")
@@ -423,6 +754,14 @@ func main() {
 	dataTypeLabel := "IOT (Server Metrics)"
 	if cfg.DataType == "financial" {
 		dataTypeLabel = "FINANCIAL (Stock Prices)"
+	} else if cfg.DataType == "industrial" {
+		dataTypeLabel = "INDUSTRIAL (Pump Telemetry)"
+	} else if cfg.DataType == "aerospace" {
+		dataTypeLabel = "AEROSPACE (Rocket Telemetry)"
+	} else if cfg.DataType == "energy" {
+		dataTypeLabel = "ENERGY (Wind Turbine)"
+	} else if cfg.DataType == "racing" {
+		dataTypeLabel = "RACING (F1/Motorsport)"
 	}
 
 	protocolLabel := "MessagePack Columnar"
@@ -454,6 +793,14 @@ func main() {
 		batches = generateLineProtocolBatches(cfg.Pregenerate, cfg.BatchSize, cfg.Compress, cfg.ZstdLevel, cfg.DataType)
 	} else if cfg.DataType == "financial" {
 		batches = generateFinancialBatches(cfg.Pregenerate, cfg.BatchSize, cfg.Compress, cfg.ZstdLevel)
+	} else if cfg.DataType == "industrial" {
+		batches = generateIndustrialBatches(cfg.Pregenerate, cfg.BatchSize, cfg.Compress, cfg.ZstdLevel)
+	} else if cfg.DataType == "aerospace" {
+		batches = generateAerospaceBatches(cfg.Pregenerate, cfg.BatchSize, cfg.Compress, cfg.ZstdLevel)
+	} else if cfg.DataType == "energy" {
+		batches = generateEnergyBatches(cfg.Pregenerate, cfg.BatchSize, cfg.Compress, cfg.ZstdLevel)
+	} else if cfg.DataType == "racing" {
+		batches = generateRacingBatches(cfg.Pregenerate, cfg.BatchSize, cfg.Compress, cfg.ZstdLevel)
 	} else {
 		batches = generateIOTBatches(cfg.Pregenerate, cfg.BatchSize, cfg.Compress, cfg.ZstdLevel)
 	}
