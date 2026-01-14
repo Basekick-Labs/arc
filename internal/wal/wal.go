@@ -2,6 +2,7 @@ package wal
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"os"
@@ -26,6 +27,11 @@ const (
 	// Entry format: [Length: 4 bytes] [Timestamp: 8 bytes] [Checksum: 4 bytes] [Payload: N bytes]
 	WALEntryHeaderSize = 16
 	WALFileHeaderSize  = 7 // Magic(4) + Version(2) + ChecksumType(1)
+
+	// MaxWALPayloadSize is the maximum allowed payload size for a single WAL entry.
+	// This limit prevents integer overflow during buffer allocation (CWE-190) and
+	// aligns with the replication protocol limit (100MB).
+	MaxWALPayloadSize = 100 * 1024 * 1024 // 100MB
 )
 
 // SyncMode defines how WAL syncs to disk
@@ -36,6 +42,9 @@ const (
 	SyncModeFdatasync SyncMode = "fdatasync" // Data sync only (balanced, default)
 	SyncModeAsync     SyncMode = "async"     // No explicit sync (fastest, least safe)
 )
+
+// ErrPayloadTooLarge indicates the payload exceeds MaxWALPayloadSize.
+var ErrPayloadTooLarge = errors.New("WAL payload exceeds maximum allowed size")
 
 // walEntry is a pre-serialized WAL entry ready for writing
 type walEntry struct {
@@ -304,6 +313,11 @@ func (w *Writer) Append(records []map[string]interface{}) error {
 // AppendRaw writes raw (already serialized) msgpack bytes to the WAL asynchronously
 // This is a zero-copy optimization - use this when you already have msgpack bytes
 func (w *Writer) AppendRaw(payload []byte) error {
+	// Validate payload size to prevent integer overflow during allocation (CWE-190)
+	if len(payload) > MaxWALPayloadSize {
+		return fmt.Errorf("%w: size %d exceeds limit %d", ErrPayloadTooLarge, len(payload), MaxWALPayloadSize)
+	}
+
 	// Calculate checksum (CRC32)
 	checksum := crc32.ChecksumIEEE(payload)
 
