@@ -158,17 +158,27 @@ func GetTokenInfo(c *fiber.Ctx) *TokenInfo {
 	return nil
 }
 
-// ExtractTokenFromRequest extracts auth token from Fiber request headers.
-// Checks in order: Authorization Bearer, Authorization plain, x-api-key.
+// ExtractTokenFromRequest extracts auth token from Fiber request.
+// Checks in order: Authorization Bearer, Authorization Token, Authorization plain,
+// x-api-key header, p= query parameter (InfluxDB 1.x compatibility).
 func ExtractTokenFromRequest(c *fiber.Ctx) string {
 	authHeader := c.Get("Authorization")
 	if strings.HasPrefix(authHeader, "Bearer ") {
 		return strings.TrimPrefix(authHeader, "Bearer ")
 	}
+	// InfluxDB 2.x also uses "Token" scheme
+	if strings.HasPrefix(authHeader, "Token ") {
+		return strings.TrimPrefix(authHeader, "Token ")
+	}
 	if authHeader != "" {
 		return authHeader
 	}
-	return c.Get("x-api-key")
+	if apiKey := c.Get("x-api-key"); apiKey != "" {
+		return apiKey
+	}
+	// InfluxDB 1.x compatibility: accept token in password query parameter
+	// This allows 1.x clients to authenticate using ?u=ignored&p=token
+	return c.Query("p")
 }
 
 // RequireResourcePermission creates middleware that checks resource-scoped permissions

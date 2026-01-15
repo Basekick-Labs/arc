@@ -101,13 +101,13 @@ func (h *LineProtocolHandler) checkWritePermissions(c *fiber.Ctx, database strin
 
 // RegisterRoutes registers Line Protocol routes
 func (h *LineProtocolHandler) RegisterRoutes(app *fiber.App) {
-	// InfluxDB 1.x compatible endpoint
-	app.Post("/api/v1/write", h.WriteV1)
+	// InfluxDB 1.x compatible endpoint (matches InfluxDB API)
+	app.Post("/write", h.WriteV1)
 
-	// InfluxDB 2.x compatible endpoint
-	app.Post("/api/v1/write/influxdb", h.WriteInfluxDB)
+	// InfluxDB 2.x compatible endpoint (matches InfluxDB API)
+	app.Post("/api/v2/write", h.WriteInfluxDB)
 
-	// Simple write endpoint (no query parameters)
+	// Arc native endpoint (no query parameters, uses x-arc-database header)
 	app.Post("/api/v1/write/line-protocol", h.WriteSimple)
 
 	// Stats endpoint
@@ -123,7 +123,7 @@ func (h *LineProtocolHandler) RegisterRoutes(app *fiber.App) {
 }
 
 // WriteV1 handles InfluxDB 1.x compatible write requests
-// POST /api/v1/write?db=telegraf&rp=default&precision=ns
+// POST /write?db=telegraf&rp=default&precision=ns
 func (h *LineProtocolHandler) WriteV1(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
 
@@ -141,7 +141,7 @@ func (h *LineProtocolHandler) WriteV1(c *fiber.Ctx) error {
 }
 
 // WriteInfluxDB handles InfluxDB 2.x compatible write requests
-// POST /api/v1/write/influxdb?org=myorg&bucket=mybucket&precision=ns
+// POST /api/v2/write?org=myorg&bucket=mybucket&precision=ns
 func (h *LineProtocolHandler) WriteInfluxDB(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
 

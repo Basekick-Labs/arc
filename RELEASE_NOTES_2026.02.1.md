@@ -2,6 +2,54 @@
 
 ## New Features
 
+### InfluxDB Client Compatibility
+
+Arc's Line Protocol endpoints now use the same paths as InfluxDB, enabling drop-in compatibility with all official InfluxDB client libraries.
+
+**Endpoint changes:**
+| Old Path | New Path | Compatible With |
+|----------|----------|-----------------|
+| `/api/v1/write` | `/write` | InfluxDB 1.x clients, Telegraf |
+| `/api/v1/write/influxdb` | `/api/v2/write` | InfluxDB 2.x clients |
+
+**Supported clients (no code changes required):**
+- Go: `github.com/influxdata/influxdb-client-go`
+- Python: `influxdb-client`
+- JavaScript/Node.js: `@influxdata/influxdb-client`
+- Java: `influxdb-client-java`
+- C#: `InfluxDB.Client`
+- PHP, Ruby, and other official InfluxDB clients
+- Telegraf (InfluxDB output plugin)
+- Node-RED: `node-red-contrib-influxdb`
+
+**Usage:** Point your existing InfluxDB client at Arc's URL - it just works.
+
+```python
+# Python example - works unchanged
+from influxdb_client import InfluxDBClient
+
+client = InfluxDBClient(url="http://localhost:8000", token="your-token", org="myorg")
+write_api = client.write_api()
+write_api.write(bucket="mydb", record="cpu,host=server01 usage=90.5")
+```
+
+**Authentication methods supported:**
+| Method | Example | Notes |
+|--------|---------|-------|
+| Bearer token | `Authorization: Bearer <token>` | Standard OAuth2 style |
+| Token header | `Authorization: Token <token>` | InfluxDB 2.x style |
+| API key header | `x-api-key: <token>` | Simple header auth |
+| Query parameter | `?p=<token>` | InfluxDB 1.x compatibility (username `u=` is ignored) |
+
+```bash
+# InfluxDB 1.x style auth with token in password parameter
+curl -X POST "http://localhost:8000/write?db=mydb&u=ignored&p=your-token" \
+  -d 'cpu,host=server01 usage=90.5'
+```
+
+**Arc-native endpoint preserved:**
+- `/api/v1/write/line-protocol` - Uses `x-arc-database` header (no query params)
+
 ### MQTT Ingestion Support
 
 Arc now supports native MQTT subscription for IoT and edge data ingestion. Connect directly to MQTT brokers to ingest time-series data without requiring additional infrastructure.
@@ -233,7 +281,18 @@ Added `/api/v1/restart` endpoint to restart the MQTT client, allowing configurat
 
 ## Breaking Changes
 
-None
+### Line Protocol Endpoint Paths Changed
+
+The Line Protocol write endpoints have been renamed to match InfluxDB's API paths for client compatibility:
+
+| Old Path (removed) | New Path | Action Required |
+|--------------------|----------|-----------------|
+| `/api/v1/write` | `/write` | Update client config |
+| `/api/v1/write/influxdb` | `/api/v2/write` | Update client config |
+
+**Impact:** If you were using the old Arc-specific paths directly, update your client configuration to use the new paths. If you're using official InfluxDB client libraries, no changes are needed - the new paths are what those clients expect.
+
+**Unaffected:** `/api/v1/write/line-protocol` and `/api/v1/write/msgpack` remain unchanged.
 
 ## Upgrade Notes
 
