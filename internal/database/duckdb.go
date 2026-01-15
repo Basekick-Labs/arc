@@ -2,13 +2,24 @@ package database
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"os"
 	"runtime"
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 	"github.com/rs/zerolog"
 )
+
+// QueryProfile contains timing breakdown for a query execution
+type QueryProfile struct {
+	TotalMs     float64 `json:"total_ms"`
+	PlannerMs   float64 `json:"planner_ms"`
+	ExecutionMs float64 `json:"execution_ms"`
+	RowsScanned uint64  `json:"rows_scanned"`
+	Latency     float64 `json:"latency_ms"` // DuckDB reported latency
+}
 
 // DuckDB manages DuckDB connections and query execution
 // Note: No mutex is needed here because:
@@ -309,4 +320,124 @@ func (d *DuckDB) Stats() sql.DBStats {
 // This is used for passing to components that need direct DB access (e.g., compaction)
 func (d *DuckDB) DB() *sql.DB {
 	return d.db
+}
+
+// QueryWithProfile executes a query and returns timing breakdown using DuckDB profiling
+// This is used to measure parsing/planning overhead for optimization decisions
+func (d *DuckDB) QueryWithProfile(query string) (*sql.Rows, *QueryProfile, error) {
+	// Create a temporary file for profiling output
+	tmpFile, err := os.CreateTemp("", "duckdb_profile_*.json")
+	if err != nil {
+		// Fall back to regular query if we can't create temp file
+		rows, err := d.Query(query)
+		return rows, nil, err
+	}
+	profilePath := tmpFile.Name()
+	tmpFile.Close()
+	defer os.Remove(profilePath)
+
+	// Enable JSON profiling with custom metrics to capture planning time
+	if _, err := d.db.Exec("PRAGMA enable_profiling='json'"); err != nil {
+		d.logger.Warn().Err(err).Msg("Failed to enable profiling")
+	}
+	if _, err := d.db.Exec(fmt.Sprintf("PRAGMA profiling_output='%s'", profilePath)); err != nil {
+		d.logger.Warn().Err(err).Msg("Failed to set profiling output")
+	}
+	// Enable planner timing metrics
+	if _, err := d.db.Exec("SET custom_profiling_settings='{\"PLANNER\": \"true\", \"PLANNER_BINDING\": \"true\", \"PHYSICAL_PLANNER\": \"true\", \"OPERATOR_TIMING\": \"true\", \"OPERATOR_CARDINALITY\": \"true\"}'"); err != nil {
+		d.logger.Warn().Err(err).Msg("Failed to set custom profiling settings")
+	}
+
+	// Execute the query with timing
+	start := time.Now()
+	rows, err := d.db.Query(query)
+	totalTime := time.Since(start)
+
+	// Disable profiling
+	d.db.Exec("PRAGMA disable_profiling")
+
+	if err != nil {
+		return nil, nil, fmt.Errorf("query failed: %w", err)
+	}
+
+	// Parse the profiling output
+	profile := d.parseProfileOutput(profilePath, totalTime)
+
+	d.logger.Debug().
+		Str("query", query).
+		Float64("total_ms", profile.TotalMs).
+		Float64("planner_ms", profile.PlannerMs).
+		Float64("execution_ms", profile.ExecutionMs).
+		Msg("Query profiled")
+
+	return rows, profile, nil
+}
+
+// duckdbProfileOutput represents the JSON structure from DuckDB profiling
+type duckdbProfileOutput struct {
+	Latency     float64                  `json:"latency"`
+	RowsScanned uint64                   `json:"operator_rows_scanned"`
+	Planner     float64                  `json:"planner"`
+	Children    []duckdbProfileOperator  `json:"children"`
+	Timings     map[string]interface{}   `json:"timings"`
+}
+
+type duckdbProfileOperator struct {
+	OperatorTiming      float64                 `json:"operator_timing"`
+	OperatorCardinality uint64                  `json:"operator_cardinality"`
+	OperatorRowsScanned uint64                  `json:"operator_rows_scanned"`
+	Children            []duckdbProfileOperator `json:"children"`
+}
+
+// parseProfileOutput reads and parses the DuckDB profiling JSON output
+func (d *DuckDB) parseProfileOutput(path string, totalTime time.Duration) *QueryProfile {
+	profile := &QueryProfile{
+		TotalMs: float64(totalTime.Microseconds()) / 1000.0,
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		d.logger.Debug().Err(err).Str("path", path).Msg("Failed to read profile output")
+		return profile
+	}
+
+	// Debug: log raw JSON to understand structure
+	d.logger.Debug().Str("raw_json", string(data[:min(500, len(data))])).Msg("DuckDB profile JSON")
+
+	var output duckdbProfileOutput
+	if err := json.Unmarshal(data, &output); err != nil {
+		d.logger.Debug().Err(err).Str("raw", string(data[:min(200, len(data))])).Msg("Failed to parse profile JSON")
+		return profile
+	}
+
+	// DuckDB reports latency in seconds, convert to ms
+	profile.Latency = output.Latency * 1000.0
+	profile.PlannerMs = output.Planner * 1000.0
+	profile.RowsScanned = output.RowsScanned
+
+	// Calculate execution time as latency minus planner time
+	// (or estimate from operators if planner timing not available)
+	if profile.PlannerMs > 0 {
+		profile.ExecutionMs = profile.Latency - profile.PlannerMs
+	} else {
+		// Sum operator timings as execution time
+		profile.ExecutionMs = sumOperatorTimings(output.Children) * 1000.0
+	}
+
+	// If DuckDB latency is available, use it; otherwise use our measured total
+	if profile.Latency == 0 {
+		profile.Latency = profile.TotalMs
+	}
+
+	return profile
+}
+
+// sumOperatorTimings recursively sums operator timings in seconds
+func sumOperatorTimings(operators []duckdbProfileOperator) float64 {
+	var total float64
+	for _, op := range operators {
+		total += op.OperatorTiming
+		total += sumOperatorTimings(op.Children)
+	}
+	return total
 }
