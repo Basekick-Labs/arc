@@ -28,6 +28,22 @@ func TestRewriteRegexToStringFuncs(t *testing.T) {
 			input:    `SELECT REGEXP_REPLACE(name, '[0-9]+', '') FROM users`,
 			wantSame: true,
 		},
+		{
+			name:     "URL domain extraction with REGEXP_EXTRACT",
+			input:    `SELECT REGEXP_EXTRACT(Referer, '^https?://(?:www\.)?([^/]+)', 1) AS domain FROM hits`,
+			wantSame: false,
+			contains: []string{"CASE", "WHEN", "LIKE", "split_part", "substr"},
+		},
+		{
+			name:     "non-URL REGEXP_EXTRACT should not be rewritten",
+			input:    `SELECT REGEXP_EXTRACT(name, '([0-9]+)', 1) FROM users`,
+			wantSame: true,
+		},
+		{
+			name:     "REGEXP_EXTRACT with group 2 should not be rewritten",
+			input:    `SELECT REGEXP_EXTRACT(Referer, '^https?://(?:www\.)?([^/]+)', 2) FROM hits`,
+			wantSame: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -90,6 +106,13 @@ func BenchmarkRewriteRegexToStringFuncs_NoRegex(b *testing.B) {
 
 func BenchmarkRewriteRegexToStringFuncs_WithRegex(b *testing.B) {
 	sql := `SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k FROM hits`
+	for i := 0; i < b.N; i++ {
+		RewriteRegexToStringFuncs(sql)
+	}
+}
+
+func BenchmarkRewriteRegexToStringFuncs_WithRegexExtract(b *testing.B) {
+	sql := `SELECT REGEXP_EXTRACT(Referer, '^https?://(?:www\.)?([^/]+)', 1) AS domain FROM hits`
 	for i := 0; i < b.N; i++ {
 		RewriteRegexToStringFuncs(sql)
 	}
