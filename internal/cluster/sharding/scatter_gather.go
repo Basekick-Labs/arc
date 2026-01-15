@@ -388,3 +388,71 @@ func (sg *ScatterGather) Stats() map[string]interface{} {
 		"timeout_ms":           sg.cfg.Timeout.Milliseconds(),
 	}
 }
+
+// TwoStageAggregation executes a query using two-stage distributed aggregation.
+// The aggregation rewriter transforms the query to compute partial aggregates on shards,
+// then combines them at the coordinator.
+// Returns the final merged result as JSON.
+func (sg *ScatterGather) TwoStageAggregation(
+	ctx context.Context,
+	databases []string,
+	originalSQL string,
+	rewriter *AggregationRewriter,
+	buildRequest func(shardID int, nodeAddr string, shardSQL string) (*http.Request, error),
+) (json.RawMessage, error) {
+	// Check if query can use two-stage
+	if !rewriter.CanRewrite(originalSQL) {
+		return nil, fmt.Errorf("query not suitable for two-stage aggregation")
+	}
+
+	// Rewrite the query for partial aggregation
+	rewrite, err := rewriter.Rewrite(originalSQL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to rewrite query: %w", err)
+	}
+
+	sg.logger.Info().
+		Str("original_sql", originalSQL).
+		Str("shard_sql", rewrite.ShardQuery).
+		Int("final_aggregations", len(rewrite.FinalAggregations)).
+		Strs("group_by", rewrite.GroupByColumns).
+		Msg("Two-stage aggregation: query rewritten")
+
+	// Execute on all shards with the rewritten query
+	result, err := sg.Query(ctx, databases, func(shardID int, nodeAddr string) (*http.Request, error) {
+		return buildRequest(shardID, nodeAddr, rewrite.ShardQuery)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("scatter phase failed: %w", err)
+	}
+
+	// Collect successful shard results
+	var partialResults []json.RawMessage
+	for _, r := range result.Results {
+		if r.Error == "" && len(r.Data) > 0 {
+			partialResults = append(partialResults, r.Data)
+		}
+	}
+
+	if len(partialResults) == 0 {
+		// Return empty result
+		return json.Marshal(map[string]interface{}{
+			"columns": []string{},
+			"data":    [][]interface{}{},
+		})
+	}
+
+	// Merge partial results at coordinator
+	merged, err := rewriter.MergeAggregatedResults(rewrite, partialResults)
+	if err != nil {
+		return nil, fmt.Errorf("gather phase failed: %w", err)
+	}
+
+	sg.logger.Info().
+		Int("shards_queried", result.TotalShards).
+		Int("shards_success", result.SuccessShards).
+		Int("partial_results", len(partialResults)).
+		Msg("Two-stage aggregation: merge completed")
+
+	return merged, nil
+}

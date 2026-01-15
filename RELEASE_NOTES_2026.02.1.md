@@ -251,6 +251,91 @@ Queries using `time_bucket()` and `date_trunc()` are now automatically rewritten
 
 **Fast-path optimization (PR #99):** Queries that don't use `time_bucket` or `date_trunc` now skip regex processing entirely via a simple `strings.Contains` check. This eliminates ~21 unnecessary allocations (~44KB) per query, providing an **8.8x speedup** for the SQL transformation step on queries without time functions.
 
+### Parallel Partition Scanning
+
+Queries spanning multiple time partitions now execute in parallel, providing **2-4x speedup** for time-range queries on partitioned data.
+
+**How it works:**
+- When partition pruning identifies 3+ partition paths (configurable), queries execute concurrently
+- Each partition query runs in its own goroutine with semaphore-based concurrency control
+- Results are merged via a streaming iterator that presents partitions as a single result set
+- Default: 4 concurrent partition queries (bounded by DuckDB connection pool)
+
+**Example - Query spanning 24 hourly partitions:**
+```sql
+SELECT host, AVG(cpu) FROM metrics
+WHERE time >= '2024-01-01' AND time < '2024-01-02'
+GROUP BY host
+```
+
+| Execution Mode | Time |
+|----------------|------|
+| Sequential (before) | ~2400ms |
+| Parallel 4x (after) | ~600ms |
+
+**Configuration:**
+- `MinPartitionsForParallel`: Minimum partitions to trigger parallel execution (default: 3)
+- `MaxConcurrentPartitions`: Maximum concurrent partition queries (default: 4)
+
+**Benefits:**
+- Transparent to clients - no query changes required
+- Bounded memory usage - results stream incrementally
+- Works with existing partition pruning (time-range WHERE clauses)
+
+### Two-Stage Distributed Aggregation (Arc Enterprise)
+
+Aggregation queries on distributed clusters now use two-stage execution, providing **5-20x speedup** for cross-shard aggregations.
+
+**How it works:**
+1. **Scatter phase**: Query is rewritten to compute partial aggregates on each shard
+2. **Gather phase**: Coordinator merges partial results into final aggregates
+
+**Aggregation transformations:**
+| Function | Shard Query | Coordinator |
+|----------|-------------|-------------|
+| `SUM(x)` | `SUM(x)` | `SUM(partial_sums)` |
+| `COUNT(*)` | `COUNT(*)` | `SUM(partial_counts)` |
+| `AVG(x)` | `SUM(x), COUNT(x)` | `SUM(sums)/SUM(counts)` |
+| `MIN(x)` | `MIN(x)` | `MIN(partial_mins)` |
+| `MAX(x)` | `MAX(x)` | `MAX(partial_maxes)` |
+
+**Example - 4-shard cluster:**
+```sql
+-- Original query
+SELECT region, AVG(latency), COUNT(*) FROM requests GROUP BY region
+
+-- Shard query (sent to each shard)
+SELECT region, SUM(latency) AS __partial_sum_0, COUNT(latency) AS __partial_count_0
+FROM requests GROUP BY region
+
+-- Coordinator merges: AVG = SUM(__partial_sum_0) / SUM(__partial_count_0)
+```
+
+**Benefits:**
+- Reduces network transfer (partial aggregates vs full rows)
+- Enables aggregations on datasets larger than any single shard
+- Automatic query detection - no hints required
+- Falls back to standard execution for unsupported patterns (HAVING, window functions, subqueries)
+
+### DuckDB Query Engine Optimizations
+
+Added DuckDB configuration settings that improve query performance across all query types.
+
+**Settings enabled:**
+- `enable_object_cache=true` - Caches Parquet file metadata for faster repeated access
+- `preserve_insertion_order=true` - Ensures deterministic results for LIMIT queries
+
+**ClickBench benchmark results (100M rows, 43 queries):**
+
+| Metric | Before | After | Change |
+|--------|--------|-------|--------|
+| Total time | 19,173ms | 18,736ms | **-2.3%** |
+| Q3: SUM/COUNT/AVG | 82ms | 62ms | **-24%** |
+| Q4: AVG(UserID) | 90ms | 69ms | **-23%** |
+| Q1: COUNT(*) | 49ms | 40ms | **-18%** |
+| Q2: COUNT(*) WHERE | 58ms | 47ms | **-19%** |
+| Q29: REGEXP_REPLACE | 5700ms | 5274ms | **-7%** |
+
 ### Database Header for Query Optimization
 
 Query endpoints now support the `x-arc-database` header for specifying the database context, providing **4-17% performance improvement** by skipping database extraction regex patterns.
