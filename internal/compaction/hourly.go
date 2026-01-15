@@ -127,12 +127,6 @@ func (t *HourlyTier) ShouldCompact(files []string, partitionTime time.Time) bool
 	)
 }
 
-// GetCompactedFilename generates the filename for a compacted file
-func (t *HourlyTier) GetCompactedFilename(measurement string, partitionTime time.Time) string {
-	timestamp := partitionTime.Format("20060102_150405")
-	return measurement + "_" + timestamp + "_compacted.parquet"
-}
-
 // IsCompactedFile checks if a file is a compacted hourly file
 func (t *HourlyTier) IsCompactedFile(filename string) bool {
 	return strings.HasSuffix(filename, "_compacted.parquet")

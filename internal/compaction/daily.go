@@ -130,12 +130,6 @@ func (t *DailyTier) ShouldCompact(files []string, partitionTime time.Time) bool 
 	)
 }
 
-// GetCompactedFilename generates the filename for a compacted file
-func (t *DailyTier) GetCompactedFilename(measurement string, partitionTime time.Time) string {
-	timestamp := partitionTime.Format("20060102")
-	return measurement + "_" + timestamp + "_daily.parquet"
-}
-
 // IsCompactedFile checks if a file is a compacted daily file
 func (t *DailyTier) IsCompactedFile(filename string) bool {
 	return strings.HasSuffix(filename, "_daily.parquet")
@@ -263,18 +257,18 @@ func extractNewestFileTime(files []string) time.Time {
 		// Remove .parquet extension
 		filename = strings.TrimSuffix(filename, ".parquet")
 
-		// Check if it's a daily compacted file: measurement_YYYYMMDD_daily
+		// Check if it's a daily compacted file: measurement_YYYYMMDD_HHMMSS_daily
 		if strings.HasSuffix(filename, "_daily") {
 			// Remove _daily suffix
 			filename = strings.TrimSuffix(filename, "_daily")
 			fileParts := strings.Split(filename, "_")
-			if len(fileParts) < 2 {
+			if len(fileParts) < 3 {
 				continue
 			}
-			// Last part is the date
-			datePart := fileParts[len(fileParts)-1]
-			// Parse date: YYYYMMDD (daily files created at midnight UTC)
-			fileTime, err := time.Parse("20060102", datePart)
+			// Last two parts are date and time: YYYYMMDD_HHMMSS
+			dateTimePart := fileParts[len(fileParts)-2] + "_" + fileParts[len(fileParts)-1]
+			// Parse timestamp: YYYYMMDD_HHMMSS
+			fileTime, err := time.Parse("20060102_150405", dateTimePart)
 			if err != nil {
 				continue
 			}

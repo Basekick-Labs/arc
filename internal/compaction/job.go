@@ -428,8 +428,8 @@ func (j *Job) downloadSingleFile(ctx context.Context, tempDir string, index int,
 // It validates each file and only compacts valid ones, storing the list of
 // successfully compacted files' storage keys in j.compactedFiles.
 func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir string) (string, error) {
-	// Generate output filename with tier-specific suffix
-	timestamp := time.Now().Format("20060102_150405")
+	// Generate output filename with tier-specific suffix (use UTC for consistency)
+	timestamp := time.Now().UTC().Format("20060102_150405")
 	suffix := "compacted"
 	if j.Tier != "hourly" {
 		suffix = j.Tier

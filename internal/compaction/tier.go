@@ -79,9 +79,6 @@ type Tier interface {
 	// ShouldCompact determines if a partition should be compacted based on tier-specific criteria
 	ShouldCompact(files []string, partitionTime time.Time) bool
 
-	// GetCompactedFilename generates the filename for a compacted file
-	GetCompactedFilename(measurement string, partitionTime time.Time) string
-
 	// IsCompactedFile checks if a file is already a compacted file from this tier
 	IsCompactedFile(filename string) bool
 
@@ -162,12 +159,6 @@ func (t *BaseTier) RecordCompaction(filesCompacted int, bytesSaved int64) {
 	t.TotalCompactions++
 	t.TotalFilesCompacted += filesCompacted
 	t.TotalBytesSaved += bytesSaved
-}
-
-// GetCompactedFilename generates a filename for a compacted file
-func (t *BaseTier) GetCompactedFilename(tierName, measurement string, partitionTime time.Time) string {
-	timestamp := partitionTime.Format("20060102")
-	return fmt.Sprintf("%s_%s_%s.parquet", measurement, timestamp, tierName)
 }
 
 // IsCompactedFile checks if a file is a compacted file from a specific tier
