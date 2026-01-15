@@ -160,6 +160,14 @@ WHERE time > NOW() - INTERVAL '4 minutes'
 
 ## Bug Fixes
 
+### Large Payload Ingestion (413 Request Entity Too Large)
+
+Fixed an issue where large ingestion requests (>4MB) would fail with `413 Request Entity Too Large` even though `server.max_payload_size` was configured to allow larger payloads (default: 1GB).
+
+**Cause:** The `MaxPayloadSize` config value was not being passed to Fiber's `BodyLimit` setting, so Fiber used its default 4MB limit.
+
+**Fix:** Now passes the configured `MaxPayloadSize` to Fiber's `BodyLimit`, allowing payloads up to the configured limit (default 1GB).
+
 ### Query Results Timestamp Timezone Inconsistency
 
 Fixed a bug where `time.Time` values in query results could be returned with the server's local timezone instead of UTC. This caused timestamp inconsistencies when servers were running in non-UTC timezones.
