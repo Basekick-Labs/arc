@@ -231,6 +231,19 @@ When `client_id` is not specified in the MQTT configuration, Arc now auto-genera
 
 Added `/api/v1/restart` endpoint to restart the MQTT client, allowing configuration changes to be applied without restarting the entire Arc server.
 
+## Security
+
+### Token Hashing Security Model
+
+Arc uses a defense-in-depth approach for API token security:
+
+- **Storage**: All new tokens are hashed with **bcrypt** (cost factor 10) before storage
+- **Lookup optimization**: SHA256-based prefixes enable O(1) database lookups without exposing tokens
+- **Cache keys**: In-memory cache uses SHA256 for fast key derivation (not security-sensitive)
+- **Legacy support**: Pre-v26 tokens using SHA256 hashes continue to work for backward compatibility
+
+New tokens created since v26 use bcrypt exclusively for storage. The SHA256 usage for cache keys and database indexes is a performance optimization - security is provided by the bcrypt-hashed storage, not the lookup indexes.
+
 ## Breaking Changes
 
 None

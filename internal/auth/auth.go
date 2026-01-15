@@ -334,23 +334,30 @@ func (am *AuthManager) hashToken(token string) (string, error) {
 
 // verifyTokenHash checks if a token matches a stored hash
 func (am *AuthManager) verifyTokenHash(token, hash string) bool {
-	// Bcrypt hash
+	// Bcrypt hash (secure, used for all new tokens since v26)
 	if strings.HasPrefix(hash, "$2") {
 		return bcrypt.CompareHashAndPassword([]byte(hash), []byte(token)) == nil
 	}
-	// SHA256 hash (legacy compatibility)
+	// SHA256 hash (legacy compatibility for pre-v26 tokens)
+	// New tokens always use bcrypt. This path only verifies existing old tokens.
+	// #nosec G401 -- Legacy compatibility only, not used for new token storage
 	h := sha256.Sum256([]byte(token))
 	return hash == hex.EncodeToString(h[:])
 }
 
-// cacheKey generates a cache key from a token (using SHA256 for fast lookup)
+// cacheKey generates a cache key for in-memory token lookup.
+// This is NOT password storage - it's a fast cache index for O(1) lookups.
+// The actual token is stored securely with bcrypt in the database.
+// #nosec G401 -- Not password hashing, just cache key derivation for lookups
 func cacheKey(token string) string {
 	h := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(h[:])
 }
 
-// tokenPrefix generates a prefix for fast token lookup (first 16 chars of SHA256)
-// This enables O(1) database lookup instead of O(n) full table scan
+// tokenPrefix generates a prefix for fast database token lookup.
+// This enables O(1) database lookup via index instead of O(n) full table scan.
+// The actual token is stored securely with bcrypt - this is just a lookup index.
+// #nosec G401 -- Not password hashing, just lookup index derivation
 func tokenPrefix(token string) string {
 	h := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(h[:])[:16]
