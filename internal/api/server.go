@@ -68,6 +68,7 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 		ReadTimeout:           config.ReadTimeout,
 		WriteTimeout:          config.WriteTimeout,
 		IdleTimeout:           config.IdleTimeout,
+		BodyLimit:             int(config.MaxPayloadSize),
 		DisableStartupMessage: true,
 		ErrorHandler:          customErrorHandler(logger),
 		// CRITICAL: Disable automatic request body parsing to preserve gzip-compressed payloads
