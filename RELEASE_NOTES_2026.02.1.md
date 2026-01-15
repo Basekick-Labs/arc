@@ -56,66 +56,76 @@ Arc now supports native MQTT subscription for IoT and edge data ingestion. Conne
 
 **Key features:**
 - Subscribe to multiple MQTT topics with wildcard support (`+`, `#`)
-- Flexible payload mapping from JSON to Arc measurements
-- Automatic timestamp extraction from payloads or broker receive time
-- QoS 0, 1, and 2 support
+- Dynamic subscription management via REST API
 - TLS/SSL connections with certificate validation
 - Authentication via username/password or client certificates
 - Connection auto-reconnect with exponential backoff
 - Per-subscription statistics and monitoring
+- Passwords encrypted at rest
+- Auto-start subscriptions on server restart
 
-**Configuration:**
+**Enable MQTT in arc.toml:**
 ```toml
 [mqtt]
 enabled = true
-broker_url = "tcp://localhost:1883"
-client_id = "arc-subscriber"
-username = "arc"
-password = "secret"
-
-[[mqtt.subscriptions]]
-topic = "sensors/+/temperature"
-qos = 1
-database = "iot"
-measurement = "temperature"
-payload_format = "json"
-
-[mqtt.subscriptions.field_mappings]
-value = "$.temp"
-sensor_id = "$.device_id"
 ```
-
-**Payload formats supported:**
-- JSON with JSONPath field extraction
-- Plain text/numeric values
 
 **REST API for subscription management:**
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/api/v1/mqtt/subscriptions` | List all subscriptions with stats |
-| `POST` | `/api/v1/mqtt/subscriptions` | Add a new subscription |
-| `DELETE` | `/api/v1/mqtt/subscriptions/:topic` | Remove a subscription |
-| `GET` | `/api/v1/mqtt/stats` | Get MQTT client statistics |
-| `POST` | `/api/v1/restart` | Restart MQTT client (applies config changes) |
+| `POST` | `/api/v1/mqtt/subscriptions` | Create a new subscription |
+| `GET` | `/api/v1/mqtt/subscriptions` | List all subscriptions |
+| `GET` | `/api/v1/mqtt/subscriptions/:id` | Get subscription details |
+| `PUT` | `/api/v1/mqtt/subscriptions/:id` | Update a subscription |
+| `DELETE` | `/api/v1/mqtt/subscriptions/:id` | Delete a subscription |
+| `POST` | `/api/v1/mqtt/subscriptions/:id/start` | Start a subscription |
+| `POST` | `/api/v1/mqtt/subscriptions/:id/stop` | Stop a subscription |
+| `POST` | `/api/v1/mqtt/subscriptions/:id/restart` | Restart a subscription |
+| `GET` | `/api/v1/mqtt/subscriptions/:id/stats` | Get subscription statistics |
+| `GET` | `/api/v1/mqtt/stats` | Aggregate stats for all subscriptions |
+| `GET` | `/api/v1/mqtt/health` | MQTT service health check |
 
-**Example - Add subscription via API:**
+**Example - Create subscription via API:**
 ```bash
-curl -X POST -H "Authorization: Bearer $TOKEN" \
+curl -X POST "http://localhost:8000/api/v1/mqtt/subscriptions" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "topic": "factory/+/metrics",
+    "name": "factory-sensors",
+    "broker": "tcp://mqtt.example.com:1883",
+    "topics": ["sensors/+/temperature", "sensors/+/humidity"],
     "qos": 1,
-    "database": "manufacturing",
-    "measurement": "machine_metrics",
-    "payload_format": "json",
-    "field_mappings": {
-      "temperature": "$.temp",
-      "pressure": "$.psi",
-      "machine_id": "$.id"
+    "database": "iot",
+    "username": "arc",
+    "password": "secret",
+    "auto_start": true,
+    "topic_mapping": {
+      "sensors/+/temperature": "temperature",
+      "sensors/+/humidity": "humidity"
     }
-  }' \
-  http://localhost:8080/api/v1/mqtt/subscriptions
+  }'
 ```
+
+**Example - List subscriptions:**
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8000/api/v1/mqtt/subscriptions
+```
+
+**Subscription options:**
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Unique subscription name |
+| `broker` | string | Yes | Broker URL (tcp://, ssl://, ws://) |
+| `topics` | array | Yes | Topics to subscribe (supports wildcards) |
+| `database` | string | Yes | Target Arc database |
+| `qos` | int | No | QoS level: 0, 1, or 2 (default: 1) |
+| `client_id` | string | No | MQTT client ID (auto-generated if not set) |
+| `username` | string | No | MQTT username |
+| `password` | string | No | MQTT password (encrypted at rest) |
+| `tls_enabled` | bool | No | Enable TLS/SSL |
+| `auto_start` | bool | No | Start on creation and server restart |
+| `topic_mapping` | object | No | Map topics to measurement names |
 
 ### Relative Time Expression Support in Partition Pruning
 
