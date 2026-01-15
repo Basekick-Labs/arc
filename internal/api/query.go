@@ -549,13 +549,14 @@ type QueryRequest struct {
 
 // QueryResponse represents a SQL query response
 type QueryResponse struct {
-	Success         bool            `json:"success"`
-	Columns         []string        `json:"columns"`
-	Data            [][]interface{} `json:"data"`
-	RowCount        int             `json:"row_count"`
-	ExecutionTimeMs float64         `json:"execution_time_ms"`
-	Timestamp       string          `json:"timestamp"`
-	Error           string          `json:"error,omitempty"`
+	Success         bool                   `json:"success"`
+	Columns         []string               `json:"columns"`
+	Data            [][]interface{}        `json:"data"`
+	RowCount        int                    `json:"row_count"`
+	ExecutionTimeMs float64                `json:"execution_time_ms"`
+	Timestamp       string                 `json:"timestamp"`
+	Error           string                 `json:"error,omitempty"`
+	Profile         *database.QueryProfile `json:"profile,omitempty"`
 }
 
 // Dangerous SQL patterns (with word boundaries to avoid false positives)
@@ -1059,6 +1060,10 @@ localProcessing:
 	var columns []string
 	var data [][]interface{}
 	var rowCount int
+	var profile *database.QueryProfile
+
+	// Check for profiling mode
+	profileMode := c.Get("x-arc-profile") == "true"
 
 	// Execute query - use parallel path if available
 	if parallelInfo != nil && h.parallelExecutor != nil {
@@ -1125,7 +1130,16 @@ localProcessing:
 		}
 	} else {
 		// Standard single-query execution
-		rows, err := h.db.Query(convertedSQL)
+		var rows *sql.Rows
+		var err error
+
+		if profileMode {
+			// Use profiled query to capture timing breakdown
+			rows, profile, err = h.db.QueryWithProfile(convertedSQL)
+		} else {
+			rows, err = h.db.Query(convertedSQL)
+		}
+
 		if err != nil {
 			m.IncQueryErrors()
 			h.logger.Error().Err(err).Str("sql", req.SQL).Msg("Query execution failed")
@@ -1204,6 +1218,7 @@ localProcessing:
 		RowCount:        rowCount,
 		ExecutionTimeMs: executionTime,
 		Timestamp:       timestamp,
+		Profile:         profile,
 	})
 }
 
@@ -1307,7 +1322,12 @@ func (h *QueryHandler) getTransformedSQLForParallel(sql string, headerDB string)
 func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 	originalSQL := sql
 
-	// Phase 0: Rewrite time functions to faster epoch-based alternatives BEFORE masking
+	// Phase 0a: Rewrite regex functions to faster string functions BEFORE masking
+	// This rewrites patterns like REGEXP_REPLACE(col, 'url_pattern', '\1') to CASE expressions
+	// Must happen before masking since the regex patterns contain string literals
+	sql, _ = RewriteRegexToStringFuncs(sql)
+
+	// Phase 0b: Rewrite time functions to faster epoch-based alternatives BEFORE masking
 	// This must happen first because these functions contain string literals
 	// that would be masked, preventing our regex from matching
 	sql = rewriteTimeBucket(sql)
@@ -1629,6 +1649,12 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database
 	originalSQL := sql
 	sqlLower := strings.ToLower(sql)
 
+	// Phase 0a: Rewrite regex functions to faster string functions BEFORE any other processing
+	sql, _ = RewriteRegexToStringFuncs(sql)
+	if sql != originalSQL {
+		sqlLower = strings.ToLower(sql)
+	}
+
 	// FAST PATH: For simple single-table queries without special SQL features,
 	// skip all the regex machinery and use direct string manipulation
 	if isSingleTableQuery(sqlLower) && !strings.Contains(sqlLower, "with ") {
@@ -1644,7 +1670,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database
 		}
 	}
 
-	// Phase 0: Rewrite time functions to faster epoch-based alternatives BEFORE masking
+	// Phase 0b: Rewrite time functions to faster epoch-based alternatives BEFORE masking
 	sql = rewriteTimeBucket(sql)
 	sql = rewriteDateTrunc(sql)
 
