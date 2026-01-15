@@ -19,8 +19,9 @@ func RewriteRegexToStringFuncs(sql string) (string, bool) {
 
 	original := sql
 
-	// Try URL domain extraction rewrite
+	// Try URL domain extraction rewrites (both REGEXP_REPLACE and REGEXP_EXTRACT)
 	sql = rewriteURLDomainExtraction(sql)
+	sql = rewriteURLDomainExtractionExtract(sql)
 
 	return sql, sql != original
 }
@@ -83,4 +84,42 @@ func buildURLDomainCASE(column string) string {
 		column, column,
 		column, column,
 		column)
+}
+
+// rewriteURLDomainExtractionExtract rewrites REGEXP_EXTRACT for URL domain extraction.
+// Converts: REGEXP_EXTRACT(Referer, '^https?://(?:www\.)?([^/]+)', 1)
+// To: CASE WHEN Referer LIKE 'https://www.%' THEN split_part(substr(Referer, 13), '/', 1) ... END
+func rewriteURLDomainExtractionExtract(sql string) string {
+	sqlLower := strings.ToLower(sql)
+
+	// Look for REGEXP_EXTRACT with URL-like patterns
+	if !strings.Contains(sqlLower, "regexp_extract") {
+		return sql
+	}
+
+	// Find REGEXP_EXTRACT calls that look like URL domain extraction
+	// Pattern: REGEXP_EXTRACT(column, 'regex_with_https_and_domain_capture', 1)
+	re := regexp.MustCompile(`(?i)REGEXP_EXTRACT\s*\(\s*(\w+)\s*,\s*'([^']+)'\s*,\s*1\s*\)`)
+
+	result := re.ReplaceAllStringFunc(sql, func(match string) string {
+		parts := re.FindStringSubmatch(match)
+		if len(parts) < 3 {
+			return match
+		}
+
+		column := parts[1]
+		pattern := parts[2]
+
+		// Check if this is a URL domain extraction pattern
+		// Look for: https?, and a domain capture pattern [^/]
+		if !strings.Contains(strings.ToLower(pattern), "https") ||
+			(!strings.Contains(pattern, "[^/]") && !strings.Contains(pattern, "[^\\/]")) {
+			return match
+		}
+
+		// Generate equivalent CASE expression using string functions
+		return buildURLDomainCASE(column)
+	})
+
+	return result
 }
