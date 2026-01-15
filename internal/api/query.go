@@ -18,6 +18,7 @@ import (
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/pruning"
+	"github.com/basekick-labs/arc/internal/query"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
@@ -83,6 +84,7 @@ var (
 
 	// Pattern for extracting LIMIT clause value for result pre-allocation
 	patternLimit = regexp.MustCompile(`(?i)\bLIMIT\s+(\d+)\b`)
+
 )
 
 // isIdentChar returns true if c is a valid SQL identifier character (a-z, A-Z, 0-9, _)
@@ -520,14 +522,15 @@ func stripSQLComments(sql string, hasComments bool) string {
 
 // QueryHandler handles SQL query endpoints
 type QueryHandler struct {
-	db           *database.DuckDB
-	storage      storage.Backend
-	pruner       *pruning.PartitionPruner
-	queryCache   *database.QueryCache
-	logger       zerolog.Logger
-	authManager  AuthManager
-	rbacManager  RBACChecker
-	debugEnabled bool // Cached check for debug logging to avoid repeated level checks
+	db               *database.DuckDB
+	storage          storage.Backend
+	pruner           *pruning.PartitionPruner
+	queryCache       *database.QueryCache
+	logger           zerolog.Logger
+	authManager      AuthManager
+	rbacManager      RBACChecker
+	debugEnabled     bool // Cached check for debug logging to avoid repeated level checks
+	parallelExecutor *query.ParallelExecutor
 
 	// Cluster routing support
 	router *cluster.Router
@@ -658,14 +661,15 @@ func validateWhereClauseQuery(where string) error {
 func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolog.Logger) *QueryHandler {
 	handlerLogger := logger.With().Str("component", "query-handler").Logger()
 	return &QueryHandler{
-		db:           db,
-		storage:      storage,
-		pruner:       pruning.NewPartitionPruner(logger),
-		queryCache:   database.NewQueryCache(database.QueryCacheTTL, database.DefaultQueryCacheMaxSize),
-		logger:       handlerLogger,
-		authManager:  nil,
-		rbacManager:  nil,
-		debugEnabled: handlerLogger.GetLevel() <= zerolog.DebugLevel,
+		db:               db,
+		storage:          storage,
+		pruner:           pruning.NewPartitionPruner(logger),
+		queryCache:       database.NewQueryCache(database.QueryCacheTTL, database.DefaultQueryCacheMaxSize),
+		logger:           handlerLogger,
+		authManager:      nil,
+		rbacManager:      nil,
+		debugEnabled:     handlerLogger.GetLevel() <= zerolog.DebugLevel,
+		parallelExecutor: query.NewParallelExecutor(db.DB(), query.DefaultParallelConfig(), handlerLogger),
 	}
 }
 
@@ -1039,82 +1043,146 @@ localProcessing:
 		})
 	}
 
-	// Convert SQL to storage paths (with caching)
-	// If headerDB is set, uses optimized path that skips db.table regex patterns
-	convertedSQL, cached := h.getTransformedSQL(req.SQL, headerDB)
+	// Convert SQL to storage paths and check for parallel execution opportunity
+	convertedSQL, parallelInfo, cached := h.getTransformedSQLForParallel(req.SQL, headerDB)
 
 	if h.debugEnabled {
 		h.logger.Debug().
 			Str("original_sql", req.SQL).
 			Str("converted_sql", convertedSQL).
 			Bool("cache_hit", cached).
+			Bool("parallel", parallelInfo != nil).
 			Str("header_db", headerDB).
 			Msg("Executing query")
 	}
 
-	// Execute query
-	rows, err := h.db.Query(convertedSQL)
-	if err != nil {
-		m.IncQueryErrors()
-		h.logger.Error().Err(err).Str("sql", req.SQL).Msg("Query execution failed")
-		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
-			Success:         false,
-			Error:           "Query execution failed", // Don't expose database error details
-			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
-			Timestamp:       timestamp,
-		})
-	}
-	defer rows.Close()
+	var columns []string
+	var data [][]interface{}
+	var rowCount int
 
-	// Get column names
-	columns, err := rows.Columns()
-	if err != nil {
-		m.IncQueryErrors()
-		h.logger.Error().Err(err).Msg("Failed to get column names")
-		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
-			Success:         false,
-			Error:           "Query execution failed", // Don't expose database error details
-			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
-			Timestamp:       timestamp,
-		})
-	}
-
-	// Fetch results with optimized memory allocation
-	// Pre-allocate based on LIMIT clause or reasonable default
-	estimatedRows := extractLimit(req.SQL, 1000)
-	data := make([][]interface{}, 0, estimatedRows)
-	rowCount := 0
-	numCols := len(columns)
-
-	// Get scan buffer from pool to avoid allocating per row
-	buf := scanBufferPool.Get().(*scanBuffer)
-	buf.reset(numCols)
-	defer func() {
-		// Clear references before returning to pool to allow GC
-		for i := range buf.values {
-			buf.values[i] = nil
-		}
-		scanBufferPool.Put(buf)
-	}()
-
-	for rows.Next() {
-		if err := rows.Scan(buf.valuePtrs...); err != nil {
-			h.logger.Error().Err(err).Msg("Failed to scan row")
-			continue
+	// Execute query - use parallel path if available
+	if parallelInfo != nil && h.parallelExecutor != nil {
+		// Parallel partition execution
+		results, err := h.parallelExecutor.ExecutePartitioned(
+			context.Background(),
+			parallelInfo.Paths,
+			parallelInfo.QueryTemplate,
+			parallelInfo.ReadParquetOptions,
+		)
+		if err != nil {
+			m.IncQueryErrors()
+			h.logger.Error().Err(err).Str("sql", req.SQL).Msg("Parallel query execution failed")
+			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
+				Success:         false,
+				Error:           "Query execution failed",
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+				Timestamp:       timestamp,
+			})
 		}
 
-		// Convert values to JSON-serializable types (allocate only the output row)
-		row := make([]interface{}, numCols)
-		for i, v := range buf.values {
-			row[i] = h.convertValue(v)
+		// Create merged iterator
+		iter, err := query.NewMergedRowIterator(results, h.logger)
+		if err != nil {
+			// Close all results on error
+			for _, r := range results {
+				if r.Rows != nil {
+					r.Rows.Close()
+				}
+			}
+			m.IncQueryErrors()
+			h.logger.Error().Err(err).Msg("Failed to create merged iterator")
+			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
+				Success:         false,
+				Error:           "Query execution failed",
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+				Timestamp:       timestamp,
+			})
+		}
+		defer iter.Close()
+
+		columns = iter.Columns()
+		numCols := len(columns)
+		estimatedRows := extractLimit(req.SQL, 1000)
+		data = make([][]interface{}, 0, estimatedRows)
+
+		for iter.Next() {
+			values, err := iter.ScanBuffer()
+			if err != nil {
+				h.logger.Error().Err(err).Msg("Failed to scan row")
+				continue
+			}
+
+			row := make([]interface{}, numCols)
+			for i, v := range values {
+				row[i] = h.convertValue(v)
+			}
+			data = append(data, row)
+			rowCount++
 		}
 
-		data = append(data, row)
-		rowCount++
-	}
+		if err := iter.Err(); err != nil {
+			h.logger.Error().Err(err).Msg("Error iterating merged rows")
+		}
+	} else {
+		// Standard single-query execution
+		rows, err := h.db.Query(convertedSQL)
+		if err != nil {
+			m.IncQueryErrors()
+			h.logger.Error().Err(err).Str("sql", req.SQL).Msg("Query execution failed")
+			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
+				Success:         false,
+				Error:           "Query execution failed",
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+				Timestamp:       timestamp,
+			})
+		}
+		defer rows.Close()
 
-	if err := rows.Err(); err != nil {
-		h.logger.Error().Err(err).Msg("Error iterating rows")
+		// Get column names
+		columns, err = rows.Columns()
+		if err != nil {
+			m.IncQueryErrors()
+			h.logger.Error().Err(err).Msg("Failed to get column names")
+			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
+				Success:         false,
+				Error:           "Query execution failed",
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+				Timestamp:       timestamp,
+			})
+		}
+
+		// Fetch results with optimized memory allocation
+		estimatedRows := extractLimit(req.SQL, 1000)
+		data = make([][]interface{}, 0, estimatedRows)
+		numCols := len(columns)
+
+		// Get scan buffer from pool to avoid allocating per row
+		buf := scanBufferPool.Get().(*scanBuffer)
+		buf.reset(numCols)
+		defer func() {
+			for i := range buf.values {
+				buf.values[i] = nil
+			}
+			scanBufferPool.Put(buf)
+		}()
+
+		for rows.Next() {
+			if err := rows.Scan(buf.valuePtrs...); err != nil {
+				h.logger.Error().Err(err).Msg("Failed to scan row")
+				continue
+			}
+
+			row := make([]interface{}, numCols)
+			for i, v := range buf.values {
+				row[i] = h.convertValue(v)
+			}
+			data = append(data, row)
+			rowCount++
+		}
+
+		if err := rows.Err(); err != nil {
+			h.logger.Error().Err(err).Msg("Error iterating rows")
+		}
 	}
 
 	executionTime := float64(time.Since(start).Milliseconds())
@@ -1186,6 +1254,47 @@ func (h *QueryHandler) getTransformedSQL(sql string, headerDB string) (string, b
 
 	h.queryCache.Set(cacheKey, transformed)
 	return transformed, false
+}
+
+// getTransformedSQLForParallel returns the transformed SQL and parallel execution info.
+// This variant checks if the query can benefit from parallel partition scanning.
+// Only simple single-table queries with header DB can use parallel execution.
+// Returns (sql, parallel_info, cache_hit).
+func (h *QueryHandler) getTransformedSQLForParallel(sql string, headerDB string) (string, *ParallelQueryInfo, bool) {
+	sqlLower := strings.ToLower(sql)
+
+	// Fast paths that don't support parallel execution
+	if strings.Contains(sqlLower, "read_parquet") {
+		return sql, nil, true
+	}
+	if !strings.Contains(sqlLower, "from") && !strings.Contains(sqlLower, "join") {
+		return sql, nil, true
+	}
+
+	// Parallel execution only supported for simple single-table queries with header DB
+	// Complex queries (JOINs, subqueries, CTEs) fall back to standard execution
+	if headerDB == "" || !isSingleTableQuery(sqlLower) || strings.Contains(sqlLower, "with ") {
+		transformed, cached := h.getTransformedSQL(sql, headerDB)
+		return transformed, nil, cached
+	}
+
+	// Check for features that prevent fast path
+	features := scanSQLFeatures(sql)
+	if features.hasQuotes || features.hasDashComment || features.hasBlockComment {
+		transformed, cached := h.getTransformedSQL(sql, headerDB)
+		return transformed, nil, cached
+	}
+
+	// Rewrite time functions if present
+	if strings.Contains(sqlLower, "time_bucket") || strings.Contains(sqlLower, "date_trunc") {
+		sql = rewriteTimeBucket(sql)
+		sql = rewriteDateTrunc(sql)
+		sqlLower = strings.ToLower(sql)
+	}
+
+	// Use parallel-aware conversion
+	convertedSQL, parallelInfo := h.convertSingleTableQueryForParallel(sql, sqlLower, headerDB)
+	return convertedSQL, parallelInfo, false
 }
 
 // convertSQLToStoragePaths converts table references to storage paths
@@ -1313,9 +1422,31 @@ func (h *QueryHandler) getStoragePath(database, table string) string {
 	return storage.GetStoragePath(h.storage, database, table)
 }
 
+// buildReadParquetOptions builds the read_parquet options string.
+// Returns options like "union_by_name=true"
+// Note: column pruning via 'columns' parameter is not supported in current DuckDB version.
+// DuckDB handles projection pushdown internally when it sees which columns are actually used.
+func buildReadParquetOptions() string {
+	return "union_by_name=true"
+}
+
+// ParallelQueryInfo contains information for parallel partition execution.
+// When set, the query should be executed using the parallel executor.
+type ParallelQueryInfo struct {
+	// Paths contains the partition paths to execute in parallel
+	Paths []string
+	// QueryTemplate is the SQL with {PARTITION_PATH} placeholder
+	QueryTemplate string
+	// ReadParquetOptions are the options to pass to read_parquet
+	ReadParquetOptions string
+}
+
 // buildReadParquetExpr builds a read_parquet expression with optional partition pruning.
 // keyword is "FROM" or "JOIN" to prepend to the result.
 func (h *QueryHandler) buildReadParquetExpr(path, originalSQL, keyword string) string {
+	// Build options string
+	options := buildReadParquetOptions()
+
 	// Apply partition pruning
 	optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(path, originalSQL)
 
@@ -1335,14 +1466,62 @@ func (h *QueryHandler) buildReadParquetExpr(path, originalSQL, keyword string) s
 			}
 			pathsStr.WriteString("]")
 			h.logger.Info().Int("partition_count", len(pathList)).Str("keyword", keyword).Msg("Partition pruning: Using targeted paths")
-			return keyword + " read_parquet(" + pathsStr.String() + ", union_by_name=true)"
+			return keyword + " read_parquet(" + pathsStr.String() + ", " + options + ")"
 		} else if pathStr, ok := optimizedPath.(string); ok {
 			h.logger.Info().Str("optimized_path", pathStr).Str("keyword", keyword).Msg("Partition pruning: Using optimized path")
-			return keyword + " read_parquet('" + pathStr + "', union_by_name=true)"
+			return keyword + " read_parquet('" + pathStr + "', " + options + ")"
 		}
 	}
 
-	return keyword + " read_parquet('" + path + "', union_by_name=true)"
+	return keyword + " read_parquet('" + path + "', " + options + ")"
+}
+
+// buildReadParquetExprForParallel builds a read_parquet expression and returns
+// parallel execution info if the query can benefit from parallel partition scanning.
+// Returns (sql_expression, parallel_info) where parallel_info is non-nil if parallel is recommended.
+func (h *QueryHandler) buildReadParquetExprForParallel(path, originalSQL, keyword string) (string, *ParallelQueryInfo) {
+	options := buildReadParquetOptions()
+
+	// Apply partition pruning
+	optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(path, originalSQL)
+
+	if wasOptimized {
+		if pathList, ok := optimizedPath.([]string); ok {
+			// Check if parallel execution is recommended
+			if h.parallelExecutor != nil && h.parallelExecutor.ShouldUseParallel(len(pathList)) {
+				h.logger.Info().
+					Int("partition_count", len(pathList)).
+					Str("keyword", keyword).
+					Msg("Partition pruning: Using parallel execution")
+
+				// Return placeholder for template and parallel info
+				return keyword + " {PARTITION_PATH}", &ParallelQueryInfo{
+					Paths:              pathList,
+					ReadParquetOptions: options,
+				}
+			}
+
+			// Fall back to standard array syntax if parallel not recommended
+			var pathsStr strings.Builder
+			pathsStr.WriteString("[")
+			for i, p := range pathList {
+				if i > 0 {
+					pathsStr.WriteString(", ")
+				}
+				pathsStr.WriteString("'")
+				pathsStr.WriteString(p)
+				pathsStr.WriteString("'")
+			}
+			pathsStr.WriteString("]")
+			h.logger.Info().Int("partition_count", len(pathList)).Str("keyword", keyword).Msg("Partition pruning: Using targeted paths")
+			return keyword + " read_parquet(" + pathsStr.String() + ", " + options + ")", nil
+		} else if pathStr, ok := optimizedPath.(string); ok {
+			h.logger.Info().Str("optimized_path", pathStr).Str("keyword", keyword).Msg("Partition pruning: Using optimized path")
+			return keyword + " read_parquet('" + pathStr + "', " + options + ")", nil
+		}
+	}
+
+	return keyword + " read_parquet('" + path + "', " + options + ")", nil
 }
 
 // shouldSkipTableConversion returns true if the table name should not be converted to a storage path
@@ -1393,6 +1572,53 @@ func (h *QueryHandler) convertSingleTableQuery(sql, sqlLower, database string) s
 	replacement := h.buildReadParquetExpr(path, sql, "FROM")
 
 	return sql[:idx] + replacement + sql[end:]
+}
+
+// convertSingleTableQueryForParallel is a variant that returns parallel execution info.
+// Returns (converted_sql, parallel_info) where parallel_info is non-nil if parallel execution is recommended.
+func (h *QueryHandler) convertSingleTableQueryForParallel(sql, sqlLower, database string) (string, *ParallelQueryInfo) {
+	// Find "FROM table" position
+	idx := strings.Index(sqlLower, "from ")
+	if idx < 0 {
+		return sql, nil
+	}
+
+	start := idx + 5
+	// Skip whitespace after FROM
+	for start < len(sql) && (sql[start] == ' ' || sql[start] == '\t' || sql[start] == '\n') {
+		start++
+	}
+
+	// Find table name end
+	end := start
+	for end < len(sql) && isIdentChar(sql[end]) {
+		end++
+	}
+
+	if end == start {
+		return sql, nil // No table found, return original
+	}
+
+	tableName := sql[start:end]
+	tableLower := strings.ToLower(tableName)
+
+	// Skip system tables
+	if shouldSkipTableConversion(tableLower) {
+		return sql, nil
+	}
+
+	// Build replacement with parallel info
+	path := h.getStoragePath(database, tableName)
+	replacement, parallelInfo := h.buildReadParquetExprForParallel(path, sql, "FROM")
+
+	convertedSQL := sql[:idx] + replacement + sql[end:]
+
+	// Store the template in parallel info if parallel execution is needed
+	if parallelInfo != nil {
+		parallelInfo.QueryTemplate = convertedSQL
+	}
+
+	return convertedSQL, parallelInfo
 }
 
 // convertSQLToStoragePathsWithHeaderDB converts table references to storage paths using

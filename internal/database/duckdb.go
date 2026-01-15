@@ -111,6 +111,17 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		}
 	}
 
+	// Enable object cache for Parquet metadata - significantly improves repeated queries
+	// This caches Parquet file metadata (schema, row group info) reducing I/O on repeated access
+	if _, err := db.Exec("SET enable_object_cache=true"); err != nil {
+		logger.Warn().Err(err).Msg("Failed to enable object cache (continuing without it)")
+	}
+
+	// Preserve insertion order for deterministic results (important for LIMIT queries)
+	if _, err := db.Exec("SET preserve_insertion_order=true"); err != nil {
+		logger.Warn().Err(err).Msg("Failed to set preserve_insertion_order")
+	}
+
 	// Configure httpfs extension for S3 access if credentials are provided
 	if cfg.S3AccessKey != "" && cfg.S3SecretKey != "" {
 		if err := configureS3Access(db, cfg); err != nil {
