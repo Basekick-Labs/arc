@@ -656,8 +656,8 @@ func main() {
 	// Initialize HTTP server
 	serverConfig := &api.ServerConfig{
 		Port:            cfg.Server.Port,
-		ReadTimeout:     30 * time.Second,
-		WriteTimeout:    30 * time.Second,
+		ReadTimeout:     time.Duration(cfg.Server.ReadTimeout) * time.Second,
+		WriteTimeout:    time.Duration(cfg.Server.WriteTimeout) * time.Second,
 		IdleTimeout:     120 * time.Second,
 		ShutdownTimeout: 30 * time.Second,
 		MaxPayloadSize:  cfg.Server.MaxPayloadSize,
