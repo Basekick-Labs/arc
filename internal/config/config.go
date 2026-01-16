@@ -32,11 +32,13 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Host           string
-	Port           int
-	ReadTimeout    int
-	WriteTimeout   int
-	MaxPayloadSize int64 // Maximum request payload size in bytes (applies to both compressed and decompressed)
+	Host            string
+	Port            int
+	ReadTimeout     int
+	WriteTimeout    int
+	IdleTimeout     int // Connection idle timeout in seconds
+	ShutdownTimeout int // Graceful shutdown timeout in seconds
+	MaxPayloadSize  int64 // Maximum request payload size in bytes (applies to both compressed and decompressed)
 	// TLS Configuration
 	TLSEnabled  bool   // Enable HTTPS/TLS
 	TLSCertFile string // Path to TLS certificate file (PEM format)
@@ -266,9 +268,11 @@ func Load() (*Config, error) {
 		Server: ServerConfig{
 			Host:           v.GetString("server.host"),
 			Port:           v.GetInt("server.port"),
-			ReadTimeout:    v.GetInt("server.read_timeout"),
-			WriteTimeout:   v.GetInt("server.write_timeout"),
-			MaxPayloadSize: maxPayloadSize,
+			ReadTimeout:     v.GetInt("server.read_timeout"),
+			WriteTimeout:    v.GetInt("server.write_timeout"),
+			IdleTimeout:     v.GetInt("server.idle_timeout"),
+			ShutdownTimeout: v.GetInt("server.shutdown_timeout"),
+			MaxPayloadSize:  maxPayloadSize,
 			TLSEnabled:     v.GetBool("server.tls_enabled"),
 			TLSCertFile:    v.GetString("server.tls_cert_file"),
 			TLSKeyFile:     v.GetString("server.tls_key_file"),
@@ -426,6 +430,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("server.port", 8000)
 	v.SetDefault("server.read_timeout", 30)
 	v.SetDefault("server.write_timeout", 30)
+	v.SetDefault("server.idle_timeout", 120)
+	v.SetDefault("server.shutdown_timeout", 30)
 	// Max payload size default - 1GB
 	v.SetDefault("server.max_payload_size", "1GB")
 	// TLS defaults - disabled by default for backward compatibility
