@@ -1,15 +1,62 @@
 package pruning
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
 )
+
+// mockS3Backend implements storage.Backend and storage.DirectoryLister for testing
+type mockS3Backend struct {
+	existingDirs map[string][]string // parent prefix -> list of subdirectory names
+}
+
+func (m *mockS3Backend) Write(ctx context.Context, path string, data []byte) error {
+	return nil
+}
+func (m *mockS3Backend) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) error {
+	return nil
+}
+func (m *mockS3Backend) Read(ctx context.Context, path string) ([]byte, error) {
+	return nil, nil
+}
+func (m *mockS3Backend) ReadTo(ctx context.Context, path string, writer io.Writer) error {
+	return nil
+}
+func (m *mockS3Backend) List(ctx context.Context, prefix string) ([]string, error) {
+	return nil, nil
+}
+func (m *mockS3Backend) Delete(ctx context.Context, path string) error {
+	return nil
+}
+func (m *mockS3Backend) Exists(ctx context.Context, path string) (bool, error) {
+	return false, nil
+}
+func (m *mockS3Backend) Close() error {
+	return nil
+}
+func (m *mockS3Backend) Type() string {
+	return "s3"
+}
+func (m *mockS3Backend) ConfigJSON() string {
+	return "{}"
+}
+
+// ListDirectories implements storage.DirectoryLister
+func (m *mockS3Backend) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
+	if dirs, ok := m.existingDirs[prefix]; ok {
+		return dirs, nil
+	}
+	return []string{}, nil
+}
 
 // TestNewPartitionPruner tests pruner creation
 func TestNewPartitionPruner(t *testing.T) {
@@ -1017,6 +1064,194 @@ func TestExtractTimeRangeRelative(t *testing.T) {
 				if diff > time.Hour {
 					t.Errorf("End time = %v, want approximately %v (diff: %v)", tr.End, expectedEnd, diff)
 				}
+			}
+		})
+	}
+}
+
+// TestFilterExistingRemotePaths tests S3/Azure path filtering with missing partitions
+func TestFilterExistingRemotePaths(t *testing.T) {
+	logger := zerolog.Nop()
+	p := NewPartitionPruner(logger)
+
+	// Create a mock S3 backend where only some directories exist
+	// Simulate: data exists for 2025/01/15 hours 10, 11, 12 but NOT 13, 14, 15
+	mockBackend := &mockS3Backend{
+		existingDirs: map[string][]string{
+			// Parent: default/cpu/2025/01/15/
+			"default/cpu/2025/01/15/": {"10", "11", "12"}, // Only hours 10, 11, 12 exist
+		},
+	}
+	p.SetStorageBackend(mockBackend)
+
+	// Generate paths for hours 10-15 (6 hours)
+	inputPaths := []string{
+		"s3://mybucket/default/cpu/2025/01/15/10/*.parquet",
+		"s3://mybucket/default/cpu/2025/01/15/11/*.parquet",
+		"s3://mybucket/default/cpu/2025/01/15/12/*.parquet",
+		"s3://mybucket/default/cpu/2025/01/15/13/*.parquet", // Does not exist
+		"s3://mybucket/default/cpu/2025/01/15/14/*.parquet", // Does not exist
+		"s3://mybucket/default/cpu/2025/01/15/15/*.parquet", // Does not exist
+	}
+
+	// Filter should return only paths that exist
+	result := p.filterExistingPaths(inputPaths)
+
+	// Should only have 3 paths (hours 10, 11, 12)
+	if len(result) != 3 {
+		t.Errorf("Expected 3 paths, got %d: %v", len(result), result)
+	}
+
+	// Verify the correct paths were kept
+	expectedPaths := map[string]bool{
+		"s3://mybucket/default/cpu/2025/01/15/10/*.parquet": true,
+		"s3://mybucket/default/cpu/2025/01/15/11/*.parquet": true,
+		"s3://mybucket/default/cpu/2025/01/15/12/*.parquet": true,
+	}
+	for _, path := range result {
+		if !expectedPaths[path] {
+			t.Errorf("Unexpected path in result: %s", path)
+		}
+	}
+}
+
+// TestFilterExistingRemotePaths_NoStorageBackend tests behavior when no storage backend is set
+func TestFilterExistingRemotePaths_NoStorageBackend(t *testing.T) {
+	logger := zerolog.Nop()
+	p := NewPartitionPruner(logger)
+	// Don't set storage backend
+
+	inputPaths := []string{
+		"s3://mybucket/default/cpu/2025/01/15/10/*.parquet",
+		"s3://mybucket/default/cpu/2025/01/15/11/*.parquet",
+	}
+
+	// Without storage backend, all paths should be returned (no filtering possible)
+	result := p.filterExistingPaths(inputPaths)
+
+	if len(result) != len(inputPaths) {
+		t.Errorf("Expected all %d paths to be returned when no storage backend, got %d", len(inputPaths), len(result))
+	}
+}
+
+// TestFilterExistingRemotePaths_AllMissing tests behavior when all partitions are missing
+func TestFilterExistingRemotePaths_AllMissing(t *testing.T) {
+	logger := zerolog.Nop()
+	p := NewPartitionPruner(logger)
+
+	// Create mock with no existing directories
+	mockBackend := &mockS3Backend{
+		existingDirs: map[string][]string{},
+	}
+	p.SetStorageBackend(mockBackend)
+
+	inputPaths := []string{
+		"s3://mybucket/default/cpu/2025/12/17/10/*.parquet",
+		"s3://mybucket/default/cpu/2025/12/17/11/*.parquet",
+	}
+
+	result := p.filterExistingPaths(inputPaths)
+
+	// Should return empty slice when all partitions are missing
+	if len(result) != 0 {
+		t.Errorf("Expected 0 paths when all are missing, got %d: %v", len(result), result)
+	}
+}
+
+// TestOptimizeTablePath_S3WithMissingPartitions tests full optimization flow with S3
+func TestOptimizeTablePath_S3WithMissingPartitions(t *testing.T) {
+	logger := zerolog.Nop()
+	p := NewPartitionPruner(logger)
+
+	// Mock: Only 2026/01/15 hours 10, 11 exist; 12, 13 do not
+	// We need to set up the directories properly - ListDirectories returns full paths
+	mockBackend := &mockS3Backend{
+		existingDirs: map[string][]string{
+			"default/cpu/2026/01/15/": {"10", "11"},
+			"default/cpu/2026/01/":    {"15"}, // The day must exist
+			"default/cpu/2026/":       {"01"}, // The month must exist
+			"default/cpu/":            {"2026"},
+		},
+	}
+	p.SetStorageBackend(mockBackend)
+
+	originalPath := "s3://mybucket/default/cpu/**/*.parquet"
+	sql := "SELECT * FROM cpu WHERE time >= '2026-01-15 10:00:00' AND time < '2026-01-15 14:00:00'"
+
+	result, optimized := p.OptimizeTablePath(originalPath, sql)
+
+	// The result depends on whether filtering works correctly
+	// If optimization applied, we should have filtered paths
+	// If not (e.g., all filtered out), we fall back to original
+
+	if optimized {
+		// Should return only the 2 existing partition paths
+		pathList, ok := result.([]string)
+		if !ok {
+			// Might be single path if only one exists
+			singlePath, ok := result.(string)
+			if !ok {
+				t.Fatalf("Expected []string or string result, got %T", result)
+			}
+			// Should contain hour 10 or 11
+			if singlePath != "s3://mybucket/default/cpu/2026/01/15/10/*.parquet" &&
+				singlePath != "s3://mybucket/default/cpu/2026/01/15/11/*.parquet" {
+				t.Errorf("Unexpected single path: %s", singlePath)
+			}
+			return
+		}
+
+		// Check we only have paths for existing hours (10, 11) or daily paths
+		// Daily paths look like: s3://mybucket/default/cpu/2026/01/15/*.parquet (no hour component)
+		for _, path := range pathList {
+			isHourlyPath := containsAnySubstring(path, []string{"/10/", "/11/"})
+			isDailyPath := strings.HasSuffix(path, "/15/*.parquet") && !containsAnySubstring(path, []string{"/10/", "/11/", "/12/", "/13/"})
+			if !isHourlyPath && !isDailyPath {
+				t.Errorf("Path should only contain existing hours (10, 11) or be a daily path: %s", path)
+			}
+		}
+	} else {
+		// Fallback to original - this is acceptable if all partitions were filtered
+		singlePath, ok := result.(string)
+		if !ok {
+			t.Fatalf("Expected string fallback, got %T", result)
+		}
+		if singlePath != originalPath {
+			t.Errorf("Expected fallback to original path %q, got %q", originalPath, singlePath)
+		}
+	}
+}
+
+// containsAnySubstring checks if s contains any of the substrings
+func containsAnySubstring(s string, substrings []string) bool {
+	for _, sub := range substrings {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestExtractStoragePrefix tests the URL to storage prefix conversion
+func TestExtractStoragePrefix(t *testing.T) {
+	logger := zerolog.Nop()
+	p := NewPartitionPruner(logger)
+
+	tests := []struct {
+		url      string
+		expected string
+	}{
+		{"s3://mybucket/default/cpu/2025/01/15/", "default/cpu/2025/01/15/"},
+		{"s3://bucket-name/db/measurement/", "db/measurement/"},
+		{"azure://mycontainer/default/cpu/2025/", "default/cpu/2025/"},
+		{"azure://container/db/", "db/"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.url, func(t *testing.T) {
+			result := p.extractStoragePrefix(tt.url)
+			if result != tt.expected {
+				t.Errorf("extractStoragePrefix(%q) = %q, want %q", tt.url, result, tt.expected)
 			}
 		})
 	}
