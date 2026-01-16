@@ -100,6 +100,7 @@ Arrow IPC format provides 2x throughput vs JSON for large result sets:
 **Best throughput:**
 - Arrow: **2.64M rows/sec** (1M row SELECT)
 - JSON: **1.27M rows/sec** (1M row SELECT)
+- COUNT(*): **12-19B rows/sec** (134M rows, 7-11ms)
 
 ---
 
