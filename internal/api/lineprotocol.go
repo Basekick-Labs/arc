@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"regexp"
 	"sync"
 	"sync/atomic"
 
@@ -39,6 +40,18 @@ type LineProtocolHandler struct {
 	totalBytes        atomic.Int64
 	totalBytesGzipped atomic.Int64
 	totalErrors       atomic.Int64
+}
+
+// Measurement name validation - must start with letter, contain only alphanumeric, underscore, or hyphen
+// This prevents XML-illegal control characters from corrupting S3 ListObjectsV2 responses
+var validMeasurementName = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_-]*$`)
+
+// isValidMeasurementName validates a measurement name
+func isValidMeasurementName(name string) bool {
+	if len(name) == 0 || len(name) > 128 {
+		return false
+	}
+	return validMeasurementName.MatchString(name)
 }
 
 // NewLineProtocolHandler creates a new Line Protocol handler
@@ -256,6 +269,16 @@ localProcessing:
 			h.totalErrors.Add(1)
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 				"error": err.Error(),
+			})
+		}
+	}
+
+	// Validate measurement names (prevent control chars that break S3 XML responses)
+	for measurement := range columnarByMeasurement {
+		if !isValidMeasurementName(measurement) {
+			h.totalErrors.Add(1)
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": fmt.Sprintf("invalid measurement name %q: must start with a letter and contain only alphanumeric characters, underscores, or hyphens", measurement),
 			})
 		}
 	}
