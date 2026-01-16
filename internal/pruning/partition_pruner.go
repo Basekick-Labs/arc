@@ -1,6 +1,7 @@
 package pruning
 
 import (
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
 
@@ -262,6 +264,7 @@ type PartitionPruner struct {
 	stats          PrunerStats
 	globCache      *globCache
 	partitionCache *partitionCache
+	storage        storage.Backend // Optional storage backend for S3/Azure path validation
 }
 
 // PrunerStats tracks partition pruning statistics using atomic counters for thread-safety
@@ -322,6 +325,12 @@ func NewPartitionPruner(logger zerolog.Logger) *PartitionPruner {
 		globCache:      newGlobCache(GlobCacheTTL),
 		partitionCache: newPartitionCache(PartitionCacheTTL),
 	}
+}
+
+// SetStorageBackend sets the storage backend for remote path validation (S3/Azure).
+// When set, the pruner will filter out non-existent partition paths before returning them.
+func (p *PartitionPruner) SetStorageBackend(backend storage.Backend) {
+	p.storage = backend
 }
 
 // ExtractTimeRange extracts time range from WHERE clause
@@ -455,6 +464,10 @@ func (p *PartitionPruner) GeneratePartitionPaths(basePath, database, measurement
 	paths := []string{}
 	daysMap := make(map[string]bool)
 
+	// Detect if this is a remote path (S3/Azure) - use string concatenation instead of filepath.Join
+	// because filepath.Join will mangle URLs like s3://bucket to s3:/bucket
+	isRemote := strings.HasPrefix(basePath, "s3://") || strings.HasPrefix(basePath, "azure://")
+
 	// Generate hour-by-hour paths
 	current := timeRange.Start.Truncate(time.Hour)
 	end := timeRange.End
@@ -470,7 +483,13 @@ func (p *PartitionPruner) GeneratePartitionPaths(basePath, database, measurement
 		daysMap[dayKey] = true
 
 		// Build path for this hour partition (hourly compacted files)
-		hourPath := filepath.Join(basePath, database, measurement, year, month, day, hour, "*.parquet")
+		var hourPath string
+		if isRemote {
+			// Use string concatenation for remote URLs to preserve protocol://
+			hourPath = basePath + "/" + database + "/" + measurement + "/" + year + "/" + month + "/" + day + "/" + hour + "/*.parquet"
+		} else {
+			hourPath = filepath.Join(basePath, database, measurement, year, month, day, hour, "*.parquet")
+		}
 		paths = append(paths, hourPath)
 
 		current = current.Add(time.Hour)
@@ -479,7 +498,12 @@ func (p *PartitionPruner) GeneratePartitionPaths(basePath, database, measurement
 	// Add day-level paths for daily compacted files
 	// Daily compacted files are stored at /year/month/day/*.parquet (not in hour subdirs)
 	for dayKey := range daysMap {
-		dayPath := filepath.Join(basePath, database, measurement, dayKey, "*.parquet")
+		var dayPath string
+		if isRemote {
+			dayPath = basePath + "/" + database + "/" + measurement + "/" + dayKey + "/*.parquet"
+		} else {
+			dayPath = filepath.Join(basePath, database, measurement, dayKey, "*.parquet")
+		}
 		paths = append(paths, dayPath)
 	}
 
@@ -549,14 +573,12 @@ func (p *PartitionPruner) OptimizeTablePath(originalPath, sql string) (interface
 		return originalPath, false
 	}
 
-	// Filter out non-existent paths for local storage
-	if strings.HasPrefix(basePath, "/") || strings.HasPrefix(basePath, ".") {
-		partitionPaths = p.filterExistingPaths(partitionPaths)
-		if len(partitionPaths) == 0 {
-			p.logger.Info().Msg("No data exists for time range, using fallback")
-			p.partitionCache.set(cacheKey, originalPath, false)
-			return originalPath, false
-		}
+	// Filter out non-existent paths (works for both local and S3/Azure storage)
+	partitionPaths = p.filterExistingPaths(partitionPaths)
+	if len(partitionPaths) == 0 {
+		p.logger.Info().Msg("No data exists for time range, using fallback")
+		p.partitionCache.set(cacheKey, originalPath, false)
+		return originalPath, false
 	}
 
 	var result interface{}
@@ -625,7 +647,24 @@ func parseDateTime(timeStr string) (time.Time, error) {
 
 // filterExistingPaths filters out paths that don't have any matching files
 // Uses a TTL cache to avoid repeated expensive filesystem operations
+// Handles both local and remote (S3/Azure) paths
 func (p *PartitionPruner) filterExistingPaths(paths []string) []string {
+	if len(paths) == 0 {
+		return paths
+	}
+
+	// Check if this is remote storage (S3/Azure)
+	firstPath := paths[0]
+	if strings.HasPrefix(firstPath, "s3://") || strings.HasPrefix(firstPath, "azure://") {
+		return p.filterExistingRemotePaths(paths)
+	}
+
+	// Local path filtering using filepath.Glob
+	return p.filterExistingLocalPaths(paths)
+}
+
+// filterExistingLocalPaths filters local paths using filepath.Glob
+func (p *PartitionPruner) filterExistingLocalPaths(paths []string) []string {
 	existingPaths := []string{}
 
 	for _, pattern := range paths {
@@ -659,9 +698,143 @@ func (p *PartitionPruner) filterExistingPaths(paths []string) []string {
 	p.logger.Info().
 		Int("original_count", len(paths)).
 		Int("existing_count", len(existingPaths)).
-		Msg("Filtered existing paths")
+		Msg("Filtered existing local paths")
 
 	return existingPaths
+}
+
+// filterExistingRemotePaths filters S3/Azure paths by checking which directories exist
+func (p *PartitionPruner) filterExistingRemotePaths(paths []string) []string {
+	if p.storage == nil {
+		// No storage backend configured - return all paths and let DuckDB handle errors
+		p.logger.Debug().Msg("No storage backend configured, skipping remote path filtering")
+		return paths
+	}
+
+	lister, ok := p.storage.(storage.DirectoryLister)
+	if !ok {
+		// Storage backend doesn't support directory listing
+		p.logger.Debug().Msg("Storage backend doesn't support directory listing, skipping filtering")
+		return paths
+	}
+
+	// Extract unique parent directories to check
+	// Path format: s3://bucket/db/measurement/2025/12/17/16/*.parquet
+	// We need to check if the hour directory exists
+	dirsToCheck := make(map[string]struct{})
+	pathToDir := make(map[string]string)
+
+	for _, path := range paths {
+		// Remove the glob suffix to get the directory
+		dir := strings.TrimSuffix(path, "/*.parquet")
+		// Also handle daily paths without hour component
+		dir = strings.TrimSuffix(dir, "/*.parquet")
+		dirsToCheck[dir] = struct{}{}
+		pathToDir[path] = dir
+	}
+
+	// Check which directories exist
+	// We need to extract the prefix and list directories at the parent level
+	existingDirs := make(map[string]bool)
+
+	for dir := range dirsToCheck {
+		// Check cache first
+		cacheKey := "remote:" + dir
+		if matches, ok := p.globCache.get(cacheKey); ok {
+			existingDirs[dir] = len(matches) > 0
+			if len(matches) > 0 {
+				p.logger.Debug().Str("dir", dir).Msg("Remote directory exists (cached)")
+			}
+			continue
+		}
+
+		// Extract the parent directory and the target directory name
+		// e.g., s3://bucket/db/measurement/2025/12/17/16 -> parent: s3://bucket/db/measurement/2025/12/17/, target: 16
+		lastSlash := strings.LastIndex(dir, "/")
+		if lastSlash == -1 {
+			continue
+		}
+
+		parentDir := dir[:lastSlash+1] // Include trailing slash
+		targetName := dir[lastSlash+1:]
+
+		// Convert S3 URL to storage prefix
+		// s3://bucket/db/measurement/2025/12/17/ -> db/measurement/2025/12/17/
+		storagePrefix := p.extractStoragePrefix(parentDir)
+
+		// List directories at the parent level
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		subdirs, err := lister.ListDirectories(ctx, storagePrefix)
+		cancel()
+
+		if err != nil {
+			p.logger.Debug().Err(err).Str("prefix", storagePrefix).Msg("Failed to list remote directories")
+			// On error, assume directory exists to avoid false negatives
+			existingDirs[dir] = true
+			p.globCache.set(cacheKey, []string{dir})
+			continue
+		}
+
+		// Check if our target directory is in the list
+		found := false
+		for _, subdir := range subdirs {
+			// subdirs come back as "db/measurement/2025/12/17/16/" - extract just the name
+			subdir = strings.TrimSuffix(subdir, "/")
+			subdirName := subdir
+			if idx := strings.LastIndex(subdir, "/"); idx != -1 {
+				subdirName = subdir[idx+1:]
+			}
+			if subdirName == targetName {
+				found = true
+				break
+			}
+		}
+
+		existingDirs[dir] = found
+		if found {
+			p.globCache.set(cacheKey, []string{dir})
+			p.logger.Debug().Str("dir", dir).Msg("Remote directory exists")
+		} else {
+			p.globCache.set(cacheKey, []string{})
+			p.logger.Debug().Str("dir", dir).Msg("Remote directory does not exist")
+		}
+	}
+
+	// Filter paths to only include existing directories
+	existingPaths := []string{}
+	for _, path := range paths {
+		dir := pathToDir[path]
+		if existingDirs[dir] {
+			existingPaths = append(existingPaths, path)
+		}
+	}
+
+	p.logger.Info().
+		Int("original_count", len(paths)).
+		Int("existing_count", len(existingPaths)).
+		Msg("Filtered existing remote paths")
+
+	return existingPaths
+}
+
+// extractStoragePrefix converts an S3/Azure URL to a storage prefix
+// e.g., s3://bucket/db/measurement/2025/ -> db/measurement/2025/
+func (p *PartitionPruner) extractStoragePrefix(url string) string {
+	// Remove protocol prefix
+	if strings.HasPrefix(url, "s3://") {
+		url = strings.TrimPrefix(url, "s3://")
+		// Remove bucket name (first path component)
+		if idx := strings.Index(url, "/"); idx != -1 {
+			return url[idx+1:]
+		}
+	} else if strings.HasPrefix(url, "azure://") {
+		url = strings.TrimPrefix(url, "azure://")
+		// Remove container name (first path component)
+		if idx := strings.Index(url, "/"); idx != -1 {
+			return url[idx+1:]
+		}
+	}
+	return url
 }
 
 // InvalidateGlobCache clears the glob cache

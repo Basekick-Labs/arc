@@ -661,10 +661,12 @@ func validateWhereClauseQuery(where string) error {
 // NewQueryHandler creates a new query handler
 func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolog.Logger) *QueryHandler {
 	handlerLogger := logger.With().Str("component", "query-handler").Logger()
+	pruner := pruning.NewPartitionPruner(logger)
+	pruner.SetStorageBackend(storage) // Enable S3/Azure partition filtering
 	return &QueryHandler{
 		db:               db,
 		storage:          storage,
-		pruner:           pruning.NewPartitionPruner(logger),
+		pruner:           pruner,
 		queryCache:       database.NewQueryCache(database.QueryCacheTTL, database.DefaultQueryCacheMaxSize),
 		logger:           handlerLogger,
 		authManager:      nil,
