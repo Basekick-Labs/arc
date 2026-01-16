@@ -230,6 +230,11 @@ func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
 	if req.DestinationMeasurement == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "destination_measurement is required"})
 	}
+	if !isValidMeasurementName(req.DestinationMeasurement) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid destination_measurement: must start with a letter and contain only alphanumeric characters, underscores, or hyphens",
+		})
+	}
 	if req.Query == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "query is required"})
 	}
@@ -319,6 +324,13 @@ func (h *ContinuousQueryHandler) handleUpdate(c *fiber.Ctx) error {
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Invalid request body: " + err.Error(),
+		})
+	}
+
+	// Validate destination_measurement if provided
+	if req.DestinationMeasurement != "" && !isValidMeasurementName(req.DestinationMeasurement) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid destination_measurement: must start with a letter and contain only alphanumeric characters, underscores, or hyphens",
 		})
 	}
 

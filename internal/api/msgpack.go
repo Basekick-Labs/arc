@@ -298,10 +298,20 @@ localProcessing:
 		database = "default"
 	}
 
+	// Extract measurements for validation and RBAC
+	measurements := h.extractMeasurements(records)
+
+	// Validate measurement names (prevent control chars that break S3 XML responses)
+	for _, measurement := range measurements {
+		if !isValidMeasurementName(measurement) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": fmt.Sprintf("invalid measurement name %q: must start with a letter and contain only alphanumeric characters, underscores, or hyphens", measurement),
+			})
+		}
+	}
+
 	// Check RBAC permissions for all measurements being written (only if RBAC is enabled)
-	// Skip measurement extraction when RBAC is disabled - it's O(n) on all records
 	if h.rbacManager != nil && h.rbacManager.IsRBACEnabled() {
-		measurements := h.extractMeasurements(records)
 		if err := h.checkWritePermissions(c, database, measurements); err != nil {
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 				"error": err.Error(),
