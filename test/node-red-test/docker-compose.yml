@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  nodered:
+    image: nodered/node-red:latest
+    ports:
+      - "1880:1880"
+    volumes:
+      - ./nodered-data:/data
+    environment:
+      - TZ=UTC
+    # Use host network to reach Arc running on host
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

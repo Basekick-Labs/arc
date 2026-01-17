@@ -160,6 +160,47 @@ WHERE time > NOW() - INTERVAL '4 minutes'
 
 ## Bug Fixes
 
+### Control Characters in Measurement Names Break S3 (Issue #122)
+
+Fixed an issue where measurement names containing ASCII control characters (0x01-0x08, 0x0B-0x0C, 0x0E-0x1F) would cause S3 ListObjectsV2 operations to fail with XML parsing errors.
+
+**Cause:** S3 returns XML 1.0 responses which forbid certain control characters. Measurement names from Line Protocol, MsgPack, and Continuous Query endpoints were not validated, allowing invalid characters to be used as S3 key prefixes.
+
+**Fix:** Added strict validation for measurement names across all ingestion endpoints:
+- Must start with a letter (a-z, A-Z)
+- May only contain alphanumeric characters, underscores, and hyphens
+- Maximum length of 128 characters
+
+**Affected endpoints:**
+- `/write` and `/api/v2/write` (Line Protocol)
+- `/api/v1/write/msgpack` (MsgPack)
+- `/api/v1/continuous-queries` (Continuous Query create/update)
+
+Invalid measurement names now return a `400 Bad Request` with a descriptive error message.
+
+### Partition Pruner Fails on Non-Existent S3 Partitions (Issue #125)
+
+Fixed an issue where time-filtered queries would fail with "No files found" errors when the requested time range included partitions that don't exist in S3 storage.
+
+**Cause:** The partition pruner generated paths for all hours in a time range without verifying existence. For local storage, it used `filepath.Glob()` to filter paths, but for S3/Azure storage, paths were passed directly to DuckDB which threw errors for missing partitions.
+
+**Fix:** Extended `filterExistingPaths()` to handle S3/Azure storage:
+- Uses `ListDirectories()` to verify which partition paths actually exist
+- Filters out non-existent partitions before passing to DuckDB
+- Also fixed a pre-existing bug where `filepath.Join()` was mangling S3 URLs (`s3://bucket` → `s3:/bucket`)
+
+**Result:** Queries on sparse datasets (with gaps in time partitions) now succeed and return data from existing partitions instead of failing.
+
+### Server Timeout Config Values Ignored (Issue #126)
+
+Fixed an issue where `server.read_timeout` and `server.write_timeout` configuration values were ignored, with the server always using hardcoded 30-second timeouts.
+
+**Cause:** The timeout values in `cmd/arc/main.go` were hardcoded to 30 seconds instead of using the loaded configuration values.
+
+**Fix:** Now uses `cfg.Server.ReadTimeout` and `cfg.Server.WriteTimeout` from the configuration, allowing users to customize timeouts via `arc.toml` or environment variables (`ARC_SERVER_READ_TIMEOUT`, `ARC_SERVER_WRITE_TIMEOUT`).
+
+**Note:** Default values remain at 30 seconds for backward compatibility.
+
 ### Large Payload Ingestion (413 Request Entity Too Large)
 
 Fixed an issue where large ingestion requests (>4MB) would fail with `413 Request Entity Too Large` even though `server.max_payload_size` was configured to allow larger payloads (default: 1GB).
@@ -222,6 +263,25 @@ Fixed critical memory issues in the compactor that caused OOM kills and DuckDB s
 **Optional profiling:** Set `ARC_COMPACTION_PROFILE=1` to enable heap profiling during compaction (writes to `/tmp/arc_compaction_heap.pprof`).
 
 ## Improvements
+
+### Configurable Server Idle and Shutdown Timeouts
+
+Server idle timeout and graceful shutdown timeout are now configurable instead of being hardcoded.
+
+**New configuration options:**
+| Setting | Config Key | Environment Variable | Default |
+|---------|------------|---------------------|---------|
+| Idle Timeout | `server.idle_timeout` | `ARC_SERVER_IDLE_TIMEOUT` | 120 seconds |
+| Shutdown Timeout | `server.shutdown_timeout` | `ARC_SERVER_SHUTDOWN_TIMEOUT` | 30 seconds |
+
+**Example configuration:**
+```toml
+[server]
+idle_timeout = 300      # 5 minutes
+shutdown_timeout = 60   # 1 minute
+```
+
+This completes the server timeout configuration options alongside the existing `read_timeout` and `write_timeout` settings.
 
 ### Automatic Time Function Query Optimization (GROUP BY Performance)
 
