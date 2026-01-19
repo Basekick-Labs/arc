@@ -53,7 +53,7 @@ func TestExtractNewestFileTime(t *testing.T) {
 		{
 			name: "daily compacted file",
 			files: []string{
-				"default/metrics/2026/01/01/metrics_20260102_daily.parquet",
+				"default/metrics/2026/01/01/metrics_20260102_000000_daily.parquet",
 			},
 			expected: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
 		},
@@ -62,7 +62,7 @@ func TestExtractNewestFileTime(t *testing.T) {
 			files: []string{
 				"default/metrics/2026/01/01/00/metrics_20260101_120000_123456789.parquet",
 				"default/metrics/2026/01/01/01/metrics_20260101_130000_987654321.parquet",
-				"default/metrics/2026/01/01/metrics_20260102_daily.parquet",
+				"default/metrics/2026/01/01/metrics_20260102_000000_daily.parquet",
 			},
 			expected: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
 		},
