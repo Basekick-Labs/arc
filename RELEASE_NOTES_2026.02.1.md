@@ -255,6 +255,20 @@ Fixed compaction failures on S3-compatible storage services (Hetzner, MinIO, etc
 - Subprocess defaulted to HTTP when main process used HTTPS (port mismatch)
 - Fix: `use_ssl` config now included in subprocess configuration
 
+### Query Failures with Non-UTF8 Data (Issue #136)
+
+Fixed query failures caused by non-UTF-8 characters in ingested data. Users ingesting rsyslog messages or data containing binary/non-UTF-8 content would encounter DuckDB query errors like "is not valid UTF8" when querying the data.
+
+**Root cause:** Arc had no UTF-8 validation in the ingestion pipeline. Non-UTF-8 bytes passed through to Parquet files, which DuckDB then rejected at query time.
+
+**Fix:** Added automatic UTF-8 sanitization during ingestion:
+- Invalid UTF-8 sequences are replaced with the Unicode replacement character (U+FFFD)
+- Applies to both MessagePack and Line Protocol string fields
+- Optimized fast-path: valid UTF-8 (99%+ of data) adds only ~6-25ns overhead with zero allocations
+- Batch-level logging warns when sanitization occurs (avoids log spam)
+
+**Impact:** Data with invalid UTF-8 is now queryable. Users see a warning log when sanitization occurs, making it visible without breaking the ingestion flow.
+
 ### Arrow Writer Panic During High-Concurrency Writes (Issue #130)
 
 Fixed a panic that occurred during high-concurrency writes when batches had different column sets (schema evolution).
