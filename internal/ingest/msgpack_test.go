@@ -298,6 +298,11 @@ func TestMessagePackDecoder_ExtractTimestamp(t *testing.T) {
 			wantUnit: "microseconds",
 		},
 		{
+			name:     "nanoseconds timestamp",
+			input:    int64(1609459200000000000),
+			wantUnit: "nanoseconds",
+		},
+		{
 			name:     "nil timestamp (uses current time)",
 			input:    nil,
 			wantUnit: "current",
@@ -392,6 +397,11 @@ func TestMessagePackDecoder_NormalizeTimestamps(t *testing.T) {
 			name:     "microseconds unchanged",
 			input:    []interface{}{int64(1609459200000000)},
 			expected: 1609459200000000,
+		},
+		{
+			name:     "nanoseconds to microseconds",
+			input:    []interface{}{int64(1609459200000000000)}, // 19 digits
+			expected: 1609459200000000,                          // 16 digits
 		},
 	}
 
