@@ -369,15 +369,23 @@ func (d *MessagePackDecoder) extractTimestamp(t interface{}) (time.Time, error) 
 	}
 
 	// Auto-detect unit and convert to time.Time
+	// Ranges (approximate for year 2026):
+	//   Seconds:      ~1.7e9  (10 digits)
+	//   Milliseconds: ~1.7e12 (13 digits)
+	//   Microseconds: ~1.7e15 (16 digits)
+	//   Nanoseconds:  ~1.7e18 (19 digits)
 	if ts < 1e10 {
 		// Seconds
 		return time.Unix(ts, 0).UTC(), nil
 	} else if ts < 1e13 {
 		// Milliseconds
 		return time.UnixMilli(ts).UTC(), nil
-	} else {
+	} else if ts < 1e16 {
 		// Microseconds
 		return time.UnixMicro(ts).UTC(), nil
+	} else {
+		// Nanoseconds - convert to microseconds
+		return time.UnixMicro(ts / 1000).UTC(), nil
 	}
 }
 
@@ -430,6 +438,11 @@ func (d *MessagePackDecoder) normalizeTimestamps(columns map[string][]interface{
 	}
 
 	// Determine multiplier based on detected unit
+	// Ranges (approximate for year 2026):
+	//   Seconds:      ~1.7e9  (10 digits)
+	//   Milliseconds: ~1.7e12 (13 digits)
+	//   Microseconds: ~1.7e15 (16 digits)
+	//   Nanoseconds:  ~1.7e18 (19 digits)
 	var multiplier int64
 	if firstVal < 1e10 {
 		// Seconds → microseconds
@@ -437,27 +450,48 @@ func (d *MessagePackDecoder) normalizeTimestamps(columns map[string][]interface{
 	} else if firstVal < 1e13 {
 		// Milliseconds → microseconds
 		multiplier = 1000
-	} else {
+	} else if firstVal < 1e16 {
 		// Already microseconds - still need to normalize types to int64
 		multiplier = 1
+	} else {
+		// Nanoseconds → microseconds (divide by 1000)
+		// We'll handle this specially since we need to divide, not multiply
+		multiplier = -1000 // Negative signals division
 	}
 
 	// SINGLE-PASS: Convert and normalize in one iteration
 	// For homogeneous int64 columns (common case), the type assertion is very fast
 	// For mixed types, we fall back to the helper on first non-int64 value
-	for i, val := range timeCol {
-		// Fast path: direct int64 assertion (most common case)
-		if ts, ok := val.(int64); ok {
-			timeCol[i] = ts * multiplier
-			continue
+	if multiplier < 0 {
+		// Division case (nanoseconds → microseconds)
+		divisor := -multiplier
+		for i, val := range timeCol {
+			if ts, ok := val.(int64); ok {
+				timeCol[i] = ts / divisor
+				continue
+			}
+			ts, ok := toInt64Timestamp(val)
+			if !ok {
+				return fmt.Errorf("invalid timestamp type at index %d: %T", i, val)
+			}
+			timeCol[i] = ts / divisor
 		}
+	} else {
+		// Multiplication case (seconds/milliseconds → microseconds, or already microseconds)
+		for i, val := range timeCol {
+			// Fast path: direct int64 assertion (most common case)
+			if ts, ok := val.(int64); ok {
+				timeCol[i] = ts * multiplier
+				continue
+			}
 
-		// Slow path: use helper for other numeric types
-		ts, ok := toInt64Timestamp(val)
-		if !ok {
-			return fmt.Errorf("invalid timestamp type at index %d: %T", i, val)
+			// Slow path: use helper for other numeric types
+			ts, ok := toInt64Timestamp(val)
+			if !ok {
+				return fmt.Errorf("invalid timestamp type at index %d: %T", i, val)
+			}
+			timeCol[i] = ts * multiplier
 		}
-		timeCol[i] = ts * multiplier
 	}
 
 	return nil

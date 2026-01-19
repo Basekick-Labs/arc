@@ -269,6 +269,20 @@ Fixed query failures caused by non-UTF-8 characters in ingested data. Users inge
 
 **Impact:** Data with invalid UTF-8 is now queryable. Users see a warning log when sanitization occurs, making it visible without breaking the ingestion flow.
 
+### Nanosecond Timestamp Support for MessagePack Ingestion
+
+Added support for nanosecond-precision timestamps in the MessagePack ingestion endpoint. This is particularly important for users migrating from InfluxDB, which uses nanosecond timestamps by default.
+
+**Root cause:** The timestamp auto-detection logic only handled seconds, milliseconds, and microseconds. Nanosecond timestamps (19-digit values like `1737298800000000000`) were incorrectly treated as microseconds, resulting in dates far in the future (year ~57,000).
+
+**Fix:** Extended timestamp detection to recognize nanosecond precision:
+- Seconds: < 1e10 (10 digits) → multiply by 1,000,000
+- Milliseconds: < 1e13 (13 digits) → multiply by 1,000
+- Microseconds: < 1e16 (16 digits) → no conversion
+- Nanoseconds: >= 1e16 (19 digits) → divide by 1,000
+
+**Note:** Line Protocol already correctly handles nanoseconds per the InfluxDB specification.
+
 ### Arrow Writer Panic During High-Concurrency Writes (Issue #130)
 
 Fixed a panic that occurred during high-concurrency writes when batches had different column sets (schema evolution).
