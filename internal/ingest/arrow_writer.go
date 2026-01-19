@@ -1888,6 +1888,7 @@ func (b *ArrowBuffer) flushBufferLockedDataTime(ctx context.Context, bufferKey, 
 
 // mergeBatches merges multiple column batches into a single columnar structure
 // OPTIMIZATION: Pre-allocate merged arrays to avoid O(n²) append reallocations
+// Handles sparse columns (schema evolution) by ensuring all columns have the same length
 func (b *ArrowBuffer) mergeBatches(batches []interface{}) (map[string]interface{}, error) {
 	if len(batches) == 0 {
 		return nil, fmt.Errorf("no batches to merge")
@@ -1901,84 +1902,90 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (map[string]interface{
 		return nil, fmt.Errorf("invalid batch type: %T", batches[0])
 	}
 
-	// PHASE 1: Calculate total sizes per column and detect types
+	// PHASE 1: Calculate total rows from time column and collect column type info
 	type colInfo struct {
-		totalSize int
-		colType   string // "int64", "float64", "string", "bool"
+		colType string // "int64", "float64", "string", "bool"
 	}
-	sizes := make(map[string]*colInfo)
+	colTypes := make(map[string]*colInfo)
+	totalRows := 0
 
+	// First pass: count total rows using time column
 	for _, batch := range batches {
 		cols, ok := batch.(map[string]interface{})
 		if !ok {
 			return nil, fmt.Errorf("invalid batch type: %T", batch)
 		}
 
-		for name, col := range cols {
-			info := sizes[name]
-			if info == nil {
-				info = &colInfo{}
-				sizes[name] = info
-			}
+		// Count rows from time column (always present)
+		if timeCol, ok := cols["time"].([]int64); ok {
+			totalRows += len(timeCol)
+		}
 
-			switch v := col.(type) {
-			case []int64:
-				info.totalSize += len(v)
-				info.colType = "int64"
-			case []float64:
-				info.totalSize += len(v)
-				info.colType = "float64"
-			case []string:
-				info.totalSize += len(v)
-				info.colType = "string"
-			case []bool:
-				info.totalSize += len(v)
-				info.colType = "bool"
-			default:
-				return nil, fmt.Errorf("unsupported column type: %T", v)
+		// Collect column types
+		for name, col := range cols {
+			if colTypes[name] == nil {
+				info := &colInfo{}
+				switch col.(type) {
+				case []int64:
+					info.colType = "int64"
+				case []float64:
+					info.colType = "float64"
+				case []string:
+					info.colType = "string"
+				case []bool:
+					info.colType = "bool"
+				default:
+					return nil, fmt.Errorf("unsupported column type: %T", col)
+				}
+				colTypes[name] = info
 			}
 		}
 	}
 
-	// PHASE 2: Pre-allocate merged arrays with exact capacity
-	merged := make(map[string]interface{}, len(sizes))
-	offsets := make(map[string]int, len(sizes)) // Track copy position per column
+	// PHASE 2: Pre-allocate ALL columns to totalRows (handles sparse columns)
+	merged := make(map[string]interface{}, len(colTypes))
 
-	for name, info := range sizes {
+	for name, info := range colTypes {
 		switch info.colType {
 		case "int64":
-			merged[name] = make([]int64, info.totalSize)
+			merged[name] = make([]int64, totalRows)
 		case "float64":
-			merged[name] = make([]float64, info.totalSize)
+			merged[name] = make([]float64, totalRows)
 		case "string":
-			merged[name] = make([]string, info.totalSize)
+			merged[name] = make([]string, totalRows)
 		case "bool":
-			merged[name] = make([]bool, info.totalSize)
+			merged[name] = make([]bool, totalRows)
 		}
-		offsets[name] = 0
 	}
 
-	// PHASE 3: Copy data without reallocation
+	// PHASE 3: Copy data at correct row offsets (not per-column offsets)
+	rowOffset := 0
 	for _, batch := range batches {
 		cols := batch.(map[string]interface{}) // Already validated above
 
+		// Determine batch size from time column
+		batchRows := 0
+		if timeCol, ok := cols["time"].([]int64); ok {
+			batchRows = len(timeCol)
+		}
+
+		// Copy each column's data at the current row offset
 		for name, col := range cols {
-			offset := offsets[name]
 			switch v := col.(type) {
 			case []int64:
-				copy(merged[name].([]int64)[offset:], v)
-				offsets[name] = offset + len(v)
+				copy(merged[name].([]int64)[rowOffset:], v)
 			case []float64:
-				copy(merged[name].([]float64)[offset:], v)
-				offsets[name] = offset + len(v)
+				copy(merged[name].([]float64)[rowOffset:], v)
 			case []string:
-				copy(merged[name].([]string)[offset:], v)
-				offsets[name] = offset + len(v)
+				copy(merged[name].([]string)[rowOffset:], v)
 			case []bool:
-				copy(merged[name].([]bool)[offset:], v)
-				offsets[name] = offset + len(v)
+				copy(merged[name].([]bool)[rowOffset:], v)
 			}
 		}
+		// Sparse columns that don't exist in this batch will have zero values
+		// at positions [rowOffset : rowOffset+batchRows]
+
+		rowOffset += batchRows
 	}
 
 	return merged, nil
@@ -2258,6 +2265,7 @@ func groupByHour(times []int64) (map[int64]*hourBucket, int64, int64, error) {
 
 // sliceColumnsByIndices extracts rows from all columns based on a list of indices
 // Returns a new column map with only the selected rows
+// Handles sparse columns (columns shorter than indices) by using zero values for out-of-bounds access
 func sliceColumnsByIndices(columns map[string]interface{}, indices []int) map[string]interface{} {
 	result := make(map[string]interface{}, len(columns))
 
@@ -2265,29 +2273,45 @@ func sliceColumnsByIndices(columns map[string]interface{}, indices []int) map[st
 		switch col := colData.(type) {
 		case []int64:
 			newCol := make([]int64, len(indices))
+			colLen := len(col)
 			for i, idx := range indices {
-				newCol[i] = col[idx]
+				if idx < colLen {
+					newCol[i] = col[idx]
+				}
+				// else: leave as zero value (sparse column handling)
 			}
 			result[colName] = newCol
 
 		case []float64:
 			newCol := make([]float64, len(indices))
+			colLen := len(col)
 			for i, idx := range indices {
-				newCol[i] = col[idx]
+				if idx < colLen {
+					newCol[i] = col[idx]
+				}
+				// else: leave as zero value (sparse column handling)
 			}
 			result[colName] = newCol
 
 		case []string:
 			newCol := make([]string, len(indices))
+			colLen := len(col)
 			for i, idx := range indices {
-				newCol[i] = col[idx]
+				if idx < colLen {
+					newCol[i] = col[idx]
+				}
+				// else: leave as empty string (sparse column handling)
 			}
 			result[colName] = newCol
 
 		case []bool:
 			newCol := make([]bool, len(indices))
+			colLen := len(col)
 			for i, idx := range indices {
-				newCol[i] = col[idx]
+				if idx < colLen {
+					newCol[i] = col[idx]
+				}
+				// else: leave as false (sparse column handling)
 			}
 			result[colName] = newCol
 
