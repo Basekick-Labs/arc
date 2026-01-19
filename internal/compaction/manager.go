@@ -3,6 +3,7 @@ package compaction
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -282,6 +283,128 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 	return nil
 }
 
+// compactFilesAdaptively attempts compaction with adaptive batch sizing.
+// If compaction fails with a recoverable error (segfault, OOM), it splits the batch
+// in half and retries each half recursively. This allows large compactions to succeed
+// by automatically finding a batch size that fits in memory.
+//
+// Parameters:
+//   - ctx: context for cancellation
+//   - candidate: the original candidate (used for metadata)
+//   - files: the current subset of files to compact
+//   - depth: recursion depth (0 = original batch, 1+ = split retries)
+//   - stderr: stderr output from last failed attempt (for error classification)
+//
+// The algorithm:
+//  1. Try to compact all files in the batch
+//  2. If it fails with a recoverable error and batch size > minBatchSize:
+//     - Split files in half
+//     - Recursively compact each half
+//  3. If batch size <= minBatchSize and still failing, give up
+func (m *Manager) compactFilesAdaptively(ctx context.Context, candidate Candidate, files []string, depth int, stderr string) error {
+	const maxDepth = 4     // Maximum split depth: 30 → 15 → 7 → 3 → minimum
+	const minBatchSize = 2 // Don't split below 2 files
+
+	// Check context cancellation
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	// Safety check: too deep or too few files
+	if depth > maxDepth {
+		return fmt.Errorf("compaction failed: exceeded max retry depth %d", maxDepth)
+	}
+	if len(files) < minBatchSize {
+		return fmt.Errorf("compaction failed: batch size %d below minimum %d", len(files), minBatchSize)
+	}
+
+	// Create candidate for this batch
+	batchCandidate := candidate
+	batchCandidate.Files = files
+
+	// Log retry attempts
+	if depth > 0 {
+		m.logger.Info().
+			Int("depth", depth).
+			Int("file_count", len(files)).
+			Str("partition", candidate.PartitionPath).
+			Msg("Retrying compaction with reduced batch size")
+	}
+
+	// Attempt compaction
+	err := m.CompactPartition(ctx, batchCandidate)
+	if err == nil {
+		// Success!
+		if depth > 0 {
+			m.logger.Info().
+				Int("depth", depth).
+				Int("file_count", len(files)).
+				Str("partition", candidate.PartitionPath).
+				Msg("Compaction succeeded after batch size reduction")
+		}
+		return nil
+	}
+
+	// Extract stderr from error message for classification
+	// Error format from RunJobInSubprocess: "subprocess failed: %w (stderr: %s)"
+	errStderr := stderr
+	if errStr := err.Error(); strings.Contains(errStr, "(stderr:") {
+		parts := strings.SplitN(errStr, "(stderr:", 2)
+		if len(parts) > 1 {
+			errStderr = strings.TrimSuffix(strings.TrimSpace(parts[1]), ")")
+		}
+	}
+
+	// Classify the error
+	recoverable, reason := ClassifySubprocessError(err, errStderr)
+
+	if !recoverable {
+		m.logger.Error().
+			Err(err).
+			Str("reason", reason).
+			Str("partition", candidate.PartitionPath).
+			Msg("Compaction failed with non-recoverable error")
+		return err
+	}
+
+	// Check if we can split further
+	if len(files) <= minBatchSize {
+		m.logger.Error().
+			Err(err).
+			Str("reason", reason).
+			Int("batch_size", len(files)).
+			Str("partition", candidate.PartitionPath).
+			Msg("Compaction failed at minimum batch size, cannot split further")
+		return err
+	}
+
+	// Split batch in half and try each half
+	mid := len(files) / 2
+	firstHalf := files[:mid]
+	secondHalf := files[mid:]
+
+	m.logger.Warn().
+		Int("depth", depth).
+		Int("original_size", len(files)).
+		Int("first_half", len(firstHalf)).
+		Int("second_half", len(secondHalf)).
+		Str("reason", reason).
+		Str("partition", candidate.PartitionPath).
+		Msg("Splitting batch after recoverable failure")
+
+	// Try first half
+	if err := m.compactFilesAdaptively(ctx, candidate, firstHalf, depth+1, errStderr); err != nil {
+		return fmt.Errorf("first half failed: %w", err)
+	}
+
+	// Try second half
+	if err := m.compactFilesAdaptively(ctx, candidate, secondHalf, depth+1, errStderr); err != nil {
+		return fmt.Errorf("second half failed: %w", err)
+	}
+
+	return nil
+}
+
 // RunCompactionCycle runs one compaction cycle for all enabled tiers.
 // Returns the cycle ID and an error if the cycle couldn't be started.
 // Returns ErrCycleAlreadyRunning if a cycle is already in progress.
@@ -425,7 +548,8 @@ func (m *Manager) RunCompactionCycleForTiers(ctx context.Context, tierNames []st
 						defer func() { <-sem }() // Release semaphore
 
 						for _, batch := range partitionBatches {
-							if err := m.CompactPartition(ctx, batch); err != nil {
+							// Use adaptive compaction with automatic batch splitting on failure
+							if err := m.compactFilesAdaptively(ctx, batch, batch.Files, 0, ""); err != nil {
 								m.logger.Error().Err(err).
 									Str("partition", batch.PartitionPath).
 									Str("tier", tierName).

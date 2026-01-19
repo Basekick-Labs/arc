@@ -306,3 +306,65 @@ func createStorageBackendFromConfig(config *SubprocessJobConfig, logger zerolog.
 		return nil, fmt.Errorf("unsupported storage type: %s", config.StorageType)
 	}
 }
+
+// ClassifySubprocessError determines if a subprocess error is recoverable via retry.
+// Returns (recoverable, reason) where reason describes the error type.
+//
+// Recoverable errors (should retry with smaller batch):
+//   - Segmentation faults (memory corruption, often from memory pressure)
+//   - SIGKILL (exit code 137, usually OOM killer)
+//   - Explicit memory errors in stderr
+//
+// Non-recoverable errors (should not retry):
+//   - Permission denied
+//   - File not found
+//   - Access denied
+func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason string) {
+	if err == nil {
+		return false, ""
+	}
+
+	errStr := err.Error()
+	stderrLower := strings.ToLower(stderr)
+
+	// Check for signals (segfault, killed)
+	if strings.Contains(errStr, "signal:") {
+		if strings.Contains(errStr, "segmentation fault") {
+			return true, "segfault"
+		}
+		if strings.Contains(errStr, "killed") {
+			return true, "killed"
+		}
+	}
+
+	// Check exit codes for OOM (137 = SIGKILL, often OOM killer)
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		exitCode := exitErr.ExitCode()
+		if exitCode == 137 {
+			return true, "oom_killed"
+		}
+		// Exit code 139 is SIGSEGV
+		if exitCode == 139 {
+			return true, "segfault"
+		}
+	}
+
+	// Check stderr for memory-related errors
+	if strings.Contains(stderrLower, "out of memory") ||
+		strings.Contains(stderrLower, "cannot allocate") ||
+		strings.Contains(stderrLower, "memory allocation failed") {
+		return true, "memory_error"
+	}
+
+	// Non-recoverable errors - don't waste time retrying
+	if strings.Contains(stderrLower, "permission denied") ||
+		strings.Contains(stderrLower, "no such file") ||
+		strings.Contains(stderrLower, "access denied") ||
+		strings.Contains(stderrLower, "not found") {
+		return false, "permanent_error"
+	}
+
+	// Default: treat unknown errors as potentially recoverable once
+	// This allows one retry for transient issues
+	return true, "unknown"
+}
