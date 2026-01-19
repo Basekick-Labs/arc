@@ -324,8 +324,9 @@ Fixed critical memory issues in the compactor that caused OOM kills and DuckDB s
 - **Streaming I/O**: Downloads now use `ReadTo()` and uploads use `WriteReader()` to stream directly to/from disk without loading files into memory
 - **Memory limit passthrough**: Compaction subprocess now applies the configured `database.memory_limit` to DuckDB
 - **File batching**: Partitions with >1000 files are automatically split into batches of 1000 files each, processed sequentially to avoid DuckDB limitations
+- **Adaptive batch sizing on failure**: When compaction fails with recoverable errors (segfault, OOM kill, memory allocation errors), the batch is automatically split in half and retried. This continues recursively until either success or minimum batch size (2 files) is reached. Non-recoverable errors (permission denied, file not found) are not retried.
 
-**Result:** Compaction now handles tables with billions of rows without OOM or segfaults. Query performance improved ~2x after successful compaction due to reduced file count.
+**Result:** Compaction now handles tables with billions of rows without OOM or segfaults. Even when individual batches fail due to memory pressure, adaptive splitting ensures eventual success with smaller batches. Query performance improved ~2x after successful compaction due to reduced file count.
 
 **Optional profiling:** Set `ARC_COMPACTION_PROFILE=1` to enable heap profiling during compaction (writes to `/tmp/arc_compaction_heap.pprof`).
 
