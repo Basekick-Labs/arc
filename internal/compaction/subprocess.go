@@ -269,6 +269,7 @@ func createStorageBackendFromConfig(config *SubprocessJobConfig, logger zerolog.
 			Region    string `json:"region"`
 			Endpoint  string `json:"endpoint"`
 			PathStyle bool   `json:"path_style"`
+			UseSSL    bool   `json:"use_ssl"`
 		}
 		if err := json.Unmarshal([]byte(config.StorageConfig), &s3Config); err != nil {
 			return nil, fmt.Errorf("failed to parse S3 storage config: %w", err)
@@ -278,6 +279,7 @@ func createStorageBackendFromConfig(config *SubprocessJobConfig, logger zerolog.
 			Region:    s3Config.Region,
 			Endpoint:  s3Config.Endpoint,
 			PathStyle: s3Config.PathStyle,
+			UseSSL:    s3Config.UseSSL,
 			// Credentials come from environment variables
 		}, logger)
 

@@ -31,13 +31,16 @@ const (
 
 // S3Backend implements the Backend interface for S3 and MinIO storage
 type S3Backend struct {
-	client   *s3.Client
-	uploader *manager.Uploader
-	bucket   string
-	region   string
-	endpoint string
+	client    *s3.Client
+	uploader  *manager.Uploader
+	bucket    string
+	region    string
+	endpoint  string
 	pathStyle bool
-	logger   zerolog.Logger
+	useSSL    bool   // stored for subprocess config passing
+	accessKey string // stored for subprocess credential passing
+	secretKey string // stored for subprocess credential passing
+	logger    zerolog.Logger
 }
 
 // S3Config holds S3 backend configuration
@@ -135,13 +138,16 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 	})
 
 	backend := &S3Backend{
-		client:   client,
-		uploader: uploader,
-		bucket:   cfg.Bucket,
-		region:   region,
-		endpoint: cfg.Endpoint,
+		client:    client,
+		uploader:  uploader,
+		bucket:    cfg.Bucket,
+		region:    region,
+		endpoint:  cfg.Endpoint,
 		pathStyle: cfg.PathStyle,
-		logger:   log,
+		useSSL:    cfg.UseSSL,
+		accessKey: accessKey,
+		secretKey: secretKey,
+		logger:    log,
 	}
 
 	// Test connection by checking if bucket exists
@@ -409,6 +415,16 @@ func (b *S3Backend) GetRegion() string {
 	return b.region
 }
 
+// GetAccessKey returns the access key (for subprocess credential passing)
+func (b *S3Backend) GetAccessKey() string {
+	return b.accessKey
+}
+
+// GetSecretKey returns the secret key (for subprocess credential passing)
+func (b *S3Backend) GetSecretKey() string {
+	return b.secretKey
+}
+
 // GetS3Path returns the S3 URI for a path
 func (b *S3Backend) GetS3Path(path string) string {
 	return fmt.Sprintf("s3://%s/%s", b.bucket, path)
@@ -473,6 +489,7 @@ func (b *S3Backend) ConfigJSON() string {
 		"region":     b.region,
 		"endpoint":   b.endpoint,
 		"path_style": b.pathStyle,
+		"use_ssl":    b.useSSL,
 	}
 	data, _ := json.Marshal(config)
 	return string(data)

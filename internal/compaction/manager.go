@@ -209,11 +209,19 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 		StorageConfig: m.StorageBackend.ConfigJSON(),
 	}
 
-	// Build extra environment variables for subprocess (e.g., Azure credentials)
+	// Build extra environment variables for subprocess (storage credentials)
 	var extraEnv []string
 	if azureBackend, ok := m.StorageBackend.(*storage.AzureBlobBackend); ok {
 		if key := azureBackend.GetAccountKey(); key != "" {
 			extraEnv = append(extraEnv, "AZURE_STORAGE_KEY="+key)
+		}
+	}
+	if s3Backend, ok := m.StorageBackend.(*storage.S3Backend); ok {
+		if accessKey := s3Backend.GetAccessKey(); accessKey != "" {
+			extraEnv = append(extraEnv, "AWS_ACCESS_KEY_ID="+accessKey)
+		}
+		if secretKey := s3Backend.GetSecretKey(); secretKey != "" {
+			extraEnv = append(extraEnv, "AWS_SECRET_ACCESS_KEY="+secretKey)
 		}
 	}
 
