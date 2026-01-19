@@ -160,3 +160,52 @@ func BenchmarkSanitizeUTF8_InvalidMultiple(b *testing.B) {
 		SanitizeUTF8(input)
 	}
 }
+
+// Benchmarks to compare different fast-path strategies
+
+func BenchmarkSanitizeUTF8_ASCIIOnly_Short(b *testing.B) {
+	// Pure ASCII - no high bytes at all
+	input := "user=admin action=login status=success"
+	for i := 0; i < b.N; i++ {
+		SanitizeUTF8(input)
+	}
+}
+
+func BenchmarkSanitizeUTF8_ASCIIOnly_Long(b *testing.B) {
+	// Long pure ASCII string
+	input := "2026-01-19T10:30:00Z INFO [api-gateway] Request processed successfully user=admin action=login status=success ip=192.168.1.100 duration=42ms"
+	for i := 0; i < b.N; i++ {
+		SanitizeUTF8(input)
+	}
+}
+
+// Test hasHighBit approach
+func hasHighBit(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return true
+		}
+	}
+	return false
+}
+
+func BenchmarkHasHighBit_ASCIIShort(b *testing.B) {
+	input := "user=admin action=login status=success"
+	for i := 0; i < b.N; i++ {
+		hasHighBit(input)
+	}
+}
+
+func BenchmarkHasHighBit_ASCIILong(b *testing.B) {
+	input := "2026-01-19T10:30:00Z INFO [api-gateway] Request processed successfully user=admin action=login status=success ip=192.168.1.100 duration=42ms"
+	for i := 0; i < b.N; i++ {
+		hasHighBit(input)
+	}
+}
+
+func BenchmarkHasHighBit_WithUnicode(b *testing.B) {
+	input := "日志消息 with mixed 内容 and émojis 🎉"
+	for i := 0; i < b.N; i++ {
+		hasHighBit(input)
+	}
+}
