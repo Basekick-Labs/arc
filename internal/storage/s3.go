@@ -37,6 +37,7 @@ type S3Backend struct {
 	region    string
 	endpoint  string
 	pathStyle bool
+	useSSL    bool   // stored for subprocess config passing
 	accessKey string // stored for subprocess credential passing
 	secretKey string // stored for subprocess credential passing
 	logger    zerolog.Logger
@@ -143,6 +144,7 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 		region:    region,
 		endpoint:  cfg.Endpoint,
 		pathStyle: cfg.PathStyle,
+		useSSL:    cfg.UseSSL,
 		accessKey: accessKey,
 		secretKey: secretKey,
 		logger:    log,
@@ -487,6 +489,7 @@ func (b *S3Backend) ConfigJSON() string {
 		"region":     b.region,
 		"endpoint":   b.endpoint,
 		"path_style": b.pathStyle,
+		"use_ssl":    b.useSSL,
 	}
 	data, _ := json.Marshal(config)
 	return string(data)
