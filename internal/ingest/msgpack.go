@@ -231,6 +231,15 @@ func (d *MessagePackDecoder) decodeColumnar(payload *models.MsgPackPayload, rawD
 		return nil, fmt.Errorf("failed to normalize timestamps: %w", err)
 	}
 
+	// Sanitize string columns to ensure valid UTF-8 (prevents DuckDB query failures)
+	sanitizedCount := d.sanitizeStringColumns(payload.Columns)
+	if sanitizedCount > 0 {
+		d.logger.Warn().
+			Str("measurement", measurement).
+			Int("sanitized_fields", sanitizedCount).
+			Msg("Sanitized non-UTF8 characters in string columns")
+	}
+
 	return &models.ColumnarRecord{
 		Measurement: measurement,
 		Columnar:    true,
@@ -286,6 +295,15 @@ func (d *MessagePackDecoder) decodeRow(payload *models.MsgPackPayload) (*models.
 	// Add host to tags if present
 	if host != "" {
 		tags["host"] = host
+	}
+
+	// Sanitize string fields to ensure valid UTF-8 (prevents DuckDB query failures)
+	sanitizedCount := d.sanitizeStringFields(fields)
+	if sanitizedCount > 0 {
+		d.logger.Warn().
+			Str("measurement", measurement).
+			Int("sanitized_fields", sanitizedCount).
+			Msg("Sanitized non-UTF8 characters in string fields")
 	}
 
 	return &models.Record{
@@ -476,6 +494,42 @@ func toInt64Timestamp(v interface{}) (int64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// sanitizeStringColumns sanitizes string values in columnar data to ensure valid UTF-8.
+// This prevents DuckDB query failures caused by non-UTF-8 data in Parquet files.
+// Returns count of sanitized fields for logging.
+func (d *MessagePackDecoder) sanitizeStringColumns(columns map[string][]interface{}) int {
+	sanitizedCount := 0
+	for _, colData := range columns {
+		for i, val := range colData {
+			if s, ok := val.(string); ok {
+				sanitized, modified := SanitizeUTF8(s)
+				if modified {
+					colData[i] = sanitized
+					sanitizedCount++
+				}
+			}
+		}
+	}
+	return sanitizedCount
+}
+
+// sanitizeStringFields sanitizes string values in row-format fields to ensure valid UTF-8.
+// This prevents DuckDB query failures caused by non-UTF-8 data in Parquet files.
+// Returns count of sanitized fields for logging.
+func (d *MessagePackDecoder) sanitizeStringFields(fields map[string]interface{}) int {
+	sanitizedCount := 0
+	for key, val := range fields {
+		if s, ok := val.(string); ok {
+			sanitized, modified := SanitizeUTF8(s)
+			if modified {
+				fields[key] = sanitized
+				sanitizedCount++
+			}
+		}
+	}
+	return sanitizedCount
 }
 
 // GetStats returns decoder statistics

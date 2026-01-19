@@ -247,11 +247,14 @@ func (p *LineProtocolParser) parseFieldValue(value []byte) interface{} {
 	// String (quoted)
 	if value[0] == '"' {
 		if len(value) > 1 && value[len(value)-1] == '"' {
-			// Remove quotes and unescape
-			return p.unescape(value[1 : len(value)-1])
+			// Remove quotes and unescape, then sanitize for valid UTF-8
+			unescaped := p.unescape(value[1 : len(value)-1])
+			sanitized, _ := SanitizeUTF8(unescaped)
+			return sanitized
 		}
-		// Malformed quoted string - return as-is without leading quote
-		return strings.Trim(strValue, "\"")
+		// Malformed quoted string - return as-is without leading quote, sanitized
+		sanitized, _ := SanitizeUTF8(strings.Trim(strValue, "\""))
+		return sanitized
 	}
 
 	// Integer (ends with 'i')
@@ -278,8 +281,9 @@ func (p *LineProtocolParser) parseFieldValue(value []byte) interface{} {
 		return floatVal
 	}
 
-	// If all else fails, treat as string
-	return strValue
+	// If all else fails, treat as string (sanitized for valid UTF-8)
+	sanitized, _ := SanitizeUTF8(strValue)
+	return sanitized
 }
 
 // parseTimestamp parses timestamp from line protocol
