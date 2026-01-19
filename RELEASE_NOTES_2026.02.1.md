@@ -283,6 +283,25 @@ Added support for nanosecond-precision timestamps in the MessagePack ingestion e
 
 **Note:** Line Protocol already correctly handles nanoseconds per the InfluxDB specification.
 
+### Buffer Age-Based Flush Timing Under High Load (Issue #142)
+
+Fixed an issue where buffers configured with `max_buffer_age_ms` would flush significantly later than configured under high throughput scenarios.
+
+**Root cause:** Under heavy load, the periodic flush goroutine could be starved or delayed by intensive I/O operations and lock contention. With the ticker firing every `max_buffer_age_ms`, buffers created between ticker fires had to wait for the next check cycle, and under load this delay compounded.
+
+**Symptoms:**
+- Buffers configured with `max_buffer_age_ms=5000` flushing at 6700-7000ms
+- Buffers configured with `max_buffer_age_ms=1000` flushing at 2000ms+
+- More pronounced under high throughput with frequent size-based flushes
+
+**Fix:** The ticker now fires every `max_buffer_age_ms / 2` (e.g., every 2500ms for 5000ms config) while keeping the age threshold at `max_buffer_age_ms`. This gives the periodic flush goroutine more opportunities to run even under heavy load, without flushing buffers prematurely.
+
+**Impact:**
+- Before: age=6700-7000ms (with max_buffer_age_ms=5000)
+- After:  age=5100-5700ms (with max_buffer_age_ms=5000)
+- Improvement: ~25% faster flush timing
+- Throughput: Minimal overhead (~1%)
+
 ### Arrow Writer Panic During High-Concurrency Writes (Issue #130)
 
 Fixed a panic that occurred during high-concurrency writes when batches had different column sets (schema evolution).
