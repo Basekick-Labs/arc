@@ -947,7 +947,7 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		shardCount:      uint32(shardCount),
 		ctx:             ctx,
 		cancel:          cancel,
-		flushTimer:      time.NewTicker(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
+		flushTimer:      time.NewTicker(time.Duration(cfg.MaxBufferAgeMS/2) * time.Millisecond),
 		flushQueue:      make(chan flushTask, queueSize),
 		flushWorkers:    flushWorkers,
 		sortKeysConfig:  sortKeysConfig,
@@ -1592,6 +1592,10 @@ func (b *ArrowBuffer) flushAgedBuffers() {
 	now := time.Now().UTC()
 	maxAge := time.Duration(b.config.MaxBufferAgeMS) * time.Millisecond
 
+	// Ticker fires at maxAge/2 interval, so use full maxAge as threshold
+	// This ensures buffers don't flush too early while still getting checked frequently
+	threshold := maxAge  // Full maxAge (e.g., 5000ms threshold, checked every 2500ms)
+
 	// Iterate over all shards
 	for shardIdx := range b.shards {
 		shard := b.shards[shardIdx]
@@ -1601,10 +1605,11 @@ func (b *ArrowBuffer) flushAgedBuffers() {
 		// Check each buffer in this shard for age
 		for key, startTime := range shard.bufferStartTimes {
 			age := now.Sub(startTime)
-			if age >= maxAge {
+			if age >= threshold {
 				b.logger.Info().
 					Str("buffer_key", key).
 					Dur("age", age).
+					Dur("threshold", threshold).
 					Int("shard", shardIdx).
 					Msg("Flushing aged buffer")
 
