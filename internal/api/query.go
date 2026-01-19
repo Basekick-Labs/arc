@@ -83,7 +83,8 @@ var (
 	patternDateTrunc = regexp.MustCompile(`(?i)\bdate_trunc\s*\(\s*'(second|minute|hour|day|week|month)'\s*,\s*([^)]+)\)`)
 
 	// Pattern for extracting LIMIT clause value for result pre-allocation
-	patternLimit = regexp.MustCompile(`(?i)\bLIMIT\s+(\d+)\b`)
+	patternLimit        = regexp.MustCompile(`(?i)\bLIMIT\s+(\d+)\b`)
+	patternDayLevelPath = regexp.MustCompile(`'[^']*\d{4}/\d{2}/\d{2}/\*\.parquet'`)
 
 )
 
@@ -1143,14 +1144,27 @@ localProcessing:
 		}
 
 		if err != nil {
-			m.IncQueryErrors()
-			h.logger.Error().Err(err).Str("sql", req.SQL).Msg("Query execution failed")
-			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
-				Success:         false,
-				Error:           "Query execution failed",
-				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
-				Timestamp:       timestamp,
-			})
+			if strings.Contains(err.Error(), "No files found") && isDayLevelPathError(err.Error()) {
+				retrySQL := removeDayLevelPaths(convertedSQL)
+				if retrySQL != convertedSQL {
+					h.logger.Debug().Msg("Retrying query without day-level paths")
+					if profileMode {
+						rows, profile, err = h.db.QueryWithProfile(retrySQL)
+					} else {
+						rows, err = h.db.Query(retrySQL)
+					}
+				}
+			}
+			if err != nil {
+				m.IncQueryErrors()
+				h.logger.Error().Err(err).Str("sql", req.SQL).Msg("Query execution failed")
+				return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
+					Success:         false,
+					Error:           "Query execution failed",
+					ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+					Timestamp:       timestamp,
+				})
+			}
 		}
 		defer rows.Close()
 
@@ -2520,5 +2534,17 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		ExecutionTimeMs: executionTime,
 		Timestamp:       time.Now().UTC().Format(time.RFC3339),
 	})
+}
+
+func isDayLevelPathError(errMsg string) bool {
+	return patternDayLevelPath.MatchString(errMsg)
+}
+
+func removeDayLevelPaths(sql string) string {
+	result := patternDayLevelPath.ReplaceAllString(sql, "")
+	result = strings.ReplaceAll(result, ", , ", ", ")
+	result = strings.ReplaceAll(result, "[, ", "[")
+	result = strings.ReplaceAll(result, ", ]", "]")
+	return result
 }
 
