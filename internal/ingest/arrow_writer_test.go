@@ -491,3 +491,139 @@ func BenchmarkRowsToColumnar_SchemaVariation(b *testing.B) {
 		buffer.rowsToColumnar("cpu", rows)
 	}
 }
+
+// TestMergeBatches_SparseColumns tests that mergeBatches handles schema evolution correctly
+// This reproduces Issue #130: panic during high-concurrency writes with different column sets
+func TestMergeBatches_SparseColumns(t *testing.T) {
+	buffer := createTestArrowBuffer(t)
+
+	// Create batches with different column sets (simulating schema evolution)
+	batch1 := map[string]interface{}{
+		"time": []int64{1, 2, 3},
+		"cpu":  []float64{10.0, 20.0, 30.0},
+	}
+	batch2 := map[string]interface{}{
+		"time":        []int64{4, 5},
+		"temperature": []float64{70.0, 80.0}, // New column not in batch1
+	}
+	batch3 := map[string]interface{}{
+		"time": []int64{6, 7, 8},
+		"cpu":  []float64{40.0, 50.0, 60.0}, // cpu column returns
+	}
+
+	batches := []interface{}{batch1, batch2, batch3}
+
+	merged, err := buffer.mergeBatches(batches)
+	if err != nil {
+		t.Fatalf("mergeBatches failed: %v", err)
+	}
+
+	// Verify all columns have the same length (8 total rows)
+	expectedLen := 8
+	for colName, colData := range merged {
+		var actualLen int
+		switch col := colData.(type) {
+		case []int64:
+			actualLen = len(col)
+		case []float64:
+			actualLen = len(col)
+		case []string:
+			actualLen = len(col)
+		case []bool:
+			actualLen = len(col)
+		}
+		if actualLen != expectedLen {
+			t.Errorf("Column %q has length %d, expected %d", colName, actualLen, expectedLen)
+		}
+	}
+
+	// Verify time column has all values
+	timeCol := merged["time"].([]int64)
+	expectedTime := []int64{1, 2, 3, 4, 5, 6, 7, 8}
+	for i, expected := range expectedTime {
+		if timeCol[i] != expected {
+			t.Errorf("time[%d] = %d, expected %d", i, timeCol[i], expected)
+		}
+	}
+
+	// Verify cpu column: should have values at positions 0,1,2 and 5,6,7, zeros at 3,4
+	cpuCol := merged["cpu"].([]float64)
+	expectedCpu := []float64{10.0, 20.0, 30.0, 0.0, 0.0, 40.0, 50.0, 60.0}
+	for i, expected := range expectedCpu {
+		if cpuCol[i] != expected {
+			t.Errorf("cpu[%d] = %f, expected %f", i, cpuCol[i], expected)
+		}
+	}
+
+	// Verify temperature column: should have values at positions 3,4, zeros elsewhere
+	tempCol := merged["temperature"].([]float64)
+	expectedTemp := []float64{0.0, 0.0, 0.0, 70.0, 80.0, 0.0, 0.0, 0.0}
+	for i, expected := range expectedTemp {
+		if tempCol[i] != expected {
+			t.Errorf("temperature[%d] = %f, expected %f", i, tempCol[i], expected)
+		}
+	}
+}
+
+// TestSliceColumnsByIndices_BoundsCheck tests that sliceColumnsByIndices handles sparse columns
+func TestSliceColumnsByIndices_BoundsCheck(t *testing.T) {
+	// Create columns with different lengths (sparse scenario)
+	columns := map[string]interface{}{
+		"time":        []int64{1, 2, 3, 4, 5, 6, 7, 8},
+		"cpu":         []float64{10.0, 20.0, 30.0, 40.0, 50.0, 60.0}, // Only 6 elements
+		"temperature": []float64{70.0, 80.0},                         // Only 2 elements
+		"host":        []string{"a", "b", "c", "d"},                  // Only 4 elements
+		"active":      []bool{true, false, true},                     // Only 3 elements
+	}
+
+	// Try to slice with indices that exceed shorter columns' lengths
+	indices := []int{0, 2, 4, 6, 7} // Indices 6,7 exceed temperature, host, active columns
+
+	// This should NOT panic (previously would panic with index out of range)
+	result := sliceColumnsByIndices(columns, indices)
+
+	// Verify time column (all indices valid)
+	timeCol := result["time"].([]int64)
+	expectedTime := []int64{1, 3, 5, 7, 8}
+	for i, expected := range expectedTime {
+		if timeCol[i] != expected {
+			t.Errorf("time[%d] = %d, expected %d", i, timeCol[i], expected)
+		}
+	}
+
+	// Verify cpu column (indices 0,2,4 valid; 6 invalid -> 0.0)
+	cpuCol := result["cpu"].([]float64)
+	expectedCpu := []float64{10.0, 30.0, 50.0, 0.0, 0.0} // Last two are zero (out of bounds)
+	for i, expected := range expectedCpu {
+		if cpuCol[i] != expected {
+			t.Errorf("cpu[%d] = %f, expected %f", i, cpuCol[i], expected)
+		}
+	}
+
+	// Verify temperature column (only indices 0 valid)
+	tempCol := result["temperature"].([]float64)
+	expectedTemp := []float64{70.0, 0.0, 0.0, 0.0, 0.0} // Only first is valid
+	for i, expected := range expectedTemp {
+		if tempCol[i] != expected {
+			t.Errorf("temperature[%d] = %f, expected %f", i, tempCol[i], expected)
+		}
+	}
+
+	// Verify host column (indices 0,2 valid)
+	hostCol := result["host"].([]string)
+	expectedHost := []string{"a", "c", "", "", ""} // Indices 4,6,7 out of bounds
+	for i, expected := range expectedHost {
+		if hostCol[i] != expected {
+			t.Errorf("host[%d] = %q, expected %q", i, hostCol[i], expected)
+		}
+	}
+
+	// Verify active column (indices 0,2 valid)
+	activeCol := result["active"].([]bool)
+	expectedActive := []bool{true, true, false, false, false} // Indices 4,6,7 out of bounds
+	for i, expected := range expectedActive {
+		if activeCol[i] != expected {
+			t.Errorf("active[%d] = %v, expected %v", i, activeCol[i], expected)
+		}
+	}
+}

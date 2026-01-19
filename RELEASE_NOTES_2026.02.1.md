@@ -231,6 +231,45 @@ Fixed SSL certificate validation errors when querying data from Azure Blob Stora
 
 *Contributed by [@schotime](https://github.com/schotime)*
 
+### UTC Consistency for Compaction Filenames (PR #132)
+
+Fixed timezone inconsistency in compacted file naming. Files were being named using the server's local timezone instead of UTC, which could cause issues when servers in different timezones processed the same data.
+
+**Changes:**
+- Compacted filenames now use UTC timestamps consistently (`time.Now().UTC()`)
+- Updated daily file parsing to handle the full timestamp format (`YYYYMMDD_HHMMSS`)
+- Removed unused `GetCompactedFilename` methods from tier implementations
+
+*Contributed by [@schotime](https://github.com/schotime)*
+
+### S3 Subprocess Configuration Issues (Issue #131)
+
+Fixed compaction failures on S3-compatible storage services (Hetzner, MinIO, etc.) due to missing subprocess configuration.
+
+**Issue 1: Credentials not forwarded**
+- Subprocess fell back to AWS EC2 IMDS for credentials, timing out on non-AWS environments
+- Error: `"operation error S3: GetObject, exceeded maximum number of attempts"`
+- Fix: S3 credentials now passed via `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` environment variables
+
+**Issue 2: SSL config not forwarded**
+- Subprocess defaulted to HTTP when main process used HTTPS (port mismatch)
+- Fix: `use_ssl` config now included in subprocess configuration
+
+### Arrow Writer Panic During High-Concurrency Writes (Issue #130)
+
+Fixed a panic that occurred during high-concurrency writes when batches had different column sets (schema evolution).
+
+**Symptoms:**
+- Panic: `runtime error: index out of range [N] with length M`
+- Occurred in `sliceColumnsByIndices()` during flush operations
+- More likely with high write concurrency (many workers, large batches)
+
+**Root cause:** When batches with different schemas were merged (e.g., some records had `cpu` field, others had `temperature`), the `mergeBatches()` function created columns of different lengths. When `groupByHour()` generated indices from the `time` column, accessing those indices on shorter columns caused an out-of-bounds panic.
+
+**Fix:**
+- `mergeBatches()` now normalizes all columns to the same length, using zero values for sparse positions
+- `sliceColumnsByIndices()` now includes defensive bounds checking as an additional safety layer
+
 ### Empty Directories Not Cleaned Up After Daily Compaction
 
 Fixed an issue where empty hour-level partition directories were left behind after daily compaction consolidated files into day-level partitions.
