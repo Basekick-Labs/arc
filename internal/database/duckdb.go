@@ -49,6 +49,8 @@ type Config struct {
 	AzureAccountName string
 	AzureAccountKey  string
 	AzureEndpoint    string // Custom endpoint (optional)
+	// Query optimization configuration
+	EnableS3Cache bool // Enable S3 file caching via cache_httpfs extension
 }
 
 // New creates a new DuckDB instance
@@ -199,6 +201,15 @@ func configureS3Access(db *sql.DB, cfg *Config) error {
 	}
 	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_use_ssl=%s", useSSL)); err != nil {
 		return fmt.Errorf("failed to set s3_use_ssl: %w", err)
+	}
+
+	// Configure cache_httpfs extension for S3 file caching if enabled
+	if cfg.EnableS3Cache {
+		if _, err := db.Exec("INSTALL cache_httpfs FROM community"); err == nil {
+			if _, err := db.Exec("LOAD cache_httpfs"); err == nil {
+				db.Exec("SET cache_httpfs_type='in_memory'")
+			}
+		}
 	}
 
 	return nil

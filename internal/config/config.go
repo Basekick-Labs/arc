@@ -29,6 +29,7 @@ type Config struct {
 	License         LicenseConfig
 	Scheduler       SchedulerConfig
 	Cluster         ClusterConfig
+	Query           QueryConfig
 }
 
 type ServerConfig struct {
@@ -159,6 +160,11 @@ type MetricsConfig struct {
 // See POST /api/v1/mqtt/subscriptions for creating subscriptions.
 type MQTTConfig struct {
 	Enabled bool // Enable MQTT subscription manager feature
+}
+
+// QueryConfig holds configuration for query execution optimizations
+type QueryConfig struct {
+	EnableS3Cache bool // Enable S3 file caching for faster repeated reads (useful for CTEs/subqueries)
 }
 
 // LicenseConfig holds configuration for enterprise license validation
@@ -375,6 +381,9 @@ func Load() (*Config, error) {
 		MQTT: MQTTConfig{
 			Enabled: v.GetBool("mqtt.enabled"),
 		},
+		Query: QueryConfig{
+			EnableS3Cache: v.GetBool("query.enable_s3_cache"),
+		},
 		License: LicenseConfig{
 			Enabled: v.GetBool("license.enabled"),
 			Key:     v.GetString("license.key"),
@@ -524,6 +533,9 @@ func setDefaults(v *viper.Viper) {
 
 	// MQTT defaults (subscriptions are configured via REST API, stored in SQLite)
 	v.SetDefault("mqtt.enabled", false) // Feature toggle only - disabled by default
+
+	// Query defaults
+	v.SetDefault("query.enable_s3_cache", false) // Disabled by default (opt-in feature)
 
 	// License defaults (Enterprise features)
 	// Note: Server URL and validation interval are hardcoded in internal/license/client.go
