@@ -1,0 +1,160 @@
+name: Bug Report
+description: Report a bug to help us improve Arc
+labels:
+  - bug
+  - needs triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for taking the time to report a bug! Please fill out the form below to help us understand and reproduce the issue.
+
+        **Before submitting:**
+        - Check if a similar issue already exists in [open issues](https://github.com/basekick-labs/arc/issues)
+        - For security vulnerabilities, please email **security@basekick.net** instead
+
+  - type: textarea
+    attributes:
+      label: What happened?
+      description: A clear and concise description of what the bug is.
+      placeholder: |
+        Example: Queries return "No files found" error when querying data ingested less than 24 hours ago on S3 storage.
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+      placeholder: |
+        Example: The query should return data from hourly partitions when daily compaction hasn't run yet.
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Steps to reproduce
+      description: |
+        Please provide detailed steps to reproduce the issue. Include:
+        - Configuration (relevant sections from arc.toml)
+        - API requests (curl commands or SDK code)
+        - SQL queries if applicable
+
+        Format code blocks using triple backticks:
+        ```
+        CODE HERE
+        ```
+      placeholder: |
+        1. Configure Arc with S3 storage backend
+        2. Ingest data using: `curl -X POST http://localhost:8000/api/v1/write/msgpack ...`
+        3. Query the data: `SELECT * FROM mydb.cpu WHERE time > NOW() - INTERVAL '1 hour'`
+        4. See error: "No files found that match the pattern"
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Relevant log output
+      description: |
+        Please copy and paste any relevant log output. This will be automatically formatted into code.
+      render: shell
+    validations:
+      required: false
+
+  - type: markdown
+    attributes:
+      value: "## Environment"
+
+  - type: input
+    attributes:
+      label: Arc Version
+      description: Output of `arc version` or the Docker image tag
+      placeholder: "v26.02.1"
+    validations:
+      required: true
+
+  - type: input
+    attributes:
+      label: Operating System
+      description: Include OS version and architecture (e.g., aarch64, x86_64)
+      placeholder: "Ubuntu 22.04 LTS (x86_64)"
+    validations:
+      required: true
+
+  - type: dropdown
+    attributes:
+      label: Storage Backend
+      description: Which storage backend are you using?
+      options:
+        - Local filesystem
+        - S3
+        - MinIO
+        - Azure Blob Storage
+        - Other (please specify in description)
+    validations:
+      required: true
+
+  - type: dropdown
+    attributes:
+      label: Deployment Method
+      description: How is Arc deployed?
+      options:
+        - Docker
+        - Docker Compose
+        - Kubernetes / Helm
+        - Native binary (deb/rpm)
+        - Built from source
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    attributes:
+      label: Hardware
+      description: CPU, memory, and disk type (especially for performance issues)
+      placeholder: "8-core CPU, 32GB RAM, NVMe SSD"
+    validations:
+      required: false
+
+  - type: markdown
+    attributes:
+      value: "## Identity Disclosure"
+
+  - type: input
+    attributes:
+      label: Full Name
+      description: Your full name (required for issue triage)
+      placeholder: "John Doe"
+    validations:
+      required: true
+
+  - type: input
+    attributes:
+      label: Affiliation
+      description: Your company or organization (if applicable)
+      placeholder: "Acme Corporation"
+    validations:
+      required: false
+
+  - type: markdown
+    attributes:
+      value: |
+        We ask for identity disclosure to help us prioritize issues and maintain accountability in our community.
+        If your GitHub profile clearly shows your identity, you can leave the affiliation field blank.
+
+        If the above is not provided and is not obvious from your GitHub profile, we may close your issue without further review.
+        Please refer to the [reasoning behind this rule](https://berthub.eu/articles/posts/anonymous-help/) if you have questions.
+
+        ## Before Submitting
+
+  - type: checkboxes
+    attributes:
+      label: Checklist
+      description: Please confirm the following
+      options:
+        - label: I have searched existing issues to ensure this bug hasn't been reported
+          required: true
+        - label: I have included all relevant configuration and environment details
+          required: true
+        - label: I have provided steps to reproduce the issue
+          required: true

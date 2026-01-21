@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Feature Request
+    url: https://github.com/basekick-labs/arc/discussions/new?category=ideas&title=Feature%20Request:%20...
+    about: Submit feature requests and ideas for new functionality
+  - name: Questions & Discussions
+    url: https://github.com/basekick-labs/arc/discussions
+    about: Ask questions, share tips, and discuss Arc with the community
+  - name: Discord Community
+    url: https://discord.gg/nxnWfUxsdm
+    about: Chat with the Arc community in real-time
