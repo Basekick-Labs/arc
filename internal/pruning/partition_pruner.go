@@ -812,9 +812,30 @@ func (p *PartitionPruner) filterExistingRemotePaths(paths []string) []string {
 	existingPaths := []string{}
 	for _, path := range paths {
 		dir := pathToDir[path]
-		if existingDirs[dir] {
-			existingPaths = append(existingPaths, path)
+		if !existingDirs[dir] {
+			continue
 		}
+
+		// For day-level paths (5 segments: db/measurement/year/month/day),
+		// verify .parquet files exist directly at that level
+		prefix := p.extractStoragePrefix(dir + "/")
+		if parts := strings.Split(strings.Trim(prefix, "/"), "/"); len(parts) == 5 {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			files, _ := p.storage.List(ctx, prefix)
+			cancel()
+			hasFiles := false
+			for _, f := range files {
+				if !strings.Contains(strings.TrimPrefix(f, prefix), "/") {
+					hasFiles = true
+					break
+				}
+			}
+			if !hasFiles {
+				continue
+			}
+		}
+
+		existingPaths = append(existingPaths, path)
 	}
 
 	p.logger.Info().
