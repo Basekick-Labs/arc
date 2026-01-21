@@ -113,7 +113,8 @@ func (c *globCache) stats() (hits, misses int64, size int) {
 // These are compiled once at package init rather than on every query
 var (
 	// Pattern to extract WHERE clause from SQL
-	whereClausePattern = regexp.MustCompile(`(?i)\bWHERE\b\s+(.+?)(?:\bGROUP BY\b|\bORDER BY\b|\bLIMIT\b|$)`)
+	// Using [\s\S]+? instead of .+? to match across newlines
+	whereClausePattern = regexp.MustCompile(`(?i)\bWHERE\b\s+([\s\S]+?)(?:\bGROUP BY\b|\bORDER BY\b|\bLIMIT\b|$)`)
 
 	// Patterns for start time extraction
 	startTimePatterns = []*regexp.Regexp{
