@@ -19,6 +19,7 @@ import (
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/pruning"
 	"github.com/basekick-labs/arc/internal/query"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
@@ -359,12 +360,6 @@ func parseTimeBucketOrigin(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("cannot parse timestamp: %s", s)
 }
 
-// stringMask holds a placeholder and the original string content it replaced
-type stringMask struct {
-	placeholder string
-	original    string
-}
-
 // sqlFeatures contains flags for what features are present in a SQL string
 type sqlFeatures struct {
 	hasQuotes      bool // single or double quotes
@@ -393,77 +388,6 @@ func scanSQLFeatures(sql string) sqlFeatures {
 	return f
 }
 
-// maskStringLiterals replaces string literals with placeholders to prevent regex from matching inside them.
-// Handles both single-quoted ('...') and double-quoted ("...") strings, including escaped quotes.
-// Returns the masked SQL and a slice of masks for later restoration.
-func maskStringLiterals(sql string, hasQuotes bool) (string, []stringMask) {
-	// Fast path: if no quotes, return original string (avoids allocation)
-	if !hasQuotes {
-		return sql, nil
-	}
-
-	var masks []stringMask
-	var result strings.Builder
-	result.Grow(len(sql))
-
-	i := 0
-	maskIndex := 0
-
-	for i < len(sql) {
-		ch := sql[i]
-
-		// Check for string literal start (single or double quote)
-		if ch == '\'' || ch == '"' {
-			quote := ch
-			start := i
-			i++ // Move past opening quote
-
-			// Find the closing quote, handling escaped quotes
-			for i < len(sql) {
-				if sql[i] == quote {
-					// Check if it's an escaped quote ('' or "")
-					if i+1 < len(sql) && sql[i+1] == quote {
-						i += 2 // Skip escaped quote
-						continue
-					}
-					// Also handle backslash escaping (\' or \")
-					if i > 0 && sql[i-1] == '\\' {
-						i++
-						continue
-					}
-					break // Found closing quote
-				}
-				i++
-			}
-
-			// Include the closing quote if found
-			if i < len(sql) {
-				i++
-			}
-
-			// Extract the full string literal and create a placeholder
-			original := sql[start:i]
-			placeholder := fmt.Sprintf("__STR_%d__", maskIndex)
-			masks = append(masks, stringMask{placeholder: placeholder, original: original})
-			result.WriteString(placeholder)
-			maskIndex++
-		} else {
-			result.WriteByte(ch)
-			i++
-		}
-	}
-
-	return result.String(), masks
-}
-
-// unmaskStringLiterals restores the original string literals from their placeholders.
-func unmaskStringLiterals(sql string, masks []stringMask) string {
-	result := sql
-	for _, mask := range masks {
-		result = strings.Replace(result, mask.placeholder, mask.original, 1)
-	}
-	return result
-}
 
 // stripSQLComments removes SQL comments from the query.
 // Handles: -- single line comments and /* multi-line comments */
@@ -1340,7 +1264,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 
 	// Phase 1: Mask string literals to prevent regex from matching inside them
 	// e.g., WHERE msg = 'SELECT * FROM mydb.cpu' should not convert the string content
-	sql, masks := maskStringLiterals(sql, features.hasQuotes)
+	sql, masks := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
 
 	// Phase 2: Strip SQL comments (after masking to preserve comments inside strings)
 	// e.g., "-- FROM mydb.cpu" should not be converted
@@ -1434,7 +1358,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 	})
 
 	// Restore original string literals
-	sql = unmaskStringLiterals(sql, masks)
+	sql = sqlutil.UnmaskStringLiterals(sql, masks)
 
 	return sql
 }
@@ -1680,7 +1604,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database
 	features := scanSQLFeatures(sql)
 
 	// Phase 1: Mask string literals to prevent regex from matching inside them
-	sql, masks := maskStringLiterals(sql, features.hasQuotes)
+	sql, masks := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
 
 	// Phase 2: Strip SQL comments
 	sql = stripSQLComments(sql, features.hasDashComment || features.hasBlockComment)
@@ -1761,7 +1685,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database
 	})
 
 	// Restore original string literals
-	sql = unmaskStringLiterals(sql, masks)
+	sql = sqlutil.UnmaskStringLiterals(sql, masks)
 
 	return sql
 }

@@ -8,6 +8,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/pruning"
+	"github.com/basekick-labs/arc/internal/sql"
 	"github.com/rs/zerolog"
 )
 
@@ -129,12 +130,12 @@ func TestMaskStringLiterals(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			features := scanSQLFeatures(tt.input)
-			masked, masks := maskStringLiterals(tt.input, features.hasQuotes)
+			masked, masks := sql.MaskStringLiterals(tt.input, features.hasQuotes)
 			if masked != tt.expectedMasked {
-				t.Errorf("maskStringLiterals() masked = %q, want %q", masked, tt.expectedMasked)
+				t.Errorf("MaskStringLiterals() masked = %q, want %q", masked, tt.expectedMasked)
 			}
 			if len(masks) != tt.expectedMasks {
-				t.Errorf("maskStringLiterals() masks count = %d, want %d", len(masks), tt.expectedMasks)
+				t.Errorf("MaskStringLiterals() masks count = %d, want %d", len(masks), tt.expectedMasks)
 			}
 		})
 	}
@@ -144,21 +145,21 @@ func TestUnmaskStringLiterals(t *testing.T) {
 	tests := []struct {
 		name     string
 		input    string
-		masks    []stringMask
+		masks    []sql.StringMask
 		expected string
 	}{
 		{
 			name:     "restore single string",
 			input:    "SELECT * FROM t WHERE x = __STR_0__",
-			masks:    []stringMask{{placeholder: "__STR_0__", original: "'hello'"}},
+			masks:    []sql.StringMask{{Placeholder: "__STR_0__", Original: "'hello'"}},
 			expected: "SELECT * FROM t WHERE x = 'hello'",
 		},
 		{
 			name:  "restore multiple strings",
 			input: "SELECT * FROM t WHERE x = __STR_0__ AND y = __STR_1__",
-			masks: []stringMask{
-				{placeholder: "__STR_0__", original: "'hello'"},
-				{placeholder: "__STR_1__", original: "'world'"},
+			masks: []sql.StringMask{
+				{Placeholder: "__STR_0__", Original: "'hello'"},
+				{Placeholder: "__STR_1__", Original: "'world'"},
 			},
 			expected: "SELECT * FROM t WHERE x = 'hello' AND y = 'world'",
 		},
@@ -166,9 +167,9 @@ func TestUnmaskStringLiterals(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := unmaskStringLiterals(tt.input, tt.masks)
+			result := sql.UnmaskStringLiterals(tt.input, tt.masks)
 			if result != tt.expected {
-				t.Errorf("unmaskStringLiterals() = %q, want %q", result, tt.expected)
+				t.Errorf("UnmaskStringLiterals() = %q, want %q", result, tt.expected)
 			}
 		})
 	}

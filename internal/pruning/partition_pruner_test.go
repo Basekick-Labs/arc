@@ -153,6 +153,52 @@ func TestExtractTimeRange(t *testing.T) {
 			wantStart: "2024-03-15",
 			wantEnd:   "2024-03-16",
 		},
+		{
+			name: "multi-line query with GROUP BY",
+			sql: `SELECT region, COUNT(*)
+FROM metrics
+WHERE time >= '2024-03-15T00:00:00Z' AND time < '2024-03-16T00:00:00Z'
+GROUP BY region`,
+			wantStart: "2024-03-15T00:00:00Z",
+			wantEnd:   "2024-03-16T00:00:00Z",
+		},
+		{
+			name: "multi-line query with ORDER BY",
+			sql: `SELECT *
+FROM cpu
+WHERE time >= '2024-03-15' AND time < '2024-03-16'
+ORDER BY time DESC`,
+			wantStart: "2024-03-15",
+			wantEnd:   "2024-03-16",
+		},
+		{
+			name: "multi-line query with LIMIT",
+			sql: `SELECT *
+FROM cpu
+WHERE time >= '2024-03-15'
+  AND time < '2024-03-16'
+LIMIT 100`,
+			wantStart: "2024-03-15",
+			wantEnd:   "2024-03-16",
+		},
+		{
+			name:      "string literal with GROUP BY",
+			sql:       "SELECT * FROM cpu WHERE time >= '2024-03-15' AND message LIKE '%GROUP BY%' AND time < '2024-03-16' GROUP BY host",
+			wantStart: "2024-03-15",
+			wantEnd:   "2024-03-16",
+		},
+		{
+			name:      "string literal with ORDER BY",
+			sql:       "SELECT * FROM cpu WHERE time >= '2024-03-15' AND error = 'ORDER BY failed' AND time < '2024-03-16' ORDER BY time",
+			wantStart: "2024-03-15",
+			wantEnd:   "2024-03-16",
+		},
+		{
+			name:      "string literal with LIMIT",
+			sql:       "SELECT * FROM logs WHERE time >= '2024-03-15' AND query LIKE '%LIMIT 100%' AND time < '2024-03-16' LIMIT 50",
+			wantStart: "2024-03-15",
+			wantEnd:   "2024-03-16",
+		},
 	}
 
 	for _, tt := range tests {

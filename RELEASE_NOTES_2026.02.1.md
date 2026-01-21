@@ -178,9 +178,9 @@ Fixed an issue where measurement names containing ASCII control characters (0x01
 
 Invalid measurement names now return a `400 Bad Request` with a descriptive error message.
 
-### Partition Pruner Fails on Non-Existent S3 Partitions (Issue #125)
+### Partition Pruner Fails on Non-Existent S3 Partitions (Issue #125, #144)
 
-Fixed an issue where time-filtered queries would fail with "No files found" errors when the requested time range included partitions that don't exist in S3 storage.
+Fixed an issue where time-filtered queries would fail with "No files found" errors when the requested time range included partitions that don't exist in S3 storage. This particularly affected queries for recent data (< 24 hours) before daily compaction has run.
 
 **Cause:** The partition pruner generated paths for all hours in a time range without verifying existence. For local storage, it used `filepath.Glob()` to filter paths, but for S3/Azure storage, paths were passed directly to DuckDB which threw errors for missing partitions.
 
@@ -282,6 +282,57 @@ Added support for nanosecond-precision timestamps in the MessagePack ingestion e
 - Nanoseconds: >= 1e16 (19 digits) → divide by 1,000
 
 **Note:** Line Protocol already correctly handles nanoseconds per the InfluxDB specification.
+
+### WHERE Clause Regex Fails to Match Multi-Line Queries (Issue #146, PR #148)
+
+Fixed an issue where the partition pruner failed to extract time ranges from multi-line SQL queries, causing full table scans instead of targeted partition access.
+
+**Root cause:** The `whereClausePattern` regex used `.+?` which does not match newlines in Go's regex engine. Multi-line queries with WHERE clauses spanning multiple lines would fail to extract time bounds.
+
+**Symptoms:**
+- Queries with newlines in the WHERE clause skipped partition pruning entirely
+- Debug logs showed "No time range found in query, skipping partition pruning"
+- Resulted in `/**/*.parquet` glob patterns (full table scan) instead of targeted partitions
+- Increased S3 costs and query latency
+
+**Fix:** Changed `.+?` to `[\s\S]+?` in the WHERE clause pattern to explicitly match any character including newlines.
+
+**Example query now working:**
+```sql
+SELECT region, COUNT(*)
+FROM metrics
+WHERE time >= '2026-01-21T07:00:00Z'
+  AND time < '2026-01-21T08:00:00Z'
+GROUP BY region
+```
+
+*Contributed by [@khalid244](https://github.com/khalid244)*
+
+### String Literals Containing SQL Keywords Break Partition Pruning
+
+Fixed an issue where string literals containing SQL keywords (`GROUP BY`, `ORDER BY`, `LIMIT`) would cause the WHERE clause regex to terminate prematurely, potentially missing time range extraction.
+
+**Root cause:** The `whereClausePattern` regex stopped at SQL keywords without checking if they were inside string literals. A query like `WHERE time >= '2024-01-01' AND message LIKE '%GROUP BY%'` would only capture `time >= '2024-01-01' AND message LIKE '%` before hitting the embedded `GROUP BY`.
+
+**Fix:** Added string literal masking before regex matching. String literals are replaced with placeholders (`__STR_0__`, etc.) during WHERE clause boundary detection, then restored for time value extraction.
+
+**Example queries now working:**
+```sql
+-- String containing GROUP BY
+SELECT * FROM logs
+WHERE time >= '2024-03-15' AND error LIKE '%GROUP BY%' AND time < '2024-03-16'
+GROUP BY host
+
+-- String containing ORDER BY
+SELECT * FROM logs
+WHERE time >= '2024-03-15' AND query = 'SELECT * ORDER BY id' AND time < '2024-03-16'
+ORDER BY time
+
+-- String containing LIMIT
+SELECT * FROM logs
+WHERE time >= '2024-03-15' AND msg LIKE '%LIMIT 100%' AND time < '2024-03-16'
+LIMIT 50
+```
 
 ### Buffer Age-Based Flush Timing Under High Load (Issue #142)
 
@@ -945,6 +996,7 @@ None
 Thanks to the following contributors for this release:
 
 - [@schotime](https://github.com/schotime) (Adam Schroder) - Data-time partitioning, compaction API triggers, UTC fixes, Azure SSL certificate fix
+- [@khalid244](https://github.com/khalid244) - Multi-line WHERE clause regex fix (Issue #146, PR #148)
 
 ## Dependencies
 

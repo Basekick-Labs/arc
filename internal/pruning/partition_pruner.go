@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
@@ -344,19 +345,25 @@ func (p *PartitionPruner) SetStorageBackend(backend storage.Backend) {
 // - time > NOW() - INTERVAL '20 days'
 // - time >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
 // - time < NOW() + INTERVAL '1 week'
-func (p *PartitionPruner) ExtractTimeRange(sql string) *TimeRange {
+func (p *PartitionPruner) ExtractTimeRange(sqlStr string) *TimeRange {
 	// Check if WHERE clause exists
-	if !strings.Contains(strings.ToUpper(sql), "WHERE") {
+	if !strings.Contains(strings.ToUpper(sqlStr), "WHERE") {
 		return nil
 	}
 
-	// Extract WHERE clause using pre-compiled pattern
-	matches := whereClausePattern.FindStringSubmatch(sql)
+	// Mask string literals to prevent regex from matching GROUP BY/ORDER BY/LIMIT inside strings
+	// e.g., "WHERE message LIKE '%GROUP BY%'" should not stop at the literal GROUP BY
+	maskedSQL, masks := sql.MaskStringLiterals(sqlStr, sql.HasQuotes(sqlStr))
+
+	// Extract WHERE clause boundaries using masked SQL
+	matches := whereClausePattern.FindStringSubmatch(maskedSQL)
 	if len(matches) < 2 {
 		return nil
 	}
 
-	whereClause := matches[1]
+	// Get the masked WHERE clause, then unmask it to get actual time values
+	maskedWhereClause := matches[1]
+	whereClause := sql.UnmaskStringLiterals(maskedWhereClause, masks)
 	p.logger.Debug().Str("where_clause", whereClause[:min(100, len(whereClause))]).Msg("Analyzing WHERE clause")
 
 	var startTime, endTime *time.Time
