@@ -178,18 +178,23 @@ Fixed an issue where measurement names containing ASCII control characters (0x01
 
 Invalid measurement names now return a `400 Bad Request` with a descriptive error message.
 
-### Partition Pruner Fails on Non-Existent S3 Partitions (Issue #125, #144)
+### Partition Pruner Fails on Non-Existent S3 Partitions (Issue #125, #144, PR #145)
 
 Fixed an issue where time-filtered queries would fail with "No files found" errors when the requested time range included partitions that don't exist in S3 storage. This particularly affected queries for recent data (< 24 hours) before daily compaction has run.
 
 **Cause:** The partition pruner generated paths for all hours in a time range without verifying existence. For local storage, it used `filepath.Glob()` to filter paths, but for S3/Azure storage, paths were passed directly to DuckDB which threw errors for missing partitions.
 
+Additionally, for day-level paths (`year/month/day/*.parquet`), the pruner only checked if the **directory** existed (which passes when hourly subdirectories exist), but didn't verify that actual `.parquet` files exist at the day level.
+
 **Fix:** Extended `filterExistingPaths()` to handle S3/Azure storage:
 - Uses `ListDirectories()` to verify which partition paths actually exist
+- For day-level paths (5 segments), verifies that `.parquet` files exist directly at that level (not just in subdirectories)
 - Filters out non-existent partitions before passing to DuckDB
 - Also fixed a pre-existing bug where `filepath.Join()` was mangling S3 URLs (`s3://bucket` → `s3:/bucket`)
 
-**Result:** Queries on sparse datasets (with gaps in time partitions) now succeed and return data from existing partitions instead of failing.
+**Result:** Queries on sparse datasets (with gaps in time partitions) now succeed and return data from existing partitions instead of failing. Grafana dashboards querying recent data (< 24 hours) on S3 now work correctly.
+
+*Day-level file verification contributed by [@khalid244](https://github.com/khalid244)*
 
 ### Server Timeout Config Values Ignored (Issue #126)
 
@@ -996,7 +1001,7 @@ None
 Thanks to the following contributors for this release:
 
 - [@schotime](https://github.com/schotime) (Adam Schroder) - Data-time partitioning, compaction API triggers, UTC fixes, Azure SSL certificate fix
-- [@khalid244](https://github.com/khalid244) - Multi-line WHERE clause regex fix (Issue #146, PR #148)
+- [@khalid244](https://github.com/khalid244) - Multi-line WHERE clause regex fix (Issue #146, PR #148), S3 day-level file verification (Issue #144, PR #145)
 
 ## Dependencies
 
