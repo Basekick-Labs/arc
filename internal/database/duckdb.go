@@ -214,8 +214,8 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		} else if _, err := db.Exec("LOAD cache_httpfs"); err != nil {
 			logger.Warn().Err(err).Msg("Failed to load cache_httpfs extension, continuing without cache")
 		} else {
-			if _, err := db.Exec("SET cache_httpfs_type='in_memory'"); err != nil {
-				logger.Warn().Err(err).Msg("Failed to set cache_httpfs_type to in_memory")
+			if _, err := db.Exec("SET cache_httpfs_type='in_mem'"); err != nil {
+				logger.Warn().Err(err).Msg("Failed to set cache_httpfs_type to in_mem")
 			}
 			// Calculate max blocks from cache size (each block is 512KB)
 			if cfg.S3CacheSize > 0 {
@@ -238,7 +238,7 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 			logger.Info().
 				Int64("cache_size_bytes", cfg.S3CacheSize).
 				Int("ttl_seconds", cfg.S3CacheTTLSeconds).
-				Msg("cache_httpfs extension loaded with in_memory mode")
+				Msg("cache_httpfs extension loaded with in_mem mode")
 		}
 	}
 
