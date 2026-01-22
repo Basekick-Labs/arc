@@ -657,3 +657,71 @@ func TestLoad_ClusterSeedsEnvOverride(t *testing.T) {
 		}
 	}
 }
+
+// QueryConfig Tests
+
+func TestQueryConfig_Defaults(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	// Test defaults
+	if cfg.Query.EnableS3Cache != false {
+		t.Errorf("Query.EnableS3Cache default = %v, want false", cfg.Query.EnableS3Cache)
+	}
+	expectedSize := int64(128 * 1024 * 1024) // 128MB in bytes
+	if cfg.Query.S3CacheSize != expectedSize {
+		t.Errorf("Query.S3CacheSize default = %d, want %d (128MB)", cfg.Query.S3CacheSize, expectedSize)
+	}
+	if cfg.Query.S3CacheTTLSeconds != 3600 {
+		t.Errorf("Query.S3CacheTTLSeconds default = %d, want 3600", cfg.Query.S3CacheTTLSeconds)
+	}
+}
+
+func TestQueryConfig_EnvOverride(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	os.Setenv("ARC_QUERY_ENABLE_S3_CACHE", "true")
+	os.Setenv("ARC_QUERY_S3_CACHE_SIZE", "256MB")
+	os.Setenv("ARC_QUERY_S3_CACHE_TTL_SECONDS", "7200")
+	defer func() {
+		os.Unsetenv("ARC_QUERY_ENABLE_S3_CACHE")
+		os.Unsetenv("ARC_QUERY_S3_CACHE_SIZE")
+		os.Unsetenv("ARC_QUERY_S3_CACHE_TTL_SECONDS")
+	}()
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Query.EnableS3Cache != true {
+		t.Errorf("Query.EnableS3Cache = %v, want true", cfg.Query.EnableS3Cache)
+	}
+	expectedSize := int64(256 * 1024 * 1024) // 256MB in bytes
+	if cfg.Query.S3CacheSize != expectedSize {
+		t.Errorf("Query.S3CacheSize = %d, want %d (256MB)", cfg.Query.S3CacheSize, expectedSize)
+	}
+	if cfg.Query.S3CacheTTLSeconds != 7200 {
+		t.Errorf("Query.S3CacheTTLSeconds = %d, want 7200", cfg.Query.S3CacheTTLSeconds)
+	}
+}

@@ -29,6 +29,7 @@ type Config struct {
 	License         LicenseConfig
 	Scheduler       SchedulerConfig
 	Cluster         ClusterConfig
+	Query           QueryConfig
 }
 
 type ServerConfig struct {
@@ -161,6 +162,13 @@ type MQTTConfig struct {
 	Enabled bool // Enable MQTT subscription manager feature
 }
 
+// QueryConfig holds configuration for query execution optimizations
+type QueryConfig struct {
+	EnableS3Cache     bool  // Enable S3 file caching for faster repeated reads (useful for CTEs/subqueries)
+	S3CacheSize       int64 // Cache size in bytes (parsed from "128MB", "256MB", etc.)
+	S3CacheTTLSeconds int   // Cache entry TTL in seconds (default: 3600 = 1 hour)
+}
+
 // LicenseConfig holds configuration for enterprise license validation
 type LicenseConfig struct {
 	Enabled bool   // Enable license validation (default: false)
@@ -261,6 +269,12 @@ func Load() (*Config, error) {
 	maxPayloadSize, err := ParseSize(v.GetString("server.max_payload_size"))
 	if err != nil {
 		return nil, fmt.Errorf("invalid server.max_payload_size: %w", err)
+	}
+
+	// Parse S3 cache size
+	s3CacheSize, err := ParseSize(v.GetString("query.s3_cache_size"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid query.s3_cache_size: %w", err)
 	}
 
 	// Build config from Viper (which includes defaults + env vars)
@@ -374,6 +388,11 @@ func Load() (*Config, error) {
 		},
 		MQTT: MQTTConfig{
 			Enabled: v.GetBool("mqtt.enabled"),
+		},
+		Query: QueryConfig{
+			EnableS3Cache:     v.GetBool("query.enable_s3_cache"),
+			S3CacheSize:       s3CacheSize,
+			S3CacheTTLSeconds: v.GetInt("query.s3_cache_ttl_seconds"),
 		},
 		License: LicenseConfig{
 			Enabled: v.GetBool("license.enabled"),
@@ -524,6 +543,11 @@ func setDefaults(v *viper.Viper) {
 
 	// MQTT defaults (subscriptions are configured via REST API, stored in SQLite)
 	v.SetDefault("mqtt.enabled", false) // Feature toggle only - disabled by default
+
+	// Query defaults
+	v.SetDefault("query.enable_s3_cache", false)       // Disabled by default (opt-in feature)
+	v.SetDefault("query.s3_cache_size", "128MB")       // 128MB cache (256 blocks × 512KB)
+	v.SetDefault("query.s3_cache_ttl_seconds", 3600)   // 1 hour
 
 	// License defaults (Enterprise features)
 	// Note: Server URL and validation interval are hardcoded in internal/license/client.go

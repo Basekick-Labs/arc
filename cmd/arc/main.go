@@ -166,6 +166,10 @@ func main() {
 		AzureAccountName: cfg.Storage.AzureAccountName,
 		AzureAccountKey:  cfg.Storage.AzureAccountKey,
 		AzureEndpoint:    cfg.Storage.AzureEndpoint,
+		// Query optimization
+		EnableS3Cache:     cfg.Query.EnableS3Cache,
+		S3CacheSize:       cfg.Query.S3CacheSize,
+		S3CacheTTLSeconds: cfg.Query.S3CacheTTLSeconds,
 	}
 
 	db, err := database.New(dbConfig, logger.Get("database"))

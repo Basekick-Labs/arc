@@ -257,5 +257,36 @@ enabled = false
 # Enable MQTT subscription manager (subscriptions configured via API)
 enabled = false
 
+# -----------------------------------------------------------------------------
+# Query Configuration
+# -----------------------------------------------------------------------------
+# Query execution optimizations
+[query]
+# Enable S3 file caching via DuckDB's cache_httpfs extension
+# When enabled, caches S3 Parquet files in memory for faster repeated reads.
+# This significantly improves query performance (5-10x) for:
+#   - CTEs (Common Table Expressions) that read the same table multiple times
+#   - Subqueries accessing the same data
+#   - Grafana dashboards with multiple panels querying similar time ranges
+#
+# Trade-off: Increases memory usage based on cache size settings below
+# Only effective when storage.backend = "s3"
+#
+# Environment variable: ARC_QUERY_ENABLE_S3_CACHE
+# Default: false
+enable_s3_cache = false
+
+# Maximum size for in-memory S3 cache
+# Supports: KB, MB, GB (e.g., "128MB", "256MB", "1GB")
+# Environment variable: ARC_QUERY_S3_CACHE_SIZE
+# Default: "128MB"
+s3_cache_size = "128MB"
+
+# Cache entry TTL (time-to-live) in seconds
+# Cached blocks are evicted after this duration
+# Environment variable: ARC_QUERY_S3_CACHE_TTL_SECONDS
+# Default: 3600 (1 hour)
+s3_cache_ttl_seconds = 3600
+
 [telemetry]
 enabled = true

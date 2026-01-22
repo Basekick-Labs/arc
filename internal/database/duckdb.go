@@ -49,6 +49,10 @@ type Config struct {
 	AzureAccountName string
 	AzureAccountKey  string
 	AzureEndpoint    string // Custom endpoint (optional)
+	// Query optimization configuration
+	EnableS3Cache     bool  // Enable S3 file caching via cache_httpfs extension
+	S3CacheSize       int64 // Cache size in bytes
+	S3CacheTTLSeconds int   // Cache entry TTL in seconds (default: 3600)
 }
 
 // New creates a new DuckDB instance
@@ -88,6 +92,7 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 		Bool("wal_enabled", cfg.EnableWAL).
 		Bool("s3_enabled", s3Enabled).
 		Str("s3_region", cfg.S3Region).
+		Bool("s3_cache_enabled", cfg.EnableS3Cache).
 		Bool("azure_enabled", azureEnabled).
 		Str("azure_account", cfg.AzureAccountName).
 		Msg("DuckDB initialized")
@@ -135,7 +140,7 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 
 	// Configure httpfs extension for S3 access if credentials are provided
 	if cfg.S3AccessKey != "" && cfg.S3SecretKey != "" {
-		if err := configureS3Access(db, cfg); err != nil {
+		if err := configureS3Access(db, cfg, logger); err != nil {
 			return fmt.Errorf("failed to configure S3 access: %w", err)
 		}
 	}
@@ -152,7 +157,7 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 
 // configureS3Access sets up the httpfs extension for S3 access
 // Note: We use SET GLOBAL to ensure settings persist across all connections in the pool
-func configureS3Access(db *sql.DB, cfg *Config) error {
+func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	// Install and load the httpfs extension
 	if _, err := db.Exec("INSTALL httpfs"); err != nil {
 		return fmt.Errorf("failed to install httpfs: %w", err)
@@ -199,6 +204,36 @@ func configureS3Access(db *sql.DB, cfg *Config) error {
 	}
 	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_use_ssl=%s", useSSL)); err != nil {
 		return fmt.Errorf("failed to set s3_use_ssl: %w", err)
+	}
+
+	// Configure cache_httpfs extension for S3 file caching if enabled
+	if cfg.EnableS3Cache {
+		logger.Info().Msg("Enabling S3 file caching via cache_httpfs extension")
+		if _, err := db.Exec("INSTALL cache_httpfs FROM community"); err != nil {
+			logger.Warn().Err(err).Msg("Failed to install cache_httpfs extension, continuing without cache")
+		} else if _, err := db.Exec("LOAD cache_httpfs"); err != nil {
+			logger.Warn().Err(err).Msg("Failed to load cache_httpfs extension, continuing without cache")
+		} else {
+			db.Exec("SET cache_httpfs_type='in_memory'")
+			// Calculate max blocks from cache size (each block is 512KB)
+			if cfg.S3CacheSize > 0 {
+				maxBlocks := cfg.S3CacheSize / (512 * 1024) // 512KB per block
+				if maxBlocks > 0 {
+					db.Exec(fmt.Sprintf("SET cache_httpfs_max_in_mem_cache_block_count=%d", maxBlocks))
+				} else {
+					logger.Warn().
+						Int64("configured_bytes", cfg.S3CacheSize).
+						Msg("S3 cache size too small (minimum 512KB), increase s3_cache_size for caching to take effect")
+				}
+			}
+			if cfg.S3CacheTTLSeconds > 0 {
+				db.Exec(fmt.Sprintf("SET cache_httpfs_in_mem_cache_block_timeout_millisec=%d", cfg.S3CacheTTLSeconds*1000))
+			}
+			logger.Info().
+				Int64("cache_size_bytes", cfg.S3CacheSize).
+				Int("ttl_seconds", cfg.S3CacheTTLSeconds).
+				Msg("cache_httpfs extension loaded with in_memory mode")
+		}
 	}
 
 	return nil
