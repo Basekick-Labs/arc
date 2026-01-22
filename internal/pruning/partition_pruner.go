@@ -808,7 +808,7 @@ func (p *PartitionPruner) filterExistingRemotePaths(paths []string) []string {
 		}
 	}
 
-	// Filter paths to only include existing directories
+	// Filter paths to only include existing directories/files
 	existingPaths := []string{}
 	for _, path := range paths {
 		dir := pathToDir[path]
@@ -817,20 +817,28 @@ func (p *PartitionPruner) filterExistingRemotePaths(paths []string) []string {
 		}
 
 		// For day-level paths (5 segments: db/measurement/year/month/day),
-		// verify .parquet files exist directly at that level
+		// verify .parquet files exist directly at that level (not in subdirs).
+		// This prevents "No files found" errors when daily compaction hasn't run yet.
 		prefix := p.extractStoragePrefix(dir + "/")
 		if parts := strings.Split(strings.Trim(prefix, "/"), "/"); len(parts) == 5 {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			files, _ := p.storage.List(ctx, prefix)
+			files, err := p.storage.List(ctx, prefix)
 			cancel()
+			if err != nil {
+				p.logger.Debug().Err(err).Str("prefix", prefix).Msg("Failed to list files at day-level path")
+				continue
+			}
 			hasFiles := false
 			for _, f := range files {
-				if !strings.Contains(strings.TrimPrefix(f, prefix), "/") {
+				// Check if file is directly in this dir (no / in remaining path after prefix)
+				remaining := strings.TrimPrefix(f, prefix)
+				if remaining != "" && !strings.Contains(remaining, "/") && strings.HasSuffix(remaining, ".parquet") {
 					hasFiles = true
 					break
 				}
 			}
 			if !hasFiles {
+				p.logger.Debug().Str("path", path).Msg("Day-level path has no direct parquet files, skipping")
 				continue
 			}
 		}
