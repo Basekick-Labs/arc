@@ -127,6 +127,43 @@ curl -H "Authorization: Bearer $TOKEN" \
 | `auto_start` | bool | No | Start on creation and server restart |
 | `topic_mapping` | object | No | Map topics to measurement names |
 
+### S3 File Caching via cache_httpfs Extension (PR #149)
+
+Arc now supports optional in-memory caching of S3 Parquet files via DuckDB's `cache_httpfs` community extension. This can significantly improve query performance (5-10x) for workloads with repeated file access.
+
+**When this helps:**
+- CTEs (Common Table Expressions) that read the same table multiple times
+- Subqueries accessing the same data
+- Grafana dashboards with multiple panels querying similar time ranges
+
+**Configuration:**
+```toml
+[query]
+# Enable S3 file caching (disabled by default)
+enable_s3_cache = true
+
+# Cache size (default: 128MB)
+s3_cache_size = "256MB"
+
+# Cache TTL in seconds (default: 3600 = 1 hour)
+s3_cache_ttl_seconds = 3600
+```
+
+**Environment variables:**
+- `ARC_QUERY_ENABLE_S3_CACHE` - Enable/disable caching
+- `ARC_QUERY_S3_CACHE_SIZE` - Cache size (e.g., "128MB", "256MB")
+- `ARC_QUERY_S3_CACHE_TTL_SECONDS` - TTL in seconds
+
+**Key features:**
+- **In-memory only** - No disk caching, preserves Arc's stateless compute philosophy
+- **Opt-in** - Disabled by default, no impact unless enabled
+- **Configurable** - Tune cache size and TTL for your workload
+- **Graceful degradation** - If extension fails to load, Arc continues without caching
+
+**Trade-off:** Increases memory usage by the configured cache size (default 128MB).
+
+*Contributed by [@khalid244](https://github.com/khalid244)*
+
 ### Relative Time Expression Support in Partition Pruning
 
 Queries using relative time expressions like `NOW() - INTERVAL` now benefit from partition pruning, dramatically reducing query times for time-filtered queries.

@@ -214,12 +214,16 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		} else if _, err := db.Exec("LOAD cache_httpfs"); err != nil {
 			logger.Warn().Err(err).Msg("Failed to load cache_httpfs extension, continuing without cache")
 		} else {
-			db.Exec("SET cache_httpfs_type='in_memory'")
+			if _, err := db.Exec("SET cache_httpfs_type='in_memory'"); err != nil {
+				logger.Warn().Err(err).Msg("Failed to set cache_httpfs_type to in_memory")
+			}
 			// Calculate max blocks from cache size (each block is 512KB)
 			if cfg.S3CacheSize > 0 {
 				maxBlocks := cfg.S3CacheSize / (512 * 1024) // 512KB per block
 				if maxBlocks > 0 {
-					db.Exec(fmt.Sprintf("SET cache_httpfs_max_in_mem_cache_block_count=%d", maxBlocks))
+					if _, err := db.Exec(fmt.Sprintf("SET cache_httpfs_max_in_mem_cache_block_count=%d", maxBlocks)); err != nil {
+						logger.Warn().Err(err).Int64("max_blocks", maxBlocks).Msg("Failed to set cache_httpfs_max_in_mem_cache_block_count")
+					}
 				} else {
 					logger.Warn().
 						Int64("configured_bytes", cfg.S3CacheSize).
@@ -227,7 +231,9 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 				}
 			}
 			if cfg.S3CacheTTLSeconds > 0 {
-				db.Exec(fmt.Sprintf("SET cache_httpfs_in_mem_cache_block_timeout_millisec=%d", cfg.S3CacheTTLSeconds*1000))
+				if _, err := db.Exec(fmt.Sprintf("SET cache_httpfs_in_mem_cache_block_timeout_millisec=%d", cfg.S3CacheTTLSeconds*1000)); err != nil {
+					logger.Warn().Err(err).Int("ttl_ms", cfg.S3CacheTTLSeconds*1000).Msg("Failed to set cache_httpfs_in_mem_cache_block_timeout_millisec")
+				}
 			}
 			logger.Info().
 				Int64("cache_size_bytes", cfg.S3CacheSize).
