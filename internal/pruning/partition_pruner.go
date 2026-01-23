@@ -741,69 +741,87 @@ func (p *PartitionPruner) filterExistingRemotePaths(paths []string) []string {
 		pathToDir[path] = dir
 	}
 
-	// Check which directories exist
-	// We need to extract the prefix and list directories at the parent level
-	existingDirs := make(map[string]bool)
+	// Group directories by parent to minimize ListDirectories calls
+	// This reduces API calls from O(hours) to O(days) for time-range queries
+	type dirInfo struct {
+		parent string
+		target string
+	}
+	dirDetails := make(map[string]dirInfo) // full dir -> {parent, target}
+	uniqueParents := make(map[string]bool)
 
 	for dir := range dirsToCheck {
-		// Check cache first
-		cacheKey := "remote:" + dir
-		if matches, ok := p.globCache.get(cacheKey); ok {
-			existingDirs[dir] = len(matches) > 0
-			if len(matches) > 0 {
-				p.logger.Debug().Str("dir", dir).Msg("Remote directory exists (cached)")
-			}
-			continue
-		}
-
-		// Extract the parent directory and the target directory name
-		// e.g., s3://bucket/db/measurement/2025/12/17/16 -> parent: s3://bucket/db/measurement/2025/12/17/, target: 16
 		lastSlash := strings.LastIndex(dir, "/")
 		if lastSlash == -1 {
 			continue
 		}
-
 		parentDir := dir[:lastSlash+1] // Include trailing slash
 		targetName := dir[lastSlash+1:]
+		dirDetails[dir] = dirInfo{parent: parentDir, target: targetName}
+		uniqueParents[parentDir] = true
+	}
 
-		// Convert S3 URL to storage prefix
-		// s3://bucket/db/measurement/2025/12/17/ -> db/measurement/2025/12/17/
+	// Cache of parent -> set of existing child directories
+	parentChildren := make(map[string]map[string]bool)
+
+	// Fetch child listings for each unique parent (one API call per parent)
+	for parentDir := range uniqueParents {
+		cacheKey := "remote:parent:" + parentDir
+
+		if cached, ok := p.globCache.get(cacheKey); ok {
+			// Cache hit - rebuild set from cached slice
+			childSet := make(map[string]bool, len(cached))
+			for _, child := range cached {
+				childSet[child] = true
+			}
+			parentChildren[parentDir] = childSet
+			p.logger.Debug().Str("parent", parentDir).Int("children", len(childSet)).Msg("Using cached parent listing")
+			continue
+		}
+
+		// Cache miss - call ListDirectories once for this parent
 		storagePrefix := p.extractStoragePrefix(parentDir)
-
-		// List directories at the parent level
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		subdirs, err := lister.ListDirectories(ctx, storagePrefix)
 		cancel()
 
 		if err != nil {
 			p.logger.Debug().Err(err).Str("prefix", storagePrefix).Msg("Failed to list remote directories")
-			// On error, assume directory exists to avoid false negatives
-			existingDirs[dir] = true
-			p.globCache.set(cacheKey, []string{dir})
+			// On error, mark all children as existing to avoid false negatives
+			parentChildren[parentDir] = nil // nil means "assume all exist"
 			continue
 		}
 
-		// Check if our target directory is in the list
-		found := false
+		// Build set of existing child directories
+		childSet := make(map[string]bool, len(subdirs))
+		childNames := make([]string, 0, len(subdirs))
 		for _, subdir := range subdirs {
-			// subdirs come back as "db/measurement/2025/12/17/16/" - extract just the name
 			subdir = strings.TrimSuffix(subdir, "/")
-			subdirName := subdir
 			if idx := strings.LastIndex(subdir, "/"); idx != -1 {
-				subdirName = subdir[idx+1:]
+				subdir = subdir[idx+1:]
 			}
-			if subdirName == targetName {
-				found = true
-				break
-			}
+			childSet[subdir] = true
+			childNames = append(childNames, subdir)
 		}
 
-		existingDirs[dir] = found
-		if found {
-			p.globCache.set(cacheKey, []string{dir})
+		// Cache by parent directory
+		p.globCache.set(cacheKey, childNames)
+		parentChildren[parentDir] = childSet
+		p.logger.Debug().Str("parent", parentDir).Int("children", len(childNames)).Msg("Cached parent listing")
+	}
+
+	// Check which directories exist
+	existingDirs := make(map[string]bool)
+	for dir, info := range dirDetails {
+		childSet := parentChildren[info.parent]
+		if childSet == nil {
+			// Parent listing failed - assume directory exists
+			existingDirs[dir] = true
+			p.logger.Debug().Str("dir", dir).Msg("Remote directory exists (assumed)")
+		} else if childSet[info.target] {
+			existingDirs[dir] = true
 			p.logger.Debug().Str("dir", dir).Msg("Remote directory exists")
 		} else {
-			p.globCache.set(cacheKey, []string{})
 			p.logger.Debug().Str("dir", dir).Msg("Remote directory does not exist")
 		}
 	}
