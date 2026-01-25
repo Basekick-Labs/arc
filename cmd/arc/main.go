@@ -477,6 +477,11 @@ func main() {
 			Logger:          logger.Get("compaction"),
 		})
 
+		// Cleanup orphaned temp directories from previous runs (e.g., pod crashes)
+		if err := compactionManager.CleanupOrphanedTempDirs(); err != nil {
+			log.Warn().Err(err).Msg("Failed to cleanup orphaned compaction temp directories")
+		}
+
 		// Create hourly scheduler (if hourly tier is enabled)
 		if cfg.Compaction.HourlyEnabled {
 			hourlyScheduler, err = compaction.NewScheduler(&compaction.SchedulerConfig{

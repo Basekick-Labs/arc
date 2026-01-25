@@ -445,3 +445,77 @@ func TestCandidate(t *testing.T) {
 		t.Errorf("Tier = %s, want hourly", candidate.Tier)
 	}
 }
+
+// TestManager_CleanupOrphanedTempDirs tests orphaned temp directory cleanup
+func TestManager_CleanupOrphanedTempDirs(t *testing.T) {
+	manager, _, cleanup := setupTestManager(t)
+	defer cleanup()
+
+	// Create orphaned temp directories (simulating crash leftovers)
+	orphan1 := manager.TempDirectory + "/orphan_job_123"
+	orphan2 := manager.TempDirectory + "/orphan_job_456"
+	if err := os.MkdirAll(orphan1, 0755); err != nil {
+		t.Fatalf("failed to create orphan1: %v", err)
+	}
+	if err := os.MkdirAll(orphan2, 0755); err != nil {
+		t.Fatalf("failed to create orphan2: %v", err)
+	}
+
+	// Create a file inside one of them (simulating downloaded parquet)
+	testFile := orphan1 + "/test.parquet"
+	if err := os.WriteFile(testFile, []byte("test data"), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	// Verify orphans exist
+	entries, err := os.ReadDir(manager.TempDirectory)
+	if err != nil {
+		t.Fatalf("failed to read temp directory: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 orphan directories, got %d", len(entries))
+	}
+
+	// Run cleanup
+	if err := manager.CleanupOrphanedTempDirs(); err != nil {
+		t.Fatalf("CleanupOrphanedTempDirs failed: %v", err)
+	}
+
+	// Verify orphans are removed
+	entries, err = os.ReadDir(manager.TempDirectory)
+	if err != nil {
+		t.Fatalf("failed to read temp directory after cleanup: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("expected 0 directories after cleanup, got %d", len(entries))
+	}
+}
+
+// TestManager_CleanupOrphanedTempDirs_NonExistentDir tests cleanup when temp dir doesn't exist
+func TestManager_CleanupOrphanedTempDirs_NonExistentDir(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-compaction-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	logger := zerolog.Nop()
+	backend, err := storage.NewLocalBackend(tmpDir, logger)
+	if err != nil {
+		t.Fatalf("failed to create storage backend: %v", err)
+	}
+	defer backend.Close()
+
+	// Use a non-existent temp directory
+	manager := NewManager(&ManagerConfig{
+		StorageBackend: backend,
+		LockManager:    NewLockManager(),
+		TempDirectory:  tmpDir + "/nonexistent/path",
+		Logger:         logger,
+	})
+
+	// Should not error when directory doesn't exist
+	if err := manager.CleanupOrphanedTempDirs(); err != nil {
+		t.Errorf("CleanupOrphanedTempDirs should not error on non-existent dir, got: %v", err)
+	}
+}
