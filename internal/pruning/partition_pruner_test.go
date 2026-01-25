@@ -849,26 +849,6 @@ func TestGlobCacheConcurrency(t *testing.T) {
 	// Should not panic
 }
 
-// TestMinFunction tests the min helper function
-func TestMinFunction(t *testing.T) {
-	tests := []struct {
-		a, b, want int
-	}{
-		{1, 2, 1},
-		{2, 1, 1},
-		{5, 5, 5},
-		{0, 10, 0},
-		{-1, 1, -1},
-	}
-
-	for _, tt := range tests {
-		t.Run(fmt.Sprintf("min(%d,%d)", tt.a, tt.b), func(t *testing.T) {
-			if got := min(tt.a, tt.b); got != tt.want {
-				t.Errorf("min(%d, %d) = %d, want %d", tt.a, tt.b, got, tt.want)
-			}
-		})
-	}
-}
 
 // Helper function
 func contains(s, substr string) bool {
