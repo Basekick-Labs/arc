@@ -19,7 +19,20 @@ type RecoveryStats struct {
 	RecoveredBatches  int
 	RecoveredEntries  int
 	CorruptedEntries  int
+	SkippedFiles      int
 	RecoveryDuration  time.Duration
+}
+
+// RecoveryOptions configures WAL recovery behavior
+type RecoveryOptions struct {
+	// SkipActiveFile is the path to the currently active WAL file that should be skipped
+	// during periodic recovery (to avoid reading a file being actively written)
+	SkipActiveFile string
+
+	// BatchSize limits how many records are replayed per callback invocation
+	// This provides backpressure during mass recovery after prolonged outages
+	// 0 means no limit (all records in an entry replayed at once)
+	BatchSize int
 }
 
 // Recovery manages WAL recovery operations
@@ -38,8 +51,17 @@ func NewRecovery(walDir string, logger zerolog.Logger) *Recovery {
 
 // Recover scans the WAL directory and replays all WAL files
 func (r *Recovery) Recover(ctx context.Context, callback RecoveryCallback) (*RecoveryStats, error) {
+	return r.RecoverWithOptions(ctx, callback, nil)
+}
+
+// RecoverWithOptions scans the WAL directory and replays WAL files with configurable options
+func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCallback, opts *RecoveryOptions) (*RecoveryStats, error) {
 	startTime := time.Now()
 	stats := &RecoveryStats{}
+
+	if opts == nil {
+		opts = &RecoveryOptions{}
+	}
 
 	// Check if WAL directory exists
 	if _, err := os.Stat(r.walDir); os.IsNotExist(err) {
@@ -68,6 +90,13 @@ func (r *Recovery) Recover(ctx context.Context, callback RecoveryCallback) (*Rec
 		default:
 		}
 
+		// Skip the active WAL file if specified (prevents reading file being written)
+		if opts.SkipActiveFile != "" && walFile == opts.SkipActiveFile {
+			r.logger.Debug().Str("file", filepath.Base(walFile)).Msg("Skipping active WAL file")
+			stats.SkippedFiles++
+			continue
+		}
+
 		r.logger.Info().Str("file", filepath.Base(walFile)).Msg("Recovering WAL file")
 
 		reader := NewReader(walFile, r.logger)
@@ -83,13 +112,35 @@ func (r *Recovery) Recover(ctx context.Context, callback RecoveryCallback) (*Rec
 		fileRecoveredEntries := 0
 
 		for _, entry := range entries {
-			if err := callback(ctx, entry.Records); err != nil {
-				r.logger.Error().Err(err).Msg("Failed to replay WAL entry")
-				allEntriesSucceeded = false
-				break // Stop processing this file - will retry on next recovery
+			// Apply rate limiting via batch size if configured
+			if opts.BatchSize > 0 && len(entry.Records) > opts.BatchSize {
+				// Split large entries into smaller batches for backpressure
+				for i := 0; i < len(entry.Records); i += opts.BatchSize {
+					end := i + opts.BatchSize
+					if end > len(entry.Records) {
+						end = len(entry.Records)
+					}
+					batch := entry.Records[i:end]
+					if err := callback(ctx, batch); err != nil {
+						r.logger.Error().Err(err).Msg("Failed to replay WAL entry batch")
+						allEntriesSucceeded = false
+						break
+					}
+					fileRecoveredBatches++
+					fileRecoveredEntries += len(batch)
+				}
+				if !allEntriesSucceeded {
+					break
+				}
+			} else {
+				if err := callback(ctx, entry.Records); err != nil {
+					r.logger.Error().Err(err).Msg("Failed to replay WAL entry")
+					allEntriesSucceeded = false
+					break // Stop processing this file - will retry on next recovery
+				}
+				fileRecoveredBatches++
+				fileRecoveredEntries += len(entry.Records)
 			}
-			fileRecoveredBatches++
-			fileRecoveredEntries += len(entry.Records)
 		}
 
 		stats.CorruptedEntries += int(reader.CorruptedEntries)
@@ -125,6 +176,7 @@ func (r *Recovery) Recover(ctx context.Context, callback RecoveryCallback) (*Rec
 		Int("batches", stats.RecoveredBatches).
 		Int("entries", stats.RecoveredEntries).
 		Int("corrupted", stats.CorruptedEntries).
+		Int("skipped", stats.SkippedFiles).
 		Dur("duration", stats.RecoveryDuration).
 		Msg("WAL recovery complete")
 

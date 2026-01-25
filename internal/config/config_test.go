@@ -725,3 +725,59 @@ func TestQueryConfig_EnvOverride(t *testing.T) {
 		t.Errorf("Query.S3CacheTTLSeconds = %d, want 7200", cfg.Query.S3CacheTTLSeconds)
 	}
 }
+
+func TestWALConfig_Defaults(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	// Test WAL defaults
+	if cfg.WAL.RecoveryIntervalSeconds != 300 {
+		t.Errorf("WAL.RecoveryIntervalSeconds default = %d, want 300", cfg.WAL.RecoveryIntervalSeconds)
+	}
+	if cfg.WAL.RecoveryBatchSize != 10000 {
+		t.Errorf("WAL.RecoveryBatchSize default = %d, want 10000", cfg.WAL.RecoveryBatchSize)
+	}
+}
+
+func TestWALConfig_EnvOverride(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	os.Setenv("ARC_WAL_RECOVERY_INTERVAL_SECONDS", "600")
+	os.Setenv("ARC_WAL_RECOVERY_BATCH_SIZE", "5000")
+	defer func() {
+		os.Unsetenv("ARC_WAL_RECOVERY_INTERVAL_SECONDS")
+		os.Unsetenv("ARC_WAL_RECOVERY_BATCH_SIZE")
+	}()
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.WAL.RecoveryIntervalSeconds != 600 {
+		t.Errorf("WAL.RecoveryIntervalSeconds = %d, want 600", cfg.WAL.RecoveryIntervalSeconds)
+	}
+	if cfg.WAL.RecoveryBatchSize != 5000 {
+		t.Errorf("WAL.RecoveryBatchSize = %d, want 5000", cfg.WAL.RecoveryBatchSize)
+	}
+}

@@ -122,11 +122,13 @@ type CompactionConfig struct {
 }
 
 type WALConfig struct {
-	Enabled       bool   // Enable WAL for durability (default: false)
-	Directory     string // WAL directory (default: ./data/wal)
-	SyncMode      string // Sync mode: fsync, fdatasync, async (default: fdatasync)
-	MaxSizeMB     int    // Rotate WAL when it reaches this size in MB (default: 100)
-	MaxAgeSeconds int    // Rotate WAL after this many seconds (default: 3600)
+	Enabled                 bool   // Enable WAL for durability (default: false)
+	Directory               string // WAL directory (default: ./data/wal)
+	SyncMode                string // Sync mode: fsync, fdatasync, async (default: fdatasync)
+	MaxSizeMB               int    // Rotate WAL when it reaches this size in MB (default: 100)
+	MaxAgeSeconds           int    // Rotate WAL after this many seconds (default: 3600)
+	RecoveryIntervalSeconds int    // Interval for periodic WAL recovery in seconds (default: 300 = 5 minutes)
+	RecoveryBatchSize       int    // Max records to replay per batch during recovery (default: 10000)
 }
 
 type TelemetryConfig struct {
@@ -408,11 +410,13 @@ func Load() (*Config, error) {
 			TempDirectory:     v.GetString("compaction.temp_directory"),
 		},
 		WAL: WALConfig{
-			Enabled:       v.GetBool("wal.enabled"),
-			Directory:     v.GetString("wal.directory"),
-			SyncMode:      v.GetString("wal.sync_mode"),
-			MaxSizeMB:     v.GetInt("wal.max_size_mb"),
-			MaxAgeSeconds: v.GetInt("wal.max_age_seconds"),
+			Enabled:                 v.GetBool("wal.enabled"),
+			Directory:               v.GetString("wal.directory"),
+			SyncMode:                v.GetString("wal.sync_mode"),
+			MaxSizeMB:               v.GetInt("wal.max_size_mb"),
+			MaxAgeSeconds:           v.GetInt("wal.max_age_seconds"),
+			RecoveryIntervalSeconds: v.GetInt("wal.recovery_interval_seconds"),
+			RecoveryBatchSize:       v.GetInt("wal.recovery_batch_size"),
 		},
 		Telemetry: TelemetryConfig{
 			Enabled:         v.GetBool("telemetry.enabled"),
@@ -591,11 +595,13 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
 
 	// WAL defaults
-	v.SetDefault("wal.enabled", false)           // Disabled by default for backwards compatibility
-	v.SetDefault("wal.directory", "./data/wal")  // WAL directory
-	v.SetDefault("wal.sync_mode", "fdatasync")   // Balanced mode: fdatasync, fsync, or async
-	v.SetDefault("wal.max_size_mb", 100)         // Rotate WAL at 100MB
-	v.SetDefault("wal.max_age_seconds", 3600)    // Rotate WAL after 1 hour
+	v.SetDefault("wal.enabled", false)                    // Disabled by default for backwards compatibility
+	v.SetDefault("wal.directory", "./data/wal")           // WAL directory
+	v.SetDefault("wal.sync_mode", "fdatasync")            // Balanced mode: fdatasync, fsync, or async
+	v.SetDefault("wal.max_size_mb", 100)                  // Rotate WAL at 100MB
+	v.SetDefault("wal.max_age_seconds", 3600)             // Rotate WAL after 1 hour
+	v.SetDefault("wal.recovery_interval_seconds", 300)    // Periodic recovery every 5 minutes
+	v.SetDefault("wal.recovery_batch_size", 10000)        // Max records per recovery batch (rate limiting)
 
 	// Telemetry defaults
 	v.SetDefault("telemetry.enabled", true)                                               // Enabled by default (opt-out)

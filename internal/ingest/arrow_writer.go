@@ -18,6 +18,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/compress"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/basekick-labs/arc/internal/config"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/basekick-labs/arc/pkg/models"
@@ -1175,6 +1176,8 @@ func (b *ArrowBuffer) writeColumnar(ctx context.Context, database string, record
 				Int64("queue_depth", b.queueDepth.Load()).
 				Msg("Flush queue full - data preserved in WAL for recovery")
 			b.totalErrors.Add(1)
+			// Track records preserved in WAL for operator visibility
+			metrics.Get().IncWALRecordsPreserved(int64(totalBuffered))
 			// Data is already in WAL (written at ingest time) - no memory growth
 			// WAL will be replayed on restart or via periodic recovery
 		}

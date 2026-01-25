@@ -92,6 +92,11 @@ type Metrics struct {
 	mqttConnected        atomic.Int64 // 1 = connected, 0 = disconnected
 	mqttReconnects       atomic.Int64
 
+	// WAL metrics
+	walRecordsPreserved   atomic.Int64 // Records preserved in WAL for recovery (flush failures)
+	walRecoveryTotal      atomic.Int64 // Successful WAL recovery operations
+	walRecoveryRecords    atomic.Int64 // Total records recovered from WAL
+
 	logger zerolog.Logger
 }
 
@@ -237,6 +242,11 @@ func (m *Metrics) SetMQTTConnected(connected bool)   {
 }
 func (m *Metrics) IncMQTTReconnects()                { m.mqttReconnects.Add(1) }
 
+// WAL Metrics
+func (m *Metrics) IncWALRecordsPreserved(count int64) { m.walRecordsPreserved.Add(count) }
+func (m *Metrics) IncWALRecoveryTotal()               { m.walRecoveryTotal.Add(1) }
+func (m *Metrics) IncWALRecoveryRecords(count int64)  { m.walRecoveryRecords.Add(count) }
+
 // Snapshot returns all metrics as a map (for JSON endpoint)
 func (m *Metrics) Snapshot() map[string]interface{} {
 	var memStats runtime.MemStats
@@ -335,6 +345,11 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"mqtt_decode_errors":     m.mqttDecodeErrors.Load(),
 		"mqtt_connected":         m.mqttConnected.Load(),
 		"mqtt_reconnects":        m.mqttReconnects.Load(),
+
+		// WAL
+		"wal_records_preserved": m.walRecordsPreserved.Load(),
+		"wal_recovery_total":    m.walRecoveryTotal.Load(),
+		"wal_recovery_records":  m.walRecoveryRecords.Load(),
 	}
 }
 
@@ -546,6 +561,19 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_mqtt_reconnects_total Total MQTT reconnection attempts\n"...)
 	b = append(b, "# TYPE arc_mqtt_reconnects_total counter\n"...)
 	b = appendMetric(b, "arc_mqtt_reconnects_total", float64(m.mqttReconnects.Load()))
+
+	// WAL metrics
+	b = append(b, "# HELP arc_wal_records_preserved_total Records preserved in WAL for recovery\n"...)
+	b = append(b, "# TYPE arc_wal_records_preserved_total counter\n"...)
+	b = appendMetric(b, "arc_wal_records_preserved_total", float64(m.walRecordsPreserved.Load()))
+
+	b = append(b, "# HELP arc_wal_recovery_total Successful WAL recovery operations\n"...)
+	b = append(b, "# TYPE arc_wal_recovery_total counter\n"...)
+	b = appendMetric(b, "arc_wal_recovery_total", float64(m.walRecoveryTotal.Load()))
+
+	b = append(b, "# HELP arc_wal_recovery_records_total Total records recovered from WAL\n"...)
+	b = append(b, "# TYPE arc_wal_recovery_records_total counter\n"...)
+	b = appendMetric(b, "arc_wal_recovery_records_total", float64(m.walRecoveryRecords.Load()))
 
 	return string(b)
 }
