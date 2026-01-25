@@ -354,13 +354,10 @@ func TestRecovery_Recover(t *testing.T) {
 		t.Errorf("expected at least 1 recovered record, got %d", len(recoveredRecords))
 	}
 
-	// Check that WAL file was archived
-	activeFiles, recoveredFiles, _ := recovery.ListWALFiles()
+	// Check that WAL file was deleted after successful recovery
+	activeFiles, _, _ := recovery.ListWALFiles()
 	if len(activeFiles) != 0 {
-		t.Errorf("expected 0 active files, got %d", len(activeFiles))
-	}
-	if len(recoveredFiles) != 1 {
-		t.Errorf("expected 1 recovered file, got %d", len(recoveredFiles))
+		t.Errorf("expected 0 active files after recovery, got %d", len(activeFiles))
 	}
 }
 
@@ -608,5 +605,257 @@ func TestWriter_AppendRaw_PayloadAtLimit(t *testing.T) {
 	err := writer.AppendRaw(payload)
 	if err != nil {
 		t.Errorf("AppendRaw should succeed for payload at limit: %v", err)
+	}
+}
+
+func TestRecovery_SkipActiveFile(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "wal-test-skip-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create first WAL file
+	file1 := filepath.Join(tmpDir, "arc-20240101_120000.wal")
+	writer1, err := NewWriter(&WriterConfig{
+		WALDir:       tmpDir,
+		SyncMode:     SyncModeAsync,
+		MaxSizeBytes: 100 * 1024 * 1024,
+		Logger:       zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("failed to create writer1: %v", err)
+	}
+
+	records := []map[string]interface{}{
+		{"measurement": "cpu", "value": 90.5},
+	}
+	writer1.Append(records)
+	time.Sleep(50 * time.Millisecond)
+	file1 = writer1.CurrentFile()
+	writer1.Close()
+
+	// Wait a moment to ensure different timestamp
+	time.Sleep(1100 * time.Millisecond)
+
+	// Create second WAL file
+	writer2, err := NewWriter(&WriterConfig{
+		WALDir:       tmpDir,
+		SyncMode:     SyncModeAsync,
+		MaxSizeBytes: 100 * 1024 * 1024,
+		Logger:       zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("failed to create writer2: %v", err)
+	}
+
+	writer2.Append(records)
+	time.Sleep(50 * time.Millisecond)
+	file2 := writer2.CurrentFile()
+	writer2.Close()
+
+	// Verify both files exist and are different
+	if file1 == file2 {
+		t.Skip("WAL files have same path, skipping test")
+	}
+
+	// Recover with SkipActiveFile set to the second file
+	recovery := NewRecovery(tmpDir, zerolog.Nop())
+
+	var recoveredCount int
+	callback := func(ctx context.Context, records []map[string]interface{}) error {
+		recoveredCount += len(records)
+		return nil
+	}
+
+	stats, err := recovery.RecoverWithOptions(context.Background(), callback, &RecoveryOptions{
+		SkipActiveFile: file2,
+	})
+	if err != nil {
+		t.Fatalf("RecoverWithOptions failed: %v", err)
+	}
+
+	// Should have skipped one file
+	if stats.SkippedFiles != 1 {
+		t.Errorf("expected 1 skipped file, got %d", stats.SkippedFiles)
+	}
+
+	// Should have recovered from the first file only
+	if stats.RecoveredFiles != 1 {
+		t.Errorf("expected 1 recovered file, got %d", stats.RecoveredFiles)
+	}
+
+	// Verify the skipped file still exists
+	if _, err := os.Stat(file2); os.IsNotExist(err) {
+		t.Error("skipped file should still exist")
+	}
+
+	// Verify the recovered file was deleted
+	if _, err := os.Stat(file1); !os.IsNotExist(err) {
+		t.Error("recovered file should have been deleted")
+	}
+}
+
+func TestRecovery_BatchSize(t *testing.T) {
+	writer, tmpDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(tmpDir)
+
+	// Write a batch of 10 records
+	records := make([]map[string]interface{}, 10)
+	for i := 0; i < 10; i++ {
+		records[i] = map[string]interface{}{
+			"measurement": "cpu",
+			"index":       i,
+			"value":       float64(i * 10),
+		}
+	}
+	writer.Append(records)
+	time.Sleep(50 * time.Millisecond)
+	writer.Close()
+
+	// Recover with BatchSize = 3 (should split into 4 batches: 3+3+3+1)
+	recovery := NewRecovery(tmpDir, zerolog.Nop())
+
+	var batchCount int
+	var totalRecords int
+	callback := func(ctx context.Context, records []map[string]interface{}) error {
+		batchCount++
+		totalRecords += len(records)
+		// Verify batch size limit
+		if len(records) > 3 {
+			t.Errorf("batch size exceeded limit: got %d, max 3", len(records))
+		}
+		return nil
+	}
+
+	stats, err := recovery.RecoverWithOptions(context.Background(), callback, &RecoveryOptions{
+		BatchSize: 3,
+	})
+	if err != nil {
+		t.Fatalf("RecoverWithOptions failed: %v", err)
+	}
+
+	// Should have split into 4 batches (3+3+3+1=10)
+	if batchCount != 4 {
+		t.Errorf("expected 4 batches, got %d", batchCount)
+	}
+
+	if totalRecords != 10 {
+		t.Errorf("expected 10 total records, got %d", totalRecords)
+	}
+
+	if stats.RecoveredEntries != 10 {
+		t.Errorf("expected 10 recovered entries in stats, got %d", stats.RecoveredEntries)
+	}
+}
+
+func TestRecovery_PartialFailure_KeepsFileForRetry(t *testing.T) {
+	writer, tmpDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(tmpDir)
+
+	// Write test records
+	records := []map[string]interface{}{
+		{"measurement": "cpu", "value": 1.0},
+		{"measurement": "cpu", "value": 2.0},
+		{"measurement": "cpu", "value": 3.0},
+	}
+	writer.Append(records)
+	time.Sleep(50 * time.Millisecond)
+	walFile := writer.CurrentFile()
+	writer.Close()
+
+	// Recover with a callback that fails on the first call
+	recovery := NewRecovery(tmpDir, zerolog.Nop())
+
+	callbackErr := errors.New("simulated S3 failure")
+	callback := func(ctx context.Context, records []map[string]interface{}) error {
+		return callbackErr
+	}
+
+	stats, err := recovery.Recover(context.Background(), callback)
+	if err != nil {
+		t.Fatalf("Recover should not return error for callback failure: %v", err)
+	}
+
+	// Should have 0 recovered files (recovery failed)
+	if stats.RecoveredFiles != 0 {
+		t.Errorf("expected 0 recovered files, got %d", stats.RecoveredFiles)
+	}
+
+	// WAL file should still exist for retry
+	if _, err := os.Stat(walFile); os.IsNotExist(err) {
+		t.Error("WAL file should be kept for retry after failure")
+	}
+
+	// Second recovery attempt should succeed
+	var recoveredRecords int
+	successCallback := func(ctx context.Context, records []map[string]interface{}) error {
+		recoveredRecords += len(records)
+		return nil
+	}
+
+	stats2, err := recovery.Recover(context.Background(), successCallback)
+	if err != nil {
+		t.Fatalf("Second recovery attempt failed: %v", err)
+	}
+
+	if stats2.RecoveredFiles != 1 {
+		t.Errorf("expected 1 recovered file on retry, got %d", stats2.RecoveredFiles)
+	}
+
+	if recoveredRecords != 3 {
+		t.Errorf("expected 3 recovered records on retry, got %d", recoveredRecords)
+	}
+
+	// WAL file should now be deleted
+	if _, err := os.Stat(walFile); !os.IsNotExist(err) {
+		t.Error("WAL file should be deleted after successful retry")
+	}
+}
+
+func TestRecovery_BatchSize_PartialBatchFailure(t *testing.T) {
+	writer, tmpDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(tmpDir)
+
+	// Write 10 records
+	records := make([]map[string]interface{}, 10)
+	for i := 0; i < 10; i++ {
+		records[i] = map[string]interface{}{
+			"measurement": "cpu",
+			"index":       i,
+		}
+	}
+	writer.Append(records)
+	time.Sleep(50 * time.Millisecond)
+	walFile := writer.CurrentFile()
+	writer.Close()
+
+	// Recover with BatchSize=3, fail on second batch
+	recovery := NewRecovery(tmpDir, zerolog.Nop())
+
+	batchNum := 0
+	callback := func(ctx context.Context, records []map[string]interface{}) error {
+		batchNum++
+		if batchNum == 2 {
+			return errors.New("simulated failure on second batch")
+		}
+		return nil
+	}
+
+	stats, err := recovery.RecoverWithOptions(context.Background(), callback, &RecoveryOptions{
+		BatchSize: 3,
+	})
+	if err != nil {
+		t.Fatalf("Recover should not return error for callback failure: %v", err)
+	}
+
+	// Recovery failed, so file should be kept
+	if stats.RecoveredFiles != 0 {
+		t.Errorf("expected 0 recovered files after partial failure, got %d", stats.RecoveredFiles)
+	}
+
+	// WAL file should still exist
+	if _, err := os.Stat(walFile); os.IsNotExist(err) {
+		t.Error("WAL file should be kept after partial batch failure")
 	}
 }

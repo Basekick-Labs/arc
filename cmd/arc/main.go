@@ -29,6 +29,7 @@ import (
 	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/basekick-labs/arc/internal/wal"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
@@ -270,30 +271,11 @@ func main() {
 		log.Fatal().Str("backend", cfg.Storage.Backend).Msg("Unsupported storage backend (use 'local', 's3', 'minio', 'azure', or 'azblob')")
 	}
 
-	// Initialize WAL (if enabled)
+	// Initialize WAL writer (if enabled) - recovery happens after ArrowBuffer is ready
 	var walWriter *wal.Writer
+	var walRecovery *wal.Recovery
 	if cfg.WAL.Enabled {
-		// Run WAL recovery FIRST (before creating new WAL writer)
-		recovery := wal.NewRecovery(cfg.WAL.Directory, logger.Get("wal"))
-		recoveryStats, err := recovery.Recover(context.Background(), func(ctx context.Context, records []map[string]interface{}) error {
-			// Re-ingest recovered records through the ingest pipeline
-			// For now, just log - full integration requires ArrowBuffer to be created first
-			log.Info().Int("records", len(records)).Msg("WAL recovery: replaying records")
-			return nil
-		})
-		if err != nil {
-			log.Error().Err(err).Msg("WAL recovery failed")
-		} else if recoveryStats.RecoveredFiles > 0 {
-			log.Info().
-				Int("files", recoveryStats.RecoveredFiles).
-				Int("batches", recoveryStats.RecoveredBatches).
-				Int("entries", recoveryStats.RecoveredEntries).
-				Int("corrupted", recoveryStats.CorruptedEntries).
-				Dur("duration", recoveryStats.RecoveryDuration).
-				Msg("WAL recovery complete")
-		}
-
-		// Create WAL writer AFTER recovery (so new file isn't recovered)
+		var err error
 		walWriter, err = wal.NewWriter(&wal.WriterConfig{
 			WALDir:       cfg.WAL.Directory,
 			SyncMode:     wal.SyncMode(cfg.WAL.SyncMode),
@@ -305,6 +287,9 @@ func main() {
 			log.Fatal().Err(err).Msg("Failed to initialize WAL writer")
 		}
 		shutdownCoordinator.Register("wal", walWriter, shutdown.PriorityWAL)
+
+		// Prepare recovery (will run after ArrowBuffer is created)
+		walRecovery = wal.NewRecovery(cfg.WAL.Directory, logger.Get("wal"))
 
 		log.Info().
 			Str("directory", cfg.WAL.Directory).
@@ -327,6 +312,77 @@ func main() {
 		arrowBuffer.SetWAL(walWriter)
 	}
 	shutdownCoordinator.Register("arrow-buffer", arrowBuffer, shutdown.PriorityBuffer)
+
+	// Run WAL recovery NOW that ArrowBuffer is ready
+	if walRecovery != nil {
+		// Create shared recovery callback to avoid code duplication
+		recoveryCallback := createWALRecoveryCallback(arrowBuffer, logger.Get("wal-recovery"))
+
+		recoveryStats, err := walRecovery.RecoverWithOptions(context.Background(), recoveryCallback, &wal.RecoveryOptions{
+			BatchSize: cfg.WAL.RecoveryBatchSize,
+		})
+		if err != nil {
+			log.Error().Err(err).Msg("WAL recovery failed")
+		} else if recoveryStats.RecoveredFiles > 0 {
+			// Track recovery metrics
+			metrics.Get().IncWALRecoveryTotal()
+			metrics.Get().IncWALRecoveryRecords(int64(recoveryStats.RecoveredEntries))
+			log.Info().
+				Int("files", recoveryStats.RecoveredFiles).
+				Int("batches", recoveryStats.RecoveredBatches).
+				Int("entries", recoveryStats.RecoveredEntries).
+				Int("corrupted", recoveryStats.CorruptedEntries).
+				Dur("duration", recoveryStats.RecoveryDuration).
+				Msg("WAL recovery complete")
+		}
+
+		// Start periodic WAL recovery (recovers data after S3 outages without restart)
+		walRecoveryCtx, walRecoveryCancel := context.WithCancel(context.Background())
+		shutdownCoordinator.RegisterHook("wal-periodic-recovery", func(ctx context.Context) error {
+			walRecoveryCancel()
+			return nil
+		}, shutdown.PriorityBuffer)
+
+		recoveryInterval := time.Duration(cfg.WAL.RecoveryIntervalSeconds) * time.Second
+		go func() {
+			ticker := time.NewTicker(recoveryInterval)
+			defer ticker.Stop()
+			walLogger := logger.Get("wal-recovery")
+
+			for {
+				select {
+				case <-walRecoveryCtx.Done():
+					return
+				case <-ticker.C:
+					recovery := wal.NewRecovery(cfg.WAL.Directory, walLogger)
+					// Skip the active WAL file to avoid reading while it's being written
+					activeFile := ""
+					if walWriter != nil {
+						activeFile = walWriter.CurrentFile()
+					}
+					stats, err := recovery.RecoverWithOptions(context.Background(), recoveryCallback, &wal.RecoveryOptions{
+						SkipActiveFile: activeFile,
+						BatchSize:      cfg.WAL.RecoveryBatchSize,
+					})
+					if err != nil {
+						walLogger.Error().Err(err).Msg("Periodic WAL recovery failed")
+					} else if stats.RecoveredFiles > 0 {
+						// Track recovery metrics
+						metrics.Get().IncWALRecoveryTotal()
+						metrics.Get().IncWALRecoveryRecords(int64(stats.RecoveredEntries))
+						walLogger.Info().
+							Int("files", stats.RecoveredFiles).
+							Int("entries", stats.RecoveredEntries).
+							Msg("Periodic WAL recovery complete")
+					}
+				}
+			}
+		}()
+		log.Info().
+			Dur("interval", recoveryInterval).
+			Int("batch_size", cfg.WAL.RecoveryBatchSize).
+			Msg("Periodic WAL recovery enabled")
+	}
 
 	// Initialize MQTT Subscription Manager (if enabled)
 	var mqttManager mqtt.Manager
@@ -1045,6 +1101,47 @@ func main() {
 	}
 
 	log.Info().Msg("Arc shutdown complete")
+}
+
+// createWALRecoveryCallback creates a reusable WAL recovery callback function.
+// This callback replays recovered WAL records through the ArrowBuffer for re-ingestion.
+func createWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolog.Logger) wal.RecoveryCallback {
+	return func(ctx context.Context, records []map[string]interface{}) error {
+		if len(records) == 0 {
+			return nil
+		}
+		for _, rec := range records {
+			// Extract measurement from recovered record
+			measurement, _ := rec["measurement"].(string)
+			if measurement == "" {
+				measurement, _ = rec["m"].(string)
+			}
+			if measurement == "" {
+				continue // Skip records without measurement
+			}
+
+			database, _ := rec["database"].(string)
+			if database == "" {
+				database = "default"
+			}
+
+			// Build columnar record from recovered data
+			columns := make(map[string][]interface{})
+			for key, value := range rec {
+				if key == "measurement" || key == "m" || key == "database" {
+					continue
+				}
+				columns[key] = []interface{}{value}
+			}
+
+			if err := arrowBuffer.WriteColumnarDirect(ctx, database, measurement, columns); err != nil {
+				walLogger.Error().Err(err).Str("measurement", measurement).Msg("Failed to replay WAL record")
+				return err
+			}
+		}
+		walLogger.Info().Int("records", len(records)).Msg("WAL recovery: replayed records")
+		return nil
+	}
 }
 
 // runCompactSubcommand handles the "compact" subcommand for subprocess-based compaction.
