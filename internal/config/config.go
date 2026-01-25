@@ -165,7 +165,7 @@ type MQTTConfig struct {
 
 // QueryConfig holds configuration for query execution optimizations
 type QueryConfig struct {
-	Timeout           int   // Query execution timeout in seconds (0 = no timeout, default: 30)
+	Timeout           int   // Query execution timeout in seconds (0 = no timeout, default: 300)
 	EnableS3Cache     bool  // Enable S3 file caching for faster repeated reads (useful for CTEs/subqueries)
 	S3CacheSize       int64 // Cache size in bytes (parsed from "128MB", "256MB", etc.)
 	S3CacheTTLSeconds int   // Cache entry TTL in seconds (default: 3600 = 1 hour)
@@ -625,7 +625,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("mqtt.enabled", false) // Feature toggle only - disabled by default
 
 	// Query defaults
-	v.SetDefault("query.timeout", 30)                  // 30 second query timeout (0 = no timeout)
+	v.SetDefault("query.timeout", 300)                 // 5 minute query timeout (0 = no timeout)
 	v.SetDefault("query.enable_s3_cache", false)       // Disabled by default (opt-in feature)
 	v.SetDefault("query.s3_cache_size", "128MB")       // 128MB cache (256 blocks × 512KB)
 	v.SetDefault("query.s3_cache_ttl_seconds", 3600)   // 1 hour
