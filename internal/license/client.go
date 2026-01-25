@@ -350,6 +350,13 @@ func (c *Client) CanUseRetentionScheduler() bool {
 	return c.license != nil && c.license.CanUseRetentionScheduler()
 }
 
+// CanUseTieredStorage returns true if tiered storage is allowed
+func (c *Client) CanUseTieredStorage() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.license != nil && c.license.CanUseTieredStorage()
+}
+
 // GetFingerprint returns the machine fingerprint
 func (c *Client) GetFingerprint() string {
 	return c.fingerprint

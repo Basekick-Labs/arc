@@ -19,6 +19,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/rs/zerolog"
 )
@@ -829,6 +830,9 @@ type ArrowBuffer struct {
 	// Optional WAL for durability
 	wal WALWriter
 
+	// Optional tiering manager for registering files in tier metadata
+	tieringManager *tiering.Manager
+
 	// OPTIMIZATION: Shard buffers to reduce lock contention
 	// Configurable via ingest.shard_count (default 32)
 	// Each shard handles ~1/N of measurements where N = shard count
@@ -992,6 +996,44 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 func (b *ArrowBuffer) SetWAL(wal WALWriter) {
 	b.wal = wal
 	b.logger.Info().Msg("WAL enabled for ArrowBuffer")
+}
+
+// SetTieringManager sets the tiering manager for automatic file registration.
+// When set, newly written parquet files are automatically registered in tiering metadata.
+func (b *ArrowBuffer) SetTieringManager(tm *tiering.Manager) {
+	b.tieringManager = tm
+	b.logger.Info().Msg("Tiering manager enabled for ArrowBuffer - files will be auto-registered")
+}
+
+// registerFileInTiering registers a newly written parquet file in the tiering metadata.
+// This allows the tiering system to track the file for future migration and query routing.
+func (b *ArrowBuffer) registerFileInTiering(ctx context.Context, database, measurement, storagePath string, partitionTime time.Time, sizeBytes int64) {
+	if b.tieringManager == nil {
+		return
+	}
+
+	metadata := b.tieringManager.GetMetadata()
+	if metadata == nil {
+		return
+	}
+
+	file := &tiering.FileMetadata{
+		Path:          storagePath,
+		Database:      database,
+		Measurement:   measurement,
+		PartitionTime: partitionTime,
+		Tier:          tiering.TierHot,
+		SizeBytes:     sizeBytes,
+		CreatedAt:     time.Now().UTC(),
+	}
+
+	if err := metadata.RecordFile(ctx, file); err != nil {
+		b.logger.Warn().Err(err).
+			Str("path", storagePath).
+			Str("database", database).
+			Str("measurement", measurement).
+			Msg("Failed to register file in tiering metadata")
+	}
 }
 
 // columnarToWALRecords converts columnar data to row-based records for WAL storage
@@ -1760,6 +1802,9 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 			return fmt.Errorf("failed to write to storage: %w", err)
 		}
 
+		// Register file in tiering metadata for query routing
+		b.registerFileInTiering(ctx, database, measurement, storagePath, minTime, int64(len(parquetData)))
+
 		b.totalRecordsWritten.Add(int64(recordCount))
 		b.totalFlushes.Add(1)
 
@@ -1810,6 +1855,9 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
 			return fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err)
 		}
+
+		// Register file in tiering metadata for query routing
+		b.registerFileInTiering(ctx, database, measurement, storagePath, bucketTime, int64(len(parquetData)))
 
 		splitRecordCount := len(bucket.indices)
 		totalWritten += splitRecordCount

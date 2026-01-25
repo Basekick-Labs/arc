@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -25,7 +26,9 @@ import (
 	"github.com/basekick-labs/arc/internal/shutdown"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/telemetry"
+	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/basekick-labs/arc/internal/wal"
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog/log"
 )
 
@@ -885,6 +888,125 @@ func main() {
 	if mqttManager != nil {
 		mqttSubHandler := api.NewMQTTSubscriptionHandler(mqttManager, authManager, logger.Get("mqtt-subscriptions-api"))
 		mqttSubHandler.RegisterRoutes(server.GetApp())
+	}
+
+	// Initialize Tiered Storage (Enterprise feature - requires valid license)
+	// 2-tier system: Hot (local) -> Cold (S3/Azure archive)
+	var tieringManager *tiering.Manager
+	if cfg.TieredStorage.Enabled {
+		if licenseClient == nil {
+			log.Warn().Msg("Tiered storage requires enterprise license - feature disabled")
+		} else if !licenseClient.CanUseTieredStorage() {
+			log.Warn().Msg("License does not include tiered_storage feature - feature disabled")
+		} else {
+			// Open SQLite database for tiering metadata (shared with other features)
+			tieringDBPath := cfg.Auth.DBPath // Use shared SQLite database
+			tieringDB, err := sql.Open("sqlite3", tieringDBPath)
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to open tiering database - feature disabled")
+			} else {
+				// Create cold tier backend (S3 or Azure)
+				var coldBackend storage.Backend
+				cold := cfg.TieredStorage.Cold
+
+				if cold.Enabled {
+					switch cold.Backend {
+					case "s3":
+						s3Config := &storage.S3Config{
+							Region:    cold.S3Region,
+							Bucket:    cold.S3Bucket,
+							Endpoint:  cold.S3Endpoint,
+							AccessKey: cold.S3AccessKey,
+							SecretKey: cold.S3SecretKey,
+							UseSSL:    cold.S3UseSSL,
+							PathStyle: cold.S3PathStyle,
+						}
+						coldBackend, err = storage.NewS3Backend(s3Config, logger.Get("tiering-cold-s3"))
+						if err != nil {
+							log.Error().Err(err).Msg("Failed to create cold tier S3 backend for tiering")
+						}
+
+					case "azure":
+						azureConfig := &storage.AzureBlobConfig{
+							ConnectionString:   cold.AzureConnectionString,
+							AccountName:        cold.AzureAccountName,
+							AccountKey:         cold.AzureAccountKey,
+							SASToken:           cold.AzureSASToken,
+							ContainerName:      cold.AzureContainer,
+							Endpoint:           cold.AzureEndpoint,
+							UseManagedIdentity: cold.AzureUseManagedIdentity,
+						}
+						coldBackend, err = storage.NewAzureBlobBackend(azureConfig, logger.Get("tiering-cold-azure"))
+						if err != nil {
+							log.Error().Err(err).Msg("Failed to create cold tier Azure backend for tiering")
+						}
+					}
+				}
+
+				// Create tiering manager
+				tieringManager, err = tiering.NewManager(&tiering.ManagerConfig{
+					HotBackend:    storageBackend,
+					ColdBackend:   coldBackend,
+					DB:            tieringDB,
+					Config:        &cfg.TieredStorage,
+					LicenseClient: licenseClient,
+					Logger:        logger.Get("tiering"),
+				})
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to create tiering manager - feature disabled")
+				} else {
+					// Start tiering manager
+					if err := tieringManager.Start(); err != nil {
+						log.Error().Err(err).Msg("Failed to start tiering manager")
+					} else {
+						shutdownCoordinator.RegisterHook("tiering", func(ctx context.Context) error {
+							return tieringManager.Stop()
+						}, shutdown.PriorityCompaction)
+
+						log.Info().
+							Str("schedule", cfg.TieredStorage.MigrationSchedule).
+							Bool("cold_enabled", cfg.TieredStorage.Cold.Enabled).
+							Int("default_hot_days", cfg.TieredStorage.DefaultHotMaxAgeDays).
+							Msg("Tiered storage enabled")
+					}
+				}
+			}
+		}
+	}
+
+	// Register Tiering API handlers (always register, handlers check if manager is nil)
+	if tieringManager != nil {
+		tieringHandler := api.NewTieringHandler(tieringManager, logger.Get("tiering-api"))
+		tieringHandler.RegisterRoutes(server.GetApp())
+
+		tieringPoliciesHandler := api.NewTieringPoliciesHandler(tieringManager, logger.Get("tiering-policies-api"))
+		tieringPoliciesHandler.RegisterRoutes(server.GetApp())
+
+		// Wire tiering manager to query handler for multi-tier query routing
+		queryHandler.SetTieringManager(tieringManager)
+		log.Info().Msg("Tiering manager wired to query handler for multi-tier queries")
+
+		// Wire tiering manager to arrow buffer for automatic file registration
+		arrowBuffer.SetTieringManager(tieringManager)
+		log.Info().Msg("Tiering manager wired to arrow buffer for auto-registration")
+
+		// Configure DuckDB with cold tier S3 credentials for direct S3 queries
+		// This is needed because DuckDB's httpfs extension needs credentials to query S3 directly
+		cold := cfg.TieredStorage.Cold
+		if cold.Enabled && cold.Backend == "s3" && cold.S3AccessKey != "" {
+			if err := db.ConfigureS3(&database.S3Config{
+				Region:    cold.S3Region,
+				Endpoint:  cold.S3Endpoint,
+				AccessKey: cold.S3AccessKey,
+				SecretKey: cold.S3SecretKey,
+				UseSSL:    cold.S3UseSSL,
+				PathStyle: cold.S3PathStyle,
+			}); err != nil {
+				log.Warn().Err(err).Msg("Failed to configure DuckDB with cold tier S3 credentials")
+			} else {
+				log.Info().Msg("DuckDB configured with cold tier S3 credentials for multi-tier queries")
+			}
+		}
 	}
 
 	// Register HTTP server shutdown hook (first to stop accepting new requests)
