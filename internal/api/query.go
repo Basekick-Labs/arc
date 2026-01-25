@@ -1079,6 +1079,7 @@ localProcessing:
 			m.IncQueryErrors()
 			// Check if it was a timeout
 			if h.queryTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
+				m.IncQueryTimeouts()
 				h.logger.Error().Err(err).Str("sql", req.SQL).Dur("timeout", h.queryTimeout).Msg("Query timed out")
 				return c.Status(fiber.StatusGatewayTimeout).JSON(QueryResponse{
 					Success:         false,
