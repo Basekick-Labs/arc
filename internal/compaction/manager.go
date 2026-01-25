@@ -19,8 +19,9 @@ var ErrCycleAlreadyRunning = errors.New("compaction cycle already running")
 
 // Manager orchestrates compaction jobs across all measurements
 type Manager struct {
-	StorageBackend storage.Backend
-	LockManager    *LockManager
+	StorageBackend  storage.Backend
+	LockManager     *LockManager
+	ManifestManager *ManifestManager
 
 	// Configuration
 	MinAgeHours   int
@@ -45,10 +46,11 @@ type Manager struct {
 	cycleID      atomic.Int64
 
 	// Metrics
-	TotalJobsCompleted  int
-	TotalJobsFailed     int
-	TotalFilesCompacted int
-	TotalBytesSaved     int64
+	TotalJobsCompleted   int
+	TotalJobsFailed      int
+	TotalFilesCompacted  int
+	TotalBytesSaved      int64
+	TotalManifestsRecov  int // Number of manifests recovered
 
 	logger zerolog.Logger
 	mu     sync.Mutex
@@ -100,9 +102,12 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		defaultSortKeys = []string{"time"} // Default to time-only sorting
 	}
 
+	logger := cfg.Logger.With().Str("component", "compaction-manager").Logger()
+
 	m := &Manager{
 		StorageBackend:  cfg.StorageBackend,
 		LockManager:     cfg.LockManager,
+		ManifestManager: NewManifestManager(cfg.StorageBackend, logger),
 		MinAgeHours:     cfg.MinAgeHours,
 		MinFiles:        cfg.MinFiles,
 		TargetSizeMB:    cfg.TargetSizeMB,
@@ -113,7 +118,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		DefaultSortKeys: defaultSortKeys,
 		Tiers:           cfg.Tiers,
 		jobHistory:      make([]map[string]interface{}, 0),
-		logger:          cfg.Logger.With().Str("component", "compaction-manager").Logger(),
+		logger:          logger,
 	}
 
 	// Log tier information
@@ -461,6 +466,21 @@ func (m *Manager) RunCompactionCycleForTiers(ctx context.Context, tierNames []st
 		Strs("tiers", tierNames).
 		Msg("Starting compaction cycle for specific tiers")
 
+	// Run manifest recovery before starting new compactions
+	// This ensures interrupted compactions from previous cycles are completed
+	if m.ManifestManager != nil {
+		recovered, err := m.ManifestManager.RecoverOrphanedManifests(ctx)
+		if err != nil {
+			m.logger.Warn().Err(err).Msg("Manifest recovery encountered errors")
+		}
+		if recovered > 0 {
+			m.mu.Lock()
+			m.TotalManifestsRecov += recovered
+			m.mu.Unlock()
+			m.logger.Info().Int("recovered", recovered).Msg("Recovered orphaned compaction manifests")
+		}
+	}
+
 	// Build tier filter map for quick lookup
 	tierFilter := make(map[string]bool)
 	for _, name := range tierNames {
@@ -550,13 +570,22 @@ func (m *Manager) RunCompactionCycleForTiers(ctx context.Context, tierNames []st
 
 				// Process this measurement's candidates immediately
 				for _, candidate := range candidates {
+					// Filter out files that are tracked by manifests (pending compaction)
+					filteredCandidate, shouldProcess := m.filterCandidateFiles(ctx, candidate)
+					if !shouldProcess {
+						m.logger.Debug().
+							Str("partition", candidate.PartitionPath).
+							Msg("Skipping candidate: all files are tracked by manifests")
+						continue
+					}
+
 					// Split large candidates into batches to prevent DuckDB segfaults
 					// when processing too many files in a single read_parquet() call
-					batches := SplitCandidateIntoBatches(candidate)
+					batches := SplitCandidateIntoBatches(filteredCandidate)
 					if len(batches) > 1 {
 						m.logger.Info().
-							Str("partition", candidate.PartitionPath).
-							Int("total_files", len(candidate.Files)).
+							Str("partition", filteredCandidate.PartitionPath).
+							Int("total_files", len(filteredCandidate.Files)).
 							Int("batches", len(batches)).
 							Msg("Splitting large candidate into batches")
 					}
@@ -754,19 +783,62 @@ func (m *Manager) GetSortKeys(measurement string) []string {
 	return m.DefaultSortKeys
 }
 
+// filterCandidateFiles removes files that are tracked by manifests from a candidate.
+// Returns the filtered candidate and whether it should still be processed.
+func (m *Manager) filterCandidateFiles(ctx context.Context, candidate Candidate) (Candidate, bool) {
+	if m.ManifestManager == nil {
+		return candidate, len(candidate.Files) > 0
+	}
+
+	filesInManifests, err := m.ManifestManager.GetFilesInManifests(ctx)
+	if err != nil {
+		m.logger.Warn().Err(err).Msg("Failed to get files in manifests, proceeding without filtering")
+		return candidate, len(candidate.Files) > 0
+	}
+
+	if len(filesInManifests) == 0 {
+		return candidate, len(candidate.Files) > 0
+	}
+
+	// Filter out files that are in manifests
+	filteredFiles := make([]string, 0, len(candidate.Files))
+	var skipped int
+	for _, f := range candidate.Files {
+		if _, inManifest := filesInManifests[f]; inManifest {
+			skipped++
+			continue
+		}
+		filteredFiles = append(filteredFiles, f)
+	}
+
+	if skipped > 0 {
+		m.logger.Debug().
+			Str("partition", candidate.PartitionPath).
+			Int("skipped", skipped).
+			Int("remaining", len(filteredFiles)).
+			Msg("Filtered files tracked by manifests")
+	}
+
+	candidate.Files = filteredFiles
+	candidate.FileCount = len(filteredFiles)
+
+	return candidate, len(filteredFiles) > 0
+}
+
 // Stats returns compaction statistics
 func (m *Manager) Stats() map[string]interface{} {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	stats := map[string]interface{}{
-		"total_jobs_completed":  m.TotalJobsCompleted,
-		"total_jobs_failed":     m.TotalJobsFailed,
-		"total_files_compacted": m.TotalFilesCompacted,
-		"total_bytes_saved":     m.TotalBytesSaved,
-		"total_bytes_saved_mb":  float64(m.TotalBytesSaved) / 1024 / 1024,
-		"cycle_running":         m.cycleRunning.Load(),
-		"current_cycle_id":      m.cycleID.Load(),
+		"total_jobs_completed":    m.TotalJobsCompleted,
+		"total_jobs_failed":       m.TotalJobsFailed,
+		"total_files_compacted":   m.TotalFilesCompacted,
+		"total_bytes_saved":       m.TotalBytesSaved,
+		"total_bytes_saved_mb":    float64(m.TotalBytesSaved) / 1024 / 1024,
+		"total_manifests_recover": m.TotalManifestsRecov,
+		"cycle_running":           m.cycleRunning.Load(),
+		"current_cycle_id":        m.cycleID.Load(),
 	}
 
 	// Add recent jobs (last 10)
