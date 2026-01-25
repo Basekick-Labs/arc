@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -767,6 +768,37 @@ func (m *Manager) Stats() map[string]interface{} {
 	}
 
 	return stats
+}
+
+// CleanupOrphanedTempDirs removes orphaned temp directories from previous runs.
+// This handles cleanup after pod crashes where the defer cleanup didn't run.
+// Call this on startup before running compaction cycles.
+func (m *Manager) CleanupOrphanedTempDirs() error {
+	entries, err := os.ReadDir(m.TempDirectory)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // Directory doesn't exist yet
+		}
+		return fmt.Errorf("failed to read temp directory: %w", err)
+	}
+
+	var cleaned int
+	for _, entry := range entries {
+		if entry.IsDir() {
+			path := filepath.Join(m.TempDirectory, entry.Name())
+			if err := os.RemoveAll(path); err != nil {
+				m.logger.Warn().Err(err).Str("dir", entry.Name()).Msg("Failed to cleanup orphaned temp directory")
+			} else {
+				m.logger.Info().Str("dir", entry.Name()).Msg("Cleaned up orphaned temp directory")
+				cleaned++
+			}
+		}
+	}
+
+	if cleaned > 0 {
+		m.logger.Info().Int("count", cleaned).Msg("Orphaned temp directories cleaned")
+	}
+	return nil
 }
 
 // LockManager manages locks for compaction partitions
