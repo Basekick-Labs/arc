@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
@@ -23,6 +24,11 @@ const (
 
 // ManifestBasePath is the base directory for storing compaction manifests
 const ManifestBasePath = "_compaction_state"
+
+// ManifestMaxAge is the maximum age for manifests before they're considered stale.
+// Manifests older than this are deleted during recovery - they likely indicate
+// a deeper problem that requires investigation.
+const ManifestMaxAge = 7 * 24 * time.Hour // 7 days
 
 // Manifest tracks the state of a compaction operation for crash recovery.
 // If a pod crashes after uploading the compacted file but before deleting
@@ -184,6 +190,12 @@ func (m *ManifestManager) RecoverOrphanedManifests(ctx context.Context) (int, er
 	}
 
 	m.logger.Info().Int("recovered", recovered).Int("total", len(manifests)).Msg("Manifest recovery complete")
+
+	// Track recovery metrics
+	if recovered > 0 {
+		metrics.Get().IncCompactionManifestsRecovered(int64(recovered))
+	}
+
 	return recovered, nil
 }
 
@@ -193,6 +205,18 @@ func (m *ManifestManager) recoverManifest(ctx context.Context, manifestPath stri
 	if err != nil {
 		// If we can't read the manifest, delete it and let compaction retry
 		m.logger.Warn().Err(err).Str("manifest", manifestPath).Msg("Cannot read manifest, deleting")
+		return m.DeleteManifest(ctx, manifestPath)
+	}
+
+	// Check for stale manifests - if older than ManifestMaxAge, delete without recovery
+	// Very old manifests likely indicate a deeper problem that needs investigation
+	manifestAge := time.Since(manifest.CreatedAt)
+	if manifestAge > ManifestMaxAge {
+		m.logger.Warn().
+			Str("manifest", manifestPath).
+			Dur("age", manifestAge).
+			Time("created_at", manifest.CreatedAt).
+			Msg("Deleting stale manifest (older than 7 days) - investigate root cause")
 		return m.DeleteManifest(ctx, manifestPath)
 	}
 

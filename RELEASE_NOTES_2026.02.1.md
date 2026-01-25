@@ -457,6 +457,26 @@ Fixed an issue where compaction temp directories (`./data/compaction/{job_id}/`)
 - Pod crashes and restarts
 - Arc is restarted after abnormal shutdown
 
+### Compaction Data Duplication on Crash (Issue #157, PR #163)
+
+Fixed an issue where compaction crashes could cause data duplication. If a pod crashed after uploading the compacted file but before deleting the source files, restarting compaction would re-compact the same data.
+
+**Root cause:** No tracking mechanism existed to know which compaction operations were in progress. After a crash, Arc had no way to determine if a compacted file had been successfully uploaded.
+
+**Fix:** Manifest-based tracking stored in S3 at `_compaction_state/`:
+1. Before compaction starts, a manifest is written with input files and expected output
+2. After successful upload, the manifest tracks what needs to be deleted
+3. On startup, orphaned manifests are recovered - either completing deletions or retrying compaction
+4. Stale manifests (older than 7 days) are automatically deleted with a warning
+
+**Features:**
+- Manifests stored in S3, preserving compute/storage separation
+- Size validation detects partial uploads
+- Files tracked by manifests are excluded from re-compaction candidates
+- New metric: `arc_compaction_manifests_recovered_total`
+
+*Contributed by [@khalid244](https://github.com/khalid244)*
+
 ## Improvements
 
 ### Configurable Server Idle and Shutdown Timeouts
@@ -1053,7 +1073,7 @@ None
 Thanks to the following contributors for this release:
 
 - [@schotime](https://github.com/schotime) (Adam Schroder) - Data-time partitioning, compaction API triggers, UTC fixes, Azure SSL certificate fix
-- [@khalid244](https://github.com/khalid244) - Multi-line WHERE clause regex fix (Issue #146, PR #148), S3 day-level file verification (Issue #144, PR #145)
+- [@khalid244](https://github.com/khalid244) - Multi-line WHERE clause regex fix (Issue #146, PR #148), S3 day-level file verification (Issue #144, PR #145), S3 file caching (PR #149), Manifest-based compaction recovery (Issue #157, PR #163)
 
 ## Dependencies
 

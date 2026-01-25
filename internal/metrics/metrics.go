@@ -63,12 +63,13 @@ type Metrics struct {
 	storageErrorsTotal    atomic.Int64
 
 	// Compaction metrics
-	compactionJobsTotal     atomic.Int64
-	compactionJobsSuccess   atomic.Int64
-	compactionJobsFailed    atomic.Int64
-	compactionFilesCompacted atomic.Int64
-	compactionBytesRead     atomic.Int64
-	compactionBytesWritten  atomic.Int64
+	compactionJobsTotal        atomic.Int64
+	compactionJobsSuccess      atomic.Int64
+	compactionJobsFailed       atomic.Int64
+	compactionFilesCompacted   atomic.Int64
+	compactionBytesRead        atomic.Int64
+	compactionBytesWritten     atomic.Int64
+	compactionManifestsRecovered atomic.Int64
 
 	// Auth metrics
 	authRequestsTotal     atomic.Int64
@@ -208,6 +209,7 @@ func (m *Metrics) IncCompactionFailed()          { m.compactionJobsFailed.Add(1)
 func (m *Metrics) IncCompactionFilesCompacted(count int64) { m.compactionFilesCompacted.Add(count) }
 func (m *Metrics) IncCompactionBytesRead(bytes int64) { m.compactionBytesRead.Add(bytes) }
 func (m *Metrics) IncCompactionBytesWritten(bytes int64) { m.compactionBytesWritten.Add(bytes) }
+func (m *Metrics) IncCompactionManifestsRecovered(count int64) { m.compactionManifestsRecovered.Add(count) }
 
 // Auth Metrics
 func (m *Metrics) IncAuthRequests()              { m.authRequestsTotal.Add(1) }
@@ -307,12 +309,13 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"storage_errors_total":      m.storageErrorsTotal.Load(),
 
 		// Compaction
-		"compaction_jobs_total":      m.compactionJobsTotal.Load(),
-		"compaction_jobs_success":    m.compactionJobsSuccess.Load(),
-		"compaction_jobs_failed":     m.compactionJobsFailed.Load(),
-		"compaction_files_compacted": m.compactionFilesCompacted.Load(),
-		"compaction_bytes_read":      m.compactionBytesRead.Load(),
-		"compaction_bytes_written":   m.compactionBytesWritten.Load(),
+		"compaction_jobs_total":         m.compactionJobsTotal.Load(),
+		"compaction_jobs_success":       m.compactionJobsSuccess.Load(),
+		"compaction_jobs_failed":        m.compactionJobsFailed.Load(),
+		"compaction_files_compacted":    m.compactionFilesCompacted.Load(),
+		"compaction_bytes_read":         m.compactionBytesRead.Load(),
+		"compaction_bytes_written":      m.compactionBytesWritten.Load(),
+		"compaction_manifests_recovered": m.compactionManifestsRecovered.Load(),
 
 		// Auth
 		"auth_requests_total":   m.authRequestsTotal.Load(),
@@ -491,6 +494,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_compaction_jobs_failed_total Failed compaction jobs\n"...)
 	b = append(b, "# TYPE arc_compaction_jobs_failed_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_jobs_failed_total", float64(m.compactionJobsFailed.Load()))
+
+	b = append(b, "# HELP arc_compaction_manifests_recovered_total Compaction manifests recovered after crash\n"...)
+	b = append(b, "# TYPE arc_compaction_manifests_recovered_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_manifests_recovered_total", float64(m.compactionManifestsRecovered.Load()))
 
 	// Auth metrics
 	b = append(b, "# HELP arc_auth_requests_total Total authentication requests\n"...)
