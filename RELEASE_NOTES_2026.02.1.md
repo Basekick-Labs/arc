@@ -442,6 +442,21 @@ Fixed critical memory issues in the compactor that caused OOM kills and DuckDB s
 
 **Optional profiling:** Set `ARC_COMPACTION_PROFILE=1` to enable heap profiling during compaction (writes to `/tmp/arc_compaction_heap.pprof`).
 
+### Orphaned Compaction Temp Directories (Issue #164, PR #165)
+
+Fixed an issue where compaction temp directories (`./data/compaction/{job_id}/`) accumulated on disk when compaction subprocesses crashed or were OOM-killed.
+
+**Root cause:** Compaction runs in a subprocess for memory isolation. Each subprocess has a `defer cleanupTemp()` for cleanup, but when the subprocess is killed (SIGKILL, OOMKilled), the defer never executes.
+
+**Fix:** Two-layer cleanup strategy:
+1. **Startup cleanup**: `CleanupOrphanedTempDirs()` runs on Arc startup to remove orphaned directories from previous runs/crashes
+2. **Parent-side cleanup**: After each subprocess completes (success or failure), the parent process removes the job's temp directory
+
+**Result:** Temp directories are now cleaned up even when:
+- Subprocess crashes or is OOM-killed mid-operation
+- Pod crashes and restarts
+- Arc is restarted after abnormal shutdown
+
 ## Improvements
 
 ### Configurable Server Idle and Shutdown Timeouts
