@@ -456,6 +456,7 @@ type QueryHandler struct {
 	rbacManager      RBACChecker
 	debugEnabled     bool // Cached check for debug logging to avoid repeated level checks
 	parallelExecutor *query.ParallelExecutor
+	queryTimeout     time.Duration // Query timeout (0 = no timeout)
 
 	// Cluster routing support
 	router *cluster.Router
@@ -587,10 +588,18 @@ func validateWhereClauseQuery(where string) error {
 }
 
 // NewQueryHandler creates a new query handler
-func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolog.Logger) *QueryHandler {
+// queryTimeoutSeconds: timeout for query execution in seconds (0 = no timeout)
+func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolog.Logger, queryTimeoutSeconds int) *QueryHandler {
 	handlerLogger := logger.With().Str("component", "query-handler").Logger()
 	pruner := pruning.NewPartitionPruner(logger)
 	pruner.SetStorageBackend(storage) // Enable S3/Azure partition filtering
+
+	var queryTimeout time.Duration
+	if queryTimeoutSeconds > 0 {
+		queryTimeout = time.Duration(queryTimeoutSeconds) * time.Second
+		handlerLogger.Info().Int("timeout_seconds", queryTimeoutSeconds).Msg("Query timeout configured")
+	}
+
 	return &QueryHandler{
 		db:               db,
 		storage:          storage,
@@ -601,6 +610,7 @@ func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolo
 		rbacManager:      nil,
 		debugEnabled:     handlerLogger.GetLevel() <= zerolog.DebugLevel,
 		parallelExecutor: query.NewParallelExecutor(db.DB(), query.DefaultParallelConfig(), handlerLogger),
+		queryTimeout:     queryTimeout,
 	}
 }
 
@@ -1050,15 +1060,33 @@ localProcessing:
 		var rows *sql.Rows
 		var err error
 
+		// Create context with timeout if configured (0 = no timeout)
+		ctx := c.UserContext()
+		var cancel context.CancelFunc
+		if h.queryTimeout > 0 {
+			ctx, cancel = context.WithTimeout(ctx, h.queryTimeout)
+			defer cancel()
+		}
+
 		if profileMode {
 			// Use profiled query to capture timing breakdown
 			rows, profile, err = h.db.QueryWithProfile(convertedSQL)
 		} else {
-			rows, err = h.db.Query(convertedSQL)
+			rows, err = h.db.QueryContext(ctx, convertedSQL)
 		}
 
 		if err != nil {
 			m.IncQueryErrors()
+			// Check if it was a timeout
+			if h.queryTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
+				h.logger.Error().Err(err).Str("sql", req.SQL).Dur("timeout", h.queryTimeout).Msg("Query timed out")
+				return c.Status(fiber.StatusGatewayTimeout).JSON(QueryResponse{
+					Success:         false,
+					Error:           "Query timed out",
+					ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+					Timestamp:       timestamp,
+				})
+			}
 			h.logger.Error().Err(err).Str("sql", req.SQL).Msg("Query execution failed")
 			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 				Success:         false,

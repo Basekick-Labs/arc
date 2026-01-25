@@ -728,8 +728,8 @@ func main() {
 	}
 	lineProtocolHandler.RegisterRoutes(server.GetApp())
 
-	// Register Query handler
-	queryHandler := api.NewQueryHandler(db, storageBackend, logger.Get("query"))
+	// Register Query handler (uses server read_timeout for query timeout)
+	queryHandler := api.NewQueryHandler(db, storageBackend, logger.Get("query"), cfg.Server.ReadTimeout)
 	if authManager != nil && rbacManager != nil {
 		queryHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}

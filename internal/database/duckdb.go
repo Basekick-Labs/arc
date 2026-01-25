@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -379,6 +380,29 @@ func configureAzureAccess(db *sql.DB, cfg *Config, logger zerolog.Logger) error 
 func (d *DuckDB) Query(query string, args ...interface{}) (*sql.Rows, error) {
 	start := time.Now()
 	rows, err := d.db.Query(query, args...)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		d.logger.Error().
+			Err(err).
+			Str("query", query).
+			Dur("elapsed", elapsed).
+			Msg("Query failed")
+		return nil, fmt.Errorf("query failed: %w", err)
+	}
+
+	d.logger.Debug().
+		Str("query", query).
+		Dur("elapsed", elapsed).
+		Msg("Query executed")
+
+	return rows, nil
+}
+
+// QueryContext executes a query with context support for timeout/cancellation
+func (d *DuckDB) QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	start := time.Now()
+	rows, err := d.db.QueryContext(ctx, query, args...)
 	elapsed := time.Since(start)
 
 	if err != nil {
