@@ -230,6 +230,24 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 	// Run compaction in subprocess for memory isolation
 	result, err := RunJobInSubprocess(ctx, config, m.logger, extraEnv...)
 
+	// Always clean up temp directories for this partition after subprocess completes.
+	// The subprocess has its own defer cleanup, but if it crashes or gets OOM-killed,
+	// the defer never runs. This ensures cleanup happens from the parent process.
+	// Job temp dirs are named: {database}_{partition_path_with_underscores}_{timestamp}
+	partitionPrefix := candidate.Database + "_" + strings.ReplaceAll(candidate.PartitionPath, "/", "_") + "_"
+	if entries, readErr := os.ReadDir(config.TempDirectory); readErr == nil {
+		for _, entry := range entries {
+			if entry.IsDir() && strings.HasPrefix(entry.Name(), partitionPrefix) {
+				dirPath := filepath.Join(config.TempDirectory, entry.Name())
+				if removeErr := os.RemoveAll(dirPath); removeErr != nil {
+					m.logger.Debug().Err(removeErr).Str("dir", entry.Name()).Msg("Failed to cleanup subprocess temp directory")
+				} else {
+					m.logger.Debug().Str("dir", entry.Name()).Msg("Cleaned up subprocess temp directory")
+				}
+			}
+		}
+	}
+
 	// Update metrics
 	m.mu.Lock()
 	defer m.mu.Unlock()
