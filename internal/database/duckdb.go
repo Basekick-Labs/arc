@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -398,6 +399,29 @@ func (d *DuckDB) Query(query string, args ...interface{}) (*sql.Rows, error) {
 	return rows, nil
 }
 
+// QueryContext executes a query with context support for timeout/cancellation
+func (d *DuckDB) QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	start := time.Now()
+	rows, err := d.db.QueryContext(ctx, query, args...)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		d.logger.Error().
+			Err(err).
+			Str("query", query).
+			Dur("elapsed", elapsed).
+			Msg("Query failed")
+		return nil, fmt.Errorf("query failed: %w", err)
+	}
+
+	d.logger.Debug().
+		Str("query", query).
+		Dur("elapsed", elapsed).
+		Msg("Query executed")
+
+	return rows, nil
+}
+
 // Exec executes a statement without returning rows
 func (d *DuckDB) Exec(query string, args ...interface{}) (sql.Result, error) {
 	start := time.Now()
@@ -445,11 +469,17 @@ func (d *DuckDB) DB() *sql.DB {
 // QueryWithProfile executes a query and returns timing breakdown using DuckDB profiling
 // This is used to measure parsing/planning overhead for optimization decisions
 func (d *DuckDB) QueryWithProfile(query string) (*sql.Rows, *QueryProfile, error) {
+	return d.QueryWithProfileContext(context.Background(), query)
+}
+
+// QueryWithProfileContext executes a query with context support for timeout/cancellation
+// and returns timing breakdown using DuckDB profiling
+func (d *DuckDB) QueryWithProfileContext(ctx context.Context, query string) (*sql.Rows, *QueryProfile, error) {
 	// Create a temporary file for profiling output
 	tmpFile, err := os.CreateTemp("", "duckdb_profile_*.json")
 	if err != nil {
 		// Fall back to regular query if we can't create temp file
-		rows, err := d.Query(query)
+		rows, err := d.QueryContext(ctx, query)
 		return rows, nil, err
 	}
 	profilePath := tmpFile.Name()
@@ -468,9 +498,9 @@ func (d *DuckDB) QueryWithProfile(query string) (*sql.Rows, *QueryProfile, error
 		d.logger.Warn().Err(err).Msg("Failed to set custom profiling settings")
 	}
 
-	// Execute the query with timing
+	// Execute the query with timing and context
 	start := time.Now()
-	rows, err := d.db.Query(query)
+	rows, err := d.db.QueryContext(ctx, query)
 	totalTime := time.Since(start)
 
 	// Disable profiling

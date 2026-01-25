@@ -2,6 +2,7 @@ package api
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -75,9 +76,26 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		Str("header_db", headerDB).
 		Msg("Executing Arrow query")
 
-	// Execute query using standard database/sql interface
-	rows, err := h.db.Query(convertedSQL)
+	// Create context with timeout if configured
+	ctx := c.UserContext()
+	var cancel context.CancelFunc
+	if h.queryTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, h.queryTimeout)
+		defer cancel()
+	}
+
+	// Execute query using standard database/sql interface with timeout support
+	rows, err := h.db.QueryContext(ctx, convertedSQL)
 	if err != nil {
+		// Check if it was a timeout
+		if h.queryTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
+			m.IncQueryTimeouts()
+			h.logger.Error().Err(err).Str("sql", req.SQL).Dur("timeout", h.queryTimeout).Msg("Arrow query timed out")
+			return c.Status(fiber.StatusGatewayTimeout).JSON(fiber.Map{
+				"success": false,
+				"error":   "Query timed out",
+			})
+		}
 		m.IncQueryErrors()
 		h.logger.Error().Err(err).Str("sql", req.SQL).Msg("Arrow query execution failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
