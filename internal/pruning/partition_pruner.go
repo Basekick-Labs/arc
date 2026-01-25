@@ -272,8 +272,6 @@ type PartitionPruner struct {
 // PrunerStats tracks partition pruning statistics using atomic counters for thread-safety
 type PrunerStats struct {
 	QueriesOptimized atomic.Int64
-	FilesPruned      atomic.Int64
-	FilesScanned     atomic.Int64
 }
 
 // TimeRange represents a time range filter
@@ -610,24 +608,18 @@ func (p *PartitionPruner) OptimizeTablePath(originalPath, sql string) (interface
 // StatsSnapshot holds a point-in-time snapshot of pruner statistics
 type StatsSnapshot struct {
 	QueriesOptimized int64
-	FilesPruned      int64
-	FilesScanned     int64
 }
 
 // GetStats returns a snapshot of pruning statistics (thread-safe)
 func (p *PartitionPruner) GetStats() StatsSnapshot {
 	return StatsSnapshot{
 		QueriesOptimized: p.stats.QueriesOptimized.Load(),
-		FilesPruned:      p.stats.FilesPruned.Load(),
-		FilesScanned:     p.stats.FilesScanned.Load(),
 	}
 }
 
 // ResetStats resets statistics counters (thread-safe)
 func (p *PartitionPruner) ResetStats() {
 	p.stats.QueriesOptimized.Store(0)
-	p.stats.FilesPruned.Store(0)
-	p.stats.FilesScanned.Store(0)
 }
 
 // parseDateTime parses datetime string in various formats
@@ -735,8 +727,6 @@ func (p *PartitionPruner) filterExistingRemotePaths(paths []string) []string {
 	for _, path := range paths {
 		// Remove the glob suffix to get the directory
 		dir := strings.TrimSuffix(path, "/*.parquet")
-		// Also handle daily paths without hour component
-		dir = strings.TrimSuffix(dir, "/*.parquet")
 		dirsToCheck[dir] = struct{}{}
 		pathToDir[path] = dir
 	}
@@ -839,21 +829,33 @@ func (p *PartitionPruner) filterExistingRemotePaths(paths []string) []string {
 		// This prevents "No files found" errors when daily compaction hasn't run yet.
 		prefix := p.extractStoragePrefix(dir + "/")
 		if parts := strings.Split(strings.Trim(prefix, "/"), "/"); len(parts) == 5 {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			files, err := p.storage.List(ctx, prefix)
-			cancel()
-			if err != nil {
-				p.logger.Debug().Err(err).Str("prefix", prefix).Msg("Failed to list files at day-level path")
-				continue
-			}
-			hasFiles := false
-			for _, f := range files {
-				// Check if file is directly in this dir (no / in remaining path after prefix)
-				remaining := strings.TrimPrefix(f, prefix)
-				if remaining != "" && !strings.Contains(remaining, "/") && strings.HasSuffix(remaining, ".parquet") {
-					hasFiles = true
-					break
+			// Check cache first for day-level file existence
+			cacheKey := "remote:dayfiles:" + prefix
+			var hasFiles bool
+			if cached, ok := p.globCache.get(cacheKey); ok {
+				hasFiles = len(cached) > 0
+				p.logger.Debug().Str("prefix", prefix).Bool("has_files", hasFiles).Msg("Using cached day-level file check")
+			} else {
+				// Cache miss - make API call
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				files, err := p.storage.List(ctx, prefix)
+				cancel()
+				if err != nil {
+					p.logger.Debug().Err(err).Str("prefix", prefix).Msg("Failed to list files at day-level path")
+					continue
 				}
+				// Find direct parquet files (not in subdirs)
+				var directFiles []string
+				for _, f := range files {
+					remaining := strings.TrimPrefix(f, prefix)
+					if remaining != "" && !strings.Contains(remaining, "/") && strings.HasSuffix(remaining, ".parquet") {
+						directFiles = append(directFiles, remaining)
+					}
+				}
+				// Cache the result
+				p.globCache.set(cacheKey, directFiles)
+				hasFiles = len(directFiles) > 0
+				p.logger.Debug().Str("prefix", prefix).Int("files", len(directFiles)).Msg("Cached day-level file check")
 			}
 			if !hasFiles {
 				p.logger.Debug().Str("path", path).Msg("Day-level path has no direct parquet files, skipping")
@@ -923,6 +925,15 @@ func (p *PartitionPruner) CleanupGlobCache() int {
 	return removed
 }
 
+// CleanupPartitionCache removes expired entries from the partition cache
+func (p *PartitionPruner) CleanupPartitionCache() int {
+	removed := p.partitionCache.cleanup()
+	if removed > 0 {
+		p.logger.Debug().Int("removed", removed).Msg("Cleaned up expired partition cache entries")
+	}
+	return removed
+}
+
 // GetGlobCacheStats returns glob cache statistics
 func (p *PartitionPruner) GetGlobCacheStats() map[string]interface{} {
 	hits, misses, size := p.globCache.stats()
@@ -963,12 +974,4 @@ func (p *PartitionPruner) GetAllCacheStats() map[string]interface{} {
 		"glob_cache":      p.GetGlobCacheStats(),
 		"partition_cache": p.GetPartitionCacheStats(),
 	}
-}
-
-// min returns the minimum of two integers
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
