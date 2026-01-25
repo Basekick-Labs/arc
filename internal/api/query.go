@@ -1069,8 +1069,8 @@ localProcessing:
 		}
 
 		if profileMode {
-			// Use profiled query to capture timing breakdown
-			rows, profile, err = h.db.QueryWithProfile(convertedSQL)
+			// Use profiled query to capture timing breakdown (with timeout support)
+			rows, profile, err = h.db.QueryWithProfileContext(ctx, convertedSQL)
 		} else {
 			rows, err = h.db.QueryContext(ctx, convertedSQL)
 		}
