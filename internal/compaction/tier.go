@@ -2,7 +2,6 @@ package compaction
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
@@ -149,22 +148,6 @@ func (t *BaseTier) GetBaseStats(tierName string) map[string]interface{} {
 		"total_bytes_saved":     t.TotalBytesSaved,
 		"total_bytes_saved_mb":  float64(t.TotalBytesSaved) / 1024 / 1024,
 	}
-}
-
-// RecordCompaction records metrics for a completed compaction
-func (t *BaseTier) RecordCompaction(filesCompacted int, bytesSaved int64) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	t.TotalCompactions++
-	t.TotalFilesCompacted += filesCompacted
-	t.TotalBytesSaved += bytesSaved
-}
-
-// IsCompactedFile checks if a file is a compacted file from a specific tier
-func (t *BaseTier) IsCompactedFile(tierName, filename string) bool {
-	suffix := fmt.Sprintf("_%s.parquet", tierName)
-	return len(filename) >= len(suffix) && filename[len(filename)-len(suffix):] == suffix
 }
 
 // ShouldCompactByFileSuffix determines if compaction is needed based on file classification.

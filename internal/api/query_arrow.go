@@ -10,6 +10,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -22,33 +23,21 @@ const arrowBatchSize = 10000
 // Optimized to stream rows directly into Arrow batches without intermediate buffering.
 func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	start := time.Now()
+	m := metrics.Get()
 
 	// Parse request body
 	var req QueryRequest
 	if err := c.BodyParser(&req); err != nil {
+		m.IncQueryErrors()
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"success": false,
 			"error":   "Invalid request body: " + err.Error(),
 		})
 	}
 
-	// Validate SQL
-	if strings.TrimSpace(req.SQL) == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"success": false,
-			"error":   "SQL query is required",
-		})
-	}
-
-	if len(req.SQL) > 10000 {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"success": false,
-			"error":   "SQL query exceeds maximum length (10000 characters)",
-		})
-	}
-
-	// Check for dangerous SQL patterns
-	if err := h.validateSQL(req.SQL); err != nil {
+	// Validate SQL (empty, max length, dangerous patterns)
+	if err := ValidateSQLRequest(req.SQL); err != nil {
+		m.IncQueryErrors()
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"success": false,
 			"error":   err.Error(),
@@ -60,6 +49,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 
 	// If header is set, reject cross-database syntax (db.table not allowed)
 	if headerDB != "" && hasCrossDatabaseSyntax(req.SQL) {
+		m.IncQueryErrors()
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"success": false,
 			"error":   "Cross-database queries (db.table syntax) not allowed when x-arc-database header is set",
@@ -68,6 +58,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 
 	// Check RBAC permissions for all tables referenced in the query
 	if err := h.checkQueryPermissions(c, req.SQL, "read"); err != nil {
+		m.IncQueryErrors()
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 			"success": false,
 			"error":   err.Error(),
@@ -87,6 +78,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// Execute query using standard database/sql interface
 	rows, err := h.db.Query(convertedSQL)
 	if err != nil {
+		m.IncQueryErrors()
 		h.logger.Error().Err(err).Str("sql", req.SQL).Msg("Arrow query execution failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
@@ -99,6 +91,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// Get column info
 	columns, err := rows.Columns()
 	if err != nil {
+		m.IncQueryErrors()
 		h.logger.Error().Err(err).Msg("Failed to get column names")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
@@ -108,6 +101,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 
 	columnTypes, err := rows.ColumnTypes()
 	if err != nil {
+		m.IncQueryErrors()
 		h.logger.Error().Err(err).Msg("Failed to get column types")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,

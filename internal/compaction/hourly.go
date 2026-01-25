@@ -175,10 +175,19 @@ func (t *HourlyTier) listHourPartitions(ctx context.Context, database, measureme
 			continue // Not a valid hour, skip
 		}
 
-		// Parse partition time
-		yearInt, _ := strconv.Atoi(year)
-		monthInt, _ := strconv.Atoi(month)
-		dayInt, _ := strconv.Atoi(day)
+		// Parse partition time with proper error handling
+		yearInt, err := strconv.Atoi(year)
+		if err != nil {
+			continue // Invalid year, skip
+		}
+		monthInt, err := strconv.Atoi(month)
+		if err != nil || monthInt < 1 || monthInt > 12 {
+			continue // Invalid month, skip
+		}
+		dayInt, err := strconv.Atoi(day)
+		if err != nil || dayInt < 1 || dayInt > 31 {
+			continue // Invalid day, skip
+		}
 
 		partitionTime := time.Date(yearInt, time.Month(monthInt), dayInt, hourInt, 0, 0, 0, time.UTC)
 
