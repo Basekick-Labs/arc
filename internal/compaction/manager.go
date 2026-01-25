@@ -448,6 +448,27 @@ func (m *Manager) RunCompactionCycleForTiers(ctx context.Context, tierNames []st
 		tierFilter[name] = true
 	}
 
+	// Pre-discover databases and measurements ONCE before processing tiers
+	// This avoids redundant storage API calls when multiple tiers are enabled
+	databases, err := m.listDatabases(ctx)
+	if err != nil {
+		m.logger.Error().Err(err).Msg("Failed to list databases for compaction cycle")
+		return cycleID, err
+	}
+
+	// Build database -> measurements map to avoid repeated lookups
+	dbMeasurements := make(map[string][]string)
+	for _, database := range databases {
+		measurements, err := m.listMeasurements(ctx, database)
+		if err != nil {
+			m.logger.Error().Err(err).
+				Str("database", database).
+				Msg("Failed to list measurements")
+			continue
+		}
+		dbMeasurements[database] = measurements
+	}
+
 	// Process tiers sequentially to maintain hierarchy (hourly -> daily)
 	// This ensures lower tiers complete before higher tiers run
 	totalCandidates := 0
@@ -473,13 +494,6 @@ func (m *Manager) RunCompactionCycleForTiers(ctx context.Context, tierNames []st
 			Str("tier", tierName).
 			Msg("Processing tier")
 
-		// Find candidates for this tier
-		databases, err := m.listDatabases(ctx)
-		if err != nil {
-			m.logger.Error().Err(err).Str("tier", tierName).Msg("Failed to list databases")
-			continue
-		}
-
 		// MEMORY OPTIMIZATION: Process candidates as they're found instead of accumulating all.
 		// This prevents unbounded memory growth when there are millions of files.
 		// Each measurement's candidates are processed and then eligible for GC.
@@ -490,14 +504,7 @@ func (m *Manager) RunCompactionCycleForTiers(ctx context.Context, tierNames []st
 		var errMu sync.Mutex
 
 		for _, database := range databases {
-			measurements, err := m.listMeasurements(ctx, database)
-			if err != nil {
-				m.logger.Error().Err(err).
-					Str("database", database).
-					Str("tier", tierName).
-					Msg("Failed to list measurements")
-				continue
-			}
+			measurements := dbMeasurements[database]
 
 			for _, meas := range measurements {
 				// Check for cancellation between measurements

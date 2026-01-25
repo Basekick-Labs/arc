@@ -896,27 +896,8 @@ localProcessing:
 		})
 	}
 
-	// Validate SQL
-	if strings.TrimSpace(req.SQL) == "" {
-		m.IncQueryErrors()
-		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
-			Success:   false,
-			Error:     "SQL query is required",
-			Timestamp: timestamp,
-		})
-	}
-
-	if len(req.SQL) > 10000 {
-		m.IncQueryErrors()
-		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
-			Success:   false,
-			Error:     "SQL query exceeds maximum length (10000 characters)",
-			Timestamp: timestamp,
-		})
-	}
-
-	// Check for dangerous SQL patterns
-	if err := h.validateSQL(req.SQL); err != nil {
+	// Validate SQL (empty, max length, dangerous patterns)
+	if err := ValidateSQLRequest(req.SQL); err != nil {
 		m.IncQueryErrors()
 		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
 			Success:   false,
@@ -1156,6 +1137,37 @@ localProcessing:
 		Timestamp:       timestamp,
 		Profile:         profile,
 	})
+}
+
+// SQLValidationError represents an error from SQL validation
+type SQLValidationError struct {
+	Message string
+}
+
+func (e *SQLValidationError) Error() string {
+	return e.Message
+}
+
+// ValidateSQLRequest validates an SQL query for common issues.
+// Returns nil if valid, or an error with appropriate message.
+// This is a shared function used by multiple query endpoints.
+func ValidateSQLRequest(sql string) error {
+	if strings.TrimSpace(sql) == "" {
+		return &SQLValidationError{Message: "SQL query is required"}
+	}
+
+	if len(sql) > 10000 {
+		return &SQLValidationError{Message: "SQL query exceeds maximum length (10000 characters)"}
+	}
+
+	// Check for dangerous SQL patterns
+	for _, pattern := range dangerousSQLPatterns {
+		if pattern.MatchString(sql) {
+			return &SQLValidationError{Message: "Dangerous SQL operation not allowed"}
+		}
+	}
+
+	return nil
 }
 
 // validateSQL checks for dangerous SQL patterns
@@ -2215,17 +2227,8 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 		})
 	}
 
-	// Validate SQL
-	if strings.TrimSpace(req.SQL) == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(EstimateResponse{
-			Success:      false,
-			Error:        "SQL query is required",
-			WarningLevel: "error",
-		})
-	}
-
-	// Check for dangerous SQL patterns
-	if err := h.validateSQL(req.SQL); err != nil {
+	// Validate SQL (empty, max length, dangerous patterns)
+	if err := ValidateSQLRequest(req.SQL); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(EstimateResponse{
 			Success:      false,
 			Error:        err.Error(),
