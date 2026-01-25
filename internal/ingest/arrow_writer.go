@@ -537,201 +537,6 @@ func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement stri
 	return w.writeRecordToParquet(schema, arrays)
 }
 
-// WriteParquetFromInterface writes columnar data directly from []interface{} to Parquet
-// SINGLE-PASS OPTIMIZATION: Skips convertColumnsToTyped() - builds Arrow arrays directly
-// This reduces iterations from 2 to 1, improving latency by ~30-40%
-func (w *ArrowWriter) WriteParquetFromInterface(ctx context.Context, measurement string, columns map[string][]interface{}) ([]byte, error) {
-	if len(columns) == 0 {
-		return nil, fmt.Errorf("no columns provided")
-	}
-
-	// Get number of records from first column
-	var numRows int
-	for _, col := range columns {
-		numRows = len(col)
-		break
-	}
-	if numRows == 0 {
-		return nil, fmt.Errorf("empty columns")
-	}
-
-	// Get or infer schema from interface columns
-	schema, err := w.getSchemaFromInterface(measurement, columns)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get schema: %w", err)
-	}
-
-	// Create Arrow arrays from columns - SINGLE PASS
-	mem := memory.NewGoAllocator()
-	arrays := make([]arrow.Array, len(schema.Fields()))
-
-	defer func() {
-		for _, arr := range arrays {
-			if arr != nil {
-				arr.Release()
-			}
-		}
-	}()
-
-	// Build arrays directly from []interface{} - NO pre-conversion!
-	for i, field := range schema.Fields() {
-		col, ok := columns[field.Name]
-		if !ok {
-			return nil, fmt.Errorf("column %s not found in data", field.Name)
-		}
-
-		arr, err := w.buildArrayFromInterface(mem, field, col)
-		if err != nil {
-			return nil, fmt.Errorf("failed to build array for column %s: %w", field.Name, err)
-		}
-		arrays[i] = arr
-	}
-
-	return w.writeRecordToParquet(schema, arrays)
-}
-
-// buildArrayFromInterface builds an Arrow array directly from []interface{}
-// SINGLE-PASS: Iterates once while building, no pre-conversion needed
-// IMPORTANT: Caller must call Release() on the returned array when done
-func (w *ArrowWriter) buildArrayFromInterface(mem memory.Allocator, field arrow.Field, col []interface{}) (arrow.Array, error) {
-	switch field.Type.ID() {
-	case arrow.INT64:
-		builder := array.NewInt64Builder(mem)
-		defer builder.Release() // CRITICAL: Release builder to prevent memory leak
-		builder.Reserve(len(col))
-		for _, v := range col {
-			if v == nil {
-				builder.AppendNull()
-				continue
-			}
-			val, ok := toInt64(v)
-			if !ok {
-				return nil, fmt.Errorf("cannot convert %T to int64", v)
-			}
-			builder.Append(val)
-		}
-		return builder.NewArray(), nil
-
-	case arrow.TIMESTAMP:
-		builder := array.NewTimestampBuilder(mem, arrow.FixedWidthTypes.Timestamp_us.(*arrow.TimestampType))
-		defer builder.Release() // CRITICAL: Release builder to prevent memory leak
-		builder.Reserve(len(col))
-		for _, v := range col {
-			if v == nil {
-				builder.AppendNull()
-				continue
-			}
-			val, ok := toInt64(v)
-			if !ok {
-				return nil, fmt.Errorf("cannot convert %T to timestamp", v)
-			}
-			builder.Append(arrow.Timestamp(val))
-		}
-		return builder.NewArray(), nil
-
-	case arrow.FLOAT64:
-		builder := array.NewFloat64Builder(mem)
-		defer builder.Release() // CRITICAL: Release builder to prevent memory leak
-		builder.Reserve(len(col))
-		for _, v := range col {
-			if v == nil {
-				builder.AppendNull()
-				continue
-			}
-			val, ok := toFloat64(v)
-			if !ok {
-				return nil, fmt.Errorf("cannot convert %T to float64", v)
-			}
-			builder.Append(val)
-		}
-		return builder.NewArray(), nil
-
-	case arrow.STRING:
-		builder := array.NewStringBuilder(mem)
-		defer builder.Release() // CRITICAL: Release builder to prevent memory leak
-		builder.Reserve(len(col))
-		for _, v := range col {
-			if v == nil {
-				builder.AppendNull()
-				continue
-			}
-			if str, ok := v.(string); ok {
-				builder.Append(str)
-			} else {
-				return nil, fmt.Errorf("cannot convert %T to string", v)
-			}
-		}
-		return builder.NewArray(), nil
-
-	case arrow.BOOL:
-		builder := array.NewBooleanBuilder(mem)
-		defer builder.Release() // CRITICAL: Release builder to prevent memory leak
-		builder.Reserve(len(col))
-		for _, v := range col {
-			if v == nil {
-				builder.AppendNull()
-				continue
-			}
-			if b, ok := v.(bool); ok {
-				builder.Append(b)
-			} else {
-				return nil, fmt.Errorf("cannot convert %T to bool", v)
-			}
-		}
-		return builder.NewArray(), nil
-
-	default:
-		return nil, fmt.Errorf("unsupported Arrow type: %s", field.Type.Name())
-	}
-}
-
-// getSchemaFromInterface infers schema from []interface{} columns (LRU cached)
-func (w *ArrowWriter) getSchemaFromInterface(measurement string, columns map[string][]interface{}) (*arrow.Schema, error) {
-	// Check LRU cache first
-	if schema := w.schemaCache.get(measurement); schema != nil {
-		return schema, nil
-	}
-
-	// Infer schema from data
-	fields := make([]arrow.Field, 0, len(columns))
-
-	// Process columns in consistent order (time first, then alphabetical)
-	colNames := make([]string, 0, len(columns))
-	for name := range columns {
-		colNames = append(colNames, name)
-	}
-
-	// Sort: time first, then alphabetical (O(n log n) vs O(n²) bubble sort)
-	sortColumnsTimeFirst(colNames)
-
-	for _, name := range colNames {
-		col := columns[name]
-		if len(col) == 0 {
-			continue
-		}
-
-		// Find first non-nil value for type inference
-		firstVal := firstNonNil(col)
-		if firstVal == nil {
-			continue // Skip all-nil columns
-		}
-
-		// Infer Arrow type using consolidated helper
-		arrowType, err := inferArrowType(name, firstVal)
-		if err != nil {
-			return nil, fmt.Errorf("column %s: %w", name, err)
-		}
-
-		fields = append(fields, arrow.Field{Name: name, Type: arrowType, Nullable: true})
-	}
-
-	schema := arrow.NewSchema(fields, nil)
-
-	// Store in LRU cache
-	w.schemaCache.set(measurement, schema)
-
-	return schema, nil
-}
 
 // writeRecordToParquet writes Arrow arrays to Parquet bytes
 func (w *ArrowWriter) writeRecordToParquet(schema *arrow.Schema, arrays []arrow.Array) ([]byte, error) {
@@ -742,22 +547,16 @@ func (w *ArrowWriter) writeRecordToParquet(schema *arrow.Schema, arrays []arrow.
 	// Write to Parquet
 	var buf bytes.Buffer
 
-	// Configure Parquet writer properties
-	writerProps := parquet.NewWriterProperties(
+	// Configure Parquet writer properties (built once with all options)
+	writerOpts := []parquet.WriterProperty{
 		parquet.WithCompression(w.compression),
 		parquet.WithDictionaryDefault(w.useDictionary),
 		parquet.WithStats(w.writeStatistics),
-	)
-
-	// Set data page version
-	if w.dataPageVersion == "2.0" {
-		writerProps = parquet.NewWriterProperties(
-			parquet.WithCompression(w.compression),
-			parquet.WithDictionaryDefault(w.useDictionary),
-			parquet.WithStats(w.writeStatistics),
-			parquet.WithDataPageVersion(parquet.DataPageV2),
-		)
 	}
+	if w.dataPageVersion == "2.0" {
+		writerOpts = append(writerOpts, parquet.WithDataPageVersion(parquet.DataPageV2))
+	}
+	writerProps := parquet.NewWriterProperties(writerOpts...)
 
 	// Create Arrow writer properties
 	arrowProps := pqarrow.NewArrowWriterProperties(pqarrow.WithStoreSchema())
@@ -1548,8 +1347,19 @@ func (b *ArrowBuffer) convertColumnsToTyped(columns map[string][]interface{}) (m
 // ZERO-COPY HELPERS: Try bulk type assertion for homogeneous arrays
 
 // tryInt64ZeroCopy attempts zero-copy conversion for int64 arrays
-// OPTIMIZATION: Single-pass check + conversion to reduce CPU cache thrashing
+// OPTIMIZATION: Check first element type before allocating to avoid wasted allocation
 func (b *ArrowBuffer) tryInt64ZeroCopy(col []interface{}) ([]int64, bool) {
+	if len(col) == 0 {
+		return nil, false
+	}
+	// Check first element to avoid wasted allocation on type mismatch
+	if col[0] == nil {
+		return nil, false
+	}
+	if _, ok := col[0].(int64); !ok {
+		return nil, false
+	}
+	// Now allocate and convert
 	arr := make([]int64, len(col))
 	for i, v := range col {
 		if v == nil {
@@ -1565,8 +1375,19 @@ func (b *ArrowBuffer) tryInt64ZeroCopy(col []interface{}) ([]int64, bool) {
 }
 
 // tryFloat64ZeroCopy attempts zero-copy conversion for float64 arrays
-// OPTIMIZATION: Single-pass check + conversion to reduce CPU cache thrashing
+// OPTIMIZATION: Check first element type before allocating to avoid wasted allocation
 func (b *ArrowBuffer) tryFloat64ZeroCopy(col []interface{}) ([]float64, bool) {
+	if len(col) == 0 {
+		return nil, false
+	}
+	// Check first element to avoid wasted allocation on type mismatch
+	if col[0] == nil {
+		return nil, false
+	}
+	if _, ok := col[0].(float64); !ok {
+		return nil, false
+	}
+	// Now allocate and convert
 	arr := make([]float64, len(col))
 	for i, v := range col {
 		if v == nil {
@@ -1582,8 +1403,19 @@ func (b *ArrowBuffer) tryFloat64ZeroCopy(col []interface{}) ([]float64, bool) {
 }
 
 // tryStringZeroCopy attempts zero-copy conversion for string arrays
-// OPTIMIZATION: Single-pass check + conversion to reduce CPU cache thrashing
+// OPTIMIZATION: Check first element type before allocating to avoid wasted allocation
 func (b *ArrowBuffer) tryStringZeroCopy(col []interface{}) ([]string, bool) {
+	if len(col) == 0 {
+		return nil, false
+	}
+	// Check first element to avoid wasted allocation on type mismatch
+	if col[0] == nil {
+		return nil, false
+	}
+	if _, ok := col[0].(string); !ok {
+		return nil, false
+	}
+	// Now allocate and convert
 	arr := make([]string, len(col))
 	for i, v := range col {
 		if v == nil {
@@ -1599,8 +1431,19 @@ func (b *ArrowBuffer) tryStringZeroCopy(col []interface{}) ([]string, bool) {
 }
 
 // tryBoolZeroCopy attempts zero-copy conversion for bool arrays
-// OPTIMIZATION: Single-pass check + conversion to reduce CPU cache thrashing
+// OPTIMIZATION: Check first element type before allocating to avoid wasted allocation
 func (b *ArrowBuffer) tryBoolZeroCopy(col []interface{}) ([]bool, bool) {
+	if len(col) == 0 {
+		return nil, false
+	}
+	// Check first element to avoid wasted allocation on type mismatch
+	if col[0] == nil {
+		return nil, false
+	}
+	if _, ok := col[0].(bool); !ok {
+		return nil, false
+	}
+	// Now allocate and convert
 	arr := make([]bool, len(col))
 	for i, v := range col {
 		if v == nil {
