@@ -503,6 +503,31 @@ recovery_batch_size = 10000      # Max records per recovery batch (default: 1000
 
 *Contributed by [@khalid244](https://github.com/khalid244)*
 
+### Query Timeout for S3 Disconnection (Issue #151, PR #152)
+
+Added configurable query timeout to prevent indefinite hangs when S3 becomes unavailable during query execution.
+
+**Problem:** When S3 connectivity was lost mid-query, DuckDB would hang waiting for its internal HTTP timeout (120+ seconds), causing queries to appear frozen and client connections to timeout unpredictably.
+
+**Fix:** New `query.timeout` configuration with context-based cancellation:
+- All query endpoints (JSON, Arrow, Estimate) now respect the timeout
+- Returns HTTP 504 Gateway Timeout when exceeded
+- Profiled queries also support timeout via new `QueryWithProfileContext` method
+
+**Configuration:**
+```toml
+[query]
+timeout = 300  # Query timeout in seconds (default: 300s, 0 = no timeout)
+```
+
+**Environment variable:** `ARC_QUERY_TIMEOUT`
+
+**New metric:** `arc_query_timeouts_total` - Counter of queries that exceeded the timeout
+
+**Note:** The context cancellation signals the timeout but doesn't immediately stop DuckDB's internal HTTP operations. The query will return 504 to the client while DuckDB completes in the background.
+
+*Contributed by [@khalid244](https://github.com/khalid244)*
+
 ## Improvements
 
 ### Configurable Server Idle and Shutdown Timeouts
@@ -1099,7 +1124,7 @@ None
 Thanks to the following contributors for this release:
 
 - [@schotime](https://github.com/schotime) (Adam Schroder) - Data-time partitioning, compaction API triggers, UTC fixes, Azure SSL certificate fix
-- [@khalid244](https://github.com/khalid244) - Multi-line WHERE clause regex fix (Issue #146, PR #148), S3 day-level file verification (Issue #144, PR #145), S3 file caching (PR #149), Manifest-based compaction recovery (Issue #157, PR #163), WAL-based S3 recovery (Issue #159, PR #162)
+- [@khalid244](https://github.com/khalid244) - Multi-line WHERE clause regex fix (Issue #146, PR #148), S3 day-level file verification (Issue #144, PR #145), S3 file caching (PR #149), Manifest-based compaction recovery (Issue #157, PR #163), WAL-based S3 recovery (Issue #159, PR #162), Query timeout for S3 disconnection (Issue #151, PR #152)
 
 ## Dependencies
 
