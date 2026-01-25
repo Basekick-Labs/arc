@@ -1347,19 +1347,8 @@ func (b *ArrowBuffer) convertColumnsToTyped(columns map[string][]interface{}) (m
 // ZERO-COPY HELPERS: Try bulk type assertion for homogeneous arrays
 
 // tryInt64ZeroCopy attempts zero-copy conversion for int64 arrays
-// OPTIMIZATION: Check first element type before allocating to avoid wasted allocation
+// OPTIMIZATION: Single-pass check + conversion to reduce CPU cache thrashing
 func (b *ArrowBuffer) tryInt64ZeroCopy(col []interface{}) ([]int64, bool) {
-	if len(col) == 0 {
-		return nil, false
-	}
-	// Check first element to avoid wasted allocation on type mismatch
-	if col[0] == nil {
-		return nil, false
-	}
-	if _, ok := col[0].(int64); !ok {
-		return nil, false
-	}
-	// Now allocate and convert
 	arr := make([]int64, len(col))
 	for i, v := range col {
 		if v == nil {
@@ -1375,19 +1364,8 @@ func (b *ArrowBuffer) tryInt64ZeroCopy(col []interface{}) ([]int64, bool) {
 }
 
 // tryFloat64ZeroCopy attempts zero-copy conversion for float64 arrays
-// OPTIMIZATION: Check first element type before allocating to avoid wasted allocation
+// OPTIMIZATION: Single-pass check + conversion to reduce CPU cache thrashing
 func (b *ArrowBuffer) tryFloat64ZeroCopy(col []interface{}) ([]float64, bool) {
-	if len(col) == 0 {
-		return nil, false
-	}
-	// Check first element to avoid wasted allocation on type mismatch
-	if col[0] == nil {
-		return nil, false
-	}
-	if _, ok := col[0].(float64); !ok {
-		return nil, false
-	}
-	// Now allocate and convert
 	arr := make([]float64, len(col))
 	for i, v := range col {
 		if v == nil {
@@ -1403,19 +1381,8 @@ func (b *ArrowBuffer) tryFloat64ZeroCopy(col []interface{}) ([]float64, bool) {
 }
 
 // tryStringZeroCopy attempts zero-copy conversion for string arrays
-// OPTIMIZATION: Check first element type before allocating to avoid wasted allocation
+// OPTIMIZATION: Single-pass check + conversion to reduce CPU cache thrashing
 func (b *ArrowBuffer) tryStringZeroCopy(col []interface{}) ([]string, bool) {
-	if len(col) == 0 {
-		return nil, false
-	}
-	// Check first element to avoid wasted allocation on type mismatch
-	if col[0] == nil {
-		return nil, false
-	}
-	if _, ok := col[0].(string); !ok {
-		return nil, false
-	}
-	// Now allocate and convert
 	arr := make([]string, len(col))
 	for i, v := range col {
 		if v == nil {
@@ -1431,19 +1398,8 @@ func (b *ArrowBuffer) tryStringZeroCopy(col []interface{}) ([]string, bool) {
 }
 
 // tryBoolZeroCopy attempts zero-copy conversion for bool arrays
-// OPTIMIZATION: Check first element type before allocating to avoid wasted allocation
+// OPTIMIZATION: Single-pass check + conversion to reduce CPU cache thrashing
 func (b *ArrowBuffer) tryBoolZeroCopy(col []interface{}) ([]bool, bool) {
-	if len(col) == 0 {
-		return nil, false
-	}
-	// Check first element to avoid wasted allocation on type mismatch
-	if col[0] == nil {
-		return nil, false
-	}
-	if _, ok := col[0].(bool); !ok {
-		return nil, false
-	}
-	// Now allocate and convert
 	arr := make([]bool, len(col))
 	for i, v := range col {
 		if v == nil {
