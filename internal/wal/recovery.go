@@ -47,7 +47,7 @@ func (r *Recovery) Recover(ctx context.Context, callback RecoveryCallback) (*Rec
 		return stats, nil
 	}
 
-	// Find all WAL files (not .recovered)
+	// Find all pending WAL files
 	walFiles, err := r.findWALFiles()
 	if err != nil {
 		return nil, err
@@ -77,25 +77,44 @@ func (r *Recovery) Recover(ctx context.Context, callback RecoveryCallback) (*Rec
 			continue
 		}
 
-		// Replay entries
+		// Replay entries - track if all succeed
+		allEntriesSucceeded := true
+		fileRecoveredBatches := 0
+		fileRecoveredEntries := 0
+
 		for _, entry := range entries {
 			if err := callback(ctx, entry.Records); err != nil {
 				r.logger.Error().Err(err).Msg("Failed to replay WAL entry")
-				continue
+				allEntriesSucceeded = false
+				break // Stop processing this file - will retry on next recovery
 			}
-			stats.RecoveredBatches++
-			stats.RecoveredEntries += len(entry.Records)
+			fileRecoveredBatches++
+			fileRecoveredEntries += len(entry.Records)
 		}
 
 		stats.CorruptedEntries += int(reader.CorruptedEntries)
-		stats.RecoveredFiles++
 
-		// Archive recovered WAL file
-		archivePath := walFile + ".recovered"
-		if err := os.Rename(walFile, archivePath); err != nil {
-			r.logger.Error().Err(err).Str("file", walFile).Msg("Failed to archive WAL file")
-		} else {
-			r.logger.Info().Str("file", filepath.Base(archivePath)).Msg("WAL file archived")
+		// Only delete WAL file if ALL entries were successfully replayed
+		if allEntriesSucceeded && len(entries) > 0 {
+			stats.RecoveredBatches += fileRecoveredBatches
+			stats.RecoveredEntries += fileRecoveredEntries
+			stats.RecoveredFiles++
+
+			// Delete the WAL file after successful recovery
+			if err := os.Remove(walFile); err != nil {
+				r.logger.Error().Err(err).Str("file", walFile).Msg("Failed to delete recovered WAL file")
+			} else {
+				r.logger.Info().
+					Str("file", filepath.Base(walFile)).
+					Int("entries", fileRecoveredEntries).
+					Msg("WAL file recovered and deleted")
+			}
+		} else if !allEntriesSucceeded {
+			r.logger.Warn().
+				Str("file", filepath.Base(walFile)).
+				Int("recovered_entries", fileRecoveredEntries).
+				Int("total_entries", len(entries)).
+				Msg("WAL file partially recovered - keeping for retry")
 		}
 	}
 
@@ -115,19 +134,9 @@ func (r *Recovery) Recover(ctx context.Context, callback RecoveryCallback) (*Rec
 // findWALFiles finds all WAL files in the directory, sorted by modification time
 func (r *Recovery) findWALFiles() ([]string, error) {
 	pattern := filepath.Join(r.walDir, "*.wal")
-	matches, err := filepath.Glob(pattern)
+	walFiles, err := filepath.Glob(pattern)
 	if err != nil {
 		return nil, err
-	}
-
-	// Filter out .recovered files and sort by modification time
-	var walFiles []string
-	for _, match := range matches {
-		// Skip .recovered files
-		if filepath.Ext(match) == ".recovered" {
-			continue
-		}
-		walFiles = append(walFiles, match)
 	}
 
 	// Sort by modification time (oldest first)
@@ -143,7 +152,10 @@ func (r *Recovery) findWALFiles() ([]string, error) {
 	return walFiles, nil
 }
 
-// CleanupOldWALs removes recovered WAL files older than the specified age
+// CleanupOldWALs removes legacy .recovered WAL files older than the specified age.
+// Note: As of the current implementation, WAL files are deleted immediately after
+// successful recovery, so this function is primarily for cleaning up legacy files
+// from previous versions that renamed files to .recovered instead of deleting them.
 func (r *Recovery) CleanupOldWALs(maxAge time.Duration) (int, int64, error) {
 	pattern := filepath.Join(r.walDir, "*.wal.recovered")
 	matches, err := filepath.Glob(pattern)
@@ -184,23 +196,20 @@ func (r *Recovery) CleanupOldWALs(maxAge time.Duration) (int, int64, error) {
 	return deletedCount, freedBytes, nil
 }
 
-// ListWALFiles lists all WAL files in the directory
+// ListWALFiles lists all WAL files in the directory.
+// Returns active (pending) WAL files and legacy .recovered files.
+// Note: As of the current implementation, WAL files are deleted immediately after
+// successful recovery, so the recovered list will typically be empty or contain
+// only legacy files from previous versions.
 func (r *Recovery) ListWALFiles() (active []string, recovered []string, err error) {
-	// Active WAL files
+	// Active WAL files (pending recovery)
 	activePattern := filepath.Join(r.walDir, "*.wal")
-	activeMatches, err := filepath.Glob(activePattern)
+	active, err = filepath.Glob(activePattern)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// Filter out .recovered from active matches
-	for _, match := range activeMatches {
-		if filepath.Ext(match) != ".recovered" {
-			active = append(active, match)
-		}
-	}
-
-	// Recovered WAL files
+	// Legacy recovered WAL files (from previous versions)
 	recoveredPattern := filepath.Join(r.walDir, "*.wal.recovered")
 	recovered, err = filepath.Glob(recoveredPattern)
 	if err != nil {

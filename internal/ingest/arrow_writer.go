@@ -1168,12 +1168,15 @@ func (b *ArrowBuffer) writeColumnar(ctx context.Context, database string, record
 				Int64("queue_depth", b.queueDepth.Load()).
 				Msg("Buffer size exceeded, queued flush to worker pool")
 		default:
-			// Queue full - log warning but don't block
+			// Queue full - data is already in WAL, don't grow memory
 			b.logger.Warn().
 				Str("buffer_key", bufferKey).
+				Int("records", totalBuffered).
 				Int64("queue_depth", b.queueDepth.Load()).
-				Msg("Flush queue full, dropping task (backpressure)")
+				Msg("Flush queue full - data preserved in WAL for recovery")
 			b.totalErrors.Add(1)
+			// Data is already in WAL (written at ingest time) - no memory growth
+			// WAL will be replayed on restart or via periodic recovery
 		}
 	}
 
@@ -1524,6 +1527,8 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 			Msg("Failed to merge batches during async flush")
 
 		b.totalErrors.Add(1)
+		// Data is already in WAL (written at ingest time) - no need to restore to buffer
+		// WAL will be replayed on restart or via periodic recovery
 		return
 	}
 
@@ -1532,8 +1537,11 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 		b.logger.Error().
 			Err(err).
 			Str("buffer_key", bufferKey).
-			Msg("Failed to flush")
+			Int("records", recordCount).
+			Msg("Failed to flush - data preserved in WAL for recovery")
 		b.totalErrors.Add(1)
+		// Data is already in WAL (written at ingest time) - no memory growth
+		// WAL will be replayed on restart or via periodic recovery
 	}
 }
 
@@ -1725,6 +1733,14 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 	startTime := time.Now().UTC()
 	if err := b.flushBufferLockedDataTime(ctx, bufferKey, database, measurement, merged, recordCount, startTime); err != nil {
 		shard.mu.Lock() // Re-acquire lock for caller
+		b.logger.Warn().
+			Err(err).
+			Str("buffer_key", bufferKey).
+			Int("records", recordCount).
+			Msg("Flush failed - data preserved in WAL for recovery")
+		// Data is already in WAL (written at ingest time) - no need to restore to buffer
+		// This prevents memory growth during prolonged S3 outages
+		// WAL will be replayed on restart or via periodic recovery
 		return err
 	}
 
