@@ -477,6 +477,32 @@ Fixed an issue where compaction crashes could cause data duplication. If a pod c
 
 *Contributed by [@khalid244](https://github.com/khalid244)*
 
+### WAL-Based S3 Recovery (Issue #159, PR #162)
+
+Fixed data loss during S3 outages. Previously, when S3 was unavailable, data in the Arrow buffer would be lost after the WAL callback (which preserves data for recovery) was a no-op since `ArrowBuffer` wasn't available at that point.
+
+**Root cause:** The WAL recovery callback was registered before `ArrowBuffer` was initialized, making it impossible to replay records through the normal ingestion path.
+
+**Fix:** Complete WAL recovery implementation:
+1. **Startup recovery**: On startup, any WAL files from previous runs are replayed through `ArrowBuffer.WriteColumnarDirect()`
+2. **Periodic recovery**: Background goroutine runs every `recovery_interval_seconds` (default: 300s) to recover from transient S3 failures
+3. **Active file protection**: Periodic recovery skips the currently active WAL file to avoid reading uncommitted entries
+4. **Backpressure handling**: Records are replayed in configurable batches (`recovery_batch_size`, default: 10000) to avoid overwhelming the buffer
+
+**New configuration options:**
+```toml
+[wal]
+recovery_interval_seconds = 300  # How often to check for WAL files to recover (default: 5 minutes)
+recovery_batch_size = 10000      # Max records per recovery batch (default: 10000)
+```
+
+**New metrics:**
+- `arc_wal_records_preserved_total` - Records written to WAL for potential recovery
+- `arc_wal_recovery_total` - Number of WAL recovery operations
+- `arc_wal_recovery_records_total` - Records successfully recovered from WAL
+
+*Contributed by [@khalid244](https://github.com/khalid244)*
+
 ## Improvements
 
 ### Configurable Server Idle and Shutdown Timeouts
@@ -1073,7 +1099,7 @@ None
 Thanks to the following contributors for this release:
 
 - [@schotime](https://github.com/schotime) (Adam Schroder) - Data-time partitioning, compaction API triggers, UTC fixes, Azure SSL certificate fix
-- [@khalid244](https://github.com/khalid244) - Multi-line WHERE clause regex fix (Issue #146, PR #148), S3 day-level file verification (Issue #144, PR #145), S3 file caching (PR #149), Manifest-based compaction recovery (Issue #157, PR #163)
+- [@khalid244](https://github.com/khalid244) - Multi-line WHERE clause regex fix (Issue #146, PR #148), S3 day-level file verification (Issue #144, PR #145), S3 file caching (PR #149), Manifest-based compaction recovery (Issue #157, PR #163), WAL-based S3 recovery (Issue #159, PR #162)
 
 ## Dependencies
 
