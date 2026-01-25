@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
@@ -30,6 +31,12 @@ type DuckDB struct {
 	db     *sql.DB
 	logger zerolog.Logger
 	config *Config
+}
+
+// escapeSQLString escapes single quotes for safe use in DuckDB SQL strings.
+// This prevents SQL injection when interpolating configuration values.
+func escapeSQLString(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
 }
 
 // Config holds DuckDB configuration
@@ -167,23 +174,24 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	}
 
 	// Set S3 credentials using GLOBAL scope to persist across connections
-	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_access_key_id='%s'", cfg.S3AccessKey)); err != nil {
+	// Note: credentials are escaped to prevent SQL injection
+	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_access_key_id='%s'", escapeSQLString(cfg.S3AccessKey))); err != nil {
 		return fmt.Errorf("failed to set s3_access_key_id: %w", err)
 	}
-	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_secret_access_key='%s'", cfg.S3SecretKey)); err != nil {
+	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_secret_access_key='%s'", escapeSQLString(cfg.S3SecretKey))); err != nil {
 		return fmt.Errorf("failed to set s3_secret_access_key: %w", err)
 	}
 
 	// Set S3 region
 	if cfg.S3Region != "" {
-		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_region='%s'", cfg.S3Region)); err != nil {
+		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_region='%s'", escapeSQLString(cfg.S3Region))); err != nil {
 			return fmt.Errorf("failed to set s3_region: %w", err)
 		}
 	}
 
 	// Set custom endpoint for MinIO or S3-compatible services
 	if cfg.S3Endpoint != "" {
-		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", cfg.S3Endpoint)); err != nil {
+		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", escapeSQLString(cfg.S3Endpoint))); err != nil {
 			return fmt.Errorf("failed to set s3_endpoint: %w", err)
 		}
 	}
@@ -259,28 +267,28 @@ type S3Config struct {
 // This is useful when tiered storage uses different S3 credentials than the main storage.
 // The httpfs extension must already be loaded.
 func (d *DuckDB) ConfigureS3(s3cfg *S3Config) error {
-	// Set S3 credentials
+	// Set S3 credentials (escaped to prevent SQL injection)
 	if s3cfg.AccessKey != "" {
-		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_access_key_id='%s'", s3cfg.AccessKey)); err != nil {
+		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_access_key_id='%s'", escapeSQLString(s3cfg.AccessKey))); err != nil {
 			return fmt.Errorf("failed to set s3_access_key_id: %w", err)
 		}
 	}
 	if s3cfg.SecretKey != "" {
-		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_secret_access_key='%s'", s3cfg.SecretKey)); err != nil {
+		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_secret_access_key='%s'", escapeSQLString(s3cfg.SecretKey))); err != nil {
 			return fmt.Errorf("failed to set s3_secret_access_key: %w", err)
 		}
 	}
 
 	// Set S3 region
 	if s3cfg.Region != "" {
-		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_region='%s'", s3cfg.Region)); err != nil {
+		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_region='%s'", escapeSQLString(s3cfg.Region))); err != nil {
 			return fmt.Errorf("failed to set s3_region: %w", err)
 		}
 	}
 
 	// Set custom endpoint for MinIO or S3-compatible services
 	if s3cfg.Endpoint != "" {
-		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", s3cfg.Endpoint)); err != nil {
+		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", escapeSQLString(s3cfg.Endpoint))); err != nil {
 			return fmt.Errorf("failed to set s3_endpoint: %w", err)
 		}
 	}
@@ -336,10 +344,13 @@ func configureAzureAccess(db *sql.DB, cfg *Config, logger zerolog.Logger) error 
 	}
 
 	// Create a secret for Azure Blob Storage authentication
+	// Note: values are escaped to prevent SQL injection
 	var secretSQL string
 	if cfg.AzureAccountKey != "" {
 		// Use connection string with account key
-		connStr := fmt.Sprintf("AccountName=%s;AccountKey=%s", cfg.AzureAccountName, cfg.AzureAccountKey)
+		connStr := fmt.Sprintf("AccountName=%s;AccountKey=%s",
+			escapeSQLString(cfg.AzureAccountName),
+			escapeSQLString(cfg.AzureAccountKey))
 		secretSQL = fmt.Sprintf(`
 			CREATE SECRET azure_secret (
 				TYPE AZURE,
@@ -354,7 +365,7 @@ func configureAzureAccess(db *sql.DB, cfg *Config, logger zerolog.Logger) error 
 				PROVIDER CREDENTIAL_CHAIN,
 				ACCOUNT_NAME '%s'
 			)
-		`, cfg.AzureAccountName)
+		`, escapeSQLString(cfg.AzureAccountName))
 	}
 
 	if _, err := db.Exec(secretSQL); err != nil {
