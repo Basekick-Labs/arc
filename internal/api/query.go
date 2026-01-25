@@ -2279,9 +2279,30 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 		Str("count_sql", countSQL).
 		Msg("Estimating query")
 
-	// Execute count query
-	rows, err := h.db.Query(countSQL)
+	m := metrics.Get()
+
+	// Create context with timeout if configured
+	ctx := c.UserContext()
+	var cancel context.CancelFunc
+	if h.queryTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, h.queryTimeout)
+		defer cancel()
+	}
+
+	// Execute count query with timeout support
+	rows, err := h.db.QueryContext(ctx, countSQL)
 	if err != nil {
+		// Check if it was a timeout
+		if h.queryTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
+			m.IncQueryTimeouts()
+			h.logger.Error().Err(err).Str("sql", countSQL).Dur("timeout", h.queryTimeout).Msg("Estimate query timed out")
+			return c.Status(fiber.StatusGatewayTimeout).JSON(EstimateResponse{
+				Success:         false,
+				Error:           "Query timed out",
+				WarningLevel:    "error",
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+			})
+		}
 		h.logger.Error().Err(err).Str("sql", countSQL).Msg("Estimate query failed")
 		return c.JSON(EstimateResponse{
 			Success:         false,
