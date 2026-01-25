@@ -120,25 +120,28 @@ type Job struct {
 	DurationSeconds float64
 
 	// Internal
-	logger         zerolog.Logger
-	mu             sync.Mutex
-	db             *sql.DB  // Shared DuckDB connection
-	compactedFiles []string // Files that were actually compacted (valid files only)
+	logger          zerolog.Logger
+	mu              sync.Mutex
+	db              *sql.DB  // Shared DuckDB connection
+	compactedFiles  []string // Files that were actually compacted (valid files only)
+	manifestManager *ManifestManager
+	manifestPath    string // Path to the manifest file for this job
 }
 
 // JobConfig holds configuration for creating a compaction job
 type JobConfig struct {
-	Measurement    string
-	PartitionPath  string
-	Files          []string
-	StorageBackend storage.Backend
-	Database       string
-	TargetSizeMB   int
-	Tier           string
-	TempDirectory  string   // Base temp directory for compaction files (default: ./data/compaction)
-	SortKeys       []string // Sort keys for this measurement (for ORDER BY in compaction)
-	Logger         zerolog.Logger
-	DB             *sql.DB // Shared DuckDB connection (avoids memory retention from temp connections)
+	Measurement     string
+	PartitionPath   string
+	Files           []string
+	StorageBackend  storage.Backend
+	Database        string
+	TargetSizeMB    int
+	Tier            string
+	TempDirectory   string   // Base temp directory for compaction files (default: ./data/compaction)
+	SortKeys        []string // Sort keys for this measurement (for ORDER BY in compaction)
+	Logger          zerolog.Logger
+	DB              *sql.DB          // Shared DuckDB connection (avoids memory retention from temp connections)
+	ManifestManager *ManifestManager // Manifest manager for crash recovery (optional, recommended)
 }
 
 // NewJob creates a new compaction job
@@ -164,19 +167,20 @@ func NewJob(cfg *JobConfig) *Job {
 	}
 
 	return &Job{
-		Measurement:    cfg.Measurement,
-		PartitionPath:  cfg.PartitionPath,
-		Files:          cfg.Files,
-		StorageBackend: cfg.StorageBackend,
-		Database:       cfg.Database,
-		TargetSizeMB:   cfg.TargetSizeMB,
-		Tier:           cfg.Tier,
-		TempDirectory:  tempDir,
-		SortKeys:       sortKeys,
-		JobID:          jobID,
-		Status:         JobStatusPending,
-		logger:         cfg.Logger.With().Str("job_id", jobID).Logger(),
-		db:             cfg.DB,
+		Measurement:     cfg.Measurement,
+		PartitionPath:   cfg.PartitionPath,
+		Files:           cfg.Files,
+		StorageBackend:  cfg.StorageBackend,
+		Database:        cfg.Database,
+		TargetSizeMB:    cfg.TargetSizeMB,
+		Tier:            cfg.Tier,
+		TempDirectory:   tempDir,
+		SortKeys:        sortKeys,
+		JobID:           jobID,
+		Status:          JobStatusPending,
+		logger:          cfg.Logger.With().Str("job_id", jobID).Logger(),
+		db:              cfg.DB,
+		manifestManager: cfg.ManifestManager,
 	}
 }
 
@@ -242,14 +246,54 @@ func (j *Job) Run(ctx context.Context) error {
 
 	// Upload compacted file
 	compactedKey := filepath.Join(j.PartitionPath, filepath.Base(compactedFile))
+
+	// Write manifest BEFORE upload to enable crash recovery
+	// If we crash after upload but before deletion, the manifest allows recovery
+	if j.manifestManager != nil {
+		manifest := &Manifest{
+			OutputPath:    compactedKey,
+			OutputSize:    j.BytesAfter,
+			InputFiles:    j.compactedFiles,
+			Database:      j.Database,
+			Measurement:   j.Measurement,
+			PartitionPath: j.PartitionPath,
+			Tier:          j.Tier,
+			Status:        ManifestStatusPending,
+			CreatedAt:     time.Now().UTC(),
+			JobID:         j.JobID,
+		}
+
+		manifestPath, err := j.manifestManager.WriteManifest(ctx, manifest)
+		if err != nil {
+			return j.fail(fmt.Errorf("failed to write manifest: %w", err))
+		}
+		j.manifestPath = manifestPath
+		j.logger.Debug().Str("manifest", manifestPath).Msg("Wrote compaction manifest")
+	}
+
 	if err := j.uploadFile(ctx, compactedFile, compactedKey); err != nil {
+		// Upload failed - delete manifest since output doesn't exist
+		if j.manifestManager != nil && j.manifestPath != "" {
+			if delErr := j.manifestManager.DeleteManifest(ctx, j.manifestPath); delErr != nil {
+				j.logger.Warn().Err(delErr).Msg("Failed to delete manifest after upload failure")
+			}
+		}
 		return j.fail(fmt.Errorf("failed to upload compacted file: %w", err))
 	}
 
 	// Delete old files from storage
 	if err := j.deleteOldFiles(ctx); err != nil {
 		j.logger.Warn().Err(err).Msg("Failed to delete some old files")
-		// Don't fail the job for deletion errors
+		// Don't fail the job - manifest will enable recovery on next cycle
+		// The manifest remains so recovery can retry deletion
+	} else {
+		// Deletion succeeded - delete the manifest
+		if j.manifestManager != nil && j.manifestPath != "" {
+			if delErr := j.manifestManager.DeleteManifest(ctx, j.manifestPath); delErr != nil {
+				j.logger.Warn().Err(delErr).Msg("Failed to delete manifest after successful deletion")
+				// Non-fatal - manifest will be cleaned up during recovery
+			}
+		}
 	}
 
 	// Cleanup empty directories (best-effort, local storage only)

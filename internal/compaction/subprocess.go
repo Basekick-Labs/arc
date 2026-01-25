@@ -95,19 +95,23 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 		}
 	}
 
+	// Create manifest manager for crash recovery
+	manifestManager := NewManifestManager(backend, logger)
+
 	// Create and run job
 	job := NewJob(&JobConfig{
-		Database:       config.Database,
-		Measurement:    config.Measurement,
-		PartitionPath:  config.PartitionPath,
-		Files:          config.Files,
-		StorageBackend: backend,
-		TargetSizeMB:   config.TargetSizeMB,
-		Tier:           config.Tier,
-		TempDirectory:  config.TempDirectory,
-		SortKeys:       config.SortKeys,
-		Logger:         logger,
-		DB:             db,
+		Database:        config.Database,
+		Measurement:     config.Measurement,
+		PartitionPath:   config.PartitionPath,
+		Files:           config.Files,
+		StorageBackend:  backend,
+		TargetSizeMB:    config.TargetSizeMB,
+		Tier:            config.Tier,
+		TempDirectory:   config.TempDirectory,
+		SortKeys:        config.SortKeys,
+		Logger:          logger,
+		DB:              db,
+		ManifestManager: manifestManager,
 	})
 
 	ctx := context.Background()
