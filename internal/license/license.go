@@ -20,7 +20,7 @@ const (
 	FeatureRetentionScheduler = "retention_scheduler"
 	FeatureClustering         = "clustering"
 	FeatureRBAC               = "rbac"
-	FeatureTieredStorage      = "tiered_storage"
+	FeatureTieredStorage      = "tiering"
 	FeatureAutoAggregation    = "auto_aggregation"
 )
 
@@ -93,6 +93,12 @@ func (l *License) CanUseCQScheduler() bool {
 // All valid license tiers (starter, professional, enterprise, unlimited) include this feature
 func (l *License) CanUseRetentionScheduler() bool {
 	return l.IsValid()
+}
+
+// CanUseTieredStorage returns true if the license allows tiered storage
+// Requires enterprise license with the tiered_storage feature
+func (l *License) CanUseTieredStorage() bool {
+	return l.HasFeature(FeatureTieredStorage)
 }
 
 // TierFromString converts a string to a Tier

@@ -21,6 +21,7 @@ import (
 	"github.com/basekick-labs/arc/internal/query"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
@@ -458,6 +459,9 @@ type QueryHandler struct {
 
 	// Cluster routing support
 	router *cluster.Router
+
+	// Tiering support for multi-tier query routing (hot/cold)
+	tieringManager *tiering.Manager
 }
 
 // isDebugEnabled returns true if debug logging is enabled.
@@ -612,6 +616,12 @@ func (h *QueryHandler) SetAuthAndRBAC(am AuthManager, rm RBACChecker) {
 // This is provided for future extensibility (e.g., prefer_readers mode).
 func (h *QueryHandler) SetRouter(router *cluster.Router) {
 	h.router = router
+}
+
+// SetTieringManager sets the tiering manager for multi-tier query routing.
+// When set, queries will check both hot and cold tiers for data.
+func (h *QueryHandler) SetTieringManager(manager *tiering.Manager) {
+	h.tieringManager = manager
 }
 
 // extractTableReferences extracts all database.measurement references from SQL
@@ -1389,8 +1399,31 @@ type ParallelQueryInfo struct {
 
 // buildReadParquetExpr builds a read_parquet expression with optional partition pruning.
 // keyword is "FROM" or "JOIN" to prepend to the result.
+// If tiering is enabled and cold tier has data, builds a UNION ALL query across tiers.
 func (h *QueryHandler) buildReadParquetExpr(path, originalSQL, keyword string) string {
-	// Build options string
+	// Check if tiering is enabled and cold tier is configured
+	if h.tieringManager != nil {
+		router := h.tieringManager.GetRouter()
+		if router != nil {
+			// Extract database/measurement from the path
+			database, measurement := h.extractDBMeasurementFromPath(path)
+			if database != "" && measurement != "" {
+				// Get glob paths for both tiers
+				tieredPaths := router.GetGlobPathsForQuery(database, measurement)
+
+				// If cold tier is configured and enabled, build multi-tier query
+				if _, hasCold := tieredPaths[tiering.TierCold]; hasCold {
+					h.logger.Debug().
+						Str("database", database).
+						Str("measurement", measurement).
+						Msg("Tiering enabled: building multi-tier query")
+					return h.buildMultiTierReadParquet(database, measurement, tieredPaths, keyword)
+				}
+			}
+		}
+	}
+
+	// Fall back to single-tier behavior (original logic)
 	options := buildReadParquetOptions()
 
 	// Apply partition pruning
@@ -1478,6 +1511,159 @@ func shouldSkipTableConversion(table string) bool {
 		}
 	}
 	return false
+}
+
+// extractDBMeasurementFromPath extracts database and measurement from a storage path.
+// Path format: /some/base/path/{database}/{measurement}/**/*.parquet
+// or: s3://bucket/{database}/{measurement}/**/*.parquet
+// or: {database}/{measurement}/**/*.parquet (relative path)
+// The key insight: database/measurement are always followed by year directories (4-digit numbers)
+func (h *QueryHandler) extractDBMeasurementFromPath(path string) (database, measurement string) {
+	// Normalize path separators
+	path = strings.ReplaceAll(path, "\\", "/")
+
+	// Remove any s3:// or azure:// prefix and bucket name
+	if strings.Contains(path, "://") {
+		parts := strings.SplitN(path, "://", 2)
+		if len(parts) == 2 {
+			// Remove bucket/container name
+			path = parts[1]
+			if idx := strings.Index(path, "/"); idx >= 0 {
+				path = path[idx+1:]
+			}
+		}
+	}
+
+	// Remove glob pattern suffix (**/*.parquet)
+	if idx := strings.Index(path, "**"); idx > 0 {
+		path = path[:idx]
+	}
+	path = strings.TrimSuffix(path, "/")
+
+	parts := strings.Split(path, "/")
+
+	// Find database/measurement by looking for the pattern where:
+	// - database is a non-numeric directory name
+	// - measurement is a non-numeric directory name
+	// - followed by year (4-digit number like 2024, 2025, 2026)
+	// Scan from the end to find the measurement (just before the year)
+	for i := len(parts) - 1; i >= 2; i-- {
+		// Check if this part looks like a year (4 digits starting with 20)
+		if len(parts[i]) == 4 && strings.HasPrefix(parts[i], "20") {
+			if _, err := strconv.Atoi(parts[i]); err == nil {
+				// parts[i] is the year, parts[i-1] is measurement, parts[i-2] is database
+				if i >= 2 {
+					return parts[i-2], parts[i-1]
+				}
+			}
+		}
+	}
+
+	// Fallback: if path doesn't have year structure, take last two non-empty parts
+	// This handles paths like: production/cpu/**/*.parquet
+	nonEmpty := make([]string, 0)
+	for _, p := range parts {
+		if p != "" && p != "**" && !strings.Contains(p, "*") {
+			nonEmpty = append(nonEmpty, p)
+		}
+	}
+	if len(nonEmpty) >= 2 {
+		return nonEmpty[len(nonEmpty)-2], nonEmpty[len(nonEmpty)-1]
+	}
+
+	return "", ""
+}
+
+// buildMultiTierReadParquet builds a read_parquet expression that queries tiers with actual data.
+// Queries the tiering metadata to determine which tiers have files for this database/measurement,
+// then only includes paths for tiers that actually have data.
+func (h *QueryHandler) buildMultiTierReadParquet(database, measurement string, tieredPaths map[tiering.Tier]string, keyword string) string {
+	options := buildReadParquetOptions()
+
+	// Query metadata to find which tiers actually have data for this measurement
+	ctx := context.Background()
+	actualTiers, err := h.tieringManager.GetMetadata().GetTiersForMeasurement(ctx, database, measurement)
+	if err != nil {
+		h.logger.Warn().Err(err).
+			Str("database", database).
+			Str("measurement", measurement).
+			Msg("Failed to query tier metadata, falling back to hot tier only")
+		// Fall back to hot tier only on error
+		return keyword + fmt.Sprintf(" read_parquet('%s', %s)", h.getStoragePath(database, measurement), options)
+	}
+
+	// If no metadata found, fall back to hot tier (data might not be registered yet)
+	if len(actualTiers) == 0 {
+		h.logger.Debug().
+			Str("database", database).
+			Str("measurement", measurement).
+			Msg("No tier metadata found, using hot tier")
+		return keyword + fmt.Sprintf(" read_parquet('%s', %s)", h.getStoragePath(database, measurement), options)
+	}
+
+	// Collect paths only for tiers that actually have data
+	var paths []string
+
+	// Hot tier (local) - only if metadata says there's hot data
+	if actualTiers[tiering.TierHot] {
+		if _, ok := tieredPaths[tiering.TierHot]; ok {
+			fullHotPath := h.getStoragePath(database, measurement)
+			paths = append(paths, fullHotPath)
+		}
+	}
+
+	// Cold tier (S3/Azure) - only if metadata says there's cold data
+	if actualTiers[tiering.TierCold] {
+		if _, ok := tieredPaths[tiering.TierCold]; ok {
+			coldBackend := h.tieringManager.GetBackendForTier(tiering.TierCold)
+			if coldBackend != nil {
+				coldPath := storage.GetStoragePath(coldBackend, database, measurement)
+				paths = append(paths, coldPath)
+			}
+		}
+	}
+
+	if len(paths) == 0 {
+		// No paths found, return empty result
+		h.logger.Warn().
+			Str("database", database).
+			Str("measurement", measurement).
+			Msg("No tier paths found despite having metadata")
+		return keyword + " (SELECT * WHERE 1=0)"
+	}
+
+	if len(paths) == 1 {
+		// Single tier - use standard read_parquet
+		h.logger.Debug().
+			Str("database", database).
+			Str("measurement", measurement).
+			Str("path", paths[0]).
+			Msg("Single-tier query")
+		return keyword + fmt.Sprintf(" read_parquet('%s', %s)", paths[0], options)
+	}
+
+	// Multiple tiers: use read_parquet with a list of paths
+	h.logger.Info().
+		Str("database", database).
+		Str("measurement", measurement).
+		Int("tier_count", len(paths)).
+		Strs("paths", paths).
+		Msg("Building multi-tier query")
+
+	// Build path list: ['path1', 'path2']
+	var pathList strings.Builder
+	pathList.WriteString("[")
+	for i, p := range paths {
+		if i > 0 {
+			pathList.WriteString(", ")
+		}
+		pathList.WriteString("'")
+		pathList.WriteString(p)
+		pathList.WriteString("'")
+	}
+	pathList.WriteString("]")
+
+	return keyword + fmt.Sprintf(" read_parquet(%s, %s)", pathList.String(), options)
 }
 
 // convertSingleTableQuery is a fast path for simple single-table queries.

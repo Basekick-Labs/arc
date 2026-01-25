@@ -30,6 +30,7 @@ type Config struct {
 	Scheduler       SchedulerConfig
 	Cluster         ClusterConfig
 	Query           QueryConfig
+	TieredStorage   TieredStorageConfig
 }
 
 type ServerConfig struct {
@@ -180,6 +181,55 @@ type LicenseConfig struct {
 // are enabled (continuous_query.enabled, retention.enabled) AND a valid license is present.
 type SchedulerConfig struct {
 	RetentionSchedule string // Cron schedule for retention (default: "0 3 * * *" = 3am daily)
+}
+
+// TieredStorageConfig holds configuration for tiered storage (Enterprise feature)
+// Tiered storage enables automatic data lifecycle management with hot/cold tiers.
+// - Hot tier: Local storage for recent data (fast access)
+// - Cold tier: S3/Azure for archived data (cost-effective archival storage)
+//
+// Data older than DefaultHotMaxAgeDays is automatically migrated to cold storage.
+type TieredStorageConfig struct {
+	Enabled              bool   // Enable tiered storage (requires enterprise license)
+	MigrationSchedule    string // Cron schedule for migrations (default: "0 2 * * *" = 2am daily)
+	MigrationMaxConcurrent int  // Max concurrent file migrations (default: 4)
+	MigrationBatchSize   int    // Files per migration batch (default: 100)
+
+	// Single threshold: data older than this moves from hot to cold
+	DefaultHotMaxAgeDays int // Data older than this migrates to cold (default: 30)
+
+	// Cold tier configuration (remote S3/Azure storage)
+	Cold ColdTierConfig
+}
+
+// ColdTierConfig holds configuration for the cold storage tier (S3/Azure archive).
+// This is the only remote tier - data moves directly from hot (local) to cold (remote).
+type ColdTierConfig struct {
+	Enabled bool   // Enable cold tier
+	Backend string // "s3" or "azure"
+
+	// S3 settings
+	S3Bucket       string // S3 bucket for archived data
+	S3Region       string // AWS region
+	S3Endpoint     string // Custom endpoint for MinIO
+	S3AccessKey    string // AWS access key (use env: ARC_TIERED_STORAGE_COLD_S3_ACCESS_KEY)
+	S3SecretKey    string // AWS secret key (use env: ARC_TIERED_STORAGE_COLD_S3_SECRET_KEY)
+	S3UseSSL       bool   // Use HTTPS for S3 connections
+	S3PathStyle    bool   // Use path-style addressing (required for MinIO)
+	S3StorageClass string // S3 storage class (default: "GLACIER")
+
+	// Azure settings
+	AzureContainer         string // Azure container for archived data
+	AzureConnectionString  string // Connection string (simplest auth method)
+	AzureAccountName       string // Storage account name
+	AzureAccountKey        string // Storage account key
+	AzureSASToken          string // SAS token for scoped access
+	AzureEndpoint          string // Custom endpoint (for Azurite testing)
+	AzureUseManagedIdentity bool   // Use managed identity (Azure-hosted deployments)
+	AzureAccessTier        string // Azure access tier (default: "Archive")
+
+	// Retrieval settings (for Glacier/Archive)
+	RetrievalMode string // Glacier retrieval mode: "standard", "expedited", "bulk" (default: "standard")
 }
 
 // ClusterConfig holds configuration for Arc clustering (Enterprise feature)
@@ -438,6 +488,34 @@ func Load() (*Config, error) {
 			ShardingReplicationFactor: v.GetInt("cluster.sharding_replication_factor"),
 			ShardingRouteTimeout:      v.GetInt("cluster.sharding_route_timeout"),
 		},
+		TieredStorage: TieredStorageConfig{
+			Enabled:              v.GetBool("tiered_storage.enabled"),
+			MigrationSchedule:    v.GetString("tiered_storage.migration_schedule"),
+			MigrationMaxConcurrent: v.GetInt("tiered_storage.migration_max_concurrent"),
+			MigrationBatchSize:   v.GetInt("tiered_storage.migration_batch_size"),
+			DefaultHotMaxAgeDays: v.GetInt("tiered_storage.default_hot_max_age_days"),
+			Cold: ColdTierConfig{
+				Enabled:               v.GetBool("tiered_storage.cold.enabled"),
+				Backend:               v.GetString("tiered_storage.cold.backend"),
+				S3Bucket:              v.GetString("tiered_storage.cold.s3_bucket"),
+				S3Region:              v.GetString("tiered_storage.cold.s3_region"),
+				S3Endpoint:            v.GetString("tiered_storage.cold.s3_endpoint"),
+				S3AccessKey:           v.GetString("tiered_storage.cold.s3_access_key"),
+				S3SecretKey:           v.GetString("tiered_storage.cold.s3_secret_key"),
+				S3UseSSL:              v.GetBool("tiered_storage.cold.s3_use_ssl"),
+				S3PathStyle:           v.GetBool("tiered_storage.cold.s3_path_style"),
+				S3StorageClass:        v.GetString("tiered_storage.cold.s3_storage_class"),
+				AzureContainer:        v.GetString("tiered_storage.cold.azure_container"),
+				AzureConnectionString: v.GetString("tiered_storage.cold.azure_connection_string"),
+				AzureAccountName:      v.GetString("tiered_storage.cold.azure_account_name"),
+				AzureAccountKey:       v.GetString("tiered_storage.cold.azure_account_key"),
+				AzureSASToken:         v.GetString("tiered_storage.cold.azure_sas_token"),
+				AzureEndpoint:         v.GetString("tiered_storage.cold.azure_endpoint"),
+				AzureUseManagedIdentity: v.GetBool("tiered_storage.cold.azure_use_managed_identity"),
+				AzureAccessTier:       v.GetString("tiered_storage.cold.azure_access_tier"),
+				RetrievalMode:         v.GetString("tiered_storage.cold.retrieval_mode"),
+			},
+		},
 	}
 
 	return cfg, nil
@@ -598,6 +676,35 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.sharding_shard_key", "database")     // Database-level sharding
 	v.SetDefault("cluster.sharding_replication_factor", 3)     // RF=3 for fault tolerance
 	v.SetDefault("cluster.sharding_route_timeout", 5000)       // 5 second timeout
+
+	// Tiered storage defaults (Enterprise feature)
+	// Simple 2-tier system: Hot (local) -> Cold (S3/Azure archive)
+	v.SetDefault("tiered_storage.enabled", false)                    // Disabled by default
+	v.SetDefault("tiered_storage.migration_schedule", "0 2 * * *")   // 2am daily
+	v.SetDefault("tiered_storage.migration_max_concurrent", 4)       // 4 concurrent migrations
+	v.SetDefault("tiered_storage.migration_batch_size", 100)         // 100 files per batch
+	v.SetDefault("tiered_storage.default_hot_max_age_days", 30)      // 30 days in hot tier before archiving
+
+	// Cold tier defaults (S3/Azure archive storage)
+	v.SetDefault("tiered_storage.cold.enabled", false)               // Disabled by default
+	v.SetDefault("tiered_storage.cold.backend", "s3")                // S3 by default
+	v.SetDefault("tiered_storage.cold.s3_bucket", "")                // Must be configured
+	v.SetDefault("tiered_storage.cold.s3_region", "us-east-1")       // Default region
+	v.SetDefault("tiered_storage.cold.s3_endpoint", "")              // Empty for AWS, set for MinIO
+	v.SetDefault("tiered_storage.cold.s3_access_key", "")            // Must be configured
+	v.SetDefault("tiered_storage.cold.s3_secret_key", "")            // Must be configured
+	v.SetDefault("tiered_storage.cold.s3_use_ssl", true)             // HTTPS by default
+	v.SetDefault("tiered_storage.cold.s3_path_style", false)         // Virtual-hosted style for AWS
+	v.SetDefault("tiered_storage.cold.s3_storage_class", "GLACIER")  // Glacier by default
+	v.SetDefault("tiered_storage.cold.azure_container", "")          // Must be configured for Azure
+	v.SetDefault("tiered_storage.cold.azure_connection_string", "")
+	v.SetDefault("tiered_storage.cold.azure_account_name", "")
+	v.SetDefault("tiered_storage.cold.azure_account_key", "")
+	v.SetDefault("tiered_storage.cold.azure_sas_token", "")
+	v.SetDefault("tiered_storage.cold.azure_endpoint", "")
+	v.SetDefault("tiered_storage.cold.azure_use_managed_identity", false)
+	v.SetDefault("tiered_storage.cold.azure_access_tier", "Archive") // Azure archive tier
+	v.SetDefault("tiered_storage.cold.retrieval_mode", "standard")   // Standard retrieval
 }
 
 func getDefaultThreadCount() int {

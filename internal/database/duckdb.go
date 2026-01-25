@@ -245,6 +245,74 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	return nil
 }
 
+// S3Config holds S3 configuration for DuckDB httpfs extension
+type S3Config struct {
+	Region    string
+	Endpoint  string
+	AccessKey string
+	SecretKey string
+	UseSSL    bool
+	PathStyle bool
+}
+
+// ConfigureS3 reconfigures DuckDB's S3 settings at runtime.
+// This is useful when tiered storage uses different S3 credentials than the main storage.
+// The httpfs extension must already be loaded.
+func (d *DuckDB) ConfigureS3(s3cfg *S3Config) error {
+	// Set S3 credentials
+	if s3cfg.AccessKey != "" {
+		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_access_key_id='%s'", s3cfg.AccessKey)); err != nil {
+			return fmt.Errorf("failed to set s3_access_key_id: %w", err)
+		}
+	}
+	if s3cfg.SecretKey != "" {
+		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_secret_access_key='%s'", s3cfg.SecretKey)); err != nil {
+			return fmt.Errorf("failed to set s3_secret_access_key: %w", err)
+		}
+	}
+
+	// Set S3 region
+	if s3cfg.Region != "" {
+		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_region='%s'", s3cfg.Region)); err != nil {
+			return fmt.Errorf("failed to set s3_region: %w", err)
+		}
+	}
+
+	// Set custom endpoint for MinIO or S3-compatible services
+	if s3cfg.Endpoint != "" {
+		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", s3cfg.Endpoint)); err != nil {
+			return fmt.Errorf("failed to set s3_endpoint: %w", err)
+		}
+	}
+
+	// Set URL style (path-style for MinIO, virtual-hosted for AWS S3)
+	urlStyle := "vhost"
+	if s3cfg.PathStyle {
+		urlStyle = "path"
+	}
+	if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_url_style='%s'", urlStyle)); err != nil {
+		return fmt.Errorf("failed to set s3_url_style: %w", err)
+	}
+
+	// Set SSL usage
+	useSSL := "true"
+	if !s3cfg.UseSSL {
+		useSSL = "false"
+	}
+	if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_use_ssl=%s", useSSL)); err != nil {
+		return fmt.Errorf("failed to set s3_use_ssl: %w", err)
+	}
+
+	d.logger.Info().
+		Str("region", s3cfg.Region).
+		Str("endpoint", s3cfg.Endpoint).
+		Bool("path_style", s3cfg.PathStyle).
+		Bool("use_ssl", s3cfg.UseSSL).
+		Msg("DuckDB S3 configuration updated")
+
+	return nil
+}
+
 // configureAzureAccess sets up the azure extension for Azure Blob Storage access
 // Note: We use SET GLOBAL to ensure settings persist across all connections in the pool
 func configureAzureAccess(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
