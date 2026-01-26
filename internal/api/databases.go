@@ -9,15 +9,17 @@ import (
 
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
 
 // DatabasesHandler handles database management API endpoints
 type DatabasesHandler struct {
-	storage      storage.Backend
-	deleteConfig *config.DeleteConfig
-	logger       zerolog.Logger
+	storage        storage.Backend
+	deleteConfig   *config.DeleteConfig
+	tieringManager *tiering.Manager
+	logger         zerolog.Logger
 }
 
 // CreateDatabaseRequest represents a request to create a new database
@@ -68,6 +70,12 @@ func NewDatabasesHandler(storage storage.Backend, deleteConfig *config.DeleteCon
 		deleteConfig: deleteConfig,
 		logger:       logger.With().Str("component", "databases-handler").Logger(),
 	}
+}
+
+// SetTieringManager sets the tiering manager for multi-tier database/measurement listing.
+// This is called after initialization when tiering is enabled and licensed.
+func (h *DatabasesHandler) SetTieringManager(tm *tiering.Manager) {
+	h.tieringManager = tm
 }
 
 // RegisterRoutes registers the database management routes
@@ -428,19 +436,10 @@ func (h *DatabasesHandler) listDatabases(ctx context.Context) ([]string, error) 
 // listDatabasesWithMeasurementCounts returns all databases with their measurement counts
 // using minimal storage calls instead of N+1 calls.
 // Strategy: Get list of databases first (1 call), then get all files (1 call) to count measurements.
+// Also checks tiering metadata for databases that may only have data in cold storage.
 func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Context) ([]DatabaseInfo, error) {
-	// First, get list of all databases (includes empty databases with just .arc-database marker)
+	// First, get list of all databases from hot tier (includes empty databases with just .arc-database marker)
 	databases, err := h.listDatabases(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(databases) == 0 {
-		return []DatabaseInfo{}, nil
-	}
-
-	// Single storage call to get all files for measurement counting
-	files, err := h.storage.List(ctx, "")
 	if err != nil {
 		return nil, err
 	}
@@ -448,12 +447,41 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 	// Build a map of database -> set of measurements from files
 	dbMeasurements := make(map[string]map[string]bool)
 
-	// Initialize all known databases (some may be empty)
+	// Initialize all known databases from hot tier (some may be empty)
 	for _, db := range databases {
 		dbMeasurements[db] = make(map[string]bool)
 	}
 
-	// Count measurements from files
+	// Also check tiering metadata for cold-only databases
+	if h.tieringManager != nil {
+		metadata := h.tieringManager.GetMetadata()
+		if metadata != nil {
+			coldDatabases, err := metadata.GetAllDatabases(ctx)
+			if err != nil {
+				h.logger.Warn().Err(err).Msg("Failed to get databases from tiering metadata")
+			} else {
+				// Add any databases that only exist in cold tier
+				for _, db := range coldDatabases {
+					if dbMeasurements[db] == nil {
+						dbMeasurements[db] = make(map[string]bool)
+					}
+				}
+			}
+		}
+	}
+
+	// If no databases at all, return empty
+	if len(dbMeasurements) == 0 {
+		return []DatabaseInfo{}, nil
+	}
+
+	// Single storage call to get all files for measurement counting (hot tier)
+	files, err := h.storage.List(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+
+	// Count measurements from hot tier files
 	for _, file := range files {
 		parts := strings.SplitN(file, "/", 3)
 		if len(parts) < 2 {
@@ -476,9 +504,34 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 		dbMeasurements[db][measurement] = true
 	}
 
+	// Also get measurements from tiering metadata (for cold-only measurements)
+	if h.tieringManager != nil {
+		metadata := h.tieringManager.GetMetadata()
+		if metadata != nil {
+			for db := range dbMeasurements {
+				coldMeasurements, err := metadata.GetMeasurementsByDatabase(ctx, db)
+				if err != nil {
+					h.logger.Warn().Err(err).Str("database", db).Msg("Failed to get measurements from tiering metadata")
+					continue
+				}
+				for _, m := range coldMeasurements {
+					if !strings.HasPrefix(m, ".") && !strings.HasPrefix(m, "_") {
+						dbMeasurements[db][m] = true
+					}
+				}
+			}
+		}
+	}
+
 	// Convert to sorted list of DatabaseInfo
-	result := make([]DatabaseInfo, 0, len(databases))
-	for _, db := range databases {
+	sortedDatabases := make([]string, 0, len(dbMeasurements))
+	for db := range dbMeasurements {
+		sortedDatabases = append(sortedDatabases, db)
+	}
+	sort.Strings(sortedDatabases)
+
+	result := make([]DatabaseInfo, 0, len(sortedDatabases))
+	for _, db := range sortedDatabases {
 		result = append(result, DatabaseInfo{
 			Name:             db,
 			MeasurementCount: len(dbMeasurements[db]),
@@ -489,27 +542,47 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 }
 
 func (h *DatabasesHandler) listMeasurements(ctx context.Context, database string) ([]string, error) {
-	var measurements []string
+	// Use a set to deduplicate measurements from hot and cold tiers
+	measurementSet := make(map[string]bool)
 
-	// Use DirectoryLister if available
+	// Get measurements from hot tier
 	if lister, ok := h.storage.(storage.DirectoryLister); ok {
 		dirs, err := lister.ListDirectories(ctx, database+"/")
 		if err != nil {
 			return nil, err
 		}
-		measurements = dirs
+		for _, m := range dirs {
+			measurementSet[m] = true
+		}
 	} else {
 		// Fall back to List and extract unique subdirectories
 		files, err := h.storage.List(ctx, database+"/")
 		if err != nil {
 			return nil, err
 		}
-		measurements = extractSubdirectories(files, database)
+		for _, m := range extractSubdirectories(files, database) {
+			measurementSet[m] = true
+		}
+	}
+
+	// Also get measurements from tiering metadata (for cold-only measurements)
+	if h.tieringManager != nil {
+		metadata := h.tieringManager.GetMetadata()
+		if metadata != nil {
+			coldMeasurements, err := metadata.GetMeasurementsByDatabase(ctx, database)
+			if err != nil {
+				h.logger.Warn().Err(err).Str("database", database).Msg("Failed to get measurements from tiering metadata")
+			} else {
+				for _, m := range coldMeasurements {
+					measurementSet[m] = true
+				}
+			}
+		}
 	}
 
 	// Filter out hidden directories and sort
-	filtered := make([]string, 0, len(measurements))
-	for _, m := range measurements {
+	filtered := make([]string, 0, len(measurementSet))
+	for m := range measurementSet {
 		if !strings.HasPrefix(m, ".") && !strings.HasPrefix(m, "_") {
 			filtered = append(filtered, m)
 		}
