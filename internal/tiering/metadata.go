@@ -219,6 +219,66 @@ func (s *MetadataStore) GetFilesByDatabase(ctx context.Context, database string)
 	return s.scanFiles(rows)
 }
 
+// GetAllDatabases returns all unique database names from the tier metadata.
+// This includes databases that may only have data in cold storage.
+func (s *MetadataStore) GetAllDatabases(ctx context.Context) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	query := `SELECT DISTINCT database FROM tier_files ORDER BY database`
+
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query databases: %w", err)
+	}
+	defer rows.Close()
+
+	var databases []string
+	for rows.Next() {
+		var db string
+		if err := rows.Scan(&db); err != nil {
+			return nil, fmt.Errorf("failed to scan database: %w", err)
+		}
+		databases = append(databases, db)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating databases: %w", err)
+	}
+
+	return databases, nil
+}
+
+// GetMeasurementsByDatabase returns all unique measurements for a database from the tier metadata.
+// This includes measurements that may only have data in cold storage.
+func (s *MetadataStore) GetMeasurementsByDatabase(ctx context.Context, database string) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	query := `SELECT DISTINCT measurement FROM tier_files WHERE database = ? ORDER BY measurement`
+
+	rows, err := s.db.QueryContext(ctx, query, database)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query measurements: %w", err)
+	}
+	defer rows.Close()
+
+	var measurements []string
+	for rows.Next() {
+		var m string
+		if err := rows.Scan(&m); err != nil {
+			return nil, fmt.Errorf("failed to scan measurement: %w", err)
+		}
+		measurements = append(measurements, m)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating measurements: %w", err)
+	}
+
+	return measurements, nil
+}
+
 // UpdateTier updates the tier for a file
 func (s *MetadataStore) UpdateTier(ctx context.Context, path string, newTier Tier) error {
 	s.mu.Lock()

@@ -1496,6 +1496,33 @@ func (h *QueryHandler) buildReadParquetExpr(path, originalSQL, keyword string) s
 	return keyword + " read_parquet('" + path + "', " + options + ")"
 }
 
+// buildReadParquetExprForMeasurement builds a read_parquet expression for a database/measurement pair.
+// This is the tiering-aware version used by the fast path that takes database and measurement
+// separately instead of a pre-constructed path, allowing proper tiering metadata lookup.
+func (h *QueryHandler) buildReadParquetExprForMeasurement(database, measurement, originalSQL, keyword string) string {
+	// Check if tiering is enabled and cold tier is configured
+	if h.tieringManager != nil {
+		router := h.tieringManager.GetRouter()
+		if router != nil {
+			// Get glob paths for both tiers
+			tieredPaths := router.GetGlobPathsForQuery(database, measurement)
+
+			// If cold tier is configured and enabled, build multi-tier query
+			if _, hasCold := tieredPaths[tiering.TierCold]; hasCold {
+				h.logger.Debug().
+					Str("database", database).
+					Str("measurement", measurement).
+					Msg("Tiering enabled: building multi-tier query (fast path)")
+				return h.buildMultiTierReadParquet(database, measurement, tieredPaths, keyword)
+			}
+		}
+	}
+
+	// Fall back to single-tier behavior (hot tier only)
+	path := h.getStoragePath(database, measurement)
+	return h.buildReadParquetExpr(path, originalSQL, keyword)
+}
+
 // buildReadParquetExprForParallel builds a read_parquet expression and returns
 // parallel execution info if the query can benefit from parallel partition scanning.
 // Returns (sql_expression, parallel_info) where parallel_info is non-nil if parallel is recommended.
@@ -1740,9 +1767,8 @@ func (h *QueryHandler) convertSingleTableQuery(sql, sqlLower, database string) s
 		return sql
 	}
 
-	// Build replacement
-	path := h.getStoragePath(database, tableName)
-	replacement := h.buildReadParquetExpr(path, sql, "FROM")
+	// Build replacement - use tiering-aware method that checks both hot and cold tiers
+	replacement := h.buildReadParquetExprForMeasurement(database, tableName, sql, "FROM")
 
 	return sql[:idx] + replacement + sql[end:]
 }
@@ -1780,7 +1806,20 @@ func (h *QueryHandler) convertSingleTableQueryForParallel(sql, sqlLower, databas
 		return sql, nil
 	}
 
-	// Build replacement with parallel info
+	// Check tiering first - if cold tier exists, use tiering-aware method (no parallel for multi-tier)
+	if h.tieringManager != nil {
+		router := h.tieringManager.GetRouter()
+		if router != nil {
+			tieredPaths := router.GetGlobPathsForQuery(database, tableName)
+			if _, hasCold := tieredPaths[tiering.TierCold]; hasCold {
+				// Use tiering-aware method - parallel not supported for multi-tier queries
+				replacement := h.buildMultiTierReadParquet(database, tableName, tieredPaths, "FROM")
+				return sql[:idx] + replacement + sql[end:], nil
+			}
+		}
+	}
+
+	// Build replacement with parallel info (hot tier only)
 	path := h.getStoragePath(database, tableName)
 	replacement, parallelInfo := h.buildReadParquetExprForParallel(path, sql, "FROM")
 

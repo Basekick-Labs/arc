@@ -1047,6 +1047,10 @@ func main() {
 		queryHandler.SetTieringManager(tieringManager)
 		log.Info().Msg("Tiering manager wired to query handler for multi-tier queries")
 
+		// Wire tiering manager to databases handler for cold-tier database/measurement listing
+		databasesHandler.SetTieringManager(tieringManager)
+		log.Info().Msg("Tiering manager wired to databases handler for cold-tier listing")
+
 		// Wire tiering manager to arrow buffer for automatic file registration
 		arrowBuffer.SetTieringManager(tieringManager)
 		log.Info().Msg("Tiering manager wired to arrow buffer for auto-registration")
