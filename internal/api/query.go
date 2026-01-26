@@ -2029,7 +2029,14 @@ func (h *QueryHandler) convertValue(v interface{}) interface{} {
 func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error {
 	h.logger.Debug().Msg("Handling SHOW DATABASES")
 
-	columns := []string{"database"}
+	// Include tier column if tiering is enabled
+	var columns []string
+	hasTiering := h.tieringManager != nil
+	if hasTiering {
+		columns = []string{"database", "tier"}
+	} else {
+		columns = []string{"database"}
+	}
 	data := make([][]interface{}, 0)
 
 	ctx := context.Background()
@@ -2060,6 +2067,31 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 		})
 	}
 
+	// Also get databases from tiering metadata (for cold-only databases)
+	if h.tieringManager != nil {
+		metadata := h.tieringManager.GetMetadata()
+		if metadata != nil {
+			coldDatabases, coldErr := metadata.GetAllDatabases(ctx)
+			if coldErr != nil {
+				h.logger.Warn().Err(coldErr).Msg("Failed to get databases from tiering metadata")
+			} else {
+				// Merge into a set to deduplicate
+				dbSet := make(map[string]bool)
+				for _, db := range databases {
+					dbSet[db] = true
+				}
+				for _, db := range coldDatabases {
+					dbSet[db] = true
+				}
+				// Convert back to slice
+				databases = make([]string, 0, len(dbSet))
+				for db := range dbSet {
+					databases = append(databases, db)
+				}
+			}
+		}
+	}
+
 	// Filter out hidden directories
 	filtered := make([]string, 0)
 	for _, db := range databases {
@@ -2072,7 +2104,22 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 	sort.Strings(filtered)
 
 	for _, db := range filtered {
-		data = append(data, []interface{}{db})
+		if hasTiering {
+			// Get tier info for this database
+			tierStr := "local" // Default for databases not in tiering metadata
+			metadata := h.tieringManager.GetMetadata()
+			if metadata != nil {
+				tiers, err := metadata.GetTiersForDatabase(ctx, db)
+				if err != nil {
+					h.logger.Warn().Err(err).Str("database", db).Msg("Failed to get tiers for database")
+				} else if len(tiers) > 0 {
+					tierStr = strings.Join(tiers, ",")
+				}
+			}
+			data = append(data, []interface{}{db, tierStr})
+		} else {
+			data = append(data, []interface{}{db})
+		}
 	}
 
 	executionTime := float64(time.Since(start).Milliseconds())
@@ -2126,6 +2173,31 @@ func (h *QueryHandler) handleShowTables(c *fiber.Ctx, start time.Time, database 
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 			Timestamp:       time.Now().UTC().Format(time.RFC3339),
 		})
+	}
+
+	// Also get tables from tiering metadata (for cold-only tables)
+	if h.tieringManager != nil {
+		metadata := h.tieringManager.GetMetadata()
+		if metadata != nil {
+			coldTables, coldErr := metadata.GetMeasurementsByDatabase(ctx, database)
+			if coldErr != nil {
+				h.logger.Warn().Err(coldErr).Str("database", database).Msg("Failed to get tables from tiering metadata")
+			} else {
+				// Merge into a set to deduplicate
+				tableSet := make(map[string]bool)
+				for _, t := range tables {
+					tableSet[t] = true
+				}
+				for _, t := range coldTables {
+					tableSet[t] = true
+				}
+				// Convert back to slice
+				tables = make([]string, 0, len(tableSet))
+				for t := range tableSet {
+					tables = append(tables, t)
+				}
+			}
+		}
 	}
 
 	// Filter out hidden tables

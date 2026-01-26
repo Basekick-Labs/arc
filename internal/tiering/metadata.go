@@ -249,6 +249,36 @@ func (s *MetadataStore) GetAllDatabases(ctx context.Context) ([]string, error) {
 	return databases, nil
 }
 
+// GetTiersForDatabase returns which tiers have data for a specific database.
+// Returns a slice of tier names (e.g., ["hot"], ["cold"], or ["hot", "cold"]).
+func (s *MetadataStore) GetTiersForDatabase(ctx context.Context, database string) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	query := `SELECT DISTINCT tier FROM tier_files WHERE database = ? ORDER BY tier`
+
+	rows, err := s.db.QueryContext(ctx, query, database)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query tiers: %w", err)
+	}
+	defer rows.Close()
+
+	var tiers []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, fmt.Errorf("failed to scan tier: %w", err)
+		}
+		tiers = append(tiers, t)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating tiers: %w", err)
+	}
+
+	return tiers, nil
+}
+
 // GetMeasurementsByDatabase returns all unique measurements for a database from the tier metadata.
 // This includes measurements that may only have data in cold storage.
 func (s *MetadataStore) GetMeasurementsByDatabase(ctx context.Context, database string) ([]string, error) {
