@@ -359,7 +359,7 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 		Msg("Executing scheduled retention policy")
 
 	// Get measurements to process
-	measurements, err := h.getMeasurementsToProcess(policy)
+	measurements, err := h.getMeasurementsToProcess(ctx, policy)
 	if err != nil {
 		return nil, fmt.Errorf("failed to discover measurements: %w", err)
 	}
@@ -493,7 +493,7 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 		Msg("Executing retention policy")
 
 	// Get measurements to process
-	measurements, err := h.getMeasurementsToProcess(policy)
+	measurements, err := h.getMeasurementsToProcess(c.Context(), policy)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to discover measurements: " + err.Error(),
@@ -651,88 +651,85 @@ func (h *RetentionHandler) getPolicies() ([]RetentionPolicy, error) {
 }
 
 // getMeasurementsToProcess gets measurements for a policy
-func (h *RetentionHandler) getMeasurementsToProcess(policy *RetentionPolicy) ([]string, error) {
+// Supports all storage backends: local, S3, and Azure
+func (h *RetentionHandler) getMeasurementsToProcess(ctx context.Context, policy *RetentionPolicy) ([]string, error) {
 	if policy.Measurement != nil && *policy.Measurement != "" {
 		return []string{*policy.Measurement}, nil
 	}
 
-	// Get all measurements in database by scanning storage
-	basePath := h.getStorageBasePath()
-	if basePath == "" {
-		return nil, fmt.Errorf("unable to determine storage base path")
+	// Get all measurements in database by listing storage with database prefix
+	prefix := policy.Database + "/"
+	files, err := h.storage.List(ctx, prefix)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list files: %w", err)
 	}
 
-	dbPath := filepath.Join(basePath, policy.Database)
-	entries, err := os.ReadDir(dbPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return []string{}, nil
+	// Extract unique measurement names from file paths
+	// Files are stored as: database/measurement/YYYY/MM/DD/HH/file.parquet
+	measurementSet := make(map[string]struct{})
+	for _, f := range files {
+		// Remove database prefix
+		relPath := strings.TrimPrefix(f, prefix)
+		// Get first path component (measurement name)
+		parts := strings.SplitN(relPath, "/", 2)
+		if len(parts) > 0 && parts[0] != "" && !strings.HasPrefix(parts[0], ".") {
+			measurementSet[parts[0]] = struct{}{}
 		}
-		return nil, err
 	}
 
 	var measurements []string
-	for _, entry := range entries {
-		if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
-			measurements = append(measurements, entry.Name())
-		}
+	for m := range measurementSet {
+		measurements = append(measurements, m)
 	}
 
 	return measurements, nil
 }
 
 // deleteOldFiles deletes Parquet files where ALL rows are older than cutoffDate
+// Supports all storage backends: local, S3, and Azure
 func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measurement string, cutoffDate time.Time, dryRun bool) (int64, int, error) {
-	basePath := h.getStorageBasePath()
-	if basePath == "" {
-		return 0, 0, fmt.Errorf("unable to determine storage base path")
-	}
-
-	measurementPath := filepath.Join(basePath, database, measurement)
-	if _, err := os.Stat(measurementPath); os.IsNotExist(err) {
-		return 0, 0, nil
-	}
-
-	// Find all parquet files
-	var parquetFiles []string
-	err := filepath.Walk(measurementPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-		if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".parquet") {
-			parquetFiles = append(parquetFiles, path)
-		}
-		return nil
-	})
+	// List all files for this measurement using storage backend
+	prefix := database + "/" + measurement + "/"
+	files, err := h.storage.List(ctx, prefix)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, fmt.Errorf("failed to list files: %w", err)
+	}
+
+	// Filter to only parquet files
+	var parquetFiles []string
+	for _, f := range files {
+		if strings.HasSuffix(strings.ToLower(f), ".parquet") {
+			parquetFiles = append(parquetFiles, f)
+		}
 	}
 
 	h.logger.Debug().Int("file_count", len(parquetFiles)).Str("measurement", measurement).Msg("Scanning files for old data")
 
-	// Check each file
 	var deletedRows int64
 	var deletedFiles int
 
-	for _, filePath := range parquetFiles {
-		maxTime, rowCount, err := h.getFileMaxTimeAndRowCount(ctx, filePath)
+	for _, relativePath := range parquetFiles {
+		// Build full path for DuckDB to read (s3://, azure://, or local path)
+		fullPath := h.buildParquetPath(relativePath)
+
+		maxTime, rowCount, err := h.getFileMaxTimeAndRowCount(ctx, fullPath)
 		if err != nil {
-			h.logger.Warn().Err(err).Str("file", filePath).Msg("Failed to read file metadata")
+			h.logger.Warn().Err(err).Str("file", relativePath).Msg("Failed to read file metadata")
 			continue
 		}
 
 		// If ALL rows in file are older than cutoff, delete the file
 		if maxTime.Before(cutoffDate) {
 			h.logger.Info().
-				Str("file", filepath.Base(filePath)).
+				Str("file", filepath.Base(relativePath)).
 				Time("max_time", maxTime).
 				Int64("rows", rowCount).
 				Bool("dry_run", dryRun).
 				Msg("File eligible for deletion")
 
 			if !dryRun {
-				if err := os.Remove(filePath); err != nil {
-					h.logger.Error().Err(err).Str("file", filePath).Msg("Failed to delete file")
+				if err := h.storage.Delete(ctx, relativePath); err != nil {
+					h.logger.Error().Err(err).Str("file", relativePath).Msg("Failed to delete file")
 					continue
 				}
 			}
@@ -754,16 +751,13 @@ func (h *RetentionHandler) getFileMaxTimeAndRowCount(ctx context.Context, filePa
 	query := fmt.Sprintf("SELECT MAX(time) as max_time, COUNT(*) as cnt FROM read_parquet('%s')", filePath)
 	row := db.QueryRowContext(ctx, query)
 
-	var maxTimeMicros int64
+	var maxTime time.Time
 	var rowCount int64
-	if err := row.Scan(&maxTimeMicros, &rowCount); err != nil {
+	if err := row.Scan(&maxTime, &rowCount); err != nil {
 		return time.Time{}, 0, err
 	}
 
-	// Convert microseconds to time
-	maxTime := time.UnixMicro(maxTimeMicros).UTC()
-
-	return maxTime, rowCount, nil
+	return maxTime.UTC(), rowCount, nil
 }
 
 // recordExecutionStart records the start of an execution
@@ -792,7 +786,17 @@ func (h *RetentionHandler) recordExecutionComplete(executionID int64, status str
 	}
 }
 
-// getStorageBasePath returns the base path for storage
-func (h *RetentionHandler) getStorageBasePath() string {
-	return storage.GetLocalBasePath(h.storage, &h.logger, "Retention", "./data/arc")
+// buildParquetPath returns the full path for DuckDB to read a parquet file
+// based on the storage backend type
+func (h *RetentionHandler) buildParquetPath(relativePath string) string {
+	switch b := h.storage.(type) {
+	case *storage.S3Backend:
+		return "s3://" + b.GetBucket() + "/" + relativePath
+	case *storage.AzureBlobBackend:
+		return "azure://" + b.GetContainer() + "/" + relativePath
+	case *storage.LocalBackend:
+		return filepath.Join(b.GetBasePath(), relativePath)
+	default:
+		return relativePath
+	}
 }
