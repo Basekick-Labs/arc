@@ -363,3 +363,72 @@ func TestDeleteOldFiles_KeepsRecentFiles(t *testing.T) {
 		t.Error("deleteOldFiles() should not delete recent files")
 	}
 }
+
+func TestDeleteOldFiles_CleansUpEmptyDirectories(t *testing.T) {
+	handler, tmpDir := setupTestRetentionHandler(t)
+
+	// Create a test parquet file with DuckDB
+	db := handler.duckdb.DB()
+
+	measurementDir := filepath.Join(tmpDir, "testdb", "logs", "2020", "01", "01", "00")
+	if err := os.MkdirAll(measurementDir, 0755); err != nil {
+		t.Fatalf("failed to create measurement dir: %v", err)
+	}
+
+	parquetPath := filepath.Join(measurementDir, "test.parquet")
+
+	// Create a parquet file with old timestamps (2020)
+	createSQL := `COPY (
+		SELECT
+			TIMESTAMP '2020-01-01 00:00:00' as time,
+			'test' as message
+		FROM range(10)
+	) TO '` + parquetPath + `' (FORMAT PARQUET)`
+
+	if _, err := db.Exec(createSQL); err != nil {
+		t.Fatalf("failed to create test parquet file: %v", err)
+	}
+
+	// Verify directory structure exists
+	hourDir := filepath.Join(tmpDir, "testdb", "logs", "2020", "01", "01", "00")
+	if _, err := os.Stat(hourDir); os.IsNotExist(err) {
+		t.Fatalf("hour directory was not created")
+	}
+
+	// Run actual deletion with a cutoff date after the data
+	cutoff := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
+	_, _, err := handler.deleteOldFiles(context.Background(), "testdb", "logs", cutoff, false)
+
+	if err != nil {
+		t.Fatalf("deleteOldFiles() error = %v", err)
+	}
+
+	// Hour directory should be deleted (empty after file deletion)
+	if _, err := os.Stat(hourDir); !os.IsNotExist(err) {
+		t.Error("deleteOldFiles() should have deleted empty hour directory")
+	}
+
+	// Day directory should be deleted (empty after hour deletion)
+	dayDir := filepath.Join(tmpDir, "testdb", "logs", "2020", "01", "01")
+	if _, err := os.Stat(dayDir); !os.IsNotExist(err) {
+		t.Error("deleteOldFiles() should have deleted empty day directory")
+	}
+
+	// Month directory should be deleted (empty after day deletion)
+	monthDir := filepath.Join(tmpDir, "testdb", "logs", "2020", "01")
+	if _, err := os.Stat(monthDir); !os.IsNotExist(err) {
+		t.Error("deleteOldFiles() should have deleted empty month directory")
+	}
+
+	// Year directory should be deleted (empty after month deletion)
+	yearDir := filepath.Join(tmpDir, "testdb", "logs", "2020")
+	if _, err := os.Stat(yearDir); !os.IsNotExist(err) {
+		t.Error("deleteOldFiles() should have deleted empty year directory")
+	}
+
+	// Measurement directory should still exist (we don't delete it)
+	measurementBaseDir := filepath.Join(tmpDir, "testdb", "logs")
+	if _, err := os.Stat(measurementBaseDir); os.IsNotExist(err) {
+		t.Error("deleteOldFiles() should NOT delete measurement directory")
+	}
+}

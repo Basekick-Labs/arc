@@ -707,6 +707,7 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 
 	var deletedRows int64
 	var deletedFiles int
+	var deletedFilePaths []string
 
 	for _, relativePath := range parquetFiles {
 		// Build full path for DuckDB to read (s3://, azure://, or local path)
@@ -732,11 +733,17 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 					h.logger.Error().Err(err).Str("file", relativePath).Msg("Failed to delete file")
 					continue
 				}
+				deletedFilePaths = append(deletedFilePaths, relativePath)
 			}
 
 			deletedRows += rowCount
 			deletedFiles++
 		}
+	}
+
+	// Clean up empty directories after deletion (only for local storage)
+	if !dryRun && len(deletedFilePaths) > 0 {
+		h.cleanupEmptyDirectories(ctx, deletedFilePaths)
 	}
 
 	return deletedRows, deletedFiles, nil
@@ -799,4 +806,53 @@ func (h *RetentionHandler) buildParquetPath(relativePath string) string {
 	default:
 		return relativePath
 	}
+}
+
+// cleanupEmptyDirectories attempts to remove empty directories after file deletion.
+// Only works with storage backends that implement DirectoryRemover (e.g., LocalBackend).
+func (h *RetentionHandler) cleanupEmptyDirectories(ctx context.Context, deletedFiles []string) {
+	remover, ok := h.storage.(storage.DirectoryRemover)
+	if !ok {
+		h.logger.Debug().Msg("Storage backend does not support directory removal, skipping cleanup")
+		return
+	}
+
+	// Collect unique directories from deleted files
+	dirs := make(map[string]struct{})
+	for _, filePath := range deletedFiles {
+		dir := filepath.Dir(filePath)
+		dirs[dir] = struct{}{}
+	}
+
+	if len(dirs) == 0 {
+		return
+	}
+
+	var removed int
+	for dir := range dirs {
+		removed += h.removeDirectoryTree(ctx, remover, dir)
+	}
+
+	if removed > 0 {
+		h.logger.Info().Int("directories_removed", removed).Msg("Cleaned up empty directories")
+	}
+}
+
+// removeDirectoryTree attempts to remove a directory and its empty parents.
+// Stops at the measurement level (database/measurement) to preserve structure.
+func (h *RetentionHandler) removeDirectoryTree(ctx context.Context, remover storage.DirectoryRemover, dir string) int {
+	parts := strings.Split(dir, "/")
+	if len(parts) <= 2 {
+		return 0 // Don't remove database or measurement directories
+	}
+
+	if err := remover.RemoveDirectory(ctx, dir); err != nil {
+		h.logger.Debug().Err(err).Str("dir", dir).Msg("Could not remove directory (may not be empty)")
+		return 0
+	}
+
+	h.logger.Debug().Str("dir", dir).Msg("Removed empty directory")
+
+	parent := filepath.Dir(dir)
+	return 1 + h.removeDirectoryTree(ctx, remover, parent)
 }

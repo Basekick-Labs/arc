@@ -537,6 +537,18 @@ Retention policies now work with all storage backends (local, S3, Azure) instead
 - S3: `s3://bucket/database/measurement/...`
 - Azure: `azure://container/database/measurement/...`
 
+### Retention Policy Empty Directory Cleanup (Issue #171)
+
+Retention policies now clean up empty directories after deleting parquet files on local filesystem storage.
+
+**Problem:** When retention policies deleted old parquet files, the empty YYYY/MM/DD/HH directory structure was left behind, causing directory clutter over time.
+
+**Fix:**
+- Added `cleanupEmptyDirectories()` using existing `DirectoryRemover` interface
+- Recursively removes empty parent directories up to measurement level
+- Only applies to local filesystem (S3/Azure don't have physical directories)
+- Follows same pattern as compaction cleanup
+
 ### Query Timeout for S3 Disconnection (Issue #151, PR #152)
 
 Added configurable query timeout to prevent indefinite hangs when S3 becomes unavailable during query execution.
