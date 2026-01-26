@@ -1,292 +1,157 @@
 # =============================================================================
 # Arc Configuration
 # =============================================================================
-# Arc is a high-performance time-series database built on DuckDB and Parquet.
-# This file configures all aspects of the Arc server.
 
 # -----------------------------------------------------------------------------
-# Server Configuration
+# Server
 # -----------------------------------------------------------------------------
-# HTTP server settings for the Arc API
 [server]
-# Port to listen on for HTTP/HTTPS requests
 port = 8000
 
-# TLS/HTTPS Configuration
-# Enable native HTTPS support without requiring a reverse proxy
-# Environment variables: ARC_SERVER_TLS_ENABLED, ARC_SERVER_TLS_CERT_FILE, ARC_SERVER_TLS_KEY_FILE
-#
-# Example with Let's Encrypt:
-#   tls_enabled = true
-#   tls_cert_file = "/etc/letsencrypt/live/example.com/fullchain.pem"
-#   tls_key_file = "/etc/letsencrypt/live/example.com/privkey.pem"
-#
-# Example with self-signed certificate (development only):
-#   tls_enabled = true
-#   tls_cert_file = "./certs/server.crt"
-#   tls_key_file = "./certs/server.key"
-#
-# IMPORTANT: Ensure key file has restricted permissions (chmod 600)
-# Default: false (plain HTTP)
+# TLS/HTTPS (disabled by default)
 tls_enabled = false
-# tls_cert_file = ""
-# tls_key_file = ""
+# tls_cert_file = "/etc/letsencrypt/live/example.com/fullchain.pem"
+# tls_key_file = "/etc/letsencrypt/live/example.com/privkey.pem"
 
 # -----------------------------------------------------------------------------
-# Logging Configuration
+# Logging
 # -----------------------------------------------------------------------------
-# Controls log output format and verbosity
 [log]
-# Log level: debug, info, warn, error, fatal, panic
-level = "info"
-# Output format: "json" for structured logs, "console" for human-readable
-format = "console"
+level = "info"      # debug, info, warn, error, fatal, panic
+format = "console"  # json or console
 
 # -----------------------------------------------------------------------------
-# Database Configuration (DuckDB)
+# Database (DuckDB)
 # -----------------------------------------------------------------------------
-# DuckDB connection pool and resource settings
-#
-# AUTO-DETECTION: If these values are not set (commented out), Arc will
-# automatically configure optimal defaults based on your system:
-#   - max_connections: 2x CPU cores (min 4, max 64)
-#   - memory_limit: ~50% of estimated system memory (1GB-32GB)
-#   - thread_count: Number of CPU cores
-#
-# You can also override via environment variables:
-#   - ARC_DATABASE_MAX_CONNECTIONS
-#   - ARC_DATABASE_MEMORY_LIMIT
-#   - ARC_DATABASE_THREAD_COUNT
-#
+# Auto-configured based on system resources if not set.
+# Override via: ARC_DATABASE_MAX_CONNECTIONS, ARC_DATABASE_MEMORY_LIMIT, ARC_DATABASE_THREAD_COUNT
 [database]
-# Maximum number of connections in the pool
-# Each connection can execute one query at a time
-# Default: 2x CPU cores (e.g., 28 on a 14-core machine)
-# max_connections = 28
-
-# Memory limit for DuckDB operations
-# Format: "2GB", "512MB", etc.
-# Default: ~50% of estimated system memory based on CPU cores
-# memory_limit = "8GB"
-
-# Number of threads DuckDB can use for query execution
-# Default: Number of CPU cores
-# thread_count = 14
-
-# Enable Write-Ahead Logging for crash recovery
-# Currently disabled - Arc uses Parquet files as the source of truth
+# max_connections = 28    # Default: 2x CPU cores
+# memory_limit = "8GB"    # Default: ~50% system memory
+# thread_count = 14       # Default: CPU cores
 enable_wal = false
 
 # -----------------------------------------------------------------------------
-# Storage Configuration
+# Storage
 # -----------------------------------------------------------------------------
-# Where and how Arc stores Parquet files
 [storage]
-# Storage backend: "local" or "s3"
-backend = "local"
-
-# Local filesystem path for data storage (when backend = "local")
+backend = "local"           # "local" or "s3"
 local_path = "./data/arc"
 
-# S3/MinIO configuration (when backend = "s3")
+# S3/MinIO (when backend = "s3")
 s3_bucket = "arc-test"
 s3_region = "us-east-2"
-s3_endpoint = ""
-
-# SECURITY WARNING: Never commit credentials!
-# For production, use environment variables: ARC_STORAGE_S3_ACCESS_KEY, ARC_STORAGE_S3_SECRET_KEY
-# Or use IAM roles (recommended for AWS deployments)
-# s3_access_key = ""
-# s3_secret_key = ""
-
-# SECURITY: Set to true for production! Only false for local MinIO without TLS
-s3_use_ssl = false                      # Default: true. Only false for local dev with non-TLS MinIO
-s3_path_style = true                    # Required for MinIO, false for AWS S3
+s3_endpoint = ""            # Empty for AWS, set for MinIO
+s3_use_ssl = false          # Set true for production
+s3_path_style = true        # True for MinIO, false for AWS
+# Credentials via env: ARC_STORAGE_S3_ACCESS_KEY, ARC_STORAGE_S3_SECRET_KEY
 
 # -----------------------------------------------------------------------------
-# Ingestion Configuration
+# Ingestion
 # -----------------------------------------------------------------------------
-# Controls how incoming data is buffered and written to Parquet files.
-#
-# Data is flushed to disk when EITHER condition is met:
-#   1. Buffer reaches max_buffer_size records
-#   2. Buffer age exceeds max_buffer_age_ms
-#
-# This ensures both high throughput (batch large writes) and low latency
-# (don't wait forever for small streams).
-#
 [ingest]
-# Maximum records to buffer per measurement before flushing to Parquet
-# Higher = better write throughput, but more memory usage
-# Default: 50000
-max_buffer_size = 5000000
+max_buffer_size = 5000000   # Records before flush (default: 50000)
+max_buffer_age_ms = 5000    # Max buffer age before flush
 
-# Maximum age of buffered data in milliseconds before forcing a flush
-# Lower = fresher data on disk, but more small files
-# Default: 5000 (5 seconds)
-max_buffer_age_ms = 5000
-
-# DATA PARTITIONING (Always Active):
-#   - Data is automatically partitioned by hour using the data's timestamp
-#   - Files are organized as: database/measurement/YYYY/MM/DD/HH/file.parquet
-#   - Sort keys are applied WITHIN each hourly partition
-#   - This enables efficient time-range queries via partition pruning
-#
-# TIMESTAMP HANDLING:
-#   - If incoming data lacks a "time" column, UTC timestamps are auto-generated
-#   - A warning is logged when timestamps are auto-generated
-#
-# Secondary sort keys for improved compression and query performance
-# Format: "measurement:column1,column2"
-#
-# NOTE: The "time" column is ALWAYS appended automatically to sort keys.
-# You only need to specify ADDITIONAL columns to sort by before time.
-#
-# BENEFITS:
-#   - 30-50% smaller files (better compression when similar values grouped)
-#   - 10-100x faster queries on sort key columns (data clustering + row group pruning)
-#   - Enables dictionary encoding and RLE compression to work optimally
-#
-# EXAMPLES:
-#   IoT sensors: sort by sensor_id, then time (automatic)
-#     sort_keys = ["temperature:tag_sensor_id", "humidity:tag_sensor_id"]
-#
-#   Multi-tenant: sort by tenant, service, then time (automatic)
-#     sort_keys = ["metrics:tag_tenant_id,tag_service"]
-#
-#   Infrastructure: sort by host, metric name, then time (automatic)
-#     sort_keys = ["cpu:tag_host,tag_metric", "memory:tag_host,tag_metric"]
-#
-# HOW IT WORKS:
-#   - Data within each hourly Parquet file is sorted by these columns
-#   - Groups all data for same sensor/host/tenant together within each hour
-#   - Dramatically improves compression (similar values adjacent)
-#   - Faster queries with WHERE clauses on sort key columns
-#
-# PERFORMANCE COST:
-#   - Adds ~35% to sort time (e.g., 7ms → 10ms for 100K records)
-#   - Trade-off: slightly slower writes for much smaller files + faster queries
-#
-# Default: [] (time-only sorting for all measurements)
+# Sort keys for compression/query performance: "measurement:col1,col2"
+# Time column is always appended automatically
 sort_keys = []
-
-# Default sort keys for measurements not specified above
-# Format: comma-separated list of additional column names (time is automatic)
-#
-# EXAMPLES:
-#   Time-only (default): ""
-#   Host then time: "tag_host"
-#   Multi-column: "tag_region,tag_host"
-#
-# NOTE:
-#   - Leave empty for time-only sorting (recommended default)
-#   - Columns must exist in the data or flush will fall back to time-only
-#   - Applied to ALL measurements not explicitly configured in sort_keys
-#
-# Default: "" (time-only sorting)
 default_sort_keys = ""
 
 # -----------------------------------------------------------------------------
-# Compaction Configuration
+# Compaction
 # -----------------------------------------------------------------------------
-# Automatic merging of small Parquet files into larger ones
 [compaction]
-# Enable/disable automatic compaction
 enabled = true
 
-# Hourly tier configuration
+# Hourly
 hourly_enabled = true
-hourly_schedule = "5 * * * *"  # Every hour at :05
-hourly_min_age_hours = 0       # Compact immediately
-hourly_min_files = 5           # Minimum files to trigger compaction
+hourly_schedule = "5 * * * *"
+hourly_min_age_hours = 0
+hourly_min_files = 5
 
-# Daily tier configuration
+# Daily
 daily_enabled = true
-daily_schedule = "0 3 * * *"   # Daily at 3 AM UTC
-daily_min_age_hours = 24       # Only compact days older than 24 hours
-daily_min_files = 12           # Minimum 12 hourly files before compacting
+daily_schedule = "0 3 * * *"
+daily_min_age_hours = 24
+daily_min_files = 12
 
 # -----------------------------------------------------------------------------
-# Authentication Configuration
+# Authentication
 # -----------------------------------------------------------------------------
-# API authentication settings
 [auth]
-# Enable/disable authentication
-# When enabled, requests must include a valid token in the Authorization header
-# Public endpoints (/health, /ready, /metrics) are always accessible
 enabled = true
 
 # -----------------------------------------------------------------------------
-# Delete Configuration
+# Delete
 # -----------------------------------------------------------------------------
-# Settings for DELETE operations on time-series data
 [delete]
-# Enable/disable delete functionality
 enabled = true
-
-# Row count threshold requiring explicit confirmation
-# Deletes affecting more rows than this require "confirm": true in request
 confirmation_threshold = 10000
-
-# Maximum rows that can be deleted in a single operation
-# Prevents accidental deletion of entire datasets
 max_rows_per_delete = 1000000
 
 # -----------------------------------------------------------------------------
-# Retention Policy Configuration
+# Retention
 # -----------------------------------------------------------------------------
-# Automatic data expiration based on age
 [retention]
-# Enable/disable retention policy enforcement
-# Policies are defined per-database via the API
 enabled = true
 
 # -----------------------------------------------------------------------------
-# Continuous Query Configuration
+# Continuous Queries
 # -----------------------------------------------------------------------------
-# Scheduled queries that run automatically (e.g., for downsampling)
 [continuous_query]
-# Enable/disable continuous query execution
-# Queries are defined via the API
 enabled = false
 
 # -----------------------------------------------------------------------------
-# MQTT Ingestion Configuration
+# MQTT
 # -----------------------------------------------------------------------------
 [mqtt]
-# Enable MQTT subscription manager (subscriptions configured via API)
 enabled = false
 
 # -----------------------------------------------------------------------------
-# Query Configuration
+# Query
 # -----------------------------------------------------------------------------
-# Query execution optimizations
 [query]
-# Enable S3 file caching via DuckDB's cache_httpfs extension
-# When enabled, caches S3 Parquet files in memory for faster repeated reads.
-# This significantly improves query performance (5-10x) for:
-#   - CTEs (Common Table Expressions) that read the same table multiple times
-#   - Subqueries accessing the same data
-#   - Grafana dashboards with multiple panels querying similar time ranges
-#
-# Trade-off: Increases memory usage based on cache size settings below
-# Only effective when storage.backend = "s3"
-#
-# Environment variable: ARC_QUERY_ENABLE_S3_CACHE
-# Default: false
+# S3 file caching (improves CTEs, subqueries, dashboard queries)
 enable_s3_cache = false
-
-# Maximum size for in-memory S3 cache
-# Supports: KB, MB, GB (e.g., "128MB", "256MB", "1GB")
-# Environment variable: ARC_QUERY_S3_CACHE_SIZE
-# Default: "128MB"
 s3_cache_size = "128MB"
-
-# Cache entry TTL (time-to-live) in seconds
-# Cached blocks are evicted after this duration
-# Environment variable: ARC_QUERY_S3_CACHE_TTL_SECONDS
-# Default: 3600 (1 hour)
 s3_cache_ttl_seconds = 3600
 
+# -----------------------------------------------------------------------------
+# Telemetry
+# -----------------------------------------------------------------------------
 [telemetry]
 enabled = true
+
+# -----------------------------------------------------------------------------
+# Tiered Storage (Enterprise)
+# -----------------------------------------------------------------------------
+# Hot tier (local) -> Cold tier (S3/Azure) based on data age
+[tiered_storage]
+enabled = true
+migration_schedule = "0 2 * * *"
+migration_max_concurrent = 4
+migration_batch_size = 100
+default_hot_max_age_days = 0
+
+[tiered_storage.cold]
+enabled = true
+backend = "s3"              # "s3" or "azure"
+
+# S3/MinIO
+s3_bucket = "arc-archive"
+s3_region = "us-east-1"
+s3_endpoint = "localhost:9000"
+s3_access_key = "minioadmin"
+s3_secret_key = "minioadmin"
+s3_use_ssl = false
+s3_path_style = true
+s3_storage_class = "GLACIER"
+
+# Azure (when backend = "azure")
+azure_container = ""
+azure_endpoint = ""
+azure_use_managed_identity = false
+azure_access_tier = "Archive"
+
+retrieval_mode = "standard"  # standard, expedited, bulk

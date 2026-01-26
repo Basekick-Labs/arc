@@ -503,6 +503,40 @@ recovery_batch_size = 10000      # Max records per recovery batch (default: 1000
 
 *Contributed by [@khalid244](https://github.com/khalid244)*
 
+### Tiered Storage Query Routing (Issue #166, PR #167)
+
+Fixed X-Arc-Database header queries not routing to cold tier data and database listing not showing cold-only databases.
+
+**Problem:** When data was fully migrated to cold tier (S3/Azure) and no longer existed in hot tier (local), queries using the `X-Arc-Database` header would fail with "No files found" errors. Additionally, `GET /api/v1/databases` and `SHOW DATABASES` wouldn't list databases that only existed in cold storage.
+
+**Fix:**
+- Query routing now checks tiering metadata and builds multi-tier `read_parquet()` expressions when cold tier data exists
+- Database and measurement listing APIs now merge results from both hot and cold tiers
+- `SHOW DATABASES` and `SHOW TABLES` SQL commands now include cold tier data
+- Added new `tier` column to `SHOW DATABASES` output showing 'local', 'hot', 'cold', or 'hot,cold'
+
+**New API methods in tiering metadata:**
+- `GetAllDatabases()` - List all databases across tiers
+- `GetMeasurementsByDatabase()` - List measurements in a database across tiers
+- `GetTiersForDatabase()` - Get which tiers contain data for a database
+
+### Retention Policies for S3/Azure Storage Backends (Issue #169, PR #170)
+
+Retention policies now work with all storage backends (local, S3, Azure) instead of just local filesystem.
+
+**Problem:** When S3 or Azure was configured as the primary storage backend, retention policies silently did nothing because the implementation used filesystem-only operations (`filepath.Walk`, `os.Remove`).
+
+**Fix:**
+- Refactored `deleteOldFiles()` to use storage backend interface (`List()`, `Delete()`)
+- Refactored `getMeasurementsToProcess()` to use `storage.List()` for measurement discovery
+- Added `buildParquetPath()` helper to construct correct DuckDB paths for each backend type
+- Fixed `getFileMaxTimeAndRowCount()` to handle `time.Time` directly from DuckDB driver
+
+**Supported backends:**
+- Local filesystem: `/path/to/base/database/measurement/...`
+- S3: `s3://bucket/database/measurement/...`
+- Azure: `azure://container/database/measurement/...`
+
 ### Query Timeout for S3 Disconnection (Issue #151, PR #152)
 
 Added configurable query timeout to prevent indefinite hangs when S3 becomes unavailable during query execution.
