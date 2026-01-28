@@ -24,7 +24,7 @@ type Config struct {
 	Query      string
 	Format     string // "json" or "arrow"
 	Iterations int
-	Rows       int64  // Expected row count (for throughput calculation)
+	Rows       int64 // Expected row count (for throughput calculation)
 	Host       string
 	Port       int
 	Token      string
