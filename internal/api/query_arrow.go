@@ -77,16 +77,22 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		Msg("Executing Arrow query")
 
 	// Create context with timeout if configured
-	ctx := c.UserContext()
+	// Use context.Background() instead of c.UserContext() because SetBodyStreamWriter
+	// runs asynchronously after the handler returns, and c.UserContext() would be cancelled
+	// Note: We don't use defer cancel() here because the streaming callback runs after
+	// this handler returns - cancel is called inside the callback after rows are consumed
+	ctx := context.Background()
 	var cancel context.CancelFunc
 	if h.queryTimeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, h.queryTimeout)
-		defer cancel()
 	}
 
 	// Execute query using standard database/sql interface with timeout support
 	rows, err := h.db.QueryContext(ctx, convertedSQL)
 	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
 		// Check if it was a timeout
 		if h.queryTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
 			m.IncQueryTimeouts()
@@ -109,6 +115,10 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// Get column info
 	columns, err := rows.Columns()
 	if err != nil {
+		rows.Close()
+		if cancel != nil {
+			cancel()
+		}
 		m.IncQueryErrors()
 		h.logger.Error().Err(err).Msg("Failed to get column names")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -119,6 +129,10 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 
 	columnTypes, err := rows.ColumnTypes()
 	if err != nil {
+		rows.Close()
+		if cancel != nil {
+			cancel()
+		}
 		m.IncQueryErrors()
 		h.logger.Error().Err(err).Msg("Failed to get column types")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -211,6 +225,11 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 
 		// Close rows here since we can't use defer (handler returns before streaming completes)
 		rows.Close()
+
+		// Cancel timeout context if one was created
+		if cancel != nil {
+			cancel()
+		}
 
 		executionTime := float64(time.Since(start).Milliseconds())
 		h.logger.Info().
