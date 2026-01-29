@@ -135,10 +135,9 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		}
 	}
 
-	// Enable object cache for Parquet metadata - significantly improves repeated queries
-	// This caches Parquet file metadata (schema, row group info) reducing I/O on repeated access
-	if _, err := db.Exec("SET enable_object_cache=true"); err != nil {
-		logger.Warn().Err(err).Msg("Failed to enable object cache (continuing without it)")
+	// Cache Parquet file metadata (schema, row group info) to reduce I/O on repeated access
+	if _, err := db.Exec("SET GLOBAL parquet_metadata_cache=true"); err != nil {
+		logger.Warn().Err(err).Msg("Failed to enable parquet metadata cache (continuing without it)")
 	}
 
 	// Preserve insertion order for deterministic results (important for LIMIT queries)
@@ -213,6 +212,10 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	}
 	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_use_ssl=%s", useSSL)); err != nil {
 		return fmt.Errorf("failed to set s3_use_ssl: %w", err)
+	}
+
+	if _, err := db.Exec("SET GLOBAL prefetch_all_parquet_files=true"); err != nil {
+		logger.Warn().Err(err).Msg("Failed to set prefetch_all_parquet_files")
 	}
 
 	// Configure cache_httpfs extension for S3 file caching if enabled
