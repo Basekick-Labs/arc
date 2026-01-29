@@ -691,16 +691,22 @@ FROM requests GROUP BY region
 
 ### DuckDB Query Engine Optimizations
 
-Added DuckDB configuration settings that improve query performance across all query types.
+Added DuckDB configuration settings that improve query performance across all query types. All settings now use `SET GLOBAL` to ensure they apply consistently across all connections in the DuckDB pool (PR #172).
 
 **Settings enabled:**
-- `enable_object_cache=true` - Caches Parquet file metadata for faster repeated access
+- `parquet_metadata_cache=true` - Caches Parquet file metadata (schema, row group info) to reduce I/O on repeated access
+- `prefetch_all_parquet_files=true` - Prefetches all Parquet files for S3 queries, reducing latency
 - `preserve_insertion_order=true` - Ensures deterministic results for LIMIT queries
+
+**Pool-wide consistency (PR #172):**
+Previously, DuckDB settings were applied with `SET`, which only affects the connection that executes the statement. With connection pooling (`SetMaxOpenConns`), other connections in the pool would not inherit these settings. All settings are now applied with `SET GLOBAL` to ensure consistent behavior across the entire pool.
 
 **Performance impact:**
 - Aggregation queries (SUM, COUNT, AVG): **18-24% faster**
 - Full table scans: **2-3% faster**
 - Repeated queries on same data: benefit from metadata caching
+
+*`SET GLOBAL` fix contributed by [@khalid244](https://github.com/khalid244)*
 
 ### Automatic Regex-to-String Function Optimization
 
