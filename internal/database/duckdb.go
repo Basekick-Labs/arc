@@ -123,14 +123,14 @@ func buildDSN(_ *Config) string {
 func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	// Set memory limit to prevent unbounded memory growth
 	if cfg.MemoryLimit != "" {
-		if _, err := db.Exec(fmt.Sprintf("SET memory_limit='%s'", cfg.MemoryLimit)); err != nil {
+		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL memory_limit='%s'", cfg.MemoryLimit)); err != nil {
 			return fmt.Errorf("failed to set memory_limit: %w", err)
 		}
 	}
 	// Set thread count
 	if cfg.ThreadCount > 0 {
 		logger.Info().Int("threads", cfg.ThreadCount).Msg("Setting DuckDB thread count")
-		if _, err := db.Exec(fmt.Sprintf("SET threads=%d", cfg.ThreadCount)); err != nil {
+		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL threads=%d", cfg.ThreadCount)); err != nil {
 			return fmt.Errorf("failed to set threads: %w", err)
 		}
 	}
@@ -141,7 +141,7 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	}
 
 	// Preserve insertion order for deterministic results (important for LIMIT queries)
-	if _, err := db.Exec("SET preserve_insertion_order=true"); err != nil {
+	if _, err := db.Exec("SET GLOBAL preserve_insertion_order=true"); err != nil {
 		logger.Warn().Err(err).Msg("Failed to set preserve_insertion_order")
 	}
 
@@ -226,14 +226,14 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		} else if _, err := db.Exec("LOAD cache_httpfs"); err != nil {
 			logger.Warn().Err(err).Msg("Failed to load cache_httpfs extension, continuing without cache")
 		} else {
-			if _, err := db.Exec("SET cache_httpfs_type='in_mem'"); err != nil {
+			if _, err := db.Exec("SET GLOBAL cache_httpfs_type='in_mem'"); err != nil {
 				logger.Warn().Err(err).Msg("Failed to set cache_httpfs_type to in_mem")
 			}
 			// Calculate max blocks from cache size (each block is 512KB)
 			if cfg.S3CacheSize > 0 {
 				maxBlocks := cfg.S3CacheSize / (512 * 1024) // 512KB per block
 				if maxBlocks > 0 {
-					if _, err := db.Exec(fmt.Sprintf("SET cache_httpfs_max_in_mem_cache_block_count=%d", maxBlocks)); err != nil {
+					if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_max_in_mem_cache_block_count=%d", maxBlocks)); err != nil {
 						logger.Warn().Err(err).Int64("max_blocks", maxBlocks).Msg("Failed to set cache_httpfs_max_in_mem_cache_block_count")
 					}
 				} else {
@@ -243,7 +243,7 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 				}
 			}
 			if cfg.S3CacheTTLSeconds > 0 {
-				if _, err := db.Exec(fmt.Sprintf("SET cache_httpfs_in_mem_cache_block_timeout_millisec=%d", cfg.S3CacheTTLSeconds*1000)); err != nil {
+				if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_in_mem_cache_block_timeout_millisec=%d", cfg.S3CacheTTLSeconds*1000)); err != nil {
 					logger.Warn().Err(err).Int("ttl_ms", cfg.S3CacheTTLSeconds*1000).Msg("Failed to set cache_httpfs_in_mem_cache_block_timeout_millisec")
 				}
 			}
