@@ -84,7 +84,7 @@ func (r *Reader) ReadAll() ([]Entry, error) {
 			break
 		}
 		if err != nil {
-			r.logger.Error().Err(err).Msg("Error reading WAL entry")
+			r.logger.Warn().Err(err).Msg("Skipping incomplete WAL entry")
 			r.CorruptedEntries++
 			continue
 		}
