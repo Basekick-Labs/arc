@@ -2,8 +2,13 @@
 
 **Machine**: macOS Darwin 23.6.0
 **Date**: 2026-01-28
+**Last updated**: 2026-01-30
 **Workload**: Web API logs (500 logs/batch, 100 pre-generated batches)
 **Duration**: 60 seconds
+
+### Changelog
+
+- **2026-01-30**: Added Arc WAL-enabled benchmark (4.59M logs/sec, ~6.5% overhead vs WAL-off). Fixed Quickwit query benchmark: per-query `max_hits` (was hardcoded to 10K) and proper `terms` aggregation for Top 10. Quickwit improvements: Count 174ms -> 0.81ms, Top 10 175ms -> 1.11ms, Filter Level 1085ms -> 120ms, Complex Filter 4595ms -> 414ms.
 
 ## Summary
 
@@ -545,60 +550,61 @@ Iterations: 5 per query
 ================================================================================
 
 Query: Count All Logs
-  Latency: 174.35 ms (p50: 174.92 ms, p99: 175.35 ms)
-  Rows: 50168000
+  Latency: 0.81 ms (p50: 0.80 ms, p99: 0.96 ms)
+  Rows: 50020000
 
 Query: Filter by Level (ERROR)
-  Latency: 1084.58 ms (p50: 1083.75 ms, p99: 1089.87 ms)
-  Rows: 2014342
+  Latency: 119.52 ms (p50: 119.65 ms, p99: 120.41 ms)
+  Rows: 1998185
 
 Query: Filter by Service (api)
-  Latency: 898.34 ms (p50: 897.95 ms, p99: 902.10 ms)
-  Rows: 2477189
+  Latency: 105.91 ms (p50: 105.78 ms, p99: 107.34 ms)
+  Rows: 2489116
 
 Query: Full-text Search (timeout)
-  Latency: 3586.29 ms (p50: 3587.22 ms, p99: 3590.01 ms)
-  Rows: 274653
+  Latency: 362.17 ms (p50: 362.18 ms, p99: 362.64 ms)
+  Rows: 291501
 
 Query: Time Range (Last 1 Hour)
-  Latency: 948.24 ms (p50: 948.23 ms, p99: 951.93 ms)
-  Rows: 35034000
+  Latency: 997.36 ms (p50: 997.03 ms, p99: 998.91 ms)
+  Rows: 50020000
 
 Query: Top 10 Services by Count
-  Latency: 175.04 ms (p50: 175.25 ms, p99: 177.08 ms)
-  Rows: 50168000
+  Latency: 1.11 ms (p50: 1.01 ms, p99: 1.90 ms)
+  Rows: 10
 
 Query: Complex Filter (api + ERROR)
-  Latency: 4594.83 ms (p50: 4595.03 ms, p99: 4599.10 ms)
-  Rows: 96865
+  Latency: 413.99 ms (p50: 414.39 ms, p99: 416.54 ms)
+  Rows: 93839
 
 Query: SELECT LIMIT 10K
-  Latency: 173.00 ms (p50: 172.68 ms, p99: 175.74 ms)
-  Rows: 50168000
+  Latency: 156.49 ms (p50: 156.74 ms, p99: 157.40 ms)
+  Rows: 50020000
 
 ================================================================================
 SUMMARY
 ================================================================================
 Query                               |     Avg (ms) |     p99 (ms) |         Rows
 --------------------------------------------------------------------------------
-Count All Logs                      |       174.35 |       175.35 |     50168000
-Filter by Level (ERROR)             |      1084.58 |      1089.87 |      2014342
-Filter by Service (api)             |       898.34 |       902.10 |      2477189
-Full-text Search (timeout)          |      3586.29 |      3590.01 |       274653
-Time Range (Last 1 Hour)            |       948.24 |       951.93 |     35034000
-Top 10 Services by Count            |       175.04 |       177.08 |     50168000
-Complex Filter (api + ERROR)        |      4594.83 |      4599.10 |        96865
-SELECT LIMIT 10K                    |       173.00 |       175.74 |     50168000
+Count All Logs                      |         0.81 |         0.96 |     50020000
+Filter by Level (ERROR)             |       119.52 |       120.41 |      1998185
+Filter by Service (api)             |       105.91 |       107.34 |      2489116
+Full-text Search (timeout)          |       362.17 |       362.64 |       291501
+Time Range (Last 1 Hour)            |       997.36 |       998.91 |     50020000
+Top 10 Services by Count            |         1.11 |         1.90 |           10
+Complex Filter (api + ERROR)        |       413.99 |       416.54 |        93839
+SELECT LIMIT 10K                    |       156.49 |       157.40 |     50020000
 ================================================================================
 ```
 
 **Notes**:
-- Dataset: 50.2M logs (standardized benchmark)
+- Dataset: 50.0M logs (standardized benchmark)
 - Full-text search engine built on Tantivy (Rust)
-- Quickwit returns full result counts (not limited) — row counts reflect total matches, not LIMIT
-- Time Range now returns 35M rows at 948ms (previously 0 rows on 15M dataset — data not in last hour)
-- Complex filters with full-text search remain expensive (4.6s)
-- Count/Top10/SELECT queries all ~174ms — consistent baseline overhead
+- Fixed: per-query `max_hits` (previously hardcoded to 10K) and proper `terms` aggregation for Top 10
+- Count query now 0.81ms (was 174ms with max_hits=10000)
+- Top 10 aggregation now 1.11ms (was 175ms fetching 10K docs instead of aggregating)
+- Row counts reflect `num_hits` (total matches), not returned documents
+- Filter queries 106-120ms, significantly faster than previous incorrect benchmark
 
 ---
 
@@ -944,42 +950,42 @@ SELECT LIMIT 10K                    |        29.10 |        29.53 |        10000
 
 ## Cross-System Query Comparison
 
-**Dataset sizes**: Arc 50.1M | ClickHouse 49.3M | Elasticsearch 50.5M | VictoriaLogs 50.2M | Quickwit 50.2M | Loki 1.4M
+**Dataset sizes**: Arc 50.1M | ClickHouse 49.3M | Elasticsearch 50.5M | VictoriaLogs 50.2M | Quickwit 50.0M | Loki 1.4M
 
-> Note: Loki was tested with a smaller dataset due to silent ingestion rejection (returned 204 but dropped most logs). Quickwit returns full match counts rather than LIMIT-capped rows, so row counts differ from other systems.
+> Note: Loki was tested with a smaller dataset due to silent ingestion rejection (returned 204 but dropped most logs). Quickwit row counts reflect `num_hits` (total matches), not returned documents — actual results are capped by `max_hits`.
 
 ### Raw Latencies (ms)
 
 | Query | Arc JSON | Arc Arrow | ClickHouse | Elasticsearch | VictoriaLogs | Quickwit | Loki |
 |-------|--------:|---------:|----------:|-------------:|------------:|--------:|-----:|
-| Count All | 2.51 | 2.69 | 1.98 | 0.81 | 1.21 | 174.35 | 3840.39 |
-| Filter Level | 8.12 | 7.71 | 122.23 | 17.53 | 2.87 | 1084.58 | 26.11 |
-| Filter Service | 7.66 | 7.52 | 87.78 | 16.13 | 2.51 | 898.34 | 152.54 |
-| Full-text Search | 8.89 | 9.11 | 77.09 | 17.78 | 9.08 | 3586.29 | 2074.04 |
-| Time Range 10K | 29.03 | 24.91 | 83.04 | 70.89 | 9.26 | 948.24 | 1885.80 |
-| Top 10 Services | 18.28 | 18.56 | 54.00 | 1.14 | 157.90 | 175.04 | 3571.84 |
-| Complex Filter | 9.57 | 9.09 | 59.13 | 24.57 | 10.95 | 4594.83 | 11.59 |
-| SELECT 10K | 32.68 | 29.10 | 39.54 | 53.23 | 9.74 | 173.00 | 1869.42 |
+| Count All | 2.51 | 2.69 | 1.98 | 0.81 | 1.21 | 0.81 | 3840.39 |
+| Filter Level | 8.12 | 7.71 | 122.23 | 17.53 | 2.87 | 119.52 | 26.11 |
+| Filter Service | 7.66 | 7.52 | 87.78 | 16.13 | 2.51 | 105.91 | 152.54 |
+| Full-text Search | 8.89 | 9.11 | 77.09 | 17.78 | 9.08 | 362.17 | 2074.04 |
+| Time Range 10K | 29.03 | 24.91 | 83.04 | 70.89 | 9.26 | 997.36 | 1885.80 |
+| Top 10 Services | 18.28 | 18.56 | 54.00 | 1.14 | 157.90 | 1.11 | 3571.84 |
+| Complex Filter | 9.57 | 9.09 | 59.13 | 24.57 | 10.95 | 413.99 | 11.59 |
+| SELECT 10K | 32.68 | 29.10 | 39.54 | 53.23 | 9.74 | 156.49 | 1869.42 |
 
 ### Rankings by Query Type
 
 | Query | 1st | 2nd | 3rd | 4th | 5th | 6th | 7th |
 |-------|-----|-----|-----|-----|-----|------|------|
-| Count All | **ES** 0.8ms | **VLogs** 1.2ms | **CH** 2.0ms | **Arc** 2.5ms | QW 174ms | Loki 3840ms | |
-| Filter Level | **VLogs** 2.9ms | **Arc** 7.7ms | **Arc JSON** 8.1ms | ES 18ms | Loki 26ms | CH 122ms | QW 1085ms |
-| Filter Service | **VLogs** 2.5ms | **Arc** 7.5ms | **Arc JSON** 7.7ms | ES 16ms | CH 88ms | Loki 153ms | QW 898ms |
-| Full-text Search | **Arc JSON** 8.9ms | **VLogs** 9.1ms | **Arc** 9.1ms | ES 18ms | CH 77ms | Loki 2074ms | QW 3586ms |
-| Time Range 10K | **VLogs** 9.3ms | **Arc** 24.9ms | **Arc JSON** 29.0ms | ES 71ms | CH 83ms | QW 948ms | Loki 1886ms |
-| Top 10 Services | **ES** 1.1ms | **Arc** 18.3ms | CH 54ms | VLogs 158ms | QW 175ms | Loki 3572ms | |
-| Complex Filter | **Arc** 9.1ms | **Arc JSON** 9.6ms | **VLogs** 11.0ms | Loki 12ms | ES 25ms | CH 59ms | QW 4595ms |
-| SELECT 10K | **VLogs** 9.7ms | **Arc** 29.1ms | **Arc JSON** 32.7ms | CH 40ms | ES 53ms | QW 173ms | Loki 1869ms |
+| Count All | **ES** 0.8ms | **QW** 0.8ms | **VLogs** 1.2ms | **CH** 2.0ms | **Arc** 2.5ms | Loki 3840ms | |
+| Filter Level | **VLogs** 2.9ms | **Arc** 7.7ms | **Arc JSON** 8.1ms | ES 18ms | Loki 26ms | QW 120ms | CH 122ms |
+| Filter Service | **VLogs** 2.5ms | **Arc** 7.5ms | **Arc JSON** 7.7ms | ES 16ms | QW 106ms | Loki 153ms | CH 88ms |
+| Full-text Search | **Arc JSON** 8.9ms | **VLogs** 9.1ms | **Arc** 9.1ms | ES 18ms | CH 77ms | QW 362ms | Loki 2074ms |
+| Time Range 10K | **VLogs** 9.3ms | **Arc** 24.9ms | **Arc JSON** 29.0ms | ES 71ms | CH 83ms | QW 997ms | Loki 1886ms |
+| Top 10 Services | **QW** 1.1ms | **ES** 1.1ms | **Arc** 18.3ms | CH 54ms | VLogs 158ms | Loki 3572ms | |
+| Complex Filter | **Arc** 9.1ms | **Arc JSON** 9.6ms | **VLogs** 11.0ms | Loki 12ms | ES 25ms | CH 59ms | QW 414ms |
+| SELECT 10K | **VLogs** 9.7ms | **Arc** 29.1ms | **Arc JSON** 32.7ms | CH 40ms | ES 53ms | QW 156ms | Loki 1869ms |
 
 ### Key Insights
 
 1. **Arc is consistently top-3** across all query types on 50M logs, and fastest on Complex Filter (9ms) and Full-text Search (8.9ms)
 2. **VictoriaLogs excels at filters and retrieval** — fastest on Filter Level, Filter Service, Time Range, and SELECT 10K
-3. **Elasticsearch** is fastest on Count (0.8ms) and Top 10 aggregation (1.1ms) on 50M logs — inverted index optimized for metadata queries
+3. **Elasticsearch and Quickwit** tie for fastest Count (0.8ms); Quickwit also wins Top 10 aggregation (1.1ms) with proper `terms` aggregation
 4. **ClickHouse count is fast (2ms)** but filter queries are slower (59-122ms) at 50M scale — high p99 variance suggests compaction overhead
 5. **Arc Arrow vs JSON**: Arrow is 5-14% faster on data-heavy queries (Time Range, SELECT 10K) due to eliminated JSON serialization
-6. **Quickwit** now tested at 50M scale — latencies similar to 15M run, confirming ~174ms baseline overhead and 0.9-4.6s for filter/search queries
+6. **Quickwit** re-benchmarked with correct per-query `max_hits` and proper aggregations — dramatically faster than previous incorrect benchmark (Count: 0.8ms vs 174ms, Top 10: 1.1ms vs 175ms). Filter queries 106-120ms, full-text search 362ms.
 7. **Loki** only stored 1.4M of 50M ingested logs due to silent rejection — results not comparable at scale

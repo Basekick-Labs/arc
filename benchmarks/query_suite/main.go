@@ -79,7 +79,9 @@ type BenchmarkQuery struct {
 	ElasticDSL     map[string]interface{}
 	VictoriaLogsQL string
 	LokiQL         string
-	QuickwitQuery  string
+	QuickwitQuery   string
+	QuickwitMaxHits int                    // 0 = count-only (no hits returned)
+	QuickwitAggs    map[string]interface{} // optional aggregations
 }
 
 type QueryResult struct {
@@ -531,8 +533,10 @@ func runLokiQuery(cfg *Config, logql string, client *http.Client) (latencyMs flo
 }
 
 // Quickwit query executor
-func runQuickwitQuery(cfg *Config, query string, client *http.Client) (latencyMs float64, rows int64, err error) {
+func runQuickwitQuery(cfg *Config, q BenchmarkQuery, client *http.Client) (latencyMs float64, rows int64, err error) {
 	queryURL := fmt.Sprintf("http://%s:%d/api/v1/%s/search", cfg.Host, cfg.Port, cfg.Index)
+
+	query := q.QuickwitQuery
 
 	// Replace relative time placeholders with actual timestamps
 	if strings.Contains(query, "{{NOW}}") || strings.Contains(query, "{{1H_AGO}}") {
@@ -544,7 +548,10 @@ func runQuickwitQuery(cfg *Config, query string, client *http.Client) (latencyMs
 
 	reqBody := map[string]interface{}{
 		"query":    query,
-		"max_hits": 10000,
+		"max_hits": q.QuickwitMaxHits,
+	}
+	if q.QuickwitAggs != nil {
+		reqBody["aggs"] = q.QuickwitAggs
 	}
 	body, _ := json.Marshal(reqBody)
 
@@ -577,11 +584,24 @@ func runQuickwitQuery(cfg *Config, query string, client *http.Client) (latencyMs
 	// Parse Quickwit response
 	var result map[string]interface{}
 	if err := json.Unmarshal(respBody, &result); err == nil {
-		if numHits, ok := result["num_hits"].(float64); ok {
-			rows = int64(numHits)
+		// Check for aggregation results first
+		if aggs, ok := result["aggregations"].(map[string]interface{}); ok {
+			for _, agg := range aggs {
+				if aggMap, ok := agg.(map[string]interface{}); ok {
+					if buckets, ok := aggMap["buckets"].([]interface{}); ok {
+						rows = int64(len(buckets))
+					}
+				}
+			}
 		}
-		if hits, ok := result["hits"].([]interface{}); ok && rows == 0 {
-			rows = int64(len(hits))
+		// Fall back to hit count
+		if rows == 0 {
+			if numHits, ok := result["num_hits"].(float64); ok {
+				rows = int64(numHits)
+			}
+			if hits, ok := result["hits"].([]interface{}); ok && rows == 0 {
+				rows = int64(len(hits))
+			}
 		}
 	}
 
@@ -603,7 +623,7 @@ func runBenchmarkQuery(cfg *Config, q BenchmarkQuery, client *http.Client) (late
 	case TargetLoki:
 		return runLokiQuery(cfg, q.LokiQL, client)
 	case TargetQuickwit:
-		return runQuickwitQuery(cfg, q.QuickwitQuery, client)
+		return runQuickwitQuery(cfg, q, client)
 	default:
 		return 0, 0, fmt.Errorf("unknown target: %s", cfg.Target)
 	}
@@ -647,9 +667,10 @@ func main() {
 				"track_total_hits": true,
 				"size":             0,
 			},
-			VictoriaLogsQL: "* | stats count() as total",
-			LokiQL:         `count_over_time({service=~".+"} [24h])`,
-			QuickwitQuery:  "*",
+			VictoriaLogsQL:  "* | stats count() as total",
+			LokiQL:          `count_over_time({service=~".+"} [24h])`,
+			QuickwitQuery:   "*",
+			QuickwitMaxHits: 0,
 		},
 		{
 			Name:          "Filter by Level (ERROR)",
@@ -659,9 +680,10 @@ func main() {
 				"query": map[string]interface{}{"term": map[string]interface{}{"level.keyword": "ERROR"}},
 				"size":  1000,
 			},
-			VictoriaLogsQL: "level:ERROR | limit 1000",
-			LokiQL:         `{level="ERROR"}`,
-			QuickwitQuery:  "level:ERROR",
+			VictoriaLogsQL:  "level:ERROR | limit 1000",
+			LokiQL:          `{level="ERROR"}`,
+			QuickwitQuery:   "level:ERROR",
+			QuickwitMaxHits: 1000,
 		},
 		{
 			Name:          "Filter by Service (api)",
@@ -671,9 +693,10 @@ func main() {
 				"query": map[string]interface{}{"term": map[string]interface{}{"service.keyword": "api"}},
 				"size":  1000,
 			},
-			VictoriaLogsQL: "service:api | limit 1000",
-			LokiQL:         `{service="api"}`,
-			QuickwitQuery:  "service:api",
+			VictoriaLogsQL:  "service:api | limit 1000",
+			LokiQL:          `{service="api"}`,
+			QuickwitQuery:   "service:api",
+			QuickwitMaxHits: 1000,
 		},
 		{
 			Name:          "Full-text Search (timeout)",
@@ -683,9 +706,10 @@ func main() {
 				"query": map[string]interface{}{"match": map[string]interface{}{"message": "timeout"}},
 				"size":  1000,
 			},
-			VictoriaLogsQL: "timeout | limit 1000",
-			LokiQL:         `{service=~".+"} |= "timeout"`,
-			QuickwitQuery:  "message:timeout",
+			VictoriaLogsQL:  "timeout | limit 1000",
+			LokiQL:          `{service=~".+"} |= "timeout"`,
+			QuickwitQuery:   "message:timeout",
+			QuickwitMaxHits: 1000,
 		},
 		{
 			Name:          "Time Range (Last 1 Hour)",
@@ -699,9 +723,10 @@ func main() {
 				},
 				"size": 10000,
 			},
-			VictoriaLogsQL: "_time:1h | limit 10000",
-			LokiQL:         `{service=~".+"}`,
-			QuickwitQuery:  "timestamp:[{{1H_AGO}} TO {{NOW}}]",
+			VictoriaLogsQL:  "_time:1h | limit 10000",
+			LokiQL:          `{service=~".+"}`,
+			QuickwitQuery:   "timestamp:[{{1H_AGO}} TO {{NOW}}]",
+			QuickwitMaxHits: 10000,
 		},
 		{
 			Name:          "Top 10 Services by Count",
@@ -718,9 +743,18 @@ func main() {
 					},
 				},
 			},
-			VictoriaLogsQL: "* | stats by(service) count() as cnt | sort by(cnt) desc | limit 10",
-			LokiQL:         `sum by(service) (count_over_time({service=~".+"} [24h]))`,
-			QuickwitQuery:  "*",
+			VictoriaLogsQL:  "* | stats by(service) count() as cnt | sort by(cnt) desc | limit 10",
+			LokiQL:          `sum by(service) (count_over_time({service=~".+"} [24h]))`,
+			QuickwitQuery:   "*",
+			QuickwitMaxHits: 0,
+			QuickwitAggs: map[string]interface{}{
+				"top_services": map[string]interface{}{
+					"terms": map[string]interface{}{
+						"field": "service",
+						"size":  10,
+					},
+				},
+			},
 		},
 		{
 			Name:          "Complex Filter (api + ERROR)",
@@ -737,9 +771,10 @@ func main() {
 				},
 				"size": 1000,
 			},
-			VictoriaLogsQL: "service:api AND level:ERROR | limit 1000",
-			LokiQL:         `{service="api", level="ERROR"}`,
-			QuickwitQuery:  "service:api AND level:ERROR",
+			VictoriaLogsQL:  "service:api AND level:ERROR | limit 1000",
+			LokiQL:          `{service="api", level="ERROR"}`,
+			QuickwitQuery:   "service:api AND level:ERROR",
+			QuickwitMaxHits: 1000,
 		},
 		{
 			Name:          "SELECT LIMIT 10K",
@@ -749,9 +784,10 @@ func main() {
 				"query": map[string]interface{}{"match_all": map[string]interface{}{}},
 				"size":  10000,
 			},
-			VictoriaLogsQL: "* | limit 10000",
-			LokiQL:         `{service=~".+"}`,
-			QuickwitQuery:  "*",
+			VictoriaLogsQL:  "* | limit 10000",
+			LokiQL:          `{service=~".+"}`,
+			QuickwitQuery:   "*",
+			QuickwitMaxHits: 10000,
 		},
 	}
 
