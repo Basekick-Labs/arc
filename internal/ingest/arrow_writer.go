@@ -615,7 +615,8 @@ type flushTask struct {
 // WALWriter interface for Write-Ahead Log support
 type WALWriter interface {
 	Append(records []map[string]interface{}) error
-	AppendRaw(payload []byte) error // Zero-copy: write raw msgpack bytes directly
+	AppendRaw(payload []byte) error                        // Zero-copy: write raw msgpack bytes directly
+	AppendRawWithMeta(database string, payload []byte) error // Zero-copy with database metadata envelope
 	Stats() map[string]interface{}
 	Close() error
 }
@@ -1024,18 +1025,33 @@ func (b *ArrowBuffer) WriteColumnarDirect(ctx context.Context, database, measure
 	return b.writeColumnar(ctx, database, record)
 }
 
+// WriteColumnarDirectNoWAL writes columnar data without writing to WAL.
+// Used during WAL recovery to avoid re-writing recovered data back to WAL.
+func (b *ArrowBuffer) WriteColumnarDirectNoWAL(ctx context.Context, database, measurement string, columns map[string][]interface{}) error {
+	record := &models.ColumnarRecord{
+		Measurement: measurement,
+		Columns:     columns,
+		Columnar:    true,
+	}
+	return b.writeColumnarInternal(ctx, database, record, true)
+}
+
 // writeColumnar writes a columnar record to the buffer
 func (b *ArrowBuffer) writeColumnar(ctx context.Context, database string, record *models.ColumnarRecord) error {
+	return b.writeColumnarInternal(ctx, database, record, false)
+}
+
+func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string, record *models.ColumnarRecord, skipWAL bool) error {
 	// Create buffer key: database/measurement
 	// OPTIMIZATION: String concatenation is faster than fmt.Sprintf (no reflection)
 	bufferKey := database + "/" + record.Measurement
 
 	// WAL: Write to WAL before buffering (if enabled)
-	// This ensures data survives crashes even if not yet flushed to Parquet
-	if b.wal != nil {
+	// Skip WAL during recovery to avoid re-writing recovered data
+	if b.wal != nil && !skipWAL {
 		// ZERO-COPY PATH: Use raw msgpack bytes if available (avoids re-serialization)
 		if len(record.RawPayload) > 0 {
-			if err := b.wal.AppendRaw(record.RawPayload); err != nil {
+			if err := b.wal.AppendRawWithMeta(database, record.RawPayload); err != nil {
 				// Log error but don't fail the write - WAL is for durability, not correctness
 				b.logger.Error().Err(err).
 					Str("database", database).

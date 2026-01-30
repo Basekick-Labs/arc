@@ -313,13 +313,32 @@ func main() {
 	}
 	shutdownCoordinator.Register("arrow-buffer", arrowBuffer, shutdown.PriorityBuffer)
 
+	// After ArrowBuffer flushes (priority 30) but before WAL closes (priority 40),
+	// purge WAL files since all data has been flushed to storage.
+	// This prevents recovery from replaying already-persisted data on next startup.
+	if walWriter != nil {
+		shutdownCoordinator.RegisterHook("wal-purge", func(ctx context.Context) error {
+			deleted, err := walWriter.PurgeAll()
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to purge WAL files on shutdown")
+				return err
+			}
+			if deleted > 0 {
+				log.Info().Int("deleted", deleted).Msg("Purged WAL files after clean buffer flush")
+			}
+			return nil
+		}, 35) // Between PriorityBuffer(30) and PriorityWAL(40)
+	}
+
 	// Run WAL recovery NOW that ArrowBuffer is ready
 	if walRecovery != nil {
 		// Create shared recovery callback to avoid code duplication
 		recoveryCallback := createWALRecoveryCallback(arrowBuffer, logger.Get("wal-recovery"))
+		columnarCallback := createColumnarRecoveryCallback(arrowBuffer, logger.Get("wal-recovery"))
 
 		recoveryStats, err := walRecovery.RecoverWithOptions(context.Background(), recoveryCallback, &wal.RecoveryOptions{
-			BatchSize: cfg.WAL.RecoveryBatchSize,
+			BatchSize:        cfg.WAL.RecoveryBatchSize,
+			ColumnarCallback: columnarCallback,
 		})
 		if err != nil {
 			log.Error().Err(err).Msg("WAL recovery failed")
@@ -361,8 +380,9 @@ func main() {
 						activeFile = walWriter.CurrentFile()
 					}
 					stats, err := recovery.RecoverWithOptions(context.Background(), recoveryCallback, &wal.RecoveryOptions{
-						SkipActiveFile: activeFile,
-						BatchSize:      cfg.WAL.RecoveryBatchSize,
+						SkipActiveFile:   activeFile,
+						BatchSize:        cfg.WAL.RecoveryBatchSize,
+						ColumnarCallback: columnarCallback,
 					})
 					if err != nil {
 						walLogger.Error().Err(err).Msg("Periodic WAL recovery failed")
@@ -1116,7 +1136,11 @@ func createWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolo
 		}
 		for _, rec := range records {
 			// Extract measurement from recovered record
-			measurement, _ := rec["measurement"].(string)
+			// WAL row format uses underscore-prefixed keys: _measurement, _database
+			measurement, _ := rec["_measurement"].(string)
+			if measurement == "" {
+				measurement, _ = rec["measurement"].(string)
+			}
 			if measurement == "" {
 				measurement, _ = rec["m"].(string)
 			}
@@ -1124,7 +1148,10 @@ func createWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolo
 				continue // Skip records without measurement
 			}
 
-			database, _ := rec["database"].(string)
+			database, _ := rec["_database"].(string)
+			if database == "" {
+				database, _ = rec["database"].(string)
+			}
 			if database == "" {
 				database = "default"
 			}
@@ -1132,18 +1159,39 @@ func createWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolo
 			// Build columnar record from recovered data
 			columns := make(map[string][]interface{})
 			for key, value := range rec {
-				if key == "measurement" || key == "m" || key == "database" {
+				if key == "_measurement" || key == "measurement" || key == "m" || key == "_database" || key == "database" {
 					continue
 				}
 				columns[key] = []interface{}{value}
 			}
 
-			if err := arrowBuffer.WriteColumnarDirect(ctx, database, measurement, columns); err != nil {
+			if err := arrowBuffer.WriteColumnarDirectNoWAL(ctx, database, measurement, columns); err != nil {
 				walLogger.Error().Err(err).Str("measurement", measurement).Msg("Failed to replay WAL record")
 				return err
 			}
 		}
 		walLogger.Info().Int("records", len(records)).Msg("WAL recovery: replayed records")
+		return nil
+	}
+}
+
+// createColumnarRecoveryCallback creates a WAL recovery callback for columnar entries
+// written via the zero-copy AppendRaw path.
+func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolog.Logger) wal.ColumnarRecoveryCallback {
+	return func(ctx context.Context, database, measurement string, columns map[string][]interface{}) error {
+		if database == "" {
+			database = "default"
+		}
+		if err := arrowBuffer.WriteColumnarDirectNoWAL(ctx, database, measurement, columns); err != nil {
+			walLogger.Error().Err(err).Str("database", database).Str("measurement", measurement).Msg("Failed to replay columnar WAL entry")
+			return err
+		}
+		rowCount := 0
+		for _, col := range columns {
+			rowCount = len(col)
+			break
+		}
+		walLogger.Info().Str("database", database).Str("measurement", measurement).Int("rows", rowCount).Msg("WAL recovery: replayed columnar entry")
 		return nil
 	}
 }

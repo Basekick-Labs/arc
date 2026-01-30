@@ -10,8 +10,12 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// RecoveryCallback is called for each batch of records during recovery
+// RecoveryCallback is called for each batch of records during recovery (row format)
 type RecoveryCallback func(ctx context.Context, records []map[string]interface{}) error
+
+// ColumnarRecoveryCallback is called for columnar WAL entries during recovery
+// database may be empty if the WAL entry predates the envelope format (defaults to "default")
+type ColumnarRecoveryCallback func(ctx context.Context, database, measurement string, columns map[string][]interface{}) error
 
 // RecoveryStats holds statistics about WAL recovery
 type RecoveryStats struct {
@@ -33,6 +37,9 @@ type RecoveryOptions struct {
 	// This provides backpressure during mass recovery after prolonged outages
 	// 0 means no limit (all records in an entry replayed at once)
 	BatchSize int
+
+	// ColumnarCallback handles columnar WAL entries from the zero-copy write path
+	ColumnarCallback ColumnarRecoveryCallback
 }
 
 // Recovery manages WAL recovery operations
@@ -112,34 +119,50 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		fileRecoveredEntries := 0
 
 		for _, entry := range entries {
-			// Apply rate limiting via batch size if configured
-			if opts.BatchSize > 0 && len(entry.Records) > opts.BatchSize {
-				// Split large entries into smaller batches for backpressure
-				for i := 0; i < len(entry.Records); i += opts.BatchSize {
-					end := i + opts.BatchSize
-					if end > len(entry.Records) {
-						end = len(entry.Records)
+			// Dispatch based on entry format
+			if entry.ColumnarData != nil && opts.ColumnarCallback != nil {
+				// Columnar entry from zero-copy AppendRaw path
+				if err := opts.ColumnarCallback(ctx, entry.ColumnarData.Database, entry.ColumnarData.Measurement, entry.ColumnarData.Columns); err != nil {
+					r.logger.Error().Err(err).Msg("Failed to replay columnar WAL entry")
+					allEntriesSucceeded = false
+					break
+				}
+				fileRecoveredBatches++
+				// Count rows from first column length
+				for _, col := range entry.ColumnarData.Columns {
+					fileRecoveredEntries += len(col)
+					break
+				}
+			} else if entry.Records != nil {
+				// Row-format entry from Append path
+				// Apply rate limiting via batch size if configured
+				if opts.BatchSize > 0 && len(entry.Records) > opts.BatchSize {
+					for i := 0; i < len(entry.Records); i += opts.BatchSize {
+						end := i + opts.BatchSize
+						if end > len(entry.Records) {
+							end = len(entry.Records)
+						}
+						batch := entry.Records[i:end]
+						if err := callback(ctx, batch); err != nil {
+							r.logger.Error().Err(err).Msg("Failed to replay WAL entry batch")
+							allEntriesSucceeded = false
+							break
+						}
+						fileRecoveredBatches++
+						fileRecoveredEntries += len(batch)
 					}
-					batch := entry.Records[i:end]
-					if err := callback(ctx, batch); err != nil {
-						r.logger.Error().Err(err).Msg("Failed to replay WAL entry batch")
+					if !allEntriesSucceeded {
+						break
+					}
+				} else {
+					if err := callback(ctx, entry.Records); err != nil {
+						r.logger.Error().Err(err).Msg("Failed to replay WAL entry")
 						allEntriesSucceeded = false
 						break
 					}
 					fileRecoveredBatches++
-					fileRecoveredEntries += len(batch)
+					fileRecoveredEntries += len(entry.Records)
 				}
-				if !allEntriesSucceeded {
-					break
-				}
-			} else {
-				if err := callback(ctx, entry.Records); err != nil {
-					r.logger.Error().Err(err).Msg("Failed to replay WAL entry")
-					allEntriesSucceeded = false
-					break // Stop processing this file - will retry on next recovery
-				}
-				fileRecoveredBatches++
-				fileRecoveredEntries += len(entry.Records)
 			}
 		}
 
