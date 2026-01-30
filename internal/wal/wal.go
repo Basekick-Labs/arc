@@ -32,6 +32,11 @@ const (
 	// This limit prevents integer overflow during buffer allocation (CWE-190) and
 	// aligns with the replication protocol limit (100MB).
 	MaxWALPayloadSize = 100 * 1024 * 1024 // 100MB
+
+	// WALEnvelopeMarker is the first byte of an enveloped WAL payload.
+	// Enveloped format: [0x01][2-byte db name length][db name][original msgpack]
+	// Since msgpack maps/arrays always start with bytes >= 0x80, 0x01 is unambiguous.
+	WALEnvelopeMarker = 0x01
 )
 
 // SyncMode defines how WAL syncs to disk
@@ -266,7 +271,7 @@ func (w *Writer) rotate() error {
 	}
 
 	// Generate new filename
-	timestamp := time.Now().Format("20060102_150405")
+	timestamp := time.Now().UTC().Format("20060102_150405")
 	filename := fmt.Sprintf("arc-%s.wal", timestamp)
 	w.currentPath = filepath.Join(w.config.WALDir, filename)
 
@@ -308,6 +313,69 @@ func (w *Writer) Append(records []map[string]interface{}) error {
 	}
 
 	return w.AppendRaw(payload)
+}
+
+// AppendRawWithMeta writes raw msgpack bytes with database metadata envelope.
+// Format: [0x01 marker][2-byte db name length][db name][original msgpack]
+// This preserves the database name for correct recovery routing.
+//
+// Unlike calling AppendRaw with a pre-built envelope, this method builds the
+// WAL entry in a single allocation to avoid copying the payload twice.
+func (w *Writer) AppendRawWithMeta(database string, payload []byte) error {
+	dbBytes := []byte(database)
+	envelopeHeaderLen := 1 + 2 + len(dbBytes) // marker + dbLen + dbName
+	totalPayloadLen := envelopeHeaderLen + len(payload)
+
+	if totalPayloadLen > MaxWALPayloadSize {
+		return fmt.Errorf("%w: size %d exceeds limit %d", ErrPayloadTooLarge, totalPayloadLen, MaxWALPayloadSize)
+	}
+
+	// Compute CRC32 over the logical payload (envelope header + msgpack) without copying
+	crc := crc32.NewIEEE()
+	var envHeader [1 + 2 + 255]byte // envelope header (db name max 255 bytes)
+	envHeader[0] = WALEnvelopeMarker
+	binary.BigEndian.PutUint16(envHeader[1:3], uint16(len(dbBytes)))
+	copy(envHeader[3:], dbBytes)
+	crc.Write(envHeader[:envelopeHeaderLen])
+	crc.Write(payload)
+	checksum := crc.Sum32()
+
+	timestampUS := uint64(time.Now().UnixMicro())
+
+	// Replication hook
+	if w.replicationHook != nil {
+		w.mu.Lock()
+		w.sequence++
+		seq := w.sequence
+		hook := w.replicationHook
+		w.mu.Unlock()
+
+		// Build envelope for replication (unavoidable copy for hook consumers)
+		repPayload := make([]byte, totalPayloadLen)
+		copy(repPayload, envHeader[:envelopeHeaderLen])
+		copy(repPayload[envelopeHeaderLen:], payload)
+		hook(&ReplicationEntry{
+			Sequence:    seq,
+			TimestampUS: timestampUS,
+			Payload:     repPayload,
+		})
+	}
+
+	// Build complete WAL entry in one allocation: header + envelope header + payload
+	entryData := make([]byte, WALEntryHeaderSize+totalPayloadLen)
+	binary.BigEndian.PutUint32(entryData[0:4], uint32(totalPayloadLen))
+	binary.BigEndian.PutUint64(entryData[4:12], timestampUS)
+	binary.BigEndian.PutUint32(entryData[12:16], checksum)
+	copy(entryData[WALEntryHeaderSize:], envHeader[:envelopeHeaderLen])
+	copy(entryData[WALEntryHeaderSize+envelopeHeaderLen:], payload)
+
+	select {
+	case w.entryChan <- walEntry{data: entryData}:
+		return nil
+	default:
+		atomic.AddInt64(&w.DroppedEntries, 1)
+		return nil
+	}
 }
 
 // AppendRaw writes raw (already serialized) msgpack bytes to the WAL asynchronously
@@ -398,6 +466,31 @@ func (w *Writer) Close() error {
 		return err
 	}
 	return nil
+}
+
+// PurgeAll deletes all WAL files in the directory.
+// Call this after a clean shutdown where all data has been flushed to storage,
+// so that recovery on next startup doesn't replay already-persisted data.
+func (w *Writer) PurgeAll() (int, error) {
+	pattern := filepath.Join(w.config.WALDir, "*.wal")
+	files, err := filepath.Glob(pattern)
+	if err != nil {
+		return 0, err
+	}
+
+	deleted := 0
+	for _, f := range files {
+		if err := os.Remove(f); err != nil {
+			w.logger.Error().Err(err).Str("file", f).Msg("Failed to purge WAL file")
+		} else {
+			deleted++
+		}
+	}
+
+	if deleted > 0 {
+		w.logger.Info().Int("deleted", deleted).Msg("Purged WAL files after clean shutdown")
+	}
+	return deleted, nil
 }
 
 // Stats returns WAL statistics

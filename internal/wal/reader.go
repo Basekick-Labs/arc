@@ -33,8 +33,16 @@ func NewReader(filePath string, logger zerolog.Logger) *Reader {
 
 // Entry represents a single WAL entry
 type Entry struct {
-	TimestampUS uint64                   // Microseconds since epoch
-	Records     []map[string]interface{} // Deserialized records
+	TimestampUS  uint64                   // Microseconds since epoch
+	Records      []map[string]interface{} // Row format (from Append path)
+	ColumnarData *ColumnarEntry           // Columnar format (from AppendRaw path)
+}
+
+// ColumnarEntry represents a columnar WAL entry written via the zero-copy path
+type ColumnarEntry struct {
+	Database    string // From envelope metadata (empty = "default")
+	Measurement string
+	Columns     map[string][]interface{}
 }
 
 // ReadAll reads all entries from the WAL file
@@ -126,14 +134,69 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 		return nil, fmt.Errorf("checksum mismatch: expected %d, got %d", expectedChecksum, actualChecksum)
 	}
 
-	// Deserialize records
-	var records []map[string]interface{}
-	if err := msgpack.Unmarshal(payload, &records); err != nil {
-		return nil, fmt.Errorf("failed to deserialize records: %w", err)
+	// Check for envelope format: [0x01 marker][2-byte dbLen][dbName][msgpack]
+	var database string
+	msgpackData := payload
+	if len(payload) > 3 && payload[0] == WALEnvelopeMarker {
+		dbLen := binary.BigEndian.Uint16(payload[1:3])
+		if int(3+dbLen) <= len(payload) {
+			database = string(payload[3 : 3+dbLen])
+			msgpackData = payload[3+dbLen:]
+		}
 	}
 
-	return &Entry{
-		TimestampUS: timestampUS,
-		Records:     records,
-	}, nil
+	// Try row format first (array of maps from Append path)
+	var records []map[string]interface{}
+	if err := msgpack.Unmarshal(msgpackData, &records); err == nil {
+		return &Entry{
+			TimestampUS: timestampUS,
+			Records:     records,
+		}, nil
+	}
+
+	// Try columnar format (map with m + columns from AppendRaw path)
+	var rawMap map[string]interface{}
+	if err := msgpack.Unmarshal(msgpackData, &rawMap); err == nil {
+		if colEntry := parseColumnarEntry(rawMap); colEntry != nil {
+			colEntry.Database = database
+			return &Entry{
+				TimestampUS:  timestampUS,
+				ColumnarData: colEntry,
+			}, nil
+		}
+	}
+
+	return nil, fmt.Errorf("failed to deserialize: unrecognized WAL entry format")
+}
+
+// parseColumnarEntry extracts measurement and columns from a raw msgpack map
+func parseColumnarEntry(rawMap map[string]interface{}) *ColumnarEntry {
+	m, ok := rawMap["m"].(string)
+	if !ok {
+		return nil
+	}
+
+	colsRaw, ok := rawMap["columns"]
+	if !ok {
+		return nil
+	}
+
+	colsMap, ok := colsRaw.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	columns := make(map[string][]interface{}, len(colsMap))
+	for k, v := range colsMap {
+		arr, ok := v.([]interface{})
+		if !ok {
+			continue
+		}
+		columns[k] = arr
+	}
+
+	return &ColumnarEntry{
+		Measurement: m,
+		Columns:     columns,
+	}
 }
