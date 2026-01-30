@@ -9,22 +9,23 @@
 
 | System | Throughput (logs/sec) | p50 (ms) | p95 (ms) | p99 (ms) | p999 (ms) | Errors |
 |--------|----------------------:|----------|----------|----------|-----------|--------|
-| **Arc** | **4,905,141** | 0.92 | 2.94 | 5.87 | 14.59 | 0 |
+| **Arc (WAL off)** | **4,905,141** | 0.92 | 2.94 | 5.87 | 14.59 | 0 |
+| **Arc (WAL on)** | **4,587,906** | 1.00 | 3.04 | 6.27 | 15.42 | 0 |
 | VictoriaLogs | 2,262,593 | 0.86 | 16.34 | 22.90 | 37.10 | 0 |
 | Loki | 1,135,568 | 4.38 | 8.91 | 25.36 | 31.43 | 0 |
 | ClickHouse | 400,851 | 9.15 | 28.85 | 58.96 | 1084.17 | 0 |
 | Quickwit | 251,933 | 4.06 | 93.49 | 122.77 | 265.55 | 0 |
 | Elasticsearch | 101,087 | 37.93 | 78.88 | 807.50 | 2288.22 | 0 |
 
-### Arc Performance Comparison
+### Arc Performance Comparison (WAL on)
 
 | vs System | Arc is X faster |
 |-----------|-----------------|
-| VictoriaLogs | **2.2x** |
-| Loki | **4.3x** |
-| ClickHouse | **12.2x** |
-| Quickwit | **19.5x** |
-| Elasticsearch | **48.5x** |
+| VictoriaLogs | **2.0x** |
+| Loki | **4.0x** |
+| ClickHouse | **11.4x** |
+| Quickwit | **18.2x** |
+| Elasticsearch | **45.4x** |
 
 ## Detailed Results
 
@@ -82,6 +83,64 @@ Latency percentiles:
 - WAL disabled
 - Buffer size reduced from 5M to 2.5M (improved throughput)
 - 12 workers
+
+---
+
+### Arc (WAL enabled)
+
+```
+================================================================================
+LOG INGESTION BENCHMARK - ARC (No Compression)
+================================================================================
+Target: http://localhost:8000/api/v1/write/msgpack
+Duration: 60s
+Batch size: 500 logs
+Workers: 12
+Pre-generate: 100 batches
+Index: logs
+================================================================================
+
+Pre-generating 100 batches of 500 logs each...
+  Progress: 100/100
+Generated 100 batches in 0.1s
+  Avg batch size: 104.1 KB (uncompressed)
+
+Starting test...
+[   5.0s] RPS:    4837400 | Total:     24187000 | Errors:      0
+[  10.0s] RPS:    4852400 | Total:     48449000 | Errors:      0
+[  15.0s] RPS:    4650400 | Total:     71701000 | Errors:      0
+[  20.0s] RPS:    4763700 | Total:     95519500 | Errors:      0
+[  25.0s] RPS:    4710100 | Total:    119070000 | Errors:      0
+[  30.0s] RPS:    4397400 | Total:    141057000 | Errors:      0
+[  35.0s] RPS:    4487900 | Total:    163496500 | Errors:      0
+[  40.0s] RPS:    4485600 | Total:    185924500 | Errors:      0
+[  45.0s] RPS:    4565700 | Total:    208753000 | Errors:      0
+[  50.0s] RPS:    4537800 | Total:    231442000 | Errors:      0
+[  55.0s] RPS:    4389400 | Total:    253389000 | Errors:      0
+
+================================================================================
+RESULTS
+================================================================================
+Duration:        60.0s
+Total sent:      275279000 logs
+Total errors:    0
+Success rate:    100.00%
+
+THROUGHPUT:   4587906 logs/sec
+
+Latency percentiles:
+  p50:  1.00 ms
+  p95:  3.04 ms
+  p99:  6.27 ms
+  p999: 15.42 ms
+================================================================================
+```
+
+**Notes**:
+- WAL enabled (fdatasync mode)
+- Buffer size 2.5M, 12 workers
+- ~6.5% slower than WAL-disabled (4.59M vs 4.91M logs/sec)
+- Latency slightly higher across all percentiles
 
 ---
 
