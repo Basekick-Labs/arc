@@ -29,7 +29,7 @@ format = "console"  # json or console
 # max_connections = 28    # Default: 2x CPU cores
 # memory_limit = "8GB"    # Default: ~50% system memory
 # thread_count = 14       # Default: CPU cores
-enable_wal = false
+enable_wal = true
 
 # -----------------------------------------------------------------------------
 # Storage
@@ -50,8 +50,8 @@ s3_path_style = true        # True for MinIO, false for AWS
 # Ingestion
 # -----------------------------------------------------------------------------
 [ingest]
-max_buffer_size = 5000000   # Records before flush (default: 50000)
-max_buffer_age_ms = 5000    # Max buffer age before flush
+max_buffer_size = 2500000   # Records before flush (default: 50000)
+max_buffer_age_ms = 500    # Max buffer age before flush
 
 # Sort keys for compression/query performance: "measurement:col1,col2"
 # Time column is always appended automatically
@@ -128,14 +128,14 @@ enabled = true
 # -----------------------------------------------------------------------------
 # Hot tier (local) -> Cold tier (S3/Azure) based on data age
 [tiered_storage]
-enabled = true
+enabled = false
 migration_schedule = "0 2 * * *"
 migration_max_concurrent = 4
 migration_batch_size = 100
 default_hot_max_age_days = 0
 
 [tiered_storage.cold]
-enabled = true
+enabled = false
 backend = "s3"              # "s3" or "azure"
 
 # S3/MinIO
@@ -155,3 +155,6 @@ azure_use_managed_identity = false
 azure_access_tier = "Archive"
 
 retrieval_mode = "standard"  # standard, expedited, bulk
+
+[wal]
+enabled = false
