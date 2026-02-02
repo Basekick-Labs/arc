@@ -468,3 +468,45 @@ func (n *Node) UpdateNodeState(nodeID, newState string, timeout time.Duration) e
 
 	return n.Apply(cmd, timeout)
 }
+
+// PromoteWriter promotes a writer node to primary via Raft consensus.
+func (n *Node) PromoteWriter(nodeID, oldPrimaryID string, timeout time.Duration) error {
+	payload, err := json.Marshal(PromoteWriterPayload{NodeID: nodeID, OldPrimaryID: oldPrimaryID})
+	if err != nil {
+		return fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
+	cmd := &Command{
+		Type:    CommandPromoteWriter,
+		Payload: payload,
+	}
+
+	return n.Apply(cmd, timeout)
+}
+
+// DemoteWriter demotes a writer node to standby via Raft consensus.
+func (n *Node) DemoteWriter(nodeID string, timeout time.Duration) error {
+	payload, err := json.Marshal(DemoteWriterPayload{NodeID: nodeID})
+	if err != nil {
+		return fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
+	cmd := &Command{
+		Type:    CommandDemoteWriter,
+		Payload: payload,
+	}
+
+	return n.Apply(cmd, timeout)
+}
+
+// LeaderCh returns a channel that signals leadership changes.
+// True means this node became leader, false means it lost leadership.
+func (n *Node) LeaderCh() <-chan bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.raft == nil {
+		ch := make(chan bool)
+		return ch
+	}
+	return n.raft.LeaderCh()
+}

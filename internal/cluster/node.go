@@ -33,6 +33,20 @@ func (s NodeState) String() string {
 	return string(s)
 }
 
+// WriterState represents whether a writer node is primary or standby.
+type WriterState string
+
+const (
+	// WriterStatePrimary indicates this writer is the active primary accepting writes.
+	WriterStatePrimary WriterState = "primary"
+
+	// WriterStateStandby indicates this writer is a hot standby ready for promotion.
+	WriterStateStandby WriterState = "standby"
+
+	// WriterStateNone indicates the node is not a writer or has no assigned writer state.
+	WriterStateNone WriterState = ""
+)
+
 // NodeStats contains runtime statistics for a node.
 // These are updated periodically via heartbeat.
 type NodeStats struct {
@@ -70,6 +84,9 @@ type Node struct {
 	Version   string    `json:"version"`    // Arc version running on this node
 	StartedAt time.Time `json:"started_at"` // When the node process started
 	JoinedAt  time.Time `json:"joined_at"`  // When the node joined the cluster
+
+	// Writer state (primary/standby) - only relevant for writer nodes
+	WriterSt WriterState `json:"writer_state,omitempty"`
 
 	// Runtime stats (updated via heartbeat)
 	Stats NodeStats `json:"stats"`
@@ -188,6 +205,27 @@ func (n *Node) MarkJoined() {
 	n.LastHealthy = time.Now()
 }
 
+// GetWriterState returns the writer state of this node.
+func (n *Node) GetWriterState() WriterState {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.WriterSt
+}
+
+// SetWriterState sets the writer state of this node.
+func (n *Node) SetWriterState(state WriterState) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.WriterSt = state
+}
+
+// IsPrimaryWriter returns true if this node is the primary writer.
+func (n *Node) IsPrimaryWriter() bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.Role == RoleWriter && n.WriterSt == WriterStatePrimary
+}
+
 // GetCapabilities returns the capabilities for this node's role.
 func (n *Node) GetCapabilities() RoleCapabilities {
 	n.mu.RLock()
@@ -207,6 +245,7 @@ func (n *Node) Clone() *Node {
 		Address:       n.Address,
 		APIAddress:    n.APIAddress,
 		State:         n.State,
+		WriterSt:      n.WriterSt,
 		LastHeartbeat: n.LastHeartbeat,
 		LastHealthy:   n.LastHealthy,
 		FailedChecks:  n.FailedChecks,

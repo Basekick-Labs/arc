@@ -40,6 +40,9 @@ type Coordinator struct {
 	// Request routing (Phase 3)
 	router *Router
 
+	// Writer failover (Phase 3)
+	writerFailoverMgr *WriterFailoverManager
+
 	// WAL Replication (Phase 3.3)
 	replicationSender   *replication.Sender   // Writer only: sends entries to readers
 	replicationReceiver *replication.Receiver // Reader only: receives entries from writer
@@ -168,6 +171,28 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		Logger:    cfg.Logger,
 	})
 
+	// Initialize writer failover manager (Phase 3) — requires license and Raft
+	if cfg.Config.FailoverEnabled && c.raftNode != nil {
+		if cfg.LicenseClient == nil || !cfg.LicenseClient.CanUseWriterFailover() {
+			c.logger.Warn().Msg("Writer failover enabled but license does not include writer_failover feature — failover disabled")
+		} else {
+			c.writerFailoverMgr = NewWriterFailoverManager(&WriterFailoverConfig{
+				Registry:           registry,
+				RaftNode:           c.raftNode,
+				FailoverTimeout:    time.Duration(cfg.Config.FailoverTimeoutSeconds) * time.Second,
+				CooldownPeriod:     time.Duration(cfg.Config.FailoverCooldownSeconds) * time.Second,
+				Logger:             cfg.Logger,
+			})
+
+			// Wire FSM writer promotion callback to update registry
+			c.raftFSM.SetWriterPromotedCallback(func(newPrimaryID, oldPrimaryID string) {
+				c.onWriterPromoted(newPrimaryID, oldPrimaryID)
+			})
+
+			c.logger.Info().Msg("Writer failover manager initialized")
+		}
+	}
+
 	c.logger.Info().
 		Str("node_id", nodeID).
 		Str("role", string(role)).
@@ -220,6 +245,17 @@ func (c *Coordinator) Start() error {
 	// Start health checker
 	c.healthChecker.Start()
 
+	// Start writer failover manager if configured
+	if c.writerFailoverMgr != nil {
+		// Wire unhealthy callback to failover manager
+		c.registry.SetCallbacks(nil, nil, nil, func(node *Node) {
+			c.writerFailoverMgr.HandleWriterUnhealthy(node)
+		})
+		if err := c.writerFailoverMgr.Start(context.Background()); err != nil {
+			c.logger.Error().Err(err).Msg("Failed to start writer failover manager")
+		}
+	}
+
 	// Start peer discovery if we have seeds
 	if len(c.cfg.Seeds) > 0 {
 		go c.discoveryLoop()
@@ -250,6 +286,13 @@ func (c *Coordinator) Stop() error {
 
 	// Signal all goroutines to stop
 	close(c.stopCh)
+
+	// Stop writer failover manager
+	if c.writerFailoverMgr != nil {
+		if err := c.writerFailoverMgr.Stop(); err != nil {
+			c.logger.Error().Err(err).Msg("Error stopping writer failover manager")
+		}
+	}
 
 	// Stop Raft node if running (Phase 3)
 	if c.raftNode != nil {
@@ -924,6 +967,29 @@ func (c *Coordinator) onRaftNodeUpdated(n *raft.NodeInfo) {
 	// Update the existing node's state
 	node.UpdateState(NodeState(n.State))
 	c.registry.Register(node)
+}
+
+// onWriterPromoted is called when the FSM promotes a new primary writer.
+// It updates the local registry to reflect the new writer states.
+func (c *Coordinator) onWriterPromoted(newPrimaryID, oldPrimaryID string) {
+	// Demote old primary in registry
+	if oldPrimaryID != "" {
+		if oldNode, exists := c.registry.Get(oldPrimaryID); exists {
+			oldNode.SetWriterState(WriterStateStandby)
+			c.registry.Register(oldNode)
+		}
+	}
+
+	// Promote new primary in registry
+	if newNode, exists := c.registry.Get(newPrimaryID); exists {
+		newNode.SetWriterState(WriterStatePrimary)
+		c.registry.Register(newNode)
+	}
+
+	c.logger.Info().
+		Str("new_primary", newPrimaryID).
+		Str("old_primary", oldPrimaryID).
+		Msg("Writer promotion applied to registry")
 }
 
 // GetRouter returns the request router.

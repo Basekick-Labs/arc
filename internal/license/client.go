@@ -364,6 +364,13 @@ func (c *Client) CanUseAuditLogging() bool {
 	return c.license != nil && c.license.CanUseAuditLogging()
 }
 
+// CanUseWriterFailover returns true if automatic writer failover is allowed
+func (c *Client) CanUseWriterFailover() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.license != nil && c.license.CanUseWriterFailover()
+}
+
 // GetFingerprint returns the machine fingerprint
 func (c *Client) GetFingerprint() string {
 	return c.fingerprint

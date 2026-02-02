@@ -298,6 +298,11 @@ type ClusterConfig struct {
 	ShardingShardKey          string // Shard key: "database" or "measurement" (default: "database")
 	ShardingReplicationFactor int    // Number of copies per shard (default: 3)
 	ShardingRouteTimeout      int    // Timeout for shard routing in milliseconds (default: 5000)
+
+	// Writer failover configuration (Phase 3)
+	FailoverEnabled        bool // Enable automatic writer failover (default: false)
+	FailoverTimeoutSeconds int  // Timeout for failover operation in seconds (default: 30)
+	FailoverCooldownSeconds int // Cooldown between failovers in seconds (default: 60)
 }
 
 // Load loads configuration from environment and config file
@@ -502,6 +507,10 @@ func Load() (*Config, error) {
 			ShardingShardKey:          v.GetString("cluster.sharding_shard_key"),
 			ShardingReplicationFactor: v.GetInt("cluster.sharding_replication_factor"),
 			ShardingRouteTimeout:      v.GetInt("cluster.sharding_route_timeout"),
+			// Writer failover configuration
+			FailoverEnabled:         v.GetBool("cluster.failover_enabled"),
+			FailoverTimeoutSeconds:  v.GetInt("cluster.failover_timeout"),
+			FailoverCooldownSeconds: v.GetInt("cluster.failover_cooldown"),
 		},
 		TieredStorage: TieredStorageConfig{
 			Enabled:              v.GetBool("tiered_storage.enabled"),
@@ -699,6 +708,11 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.sharding_shard_key", "database")     // Database-level sharding
 	v.SetDefault("cluster.sharding_replication_factor", 3)     // RF=3 for fault tolerance
 	v.SetDefault("cluster.sharding_route_timeout", 5000)       // 5 second timeout
+
+	// Writer failover defaults (Phase 3)
+	v.SetDefault("cluster.failover_enabled", false) // Disabled by default
+	v.SetDefault("cluster.failover_timeout", 30)    // 30 second failover timeout
+	v.SetDefault("cluster.failover_cooldown", 60)   // 60 second cooldown between failovers
 
 	// Tiered storage defaults (Enterprise feature)
 	// Simple 2-tier system: Hot (local) -> Cold (S3/Azure archive)

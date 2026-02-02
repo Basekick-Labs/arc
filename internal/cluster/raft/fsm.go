@@ -22,6 +22,10 @@ const (
 	CommandUpdateNode
 	// CommandUpdateNodeState updates a node's state.
 	CommandUpdateNodeState
+	// CommandPromoteWriter promotes a writer node to primary.
+	CommandPromoteWriter
+	// CommandDemoteWriter demotes a writer node to standby.
+	CommandDemoteWriter
 )
 
 // Command represents a command to be applied to the FSM.
@@ -40,6 +44,7 @@ type NodeInfo struct {
 	APIAddress  string `json:"api_address"`
 	State       string `json:"state"`
 	Version     string `json:"version"`
+	WriterState string `json:"writer_state,omitempty"` // "primary", "standby", or "" for non-writers
 }
 
 // AddNodePayload is the payload for CommandAddNode.
@@ -63,22 +68,36 @@ type UpdateNodeStatePayload struct {
 	NewState string `json:"new_state"`
 }
 
+// PromoteWriterPayload is the payload for CommandPromoteWriter.
+type PromoteWriterPayload struct {
+	NodeID       string `json:"node_id"`        // Node to promote to primary
+	OldPrimaryID string `json:"old_primary_id"` // Previous primary (to demote)
+}
+
+// DemoteWriterPayload is the payload for CommandDemoteWriter.
+type DemoteWriterPayload struct {
+	NodeID string `json:"node_id"` // Node to demote to standby
+}
+
 // FSMSnapshot represents a snapshot of the FSM state.
 type FSMSnapshot struct {
-	Nodes map[string]*NodeInfo `json:"nodes"`
+	Nodes           map[string]*NodeInfo `json:"nodes"`
+	PrimaryWriterID string               `json:"primary_writer_id,omitempty"`
 }
 
 // ClusterFSM implements the raft.FSM interface for cluster state management.
 // It maintains the authoritative state of nodes in the cluster.
 type ClusterFSM struct {
-	mu     sync.RWMutex
-	nodes  map[string]*NodeInfo
-	logger zerolog.Logger
+	mu              sync.RWMutex
+	nodes           map[string]*NodeInfo
+	primaryWriterID string // ID of the current primary writer node
+	logger          zerolog.Logger
 
 	// Callbacks for state changes
-	onNodeAdded   func(*NodeInfo)
-	onNodeRemoved func(string)
-	onNodeUpdated func(*NodeInfo)
+	onNodeAdded      func(*NodeInfo)
+	onNodeRemoved    func(string)
+	onNodeUpdated    func(*NodeInfo)
+	onWriterPromoted func(newPrimaryID, oldPrimaryID string)
 }
 
 // NewClusterFSM creates a new cluster FSM.
@@ -96,6 +115,20 @@ func (f *ClusterFSM) SetCallbacks(onAdded func(*NodeInfo), onRemoved func(string
 	f.onNodeAdded = onAdded
 	f.onNodeRemoved = onRemoved
 	f.onNodeUpdated = onUpdated
+}
+
+// SetWriterPromotedCallback sets the callback for writer promotion events.
+func (f *ClusterFSM) SetWriterPromotedCallback(cb func(newPrimaryID, oldPrimaryID string)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onWriterPromoted = cb
+}
+
+// GetPrimaryWriterID returns the current primary writer node ID.
+func (f *ClusterFSM) GetPrimaryWriterID() string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.primaryWriterID
 }
 
 // Apply applies a Raft log entry to the FSM.
@@ -116,6 +149,10 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.applyUpdateNode(cmd.Payload)
 	case CommandUpdateNodeState:
 		return f.applyUpdateNodeState(cmd.Payload)
+	case CommandPromoteWriter:
+		return f.applyPromoteWriter(cmd.Payload)
+	case CommandDemoteWriter:
+		return f.applyDemoteWriter(cmd.Payload)
 	default:
 		return fmt.Errorf("unknown command type: %d", cmd.Type)
 	}
@@ -218,6 +255,93 @@ func (f *ClusterFSM) applyUpdateNodeState(payload []byte) interface{} {
 	return nil
 }
 
+func (f *ClusterFSM) applyPromoteWriter(payload []byte) interface{} {
+	var p PromoteWriterPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal promote writer payload: %w", err)
+	}
+
+	if p.NodeID == "" {
+		return fmt.Errorf("promote writer: node_id is required")
+	}
+
+	f.mu.Lock()
+	// Validate the node exists and is a writer
+	if node, exists := f.nodes[p.NodeID]; exists && node.Role != "writer" {
+		f.mu.Unlock()
+		return fmt.Errorf("promote writer: node %s has role %s, expected writer", p.NodeID, node.Role)
+	}
+
+	// Warn if OldPrimaryID doesn't match actual primary (informational only — FSM uses its own tracking)
+	oldPrimaryID := f.primaryWriterID
+	if p.OldPrimaryID != "" && oldPrimaryID != "" && p.OldPrimaryID != oldPrimaryID {
+		f.logger.Warn().
+			Str("expected_old_primary", p.OldPrimaryID).
+			Str("actual_old_primary", oldPrimaryID).
+			Msg("OldPrimaryID mismatch during promotion")
+	}
+	if oldPrimaryID != "" && oldPrimaryID != p.NodeID {
+		if oldNode, exists := f.nodes[oldPrimaryID]; exists {
+			oldNode.WriterState = "standby"
+		}
+	}
+
+	// Promote new primary
+	newNode, exists := f.nodes[p.NodeID]
+	if exists {
+		newNode.WriterState = "primary"
+	}
+	f.primaryWriterID = p.NodeID
+	callback := f.onWriterPromoted
+	f.mu.Unlock()
+
+	if !exists {
+		return fmt.Errorf("node %s not found", p.NodeID)
+	}
+
+	f.logger.Info().
+		Str("new_primary", p.NodeID).
+		Str("old_primary", oldPrimaryID).
+		Msg("Writer promoted to primary")
+
+	if callback != nil {
+		callback(p.NodeID, oldPrimaryID)
+	}
+
+	return nil
+}
+
+func (f *ClusterFSM) applyDemoteWriter(payload []byte) interface{} {
+	var p DemoteWriterPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal demote writer payload: %w", err)
+	}
+
+	if p.NodeID == "" {
+		return fmt.Errorf("demote writer: node_id is required")
+	}
+
+	f.mu.Lock()
+	node, exists := f.nodes[p.NodeID]
+	if exists {
+		node.WriterState = "standby"
+	}
+	if f.primaryWriterID == p.NodeID {
+		f.primaryWriterID = ""
+	}
+	f.mu.Unlock()
+
+	if !exists {
+		return fmt.Errorf("node %s not found", p.NodeID)
+	}
+
+	f.logger.Info().
+		Str("node_id", p.NodeID).
+		Msg("Writer demoted to standby")
+
+	return nil
+}
+
 // Snapshot returns a snapshot of the FSM state.
 func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 	f.mu.RLock()
@@ -230,7 +354,7 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 		nodes[id] = &nodeCopy
 	}
 
-	return &fsmSnapshot{nodes: nodes}, nil
+	return &fsmSnapshot{nodes: nodes, primaryWriterID: f.primaryWriterID}, nil
 }
 
 // Restore restores the FSM from a snapshot.
@@ -244,10 +368,12 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 
 	f.mu.Lock()
 	f.nodes = snapshot.Nodes
+	f.primaryWriterID = snapshot.PrimaryWriterID
 	f.mu.Unlock()
 
 	f.logger.Info().
 		Int("node_count", len(snapshot.Nodes)).
+		Str("primary_writer", snapshot.PrimaryWriterID).
 		Msg("FSM restored from snapshot")
 
 	return nil
@@ -300,12 +426,13 @@ func (f *ClusterFSM) NodeCount() int {
 
 // fsmSnapshot implements raft.FSMSnapshot.
 type fsmSnapshot struct {
-	nodes map[string]*NodeInfo
+	nodes           map[string]*NodeInfo
+	primaryWriterID string
 }
 
 // Persist writes the snapshot to the given sink.
 func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
-	snapshot := FSMSnapshot{Nodes: s.nodes}
+	snapshot := FSMSnapshot{Nodes: s.nodes, PrimaryWriterID: s.primaryWriterID}
 
 	data, err := json.Marshal(snapshot)
 	if err != nil {

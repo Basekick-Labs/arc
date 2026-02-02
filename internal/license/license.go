@@ -23,6 +23,7 @@ const (
 	FeatureTieredStorage      = "tiering"
 	FeatureAutoAggregation    = "auto_aggregation"
 	FeatureAuditLogging       = "audit_logging"
+	FeatureWriterFailover     = "writer_failover"
 )
 
 // License represents a validated license
@@ -105,6 +106,11 @@ func (l *License) CanUseTieredStorage() bool {
 // CanUseAuditLogging returns true if the license allows audit logging
 func (l *License) CanUseAuditLogging() bool {
 	return l.HasFeature(FeatureAuditLogging)
+}
+
+// CanUseWriterFailover returns true if the license allows automatic writer failover
+func (l *License) CanUseWriterFailover() bool {
+	return l.HasFeature(FeatureWriterFailover)
 }
 
 // TierFromString converts a string to a Tier

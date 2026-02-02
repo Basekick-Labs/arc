@@ -133,6 +133,27 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 **Requires:** Enterprise license with `audit_logging` feature.
 
+### Automatic Writer Failover (< 30s RTO)
+
+Arc Enterprise clusters now support automatic single-writer failover. When the primary writer node fails, a healthy standby writer is automatically promoted via Raft consensus. The failover manager monitors writer health, selects the best standby, and coordinates promotion across the cluster.
+
+**Key capabilities:**
+- Health-based failure detection (3 consecutive failed checks)
+- Standby writer selection with automatic Raft-based promotion
+- Cooldown period to prevent flapping
+- Manual failover trigger support
+- Router automatically routes writes to the new primary
+
+**Configuration:**
+```toml
+[cluster]
+failover_enabled = true
+failover_timeout = 30       # seconds
+failover_cooldown = 60      # seconds between failovers
+```
+
+**Requires:** Enterprise license with `writer_failover` feature.
+
 ### Tiered Storage: Daily-Compacted-Only Migration Gate
 
 The tiered storage migrator now only moves daily-compacted files to cold tier (S3 GLACIER / Azure Archive). Raw ingestion files and hourly-compacted files are skipped, ensuring fewer, larger objects land in archive storage.
