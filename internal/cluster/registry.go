@@ -226,6 +226,25 @@ func (r *Registry) GetCompactors() []*Node {
 	return r.filterNodes(func(n *Node) bool { return n.Role == RoleCompactor && n.IsHealthy() })
 }
 
+// GetPrimaryWriter returns the primary writer node, or nil if none exists.
+func (r *Registry) GetPrimaryWriter() *Node {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, node := range r.nodes {
+		if node.Role == RoleWriter && node.WriterSt == WriterStatePrimary && node.IsHealthy() {
+			return node.Clone()
+		}
+	}
+	return nil
+}
+
+// GetStandbyWriters returns healthy standby writer nodes.
+func (r *Registry) GetStandbyWriters() []*Node {
+	return r.filterNodes(func(n *Node) bool {
+		return n.Role == RoleWriter && n.WriterSt == WriterStateStandby && n.IsHealthy()
+	})
+}
+
 // Local returns the local node.
 func (r *Registry) Local() *Node {
 	return r.localNode

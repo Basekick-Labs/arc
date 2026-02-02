@@ -118,16 +118,17 @@ func (r *Router) RouteWrite(ctx context.Context, req *http.Request) (*http.Respo
 		return nil, ErrLocalNodeCanHandle
 	}
 
-	// Find a healthy writer
-	writers := r.cfg.Registry.GetWriters()
-	if len(writers) == 0 {
-		r.logger.Warn().Msg("No healthy writer nodes available for routing")
-		return nil, ErrNoWriterAvailable
+	// Prefer the designated primary writer
+	writer := r.cfg.Registry.GetPrimaryWriter()
+	if writer == nil {
+		// Fall back to any healthy writer (no failover configured or pre-promotion)
+		writers := r.cfg.Registry.GetWriters()
+		if len(writers) == 0 {
+			r.logger.Warn().Msg("No healthy writer nodes available for routing")
+			return nil, ErrNoWriterAvailable
+		}
+		writer = writers[0]
 	}
-
-	// For writes, we typically use the primary writer (first healthy one)
-	// In future, this could support multi-writer with sharding
-	writer := writers[0]
 
 	return r.forwardRequest(ctx, writer, req)
 }
