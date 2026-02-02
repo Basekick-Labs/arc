@@ -256,6 +256,30 @@ curl -X DELETE http://localhost:8080/api/v1/backup/backup-20260202-150000-a1b2c3
   -H "Authorization: Bearer <token>"
 ```
 
+## Off-Site Storage & Disaster Recovery
+
+Backups are plain directory trees on the local filesystem. After a backup completes, you can copy the entire backup directory to any off-site storage — S3, Azure Blob, an external drive, NAS, tape, etc. — using standard tools (`aws s3 cp`, `rsync`, `cp`, etc.).
+
+To restore from an off-site backup:
+
+1. Copy the backup directory back into Arc's backup path (default `./data/backups/`), preserving the directory structure
+2. Verify the backup appears with `GET /api/v1/backup` (it will be discovered automatically via its `manifest.json`)
+3. Trigger the restore with `POST /api/v1/backup/restore`
+
+```bash
+# Example: copy backup from S3 back to Arc's backup directory
+aws s3 cp --recursive s3://my-backups/backup-20260202-150000-a1b2c3d4 \
+  ./data/backups/backup-20260202-150000-a1b2c3d4
+
+# Restore it
+curl -X POST http://localhost:8080/api/v1/backup/restore \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"backup_id":"backup-20260202-150000-a1b2c3d4","confirm":true}'
+```
+
+This makes Arc backups fully portable — they are not tied to the original instance or storage backend.
+
 ## Notes
 
 - Only one backup/restore operation can run at a time.
