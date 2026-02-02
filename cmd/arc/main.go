@@ -791,6 +791,45 @@ func main() {
 		rbacHandler.RegisterRoutes(server.GetApp())
 	}
 
+	// Initialize Audit Logging (Enterprise feature - requires valid license)
+	// Must be registered before API routes so the middleware captures all requests
+	var auditLogger *audit.Logger
+	if cfg.AuditLog.Enabled {
+		if licenseClient == nil {
+			log.Warn().Msg("Audit logging requires enterprise license - feature disabled")
+		} else if !licenseClient.CanUseAuditLogging() {
+			log.Warn().Msg("License does not include audit_logging feature - feature disabled")
+		} else {
+			auditDB, err := sql.Open("sqlite3", cfg.Auth.DBPath)
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to open audit database - feature disabled")
+			} else {
+				auditLogger, err = audit.NewLogger(&audit.LoggerConfig{
+					DB:     auditDB,
+					Config: &cfg.AuditLog,
+					Logger: logger.Get("audit"),
+				})
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to create audit logger - feature disabled")
+				} else {
+					auditLogger.Start()
+					shutdownCoordinator.RegisterHook("audit", func(ctx context.Context) error {
+						auditLogger.Stop()
+						return nil
+					}, shutdown.PriorityCompaction)
+
+					// Register audit middleware BEFORE API routes
+					server.GetApp().Use(audit.Middleware(auditLogger, cfg.AuditLog.IncludeReads))
+
+					log.Info().
+						Int("retention_days", cfg.AuditLog.RetentionDays).
+						Bool("include_reads", cfg.AuditLog.IncludeReads).
+						Msg("Audit logging enabled")
+				}
+			}
+		}
+	}
+
 	// Register MessagePack handler with Arrow buffer
 	msgpackHandler := api.NewMsgPackHandler(logger.Get("msgpack"), arrowBuffer, server.GetMaxPayloadSize())
 	if authManager != nil && rbacManager != nil {
@@ -1095,48 +1134,11 @@ func main() {
 		}
 	}
 
-	// Initialize Audit Logging (Enterprise feature - requires valid license)
-	var auditLogger *audit.Logger
-	if cfg.AuditLog.Enabled {
-		if licenseClient == nil {
-			log.Warn().Msg("Audit logging requires enterprise license - feature disabled")
-		} else if !licenseClient.CanUseAuditLogging() {
-			log.Warn().Msg("License does not include audit_logging feature - feature disabled")
-		} else {
-			auditDB, err := sql.Open("sqlite3", cfg.Auth.DBPath)
-			if err != nil {
-				log.Error().Err(err).Msg("Failed to open audit database - feature disabled")
-			} else {
-				auditLogger, err = audit.NewLogger(&audit.LoggerConfig{
-					DB:     auditDB,
-					Config: &cfg.AuditLog,
-					Logger: logger.Get("audit"),
-				})
-				if err != nil {
-					log.Error().Err(err).Msg("Failed to create audit logger - feature disabled")
-				} else {
-					auditLogger.Start()
-					shutdownCoordinator.RegisterHook("audit", func(ctx context.Context) error {
-						auditLogger.Stop()
-						return nil
-					}, shutdown.PriorityCompaction)
-
-					// Register audit middleware (after auth middleware)
-					server.GetApp().Use(audit.Middleware(auditLogger, cfg.AuditLog.IncludeReads))
-
-					// Register audit API routes
-					auditHandler := api.NewAuditHandler(auditLogger, authManager, licenseClient, logger.Get("audit-api"))
-					auditHandler.RegisterRoutes(server.GetApp())
-
-					log.Info().
-						Int("retention_days", cfg.AuditLog.RetentionDays).
-						Bool("include_reads", cfg.AuditLog.IncludeReads).
-						Msg("Audit logging enabled")
-				}
-			}
-		}
+	// Register audit API routes (audit logger initialized earlier, before API routes)
+	if auditLogger != nil {
+		auditHandler := api.NewAuditHandler(auditLogger, authManager, licenseClient, logger.Get("audit-api"))
+		auditHandler.RegisterRoutes(server.GetApp())
 	}
-	_ = auditLogger // avoid unused warning when disabled
 
 	// Register HTTP server shutdown hook (first to stop accepting new requests)
 	shutdownCoordinator.RegisterHook("http-server", func(ctx context.Context) error {

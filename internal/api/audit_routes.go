@@ -32,7 +32,9 @@ func NewAuditHandler(auditLogger *audit.Logger, authManager *auth.AuthManager, l
 // RegisterRoutes registers audit log query endpoints
 func (h *AuditHandler) RegisterRoutes(app *fiber.App) {
 	auditGroup := app.Group("/api/v1/audit")
-	auditGroup.Use(auth.RequireAdmin(h.authManager))
+	if h.authManager != nil {
+		auditGroup.Use(auth.RequireAdmin(h.authManager))
+	}
 	auditGroup.Use(h.requireAuditLicense)
 
 	auditGroup.Get("/logs", h.queryLogs)
