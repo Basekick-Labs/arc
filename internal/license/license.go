@@ -22,6 +22,7 @@ const (
 	FeatureRBAC               = "rbac"
 	FeatureTieredStorage      = "tiering"
 	FeatureAutoAggregation    = "auto_aggregation"
+	FeatureAuditLogging       = "audit_logging"
 )
 
 // License represents a validated license
@@ -99,6 +100,11 @@ func (l *License) CanUseRetentionScheduler() bool {
 // Requires enterprise license with the tiered_storage feature
 func (l *License) CanUseTieredStorage() bool {
 	return l.HasFeature(FeatureTieredStorage)
+}
+
+// CanUseAuditLogging returns true if the license allows audit logging
+func (l *License) CanUseAuditLogging() bool {
+	return l.HasFeature(FeatureAuditLogging)
 }
 
 // TierFromString converts a string to a Tier

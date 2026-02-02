@@ -31,6 +31,7 @@ type Config struct {
 	Cluster         ClusterConfig
 	Query           QueryConfig
 	TieredStorage   TieredStorageConfig
+	AuditLog        AuditLogConfig
 }
 
 type ServerConfig struct {
@@ -233,6 +234,14 @@ type ColdTierConfig struct {
 
 	// Retrieval settings (for Glacier/Archive)
 	RetrievalMode string // Glacier retrieval mode: "standard", "expedited", "bulk" (default: "standard")
+}
+
+// AuditLogConfig holds configuration for enterprise audit logging.
+// When enabled, all auditable API requests are logged to SQLite for compliance.
+type AuditLogConfig struct {
+	Enabled       bool // Enable audit logging (requires enterprise license)
+	RetentionDays int  // How long to keep audit logs (default: 90)
+	IncludeReads  bool // Log read/query operations (default: false, high volume)
 }
 
 // ClusterConfig holds configuration for Arc clustering (Enterprise feature)
@@ -522,6 +531,11 @@ func Load() (*Config, error) {
 				RetrievalMode:         v.GetString("tiered_storage.cold.retrieval_mode"),
 			},
 		},
+		AuditLog: AuditLogConfig{
+			Enabled:       v.GetBool("audit_log.enabled"),
+			RetentionDays: v.GetInt("audit_log.retention_days"),
+			IncludeReads:  v.GetBool("audit_log.include_reads"),
+		},
 	}
 
 	return cfg, nil
@@ -714,6 +728,11 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("tiered_storage.cold.azure_use_managed_identity", false)
 	v.SetDefault("tiered_storage.cold.azure_access_tier", "Archive") // Azure archive tier
 	v.SetDefault("tiered_storage.cold.retrieval_mode", "standard")   // Standard retrieval
+
+	// Audit log defaults (Enterprise feature)
+	v.SetDefault("audit_log.enabled", false)
+	v.SetDefault("audit_log.retention_days", 90)
+	v.SetDefault("audit_log.include_reads", false)
 }
 
 func getDefaultThreadCount() int {

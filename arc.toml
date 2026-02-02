@@ -156,5 +156,13 @@ azure_access_tier = "Archive"
 
 retrieval_mode = "standard"  # standard, expedited, bulk
 
+# -----------------------------------------------------------------------------
+# Audit Logging (Enterprise)
+# -----------------------------------------------------------------------------
+[audit_log]
+enabled = false
+retention_days = 90
+include_reads = false           # Log GET/query requests (high volume)
+
 [wal]
 enabled = false
