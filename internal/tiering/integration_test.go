@@ -245,8 +245,8 @@ func TestIntegration_PolicyBasedMigration(t *testing.T) {
 	db1Data := []byte("database 1 data")
 	db2Data := []byte("database 2 data")
 
-	db1Path := "db1/cpu/2025/01/01/data.parquet"
-	db2Path := "db2/cpu/2025/01/01/data.parquet"
+	db1Path := "db1/cpu/2025/01/01/cpu_20250101_000000_daily.parquet"
+	db2Path := "db2/cpu/2025/01/01/cpu_20250101_000000_daily.parquet"
 
 	if err := hotBackend.Write(ctx, db1Path, db1Data); err != nil {
 		t.Fatalf("Failed to write db1 data: %v", err)
@@ -516,5 +516,51 @@ func TestIntegration_MigrateBatch(t *testing.T) {
 		if retrieved.Tier != TierCold {
 			t.Errorf("File %s tier should be cold, got %s", f.Path, retrieved.Tier)
 		}
+	}
+}
+
+func TestIntegration_OnlyDailyCompactedFilesMigrate(t *testing.T) {
+	m, hotBackend, _, cleanup := setupIntegrationTest(t, true)
+	defer cleanup()
+
+	ctx := context.Background()
+	oldTime := time.Now().UTC().AddDate(0, 0, -30)
+
+	// Create three file types: raw, hourly-compacted, daily-compacted
+	files := []struct {
+		path     string
+		eligible bool
+	}{
+		{"testdb/cpu/2025/01/01/10/cpu_20250101_100000_123456789.parquet", false}, // raw
+		{"testdb/cpu/2025/01/01/10/cpu_20250101_100000_compacted.parquet", false}, // hourly
+		{"testdb/cpu/2025/01/01/10/cpu_20250101_100000_daily.parquet", true},      // daily
+	}
+
+	for _, f := range files {
+		data := []byte("test data")
+		if err := hotBackend.Write(ctx, f.path, data); err != nil {
+			t.Fatalf("Failed to write: %v", err)
+		}
+		if err := m.RecordNewFile(ctx, &FileMetadata{
+			Path:          f.path,
+			Database:      "testdb",
+			Measurement:   "cpu",
+			PartitionTime: oldTime,
+			SizeBytes:     int64(len(data)),
+		}); err != nil {
+			t.Fatalf("RecordNewFile failed: %v", err)
+		}
+	}
+
+	candidates, err := m.migrator.FindCandidates(ctx, TierHot, TierCold)
+	if err != nil {
+		t.Fatalf("FindCandidates failed: %v", err)
+	}
+
+	if len(candidates) != 1 {
+		t.Fatalf("Expected 1 candidate (daily only), got %d", len(candidates))
+	}
+	if candidates[0].Path != files[2].path {
+		t.Errorf("Expected daily file, got %s", candidates[0].Path)
 	}
 }

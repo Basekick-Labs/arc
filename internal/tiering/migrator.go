@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -125,6 +126,11 @@ func (m *Migrator) FindCandidates(ctx context.Context, fromTier, toTier Tier) ([
 		// Check if file is old enough based on its policy
 		fileAge := now.Sub(file.PartitionTime)
 		if fileAge < ageThreshold {
+			continue
+		}
+
+		// Only migrate daily-compacted files to cold tier
+		if !strings.HasSuffix(file.Path, "_daily.parquet") {
 			continue
 		}
 
