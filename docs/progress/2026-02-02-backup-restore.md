@@ -260,25 +260,49 @@ curl -X DELETE http://localhost:8080/api/v1/backup/backup-20260202-150000-a1b2c3
 
 Backups are plain directory trees on the local filesystem. After a backup completes, you can copy the entire backup directory to any off-site storage — S3, Azure Blob, an external drive, NAS, tape, etc. — using standard tools (`aws s3 cp`, `rsync`, `cp`, etc.).
 
-To restore from an off-site backup:
+There are two ways to restore from an off-site backup:
 
-1. Copy the backup directory back into Arc's backup path (default `./data/backups/`), preserving the directory structure
-2. Verify the backup appears with `GET /api/v1/backup` (it will be discovered automatically via its `manifest.json`)
-3. Trigger the restore with `POST /api/v1/backup/restore`
+### Option 1: Copy files directly into Arc's data directory (no API needed)
+
+Since backups preserve the original storage path structure under `data/`, you can copy the parquet files straight into Arc's data directory. This works even if Arc is not running — useful for full disaster recovery or migrating to a new instance.
 
 ```bash
-# Example: copy backup from S3 back to Arc's backup directory
+# Copy parquet data files directly into Arc's data directory
+cp -r ./data/backups/backup-20260202-150000-a1b2c3d4/data/* ./data/
+
+# Optionally restore the SQLite metadata database
+cp ./data/backups/backup-20260202-150000-a1b2c3d4/metadata/arc.db /path/to/arc.db
+
+# Optionally restore the config
+cp ./data/backups/backup-20260202-150000-a1b2c3d4/config/arc.toml /path/to/arc.toml
+```
+
+This also works from S3 or any other storage — just download the backup directory first:
+
+```bash
+aws s3 cp --recursive s3://my-backups/backup-20260202-150000-a1b2c3d4 /tmp/restore/
+cp -r /tmp/restore/data/* ./data/
+```
+
+### Option 2: Use the restore API (Arc must be running)
+
+Copy the backup directory into Arc's backup path, then use the API:
+
+```bash
+# Place backup in Arc's backup directory
 aws s3 cp --recursive s3://my-backups/backup-20260202-150000-a1b2c3d4 \
   ./data/backups/backup-20260202-150000-a1b2c3d4
 
-# Restore it
+# Restore via API (handles SQLite checkpoint, pre-restore safety copies, progress tracking)
 curl -X POST http://localhost:8080/api/v1/backup/restore \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{"backup_id":"backup-20260202-150000-a1b2c3d4","confirm":true}'
 ```
 
-This makes Arc backups fully portable — they are not tied to the original instance or storage backend.
+The API approach adds safety features (pre-restore backups of current files, progress tracking, permission handling) but requires a running Arc instance.
+
+Either way, backups are fully portable — they are not tied to the original instance or storage backend.
 
 ## Notes
 
