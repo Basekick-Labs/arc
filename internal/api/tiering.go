@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
@@ -11,15 +13,19 @@ import (
 
 // TieringHandler handles tiered storage API operations
 type TieringHandler struct {
-	manager *tiering.Manager
-	logger  zerolog.Logger
+	manager       *tiering.Manager
+	authManager   *auth.AuthManager
+	licenseClient *license.Client
+	logger        zerolog.Logger
 }
 
 // NewTieringHandler creates a new tiering handler
-func NewTieringHandler(manager *tiering.Manager, logger zerolog.Logger) *TieringHandler {
+func NewTieringHandler(manager *tiering.Manager, authManager *auth.AuthManager, licenseClient *license.Client, logger zerolog.Logger) *TieringHandler {
 	return &TieringHandler{
-		manager: manager,
-		logger:  logger.With().Str("component", "tiering-api").Logger(),
+		manager:       manager,
+		authManager:   authManager,
+		licenseClient: licenseClient,
+		logger:        logger.With().Str("component", "tiering-api").Logger(),
 	}
 }
 
@@ -181,9 +187,24 @@ func (h *TieringHandler) ScanFiles(c *fiber.Ctx) error {
 	return c.JSON(result)
 }
 
+// requireTieringLicense checks that the license still includes the tiering feature.
+func (h *TieringHandler) requireTieringLicense(c *fiber.Ctx) error {
+	if h.licenseClient == nil || !h.licenseClient.CanUseTieredStorage() {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"success": false,
+			"error":   "Tiered storage requires an enterprise license with the 'tiering' feature enabled",
+		})
+	}
+	return c.Next()
+}
+
 // RegisterRoutes registers tiering API routes
 func (h *TieringHandler) RegisterRoutes(app fiber.Router) {
 	tiering := app.Group("/api/v1/tiering")
+	if h.authManager != nil {
+		tiering.Use(auth.RequireAdmin(h.authManager))
+	}
+	tiering.Use(h.requireTieringLicense)
 
 	tiering.Get("/status", h.GetStatus)
 	tiering.Get("/files", h.GetFiles)

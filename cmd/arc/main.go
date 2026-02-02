@@ -465,6 +465,11 @@ func main() {
 		}
 		shutdownCoordinator.Register("auth", authManager, shutdown.PriorityAuth)
 
+		// Restrict SQLite database file permissions (contains auth tokens, audit logs, etc.)
+		if err := os.Chmod(cfg.Auth.DBPath, 0600); err != nil {
+			log.Warn().Err(err).Str("path", cfg.Auth.DBPath).Msg("Failed to set database file permissions")
+		}
+
 		// Create initial admin token if this is first run
 		if token, err := authManager.EnsureInitialToken(); err != nil {
 			log.Error().Err(err).Msg("Failed to create initial admin token")
@@ -1097,10 +1102,10 @@ func main() {
 
 	// Register Tiering API handlers (always register, handlers check if manager is nil)
 	if tieringManager != nil {
-		tieringHandler := api.NewTieringHandler(tieringManager, logger.Get("tiering-api"))
+		tieringHandler := api.NewTieringHandler(tieringManager, authManager, licenseClient, logger.Get("tiering-api"))
 		tieringHandler.RegisterRoutes(server.GetApp())
 
-		tieringPoliciesHandler := api.NewTieringPoliciesHandler(tieringManager, logger.Get("tiering-policies-api"))
+		tieringPoliciesHandler := api.NewTieringPoliciesHandler(tieringManager, authManager, licenseClient, logger.Get("tiering-policies-api"))
 		tieringPoliciesHandler.RegisterRoutes(server.GetApp())
 
 		// Wire tiering manager to query handler for multi-tier query routing

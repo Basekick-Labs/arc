@@ -436,6 +436,14 @@ func (m *Manager) parseFilePath(path string) (*filePathInfo, error) {
 	database := parts[0]
 	measurement := parts[1]
 
+	// Validate no path traversal in database or measurement names
+	if strings.Contains(database, "..") || strings.ContainsAny(database, "/\\") {
+		return nil, fmt.Errorf("invalid database name in path: %s", database)
+	}
+	if strings.Contains(measurement, "..") || strings.ContainsAny(measurement, "/\\") {
+		return nil, fmt.Errorf("invalid measurement name in path: %s", measurement)
+	}
+
 	// Parse year, month, day, hour
 	year, err := strconv.Atoi(parts[2])
 	if err != nil {
