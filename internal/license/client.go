@@ -357,6 +357,13 @@ func (c *Client) CanUseTieredStorage() bool {
 	return c.license != nil && c.license.CanUseTieredStorage()
 }
 
+// CanUseAuditLogging returns true if audit logging is allowed
+func (c *Client) CanUseAuditLogging() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.license != nil && c.license.CanUseAuditLogging()
+}
+
 // GetFingerprint returns the machine fingerprint
 func (c *Client) GetFingerprint() string {
 	return c.fingerprint

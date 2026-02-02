@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/api"
+	"github.com/basekick-labs/arc/internal/audit"
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/compaction"
@@ -1093,6 +1094,49 @@ func main() {
 			}
 		}
 	}
+
+	// Initialize Audit Logging (Enterprise feature - requires valid license)
+	var auditLogger *audit.Logger
+	if cfg.AuditLog.Enabled {
+		if licenseClient == nil {
+			log.Warn().Msg("Audit logging requires enterprise license - feature disabled")
+		} else if !licenseClient.CanUseAuditLogging() {
+			log.Warn().Msg("License does not include audit_logging feature - feature disabled")
+		} else {
+			auditDB, err := sql.Open("sqlite3", cfg.Auth.DBPath)
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to open audit database - feature disabled")
+			} else {
+				auditLogger, err = audit.NewLogger(&audit.LoggerConfig{
+					DB:     auditDB,
+					Config: &cfg.AuditLog,
+					Logger: logger.Get("audit"),
+				})
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to create audit logger - feature disabled")
+				} else {
+					auditLogger.Start()
+					shutdownCoordinator.RegisterHook("audit", func(ctx context.Context) error {
+						auditLogger.Stop()
+						return nil
+					}, shutdown.PriorityCompaction)
+
+					// Register audit middleware (after auth middleware)
+					server.GetApp().Use(audit.Middleware(auditLogger, cfg.AuditLog.IncludeReads))
+
+					// Register audit API routes
+					auditHandler := api.NewAuditHandler(auditLogger, authManager, licenseClient, logger.Get("audit-api"))
+					auditHandler.RegisterRoutes(server.GetApp())
+
+					log.Info().
+						Int("retention_days", cfg.AuditLog.RetentionDays).
+						Bool("include_reads", cfg.AuditLog.IncludeReads).
+						Msg("Audit logging enabled")
+				}
+			}
+		}
+	}
+	_ = auditLogger // avoid unused warning when disabled
 
 	// Register HTTP server shutdown hook (first to stop accepting new requests)
 	shutdownCoordinator.RegisterHook("http-server", func(ctx context.Context) error {

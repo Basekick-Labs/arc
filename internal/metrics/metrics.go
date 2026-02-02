@@ -94,6 +94,10 @@ type Metrics struct {
 	mqttConnected        atomic.Int64 // 1 = connected, 0 = disconnected
 	mqttReconnects       atomic.Int64
 
+	// Audit metrics
+	auditEventsTotal  atomic.Int64
+	auditWriteErrors  atomic.Int64
+
 	// WAL metrics
 	walRecordsPreserved   atomic.Int64 // Records preserved in WAL for recovery (flush failures)
 	walRecoveryTotal      atomic.Int64 // Successful WAL recovery operations
@@ -231,6 +235,10 @@ func (m *Metrics) SetDBConnectionsIdle(count int64)  { m.dbConnectionsIdle.Store
 func (m *Metrics) IncDBQueries()                     { m.dbQueriesTotal.Add(1) }
 func (m *Metrics) IncDBQueryErrors()                 { m.dbQueryErrorsTotal.Add(1) }
 
+// Audit Metrics
+func (m *Metrics) IncAuditEvents()      { m.auditEventsTotal.Add(1) }
+func (m *Metrics) IncAuditWriteErrors() { m.auditWriteErrors.Add(1) }
+
 // MQTT Metrics
 func (m *Metrics) IncMQTTMessagesReceived()          { m.mqttMessagesReceived.Add(1) }
 func (m *Metrics) IncMQTTMessagesFailed()            { m.mqttMessagesFailed.Add(1) }
@@ -342,6 +350,10 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"db_connections_idle":   m.dbConnectionsIdle.Load(),
 		"db_queries_total":      m.dbQueriesTotal.Load(),
 		"db_query_errors_total": m.dbQueryErrorsTotal.Load(),
+
+		// Audit
+		"audit_events_total":  m.auditEventsTotal.Load(),
+		"audit_write_errors":  m.auditWriteErrors.Load(),
 
 		// MQTT
 		"mqtt_messages_received": m.mqttMessagesReceived.Load(),
@@ -546,6 +558,15 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_db_queries_total Total database queries\n"...)
 	b = append(b, "# TYPE arc_db_queries_total counter\n"...)
 	b = appendMetric(b, "arc_db_queries_total", float64(m.dbQueriesTotal.Load()))
+
+	// Audit metrics
+	b = append(b, "# HELP arc_audit_events_total Total audit log events\n"...)
+	b = append(b, "# TYPE arc_audit_events_total counter\n"...)
+	b = appendMetric(b, "arc_audit_events_total", float64(m.auditEventsTotal.Load()))
+
+	b = append(b, "# HELP arc_audit_write_errors_total Total audit log write errors\n"...)
+	b = append(b, "# TYPE arc_audit_write_errors_total counter\n"...)
+	b = appendMetric(b, "arc_audit_write_errors_total", float64(m.auditWriteErrors.Load()))
 
 	// MQTT metrics
 	b = append(b, "# HELP arc_mqtt_messages_received_total Total MQTT messages received\n"...)
