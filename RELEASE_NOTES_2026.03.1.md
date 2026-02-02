@@ -154,7 +154,7 @@ The tiered storage migrator now only moves daily-compacted files to cold tier (S
 
 ## Improvements
 
-*None yet*
+- **Audit log SQLite storage**: Added `auto_vacuum = INCREMENTAL` to prevent database file bloat. Runs full `VACUUM` on startup and incremental vacuum after retention cleanup deletes old entries.
 
 ## Upgrade Notes
 

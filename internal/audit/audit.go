@@ -100,6 +100,12 @@ func NewLogger(cfg *LoggerConfig) (*Logger, error) {
 }
 
 func (l *Logger) initSchema() error {
+	// Enable incremental auto-vacuum to reclaim disk space after retention cleanup.
+	// Must be set before creating tables (only takes effect on new databases).
+	if _, err := l.db.Exec("PRAGMA auto_vacuum = INCREMENTAL"); err != nil {
+		l.logger.Warn().Err(err).Msg("Failed to set auto_vacuum pragma")
+	}
+
 	schema := `
 	CREATE TABLE IF NOT EXISTS audit_logs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -264,8 +270,11 @@ func (l *Logger) flushBatch(batch []*AuditEvent) {
 func (l *Logger) retentionLoop() {
 	defer l.wg.Done()
 
-	// Run once on startup
+	// Run cleanup and vacuum once on startup to reclaim space from previous runs
 	l.cleanupOldEntries()
+	if _, err := l.db.Exec("VACUUM"); err != nil {
+		l.logger.Warn().Err(err).Msg("Failed to vacuum audit database on startup")
+	}
 
 	ticker := time.NewTicker(24 * time.Hour)
 	defer ticker.Stop()
@@ -295,6 +304,11 @@ func (l *Logger) cleanupOldEntries() {
 
 	if rows, _ := result.RowsAffected(); rows > 0 {
 		l.logger.Info().Int64("deleted", rows).Int("retention_days", l.config.RetentionDays).Msg("Cleaned up old audit entries")
+
+		// Reclaim disk space freed by deleted rows
+		if _, err := l.db.Exec("PRAGMA incremental_vacuum"); err != nil {
+			l.logger.Warn().Err(err).Msg("Failed to run incremental vacuum")
+		}
 	}
 }
 
