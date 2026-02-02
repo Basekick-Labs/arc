@@ -164,5 +164,11 @@ enabled = false
 retention_days = 90
 include_reads = false           # Log GET/query requests (high volume)
 
+# Backup & Restore
+# -----------------------------------------------------------------------------
+[backup]
+enabled = true
+local_path = "./data/backups"           # Directory for local backups
+
 [wal]
 enabled = false
