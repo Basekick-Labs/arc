@@ -32,6 +32,7 @@ type Config struct {
 	Query           QueryConfig
 	TieredStorage   TieredStorageConfig
 	AuditLog        AuditLogConfig
+	Backup          BackupConfig
 }
 
 type ServerConfig struct {
@@ -242,6 +243,11 @@ type AuditLogConfig struct {
 	Enabled       bool // Enable audit logging (requires enterprise license)
 	RetentionDays int  // How long to keep audit logs (default: 90)
 	IncludeReads  bool // Log read/query operations (default: false, high volume)
+}
+
+type BackupConfig struct {
+	Enabled   bool   // Enable backup/restore API
+	LocalPath string // Local directory for backups (default: "./data/backups")
 }
 
 // ClusterConfig holds configuration for Arc clustering (Enterprise feature)
@@ -747,6 +753,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("audit_log.enabled", false)
 	v.SetDefault("audit_log.retention_days", 90)
 	v.SetDefault("audit_log.include_reads", false)
+
+	// Backup defaults
+	v.SetDefault("backup.enabled", true)
+	v.SetDefault("backup.local_path", "./data/backups")
 }
 
 func getDefaultThreadCount() int {

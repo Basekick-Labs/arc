@@ -13,6 +13,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/api"
 	"github.com/basekick-labs/arc/internal/audit"
+	"github.com/basekick-labs/arc/internal/backup"
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/compaction"
@@ -1136,6 +1137,24 @@ func main() {
 			} else {
 				log.Info().Msg("DuckDB configured with cold tier S3 credentials for multi-tier queries")
 			}
+		}
+	}
+
+	// Initialize Backup/Restore (OSS feature — no license required)
+	if cfg.Backup.Enabled {
+		backupManager, err := backup.NewManager(&backup.ManagerConfig{
+			DataStorage:  storageBackend,
+			BackupPath:   cfg.Backup.LocalPath,
+			SQLiteDBPath: cfg.Auth.DBPath,
+			ConfigPath:   "arc.toml",
+			Logger:       logger.Get("backup"),
+		})
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to initialize backup manager")
+		} else {
+			backupHandler := api.NewBackupHandler(backupManager, authManager, logger.Get("backup-api"))
+			backupHandler.RegisterRoutes(server.GetApp())
+			log.Info().Str("backup_path", cfg.Backup.LocalPath).Msg("Backup/restore enabled")
 		}
 	}
 
