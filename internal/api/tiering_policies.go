@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
@@ -11,15 +13,19 @@ import (
 
 // TieringPoliciesHandler handles tiering policy API operations
 type TieringPoliciesHandler struct {
-	manager *tiering.Manager
-	logger  zerolog.Logger
+	manager       *tiering.Manager
+	authManager   *auth.AuthManager
+	licenseClient *license.Client
+	logger        zerolog.Logger
 }
 
 // NewTieringPoliciesHandler creates a new tiering policies handler
-func NewTieringPoliciesHandler(manager *tiering.Manager, logger zerolog.Logger) *TieringPoliciesHandler {
+func NewTieringPoliciesHandler(manager *tiering.Manager, authManager *auth.AuthManager, licenseClient *license.Client, logger zerolog.Logger) *TieringPoliciesHandler {
 	return &TieringPoliciesHandler{
-		manager: manager,
-		logger:  logger.With().Str("component", "tiering-policies-api").Logger(),
+		manager:       manager,
+		authManager:   authManager,
+		licenseClient: licenseClient,
+		logger:        logger.With().Str("component", "tiering-policies-api").Logger(),
 	}
 }
 
@@ -173,9 +179,24 @@ func (h *TieringPoliciesHandler) GetEffectivePolicy(c *fiber.Ctx) error {
 	return c.JSON(effective)
 }
 
+// requireTieringLicense checks that the license includes the tiering feature.
+func (h *TieringPoliciesHandler) requireTieringLicense(c *fiber.Ctx) error {
+	if h.licenseClient == nil || !h.licenseClient.CanUseTieredStorage() {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"success": false,
+			"error":   "Tiered storage requires an enterprise license with the 'tiering' feature enabled",
+		})
+	}
+	return c.Next()
+}
+
 // RegisterRoutes registers tiering policy API routes
 func (h *TieringPoliciesHandler) RegisterRoutes(app fiber.Router) {
 	policies := app.Group("/api/v1/tiering/policies")
+	if h.authManager != nil {
+		policies.Use(auth.RequireAdmin(h.authManager))
+	}
+	policies.Use(h.requireTieringLicense)
 
 	policies.Get("/", h.ListPolicies)
 	policies.Get("/:database", h.GetPolicy)
