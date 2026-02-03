@@ -175,6 +175,42 @@ The tiered storage migrator now only moves daily-compacted files to cold tier (S
 
 ## Improvements
 
+### LIKE Query Predicate Optimization
+
+Queries combining `LIKE '%pattern%'` with empty string checks (`col <> ''`) are now automatically optimized by reordering WHERE clause predicates to put cheaper operations first.
+
+**How it works:**
+- Empty string checks (`col <> ''`) are O(1) per row
+- `LIKE '%pattern%'` scans are O(n*m) where n=string length, m=pattern length
+- DuckDB evaluates predicates left-to-right and can short-circuit
+- By filtering out empty strings first, fewer expensive LIKE operations are executed
+
+**Example transformation:**
+```sql
+-- Original query
+SELECT SearchPhrase, MIN(URL), MIN(Title), COUNT(*) AS c
+FROM hits
+WHERE Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> ''
+GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10
+
+-- Automatically rewritten to
+SELECT SearchPhrase, MIN(URL), MIN(Title), COUNT(*) AS c
+FROM hits
+WHERE SearchPhrase <> '' AND Title LIKE '%Google%' AND URL NOT LIKE '%.google.%'
+GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10
+```
+
+**Performance results (ClickBench Q23):**
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| Avg latency | 1106ms | 967ms | **12.6% faster** |
+
+**Key features:**
+- Transparent to applications - no query changes required
+- Fast-path: queries without LIKE or WHERE skip optimization entirely
+- Only reorders when beneficial (predicates must contain LIKE)
+- Works with both LIKE and NOT LIKE patterns
+
 - **Audit log SQLite storage**: Added `auto_vacuum = INCREMENTAL` to prevent database file bloat. Runs full `VACUUM` on startup and incremental vacuum after retention cleanup deletes old entries.
 
 ## Upgrade Notes
