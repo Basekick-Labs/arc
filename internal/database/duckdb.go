@@ -145,6 +145,7 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		logger.Warn().Err(err).Msg("Failed to set preserve_insertion_order")
 	}
 
+
 	// Configure httpfs extension for S3 access if credentials are provided
 	if cfg.S3AccessKey != "" && cfg.S3SecretKey != "" {
 		if err := configureS3Access(db, cfg, logger); err != nil {

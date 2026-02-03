@@ -1310,6 +1310,11 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 	sql = rewriteTimeBucket(sql)
 	sql = rewriteDateTrunc(sql)
 
+	// Phase 0c: Optimize LIKE patterns by reordering WHERE clause predicates
+	// Moves cheap operations (empty string checks) before expensive operations (LIKE scans)
+	// This allows DuckDB to short-circuit rows early, reducing LIKE evaluations
+	sql, _ = OptimizeLikePatterns(sql)
+
 	// Single pass to detect features (replaces 3 separate strings.Contains calls)
 	features := scanSQLFeatures(sql)
 
@@ -1865,6 +1870,9 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database
 	// Phase 0b: Rewrite time functions to faster epoch-based alternatives BEFORE masking
 	sql = rewriteTimeBucket(sql)
 	sql = rewriteDateTrunc(sql)
+
+	// Phase 0c: Optimize LIKE patterns by reordering WHERE clause predicates
+	sql, _ = OptimizeLikePatterns(sql)
 
 	// Single pass to detect features
 	features := scanSQLFeatures(sql)
