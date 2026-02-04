@@ -45,6 +45,7 @@ type NodeInfo struct {
 	State       string `json:"state"`
 	Version     string `json:"version"`
 	WriterState string `json:"writer_state,omitempty"` // "primary", "standby", or "" for non-writers
+	CoreCount   int    `json:"core_count"`             // Number of CPU cores on this node
 }
 
 // AddNodePayload is the payload for CommandAddNode.
@@ -422,6 +423,17 @@ func (f *ClusterFSM) NodeCount() int {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return len(f.nodes)
+}
+
+// TotalCores returns the sum of CoreCount across all nodes in the FSM.
+func (f *ClusterFSM) TotalCores() int {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	total := 0
+	for _, node := range f.nodes {
+		total += node.CoreCount
+	}
+	return total
 }
 
 // fsmSnapshot implements raft.FSMSnapshot.

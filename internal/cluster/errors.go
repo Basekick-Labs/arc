@@ -39,4 +39,7 @@ var (
 
 	// ErrTooManyNodes indicates the registry has reached its maximum node capacity.
 	ErrTooManyNodes = errors.New("maximum number of cluster nodes reached")
+
+	// ErrCoreLimitExceeded indicates adding this node would exceed the licensed core limit.
+	ErrCoreLimitExceeded = errors.New("cluster core limit exceeded")
 )

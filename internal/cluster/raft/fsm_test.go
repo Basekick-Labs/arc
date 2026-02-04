@@ -295,6 +295,102 @@ func TestFSMCloneIsolation(t *testing.T) {
 	}
 }
 
+func TestFSMTotalCores(t *testing.T) {
+	fsm := newTestFSM()
+
+	// Add nodes with different core counts
+	nodes := []NodeInfo{
+		{ID: "node-1", Name: "Node 1", Role: "writer", CoreCount: 8},
+		{ID: "node-2", Name: "Node 2", Role: "reader", CoreCount: 4},
+		{ID: "node-3", Name: "Node 3", Role: "reader", CoreCount: 16},
+	}
+
+	for _, node := range nodes {
+		data := makeCommand(t, CommandAddNode, AddNodePayload{Node: node})
+		fsm.Apply(&raft.Log{Data: data})
+	}
+
+	// Total should be 28 (8+4+16)
+	if total := fsm.TotalCores(); total != 28 {
+		t.Errorf("TotalCores() = %d, want 28", total)
+	}
+}
+
+func TestFSMTotalCoresAfterRemove(t *testing.T) {
+	fsm := newTestFSM()
+
+	// Add nodes
+	fsm.Apply(&raft.Log{Data: makeCommand(t, CommandAddNode, AddNodePayload{
+		Node: NodeInfo{ID: "node-1", Name: "Node 1", Role: "writer", CoreCount: 8},
+	})})
+	fsm.Apply(&raft.Log{Data: makeCommand(t, CommandAddNode, AddNodePayload{
+		Node: NodeInfo{ID: "node-2", Name: "Node 2", Role: "reader", CoreCount: 4},
+	})})
+
+	// Total should be 12
+	if total := fsm.TotalCores(); total != 12 {
+		t.Errorf("TotalCores() = %d, want 12", total)
+	}
+
+	// Remove node-1
+	fsm.Apply(&raft.Log{Data: makeCommand(t, CommandRemoveNode, RemoveNodePayload{
+		NodeID: "node-1",
+	})})
+
+	// Total should now be 4
+	if total := fsm.TotalCores(); total != 4 {
+		t.Errorf("TotalCores() after remove = %d, want 4", total)
+	}
+}
+
+func TestFSMTotalCoresEmpty(t *testing.T) {
+	fsm := newTestFSM()
+
+	// Empty FSM should have 0 cores
+	if total := fsm.TotalCores(); total != 0 {
+		t.Errorf("TotalCores() on empty FSM = %d, want 0", total)
+	}
+}
+
+func TestFSMSnapshotRestoreWithCores(t *testing.T) {
+	fsm := newTestFSM()
+
+	// Add node with cores
+	node := NodeInfo{ID: "node-1", Name: "Node 1", Role: "writer", CoreCount: 16}
+	fsm.Apply(&raft.Log{Data: makeCommand(t, CommandAddNode, AddNodePayload{Node: node})})
+
+	// Verify initial state
+	if total := fsm.TotalCores(); total != 16 {
+		t.Errorf("Initial TotalCores() = %d, want 16", total)
+	}
+
+	// Snapshot and restore
+	snapshot, err := fsm.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot() failed: %v", err)
+	}
+
+	var buf bytes.Buffer
+	sink := &testSnapshotSink{Writer: &buf}
+	if err := snapshot.Persist(sink); err != nil {
+		t.Fatalf("Persist() failed: %v", err)
+	}
+
+	fsm2 := newTestFSM()
+	if err := fsm2.Restore(io.NopCloser(&buf)); err != nil {
+		t.Fatalf("Restore() failed: %v", err)
+	}
+
+	// Verify cores preserved
+	restored, _ := fsm2.GetNode("node-1")
+	if restored.CoreCount != 16 {
+		t.Errorf("Restored CoreCount = %d, want 16", restored.CoreCount)
+	}
+	if fsm2.TotalCores() != 16 {
+		t.Errorf("Restored TotalCores() = %d, want 16", fsm2.TotalCores())
+	}
+}
+
 // testSnapshotSink implements raft.SnapshotSink for testing
 type testSnapshotSink struct {
 	io.Writer

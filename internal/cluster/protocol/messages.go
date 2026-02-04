@@ -73,17 +73,19 @@ type JoinRequest struct {
 	APIAddr     string `json:"api_addr"`     // HTTP API address
 	CoordAddr   string `json:"coord_addr"`   // Coordinator address (for peer communication)
 	Version     string `json:"version"`
+	CoreCount   int    `json:"core_count"`   // Number of CPU cores (GOMAXPROCS) on this node
 }
 
 // NodeInfo represents a node in the cluster (used in JoinResponse).
 type NodeInfo struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Role        string `json:"role"`
-	State       string `json:"state"`
-	RaftAddr    string `json:"raft_addr"`
-	APIAddr     string `json:"api_addr"`
-	CoordAddr   string `json:"coord_addr"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Role      string `json:"role"`
+	State     string `json:"state"`
+	RaftAddr  string `json:"raft_addr"`
+	APIAddr   string `json:"api_addr"`
+	CoordAddr string `json:"coord_addr"`
+	CoreCount int    `json:"core_count"` // Number of CPU cores on this node
 }
 
 // JoinResponse is sent by the leader after processing a join request.

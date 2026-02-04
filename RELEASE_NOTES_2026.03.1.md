@@ -154,6 +154,33 @@ failover_cooldown = 60      # seconds between failovers
 
 **Requires:** Enterprise license with `writer_failover` feature.
 
+### Cluster-Wide Core Limit Enforcement
+
+Enterprise license core limits (`MaxCores`) are now enforced cluster-wide instead of per-node. This ensures the licensed core count applies to the total cores across all nodes in the cluster.
+
+**How it works:**
+- Each node reports its core count (`runtime.GOMAXPROCS(0)`) when joining the cluster
+- The cluster leader validates that adding a new node won't exceed the license `MaxCores` limit
+- Nodes that would cause the cluster to exceed the limit are rejected with a clear error message
+
+**Example with Enterprise license (128 cores):**
+| Configuration | Total Cores | Allowed? |
+|---------------|-------------|----------|
+| 4 nodes × 32 cores | 128 | ✅ Yes |
+| 2 nodes × 64 cores | 128 | ✅ Yes |
+| 4 nodes × 64 cores | 256 | ❌ Rejected |
+
+**Cluster status now shows core usage:**
+```json
+{
+  "total_cores": 64,
+  "max_cores": 128,
+  "cores_remaining": 64
+}
+```
+
+**Note:** Per-node GOMAXPROCS limiting is still applied as defense-in-depth. The `Unlimited` tier (`MaxCores=0`) skips cluster-wide validation.
+
 ### Tiered Storage: Daily-Compacted-Only Migration Gate
 
 The tiered storage migrator now only moves daily-compacted files to cold tier (S3 GLACIER / Azure Archive). Raw ingestion files and hourly-compacted files are skipped, ensuring fewer, larger objects land in archive storage.

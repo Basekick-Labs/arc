@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -398,6 +399,7 @@ func (c *Coordinator) tryJoinViaSeed(seedAddr string) error {
 		APIAddr:     c.localNode.APIAddress,
 		CoordAddr:   c.cfg.AdvertiseAddr,
 		Version:     c.localNode.Version,
+		CoreCount:   runtime.GOMAXPROCS(0), // Report current GOMAXPROCS as core count
 	}
 
 	// If RaftAdvertiseAddr is empty, use RaftBindAddr
@@ -542,6 +544,7 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 		Str("node_id", req.NodeID).
 		Str("role", req.Role).
 		Str("cluster", req.ClusterName).
+		Int("core_count", req.CoreCount).
 		Msg("Received join request")
 
 	// Validate cluster name
@@ -554,6 +557,17 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 	if c.raftNode != nil && !c.raftNode.IsLeader() {
 		// Redirect to leader
 		c.sendLeaderRedirect(conn)
+		return
+	}
+
+	// Validate cluster-wide core limit
+	if err := c.validateCoreLimitForJoin(req.NodeID, req.CoreCount); err != nil {
+		c.logger.Warn().
+			Err(err).
+			Str("node_id", req.NodeID).
+			Int("core_count", req.CoreCount).
+			Msg("Join rejected: core limit exceeded")
+		c.sendJoinError(conn, err.Error())
 		return
 	}
 
@@ -583,6 +597,7 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 			APIAddress:  req.APIAddr,
 			State:       string(StateHealthy),
 			Version:     req.Version,
+			CoreCount:   req.CoreCount,
 		}
 		if err := c.raftNode.AddNode(nodeInfo, 5*time.Second); err != nil {
 			c.logger.Error().Err(err).Str("node_id", req.NodeID).Msg("Failed to add node to FSM")
@@ -852,6 +867,20 @@ func (c *Coordinator) Status() map[string]interface{} {
 		status["router"] = c.router.Stats()
 	}
 
+	// Add cluster-wide core limit info
+	if c.raftFSM != nil {
+		totalCores := c.raftFSM.TotalCores()
+		status["total_cores"] = totalCores
+
+		if c.licenseClient != nil && c.licenseClient.GetLicense() != nil {
+			maxCores := c.licenseClient.GetLicense().MaxCores
+			status["max_cores"] = maxCores
+			if maxCores > 0 {
+				status["cores_remaining"] = maxCores - totalCores
+			}
+		}
+	}
+
 	return status
 }
 
@@ -882,6 +911,58 @@ func validateClusteringLicense(client *license.Client) error {
 	if !lic.HasFeature(license.FeatureClustering) {
 		return ErrClusteringFeatureRequired
 	}
+	return nil
+}
+
+// validateCoreLimitForJoin checks if adding a node with the given core count
+// would exceed the license MaxCores limit for the entire cluster.
+// Returns nil if the join is allowed, or an error if it would exceed the limit.
+func (c *Coordinator) validateCoreLimitForJoin(nodeID string, coreCount int) error {
+	if c.licenseClient == nil {
+		return nil
+	}
+
+	lic := c.licenseClient.GetLicense()
+	if lic == nil {
+		return ErrLicenseRequired
+	}
+
+	// MaxCores=0 means unlimited
+	if lic.MaxCores == 0 {
+		c.logger.Debug().
+			Str("node_id", nodeID).
+			Int("core_count", coreCount).
+			Msg("Unlimited license tier - skipping core limit validation")
+		return nil
+	}
+
+	// Get current total cores from FSM
+	currentTotal := 0
+	if c.raftFSM != nil {
+		currentTotal = c.raftFSM.TotalCores()
+
+		// Handle rejoin case: subtract existing node's cores from total
+		if existingNode, exists := c.raftFSM.GetNode(nodeID); exists {
+			currentTotal -= existingNode.CoreCount
+		}
+	}
+
+	// Calculate what the total would be after adding this node
+	projectedTotal := currentTotal + coreCount
+
+	if projectedTotal > lic.MaxCores {
+		return fmt.Errorf("%w: current cluster cores=%d, new node cores=%d, projected total=%d, license limit=%d",
+			ErrCoreLimitExceeded, currentTotal, coreCount, projectedTotal, lic.MaxCores)
+	}
+
+	c.logger.Info().
+		Str("node_id", nodeID).
+		Int("node_cores", coreCount).
+		Int("current_total", currentTotal).
+		Int("projected_total", projectedTotal).
+		Int("license_max", lic.MaxCores).
+		Msg("Core limit validation passed")
+
 	return nil
 }
 
@@ -927,6 +1008,7 @@ func (c *Coordinator) registerSelfInFSMWhenLeader() {
 		APIAddress:  c.localNode.APIAddress,
 		State:       string(StateHealthy),
 		Version:     c.localNode.Version,
+		CoreCount:   runtime.GOMAXPROCS(0), // Leader's core count
 	}
 
 	if err := c.raftNode.AddNode(nodeInfo, 5*time.Second); err != nil {

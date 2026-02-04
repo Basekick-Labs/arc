@@ -381,8 +381,8 @@ After analyzing industry standards (TimescaleDB, InfluxDB, ClickHouse Cloud, Dat
 
 #### Option A: Core-Based Licensing (Recommended)
 
-| Tier | Cores | Annual Price | Features |
-|------|-------|--------------|----------|
+| Tier | Cluster-Wide Cores | Annual Price | Features |
+|------|-------------------|--------------|----------|
 | Starter | Up to 8 | $5,000/year | All Enterprise features, single cluster |
 | Professional | Up to 32 | $15,000/year | + Multi-cluster, priority support |
 | Enterprise | Up to 128 | $40,000/year | + Dedicated support, SLA |
@@ -390,11 +390,25 @@ After analyzing industry standards (TimescaleDB, InfluxDB, ClickHouse Cloud, Dat
 
 *Multi-year discounts available. Contact sales.*
 
+**Core Counting:**
+- Core limits apply to the **total cores across all nodes** in the cluster
+- Each node reports its core count (`GOMAXPROCS`) when joining the cluster
+- The cluster leader validates that adding a new node won't exceed the license limit
+- Nodes that would cause the cluster to exceed the limit are rejected with a clear error
+
+**Example with Enterprise license (128 cores):**
+| Configuration | Total Cores | Allowed? |
+|---------------|-------------|----------|
+| 4 nodes × 32 cores | 128 | Yes |
+| 2 nodes × 64 cores | 128 | Yes |
+| 4 nodes × 64 cores | 256 | No (exceeds limit) |
+
 **Rationale:**
 - Cores correlate with workload capacity
 - Simple to understand and audit
 - Common in database industry (Oracle, SQL Server model)
 - Allows growth within tier before upgrade
+- Cluster-wide counting prevents license arbitrage via many small nodes
 
 #### Option B: Node-Based Licensing
 
@@ -428,8 +442,8 @@ After analyzing industry standards (TimescaleDB, InfluxDB, ClickHouse Cloud, Dat
 **Base License (Core-Based):**
 ```
 Arc Enterprise License
-├── Base: $500/month for 8 cores
-├── Additional cores: $50/core/month
+├── Base: $500/month for 8 cores (cluster-wide total)
+├── Additional cores: $50/core/month (cluster-wide total)
 └── Includes: All Enterprise features
 ```
 
