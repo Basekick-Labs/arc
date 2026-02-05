@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -29,6 +30,18 @@ const (
 	flushTypeAsync = "async"
 	flushTypeSync  = "sync"
 )
+
+// sharedArrowAllocator is a package-level shared allocator for Arrow operations.
+// memory.GoAllocator is documented as thread-safe for concurrent use.
+// Using a shared instance avoids allocator overhead per-write operation.
+var sharedArrowAllocator = memory.NewGoAllocator()
+
+// int64SliceToTimestamps converts []int64 to []arrow.Timestamp without allocation.
+// This is safe because arrow.Timestamp is defined as `type Timestamp int64`.
+// The conversion is a simple reinterpretation of the slice header.
+func int64SliceToTimestamps(src []int64) []arrow.Timestamp {
+	return *(*[]arrow.Timestamp)(unsafe.Pointer(&src))
+}
 
 // getFlushMessageType returns the human-readable flush type message for logging
 func getFlushMessageType(flushType string) string {
@@ -449,7 +462,8 @@ func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement stri
 	}
 
 	// Create Arrow arrays from columns
-	mem := memory.NewGoAllocator()
+	// MEMORY FIX: Use shared allocator instead of creating new one per write
+	mem := sharedArrowAllocator
 	builders := make([]array.Builder, len(schema.Fields()))
 	arrays := make([]arrow.Array, len(schema.Fields()))
 
@@ -489,11 +503,9 @@ func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement stri
 			builder := array.NewTimestampBuilder(mem, arrow.FixedWidthTypes.Timestamp_us.(*arrow.TimestampType))
 			builders[i] = builder
 			if intCol, ok := col.([]int64); ok {
-				// Convert int64 microseconds to arrow.Timestamp
-				tsValues := make([]arrow.Timestamp, len(intCol))
-				for j, v := range intCol {
-					tsValues[j] = arrow.Timestamp(v)
-				}
+				// MEMORY FIX: Zero-copy conversion from []int64 to []arrow.Timestamp
+				// This avoids allocating a temporary slice on every write
+				tsValues := int64SliceToTimestamps(intCol)
 				builder.AppendValues(tsValues, nil)
 			} else {
 				return nil, fmt.Errorf("column %s: expected []int64 for timestamp, got %T", field.Name, col)
@@ -1539,6 +1551,13 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 
 	// Merge typed column batches
 	merged, err := b.mergeBatches(records)
+
+	// MEMORY FIX: Clear batch references immediately after merge to allow GC
+	// The merged map now owns all the data, original batches can be collected
+	for i := range records {
+		records[i] = nil
+	}
+
 	if err != nil {
 		b.logger.Error().
 			Err(err).
@@ -1659,6 +1678,9 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	// Write one file per hour
 	totalWritten := 0
 	for hourID, bucket := range hourBuckets {
+		// Save count before clearing indices
+		splitRecordCount := len(bucket.indices)
+
 		// Extract rows for this hour using the index list
 		hourColumns := sliceColumnsByIndices(merged, bucket.indices)
 
@@ -1685,7 +1707,6 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		// Register file in tiering metadata for query routing
 		b.registerFileInTiering(ctx, database, measurement, storagePath, bucketTime, int64(len(parquetData)))
 
-		splitRecordCount := len(bucket.indices)
 		totalWritten += splitRecordCount
 
 		b.logger.Info().

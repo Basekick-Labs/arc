@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
@@ -16,12 +17,29 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// Buffer pool configuration for memory management
+const (
+	// Initial buffer size for the pool (256KB covers most payloads)
+	initialBufferSize = 256 * 1024
+	// Maximum buffer size to return to pool (1MB) - larger buffers are discarded
+	// This prevents memory accumulation from occasional large payloads
+	maxPooledBufferSize = 1024 * 1024
+)
+
+// Track oversized buffer discards for monitoring
+var decompBufferDiscards atomic.Int64
+
+// GetDecompBufferDiscards returns the count of oversized buffers not returned to pool
+func GetDecompBufferDiscards() int64 {
+	return decompBufferDiscards.Load()
+}
+
 // Pool for decompression buffers - reduces GC pressure under high load
 var decompressBufferPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		// Pre-allocate 256KB buffer to cover most decompressed payloads
 		// This avoids reallocations during decompression for typical payloads
-		buf := make([]byte, 0, 256*1024)
+		buf := make([]byte, 0, initialBufferSize)
 		return &buf
 	},
 }
@@ -371,8 +389,21 @@ func (h *MsgPackHandler) decompressGzip(data []byte) (*PooledBuffer, error) {
 		return nil, fmt.Errorf("decompressed payload exceeds %s limit", formatBytes(maxDecompressedSize))
 	}
 
-	// Update the pooled buffer pointer with potentially grown buffer
-	*bufPtr = buf
+	// MEMORY FIX: Cap buffer size before returning to pool
+	// If the buffer grew beyond maxPooledBufferSize during decompression,
+	// allocate a fresh small buffer for the pool to prevent memory accumulation.
+	// The oversized buffer will be GC'd after this request completes.
+	if cap(buf) > maxPooledBufferSize {
+		// Don't pollute pool with oversized buffers
+		decompBufferDiscards.Add(1)
+		metrics.Get().IncDecompBufferDiscards()
+		// Create fresh buffer for pool return
+		freshBuf := make([]byte, 0, initialBufferSize)
+		bufPtr = &freshBuf
+	} else {
+		// Buffer is within limits, update pointer for pool return
+		*bufPtr = buf
+	}
 
 	// ZERO-COPY: Return pooled buffer directly - caller MUST call Release()
 	// This eliminates the ~45KB allocation per request that was causing GC pressure
@@ -426,8 +457,21 @@ func (h *MsgPackHandler) decompressZstd(data []byte) (*PooledBuffer, error) {
 		return nil, fmt.Errorf("decompressed payload exceeds %s limit", formatBytes(maxDecompressedSize))
 	}
 
-	// Update the pooled buffer pointer with potentially grown buffer
-	*bufPtr = buf
+	// MEMORY FIX: Cap buffer size before returning to pool
+	// If the buffer grew beyond maxPooledBufferSize during decompression,
+	// allocate a fresh small buffer for the pool to prevent memory accumulation.
+	// The oversized buffer will be GC'd after this request completes.
+	if cap(buf) > maxPooledBufferSize {
+		// Don't pollute pool with oversized buffers
+		decompBufferDiscards.Add(1)
+		metrics.Get().IncDecompBufferDiscards()
+		// Create fresh buffer for pool return
+		freshBuf := make([]byte, 0, initialBufferSize)
+		bufPtr = &freshBuf
+	} else {
+		// Buffer is within limits, update pointer for pool return
+		*bufPtr = buf
+	}
 
 	// ZERO-COPY: Return pooled buffer directly - caller MUST call Release()
 	return &PooledBuffer{
