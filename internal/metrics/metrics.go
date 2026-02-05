@@ -103,6 +103,9 @@ type Metrics struct {
 	walRecoveryTotal      atomic.Int64 // Successful WAL recovery operations
 	walRecoveryRecords    atomic.Int64 // Total records recovered from WAL
 
+	// Decompression pool metrics
+	decompBufferDiscards atomic.Int64 // Oversized buffers not returned to pool
+
 	logger zerolog.Logger
 }
 
@@ -259,6 +262,9 @@ func (m *Metrics) IncWALRecordsPreserved(count int64) { m.walRecordsPreserved.Ad
 func (m *Metrics) IncWALRecoveryTotal()               { m.walRecoveryTotal.Add(1) }
 func (m *Metrics) IncWALRecoveryRecords(count int64)  { m.walRecoveryRecords.Add(count) }
 
+// Decompression Pool Metrics
+func (m *Metrics) IncDecompBufferDiscards()           { m.decompBufferDiscards.Add(1) }
+
 // Snapshot returns all metrics as a map (for JSON endpoint)
 func (m *Metrics) Snapshot() map[string]interface{} {
 	var memStats runtime.MemStats
@@ -368,6 +374,9 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"wal_records_preserved": m.walRecordsPreserved.Load(),
 		"wal_recovery_total":    m.walRecoveryTotal.Load(),
 		"wal_recovery_records":  m.walRecoveryRecords.Load(),
+
+		// Decompression Pool
+		"decomp_buffer_discards": m.decompBufferDiscards.Load(),
 	}
 }
 
@@ -609,6 +618,11 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_recovery_records_total Total records recovered from WAL\n"...)
 	b = append(b, "# TYPE arc_wal_recovery_records_total counter\n"...)
 	b = appendMetric(b, "arc_wal_recovery_records_total", float64(m.walRecoveryRecords.Load()))
+
+	// Decompression pool metrics
+	b = append(b, "# HELP arc_decomp_buffer_discards_total Oversized decompression buffers not returned to pool\n"...)
+	b = append(b, "# TYPE arc_decomp_buffer_discards_total counter\n"...)
+	b = appendMetric(b, "arc_decomp_buffer_discards_total", float64(m.decompBufferDiscards.Load()))
 
 	return string(b)
 }
