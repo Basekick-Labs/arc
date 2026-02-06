@@ -749,6 +749,15 @@ func main() {
 			Msg("Node running with cluster role")
 	}
 
+	// Auto-sync: ensure HTTP write timeout can accommodate query timeout
+	if cfg.Query.Timeout > 0 && cfg.Server.WriteTimeout < cfg.Query.Timeout {
+		log.Warn().
+			Int("write_timeout", cfg.Server.WriteTimeout).
+			Int("query_timeout", cfg.Query.Timeout).
+			Msg("HTTP write_timeout is less than query timeout - adjusting to match")
+		cfg.Server.WriteTimeout = cfg.Query.Timeout
+	}
+
 	// Initialize HTTP server
 	serverConfig := &api.ServerConfig{
 		Port:            cfg.Server.Port,
