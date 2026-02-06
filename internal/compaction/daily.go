@@ -15,14 +15,16 @@ import (
 // Compacts hourly-compacted files into daily files
 type DailyTier struct {
 	*BaseTier
+	SkipFileAgeCheckDays int // Skip file creation time check for partitions older than this
 }
 
 // DailyTierConfig holds configuration for daily compaction tier
 type DailyTierConfig struct {
 	StorageBackend storage.Backend
 	MinAgeHours    int  // Don't compact days younger than this (default: 24)
-	MinFiles       int  // Only compact days with at least this many files (default: 12)
-	TargetSizeMB   int  // Target size for compacted files (default: 2048)
+	MinFiles             int // Only compact days with at least this many files (default: 12)
+	SkipFileAgeCheckDays int // Skip file creation time check for partitions older than this (default: 7)
+	TargetSizeMB         int // Target size for compacted files (default: 2048)
 	Enabled        bool // Enable daily compaction (default: true)
 	Logger         zerolog.Logger
 }
@@ -35,6 +37,9 @@ func NewDailyTier(cfg *DailyTierConfig) *DailyTier {
 	}
 	if cfg.MinFiles == 0 {
 		cfg.MinFiles = 12 // At least half a day of data
+	}
+	if cfg.SkipFileAgeCheckDays <= 0 {
+		cfg.SkipFileAgeCheckDays = 7 // Skip file age check for partitions older than 7 days
 	}
 	if cfg.TargetSizeMB == 0 {
 		cfg.TargetSizeMB = 2048 // 2GB target
@@ -49,11 +54,13 @@ func NewDailyTier(cfg *DailyTierConfig) *DailyTier {
 			Enabled:        cfg.Enabled,
 			Logger:         cfg.Logger.With().Str("tier", "daily").Logger(),
 		}),
+		SkipFileAgeCheckDays: cfg.SkipFileAgeCheckDays,
 	}
 
 	tier.Logger.Info().
 		Int("min_age_hours", cfg.MinAgeHours).
 		Int("min_files", cfg.MinFiles).
+		Int("skip_file_age_check_days", cfg.SkipFileAgeCheckDays).
 		Int("target_size_mb", cfg.TargetSizeMB).
 		Bool("enabled", cfg.Enabled).
 		Msg("Daily compaction tier initialized")
@@ -212,20 +219,26 @@ func (t *DailyTier) listDayPartitions(ctx context.Context, database, measurement
 
 	// Convert map to slice, filtering by newest file creation time
 	result := make([]Candidate, 0, len(partitions))
-	for _, p := range partitions {
-		// Check newest file creation time in this partition
-		newestFileTime := extractNewestFileTime(p.Files)
+	skipAgeThreshold := time.Duration(t.SkipFileAgeCheckDays*24) * time.Hour
 
-		// Skip partition if newest file is too recent (younger than cutoff)
-		// This handles late-arriving data: if files are still being written to this partition,
-		// wait until all files are old enough before compacting
-		if !newestFileTime.IsZero() && newestFileTime.After(cutoffTime) {
-			t.Logger.Debug().
-				Str("partition", p.PartitionPath).
-				Time("newest_file", newestFileTime).
-				Time("cutoff", cutoffTime).
-				Msg("Skipping partition: has files newer than cutoff")
-			continue
+	for _, p := range partitions {
+		// For partitions older than SkipFileAgeCheckDays, bypass file creation time check.
+		// This unblocks backfilled historical data while preserving late-sync protection for recent data.
+		partitionAge := time.Since(p.PartitionTime)
+		if partitionAge <= skipAgeThreshold {
+			newestFileTime := extractNewestFileTime(p.Files)
+
+			// Skip partition if newest file is too recent (younger than cutoff)
+			// This handles late-arriving data: if files are still being written to this partition,
+			// wait until all files are old enough before compacting
+			if !newestFileTime.IsZero() && newestFileTime.After(cutoffTime) {
+				t.Logger.Debug().
+					Str("partition", p.PartitionPath).
+					Time("newest_file", newestFileTime).
+					Time("cutoff", cutoffTime).
+					Msg("Skipping partition: has recent files")
+				continue
+			}
 		}
 
 		result = append(result, *p)

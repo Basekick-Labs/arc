@@ -118,8 +118,9 @@ type CompactionConfig struct {
 	HourlyMinAgeHours int    // Minimum age for hourly compaction (default: 1)
 	HourlyMinFiles    int    // Minimum files for hourly compaction (default: 10)
 	DailyMinAgeHours  int    // Minimum age for daily compaction (default: 24)
-	DailyMinFiles     int    // Minimum files for daily compaction (default: 12)
-	MaxConcurrent     int    // Max concurrent compaction jobs (default: 2)
+	DailyMinFiles             int // Minimum files for daily compaction (default: 12)
+	DailySkipFileAgeCheckDays int // Skip file creation time check for partitions older than N days (default: 7)
+	MaxConcurrent             int // Max concurrent compaction jobs (default: 2)
 	TempDirectory     string // Temporary directory for compaction files (default: ./data/compaction)
 }
 
@@ -426,8 +427,9 @@ func Load() (*Config, error) {
 			HourlyMinAgeHours: v.GetInt("compaction.hourly_min_age_hours"),
 			HourlyMinFiles:    v.GetInt("compaction.hourly_min_files"),
 			DailyMinAgeHours:  v.GetInt("compaction.daily_min_age_hours"),
-			DailyMinFiles:     v.GetInt("compaction.daily_min_files"),
-			MaxConcurrent:     v.GetInt("compaction.max_concurrent"),
+			DailyMinFiles:             v.GetInt("compaction.daily_min_files"),
+			DailySkipFileAgeCheckDays: v.GetInt("compaction.daily_skip_file_age_check_days"),
+			MaxConcurrent:             v.GetInt("compaction.max_concurrent"),
 			TempDirectory:     v.GetString("compaction.temp_directory"),
 		},
 		WAL: WALConfig{
@@ -622,6 +624,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.hourly_min_files", 10)           // 10 files minimum
 	v.SetDefault("compaction.daily_min_age_hours", 24)        // 24 hours min age
 	v.SetDefault("compaction.daily_min_files", 12)            // 12 files minimum
+	v.SetDefault("compaction.daily_skip_file_age_check_days", 7) // Skip file age check for partitions older than 7 days
 	v.SetDefault("compaction.max_concurrent", 2)              // 2 concurrent jobs
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
 
