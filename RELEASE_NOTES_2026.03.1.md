@@ -198,7 +198,19 @@ The tiered storage migrator now only moves daily-compacted files to cold tier (S
 
 ## Bug Fixes
 
-*None yet*
+### Daily Compaction Blocked for Backfilled Data (#187)
+
+Daily compaction previously checked the **file creation timestamp** (extracted from filename) against a 24-hour cutoff for all partitions. This blocked compaction of backfilled historical data — files created today for data from years ago would be skipped because the files were "too new."
+
+**Fix:** Partitions older than 7 days now bypass the file creation time check entirely, since no late-arriving data is expected for old partitions. Recent partitions (≤7 days) retain the check to protect IoT late-sync scenarios.
+
+**Configuration:**
+```toml
+[compaction]
+daily_skip_file_age_check_days = 7  # default: 7 (0 = disabled)
+```
+
+**Env var:** `ARC_COMPACTION_DAILY_SKIP_FILE_AGE_CHECK_DAYS`
 
 ## Improvements
 

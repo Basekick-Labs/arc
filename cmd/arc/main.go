@@ -526,11 +526,12 @@ func main() {
 
 		if cfg.Compaction.DailyEnabled {
 			dailyTier := compaction.NewDailyTier(&compaction.DailyTierConfig{
-				StorageBackend: storageBackend,
-				MinAgeHours:    cfg.Compaction.DailyMinAgeHours,
-				MinFiles:       cfg.Compaction.DailyMinFiles,
-				Enabled:        true,
-				Logger:         logger.Get("compaction"),
+				StorageBackend:       storageBackend,
+				MinAgeHours:          cfg.Compaction.DailyMinAgeHours,
+				MinFiles:             cfg.Compaction.DailyMinFiles,
+				SkipFileAgeCheckDays: cfg.Compaction.DailySkipFileAgeCheckDays,
+				Enabled:              true,
+				Logger:               logger.Get("compaction"),
 			})
 			tiers = append(tiers, dailyTier)
 		}
