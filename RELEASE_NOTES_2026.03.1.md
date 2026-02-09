@@ -66,6 +66,51 @@ curl -X POST "http://localhost:8000/api/v1/import/parquet?measurement=events" \
 
 ## Enterprise Features
 
+### Query Governance (Rate Limiting & Quotas)
+
+Arc Enterprise now includes per-token query governance with sliding window rate limiting and hourly/daily query quotas. This gives teams resource predictability and prevents runaway queries from impacting cluster performance.
+
+**Capabilities:**
+- Per-token **rate limiting** (requests/minute, requests/hour) using a sliding window algorithm
+- Per-token **query quotas** (max queries/hour, max queries/day)
+- Per-token **max rows per query** — queries stop early and return partial results with a warning
+- Per-token **timeout override** — enforce shorter timeouts for specific tokens
+- **Default policies** via config — apply limits to all tokens without explicit policies
+- **Hot-reconfigurable** — policy changes take effect immediately without restart
+
+**Configuration:**
+```toml
+[governance]
+enabled = true
+default_rate_limit_per_min = 60      # 0 = unlimited
+default_rate_limit_per_hour = 1000
+default_max_queries_per_hour = 500
+default_max_queries_per_day = 5000
+default_max_rows_per_query = 100000
+```
+
+**API endpoints (admin-only, license-gated):**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/v1/governance/policies` | Create policy for a token |
+| `GET` | `/api/v1/governance/policies` | List all policies |
+| `GET` | `/api/v1/governance/policies/:token_id` | Get policy for token |
+| `PUT` | `/api/v1/governance/policies/:token_id` | Update policy |
+| `DELETE` | `/api/v1/governance/policies/:token_id` | Delete policy |
+| `GET` | `/api/v1/governance/usage/:token_id` | Current usage + remaining quota |
+
+**Rate limited responses return HTTP 429 with `Retry-After` header:**
+```json
+{
+  "success": false,
+  "error": "Rate limit exceeded: 60 queries per minute",
+  "retry_after_sec": 3
+}
+```
+
+**Requires:** Enterprise license with `query_governance` feature.
+
 ### Audit Logging
 
 Arc Enterprise now includes structured audit logging that records authentication events, RBAC changes, data access, and administrative actions to SQLite. All audit data is queryable via REST API.
@@ -193,6 +238,9 @@ The tiered storage migrator now only moves daily-compacted files to cold tier (S
 
 | Metric | Description |
 |--------|-------------|
+| `arc_governance_rate_limited_total` | Queries rejected by rate limiting |
+| `arc_governance_quota_exhausted_total` | Queries rejected by quota limits |
+| `arc_governance_policies_active` | Number of active governance policies |
 | `arc_audit_events_total` | Total audit events logged |
 | `arc_audit_write_errors` | Audit log write failures |
 
@@ -211,6 +259,10 @@ daily_skip_file_age_check_days = 7  # default: 7 (0 = disabled)
 ```
 
 **Env var:** `ARC_COMPACTION_DAILY_SKIP_FILE_AGE_CHECK_DAYS`
+
+### HTTP Write Timeout vs Query Timeout Mismatch (#185)
+
+HTTP `WriteTimeout` (30s default) was lower than `query.timeout` (300s default), causing long-running queries to fail with a connection timeout before the result could be written back. Arc now auto-syncs `WriteTimeout` to match `query.timeout` at startup when the mismatch is detected, with a warning log.
 
 ## Improvements
 
@@ -258,4 +310,4 @@ GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10
 
 ## Dependencies
 
-*No new dependencies*
+- **github.com/gofiber/fiber/v2**: 2.52.10 → 2.52.11 — defensive copying bug fixes, limiter middleware improvements, mounted sub-app error handler fix

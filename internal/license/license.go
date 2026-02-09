@@ -24,6 +24,7 @@ const (
 	FeatureAutoAggregation    = "auto_aggregation"
 	FeatureAuditLogging       = "audit_logging"
 	FeatureWriterFailover     = "writer_failover"
+	FeatureQueryGovernance    = "query_governance"
 )
 
 // License represents a validated license
@@ -111,6 +112,12 @@ func (l *License) CanUseAuditLogging() bool {
 // CanUseWriterFailover returns true if the license allows automatic writer failover
 func (l *License) CanUseWriterFailover() bool {
 	return l.HasFeature(FeatureWriterFailover)
+}
+
+// CanUseQueryGovernance returns true if the license allows query governance
+// Requires enterprise license with the query_governance feature
+func (l *License) CanUseQueryGovernance() bool {
+	return l.HasFeature(FeatureQueryGovernance)
 }
 
 // TierFromString converts a string to a Tier

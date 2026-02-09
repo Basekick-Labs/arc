@@ -33,6 +33,7 @@ type Config struct {
 	TieredStorage   TieredStorageConfig
 	AuditLog        AuditLogConfig
 	Backup          BackupConfig
+	Governance      GovernanceConfig
 }
 
 type ServerConfig struct {
@@ -244,6 +245,17 @@ type AuditLogConfig struct {
 	Enabled       bool // Enable audit logging (requires enterprise license)
 	RetentionDays int  // How long to keep audit logs (default: 90)
 	IncludeReads  bool // Log read/query operations (default: false, high volume)
+}
+
+// GovernanceConfig holds configuration for query governance (Enterprise feature).
+// Provides per-token rate limiting and query quotas for resource predictability.
+type GovernanceConfig struct {
+	Enabled                 bool // Enable query governance (requires enterprise license with query_governance feature)
+	DefaultRateLimitPerMin  int  // Default rate limit per minute for all tokens (0 = unlimited)
+	DefaultRateLimitPerHour int  // Default rate limit per hour for all tokens (0 = unlimited)
+	DefaultMaxQueriesPerHour int // Default max queries per hour per token (0 = unlimited)
+	DefaultMaxQueriesPerDay  int // Default max queries per day per token (0 = unlimited)
+	DefaultMaxRowsPerQuery   int // Default max rows returned per query (0 = unlimited)
 }
 
 type BackupConfig struct {
@@ -553,6 +565,14 @@ func Load() (*Config, error) {
 			RetentionDays: v.GetInt("audit_log.retention_days"),
 			IncludeReads:  v.GetBool("audit_log.include_reads"),
 		},
+		Governance: GovernanceConfig{
+			Enabled:                 v.GetBool("governance.enabled"),
+			DefaultRateLimitPerMin:  v.GetInt("governance.default_rate_limit_per_min"),
+			DefaultRateLimitPerHour: v.GetInt("governance.default_rate_limit_per_hour"),
+			DefaultMaxQueriesPerHour: v.GetInt("governance.default_max_queries_per_hour"),
+			DefaultMaxQueriesPerDay:  v.GetInt("governance.default_max_queries_per_day"),
+			DefaultMaxRowsPerQuery:   v.GetInt("governance.default_max_rows_per_query"),
+		},
 	}
 
 	return cfg, nil
@@ -756,6 +776,14 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("audit_log.enabled", false)
 	v.SetDefault("audit_log.retention_days", 90)
 	v.SetDefault("audit_log.include_reads", false)
+
+	// Query governance defaults (Enterprise feature)
+	v.SetDefault("governance.enabled", false)
+	v.SetDefault("governance.default_rate_limit_per_min", 0)
+	v.SetDefault("governance.default_rate_limit_per_hour", 0)
+	v.SetDefault("governance.default_max_queries_per_hour", 0)
+	v.SetDefault("governance.default_max_queries_per_day", 0)
+	v.SetDefault("governance.default_max_rows_per_query", 0)
 
 	// Backup defaults
 	v.SetDefault("backup.enabled", true)

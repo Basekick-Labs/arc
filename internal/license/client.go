@@ -371,6 +371,13 @@ func (c *Client) CanUseWriterFailover() bool {
 	return c.license != nil && c.license.CanUseWriterFailover()
 }
 
+// CanUseQueryGovernance returns true if query governance is allowed
+func (c *Client) CanUseQueryGovernance() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.license != nil && c.license.CanUseQueryGovernance()
+}
+
 // GetFingerprint returns the machine fingerprint
 func (c *Client) GetFingerprint() string {
 	return c.fingerprint

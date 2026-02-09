@@ -16,6 +16,8 @@ import (
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/database"
+	"github.com/basekick-labs/arc/internal/governance"
+	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/pruning"
 	"github.com/basekick-labs/arc/internal/query"
@@ -463,6 +465,10 @@ type QueryHandler struct {
 
 	// Tiering support for multi-tier query routing (hot/cold)
 	tieringManager *tiering.Manager
+
+	// Query governance (Enterprise feature - rate limiting and quotas)
+	governanceManager *governance.Manager
+	licenseClient     *license.Client
 }
 
 // isDebugEnabled returns true if debug logging is enabled.
@@ -632,6 +638,12 @@ func (h *QueryHandler) SetRouter(router *cluster.Router) {
 // When set, queries will check both hot and cold tiers for data.
 func (h *QueryHandler) SetTieringManager(manager *tiering.Manager) {
 	h.tieringManager = manager
+}
+
+// SetGovernance sets the governance manager and license client for query rate limiting and quotas.
+func (h *QueryHandler) SetGovernance(manager *governance.Manager, lc *license.Client) {
+	h.governanceManager = manager
+	h.licenseClient = lc
 }
 
 // extractTableReferences extracts all database.measurement references from SQL
@@ -895,6 +907,37 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 	}
 
 localProcessing:
+
+	// Query governance enforcement (Enterprise feature - rate limiting and quotas)
+	var governanceMaxRows int
+	var governanceTimeout time.Duration
+	if h.governanceManager != nil && h.licenseClient != nil && h.licenseClient.CanUseQueryGovernance() {
+		if tokenInfo := auth.GetTokenInfo(c); tokenInfo != nil {
+			if result := h.governanceManager.CheckRateLimit(tokenInfo.ID); !result.Allowed {
+				c.Set("Retry-After", strconv.Itoa(result.RetryAfterSec))
+				m.IncQueryErrors()
+				metrics.Get().IncGovernanceRateLimited()
+				return c.Status(fiber.StatusTooManyRequests).JSON(QueryResponse{
+					Success:   false,
+					Error:     result.Reason,
+					Timestamp: timestamp,
+				})
+			}
+			if result := h.governanceManager.CheckQuota(tokenInfo.ID); !result.Allowed {
+				m.IncQueryErrors()
+				metrics.Get().IncGovernanceQuotaExhausted()
+				return c.Status(fiber.StatusTooManyRequests).JSON(QueryResponse{
+					Success:   false,
+					Error:     result.Reason,
+					Timestamp: timestamp,
+				})
+			} else {
+				governanceMaxRows = result.MaxRows
+				governanceTimeout = result.MaxDuration
+			}
+		}
+	}
+
 	// Parse request body
 	var req QueryRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -1050,6 +1093,10 @@ localProcessing:
 			}
 			data = append(data, row)
 			rowCount++
+
+			if governanceMaxRows > 0 && rowCount >= governanceMaxRows {
+				break
+			}
 		}
 
 		if err := iter.Err(); err != nil {
@@ -1061,10 +1108,15 @@ localProcessing:
 		var err error
 
 		// Create context with timeout if configured (0 = no timeout)
+		// Per-token governance timeout overrides the global timeout
+		effectiveTimeout := h.queryTimeout
+		if governanceTimeout > 0 {
+			effectiveTimeout = governanceTimeout
+		}
 		ctx := c.UserContext()
 		var cancel context.CancelFunc
-		if h.queryTimeout > 0 {
-			ctx, cancel = context.WithTimeout(ctx, h.queryTimeout)
+		if effectiveTimeout > 0 {
+			ctx, cancel = context.WithTimeout(ctx, effectiveTimeout)
 			defer cancel()
 		}
 
@@ -1138,6 +1190,10 @@ localProcessing:
 			}
 			data = append(data, row)
 			rowCount++
+
+			if governanceMaxRows > 0 && rowCount >= governanceMaxRows {
+				break
+			}
 		}
 
 		if err := rows.Err(); err != nil {
