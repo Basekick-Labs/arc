@@ -51,7 +51,7 @@ s3_path_style = true        # True for MinIO, false for AWS
 # -----------------------------------------------------------------------------
 [ingest]
 max_buffer_size = 2500000   # Records before flush (default: 50000)
-max_buffer_age_ms = 500    # Max buffer age before flush
+max_buffer_age_ms = 100   # Max buffer age before flush
 
 # Sort keys for compression/query performance: "measurement:col1,col2"
 # Time column is always appended automatically
@@ -169,6 +169,12 @@ include_reads = false           # Log GET/query requests (high volume)
 [backup]
 enabled = true
 local_path = "./data/backups"           # Directory for local backups
+
+# Query Management (Enterprise)
+# -----------------------------------------------------------------------------
+# [query_management]
+# enabled = false
+# history_size = 100              # Number of completed queries to keep in memory
 
 [wal]
 enabled = false

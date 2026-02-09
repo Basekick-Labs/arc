@@ -226,6 +226,35 @@ Enterprise license core limits (`MaxCores`) are now enforced cluster-wide instea
 
 **Note:** Per-node GOMAXPROCS limiting is still applied as defense-in-depth. The `Unlimited` tier (`MaxCores=0`) skips cluster-wide validation.
 
+### Long-Running Query Management
+
+Arc Enterprise now includes real-time query tracking, cancellation, and history. Administrators can monitor active queries, cancel runaway queries mid-flight, and review recent query history — all through a REST API.
+
+**Capabilities:**
+- **Active query tracking** — every query is assigned a unique ID and tracked in-memory with start time, SQL text, token info, and execution status
+- **Query cancellation** — cancel any running query by ID via `DELETE /api/v1/queries/:id`, which propagates cancellation to DuckDB through Go's context mechanism
+- **Query history** — configurable ring buffer (default: 100) of recently completed, cancelled, failed, and timed-out queries
+- **Client correlation** — `X-Arc-Query-ID` response header returned on every tracked query for client-side tracking
+- **Parallel query fix** — parallel executor now respects query timeout (previously used `context.Background()` with no timeout)
+
+**Configuration:**
+```toml
+[query_management]
+enabled = true
+history_size = 100        # Ring buffer size for completed query history
+```
+
+**API endpoints (admin-only, license-gated):**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/v1/queries/active` | List all currently running queries |
+| `GET` | `/api/v1/queries/history?limit=50` | Recent completed/cancelled/failed queries |
+| `GET` | `/api/v1/queries/:id` | Get specific query details |
+| `DELETE` | `/api/v1/queries/:id` | Cancel a running query |
+
+**Requires:** Enterprise license with `query_management` feature.
+
 ### Tiered Storage: Daily-Compacted-Only Migration Gate
 
 The tiered storage migrator now only moves daily-compacted files to cold tier (S3 GLACIER / Azure Archive). Raw ingestion files and hourly-compacted files are skipped, ensuring fewer, larger objects land in archive storage.
@@ -243,6 +272,9 @@ The tiered storage migrator now only moves daily-compacted files to cold tier (S
 | `arc_governance_policies_active` | Number of active governance policies |
 | `arc_audit_events_total` | Total audit events logged |
 | `arc_audit_write_errors` | Audit log write failures |
+| `arc_query_mgmt_active_queries` | Currently running tracked queries |
+| `arc_query_mgmt_cancelled_total` | Total queries cancelled via management API |
+| `arc_query_mgmt_history_size` | Completed queries in history buffer |
 
 ## Bug Fixes
 

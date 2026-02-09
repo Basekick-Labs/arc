@@ -111,6 +111,11 @@ type Metrics struct {
 	governanceQuotaExhausted atomic.Int64 // Queries rejected by quota exhaustion
 	governancePoliciesActive atomic.Int64 // Number of active governance policies
 
+	// Query Management metrics
+	queryMgmtActiveQueries  atomic.Int64 // Currently running tracked queries (gauge)
+	queryMgmtCancelledTotal atomic.Int64 // Total queries cancelled via API
+	queryMgmtHistorySize    atomic.Int64 // Completed queries in history buffer (gauge)
+
 	logger zerolog.Logger
 }
 
@@ -275,6 +280,11 @@ func (m *Metrics) IncGovernanceRateLimited()               { m.governanceRateLim
 func (m *Metrics) IncGovernanceQuotaExhausted()            { m.governanceQuotaExhausted.Add(1) }
 func (m *Metrics) SetGovernancePoliciesActive(n int64)     { m.governancePoliciesActive.Store(n) }
 
+// Query Management Metrics
+func (m *Metrics) SetQueryMgmtActiveQueries(n int64) { m.queryMgmtActiveQueries.Store(n) }
+func (m *Metrics) IncQueryMgmtCancelled()            { m.queryMgmtCancelledTotal.Add(1) }
+func (m *Metrics) SetQueryMgmtHistorySize(n int64)   { m.queryMgmtHistorySize.Store(n) }
+
 // Snapshot returns all metrics as a map (for JSON endpoint)
 func (m *Metrics) Snapshot() map[string]interface{} {
 	var memStats runtime.MemStats
@@ -392,6 +402,11 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"governance_rate_limited_total":    m.governanceRateLimited.Load(),
 		"governance_quota_exhausted_total": m.governanceQuotaExhausted.Load(),
 		"governance_policies_active":       m.governancePoliciesActive.Load(),
+
+		// Query Management
+		"query_mgmt_active_queries":  m.queryMgmtActiveQueries.Load(),
+		"query_mgmt_cancelled_total": m.queryMgmtCancelledTotal.Load(),
+		"query_mgmt_history_size":    m.queryMgmtHistorySize.Load(),
 	}
 }
 
@@ -651,6 +666,19 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_governance_policies_active Number of active governance policies\n"...)
 	b = append(b, "# TYPE arc_governance_policies_active gauge\n"...)
 	b = appendMetric(b, "arc_governance_policies_active", float64(m.governancePoliciesActive.Load()))
+
+	// Query Management metrics
+	b = append(b, "# HELP arc_query_mgmt_active_queries Currently running tracked queries\n"...)
+	b = append(b, "# TYPE arc_query_mgmt_active_queries gauge\n"...)
+	b = appendMetric(b, "arc_query_mgmt_active_queries", float64(m.queryMgmtActiveQueries.Load()))
+
+	b = append(b, "# HELP arc_query_mgmt_cancelled_total Total queries cancelled via management API\n"...)
+	b = append(b, "# TYPE arc_query_mgmt_cancelled_total counter\n"...)
+	b = appendMetric(b, "arc_query_mgmt_cancelled_total", float64(m.queryMgmtCancelledTotal.Load()))
+
+	b = append(b, "# HELP arc_query_mgmt_history_size Completed queries in history buffer\n"...)
+	b = append(b, "# TYPE arc_query_mgmt_history_size gauge\n"...)
+	b = appendMetric(b, "arc_query_mgmt_history_size", float64(m.queryMgmtHistorySize.Load()))
 
 	return string(b)
 }

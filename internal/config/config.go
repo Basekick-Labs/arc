@@ -34,6 +34,7 @@ type Config struct {
 	AuditLog        AuditLogConfig
 	Backup          BackupConfig
 	Governance      GovernanceConfig
+	QueryManagement QueryManagementConfig
 }
 
 type ServerConfig struct {
@@ -256,6 +257,13 @@ type GovernanceConfig struct {
 	DefaultMaxQueriesPerHour int // Default max queries per hour per token (0 = unlimited)
 	DefaultMaxQueriesPerDay  int // Default max queries per day per token (0 = unlimited)
 	DefaultMaxRowsPerQuery   int // Default max rows returned per query (0 = unlimited)
+}
+
+// QueryManagementConfig holds configuration for long-running query management (Enterprise feature).
+// Provides active query tracking, cancellation, and history.
+type QueryManagementConfig struct {
+	Enabled     bool // Enable query management (requires enterprise license with query_management feature)
+	HistorySize int  // Ring buffer size for completed query history (default: 100)
 }
 
 type BackupConfig struct {
@@ -573,6 +581,10 @@ func Load() (*Config, error) {
 			DefaultMaxQueriesPerDay:  v.GetInt("governance.default_max_queries_per_day"),
 			DefaultMaxRowsPerQuery:   v.GetInt("governance.default_max_rows_per_query"),
 		},
+		QueryManagement: QueryManagementConfig{
+			Enabled:     v.GetBool("query_management.enabled"),
+			HistorySize: v.GetInt("query_management.history_size"),
+		},
 	}
 
 	return cfg, nil
@@ -784,6 +796,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("governance.default_max_queries_per_hour", 0)
 	v.SetDefault("governance.default_max_queries_per_day", 0)
 	v.SetDefault("governance.default_max_rows_per_query", 0)
+
+	// Query management defaults (Enterprise feature)
+	v.SetDefault("query_management.enabled", false)
+	v.SetDefault("query_management.history_size", 100)
 
 	// Backup defaults
 	v.SetDefault("backup.enabled", true)
