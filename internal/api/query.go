@@ -917,6 +917,12 @@ localProcessing:
 				c.Set("Retry-After", strconv.Itoa(result.RetryAfterSec))
 				m.IncQueryErrors()
 				metrics.Get().IncGovernanceRateLimited()
+				h.logger.Warn().
+					Int64("token_id", tokenInfo.ID).
+					Str("token_name", tokenInfo.Name).
+					Str("reason", result.Reason).
+					Int("retry_after_sec", result.RetryAfterSec).
+					Msg("Query rejected: rate limit exceeded")
 				return c.Status(fiber.StatusTooManyRequests).JSON(QueryResponse{
 					Success:   false,
 					Error:     result.Reason,
@@ -926,6 +932,11 @@ localProcessing:
 			if result := h.governanceManager.CheckQuota(tokenInfo.ID); !result.Allowed {
 				m.IncQueryErrors()
 				metrics.Get().IncGovernanceQuotaExhausted()
+				h.logger.Warn().
+					Int64("token_id", tokenInfo.ID).
+					Str("token_name", tokenInfo.Name).
+					Str("reason", result.Reason).
+					Msg("Query rejected: quota exhausted")
 				return c.Status(fiber.StatusTooManyRequests).JSON(QueryResponse{
 					Success:   false,
 					Error:     result.Reason,
