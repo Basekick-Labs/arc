@@ -20,6 +20,7 @@ import (
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/governance"
 	"github.com/basekick-labs/arc/internal/database"
+	"github.com/basekick-labs/arc/internal/queryregistry"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/logger"
@@ -926,6 +927,31 @@ func main() {
 						Msg("Query governance enabled")
 				}
 			}
+		}
+	}
+
+	// Initialize Query Management (Enterprise feature - requires valid license)
+	if cfg.QueryManagement.Enabled {
+		if licenseClient == nil {
+			log.Warn().Msg("Query management requires enterprise license - feature disabled")
+		} else if !licenseClient.CanUseQueryManagement() {
+			log.Warn().Msg("License does not include query_management feature - feature disabled")
+		} else {
+			qmRegistry := queryregistry.NewRegistry(&queryregistry.RegistryConfig{
+				HistorySize: cfg.QueryManagement.HistorySize,
+			}, logger.Get("query-registry"))
+
+			// Wire registry to query handler
+			queryHandler.SetQueryRegistry(qmRegistry)
+
+			// Register query management API handler
+			qmHandler := api.NewQueryManagementHandler(qmRegistry, authManager, licenseClient, logger.Get("query-mgmt-api"))
+			qmHandler.RegisterRoutes(server.GetApp())
+
+			log.Info().
+				Bool("enabled", true).
+				Int("history_size", cfg.QueryManagement.HistorySize).
+				Msg("Query management enabled")
 		}
 	}
 

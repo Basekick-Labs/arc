@@ -21,6 +21,7 @@ import (
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/pruning"
 	"github.com/basekick-labs/arc/internal/query"
+	"github.com/basekick-labs/arc/internal/queryregistry"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
@@ -469,6 +470,9 @@ type QueryHandler struct {
 	// Query governance (Enterprise feature - rate limiting and quotas)
 	governanceManager *governance.Manager
 	licenseClient     *license.Client
+
+	// Query management (Enterprise feature - active query tracking and cancellation)
+	queryRegistry *queryregistry.Registry
 }
 
 // isDebugEnabled returns true if debug logging is enabled.
@@ -644,6 +648,11 @@ func (h *QueryHandler) SetTieringManager(manager *tiering.Manager) {
 func (h *QueryHandler) SetGovernance(manager *governance.Manager, lc *license.Client) {
 	h.governanceManager = manager
 	h.licenseClient = lc
+}
+
+// SetQueryRegistry sets the query registry for long-running query management.
+func (h *QueryHandler) SetQueryRegistry(registry *queryregistry.Registry) {
+	h.queryRegistry = registry
 }
 
 // extractTableReferences extracts all database.measurement references from SQL
@@ -1043,20 +1052,65 @@ localProcessing:
 	var rowCount int
 	var profile *database.QueryProfile
 
+	// Register query with management registry if available
+	var queryID string
+	var queryCtx context.Context
+	if h.queryRegistry != nil {
+		var tokenID int64
+		var tokenName string
+		if tokenInfo := auth.GetTokenInfo(c); tokenInfo != nil {
+			tokenID = tokenInfo.ID
+			tokenName = tokenInfo.Name
+		}
+		isParallel := parallelInfo != nil && h.parallelExecutor != nil
+		partCount := 0
+		if isParallel {
+			partCount = len(parallelInfo.Paths)
+		}
+		queryID, queryCtx = h.queryRegistry.Register(
+			c.UserContext(), req.SQL, tokenID, tokenName, c.IP(), isParallel, partCount,
+		)
+		c.Set("X-Arc-Query-ID", queryID)
+	}
+
+	// Compute effective timeout for both parallel and standard paths
+	effectiveTimeout := h.queryTimeout
+	if governanceTimeout > 0 {
+		effectiveTimeout = governanceTimeout
+	}
+
 	// Check for profiling mode
 	profileMode := c.Get("x-arc-profile") == "true"
 
 	// Execute query - use parallel path if available
 	if parallelInfo != nil && h.parallelExecutor != nil {
-		// Parallel partition execution
+		// Parallel partition execution — use registry context if available
+		execCtx := c.UserContext()
+		if queryCtx != nil {
+			execCtx = queryCtx
+		}
+		var cancelTimeout context.CancelFunc
+		if effectiveTimeout > 0 {
+			execCtx, cancelTimeout = context.WithTimeout(execCtx, effectiveTimeout)
+			defer cancelTimeout()
+		}
 		results, err := h.parallelExecutor.ExecutePartitioned(
-			context.Background(),
+			execCtx,
 			parallelInfo.Paths,
 			parallelInfo.QueryTemplate,
 			parallelInfo.ReadParquetOptions,
 		)
 		if err != nil {
 			m.IncQueryErrors()
+			if h.queryRegistry != nil && queryID != "" {
+				if execCtx.Err() == context.DeadlineExceeded {
+					h.queryRegistry.TimedOut(queryID)
+				} else if execCtx.Err() == context.Canceled {
+					// Already marked as cancelled by Cancel() — no-op
+				} else {
+					h.queryRegistry.Fail(queryID, "Parallel query execution failed")
+				}
+			}
 			h.logger.Error().Err(err).Str("sql", req.SQL).Msg("Parallel query execution failed")
 			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 				Success:         false,
@@ -1076,6 +1130,9 @@ localProcessing:
 				}
 			}
 			m.IncQueryErrors()
+			if h.queryRegistry != nil && queryID != "" {
+				h.queryRegistry.Fail(queryID, "Failed to create merged iterator")
+			}
 			h.logger.Error().Err(err).Msg("Failed to create merged iterator")
 			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 				Success:         false,
@@ -1119,12 +1176,10 @@ localProcessing:
 		var err error
 
 		// Create context with timeout if configured (0 = no timeout)
-		// Per-token governance timeout overrides the global timeout
-		effectiveTimeout := h.queryTimeout
-		if governanceTimeout > 0 {
-			effectiveTimeout = governanceTimeout
-		}
 		ctx := c.UserContext()
+		if queryCtx != nil {
+			ctx = queryCtx
+		}
 		var cancel context.CancelFunc
 		if effectiveTimeout > 0 {
 			ctx, cancel = context.WithTimeout(ctx, effectiveTimeout)
@@ -1141,15 +1196,25 @@ localProcessing:
 		if err != nil {
 			m.IncQueryErrors()
 			// Check if it was a timeout
-			if h.queryTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
+			if effectiveTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
 				m.IncQueryTimeouts()
-				h.logger.Error().Err(err).Str("sql", req.SQL).Dur("timeout", h.queryTimeout).Msg("Query timed out")
+				if h.queryRegistry != nil && queryID != "" {
+					h.queryRegistry.TimedOut(queryID)
+				}
+				h.logger.Error().Err(err).Str("sql", req.SQL).Dur("timeout", effectiveTimeout).Msg("Query timed out")
 				return c.Status(fiber.StatusGatewayTimeout).JSON(QueryResponse{
 					Success:         false,
 					Error:           "Query timed out",
 					ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 					Timestamp:       timestamp,
 				})
+			}
+			if h.queryRegistry != nil && queryID != "" {
+				if ctx.Err() == context.Canceled {
+					// Already marked as cancelled by Cancel() — no-op
+				} else {
+					h.queryRegistry.Fail(queryID, "Query execution failed")
+				}
 			}
 			h.logger.Error().Err(err).Str("sql", req.SQL).Msg("Query execution failed")
 			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
@@ -1213,6 +1278,11 @@ localProcessing:
 	}
 
 	executionTime := float64(time.Since(start).Milliseconds())
+
+	// Record query completion in registry
+	if h.queryRegistry != nil && queryID != "" {
+		h.queryRegistry.Complete(queryID, rowCount)
+	}
 
 	// Record success metrics
 	m.IncQuerySuccess()

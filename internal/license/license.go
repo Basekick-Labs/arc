@@ -25,6 +25,7 @@ const (
 	FeatureAuditLogging       = "audit_logging"
 	FeatureWriterFailover     = "writer_failover"
 	FeatureQueryGovernance    = "query_governance"
+	FeatureQueryManagement   = "query_management"
 )
 
 // License represents a validated license
@@ -118,6 +119,12 @@ func (l *License) CanUseWriterFailover() bool {
 // Requires enterprise license with the query_governance feature
 func (l *License) CanUseQueryGovernance() bool {
 	return l.HasFeature(FeatureQueryGovernance)
+}
+
+// CanUseQueryManagement returns true if the license allows query management
+// Requires enterprise license with the query_management feature
+func (l *License) CanUseQueryManagement() bool {
+	return l.HasFeature(FeatureQueryManagement)
 }
 
 // TierFromString converts a string to a Tier

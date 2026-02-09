@@ -378,6 +378,13 @@ func (c *Client) CanUseQueryGovernance() bool {
 	return c.license != nil && c.license.CanUseQueryGovernance()
 }
 
+// CanUseQueryManagement returns true if query management is allowed
+func (c *Client) CanUseQueryManagement() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.license != nil && c.license.CanUseQueryManagement()
+}
+
 // GetFingerprint returns the machine fingerprint
 func (c *Client) GetFingerprint() string {
 	return c.fingerprint
