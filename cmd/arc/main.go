@@ -18,6 +18,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/compaction"
 	"github.com/basekick-labs/arc/internal/config"
+	"github.com/basekick-labs/arc/internal/governance"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/license"
@@ -877,6 +878,54 @@ func main() {
 			lineProtocolHandler.SetRouter(router)
 			queryHandler.SetRouter(router)
 			log.Info().Msg("Cluster router wired to API handlers for request forwarding")
+		}
+	}
+
+	// Initialize Query Governance (Enterprise feature - requires valid license)
+	if cfg.Governance.Enabled {
+		if licenseClient == nil {
+			log.Warn().Msg("Query governance requires enterprise license - feature disabled")
+		} else if !licenseClient.CanUseQueryGovernance() {
+			log.Warn().Msg("License does not include query_governance feature - feature disabled")
+		} else {
+			governanceDBPath := cfg.Auth.DBPath
+			if governanceDBPath == "" {
+				governanceDBPath = "./data/arc.db"
+			}
+			governanceDB, err := sql.Open("sqlite3", governanceDBPath)
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to open governance database - feature disabled")
+			} else {
+				governanceManager, err := governance.NewManager(&governance.ManagerConfig{
+					DB:     governanceDB,
+					Config: &cfg.Governance,
+					Logger: logger.Get("governance"),
+				})
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to create governance manager - feature disabled")
+				} else {
+					governanceManager.Start()
+					shutdownCoordinator.RegisterHook("governance", func(ctx context.Context) error {
+						return governanceManager.Stop()
+					}, shutdown.PriorityCompaction)
+
+					// Wire governance to query handler
+					queryHandler.SetGovernance(governanceManager, licenseClient)
+
+					// Register governance API handler
+					governanceHandler := api.NewGovernanceHandler(governanceManager, authManager, licenseClient, logger.Get("governance-api"))
+					governanceHandler.RegisterRoutes(server.GetApp())
+
+					log.Info().
+						Bool("enabled", true).
+						Int("default_rate_limit_per_min", cfg.Governance.DefaultRateLimitPerMin).
+						Int("default_rate_limit_per_hour", cfg.Governance.DefaultRateLimitPerHour).
+						Int("default_max_queries_per_hour", cfg.Governance.DefaultMaxQueriesPerHour).
+						Int("default_max_queries_per_day", cfg.Governance.DefaultMaxQueriesPerDay).
+						Int("default_max_rows_per_query", cfg.Governance.DefaultMaxRowsPerQuery).
+						Msg("Query governance enabled")
+				}
+			}
 		}
 	}
 

@@ -106,6 +106,11 @@ type Metrics struct {
 	// Decompression pool metrics
 	decompBufferDiscards atomic.Int64 // Oversized buffers not returned to pool
 
+	// Governance metrics
+	governanceRateLimited    atomic.Int64 // Queries rejected by rate limiting
+	governanceQuotaExhausted atomic.Int64 // Queries rejected by quota exhaustion
+	governancePoliciesActive atomic.Int64 // Number of active governance policies
+
 	logger zerolog.Logger
 }
 
@@ -265,6 +270,11 @@ func (m *Metrics) IncWALRecoveryRecords(count int64)  { m.walRecoveryRecords.Add
 // Decompression Pool Metrics
 func (m *Metrics) IncDecompBufferDiscards()           { m.decompBufferDiscards.Add(1) }
 
+// Governance Metrics
+func (m *Metrics) IncGovernanceRateLimited()               { m.governanceRateLimited.Add(1) }
+func (m *Metrics) IncGovernanceQuotaExhausted()            { m.governanceQuotaExhausted.Add(1) }
+func (m *Metrics) SetGovernancePoliciesActive(n int64)     { m.governancePoliciesActive.Store(n) }
+
 // Snapshot returns all metrics as a map (for JSON endpoint)
 func (m *Metrics) Snapshot() map[string]interface{} {
 	var memStats runtime.MemStats
@@ -377,6 +387,11 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 
 		// Decompression Pool
 		"decomp_buffer_discards": m.decompBufferDiscards.Load(),
+
+		// Governance
+		"governance_rate_limited_total":    m.governanceRateLimited.Load(),
+		"governance_quota_exhausted_total": m.governanceQuotaExhausted.Load(),
+		"governance_policies_active":       m.governancePoliciesActive.Load(),
 	}
 }
 
@@ -623,6 +638,19 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_decomp_buffer_discards_total Oversized decompression buffers not returned to pool\n"...)
 	b = append(b, "# TYPE arc_decomp_buffer_discards_total counter\n"...)
 	b = appendMetric(b, "arc_decomp_buffer_discards_total", float64(m.decompBufferDiscards.Load()))
+
+	// Governance metrics
+	b = append(b, "# HELP arc_governance_rate_limited_total Queries rejected by rate limiting\n"...)
+	b = append(b, "# TYPE arc_governance_rate_limited_total counter\n"...)
+	b = appendMetric(b, "arc_governance_rate_limited_total", float64(m.governanceRateLimited.Load()))
+
+	b = append(b, "# HELP arc_governance_quota_exhausted_total Queries rejected by quota exhaustion\n"...)
+	b = append(b, "# TYPE arc_governance_quota_exhausted_total counter\n"...)
+	b = appendMetric(b, "arc_governance_quota_exhausted_total", float64(m.governanceQuotaExhausted.Load()))
+
+	b = append(b, "# HELP arc_governance_policies_active Number of active governance policies\n"...)
+	b = append(b, "# TYPE arc_governance_policies_active gauge\n"...)
+	b = appendMetric(b, "arc_governance_policies_active", float64(m.governancePoliciesActive.Load()))
 
 	return string(b)
 }
