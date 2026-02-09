@@ -334,6 +334,18 @@ GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10
 - Only reorders when beneficial (predicates must contain LIKE)
 - Works with both LIKE and NOT LIKE patterns
 
+### Per-Database Compaction (#184)
+
+The compaction trigger API now supports an optional `database` parameter to compact a single database instead of all databases. This is useful for large deployments where you want to prioritize compaction for high-traffic databases or trigger compaction after a bulk import to a specific database.
+
+```bash
+# Compact only the "production" database
+curl -X POST "http://localhost:8000/api/v1/compaction/trigger?database=production&tier=hourly" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+When no `database` parameter is provided, compaction runs across all databases as before (backward compatible).
+
 - **Audit log SQLite storage**: Added `auto_vacuum = INCREMENTAL` to prevent database file bloat. Runs full `VACUUM` on startup and incremental vacuum after retention cleanup deletes old entries.
 
 ## Upgrade Notes
