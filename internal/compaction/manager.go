@@ -443,9 +443,21 @@ func (m *Manager) RunCompactionCycle(ctx context.Context) (int64, error) {
 	return m.RunCompactionCycleForTiers(ctx, tierNames)
 }
 
-// RunCompactionCycleForTiers runs a complete compaction cycle for specific tiers
-// tierNames must be non-empty - specify which tiers to run explicitly
+// RunCompactionCycleForTiers runs a complete compaction cycle for specific tiers across all databases.
+// tierNames must be non-empty - specify which tiers to run explicitly.
 func (m *Manager) RunCompactionCycleForTiers(ctx context.Context, tierNames []string) (int64, error) {
+	return m.runCycleInternal(ctx, nil, tierNames)
+}
+
+// RunCompactionCycleForDatabase runs a compaction cycle for a single database.
+// tierNames must be non-empty - specify which tiers to run explicitly.
+func (m *Manager) RunCompactionCycleForDatabase(ctx context.Context, database string, tierNames []string) (int64, error) {
+	return m.runCycleInternal(ctx, []string{database}, tierNames)
+}
+
+// runCycleInternal is the shared implementation for compaction cycles.
+// If filterDatabases is non-nil, only those databases are compacted; otherwise all databases are discovered.
+func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string, tierNames []string) (int64, error) {
 	// Prevent concurrent compaction cycles using atomic compare-and-swap
 	if !m.cycleRunning.CompareAndSwap(false, true) {
 		m.logger.Warn().Msg("Compaction cycle already running, skipping")
@@ -461,10 +473,13 @@ func (m *Manager) RunCompactionCycleForTiers(ctx context.Context, tierNames []st
 		return cycleID, nil
 	}
 
-	m.logger.Info().
+	logEvent := m.logger.Info().
 		Int64("cycle_id", cycleID).
-		Strs("tiers", tierNames).
-		Msg("Starting compaction cycle for specific tiers")
+		Strs("tiers", tierNames)
+	if filterDatabases != nil {
+		logEvent = logEvent.Strs("databases", filterDatabases)
+	}
+	logEvent.Msg("Starting compaction cycle")
 
 	// Run manifest recovery before starting new compactions
 	// This ensures interrupted compactions from previous cycles are completed
@@ -487,12 +502,19 @@ func (m *Manager) RunCompactionCycleForTiers(ctx context.Context, tierNames []st
 		tierFilter[name] = true
 	}
 
-	// Pre-discover databases and measurements ONCE before processing tiers
-	// This avoids redundant storage API calls when multiple tiers are enabled
-	databases, err := m.listDatabases(ctx)
-	if err != nil {
-		m.logger.Error().Err(err).Msg("Failed to list databases for compaction cycle")
-		return cycleID, err
+	// Determine databases to compact
+	var databases []string
+	if filterDatabases != nil {
+		databases = filterDatabases
+	} else {
+		// Pre-discover databases ONCE before processing tiers
+		// This avoids redundant storage API calls when multiple tiers are enabled
+		var err error
+		databases, err = m.listDatabases(ctx)
+		if err != nil {
+			m.logger.Error().Err(err).Msg("Failed to list databases for compaction cycle")
+			return cycleID, err
+		}
 	}
 
 	// Build database -> measurements map to avoid repeated lookups

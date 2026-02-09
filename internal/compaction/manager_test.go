@@ -446,6 +446,63 @@ func TestCandidate(t *testing.T) {
 	}
 }
 
+// TestManager_RunCompactionCycleForDatabase tests per-database compaction
+func TestManager_RunCompactionCycleForDatabase(t *testing.T) {
+	manager, backend, cleanup := setupTestManager(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create test files in multiple databases
+	backend.Write(ctx, "db1/cpu/2025/01/01/00/file1.parquet", []byte("data"))
+	backend.Write(ctx, "db2/mem/2025/01/01/00/file1.parquet", []byte("data"))
+	backend.Write(ctx, "db3/disk/2025/01/01/00/file1.parquet", []byte("data"))
+
+	// Run compaction for db1 only — no tiers configured so it completes quickly
+	// but cycle ID should still increment
+	cycleID, err := manager.RunCompactionCycleForDatabase(ctx, "db1", []string{"hourly"})
+	if err != nil {
+		t.Fatalf("RunCompactionCycleForDatabase failed: %v", err)
+	}
+	if cycleID != 1 {
+		t.Errorf("Expected cycle ID 1, got %d", cycleID)
+	}
+}
+
+// TestManager_RunCompactionCycleForDatabase_EmptyTiers tests that empty tiers skips cycle
+func TestManager_RunCompactionCycleForDatabase_EmptyTiers(t *testing.T) {
+	manager, _, cleanup := setupTestManager(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	cycleID, err := manager.RunCompactionCycleForDatabase(ctx, "db1", nil)
+	if err != nil {
+		t.Fatalf("RunCompactionCycleForDatabase failed: %v", err)
+	}
+	// Empty tier names should still allocate a cycle ID but skip processing
+	if cycleID != 1 {
+		t.Errorf("Expected cycle ID 1, got %d", cycleID)
+	}
+}
+
+// TestManager_RunCompactionCycleForDatabase_ConcurrentBlock tests concurrent cycle guard
+func TestManager_RunCompactionCycleForDatabase_ConcurrentBlock(t *testing.T) {
+	manager, _, cleanup := setupTestManager(t)
+	defer cleanup()
+
+	// Simulate a cycle already running
+	manager.cycleRunning.Store(true)
+
+	ctx := context.Background()
+	_, err := manager.RunCompactionCycleForDatabase(ctx, "db1", []string{"hourly"})
+	if err != ErrCycleAlreadyRunning {
+		t.Errorf("Expected ErrCycleAlreadyRunning, got %v", err)
+	}
+
+	manager.cycleRunning.Store(false)
+}
+
 // TestManager_CleanupOrphanedTempDirs tests orphaned temp directory cleanup
 func TestManager_CleanupOrphanedTempDirs(t *testing.T) {
 	manager, _, cleanup := setupTestManager(t)

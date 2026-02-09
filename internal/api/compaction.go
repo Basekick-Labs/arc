@@ -120,11 +120,21 @@ func (h *CompactionHandler) getCandidates(c *fiber.Ctx) error {
 }
 
 // triggerCompaction handles POST /api/v1/compaction/trigger
-// Query parameter: tier=hourly,daily (optional, defaults to all enabled tiers)
+// Query parameters:
+//   - tier=hourly,daily (optional, defaults to all enabled tiers)
+//   - database=mydb (optional, defaults to all databases)
 func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 	if h.manager == nil {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 			"error": "Compaction not initialized",
+		})
+	}
+
+	// Parse database parameter (reuses same validation as database creation API)
+	dbParam := c.Query("database", "")
+	if dbParam != "" && !isValidDatabaseName(dbParam) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
 		})
 	}
 
@@ -152,16 +162,18 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 		}
 	}
 
-	h.logger.Info().
-		Strs("tiers", tierNames).
-		Msg("Manual compaction triggered via API")
+	logEvent := h.logger.Info().Strs("tiers", tierNames)
+	if dbParam != "" {
+		logEvent = logEvent.Str("database", dbParam)
+	}
+	logEvent.Msg("Manual compaction triggered via API")
 
 	// Check if a cycle is already running
 	if h.manager.IsCycleRunning() {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
-			"error":     "Compaction cycle already running",
-			"message":   "A compaction cycle is already in progress. Please wait for it to complete.",
-			"cycle_id":  h.manager.GetCurrentCycleID(),
+			"error":      "Compaction cycle already running",
+			"message":    "A compaction cycle is already in progress. Please wait for it to complete.",
+			"cycle_id":   h.manager.GetCurrentCycleID(),
 			"is_running": true,
 		})
 	}
@@ -172,31 +184,41 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 		defer cancel()
 
 		start := time.Now()
-		cycleID, err := h.manager.RunCompactionCycleForTiers(ctx, tierNames)
+		var cycleID int64
+		var err error
+		if dbParam != "" {
+			cycleID, err = h.manager.RunCompactionCycleForDatabase(ctx, dbParam, tierNames)
+		} else {
+			cycleID, err = h.manager.RunCompactionCycleForTiers(ctx, tierNames)
+		}
 		duration := time.Since(start)
 
+		logCtx := h.logger.With().
+			Int64("cycle_id", cycleID).
+			Dur("duration", duration).
+			Strs("tiers", tierNames)
+		if dbParam != "" {
+			logCtx = logCtx.Str("database", dbParam)
+		}
+		logger := logCtx.Logger()
+
 		if err != nil {
-			h.logger.Error().
-				Err(err).
-				Int64("cycle_id", cycleID).
-				Dur("duration", duration).
-				Strs("tiers", tierNames).
-				Msg("Manual compaction failed")
+			logger.Error().Err(err).Msg("Manual compaction failed")
 		} else {
-			h.logger.Info().
-				Int64("cycle_id", cycleID).
-				Dur("duration", duration).
-				Strs("tiers", tierNames).
-				Msg("Manual compaction completed")
+			logger.Info().Msg("Manual compaction completed")
 		}
 	}()
 
-	return c.JSON(fiber.Map{
+	resp := fiber.Map{
 		"message":  "Compaction triggered",
 		"status":   "running",
 		"tiers":    tierNames,
 		"cycle_id": h.manager.GetCurrentCycleID() + 1, // Next cycle ID that will be assigned
-	})
+	}
+	if dbParam != "" {
+		resp["database"] = dbParam
+	}
+	return c.JSON(resp)
 }
 
 // getActiveJobs handles GET /api/v1/compaction/jobs
