@@ -493,6 +493,38 @@ func (w *Writer) PurgeAll() (int, error) {
 	return deleted, nil
 }
 
+// PurgeInactive deletes all WAL files except the currently active one.
+// Use this during normal operation (unlike PurgeAll which is for shutdown)
+// to clean up rotated WAL files after their data has been flushed to storage.
+func (w *Writer) PurgeInactive() (int, error) {
+	w.mu.Lock()
+	activePath := w.currentPath
+	w.mu.Unlock()
+
+	pattern := filepath.Join(w.config.WALDir, "*.wal")
+	files, err := filepath.Glob(pattern)
+	if err != nil {
+		return 0, err
+	}
+
+	deleted := 0
+	for _, f := range files {
+		if f == activePath {
+			continue
+		}
+		if err := os.Remove(f); err != nil {
+			w.logger.Error().Err(err).Str("file", f).Msg("Failed to purge inactive WAL file")
+		} else {
+			deleted++
+		}
+	}
+
+	if deleted > 0 {
+		w.logger.Info().Int("deleted", deleted).Msg("Purged inactive WAL files")
+	}
+	return deleted, nil
+}
+
 // Stats returns WAL statistics
 func (w *Writer) Stats() map[string]interface{} {
 	w.mu.Lock()
