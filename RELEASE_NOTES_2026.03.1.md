@@ -308,6 +308,16 @@ flush_timeout_seconds = 30  # default: 30s, 0 = no timeout
 
 **Credit:** Bug identified and fix contributed by [@khalid244](https://github.com/khalid244) in PR #197.
 
+### Query Returns HTTP 500 for Measurements With No Data (#198)
+
+When querying a measurement that has no parquet files on storage yet (e.g., newly created measurement, or DuckDB's httpfs directory cache is stale), DuckDB returns an IO error: `"No files found that match the pattern"`. Arc treated this as a generic query execution failure and returned HTTP 500.
+
+**Root cause:** The query error handler did not distinguish between real DuckDB errors and the expected "no files" condition. This is especially visible on S3 backends where DuckDB's httpfs caches directory listings — a measurement can appear empty for minutes after its first data is written, even though other measurements work fine simultaneously.
+
+**Fix:** The query handler now detects "No files found" errors from DuckDB and returns HTTP 200 with an empty result set (`columns: [], data: [], row_count: 0`) — matching the expected behavior for measurements with no data yet.
+
+**Credit:** Bug identified and fix contributed by [@khalid244](https://github.com/khalid244) in PR #198.
+
 ### Daily Compaction Blocked for Backfilled Data (#187)
 
 Daily compaction previously checked the **file creation timestamp** (extracted from filename) against a 24-hour cutoff for all partitions. This blocked compaction of backfilled historical data — files created today for data from years ago would be skipped because the files were "too new."
