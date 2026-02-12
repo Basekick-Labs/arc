@@ -278,6 +278,22 @@ The tiered storage migrator now only moves daily-compacted files to cold tier (S
 
 ## Bug Fixes
 
+### WAL Periodic Recovery Causes 2x Data Duplication (#199)
+
+During normal runtime (no restarts), the periodic WAL maintenance goroutine replayed all entries from rotated WAL files — including entries already flushed to parquet by the normal buffer flush cycle. This caused every record to be stored exactly twice. On S3 backends with high ingestion volumes, this resulted in 2x the expected row counts.
+
+**Root cause:** The periodic goroutine unconditionally called `RecoverWithOptions()` on rotated WAL files, replaying data through the callback into ArrowBuffer, which then flushed to parquet a second time. The shutdown/restart path was already fixed (PR #173), but the runtime path was not.
+
+**Fix:** The periodic goroutine now operates in two modes:
+- **Normal operation:** Purges rotated WAL files older than a safe age threshold (`3 × MaxBufferAgeMS`, floor 30s) — their data is guaranteed to be in parquet already. No replay, no `FlushAll()`.
+- **Storage failure recovery:** When a flush failure is detected (e.g., S3 outage), falls back to WAL replay to recover data cleared from buffers after the failed flush.
+
+**Additional fixes:**
+- Empty WAL files (7-byte header-only) that accumulated indefinitely are now cleaned up during recovery
+- WAL purge methods consolidated to eliminate code duplication
+
+**Credit:** Bug identified and initial fix contributed by [@khalid244](https://github.com/khalid244) in PR #199.
+
 ### Daily Compaction Blocked for Backfilled Data (#187)
 
 Daily compaction previously checked the **file creation timestamp** (extracted from filename) against a 24-hour cutoff for all partitions. This blocked compaction of backfilled historical data — files created today for data from years ago would be skipped because the files were "too new."

@@ -675,6 +675,11 @@ type ArrowBuffer struct {
 	totalErrors          atomic.Int64
 	queueDepth           atomic.Int64 // Current flush queue depth
 
+	// Flush failure tracking for WAL maintenance.
+	// Set when a storage write fails (S3 outage etc.), cleared after successful recovery.
+	// The periodic WAL goroutine checks this to decide whether WAL replay is needed.
+	hasFlushFailure atomic.Bool
+
 	logger zerolog.Logger
 }
 
@@ -700,6 +705,19 @@ func (b *ArrowBuffer) getShard(bufferKey string) *bufferShard {
 		hash *= 16777619
 	}
 	return b.shards[hash%b.shardCount]
+}
+
+// HasFlushFailure returns true if any flush has failed since the last reset.
+// Used by the periodic WAL maintenance goroutine to decide whether WAL replay
+// is needed (e.g., after an S3 outage where data was cleared from buffers).
+func (b *ArrowBuffer) HasFlushFailure() bool {
+	return b.hasFlushFailure.Load()
+}
+
+// ResetFlushFailure clears the flush failure flag.
+// Called after successful WAL recovery replay.
+func (b *ArrowBuffer) ResetFlushFailure() {
+	b.hasFlushFailure.Store(false)
 }
 
 // getSortKeys returns sort keys for a measurement.
@@ -1565,6 +1583,7 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 			Msg("Failed to merge batches during async flush")
 
 		b.totalErrors.Add(1)
+		b.hasFlushFailure.Store(true)
 		// Data is already in WAL (written at ingest time) - no need to restore to buffer
 		// WAL will be replayed on restart or via periodic recovery
 		return
@@ -1578,6 +1597,7 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 			Int("records", recordCount).
 			Msg("Failed to flush - data preserved in WAL for recovery")
 		b.totalErrors.Add(1)
+		b.hasFlushFailure.Store(true)
 		// Data is already in WAL (written at ingest time) - no memory growth
 		// WAL will be replayed on restart or via periodic recovery
 	}
