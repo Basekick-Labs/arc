@@ -468,10 +468,9 @@ func (w *Writer) Close() error {
 	return nil
 }
 
-// PurgeAll deletes all WAL files in the directory.
-// Call this after a clean shutdown where all data has been flushed to storage,
-// so that recovery on next startup doesn't replay already-persisted data.
-func (w *Writer) PurgeAll() (int, error) {
+// purgeWALFiles deletes WAL files matching the given filter function.
+// Returns the count of deleted files.
+func (w *Writer) purgeWALFiles(shouldDelete func(path string) bool) (int, error) {
 	pattern := filepath.Join(w.config.WALDir, "*.wal")
 	files, err := filepath.Glob(pattern)
 	if err != nil {
@@ -480,17 +479,26 @@ func (w *Writer) PurgeAll() (int, error) {
 
 	deleted := 0
 	for _, f := range files {
-		if err := os.Remove(f); err != nil {
-			w.logger.Error().Err(err).Str("file", f).Msg("Failed to purge WAL file")
-		} else {
-			deleted++
+		if shouldDelete(f) {
+			if err := os.Remove(f); err != nil {
+				w.logger.Error().Err(err).Str("file", f).Msg("Failed to purge WAL file")
+			} else {
+				deleted++
+			}
 		}
 	}
+	return deleted, nil
+}
 
+// PurgeAll deletes all WAL files in the directory.
+// Call this after a clean shutdown where all data has been flushed to storage,
+// so that recovery on next startup doesn't replay already-persisted data.
+func (w *Writer) PurgeAll() (int, error) {
+	deleted, err := w.purgeWALFiles(func(_ string) bool { return true })
 	if deleted > 0 {
 		w.logger.Info().Int("deleted", deleted).Msg("Purged WAL files after clean shutdown")
 	}
-	return deleted, nil
+	return deleted, err
 }
 
 // PurgeInactive deletes all WAL files except the currently active one.
@@ -501,28 +509,39 @@ func (w *Writer) PurgeInactive() (int, error) {
 	activePath := w.currentPath
 	w.mu.Unlock()
 
-	pattern := filepath.Join(w.config.WALDir, "*.wal")
-	files, err := filepath.Glob(pattern)
-	if err != nil {
-		return 0, err
-	}
-
-	deleted := 0
-	for _, f := range files {
-		if f == activePath {
-			continue
-		}
-		if err := os.Remove(f); err != nil {
-			w.logger.Error().Err(err).Str("file", f).Msg("Failed to purge inactive WAL file")
-		} else {
-			deleted++
-		}
-	}
-
+	deleted, err := w.purgeWALFiles(func(path string) bool {
+		return path != activePath
+	})
 	if deleted > 0 {
 		w.logger.Info().Int("deleted", deleted).Msg("Purged inactive WAL files")
 	}
-	return deleted, nil
+	return deleted, err
+}
+
+// PurgeOlderThan deletes inactive WAL files whose modification time is older
+// than the given threshold. The active WAL file is never deleted.
+// Use this during normal operation to safely purge rotated WAL files whose
+// data has been flushed to parquet by the normal buffer flush cycle.
+func (w *Writer) PurgeOlderThan(minAge time.Duration) (int, error) {
+	w.mu.Lock()
+	activePath := w.currentPath
+	w.mu.Unlock()
+
+	now := time.Now()
+	deleted, err := w.purgeWALFiles(func(path string) bool {
+		if path == activePath {
+			return false
+		}
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			return false
+		}
+		return now.Sub(info.ModTime()) > minAge
+	})
+	if deleted > 0 {
+		w.logger.Info().Int("deleted", deleted).Dur("min_age", minAge).Msg("Purged old WAL files")
+	}
+	return deleted, err
 }
 
 // Stats returns WAL statistics

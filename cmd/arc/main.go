@@ -359,42 +359,80 @@ func main() {
 				Msg("WAL recovery complete")
 		}
 
-		// Start periodic WAL recovery (recovers data after S3 outages without restart)
-		walRecoveryCtx, walRecoveryCancel := context.WithCancel(context.Background())
-		shutdownCoordinator.RegisterHook("wal-periodic-recovery", func(ctx context.Context) error {
-			walRecoveryCancel()
+		// Start periodic WAL maintenance goroutine.
+		// Two modes:
+		//   Normal:   purge rotated WAL files older than safeAge (data already in parquet)
+		//   Recovery: when a flush failure is detected (S3 outage), replay WAL files
+		//             to re-buffer data that was cleared from buffers after failed flush
+		walMaintenanceCtx, walMaintenanceCancel := context.WithCancel(context.Background())
+		shutdownCoordinator.RegisterHook("wal-periodic-maintenance", func(ctx context.Context) error {
+			walMaintenanceCancel()
 			return nil
 		}, shutdown.PriorityBuffer)
+
+		// Safe age threshold: after this duration, a rotated WAL file's data MUST have
+		// been flushed to parquet by the normal buffer flush cycle (MaxBufferAgeMS).
+		// We use 3x margin to account for flush worker delays and clock skew.
+		safeAge := time.Duration(cfg.Ingest.MaxBufferAgeMS) * time.Millisecond * 3
+		if safeAge < 30*time.Second {
+			safeAge = 30 * time.Second
+		}
 
 		recoveryInterval := time.Duration(cfg.WAL.RecoveryIntervalSeconds) * time.Second
 		go func() {
 			ticker := time.NewTicker(recoveryInterval)
 			defer ticker.Stop()
-			walLogger := logger.Get("wal-cleanup")
+			walLogger := logger.Get("wal-maintenance")
 
 			for {
 				select {
-				case <-walRecoveryCtx.Done():
+				case <-walMaintenanceCtx.Done():
 					return
 				case <-ticker.C:
-					// Flush all buffers to ensure WAL data is persisted to parquet
-					if err := arrowBuffer.FlushAll(context.Background()); err != nil {
-						walLogger.Error().Err(err).Msg("Periodic flush failed, keeping WAL files")
-						continue
-					}
-					// All data safely in parquet — purge non-active WAL files
-					deleted, err := walWriter.PurgeInactive()
-					if err != nil {
-						walLogger.Error().Err(err).Msg("Periodic WAL purge failed")
-					} else if deleted > 0 {
-						walLogger.Info().Int("deleted", deleted).Msg("Periodic WAL cleanup complete")
+					if arrowBuffer.HasFlushFailure() {
+						// Storage failure detected — replay WAL files to recover data
+						// that was cleared from buffers after failed flush
+						walLogger.Info().Msg("Flush failure detected, attempting WAL recovery")
+						recovery := wal.NewRecovery(cfg.WAL.Directory, walLogger)
+						activeFile := ""
+						if walWriter != nil {
+							activeFile = walWriter.CurrentFile()
+						}
+						stats, err := recovery.RecoverWithOptions(context.Background(), recoveryCallback, &wal.RecoveryOptions{
+							SkipActiveFile:   activeFile,
+							BatchSize:        cfg.WAL.RecoveryBatchSize,
+							ColumnarCallback: columnarCallback,
+						})
+						if err != nil {
+							walLogger.Error().Err(err).Msg("WAL recovery after flush failure failed")
+						} else {
+							if stats.RecoveredFiles > 0 {
+								metrics.Get().IncWALRecoveryTotal()
+								metrics.Get().IncWALRecoveryRecords(int64(stats.RecoveredEntries))
+								walLogger.Info().
+									Int("files", stats.RecoveredFiles).
+									Int("entries", stats.RecoveredEntries).
+									Msg("WAL recovery after flush failure complete")
+							}
+							arrowBuffer.ResetFlushFailure()
+						}
+					} else {
+						// Normal operation — purge WAL files old enough that their data
+						// has been flushed to parquet by the normal buffer flush cycle
+						deleted, err := walWriter.PurgeOlderThan(safeAge)
+						if err != nil {
+							walLogger.Error().Err(err).Msg("Periodic WAL purge failed")
+						} else if deleted > 0 {
+							walLogger.Info().Int("deleted", deleted).Msg("Periodic WAL cleanup complete")
+						}
 					}
 				}
 			}
 		}()
 		log.Info().
 			Dur("interval", recoveryInterval).
-			Msg("Periodic WAL cleanup enabled")
+			Dur("safe_age", safeAge).
+			Msg("Periodic WAL maintenance enabled")
 	}
 
 	// Initialize MQTT Subscription Manager (if enabled)

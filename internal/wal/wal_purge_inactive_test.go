@@ -725,3 +725,172 @@ func TestStartupRecovery_StillWorks(t *testing.T) {
 		t.Errorf("expected 0 WAL files after recovery, got %d", len(remaining))
 	}
 }
+
+// ==========================================================================
+// PurgeOlderThan() method tests
+// ==========================================================================
+
+// TestPurgeOlderThan_DeletesOldFiles verifies PurgeOlderThan deletes files
+// older than the threshold while preserving recent and active files.
+func TestPurgeOlderThan_DeletesOldFiles(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "wal-test-purge-older-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	writer, err := NewWriter(&WriterConfig{
+		WALDir:       tmpDir,
+		SyncMode:     SyncModeAsync,
+		MaxSizeBytes: 100 * 1024 * 1024,
+		Logger:       zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("failed to create writer: %v", err)
+	}
+	defer writer.Close()
+
+	// Create old WAL files with modification time in the past
+	oldFiles := []string{
+		filepath.Join(tmpDir, "arc-20240101_100000.wal"),
+		filepath.Join(tmpDir, "arc-20240101_110000.wal"),
+	}
+	for _, f := range oldFiles {
+		os.WriteFile(f, []byte("old data"), 0600)
+		// Set modification time to 1 hour ago
+		past := time.Now().Add(-1 * time.Hour)
+		os.Chtimes(f, past, past)
+	}
+
+	// Create a recent WAL file (should NOT be deleted)
+	recentFile := filepath.Join(tmpDir, "arc-20240101_120000.wal")
+	os.WriteFile(recentFile, []byte("recent data"), 0600)
+
+	allFiles, _ := filepath.Glob(filepath.Join(tmpDir, "*.wal"))
+	if len(allFiles) != 4 { // 1 active + 2 old + 1 recent
+		t.Fatalf("expected 4 WAL files before purge, got %d", len(allFiles))
+	}
+
+	// Purge files older than 30 seconds
+	deleted, err := writer.PurgeOlderThan(30 * time.Second)
+	if err != nil {
+		t.Fatalf("PurgeOlderThan failed: %v", err)
+	}
+	if deleted != 2 {
+		t.Errorf("expected 2 deleted (old files), got %d", deleted)
+	}
+
+	remaining, _ := filepath.Glob(filepath.Join(tmpDir, "*.wal"))
+	if len(remaining) != 2 { // active + recent
+		t.Errorf("expected 2 remaining WAL files, got %d", len(remaining))
+	}
+
+	// Verify active file still exists
+	if _, err := os.Stat(writer.CurrentFile()); os.IsNotExist(err) {
+		t.Error("active WAL file should not be deleted")
+	}
+	// Verify recent file still exists
+	if _, err := os.Stat(recentFile); os.IsNotExist(err) {
+		t.Error("recent WAL file should not be deleted")
+	}
+}
+
+// TestPurgeOlderThan_NeverDeletesActiveFile verifies the active file is
+// preserved even if it's older than the threshold.
+func TestPurgeOlderThan_NeverDeletesActiveFile(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "wal-test-purge-older-active-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	writer, err := NewWriter(&WriterConfig{
+		WALDir:       tmpDir,
+		SyncMode:     SyncModeAsync,
+		MaxSizeBytes: 100 * 1024 * 1024,
+		Logger:       zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("failed to create writer: %v", err)
+	}
+	defer writer.Close()
+
+	// Set active file's modification time to the past
+	activeFile := writer.CurrentFile()
+	past := time.Now().Add(-2 * time.Hour)
+	os.Chtimes(activeFile, past, past)
+
+	// Purge with threshold shorter than the active file's age
+	deleted, err := writer.PurgeOlderThan(1 * time.Second)
+	if err != nil {
+		t.Fatalf("PurgeOlderThan failed: %v", err)
+	}
+	if deleted != 0 {
+		t.Errorf("expected 0 deleted (active file should be preserved), got %d", deleted)
+	}
+	if _, err := os.Stat(activeFile); os.IsNotExist(err) {
+		t.Error("active WAL file should never be deleted by PurgeOlderThan")
+	}
+}
+
+// TestPurgeOlderThan_NoFilesToPurge verifies PurgeOlderThan returns 0
+// when no files are old enough.
+func TestPurgeOlderThan_NoFilesToPurge(t *testing.T) {
+	writer, tmpDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(tmpDir)
+	defer writer.Close()
+
+	// Create a recent non-active file
+	os.WriteFile(filepath.Join(tmpDir, "arc-20240101_000000.wal"), []byte("data"), 0600)
+
+	deleted, err := writer.PurgeOlderThan(1 * time.Hour)
+	if err != nil {
+		t.Fatalf("PurgeOlderThan failed: %v", err)
+	}
+	if deleted != 0 {
+		t.Errorf("expected 0 deleted (files too recent), got %d", deleted)
+	}
+}
+
+// TestPurgeAll_UsesSharedHelper verifies PurgeAll still works after refactoring
+// to use the shared purgeWALFiles helper.
+func TestPurgeAll_UsesSharedHelper(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "wal-test-purge-all-shared-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	writer, err := NewWriter(&WriterConfig{
+		WALDir:       tmpDir,
+		SyncMode:     SyncModeAsync,
+		MaxSizeBytes: 100 * 1024 * 1024,
+		Logger:       zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("failed to create writer: %v", err)
+	}
+
+	// Create extra files
+	os.WriteFile(filepath.Join(tmpDir, "arc-20240101_000000.wal"), []byte("old"), 0600)
+	os.WriteFile(filepath.Join(tmpDir, "arc-20240102_000000.wal"), []byte("old"), 0600)
+	writer.Close()
+
+	allFiles, _ := filepath.Glob(filepath.Join(tmpDir, "*.wal"))
+	if len(allFiles) != 3 {
+		t.Fatalf("expected 3 WAL files, got %d", len(allFiles))
+	}
+
+	deleted, err := writer.PurgeAll()
+	if err != nil {
+		t.Fatalf("PurgeAll failed: %v", err)
+	}
+	if deleted != 3 {
+		t.Errorf("expected 3 deleted, got %d", deleted)
+	}
+
+	remaining, _ := filepath.Glob(filepath.Join(tmpDir, "*.wal"))
+	if len(remaining) != 0 {
+		t.Errorf("expected 0 remaining, got %d", len(remaining))
+	}
+}
