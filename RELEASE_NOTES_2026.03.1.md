@@ -294,6 +294,20 @@ During normal runtime (no restarts), the periodic WAL maintenance goroutine repl
 
 **Credit:** Bug identified and initial fix contributed by [@khalid244](https://github.com/khalid244) in PR #199.
 
+### S3 Flush Hang: Workers Block Forever on Slow/Unresponsive Storage (#197)
+
+When S3 becomes slow or unresponsive, flush workers called `storage.Write()` with `context.Background()` — no timeout, no cancellation. This caused all flush workers to block indefinitely, preventing new data from being persisted, blocking age-based flushes for all measurements, and causing `Close()` to hang.
+
+**Fix:** All storage write paths now use `context.WithTimeout` derived from the buffer's parent context with a configurable timeout (default 30s). `Close()` cancels in-flight writes immediately. Context cleanup is handled on queue-full drops and channel close to prevent leaks.
+
+**Configuration:**
+```toml
+[ingest]
+flush_timeout_seconds = 30  # default: 30s, 0 = no timeout
+```
+
+**Credit:** Bug identified and fix contributed by [@khalid244](https://github.com/khalid244) in PR #197.
+
 ### Daily Compaction Blocked for Backfilled Data (#187)
 
 Daily compaction previously checked the **file creation timestamp** (extracted from filename) against a 24-hour cutoff for all partitions. This blocked compaction of backfilled historical data — files created today for data from years ago would be skipped because the files were "too new."

@@ -86,9 +86,9 @@ type IngestConfig struct {
 	UseDictionary     bool   // Use dictionary encoding
 	WriteStatistics   bool   // Write Parquet statistics
 	DataPageVersion   string // Parquet data page version: 1.0 or 2.0
-	FlushWorkers      int    // Number of workers for async flush (default: 2x CPU, min 8, max 64)
-	FlushQueueSize    int    // Capacity of flush task queue (default: 4x workers, min 100)
-	ShardCount        int    // Number of buffer shards for lock distribution (default: 32)
+	FlushWorkers        int      // Number of workers for async flush (default: 2x CPU, min 8, max 64)
+	FlushQueueSize      int      // Capacity of flush task queue (default: 4x workers, min 100)
+	ShardCount          int      // Number of buffer shards for lock distribution (default: 32)
 	SortKeys            []string // Per-measurement sort keys: "measurement:col1,col2,time"
 	DefaultSortKeys     string   // Default sort keys for measurements not in SortKeys
 	FlushTimeoutSeconds int      // Timeout for storage writes during flush (default: 30s, 0 = no timeout)
@@ -421,9 +421,9 @@ func Load() (*Config, error) {
 			FlushWorkers:        v.GetInt("ingest.flush_workers"),
 			FlushQueueSize:      v.GetInt("ingest.flush_queue_size"),
 			FlushTimeoutSeconds: v.GetInt("ingest.flush_timeout_seconds"),
-			ShardCount:      v.GetInt("ingest.shard_count"),
-			SortKeys:        v.GetStringSlice("ingest.sort_keys"),
-			DefaultSortKeys: v.GetString("ingest.default_sort_keys"),
+			ShardCount:          v.GetInt("ingest.shard_count"),
+			SortKeys:            v.GetStringSlice("ingest.sort_keys"),
+			DefaultSortKeys:     v.GetString("ingest.default_sort_keys"),
 		},
 		Cache: CacheConfig{
 			Enabled:    v.GetBool("cache.enabled"),
