@@ -1,4 +1,4 @@
-# Arc 2026.03.1 Release Notes
+# Arc 2026.02.2 Release Notes
 
 ## New Features
 
