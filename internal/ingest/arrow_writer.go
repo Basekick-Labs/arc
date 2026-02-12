@@ -617,6 +617,7 @@ type bufferShard struct {
 // flushTask represents a flush operation to be executed by workers
 type flushTask struct {
 	ctx         context.Context
+	cancel      context.CancelFunc // must be called when task completes to release resources
 	bufferKey   string
 	database    string
 	measurement string
@@ -667,6 +668,9 @@ type ArrowBuffer struct {
 	// Sort key configuration (for multi-column sorting)
 	sortKeysConfig  map[string][]string // measurement -> sort keys
 	defaultSortKeys []string            // default sort keys
+
+	// Flush timeout for storage writes (prevents workers from blocking forever on S3 hangs)
+	flushTimeout time.Duration
 
 	// Metrics (using atomic operations to avoid lock contention)
 	totalRecordsBuffered atomic.Int64
@@ -774,6 +778,12 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		defaultSortKeys = []string{"time"}
 	}
 
+	// Parse flush timeout (default 30s)
+	flushTimeout := time.Duration(cfg.FlushTimeoutSeconds) * time.Second
+	if cfg.FlushTimeoutSeconds <= 0 {
+		flushTimeout = 30 * time.Second
+	}
+
 	buffer := &ArrowBuffer{
 		config:          cfg,
 		storage:         storage,
@@ -785,6 +795,7 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		flushTimer:      time.NewTicker(time.Duration(cfg.MaxBufferAgeMS/2) * time.Millisecond),
 		flushQueue:      make(chan flushTask, queueSize),
 		flushWorkers:    flushWorkers,
+		flushTimeout:    flushTimeout,
 		sortKeysConfig:  sortKeysConfig,
 		defaultSortKeys: defaultSortKeys,
 		logger:          logger.With().Str("component", "arrow-buffer").Logger(),
@@ -817,6 +828,7 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		Int("shards", shardCount).
 		Int("flush_workers", flushWorkers).
 		Int("queue_size", queueSize).
+		Dur("flush_timeout", flushTimeout).
 		Msg("ArrowBuffer initialized with lock sharding and worker pool")
 
 	return buffer
@@ -1196,8 +1208,12 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 	// OPTIMIZATION: Queue flush to worker pool (bounded concurrency)
 	// This prevents goroutine explosion under sustained load
 	if shouldFlush {
+		// Use buffer ctx as parent so Close() cancels in-flight writes,
+		// with a timeout to prevent workers from blocking forever on slow storage
+		flushCtx, flushCancel := context.WithTimeout(b.ctx, b.flushTimeout)
 		task := flushTask{
-			ctx:         context.Background(),
+			ctx:         flushCtx,
+			cancel:      flushCancel,
 			bufferKey:   bufferKey,
 			database:    database,
 			measurement: record.Measurement,
@@ -1215,6 +1231,8 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 				Int64("queue_depth", b.queueDepth.Load()).
 				Msg("Buffer size exceeded, queued flush to worker pool")
 		default:
+			// Queue full - cancel the unused context to avoid leak
+			flushCancel()
 			// Queue full - data is already in WAL, don't grow memory
 			b.logger.Warn().
 				Str("buffer_key", bufferKey).
@@ -1513,9 +1531,11 @@ func (b *ArrowBuffer) flushAgedBuffers() {
 					continue
 				}
 
-				if err := b.flushBufferLocked(context.Background(), shard, key, parts[0], parts[1]); err != nil {
+				flushCtx, flushCancel := context.WithTimeout(b.ctx, b.flushTimeout)
+				if err := b.flushBufferLocked(flushCtx, shard, key, parts[0], parts[1]); err != nil {
 					b.logger.Error().Err(err).Str("buffer_key", key).Msg("Failed to flush aged buffer")
 				}
+				flushCancel()
 			}
 		}
 
@@ -1548,7 +1568,11 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 		case <-b.ctx.Done():
 			b.logger.Info().Int("worker_id", workerID).Msg("Flush worker stopping")
 			return
-		case task := <-b.flushQueue:
+		case task, ok := <-b.flushQueue:
+			if !ok {
+				// Channel closed during shutdown
+				return
+			}
 			b.queueDepth.Add(-1)
 
 			b.logger.Debug().
@@ -1560,6 +1584,8 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 
 			// Execute flush
 			b.flushRecordsAsync(task.ctx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount)
+			// Release timeout context resources
+			task.cancel()
 		}
 	}
 }
@@ -2346,9 +2372,11 @@ func (b *ArrowBuffer) Close() error {
 				continue
 			}
 
-			if err := b.flushBufferLocked(context.Background(), shard, key, parts[0], parts[1]); err != nil {
+			flushCtx, flushCancel := context.WithTimeout(context.Background(), b.flushTimeout)
+			if err := b.flushBufferLocked(flushCtx, shard, key, parts[0], parts[1]); err != nil {
 				b.logger.Error().Err(err).Str("buffer_key", key).Msg("Failed to flush buffer during close")
 			}
+			flushCancel()
 		}
 
 		shard.mu.Unlock()
