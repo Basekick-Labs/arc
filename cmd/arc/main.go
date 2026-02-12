@@ -370,42 +370,31 @@ func main() {
 		go func() {
 			ticker := time.NewTicker(recoveryInterval)
 			defer ticker.Stop()
-			walLogger := logger.Get("wal-recovery")
+			walLogger := logger.Get("wal-cleanup")
 
 			for {
 				select {
 				case <-walRecoveryCtx.Done():
 					return
 				case <-ticker.C:
-					recovery := wal.NewRecovery(cfg.WAL.Directory, walLogger)
-					// Skip the active WAL file to avoid reading while it's being written
-					activeFile := ""
-					if walWriter != nil {
-						activeFile = walWriter.CurrentFile()
+					// Flush all buffers to ensure WAL data is persisted to parquet
+					if err := arrowBuffer.FlushAll(context.Background()); err != nil {
+						walLogger.Error().Err(err).Msg("Periodic flush failed, keeping WAL files")
+						continue
 					}
-					stats, err := recovery.RecoverWithOptions(context.Background(), recoveryCallback, &wal.RecoveryOptions{
-						SkipActiveFile:   activeFile,
-						BatchSize:        cfg.WAL.RecoveryBatchSize,
-						ColumnarCallback: columnarCallback,
-					})
+					// All data safely in parquet — purge non-active WAL files
+					deleted, err := walWriter.PurgeInactive()
 					if err != nil {
-						walLogger.Error().Err(err).Msg("Periodic WAL recovery failed")
-					} else if stats.RecoveredFiles > 0 {
-						// Track recovery metrics
-						metrics.Get().IncWALRecoveryTotal()
-						metrics.Get().IncWALRecoveryRecords(int64(stats.RecoveredEntries))
-						walLogger.Info().
-							Int("files", stats.RecoveredFiles).
-							Int("entries", stats.RecoveredEntries).
-							Msg("Periodic WAL recovery complete")
+						walLogger.Error().Err(err).Msg("Periodic WAL purge failed")
+					} else if deleted > 0 {
+						walLogger.Info().Int("deleted", deleted).Msg("Periodic WAL cleanup complete")
 					}
 				}
 			}
 		}()
 		log.Info().
 			Dur("interval", recoveryInterval).
-			Int("batch_size", cfg.WAL.RecoveryBatchSize).
-			Msg("Periodic WAL recovery enabled")
+			Msg("Periodic WAL cleanup enabled")
 	}
 
 	// Initialize MQTT Subscription Manager (if enabled)

@@ -183,6 +183,13 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 					Int("entries", fileRecoveredEntries).
 					Msg("WAL file recovered and deleted")
 			}
+		} else if allEntriesSucceeded && len(entries) == 0 {
+			// Empty WAL file (header-only, 7 bytes) — safe to delete
+			if err := os.Remove(walFile); err != nil {
+				r.logger.Error().Err(err).Str("file", walFile).Msg("Failed to delete empty WAL file")
+			} else {
+				r.logger.Debug().Str("file", filepath.Base(walFile)).Msg("Deleted empty WAL file")
+			}
 		} else if !allEntriesSucceeded {
 			r.logger.Warn().
 				Str("file", filepath.Base(walFile)).
