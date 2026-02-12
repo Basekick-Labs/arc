@@ -1194,6 +1194,25 @@ localProcessing:
 		}
 
 		if err != nil {
+			// Check if this is a "no files found" error — treat as empty result, not an error.
+			// This happens when querying a measurement that has no data on storage yet
+			// (e.g., new measurement, or DuckDB's httpfs cache is stale).
+			if isNoFilesFoundError(err) {
+				h.logger.Info().Str("sql", req.SQL).Msg("No files found for measurement, returning empty result")
+				m.IncQuerySuccess()
+				if h.queryRegistry != nil && queryID != "" {
+					h.queryRegistry.Complete(queryID, 0)
+				}
+				return c.JSON(QueryResponse{
+					Success:         true,
+					Columns:         []string{},
+					Data:            [][]interface{}{},
+					RowCount:        0,
+					ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+					Timestamp:       timestamp,
+				})
+			}
+
 			m.IncQueryErrors()
 			// Check if it was a timeout
 			if effectiveTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
@@ -1303,6 +1322,14 @@ localProcessing:
 		Timestamp:       timestamp,
 		Profile:         profile,
 	})
+}
+
+// isNoFilesFoundError checks if a DuckDB error is the "No files found" IO error.
+// This occurs when read_parquet glob pattern matches zero files on S3/Azure/local storage.
+// This is NOT a real error — it means the measurement has no data yet (or DuckDB's
+// httpfs directory cache is stale). We treat it as an empty result.
+func isNoFilesFoundError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "No files found that match the pattern")
 }
 
 // SQLValidationError represents an error from SQL validation
