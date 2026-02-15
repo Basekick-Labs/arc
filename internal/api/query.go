@@ -883,6 +883,22 @@ func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 	app.Get("/api/v1/measurements", h.listMeasurements)
 	app.Get("/api/v1/query/:measurement", h.queryMeasurement)
 	h.registerArrowRoutes(app)
+
+	// Internal endpoint for distributed cache invalidation (enterprise clustering).
+	// Called by compactor/writer nodes after compaction to clear stale caches on readers.
+	app.Post("/api/v1/internal/cache/invalidate", h.handleCacheInvalidate)
+}
+
+// handleCacheInvalidate handles POST /api/v1/internal/cache/invalidate
+// This is an internal endpoint called by cluster peers after compaction
+// to clear stale glob results and partition metadata from DuckDB caches.
+func (h *QueryHandler) handleCacheInvalidate(c *fiber.Ctx) error {
+	if c.Get("X-Arc-Internal") != "cache-invalidate" {
+		return c.SendStatus(fiber.StatusForbidden)
+	}
+	h.db.ClearHTTPCache()
+	h.InvalidateCaches()
+	return c.SendStatus(fiber.StatusNoContent)
 }
 
 // executeQuery handles POST /api/v1/query - returns JSON response
