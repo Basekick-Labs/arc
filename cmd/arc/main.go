@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"runtime"
 	"time"
@@ -811,7 +812,7 @@ func main() {
 		middlewareConfig := auth.DefaultMiddlewareConfig()
 		middlewareConfig.AuthManager = authManager
 		// Add public routes that don't need auth
-		middlewareConfig.PublicRoutes = append(middlewareConfig.PublicRoutes, "/health", "/ready", "/api/v1/auth/verify")
+		middlewareConfig.PublicRoutes = append(middlewareConfig.PublicRoutes, "/health", "/ready", "/api/v1/auth/verify", "/api/v1/internal/cache/invalidate")
 		middlewareConfig.PublicPrefixes = append(middlewareConfig.PublicPrefixes, "/metrics", "/debug/pprof")
 		server.GetApp().Use(auth.NewMiddleware(middlewareConfig))
 
@@ -993,8 +994,55 @@ func main() {
 		// This callback clears all relevant caches in the parent process after each
 		// successful compaction job. See: https://github.com/Basekick-Labs/arc/issues/204
 		compactionManager.SetOnCompactionComplete(func() {
+			// Local invalidation
 			db.ClearHTTPCache()
 			queryHandler.InvalidateCaches()
+
+			// Distributed invalidation (enterprise clustering)
+			// Notify all query-capable nodes to clear their caches too
+			if clusterCoordinator != nil {
+				registry := clusterCoordinator.GetRegistry()
+				localNode := registry.Local()
+				if localNode == nil {
+					return
+				}
+
+				targets := registry.GetReaders()
+				targets = append(targets, registry.GetWriters()...)
+
+				for _, node := range targets {
+					if node.ID == localNode.ID {
+						continue
+					}
+					go func(n *cluster.Node) {
+						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+						defer cancel()
+
+						url := fmt.Sprintf("http://%s/api/v1/internal/cache/invalidate", n.APIAddress)
+						req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+						if err != nil {
+							log.Warn().Err(err).Str("node_id", n.ID).Msg("Failed to create cache invalidation request")
+							return
+						}
+						req.Header.Set("X-Arc-Internal", "cache-invalidate")
+
+						resp, err := http.DefaultClient.Do(req)
+						if err != nil {
+							log.Warn().Err(err).Str("node_id", n.ID).Str("address", n.APIAddress).
+								Msg("Failed to invalidate cache on remote node")
+							return
+						}
+						io.Copy(io.Discard, resp.Body)
+						resp.Body.Close()
+						if resp.StatusCode != 204 {
+							log.Warn().Int("status", resp.StatusCode).Str("node_id", n.ID).
+								Msg("Unexpected status from cache invalidation")
+						} else {
+							log.Debug().Str("node_id", n.ID).Msg("Remote cache invalidated after compaction")
+						}
+					}(node)
+				}
+			}
 		})
 	}
 
