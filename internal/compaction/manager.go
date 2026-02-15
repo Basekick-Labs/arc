@@ -52,6 +52,10 @@ type Manager struct {
 	TotalBytesSaved      int64
 	TotalManifestsRecov  int // Number of manifests recovered
 
+	// Callback invoked after a successful compaction job (in parent process).
+	// Used to invalidate DuckDB and query caches after files are deleted.
+	onCompactionComplete func()
+
 	logger zerolog.Logger
 	mu     sync.Mutex
 }
@@ -137,6 +141,13 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	}
 
 	return m
+}
+
+// SetOnCompactionComplete sets the callback invoked after each successful compaction job.
+// This is used to invalidate DuckDB and query caches in the parent process after
+// the compaction subprocess deletes old parquet files.
+func (m *Manager) SetOnCompactionComplete(fn func()) {
+	m.onCompactionComplete = fn
 }
 
 // FindCandidates finds partitions that are candidates for compaction across all databases
@@ -254,10 +265,10 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 	}
 
 	// Update metrics
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	shouldInvalidateCache := err == nil && result.Success
 
-	if err == nil && result.Success {
+	m.mu.Lock()
+	if shouldInvalidateCache {
 		m.TotalJobsCompleted++
 		m.TotalFilesCompacted += result.FilesCompacted
 		m.TotalBytesSaved += (result.BytesBefore - result.BytesAfter)
@@ -295,6 +306,15 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 	// Keep last 100 jobs
 	if len(m.jobHistory) > 100 {
 		m.jobHistory = m.jobHistory[len(m.jobHistory)-100:]
+	}
+	m.mu.Unlock()
+
+	// Invalidate caches outside the lock — the callback performs IO (DuckDB Exec)
+	// and should not block stat reads or other concurrent compaction goroutines.
+	// The subprocess deleted old parquet files from storage, but DuckDB's
+	// cache_httpfs and parquet_metadata_cache still reference them.
+	if shouldInvalidateCache && m.onCompactionComplete != nil {
+		m.onCompactionComplete()
 	}
 
 	// Return error if subprocess failed

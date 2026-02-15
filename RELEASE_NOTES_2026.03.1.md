@@ -12,6 +12,16 @@ Fixed a bug where missing fields in line protocol ingestion were stored as `0` i
 
 *Reported by [@bjarneksat](https://github.com/bjarneksat) — thank you!*
 
+### Stale Cache After Compaction Causes 404 Errors (#204)
+
+Fixed a bug where queries would intermittently fail with HTTP 404 errors after compaction deleted old parquet files from S3. DuckDB's `cache_httpfs` extension was caching glob results (directory listings) that still referenced deleted files, causing queries to attempt reading non-existent objects.
+
+**Root cause:** After compaction merged and deleted old parquet files, no cache invalidation was performed. DuckDB's `cache_httpfs` glob cache, `parquet_metadata_cache`, and Arc's partition pruner caches all retained stale references until their TTLs expired (~1 hour).
+
+**Fix:** Added post-compaction cache invalidation that clears all relevant caches (DuckDB `cache_httpfs`, `parquet_metadata_cache`, partition pruner, and SQL transform cache) immediately after each successful compaction job completes.
+
+*Reported by [@khalid244](https://github.com/khalid244) — thank you!*
+
 ## New Features
 
 ### Backup & Restore API
