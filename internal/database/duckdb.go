@@ -326,6 +326,30 @@ func (d *DuckDB) ConfigureS3(s3cfg *S3Config) error {
 	return nil
 }
 
+// ClearHTTPCache clears DuckDB's cache_httpfs and parquet_metadata_cache.
+// This should be called after compaction deletes files to prevent stale cache hits
+// (glob results, file metadata, and data blocks pointing to deleted parquet files).
+// Safe to call even if cache_httpfs is not loaded — the error is silently ignored.
+func (d *DuckDB) ClearHTTPCache() {
+	// Clear cache_httpfs (glob results, data blocks, file handles, file metadata)
+	if _, err := d.db.Exec("SELECT cache_httpfs_clear_cache()"); err != nil {
+		d.logger.Debug().Err(err).Msg("cache_httpfs_clear_cache not available (extension may not be loaded)")
+	} else {
+		d.logger.Info().Msg("Cleared cache_httpfs cache after compaction")
+	}
+
+	// Reset parquet_metadata_cache by toggling off/on to clear cached schema for deleted files
+	if _, err := d.db.Exec("SET GLOBAL parquet_metadata_cache=false"); err != nil {
+		d.logger.Debug().Err(err).Msg("Failed to disable parquet_metadata_cache")
+	} else {
+		if _, err := d.db.Exec("SET GLOBAL parquet_metadata_cache=true"); err != nil {
+			d.logger.Warn().Err(err).Msg("Failed to re-enable parquet_metadata_cache")
+		} else {
+			d.logger.Info().Msg("Reset parquet_metadata_cache after compaction")
+		}
+	}
+}
+
 // configureAzureAccess sets up the azure extension for Azure Blob Storage access
 // Note: We use SET GLOBAL to ensure settings persist across all connections in the pool
 func configureAzureAccess(db *sql.DB, cfg *Config, logger zerolog.Logger) error {

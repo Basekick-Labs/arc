@@ -655,6 +655,14 @@ func (h *QueryHandler) SetQueryRegistry(registry *queryregistry.Registry) {
 	h.queryRegistry = registry
 }
 
+// InvalidateCaches clears all internal caches (partition pruner and SQL transform cache).
+// This should be called after compaction to prevent stale file references.
+func (h *QueryHandler) InvalidateCaches() {
+	h.pruner.InvalidateAllCaches()
+	h.queryCache.Invalidate()
+	h.logger.Info().Msg("Query caches invalidated after compaction")
+}
+
 // extractTableReferences extracts all database.measurement references from SQL
 // Returns a slice of TableReference structs for permission checking
 func extractTableReferences(sql string) []TableReference {

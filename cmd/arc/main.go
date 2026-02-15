@@ -986,6 +986,16 @@ func main() {
 	if compactionManager != nil {
 		compactionHandler := api.NewCompactionHandler(compactionManager, hourlyScheduler, dailyScheduler, logger.Get("compaction"))
 		compactionHandler.RegisterRoutes(server.GetApp())
+
+		// Wire post-compaction cache invalidation.
+		// After compaction deletes old parquet files, DuckDB's cache_httpfs still holds
+		// cached glob results (directory listings) pointing to deleted files, causing 404s.
+		// This callback clears all relevant caches in the parent process after each
+		// successful compaction job. See: https://github.com/Basekick-Labs/arc/issues/204
+		compactionManager.SetOnCompactionComplete(func() {
+			db.ClearHTTPCache()
+			queryHandler.InvalidateCaches()
+		})
 	}
 
 	// Register Delete handler
