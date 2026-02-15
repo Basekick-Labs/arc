@@ -520,7 +520,7 @@ func TestMergeBatches_SparseColumns(t *testing.T) {
 
 	// Verify all columns have the same length (8 total rows)
 	expectedLen := 8
-	for colName, colData := range merged {
+	for colName, colData := range merged.Data {
 		var actualLen int
 		switch col := colData.(type) {
 		case []int64:
@@ -538,7 +538,7 @@ func TestMergeBatches_SparseColumns(t *testing.T) {
 	}
 
 	// Verify time column has all values
-	timeCol := merged["time"].([]int64)
+	timeCol := merged.Data["time"].([]int64)
 	expectedTime := []int64{1, 2, 3, 4, 5, 6, 7, 8}
 	for i, expected := range expectedTime {
 		if timeCol[i] != expected {
@@ -546,8 +546,8 @@ func TestMergeBatches_SparseColumns(t *testing.T) {
 		}
 	}
 
-	// Verify cpu column: should have values at positions 0,1,2 and 5,6,7, zeros at 3,4
-	cpuCol := merged["cpu"].([]float64)
+	// Verify cpu column: data values at positions 0,1,2 and 5,6,7, placeholder zeros at 3,4
+	cpuCol := merged.Data["cpu"].([]float64)
 	expectedCpu := []float64{10.0, 20.0, 30.0, 0.0, 0.0, 40.0, 50.0, 60.0}
 	for i, expected := range expectedCpu {
 		if cpuCol[i] != expected {
@@ -555,13 +555,42 @@ func TestMergeBatches_SparseColumns(t *testing.T) {
 		}
 	}
 
-	// Verify temperature column: should have values at positions 3,4, zeros elsewhere
-	tempCol := merged["temperature"].([]float64)
+	// Verify cpu validity: positions 3,4 should be null (false)
+	cpuValidity := merged.Validity["cpu"]
+	if cpuValidity == nil {
+		t.Fatal("cpu column should have validity bitmap for sparse positions")
+	}
+	expectedCpuValidity := []bool{true, true, true, false, false, true, true, true}
+	for i, expected := range expectedCpuValidity {
+		if cpuValidity[i] != expected {
+			t.Errorf("cpu validity[%d] = %v, expected %v", i, cpuValidity[i], expected)
+		}
+	}
+
+	// Verify temperature column: data values at positions 3,4, placeholder zeros elsewhere
+	tempCol := merged.Data["temperature"].([]float64)
 	expectedTemp := []float64{0.0, 0.0, 0.0, 70.0, 80.0, 0.0, 0.0, 0.0}
 	for i, expected := range expectedTemp {
 		if tempCol[i] != expected {
 			t.Errorf("temperature[%d] = %f, expected %f", i, tempCol[i], expected)
 		}
+	}
+
+	// Verify temperature validity: only positions 3,4 should be valid
+	tempValidity := merged.Validity["temperature"]
+	if tempValidity == nil {
+		t.Fatal("temperature column should have validity bitmap for sparse positions")
+	}
+	expectedTempValidity := []bool{false, false, false, true, true, false, false, false}
+	for i, expected := range expectedTempValidity {
+		if tempValidity[i] != expected {
+			t.Errorf("temperature validity[%d] = %v, expected %v", i, tempValidity[i], expected)
+		}
+	}
+
+	// Verify time column has NO validity bitmap (always present in all batches)
+	if _, hasTimeValidity := merged.Validity["time"]; hasTimeValidity {
+		t.Error("time column should not have validity bitmap (present in all batches)")
 	}
 }
 

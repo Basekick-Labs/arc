@@ -453,8 +453,10 @@ func (w *ArrowWriter) inferSchema(columns map[string]interface{}) (*arrow.Schema
 	return arrow.NewSchema(fields, nil), nil
 }
 
-// WriteParquetColumnar writes columnar data directly to Parquet (zero-copy path)
-func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement string, columns map[string]interface{}) ([]byte, error) {
+// WriteParquetColumnar writes columnar data directly to Parquet (zero-copy path).
+// validity is an optional map of column name → []bool where false means null.
+// Columns without a validity entry (or when validity is nil) are treated as fully valid.
+func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement string, columns map[string]interface{}, validity map[string][]bool) ([]byte, error) {
 	// Get or infer schema (with caching)
 	schema, err := w.getSchema(measurement, columns)
 	if err != nil {
@@ -488,12 +490,18 @@ func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement stri
 			return nil, fmt.Errorf("column %s not found in data", field.Name)
 		}
 
+		// Get validity bitmap for this column (nil means all valid)
+		var colValidity []bool
+		if validity != nil {
+			colValidity = validity[field.Name]
+		}
+
 		switch field.Type.ID() {
 		case arrow.INT64:
 			builder := array.NewInt64Builder(mem)
 			builders[i] = builder
 			if intCol, ok := col.([]int64); ok {
-				builder.AppendValues(intCol, nil)
+				builder.AppendValues(intCol, colValidity)
 			} else {
 				return nil, fmt.Errorf("column %s: expected []int64, got %T", field.Name, col)
 			}
@@ -506,7 +514,7 @@ func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement stri
 				// MEMORY FIX: Zero-copy conversion from []int64 to []arrow.Timestamp
 				// This avoids allocating a temporary slice on every write
 				tsValues := int64SliceToTimestamps(intCol)
-				builder.AppendValues(tsValues, nil)
+				builder.AppendValues(tsValues, colValidity)
 			} else {
 				return nil, fmt.Errorf("column %s: expected []int64 for timestamp, got %T", field.Name, col)
 			}
@@ -516,7 +524,7 @@ func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement stri
 			builder := array.NewFloat64Builder(mem)
 			builders[i] = builder
 			if floatCol, ok := col.([]float64); ok {
-				builder.AppendValues(floatCol, nil)
+				builder.AppendValues(floatCol, colValidity)
 			} else {
 				return nil, fmt.Errorf("column %s: expected []float64, got %T", field.Name, col)
 			}
@@ -526,7 +534,7 @@ func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement stri
 			builder := array.NewStringBuilder(mem)
 			builders[i] = builder
 			if strCol, ok := col.([]string); ok {
-				builder.AppendValues(strCol, nil)
+				builder.AppendValues(strCol, colValidity)
 			} else {
 				return nil, fmt.Errorf("column %s: expected []string, got %T", field.Name, col)
 			}
@@ -536,7 +544,7 @@ func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement stri
 			builder := array.NewBooleanBuilder(mem)
 			builders[i] = builder
 			if boolCol, ok := col.([]bool); ok {
-				builder.AppendValues(boolCol, nil)
+				builder.AppendValues(boolCol, colValidity)
 			} else {
 				return nil, fmt.Errorf("column %s: expected []bool, got %T", field.Name, col)
 			}
@@ -606,6 +614,14 @@ func (w *ArrowWriter) writeRecordToParquet(schema *arrow.Schema, arrays []arrow.
 }
 
 // bufferShard represents a single shard of the buffer map with its own lock
+// TypedColumnBatch holds typed column arrays with optional validity bitmaps.
+// Validity tracks which values are null (false=null, true=valid).
+// Columns without a validity entry are fully valid (no nulls).
+type TypedColumnBatch struct {
+	Data     map[string]interface{} // typed arrays ([]int64, []float64, []string, []bool)
+	Validity map[string][]bool      // per-column null bitmap; nil entry = all valid
+}
+
 type bufferShard struct {
 	buffers            map[string][]interface{}
 	bufferStartTimes   map[string]time.Time
@@ -1124,7 +1140,7 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 	}
 
 	// Get column signature for schema evolution detection
-	newSignature := getColumnSignature(typedColumns)
+	newSignature := getColumnSignature(typedColumns.Data)
 
 	// OPTIMIZATION: Get shard for this buffer key (lock sharding)
 	shard := b.getShard(bufferKey)
@@ -1251,10 +1267,13 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 	return nil
 }
 
-// convertColumnsToTyped converts []interface{} columns to typed arrays
+// convertColumnsToTyped converts []interface{} columns to typed arrays with null tracking.
+// Returns a TypedColumnBatch where Validity maps track which values are null (false=null).
+// Columns with no nil values have no entry in Validity (all valid).
 // ZERO-COPY OPTIMIZATION: Try bulk type assertion first before element-by-element conversion
-func (b *ArrowBuffer) convertColumnsToTyped(columns map[string][]interface{}) (map[string]interface{}, int, error) {
+func (b *ArrowBuffer) convertColumnsToTyped(columns map[string][]interface{}) (*TypedColumnBatch, int, error) {
 	typed := make(map[string]interface{})
+	validity := make(map[string][]bool)
 	var numRecords int
 
 	for name, col := range columns {
@@ -1273,110 +1292,74 @@ func (b *ArrowBuffer) convertColumnsToTyped(columns map[string][]interface{}) (m
 			continue // Skip all-nil columns
 		}
 
-		// FAST PATH: Try zero-copy bulk conversion for homogeneous types
-		// MessagePack often provides []interface{} that's actually homogeneous underneath
+		// FAST PATH: Try zero-copy bulk conversion first (fails fast on nils or mixed types).
+		// If zero-copy succeeds, no nils exist and no validity bitmap is needed.
 		switch firstVal.(type) {
 		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
-			// Try zero-copy int64 first
 			if arr, ok := b.tryInt64ZeroCopy(col); ok {
 				typed[name] = arr
 				continue
 			}
-			// OPTIMIZATION: Bulk conversion with pre-allocation
-			// Pre-allocate result array (avoid reallocations)
+			// Zero-copy failed (has nils or mixed types) — single-pass conversion with validity
 			arr := make([]int64, len(col))
-
-			// FAST PATH: Check if all values are same type (common case)
-			// This allows tighter loop without type switch
-			allInt64 := true
-			for _, v := range col {
-				if v != nil {
-					if _, ok := v.(int64); !ok {
-						allInt64 = false
-						break
-					}
+			valid := make([]bool, len(col))
+			hasNils := false
+			for i, v := range col {
+				if v == nil {
+					hasNils = true
+					continue
 				}
-			}
-
-			if allInt64 {
-				// HOT PATH: All int64 - tight loop without type switch
-				for i, v := range col {
-					if v != nil {
-						arr[i] = v.(int64)
-					}
+				valid[i] = true
+				val, ok := toInt64(v)
+				if !ok {
+					return nil, 0, fmt.Errorf("cannot convert %T to int64 in column '%s'", v, name)
 				}
-			} else {
-				// Fallback: Mixed types - use consolidated toInt64 helper
-				for i, v := range col {
-					if v == nil {
-						arr[i] = 0
-						continue
-					}
-					val, ok := toInt64(v)
-					if !ok {
-						return nil, 0, fmt.Errorf("cannot convert %T to int64 in column '%s'", v, name)
-					}
-					arr[i] = val
-				}
+				arr[i] = val
 			}
 			typed[name] = arr
+			if hasNils {
+				validity[name] = valid
+			}
 
 		case float32, float64:
-			// Try zero-copy float64 first
 			if arr, ok := b.tryFloat64ZeroCopy(col); ok {
 				typed[name] = arr
 				continue
 			}
-			// OPTIMIZATION: Bulk conversion with pre-allocation
 			arr := make([]float64, len(col))
-
-			// FAST PATH: Check if all values are float64
-			allFloat64 := true
-			for _, v := range col {
-				if v != nil {
-					if _, ok := v.(float64); !ok {
-						allFloat64 = false
-						break
-					}
+			valid := make([]bool, len(col))
+			hasNils := false
+			for i, v := range col {
+				if v == nil {
+					hasNils = true
+					continue
 				}
-			}
-
-			if allFloat64 {
-				// HOT PATH: All float64 - tight loop
-				for i, v := range col {
-					if v != nil {
-						arr[i] = v.(float64)
-					}
+				valid[i] = true
+				val, ok := toFloat64(v)
+				if !ok {
+					return nil, 0, fmt.Errorf("cannot convert %T to float64 in column '%s'", v, name)
 				}
-			} else {
-				// Fallback: Mixed types - use consolidated toFloat64 helper
-				for i, v := range col {
-					if v == nil {
-						arr[i] = 0.0
-						continue
-					}
-					val, ok := toFloat64(v)
-					if !ok {
-						return nil, 0, fmt.Errorf("cannot convert %T to float64 in column '%s'", v, name)
-					}
-					arr[i] = val
-				}
+				arr[i] = val
 			}
 			typed[name] = arr
+			if hasNils {
+				validity[name] = valid
+			}
 
 		case string:
-			// Try zero-copy string first
 			if arr, ok := b.tryStringZeroCopy(col); ok {
 				typed[name] = arr
 				continue
 			}
-			// Fall back to element-by-element conversion
 			arr := make([]string, len(col))
+			valid := make([]bool, len(col))
+			hasNils := false
 			for i, v := range col {
 				if v == nil {
-					arr[i] = ""
+					hasNils = true
 					continue
 				}
+				valid[i] = true
 				str, ok := v.(string)
 				if !ok {
 					return nil, 0, fmt.Errorf("unexpected type in string column '%s': %T", name, v)
@@ -1384,34 +1367,42 @@ func (b *ArrowBuffer) convertColumnsToTyped(columns map[string][]interface{}) (m
 				arr[i] = str
 			}
 			typed[name] = arr
+			if hasNils {
+				validity[name] = valid
+			}
 
 		case bool:
-			// Try zero-copy bool first
 			if arr, ok := b.tryBoolZeroCopy(col); ok {
 				typed[name] = arr
 				continue
 			}
-			// Fall back to element-by-element conversion
 			arr := make([]bool, len(col))
+			valid := make([]bool, len(col))
+			hasNils := false
 			for i, v := range col {
 				if v == nil {
-					arr[i] = false
+					hasNils = true
 					continue
 				}
-				b, ok := v.(bool)
+				valid[i] = true
+				bval, ok := v.(bool)
 				if !ok {
 					return nil, 0, fmt.Errorf("unexpected type in bool column '%s': %T", name, v)
 				}
-				arr[i] = b
+				arr[i] = bval
 			}
 			typed[name] = arr
+			if hasNils {
+				validity[name] = valid
+			}
 
 		default:
 			return nil, 0, fmt.Errorf("unsupported column type for '%s': %T", name, firstVal)
 		}
 	}
 
-	return typed, numRecords, nil
+	batch := &TypedColumnBatch{Data: typed, Validity: validity}
+	return batch, numRecords, nil
 }
 
 // ZERO-COPY HELPERS: Try bulk type assertion for homogeneous arrays
@@ -1630,19 +1621,19 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 }
 
 // flushWithDataTimePartitioning partitions data by data timestamps (async path)
-func (b *ArrowBuffer) flushWithDataTimePartitioning(ctx context.Context, bufferKey, database, measurement string, merged map[string]interface{}, recordCount int, startTime time.Time) error {
+func (b *ArrowBuffer) flushWithDataTimePartitioning(ctx context.Context, bufferKey, database, measurement string, merged *TypedColumnBatch, recordCount int, startTime time.Time) error {
 	return b.flushPartitionedData(ctx, bufferKey, database, measurement, merged, recordCount, flushTypeAsync, startTime)
 }
 
 // flushPartitionedData is the shared core logic for partitioning and writing data by hour boundaries
 // Called by both async (flushWithDataTimePartitioning) and sync (flushBufferLockedDataTime) paths
 // Uses hash-based grouping to partition by hour, then sorts each hour independently
-func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, database, measurement string, merged map[string]interface{}, recordCount int, flushType string, startTime time.Time) error {
+func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, database, measurement string, merged *TypedColumnBatch, recordCount int, flushType string, startTime time.Time) error {
 	// Get sort keys for this measurement (guaranteed to include "time")
 	sortKeys := b.getSortKeys(measurement)
 
 	// Extract time column (doesn't need to be sorted yet)
-	times, ok := merged["time"].([]int64)
+	times, ok := merged.Data["time"].([]int64)
 	if !ok || len(times) == 0 {
 		return fmt.Errorf("no time data in batch")
 	}
@@ -1677,12 +1668,9 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	maxHour := maxTime.Truncate(time.Hour)
 	if minHour.Equal(maxHour) {
 		// Single hour - sort once and write one file
-		sorted, err := sortColumnsByKeys(merged, sortKeys)
-		if err != nil {
-			return fmt.Errorf("failed to sort columns by %v: %w", sortKeys, err)
-		}
+		sorted := sortTypedColumnBatchByKeys(merged, sortKeys)
 
-		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted)
+		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted.Data, sorted.Validity)
 		if err != nil {
 			return fmt.Errorf("failed to write Parquet: %w", err)
 		}
@@ -1728,16 +1716,13 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		splitRecordCount := len(bucket.indices)
 
 		// Extract rows for this hour using the index list
-		hourColumns := sliceColumnsByIndices(merged, bucket.indices)
+		hourBatch := sliceTypedColumnBatchByIndices(merged, bucket.indices)
 
 		// Sort this hour's data by configured sort keys
-		sorted, err := sortColumnsByKeys(hourColumns, sortKeys)
-		if err != nil {
-			return fmt.Errorf("failed to sort hour %d by %v: %w", hourID, sortKeys, err)
-		}
+		sorted := sortTypedColumnBatchByKeys(hourBatch, sortKeys)
 
 		// Write Parquet file for this hour
-		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted)
+		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted.Data, sorted.Validity)
 		if err != nil {
 			return fmt.Errorf("failed to write Parquet for hour %d: %w", hourID, err)
 		}
@@ -1836,22 +1821,26 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 }
 
 // flushBufferLockedDataTime flushes with data_time partitioning (sync path)
-func (b *ArrowBuffer) flushBufferLockedDataTime(ctx context.Context, bufferKey, database, measurement string, merged map[string]interface{}, recordCount int, startTime time.Time) error {
+func (b *ArrowBuffer) flushBufferLockedDataTime(ctx context.Context, bufferKey, database, measurement string, merged *TypedColumnBatch, recordCount int, startTime time.Time) error {
 	return b.flushPartitionedData(ctx, bufferKey, database, measurement, merged, recordCount, flushTypeSync, startTime)
 }
 
-// mergeBatches merges multiple column batches into a single columnar structure
+// mergeBatches merges multiple column batches into a single TypedColumnBatch.
 // OPTIMIZATION: Pre-allocate merged arrays to avoid O(n²) append reallocations
-// Handles sparse columns (schema evolution) by ensuring all columns have the same length
-func (b *ArrowBuffer) mergeBatches(batches []interface{}) (map[string]interface{}, error) {
+// Handles sparse columns (schema evolution) by marking missing positions as null via validity bitmaps.
+func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, error) {
 	if len(batches) == 0 {
 		return nil, fmt.Errorf("no batches to merge")
 	}
 
 	// If only one batch, return it directly
 	if len(batches) == 1 {
+		if tcb, ok := batches[0].(*TypedColumnBatch); ok {
+			return tcb, nil
+		}
+		// Legacy: bare map without validity (e.g. from WAL replay)
 		if cols, ok := batches[0].(map[string]interface{}); ok {
-			return cols, nil
+			return &TypedColumnBatch{Data: cols, Validity: nil}, nil
 		}
 		return nil, fmt.Errorf("invalid batch type: %T", batches[0])
 	}
@@ -1863,10 +1852,21 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (map[string]interface{
 	colTypes := make(map[string]*colInfo)
 	totalRows := 0
 
+	// Track which columns have validity bitmaps and which batches have which columns
+	hasAnyValidity := false
+
 	// First pass: count total rows using time column
 	for _, batch := range batches {
-		cols, ok := batch.(map[string]interface{})
-		if !ok {
+		var cols map[string]interface{}
+		switch b := batch.(type) {
+		case *TypedColumnBatch:
+			cols = b.Data
+			if len(b.Validity) > 0 {
+				hasAnyValidity = true
+			}
+		case map[string]interface{}:
+			cols = b
+		default:
 			return nil, fmt.Errorf("invalid batch type: %T", batch)
 		}
 
@@ -1896,8 +1896,31 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (map[string]interface{
 		}
 	}
 
+	// Determine if we need validity tracking.
+	// Needed if: any batch already has validity, OR columns are sparse across batches.
+	// Check sparsity: if any batch doesn't have all columns, those positions are null.
+	hasSparseColumns := false
+	for _, batch := range batches {
+		var cols map[string]interface{}
+		switch b := batch.(type) {
+		case *TypedColumnBatch:
+			cols = b.Data
+		case map[string]interface{}:
+			cols = b
+		}
+		if len(cols) < len(colTypes) {
+			hasSparseColumns = true
+			break
+		}
+	}
+	needsValidity := hasAnyValidity || hasSparseColumns
+
 	// PHASE 2: Pre-allocate ALL columns to totalRows (handles sparse columns)
 	merged := make(map[string]interface{}, len(colTypes))
+	var mergedValidity map[string][]bool
+	if needsValidity {
+		mergedValidity = make(map[string][]bool, len(colTypes))
+	}
 
 	for name, info := range colTypes {
 		switch info.colType {
@@ -1910,12 +1933,24 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (map[string]interface{
 		case "bool":
 			merged[name] = make([]bool, totalRows)
 		}
+		if needsValidity {
+			// Initialize all positions as invalid (null). Positions with data get set to true below.
+			mergedValidity[name] = make([]bool, totalRows)
+		}
 	}
 
 	// PHASE 3: Copy data at correct row offsets (not per-column offsets)
 	rowOffset := 0
 	for _, batch := range batches {
-		cols := batch.(map[string]interface{}) // Already validated above
+		var cols map[string]interface{}
+		var batchValidity map[string][]bool
+		switch b := batch.(type) {
+		case *TypedColumnBatch:
+			cols = b.Data
+			batchValidity = b.Validity
+		case map[string]interface{}:
+			cols = b
+		}
 
 		// Determine batch size from time column
 		batchRows := 0
@@ -1935,14 +1970,54 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (map[string]interface{
 			case []bool:
 				copy(merged[name].([]bool)[rowOffset:], v)
 			}
+
+			// Copy validity bitmap for this column
+			if needsValidity {
+				dest := mergedValidity[name][rowOffset : rowOffset+batchRows]
+				if batchValidity != nil {
+					if srcValid, ok := batchValidity[name]; ok {
+						// Batch has explicit validity for this column — copy it
+						copy(dest, srcValid)
+					} else {
+						// Batch has validity tracking but not for this column → all valid
+						for i := range dest {
+							dest[i] = true
+						}
+					}
+				} else {
+					// Batch has no validity tracking at all → all valid
+					for i := range dest {
+						dest[i] = true
+					}
+				}
+			}
 		}
-		// Sparse columns that don't exist in this batch will have zero values
-		// at positions [rowOffset : rowOffset+batchRows]
+		// Sparse columns that don't exist in this batch keep validity=false (null)
+		// at positions [rowOffset : rowOffset+batchRows] — no action needed.
 
 		rowOffset += batchRows
 	}
 
-	return merged, nil
+	// Optimization: strip validity entries that are all-true (no nulls)
+	if mergedValidity != nil {
+		for name, valid := range mergedValidity {
+			allValid := true
+			for _, v := range valid {
+				if !v {
+					allValid = false
+					break
+				}
+			}
+			if allValid {
+				delete(mergedValidity, name)
+			}
+		}
+		if len(mergedValidity) == 0 {
+			mergedValidity = nil
+		}
+	}
+
+	return &TypedColumnBatch{Data: merged, Validity: mergedValidity}, nil
 }
 
 // sortColumnsByTime sorts all columns by the time column in-place
@@ -2145,6 +2220,125 @@ func applyPermutation(colData interface{}, indices []int) interface{} {
 	default:
 		return colData // Unknown type, return as-is
 	}
+}
+
+// sortTypedColumnBatchByKeys sorts a TypedColumnBatch by the given keys,
+// keeping validity bitmaps aligned with the reordered data.
+func sortTypedColumnBatchByKeys(batch *TypedColumnBatch, sortKeys []string) *TypedColumnBatch {
+	sorted, err := sortColumnsByKeys(batch.Data, sortKeys)
+	if err != nil {
+		// sortColumnsByKeys only errors on missing sort key or empty keys,
+		// which shouldn't happen at this point. Return unsorted on error.
+		return batch
+	}
+
+	if batch.Validity == nil {
+		return &TypedColumnBatch{Data: sorted, Validity: nil}
+	}
+
+	// The sort produced a permutation — we need to apply the same permutation to validity.
+	// sortColumnsByKeys uses applyPermutation internally via indices.
+	// We need to derive the same permutation to reorder validity.
+	// Since sortColumnsByKeys returns already-permuted data, we recover the permutation
+	// by comparing the time column order.
+	//
+	// Optimization: extract the permutation directly by sorting indices ourselves.
+	// This duplicates the sort but avoids modifying sortColumnsByKeys's signature.
+
+	// Get row count
+	var n int
+	for _, col := range batch.Data {
+		switch c := col.(type) {
+		case []int64:
+			n = len(c)
+		case []float64:
+			n = len(c)
+		case []string:
+			n = len(c)
+		case []bool:
+			n = len(c)
+		}
+		if n > 0 {
+			break
+		}
+	}
+
+	if n == 0 {
+		return &TypedColumnBatch{Data: sorted, Validity: batch.Validity}
+	}
+
+	// Build permutation indices (same logic as sortColumnsByKeys)
+	indices := make([]int, n)
+	for i := range indices {
+		indices[i] = i
+	}
+
+	// Sort indices by the same keys
+	if len(sortKeys) == 1 && sortKeys[0] == "time" {
+		if times, ok := batch.Data["time"].([]int64); ok {
+			// Check if already sorted
+			alreadySorted := true
+			for i := 1; i < n; i++ {
+				if times[i] < times[i-1] {
+					alreadySorted = false
+					break
+				}
+			}
+			if alreadySorted {
+				return &TypedColumnBatch{Data: sorted, Validity: batch.Validity}
+			}
+			sort.Slice(indices, func(i, j int) bool {
+				return times[indices[i]] < times[indices[j]]
+			})
+		}
+	} else {
+		cachedCols := make([]interface{}, 0, len(sortKeys))
+		for _, key := range sortKeys {
+			if col, exists := batch.Data[key]; exists {
+				cachedCols = append(cachedCols, col)
+			}
+		}
+		sort.Slice(indices, func(i, j int) bool {
+			return compareMultiKeyCached(cachedCols, indices[i], indices[j])
+		})
+	}
+
+	// Apply permutation to validity bitmaps
+	sortedValidity := make(map[string][]bool, len(batch.Validity))
+	for name, valid := range batch.Validity {
+		newValid := make([]bool, n)
+		for i, idx := range indices {
+			newValid[i] = valid[idx]
+		}
+		sortedValidity[name] = newValid
+	}
+
+	return &TypedColumnBatch{Data: sorted, Validity: sortedValidity}
+}
+
+// sliceTypedColumnBatchByIndices extracts rows from a TypedColumnBatch by index list,
+// keeping validity bitmaps aligned.
+func sliceTypedColumnBatchByIndices(batch *TypedColumnBatch, indices []int) *TypedColumnBatch {
+	slicedData := sliceColumnsByIndices(batch.Data, indices)
+
+	if batch.Validity == nil {
+		return &TypedColumnBatch{Data: slicedData, Validity: nil}
+	}
+
+	slicedValidity := make(map[string][]bool, len(batch.Validity))
+	for name, valid := range batch.Validity {
+		newValid := make([]bool, len(indices))
+		validLen := len(valid)
+		for i, idx := range indices {
+			if idx < validLen {
+				newValid[i] = valid[idx]
+			}
+			// else: out-of-bounds stays false (null)
+		}
+		slicedValidity[name] = newValid
+	}
+
+	return &TypedColumnBatch{Data: slicedData, Validity: slicedValidity}
 }
 
 // microPerHour is the number of microseconds in one hour (3600 * 1,000,000)
