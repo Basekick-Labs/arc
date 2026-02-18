@@ -890,6 +890,14 @@ func main() {
 	}
 	lineProtocolHandler.RegisterRoutes(server.GetApp())
 
+	// Register Import handler (CSV, Parquet, Line Protocol bulk import)
+	importHandler := api.NewImportHandler(db, storageBackend, logger.Get("import"))
+	importHandler.SetArrowBuffer(arrowBuffer)
+	if authManager != nil && rbacManager != nil {
+		importHandler.SetAuthAndRBAC(authManager, rbacManager)
+	}
+	importHandler.RegisterRoutes(server.GetApp())
+
 	// Register Query handler with dedicated query timeout
 	queryHandler := api.NewQueryHandler(db, storageBackend, logger.Get("query"), cfg.Query.Timeout)
 	if authManager != nil && rbacManager != nil {
