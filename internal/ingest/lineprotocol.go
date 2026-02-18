@@ -29,58 +29,11 @@ func NewLineProtocolParser() *LineProtocolParser {
 	return &LineProtocolParser{}
 }
 
-// ParseLine parses a single line of InfluxDB Line Protocol
-// Returns nil if the line is invalid or a comment
+// ParseLine parses a single line of InfluxDB Line Protocol.
+// Timestamps are assumed to be nanoseconds and converted to microseconds.
+// Returns nil if the line is invalid or a comment.
 func (p *LineProtocolParser) ParseLine(line []byte) *models.Record {
-	// Trim whitespace
-	line = bytes.TrimSpace(line)
-
-	// Skip empty lines and comments
-	if len(line) == 0 || line[0] == '#' {
-		return nil
-	}
-
-	// Split into main components: measurement[,tags] fields [timestamp]
-	// Parts are separated by unescaped spaces outside of quoted strings
-	parts := p.splitLine(line)
-
-	if len(parts) < 2 {
-		return nil
-	}
-
-	// Parse measurement and tags
-	measurement, tags := p.parseMeasurementTags(parts[0])
-	if measurement == "" {
-		return nil
-	}
-
-	// Parse fields
-	fields := p.parseFields(parts[1])
-	if len(fields) == 0 {
-		return nil
-	}
-
-	// Parse timestamp (optional)
-	var timestamp int64
-	if len(parts) >= 3 {
-		ts, err := p.parseTimestamp(parts[2])
-		if err != nil {
-			// Use current time if timestamp is invalid
-			timestamp = time.Now().UnixMicro()
-		} else {
-			timestamp = ts
-		}
-	} else {
-		// Use current time if no timestamp provided
-		timestamp = time.Now().UnixMicro()
-	}
-
-	return &models.Record{
-		Measurement: measurement,
-		Tags:        tags,
-		Fields:      fields,
-		Timestamp:   timestamp, // Microseconds
-	}
+	return p.parseLineWithPrecision(line, "ns")
 }
 
 // ParseBatch parses multiple lines of line protocol
@@ -98,6 +51,84 @@ func (p *LineProtocolParser) ParseBatch(data []byte) []*models.Record {
 	}
 
 	return records
+}
+
+// ParseBatchWithPrecision parses LP data with a specified timestamp precision.
+// The precision parameter controls how raw timestamp values are interpreted:
+//   - "ns" (default): nanoseconds — same as ParseBatch
+//   - "us": microseconds
+//   - "ms": milliseconds
+//   - "s": seconds
+//
+// All timestamps are normalized to microseconds in the output records.
+func (p *LineProtocolParser) ParseBatchWithPrecision(data []byte, precision string) []*models.Record {
+	if precision == "" || precision == "ns" {
+		return p.ParseBatch(data)
+	}
+
+	var records []*models.Record
+	lines := bytes.Split(data, []byte{'\n'})
+
+	for _, line := range lines {
+		record := p.parseLineWithPrecision(line, precision)
+		if record != nil {
+			records = append(records, record)
+		}
+	}
+
+	return records
+}
+
+// parseLineWithPrecision parses a single LP line with custom timestamp precision.
+// Converts the raw timestamp to microseconds based on the given precision.
+func (p *LineProtocolParser) parseLineWithPrecision(line []byte, precision string) *models.Record {
+	line = bytes.TrimSpace(line)
+	if len(line) == 0 || line[0] == '#' {
+		return nil
+	}
+
+	parts := p.splitLine(line)
+	if len(parts) < 2 {
+		return nil
+	}
+
+	measurement, tags := p.parseMeasurementTags(parts[0])
+	if measurement == "" {
+		return nil
+	}
+
+	fields := p.parseFields(parts[1])
+	if len(fields) == 0 {
+		return nil
+	}
+
+	var timestamp int64
+	if len(parts) >= 3 {
+		rawTs, err := strconv.ParseInt(string(bytes.TrimSpace(parts[2])), 10, 64)
+		if err != nil {
+			timestamp = time.Now().UnixMicro()
+		} else {
+			switch precision {
+			case "us":
+				timestamp = rawTs
+			case "ms":
+				timestamp = rawTs * 1000
+			case "s":
+				timestamp = rawTs * 1_000_000
+			default:
+				timestamp = rawTs / 1000 // ns → μs (fallback)
+			}
+		}
+	} else {
+		timestamp = time.Now().UnixMicro()
+	}
+
+	return &models.Record{
+		Measurement: measurement,
+		Tags:        tags,
+		Fields:      fields,
+		Timestamp:   timestamp,
+	}
 }
 
 // splitLine splits a line protocol line into parts, respecting escaped spaces and quoted strings

@@ -22,6 +22,18 @@ Fixed a bug where queries would intermittently fail with HTTP 404 errors after c
 
 *Reported by [@khalid244](https://github.com/khalid244) — thank you!*
 
+### Distributed Cache Invalidation for Enterprise Clustering (#204, #206)
+
+Extended the post-compaction cache fix (#204) to support enterprise clustering, where compaction runs on a dedicated Compactor node separate from Reader/Writer nodes. After each successful compaction job, the Compactor now broadcasts cache invalidation to all healthy cluster peers via `POST /api/v1/internal/cache/invalidate`.
+
+**How it works:** Fire-and-forget goroutines with a 5-second timeout broadcast to each peer. If a reader is temporarily unreachable, its cache expires naturally via TTL. The next compaction cycle implicitly retries. Local node caches are invalidated before the broadcast.
+
+### Generic Query Error Messages (#207)
+
+All query endpoints (`/api/v1/query`, `/api/v1/query/arrow`, `/api/v1/query/:measurement`) now return the actual DuckDB error message instead of a generic `"Query execution failed"`. Users can now see actionable errors like `Parser Error: syntax error at or near "SELEC"` directly in API responses and Grafana, making SQL debugging significantly easier.
+
+*Reported by [@khalid244](https://github.com/khalid244) — thank you!*
+
 ## New Features
 
 ### Backup & Restore API
@@ -95,4 +107,53 @@ local_path = "./data/backups"   # default: ./data/backups
   data/                # parquet files preserving partition layout
   metadata/arc.db      # SQLite database snapshot
   config/arc.toml      # configuration file
+```
+
+### Line Protocol Bulk Import
+
+New endpoint `POST /api/v1/import/lp` for bulk importing InfluxDB Line Protocol files. Enables one-command migration from InfluxDB to Arc by uploading `.lp` or `.txt` files (plain or gzip-compressed).
+
+Data flows through Arc's high-performance columnar ingest pipeline (ArrowBuffer → ArrowWriter → Parquet → storage) — the same path used by streaming LP ingestion — so bulk imports benefit from the same throughput and sort optimization.
+
+**Endpoint:**
+```bash
+curl -X POST "http://localhost:8000/api/v1/import/lp" \
+  -H "X-Arc-Database: mydb" \
+  -F "file=@export.lp"
+```
+
+**Query parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `measurement` | *(all)* | Filter to a single measurement from the LP file |
+| `precision` | `ns` | Timestamp precision: `ns`, `us`, `ms`, `s` |
+
+**Features:**
+- **Gzip support** — automatically detects and decompresses `.gz` files (magic byte detection)
+- **Precision-aware timestamps** — lossless conversion from any precision to Arc's internal microsecond format
+- **Multi-measurement** — a single LP file can contain multiple measurements; all are imported in one request
+- **RBAC-aware** — checks write permissions for every measurement in the file
+- **500 MB size limit** — enforced on both compressed and uncompressed data
+
+**Example with precision:**
+```bash
+# Import LP file with second-precision timestamps
+curl -X POST "http://localhost:8000/api/v1/import/lp?precision=s" \
+  -H "X-Arc-Database: mydb" \
+  -F "file=@export_seconds.lp"
+```
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "result": {
+    "database": "mydb",
+    "measurements": ["cpu", "mem"],
+    "rows_imported": 150000,
+    "precision": "ns",
+    "duration_ms": 342
+  }
+}
 ```
