@@ -1138,7 +1138,7 @@ localProcessing:
 			h.logger.Error().Err(err).Str("sql", req.SQL).Msg("Parallel query execution failed")
 			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 				Success:         false,
-				Error:           "Query execution failed",
+				Error:           err.Error(),
 				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 				Timestamp:       timestamp,
 			})
@@ -1160,7 +1160,7 @@ localProcessing:
 			h.logger.Error().Err(err).Msg("Failed to create merged iterator")
 			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 				Success:         false,
-				Error:           "Query execution failed",
+				Error:           err.Error(),
 				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 				Timestamp:       timestamp,
 			})
@@ -1262,7 +1262,7 @@ localProcessing:
 			h.logger.Error().Err(err).Str("sql", req.SQL).Msg("Query execution failed")
 			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 				Success:         false,
-				Error:           "Query execution failed",
+				Error:           err.Error(),
 				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 				Timestamp:       timestamp,
 			})
@@ -1276,7 +1276,7 @@ localProcessing:
 			h.logger.Error().Err(err).Msg("Failed to get column names")
 			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 				Success:         false,
-				Error:           "Query execution failed",
+				Error:           err.Error(),
 				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 				Timestamp:       timestamp,
 			})
@@ -2924,7 +2924,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		h.logger.Error().Err(err).Str("sql", sql).Msg("Measurement query failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
-			Error:           "Query execution failed", // Don't expose database error details
+			Error:           err.Error(),
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 			Timestamp:       time.Now().UTC().Format(time.RFC3339),
 		})
@@ -2938,7 +2938,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		h.logger.Error().Err(err).Msg("Failed to get column names in measurement query")
 		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
-			Error:           "Query execution failed", // Don't expose database error details
+			Error:           err.Error(),
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 			Timestamp:       time.Now().UTC().Format(time.RFC3339),
 		})

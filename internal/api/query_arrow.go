@@ -106,7 +106,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		h.logger.Error().Err(err).Str("sql", req.SQL).Msg("Arrow query execution failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
-			"error":   "Query execution failed",
+			"error":   err.Error(),
 		})
 	}
 	// Note: rows.Close() is called inside SetBodyStreamWriter callback, not here,
@@ -123,7 +123,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		h.logger.Error().Err(err).Msg("Failed to get column names")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
-			"error":   "Query execution failed",
+			"error":   err.Error(),
 		})
 	}
 
@@ -137,7 +137,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		h.logger.Error().Err(err).Msg("Failed to get column types")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
-			"error":   "Query execution failed",
+			"error":   err.Error(),
 		})
 	}
 
