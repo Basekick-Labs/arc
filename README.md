@@ -10,29 +10,60 @@
 [![Discord](https://img.shields.io/badge/discord-join-7289da?logo=discord)](https://discord.gg/nxnWfUxsdm)
 [![GitHub](https://img.shields.io/github/stars/basekick-labs/arc?style=social)](https://github.com/basekick-labs/arc)
 
-High-performance time-series database built on DuckDB. Go implementation.
+High-performance time-series database for Aerospace, Defense, and Industrial IoT. 18.6M records/sec. Satellite tracking, launch telemetry, ground stations, manufacturing, energy. DuckDB SQL + Parquet + Arrow. AGPL-3.0
 
 ---
 
 ## The Problem
 
-Industrial IoT generates massive data at scale:
+Aerospace, defense, and industrial systems generate massive telemetry at scale:
 
-- **Racing & Motorsport**: 100M+ sensor readings per race
-- **Smart Cities**: Billions of infrastructure events daily
-- **Mining & Manufacturing**: Equipment telemetry at unprecedented scale
-- **Energy & Utilities**: Grid monitoring, smart meters, renewable output
-- **Oil & Gas**: Pipeline sensors, drilling telemetry, refinery monitoring
-- **Logistics & Fleet**: Vehicle tracking, route optimization, delivery metrics
-- **Medical & Healthcare**: Patient monitoring, clinical sleep studies, device telemetry
-- **Observability**: Metrics, logs, traces from distributed systems
+* **Aerospace & Defense**: Satellite constellations, launch vehicles, ground stations, orbital tracking
+* **Space Operations**: 14K+ objects in orbit, TLE data, SGP4 propagation, conjunction analysis
+* **Industrial IoT**: Manufacturing telemetry, mining sensors, equipment monitoring
+* **Energy & Utilities**: Grid monitoring, smart meters, renewable output, pipeline sensors
+* **Transportation**: Racing telemetry, fleet tracking, logistics optimization
+* **Healthcare**: Patient monitoring, medical devices, clinical studies
+* **Observability**: Metrics, logs, traces from distributed systems
 
-Traditional time-series databases can't keep up. They're slow, expensive, and lock your data in proprietary formats.
+Traditional time-series databases weren't built for aerospace workloads:
+- ITAR compliance requires self-hosted infrastructure
+- Mission-critical systems can't risk vendor lock-in
+- Burst ingestion during satellite passes (10M+ metrics/sec → silence → burst)
+- Multi-decade retention for space missions
+- Sub-second queries for real-time decision making
 
-**Arc solves this: 18.6M records/sec ingestion, sub-second queries on billions of rows, portable Parquet files you own.**
+**Arc solves this: 18.6M records/sec ingestion, sub-second queries on billions of rows, portable Parquet files you own, ITAR-ready self-hosted deployment.**
 
 ```sql
--- Analyze equipment anomalies across facilities
+-- Track satellite orbital elements over time
+SELECT
+  satellite_id,
+  norad_id,
+  epoch,
+  inclination,
+  eccentricity,
+  mean_motion,
+  LAG(mean_motion) OVER (PARTITION BY satellite_id ORDER BY epoch) as prev_mean_motion,
+  mean_motion - LAG(mean_motion) OVER (PARTITION BY satellite_id ORDER BY epoch) as orbital_decay
+FROM tle.satellites
+WHERE satellite_id LIKE 'Starlink%'
+  AND epoch > NOW() - INTERVAL '30 days'
+ORDER BY satellite_id, epoch DESC;
+
+-- Analyze ground station contact windows
+SELECT
+  ground_station_id,
+  satellite_id,
+  MAX(signal_strength) as peak_signal,
+  AVG(data_rate) as avg_throughput,
+  SUM(bytes_received) as total_data
+FROM telemetry.contacts
+WHERE contact_start > NOW() - INTERVAL '24 hours'
+GROUP BY ground_station_id, satellite_id
+HAVING AVG(data_rate) > 1000000;  -- 1 Mbps minimum
+
+-- Industrial equipment monitoring
 SELECT
   device_id,
   facility_name,
@@ -41,13 +72,11 @@ SELECT
     ORDER BY timestamp
     ROWS BETWEEN 10 PRECEDING AND CURRENT ROW
   ) as temp_moving_avg,
-  MAX(pressure) as peak_pressure,
-  STDDEV(vibration) as vibration_variance
-FROM data.iot_sensors
+  MAX(pressure) as peak_pressure
+FROM iot.sensors
 WHERE timestamp > NOW() - INTERVAL '24 hours'
-  AND facility_id IN ('mining_site_42', 'plant_7')
-GROUP BY device_id, facility_name, timestamp
-HAVING MAX(pressure) > 850 OR STDDEV(vibration) > 2.5;
+  AND facility_id IN ('plant_7', 'mining_site_42')
+HAVING MAX(pressure) > 850;
 ```
 
 **Standard DuckDB SQL. Window functions, CTEs, joins. No proprietary query language.**
@@ -128,6 +157,35 @@ curl http://localhost:8000/health
 
 ---
 
+---
+
+## Aerospace & Defense
+
+Arc is built for mission-critical aerospace and defense workloads:
+
+### **Satellite Operations**
+- **TLE ingestion**: Native Two-Line Element (TLE) parser for orbital tracking
+- **Ground station telemetry**: Burst ingestion during satellite contacts (10M+ metrics/sec)
+- **Constellation management**: Track 14,000+ objects in Earth orbit
+- **Orbital analysis**: Store years of TLE history, query propagation data
+
+### **Launch Vehicle Telemetry**
+- **High-rate sensors**: 100K+ channels, 1000 Hz sample rates
+- **Mission replay**: Query entire flight profile in seconds
+- **Anomaly detection**: Window functions for real-time analysis
+
+### **ITAR Compliance**
+- **Self-hosted**: Deploy on-premises or in controlled cloud
+- **No vendor lock-in**: Portable Parquet format, export anytime
+- **Data sovereignty**: Your data stays where you need it
+- **Audit logs**: Track all access and queries
+
+### **Live Demo**
+See Arc tracking 14,273 satellites in real-time:
+🛰️ [https://basekick.net/demos/satellite-tracking](https://basekick.net/demos/satellite-tracking)
+
+**Used by satellite operators, ground stations, and launch providers.**
+
 ## Installation
 
 ### Docker
@@ -143,7 +201,7 @@ docker run -d \
 
 ```bash
 wget https://github.com/basekick-labs/arc/releases/download/v26.01.2/arc_26.01.2_amd64.deb
-sudo dpkg -i arc_26.01.2_amd64.deb
+sudo dpkg -i arc_26.02.2_amd64.deb
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
@@ -151,14 +209,14 @@ sudo systemctl enable arc && sudo systemctl start arc
 
 ```bash
 wget https://github.com/basekick-labs/arc/releases/download/v26.01.2/arc-26.01.2-1.x86_64.rpm
-sudo rpm -i arc-26.01.2-1.x86_64.rpm
+sudo rpm -i arc-26.02.2-1.x86_64.rpm
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
 ### Kubernetes (Helm)
 
 ```bash
-helm install arc https://github.com/basekick-labs/arc/releases/download/v26.01.2/arc-26.01.2.tgz
+helm install arc https://github.com/basekick-labs/arc/releases/download/v26.01.2/arc-26.02.2.tgz
 ```
 
 ### Build from Source
