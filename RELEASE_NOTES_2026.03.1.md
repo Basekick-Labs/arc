@@ -50,6 +50,17 @@ DuckDB's `cache_httpfs` glob, metadata, and file handle caches are now properly 
 
 *Reported by [@khalid244](https://github.com/khalid244) — thank you!*
 
+## Infrastructure
+
+### Go 1.26 Upgrade
+
+Upgraded from Go 1.25.6 to Go 1.26. Key runtime improvements:
+
+- **Green Tea GC**: 10–40% reduction in GC overhead (enabled by default)
+- **30% faster cgo calls**: Benefits every DuckDB query and SQLite operation
+- **2x faster `io.ReadAll`**: Improves S3/Azure storage reads and HTTP response parsing
+- **Stack allocation for slice backing stores**: Compiler can stack-allocate more slices, reducing heap pressure in hot paths
+
 ## New Features
 
 ### Backup & Restore API
