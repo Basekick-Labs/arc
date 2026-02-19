@@ -311,38 +311,64 @@ func TestClassifyOrbit(t *testing.T) {
 	}
 }
 
-func TestTLERecordsToColumnar(t *testing.T) {
+func TestTLERecordsToTypedColumnar(t *testing.T) {
 	parser := NewTLEParser()
 	rec, err := parser.ParseTLEEntry(issName, issLine1, issLine2)
 	if err != nil {
 		t.Fatalf("ParseTLEEntry failed: %v", err)
 	}
 
-	columns := TLERecordsToColumnar([]*TLERecord{rec})
+	batch, n := TLERecordsToTypedColumnar([]TLERecord{*rec})
 
-	// Should have 20 columns (1 time + 5 tags + 14 fields)
-	if len(columns) != 20 {
-		t.Errorf("expected 20 columns, got %d", len(columns))
+	if n != 1 {
+		t.Fatalf("expected 1 record, got %d", n)
 	}
 
-	// Check time
-	timeCol := columns["time"]
+	// Should have 20 columns (1 time + 5 tags + 14 fields)
+	if len(batch.Data) != 20 {
+		t.Errorf("expected 20 columns, got %d", len(batch.Data))
+	}
+
+	// No validity bitmaps (TLE never has nulls)
+	if len(batch.Validity) != 0 {
+		t.Errorf("expected no validity bitmaps, got %d", len(batch.Validity))
+	}
+
+	// Check time column is []int64
+	timeCol, ok := batch.Data["time"].([]int64)
+	if !ok {
+		t.Fatalf("time column is %T, want []int64", batch.Data["time"])
+	}
 	if len(timeCol) != 1 {
 		t.Fatalf("time column has %d rows, want 1", len(timeCol))
 	}
 	if timeCol[0] != rec.EpochTimestampUs {
-		t.Errorf("time[0] = %v, want %d", timeCol[0], rec.EpochTimestampUs)
+		t.Errorf("time[0] = %d, want %d", timeCol[0], rec.EpochTimestampUs)
 	}
 
-	// Check tags
-	if columns["norad_id"][0] != "25544" {
-		t.Errorf("norad_id[0] = %v, want %q", columns["norad_id"][0], "25544")
+	// Check string tags are []string
+	noradCol, ok := batch.Data["norad_id"].([]string)
+	if !ok {
+		t.Fatalf("norad_id is %T, want []string", batch.Data["norad_id"])
 	}
-	if columns["object_name"][0] != "ISS (ZARYA)" {
-		t.Errorf("object_name[0] = %v, want %q", columns["object_name"][0], "ISS (ZARYA)")
+	if noradCol[0] != "25544" {
+		t.Errorf("norad_id[0] = %q, want %q", noradCol[0], "25544")
 	}
-	if columns["orbit_type"][0] != "LEO" {
-		t.Errorf("orbit_type[0] = %v, want %q", columns["orbit_type"][0], "LEO")
+
+	nameCol, ok := batch.Data["object_name"].([]string)
+	if !ok {
+		t.Fatalf("object_name is %T, want []string", batch.Data["object_name"])
+	}
+	if nameCol[0] != "ISS (ZARYA)" {
+		t.Errorf("object_name[0] = %q, want %q", nameCol[0], "ISS (ZARYA)")
+	}
+
+	orbitCol, ok := batch.Data["orbit_type"].([]string)
+	if !ok {
+		t.Fatalf("orbit_type is %T, want []string", batch.Data["orbit_type"])
+	}
+	if orbitCol[0] != "LEO" {
+		t.Errorf("orbit_type[0] = %q, want %q", orbitCol[0], "LEO")
 	}
 
 	// Check all expected columns exist
@@ -354,22 +380,22 @@ func TestTLERecordsToColumnar(t *testing.T) {
 		"period_min", "apogee_km", "perigee_km",
 	}
 	for _, col := range expectedCols {
-		if _, ok := columns[col]; !ok {
+		if _, ok := batch.Data[col]; !ok {
 			t.Errorf("missing column %q", col)
 		}
 	}
 
-	// Check a specific field value
-	inc, ok := columns["inclination_deg"][0].(float64)
+	// Check a float field is []float64
+	incCol, ok := batch.Data["inclination_deg"].([]float64)
 	if !ok {
-		t.Fatalf("inclination_deg is not float64")
+		t.Fatalf("inclination_deg is %T, want []float64", batch.Data["inclination_deg"])
 	}
-	if math.Abs(inc-51.6400) > 0.001 {
-		t.Errorf("inclination_deg = %f, want 51.6400", inc)
+	if math.Abs(incCol[0]-51.6400) > 0.001 {
+		t.Errorf("inclination_deg = %f, want 51.6400", incCol[0])
 	}
 }
 
-func TestTLEToColumnar_RoundTrip(t *testing.T) {
+func TestTLEToTypedColumnar_RoundTrip(t *testing.T) {
 	data := `ISS (ZARYA)
 1 25544U 98067A   24051.34722222  .00016717  00000-0  10270-3 0  9014
 2 25544  51.6400 208.9163 0006703 319.1918  40.8793 15.49560830442108
@@ -387,35 +413,41 @@ NOAA 19
 		t.Fatalf("expected 2 TLE records, got %d", len(tleRecords))
 	}
 
-	// Convert directly to columnar
-	columns := TLERecordsToColumnar(tleRecords)
-
-	// Should have 20 columns
-	if len(columns) != 20 {
-		t.Fatalf("expected 20 columns, got %d", len(columns))
+	// Convert to typed columnar
+	batch, n := TLERecordsToTypedColumnar(tleRecords)
+	if n != 2 {
+		t.Fatalf("expected 2 records, got %d", n)
 	}
 
-	// Should have 2 rows per column
-	timeCol, ok := columns["time"]
+	// Should have 20 columns
+	if len(batch.Data) != 20 {
+		t.Fatalf("expected 20 columns, got %d", len(batch.Data))
+	}
+
+	// Should have 2 rows per column (check time as []int64)
+	timeCol, ok := batch.Data["time"].([]int64)
 	if !ok {
-		t.Fatal("missing 'time' column")
+		t.Fatalf("time is %T, want []int64", batch.Data["time"])
 	}
 	if len(timeCol) != 2 {
 		t.Errorf("time column has %d rows, want 2", len(timeCol))
 	}
 
-	// Verify both satellites are present
-	if columns["norad_id"][0] != "25544" {
-		t.Errorf("norad_id[0] = %v, want %q", columns["norad_id"][0], "25544")
+	// Verify both satellites are present (check norad_id as []string)
+	noradCol := batch.Data["norad_id"].([]string)
+	if noradCol[0] != "25544" {
+		t.Errorf("norad_id[0] = %q, want %q", noradCol[0], "25544")
 	}
-	if columns["norad_id"][1] != "33591" {
-		t.Errorf("norad_id[1] = %v, want %q", columns["norad_id"][1], "33591")
+	if noradCol[1] != "33591" {
+		t.Errorf("norad_id[1] = %q, want %q", noradCol[1], "33591")
 	}
-	if columns["object_name"][0] != "ISS (ZARYA)" {
-		t.Errorf("object_name[0] = %v, want %q", columns["object_name"][0], "ISS (ZARYA)")
+
+	nameCol := batch.Data["object_name"].([]string)
+	if nameCol[0] != "ISS (ZARYA)" {
+		t.Errorf("object_name[0] = %q, want %q", nameCol[0], "ISS (ZARYA)")
 	}
-	if columns["object_name"][1] != "NOAA 19" {
-		t.Errorf("object_name[1] = %v, want %q", columns["object_name"][1], "NOAA 19")
+	if nameCol[1] != "NOAA 19" {
+		t.Errorf("object_name[1] = %q, want %q", nameCol[1], "NOAA 19")
 	}
 
 	// Check that expected columns exist
@@ -424,7 +456,7 @@ NOAA 19
 		"inclination_deg", "period_min", "perigee_km", "apogee_km",
 	}
 	for _, col := range expectedCols {
-		if _, ok := columns[col]; !ok {
+		if _, ok := batch.Data[col]; !ok {
 			t.Errorf("missing column %q", col)
 		}
 	}

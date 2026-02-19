@@ -237,6 +237,8 @@ curl -X POST "http://localhost:8000/api/v1/write/tle" \
 - RBAC-aware, cluster routing enabled
 - 500 MB size limit on bulk imports
 
+**Performance:** TLE ingestion uses a typed columnar fast path that bypasses the `[]interface{}` intermediary and `convertColumnsToTyped` pass used by generic ingestion. The parser operates directly on `[]byte` input with contiguous record allocation and single-pass typed column construction, achieving ~3.5M records/sec on commodity hardware.
+
 **Example query:**
 ```sql
 SELECT object_name, orbit_type, period_min, perigee_km, apogee_km

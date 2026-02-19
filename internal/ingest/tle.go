@@ -13,6 +13,7 @@
 package ingest
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"strconv"
@@ -73,19 +74,18 @@ func NewTLEParser() *TLEParser {
 // ParseTLEFile parses a complete TLE file containing one or more satellites.
 // Returns parsed records and any warnings (e.g., checksum failures).
 // Entries with invalid checksums are skipped with a warning, not a fatal error.
-func (p *TLEParser) ParseTLEFile(data []byte) ([]*TLERecord, []string) {
-	// Normalize line endings
-	text := strings.ReplaceAll(string(data), "\r\n", "\n")
-	text = strings.ReplaceAll(text, "\r", "\n")
+// Uses bytes-based parsing to avoid full-payload string copies.
+func (p *TLEParser) ParseTLEFile(data []byte) ([]TLERecord, []string) {
+	// Split on \n directly — no full-payload string conversion
+	rawLines := bytes.Split(data, []byte{'\n'})
 
-	allLines := strings.Split(text, "\n")
-
-	// Filter out blank lines and collect non-empty lines
-	var lines []string
-	for _, l := range allLines {
-		trimmed := strings.TrimRight(l, " \t")
-		if trimmed != "" {
-			lines = append(lines, trimmed)
+	// Filter blank lines and trim \r in a single pass
+	lines := make([]string, 0, len(rawLines))
+	for _, raw := range rawLines {
+		// Trim trailing \r, spaces, tabs (handles CRLF, CR-only, trailing whitespace)
+		trimmed := trimRightBytes(raw)
+		if len(trimmed) > 0 {
+			lines = append(lines, string(trimmed))
 		}
 	}
 
@@ -93,7 +93,8 @@ func (p *TLEParser) ParseTLEFile(data []byte) ([]*TLERecord, []string) {
 		return nil, nil
 	}
 
-	var records []*TLERecord
+	// Pre-allocate contiguous record slice (single alloc for all records)
+	records := make([]TLERecord, 0, len(lines)/2)
 	var warnings []string
 	const maxWarnings = 100
 	warningCount := 0
@@ -113,7 +114,7 @@ func (p *TLEParser) ParseTLEFile(data []byte) ([]*TLERecord, []string) {
 			}
 			line1 = lines[i]
 			line2 = lines[i+1]
-			name = "NORAD " + strings.TrimSpace(line1[2:7])
+			name = "NORAD " + trimSpaces(line1[2:7])
 			i += 2
 		} else {
 			// 3-line format: current line is name
@@ -126,17 +127,19 @@ func (p *TLEParser) ParseTLEFile(data []byte) ([]*TLERecord, []string) {
 			i += 3
 		}
 
-		rec, err := p.ParseTLEEntry(name, line1, line2)
-		if err != nil {
+		// Grow slice by one and fill in-place (avoids per-record heap alloc)
+		records = append(records, TLERecord{})
+		rec := &records[len(records)-1]
+		if err := p.parseTLEEntry(name, line1, line2, rec); err != nil {
+			records = records[:len(records)-1] // undo append
 			warningCount++
 			if len(warnings) < maxWarnings {
-				warnings = append(warnings, fmt.Sprintf("entry %d (%s): %v", entryNum, strings.TrimSpace(name), err))
+				warnings = append(warnings, fmt.Sprintf("entry %d (%s): %v", entryNum, trimSpaces(name), err))
 			} else if len(warnings) == maxWarnings {
 				warnings = append(warnings, fmt.Sprintf("... and %d more warnings suppressed", warningCount-maxWarnings))
 			}
 			continue
 		}
-		records = append(records, rec)
 	}
 
 	// Update the suppressed count if we exceeded max
@@ -147,39 +150,46 @@ func (p *TLEParser) ParseTLEFile(data []byte) ([]*TLERecord, []string) {
 	return records, warnings
 }
 
-// ParseTLEEntry parses a single 3-line TLE entry.
+// ParseTLEEntry parses a single 3-line TLE entry. Public API for individual entries.
 func (p *TLEParser) ParseTLEEntry(name, line1, line2 string) (*TLERecord, error) {
-	// Validate line numbers
+	rec := &TLERecord{}
+	if err := p.parseTLEEntry(name, line1, line2, rec); err != nil {
+		return nil, err
+	}
+	return rec, nil
+}
+
+// parseTLEEntry fills a TLERecord in-place from a 3-line TLE entry.
+func (p *TLEParser) parseTLEEntry(name, line1, line2 string, rec *TLERecord) error {
+	// Validate line lengths
 	if len(line1) < 69 {
-		return nil, fmt.Errorf("line 1 too short (%d chars, need 69)", len(line1))
+		return fmt.Errorf("line 1 too short (%d chars, need 69)", len(line1))
 	}
 	if len(line2) < 69 {
-		return nil, fmt.Errorf("line 2 too short (%d chars, need 69)", len(line2))
+		return fmt.Errorf("line 2 too short (%d chars, need 69)", len(line2))
 	}
 	if line1[0] != '1' {
-		return nil, fmt.Errorf("line 1 does not start with '1'")
+		return fmt.Errorf("line 1 does not start with '1'")
 	}
 	if line2[0] != '2' {
-		return nil, fmt.Errorf("line 2 does not start with '2'")
+		return fmt.Errorf("line 2 does not start with '2'")
 	}
 
 	// Validate checksums
 	if !validateChecksum(line1) {
-		return nil, fmt.Errorf("line 1 checksum mismatch")
+		return fmt.Errorf("line 1 checksum mismatch")
 	}
 	if !validateChecksum(line2) {
-		return nil, fmt.Errorf("line 2 checksum mismatch")
+		return fmt.Errorf("line 2 checksum mismatch")
 	}
 
-	rec := &TLERecord{
-		ObjectName: strings.TrimSpace(name),
-	}
+	rec.ObjectName = trimSpaces(name)
 
 	if err := p.parseLine1(line1, rec); err != nil {
-		return nil, fmt.Errorf("line 1: %w", err)
+		return fmt.Errorf("line 1: %w", err)
 	}
 	if err := p.parseLine2(line2, rec); err != nil {
-		return nil, fmt.Errorf("line 2: %w", err)
+		return fmt.Errorf("line 2: %w", err)
 	}
 
 	// Compute epoch timestamp
@@ -189,37 +199,37 @@ func (p *TLEParser) ParseTLEEntry(name, line1, line2 string) (*TLERecord, error)
 	// Compute derived orbital mechanics
 	computeDerivedMetrics(rec)
 
-	return rec, nil
+	return nil
 }
 
 // parseLine1 extracts fields from TLE line 1 (fixed-width columns).
 // Col positions are 1-indexed per the TLE spec.
 func (p *TLEParser) parseLine1(line string, rec *TLERecord) error {
 	// Cols 3-7: Satellite number
-	rec.NoradID = strings.TrimSpace(line[2:7])
+	rec.NoradID = trimSpaces(line[2:7])
 
 	// Col 8: Classification
 	rec.Classification = string(line[7])
 
 	// Cols 10-17: International designator
-	rec.InternationalDesignator = strings.TrimSpace(line[9:17])
+	rec.InternationalDesignator = trimSpaces(line[9:17])
 
 	// Cols 19-20: Epoch year (2-digit)
-	epochYr, err := strconv.Atoi(strings.TrimSpace(line[18:20]))
+	epochYr, err := strconv.Atoi(trimSpaces(line[18:20]))
 	if err != nil {
 		return fmt.Errorf("epoch year: %w", err)
 	}
 	rec.EpochYear = epochYr
 
 	// Cols 21-32: Epoch day (fractional day of year)
-	epochDay, err := strconv.ParseFloat(strings.TrimSpace(line[20:32]), 64)
+	epochDay, err := strconv.ParseFloat(trimSpaces(line[20:32]), 64)
 	if err != nil {
 		return fmt.Errorf("epoch day: %w", err)
 	}
 	rec.EpochDay = epochDay
 
 	// Cols 34-43: 1st derivative of mean motion (rev/day²)
-	mmDot, err := strconv.ParseFloat(strings.TrimSpace(line[33:43]), 64)
+	mmDot, err := strconv.ParseFloat(trimSpaces(line[33:43]), 64)
 	if err != nil {
 		return fmt.Errorf("mean motion dot: %w", err)
 	}
@@ -240,13 +250,13 @@ func (p *TLEParser) parseLine1(line string, rec *TLERecord) error {
 	rec.BStar = bstar
 
 	// Col 63: Ephemeris type
-	ephType := strings.TrimSpace(string(line[62]))
+	ephType := trimSpaces(string(line[62]))
 	if ephType != "" {
 		rec.EphemerisType, _ = strconv.Atoi(ephType)
 	}
 
 	// Cols 65-68: Element set number
-	elSetStr := strings.TrimSpace(line[64:68])
+	elSetStr := trimSpaces(line[64:68])
 	if elSetStr != "" {
 		rec.ElementSetNumber, _ = strconv.Atoi(elSetStr)
 	}
@@ -257,27 +267,27 @@ func (p *TLEParser) parseLine1(line string, rec *TLERecord) error {
 // parseLine2 extracts fields from TLE line 2 (fixed-width columns).
 func (p *TLEParser) parseLine2(line string, rec *TLERecord) error {
 	// Verify satellite numbers match (cols 3-7 of both lines)
-	noradID2 := strings.TrimSpace(line[2:7])
+	noradID2 := trimSpaces(line[2:7])
 	if noradID2 != rec.NoradID {
 		return fmt.Errorf("satellite number mismatch: line1=%s line2=%s", rec.NoradID, noradID2)
 	}
 
 	// Cols 9-16: Inclination (degrees)
-	inc, err := strconv.ParseFloat(strings.TrimSpace(line[8:16]), 64)
+	inc, err := strconv.ParseFloat(trimSpaces(line[8:16]), 64)
 	if err != nil {
 		return fmt.Errorf("inclination: %w", err)
 	}
 	rec.InclinationDeg = inc
 
 	// Cols 18-25: RAAN (degrees)
-	raan, err := strconv.ParseFloat(strings.TrimSpace(line[17:25]), 64)
+	raan, err := strconv.ParseFloat(trimSpaces(line[17:25]), 64)
 	if err != nil {
 		return fmt.Errorf("raan: %w", err)
 	}
 	rec.RAANDeg = raan
 
 	// Cols 27-33: Eccentricity (implied leading "0.")
-	eccStr := strings.TrimSpace(line[26:33])
+	eccStr := trimSpaces(line[26:33])
 	ecc, err := strconv.ParseFloat("0."+eccStr, 64)
 	if err != nil {
 		return fmt.Errorf("eccentricity: %w", err)
@@ -285,28 +295,28 @@ func (p *TLEParser) parseLine2(line string, rec *TLERecord) error {
 	rec.Eccentricity = ecc
 
 	// Cols 35-42: Argument of perigee (degrees)
-	argP, err := strconv.ParseFloat(strings.TrimSpace(line[34:42]), 64)
+	argP, err := strconv.ParseFloat(trimSpaces(line[34:42]), 64)
 	if err != nil {
 		return fmt.Errorf("arg perigee: %w", err)
 	}
 	rec.ArgPerigeeDeg = argP
 
 	// Cols 44-51: Mean anomaly (degrees)
-	ma, err := strconv.ParseFloat(strings.TrimSpace(line[43:51]), 64)
+	ma, err := strconv.ParseFloat(trimSpaces(line[43:51]), 64)
 	if err != nil {
 		return fmt.Errorf("mean anomaly: %w", err)
 	}
 	rec.MeanAnomalyDeg = ma
 
 	// Cols 53-63: Mean motion (rev/day)
-	mm, err := strconv.ParseFloat(strings.TrimSpace(line[52:63]), 64)
+	mm, err := strconv.ParseFloat(trimSpaces(line[52:63]), 64)
 	if err != nil {
 		return fmt.Errorf("mean motion: %w", err)
 	}
 	rec.MeanMotionRevDay = mm
 
 	// Cols 64-68: Revolution number at epoch
-	revStr := strings.TrimSpace(line[63:68])
+	revStr := trimSpaces(line[63:68])
 	if revStr != "" {
 		rec.RevolutionNumber, _ = strconv.Atoi(revStr)
 	}
@@ -331,6 +341,31 @@ func validateChecksum(line string) bool {
 	}
 	expected := int(line[68] - '0')
 	return (sum % 10) == expected
+}
+
+// trimRightBytes trims trailing \r, spaces, and tabs from a byte slice.
+// Faster than bytes.TrimRight for the ASCII-only TLE format.
+func trimRightBytes(b []byte) []byte {
+	i := len(b)
+	for i > 0 && (b[i-1] == '\r' || b[i-1] == ' ' || b[i-1] == '\t') {
+		i--
+	}
+	return b[:i]
+}
+
+// trimSpaces trims leading and trailing spaces from a string.
+// For TLE fixed-width fields, this is equivalent to strings.TrimSpace
+// but avoids the unicode-aware path since TLE is always ASCII.
+func trimSpaces(s string) string {
+	start := 0
+	for start < len(s) && s[start] == ' ' {
+		start++
+	}
+	end := len(s)
+	for end > start && s[end-1] == ' ' {
+		end--
+	}
+	return s[start:end]
 }
 
 // parseModifiedExponential converts TLE's modified exponential notation.
@@ -467,58 +502,90 @@ func classifyOrbit(perigeeKm, apogeeKm, eccentricity float64) string {
 	return "HEO"
 }
 
-// TLERecordsToColumnar converts parsed TLE records directly to columnar format
-// for the ArrowBuffer.WriteColumnarDirect pipeline. Skips the intermediate
-// models.Record allocation and BatchToColumnar conversion for ~35% less overhead.
-// All 20 column slices are pre-allocated at exact size in a single pass.
-func TLERecordsToColumnar(records []*TLERecord) map[string][]interface{} {
+// TLERecordsToTypedColumnar converts parsed TLE records directly to a TypedColumnBatch,
+// bypassing the []interface{} intermediary and convertColumnsToTyped entirely.
+// All typed slices are pre-allocated at exact size and filled in a single pass.
+// Returns the batch and the number of records.
+func TLERecordsToTypedColumnar(records []TLERecord) (*TypedColumnBatch, int) {
 	n := len(records)
-
-	columns := map[string][]interface{}{
-		"time":                     make([]interface{}, n),
-		"norad_id":                 make([]interface{}, n),
-		"object_name":              make([]interface{}, n),
-		"classification":           make([]interface{}, n),
-		"international_designator": make([]interface{}, n),
-		"orbit_type":               make([]interface{}, n),
-		"inclination_deg":          make([]interface{}, n),
-		"raan_deg":                 make([]interface{}, n),
-		"eccentricity":             make([]interface{}, n),
-		"arg_perigee_deg":          make([]interface{}, n),
-		"mean_anomaly_deg":         make([]interface{}, n),
-		"mean_motion_rev_day":      make([]interface{}, n),
-		"bstar":                    make([]interface{}, n),
-		"mean_motion_dot":          make([]interface{}, n),
-		"mean_motion_ddot":         make([]interface{}, n),
-		"revolution_number":        make([]interface{}, n),
-		"semi_major_axis_km":       make([]interface{}, n),
-		"period_min":               make([]interface{}, n),
-		"apogee_km":                make([]interface{}, n),
-		"perigee_km":               make([]interface{}, n),
+	if n == 0 {
+		return &TypedColumnBatch{
+			Data: make(map[string]interface{}),
+		}, 0
 	}
 
-	for i, tle := range records {
-		columns["time"][i] = tle.EpochTimestampUs
-		columns["norad_id"][i] = tle.NoradID
-		columns["object_name"][i] = strings.TrimSpace(tle.ObjectName)
-		columns["classification"][i] = tle.Classification
-		columns["international_designator"][i] = tle.InternationalDesignator
-		columns["orbit_type"][i] = tle.OrbitType
-		columns["inclination_deg"][i] = tle.InclinationDeg
-		columns["raan_deg"][i] = tle.RAANDeg
-		columns["eccentricity"][i] = tle.Eccentricity
-		columns["arg_perigee_deg"][i] = tle.ArgPerigeeDeg
-		columns["mean_anomaly_deg"][i] = tle.MeanAnomalyDeg
-		columns["mean_motion_rev_day"][i] = tle.MeanMotionRevDay
-		columns["bstar"][i] = tle.BStar
-		columns["mean_motion_dot"][i] = tle.MeanMotionDot
-		columns["mean_motion_ddot"][i] = tle.MeanMotionDDot
-		columns["revolution_number"][i] = float64(tle.RevolutionNumber)
-		columns["semi_major_axis_km"][i] = tle.SemiMajorAxisKm
-		columns["period_min"][i] = tle.PeriodMin
-		columns["apogee_km"][i] = tle.ApogeeKm
-		columns["perigee_km"][i] = tle.PerigeeKm
+	// Pre-allocate all typed slices
+	timeCol := make([]int64, n)
+	noradID := make([]string, n)
+	objectName := make([]string, n)
+	classification := make([]string, n)
+	intlDesignator := make([]string, n)
+	orbitType := make([]string, n)
+	inclinationDeg := make([]float64, n)
+	raanDeg := make([]float64, n)
+	eccentricity := make([]float64, n)
+	argPerigeeDeg := make([]float64, n)
+	meanAnomalyDeg := make([]float64, n)
+	meanMotionRevDay := make([]float64, n)
+	bstar := make([]float64, n)
+	meanMotionDot := make([]float64, n)
+	meanMotionDDot := make([]float64, n)
+	revolutionNumber := make([]float64, n) // float64 for Parquet schema compat
+	semiMajorAxisKm := make([]float64, n)
+	periodMin := make([]float64, n)
+	apogeeKm := make([]float64, n)
+	perigeeKm := make([]float64, n)
+
+	// Single pass — fill all columns
+	for i := range records {
+		tle := &records[i]
+		timeCol[i] = tle.EpochTimestampUs
+		noradID[i] = tle.NoradID
+		objectName[i] = tle.ObjectName
+		classification[i] = tle.Classification
+		intlDesignator[i] = tle.InternationalDesignator
+		orbitType[i] = tle.OrbitType
+		inclinationDeg[i] = tle.InclinationDeg
+		raanDeg[i] = tle.RAANDeg
+		eccentricity[i] = tle.Eccentricity
+		argPerigeeDeg[i] = tle.ArgPerigeeDeg
+		meanAnomalyDeg[i] = tle.MeanAnomalyDeg
+		meanMotionRevDay[i] = tle.MeanMotionRevDay
+		bstar[i] = tle.BStar
+		meanMotionDot[i] = tle.MeanMotionDot
+		meanMotionDDot[i] = tle.MeanMotionDDot
+		revolutionNumber[i] = float64(tle.RevolutionNumber)
+		semiMajorAxisKm[i] = tle.SemiMajorAxisKm
+		periodMin[i] = tle.PeriodMin
+		apogeeKm[i] = tle.ApogeeKm
+		perigeeKm[i] = tle.PerigeeKm
 	}
 
-	return columns
+	batch := &TypedColumnBatch{
+		Data: map[string]interface{}{
+			"time":                     timeCol,
+			"norad_id":                 noradID,
+			"object_name":              objectName,
+			"classification":           classification,
+			"international_designator": intlDesignator,
+			"orbit_type":               orbitType,
+			"inclination_deg":          inclinationDeg,
+			"raan_deg":                 raanDeg,
+			"eccentricity":             eccentricity,
+			"arg_perigee_deg":          argPerigeeDeg,
+			"mean_anomaly_deg":         meanAnomalyDeg,
+			"mean_motion_rev_day":      meanMotionRevDay,
+			"bstar":                    bstar,
+			"mean_motion_dot":          meanMotionDot,
+			"mean_motion_ddot":         meanMotionDDot,
+			"revolution_number":        revolutionNumber,
+			"semi_major_axis_km":       semiMajorAxisKm,
+			"period_min":               periodMin,
+			"apogee_km":                apogeeKm,
+			"perigee_km":               perigeeKm,
+		},
+		// No validity bitmaps — TLE records never have null values
+	}
+
+	return batch, n
 }

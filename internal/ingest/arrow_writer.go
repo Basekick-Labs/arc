@@ -1094,6 +1094,13 @@ func (b *ArrowBuffer) WriteColumnarDirectNoWAL(ctx context.Context, database, me
 	return b.writeColumnarInternal(ctx, database, record, true)
 }
 
+// WriteTypedColumnarDirect writes a pre-typed column batch to the buffer,
+// bypassing the []interface{} → typed conversion in convertColumnsToTyped.
+// Used by format-specific parsers (e.g., TLE) that know column types at compile time.
+func (b *ArrowBuffer) WriteTypedColumnarDirect(ctx context.Context, database, measurement string, batch *TypedColumnBatch, numRecords int) error {
+	return b.writeTypedColumnarInternal(ctx, database, measurement, batch, numRecords, false)
+}
+
 // writeColumnar writes a columnar record to the buffer
 func (b *ArrowBuffer) writeColumnar(ctx context.Context, database string, record *models.ColumnarRecord) error {
 	return b.writeColumnarInternal(ctx, database, record, false)
@@ -1265,6 +1272,172 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 
 	// Return immediately (don't wait for flush to complete!)
 	return nil
+}
+
+// writeTypedColumnarInternal writes a pre-typed column batch to the buffer.
+// Mirrors writeColumnarInternal but skips convertColumnsToTyped since the batch
+// is already typed ([]int64, []float64, []string). Used by format-specific parsers
+// that know column types at compile time.
+func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, measurement string, typedColumns *TypedColumnBatch, numRecords int, skipWAL bool) error {
+	bufferKey := database + "/" + measurement
+
+	// WAL: Convert typed batch to row format for WAL storage
+	if b.wal != nil && !skipWAL {
+		walRecords := typedBatchToWALRecords(database, measurement, typedColumns, numRecords)
+		if len(walRecords) > 0 {
+			if err := b.wal.Append(walRecords); err != nil {
+				b.logger.Error().Err(err).
+					Str("database", database).
+					Str("measurement", measurement).
+					Int("records", len(walRecords)).
+					Msg("WAL write failed - data may be lost on crash")
+			}
+		}
+	}
+
+	// Column signature for schema evolution detection
+	newSignature := getColumnSignature(typedColumns.Data)
+
+	// Get shard for this buffer key (lock sharding)
+	shard := b.getShard(bufferKey)
+
+	var recordsToFlush []interface{}
+	var shouldFlush bool
+
+	shard.mu.Lock()
+
+	// Schema evolution detection: flush buffer if columns changed
+	if existingSignature, exists := shard.bufferSchemas[bufferKey]; exists {
+		if existingSignature != newSignature {
+			b.logger.Debug().
+				Str("buffer_key", bufferKey).
+				Str("old_schema", existingSignature).
+				Str("new_schema", newSignature).
+				Msg("Schema evolution detected, flushing buffer")
+
+			if err := b.flushBufferLocked(ctx, shard, bufferKey, database, measurement); err != nil {
+				b.logger.Error().Err(err).
+					Str("buffer_key", bufferKey).
+					Msg("Failed to flush buffer on schema change")
+			}
+		}
+	}
+
+	// Initialize buffer and record count if needed
+	if _, exists := shard.buffers[bufferKey]; !exists {
+		shard.bufferStartTimes[bufferKey] = time.Now().UTC()
+		shard.bufferRecordCounts[bufferKey] = 0
+		shard.bufferSchemas[bufferKey] = newSignature
+	}
+
+	// Add typed columns to buffer directly (no conversion needed)
+	shard.buffers[bufferKey] = append(shard.buffers[bufferKey], typedColumns)
+
+	shard.bufferRecordCounts[bufferKey] += numRecords
+	totalBuffered := shard.bufferRecordCounts[bufferKey]
+
+	// Check if buffer needs flush (size-based)
+	if totalBuffered >= b.config.MaxBufferSize {
+		recordsToFlush = make([]interface{}, len(shard.buffers[bufferKey]))
+		copy(recordsToFlush, shard.buffers[bufferKey])
+
+		delete(shard.buffers, bufferKey)
+		delete(shard.bufferStartTimes, bufferKey)
+		delete(shard.bufferRecordCounts, bufferKey)
+		delete(shard.bufferSchemas, bufferKey)
+
+		shouldFlush = true
+
+		b.logger.Debug().
+			Str("buffer_key", bufferKey).
+			Int("total_records", totalBuffered).
+			Msg("Extracted records for flush (fire-and-forget)")
+	}
+
+	shard.mu.Unlock()
+
+	b.totalRecordsBuffered.Add(int64(numRecords))
+
+	b.logger.Debug().
+		Str("buffer_key", bufferKey).
+		Int("num_records", numRecords).
+		Int("total_buffered", totalBuffered).
+		Bool("flushing", shouldFlush).
+		Msg("Added typed columnar data to buffer")
+
+	// Queue flush to worker pool if needed
+	if shouldFlush {
+		flushCtx, flushCancel := context.WithTimeout(b.ctx, b.flushTimeout)
+		task := flushTask{
+			ctx:         flushCtx,
+			cancel:      flushCancel,
+			bufferKey:   bufferKey,
+			database:    database,
+			measurement: measurement,
+			records:     recordsToFlush,
+			recordCount: totalBuffered,
+		}
+
+		select {
+		case b.flushQueue <- task:
+			b.queueDepth.Add(1)
+			b.logger.Info().
+				Str("buffer_key", bufferKey).
+				Int("total_records", totalBuffered).
+				Int64("queue_depth", b.queueDepth.Load()).
+				Msg("Buffer size exceeded, queued flush to worker pool")
+		default:
+			flushCancel()
+			b.logger.Warn().
+				Str("buffer_key", bufferKey).
+				Int("records", totalBuffered).
+				Int64("queue_depth", b.queueDepth.Load()).
+				Msg("Flush queue full - data preserved in WAL for recovery")
+			b.totalErrors.Add(1)
+			metrics.Get().IncWALRecordsPreserved(int64(totalBuffered))
+		}
+	}
+
+	return nil
+}
+
+// typedBatchToWALRecords converts a TypedColumnBatch to row-format records for WAL storage.
+// This is the WAL fallback path for typed batches (e.g., TLE) that don't have raw msgpack bytes.
+func typedBatchToWALRecords(database, measurement string, batch *TypedColumnBatch, numRecords int) []map[string]interface{} {
+	if numRecords == 0 {
+		return nil
+	}
+
+	records := make([]map[string]interface{}, numRecords)
+	for i := 0; i < numRecords; i++ {
+		row := map[string]interface{}{
+			"_database":    database,
+			"_measurement": measurement,
+		}
+		for colName, colData := range batch.Data {
+			switch arr := colData.(type) {
+			case []int64:
+				if i < len(arr) {
+					row[colName] = arr[i]
+				}
+			case []float64:
+				if i < len(arr) {
+					row[colName] = arr[i]
+				}
+			case []string:
+				if i < len(arr) {
+					row[colName] = arr[i]
+				}
+			case []bool:
+				if i < len(arr) {
+					row[colName] = arr[i]
+				}
+			}
+		}
+		records[i] = row
+	}
+
+	return records
 }
 
 // convertColumnsToTyped converts []interface{} columns to typed arrays with null tracking.
