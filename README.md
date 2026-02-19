@@ -83,6 +83,12 @@ HAVING MAX(pressure) > 850;
 
 ---
 
+## **Live Demo**
+See Arc tracking 14,273 satellites in real-time:
+🛰️ [https://basekick.net/demos/satellite-tracking](https://basekick.net/demos/satellite-tracking)
+
+---
+
 ## Performance
 
 Benchmarked on Apple MacBook Pro M3 Max (14 cores, 36GB RAM, 1TB NVMe).
@@ -156,35 +162,6 @@ curl http://localhost:8000/health
 ```
 
 ---
-
----
-
-## Aerospace & Defense
-
-Arc is built for mission-critical aerospace and defense workloads:
-
-### **Satellite Operations**
-- **TLE ingestion**: Native Two-Line Element (TLE) parser for orbital tracking
-- **Ground station telemetry**: Burst ingestion during satellite contacts (10M+ metrics/sec)
-- **Constellation management**: Track 14,000+ objects in Earth orbit
-- **Orbital analysis**: Store years of TLE history, query propagation data
-
-### **Launch Vehicle Telemetry**
-- **High-rate sensors**: 100K+ channels, 1000 Hz sample rates
-- **Mission replay**: Query entire flight profile in seconds
-- **Anomaly detection**: Window functions for real-time analysis
-
-### **ITAR Compliance**
-- **Self-hosted**: Deploy on-premises or in controlled cloud
-- **No vendor lock-in**: Portable Parquet format, export anytime
-- **Data sovereignty**: Your data stays where you need it
-- **Audit logs**: Track all access and queries
-
-### **Live Demo**
-See Arc tracking 14,273 satellites in real-time:
-🛰️ [https://basekick.net/demos/satellite-tracking](https://basekick.net/demos/satellite-tracking)
-
-**Used by satellite operators, ground stations, and launch providers.**
 
 ## Installation
 
