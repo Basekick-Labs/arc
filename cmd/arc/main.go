@@ -890,7 +890,14 @@ func main() {
 	}
 	lineProtocolHandler.RegisterRoutes(server.GetApp())
 
-	// Register Import handler (CSV, Parquet, Line Protocol bulk import)
+	// Register TLE handler (streaming TLE ingestion)
+	tleHandler := api.NewTLEHandler(arrowBuffer, logger.Get("tle"))
+	if authManager != nil && rbacManager != nil {
+		tleHandler.SetAuthAndRBAC(authManager, rbacManager)
+	}
+	tleHandler.RegisterRoutes(server.GetApp())
+
+	// Register Import handler (CSV, Parquet, Line Protocol, TLE bulk import)
 	importHandler := api.NewImportHandler(db, storageBackend, logger.Get("import"))
 	importHandler.SetArrowBuffer(arrowBuffer)
 	if authManager != nil && rbacManager != nil {
@@ -913,6 +920,7 @@ func main() {
 		if router != nil {
 			msgpackHandler.SetRouter(router)
 			lineProtocolHandler.SetRouter(router)
+			tleHandler.SetRouter(router)
 			queryHandler.SetRouter(router)
 			log.Info().Msg("Cluster router wired to API handlers for request forwarding")
 		}

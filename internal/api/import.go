@@ -41,6 +41,16 @@ type LPImportResult struct {
 	DurationMs   int64    `json:"duration_ms"`
 }
 
+// TLEImportResult holds the result of a TLE bulk import operation
+type TLEImportResult struct {
+	Database       string   `json:"database"`
+	Measurement    string   `json:"measurement"`
+	SatelliteCount int      `json:"satellite_count"`
+	RowsImported   int64    `json:"rows_imported"`
+	ParseWarnings  []string `json:"parse_warnings,omitempty"`
+	DurationMs     int64    `json:"duration_ms"`
+}
+
 // ImportHandler handles bulk CSV, Parquet, and Line Protocol file imports
 type ImportHandler struct {
 	db      *database.DuckDB
@@ -85,6 +95,7 @@ func (h *ImportHandler) RegisterRoutes(app *fiber.App) {
 	app.Post("/api/v1/import/csv", h.handleCSVImport)
 	app.Post("/api/v1/import/parquet", h.handleParquetImport)
 	app.Post("/api/v1/import/lp", h.handleLineProtocolImport)
+	app.Post("/api/v1/import/tle", h.handleTLEImport)
 	app.Get("/api/v1/import/stats", h.Stats)
 
 	h.logger.Info().Msg("Import routes registered")
@@ -848,6 +859,191 @@ func (h *ImportHandler) importErrorResponse(c *fiber.Ctx, err error) error {
 // escapeSQLString escapes single quotes for safe use in DuckDB SQL strings
 func escapeSQLString(s string) string {
 	return strings.ReplaceAll(s, "'", "''")
+}
+
+// handleTLEImport handles TLE file upload and import.
+// Uses the same ArrowBuffer ingest pipeline as streaming TLE ingestion.
+func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
+	h.totalRequests.Add(1)
+	start := time.Now()
+
+	database := c.Get("x-arc-database")
+	if database == "" {
+		database = c.Query("db")
+	}
+	if database == "" {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "database is required (set x-arc-database header or db query param)",
+		})
+	}
+
+	if !isValidDatabaseName(database) {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
+		})
+	}
+
+	if h.arrowBuffer == nil {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "TLE import not available (ingest pipeline not configured)",
+		})
+	}
+
+	// Get uploaded file
+	fileHeader, err := c.FormFile("file")
+	if err != nil {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "no file uploaded: use multipart/form-data with field name 'file'",
+		})
+	}
+
+	// Read file contents
+	file, err := fileHeader.Open()
+	if err != nil {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "failed to open uploaded file: " + err.Error(),
+		})
+	}
+	defer file.Close()
+
+	data, err := io.ReadAll(file)
+	if err != nil {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "failed to read uploaded file: " + err.Error(),
+		})
+	}
+
+	const maxImportSize = 500 * 1024 * 1024 // 500MB
+
+	// Detect and decompress gzip (magic bytes: 0x1f 0x8b)
+	if len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+		reader, gzErr := gzip.NewReader(bytes.NewReader(data))
+		if gzErr != nil {
+			h.totalErrors.Add(1)
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "failed to decompress gzip file: " + gzErr.Error(),
+			})
+		}
+		decompressed, gzErr := io.ReadAll(io.LimitReader(reader, maxImportSize+1))
+		reader.Close()
+		if gzErr != nil {
+			h.totalErrors.Add(1)
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "failed to decompress gzip file: " + gzErr.Error(),
+			})
+		}
+		if len(decompressed) > maxImportSize {
+			h.totalErrors.Add(1)
+			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
+				"error": "decompressed file exceeds 500MB limit",
+			})
+		}
+		data = decompressed
+	}
+
+	if len(data) > maxImportSize {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
+			"error": "file exceeds 500MB limit",
+		})
+	}
+
+	if len(data) == 0 {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "file is empty",
+		})
+	}
+
+	// Measurement name from header (default: satellite_tle)
+	measurement := c.Get("x-arc-measurement", "satellite_tle")
+	if !isValidMeasurementName(measurement) {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("invalid measurement name %q: must start with a letter and contain only alphanumeric characters, underscores, or hyphens", measurement),
+		})
+	}
+
+	// Parse TLE data
+	parser := ingest.NewTLEParser()
+	tleRecords, warnings := parser.ParseTLEFile(data)
+	if len(tleRecords) == 0 {
+		h.totalErrors.Add(1)
+		errMsg := "no valid TLE records found in file"
+		if len(warnings) > 0 {
+			errMsg = fmt.Sprintf("no valid TLE records found in file (warnings: %v)", warnings)
+		}
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": errMsg,
+		})
+	}
+
+	satelliteCount := len(tleRecords)
+
+	// Convert directly to columnar format (single pass, pre-allocated)
+	columns := ingest.TLERecordsToColumnar(tleRecords)
+
+	// Check RBAC permissions
+	if h.rbacManager != nil && h.rbacManager.IsRBACEnabled() {
+		if err := CheckWritePermissions(c, h.rbacManager, h.logger, database, []string{measurement}); err != nil {
+			h.totalErrors.Add(1)
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+				"error": err.Error(),
+			})
+		}
+	}
+
+	// Write directly to the ArrowBuffer ingest pipeline
+	totalRows := int64(len(tleRecords))
+	if err := h.arrowBuffer.WriteColumnarDirect(c.Context(), database, measurement, columns); err != nil {
+		h.totalErrors.Add(1)
+		h.logger.Error().Err(err).
+			Str("database", database).
+			Str("measurement", measurement).
+			Msg("TLE import: failed to write to buffer")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": fmt.Sprintf("failed to ingest measurement %q: %v", measurement, err),
+		})
+	}
+
+	// Force flush to ensure data is persisted before returning
+	if err := h.arrowBuffer.FlushAll(c.Context()); err != nil {
+		h.totalErrors.Add(1)
+		h.logger.Error().Err(err).Str("database", database).Msg("TLE import: flush failed")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "failed to flush imported data: " + err.Error(),
+		})
+	}
+
+	durationMs := time.Since(start).Milliseconds()
+	h.totalRecords.Add(totalRows)
+
+	h.logger.Info().
+		Str("database", database).
+		Str("measurement", measurement).
+		Int("satellites", satelliteCount).
+		Int64("rows", totalRows).
+		Int("warnings", len(warnings)).
+		Int64("duration_ms", durationMs).
+		Msg("TLE import completed")
+
+	return c.JSON(fiber.Map{
+		"status": "ok",
+		"result": TLEImportResult{
+			Database:       database,
+			Measurement:    measurement,
+			SatelliteCount: satelliteCount,
+			RowsImported:   totalRows,
+			ParseWarnings:  warnings,
+			DurationMs:     durationMs,
+		},
+	})
 }
 
 // Stats returns import handler statistics

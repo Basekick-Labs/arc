@@ -157,3 +157,90 @@ curl -X POST "http://localhost:8000/api/v1/import/lp?precision=s" \
   }
 }
 ```
+
+### TLE (Two-Line Element) Ingestion & Import
+
+Native support for ingesting satellite orbital data in the standard TLE format used by Space-Track.org, CelesTrak, and ground station pipelines. TLE data is parsed into a configurable measurement (default: `satellite_tle`) with orbital elements as fields and satellite identifiers as tags.
+
+Two endpoints are provided:
+
+**Streaming ingestion** — `POST /api/v1/write/tle` — for continuous TLE feeds, cron jobs, and real-time updates:
+```bash
+curl -X POST "http://localhost:8000/api/v1/write/tle" \
+  -H "X-Arc-Database: satellites" \
+  --data-binary @stations.tle
+# → 204 No Content
+```
+
+**Bulk import** — `POST /api/v1/import/tle` — for historical backfill from Space-Track.org exports or CelesTrak catalog dumps:
+```bash
+curl -X POST "http://localhost:8000/api/v1/import/tle" \
+  -H "X-Arc-Database: satellites" \
+  -F "file=@catalog.tle"
+```
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "database": "satellites",
+    "measurement": "satellite_tle",
+    "satellite_count": 28000,
+    "rows_imported": 28000,
+    "duration_ms": 1250
+  }
+}
+```
+
+**Headers:**
+
+| Header | Default | Description |
+|--------|---------|-------------|
+| `X-Arc-Database` | `default` | Target database |
+| `X-Arc-Measurement` | `satellite_tle` | Target measurement name |
+
+**Custom measurement example:**
+```bash
+curl -X POST "http://localhost:8000/api/v1/write/tle" \
+  -H "X-Arc-Database: satellites" \
+  -H "X-Arc-Measurement: iss_orbital_elements" \
+  --data-binary @iss.tle
+```
+
+**Schema (default measurement `satellite_tle`):**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `norad_id` | tag | NORAD catalog number |
+| `object_name` | tag | Satellite name |
+| `classification` | tag | U (unclassified), C, S |
+| `international_designator` | tag | Launch year + piece |
+| `orbit_type` | tag | LEO, MEO, GEO, HEO |
+| `inclination_deg` | field | Orbital inclination |
+| `raan_deg` | field | Right ascension of ascending node |
+| `eccentricity` | field | Orbital eccentricity |
+| `arg_perigee_deg` | field | Argument of perigee |
+| `mean_anomaly_deg` | field | Mean anomaly |
+| `mean_motion_rev_day` | field | Revolutions per day |
+| `bstar` | field | BSTAR drag coefficient |
+| `semi_major_axis_km` | field | Derived: semi-major axis |
+| `period_min` | field | Derived: orbital period |
+| `apogee_km` | field | Derived: apogee altitude |
+| `perigee_km` | field | Derived: perigee altitude |
+
+**Features:**
+- Pure Go parser — no external dependencies
+- Supports both 3-line (with name) and 2-line (no name) TLE formats, including mixed-format files
+- Gzip-compressed payloads auto-detected
+- Checksum validation with graceful skip on bad entries (warnings collected, not fatal)
+- Derived orbital metrics computed automatically (semi-major axis, period, apogee, perigee, orbit classification)
+- RBAC-aware, cluster routing enabled
+- 500 MB size limit on bulk imports
+
+**Example query:**
+```sql
+SELECT object_name, orbit_type, period_min, perigee_km, apogee_km
+FROM satellite_tle
+WHERE orbit_type = 'LEO'
+ORDER BY period_min
+```
