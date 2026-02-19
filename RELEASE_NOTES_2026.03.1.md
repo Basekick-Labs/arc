@@ -34,6 +34,16 @@ All query endpoints (`/api/v1/query`, `/api/v1/query/arrow`, `/api/v1/query/:mea
 
 *Reported by [@khalid244](https://github.com/khalid244) — thank you!*
 
+### time_bucket and date_trunc Return Per-Second Rows Instead of Proper Buckets (#212)
+
+Fixed a bug where `time_bucket()` and `date_trunc()` GROUP BY queries returned one row per unique second instead of proper time buckets. A 7-day hourly query returned 604,801 rows / 16.9MB instead of 169 rows / 5KB, causing Grafana dashboards to timeout on ranges > 24h.
+
+**Root cause:** Arc's query rewriter (`rewriteTimeBucket`, `rewriteDateTrunc`) converts time-bucketing SQL to epoch-based arithmetic for performance. The rewritten SQL used DuckDB's `/` operator for division, which performs **float division** on integers (unlike PostgreSQL). This meant `(epoch(time)::BIGINT / 3600) * 3600` returned the original value — no bucketing happened.
+
+**Fix:** Changed `/` to `//` (DuckDB's integer division operator) in all three rewrite locations. `(epoch(time)::BIGINT // 3600) * 3600` now correctly truncates to hour boundaries.
+
+*Reported by [@khalid244](https://github.com/khalid244) — thank you!*
+
 ## New Features
 
 ### Backup & Restore API
