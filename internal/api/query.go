@@ -267,7 +267,7 @@ func rewriteTimeBucket(sql string) string {
 		originEpoch := originTime.Unix()
 
 		// Formula: origin + floor((epoch(col) - origin_epoch) / interval) * interval
-		return fmt.Sprintf("to_timestamp(%d + ((epoch(%s)::BIGINT - %d) / %d) * %d)",
+		return fmt.Sprintf("to_timestamp(%d + ((epoch(%s)::BIGINT - %d) // %d) * %d)",
 			originEpoch, column, originEpoch, seconds, seconds)
 	})
 
@@ -288,7 +288,7 @@ func rewriteTimeBucket(sql string) string {
 			return match // Keep original for months (variable length)
 		}
 
-		return fmt.Sprintf("to_timestamp((epoch(%s)::BIGINT / %d) * %d)", column, seconds, seconds)
+		return fmt.Sprintf("to_timestamp((epoch(%s)::BIGINT // %d) * %d)", column, seconds, seconds)
 	})
 
 	return sql
@@ -318,8 +318,8 @@ func rewriteDateTrunc(sql string) string {
 			return match // Keep original for months (variable length)
 		}
 
-		// Convert to epoch-based arithmetic: to_timestamp((epoch(col) / interval) * interval)
-		return fmt.Sprintf("to_timestamp((epoch(%s)::BIGINT / %d) * %d)", column, seconds, seconds)
+		// Convert to epoch-based arithmetic: to_timestamp((epoch(col) // interval) * interval)
+		return fmt.Sprintf("to_timestamp((epoch(%s)::BIGINT // %d) * %d)", column, seconds, seconds)
 	})
 }
 
