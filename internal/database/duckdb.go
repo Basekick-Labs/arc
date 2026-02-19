@@ -244,8 +244,21 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 				}
 			}
 			if cfg.S3CacheTTLSeconds > 0 {
-				if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_in_mem_cache_block_timeout_millisec=%d", cfg.S3CacheTTLSeconds*1000)); err != nil {
-					logger.Warn().Err(err).Int("ttl_ms", cfg.S3CacheTTLSeconds*1000).Msg("Failed to set cache_httpfs_in_mem_cache_block_timeout_millisec")
+				ttlMs := cfg.S3CacheTTLSeconds * 1000
+				if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_in_mem_cache_block_timeout_millisec=%d", ttlMs)); err != nil {
+					logger.Warn().Err(err).Int("ttl_ms", ttlMs).Msg("Failed to set cache_httpfs_in_mem_cache_block_timeout_millisec")
+				}
+				// Link glob, metadata, and file handle cache TTLs to the same value.
+				// Arc's parquet files are immutable — shorter default TTLs waste S3 HEAD/LIST requests.
+				// Post-compaction cache invalidation handles stale entries.
+				if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_glob_cache_entry_timeout_millisec=%d", ttlMs)); err != nil {
+					logger.Warn().Err(err).Msg("Failed to set cache_httpfs_glob_cache_entry_timeout_millisec")
+				}
+				if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_metadata_cache_entry_timeout_millisec=%d", ttlMs)); err != nil {
+					logger.Warn().Err(err).Msg("Failed to set cache_httpfs_metadata_cache_entry_timeout_millisec")
+				}
+				if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_file_handle_cache_entry_timeout_millisec=%d", ttlMs)); err != nil {
+					logger.Warn().Err(err).Msg("Failed to set cache_httpfs_file_handle_cache_entry_timeout_millisec")
 				}
 			}
 			logger.Info().

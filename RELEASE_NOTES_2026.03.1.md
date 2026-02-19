@@ -44,6 +44,12 @@ Fixed a bug where `time_bucket()` and `date_trunc()` GROUP BY queries returned o
 
 *Reported by [@khalid244](https://github.com/khalid244) — thank you!*
 
+### Unified cache_httpfs TTLs for S3 Caching (#214)
+
+The glob, metadata, and file handle caches in DuckDB's `cache_httpfs` extension now use the same TTL as the data block cache (`s3_cache_ttl_seconds`). Previously these were stuck at DuckDB defaults (30min for glob, 1hr for metadata/file handles), causing unnecessary S3 HEAD/LIST requests for immutable parquet files. No new config settings — the existing `s3_cache_ttl_seconds` now controls all four cache layers.
+
+*Reported by [@khalid244](https://github.com/khalid244) — thank you!*
+
 ## New Features
 
 ### Backup & Restore API
