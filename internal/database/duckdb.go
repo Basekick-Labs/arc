@@ -237,6 +237,21 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 					if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_max_in_mem_cache_block_count=%d", maxBlocks)); err != nil {
 						logger.Warn().Err(err).Int64("max_blocks", maxBlocks).Msg("Failed to set cache_httpfs_max_in_mem_cache_block_count")
 					}
+					// Scale glob/metadata/file-handle cache sizes proportionally.
+					// A 7-day hourly query generates ~168 glob patterns — the default
+					// 64 entries causes constant eviction on large deployments.
+					globEntries := max(maxBlocks/20, 64)      // ~5% of blocks, floor at default
+					metadataEntries := max(maxBlocks/10, 250)  // ~10% of blocks, floor at default
+					fileHandleEntries := max(maxBlocks/10, 250)
+					if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_glob_cache_entry_size=%d", globEntries)); err != nil {
+						logger.Warn().Err(err).Msg("Failed to set cache_httpfs_glob_cache_entry_size")
+					}
+					if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_metadata_cache_entry_size=%d", metadataEntries)); err != nil {
+						logger.Warn().Err(err).Msg("Failed to set cache_httpfs_metadata_cache_entry_size")
+					}
+					if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_file_handle_cache_entry_size=%d", fileHandleEntries)); err != nil {
+						logger.Warn().Err(err).Msg("Failed to set cache_httpfs_file_handle_cache_entry_size")
+					}
 				} else {
 					logger.Warn().
 						Int64("configured_bytes", cfg.S3CacheSize).
@@ -248,18 +263,19 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 				if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_in_mem_cache_block_timeout_millisec=%d", ttlMs)); err != nil {
 					logger.Warn().Err(err).Int("ttl_ms", ttlMs).Msg("Failed to set cache_httpfs_in_mem_cache_block_timeout_millisec")
 				}
-				// Link glob, metadata, and file handle cache TTLs to the same value.
-				// Arc's parquet files are immutable — shorter default TTLs waste S3 HEAD/LIST requests.
-				// Post-compaction cache invalidation handles stale entries.
-				if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_glob_cache_entry_timeout_millisec=%d", ttlMs)); err != nil {
-					logger.Warn().Err(err).Msg("Failed to set cache_httpfs_glob_cache_entry_timeout_millisec")
-				}
+				// Metadata and file handle TTLs match s3_cache_ttl_seconds — these
+				// reference immutable individual parquet files.
 				if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_metadata_cache_entry_timeout_millisec=%d", ttlMs)); err != nil {
 					logger.Warn().Err(err).Msg("Failed to set cache_httpfs_metadata_cache_entry_timeout_millisec")
 				}
 				if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_file_handle_cache_entry_timeout_millisec=%d", ttlMs)); err != nil {
 					logger.Warn().Err(err).Msg("Failed to set cache_httpfs_file_handle_cache_entry_timeout_millisec")
 				}
+			}
+			// Glob TTL: 10s — directory listings change during compaction and S3 LIST
+			// overhead is negligible. Post-compaction invalidation handles the rest.
+			if _, err := db.Exec("SET GLOBAL cache_httpfs_glob_cache_entry_timeout_millisec=10000"); err != nil {
+				logger.Warn().Err(err).Msg("Failed to set cache_httpfs_glob_cache_entry_timeout_millisec")
 			}
 			logger.Info().
 				Int64("cache_size_bytes", cfg.S3CacheSize).
