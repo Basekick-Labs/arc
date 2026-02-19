@@ -986,8 +986,8 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 
 	satelliteCount := len(tleRecords)
 
-	// Convert directly to columnar format (single pass, pre-allocated)
-	columns := ingest.TLERecordsToColumnar(tleRecords)
+	// Convert directly to typed columnar format (single pass, no []interface{})
+	batch, numRecords := ingest.TLERecordsToTypedColumnar(tleRecords)
 
 	// Check RBAC permissions
 	if h.rbacManager != nil && h.rbacManager.IsRBACEnabled() {
@@ -999,9 +999,9 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 		}
 	}
 
-	// Write directly to the ArrowBuffer ingest pipeline
-	totalRows := int64(len(tleRecords))
-	if err := h.arrowBuffer.WriteColumnarDirect(c.Context(), database, measurement, columns); err != nil {
+	// Write directly to the ArrowBuffer ingest pipeline (typed path)
+	totalRows := int64(numRecords)
+	if err := h.arrowBuffer.WriteTypedColumnarDirect(c.Context(), database, measurement, batch, numRecords); err != nil {
 		h.totalErrors.Add(1)
 		h.logger.Error().Err(err).
 			Str("database", database).

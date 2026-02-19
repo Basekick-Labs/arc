@@ -156,9 +156,9 @@ localProcessing:
 		h.logger.Warn().Strs("warnings", warnings).Msg("TLE parse warnings")
 	}
 
-	// Convert directly to columnar format (single pass, pre-allocated)
-	columns := ingest.TLERecordsToColumnar(tleRecords)
-	h.totalRecords.Add(int64(len(tleRecords)))
+	// Convert directly to typed columnar format (single pass, pre-allocated, no []interface{})
+	batch, numRecords := ingest.TLERecordsToTypedColumnar(tleRecords)
+	h.totalRecords.Add(int64(numRecords))
 
 	// Check RBAC permissions
 	if h.rbacManager != nil && h.rbacManager.IsRBACEnabled() {
@@ -170,8 +170,8 @@ localProcessing:
 		}
 	}
 
-	// Write directly to the buffer
-	if err := h.buffer.WriteColumnarDirect(c.Context(), database, measurement, columns); err != nil {
+	// Write directly to the buffer (typed path — skips convertColumnsToTyped)
+	if err := h.buffer.WriteTypedColumnarDirect(c.Context(), database, measurement, batch, numRecords); err != nil {
 		h.totalErrors.Add(1)
 		metrics.Get().IncIngestErrors()
 		h.logger.Error().
