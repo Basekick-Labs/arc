@@ -44,6 +44,16 @@ Fixed a bug where `time_bucket()` and `date_trunc()` GROUP BY queries returned o
 
 *Reported by [@khalid244](https://github.com/khalid244) — thank you!*
 
+### WAL Recovery After Flush Failure Replays Already-Flushed Data (#218)
+
+Fixed a bug where WAL recovery after a storage flush failure (S3/Azure timeout) replayed all rotated WAL files — including files whose data was already successfully flushed to parquet. This caused data duplication on object storage, inflated query results, and increased storage costs.
+
+**Root cause:** The `hasFlushFailure` recovery branch in the periodic WAL maintenance goroutine called `RecoverWithOptions()` without first purging old WAL files. The normal maintenance branch already called `PurgeOlderThan(safeAge)`, but the failure branch skipped this step, causing every WAL file on disk to be replayed and re-written with new parquet filenames (since `generateStoragePath()` uses `time.Now()`).
+
+**Fix:** Added `PurgeOlderThan(safeAge)` before `RecoverWithOptions()` in the failure branch, mirroring the normal maintenance path. This limits the replay window from all WAL history to `safeAge` (minimum 30s), eliminating duplication for data flushed before the failure window.
+
+*Reported by [@khalid244](https://github.com/khalid244) — thank you!*
+
 ### Unified cache_httpfs TTLs and Scaled Cache Sizes (#214)
 
 DuckDB's `cache_httpfs` glob, metadata, and file handle caches are now properly tuned. Metadata and file handle TTLs match `s3_cache_ttl_seconds` (these reference immutable parquet files). Glob TTL is fixed at 10 seconds — directory listings change during compaction, and S3 LIST overhead is negligible. Cache sizes now scale proportionally with `s3_cache_size` (glob: 5% of block count, metadata/file handles: 10%), with floors at DuckDB defaults for small deployments. No new config settings.
