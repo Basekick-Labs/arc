@@ -394,6 +394,18 @@ func main() {
 						// Storage failure detected — replay WAL files to recover data
 						// that was cleared from buffers after failed flush
 						walLogger.Info().Msg("Flush failure detected, attempting WAL recovery")
+
+						// Purge old WAL files first (same as normal path) to avoid replaying
+						// data that was already successfully flushed to parquet before the failure.
+						if walWriter != nil {
+							deleted, purgeErr := walWriter.PurgeOlderThan(safeAge)
+							if purgeErr != nil {
+								walLogger.Error().Err(purgeErr).Msg("WAL purge before recovery failed")
+							} else if deleted > 0 {
+								walLogger.Info().Int("deleted", deleted).Msg("Purged old WAL files before recovery")
+							}
+						}
+
 						recovery := wal.NewRecovery(cfg.WAL.Directory, walLogger)
 						activeFile := ""
 						if walWriter != nil {
