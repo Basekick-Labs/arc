@@ -1718,7 +1718,7 @@ func (b *ArrowBuffer) computeNextFlushDelay() time.Duration {
 // flushAgedBuffers flushes buffers that have exceeded max age
 func (b *ArrowBuffer) flushAgedBuffers() {
 	now := time.Now().UTC()
-	maxAge := time.Duration(b.config.MaxBufferAgeMS) * time.Millisecond
+maxAge := b.maxBufferAge
 
 	threshold := maxAge
 
