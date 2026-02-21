@@ -54,6 +54,10 @@ Fixed a bug where WAL recovery after a storage flush failure (S3/Azure timeout) 
 
 *Reported by [@khalid244](https://github.com/khalid244) — thank you!*
 
+### Self-Adjusting Flush Timer (#142)
+
+The periodic flush goroutine used a fixed-period ticker (`max_buffer_age_ms / 2`), meaning buffers created just after a tick waited up to ~1.5x the configured age before flushing. Replaced with a self-adjusting `time.Timer` that fires exactly when the oldest buffer is due to expire. A `newBufferCh` signal channel recomputes the timer on every new buffer creation. Worst-case flush delay drops from ~1.5x to ~1.0x of `max_buffer_age_ms`.
+
 ### Unified cache_httpfs TTLs and Scaled Cache Sizes (#214)
 
 DuckDB's `cache_httpfs` glob, metadata, and file handle caches are now properly tuned. Metadata and file handle TTLs match `s3_cache_ttl_seconds` (these reference immutable parquet files). Glob TTL is fixed at 10 seconds — directory listings change during compaction, and S3 LIST overhead is negligible. Cache sizes now scale proportionally with `s3_cache_size` (glob: 5% of block count, metadata/file handles: 10%), with floors at DuckDB defaults for small deployments. No new config settings.
