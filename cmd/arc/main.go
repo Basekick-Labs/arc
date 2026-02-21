@@ -548,8 +548,7 @@ func main() {
 	}
 
 	// Initialize Compaction (if enabled)
-	var hourlyScheduler *compaction.Scheduler
-	var dailyScheduler *compaction.Scheduler
+	var compactionScheduler *compaction.Scheduler
 	var compactionManager *compaction.Manager
 	if cfg.Compaction.Enabled {
 		// Build tiers
@@ -608,58 +607,53 @@ func main() {
 			log.Warn().Err(err).Msg("Failed to cleanup orphaned compaction temp directories")
 		}
 
-		// Create hourly scheduler (if hourly tier is enabled)
+		// Create a single compaction scheduler for all enabled tiers.
+		// Using one scheduler prevents daily tier starvation: previously, two separate
+		// schedulers shared a single cycleRunning lock, so if hourly held the lock when
+		// daily's 3AM window arrived, daily would get ErrCycleAlreadyRunning and silently
+		// skip. With a single scheduler, both tiers are processed sequentially in the same
+		// cycle, guaranteeing daily always runs.
+		var enabledTiers []string
 		if cfg.Compaction.HourlyEnabled {
-			hourlyScheduler, err = compaction.NewScheduler(&compaction.SchedulerConfig{
-				Manager:   compactionManager,
-				Schedule:  cfg.Compaction.HourlySchedule,
-				TierNames: []string{"hourly"},
-				Enabled:   true,
-				Logger:    logger.Get("compaction-hourly"),
-			})
-			if err != nil {
-				log.Fatal().Err(err).Msg("Failed to create hourly compaction scheduler")
-			}
-
-			if err := hourlyScheduler.Start(); err != nil {
-				log.Fatal().Err(err).Msg("Failed to start hourly compaction scheduler")
-			}
-
-			shutdownCoordinator.RegisterHook("hourly-compaction-scheduler", func(ctx context.Context) error {
-				hourlyScheduler.Stop()
-				return nil
-			}, shutdown.PriorityCompaction)
-
-			log.Info().
-				Str("schedule", cfg.Compaction.HourlySchedule).
-				Msg("Hourly compaction scheduler started")
+			enabledTiers = append(enabledTiers, "hourly")
+		}
+		if cfg.Compaction.DailyEnabled {
+			enabledTiers = append(enabledTiers, "daily")
 		}
 
-		// Create daily scheduler (if daily tier is enabled)
-		if cfg.Compaction.DailyEnabled {
-			dailyScheduler, err = compaction.NewScheduler(&compaction.SchedulerConfig{
+		if len(enabledTiers) > 0 {
+			// Use the hourly schedule when hourly is enabled (fires frequently so daily
+			// is evaluated every hour and never starved). Fall back to daily schedule
+			// when only daily tier is configured.
+			schedule := cfg.Compaction.HourlySchedule
+			if !cfg.Compaction.HourlyEnabled {
+				schedule = cfg.Compaction.DailySchedule
+			}
+
+			compactionScheduler, err = compaction.NewScheduler(&compaction.SchedulerConfig{
 				Manager:   compactionManager,
-				Schedule:  cfg.Compaction.DailySchedule,
-				TierNames: []string{"daily"},
+				Schedule:  schedule,
+				TierNames: enabledTiers,
 				Enabled:   true,
-				Logger:    logger.Get("compaction-daily"),
+				Logger:    logger.Get("compaction"),
 			})
 			if err != nil {
-				log.Fatal().Err(err).Msg("Failed to create daily compaction scheduler")
+				log.Fatal().Err(err).Msg("Failed to create compaction scheduler")
 			}
 
-			if err := dailyScheduler.Start(); err != nil {
-				log.Fatal().Err(err).Msg("Failed to start daily compaction scheduler")
+			if err := compactionScheduler.Start(); err != nil {
+				log.Fatal().Err(err).Msg("Failed to start compaction scheduler")
 			}
 
-			shutdownCoordinator.RegisterHook("daily-compaction-scheduler", func(ctx context.Context) error {
-				dailyScheduler.Stop()
+			shutdownCoordinator.RegisterHook("compaction-scheduler", func(ctx context.Context) error {
+				compactionScheduler.Stop()
 				return nil
 			}, shutdown.PriorityCompaction)
 
 			log.Info().
-				Str("schedule", cfg.Compaction.DailySchedule).
-				Msg("Daily compaction scheduler started")
+				Str("schedule", schedule).
+				Strs("tiers", enabledTiers).
+				Msg("Compaction scheduler started")
 		}
 
 		log.Info().
@@ -1013,7 +1007,7 @@ func main() {
 
 	// Register Compaction handler (if compaction is enabled)
 	if compactionManager != nil {
-		compactionHandler := api.NewCompactionHandler(compactionManager, hourlyScheduler, dailyScheduler, logger.Get("compaction"))
+		compactionHandler := api.NewCompactionHandler(compactionManager, compactionScheduler, logger.Get("compaction"))
 		compactionHandler.RegisterRoutes(server.GetApp())
 
 		// Wire post-compaction cache invalidation.
