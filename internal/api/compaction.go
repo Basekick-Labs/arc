@@ -13,17 +13,19 @@ import (
 
 // CompactionHandler handles compaction API endpoints
 type CompactionHandler struct {
-	manager   *compaction.Manager
-	scheduler *compaction.Scheduler
-	logger    zerolog.Logger
+	manager         *compaction.Manager
+	hourlyScheduler *compaction.Scheduler
+	dailyScheduler  *compaction.Scheduler
+	logger          zerolog.Logger
 }
 
 // NewCompactionHandler creates a new compaction handler
-func NewCompactionHandler(manager *compaction.Manager, scheduler *compaction.Scheduler, logger zerolog.Logger) *CompactionHandler {
+func NewCompactionHandler(manager *compaction.Manager, hourlyScheduler, dailyScheduler *compaction.Scheduler, logger zerolog.Logger) *CompactionHandler {
 	return &CompactionHandler{
-		manager:   manager,
-		scheduler: scheduler,
-		logger:    logger.With().Str("component", "compaction-handler").Logger(),
+		manager:         manager,
+		hourlyScheduler: hourlyScheduler,
+		dailyScheduler:  dailyScheduler,
+		logger:          logger.With().Str("component", "compaction-handler").Logger(),
 	}
 }
 
@@ -56,10 +58,13 @@ func (h *CompactionHandler) getStatus(c *fiber.Ctx) error {
 		},
 	}
 
-	// Add scheduler status
+	// Add scheduler status for each tier
 	schedulers := fiber.Map{}
-	if h.scheduler != nil {
-		schedulers["compaction"] = h.scheduler.Status()
+	if h.hourlyScheduler != nil {
+		schedulers["hourly"] = h.hourlyScheduler.Status()
+	}
+	if h.dailyScheduler != nil {
+		schedulers["daily"] = h.dailyScheduler.Status()
 	}
 	response["schedulers"] = schedulers
 
