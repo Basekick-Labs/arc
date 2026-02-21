@@ -1696,7 +1696,7 @@ func (b *ArrowBuffer) periodicFlush() {
 // goroutine sleeps until a new buffer signals it via newBufferCh.
 func (b *ArrowBuffer) computeNextFlushDelay() time.Duration {
 	now := time.Now()
-	maxAge := time.Duration(b.config.MaxBufferAgeMS) * time.Millisecond
+maxAge := b.maxBufferAge
 	earliest := now.Add(maxAge) // default when no buffers exist
 
 	for _, shard := range b.shards {
