@@ -192,9 +192,10 @@ func (s *Scheduler) Status() map[string]interface{} {
 	defer s.mu.Unlock()
 
 	status := map[string]interface{}{
-		"enabled":  s.enabled,
-		"running":  s.running,
-		"schedule": s.schedule,
+		"enabled":    s.enabled,
+		"running":    s.running,
+		"schedule":   s.schedule,
+		"tier_names": s.tierNames,
 	}
 
 	if s.running {
