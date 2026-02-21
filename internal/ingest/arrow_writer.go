@@ -688,6 +688,7 @@ type ArrowBuffer struct {
 
 	// Flush timeout for storage writes (prevents workers from blocking forever on S3 hangs)
 	flushTimeout time.Duration
+	maxBufferAge time.Duration // pre-calculated from cfg.MaxBufferAgeMS
 
 	// Metrics (using atomic operations to avoid lock contention)
 	totalRecordsBuffered atomic.Int64
@@ -814,6 +815,7 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		flushQueue:      make(chan flushTask, queueSize),
 		flushWorkers:    flushWorkers,
 		flushTimeout:    flushTimeout,
+		maxBufferAge:    time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond,
 		sortKeysConfig:  sortKeysConfig,
 		defaultSortKeys: defaultSortKeys,
 		logger:          logger.With().Str("component", "arrow-buffer").Logger(),
@@ -1696,7 +1698,7 @@ func (b *ArrowBuffer) periodicFlush() {
 // goroutine sleeps until a new buffer signals it via newBufferCh.
 func (b *ArrowBuffer) computeNextFlushDelay() time.Duration {
 	now := time.Now()
-maxAge := b.maxBufferAge
+	maxAge := b.maxBufferAge
 	earliest := now.Add(maxAge) // default when no buffers exist
 
 	for _, shard := range b.shards {
@@ -1709,16 +1711,16 @@ maxAge := b.maxBufferAge
 		shard.mu.RUnlock()
 	}
 
-	if delay := earliest.Sub(now); delay > 0 {
+	if delay := earliest.Sub(now); delay > time.Millisecond {
 		return delay
 	}
-	return 0
+	return time.Millisecond
 }
 
 // flushAgedBuffers flushes buffers that have exceeded max age
 func (b *ArrowBuffer) flushAgedBuffers() {
 	now := time.Now().UTC()
-maxAge := b.maxBufferAge
+	maxAge := b.maxBufferAge
 
 	threshold := maxAge
 
