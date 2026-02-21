@@ -671,10 +671,11 @@ type ArrowBuffer struct {
 	shardCount uint32
 
 	// Background flush
-	ctx        context.Context
-	cancel     context.CancelFunc
-	flushTimer *time.Ticker
-	wg         sync.WaitGroup
+	ctx          context.Context
+	cancel       context.CancelFunc
+	flushTimer   *time.Timer   // self-adjusting: fires when the oldest buffer is due to expire
+	newBufferCh  chan struct{}  // signals periodicFlush to recompute the next wakeup time
+	wg           sync.WaitGroup
 
 	// OPTIMIZATION: Worker pool for bounded flush concurrency
 	// Prevents goroutine explosion under sustained load
@@ -808,7 +809,8 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		shardCount:      uint32(shardCount),
 		ctx:             ctx,
 		cancel:          cancel,
-		flushTimer:      time.NewTicker(time.Duration(cfg.MaxBufferAgeMS/2) * time.Millisecond),
+		flushTimer:      time.NewTimer(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
+		newBufferCh:     make(chan struct{}, 1),
 		flushQueue:      make(chan flushTask, queueSize),
 		flushWorkers:    flushWorkers,
 		flushTimeout:    flushTimeout,
@@ -1184,6 +1186,11 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 		shard.bufferStartTimes[bufferKey] = time.Now().UTC()
 		shard.bufferRecordCounts[bufferKey] = 0
 		shard.bufferSchemas[bufferKey] = newSignature // Store schema for evolution detection
+		// Tell periodicFlush to recompute its wakeup time for this new buffer.
+		select {
+		case b.newBufferCh <- struct{}{}:
+		default:
+		}
 	}
 
 	// Add typed columns to buffer (already converted via zero-copy fast paths)
@@ -1328,6 +1335,11 @@ func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, 
 		shard.bufferStartTimes[bufferKey] = time.Now().UTC()
 		shard.bufferRecordCounts[bufferKey] = 0
 		shard.bufferSchemas[bufferKey] = newSignature
+		// Tell periodicFlush to recompute its wakeup time for this new buffer.
+		select {
+		case b.newBufferCh <- struct{}{}:
+		default:
+		}
 	}
 
 	// Add typed columns to buffer directly (no conversion needed)
@@ -1648,7 +1660,9 @@ func (b *ArrowBuffer) tryBoolZeroCopy(col []interface{}) ([]bool, bool) {
 	return arr, true
 }
 
-// periodicFlush runs in the background and flushes old buffers
+// periodicFlush runs in the background and flushes old buffers.
+// It uses a self-adjusting timer that fires exactly when the oldest buffer is due
+// to expire, eliminating the phase-misalignment lag of a fixed-period ticker.
 func (b *ArrowBuffer) periodicFlush() {
 	defer b.wg.Done()
 
@@ -1656,10 +1670,49 @@ func (b *ArrowBuffer) periodicFlush() {
 		select {
 		case <-b.ctx.Done():
 			return
+
+		case <-b.newBufferCh:
+			// A new buffer was created; recompute the next wakeup time so the
+			// timer fires at T+maxAge rather than at whatever the old interval was.
+			nextDelay := b.computeNextFlushDelay()
+			if !b.flushTimer.Stop() {
+				select {
+				case <-b.flushTimer.C:
+				default:
+				}
+			}
+			b.flushTimer.Reset(nextDelay)
+
 		case <-b.flushTimer.C:
 			b.flushAgedBuffers()
+			// Rearm the timer for the next oldest buffer expiry.
+			b.flushTimer.Reset(b.computeNextFlushDelay())
 		}
 	}
+}
+
+// computeNextFlushDelay returns the duration until the oldest buffered key is
+// due to be flushed.  If no buffers exist it returns the full maxAge so the
+// goroutine sleeps until a new buffer signals it via newBufferCh.
+func (b *ArrowBuffer) computeNextFlushDelay() time.Duration {
+	now := time.Now()
+	maxAge := time.Duration(b.config.MaxBufferAgeMS) * time.Millisecond
+	earliest := now.Add(maxAge) // default when no buffers exist
+
+	for _, shard := range b.shards {
+		shard.mu.RLock()
+		for _, startTime := range shard.bufferStartTimes {
+			if expiry := startTime.Add(maxAge); expiry.Before(earliest) {
+				earliest = expiry
+			}
+		}
+		shard.mu.RUnlock()
+	}
+
+	if delay := earliest.Sub(now); delay > 0 {
+		return delay
+	}
+	return 0
 }
 
 // flushAgedBuffers flushes buffers that have exceeded max age
@@ -1667,9 +1720,7 @@ func (b *ArrowBuffer) flushAgedBuffers() {
 	now := time.Now().UTC()
 	maxAge := time.Duration(b.config.MaxBufferAgeMS) * time.Millisecond
 
-	// Ticker fires at maxAge/2 interval, so use full maxAge as threshold
-	// This ensures buffers don't flush too early while still getting checked frequently
-	threshold := maxAge  // Full maxAge (e.g., 5000ms threshold, checked every 2500ms)
+	threshold := maxAge
 
 	// Iterate over all shards
 	for shardIdx := range b.shards {
