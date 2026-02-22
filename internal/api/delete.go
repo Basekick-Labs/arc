@@ -41,6 +41,7 @@ type DeleteResponse struct {
 	ExecutionTimeMs float64  `json:"execution_time_ms"`
 	DryRun          bool     `json:"dry_run"`
 	FilesProcessed  []string `json:"files_processed"`
+	FailedFiles     []string `json:"failed_files,omitempty"`
 	Error           string   `json:"error,omitempty"`
 }
 
@@ -253,12 +254,14 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 
 	var totalDeleted int64
 	var rewrittenCount int
-	var processedFiles []string
+	processedFiles := make([]string, 0, len(affected))
+	failedFiles := make([]string, 0, len(affected))
 
 	for _, f := range affected {
 		deleted, err := h.rewriteFileWithoutDeletedRows(ctx, f.path, f.relativePath, req.Where)
 		if err != nil {
 			h.logger.Error().Err(err).Str("file", f.path).Msg("Failed to rewrite file")
+			failedFiles = append(failedFiles, filepath.Base(f.path))
 			continue
 		}
 
@@ -277,18 +280,27 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	h.logger.Info().
 		Int64("deleted_count", totalDeleted).
 		Int("rewritten_files", rewrittenCount).
+		Int("failed_files", len(failedFiles)).
 		Float64("execution_time_ms", executionTime).
 		Msg("Delete operation completed")
 
-	return c.JSON(DeleteResponse{
-		Success:         true,
+	resp := DeleteResponse{
+		Success:         len(failedFiles) == 0,
 		DeletedCount:    totalDeleted,
 		AffectedFiles:   len(affected),
 		RewrittenFiles:  rewrittenCount,
 		ExecutionTimeMs: executionTime,
 		DryRun:          false,
 		FilesProcessed:  processedFiles,
-	})
+		FailedFiles:     failedFiles,
+	}
+
+	if len(failedFiles) > 0 {
+		resp.Error = fmt.Sprintf("%d of %d files failed to process", len(failedFiles), len(affected))
+		return c.Status(fiber.StatusMultiStatus).JSON(resp)
+	}
+
+	return c.JSON(resp)
 }
 
 // validateWhereClause validates the WHERE clause and returns true if it's a full table delete
