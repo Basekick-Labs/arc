@@ -54,6 +54,7 @@ type Subscription struct {
 	ConnectTimeoutSeconds int                `json:"connect_timeout_seconds"`
 	ReconnectMinSeconds   int                `json:"reconnect_min_seconds"`
 	ReconnectMaxSeconds   int                `json:"reconnect_max_seconds"`
+	CleanSession          bool               `json:"clean_session"`
 	CreatedAt             time.Time          `json:"created_at"`
 	UpdatedAt             time.Time          `json:"updated_at"`
 }
@@ -79,6 +80,7 @@ type CreateSubscriptionRequest struct {
 	ConnectTimeoutSeconds int               `json:"connect_timeout_seconds"`
 	ReconnectMinSeconds   int               `json:"reconnect_min_seconds"`
 	ReconnectMaxSeconds   int               `json:"reconnect_max_seconds"`
+	CleanSession          bool              `json:"clean_session"`
 }
 
 // UpdateSubscriptionRequest is the request body for updating a subscription
@@ -102,6 +104,7 @@ type UpdateSubscriptionRequest struct {
 	ConnectTimeoutSeconds *int               `json:"connect_timeout_seconds,omitempty"`
 	ReconnectMinSeconds   *int               `json:"reconnect_min_seconds,omitempty"`
 	ReconnectMaxSeconds   *int               `json:"reconnect_max_seconds,omitempty"`
+	CleanSession          *bool              `json:"clean_session,omitempty"`
 }
 
 // SubscriptionStats contains runtime statistics for a subscription
@@ -274,6 +277,7 @@ func ValidateCreateRequest(req *CreateSubscriptionRequest) error {
 		ConnectTimeoutSeconds: req.ConnectTimeoutSeconds,
 		ReconnectMinSeconds:   req.ReconnectMinSeconds,
 		ReconnectMaxSeconds:   req.ReconnectMaxSeconds,
+		CleanSession:          req.CleanSession,
 	}
 	s.SetDefaults()
 	return s.Validate()

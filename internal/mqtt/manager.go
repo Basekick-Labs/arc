@@ -162,6 +162,7 @@ func (m *SubscriptionManager) Create(ctx context.Context, req *CreateSubscriptio
 		ConnectTimeoutSeconds: req.ConnectTimeoutSeconds,
 		ReconnectMinSeconds:   req.ReconnectMinSeconds,
 		ReconnectMaxSeconds:   req.ReconnectMaxSeconds,
+		CleanSession:          req.CleanSession,
 		Status:                StatusStopped,
 	}
 
@@ -285,6 +286,9 @@ func (m *SubscriptionManager) Update(ctx context.Context, id string, req *Update
 	}
 	if req.ReconnectMaxSeconds != nil {
 		sub.ReconnectMaxSeconds = *req.ReconnectMaxSeconds
+	}
+	if req.CleanSession != nil {
+		sub.CleanSession = *req.CleanSession
 	}
 
 	// Validate updated subscription

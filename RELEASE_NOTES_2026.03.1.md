@@ -20,8 +20,6 @@ Fixed a bug where queries would intermittently fail with HTTP 404 errors after c
 
 **Fix:** Added post-compaction cache invalidation that clears all relevant caches (DuckDB `cache_httpfs`, `parquet_metadata_cache`, partition pruner, and SQL transform cache) immediately after each successful compaction job completes.
 
-*Reported by [@khalid244](https://github.com/khalid244) — thank you!*
-
 ### Distributed Cache Invalidation for Enterprise Clustering (#204, #206)
 
 Extended the post-compaction cache fix (#204) to support enterprise clustering, where compaction runs on a dedicated Compactor node separate from Reader/Writer nodes. After each successful compaction job, the Compactor now broadcasts cache invalidation to all healthy cluster peers via `POST /api/v1/internal/cache/invalidate`.
@@ -32,8 +30,6 @@ Extended the post-compaction cache fix (#204) to support enterprise clustering, 
 
 All query endpoints (`/api/v1/query`, `/api/v1/query/arrow`, `/api/v1/query/:measurement`) now return the actual DuckDB error message instead of a generic `"Query execution failed"`. Users can now see actionable errors like `Parser Error: syntax error at or near "SELEC"` directly in API responses and Grafana, making SQL debugging significantly easier.
 
-*Reported by [@khalid244](https://github.com/khalid244) — thank you!*
-
 ### time_bucket and date_trunc Return Per-Second Rows Instead of Proper Buckets (#212)
 
 Fixed a bug where `time_bucket()` and `date_trunc()` GROUP BY queries returned one row per unique second instead of proper time buckets. A 7-day hourly query returned 604,801 rows / 16.9MB instead of 169 rows / 5KB, causing Grafana dashboards to timeout on ranges > 24h.
@@ -41,8 +37,6 @@ Fixed a bug where `time_bucket()` and `date_trunc()` GROUP BY queries returned o
 **Root cause:** Arc's query rewriter (`rewriteTimeBucket`, `rewriteDateTrunc`) converts time-bucketing SQL to epoch-based arithmetic for performance. The rewritten SQL used DuckDB's `/` operator for division, which performs **float division** on integers (unlike PostgreSQL). This meant `(epoch(time)::BIGINT / 3600) * 3600` returned the original value — no bucketing happened.
 
 **Fix:** Changed `/` to `//` (DuckDB's integer division operator) in all three rewrite locations. `(epoch(time)::BIGINT // 3600) * 3600` now correctly truncates to hour boundaries.
-
-*Reported by [@khalid244](https://github.com/khalid244) — thank you!*
 
 ### WAL Recovery After Flush Failure Replays Already-Flushed Data (#218)
 
@@ -52,11 +46,15 @@ Fixed a bug where WAL recovery after a storage flush failure (S3/Azure timeout) 
 
 **Fix:** Added `PurgeOlderThan(safeAge)` before `RecoverWithOptions()` in the failure branch, mirroring the normal maintenance path. This limits the replay window from all WAL history to `safeAge` (minimum 30s), eliminating duplication for data flushed before the failure window.
 
-*Reported by [@khalid244](https://github.com/khalid244) — thank you!*
-
 ### Self-Adjusting Flush Timer (#142)
 
 The periodic flush goroutine used a fixed-period ticker (`max_buffer_age_ms / 2`), meaning buffers created just after a tick waited up to ~1.5x the configured age before flushing. Replaced with a self-adjusting `time.Timer` that fires exactly when the oldest buffer is due to expire. A `newBufferCh` signal channel recomputes the timer on every new buffer creation. Worst-case flush delay drops from ~1.5x to ~1.0x of `max_buffer_age_ms`.
+
+### MQTT CleanSession Configurable — Default Changed to False (#239)
+
+`CleanSession` was hardcoded to `true`, which told the MQTT broker to discard any unacknowledged messages when Arc disconnected. With QoS=1 (the default), this silently dropped messages sent during reconnection windows — making at-least-once delivery behave as at-most-once across reconnects.
+
+`CleanSession` is now configurable per subscription via the API (`clean_session` field) and defaults to `false`. Existing subscriptions are unaffected — the migration sets the column default to `0` (false). Users who intentionally want ephemeral sessions can set `clean_session: true` when creating or updating a subscription.
 
 ### Replication Observability: Prometheus Metrics and Sequence Gap Detection (#237)
 
@@ -81,8 +79,6 @@ Fixed three related bugs in the compaction manifest system that could leave orph
 ### Unified cache_httpfs TTLs and Scaled Cache Sizes (#214)
 
 DuckDB's `cache_httpfs` glob, metadata, and file handle caches are now properly tuned. Metadata and file handle TTLs match `s3_cache_ttl_seconds` (these reference immutable parquet files). Glob TTL is fixed at 10 seconds — directory listings change during compaction, and S3 LIST overhead is negligible. Cache sizes now scale proportionally with `s3_cache_size` (glob: 5% of block count, metadata/file handles: 10%), with floors at DuckDB defaults for small deployments. No new config settings.
-
-*Reported by [@khalid244](https://github.com/khalid244) — thank you!*
 
 ## Infrastructure
 
@@ -146,7 +142,7 @@ curl -X POST "http://localhost:8000/api/v1/backup/restore" \
 ```
 
 **Key features:**
-- **Async operations** — backup and restore run in background goroutines (2-hour timeout). Clients poll `/status` for progress.
+- **Async operations** — backup and restore run in background goroutines (2-hour timeout). Clients poll `/status` for progress
 - **What gets backed up** — parquet data files, SQLite database (with WAL checkpoint for consistency), and `arc.toml` config
 - **Selective restore** — independently choose to restore data, metadata, and/or config
 - **Pre-restore safety** — existing SQLite and config files are copied with `.before-restore` suffix before overwriting
