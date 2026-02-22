@@ -86,6 +86,7 @@ func (r *Repository) initSchema() error {
 		connect_timeout_seconds INTEGER DEFAULT 30,
 		reconnect_min_seconds INTEGER DEFAULT 1,
 		reconnect_max_seconds INTEGER DEFAULT 60,
+		clean_session INTEGER DEFAULT 0,
 		created_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL
 	);
@@ -115,6 +116,11 @@ func (r *Repository) runMigrations() error {
 			name:  "add_tls_insecure_skip_verify",
 			check: "SELECT tls_insecure_skip_verify FROM mqtt_subscriptions LIMIT 1",
 			apply: "ALTER TABLE mqtt_subscriptions ADD COLUMN tls_insecure_skip_verify INTEGER DEFAULT 0",
+		},
+		{
+			name:  "add_clean_session",
+			check: "SELECT clean_session FROM mqtt_subscriptions LIMIT 1",
+			apply: "ALTER TABLE mqtt_subscriptions ADD COLUMN clean_session INTEGER DEFAULT 0",
 		},
 	}
 
@@ -172,8 +178,8 @@ func (r *Repository) Create(ctx context.Context, sub *Subscription) error {
 		tls_key_path, tls_ca_path, tls_insecure_skip_verify, auto_start,
 		status, error_message, topic_mapping, keep_alive_seconds,
 		connect_timeout_seconds, reconnect_min_seconds, reconnect_max_seconds,
-		created_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		clean_session, created_at, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	_, err = r.db.ExecContext(ctx, query,
@@ -184,7 +190,8 @@ func (r *Repository) Create(ctx context.Context, sub *Subscription) error {
 		boolToInt(sub.AutoStart), string(sub.Status), sub.ErrorMessage,
 		nullableString(topicMappingJSON), sub.KeepAliveSeconds,
 		sub.ConnectTimeoutSeconds, sub.ReconnectMinSeconds,
-		sub.ReconnectMaxSeconds, sub.CreatedAt.Format(time.RFC3339),
+		sub.ReconnectMaxSeconds, boolToInt(sub.CleanSession),
+		sub.CreatedAt.Format(time.RFC3339),
 		sub.UpdatedAt.Format(time.RFC3339),
 	)
 
@@ -206,7 +213,7 @@ func (r *Repository) Get(ctx context.Context, id string) (*Subscription, error) 
 		tls_key_path, tls_ca_path, tls_insecure_skip_verify, auto_start,
 		status, error_message, topic_mapping, keep_alive_seconds,
 		connect_timeout_seconds, reconnect_min_seconds, reconnect_max_seconds,
-		created_at, updated_at
+		clean_session, created_at, updated_at
 	FROM mqtt_subscriptions
 	WHERE id = ?
 	`
@@ -222,7 +229,7 @@ func (r *Repository) GetByName(ctx context.Context, name string) (*Subscription,
 		tls_key_path, tls_ca_path, tls_insecure_skip_verify, auto_start,
 		status, error_message, topic_mapping, keep_alive_seconds,
 		connect_timeout_seconds, reconnect_min_seconds, reconnect_max_seconds,
-		created_at, updated_at
+		clean_session, created_at, updated_at
 	FROM mqtt_subscriptions
 	WHERE name = ?
 	`
@@ -238,7 +245,7 @@ func (r *Repository) List(ctx context.Context) ([]*Subscription, error) {
 		tls_key_path, tls_ca_path, tls_insecure_skip_verify, auto_start,
 		status, error_message, topic_mapping, keep_alive_seconds,
 		connect_timeout_seconds, reconnect_min_seconds, reconnect_max_seconds,
-		created_at, updated_at
+		clean_session, created_at, updated_at
 	FROM mqtt_subscriptions
 	ORDER BY name
 	`
@@ -273,7 +280,7 @@ func (r *Repository) ListAutoStart(ctx context.Context) ([]*Subscription, error)
 		tls_key_path, tls_ca_path, tls_insecure_skip_verify, auto_start,
 		status, error_message, topic_mapping, keep_alive_seconds,
 		connect_timeout_seconds, reconnect_min_seconds, reconnect_max_seconds,
-		created_at, updated_at
+		clean_session, created_at, updated_at
 	FROM mqtt_subscriptions
 	WHERE auto_start = 1
 	ORDER BY name
@@ -329,7 +336,7 @@ func (r *Repository) Update(ctx context.Context, sub *Subscription) error {
 		status = ?, error_message = ?, topic_mapping = ?,
 		keep_alive_seconds = ?, connect_timeout_seconds = ?,
 		reconnect_min_seconds = ?, reconnect_max_seconds = ?,
-		updated_at = ?
+		clean_session = ?, updated_at = ?
 	WHERE id = ?
 	`
 
@@ -341,7 +348,8 @@ func (r *Repository) Update(ctx context.Context, sub *Subscription) error {
 		boolToInt(sub.AutoStart), string(sub.Status), sub.ErrorMessage,
 		nullableString(topicMappingJSON), sub.KeepAliveSeconds,
 		sub.ConnectTimeoutSeconds, sub.ReconnectMinSeconds,
-		sub.ReconnectMaxSeconds, sub.UpdatedAt.Format(time.RFC3339),
+		sub.ReconnectMaxSeconds, boolToInt(sub.CleanSession),
+		sub.UpdatedAt.Format(time.RFC3339),
 		sub.ID,
 	)
 
@@ -413,7 +421,7 @@ func (r *Repository) scanSubscription(row *sql.Row) (*Subscription, error) {
 	var topicsJSON string
 	var topicMappingJSON sql.NullString
 	var createdAt, updatedAt string
-	var tlsEnabled, tlsInsecureSkipVerify, autoStart int
+	var tlsEnabled, tlsInsecureSkipVerify, autoStart, cleanSession int
 	var status string
 
 	err := row.Scan(
@@ -423,7 +431,7 @@ func (r *Repository) scanSubscription(row *sql.Row) (*Subscription, error) {
 		&tlsInsecureSkipVerify, &autoStart, &status, &sub.ErrorMessage,
 		&topicMappingJSON, &sub.KeepAliveSeconds, &sub.ConnectTimeoutSeconds,
 		&sub.ReconnectMinSeconds, &sub.ReconnectMaxSeconds,
-		&createdAt, &updatedAt,
+		&cleanSession, &createdAt, &updatedAt,
 	)
 
 	if err == sql.ErrNoRows {
@@ -453,6 +461,7 @@ func (r *Repository) scanSubscription(row *sql.Row) (*Subscription, error) {
 	sub.TLSEnabled = tlsEnabled == 1
 	sub.TLSInsecureSkipVerify = tlsInsecureSkipVerify == 1
 	sub.AutoStart = autoStart == 1
+	sub.CleanSession = cleanSession == 1
 	sub.Status = SubscriptionStatus(status)
 	sub.HasPassword = sub.PasswordEncrypted != ""
 
@@ -465,7 +474,7 @@ func (r *Repository) scanSubscriptionRow(rows *sql.Rows) (*Subscription, error) 
 	var topicsJSON string
 	var topicMappingJSON sql.NullString
 	var createdAt, updatedAt string
-	var tlsEnabled, tlsInsecureSkipVerify, autoStart int
+	var tlsEnabled, tlsInsecureSkipVerify, autoStart, cleanSession int
 	var status string
 
 	err := rows.Scan(
@@ -475,7 +484,7 @@ func (r *Repository) scanSubscriptionRow(rows *sql.Rows) (*Subscription, error) 
 		&tlsInsecureSkipVerify, &autoStart, &status, &sub.ErrorMessage,
 		&topicMappingJSON, &sub.KeepAliveSeconds, &sub.ConnectTimeoutSeconds,
 		&sub.ReconnectMinSeconds, &sub.ReconnectMaxSeconds,
-		&createdAt, &updatedAt,
+		&cleanSession, &createdAt, &updatedAt,
 	)
 
 	if err != nil {
@@ -502,6 +511,7 @@ func (r *Repository) scanSubscriptionRow(rows *sql.Rows) (*Subscription, error) 
 	sub.TLSEnabled = tlsEnabled == 1
 	sub.TLSInsecureSkipVerify = tlsInsecureSkipVerify == 1
 	sub.AutoStart = autoStart == 1
+	sub.CleanSession = cleanSession == 1
 	sub.Status = SubscriptionStatus(status)
 	sub.HasPassword = sub.PasswordEncrypted != ""
 

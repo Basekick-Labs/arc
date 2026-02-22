@@ -88,7 +88,7 @@ func (s *Subscriber) Start() error {
 	s.client = pahomqtt.NewClient(opts)
 
 	// Connect
-	s.logger.Info().Str("broker", s.config.Broker).Msg("Connecting to MQTT broker")
+	s.logger.Info().Str("broker", s.config.Broker).Bool("clean_session", s.config.CleanSession).Msg("Connecting to MQTT broker")
 
 	token := s.client.Connect()
 	if !token.WaitTimeout(time.Duration(s.config.ConnectTimeoutSeconds) * time.Second) {
@@ -209,8 +209,8 @@ func (s *Subscriber) buildClientOptions() (*pahomqtt.ClientOptions, error) {
 	opts.SetConnectionLostHandler(s.onConnectionLost)
 	opts.SetReconnectingHandler(s.onReconnecting)
 
-	// Clean session
-	opts.SetCleanSession(true)
+	// Clean session — default false preserves QoS=1 at-least-once delivery across reconnects
+	opts.SetCleanSession(s.config.CleanSession)
 
 	return opts, nil
 }
