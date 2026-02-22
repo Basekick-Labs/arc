@@ -118,7 +118,7 @@ type Metrics struct {
 
 	// Replication metrics
 	replicationEntriesDroppedTotal atomic.Int64 // Total replication entries dropped due to full buffer
-	replicationSequenceGapsTotal   atomic.Int64 // Total sequence gaps detected on replication receivers
+	replicationSequenceGapsTotal   atomic.Int64 // Total number of missing replication entries detected via sequence gaps
 
 	logger zerolog.Logger
 }
