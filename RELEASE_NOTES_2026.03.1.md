@@ -58,6 +58,10 @@ Fixed a bug where WAL recovery after a storage flush failure (S3/Azure timeout) 
 
 The periodic flush goroutine used a fixed-period ticker (`max_buffer_age_ms / 2`), meaning buffers created just after a tick waited up to ~1.5x the configured age before flushing. Replaced with a self-adjusting `time.Timer` that fires exactly when the oldest buffer is due to expire. A `newBufferCh` signal channel recomputes the timer on every new buffer creation. Worst-case flush delay drops from ~1.5x to ~1.0x of `max_buffer_age_ms`.
 
+### Orphaned Hot File Cleanup After Tiering Migration (#236)
+
+Added a reconciliation pass to the tiering migration cycle that detects and removes orphaned files from hot storage. When migration copies a file to cold but fails to delete it from hot, the hot copy was left orphaned — wasting storage and potentially confusing compaction. The reconciliation runs automatically after each migration cycle: it queries metadata for all cold-tier files, checks if they still exist in hot storage, and deletes any orphans.
+
 ### Compaction Manifest Cleanup Leaves Orphaned Files (#240)
 
 Fixed three related bugs in the compaction manifest system that could leave orphaned input files alongside compacted output files, causing queries to return duplicated data.
