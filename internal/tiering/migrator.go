@@ -345,6 +345,67 @@ func (m *Migrator) copyFileStreaming(ctx context.Context, src, dst StreamingBack
 	return nil
 }
 
+// ReconcileOrphanedFiles finds and deletes files that exist in hot storage
+// but are tracked as cold in metadata (orphaned after failed hot deletion during migration).
+// Only checks files migrated within the last 48 hours to limit I/O.
+func (m *Migrator) ReconcileOrphanedFiles(ctx context.Context) (orphansFound, deleted, errors int) {
+	const reconcileWindow = 48 * time.Hour
+
+	coldFiles, err := m.manager.metadata.GetRecentlyMigratedFiles(ctx, TierCold, reconcileWindow)
+	if err != nil {
+		m.logger.Error().Err(err).Msg("Failed to get recently migrated files for reconciliation")
+		return 0, 0, 1
+	}
+
+	if len(coldFiles) == 0 {
+		return 0, 0, 0
+	}
+
+	hotBackend := m.manager.GetBackendForTier(TierHot)
+	if hotBackend == nil {
+		return 0, 0, 0
+	}
+
+	for _, file := range coldFiles {
+		select {
+		case <-ctx.Done():
+			return orphansFound, deleted, errors
+		default:
+		}
+
+		exists, err := hotBackend.Exists(ctx, file.Path)
+		if err != nil {
+			m.logger.Warn().Err(err).Str("path", file.Path).Msg("Failed to check hot existence during reconciliation")
+			errors++
+			continue
+		}
+
+		if !exists {
+			continue
+		}
+
+		// Orphan found — file is in both hot and cold
+		orphansFound++
+		m.logger.Info().
+			Str("path", file.Path).
+			Str("database", file.Database).
+			Str("measurement", file.Measurement).
+			Int64("size_bytes", file.SizeBytes).
+			Msg("Found orphaned hot file (metadata says cold), deleting from hot")
+
+		if err := hotBackend.Delete(ctx, file.Path); err != nil {
+			m.logger.Warn().Err(err).Str("path", file.Path).Msg("Failed to delete orphaned hot file")
+			errors++
+			continue
+		}
+
+		deleted++
+		m.CleanupEmptyDirectories(ctx, file.Path)
+	}
+
+	return orphansFound, deleted, errors
+}
+
 // CleanupEmptyDirectories removes empty directories after file migration
 // Walks up from the file's hour directory, removing empty dirs until hitting a non-empty one
 // Path format: {database}/{measurement}/{year}/{month}/{day}/{hour}/

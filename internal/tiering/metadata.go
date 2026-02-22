@@ -198,6 +198,30 @@ func (s *MetadataStore) GetFilesOlderThan(ctx context.Context, tier Tier, maxAge
 	return s.scanFiles(rows)
 }
 
+// GetRecentlyMigratedFiles retrieves files in a tier that were migrated within the given window.
+// Used by reconciliation to limit the working set to recently-migrated files.
+func (s *MetadataStore) GetRecentlyMigratedFiles(ctx context.Context, tier Tier, window time.Duration) ([]FileMetadata, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	cutoff := time.Now().UTC().Add(-window)
+
+	query := `
+		SELECT id, path, database, measurement, partition_time, tier, size_bytes, created_at, migrated_at
+		FROM tier_files
+		WHERE tier = ? AND migrated_at IS NOT NULL AND migrated_at >= ?
+		ORDER BY migrated_at DESC
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, string(tier), cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query recently migrated files: %w", err)
+	}
+	defer rows.Close()
+
+	return s.scanFiles(rows)
+}
+
 // GetFilesByDatabase retrieves all files for a specific database
 func (s *MetadataStore) GetFilesByDatabase(ctx context.Context, database string) ([]FileMetadata, error) {
 	s.mu.RLock()
