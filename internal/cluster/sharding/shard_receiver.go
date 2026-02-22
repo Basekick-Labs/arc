@@ -420,7 +420,7 @@ func (r *ShardReceiver) receiveLoop() {
 			prevSeq := r.lastSeq.Load()
 			if prevSeq > 0 && entry.Sequence > prevSeq+1 {
 				gap := entry.Sequence - prevSeq - 1
-				metrics.Get().IncReplicationSequenceGaps()
+				metrics.Get().IncReplicationSequenceGaps(int64(gap))
 				r.logger.Warn().
 					Uint64("expected", prevSeq+1).
 					Uint64("received", entry.Sequence).
