@@ -834,8 +834,8 @@ func (m *Manager) filterCandidateFiles(ctx context.Context, candidate Candidate)
 
 	filesInManifests, err := m.ManifestManager.GetFilesInManifests(ctx)
 	if err != nil {
-		m.logger.Warn().Err(err).Msg("Failed to get files in manifests, proceeding without filtering")
-		return candidate, len(candidate.Files) > 0
+		m.logger.Warn().Err(err).Msg("Failed to get files in manifests, skipping partition to avoid re-compaction")
+		return candidate, false
 	}
 
 	if len(filesInManifests) == 0 {
