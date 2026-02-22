@@ -291,7 +291,7 @@ func (m *Metrics) SetQueryMgmtHistorySize(n int64)   { m.queryMgmtHistorySize.St
 
 // Replication Metrics
 func (m *Metrics) IncReplicationEntriesDropped() { m.replicationEntriesDroppedTotal.Add(1) }
-func (m *Metrics) IncReplicationSequenceGaps()   { m.replicationSequenceGapsTotal.Add(1) }
+func (m *Metrics) IncReplicationSequenceGaps(n int64)   { m.replicationSequenceGapsTotal.Add(n) }
 
 // Snapshot returns all metrics as a map (for JSON endpoint)
 func (m *Metrics) Snapshot() map[string]interface{} {
