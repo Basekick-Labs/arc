@@ -428,7 +428,9 @@ func (r *ShardReceiver) receiveLoop() {
 					Msg("Sequence gap detected in replication stream")
 			}
 
-			r.lastSeq.Store(entry.Sequence)
+			if entry.Sequence > prevSeq {
+				r.lastSeq.Store(entry.Sequence)
+			}
 			r.totalEntriesReceived.Add(1)
 			r.totalBytesReceived.Add(int64(len(entry.Payload)))
 			r.lastReceiveTime.Store(time.Now().UnixNano())
