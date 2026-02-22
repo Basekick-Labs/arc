@@ -363,7 +363,8 @@ func (m *Migrator) ReconcileOrphanedFiles(ctx context.Context) (orphansFound, de
 
 	hotBackend := m.manager.GetBackendForTier(TierHot)
 	if hotBackend == nil {
-		return 0, 0, 0
+                m.logger.Error().Msg("Hot backend not available for orphaned file reconciliation")
+                return 0, 0, 1
 	}
 
 	for _, file := range coldFiles {
