@@ -218,7 +218,8 @@ func (m *Manager) RunMigrationCycle(ctx context.Context) error {
 
 	// Reconcile orphaned hot files (files tracked as cold but still in hot storage)
 	orphansFound, orphansDeleted, orphanErrors := m.migrator.ReconcileOrphanedFiles(ctx)
-	if orphansFound > 0 {
+	totalErrors += orphanErrors
+	if orphansFound > 0 || orphanErrors > 0 {
 		m.logger.Info().
 			Int("found", orphansFound).
 			Int("deleted", orphansDeleted).

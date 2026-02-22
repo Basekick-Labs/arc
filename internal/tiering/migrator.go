@@ -347,10 +347,13 @@ func (m *Migrator) copyFileStreaming(ctx context.Context, src, dst StreamingBack
 
 // ReconcileOrphanedFiles finds and deletes files that exist in hot storage
 // but are tracked as cold in metadata (orphaned after failed hot deletion during migration).
+// Only checks files migrated within the last 48 hours to limit I/O.
 func (m *Migrator) ReconcileOrphanedFiles(ctx context.Context) (orphansFound, deleted, errors int) {
-	coldFiles, err := m.manager.metadata.GetFilesInTier(ctx, TierCold)
+	const reconcileWindow = 48 * time.Hour
+
+	coldFiles, err := m.manager.metadata.GetRecentlyMigratedFiles(ctx, TierCold, reconcileWindow)
 	if err != nil {
-		m.logger.Error().Err(err).Msg("Failed to get cold tier files for reconciliation")
+		m.logger.Error().Err(err).Msg("Failed to get recently migrated files for reconciliation")
 		return 0, 0, 1
 	}
 
