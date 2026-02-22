@@ -56,6 +56,10 @@ The periodic flush goroutine used a fixed-period ticker (`max_buffer_age_ms / 2`
 
 `CleanSession` is now configurable per subscription via the API (`clean_session` field) and defaults to `false`. Existing subscriptions are unaffected — the migration sets the column default to `0` (false). Users who intentionally want ephemeral sessions can set `clean_session: true` when creating or updating a subscription.
 
+### Delete API: Partial Failure Reporting (#235)
+
+The delete endpoint now correctly reports partial failures. Previously, the response always returned `success: true` even when some files failed to rewrite. Now returns `success: false` with HTTP 207 (Multi-Status) when files fail, includes a `failed_files` list of filenames that could not be processed, and populates the `error` field with a summary. Successfully processed files are still reported in `files_processed`.
+
 ### Replication Observability: Prometheus Metrics and Sequence Gap Detection (#237)
 
 Added two Prometheus metrics for replication monitoring: `arc_replication_entries_dropped_total` tracks entries dropped due to full replication buffers (both shard and WAL replication), and `arc_replication_sequence_gaps_total` tracks sequence gaps detected on replication receivers. Receivers now log a warning with gap details when non-consecutive sequences are received, giving operators visibility into which data windows may be incomplete on replicas.
