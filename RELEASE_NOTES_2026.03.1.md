@@ -58,6 +58,18 @@ Fixed a bug where WAL recovery after a storage flush failure (S3/Azure timeout) 
 
 The periodic flush goroutine used a fixed-period ticker (`max_buffer_age_ms / 2`), meaning buffers created just after a tick waited up to ~1.5x the configured age before flushing. Replaced with a self-adjusting `time.Timer` that fires exactly when the oldest buffer is due to expire. A `newBufferCh` signal channel recomputes the timer on every new buffer creation. Worst-case flush delay drops from ~1.5x to ~1.0x of `max_buffer_age_ms`.
 
+### Compaction Manifest Cleanup Leaves Orphaned Files (#240)
+
+Fixed three related bugs in the compaction manifest system that could leave orphaned input files alongside compacted output files, causing queries to return duplicated data.
+
+1. **Stale manifest deletion skipped input file cleanup** — Manifests older than 7 days were deleted without first removing the input files they tracked. If the compacted output file existed, both input files and output file remained in storage, doubling query results for that partition.
+
+2. **Manifest deleted despite failed input file deletion** — During manifest recovery, if some input files failed to delete (e.g., transient storage error), the manifest was deleted anyway. The failed-to-delete input files became permanently orphaned with no tracking for retry.
+
+3. **Manifest filtering skipped on error** — When `GetFilesInManifests()` returned an error, compaction candidates were returned unfiltered, risking re-compaction of files already being processed by another job.
+
+**Fix:** Stale manifests now follow the same recovery path as normal manifests (verify output, delete inputs, then delete manifest). Manifest deletion is deferred until all input files are successfully removed. On filtering errors, the partition is skipped rather than processed without safety checks.
+
 ### Unified cache_httpfs TTLs and Scaled Cache Sizes (#214)
 
 DuckDB's `cache_httpfs` glob, metadata, and file handle caches are now properly tuned. Metadata and file handle TTLs match `s3_cache_ttl_seconds` (these reference immutable parquet files). Glob TTL is fixed at 10 seconds — directory listings change during compaction, and S3 LIST overhead is negligible. Cache sizes now scale proportionally with `s3_cache_size` (glob: 5% of block count, metadata/file handles: 10%), with floors at DuckDB defaults for small deployments. No new config settings.

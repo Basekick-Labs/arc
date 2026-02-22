@@ -208,16 +208,15 @@ func (m *ManifestManager) recoverManifest(ctx context.Context, manifestPath stri
 		return m.DeleteManifest(ctx, manifestPath)
 	}
 
-	// Check for stale manifests - if older than ManifestMaxAge, delete without recovery
-	// Very old manifests likely indicate a deeper problem that needs investigation
+	// Check for stale manifests - older than ManifestMaxAge likely indicate a deeper problem
 	manifestAge := time.Since(manifest.CreatedAt)
-	if manifestAge > ManifestMaxAge {
+	isStale := manifestAge > ManifestMaxAge
+	if isStale {
 		m.logger.Warn().
 			Str("manifest", manifestPath).
 			Dur("age", manifestAge).
 			Time("created_at", manifest.CreatedAt).
-			Msg("Deleting stale manifest (older than 7 days) - investigate root cause")
-		return m.DeleteManifest(ctx, manifestPath)
+			Msg("Processing stale manifest (older than 7 days) - investigate root cause")
 	}
 
 	m.logger.Info().
@@ -287,10 +286,11 @@ func (m *ManifestManager) recoverManifest(ctx context.Context, manifestPath stri
 		m.logger.Warn().
 			Int("errors", deleteErrors).
 			Int("total", len(manifest.InputFiles)).
-			Msg("Some input files could not be deleted during recovery")
+			Msg("Some input files could not be deleted during recovery, keeping manifest for retry")
+		return fmt.Errorf("failed to delete %d of %d input files", deleteErrors, len(manifest.InputFiles))
 	}
 
-	// Delete the manifest to complete recovery
+	// All input files deleted — safe to remove manifest
 	return m.DeleteManifest(ctx, manifestPath)
 }
 
