@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
 
@@ -209,6 +210,7 @@ func (s *Sender) Replicate(entry *ReplicateEntry) {
 	default:
 		// Buffer full, drop entry
 		s.totalEntriesDropped.Add(1)
+		metrics.Get().IncReplicationEntriesDropped()
 		s.logger.Warn().
 			Uint64("sequence", entry.Sequence).
 			Int("buffer_size", s.cfg.BufferSize).

@@ -10,6 +10,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/cluster/replication"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
 
@@ -358,6 +359,7 @@ func (s *ShardSender) Replicate(entry *replication.ReplicateEntry) {
 	default:
 		// Buffer full
 		s.totalEntriesDropped.Add(1)
+		metrics.Get().IncReplicationEntriesDropped()
 		s.logger.Warn().
 			Uint64("sequence", entry.Sequence).
 			Msg("Shard replication buffer full, entry dropped")

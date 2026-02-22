@@ -116,6 +116,10 @@ type Metrics struct {
 	queryMgmtCancelledTotal atomic.Int64 // Total queries cancelled via API
 	queryMgmtHistorySize    atomic.Int64 // Completed queries in history buffer (gauge)
 
+	// Replication metrics
+	replicationEntriesDroppedTotal atomic.Int64 // Total replication entries dropped due to full buffer
+	replicationSequenceGapsTotal   atomic.Int64 // Total number of missing replication entries detected via sequence gaps
+
 	logger zerolog.Logger
 }
 
@@ -285,6 +289,10 @@ func (m *Metrics) SetQueryMgmtActiveQueries(n int64) { m.queryMgmtActiveQueries.
 func (m *Metrics) IncQueryMgmtCancelled()            { m.queryMgmtCancelledTotal.Add(1) }
 func (m *Metrics) SetQueryMgmtHistorySize(n int64)   { m.queryMgmtHistorySize.Store(n) }
 
+// Replication Metrics
+func (m *Metrics) IncReplicationEntriesDropped() { m.replicationEntriesDroppedTotal.Add(1) }
+func (m *Metrics) IncReplicationSequenceGaps(n int64)   { m.replicationSequenceGapsTotal.Add(n) }
+
 // Snapshot returns all metrics as a map (for JSON endpoint)
 func (m *Metrics) Snapshot() map[string]interface{} {
 	var memStats runtime.MemStats
@@ -407,6 +415,10 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"query_mgmt_active_queries":  m.queryMgmtActiveQueries.Load(),
 		"query_mgmt_cancelled_total": m.queryMgmtCancelledTotal.Load(),
 		"query_mgmt_history_size":    m.queryMgmtHistorySize.Load(),
+
+		// Replication
+		"replication_entries_dropped_total": m.replicationEntriesDroppedTotal.Load(),
+		"replication_sequence_gaps_total":   m.replicationSequenceGapsTotal.Load(),
 	}
 }
 
@@ -679,6 +691,15 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_query_mgmt_history_size Completed queries in history buffer\n"...)
 	b = append(b, "# TYPE arc_query_mgmt_history_size gauge\n"...)
 	b = appendMetric(b, "arc_query_mgmt_history_size", float64(m.queryMgmtHistorySize.Load()))
+
+	// Replication metrics
+	b = append(b, "# HELP arc_replication_entries_dropped_total Total replication entries dropped due to full buffer\n"...)
+	b = append(b, "# TYPE arc_replication_entries_dropped_total counter\n"...)
+	b = appendMetric(b, "arc_replication_entries_dropped_total", float64(m.replicationEntriesDroppedTotal.Load()))
+
+	b = append(b, "# HELP arc_replication_sequence_gaps_total Total sequence gaps detected on replication receivers\n"...)
+	b = append(b, "# TYPE arc_replication_sequence_gaps_total counter\n"...)
+	b = appendMetric(b, "arc_replication_sequence_gaps_total", float64(m.replicationSequenceGapsTotal.Load()))
 
 	return string(b)
 }
