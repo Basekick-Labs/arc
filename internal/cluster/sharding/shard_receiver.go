@@ -10,6 +10,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/cluster/replication"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
 
@@ -413,6 +414,18 @@ func (r *ShardReceiver) receiveLoop() {
 					Uint64("sequence", entry.Sequence).
 					Msg("Failed to apply entry")
 				continue
+			}
+
+			// Detect sequence gaps
+			prevSeq := r.lastSeq.Load()
+			if prevSeq > 0 && entry.Sequence > prevSeq+1 {
+				gap := entry.Sequence - prevSeq - 1
+				metrics.Get().IncReplicationSequenceGaps()
+				r.logger.Warn().
+					Uint64("expected", prevSeq+1).
+					Uint64("received", entry.Sequence).
+					Uint64("gap", gap).
+					Msg("Sequence gap detected in replication stream")
 			}
 
 			r.lastSeq.Store(entry.Sequence)
