@@ -254,8 +254,8 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 
 	var totalDeleted int64
 	var rewrittenCount int
-	var processedFiles []string
-	var failedFiles []string
+	processedFiles := make([]string, 0, len(affected))
+	failedFiles := make([]string, 0, len(affected))
 
 	for _, f := range affected {
 		deleted, err := h.rewriteFileWithoutDeletedRows(ctx, f.path, f.relativePath, req.Where)
