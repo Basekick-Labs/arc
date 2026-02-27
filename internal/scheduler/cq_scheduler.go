@@ -16,6 +16,7 @@ type CQScheduler struct {
 	licenseClient *license.Client
 	jobs          map[int64]*cqJob // CQ ID → job info
 	mu            sync.RWMutex
+	wg            sync.WaitGroup
 	stopCh        chan struct{}
 	running       bool
 	logger        zerolog.Logger
@@ -96,9 +97,9 @@ func (s *CQScheduler) Start() error {
 // Stop stops all CQ jobs and the scheduler
 func (s *CQScheduler) Stop() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if !s.running {
+		s.mu.Unlock()
 		return
 	}
 
@@ -112,8 +113,12 @@ func (s *CQScheduler) Stop() {
 			Msg("Stopped CQ job")
 	}
 	s.jobs = make(map[int64]*cqJob)
-
 	s.running = false
+	s.mu.Unlock()
+
+	// Wait for all goroutines to finish outside the lock to avoid deadlock
+	s.wg.Wait()
+
 	s.logger.Info().Msg("CQ scheduler stopped")
 }
 
@@ -212,6 +217,7 @@ func (s *CQScheduler) startJob(cqID int64, cqName, intervalStr string) error {
 	s.jobs[cqID] = job
 
 	// Start the job goroutine
+	s.wg.Add(1)
 	go s.runJob(job)
 
 	s.logger.Info().
@@ -225,6 +231,7 @@ func (s *CQScheduler) startJob(cqID int64, cqName, intervalStr string) error {
 
 // runJob runs a single CQ job on its interval
 func (s *CQScheduler) runJob(job *cqJob) {
+	defer s.wg.Done()
 	for {
 		select {
 		case <-job.ticker.C:

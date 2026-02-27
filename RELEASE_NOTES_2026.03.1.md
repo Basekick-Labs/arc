@@ -84,6 +84,58 @@ Fixed three related bugs in the compaction manifest system that could leave orph
 
 DuckDB's `cache_httpfs` glob, metadata, and file handle caches are now properly tuned. Metadata and file handle TTLs match `s3_cache_ttl_seconds` (these reference immutable parquet files). Glob TTL is fixed at 10 seconds — directory listings change during compaction, and S3 LIST overhead is negligible. Cache sizes now scale proportionally with `s3_cache_size` (glob: 5% of block count, metadata/file handles: 10%), with floors at DuckDB defaults for small deployments. No new config settings.
 
+## Code Quality
+
+Comprehensive code review across 11 Arc components. Two review passes covering Scheduler, Clustering, Backup, MQTT, Querying, Compaction, Line Protocol, MsgPack, CSV/Parquet Import, and TLE.
+
+### Security: Missing Database Name Validation on Write Endpoints
+
+Added `isValidDatabaseName()` validation to Line Protocol write handlers (`/write`, `/api/v2/write`, `/api/v1/write/line-protocol`), CSV import (`/api/v1/import/csv`), Parquet import (`/api/v1/import/parquet`), and MsgPack write (`/api/v1/write/msgpack`). These endpoints accepted user-supplied database names from query parameters and headers without validation, which could allow path traversal in storage operations. TLE and LP bulk import endpoints already validated correctly.
+
+### Security: Backup Restore File Permissions
+
+Backup restore (`restoreConfig`, `restoreSQLite`) now writes files with `0600` permissions instead of `0644`. The config file (`arc.toml`) and SQLite database (containing auth tokens and audit logs) were previously world-readable after restore.
+
+### Fix: Scheduler Goroutine Leak on Stop
+
+`CQScheduler.Stop()` now waits for all in-flight query goroutines to complete via `sync.WaitGroup` before returning. Previously, `Stop()` cancelled the context but did not wait, leaking goroutines that held DuckDB connections.
+
+### Fix: MQTT Subscription TOCTOU Race
+
+`StartSubscription()` now inserts a nil placeholder into the subscribers map under lock before starting the subscriber, preventing concurrent callers from starting duplicate subscribers for the same subscription ID. All map readers (Shutdown, Stop, Pause, Delete, Restart, GetStats) handle nil entries.
+
+### Fix: Cluster Router Unbounded Map Growth
+
+The `activeConns` map in the cluster router now prunes entries when a node's connection count drops to zero. Previously, entries were never removed, causing memory growth proportional to the total number of unique nodes seen over the lifetime of the process.
+
+### Fix: Line Protocol Precision Parameter Now Honored
+
+The `precision` query parameter on `/write` (v1) and `/api/v2/write` (v2) endpoints was silently ignored — timestamps were always treated as nanoseconds. The parameter is now validated (`ns`, `us`, `ms`, `s`) and passed to `ParseBatchWithPrecision()`, matching InfluxDB's behavior. Invalid precision values return HTTP 400.
+
+### Performance: Pooled Gzip Decompression for Imports
+
+CSV, Parquet, and TLE bulk import endpoints now use the same pooled klauspost gzip reader as the streaming Line Protocol and MsgPack handlers, instead of allocating a new stdlib `compress/gzip` reader per request. This reduces GC pressure on import-heavy workloads and improves decompression throughput by 3–5x.
+
+### Performance: Single-Pass Line Protocol Unescape
+
+The LP parser's `unescape()` function was replaced with a single-pass byte scanner (from three sequential `strings.ReplaceAll` calls). A fast path returns immediately when no backslash escapes are present, avoiding allocation entirely. Combined with pre-allocated record slices in `ParseBatch`/`ParseBatchWithPrecision`, this reduces allocations in the ingestion hot path.
+
+### Performance: Single-Pass SQL Safety Regex
+
+The 7 separate compiled regexes in the SQL safety validator were combined into a single alternation pattern, reducing query validation from 7 regex passes to 1. The repeated `strings.ToLower` calls in the query path were also consolidated to compute once after SQL pre-processing.
+
+### Cleanup: Import Handler Deduplication
+
+The CSV and Parquet import handlers, which shared ~80% identical code (validation, RBAC, file upload, temp file management, import execution, response formatting), were consolidated into a shared `handleFileImport()` function. Each handler is now a thin wrapper that supplies format-specific options.
+
+### Cleanup: Line Protocol Parser Deduplication
+
+The duplicate `splitLine()` and `splitOnComma()` functions (~65 lines of identical escape/quote-aware delimiter logic) were extracted into a shared `splitOnDelimiter()` function. The unused `parseTimestamp()` method was removed (timestamp parsing is handled inline in `parseLineWithPrecision()`).
+
+### Cleanup: MQTT Repository
+
+Replaced custom `contains()`/`containsImpl()` helper functions with `strings.Contains()` from the standard library.
+
 ## Infrastructure
 
 ### Go 1.26 Upgrade

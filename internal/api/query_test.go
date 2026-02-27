@@ -629,15 +629,9 @@ func TestDangerousSQLPatterns(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			matched := false
-			for _, pattern := range dangerousSQLPatterns {
-				if pattern.MatchString(tt.sql) {
-					matched = true
-					break
-				}
-			}
+			matched := dangerousSQLPattern.MatchString(tt.sql)
 			if matched != tt.shouldFail {
-				t.Errorf("dangerousSQLPatterns for %q: matched=%v, shouldFail=%v", tt.sql, matched, tt.shouldFail)
+				t.Errorf("dangerousSQLPattern for %q: matched=%v, shouldFail=%v", tt.sql, matched, tt.shouldFail)
 			}
 		})
 	}
@@ -828,9 +822,7 @@ func BenchmarkDangerousSQLCheck(b *testing.B) {
 	sql := "SELECT AVG(value), host FROM mydb.cpu WHERE time > 1609459200000000 GROUP BY host ORDER BY time DESC LIMIT 100"
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		for _, pattern := range dangerousSQLPatterns {
-			pattern.MatchString(sql)
-		}
+		dangerousSQLPattern.MatchString(sql)
 	}
 }
 

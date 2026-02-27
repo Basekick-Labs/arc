@@ -1,8 +1,6 @@
 package api
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -103,111 +101,30 @@ func (h *ImportHandler) RegisterRoutes(app *fiber.App) {
 
 // handleCSVImport handles CSV file upload and import
 func (h *ImportHandler) handleCSVImport(c *fiber.Ctx) error {
-	h.totalRequests.Add(1)
-	start := time.Now()
-
-	database := c.Get("x-arc-database")
-	if database == "" {
-		database = c.Query("db")
-	}
-	if database == "" {
-		h.totalErrors.Add(1)
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "database is required (set x-arc-database header or db query param)",
-		})
-	}
-
-	measurement := c.Query("measurement")
-	if measurement == "" {
-		h.totalErrors.Add(1)
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "measurement query parameter is required",
-		})
-	}
-
-	if !isValidMeasurementName(measurement) {
-		h.totalErrors.Add(1)
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": fmt.Sprintf("invalid measurement name %q: must start with a letter and contain only alphanumeric characters, underscores, or hyphens", measurement),
-		})
-	}
-
-	// Check RBAC permissions
-	if h.rbacManager != nil && h.rbacManager.IsRBACEnabled() {
-		if err := CheckWritePermissions(c, h.rbacManager, h.logger, database, []string{measurement}); err != nil {
-			h.totalErrors.Add(1)
-			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-				"error": err.Error(),
-			})
+	return h.handleFileImport(c, "csv", func(c *fiber.Ctx) importOptions {
+		return importOptions{
+			format:     "csv",
+			timeColumn: c.Query("time_column", "time"),
+			timeFormat: c.Query("time_format", ""),
+			delimiter:  c.Query("delimiter", ","),
+			skipRows:   c.QueryInt("skip_rows", 0),
 		}
-	}
-
-	// Get uploaded file
-	fileHeader, err := c.FormFile("file")
-	if err != nil {
-		h.totalErrors.Add(1)
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "no file uploaded: use multipart/form-data with field name 'file'",
-		})
-	}
-
-	// Save to temp file
-	tempDir, err := os.MkdirTemp("", "arc-import-*")
-	if err != nil {
-		h.totalErrors.Add(1)
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "failed to create temp directory: " + err.Error(),
-		})
-	}
-	defer os.RemoveAll(tempDir)
-
-	tempFile := filepath.Join(tempDir, "import.csv")
-	if err := c.SaveFile(fileHeader, tempFile); err != nil {
-		h.totalErrors.Add(1)
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "failed to save uploaded file: " + err.Error(),
-		})
-	}
-
-	// Parse import options
-	opts := importOptions{
-		format:     "csv",
-		timeColumn: c.Query("time_column", "time"),
-		timeFormat: c.Query("time_format", ""),
-		delimiter:  c.Query("delimiter", ","),
-		skipRows:   c.QueryInt("skip_rows", 0),
-	}
-
-	result, err := h.importFile(c.Context(), database, measurement, tempFile, tempDir, opts)
-	if err != nil {
-		h.totalErrors.Add(1)
-		h.logger.Error().Err(err).
-			Str("database", database).
-			Str("measurement", measurement).
-			Str("format", "csv").
-			Msg("Import failed")
-		return h.importErrorResponse(c, err)
-	}
-
-	result.DurationMs = time.Since(start).Milliseconds()
-	h.totalRecords.Add(result.RowsImported)
-
-	h.logger.Info().
-		Str("database", database).
-		Str("measurement", measurement).
-		Int64("rows", result.RowsImported).
-		Int("partitions", result.PartitionsCreated).
-		Int64("duration_ms", result.DurationMs).
-		Msg("CSV import completed")
-
-	return c.JSON(fiber.Map{
-		"status": "ok",
-		"result": result,
 	})
 }
 
 // handleParquetImport handles Parquet file upload and import
 func (h *ImportHandler) handleParquetImport(c *fiber.Ctx) error {
+	return h.handleFileImport(c, "parquet", func(c *fiber.Ctx) importOptions {
+		return importOptions{
+			format:     "parquet",
+			timeColumn: c.Query("time_column", "time"),
+		}
+	})
+}
+
+// handleFileImport is the shared implementation for CSV and Parquet imports.
+// It validates inputs, handles file upload, calls importFile, and returns the result.
+func (h *ImportHandler) handleFileImport(c *fiber.Ctx, format string, buildOpts func(*fiber.Ctx) importOptions) error {
 	h.totalRequests.Add(1)
 	start := time.Now()
 
@@ -219,6 +136,13 @@ func (h *ImportHandler) handleParquetImport(c *fiber.Ctx) error {
 		h.totalErrors.Add(1)
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "database is required (set x-arc-database header or db query param)",
+		})
+	}
+
+	if !isValidDatabaseName(database) {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
 		})
 	}
 
@@ -266,7 +190,7 @@ func (h *ImportHandler) handleParquetImport(c *fiber.Ctx) error {
 	}
 	defer os.RemoveAll(tempDir)
 
-	tempFile := filepath.Join(tempDir, "import.parquet")
+	tempFile := filepath.Join(tempDir, "import."+format)
 	if err := c.SaveFile(fileHeader, tempFile); err != nil {
 		h.totalErrors.Add(1)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -274,10 +198,7 @@ func (h *ImportHandler) handleParquetImport(c *fiber.Ctx) error {
 		})
 	}
 
-	opts := importOptions{
-		format:     "parquet",
-		timeColumn: c.Query("time_column", "time"),
-	}
+	opts := buildOpts(c)
 
 	result, err := h.importFile(c.Context(), database, measurement, tempFile, tempDir, opts)
 	if err != nil {
@@ -285,7 +206,7 @@ func (h *ImportHandler) handleParquetImport(c *fiber.Ctx) error {
 		h.logger.Error().Err(err).
 			Str("database", database).
 			Str("measurement", measurement).
-			Str("format", "parquet").
+			Str("format", format).
 			Msg("Import failed")
 		return h.importErrorResponse(c, err)
 	}
@@ -299,7 +220,7 @@ func (h *ImportHandler) handleParquetImport(c *fiber.Ctx) error {
 		Int64("rows", result.RowsImported).
 		Int("partitions", result.PartitionsCreated).
 		Int64("duration_ms", result.DurationMs).
-		Msg("Parquet import completed")
+		Msg(strings.ToUpper(format) + " import completed")
 
 	return c.JSON(fiber.Map{
 		"status": "ok",
@@ -387,25 +308,11 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 
 	// Detect and decompress gzip (magic bytes: 0x1f 0x8b)
 	if len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b {
-		reader, err := gzip.NewReader(bytes.NewReader(data))
+		decompressed, err := decompressGzipPooled(data, maxImportSize)
 		if err != nil {
 			h.totalErrors.Add(1)
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 				"error": "failed to decompress gzip file: " + err.Error(),
-			})
-		}
-		decompressed, err := io.ReadAll(io.LimitReader(reader, maxImportSize+1))
-		reader.Close()
-		if err != nil {
-			h.totalErrors.Add(1)
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": "failed to decompress gzip file: " + err.Error(),
-			})
-		}
-		if len(decompressed) > maxImportSize {
-			h.totalErrors.Add(1)
-			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
-				"error": "decompressed file exceeds 500MB limit",
 			})
 		}
 		data = decompressed
@@ -923,25 +830,11 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 
 	// Detect and decompress gzip (magic bytes: 0x1f 0x8b)
 	if len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b {
-		reader, gzErr := gzip.NewReader(bytes.NewReader(data))
+		decompressed, gzErr := decompressGzipPooled(data, maxImportSize)
 		if gzErr != nil {
 			h.totalErrors.Add(1)
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 				"error": "failed to decompress gzip file: " + gzErr.Error(),
-			})
-		}
-		decompressed, gzErr := io.ReadAll(io.LimitReader(reader, maxImportSize+1))
-		reader.Close()
-		if gzErr != nil {
-			h.totalErrors.Add(1)
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": "failed to decompress gzip file: " + gzErr.Error(),
-			})
-		}
-		if len(decompressed) > maxImportSize {
-			h.totalErrors.Add(1)
-			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
-				"error": "decompressed file exceeds 500MB limit",
 			})
 		}
 		data = decompressed

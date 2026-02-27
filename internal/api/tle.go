@@ -112,7 +112,7 @@ localProcessing:
 	// Check for gzip compression (magic number: 0x1f 0x8b)
 	// Reuses the LP gzip reader pool to share pooled readers across handlers
 	if len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b {
-		decompressed, err := decompressGzipPooled(body)
+		decompressed, err := decompressGzipPooled(body, 0)
 		if err != nil {
 			h.totalErrors.Add(1)
 			h.logger.Error().Err(err).Msg("Failed to decompress gzip data")
@@ -209,8 +209,11 @@ func (h *TLEHandler) Stats(c *fiber.Ctx) error {
 
 // decompressGzipPooled decompresses gzip data using pooled readers to minimize allocations.
 // Shared across handlers — uses lpGzipReaderPool (declared in lineprotocol.go).
-func decompressGzipPooled(data []byte) ([]byte, error) {
-	const maxDecompressedSize = 100 * 1024 * 1024 // 100MB
+// maxSize limits the decompressed output; pass 0 for the default 100MB limit.
+func decompressGzipPooled(data []byte, maxSize int) ([]byte, error) {
+	if maxSize <= 0 {
+		maxSize = 100 * 1024 * 1024 // 100MB default
+	}
 
 	var reader *gzip.Reader
 	var err error
@@ -227,15 +230,15 @@ func decompressGzipPooled(data []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	result, err := io.ReadAll(io.LimitReader(reader, int64(maxDecompressedSize)+1))
+	result, err := io.ReadAll(io.LimitReader(reader, int64(maxSize)+1))
 	if err != nil {
 		lpGzipReaderPool.Put(reader)
 		return nil, err
 	}
 
-	if len(result) > maxDecompressedSize {
+	if len(result) > maxSize {
 		lpGzipReaderPool.Put(reader)
-		return nil, fmt.Errorf("decompressed payload exceeds 100MB limit")
+		return nil, fmt.Errorf("decompressed payload exceeds %dMB limit", maxSize/(1024*1024))
 	}
 
 	lpGzipReaderPool.Put(reader)

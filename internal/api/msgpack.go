@@ -283,6 +283,13 @@ localProcessing:
 		database = "default"
 	}
 
+	// Validate database name to prevent path traversal
+	if !isValidDatabaseName(database) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
+		})
+	}
+
 	// Extract measurements for validation and RBAC
 	measurements := h.extractMeasurements(records)
 

@@ -36,13 +36,20 @@ func NewDailyTier(cfg *DailyTierConfig) *DailyTier {
 		cfg.MinAgeHours = 24 // Full day must pass
 	}
 	if cfg.MinFiles == 0 {
-		cfg.MinFiles = 12 // At least half a day of data
+		// 12 files: hourly compaction produces ~1 file/hour, so 12 ≈ half a day.
+		// Ensures enough data volume to justify the cost of daily re-compaction.
+		cfg.MinFiles = 12
 	}
 	if cfg.SkipFileAgeCheckDays <= 0 {
-		cfg.SkipFileAgeCheckDays = 7 // Skip file age check for partitions older than 7 days
+		// 7 days: for partitions older than this, skip the file creation time check
+		// that normally prevents compacting in-progress data. After a week, any
+		// backfill is assumed complete.
+		cfg.SkipFileAgeCheckDays = 7
 	}
 	if cfg.TargetSizeMB == 0 {
-		cfg.TargetSizeMB = 2048 // 2GB target
+		// 2048 MB (2 GB): daily files should be large for efficient cold-tier reads.
+		// Larger than hourly (512 MB) because daily data is read less frequently.
+		cfg.TargetSizeMB = 2048
 	}
 
 	tier := &DailyTier{

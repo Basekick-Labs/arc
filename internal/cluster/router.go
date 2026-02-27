@@ -324,13 +324,16 @@ func (r *Router) incrementConns(nodeID string) {
 }
 
 // decrementConns decrements the active connection count for a node.
+// Prunes the map entry when the count drops to zero to prevent unbounded growth.
 func (r *Router) decrementConns(nodeID string) {
-	r.activeConnsMu.RLock()
+	r.activeConnsMu.Lock()
 	counter, exists := r.activeConns[nodeID]
-	r.activeConnsMu.RUnlock()
 	if exists {
-		counter.Add(-1)
+		if counter.Add(-1) <= 0 {
+			delete(r.activeConns, nodeID)
+		}
 	}
+	r.activeConnsMu.Unlock()
 }
 
 // GetActiveConnections returns the number of active connections to a node.

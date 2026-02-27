@@ -117,25 +117,25 @@ Benefits:
 - **Faster queries** - scan 1 file vs 43 files
 - **Lower cloud costs** - less storage, fewer API calls
 
-### Query (January 2026)
+### Query (February 2026)
 
 Arrow IPC format provides 2x throughput vs JSON for large result sets:
 
 | Query | Arrow (ms) | JSON (ms) | Speedup |
 |-------|------------|-----------|---------|
-| COUNT(*) - Full Table | 6.7 | 9.0 | 1.35x |
-| SELECT LIMIT 10K | 27 | 31 | 1.14x |
-| SELECT LIMIT 100K | 55 | 103 | 1.88x |
-| SELECT LIMIT 500K | 201 | 420 | **2.10x** |
-| SELECT LIMIT 1M | 379 | 789 | **2.08x** |
-| AVG/MIN/MAX Aggregation | 146 | 146 | 1.00x |
-| GROUP BY host (Top 10) | 107 | 104 | 0.98x |
-| Last 1 hour filter | 12 | 11 | 0.96x |
+| COUNT(*) - 963M rows | 2.5 | 1.9 | 0.76x |
+| SELECT LIMIT 10K | 39 | 40 | 1.03x |
+| SELECT LIMIT 100K | 70 | 103 | 1.48x |
+| SELECT LIMIT 500K | 207 | 380 | **1.84x** |
+| SELECT LIMIT 1M | 378 | 742 | **1.96x** |
+| Time Range (7d) LIMIT 10K | 13 | 16 | 1.20x |
+| Time Bucket (1h, 7d) | 281 | 276 | 0.98x |
+| Date Trunc (day, 30d) | 1045 | 1059 | 1.01x |
 
 **Best throughput:**
 - Arrow: **2.64M rows/sec** (1M row SELECT)
-- JSON: **1.27M rows/sec** (1M row SELECT)
-- COUNT(*): **12-19B rows/sec** (134M rows, 7-11ms)
+- JSON: **1.35M rows/sec** (1M row SELECT)
+- COUNT(*): **~510B rows/sec** (963M rows, 1.9ms)
 
 ---
 
@@ -212,6 +212,19 @@ make build
 
 ---
 
+## Ecosystem & Integrations
+
+| Tool | Description | Link |
+|------|-------------|------|
+| **VS Code Extension** | Browse databases, run queries, visualize results | [Marketplace](https://marketplace.visualstudio.com/items?itemName=basekick-labs.arc-db-manager) |
+| **Grafana Data Source** | Native Grafana plugin for dashboards and alerting | [GitHub](https://github.com/Basekick-Labs/grafana-arc-datasource) |
+| **Telegraf Output Plugin** | Ship metrics from 300+ Telegraf inputs directly to Arc | [Docs](https://docs.influxdata.com/telegraf/v1/output-plugins/arc/) |
+| **Python SDK** | Query and ingest from Python applications | [PyPI](https://pypi.org/project/arc-tsdb-client/) |
+| **Superset Dialect (JSON)** | Apache Superset connector using JSON transport | [GitHub](https://github.com/Basekick-Labs/arc-superset-dialect) |
+| **Superset Dialect (Arrow)** | Apache Superset connector using Arrow transport | [GitHub](https://github.com/Basekick-Labs/arc-superset-arrow) |
+
+---
+
 ## Features
 
 - **Ingestion**: MessagePack columnar (fastest), InfluxDB Line Protocol
@@ -263,25 +276,40 @@ See [arc.toml](./arc.toml) for complete configuration reference.
 
 ```
 arc/
-├── cmd/arc/           # Application entry point
+├── cmd/arc/              # Application entry point
 ├── internal/
-│   ├── api/           # HTTP handlers (Fiber)
-│   ├── auth/          # Token authentication
-│   ├── compaction/    # Tiered file compaction
-│   ├── config/        # Configuration management
-│   ├── database/      # DuckDB connection pool
-│   ├── ingest/        # MessagePack, Line Protocol, Arrow writer
-│   ├── logger/        # Structured logging (zerolog)
-│   ├── metrics/       # Prometheus metrics
-│   ├── pruning/       # Query partition pruning
-│   ├── shutdown/      # Graceful shutdown coordinator
-│   ├── storage/       # Local, S3, MinIO backends
-│   ├── telemetry/     # Usage telemetry
-│   ├── circuitbreaker/# Resilience patterns
-│   └── wal/           # Write-ahead log
-├── test/integration/  # Integration tests
-├── arc.toml           # Configuration file
-├── Makefile           # Build commands
+│   ├── api/              # HTTP handlers (Fiber) — query, write, import, TLE, admin
+│   ├── audit/            # Audit logging for API operations
+│   ├── auth/             # Token authentication and RBAC
+│   ├── backup/           # Backup and restore (data, metadata, config)
+│   ├── circuitbreaker/   # Resilience patterns (retry, backoff)
+│   ├── cluster/          # Raft consensus, node roles, WAL replication
+│   ├── compaction/       # Tiered hourly/daily Parquet file merging
+│   ├── config/           # TOML configuration with env var overrides
+│   ├── database/         # DuckDB connection pool
+│   ├── governance/       # Per-token query quotas and rate limiting
+│   ├── ingest/           # MessagePack, Line Protocol, TLE, Arrow writer
+│   ├── license/          # License validation and feature gating
+│   ├── logger/           # Structured logging (zerolog)
+│   ├── metrics/          # Prometheus metrics
+│   ├── mqtt/             # MQTT subscriber — topic-to-measurement ingestion
+│   ├── pruning/          # Query-time partition pruning
+│   ├── query/            # Parallel partition executor
+│   ├── queryregistry/    # Active/completed query tracking
+│   ├── scheduler/        # Continuous queries and retention policies
+│   ├── shutdown/         # Graceful shutdown coordinator
+│   ├── sql/              # SQL parsing utilities
+│   ├── storage/          # Local, S3, Azure backends
+│   ├── telemetry/        # Usage telemetry
+│   ├── tiering/          # Hot/cold storage lifecycle management
+│   └── wal/              # Write-ahead log
+├── pkg/models/           # Shared data structures (Record, ColumnarRecord)
+├── benchmarks/           # Performance benchmarking suites
+├── deploy/               # Docker Compose and Kubernetes configs
+├── helm/                 # Helm charts
+├── scripts/              # Utility scripts (analysis, backfill, debugging)
+├── arc.toml              # Configuration file
+├── Makefile              # Build commands
 └── go.mod
 ```
 

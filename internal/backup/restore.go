@@ -186,7 +186,7 @@ func (m *Manager) restoreConfig(ctx context.Context, backupID string) error {
 		preRestorePath := m.configPath + ".before-restore"
 		currentData, err := os.ReadFile(m.configPath)
 		if err == nil {
-			if err := os.WriteFile(preRestorePath, currentData, 0644); err != nil {
+			if err := os.WriteFile(preRestorePath, currentData, 0600); err != nil {
 				m.logger.Warn().Err(err).Msg("Failed to create pre-restore backup of config")
 			} else {
 				m.logger.Info().Str("path", preRestorePath).Msg("Created pre-restore backup of config")
@@ -194,7 +194,7 @@ func (m *Manager) restoreConfig(ctx context.Context, backupID string) error {
 		}
 	}
 
-	if err := os.WriteFile(m.configPath, data, 0644); err != nil {
+	if err := os.WriteFile(m.configPath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 

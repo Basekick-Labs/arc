@@ -107,17 +107,16 @@ func (h *LineProtocolHandler) RegisterRoutes(app *fiber.App) {
 func (h *LineProtocolHandler) WriteV1(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
 
-	// Get query parameters
 	db := c.Query("db", "default")
+	precision := c.Query("precision", "ns")
 	// rp (retention policy) is ignored for compatibility
-	// precision is ignored - we always expect nanoseconds and convert to microseconds
 
 	// Get database from header if specified
 	if headerDB := c.Get("x-arc-database"); headerDB != "" {
 		db = headerDB
 	}
 
-	return h.handleWrite(c, db)
+	return h.handleWrite(c, db, precision)
 }
 
 // WriteInfluxDB handles InfluxDB 2.x compatible write requests
@@ -125,10 +124,9 @@ func (h *LineProtocolHandler) WriteV1(c *fiber.Ctx) error {
 func (h *LineProtocolHandler) WriteInfluxDB(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
 
-	// Get query parameters
 	bucket := c.Query("bucket", "default")
+	precision := c.Query("precision", "ns")
 	// org is ignored for now
-	// precision is ignored - we always expect nanoseconds and convert to microseconds
 
 	// Get database from header if specified (takes precedence)
 	db := bucket
@@ -136,7 +134,7 @@ func (h *LineProtocolHandler) WriteInfluxDB(c *fiber.Ctx) error {
 		db = headerDB
 	}
 
-	return h.handleWrite(c, db)
+	return h.handleWrite(c, db, precision)
 }
 
 // WriteSimple handles simple write requests without query parameters
@@ -144,14 +142,34 @@ func (h *LineProtocolHandler) WriteInfluxDB(c *fiber.Ctx) error {
 func (h *LineProtocolHandler) WriteSimple(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
 
-	// Get database from header
 	db := c.Get("x-arc-database", "default")
+	precision := c.Query("precision", "ns")
 
-	return h.handleWrite(c, db)
+	return h.handleWrite(c, db, precision)
 }
 
-// handleWrite processes Line Protocol data and writes to the Arrow buffer
-func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string) error {
+// handleWrite processes Line Protocol data and writes to the Arrow buffer.
+// precision controls timestamp interpretation: "ns" (default), "us", "ms", "s".
+func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string, precision string) error {
+	// Validate database name to prevent path traversal
+	if !isValidDatabaseName(database) {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
+		})
+	}
+
+	// Validate precision parameter
+	switch precision {
+	case "ns", "us", "ms", "s":
+		// valid
+	default:
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("invalid precision %q: must be ns, us, ms, or s", precision),
+		})
+	}
+
 	// Check if this request should be forwarded to a writer node
 	// Reader nodes cannot process writes locally, so they forward to writers
 	if h.router != nil && ShouldForwardWrite(h.router, c) {
@@ -211,8 +229,8 @@ localProcessing:
 		})
 	}
 
-	// Parse line protocol
-	records := h.parser.ParseBatch(body)
+	// Parse line protocol with timestamp precision
+	records := h.parser.ParseBatchWithPrecision(body, precision)
 
 	if len(records) == 0 {
 		h.totalErrors.Add(1)
