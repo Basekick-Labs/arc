@@ -301,7 +301,8 @@ func (p *LineProtocolParser) unescape(data []byte) string {
 	for i := 0; i < len(data); i++ {
 		if data[i] == '\\' && i+1 < len(data) {
 			next := data[i+1]
-			if next == ',' || next == ' ' || next == '=' {
+			switch next {
+			case ',', ' ', '=', '"', '\\':
 				buf = append(buf, next)
 				i++ // skip next
 				continue
