@@ -34,9 +34,13 @@ func NewHourlyTier(cfg *HourlyTierConfig) *HourlyTier {
 		cfg.MinAgeHours = 1
 	}
 	if cfg.MinFiles == 0 {
+		// 10 files: ingestion flushes ~every 6 min, so 10 files ≈ 1 hour of data.
+		// Below this threshold compaction overhead outweighs the read-time savings.
 		cfg.MinFiles = 10
 	}
 	if cfg.TargetSizeMB == 0 {
+		// 512 MB: balances DuckDB read performance (prefers fewer, larger files)
+		// with memory usage during compaction.
 		cfg.TargetSizeMB = 512
 	}
 

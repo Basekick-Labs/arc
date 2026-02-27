@@ -212,6 +212,19 @@ make build
 
 ---
 
+## Ecosystem & Integrations
+
+| Tool | Description | Link |
+|------|-------------|------|
+| **VS Code Extension** | Browse databases, run queries, visualize results | [Marketplace](https://marketplace.visualstudio.com/items?itemName=basekick-labs.arc-db-manager) |
+| **Grafana Data Source** | Native Grafana plugin for dashboards and alerting | [GitHub](https://github.com/Basekick-Labs/grafana-arc-datasource) |
+| **Telegraf Output Plugin** | Ship metrics from 300+ Telegraf inputs directly to Arc | [Docs](https://docs.influxdata.com/telegraf/v1/output-plugins/arc/) |
+| **Python SDK** | Query and ingest from Python applications | [PyPI](https://pypi.org/project/arc-tsdb-client/) |
+| **Superset Dialect (JSON)** | Apache Superset connector using JSON transport | [GitHub](https://github.com/Basekick-Labs/arc-superset-dialect) |
+| **Superset Dialect (Arrow)** | Apache Superset connector using Arrow transport | [GitHub](https://github.com/Basekick-Labs/arc-superset-arrow) |
+
+---
+
 ## Features
 
 - **Ingestion**: MessagePack columnar (fastest), InfluxDB Line Protocol
@@ -263,25 +276,40 @@ See [arc.toml](./arc.toml) for complete configuration reference.
 
 ```
 arc/
-├── cmd/arc/           # Application entry point
+├── cmd/arc/              # Application entry point
 ├── internal/
-│   ├── api/           # HTTP handlers (Fiber)
-│   ├── auth/          # Token authentication
-│   ├── compaction/    # Tiered file compaction
-│   ├── config/        # Configuration management
-│   ├── database/      # DuckDB connection pool
-│   ├── ingest/        # MessagePack, Line Protocol, Arrow writer
-│   ├── logger/        # Structured logging (zerolog)
-│   ├── metrics/       # Prometheus metrics
-│   ├── pruning/       # Query partition pruning
-│   ├── shutdown/      # Graceful shutdown coordinator
-│   ├── storage/       # Local, S3, MinIO backends
-│   ├── telemetry/     # Usage telemetry
-│   ├── circuitbreaker/# Resilience patterns
-│   └── wal/           # Write-ahead log
-├── test/integration/  # Integration tests
-├── arc.toml           # Configuration file
-├── Makefile           # Build commands
+│   ├── api/              # HTTP handlers (Fiber) — query, write, import, TLE, admin
+│   ├── audit/            # Audit logging for API operations
+│   ├── auth/             # Token authentication and RBAC
+│   ├── backup/           # Backup and restore (data, metadata, config)
+│   ├── circuitbreaker/   # Resilience patterns (retry, backoff)
+│   ├── cluster/          # Raft consensus, node roles, WAL replication
+│   ├── compaction/       # Tiered hourly/daily Parquet file merging
+│   ├── config/           # TOML configuration with env var overrides
+│   ├── database/         # DuckDB connection pool
+│   ├── governance/       # Per-token query quotas and rate limiting
+│   ├── ingest/           # MessagePack, Line Protocol, TLE, Arrow writer
+│   ├── license/          # License validation and feature gating
+│   ├── logger/           # Structured logging (zerolog)
+│   ├── metrics/          # Prometheus metrics
+│   ├── mqtt/             # MQTT subscriber — topic-to-measurement ingestion
+│   ├── pruning/          # Query-time partition pruning
+│   ├── query/            # Parallel partition executor
+│   ├── queryregistry/    # Active/completed query tracking
+│   ├── scheduler/        # Continuous queries and retention policies
+│   ├── shutdown/         # Graceful shutdown coordinator
+│   ├── sql/              # SQL parsing utilities
+│   ├── storage/          # Local, S3, Azure backends
+│   ├── telemetry/        # Usage telemetry
+│   ├── tiering/          # Hot/cold storage lifecycle management
+│   └── wal/              # Write-ahead log
+├── pkg/models/           # Shared data structures (Record, ColumnarRecord)
+├── benchmarks/           # Performance benchmarking suites
+├── deploy/               # Docker Compose and Kubernetes configs
+├── helm/                 # Helm charts
+├── scripts/              # Utility scripts (analysis, backfill, debugging)
+├── arc.toml              # Configuration file
+├── Makefile              # Build commands
 └── go.mod
 ```
 

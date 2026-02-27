@@ -105,8 +105,11 @@ func (m *SubscriptionManager) Shutdown(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Stop all subscribers
+	// Stop all subscribers (nil check for in-progress placeholders)
 	for id, subscriber := range m.subscribers {
+		if subscriber == nil {
+			continue
+		}
 		if err := subscriber.Stop(); err != nil {
 			m.logger.Error().Err(err).Str("id", id).Msg("Error stopping subscriber during shutdown")
 		}
@@ -310,7 +313,9 @@ func (m *SubscriptionManager) Delete(ctx context.Context, id string) error {
 	// Stop if running
 	m.mu.Lock()
 	if subscriber, ok := m.subscribers[id]; ok {
-		subscriber.Stop()
+		if subscriber != nil {
+			subscriber.Stop()
+		}
 		delete(m.subscribers, id)
 	}
 	m.mu.Unlock()
@@ -333,14 +338,21 @@ func (m *SubscriptionManager) StartSubscription(ctx context.Context, id string) 
 		return fmt.Errorf("subscription not found: %s", id)
 	}
 
+	// Reserve the slot under lock to prevent concurrent starts (TOCTOU).
+	// We insert a nil placeholder; startSubscriber replaces it on success.
 	m.mu.Lock()
 	if _, ok := m.subscribers[id]; ok {
 		m.mu.Unlock()
 		return fmt.Errorf("subscription already running")
 	}
+	m.subscribers[id] = nil // placeholder — slot is reserved
 	m.mu.Unlock()
 
 	if err := m.startSubscriber(sub); err != nil {
+		// Remove the placeholder on failure
+		m.mu.Lock()
+		delete(m.subscribers, id)
+		m.mu.Unlock()
 		m.repo.UpdateStatus(ctx, id, StatusError, err.Error())
 		return err
 	}
@@ -352,7 +364,7 @@ func (m *SubscriptionManager) StartSubscription(ctx context.Context, id string) 
 func (m *SubscriptionManager) StopSubscription(ctx context.Context, id string) error {
 	m.mu.Lock()
 	subscriber, ok := m.subscribers[id]
-	if !ok {
+	if !ok || subscriber == nil {
 		m.mu.Unlock()
 		return fmt.Errorf("subscription not running")
 	}
@@ -373,7 +385,7 @@ func (m *SubscriptionManager) StopSubscription(ctx context.Context, id string) e
 func (m *SubscriptionManager) PauseSubscription(ctx context.Context, id string) error {
 	m.mu.Lock()
 	subscriber, ok := m.subscribers[id]
-	if !ok {
+	if !ok || subscriber == nil {
 		m.mu.Unlock()
 		return fmt.Errorf("subscription not running")
 	}
@@ -396,7 +408,9 @@ func (m *SubscriptionManager) RestartSubscription(ctx context.Context, id string
 	m.mu.Lock()
 	subscriber, ok := m.subscribers[id]
 	if ok {
-		subscriber.Stop()
+		if subscriber != nil {
+			subscriber.Stop()
+		}
 		delete(m.subscribers, id)
 	}
 	m.mu.Unlock()
@@ -426,8 +440,8 @@ func (m *SubscriptionManager) GetStats(ctx context.Context, id string) (*Subscri
 	subscriber, ok := m.subscribers[id]
 	m.mu.RUnlock()
 
-	if !ok {
-		// Return stats from DB for stopped subscription
+	if !ok || subscriber == nil {
+		// Return stats from DB for stopped/starting subscription
 		sub, err := m.repo.Get(ctx, id)
 		if err != nil {
 			return nil, err

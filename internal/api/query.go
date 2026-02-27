@@ -498,16 +498,17 @@ type QueryResponse struct {
 	Profile         *database.QueryProfile `json:"profile,omitempty"`
 }
 
-// Dangerous SQL patterns (with word boundaries to avoid false positives)
-var dangerousSQLPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)\bDROP\s+(?:TABLE|DATABASE|INDEX|VIEW)\b`),
-	regexp.MustCompile(`(?i)\bDELETE\s+FROM\b`),
-	regexp.MustCompile(`(?i)\bTRUNCATE\s+TABLE\b`),
-	regexp.MustCompile(`(?i)\bALTER\s+TABLE\b`),
-	regexp.MustCompile(`(?i)\bCREATE\s+(?:TABLE|DATABASE|INDEX)\b`),
-	regexp.MustCompile(`(?i)\bINSERT\s+INTO\b`),
-	regexp.MustCompile(`(?i)\bUPDATE\s+\w+\s+SET\b`),
-}
+// dangerousSQLPattern is a single combined regex for all dangerous SQL operations.
+// Using one pattern instead of 7 separate ones reduces regex matching to a single pass.
+var dangerousSQLPattern = regexp.MustCompile(`(?i)\b(?:` +
+	`DROP\s+(?:TABLE|DATABASE|INDEX|VIEW)` +
+	`|DELETE\s+FROM` +
+	`|TRUNCATE\s+TABLE` +
+	`|ALTER\s+TABLE` +
+	`|CREATE\s+(?:TABLE|DATABASE|INDEX)` +
+	`|INSERT\s+INTO` +
+	`|UPDATE\s+\w+\s+SET` +
+	`)\b`)
 
 // Patterns for SQL injection prevention in queryMeasurement endpoint
 var (
@@ -1377,11 +1378,9 @@ func ValidateSQLRequest(sql string) error {
 		return &SQLValidationError{Message: "SQL query exceeds maximum length (10000 characters)"}
 	}
 
-	// Check for dangerous SQL patterns
-	for _, pattern := range dangerousSQLPatterns {
-		if pattern.MatchString(sql) {
-			return &SQLValidationError{Message: "Dangerous SQL operation not allowed"}
-		}
+	// Check for dangerous SQL patterns (single-pass combined regex)
+	if dangerousSQLPattern.MatchString(sql) {
+		return &SQLValidationError{Message: "Dangerous SQL operation not allowed"}
 	}
 
 	return nil
@@ -1389,10 +1388,8 @@ func ValidateSQLRequest(sql string) error {
 
 // validateSQL checks for dangerous SQL patterns
 func (h *QueryHandler) validateSQL(sql string) error {
-	for _, pattern := range dangerousSQLPatterns {
-		if pattern.MatchString(sql) {
-			return fiber.NewError(fiber.StatusBadRequest, "Dangerous SQL operation not allowed")
-		}
+	if dangerousSQLPattern.MatchString(sql) {
+		return fiber.NewError(fiber.StatusBadRequest, "Dangerous SQL operation not allowed")
 	}
 	return nil
 }
@@ -1514,6 +1511,9 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 	// e.g., "-- FROM mydb.cpu" should not be converted
 	sql = stripSQLComments(sql, features.hasDashComment || features.hasBlockComment)
 
+	// Compute sqlLower once after all pre-processing mutations
+	sqlLower := strings.ToLower(sql)
+
 	// Extract CTE names to avoid converting them to storage paths
 	cteNames := extractCTENames(sql)
 
@@ -1556,7 +1556,8 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 		}
 
 		// Check if followed by a dot (database.table already handled) or parenthesis (function call)
-		idx := strings.Index(strings.ToLower(sql), strings.ToLower(match))
+		matchLower := strings.ToLower(match)
+		idx := strings.Index(sqlLower, matchLower)
 		if idx >= 0 {
 			afterMatch := sql[idx+len(match):]
 			afterMatch = strings.TrimLeft(afterMatch, " \t")
@@ -1588,7 +1589,8 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 		}
 
 		// Check if followed by a dot or parenthesis
-		idx := strings.Index(strings.ToLower(sql), strings.ToLower(match))
+		matchLower := strings.ToLower(match)
+		idx := strings.Index(sqlLower, matchLower)
 		if idx >= 0 {
 			afterMatch := sql[idx+len(match):]
 			afterMatch = strings.TrimLeft(afterMatch, " \t")
@@ -2071,9 +2073,12 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database
 	// Phase 2: Strip SQL comments
 	sql = stripSQLComments(sql, features.hasDashComment || features.hasBlockComment)
 
+	// Compute sqlLower once after all pre-processing mutations
+	sqlLower = strings.ToLower(sql)
+
 	// Extract CTE names only if query has WITH clause (fast path for majority of queries)
 	var cteNames map[string]bool
-	if strings.Contains(strings.ToLower(sql), "with ") {
+	if strings.Contains(sqlLower, "with ") {
 		cteNames = extractCTENames(sql)
 	}
 
@@ -2099,7 +2104,8 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database
 		}
 
 		// Check if followed by a dot (function call like db.func()) or parenthesis
-		idx := strings.Index(strings.ToLower(sql), strings.ToLower(match))
+		matchLower := strings.ToLower(match)
+		idx := strings.Index(sqlLower, matchLower)
 		if idx >= 0 {
 			afterMatch := sql[idx+len(match):]
 			afterMatch = strings.TrimLeft(afterMatch, " \t")
@@ -2132,7 +2138,8 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database
 		}
 
 		// Check if followed by a dot or parenthesis
-		idx := strings.Index(strings.ToLower(sql), strings.ToLower(match))
+		matchLower := strings.ToLower(match)
+		idx := strings.Index(sqlLower, matchLower)
 		if idx >= 0 {
 			afterMatch := sql[idx+len(match):]
 			afterMatch = strings.TrimLeft(afterMatch, " \t")

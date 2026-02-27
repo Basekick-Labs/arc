@@ -38,10 +38,8 @@ func (p *LineProtocolParser) ParseLine(line []byte) *models.Record {
 
 // ParseBatch parses multiple lines of line protocol
 func (p *LineProtocolParser) ParseBatch(data []byte) []*models.Record {
-	var records []*models.Record
-
-	// Split by newlines
 	lines := bytes.Split(data, []byte{'\n'})
+	records := make([]*models.Record, 0, len(lines))
 
 	for _, line := range lines {
 		record := p.ParseLine(line)
@@ -66,8 +64,8 @@ func (p *LineProtocolParser) ParseBatchWithPrecision(data []byte, precision stri
 		return p.ParseBatch(data)
 	}
 
-	var records []*models.Record
 	lines := bytes.Split(data, []byte{'\n'})
+	records := make([]*models.Record, 0, len(lines))
 
 	for _, line := range lines {
 		record := p.parseLineWithPrecision(line, precision)
@@ -131,34 +129,31 @@ func (p *LineProtocolParser) parseLineWithPrecision(line []byte, precision strin
 	}
 }
 
-// splitLine splits a line protocol line into parts, respecting escaped spaces and quoted strings
-// Returns [measurement_tags, fields, timestamp?]
-func (p *LineProtocolParser) splitLine(line []byte) [][]byte {
+// splitOnDelimiter splits data on an unescaped delimiter, respecting escaped chars and quoted strings.
+// Used by splitLine (space) and splitOnComma (comma).
+func splitOnDelimiter(data []byte, delim byte) [][]byte {
 	var parts [][]byte
 	var current []byte
 	inQuotes := false
 
-	for i := 0; i < len(line); i++ {
-		if line[i] == '\\' && i+1 < len(line) {
+	for i := 0; i < len(data); i++ {
+		if data[i] == '\\' && i+1 < len(data) {
 			// Escaped character - include both backslash and next char
-			current = append(current, line[i], line[i+1])
+			current = append(current, data[i], data[i+1])
 			i++
-		} else if line[i] == '"' {
-			// Toggle quote state
+		} else if data[i] == '"' {
 			inQuotes = !inQuotes
-			current = append(current, line[i])
-		} else if line[i] == ' ' && !inQuotes {
-			// Unescaped space outside quotes - part boundary
+			current = append(current, data[i])
+		} else if data[i] == delim && !inQuotes {
 			if len(current) > 0 {
 				parts = append(parts, current)
 				current = nil
 			}
 		} else {
-			current = append(current, line[i])
+			current = append(current, data[i])
 		}
 	}
 
-	// Add final part
 	if len(current) > 0 {
 		parts = append(parts, current)
 	}
@@ -166,38 +161,15 @@ func (p *LineProtocolParser) splitLine(line []byte) [][]byte {
 	return parts
 }
 
-// splitOnComma splits on unescaped commas, respecting quoted strings
+// splitLine splits a line protocol line into parts on unescaped spaces.
+// Returns [measurement_tags, fields, timestamp?]
+func (p *LineProtocolParser) splitLine(line []byte) [][]byte {
+	return splitOnDelimiter(line, ' ')
+}
+
+// splitOnComma splits on unescaped commas, respecting quoted strings.
 func (p *LineProtocolParser) splitOnComma(data []byte) [][]byte {
-	var parts [][]byte
-	var current []byte
-	inQuotes := false
-
-	for i := 0; i < len(data); i++ {
-		if data[i] == '\\' && i+1 < len(data) {
-			// Escaped character
-			current = append(current, data[i], data[i+1])
-			i++
-		} else if data[i] == '"' {
-			// Toggle quote state
-			inQuotes = !inQuotes
-			current = append(current, data[i])
-		} else if data[i] == ',' && !inQuotes {
-			// Unescaped comma outside quotes - separator
-			if len(current) > 0 {
-				parts = append(parts, current)
-				current = nil
-			}
-		} else {
-			current = append(current, data[i])
-		}
-	}
-
-	// Add final part
-	if len(current) > 0 {
-		parts = append(parts, current)
-	}
-
-	return parts
+	return splitOnDelimiter(data, ',')
 }
 
 // parseMeasurementTags parses measurement name and tags
@@ -317,27 +289,27 @@ func (p *LineProtocolParser) parseFieldValue(value []byte) interface{} {
 	return sanitized
 }
 
-// parseTimestamp parses timestamp from line protocol
-// Line Protocol timestamps are in nanoseconds since Unix epoch.
-// We normalize to microseconds for Arrow compatibility.
-func (p *LineProtocolParser) parseTimestamp(data []byte) (int64, error) {
-	timestampNs, err := strconv.ParseInt(string(data), 10, 64)
-	if err != nil {
-		return 0, err
+// unescape unescapes special characters in line protocol (\, \  \=)
+// Single-pass: only allocates a new string when escapes are found.
+func (p *LineProtocolParser) unescape(data []byte) string {
+	// Fast path: no backslash means no escapes
+	if !bytes.ContainsRune(data, '\\') {
+		return string(data)
 	}
 
-	// Convert nanoseconds to microseconds
-	return timestampNs / 1000, nil
-}
-
-// unescape unescapes special characters in line protocol
-// Escaped characters: comma, space, equals sign
-func (p *LineProtocolParser) unescape(data []byte) string {
-	s := string(data)
-	s = strings.ReplaceAll(s, "\\,", ",")
-	s = strings.ReplaceAll(s, "\\ ", " ")
-	s = strings.ReplaceAll(s, "\\=", "=")
-	return s
+	buf := make([]byte, 0, len(data))
+	for i := 0; i < len(data); i++ {
+		if data[i] == '\\' && i+1 < len(data) {
+			next := data[i+1]
+			if next == ',' || next == ' ' || next == '=' {
+				buf = append(buf, next)
+				i++ // skip next
+				continue
+			}
+		}
+		buf = append(buf, data[i])
+	}
+	return string(buf)
 }
 
 // ToFlatRecord converts a parsed record to a flat map for Arrow/Parquet

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -537,19 +538,6 @@ func nullableString(b []byte) sql.NullString {
 func isUniqueConstraintError(err error) bool {
 	return err != nil && (errors.Is(err, sql.ErrNoRows) ||
 		// SQLite unique constraint error
-		(err.Error() != "" && (contains(err.Error(), "UNIQUE constraint failed") ||
-			contains(err.Error(), "unique constraint"))))
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsImpl(s, substr))
-}
-
-func containsImpl(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
+		(err.Error() != "" && (strings.Contains(err.Error(), "UNIQUE constraint failed") ||
+			strings.Contains(err.Error(), "unique constraint"))))
 }
