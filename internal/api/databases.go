@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -52,9 +51,6 @@ type MeasurementListResponse struct {
 	Measurements []DatabaseMeasurement `json:"measurements"`
 	Count        int                   `json:"count"`
 }
-
-// Database name validation
-var validDatabaseName = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_-]*$`)
 
 // Reserved database names that cannot be created
 var reservedDatabaseNames = map[string]bool{
@@ -396,10 +392,23 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 // Helper functions
 
 func isValidDatabaseName(name string) bool {
-	if len(name) == 0 || len(name) > 64 {
+	n := len(name)
+	if n == 0 || n > 64 {
 		return false
 	}
-	return validDatabaseName.MatchString(name)
+	// First char must be a letter
+	c := name[0]
+	if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+		return false
+	}
+	// Remaining chars: alphanumeric, underscore, hyphen
+	for i := 1; i < n; i++ {
+		c = name[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 func (h *DatabasesHandler) listDatabases(ctx context.Context) ([]string, error) {
