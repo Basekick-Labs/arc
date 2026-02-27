@@ -117,25 +117,25 @@ Benefits:
 - **Faster queries** - scan 1 file vs 43 files
 - **Lower cloud costs** - less storage, fewer API calls
 
-### Query (January 2026)
+### Query (February 2026)
 
 Arrow IPC format provides 2x throughput vs JSON for large result sets:
 
 | Query | Arrow (ms) | JSON (ms) | Speedup |
 |-------|------------|-----------|---------|
-| COUNT(*) - Full Table | 6.7 | 9.0 | 1.35x |
-| SELECT LIMIT 10K | 27 | 31 | 1.14x |
-| SELECT LIMIT 100K | 55 | 103 | 1.88x |
-| SELECT LIMIT 500K | 201 | 420 | **2.10x** |
-| SELECT LIMIT 1M | 379 | 789 | **2.08x** |
-| AVG/MIN/MAX Aggregation | 146 | 146 | 1.00x |
-| GROUP BY host (Top 10) | 107 | 104 | 0.98x |
-| Last 1 hour filter | 12 | 11 | 0.96x |
+| COUNT(*) - 963M rows | 2.5 | 1.9 | 0.76x |
+| SELECT LIMIT 10K | 39 | 40 | 1.03x |
+| SELECT LIMIT 100K | 70 | 103 | 1.48x |
+| SELECT LIMIT 500K | 207 | 380 | **1.84x** |
+| SELECT LIMIT 1M | 378 | 742 | **1.96x** |
+| Time Range (7d) LIMIT 10K | 13 | 16 | 1.20x |
+| Time Bucket (1h, 7d) | 281 | 276 | 0.98x |
+| Date Trunc (day, 30d) | 1045 | 1059 | 1.01x |
 
 **Best throughput:**
 - Arrow: **2.64M rows/sec** (1M row SELECT)
-- JSON: **1.27M rows/sec** (1M row SELECT)
-- COUNT(*): **12-19B rows/sec** (134M rows, 7-11ms)
+- JSON: **1.35M rows/sec** (1M row SELECT)
+- COUNT(*): **~510B rows/sec** (963M rows, 1.9ms)
 
 ---
 
