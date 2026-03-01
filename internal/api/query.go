@@ -2952,13 +2952,9 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	// Try Arrow-native path first (available when compiled with duckdb_arrow tag)
 	if arrowJSONQueryFunc != nil {
 		ctx := context.Background()
-		arrowRowCount, handled := arrowJSONQueryFunc(h, c, ctx, nil, convertedSQL, false, 0, start, timestamp)
+		_, handled := arrowJSONQueryFunc(h, c, ctx, nil, convertedSQL, false, 0, start, timestamp)
 		if handled {
-			if arrowRowCount >= 0 {
-				m.IncQuerySuccess()
-				m.IncQueryRows(int64(arrowRowCount))
-				m.RecordQueryLatency(time.Since(start).Microseconds())
-			}
+			// Metrics are recorded inside the async stream callback — not here.
 			return nil
 		}
 	}

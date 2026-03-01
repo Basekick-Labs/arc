@@ -15,6 +15,19 @@ import (
 	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
+// arrowQueryOnConn executes a query via the Arrow API on a raw driver connection.
+func arrowQueryOnConn(ctx context.Context, driverConn any, query string) (array.RecordReader, error) {
+	dc, ok := driverConn.(driver.Conn)
+	if !ok {
+		return nil, fmt.Errorf("connection does not implement driver.Conn")
+	}
+	arrowAPI, err := duckdb.NewArrowFromConn(dc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Arrow interface: %w", err)
+	}
+	return arrowAPI.QueryContext(ctx, query)
+}
+
 // ArrowQueryContext executes a query using DuckDB's native Arrow API,
 // returning an array.RecordReader that yields Arrow record batches directly
 // from DuckDB's internal columnar chunks — no row-by-row scanning.
@@ -30,16 +43,9 @@ func (d *DuckDB) ArrowQueryContext(ctx context.Context, query string) (array.Rec
 
 	var reader array.RecordReader
 	err = conn.Raw(func(driverConn any) error {
-		dc, ok := driverConn.(driver.Conn)
-		if !ok {
-			return fmt.Errorf("connection does not implement driver.Conn")
-		}
-		arrowAPI, err := duckdb.NewArrowFromConn(dc)
-		if err != nil {
-			return fmt.Errorf("failed to create Arrow interface: %w", err)
-		}
-		reader, err = arrowAPI.QueryContext(ctx, query)
-		return err
+		var rawErr error
+		reader, rawErr = arrowQueryOnConn(ctx, driverConn, query)
+		return rawErr
 	})
 
 	if err != nil {
@@ -72,15 +78,8 @@ func (d *DuckDB) ArrowQueryWithProfileContext(ctx context.Context, query string)
 		// Fall back to non-profile Arrow query
 		var reader array.RecordReader
 		rawErr := conn.Raw(func(driverConn any) error {
-			dc, ok := driverConn.(driver.Conn)
-			if !ok {
-				return fmt.Errorf("connection does not implement driver.Conn")
-			}
-			arrowAPI, err := duckdb.NewArrowFromConn(dc)
-			if err != nil {
-				return err
-			}
-			reader, err = arrowAPI.QueryContext(ctx, query)
+			var err error
+			reader, err = arrowQueryOnConn(ctx, driverConn, query)
 			return err
 		})
 		if rawErr != nil {
@@ -108,15 +107,8 @@ func (d *DuckDB) ArrowQueryWithProfileContext(ctx context.Context, query string)
 	start := time.Now()
 	var reader array.RecordReader
 	rawErr := conn.Raw(func(driverConn any) error {
-		dc, ok := driverConn.(driver.Conn)
-		if !ok {
-			return fmt.Errorf("connection does not implement driver.Conn")
-		}
-		arrowAPI, err := duckdb.NewArrowFromConn(dc)
-		if err != nil {
-			return err
-		}
-		reader, err = arrowAPI.QueryContext(ctx, query)
+		var err error
+		reader, err = arrowQueryOnConn(ctx, driverConn, query)
 		return err
 	})
 	totalTime := time.Since(start)

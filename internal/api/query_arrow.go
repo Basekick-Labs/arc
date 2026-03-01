@@ -137,7 +137,9 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			h.logger.Error().Err(err).Msg("Error iterating Arrow batches")
 		}
 
-		ipcWriter.Close()
+		if err := ipcWriter.Close(); err != nil {
+			h.logger.Error().Err(err).Msg("Failed to close Arrow IPC writer")
+		}
 		reader.Release()
 		conn.Close()
 		if cancel != nil {
