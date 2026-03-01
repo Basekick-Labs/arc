@@ -93,6 +93,11 @@ var (
 
 )
 
+// arrowJSONQueryFunc is set by query_arrow_json.go init() when compiled with duckdb_arrow tag.
+// It executes a query via DuckDB's native Arrow API and streams the JSON response.
+// Returns (rowCount, handled). If handled is false, the caller falls back to database/sql.
+var arrowJSONQueryFunc func(h *QueryHandler, c *fiber.Ctx, ctx context.Context, cancel context.CancelFunc, convertedSQL string, profileMode bool, governanceMaxRows int, start time.Time, timestamp string) (int, bool)
+
 // isIdentChar returns true if c is a valid SQL identifier character (a-z, A-Z, 0-9, _)
 func isIdentChar(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
@@ -1218,8 +1223,6 @@ localProcessing:
 		return nil
 	} else {
 		// Standard single-query execution
-		var rows *sql.Rows
-		var err error
 
 		// Create context with timeout if configured (0 = no timeout)
 		ctx := c.UserContext()
@@ -1232,6 +1235,26 @@ localProcessing:
 			// Note: cancel is called inside the stream writer callback, not deferred here,
 			// because SetBodyStreamWriter runs asynchronously after this function returns.
 		}
+
+		// Try Arrow-native path first (available when compiled with duckdb_arrow tag).
+		// This bypasses database/sql row scanning entirely — reads typed values directly
+		// from DuckDB's internal Arrow columnar chunks.
+		if arrowJSONQueryFunc != nil {
+			_, handled := arrowJSONQueryFunc(h, c, ctx, cancel, convertedSQL, profileMode, governanceMaxRows, start, timestamp)
+			if handled {
+				// Arrow path handled the response — metrics are recorded
+				// inside the async stream writer callback.
+				if h.queryRegistry != nil && queryID != "" {
+					h.queryRegistry.Complete(queryID, 0)
+				}
+				return nil
+			}
+			// handled=false means Arrow path declined (e.g., driver issue).
+			// Fall through to database/sql path.
+		}
+
+		var rows *sql.Rows
+		var err error
 
 		if profileMode {
 			// Use profiled query to capture timing breakdown (with timeout support)
@@ -2924,7 +2947,19 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		Str("sql", convertedSQL).
 		Msg("Querying measurement")
 
-	// Execute query
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+
+	// Try Arrow-native path first (available when compiled with duckdb_arrow tag)
+	if arrowJSONQueryFunc != nil {
+		ctx := context.Background()
+		_, handled := arrowJSONQueryFunc(h, c, ctx, nil, convertedSQL, false, 0, start, timestamp)
+		if handled {
+			// Metrics are recorded inside the async stream callback — not here.
+			return nil
+		}
+	}
+
+	// Fallback: database/sql path
 	rows, err := h.db.Query(convertedSQL)
 	if err != nil {
 		m.IncQueryErrors()
@@ -2933,7 +2968,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 			Success:         false,
 			Error:           err.Error(),
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
-			Timestamp:       time.Now().UTC().Format(time.RFC3339),
+			Timestamp:       timestamp,
 		})
 	}
 
@@ -2947,7 +2982,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 			Success:         false,
 			Error:           err.Error(),
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
-			Timestamp:       time.Now().UTC().Format(time.RFC3339),
+			Timestamp:       timestamp,
 		})
 	}
 
@@ -2961,7 +2996,6 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	}
 
 	// Stream typed JSON response directly to HTTP
-	timestamp := time.Now().UTC().Format(time.RFC3339)
 	c.Set("Content-Type", "application/json")
 	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
 		rowCount := streamTypedJSON(w, columns, colTypes, rows, 0, nil, start, timestamp)

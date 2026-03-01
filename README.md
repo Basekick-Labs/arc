@@ -1,7 +1,7 @@
 # Arc
 
 [![Ingestion](https://img.shields.io/badge/ingestion-18.6M%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
-[![Query](https://img.shields.io/badge/query-2.64M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
+[![Query](https://img.shields.io/badge/query-6.29M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
 [![Go](https://img.shields.io/badge/go-1.26+-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
@@ -119,23 +119,23 @@ Benefits:
 
 ### Query (March 2026)
 
-Arrow IPC format provides up to 1.7x throughput vs JSON for large result sets:
+Arrow IPC format provides up to 3.6x throughput vs JSON for large result sets:
 
 | Query | Arrow (ms) | JSON (ms) | Speedup |
 |-------|------------|-----------|---------|
-| COUNT(*) - 1.88B rows | 1.9 | 1.7 | 0.89x |
-| SELECT LIMIT 10K | 70 | 76 | 1.09x |
-| SELECT LIMIT 100K | 102 | 134 | 1.31x |
-| SELECT LIMIT 500K | 242 | 387 | **1.60x** |
-| SELECT LIMIT 1M | 412 | 706 | **1.72x** |
-| Time Range (7d) LIMIT 10K | 50 | 62 | 1.26x |
-| Time Bucket (1h, 7d) | 1014 | 1004 | 0.99x |
-| Date Trunc (day, 30d) | 2169 | 2064 | 0.95x |
+| COUNT(*) - 1.88B rows | 1.9 | 1.8 | 0.95x |
+| SELECT LIMIT 10K | 70 | 75 | 1.07x |
+| SELECT LIMIT 100K | 88 | 106 | 1.20x |
+| SELECT LIMIT 500K | 127 | 253 | **1.99x** |
+| SELECT LIMIT 1M | 159 | 438 | **2.75x** |
+| Time Range (7d) LIMIT 10K | 45 | 51 | 1.13x |
+| Time Bucket (1h, 7d) | 986 | 1089 | 1.10x |
+| Date Trunc (day, 30d) | 2013 | 2190 | 1.09x |
 
 **Best throughput:**
-- Arrow: **2.43M rows/sec** (1M row SELECT)
-- JSON: **1.42M rows/sec** (1M row SELECT)
-- COUNT(*): **~1.1T rows/sec** (1.88B rows, 1.7ms)
+- Arrow: **6.29M rows/sec** (1M row SELECT)
+- JSON: **2.28M rows/sec** (1M row SELECT)
+- COUNT(*): **~1.1T rows/sec** (1.88B rows, 1.8ms)
 
 ---
 

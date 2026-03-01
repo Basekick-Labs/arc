@@ -146,7 +146,8 @@ jobs:
         run: |
           VERSION=${{ needs.prepare.outputs.version }}
 
-          go build -ldflags "-s -w -X main.Version=${VERSION}" \
+          go build -tags=duckdb_arrow \
+            -ldflags "-s -w -X main.Version=${VERSION}" \
             -o arc-${{ matrix.suffix }} \
             ./cmd/arc
 

@@ -18,6 +18,7 @@ COPY . .
 # Build
 ARG VERSION
 RUN go build -v \
+    -tags=duckdb_arrow \
     -ldflags="-s -w -X main.Version=${VERSION}" \
     -o arc ./cmd/arc
 
