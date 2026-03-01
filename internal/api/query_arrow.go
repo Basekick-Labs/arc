@@ -1,3 +1,5 @@
+//go:build duckdb_arrow
+
 package api
 
 import (
@@ -10,7 +12,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
-	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/gofiber/fiber/v2"
 )
@@ -87,13 +88,13 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		ctx, cancel = context.WithTimeout(ctx, h.queryTimeout)
 	}
 
-	// Execute query using standard database/sql interface with timeout support
-	rows, err := h.db.QueryContext(ctx, convertedSQL)
+	// Execute query using DuckDB's native Arrow API — returns record batches
+	// directly from DuckDB's internal columnar chunks, no row-by-row scanning.
+	reader, conn, err := h.db.ArrowQueryContext(ctx, convertedSQL)
 	if err != nil {
 		if cancel != nil {
 			cancel()
 		}
-		// Check if it was a timeout
 		if h.queryTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
 			m.IncQueryTimeouts()
 			h.logger.Error().Err(err).Str("sql", req.SQL).Dur("timeout", h.queryTimeout).Msg("Arrow query timed out")
@@ -109,132 +110,43 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			"error":   err.Error(),
 		})
 	}
-	// Note: rows.Close() is called inside SetBodyStreamWriter callback, not here,
-	// because SetBodyStreamWriter runs asynchronously after this handler returns.
 
-	// Get column info
-	columns, err := rows.Columns()
-	if err != nil {
-		rows.Close()
-		if cancel != nil {
-			cancel()
-		}
-		m.IncQueryErrors()
-		h.logger.Error().Err(err).Msg("Failed to get column names")
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"success": false,
-			"error":   err.Error(),
-		})
-	}
+	schema := reader.Schema()
 
-	columnTypes, err := rows.ColumnTypes()
-	if err != nil {
-		rows.Close()
-		if cancel != nil {
-			cancel()
-		}
-		m.IncQueryErrors()
-		h.logger.Error().Err(err).Msg("Failed to get column types")
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"success": false,
-			"error":   err.Error(),
-		})
-	}
-
-	// Build Arrow schema from column types
-	arrowFields := make([]arrow.Field, len(columns))
-	for i, col := range columns {
-		arrowFields[i] = arrow.Field{
-			Name:     col,
-			Type:     sqlTypeToArrowType(columnTypes[i].DatabaseTypeName()),
-			Nullable: true,
-		}
-	}
-	schema := arrow.NewSchema(arrowFields, nil)
-
-	// Set response headers before streaming
 	c.Set("Content-Type", "application/vnd.apache.arrow.stream")
 
-	// Use streaming response - write Arrow batches directly to the response
-	// This eliminates double-buffering: rows go directly into Arrow builders,
-	// and batches are written to the response as they're filled.
 	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
-		mem := memory.NewGoAllocator()
 		ipcWriter := ipc.NewWriter(w, ipc.WithSchema(schema))
-		defer ipcWriter.Close()
-
-		recordBuilder := array.NewRecordBuilder(mem, schema)
-		defer recordBuilder.Release()
 
 		var totalRows int64
-		var batchRows int
+		for reader.Next() {
+			batch := reader.Record()
+			if batch == nil {
+				break
+			}
+			totalRows += batch.NumRows()
 
-		// Pre-allocate scan buffers once (reused for each row)
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
-		for i := range values {
-			valuePtrs[i] = &values[i]
+			if err := ipcWriter.Write(batch); err != nil {
+				h.logger.Error().Err(err).Msg("Failed to write Arrow batch")
+				break
+			}
+			w.Flush()
 		}
 
-		for rows.Next() {
-			if err := rows.Scan(valuePtrs...); err != nil {
-				h.logger.Error().Err(err).Msg("Failed to scan row")
-				continue
-			}
-
-			// Append values directly to Arrow builders (no intermediate slice)
-			for colIdx, val := range values {
-				appendValueToBuilder(recordBuilder.Field(colIdx), val, arrowFields[colIdx].Type)
-			}
-
-			batchRows++
-			totalRows++
-
-			// Flush batch when it reaches the target size
-			if batchRows >= arrowBatchSize {
-				record := recordBuilder.NewRecord()
-				if err := ipcWriter.Write(record); err != nil {
-					h.logger.Error().Err(err).Msg("Failed to write Arrow batch")
-					record.Release()
-					return
-				}
-				record.Release()
-				w.Flush() // Flush to client immediately
-
-				// Reset builder for next batch
-				recordBuilder.Release()
-				recordBuilder = array.NewRecordBuilder(mem, schema)
-				batchRows = 0
-			}
+		if err := reader.Err(); err != nil {
+			h.logger.Error().Err(err).Msg("Error iterating Arrow batches")
 		}
 
-		// Write any remaining rows as final batch
-		if batchRows > 0 {
-			record := recordBuilder.NewRecord()
-			if err := ipcWriter.Write(record); err != nil {
-				h.logger.Error().Err(err).Msg("Failed to write final Arrow batch")
-				record.Release()
-				return
-			}
-			record.Release()
-		}
-
-		if err := rows.Err(); err != nil {
-			h.logger.Error().Err(err).Msg("Error iterating rows")
-		}
-
-		// Close rows here since we can't use defer (handler returns before streaming completes)
-		rows.Close()
-
-		// Cancel timeout context if one was created
+		ipcWriter.Close()
+		reader.Release()
+		conn.Close()
 		if cancel != nil {
 			cancel()
 		}
 
-		executionTime := float64(time.Since(start).Milliseconds())
 		h.logger.Info().
 			Int64("row_count", totalRows).
-			Float64("execution_time_ms", executionTime).
+			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 			Msg("Arrow streaming query completed")
 	})
 
