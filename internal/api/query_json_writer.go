@@ -53,8 +53,10 @@ func mapColumnType(dbType string) colType {
 		return colBool
 	case strings.Contains(dbType, "TIMESTAMP"), strings.Contains(dbType, "DATETIME"):
 		return colTimestamp
-	case strings.Contains(dbType, "INT64"), strings.Contains(dbType, "BIGINT"),
-		strings.Contains(dbType, "HUGEINT"), strings.Contains(dbType, "UBIGINT"):
+	case strings.Contains(dbType, "HUGEINT"), strings.Contains(dbType, "UBIGINT"):
+		// 128-bit integers don't fit in int64 — serialize as strings
+		return colString
+	case strings.Contains(dbType, "INT64"), strings.Contains(dbType, "BIGINT"):
 		return colInt64
 	case strings.Contains(dbType, "INT"):
 		// INT, INTEGER, INT32, SMALLINT, TINYINT, etc.
