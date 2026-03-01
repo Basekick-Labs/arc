@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"fmt"
@@ -1073,7 +1074,6 @@ localProcessing:
 	}
 
 	var columns []string
-	var data [][]interface{}
 	var rowCount int
 	var profile *database.QueryProfile
 
@@ -1117,7 +1117,8 @@ localProcessing:
 		var cancelTimeout context.CancelFunc
 		if effectiveTimeout > 0 {
 			execCtx, cancelTimeout = context.WithTimeout(execCtx, effectiveTimeout)
-			defer cancelTimeout()
+			// Note: cancelTimeout is called inside the stream writer callback, not deferred here,
+			// because SetBodyStreamWriter runs asynchronously after this function returns.
 		}
 		results, err := h.parallelExecutor.ExecutePartitioned(
 			execCtx,
@@ -1126,6 +1127,9 @@ localProcessing:
 			parallelInfo.ReadParquetOptions,
 		)
 		if err != nil {
+			if cancelTimeout != nil {
+				cancelTimeout()
+			}
 			m.IncQueryErrors()
 			if h.queryRegistry != nil && queryID != "" {
 				if execCtx.Err() == context.DeadlineExceeded {
@@ -1154,6 +1158,9 @@ localProcessing:
 					r.Rows.Close()
 				}
 			}
+			if cancelTimeout != nil {
+				cancelTimeout()
+			}
 			m.IncQueryErrors()
 			if h.queryRegistry != nil && queryID != "" {
 				h.queryRegistry.Fail(queryID, "Failed to create merged iterator")
@@ -1166,35 +1173,49 @@ localProcessing:
 				Timestamp:       timestamp,
 			})
 		}
-		defer iter.Close()
 
 		columns = iter.Columns()
-		numCols := len(columns)
-		estimatedRows := extractLimit(req.SQL, 1000)
-		data = make([][]interface{}, 0, estimatedRows)
 
-		for iter.Next() {
-			values, err := iter.ScanBuffer()
-			if err != nil {
-				h.logger.Error().Err(err).Msg("Failed to scan row")
-				continue
-			}
-
-			row := make([]interface{}, numCols)
-			for i, v := range values {
-				row[i] = h.convertValue(v)
-			}
-			data = append(data, row)
-			rowCount++
-
-			if governanceMaxRows > 0 && rowCount >= governanceMaxRows {
-				break
+		// Get column types from first successful partition for typed JSON serialization
+		var colTypes []colType
+		for _, r := range results {
+			if r.Error == nil && r.Rows != nil {
+				if ct, err := r.Rows.ColumnTypes(); err == nil {
+					colTypes = mapColumnTypes(ct)
+					break
+				}
 			}
 		}
-
-		if err := iter.Err(); err != nil {
-			h.logger.Error().Err(err).Msg("Error iterating merged rows")
+		if colTypes == nil {
+			// Fallback: treat all columns as strings
+			colTypes = make([]colType, len(columns))
 		}
+
+		// Stream typed JSON response directly to HTTP — no full-response buffering
+		c.Set("Content-Type", "application/json")
+		c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+			rowCount = streamTypedJSON(w, columns, colTypes, iter, governanceMaxRows, profile, start, timestamp)
+			w.Flush()
+
+			iter.Close()
+			if cancelTimeout != nil {
+				cancelTimeout()
+			}
+
+			// Record metrics after streaming completes
+			if h.queryRegistry != nil && queryID != "" {
+				h.queryRegistry.Complete(queryID, rowCount)
+			}
+			m.IncQuerySuccess()
+			m.IncQueryRows(int64(rowCount))
+			m.RecordQueryLatency(time.Since(start).Microseconds())
+
+			h.logger.Info().
+				Int("row_count", rowCount).
+				Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
+				Msg("Query completed")
+		})
+		return nil
 	} else {
 		// Standard single-query execution
 		var rows *sql.Rows
@@ -1208,7 +1229,8 @@ localProcessing:
 		var cancel context.CancelFunc
 		if effectiveTimeout > 0 {
 			ctx, cancel = context.WithTimeout(ctx, effectiveTimeout)
-			defer cancel()
+			// Note: cancel is called inside the stream writer callback, not deferred here,
+			// because SetBodyStreamWriter runs asynchronously after this function returns.
 		}
 
 		if profileMode {
@@ -1219,6 +1241,9 @@ localProcessing:
 		}
 
 		if err != nil {
+			if cancel != nil {
+				cancel()
+			}
 			// Check if this is a "no files found" error — treat as empty result, not an error.
 			// This happens when querying a measurement that has no data on storage yet
 			// (e.g., new measurement, or DuckDB's httpfs cache is stale).
@@ -1268,11 +1293,14 @@ localProcessing:
 				Timestamp:       timestamp,
 			})
 		}
-		defer rows.Close()
 
 		// Get column names
 		columns, err = rows.Columns()
 		if err != nil {
+			rows.Close()
+			if cancel != nil {
+				cancel()
+			}
 			m.IncQueryErrors()
 			h.logger.Error().Err(err).Msg("Failed to get column names")
 			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
@@ -1283,70 +1311,42 @@ localProcessing:
 			})
 		}
 
-		// Fetch results with optimized memory allocation
-		estimatedRows := extractLimit(req.SQL, 1000)
-		data = make([][]interface{}, 0, estimatedRows)
-		numCols := len(columns)
-
-		// Get scan buffer from pool to avoid allocating per row
-		buf := scanBufferPool.Get().(*scanBuffer)
-		buf.reset(numCols)
-		defer func() {
-			for i := range buf.values {
-				buf.values[i] = nil
-			}
-			scanBufferPool.Put(buf)
-		}()
-
-		for rows.Next() {
-			if err := rows.Scan(buf.valuePtrs...); err != nil {
-				h.logger.Error().Err(err).Msg("Failed to scan row")
-				continue
-			}
-
-			row := make([]interface{}, numCols)
-			for i, v := range buf.values {
-				row[i] = h.convertValue(v)
-			}
-			data = append(data, row)
-			rowCount++
-
-			if governanceMaxRows > 0 && rowCount >= governanceMaxRows {
-				break
-			}
+		// Get column types for typed JSON serialization
+		columnTypes, err := rows.ColumnTypes()
+		var colTypes []colType
+		if err == nil {
+			colTypes = mapColumnTypes(columnTypes)
+		} else {
+			// Fallback: treat all columns as strings
+			colTypes = make([]colType, len(columns))
 		}
 
-		if err := rows.Err(); err != nil {
-			h.logger.Error().Err(err).Msg("Error iterating rows")
-		}
+		// Stream typed JSON response directly to HTTP — no full-response buffering
+		c.Set("Content-Type", "application/json")
+		c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+			rowCount = streamTypedJSON(w, columns, colTypes, rows, governanceMaxRows, profile, start, timestamp)
+			w.Flush()
+
+			rows.Close()
+			if cancel != nil {
+				cancel()
+			}
+
+			// Record metrics after streaming completes
+			if h.queryRegistry != nil && queryID != "" {
+				h.queryRegistry.Complete(queryID, rowCount)
+			}
+			m.IncQuerySuccess()
+			m.IncQueryRows(int64(rowCount))
+			m.RecordQueryLatency(time.Since(start).Microseconds())
+
+			h.logger.Info().
+				Int("row_count", rowCount).
+				Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
+				Msg("Query completed")
+		})
+		return nil
 	}
-
-	executionTime := float64(time.Since(start).Milliseconds())
-
-	// Record query completion in registry
-	if h.queryRegistry != nil && queryID != "" {
-		h.queryRegistry.Complete(queryID, rowCount)
-	}
-
-	// Record success metrics
-	m.IncQuerySuccess()
-	m.IncQueryRows(int64(rowCount))
-	m.RecordQueryLatency(time.Since(start).Microseconds())
-
-	h.logger.Info().
-		Int("row_count", rowCount).
-		Float64("execution_time_ms", executionTime).
-		Msg("Query completed")
-
-	return c.JSON(QueryResponse{
-		Success:         true,
-		Columns:         columns,
-		Data:            data,
-		RowCount:        rowCount,
-		ExecutionTimeMs: executionTime,
-		Timestamp:       timestamp,
-		Profile:         profile,
-	})
 }
 
 // isNoFilesFoundError checks if a DuckDB error is the "No files found" IO error.
@@ -2936,11 +2936,11 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 			Timestamp:       time.Now().UTC().Format(time.RFC3339),
 		})
 	}
-	defer rows.Close()
 
 	// Get column names
 	columns, err := rows.Columns()
 	if err != nil {
+		rows.Close()
 		m.IncQueryErrors()
 		h.logger.Error().Err(err).Msg("Failed to get column names in measurement query")
 		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
@@ -2951,51 +2951,35 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		})
 	}
 
-	// Fetch results
-	data := make([][]interface{}, 0)
-	rowCount := 0
-
-	for rows.Next() {
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
-		if err := rows.Scan(valuePtrs...); err != nil {
-			h.logger.Error().Err(err).Msg("Failed to scan row")
-			continue
-		}
-
-		row := make([]interface{}, len(values))
-		for i, v := range values {
-			row[i] = h.convertValue(v)
-		}
-
-		data = append(data, row)
-		rowCount++
+	// Get column types for typed JSON serialization
+	columnTypes, err := rows.ColumnTypes()
+	var colTypes []colType
+	if err == nil {
+		colTypes = mapColumnTypes(columnTypes)
+	} else {
+		colTypes = make([]colType, len(columns))
 	}
 
-	executionTime := float64(time.Since(start).Milliseconds())
+	// Stream typed JSON response directly to HTTP
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+	c.Set("Content-Type", "application/json")
+	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+		rowCount := streamTypedJSON(w, columns, colTypes, rows, 0, nil, start, timestamp)
+		w.Flush()
 
-	// Record success metrics
-	m.IncQuerySuccess()
-	m.IncQueryRows(int64(rowCount))
-	m.RecordQueryLatency(time.Since(start).Microseconds())
+		rows.Close()
 
-	h.logger.Info().
-		Str("measurement", measurement).
-		Int("row_count", rowCount).
-		Float64("execution_time_ms", executionTime).
-		Msg("Measurement query completed")
+		// Record success metrics
+		m.IncQuerySuccess()
+		m.IncQueryRows(int64(rowCount))
+		m.RecordQueryLatency(time.Since(start).Microseconds())
 
-	return c.JSON(QueryResponse{
-		Success:         true,
-		Columns:         columns,
-		Data:            data,
-		RowCount:        rowCount,
-		ExecutionTimeMs: executionTime,
-		Timestamp:       time.Now().UTC().Format(time.RFC3339),
+		h.logger.Info().
+			Str("measurement", measurement).
+			Int("row_count", rowCount).
+			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
+			Msg("Measurement query completed")
 	})
+	return nil
 }
 
