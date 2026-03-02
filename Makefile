@@ -3,8 +3,7 @@
 # Variables
 BINARY_NAME=arc
 GO=go
-GOFLAGS=-v
-GOTAGS=-tags=duckdb_arrow
+GOFLAGS=-v -tags=duckdb_arrow
 MAIN_PATH=./cmd/arc
 
 help: ## Show this help message
@@ -20,17 +19,14 @@ deps: ## Download Go dependencies
 install: ## Install dependencies (alias for deps)
 	@make deps
 
-build: ## Build the binary (with Arrow support)
-	$(GO) build $(GOFLAGS) $(GOTAGS) -o $(BINARY_NAME) $(MAIN_PATH)
-
-build-minimal: ## Build without Arrow support (smaller binary)
+build: ## Build the binary
 	$(GO) build $(GOFLAGS) -o $(BINARY_NAME) $(MAIN_PATH)
 
 run: ## Run Arc directly (without building)
-	$(GO) run $(GOTAGS) $(MAIN_PATH)
+	$(GO) run $(GOFLAGS) $(MAIN_PATH)
 
 test: ## Run all tests
-	$(GO) test $(GOTAGS) -v -race -coverprofile=coverage.out ./...
+	$(GO) test $(GOFLAGS) -race -coverprofile=coverage.out ./...
 
 test-coverage: test ## Run tests with coverage report
 	$(GO) tool cover -html=coverage.out

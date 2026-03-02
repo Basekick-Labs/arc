@@ -48,4 +48,4 @@ Detailed JSON benchmarks:
 
 - No change to the JSON response format — fully backwards compatible
 - Automatic fallback to `database/sql` path when Arrow API is unavailable
-- Build-tag gated (`duckdb_arrow`) — minimal builds unaffected. Will become the default (no tag required) in v2026.05.1
+- Always enabled — the native Arrow path is compiled by default with no build tag required

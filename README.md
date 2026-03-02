@@ -206,6 +206,9 @@ git clone https://github.com/basekick-labs/arc.git
 cd arc
 make build
 
+# Or build directly with Go (the duckdb_arrow tag is required)
+go build -tags=duckdb_arrow ./cmd/arc
+
 # Run
 ./arc
 ```

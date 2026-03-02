@@ -1236,9 +1236,8 @@ localProcessing:
 			// because SetBodyStreamWriter runs asynchronously after this function returns.
 		}
 
-		// Try Arrow-native path first (available when compiled with duckdb_arrow tag).
-		// This bypasses database/sql row scanning entirely — reads typed values directly
-		// from DuckDB's internal Arrow columnar chunks.
+		// Arrow-native path: bypasses database/sql row scanning entirely — reads typed
+		// values directly from DuckDB's internal Arrow columnar chunks.
 		if arrowJSONQueryFunc != nil {
 			_, handled := arrowJSONQueryFunc(h, c, ctx, cancel, convertedSQL, profileMode, governanceMaxRows, start, timestamp)
 			if handled {
@@ -2949,7 +2948,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 
 	timestamp := time.Now().UTC().Format(time.RFC3339)
 
-	// Try Arrow-native path first (available when compiled with duckdb_arrow tag)
+	// Arrow-native path: bypasses database/sql row scanning entirely.
 	if arrowJSONQueryFunc != nil {
 		ctx := context.Background()
 		_, handled := arrowJSONQueryFunc(h, c, ctx, nil, convertedSQL, false, 0, start, timestamp)
