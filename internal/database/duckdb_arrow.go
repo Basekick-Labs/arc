@@ -15,6 +15,10 @@ import (
 	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
+func init() {
+	ArrowEnabled = true
+}
+
 // arrowQueryOnConn executes a query via the Arrow API on a raw driver connection.
 func arrowQueryOnConn(ctx context.Context, driverConn any, query string) (array.RecordReader, error) {
 	dc, ok := driverConn.(driver.Conn)

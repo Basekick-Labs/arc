@@ -63,7 +63,7 @@ func main() {
 
 	// Setup logger
 	logger.Setup(cfg.Log.Level, cfg.Log.Format)
-	log.Info().Str("version", Version).Msg("Starting Arc...")
+	log.Info().Str("version", Version).Bool("duckdb_arrow", database.ArrowEnabled).Msg("Starting Arc...")
 
 	// Validate Enterprise License early (before component initialization)
 	// This allows us to apply core limits to DuckDB and ingestion workers

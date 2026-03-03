@@ -14,6 +14,9 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// ArrowEnabled is set to true by duckdb_arrow.go init() when compiled with the duckdb_arrow tag.
+var ArrowEnabled bool
+
 // QueryProfile contains timing breakdown for a query execution
 type QueryProfile struct {
 	TotalMs     float64 `json:"total_ms"`
