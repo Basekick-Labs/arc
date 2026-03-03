@@ -15,6 +15,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/gofiber/fiber/v2"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/metrics"
 )
@@ -114,6 +115,12 @@ func executeArrowJSONQuery(
 		return -1, true
 	}
 
+	// Capture token name before async callback (Fiber context not safe in callbacks)
+	tokenName := ""
+	if ti := auth.GetTokenInfo(c); ti != nil {
+		tokenName = ti.Name
+	}
+
 	// Stream Arrow JSON response.
 	// SetBodyStreamWriter runs asynchronously — metrics are recorded in the callback.
 	c.Set("Content-Type", "application/json")
@@ -135,6 +142,7 @@ func executeArrowJSONQuery(
 			Int("row_count", rc).
 			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 			Msg("Arrow JSON query completed")
+		h.logSlowQuery(convertedSQL, start, rc, tokenName)
 	})
 
 	// Return 0 — actual row count is only known after async streaming completes.

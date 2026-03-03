@@ -465,7 +465,8 @@ type QueryHandler struct {
 	rbacManager      RBACChecker
 	debugEnabled     bool // Cached check for debug logging to avoid repeated level checks
 	parallelExecutor *query.ParallelExecutor
-	queryTimeout     time.Duration // Query timeout (0 = no timeout)
+	queryTimeout       time.Duration // Query timeout (0 = no timeout)
+	slowQueryThreshold time.Duration // Slow query WARN threshold (0 = disabled)
 
 	// Cluster routing support
 	router *cluster.Router
@@ -606,7 +607,8 @@ func validateWhereClauseQuery(where string) error {
 
 // NewQueryHandler creates a new query handler
 // queryTimeoutSeconds: timeout for query execution in seconds (0 = no timeout)
-func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolog.Logger, queryTimeoutSeconds int) *QueryHandler {
+// slowQueryThresholdMs: threshold in milliseconds for slow query WARN logging (0 = disabled)
+func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolog.Logger, queryTimeoutSeconds int, slowQueryThresholdMs int) *QueryHandler {
 	handlerLogger := logger.With().Str("component", "query-handler").Logger()
 	pruner := pruning.NewPartitionPruner(logger)
 	pruner.SetStorageBackend(storage) // Enable S3/Azure partition filtering
@@ -617,18 +619,44 @@ func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolo
 		handlerLogger.Info().Int("timeout_seconds", queryTimeoutSeconds).Msg("Query timeout configured")
 	}
 
-	return &QueryHandler{
-		db:               db,
-		storage:          storage,
-		pruner:           pruner,
-		queryCache:       database.NewQueryCache(database.QueryCacheTTL, database.DefaultQueryCacheMaxSize),
-		logger:           handlerLogger,
-		authManager:      nil,
-		rbacManager:      nil,
-		debugEnabled:     handlerLogger.GetLevel() <= zerolog.DebugLevel,
-		parallelExecutor: query.NewParallelExecutor(db.DB(), query.DefaultParallelConfig(), handlerLogger),
-		queryTimeout:     queryTimeout,
+	var slowQueryThreshold time.Duration
+	if slowQueryThresholdMs > 0 {
+		slowQueryThreshold = time.Duration(slowQueryThresholdMs) * time.Millisecond
+		handlerLogger.Info().Int("threshold_ms", slowQueryThresholdMs).Msg("Slow query logging enabled")
 	}
+
+	return &QueryHandler{
+		db:                 db,
+		storage:            storage,
+		pruner:             pruner,
+		queryCache:         database.NewQueryCache(database.QueryCacheTTL, database.DefaultQueryCacheMaxSize),
+		logger:             handlerLogger,
+		authManager:        nil,
+		rbacManager:        nil,
+		debugEnabled:       handlerLogger.GetLevel() <= zerolog.DebugLevel,
+		parallelExecutor:   query.NewParallelExecutor(db.DB(), query.DefaultParallelConfig(), handlerLogger),
+		queryTimeout:       queryTimeout,
+		slowQueryThreshold: slowQueryThreshold,
+	}
+}
+
+// logSlowQuery emits a WARN log and increments the slow query counter if
+// the query duration exceeds the configured threshold.
+func (h *QueryHandler) logSlowQuery(sql string, start time.Time, rowCount int, tokenName string) {
+	if h.slowQueryThreshold <= 0 {
+		return
+	}
+	elapsed := time.Since(start)
+	if elapsed < h.slowQueryThreshold {
+		return
+	}
+	metrics.Get().IncSlowQueries()
+	h.logger.Warn().
+		Str("sql", sql).
+		Float64("execution_time_ms", float64(elapsed.Milliseconds())).
+		Int("row_count", rowCount).
+		Str("token_name", tokenName).
+		Msg("Slow query detected")
 }
 
 // SetAuthAndRBAC sets the auth and RBAC managers for permission checking
@@ -1196,6 +1224,12 @@ localProcessing:
 			colTypes = make([]colType, len(columns))
 		}
 
+		// Capture token name before async callback (Fiber context not safe in callbacks)
+		tokenName := ""
+		if ti := auth.GetTokenInfo(c); ti != nil {
+			tokenName = ti.Name
+		}
+
 		// Stream typed JSON response directly to HTTP — no full-response buffering
 		c.Set("Content-Type", "application/json")
 		c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
@@ -1219,6 +1253,7 @@ localProcessing:
 				Int("row_count", rowCount).
 				Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 				Msg("Query completed")
+			h.logSlowQuery(convertedSQL, start, rowCount, tokenName)
 		})
 		return nil
 	} else {
@@ -1343,6 +1378,12 @@ localProcessing:
 			colTypes = make([]colType, len(columns))
 		}
 
+		// Capture token name before async callback (Fiber context not safe in callbacks)
+		tokenName := ""
+		if ti := auth.GetTokenInfo(c); ti != nil {
+			tokenName = ti.Name
+		}
+
 		// Stream typed JSON response directly to HTTP — no full-response buffering
 		c.Set("Content-Type", "application/json")
 		c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
@@ -1366,6 +1407,7 @@ localProcessing:
 				Int("row_count", rowCount).
 				Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 				Msg("Query completed")
+			h.logSlowQuery(convertedSQL, start, rowCount, tokenName)
 		})
 		return nil
 	}
@@ -2994,6 +3036,12 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		colTypes = make([]colType, len(columns))
 	}
 
+	// Capture token name before async callback (Fiber context not safe in callbacks)
+	tokenName := ""
+	if ti := auth.GetTokenInfo(c); ti != nil {
+		tokenName = ti.Name
+	}
+
 	// Stream typed JSON response directly to HTTP
 	c.Set("Content-Type", "application/json")
 	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
@@ -3012,6 +3060,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 			Int("row_count", rowCount).
 			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 			Msg("Measurement query completed")
+		h.logSlowQuery(sql, start, rowCount, tokenName)
 	})
 	return nil
 }

@@ -173,10 +173,11 @@ type MQTTConfig struct {
 
 // QueryConfig holds configuration for query execution optimizations
 type QueryConfig struct {
-	Timeout           int   // Query execution timeout in seconds (0 = no timeout, default: 300)
-	EnableS3Cache     bool  // Enable S3 file caching for faster repeated reads (useful for CTEs/subqueries)
-	S3CacheSize       int64 // Cache size in bytes (parsed from "128MB", "256MB", etc.)
-	S3CacheTTLSeconds int   // Cache entry TTL in seconds (default: 3600 = 1 hour)
+	Timeout              int   // Query execution timeout in seconds (0 = no timeout, default: 300)
+	SlowQueryThresholdMs int   // Slow query WARN threshold in milliseconds (0 = disabled)
+	EnableS3Cache        bool  // Enable S3 file caching for faster repeated reads (useful for CTEs/subqueries)
+	S3CacheSize          int64 // Cache size in bytes (parsed from "128MB", "256MB", etc.)
+	S3CacheTTLSeconds    int   // Cache entry TTL in seconds (default: 3600 = 1 hour)
 }
 
 // LicenseConfig holds configuration for enterprise license validation
@@ -489,10 +490,11 @@ func Load() (*Config, error) {
 			Enabled: v.GetBool("mqtt.enabled"),
 		},
 		Query: QueryConfig{
-			Timeout:           v.GetInt("query.timeout"),
-			EnableS3Cache:     v.GetBool("query.enable_s3_cache"),
-			S3CacheSize:       s3CacheSize,
-			S3CacheTTLSeconds: v.GetInt("query.s3_cache_ttl_seconds"),
+			Timeout:              v.GetInt("query.timeout"),
+			SlowQueryThresholdMs: v.GetInt("query.slow_query_threshold_ms"),
+			EnableS3Cache:        v.GetBool("query.enable_s3_cache"),
+			S3CacheSize:          s3CacheSize,
+			S3CacheTTLSeconds:    v.GetInt("query.s3_cache_ttl_seconds"),
 		},
 		License: LicenseConfig{
 			Enabled: v.GetBool("license.enabled"),
@@ -699,6 +701,7 @@ func setDefaults(v *viper.Viper) {
 
 	// Query defaults
 	v.SetDefault("query.timeout", 300)                 // 5 minute query timeout (0 = no timeout)
+	v.SetDefault("query.slow_query_threshold_ms", 0)   // Disabled by default (0 = no slow query logging)
 	v.SetDefault("query.enable_s3_cache", false)       // Disabled by default (opt-in feature)
 	v.SetDefault("query.s3_cache_size", "128MB")       // 128MB cache (256 blocks × 512KB)
 	v.SetDefault("query.s3_cache_ttl_seconds", 3600)   // 1 hour

@@ -46,6 +46,7 @@ type Metrics struct {
 	queryErrorsTotal      atomic.Int64
 	queryTimeoutsTotal    atomic.Int64
 	queryRowsTotal        atomic.Int64
+	querySlowTotal        atomic.Int64
 	queryLatencySum       atomic.Int64 // microseconds
 	queryLatencyCount     atomic.Int64
 
@@ -208,6 +209,7 @@ func (m *Metrics) IncQueryRequests()             { m.queryRequestsTotal.Add(1) }
 func (m *Metrics) IncQuerySuccess()              { m.querySuccessTotal.Add(1) }
 func (m *Metrics) IncQueryErrors()               { m.queryErrorsTotal.Add(1) }
 func (m *Metrics) IncQueryTimeouts()             { m.queryTimeoutsTotal.Add(1) }
+func (m *Metrics) IncSlowQueries()               { m.querySlowTotal.Add(1) }
 func (m *Metrics) IncQueryRows(count int64)      { m.queryRowsTotal.Add(count) }
 
 // RecordQueryLatency records query latency in microseconds
@@ -345,6 +347,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"query_success_total":   m.querySuccessTotal.Load(),
 		"query_errors_total":    m.queryErrorsTotal.Load(),
 		"query_timeouts_total":  m.queryTimeoutsTotal.Load(),
+		"query_slow_total":     m.querySlowTotal.Load(),
 		"query_rows_total":      m.queryRowsTotal.Load(),
 		"query_latency_sum_us":  m.queryLatencySum.Load(),
 		"query_latency_count":   m.queryLatencyCount.Load(),
@@ -532,6 +535,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_query_timeouts_total Queries that exceeded timeout\n"...)
 	b = append(b, "# TYPE arc_query_timeouts_total counter\n"...)
 	b = appendMetric(b, "arc_query_timeouts_total", float64(m.queryTimeoutsTotal.Load()))
+
+	b = append(b, "# HELP arc_slow_queries_total Queries that exceeded slow query threshold\n"...)
+	b = append(b, "# TYPE arc_slow_queries_total counter\n"...)
+	b = appendMetric(b, "arc_slow_queries_total", float64(m.querySlowTotal.Load()))
 
 	b = append(b, "# HELP arc_query_rows_total Total rows returned by queries\n"...)
 	b = append(b, "# TYPE arc_query_rows_total counter\n"...)

@@ -51,7 +51,7 @@ s3_path_style = true        # True for MinIO, false for AWS
 # -----------------------------------------------------------------------------
 [ingest]
 max_buffer_size = 5000000   # Records before flush (default: 50000)
-max_buffer_age_ms = 1000   # Max buffer age before flush
+max_buffer_age_ms = 100   # Max buffer age before flush
 
 # Sort keys for compression/query performance: "measurement:col1,col2"
 # Time column is always appended automatically
@@ -112,6 +112,10 @@ enabled = false
 # Query
 # -----------------------------------------------------------------------------
 [query]
+# Slow query logging threshold in milliseconds (0 = disabled)
+# Queries exceeding this threshold emit a WARN log and increment arc_slow_queries_total
+# slow_query_threshold_ms = 1000
+
 # S3 file caching (improves CTEs, subqueries, dashboard queries)
 enable_s3_cache = false
 s3_cache_size = "128MB"

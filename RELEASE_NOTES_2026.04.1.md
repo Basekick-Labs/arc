@@ -10,7 +10,7 @@ Replaced the query response serialization path with a typed JSON streaming write
 2. Streams JSON directly to the HTTP response using `bufio.Writer`
 3. Serializes values with `strconv.AppendInt`, `strconv.AppendFloat`, `time.AppendFormat` — zero-allocation per cell
 
-**Results (1.8B row dataset, Apple M2 Pro):**
+**Results (1.8B row dataset, Apple M3 Max):**
 
 | Query | Before (ms) | After (ms) | Improvement |
 |-------|------------|------------|-------------|
@@ -31,7 +31,7 @@ This benefits both response formats:
 - **JSON**: Typed values read directly from Arrow column arrays (`(*array.Int64).Value(row)`) instead of `interface{}` type-switching
 - **Arrow IPC**: Batches go straight from DuckDB to the IPC writer — no intermediate conversion
 
-**Results (1.88B row dataset, Apple M2 Pro):**
+**Results (1.88B row dataset, Apple M3 Max):**
 
 | Endpoint | Before | After | Improvement |
 |----------|--------|-------|-------------|
@@ -49,3 +49,42 @@ Detailed JSON benchmarks:
 - No change to the JSON response format — fully backwards compatible
 - Automatic fallback to `database/sql` path when Arrow API is unavailable
 - Always enabled — the native Arrow path is compiled by default with no build tag required
+- Arrow status is logged at startup: `duckdb_arrow=true`
+
+### Basekick-Labs/msgpack v6
+
+Migrated from `vmihailenco/msgpack/v5` to our optimized fork `Basekick-Labs/msgpack/v6`. The fork reduces allocations in the decode path, resulting in lower GC pressure under sustained high-throughput ingestion.
+
+**Results (60s sustained load, 12 workers, Apple M3 Max):**
+
+| Metric | vmihailenco v5.4.1 | Basekick-Labs v6.0.0 |
+|--------|-------------------|---------------------|
+| Avg throughput | 16.78M rec/s | **18.23M rec/s** |
+| p50 latency | 0.52 ms | **0.47 ms** |
+| p99 latency | 3.72 ms | **3.58 ms** |
+| 60s degradation | 22% | **13%** |
+
+The flatter degradation curve means throughput stays more consistent over time instead of dropping as GC pressure accumulates
+
+## Observability
+
+### Slow Query Logging
+
+Configurable slow query detection with WARN-level logging and a Prometheus counter. When a query exceeds the threshold, Arc logs the SQL, execution time, row count, and token name — giving operators immediate visibility into queries that may need optimization.
+
+**Configuration:**
+```toml
+[query]
+slow_query_threshold_ms = 1000   # 0 = disabled (default)
+```
+
+Env var: `ARC_QUERY_SLOW_QUERY_THRESHOLD_MS`
+
+**Log output:**
+```
+WRN Slow query detected component=query-handler execution_time_ms=1250 row_count=500000 sql="SELECT * FROM ..." token_name=my-api-token
+```
+
+**Prometheus metric:** `arc_slow_queries_total` — counter incremented for each query exceeding the threshold.
+
+Covers all query paths: standard JSON, parallel JSON, measurement queries, and Arrow IPC JSON.
