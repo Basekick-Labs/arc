@@ -114,6 +114,9 @@ func executeArrowJSONQuery(
 		return -1, true
 	}
 
+	// Capture token name before async callback (Fiber context not safe in callbacks)
+	tokenName := getTokenName(c)
+
 	// Stream Arrow JSON response.
 	// SetBodyStreamWriter runs asynchronously — metrics are recorded in the callback.
 	c.Set("Content-Type", "application/json")
@@ -135,6 +138,7 @@ func executeArrowJSONQuery(
 			Int("row_count", rc).
 			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 			Msg("Arrow JSON query completed")
+		h.logSlowQuery(convertedSQL, start, rc, tokenName)
 	})
 
 	// Return 0 — actual row count is only known after async streaming completes.

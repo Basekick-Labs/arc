@@ -917,8 +917,8 @@ func main() {
 	}
 	importHandler.RegisterRoutes(server.GetApp())
 
-	// Register Query handler with dedicated query timeout
-	queryHandler := api.NewQueryHandler(db, storageBackend, logger.Get("query"), cfg.Query.Timeout)
+	// Register Query handler with dedicated query timeout and slow query logging
+	queryHandler := api.NewQueryHandler(db, storageBackend, logger.Get("query"), cfg.Query.Timeout, cfg.Query.SlowQueryThresholdMs)
 	if authManager != nil && rbacManager != nil {
 		queryHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}
