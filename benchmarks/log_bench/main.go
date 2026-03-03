@@ -32,7 +32,7 @@ import (
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/google/uuid"
 	"github.com/klauspost/compress/zstd"
-	"github.com/vmihailenco/msgpack/v5"
+	"github.com/Basekick-Labs/msgpack/v6"
 )
 
 // Target systems

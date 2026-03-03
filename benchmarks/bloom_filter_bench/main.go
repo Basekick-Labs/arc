@@ -28,7 +28,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/vmihailenco/msgpack/v5"
+	"github.com/Basekick-Labs/msgpack/v6"
 )
 
 // Log levels with realistic distribution

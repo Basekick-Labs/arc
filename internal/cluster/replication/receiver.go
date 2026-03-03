@@ -10,7 +10,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/cluster/protocol"
 	"github.com/rs/zerolog"
-	"github.com/vmihailenco/msgpack/v5"
+	"github.com/Basekick-Labs/msgpack/v6"
 )
 
 // WALWriter interface for writing to local WAL

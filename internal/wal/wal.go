@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
-	"github.com/vmihailenco/msgpack/v5"
+	"github.com/Basekick-Labs/msgpack/v6"
 )
 
 // WAL file format constants

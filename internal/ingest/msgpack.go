@@ -6,7 +6,7 @@ import (
 
 	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/rs/zerolog"
-	"github.com/vmihailenco/msgpack/v5"
+	"github.com/Basekick-Labs/msgpack/v6"
 )
 
 // MessagePackDecoder handles decoding of MessagePack binary protocol

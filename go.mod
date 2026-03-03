@@ -6,6 +6,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.20.0
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.13.1
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.6.3
+	github.com/Basekick-Labs/msgpack/v6 v6.0.0
 	github.com/ClickHouse/clickhouse-go/v2 v2.43.0
 	github.com/apache/arrow-go/v18 v18.4.1
 	github.com/aws/aws-sdk-go-v2 v1.40.0
@@ -26,7 +27,6 @@ require (
 	github.com/rs/zerolog v1.31.0
 	github.com/spf13/viper v1.18.2
 	github.com/stretchr/testify v1.11.1
-	github.com/vmihailenco/msgpack/v5 v5.4.1
 	golang.org/x/crypto v0.47.0
 	golang.org/x/sync v0.19.0
 )
