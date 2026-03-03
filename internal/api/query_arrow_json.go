@@ -15,7 +15,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/gofiber/fiber/v2"
 
-	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/metrics"
 )
@@ -116,10 +115,7 @@ func executeArrowJSONQuery(
 	}
 
 	// Capture token name before async callback (Fiber context not safe in callbacks)
-	tokenName := ""
-	if ti := auth.GetTokenInfo(c); ti != nil {
-		tokenName = ti.Name
-	}
+	tokenName := getTokenName(c)
 
 	// Stream Arrow JSON response.
 	// SetBodyStreamWriter runs asynchronously — metrics are recorded in the callback.

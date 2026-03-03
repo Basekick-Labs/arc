@@ -651,12 +651,22 @@ func (h *QueryHandler) logSlowQuery(sql string, start time.Time, rowCount int, t
 		return
 	}
 	metrics.Get().IncSlowQueries()
+	maskedSQL, _ := sqlutil.MaskStringLiterals(sql, sqlutil.HasQuotes(sql))
 	h.logger.Warn().
-		Str("sql", sql).
+		Str("sql", maskedSQL).
 		Float64("execution_time_ms", float64(elapsed.Milliseconds())).
 		Int("row_count", rowCount).
 		Str("token_name", tokenName).
 		Msg("Slow query detected")
+}
+
+// getTokenName extracts the token name from the Fiber context, or returns
+// empty string if auth is not configured or no token is present.
+func getTokenName(c *fiber.Ctx) string {
+	if ti := auth.GetTokenInfo(c); ti != nil {
+		return ti.Name
+	}
+	return ""
 }
 
 // SetAuthAndRBAC sets the auth and RBAC managers for permission checking
@@ -1225,10 +1235,7 @@ localProcessing:
 		}
 
 		// Capture token name before async callback (Fiber context not safe in callbacks)
-		tokenName := ""
-		if ti := auth.GetTokenInfo(c); ti != nil {
-			tokenName = ti.Name
-		}
+		tokenName := getTokenName(c)
 
 		// Stream typed JSON response directly to HTTP — no full-response buffering
 		c.Set("Content-Type", "application/json")
@@ -1379,10 +1386,7 @@ localProcessing:
 		}
 
 		// Capture token name before async callback (Fiber context not safe in callbacks)
-		tokenName := ""
-		if ti := auth.GetTokenInfo(c); ti != nil {
-			tokenName = ti.Name
-		}
+		tokenName := getTokenName(c)
 
 		// Stream typed JSON response directly to HTTP — no full-response buffering
 		c.Set("Content-Type", "application/json")
@@ -3037,10 +3041,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	}
 
 	// Capture token name before async callback (Fiber context not safe in callbacks)
-	tokenName := ""
-	if ti := auth.GetTokenInfo(c); ti != nil {
-		tokenName = ti.Name
-	}
+	tokenName := getTokenName(c)
 
 	// Stream typed JSON response directly to HTTP
 	c.Set("Content-Type", "application/json")
