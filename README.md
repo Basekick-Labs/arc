@@ -10,73 +10,68 @@
 [![Discord](https://img.shields.io/badge/discord-join-7289da?logo=discord)](https://discord.gg/nxnWfUxsdm)
 [![GitHub](https://img.shields.io/github/stars/basekick-labs/arc?style=social)](https://github.com/basekick-labs/arc)
 
-High-performance time-series database for Aerospace, Defense, and Industrial IoT. 18.6M records/sec. Satellite tracking, launch telemetry, ground stations, manufacturing, energy. DuckDB SQL + Parquet + Arrow. AGPL-3.0
+High-performance columnar analytical database. 10M+ records/sec ingestion, 6M+ rows/sec queries. Built on DuckDB + Parquet + Arrow. Use for product analytics, observability, AI agents, IoT, logs, or data warehousing. Single binary. No vendor lock-in. AGPL-3.0
 
 ---
 
 ## The Problem
 
-Aerospace, defense, and industrial systems generate massive telemetry at scale:
+Modern applications generate massive amounts of data that needs fast ingestion and analytical queries:
 
-* **Aerospace & Defense**: Satellite constellations, launch vehicles, ground stations, orbital tracking
-* **Space Operations**: 14K+ objects in orbit, TLE data, SGP4 propagation, conjunction analysis
-* **Industrial IoT**: Manufacturing telemetry, mining sensors, equipment monitoring
-* **Energy & Utilities**: Grid monitoring, smart meters, renewable output, pipeline sensors
-* **Transportation**: Racing telemetry, fleet tracking, logistics optimization
-* **Healthcare**: Patient monitoring, medical devices, clinical studies
+* **Product Analytics**: Events, clickstreams, user behavior, A/B testing
 * **Observability**: Metrics, logs, traces from distributed systems
+* **AI Agent Memory**: Conversation history, context, RAG, embeddings
+* **Industrial IoT**: Manufacturing telemetry, sensors, equipment monitoring
+* **Security & Compliance**: Audit logs, SIEM, security events
+* **Data Warehousing**: Analytics, BI, reporting on time-series or event data
 
-Traditional time-series databases weren't built for aerospace workloads:
-- ITAR compliance requires self-hosted infrastructure
-- Mission-critical systems can't risk vendor lock-in
-- Burst ingestion during satellite passes (10M+ metrics/sec → silence → burst)
-- Multi-decade retention for space missions
-- Sub-second queries for real-time decision making
+Traditional solutions have problems:
+- **Expensive**: Cloud data warehouses cost thousands per month at scale
+- **Complex**: ClickHouse/Druid require cluster management expertise
+- **Vendor lock-in**: Proprietary formats trap your data
+- **Slow ingestion**: Most analytical DBs struggle with high-throughput writes
+- **Overkill**: Need simple deployment, not Kubernetes orchestration
 
-**Arc solves this: 18.6M records/sec ingestion, sub-second queries on billions of rows, portable Parquet files you own, ITAR-ready self-hosted deployment.**
+**Arc solves this: 10M+ records/sec ingestion, 6M+ rows/sec queries, portable Parquet files you own, single binary deployment.**
 
 ```sql
--- Track satellite orbital elements over time
+-- Product analytics: user events
 SELECT
-  satellite_id,
-  norad_id,
-  epoch,
-  inclination,
-  eccentricity,
-  mean_motion,
-  LAG(mean_motion) OVER (PARTITION BY satellite_id ORDER BY epoch) as prev_mean_motion,
-  mean_motion - LAG(mean_motion) OVER (PARTITION BY satellite_id ORDER BY epoch) as orbital_decay
-FROM tle.satellites
-WHERE satellite_id LIKE 'Starlink%'
-  AND epoch > NOW() - INTERVAL '30 days'
-ORDER BY satellite_id, epoch DESC;
+  user_id,
+  event_type,
+  COUNT(*) as event_count,
+  COUNT(DISTINCT session_id) as sessions
+FROM analytics.events
+WHERE timestamp > NOW() - INTERVAL '7 days'
+  AND event_type IN ('page_view', 'click', 'purchase')
+GROUP BY user_id, event_type
+HAVING COUNT(*) > 100;
 
--- Analyze ground station contact windows
+-- Observability: error rate by service
 SELECT
-  ground_station_id,
-  satellite_id,
-  MAX(signal_strength) as peak_signal,
-  AVG(data_rate) as avg_throughput,
-  SUM(bytes_received) as total_data
-FROM telemetry.contacts
-WHERE contact_start > NOW() - INTERVAL '24 hours'
-GROUP BY ground_station_id, satellite_id
-HAVING AVG(data_rate) > 1000000;  -- 1 Mbps minimum
-
--- Industrial equipment monitoring
-SELECT
-  device_id,
-  facility_name,
-  AVG(temperature) OVER (
-    PARTITION BY device_id
-    ORDER BY timestamp
-    ROWS BETWEEN 10 PRECEDING AND CURRENT ROW
-  ) as temp_moving_avg,
-  MAX(pressure) as peak_pressure
-FROM iot.sensors
+  service_name,
+  DATE_TRUNC('hour', timestamp) as hour,
+  COUNT(*) as total_requests,
+  SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END) as errors,
+  (SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END)::FLOAT / COUNT(*)) * 100 as error_rate
+FROM logs.http_requests
 WHERE timestamp > NOW() - INTERVAL '24 hours'
-  AND facility_id IN ('plant_7', 'mining_site_42')
-HAVING MAX(pressure) > 850;
+GROUP BY service_name, hour
+HAVING error_rate > 1.0;
+
+-- AI agent memory: conversation search
+SELECT
+  agent_id,
+  conversation_id,
+  user_message,
+  assistant_response,
+  created_at
+FROM ai.conversations
+WHERE agent_id = 'support-bot-v2'
+  AND created_at > NOW() - INTERVAL '30 days'
+  AND user_message ILIKE '%refund%'
+ORDER BY created_at DESC
+LIMIT 100;
 ```
 
 **Standard DuckDB SQL. Window functions, CTEs, joins. No proprietary query language.**
@@ -84,15 +79,14 @@ HAVING MAX(pressure) > 850;
 ---
 
 ## **Live Demo**
-See Arc tracking 14,273 satellites in real-time:
-🛰️ [https://basekick.net/demos/satellite-tracking](https://basekick.net/demos/satellite-tracking)
+See Arc in action: [https://basekick.net/demos](https://basekick.net/demos)
 
 ---
 
 ## Performance
 
 Benchmarked on Apple MacBook Pro M3 Max (14 cores, 36GB RAM, 1TB NVMe).
-Test config: 12 concurrent workers, 1000-record batches, IoT sensor data.
+Test config: 12 concurrent workers, 1000-record batches, columnar data.
 
 ### Ingestion
 
@@ -221,7 +215,7 @@ go build -tags=duckdb_arrow ./cmd/arc
 |------|-------------|------|
 | **VS Code Extension** | Browse databases, run queries, visualize results | [Marketplace](https://marketplace.visualstudio.com/items?itemName=basekick-labs.arc-db-manager) |
 | **Grafana Data Source** | Native Grafana plugin for dashboards and alerting | [GitHub](https://github.com/Basekick-Labs/grafana-arc-datasource) |
-| **Telegraf Output Plugin** | Ship metrics from 300+ Telegraf inputs directly to Arc | [Docs](https://docs.influxdata.com/telegraf/v1/output-plugins/arc/) |
+| **Telegraf Output Plugin** | Ship data from 300+ Telegraf inputs directly to Arc | [Docs](https://docs.influxdata.com/telegraf/v1/output-plugins/arc/) |
 | **Python SDK** | Query and ingest from Python applications | [PyPI](https://pypi.org/project/arc-tsdb-client/) |
 | **Superset Dialect (JSON)** | Apache Superset connector using JSON transport | [GitHub](https://github.com/Basekick-Labs/arc-superset-dialect) |
 | **Superset Dialect (Arrow)** | Apache Superset connector using Arrow transport | [GitHub](https://github.com/Basekick-Labs/arc-superset-arrow) |
@@ -229,6 +223,10 @@ go build -tags=duckdb_arrow ./cmd/arc
 ---
 
 ## Features
+
+### Core Capabilities
+- **Columnar storage**: Parquet format with DuckDB query engine
+- **Multi-use-case**: Product analytics, observability, AI, IoT, logs, data warehousing
 
 - **Ingestion**: MessagePack columnar (fastest), InfluxDB Line Protocol
 - **Query**: DuckDB SQL engine, JSON and Apache Arrow IPC responses
