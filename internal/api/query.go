@@ -3061,7 +3061,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 			Int("row_count", rowCount).
 			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 			Msg("Measurement query completed")
-		h.logSlowQuery(sql, start, rowCount, tokenName)
+		h.logSlowQuery(convertedSQL, start, rowCount, tokenName)
 	})
 	return nil
 }
