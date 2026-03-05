@@ -30,8 +30,8 @@ type TokenInfo struct {
 	Permissions []string  `json:"permissions"`
 	CreatedAt   time.Time `json:"created_at"`
 	LastUsedAt  time.Time `json:"last_used_at,omitempty"`
-	Enabled     bool      `json:"enabled"`
-	ExpiresAt   time.Time `json:"expires_at,omitempty"`
+	Enabled     bool       `json:"enabled"`
+	ExpiresAt   *time.Time `json:"expires_at"`
 }
 
 // cacheEntry represents a cached token
@@ -508,7 +508,7 @@ func (am *AuthManager) VerifyToken(token string) *TokenInfo {
 			info.LastUsedAt = lastUsedAt.Time
 		}
 		if expiresAt.Valid {
-			info.ExpiresAt = expiresAt.Time
+			info.ExpiresAt = &expiresAt.Time
 		}
 
 		// Add to cache
@@ -597,7 +597,7 @@ func (am *AuthManager) ListTokens() ([]TokenInfo, error) {
 			info.LastUsedAt = lastUsedAt.Time
 		}
 		if expiresAt.Valid {
-			info.ExpiresAt = expiresAt.Time
+			info.ExpiresAt = &expiresAt.Time
 		}
 
 		tokens = append(tokens, info)
@@ -645,7 +645,7 @@ func (am *AuthManager) GetTokenByID(id int64) (*TokenInfo, error) {
 		info.LastUsedAt = lastUsedAt.Time
 	}
 	if expiresAt.Valid {
-		info.ExpiresAt = expiresAt.Time
+		info.ExpiresAt = &expiresAt.Time
 	}
 
 	return info, nil
