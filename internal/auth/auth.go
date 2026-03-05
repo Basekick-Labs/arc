@@ -31,7 +31,7 @@ type TokenInfo struct {
 	CreatedAt   time.Time `json:"created_at"`
 	LastUsedAt  time.Time `json:"last_used_at,omitempty"`
 	Enabled     bool       `json:"enabled"`
-	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+	ExpiresAt   *time.Time `json:"expires_at"`
 }
 
 // cacheEntry represents a cached token
