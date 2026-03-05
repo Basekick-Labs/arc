@@ -88,3 +88,9 @@ WRN Slow query detected component=query-handler execution_time_ms=1250 row_count
 **Prometheus metric:** `arc_slow_queries_total` — counter incremented for each query exceeding the threshold.
 
 Covers all query paths: standard JSON, parallel JSON, measurement queries, and Arrow IPC JSON.
+
+## Bug Fixes
+
+### Token Expiration Display Fix
+
+Fixed non-expiring admin tokens incorrectly showing as "Expired" in the UI. The `TokenInfo.ExpiresAt` field used Go's `time.Time` zero value (`0001-01-01T00:00:00Z`) for tokens without expiration, which was serialized to JSON and interpreted as an expired date. Changed `ExpiresAt` from `time.Time` to `*time.Time` so non-expiring tokens serialize as `null` and are correctly displayed as "Never expires".
