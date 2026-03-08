@@ -32,7 +32,7 @@ Traditional solutions have problems:
 - **Slow ingestion**: Most analytical DBs struggle with high-throughput writes
 - **Overkill**: Need simple deployment, not Kubernetes orchestration
 
-**Arc solves this: 10M+ records/sec ingestion, 6M+ rows/sec queries, portable Parquet files you own, single binary deployment.**
+**Arc solves this: 18M+ records/sec ingestion, 6M+ rows/sec queries, portable Parquet files you own, single binary deployment.**
 
 ```sql
 -- Product analytics: user events
