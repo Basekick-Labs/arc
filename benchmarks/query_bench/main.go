@@ -2,9 +2,9 @@
 // Usage: go run benchmarks/query_bench.go [flags]
 //
 // Examples:
-//   go run benchmarks/query_bench.go --query "SELECT * FROM production.cpu LIMIT 100000"
-//   go run benchmarks/query_bench.go --format arrow --query "SELECT * FROM production.cpu LIMIT 500000"
-//   go run benchmarks/query_bench.go --iterations 10 --format json
+//   go run benchmarks/query_bench/main.go --database production --query "SELECT * FROM cpu LIMIT 100000"
+//   go run benchmarks/query_bench/main.go --database production --format arrow --query "SELECT * FROM cpu LIMIT 500000"
+//   go run benchmarks/query_bench/main.go --iterations 10 --format json
 
 package main
 
@@ -154,7 +154,7 @@ func runQuery(cfg *Config, client *http.Client) (latencyMs float64, respBytes in
 func main() {
 	cfg := Config{}
 
-	flag.StringVar(&cfg.Query, "query", "SELECT * FROM production.cpu LIMIT 100000", "SQL query to execute")
+	flag.StringVar(&cfg.Query, "query", "SELECT * FROM cpu LIMIT 100000", "SQL query to execute (use table name only, database set via --database)")
 	flag.StringVar(&cfg.Format, "format", "both", "Response format: json, arrow, or both")
 	flag.IntVar(&cfg.Iterations, "iterations", 5, "Number of iterations per format")
 	flag.Int64Var(&cfg.Rows, "rows", 0, "Expected row count (for throughput calculation, 0=auto-detect from JSON)")

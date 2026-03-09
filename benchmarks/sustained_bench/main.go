@@ -12,20 +12,24 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/klauspost/compress/zstd"
 	"github.com/Basekick-Labs/msgpack/v6"
+	"github.com/klauspost/compress/zstd"
 )
 
 type Config struct {
@@ -40,6 +44,7 @@ type Config struct {
 	Host        string
 	Port        int
 	Token       string
+	TLS         bool
 }
 
 type Stats struct {
@@ -283,11 +288,11 @@ func generateRacingBatches(count, batchSize int, compress string, zstdLevel int)
 			carNumberVals[j] = carNumbers[idx]
 			driverVals[j] = drivers[idx]
 			speed[j] = roundTo(50+rand.Float64()*300, 1)      // 50-350 km/h
-			engineRPM[j] = 8000 + rand.Intn(7000)              // 8000-15000 RPM
-			throttle[j] = roundTo(rand.Float64()*100, 1)       // 0-100%
-			brake[j] = roundTo(rand.Float64()*100, 1)          // 0-100%
-			steering[j] = roundTo(-180+rand.Float64()*360, 1)  // -180 to 180 degrees
-			gear[j] = 1 + rand.Intn(8)                 // 1-8
+			engineRPM[j] = 8000 + rand.Intn(7000)             // 8000-15000 RPM
+			throttle[j] = roundTo(rand.Float64()*100, 1)      // 0-100%
+			brake[j] = roundTo(rand.Float64()*100, 1)         // 0-100%
+			steering[j] = roundTo(-180+rand.Float64()*360, 1) // -180 to 180 degrees
+			gear[j] = 1 + rand.Intn(8)                        // 1-8
 		}
 
 		payload := map[string]interface{}{
@@ -367,13 +372,13 @@ func generateEnergyBatches(count, batchSize int, compress string, zstdLevel int)
 			times[j] = nowMicros + int64(j)
 			turbineIDVals[j] = turbineIDs[rand.Intn(len(turbineIDs))]
 			farmVals[j] = farms[rand.Intn(len(farms))]
-			windSpeed[j] = roundTo(2+rand.Float64()*23, 1)         // 2-25 m/s
-			windDirection[j] = roundTo(rand.Float64()*360, 1)       // 0-360 degrees
-			rotorRPM[j] = roundTo(5+rand.Float64()*15, 1)          // 5-20 RPM
-			powerOutput[j] = roundTo(rand.Float64()*5000, 1)       // 0-5000 kW (5MW turbine)
-			bladePitch[j] = roundTo(rand.Float64()*25, 1)          // 0-25 degrees
-			nacelleTemp[j] = roundTo(15+rand.Float64()*45, 1)      // 15-60 C
-			generatorTemp[j] = roundTo(40+rand.Float64()*60, 1)    // 40-100 C
+			windSpeed[j] = roundTo(2+rand.Float64()*23, 1)      // 2-25 m/s
+			windDirection[j] = roundTo(rand.Float64()*360, 1)   // 0-360 degrees
+			rotorRPM[j] = roundTo(5+rand.Float64()*15, 1)       // 5-20 RPM
+			powerOutput[j] = roundTo(rand.Float64()*5000, 1)    // 0-5000 kW (5MW turbine)
+			bladePitch[j] = roundTo(rand.Float64()*25, 1)       // 0-25 degrees
+			nacelleTemp[j] = roundTo(15+rand.Float64()*45, 1)   // 15-60 C
+			generatorTemp[j] = roundTo(40+rand.Float64()*60, 1) // 40-100 C
 		}
 
 		payload := map[string]interface{}{
@@ -510,28 +515,28 @@ func generateIndustrialBatches(count, batchSize int, compress string, zstdLevel 
 		pumpIDVals := make([]string, batchSize)
 		facilityVals := make([]string, batchSize)
 		pumpTypeVals := make([]string, batchSize)
-		flowRate := make([]float64, batchSize)      // GPM
-		pressureIn := make([]float64, batchSize)    // PSI
-		pressureOut := make([]float64, batchSize)   // PSI
-		temperature := make([]float64, batchSize)   // Celsius
-		vibration := make([]float64, batchSize)     // mm/s
-		current := make([]float64, batchSize)       // Amps
-		rpm := make([]int, batchSize)               // RPM
-		power := make([]float64, batchSize)         // kW
+		flowRate := make([]float64, batchSize)    // GPM
+		pressureIn := make([]float64, batchSize)  // PSI
+		pressureOut := make([]float64, batchSize) // PSI
+		temperature := make([]float64, batchSize) // Celsius
+		vibration := make([]float64, batchSize)   // mm/s
+		current := make([]float64, batchSize)     // Amps
+		rpm := make([]int, batchSize)             // RPM
+		power := make([]float64, batchSize)       // kW
 
 		for j := 0; j < batchSize; j++ {
 			times[j] = nowMicros + int64(j)
 			pumpIDVals[j] = pumpIDs[rand.Intn(len(pumpIDs))]
 			facilityVals[j] = facilities[rand.Intn(len(facilities))]
 			pumpTypeVals[j] = pumpTypes[rand.Intn(len(pumpTypes))]
-			flowRate[j] = roundTo(50+rand.Float64()*450, 1)       // 50-500 GPM
-			pressureIn[j] = roundTo(10+rand.Float64()*40, 1)      // 10-50 PSI inlet
-			pressureOut[j] = roundTo(100+rand.Float64()*400, 1)   // 100-500 PSI outlet
-			temperature[j] = roundTo(20+rand.Float64()*60, 1)     // 20-80 C
-			vibration[j] = roundTo(rand.Float64()*10, 2)          // 0-10 mm/s
-			current[j] = roundTo(10+rand.Float64()*90, 1)         // 10-100 Amps
-			rpm[j] = 1000 + rand.Intn(2500)                       // 1000-3500 RPM
-			power[j] = roundTo(5+rand.Float64()*95, 1)            // 5-100 kW
+			flowRate[j] = roundTo(50+rand.Float64()*450, 1)     // 50-500 GPM
+			pressureIn[j] = roundTo(10+rand.Float64()*40, 1)    // 10-50 PSI inlet
+			pressureOut[j] = roundTo(100+rand.Float64()*400, 1) // 100-500 PSI outlet
+			temperature[j] = roundTo(20+rand.Float64()*60, 1)   // 20-80 C
+			vibration[j] = roundTo(rand.Float64()*10, 2)        // 0-10 mm/s
+			current[j] = roundTo(10+rand.Float64()*90, 1)       // 10-100 Amps
+			rpm[j] = 1000 + rand.Intn(2500)                     // 1000-3500 RPM
+			power[j] = roundTo(5+rand.Float64()*95, 1)          // 5-100 kW
 		}
 
 		payload := map[string]interface{}{
@@ -669,11 +674,16 @@ func worker(id int, cfg *Config, batches [][]byte, stats *Stats, client *http.Cl
 	var url string
 	var contentType string
 
+	scheme := "http"
+	if cfg.TLS {
+		scheme = "https"
+	}
+
 	if cfg.Protocol == "lineprotocol" {
-		url = fmt.Sprintf("http://%s:%d/api/v1/write", cfg.Host, cfg.Port)
+		url = fmt.Sprintf("%s://%s:%d/api/v1/write", scheme, cfg.Host, cfg.Port)
 		contentType = "text/plain"
 	} else {
-		url = fmt.Sprintf("http://%s:%d/api/v1/write/msgpack", cfg.Host, cfg.Port)
+		url = fmt.Sprintf("%s://%s:%d/api/v1/write/msgpack", scheme, cfg.Host, cfg.Port)
 		contentType = "application/msgpack"
 	}
 
@@ -746,6 +756,7 @@ func main() {
 	flag.StringVar(&cfg.Protocol, "protocol", "msgpack", "Protocol: msgpack, lineprotocol")
 	flag.StringVar(&cfg.Host, "host", "localhost", "Server host")
 	flag.IntVar(&cfg.Port, "port", 8000, "Server port")
+	flag.BoolVar(&cfg.TLS, "tls", false, "Use HTTPS instead of HTTP")
 	flag.Parse()
 
 	cfg.Token = os.Getenv("ARC_TOKEN")
@@ -781,7 +792,11 @@ func main() {
 	fmt.Println("================================================================================")
 	fmt.Printf("SUSTAINED LOAD TEST - GO CLIENT (%s)\n", compressLabel)
 	fmt.Println("================================================================================")
-	fmt.Printf("Target: http://%s:%d%s\n", cfg.Host, cfg.Port, endpoint)
+	scheme := "http"
+	if cfg.TLS {
+		scheme = "https"
+	}
+	fmt.Printf("Target: %s://%s:%d%s\n", scheme, cfg.Host, cfg.Port, endpoint)
 	fmt.Printf("Protocol: %s\n", protocolLabel)
 	fmt.Printf("Data type: %s\n", dataTypeLabel)
 	fmt.Printf("Duration: %ds\n", cfg.Duration)
@@ -834,15 +849,27 @@ func main() {
 	}
 
 	// Create HTTP client with connection pooling
+	transport := &http.Transport{
+		MaxIdleConns:        cfg.Workers + 50,
+		MaxIdleConnsPerHost: cfg.Workers + 50,
+		MaxConnsPerHost:     cfg.Workers + 50,
+		IdleConnTimeout:     30 * time.Second,
+		DisableKeepAlives:   false,
+	}
+	if cfg.TLS {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+	// Resolve *.localhost to 127.0.0.1 (browsers do this per RFC 6761, Go doesn't)
+	if strings.HasSuffix(cfg.Host, ".localhost") {
+		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			_, port, _ := net.SplitHostPort(addr)
+			return dialer.DialContext(ctx, network, net.JoinHostPort("127.0.0.1", port))
+		}
+	}
 	client := &http.Client{
-		Transport: &http.Transport{
-			MaxIdleConns:        cfg.Workers + 50,
-			MaxIdleConnsPerHost: cfg.Workers + 50,
-			MaxConnsPerHost:     cfg.Workers + 50,
-			IdleConnTimeout:     30 * time.Second,
-			DisableKeepAlives:   false,
-		},
-		Timeout: 120 * time.Second,
+		Transport: transport,
+		Timeout:   120 * time.Second,
 	}
 
 	// Run benchmark

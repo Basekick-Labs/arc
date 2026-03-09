@@ -29,9 +29,9 @@ const (
 
 // Test queries of varying complexity
 var testQueries = []struct {
-	name      string
-	duckSQL   string // SQL for direct DuckDB (with read_parquet)
-	arcSQL    string // SQL for Arc API (table name)
+	name    string
+	duckSQL string // SQL for direct DuckDB (with read_parquet)
+	arcSQL  string // SQL for Arc API (table name)
 }{
 	{
 		name:    "Q1: Simple COUNT",
