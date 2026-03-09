@@ -645,7 +645,7 @@ func (h *DeleteHandler) getQueryPath(relativePath string) string {
 	case *storage.LocalBackend:
 		return filepath.Join(backend.GetBasePath(), relativePath)
 	case *storage.S3Backend:
-		return fmt.Sprintf("s3://%s/%s", backend.GetBucket(), relativePath)
+		return fmt.Sprintf("s3://%s/%s%s", backend.GetBucket(), backend.GetPrefix(), relativePath)
 	default:
 		return relativePath
 	}
