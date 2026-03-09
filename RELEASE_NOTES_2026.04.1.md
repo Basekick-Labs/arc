@@ -89,6 +89,30 @@ WRN Slow query detected component=query-handler execution_time_ms=1250 row_count
 
 Covers all query paths: standard JSON, parallel JSON, measurement queries, and Arrow IPC JSON.
 
+## Dependencies
+
+### DuckDB 1.4.3 → 1.4.4
+
+Upgraded the DuckDB query engine (`duckdb-go` v2.5.4 → v2.5.5). Key fixes:
+
+- **Parquet UTF-8 string stats tolerance** — Invalid UTF-8 in string statistics now tolerated instead of throwing errors, preventing query failures on data with non-UTF-8 characters
+- **Arrow string view pushdown fix** — Correctness fix for the native Arrow query path, preventing incorrect varchar filter pushdown
+- **`date_trunc` stat propagation** — Corrected statistics calculation for date truncation, improving row group skipping on time-based queries
+- **`mode()` use-after-free** — Memory safety fix for the `mode()` aggregate function
+- **RadixPartitionedHashTable stability** — Defensive fixes for GROUP BY operations under concurrent load
+- **Secret secure clear** — S3/Azure credentials properly cleared from memory after use
+- **httpfs upstream fixes** — Improved S3 connection stability
+- **Pragma input sanitization** — Defense in depth against malformed pragma inputs
+
+### Arrow Go v18.5.1 → v18.5.2
+
+Upgraded the Apache Arrow columnar format library. Key fixes:
+
+- **Large string Parquet writes** — Fixed serialization of strings exceeding certain size thresholds, preventing potential data corruption on large log messages or JSON payloads
+- **Decompression regression** — Restored proper Parquet decompression that had degraded in a prior release
+- **Reduced GC pressure** — Fewer object allocations in hot paths, benefiting high-throughput ingestion
+- **Empty binary value handling** — Fixed edge case in BinaryBuilder for empty string values
+
 ## Bug Fixes
 
 ### Token Expiration Display Fix
