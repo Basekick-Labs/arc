@@ -104,7 +104,7 @@ Upgraded the DuckDB query engine (`duckdb-go` v2.5.4 → v2.5.5). Key fixes:
 - **httpfs upstream fixes** — Improved S3 connection stability
 - **Pragma input sanitization** — Defense in depth against malformed pragma inputs
 
-### Arrow Go v18.5.1 → v18.5.2
+### Arrow Go v18.4.1 → v18.5.2
 
 Upgraded the Apache Arrow columnar format library. Key fixes:
 
