@@ -21,8 +21,8 @@ import (
 type RetentionHandler struct {
 	storage storage.Backend
 	config  *config.RetentionConfig
-	db      *sql.DB           // SQLite for policy metadata
-	duckdb  *database.DuckDB  // Shared DuckDB for parquet queries
+	db      *sql.DB          // SQLite for policy metadata
+	duckdb  *database.DuckDB // Shared DuckDB for parquet queries
 	logger  zerolog.Logger
 }
 

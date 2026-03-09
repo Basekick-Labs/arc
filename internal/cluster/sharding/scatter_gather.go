@@ -43,12 +43,12 @@ type ScatterGather struct {
 
 // ShardQueryResult represents the result from a single shard query.
 type ShardQueryResult struct {
-	ShardID  int                 `json:"shard_id"`
-	NodeID   string              `json:"node_id"`
-	Data     json.RawMessage     `json:"data,omitempty"`
-	Error    string              `json:"error,omitempty"`
-	Duration time.Duration       `json:"duration_ms"`
-	Status   int                 `json:"status"`
+	ShardID  int             `json:"shard_id"`
+	NodeID   string          `json:"node_id"`
+	Data     json.RawMessage `json:"data,omitempty"`
+	Error    string          `json:"error,omitempty"`
+	Duration time.Duration   `json:"duration_ms"`
+	Status   int             `json:"status"`
 }
 
 // ScatterGatherResult represents the combined result from all shards.
@@ -383,9 +383,9 @@ func (sg *ScatterGather) NeedsFanout(databases []string) bool {
 // Stats returns scatter-gather statistics.
 func (sg *ScatterGather) Stats() map[string]interface{} {
 	return map[string]interface{}{
-		"num_shards":           sg.cfg.ShardMap.NumShards(),
-		"max_concurrent":       sg.cfg.MaxConcurrentShards,
-		"timeout_ms":           sg.cfg.Timeout.Milliseconds(),
+		"num_shards":     sg.cfg.ShardMap.NumShards(),
+		"max_concurrent": sg.cfg.MaxConcurrentShards,
+		"timeout_ms":     sg.cfg.Timeout.Milliseconds(),
 	}
 }
 

@@ -74,8 +74,13 @@ func TestSubscription_Validate(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "too_many_topics",
-			modify:  func(s *Subscription) { s.Topics = make([]string, MaxTopics+1); for i := range s.Topics { s.Topics[i] = "topic" } },
+			name: "too_many_topics",
+			modify: func(s *Subscription) {
+				s.Topics = make([]string, MaxTopics+1)
+				for i := range s.Topics {
+					s.Topics[i] = "topic"
+				}
+			},
 			wantErr: true,
 		},
 		{

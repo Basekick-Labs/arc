@@ -14,19 +14,19 @@ import (
 
 	"github.com/basekick-labs/arc/internal/api"
 	"github.com/basekick-labs/arc/internal/audit"
-	"github.com/basekick-labs/arc/internal/backup"
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/backup"
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/compaction"
 	"github.com/basekick-labs/arc/internal/config"
-	"github.com/basekick-labs/arc/internal/governance"
 	"github.com/basekick-labs/arc/internal/database"
-	"github.com/basekick-labs/arc/internal/queryregistry"
+	"github.com/basekick-labs/arc/internal/governance"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/logger"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/mqtt"
+	"github.com/basekick-labs/arc/internal/queryregistry"
 	"github.com/basekick-labs/arc/internal/scheduler"
 	"github.com/basekick-labs/arc/internal/shutdown"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -1516,4 +1516,3 @@ func runCompactSubcommand(args []string) {
 		os.Exit(1)
 	}
 }
-

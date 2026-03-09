@@ -19,12 +19,12 @@ type ColumnarRecoveryCallback func(ctx context.Context, database, measurement st
 
 // RecoveryStats holds statistics about WAL recovery
 type RecoveryStats struct {
-	RecoveredFiles    int
-	RecoveredBatches  int
-	RecoveredEntries  int
-	CorruptedEntries  int
-	SkippedFiles      int
-	RecoveryDuration  time.Duration
+	RecoveredFiles   int
+	RecoveredBatches int
+	RecoveredEntries int
+	CorruptedEntries int
+	SkippedFiles     int
+	RecoveryDuration time.Duration
 }
 
 // RecoveryOptions configures WAL recovery behavior

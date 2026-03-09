@@ -27,11 +27,11 @@ type Manager struct {
 
 // ManagerConfig holds configuration for creating a backup manager.
 type ManagerConfig struct {
-	DataStorage   storage.Backend
-	BackupPath    string // local directory for backups
-	SQLiteDBPath  string
-	ConfigPath    string
-	Logger        zerolog.Logger
+	DataStorage  storage.Backend
+	BackupPath   string // local directory for backups
+	SQLiteDBPath string
+	ConfigPath   string
+	Logger       zerolog.Logger
 }
 
 // NewManager creates a new backup manager.

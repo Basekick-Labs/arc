@@ -33,7 +33,7 @@ func TestBufferFlushTimingUnderLoad(t *testing.T) {
 	// Configure similar to production
 	maxBufferAgeMS := 5000
 	cfg := &config.IngestConfig{
-		MaxBufferSize:  100000,        // Lower to trigger size flushes faster
+		MaxBufferSize:  100000,         // Lower to trigger size flushes faster
 		MaxBufferAgeMS: maxBufferAgeMS, // 5 seconds
 		FlushWorkers:   8,              // More workers like production
 		FlushQueueSize: 20,

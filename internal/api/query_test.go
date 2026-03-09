@@ -255,7 +255,7 @@ func TestConvertSQLWithCTE(t *testing.T) {
 			shouldContain: []string{
 				"read_parquet('./data/mydb/t1/**/*.parquet'", // t1 converted
 				"read_parquet('./data/mydb/t2/**/*.parquet'", // t2 converted
-				"FROM a JOIN b",                               // CTE references preserved
+				"FROM a JOIN b", // CTE references preserved
 			},
 			shouldNotContain: []string{
 				"read_parquet('./data/default/a/",
@@ -296,7 +296,7 @@ func TestConvertSQLWithCTE(t *testing.T) {
 			inputSQL: "SELECT * FROM mydb.logs WHERE message = 'SELECT * FROM mydb.cpu'",
 			shouldContain: []string{
 				"read_parquet('./data/mydb/logs/**/*.parquet'", // logs table converted
-				"'SELECT * FROM mydb.cpu'",                      // string literal preserved
+				"'SELECT * FROM mydb.cpu'",                     // string literal preserved
 			},
 			shouldNotContain: []string{
 				"read_parquet('./data/mydb/cpu/", // cpu inside string should NOT be converted
@@ -639,8 +639,8 @@ func TestDangerousSQLPatterns(t *testing.T) {
 
 func TestShowDatabasesPattern(t *testing.T) {
 	tests := []struct {
-		name      string
-		sql       string
+		name        string
+		sql         string
 		shouldMatch bool
 	}{
 		{name: "basic", sql: "SHOW DATABASES", shouldMatch: true},
@@ -666,10 +666,10 @@ func TestShowDatabasesPattern(t *testing.T) {
 
 func TestShowTablesPattern(t *testing.T) {
 	tests := []struct {
-		name      string
-		sql       string
+		name        string
+		sql         string
 		shouldMatch bool
-		database  string
+		database    string
 	}{
 		{name: "basic tables", sql: "SHOW TABLES", shouldMatch: true, database: ""},
 		{name: "basic measurements", sql: "SHOW MEASUREMENTS", shouldMatch: true, database: ""},
@@ -771,8 +771,8 @@ func TestFormatNumber(t *testing.T) {
 
 func TestValidIdentifierPattern(t *testing.T) {
 	tests := []struct {
-		name      string
-		input     string
+		name        string
+		input       string
 		shouldMatch bool
 	}{
 		// Valid
@@ -931,19 +931,21 @@ type mockLocalBackend struct {
 	basePath string
 }
 
-func (m *mockLocalBackend) GetBasePath() string                                            { return m.basePath }
-func (m *mockLocalBackend) Write(ctx context.Context, path string, data []byte) error      { return nil }
+func (m *mockLocalBackend) GetBasePath() string                                       { return m.basePath }
+func (m *mockLocalBackend) Write(ctx context.Context, path string, data []byte) error { return nil }
 func (m *mockLocalBackend) WriteReader(ctx context.Context, path string, r io.Reader, size int64) error {
 	return nil
 }
-func (m *mockLocalBackend) Read(ctx context.Context, path string) ([]byte, error)          { return nil, nil }
-func (m *mockLocalBackend) ReadTo(ctx context.Context, path string, w io.Writer) error     { return nil }
-func (m *mockLocalBackend) List(ctx context.Context, prefix string) ([]string, error)      { return nil, nil }
-func (m *mockLocalBackend) Delete(ctx context.Context, path string) error                  { return nil }
-func (m *mockLocalBackend) Exists(ctx context.Context, path string) (bool, error)          { return false, nil }
-func (m *mockLocalBackend) Close() error                                                   { return nil }
-func (m *mockLocalBackend) Type() string                                                   { return "mock" }
-func (m *mockLocalBackend) ConfigJSON() string                                             { return "{}" }
+func (m *mockLocalBackend) Read(ctx context.Context, path string) ([]byte, error)      { return nil, nil }
+func (m *mockLocalBackend) ReadTo(ctx context.Context, path string, w io.Writer) error { return nil }
+func (m *mockLocalBackend) List(ctx context.Context, prefix string) ([]string, error) {
+	return nil, nil
+}
+func (m *mockLocalBackend) Delete(ctx context.Context, path string) error         { return nil }
+func (m *mockLocalBackend) Exists(ctx context.Context, path string) (bool, error) { return false, nil }
+func (m *mockLocalBackend) Close() error                                          { return nil }
+func (m *mockLocalBackend) Type() string                                          { return "mock" }
+func (m *mockLocalBackend) ConfigJSON() string                                    { return "{}" }
 
 func TestRewriteTimeBucket(t *testing.T) {
 	tests := []struct {

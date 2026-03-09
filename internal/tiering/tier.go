@@ -41,26 +41,26 @@ func TierFromString(s string) Tier {
 
 // FileMetadata represents metadata about a file in the tiering system
 type FileMetadata struct {
-	ID            int64     `json:"id"`
-	Path          string    `json:"path"`
-	Database      string    `json:"database"`
-	Measurement   string    `json:"measurement"`
-	PartitionTime time.Time `json:"partition_time"`
-	Tier          Tier      `json:"tier"`
-	SizeBytes     int64     `json:"size_bytes"`
-	CreatedAt     time.Time `json:"created_at"`
+	ID            int64      `json:"id"`
+	Path          string     `json:"path"`
+	Database      string     `json:"database"`
+	Measurement   string     `json:"measurement"`
+	PartitionTime time.Time  `json:"partition_time"`
+	Tier          Tier       `json:"tier"`
+	SizeBytes     int64      `json:"size_bytes"`
+	CreatedAt     time.Time  `json:"created_at"`
 	MigratedAt    *time.Time `json:"migrated_at,omitempty"`
 }
 
 // MigrationCandidate represents a file that is eligible for tier migration
 type MigrationCandidate struct {
-	Path          string    `json:"path"`
-	Database      string    `json:"database"`
-	Measurement   string    `json:"measurement"`
-	PartitionTime time.Time `json:"partition_time"`
-	SizeBytes     int64     `json:"size_bytes"`
-	CurrentTier   Tier      `json:"current_tier"`
-	TargetTier    Tier      `json:"target_tier"`
+	Path          string        `json:"path"`
+	Database      string        `json:"database"`
+	Measurement   string        `json:"measurement"`
+	PartitionTime time.Time     `json:"partition_time"`
+	SizeBytes     int64         `json:"size_bytes"`
+	CurrentTier   Tier          `json:"current_tier"`
+	TargetTier    Tier          `json:"target_tier"`
 	Age           time.Duration `json:"age"`
 }
 
@@ -95,11 +95,11 @@ type TierStats struct {
 
 // StatusResponse represents the tiering status API response
 type StatusResponse struct {
-	Enabled      bool                  `json:"enabled"`
-	LicenseValid bool                  `json:"license_valid"`
-	Reason       string                `json:"reason,omitempty"`
-	Tiers        map[string]TierStats  `json:"tiers,omitempty"`
-	Scheduler    *SchedulerStatus      `json:"scheduler,omitempty"`
+	Enabled      bool                 `json:"enabled"`
+	LicenseValid bool                 `json:"license_valid"`
+	Reason       string               `json:"reason,omitempty"`
+	Tiers        map[string]TierStats `json:"tiers,omitempty"`
+	Scheduler    *SchedulerStatus     `json:"scheduler,omitempty"`
 }
 
 // SchedulerStatus represents the migration scheduler status

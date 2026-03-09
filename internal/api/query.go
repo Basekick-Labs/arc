@@ -90,7 +90,6 @@ var (
 
 	// Pattern for extracting LIMIT clause value for result pre-allocation
 	patternLimit = regexp.MustCompile(`(?i)\bLIMIT\s+(\d+)\b`)
-
 )
 
 // arrowJSONQueryFunc is set by query_arrow_json.go init() when compiled with duckdb_arrow tag.
@@ -372,8 +371,8 @@ func parseTimeBucketOrigin(s string) (time.Time, error) {
 
 // sqlFeatures contains flags for what features are present in a SQL string
 type sqlFeatures struct {
-	hasQuotes      bool // single or double quotes
-	hasDashComment bool // -- comment
+	hasQuotes       bool // single or double quotes
+	hasDashComment  bool // -- comment
 	hasBlockComment bool // /* comment */
 }
 
@@ -397,7 +396,6 @@ func scanSQLFeatures(sql string) sqlFeatures {
 	}
 	return f
 }
-
 
 // stripSQLComments removes SQL comments from the query.
 // Handles: -- single line comments and /* multi-line comments */
@@ -456,15 +454,15 @@ func stripSQLComments(sql string, hasComments bool) string {
 
 // QueryHandler handles SQL query endpoints
 type QueryHandler struct {
-	db               *database.DuckDB
-	storage          storage.Backend
-	pruner           *pruning.PartitionPruner
-	queryCache       *database.QueryCache
-	logger           zerolog.Logger
-	authManager      AuthManager
-	rbacManager      RBACChecker
-	debugEnabled     bool // Cached check for debug logging to avoid repeated level checks
-	parallelExecutor *query.ParallelExecutor
+	db                 *database.DuckDB
+	storage            storage.Backend
+	pruner             *pruning.PartitionPruner
+	queryCache         *database.QueryCache
+	logger             zerolog.Logger
+	authManager        AuthManager
+	rbacManager        RBACChecker
+	debugEnabled       bool // Cached check for debug logging to avoid repeated level checks
+	parallelExecutor   *query.ParallelExecutor
 	queryTimeout       time.Duration // Query timeout (0 = no timeout)
 	slowQueryThreshold time.Duration // Slow query WARN threshold (0 = disabled)
 
@@ -3065,4 +3063,3 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	})
 	return nil
 }
-

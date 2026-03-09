@@ -11,15 +11,15 @@ import (
 
 // Config holds all configuration for Arc
 type Config struct {
-	Server     ServerConfig
-	Database   DatabaseConfig
-	Storage    StorageConfig
-	Ingest     IngestConfig
-	Cache      CacheConfig
-	Log        LogConfig
-	Auth       AuthConfig
-	Compaction CompactionConfig
-	WAL        WALConfig
+	Server          ServerConfig
+	Database        DatabaseConfig
+	Storage         StorageConfig
+	Ingest          IngestConfig
+	Cache           CacheConfig
+	Log             LogConfig
+	Auth            AuthConfig
+	Compaction      CompactionConfig
+	WAL             WALConfig
 	Telemetry       TelemetryConfig
 	Delete          DeleteConfig
 	Retention       RetentionConfig
@@ -42,8 +42,8 @@ type ServerConfig struct {
 	Port            int
 	ReadTimeout     int
 	WriteTimeout    int
-	IdleTimeout     int // Connection idle timeout in seconds
-	ShutdownTimeout int // Graceful shutdown timeout in seconds
+	IdleTimeout     int   // Connection idle timeout in seconds
+	ShutdownTimeout int   // Graceful shutdown timeout in seconds
 	MaxPayloadSize  int64 // Maximum request payload size in bytes (applies to both compressed and decompressed)
 	// TLS Configuration
 	TLSEnabled  bool   // Enable HTTPS/TLS
@@ -71,22 +71,22 @@ type StorageConfig struct {
 	S3PathStyle bool   // Use path-style addressing (required for MinIO)
 	S3Prefix    string // Path prefix within the bucket (e.g., "instances/abc123/")
 	// Azure Blob Storage configuration
-	AzureConnectionString  string // Connection string (simplest auth method)
-	AzureAccountName       string // Storage account name
-	AzureAccountKey        string // Storage account key
-	AzureSASToken          string // SAS token for scoped access
-	AzureContainer         string // Container name
-	AzureEndpoint          string // Custom endpoint (for Azurite testing)
+	AzureConnectionString   string // Connection string (simplest auth method)
+	AzureAccountName        string // Storage account name
+	AzureAccountKey         string // Storage account key
+	AzureSASToken           string // SAS token for scoped access
+	AzureContainer          string // Container name
+	AzureEndpoint           string // Custom endpoint (for Azurite testing)
 	AzureUseManagedIdentity bool   // Use managed identity (Azure-hosted deployments)
 }
 
 type IngestConfig struct {
-	MaxBufferSize     int    // Max records before flush
-	MaxBufferAgeMS    int    // Max age in milliseconds before flush
-	Compression       string // Parquet compression: snappy, gzip, zstd
-	UseDictionary     bool   // Use dictionary encoding
-	WriteStatistics   bool   // Write Parquet statistics
-	DataPageVersion   string // Parquet data page version: 1.0 or 2.0
+	MaxBufferSize       int      // Max records before flush
+	MaxBufferAgeMS      int      // Max age in milliseconds before flush
+	Compression         string   // Parquet compression: snappy, gzip, zstd
+	UseDictionary       bool     // Use dictionary encoding
+	WriteStatistics     bool     // Write Parquet statistics
+	DataPageVersion     string   // Parquet data page version: 1.0 or 2.0
 	FlushWorkers        int      // Number of workers for async flush (default: 2x CPU, min 8, max 64)
 	FlushQueueSize      int      // Capacity of flush task queue (default: 4x workers, min 100)
 	ShardCount          int      // Number of buffer shards for lock distribution (default: 32)
@@ -114,18 +114,18 @@ type AuthConfig struct {
 }
 
 type CompactionConfig struct {
-	Enabled           bool   // Enable compaction
-	HourlySchedule    string // Cron schedule for hourly compaction (default: "5 * * * *")
-	DailySchedule     string // Cron schedule for daily compaction (default: "0 3 * * *")
-	HourlyEnabled     bool   // Enable hourly tier
-	DailyEnabled      bool   // Enable daily tier
-	HourlyMinAgeHours int    // Minimum age for hourly compaction (default: 1)
-	HourlyMinFiles    int    // Minimum files for hourly compaction (default: 10)
-	DailyMinAgeHours  int    // Minimum age for daily compaction (default: 24)
-	DailyMinFiles             int // Minimum files for daily compaction (default: 12)
-	DailySkipFileAgeCheckDays int // Skip file creation time check for partitions older than N days (default: 7)
-	MaxConcurrent             int // Max concurrent compaction jobs (default: 2)
-	TempDirectory     string // Temporary directory for compaction files (default: ./data/compaction)
+	Enabled                   bool   // Enable compaction
+	HourlySchedule            string // Cron schedule for hourly compaction (default: "5 * * * *")
+	DailySchedule             string // Cron schedule for daily compaction (default: "0 3 * * *")
+	HourlyEnabled             bool   // Enable hourly tier
+	DailyEnabled              bool   // Enable daily tier
+	HourlyMinAgeHours         int    // Minimum age for hourly compaction (default: 1)
+	HourlyMinFiles            int    // Minimum files for hourly compaction (default: 10)
+	DailyMinAgeHours          int    // Minimum age for daily compaction (default: 24)
+	DailyMinFiles             int    // Minimum files for daily compaction (default: 12)
+	DailySkipFileAgeCheckDays int    // Skip file creation time check for partitions older than N days (default: 7)
+	MaxConcurrent             int    // Max concurrent compaction jobs (default: 2)
+	TempDirectory             string // Temporary directory for compaction files (default: ./data/compaction)
 }
 
 type WALConfig struct {
@@ -201,10 +201,10 @@ type SchedulerConfig struct {
 //
 // Data older than DefaultHotMaxAgeDays is automatically migrated to cold storage.
 type TieredStorageConfig struct {
-	Enabled              bool   // Enable tiered storage (requires enterprise license)
-	MigrationSchedule    string // Cron schedule for migrations (default: "0 2 * * *" = 2am daily)
-	MigrationMaxConcurrent int  // Max concurrent file migrations (default: 4)
-	MigrationBatchSize   int    // Files per migration batch (default: 100)
+	Enabled                bool   // Enable tiered storage (requires enterprise license)
+	MigrationSchedule      string // Cron schedule for migrations (default: "0 2 * * *" = 2am daily)
+	MigrationMaxConcurrent int    // Max concurrent file migrations (default: 4)
+	MigrationBatchSize     int    // Files per migration batch (default: 100)
 
 	// Single threshold: data older than this moves from hot to cold
 	DefaultHotMaxAgeDays int // Data older than this migrates to cold (default: 30)
@@ -231,14 +231,14 @@ type ColdTierConfig struct {
 	S3StorageClass string // S3 storage class (default: "GLACIER")
 
 	// Azure settings
-	AzureContainer         string // Azure container for archived data
-	AzureConnectionString  string // Connection string (simplest auth method)
-	AzureAccountName       string // Storage account name
-	AzureAccountKey        string // Storage account key
-	AzureSASToken          string // SAS token for scoped access
-	AzureEndpoint          string // Custom endpoint (for Azurite testing)
+	AzureContainer          string // Azure container for archived data
+	AzureConnectionString   string // Connection string (simplest auth method)
+	AzureAccountName        string // Storage account name
+	AzureAccountKey         string // Storage account key
+	AzureSASToken           string // SAS token for scoped access
+	AzureEndpoint           string // Custom endpoint (for Azurite testing)
 	AzureUseManagedIdentity bool   // Use managed identity (Azure-hosted deployments)
-	AzureAccessTier        string // Azure access tier (default: "Archive")
+	AzureAccessTier         string // Azure access tier (default: "Archive")
 
 	// Retrieval settings (for Glacier/Archive)
 	RetrievalMode string // Glacier retrieval mode: "standard", "expedited", "bulk" (default: "standard")
@@ -255,12 +255,12 @@ type AuditLogConfig struct {
 // GovernanceConfig holds configuration for query governance (Enterprise feature).
 // Provides per-token rate limiting and query quotas for resource predictability.
 type GovernanceConfig struct {
-	Enabled                 bool // Enable query governance (requires enterprise license with query_governance feature)
-	DefaultRateLimitPerMin  int  // Default rate limit per minute for all tokens (0 = unlimited)
-	DefaultRateLimitPerHour int  // Default rate limit per hour for all tokens (0 = unlimited)
-	DefaultMaxQueriesPerHour int // Default max queries per hour per token (0 = unlimited)
-	DefaultMaxQueriesPerDay  int // Default max queries per day per token (0 = unlimited)
-	DefaultMaxRowsPerQuery   int // Default max rows returned per query (0 = unlimited)
+	Enabled                  bool // Enable query governance (requires enterprise license with query_governance feature)
+	DefaultRateLimitPerMin   int  // Default rate limit per minute for all tokens (0 = unlimited)
+	DefaultRateLimitPerHour  int  // Default rate limit per hour for all tokens (0 = unlimited)
+	DefaultMaxQueriesPerHour int  // Default max queries per hour per token (0 = unlimited)
+	DefaultMaxQueriesPerDay  int  // Default max queries per day per token (0 = unlimited)
+	DefaultMaxRowsPerQuery   int  // Default max rows returned per query (0 = unlimited)
 }
 
 // QueryManagementConfig holds configuration for long-running query management (Enterprise feature).
@@ -304,14 +304,14 @@ type ClusterConfig struct {
 	HeartbeatTimeout  int // Heartbeat timeout before considering node dead (default: 5)
 
 	// Raft consensus configuration (Phase 3)
-	RaftDataDir          string // Directory for Raft data (default: ./data/raft)
-	RaftBindAddr         string // Address to bind Raft transport (default: ":9200")
-	RaftAdvertiseAddr    string // Address advertised to Raft peers (auto-detected if empty)
-	RaftBootstrap        bool   // Bootstrap a new Raft cluster (only for first node)
-	RaftElectionTimeout  int    // Election timeout in milliseconds (default: 1000)
-	RaftHeartbeatTimeout int    // Raft heartbeat timeout in milliseconds (default: 500)
-	RaftSnapshotInterval int    // Snapshot interval in seconds (default: 300)
-	RaftSnapshotThreshold int   // Number of logs before snapshot (default: 10000)
+	RaftDataDir           string // Directory for Raft data (default: ./data/raft)
+	RaftBindAddr          string // Address to bind Raft transport (default: ":9200")
+	RaftAdvertiseAddr     string // Address advertised to Raft peers (auto-detected if empty)
+	RaftBootstrap         bool   // Bootstrap a new Raft cluster (only for first node)
+	RaftElectionTimeout   int    // Election timeout in milliseconds (default: 1000)
+	RaftHeartbeatTimeout  int    // Raft heartbeat timeout in milliseconds (default: 500)
+	RaftSnapshotInterval  int    // Snapshot interval in seconds (default: 300)
+	RaftSnapshotThreshold int    // Number of logs before snapshot (default: 10000)
 
 	// Request routing configuration (Phase 3)
 	RouteTimeout int // Timeout for forwarded requests in milliseconds (default: 5000)
@@ -331,9 +331,9 @@ type ClusterConfig struct {
 	ShardingRouteTimeout      int    // Timeout for shard routing in milliseconds (default: 5000)
 
 	// Writer failover configuration (Phase 3)
-	FailoverEnabled        bool // Enable automatic writer failover (default: false)
-	FailoverTimeoutSeconds int  // Timeout for failover operation in seconds (default: 30)
-	FailoverCooldownSeconds int // Cooldown between failovers in seconds (default: 60)
+	FailoverEnabled         bool // Enable automatic writer failover (default: false)
+	FailoverTimeoutSeconds  int  // Timeout for failover operation in seconds (default: 30)
+	FailoverCooldownSeconds int  // Cooldown between failovers in seconds (default: 60)
 }
 
 // Load loads configuration from environment and config file
@@ -378,16 +378,16 @@ func Load() (*Config, error) {
 	// Build config from Viper (which includes defaults + env vars)
 	cfg := &Config{
 		Server: ServerConfig{
-			Host:           v.GetString("server.host"),
-			Port:           v.GetInt("server.port"),
+			Host:            v.GetString("server.host"),
+			Port:            v.GetInt("server.port"),
 			ReadTimeout:     v.GetInt("server.read_timeout"),
 			WriteTimeout:    v.GetInt("server.write_timeout"),
 			IdleTimeout:     v.GetInt("server.idle_timeout"),
 			ShutdownTimeout: v.GetInt("server.shutdown_timeout"),
 			MaxPayloadSize:  maxPayloadSize,
-			TLSEnabled:     v.GetBool("server.tls_enabled"),
-			TLSCertFile:    v.GetString("server.tls_cert_file"),
-			TLSKeyFile:     v.GetString("server.tls_key_file"),
+			TLSEnabled:      v.GetBool("server.tls_enabled"),
+			TLSCertFile:     v.GetString("server.tls_cert_file"),
+			TLSKeyFile:      v.GetString("server.tls_key_file"),
 		},
 		Database: DatabaseConfig{
 			MaxConnections: v.GetInt("database.max_connections"),
@@ -416,12 +416,12 @@ func Load() (*Config, error) {
 			AzureUseManagedIdentity: v.GetBool("storage.azure_use_managed_identity"),
 		},
 		Ingest: IngestConfig{
-			MaxBufferSize:   v.GetInt("ingest.max_buffer_size"),
-			MaxBufferAgeMS:  v.GetInt("ingest.max_buffer_age_ms"),
-			Compression:     v.GetString("ingest.compression"),
-			UseDictionary:   v.GetBool("ingest.use_dictionary"),
-			WriteStatistics: v.GetBool("ingest.write_statistics"),
-			DataPageVersion: v.GetString("ingest.data_page_version"),
+			MaxBufferSize:       v.GetInt("ingest.max_buffer_size"),
+			MaxBufferAgeMS:      v.GetInt("ingest.max_buffer_age_ms"),
+			Compression:         v.GetString("ingest.compression"),
+			UseDictionary:       v.GetBool("ingest.use_dictionary"),
+			WriteStatistics:     v.GetBool("ingest.write_statistics"),
+			DataPageVersion:     v.GetString("ingest.data_page_version"),
 			FlushWorkers:        v.GetInt("ingest.flush_workers"),
 			FlushQueueSize:      v.GetInt("ingest.flush_queue_size"),
 			FlushTimeoutSeconds: v.GetInt("ingest.flush_timeout_seconds"),
@@ -445,18 +445,18 @@ func Load() (*Config, error) {
 			MaxCacheSize: v.GetInt("auth.max_cache_size"),
 		},
 		Compaction: CompactionConfig{
-			Enabled:           v.GetBool("compaction.enabled"),
-			HourlySchedule:    v.GetString("compaction.hourly_schedule"),
-			DailySchedule:     v.GetString("compaction.daily_schedule"),
-			HourlyEnabled:     v.GetBool("compaction.hourly_enabled"),
-			DailyEnabled:      v.GetBool("compaction.daily_enabled"),
-			HourlyMinAgeHours: v.GetInt("compaction.hourly_min_age_hours"),
-			HourlyMinFiles:    v.GetInt("compaction.hourly_min_files"),
-			DailyMinAgeHours:  v.GetInt("compaction.daily_min_age_hours"),
+			Enabled:                   v.GetBool("compaction.enabled"),
+			HourlySchedule:            v.GetString("compaction.hourly_schedule"),
+			DailySchedule:             v.GetString("compaction.daily_schedule"),
+			HourlyEnabled:             v.GetBool("compaction.hourly_enabled"),
+			DailyEnabled:              v.GetBool("compaction.daily_enabled"),
+			HourlyMinAgeHours:         v.GetInt("compaction.hourly_min_age_hours"),
+			HourlyMinFiles:            v.GetInt("compaction.hourly_min_files"),
+			DailyMinAgeHours:          v.GetInt("compaction.daily_min_age_hours"),
 			DailyMinFiles:             v.GetInt("compaction.daily_min_files"),
 			DailySkipFileAgeCheckDays: v.GetInt("compaction.daily_skip_file_age_check_days"),
 			MaxConcurrent:             v.GetInt("compaction.max_concurrent"),
-			TempDirectory:     v.GetString("compaction.temp_directory"),
+			TempDirectory:             v.GetString("compaction.temp_directory"),
 		},
 		WAL: WALConfig{
 			Enabled:                 v.GetBool("wal.enabled"),
@@ -520,13 +520,13 @@ func Load() (*Config, error) {
 			HeartbeatInterval:   v.GetInt("cluster.heartbeat_interval"),
 			HeartbeatTimeout:    v.GetInt("cluster.heartbeat_timeout"),
 			// Raft configuration
-			RaftDataDir:          v.GetString("cluster.raft_data_dir"),
-			RaftBindAddr:         v.GetString("cluster.raft_bind_addr"),
-			RaftAdvertiseAddr:    v.GetString("cluster.raft_advertise_addr"),
-			RaftBootstrap:        v.GetBool("cluster.raft_bootstrap"),
-			RaftElectionTimeout:  v.GetInt("cluster.raft_election_timeout"),
-			RaftHeartbeatTimeout: v.GetInt("cluster.raft_heartbeat_timeout"),
-			RaftSnapshotInterval: v.GetInt("cluster.raft_snapshot_interval"),
+			RaftDataDir:           v.GetString("cluster.raft_data_dir"),
+			RaftBindAddr:          v.GetString("cluster.raft_bind_addr"),
+			RaftAdvertiseAddr:     v.GetString("cluster.raft_advertise_addr"),
+			RaftBootstrap:         v.GetBool("cluster.raft_bootstrap"),
+			RaftElectionTimeout:   v.GetInt("cluster.raft_election_timeout"),
+			RaftHeartbeatTimeout:  v.GetInt("cluster.raft_heartbeat_timeout"),
+			RaftSnapshotInterval:  v.GetInt("cluster.raft_snapshot_interval"),
 			RaftSnapshotThreshold: v.GetInt("cluster.raft_snapshot_threshold"),
 			// Routing configuration
 			RouteTimeout: v.GetInt("cluster.route_timeout"),
@@ -548,32 +548,32 @@ func Load() (*Config, error) {
 			FailoverCooldownSeconds: v.GetInt("cluster.failover_cooldown"),
 		},
 		TieredStorage: TieredStorageConfig{
-			Enabled:              v.GetBool("tiered_storage.enabled"),
-			MigrationSchedule:    v.GetString("tiered_storage.migration_schedule"),
+			Enabled:                v.GetBool("tiered_storage.enabled"),
+			MigrationSchedule:      v.GetString("tiered_storage.migration_schedule"),
 			MigrationMaxConcurrent: v.GetInt("tiered_storage.migration_max_concurrent"),
-			MigrationBatchSize:   v.GetInt("tiered_storage.migration_batch_size"),
-			DefaultHotMaxAgeDays: v.GetInt("tiered_storage.default_hot_max_age_days"),
+			MigrationBatchSize:     v.GetInt("tiered_storage.migration_batch_size"),
+			DefaultHotMaxAgeDays:   v.GetInt("tiered_storage.default_hot_max_age_days"),
 			Cold: ColdTierConfig{
-				Enabled:               v.GetBool("tiered_storage.cold.enabled"),
-				Backend:               v.GetString("tiered_storage.cold.backend"),
-				S3Bucket:              v.GetString("tiered_storage.cold.s3_bucket"),
-				S3Region:              v.GetString("tiered_storage.cold.s3_region"),
-				S3Endpoint:            v.GetString("tiered_storage.cold.s3_endpoint"),
-				S3AccessKey:           v.GetString("tiered_storage.cold.s3_access_key"),
-				S3SecretKey:           v.GetString("tiered_storage.cold.s3_secret_key"),
-				S3UseSSL:              v.GetBool("tiered_storage.cold.s3_use_ssl"),
-				S3PathStyle:           v.GetBool("tiered_storage.cold.s3_path_style"),
-				S3Prefix:              v.GetString("tiered_storage.cold.s3_prefix"),
-				S3StorageClass:        v.GetString("tiered_storage.cold.s3_storage_class"),
-				AzureContainer:        v.GetString("tiered_storage.cold.azure_container"),
-				AzureConnectionString: v.GetString("tiered_storage.cold.azure_connection_string"),
-				AzureAccountName:      v.GetString("tiered_storage.cold.azure_account_name"),
-				AzureAccountKey:       v.GetString("tiered_storage.cold.azure_account_key"),
-				AzureSASToken:         v.GetString("tiered_storage.cold.azure_sas_token"),
-				AzureEndpoint:         v.GetString("tiered_storage.cold.azure_endpoint"),
+				Enabled:                 v.GetBool("tiered_storage.cold.enabled"),
+				Backend:                 v.GetString("tiered_storage.cold.backend"),
+				S3Bucket:                v.GetString("tiered_storage.cold.s3_bucket"),
+				S3Region:                v.GetString("tiered_storage.cold.s3_region"),
+				S3Endpoint:              v.GetString("tiered_storage.cold.s3_endpoint"),
+				S3AccessKey:             v.GetString("tiered_storage.cold.s3_access_key"),
+				S3SecretKey:             v.GetString("tiered_storage.cold.s3_secret_key"),
+				S3UseSSL:                v.GetBool("tiered_storage.cold.s3_use_ssl"),
+				S3PathStyle:             v.GetBool("tiered_storage.cold.s3_path_style"),
+				S3Prefix:                v.GetString("tiered_storage.cold.s3_prefix"),
+				S3StorageClass:          v.GetString("tiered_storage.cold.s3_storage_class"),
+				AzureContainer:          v.GetString("tiered_storage.cold.azure_container"),
+				AzureConnectionString:   v.GetString("tiered_storage.cold.azure_connection_string"),
+				AzureAccountName:        v.GetString("tiered_storage.cold.azure_account_name"),
+				AzureAccountKey:         v.GetString("tiered_storage.cold.azure_account_key"),
+				AzureSASToken:           v.GetString("tiered_storage.cold.azure_sas_token"),
+				AzureEndpoint:           v.GetString("tiered_storage.cold.azure_endpoint"),
 				AzureUseManagedIdentity: v.GetBool("tiered_storage.cold.azure_use_managed_identity"),
-				AzureAccessTier:       v.GetString("tiered_storage.cold.azure_access_tier"),
-				RetrievalMode:         v.GetString("tiered_storage.cold.retrieval_mode"),
+				AzureAccessTier:         v.GetString("tiered_storage.cold.azure_access_tier"),
+				RetrievalMode:           v.GetString("tiered_storage.cold.retrieval_mode"),
 			},
 		},
 		AuditLog: AuditLogConfig{
@@ -582,9 +582,9 @@ func Load() (*Config, error) {
 			IncludeReads:  v.GetBool("audit_log.include_reads"),
 		},
 		Governance: GovernanceConfig{
-			Enabled:                 v.GetBool("governance.enabled"),
-			DefaultRateLimitPerMin:  v.GetInt("governance.default_rate_limit_per_min"),
-			DefaultRateLimitPerHour: v.GetInt("governance.default_rate_limit_per_hour"),
+			Enabled:                  v.GetBool("governance.enabled"),
+			DefaultRateLimitPerMin:   v.GetInt("governance.default_rate_limit_per_min"),
+			DefaultRateLimitPerHour:  v.GetInt("governance.default_rate_limit_per_hour"),
 			DefaultMaxQueriesPerHour: v.GetInt("governance.default_max_queries_per_hour"),
 			DefaultMaxQueriesPerDay:  v.GetInt("governance.default_max_queries_per_day"),
 			DefaultMaxRowsPerQuery:   v.GetInt("governance.default_max_rows_per_query"),
@@ -641,9 +641,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.flush_workers", getDefaultFlushWorkers())
 	v.SetDefault("ingest.flush_queue_size", getDefaultFlushQueueSize())
 	v.SetDefault("ingest.shard_count", 32)
-	v.SetDefault("ingest.sort_keys", []string{})          // No custom sort keys by default
-	v.SetDefault("ingest.default_sort_keys", "time")      // Default to time-only sorting
-	v.SetDefault("ingest.flush_timeout_seconds", 30)      // 30s timeout for storage writes during flush
+	v.SetDefault("ingest.sort_keys", []string{})     // No custom sort keys by default
+	v.SetDefault("ingest.default_sort_keys", "time") // Default to time-only sorting
+	v.SetDefault("ingest.flush_timeout_seconds", 30) // 30s timeout for storage writes during flush
 
 	// Log defaults
 	v.SetDefault("log.level", "info")
@@ -657,26 +657,26 @@ func setDefaults(v *viper.Viper) {
 
 	// Compaction defaults
 	v.SetDefault("compaction.enabled", true)
-	v.SetDefault("compaction.hourly_schedule", "5 * * * *")   // Every hour at :05
-	v.SetDefault("compaction.daily_schedule", "0 3 * * *")    // 3 AM daily
-	v.SetDefault("compaction.hourly_enabled", true)           // Enable hourly tier
-	v.SetDefault("compaction.daily_enabled", true)            // Enable daily tier
-	v.SetDefault("compaction.hourly_min_age_hours", 0)        // 0 hours min age (compact immediately)
-	v.SetDefault("compaction.hourly_min_files", 10)           // 10 files minimum
-	v.SetDefault("compaction.daily_min_age_hours", 24)        // 24 hours min age
-	v.SetDefault("compaction.daily_min_files", 12)            // 12 files minimum
-	v.SetDefault("compaction.daily_skip_file_age_check_days", 7) // Skip file age check for partitions older than 7 days
-	v.SetDefault("compaction.max_concurrent", 2)              // 2 concurrent jobs
+	v.SetDefault("compaction.hourly_schedule", "5 * * * *")        // Every hour at :05
+	v.SetDefault("compaction.daily_schedule", "0 3 * * *")         // 3 AM daily
+	v.SetDefault("compaction.hourly_enabled", true)                // Enable hourly tier
+	v.SetDefault("compaction.daily_enabled", true)                 // Enable daily tier
+	v.SetDefault("compaction.hourly_min_age_hours", 0)             // 0 hours min age (compact immediately)
+	v.SetDefault("compaction.hourly_min_files", 10)                // 10 files minimum
+	v.SetDefault("compaction.daily_min_age_hours", 24)             // 24 hours min age
+	v.SetDefault("compaction.daily_min_files", 12)                 // 12 files minimum
+	v.SetDefault("compaction.daily_skip_file_age_check_days", 7)   // Skip file age check for partitions older than 7 days
+	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
 
 	// WAL defaults
-	v.SetDefault("wal.enabled", false)                    // Disabled by default for backwards compatibility
-	v.SetDefault("wal.directory", "./data/wal")           // WAL directory
-	v.SetDefault("wal.sync_mode", "fdatasync")            // Balanced mode: fdatasync, fsync, or async
-	v.SetDefault("wal.max_size_mb", 100)                  // Rotate WAL at 100MB
-	v.SetDefault("wal.max_age_seconds", 3600)             // Rotate WAL after 1 hour
-	v.SetDefault("wal.recovery_interval_seconds", 300)    // Periodic recovery every 5 minutes
-	v.SetDefault("wal.recovery_batch_size", 10000)        // Max records per recovery batch (rate limiting)
+	v.SetDefault("wal.enabled", false)                 // Disabled by default for backwards compatibility
+	v.SetDefault("wal.directory", "./data/wal")        // WAL directory
+	v.SetDefault("wal.sync_mode", "fdatasync")         // Balanced mode: fdatasync, fsync, or async
+	v.SetDefault("wal.max_size_mb", 100)               // Rotate WAL at 100MB
+	v.SetDefault("wal.max_age_seconds", 3600)          // Rotate WAL after 1 hour
+	v.SetDefault("wal.recovery_interval_seconds", 300) // Periodic recovery every 5 minutes
+	v.SetDefault("wal.recovery_batch_size", 10000)     // Max records per recovery batch (rate limiting)
 
 	// Telemetry defaults
 	v.SetDefault("telemetry.enabled", true)                                               // Enabled by default (opt-out)
@@ -689,8 +689,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("delete.max_rows_per_delete", 1000000)  // Max 1M rows per delete
 
 	// Retention policy defaults
-	v.SetDefault("retention.enabled", true)             // Enable policy management by default
-	v.SetDefault("retention.db_path", "./data/arc.db")  // Shared SQLite DB with auth
+	v.SetDefault("retention.enabled", true)            // Enable policy management by default
+	v.SetDefault("retention.db_path", "./data/arc.db") // Shared SQLite DB with auth
 
 	// Continuous query defaults
 	v.SetDefault("continuous_query.enabled", true)            // Enable CQ management by default
@@ -704,11 +704,11 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("mqtt.enabled", false) // Feature toggle only - disabled by default
 
 	// Query defaults
-	v.SetDefault("query.timeout", 300)                 // 5 minute query timeout (0 = no timeout)
-	v.SetDefault("query.slow_query_threshold_ms", 0)   // Disabled by default (0 = no slow query logging)
-	v.SetDefault("query.enable_s3_cache", false)       // Disabled by default (opt-in feature)
-	v.SetDefault("query.s3_cache_size", "128MB")       // 128MB cache (256 blocks × 512KB)
-	v.SetDefault("query.s3_cache_ttl_seconds", 3600)   // 1 hour
+	v.SetDefault("query.timeout", 300)               // 5 minute query timeout (0 = no timeout)
+	v.SetDefault("query.slow_query_threshold_ms", 0) // Disabled by default (0 = no slow query logging)
+	v.SetDefault("query.enable_s3_cache", false)     // Disabled by default (opt-in feature)
+	v.SetDefault("query.s3_cache_size", "128MB")     // 128MB cache (256 blocks × 512KB)
+	v.SetDefault("query.s3_cache_ttl_seconds", 3600) // 1 hour
 
 	// License defaults (Enterprise features)
 	// Note: Server URL and validation interval are hardcoded in internal/license/client.go
@@ -720,18 +720,18 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("scheduler.retention_schedule", "0 3 * * *") // 3am daily
 
 	// Cluster defaults (Enterprise feature)
-	v.SetDefault("cluster.enabled", false)                 // Disabled by default (standalone mode)
-	v.SetDefault("cluster.node_id", "")                    // Auto-generated if empty
-	v.SetDefault("cluster.role", "standalone")             // standalone, writer, reader, compactor
-	v.SetDefault("cluster.cluster_name", "arc-cluster")    // Default cluster name
-	v.SetDefault("cluster.seeds", []string{})              // No seeds by default
-	v.SetDefault("cluster.coordinator_addr", ":9100")      // Coordinator bind address
-	v.SetDefault("cluster.advertise_addr", "")             // Auto-detected if empty
-	v.SetDefault("cluster.health_check_interval", 5)       // 5 seconds
-	v.SetDefault("cluster.health_check_timeout", 3)        // 3 seconds
-	v.SetDefault("cluster.unhealthy_threshold", 3)         // 3 failed checks
-	v.SetDefault("cluster.heartbeat_interval", 1)          // 1 second
-	v.SetDefault("cluster.heartbeat_timeout", 5)           // 5 seconds
+	v.SetDefault("cluster.enabled", false)              // Disabled by default (standalone mode)
+	v.SetDefault("cluster.node_id", "")                 // Auto-generated if empty
+	v.SetDefault("cluster.role", "standalone")          // standalone, writer, reader, compactor
+	v.SetDefault("cluster.cluster_name", "arc-cluster") // Default cluster name
+	v.SetDefault("cluster.seeds", []string{})           // No seeds by default
+	v.SetDefault("cluster.coordinator_addr", ":9100")   // Coordinator bind address
+	v.SetDefault("cluster.advertise_addr", "")          // Auto-detected if empty
+	v.SetDefault("cluster.health_check_interval", 5)    // 5 seconds
+	v.SetDefault("cluster.health_check_timeout", 3)     // 3 seconds
+	v.SetDefault("cluster.unhealthy_threshold", 3)      // 3 failed checks
+	v.SetDefault("cluster.heartbeat_interval", 1)       // 1 second
+	v.SetDefault("cluster.heartbeat_timeout", 5)        // 5 seconds
 
 	// Raft consensus defaults (Phase 3)
 	v.SetDefault("cluster.raft_data_dir", "./data/raft")   // Raft data directory
@@ -744,8 +744,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.raft_snapshot_threshold", 10000) // 10k logs before snapshot
 
 	// Request routing defaults (Phase 3)
-	v.SetDefault("cluster.route_timeout", 5000)            // 5 second timeout for forwards
-	v.SetDefault("cluster.route_retries", 3)               // 3 retries for failed forwards
+	v.SetDefault("cluster.route_timeout", 5000) // 5 second timeout for forwards
+	v.SetDefault("cluster.route_retries", 3)    // 3 retries for failed forwards
 
 	// WAL Replication defaults (Phase 3.3)
 	v.SetDefault("cluster.replication_enabled", false)     // Disabled by default
@@ -754,11 +754,11 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.replication_ack_interval", 100)  // 100ms ack interval
 
 	// Sharding defaults (Phase 4)
-	v.SetDefault("cluster.sharding_enabled", false)            // Disabled by default
-	v.SetDefault("cluster.sharding_num_shards", 3)             // 3 shards default
-	v.SetDefault("cluster.sharding_shard_key", "database")     // Database-level sharding
-	v.SetDefault("cluster.sharding_replication_factor", 3)     // RF=3 for fault tolerance
-	v.SetDefault("cluster.sharding_route_timeout", 5000)       // 5 second timeout
+	v.SetDefault("cluster.sharding_enabled", false)        // Disabled by default
+	v.SetDefault("cluster.sharding_num_shards", 3)         // 3 shards default
+	v.SetDefault("cluster.sharding_shard_key", "database") // Database-level sharding
+	v.SetDefault("cluster.sharding_replication_factor", 3) // RF=3 for fault tolerance
+	v.SetDefault("cluster.sharding_route_timeout", 5000)   // 5 second timeout
 
 	// Writer failover defaults (Phase 3)
 	v.SetDefault("cluster.failover_enabled", false) // Disabled by default
@@ -767,24 +767,24 @@ func setDefaults(v *viper.Viper) {
 
 	// Tiered storage defaults (Enterprise feature)
 	// Simple 2-tier system: Hot (local) -> Cold (S3/Azure archive)
-	v.SetDefault("tiered_storage.enabled", false)                    // Disabled by default
-	v.SetDefault("tiered_storage.migration_schedule", "0 2 * * *")   // 2am daily
-	v.SetDefault("tiered_storage.migration_max_concurrent", 4)       // 4 concurrent migrations
-	v.SetDefault("tiered_storage.migration_batch_size", 100)         // 100 files per batch
-	v.SetDefault("tiered_storage.default_hot_max_age_days", 30)      // 30 days in hot tier before archiving
+	v.SetDefault("tiered_storage.enabled", false)                  // Disabled by default
+	v.SetDefault("tiered_storage.migration_schedule", "0 2 * * *") // 2am daily
+	v.SetDefault("tiered_storage.migration_max_concurrent", 4)     // 4 concurrent migrations
+	v.SetDefault("tiered_storage.migration_batch_size", 100)       // 100 files per batch
+	v.SetDefault("tiered_storage.default_hot_max_age_days", 30)    // 30 days in hot tier before archiving
 
 	// Cold tier defaults (S3/Azure archive storage)
-	v.SetDefault("tiered_storage.cold.enabled", false)               // Disabled by default
-	v.SetDefault("tiered_storage.cold.backend", "s3")                // S3 by default
-	v.SetDefault("tiered_storage.cold.s3_bucket", "")                // Must be configured
-	v.SetDefault("tiered_storage.cold.s3_region", "us-east-1")       // Default region
-	v.SetDefault("tiered_storage.cold.s3_endpoint", "")              // Empty for AWS, set for MinIO
-	v.SetDefault("tiered_storage.cold.s3_access_key", "")            // Must be configured
-	v.SetDefault("tiered_storage.cold.s3_secret_key", "")            // Must be configured
-	v.SetDefault("tiered_storage.cold.s3_use_ssl", true)             // HTTPS by default
-	v.SetDefault("tiered_storage.cold.s3_path_style", false)         // Virtual-hosted style for AWS
-	v.SetDefault("tiered_storage.cold.s3_storage_class", "GLACIER")  // Glacier by default
-	v.SetDefault("tiered_storage.cold.azure_container", "")          // Must be configured for Azure
+	v.SetDefault("tiered_storage.cold.enabled", false)              // Disabled by default
+	v.SetDefault("tiered_storage.cold.backend", "s3")               // S3 by default
+	v.SetDefault("tiered_storage.cold.s3_bucket", "")               // Must be configured
+	v.SetDefault("tiered_storage.cold.s3_region", "us-east-1")      // Default region
+	v.SetDefault("tiered_storage.cold.s3_endpoint", "")             // Empty for AWS, set for MinIO
+	v.SetDefault("tiered_storage.cold.s3_access_key", "")           // Must be configured
+	v.SetDefault("tiered_storage.cold.s3_secret_key", "")           // Must be configured
+	v.SetDefault("tiered_storage.cold.s3_use_ssl", true)            // HTTPS by default
+	v.SetDefault("tiered_storage.cold.s3_path_style", false)        // Virtual-hosted style for AWS
+	v.SetDefault("tiered_storage.cold.s3_storage_class", "GLACIER") // Glacier by default
+	v.SetDefault("tiered_storage.cold.azure_container", "")         // Must be configured for Azure
 	v.SetDefault("tiered_storage.cold.azure_connection_string", "")
 	v.SetDefault("tiered_storage.cold.azure_account_name", "")
 	v.SetDefault("tiered_storage.cold.azure_account_key", "")

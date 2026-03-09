@@ -20,13 +20,13 @@ type DailyTier struct {
 
 // DailyTierConfig holds configuration for daily compaction tier
 type DailyTierConfig struct {
-	StorageBackend storage.Backend
-	MinAgeHours    int  // Don't compact days younger than this (default: 24)
-	MinFiles             int // Only compact days with at least this many files (default: 12)
-	SkipFileAgeCheckDays int // Skip file creation time check for partitions older than this (default: 7)
-	TargetSizeMB         int // Target size for compacted files (default: 2048)
-	Enabled        bool // Enable daily compaction (default: true)
-	Logger         zerolog.Logger
+	StorageBackend       storage.Backend
+	MinAgeHours          int  // Don't compact days younger than this (default: 24)
+	MinFiles             int  // Only compact days with at least this many files (default: 12)
+	SkipFileAgeCheckDays int  // Skip file creation time check for partitions older than this (default: 7)
+	TargetSizeMB         int  // Target size for compacted files (default: 2048)
+	Enabled              bool // Enable daily compaction (default: true)
+	Logger               zerolog.Logger
 }
 
 // NewDailyTier creates a new daily compaction tier

@@ -497,10 +497,10 @@ func TestGlobCache(t *testing.T) {
 
 		// Cause some hits and misses
 		statsCache.set("/hit/*.parquet", []string{"file.parquet"})
-		statsCache.get("/hit/*.parquet")      // hit
-		statsCache.get("/hit/*.parquet")      // hit
-		statsCache.get("/miss/*.parquet")     // miss
-		statsCache.get("/miss2/*.parquet")    // miss
+		statsCache.get("/hit/*.parquet")   // hit
+		statsCache.get("/hit/*.parquet")   // hit
+		statsCache.get("/miss/*.parquet")  // miss
+		statsCache.get("/miss2/*.parquet") // miss
 
 		hits, misses, size := statsCache.stats()
 		if hits != 2 {
@@ -567,8 +567,8 @@ func TestPartitionCache(t *testing.T) {
 		statsCache := newPartitionCache(1 * time.Second)
 
 		statsCache.set("hit-key", "result", true)
-		statsCache.get("hit-key")    // hit
-		statsCache.get("miss-key")   // miss
+		statsCache.get("hit-key")  // hit
+		statsCache.get("miss-key") // miss
 
 		hits, misses, size := statsCache.stats()
 		if hits != 1 {
@@ -849,7 +849,6 @@ func TestGlobCacheConcurrency(t *testing.T) {
 	// Should not panic
 }
 
-
 // Helper function
 func contains(s, substr string) bool {
 	for i := 0; i <= len(s)-len(substr); i++ {
@@ -991,12 +990,12 @@ func TestExtractTimeRangeRelative(t *testing.T) {
 	now := time.Now().UTC()
 
 	tests := []struct {
-		name          string
-		sql           string
-		expectStart   bool
-		startDaysAgo  int // approximate days from now (negative = past)
-		expectEnd     bool
-		endDaysAgo    int
+		name         string
+		sql          string
+		expectStart  bool
+		startDaysAgo int // approximate days from now (negative = past)
+		expectEnd    bool
+		endDaysAgo   int
 	}{
 		{
 			name:         "NOW() - INTERVAL days",
@@ -1023,10 +1022,10 @@ func TestExtractTimeRangeRelative(t *testing.T) {
 			startDaysAgo: -1, // 24 hours ≈ 1 day
 		},
 		{
-			name:         "end time with relative",
-			sql:          "SELECT * FROM cpu WHERE time < NOW() - INTERVAL '30 days'",
-			expectEnd:    true,
-			endDaysAgo:   -30,
+			name:       "end time with relative",
+			sql:        "SELECT * FROM cpu WHERE time < NOW() - INTERVAL '30 days'",
+			expectEnd:  true,
+			endDaysAgo: -30,
 		},
 		{
 			name:         "NOW() + INTERVAL (future)",

@@ -75,7 +75,7 @@ func TestNodeIsAvailable(t *testing.T) {
 		expected bool
 	}{
 		{StateUnknown, false},
-		{StateJoining, true},  // Joining nodes are available
+		{StateJoining, true}, // Joining nodes are available
 		{StateHealthy, true},
 		{StateUnhealthy, false},
 		{StateDead, false},

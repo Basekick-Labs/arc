@@ -178,11 +178,11 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 			c.logger.Warn().Msg("Writer failover enabled but license does not include writer_failover feature — failover disabled")
 		} else {
 			c.writerFailoverMgr = NewWriterFailoverManager(&WriterFailoverConfig{
-				Registry:           registry,
-				RaftNode:           c.raftNode,
-				FailoverTimeout:    time.Duration(cfg.Config.FailoverTimeoutSeconds) * time.Second,
-				CooldownPeriod:     time.Duration(cfg.Config.FailoverCooldownSeconds) * time.Second,
-				Logger:             cfg.Logger,
+				Registry:        registry,
+				RaftNode:        c.raftNode,
+				FailoverTimeout: time.Duration(cfg.Config.FailoverTimeoutSeconds) * time.Second,
+				CooldownPeriod:  time.Duration(cfg.Config.FailoverCooldownSeconds) * time.Second,
+				Logger:          cfg.Logger,
 			})
 
 			// Wire FSM writer promotion callback to update registry

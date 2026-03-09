@@ -361,12 +361,12 @@ func TestRowsToColumnar_DifferentFieldTypes(t *testing.T) {
 func BenchmarkGetColumnSignature(b *testing.B) {
 	// Typical columnar payload columns
 	columns := map[string]interface{}{
-		"time":        nil,
-		"host":        nil,
-		"region":      nil,
-		"datacenter":  nil,
-		"usage_idle":  nil,
-		"usage_user":  nil,
+		"time":         nil,
+		"host":         nil,
+		"region":       nil,
+		"datacenter":   nil,
+		"usage_idle":   nil,
+		"usage_user":   nil,
 		"usage_system": nil,
 		"usage_iowait": nil,
 	}

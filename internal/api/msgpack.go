@@ -530,11 +530,11 @@ func (h *MsgPackHandler) msgPackSpec(c *fiber.Ctx) error {
 		"example_columnar": fiber.Map{
 			"m": "cpu",
 			"columns": fiber.Map{
-				"time":        []int64{1633024800000, 1633024801000, 1633024802000},
-				"host":        []string{"server01", "server01", "server01"},
-				"region":      []string{"us-east", "us-east", "us-east"},
-				"usage_idle":  []float64{95.0, 94.5, 94.2},
-				"usage_user":  []float64{3.2, 3.8, 4.1},
+				"time":         []int64{1633024800000, 1633024801000, 1633024802000},
+				"host":         []string{"server01", "server01", "server01"},
+				"region":       []string{"us-east", "us-east", "us-east"},
+				"usage_idle":   []float64{95.0, 94.5, 94.2},
+				"usage_user":   []float64{3.2, 3.8, 4.1},
 				"usage_system": []float64{1.8, 1.7, 1.7},
 			},
 		},
@@ -553,13 +553,13 @@ func (h *MsgPackHandler) msgPackSpec(c *fiber.Ctx) error {
 			},
 		},
 		"performance": fiber.Map{
-			"expected_rps_columnar":  "2.5M+ (columnar format, zero-copy)",
-			"expected_rps_row":       "2.1M (row format, with conversion)",
-			"columnar_advantage":     "25-35% faster (no flattening, no row→column conversion)",
-			"parsing_speed":          "10-15x faster than text parsing",
-			"serialization":          "Direct Arrow (2-3x faster than DataFrame)",
-			"payload_size":           "50-70% smaller than Line Protocol",
-			"wire_efficiency":        "Columnar sends field names once vs per-record",
+			"expected_rps_columnar": "2.5M+ (columnar format, zero-copy)",
+			"expected_rps_row":      "2.1M (row format, with conversion)",
+			"columnar_advantage":    "25-35% faster (no flattening, no row→column conversion)",
+			"parsing_speed":         "10-15x faster than text parsing",
+			"serialization":         "Direct Arrow (2-3x faster than DataFrame)",
+			"payload_size":          "50-70% smaller than Line Protocol",
+			"wire_efficiency":       "Columnar sends field names once vs per-record",
 		},
 	}
 

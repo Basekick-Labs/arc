@@ -4,9 +4,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/rs/zerolog"
-	"github.com/Basekick-Labs/msgpack/v6"
 )
 
 func newTestDecoder() *MessagePackDecoder {
@@ -277,10 +277,10 @@ func TestMessagePackDecoder_ExtractTimestamp(t *testing.T) {
 	decoder := newTestDecoder()
 
 	tests := []struct {
-		name      string
-		input     interface{}
-		wantUnit  string
-		wantErr   bool
+		name     string
+		input    interface{}
+		wantUnit string
+		wantErr  bool
 	}{
 		{
 			name:     "seconds timestamp",

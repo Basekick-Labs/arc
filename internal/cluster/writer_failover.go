@@ -38,13 +38,13 @@ type WriterFailoverConfig struct {
 // WriterFailoverManager monitors writer health and promotes standby writers
 // when the primary fails. Only the Raft leader runs active health checks.
 type WriterFailoverManager struct {
-	cfg             *WriterFailoverConfig
-	mu              sync.RWMutex
-	logger          zerolog.Logger
-	ctx             context.Context
-	cancelFn        context.CancelFunc
-	running         atomic.Bool
-	wg              sync.WaitGroup
+	cfg      *WriterFailoverConfig
+	mu       sync.RWMutex
+	logger   zerolog.Logger
+	ctx      context.Context
+	cancelFn context.CancelFunc
+	running  atomic.Bool
+	wg       sync.WaitGroup
 
 	// State tracking
 	primaryID        string
@@ -358,11 +358,11 @@ func (m *WriterFailoverManager) Stats() map[string]interface{} {
 	defer m.mu.RUnlock()
 
 	stats := map[string]interface{}{
-		"running":            m.running.Load(),
-		"primary_id":         m.primaryID,
-		"consecutive_fails":  m.consecutiveFails,
+		"running":              m.running.Load(),
+		"primary_id":           m.primaryID,
+		"consecutive_fails":    m.consecutiveFails,
 		"failover_in_progress": m.failoverInProg,
-		"cooldown_period":    m.cfg.CooldownPeriod.String(),
+		"cooldown_period":      m.cfg.CooldownPeriod.String(),
 	}
 
 	if !m.lastFailoverAt.IsZero() {

@@ -83,13 +83,13 @@ type ReplicateError struct {
 
 // Error codes for replication failures
 const (
-	ErrCodeSequenceGap  = "SEQUENCE_GAP"  // Reader is too far behind to resume
-	ErrCodeWALRotated   = "WAL_ROTATED"   // WAL was rotated, need full resync
-	ErrCodeInvalidMsg   = "INVALID_MSG"   // Invalid message format
-	ErrCodeNotWriter    = "NOT_WRITER"    // Connected to non-writer node
-	ErrCodeBufferFull   = "BUFFER_FULL"   // Replication buffer is full
-	ErrCodeWriteFailed  = "WRITE_FAILED"  // Failed to write entry
-	ErrCodeApplyFailed  = "APPLY_FAILED"  // Failed to apply entry
+	ErrCodeSequenceGap = "SEQUENCE_GAP" // Reader is too far behind to resume
+	ErrCodeWALRotated  = "WAL_ROTATED"  // WAL was rotated, need full resync
+	ErrCodeInvalidMsg  = "INVALID_MSG"  // Invalid message format
+	ErrCodeNotWriter   = "NOT_WRITER"   // Connected to non-writer node
+	ErrCodeBufferFull  = "BUFFER_FULL"  // Replication buffer is full
+	ErrCodeWriteFailed = "WRITE_FAILED" // Failed to write entry
+	ErrCodeApplyFailed = "APPLY_FAILED" // Failed to apply entry
 )
 
 // Wire format: [4-byte length (big-endian)][1-byte type][JSON payload]

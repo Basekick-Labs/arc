@@ -427,9 +427,9 @@ func (m *MetaCluster) Status() map[string]interface{} {
 	for i := 0; i < shardMap.NumShards(); i++ {
 		group := shardMap.GetShardGroup(i)
 		ss := map[string]interface{}{
-			"shard_id":     i,
-			"primary":      nil,
-			"replicas":     []string{},
+			"shard_id":      i,
+			"primary":       nil,
+			"replicas":      []string{},
 			"replica_count": len(group.Replicas),
 		}
 		if group.Primary != nil {

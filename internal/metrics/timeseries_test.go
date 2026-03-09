@@ -252,10 +252,10 @@ func TestBufferSizeCalculation(t *testing.T) {
 		intervalSeconds  int
 		expectedSize     int
 	}{
-		{30, 5, 360},   // 30 min * 60 sec / 5 sec = 360 points
-		{60, 10, 360},  // 60 min * 60 sec / 10 sec = 360 points
-		{30, 1, 1800},  // 30 min * 60 sec / 1 sec = 1800 points
-		{1, 1, 60},     // 1 min * 60 sec / 1 sec = 60 points
+		{30, 5, 360},  // 30 min * 60 sec / 5 sec = 360 points
+		{60, 10, 360}, // 60 min * 60 sec / 10 sec = 360 points
+		{30, 1, 1800}, // 30 min * 60 sec / 1 sec = 1800 points
+		{1, 1, 60},    // 1 min * 60 sec / 1 sec = 60 points
 	}
 
 	for _, tt := range tests {

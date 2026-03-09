@@ -558,7 +558,6 @@ func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement stri
 	return w.writeRecordToParquet(schema, arrays)
 }
 
-
 // writeRecordToParquet writes Arrow arrays to Parquet bytes
 func (w *ArrowWriter) writeRecordToParquet(schema *arrow.Schema, arrays []arrow.Array) ([]byte, error) {
 	// Create record batch
@@ -644,7 +643,7 @@ type flushTask struct {
 // WALWriter interface for Write-Ahead Log support
 type WALWriter interface {
 	Append(records []map[string]interface{}) error
-	AppendRaw(payload []byte) error                        // Zero-copy: write raw msgpack bytes directly
+	AppendRaw(payload []byte) error                          // Zero-copy: write raw msgpack bytes directly
 	AppendRawWithMeta(database string, payload []byte) error // Zero-copy with database metadata envelope
 	Stats() map[string]interface{}
 	Close() error
@@ -671,11 +670,11 @@ type ArrowBuffer struct {
 	shardCount uint32
 
 	// Background flush
-	ctx          context.Context
-	cancel       context.CancelFunc
-	flushTimer   *time.Timer   // self-adjusting: fires when the oldest buffer is due to expire
-	newBufferCh  chan struct{}  // signals periodicFlush to recompute the next wakeup time
-	wg           sync.WaitGroup
+	ctx         context.Context
+	cancel      context.CancelFunc
+	flushTimer  *time.Timer   // self-adjusting: fires when the oldest buffer is due to expire
+	newBufferCh chan struct{} // signals periodicFlush to recompute the next wakeup time
+	wg          sync.WaitGroup
 
 	// OPTIMIZATION: Worker pool for bounded flush concurrency
 	// Prevents goroutine explosion under sustained load

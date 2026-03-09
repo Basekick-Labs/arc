@@ -20,20 +20,20 @@ type Metrics struct {
 
 	// HTTP latency histogram buckets (microseconds)
 	// Buckets: 1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, +Inf
-	httpLatencyBuckets     [10]atomic.Int64
-	httpLatencySum         atomic.Int64
-	httpLatencyCount       atomic.Int64
+	httpLatencyBuckets [10]atomic.Int64
+	httpLatencySum     atomic.Int64
+	httpLatencyCount   atomic.Int64
 
 	// Ingestion metrics
-	ingestRecordsTotal    atomic.Int64
-	ingestBytesTotal      atomic.Int64
-	ingestBatchesTotal    atomic.Int64
-	ingestErrorsTotal     atomic.Int64
+	ingestRecordsTotal atomic.Int64
+	ingestBytesTotal   atomic.Int64
+	ingestBatchesTotal atomic.Int64
+	ingestErrorsTotal  atomic.Int64
 
 	// MessagePack specific
-	msgpackRequestsTotal  atomic.Int64
-	msgpackRecordsTotal   atomic.Int64
-	msgpackBytesTotal     atomic.Int64
+	msgpackRequestsTotal atomic.Int64
+	msgpackRecordsTotal  atomic.Int64
+	msgpackBytesTotal    atomic.Int64
 
 	// Line Protocol specific
 	lineprotocolRequestsTotal atomic.Int64
@@ -41,14 +41,14 @@ type Metrics struct {
 	lineprotocolBytesTotal    atomic.Int64
 
 	// Query metrics
-	queryRequestsTotal    atomic.Int64
-	querySuccessTotal     atomic.Int64
-	queryErrorsTotal      atomic.Int64
-	queryTimeoutsTotal    atomic.Int64
-	queryRowsTotal        atomic.Int64
-	querySlowTotal        atomic.Int64
-	queryLatencySum       atomic.Int64 // microseconds
-	queryLatencyCount     atomic.Int64
+	queryRequestsTotal atomic.Int64
+	querySuccessTotal  atomic.Int64
+	queryErrorsTotal   atomic.Int64
+	queryTimeoutsTotal atomic.Int64
+	queryRowsTotal     atomic.Int64
+	querySlowTotal     atomic.Int64
+	queryLatencySum    atomic.Int64 // microseconds
+	queryLatencyCount  atomic.Int64
 
 	// Arrow buffer metrics
 	bufferRecordsBuffered atomic.Int64
@@ -58,33 +58,33 @@ type Metrics struct {
 	bufferQueueDepth      atomic.Int64
 
 	// Storage metrics
-	storageWritesTotal    atomic.Int64
+	storageWritesTotal     atomic.Int64
 	storageWriteBytesTotal atomic.Int64
-	storageReadsTotal     atomic.Int64
-	storageReadBytesTotal atomic.Int64
-	storageErrorsTotal    atomic.Int64
+	storageReadsTotal      atomic.Int64
+	storageReadBytesTotal  atomic.Int64
+	storageErrorsTotal     atomic.Int64
 
 	// Compaction metrics
-	compactionJobsTotal        atomic.Int64
-	compactionJobsSuccess      atomic.Int64
-	compactionJobsFailed       atomic.Int64
-	compactionFilesCompacted   atomic.Int64
-	compactionBytesRead        atomic.Int64
-	compactionBytesWritten     atomic.Int64
+	compactionJobsTotal          atomic.Int64
+	compactionJobsSuccess        atomic.Int64
+	compactionJobsFailed         atomic.Int64
+	compactionFilesCompacted     atomic.Int64
+	compactionBytesRead          atomic.Int64
+	compactionBytesWritten       atomic.Int64
 	compactionManifestsRecovered atomic.Int64
 
 	// Auth metrics
-	authRequestsTotal     atomic.Int64
-	authCacheHits         atomic.Int64
-	authCacheMisses       atomic.Int64
-	authFailuresTotal     atomic.Int64
+	authRequestsTotal atomic.Int64
+	authCacheHits     atomic.Int64
+	authCacheMisses   atomic.Int64
+	authFailuresTotal atomic.Int64
 
 	// DuckDB connection pool
-	dbConnectionsOpen     atomic.Int64
-	dbConnectionsInUse    atomic.Int64
-	dbConnectionsIdle     atomic.Int64
-	dbQueriesTotal        atomic.Int64
-	dbQueryErrorsTotal    atomic.Int64
+	dbConnectionsOpen  atomic.Int64
+	dbConnectionsInUse atomic.Int64
+	dbConnectionsIdle  atomic.Int64
+	dbQueriesTotal     atomic.Int64
+	dbQueryErrorsTotal atomic.Int64
 
 	// MQTT metrics
 	mqttMessagesReceived atomic.Int64
@@ -96,13 +96,13 @@ type Metrics struct {
 	mqttReconnects       atomic.Int64
 
 	// Audit metrics
-	auditEventsTotal  atomic.Int64
-	auditWriteErrors  atomic.Int64
+	auditEventsTotal atomic.Int64
+	auditWriteErrors atomic.Int64
 
 	// WAL metrics
-	walRecordsPreserved   atomic.Int64 // Records preserved in WAL for recovery (flush failures)
-	walRecoveryTotal      atomic.Int64 // Successful WAL recovery operations
-	walRecoveryRecords    atomic.Int64 // Total records recovered from WAL
+	walRecordsPreserved atomic.Int64 // Records preserved in WAL for recovery (flush failures)
+	walRecoveryTotal    atomic.Int64 // Successful WAL recovery operations
+	walRecoveryRecords  atomic.Int64 // Total records recovered from WAL
 
 	// Decompression pool metrics
 	decompBufferDiscards atomic.Int64 // Oversized buffers not returned to pool
@@ -148,9 +148,9 @@ func Init(logger zerolog.Logger) *Metrics {
 }
 
 // HTTP Metrics
-func (m *Metrics) IncHTTPRequests()        { m.httpRequestsTotal.Add(1) }
-func (m *Metrics) IncHTTPSuccess()         { m.httpRequestsSuccess.Add(1) }
-func (m *Metrics) IncHTTPError()           { m.httpRequestsError.Add(1) }
+func (m *Metrics) IncHTTPRequests() { m.httpRequestsTotal.Add(1) }
+func (m *Metrics) IncHTTPSuccess()  { m.httpRequestsSuccess.Add(1) }
+func (m *Metrics) IncHTTPError()    { m.httpRequestsError.Add(1) }
 
 // RecordHTTPLatency records HTTP request latency in microseconds
 func (m *Metrics) RecordHTTPLatency(durationMicros int64) {
@@ -189,10 +189,10 @@ func (m *Metrics) getLatencyBucket(micros int64) int {
 }
 
 // Ingestion Metrics
-func (m *Metrics) IncIngestRecords(count int64)  { m.ingestRecordsTotal.Add(count) }
-func (m *Metrics) IncIngestBytes(bytes int64)    { m.ingestBytesTotal.Add(bytes) }
-func (m *Metrics) IncIngestBatches()             { m.ingestBatchesTotal.Add(1) }
-func (m *Metrics) IncIngestErrors()              { m.ingestErrorsTotal.Add(1) }
+func (m *Metrics) IncIngestRecords(count int64) { m.ingestRecordsTotal.Add(count) }
+func (m *Metrics) IncIngestBytes(bytes int64)   { m.ingestBytesTotal.Add(bytes) }
+func (m *Metrics) IncIngestBatches()            { m.ingestBatchesTotal.Add(1) }
+func (m *Metrics) IncIngestErrors()             { m.ingestErrorsTotal.Add(1) }
 
 // MessagePack Metrics
 func (m *Metrics) IncMsgPackRequests()           { m.msgpackRequestsTotal.Add(1) }
@@ -205,12 +205,12 @@ func (m *Metrics) IncLineProtocolRecords(count int64) { m.lineprotocolRecordsTot
 func (m *Metrics) IncLineProtocolBytes(bytes int64)   { m.lineprotocolBytesTotal.Add(bytes) }
 
 // Query Metrics
-func (m *Metrics) IncQueryRequests()             { m.queryRequestsTotal.Add(1) }
-func (m *Metrics) IncQuerySuccess()              { m.querySuccessTotal.Add(1) }
-func (m *Metrics) IncQueryErrors()               { m.queryErrorsTotal.Add(1) }
-func (m *Metrics) IncQueryTimeouts()             { m.queryTimeoutsTotal.Add(1) }
-func (m *Metrics) IncSlowQueries()               { m.querySlowTotal.Add(1) }
-func (m *Metrics) IncQueryRows(count int64)      { m.queryRowsTotal.Add(count) }
+func (m *Metrics) IncQueryRequests()        { m.queryRequestsTotal.Add(1) }
+func (m *Metrics) IncQuerySuccess()         { m.querySuccessTotal.Add(1) }
+func (m *Metrics) IncQueryErrors()          { m.queryErrorsTotal.Add(1) }
+func (m *Metrics) IncQueryTimeouts()        { m.queryTimeoutsTotal.Add(1) }
+func (m *Metrics) IncSlowQueries()          { m.querySlowTotal.Add(1) }
+func (m *Metrics) IncQueryRows(count int64) { m.queryRowsTotal.Add(count) }
 
 // RecordQueryLatency records query latency in microseconds
 func (m *Metrics) RecordQueryLatency(durationMicros int64) {
@@ -226,26 +226,28 @@ func (m *Metrics) SetBufferErrors(count int64)          { m.bufferErrorsTotal.St
 func (m *Metrics) SetBufferQueueDepth(depth int64)      { m.bufferQueueDepth.Store(depth) }
 
 // Storage Metrics
-func (m *Metrics) IncStorageWrites()             { m.storageWritesTotal.Add(1) }
+func (m *Metrics) IncStorageWrites()                { m.storageWritesTotal.Add(1) }
 func (m *Metrics) IncStorageWriteBytes(bytes int64) { m.storageWriteBytesTotal.Add(bytes) }
-func (m *Metrics) IncStorageReads()              { m.storageReadsTotal.Add(1) }
-func (m *Metrics) IncStorageReadBytes(bytes int64) { m.storageReadBytesTotal.Add(bytes) }
-func (m *Metrics) IncStorageErrors()             { m.storageErrorsTotal.Add(1) }
+func (m *Metrics) IncStorageReads()                 { m.storageReadsTotal.Add(1) }
+func (m *Metrics) IncStorageReadBytes(bytes int64)  { m.storageReadBytesTotal.Add(bytes) }
+func (m *Metrics) IncStorageErrors()                { m.storageErrorsTotal.Add(1) }
 
 // Compaction Metrics
-func (m *Metrics) IncCompactionJobs()            { m.compactionJobsTotal.Add(1) }
-func (m *Metrics) IncCompactionSuccess()         { m.compactionJobsSuccess.Add(1) }
-func (m *Metrics) IncCompactionFailed()          { m.compactionJobsFailed.Add(1) }
+func (m *Metrics) IncCompactionJobs()                      { m.compactionJobsTotal.Add(1) }
+func (m *Metrics) IncCompactionSuccess()                   { m.compactionJobsSuccess.Add(1) }
+func (m *Metrics) IncCompactionFailed()                    { m.compactionJobsFailed.Add(1) }
 func (m *Metrics) IncCompactionFilesCompacted(count int64) { m.compactionFilesCompacted.Add(count) }
-func (m *Metrics) IncCompactionBytesRead(bytes int64) { m.compactionBytesRead.Add(bytes) }
-func (m *Metrics) IncCompactionBytesWritten(bytes int64) { m.compactionBytesWritten.Add(bytes) }
-func (m *Metrics) IncCompactionManifestsRecovered(count int64) { m.compactionManifestsRecovered.Add(count) }
+func (m *Metrics) IncCompactionBytesRead(bytes int64)      { m.compactionBytesRead.Add(bytes) }
+func (m *Metrics) IncCompactionBytesWritten(bytes int64)   { m.compactionBytesWritten.Add(bytes) }
+func (m *Metrics) IncCompactionManifestsRecovered(count int64) {
+	m.compactionManifestsRecovered.Add(count)
+}
 
 // Auth Metrics
-func (m *Metrics) IncAuthRequests()              { m.authRequestsTotal.Add(1) }
-func (m *Metrics) IncAuthCacheHit()              { m.authCacheHits.Add(1) }
-func (m *Metrics) IncAuthCacheMiss()             { m.authCacheMisses.Add(1) }
-func (m *Metrics) IncAuthFailures()              { m.authFailuresTotal.Add(1) }
+func (m *Metrics) IncAuthRequests()  { m.authRequestsTotal.Add(1) }
+func (m *Metrics) IncAuthCacheHit()  { m.authCacheHits.Add(1) }
+func (m *Metrics) IncAuthCacheMiss() { m.authCacheMisses.Add(1) }
+func (m *Metrics) IncAuthFailures()  { m.authFailuresTotal.Add(1) }
 
 // Database Metrics
 func (m *Metrics) SetDBConnectionsOpen(count int64)  { m.dbConnectionsOpen.Store(count) }
@@ -259,19 +261,19 @@ func (m *Metrics) IncAuditEvents()      { m.auditEventsTotal.Add(1) }
 func (m *Metrics) IncAuditWriteErrors() { m.auditWriteErrors.Add(1) }
 
 // MQTT Metrics
-func (m *Metrics) IncMQTTMessagesReceived()          { m.mqttMessagesReceived.Add(1) }
-func (m *Metrics) IncMQTTMessagesFailed()            { m.mqttMessagesFailed.Add(1) }
-func (m *Metrics) IncMQTTBytesReceived(bytes int64)  { m.mqttBytesReceived.Add(bytes) }
-func (m *Metrics) IncMQTTDecodeSuccess()             { m.mqttDecodeSuccess.Add(1) }
-func (m *Metrics) IncMQTTDecodeErrors()              { m.mqttDecodeErrors.Add(1) }
-func (m *Metrics) SetMQTTConnected(connected bool)   {
+func (m *Metrics) IncMQTTMessagesReceived()         { m.mqttMessagesReceived.Add(1) }
+func (m *Metrics) IncMQTTMessagesFailed()           { m.mqttMessagesFailed.Add(1) }
+func (m *Metrics) IncMQTTBytesReceived(bytes int64) { m.mqttBytesReceived.Add(bytes) }
+func (m *Metrics) IncMQTTDecodeSuccess()            { m.mqttDecodeSuccess.Add(1) }
+func (m *Metrics) IncMQTTDecodeErrors()             { m.mqttDecodeErrors.Add(1) }
+func (m *Metrics) SetMQTTConnected(connected bool) {
 	if connected {
 		m.mqttConnected.Store(1)
 	} else {
 		m.mqttConnected.Store(0)
 	}
 }
-func (m *Metrics) IncMQTTReconnects()                { m.mqttReconnects.Add(1) }
+func (m *Metrics) IncMQTTReconnects() { m.mqttReconnects.Add(1) }
 
 // WAL Metrics
 func (m *Metrics) IncWALRecordsPreserved(count int64) { m.walRecordsPreserved.Add(count) }
@@ -279,12 +281,12 @@ func (m *Metrics) IncWALRecoveryTotal()               { m.walRecoveryTotal.Add(1
 func (m *Metrics) IncWALRecoveryRecords(count int64)  { m.walRecoveryRecords.Add(count) }
 
 // Decompression Pool Metrics
-func (m *Metrics) IncDecompBufferDiscards()           { m.decompBufferDiscards.Add(1) }
+func (m *Metrics) IncDecompBufferDiscards() { m.decompBufferDiscards.Add(1) }
 
 // Governance Metrics
-func (m *Metrics) IncGovernanceRateLimited()               { m.governanceRateLimited.Add(1) }
-func (m *Metrics) IncGovernanceQuotaExhausted()            { m.governanceQuotaExhausted.Add(1) }
-func (m *Metrics) SetGovernancePoliciesActive(n int64)     { m.governancePoliciesActive.Store(n) }
+func (m *Metrics) IncGovernanceRateLimited()           { m.governanceRateLimited.Add(1) }
+func (m *Metrics) IncGovernanceQuotaExhausted()        { m.governanceQuotaExhausted.Add(1) }
+func (m *Metrics) SetGovernancePoliciesActive(n int64) { m.governancePoliciesActive.Store(n) }
 
 // Query Management Metrics
 func (m *Metrics) SetQueryMgmtActiveQueries(n int64) { m.queryMgmtActiveQueries.Store(n) }
@@ -292,8 +294,8 @@ func (m *Metrics) IncQueryMgmtCancelled()            { m.queryMgmtCancelledTotal
 func (m *Metrics) SetQueryMgmtHistorySize(n int64)   { m.queryMgmtHistorySize.Store(n) }
 
 // Replication Metrics
-func (m *Metrics) IncReplicationEntriesDropped() { m.replicationEntriesDroppedTotal.Add(1) }
-func (m *Metrics) IncReplicationSequenceGaps(n int64)   { m.replicationSequenceGapsTotal.Add(n) }
+func (m *Metrics) IncReplicationEntriesDropped()      { m.replicationEntriesDroppedTotal.Add(1) }
+func (m *Metrics) IncReplicationSequenceGaps(n int64) { m.replicationSequenceGapsTotal.Add(n) }
 
 // Snapshot returns all metrics as a map (for JSON endpoint)
 func (m *Metrics) Snapshot() map[string]interface{} {
@@ -302,11 +304,11 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 
 	return map[string]interface{}{
 		// Process info
-		"uptime_seconds":    time.Since(m.startTime).Seconds(),
-		"goroutines":        runtime.NumGoroutine(),
-		"go_version":        runtime.Version(),
-		"num_cpu":           runtime.NumCPU(),
-		"gomaxprocs":        runtime.GOMAXPROCS(0),
+		"uptime_seconds": time.Since(m.startTime).Seconds(),
+		"goroutines":     runtime.NumGoroutine(),
+		"go_version":     runtime.Version(),
+		"num_cpu":        runtime.NumCPU(),
+		"gomaxprocs":     runtime.GOMAXPROCS(0),
 
 		// Memory (Go runtime)
 		"memory_alloc_bytes":       memStats.Alloc,
@@ -343,14 +345,14 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"lineprotocol_bytes_total":    m.lineprotocolBytesTotal.Load(),
 
 		// Query
-		"query_requests_total":  m.queryRequestsTotal.Load(),
-		"query_success_total":   m.querySuccessTotal.Load(),
-		"query_errors_total":    m.queryErrorsTotal.Load(),
-		"query_timeouts_total":  m.queryTimeoutsTotal.Load(),
+		"query_requests_total": m.queryRequestsTotal.Load(),
+		"query_success_total":  m.querySuccessTotal.Load(),
+		"query_errors_total":   m.queryErrorsTotal.Load(),
+		"query_timeouts_total": m.queryTimeoutsTotal.Load(),
 		"query_slow_total":     m.querySlowTotal.Load(),
-		"query_rows_total":      m.queryRowsTotal.Load(),
-		"query_latency_sum_us":  m.queryLatencySum.Load(),
-		"query_latency_count":   m.queryLatencyCount.Load(),
+		"query_rows_total":     m.queryRowsTotal.Load(),
+		"query_latency_sum_us": m.queryLatencySum.Load(),
+		"query_latency_count":  m.queryLatencyCount.Load(),
 
 		// Buffer
 		"buffer_records_buffered": m.bufferRecordsBuffered.Load(),
@@ -367,19 +369,19 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"storage_errors_total":      m.storageErrorsTotal.Load(),
 
 		// Compaction
-		"compaction_jobs_total":         m.compactionJobsTotal.Load(),
-		"compaction_jobs_success":       m.compactionJobsSuccess.Load(),
-		"compaction_jobs_failed":        m.compactionJobsFailed.Load(),
-		"compaction_files_compacted":    m.compactionFilesCompacted.Load(),
-		"compaction_bytes_read":         m.compactionBytesRead.Load(),
-		"compaction_bytes_written":      m.compactionBytesWritten.Load(),
+		"compaction_jobs_total":          m.compactionJobsTotal.Load(),
+		"compaction_jobs_success":        m.compactionJobsSuccess.Load(),
+		"compaction_jobs_failed":         m.compactionJobsFailed.Load(),
+		"compaction_files_compacted":     m.compactionFilesCompacted.Load(),
+		"compaction_bytes_read":          m.compactionBytesRead.Load(),
+		"compaction_bytes_written":       m.compactionBytesWritten.Load(),
 		"compaction_manifests_recovered": m.compactionManifestsRecovered.Load(),
 
 		// Auth
-		"auth_requests_total":   m.authRequestsTotal.Load(),
-		"auth_cache_hits":       m.authCacheHits.Load(),
-		"auth_cache_misses":     m.authCacheMisses.Load(),
-		"auth_failures_total":   m.authFailuresTotal.Load(),
+		"auth_requests_total": m.authRequestsTotal.Load(),
+		"auth_cache_hits":     m.authCacheHits.Load(),
+		"auth_cache_misses":   m.authCacheMisses.Load(),
+		"auth_failures_total": m.authFailuresTotal.Load(),
 
 		// Database
 		"db_connections_open":   m.dbConnectionsOpen.Load(),
@@ -389,8 +391,8 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"db_query_errors_total": m.dbQueryErrorsTotal.Load(),
 
 		// Audit
-		"audit_events_total":  m.auditEventsTotal.Load(),
-		"audit_write_errors":  m.auditWriteErrors.Load(),
+		"audit_events_total": m.auditEventsTotal.Load(),
+		"audit_write_errors": m.auditWriteErrors.Load(),
 
 		// MQTT
 		"mqtt_messages_received": m.mqttMessagesReceived.Load(),

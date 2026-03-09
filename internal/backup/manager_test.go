@@ -113,9 +113,9 @@ func TestGenerateBackupID(t *testing.T) {
 
 func TestParseDBMeasurement(t *testing.T) {
 	tests := []struct {
-		path    string
-		wantDB  string
-		wantM   string
+		path   string
+		wantDB string
+		wantM  string
 	}{
 		{"mydb/cpu/2026/01/30/14/cpu_123.parquet", "mydb", "cpu"},
 		{"prod/memory/2026/02/01/00/memory_456.parquet", "prod", "memory"},

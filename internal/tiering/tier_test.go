@@ -31,7 +31,7 @@ func TestTier_IsValid(t *testing.T) {
 	}{
 		{TierHot, true},
 		{TierCold, true},
-		{Tier("warm"), false},    // Warm tier removed in 2-tier system
+		{Tier("warm"), false}, // Warm tier removed in 2-tier system
 		{Tier("invalid"), false},
 		{Tier(""), false},
 	}

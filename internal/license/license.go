@@ -25,7 +25,7 @@ const (
 	FeatureAuditLogging       = "audit_logging"
 	FeatureWriterFailover     = "writer_failover"
 	FeatureQueryGovernance    = "query_governance"
-	FeatureQueryManagement   = "query_management"
+	FeatureQueryManagement    = "query_management"
 )
 
 // License represents a validated license

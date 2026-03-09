@@ -187,12 +187,12 @@ func (e *ParallelExecutor) buildPartitionQuery(template, path, options string) s
 // It iterates through all partition results sequentially, presenting them as
 // a single result set.
 type MergedRowIterator struct {
-	results     []*PartitionResult
-	currentIdx  int
-	columns     []string
-	scanBuffer  []interface{}
-	valuePtrs   []interface{}
-	logger      zerolog.Logger
+	results    []*PartitionResult
+	currentIdx int
+	columns    []string
+	scanBuffer []interface{}
+	valuePtrs  []interface{}
+	logger     zerolog.Logger
 }
 
 // NewMergedRowIterator creates an iterator over multiple partition results.

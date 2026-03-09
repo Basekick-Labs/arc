@@ -11,9 +11,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Basekick-Labs/msgpack/v6"
 	pahomqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/rs/zerolog"
-	"github.com/Basekick-Labs/msgpack/v6"
 
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
@@ -22,12 +22,12 @@ import (
 
 // Subscriber handles MQTT connection and message processing for a single subscription
 type Subscriber struct {
-	id           string
-	config       *Subscription
-	client       pahomqtt.Client
-	arrowBuffer  *ingest.ArrowBuffer
-	logger       zerolog.Logger
-	encryptor    PasswordEncryptor
+	id             string
+	config         *Subscription
+	client         pahomqtt.Client
+	arrowBuffer    *ingest.ArrowBuffer
+	logger         zerolog.Logger
+	encryptor      PasswordEncryptor
 	onStatusChange func(id string, status SubscriptionStatus, errMsg string)
 
 	// Runtime state

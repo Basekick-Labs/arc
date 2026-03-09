@@ -8,9 +8,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/basekick-labs/arc/internal/cluster/protocol"
 	"github.com/rs/zerolog"
-	"github.com/Basekick-Labs/msgpack/v6"
 )
 
 // WALWriter interface for writing to local WAL
@@ -52,11 +52,11 @@ type ReceiverConfig struct {
 // Receiver receives WAL entries from the writer node and applies them locally.
 // It runs on reader nodes to maintain data consistency with the writer.
 type Receiver struct {
-	cfg        *ReceiverConfig
-	conn       net.Conn
-	lastSeq    atomic.Uint64 // Last received sequence
-	mu         sync.Mutex
-	logger     zerolog.Logger
+	cfg     *ReceiverConfig
+	conn    net.Conn
+	lastSeq atomic.Uint64 // Last received sequence
+	mu      sync.Mutex
+	logger  zerolog.Logger
 
 	// Lifecycle
 	ctx        context.Context

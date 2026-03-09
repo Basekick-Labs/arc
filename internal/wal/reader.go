@@ -8,8 +8,8 @@ import (
 	"io"
 	"os"
 
-	"github.com/rs/zerolog"
 	"github.com/Basekick-Labs/msgpack/v6"
+	"github.com/rs/zerolog"
 )
 
 // Reader reads WAL files for recovery operations

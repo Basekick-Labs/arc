@@ -288,8 +288,8 @@ func TestComputeDerivedMetrics(t *testing.T) {
 func TestClassifyOrbit(t *testing.T) {
 	tests := []struct {
 		name         string
-		perigeeKm   float64
-		apogeeKm    float64
+		perigeeKm    float64
+		apogeeKm     float64
 		eccentricity float64
 		expected     string
 	}{

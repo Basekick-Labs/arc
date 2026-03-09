@@ -69,11 +69,11 @@ type JoinRequest struct {
 	NodeName    string `json:"node_name"`
 	Role        string `json:"role"`
 	ClusterName string `json:"cluster_name"`
-	RaftAddr    string `json:"raft_addr"`    // Raft transport address for AddVoter
-	APIAddr     string `json:"api_addr"`     // HTTP API address
-	CoordAddr   string `json:"coord_addr"`   // Coordinator address (for peer communication)
+	RaftAddr    string `json:"raft_addr"`  // Raft transport address for AddVoter
+	APIAddr     string `json:"api_addr"`   // HTTP API address
+	CoordAddr   string `json:"coord_addr"` // Coordinator address (for peer communication)
 	Version     string `json:"version"`
-	CoreCount   int    `json:"core_count"`   // Number of CPU cores (GOMAXPROCS) on this node
+	CoreCount   int    `json:"core_count"` // Number of CPU cores (GOMAXPROCS) on this node
 }
 
 // NodeInfo represents a node in the cluster (used in JoinResponse).

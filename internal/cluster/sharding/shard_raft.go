@@ -40,11 +40,11 @@ type ShardRaftConfig struct {
 // ShardRaftManager manages per-shard Raft clusters.
 // Each shard has its own Raft cluster for leader election and failover.
 type ShardRaftManager struct {
-	cfg      *ShardRaftConfig
-	shards   map[int]*ShardRaftNode // shardID -> raft node
-	mu       sync.RWMutex
-	logger   zerolog.Logger
-	running  bool
+	cfg     *ShardRaftConfig
+	shards  map[int]*ShardRaftNode // shardID -> raft node
+	mu      sync.RWMutex
+	logger  zerolog.Logger
+	running bool
 
 	// Callbacks for leadership changes
 	onBecomeLeader   func(shardID int)
@@ -65,8 +65,8 @@ type ShardRaftNode struct {
 	running     bool
 
 	// Leadership tracking
-	isLeader    bool
-	leaderMu    sync.RWMutex
+	isLeader       bool
+	leaderMu       sync.RWMutex
 	onLeaderChange func(isLeader bool)
 }
 
@@ -74,9 +74,9 @@ type ShardRaftNode struct {
 // It tracks which node is the primary and replication state.
 type ShardFSM struct {
 	shardID      int
-	primaryID    string                // Current primary node ID
-	replicaLag   map[string]int64      // replica ID -> bytes behind
-	lastWriteSeq uint64                // Last write sequence
+	primaryID    string           // Current primary node ID
+	replicaLag   map[string]int64 // replica ID -> bytes behind
+	lastWriteSeq uint64           // Last write sequence
 	mu           sync.RWMutex
 	logger       zerolog.Logger
 }

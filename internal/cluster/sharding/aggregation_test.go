@@ -73,10 +73,10 @@ func TestAggregationRewriter_DetectAggregations(t *testing.T) {
 	rewriter := NewAggregationRewriter(logger)
 
 	tests := []struct {
-		name           string
-		selectClause   string
-		expectedTypes  []AggregationType
-		expectedCount  int
+		name          string
+		selectClause  string
+		expectedTypes []AggregationType
+		expectedCount int
 	}{
 		{
 			name:          "single SUM",

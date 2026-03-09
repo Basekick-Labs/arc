@@ -29,8 +29,8 @@ type Team struct {
 type Role struct {
 	ID                     int64                   `json:"id"`
 	TeamID                 int64                   `json:"team_id"`
-	DatabasePattern        string                  `json:"database_pattern"`         // e.g., "production", "*", "analytics_*"
-	Permissions            []string                `json:"permissions"`              // ["read", "write", "delete"]
+	DatabasePattern        string                  `json:"database_pattern"` // e.g., "production", "*", "analytics_*"
+	Permissions            []string                `json:"permissions"`      // ["read", "write", "delete"]
 	CreatedAt              time.Time               `json:"created_at"`
 	MeasurementPermissions []MeasurementPermission `json:"measurement_permissions,omitempty"` // Populated on request
 }

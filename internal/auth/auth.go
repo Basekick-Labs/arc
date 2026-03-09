@@ -24,12 +24,12 @@ import (
 
 // TokenInfo represents token metadata returned by verify
 type TokenInfo struct {
-	ID          int64     `json:"id"`
-	Name        string    `json:"name"`
-	Description string    `json:"description,omitempty"`
-	Permissions []string  `json:"permissions"`
-	CreatedAt   time.Time `json:"created_at"`
-	LastUsedAt  time.Time `json:"last_used_at,omitempty"`
+	ID          int64      `json:"id"`
+	Name        string     `json:"name"`
+	Description string     `json:"description,omitempty"`
+	Permissions []string   `json:"permissions"`
+	CreatedAt   time.Time  `json:"created_at"`
+	LastUsedAt  time.Time  `json:"last_used_at,omitempty"`
 	Enabled     bool       `json:"enabled"`
 	ExpiresAt   *time.Time `json:"expires_at"`
 }
