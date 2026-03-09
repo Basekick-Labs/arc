@@ -89,6 +89,25 @@ WRN Slow query detected component=query-handler execution_time_ms=1250 row_count
 
 Covers all query paths: standard JSON, parallel JSON, measurement queries, and Arrow IPC JSON.
 
+## Storage
+
+### S3 Path Prefix Support
+
+Added `ARC_STORAGE_S3_PREFIX` configuration option that prepends a path prefix to all S3 storage operations. This enables shared-bucket multi-tenant deployments where many instances share a single S3 bucket with path-based isolation.
+
+**Configuration:**
+```toml
+[storage]
+s3_bucket = "arc-cloud-data"
+s3_prefix = "instances/abc123/"
+```
+
+Env var: `ARC_STORAGE_S3_PREFIX`
+
+Files are stored as: `s3://arc-cloud-data/instances/abc123/{database}/{measurement}/...`
+
+Works transparently with cold storage tiering, compaction, queries, and all existing storage operations. When not set, behavior is unchanged (fully backwards compatible). The prefix is validated with a character allowlist (alphanumeric, `/`, `-`, `_`, `.`) and path traversal protection.
+
 ## Dependencies
 
 ### DuckDB 1.4.3 → 1.4.4

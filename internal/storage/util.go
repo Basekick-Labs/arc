@@ -35,7 +35,7 @@ func GetLocalBasePath(backend Backend, logger *zerolog.Logger, feature string, f
 func GetStoragePath(backend Backend, database, measurement string) string {
 	switch b := backend.(type) {
 	case *S3Backend:
-		return "s3://" + b.GetBucket() + "/" + database + "/" + measurement + "/**/*.parquet"
+		return "s3://" + b.GetBucket() + "/" + b.GetPrefix() + database + "/" + measurement + "/**/*.parquet"
 	case *AzureBlobBackend:
 		return "azure://" + b.GetContainer() + "/" + database + "/" + measurement + "/**/*.parquet"
 	case *LocalBackend:

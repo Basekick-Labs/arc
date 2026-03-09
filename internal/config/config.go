@@ -69,6 +69,7 @@ type StorageConfig struct {
 	S3SecretKey string // AWS secret key (or use AWS_SECRET_ACCESS_KEY env var)
 	S3UseSSL    bool   // Use HTTPS for S3 connections
 	S3PathStyle bool   // Use path-style addressing (required for MinIO)
+	S3Prefix    string // Path prefix within the bucket (e.g., "instances/abc123/")
 	// Azure Blob Storage configuration
 	AzureConnectionString  string // Connection string (simplest auth method)
 	AzureAccountName       string // Storage account name
@@ -226,6 +227,7 @@ type ColdTierConfig struct {
 	S3SecretKey    string // AWS secret key (use env: ARC_TIERED_STORAGE_COLD_S3_SECRET_KEY)
 	S3UseSSL       bool   // Use HTTPS for S3 connections
 	S3PathStyle    bool   // Use path-style addressing (required for MinIO)
+	S3Prefix       string // Path prefix within the bucket (e.g., "instances/abc123/")
 	S3StorageClass string // S3 storage class (default: "GLACIER")
 
 	// Azure settings
@@ -403,6 +405,7 @@ func Load() (*Config, error) {
 			S3SecretKey: v.GetString("storage.s3_secret_key"),
 			S3UseSSL:    v.GetBool("storage.s3_use_ssl"),
 			S3PathStyle: v.GetBool("storage.s3_path_style"),
+			S3Prefix:    v.GetString("storage.s3_prefix"),
 			// Azure Blob Storage
 			AzureConnectionString:   v.GetString("storage.azure_connection_string"),
 			AzureAccountName:        v.GetString("storage.azure_account_name"),
@@ -560,6 +563,7 @@ func Load() (*Config, error) {
 				S3SecretKey:           v.GetString("tiered_storage.cold.s3_secret_key"),
 				S3UseSSL:              v.GetBool("tiered_storage.cold.s3_use_ssl"),
 				S3PathStyle:           v.GetBool("tiered_storage.cold.s3_path_style"),
+				S3Prefix:              v.GetString("tiered_storage.cold.s3_prefix"),
 				S3StorageClass:        v.GetString("tiered_storage.cold.s3_storage_class"),
 				AzureContainer:        v.GetString("tiered_storage.cold.azure_container"),
 				AzureConnectionString: v.GetString("tiered_storage.cold.azure_connection_string"),

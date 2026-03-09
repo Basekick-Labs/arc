@@ -34,6 +34,7 @@ type S3Backend struct {
 	client    *s3.Client
 	uploader  *manager.Uploader
 	bucket    string
+	prefix    string // path prefix within the bucket (sanitized, with trailing /)
 	region    string
 	endpoint  string
 	pathStyle bool
@@ -51,7 +52,8 @@ type S3Config struct {
 	AccessKey string
 	SecretKey string
 	UseSSL    bool
-	PathStyle bool // Use path-style addressing (required for MinIO)
+	PathStyle bool   // Use path-style addressing (required for MinIO)
+	Prefix    string // Path prefix within the bucket (e.g., "instances/abc123/")
 }
 
 // NewS3Backend creates a new S3/MinIO backend
@@ -137,10 +139,14 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 		u.Concurrency = multipartConcurrency
 	})
 
+	// Sanitize prefix: strip leading /, reject .., ensure trailing / if non-empty
+	prefix := SanitizeS3Prefix(cfg.Prefix)
+
 	backend := &S3Backend{
 		client:    client,
 		uploader:  uploader,
 		bucket:    cfg.Bucket,
+		prefix:    prefix,
 		region:    region,
 		endpoint:  cfg.Endpoint,
 		pathStyle: cfg.PathStyle,
@@ -191,7 +197,7 @@ func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Read
 	// For small files with known size, use simple PutObject
 	_, err := b.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:        aws.String(b.bucket),
-		Key:           aws.String(path),
+		Key:           aws.String(b.prefixedKey(path)),
 		Body:          reader,
 		ContentLength: aws.Int64(size),
 		ContentType:   aws.String(contentType),
@@ -220,7 +226,7 @@ func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Read
 func (b *S3Backend) writeMultipart(ctx context.Context, path string, reader io.Reader, size int64, contentType string, start time.Time) error {
 	_, err := b.uploader.Upload(ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(b.bucket),
-		Key:         aws.String(path),
+		Key:         aws.String(b.prefixedKey(path)),
 		Body:        reader,
 		ContentType: aws.String(contentType),
 	})
@@ -248,7 +254,7 @@ func (b *S3Backend) writeMultipart(ctx context.Context, path string, reader io.R
 func (b *S3Backend) Read(ctx context.Context, path string) ([]byte, error) {
 	result, err := b.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(b.bucket),
-		Key:    aws.String(path),
+		Key:    aws.String(b.prefixedKey(path)),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to read from S3: %w", err)
@@ -267,7 +273,7 @@ func (b *S3Backend) Read(ctx context.Context, path string) ([]byte, error) {
 func (b *S3Backend) ReadTo(ctx context.Context, path string, writer io.Writer) error {
 	result, err := b.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(b.bucket),
-		Key:    aws.String(path),
+		Key:    aws.String(b.prefixedKey(path)),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to read from S3: %w", err)
@@ -290,7 +296,7 @@ func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 	for {
 		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket:            aws.String(b.bucket),
-			Prefix:            aws.String(prefix),
+			Prefix:            aws.String(b.prefixedKey(prefix)),
 			ContinuationToken: continuationToken,
 		})
 		if err != nil {
@@ -299,7 +305,9 @@ func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 
 		for _, obj := range result.Contents {
 			if obj.Key != nil {
-				objects = append(objects, *obj.Key)
+				// Strip prefix so callers see paths relative to the logical root
+				key := strings.TrimPrefix(*obj.Key, b.prefix)
+				objects = append(objects, key)
 			}
 		}
 
@@ -316,7 +324,7 @@ func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 func (b *S3Backend) Delete(ctx context.Context, path string) error {
 	_, err := b.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(b.bucket),
-		Key:    aws.String(path),
+		Key:    aws.String(b.prefixedKey(path)),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to delete from S3: %w", err)
@@ -345,7 +353,7 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 		objects := make([]types.ObjectIdentifier, len(batch))
 		for j, path := range batch {
 			objects[j] = types.ObjectIdentifier{
-				Key: aws.String(path),
+				Key: aws.String(b.prefixedKey(path)),
 			}
 		}
 
@@ -369,7 +377,7 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 func (b *S3Backend) Exists(ctx context.Context, path string) (bool, error) {
 	_, err := b.client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(b.bucket),
-		Key:    aws.String(path),
+		Key:    aws.String(b.prefixedKey(path)),
 	})
 	if err != nil {
 		// Check if it's a "not found" error
@@ -399,6 +407,40 @@ func isNotFoundError(err error) bool {
 		strings.Contains(errStr, "404")
 }
 
+// SanitizeS3Prefix cleans and validates an S3 path prefix.
+// Returns empty string if prefix is empty (no-op), otherwise ensures trailing /.
+// Only allows alphanumeric characters, hyphens, underscores, dots, and slashes.
+func SanitizeS3Prefix(prefix string) string {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return ""
+	}
+	// Strip leading slash
+	prefix = strings.TrimLeft(prefix, "/")
+	// Reject path traversal
+	if strings.Contains(prefix, "..") {
+		return ""
+	}
+	// Reject unsafe characters (defense-in-depth against SQL injection
+	// since prefixes are interpolated into DuckDB read_parquet() calls)
+	for _, c := range prefix {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+			c == '/' || c == '-' || c == '_' || c == '.') {
+			return ""
+		}
+	}
+	// Ensure trailing slash
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	return prefix
+}
+
+// prefixedKey prepends the configured prefix to an S3 object key
+func (b *S3Backend) prefixedKey(path string) string {
+	return b.prefix + path
+}
+
 // Close closes the S3 backend (no-op for S3)
 func (b *S3Backend) Close() error {
 	b.logger.Info().Msg("S3 backend closed")
@@ -408,6 +450,11 @@ func (b *S3Backend) Close() error {
 // GetBucket returns the bucket name
 func (b *S3Backend) GetBucket() string {
 	return b.bucket
+}
+
+// GetPrefix returns the path prefix (empty string if none configured)
+func (b *S3Backend) GetPrefix() string {
+	return b.prefix
 }
 
 // GetRegion returns the region
@@ -427,7 +474,7 @@ func (b *S3Backend) GetSecretKey() string {
 
 // GetS3Path returns the S3 URI for a path
 func (b *S3Backend) GetS3Path(path string) string {
-	return fmt.Sprintf("s3://%s/%s", b.bucket, path)
+	return fmt.Sprintf("s3://%s/%s%s", b.bucket, b.prefix, path)
 }
 
 // GetQueryPath generates S3 path patterns for time-based query pruning
@@ -440,20 +487,20 @@ func (b *S3Backend) GetS3Path(path string) string {
 func (b *S3Backend) GetQueryPath(database, measurement string, year, month, day, hour int) string {
 	if hour > 0 {
 		// Specific hour
-		return fmt.Sprintf("s3://%s/%s/%s/%04d/%02d/%02d/%02d/*.parquet",
-			b.bucket, database, measurement, year, month, day, hour)
+		return fmt.Sprintf("s3://%s/%s%s/%s/%04d/%02d/%02d/%02d/*.parquet",
+			b.bucket, b.prefix, database, measurement, year, month, day, hour)
 	} else if day > 0 {
 		// Specific day, all hours
-		return fmt.Sprintf("s3://%s/%s/%s/%04d/%02d/%02d/*/*.parquet",
-			b.bucket, database, measurement, year, month, day)
+		return fmt.Sprintf("s3://%s/%s%s/%s/%04d/%02d/%02d/*/*.parquet",
+			b.bucket, b.prefix, database, measurement, year, month, day)
 	} else if month > 0 {
 		// Specific month, all days and hours
-		return fmt.Sprintf("s3://%s/%s/%s/%04d/%02d/*/*/*.parquet",
-			b.bucket, database, measurement, year, month)
+		return fmt.Sprintf("s3://%s/%s%s/%s/%04d/%02d/*/*/*.parquet",
+			b.bucket, b.prefix, database, measurement, year, month)
 	} else {
 		// Entire year
-		return fmt.Sprintf("s3://%s/%s/%s/%04d/*/*/*/*.parquet",
-			b.bucket, database, measurement, year)
+		return fmt.Sprintf("s3://%s/%s%s/%s/%04d/*/*/*/*.parquet",
+			b.bucket, b.prefix, database, measurement, year)
 	}
 }
 
@@ -467,8 +514,8 @@ func (b *S3Backend) GetQueryPathRange(database, measurement string, startTime, e
 	end := endTime.Truncate(24 * time.Hour).Add(24 * time.Hour)
 
 	for current.Before(end) {
-		path := fmt.Sprintf("s3://%s/%s/%s/%04d/%02d/%02d/*/*.parquet",
-			b.bucket, database, measurement,
+		path := fmt.Sprintf("s3://%s/%s%s/%s/%04d/%02d/%02d/*/*.parquet",
+			b.bucket, b.prefix, database, measurement,
 			current.Year(), int(current.Month()), current.Day())
 		paths = append(paths, path)
 		current = current.Add(24 * time.Hour)
@@ -486,6 +533,7 @@ func (b *S3Backend) Type() string {
 func (b *S3Backend) ConfigJSON() string {
 	config := map[string]interface{}{
 		"bucket":     b.bucket,
+		"prefix":     b.prefix,
 		"region":     b.region,
 		"endpoint":   b.endpoint,
 		"path_style": b.pathStyle,
@@ -504,13 +552,15 @@ func (b *S3Backend) ListDirectories(ctx context.Context, prefix string) ([]strin
 		prefix = prefix + "/"
 	}
 
+	fullPrefix := b.prefixedKey(prefix)
+
 	var dirs []string
 	var continuationToken *string
 
 	for {
 		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket:            aws.String(b.bucket),
-			Prefix:            aws.String(prefix),
+			Prefix:            aws.String(fullPrefix),
 			Delimiter:         aws.String("/"),
 			ContinuationToken: continuationToken,
 		})
@@ -522,8 +572,8 @@ func (b *S3Backend) ListDirectories(ctx context.Context, prefix string) ([]strin
 		for _, cp := range result.CommonPrefixes {
 			if cp.Prefix != nil {
 				// Extract directory name from the prefix
-				// e.g., "mydb/cpu/" -> "cpu"
-				dir := strings.TrimPrefix(*cp.Prefix, prefix)
+				// e.g., "instances/abc/mydb/cpu/" -> "cpu"
+				dir := strings.TrimPrefix(*cp.Prefix, fullPrefix)
 				dir = strings.TrimSuffix(dir, "/")
 				if dir != "" && !strings.HasPrefix(dir, ".") {
 					dirs = append(dirs, dir)
@@ -549,7 +599,7 @@ func (b *S3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInf
 	for {
 		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket:            aws.String(b.bucket),
-			Prefix:            aws.String(prefix),
+			Prefix:            aws.String(b.prefixedKey(prefix)),
 			ContinuationToken: continuationToken,
 		})
 		if err != nil {
@@ -559,7 +609,7 @@ func (b *S3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInf
 		for _, obj := range result.Contents {
 			if obj.Key != nil {
 				info := ObjectInfo{
-					Path: *obj.Key,
+					Path: strings.TrimPrefix(*obj.Key, b.prefix),
 				}
 				if obj.Size != nil {
 					info.Size = *obj.Size

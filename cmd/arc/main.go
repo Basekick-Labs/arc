@@ -238,6 +238,7 @@ func main() {
 			SecretKey: cfg.Storage.S3SecretKey,
 			UseSSL:    cfg.Storage.S3UseSSL,
 			PathStyle: cfg.Storage.S3PathStyle,
+			Prefix:    cfg.Storage.S3Prefix,
 		}
 		storageBackend, err = storage.NewS3Backend(s3Config, logger.Get("storage"))
 		if err != nil {
@@ -247,6 +248,7 @@ func main() {
 		log.Info().
 			Str("backend", cfg.Storage.Backend).
 			Str("bucket", cfg.Storage.S3Bucket).
+			Str("prefix", cfg.Storage.S3Prefix).
 			Str("region", cfg.Storage.S3Region).
 			Str("endpoint", cfg.Storage.S3Endpoint).
 			Msg("Storage backend initialized")
@@ -1245,6 +1247,7 @@ func main() {
 							SecretKey: cold.S3SecretKey,
 							UseSSL:    cold.S3UseSSL,
 							PathStyle: cold.S3PathStyle,
+							Prefix:    cold.S3Prefix,
 						}
 						coldBackend, err = storage.NewS3Backend(s3Config, logger.Get("tiering-cold-s3"))
 						if err != nil {

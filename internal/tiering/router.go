@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
 
@@ -185,16 +186,11 @@ func (r *Router) buildReadParquet(paths []string) string {
 }
 
 func (r *Router) buildFullPath(backendType, path string) string {
-	switch backendType {
-	case "s3":
-		bucket := r.manager.config.Cold.S3Bucket
-		return fmt.Sprintf("s3://%s/%s", bucket, path)
-	case "azure":
-		container := r.manager.config.Cold.AzureContainer
-		return fmt.Sprintf("azure://%s/%s", container, path)
-	case "local":
-		// For local, the path is already relative to storage root
-		return path
+	switch backend := r.manager.coldBackend.(type) {
+	case *storage.S3Backend:
+		return fmt.Sprintf("s3://%s/%s%s", backend.GetBucket(), backend.GetPrefix(), path)
+	case *storage.AzureBlobBackend:
+		return fmt.Sprintf("azure://%s/%s", backend.GetContainer(), path)
 	default:
 		return path
 	}
