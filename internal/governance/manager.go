@@ -29,13 +29,13 @@ type Policy struct {
 
 // TokenUsage represents current usage stats for a token.
 type TokenUsage struct {
-	TokenID                    int64     `json:"token_id"`
-	QueriesThisHour            int       `json:"queries_this_hour"`
-	QueriesThisDay             int       `json:"queries_this_day"`
-	HourResetAt                time.Time `json:"hour_reset_at"`
-	DayResetAt                 time.Time `json:"day_reset_at"`
-	RateLimitRemainingPerMin   int       `json:"rate_limit_remaining_per_minute"`
-	RateLimitRemainingPerHour  int       `json:"rate_limit_remaining_per_hour"`
+	TokenID                   int64     `json:"token_id"`
+	QueriesThisHour           int       `json:"queries_this_hour"`
+	QueriesThisDay            int       `json:"queries_this_day"`
+	HourResetAt               time.Time `json:"hour_reset_at"`
+	DayResetAt                time.Time `json:"day_reset_at"`
+	RateLimitRemainingPerMin  int       `json:"rate_limit_remaining_per_minute"`
+	RateLimitRemainingPerHour int       `json:"rate_limit_remaining_per_hour"`
 }
 
 // EnforcementResult is returned when checking if a query is allowed.

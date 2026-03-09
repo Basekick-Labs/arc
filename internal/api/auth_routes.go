@@ -80,10 +80,10 @@ func (h *AuthHandler) verifyToken(c *fiber.Ctx) error {
 
 // CreateTokenRequest represents a token creation request
 type CreateTokenRequest struct {
-	Name        string   `json:"name"`
-	Description string   `json:"description,omitempty"`
+	Name        string    `json:"name"`
+	Description string    `json:"description,omitempty"`
 	Permissions *[]string `json:"permissions,omitempty"` // nil = default (read,write), empty array = no permissions (RBAC-only)
-	ExpiresIn   string   `json:"expires_in,omitempty"` // e.g., "24h", "7d", "30d"
+	ExpiresIn   string    `json:"expires_in,omitempty"`  // e.g., "24h", "7d", "30d"
 }
 
 // createToken handles POST /api/v1/auth/tokens
@@ -645,8 +645,8 @@ func (h *AuthHandler) getEffectivePermissions(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{
-		"success":     true,
-		"permissions": perms,
+		"success":      true,
+		"permissions":  perms,
 		"rbac_enabled": h.rbacManager.IsRBACEnabled(),
 	})
 }

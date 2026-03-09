@@ -97,11 +97,11 @@ func (h *TieringHandler) GetFiles(c *fiber.Ctx) error {
 
 // TriggerMigrationRequest represents a manual migration request
 type TriggerMigrationRequest struct {
-	FromTier    string `json:"from_tier,omitempty"`    // Optional: "hot" (2-tier system)
-	ToTier      string `json:"to_tier,omitempty"`      // Optional: "cold" (2-tier system)
-	Database    string `json:"database,omitempty"`     // Optional: filter by database
-	Measurement string `json:"measurement,omitempty"`  // Optional: filter by measurement
-	DryRun      bool   `json:"dry_run,omitempty"`      // If true, only report what would be migrated
+	FromTier    string `json:"from_tier,omitempty"`   // Optional: "hot" (2-tier system)
+	ToTier      string `json:"to_tier,omitempty"`     // Optional: "cold" (2-tier system)
+	Database    string `json:"database,omitempty"`    // Optional: filter by database
+	Measurement string `json:"measurement,omitempty"` // Optional: filter by measurement
+	DryRun      bool   `json:"dry_run,omitempty"`     // If true, only report what would be migrated
 }
 
 // TriggerMigration triggers a manual migration

@@ -51,7 +51,7 @@ type TLERecord struct {
 	RAANDeg          float64
 	Eccentricity     float64
 	ArgPerigeeDeg    float64
-	MeanAnomalyDeg  float64
+	MeanAnomalyDeg   float64
 	MeanMotionRevDay float64
 	RevolutionNumber int
 

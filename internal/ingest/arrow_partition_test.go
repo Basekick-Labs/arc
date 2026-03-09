@@ -205,7 +205,6 @@ func TestSortColumnsByTime(t *testing.T) {
 	}
 }
 
-
 // TestGenerateStoragePath tests the storage path generation with data time
 func TestGenerateStoragePath(t *testing.T) {
 	buffer := &ArrowBuffer{}
@@ -329,10 +328,10 @@ func TestGroupByHourWithMultiKeySort(t *testing.T) {
 func TestSliceColumnsByIndices(t *testing.T) {
 	// Create sample data
 	columns := map[string]interface{}{
-		"time":           []int64{100, 200, 300, 400, 500, 600},
-		"tag_sensor_id":  []string{"A", "A", "B", "B", "C", "C"},
-		"value":          []float64{1.1, 2.2, 3.3, 4.4, 5.5, 6.6},
-		"tag_location":   []string{"room1", "room2", "room1", "room2", "room1", "room2"},
+		"time":          []int64{100, 200, 300, 400, 500, 600},
+		"tag_sensor_id": []string{"A", "A", "B", "B", "C", "C"},
+		"value":         []float64{1.1, 2.2, 3.3, 4.4, 5.5, 6.6},
+		"tag_location":  []string{"room1", "room2", "room1", "room2", "room1", "room2"},
 	}
 
 	// Extract indices [0, 2, 4] (first occurrence of each sensor)
@@ -696,4 +695,3 @@ func BenchmarkSortColumnsByKeys(b *testing.B) {
 		})
 	}
 }
-

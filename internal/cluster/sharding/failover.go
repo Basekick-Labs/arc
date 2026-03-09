@@ -38,15 +38,15 @@ type FailoverConfig struct {
 // FailoverManager monitors shard health and triggers automatic failover.
 // It runs on the meta cluster leader and coordinates shard reassignment.
 type FailoverManager struct {
-	cfg           *FailoverConfig
-	nodeHealth    map[string]*nodeHealthState // nodeID -> health state
-	shardHealth   map[int]*shardHealthState   // shardID -> health state
-	mu            sync.RWMutex
-	logger        zerolog.Logger
-	ctx           context.Context
-	cancelFn      context.CancelFunc
-	running       atomic.Bool
-	wg            sync.WaitGroup
+	cfg         *FailoverConfig
+	nodeHealth  map[string]*nodeHealthState // nodeID -> health state
+	shardHealth map[int]*shardHealthState   // shardID -> health state
+	mu          sync.RWMutex
+	logger      zerolog.Logger
+	ctx         context.Context
+	cancelFn    context.CancelFunc
+	running     atomic.Bool
+	wg          sync.WaitGroup
 
 	// Callbacks
 	onFailoverStart    func(shardID int, oldPrimary, newPrimary string)
@@ -439,11 +439,11 @@ func (m *FailoverManager) GetShardHealthStatus(shardID int) map[string]interface
 	}
 
 	return map[string]interface{}{
-		"shard_id":          state.shardID,
-		"primary_id":        state.primaryID,
-		"is_primary_up":     state.isPrimaryUp,
-		"failover_in_prog":  state.failoverInProg,
-		"last_check":        state.lastCheck.Format(time.RFC3339),
+		"shard_id":         state.shardID,
+		"primary_id":       state.primaryID,
+		"is_primary_up":    state.isPrimaryUp,
+		"failover_in_prog": state.failoverInProg,
+		"last_check":       state.lastCheck.Format(time.RFC3339),
 	}
 }
 

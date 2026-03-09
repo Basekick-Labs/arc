@@ -73,10 +73,10 @@ func TestParseRole(t *testing.T) {
 
 func TestRoleCapabilities(t *testing.T) {
 	tests := []struct {
-		role         NodeRole
-		canIngest    bool
-		canQuery     bool
-		canCompact   bool
+		role          NodeRole
+		canIngest     bool
+		canQuery      bool
+		canCompact    bool
 		canCoordinate bool
 	}{
 		{RoleStandalone, true, true, true, false},

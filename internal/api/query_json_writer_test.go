@@ -342,8 +342,8 @@ func TestStreamTypedJSON_DuckDBTypeCrossover(t *testing.T) {
 	// DuckDB sometimes returns float64 for integer columns (e.g., COUNT(*))
 	scanner := &mockRowScanner{
 		rows: [][]interface{}{
-			{float64(12345)},  // float64 in int64 column — should render as integer
-			{float64(99.99)},  // actual float in int64 column — should render as float
+			{float64(12345)}, // float64 in int64 column — should render as integer
+			{float64(99.99)}, // actual float in int64 column — should render as float
 		},
 	}
 

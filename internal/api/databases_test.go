@@ -672,10 +672,10 @@ func setupBenchmarkHandler(b *testing.B, numDatabases, measurementsPerDB int) (*
 // results in N+1 storage.List() calls instead of 1-2.
 func BenchmarkDatabasesHandler_List(b *testing.B) {
 	cases := []struct {
-		name           string
-		numDBs         int
-		measurePerDB   int
-		expectedCalls  int // Expected with optimization (1 or 2 calls)
+		name          string
+		numDBs        int
+		measurePerDB  int
+		expectedCalls int // Expected with optimization (1 or 2 calls)
 	}{
 		{"5_databases_2_measurements", 5, 2, 2},
 		{"10_databases_3_measurements", 10, 3, 2},

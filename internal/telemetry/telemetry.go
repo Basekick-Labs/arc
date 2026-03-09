@@ -63,12 +63,12 @@ type Collector struct {
 // TelemetryPayload represents the data sent to the telemetry endpoint
 // Matches Python format from collector.py
 type TelemetryPayload struct {
-	InstanceID string    `json:"instance_id"`
-	Timestamp  string    `json:"timestamp"`
-	ArcVersion string    `json:"arc_version"`
-	OS         OSInfo    `json:"os"`
-	CPU        CPUInfo   `json:"cpu"`
-	Memory     MemInfo   `json:"memory"`
+	InstanceID string  `json:"instance_id"`
+	Timestamp  string  `json:"timestamp"`
+	ArcVersion string  `json:"arc_version"`
+	OS         OSInfo  `json:"os"`
+	CPU        CPUInfo `json:"cpu"`
+	Memory     MemInfo `json:"memory"`
 }
 
 // OSInfo contains operating system information

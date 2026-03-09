@@ -78,8 +78,8 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 
 	// Set connection pool limits optimized for query-heavy workloads
 	db.SetMaxOpenConns(cfg.MaxConnections)
-	db.SetMaxIdleConns(cfg.MaxConnections) // Keep all connections idle-ready to avoid acquisition overhead
-	db.SetConnMaxLifetime(0)               // No lifetime limit - DuckDB handles connection health internally
+	db.SetMaxIdleConns(cfg.MaxConnections)  // Keep all connections idle-ready to avoid acquisition overhead
+	db.SetConnMaxLifetime(0)                // No lifetime limit - DuckDB handles connection health internally
 	db.SetConnMaxIdleTime(10 * time.Minute) // Longer idle time to reduce connection churn
 
 	// Test connection
@@ -147,7 +147,6 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	if _, err := db.Exec("SET GLOBAL preserve_insertion_order=true"); err != nil {
 		logger.Warn().Err(err).Msg("Failed to set preserve_insertion_order")
 	}
-
 
 	// Configure httpfs extension for S3 access if credentials are provided
 	if cfg.S3AccessKey != "" && cfg.S3SecretKey != "" {
@@ -244,7 +243,7 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 					// A 7-day hourly query generates ~168 glob patterns — the default
 					// 64 entries causes constant eviction on large deployments.
 					globEntries := max(maxBlocks/20, 64)      // ~5% of blocks, floor at default
-					metadataEntries := max(maxBlocks/10, 250)  // ~10% of blocks, floor at default
+					metadataEntries := max(maxBlocks/10, 250) // ~10% of blocks, floor at default
 					fileHandleEntries := max(maxBlocks/10, 250)
 					if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_glob_cache_entry_size=%d", globEntries)); err != nil {
 						logger.Warn().Err(err).Msg("Failed to set cache_httpfs_glob_cache_entry_size")
@@ -585,11 +584,11 @@ func (d *DuckDB) QueryWithProfileContext(ctx context.Context, query string) (*sq
 
 // duckdbProfileOutput represents the JSON structure from DuckDB profiling
 type duckdbProfileOutput struct {
-	Latency     float64                  `json:"latency"`
-	RowsScanned uint64                   `json:"operator_rows_scanned"`
-	Planner     float64                  `json:"planner"`
-	Children    []duckdbProfileOperator  `json:"children"`
-	Timings     map[string]interface{}   `json:"timings"`
+	Latency     float64                 `json:"latency"`
+	RowsScanned uint64                  `json:"operator_rows_scanned"`
+	Planner     float64                 `json:"planner"`
+	Children    []duckdbProfileOperator `json:"children"`
+	Timings     map[string]interface{}  `json:"timings"`
 }
 
 type duckdbProfileOperator struct {

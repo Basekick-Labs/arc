@@ -264,4 +264,3 @@ func parseDBMeasurement(path string) (database, measurement string) {
 	}
 	return "unknown", "unknown"
 }
-

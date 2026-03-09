@@ -215,9 +215,9 @@ func TestManager_CheckQuota_WithPolicy(t *testing.T) {
 	ctx := context.Background()
 
 	m.CreatePolicy(ctx, &Policy{
-		TokenID:           1,
-		MaxQueriesPerHour: 3,
-		MaxRowsPerQuery:   50000,
+		TokenID:            1,
+		MaxQueriesPerHour:  3,
+		MaxRowsPerQuery:    50000,
 		MaxScanDurationSec: 10,
 	})
 

@@ -261,11 +261,11 @@ func (sm *ShardMap) Stats() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"num_shards":       sm.numShards,
-		"assigned_shards":  primaryCount,
-		"unassigned":       unassignedCount,
-		"total_replicas":   replicaCount,
-		"version":          sm.version.Load(),
+		"num_shards":      sm.numShards,
+		"assigned_shards": primaryCount,
+		"unassigned":      unassignedCount,
+		"total_replicas":  replicaCount,
+		"version":         sm.version.Load(),
 	}
 }
 

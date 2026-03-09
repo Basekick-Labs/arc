@@ -49,8 +49,8 @@ func validateName(name string) error {
 // tokenRBACData holds all preloaded RBAC data for a token
 type tokenRBACData struct {
 	teams     []Team
-	roles     map[int64][]Role                    // teamID -> roles
-	measPerms map[int64][]MeasurementPermission   // roleID -> measurement permissions
+	roles     map[int64][]Role                  // teamID -> roles
+	measPerms map[int64][]MeasurementPermission // roleID -> measurement permissions
 	loadedAt  time.Time
 }
 
@@ -75,13 +75,13 @@ type RBACManager struct {
 	logger        zerolog.Logger
 
 	// Token RBAC data cache (teams/roles/permissions preloaded)
-	tokenCache   map[int64]*tokenRBACData
-	tokenCacheMu sync.RWMutex
+	tokenCache    map[int64]*tokenRBACData
+	tokenCacheMu  sync.RWMutex
 	tokenCacheTTL time.Duration
 
 	// Permission result cache
-	permCache   map[permissionCacheKey]*permissionCacheEntry
-	permCacheMu sync.RWMutex
+	permCache    map[permissionCacheKey]*permissionCacheEntry
+	permCacheMu  sync.RWMutex
 	permCacheTTL time.Duration
 
 	// Cache stats

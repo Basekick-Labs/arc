@@ -187,11 +187,11 @@ func TestLineProtocolParser_ParseLine_FieldTypes(t *testing.T) {
 	parser := NewLineProtocolParser()
 
 	tests := []struct {
-		name       string
-		input      string
-		fieldName  string
-		wantValue  interface{}
-		wantType   string
+		name      string
+		input     string
+		fieldName string
+		wantValue interface{}
+		wantType  string
 	}{
 		{
 			name:      "float without decimal",

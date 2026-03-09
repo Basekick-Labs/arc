@@ -46,11 +46,11 @@ type Manager struct {
 	cycleID      atomic.Int64
 
 	// Metrics
-	TotalJobsCompleted   int
-	TotalJobsFailed      int
-	TotalFilesCompacted  int
-	TotalBytesSaved      int64
-	TotalManifestsRecov  int // Number of manifests recovered
+	TotalJobsCompleted  int
+	TotalJobsFailed     int
+	TotalFilesCompacted int
+	TotalBytesSaved     int64
+	TotalManifestsRecov int // Number of manifests recovered
 
 	// Callback invoked after a successful compaction job (in parent process).
 	// Used to invalidate DuckDB and query caches after files are deleted.

@@ -89,21 +89,21 @@ func getMACAddresses() []string {
 func isVirtualInterface(name string) bool {
 	// Virtual/bridge interfaces that can change between restarts
 	virtualPrefixes := []string{
-		"docker",   // Docker networks
-		"br-",      // Docker/Linux bridges
-		"veth",     // Virtual ethernet (Docker containers)
-		"vmnet",    // VMware networks
-		"vmenet",   // macOS VM networks
-		"bridge",   // Bridge interfaces (Linux, macOS)
-		"virbr",    // libvirt bridges
-		"vboxnet",  // VirtualBox networks
-		"utun",     // VPN tunnels
-		"tun",      // TUN devices
-		"tap",      // TAP devices
-		"awdl",     // Apple Wireless Direct Link (unstable)
-		"llw",      // Apple Low Latency WLAN (unstable)
-		"ap",       // Apple access point (hotspot)
-		"anpi",     // Apple network processor interface
+		"docker",  // Docker networks
+		"br-",     // Docker/Linux bridges
+		"veth",    // Virtual ethernet (Docker containers)
+		"vmnet",   // VMware networks
+		"vmenet",  // macOS VM networks
+		"bridge",  // Bridge interfaces (Linux, macOS)
+		"virbr",   // libvirt bridges
+		"vboxnet", // VirtualBox networks
+		"utun",    // VPN tunnels
+		"tun",     // TUN devices
+		"tap",     // TAP devices
+		"awdl",    // Apple Wireless Direct Link (unstable)
+		"llw",     // Apple Low Latency WLAN (unstable)
+		"ap",      // Apple access point (hotspot)
+		"anpi",    // Apple network processor interface
 	}
 
 	for _, prefix := range virtualPrefixes {

@@ -4,17 +4,17 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/rs/zerolog"
-	"github.com/Basekick-Labs/msgpack/v6"
 )
 
 // MessagePackDecoder handles decoding of MessagePack binary protocol
 // Supports row format, columnar format (fastest), and batch format
 type MessagePackDecoder struct {
-	logger        zerolog.Logger
-	totalDecoded  uint64
-	totalErrors   uint64
+	logger       zerolog.Logger
+	totalDecoded uint64
+	totalErrors  uint64
 }
 
 // NewMessagePackDecoder creates a new MessagePack decoder
@@ -244,8 +244,8 @@ func (d *MessagePackDecoder) decodeColumnar(payload *models.MsgPackPayload, rawD
 		Measurement: measurement,
 		Columnar:    true,
 		Columns:     payload.Columns,
-		TimeUnit:    "us",      // microseconds
-		RawPayload:  rawData,   // Zero-copy: store original msgpack bytes for WAL
+		TimeUnit:    "us",    // microseconds
+		RawPayload:  rawData, // Zero-copy: store original msgpack bytes for WAL
 	}, nil
 }
 

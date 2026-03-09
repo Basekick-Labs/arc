@@ -27,8 +27,8 @@ type SenderConfig struct {
 type ReaderConnection struct {
 	id         string
 	conn       net.Conn
-	lastAck    atomic.Uint64  // Last acknowledged sequence
-	writeMu    sync.Mutex     // Serialize writes to connection
+	lastAck    atomic.Uint64 // Last acknowledged sequence
+	writeMu    sync.Mutex    // Serialize writes to connection
 	cancelFunc context.CancelFunc
 	ctx        context.Context
 

@@ -62,14 +62,22 @@ func (h *hangingStorageBackend) WriteReader(ctx context.Context, path string, r 
 	data, _ := io.ReadAll(r)
 	return h.Write(ctx, path, data)
 }
-func (h *hangingStorageBackend) Read(ctx context.Context, path string) ([]byte, error)     { return nil, nil }
-func (h *hangingStorageBackend) ReadTo(ctx context.Context, path string, w io.Writer) error { return nil }
-func (h *hangingStorageBackend) List(ctx context.Context, prefix string) ([]string, error)  { return nil, nil }
-func (h *hangingStorageBackend) Delete(ctx context.Context, path string) error              { return nil }
-func (h *hangingStorageBackend) Exists(ctx context.Context, path string) (bool, error)      { return false, nil }
-func (h *hangingStorageBackend) Close() error                                               { return nil }
-func (h *hangingStorageBackend) Type() string                                               { return "mock-hanging" }
-func (h *hangingStorageBackend) ConfigJSON() string                                         { return "{}" }
+func (h *hangingStorageBackend) Read(ctx context.Context, path string) ([]byte, error) {
+	return nil, nil
+}
+func (h *hangingStorageBackend) ReadTo(ctx context.Context, path string, w io.Writer) error {
+	return nil
+}
+func (h *hangingStorageBackend) List(ctx context.Context, prefix string) ([]string, error) {
+	return nil, nil
+}
+func (h *hangingStorageBackend) Delete(ctx context.Context, path string) error { return nil }
+func (h *hangingStorageBackend) Exists(ctx context.Context, path string) (bool, error) {
+	return false, nil
+}
+func (h *hangingStorageBackend) Close() error       { return nil }
+func (h *hangingStorageBackend) Type() string       { return "mock-hanging" }
+func (h *hangingStorageBackend) ConfigJSON() string { return "{}" }
 
 // makeColumns builds a columnar batch with the given record count.
 func makeColumns(n int) map[string][]interface{} {

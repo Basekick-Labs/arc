@@ -35,29 +35,29 @@ type ShardReplicationConfig struct {
 // ShardReplicationManager manages WAL replication for shards where this node is primary.
 // Each shard has independent replication streams to its replicas.
 type ShardReplicationManager struct {
-	cfg       *ShardReplicationConfig
-	shards    map[int]*ShardSender // shardID -> sender (only for shards we're primary for)
-	mu        sync.RWMutex
-	logger    zerolog.Logger
-	ctx       context.Context
-	cancelFn  context.CancelFunc
-	running   atomic.Bool
-	wg        sync.WaitGroup
+	cfg      *ShardReplicationConfig
+	shards   map[int]*ShardSender // shardID -> sender (only for shards we're primary for)
+	mu       sync.RWMutex
+	logger   zerolog.Logger
+	ctx      context.Context
+	cancelFn context.CancelFunc
+	running  atomic.Bool
+	wg       sync.WaitGroup
 }
 
 // ShardSender handles replication for a single shard from primary to replicas.
 type ShardSender struct {
-	shardID    int
-	replicas   map[string]*ShardReplicaConn // nodeID -> connection
-	entryChan  chan *replication.ReplicateEntry
-	sequence   atomic.Uint64
-	mu         sync.RWMutex
-	logger     zerolog.Logger
-	cfg        *ShardReplicationConfig
-	ctx        context.Context
-	cancelFn   context.CancelFunc
-	wg         sync.WaitGroup
-	running    atomic.Bool
+	shardID   int
+	replicas  map[string]*ShardReplicaConn // nodeID -> connection
+	entryChan chan *replication.ReplicateEntry
+	sequence  atomic.Uint64
+	mu        sync.RWMutex
+	logger    zerolog.Logger
+	cfg       *ShardReplicationConfig
+	ctx       context.Context
+	cancelFn  context.CancelFunc
+	wg        sync.WaitGroup
+	running   atomic.Bool
 
 	// Stats
 	totalEntriesReceived atomic.Int64

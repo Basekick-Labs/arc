@@ -29,9 +29,9 @@ type Coordinator struct {
 	hooks      []namedHook
 
 	// Shutdown state
-	shutdownOnce  sync.Once
-	triggerOnce   sync.Once // Separate Once for TriggerShutdown to prevent race condition
-	shutdownCh    chan struct{}
+	shutdownOnce sync.Once
+	triggerOnce  sync.Once // Separate Once for TriggerShutdown to prevent race condition
+	shutdownCh   chan struct{}
 }
 
 type namedComponent struct {
@@ -240,13 +240,13 @@ func sortHooksByPriority(hooks []namedHook) {
 
 // Priorities for common components (use these as guidelines)
 const (
-	PriorityHTTPServer  = 10  // Stop accepting new requests first
-	PriorityIngest      = 20  // Stop ingestion
-	PriorityBuffer      = 30  // Flush buffers
-	PriorityWAL         = 40  // Flush WAL
-	PriorityCompaction  = 50  // Stop compaction
-	PriorityTelemetry   = 60  // Send final telemetry
-	PriorityAuth        = 70  // Auth manager
-	PriorityStorage     = 80  // Storage backends
-	PriorityDatabase    = 90  // Database connections last
+	PriorityHTTPServer = 10 // Stop accepting new requests first
+	PriorityIngest     = 20 // Stop ingestion
+	PriorityBuffer     = 30 // Flush buffers
+	PriorityWAL        = 40 // Flush WAL
+	PriorityCompaction = 50 // Stop compaction
+	PriorityTelemetry  = 60 // Send final telemetry
+	PriorityAuth       = 70 // Auth manager
+	PriorityStorage    = 80 // Storage backends
+	PriorityDatabase   = 90 // Database connections last
 )

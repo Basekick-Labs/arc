@@ -17,23 +17,23 @@ func TestBuildReadExpression_CSV(t *testing.T) {
 		expected string
 	}{
 		{
-			name: "default CSV",
-			opts: importOptions{format: "csv", delimiter: ","},
+			name:     "default CSV",
+			opts:     importOptions{format: "csv", delimiter: ","},
 			expected: "read_csv('/tmp/test.csv', auto_detect=true, header=true)",
 		},
 		{
-			name: "tab delimiter",
-			opts: importOptions{format: "csv", delimiter: "\t"},
+			name:     "tab delimiter",
+			opts:     importOptions{format: "csv", delimiter: "\t"},
 			expected: "read_csv('/tmp/test.csv', auto_detect=true, header=true, delim='\t')",
 		},
 		{
-			name: "skip rows",
-			opts: importOptions{format: "csv", delimiter: ",", skipRows: 2},
+			name:     "skip rows",
+			opts:     importOptions{format: "csv", delimiter: ",", skipRows: 2},
 			expected: "read_csv('/tmp/test.csv', auto_detect=true, header=true, skip=2)",
 		},
 		{
-			name: "semicolon with skip",
-			opts: importOptions{format: "csv", delimiter: ";", skipRows: 1},
+			name:     "semicolon with skip",
+			opts:     importOptions{format: "csv", delimiter: ";", skipRows: 1},
 			expected: "read_csv('/tmp/test.csv', auto_detect=true, header=true, delim=';', skip=1)",
 		},
 	}

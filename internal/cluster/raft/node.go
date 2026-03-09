@@ -30,10 +30,10 @@ type NodeConfig struct {
 	Peers []string
 
 	// Timeouts
-	ElectionTimeout  time.Duration
-	HeartbeatTimeout time.Duration
+	ElectionTimeout    time.Duration
+	HeartbeatTimeout   time.Duration
 	LeaderLeaseTimeout time.Duration
-	CommitTimeout    time.Duration
+	CommitTimeout      time.Duration
 
 	// Snapshots
 	SnapshotInterval  time.Duration
@@ -58,13 +58,13 @@ func DefaultNodeConfig() *NodeConfig {
 
 // Node wraps hashicorp/raft and provides a higher-level API.
 type Node struct {
-	cfg       *NodeConfig
-	raft      *raft.Raft
-	fsm       *ClusterFSM
-	transport *raft.NetworkTransport
-	logStore  *raftboltdb.BoltStore
+	cfg         *NodeConfig
+	raft        *raft.Raft
+	fsm         *ClusterFSM
+	transport   *raft.NetworkTransport
+	logStore    *raftboltdb.BoltStore
 	stableStore *raftboltdb.BoltStore
-	snapStore raft.SnapshotStore
+	snapStore   raft.SnapshotStore
 
 	mu      sync.RWMutex
 	running bool

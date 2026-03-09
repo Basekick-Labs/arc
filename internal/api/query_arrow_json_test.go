@@ -70,12 +70,12 @@ func newSimpleRecordReader(schema *arrow.Schema, records []arrow.Record) *simple
 	return &simpleRecordReader{schema: schema, records: records, idx: -1, refCnt: 1}
 }
 
-func (r *simpleRecordReader) Schema() *arrow.Schema         { return r.schema }
-func (r *simpleRecordReader) Next() bool                    { r.idx++; return r.idx < len(r.records) }
-func (r *simpleRecordReader) Record() arrow.Record          { return r.records[r.idx] }
+func (r *simpleRecordReader) Schema() *arrow.Schema          { return r.schema }
+func (r *simpleRecordReader) Next() bool                     { r.idx++; return r.idx < len(r.records) }
+func (r *simpleRecordReader) Record() arrow.Record           { return r.records[r.idx] }
 func (r *simpleRecordReader) RecordBatch() arrow.RecordBatch { return r.records[r.idx] }
-func (r *simpleRecordReader) Err() error                    { return nil }
-func (r *simpleRecordReader) Retain()                       { r.refCnt++ }
+func (r *simpleRecordReader) Err() error                     { return nil }
+func (r *simpleRecordReader) Retain()                        { r.refCnt++ }
 func (r *simpleRecordReader) Release() {
 	r.refCnt--
 	if r.refCnt == 0 {

@@ -57,8 +57,8 @@ func (h *BackupHandler) CreateBackup(c *fiber.Ctx) error {
 	// Check if a backup is already running
 	if p := h.manager.GetProgress(); p != nil && p.Status == "running" {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
-			"error":   "A backup or restore operation is already in progress",
-			"status":  p.Status,
+			"error":     "A backup or restore operation is already in progress",
+			"status":    p.Status,
 			"operation": p.Operation,
 		})
 	}

@@ -53,18 +53,18 @@ type ShardReceiverManager struct {
 
 // ShardReceiver handles replication for a single shard from its primary.
 type ShardReceiver struct {
-	shardID       int
-	primaryNode   *cluster.Node
-	conn          net.Conn
-	lastSeq       atomic.Uint64
-	mu            sync.Mutex
-	logger        zerolog.Logger
-	cfg           *ShardReceiverConfig
-	ctx           context.Context
-	cancelFn      context.CancelFunc
-	wg            sync.WaitGroup
-	running       atomic.Bool
-	connected     atomic.Bool
+	shardID     int
+	primaryNode *cluster.Node
+	conn        net.Conn
+	lastSeq     atomic.Uint64
+	mu          sync.Mutex
+	logger      zerolog.Logger
+	cfg         *ShardReceiverConfig
+	ctx         context.Context
+	cancelFn    context.CancelFunc
+	wg          sync.WaitGroup
+	running     atomic.Bool
+	connected   atomic.Bool
 
 	// Stats
 	totalEntriesReceived atomic.Int64

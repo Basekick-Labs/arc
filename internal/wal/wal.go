@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/rs/zerolog"
 	"github.com/Basekick-Labs/msgpack/v6"
+	"github.com/rs/zerolog"
 )
 
 // WAL file format constants
@@ -58,14 +58,14 @@ type walEntry struct {
 
 // WriterConfig holds configuration for WAL writer
 type WriterConfig struct {
-	WALDir        string        // Directory for WAL files
-	SyncMode      SyncMode      // Sync mode: fsync, fdatasync, async
-	MaxSizeBytes  int64         // Rotate WAL when it reaches this size (default: 100MB)
-	MaxAge        time.Duration // Rotate WAL after this duration (default: 1 hour)
-	SyncInterval  time.Duration // Sync at most this often (default: 100ms, 0 = sync every write)
-	SyncBytes     int64         // Sync after this many bytes written (default: 1MB, 0 = no byte threshold)
-	BufferSize    int           // Size of async write buffer (default: 10000)
-	Logger        zerolog.Logger
+	WALDir       string        // Directory for WAL files
+	SyncMode     SyncMode      // Sync mode: fsync, fdatasync, async
+	MaxSizeBytes int64         // Rotate WAL when it reaches this size (default: 100MB)
+	MaxAge       time.Duration // Rotate WAL after this duration (default: 1 hour)
+	SyncInterval time.Duration // Sync at most this often (default: 100ms, 0 = sync every write)
+	SyncBytes    int64         // Sync after this many bytes written (default: 1MB, 0 = no byte threshold)
+	BufferSize   int           // Size of async write buffer (default: 10000)
+	Logger       zerolog.Logger
 }
 
 // ReplicationEntry represents a WAL entry for replication.

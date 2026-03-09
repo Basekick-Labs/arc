@@ -26,7 +26,7 @@ func TestBufferFlushTiming(t *testing.T) {
 	// Configure with 5 second max buffer age
 	maxBufferAgeMS := 5000
 	cfg := &config.IngestConfig{
-		MaxBufferSize:  1000000,       // 1MB - high enough to not trigger size-based flush
+		MaxBufferSize:  1000000,        // 1MB - high enough to not trigger size-based flush
 		MaxBufferAgeMS: maxBufferAgeMS, // 5 seconds
 		FlushWorkers:   2,
 		FlushQueueSize: 10,

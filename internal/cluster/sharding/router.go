@@ -15,10 +15,10 @@ import (
 
 // Errors returned by the shard router.
 var (
-	ErrNoDatabaseHeader = errors.New("missing x-arc-database header")
-	ErrNoShardPrimary   = errors.New("no primary for shard")
+	ErrNoDatabaseHeader   = errors.New("missing x-arc-database header")
+	ErrNoShardPrimary     = errors.New("no primary for shard")
 	ErrLocalNodeCanHandle = errors.New("local node can handle request")
-	ErrShardingDisabled = errors.New("sharding is not enabled")
+	ErrShardingDisabled   = errors.New("sharding is not enabled")
 )
 
 // ShardRouter routes requests to the appropriate shard primary.
@@ -38,10 +38,10 @@ type ShardRouter struct {
 
 // ShardRouterConfig holds configuration for the shard router.
 type ShardRouterConfig struct {
-	ShardMap    *ShardMap
-	LocalNode   *cluster.Node
-	Timeout     time.Duration
-	Logger      zerolog.Logger
+	ShardMap  *ShardMap
+	LocalNode *cluster.Node
+	Timeout   time.Duration
+	Logger    zerolog.Logger
 }
 
 // NewShardRouter creates a new shard router.
