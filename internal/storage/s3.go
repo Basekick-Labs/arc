@@ -424,8 +424,10 @@ func SanitizeS3Prefix(prefix string) string {
 	// Reject unsafe characters (defense-in-depth against SQL injection
 	// since prefixes are interpolated into DuckDB read_parquet() calls)
 	for _, c := range prefix {
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-			c == '/' || c == '-' || c == '_' || c == '.') {
+		switch {
+		case (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'):
+		case c == '/' || c == '-' || c == '_' || c == '.':
+		default:
 			return ""
 		}
 	}
