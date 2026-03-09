@@ -37,11 +37,11 @@ type BenchmarkQuery struct {
 }
 
 type QueryResult struct {
-	ID         int
-	Name       string
-	Latencies  []float64
-	Errors     int
-	ErrorMsg   string
+	ID        int
+	Name      string
+	Latencies []float64
+	Errors    int
+	ErrorMsg  string
 }
 
 func (r *QueryResult) avgLatency() float64 {

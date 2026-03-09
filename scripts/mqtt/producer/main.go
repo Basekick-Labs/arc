@@ -22,8 +22,8 @@ import (
 	"syscall"
 	"time"
 
-	pahomqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/Basekick-Labs/msgpack/v6"
+	pahomqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
 var (
@@ -181,7 +181,7 @@ func main() {
 
 			// Publish
 			token := client.Publish(*topic, byte(*qos), false, payload)
-			if token.WaitTimeout(5 * time.Second) && token.Error() == nil {
+			if token.WaitTimeout(5*time.Second) && token.Error() == nil {
 				atomic.AddInt64(&sent, 1)
 				if *verbose {
 					fmt.Printf("Sent message %d (%d bytes)\n", messageNum+1, len(payload))

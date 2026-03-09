@@ -29,46 +29,46 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/google/uuid"
 	"github.com/klauspost/compress/zstd"
-	"github.com/Basekick-Labs/msgpack/v6"
 )
 
 // Target systems
 const (
-	TargetArc                = "arc"
-	TargetElastic            = "elastic"
-	TargetOpenSearch         = "opensearch"
-	TargetClickHouse         = "clickhouse"
-	TargetClickHouseNative   = "clickhouse-native"
-	TargetVictoriaLogs       = "victorialogs"
-	TargetLoki               = "loki"
-	TargetQuickwit           = "quickwit"
+	TargetArc              = "arc"
+	TargetElastic          = "elastic"
+	TargetOpenSearch       = "opensearch"
+	TargetClickHouse       = "clickhouse"
+	TargetClickHouseNative = "clickhouse-native"
+	TargetVictoriaLogs     = "victorialogs"
+	TargetLoki             = "loki"
+	TargetQuickwit         = "quickwit"
 )
 
 // Default ports per target
 var defaultPorts = map[string]int{
-	TargetArc:                8000,
-	TargetElastic:            9200,
-	TargetOpenSearch:         9200,
-	TargetClickHouse:         8123,
-	TargetClickHouseNative:   9000,
-	TargetVictoriaLogs:       9428,
-	TargetLoki:               3100,
-	TargetQuickwit:           7280,
+	TargetArc:              8000,
+	TargetElastic:          9200,
+	TargetOpenSearch:       9200,
+	TargetClickHouse:       8123,
+	TargetClickHouseNative: 9000,
+	TargetVictoriaLogs:     9428,
+	TargetLoki:             3100,
+	TargetQuickwit:         7280,
 }
 
 // Success status codes per target
 var successCodes = map[string]int{
-	TargetArc:                204,
-	TargetElastic:            200,
-	TargetOpenSearch:         200,
-	TargetClickHouse:         200,
-	TargetClickHouseNative:   0, // Not HTTP-based
-	TargetVictoriaLogs:       200,
-	TargetLoki:               204,
-	TargetQuickwit:           200,
+	TargetArc:              204,
+	TargetElastic:          200,
+	TargetOpenSearch:       200,
+	TargetClickHouse:       200,
+	TargetClickHouseNative: 0, // Not HTTP-based
+	TargetVictoriaLogs:     200,
+	TargetLoki:             204,
+	TargetQuickwit:         200,
 }
 
 type Config struct {
@@ -84,7 +84,7 @@ type Config struct {
 	Index       string
 	Protocol    string // For Arc: msgpack or lineprotocol
 	Token       string
-	MaxLogs     int64  // Stop after ingesting this many logs (0 = unlimited, use duration)
+	MaxLogs     int64 // Stop after ingesting this many logs (0 = unlimited, use duration)
 }
 
 type Stats struct {

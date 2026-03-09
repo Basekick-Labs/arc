@@ -19,7 +19,7 @@ type ColumnarRecord struct {
 	Columnar    bool                     `json:"_columnar"` // Marker for columnar format
 	Columns     map[string][]interface{} `json:"columns"`   // Column name -> array of values
 	TimeUnit    string                   `json:"_time_unit,omitempty"`
-	RawPayload  []byte                   `json:"-"`         // Original msgpack bytes for zero-copy WAL
+	RawPayload  []byte                   `json:"-"` // Original msgpack bytes for zero-copy WAL
 }
 
 // MsgPackPayload represents the top-level MessagePack payload structure

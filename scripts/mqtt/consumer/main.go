@@ -19,8 +19,8 @@ import (
 	"syscall"
 	"time"
 
-	pahomqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/Basekick-Labs/msgpack/v6"
+	pahomqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
 var (
@@ -69,7 +69,7 @@ func main() {
 		fmt.Println("Connected to broker")
 		// Subscribe on connect (and reconnect)
 		token := c.Subscribe(*topic, byte(*qos), messageHandler)
-		if token.WaitTimeout(10 * time.Second) && token.Error() == nil {
+		if token.WaitTimeout(10*time.Second) && token.Error() == nil {
 			fmt.Printf("Subscribed to: %s\n", *topic)
 		} else {
 			fmt.Printf("Subscribe error: %v\n", token.Error())
