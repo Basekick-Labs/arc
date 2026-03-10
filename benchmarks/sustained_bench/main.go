@@ -681,11 +681,13 @@ func generateFinancialBatches(count, batchSize int, compress string, zstdLevel i
 
 // ClickHouse table schemas per data type
 var clickHouseSchemas = map[string]struct {
-	table  string
-	create string
+	table   string
+	columns []string
+	create  string
 }{
 	"iot": {
-		table: "cpu",
+		table:   "cpu",
+		columns: []string{"time", "host", "value", "cpu_idle", "cpu_user"},
 		create: `CREATE TABLE IF NOT EXISTS cpu (
 			time DateTime64(6),
 			host String,
@@ -695,7 +697,8 @@ var clickHouseSchemas = map[string]struct {
 		) ENGINE = MergeTree() ORDER BY (host, time)`,
 	},
 	"financial": {
-		table: "trades",
+		table:   "trades",
+		columns: []string{"time", "symbol", "exchange", "price", "bid", "ask", "bid_size", "ask_size", "volume", "trade_id"},
 		create: `CREATE TABLE IF NOT EXISTS trades (
 			time DateTime64(6),
 			symbol String,
@@ -710,7 +713,8 @@ var clickHouseSchemas = map[string]struct {
 		) ENGINE = MergeTree() ORDER BY (symbol, time)`,
 	},
 	"industrial": {
-		table: "pump_telemetry",
+		table:   "pump_telemetry",
+		columns: []string{"time", "pump_id", "facility", "pump_type", "flow_rate", "pressure_in", "pressure_out", "temperature", "vibration", "current", "rpm", "power"},
 		create: `CREATE TABLE IF NOT EXISTS pump_telemetry (
 			time DateTime64(6),
 			pump_id String,
@@ -727,7 +731,8 @@ var clickHouseSchemas = map[string]struct {
 		) ENGINE = MergeTree() ORDER BY (pump_id, time)`,
 	},
 	"aerospace": {
-		table: "rocket_telemetry",
+		table:   "rocket_telemetry",
+		columns: []string{"time", "sensor_id", "value"},
 		create: `CREATE TABLE IF NOT EXISTS rocket_telemetry (
 			time DateTime64(6),
 			sensor_id String,
@@ -735,7 +740,8 @@ var clickHouseSchemas = map[string]struct {
 		) ENGINE = MergeTree() ORDER BY (sensor_id, time)`,
 	},
 	"energy": {
-		table: "wind_turbine",
+		table:   "wind_turbine",
+		columns: []string{"time", "turbine_id", "farm", "wind_speed", "wind_direction", "rotor_rpm", "power_output", "blade_pitch", "nacelle_temp", "generator_temp"},
 		create: `CREATE TABLE IF NOT EXISTS wind_turbine (
 			time DateTime64(6),
 			turbine_id String,
@@ -750,7 +756,8 @@ var clickHouseSchemas = map[string]struct {
 		) ENGINE = MergeTree() ORDER BY (turbine_id, time)`,
 	},
 	"racing": {
-		table: "car_telemetry",
+		table:   "car_telemetry",
+		columns: []string{"time", "car_number", "driver", "speed", "engine_rpm", "throttle", "brake", "steering", "gear"},
 		create: `CREATE TABLE IF NOT EXISTS car_telemetry (
 			time DateTime64(6),
 			car_number String,
@@ -1107,52 +1114,37 @@ func clickhouseWorker(id int, cfg *Config, colBatches []columnBatch, stats *Stat
 	}
 }
 
-// generateClickHouseJSONBatches produces JSONEachRow payloads for ClickHouse HTTP interface.
-func generateClickHouseJSONBatches(dataType string, count, batchSize int) [][]byte {
-	batches := make([][]byte, count)
+// columnBatchesToJSON converts pre-generated column batches into JSONEachRow payloads.
+// This reuses the same data generated for native protocol, avoiding duplicate generation logic.
+func columnBatchesToJSON(colBatches []columnBatch, columns []string, batchSize int) [][]byte {
+	batches := make([][]byte, len(colBatches))
 
-	for i := 0; i < count; i++ {
+	for i, cb := range colBatches {
 		var buf bytes.Buffer
-		now := time.Now()
-
 		for j := 0; j < batchSize; j++ {
-			ts := now.Add(time.Duration(j) * time.Microsecond).UTC().Format("2006-01-02 15:04:05.000000")
-			var row map[string]interface{}
-
-			switch dataType {
-			case "financial":
-				symbols := []string{"AAPL", "GOOGL", "MSFT", "AMZN", "META", "NVDA", "TSLA", "JPM", "V", "JNJ",
-					"WMT", "PG", "UNH", "HD", "MA", "DIS", "PYPL", "BAC", "ADBE", "NFLX"}
-				exchanges := []string{"NYSE", "NASDAQ", "ARCA", "BATS", "IEX"}
-				basePrice := roundTo(10+rand.Float64()*490, 2)
-				row = map[string]interface{}{
-					"time": ts, "symbol": symbols[rand.Intn(len(symbols))], "exchange": exchanges[rand.Intn(len(exchanges))],
-					"price": basePrice, "bid": roundTo(basePrice-rand.Float64()*0.04-0.01, 2),
-					"ask": roundTo(basePrice+rand.Float64()*0.04+0.01, 2),
-					"bid_size": 100 + rand.Intn(9900), "ask_size": 100 + rand.Intn(9900),
-					"volume": 1 + rand.Intn(999), "trade_id": 1000000 + rand.Intn(8999999),
-				}
-			case "aerospace":
-				row = map[string]interface{}{
-					"time": ts, "sensor_id": fmt.Sprintf("sens_%04d", rand.Intn(2000)),
-					"value": roundTo(rand.Float64()*1000, 2),
-				}
-			default: // iot
-				row = map[string]interface{}{
-					"time": ts, "host": fmt.Sprintf("server%03d", rand.Intn(1000)),
-					"value": roundTo(rand.Float64()*100, 2), "cpu_idle": roundTo(rand.Float64()*100, 2),
-					"cpu_user": roundTo(rand.Float64()*100, 2),
+			row := make(map[string]interface{}, len(columns))
+			for colIdx, colName := range columns {
+				switch v := cb.columns[colIdx].(type) {
+				case []time.Time:
+					row[colName] = v[j].UTC().Format("2006-01-02 15:04:05.000000")
+				case []string:
+					row[colName] = v[j]
+				case []float64:
+					row[colName] = v[j]
+				case []int64:
+					row[colName] = v[j]
 				}
 			}
-
-			docBytes, _ := json.Marshal(row)
+			docBytes, err := json.Marshal(row)
+			if err != nil {
+				panic(fmt.Sprintf("failed to marshal json row: %v", err))
+			}
 			buf.Write(docBytes)
 			buf.WriteByte('\n')
 		}
-
 		batches[i] = buf.Bytes()
 		if (i+1)%100 == 0 {
-			fmt.Printf("  Progress: %d/%d\n", i+1, count)
+			fmt.Printf("  Progress (JSON): %d/%d\n", i+1, len(colBatches))
 		}
 	}
 	return batches
@@ -1401,8 +1393,10 @@ func main() {
 			}(i)
 		}
 	} else if cfg.Target == "clickhouse-http" {
-		// ClickHouse HTTP interface — JSONEachRow
-		jsonBatches := generateClickHouseJSONBatches(cfg.DataType, cfg.Pregenerate, cfg.BatchSize)
+		// ClickHouse HTTP interface — JSONEachRow (reuse column generators, convert to JSON)
+		schema := clickHouseSchemas[cfg.DataType]
+		colBatches := generateColumnBatches(cfg.DataType, cfg.Pregenerate, cfg.BatchSize)
+		jsonBatches := columnBatchesToJSON(colBatches, schema.columns, cfg.BatchSize)
 
 		genTime := time.Since(startGen)
 		var totalSize int64
@@ -1416,7 +1410,7 @@ func main() {
 
 		// Create table via native connection
 		setupConn, err := clickhouse.Open(&clickhouse.Options{
-			Addr: []string{fmt.Sprintf("%s:9000", cfg.Host)},
+			Addr: []string{fmt.Sprintf("%s:%d", cfg.Host, cfg.CHPort)},
 			Auth: clickhouse.Auth{Database: cfg.Database},
 		})
 		if err != nil {
