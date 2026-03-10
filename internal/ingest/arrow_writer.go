@@ -264,13 +264,13 @@ func toInt64(v interface{}) (int64, bool) {
 		if val > float32(math.MaxInt64) || val < float32(math.MinInt64) {
 			return 0, false
 		}
-		return int64(val), true
+		return int64(val), true //nolint:gosec // Bounds checked above
 	case float64:
 		// Bounds check required before conversion to int64
 		if val > float64(math.MaxInt64) || val < float64(math.MinInt64) {
 			return 0, false
 		}
-		return int64(val), true
+		return int64(val), true //nolint:gosec // Bounds checked above
 	default:
 		return 0, false
 	}

@@ -586,9 +586,9 @@ int main(int argc, char *argv[]) {
     /* Create stats */
     stats_t *stats = stats_create(1000000);  /* 1M latency samples */
 
-    /* Build URL and headers */
+    /* Build URL and headers — benchmark tool uses plain HTTP for local testing; not production code */
     char url[256];
-    snprintf(url, sizeof(url), "http://%s:%d/api/v1/write/msgpack", cfg.host, cfg.port);
+    snprintf(url, sizeof(url), "http://%s:%d/api/v1/write/msgpack", cfg.host, cfg.port); /* lgtm[cpp/non-https-url] */
 
     struct curl_slist *headers = NULL;
     headers = curl_slist_append(headers, "Content-Type: application/msgpack");
