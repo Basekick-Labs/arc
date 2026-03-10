@@ -48,7 +48,8 @@ type Config struct {
 	ZstdLevel   int
 	DataType    string
 	Protocol    string // "msgpack" or "lineprotocol"
-	Target      string // "arc", "clickhouse", "clickhouse-http", "timescaledb"
+	Target      string // "arc", "clickhouse", "clickhouse-http", "timescaledb", "influxdb3"
+	InfluxPort  int
 	Host        string
 	Port        int
 	CHPort      int
@@ -1346,6 +1347,167 @@ func columnBatchesToJSON(colBatches []columnBatch, columns []string, batchSize i
 	return batches
 }
 
+// influxLineProtocolSchema defines how to convert column batches to InfluxDB line protocol.
+// measurement is the measurement name, tagIdxs are column indices for tags,
+// fieldIdxs are column indices for fields, and timeIdx is the column index for timestamp.
+type influxLineProtocolSchema struct {
+	measurement string
+	tagNames    []string
+	tagIdxs     []int
+	fieldNames  []string
+	fieldIdxs   []int
+	timeIdx     int
+}
+
+var influxSchemas = map[string]influxLineProtocolSchema{
+	"iot": {
+		measurement: "cpu",
+		tagNames:    []string{"host"},
+		tagIdxs:     []int{1},
+		fieldNames:  []string{"value", "cpu_idle", "cpu_user"},
+		fieldIdxs:   []int{2, 3, 4},
+		timeIdx:     0,
+	},
+	"financial": {
+		measurement: "trades",
+		tagNames:    []string{"symbol", "exchange"},
+		tagIdxs:     []int{1, 2},
+		fieldNames:  []string{"price", "bid", "ask", "bid_size", "ask_size", "volume", "trade_id"},
+		fieldIdxs:   []int{3, 4, 5, 6, 7, 8, 9},
+		timeIdx:     0,
+	},
+	"industrial": {
+		measurement: "pump_telemetry",
+		tagNames:    []string{"pump_id", "facility", "pump_type"},
+		tagIdxs:     []int{1, 2, 3},
+		fieldNames:  []string{"flow_rate", "pressure_in", "pressure_out", "temperature", "vibration", "current", "rpm", "power"},
+		fieldIdxs:   []int{4, 5, 6, 7, 8, 9, 10, 11},
+		timeIdx:     0,
+	},
+	"aerospace": {
+		measurement: "rocket_telemetry",
+		tagNames:    []string{"sensor_id"},
+		tagIdxs:     []int{1},
+		fieldNames:  []string{"value"},
+		fieldIdxs:   []int{2},
+		timeIdx:     0,
+	},
+	"energy": {
+		measurement: "wind_turbine",
+		tagNames:    []string{"turbine_id", "farm"},
+		tagIdxs:     []int{1, 2},
+		fieldNames:  []string{"wind_speed", "wind_direction", "rotor_rpm", "power_output", "blade_pitch", "nacelle_temp", "generator_temp"},
+		fieldIdxs:   []int{3, 4, 5, 6, 7, 8, 9},
+		timeIdx:     0,
+	},
+	"racing": {
+		measurement: "car_telemetry",
+		tagNames:    []string{"car_number", "driver"},
+		tagIdxs:     []int{1, 2},
+		fieldNames:  []string{"speed", "engine_rpm", "throttle", "brake", "steering", "gear"},
+		fieldIdxs:   []int{3, 4, 5, 6, 7, 8},
+		timeIdx:     0,
+	},
+}
+
+func columnBatchesToLineProtocol(colBatches []columnBatch, schema influxLineProtocolSchema, batchSize int) [][]byte {
+	batches := make([][]byte, len(colBatches))
+
+	for i, cb := range colBatches {
+		var buf bytes.Buffer
+		// Pre-size buffer: rough estimate ~100 bytes per line
+		buf.Grow(batchSize * 100)
+
+		for j := 0; j < batchSize; j++ {
+			// Measurement
+			buf.WriteString(schema.measurement)
+
+			// Tags (comma-separated, no spaces)
+			for t, tagIdx := range schema.tagIdxs {
+				buf.WriteByte(',')
+				buf.WriteString(schema.tagNames[t])
+				buf.WriteByte('=')
+				switch v := cb.columns[tagIdx].(type) {
+				case []string:
+					buf.WriteString(v[j])
+				}
+			}
+
+			// Fields (space before first, comma-separated)
+			buf.WriteByte(' ')
+			for f, fieldIdx := range schema.fieldIdxs {
+				if f > 0 {
+					buf.WriteByte(',')
+				}
+				buf.WriteString(schema.fieldNames[f])
+				buf.WriteByte('=')
+				switch v := cb.columns[fieldIdx].(type) {
+				case []float64:
+					fmt.Fprintf(&buf, "%.4f", v[j])
+				case []int64:
+					fmt.Fprintf(&buf, "%di", v[j])
+				}
+			}
+
+			// Timestamp in microseconds
+			buf.WriteByte(' ')
+			switch v := cb.columns[schema.timeIdx].(type) {
+			case []time.Time:
+				fmt.Fprintf(&buf, "%d", v[j].UnixMicro())
+			}
+			buf.WriteByte('\n')
+		}
+
+		batches[i] = buf.Bytes()
+		if (i+1)%100 == 0 {
+			fmt.Printf("  Progress (Line Protocol): %d/%d\n", i+1, len(colBatches))
+		}
+	}
+	return batches
+}
+
+func influxdb3Worker(id int, cfg *Config, batches [][]byte, stats *Stats, client *http.Client) {
+	url := fmt.Sprintf("http://%s:%d/api/v3/write_lp?db=%s&precision=microsecond", cfg.Host, cfg.InfluxPort, cfg.Database)
+	batchIdx := 0
+
+	for stats.running.Load() {
+		batch := batches[batchIdx%len(batches)]
+		batchIdx++
+
+		start := time.Now()
+
+		req, err := http.NewRequest("POST", url, bytes.NewReader(batch))
+		if err != nil {
+			stats.totalErrors.Add(1)
+			continue
+		}
+		req.Header.Set("Content-Type", "text/plain")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			stats.totalErrors.Add(1)
+			if stats.totalErrors.Load() <= 3 {
+				fmt.Printf("Worker %d: HTTP error: %v\n", id, err)
+			}
+			continue
+		}
+
+		latencyMs := float64(time.Since(start).Microseconds()) / 1000.0
+
+		if resp.StatusCode == 204 {
+			stats.totalSent.Add(int64(cfg.BatchSize))
+			stats.addLatency(id, latencyMs)
+		} else {
+			stats.totalErrors.Add(1)
+			if stats.totalErrors.Load() <= 3 {
+				body, _ := io.ReadAll(resp.Body)
+				fmt.Printf("Worker %d: HTTP %d: %s\n", id, resp.StatusCode, string(body)[:min(200, len(body))])
+			}
+		}
+		resp.Body.Close()
+	}
+}
+
 func clickhouseHTTPWorker(id int, cfg *Config, batches [][]byte, stats *Stats, client *http.Client, tableName string) {
 	url := fmt.Sprintf("http://%s:%d/?query=INSERT+INTO+%s+FORMAT+JSONEachRow", cfg.Host, cfg.CHPort, tableName)
 	batchIdx := 0
@@ -1472,11 +1634,12 @@ func main() {
 	flag.IntVar(&cfg.ZstdLevel, "zstd-level", 3, "Zstd compression level (1-22)")
 	flag.StringVar(&cfg.DataType, "data-type", "iot", "Data type: iot, financial, industrial, aerospace, energy, racing")
 	flag.StringVar(&cfg.Protocol, "protocol", "msgpack", "Protocol: msgpack, lineprotocol")
-	flag.StringVar(&cfg.Target, "target", "arc", "Target: arc, clickhouse, clickhouse-http, timescaledb")
+	flag.StringVar(&cfg.Target, "target", "arc", "Target: arc, clickhouse, clickhouse-http, timescaledb, influxdb3")
 	flag.StringVar(&cfg.Host, "host", "localhost", "Server host")
 	flag.IntVar(&cfg.Port, "port", 8000, "Server port (Arc HTTP)")
 	flag.IntVar(&cfg.CHPort, "ch-port", 9000, "ClickHouse native port")
 	flag.IntVar(&cfg.PGPort, "pg-port", 5432, "PostgreSQL/TimescaleDB port")
+	flag.IntVar(&cfg.InfluxPort, "influx-port", 8181, "InfluxDB 3 HTTP port")
 	flag.StringVar(&cfg.Database, "database", "default", "Database name (ClickHouse/TimescaleDB)")
 	flag.BoolVar(&cfg.AsyncInsert, "async-insert", false, "Enable ClickHouse async_insert (server-side batching)")
 	flag.BoolVar(&cfg.TLS, "tls", false, "Use HTTPS instead of HTTP")
@@ -1529,6 +1692,10 @@ func main() {
 		fmt.Println("SUSTAINED LOAD TEST - TIMESCALEDB (pgx COPY protocol)")
 		fmt.Println("================================================================================")
 		fmt.Printf("Target: postgres://%s:%d/%s\n", cfg.Host, cfg.PGPort, cfg.Database)
+	} else if cfg.Target == "influxdb3" {
+		fmt.Println("SUSTAINED LOAD TEST - INFLUXDB 3 (Line Protocol over HTTP)")
+		fmt.Println("================================================================================")
+		fmt.Printf("Target: http://%s:%d (database: %s)\n", cfg.Host, cfg.InfluxPort, cfg.Database)
 	} else {
 		fmt.Printf("SUSTAINED LOAD TEST - GO CLIENT (%s)\n", compressLabel)
 		fmt.Println("================================================================================")
@@ -1671,6 +1838,57 @@ func main() {
 			go func(id int) {
 				defer wg.Done()
 				timescaleWorker(id, &cfg, colBatches, stats, tableName, schema.columns)
+			}(i)
+		}
+	} else if cfg.Target == "influxdb3" {
+		// InfluxDB 3 — Line Protocol over HTTP
+		schema, ok := influxSchemas[cfg.DataType]
+		if !ok {
+			fmt.Printf("Unsupported data type for InfluxDB 3: %s\n", cfg.DataType)
+			os.Exit(1)
+		}
+		colBatches := generateColumnBatches(cfg.DataType, cfg.Pregenerate, cfg.BatchSize)
+		lpBatches := columnBatchesToLineProtocol(colBatches, schema, cfg.BatchSize)
+
+		genTime := time.Since(startGen)
+		var totalSize int64
+		for _, b := range lpBatches {
+			totalSize += int64(len(b))
+		}
+		avgSize := float64(totalSize) / float64(len(lpBatches))
+		fmt.Printf("✓ Generated %d batches in %.1fs\n", cfg.Pregenerate, genTime.Seconds())
+		fmt.Printf("  Avg size: %.1f KB (Line Protocol)\n", avgSize/1024)
+		fmt.Println()
+
+		// Create database (ignore error if exists)
+		createDBURL := fmt.Sprintf("http://%s:%d/api/v3/configure/database", cfg.Host, cfg.InfluxPort)
+		dbBody := fmt.Sprintf(`{"name": "%s"}`, cfg.Database)
+		resp, err := http.Post(createDBURL, "application/json", strings.NewReader(dbBody))
+		if err != nil {
+			fmt.Printf("Warning: could not create database: %v\n", err)
+		} else {
+			resp.Body.Close()
+		}
+		fmt.Printf("✓ Database '%s' ready\n", cfg.Database)
+		fmt.Println()
+
+		// HTTP client
+		client := &http.Client{
+			Transport: &http.Transport{
+				MaxIdleConns:        cfg.Workers + 50,
+				MaxIdleConnsPerHost: cfg.Workers + 50,
+				MaxConnsPerHost:     cfg.Workers + 50,
+				IdleConnTimeout:     30 * time.Second,
+			},
+			Timeout: 120 * time.Second,
+		}
+
+		fmt.Println("Starting test...")
+		for i := 0; i < cfg.Workers; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				influxdb3Worker(id, &cfg, lpBatches, stats, client)
 			}(i)
 		}
 	} else {
