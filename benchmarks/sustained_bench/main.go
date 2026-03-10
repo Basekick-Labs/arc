@@ -857,7 +857,8 @@ func main() {
 		DisableKeepAlives:   false,
 	}
 	if cfg.TLS {
-		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		// Benchmark tool only — connects to local/dev instances with self-signed certs
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
 	}
 	// Resolve *.localhost to 127.0.0.1 (browsers do this per RFC 6761, Go doesn't)
 	if strings.HasSuffix(cfg.Host, ".localhost") {
