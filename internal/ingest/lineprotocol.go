@@ -40,8 +40,12 @@ func (p *LineProtocolParser) ParseLine(line []byte) *models.Record {
 	return p.parseLineWithPrecision(line, "ns")
 }
 
-// ParseBatch parses multiple lines of line protocol
+// ParseBatch parses multiple lines of line protocol.
+// Note: payloadValidUTF8 is not set here — callers using ParseBatch directly
+// get the safe default (false), meaning per-field sanitization runs normally.
+// Use ParseBatchWithPrecision for the bulk pre-validation optimization.
 func (p *LineProtocolParser) ParseBatch(data []byte) []*models.Record {
+	p.payloadValidUTF8 = false
 	lines := bytes.Split(data, []byte{'\n'})
 	records := make([]*models.Record, 0, len(lines))
 
