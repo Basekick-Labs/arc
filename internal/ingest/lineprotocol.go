@@ -22,6 +22,8 @@ import (
 )
 
 // LineProtocolParser parses InfluxDB Line Protocol format
+// LineProtocolParser parses InfluxDB Line Protocol format.
+// Safe for concurrent use — no mutable state.
 type LineProtocolParser struct{}
 
 // NewLineProtocolParser creates a new Line Protocol parser
@@ -33,16 +35,20 @@ func NewLineProtocolParser() *LineProtocolParser {
 // Timestamps are assumed to be nanoseconds and converted to microseconds.
 // Returns nil if the line is invalid or a comment.
 func (p *LineProtocolParser) ParseLine(line []byte) *models.Record {
-	return p.parseLineWithPrecision(line, "ns")
+	return p.parseLineWithPrecision(line, "ns", false)
 }
 
-// ParseBatch parses multiple lines of line protocol
+// ParseBatch parses multiple lines of line protocol.
 func (p *LineProtocolParser) ParseBatch(data []byte) []*models.Record {
+	return p.parseBatchInternal(data, "ns", false)
+}
+
+func (p *LineProtocolParser) parseBatchInternal(data []byte, precision string, validUTF8 bool) []*models.Record {
 	lines := bytes.Split(data, []byte{'\n'})
 	records := make([]*models.Record, 0, len(lines))
 
 	for _, line := range lines {
-		record := p.ParseLine(line)
+		record := p.parseLineWithPrecision(line, precision, validUTF8)
 		if record != nil {
 			records = append(records, record)
 		}
@@ -59,27 +65,22 @@ func (p *LineProtocolParser) ParseBatch(data []byte) []*models.Record {
 //   - "s": seconds
 //
 // All timestamps are normalized to microseconds in the output records.
+// If the payload is valid UTF-8, per-field sanitization is skipped.
 func (p *LineProtocolParser) ParseBatchWithPrecision(data []byte, precision string) []*models.Record {
-	if precision == "" || precision == "ns" {
-		return p.ParseBatch(data)
+	// Pre-validate the entire payload as UTF-8 in one pass.
+	// If valid, skip per-field SanitizeUTF8 calls during parsing.
+	validUTF8 := ValidateUTF8Bytes(data)
+
+	if precision == "" {
+		precision = "ns"
 	}
 
-	lines := bytes.Split(data, []byte{'\n'})
-	records := make([]*models.Record, 0, len(lines))
-
-	for _, line := range lines {
-		record := p.parseLineWithPrecision(line, precision)
-		if record != nil {
-			records = append(records, record)
-		}
-	}
-
-	return records
+	return p.parseBatchInternal(data, precision, validUTF8)
 }
 
 // parseLineWithPrecision parses a single LP line with custom timestamp precision.
 // Converts the raw timestamp to microseconds based on the given precision.
-func (p *LineProtocolParser) parseLineWithPrecision(line []byte, precision string) *models.Record {
+func (p *LineProtocolParser) parseLineWithPrecision(line []byte, precision string, validUTF8 bool) *models.Record {
 	line = bytes.TrimSpace(line)
 	if len(line) == 0 || line[0] == '#' {
 		return nil
@@ -95,7 +96,7 @@ func (p *LineProtocolParser) parseLineWithPrecision(line []byte, precision strin
 		return nil
 	}
 
-	fields := p.parseFields(parts[1])
+	fields := p.parseFields(parts[1], validUTF8)
 	if len(fields) == 0 {
 		return nil
 	}
@@ -199,7 +200,7 @@ func (p *LineProtocolParser) parseMeasurementTags(part []byte) (string, map[stri
 
 // parseFields parses field set
 // Format: field_key=field_value[,field_key=field_value...]
-func (p *LineProtocolParser) parseFields(part []byte) map[string]interface{} {
+func (p *LineProtocolParser) parseFields(part []byte, validUTF8 bool) map[string]interface{} {
 	fields := make(map[string]interface{})
 
 	// Split on unescaped commas
@@ -212,7 +213,7 @@ func (p *LineProtocolParser) parseFields(part []byte) map[string]interface{} {
 		}
 
 		key := p.unescape(fieldPart[:idx])
-		value := p.parseFieldValue(fieldPart[idx+1:])
+		value := p.parseFieldValue(fieldPart[idx+1:], validUTF8)
 
 		if value != nil {
 			fields[key] = value
@@ -229,7 +230,7 @@ func (p *LineProtocolParser) parseFields(part []byte) map[string]interface{} {
 //   - Float: numeric without suffix (e.g., 123.45)
 //   - String: wrapped in quotes (e.g., "hello")
 //   - Boolean: t, T, true, TRUE, f, F, false, FALSE
-func (p *LineProtocolParser) parseFieldValue(value []byte) interface{} {
+func (p *LineProtocolParser) parseFieldValue(value []byte, validUTF8 bool) interface{} {
 	value = bytes.TrimSpace(value)
 	if len(value) == 0 {
 		return nil
@@ -252,11 +253,18 @@ func (p *LineProtocolParser) parseFieldValue(value []byte) interface{} {
 		if len(value) > 1 && value[len(value)-1] == '"' {
 			// Remove quotes and unescape, then sanitize for valid UTF-8
 			unescaped := p.unescape(value[1 : len(value)-1])
+			if validUTF8 {
+				return unescaped
+			}
 			sanitized, _ := SanitizeUTF8(unescaped)
 			return sanitized
 		}
 		// Malformed quoted string - return as-is without leading quote, sanitized
-		sanitized, _ := SanitizeUTF8(strings.Trim(strValue, "\""))
+		trimmed := strings.Trim(strValue, "\"")
+		if validUTF8 {
+			return trimmed
+		}
+		sanitized, _ := SanitizeUTF8(trimmed)
 		return sanitized
 	}
 
@@ -285,6 +293,9 @@ func (p *LineProtocolParser) parseFieldValue(value []byte) interface{} {
 	}
 
 	// If all else fails, treat as string (sanitized for valid UTF-8)
+	if validUTF8 {
+		return strValue
+	}
 	sanitized, _ := SanitizeUTF8(strValue)
 	return sanitized
 }

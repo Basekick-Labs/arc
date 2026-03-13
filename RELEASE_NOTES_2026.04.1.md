@@ -132,6 +132,30 @@ Upgraded the Apache Arrow columnar format library. Key fixes:
 - **Reduced GC pressure** — Fewer object allocations in hot paths, benefiting high-throughput ingestion
 - **Empty binary value handling** — Fixed edge case in BinaryBuilder for empty string values
 
+## Ingestion
+
+### Bulk UTF-8 Payload Pre-Validation
+
+Replaced per-field UTF-8 validation with a single bulk validation pass over the entire HTTP payload. Previously, every string field was individually validated via `SanitizeUTF8()` during parsing — for a 1000-row batch with 5 string fields, this meant ~5000 validation calls. Now, `ValidateUTF8Bytes()` validates the entire payload once; when valid (the common case), all per-field sanitization is skipped.
+
+This optimization applies to both ingestion paths:
+- **Line Protocol**: Pre-validates in `ParseBatchWithPrecision`, skips 3 `SanitizeUTF8` call sites in `parseFieldValue`
+- **MessagePack**: Pre-validates in `Decode`, short-circuits `sanitizeStringColumns` and `sanitizeStringFields`
+
+**Benchmark results (Apple M3 Max, arm64):**
+
+| Buffer Size | Time/op | Throughput |
+|-------------|---------|------------|
+| 1 KB | 17.4 ns | 58.8 GB/s |
+| 4 KB | 59.3 ns | 68.9 GB/s |
+| 16 KB | 208 ns | 78.6 GB/s |
+| 64 KB | 793 ns | 82.5 GB/s |
+| 1 MB | 12.4 μs | 84.3 GB/s |
+
+Zero allocations on the fast path. Go's `utf8.ValidString` on arm64 already leverages NEON SIMD internally, achieving 58-84 GB/s throughput.
+
+**Optional SIMD acceleration:** Build with `-tags simdutf` to use the [simdutf](https://github.com/simdutf/simdutf) library for large buffers (≥4KB). This provides AVX2/SSE4 acceleration on x86 servers where Go's stdlib lacks SIMD UTF-8 validation. On arm64, the standard build is already optimal. Requires `libsimdutf` installed on the build machine.
+
 ## Bug Fixes
 
 ### Token Expiration Display Fix
