@@ -15,6 +15,9 @@ type MessagePackDecoder struct {
 	logger       zerolog.Logger
 	totalDecoded uint64
 	totalErrors  uint64
+	// payloadValidUTF8 is set when the entire payload has been pre-validated as UTF-8.
+	// When true, per-field SanitizeUTF8 calls are skipped since the data is known-clean.
+	payloadValidUTF8 bool
 }
 
 // NewMessagePackDecoder creates a new MessagePack decoder
@@ -28,6 +31,10 @@ func NewMessagePackDecoder(logger zerolog.Logger) *MessagePackDecoder {
 // Returns either []models.Record or []models.ColumnarRecord depending on input format
 // The raw bytes are preserved in ColumnarRecord.RawPayload for zero-copy WAL
 func (d *MessagePackDecoder) Decode(data []byte) (interface{}, error) {
+	// Pre-validate the entire payload as UTF-8 in one pass.
+	// If valid, skip per-field SanitizeUTF8 calls during decoding.
+	d.payloadValidUTF8 = ValidateUTF8Bytes(data)
+
 	// IMPORTANT: Decode to generic interface{} first to handle both map and array formats
 	// Telegraf and other clients may send data in array-encoded format which would fail
 	// if we try to decode directly into a struct
@@ -533,7 +540,11 @@ func toInt64Timestamp(v interface{}) (int64, bool) {
 // sanitizeStringColumns sanitizes string values in columnar data to ensure valid UTF-8.
 // This prevents DuckDB query failures caused by non-UTF-8 data in Parquet files.
 // Returns count of sanitized fields for logging.
+// Skipped entirely when the payload has been pre-validated as valid UTF-8.
 func (d *MessagePackDecoder) sanitizeStringColumns(columns map[string][]interface{}) int {
+	if d.payloadValidUTF8 {
+		return 0
+	}
 	sanitizedCount := 0
 	for _, colData := range columns {
 		for i, val := range colData {
@@ -552,7 +563,11 @@ func (d *MessagePackDecoder) sanitizeStringColumns(columns map[string][]interfac
 // sanitizeStringFields sanitizes string values in row-format fields to ensure valid UTF-8.
 // This prevents DuckDB query failures caused by non-UTF-8 data in Parquet files.
 // Returns count of sanitized fields for logging.
+// Skipped entirely when the payload has been pre-validated as valid UTF-8.
 func (d *MessagePackDecoder) sanitizeStringFields(fields map[string]interface{}) int {
+	if d.payloadValidUTF8 {
+		return 0
+	}
 	sanitizedCount := 0
 	for key, val := range fields {
 		if s, ok := val.(string); ok {

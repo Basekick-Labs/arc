@@ -1,6 +1,18 @@
+//go:build !simdutf
+
 package ingest
 
 import "unicode/utf8"
+
+// ValidateUTF8 checks if a string is valid UTF-8.
+func ValidateUTF8(s string) bool {
+	return utf8.ValidString(s)
+}
+
+// ValidateUTF8Bytes checks if a byte slice is valid UTF-8.
+func ValidateUTF8Bytes(b []byte) bool {
+	return utf8.Valid(b)
+}
 
 // SanitizeUTF8 replaces invalid UTF-8 sequences with the Unicode replacement character (U+FFFD).
 // This function is optimized for the common case where strings are already valid UTF-8:
@@ -12,23 +24,9 @@ import "unicode/utf8"
 // and data from non-UTF-8 encodings (Latin-1, Windows-1252).
 func SanitizeUTF8(s string) (string, bool) {
 	// Fast path: ~3-25ns for typical strings, no allocation
-	if utf8.ValidString(s) {
+	if ValidateUTF8(s) {
 		return s, false
 	}
 
-	// Slow path: only executed for invalid UTF-8 (rare)
-	// Pre-allocate with some growth room for replacement characters
-	result := make([]byte, 0, len(s)+len(s)/8)
-	for i := 0; i < len(s); {
-		r, size := utf8.DecodeRuneInString(s[i:])
-		if r == utf8.RuneError && size == 1 {
-			// Invalid UTF-8 byte - replace with U+FFFD (replacement character)
-			result = append(result, '\xef', '\xbf', '\xbd')
-			i++
-		} else {
-			result = append(result, s[i:i+size]...)
-			i += size
-		}
-	}
-	return string(result), true
+	return sanitizeUTF8SlowPath(s), true
 }

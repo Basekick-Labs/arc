@@ -22,7 +22,11 @@ import (
 )
 
 // LineProtocolParser parses InfluxDB Line Protocol format
-type LineProtocolParser struct{}
+type LineProtocolParser struct {
+	// payloadValidUTF8 is set when the entire payload has been pre-validated as UTF-8.
+	// When true, per-field SanitizeUTF8 calls are skipped since the data is known-clean.
+	payloadValidUTF8 bool
+}
 
 // NewLineProtocolParser creates a new Line Protocol parser
 func NewLineProtocolParser() *LineProtocolParser {
@@ -59,7 +63,12 @@ func (p *LineProtocolParser) ParseBatch(data []byte) []*models.Record {
 //   - "s": seconds
 //
 // All timestamps are normalized to microseconds in the output records.
+// If the payload has been pre-validated as valid UTF-8, per-field sanitization is skipped.
 func (p *LineProtocolParser) ParseBatchWithPrecision(data []byte, precision string) []*models.Record {
+	// Pre-validate the entire payload as UTF-8 in one pass.
+	// If valid, skip per-field SanitizeUTF8 calls during parsing.
+	p.payloadValidUTF8 = ValidateUTF8Bytes(data)
+
 	if precision == "" || precision == "ns" {
 		return p.ParseBatch(data)
 	}
@@ -252,11 +261,18 @@ func (p *LineProtocolParser) parseFieldValue(value []byte) interface{} {
 		if len(value) > 1 && value[len(value)-1] == '"' {
 			// Remove quotes and unescape, then sanitize for valid UTF-8
 			unescaped := p.unescape(value[1 : len(value)-1])
+			if p.payloadValidUTF8 {
+				return unescaped
+			}
 			sanitized, _ := SanitizeUTF8(unescaped)
 			return sanitized
 		}
 		// Malformed quoted string - return as-is without leading quote, sanitized
-		sanitized, _ := SanitizeUTF8(strings.Trim(strValue, "\""))
+		trimmed := strings.Trim(strValue, "\"")
+		if p.payloadValidUTF8 {
+			return trimmed
+		}
+		sanitized, _ := SanitizeUTF8(trimmed)
 		return sanitized
 	}
 
@@ -285,6 +301,9 @@ func (p *LineProtocolParser) parseFieldValue(value []byte) interface{} {
 	}
 
 	// If all else fails, treat as string (sanitized for valid UTF-8)
+	if p.payloadValidUTF8 {
+		return strValue
+	}
 	sanitized, _ := SanitizeUTF8(strValue)
 	return sanitized
 }

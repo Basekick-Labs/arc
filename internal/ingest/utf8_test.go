@@ -209,3 +209,61 @@ func BenchmarkHasHighBit_WithUnicode(b *testing.B) {
 		hasHighBit(input)
 	}
 }
+
+// Large string benchmarks — where SIMD validation shines
+func BenchmarkSanitizeUTF8_Valid1KB(b *testing.B) {
+	input := strings.Repeat("2026-01-19T10:30:00Z INFO [api-gateway] Request processed user=admin ip=192.168.1.1 dur=42ms ", 11) // ~1KB
+	b.SetBytes(int64(len(input)))
+	for i := 0; i < b.N; i++ {
+		SanitizeUTF8(input)
+	}
+}
+
+func BenchmarkSanitizeUTF8_Valid4KB(b *testing.B) {
+	input := strings.Repeat("2026-01-19T10:30:00Z INFO [api-gateway] Request processed user=admin ip=192.168.1.1 dur=42ms ", 44) // ~4KB
+	b.SetBytes(int64(len(input)))
+	for i := 0; i < b.N; i++ {
+		SanitizeUTF8(input)
+	}
+}
+
+func BenchmarkSanitizeUTF8_Valid16KB(b *testing.B) {
+	input := strings.Repeat("2026-01-19T10:30:00Z INFO [api-gateway] Request processed user=admin ip=192.168.1.1 dur=42ms ", 176) // ~16KB
+	b.SetBytes(int64(len(input)))
+	for i := 0; i < b.N; i++ {
+		SanitizeUTF8(input)
+	}
+}
+
+func BenchmarkSanitizeUTF8_Valid64KB(b *testing.B) {
+	input := strings.Repeat("2026-01-19T10:30:00Z INFO [api-gateway] Request processed user=admin ip=192.168.1.1 dur=42ms ", 704) // ~64KB
+	b.SetBytes(int64(len(input)))
+	for i := 0; i < b.N; i++ {
+		SanitizeUTF8(input)
+	}
+}
+
+// ValidateUTF8Bytes benchmarks — simulates validating an entire HTTP payload
+func BenchmarkValidateUTF8Bytes_4KB(b *testing.B) {
+	input := []byte(strings.Repeat("2026-01-19T10:30:00Z INFO [api-gateway] Request processed user=admin ip=192.168.1.1 dur=42ms ", 44))
+	b.SetBytes(int64(len(input)))
+	for i := 0; i < b.N; i++ {
+		ValidateUTF8Bytes(input)
+	}
+}
+
+func BenchmarkValidateUTF8Bytes_64KB(b *testing.B) {
+	input := []byte(strings.Repeat("2026-01-19T10:30:00Z INFO [api-gateway] Request processed user=admin ip=192.168.1.1 dur=42ms ", 704))
+	b.SetBytes(int64(len(input)))
+	for i := 0; i < b.N; i++ {
+		ValidateUTF8Bytes(input)
+	}
+}
+
+func BenchmarkValidateUTF8Bytes_1MB(b *testing.B) {
+	input := []byte(strings.Repeat("2026-01-19T10:30:00Z INFO [api-gateway] Request processed user=admin ip=192.168.1.1 dur=42ms ", 11264))
+	b.SetBytes(int64(len(input)))
+	for i := 0; i < b.N; i++ {
+		ValidateUTF8Bytes(input)
+	}
+}
