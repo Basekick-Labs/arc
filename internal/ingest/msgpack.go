@@ -15,9 +15,6 @@ type MessagePackDecoder struct {
 	logger       zerolog.Logger
 	totalDecoded uint64
 	totalErrors  uint64
-	// payloadValidUTF8 is set when the entire payload has been pre-validated as UTF-8.
-	// When true, per-field SanitizeUTF8 calls are skipped since the data is known-clean.
-	payloadValidUTF8 bool
 }
 
 // NewMessagePackDecoder creates a new MessagePack decoder
@@ -33,7 +30,7 @@ func NewMessagePackDecoder(logger zerolog.Logger) *MessagePackDecoder {
 func (d *MessagePackDecoder) Decode(data []byte) (interface{}, error) {
 	// Pre-validate the entire payload as UTF-8 in one pass.
 	// If valid, skip per-field SanitizeUTF8 calls during decoding.
-	d.payloadValidUTF8 = ValidateUTF8Bytes(data)
+	validUTF8 := ValidateUTF8Bytes(data)
 
 	// IMPORTANT: Decode to generic interface{} first to handle both map and array formats
 	// Telegraf and other clients may send data in array-encoded format which would fail
@@ -50,7 +47,7 @@ func (d *MessagePackDecoder) Decode(data []byte) (interface{}, error) {
 	switch payload := rawPayload.(type) {
 	case map[string]interface{}:
 		// Standard map format - convert to MsgPackPayload and decode
-		result, err := d.decodeMapPayload(payload, data)
+		result, err := d.decodeMapPayload(payload, data, validUTF8)
 		if err != nil {
 			d.totalErrors++
 			return nil, err
@@ -66,7 +63,7 @@ func (d *MessagePackDecoder) Decode(data []byte) (interface{}, error) {
 		for _, item := range payload {
 			switch typedItem := item.(type) {
 			case map[string]interface{}:
-				result, err := d.decodeMapPayload(typedItem, nil)
+				result, err := d.decodeMapPayload(typedItem, nil, validUTF8)
 				if err != nil {
 					d.logger.Error().Err(err).Msg("Failed to decode array item")
 					continue
@@ -87,14 +84,14 @@ func (d *MessagePackDecoder) Decode(data []byte) (interface{}, error) {
 }
 
 // decodeMapPayload decodes a map[string]interface{} payload
-func (d *MessagePackDecoder) decodeMapPayload(payload map[string]interface{}, rawData []byte) (interface{}, error) {
+func (d *MessagePackDecoder) decodeMapPayload(payload map[string]interface{}, rawData []byte, validUTF8 bool) (interface{}, error) {
 	// Check for batch format
 	if batch, ok := payload["batch"]; ok {
 		if batchSlice, ok := batch.([]interface{}); ok {
 			var results []interface{}
 			for _, item := range batchSlice {
 				if itemMap, ok := item.(map[string]interface{}); ok {
-					result, err := d.decodeMapPayload(itemMap, nil)
+					result, err := d.decodeMapPayload(itemMap, nil, validUTF8)
 					if err != nil {
 						d.logger.Error().Err(err).Msg("Failed to decode batch item")
 						continue
@@ -110,7 +107,7 @@ func (d *MessagePackDecoder) decodeMapPayload(payload map[string]interface{}, ra
 	msgPayload := d.mapToPayload(payload)
 
 	// Decode item with raw data for zero-copy WAL
-	return d.decodeItemWithRaw(msgPayload, rawData)
+	return d.decodeItemWithRaw(msgPayload, rawData, validUTF8)
 }
 
 // mapToPayload converts a generic map to MsgPackPayload struct
@@ -174,20 +171,20 @@ func (d *MessagePackDecoder) mapToPayload(m map[string]interface{}) *models.MsgP
 }
 
 // decodeItemWithRaw decodes a single item and passes raw bytes for zero-copy WAL
-func (d *MessagePackDecoder) decodeItemWithRaw(payload *models.MsgPackPayload, rawData []byte) (interface{}, error) {
+func (d *MessagePackDecoder) decodeItemWithRaw(payload *models.MsgPackPayload, rawData []byte, validUTF8 bool) (interface{}, error) {
 	// FAST PATH: Columnar format (zero-copy passthrough to Arrow and WAL)
 	if payload.Columns != nil {
-		return d.decodeColumnar(payload, rawData)
+		return d.decodeColumnar(payload, rawData, validUTF8)
 	}
 
 	// LEGACY PATH: Row format (requires flattening, no zero-copy WAL)
-	return d.decodeRow(payload)
+	return d.decodeRow(payload, validUTF8)
 }
 
 // decodeColumnar handles columnar format (ZERO-COPY passthrough)
 // Input:  {m: "cpu", columns: {time: [...], val: [...], region: [...]}}
 // Output: ColumnarRecord with validated columns and optional raw bytes for WAL
-func (d *MessagePackDecoder) decodeColumnar(payload *models.MsgPackPayload, rawData []byte) (*models.ColumnarRecord, error) {
+func (d *MessagePackDecoder) decodeColumnar(payload *models.MsgPackPayload, rawData []byte, validUTF8 bool) (*models.ColumnarRecord, error) {
 	// Extract measurement
 	measurement, err := d.extractMeasurement(payload.M)
 	if err != nil {
@@ -239,7 +236,7 @@ func (d *MessagePackDecoder) decodeColumnar(payload *models.MsgPackPayload, rawD
 	}
 
 	// Sanitize string columns to ensure valid UTF-8 (prevents DuckDB query failures)
-	sanitizedCount := d.sanitizeStringColumns(payload.Columns)
+	sanitizedCount := d.sanitizeStringColumns(payload.Columns, validUTF8)
 	if sanitizedCount > 0 {
 		d.logger.Warn().
 			Str("measurement", measurement).
@@ -259,7 +256,7 @@ func (d *MessagePackDecoder) decodeColumnar(payload *models.MsgPackPayload, rawD
 // decodeRow handles row format (legacy, requires flattening)
 // Input:  {m: "cpu", t: 1633024800000, h: "server01", fields: {...}, tags: {...}}
 // Output: Record with flattened structure
-func (d *MessagePackDecoder) decodeRow(payload *models.MsgPackPayload) (*models.Record, error) {
+func (d *MessagePackDecoder) decodeRow(payload *models.MsgPackPayload, validUTF8 bool) (*models.Record, error) {
 	// Extract measurement
 	measurement, err := d.extractMeasurement(payload.M)
 	if err != nil {
@@ -305,7 +302,7 @@ func (d *MessagePackDecoder) decodeRow(payload *models.MsgPackPayload) (*models.
 	}
 
 	// Sanitize string fields to ensure valid UTF-8 (prevents DuckDB query failures)
-	sanitizedCount := d.sanitizeStringFields(fields)
+	sanitizedCount := d.sanitizeStringFields(fields, validUTF8)
 	if sanitizedCount > 0 {
 		d.logger.Warn().
 			Str("measurement", measurement).
@@ -541,8 +538,8 @@ func toInt64Timestamp(v interface{}) (int64, bool) {
 // This prevents DuckDB query failures caused by non-UTF-8 data in Parquet files.
 // Returns count of sanitized fields for logging.
 // Skipped entirely when the payload has been pre-validated as valid UTF-8.
-func (d *MessagePackDecoder) sanitizeStringColumns(columns map[string][]interface{}) int {
-	if d.payloadValidUTF8 {
+func (d *MessagePackDecoder) sanitizeStringColumns(columns map[string][]interface{}, validUTF8 bool) int {
+	if validUTF8 {
 		return 0
 	}
 	sanitizedCount := 0
@@ -564,8 +561,8 @@ func (d *MessagePackDecoder) sanitizeStringColumns(columns map[string][]interfac
 // This prevents DuckDB query failures caused by non-UTF-8 data in Parquet files.
 // Returns count of sanitized fields for logging.
 // Skipped entirely when the payload has been pre-validated as valid UTF-8.
-func (d *MessagePackDecoder) sanitizeStringFields(fields map[string]interface{}) int {
-	if d.payloadValidUTF8 {
+func (d *MessagePackDecoder) sanitizeStringFields(fields map[string]interface{}, validUTF8 bool) int {
+	if validUTF8 {
 		return 0
 	}
 	sanitizedCount := 0
