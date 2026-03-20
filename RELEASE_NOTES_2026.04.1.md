@@ -68,6 +68,21 @@ The flatter degradation curve means throughput stays more consistent over time i
 
 ## Observability
 
+### WAL Dropped Entries Metric
+
+Exposed WAL buffer drops as a Prometheus counter (`arc_wal_dropped_entries_total`) so operators can detect and alert on WAL drops in real time. Previously, drop counts were only available via `Stats()` at WAL close time.
+
+The WAL async write buffer size is now configurable:
+
+```toml
+[wal]
+buffer_size = 10000   # default: 10000 entries
+```
+
+Env var: `ARC_WAL_BUFFER_SIZE`
+
+Operators experiencing drops under sustained load can increase this to reduce entry loss.
+
 ### Slow Query Logging
 
 Configurable slow query detection with WARN-level logging and a Prometheus counter. When a query exceeds the threshold, Arc logs the SQL, execution time, row count, and token name — giving operators immediate visibility into queries that may need optimization.
