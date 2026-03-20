@@ -123,6 +123,13 @@ Upgraded the DuckDB query engine (`duckdb-go` v2.5.4 → v2.5.5). Key fixes:
 - **httpfs upstream fixes** — Improved S3 connection stability
 - **Pragma input sanitization** — Defense in depth against malformed pragma inputs
 
+### gRPC 1.79.1 → 1.79.3 (Security)
+
+Updated the `google.golang.org/grpc` indirect dependency. Key fixes:
+
+- **Authorization bypass fix (1.79.3)** — Malformed `:path` headers missing the leading slash could bypass path-based "deny" rules in `grpc/authz` interceptors. Non-canonical paths are now immediately rejected with `Unimplemented`
+- **Redundant error logging (1.79.2)** — Fixed spurious error logs in health/ORCA producers when no stats handler is configured
+
 ### Arrow Go v18.4.1 → v18.5.2
 
 Upgraded the Apache Arrow columnar format library. Key fixes:
