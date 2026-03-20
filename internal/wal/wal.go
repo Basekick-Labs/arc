@@ -140,8 +140,10 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 	if cfg.SyncBytes == 0 {
 		cfg.SyncBytes = 1024 * 1024 // 1MB
 	}
-	if cfg.BufferSize == 0 {
+	if cfg.BufferSize < 1 {
 		cfg.BufferSize = 10000 // Default buffer size
+	} else if cfg.BufferSize > 1000000 {
+		cfg.BufferSize = 1000000 // Cap to prevent excessive memory allocation
 	}
 
 	// Create WAL directory with owner-only permissions (WAL contains sensitive data)
