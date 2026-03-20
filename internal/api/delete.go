@@ -571,7 +571,7 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, _, where
 	// Create temp file for the rewritten data
 	dir := filepath.Dir(filePath)
 	tempDir := filepath.Join(dir, ".tmp")
-	if err := os.MkdirAll(tempDir, 0755); err != nil {
+	if err := os.MkdirAll(tempDir, 0700); err != nil {
 		return 0, fmt.Errorf("failed to create temp directory: %w", err)
 	}
 

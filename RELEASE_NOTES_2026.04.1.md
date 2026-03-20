@@ -196,9 +196,9 @@ Read-only endpoints (list, get, status) remain accessible to any authenticated t
 
 Expanded the forbidden keyword list for delete WHERE clauses to block `UNION`, `SELECT`, `CREATE`, `COPY`, `ATTACH`, `LOAD`, `PRAGMA`, `CALL`, and `SET` — preventing SQL injection vectors specific to DuckDB's query dialect.
 
-### Compactor Temp Directory Permissions
+### Temp Directory Permissions
 
-Changed compaction temp directories from world-readable (`0755`) to owner-only (`0700`), preventing other system users from reading uncompacted data files.
+Changed all temp directories (compaction, delete rewrite) from world-readable (`0755`) to owner-only (`0700`), preventing other system users from reading uncompacted or in-flight data files.
 
 ## Bug Fixes
 
@@ -225,6 +225,16 @@ The CQ scheduler now cancels in-flight query executions when stopping, instead o
 ### Compactor Subprocess Signal Handling
 
 Compaction subprocesses now respond to SIGTERM/SIGINT via `signal.NotifyContext`, allowing DuckDB queries to be cancelled when the parent process times out.
+
+### Streaming Backup Restore
+
+Backup restore now streams Parquet files through a temp file instead of loading the entire file into memory. This prevents OOM during restore of databases with large Parquet files (100MB+).
+
+### Local Storage Optimizations
+
+- **WriteReader directory cache**: The streaming write path (`WriteReader`) now uses the same directory cache optimization as `Write`, reducing filesystem lock contention under sustained load
+- **Context-aware file listing**: `List` and `ListObjects` now check for context cancellation during directory walks, allowing long listings on large databases to be cancelled promptly
+- **DeleteBatch error reporting**: Batch deletes now return all errors (via `errors.Join`) instead of only the last one, improving diagnostics when multiple files fail to delete
 
 ### Token Expiration Display Fix
 
