@@ -100,9 +100,10 @@ type Metrics struct {
 	auditWriteErrors atomic.Int64
 
 	// WAL metrics
-	walRecordsPreserved atomic.Int64 // Records preserved in WAL for recovery (flush failures)
-	walRecoveryTotal    atomic.Int64 // Successful WAL recovery operations
-	walRecoveryRecords  atomic.Int64 // Total records recovered from WAL
+	walRecordsPreserved  atomic.Int64 // Records preserved in WAL for recovery (flush failures)
+	walRecoveryTotal     atomic.Int64 // Successful WAL recovery operations
+	walRecoveryRecords   atomic.Int64 // Total records recovered from WAL
+	walDroppedEntries    atomic.Int64 // Entries dropped due to full WAL buffer
 
 	// Decompression pool metrics
 	decompBufferDiscards atomic.Int64 // Oversized buffers not returned to pool
@@ -279,6 +280,7 @@ func (m *Metrics) IncMQTTReconnects() { m.mqttReconnects.Add(1) }
 func (m *Metrics) IncWALRecordsPreserved(count int64) { m.walRecordsPreserved.Add(count) }
 func (m *Metrics) IncWALRecoveryTotal()               { m.walRecoveryTotal.Add(1) }
 func (m *Metrics) IncWALRecoveryRecords(count int64)  { m.walRecoveryRecords.Add(count) }
+func (m *Metrics) IncWALDroppedEntries()              { m.walDroppedEntries.Add(1) }
 
 // Decompression Pool Metrics
 func (m *Metrics) IncDecompBufferDiscards() { m.decompBufferDiscards.Add(1) }
@@ -407,6 +409,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"wal_records_preserved": m.walRecordsPreserved.Load(),
 		"wal_recovery_total":    m.walRecoveryTotal.Load(),
 		"wal_recovery_records":  m.walRecoveryRecords.Load(),
+		"wal_dropped_entries":   m.walDroppedEntries.Load(),
 
 		// Decompression Pool
 		"decomp_buffer_discards": m.decompBufferDiscards.Load(),
@@ -669,6 +672,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_recovery_records_total Total records recovered from WAL\n"...)
 	b = append(b, "# TYPE arc_wal_recovery_records_total counter\n"...)
 	b = appendMetric(b, "arc_wal_recovery_records_total", float64(m.walRecoveryRecords.Load()))
+
+	b = append(b, "# HELP arc_wal_dropped_entries_total WAL entries dropped due to full buffer\n"...)
+	b = append(b, "# TYPE arc_wal_dropped_entries_total counter\n"...)
+	b = appendMetric(b, "arc_wal_dropped_entries_total", float64(m.walDroppedEntries.Load()))
 
 	// Decompression pool metrics
 	b = append(b, "# HELP arc_decomp_buffer_discards_total Oversized decompression buffers not returned to pool\n"...)

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Basekick-Labs/msgpack/v6"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
 
@@ -139,8 +140,10 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 	if cfg.SyncBytes == 0 {
 		cfg.SyncBytes = 1024 * 1024 // 1MB
 	}
-	if cfg.BufferSize == 0 {
+	if cfg.BufferSize < 1 {
 		cfg.BufferSize = 10000 // Default buffer size
+	} else if cfg.BufferSize > 1000000 {
+		cfg.BufferSize = 1000000 // Cap to prevent excessive memory allocation
 	}
 
 	// Create WAL directory with owner-only permissions (WAL contains sensitive data)
@@ -374,6 +377,7 @@ func (w *Writer) AppendRawWithMeta(database string, payload []byte) error {
 		return nil
 	default:
 		atomic.AddInt64(&w.DroppedEntries, 1)
+		metrics.Get().IncWALDroppedEntries()
 		return nil
 	}
 }
@@ -423,6 +427,7 @@ func (w *Writer) AppendRaw(payload []byte) error {
 	default:
 		// Buffer full - drop entry (trade durability for throughput)
 		atomic.AddInt64(&w.DroppedEntries, 1)
+		metrics.Get().IncWALDroppedEntries()
 		return nil // Don't return error to avoid slowing down the caller
 	}
 }
