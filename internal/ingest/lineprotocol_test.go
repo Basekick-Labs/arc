@@ -413,27 +413,31 @@ memory,host=server01 free=1024i 1609459200000000000`
 	}
 
 	// Check cpu measurement
-	cpuData := columnar["cpu"]
-	if cpuData == nil {
+	cpuRecord := columnar["cpu"]
+	if cpuRecord == nil {
 		t.Fatal("expected cpu measurement data")
 	}
-	if len(cpuData["time"]) != 2 {
-		t.Errorf("cpu time column: expected 2 values, got %d", len(cpuData["time"]))
+	if len(cpuRecord.Columns["time"]) != 2 {
+		t.Errorf("cpu time column: expected 2 values, got %d", len(cpuRecord.Columns["time"]))
 	}
-	if len(cpuData["host"]) != 2 {
-		t.Errorf("cpu host column: expected 2 values, got %d", len(cpuData["host"]))
+	if len(cpuRecord.Columns["host"]) != 2 {
+		t.Errorf("cpu host column: expected 2 values, got %d", len(cpuRecord.Columns["host"]))
 	}
-	if len(cpuData["usage"]) != 2 {
-		t.Errorf("cpu usage column: expected 2 values, got %d", len(cpuData["usage"]))
+	if len(cpuRecord.Columns["usage"]) != 2 {
+		t.Errorf("cpu usage column: expected 2 values, got %d", len(cpuRecord.Columns["usage"]))
+	}
+	// Verify tag columns are tracked
+	if len(cpuRecord.TagColumns) != 1 {
+		t.Errorf("cpu: expected 1 tag column, got %d", len(cpuRecord.TagColumns))
 	}
 
 	// Check memory measurement
-	memData := columnar["memory"]
-	if memData == nil {
+	memRecord := columnar["memory"]
+	if memRecord == nil {
 		t.Fatal("expected memory measurement data")
 	}
-	if len(memData["time"]) != 1 {
-		t.Errorf("memory time column: expected 1 value, got %d", len(memData["time"]))
+	if len(memRecord.Columns["time"]) != 1 {
+		t.Errorf("memory time column: expected 1 value, got %d", len(memRecord.Columns["time"]))
 	}
 }
 

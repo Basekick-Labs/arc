@@ -394,8 +394,8 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	// Feed each measurement into the ArrowBuffer ingest pipeline
 	var totalRows int64
 	importedMeasurements := make([]string, 0, len(columnarByMeasurement))
-	for measurement, columns := range columnarByMeasurement {
-		if err := h.arrowBuffer.WriteColumnarDirect(c.Context(), database, measurement, columns); err != nil {
+	for measurement, record := range columnarByMeasurement {
+		if err := h.arrowBuffer.WriteColumnarRecord(c.Context(), database, record); err != nil {
 			h.totalErrors.Add(1)
 			h.logger.Error().Err(err).
 				Str("database", database).
@@ -406,7 +406,7 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 			})
 		}
 		// Count rows from the time column
-		if timeCol, ok := columns["time"]; ok {
+		if timeCol, ok := record.Columns["time"]; ok {
 			totalRows += int64(len(timeCol))
 		}
 		importedMeasurements = append(importedMeasurements, measurement)

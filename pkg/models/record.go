@@ -18,6 +18,7 @@ type ColumnarRecord struct {
 	Measurement string                   `json:"measurement"`
 	Columnar    bool                     `json:"_columnar"` // Marker for columnar format
 	Columns     map[string][]interface{} `json:"columns"`   // Column name -> array of values
+	TagColumns  []string                 `json:"-"`          // Tag column names (for Parquet metadata, enables auto-dedup)
 	TimeUnit    string                   `json:"_time_unit,omitempty"`
 	RawPayload  []byte                   `json:"-"` // Original msgpack bytes for zero-copy WAL
 }

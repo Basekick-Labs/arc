@@ -354,23 +354,25 @@ func ToFlatRecord(record *models.Record) map[string]interface{} {
 
 // BatchToColumnar converts a batch of records to columnar format
 // Groups records by measurement and converts to column-oriented data
-func BatchToColumnar(records []*models.Record) map[string]map[string][]interface{} {
+func BatchToColumnar(records []*models.Record) map[string]*models.ColumnarRecord {
 	// Group by measurement
 	byMeasurement := make(map[string][]*models.Record)
 	for _, record := range records {
 		byMeasurement[record.Measurement] = append(byMeasurement[record.Measurement], record)
 	}
 
-	result := make(map[string]map[string][]interface{})
+	result := make(map[string]*models.ColumnarRecord)
 
 	for measurement, measurementRecords := range byMeasurement {
-		// Collect all column names
+		// Collect all column names and track tags separately
 		columns := make(map[string]bool)
 		columns["time"] = true
+		allTags := make(map[string]struct{})
 
 		for _, record := range measurementRecords {
 			for key := range record.Tags {
 				columns[key] = true
+				allTags[key] = struct{}{}
 			}
 			for key := range record.Fields {
 				if _, hasTag := record.Tags[key]; hasTag {
@@ -404,7 +406,18 @@ func BatchToColumnar(records []*models.Record) map[string]map[string][]interface
 			}
 		}
 
-		result[measurement] = columnarData
+		// Collect tag column names for Parquet metadata (enables auto-dedup in compaction)
+		tagColumns := make([]string, 0, len(allTags))
+		for tag := range allTags {
+			tagColumns = append(tagColumns, tag)
+		}
+
+		result[measurement] = &models.ColumnarRecord{
+			Measurement: measurement,
+			Columnar:    true,
+			Columns:     columnarData,
+			TagColumns:  tagColumns,
+		}
 	}
 
 	return result
