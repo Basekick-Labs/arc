@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/compaction"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
@@ -16,27 +17,38 @@ type CompactionHandler struct {
 	manager         *compaction.Manager
 	hourlyScheduler *compaction.Scheduler
 	dailyScheduler  *compaction.Scheduler
+	authManager     *auth.AuthManager
 	logger          zerolog.Logger
 }
 
 // NewCompactionHandler creates a new compaction handler
-func NewCompactionHandler(manager *compaction.Manager, hourlyScheduler, dailyScheduler *compaction.Scheduler, logger zerolog.Logger) *CompactionHandler {
+func NewCompactionHandler(manager *compaction.Manager, hourlyScheduler, dailyScheduler *compaction.Scheduler, authManager *auth.AuthManager, logger zerolog.Logger) *CompactionHandler {
 	return &CompactionHandler{
 		manager:         manager,
 		hourlyScheduler: hourlyScheduler,
 		dailyScheduler:  dailyScheduler,
+		authManager:     authManager,
 		logger:          logger.With().Str("component", "compaction-handler").Logger(),
 	}
 }
 
 // RegisterRoutes registers compaction endpoints
 func (h *CompactionHandler) RegisterRoutes(app *fiber.App) {
-	app.Get("/api/v1/compaction/status", h.getStatus)
-	app.Get("/api/v1/compaction/stats", h.getStats)
-	app.Get("/api/v1/compaction/candidates", h.getCandidates)
-	app.Post("/api/v1/compaction/trigger", h.triggerCompaction)
-	app.Get("/api/v1/compaction/jobs", h.getActiveJobs)
-	app.Get("/api/v1/compaction/history", h.getHistory)
+	group := app.Group("/api/v1/compaction")
+
+	// Read-only routes — any authenticated token
+	group.Get("/status", h.getStatus)
+	group.Get("/stats", h.getStats)
+	group.Get("/candidates", h.getCandidates)
+	group.Get("/jobs", h.getActiveJobs)
+	group.Get("/history", h.getHistory)
+
+	// Admin route — trigger compaction requires admin permission
+	if h.authManager != nil {
+		group.Post("/trigger", auth.RequireAdmin(h.authManager), h.triggerCompaction)
+	} else {
+		group.Post("/trigger", h.triggerCompaction)
+	}
 
 	h.logger.Info().Msg("Compaction routes registered")
 }

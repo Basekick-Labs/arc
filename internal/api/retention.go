@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -19,11 +20,12 @@ import (
 
 // RetentionHandler handles retention policy operations
 type RetentionHandler struct {
-	storage storage.Backend
-	config  *config.RetentionConfig
-	db      *sql.DB          // SQLite for policy metadata
-	duckdb  *database.DuckDB // Shared DuckDB for parquet queries
-	logger  zerolog.Logger
+	storage     storage.Backend
+	config      *config.RetentionConfig
+	db          *sql.DB          // SQLite for policy metadata
+	duckdb      *database.DuckDB // Shared DuckDB for parquet queries
+	authManager *auth.AuthManager
+	logger      zerolog.Logger
 }
 
 // RetentionPolicy represents a retention policy
@@ -83,7 +85,7 @@ type RetentionExecution struct {
 }
 
 // NewRetentionHandler creates a new retention handler
-func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *config.RetentionConfig, logger zerolog.Logger) (*RetentionHandler, error) {
+func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *config.RetentionConfig, authManager *auth.AuthManager, logger zerolog.Logger) (*RetentionHandler, error) {
 	// Ensure directory exists
 	dir := filepath.Dir(cfg.DBPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -97,11 +99,12 @@ func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *
 	}
 
 	h := &RetentionHandler{
-		storage: storage,
-		config:  cfg,
-		db:      db,
-		duckdb:  duckdb,
-		logger:  logger.With().Str("component", "retention-handler").Logger(),
+		storage:     storage,
+		config:      cfg,
+		db:          db,
+		duckdb:      duckdb,
+		authManager: authManager,
+		logger:      logger.With().Str("component", "retention-handler").Logger(),
 	}
 
 	// Initialize tables
@@ -162,13 +165,25 @@ func (h *RetentionHandler) Close() error {
 
 // RegisterRoutes registers retention endpoints
 func (h *RetentionHandler) RegisterRoutes(app *fiber.App) {
-	app.Post("/api/v1/retention", h.handleCreate)
-	app.Get("/api/v1/retention", h.handleList)
-	app.Get("/api/v1/retention/:id", h.handleGet)
-	app.Put("/api/v1/retention/:id", h.handleUpdate)
-	app.Delete("/api/v1/retention/:id", h.handleDelete)
-	app.Post("/api/v1/retention/:id/execute", h.handleExecute)
-	app.Get("/api/v1/retention/:id/executions", h.handleGetExecutions)
+	group := app.Group("/api/v1/retention")
+
+	// Read-only routes — any authenticated token
+	group.Get("/", h.handleList)
+	group.Get("/:id", h.handleGet)
+	group.Get("/:id/executions", h.handleGetExecutions)
+
+	// Admin routes — require admin permission for mutating operations
+	if h.authManager != nil {
+		group.Post("/", auth.RequireAdmin(h.authManager), h.handleCreate)
+		group.Put("/:id", auth.RequireAdmin(h.authManager), h.handleUpdate)
+		group.Delete("/:id", auth.RequireAdmin(h.authManager), h.handleDelete)
+		group.Post("/:id/execute", auth.RequireAdmin(h.authManager), h.handleExecute)
+	} else {
+		group.Post("/", h.handleCreate)
+		group.Put("/:id", h.handleUpdate)
+		group.Delete("/:id", h.handleDelete)
+		group.Post("/:id/execute", h.handleExecute)
+	}
 }
 
 // handleCreate creates a new retention policy

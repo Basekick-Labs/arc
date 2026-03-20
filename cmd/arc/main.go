@@ -1016,7 +1016,7 @@ func main() {
 
 	// Register Compaction handler (if compaction is enabled)
 	if compactionManager != nil {
-		compactionHandler := api.NewCompactionHandler(compactionManager, hourlyScheduler, dailyScheduler, logger.Get("compaction"))
+		compactionHandler := api.NewCompactionHandler(compactionManager, hourlyScheduler, dailyScheduler, authManager, logger.Get("compaction"))
 		compactionHandler.RegisterRoutes(server.GetApp())
 
 		// Wire post-compaction cache invalidation.
@@ -1078,7 +1078,7 @@ func main() {
 	}
 
 	// Register Delete handler
-	deleteHandler := api.NewDeleteHandler(db, storageBackend, &cfg.Delete, logger.Get("delete"))
+	deleteHandler := api.NewDeleteHandler(db, storageBackend, &cfg.Delete, authManager, logger.Get("delete"))
 	deleteHandler.RegisterRoutes(server.GetApp())
 	if cfg.Delete.Enabled {
 		log.Info().
@@ -1090,14 +1090,14 @@ func main() {
 	}
 
 	// Register Databases handler
-	databasesHandler := api.NewDatabasesHandler(storageBackend, &cfg.Delete, logger.Get("databases"))
+	databasesHandler := api.NewDatabasesHandler(storageBackend, &cfg.Delete, authManager, logger.Get("databases"))
 	databasesHandler.RegisterRoutes(server.GetApp())
 
 	// Register Retention handler
 	var retentionHandler *api.RetentionHandler
 	if cfg.Retention.Enabled {
 		var err error
-		retentionHandler, err = api.NewRetentionHandler(storageBackend, db, &cfg.Retention, logger.Get("retention"))
+		retentionHandler, err = api.NewRetentionHandler(storageBackend, db, &cfg.Retention, authManager, logger.Get("retention"))
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize retention handler")
 		}
@@ -1114,7 +1114,7 @@ func main() {
 	var cqHandler *api.ContinuousQueryHandler
 	if cfg.ContinuousQuery.Enabled {
 		var err error
-		cqHandler, err = api.NewContinuousQueryHandler(db, storageBackend, arrowBuffer, &cfg.ContinuousQuery, logger.Get("cq"))
+		cqHandler, err = api.NewContinuousQueryHandler(db, storageBackend, arrowBuffer, &cfg.ContinuousQuery, authManager, logger.Get("cq"))
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize continuous query handler")
 		}
@@ -1148,6 +1148,7 @@ func main() {
 						cqScheduler.Stop()
 						return nil
 					}, shutdown.PriorityCompaction)
+					cqHandler.SetScheduler(cqScheduler)
 					log.Info().Int("job_count", cqScheduler.JobCount()).Msg("CQ scheduler started")
 				}
 			}
@@ -1201,7 +1202,7 @@ func main() {
 	if retentionScheduler != nil {
 		retentionSchedulerInterface = retentionScheduler
 	}
-	schedulerHandler := api.NewSchedulerHandler(cqSchedulerInterface, retentionSchedulerInterface, licenseClient, logger.Get("scheduler-api"))
+	schedulerHandler := api.NewSchedulerHandler(cqSchedulerInterface, retentionSchedulerInterface, licenseClient, authManager, logger.Get("scheduler-api"))
 	schedulerHandler.RegisterRoutes(server.GetApp())
 
 	// Register Cluster handler (always register, shows status even if clustering not enabled)

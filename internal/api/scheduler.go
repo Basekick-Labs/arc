@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/license"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
@@ -26,6 +27,7 @@ type SchedulerHandler struct {
 	cqScheduler        CQSchedulerInterface
 	retentionScheduler RetentionSchedulerInterface
 	licenseClient      *license.Client
+	authManager        *auth.AuthManager
 	logger             zerolog.Logger
 }
 
@@ -34,21 +36,33 @@ func NewSchedulerHandler(
 	cqScheduler CQSchedulerInterface,
 	retentionScheduler RetentionSchedulerInterface,
 	licenseClient *license.Client,
+	authManager *auth.AuthManager,
 	logger zerolog.Logger,
 ) *SchedulerHandler {
 	return &SchedulerHandler{
 		cqScheduler:        cqScheduler,
 		retentionScheduler: retentionScheduler,
 		licenseClient:      licenseClient,
+		authManager:        authManager,
 		logger:             logger.With().Str("component", "scheduler-handler").Logger(),
 	}
 }
 
 // RegisterRoutes registers scheduler API routes
 func (h *SchedulerHandler) RegisterRoutes(app *fiber.App) {
-	app.Get("/api/v1/schedulers", h.handleGetStatus)
-	app.Post("/api/v1/schedulers/cq/reload", h.handleCQReload)
-	app.Post("/api/v1/schedulers/retention/trigger", h.handleRetentionTrigger)
+	group := app.Group("/api/v1/schedulers")
+
+	// Read-only route — any authenticated token
+	group.Get("/", h.handleGetStatus)
+
+	// Admin routes — require admin permission
+	if h.authManager != nil {
+		group.Post("/cq/reload", auth.RequireAdmin(h.authManager), h.handleCQReload)
+		group.Post("/retention/trigger", auth.RequireAdmin(h.authManager), h.handleRetentionTrigger)
+	} else {
+		group.Post("/cq/reload", h.handleCQReload)
+		group.Post("/retention/trigger", h.handleRetentionTrigger)
+	}
 }
 
 // handleGetStatus returns the status of all schedulers

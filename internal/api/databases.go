@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
@@ -18,6 +19,7 @@ type DatabasesHandler struct {
 	storage        storage.Backend
 	deleteConfig   *config.DeleteConfig
 	tieringManager *tiering.Manager
+	authManager    *auth.AuthManager
 	logger         zerolog.Logger
 }
 
@@ -60,10 +62,11 @@ var reservedDatabaseNames = map[string]bool{
 }
 
 // NewDatabasesHandler creates a new databases handler
-func NewDatabasesHandler(storage storage.Backend, deleteConfig *config.DeleteConfig, logger zerolog.Logger) *DatabasesHandler {
+func NewDatabasesHandler(storage storage.Backend, deleteConfig *config.DeleteConfig, authManager *auth.AuthManager, logger zerolog.Logger) *DatabasesHandler {
 	return &DatabasesHandler{
 		storage:      storage,
 		deleteConfig: deleteConfig,
+		authManager:  authManager,
 		logger:       logger.With().Str("component", "databases-handler").Logger(),
 	}
 }
@@ -80,7 +83,11 @@ func (h *DatabasesHandler) RegisterRoutes(app *fiber.App) {
 	app.Post("/api/v1/databases", h.handleCreate)
 	app.Get("/api/v1/databases/:name", h.handleGet)
 	app.Get("/api/v1/databases/:name/measurements", h.handleListMeasurements)
-	app.Delete("/api/v1/databases/:name", h.handleDelete)
+	if h.authManager != nil {
+		app.Delete("/api/v1/databases/:name", auth.RequireAdmin(h.authManager), h.handleDelete)
+	} else {
+		app.Delete("/api/v1/databases/:name", h.handleDelete)
+	}
 }
 
 // handleList handles GET /api/v1/databases
@@ -328,16 +335,17 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	deletedCount := 0
 	var deleteErrors []string
 
-	// Try batch delete if available
+	// Try batch delete if available, fall back to individual deletes
+	deleteIndividually := true
 	if batchDeleter, ok := h.storage.(storage.BatchDeleter); ok && len(files) > 0 {
 		if err := batchDeleter.DeleteBatch(ctx, files); err != nil {
-			h.logger.Error().Err(err).Str("database", name).Msg("Batch delete failed")
-			deleteErrors = append(deleteErrors, err.Error())
+			h.logger.Warn().Err(err).Str("database", name).Msg("Batch delete failed, falling back to individual deletes")
 		} else {
 			deletedCount = len(files)
+			deleteIndividually = false
 		}
-	} else {
-		// Fall back to individual deletes
+	}
+	if deleteIndividually {
 		for _, file := range files {
 			if err := h.storage.Delete(ctx, file); err != nil {
 				h.logger.Warn().Err(err).Str("file", file).Msg("Failed to delete file")

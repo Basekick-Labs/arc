@@ -70,7 +70,7 @@ func setupTestDatabasesHandler(t *testing.T, deleteEnabled bool) (*DatabasesHand
 		Enabled: deleteEnabled,
 	}
 
-	handler := NewDatabasesHandler(backend, deleteConfig, logger)
+	handler := NewDatabasesHandler(backend, deleteConfig, nil, logger)
 
 	app := fiber.New()
 	handler.RegisterRoutes(app)
@@ -654,7 +654,7 @@ func setupBenchmarkHandler(b *testing.B, numDatabases, measurementsPerDB int) (*
 	}
 
 	deleteConfig := &config.DeleteConfig{Enabled: false}
-	handler := NewDatabasesHandler(counting, deleteConfig, logger)
+	handler := NewDatabasesHandler(counting, deleteConfig, nil, logger)
 
 	app := fiber.New()
 	handler.RegisterRoutes(app)
