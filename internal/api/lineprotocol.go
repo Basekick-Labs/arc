@@ -269,8 +269,8 @@ localProcessing:
 	}
 
 	// Write each measurement to the buffer
-	for measurement, columns := range columnarByMeasurement {
-		err := h.buffer.WriteColumnarDirect(c.Context(), database, measurement, columns)
+	for measurement, record := range columnarByMeasurement {
+		err := h.buffer.WriteColumnarRecord(c.Context(), database, record)
 		if err != nil {
 			h.totalErrors.Add(1)
 			metrics.Get().IncIngestErrors()
@@ -278,7 +278,7 @@ localProcessing:
 				Err(err).
 				Str("database", database).
 				Str("measurement", measurement).
-				Int("records", len(columns["time"])).
+				Int("records", len(record.Columns["time"])).
 				Msg("Failed to write to Arrow buffer")
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"error": "Write failed: " + err.Error(),

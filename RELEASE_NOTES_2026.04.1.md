@@ -104,6 +104,25 @@ WRN Slow query detected component=query-handler execution_time_ms=1250 row_count
 
 Covers all query paths: standard JSON, parallel JSON, measurement queries, and Arrow IPC JSON.
 
+## Compaction
+
+### Automatic Deduplication
+
+Compaction now automatically deduplicates rows with identical tag values and timestamps (last-write-wins). This is the same semantic as InfluxDB's series key model — if the same combination of tag values and timestamp is ingested multiple times, only the most recent row is kept after compaction.
+
+**How it works:**
+
+1. **Ingestion**: Tag column names are stored as Parquet metadata (`arc:tags`) during ingestion. This happens automatically for Line Protocol and MessagePack row-format data — no configuration required.
+2. **Compaction**: When compacting Parquet files, the compactor reads the `arc:tags` metadata and uses a `ROW_NUMBER() OVER (PARTITION BY tags, time)` window function to deduplicate.
+3. **Metrics**: When duplicates are found, the compactor logs `rows_before`, `rows_after`, `rows_deduped`, and `dedup_ratio`.
+
+**Key properties:**
+- **Zero config**: No dedup keys to configure — tag columns are auto-detected from Parquet metadata
+- **Zero overhead when no duplicates**: The window function adds minimal cost to compaction, and only runs on files that have tag metadata
+- **Backwards compatible**: Files written before this feature have no `arc:tags` metadata and are compacted normally (no dedup)
+- **Ingestion performance unchanged**: Dedup happens only during compaction, not at ingest time
+- **MessagePack columnar path**: The columnar MessagePack format doesn't distinguish tags from fields, so files from this path won't have dedup metadata. Per-field data from the row format and Line Protocol paths will.
+
 ## Storage
 
 ### S3 Path Prefix Support

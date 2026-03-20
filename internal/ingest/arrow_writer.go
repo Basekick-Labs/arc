@@ -359,7 +359,7 @@ func sortColumnsTimeFirst(colNames []string) {
 // =============================================================================
 
 // getSchema gets or infers Arrow schema for columnar data (LRU cached per measurement)
-func (w *ArrowWriter) getSchema(measurement string, columns map[string]interface{}) (*arrow.Schema, error) {
+func (w *ArrowWriter) getSchema(measurement string, columns map[string]interface{}, tagColumns []string) (*arrow.Schema, error) {
 	// Create cache key from column names and types
 	var colNames []string
 	var typeNames []string
@@ -392,8 +392,8 @@ func (w *ArrowWriter) getSchema(measurement string, columns map[string]interface
 		}
 	}
 
-	// Create cache key
-	cacheKey := fmt.Sprintf("%s:%v:%v", measurement, colNames, typeNames)
+	// Create cache key (includes tag columns to ensure metadata correctness)
+	cacheKey := fmt.Sprintf("%s:%v:%v:%v", measurement, colNames, typeNames, tagColumns)
 
 	// Check LRU cache
 	if schema := w.schemaCache.get(cacheKey); schema != nil {
@@ -401,7 +401,7 @@ func (w *ArrowWriter) getSchema(measurement string, columns map[string]interface
 	}
 
 	// Cache miss - infer schema
-	schema, err := w.inferSchema(columns)
+	schema, err := w.inferSchema(columns, tagColumns)
 	if err != nil {
 		return nil, err
 	}
@@ -417,8 +417,9 @@ func (w *ArrowWriter) getSchema(measurement string, columns map[string]interface
 	return schema, nil
 }
 
-// inferSchema infers Arrow schema from columnar data
-func (w *ArrowWriter) inferSchema(columns map[string]interface{}) (*arrow.Schema, error) {
+// inferSchema infers Arrow schema from columnar data.
+// tagColumns optionally lists which columns are tags (stored as schema metadata for compaction dedup).
+func (w *ArrowWriter) inferSchema(columns map[string]interface{}, tagColumns []string) (*arrow.Schema, error) {
 	var fields []arrow.Field
 
 	for name, col := range columns {
@@ -450,15 +451,27 @@ func (w *ArrowWriter) inferSchema(columns map[string]interface{}) (*arrow.Schema
 		fields = append(fields, arrow.Field{Name: name, Type: arrowType, Nullable: true})
 	}
 
-	return arrow.NewSchema(fields, nil), nil
+	// Store tag column names as schema metadata so compaction can auto-deduplicate.
+	// Format: "arc:tags" → "host,region,service" (sorted, comma-separated)
+	var metadata *arrow.Metadata
+	if len(tagColumns) > 0 {
+		sorted := make([]string, len(tagColumns))
+		copy(sorted, tagColumns)
+		sort.Strings(sorted)
+		md := arrow.NewMetadata([]string{"arc:tags"}, []string{strings.Join(sorted, ",")})
+		metadata = &md
+	}
+
+	return arrow.NewSchema(fields, metadata), nil
 }
 
 // WriteParquetColumnar writes columnar data directly to Parquet (zero-copy path).
 // validity is an optional map of column name → []bool where false means null.
 // Columns without a validity entry (or when validity is nil) are treated as fully valid.
-func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement string, columns map[string]interface{}, validity map[string][]bool) ([]byte, error) {
+// tagColumns optionally lists which columns are tags (stored as Parquet metadata for compaction dedup).
+func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement string, columns map[string]interface{}, validity map[string][]bool, tagColumns []string) ([]byte, error) {
 	// Get or infer schema (with caching)
-	schema, err := w.getSchema(measurement, columns)
+	schema, err := w.getSchema(measurement, columns, tagColumns)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get schema: %w", err)
 	}
@@ -617,8 +630,9 @@ func (w *ArrowWriter) writeRecordToParquet(schema *arrow.Schema, arrays []arrow.
 // Validity tracks which values are null (false=null, true=valid).
 // Columns without a validity entry are fully valid (no nulls).
 type TypedColumnBatch struct {
-	Data     map[string]interface{} // typed arrays ([]int64, []float64, []string, []bool)
-	Validity map[string][]bool      // per-column null bitmap; nil entry = all valid
+	Data       map[string]interface{} // typed arrays ([]int64, []float64, []string, []bool)
+	Validity   map[string][]bool      // per-column null bitmap; nil entry = all valid
+	TagColumns []string               // tag column names (for Parquet metadata, enables auto-dedup)
 }
 
 type bufferShard struct {
@@ -1024,10 +1038,17 @@ func (b *ArrowBuffer) rowsToColumnar(measurement string, rows []*models.Record) 
 		}
 	}
 
+	// Collect tag column names for Parquet metadata (enables auto-dedup in compaction)
+	tagColumns := make([]string, 0, len(allTags))
+	for tag := range allTags {
+		tagColumns = append(tagColumns, tag)
+	}
+
 	return &models.ColumnarRecord{
 		Measurement: measurement,
 		Columnar:    true,
 		Columns:     columns,
+		TagColumns:  tagColumns,
 	}
 }
 
@@ -1083,6 +1104,12 @@ func (b *ArrowBuffer) WriteColumnarDirect(ctx context.Context, database, measure
 		Columns:     columns,
 		Columnar:    true,
 	}
+	return b.writeColumnar(ctx, database, record)
+}
+
+// WriteColumnarRecord writes a pre-built ColumnarRecord to the buffer.
+// Preserves TagColumns metadata for Parquet schema (enables auto-dedup in compaction).
+func (b *ArrowBuffer) WriteColumnarRecord(ctx context.Context, database string, record *models.ColumnarRecord) error {
 	return b.writeColumnar(ctx, database, record)
 }
 
@@ -1148,6 +1175,9 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 	if err != nil {
 		return fmt.Errorf("failed to convert columns: %w", err)
 	}
+
+	// Propagate tag column names for Parquet metadata (enables auto-dedup in compaction)
+	typedColumns.TagColumns = record.TagColumns
 
 	// Get column signature for schema evolution detection
 	newSignature := getColumnSignature(typedColumns.Data)
@@ -1895,7 +1925,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		// Single hour - sort once and write one file
 		sorted := sortTypedColumnBatchByKeys(merged, sortKeys)
 
-		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted.Data, sorted.Validity)
+		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted.Data, sorted.Validity, sorted.TagColumns)
 		if err != nil {
 			return fmt.Errorf("failed to write Parquet: %w", err)
 		}
@@ -1947,7 +1977,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		sorted := sortTypedColumnBatchByKeys(hourBatch, sortKeys)
 
 		// Write Parquet file for this hour
-		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted.Data, sorted.Validity)
+		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted.Data, sorted.Validity, sorted.TagColumns)
 		if err != nil {
 			return fmt.Errorf("failed to write Parquet for hour %d: %w", hourID, err)
 		}
@@ -2080,6 +2110,9 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 	// Track which columns have validity bitmaps and which batches have which columns
 	hasAnyValidity := false
 
+	// Union of tag columns across all batches (for Parquet metadata)
+	tagColumnSet := make(map[string]struct{})
+
 	// First pass: count total rows using time column
 	for _, batch := range batches {
 		var cols map[string]interface{}
@@ -2088,6 +2121,9 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 			cols = b.Data
 			if len(b.Validity) > 0 {
 				hasAnyValidity = true
+			}
+			for _, tag := range b.TagColumns {
+				tagColumnSet[tag] = struct{}{}
 			}
 		case map[string]interface{}:
 			cols = b
@@ -2242,7 +2278,16 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 		}
 	}
 
-	return &TypedColumnBatch{Data: merged, Validity: mergedValidity}, nil
+	// Collect merged tag columns
+	var mergedTagColumns []string
+	if len(tagColumnSet) > 0 {
+		mergedTagColumns = make([]string, 0, len(tagColumnSet))
+		for tag := range tagColumnSet {
+			mergedTagColumns = append(mergedTagColumns, tag)
+		}
+	}
+
+	return &TypedColumnBatch{Data: merged, Validity: mergedValidity, TagColumns: mergedTagColumns}, nil
 }
 
 // sortColumnsByTime sorts all columns by the time column in-place
@@ -2458,7 +2503,7 @@ func sortTypedColumnBatchByKeys(batch *TypedColumnBatch, sortKeys []string) *Typ
 	}
 
 	if batch.Validity == nil {
-		return &TypedColumnBatch{Data: sorted, Validity: nil}
+		return &TypedColumnBatch{Data: sorted, Validity: nil, TagColumns: batch.TagColumns}
 	}
 
 	// The sort produced a permutation — we need to apply the same permutation to validity.
@@ -2489,7 +2534,7 @@ func sortTypedColumnBatchByKeys(batch *TypedColumnBatch, sortKeys []string) *Typ
 	}
 
 	if n == 0 {
-		return &TypedColumnBatch{Data: sorted, Validity: batch.Validity}
+		return &TypedColumnBatch{Data: sorted, Validity: batch.Validity, TagColumns: batch.TagColumns}
 	}
 
 	// Build permutation indices (same logic as sortColumnsByKeys)
@@ -2510,7 +2555,7 @@ func sortTypedColumnBatchByKeys(batch *TypedColumnBatch, sortKeys []string) *Typ
 				}
 			}
 			if alreadySorted {
-				return &TypedColumnBatch{Data: sorted, Validity: batch.Validity}
+				return &TypedColumnBatch{Data: sorted, Validity: batch.Validity, TagColumns: batch.TagColumns}
 			}
 			sort.Slice(indices, func(i, j int) bool {
 				return times[indices[i]] < times[indices[j]]
@@ -2538,7 +2583,7 @@ func sortTypedColumnBatchByKeys(batch *TypedColumnBatch, sortKeys []string) *Typ
 		sortedValidity[name] = newValid
 	}
 
-	return &TypedColumnBatch{Data: sorted, Validity: sortedValidity}
+	return &TypedColumnBatch{Data: sorted, Validity: sortedValidity, TagColumns: batch.TagColumns}
 }
 
 // sliceTypedColumnBatchByIndices extracts rows from a TypedColumnBatch by index list,
@@ -2547,7 +2592,7 @@ func sliceTypedColumnBatchByIndices(batch *TypedColumnBatch, indices []int) *Typ
 	slicedData := sliceColumnsByIndices(batch.Data, indices)
 
 	if batch.Validity == nil {
-		return &TypedColumnBatch{Data: slicedData, Validity: nil}
+		return &TypedColumnBatch{Data: slicedData, Validity: nil, TagColumns: batch.TagColumns}
 	}
 
 	slicedValidity := make(map[string][]bool, len(batch.Validity))
@@ -2563,7 +2608,7 @@ func sliceTypedColumnBatchByIndices(batch *TypedColumnBatch, indices []int) *Typ
 		slicedValidity[name] = newValid
 	}
 
-	return &TypedColumnBatch{Data: slicedData, Validity: slicedValidity}
+	return &TypedColumnBatch{Data: slicedData, Validity: slicedValidity, TagColumns: batch.TagColumns}
 }
 
 // microPerHour is the number of microseconds in one hour (3600 * 1,000,000)

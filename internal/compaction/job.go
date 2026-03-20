@@ -534,25 +534,50 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// This ensures compacted files maintain the same sort order as ingested files
 	orderByClause := buildOrderByClause(j.SortKeys)
 
-	// Execute compaction query
-	// Uses union_by_name=true to handle schema evolution
-	// Sorts by configured keys to maintain compression benefits
-	escapedOutputFile := escapeSQLPath(outputFile)
-	query := fmt.Sprintf(`
-		COPY (
-			SELECT * FROM read_parquet(%s, union_by_name=true)
-			%s
-		) TO '%s' (
-			FORMAT PARQUET,
-			COMPRESSION ZSTD,
-			COMPRESSION_LEVEL 3,
-			ROW_GROUP_SIZE 122880
-		)
-	`, fileListSQL, orderByClause, escapedOutputFile)
+	// Auto-dedup: read tag metadata from Parquet files (union across all files for schema evolution).
+	// If tags are present, dedup on (tags, time) keeping one row per unique key.
+	// Files without tag metadata (pre-dedup or msgpack columnar) are compacted normally.
+	var tagColumns []string
+	if len(validLocalPaths) > 0 {
+		tags, err := readTagColumnsFromParquetFiles(ctx, db, validLocalPaths)
+		if err != nil {
+			j.logger.Warn().Err(err).Msg("Failed to read tag metadata from parquet, skipping dedup")
+		} else if len(tags) > 0 {
+			tagColumns = tags
+			j.logger.Info().
+				Strs("tag_columns", tagColumns).
+				Int("files", len(validLocalPaths)).
+				Msg("Auto-dedup enabled: found tag metadata in parquet files")
+		}
+	}
+
+	// Build and execute compaction query (with dedup if tag metadata found)
+	query := buildCompactionQuery(fileListSQL, orderByClause, outputFile, tagColumns)
+
+	// When dedup is active, count rows before compaction using parquet metadata (no data scan)
+	var rowsBefore int64
+	if len(tagColumns) > 0 {
+		rowsBefore, _ = countParquetRows(ctx, db, fileListSQL)
+	}
 
 	_, err := db.ExecContext(ctx, query)
 	if err != nil {
 		return "", fmt.Errorf("failed to execute compaction query: %w", err)
+	}
+
+	// Log dedup metrics when rows were removed
+	if len(tagColumns) > 0 && rowsBefore > 0 {
+		escapedOutput := escapeSQLPath(outputFile)
+		rowsAfter, _ := countParquetRows(ctx, db, fmt.Sprintf("['%s']", escapedOutput))
+		if rowsAfter > 0 && rowsAfter < rowsBefore {
+			deduped := rowsBefore - rowsAfter
+			j.logger.Info().
+				Int64("rows_before", rowsBefore).
+				Int64("rows_after", rowsAfter).
+				Int64("rows_deduped", deduped).
+				Float64("dedup_ratio", float64(deduped)/float64(rowsBefore)*100).
+				Msg("Deduplication removed duplicate rows")
+		}
 	}
 
 	// Store the list of files that were actually compacted (for safe deletion)

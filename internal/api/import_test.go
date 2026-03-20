@@ -204,21 +204,21 @@ func TestParseBatchToColumnar_RoundTrip(t *testing.T) {
 	}
 
 	// cpu should have 2 rows
-	cpuCols, ok := columnar["cpu"]
+	cpuRecord, ok := columnar["cpu"]
 	if !ok {
 		t.Fatal("missing 'cpu' measurement")
 	}
-	if timeCols, ok := cpuCols["time"]; !ok || len(timeCols) != 2 {
-		t.Errorf("cpu: expected 2 time values, got %d", len(cpuCols["time"]))
+	if timeCols, ok := cpuRecord.Columns["time"]; !ok || len(timeCols) != 2 {
+		t.Errorf("cpu: expected 2 time values, got %d", len(cpuRecord.Columns["time"]))
 	}
 
 	// mem should have 1 row
-	memCols, ok := columnar["mem"]
+	memRecord, ok := columnar["mem"]
 	if !ok {
 		t.Fatal("missing 'mem' measurement")
 	}
-	if timeCols, ok := memCols["time"]; !ok || len(timeCols) != 1 {
-		t.Errorf("mem: expected 1 time value, got %d", len(memCols["time"]))
+	if timeCols, ok := memRecord.Columns["time"]; !ok || len(timeCols) != 1 {
+		t.Errorf("mem: expected 1 time value, got %d", len(memRecord.Columns["time"]))
 	}
 }
 
