@@ -118,18 +118,15 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 			continue
 		}
 
-		data, err := m.backupStorage.Read(ctx, srcPath)
+		// Stream via temp file to avoid loading entire Parquet file into memory
+		bytesWritten, err := m.streamRestoreFile(ctx, srcPath, destPath)
 		if err != nil {
-			m.logger.Warn().Str("path", srcPath).Err(err).Msg("Failed to read backup file, skipping")
+			m.logger.Warn().Str("path", srcPath).Err(err).Msg("Failed to restore backup file, skipping")
 			continue
 		}
 
-		if err := m.dataStorage.Write(ctx, destPath, data); err != nil {
-			return fmt.Errorf("failed to restore file %s: %w", destPath, err)
-		}
-
 		atomic.AddInt64(&progress.ProcessedFiles, 1)
-		atomic.AddInt64(&progress.ProcessedBytes, int64(len(data)))
+		atomic.AddInt64(&progress.ProcessedBytes, bytesWritten)
 
 		if atomic.LoadInt64(&progress.ProcessedFiles)%100 == 0 {
 			m.logger.Info().
@@ -140,6 +137,41 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 	}
 
 	return nil
+}
+
+// streamRestoreFile streams a file from backup storage to data storage via a temp file,
+// avoiding loading the entire file into memory (important for large Parquet files).
+func (m *Manager) streamRestoreFile(ctx context.Context, srcPath, destPath string) (int64, error) {
+	tmpFile, err := os.CreateTemp("", "arc-restore-*.parquet")
+	if err != nil {
+		return 0, fmt.Errorf("failed to create temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+	defer tmpFile.Close()
+
+	// Stream from backup storage to temp file
+	if err := m.backupStorage.ReadTo(ctx, srcPath, tmpFile); err != nil {
+		return 0, fmt.Errorf("failed to read from backup: %w", err)
+	}
+
+	// Get size and rewind for upload
+	info, err := tmpFile.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("failed to stat temp file: %w", err)
+	}
+	size := info.Size()
+
+	if _, err := tmpFile.Seek(0, 0); err != nil {
+		return 0, fmt.Errorf("failed to seek temp file: %w", err)
+	}
+
+	// Stream from temp file to data storage
+	if err := m.dataStorage.WriteReader(ctx, destPath, tmpFile, size); err != nil {
+		return 0, fmt.Errorf("failed to write to data storage: %w", err)
+	}
+
+	return size, nil
 }
 
 // restoreSQLite restores the SQLite database from the backup.

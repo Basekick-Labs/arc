@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -47,6 +48,32 @@ func NewLocalBackend(basePath string, logger zerolog.Logger) (*LocalBackend, err
 	}, nil
 }
 
+// ensureDir creates the directory if it doesn't exist, using a cache to avoid
+// redundant os.MkdirAll calls under sustained load.
+func (b *LocalBackend) ensureDir(dir string) error {
+	// Fast path: check if directory already exists in cache (RLock)
+	b.dirMu.RLock()
+	exists := b.dirCache[dir]
+	b.dirMu.RUnlock()
+
+	if exists {
+		return nil
+	}
+
+	// Slow path: create directory and update cache (Lock)
+	b.dirMu.Lock()
+	defer b.dirMu.Unlock()
+	// Double-check after acquiring write lock
+	if !b.dirCache[dir] {
+		// Use 0700 for owner-only access (security best practice)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return fmt.Errorf("failed to create directory: %w", err)
+		}
+		b.dirCache[dir] = true
+	}
+	return nil
+}
+
 // Write writes data to the specified path with atomic write (write to temp, then rename)
 func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) error {
 	// Validate and sanitize the path to prevent path traversal
@@ -55,44 +82,22 @@ func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) erro
 		return fmt.Errorf("invalid path: %w", err)
 	}
 
-	// OPTIMIZATION: Check directory cache first (avoid filesystem lock contention)
 	dir := filepath.Dir(fullPath)
-
-	// Fast path: check if directory already exists in cache (RLock)
-	b.dirMu.RLock()
-	exists := b.dirCache[dir]
-	b.dirMu.RUnlock()
-
-	if !exists {
-		// Slow path: create directory and update cache (Lock)
-		b.dirMu.Lock()
-		// Double-check after acquiring write lock
-		if !b.dirCache[dir] {
-			// Use 0700 for owner-only access (security best practice)
-			if err := os.MkdirAll(dir, 0700); err != nil {
-				b.dirMu.Unlock()
-				return fmt.Errorf("failed to create directory: %w", err)
-			}
-			b.dirCache[dir] = true
-		}
-		b.dirMu.Unlock()
+	if err := b.ensureDir(dir); err != nil {
+		return err
 	}
 
 	// Write to temporary file with cryptographically random name (prevents TOCTOU attacks)
 	tmpFile, err := os.CreateTemp(dir, ".arc-*.tmp")
 	if err != nil {
-		// Directory might have been deleted externally - invalidate cache and retry
+		// Directory might have been deleted externally — invalidate cache and retry
 		if os.IsNotExist(err) {
 			b.dirMu.Lock()
 			delete(b.dirCache, dir)
-			if err := os.MkdirAll(dir, 0700); err != nil {
-				b.dirMu.Unlock()
-				return fmt.Errorf("failed to create directory: %w", err)
-			}
-			b.dirCache[dir] = true
 			b.dirMu.Unlock()
-
-			// Retry CreateTemp
+			if err := b.ensureDir(dir); err != nil {
+				return err
+			}
 			tmpFile, err = os.CreateTemp(dir, ".arc-*.tmp")
 			if err != nil {
 				return fmt.Errorf("failed to create temp file: %w", err)
@@ -142,16 +147,29 @@ func (b *LocalBackend) WriteReader(ctx context.Context, path string, reader io.R
 		return fmt.Errorf("invalid path: %w", err)
 	}
 
-	// Create parent directory if it doesn't exist (owner-only permissions)
 	dir := filepath.Dir(fullPath)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("failed to create directory: %w", err)
+	if err := b.ensureDir(dir); err != nil {
+		return err
 	}
 
 	// Write to temporary file with cryptographically random name (prevents TOCTOU attacks)
 	tmpFile, err := os.CreateTemp(dir, ".arc-*.tmp")
 	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
+		// Directory might have been deleted externally — invalidate cache and retry
+		if os.IsNotExist(err) {
+			b.dirMu.Lock()
+			delete(b.dirCache, dir)
+			b.dirMu.Unlock()
+			if err := b.ensureDir(dir); err != nil {
+				return err
+			}
+			tmpFile, err = os.CreateTemp(dir, ".arc-*.tmp")
+			if err != nil {
+				return fmt.Errorf("failed to create temp file: %w", err)
+			}
+		} else {
+			return fmt.Errorf("failed to create temp file: %w", err)
+		}
 	}
 	tmpPath := tmpFile.Name()
 
@@ -254,6 +272,11 @@ func (b *LocalBackend) List(ctx context.Context, prefix string) ([]string, error
 
 	// Use filepath.Walk to recursively list files
 	err = filepath.Walk(searchPath, func(path string, info os.FileInfo, err error) error {
+		// Respect context cancellation (important for large directory trees)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
 		if err != nil {
 			// Skip directories that don't exist
 			if os.IsNotExist(err) {
@@ -402,14 +425,14 @@ func (b *LocalBackend) ListDirectories(ctx context.Context, prefix string) ([]st
 // DeleteBatch deletes multiple objects at the specified paths.
 // Implements the BatchDeleter interface.
 func (b *LocalBackend) DeleteBatch(ctx context.Context, paths []string) error {
-	var lastErr error
+	var errs []error
 	for _, path := range paths {
 		if err := b.Delete(ctx, path); err != nil {
-			lastErr = err
+			errs = append(errs, fmt.Errorf("%s: %w", path, err))
 			b.logger.Error().Err(err).Str("path", path).Msg("Failed to delete file in batch")
 		}
 	}
-	return lastErr
+	return errors.Join(errs...)
 }
 
 // RemoveDirectory removes an empty directory.
@@ -452,6 +475,11 @@ func (b *LocalBackend) ListObjects(ctx context.Context, prefix string) ([]Object
 	var results []ObjectInfo
 
 	err = filepath.Walk(searchPath, func(path string, info os.FileInfo, err error) error {
+		// Respect context cancellation (important for large directory trees)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
 		if err != nil {
 			if os.IsNotExist(err) {
 				return nil
@@ -519,15 +547,9 @@ func (b *LocalBackend) validatePath(path string) (string, error) {
 		return "", fmt.Errorf("failed to resolve path: %w", err)
 	}
 
-	// Get absolute base path for comparison
-	absBasePath, err := filepath.Abs(b.basePath)
-	if err != nil {
-		return "", fmt.Errorf("failed to resolve base path: %w", err)
-	}
-
 	// Ensure the resolved path is within the base path
-	// Use filepath.Rel to check if the path is under basePath
-	relPath, err := filepath.Rel(absBasePath, absPath)
+	// basePath is already absolute (set in NewLocalBackend via filepath.Abs)
+	relPath, err := filepath.Rel(b.basePath, absPath)
 	if err != nil {
 		return "", fmt.Errorf("path traversal detected")
 	}
