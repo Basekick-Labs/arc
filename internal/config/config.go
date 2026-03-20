@@ -136,6 +136,7 @@ type WALConfig struct {
 	MaxAgeSeconds           int    // Rotate WAL after this many seconds (default: 3600)
 	RecoveryIntervalSeconds int    // Interval for periodic WAL recovery in seconds (default: 300 = 5 minutes)
 	RecoveryBatchSize       int    // Max records to replay per batch during recovery (default: 10000)
+	BufferSize              int    // Async write buffer size in entries (default: 10000)
 }
 
 type TelemetryConfig struct {
@@ -466,6 +467,7 @@ func Load() (*Config, error) {
 			MaxAgeSeconds:           v.GetInt("wal.max_age_seconds"),
 			RecoveryIntervalSeconds: v.GetInt("wal.recovery_interval_seconds"),
 			RecoveryBatchSize:       v.GetInt("wal.recovery_batch_size"),
+			BufferSize:              v.GetInt("wal.buffer_size"),
 		},
 		Telemetry: TelemetryConfig{
 			Enabled:         v.GetBool("telemetry.enabled"),
@@ -677,6 +679,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("wal.max_age_seconds", 3600)          // Rotate WAL after 1 hour
 	v.SetDefault("wal.recovery_interval_seconds", 300) // Periodic recovery every 5 minutes
 	v.SetDefault("wal.recovery_batch_size", 10000)     // Max records per recovery batch (rate limiting)
+	v.SetDefault("wal.buffer_size", 10000)             // Async write buffer size in entries
 
 	// Telemetry defaults
 	v.SetDefault("telemetry.enabled", true)                                               // Enabled by default (opt-out)

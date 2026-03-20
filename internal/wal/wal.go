@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Basekick-Labs/msgpack/v6"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
 
@@ -374,6 +375,7 @@ func (w *Writer) AppendRawWithMeta(database string, payload []byte) error {
 		return nil
 	default:
 		atomic.AddInt64(&w.DroppedEntries, 1)
+		metrics.Get().IncWALDroppedEntries()
 		return nil
 	}
 }
@@ -423,6 +425,7 @@ func (w *Writer) AppendRaw(payload []byte) error {
 	default:
 		// Buffer full - drop entry (trade durability for throughput)
 		atomic.AddInt64(&w.DroppedEntries, 1)
+		metrics.Get().IncWALDroppedEntries()
 		return nil // Don't return error to avoid slowing down the caller
 	}
 }

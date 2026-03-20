@@ -288,6 +288,7 @@ func main() {
 			SyncMode:     wal.SyncMode(cfg.WAL.SyncMode),
 			MaxSizeBytes: int64(cfg.WAL.MaxSizeMB) * 1024 * 1024,
 			MaxAge:       time.Duration(cfg.WAL.MaxAgeSeconds) * time.Second,
+			BufferSize:   cfg.WAL.BufferSize,
 			Logger:       logger.Get("wal"),
 		})
 		if err != nil {
