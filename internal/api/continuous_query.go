@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/ingest"
@@ -20,6 +21,12 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// CQSchedulerReloader is an interface for reloading CQ schedules after updates.
+// This avoids a circular import between api and scheduler packages.
+type CQSchedulerReloader interface {
+	ReloadCQ(cqID int64) error
+}
+
 // ContinuousQueryHandler handles continuous query operations
 type ContinuousQueryHandler struct {
 	db          *database.DuckDB
@@ -27,7 +34,15 @@ type ContinuousQueryHandler struct {
 	arrowBuffer *ingest.ArrowBuffer
 	config      *config.ContinuousQueryConfig
 	sqliteDB    *sql.DB
+	authManager *auth.AuthManager
+	scheduler   CQSchedulerReloader
 	logger      zerolog.Logger
+}
+
+// SetScheduler sets the CQ scheduler for reloading after updates.
+// Called after scheduler creation since it depends on the handler.
+func (h *ContinuousQueryHandler) SetScheduler(s CQSchedulerReloader) {
+	h.scheduler = s
 }
 
 // ContinuousQuery represents a continuous query definition
@@ -105,7 +120,7 @@ type CQExecution struct {
 }
 
 // NewContinuousQueryHandler creates a new continuous query handler
-func NewContinuousQueryHandler(db *database.DuckDB, storage storage.Backend, arrowBuffer *ingest.ArrowBuffer, cfg *config.ContinuousQueryConfig, logger zerolog.Logger) (*ContinuousQueryHandler, error) {
+func NewContinuousQueryHandler(db *database.DuckDB, storage storage.Backend, arrowBuffer *ingest.ArrowBuffer, cfg *config.ContinuousQueryConfig, authManager *auth.AuthManager, logger zerolog.Logger) (*ContinuousQueryHandler, error) {
 	// Ensure directory exists
 	dir := filepath.Dir(cfg.DBPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -124,6 +139,7 @@ func NewContinuousQueryHandler(db *database.DuckDB, storage storage.Backend, arr
 		arrowBuffer: arrowBuffer,
 		config:      cfg,
 		sqliteDB:    sqliteDB,
+		authManager: authManager,
 		logger:      logger.With().Str("component", "cq-handler").Logger(),
 	}
 
@@ -193,13 +209,17 @@ func (h *ContinuousQueryHandler) Close() error {
 
 // RegisterRoutes registers continuous query endpoints
 func (h *ContinuousQueryHandler) RegisterRoutes(app *fiber.App) {
-	app.Post("/api/v1/continuous_queries", h.handleCreate)
-	app.Get("/api/v1/continuous_queries", h.handleList)
-	app.Get("/api/v1/continuous_queries/:id", h.handleGet)
-	app.Put("/api/v1/continuous_queries/:id", h.handleUpdate)
-	app.Delete("/api/v1/continuous_queries/:id", h.handleDelete)
-	app.Post("/api/v1/continuous_queries/:id/execute", h.handleExecute)
-	app.Get("/api/v1/continuous_queries/:id/executions", h.handleGetExecutions)
+	group := app.Group("/api/v1/continuous_queries")
+	if h.authManager != nil {
+		group.Use(auth.RequireAdmin(h.authManager))
+	}
+	group.Post("/", h.handleCreate)
+	group.Get("/", h.handleList)
+	group.Get("/:id", h.handleGet)
+	group.Put("/:id", h.handleUpdate)
+	group.Delete("/:id", h.handleDelete)
+	group.Post("/:id/execute", h.handleExecute)
+	group.Get("/:id/executions", h.handleGetExecutions)
 }
 
 // handleCreate creates a new continuous query
@@ -356,6 +376,13 @@ func (h *ContinuousQueryHandler) handleUpdate(c *fiber.Ctx) error {
 
 	h.logger.Info().Int("query_id", queryID).Msg("Updated continuous query")
 
+	// Reload the scheduler so it picks up the new definition
+	if h.scheduler != nil {
+		if err := h.scheduler.ReloadCQ(int64(queryID)); err != nil {
+			h.logger.Warn().Err(err).Int("query_id", queryID).Msg("Failed to reload CQ schedule after update")
+		}
+	}
+
 	cq, _ := h.getQuery(int64(queryID))
 	return c.JSON(cq)
 }
@@ -446,11 +473,10 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
 
 	executionDuration := time.Since(start).Seconds()
 
-	// Record successful execution
-	h.recordExecution(queryID, executionID, "completed", startTime, endTime, nil, recordsWritten, executionDuration, "")
-
-	// Update last processed time
-	h.updateLastProcessedTime(queryID, endTime)
+	// Record successful execution and update last processed time atomically
+	if err := h.recordExecutionAndUpdateTime(queryID, executionID, startTime, endTime, recordsWritten, executionDuration); err != nil {
+		h.logger.Error().Err(err).Str("query_name", cq.Name).Msg("Failed to record execution (data was written)")
+	}
 
 	h.logger.Info().
 		Str("query_name", cq.Name).
@@ -592,11 +618,10 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 
 	executionDuration := time.Since(start).Seconds()
 
-	// Record successful execution
-	h.recordExecution(int64(queryID), executionID, "completed", startTime, endTime, nil, recordsWritten, executionDuration, "")
-
-	// Update last processed time
-	h.updateLastProcessedTime(int64(queryID), endTime)
+	// Record successful execution and update last processed time atomically
+	if err := h.recordExecutionAndUpdateTime(int64(queryID), executionID, startTime, endTime, recordsWritten, executionDuration); err != nil {
+		h.logger.Error().Err(err).Int("query_id", queryID).Msg("Failed to record execution")
+	}
 
 	h.logger.Info().
 		Str("query_name", cq.Name).
@@ -880,6 +905,35 @@ func (h *ContinuousQueryHandler) getQueries(database, isActiveStr string) ([]Con
 	}
 
 	return queries, nil
+}
+
+// recordExecutionAndUpdateTime atomically records a successful execution and updates
+// the last processed time in a single SQLite transaction. This prevents partial state
+// where execution is recorded but last_processed_time is stale (causing time window overlap).
+func (h *ContinuousQueryHandler) recordExecutionAndUpdateTime(queryID int64, executionID string, startTime, endTime time.Time, recordsWritten int64, duration float64) error {
+	tx, err := h.sqliteDB.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(`
+		INSERT INTO continuous_query_executions
+		(query_id, execution_id, status, start_time, end_time, records_read, records_written, execution_duration_seconds, error_message)
+		VALUES (?, ?, 'completed', ?, ?, NULL, ?, ?, NULL)
+	`, queryID, executionID, startTime.Format(time.RFC3339), endTime.Format(time.RFC3339), recordsWritten, duration)
+	if err != nil {
+		return fmt.Errorf("failed to record execution: %w", err)
+	}
+
+	_, err = tx.Exec(`
+		UPDATE continuous_queries SET last_processed_time = ? WHERE id = ?
+	`, endTime.Format(time.RFC3339), queryID)
+	if err != nil {
+		return fmt.Errorf("failed to update last processed time: %w", err)
+	}
+
+	return tx.Commit()
 }
 
 // recordExecution records an execution in the database

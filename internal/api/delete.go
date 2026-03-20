@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -17,10 +19,11 @@ import (
 
 // DeleteHandler handles delete operations using file rewrite strategy
 type DeleteHandler struct {
-	db      *database.DuckDB
-	storage storage.Backend
-	config  *config.DeleteConfig
-	logger  zerolog.Logger
+	db          *database.DuckDB
+	storage     storage.Backend
+	config      *config.DeleteConfig
+	authManager *auth.AuthManager
+	logger      zerolog.Logger
 }
 
 // DeleteRequest represents a delete operation request
@@ -61,35 +64,42 @@ type affectedFile struct {
 	relativePath string
 }
 
-// Dangerous patterns for WHERE clause validation
-var dangerousWherePatterns = []string{
-	";",      // Statement terminator
-	"--",     // SQL comment
-	"/*",     // Multi-line comment
-	"DROP",   // DDL
-	"DELETE", // DML (in WHERE context means injection attempt)
-	"INSERT",
-	"UPDATE",
-	"EXEC",
-	"EXECUTE",
+// Dangerous punctuation patterns for WHERE clause validation (exact substring match)
+var dangerousPunctuationPatterns = []string{
+	";",  // Statement terminator
+	"--", // SQL comment
+	"/*", // Multi-line comment
+}
+
+// Dangerous keyword patterns for WHERE clause validation (word-boundary match)
+// Uses \b word boundaries to avoid false positives on column names like "offset", "payload", "dataset"
+var dangerousKeywordPattern = regexp.MustCompile(`(?i)\b(DROP|DELETE|INSERT|UPDATE|EXEC|EXECUTE|UNION|SELECT|CREATE|ALTER|COPY|ATTACH|DETACH|LOAD|INSTALL|PRAGMA|CALL|SET)\b`)
+
+// Dangerous prefix patterns (match at word start)
+var dangerousPrefixPatterns = []string{
 	"xp_",
 	"sp_",
 }
 
 // NewDeleteHandler creates a new delete handler
-func NewDeleteHandler(db *database.DuckDB, storage storage.Backend, cfg *config.DeleteConfig, logger zerolog.Logger) *DeleteHandler {
+func NewDeleteHandler(db *database.DuckDB, storage storage.Backend, cfg *config.DeleteConfig, authManager *auth.AuthManager, logger zerolog.Logger) *DeleteHandler {
 	return &DeleteHandler{
-		db:      db,
-		storage: storage,
-		config:  cfg,
-		logger:  logger.With().Str("component", "delete-handler").Logger(),
+		db:          db,
+		storage:     storage,
+		config:      cfg,
+		authManager: authManager,
+		logger:      logger.With().Str("component", "delete-handler").Logger(),
 	}
 }
 
 // RegisterRoutes registers delete endpoints
 func (h *DeleteHandler) RegisterRoutes(app *fiber.App) {
-	app.Post("/api/v1/delete", h.handleDelete)
-	app.Get("/api/v1/delete/config", h.handleGetConfig)
+	group := app.Group("/api/v1/delete")
+	if h.authManager != nil {
+		group.Use(auth.RequireAdmin(h.authManager))
+	}
+	group.Post("/", h.handleDelete)
+	group.Get("/config", h.handleGetConfig)
 }
 
 // handleGetConfig returns the current delete configuration
@@ -316,10 +326,24 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 		whereUpper = strings.TrimSpace(whereUpper[6:])
 	}
 
-	// Check for dangerous patterns
-	for _, pattern := range dangerousWherePatterns {
+	// Check for dangerous punctuation patterns (exact substring match)
+	for _, pattern := range dangerousPunctuationPatterns {
 		if strings.Contains(whereUpper, pattern) {
-			return false, fmt.Errorf("WHERE clause contains forbidden keyword: %s", pattern)
+			return false, fmt.Errorf("WHERE clause contains forbidden pattern: %s", pattern)
+		}
+	}
+
+	// Check for dangerous SQL keywords using word boundaries to avoid false positives
+	// on column names like "offset" (contains SET), "payload" (contains LOAD), "dataset" (contains SET)
+	if match := dangerousKeywordPattern.FindString(where); match != "" {
+		return false, fmt.Errorf("WHERE clause contains forbidden keyword: %s", strings.ToUpper(match))
+	}
+
+
+	// Check for dangerous prefixes
+	for _, pattern := range dangerousPrefixPatterns {
+		if strings.Contains(whereUpper, pattern) {
+			return false, fmt.Errorf("WHERE clause contains forbidden pattern: %s", pattern)
 		}
 	}
 
@@ -618,14 +642,19 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 		return 0, fmt.Errorf("failed to write filtered data: %w", err)
 	}
 
-	// Read the temp file and upload to S3
-	data, err := os.ReadFile(tempPath)
+	// Stream temp file to S3 (avoids loading entire file into memory)
+	uploadFile, err := os.Open(tempPath)
 	if err != nil {
-		return 0, fmt.Errorf("failed to read temp file: %w", err)
+		return 0, fmt.Errorf("failed to open temp file for upload: %w", err)
+	}
+	defer uploadFile.Close()
+
+	info, err := uploadFile.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("failed to stat temp file: %w", err)
 	}
 
-	// Upload back to S3 (overwrites the original)
-	if err := h.storage.Write(ctx, relativePath, data); err != nil {
+	if err := h.storage.WriteReader(ctx, relativePath, uploadFile, info.Size()); err != nil {
 		return 0, fmt.Errorf("failed to upload rewritten file to S3: %w", err)
 	}
 

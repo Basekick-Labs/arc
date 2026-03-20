@@ -178,7 +178,53 @@ Zero allocations on the fast path. Go's `utf8.ValidString` on arm64 already leve
 
 **Optional SIMD acceleration:** Build with `-tags simdutf` to use the [simdutf](https://github.com/simdutf/simdutf) library for large buffers (≥4KB). This provides AVX2/SSE4 acceleration on x86 servers where Go's stdlib lacks SIMD UTF-8 validation. On arm64, the standard build is already optimal. Requires `libsimdutf` installed on the build machine.
 
+## Security
+
+### Admin Authorization on Mutating Endpoints
+
+Added `RequireAdmin` authorization middleware to all mutating API endpoints that previously accepted any valid token. While all endpoints already required authentication via the global token middleware, these admin-only operations (create, update, delete, execute, trigger) were accessible to read-only tokens:
+
+- **Continuous query endpoints**: create, update, delete, execute
+- **Delete endpoints**: delete, config, database delete
+- **Retention policy endpoints**: create, update, delete, execute
+- **Compaction endpoint**: trigger
+- **Scheduler endpoints**: CQ reload, retention trigger
+
+Read-only endpoints (list, get, status) remain accessible to any authenticated token.
+
+### Hardened Delete WHERE Clause Validation
+
+Expanded the forbidden keyword list for delete WHERE clauses to block `UNION`, `SELECT`, `CREATE`, `COPY`, `ATTACH`, `LOAD`, `PRAGMA`, `CALL`, and `SET` — preventing SQL injection vectors specific to DuckDB's query dialect.
+
+### Compactor Temp Directory Permissions
+
+Changed compaction temp directories from world-readable (`0755`) to owner-only (`0700`), preventing other system users from reading uncompacted data files.
+
 ## Bug Fixes
+
+### CQ Scheduler Reload on Update
+
+Continuous query updates now immediately reload the scheduler with the new definition. Previously, updated CQ definitions were only picked up after a scheduler restart.
+
+### Atomic CQ Execution Recording
+
+Successful CQ execution recording and `last_processed_time` update are now wrapped in a SQLite transaction. Previously, a failure between the two writes could leave the time window stale, causing duplicate or missing data on the next execution.
+
+### Database Delete Batch Fallback
+
+When S3/Azure batch delete fails, the handler now falls back to individual file deletion instead of reporting a complete failure. This improves reliability of database deletion on cloud storage.
+
+### S3 Delete File Rewrite Streaming
+
+The S3 delete-rewrite path now streams the temp file to S3 via `WriteReader` instead of loading the entire file into memory with `os.ReadFile`. This prevents OOM on large Parquet files.
+
+### CQ Scheduler Graceful Shutdown
+
+The CQ scheduler now cancels in-flight query executions when stopping, instead of waiting for the full 10-minute timeout to expire.
+
+### Compactor Subprocess Signal Handling
+
+Compaction subprocesses now respond to SIGTERM/SIGINT via `signal.NotifyContext`, allowing DuckDB queries to be cancelled when the parent process times out.
 
 ### Token Expiration Display Fix
 

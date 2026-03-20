@@ -46,7 +46,7 @@ func setupTestRetentionHandler(t *testing.T) (*RetentionHandler, string) {
 		DBPath:  filepath.Join(tmpDir, "retention.db"),
 	}
 
-	handler, err := NewRetentionHandler(backend, duckdb, retentionCfg, logger)
+	handler, err := NewRetentionHandler(backend, duckdb, retentionCfg, nil, logger)
 	if err != nil {
 		duckdb.Close()
 		os.RemoveAll(tmpDir)

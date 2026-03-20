@@ -253,8 +253,18 @@ func (s *CQScheduler) runJob(job *cqJob) {
 
 // executeJob executes a single CQ
 func (s *CQScheduler) executeJob(job *cqJob) {
+	// Use a context that cancels on both timeout and stop signal
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
+
+	// Cancel context if stop signal is received during execution
+	go func() {
+		select {
+		case <-job.stopCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 
 	s.logger.Debug().
 		Int64("cq_id", job.cqID).

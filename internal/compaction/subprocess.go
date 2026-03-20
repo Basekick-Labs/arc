@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"runtime"
 	"runtime/pprof"
 	"strings"
+	"syscall"
 
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
@@ -114,7 +116,10 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 		ManifestManager: manifestManager,
 	})
 
-	ctx := context.Background()
+	// Use signal-aware context so the subprocess can cancel DuckDB queries
+	// when the parent kills it via SIGTERM (from exec.CommandContext).
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
 	err = job.Run(ctx)
 
 	result := &SubprocessJobResult{

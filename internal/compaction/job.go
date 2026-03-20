@@ -16,10 +16,12 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// escapeSQLPath escapes single quotes in file paths for safe SQL interpolation in DuckDB queries.
-// This prevents SQL injection attacks from malicious filenames containing quotes.
+// escapeSQLPath escapes file paths for safe SQL interpolation in DuckDB queries.
+// This prevents SQL injection attacks from malicious filenames containing quotes or backslashes.
 func escapeSQLPath(path string) string {
-	return strings.ReplaceAll(path, "'", "''")
+	path = strings.ReplaceAll(path, "\\", "\\\\")
+	path = strings.ReplaceAll(path, "'", "''")
+	return path
 }
 
 // validateParquetFile checks if a file is a valid Parquet file by checking magic bytes.
@@ -200,7 +202,7 @@ func (j *Job) Run(ctx context.Context) error {
 
 	// Create temp directory for this job using configured base path
 	tempDir := filepath.Join(j.TempDirectory, j.JobID)
-	if err := os.MkdirAll(tempDir, 0755); err != nil {
+	if err := os.MkdirAll(tempDir, 0700); err != nil {
 		return j.fail(fmt.Errorf("failed to create temp directory: %w", err))
 	}
 	defer j.cleanupTemp(tempDir)
@@ -435,7 +437,9 @@ func (j *Job) downloadSingleFile(ctx context.Context, tempDir string, index int,
 	err = j.StorageBackend.ReadTo(ctx, fileKey, file)
 	if err != nil {
 		file.Close()
-		os.Remove(localPath) // Clean up partial file
+		if removeErr := os.Remove(localPath); removeErr != nil {
+			j.logger.Warn().Err(removeErr).Str("path", localPath).Msg("Failed to clean up partial download file")
+		}
 
 		// Check if file doesn't exist (already compacted)
 		exists, checkErr := j.StorageBackend.Exists(ctx, fileKey)
