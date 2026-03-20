@@ -160,9 +160,9 @@ Upgraded the Apache Arrow columnar format library. Key fixes:
 
 Replaced per-field UTF-8 validation with a single bulk validation pass over the entire HTTP payload. Previously, every string field was individually validated via `SanitizeUTF8()` during parsing — for a 1000-row batch with 5 string fields, this meant ~5000 validation calls. Now, `ValidateUTF8Bytes()` validates the entire payload once; when valid (the common case), all per-field sanitization is skipped.
 
-This optimization applies to both ingestion paths:
-- **Line Protocol**: Pre-validates in `ParseBatchWithPrecision`, skips 3 `SanitizeUTF8` call sites in `parseFieldValue`
-- **MessagePack**: Pre-validates in `Decode`, short-circuits `sanitizeStringColumns` and `sanitizeStringFields`
+This optimization applies to the **Line Protocol** ingestion path, pre-validating in `ParseBatchWithPrecision` and skipping 3 `SanitizeUTF8` call sites in `parseFieldValue` when the payload is valid UTF-8 (the common case).
+
+**Note:** MessagePack payloads are excluded from bulk pre-validation because MessagePack is a binary format — the raw bytes contain type markers, length prefixes, and packed numerics that are never valid UTF-8. Bulk validation would always fail, adding cost with zero benefit. Per-field `SanitizeUTF8()` handles the extracted string values after decoding.
 
 **Benchmark results (Apple M3 Max, arm64):**
 
