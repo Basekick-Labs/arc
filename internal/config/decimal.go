@@ -37,13 +37,16 @@ func ParseDecimalColumns(cfg IngestConfig) (map[string]map[string]DecimalSpec, m
 		if err != nil {
 			return nil, nil, fmt.Errorf("invalid decimal config for measurement %s: %w", measurement, err)
 		}
+		if len(specs) == 0 {
+			return nil, nil, fmt.Errorf("no decimal columns specified for measurement %s", measurement)
+		}
 
 		decimalMap[measurement] = specs
 	}
 
-	// Parse defaults
+	// Parse defaults (whitespace-only treated as empty/no defaults)
 	var defaultSpecs map[string]DecimalSpec
-	if cfg.DefaultDecimalColumns != "" {
+	if strings.TrimSpace(cfg.DefaultDecimalColumns) != "" {
 		var err error
 		defaultSpecs, err = parseDecimalSpecs(cfg.DefaultDecimalColumns)
 		if err != nil {
@@ -100,10 +103,6 @@ func parseDecimalSpecs(s string) (map[string]DecimalSpec, error) {
 			Precision: int32(precision),
 			Scale:     int32(scale),
 		}
-	}
-
-	if len(specs) == 0 {
-		return nil, fmt.Errorf("no decimal columns specified")
 	}
 
 	return specs, nil

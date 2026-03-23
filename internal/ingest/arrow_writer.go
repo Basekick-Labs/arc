@@ -1544,8 +1544,10 @@ func typedBatchToWALRecords(database, measurement string, batch *TypedColumnBatc
 				// WAL stores decimals as float64 (lossy but WAL is recovery-only)
 				if i < len(arr) {
 					s := int32(0)
-					if spec, ok := decimalCols[colName]; ok {
-						s = spec.Scale
+					if decimalCols != nil {
+						if spec, ok := decimalCols[colName]; ok {
+							s = spec.Scale
+						}
 					}
 					f := arr[i].ToBigFloat(s)
 					row[colName], _ = f.Float64()
