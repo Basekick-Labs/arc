@@ -123,6 +123,37 @@ Compaction now automatically deduplicates rows with identical tag values and tim
 - **Ingestion performance unchanged**: Dedup happens only during compaction, not at ingest time
 - **MessagePack columnar path**: The columnar MessagePack format doesn't distinguish tags from fields, so files from this path won't have dedup metadata. Per-field data from the row format and Line Protocol paths will.
 
+## Ingestion
+
+### Native Decimal128 Type Support
+
+Arc now supports Decimal128 columns for precision-sensitive use cases (financial data, scientific measurements). Declare decimal columns via per-measurement configuration, and Arc stores them as native Parquet DECIMAL type — preserving exact precision instead of coercing to float64.
+
+**Configuration:**
+```toml
+[ingest]
+decimal_columns = ["trades:price=18,8;amount=18,8"]
+default_decimal_columns = ""
+```
+
+Env vars: `ARC_INGEST_DECIMAL_COLUMNS`, `ARC_INGEST_DEFAULT_DECIMAL_COLUMNS`
+
+Format: `"measurement:column=precision,scale;column2=p,s"` where precision is 1-38 and scale is 0-precision.
+
+**How it works:**
+
+1. Float64, int, or string values arriving for declared decimal columns are converted to Arrow Decimal128 at buffer time
+2. Stored as Parquet DECIMAL logical type (16 bytes per value, exact precision)
+3. DuckDB reads Parquet DECIMAL natively — no query changes needed
+4. Decimal column specs are stored as Parquet metadata (`arc:decimals`) for self-describing files
+
+**For highest precision**: Send values as strings over msgpack (e.g., `"123.456789012345678"`) — string-to-decimal conversion is exact with no float64 intermediate.
+
+**Key properties:**
+- Zero overhead when not configured — one empty map lookup per column
+- Backwards compatible — existing float64 columns are unaffected
+- Compaction preserves DECIMAL types automatically (DuckDB handles this natively)
+
 ## Storage
 
 ### S3 Path Prefix Support

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/compress"
@@ -359,7 +361,7 @@ func sortColumnsTimeFirst(colNames []string) {
 // =============================================================================
 
 // getSchema gets or infers Arrow schema for columnar data (LRU cached per measurement)
-func (w *ArrowWriter) getSchema(measurement string, columns map[string]interface{}, tagColumns []string) (*arrow.Schema, error) {
+func (w *ArrowWriter) getSchema(measurement string, columns map[string]interface{}, tagColumns []string, decimalCols map[string]config.DecimalSpec) (*arrow.Schema, error) {
 	// Create cache key from column names and types
 	var colNames []string
 	var typeNames []string
@@ -387,6 +389,8 @@ func (w *ArrowWriter) getSchema(measurement string, columns map[string]interface
 			typeNames = append(typeNames, "string")
 		case []bool:
 			typeNames = append(typeNames, "bool")
+		case []decimal128.Num:
+			typeNames = append(typeNames, "decimal128")
 		default:
 			typeNames = append(typeNames, "unknown")
 		}
@@ -401,7 +405,7 @@ func (w *ArrowWriter) getSchema(measurement string, columns map[string]interface
 	}
 
 	// Cache miss - infer schema
-	schema, err := w.inferSchema(columns, tagColumns)
+	schema, err := w.inferSchema(columns, tagColumns, decimalCols)
 	if err != nil {
 		return nil, err
 	}
@@ -419,7 +423,8 @@ func (w *ArrowWriter) getSchema(measurement string, columns map[string]interface
 
 // inferSchema infers Arrow schema from columnar data.
 // tagColumns optionally lists which columns are tags (stored as schema metadata for compaction dedup).
-func (w *ArrowWriter) inferSchema(columns map[string]interface{}, tagColumns []string) (*arrow.Schema, error) {
+// decimalCols optionally maps column names to DecimalSpec for Decimal128 columns.
+func (w *ArrowWriter) inferSchema(columns map[string]interface{}, tagColumns []string, decimalCols map[string]config.DecimalSpec) (*arrow.Schema, error) {
 	var fields []arrow.Field
 
 	for name, col := range columns {
@@ -444,6 +449,13 @@ func (w *ArrowWriter) inferSchema(columns map[string]interface{}, tagColumns []s
 			arrowType = arrow.BinaryTypes.String
 		case []bool:
 			arrowType = arrow.FixedWidthTypes.Boolean
+		case []decimal128.Num:
+			if spec, ok := decimalCols[name]; ok {
+				arrowType = &arrow.Decimal128Type{Precision: spec.Precision, Scale: spec.Scale}
+			} else {
+				// Fallback: use max precision if no config (shouldn't happen in normal flow)
+				arrowType = &arrow.Decimal128Type{Precision: 38, Scale: 18}
+			}
 		default:
 			return nil, fmt.Errorf("unsupported column type for column %s: %T", name, arr)
 		}
@@ -451,14 +463,32 @@ func (w *ArrowWriter) inferSchema(columns map[string]interface{}, tagColumns []s
 		fields = append(fields, arrow.Field{Name: name, Type: arrowType, Nullable: true})
 	}
 
-	// Store tag column names as schema metadata so compaction can auto-deduplicate.
-	// Format: "arc:tags" → "host,region,service" (sorted, comma-separated)
-	var metadata *arrow.Metadata
+	// Build schema metadata keys/values
+	var metaKeys, metaValues []string
+
+	// Store tag column names for compaction auto-dedup
 	if len(tagColumns) > 0 {
 		sorted := make([]string, len(tagColumns))
 		copy(sorted, tagColumns)
 		sort.Strings(sorted)
-		md := arrow.NewMetadata([]string{"arc:tags"}, []string{strings.Join(sorted, ",")})
+		metaKeys = append(metaKeys, "arc:tags")
+		metaValues = append(metaValues, strings.Join(sorted, ","))
+	}
+
+	// Store decimal column specs for self-describing Parquet files
+	if len(decimalCols) > 0 {
+		var parts []string
+		for col, spec := range decimalCols {
+			parts = append(parts, fmt.Sprintf("%s:%d,%d", col, spec.Precision, spec.Scale))
+		}
+		sort.Strings(parts)
+		metaKeys = append(metaKeys, "arc:decimals")
+		metaValues = append(metaValues, strings.Join(parts, ";"))
+	}
+
+	var metadata *arrow.Metadata
+	if len(metaKeys) > 0 {
+		md := arrow.NewMetadata(metaKeys, metaValues)
 		metadata = &md
 	}
 
@@ -469,9 +499,10 @@ func (w *ArrowWriter) inferSchema(columns map[string]interface{}, tagColumns []s
 // validity is an optional map of column name → []bool where false means null.
 // Columns without a validity entry (or when validity is nil) are treated as fully valid.
 // tagColumns optionally lists which columns are tags (stored as Parquet metadata for compaction dedup).
-func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement string, columns map[string]interface{}, validity map[string][]bool, tagColumns []string) ([]byte, error) {
+// decimalCols optionally maps column names to DecimalSpec for Decimal128 type inference.
+func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement string, columns map[string]interface{}, validity map[string][]bool, tagColumns []string, decimalCols map[string]config.DecimalSpec) ([]byte, error) {
 	// Get or infer schema (with caching)
-	schema, err := w.getSchema(measurement, columns, tagColumns)
+	schema, err := w.getSchema(measurement, columns, tagColumns, decimalCols)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get schema: %w", err)
 	}
@@ -560,6 +591,17 @@ func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement stri
 				builder.AppendValues(boolCol, colValidity)
 			} else {
 				return nil, fmt.Errorf("column %s: expected []bool, got %T", field.Name, col)
+			}
+			arrays[i] = builder.NewArray()
+
+		case arrow.DECIMAL128:
+			dt := field.Type.(*arrow.Decimal128Type)
+			builder := array.NewDecimal128Builder(mem, dt)
+			builders[i] = builder
+			if decCol, ok := col.([]decimal128.Num); ok {
+				builder.AppendValues(decCol, colValidity)
+			} else {
+				return nil, fmt.Errorf("column %s: expected []decimal128.Num, got %T", field.Name, col)
 			}
 			arrays[i] = builder.NewArray()
 
@@ -699,6 +741,10 @@ type ArrowBuffer struct {
 	sortKeysConfig  map[string][]string // measurement -> sort keys
 	defaultSortKeys []string            // default sort keys
 
+	// Decimal column configuration (for Decimal128 precision support)
+	decimalConfig        map[string]map[string]config.DecimalSpec // measurement -> column -> spec
+	defaultDecimalConfig map[string]config.DecimalSpec            // default decimal columns
+
 	// Flush timeout for storage writes (prevents workers from blocking forever on S3 hangs)
 	flushTimeout time.Duration
 	maxBufferAge time.Duration // pre-calculated from cfg.MaxBufferAgeMS
@@ -781,6 +827,15 @@ func (b *ArrowBuffer) getSortKeys(measurement string) []string {
 	return append(keys, "time")
 }
 
+// getDecimalColumns returns the decimal column config for a measurement.
+// Falls back to default config if no measurement-specific config exists.
+func (b *ArrowBuffer) getDecimalColumns(measurement string) map[string]config.DecimalSpec {
+	if specs, exists := b.decimalConfig[measurement]; exists {
+		return specs
+	}
+	return b.defaultDecimalConfig
+}
+
 // NewArrowBuffer creates a new Arrow buffer with automatic flushing
 func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger zerolog.Logger) *ArrowBuffer {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -809,6 +864,14 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		defaultSortKeys = []string{"time"}
 	}
 
+	// Parse decimal column config
+	decimalConfig, defaultDecimalConfig, err := config.ParseDecimalColumns(*cfg)
+	if err != nil {
+		logger.Warn().Err(err).Msg("Invalid decimal columns config, decimal support disabled")
+		decimalConfig = make(map[string]map[string]config.DecimalSpec)
+		defaultDecimalConfig = nil
+	}
+
 	// Parse flush timeout (default 30s)
 	flushTimeout := time.Duration(cfg.FlushTimeoutSeconds) * time.Second
 	if cfg.FlushTimeoutSeconds <= 0 {
@@ -829,8 +892,10 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		flushWorkers:    flushWorkers,
 		flushTimeout:    flushTimeout,
 		maxBufferAge:    time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond,
-		sortKeysConfig:  sortKeysConfig,
-		defaultSortKeys: defaultSortKeys,
+		sortKeysConfig:       sortKeysConfig,
+		defaultSortKeys:     defaultSortKeys,
+		decimalConfig:        decimalConfig,
+		defaultDecimalConfig: defaultDecimalConfig,
 		logger:          logger.With().Str("component", "arrow-buffer").Logger(),
 	}
 
@@ -1171,7 +1236,7 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 	}
 
 	// Convert []interface{} columns to typed arrays (optimized with zero-copy fast paths)
-	typedColumns, numRecords, err := b.convertColumnsToTyped(record.Columns)
+	typedColumns, numRecords, err := b.convertColumnsToTyped(record.Measurement, record.Columns)
 	if err != nil {
 		return fmt.Errorf("failed to convert columns: %w", err)
 	}
@@ -1321,7 +1386,7 @@ func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, 
 
 	// WAL: Convert typed batch to row format for WAL storage
 	if b.wal != nil && !skipWAL {
-		walRecords := typedBatchToWALRecords(database, measurement, typedColumns, numRecords)
+		walRecords := typedBatchToWALRecords(database, measurement, typedColumns, numRecords, b.getDecimalColumns(measurement))
 		if len(walRecords) > 0 {
 			if err := b.wal.Append(walRecords); err != nil {
 				b.logger.Error().Err(err).
@@ -1446,7 +1511,7 @@ func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, 
 
 // typedBatchToWALRecords converts a TypedColumnBatch to row-format records for WAL storage.
 // This is the WAL fallback path for typed batches (e.g., TLE) that don't have raw msgpack bytes.
-func typedBatchToWALRecords(database, measurement string, batch *TypedColumnBatch, numRecords int) []map[string]interface{} {
+func typedBatchToWALRecords(database, measurement string, batch *TypedColumnBatch, numRecords int, decimalCols map[string]config.DecimalSpec) []map[string]interface{} {
 	if numRecords == 0 {
 		return nil
 	}
@@ -1475,6 +1540,18 @@ func typedBatchToWALRecords(database, measurement string, batch *TypedColumnBatc
 				if i < len(arr) {
 					row[colName] = arr[i]
 				}
+			case []decimal128.Num:
+				// WAL stores decimals as float64 (lossy but WAL is recovery-only)
+				if i < len(arr) {
+					s := int32(0)
+					if decimalCols != nil {
+						if spec, ok := decimalCols[colName]; ok {
+							s = spec.Scale
+						}
+					}
+					f := arr[i].ToBigFloat(s)
+					row[colName], _ = f.Float64()
+				}
 			}
 		}
 		records[i] = row
@@ -1487,10 +1564,13 @@ func typedBatchToWALRecords(database, measurement string, batch *TypedColumnBatc
 // Returns a TypedColumnBatch where Validity maps track which values are null (false=null).
 // Columns with no nil values have no entry in Validity (all valid).
 // ZERO-COPY OPTIMIZATION: Try bulk type assertion first before element-by-element conversion
-func (b *ArrowBuffer) convertColumnsToTyped(columns map[string][]interface{}) (*TypedColumnBatch, int, error) {
+func (b *ArrowBuffer) convertColumnsToTyped(measurement string, columns map[string][]interface{}) (*TypedColumnBatch, int, error) {
 	typed := make(map[string]interface{})
 	validity := make(map[string][]bool)
 	var numRecords int
+
+	// Look up decimal column config for this measurement (nil if none configured)
+	decimalCols := b.getDecimalColumns(measurement)
 
 	for name, col := range columns {
 		if len(col) == 0 {
@@ -1500,6 +1580,21 @@ func (b *ArrowBuffer) convertColumnsToTyped(columns map[string][]interface{}) (*
 		// Set record count from first column
 		if numRecords == 0 {
 			numRecords = len(col)
+		}
+
+		// Check if this column is declared as decimal — override normal type inference
+		if decimalCols != nil {
+			if spec, isDecimal := decimalCols[name]; isDecimal {
+				arr, valid, err := convertToDecimal128Slice(col, spec.Precision, spec.Scale)
+				if err != nil {
+					return nil, 0, fmt.Errorf("decimal conversion error in column '%s': %w", name, err)
+				}
+				typed[name] = arr
+				if valid != nil {
+					validity[name] = valid
+				}
+				continue
+			}
 		}
 
 		// Infer type from first non-nil value
@@ -1619,6 +1714,70 @@ func (b *ArrowBuffer) convertColumnsToTyped(columns map[string][]interface{}) (*
 
 	batch := &TypedColumnBatch{Data: typed, Validity: validity}
 	return batch, numRecords, nil
+}
+
+// convertToDecimal128Slice converts a []interface{} column to []decimal128.Num.
+// Accepts float64, float32, int64, int*, uint*, and string values.
+// Returns the typed array, optional validity bitmap (nil if no nulls), and error.
+func convertToDecimal128Slice(col []interface{}, precision, scale int32) ([]decimal128.Num, []bool, error) {
+	arr := make([]decimal128.Num, len(col))
+	var valid []bool
+
+	for i, v := range col {
+		if v == nil {
+			if valid == nil {
+				valid = make([]bool, len(col))
+				for j := 0; j < i; j++ {
+					valid[j] = true
+				}
+			}
+			continue
+		}
+		if valid != nil {
+			valid[i] = true
+		}
+
+		var num decimal128.Num
+		var err error
+
+		switch val := v.(type) {
+		case float64:
+			num, err = decimal128.FromFloat64(val, precision, scale)
+		case float32:
+			num, err = decimal128.FromFloat64(float64(val), precision, scale)
+		case int64:
+			num, err = decimal128.FromString(strconv.FormatInt(val, 10), precision, scale)
+		case int:
+			num, err = decimal128.FromString(strconv.FormatInt(int64(val), 10), precision, scale)
+		case int32:
+			num, err = decimal128.FromString(strconv.FormatInt(int64(val), 10), precision, scale)
+		case int16:
+			num, err = decimal128.FromString(strconv.FormatInt(int64(val), 10), precision, scale)
+		case int8:
+			num, err = decimal128.FromString(strconv.FormatInt(int64(val), 10), precision, scale)
+		case uint64:
+			num, err = decimal128.FromString(strconv.FormatUint(val, 10), precision, scale)
+		case uint:
+			num, err = decimal128.FromString(strconv.FormatUint(uint64(val), 10), precision, scale)
+		case uint32:
+			num, err = decimal128.FromString(strconv.FormatUint(uint64(val), 10), precision, scale)
+		case uint16:
+			num, err = decimal128.FromString(strconv.FormatUint(uint64(val), 10), precision, scale)
+		case uint8:
+			num, err = decimal128.FromString(strconv.FormatUint(uint64(val), 10), precision, scale)
+		case string:
+			num, err = decimal128.FromString(val, precision, scale)
+		default:
+			return nil, nil, fmt.Errorf("cannot convert %T to decimal128 at row %d", v, i)
+		}
+
+		if err != nil {
+			return nil, nil, fmt.Errorf("row %d: %w", i, err)
+		}
+		arr[i] = num
+	}
+
+	return arr, valid, nil
 }
 
 // ZERO-COPY HELPERS: Try bulk type assertion for homogeneous arrays
@@ -1887,6 +2046,9 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	// Get sort keys for this measurement (guaranteed to include "time")
 	sortKeys := b.getSortKeys(measurement)
 
+	// Get decimal column config for this measurement (nil if none configured)
+	decimalCols := b.getDecimalColumns(measurement)
+
 	// Extract time column (doesn't need to be sorted yet)
 	times, ok := merged.Data["time"].([]int64)
 	if !ok || len(times) == 0 {
@@ -1925,7 +2087,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		// Single hour - sort once and write one file
 		sorted := sortTypedColumnBatchByKeys(merged, sortKeys)
 
-		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted.Data, sorted.Validity, sorted.TagColumns)
+		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted.Data, sorted.Validity, sorted.TagColumns, decimalCols)
 		if err != nil {
 			return fmt.Errorf("failed to write Parquet: %w", err)
 		}
@@ -1977,7 +2139,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		sorted := sortTypedColumnBatchByKeys(hourBatch, sortKeys)
 
 		// Write Parquet file for this hour
-		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted.Data, sorted.Validity, sorted.TagColumns)
+		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted.Data, sorted.Validity, sorted.TagColumns, decimalCols)
 		if err != nil {
 			return fmt.Errorf("failed to write Parquet for hour %d: %w", hourID, err)
 		}
@@ -2149,6 +2311,8 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 					info.colType = "string"
 				case []bool:
 					info.colType = "bool"
+				case []decimal128.Num:
+					info.colType = "decimal128"
 				default:
 					return nil, fmt.Errorf("unsupported column type: %T", col)
 				}
@@ -2193,6 +2357,8 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 			merged[name] = make([]string, totalRows)
 		case "bool":
 			merged[name] = make([]bool, totalRows)
+		case "decimal128":
+			merged[name] = make([]decimal128.Num, totalRows)
 		}
 		if needsValidity {
 			// Initialize all positions as invalid (null). Positions with data get set to true below.
@@ -2230,6 +2396,8 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 				copy(merged[name].([]string)[rowOffset:], v)
 			case []bool:
 				copy(merged[name].([]bool)[rowOffset:], v)
+			case []decimal128.Num:
+				copy(merged[name].([]decimal128.Num)[rowOffset:], v)
 			}
 
 			// Copy validity bitmap for this column
@@ -2330,6 +2498,8 @@ func sortColumnsByKeys(columns map[string]interface{}, sortKeys []string) (map[s
 		case []string:
 			n = len(c)
 		case []bool:
+			n = len(c)
+		case []decimal128.Num:
 			n = len(c)
 		}
 		if n > 0 {
@@ -2449,6 +2619,14 @@ func compareMultiKeyCached(cachedCols []interface{}, i, j int) bool {
 			if c[i] && !c[j] {
 				return false
 			}
+
+		case []decimal128.Num:
+			if c[i].Less(c[j]) {
+				return true
+			}
+			if c[i].Greater(c[j]) {
+				return false
+			}
 		}
 	}
 
@@ -2482,6 +2660,13 @@ func applyPermutation(colData interface{}, indices []int) interface{} {
 
 	case []bool:
 		result := make([]bool, len(indices))
+		for i, idx := range indices {
+			result[i] = col[idx]
+		}
+		return result
+
+	case []decimal128.Num:
+		result := make([]decimal128.Num, len(indices))
 		for i, idx := range indices {
 			result[i] = col[idx]
 		}
@@ -2526,6 +2711,8 @@ func sortTypedColumnBatchByKeys(batch *TypedColumnBatch, sortKeys []string) *Typ
 		case []string:
 			n = len(c)
 		case []bool:
+			n = len(c)
+		case []decimal128.Num:
 			n = len(c)
 		}
 		if n > 0 {
@@ -2730,6 +2917,16 @@ func sliceColumnsByIndices(columns map[string]interface{}, indices []int) map[st
 					newCol[i] = col[idx]
 				}
 				// else: leave as false (sparse column handling)
+			}
+			result[colName] = newCol
+
+		case []decimal128.Num:
+			newCol := make([]decimal128.Num, len(indices))
+			colLen := len(col)
+			for i, idx := range indices {
+				if idx < colLen {
+					newCol[i] = col[idx]
+				}
 			}
 			result[colName] = newCol
 

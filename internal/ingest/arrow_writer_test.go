@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/rs/zerolog"
@@ -354,6 +355,208 @@ func TestRowsToColumnar_DifferentFieldTypes(t *testing.T) {
 	}
 	if result.Columns["bool_val"][0].(bool) != true {
 		t.Errorf("Expected bool true, got %v", result.Columns["bool_val"][0])
+	}
+}
+
+func TestDecimal128_ConvertColumnsToTyped(t *testing.T) {
+	buffer := createTestArrowBuffer(t)
+
+	// Configure decimal columns for "trades" measurement
+	buffer.decimalConfig = map[string]map[string]config.DecimalSpec{
+		"trades": {
+			"price":  {Precision: 18, Scale: 8},
+			"amount": {Precision: 18, Scale: 8},
+		},
+	}
+
+	columns := map[string][]interface{}{
+		"time":   {int64(1000000), int64(2000000), int64(3000000)},
+		"price":  {float64(123.456), float64(789.012), float64(0.00000001)},
+		"amount": {float64(100.0), float64(200.5), nil},
+		"symbol": {"AAPL", "GOOG", "MSFT"},
+	}
+
+	batch, numRecords, err := buffer.convertColumnsToTyped("trades", columns)
+	if err != nil {
+		t.Fatalf("convertColumnsToTyped failed: %v", err)
+	}
+	if numRecords != 3 {
+		t.Fatalf("expected 3 records, got %d", numRecords)
+	}
+
+	// Verify price is []decimal128.Num
+	priceCol, ok := batch.Data["price"]
+	if !ok {
+		t.Fatal("missing 'price' column")
+	}
+	prices, ok := priceCol.([]decimal128.Num)
+	if !ok {
+		t.Fatalf("expected []decimal128.Num for price, got %T", priceCol)
+	}
+	if len(prices) != 3 {
+		t.Fatalf("expected 3 prices, got %d", len(prices))
+	}
+	// No validity for price (no nils)
+	if batch.Validity["price"] != nil {
+		t.Error("expected no validity bitmap for price (no nils)")
+	}
+
+	// Verify amount has validity (has nil)
+	amountCol, ok := batch.Data["amount"]
+	if !ok {
+		t.Fatal("missing 'amount' column")
+	}
+	amounts, ok := amountCol.([]decimal128.Num)
+	if !ok {
+		t.Fatalf("expected []decimal128.Num for amount, got %T", amountCol)
+	}
+	if len(amounts) != 3 {
+		t.Fatalf("expected 3 amounts, got %d", len(amounts))
+	}
+	amountValidity := batch.Validity["amount"]
+	if amountValidity == nil {
+		t.Fatal("expected validity bitmap for amount (has nil)")
+	}
+	if amountValidity[0] != true || amountValidity[1] != true || amountValidity[2] != false {
+		t.Errorf("unexpected validity: %v", amountValidity)
+	}
+
+	// Verify non-decimal columns are unaffected
+	timeCol, ok := batch.Data["time"].([]int64)
+	if !ok {
+		t.Fatalf("expected []int64 for time, got %T", batch.Data["time"])
+	}
+	if len(timeCol) != 3 {
+		t.Fatalf("expected 3 times, got %d", len(timeCol))
+	}
+
+	symbolCol, ok := batch.Data["symbol"].([]string)
+	if !ok {
+		t.Fatalf("expected []string for symbol, got %T", batch.Data["symbol"])
+	}
+	if symbolCol[0] != "AAPL" {
+		t.Errorf("expected AAPL, got %s", symbolCol[0])
+	}
+}
+
+func TestDecimal128_WriteParquetRoundTrip(t *testing.T) {
+	logger := zerolog.New(os.Stderr).Level(zerolog.Disabled)
+	cfg := &config.IngestConfig{
+		Compression:   "snappy",
+		UseDictionary: true,
+	}
+	writer := NewArrowWriter(cfg, logger)
+
+	// Prepare typed decimal columns (as would come from convertColumnsToTyped)
+	price1, _ := decimal128.FromFloat64(123.45678901, 18, 8)
+	price2, _ := decimal128.FromFloat64(789.01234567, 18, 8)
+	price3, _ := decimal128.FromFloat64(0.00000001, 18, 8)
+
+	columns := map[string]interface{}{
+		"time":   []int64{1000000, 2000000, 3000000},
+		"price":  []decimal128.Num{price1, price2, price3},
+		"symbol": []string{"AAPL", "GOOG", "MSFT"},
+	}
+
+	decimalCols := map[string]config.DecimalSpec{
+		"price": {Precision: 18, Scale: 8},
+	}
+
+	ctx := context.Background()
+	data, err := writer.WriteParquetColumnar(ctx, "trades", columns, nil, nil, decimalCols)
+	if err != nil {
+		t.Fatalf("WriteParquetColumnar failed: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("expected non-empty Parquet data")
+	}
+
+	// Verify the Parquet file was written (non-zero size means Arrow+Parquet accepted the decimal type)
+	t.Logf("Written %d bytes of Parquet data with Decimal128 columns", len(data))
+}
+
+func TestDecimal128_StringConversion(t *testing.T) {
+	// Test that string values are converted to decimal128 correctly (high-precision path)
+	buffer := createTestArrowBuffer(t)
+	buffer.decimalConfig = map[string]map[string]config.DecimalSpec{
+		"trades": {
+			"price": {Precision: 38, Scale: 18},
+		},
+	}
+
+	columns := map[string][]interface{}{
+		"time":  {int64(1000000)},
+		"price": {"123.456789012345678901"},
+	}
+
+	batch, _, err := buffer.convertColumnsToTyped("trades", columns)
+	if err != nil {
+		t.Fatalf("convertColumnsToTyped with string decimal failed: %v", err)
+	}
+
+	prices, ok := batch.Data["price"].([]decimal128.Num)
+	if !ok {
+		t.Fatalf("expected []decimal128.Num, got %T", batch.Data["price"])
+	}
+
+	// Verify the value was parsed (non-zero)
+	zero := decimal128.Num{}
+	if prices[0] == zero {
+		t.Error("expected non-zero decimal value from string conversion")
+	}
+}
+
+func TestDecimal128_NoConfigNoImpact(t *testing.T) {
+	// Verify that without decimal config, float columns stay as float64
+	buffer := createTestArrowBuffer(t)
+	// No decimal config set (default)
+
+	columns := map[string][]interface{}{
+		"time":  {int64(1000000)},
+		"price": {float64(123.45)},
+	}
+
+	batch, _, err := buffer.convertColumnsToTyped("trades", columns)
+	if err != nil {
+		t.Fatalf("convertColumnsToTyped failed: %v", err)
+	}
+
+	// Price should be []float64, not []decimal128.Num
+	_, ok := batch.Data["price"].([]float64)
+	if !ok {
+		t.Fatalf("expected []float64 for price without decimal config, got %T", batch.Data["price"])
+	}
+}
+
+func TestDecimal128_SchemaMetadata(t *testing.T) {
+	logger := zerolog.New(os.Stderr).Level(zerolog.Disabled)
+	cfg := &config.IngestConfig{Compression: "snappy"}
+	writer := NewArrowWriter(cfg, logger)
+
+	price1, _ := decimal128.FromFloat64(100.0, 18, 8)
+	columns := map[string]interface{}{
+		"time":  []int64{1000000},
+		"price": []decimal128.Num{price1},
+	}
+
+	decimalCols := map[string]config.DecimalSpec{
+		"price": {Precision: 18, Scale: 8},
+	}
+
+	schema, err := writer.getSchema("trades", columns, nil, decimalCols)
+	if err != nil {
+		t.Fatalf("getSchema failed: %v", err)
+	}
+
+	// Check that arc:decimals metadata is present
+	md := schema.Metadata()
+	idx := md.FindKey("arc:decimals")
+	if idx < 0 {
+		t.Fatal("expected arc:decimals metadata key in schema")
+	}
+	val := md.Values()[idx]
+	if val != "price:18,8" {
+		t.Errorf("expected 'price:18,8', got %q", val)
 	}
 }
 
