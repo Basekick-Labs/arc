@@ -17,8 +17,8 @@ func CheckWritePermissions(c *fiber.Ctx, rbacManager RBACChecker, logger zerolog
 	}
 
 	// Get token info from context
-	tokenInfo, ok := c.Locals("token").(*auth.TokenInfo)
-	if !ok || tokenInfo == nil {
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
 		return nil // No token info, let other middleware handle auth
 	}
 

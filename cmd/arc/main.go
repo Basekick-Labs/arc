@@ -827,6 +827,9 @@ func main() {
 		middlewareConfig := auth.DefaultMiddlewareConfig()
 		middlewareConfig.AuthManager = authManager
 		// Add public routes that don't need auth
+		// Note: /api/v1/internal/cache/invalidate is public because cluster peers call it
+		// without auth tokens after compaction. Access is gated by X-Arc-Internal header
+		// validation in the handler. Cluster nodes should be on a private network.
 		middlewareConfig.PublicRoutes = append(middlewareConfig.PublicRoutes, "/health", "/ready", "/api/v1/auth/verify", "/api/v1/internal/cache/invalidate")
 		middlewareConfig.PublicPrefixes = append(middlewareConfig.PublicPrefixes, "/metrics", "/debug/pprof")
 		server.GetApp().Use(auth.NewMiddleware(middlewareConfig))

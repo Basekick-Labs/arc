@@ -527,46 +527,67 @@ func (d *DuckDB) DB() *sql.DB {
 
 // QueryWithProfile executes a query and returns timing breakdown using DuckDB profiling
 // This is used to measure parsing/planning overhead for optimization decisions
-func (d *DuckDB) QueryWithProfile(query string) (*sql.Rows, *QueryProfile, error) {
+//
+// The caller MUST close both resources when done:
+//  1. rows.Close() — releases the result set
+//  2. conn.Close() — returns the pinned connection to the pool
+func (d *DuckDB) QueryWithProfile(query string) (*sql.Rows, *sql.Conn, *QueryProfile, error) {
 	return d.QueryWithProfileContext(context.Background(), query)
 }
 
 // QueryWithProfileContext executes a query with context support for timeout/cancellation
-// and returns timing breakdown using DuckDB profiling
-func (d *DuckDB) QueryWithProfileContext(ctx context.Context, query string) (*sql.Rows, *QueryProfile, error) {
+// and returns timing breakdown using DuckDB profiling.
+// All profiling PRAGMAs and the query are pinned to a single connection to avoid
+// race conditions across the connection pool.
+//
+// The caller MUST close both resources when done:
+//  1. rows.Close() — releases the result set
+//  2. conn.Close() — returns the pinned connection to the pool
+func (d *DuckDB) QueryWithProfileContext(ctx context.Context, query string) (*sql.Rows, *sql.Conn, *QueryProfile, error) {
+	conn, err := d.db.Conn(ctx)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to acquire connection: %w", err)
+	}
+
 	// Create a temporary file for profiling output
 	tmpFile, err := os.CreateTemp("", "duckdb_profile_*.json")
 	if err != nil {
 		// Fall back to regular query if we can't create temp file
-		rows, err := d.QueryContext(ctx, query)
-		return rows, nil, err
+		rows, err := conn.QueryContext(ctx, query)
+		if err != nil {
+			conn.Close()
+			return nil, nil, nil, err
+		}
+		return rows, conn, nil, nil
 	}
 	profilePath := tmpFile.Name()
 	tmpFile.Close()
 	defer os.Remove(profilePath)
 
 	// Enable JSON profiling with custom metrics to capture planning time
-	if _, err := d.db.Exec("PRAGMA enable_profiling='json'"); err != nil {
+	// All PRAGMAs run on the same pinned connection
+	if _, err := conn.ExecContext(ctx, "PRAGMA enable_profiling='json'"); err != nil {
 		d.logger.Warn().Err(err).Msg("Failed to enable profiling")
 	}
-	if _, err := d.db.Exec(fmt.Sprintf("PRAGMA profiling_output='%s'", profilePath)); err != nil {
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA profiling_output='%s'", profilePath)); err != nil {
 		d.logger.Warn().Err(err).Msg("Failed to set profiling output")
 	}
 	// Enable planner timing metrics
-	if _, err := d.db.Exec("SET custom_profiling_settings='{\"PLANNER\": \"true\", \"PLANNER_BINDING\": \"true\", \"PHYSICAL_PLANNER\": \"true\", \"OPERATOR_TIMING\": \"true\", \"OPERATOR_CARDINALITY\": \"true\"}'"); err != nil {
+	if _, err := conn.ExecContext(ctx, "SET custom_profiling_settings='{\"PLANNER\": \"true\", \"PLANNER_BINDING\": \"true\", \"PHYSICAL_PLANNER\": \"true\", \"OPERATOR_TIMING\": \"true\", \"OPERATOR_CARDINALITY\": \"true\"}'"); err != nil {
 		d.logger.Warn().Err(err).Msg("Failed to set custom profiling settings")
 	}
 
-	// Execute the query with timing and context
+	// Execute the query with timing and context on the pinned connection
 	start := time.Now()
-	rows, err := d.db.QueryContext(ctx, query)
+	rows, err := conn.QueryContext(ctx, query)
 	totalTime := time.Since(start)
 
-	// Disable profiling
-	d.db.Exec("PRAGMA disable_profiling")
+	// Disable profiling on the same connection
+	conn.ExecContext(ctx, "PRAGMA disable_profiling")
 
 	if err != nil {
-		return nil, nil, fmt.Errorf("query failed: %w", err)
+		conn.Close()
+		return nil, nil, nil, fmt.Errorf("query failed: %w", err)
 	}
 
 	// Parse the profiling output
@@ -579,7 +600,7 @@ func (d *DuckDB) QueryWithProfileContext(ctx context.Context, query string) (*sq
 		Float64("execution_ms", profile.ExecutionMs).
 		Msg("Query profiled")
 
-	return rows, profile, nil
+	return rows, conn, profile, nil
 }
 
 // duckdbProfileOutput represents the JSON structure from DuckDB profiling

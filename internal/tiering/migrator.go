@@ -223,8 +223,8 @@ func (m *Migrator) MigrateFile(ctx context.Context, candidate MigrationCandidate
 		m.logger.Warn().Err(err).Msg("Failed to record migration start")
 	}
 
-	// Perform the migration
-	migrationErr := m.copyFile(ctx, srcBackend, dstBackend, candidate.Path, candidate.SizeBytes)
+	// Perform the migration using streaming to avoid loading entire files into memory
+	migrationErr := m.copyFileStreaming(ctx, srcBackend, dstBackend, candidate.Path, candidate.SizeBytes)
 
 	if migrationErr != nil {
 		// Record failure

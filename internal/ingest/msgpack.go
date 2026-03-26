@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/Basekick-Labs/msgpack/v6"
@@ -13,8 +14,8 @@ import (
 // Supports row format, columnar format (fastest), and batch format
 type MessagePackDecoder struct {
 	logger       zerolog.Logger
-	totalDecoded uint64
-	totalErrors  uint64
+	totalDecoded atomic.Uint64
+	totalErrors  atomic.Uint64
 }
 
 // NewMessagePackDecoder creates a new MessagePack decoder
@@ -39,7 +40,7 @@ func (d *MessagePackDecoder) Decode(data []byte) (interface{}, error) {
 	// if we try to decode directly into a struct
 	var rawPayload interface{}
 	if err := msgpack.Unmarshal(data, &rawPayload); err != nil {
-		d.totalErrors++
+		d.totalErrors.Add(1)
 		return nil, fmt.Errorf("failed to unmarshal msgpack: %w", err)
 	}
 
@@ -51,7 +52,7 @@ func (d *MessagePackDecoder) Decode(data []byte) (interface{}, error) {
 		// Standard map format - convert to MsgPackPayload and decode
 		result, err := d.decodeMapPayload(payload, data)
 		if err != nil {
-			d.totalErrors++
+			d.totalErrors.Add(1)
 			return nil, err
 		}
 		if resultSlice, ok := result.([]interface{}); ok {
@@ -77,11 +78,11 @@ func (d *MessagePackDecoder) Decode(data []byte) (interface{}, error) {
 		}
 
 	default:
-		d.totalErrors++
+		d.totalErrors.Add(1)
 		return nil, fmt.Errorf("unsupported msgpack payload type: %T", rawPayload)
 	}
 
-	d.totalDecoded += uint64(len(results))
+	d.totalDecoded.Add(uint64(len(results)))
 	return results, nil
 }
 
@@ -574,14 +575,17 @@ func (d *MessagePackDecoder) sanitizeStringFields(fields map[string]interface{})
 
 // GetStats returns decoder statistics
 func (d *MessagePackDecoder) GetStats() map[string]interface{} {
+	decoded := d.totalDecoded.Load()
+	errors := d.totalErrors.Load()
+
 	var errorRate float64
-	if d.totalDecoded > 0 {
-		errorRate = float64(d.totalErrors) / float64(d.totalDecoded)
+	if decoded > 0 {
+		errorRate = float64(errors) / float64(decoded)
 	}
 
 	return map[string]interface{}{
-		"total_decoded": d.totalDecoded,
-		"total_errors":  d.totalErrors,
+		"total_decoded": decoded,
+		"total_errors":  errors,
 		"error_rate":    errorRate,
 	}
 }
