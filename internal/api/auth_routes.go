@@ -103,13 +103,21 @@ func (h *AuthHandler) createToken(c *fiber.Ctx) error {
 		})
 	}
 
-	// Parse permissions
+	// Parse and validate permissions
 	// nil = use defaults (read,write), empty array = no permissions (RBAC-only token)
 	permissions := "read,write"
 	if req.Permissions != nil {
 		if len(*req.Permissions) == 0 {
 			permissions = "" // RBAC-only token with no OSS permissions
 		} else {
+			for _, p := range *req.Permissions {
+				if !auth.IsValidPermission(p) {
+					return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+						"success": false,
+						"error":   "Invalid permission: " + p + ". Valid permissions are: read, write, delete, admin",
+					})
+				}
+			}
 			permissions = ""
 			for i, p := range *req.Permissions {
 				if i > 0 {
@@ -246,6 +254,14 @@ func (h *AuthHandler) updateToken(c *fiber.Ctx) error {
 	if req.Permissions != nil {
 		permStr := ""
 		if len(*req.Permissions) > 0 {
+			for _, p := range *req.Permissions {
+				if !auth.IsValidPermission(p) {
+					return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+						"success": false,
+						"error":   "Invalid permission: " + p + ". Valid permissions are: read, write, delete, admin",
+					})
+				}
+			}
 			for i, p := range *req.Permissions {
 				if i > 0 {
 					permStr += ","

@@ -522,7 +522,7 @@ func (rm *RBACManager) CreateRole(teamID int64, req *CreateRoleRequest) (*Role, 
 
 	// Validate permissions
 	for _, p := range req.Permissions {
-		if !isValidPermission(p) {
+		if !IsValidPermission(p) {
 			return nil, fmt.Errorf("invalid permission: %s", p)
 		}
 	}
@@ -619,7 +619,7 @@ func (rm *RBACManager) UpdateRole(id int64, req *UpdateRoleRequest) error {
 	}
 	if len(req.Permissions) > 0 {
 		for _, p := range req.Permissions {
-			if !isValidPermission(p) {
+			if !IsValidPermission(p) {
 				return fmt.Errorf("invalid permission: %s", p)
 			}
 		}
@@ -690,7 +690,7 @@ func (rm *RBACManager) CreateMeasurementPermission(roleID int64, req *CreateMeas
 	}
 
 	for _, p := range req.Permissions {
-		if !isValidPermission(p) {
+		if !IsValidPermission(p) {
 			return nil, fmt.Errorf("invalid permission: %s", p)
 		}
 	}
@@ -1370,8 +1370,8 @@ func (rm *RBACManager) GetEffectivePermissions(tokenID int64, tokenInfo *TokenIn
 // Helper Functions
 // =============================================================================
 
-// isValidPermission checks if a permission string is valid
-func isValidPermission(p string) bool {
+// IsValidPermission checks if a permission string is valid
+func IsValidPermission(p string) bool {
 	switch p {
 	case "read", "write", "delete", "admin":
 		return true

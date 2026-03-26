@@ -119,6 +119,11 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 	timestampUS := binary.BigEndian.Uint64(header[4:12])
 	expectedChecksum := binary.BigEndian.Uint32(header[12:16])
 
+	// Validate payload length to prevent OOM on corrupt WAL files
+	if payloadLen > MaxWALPayloadSize {
+		return nil, fmt.Errorf("%w: size %d exceeds limit %d", ErrPayloadTooLarge, payloadLen, MaxWALPayloadSize)
+	}
+
 	// Read payload
 	payload := make([]byte, payloadLen)
 	n, err = io.ReadFull(f, payload)

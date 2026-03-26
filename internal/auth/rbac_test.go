@@ -632,15 +632,15 @@ func TestIsRBACEnabled(t *testing.T) {
 func TestIsValidPermission(t *testing.T) {
 	validPerms := []string{"read", "write", "delete", "admin"}
 	for _, p := range validPerms {
-		if !isValidPermission(p) {
-			t.Errorf("isValidPermission(%q) = false, want true", p)
+		if !IsValidPermission(p) {
+			t.Errorf("IsValidPermission(%q) = false, want true", p)
 		}
 	}
 
 	invalidPerms := []string{"", "invalid", "READ", "ADMIN", "create", "execute"}
 	for _, p := range invalidPerms {
-		if isValidPermission(p) {
-			t.Errorf("isValidPermission(%q) = true, want false", p)
+		if IsValidPermission(p) {
+			t.Errorf("IsValidPermission(%q) = true, want false", p)
 		}
 	}
 }

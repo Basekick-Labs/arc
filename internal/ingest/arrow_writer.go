@@ -3026,7 +3026,14 @@ func (b *ArrowBuffer) Close() error {
 
 		shard.mu.Lock()
 
+		// Copy keys to avoid modifying map while iterating
+		// (flushBufferLocked releases and re-acquires the lock during I/O)
+		keys := make([]string, 0, len(shard.buffers))
 		for key := range shard.buffers {
+			keys = append(keys, key)
+		}
+
+		for _, key := range keys {
 			parts := splitBufferKey(key)
 			if len(parts) != 2 {
 				b.logger.Error().Str("buffer_key", key).Msg("Invalid buffer key format during close")
@@ -3038,6 +3045,9 @@ func (b *ArrowBuffer) Close() error {
 				b.logger.Error().Err(err).Str("buffer_key", key).Msg("Failed to flush buffer during close")
 			}
 			flushCancel()
+
+			// Re-acquire lock since flushBufferLocked releases it
+			shard.mu.Lock()
 		}
 
 		shard.mu.Unlock()

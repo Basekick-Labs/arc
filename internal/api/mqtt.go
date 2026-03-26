@@ -28,7 +28,12 @@ func NewMQTTHandler(manager mqtt.Manager, authManager *auth.AuthManager, logger 
 func (h *MQTTHandler) RegisterRoutes(app *fiber.App) {
 	mqttGroup := app.Group("/api/v1/mqtt")
 
-	// Stats and health endpoints (read-only, less restrictive auth)
+	// Require authentication for all MQTT endpoints
+	if h.authManager != nil {
+		mqttGroup.Use(auth.RequireAdmin(h.authManager))
+	}
+
+	// Stats and health endpoints
 	mqttGroup.Get("/stats", h.handleStats)
 	mqttGroup.Get("/health", h.handleHealth)
 }
