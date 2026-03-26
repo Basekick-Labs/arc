@@ -29,8 +29,11 @@ type HourlyTierConfig struct {
 
 // NewHourlyTier creates a new hourly compaction tier
 func NewHourlyTier(cfg *HourlyTierConfig) *HourlyTier {
-	// Set defaults (MinAgeHours=0 is valid, meaning compact immediately)
-	if cfg.MinAgeHours < 0 {
+	// MinAgeHours must be >= 1 to prevent race conditions with active ingestion.
+	// With 0, compaction can download and delete files while late buffer flushes
+	// are still writing to the same partition, causing data loss.
+	overrodeMinAge := cfg.MinAgeHours < 1
+	if overrodeMinAge {
 		cfg.MinAgeHours = 1
 	}
 	if cfg.MinFiles == 0 {
@@ -53,6 +56,12 @@ func NewHourlyTier(cfg *HourlyTierConfig) *HourlyTier {
 			Enabled:        cfg.Enabled,
 			Logger:         cfg.Logger.With().Str("tier", "hourly").Logger(),
 		}),
+	}
+
+	if overrodeMinAge {
+		tier.Logger.Warn().
+			Int("enforced_value", cfg.MinAgeHours).
+			Msg("hourly_min_age_hours was < 1; overriding to 1 to prevent race conditions with active ingestion")
 	}
 
 	tier.Logger.Info().
@@ -217,9 +226,20 @@ func (t *HourlyTier) listHourPartitions(ctx context.Context, database, measureme
 		partitions[partitionPath].Files = append(partitions[partitionPath].Files, obj)
 	}
 
-	// Convert map to slice
+	// Convert map to slice, filtering by newest file creation time.
+	// This prevents compacting partitions that still have recently-written files,
+	// which would race with active ingestion and cause data loss.
 	result := make([]Candidate, 0, len(partitions))
 	for _, p := range partitions {
+		newestFileTime := extractNewestFileTime(p.Files)
+		if !newestFileTime.IsZero() && newestFileTime.After(cutoffTime) {
+			t.Logger.Debug().
+				Str("partition", p.PartitionPath).
+				Time("newest_file", newestFileTime).
+				Time("cutoff", cutoffTime).
+				Msg("Skipping partition: has recent files")
+			continue
+		}
 		result = append(result, *p)
 	}
 
