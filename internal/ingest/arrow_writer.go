@@ -2992,9 +2992,7 @@ func (b *ArrowBuffer) FlushAll(ctx context.Context) error {
 				b.logger.Error().Err(err).Str("buffer_key", key).Msg("Failed to flush buffer")
 				lastErr = err
 			}
-
-			// Re-acquire lock since flushBufferLocked releases it
-			shard.mu.Lock()
+			// flushBufferLocked returns with the lock held (re-acquires after I/O)
 		}
 
 		shard.mu.Unlock()
@@ -3045,9 +3043,7 @@ func (b *ArrowBuffer) Close() error {
 				b.logger.Error().Err(err).Str("buffer_key", key).Msg("Failed to flush buffer during close")
 			}
 			flushCancel()
-
-			// Re-acquire lock since flushBufferLocked releases it
-			shard.mu.Lock()
+			// flushBufferLocked returns with the lock held (re-acquires after I/O)
 		}
 
 		shard.mu.Unlock()

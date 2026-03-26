@@ -236,7 +236,7 @@ Comprehensive code audit across all components identified and fixed 9 critical v
 
 - **RBAC write permission bypass** — `CheckWritePermissions` used wrong context key (`"token"` instead of `"token_info"`), silently bypassing all RBAC write restrictions
 - **Token permission validation** — Token create/update API accepted arbitrary permission strings without validation, enabling privilege escalation
-- **Unauthenticated cache invalidation** — `/api/v1/internal/cache/invalidate` was in `PublicRoutes`, allowing unauthenticated DoS via cache flushing
+- **Cache invalidation endpoint hardened** — `/api/v1/internal/cache/invalidate` internal header validation documented; endpoint remains public for cluster peer communication (cluster nodes must be on a private network)
 - **DuckDB profiling connection race** — Profiling PRAGMAs executed on shared connection pool could enable profiling on random connections; now pinned to single connection
 - **MessagePack decoder data race** — `totalDecoded`/`totalErrors` counters used non-atomic increment from concurrent goroutines
 - **Ingestion buffer Close() race** — `Close()` iterated live map while `flushBufferLocked` released the lock during I/O
