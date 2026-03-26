@@ -230,6 +230,20 @@ Zero allocations on the fast path. Go's `utf8.ValidString` on arm64 already leve
 
 ## Security
 
+### Pre-Release Security Audit (9 Critical Fixes)
+
+Comprehensive code audit across all components identified and fixed 9 critical vulnerabilities:
+
+- **RBAC write permission bypass** — `CheckWritePermissions` used wrong context key (`"token"` instead of `"token_info"`), silently bypassing all RBAC write restrictions
+- **Token permission validation** — Token create/update API accepted arbitrary permission strings without validation, enabling privilege escalation
+- **Unauthenticated cache invalidation** — `/api/v1/internal/cache/invalidate` was in `PublicRoutes`, allowing unauthenticated DoS via cache flushing
+- **DuckDB profiling connection race** — Profiling PRAGMAs executed on shared connection pool could enable profiling on random connections; now pinned to single connection
+- **MessagePack decoder data race** — `totalDecoded`/`totalErrors` counters used non-atomic increment from concurrent goroutines
+- **Ingestion buffer Close() race** — `Close()` iterated live map while `flushBufferLocked` released the lock during I/O
+- **WAL reader OOM** — Reader allocated `payloadLen` bytes without validation; corrupt WAL could trigger ~4GB allocation
+- **Tiering memory exhaustion** — `copyFile` loaded entire Parquet files into memory; replaced with streaming `copyFileStreaming`
+- **MQTT endpoints missing auth** — `/api/v1/mqtt/stats` and `/health` were accessible without authentication
+
 ### Admin Authorization on Mutating Endpoints
 
 Added `RequireAdmin` authorization middleware to all mutating API endpoints that previously accepted any valid token. While all endpoints already required authentication via the global token middleware, these admin-only operations (create, update, delete, execute, trigger) were accessible to read-only tokens:
