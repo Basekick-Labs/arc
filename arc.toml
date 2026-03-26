@@ -67,8 +67,8 @@ enabled = true
 # Hourly
 hourly_enabled = true
 hourly_schedule = "5 * * * *"
-hourly_min_age_hours = 0
-hourly_min_files = 5
+hourly_min_age_hours = 1
+hourly_min_files = 10
 
 # Daily
 daily_enabled = true
