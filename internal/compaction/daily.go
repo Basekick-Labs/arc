@@ -277,28 +277,36 @@ func extractNewestFileTime(files []string) time.Time {
 		// Remove .parquet extension
 		filename = strings.TrimSuffix(filename, ".parquet")
 
-		// Check if it's a daily compacted file: measurement_YYYYMMDD_HHMMSS_daily
+		// Check if it's a tier-compacted file: measurement_YYYYMMDD_HHMMSS_{nanos}_{daily|compacted}
+		// Strip the tier suffix, then handle like a raw file
+		tierSuffix := ""
 		if strings.HasSuffix(filename, "_daily") {
-			// Remove _daily suffix
-			filename = strings.TrimSuffix(filename, "_daily")
+			tierSuffix = "_daily"
+		} else if strings.HasSuffix(filename, "_compacted") {
+			tierSuffix = "_compacted"
+		}
+
+		if tierSuffix != "" {
+			filename = strings.TrimSuffix(filename, tierSuffix)
 			fileParts := strings.Split(filename, "_")
 			if len(fileParts) < 3 {
 				continue
 			}
-			// Last two parts are date and time: YYYYMMDD_HHMMSS
+			// Try parsing last two parts as YYYYMMDD_HHMMSS (old format without nanos)
 			dateTimePart := fileParts[len(fileParts)-2] + "_" + fileParts[len(fileParts)-1]
-			// Parse timestamp: YYYYMMDD_HHMMSS
 			fileTime, err := time.Parse("20060102_150405", dateTimePart)
-			if err != nil {
-				continue
+			if err != nil && len(fileParts) >= 4 {
+				// New format with nanos: ..._YYYYMMDD_HHMMSS_nanos — skip nanos, take 3rd and 2nd from end
+				dateTimePart = fileParts[len(fileParts)-3] + "_" + fileParts[len(fileParts)-2]
+				fileTime, err = time.Parse("20060102_150405", dateTimePart)
 			}
-			if fileTime.After(newest) {
+			if err == nil && fileTime.After(newest) {
 				newest = fileTime
 			}
 			continue
 		}
 
-		// Handle hourly file: measurement_YYYYMMDD_HHMMSS_nanos
+		// Handle raw hourly file: measurement_YYYYMMDD_HHMMSS_nanos
 		fileParts := strings.Split(filename, "_")
 		if len(fileParts) < 3 {
 			continue
