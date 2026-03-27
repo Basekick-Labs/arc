@@ -266,6 +266,10 @@ Changed all temp directories (compaction, delete rewrite) from world-readable (`
 
 ## Bug Fixes
 
+### Compaction Batch Filename Collision — Data Loss
+
+When a partition had more than 30 files, compaction split them into sequential batches of 30. Each batch generated its output filename with second-precision timestamps, causing all batches to produce the same filename. Each batch overwrote the previous batch's compacted file, destroying up to 84% of data. Fixed by adding nanosecond precision to compacted filenames for guaranteed uniqueness.
+
 ### Hourly Compaction Race Condition with Active Ingestion
 
 Fixed a race condition where hourly compaction with `hourly_min_age_hours = 0` could compact and delete source files while the ingestion pipeline was still flushing data to the same partition. This caused data gaps and duplicate data visible in query results. The hourly tier now checks file creation timestamps (matching the daily tier's existing safety check) and enforces a minimum age of 1 hour. The default `arc.toml` has been corrected from `hourly_min_age_hours = 0` to `1` and `hourly_min_files` from `5` to `10`.

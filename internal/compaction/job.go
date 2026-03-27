@@ -476,13 +476,19 @@ func (j *Job) downloadSingleFile(ctx context.Context, tempDir string, index int,
 // It validates each file and only compacts valid ones, storing the list of
 // successfully compacted files' storage keys in j.compactedFiles.
 func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir string) (string, error) {
-	// Generate output filename with tier-specific suffix (use UTC for consistency)
-	timestamp := time.Now().UTC().Format("20060102_150405")
+	// Generate output filename with tier-specific suffix.
+	// Format: {measurement}_{YYYYMMDD}_{HHMMSS}_{nanos}_{suffix}.parquet
+	// The nanos field guarantees uniqueness when multiple batches run
+	// sequentially for the same partition (SplitCandidateIntoBatches).
+	// Without it, batches within the same second produce identical filenames
+	// and each overwrites the previous, destroying data.
+	now := time.Now().UTC()
+	timestamp := now.Format("20060102_150405")
 	suffix := "compacted"
 	if j.Tier != "hourly" {
 		suffix = j.Tier
 	}
-	outputFile := filepath.Join(tempDir, fmt.Sprintf("%s_%s_%s.parquet", j.Measurement, timestamp, suffix))
+	outputFile := filepath.Join(tempDir, fmt.Sprintf("%s_%s_%d_%s.parquet", j.Measurement, timestamp, now.UnixNano(), suffix))
 
 	// Use the shared DuckDB connection instead of creating a new one
 	// This prevents memory retention from DuckDB's jemalloc not releasing memory on Close()
