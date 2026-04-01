@@ -287,6 +287,10 @@ Expanded the forbidden keyword list for delete WHERE clauses to block `UNION`, `
 
 Changed all temp directories (compaction, delete rewrite) from world-readable (`0755`) to owner-only (`0700`), preventing other system users from reading uncompacted or in-flight data files.
 
+### DuckDB `memory_limit` Config Validation
+
+Arc now validates `ARC_DATABASE_MEMORY_LIMIT` at startup against an allowlist pattern (`^\d+(\.\d+)?\s*(B|KB|MB|GB|TB|%)?$`). Invalid values cause a clean startup failure instead of being interpolated into a DuckDB `SET` statement. This closes a SQL injection vector via the config file or environment.
+
 ## Bug Fixes
 
 ### Compaction Batch Filename Collision — Data Loss
