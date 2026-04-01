@@ -228,6 +228,29 @@ Zero allocations on the fast path. Go's `utf8.ValidString` on arm64 already leve
 
 **Optional SIMD acceleration:** Build with `-tags simdutf` to use the [simdutf](https://github.com/simdutf/simdutf) library for large buffers (≥4KB). This provides AVX2/SSE4 acceleration on x86 servers where Go's stdlib lacks SIMD UTF-8 validation. On arm64, the standard build is already optimal. Requires `libsimdutf` installed on the build machine.
 
+## Auth
+
+### Bootstrap Token and Recovery via Environment Variables
+
+Two new environment variables make auth easier to deploy and recover from:
+
+**`ARC_AUTH_BOOTSTRAP_TOKEN`** — Set a known admin token value at deploy time instead of catching a randomly generated one from startup logs. On first run, Arc stores this value as the initial admin token (bcrypt-hashed). On subsequent restarts, it's a no-op — the existing token is preserved.
+
+```bash
+ARC_AUTH_BOOTSTRAP_TOKEN=your-secret-token-value-here-min-32-chars
+```
+
+**`ARC_AUTH_FORCE_BOOTSTRAP`** — Recovery path for when the admin token has been lost. When set to `true` alongside `ARC_AUTH_BOOTSTRAP_TOKEN`, Arc adds a new admin token named `arc-recovery` **without removing existing tokens** — legitimate admins retain their access and can revoke the recovery token if it was added by a bad actor.
+
+```bash
+ARC_AUTH_BOOTSTRAP_TOKEN=your-new-recovery-token-min-32-chars
+ARC_AUTH_FORCE_BOOTSTRAP=true
+```
+
+After recovery, use the API to revoke any unwanted tokens, then remove `ARC_AUTH_FORCE_BOOTSTRAP` from your deployment config.
+
+**Requirements:** Token values must be at least 32 characters long. Values are stored as bcrypt hashes — the plaintext never persists to disk.
+
 ## Security
 
 ### Pre-Release Security Audit (9 Critical Fixes)
@@ -307,6 +330,10 @@ Backup restore now streams Parquet files through a temp file instead of loading 
 - **WriteReader directory cache**: The streaming write path (`WriteReader`) now uses the same directory cache optimization as `Write`, reducing filesystem lock contention under sustained load
 - **Context-aware file listing**: `List` and `ListObjects` now check for context cancellation during directory walks, allowing long listings on large databases to be cancelled promptly
 - **DeleteBatch error reporting**: Batch deletes now return all errors (via `errors.Join`) instead of only the last one, improving diagnostics when multiple files fail to delete
+
+### Auth Bootstrap Race Condition
+
+Fixed a TOCTOU (time-of-check/time-of-use) race in the initial admin token creation. Previously, Arc checked the token count and then inserted in two separate steps — when multiple nodes start simultaneously (Kubernetes rolling updates, clustered deployments), two nodes could both observe an empty table and attempt to create the `admin` token concurrently. Replaced with a single atomic `INSERT ... WHERE NOT EXISTS` statement, making first-run token creation safe under concurrent startup.
 
 ### Token Expiration Display Fix
 
