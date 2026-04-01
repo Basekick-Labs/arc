@@ -2,6 +2,15 @@
 
 replicaCount: 1
 
+# Update strategy for the Deployment. Defaults to Recreate because Arc uses a
+# ReadWriteOnce PVC — RollingUpdate deadlocks when replicaCount=1: the new pod
+# can't attach the volume until the old pod terminates, but RollingUpdate waits
+# for the new pod to be ready first.
+# Switch to RollingUpdate only when using shared object storage (s3/azure/minio)
+# with Arc Enterprise clustering (e.g. multiple stateless reader replicas).
+updateStrategy:
+  type: Recreate
+
 image:
   repository: ghcr.io/basekick-labs/arc-go
   pullPolicy: IfNotPresent
