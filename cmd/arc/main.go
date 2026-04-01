@@ -518,11 +518,11 @@ func main() {
 
 		// Create initial admin token on first run.
 		// ARC_AUTH_BOOTSTRAP_TOKEN: use a known token value instead of generating a random one.
-		// ARC_AUTH_FORCE_BOOTSTRAP: wipe all tokens and recreate admin (recovery path).
+		// ARC_AUTH_FORCE_BOOTSTRAP: add a recovery admin token without removing existing tokens (recovery path).
 		var bootstrapToken string
 		var bootstrapErr error
 		if cfg.Auth.ForceBootstrap && cfg.Auth.BootstrapToken != "" {
-			bootstrapToken, bootstrapErr = authManager.ForceResetWithToken(cfg.Auth.BootstrapToken)
+			bootstrapToken, bootstrapErr = authManager.ForceAddRecoveryToken(cfg.Auth.BootstrapToken)
 		} else if cfg.Auth.BootstrapToken != "" {
 			bootstrapToken, bootstrapErr = authManager.EnsureInitialTokenWithValue(cfg.Auth.BootstrapToken)
 		} else {
@@ -542,16 +542,21 @@ func main() {
 			fmt.Fprintln(os.Stderr)
 			fmt.Fprintln(os.Stderr, banner)
 			if cfg.Auth.ForceBootstrap {
-				fmt.Fprintln(os.Stderr, cyan+bold+"  TOKEN RESET - ALL PREVIOUS TOKENS DELETED"+reset)
+				fmt.Fprintln(os.Stderr, cyan+bold+"  RECOVERY TOKEN ADDED - EXISTING TOKENS PRESERVED"+reset)
 			} else {
 				fmt.Fprintln(os.Stderr, cyan+bold+"  FIRST RUN - INITIAL ADMIN TOKEN GENERATED"+reset)
 			}
 			fmt.Fprintln(os.Stderr, banner)
-			fmt.Fprintln(os.Stderr, yellow+bold+"  Initial admin API token: "+bootstrapToken+reset)
+			fmt.Fprintln(os.Stderr, yellow+bold+"  Admin API token: "+bootstrapToken+reset)
 			fmt.Fprintln(os.Stderr, banner)
 			fmt.Fprintln(os.Stderr, cyan+"  SAVE THIS TOKEN! It will not be shown again."+reset)
 			fmt.Fprintln(os.Stderr, cyan+"  Use this token to login to the web UI or API."+reset)
-			fmt.Fprintln(os.Stderr, cyan+"  You can create additional tokens after logging in."+reset)
+			if cfg.Auth.ForceBootstrap {
+				fmt.Fprintln(os.Stderr, cyan+"  Use the API to revoke any tokens you no longer need."+reset)
+				fmt.Fprintln(os.Stderr, cyan+"  Remove ARC_AUTH_FORCE_BOOTSTRAP after recovery."+reset)
+			} else {
+				fmt.Fprintln(os.Stderr, cyan+"  You can create additional tokens after logging in."+reset)
+			}
 			fmt.Fprintln(os.Stderr, banner)
 			fmt.Fprintln(os.Stderr)
 		}

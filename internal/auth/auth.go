@@ -854,29 +854,28 @@ func (am *AuthManager) EnsureInitialTokenWithValue(tokenValue string) (string, e
 	return token, nil
 }
 
-// ForceResetWithToken deletes all existing tokens and creates a new admin token with the provided value.
+// ForceAddRecoveryToken adds a new admin token with the provided value without removing existing tokens.
 // This is a recovery path for when the admin token has been lost. Requires ARC_AUTH_FORCE_BOOTSTRAP=true.
-func (am *AuthManager) ForceResetWithToken(tokenValue string) (string, error) {
+// Existing tokens are preserved so that legitimate admins can still revoke the recovery token if it was
+// injected by a bad actor.
+func (am *AuthManager) ForceAddRecoveryToken(tokenValue string) (string, error) {
 	if len(tokenValue) < 32 {
 		return "", fmt.Errorf("bootstrap token must be at least 32 characters long")
 	}
 
-	am.logger.Warn().Msg("ARC_AUTH_FORCE_BOOTSTRAP=true: deleting all existing tokens and creating new admin token")
+	am.logger.Warn().Msg("ARC_AUTH_FORCE_BOOTSTRAP=true: adding recovery admin token (existing tokens preserved)")
 
-	_, err := am.db.Exec("DELETE FROM api_tokens")
+	token, err := am.CreateTokenWithValue(tokenValue, "arc-recovery", "Recovery admin token added via ARC_AUTH_FORCE_BOOTSTRAP", "read,write,delete,admin", nil)
 	if err != nil {
-		return "", fmt.Errorf("failed to delete existing tokens: %w", err)
-	}
-
-	// Invalidate cache so deleted tokens can't be used
-	am.InvalidateCache()
-
-	token, err := am.CreateTokenWithValue(tokenValue, "admin", "Admin token reset via ARC_AUTH_FORCE_BOOTSTRAP", "read,write,delete,admin", nil)
-	if err != nil {
+		// If a recovery token with this name already exists, rotate it to the new value
+		if strings.Contains(err.Error(), "already exists") {
+			am.logger.Warn().Msg("Recovery token already exists — please delete it via the API after regaining access")
+			return "", nil
+		}
 		return "", err
 	}
 
-	am.logger.Warn().Msg("All tokens deleted and new admin token created via ARC_AUTH_FORCE_BOOTSTRAP")
+	am.logger.Warn().Msg("Recovery admin token created; existing tokens untouched — use the API to revoke any unwanted tokens after regaining access")
 
 	return token, nil
 }
