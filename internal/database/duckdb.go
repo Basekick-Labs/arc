@@ -560,6 +560,17 @@ func (d *DuckDB) QueryWithProfileContext(ctx context.Context, query string) (*sq
 		}
 		return rows, conn, nil, nil
 	}
+	if err := os.Chmod(tmpFile.Name(), 0600); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		// Fall back to regular query
+		rows, err := conn.QueryContext(ctx, query)
+		if err != nil {
+			conn.Close()
+			return nil, nil, nil, err
+		}
+		return rows, conn, nil, nil
+	}
 	profilePath := tmpFile.Name()
 	tmpFile.Close()
 	defer os.Remove(profilePath)

@@ -146,6 +146,11 @@ func (m *Manager) streamRestoreFile(ctx context.Context, srcPath, destPath strin
 	if err != nil {
 		return 0, fmt.Errorf("failed to create temp file: %w", err)
 	}
+	if err := os.Chmod(tmpFile.Name(), 0600); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return 0, fmt.Errorf("failed to secure temp file: %w", err)
+	}
 	tmpPath := tmpFile.Name()
 	defer os.Remove(tmpPath)
 	defer tmpFile.Close()
