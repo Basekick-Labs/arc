@@ -109,10 +109,12 @@ type LogConfig struct {
 }
 
 type AuthConfig struct {
-	Enabled      bool
-	DBPath       string // SQLite database path (shared with WAL, retention, etc.)
-	CacheTTL     int    // Token cache TTL in seconds
-	MaxCacheSize int    // Maximum number of cached tokens
+	Enabled        bool
+	DBPath         string // SQLite database path (shared with WAL, retention, etc.)
+	CacheTTL       int    // Token cache TTL in seconds
+	MaxCacheSize   int    // Maximum number of cached tokens
+	BootstrapToken string // Pre-set admin token value (env: ARC_AUTH_BOOTSTRAP_TOKEN). Used on first run instead of generating a random token.
+	ForceBootstrap bool   // Add a recovery admin token without removing existing tokens (env: ARC_AUTH_FORCE_BOOTSTRAP). Recovery path when locked out.
 }
 
 type CompactionConfig struct {
@@ -444,10 +446,12 @@ func Load() (*Config, error) {
 			Format: v.GetString("log.format"),
 		},
 		Auth: AuthConfig{
-			Enabled:      v.GetBool("auth.enabled"),
-			DBPath:       v.GetString("auth.db_path"),
-			CacheTTL:     v.GetInt("auth.cache_ttl"),
-			MaxCacheSize: v.GetInt("auth.max_cache_size"),
+			Enabled:        v.GetBool("auth.enabled"),
+			DBPath:         v.GetString("auth.db_path"),
+			CacheTTL:       v.GetInt("auth.cache_ttl"),
+			MaxCacheSize:   v.GetInt("auth.max_cache_size"),
+			BootstrapToken: v.GetString("auth.bootstrap_token"),
+			ForceBootstrap: v.GetBool("auth.force_bootstrap"),
 		},
 		Compaction: CompactionConfig{
 			Enabled:                   v.GetBool("compaction.enabled"),

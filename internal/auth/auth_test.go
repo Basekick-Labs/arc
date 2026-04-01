@@ -612,3 +612,245 @@ func sha256Sum(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(h[:])
 }
+
+// TestCreateTokenWithValue tests creating a token with a user-supplied value
+func TestCreateTokenWithValue(t *testing.T) {
+	am, cleanup := setupTestAuthManager(t)
+	defer cleanup()
+
+	validToken := "this-is-a-valid-token-value-with-enough-length"
+
+	t.Run("creates token with provided value", func(t *testing.T) {
+		got, err := am.CreateTokenWithValue(validToken, "bootstrap", "Bootstrap token", "read,write,admin", nil)
+		if err != nil {
+			t.Fatalf("CreateTokenWithValue failed: %v", err)
+		}
+		if got != validToken {
+			t.Errorf("returned token = %q, want %q", got, validToken)
+		}
+
+		// Token must be immediately verifiable
+		info := am.VerifyToken(validToken)
+		if info == nil {
+			t.Fatal("token not verifiable after creation")
+		}
+		if info.Name != "bootstrap" {
+			t.Errorf("name = %q, want %q", info.Name, "bootstrap")
+		}
+	})
+
+	t.Run("rejects token shorter than 32 chars", func(t *testing.T) {
+		_, err := am.CreateTokenWithValue("tooshort", "short", "desc", "read", nil)
+		if err == nil {
+			t.Error("expected error for token shorter than 32 chars")
+		}
+	})
+
+	t.Run("rejects duplicate name", func(t *testing.T) {
+		_, err := am.CreateTokenWithValue(validToken+"2", "bootstrap", "dup", "read", nil)
+		if err == nil {
+			t.Error("expected error for duplicate token name")
+		}
+	})
+
+	t.Run("default permissions are read,write when empty", func(t *testing.T) {
+		got, err := am.CreateTokenWithValue("another-valid-token-value-long-enough-here", "default-perms", "desc", "", nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		info := am.VerifyToken(got)
+		if info == nil {
+			t.Fatal("token not verifiable")
+		}
+		found := false
+		for _, p := range info.Permissions {
+			if p == "read" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected default read permission, got %v", info.Permissions)
+		}
+	})
+}
+
+// TestEnsureInitialTokenWithValue tests bootstrap token on first run
+func TestEnsureInitialTokenWithValue(t *testing.T) {
+	validToken := "bootstrap-token-value-long-enough-for-validation"
+
+	t.Run("creates token on first run with provided value", func(t *testing.T) {
+		am, cleanup := setupTestAuthManager(t)
+		defer cleanup()
+
+		got, err := am.EnsureInitialTokenWithValue(validToken)
+		if err != nil {
+			t.Fatalf("EnsureInitialTokenWithValue failed: %v", err)
+		}
+		if got != validToken {
+			t.Errorf("returned token = %q, want %q", got, validToken)
+		}
+
+		info := am.VerifyToken(validToken)
+		if info == nil {
+			t.Fatal("token not verifiable after creation")
+		}
+		if !am.HasPermission(info, "admin") {
+			t.Error("initial token should have admin permission")
+		}
+	})
+
+	t.Run("no-op when tokens already exist", func(t *testing.T) {
+		am, cleanup := setupTestAuthManager(t)
+		defer cleanup()
+
+		// Pre-create a token
+		_, err := am.CreateToken("existing", "pre-existing token", "admin", nil)
+		if err != nil {
+			t.Fatalf("pre-create failed: %v", err)
+		}
+
+		got, err := am.EnsureInitialTokenWithValue(validToken)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != "" {
+			t.Errorf("expected empty string (no-op), got %q", got)
+		}
+
+		// Pre-existing token must still be valid
+		tokens, _ := am.ListTokens()
+		if len(tokens) != 1 {
+			t.Errorf("expected 1 token, got %d", len(tokens))
+		}
+		if tokens[0].Name != "existing" {
+			t.Errorf("expected existing token to be unchanged, got %q", tokens[0].Name)
+		}
+	})
+
+	t.Run("rejects token shorter than 32 chars", func(t *testing.T) {
+		am, cleanup := setupTestAuthManager(t)
+		defer cleanup()
+
+		_, err := am.EnsureInitialTokenWithValue("short")
+		if err == nil {
+			t.Error("expected error for token shorter than 32 chars")
+		}
+	})
+
+	t.Run("concurrent calls are safe (no duplicate admin token)", func(t *testing.T) {
+		am, cleanup := setupTestAuthManager(t)
+		defer cleanup()
+
+		const goroutines = 10
+		results := make(chan error, goroutines)
+		for i := 0; i < goroutines; i++ {
+			go func() {
+				_, err := am.EnsureInitialTokenWithValue(validToken)
+				results <- err
+			}()
+		}
+
+		for i := 0; i < goroutines; i++ {
+			if err := <-results; err != nil {
+				t.Errorf("concurrent EnsureInitialTokenWithValue error: %v", err)
+			}
+		}
+
+		// Exactly one token should exist
+		tokens, err := am.ListTokens()
+		if err != nil {
+			t.Fatalf("ListTokens failed: %v", err)
+		}
+		if len(tokens) != 1 {
+			t.Errorf("expected 1 token after concurrent calls, got %d", len(tokens))
+		}
+	})
+}
+
+// TestForceAddRecoveryToken tests the recovery token path
+func TestForceAddRecoveryToken(t *testing.T) {
+	recoveryToken := "recovery-token-value-long-enough-for-validation"
+
+	t.Run("adds recovery token without removing existing tokens", func(t *testing.T) {
+		am, cleanup := setupTestAuthManager(t)
+		defer cleanup()
+
+		// Create an existing admin token
+		existingToken, err := am.CreateToken("existing-admin", "pre-existing", "read,write,admin", nil)
+		if err != nil {
+			t.Fatalf("pre-create failed: %v", err)
+		}
+
+		got, err := am.ForceAddRecoveryToken(recoveryToken)
+		if err != nil {
+			t.Fatalf("ForceAddRecoveryToken failed: %v", err)
+		}
+		if got != recoveryToken {
+			t.Errorf("returned token = %q, want %q", got, recoveryToken)
+		}
+
+		// Both tokens must be valid
+		if am.VerifyToken(existingToken) == nil {
+			t.Error("existing token should still be valid after ForceAddRecoveryToken")
+		}
+		if am.VerifyToken(recoveryToken) == nil {
+			t.Error("recovery token should be verifiable")
+		}
+
+		// Two tokens total
+		tokens, _ := am.ListTokens()
+		if len(tokens) != 2 {
+			t.Errorf("expected 2 tokens, got %d", len(tokens))
+		}
+	})
+
+	t.Run("recovery token has admin permissions", func(t *testing.T) {
+		am, cleanup := setupTestAuthManager(t)
+		defer cleanup()
+
+		_, err := am.ForceAddRecoveryToken(recoveryToken)
+		if err != nil {
+			t.Fatalf("ForceAddRecoveryToken failed: %v", err)
+		}
+
+		info := am.VerifyToken(recoveryToken)
+		if info == nil {
+			t.Fatal("recovery token not verifiable")
+		}
+		if !am.HasPermission(info, "admin") {
+			t.Error("recovery token should have admin permission")
+		}
+		if info.Name != "arc-recovery" {
+			t.Errorf("recovery token name = %q, want %q", info.Name, "arc-recovery")
+		}
+	})
+
+	t.Run("no-op on duplicate recovery token (idempotent restarts)", func(t *testing.T) {
+		am, cleanup := setupTestAuthManager(t)
+		defer cleanup()
+
+		_, err := am.ForceAddRecoveryToken(recoveryToken)
+		if err != nil {
+			t.Fatalf("first ForceAddRecoveryToken failed: %v", err)
+		}
+
+		// Second call with same token name should be a no-op, not an error
+		got, err := am.ForceAddRecoveryToken(recoveryToken)
+		if err != nil {
+			t.Fatalf("second ForceAddRecoveryToken should not error: %v", err)
+		}
+		if got != "" {
+			t.Errorf("expected empty string on duplicate (no-op), got %q", got)
+		}
+	})
+
+	t.Run("rejects token shorter than 32 chars", func(t *testing.T) {
+		am, cleanup := setupTestAuthManager(t)
+		defer cleanup()
+
+		_, err := am.ForceAddRecoveryToken("short")
+		if err == nil {
+			t.Error("expected error for token shorter than 32 chars")
+		}
+	})
+}
