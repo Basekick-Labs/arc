@@ -338,3 +338,23 @@ Fixed a TOCTOU (time-of-check/time-of-use) race in the initial admin token creat
 ### Token Expiration Display Fix
 
 Fixed non-expiring admin tokens incorrectly showing as "Expired" in the UI. The `TokenInfo.ExpiresAt` field used Go's `time.Time` zero value (`0001-01-01T00:00:00Z`) for tokens without expiration, which was serialized to JSON and interpreted as an expired date. Changed `ExpiresAt` from `time.Time` to `*time.Time` so non-expiring tokens serialize as `null` and are correctly displayed as "Never expires".
+
+## Helm Chart
+
+### Deployment Strategy Defaults to Recreate
+
+Changed the default Kubernetes deployment update strategy from `RollingUpdate` (Kubernetes default) to `Recreate`. With a single replica and a `ReadWriteOnce` PVC, `RollingUpdate` deadlocks: the new pod cannot attach the volume until the old pod terminates, but the rollout waits for the new pod to be healthy first.
+
+`Recreate` terminates the old pod first, then starts the new one, avoiding the deadlock entirely.
+
+The strategy is configurable via `values.yaml`:
+
+```yaml
+updateStrategy:
+  type: Recreate   # default; change to RollingUpdate for shared object storage deployments
+  # rollingUpdate:
+  #   maxSurge: 1
+  #   maxUnavailable: 0
+```
+
+Users on shared object storage (S3/Azure/MinIO) with Arc Enterprise clustering can override to `RollingUpdate` and tune `maxSurge`/`maxUnavailable` as needed.
