@@ -623,11 +623,6 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 	if err != nil {
 		return 0, fmt.Errorf("failed to create temp file: %w", err)
 	}
-	if err := os.Chmod(tempFile.Name(), 0600); err != nil {
-		tempFile.Close()
-		os.Remove(tempFile.Name())
-		return 0, fmt.Errorf("failed to secure temp file: %w", err)
-	}
 	tempPath := tempFile.Name()
 	tempFile.Close()
 	defer os.Remove(tempPath)

@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"regexp"
 	"runtime"
 	"runtime/pprof"
 	"strings"
@@ -21,8 +20,6 @@ import (
 	// Import DuckDB driver for subprocess
 	_ "github.com/duckdb/duckdb-go/v2"
 )
-
-var memLimitRe = regexp.MustCompile(`^\d+(\.\d+)?\s*(B|KB|MB|GB|TB|%)?$`)
 
 // SubprocessJobConfig is the serializable configuration passed to the subprocess.
 // It contains all information needed to run a compaction job in isolation.
@@ -93,9 +90,6 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 	// Set DuckDB memory limit from config.
 	// This prevents OOM on servers without swap by forcing DuckDB to spill to disk.
 	if config.MemoryLimit != "" {
-		if !memLimitRe.MatchString(config.MemoryLimit) {
-			return nil, fmt.Errorf("invalid memory_limit value: %q", config.MemoryLimit)
-		}
 		if _, err := db.Exec(fmt.Sprintf("SET memory_limit='%s'", config.MemoryLimit)); err != nil {
 			logger.Warn().Err(err).Str("limit", config.MemoryLimit).Msg("Failed to set DuckDB memory limit")
 		} else {
