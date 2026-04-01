@@ -3,11 +3,14 @@ package config
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"runtime"
 	"strings"
 
 	"github.com/spf13/viper"
 )
+
+var memoryLimitRe = regexp.MustCompile(`^\d+(\.\d+)?\s*(B|KB|MB|GB|TB|%)?$`)
 
 // Config holds all configuration for Arc
 type Config struct {
@@ -603,6 +606,10 @@ func Load() (*Config, error) {
 			Enabled:     v.GetBool("query_management.enabled"),
 			HistorySize: v.GetInt("query_management.history_size"),
 		},
+	}
+
+	if cfg.Database.MemoryLimit != "" && !memoryLimitRe.MatchString(cfg.Database.MemoryLimit) {
+		return nil, fmt.Errorf("invalid database.memory_limit value: %q", cfg.Database.MemoryLimit)
 	}
 
 	return cfg, nil
