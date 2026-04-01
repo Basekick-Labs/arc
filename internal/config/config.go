@@ -114,7 +114,7 @@ type AuthConfig struct {
 	CacheTTL       int    // Token cache TTL in seconds
 	MaxCacheSize   int    // Maximum number of cached tokens
 	BootstrapToken string // Pre-set admin token value (env: ARC_AUTH_BOOTSTRAP_TOKEN). Used on first run instead of generating a random token.
-	ForceBootstrap bool   // Delete all tokens and recreate admin with BootstrapToken (env: ARC_AUTH_FORCE_BOOTSTRAP). Recovery path when locked out.
+	ForceBootstrap bool   // Add a recovery admin token without removing existing tokens (env: ARC_AUTH_FORCE_BOOTSTRAP). Recovery path when locked out.
 }
 
 type CompactionConfig struct {

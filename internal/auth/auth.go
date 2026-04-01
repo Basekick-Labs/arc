@@ -372,6 +372,33 @@ func generateToken() (string, error) {
 	return base64.URLEncoding.EncodeToString(bytes), nil
 }
 
+// insertToken inserts a pre-hashed token into the database.
+// It is the shared implementation used by CreateToken and CreateTokenWithValue.
+func (am *AuthManager) insertToken(tokenValue, hash, prefix, name, description, permissions string, expiresAt *time.Time) error {
+	if permissions == "" {
+		permissions = "read,write"
+	}
+
+	var expiresAtVal interface{}
+	if expiresAt != nil {
+		expiresAtVal = *expiresAt
+	}
+
+	_, err := am.db.Exec(`
+		INSERT INTO api_tokens (name, token_hash, token_prefix, description, permissions, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, name, hash, prefix, description, permissions, expiresAtVal)
+
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return fmt.Errorf("token with name '%s' already exists", name)
+		}
+		return fmt.Errorf("failed to create token: %w", err)
+	}
+
+	return nil
+}
+
 // CreateToken creates a new API token
 func (am *AuthManager) CreateToken(name, description, permissions string, expiresAt *time.Time) (string, error) {
 	token, err := generateToken()
@@ -384,28 +411,8 @@ func (am *AuthManager) CreateToken(name, description, permissions string, expire
 		return "", fmt.Errorf("failed to hash token: %w", err)
 	}
 
-	// Generate prefix for O(1) lookup optimization
-	prefix := tokenPrefix(token)
-
-	if permissions == "" {
-		permissions = "read,write"
-	}
-
-	var expiresAtVal interface{}
-	if expiresAt != nil {
-		expiresAtVal = *expiresAt
-	}
-
-	_, err = am.db.Exec(`
-		INSERT INTO api_tokens (name, token_hash, token_prefix, description, permissions, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, name, hash, prefix, description, permissions, expiresAtVal)
-
-	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
-			return "", fmt.Errorf("token with name '%s' already exists", name)
-		}
-		return "", fmt.Errorf("failed to create token: %w", err)
+	if err := am.insertToken(token, hash, tokenPrefix(token), name, description, permissions, expiresAt); err != nil {
+		return "", err
 	}
 
 	am.logger.Info().
@@ -758,30 +765,49 @@ func (am *AuthManager) RotateToken(id int64) (string, error) {
 	return token, nil
 }
 
+// ensureFirstToken is the shared implementation for EnsureInitialToken and EnsureInitialTokenWithValue.
+// It uses INSERT OR IGNORE to atomically create a token only when none exist, avoiding a TOCTOU race.
+// Returns the token value if a new token was created, or empty string if one already existed.
+func (am *AuthManager) ensureFirstToken(tokenValue, description string) (string, error) {
+	hash, err := am.hashToken(tokenValue)
+	if err != nil {
+		return "", fmt.Errorf("failed to hash token: %w", err)
+	}
+
+	// Use a single atomic statement: INSERT only if the table is empty.
+	// This eliminates the COUNT→INSERT race when multiple nodes start simultaneously.
+	result, err := am.db.Exec(`
+		INSERT OR IGNORE INTO api_tokens (name, token_hash, token_prefix, description, permissions)
+		SELECT 'admin', ?, ?, ?, 'read,write,delete,admin'
+		WHERE NOT EXISTS (SELECT 1 FROM api_tokens)
+	`, hash, tokenPrefix(tokenValue), description)
+	if err != nil {
+		return "", fmt.Errorf("failed to create initial token: %w", err)
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return "", nil // Tokens already existed — no-op
+	}
+
+	return tokenValue, nil
+}
+
 // EnsureInitialToken creates an admin token if no tokens exist
 func (am *AuthManager) EnsureInitialToken() (string, error) {
-	var count int
-	err := am.db.QueryRow("SELECT COUNT(*) FROM api_tokens").Scan(&count)
+	token, err := generateToken()
+	if err != nil {
+		return "", fmt.Errorf("failed to generate token: %w", err)
+	}
+
+	result, err := am.ensureFirstToken(token, "Initial admin token (auto-generated on first run)")
 	if err != nil {
 		return "", err
 	}
-
-	if count > 0 {
-		return "", nil // Tokens already exist
+	if result != "" {
+		am.logger.Info().Msg("First run detected - created initial admin token")
 	}
-
-	am.logger.Info().Msg("First run detected - creating initial admin token")
-
-	token, err := am.CreateToken("admin", "Initial admin token (auto-generated on first run)", "read,write,delete,admin", nil)
-	if err != nil {
-		// Race condition - another process created it
-		if strings.Contains(err.Error(), "already exists") {
-			return "", nil
-		}
-		return "", err
-	}
-
-	return token, nil
+	return result, nil
 }
 
 // CreateTokenWithValue creates a new API token using a caller-provided token value instead of generating one.
@@ -796,27 +822,8 @@ func (am *AuthManager) CreateTokenWithValue(tokenValue, name, description, permi
 		return "", fmt.Errorf("failed to hash token: %w", err)
 	}
 
-	prefix := tokenPrefix(tokenValue)
-
-	if permissions == "" {
-		permissions = "read,write"
-	}
-
-	var expiresAtVal interface{}
-	if expiresAt != nil {
-		expiresAtVal = *expiresAt
-	}
-
-	_, err = am.db.Exec(`
-		INSERT INTO api_tokens (name, token_hash, token_prefix, description, permissions, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, name, hash, prefix, description, permissions, expiresAtVal)
-
-	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
-			return "", fmt.Errorf("token with name '%s' already exists", name)
-		}
-		return "", fmt.Errorf("failed to create token: %w", err)
+	if err := am.insertToken(tokenValue, hash, tokenPrefix(tokenValue), name, description, permissions, expiresAt); err != nil {
+		return "", err
 	}
 
 	am.logger.Info().
@@ -830,28 +837,20 @@ func (am *AuthManager) CreateTokenWithValue(tokenValue, name, description, permi
 // EnsureInitialTokenWithValue creates the initial admin token using a caller-provided value.
 // If tokens already exist, this is a no-op (returns empty string).
 func (am *AuthManager) EnsureInitialTokenWithValue(tokenValue string) (string, error) {
-	var count int
-	err := am.db.QueryRow("SELECT COUNT(*) FROM api_tokens").Scan(&count)
+	if len(tokenValue) < 32 {
+		return "", fmt.Errorf("bootstrap token must be at least 32 characters long")
+	}
+
+	result, err := am.ensureFirstToken(tokenValue, "Initial admin token (set via ARC_AUTH_BOOTSTRAP_TOKEN)")
 	if err != nil {
 		return "", err
 	}
-
-	if count > 0 {
+	if result == "" {
 		am.logger.Debug().Msg("ARC_AUTH_BOOTSTRAP_TOKEN set but tokens already exist — skipping (no-op)")
-		return "", nil
+	} else {
+		am.logger.Info().Msg("First run detected - created initial admin token from ARC_AUTH_BOOTSTRAP_TOKEN")
 	}
-
-	am.logger.Info().Msg("First run detected - creating initial admin token from ARC_AUTH_BOOTSTRAP_TOKEN")
-
-	token, err := am.CreateTokenWithValue(tokenValue, "admin", "Initial admin token (set via ARC_AUTH_BOOTSTRAP_TOKEN)", "read,write,delete,admin", nil)
-	if err != nil {
-		if strings.Contains(err.Error(), "already exists") {
-			return "", nil
-		}
-		return "", err
-	}
-
-	return token, nil
+	return result, nil
 }
 
 // ForceAddRecoveryToken adds a new admin token with the provided value without removing existing tokens.
@@ -867,9 +866,10 @@ func (am *AuthManager) ForceAddRecoveryToken(tokenValue string) (string, error) 
 
 	token, err := am.CreateTokenWithValue(tokenValue, "arc-recovery", "Recovery admin token added via ARC_AUTH_FORCE_BOOTSTRAP", "read,write,delete,admin", nil)
 	if err != nil {
-		// If a recovery token with this name already exists, rotate it to the new value
 		if strings.Contains(err.Error(), "already exists") {
-			am.logger.Warn().Msg("Recovery token already exists — please delete it via the API after regaining access")
+			// Recovery token already exists from a previous restart — no-op, the caller
+			// still holds the token value they provided and can use it.
+			am.logger.Warn().Msg("Recovery token already exists — no-op; use the API to revoke it after regaining access")
 			return "", nil
 		}
 		return "", err
