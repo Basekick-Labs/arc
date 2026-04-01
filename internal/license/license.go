@@ -100,7 +100,7 @@ func (l *License) CanUseRetentionScheduler() bool {
 }
 
 // CanUseTieredStorage returns true if the license allows tiered storage
-// Requires enterprise license with the tiered_storage feature
+// Requires license with tiered_storage feature enabled
 func (l *License) CanUseTieredStorage() bool {
 	return l.HasFeature(FeatureTieredStorage)
 }
