@@ -516,10 +516,21 @@ func main() {
 			log.Warn().Err(err).Str("path", cfg.Auth.DBPath).Msg("Failed to set database file permissions")
 		}
 
-		// Create initial admin token if this is first run
-		if token, err := authManager.EnsureInitialToken(); err != nil {
-			log.Error().Err(err).Msg("Failed to create initial admin token")
-		} else if token != "" {
+		// Create initial admin token on first run.
+		// ARC_AUTH_BOOTSTRAP_TOKEN: use a known token value instead of generating a random one.
+		// ARC_AUTH_FORCE_BOOTSTRAP: wipe all tokens and recreate admin (recovery path).
+		var bootstrapToken string
+		var bootstrapErr error
+		if cfg.Auth.ForceBootstrap && cfg.Auth.BootstrapToken != "" {
+			bootstrapToken, bootstrapErr = authManager.ForceResetWithToken(cfg.Auth.BootstrapToken)
+		} else if cfg.Auth.BootstrapToken != "" {
+			bootstrapToken, bootstrapErr = authManager.EnsureInitialTokenWithValue(cfg.Auth.BootstrapToken)
+		} else {
+			bootstrapToken, bootstrapErr = authManager.EnsureInitialToken()
+		}
+		if bootstrapErr != nil {
+			log.Error().Err(bootstrapErr).Msg("Failed to create initial admin token")
+		} else if bootstrapToken != "" {
 			// Print colorized banner to stderr (bypasses structured logging)
 			const (
 				cyan   = "\033[96m"
@@ -530,9 +541,13 @@ func main() {
 			banner := cyan + "======================================================================" + reset
 			fmt.Fprintln(os.Stderr)
 			fmt.Fprintln(os.Stderr, banner)
-			fmt.Fprintln(os.Stderr, cyan+bold+"  FIRST RUN - INITIAL ADMIN TOKEN GENERATED"+reset)
+			if cfg.Auth.ForceBootstrap {
+				fmt.Fprintln(os.Stderr, cyan+bold+"  TOKEN RESET - ALL PREVIOUS TOKENS DELETED"+reset)
+			} else {
+				fmt.Fprintln(os.Stderr, cyan+bold+"  FIRST RUN - INITIAL ADMIN TOKEN GENERATED"+reset)
+			}
 			fmt.Fprintln(os.Stderr, banner)
-			fmt.Fprintln(os.Stderr, yellow+bold+"  Initial admin API token: "+token+reset)
+			fmt.Fprintln(os.Stderr, yellow+bold+"  Initial admin API token: "+bootstrapToken+reset)
 			fmt.Fprintln(os.Stderr, banner)
 			fmt.Fprintln(os.Stderr, cyan+"  SAVE THIS TOKEN! It will not be shown again."+reset)
 			fmt.Fprintln(os.Stderr, cyan+"  Use this token to login to the web UI or API."+reset)

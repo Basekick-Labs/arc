@@ -784,6 +784,103 @@ func (am *AuthManager) EnsureInitialToken() (string, error) {
 	return token, nil
 }
 
+// CreateTokenWithValue creates a new API token using a caller-provided token value instead of generating one.
+// The value must be at least 32 characters long to ensure adequate entropy.
+func (am *AuthManager) CreateTokenWithValue(tokenValue, name, description, permissions string, expiresAt *time.Time) (string, error) {
+	if len(tokenValue) < 32 {
+		return "", fmt.Errorf("bootstrap token must be at least 32 characters long")
+	}
+
+	hash, err := am.hashToken(tokenValue)
+	if err != nil {
+		return "", fmt.Errorf("failed to hash token: %w", err)
+	}
+
+	prefix := tokenPrefix(tokenValue)
+
+	if permissions == "" {
+		permissions = "read,write"
+	}
+
+	var expiresAtVal interface{}
+	if expiresAt != nil {
+		expiresAtVal = *expiresAt
+	}
+
+	_, err = am.db.Exec(`
+		INSERT INTO api_tokens (name, token_hash, token_prefix, description, permissions, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, name, hash, prefix, description, permissions, expiresAtVal)
+
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return "", fmt.Errorf("token with name '%s' already exists", name)
+		}
+		return "", fmt.Errorf("failed to create token: %w", err)
+	}
+
+	am.logger.Info().
+		Str("name", name).
+		Str("permissions", permissions).
+		Msg("Created API token with provided value")
+
+	return tokenValue, nil
+}
+
+// EnsureInitialTokenWithValue creates the initial admin token using a caller-provided value.
+// If tokens already exist, this is a no-op (returns empty string).
+func (am *AuthManager) EnsureInitialTokenWithValue(tokenValue string) (string, error) {
+	var count int
+	err := am.db.QueryRow("SELECT COUNT(*) FROM api_tokens").Scan(&count)
+	if err != nil {
+		return "", err
+	}
+
+	if count > 0 {
+		am.logger.Debug().Msg("ARC_AUTH_BOOTSTRAP_TOKEN set but tokens already exist — skipping (no-op)")
+		return "", nil
+	}
+
+	am.logger.Info().Msg("First run detected - creating initial admin token from ARC_AUTH_BOOTSTRAP_TOKEN")
+
+	token, err := am.CreateTokenWithValue(tokenValue, "admin", "Initial admin token (set via ARC_AUTH_BOOTSTRAP_TOKEN)", "read,write,delete,admin", nil)
+	if err != nil {
+		if strings.Contains(err.Error(), "already exists") {
+			return "", nil
+		}
+		return "", err
+	}
+
+	return token, nil
+}
+
+// ForceResetWithToken deletes all existing tokens and creates a new admin token with the provided value.
+// This is a recovery path for when the admin token has been lost. Requires ARC_AUTH_FORCE_BOOTSTRAP=true.
+func (am *AuthManager) ForceResetWithToken(tokenValue string) (string, error) {
+	if len(tokenValue) < 32 {
+		return "", fmt.Errorf("bootstrap token must be at least 32 characters long")
+	}
+
+	am.logger.Warn().Msg("ARC_AUTH_FORCE_BOOTSTRAP=true: deleting all existing tokens and creating new admin token")
+
+	_, err := am.db.Exec("DELETE FROM api_tokens")
+	if err != nil {
+		return "", fmt.Errorf("failed to delete existing tokens: %w", err)
+	}
+
+	// Invalidate cache so deleted tokens can't be used
+	am.InvalidateCache()
+
+	token, err := am.CreateTokenWithValue(tokenValue, "admin", "Admin token reset via ARC_AUTH_FORCE_BOOTSTRAP", "read,write,delete,admin", nil)
+	if err != nil {
+		return "", err
+	}
+
+	am.logger.Warn().Msg("All tokens deleted and new admin token created via ARC_AUTH_FORCE_BOOTSTRAP")
+
+	return token, nil
+}
+
 // InvalidateCache clears the token cache
 func (am *AuthManager) InvalidateCache() {
 	am.cacheMu.Lock()
