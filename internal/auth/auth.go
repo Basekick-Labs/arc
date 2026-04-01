@@ -374,7 +374,7 @@ func generateToken() (string, error) {
 
 // insertToken inserts a pre-hashed token into the database.
 // It is the shared implementation used by CreateToken and CreateTokenWithValue.
-func (am *AuthManager) insertToken(tokenValue, hash, prefix, name, description, permissions string, expiresAt *time.Time) error {
+func (am *AuthManager) insertToken(hash, prefix, name, description, permissions string, expiresAt *time.Time) error {
 	if permissions == "" {
 		permissions = "read,write"
 	}
@@ -411,7 +411,7 @@ func (am *AuthManager) CreateToken(name, description, permissions string, expire
 		return "", fmt.Errorf("failed to hash token: %w", err)
 	}
 
-	if err := am.insertToken(token, hash, tokenPrefix(token), name, description, permissions, expiresAt); err != nil {
+	if err := am.insertToken(hash, tokenPrefix(token), name, description, permissions, expiresAt); err != nil {
 		return "", err
 	}
 
@@ -822,7 +822,7 @@ func (am *AuthManager) CreateTokenWithValue(tokenValue, name, description, permi
 		return "", fmt.Errorf("failed to hash token: %w", err)
 	}
 
-	if err := am.insertToken(tokenValue, hash, tokenPrefix(tokenValue), name, description, permissions, expiresAt); err != nil {
+	if err := am.insertToken(hash, tokenPrefix(tokenValue), name, description, permissions, expiresAt); err != nil {
 		return "", err
 	}
 
