@@ -1,5 +1,5 @@
-// Arc query benchmark suite — measures query latency across a set of queries
-// to detect performance regression or improvement.
+// Query benchmark suite — measures query latency across a set of queries.
+// Supports Arc (JSON), Arc (Arrow IPC), and CrateDB.
 //
 // Presets:
 //   generic — auto-generated queries against any measurement (default)
@@ -9,6 +9,7 @@
 //   go run benchmarks/query_suite/main.go --database production --measurement cpu
 //   go run benchmarks/query_suite/main.go --target arc-arrow --database production --measurement cpu
 //   go run benchmarks/query_suite/main.go --preset logs --database logs --measurement logs
+//   go run benchmarks/query_suite/main.go --target cratedb --measurement cpu
 
 package main
 
@@ -28,13 +29,14 @@ import (
 )
 
 type Config struct {
-	Target      string // "arc" or "arc-arrow"
+	Target      string // "arc", "arc-arrow", or "cratedb"
 	Preset      string // "generic" or "logs"
 	Measurement string
 	Database    string
 	Iterations  int
 	Host        string
 	Port        int
+	CrateDBPort int
 	Token       string
 }
 
@@ -204,11 +206,63 @@ func runArcArrowQuery(cfg *Config, sql string, client *http.Client) (latencyMs f
 	return latencyMs, rows, nil
 }
 
-func runQuery(cfg *Config, q BenchmarkQuery, client *http.Client) (float64, int64, error) {
-	if cfg.Target == "arc-arrow" {
-		return runArcArrowQuery(cfg, q.SQL, client)
+// runCrateDBQuery executes a query via CrateDB's /_sql HTTP endpoint.
+func runCrateDBQuery(cfg *Config, sql string, client *http.Client) (latencyMs float64, rows int64, err error) {
+	url := fmt.Sprintf("http://%s:%d/_sql", cfg.Host, cfg.CrateDBPort)
+
+	body, _ := json.Marshal(map[string]string{"stmt": sql})
+	start := time.Now()
+
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		return 0, 0, err
 	}
-	return runArcQuery(cfg, q.SQL, client)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	latencyMs = float64(time.Since(start).Microseconds()) / 1000.0
+
+	if resp.StatusCode != 200 {
+		return latencyMs, 0, fmt.Errorf("status %d: %s", resp.StatusCode, string(respBody[:min(200, len(respBody))]))
+	}
+
+	// CrateDB response: {"cols":[...], "rows":[[...]], "rowcount": N, "duration": X}
+	// For SELECT, rowcount == number of rows returned. rows[][] contains the actual data.
+	var result struct {
+		Rows [][]interface{} `json:"rows"`
+	}
+	if err := json.Unmarshal(respBody, &result); err == nil {
+		rows = int64(len(result.Rows))
+		// For COUNT(*) queries: single row, single column — return the count value itself
+		if len(result.Rows) == 1 && len(result.Rows[0]) == 1 {
+			if count, ok := result.Rows[0][0].(float64); ok {
+				rows = int64(count)
+			}
+		}
+	}
+
+	return latencyMs, rows, nil
+}
+
+func runQuery(cfg *Config, q BenchmarkQuery, client *http.Client) (float64, int64, error) {
+	switch cfg.Target {
+	case "arc-arrow":
+		return runArcArrowQuery(cfg, q.SQL, client)
+	case "cratedb":
+		return runCrateDBQuery(cfg, q.SQL, client)
+	default:
+		return runArcQuery(cfg, q.SQL, client)
+	}
 }
 
 // genericQueries returns queries that work against any time-series measurement.
@@ -253,58 +307,107 @@ func logsQueries(m string) []BenchmarkQuery {
 	}
 }
 
+// cratedbGenericQueries returns queries equivalent to genericQueries() adapted for CrateDB SQL dialect.
+// Key differences: time is stored as BIGINT (microseconds), no time_bucket(), percentile() instead of quantile_cont().
+func cratedbGenericQueries(m string) []BenchmarkQuery {
+	return []BenchmarkQuery{
+		{"Count All", fmt.Sprintf("SELECT count(*) FROM %s", m)},
+		{"Select * LIMIT 1K", fmt.Sprintf("SELECT * FROM %s LIMIT 1000", m)},
+		{"Select * LIMIT 10K", fmt.Sprintf("SELECT * FROM %s LIMIT 10000", m)},
+		{"Select * LIMIT 100K", fmt.Sprintf("SELECT * FROM %s LIMIT 100000", m)},
+		{"Select * LIMIT 500K", fmt.Sprintf("SELECT * FROM %s LIMIT 500000", m)},
+		{"Select * LIMIT 1M", fmt.Sprintf("SELECT * FROM %s LIMIT 1000000", m)},
+		// time is BIGINT microseconds — compare against EXTRACT(EPOCH FROM ...) * 1000000
+		{"Time Range (1h)", fmt.Sprintf("SELECT * FROM %s WHERE time > EXTRACT(EPOCH FROM NOW() - INTERVAL '1 hour') * 1000000 LIMIT 10000", m)},
+		{"Time Range (24h)", fmt.Sprintf("SELECT * FROM %s WHERE time > EXTRACT(EPOCH FROM NOW() - INTERVAL '24 hours') * 1000000 LIMIT 10000", m)},
+		{"Time Range (7d)", fmt.Sprintf("SELECT * FROM %s WHERE time > EXTRACT(EPOCH FROM NOW() - INTERVAL '7 days') * 1000000 LIMIT 10000", m)},
+		// date_trunc on CAST(time/1000 AS TIMESTAMP) — CrateDB has no time_bucket()
+		{"Time Bucket (1h, 24h)", fmt.Sprintf("SELECT date_trunc('hour', CAST(%s.time/1000 AS TIMESTAMP)) AS bucket, count(*) FROM %s WHERE time > EXTRACT(EPOCH FROM NOW() - INTERVAL '24 hours') * 1000000 GROUP BY bucket ORDER BY bucket", m, m)},
+		{"Time Bucket (1h, 7d)", fmt.Sprintf("SELECT date_trunc('hour', CAST(%s.time/1000 AS TIMESTAMP)) AS bucket, count(*) FROM %s WHERE time > EXTRACT(EPOCH FROM NOW() - INTERVAL '7 days') * 1000000 GROUP BY bucket ORDER BY bucket", m, m)},
+		{"Date Trunc (day, 30d)", fmt.Sprintf("SELECT date_trunc('day', CAST(%s.time/1000 AS TIMESTAMP)) AS d, count(*) FROM %s WHERE time > EXTRACT(EPOCH FROM NOW() - INTERVAL '30 days') * 1000000 GROUP BY d ORDER BY d", m, m)},
+		// Standard aggregates — identical
+		{"SUM/AVG/MIN/MAX", fmt.Sprintf("SELECT SUM(value), AVG(value), MIN(value), MAX(value) FROM %s", m)},
+		{"Multi-column AGG", fmt.Sprintf("SELECT SUM(value), SUM(cpu_user), AVG(cpu_idle), COUNT(*) FROM %s", m)},
+		{"GROUP BY host", fmt.Sprintf("SELECT host, COUNT(*), AVG(value), MAX(cpu_user) FROM %s GROUP BY host ORDER BY COUNT(*) DESC LIMIT 100", m)},
+		{"GROUP BY host + hour", fmt.Sprintf("SELECT host, date_trunc('hour', CAST(%s.time/1000 AS TIMESTAMP)) AS h, AVG(value) FROM %s GROUP BY host, h ORDER BY h DESC LIMIT 1000", m, m)},
+		{"DISTINCT hosts", fmt.Sprintf("SELECT DISTINCT host FROM %s", m)},
+		// CrateDB uses percentile() instead of quantile_cont()
+		{"Percentile (p95)", fmt.Sprintf("SELECT percentile(value, 0.95) FROM %s", m)},
+		{"Top 10 by AVG", fmt.Sprintf("SELECT host, AVG(value) AS avg_val FROM %s GROUP BY host ORDER BY avg_val DESC LIMIT 10", m)},
+		{"HAVING filter", fmt.Sprintf("SELECT host, AVG(value) AS avg_v FROM %s GROUP BY host HAVING AVG(value) > 50 ORDER BY avg_v DESC", m)},
+	}
+}
+
 func main() {
 	cfg := Config{}
 
-	flag.StringVar(&cfg.Target, "target", "arc", "Target: arc (JSON) or arc-arrow (Arrow IPC)")
+	flag.StringVar(&cfg.Target, "target", "arc", "Target: arc (JSON), arc-arrow (Arrow IPC), or cratedb")
 	flag.StringVar(&cfg.Preset, "preset", "generic", "Query preset: generic or logs")
 	flag.StringVar(&cfg.Measurement, "measurement", "cpu", "Measurement/table name")
-	flag.StringVar(&cfg.Database, "database", "default", "Database name")
+	flag.StringVar(&cfg.Database, "database", "default", "Database name (Arc only)")
 	flag.IntVar(&cfg.Iterations, "iterations", 5, "Number of iterations per query")
 	flag.StringVar(&cfg.Host, "host", "localhost", "Server host")
-	flag.IntVar(&cfg.Port, "port", 8000, "Server port")
+	flag.IntVar(&cfg.Port, "port", 8000, "Server port (Arc)")
+	flag.IntVar(&cfg.CrateDBPort, "cratedb-port", 4200, "CrateDB HTTP port")
 	flag.Parse()
 
 	cfg.Target = strings.ToLower(cfg.Target)
 	cfg.Token = os.Getenv("ARC_TOKEN")
 
-	if cfg.Target != "arc" && cfg.Target != "arc-arrow" {
-		fmt.Printf("Unknown target: %s (use arc or arc-arrow)\n", cfg.Target)
+	switch cfg.Target {
+	case "arc", "arc-arrow", "cratedb":
+		// valid
+	default:
+		fmt.Printf("Unknown target: %s (use arc, arc-arrow, or cratedb)\n", cfg.Target)
 		os.Exit(1)
 	}
 
 	var queries []BenchmarkQuery
-	switch cfg.Preset {
-	case "generic":
-		queries = genericQueries(cfg.Measurement)
-	case "logs":
-		queries = logsQueries(cfg.Measurement)
-	default:
-		fmt.Printf("Unknown preset: %s (use generic or logs)\n", cfg.Preset)
-		os.Exit(1)
+	if cfg.Target == "cratedb" {
+		// CrateDB only supports generic preset (logs table uses different schema)
+		queries = cratedbGenericQueries(cfg.Measurement)
+	} else {
+		switch cfg.Preset {
+		case "generic":
+			queries = genericQueries(cfg.Measurement)
+		case "logs":
+			queries = logsQueries(cfg.Measurement)
+		default:
+			fmt.Printf("Unknown preset: %s (use generic or logs)\n", cfg.Preset)
+			os.Exit(1)
+		}
 	}
 
 	targetLabel := "ARC (JSON)"
-	if cfg.Target == "arc-arrow" {
+	switch cfg.Target {
+	case "arc-arrow":
 		targetLabel = "ARC (Arrow IPC)"
+	case "cratedb":
+		targetLabel = "CRATEDB"
 	}
 
 	fmt.Println("================================================================================")
 	fmt.Printf("QUERY BENCHMARK SUITE — %s\n", targetLabel)
 	fmt.Println("================================================================================")
-	fmt.Printf("Target:      http://%s:%d\n", cfg.Host, cfg.Port)
-	fmt.Printf("Database:    %s\n", cfg.Database)
+	if cfg.Target == "cratedb" {
+		fmt.Printf("Target:      http://%s:%d/_sql\n", cfg.Host, cfg.CrateDBPort)
+	} else {
+		fmt.Printf("Target:      http://%s:%d\n", cfg.Host, cfg.Port)
+		fmt.Printf("Database:    %s\n", cfg.Database)
+	}
 	fmt.Printf("Measurement: %s\n", cfg.Measurement)
-	fmt.Printf("Preset:      %s (%d queries)\n", cfg.Preset, len(queries))
+	fmt.Printf("Preset:      generic (%d queries)\n", len(queries))
 	fmt.Printf("Iterations:  %d per query\n", cfg.Iterations)
 	fmt.Println("================================================================================")
 	fmt.Println()
 
-	if cfg.Token != "" {
-		fmt.Printf("Using auth token: %s...\n\n", cfg.Token[:min(8, len(cfg.Token))])
-	} else {
-		fmt.Println("No ARC_TOKEN set — authentication may fail")
-		fmt.Println()
+	if cfg.Target != "cratedb" {
+		if cfg.Token != "" {
+			fmt.Printf("Using auth token: %s...\n\n", cfg.Token[:min(8, len(cfg.Token))])
+		} else {
+			fmt.Println("No ARC_TOKEN set — authentication may fail")
+			fmt.Println()
+		}
 	}
 
 	client := &http.Client{

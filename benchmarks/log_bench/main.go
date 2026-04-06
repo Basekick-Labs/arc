@@ -1,4 +1,4 @@
-// Log ingestion benchmark for Arc vs Elasticsearch, OpenSearch, ClickHouse, VictoriaLogs, Loki, Quickwit
+// Log ingestion benchmark for Arc vs Elasticsearch, OpenSearch, ClickHouse, VictoriaLogs, Loki, Quickwit, CrateDB
 // Usage: go run benchmarks/log_bench/main.go [flags]
 //
 // Examples:
@@ -9,6 +9,11 @@
 //   go run benchmarks/log_bench/main.go --target victorialogs --batch-size 1000
 //   go run benchmarks/log_bench/main.go --target loki --duration 120
 //   go run benchmarks/log_bench/main.go --target quickwit --compress gzip
+//   go run benchmarks/log_bench/main.go --target cratedb --workers 20 --batch-size 500
+//
+// CrateDB setup (run once before benchmarking):
+//   curl -X POST http://localhost:4200/_sql -H 'Content-Type: application/json' \
+//     -d '{"stmt":"CREATE TABLE IF NOT EXISTS logs (ts BIGINT, level TEXT, service TEXT, host TEXT, request_id TEXT, trace_id TEXT, method TEXT, path TEXT, status_code INTEGER, latency_ms DOUBLE PRECISION, user_id TEXT, message TEXT, error TEXT) WITH (number_of_replicas = 0)"}'
 
 package main
 
@@ -45,6 +50,7 @@ const (
 	TargetVictoriaLogs     = "victorialogs"
 	TargetLoki             = "loki"
 	TargetQuickwit         = "quickwit"
+	TargetCrateDB          = "cratedb"
 )
 
 // Default ports per target
@@ -57,6 +63,7 @@ var defaultPorts = map[string]int{
 	TargetVictoriaLogs:     9428,
 	TargetLoki:             3100,
 	TargetQuickwit:         7280,
+	TargetCrateDB:          4200,
 }
 
 // Success status codes per target
@@ -69,6 +76,7 @@ var successCodes = map[string]int{
 	TargetVictoriaLogs:     200,
 	TargetLoki:             204,
 	TargetQuickwit:         200,
+	TargetCrateDB:          200,
 }
 
 type Config struct {
@@ -473,6 +481,22 @@ func formatForClickHouse(records []LogRecord, compress string, zstdEncoder *zstd
 	return compressData(buf.Bytes(), compress, zstdEncoder)
 }
 
+func formatForCrateDB(records []LogRecord, compress string, zstdEncoder *zstd.Encoder) []byte {
+	bulkArgs := make([][]interface{}, len(records))
+	for i, r := range records {
+		bulkArgs[i] = []interface{}{
+			r.Timestamp, r.Level, r.Service, r.Host, r.RequestID, r.TraceID,
+			r.Method, r.Path, r.StatusCode, r.LatencyMs, r.UserID, r.Message, r.Error,
+		}
+	}
+	payload := map[string]interface{}{
+		"stmt":      "INSERT INTO logs (ts, level, service, host, request_id, trace_id, method, path, status_code, latency_ms, user_id, message, error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		"bulk_args": bulkArgs,
+	}
+	data, _ := json.Marshal(payload)
+	return compressData(data, compress, zstdEncoder)
+}
+
 func compressData(data []byte, compress string, zstdEncoder *zstd.Encoder) []byte {
 	switch compress {
 	case "gzip":
@@ -517,6 +541,8 @@ func generateBatches(cfg *Config) [][]byte {
 			batches[i] = formatForLoki(records, cfg.Compress, zstdEncoder)
 		case TargetQuickwit:
 			batches[i] = formatForQuickwit(records, cfg.Compress, zstdEncoder)
+		case TargetCrateDB:
+			batches[i] = formatForCrateDB(records, cfg.Compress, zstdEncoder)
 		}
 
 		if (i+1)%100 == 0 {
@@ -564,6 +590,8 @@ func getEndpoint(cfg *Config) (string, string) {
 		return fmt.Sprintf("http://%s:%d/loki/api/v1/push", cfg.Host, cfg.Port), "application/json"
 	case TargetQuickwit:
 		return fmt.Sprintf("http://%s:%d/api/v1/%s/ingest", cfg.Host, cfg.Port, cfg.Index), "application/x-ndjson"
+	case TargetCrateDB:
+		return fmt.Sprintf("http://%s:%d/_sql", cfg.Host, cfg.Port), "application/json"
 	default:
 		panic("unknown target: " + cfg.Target)
 	}
@@ -722,7 +750,7 @@ func worker(id int, cfg *Config, batches [][]byte, stats *Stats, client *http.Cl
 func main() {
 	cfg := Config{}
 
-	flag.StringVar(&cfg.Target, "target", "arc", "Target: arc, elastic, opensearch, clickhouse, clickhouse-native, victorialogs, loki, quickwit")
+	flag.StringVar(&cfg.Target, "target", "arc", "Target: arc, elastic, opensearch, clickhouse, clickhouse-native, victorialogs, loki, quickwit, cratedb")
 	flag.IntVar(&cfg.Duration, "duration", 60, "Test duration in seconds")
 	flag.IntVar(&cfg.Workers, "workers", 100, "Number of concurrent workers")
 	flag.IntVar(&cfg.BatchSize, "batch-size", 500, "Log records per batch")
@@ -749,7 +777,7 @@ func main() {
 		port, ok := defaultPorts[cfg.Target]
 		if !ok {
 			fmt.Printf("Unknown target: %s\n", cfg.Target)
-			fmt.Println("Valid targets: arc, elastic, opensearch, clickhouse, clickhouse-native, victorialogs, loki, quickwit")
+			fmt.Println("Valid targets: arc, elastic, opensearch, clickhouse, clickhouse-native, victorialogs, loki, quickwit, cratedb")
 			os.Exit(1)
 		}
 		cfg.Port = port
@@ -773,6 +801,7 @@ func main() {
 		TargetVictoriaLogs:     "VICTORIALOGS",
 		TargetLoki:             "GRAFANA LOKI",
 		TargetQuickwit:         "QUICKWIT",
+		TargetCrateDB:          "CRATEDB",
 	}
 
 	url, _ := getEndpoint(&cfg)

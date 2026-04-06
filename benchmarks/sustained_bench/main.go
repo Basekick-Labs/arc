@@ -48,12 +48,13 @@ type Config struct {
 	ZstdLevel   int
 	DataType    string
 	Protocol    string // "msgpack" or "lineprotocol"
-	Target      string // "arc", "clickhouse", "clickhouse-http", "timescaledb", "influxdb3"
+	Target      string // "arc", "clickhouse", "clickhouse-http", "timescaledb", "influxdb3", "cratedb"
 	InfluxPort  int
 	Host        string
 	Port        int
 	CHPort      int
 	PGPort      int
+	CrateDBPort int
 	Database    string
 	AsyncInsert bool
 	Token       string
@@ -980,6 +981,152 @@ func timescaleWorker(id int, cfg *Config, colBatches []columnBatch, stats *Stats
 	}
 }
 
+// CrateDB table schemas — SQL DDL + bulk INSERT statement.
+var cratedbSchemas = map[string]struct {
+	table   string
+	columns []string
+	create  string
+	stmt    string
+}{
+	"iot": {
+		table:   "cpu",
+		columns: []string{"time", "host", "value", "cpu_idle", "cpu_user"},
+		create:  `CREATE TABLE IF NOT EXISTS cpu (time BIGINT, host TEXT, value DOUBLE PRECISION, cpu_idle DOUBLE PRECISION, cpu_user DOUBLE PRECISION) WITH (number_of_replicas = 0)`,
+		stmt:    "INSERT INTO cpu (time,host,value,cpu_idle,cpu_user) VALUES (?,?,?,?,?)",
+	},
+	"financial": {
+		table:   "trades",
+		columns: []string{"time", "symbol", "exchange", "price", "bid", "ask", "bid_size", "ask_size", "volume", "trade_id"},
+		create:  `CREATE TABLE IF NOT EXISTS trades (time BIGINT, symbol TEXT, exchange TEXT, price DOUBLE PRECISION, bid DOUBLE PRECISION, ask DOUBLE PRECISION, bid_size BIGINT, ask_size BIGINT, volume BIGINT, trade_id BIGINT) WITH (number_of_replicas = 0)`,
+		stmt:    "INSERT INTO trades (time,symbol,exchange,price,bid,ask,bid_size,ask_size,volume,trade_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
+	},
+	"industrial": {
+		table:   "pump_telemetry",
+		columns: []string{"time", "pump_id", "facility", "pump_type", "flow_rate", "pressure_in", "pressure_out", "temperature", "vibration", "current", "rpm", "power"},
+		create:  `CREATE TABLE IF NOT EXISTS pump_telemetry (time BIGINT, pump_id TEXT, facility TEXT, pump_type TEXT, flow_rate DOUBLE PRECISION, pressure_in DOUBLE PRECISION, pressure_out DOUBLE PRECISION, temperature DOUBLE PRECISION, vibration DOUBLE PRECISION, current DOUBLE PRECISION, rpm BIGINT, power DOUBLE PRECISION) WITH (number_of_replicas = 0)`,
+		stmt:    "INSERT INTO pump_telemetry (time,pump_id,facility,pump_type,flow_rate,pressure_in,pressure_out,temperature,vibration,current,rpm,power) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+	},
+	"aerospace": {
+		table:   "rocket_telemetry",
+		columns: []string{"time", "sensor_id", "value"},
+		create:  `CREATE TABLE IF NOT EXISTS rocket_telemetry (time BIGINT, sensor_id TEXT, value DOUBLE PRECISION) WITH (number_of_replicas = 0)`,
+		stmt:    "INSERT INTO rocket_telemetry (time,sensor_id,value) VALUES (?,?,?)",
+	},
+	"energy": {
+		table:   "wind_turbine",
+		columns: []string{"time", "turbine_id", "farm", "wind_speed", "wind_direction", "rotor_rpm", "power_output", "blade_pitch", "nacelle_temp", "generator_temp"},
+		create:  `CREATE TABLE IF NOT EXISTS wind_turbine (time BIGINT, turbine_id TEXT, farm TEXT, wind_speed DOUBLE PRECISION, wind_direction DOUBLE PRECISION, rotor_rpm DOUBLE PRECISION, power_output DOUBLE PRECISION, blade_pitch DOUBLE PRECISION, nacelle_temp DOUBLE PRECISION, generator_temp DOUBLE PRECISION) WITH (number_of_replicas = 0)`,
+		stmt:    "INSERT INTO wind_turbine (time,turbine_id,farm,wind_speed,wind_direction,rotor_rpm,power_output,blade_pitch,nacelle_temp,generator_temp) VALUES (?,?,?,?,?,?,?,?,?,?)",
+	},
+	"racing": {
+		table:   "car_telemetry",
+		columns: []string{"time", "car_number", "driver", "speed", "engine_rpm", "throttle", "brake", "steering", "gear"},
+		create:  `CREATE TABLE IF NOT EXISTS car_telemetry (time BIGINT, car_number TEXT, driver TEXT, speed DOUBLE PRECISION, engine_rpm DOUBLE PRECISION, throttle DOUBLE PRECISION, brake DOUBLE PRECISION, steering DOUBLE PRECISION, gear BIGINT) WITH (number_of_replicas = 0)`,
+		stmt:    "INSERT INTO car_telemetry (time,car_number,driver,speed,engine_rpm,throttle,brake,steering,gear) VALUES (?,?,?,?,?,?,?,?,?)",
+	},
+}
+
+func ensureCrateDBTable(host string, port int, dataType string) (string, error) {
+	schema, ok := cratedbSchemas[dataType]
+	if !ok {
+		return "", fmt.Errorf("unsupported data type for CrateDB: %s", dataType)
+	}
+	url := fmt.Sprintf("http://%s:%d/_sql", host, port)
+	body, _ := json.Marshal(map[string]string{"stmt": schema.create})
+	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("connect: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("create table HTTP %d: %s", resp.StatusCode, string(b))
+	}
+	return schema.table, nil
+}
+
+// columnBatchesToCrateDBBulk converts pre-generated column batches into CrateDB bulk INSERT payloads.
+// Timestamps ([]time.Time) are stored as microseconds BIGINT.
+func columnBatchesToCrateDBBulk(colBatches []columnBatch, dataType string, batchSize int) [][]byte {
+	schema := cratedbSchemas[dataType]
+	batches := make([][]byte, len(colBatches))
+
+	for i, cb := range colBatches {
+		bulkArgs := make([][]interface{}, batchSize)
+		for j := 0; j < batchSize; j++ {
+			row := make([]interface{}, len(schema.columns))
+			for colIdx := range schema.columns {
+				switch v := cb.columns[colIdx].(type) {
+				case []time.Time:
+					row[colIdx] = v[j].UnixMicro()
+				case []string:
+					row[colIdx] = v[j]
+				case []float64:
+					row[colIdx] = v[j]
+				case []int64:
+					row[colIdx] = v[j]
+				}
+			}
+			bulkArgs[j] = row
+		}
+		payload := map[string]interface{}{
+			"stmt":      schema.stmt,
+			"bulk_args": bulkArgs,
+		}
+		data, err := json.Marshal(payload)
+		if err != nil {
+			panic(fmt.Sprintf("failed to marshal cratedb bulk payload: %v", err))
+		}
+		batches[i] = data
+		if (i+1)%100 == 0 {
+			fmt.Printf("  Progress (CrateDB): %d/%d\n", i+1, len(colBatches))
+		}
+	}
+	return batches
+}
+
+func cratedbHTTPWorker(id int, cfg *Config, batches [][]byte, stats *Stats, client *http.Client) {
+	url := fmt.Sprintf("http://%s:%d/_sql", cfg.Host, cfg.CrateDBPort)
+	batchIdx := 0
+
+	for stats.running.Load() {
+		batch := batches[batchIdx%len(batches)]
+		batchIdx++
+
+		start := time.Now()
+
+		req, err := http.NewRequest("POST", url, bytes.NewReader(batch))
+		if err != nil {
+			stats.totalErrors.Add(1)
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			stats.totalErrors.Add(1)
+			if stats.totalErrors.Load() <= 3 {
+				fmt.Printf("Worker %d: HTTP error: %v\n", id, err)
+			}
+			continue
+		}
+
+		latencyMs := float64(time.Since(start).Microseconds()) / 1000.0
+
+		if resp.StatusCode == 200 {
+			stats.totalSent.Add(int64(cfg.BatchSize))
+			stats.addLatency(id, latencyMs)
+		} else {
+			stats.totalErrors.Add(1)
+			if stats.totalErrors.Load() <= 3 {
+				body, _ := io.ReadAll(resp.Body)
+				fmt.Printf("Worker %d: HTTP %d: %s\n", id, resp.StatusCode, string(body)[:min(200, len(body))])
+			}
+		}
+		resp.Body.Close()
+	}
+}
+
 // Columnar batch for ClickHouse native protocol.
 // Each column is a typed slice matching the CREATE TABLE column order.
 type columnBatch struct {
@@ -1634,16 +1781,23 @@ func main() {
 	flag.IntVar(&cfg.ZstdLevel, "zstd-level", 3, "Zstd compression level (1-22)")
 	flag.StringVar(&cfg.DataType, "data-type", "iot", "Data type: iot, financial, industrial, aerospace, energy, racing")
 	flag.StringVar(&cfg.Protocol, "protocol", "msgpack", "Protocol: msgpack, lineprotocol")
-	flag.StringVar(&cfg.Target, "target", "arc", "Target: arc, clickhouse, clickhouse-http, timescaledb, influxdb3")
+	flag.StringVar(&cfg.Target, "target", "arc", "Target: arc, clickhouse, clickhouse-http, timescaledb, influxdb3, cratedb")
 	flag.StringVar(&cfg.Host, "host", "localhost", "Server host")
 	flag.IntVar(&cfg.Port, "port", 8000, "Server port (Arc HTTP)")
 	flag.IntVar(&cfg.CHPort, "ch-port", 9000, "ClickHouse native port")
 	flag.IntVar(&cfg.PGPort, "pg-port", 5432, "PostgreSQL/TimescaleDB port")
 	flag.IntVar(&cfg.InfluxPort, "influx-port", 8181, "InfluxDB 3 HTTP port")
+	flag.IntVar(&cfg.CrateDBPort, "cratedb-port", 4200, "CrateDB HTTP port")
 	flag.StringVar(&cfg.Database, "database", "default", "Database name (ClickHouse/TimescaleDB)")
 	flag.BoolVar(&cfg.AsyncInsert, "async-insert", false, "Enable ClickHouse async_insert (server-side batching)")
 	flag.BoolVar(&cfg.TLS, "tls", false, "Use HTTPS instead of HTTP")
 	flag.Parse()
+
+	// CrateDB optimal batch size is 10k–20k rows per request (bulk_args sweet spot).
+	// Override the default of 1000 unless the user explicitly passed --batch-size.
+	if cfg.Target == "cratedb" && cfg.BatchSize == 1000 {
+		cfg.BatchSize = 15000
+	}
 
 	cfg.Token = os.Getenv("ARC_TOKEN")
 
@@ -1696,6 +1850,11 @@ func main() {
 		fmt.Println("SUSTAINED LOAD TEST - INFLUXDB 3 (Line Protocol over HTTP)")
 		fmt.Println("================================================================================")
 		fmt.Printf("Target: http://%s:%d (database: %s)\n", cfg.Host, cfg.InfluxPort, cfg.Database)
+	} else if cfg.Target == "cratedb" {
+		fmt.Println("SUSTAINED LOAD TEST - CRATEDB (bulk SQL over HTTP)")
+		fmt.Println("================================================================================")
+		fmt.Printf("Target:     http://%s:%d/_sql\n", cfg.Host, cfg.CrateDBPort)
+		fmt.Printf("Batch size: %d rows/request (optimal range: 10k–20k)\n", cfg.BatchSize)
 	} else {
 		fmt.Printf("SUSTAINED LOAD TEST - GO CLIENT (%s)\n", compressLabel)
 		fmt.Println("================================================================================")
@@ -1889,6 +2048,50 @@ func main() {
 			go func(id int) {
 				defer wg.Done()
 				influxdb3Worker(id, &cfg, lpBatches, stats, client)
+			}(i)
+		}
+	} else if cfg.Target == "cratedb" {
+		// CrateDB — bulk INSERT via /_sql
+		colBatches := generateColumnBatches(cfg.DataType, cfg.Pregenerate, cfg.BatchSize)
+		crateBatches := columnBatchesToCrateDBBulk(colBatches, cfg.DataType, cfg.BatchSize)
+
+		genTime := time.Since(startGen)
+		var totalSize int64
+		for _, b := range crateBatches {
+			totalSize += int64(len(b))
+		}
+		avgSize := float64(totalSize) / float64(len(crateBatches))
+		fmt.Printf("✓ Generated %d batches in %.1fs\n", cfg.Pregenerate, genTime.Seconds())
+		fmt.Printf("  Avg size: %.1f KB (CrateDB bulk)\n", avgSize/1024)
+		fmt.Println()
+
+		tableName, err := ensureCrateDBTable(cfg.Host, cfg.CrateDBPort, cfg.DataType)
+		if err != nil {
+			fmt.Printf("Failed to create CrateDB table: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✓ Table '%s' ready\n", tableName)
+		fmt.Println()
+
+		client := &http.Client{
+			Transport: &http.Transport{
+				MaxIdleConns:        cfg.Workers + 50,
+				MaxIdleConnsPerHost: cfg.Workers + 50,
+				MaxConnsPerHost:     cfg.Workers + 50,
+				IdleConnTimeout:     90 * time.Second,
+				DisableKeepAlives:   false,
+				// Keep connections warm to avoid Netty connection-reset warnings
+				ResponseHeaderTimeout: 120 * time.Second,
+			},
+			Timeout: 120 * time.Second,
+		}
+
+		fmt.Println("Starting test...")
+		for i := 0; i < cfg.Workers; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				cratedbHTTPWorker(id, &cfg, crateBatches, stats, client)
 			}(i)
 		}
 	} else {
