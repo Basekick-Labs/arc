@@ -366,7 +366,7 @@ func (d *DuckDB) ClearHTTPCache() {
 	if _, err := d.db.Exec("SELECT cache_httpfs_clear_cache()"); err != nil {
 		d.logger.Debug().Err(err).Msg("cache_httpfs_clear_cache not available (extension may not be loaded)")
 	} else {
-		d.logger.Info().Msg("Cleared cache_httpfs cache after compaction")
+		d.logger.Info().Msg("Cleared cache_httpfs cache")
 	}
 
 	// Reset parquet_metadata_cache by toggling off/on to clear cached schema for deleted files
@@ -376,7 +376,7 @@ func (d *DuckDB) ClearHTTPCache() {
 		if _, err := d.db.Exec("SET GLOBAL parquet_metadata_cache=true"); err != nil {
 			d.logger.Warn().Err(err).Msg("Failed to re-enable parquet_metadata_cache")
 		} else {
-			d.logger.Info().Msg("Reset parquet_metadata_cache after compaction")
+			d.logger.Info().Msg("Reset parquet_metadata_cache")
 		}
 	}
 }
