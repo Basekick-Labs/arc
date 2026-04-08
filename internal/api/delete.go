@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -284,6 +285,11 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			Int64("deleted", deleted).
 			Msg("Processed file")
 	}
+
+	// Clear DuckDB parquet metadata/data cache and release memory back to OS.
+	// FreeOSMemory runs in a goroutine to avoid blocking the response with a GC pause.
+	h.db.ClearHTTPCache()
+	go debug.FreeOSMemory()
 
 	executionTime := float64(time.Since(start).Milliseconds())
 
@@ -584,7 +590,8 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, _, where
 		) TO '%s' (
 			FORMAT PARQUET,
 			COMPRESSION ZSTD,
-			COMPRESSION_LEVEL 3
+			COMPRESSION_LEVEL 3,
+			ROW_GROUP_SIZE 122880
 		)
 	`, filePath, whereClause, tempFile)
 
@@ -634,7 +641,8 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 		) TO '%s' (
 			FORMAT PARQUET,
 			COMPRESSION ZSTD,
-			COMPRESSION_LEVEL 3
+			COMPRESSION_LEVEL 3,
+			ROW_GROUP_SIZE 122880
 		)
 	`, s3Path, whereClause, tempPath)
 

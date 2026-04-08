@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -398,6 +399,11 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 		totalFilesDeleted += filesDeleted
 	}
 
+	// Clear DuckDB parquet metadata/data cache and release memory back to OS.
+	// FreeOSMemory runs in a goroutine to avoid blocking with a GC pause.
+	h.duckdb.ClearHTTPCache()
+	go debug.FreeOSMemory()
+
 	executionTime := float64(time.Since(start).Milliseconds())
 
 	// Record execution completion
@@ -535,6 +541,13 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 		}
 		totalDeleted += deleted
 		totalFilesDeleted += filesDeleted
+	}
+
+	if !req.DryRun {
+		// Clear DuckDB parquet metadata/data cache and release memory back to OS.
+		// FreeOSMemory runs in a goroutine to avoid blocking the response with a GC pause.
+		h.duckdb.ClearHTTPCache()
+		go debug.FreeOSMemory()
 	}
 
 	executionTime := float64(time.Since(start).Milliseconds())
