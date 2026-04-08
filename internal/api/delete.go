@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -16,6 +18,26 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
+
+// parquetRowGroupSize is the row group size used for Parquet rewrites during delete operations.
+// Matches compaction's row group size to limit DuckDB's internal write buffer per group.
+const parquetRowGroupSize = 122880
+
+// lastFreeOSMemoryNano is the last time freeOSMemoryThrottled fired, used to debounce GC calls.
+var lastFreeOSMemoryNano atomic.Int64
+
+// freeOSMemoryThrottled fires debug.FreeOSMemory in a goroutine at most once every 30 seconds.
+// This prevents GC storms when multiple concurrent delete/retention requests complete together.
+func freeOSMemoryThrottled() {
+	now := time.Now().UnixNano()
+	last := lastFreeOSMemoryNano.Load()
+	if now-last < int64(30*time.Second) {
+		return
+	}
+	if lastFreeOSMemoryNano.CompareAndSwap(last, now) {
+		go debug.FreeOSMemory()
+	}
+}
 
 // DeleteHandler handles delete operations using file rewrite strategy
 type DeleteHandler struct {
@@ -197,6 +219,10 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	}
 
 	if len(affected) == 0 {
+		// findAffectedFiles scanned parquet files via read_parquet — clear the cache even though
+		// no rows matched, to avoid accumulating metadata for files that may later be deleted.
+		h.db.ClearHTTPCache()
+		freeOSMemoryThrottled()
 		return c.JSON(DeleteResponse{
 			Success:         true,
 			DeletedCount:    0,
@@ -284,6 +310,10 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			Int64("deleted", deleted).
 			Msg("Processed file")
 	}
+
+	// Clear DuckDB parquet metadata/data cache and release memory back to OS.
+	h.db.ClearHTTPCache()
+	freeOSMemoryThrottled()
 
 	executionTime := float64(time.Since(start).Milliseconds())
 
@@ -584,9 +614,9 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, _, where
 		) TO '%s' (
 			FORMAT PARQUET,
 			COMPRESSION ZSTD,
-			COMPRESSION_LEVEL 3
-		)
-	`, filePath, whereClause, tempFile)
+			COMPRESSION_LEVEL 3,
+			ROW_GROUP_SIZE %d
+		)`, filePath, whereClause, tempFile, parquetRowGroupSize)
 
 	if _, err := db.ExecContext(ctx, copyQuery); err != nil {
 		os.Remove(tempFile)
@@ -634,9 +664,9 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 		) TO '%s' (
 			FORMAT PARQUET,
 			COMPRESSION ZSTD,
-			COMPRESSION_LEVEL 3
-		)
-	`, s3Path, whereClause, tempPath)
+			COMPRESSION_LEVEL 3,
+			ROW_GROUP_SIZE %d
+		)`, s3Path, whereClause, tempPath, parquetRowGroupSize)
 
 	if _, err := db.ExecContext(ctx, copyQuery); err != nil {
 		return 0, fmt.Errorf("failed to write filtered data: %w", err)

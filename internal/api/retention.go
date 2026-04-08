@@ -398,6 +398,10 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 		totalFilesDeleted += filesDeleted
 	}
 
+	// Clear DuckDB parquet metadata/data cache and release memory back to OS.
+	h.duckdb.ClearHTTPCache()
+	freeOSMemoryThrottled()
+
 	executionTime := float64(time.Since(start).Milliseconds())
 
 	// Record execution completion
@@ -536,6 +540,11 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 		totalDeleted += deleted
 		totalFilesDeleted += filesDeleted
 	}
+
+	// Clear DuckDB parquet metadata/data cache — dry runs also populate the cache via
+	// read_parquet calls in getFileMaxTimeAndRowCount, so always clear regardless of dry run.
+	h.duckdb.ClearHTTPCache()
+	freeOSMemoryThrottled()
 
 	executionTime := float64(time.Since(start).Milliseconds())
 
