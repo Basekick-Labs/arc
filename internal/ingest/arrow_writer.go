@@ -726,11 +726,12 @@ type ArrowBuffer struct {
 	shardCount uint32
 
 	// Background flush
-	ctx         context.Context
-	cancel      context.CancelFunc
-	flushTimer  *time.Timer   // self-adjusting: fires when the oldest buffer is due to expire
-	newBufferCh chan struct{} // signals periodicFlush to recompute the next wakeup time
-	wg          sync.WaitGroup
+	ctx            context.Context
+	cancel         context.CancelFunc
+	flushTimer     *time.Timer   // self-adjusting: fires when the oldest buffer is due to expire
+	timerDeadline  time.Time     // when flushTimer is scheduled to fire (used to avoid resetting it later than it already is)
+	newBufferCh    chan struct{} // signals periodicFlush to recompute the next wakeup time
+	wg             sync.WaitGroup
 
 	// OPTIMIZATION: Worker pool for bounded flush concurrency
 	// Prevents goroutine explosion under sustained load
@@ -887,6 +888,7 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		ctx:             ctx,
 		cancel:          cancel,
 		flushTimer:      time.NewTimer(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
+		timerDeadline:   time.Now().Add(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
 		newBufferCh:     make(chan struct{}, 1),
 		flushQueue:      make(chan flushTask, queueSize),
 		flushWorkers:    flushWorkers,
@@ -1862,21 +1864,29 @@ func (b *ArrowBuffer) periodicFlush() {
 			return
 
 		case <-b.newBufferCh:
-			// A new buffer was created; recompute the next wakeup time so the
-			// timer fires at T+maxAge rather than at whatever the old interval was.
+			// A new buffer was created; recompute the next wakeup time.
+			// Only reset the timer if the new expiry fires sooner than the
+			// already-scheduled deadline — never push the deadline out, or
+			// long-lived low-volume buffers get starved under high write load.
 			nextDelay := b.computeNextFlushDelay()
-			if !b.flushTimer.Stop() {
-				select {
-				case <-b.flushTimer.C:
-				default:
+			nextDeadline := time.Now().Add(nextDelay)
+			if nextDeadline.Before(b.timerDeadline) {
+				if !b.flushTimer.Stop() {
+					select {
+					case <-b.flushTimer.C:
+					default:
+					}
 				}
+				b.timerDeadline = nextDeadline
+				b.flushTimer.Reset(nextDelay)
 			}
-			b.flushTimer.Reset(nextDelay)
 
 		case <-b.flushTimer.C:
 			b.flushAgedBuffers()
 			// Rearm the timer for the next oldest buffer expiry.
-			b.flushTimer.Reset(b.computeNextFlushDelay())
+			nextDelay := b.computeNextFlushDelay()
+			b.timerDeadline = time.Now().Add(nextDelay)
+			b.flushTimer.Reset(nextDelay)
 		}
 	}
 }
