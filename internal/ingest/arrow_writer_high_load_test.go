@@ -155,7 +155,7 @@ func TestBufferFlushTimingUnderLoad(t *testing.T) {
 					}
 
 					// Check if parquet file exists
-					pattern := fmt.Sprintf("%s/testdb/%s/*/*/*/*.parquet", tmpDir, m)
+					pattern := fmt.Sprintf("%s/testdb/%s/*/*/*/*/*.parquet", tmpDir, m)
 					matches, _ := filepath.Glob(pattern)
 					if len(matches) > 0 {
 						flushTime := time.Now()
