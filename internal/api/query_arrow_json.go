@@ -41,6 +41,8 @@ func executeArrowJSONQuery(
 	start time.Time,
 	timestamp string,
 	onComplete func(int),
+	onFail func(string),
+	onTimeout func(),
 ) (int, bool) {
 	m := metrics.Get()
 
@@ -65,6 +67,9 @@ func executeArrowJSONQuery(
 			if cancel != nil {
 				cancel()
 			}
+			if onComplete != nil {
+				onComplete(0)
+			}
 			c.JSON(QueryResponse{
 				Success:         true,
 				Columns:         []string{},
@@ -83,6 +88,9 @@ func executeArrowJSONQuery(
 			}
 			m.IncQueryErrors()
 			m.IncQueryTimeouts()
+			if onTimeout != nil {
+				onTimeout()
+			}
 			c.Status(fiber.StatusGatewayTimeout).JSON(QueryResponse{
 				Success:         false,
 				Error:           "Query timed out",
@@ -105,6 +113,9 @@ func executeArrowJSONQuery(
 			cancel()
 		}
 		m.IncQueryErrors()
+		if onFail != nil {
+			onFail(err.Error())
+		}
 		h.logger.Error().Err(err).Str("sql", convertedSQL).Msg("Arrow JSON query failed")
 		c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
