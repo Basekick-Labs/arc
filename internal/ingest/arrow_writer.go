@@ -888,7 +888,7 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		ctx:             ctx,
 		cancel:          cancel,
 		flushTimer:      time.NewTimer(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
-		flushDeadline:   time.Now().Add(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
+		flushDeadline:   time.Now().UTC().Add(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
 		newBufferCh:     make(chan struct{}, 1),
 		flushQueue:      make(chan flushTask, queueSize),
 		flushWorkers:    flushWorkers,
@@ -1897,7 +1897,7 @@ func (b *ArrowBuffer) periodicFlush() {
 // Returning an absolute time avoids drift from a second time.Now() call at
 // the call site.
 func (b *ArrowBuffer) computeNextFlushDeadline() time.Time {
-	now := time.Now()
+	now := time.Now().UTC()
 	maxAge := b.maxBufferAge
 	earliest := now.Add(maxAge) // default when no buffers exist
 
