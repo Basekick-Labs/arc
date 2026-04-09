@@ -57,6 +57,11 @@ type AuthManager struct {
 	logger      zerolog.Logger
 }
 
+// Logger returns the auth component logger.
+func (am *AuthManager) Logger() zerolog.Logger {
+	return am.logger
+}
+
 // NewAuthManager creates a new authentication manager
 func NewAuthManager(dbPath string, cacheTTL time.Duration, maxCacheSize int, logger zerolog.Logger) (*AuthManager, error) {
 	// Ensure directory exists

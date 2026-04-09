@@ -2,6 +2,7 @@ package auth
 
 import (
 	"strings"
+	"sync"
 
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/gofiber/fiber/v2"
@@ -42,6 +43,8 @@ func DefaultMiddlewareConfig() MiddlewareConfig {
 
 // NewMiddleware creates authentication middleware for Fiber
 func NewMiddleware(config MiddlewareConfig) fiber.Handler {
+	var queryParamDeprecationLogged sync.Once
+
 	return func(c *fiber.Ctx) error {
 		// Skip authentication if disabled
 		if config.Skip {
@@ -71,6 +74,17 @@ func NewMiddleware(config MiddlewareConfig) fiber.Handler {
 
 		// Extract token from request
 		token := ExtractTokenFromRequest(c)
+
+		// Warn once if token was provided via ?p= query parameter (InfluxDB 1.x compat).
+		// Tokens in URLs are exposed in HTTP access logs (reverse proxies, load balancers).
+		if token != "" && c.Query("p") != "" {
+			queryParamDeprecationLogged.Do(func() {
+				logger := config.AuthManager.Logger()
+				logger.Warn().
+					Str("client_ip", c.IP()).
+					Msg("Authentication via ?p= query parameter is deprecated — tokens in URLs are exposed in access logs. Use the Authorization header instead.")
+			})
+		}
 
 		// No token provided
 		if token == "" {
