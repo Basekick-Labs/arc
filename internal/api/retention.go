@@ -88,7 +88,7 @@ type RetentionExecution struct {
 func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *config.RetentionConfig, authManager *auth.AuthManager, logger zerolog.Logger) (*RetentionHandler, error) {
 	// Ensure directory exists
 	dir := filepath.Dir(cfg.DBPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create directory for retention DB: %w", err)
 	}
 

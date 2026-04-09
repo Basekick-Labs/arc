@@ -565,7 +565,7 @@ func (h *ImportHandler) importFile(ctx context.Context, dbName, measurement, fil
 
 	// 5. For each partition hour, COPY to a temp Parquet file, then upload to storage
 	outputDir := filepath.Join(tempDir, "output")
-	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+	if err := os.MkdirAll(outputDir, 0700); err != nil {
 		return nil, &importError{
 			StatusCode: fiber.StatusInternalServerError,
 			Message:    "failed to create output directory",

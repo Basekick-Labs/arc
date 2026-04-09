@@ -601,7 +601,7 @@ func (n *ShardRaftNode) StartFullRaft(cfg *shardRaftNodeConfig) error {
 	defer n.mu.Unlock()
 
 	// Ensure data directory exists
-	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+	if err := os.MkdirAll(cfg.DataDir, 0700); err != nil {
 		return fmt.Errorf("create data directory: %w", err)
 	}
 
