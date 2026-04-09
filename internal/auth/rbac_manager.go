@@ -155,6 +155,28 @@ func (rm *RBACManager) cacheCleanupLoop() {
 	}
 }
 
+// evictPermCacheIfFull removes a random entry from the permission cache if it
+// has reached maxCacheSize. Caller must hold permCacheMu write lock.
+func (rm *RBACManager) evictPermCacheIfFull() {
+	if len(rm.permCache) >= rm.maxCacheSize {
+		for k := range rm.permCache {
+			delete(rm.permCache, k)
+			break
+		}
+	}
+}
+
+// evictTokenCacheIfFull removes a random entry from the token cache if it
+// has reached maxCacheSize. Caller must hold tokenCacheMu write lock.
+func (rm *RBACManager) evictTokenCacheIfFull() {
+	if len(rm.tokenCache) >= rm.maxCacheSize {
+		for k := range rm.tokenCache {
+			delete(rm.tokenCache, k)
+			break
+		}
+	}
+}
+
 // cleanupExpiredCache removes expired entries from both caches
 func (rm *RBACManager) cleanupExpiredCache() {
 	now := time.Now()
@@ -930,14 +952,9 @@ func (rm *RBACManager) CheckPermission(req *PermissionCheckRequest) *PermissionC
 	// Cache miss - compute permission
 	result := rm.checkPermissionUncached(req)
 
-	// Cache the result (evict a random entry if over max size)
+	// Cache the result
 	rm.permCacheMu.Lock()
-	if len(rm.permCache) >= rm.maxCacheSize {
-		for k := range rm.permCache {
-			delete(rm.permCache, k)
-			break
-		}
-	}
+	rm.evictPermCacheIfFull()
 	rm.permCache[cacheKey] = &permissionCacheEntry{
 		result:    result,
 		expiresAt: time.Now().Add(rm.permCacheTTL),
@@ -1054,14 +1071,9 @@ func (rm *RBACManager) CheckPermissionsBatch(reqs []*PermissionCheckRequest) []*
 				}
 			}
 
-			// Cache the result (evict a random entry if over max size)
+			// Cache the result
 			rm.permCacheMu.Lock()
-			if len(rm.permCache) >= rm.maxCacheSize {
-				for k := range rm.permCache {
-					delete(rm.permCache, k)
-					break
-				}
-			}
+			rm.evictPermCacheIfFull()
 			rm.permCache[cacheKey] = &permissionCacheEntry{
 				result:    result,
 				expiresAt: time.Now().Add(rm.permCacheTTL),
@@ -1138,13 +1150,8 @@ func (rm *RBACManager) getTokenRBACData(tokenID int64) (*tokenRBACData, error) {
 		return nil, err
 	}
 
-	// Cache the result (already holding write lock, evict if over max size)
-	if len(rm.tokenCache) >= rm.maxCacheSize {
-		for k := range rm.tokenCache {
-			delete(rm.tokenCache, k)
-			break
-		}
-	}
+	// Cache the result (already holding write lock)
+	rm.evictTokenCacheIfFull()
 	rm.tokenCache[tokenID] = data
 
 	return data, nil
