@@ -118,7 +118,7 @@ func (n *Node) Start() error {
 	}
 
 	// Ensure data directory exists
-	if err := os.MkdirAll(n.cfg.DataDir, 0755); err != nil {
+	if err := os.MkdirAll(n.cfg.DataDir, 0700); err != nil {
 		return fmt.Errorf("failed to create data directory: %w", err)
 	}
 

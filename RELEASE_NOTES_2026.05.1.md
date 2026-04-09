@@ -2,6 +2,16 @@
 
 ## Security Fixes
 
+### Sensitive Directories Created with World-Readable Permissions (0755)
+
+Five directories containing sensitive data (SQLite databases with API tokens, RBAC config, audit logs, and Raft consensus state) were created with 0755 permissions, allowing any user on the system to read their contents — including SQLite WAL and SHM sidecar files.
+
+**Affected locations:** `auth.go` (auth DB), `continuous_query.go` (CQ DB), `retention.go` (retention DB), `raft/node.go` (Raft state), `sharding/shard_raft.go` (shard Raft state).
+
+**Fix:** All five changed to 0700 (owner-only), consistent with WAL, local storage, and temp directories which already used 0700.
+
+**Note:** `os.MkdirAll` does not change permissions on existing directories, so existing deployments retain their current permissions. Operators upgrading from earlier versions should manually run `chmod 700` on their data directory if desired.
+
 ### SQL Injection in DuckDB `SET memory_limit` (compaction + database init)
 
 The `SET memory_limit` command in both the main DuckDB connection (`duckdb.go`) and the compaction subprocess (`subprocess.go`) interpolated the configured memory limit value without escaping single quotes. An attacker with access to the configuration could inject arbitrary SQL.
