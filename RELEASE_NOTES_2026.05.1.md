@@ -2,6 +2,16 @@
 
 ## Bug Fixes
 
+### Query Registry Reports 0 Row Count for Arrow-Path Queries
+
+Fixed a bug where the query registry always recorded `row_count = 0` for queries served via the Arrow path.
+
+**Root cause:** `queryRegistry.Complete(queryID, 0)` was called synchronously right after `arrowJSONQueryFunc` returned, but the Arrow path streams its response asynchronously via `SetBodyStreamWriter`. At that point the real row count from `streamArrowJSON` is not yet known — so 0 was always hardcoded. Additionally, the Arrow path's error and timeout branches returned `handled=true` without notifying the registry at all, leaving queries stuck in "running" state permanently.
+
+**Fix:** Added `onComplete func(int)`, `onFail func(string)`, and `onTimeout func()` callbacks to `executeArrowJSONQuery`. The call site in `query.go` passes closures that invoke the appropriate registry method. The success path calls `onComplete(rc)` inside the `SetBodyStreamWriter` callback with the real row count; the error and timeout paths call `onFail`/`onTimeout` immediately before returning.
+
+**Impact:** The query registry now correctly reflects row counts, failure reasons, and timeout status for all Arrow-path queries.
+
 ### Low-Volume Measurements Starved of Age-Based Flushes Under High Write Load
 
 Fixed a bug in the ArrowBuffer periodic flush goroutine where low-volume measurements could be indefinitely starved of age-based flushing when a high-volume workload was running concurrently.

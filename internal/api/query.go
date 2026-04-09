@@ -95,7 +95,7 @@ var (
 // arrowJSONQueryFunc is set by query_arrow_json.go init() when compiled with duckdb_arrow tag.
 // It executes a query via DuckDB's native Arrow API and streams the JSON response.
 // Returns (rowCount, handled). If handled is false, the caller falls back to database/sql.
-var arrowJSONQueryFunc func(h *QueryHandler, c *fiber.Ctx, ctx context.Context, cancel context.CancelFunc, convertedSQL string, profileMode bool, governanceMaxRows int, start time.Time, timestamp string) (int, bool)
+var arrowJSONQueryFunc func(h *QueryHandler, c *fiber.Ctx, ctx context.Context, cancel context.CancelFunc, convertedSQL string, profileMode bool, governanceMaxRows int, start time.Time, timestamp string, onComplete func(int), onFail func(string), onTimeout func()) (int, bool)
 
 // isIdentChar returns true if c is a valid SQL identifier character (a-z, A-Z, 0-9, _)
 func isIdentChar(c byte) bool {
@@ -1279,13 +1279,19 @@ localProcessing:
 		// Arrow-native path: bypasses database/sql row scanning entirely — reads typed
 		// values directly from DuckDB's internal Arrow columnar chunks.
 		if arrowJSONQueryFunc != nil {
-			_, handled := arrowJSONQueryFunc(h, c, ctx, cancel, convertedSQL, profileMode, governanceMaxRows, start, timestamp)
+			var onComplete func(int)
+			var onFail func(string)
+			var onTimeout func()
+			if h.queryRegistry != nil && queryID != "" {
+				onComplete = func(rc int) { h.queryRegistry.Complete(queryID, rc) }
+				onFail = func(msg string) { h.queryRegistry.Fail(queryID, msg) }
+				onTimeout = func() { h.queryRegistry.TimedOut(queryID) }
+			}
+			_, handled := arrowJSONQueryFunc(h, c, ctx, cancel, convertedSQL, profileMode, governanceMaxRows, start, timestamp, onComplete, onFail, onTimeout)
 			if handled {
-				// Arrow path handled the response — metrics are recorded
-				// inside the async stream writer callback.
-				if h.queryRegistry != nil && queryID != "" {
-					h.queryRegistry.Complete(queryID, 0)
-				}
+				// Arrow path handled the response — registry callbacks are invoked
+				// inside executeArrowJSONQuery (either directly for errors, or via
+				// the async stream writer callback for success).
 				return nil
 			}
 			// handled=false means Arrow path declined (e.g., driver issue).
@@ -3002,7 +3008,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	// Arrow-native path: bypasses database/sql row scanning entirely.
 	if arrowJSONQueryFunc != nil {
 		ctx := context.Background()
-		_, handled := arrowJSONQueryFunc(h, c, ctx, nil, convertedSQL, false, 0, start, timestamp)
+		_, handled := arrowJSONQueryFunc(h, c, ctx, nil, convertedSQL, false, 0, start, timestamp, nil, nil, nil)
 		if handled {
 			// Metrics are recorded inside the async stream callback — not here.
 			return nil
