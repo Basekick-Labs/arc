@@ -40,6 +40,7 @@ func executeArrowJSONQuery(
 	governanceMaxRows int,
 	start time.Time,
 	timestamp string,
+	onComplete func(int),
 ) (int, bool) {
 	m := metrics.Get()
 
@@ -133,6 +134,10 @@ func executeArrowJSONQuery(
 		m.IncQuerySuccess()
 		m.IncQueryRows(int64(rc))
 		m.RecordQueryLatency(time.Since(start).Microseconds())
+
+		if onComplete != nil {
+			onComplete(rc)
+		}
 
 		h.logger.Info().
 			Int("row_count", rc).
