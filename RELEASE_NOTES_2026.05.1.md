@@ -2,6 +2,12 @@
 
 ## Bug Fixes
 
+### WAL Filename Rotation Collision
+
+Fixed a bug where WAL filenames used second precision (`arc-YYYYMMDD_HHMMSS.wal`), allowing two rotations within the same second to produce identical filenames. The second rotation would reopen the existing file via `O_APPEND` and write a new header, corrupting the WAL structure.
+
+**Fix:** WAL filenames now use nanosecond precision (`arc-YYYYMMDD_HHMMSS.000000000.wal`), eliminating the collision window. The new format remains lexicographically sortable and compatible with all existing `*.wal` glob patterns.
+
 ### Query Registry Reports 0 Row Count for Arrow-Path Queries
 
 Fixed a bug where the query registry always recorded `row_count = 0` for queries served via the Arrow path.

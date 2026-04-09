@@ -274,7 +274,7 @@ func (w *Writer) rotate() error {
 	}
 
 	// Generate new filename
-	timestamp := time.Now().UTC().Format("20060102_150405")
+	timestamp := time.Now().UTC().Format("20060102_150405.000000000")
 	filename := fmt.Sprintf("arc-%s.wal", timestamp)
 	w.currentPath = filepath.Join(w.config.WALDir, filename)
 
