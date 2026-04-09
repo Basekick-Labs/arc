@@ -726,12 +726,12 @@ type ArrowBuffer struct {
 	shardCount uint32
 
 	// Background flush
-	ctx            context.Context
-	cancel         context.CancelFunc
-	flushTimer     *time.Timer   // self-adjusting: fires when the oldest buffer is due to expire
-	timerDeadline  time.Time     // when flushTimer is scheduled to fire (used to avoid resetting it later than it already is)
-	newBufferCh    chan struct{} // signals periodicFlush to recompute the next wakeup time
-	wg             sync.WaitGroup
+	ctx             context.Context
+	cancel          context.CancelFunc
+	flushTimer      *time.Timer // self-adjusting: fires when the oldest buffer is due to expire
+	flushDeadline   time.Time   // absolute time when flushTimer will fire; updated whenever the timer is (re)set
+	newBufferCh     chan struct{} // signals periodicFlush that a new buffer was created (used for idle→active wake-up)
+	wg              sync.WaitGroup
 
 	// OPTIMIZATION: Worker pool for bounded flush concurrency
 	// Prevents goroutine explosion under sustained load
@@ -888,7 +888,7 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		ctx:             ctx,
 		cancel:          cancel,
 		flushTimer:      time.NewTimer(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
-		timerDeadline:   time.Now().Add(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
+		flushDeadline:   time.Now().Add(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
 		newBufferCh:     make(chan struct{}, 1),
 		flushQueue:      make(chan flushTask, queueSize),
 		flushWorkers:    flushWorkers,
@@ -1864,37 +1864,39 @@ func (b *ArrowBuffer) periodicFlush() {
 			return
 
 		case <-b.newBufferCh:
-			// A new buffer was created; recompute the next wakeup time.
-			// Only reset the timer if the new expiry fires sooner than the
-			// already-scheduled deadline — never push the deadline out, or
-			// long-lived low-volume buffers get starved under high write load.
-			nextDelay := b.computeNextFlushDelay()
-			nextDeadline := time.Now().Add(nextDelay)
-			if nextDeadline.Before(b.timerDeadline) {
+			// A new buffer was created. Only reset the timer if the oldest
+			// buffer's expiry is earlier than the currently scheduled deadline.
+			// In practice this only triggers the idle→active transition: once
+			// the timer is armed, a new buffer (expiry = now+maxAge) is always
+			// later than any existing buffer's expiry, so the condition is false
+			// and we skip the expensive shard scan entirely.
+			nextDeadline := b.computeNextFlushDeadline()
+			if nextDeadline.Before(b.flushDeadline) {
 				if !b.flushTimer.Stop() {
 					select {
 					case <-b.flushTimer.C:
 					default:
 					}
 				}
-				b.timerDeadline = nextDeadline
-				b.flushTimer.Reset(nextDelay)
+				b.flushDeadline = nextDeadline
+				b.flushTimer.Reset(time.Until(nextDeadline))
 			}
 
 		case <-b.flushTimer.C:
 			b.flushAgedBuffers()
 			// Rearm the timer for the next oldest buffer expiry.
-			nextDelay := b.computeNextFlushDelay()
-			b.timerDeadline = time.Now().Add(nextDelay)
-			b.flushTimer.Reset(nextDelay)
+			b.flushDeadline = b.computeNextFlushDeadline()
+			b.flushTimer.Reset(time.Until(b.flushDeadline))
 		}
 	}
 }
 
-// computeNextFlushDelay returns the duration until the oldest buffered key is
-// due to be flushed.  If no buffers exist it returns the full maxAge so the
+// computeNextFlushDeadline returns the absolute time when the oldest buffered
+// key is due to be flushed. If no buffers exist it returns now+maxAge so the
 // goroutine sleeps until a new buffer signals it via newBufferCh.
-func (b *ArrowBuffer) computeNextFlushDelay() time.Duration {
+// Returning an absolute time avoids drift from a second time.Now() call at
+// the call site.
+func (b *ArrowBuffer) computeNextFlushDeadline() time.Time {
 	now := time.Now()
 	maxAge := b.maxBufferAge
 	earliest := now.Add(maxAge) // default when no buffers exist
@@ -1909,10 +1911,11 @@ func (b *ArrowBuffer) computeNextFlushDelay() time.Duration {
 		shard.mu.RUnlock()
 	}
 
-	if delay := earliest.Sub(now); delay > time.Millisecond {
-		return delay
+	// Clamp to at least 1ms in the future so Reset never gets zero/negative.
+	if earliest.Before(now.Add(time.Millisecond)) {
+		return now.Add(time.Millisecond)
 	}
-	return time.Millisecond
+	return earliest
 }
 
 // flushAgedBuffers flushes buffers that have exceeded max age
