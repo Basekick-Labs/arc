@@ -78,8 +78,10 @@ func buildOrderByClause(sortKeys []string) string {
 
 	var quotedKeys []string
 	for _, key := range sortKeys {
-		// Quote column names to handle special characters and reserved words
-		quotedKeys = append(quotedKeys, fmt.Sprintf(`"%s"`, key))
+		// Double-quote escaping: DuckDB treats "" inside a quoted identifier as a literal "
+		// (same as PostgreSQL). This prevents identifier breakout even if validation is bypassed.
+		escaped := strings.ReplaceAll(key, `"`, `""`)
+		quotedKeys = append(quotedKeys, fmt.Sprintf(`"%s"`, escaped))
 	}
 
 	return fmt.Sprintf("ORDER BY %s", strings.Join(quotedKeys, ", "))
