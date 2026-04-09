@@ -126,7 +126,7 @@ func buildDSN(_ *Config) string {
 func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	// Set memory limit to prevent unbounded memory growth
 	if cfg.MemoryLimit != "" {
-		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL memory_limit='%s'", cfg.MemoryLimit)); err != nil {
+		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL memory_limit='%s'", escapeSQLString(cfg.MemoryLimit))); err != nil {
 			return fmt.Errorf("failed to set memory_limit: %w", err)
 		}
 	}

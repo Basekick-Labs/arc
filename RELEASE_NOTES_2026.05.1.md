@@ -1,5 +1,19 @@
 # Arc v2026.05.1 Release Notes
 
+## Security Fixes
+
+### SQL Injection in DuckDB `SET memory_limit` (compaction + database init)
+
+The `SET memory_limit` command in both the main DuckDB connection (`duckdb.go`) and the compaction subprocess (`subprocess.go`) interpolated the configured memory limit value without escaping single quotes. An attacker with access to the configuration could inject arbitrary SQL.
+
+**Fix:** Applied `escapeSQLString()` (single-quote doubling) to the memory limit value at both call sites. The existing config validation regex (`memoryLimitRe`) provides defense-in-depth but the SQL escaping is now a failsafe regardless of how the value arrives.
+
+### SQL Injection via Sort Key Names in Compaction `ORDER BY` Clause
+
+`buildOrderByClause()` wrapped sort key column names in double quotes but did not escape internal double quotes, allowing identifier breakout. A sort key containing a `"` character could inject arbitrary SQL into the compaction `COPY ... ORDER BY` statement.
+
+**Fix:** Added `strings.ReplaceAll(key, "\"", "\"\"")` before quoting, matching the escaping pattern already used in `dedup.go` for tag column identifiers.
+
 ## Bug Fixes
 
 ### WAL Filename Rotation Collision
