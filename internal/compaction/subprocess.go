@@ -90,7 +90,7 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 	// Set DuckDB memory limit from config.
 	// This prevents OOM on servers without swap by forcing DuckDB to spill to disk.
 	if config.MemoryLimit != "" {
-		if _, err := db.Exec(fmt.Sprintf("SET memory_limit='%s'", strings.ReplaceAll(config.MemoryLimit, "'", "''"))); err != nil {
+		if _, err := db.Exec(fmt.Sprintf("SET memory_limit='%s'", escapeSQLString(config.MemoryLimit))); err != nil {
 			logger.Warn().Err(err).Str("limit", config.MemoryLimit).Msg("Failed to set DuckDB memory limit")
 		} else {
 			logger.Info().Str("limit", config.MemoryLimit).Msg("DuckDB memory limit configured")

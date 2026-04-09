@@ -16,6 +16,12 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// escapeSQLString escapes single quotes for safe use in DuckDB SQL string literals.
+// This prevents SQL injection when interpolating configuration values.
+func escapeSQLString(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
 // escapeSQLPath escapes file paths for safe SQL interpolation in DuckDB queries.
 // This prevents SQL injection attacks from malicious filenames containing quotes or backslashes.
 func escapeSQLPath(path string) string {
