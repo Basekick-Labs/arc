@@ -1,5 +1,13 @@
 # Arc v2026.05.1 Release Notes
 
+## Deprecations
+
+### Authentication via `?p=` Query Parameter (InfluxDB 1.x Compatibility)
+
+Authentication via the `?p=token` query parameter (InfluxDB 1.x compatibility) is now **deprecated**. Tokens passed in URLs are exposed in HTTP access logs from reverse proxies, load balancers, and web servers — creating a credential leak risk.
+
+The `?p=` method continues to work but Arc now logs a one-time warning on first use. Migrate clients to the `Authorization: Bearer <token>` header instead.
+
 ## Security Fixes
 
 ### Sensitive Directories Created with World-Readable Permissions (0755)
