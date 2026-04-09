@@ -24,9 +24,6 @@ type MiddlewareConfig struct {
 
 	// Skip authentication entirely (for development/testing)
 	Skip bool
-
-	// queryParamDeprecationLogged ensures the ?p= deprecation warning is logged only once
-	queryParamDeprecationLogged sync.Once
 }
 
 // DefaultMiddlewareConfig returns default middleware config
@@ -46,6 +43,8 @@ func DefaultMiddlewareConfig() MiddlewareConfig {
 
 // NewMiddleware creates authentication middleware for Fiber
 func NewMiddleware(config MiddlewareConfig) fiber.Handler {
+	var queryParamDeprecationLogged sync.Once
+
 	return func(c *fiber.Ctx) error {
 		// Skip authentication if disabled
 		if config.Skip {
@@ -79,12 +78,11 @@ func NewMiddleware(config MiddlewareConfig) fiber.Handler {
 		// Warn once if token was provided via ?p= query parameter (InfluxDB 1.x compat).
 		// Tokens in URLs are exposed in HTTP access logs (reverse proxies, load balancers).
 		if token != "" && c.Query("p") != "" {
-			config.queryParamDeprecationLogged.Do(func() {
-				if config.AuthManager != nil {
-					config.AuthManager.Logger().Warn().
-						Str("client_ip", c.IP()).
-						Msg("Authentication via ?p= query parameter is deprecated — tokens in URLs are exposed in access logs. Use the Authorization header instead.")
-				}
+			queryParamDeprecationLogged.Do(func() {
+				logger := config.AuthManager.Logger()
+				logger.Warn().
+					Str("client_ip", c.IP()).
+					Msg("Authentication via ?p= query parameter is deprecated — tokens in URLs are exposed in access logs. Use the Authorization header instead.")
 			})
 		}
 

@@ -58,8 +58,8 @@ type AuthManager struct {
 }
 
 // Logger returns the auth component logger.
-func (am *AuthManager) Logger() *zerolog.Logger {
-	return &am.logger
+func (am *AuthManager) Logger() zerolog.Logger {
+	return am.logger
 }
 
 // NewAuthManager creates a new authentication manager
