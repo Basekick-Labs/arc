@@ -128,4 +128,8 @@ type HeartbeatAck struct {
 type LeaveNotify struct {
 	NodeID string `json:"node_id"`
 	Reason string `json:"reason,omitempty"`
+	// Authentication (present when shared_secret configured)
+	AuthNonce     string `json:"auth_nonce,omitempty"`
+	AuthTimestamp int64  `json:"auth_timestamp,omitempty"`
+	AuthHMAC      string `json:"auth_hmac,omitempty"`
 }

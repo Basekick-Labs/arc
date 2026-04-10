@@ -302,7 +302,57 @@ func (c *Coordinator) Start() error {
 }
 
 // Stop stops the cluster coordinator gracefully.
+// broadcastLeave sends a LeaveNotify message to all known peers so they can
+// immediately remove this node from Raft and the registry, rather than waiting
+// for the heartbeat timeout to detect the departure.
+func (c *Coordinator) broadcastLeave() {
+	if c.registry == nil {
+		return
+	}
+
+	leave := &protocol.LeaveNotify{
+		NodeID: c.localNode.ID,
+		Reason: "graceful shutdown",
+	}
+
+	// Sign the leave message if shared secret is configured
+	if c.cfg.SharedSecret != "" {
+		nonce, err := security.GenerateNonce()
+		if err == nil {
+			leave.AuthTimestamp = time.Now().Unix()
+			leave.AuthNonce = nonce
+			leave.AuthHMAC = security.ComputeHMAC(c.cfg.SharedSecret, nonce, leave.NodeID, c.cfg.ClusterName, leave.AuthTimestamp)
+		}
+	}
+
+	msg := protocol.NewLeaveNotify(leave)
+	notified := 0
+
+	peers := c.registry.GetAll()
+	for _, peer := range peers {
+		if peer.ID == c.localNode.ID || peer.Address == "" {
+			continue
+		}
+		conn, err := security.Dial("tcp", peer.Address, 2*time.Second, c.tlsConfig)
+		if err != nil {
+			c.logger.Debug().Str("peer", peer.Address).Err(err).Msg("Failed to notify peer of leave")
+			continue
+		}
+		_ = protocol.SendMessage(conn, msg, 2*time.Second)
+		conn.Close()
+		notified++
+	}
+
+	if notified > 0 {
+		c.logger.Info().Int("peers_notified", notified).Msg("Broadcast leave notification to cluster peers")
+	}
+}
+
 func (c *Coordinator) Stop() error {
+	// Broadcast leave BEFORE acquiring the lock — broadcastLeave() does
+	// network I/O with per-peer timeouts and must not block the mutex.
+	c.broadcastLeave()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -764,6 +814,21 @@ func (c *Coordinator) handleHeartbeat(conn net.Conn, hb *protocol.Heartbeat) {
 
 // handleLeaveNotify processes a leave notification from a peer.
 func (c *Coordinator) handleLeaveNotify(leave *protocol.LeaveNotify) {
+	// Validate shared secret if configured
+	if c.cfg.SharedSecret != "" {
+		if leave.AuthHMAC == "" {
+			c.logger.Warn().Str("node_id", leave.NodeID).Msg("Leave rejected: shared secret required but not provided")
+			return
+		}
+		if err := security.ValidateHMAC(
+			c.cfg.SharedSecret, leave.AuthNonce, leave.NodeID, c.cfg.ClusterName,
+			leave.AuthTimestamp, leave.AuthHMAC, 5*time.Minute,
+		); err != nil {
+			c.logger.Warn().Err(err).Str("node_id", leave.NodeID).Msg("Leave rejected: authentication failed")
+			return
+		}
+	}
+
 	c.logger.Info().
 		Str("node_id", leave.NodeID).
 		Str("reason", leave.Reason).
@@ -944,14 +1009,19 @@ func (c *Coordinator) Status() map[string]interface{} {
 func generateNodeID() string {
 	hostname, err := os.Hostname()
 	if err != nil {
-		hostname = "unknown"
+		// Fallback: random ID only if hostname is unavailable
+		suffix := make([]byte, 8)
+		rand.Read(suffix)
+		return fmt.Sprintf("arc-%x", suffix)
 	}
-
-	// Generate random suffix with 64 bits of entropy for collision resistance
-	suffix := make([]byte, 8)
-	rand.Read(suffix)
-
-	return fmt.Sprintf("%s-%d-%x", hostname, time.Now().UnixNano(), suffix)
+	// Use hostname as-is. In Kubernetes StatefulSets, the hostname is the
+	// stable pod name (e.g. "arc-writer-0"), which survives pod reschedules.
+	// This ensures a restarted pod rejoins the cluster with the same identity
+	// instead of registering as a new node and leaving a dead voter behind.
+	//
+	// For non-Kubernetes deployments where hostnames may collide, set
+	// cluster.node_id explicitly in the config to guarantee uniqueness.
+	return hostname
 }
 
 // validateClusteringLicense validates that the license allows clustering.

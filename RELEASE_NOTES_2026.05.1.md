@@ -27,6 +27,12 @@ cluster:
   tls_key_file: "/etc/arc/cluster-key.pem"
 ```
 
+### Kubernetes-Ready Cluster Node Identity (Enterprise)
+
+Cluster node identity is now stable across pod reschedules. When `cluster.node_id` is not explicitly set, Arc uses the OS hostname as the node ID — in Kubernetes StatefulSets, this is the pod name (e.g., `arc-writer-0`), which survives reschedules. A restarted pod rejoins the cluster with the same identity instead of registering as a new node and leaving a dead Raft voter behind.
+
+Additionally, cluster nodes now broadcast a `LeaveNotify` message to all peers during graceful shutdown. Peers immediately remove the departing node from Raft and the registry, rather than waiting for the heartbeat timeout to detect the departure. This makes rolling updates and scale-down operations clean and predictable.
+
 ### RBAC Cache Lifecycle Management (Enterprise)
 
 RBACManager now has proper lifecycle management and bounded memory usage:
