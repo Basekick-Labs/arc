@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/protocol"
@@ -326,25 +327,31 @@ func (c *Coordinator) broadcastLeave() {
 	}
 
 	msg := protocol.NewLeaveNotify(leave)
-	notified := 0
+	var notified atomic.Int32
+	var wg sync.WaitGroup
 
 	peers := c.registry.GetAll()
 	for _, peer := range peers {
 		if peer.ID == c.localNode.ID || peer.Address == "" {
 			continue
 		}
-		conn, err := security.Dial("tcp", peer.Address, 2*time.Second, c.tlsConfig)
-		if err != nil {
-			c.logger.Debug().Str("peer", peer.Address).Err(err).Msg("Failed to notify peer of leave")
-			continue
-		}
-		_ = protocol.SendMessage(conn, msg, 2*time.Second)
-		conn.Close()
-		notified++
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+			conn, err := security.Dial("tcp", addr, 2*time.Second, c.tlsConfig)
+			if err != nil {
+				c.logger.Debug().Str("peer", addr).Err(err).Msg("Failed to notify peer of leave")
+				return
+			}
+			_ = protocol.SendMessage(conn, msg, 2*time.Second)
+			conn.Close()
+			notified.Add(1)
+		}(peer.Address)
 	}
+	wg.Wait()
 
-	if notified > 0 {
-		c.logger.Info().Int("peers_notified", notified).Msg("Broadcast leave notification to cluster peers")
+	if n := notified.Load(); n > 0 {
+		c.logger.Info().Int32("peers_notified", n).Msg("Broadcast leave notification to cluster peers")
 	}
 }
 
@@ -1014,14 +1021,15 @@ func generateNodeID() string {
 		rand.Read(suffix)
 		return fmt.Sprintf("arc-%x", suffix)
 	}
-	// Use hostname as-is. In Kubernetes StatefulSets, the hostname is the
-	// stable pod name (e.g. "arc-writer-0"), which survives pod reschedules.
-	// This ensures a restarted pod rejoins the cluster with the same identity
-	// instead of registering as a new node and leaving a dead voter behind.
+	// Use hostname + PID. In Kubernetes StatefulSets, the hostname is the
+	// stable pod name (e.g. "arc-writer-0"), and PID is always 1 inside a
+	// container — so the ID is deterministic across restarts.
 	//
-	// For non-Kubernetes deployments where hostnames may collide, set
-	// cluster.node_id explicitly in the config to guarantee uniqueness.
-	return hostname
+	// For bare-metal/VM deployments, the PID suffix prevents collisions when
+	// running multiple Arc instances on the same host (e.g. dev/testing).
+	//
+	// For full control, set cluster.node_id explicitly in the config.
+	return fmt.Sprintf("%s-%d", hostname, os.Getpid())
 }
 
 // validateClusteringLicense validates that the license allows clustering.
