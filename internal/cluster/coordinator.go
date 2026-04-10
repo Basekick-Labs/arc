@@ -12,11 +12,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/basekick-labs/arc/internal/cluster/protocol"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/cluster/replication"
 	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/basekick-labs/arc/internal/config"
+	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/wal"
 	"github.com/rs/zerolog"
@@ -51,6 +53,7 @@ type Coordinator struct {
 	replicationSender   *replication.Sender   // Writer only: sends entries to readers
 	replicationReceiver *replication.Receiver // Reader only: receives entries from writer
 	walWriter           *wal.Writer           // Reference to local WAL for replication hook
+	ingestBuffer        *ingest.ArrowBuffer   // Reader only: applies replicated entries to local buffer
 
 	// Network
 	listener  net.Listener
@@ -1220,6 +1223,16 @@ func (c *Coordinator) SetWAL(walWriter *wal.Writer) {
 	c.walWriter = walWriter
 }
 
+// SetIngestBuffer sets the ArrowBuffer for reader nodes to apply replicated
+// entries. This enables query freshness — readers can query unflushed writer
+// data that arrives via WAL replication.
+func (c *Coordinator) SetIngestBuffer(buffer *ingest.ArrowBuffer) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ingestBuffer = buffer
+	c.logger.Info().Msg("Ingest buffer set for replication — readers will apply replicated entries")
+}
+
 // StartReplication starts WAL replication based on node role.
 // - Writers start a Sender to stream entries to readers
 // - Readers start a Receiver to receive entries from the writer
@@ -1321,10 +1334,18 @@ func (c *Coordinator) waitForWriterAndStartReceiver() {
 // startReceiverWithAddr starts the replication receiver with the given writer address.
 // Caller must hold c.mu lock.
 func (c *Coordinator) startReceiverWithAddr(writerAddr string) error {
+	// Build IngestHandler if ArrowBuffer is available — allows reader to
+	// apply replicated entries to its local buffer for query freshness.
+	var ingestHandler replication.IngestHandler
+	if c.ingestBuffer != nil {
+		ingestHandler = c.buildReplicationIngestHandler()
+	}
+
 	c.replicationReceiver = replication.NewReceiver(&replication.ReceiverConfig{
 		ReaderID:          c.localNode.ID,
 		WriterAddr:        writerAddr,
 		LocalWAL:          c.walWriter,
+		IngestHandler:     ingestHandler,
 		ReconnectInterval: 5 * time.Second,
 		AckInterval:       time.Duration(c.cfg.ReplicationAckInterval) * time.Millisecond,
 		Logger:            c.logger,
@@ -1337,9 +1358,98 @@ func (c *Coordinator) startReceiverWithAddr(writerAddr string) error {
 
 	c.logger.Info().
 		Str("writer_addr", writerAddr).
+		Bool("ingest_handler", ingestHandler != nil).
 		Msg("Replication receiver started (reader mode)")
 
 	return nil
+}
+
+// buildReplicationIngestHandler creates an IngestHandler that parses WAL envelope
+// payloads and writes them to the local ArrowBuffer (NoWAL variant — the receiver's
+// LocalWAL path already handles WAL persistence).
+func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler {
+	return replication.IngestHandlerFunc(func(ctx context.Context, payload []byte) error {
+		// Safety: read-lock to avoid data race with SetIngestBuffer
+		c.mu.RLock()
+		buf := c.ingestBuffer
+		c.mu.RUnlock()
+		if buf == nil {
+			return nil
+		}
+
+		// Parse WAL envelope to extract database name and msgpack payload
+		database, msgpackData := wal.ParseEnvelope(payload, "default")
+
+		// Try columnar format first (map with "m" + "columns" keys)
+		var rawMap map[string]interface{}
+		if err := msgpack.Unmarshal(msgpackData, &rawMap); err == nil {
+			if measurement, ok := rawMap["m"].(string); ok && measurement != "" {
+				if columns, ok := rawMap["columns"].(map[string]interface{}); ok && len(columns) > 0 {
+					typedColumns := make(map[string][]interface{}, len(columns))
+					for k, v := range columns {
+						if arr, ok := v.([]interface{}); ok {
+							typedColumns[k] = arr
+						}
+					}
+					if len(typedColumns) > 0 {
+						return buf.WriteColumnarDirectNoWAL(ctx, database, measurement, typedColumns)
+					}
+				}
+			}
+		}
+
+		// Fall back to row format (array of maps)
+		var records []map[string]interface{}
+		if err := msgpack.Unmarshal(msgpackData, &records); err == nil && len(records) > 0 {
+			byMeasurement := make(map[string][]map[string]interface{})
+			for _, r := range records {
+				m, _ := r["_measurement"].(string)
+				if m == "" {
+					m, _ = r["measurement"].(string)
+				}
+				if m == "" {
+					m, _ = r["m"].(string)
+				}
+				if m != "" {
+					byMeasurement[m] = append(byMeasurement[m], r)
+				}
+			}
+			for measurement, rows := range byMeasurement {
+				columns := rowsToColumns(rows)
+				if len(columns) > 0 {
+					if err := buf.WriteColumnarDirectNoWAL(ctx, database, measurement, columns); err != nil {
+						return fmt.Errorf("write replicated rows for %s: %w", measurement, err)
+					}
+				}
+			}
+			return nil
+		}
+
+		c.logger.Debug().Int("payload_size", len(payload)).Msg("Skipped unrecognized replicated entry format")
+		return nil
+	})
+}
+
+// rowsToColumns converts row-format records to columnar format for ArrowBuffer.
+// Metadata keys (_measurement, measurement, m, _database, database) are filtered
+// out to prevent them from being ingested as regular data columns.
+func rowsToColumns(rows []map[string]interface{}) map[string][]interface{} {
+	if len(rows) == 0 {
+		return map[string][]interface{}{}
+	}
+	columns := make(map[string][]interface{})
+	for i, r := range rows {
+		for k, v := range r {
+			if k == "measurement" || k == "m" || k == "_measurement" || k == "database" || k == "_database" {
+				continue
+			}
+			if _, ok := columns[k]; !ok {
+				columns[k] = make([]interface{}, len(rows))
+			}
+			columns[k][i] = v
+		}
+	}
+	return columns
 }
 
 // StopReplication stops WAL replication.

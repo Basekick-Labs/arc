@@ -40,6 +40,20 @@ const (
 	WALEnvelopeMarker = 0x01
 )
 
+// ParseEnvelope extracts the database name and msgpack payload from a WAL entry.
+// If the payload uses the envelope format [0x01][2-byte dbLen][dbName][msgpack],
+// it returns the database name and the inner msgpack bytes. Otherwise, it returns
+// defaultDB and the original payload unchanged.
+func ParseEnvelope(payload []byte, defaultDB string) (database string, msgpackData []byte) {
+	if len(payload) > 3 && payload[0] == WALEnvelopeMarker {
+		dbLen := binary.BigEndian.Uint16(payload[1:3])
+		if int(3+dbLen) <= len(payload) {
+			return string(payload[3 : 3+dbLen]), payload[3+dbLen:]
+		}
+	}
+	return defaultDB, payload
+}
+
 // SyncMode defines how WAL syncs to disk
 type SyncMode string
 
