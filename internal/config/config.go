@@ -342,6 +342,13 @@ type ClusterConfig struct {
 	FailoverEnabled         bool // Enable automatic writer failover (default: false)
 	FailoverTimeoutSeconds  int  // Timeout for failover operation in seconds (default: 30)
 	FailoverCooldownSeconds int  // Cooldown between failovers in seconds (default: 60)
+
+	// Cluster security (Enterprise)
+	SharedSecret string // Shared secret for join authentication (HMAC-SHA256). All nodes must share the same value.
+	TLSEnabled   bool   // Enable TLS for all inter-node communication (default: false)
+	TLSCertFile  string // Path to TLS certificate file (PEM format)
+	TLSKeyFile   string // Path to TLS private key file (PEM format)
+	TLSCAFile    string // Optional: CA certificate for verifying peer certificates
 }
 
 // Load loads configuration from environment and config file
@@ -559,6 +566,12 @@ func Load() (*Config, error) {
 			FailoverEnabled:         v.GetBool("cluster.failover_enabled"),
 			FailoverTimeoutSeconds:  v.GetInt("cluster.failover_timeout"),
 			FailoverCooldownSeconds: v.GetInt("cluster.failover_cooldown"),
+			// Cluster security
+			SharedSecret: v.GetString("cluster.shared_secret"),
+			TLSEnabled:   v.GetBool("cluster.tls_enabled"),
+			TLSCertFile:  v.GetString("cluster.tls_cert_file"),
+			TLSKeyFile:   v.GetString("cluster.tls_key_file"),
+			TLSCAFile:    v.GetString("cluster.tls_ca_file"),
 		},
 		TieredStorage: TieredStorageConfig{
 			Enabled:                v.GetBool("tiered_storage.enabled"),
@@ -784,6 +797,13 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.failover_enabled", false) // Disabled by default
 	v.SetDefault("cluster.failover_timeout", 30)    // 30 second failover timeout
 	v.SetDefault("cluster.failover_cooldown", 60)   // 60 second cooldown between failovers
+
+	// Cluster security defaults
+	v.SetDefault("cluster.shared_secret", "")
+	v.SetDefault("cluster.tls_enabled", false)
+	v.SetDefault("cluster.tls_cert_file", "")
+	v.SetDefault("cluster.tls_key_file", "")
+	v.SetDefault("cluster.tls_ca_file", "")
 
 	// Tiered storage defaults (Enterprise feature)
 	// Simple 2-tier system: Hot (local) -> Cold (S3/Azure archive)

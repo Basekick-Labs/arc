@@ -2,6 +2,7 @@ package replication
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"sync"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/basekick-labs/arc/internal/cluster/protocol"
+	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/rs/zerolog"
 )
 
@@ -47,6 +49,9 @@ type ReceiverConfig struct {
 
 	// Logger for receiver events
 	Logger zerolog.Logger
+
+	// TLSConfig for encrypted inter-node communication (nil = plain TCP)
+	TLSConfig *tls.Config
 }
 
 // Receiver receives WAL entries from the writer node and applies them locally.
@@ -179,8 +184,8 @@ func (r *Receiver) connectionLoop() {
 func (r *Receiver) connect() error {
 	r.logger.Debug().Str("writer_addr", r.cfg.WriterAddr).Msg("Connecting to writer")
 
-	// Connect with timeout
-	conn, err := net.DialTimeout("tcp", r.cfg.WriterAddr, 10*time.Second)
+	// Connect with timeout (TLS if configured)
+	conn, err := security.Dial("tcp", r.cfg.WriterAddr, 10*time.Second, r.cfg.TLSConfig)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}

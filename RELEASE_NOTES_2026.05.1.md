@@ -8,29 +8,43 @@ Authentication via the `?p=token` query parameter (InfluxDB 1.x compatibility) i
 
 The `?p=` method continues to work but Arc now logs a one-time warning on first use. Migrate clients to the `Authorization: Bearer <token>` header instead.
 
-## Security Fixes
+## New Features
 
-### Sensitive Directories Created with World-Readable Permissions (0755)
+### Cluster TLS Encryption and Shared Secret Authentication (Enterprise)
 
-Five directories containing sensitive data (SQLite databases with API tokens, RBAC config, audit logs, and Raft consensus state) were created with 0755 permissions, allowing any user on the system to read their contents — including SQLite WAL and SHM sidecar files.
+Arc Enterprise clustering now supports encrypted inter-node communication and authenticated cluster joins — bringing production-grade security to multi-node deployments.
 
-**Affected locations:** `auth.go` (auth DB), `continuous_query.go` (CQ DB), `retention.go` (retention DB), `raft/node.go` (Raft state), `sharding/shard_raft.go` (shard Raft state).
+- **Shared secret authentication** (`cluster.shared_secret`): When configured, join requests include an HMAC-SHA256 signature over a random nonce, node ID, cluster name, and timestamp. The leader validates the signature and rejects unauthorized joins. Timestamps are checked within a 5-minute tolerance to prevent replay attacks.
+- **TLS encryption** (`cluster.tls_enabled` + cert/key files): All inter-node TCP connections — coordinator, WAL replication, shard replication, and Raft consensus — are wrapped in TLS. Raft transport uses a custom `TLSStreamLayer` implementing `raft.StreamLayer`. Optional CA certificate (`cluster.tls_ca_file`) enables mutual TLS for peer certificate verification.
+- Both features are opt-in and backward compatible. When disabled, behavior is unchanged.
 
-**Fix:** All five changed to 0700 (owner-only), consistent with WAL, local storage, and temp directories which already used 0700.
+**Configuration example:**
+```yaml
+cluster:
+  shared_secret: "my-cluster-secret"
+  tls_enabled: true
+  tls_cert_file: "/etc/arc/cluster-cert.pem"
+  tls_key_file: "/etc/arc/cluster-key.pem"
+```
+
+### RBAC Cache Lifecycle Management (Enterprise)
+
+RBACManager now has proper lifecycle management and bounded memory usage:
+
+- Added `Close()` method with graceful shutdown of the background cache cleanup goroutine. RBACManager is registered with the shutdown coordinator.
+- Permission and token caches are now bounded with a configurable `MaxCacheSize` (default 10,000 entries per cache). When exceeded, a random entry is evicted on insertion, working alongside the existing TTL cleanup.
+
+## Hardening
+
+### Directory Permissions
+
+Directories containing sensitive data (auth database, continuous query definitions, retention policies, Raft consensus state, telemetry, and import output) now use 0700 (owner-only) permissions, consistent with WAL and local storage directories.
 
 **Note:** `os.MkdirAll` does not change permissions on existing directories, so existing deployments retain their current permissions. Operators upgrading from earlier versions should manually run `chmod 700` on their data directory if desired.
 
-### SQL Injection in DuckDB `SET memory_limit` (compaction + database init)
+### SQL Escaping in Compaction
 
-The `SET memory_limit` command in both the main DuckDB connection (`duckdb.go`) and the compaction subprocess (`subprocess.go`) interpolated the configured memory limit value without escaping single quotes. An attacker with access to the configuration could inject arbitrary SQL.
-
-**Fix:** Applied `escapeSQLString()` (single-quote doubling) to the memory limit value at both call sites. The existing config validation regex (`memoryLimitRe`) provides defense-in-depth but the SQL escaping is now a failsafe regardless of how the value arrives.
-
-### SQL Injection via Sort Key Names in Compaction `ORDER BY` Clause
-
-`buildOrderByClause()` wrapped sort key column names in double quotes but did not escape internal double quotes, allowing identifier breakout. A sort key containing a `"` character could inject arbitrary SQL into the compaction `COPY ... ORDER BY` statement.
-
-**Fix:** Added `strings.ReplaceAll(key, "\"", "\"\"")` before quoting, matching the escaping pattern already used in `dedup.go` for tag column identifiers.
+Applied defense-in-depth SQL escaping to DuckDB `SET memory_limit` (single-quote escaping) and compaction `ORDER BY` sort key names (double-quote identifier escaping). Both already had config-level validation, but the runtime escaping provides an additional safety layer.
 
 ## Bug Fixes
 

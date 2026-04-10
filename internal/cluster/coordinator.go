@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster/protocol"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/cluster/replication"
+	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/wal"
@@ -50,7 +52,8 @@ type Coordinator struct {
 	walWriter           *wal.Writer           // Reference to local WAL for replication hook
 
 	// Network
-	listener net.Listener
+	listener  net.Listener
+	tlsConfig *tls.Config // nil if cluster TLS disabled
 
 	// State
 	running bool
@@ -103,13 +106,36 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		Logger:    cfg.Logger,
 	})
 
+	// Validate and initialize cluster TLS if enabled
+	if cfg.Config.TLSEnabled {
+		if cfg.Config.TLSCertFile == "" || cfg.Config.TLSKeyFile == "" {
+			return nil, fmt.Errorf("cluster TLS enabled but tls_cert_file and tls_key_file must be specified")
+		}
+	}
+	tlsCfg, err := security.ClusterTLSConfig(cfg.Config)
+	if err != nil {
+		return nil, fmt.Errorf("cluster TLS setup: %w", err)
+	}
+
+	logger := cfg.Logger.With().Str("component", "cluster-coordinator").Logger()
+
+	// Warn if shared secret is used without TLS (HMAC is visible on the wire)
+	if cfg.Config.SharedSecret != "" && !cfg.Config.TLSEnabled {
+		logger.Warn().Msg("Cluster shared_secret configured without TLS — HMAC tokens are visible on the network. Enable cluster.tls_enabled for full security.")
+	}
+
 	c := &Coordinator{
 		cfg:           cfg.Config,
 		licenseClient: cfg.LicenseClient,
 		registry:      registry,
 		localNode:     localNode,
+		tlsConfig:     tlsCfg,
 		stopCh:        make(chan struct{}),
-		logger:        cfg.Logger.With().Str("component", "cluster-coordinator").Logger(),
+		logger:        logger,
+	}
+
+	if tlsCfg != nil {
+		c.logger.Info().Msg("Cluster TLS enabled for inter-node communication")
 	}
 
 	// Create health checker
@@ -143,6 +169,7 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 			SnapshotInterval:  time.Duration(cfg.Config.RaftSnapshotInterval) * time.Second,
 			SnapshotThreshold: uint64(cfg.Config.RaftSnapshotThreshold),
 			Logger:            cfg.Logger,
+			TLSConfig:         tlsCfg,
 		}
 
 		var err error
@@ -233,7 +260,7 @@ func (c *Coordinator) Start() error {
 
 	// Start listening for peer connections if we have a coordinator address
 	if c.cfg.CoordinatorAddr != "" {
-		listener, err := net.Listen("tcp", c.cfg.CoordinatorAddr)
+		listener, err := security.Listen("tcp", c.cfg.CoordinatorAddr, c.tlsConfig)
 		if err != nil {
 			return fmt.Errorf("failed to start coordinator listener: %w", err)
 		}
@@ -383,7 +410,7 @@ func (c *Coordinator) discoverPeers() {
 
 // tryJoinViaSeed attempts to join the cluster via a seed node.
 func (c *Coordinator) tryJoinViaSeed(seedAddr string) error {
-	conn, err := net.DialTimeout("tcp", seedAddr, 5*time.Second)
+	conn, err := security.Dial("tcp", seedAddr, 5*time.Second, c.tlsConfig)
 	if err != nil {
 		return fmt.Errorf("failed to connect to seed: %w", err)
 	}
@@ -400,6 +427,17 @@ func (c *Coordinator) tryJoinViaSeed(seedAddr string) error {
 		CoordAddr:   c.cfg.AdvertiseAddr,
 		Version:     c.localNode.Version,
 		CoreCount:   runtime.GOMAXPROCS(0), // Report current GOMAXPROCS as core count
+	}
+
+	// Sign join request if shared secret is configured
+	if c.cfg.SharedSecret != "" {
+		nonce, err := security.GenerateNonce()
+		if err != nil {
+			return fmt.Errorf("generate auth nonce: %w", err)
+		}
+		req.AuthTimestamp = time.Now().Unix()
+		req.AuthNonce = nonce
+		req.AuthHMAC = security.ComputeHMAC(c.cfg.SharedSecret, nonce, req.NodeID, req.ClusterName, req.AuthTimestamp)
 	}
 
 	// If RaftAdvertiseAddr is empty, use RaftBindAddr
@@ -551,6 +589,23 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 	if req.ClusterName != c.cfg.ClusterName {
 		c.sendJoinError(conn, fmt.Sprintf("cluster name mismatch: expected %s, got %s", c.cfg.ClusterName, req.ClusterName))
 		return
+	}
+
+	// Validate shared secret authentication
+	if c.cfg.SharedSecret != "" {
+		if req.AuthHMAC == "" {
+			c.logger.Warn().Str("node_id", req.NodeID).Msg("Join rejected: shared secret required but not provided")
+			c.sendJoinError(conn, "shared secret authentication required")
+			return
+		}
+		if err := security.ValidateHMAC(
+			c.cfg.SharedSecret, req.AuthNonce, req.NodeID, req.ClusterName,
+			req.AuthTimestamp, req.AuthHMAC, 5*time.Minute,
+		); err != nil {
+			c.logger.Warn().Err(err).Str("node_id", req.NodeID).Msg("Join rejected: authentication failed")
+			c.sendJoinError(conn, "authentication failed: invalid shared secret")
+			return
+		}
 	}
 
 	// Check if we're the leader
@@ -1195,6 +1250,7 @@ func (c *Coordinator) startReceiverWithAddr(writerAddr string) error {
 		ReconnectInterval: 5 * time.Second,
 		AckInterval:       time.Duration(c.cfg.ReplicationAckInterval) * time.Millisecond,
 		Logger:            c.logger,
+		TLSConfig:         c.tlsConfig,
 	})
 
 	if err := c.replicationReceiver.Start(c.ctx); err != nil {

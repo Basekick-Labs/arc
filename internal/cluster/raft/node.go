@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -9,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	"github.com/rs/zerolog"
@@ -41,6 +43,9 @@ type NodeConfig struct {
 	TrailingLogs      uint64
 
 	Logger zerolog.Logger
+
+	// TLSConfig for encrypted Raft transport (nil = plain TCP)
+	TLSConfig *tls.Config
 }
 
 // DefaultNodeConfig returns a NodeConfig with sensible defaults.
@@ -163,9 +168,19 @@ func (n *Node) Start() error {
 		return fmt.Errorf("failed to resolve advertise address: %w", err)
 	}
 
-	transport, err := raft.NewTCPTransport(n.cfg.BindAddr, addr, 3, 10*time.Second, os.Stderr)
-	if err != nil {
-		return fmt.Errorf("failed to create transport: %w", err)
+	var transport *raft.NetworkTransport
+	if n.cfg.TLSConfig != nil {
+		stream, tlsErr := security.NewTLSStreamLayer(n.cfg.BindAddr, addr, n.cfg.TLSConfig)
+		if tlsErr != nil {
+			return fmt.Errorf("failed to create TLS stream layer: %w", tlsErr)
+		}
+		transport = raft.NewNetworkTransport(stream, 3, 10*time.Second, os.Stderr)
+	} else {
+		var tcpErr error
+		transport, tcpErr = raft.NewTCPTransport(n.cfg.BindAddr, addr, 3, 10*time.Second, os.Stderr)
+		if tcpErr != nil {
+			return fmt.Errorf("failed to create transport: %w", tcpErr)
+		}
 	}
 	n.transport = transport
 
