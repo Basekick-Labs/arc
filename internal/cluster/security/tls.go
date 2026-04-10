@@ -23,6 +23,21 @@ func ClusterTLSConfig(cfg *config.ClusterConfig) (*tls.Config, error) {
 		return nil, fmt.Errorf("load cluster TLS keypair: %w", err)
 	}
 
+	// Check certificate expiration — warn but don't block startup
+	if len(cert.Certificate) > 0 {
+		leaf, parseErr := x509.ParseCertificate(cert.Certificate[0])
+		if parseErr == nil {
+			now := time.Now()
+			if now.After(leaf.NotAfter) {
+				fmt.Fprintf(os.Stderr, "WARNING: cluster TLS certificate EXPIRED on %s — connections may fail until certificate is renewed\n",
+					leaf.NotAfter.Format(time.RFC3339))
+			} else if leaf.NotAfter.Sub(now) < 30*24*time.Hour {
+				fmt.Fprintf(os.Stderr, "WARNING: cluster TLS certificate expires in %d days (%s)\n",
+					int(leaf.NotAfter.Sub(now).Hours()/24), leaf.NotAfter.Format(time.RFC3339))
+			}
+		}
+	}
+
 	tlsCfg := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
