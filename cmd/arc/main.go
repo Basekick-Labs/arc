@@ -783,6 +783,7 @@ func main() {
 						// Wire up WAL replication if enabled
 						if cfg.Cluster.ReplicationEnabled && walWriter != nil {
 							clusterCoordinator.SetWAL(walWriter)
+							clusterCoordinator.SetIngestBuffer(arrowBuffer)
 							if err := clusterCoordinator.StartReplication(); err != nil {
 								log.Warn().Err(err).Msg("Failed to start WAL replication")
 							} else {

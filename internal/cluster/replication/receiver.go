@@ -27,6 +27,13 @@ type IngestHandler interface {
 	ApplyReplicatedEntry(ctx context.Context, payload []byte) error
 }
 
+// IngestHandlerFunc is an adapter to allow the use of ordinary functions as IngestHandler.
+type IngestHandlerFunc func(ctx context.Context, payload []byte) error
+
+func (f IngestHandlerFunc) ApplyReplicatedEntry(ctx context.Context, payload []byte) error {
+	return f(ctx, payload)
+}
+
 // ReceiverConfig holds configuration for the replication receiver.
 type ReceiverConfig struct {
 	// ReaderID is this reader's unique identifier
