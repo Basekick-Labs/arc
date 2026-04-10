@@ -84,9 +84,15 @@ type RBACManager struct {
 	permCacheMu  sync.RWMutex
 	permCacheTTL time.Duration
 
+	// Maximum cache sizes — oldest entries evicted when exceeded
+	maxCacheSize int
+
 	// Cache stats
 	cacheHits   atomic.Int64
 	cacheMisses atomic.Int64
+
+	// Shutdown
+	done chan struct{}
 }
 
 // RBACManagerConfig holds configuration for the RBAC manager
@@ -95,6 +101,7 @@ type RBACManagerConfig struct {
 	LicenseClient *license.Client
 	Logger        zerolog.Logger
 	CacheTTL      time.Duration // TTL for permission cache (default: 30s)
+	MaxCacheSize  int           // Max entries per cache (default: 10000)
 }
 
 // NewRBACManager creates a new RBAC manager
@@ -102,6 +109,11 @@ func NewRBACManager(cfg *RBACManagerConfig) *RBACManager {
 	cacheTTL := cfg.CacheTTL
 	if cacheTTL == 0 {
 		cacheTTL = 30 * time.Second // Default 30s cache
+	}
+
+	maxCacheSize := cfg.MaxCacheSize
+	if maxCacheSize == 0 {
+		maxCacheSize = 10000 // Default 10k entries per cache
 	}
 
 	rm := &RBACManager{
@@ -112,6 +124,8 @@ func NewRBACManager(cfg *RBACManagerConfig) *RBACManager {
 		tokenCacheTTL: cacheTTL,
 		permCache:     make(map[permissionCacheKey]*permissionCacheEntry),
 		permCacheTTL:  cacheTTL,
+		maxCacheSize:  maxCacheSize,
+		done:          make(chan struct{}),
 	}
 
 	// Start background cache cleanup
@@ -120,13 +134,46 @@ func NewRBACManager(cfg *RBACManagerConfig) *RBACManager {
 	return rm
 }
 
+// Close stops the background cleanup goroutine.
+func (rm *RBACManager) Close() error {
+	close(rm.done)
+	return nil
+}
+
 // cacheCleanupLoop periodically cleans expired cache entries
 func (rm *RBACManager) cacheCleanupLoop() {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		rm.cleanupExpiredCache()
+	for {
+		select {
+		case <-ticker.C:
+			rm.cleanupExpiredCache()
+		case <-rm.done:
+			return
+		}
+	}
+}
+
+// evictPermCacheIfFull removes a random entry from the permission cache if it
+// has reached maxCacheSize. Caller must hold permCacheMu write lock.
+func (rm *RBACManager) evictPermCacheIfFull() {
+	if len(rm.permCache) >= rm.maxCacheSize {
+		for k := range rm.permCache {
+			delete(rm.permCache, k)
+			break
+		}
+	}
+}
+
+// evictTokenCacheIfFull removes a random entry from the token cache if it
+// has reached maxCacheSize. Caller must hold tokenCacheMu write lock.
+func (rm *RBACManager) evictTokenCacheIfFull() {
+	if len(rm.tokenCache) >= rm.maxCacheSize {
+		for k := range rm.tokenCache {
+			delete(rm.tokenCache, k)
+			break
+		}
 	}
 }
 
@@ -907,6 +954,7 @@ func (rm *RBACManager) CheckPermission(req *PermissionCheckRequest) *PermissionC
 
 	// Cache the result
 	rm.permCacheMu.Lock()
+	rm.evictPermCacheIfFull()
 	rm.permCache[cacheKey] = &permissionCacheEntry{
 		result:    result,
 		expiresAt: time.Now().Add(rm.permCacheTTL),
@@ -1025,6 +1073,7 @@ func (rm *RBACManager) CheckPermissionsBatch(reqs []*PermissionCheckRequest) []*
 
 			// Cache the result
 			rm.permCacheMu.Lock()
+			rm.evictPermCacheIfFull()
 			rm.permCache[cacheKey] = &permissionCacheEntry{
 				result:    result,
 				expiresAt: time.Now().Add(rm.permCacheTTL),
@@ -1102,6 +1151,7 @@ func (rm *RBACManager) getTokenRBACData(tokenID int64) (*tokenRBACData, error) {
 	}
 
 	// Cache the result (already holding write lock)
+	rm.evictTokenCacheIfFull()
 	rm.tokenCache[tokenID] = data
 
 	return data, nil

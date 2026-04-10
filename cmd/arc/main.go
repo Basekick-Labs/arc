@@ -860,6 +860,7 @@ func main() {
 			LicenseClient: licenseClient,
 			Logger:        logger.Get("rbac"),
 		})
+		shutdownCoordinator.Register("rbac", rbacManager, shutdown.PriorityAuth)
 		if rbacManager.IsRBACEnabled() {
 			log.Info().Msg("Enterprise RBAC enabled")
 		}
