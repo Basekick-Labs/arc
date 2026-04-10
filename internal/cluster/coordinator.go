@@ -1453,6 +1453,8 @@ func (c *Coordinator) AddNodeViaRaft(node *Node) error {
 }
 
 // RemoveNodeViaRaft removes a node from the cluster via Raft consensus.
+// It removes the node from both the Raft voting configuration and the
+// cluster FSM state, then unregisters it from the local registry.
 // Must be called on the leader.
 func (c *Coordinator) RemoveNodeViaRaft(nodeID string) error {
 	if c.raftNode == nil {
@@ -1465,7 +1467,23 @@ func (c *Coordinator) RemoveNodeViaRaft(nodeID string) error {
 		return fmt.Errorf("not the leader")
 	}
 
-	return c.raftNode.RemoveNode(nodeID, 5*time.Second)
+	// Remove from Raft voting configuration. Warn on failure (node may
+	// already be removed from a previous attempt) but continue with FSM
+	// cleanup to ensure consistent state.
+	if err := c.raftNode.RemoveServer(nodeID, 5*time.Second); err != nil {
+		c.logger.Warn().Err(err).Str("node_id", nodeID).Msg("Failed to remove node from Raft configuration (may already be removed)")
+	}
+
+	// Remove from cluster FSM state. The FSM callback (onRaftNodeRemoved)
+	// handles registry unregistration on all nodes, so no manual
+	// Unregister call is needed here.
+	if err := c.raftNode.RemoveNode(nodeID, 5*time.Second); err != nil {
+		c.logger.Error().Err(err).Str("node_id", nodeID).Msg("Failed to remove node from FSM")
+		return fmt.Errorf("failed to remove node from cluster state: %w", err)
+	}
+
+	c.logger.Info().Str("node_id", nodeID).Msg("Node removed from cluster")
+	return nil
 }
 
 // UpdateNodeStateViaRaft updates a node's state via Raft consensus.
