@@ -1369,8 +1369,10 @@ func (c *Coordinator) startReceiverWithAddr(writerAddr string) error {
 // LocalWAL path already handles WAL persistence).
 func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler {
 	return replication.IngestHandlerFunc(func(ctx context.Context, payload []byte) error {
-		// Safety: check buffer is still available (coordinator may be shutting down)
+		// Safety: read-lock to avoid data race with SetIngestBuffer
+		c.mu.RLock()
 		buf := c.ingestBuffer
+		c.mu.RUnlock()
 		if buf == nil {
 			return nil
 		}
@@ -1401,7 +1403,10 @@ func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler 
 		if err := msgpack.Unmarshal(msgpackData, &records); err == nil && len(records) > 0 {
 			byMeasurement := make(map[string][]map[string]interface{})
 			for _, r := range records {
-				m, _ := r["measurement"].(string)
+				m, _ := r["_measurement"].(string)
+				if m == "" {
+					m, _ = r["measurement"].(string)
+				}
 				if m == "" {
 					m, _ = r["m"].(string)
 				}
@@ -1426,26 +1431,23 @@ func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler 
 }
 
 // rowsToColumns converts row-format records to columnar format for ArrowBuffer.
+// Metadata keys (_measurement, measurement, m, _database, database) are filtered
+// out to prevent them from being ingested as regular data columns.
 func rowsToColumns(rows []map[string]interface{}) map[string][]interface{} {
 	if len(rows) == 0 {
 		return map[string][]interface{}{}
 	}
-	// Collect all column names
-	colSet := make(map[string]bool)
-	for _, r := range rows {
-		for k := range r {
-			if k != "measurement" && k != "m" {
-				colSet[k] = true
+	columns := make(map[string][]interface{})
+	for i, r := range rows {
+		for k, v := range r {
+			if k == "measurement" || k == "m" || k == "_measurement" || k == "database" || k == "_database" {
+				continue
 			}
+			if _, ok := columns[k]; !ok {
+				columns[k] = make([]interface{}, len(rows))
+			}
+			columns[k][i] = v
 		}
-	}
-	columns := make(map[string][]interface{}, len(colSet))
-	for col := range colSet {
-		arr := make([]interface{}, len(rows))
-		for i, r := range rows {
-			arr[i] = r[col]
-		}
-		columns[col] = arr
 	}
 	return columns
 }
