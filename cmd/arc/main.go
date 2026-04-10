@@ -1230,7 +1230,7 @@ func main() {
 	schedulerHandler.RegisterRoutes(server.GetApp())
 
 	// Register Cluster handler (always register, shows status even if clustering not enabled)
-	clusterHandler := api.NewClusterHandler(clusterCoordinator, licenseClient, logger.Get("cluster-api"))
+	clusterHandler := api.NewClusterHandler(clusterCoordinator, authManager, licenseClient, logger.Get("cluster-api"))
 	clusterHandler.RegisterRoutes(server.GetApp())
 
 	// Register MQTT handlers (always register, handlers check if manager is nil)

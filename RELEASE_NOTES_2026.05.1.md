@@ -33,6 +33,17 @@ Cluster node identity is now stable across pod reschedules. When `cluster.node_i
 
 Additionally, cluster nodes now broadcast a `LeaveNotify` message to all peers during graceful shutdown. Peers immediately remove the departing node from Raft and the registry, rather than waiting for the heartbeat timeout to detect the departure. This makes rolling updates and scale-down operations clean and predictable.
 
+### Dead Node Removal API (Enterprise)
+
+New admin endpoint `DELETE /api/v1/cluster/nodes/:id` to remove a dead or permanently scaled-down node from the cluster. This removes the node from both the Raft voting configuration and the cluster FSM state, preventing dead voters from accumulating and eventually breaking quorum.
+
+```bash
+curl -X DELETE http://localhost:8000/api/v1/cluster/nodes/arc-writer-2 \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+Self-removal is prevented — use graceful shutdown (`LeaveNotify`) instead.
+
 ### RBAC Cache Lifecycle Management (Enterprise)
 
 RBACManager now has proper lifecycle management and bounded memory usage:
