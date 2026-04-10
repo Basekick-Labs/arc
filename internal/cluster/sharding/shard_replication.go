@@ -2,6 +2,7 @@ package sharding
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"sync"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/cluster/replication"
+	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
@@ -30,6 +32,9 @@ type ShardReplicationConfig struct {
 
 	// Logger for replication events
 	Logger zerolog.Logger
+
+	// TLSConfig for encrypted inter-node communication (nil = plain TCP)
+	TLSConfig *tls.Config
 }
 
 // ShardReplicationManager manages WAL replication for shards where this node is primary.
@@ -492,7 +497,7 @@ func (s *ShardSender) connectToReplica(replica *ShardReplicaConn) error {
 		return fmt.Errorf("replica has no address")
 	}
 
-	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	conn, err := security.Dial("tcp", addr, 10*time.Second, s.cfg.TLSConfig)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}

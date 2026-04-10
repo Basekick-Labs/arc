@@ -1,6 +1,7 @@
 package sharding
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster"
+	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	"github.com/rs/zerolog"
@@ -35,6 +37,9 @@ type ShardRaftConfig struct {
 
 	// Logger for Raft events
 	Logger zerolog.Logger
+
+	// TLSConfig for encrypted Raft transport (nil = plain TCP)
+	TLSConfig *tls.Config
 }
 
 // ShardRaftManager manages per-shard Raft clusters.
@@ -181,6 +186,7 @@ func (m *ShardRaftManager) JoinShard(shardID int, peers []string, bootstrap bool
 		ElectionTimeout:  m.cfg.ElectionTimeout,
 		HeartbeatTimeout: m.cfg.HeartbeatTimeout,
 		Logger:           m.logger,
+		TLSConfig:        m.cfg.TLSConfig,
 	})
 	if err != nil {
 		return fmt.Errorf("create shard raft node: %w", err)
@@ -313,6 +319,7 @@ type shardRaftNodeConfig struct {
 	ElectionTimeout  time.Duration
 	HeartbeatTimeout time.Duration
 	Logger           zerolog.Logger
+	TLSConfig        *tls.Config
 }
 
 // newShardRaftNode creates a new Raft node for a shard.
@@ -617,9 +624,19 @@ func (n *ShardRaftNode) StartFullRaft(cfg *shardRaftNodeConfig) error {
 		return fmt.Errorf("resolve address: %w", err)
 	}
 
-	transport, err := raft.NewTCPTransport(cfg.BindAddr, addr, 3, 10*time.Second, os.Stderr)
-	if err != nil {
-		return fmt.Errorf("create transport: %w", err)
+	var transport *raft.NetworkTransport
+	if cfg.TLSConfig != nil {
+		stream, tlsErr := security.NewTLSStreamLayer(cfg.BindAddr, addr, cfg.TLSConfig)
+		if tlsErr != nil {
+			return fmt.Errorf("create TLS stream layer: %w", tlsErr)
+		}
+		transport = raft.NewNetworkTransport(stream, 3, 10*time.Second, os.Stderr)
+	} else {
+		var tcpErr error
+		transport, tcpErr = raft.NewTCPTransport(cfg.BindAddr, addr, 3, 10*time.Second, os.Stderr)
+		if tcpErr != nil {
+			return fmt.Errorf("create transport: %w", tcpErr)
+		}
 	}
 	n.transport = transport
 

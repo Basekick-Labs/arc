@@ -74,6 +74,10 @@ type JoinRequest struct {
 	CoordAddr   string `json:"coord_addr"` // Coordinator address (for peer communication)
 	Version     string `json:"version"`
 	CoreCount   int    `json:"core_count"` // Number of CPU cores (GOMAXPROCS) on this node
+	// Authentication (present when shared_secret is configured)
+	AuthNonce     string `json:"auth_nonce,omitempty"`
+	AuthTimestamp int64  `json:"auth_timestamp,omitempty"`
+	AuthHMAC      string `json:"auth_hmac,omitempty"`
 }
 
 // NodeInfo represents a node in the cluster (used in JoinResponse).

@@ -2,6 +2,7 @@ package sharding
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"sync"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/cluster/replication"
+	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
@@ -36,6 +38,9 @@ type ShardReceiverConfig struct {
 
 	// Logger for receiver events
 	Logger zerolog.Logger
+
+	// TLSConfig for encrypted inter-node communication (nil = plain TCP)
+	TLSConfig *tls.Config
 }
 
 // ShardReceiverManager manages receiving replication data for shards where this node is a replica.
@@ -306,7 +311,7 @@ func (r *ShardReceiver) connect() error {
 
 	r.logger.Debug().Str("primary_addr", addr).Msg("Connecting to primary")
 
-	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	conn, err := security.Dial("tcp", addr, 10*time.Second, r.cfg.TLSConfig)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
