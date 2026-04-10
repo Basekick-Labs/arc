@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/protocol"
@@ -302,7 +303,63 @@ func (c *Coordinator) Start() error {
 }
 
 // Stop stops the cluster coordinator gracefully.
+// broadcastLeave sends a LeaveNotify message to all known peers so they can
+// immediately remove this node from Raft and the registry, rather than waiting
+// for the heartbeat timeout to detect the departure.
+func (c *Coordinator) broadcastLeave() {
+	if c.registry == nil {
+		return
+	}
+
+	leave := &protocol.LeaveNotify{
+		NodeID: c.localNode.ID,
+		Reason: "graceful shutdown",
+	}
+
+	// Sign the leave message if shared secret is configured
+	if c.cfg.SharedSecret != "" {
+		nonce, err := security.GenerateNonce()
+		if err == nil {
+			leave.AuthTimestamp = time.Now().Unix()
+			leave.AuthNonce = nonce
+			leave.AuthHMAC = security.ComputeHMAC(c.cfg.SharedSecret, nonce, leave.NodeID, c.cfg.ClusterName, leave.AuthTimestamp)
+		}
+	}
+
+	msg := protocol.NewLeaveNotify(leave)
+	var notified atomic.Int32
+	var wg sync.WaitGroup
+
+	peers := c.registry.GetAll()
+	for _, peer := range peers {
+		if peer.ID == c.localNode.ID || peer.Address == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+			conn, err := security.Dial("tcp", addr, 2*time.Second, c.tlsConfig)
+			if err != nil {
+				c.logger.Debug().Str("peer", addr).Err(err).Msg("Failed to notify peer of leave")
+				return
+			}
+			_ = protocol.SendMessage(conn, msg, 2*time.Second)
+			conn.Close()
+			notified.Add(1)
+		}(peer.Address)
+	}
+	wg.Wait()
+
+	if n := notified.Load(); n > 0 {
+		c.logger.Info().Int32("peers_notified", n).Msg("Broadcast leave notification to cluster peers")
+	}
+}
+
 func (c *Coordinator) Stop() error {
+	// Broadcast leave BEFORE acquiring the lock — broadcastLeave() does
+	// network I/O with per-peer timeouts and must not block the mutex.
+	c.broadcastLeave()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -764,6 +821,21 @@ func (c *Coordinator) handleHeartbeat(conn net.Conn, hb *protocol.Heartbeat) {
 
 // handleLeaveNotify processes a leave notification from a peer.
 func (c *Coordinator) handleLeaveNotify(leave *protocol.LeaveNotify) {
+	// Validate shared secret if configured
+	if c.cfg.SharedSecret != "" {
+		if leave.AuthHMAC == "" {
+			c.logger.Warn().Str("node_id", leave.NodeID).Msg("Leave rejected: shared secret required but not provided")
+			return
+		}
+		if err := security.ValidateHMAC(
+			c.cfg.SharedSecret, leave.AuthNonce, leave.NodeID, c.cfg.ClusterName,
+			leave.AuthTimestamp, leave.AuthHMAC, 5*time.Minute,
+		); err != nil {
+			c.logger.Warn().Err(err).Str("node_id", leave.NodeID).Msg("Leave rejected: authentication failed")
+			return
+		}
+	}
+
 	c.logger.Info().
 		Str("node_id", leave.NodeID).
 		Str("reason", leave.Reason).
@@ -944,14 +1016,20 @@ func (c *Coordinator) Status() map[string]interface{} {
 func generateNodeID() string {
 	hostname, err := os.Hostname()
 	if err != nil {
-		hostname = "unknown"
+		// Fallback: random ID only if hostname is unavailable
+		suffix := make([]byte, 8)
+		rand.Read(suffix)
+		return fmt.Sprintf("arc-%x", suffix)
 	}
-
-	// Generate random suffix with 64 bits of entropy for collision resistance
-	suffix := make([]byte, 8)
-	rand.Read(suffix)
-
-	return fmt.Sprintf("%s-%d-%x", hostname, time.Now().UnixNano(), suffix)
+	// Use hostname + PID. In Kubernetes StatefulSets, the hostname is the
+	// stable pod name (e.g. "arc-writer-0"), and PID is always 1 inside a
+	// container — so the ID is deterministic across restarts.
+	//
+	// For bare-metal/VM deployments, the PID suffix prevents collisions when
+	// running multiple Arc instances on the same host (e.g. dev/testing).
+	//
+	// For full control, set cluster.node_id explicitly in the config.
+	return fmt.Sprintf("%s-%d", hostname, os.Getpid())
 }
 
 // validateClusteringLicense validates that the license allows clustering.
