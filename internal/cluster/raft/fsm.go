@@ -126,7 +126,11 @@ type ClusterFSM struct {
 	nodes           map[string]*NodeInfo
 	primaryWriterID string                // ID of the current primary writer node
 	files           map[string]*FileEntry // File manifest (path → entry) for peer replication
-	logger          zerolog.Logger
+	// Secondary index: database → set of file paths. Maintained alongside
+	// the primary `files` map on register/delete to avoid O(N) scans when
+	// filtering by database.
+	filesByDB map[string]map[string]struct{}
+	logger    zerolog.Logger
 
 	// Callbacks for state changes
 	onNodeAdded      func(*NodeInfo)
@@ -140,9 +144,10 @@ type ClusterFSM struct {
 // NewClusterFSM creates a new cluster FSM.
 func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 	return &ClusterFSM{
-		nodes:  make(map[string]*NodeInfo),
-		files:  make(map[string]*FileEntry),
-		logger: logger.With().Str("component", "cluster-fsm").Logger(),
+		nodes:     make(map[string]*NodeInfo),
+		files:     make(map[string]*FileEntry),
+		filesByDB: make(map[string]map[string]struct{}),
+		logger:    logger.With().Str("component", "cluster-fsm").Logger(),
 	}
 }
 
@@ -401,16 +406,38 @@ func (f *ClusterFSM) applyRegisterFile(payload []byte, logIndex uint64) interfac
 	if p.File.Path == "" {
 		return fmt.Errorf("register file: path is required")
 	}
-
-	// Stamp the LSN from the Raft log index
-	p.File.LSN = logIndex
 	if p.File.CreatedAt.IsZero() {
-		p.File.CreatedAt = time.Now().UTC()
+		// The creator is responsible for setting CreatedAt before appending
+		// to Raft. We do NOT fill it in here because time.Now() inside Apply
+		// is non-deterministic — log replay on other nodes would produce
+		// different values and diverge FSM state.
+		return fmt.Errorf("register file: created_at is required")
 	}
+
+	// Stamp the LSN from the Raft log index (deterministic across all nodes)
+	p.File.LSN = logIndex
 
 	f.mu.Lock()
 	entry := p.File
+	// If the file was already registered under a different database (unlikely
+	// but possible if an operator moves a file across databases), remove the
+	// old index entry first to keep filesByDB consistent.
+	if old, existed := f.files[entry.Path]; existed && old.Database != entry.Database {
+		if oldIdx, ok := f.filesByDB[old.Database]; ok {
+			delete(oldIdx, old.Path)
+			if len(oldIdx) == 0 {
+				delete(f.filesByDB, old.Database)
+			}
+		}
+	}
 	f.files[entry.Path] = &entry
+	// Maintain the database → files secondary index
+	idx, ok := f.filesByDB[entry.Database]
+	if !ok {
+		idx = make(map[string]struct{})
+		f.filesByDB[entry.Database] = idx
+	}
+	idx[entry.Path] = struct{}{}
 	callback := f.onFileRegistered
 	f.mu.Unlock()
 
@@ -442,8 +469,17 @@ func (f *ClusterFSM) applyDeleteFile(payload []byte) interface{} {
 	}
 
 	f.mu.Lock()
-	_, existed := f.files[p.Path]
+	existing, existed := f.files[p.Path]
 	delete(f.files, p.Path)
+	if existed {
+		// Remove from the database → files secondary index
+		if idx, ok := f.filesByDB[existing.Database]; ok {
+			delete(idx, p.Path)
+			if len(idx) == 0 {
+				delete(f.filesByDB, existing.Database)
+			}
+		}
+	}
 	callback := f.onFileDeleted
 	f.mu.Unlock()
 
@@ -502,6 +538,16 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		f.files = snapshot.Files
 	} else {
 		f.files = make(map[string]*FileEntry)
+	}
+	// Rebuild the database → files secondary index from the restored files
+	f.filesByDB = make(map[string]map[string]struct{}, len(f.files))
+	for path, entry := range f.files {
+		idx, ok := f.filesByDB[entry.Database]
+		if !ok {
+			idx = make(map[string]struct{})
+			f.filesByDB[entry.Database] = idx
+		}
+		idx[path] = struct{}{}
 	}
 	f.mu.Unlock()
 
@@ -583,6 +629,13 @@ func (f *ClusterFSM) GetFile(path string) (*FileEntry, bool) {
 }
 
 // GetAllFiles returns copies of all files in the manifest.
+//
+// WARNING: This is O(N) in the number of files and allocates a full copy.
+// For large clusters with millions of files this can cause memory pressure
+// and GC pauses. It is suitable for small-to-medium clusters (< ~100k files)
+// and administrative/debugging use. A future phase will add a paginated or
+// streaming variant for the API handler when scale demands it — tracked as
+// a follow-up to Phase 1.
 func (f *ClusterFSM) GetAllFiles() []*FileEntry {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -595,14 +648,20 @@ func (f *ClusterFSM) GetAllFiles() []*FileEntry {
 }
 
 // GetFilesByDatabase returns copies of all files for the given database.
+// Uses the filesByDB secondary index for O(k) lookup where k is the number
+// of files for the database — no longer scans the full manifest.
 func (f *ClusterFSM) GetFilesByDatabase(database string) []*FileEntry {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	var files []*FileEntry
-	for _, file := range f.files {
-		if file.Database == database {
-			fileCopy := *file
-			files = append(files, &fileCopy)
+	idx, ok := f.filesByDB[database]
+	if !ok {
+		return nil
+	}
+	files := make([]*FileEntry, 0, len(idx))
+	for path := range idx {
+		if entry, exists := f.files[path]; exists {
+			entryCopy := *entry
+			files = append(files, &entryCopy)
 		}
 	}
 	return files

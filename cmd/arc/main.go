@@ -797,6 +797,12 @@ func main() {
 						// The registrar is non-blocking: it enqueues file registrations
 						// and a background worker appends them to the Raft manifest.
 						// OSS deployments never reach here (no coordinator).
+						//
+						// Shutdown ordering: lower priority runs first (see shutdown.go).
+						// file-registrar is at PriorityBuffer (30), cluster-coordinator is
+						// at PriorityCompaction (50). So the registrar drains its queue
+						// BEFORE Raft is stopped, ensuring pending file announcements
+						// complete while Raft is still alive.
 						fileRegistrar := cluster.NewCoordinatorFileRegistrar(clusterCoordinator, logger.Get("file-registrar"))
 						fileRegistrar.Start(context.Background())
 						arrowBuffer.SetFileRegistrar(fileRegistrar)

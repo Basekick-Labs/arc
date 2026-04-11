@@ -414,6 +414,9 @@ func (s *testSnapshotSink) Close() error {
 // File manifest tests (peer replication, Phase 1)
 
 func makeFileEntry(path, db, measurement string, size int64) FileEntry {
+	// Fixed timestamps — FSM Apply requires CreatedAt to be set by the caller
+	// (never stamped inside Apply because that would be non-deterministic
+	// during log replay on different nodes).
 	return FileEntry{
 		Path:          path,
 		SHA256:        "",
@@ -423,6 +426,7 @@ func makeFileEntry(path, db, measurement string, size int64) FileEntry {
 		PartitionTime: time.Date(2026, 4, 11, 14, 0, 0, 0, time.UTC),
 		OriginNodeID:  "writer-1",
 		Tier:          "hot",
+		CreatedAt:     time.Date(2026, 4, 11, 15, 0, 0, 0, time.UTC),
 	}
 }
 
@@ -451,12 +455,46 @@ func TestFSMRegisterFile(t *testing.T) {
 	if got.LSN != 42 {
 		t.Errorf("LSN should be stamped from log.Index: got %d, want 42", got.LSN)
 	}
-	if got.CreatedAt.IsZero() {
-		t.Error("CreatedAt should be auto-populated")
+	if !got.CreatedAt.Equal(file.CreatedAt) {
+		t.Errorf("CreatedAt should match input: got %v, want %v", got.CreatedAt, file.CreatedAt)
 	}
 
 	if count := fsm.FileCount(); count != 1 {
 		t.Errorf("FileCount() = %d, want 1", count)
+	}
+}
+
+// TestFSMRegisterFileRejectsZeroCreatedAt verifies that the FSM rejects
+// register commands without CreatedAt — preventing non-deterministic
+// time.Now() stamping inside Apply that would diverge state across nodes.
+func TestFSMRegisterFileRejectsZeroCreatedAt(t *testing.T) {
+	fsm := newTestFSM()
+
+	file := FileEntry{
+		Path:         "db/cpu/file.parquet",
+		Database:     "db",
+		Measurement:  "cpu",
+		SizeBytes:    100,
+		OriginNodeID: "writer-1",
+		Tier:         "hot",
+		// CreatedAt intentionally left zero
+	}
+	data := makeCommand(t, CommandRegisterFile, RegisterFilePayload{File: file})
+
+	result := fsm.Apply(&raft.Log{Index: 1, Data: data})
+	if result == nil {
+		t.Fatal("Expected error for zero CreatedAt, got nil")
+	}
+	err, ok := result.(error)
+	if !ok {
+		t.Fatalf("Expected error result, got %T: %v", result, result)
+	}
+	if err.Error() == "" {
+		t.Error("Expected non-empty error message")
+	}
+
+	if fsm.FileCount() != 0 {
+		t.Error("File should not be registered when CreatedAt is zero")
 	}
 }
 
@@ -554,6 +592,91 @@ func TestFSMFileCallbacks(t *testing.T) {
 	}
 	if deletedReason != "compaction" {
 		t.Errorf("onFileDeleted callback got reason %s, want compaction", deletedReason)
+	}
+}
+
+// TestFSMFilesByDatabaseIndexConsistency verifies that the filesByDB
+// secondary index stays in sync with the primary files map across register,
+// delete, and snapshot/restore operations.
+func TestFSMFilesByDatabaseIndexConsistency(t *testing.T) {
+	fsm := newTestFSM()
+
+	// Register 3 files across 2 databases
+	files := []FileEntry{
+		makeFileEntry("prod/cpu/f1.parquet", "prod", "cpu", 100),
+		makeFileEntry("prod/mem/f2.parquet", "prod", "mem", 200),
+		makeFileEntry("staging/cpu/f3.parquet", "staging", "cpu", 300),
+	}
+	for i, f := range files {
+		data := makeCommand(t, CommandRegisterFile, RegisterFilePayload{File: f})
+		fsm.Apply(&raft.Log{Index: uint64(i + 1), Data: data})
+	}
+
+	// After register: prod=2, staging=1
+	if got := len(fsm.GetFilesByDatabase("prod")); got != 2 {
+		t.Errorf("After register: GetFilesByDatabase(prod) = %d, want 2", got)
+	}
+	if got := len(fsm.GetFilesByDatabase("staging")); got != 1 {
+		t.Errorf("After register: GetFilesByDatabase(staging) = %d, want 1", got)
+	}
+
+	// Delete one prod file → prod=1, staging=1
+	delData := makeCommand(t, CommandDeleteFile, DeleteFilePayload{Path: "prod/cpu/f1.parquet"})
+	fsm.Apply(&raft.Log{Index: 10, Data: delData})
+
+	if got := len(fsm.GetFilesByDatabase("prod")); got != 1 {
+		t.Errorf("After delete one prod: GetFilesByDatabase(prod) = %d, want 1", got)
+	}
+
+	// Delete the remaining prod file → prod should be empty (nil or 0), staging=1
+	delData2 := makeCommand(t, CommandDeleteFile, DeleteFilePayload{Path: "prod/mem/f2.parquet"})
+	fsm.Apply(&raft.Log{Index: 11, Data: delData2})
+
+	if got := len(fsm.GetFilesByDatabase("prod")); got != 0 {
+		t.Errorf("After delete all prod: GetFilesByDatabase(prod) = %d, want 0", got)
+	}
+	// Internal consistency: the database bucket should be removed from filesByDB
+	// when its last file is deleted, to prevent unbounded growth.
+	fsm.mu.RLock()
+	_, prodIdxExists := fsm.filesByDB["prod"]
+	fsm.mu.RUnlock()
+	if prodIdxExists {
+		t.Error("filesByDB[prod] should be removed after last file deleted (prevents index bloat)")
+	}
+
+	// Snapshot + restore into a fresh FSM, then verify the index is rebuilt correctly
+	snapshot, err := fsm.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot failed: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := snapshot.Persist(&testSnapshotSink{Writer: &buf}); err != nil {
+		t.Fatalf("Persist failed: %v", err)
+	}
+
+	fsm2 := newTestFSM()
+	if err := fsm2.Restore(io.NopCloser(&buf)); err != nil {
+		t.Fatalf("Restore failed: %v", err)
+	}
+
+	// After restore, the index should be rebuilt and staging=1 should work
+	if got := len(fsm2.GetFilesByDatabase("staging")); got != 1 {
+		t.Errorf("After restore: GetFilesByDatabase(staging) = %d, want 1", got)
+	}
+	if got := len(fsm2.GetFilesByDatabase("prod")); got != 0 {
+		t.Errorf("After restore: GetFilesByDatabase(prod) = %d, want 0", got)
+	}
+
+	// Verify internal index state matches the primary files map
+	fsm2.mu.RLock()
+	totalIndexed := 0
+	for _, idx := range fsm2.filesByDB {
+		totalIndexed += len(idx)
+	}
+	fileCount := len(fsm2.files)
+	fsm2.mu.RUnlock()
+	if totalIndexed != fileCount {
+		t.Errorf("Index inconsistency after restore: totalIndexed=%d, fileCount=%d", totalIndexed, fileCount)
 	}
 }
 
