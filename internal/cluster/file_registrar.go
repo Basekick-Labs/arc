@@ -18,9 +18,9 @@ import (
 // coordinator.RegisterFileInManifest. This ensures the flush hot path
 // is never blocked on Raft consensus, network I/O, or checksum compute.
 //
-// In Phase 1 we do NOT compute checksums yet — the manifest entry records
-// the path, size, and origin for validation. Checksums will be added in
-// Phase 2 when we start pulling files from peers.
+// The SHA-256 checksum is computed by the flush path on the in-memory
+// Parquet buffer before the backend write and passed to RegisterFile.
+// Peers use it to verify files pulled during Phase 2 replication.
 type CoordinatorFileRegistrar struct {
 	coordinator *Coordinator
 	queue       chan fileRegistration
@@ -56,6 +56,7 @@ type fileRegistration struct {
 	path          string
 	partitionTime time.Time
 	sizeBytes     int64
+	sha256        string // hex-encoded SHA-256 of the Parquet bytes
 }
 
 // NewCoordinatorFileRegistrar creates a new registrar backed by the coordinator.
@@ -125,13 +126,18 @@ DrainLoop:
 // registration and returns immediately. If the queue is full, the entry is
 // dropped and a counter is incremented — peer replication will discover it on
 // the next anti-entropy scan (Phase 3+).
-func (r *CoordinatorFileRegistrar) RegisterFile(database, measurement, path string, partitionTime time.Time, sizeBytes int64) {
+//
+// sha256 is a hex-encoded SHA-256 of the Parquet file bytes. The caller
+// (arrow_writer.go flush path) computes it on the in-memory buffer before the
+// storage backend write, so it's effectively free.
+func (r *CoordinatorFileRegistrar) RegisterFile(database, measurement, path string, partitionTime time.Time, sizeBytes int64, sha256 string) {
 	reg := fileRegistration{
 		database:      database,
 		measurement:   measurement,
 		path:          path,
 		partitionTime: partitionTime,
 		sizeBytes:     sizeBytes,
+		sha256:        sha256,
 	}
 	select {
 	case r.queue <- reg:
@@ -165,6 +171,7 @@ func (r *CoordinatorFileRegistrar) worker() {
 func (r *CoordinatorFileRegistrar) process(reg fileRegistration) {
 	entry := raft.FileEntry{
 		Path:          reg.path,
+		SHA256:        reg.sha256,
 		SizeBytes:     reg.sizeBytes,
 		Database:      reg.database,
 		Measurement:   reg.measurement,

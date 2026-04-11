@@ -24,6 +24,19 @@ const (
 	MsgReplicateSync MessageType = 0x10
 	// MsgReplicateSyncAck is sent by the writer in response to sync request.
 	MsgReplicateSyncAck MessageType = 0x11
+
+	// Peer file replication messages (Enterprise Phase 2) - start at 0x20
+	// to leave room for future WAL replication messages.
+	//
+	// MsgFetchFile is sent by a puller to request a Parquet file from a peer.
+	// The request payload includes the path and HMAC auth headers. The peer
+	// responds with a MsgFetchFileAck header, immediately followed by the raw
+	// file bytes (length = ack.SizeBytes) on the same TCP connection.
+	MsgFetchFile MessageType = 0x20
+	// MsgFetchFileAck is the response header for a file fetch. After the
+	// header the origin streams raw body bytes directly on the connection —
+	// the body is NOT framed as another protocol message.
+	MsgFetchFileAck MessageType = 0x21
 )
 
 // String returns the string representation of a message type.
@@ -45,6 +58,10 @@ func (m MessageType) String() string {
 		return "ReplicateSync"
 	case MsgReplicateSyncAck:
 		return "ReplicateSyncAck"
+	case MsgFetchFile:
+		return "FetchFile"
+	case MsgFetchFileAck:
+		return "FetchFileAck"
 	default:
 		return "Unknown"
 	}
@@ -132,4 +149,29 @@ type LeaveNotify struct {
 	AuthNonce     string `json:"auth_nonce,omitempty"`
 	AuthTimestamp int64  `json:"auth_timestamp,omitempty"`
 	AuthHMAC      string `json:"auth_hmac,omitempty"`
+}
+
+// FetchFileRequest is sent by a puller to request a Parquet file from a peer.
+// HMAC auth headers are embedded in the payload rather than using a separate
+// handshake because the fetch is a one-shot operation on a freshly dialed
+// connection. The validator is security.ValidateFetchHMAC with a ±5 minute
+// freshness tolerance. The path is bound into the signed payload so a stolen
+// MAC cannot be replayed to fetch a different file within the window.
+type FetchFileRequest struct {
+	Path      string `json:"path"`
+	NodeID    string `json:"node_id"`
+	Nonce     string `json:"nonce"`
+	Timestamp int64  `json:"timestamp"`
+	HMAC      string `json:"hmac"`
+}
+
+// FetchFileAckHeader is the response header for a fetch request. If Status is
+// "ok" the origin will immediately write SizeBytes of raw body content directly
+// to the TCP connection (NOT wrapped in another protocol envelope — the body is
+// read with io.CopyN on the raw conn). If Status is "error" no body follows.
+type FetchFileAckHeader struct {
+	Status    string `json:"status"`          // "ok" or "error"
+	Error     string `json:"error,omitempty"` // populated when Status == "error"
+	SizeBytes int64  `json:"size_bytes"`
+	SHA256    string `json:"sha256"` // hex-encoded; must match manifest SHA256
 }

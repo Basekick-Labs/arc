@@ -331,6 +331,15 @@ type ClusterConfig struct {
 	ReplicationBufferSize  int  // Entry buffer size for replication queue (default: 10000)
 	ReplicationAckInterval int  // How often readers send acks in milliseconds (default: 100)
 
+	// Peer file replication configuration (Enterprise Phase 2)
+	// These gate and tune the background puller that replicates Parquet files
+	// between nodes over the coordinator TCP protocol. Only takes effect when
+	// ReplicationEnabled && Enabled and FeatureClustering is licensed.
+	ReplicationPullWorkers      int // Number of concurrent fetch workers per node (default: 4)
+	ReplicationQueueSize        int // Buffered FSM callback queue size (default: 1024)
+	ReplicationFetchTimeoutMs   int // Per-fetch overall timeout in milliseconds (default: 60000)
+	ReplicationRetryMaxAttempts int // Max immediate retry attempts per enqueue (default: 3)
+
 	// Sharding configuration (Phase 4)
 	ShardingEnabled           bool   // Enable sharding for horizontal write scaling (default: false)
 	ShardingNumShards         int    // Number of shards (default: 3)
@@ -556,6 +565,11 @@ func Load() (*Config, error) {
 			ReplicationLagLimit:    v.GetInt("cluster.replication_lag_limit"),
 			ReplicationBufferSize:  v.GetInt("cluster.replication_buffer_size"),
 			ReplicationAckInterval: v.GetInt("cluster.replication_ack_interval"),
+			// Peer file replication (Enterprise Phase 2)
+			ReplicationPullWorkers:      v.GetInt("cluster.replication_pull_workers"),
+			ReplicationQueueSize:        v.GetInt("cluster.replication_queue_size"),
+			ReplicationFetchTimeoutMs:   v.GetInt("cluster.replication_fetch_timeout_ms"),
+			ReplicationRetryMaxAttempts: v.GetInt("cluster.replication_retry_max_attempts"),
 			// Sharding configuration (Phase 4)
 			ShardingEnabled:           v.GetBool("cluster.sharding_enabled"),
 			ShardingNumShards:         v.GetInt("cluster.sharding_num_shards"),
@@ -785,6 +799,11 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.replication_lag_limit", 5000)    // 5 second lag limit
 	v.SetDefault("cluster.replication_buffer_size", 10000) // 10k entry buffer
 	v.SetDefault("cluster.replication_ack_interval", 100)  // 100ms ack interval
+	// Peer file replication (Enterprise Phase 2)
+	v.SetDefault("cluster.replication_pull_workers", 4)          // 4 concurrent pullers
+	v.SetDefault("cluster.replication_queue_size", 1024)         // 1024-entry callback queue
+	v.SetDefault("cluster.replication_fetch_timeout_ms", 60000)  // 60s per-fetch timeout
+	v.SetDefault("cluster.replication_retry_max_attempts", 3)    // 3 immediate retries
 
 	// Sharding defaults (Phase 4)
 	v.SetDefault("cluster.sharding_enabled", false)        // Disabled by default
