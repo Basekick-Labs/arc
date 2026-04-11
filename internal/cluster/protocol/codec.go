@@ -177,6 +177,20 @@ func unmarshalPayload(msgType MessageType, payload []byte) (interface{}, error) 
 		}
 		return &ack, nil
 
+	case MsgFetchFile:
+		var req FetchFileRequest
+		if err := json.Unmarshal(payload, &req); err != nil {
+			return nil, err
+		}
+		return &req, nil
+
+	case MsgFetchFileAck:
+		var ack FetchFileAckHeader
+		if err := json.Unmarshal(payload, &ack); err != nil {
+			return nil, err
+		}
+		return &ack, nil
+
 	default:
 		return nil, fmt.Errorf("unknown message type: %d", msgType)
 	}

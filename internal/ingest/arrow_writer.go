@@ -3,6 +3,8 @@ package ingest
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"sort"
@@ -709,8 +711,11 @@ type WALWriter interface {
 // manifest. Implementations should be non-blocking — file registration is
 // fire-and-forget from the flush path's perspective. Wired by the cluster
 // coordinator when peer replication is enabled (Enterprise feature).
+//
+// sha256 is a hex-encoded content checksum of the Parquet file bytes.
+// Peers use this to verify the integrity of data pulled from the origin.
 type FileRegistrar interface {
-	RegisterFile(database, measurement, path string, partitionTime time.Time, sizeBytes int64)
+	RegisterFile(database, measurement, path string, partitionTime time.Time, sizeBytes int64, sha256 string)
 }
 
 // ArrowBuffer manages buffering and periodic flushing of Arrow data
@@ -974,7 +979,11 @@ func (b *ArrowBuffer) SetFileRegistrar(fr FileRegistrar) {
 // and (if enabled) announces it to the cluster-wide file manifest for peer replication.
 // This allows the tiering system to track the file for future migration and query routing,
 // and enables Enterprise peer replication to replicate the file to other cluster nodes.
-func (b *ArrowBuffer) registerFileInTiering(ctx context.Context, database, measurement, storagePath string, partitionTime time.Time, sizeBytes int64) {
+//
+// sha256Hex is a hex-encoded SHA-256 of the Parquet bytes, computed by the caller on the
+// in-memory buffer immediately before the backend write. Peers validate downloaded bytes
+// against this checksum.
+func (b *ArrowBuffer) registerFileInTiering(ctx context.Context, database, measurement, storagePath string, partitionTime time.Time, sizeBytes int64, sha256Hex string) {
 	// Register in local tiering metadata (hot/cold tracking)
 	if b.tieringManager != nil {
 		metadata := b.tieringManager.GetMetadata()
@@ -1002,7 +1011,7 @@ func (b *ArrowBuffer) registerFileInTiering(ctx context.Context, database, measu
 	// The registrar implementation MUST be non-blocking — it's called on
 	// the hot flush path.
 	if b.fileRegistrar != nil {
-		b.fileRegistrar.RegisterFile(database, measurement, storagePath, partitionTime, sizeBytes)
+		b.fileRegistrar.RegisterFile(database, measurement, storagePath, partitionTime, sizeBytes, sha256Hex)
 	}
 }
 
@@ -2134,12 +2143,19 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 
 		storagePath := b.generateStoragePath(database, measurement, minTime)
 
+		// Compute SHA-256 of the Parquet buffer before the backend write so the
+		// hash lands in the cluster manifest with the same commit that announces
+		// the file. Peers use this to verify bytes pulled from the origin.
+		// The buffer is already in memory; this is an O(n) scan of ~MB of data.
+		parquetSum := sha256.Sum256(parquetData)
+		parquetSumHex := hex.EncodeToString(parquetSum[:])
+
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
 			return fmt.Errorf("failed to write to storage: %w", err)
 		}
 
 		// Register file in tiering metadata for query routing
-		b.registerFileInTiering(ctx, database, measurement, storagePath, minTime, int64(len(parquetData)))
+		b.registerFileInTiering(ctx, database, measurement, storagePath, minTime, int64(len(parquetData)), parquetSumHex)
 
 		b.totalRecordsWritten.Add(int64(recordCount))
 		b.totalFlushes.Add(1)
@@ -2188,12 +2204,17 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		bucketTime := hourIDToTime(hourID)
 		storagePath := b.generateStoragePath(database, measurement, bucketTime)
 
+		// Compute SHA-256 of the Parquet buffer for peer replication checksum.
+		// See the single-hour branch above for rationale.
+		parquetSum := sha256.Sum256(parquetData)
+		parquetSumHex := hex.EncodeToString(parquetSum[:])
+
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
 			return fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err)
 		}
 
 		// Register file in tiering metadata for query routing
-		b.registerFileInTiering(ctx, database, measurement, storagePath, bucketTime, int64(len(parquetData)))
+		b.registerFileInTiering(ctx, database, measurement, storagePath, bucketTime, int64(len(parquetData)), parquetSumHex)
 
 		totalWritten += splitRecordCount
 

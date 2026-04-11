@@ -21,11 +21,37 @@ Arc Enterprise now maintains a cluster-wide file manifest in the Raft FSM. Every
 - Async, non-blocking registration from the flush path — the file registrar enqueues entries and a background worker appends to Raft, so write latency is unaffected
 - Zero overhead for OSS / standalone deployments — no coordinator, no registrar, no manifest
 
+### Peer File Replication (Enterprise — Phase 2)
+
+Building on the cluster file manifest, Arc Enterprise now replicates **actual Parquet bytes** between cluster nodes. When a writer flushes a file, readers automatically pull the bytes from the origin peer over the existing coordinator TCP protocol and write them to their own local storage backend. This unlocks bare-metal, VM, and edge deployments where each node has its own local SSDs and shared storage (S3, MinIO, Azure) is not available — on-prem, aerospace, defense, and edge use cases.
+
+**How it works:**
+- Every flushed Parquet file is SHA-256 hashed on the writer (on the in-memory buffer, before writing to the backend) and the hash is committed into the Raft manifest alongside the file metadata. Every node in the cluster learns the authoritative hash as soon as the Raft log replicates.
+- On each non-origin node, an `onFileRegistered` callback fires from the FSM when a new entry commits. A background `Puller` worker pool enqueues a fetch, skipping files that originated on the local node or already exist on the local backend.
+- Workers dial the origin peer using the cluster's existing TLS-wrapped coordinator connection and send a new `MsgFetchFile` request, authenticated with an HMAC that binds `{nonce, nodeID, clusterName, path, timestamp}` — including the path prevents a stolen MAC from being replayed to fetch a different file within the freshness window.
+- The origin validates the HMAC, sanitizes the path, confirms the file is in the cluster manifest (so peers cannot request arbitrary local files), and streams the body directly over the connection.
+- The puller streams body bytes through an `io.MultiWriter` tee into a `sha256.New()` hasher while writing into the local backend via `WriteReader`, and compares the computed hash against the manifest hash before accepting the file. On mismatch the partial file is deleted and the fetch retries.
+
+**Configuration** (defaults shown, set via `ARC_CLUSTER_REPLICATION_*` env vars or `cluster.replication_*` in `arc.toml`):
+- `replication_enabled` — master switch; requires `cluster.shared_secret` to be set
+- `replication_pull_workers = 4` — concurrent fetch workers per node
+- `replication_queue_size = 1024` — bounded queue; excess entries are dropped with a rate-limited warning and reconciled later
+- `replication_fetch_timeout_ms = 60000` — puller-side per-fetch timeout
+- `replication_serve_timeout_ms = 120000` — origin-side body-stream timeout; raise for large Parquet files or slow links
+- `replication_retry_max_attempts = 3` — immediate retry attempts before dropping the entry
+
+**Security:**
+- Peer replication is gated by `FeatureClustering` — a user without an enterprise license cannot construct the puller.
+- Shared secret is required at startup; Arc refuses to boot if `replication_enabled=true` and `shared_secret` is empty.
+- All fetch traffic flows over the cluster coordinator port (not the public API port), physically isolating replication bytes from client traffic.
+- When `cluster.tls_enabled=true`, the fetch client reuses the cluster TLS config for end-to-end encryption.
+
+**Scope of Phase 2:** async replication only. Phase 2 does **not** include: resume via HTTP Range, catch-up for nodes joining with existing data, quorum durability, multi-peer fanout, or compaction-aware routing. These land in Phases 3–5.
+
 **What's coming next** (separate PRs):
-- Phase 2: HTTP fetch server + background pullers to replicate files between peers over TLS-secured coordinator connections
 - Phase 3: Automatic catch-up for new nodes joining a cluster with existing data
 - Phase 4: Integration with compaction (compactor role produces files, replicas pull the compacted output)
-- Phase 5: Optional write quorum for strong durability
+- Phase 5: Optional write quorum for strong durability, multi-peer fanout, and resumable transfers via Range
 
 **Design inspiration:** ClickHouse's ReplicatedMergeTree model — a Raft-equivalent op log + HTTP-pull-based file transfer. Research compared InfluxDB Enterprise (anti-entropy + HHQ), ClickHouse (log + HTTP pull), TimescaleDB (deprecated multi-node), Apache Pinot (peer fetcher fallback), and Apache Druid (metadata-driven assignment). ClickHouse's model is the cleanest fit for Arc's existing Raft + coordinator TCP infrastructure.
 

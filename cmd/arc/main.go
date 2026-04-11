@@ -750,6 +750,15 @@ func main() {
 					apiAddr = fmt.Sprintf(":%d", cfg.Server.Port)
 				}
 
+				// Peer replication (Enterprise Phase 2) requires shared-secret auth
+				// on the coordinator protocol. Fail loudly rather than silently
+				// running unauthenticated — operators should opt in explicitly.
+				if cfg.Cluster.ReplicationEnabled && cfg.Cluster.SharedSecret == "" {
+					log.Error().Msg("cluster.replication_enabled requires ARC_CLUSTER_SHARED_SECRET to be set (peer fetches must be authenticated)")
+					log.Error().Msg("Set ARC_CLUSTER_SHARED_SECRET or disable cluster.replication_enabled to continue")
+					os.Exit(1)
+				}
+
 				var err error
 				clusterCoordinator, err = cluster.NewCoordinator(&cluster.CoordinatorConfig{
 					Config:        &cfg.Cluster,
@@ -761,6 +770,12 @@ func main() {
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to initialize cluster coordinator - running in standalone mode")
 				} else {
+					// Peer replication Phase 2 needs the storage backend handle so the
+					// fetch handler can serve local bytes and the puller can write
+					// received bytes. Must be set before Start — the puller is
+					// constructed inside Start when ReplicationEnabled is true.
+					clusterCoordinator.SetStorageBackend(storageBackend)
+
 					if err := clusterCoordinator.Start(); err != nil {
 						log.Error().Err(err).Msg("Failed to start cluster coordinator - running in standalone mode")
 						clusterCoordinator = nil
@@ -793,16 +808,32 @@ func main() {
 							}
 						}
 
-						// Wire up peer file replication manifest (Enterprise Phase 1).
-						// The registrar is non-blocking: it enqueues file registrations
-						// and a background worker appends them to the Raft manifest.
-						// OSS deployments never reach here (no coordinator).
+						// Wire up peer file replication (Enterprise Phase 1 + Phase 2).
 						//
-						// Shutdown ordering: lower priority runs first (see shutdown.go).
-						// file-registrar is at PriorityBuffer (30), cluster-coordinator is
-						// at PriorityCompaction (50). So the registrar drains its queue
-						// BEFORE Raft is stopped, ensuring pending file announcements
-						// complete while Raft is still alive.
+						// Phase 1 — the registrar is non-blocking: it enqueues file
+						// registrations from the flush path and a background worker
+						// appends them to the Raft manifest.
+						//
+						// Phase 2 — the puller is constructed inside coordinator.Start()
+						// when ReplicationEnabled is true. It watches the FSM for new
+						// file registrations and pulls the bytes from the origin peer
+						// over the coordinator TCP protocol. It's owned by the
+						// coordinator and stopped from coordinator.Stop(), so it has
+						// no separate shutdown hook here.
+						//
+						// OSS deployments never reach this block (no coordinator).
+						//
+						// Shutdown ordering (lower priority runs first, see shutdown.go):
+						//   HTTPServer (10)  — stop accepting client requests
+						//   Ingest     (20)  — drain ingest/flush
+						//   Buffer     (30)  — file-registrar drains queue into Raft
+						//   Compaction (50)  — cluster-coordinator stops:
+						//                        puller.Stop()  (first)
+						//                        raftNode.Stop()  (second)
+						//
+						// This sequence ensures final file announcements land in Raft
+						// while Raft is still alive, and pending peer pulls are
+						// cancelled promptly when Raft is about to go away.
 						fileRegistrar := cluster.NewCoordinatorFileRegistrar(clusterCoordinator, logger.Get("file-registrar"))
 						fileRegistrar.Start(context.Background())
 						arrowBuffer.SetFileRegistrar(fileRegistrar)

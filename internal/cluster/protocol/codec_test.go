@@ -75,6 +75,40 @@ func TestEncodeDecode(t *testing.T) {
 				Reason: "graceful shutdown",
 			}),
 		},
+		{
+			name: "FetchFileRequest",
+			msg: &Message{
+				Type: MsgFetchFile,
+				Payload: &FetchFileRequest{
+					Path:      "prod/cpu/2026/04/11/14/file-xxx.parquet",
+					NodeID:    "reader-1",
+					Nonce:     "nonce-12345",
+					Timestamp: time.Now().Unix(),
+					HMAC:      "abcdef0123456789",
+				},
+			},
+		},
+		{
+			name: "FetchFileAckHeader ok",
+			msg: &Message{
+				Type: MsgFetchFileAck,
+				Payload: &FetchFileAckHeader{
+					Status:    "ok",
+					SizeBytes: 1048576,
+					SHA256:    "deadbeefcafe",
+				},
+			},
+		},
+		{
+			name: "FetchFileAckHeader error",
+			msg: &Message{
+				Type: MsgFetchFileAck,
+				Payload: &FetchFileAckHeader{
+					Status: "error",
+					Error:  "file not found",
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -144,6 +178,20 @@ func TestEncodeDecode(t *testing.T) {
 				if got.NodeID != orig.NodeID || got.Reason != orig.Reason {
 					t.Errorf("LeaveNotify mismatch")
 				}
+
+			case MsgFetchFile:
+				orig := tt.msg.Payload.(*FetchFileRequest)
+				got := decoded.Payload.(*FetchFileRequest)
+				if got.Path != orig.Path || got.NodeID != orig.NodeID || got.HMAC != orig.HMAC {
+					t.Errorf("FetchFileRequest mismatch: got %+v, want %+v", got, orig)
+				}
+
+			case MsgFetchFileAck:
+				orig := tt.msg.Payload.(*FetchFileAckHeader)
+				got := decoded.Payload.(*FetchFileAckHeader)
+				if got.Status != orig.Status || got.SizeBytes != orig.SizeBytes || got.SHA256 != orig.SHA256 || got.Error != orig.Error {
+					t.Errorf("FetchFileAckHeader mismatch: got %+v, want %+v", got, orig)
+				}
 			}
 		})
 	}
@@ -207,6 +255,8 @@ func TestMessageTypeString(t *testing.T) {
 		{MsgHeartbeat, "Heartbeat"},
 		{MsgHeartbeatAck, "HeartbeatAck"},
 		{MsgLeaveNotify, "LeaveNotify"},
+		{MsgFetchFile, "FetchFile"},
+		{MsgFetchFileAck, "FetchFileAck"},
 		{MessageType(255), "Unknown"},
 	}
 

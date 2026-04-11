@@ -7,12 +7,15 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/Basekick-Labs/msgpack/v6"
+	"github.com/basekick-labs/arc/internal/cluster/filereplication"
 	"github.com/basekick-labs/arc/internal/cluster/protocol"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/cluster/replication"
@@ -20,6 +23,7 @@ import (
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/license"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/wal"
 	"github.com/rs/zerolog"
 )
@@ -54,6 +58,15 @@ type Coordinator struct {
 	replicationReceiver *replication.Receiver // Reader only: receives entries from writer
 	walWriter           *wal.Writer           // Reference to local WAL for replication hook
 	ingestBuffer        *ingest.ArrowBuffer   // Reader only: applies replicated entries to local buffer
+
+	// Peer file replication (Enterprise Phase 2)
+	// storage is the local storage backend — used both by the fetch handler
+	// (to stream local bytes back to a pulling peer) and by the puller (to
+	// write received bytes). Set via SetStorageBackend before Start.
+	storage storage.Backend
+	// puller is the background worker pool that downloads files from peers.
+	// Nil when peer replication is disabled or the license forbids it.
+	puller *filereplication.Puller
 
 	// Network
 	listener  net.Listener
@@ -262,6 +275,24 @@ func (c *Coordinator) Start() error {
 		}
 	}
 
+	// Wire the peer file replication puller (Enterprise Phase 2). This runs
+	// on every cluster node (not just readers) because nodes of any role may
+	// need to pull files they didn't originate — the Raft manifest is the
+	// source of truth for who has what, regardless of role.
+	//
+	// Gated on ReplicationEnabled so OSS and standalone deployments never
+	// pay any cost. The FeatureClustering license check already ran in
+	// validateClusteringLicense above.
+	if c.cfg.ReplicationEnabled && c.raftNode != nil {
+		if err := c.startFilePullerLocked(); err != nil {
+			// Do not fail cluster startup if the puller can't start —
+			// replication is best-effort and the rest of the cluster can
+			// still make progress. The cause is logged; operators can
+			// correct config and restart.
+			c.logger.Error().Err(err).Msg("Failed to start peer file puller — continuing without peer replication")
+		}
+	}
+
 	// Start listening for peer connections if we have a coordinator address
 	if c.cfg.CoordinatorAddr != "" {
 		listener, err := security.Listen("tcp", c.cfg.CoordinatorAddr, c.tlsConfig)
@@ -374,6 +405,15 @@ func (c *Coordinator) Stop() error {
 
 	// Signal all goroutines to stop
 	close(c.stopCh)
+
+	// Stop the peer file puller BEFORE Raft. The puller is a Raft FSM
+	// callback consumer — once Raft stops, new applyRegisterFile calls
+	// won't fire anyway, but in-flight pulls need to be cancelled promptly
+	// so their workers can join before we tear down the listener.
+	if c.puller != nil {
+		c.puller.Stop()
+		c.puller = nil
+	}
 
 	// Stop writer failover manager
 	if c.writerFailoverMgr != nil {
@@ -623,6 +663,13 @@ func (c *Coordinator) handlePeerConnection(conn net.Conn) {
 	case protocol.MsgReplicateSync:
 		c.handleReplicateSync(conn, msg.Payload.(*protocol.ReplicateSync))
 		closeConn = false // Sender takes ownership
+
+	case protocol.MsgFetchFile:
+		// The fetch handler streams the body for the lifetime of the
+		// response and closes the connection itself via defer. Hand off
+		// ownership so the dispatch loop doesn't close it a second time.
+		c.handleFetchFile(conn, msg.Payload.(*protocol.FetchFileRequest))
+		closeConn = false
 
 	default:
 		c.logger.Warn().
@@ -904,6 +951,220 @@ func (c *Coordinator) handleReplicateSync(conn net.Conn, syncReq *protocol.Repli
 		// Connection was already handled by AcceptReplicationConnection
 	}
 	// NOTE: Connection is now owned by the sender, don't close it
+}
+
+// handleFetchFile serves a peer-replication file fetch request. The caller
+// (handlePeerConnection) transferred ownership of conn to this function —
+// it must close the connection before returning.
+//
+// Wire protocol (already decoded: req is the MsgFetchFile payload):
+//  1. Validate HMAC headers against c.cfg.SharedSecret.
+//  2. Sanitize req.Path (reject absolute paths, path traversal, null bytes).
+//  3. Look up the file in the FSM manifest so we only serve known files.
+//  4. Verify the file exists on the local storage backend and get its size.
+//  5. Write a MsgFetchFileAck header with {status=ok, size, sha256}.
+//  6. Stream the file body directly onto the TCP connection via Backend.ReadTo.
+//  7. On any error before or during the ack, send {status=error, error=...}.
+//
+// This handler does NOT honor the 10-second read timeout from the dispatch
+// loop — it holds the connection open for the duration of the body stream,
+// same as MsgReplicateSync. The puller on the other side uses its own
+// per-fetch timeout (cluster.replication_fetch_timeout_ms).
+func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequest) {
+	defer conn.Close()
+	remoteAddr := conn.RemoteAddr().String()
+
+	// Step 1: HMAC validation. Peer replication requires shared secret — no
+	// fallback to unauthenticated. This is enforced at startup in main.go,
+	// but we double-check here as defense in depth.
+	if c.cfg.SharedSecret == "" {
+		c.logger.Error().
+			Str("peer", remoteAddr).
+			Msg("FetchFile rejected: shared secret not configured (peer replication requires it)")
+		c.sendFetchError(conn, "peer replication is not configured on this node")
+		return
+	}
+	// HMAC binds {nonce, nodeID, clusterName, path, timestamp} — including the
+	// path prevents a stolen MAC from being replayed to fetch a different file
+	// within the freshness window.
+	if err := security.ValidateFetchHMAC(
+		c.cfg.SharedSecret, req.Nonce, req.NodeID, c.cfg.ClusterName, req.Path,
+		req.Timestamp, req.HMAC, 5*time.Minute,
+	); err != nil {
+		c.logger.Warn().
+			Err(err).
+			Str("peer", remoteAddr).
+			Str("requesting_node", req.NodeID).
+			Msg("FetchFile rejected: HMAC validation failed")
+		c.sendFetchError(conn, "authentication failed")
+		return
+	}
+
+	// Step 2: Sanitize the path. The storage backend accepts relative paths
+	// like "mydb/cpu/2026/04/11/14/file-xxx.parquet". Reject anything that
+	// could escape the storage root or contains control characters.
+	sanitized, err := sanitizeFetchPath(req.Path)
+	if err != nil {
+		c.logger.Warn().
+			Err(err).
+			Str("peer", remoteAddr).
+			Str("path", req.Path).
+			Msg("FetchFile rejected: invalid path")
+		c.sendFetchError(conn, fmt.Sprintf("invalid path: %v", err))
+		return
+	}
+
+	// Step 3: Require the file to be in the cluster manifest. This prevents
+	// peers from fetching arbitrary backend files outside the known data set,
+	// even if they pass the path sanitizer.
+	if c.raftNode == nil {
+		c.sendFetchError(conn, "Raft not available")
+		return
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		c.sendFetchError(conn, "FSM not available")
+		return
+	}
+	entry, ok := fsm.GetFile(sanitized)
+	if !ok {
+		c.logger.Debug().
+			Str("peer", remoteAddr).
+			Str("path", sanitized).
+			Msg("FetchFile: path not in manifest")
+		c.sendFetchError(conn, "file not in manifest")
+		return
+	}
+
+	// Step 4: Read-lock access to the backend handle.
+	c.mu.RLock()
+	backend := c.storage
+	c.mu.RUnlock()
+	if backend == nil {
+		c.sendFetchError(conn, "storage backend not configured")
+		return
+	}
+
+	// Confirm the file actually exists locally — it's possible the manifest
+	// knows about a file that hasn't replicated here yet, in which case we
+	// must tell the caller so they can try a different peer. A short deadline
+	// bounds the Exists check so a stuck backend doesn't pin the goroutine.
+	existsCtx, existsCancel := context.WithTimeout(c.ctx, 5*time.Second)
+	exists, existsErr := backend.Exists(existsCtx, sanitized)
+	existsCancel()
+	if existsErr != nil {
+		c.logger.Warn().
+			Err(existsErr).
+			Str("path", sanitized).
+			Msg("FetchFile: Exists check failed")
+		c.sendFetchError(conn, "backend error")
+		return
+	}
+	if !exists {
+		c.sendFetchError(conn, "file not found on local backend")
+		return
+	}
+
+	// Step 5: Send the ack header with the size and checksum from the manifest.
+	ack := &protocol.FetchFileAckHeader{
+		Status:    "ok",
+		SizeBytes: entry.SizeBytes,
+		SHA256:    entry.SHA256,
+	}
+	// Short write timeout for the header itself — if the peer is slow reading,
+	// we want to fail fast rather than hold the goroutine.
+	if err := protocol.SendMessage(conn, &protocol.Message{
+		Type:    protocol.MsgFetchFileAck,
+		Payload: ack,
+	}, 10*time.Second); err != nil {
+		c.logger.Warn().
+			Err(err).
+			Str("peer", remoteAddr).
+			Str("path", sanitized).
+			Msg("FetchFile: failed to send ack header")
+		return
+	}
+
+	// Step 6: Stream the body directly on the raw connection. No further
+	// protocol framing — the peer reads exactly entry.SizeBytes bytes.
+	// The write deadline bounds slow peers; the context is derived from the
+	// coordinator's lifetime so shutdown cancels any in-flight transfer.
+	// Operators serving large Parquet files or running on slow/constrained
+	// links can raise cluster.replication_serve_timeout_ms.
+	bodyStreamTimeout := time.Duration(c.cfg.ReplicationServeTimeoutMs) * time.Millisecond
+	if bodyStreamTimeout <= 0 {
+		bodyStreamTimeout = 2 * time.Minute
+	}
+	if err := conn.SetWriteDeadline(time.Now().Add(bodyStreamTimeout)); err != nil {
+		c.logger.Warn().Err(err).Msg("FetchFile: failed to set write deadline")
+		return
+	}
+	bodyCtx, bodyCancel := context.WithTimeout(c.ctx, bodyStreamTimeout)
+	defer bodyCancel()
+	if err := backend.ReadTo(bodyCtx, sanitized, conn); err != nil {
+		// The peer will detect a short body via its own size accounting; we
+		// can't meaningfully recover here since the ack has already been sent.
+		c.logger.Warn().
+			Err(err).
+			Str("peer", remoteAddr).
+			Str("path", sanitized).
+			Msg("FetchFile: error streaming body")
+		return
+	}
+	// Clear the deadline so the deferred conn.Close() isn't racing with a
+	// stale timeout.
+	_ = conn.SetWriteDeadline(time.Time{})
+
+	c.logger.Debug().
+		Str("peer", remoteAddr).
+		Str("path", sanitized).
+		Int64("size_bytes", entry.SizeBytes).
+		Msg("FetchFile served successfully")
+}
+
+// sendFetchError sends a FetchFileAckHeader with an error status. Best-effort:
+// any write error is logged at debug but does not affect the caller's flow
+// (the connection is closed by the caller's defer).
+func (c *Coordinator) sendFetchError(conn net.Conn, reason string) {
+	ack := &protocol.FetchFileAckHeader{Status: "error", Error: reason}
+	if err := protocol.SendMessage(conn, &protocol.Message{
+		Type:    protocol.MsgFetchFileAck,
+		Payload: ack,
+	}, 5*time.Second); err != nil {
+		c.logger.Debug().Err(err).Msg("FetchFile: failed to send error ack")
+	}
+}
+
+// sanitizeFetchPath validates a path supplied in a MsgFetchFile request.
+// Returns the cleaned path on success or an error describing the violation.
+//
+// The storage backend treats paths as relative to its base directory. We
+// reject:
+//   - absolute paths ("/etc/passwd")
+//   - path traversal ("..", "foo/../bar")
+//   - null bytes (defense against C-string truncation bugs)
+//   - empty paths
+//   - paths that path.Clean changes (indicates funky input)
+func sanitizeFetchPath(p string) (string, error) {
+	if p == "" {
+		return "", fmt.Errorf("empty path")
+	}
+	if strings.ContainsRune(p, 0) {
+		return "", fmt.Errorf("path contains null byte")
+	}
+	if strings.HasPrefix(p, "/") {
+		return "", fmt.Errorf("absolute path not allowed")
+	}
+	// path.Clean also rejects traversal; verify the cleaned form is unchanged.
+	cleaned := path.Clean(p)
+	if cleaned != p {
+		return "", fmt.Errorf("path must be pre-cleaned (got %q, clean is %q)", p, cleaned)
+	}
+	// After Clean, ".." as a prefix means an attempt to escape.
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return "", fmt.Errorf("path traversal not allowed")
+	}
+	return cleaned, nil
 }
 
 // GetRegistry returns the node registry.
@@ -1231,6 +1492,113 @@ func (c *Coordinator) SetIngestBuffer(buffer *ingest.ArrowBuffer) {
 	defer c.mu.Unlock()
 	c.ingestBuffer = buffer
 	c.logger.Info().Msg("Ingest buffer set for replication — readers will apply replicated entries")
+}
+
+// SetStorageBackend sets the local storage backend reference. It is required
+// for Enterprise peer replication Phase 2: the fetch handler reads local file
+// bytes via this backend to stream them to pulling peers, and the puller
+// writes received bytes into it. Must be called before Start when peer
+// replication is enabled.
+func (c *Coordinator) SetStorageBackend(backend storage.Backend) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.storage = backend
+}
+
+// startFilePullerLocked constructs the puller, wires the FSM callback, and
+// starts the worker pool. Caller must hold c.mu (Start holds it through the
+// entire body).
+//
+// Preconditions: c.raftNode is running, c.cfg.ReplicationEnabled, and
+// c.storage has been set via SetStorageBackend. If SharedSecret is empty,
+// returns an error — peer replication requires authentication.
+func (c *Coordinator) startFilePullerLocked() error {
+	if c.storage == nil {
+		return fmt.Errorf("peer replication requires a storage backend (call SetStorageBackend before Start)")
+	}
+	if c.cfg.SharedSecret == "" {
+		return fmt.Errorf("peer replication requires ARC_CLUSTER_SHARED_SECRET to be set")
+	}
+
+	// Build the fetch client. Reuses cluster TLS (PR #382) so peer transfers
+	// run under the cluster PKI, not the public API cert.
+	fetchClient, err := filereplication.NewFetchClient(filereplication.FetchClient{
+		SelfNodeID:   c.localNode.ID,
+		ClusterName:  c.cfg.ClusterName,
+		SharedSecret: c.cfg.SharedSecret,
+		TLSConfig:    c.tlsConfig,
+		DialTimeout:  10 * time.Second,
+	})
+	if err != nil {
+		return fmt.Errorf("build fetch client: %w", err)
+	}
+
+	// PeerResolver closes over the registry. Capture a reference so the
+	// puller can look up peer addresses without holding c.mu.
+	registry := c.registry
+	resolver := filereplication.NewRegistryResolver(func(nodeID string) (string, bool) {
+		node, ok := registry.Get(nodeID)
+		if !ok {
+			return "", false
+		}
+		if node.Address == "" {
+			return "", false
+		}
+		return node.Address, true
+	})
+
+	pullerCfg := filereplication.Config{
+		SelfNodeID:          c.localNode.ID,
+		Backend:             c.storage,
+		Fetcher:             fetchClient,
+		PeerResolver:        resolver,
+		Workers:             c.cfg.ReplicationPullWorkers,
+		QueueSize:           c.cfg.ReplicationQueueSize,
+		RetryMaxAttempts:    c.cfg.ReplicationRetryMaxAttempts,
+		FetchTimeout:        time.Duration(c.cfg.ReplicationFetchTimeoutMs) * time.Millisecond,
+		RetryInitialBackoff: 500 * time.Millisecond,
+		Logger:              c.logger,
+	}
+
+	puller, err := filereplication.New(pullerCfg)
+	if err != nil {
+		return fmt.Errorf("construct puller: %w", err)
+	}
+
+	// Wire the FSM callback. applyRegisterFile fires onFileRegistered for
+	// every Raft commit — including entries from other applyRegisterFile
+	// calls on this same node. The puller's Enqueue handles origin-is-self
+	// and already-local skips, so there's no redundant check here.
+	//
+	// onFileDeleted is reserved for Phase 4 (compactor-initiated deletes).
+	// For now we log so operators can see deletion events flowing through.
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return fmt.Errorf("Raft FSM not available")
+	}
+	onRegister := func(entry *raft.FileEntry) {
+		// Called synchronously from applyRegisterFile. Must NOT block — the
+		// FSM apply goroutine is on the Raft hot path. Enqueue is non-blocking
+		// (drops on full queue) so this is safe.
+		puller.Enqueue(entry)
+	}
+	onDelete := func(path string, reason string) {
+		c.logger.Debug().
+			Str("path", path).
+			Str("reason", reason).
+			Msg("Cluster manifest deletion observed (Phase 4 will act on this)")
+	}
+	fsm.SetFileCallbacks(onRegister, onDelete)
+
+	// Start the puller workers.
+	puller.Start(context.Background())
+	c.puller = puller
+
+	c.logger.Info().
+		Int("workers", pullerCfg.Workers).
+		Int("queue_size", pullerCfg.QueueSize).
+		Msg("Peer file replication puller started")
+	return nil
 }
 
 // StartReplication starts WAL replication based on node role.
