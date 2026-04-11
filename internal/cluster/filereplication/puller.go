@@ -35,14 +35,23 @@ type Fetcher interface {
 	Fetch(ctx context.Context, peerAddr string, entry *raft.FileEntry, dst io.Writer) (int64, error)
 }
 
-// PeerResolver maps an origin node ID to its coordinator TCP address. The
-// puller looks up the address fresh on every enqueued entry (rather than
-// caching) so that topology changes are picked up automatically.
+// PeerResolver returns an ordered list of peer coordinator addresses that
+// can serve a given file. The puller tries each address in order until one
+// responds with the file bytes. The first address is typically the origin
+// node (if still healthy) followed by any other healthy peers — that way
+// catch-up after a Kubernetes pod rotation still works when the original
+// writer is gone.
+//
+// The resolver takes (originNodeID, path) rather than the full FileEntry so
+// the interface stays decoupled from the raft package — any future
+// implementation that wants richer routing (health-aware, latency-aware,
+// shard-aware) only needs these two fields to make its decision.
+//
+// The puller looks up addresses fresh on every attempt (no caching) so
+// topology changes are picked up automatically. An empty slice means "no
+// known peers" and is treated as a transient failure the puller can retry.
 type PeerResolver interface {
-	// ResolvePeer returns the coordinator address for a node, or ("", false)
-	// if the node is unknown. Callers treat "not found" as a transient error
-	// and may re-enqueue.
-	ResolvePeer(nodeID string) (string, bool)
+	ResolvePeers(originNodeID, path string) []string
 }
 
 // Config bundles the puller's dependencies and tunables.
@@ -81,6 +90,12 @@ type Config struct {
 	// FetchTimeout bounds a single Fetcher.Fetch call. Default: 60s.
 	FetchTimeout time.Duration
 
+	// CatchUpQueueHighWater is the queue-depth fraction above which the
+	// Phase 3 catch-up walker pauses enqueueing. Keeps the walker from
+	// racing ahead of workers and causing drop storms on large manifests.
+	// Default: 0.8 (sleep when > 80% full).
+	CatchUpQueueHighWater float64
+
 	// Logger receives structured log output.
 	Logger zerolog.Logger
 }
@@ -89,11 +104,12 @@ type Config struct {
 // the dependencies (Backend, Fetcher, PeerResolver, SelfNodeID, Logger).
 func DefaultConfig() Config {
 	return Config{
-		Workers:             4,
-		QueueSize:           1024,
-		RetryMaxAttempts:    3,
-		RetryInitialBackoff: 500 * time.Millisecond,
-		FetchTimeout:        60 * time.Second,
+		Workers:               4,
+		QueueSize:             1024,
+		RetryMaxAttempts:      3,
+		RetryInitialBackoff:   500 * time.Millisecond,
+		FetchTimeout:          60 * time.Second,
+		CatchUpQueueHighWater: 0.8,
 	}
 }
 
@@ -111,15 +127,38 @@ type Puller struct {
 	mu      sync.Mutex
 	started bool
 
+	// inflight tracks paths currently enqueued or being processed. Enqueue
+	// consults it to dedup reactive callbacks against the Phase 3 catch-up
+	// walker (both can enqueue the same path during a race), and workers
+	// remove the entry via defer in processEntry so the set stays bounded
+	// even on panic.
+	inflightMu sync.Mutex
+	inflight   map[string]struct{}
+
 	// Metrics (atomic for lock-free observability)
 	totalEnqueued          atomic.Int64
 	totalSkippedSelf       atomic.Int64 // origin is self — no pull needed
 	totalSkippedLocal      atomic.Int64 // backend.Exists already true
+	totalSkippedDup        atomic.Int64 // already enqueued / in-flight
 	totalPulled            atomic.Int64 // successful pulls
 	totalFailed            atomic.Int64 // gave up after retries
 	totalDropped           atomic.Int64 // queue full
 	totalChecksumMismatch  atomic.Int64 // bytes didn't match manifest SHA256
-	totalPeerLookupFailure atomic.Int64 // origin node not in registry
+	totalPeerLookupFailure atomic.Int64 // no candidate peers available
+
+	// Catch-up metrics (Phase 3). Populated by RunCatchUp and read via Stats.
+	catchupStartedAt     atomic.Int64 // unix seconds; 0 if never started
+	catchupCompletedAt   atomic.Int64 // unix seconds; 0 if still running or never ran
+	catchupEntriesWalked atomic.Int64 // entries the walker iterated
+	catchupEnqueued      atomic.Int64 // entries successfully enqueued by the walker
+	// catchupSkippedLocal counts entries the walker chose NOT to enqueue
+	// because Enqueue already had a reason to skip — either origin==self
+	// (totalSkippedSelf bump) or the path was already in-flight via a
+	// reactive callback (totalSkippedDup bump). It does NOT include entries
+	// skipped because backend.Exists(path) was already true — that check
+	// happens downstream inside processEntry and is tracked by the global
+	// totalSkippedLocal counter.
+	catchupSkippedLocal  atomic.Int64
 }
 
 // New constructs a Puller. Does not start background workers — call Start.
@@ -153,12 +192,41 @@ func New(cfg Config) (*Puller, error) {
 	if cfg.FetchTimeout <= 0 {
 		cfg.FetchTimeout = defaults.FetchTimeout
 	}
+	// Clamp catch-up high-water to a sane range. Values <=0 or >=1 would
+	// either disable throttling entirely or starve the walker, so fall back
+	// to the default.
+	if cfg.CatchUpQueueHighWater <= 0 || cfg.CatchUpQueueHighWater >= 1 {
+		cfg.CatchUpQueueHighWater = defaults.CatchUpQueueHighWater
+	}
 
 	return &Puller{
-		cfg:    cfg,
-		queue:  make(chan *raft.FileEntry, cfg.QueueSize),
-		logger: cfg.Logger.With().Str("component", "file-puller").Logger(),
+		cfg:      cfg,
+		queue:    make(chan *raft.FileEntry, cfg.QueueSize),
+		inflight: make(map[string]struct{}),
+		logger:   cfg.Logger.With().Str("component", "file-puller").Logger(),
 	}, nil
+}
+
+// inflightAdd records a path as in-flight (enqueued or being processed).
+// Returns false if the path was already in the set — caller should treat
+// this as "already handled, skip".
+func (p *Puller) inflightAdd(path string) bool {
+	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
+	if _, ok := p.inflight[path]; ok {
+		return false
+	}
+	p.inflight[path] = struct{}{}
+	return true
+}
+
+// inflightRemove clears a path from the in-flight set. Safe to call on a
+// path that's not in the set (no-op). Called from processEntry via defer so
+// it runs on panic unwind too.
+func (p *Puller) inflightRemove(path string) {
+	p.inflightMu.Lock()
+	delete(p.inflight, path)
+	p.inflightMu.Unlock()
 }
 
 // Start launches the worker pool. Safe to call multiple times — subsequent
@@ -204,11 +272,14 @@ func (p *Puller) Stop() {
 
 // Enqueue submits a file entry for pulling. Non-blocking: if the queue is
 // full, the entry is dropped and totalDropped is incremented. If origin is
-// self or the file already exists locally, the entry is counted as a skip
-// and never reaches a worker.
+// self, the file already exists locally, or the same path is already
+// enqueued / in-flight (via the inflight set), the entry is counted as a
+// skip and never reaches a worker.
 //
 // Enqueue is safe to call from the Raft FSM apply callback (which must
-// return quickly): all checks here are O(1) and no I/O happens inline.
+// return quickly): all checks here are O(1) and no I/O happens inline. It
+// is also safe to call from the Phase 3 catch-up walker concurrently with
+// reactive callbacks — the inflight set dedups cross-path races.
 func (p *Puller) Enqueue(entry *raft.FileEntry) {
 	if entry == nil {
 		return
@@ -218,12 +289,21 @@ func (p *Puller) Enqueue(entry *raft.FileEntry) {
 		p.totalSkippedSelf.Add(1)
 		return
 	}
+	// Dedup: if the path is already enqueued or being processed, don't add
+	// it again. The inflight slot is released by processEntry via defer.
+	if !p.inflightAdd(entry.Path) {
+		p.totalSkippedDup.Add(1)
+		return
+	}
 	// Copy so the caller can't mutate the entry out from under the worker.
 	entryCopy := *entry
 	select {
 	case p.queue <- &entryCopy:
 		p.totalEnqueued.Add(1)
 	default:
+		// Queue full — release the inflight slot so a future retry can
+		// re-enqueue this path, and count the drop.
+		p.inflightRemove(entry.Path)
 		dropped := p.totalDropped.Add(1)
 		// Power-of-2 rate limiting, same pattern as CoordinatorFileRegistrar.
 		if dropped&(dropped-1) == 0 {
@@ -235,19 +315,34 @@ func (p *Puller) Enqueue(entry *raft.FileEntry) {
 	}
 }
 
-// Stats returns a point-in-time snapshot of the puller's metrics.
+// Stats returns a point-in-time snapshot of the puller's metrics,
+// including Phase 3 catch-up counters.
 func (p *Puller) Stats() map[string]int64 {
 	return map[string]int64{
-		"enqueued":             p.totalEnqueued.Load(),
-		"skipped_self":         p.totalSkippedSelf.Load(),
-		"skipped_local":        p.totalSkippedLocal.Load(),
-		"pulled":               p.totalPulled.Load(),
-		"failed":               p.totalFailed.Load(),
-		"dropped":              p.totalDropped.Load(),
-		"checksum_mismatch":    p.totalChecksumMismatch.Load(),
-		"peer_lookup_failure":  p.totalPeerLookupFailure.Load(),
-		"queue_depth":          int64(len(p.queue)),
+		"enqueued":               p.totalEnqueued.Load(),
+		"skipped_self":           p.totalSkippedSelf.Load(),
+		"skipped_local":          p.totalSkippedLocal.Load(),
+		"skipped_dup":            p.totalSkippedDup.Load(),
+		"pulled":                 p.totalPulled.Load(),
+		"failed":                 p.totalFailed.Load(),
+		"dropped":                p.totalDropped.Load(),
+		"checksum_mismatch":      p.totalChecksumMismatch.Load(),
+		"peer_lookup_failure":    p.totalPeerLookupFailure.Load(),
+		"queue_depth":            int64(len(p.queue)),
+		"catchup_started_at":     p.catchupStartedAt.Load(),
+		"catchup_completed_at":   p.catchupCompletedAt.Load(),
+		"catchup_entries_walked": p.catchupEntriesWalked.Load(),
+		"catchup_enqueued":       p.catchupEnqueued.Load(),
+		"catchup_skipped_local":  p.catchupSkippedLocal.Load(),
 	}
+}
+
+// CatchUpCompleted reports whether the startup catch-up walker has finished.
+// Returns true once RunCatchUp has completed its pass over the manifest (not
+// once all queued pulls have drained — that's a separate signal). Phase 5
+// will use this to hard-gate the query path during startup.
+func (p *Puller) CatchUpCompleted() bool {
+	return p.catchupCompletedAt.Load() > 0
 }
 
 func (p *Puller) worker(id int) {
@@ -271,8 +366,19 @@ func (p *Puller) worker(id int) {
 
 // processEntry pulls a single file with bounded retries. Each retry re-checks
 // backend.Exists (in case a concurrent worker or external process put the
-// file in place) and re-resolves the peer address (in case of topology change).
+// file in place) and re-resolves the peer list (in case of topology change).
+// Within a single attempt, the resolver returns an ordered list of candidate
+// peers and we fall through to the next candidate on any per-peer failure
+// EXCEPT checksum mismatch — a corrupt body from one peer is a real data
+// integrity problem and shouldn't trigger pull-and-corrupt from every other
+// healthy peer in turn.
 func (p *Puller) processEntry(log zerolog.Logger, entry *raft.FileEntry) {
+	// Remove from the inflight set when we're done, whether success or failure.
+	// This keeps the set bounded even if a worker panics — Go's defer runs on
+	// panic unwind — and makes repeated catch-up walks idempotent with the
+	// reactive enqueue path.
+	defer p.inflightRemove(entry.Path)
+
 	for attempt := 1; attempt <= p.cfg.RetryMaxAttempts; attempt++ {
 		if p.ctx.Err() != nil {
 			return
@@ -287,51 +393,96 @@ func (p *Puller) processEntry(log zerolog.Logger, entry *raft.FileEntry) {
 			return
 		}
 
-		// Resolve peer address fresh on each attempt.
-		peerAddr, ok := p.cfg.PeerResolver.ResolvePeer(entry.OriginNodeID)
-		if !ok {
+		// Resolve candidate peers fresh on each attempt so topology changes
+		// (node failover, rescheduling) are picked up automatically.
+		peers := p.cfg.PeerResolver.ResolvePeers(entry.OriginNodeID, entry.Path)
+		if len(peers) == 0 {
 			p.totalPeerLookupFailure.Add(1)
 			log.Warn().
 				Str("path", entry.Path).
 				Str("origin_node_id", entry.OriginNodeID).
 				Int("attempt", attempt).
-				Msg("Origin node not found in registry, deferring pull")
+				Msg("No candidate peers available for fetch, deferring pull")
 			p.sleepBackoff(attempt)
 			continue
 		}
 
-		// Attempt the pull.
-		if err := p.pullOnce(log, entry, peerAddr, attempt); err != nil {
-			log.Warn().
+		var lastErr error
+		var lastPeer string
+		pulledFromPeer := false
+		checksumMismatch := false
+		for _, peerAddr := range peers {
+			if p.ctx.Err() != nil {
+				return
+			}
+			err := p.pullOnce(log, entry, peerAddr, attempt)
+			if err == nil {
+				p.totalPulled.Add(1)
+				log.Info().
+					Str("path", entry.Path).
+					Str("peer", peerAddr).
+					Int64("size_bytes", entry.SizeBytes).
+					Int("attempts", attempt).
+					Msg("File pulled from peer")
+				pulledFromPeer = true
+				break
+			}
+			lastErr = err
+			lastPeer = peerAddr
+			// Fast-path shutdown: if the puller is stopping, pullOnce will
+			// return a context.Canceled-wrapped error. Without this check
+			// the loop would iterate every remaining candidate, logging a
+			// debug "trying next" line and issuing a dial attempt for each,
+			// before the top-of-loop ctx check finally caught it. On a
+			// 10-peer cluster that's 10 wasted dials during shutdown.
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			// Checksum mismatch is a data-integrity signal, not a "try next
+			// peer" signal. A peer served bytes that didn't match the manifest
+			// SHA-256 — corrupt manifest, corrupt peer, or adversarial peer.
+			// Do NOT fall through to other peers; let the attempt-level retry
+			// handle it (delete-and-redownload semantics already in pullOnce).
+			if errors.Is(err, ErrChecksumMismatch) {
+				checksumMismatch = true
+				break
+			}
+			// File-not-on-peer and transport errors both fall through to the
+			// next candidate. Log at Debug so operators can see the fallback
+			// in action without drowning in noise when most peers have the
+			// file.
+			log.Debug().
 				Err(err).
 				Str("path", entry.Path).
 				Str("peer", peerAddr).
 				Int("attempt", attempt).
-				Int("max_attempts", p.cfg.RetryMaxAttempts).
-				Msg("File pull attempt failed")
-
-			if attempt >= p.cfg.RetryMaxAttempts {
-				p.totalFailed.Add(1)
-				log.Error().
-					Err(err).
-					Str("path", entry.Path).
-					Str("peer", peerAddr).
-					Msg("File pull giving up after max attempts (will be retried by next FSM callback or catch-up scan)")
-				return
-			}
-			p.sleepBackoff(attempt)
-			continue
+				Msg("Peer fetch failed, trying next candidate")
+		}
+		if pulledFromPeer {
+			return
 		}
 
-		// Success.
-		p.totalPulled.Add(1)
-		log.Info().
+		log.Warn().
+			Err(lastErr).
 			Str("path", entry.Path).
-			Str("peer", peerAddr).
-			Int64("size_bytes", entry.SizeBytes).
-			Int("attempts", attempt).
-			Msg("File pulled from peer")
-		return
+			Str("last_peer", lastPeer).
+			Int("peers_tried", len(peers)).
+			Int("attempt", attempt).
+			Int("max_attempts", p.cfg.RetryMaxAttempts).
+			Bool("checksum_mismatch", checksumMismatch).
+			Msg("File pull attempt failed on all candidate peers")
+
+		if attempt >= p.cfg.RetryMaxAttempts {
+			p.totalFailed.Add(1)
+			log.Error().
+				Err(lastErr).
+				Str("path", entry.Path).
+				Str("last_peer", lastPeer).
+				Int("peers_tried", len(peers)).
+				Msg("File pull giving up after max attempts (will be retried by next FSM callback or catch-up scan)")
+			return
+		}
+		p.sleepBackoff(attempt)
 	}
 }
 
@@ -422,5 +573,15 @@ func (p *Puller) sleepBackoff(attempt int) {
 // ErrChecksumMismatch is returned by Fetcher implementations when the bytes
 // pulled from a peer don't match the expected SHA-256 from the manifest.
 // The puller tracks this as a distinct metric and deletes the partial local
-// file before retrying.
+// file before retrying. Unlike ErrFileNotOnPeer, this error does NOT trigger
+// the multi-peer fallback — a corrupt body is a data integrity signal.
 var ErrChecksumMismatch = errors.New("filereplication: checksum mismatch")
+
+// ErrFileNotOnPeer is returned by Fetcher implementations when a peer
+// explicitly reports that it does not hold the requested file (via the ack
+// header Code field, or via a known error string from a Phase 2 peer). The
+// puller treats this as a fallback trigger: the next candidate in the
+// resolver's list is tried before the attempt is considered failed. This is
+// essential for Phase 3 catch-up after a Kubernetes pod rotation where the
+// original writer is gone but other peers still hold the file.
+var ErrFileNotOnPeer = errors.New("filereplication: file not on peer")

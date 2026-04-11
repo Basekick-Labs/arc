@@ -165,13 +165,58 @@ type FetchFileRequest struct {
 	HMAC      string `json:"hmac"`
 }
 
+// Phase 2 fetch-ack error reasons — human-readable strings the Phase 2
+// server emits in FetchFileAckHeader.Error. Phase 3 added the typed Code
+// field above, but these strings remain the compatibility contract: a
+// Phase 3 puller talking to a Phase 2 peer (no Code field) falls back to
+// exact-match on these constants to decide whether a negative ack should
+// trigger multi-peer fallback. Changing these strings is a wire-protocol
+// break against Phase 2 peers — add new codes instead.
+const (
+	ErrMsgFileNotInManifest = "file not in manifest"
+	ErrMsgFileNotFound      = "file not found on local backend"
+)
+
+// AckErrorCode is a machine-readable error category on FetchFileAckHeader,
+// added in Phase 3 so the puller can implement multi-peer fallback without
+// brittle substring matching on human-readable error text. An empty code
+// means either Status == "ok" or the remote is a Phase 2 peer that predates
+// this field — the fetch client falls back to exact-match on Error in that
+// case.
+type AckErrorCode string
+
+const (
+	// AckCodeNotFound: the peer does not have the requested file in its
+	// local backend. The puller treats this as a fallback trigger and tries
+	// the next candidate peer within the same attempt.
+	AckCodeNotFound AckErrorCode = "not_found"
+	// AckCodeManifest: the peer does not have an entry for the requested
+	// path in its Raft FSM manifest. Also triggers fallback.
+	AckCodeManifest AckErrorCode = "manifest"
+	// AckCodeAuth: HMAC validation failed. Does NOT trigger fallback — a
+	// cluster-wide shared-secret mismatch would silently fall through every
+	// peer and hide the real misconfiguration.
+	AckCodeAuth AckErrorCode = "auth"
+	// AckCodeBackend: the peer's local storage backend returned an error
+	// (Exists check failed, backend not configured, etc.). Does not fall
+	// through — surfaces as an attempt failure so operators see the problem.
+	AckCodeBackend AckErrorCode = "backend"
+	// AckCodeRaft: the peer's Raft node is unavailable (no FSM, not yet
+	// bootstrapped). Does not fall through.
+	AckCodeRaft AckErrorCode = "raft"
+	// AckCodeInvalidPath: path sanitization rejected the request (null
+	// byte, absolute path, traversal). Does not fall through.
+	AckCodeInvalidPath AckErrorCode = "invalid_path"
+)
+
 // FetchFileAckHeader is the response header for a fetch request. If Status is
 // "ok" the origin will immediately write SizeBytes of raw body content directly
 // to the TCP connection (NOT wrapped in another protocol envelope — the body is
 // read with io.CopyN on the raw conn). If Status is "error" no body follows.
 type FetchFileAckHeader struct {
-	Status    string `json:"status"`          // "ok" or "error"
-	Error     string `json:"error,omitempty"` // populated when Status == "error"
-	SizeBytes int64  `json:"size_bytes"`
-	SHA256    string `json:"sha256"` // hex-encoded; must match manifest SHA256
+	Status    string       `json:"status"`          // "ok" or "error"
+	Code      AckErrorCode `json:"code,omitempty"`  // machine-readable error category (Phase 3)
+	Error     string       `json:"error,omitempty"` // populated when Status == "error"
+	SizeBytes int64        `json:"size_bytes"`
+	SHA256    string       `json:"sha256"` // hex-encoded; must match manifest SHA256
 }

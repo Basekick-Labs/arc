@@ -67,6 +67,9 @@ type Coordinator struct {
 	// puller is the background worker pool that downloads files from peers.
 	// Nil when peer replication is disabled or the license forbids it.
 	puller *filereplication.Puller
+	// catchupOnce guarantees the Phase 3 catch-up walker runs at most once
+	// per coordinator lifetime, across repeated Start/Stop cycles in tests.
+	catchupOnce sync.Once
 
 	// Network
 	listener  net.Listener
@@ -981,7 +984,7 @@ func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequ
 		c.logger.Error().
 			Str("peer", remoteAddr).
 			Msg("FetchFile rejected: shared secret not configured (peer replication requires it)")
-		c.sendFetchError(conn, "peer replication is not configured on this node")
+		c.sendFetchError(conn, protocol.AckCodeAuth, "peer replication is not configured on this node")
 		return
 	}
 	// HMAC binds {nonce, nodeID, clusterName, path, timestamp} — including the
@@ -996,7 +999,7 @@ func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequ
 			Str("peer", remoteAddr).
 			Str("requesting_node", req.NodeID).
 			Msg("FetchFile rejected: HMAC validation failed")
-		c.sendFetchError(conn, "authentication failed")
+		c.sendFetchError(conn, protocol.AckCodeAuth, "authentication failed")
 		return
 	}
 
@@ -1010,7 +1013,7 @@ func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequ
 			Str("peer", remoteAddr).
 			Str("path", req.Path).
 			Msg("FetchFile rejected: invalid path")
-		c.sendFetchError(conn, fmt.Sprintf("invalid path: %v", err))
+		c.sendFetchError(conn, protocol.AckCodeInvalidPath, fmt.Sprintf("invalid path: %v", err))
 		return
 	}
 
@@ -1018,12 +1021,12 @@ func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequ
 	// peers from fetching arbitrary backend files outside the known data set,
 	// even if they pass the path sanitizer.
 	if c.raftNode == nil {
-		c.sendFetchError(conn, "Raft not available")
+		c.sendFetchError(conn, protocol.AckCodeRaft, "Raft not available")
 		return
 	}
 	fsm := c.raftNode.FSM()
 	if fsm == nil {
-		c.sendFetchError(conn, "FSM not available")
+		c.sendFetchError(conn, protocol.AckCodeRaft, "FSM not available")
 		return
 	}
 	entry, ok := fsm.GetFile(sanitized)
@@ -1032,7 +1035,7 @@ func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequ
 			Str("peer", remoteAddr).
 			Str("path", sanitized).
 			Msg("FetchFile: path not in manifest")
-		c.sendFetchError(conn, "file not in manifest")
+		c.sendFetchError(conn, protocol.AckCodeManifest, protocol.ErrMsgFileNotInManifest)
 		return
 	}
 
@@ -1041,7 +1044,7 @@ func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequ
 	backend := c.storage
 	c.mu.RUnlock()
 	if backend == nil {
-		c.sendFetchError(conn, "storage backend not configured")
+		c.sendFetchError(conn, protocol.AckCodeBackend, "storage backend not configured")
 		return
 	}
 
@@ -1057,11 +1060,11 @@ func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequ
 			Err(existsErr).
 			Str("path", sanitized).
 			Msg("FetchFile: Exists check failed")
-		c.sendFetchError(conn, "backend error")
+		c.sendFetchError(conn, protocol.AckCodeBackend, "backend error")
 		return
 	}
 	if !exists {
-		c.sendFetchError(conn, "file not found on local backend")
+		c.sendFetchError(conn, protocol.AckCodeNotFound, protocol.ErrMsgFileNotFound)
 		return
 	}
 
@@ -1122,11 +1125,14 @@ func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequ
 		Msg("FetchFile served successfully")
 }
 
-// sendFetchError sends a FetchFileAckHeader with an error status. Best-effort:
-// any write error is logged at debug but does not affect the caller's flow
-// (the connection is closed by the caller's defer).
-func (c *Coordinator) sendFetchError(conn net.Conn, reason string) {
-	ack := &protocol.FetchFileAckHeader{Status: "error", Error: reason}
+// sendFetchError sends a FetchFileAckHeader with an error status. code is
+// the machine-readable category (Phase 3) that the puller uses to decide
+// whether to fall through to another candidate peer. reason is a
+// human-readable message for operator debugging. Best-effort: any write
+// error is logged at debug but does not affect the caller's flow (the
+// connection is closed by the caller's defer).
+func (c *Coordinator) sendFetchError(conn net.Conn, code protocol.AckErrorCode, reason string) {
+	ack := &protocol.FetchFileAckHeader{Status: "error", Code: code, Error: reason}
 	if err := protocol.SendMessage(conn, &protocol.Message{
 		Type:    protocol.MsgFetchFileAck,
 		Payload: ack,
@@ -1535,29 +1541,62 @@ func (c *Coordinator) startFilePullerLocked() error {
 
 	// PeerResolver closes over the registry. Capture a reference so the
 	// puller can look up peer addresses without holding c.mu.
+	//
+	// Returns an ordered candidate list: the file's origin node first (if
+	// still in the registry with a usable address), followed by any other
+	// healthy peers excluding self. The puller iterates the list and tries
+	// each in turn — that way Phase 3 catch-up still works after a
+	// Kubernetes pod rotation when the original writer is gone.
 	registry := c.registry
-	resolver := filereplication.NewRegistryResolver(func(nodeID string) (string, bool) {
-		node, ok := registry.Get(nodeID)
-		if !ok {
-			return "", false
+	selfID := c.localNode.ID
+	// path is part of the signature so Phase 4+ can add shard-aware or
+	// compactor-aware routing without changing the interface; Phase 3
+	// ignores it and returns the same list regardless of which file is
+	// being fetched.
+	resolver := filereplication.NewRegistryResolver(func(originNodeID, _ string) []string {
+		seen := make(map[string]struct{})
+		candidates := make([]string, 0, 4)
+		add := func(addr string) {
+			if addr == "" {
+				return
+			}
+			if _, dup := seen[addr]; dup {
+				return
+			}
+			seen[addr] = struct{}{}
+			candidates = append(candidates, addr)
 		}
-		if node.Address == "" {
-			return "", false
+		// Origin first. If origin is unknown or address empty we still fall
+		// through to the healthy-peer list — that's the whole point.
+		if originNodeID != "" && originNodeID != selfID {
+			if node, ok := registry.Get(originNodeID); ok {
+				add(node.Address)
+			}
 		}
-		return node.Address, true
+		// Healthy fallback peers, excluding self and the origin we already
+		// tried. GetHealthy returns cloned copies so it's safe without
+		// holding c.mu.
+		for _, node := range registry.GetHealthy() {
+			if node.ID == selfID {
+				continue
+			}
+			add(node.Address)
+		}
+		return candidates
 	})
 
 	pullerCfg := filereplication.Config{
-		SelfNodeID:          c.localNode.ID,
-		Backend:             c.storage,
-		Fetcher:             fetchClient,
-		PeerResolver:        resolver,
-		Workers:             c.cfg.ReplicationPullWorkers,
-		QueueSize:           c.cfg.ReplicationQueueSize,
-		RetryMaxAttempts:    c.cfg.ReplicationRetryMaxAttempts,
-		FetchTimeout:        time.Duration(c.cfg.ReplicationFetchTimeoutMs) * time.Millisecond,
-		RetryInitialBackoff: 500 * time.Millisecond,
-		Logger:              c.logger,
+		SelfNodeID:            c.localNode.ID,
+		Backend:               c.storage,
+		Fetcher:               fetchClient,
+		PeerResolver:          resolver,
+		Workers:               c.cfg.ReplicationPullWorkers,
+		QueueSize:             c.cfg.ReplicationQueueSize,
+		RetryMaxAttempts:      c.cfg.ReplicationRetryMaxAttempts,
+		FetchTimeout:          time.Duration(c.cfg.ReplicationFetchTimeoutMs) * time.Millisecond,
+		RetryInitialBackoff:   500 * time.Millisecond,
+		CatchUpQueueHighWater: c.cfg.ReplicationCatchUpQueueHighWater,
+		Logger:                c.logger,
 	}
 
 	puller, err := filereplication.New(pullerCfg)
@@ -1598,7 +1637,122 @@ func (c *Coordinator) startFilePullerLocked() error {
 		Int("workers", pullerCfg.Workers).
 		Int("queue_size", pullerCfg.QueueSize).
 		Msg("Peer file replication puller started")
+
+	// Phase 3: kick off the catch-up walker in a background goroutine so
+	// Start() doesn't block on a potentially slow manifest walk. Queries can
+	// hit the node during catch-up — they see eventually-consistent results
+	// and operators read /api/v1/cluster/status for progress. The walker is
+	// gated on cluster.replication_catchup_enabled so operators can disable
+	// it as an emergency kill-switch on pathologically large manifests.
+	if c.cfg.ReplicationCatchUpEnabled {
+		go c.runCatchUpOnce()
+	} else {
+		c.logger.Warn().Msg("Peer file replication catch-up disabled via config (replication_catchup_enabled=false)")
+	}
 	return nil
+}
+
+// runCatchUpOnce is the Phase 3 startup reconciliation walker. It waits for
+// a leader + a Raft barrier so the local FSM reflects every committed entry,
+// then hands the full manifest to the puller.
+//
+// Called exactly once per Coordinator lifetime. The sync.Once guard means
+// repeated Start/Stop cycles in tests do NOT re-run catch-up — a fresh walk
+// requires a fresh Coordinator instance. This is intentional: in production
+// a node that wants to re-reconcile the manifest should restart the process.
+// If Phase 5 adds periodic reconciliation, it will live alongside this
+// startup-only path, not replace it.
+//
+// Errors from WaitForLeader and Barrier are logged as warnings and the
+// walker proceeds against a possibly-stale FSM snapshot. A partial walk is
+// strictly better than no walk — the reactive FSM callback path catches
+// any entries the walker missed as they apply.
+func (c *Coordinator) runCatchUpOnce() {
+	c.catchupOnce.Do(func() {
+		if c.puller == nil || c.raftNode == nil {
+			return
+		}
+
+		// Wait for a leader. On failure we still proceed — a follower with a
+		// non-empty FSM is a valid catch-up candidate against cluster state
+		// it already has locally, even if no leader is currently elected.
+		if err := c.raftNode.WaitForLeader(30 * time.Second); err != nil {
+			c.logger.Warn().
+				Err(err).
+				Msg("Catch-up: no leader after 30s, proceeding against possibly-stale manifest")
+		}
+
+		// Barrier: wait for the local FSM to apply everything up to the
+		// current commit index. Without this, GetAllFiles() on a freshly
+		// joined node may see a half-replayed manifest. On a lagging
+		// follower the barrier may time out — same degraded-but-useful
+		// fallback as above.
+		barrierTimeout := time.Duration(c.cfg.ReplicationCatchUpBarrierTimeoutMs) * time.Millisecond
+		if barrierTimeout <= 0 {
+			barrierTimeout = 10 * time.Second
+		}
+		if err := c.raftNode.Barrier(barrierTimeout); err != nil {
+			c.logger.Warn().
+				Err(err).
+				Dur("timeout", barrierTimeout).
+				Msg("Catch-up: Raft barrier timed out, proceeding against possibly-stale manifest")
+		}
+
+		fsm := c.raftNode.FSM()
+		if fsm == nil {
+			c.logger.Error().Msg("Catch-up: Raft FSM not available, skipping")
+			return
+		}
+		entries := fsm.GetAllFiles()
+		c.logger.Info().
+			Int("manifest_entries", len(entries)).
+			Msg("Catch-up: walking manifest")
+
+		// Derive a context from c.ctx (or Background if c.ctx is nil, which
+		// happens in tests that bypass Start). The walker honors cancellation
+		// so shutdown doesn't block on a large catch-up.
+		ctx := c.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		c.puller.RunCatchUp(ctx, entries)
+	})
+}
+
+// ReplicationCatchUpStatus returns the puller's catch-up-specific stats as a
+// JSON-serializable map, or nil when the puller is not running. Intended for
+// /api/v1/cluster/status. The keys mirror what Phase 5 will hard-gate the
+// query path on.
+func (c *Coordinator) ReplicationCatchUpStatus() map[string]int64 {
+	if c.puller == nil {
+		return nil
+	}
+	full := c.puller.Stats()
+	return map[string]int64{
+		"started_at":     full["catchup_started_at"],
+		"completed_at":   full["catchup_completed_at"],
+		"entries_walked": full["catchup_entries_walked"],
+		"enqueued":       full["catchup_enqueued"],
+		"skipped_local":  full["catchup_skipped_local"],
+		"pulled":         full["pulled"],
+		"failed":         full["failed"],
+		"dropped":        full["dropped"],
+		"skipped_dup":    full["skipped_dup"],
+	}
+}
+
+// ReplicationReady reports whether the Phase 3 catch-up walker has finished
+// its pass over the cluster manifest. Not currently consumed — Phase 5 will
+// use this to hard-gate the query path during startup so readers can't
+// return eventually-consistent results during catch-up. Lands now so the
+// coordinator surface doesn't need another change in Phase 5.
+func (c *Coordinator) ReplicationReady() bool {
+	if c.puller == nil {
+		// No puller means peer replication is off — treat as always ready
+		// so future Phase 5 gates don't block OSS / standalone paths.
+		return true
+	}
+	return c.puller.CatchUpCompleted()
 }
 
 // StartReplication starts WAL replication based on node role.

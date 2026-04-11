@@ -65,6 +65,16 @@ func (p *fakePeer) scriptError(reason string) {
 	p.body = nil
 }
 
+// scriptErrorCode sets both Code and Error on the next ack. Phase 3 peers
+// populate Code; Phase 2 peers leave it empty and the client falls back to
+// exact-matching Error.
+func (p *fakePeer) scriptErrorCode(code protocol.AckErrorCode, reason string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.ack = protocol.FetchFileAckHeader{Status: "error", Code: code, Error: reason}
+	p.body = nil
+}
+
 func (p *fakePeer) scriptCloseBeforeReply() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -418,5 +428,143 @@ func TestFetchClientLargeBody(t *testing.T) {
 	}
 	if n != int64(size) {
 		t.Errorf("bytes: got %d, want %d", n, size)
+	}
+}
+
+// --- Phase 3 tests: ErrFileNotOnPeer mapping ---
+
+// TestFetchClientErrFileNotOnPeerCodeNotFound verifies the machine-readable
+// Phase 3 Code field drives the fallback decision. A peer that responds with
+// Code="not_found" should trigger ErrFileNotOnPeer so the puller can fall
+// through to the next candidate.
+func TestFetchClientErrFileNotOnPeerCodeNotFound(t *testing.T) {
+	peer := startFakePeer(t)
+	defer peer.stop()
+	peer.scriptErrorCode(protocol.AckCodeNotFound, protocol.ErrMsgFileNotFound)
+
+	fc := newFetchClient(t, "reader-1", "shared-secret-xyz")
+	entry := &raft.FileEntry{
+		Path:      "db/cpu/missing.parquet",
+		SizeBytes: 42,
+		SHA256:    sha256Hex([]byte("dummy")),
+	}
+	var dst bytes.Buffer
+	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, ErrFileNotOnPeer) {
+		t.Errorf("expected ErrFileNotOnPeer, got %v", err)
+	}
+}
+
+// TestFetchClientErrFileNotOnPeerCodeManifest verifies Code="manifest" (file
+// not in the Raft manifest on the peer) also triggers fallback — a peer
+// that doesn't know about the file shouldn't fail the entire attempt.
+func TestFetchClientErrFileNotOnPeerCodeManifest(t *testing.T) {
+	peer := startFakePeer(t)
+	defer peer.stop()
+	peer.scriptErrorCode(protocol.AckCodeManifest, protocol.ErrMsgFileNotInManifest)
+
+	fc := newFetchClient(t, "reader-1", "shared-secret-xyz")
+	entry := &raft.FileEntry{
+		Path:      "db/cpu/offmanifest.parquet",
+		SizeBytes: 42,
+		SHA256:    sha256Hex([]byte("dummy")),
+	}
+	var dst bytes.Buffer
+	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, ErrFileNotOnPeer) {
+		t.Errorf("expected ErrFileNotOnPeer, got %v", err)
+	}
+}
+
+// TestFetchClientErrFileNotOnPeerPhase2Fallback verifies that when Code is
+// empty (Phase 2 peer that predates the field), the client falls back to
+// substring-matching the human-readable error text. This locks in the
+// backward-compat contract so a Phase 3 node can catch up from a Phase 2
+// origin.
+func TestFetchClientErrFileNotOnPeerPhase2Fallback(t *testing.T) {
+	cases := []struct {
+		name   string
+		reason string
+	}{
+		{"not_in_manifest", "file not in manifest"},
+		{"not_on_backend", "file not found on local backend"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			peer := startFakePeer(t)
+			defer peer.stop()
+			// scriptError leaves Code empty — Phase 2 shape.
+			peer.scriptError(tc.reason)
+
+			fc := newFetchClient(t, "reader-1", "shared-secret-xyz")
+			entry := &raft.FileEntry{
+				Path:      "db/cpu/phase2-fallback.parquet",
+				SizeBytes: 42,
+				SHA256:    sha256Hex([]byte("dummy")),
+			}
+			var dst bytes.Buffer
+			_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !errors.Is(err, ErrFileNotOnPeer) {
+				t.Errorf("expected ErrFileNotOnPeer for reason %q (Phase 2 peer fallback), got %v", tc.reason, err)
+			}
+		})
+	}
+}
+
+// TestFetchClientAuthErrorIsNotFallback verifies that auth failures do NOT
+// map to ErrFileNotOnPeer — otherwise a misconfigured cluster would silently
+// fall through every healthy peer and give up with a generic "max attempts"
+// error, hiding the real problem.
+func TestFetchClientAuthErrorIsNotFallback(t *testing.T) {
+	peer := startFakePeer(t)
+	defer peer.stop()
+	peer.scriptErrorCode(protocol.AckCodeAuth, "authentication failed")
+
+	fc := newFetchClient(t, "reader-1", "shared-secret-xyz")
+	entry := &raft.FileEntry{
+		Path:      "db/cpu/auth-fail.parquet",
+		SizeBytes: 42,
+		SHA256:    sha256Hex([]byte("dummy")),
+	}
+	var dst bytes.Buffer
+	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if errors.Is(err, ErrFileNotOnPeer) {
+		t.Errorf("auth errors must NOT map to ErrFileNotOnPeer, got %v", err)
+	}
+}
+
+// TestFetchClientBackendErrorIsNotFallback — same reasoning: a peer with a
+// broken backend isn't "file not here", it's an operational problem that
+// should surface rather than cause silent fallback.
+func TestFetchClientBackendErrorIsNotFallback(t *testing.T) {
+	peer := startFakePeer(t)
+	defer peer.stop()
+	peer.scriptErrorCode(protocol.AckCodeBackend, "backend error")
+
+	fc := newFetchClient(t, "reader-1", "shared-secret-xyz")
+	entry := &raft.FileEntry{
+		Path:      "db/cpu/backend-fail.parquet",
+		SizeBytes: 42,
+		SHA256:    sha256Hex([]byte("dummy")),
+	}
+	var dst bytes.Buffer
+	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if errors.Is(err, ErrFileNotOnPeer) {
+		t.Errorf("backend errors must NOT map to ErrFileNotOnPeer, got %v", err)
 	}
 }

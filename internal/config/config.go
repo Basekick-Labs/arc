@@ -341,6 +341,13 @@ type ClusterConfig struct {
 	ReplicationServeTimeoutMs   int // Origin-side body-stream timeout in milliseconds (default: 120000). Raise for large files or slow links.
 	ReplicationRetryMaxAttempts int // Max immediate retry attempts per enqueue (default: 3)
 
+	// Peer file replication catch-up (Phase 3). These control the startup
+	// reconciliation walker that brings a new or restarted node back into
+	// sync with the cluster manifest.
+	ReplicationCatchUpEnabled           bool    // Master switch for the catch-up walker. Emergency off-switch for pathologically large manifests. (default: true)
+	ReplicationCatchUpBarrierTimeoutMs  int     // Raft barrier timeout before walking the manifest — ensures the local FSM has applied every committed entry. (default: 10000)
+	ReplicationCatchUpQueueHighWater    float64 // Queue-depth fraction above which the walker pauses enqueueing. Keeps the walker from racing workers on large manifests. (default: 0.8)
+
 	// Sharding configuration (Phase 4)
 	ShardingEnabled           bool   // Enable sharding for horizontal write scaling (default: false)
 	ShardingNumShards         int    // Number of shards (default: 3)
@@ -567,11 +574,14 @@ func Load() (*Config, error) {
 			ReplicationBufferSize:  v.GetInt("cluster.replication_buffer_size"),
 			ReplicationAckInterval: v.GetInt("cluster.replication_ack_interval"),
 			// Peer file replication (Enterprise Phase 2)
-			ReplicationPullWorkers:      v.GetInt("cluster.replication_pull_workers"),
-			ReplicationQueueSize:        v.GetInt("cluster.replication_queue_size"),
-			ReplicationFetchTimeoutMs:   v.GetInt("cluster.replication_fetch_timeout_ms"),
-			ReplicationServeTimeoutMs:   v.GetInt("cluster.replication_serve_timeout_ms"),
-			ReplicationRetryMaxAttempts: v.GetInt("cluster.replication_retry_max_attempts"),
+			ReplicationPullWorkers:             v.GetInt("cluster.replication_pull_workers"),
+			ReplicationQueueSize:               v.GetInt("cluster.replication_queue_size"),
+			ReplicationFetchTimeoutMs:          v.GetInt("cluster.replication_fetch_timeout_ms"),
+			ReplicationServeTimeoutMs:          v.GetInt("cluster.replication_serve_timeout_ms"),
+			ReplicationRetryMaxAttempts:        v.GetInt("cluster.replication_retry_max_attempts"),
+			ReplicationCatchUpEnabled:          v.GetBool("cluster.replication_catchup_enabled"),
+			ReplicationCatchUpBarrierTimeoutMs: v.GetInt("cluster.replication_catchup_barrier_timeout_ms"),
+			ReplicationCatchUpQueueHighWater:   v.GetFloat64("cluster.replication_catchup_queue_high_water"),
 			// Sharding configuration (Phase 4)
 			ShardingEnabled:           v.GetBool("cluster.sharding_enabled"),
 			ShardingNumShards:         v.GetInt("cluster.sharding_num_shards"),
@@ -807,6 +817,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.replication_fetch_timeout_ms", 60000)  // 60s puller-side per-fetch timeout
 	v.SetDefault("cluster.replication_serve_timeout_ms", 120000) // 120s origin-side body-stream timeout
 	v.SetDefault("cluster.replication_retry_max_attempts", 3)    // 3 immediate retries
+	// Peer file replication catch-up (Enterprise Phase 3)
+	v.SetDefault("cluster.replication_catchup_enabled", true)            // Walk the manifest on startup to reconcile missing files
+	v.SetDefault("cluster.replication_catchup_barrier_timeout_ms", 10000) // 10s Raft barrier before walking
+	v.SetDefault("cluster.replication_catchup_queue_high_water", 0.8)     // Pause walker when queue is >80% full
 
 	// Sharding defaults (Phase 4)
 	v.SetDefault("cluster.sharding_enabled", false)        // Disabled by default
