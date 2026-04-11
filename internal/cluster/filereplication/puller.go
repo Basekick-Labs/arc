@@ -151,7 +151,14 @@ type Puller struct {
 	catchupCompletedAt   atomic.Int64 // unix seconds; 0 if still running or never ran
 	catchupEntriesWalked atomic.Int64 // entries the walker iterated
 	catchupEnqueued      atomic.Int64 // entries successfully enqueued by the walker
-	catchupSkippedLocal  atomic.Int64 // entries the walker skipped because backend.Exists
+	// catchupSkippedLocal counts entries the walker chose NOT to enqueue
+	// because Enqueue already had a reason to skip — either origin==self
+	// (totalSkippedSelf bump) or the path was already in-flight via a
+	// reactive callback (totalSkippedDup bump). It does NOT include entries
+	// skipped because backend.Exists(path) was already true — that check
+	// happens downstream inside processEntry and is tracked by the global
+	// totalSkippedLocal counter.
+	catchupSkippedLocal  atomic.Int64
 }
 
 // New constructs a Puller. Does not start background workers — call Start.
@@ -422,6 +429,15 @@ func (p *Puller) processEntry(log zerolog.Logger, entry *raft.FileEntry) {
 			}
 			lastErr = err
 			lastPeer = peerAddr
+			// Fast-path shutdown: if the puller is stopping, pullOnce will
+			// return a context.Canceled-wrapped error. Without this check
+			// the loop would iterate every remaining candidate, logging a
+			// debug "trying next" line and issuing a dial attempt for each,
+			// before the top-of-loop ctx check finally caught it. On a
+			// 10-peer cluster that's 10 wasted dials during shutdown.
+			if errors.Is(err, context.Canceled) {
+				return
+			}
 			// Checksum mismatch is a data-integrity signal, not a "try next
 			// peer" signal. A peer served bytes that didn't match the manifest
 			// SHA-256 — corrupt manifest, corrupt peer, or adversarial peer.

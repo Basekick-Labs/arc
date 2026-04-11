@@ -739,6 +739,75 @@ func TestPullerMultiPeerAllFailMaxAttempts(t *testing.T) {
 	}
 }
 
+// TestPullerMultiPeerCtxCanceledEarlyExit verifies that when the puller is
+// stopped mid-attempt, the peer fallback loop exits immediately on the
+// first context.Canceled error rather than iterating through every
+// remaining candidate. Regression test for the Gemini Phase 3 review
+// finding — without the explicit check, a 10-peer cluster would burn
+// 10 wasted dial attempts + 10 debug log lines during shutdown.
+func TestPullerMultiPeerCtxCanceledEarlyExit(t *testing.T) {
+	backend := newFakeBackend()
+	fetcher := newPerPeerFetcher()
+	// Peer 1: returns context.Canceled — simulates pullOnce observing
+	// that the puller's own context was cancelled mid-fetch.
+	fetcher.handle("1.1.1.1:9100", func(dst io.Writer) (int64, error) {
+		return 0, fmt.Errorf("simulated mid-fetch cancel: %w", context.Canceled)
+	})
+	// Peers 2 and 3: would fall through if called. The puller must NOT
+	// call either within the same attempt after seeing the cancel.
+	fetcher.handle("2.2.2.2:9100", func(dst io.Writer) (int64, error) {
+		return 0, fmt.Errorf("%w: file not found on local backend", ErrFileNotOnPeer)
+	})
+	fetcher.handle("3.3.3.3:9100", func(dst io.Writer) (int64, error) {
+		return 0, fmt.Errorf("%w: file not found on local backend", ErrFileNotOnPeer)
+	})
+	resolver := multiPeerResolver{addrs: []string{"1.1.1.1:9100", "2.2.2.2:9100", "3.3.3.3:9100"}}
+
+	p, err := New(Config{
+		SelfNodeID:          "reader-1",
+		Backend:             backend,
+		Fetcher:             fetcher,
+		PeerResolver:        resolver,
+		Workers:             1,
+		QueueSize:           4,
+		RetryMaxAttempts:    1,
+		RetryInitialBackoff: 10 * time.Millisecond,
+		FetchTimeout:        2 * time.Second,
+		Logger:              zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p.Start(context.Background())
+	defer p.Stop()
+
+	entry := makeEntry("testdb/cpu/ctxcancel.parquet", "writer-1", 100)
+	p.Enqueue(entry)
+
+	// Wait for the single attempt to complete. The walker returns from
+	// processEntry on ctx.Canceled without touching peers 2 or 3.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if fetcher.total.Load() > 0 && p.Stats()["enqueued"] == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Give the worker a brief moment in case it were (incorrectly) iterating.
+	time.Sleep(50 * time.Millisecond)
+
+	if c := fetcher.callsFor("1.1.1.1:9100"); c != 1 {
+		t.Errorf("peer-1 calls: got %d, want 1", c)
+	}
+	if c := fetcher.callsFor("2.2.2.2:9100"); c != 0 {
+		t.Errorf("peer-2 calls: got %d, want 0 (ctx.Canceled must break the peer loop immediately)", c)
+	}
+	if c := fetcher.callsFor("3.3.3.3:9100"); c != 0 {
+		t.Errorf("peer-3 calls: got %d, want 0 (ctx.Canceled must break the peer loop immediately)", c)
+	}
+}
+
 // TestPullerMultiPeerChecksumMismatchDoesNotFallThrough is the regression
 // test for the "checksum mismatch breaks the peer loop" decision in the
 // Phase 3 plan. A corrupt body from peer-1 is a data integrity signal —
