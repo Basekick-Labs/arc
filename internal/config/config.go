@@ -337,7 +337,8 @@ type ClusterConfig struct {
 	// ReplicationEnabled && Enabled and FeatureClustering is licensed.
 	ReplicationPullWorkers      int // Number of concurrent fetch workers per node (default: 4)
 	ReplicationQueueSize        int // Buffered FSM callback queue size (default: 1024)
-	ReplicationFetchTimeoutMs   int // Per-fetch overall timeout in milliseconds (default: 60000)
+	ReplicationFetchTimeoutMs   int // Puller-side per-fetch overall timeout in milliseconds (default: 60000)
+	ReplicationServeTimeoutMs   int // Origin-side body-stream timeout in milliseconds (default: 120000). Raise for large files or slow links.
 	ReplicationRetryMaxAttempts int // Max immediate retry attempts per enqueue (default: 3)
 
 	// Sharding configuration (Phase 4)
@@ -569,6 +570,7 @@ func Load() (*Config, error) {
 			ReplicationPullWorkers:      v.GetInt("cluster.replication_pull_workers"),
 			ReplicationQueueSize:        v.GetInt("cluster.replication_queue_size"),
 			ReplicationFetchTimeoutMs:   v.GetInt("cluster.replication_fetch_timeout_ms"),
+			ReplicationServeTimeoutMs:   v.GetInt("cluster.replication_serve_timeout_ms"),
 			ReplicationRetryMaxAttempts: v.GetInt("cluster.replication_retry_max_attempts"),
 			// Sharding configuration (Phase 4)
 			ShardingEnabled:           v.GetBool("cluster.sharding_enabled"),
@@ -802,7 +804,8 @@ func setDefaults(v *viper.Viper) {
 	// Peer file replication (Enterprise Phase 2)
 	v.SetDefault("cluster.replication_pull_workers", 4)          // 4 concurrent pullers
 	v.SetDefault("cluster.replication_queue_size", 1024)         // 1024-entry callback queue
-	v.SetDefault("cluster.replication_fetch_timeout_ms", 60000)  // 60s per-fetch timeout
+	v.SetDefault("cluster.replication_fetch_timeout_ms", 60000)  // 60s puller-side per-fetch timeout
+	v.SetDefault("cluster.replication_serve_timeout_ms", 120000) // 120s origin-side body-stream timeout
 	v.SetDefault("cluster.replication_retry_max_attempts", 3)    // 3 immediate retries
 
 	// Sharding defaults (Phase 4)

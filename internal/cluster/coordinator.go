@@ -1089,7 +1089,12 @@ func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequ
 	// protocol framing — the peer reads exactly entry.SizeBytes bytes.
 	// The write deadline bounds slow peers; the context is derived from the
 	// coordinator's lifetime so shutdown cancels any in-flight transfer.
-	const bodyStreamTimeout = 2 * time.Minute
+	// Operators serving large Parquet files or running on slow/constrained
+	// links can raise cluster.replication_serve_timeout_ms.
+	bodyStreamTimeout := time.Duration(c.cfg.ReplicationServeTimeoutMs) * time.Millisecond
+	if bodyStreamTimeout <= 0 {
+		bodyStreamTimeout = 2 * time.Minute
+	}
 	if err := conn.SetWriteDeadline(time.Now().Add(bodyStreamTimeout)); err != nil {
 		c.logger.Warn().Err(err).Msg("FetchFile: failed to set write deadline")
 		return

@@ -36,7 +36,8 @@ Building on the cluster file manifest, Arc Enterprise now replicates **actual Pa
 - `replication_enabled` — master switch; requires `cluster.shared_secret` to be set
 - `replication_pull_workers = 4` — concurrent fetch workers per node
 - `replication_queue_size = 1024` — bounded queue; excess entries are dropped with a rate-limited warning and reconciled later
-- `replication_fetch_timeout_ms = 60000` — per-fetch timeout
+- `replication_fetch_timeout_ms = 60000` — puller-side per-fetch timeout
+- `replication_serve_timeout_ms = 120000` — origin-side body-stream timeout; raise for large Parquet files or slow links
 - `replication_retry_max_attempts = 3` — immediate retry attempts before dropping the entry
 
 **Security:**
