@@ -140,6 +140,14 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 		return 0, fmt.Errorf("ack payload has wrong type: %T", ackMsg.Payload)
 	}
 	if ack.Status != "ok" {
+		// Phase 3: if the peer reports "not_found" or "manifest" (i.e. this
+		// peer simply doesn't hold this file), return ErrFileNotOnPeer so
+		// the puller can fall through to the next candidate peer. Code is
+		// empty when talking to a Phase 2 peer that predates this field —
+		// in that case, fall back to matching known human-readable strings.
+		if isFileNotOnPeerAck(ack) {
+			return 0, fmt.Errorf("%w: %s", ErrFileNotOnPeer, ack.Error)
+		}
 		return 0, fmt.Errorf("peer rejected fetch: %s", ack.Error)
 	}
 	if ack.SizeBytes < 0 {
@@ -175,15 +183,45 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 // Compile-time check that FetchClient satisfies Fetcher.
 var _ Fetcher = (*FetchClient)(nil)
 
-// NewRegistryResolver adapts any function that maps node IDs to addresses
-// into a PeerResolver. This is the simplest plumbing between the coordinator
-// (which owns the registry) and the puller (which needs a resolver).
-func NewRegistryResolver(fn func(nodeID string) (string, bool)) PeerResolver {
+// isFileNotOnPeerAck reports whether an error ack indicates the peer simply
+// doesn't have the requested file (as opposed to auth failure, backend error,
+// or Raft unavailability, which should NOT trigger multi-peer fallback).
+//
+// The primary signal is the typed Code field added in Phase 3. If Code is
+// empty (Phase 2 peer predating the field), we fall back to exact-match on
+// ack.Error against protocol.ErrMsgFileNotInManifest / ErrMsgFileNotFound,
+// which are the strings the Phase 2 server emits. Exact match (not
+// substring) prevents an adversary from crafting an Error value that
+// confuses the check — e.g. "file not found on local backend: /etc/passwd"
+// would NOT match. The server-side strings and this fallback live together
+// in internal/cluster/protocol so a refactor touches both sites at once.
+func isFileNotOnPeerAck(ack *protocol.FetchFileAckHeader) bool {
+	if ack == nil {
+		return false
+	}
+	switch ack.Code {
+	case protocol.AckCodeNotFound, protocol.AckCodeManifest:
+		return true
+	case "":
+		// Phase 2 peer — fall back to exact-match on the known strings.
+		return ack.Error == protocol.ErrMsgFileNotInManifest ||
+			ack.Error == protocol.ErrMsgFileNotFound
+	default:
+		return false
+	}
+}
+
+// NewRegistryResolver adapts a function that maps (originNodeID, path) to
+// an ordered list of candidate peer addresses into a PeerResolver. Typical
+// usage: return the origin address first (if still healthy) followed by
+// any other healthy peers — that way Phase 3 catch-up still works after a
+// Kubernetes pod rotation when the original writer is gone.
+func NewRegistryResolver(fn func(originNodeID, path string) []string) PeerResolver {
 	return funcResolver(fn)
 }
 
-type funcResolver func(string) (string, bool)
+type funcResolver func(string, string) []string
 
-func (f funcResolver) ResolvePeer(nodeID string) (string, bool) {
-	return f(nodeID)
+func (f funcResolver) ResolvePeers(originNodeID, path string) []string {
+	return f(originNodeID, path)
 }

@@ -48,12 +48,57 @@ Building on the cluster file manifest, Arc Enterprise now replicates **actual Pa
 
 **Scope of Phase 2:** async replication only. Phase 2 does **not** include: resume via HTTP Range, catch-up for nodes joining with existing data, quorum durability, multi-peer fanout, or compaction-aware routing. These land in Phases 3–5.
 
-**What's coming next** (separate PRs):
-- Phase 3: Automatic catch-up for new nodes joining a cluster with existing data
-- Phase 4: Integration with compaction (compactor role produces files, replicas pull the compacted output)
-- Phase 5: Optional write quorum for strong durability, multi-peer fanout, and resumable transfers via Range
-
 **Design inspiration:** ClickHouse's ReplicatedMergeTree model — a Raft-equivalent op log + HTTP-pull-based file transfer. Research compared InfluxDB Enterprise (anti-entropy + HHQ), ClickHouse (log + HTTP pull), TimescaleDB (deprecated multi-node), Apache Pinot (peer fetcher fallback), and Apache Druid (metadata-driven assignment). ClickHouse's model is the cleanest fit for Arc's existing Raft + coordinator TCP infrastructure.
+
+### Peer File Replication — Catch-up on Join (Enterprise — Phase 3)
+
+Phase 2 replicated files reactively — a node only pulled files that committed to Raft while its puller was running. That left two fatal gaps on Kubernetes: (1) a node that was down when a file was flushed never got the callback and had the file missing on restart, and (2) a brand-new reader joining a cluster with existing data received the Raft log but couldn't pull anything because `entry.OriginNodeID` often pointed to a pod that had been rescheduled and no longer existed. Queries against such nodes silently returned incomplete results.
+
+Phase 3 closes both gaps with a **startup reconciliation walker** and a **multi-peer fallback resolver**. A node that comes online now converges on the manifest within a bounded time, regardless of whether the original writer is still in the cluster.
+
+**How it works:**
+- After the puller starts, the coordinator spawns a background goroutine — guarded by `sync.Once` so it runs exactly once per coordinator lifetime — that waits for a Raft leader, issues a new `Node.Barrier` wrapper over `hraft.Raft.Barrier` so the local FSM reflects every committed entry, then feeds `fsm.GetAllFiles()` through a new `Puller.RunCatchUp` method. On `WaitForLeader` or `Barrier` timeout the walker proceeds against the follower's possibly-stale view — better a partial walk than no walk, and the reactive FSM callback path catches anything the walker missed as it applies.
+- The walker enqueues each manifest entry through the existing Phase 2 worker pool, so all the Phase 2 retry, backoff, checksum verification, and metrics apply automatically — catch-up is data flowing through the same code path as reactive pulls.
+- A per-path **inflight set** on the puller deduplicates enqueues: if the walker and a reactive FSM callback both try to enqueue path X during a write committing mid-walk, only the first call queues the entry and the rest are counted as `skipped_dup`. The slot is released via `defer` inside `processEntry` so the set stays bounded even on worker panic.
+- **Queue-depth backpressure** — when the queue is above `replication_catchup_queue_high_water` (default 0.8), the walker sleeps 50ms between enqueues to let workers drain. Prevents thundering-herd drop storms on large manifests without needing a second worker pool.
+
+**Multi-peer fallback resolver:** the Phase 2 `PeerResolver` interface returned a single `(addr, ok)` pair for the origin. Phase 3 changes it to `ResolvePeers(originNodeID, path string) []string` — the resolver takes just the two fields it needs (no `*raft.FileEntry` coupling), and returns an **ordered list**: origin first (if still healthy), then every other healthy peer excluding self. The `path` parameter is part of the signature so Phase 4+ can add shard-aware or compactor-aware routing without changing the interface; Phase 3 ignores it.
+
+The puller iterates the list within a single attempt and falls through to the next candidate on any per-peer failure **except** checksum mismatch. A corrupt body from peer-1 is a data integrity signal, not a "try another peer" signal — if the puller fell through on checksum mismatch it would pull-and-corrupt from every healthy peer in turn. `ErrChecksumMismatch` breaks out of the per-attempt peer loop and the attempt-level retry handles it via the existing delete-and-redownload path.
+
+**Typed ack error codes** — the ack header gained a new `protocol.AckErrorCode` typed field with constants (`AckCodeNotFound`, `AckCodeManifest`, `AckCodeAuth`, `AckCodeBackend`, `AckCodeRaft`, `AckCodeInvalidPath`) so the puller can distinguish "peer doesn't have this file" from "peer rejected me" without substring matching:
+
+| Code | Puller behavior |
+|---|---|
+| `not_found` / `manifest` | Fall through to next peer |
+| `auth` / `backend` / `raft` / `invalid_path` | Fail attempt (don't fall through) |
+
+The `Code` field is a JSON `omitempty` addition — **backward compatible** with Phase 2 peers. When `Code` is empty (Phase 2 peer), the client falls back to **exact-match** (not substring — an adversary can't craft an error string like `"file not found on local backend: /etc/passwd"` to confuse the check) against `protocol.ErrMsgFileNotInManifest` / `protocol.ErrMsgFileNotFound`. Both the typed codes and the Phase 2 fallback strings live together in `internal/cluster/protocol/messages.go` so a refactor of either touches both sites at once.
+
+**Configuration** (set via `ARC_CLUSTER_REPLICATION_CATCHUP_*` env vars or `cluster.replication_catchup_*` in `arc.toml`):
+- `replication_catchup_enabled = true` — master switch; disable as an emergency kill-switch on pathologically large manifests
+- `replication_catchup_barrier_timeout_ms = 10000` — Raft barrier timeout before walking
+- `replication_catchup_queue_high_water = 0.8` — walker pauses enqueueing when the queue is above this fraction
+
+No new worker-count knob — catch-up shares the Phase 2 `replication_pull_workers` pool.
+
+**Observability:** `Puller.Stats()` grew new counters surfaced through the coordinator:
+- `catchup_started_at` / `catchup_completed_at` (unix seconds; the latter goes non-zero once the walker has finished its pass, not once all queued pulls have drained)
+- `catchup_entries_walked` / `catchup_enqueued` / `catchup_skipped_local`
+- `skipped_dup` (new — counts Phase 3 dedup skips)
+
+New `Coordinator.ReplicationCatchUpStatus()` returns the catch-up-specific stats as a JSON-serializable map intended for `/api/v1/cluster/status`. New `Coordinator.ReplicationReady()` returns `true` once the walker has completed its pass — not currently consumed (queries can hit a node during catch-up and see eventually-consistent results), but Phase 5 will use it to hard-gate the query path so the accessor lands now and avoids another coordinator surface change later. Operators can use the status endpoint for external readiness probes in the meantime.
+
+**Security review:**
+- Multi-peer fallback expands the set of trusted peers from `OriginNodeID` to any healthy cluster member — but all peers are already mutually authenticated via shared secret + TLS, and the Phase 2 path-bound HMAC is preserved so a stolen MAC still can't fetch a different file. Regression-tested.
+- Checksum mismatch short-circuit is tested explicitly (`TestPullerMultiPeerChecksumMismatchDoesNotFallThrough`) to lock in the "one corrupt peer can't force every reader to pull-and-corrupt" invariant.
+- Every `sendFetchError` call site uses a typed `AckErrorCode` constant — no path where user input flows into `Code`.
+
+**Scope of Phase 3:** startup-only reconciliation with any-peer fallback. Phase 3 does **not** include: periodic reconciliation (reactive callbacks handle steady-state drift), orphan detection (Phase 4 compaction concern), paginated FSM walks (accepted O(N) snapshot copy — emergency kill-switch exists for 10M+ file deployments), hard query gating (Phase 5), bandwidth caps (Phase 5), or HTTP Range resume (Phase 5).
+
+**What's coming next** (separate PRs):
+- Phase 4: Integration with compaction (compactor role produces files, replicas pull the compacted output)
+- Phase 5: Optional write quorum for strong durability, hard query gating on catch-up, paginated FSM iteration, periodic reconciliation, bandwidth caps, and resumable transfers via Range
 
 ### Cluster TLS Encryption and Shared Secret Authentication (Enterprise)
 

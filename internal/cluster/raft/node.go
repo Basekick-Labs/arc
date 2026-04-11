@@ -439,6 +439,28 @@ func (n *Node) WaitForLeader(timeout time.Duration) error {
 	}
 }
 
+// Barrier issues a Raft barrier and waits for every log entry already
+// committed before the call to be applied to the local FSM. After Barrier
+// returns without error, a GetAllFiles() read on the FSM reflects every
+// file that was committed before Barrier was invoked — i.e. the caller
+// gets "read your writes up to now" semantics against the cluster state.
+//
+// This is the synchronization point the Phase 3 catch-up walker uses on
+// startup: after the node joins (or after a restart), we wait for any
+// backlog of log entries to apply before walking the manifest, so catch-up
+// doesn't run against a stale view of the cluster's files.
+//
+// Followers can call Barrier too — it waits until local apply catches up to
+// the follower's own commit index, not the leader's. On timeout (e.g.
+// follower far behind the leader), Barrier returns an error and the caller
+// is expected to fall through to its best-effort behavior.
+func (n *Node) Barrier(timeout time.Duration) error {
+	if n.raft == nil {
+		return fmt.Errorf("raft not started")
+	}
+	return n.raft.Barrier(timeout).Error()
+}
+
 // AddNode adds a node to the cluster state via Raft.
 func (n *Node) AddNode(node *NodeInfo, timeout time.Duration) error {
 	payload, err := json.Marshal(AddNodePayload{Node: *node})
