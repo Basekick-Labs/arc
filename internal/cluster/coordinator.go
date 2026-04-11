@@ -1615,3 +1615,75 @@ func (c *Coordinator) UpdateNodeStateViaRaft(nodeID string, state NodeState) err
 
 	return c.raftNode.UpdateNodeState(nodeID, string(state), 5*time.Second)
 }
+
+// RegisterFileInManifest appends a file entry to the cluster-wide manifest
+// via Raft. Returns nil if Raft is not initialized (standalone mode).
+// Only the Raft leader can append; non-leader nodes silently skip — the
+// manifest is not critical for correctness in Phase 1 since replication is
+// not yet active. A future phase will add forwarding to the leader.
+func (c *Coordinator) RegisterFileInManifest(file raft.FileEntry) error {
+	if c.raftNode == nil {
+		// Standalone mode — no manifest needed
+		return nil
+	}
+
+	if !c.raftNode.IsLeader() {
+		// Non-leader writers can't append directly. In Phase 1 this is
+		// acceptable: the manifest is informational. Phase 2 will add
+		// leader forwarding for non-leader writers.
+		c.logger.Debug().
+			Str("path", file.Path).
+			Msg("Skipping manifest registration (not the Raft leader)")
+		return nil
+	}
+
+	if err := c.raftNode.RegisterFile(file, 5*time.Second); err != nil {
+		return fmt.Errorf("register file in manifest: %w", err)
+	}
+	return nil
+}
+
+// DeleteFileFromManifest removes a file from the cluster-wide manifest.
+// Called by retention and compaction cleanup.
+func (c *Coordinator) DeleteFileFromManifest(path, reason string) error {
+	if c.raftNode == nil {
+		return nil
+	}
+
+	if !c.raftNode.IsLeader() {
+		c.logger.Debug().
+			Str("path", path).
+			Msg("Skipping manifest deletion (not the Raft leader)")
+		return nil
+	}
+
+	if err := c.raftNode.DeleteFile(path, reason, 5*time.Second); err != nil {
+		return fmt.Errorf("delete file from manifest: %w", err)
+	}
+	return nil
+}
+
+// GetFileManifest returns the current file manifest from the Raft FSM.
+// Returns nil if Raft is not initialized.
+func (c *Coordinator) GetFileManifest() []*raft.FileEntry {
+	if c.raftNode == nil {
+		return nil
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return nil
+	}
+	return fsm.GetAllFiles()
+}
+
+// GetFileManifestByDatabase returns files for a specific database.
+func (c *Coordinator) GetFileManifestByDatabase(database string) []*raft.FileEntry {
+	if c.raftNode == nil {
+		return nil
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return nil
+	}
+	return fsm.GetFilesByDatabase(database)
+}

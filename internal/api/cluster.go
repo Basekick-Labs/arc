@@ -3,6 +3,7 @@ package api
 import (
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
+	clusterraft "github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/license"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
@@ -63,7 +64,14 @@ func (h *ClusterHandler) RegisterRoutes(app *fiber.App) {
 	app.Get("/api/v1/cluster/local", h.handleGetLocalNode)
 	app.Get("/api/v1/cluster/health", h.handleGetHealth)
 
-	// Admin-only: destructive operations
+	// Admin-only: file manifest exposes database schema + file paths
+	// and destructive node removal
+	filesGroup := app.Group("/api/v1/cluster/files")
+	if h.authManager != nil {
+		filesGroup.Use(auth.RequireAdmin(h.authManager))
+	}
+	filesGroup.Get("", h.handleGetFiles)
+
 	removeGroup := app.Group("/api/v1/cluster/nodes/:id")
 	if h.authManager != nil {
 		removeGroup.Use(auth.RequireAdmin(h.authManager))
@@ -291,5 +299,29 @@ func (h *ClusterHandler) handleRemoveNode(c *fiber.Ctx) error {
 		"success": true,
 		"message": "node removed from cluster",
 		"node_id": nodeID,
+	})
+}
+
+// handleGetFiles returns the cluster-wide file manifest from the Raft FSM.
+// Supports optional `database` query parameter to filter by database.
+// This is the authoritative view of all files known to the cluster — used
+// by the peer replication system to determine what to pull from other nodes.
+func (h *ClusterHandler) handleGetFiles(c *fiber.Ctx) error {
+	if h.coordinator == nil {
+		return h.respondNotEnabled(c)
+	}
+
+	database := c.Query("database")
+
+	var files []*clusterraft.FileEntry
+	if database != "" {
+		files = h.coordinator.GetFileManifestByDatabase(database)
+	} else {
+		files = h.coordinator.GetFileManifest()
+	}
+
+	return c.JSON(fiber.Map{
+		"files": files,
+		"total": len(files),
 	})
 }

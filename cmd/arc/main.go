@@ -792,6 +792,19 @@ func main() {
 									Msg("WAL replication started")
 							}
 						}
+
+						// Wire up peer file replication manifest (Enterprise Phase 1).
+						// The registrar is non-blocking: it enqueues file registrations
+						// and a background worker appends them to the Raft manifest.
+						// OSS deployments never reach here (no coordinator).
+						fileRegistrar := cluster.NewCoordinatorFileRegistrar(clusterCoordinator, logger.Get("file-registrar"))
+						fileRegistrar.Start(context.Background())
+						arrowBuffer.SetFileRegistrar(fileRegistrar)
+						shutdownCoordinator.RegisterHook("file-registrar", func(ctx context.Context) error {
+							fileRegistrar.Stop()
+							return nil
+						}, shutdown.PriorityBuffer)
+						log.Info().Msg("Cluster file manifest registrar enabled")
 					}
 				}
 			}

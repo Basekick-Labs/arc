@@ -705,6 +705,14 @@ type WALWriter interface {
 	Close() error
 }
 
+// FileRegistrar announces a newly written Parquet file to the cluster-wide
+// manifest. Implementations should be non-blocking — file registration is
+// fire-and-forget from the flush path's perspective. Wired by the cluster
+// coordinator when peer replication is enabled (Enterprise feature).
+type FileRegistrar interface {
+	RegisterFile(database, measurement, path string, partitionTime time.Time, sizeBytes int64)
+}
+
 // ArrowBuffer manages buffering and periodic flushing of Arrow data
 // Uses lock sharding to reduce contention across concurrent writes
 type ArrowBuffer struct {
@@ -717,6 +725,11 @@ type ArrowBuffer struct {
 
 	// Optional tiering manager for registering files in tier metadata
 	tieringManager *tiering.Manager
+
+	// Optional file registrar for cluster-wide file manifest (Enterprise peer replication)
+	// Set by cmd/arc/main.go when clustering + peer replication is enabled.
+	// Called asynchronously after each flush — never blocks the flush path.
+	fileRegistrar FileRegistrar
 
 	// OPTIMIZATION: Shard buffers to reduce lock contention
 	// Configurable via ingest.shard_count (default 32)
@@ -948,34 +961,48 @@ func (b *ArrowBuffer) SetTieringManager(tm *tiering.Manager) {
 	b.logger.Info().Msg("Tiering manager enabled for ArrowBuffer - files will be auto-registered")
 }
 
-// registerFileInTiering registers a newly written parquet file in the tiering metadata.
-// This allows the tiering system to track the file for future migration and query routing.
+// SetFileRegistrar sets the cluster-wide file manifest registrar.
+// When set, newly written Parquet files are announced to the cluster manifest
+// asynchronously (non-blocking) — used by peer replication to discover files
+// that need to be pulled from other nodes.
+func (b *ArrowBuffer) SetFileRegistrar(fr FileRegistrar) {
+	b.fileRegistrar = fr
+	b.logger.Info().Msg("File registrar enabled for ArrowBuffer - files will be announced to cluster manifest")
+}
+
+// registerFileInTiering registers a newly written parquet file in the tiering metadata
+// and (if enabled) announces it to the cluster-wide file manifest for peer replication.
+// This allows the tiering system to track the file for future migration and query routing,
+// and enables Enterprise peer replication to replicate the file to other cluster nodes.
 func (b *ArrowBuffer) registerFileInTiering(ctx context.Context, database, measurement, storagePath string, partitionTime time.Time, sizeBytes int64) {
-	if b.tieringManager == nil {
-		return
+	// Register in local tiering metadata (hot/cold tracking)
+	if b.tieringManager != nil {
+		metadata := b.tieringManager.GetMetadata()
+		if metadata != nil {
+			file := &tiering.FileMetadata{
+				Path:          storagePath,
+				Database:      database,
+				Measurement:   measurement,
+				PartitionTime: partitionTime,
+				Tier:          tiering.TierHot,
+				SizeBytes:     sizeBytes,
+				CreatedAt:     time.Now().UTC(),
+			}
+			if err := metadata.RecordFile(ctx, file); err != nil {
+				b.logger.Warn().Err(err).
+					Str("path", storagePath).
+					Str("database", database).
+					Str("measurement", measurement).
+					Msg("Failed to register file in tiering metadata")
+			}
+		}
 	}
 
-	metadata := b.tieringManager.GetMetadata()
-	if metadata == nil {
-		return
-	}
-
-	file := &tiering.FileMetadata{
-		Path:          storagePath,
-		Database:      database,
-		Measurement:   measurement,
-		PartitionTime: partitionTime,
-		Tier:          tiering.TierHot,
-		SizeBytes:     sizeBytes,
-		CreatedAt:     time.Now().UTC(),
-	}
-
-	if err := metadata.RecordFile(ctx, file); err != nil {
-		b.logger.Warn().Err(err).
-			Str("path", storagePath).
-			Str("database", database).
-			Str("measurement", measurement).
-			Msg("Failed to register file in tiering metadata")
+	// Announce to cluster-wide file manifest (peer replication).
+	// The registrar implementation MUST be non-blocking — it's called on
+	// the hot flush path.
+	if b.fileRegistrar != nil {
+		b.fileRegistrar.RegisterFile(database, measurement, storagePath, partitionTime, sizeBytes)
 	}
 }
 
