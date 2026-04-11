@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/raft"
 	"github.com/rs/zerolog"
@@ -26,6 +27,10 @@ const (
 	CommandPromoteWriter
 	// CommandDemoteWriter demotes a writer node to standby.
 	CommandDemoteWriter
+	// CommandRegisterFile announces a newly written file to the cluster manifest.
+	CommandRegisterFile
+	// CommandDeleteFile removes a file from the cluster manifest.
+	CommandDeleteFile
 )
 
 // Command represents a command to be applied to the FSM.
@@ -80,10 +85,38 @@ type DemoteWriterPayload struct {
 	NodeID string `json:"node_id"` // Node to demote to standby
 }
 
+// FileEntry represents a single Parquet file in the cluster-wide manifest.
+// This is the authoritative record of a file's existence, used by peer
+// replication to decide what to pull from other nodes.
+type FileEntry struct {
+	Path          string    `json:"path"`           // Relative storage path (e.g. "db/measurement/2026/04/11/14/file.parquet")
+	SHA256        string    `json:"sha256"`         // Content checksum for verification
+	SizeBytes     int64     `json:"size_bytes"`     // File size
+	Database      string    `json:"database"`       // Arc database name
+	Measurement   string    `json:"measurement"`    // Arc measurement name
+	PartitionTime time.Time `json:"partition_time"` // Partition time (for hot/cold routing)
+	OriginNodeID  string    `json:"origin_node_id"` // Node that first wrote the file
+	Tier          string    `json:"tier"`           // "hot" or "cold"
+	CreatedAt     time.Time `json:"created_at"`     // When the file was first registered
+	LSN           uint64    `json:"lsn"`            // Raft log index at registration (for ordering)
+}
+
+// RegisterFilePayload is the payload for CommandRegisterFile.
+type RegisterFilePayload struct {
+	File FileEntry `json:"file"`
+}
+
+// DeleteFilePayload is the payload for CommandDeleteFile.
+type DeleteFilePayload struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason,omitempty"` // "retention", "compaction", "manual"
+}
+
 // FSMSnapshot represents a snapshot of the FSM state.
 type FSMSnapshot struct {
-	Nodes           map[string]*NodeInfo `json:"nodes"`
-	PrimaryWriterID string               `json:"primary_writer_id,omitempty"`
+	Nodes           map[string]*NodeInfo  `json:"nodes"`
+	PrimaryWriterID string                `json:"primary_writer_id,omitempty"`
+	Files           map[string]*FileEntry `json:"files,omitempty"` // File manifest (peer replication)
 }
 
 // ClusterFSM implements the raft.FSM interface for cluster state management.
@@ -91,21 +124,30 @@ type FSMSnapshot struct {
 type ClusterFSM struct {
 	mu              sync.RWMutex
 	nodes           map[string]*NodeInfo
-	primaryWriterID string // ID of the current primary writer node
-	logger          zerolog.Logger
+	primaryWriterID string                // ID of the current primary writer node
+	files           map[string]*FileEntry // File manifest (path → entry) for peer replication
+	// Secondary index: database → set of file paths. Maintained alongside
+	// the primary `files` map on register/delete to avoid O(N) scans when
+	// filtering by database.
+	filesByDB map[string]map[string]struct{}
+	logger    zerolog.Logger
 
 	// Callbacks for state changes
 	onNodeAdded      func(*NodeInfo)
 	onNodeRemoved    func(string)
 	onNodeUpdated    func(*NodeInfo)
 	onWriterPromoted func(newPrimaryID, oldPrimaryID string)
+	onFileRegistered func(*FileEntry)
+	onFileDeleted    func(path string, reason string)
 }
 
 // NewClusterFSM creates a new cluster FSM.
 func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 	return &ClusterFSM{
-		nodes:  make(map[string]*NodeInfo),
-		logger: logger.With().Str("component", "cluster-fsm").Logger(),
+		nodes:     make(map[string]*NodeInfo),
+		files:     make(map[string]*FileEntry),
+		filesByDB: make(map[string]map[string]struct{}),
+		logger:    logger.With().Str("component", "cluster-fsm").Logger(),
 	}
 }
 
@@ -123,6 +165,14 @@ func (f *ClusterFSM) SetWriterPromotedCallback(cb func(newPrimaryID, oldPrimaryI
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.onWriterPromoted = cb
+}
+
+// SetFileCallbacks sets the callbacks for file manifest events (peer replication).
+func (f *ClusterFSM) SetFileCallbacks(onRegistered func(*FileEntry), onDeleted func(path, reason string)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onFileRegistered = onRegistered
+	f.onFileDeleted = onDeleted
 }
 
 // GetPrimaryWriterID returns the current primary writer node ID.
@@ -154,6 +204,10 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.applyPromoteWriter(cmd.Payload)
 	case CommandDemoteWriter:
 		return f.applyDemoteWriter(cmd.Payload)
+	case CommandRegisterFile:
+		return f.applyRegisterFile(cmd.Payload, log.Index)
+	case CommandDeleteFile:
+		return f.applyDeleteFile(cmd.Payload)
 	default:
 		return fmt.Errorf("unknown command type: %d", cmd.Type)
 	}
@@ -343,6 +397,109 @@ func (f *ClusterFSM) applyDemoteWriter(payload []byte) interface{} {
 	return nil
 }
 
+func (f *ClusterFSM) applyRegisterFile(payload []byte, logIndex uint64) interface{} {
+	var p RegisterFilePayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal register file payload: %w", err)
+	}
+
+	if p.File.Path == "" {
+		return fmt.Errorf("register file: path is required")
+	}
+	if p.File.CreatedAt.IsZero() {
+		// The creator is responsible for setting CreatedAt before appending
+		// to Raft. We do NOT fill it in here because time.Now() inside Apply
+		// is non-deterministic — log replay on other nodes would produce
+		// different values and diverge FSM state.
+		return fmt.Errorf("register file: created_at is required")
+	}
+
+	// Stamp the LSN from the Raft log index (deterministic across all nodes)
+	p.File.LSN = logIndex
+
+	f.mu.Lock()
+	entry := p.File
+	// If the file was already registered under a different database (unlikely
+	// but possible if an operator moves a file across databases), remove the
+	// old index entry first to keep filesByDB consistent.
+	if old, existed := f.files[entry.Path]; existed && old.Database != entry.Database {
+		if oldIdx, ok := f.filesByDB[old.Database]; ok {
+			delete(oldIdx, old.Path)
+			if len(oldIdx) == 0 {
+				delete(f.filesByDB, old.Database)
+			}
+		}
+	}
+	f.files[entry.Path] = &entry
+	// Maintain the database → files secondary index
+	idx, ok := f.filesByDB[entry.Database]
+	if !ok {
+		idx = make(map[string]struct{})
+		f.filesByDB[entry.Database] = idx
+	}
+	idx[entry.Path] = struct{}{}
+	callback := f.onFileRegistered
+	f.mu.Unlock()
+
+	f.logger.Debug().
+		Str("path", entry.Path).
+		Str("database", entry.Database).
+		Str("measurement", entry.Measurement).
+		Str("origin", entry.OriginNodeID).
+		Int64("size_bytes", entry.SizeBytes).
+		Uint64("lsn", entry.LSN).
+		Msg("File registered in cluster manifest")
+
+	if callback != nil {
+		entryCopy := entry
+		callback(&entryCopy)
+	}
+
+	return nil
+}
+
+func (f *ClusterFSM) applyDeleteFile(payload []byte) interface{} {
+	var p DeleteFilePayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal delete file payload: %w", err)
+	}
+
+	if p.Path == "" {
+		return fmt.Errorf("delete file: path is required")
+	}
+
+	f.mu.Lock()
+	existing, existed := f.files[p.Path]
+	delete(f.files, p.Path)
+	if existed {
+		// Remove from the database → files secondary index
+		if idx, ok := f.filesByDB[existing.Database]; ok {
+			delete(idx, p.Path)
+			if len(idx) == 0 {
+				delete(f.filesByDB, existing.Database)
+			}
+		}
+	}
+	callback := f.onFileDeleted
+	f.mu.Unlock()
+
+	if !existed {
+		// Idempotent — deletion of a non-existent file is a no-op
+		return nil
+	}
+
+	f.logger.Debug().
+		Str("path", p.Path).
+		Str("reason", p.Reason).
+		Msg("File removed from cluster manifest")
+
+	if callback != nil {
+		callback(p.Path, p.Reason)
+	}
+
+	return nil
+}
+
 // Snapshot returns a snapshot of the FSM state.
 func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 	f.mu.RLock()
@@ -355,7 +512,14 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 		nodes[id] = &nodeCopy
 	}
 
-	return &fsmSnapshot{nodes: nodes, primaryWriterID: f.primaryWriterID}, nil
+	// Deep copy files
+	files := make(map[string]*FileEntry, len(f.files))
+	for path, file := range f.files {
+		fileCopy := *file
+		files[path] = &fileCopy
+	}
+
+	return &fsmSnapshot{nodes: nodes, primaryWriterID: f.primaryWriterID, files: files}, nil
 }
 
 // Restore restores the FSM from a snapshot.
@@ -370,10 +534,26 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	f.mu.Lock()
 	f.nodes = snapshot.Nodes
 	f.primaryWriterID = snapshot.PrimaryWriterID
+	if snapshot.Files != nil {
+		f.files = snapshot.Files
+	} else {
+		f.files = make(map[string]*FileEntry)
+	}
+	// Rebuild the database → files secondary index from the restored files
+	f.filesByDB = make(map[string]map[string]struct{}, len(f.files))
+	for path, entry := range f.files {
+		idx, ok := f.filesByDB[entry.Database]
+		if !ok {
+			idx = make(map[string]struct{})
+			f.filesByDB[entry.Database] = idx
+		}
+		idx[path] = struct{}{}
+	}
 	f.mu.Unlock()
 
 	f.logger.Info().
 		Int("node_count", len(snapshot.Nodes)).
+		Int("file_count", len(snapshot.Files)).
 		Str("primary_writer", snapshot.PrimaryWriterID).
 		Msg("FSM restored from snapshot")
 
@@ -436,15 +616,78 @@ func (f *ClusterFSM) TotalCores() int {
 	return total
 }
 
+// GetFile returns a copy of the file entry for the given path, or nil if not found.
+func (f *ClusterFSM) GetFile(path string) (*FileEntry, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	entry, exists := f.files[path]
+	if !exists {
+		return nil, false
+	}
+	entryCopy := *entry
+	return &entryCopy, true
+}
+
+// GetAllFiles returns copies of all files in the manifest.
+//
+// WARNING: This is O(N) in the number of files and allocates a full copy.
+// For large clusters with millions of files this can cause memory pressure
+// and GC pauses. It is suitable for small-to-medium clusters (< ~100k files)
+// and administrative/debugging use. A future phase will add a paginated or
+// streaming variant for the API handler when scale demands it — tracked as
+// a follow-up to Phase 1.
+func (f *ClusterFSM) GetAllFiles() []*FileEntry {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	files := make([]*FileEntry, 0, len(f.files))
+	for _, file := range f.files {
+		fileCopy := *file
+		files = append(files, &fileCopy)
+	}
+	return files
+}
+
+// GetFilesByDatabase returns copies of all files for the given database.
+// Uses the filesByDB secondary index for O(k) lookup where k is the number
+// of files for the database — no longer scans the full manifest.
+func (f *ClusterFSM) GetFilesByDatabase(database string) []*FileEntry {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	idx, ok := f.filesByDB[database]
+	if !ok {
+		return nil
+	}
+	files := make([]*FileEntry, 0, len(idx))
+	for path := range idx {
+		if entry, exists := f.files[path]; exists {
+			entryCopy := *entry
+			files = append(files, &entryCopy)
+		}
+	}
+	return files
+}
+
+// FileCount returns the number of files in the manifest.
+func (f *ClusterFSM) FileCount() int {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return len(f.files)
+}
+
 // fsmSnapshot implements raft.FSMSnapshot.
 type fsmSnapshot struct {
 	nodes           map[string]*NodeInfo
 	primaryWriterID string
+	files           map[string]*FileEntry
 }
 
 // Persist writes the snapshot to the given sink.
 func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
-	snapshot := FSMSnapshot{Nodes: s.nodes, PrimaryWriterID: s.primaryWriterID}
+	snapshot := FSMSnapshot{
+		Nodes:           s.nodes,
+		PrimaryWriterID: s.primaryWriterID,
+		Files:           s.files,
+	}
 
 	data, err := json.Marshal(snapshot)
 	if err != nil {

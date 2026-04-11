@@ -514,6 +514,39 @@ func (n *Node) DemoteWriter(nodeID string, timeout time.Duration) error {
 	return n.Apply(cmd, timeout)
 }
 
+// RegisterFile appends a file to the cluster-wide manifest via Raft.
+// Called by writers after flushing a new Parquet file, and by compactors
+// after producing a compacted output. The Raft log index becomes the LSN.
+func (n *Node) RegisterFile(file FileEntry, timeout time.Duration) error {
+	payload, err := json.Marshal(RegisterFilePayload{File: file})
+	if err != nil {
+		return fmt.Errorf("failed to marshal register file payload: %w", err)
+	}
+
+	cmd := &Command{
+		Type:    CommandRegisterFile,
+		Payload: payload,
+	}
+
+	return n.Apply(cmd, timeout)
+}
+
+// DeleteFile removes a file from the cluster-wide manifest via Raft.
+// Called by retention policies and post-compaction cleanup.
+func (n *Node) DeleteFile(path, reason string, timeout time.Duration) error {
+	payload, err := json.Marshal(DeleteFilePayload{Path: path, Reason: reason})
+	if err != nil {
+		return fmt.Errorf("failed to marshal delete file payload: %w", err)
+	}
+
+	cmd := &Command{
+		Type:    CommandDeleteFile,
+		Payload: payload,
+	}
+
+	return n.Apply(cmd, timeout)
+}
+
 // LeaderCh returns a channel that signals leadership changes.
 // True means this node became leader, false means it lost leadership.
 func (n *Node) LeaderCh() <-chan bool {

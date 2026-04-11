@@ -10,6 +10,25 @@ The `?p=` method continues to work but Arc now logs a one-time warning on first 
 
 ## New Features
 
+### Cluster File Manifest (Enterprise — Foundation for Peer Replication)
+
+Arc Enterprise now maintains a cluster-wide file manifest in the Raft FSM. Every Parquet file flushed by a writer (or produced by compaction) is announced to the cluster via a new Raft command, producing an authoritative view of all files known to the cluster. This is the foundation for peer-to-peer file replication in bare-metal and VM deployments where nodes have their own local storage.
+
+**What this delivers today:**
+- New Raft commands `CommandRegisterFile` and `CommandDeleteFile` added to `ClusterFSM`
+- File manifest persisted in Raft snapshots and replicated to all cluster members via standard Raft consensus
+- New API endpoint `GET /api/v1/cluster/files` returns the complete cluster file manifest (supports `?database=<name>` filter)
+- Async, non-blocking registration from the flush path — the file registrar enqueues entries and a background worker appends to Raft, so write latency is unaffected
+- Zero overhead for OSS / standalone deployments — no coordinator, no registrar, no manifest
+
+**What's coming next** (separate PRs):
+- Phase 2: HTTP fetch server + background pullers to replicate files between peers over TLS-secured coordinator connections
+- Phase 3: Automatic catch-up for new nodes joining a cluster with existing data
+- Phase 4: Integration with compaction (compactor role produces files, replicas pull the compacted output)
+- Phase 5: Optional write quorum for strong durability
+
+**Design inspiration:** ClickHouse's ReplicatedMergeTree model — a Raft-equivalent op log + HTTP-pull-based file transfer. Research compared InfluxDB Enterprise (anti-entropy + HHQ), ClickHouse (log + HTTP pull), TimescaleDB (deprecated multi-node), Apache Pinot (peer fetcher fallback), and Apache Druid (metadata-driven assignment). ClickHouse's model is the cleanest fit for Arc's existing Raft + coordinator TCP infrastructure.
+
 ### Cluster TLS Encryption and Shared Secret Authentication (Enterprise)
 
 Arc Enterprise clustering now supports encrypted inter-node communication and authenticated cluster joins — bringing production-grade security to multi-node deployments.
