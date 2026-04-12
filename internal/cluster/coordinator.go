@@ -37,6 +37,23 @@ import (
 // - Managing the node lifecycle (join, leave, fail)
 // - Leader election via Raft consensus (Phase 3)
 // - Request routing to appropriate nodes (Phase 3)
+
+// deleteRequest is an item for the bounded delete-worker queue.
+// Replaces the earlier unbounded go-func-per-deletion pattern.
+type deleteRequest struct {
+	path   string
+	reason string
+}
+
+// deleteQueueSize is the capacity of the buffered delete channel.
+// 1024 matches the puller's queue size — enough to absorb a full
+// compaction cycle's worth of source-file deletions without drops.
+const deleteQueueSize = 1024
+
+// deleteWorkerCount is the number of goroutines draining the delete queue.
+// 2 workers provide light parallelism without overwhelming local I/O.
+const deleteWorkerCount = 2
+
 type Coordinator struct {
 	cfg           *config.ClusterConfig
 	licenseClient *license.Client
@@ -71,6 +88,27 @@ type Coordinator struct {
 	// catchupOnce guarantees the Phase 3 catch-up walker runs at most once
 	// per coordinator lifetime, across repeated Start/Stop cycles in tests.
 	catchupOnce sync.Once
+
+	// deleteQueue is a bounded channel for local file deletions triggered
+	// by onFileDeleted FSM callbacks. Fixed workers drain the queue with a
+	// grace period before each delete. This replaces the earlier unbounded
+	// go func() pattern that could spawn thousands of goroutines during
+	// large compaction cycles.
+	deleteQueue chan deleteRequest
+	deleteWg    sync.WaitGroup
+
+	// nonceCache tracks recently seen nonces for replay protection on
+	// HMAC-authenticated messages (leader forwarding, and extensible to
+	// join/leave in the future). Initialized in Start().
+	nonceCache *security.NonceCache
+
+	// forwardConn caches a single TCP connection to the current Raft
+	// leader for forwarding commands. Reused across calls to avoid
+	// per-command dial + TLS overhead. Lazily reconnected on error or
+	// leader change.
+	forwardConn       net.Conn
+	forwardConnLeader string // nodeID of the leader this conn is dialed to
+	forwardConnMu     sync.Mutex
 
 	// Network
 	listener  net.Listener
@@ -285,6 +323,10 @@ func (c *Coordinator) Start() error {
 	// parent context (Phase 4 integration-test discovery).
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 
+	// Initialize the nonce cache for HMAC replay protection. The 5-minute
+	// TTL matches the HMAC timestamp tolerance in ValidateForwardHMAC.
+	c.nonceCache = security.NewNonceCache(5 * time.Minute)
+
 	// Start Raft node if configured (Phase 3)
 	if c.raftNode != nil {
 		if err := c.raftNode.Start(); err != nil {
@@ -448,6 +490,24 @@ func (c *Coordinator) Stop() error {
 		c.puller = nil
 	}
 
+	// Drain and stop the bounded delete workers. Close the channel to
+	// signal workers to exit, then wait for them to finish any in-flight
+	// deletes. Workers respect c.ctx cancellation for the grace period.
+	if c.deleteQueue != nil {
+		close(c.deleteQueue)
+		c.deleteWg.Wait()
+		c.deleteQueue = nil
+	}
+
+	// Close the cached leader-forwarding connection.
+	c.forwardConnMu.Lock()
+	if c.forwardConn != nil {
+		c.forwardConn.Close()
+		c.forwardConn = nil
+		c.forwardConnLeader = ""
+	}
+	c.forwardConnMu.Unlock()
+
 	// Stop writer failover manager
 	if c.writerFailoverMgr != nil {
 		if err := c.writerFailoverMgr.Stop(); err != nil {
@@ -477,6 +537,38 @@ func (c *Coordinator) Stop() error {
 
 	c.logger.Info().Msg("Cluster coordinator stopped")
 	return nil
+}
+
+// runDeleteWorker is a single goroutine that drains the deleteQueue channel.
+// Each item gets a 500ms grace period (for in-flight queries to finish), then
+// a bounded backend.Delete call. The worker exits when the channel is closed
+// (Stop() closes it during shutdown).
+func (c *Coordinator) runDeleteWorker() {
+	defer c.deleteWg.Done()
+	for req := range c.deleteQueue {
+		// Grace period: let in-flight queries finish reading the file.
+		select {
+		case <-c.ctx.Done():
+			// Coordinator shutting down — abandon remaining deletes.
+			// Phase 3 catch-up reconciles on next startup.
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+		delCtx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
+		if err := c.storage.Delete(delCtx, req.path); err != nil {
+			c.logger.Warn().
+				Err(err).
+				Str("path", req.path).
+				Str("reason", req.reason).
+				Msg("Phase 4 local delete worker: backend.Delete failed")
+		} else {
+			c.logger.Debug().
+				Str("path", req.path).
+				Str("reason", req.reason).
+				Msg("Phase 4 local delete worker: removed local copy")
+		}
+		cancel()
+	}
 }
 
 // Close implements the shutdown.Shutdownable interface.
@@ -707,11 +799,10 @@ func (c *Coordinator) handlePeerConnection(conn net.Conn) {
 	case protocol.MsgForwardApply:
 		// Phase 4 leader forwarding: a non-leader peer is asking us to
 		// apply a Raft command on its behalf because we're (currently)
-		// the leader. handleForwardApply validates HMAC, runs the
-		// command through Node.Apply, and replies with success/error
-		// on the same connection. Closes the connection itself via
-		// defer, so we transfer ownership.
-		c.handleForwardApply(conn, msg.Payload.(*protocol.ForwardApplyRequest))
+		// the leader. handleForwardApplyLoop owns the connection and
+		// supports multiple commands on the same TCP connection (the
+		// client caches a single persistent leader connection).
+		c.handleForwardApplyLoop(conn, msg.Payload.(*protocol.ForwardApplyRequest))
 		closeConn = false
 
 	default:
@@ -1689,35 +1780,30 @@ func (c *Coordinator) startFilePullerLocked() error {
 				Msg("FSM delete observed; shared backend, no local action needed")
 			return
 		}
-		// Deferred local delete. 500ms grace gives queries started before
-		// the Raft commit a chance to open and finish reading the file.
-		// After the grace, we call backend.Delete with a bounded context
-		// so a stuck filesystem doesn't pin the goroutine forever.
-		go func(p, r string) {
-			select {
-			case <-c.ctx.Done():
-				// Coordinator is shutting down — abandon the delete.
-				// Next startup will reconcile via Phase 3 catch-up.
-				return
-			case <-time.After(500 * time.Millisecond):
-			}
-			delCtx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
-			defer cancel()
-			if err := backend.Delete(delCtx, p); err != nil {
-				c.logger.Warn().
-					Err(err).
-					Str("path", p).
-					Str("reason", r).
-					Msg("Phase 4 local delete hook: backend.Delete failed")
-				return
-			}
-			c.logger.Debug().
-				Str("path", p).
-				Str("reason", r).
-				Msg("Phase 4 local delete hook: removed local copy")
-		}(path, reason)
+		// Enqueue to the bounded delete-worker pool. Non-blocking send
+		// mirrors the puller's Enqueue pattern — if the queue is full we
+		// drop and log, same as Phase 2's file-pull overflow. The dropped
+		// file stays in the manifest, and Phase 3 catch-up reconciles it
+		// on the next restart.
+		select {
+		case c.deleteQueue <- deleteRequest{path: path, reason: reason}:
+		default:
+			c.logger.Warn().
+				Str("path", path).
+				Str("reason", reason).
+				Msg("Phase 4 local delete queue full; dropping (will reconcile on restart)")
+		}
 	}
 	fsm.SetFileCallbacks(onRegister, onDelete)
+
+	// Start the bounded delete-worker pool for onFileDeleted callbacks.
+	// Workers drain the queue with a 500ms grace period per item so
+	// in-flight queries can finish reading the file before it's unlinked.
+	c.deleteQueue = make(chan deleteRequest, deleteQueueSize)
+	for i := 0; i < deleteWorkerCount; i++ {
+		c.deleteWg.Add(1)
+		go c.runDeleteWorker()
+	}
 
 	// Start the puller workers.
 	puller.Start(context.Background())
@@ -1726,6 +1812,8 @@ func (c *Coordinator) startFilePullerLocked() error {
 	c.logger.Info().
 		Int("workers", pullerCfg.Workers).
 		Int("queue_size", pullerCfg.QueueSize).
+		Int("delete_workers", deleteWorkerCount).
+		Int("delete_queue_size", deleteQueueSize).
 		Msg("Peer file replication puller started")
 
 	// Phase 3: kick off the catch-up walker in a background goroutine so

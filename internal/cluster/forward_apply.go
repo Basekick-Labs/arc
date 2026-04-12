@@ -129,24 +129,17 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 		HMAC:        mac,
 	}
 
-	// Dial the leader. security.Dial reuses the cluster TLS config when
-	// configured, falling back to plain TCP otherwise.
-	dialTimeout := forwardApplyTimeout
-	if deadline, ok := ctx.Deadline(); ok {
-		if remaining := time.Until(deadline); remaining < dialTimeout {
-			dialTimeout = remaining
-		}
-	}
-	conn, err := security.Dial("tcp", leaderNode.Address, dialTimeout, c.tlsConfig)
+	// Acquire or reuse a cached TCP connection to the leader. The
+	// connection is kept alive across forwarded commands to amortize
+	// dial + TLS handshake costs on the flush hot path. On any
+	// send/receive error, the connection is closed and the next call
+	// dials fresh (lazy reconnect).
+	conn, err := c.getOrDialLeader(ctx, leaderID, leaderNode.Address)
 	if err != nil {
-		return fmt.Errorf("forward apply: dial leader %s (%s): %w", leaderID, leaderNode.Address, err)
+		return fmt.Errorf("forward apply: %w", err)
 	}
-	defer conn.Close()
 
-	// Bound the whole round-trip by the caller's context if it has a
-	// deadline, otherwise use the default forward-apply timeout. This
-	// applies to both Send and Receive — a stuck leader can't pin our
-	// goroutine forever.
+	// Set a per-call deadline on the shared connection.
 	roundTripDeadline := time.Now().Add(forwardApplyTimeout)
 	if deadline, ok := ctx.Deadline(); ok && deadline.Before(roundTripDeadline) {
 		roundTripDeadline = deadline
@@ -157,24 +150,76 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 		Type:    protocol.MsgForwardApply,
 		Payload: req,
 	}, forwardApplyTimeout); err != nil {
+		c.closeForwardConn() // stale — next call redials
 		return fmt.Errorf("forward apply: send: %w", err)
 	}
 
 	ackMsg, err := protocol.ReceiveMessage(conn, forwardApplyTimeout)
 	if err != nil {
+		c.closeForwardConn()
 		return fmt.Errorf("forward apply: receive ack: %w", err)
 	}
 	if ackMsg.Type != protocol.MsgForwardApplyAck {
+		c.closeForwardConn()
 		return fmt.Errorf("forward apply: unexpected ack type: %v", ackMsg.Type)
 	}
 	ack, ok := ackMsg.Payload.(*protocol.ForwardApplyAck)
 	if !ok {
+		c.closeForwardConn()
 		return fmt.Errorf("forward apply: ack payload has wrong type: %T", ackMsg.Payload)
 	}
 	if ack.Status != "ok" {
+		// Protocol-level rejection — connection is still valid, don't close.
 		return fmt.Errorf("forward apply: leader rejected (code=%s): %s", ack.Code, ack.Error)
 	}
 	return nil
+}
+
+// getOrDialLeader returns the cached leader connection if it's still open
+// and pointed at the right leader, or dials a new one.
+func (c *Coordinator) getOrDialLeader(ctx context.Context, leaderID, leaderAddr string) (net.Conn, error) {
+	c.forwardConnMu.Lock()
+	defer c.forwardConnMu.Unlock()
+
+	// Reuse existing connection if it's to the same leader.
+	if c.forwardConn != nil && c.forwardConnLeader == leaderID {
+		return c.forwardConn, nil
+	}
+
+	// Leader changed or no connection — close stale and dial fresh.
+	if c.forwardConn != nil {
+		c.forwardConn.Close()
+		c.forwardConn = nil
+		c.forwardConnLeader = ""
+	}
+
+	dialTimeout := forwardApplyTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining < dialTimeout {
+			dialTimeout = remaining
+		}
+	}
+	conn, err := security.Dial("tcp", leaderAddr, dialTimeout, c.tlsConfig)
+	if err != nil {
+		return nil, fmt.Errorf("dial leader %s (%s): %w", leaderID, leaderAddr, err)
+	}
+
+	c.forwardConn = conn
+	c.forwardConnLeader = leaderID
+	return conn, nil
+}
+
+// closeForwardConn closes the cached leader connection (if any) so the
+// next call to getOrDialLeader redials. Safe to call even if no connection
+// is cached.
+func (c *Coordinator) closeForwardConn() {
+	c.forwardConnMu.Lock()
+	defer c.forwardConnMu.Unlock()
+	if c.forwardConn != nil {
+		c.forwardConn.Close()
+		c.forwardConn = nil
+		c.forwardConnLeader = ""
+	}
 }
 
 // handleForwardApply is the server side of leader forwarding. Dispatched
@@ -182,9 +227,10 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 // confirms we're still the leader, applies the command via Node.Apply,
 // and sends an ack on the same connection.
 //
-// Connection is owned by this function — it must close before returning.
+// The connection is NOT owned by this function — the caller
+// (handleForwardApplyLoop) manages the connection lifetime to support
+// multiple forwarded commands on the same TCP connection.
 func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApplyRequest) {
-	defer conn.Close()
 	remoteAddr := conn.RemoteAddr().String()
 
 	// HMAC validation. Uses the payload-bound variant (ComputeForwardHMAC)
@@ -205,6 +251,18 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 			Str("requesting_node", req.NodeID).
 			Msg("ForwardApply rejected: HMAC validation failed")
 		c.sendForwardApplyError(conn, protocol.ForwardCodeAuth, "authentication failed")
+		return
+	}
+
+	// Replay protection: reject duplicate (nodeID, nonce) pairs within
+	// the TTL window. The nonce cache is initialized in Start() and
+	// shared across all handleForwardApply invocations.
+	if c.nonceCache != nil && !c.nonceCache.Track(req.NodeID, req.Nonce) {
+		c.logger.Warn().
+			Str("peer", remoteAddr).
+			Str("requesting_node", req.NodeID).
+			Msg("ForwardApply rejected: nonce replay detected")
+		c.sendForwardApplyError(conn, protocol.ForwardCodeAuth, "nonce replay")
 		return
 	}
 
@@ -300,6 +358,43 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		Str("requesting_node", req.NodeID).
 		Int("cmd_type", int(cmd.Type)).
 		Msg("ForwardApply: applied successfully")
+}
+
+// handleForwardApplyLoop owns the connection for a persistent forwarding
+// session. It handles the first request (already parsed by the dispatcher),
+// then loops reading additional MsgForwardApply messages until the client
+// closes the connection or sends a different message type. This supports
+// the client-side connection caching: one dial, many commands.
+func (c *Coordinator) handleForwardApplyLoop(conn net.Conn, firstReq *protocol.ForwardApplyRequest) {
+	defer conn.Close()
+
+	// Handle the first request that was already parsed by the dispatcher.
+	c.handleForwardApply(conn, firstReq)
+
+	// Read subsequent messages on the same connection. The client sends
+	// one MsgForwardApply per forwarded command, reusing the connection.
+	// A read timeout (30s idle) prevents leaked connections if the client
+	// disappears without closing cleanly.
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		msg, err := protocol.ReceiveMessage(conn, 30*time.Second)
+		if err != nil {
+			// EOF or timeout — client closed or went idle. Normal lifecycle.
+			return
+		}
+		if msg.Type != protocol.MsgForwardApply {
+			c.logger.Warn().
+				Str("type", msg.Type.String()).
+				Msg("ForwardApplyLoop: unexpected message type on persistent connection")
+			return
+		}
+		req, ok := msg.Payload.(*protocol.ForwardApplyRequest)
+		if !ok {
+			c.logger.Warn().Msg("ForwardApplyLoop: payload type mismatch")
+			return
+		}
+		c.handleForwardApply(conn, req)
+	}
 }
 
 // sendForwardApplyError is a small helper to send an error ack. Best-effort:
