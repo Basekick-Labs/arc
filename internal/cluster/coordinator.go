@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -274,6 +275,16 @@ func (c *Coordinator) Start() error {
 		return err
 	}
 
+	// Initialize the coordinator-wide context BEFORE anything else that
+	// might need it — notably the accept loop, which hands off connections
+	// to handleFetchFile and handleFetchFile derives its per-request
+	// contexts from c.ctx. Prior to this fix, c.ctx was only assigned
+	// inside StartReplication(), which runs later from main.go and isn't
+	// even called on nodes where WAL replication is disabled. A fetch
+	// request arriving before StartReplication() would panic on the nil
+	// parent context (Phase 4 integration-test discovery).
+	c.ctx, c.cancel = context.WithCancel(context.Background())
+
 	// Start Raft node if configured (Phase 3)
 	if c.raftNode != nil {
 		if err := c.raftNode.Start(); err != nil {
@@ -418,6 +429,15 @@ func (c *Coordinator) Stop() error {
 
 	// Signal all goroutines to stop
 	close(c.stopCh)
+
+	// Cancel the coordinator-wide context so in-flight handlers
+	// (handleFetchFile, onFileDeleted's deferred local delete, catch-up
+	// walker, etc.) observe shutdown and drop out of their waits. c.cancel
+	// may be nil in tests that construct a bare Coordinator without
+	// calling Start, so guard it.
+	if c.cancel != nil {
+		c.cancel()
+	}
 
 	// Stop the peer file puller BEFORE Raft. The puller is a Raft FSM
 	// callback consumer — once Raft stops, new applyRegisterFile calls
@@ -682,6 +702,16 @@ func (c *Coordinator) handlePeerConnection(conn net.Conn) {
 		// response and closes the connection itself via defer. Hand off
 		// ownership so the dispatch loop doesn't close it a second time.
 		c.handleFetchFile(conn, msg.Payload.(*protocol.FetchFileRequest))
+		closeConn = false
+
+	case protocol.MsgForwardApply:
+		// Phase 4 leader forwarding: a non-leader peer is asking us to
+		// apply a Raft command on its behalf because we're (currently)
+		// the leader. handleForwardApply validates HMAC, runs the
+		// command through Node.Apply, and replies with success/error
+		// on the same connection. Closes the connection itself via
+		// defer, so we transfer ownership.
+		c.handleForwardApply(conn, msg.Payload.(*protocol.ForwardApplyRequest))
 		closeConn = false
 
 	default:
@@ -1828,8 +1858,16 @@ func (c *Coordinator) StartReplication() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Create context for replication
-	c.ctx, c.cancel = context.WithCancel(context.Background())
+	// c.ctx is initialized in Start() — we must NOT overwrite it here,
+	// otherwise handleFetchFile and other goroutines using the original
+	// context would end up with an orphan parent. StartReplication runs
+	// after Start so c.ctx is guaranteed non-nil.
+	if c.ctx == nil {
+		// Defensive: if a caller somehow invokes StartReplication without
+		// Start having run first, fall back to a fresh context so we
+		// don't crash on a nil parent.
+		c.ctx, c.cancel = context.WithCancel(context.Background())
+	}
 
 	if c.localNode.Role == RoleWriter || c.localNode.Role == RoleStandalone {
 		// Writer: start sender to stream entries to readers
@@ -2211,49 +2249,90 @@ func (c *Coordinator) UpdateNodeStateViaRaft(nodeID string, state NodeState) err
 
 // RegisterFileInManifest appends a file entry to the cluster-wide manifest
 // via Raft. Returns nil if Raft is not initialized (standalone mode).
-// Only the Raft leader can append; non-leader nodes silently skip — the
-// manifest is not critical for correctness in Phase 1 since replication is
-// not yet active. A future phase will add forwarding to the leader.
+//
+// Phase 4: when the local node is not the Raft leader, the command is
+// forwarded to the current leader over the peer protocol instead of being
+// silently dropped. Prior to Phase 4 this method returned nil on
+// non-leader, which was a latent data-loss bug — writers that were not
+// the leader would silently lose all their file registrations and the
+// manifest would diverge from storage.
+//
+// On forwarding failure (no leader known, leader unreachable, or the
+// leader rejects the apply), the error is returned and the caller can
+// retry. The forwarding path is bounded by forwardApplyTimeout so a
+// stuck leader doesn't block the writer flush hot path indefinitely.
 func (c *Coordinator) RegisterFileInManifest(file raft.FileEntry) error {
 	if c.raftNode == nil {
 		// Standalone mode — no manifest needed
 		return nil
 	}
 
-	if !c.raftNode.IsLeader() {
-		// Non-leader writers can't append directly. In Phase 1 this is
-		// acceptable: the manifest is informational. Phase 2 will add
-		// leader forwarding for non-leader writers.
-		c.logger.Debug().
-			Str("path", file.Path).
-			Msg("Skipping manifest registration (not the Raft leader)")
+	if c.raftNode.IsLeader() {
+		if err := c.raftNode.RegisterFile(file, 5*time.Second); err != nil {
+			return fmt.Errorf("register file in manifest: %w", err)
+		}
 		return nil
 	}
 
-	if err := c.raftNode.RegisterFile(file, 5*time.Second); err != nil {
-		return fmt.Errorf("register file in manifest: %w", err)
+	// Phase 4: forward to the current Raft leader. Build the same Command
+	// shape Node.RegisterFile would build locally so the leader's
+	// Node.Apply call is identical to a local apply.
+	payload, err := json.Marshal(raft.RegisterFilePayload{File: file})
+	if err != nil {
+		return fmt.Errorf("register file in manifest: marshal payload: %w", err)
+	}
+	cmd := &raft.Command{Type: raft.CommandRegisterFile, Payload: payload}
+
+	forwardCtx, cancel := context.WithTimeout(c.ctxOrBackground(), forwardApplyTimeout)
+	defer cancel()
+	if err := c.forwardApplyToLeader(forwardCtx, cmd); err != nil {
+		return fmt.Errorf("register file in manifest (forwarded): %w", err)
 	}
 	return nil
 }
 
 // DeleteFileFromManifest removes a file from the cluster-wide manifest.
 // Called by retention and compaction cleanup.
+//
+// Phase 4: same leader-forwarding semantics as RegisterFileInManifest.
+// Non-leader callers no longer silently drop the command.
 func (c *Coordinator) DeleteFileFromManifest(path, reason string) error {
 	if c.raftNode == nil {
 		return nil
 	}
 
-	if !c.raftNode.IsLeader() {
-		c.logger.Debug().
-			Str("path", path).
-			Msg("Skipping manifest deletion (not the Raft leader)")
+	if c.raftNode.IsLeader() {
+		if err := c.raftNode.DeleteFile(path, reason, 5*time.Second); err != nil {
+			return fmt.Errorf("delete file from manifest: %w", err)
+		}
 		return nil
 	}
 
-	if err := c.raftNode.DeleteFile(path, reason, 5*time.Second); err != nil {
-		return fmt.Errorf("delete file from manifest: %w", err)
+	// Phase 4: forward to the current Raft leader.
+	payload, err := json.Marshal(raft.DeleteFilePayload{Path: path, Reason: reason})
+	if err != nil {
+		return fmt.Errorf("delete file from manifest: marshal payload: %w", err)
+	}
+	cmd := &raft.Command{Type: raft.CommandDeleteFile, Payload: payload}
+
+	forwardCtx, cancel := context.WithTimeout(c.ctxOrBackground(), forwardApplyTimeout)
+	defer cancel()
+	if err := c.forwardApplyToLeader(forwardCtx, cmd); err != nil {
+		return fmt.Errorf("delete file from manifest (forwarded): %w", err)
 	}
 	return nil
+}
+
+// ctxOrBackground returns the coordinator's lifecycle context if it has
+// been initialized (always the case after Start), or context.Background()
+// as a defensive fallback for callers that somehow reach these methods
+// before Start has run. Phase 4 forward-apply derives bounded contexts
+// from this so shutdown cancels in-flight forwards.
+func (c *Coordinator) ctxOrBackground() context.Context {
+	if c.ctx == nil {
+		return context.Background()
+	}
+	return c.ctx
 }
 
 // GetFileManifest returns the current file manifest from the Raft FSM.

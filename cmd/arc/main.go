@@ -601,7 +601,13 @@ func main() {
 		if err := os.MkdirAll(cfg.Compaction.TempDirectory, 0o700); err != nil {
 			log.Fatal().Err(err).Str("dir", cfg.Compaction.TempDirectory).Msg("Failed to create compaction temp directory with 0700 perms")
 		}
-		completionDir = filepath.Join(cfg.Compaction.TempDirectory, ".completion", "pending")
+		// Honor an explicit compaction.completion_dir override if set;
+		// otherwise derive under {temp_directory}/.completion/pending.
+		if cfg.Compaction.CompletionDir != "" {
+			completionDir = cfg.Compaction.CompletionDir
+		} else {
+			completionDir = filepath.Join(cfg.Compaction.TempDirectory, ".completion", "pending")
+		}
 	}
 	if cfg.Compaction.Enabled {
 		// Build tiers
@@ -668,7 +674,8 @@ func main() {
 		// states (output_written, sources_deleted) are left alone so the
 		// watcher can still process them once it starts.
 		if completionDir != "" {
-			if err := compactionManager.CleanupOrphanedCompletionManifests(0); err != nil {
+			orphanTimeout := time.Duration(cfg.Compaction.CompletionOrphanTimeoutMS) * time.Millisecond
+			if err := compactionManager.CleanupOrphanedCompletionManifests(orphanTimeout); err != nil {
 				log.Warn().Err(err).Msg("Failed to cleanup orphaned completion manifests")
 			}
 		}
@@ -910,10 +917,19 @@ func main() {
 						// manifests would be lost.
 						if capabilities.CanCompact && completionDir != "" && cfg.Compaction.Enabled {
 							bridge := cluster.NewCompactionBridge(clusterCoordinator)
+							// Honor the configured poll interval; fall back to 1s if
+							// the operator didn't set it (or set it to 0/negative).
+							// The watcher's NewCompletionWatcher also clamps defaults
+							// internally, but we prefer an explicit default here so
+							// the startup log reflects the effective value.
+							pollInterval := time.Duration(cfg.Compaction.CompletionWatcherIntervalMS) * time.Millisecond
+							if pollInterval <= 0 {
+								pollInterval = 1 * time.Second
+							}
 							watcher, werr := compaction.NewCompletionWatcher(compaction.CompletionWatcherConfig{
 								Dir:          completionDir,
 								Bridge:       bridge,
-								PollInterval: 1 * time.Second,
+								PollInterval: pollInterval,
 								ApplyTimeout: 5 * time.Second,
 								Logger:       logger.Get("compaction-watcher"),
 							})
@@ -927,6 +943,7 @@ func main() {
 								}, shutdown.PriorityCompaction-1)
 								log.Info().
 									Str("completion_dir", completionDir).
+									Dur("poll_interval", pollInterval).
 									Msg("Phase 4 compaction completion watcher started")
 							}
 						}

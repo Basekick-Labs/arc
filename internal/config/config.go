@@ -133,6 +133,16 @@ type CompactionConfig struct {
 	DailySkipFileAgeCheckDays int    // Skip file creation time check for partitions older than N days (default: 7)
 	MaxConcurrent             int    // Max concurrent compaction jobs (default: 2)
 	TempDirectory             string // Temporary directory for compaction files (default: ./data/compaction)
+
+	// Phase 4: completion-manifest watcher tunables. The watcher polls
+	// {temp_directory}/.completion/pending on a 1s default interval
+	// looking for compaction jobs that finished and need their outputs
+	// registered in the Raft manifest. Operators can tighten the poll
+	// rate if they need faster visibility of compacted files in readers,
+	// or loosen it to reduce filesystem churn. See compaction/watcher.go.
+	CompletionWatcherIntervalMS int    // Watcher poll interval in milliseconds (default: 1000)
+	CompletionDir               string // Override the watcher directory (default: "" = {temp_directory}/.completion/pending)
+	CompletionOrphanTimeoutMS   int    // Sweep "writing_output" manifests older than this on startup (default: 600000 = 10min)
 }
 
 type WALConfig struct {
@@ -481,18 +491,21 @@ func Load() (*Config, error) {
 			ForceBootstrap: v.GetBool("auth.force_bootstrap"),
 		},
 		Compaction: CompactionConfig{
-			Enabled:                   v.GetBool("compaction.enabled"),
-			HourlySchedule:            v.GetString("compaction.hourly_schedule"),
-			DailySchedule:             v.GetString("compaction.daily_schedule"),
-			HourlyEnabled:             v.GetBool("compaction.hourly_enabled"),
-			DailyEnabled:              v.GetBool("compaction.daily_enabled"),
-			HourlyMinAgeHours:         v.GetInt("compaction.hourly_min_age_hours"),
-			HourlyMinFiles:            v.GetInt("compaction.hourly_min_files"),
-			DailyMinAgeHours:          v.GetInt("compaction.daily_min_age_hours"),
-			DailyMinFiles:             v.GetInt("compaction.daily_min_files"),
-			DailySkipFileAgeCheckDays: v.GetInt("compaction.daily_skip_file_age_check_days"),
-			MaxConcurrent:             v.GetInt("compaction.max_concurrent"),
-			TempDirectory:             v.GetString("compaction.temp_directory"),
+			Enabled:                     v.GetBool("compaction.enabled"),
+			HourlySchedule:              v.GetString("compaction.hourly_schedule"),
+			DailySchedule:               v.GetString("compaction.daily_schedule"),
+			HourlyEnabled:               v.GetBool("compaction.hourly_enabled"),
+			DailyEnabled:                v.GetBool("compaction.daily_enabled"),
+			HourlyMinAgeHours:           v.GetInt("compaction.hourly_min_age_hours"),
+			HourlyMinFiles:              v.GetInt("compaction.hourly_min_files"),
+			DailyMinAgeHours:            v.GetInt("compaction.daily_min_age_hours"),
+			DailyMinFiles:               v.GetInt("compaction.daily_min_files"),
+			DailySkipFileAgeCheckDays:   v.GetInt("compaction.daily_skip_file_age_check_days"),
+			MaxConcurrent:               v.GetInt("compaction.max_concurrent"),
+			TempDirectory:               v.GetString("compaction.temp_directory"),
+			CompletionWatcherIntervalMS: v.GetInt("compaction.completion_watcher_interval_ms"),
+			CompletionDir:               v.GetString("compaction.completion_dir"),
+			CompletionOrphanTimeoutMS:   v.GetInt("compaction.completion_orphan_timeout_ms"),
 		},
 		WAL: WALConfig{
 			Enabled:                 v.GetBool("wal.enabled"),
@@ -726,6 +739,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.daily_skip_file_age_check_days", 7)   // Skip file age check for partitions older than 7 days
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
+	// Phase 4: completion-manifest watcher tunables
+	v.SetDefault("compaction.completion_watcher_interval_ms", 1000)  // 1s poll rate
+	v.SetDefault("compaction.completion_dir", "")                    // "" = derive from temp_directory
+	v.SetDefault("compaction.completion_orphan_timeout_ms", 600000)  // 10min stuck-in-writing_output sweep
 
 	// WAL defaults
 	v.SetDefault("wal.enabled", false)                 // Disabled by default for backwards compatibility

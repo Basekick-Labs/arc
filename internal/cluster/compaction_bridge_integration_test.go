@@ -37,20 +37,33 @@ import (
 // observe that onFileRegistered / onFileDeleted callbacks fire and the
 // files map ends up in the expected state.
 //
-// This intentionally mirrors what a real leader coordinator does without
-// needing to stand up the full Raft cluster. The FSM.Apply path is the
-// same one exercised in production after Raft commits.
+// This intentionally mirrors what a real leader coordinator does (or a
+// non-leader that successfully forwarded to the leader) without needing
+// to stand up the full Raft cluster. The FSM.Apply path is the same one
+// exercised in production after Raft commits.
+//
+// Phase 4 + leader forwarding: the bridge no longer touches IsLeader().
+// The fsmCoordinator simulates either a leader (apply directly to FSM)
+// or a non-leader whose forwarding fails (return ErrNoLeaderKnown). The
+// "leader-flap" test exercises the latter and asserts the bridge maps
+// the error to compaction.ErrNotLeader so the watcher retries.
 type fsmCoordinator struct {
-	leader   bool
-	nodeID   string
-	fsm      *raft.ClusterFSM
-	logIndex uint64 // incremented per Apply to mimic Raft's monotonic index
+	// forwardingFailure, when non-nil, is returned from
+	// RegisterFileInManifest / DeleteFileFromManifest INSTEAD of applying
+	// to the FSM. Tests use this to simulate "non-leader, forwarding to
+	// the leader failed" without standing up real Raft.
+	forwardingFailure error
+	nodeID            string
+	fsm               *raft.ClusterFSM
+	logIndex          uint64 // incremented per Apply to mimic Raft's monotonic index
 }
 
-func (c *fsmCoordinator) IsLeader() bool      { return c.leader }
 func (c *fsmCoordinator) LocalNodeID() string { return c.nodeID }
 
 func (c *fsmCoordinator) RegisterFileInManifest(file raft.FileEntry) error {
+	if c.forwardingFailure != nil {
+		return c.forwardingFailure
+	}
 	payload, err := json.Marshal(raft.RegisterFilePayload{File: file})
 	if err != nil {
 		return fmt.Errorf("marshal register payload: %w", err)
@@ -70,6 +83,9 @@ func (c *fsmCoordinator) RegisterFileInManifest(file raft.FileEntry) error {
 }
 
 func (c *fsmCoordinator) DeleteFileFromManifest(path, reason string) error {
+	if c.forwardingFailure != nil {
+		return c.forwardingFailure
+	}
 	payload, err := json.Marshal(raft.DeleteFilePayload{Path: path, Reason: reason})
 	if err != nil {
 		return fmt.Errorf("marshal delete payload: %w", err)
@@ -116,7 +132,11 @@ func waitFSMHasFile(t *testing.T, fsm *raft.ClusterFSM, path string, timeout tim
 func TestPhase4_CompletionManifestToFSM(t *testing.T) {
 	dir := t.TempDir()
 	fsm := raft.NewClusterFSM(zerolog.Nop())
-	coord := &fsmCoordinator{leader: true, nodeID: "compactor-1", fsm: fsm}
+	// forwardingFailure=nil → coordinator behaves as the leader and applies
+	// directly to the FSM. This is the happy-path equivalent of "the
+	// compactor IS the Raft leader" or "the compactor's forward to the
+	// real leader succeeded".
+	coord := &fsmCoordinator{nodeID: "compactor-1", fsm: fsm}
 	bridge := NewCompactionBridge(coord)
 
 	// Pre-seed the sources in the manifest so the DeleteFile path has
@@ -222,14 +242,28 @@ func TestPhase4_CompletionManifestToFSM(t *testing.T) {
 	}
 }
 
-// TestPhase4_NotLeaderKeepsManifest drives the bridge against a
-// non-leader fsmCoordinator and asserts the watcher retries until the
-// coordinator becomes leader.
-func TestPhase4_NotLeaderKeepsManifestUntilLeaderFlap(t *testing.T) {
+// TestPhase4_ForwardingFailureKeepsManifestUntilRecovery exercises the
+// post-leader-forwarding contract: when the coordinator's forwarding to
+// the actual Raft leader fails (e.g. ErrNoLeaderKnown during a brief
+// election window), the bridge maps the error to compaction.ErrNotLeader
+// so the watcher keeps the manifest on disk and retries on the next tick.
+// Once forwarding recovers, the apply succeeds and the manifest is
+// removed.
+//
+// This is the same test that used to verify the bridge's IsLeader()
+// short-circuit; the test now exercises the underlying coordinator's
+// transient-failure path instead.
+func TestPhase4_ForwardingFailureKeepsManifestUntilRecovery(t *testing.T) {
 	dir := t.TempDir()
 	fsm := raft.NewClusterFSM(zerolog.Nop())
-	// Start as NOT leader — watcher should keep the manifest.
-	coord := &fsmCoordinator{leader: false, nodeID: "compactor-1", fsm: fsm}
+	// Start with forwardingFailure = ErrNoLeaderKnown — simulates a
+	// non-leader compactor whose forward to the leader can't resolve
+	// because Raft hasn't observed a leader yet.
+	coord := &fsmCoordinator{
+		nodeID:            "compactor-1",
+		fsm:               fsm,
+		forwardingFailure: ErrNoLeaderKnown,
+	}
 	bridge := NewCompactionBridge(coord)
 
 	manifest := &compaction.CompletionManifest{
@@ -271,20 +305,24 @@ func TestPhase4_NotLeaderKeepsManifestUntilLeaderFlap(t *testing.T) {
 	defer watcher.Stop()
 
 	// Give the watcher several ticks to observe the manifest under the
-	// not-leader condition. The FSM must NOT see the file during this
-	// window because the bridge short-circuits with ErrNotLeader.
+	// forwarding-failure condition. The FSM must NOT see the file during
+	// this window because the coordinator returns ErrNoLeaderKnown and
+	// the bridge maps that to compaction.ErrNotLeader.
 	time.Sleep(100 * time.Millisecond)
 	if _, ok := fsm.GetFile("db/cpu/2026/04/11/14/compacted_flap.parquet"); ok {
-		t.Fatal("file must not appear in FSM while bridge reports not-leader")
+		t.Fatal("file must not appear in FSM while forwarding fails")
 	}
 	// Manifest must still exist on disk.
 	entries, _ := listJSONPaths(dir)
 	if len(entries) != 1 {
-		t.Fatalf("manifest should still exist during leader-flap, got %d entries", len(entries))
+		t.Fatalf("manifest should still exist during forwarding failure, got %d entries", len(entries))
 	}
 
-	// Flip to leader and expect the retry to succeed within a few ticks.
-	coord.leader = true
+	// Recover: clear the simulated forwarding failure. This is the
+	// equivalent of "Raft elected a leader and the registry now has the
+	// leader's coordinator address". The next watcher tick should
+	// successfully apply via the FSM directly.
+	coord.forwardingFailure = nil
 	waitFSMHasFile(t, fsm, "db/cpu/2026/04/11/14/compacted_flap.parquet", 2*time.Second)
 
 	// Manifest should have been cleaned up after the successful apply.

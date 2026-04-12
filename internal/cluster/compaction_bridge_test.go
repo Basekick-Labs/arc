@@ -1,8 +1,10 @@
 package cluster
 
-// Unit tests for CompactionBridge. These drive the leader/not-leader
-// branches directly against a stub bridgeCoordinator so the bridge can
-// be validated without spinning up a full cluster.
+// Unit tests for CompactionBridge. These drive the bridge's mapping logic
+// (CompactedFile → raft.FileEntry, OriginNodeID stamping, error mapping)
+// against a stub bridgeCoordinator. The bridge is now a thin adapter —
+// leader resolution and forwarding live in the underlying coordinator
+// (forward_apply.go), so these tests focus on the translation layer.
 
 import (
 	"context"
@@ -16,21 +18,21 @@ import (
 )
 
 // stubBridgeCoordinator is a minimal implementation of bridgeCoordinator
-// that records calls and returns scripted errors. The tests only exercise
-// the four methods on the interface.
+// that records calls and returns scripted errors. The bridge no longer
+// touches IsLeader() — the underlying coordinator forwards or applies
+// internally — so the stub only needs the three methods on the post-Phase-4
+// interface: LocalNodeID, RegisterFileInManifest, DeleteFileFromManifest.
 type stubBridgeCoordinator struct {
-	leader       bool
-	nodeID       string
-	registerErr  error
-	deleteErr    error
-	registered   []raft.FileEntry
-	deleted      []struct{ Path, Reason string }
+	nodeID        string
+	registerErr   error
+	deleteErr     error
+	registered    []raft.FileEntry
+	deleted       []struct{ Path, Reason string }
 	registerCalls int
 	deleteCalls   int
 }
 
-func (s *stubBridgeCoordinator) IsLeader() bool       { return s.leader }
-func (s *stubBridgeCoordinator) LocalNodeID() string  { return s.nodeID }
+func (s *stubBridgeCoordinator) LocalNodeID() string { return s.nodeID }
 func (s *stubBridgeCoordinator) RegisterFileInManifest(file raft.FileEntry) error {
 	s.registerCalls++
 	s.registered = append(s.registered, file)
@@ -44,8 +46,16 @@ func (s *stubBridgeCoordinator) DeleteFileFromManifest(path, reason string) erro
 
 // --- RegisterCompactedFile ---
 
-func TestCompactionBridge_RegisterNotLeader(t *testing.T) {
-	stub := &stubBridgeCoordinator{leader: false, nodeID: "compactor-1"}
+// TestCompactionBridge_RegisterMapsNoLeaderKnownToErrNotLeader documents
+// the post-Phase-4 contract: when the underlying coordinator can't resolve
+// a leader (e.g. mid-election), the bridge maps the error to
+// compaction.ErrNotLeader so the watcher recognizes it as a transient
+// retry and keeps the manifest on disk.
+func TestCompactionBridge_RegisterMapsNoLeaderKnownToErrNotLeader(t *testing.T) {
+	stub := &stubBridgeCoordinator{
+		nodeID:      "compactor-1",
+		registerErr: ErrNoLeaderKnown,
+	}
 	bridge := NewCompactionBridge(stub)
 
 	err := bridge.RegisterCompactedFile(context.Background(), compaction.CompactedFile{
@@ -57,16 +67,39 @@ func TestCompactionBridge_RegisterNotLeader(t *testing.T) {
 		t.Fatal("expected error, got nil")
 	}
 	if !errors.Is(err, compaction.ErrNotLeader) {
-		t.Errorf("expected ErrNotLeader, got %v", err)
+		t.Errorf("expected ErrNotLeader (transient leader-resolution failure), got %v", err)
 	}
-	// Register must NOT be called when we're not the leader.
-	if stub.registerCalls != 0 {
-		t.Errorf("registerCalls: got %d, want 0 (guard must short-circuit)", stub.registerCalls)
+	// Coordinator was still called — the bridge no longer short-circuits
+	// before calling the underlying RegisterFileInManifest.
+	if stub.registerCalls != 1 {
+		t.Errorf("registerCalls: got %d, want 1 (bridge must call coordinator and let it forward)", stub.registerCalls)
 	}
 }
 
+// TestCompactionBridge_RegisterMapsLeaderUnreachableToErrNotLeader: same
+// reasoning, different transient cause (leader ID known but registry
+// doesn't have an address for it).
+func TestCompactionBridge_RegisterMapsLeaderUnreachableToErrNotLeader(t *testing.T) {
+	stub := &stubBridgeCoordinator{
+		nodeID:      "compactor-1",
+		registerErr: ErrLeaderUnreachable,
+	}
+	bridge := NewCompactionBridge(stub)
+
+	err := bridge.RegisterCompactedFile(context.Background(), compaction.CompactedFile{Path: "x.parquet"})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, compaction.ErrNotLeader) {
+		t.Errorf("expected ErrNotLeader, got %v", err)
+	}
+}
+
+// TestCompactionBridge_RegisterSuccessAsLeader verifies the happy path.
+// The stub returns nil from RegisterFileInManifest, mimicking the leader
+// successfully applying via Raft.
 func TestCompactionBridge_RegisterSuccessAsLeader(t *testing.T) {
-	stub := &stubBridgeCoordinator{leader: true, nodeID: "compactor-1"}
+	stub := &stubBridgeCoordinator{nodeID: "compactor-1"}
 	bridge := NewCompactionBridge(stub)
 
 	file := compaction.CompactedFile{
@@ -106,9 +139,12 @@ func TestCompactionBridge_RegisterSuccessAsLeader(t *testing.T) {
 	}
 }
 
+// TestCompactionBridge_RegisterUnderlyingErrorSurfaces: a non-transient
+// error from the coordinator (e.g. raft.Apply timeout, marshal failure)
+// must NOT be mapped to ErrNotLeader — operators need to see the real
+// cause in logs.
 func TestCompactionBridge_RegisterUnderlyingErrorSurfaces(t *testing.T) {
 	stub := &stubBridgeCoordinator{
-		leader:      true,
 		nodeID:      "c1",
 		registerErr: errors.New("raft timeout"),
 	}
@@ -123,13 +159,13 @@ func TestCompactionBridge_RegisterUnderlyingErrorSurfaces(t *testing.T) {
 	}
 }
 
+// TestCompactionBridge_RegisterRespectsDeadline: an already-expired
+// context fails fast before touching the coordinator. Prevents a stuck
+// Raft Apply from extending the caller's deadline budget.
 func TestCompactionBridge_RegisterRespectsDeadline(t *testing.T) {
-	stub := &stubBridgeCoordinator{leader: true, nodeID: "c1"}
+	stub := &stubBridgeCoordinator{nodeID: "c1"}
 	bridge := NewCompactionBridge(stub)
 
-	// Context already expired — bridge should bail before calling
-	// RegisterFileInManifest so a stuck Raft apply doesn't extend the
-	// caller's deadline budget.
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-1*time.Second))
 	defer cancel()
 	err := bridge.RegisterCompactedFile(ctx, compaction.CompactedFile{Path: "x.parquet"})
@@ -143,8 +179,12 @@ func TestCompactionBridge_RegisterRespectsDeadline(t *testing.T) {
 
 // --- DeleteCompactedSource ---
 
-func TestCompactionBridge_DeleteNotLeader(t *testing.T) {
-	stub := &stubBridgeCoordinator{leader: false, nodeID: "c1"}
+// Symmetric mapping test for the delete path.
+func TestCompactionBridge_DeleteMapsNoLeaderKnownToErrNotLeader(t *testing.T) {
+	stub := &stubBridgeCoordinator{
+		nodeID:    "c1",
+		deleteErr: ErrNoLeaderKnown,
+	}
 	bridge := NewCompactionBridge(stub)
 
 	err := bridge.DeleteCompactedSource(context.Background(), "src.parquet", "compaction:job-1")
@@ -154,13 +194,13 @@ func TestCompactionBridge_DeleteNotLeader(t *testing.T) {
 	if !errors.Is(err, compaction.ErrNotLeader) {
 		t.Errorf("expected ErrNotLeader, got %v", err)
 	}
-	if stub.deleteCalls != 0 {
-		t.Errorf("deleteCalls: got %d, want 0", stub.deleteCalls)
+	if stub.deleteCalls != 1 {
+		t.Errorf("deleteCalls: got %d, want 1 (bridge calls coordinator before mapping)", stub.deleteCalls)
 	}
 }
 
 func TestCompactionBridge_DeleteSuccessAsLeader(t *testing.T) {
-	stub := &stubBridgeCoordinator{leader: true, nodeID: "c1"}
+	stub := &stubBridgeCoordinator{nodeID: "c1"}
 	bridge := NewCompactionBridge(stub)
 
 	err := bridge.DeleteCompactedSource(context.Background(), "src.parquet", "compaction:job-42")
@@ -180,7 +220,6 @@ func TestCompactionBridge_DeleteSuccessAsLeader(t *testing.T) {
 
 func TestCompactionBridge_DeleteUnderlyingErrorSurfaces(t *testing.T) {
 	stub := &stubBridgeCoordinator{
-		leader:    true,
 		nodeID:    "c1",
 		deleteErr: errors.New("raft not started"),
 	}
@@ -198,8 +237,7 @@ func TestCompactionBridge_DeleteUnderlyingErrorSurfaces(t *testing.T) {
 // TestCompactionBridge_NilCoordinatorPanicsAtConstruction documents the
 // post-review contract: nil coordinator is a programming error, not a
 // runtime condition. The constructor panics loudly so the bug is caught
-// at startup, not on the first bridge call. Production wiring in main.go
-// always passes a non-nil coordinator.
+// at startup, not on the first bridge call.
 func TestCompactionBridge_NilCoordinatorPanicsAtConstruction(t *testing.T) {
 	defer func() {
 		r := recover()

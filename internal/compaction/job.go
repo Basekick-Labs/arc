@@ -811,15 +811,12 @@ func (j *Job) writeOutputWrittenManifest(_ context.Context, localPath, storageKe
 // effect (deleting the sources) has already succeeded, leaving the system
 // in a stranger state than the leak.
 func (j *Job) writeSourcesDeletedManifest() error {
-	// We read-modify-write the existing manifest. Simpler: just construct
-	// a fresh one with the same Outputs. In practice the subprocess still
-	// has j.compactedFiles and j.BytesAfter in memory, so no re-read from
-	// disk is needed.
-	//
-	// Re-hashing the compacted file here would be wasteful (we already
-	// stored the hash in the previous manifest, and the local copy may
-	// have been cleaned up by now). Instead we read back the previous
-	// manifest, copy Outputs verbatim, and update State + DeletedSources.
+	// Read-modify-write: load the existing output_written manifest, flip
+	// the state to sources_deleted, and append DeletedSources. We read
+	// the previous manifest back instead of constructing a fresh one so
+	// we don't have to re-hash the compacted file — the SHA-256 lives in
+	// the previous manifest's Outputs[] and the local compacted file may
+	// already have been cleaned up by the deferred tempdir cleanup.
 	prev, err := readCompletionManifest(filepath.Join(j.CompletionDir, j.JobID+".json"))
 	if err != nil {
 		return fmt.Errorf("read previous completion manifest: %w", err)
