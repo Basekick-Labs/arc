@@ -1801,10 +1801,12 @@ func (c *Coordinator) startFilePullerLocked() error {
 	// The callbacks fire synchronously from Raft apply — if a DeleteFile
 	// command arrives between SetFileCallbacks and queue init, the
 	// onDelete closure would send to a nil channel.
-	c.deleteQueue = make(chan deleteRequest, deleteQueueSize)
-	for i := 0; i < deleteWorkerCount; i++ {
-		c.deleteWg.Add(1)
-		go c.runDeleteWorker()
+	if c.deleteQueue == nil {
+		c.deleteQueue = make(chan deleteRequest, deleteQueueSize)
+		for i := 0; i < deleteWorkerCount; i++ {
+			c.deleteWg.Add(1)
+			go c.runDeleteWorker()
+		}
 	}
 
 	fsm.SetFileCallbacks(onRegister, onDelete)
