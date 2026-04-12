@@ -109,6 +109,7 @@ type Coordinator struct {
 	forwardConn       net.Conn
 	forwardConnLeader string // nodeID of the leader this conn is dialed to
 	forwardConnMu     sync.Mutex
+	forwardMu         sync.Mutex // Phase 4: serializes round-trips on forwardConn
 
 	// Network
 	listener  net.Listener
