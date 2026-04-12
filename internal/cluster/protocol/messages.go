@@ -37,6 +37,27 @@ const (
 	// header the origin streams raw body bytes directly on the connection —
 	// the body is NOT framed as another protocol message.
 	MsgFetchFileAck MessageType = 0x21
+
+	// Leader-forwarding messages (Enterprise Phase 4) - start at 0x30 to
+	// leave room for additional file-replication messages.
+	//
+	// MsgForwardApply is sent by a non-leader node that needs to apply a
+	// raft.Command (RegisterFile, DeleteFile, etc.) to the cluster FSM.
+	// The recipient unmarshals the embedded command and runs it through
+	// hraft.Raft.Apply locally — which only works if the recipient IS
+	// the current Raft leader. The recipient validates HMAC and returns
+	// MsgForwardApplyAck with success or error.
+	//
+	// This closes the Phase 1 silent-skip blind spot at coordinator.go's
+	// RegisterFileInManifest where non-leader writers would silently lose
+	// file registrations, AND unblocks Phase 4's compactor (which is
+	// typically NOT the leader in deployments where the writer
+	// bootstraps Raft).
+	MsgForwardApply MessageType = 0x30
+	// MsgForwardApplyAck is the response from the leader after attempting
+	// to apply the forwarded command. Includes a success/error status so
+	// the caller can distinguish "applied" from "leader rejected".
+	MsgForwardApplyAck MessageType = 0x31
 )
 
 // String returns the string representation of a message type.
@@ -62,6 +83,10 @@ func (m MessageType) String() string {
 		return "FetchFile"
 	case MsgFetchFileAck:
 		return "FetchFileAck"
+	case MsgForwardApply:
+		return "ForwardApply"
+	case MsgForwardApplyAck:
+		return "ForwardApplyAck"
 	default:
 		return "Unknown"
 	}
@@ -220,3 +245,65 @@ type FetchFileAckHeader struct {
 	SizeBytes int64        `json:"size_bytes"`
 	SHA256    string       `json:"sha256"` // hex-encoded; must match manifest SHA256
 }
+
+// ForwardApplyRequest is sent by a non-leader node to ask the Raft leader
+// to apply a Command on its behalf. CommandJSON is the already-serialized
+// raft.Command (Type + Payload) that hraft.Raft.Apply expects — keeping it
+// as a raw json.RawMessage avoids re-marshalling and lets the protocol
+// package stay free of any raft.* imports.
+//
+// HMAC auth headers use the same {nonce, nodeID, clusterName, timestamp}
+// signature as the join handshake (security.ComputeHMAC, NOT the
+// path-bound ComputeFetchHMAC). The forwarded command's content is
+// trusted because cluster peers are mutually authenticated; the HMAC's
+// only job is to prove "I am a known peer in this cluster".
+//
+// Phase 4 only sends this for RegisterFile and DeleteFile commands, but
+// the wire format accepts any Command type so future Phase 5+ commands
+// (compactor election, etc.) reuse the same path.
+type ForwardApplyRequest struct {
+	CommandJSON []byte `json:"command_json"` // already-marshalled raft.Command
+	NodeID      string `json:"node_id"`
+	Nonce       string `json:"nonce"`
+	Timestamp   int64  `json:"timestamp"`
+	HMAC        string `json:"hmac"`
+}
+
+// ForwardApplyAck is the leader's response. Status="ok" means the Raft
+// Apply succeeded and the command is durably committed. Status="error"
+// means the leader rejected (auth, no longer leader, apply failed, etc.).
+//
+// Code is machine-readable for the same reason FetchFileAckHeader.Code is:
+// the caller (CompactionBridge or file_registrar) needs to distinguish
+// "the recipient is no longer the leader, retry with the new leader" from
+// "auth failed, give up" without substring-matching the error text.
+type ForwardApplyAck struct {
+	Status string             `json:"status"`          // "ok" or "error"
+	Code   ForwardApplyCode   `json:"code,omitempty"`  // machine-readable error category
+	Error  string             `json:"error,omitempty"` // human-readable detail
+}
+
+// ForwardApplyCode is the typed error category for ForwardApplyAck. Same
+// design as AckErrorCode for fetch — the bridge consumes Code, not Error.
+type ForwardApplyCode string
+
+const (
+	// ForwardCodeNotLeader: the recipient is not the Raft leader. The
+	// caller should re-resolve the leader and retry. This can happen
+	// during leader-flap if the caller's view of who-is-leader is stale.
+	ForwardCodeNotLeader ForwardApplyCode = "not_leader"
+	// ForwardCodeAuth: HMAC validation failed.
+	ForwardCodeAuth ForwardApplyCode = "auth"
+	// ForwardCodeInvalidCommand: the embedded CommandJSON failed to
+	// unmarshal as a raft.Command. Indicates a wire-format bug or a
+	// version mismatch — caller should NOT retry.
+	ForwardCodeInvalidCommand ForwardApplyCode = "invalid_command"
+	// ForwardCodeApplyFailed: the leader's hraft.Raft.Apply call returned
+	// an error. The error message is in the Error field for diagnosis.
+	// Callers MAY retry — the failure could be transient (Raft timeout,
+	// FSM apply panic recovery, etc.).
+	ForwardCodeApplyFailed ForwardApplyCode = "apply_failed"
+	// ForwardCodeRaftUnavailable: the recipient's Raft node is nil or
+	// not running. Caller should not retry against this peer.
+	ForwardCodeRaftUnavailable ForwardApplyCode = "raft_unavailable"
+)
