@@ -170,29 +170,39 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 	}
 	if ack.Status != "ok" {
 		// Protocol-level rejection — connection is still valid, don't close.
+		// Map ForwardCodeNotLeader to ErrNoLeaderKnown so callers
+		// (CompactionBridge's isTransientLeaderError) recognize it as a
+		// transient retry condition during normal leadership transitions.
+		if ack.Code == protocol.ForwardCodeNotLeader {
+			return fmt.Errorf("forward apply: %w", ErrNoLeaderKnown)
+		}
 		return fmt.Errorf("forward apply: leader rejected (code=%s): %s", ack.Code, ack.Error)
 	}
 	return nil
 }
 
 // getOrDialLeader returns the cached leader connection if it's still open
-// and pointed at the right leader, or dials a new one.
+// and pointed at the right leader, or dials a new one. The dial happens
+// outside the mutex so a slow/unresponsive leader doesn't block all
+// concurrent forwarders waiting for the lock.
 func (c *Coordinator) getOrDialLeader(ctx context.Context, leaderID, leaderAddr string) (net.Conn, error) {
+	// Fast path: check for a cached connection under a short lock.
 	c.forwardConnMu.Lock()
-	defer c.forwardConnMu.Unlock()
-
-	// Reuse existing connection if it's to the same leader.
 	if c.forwardConn != nil && c.forwardConnLeader == leaderID {
-		return c.forwardConn, nil
+		conn := c.forwardConn
+		c.forwardConnMu.Unlock()
+		return conn, nil
 	}
-
-	// Leader changed or no connection — close stale and dial fresh.
+	// Need a new connection — close stale one if any, then unlock
+	// BEFORE dialing so we don't hold the lock during network I/O.
 	if c.forwardConn != nil {
 		c.forwardConn.Close()
 		c.forwardConn = nil
 		c.forwardConnLeader = ""
 	}
+	c.forwardConnMu.Unlock()
 
+	// Dial outside the lock.
 	dialTimeout := forwardApplyTimeout
 	if deadline, ok := ctx.Deadline(); ok {
 		if remaining := time.Until(deadline); remaining < dialTimeout {
@@ -204,8 +214,24 @@ func (c *Coordinator) getOrDialLeader(ctx context.Context, leaderID, leaderAddr 
 		return nil, fmt.Errorf("dial leader %s (%s): %w", leaderID, leaderAddr, err)
 	}
 
+	// Store the new connection. If another goroutine raced and stored
+	// one first, close ours and use theirs (last-writer-wins is fine
+	// because both connections are to the same leader).
+	c.forwardConnMu.Lock()
+	if c.forwardConn != nil && c.forwardConnLeader == leaderID {
+		// Another goroutine won the race — close our new conn, use theirs.
+		conn.Close()
+		existing := c.forwardConn
+		c.forwardConnMu.Unlock()
+		return existing, nil
+	}
+	// We won (or leader changed again) — store ours.
+	if c.forwardConn != nil {
+		c.forwardConn.Close()
+	}
 	c.forwardConn = conn
 	c.forwardConnLeader = leaderID
+	c.forwardConnMu.Unlock()
 	return conn, nil
 }
 
@@ -274,20 +300,27 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	// Authorization: ensure the requesting node's role is allowed to
 	// mutate the file manifest. Only writers (CanIngest — flush path)
 	// and compactors (CanCompact — compaction bridge) legitimately
-	// forward RegisterFile/DeleteFile commands. A compromised reader
-	// node should not be able to use its shared-secret credential to
-	// delete files from the cluster manifest.
-	if peerNode, ok := c.registry.Get(req.NodeID); ok {
-		caps := peerNode.Role.GetCapabilities()
-		if !caps.CanIngest && !caps.CanCompact {
-			c.logger.Warn().
-				Str("peer", remoteAddr).
-				Str("requesting_node", req.NodeID).
-				Str("role", string(peerNode.Role)).
-				Msg("ForwardApply rejected: node role not authorized for manifest mutations")
-			c.sendForwardApplyError(conn, protocol.ForwardCodeAuth, "unauthorized role")
-			return
-		}
+	// forward RegisterFile/DeleteFile commands. Unknown nodes (not in
+	// registry) are also rejected — if we can't verify the role, we
+	// don't allow the mutation.
+	peerNode, knownPeer := c.registry.Get(req.NodeID)
+	if !knownPeer {
+		c.logger.Warn().
+			Str("peer", remoteAddr).
+			Str("requesting_node", req.NodeID).
+			Msg("ForwardApply rejected: node not found in registry")
+		c.sendForwardApplyError(conn, protocol.ForwardCodeAuth, "unknown node")
+		return
+	}
+	caps := peerNode.Role.GetCapabilities()
+	if !caps.CanIngest && !caps.CanCompact {
+		c.logger.Warn().
+			Str("peer", remoteAddr).
+			Str("requesting_node", req.NodeID).
+			Str("role", string(peerNode.Role)).
+			Msg("ForwardApply rejected: node role not authorized for manifest mutations")
+		c.sendForwardApplyError(conn, protocol.ForwardCodeAuth, "unauthorized role")
+		return
 	}
 
 	// Confirm we're STILL the leader. The caller forwarded to us because
