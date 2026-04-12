@@ -92,6 +92,13 @@ type CoordinatorConfig struct {
 	Version       string // Arc version
 	APIAddress    string // HTTP API address for this node
 	Logger        zerolog.Logger
+
+	// Phase 4: when true, the embedded HealthChecker surfaces rate-limited
+	// Warn logs when the cluster has zero or >1 nodes in RoleCompactor.
+	// Main wires this to cfg.Cluster.Enabled && cfg.Cluster.ReplicationEnabled &&
+	// cfg.Compaction.Enabled so the warning only fires in deployments where
+	// a missing compactor is actually a problem.
+	WarnIfNoCompactor bool
 }
 
 // NewCoordinator creates a new cluster coordinator.
@@ -164,7 +171,10 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		CheckInterval:      time.Duration(cfg.Config.HealthCheckInterval) * time.Second,
 		CheckTimeout:       time.Duration(cfg.Config.HealthCheckTimeout) * time.Second,
 		UnhealthyThreshold: cfg.Config.UnhealthyThreshold,
-		Logger:             cfg.Logger,
+		// Phase 4: rate-limited compactor-election warning. Main passes
+		// this as cluster+replication+compaction enabled.
+		WarnIfNoCompactor: cfg.WarnIfNoCompactor,
+		Logger:            cfg.Logger,
 	})
 
 	// Initialize Raft FSM and node (Phase 3)
@@ -1609,8 +1619,12 @@ func (c *Coordinator) startFilePullerLocked() error {
 	// calls on this same node. The puller's Enqueue handles origin-is-self
 	// and already-local skips, so there's no redundant check here.
 	//
-	// onFileDeleted is reserved for Phase 4 (compactor-initiated deletes).
-	// For now we log so operators can see deletion events flowing through.
+	// Phase 4: onFileDeleted now wires the local-delete hook. When the
+	// compactor issues DeleteFile for a source file after a successful
+	// compaction, readers need to drop their local copy of that source —
+	// otherwise per-node disk fills up with files the manifest says are
+	// gone, and Phase 3's catch-up path would attempt to pull them from
+	// peers that no longer have them (the orphan-fetch loop).
 	fsm := c.raftNode.FSM()
 	if fsm == nil {
 		return fmt.Errorf("Raft FSM not available")
@@ -1622,10 +1636,56 @@ func (c *Coordinator) startFilePullerLocked() error {
 		puller.Enqueue(entry)
 	}
 	onDelete := func(path string, reason string) {
-		c.logger.Debug().
-			Str("path", path).
-			Str("reason", reason).
-			Msg("Cluster manifest deletion observed (Phase 4 will act on this)")
+		// Phase 4: the callback runs synchronously from applyDeleteFile on
+		// the Raft apply hot path. It MUST NOT block. We spawn a goroutine
+		// with a short grace delay so in-flight queries scanning the old
+		// file can finish, then call backend.Delete. On non-local backends
+		// (S3, Azure) the compactor that issued DeleteFile has already
+		// removed the shared object, so the local-side Delete is a no-op.
+		c.mu.RLock()
+		backend := c.storage
+		c.mu.RUnlock()
+		if backend == nil {
+			return
+		}
+		// Local backends need an actual local unlink; shared backends
+		// don't — they're already deleted cluster-wide by the compactor's
+		// StorageBackend.Delete in deleteOldFiles.
+		if backend.Type() != "local" {
+			c.logger.Debug().
+				Str("path", path).
+				Str("reason", reason).
+				Str("backend", backend.Type()).
+				Msg("FSM delete observed; shared backend, no local action needed")
+			return
+		}
+		// Deferred local delete. 500ms grace gives queries started before
+		// the Raft commit a chance to open and finish reading the file.
+		// After the grace, we call backend.Delete with a bounded context
+		// so a stuck filesystem doesn't pin the goroutine forever.
+		go func(p, r string) {
+			select {
+			case <-c.ctx.Done():
+				// Coordinator is shutting down — abandon the delete.
+				// Next startup will reconcile via Phase 3 catch-up.
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
+			delCtx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
+			defer cancel()
+			if err := backend.Delete(delCtx, p); err != nil {
+				c.logger.Warn().
+					Err(err).
+					Str("path", p).
+					Str("reason", r).
+					Msg("Phase 4 local delete hook: backend.Delete failed")
+				return
+			}
+			c.logger.Debug().
+				Str("path", p).
+				Str("reason", r).
+				Msg("Phase 4 local delete hook: removed local copy")
+		}(path, reason)
 	}
 	fsm.SetFileCallbacks(onRegister, onDelete)
 
@@ -2047,6 +2107,17 @@ func (c *Coordinator) IsLeader() bool {
 		return true // Standalone mode - this node is always the "leader"
 	}
 	return c.raftNode.IsLeader()
+}
+
+// LocalNodeID returns the local cluster node ID. Phase 4 uses this via
+// the CompactionBridge to set OriginNodeID on compacted-file Raft entries
+// so Phase 2/3's multi-peer resolver routes replica pulls back to the
+// compactor that produced the output.
+func (c *Coordinator) LocalNodeID() string {
+	if c.localNode == nil {
+		return ""
+	}
+	return c.localNode.ID
 }
 
 // LeaderAddr returns the address of the current Raft leader.

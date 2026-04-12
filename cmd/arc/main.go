@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"time"
 
@@ -574,6 +575,34 @@ func main() {
 	var hourlyScheduler *compaction.Scheduler
 	var dailyScheduler *compaction.Scheduler
 	var compactionManager *compaction.Manager
+	// Phase 4: build the compaction role gate from config. When clustering
+	// is enabled, only nodes with RoleCompactor actually run compaction —
+	// the gate is consulted at Scheduler.Start() and TriggerNow(). OSS and
+	// standalone deployments pass a nil gate (compactionGate below) and
+	// skip the role check entirely, preserving pre-Phase-4 behavior.
+	var compactionGate compaction.ClusterGate
+	if cfg.Cluster.Enabled {
+		compactionGate = newCompactionClusterGate(cfg.Cluster.Role)
+	}
+	// Phase 4: completion-manifest directory used by the cluster-mode
+	// subprocess → parent handoff. Empty in OSS (nil gate is what disables
+	// the handoff inside job.go via clusterMode()). Populated only when
+	// clustering + peer replication are BOTH enabled — that's when readers
+	// actually need the Raft manifest update to pull the compacted file.
+	//
+	// Security: explicitly create the base TempDirectory with 0700 perms
+	// BEFORE the inner .completion/pending subdirs. os.MkdirAll would
+	// otherwise create the base dir with umask'd perms (typically 0755),
+	// letting a co-located attacker inject completion manifests before the
+	// inner dir's 0700 closes the window. This is a no-op when the dir
+	// already exists with correct perms.
+	completionDir := ""
+	if cfg.Cluster.Enabled && cfg.Cluster.ReplicationEnabled {
+		if err := os.MkdirAll(cfg.Compaction.TempDirectory, 0o700); err != nil {
+			log.Fatal().Err(err).Str("dir", cfg.Compaction.TempDirectory).Msg("Failed to create compaction temp directory with 0700 perms")
+		}
+		completionDir = filepath.Join(cfg.Compaction.TempDirectory, ".completion", "pending")
+	}
 	if cfg.Compaction.Enabled {
 		// Build tiers
 		var tiers []compaction.Tier
@@ -620,25 +649,39 @@ func main() {
 			LockManager:     lockManager,
 			MaxConcurrent:   cfg.Compaction.MaxConcurrent,
 			MemoryLimit:     cfg.Database.MemoryLimit, // Use same limit as main DuckDB
+			CompletionDir:   completionDir,            // Phase 4: empty in OSS, set in cluster mode
 			SortKeysConfig:  sortKeysConfig,
 			DefaultSortKeys: defaultSortKeys,
 			Tiers:           tiers,
 			Logger:          logger.Get("compaction"),
 		})
 
-		// Cleanup orphaned temp directories from previous runs (e.g., pod crashes)
+		// Cleanup orphaned temp directories from previous runs (e.g., pod crashes).
+		// CleanupOrphanedTempDirs skips the Phase 4 reserved ".completion"
+		// subdirectory so a crash that left pending completion manifests on
+		// disk doesn't silently lose them on restart.
 		if err := compactionManager.CleanupOrphanedTempDirs(); err != nil {
 			log.Warn().Err(err).Msg("Failed to cleanup orphaned compaction temp directories")
+		}
+		// Phase 4: sweep completion manifests that are stuck in writing_output
+		// from a subprocess that crashed mid-upload. Manifests in later
+		// states (output_written, sources_deleted) are left alone so the
+		// watcher can still process them once it starts.
+		if completionDir != "" {
+			if err := compactionManager.CleanupOrphanedCompletionManifests(0); err != nil {
+				log.Warn().Err(err).Msg("Failed to cleanup orphaned completion manifests")
+			}
 		}
 
 		// Create hourly scheduler (if hourly tier is enabled)
 		if cfg.Compaction.HourlyEnabled {
 			hourlyScheduler, err = compaction.NewScheduler(&compaction.SchedulerConfig{
-				Manager:   compactionManager,
-				Schedule:  cfg.Compaction.HourlySchedule,
-				TierNames: []string{"hourly"},
-				Enabled:   true,
-				Logger:    logger.Get("compaction-hourly"),
+				Manager:     compactionManager,
+				Schedule:    cfg.Compaction.HourlySchedule,
+				TierNames:   []string{"hourly"},
+				Enabled:     true,
+				ClusterGate: compactionGate, // Phase 4: nil in OSS, role-check in cluster mode
+				Logger:      logger.Get("compaction-hourly"),
 			})
 			if err != nil {
 				log.Fatal().Err(err).Msg("Failed to create hourly compaction scheduler")
@@ -661,11 +704,12 @@ func main() {
 		// Create daily scheduler (if daily tier is enabled)
 		if cfg.Compaction.DailyEnabled {
 			dailyScheduler, err = compaction.NewScheduler(&compaction.SchedulerConfig{
-				Manager:   compactionManager,
-				Schedule:  cfg.Compaction.DailySchedule,
-				TierNames: []string{"daily"},
-				Enabled:   true,
-				Logger:    logger.Get("compaction-daily"),
+				Manager:     compactionManager,
+				Schedule:    cfg.Compaction.DailySchedule,
+				TierNames:   []string{"daily"},
+				Enabled:     true,
+				ClusterGate: compactionGate, // Phase 4: nil in OSS, role-check in cluster mode
+				Logger:      logger.Get("compaction-daily"),
 			})
 			if err != nil {
 				log.Fatal().Err(err).Msg("Failed to create daily compaction scheduler")
@@ -766,6 +810,11 @@ func main() {
 					Version:       Version,
 					APIAddress:    apiAddr,
 					Logger:        logger.Get("cluster"),
+					// Phase 4: surface the "no compactor elected" and
+					// "multiple compactors elected" warnings only when
+					// this deployment actually needs a compactor (cluster
+					// + peer replication + compaction all enabled).
+					WarnIfNoCompactor: cfg.Cluster.ReplicationEnabled && cfg.Compaction.Enabled,
 				})
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to initialize cluster coordinator - running in standalone mode")
@@ -842,6 +891,45 @@ func main() {
 							return nil
 						}, shutdown.PriorityBuffer)
 						log.Info().Msg("Cluster file manifest registrar enabled")
+
+						// Phase 4: start the compaction completion watcher on nodes that
+						// carry the compactor role. The watcher polls the local
+						// .completion/pending/ dir that compaction subprocesses write
+						// their handoff manifests to, and applies RegisterFile +
+						// DeleteFile to the Raft manifest via CompactionBridge.
+						//
+						// Only the compactor runs compaction, so only the compactor needs
+						// the watcher. Readers and writers that see an empty .completion
+						// dir do nothing, but we don't bother starting the watcher there
+						// because it would be a permanent no-op.
+						//
+						// Shutdown ordering: watcher stops at PriorityCompaction - 1 so
+						// it drains any pending manifests BEFORE the cluster coordinator
+						// tears down Raft. If the watcher stopped after Raft, the final
+						// RegisterFile calls would fail against a dead Raft node and the
+						// manifests would be lost.
+						if capabilities.CanCompact && completionDir != "" && cfg.Compaction.Enabled {
+							bridge := cluster.NewCompactionBridge(clusterCoordinator)
+							watcher, werr := compaction.NewCompletionWatcher(compaction.CompletionWatcherConfig{
+								Dir:          completionDir,
+								Bridge:       bridge,
+								PollInterval: 1 * time.Second,
+								ApplyTimeout: 5 * time.Second,
+								Logger:       logger.Get("compaction-watcher"),
+							})
+							if werr != nil {
+								log.Warn().Err(werr).Msg("Failed to construct compaction completion watcher")
+							} else {
+								watcher.Start(context.Background())
+								shutdownCoordinator.RegisterHook("compaction-completion-watcher", func(ctx context.Context) error {
+									watcher.Stop()
+									return nil
+								}, shutdown.PriorityCompaction-1)
+								log.Info().
+									Str("completion_dir", completionDir).
+									Msg("Phase 4 compaction completion watcher started")
+							}
+						}
 					}
 				}
 			}
@@ -1592,4 +1680,40 @@ func runCompactSubcommand(args []string) {
 		fmt.Fprintf(os.Stderr, "error: failed to encode result: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// compactionClusterGate implements compaction.ClusterGate by parsing the
+// local node's cluster role from config. It's constructed once at startup
+// with the role string — cfg.Cluster.Role — and the CanCompact check
+// consults the NodeRole capabilities the cluster package already exposes.
+//
+// This type sits in main.go (not in the cluster or compaction package) so
+// the compaction package has no compile-time dependency on the cluster
+// package, and the cluster package doesn't need to know about the
+// compaction scheduler. Both packages stay independent and the glue
+// lives at the one spot that already imports both — main.go.
+type compactionClusterGate struct {
+	role         cluster.NodeRole
+	capabilities cluster.RoleCapabilities
+}
+
+func newCompactionClusterGate(roleString string) *compactionClusterGate {
+	role := cluster.ParseRole(roleString)
+	return &compactionClusterGate{
+		role:         role,
+		capabilities: role.GetCapabilities(),
+	}
+}
+
+// CanCompact reports whether the local node's role has the compact
+// capability. Only RoleCompactor returns true in cluster mode — writers
+// and readers return false and the scheduler stays idle on those nodes.
+func (g *compactionClusterGate) CanCompact() bool {
+	return g.capabilities.CanCompact
+}
+
+// Role returns the node's role string for log messages. Never used for
+// authorization — CanCompact is authoritative.
+func (g *compactionClusterGate) Role() string {
+	return string(g.role)
 }

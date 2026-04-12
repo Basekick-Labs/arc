@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
@@ -30,6 +31,12 @@ type Manager struct {
 	MaxConcurrent int
 	TempDirectory string // Temp directory for compaction files
 	MemoryLimit   string // DuckDB memory limit for subprocess (e.g., "8GB")
+	// Phase 4: local-disk directory where compaction subprocesses write
+	// completion manifests for the parent-side CompletionWatcher to pick
+	// up. Empty means "OSS mode, no completion-manifest handoff". Set by
+	// the main wiring to filepath.Join(TempDirectory, ".completion", "pending")
+	// when clustering + replication are enabled.
+	CompletionDir string
 
 	// Sort key configuration (from ingest config)
 	SortKeysConfig  map[string][]string // measurement -> sort keys
@@ -70,6 +77,7 @@ type ManagerConfig struct {
 	MaxConcurrent   int
 	TempDirectory   string              // Temp directory for compaction files
 	MemoryLimit     string              // DuckDB memory limit for subprocess (e.g., "8GB")
+	CompletionDir   string              // Phase 4: local-disk completion-manifest dir (empty = OSS mode)
 	SortKeysConfig  map[string][]string // Per-measurement sort keys from ingest config
 	DefaultSortKeys []string            // Default sort keys from ingest config
 	Tiers           []Tier
@@ -118,6 +126,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		MaxConcurrent:   cfg.MaxConcurrent,
 		TempDirectory:   cfg.TempDirectory,
 		MemoryLimit:     cfg.MemoryLimit,
+		CompletionDir:   cfg.CompletionDir,
 		SortKeysConfig:  sortKeysConfig,
 		DefaultSortKeys: defaultSortKeys,
 		Tiers:           cfg.Tiers,
@@ -212,7 +221,15 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 	}
 	defer m.LockManager.ReleaseLock(lockKey)
 
-	// Build subprocess config
+	// Build subprocess config. JobID is generated here (not inside NewJob)
+	// so the parent and subprocess agree on the completion-manifest filename.
+	// The format matches NewJob's default to stay consistent with the
+	// existing temp-dir naming scheme used by CleanupOrphanedTempDirs.
+	jobID := fmt.Sprintf("%s_%s_%d",
+		candidate.Database,
+		strings.ReplaceAll(candidate.PartitionPath, "/", "_"),
+		time.Now().UnixNano(),
+	)
 	config := &SubprocessJobConfig{
 		Database:      candidate.Database,
 		Measurement:   candidate.Measurement,
@@ -225,6 +242,13 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 		SortKeys:      m.GetSortKeys(candidate.Measurement),
 		StorageType:   m.StorageBackend.Type(),
 		StorageConfig: m.StorageBackend.ConfigJSON(),
+		// Phase 4: cluster-mode fields. CompletionDir is empty in OSS
+		// (Manager.CompletionDir is never set), so the subprocess's
+		// clusterMode() returns false and no completion manifest is
+		// written — behavior is byte-identical to pre-Phase-4.
+		JobID:         jobID,
+		CompletionDir: m.CompletionDir,
+		PartitionTime: candidate.PartitionTime,
 	}
 
 	// Build extra environment variables for subprocess (storage credentials)
@@ -902,9 +926,24 @@ func (m *Manager) Stats() map[string]interface{} {
 	return stats
 }
 
+// reservedTempSubdirs are subdirectory names under TempDirectory that
+// CleanupOrphanedTempDirs must NOT delete. Phase 4 reserves ".completion"
+// for the local-disk CompletionManifest handoff: if the pod crashes
+// between a successful compaction and the watcher's Raft apply, the
+// completion manifest is the ONLY record that ties the compacted output
+// to the sources it replaced. Nuking it on restart would leak manifest
+// entries in the Raft FSM until operator intervention.
+var reservedTempSubdirs = map[string]struct{}{
+	".completion": {},
+}
+
 // CleanupOrphanedTempDirs removes orphaned temp directories from previous runs.
 // This handles cleanup after pod crashes where the defer cleanup didn't run.
 // Call this on startup before running compaction cycles.
+//
+// Phase 4: skips reserved subdirectories (see reservedTempSubdirs). Those are
+// managed by their own cleanup paths (e.g. CleanupOrphanedCompletionManifests)
+// and must not be treated as stale temp dirs.
 func (m *Manager) CleanupOrphanedTempDirs() error {
 	entries, err := os.ReadDir(m.TempDirectory)
 	if err != nil {
@@ -916,19 +955,96 @@ func (m *Manager) CleanupOrphanedTempDirs() error {
 
 	var cleaned int
 	for _, entry := range entries {
-		if entry.IsDir() {
-			path := filepath.Join(m.TempDirectory, entry.Name())
-			if err := os.RemoveAll(path); err != nil {
-				m.logger.Warn().Err(err).Str("dir", entry.Name()).Msg("Failed to cleanup orphaned temp directory")
-			} else {
-				m.logger.Info().Str("dir", entry.Name()).Msg("Cleaned up orphaned temp directory")
-				cleaned++
-			}
+		if !entry.IsDir() {
+			continue
+		}
+		if _, reserved := reservedTempSubdirs[entry.Name()]; reserved {
+			continue
+		}
+		path := filepath.Join(m.TempDirectory, entry.Name())
+		if err := os.RemoveAll(path); err != nil {
+			m.logger.Warn().Err(err).Str("dir", entry.Name()).Msg("Failed to cleanup orphaned temp directory")
+		} else {
+			m.logger.Info().Str("dir", entry.Name()).Msg("Cleaned up orphaned temp directory")
+			cleaned++
 		}
 	}
 
 	if cleaned > 0 {
 		m.logger.Info().Int("count", cleaned).Msg("Orphaned temp directories cleaned")
+	}
+	return nil
+}
+
+// CleanupOrphanedCompletionManifests sweeps the Phase 4 completion-manifest
+// directory for entries in state "writing_output" that are older than
+// orphanTimeout. These represent compaction subprocesses that started
+// writing a manifest but crashed before advancing to output_written — the
+// watcher will never pick them up (they're still in the initial state),
+// and leaving them on disk would cause confusing "stuck in writing_output"
+// log noise on every startup.
+//
+// Manifests in state output_written or sources_deleted are left alone no
+// matter how old they are — those are valid pending work that the watcher
+// needs to process, and aging them out would silently drop Raft manifest
+// updates the cluster needs.
+//
+// A zero or negative orphanTimeout means "use 10 minutes" so tests and
+// production agree on a safe default unless the operator explicitly tunes it.
+//
+// Safe to call multiple times. Safe when CompletionDir is empty (no-op).
+func (m *Manager) CleanupOrphanedCompletionManifests(orphanTimeout time.Duration) error {
+	if m.CompletionDir == "" {
+		return nil
+	}
+	if orphanTimeout <= 0 {
+		orphanTimeout = 10 * time.Minute
+	}
+
+	paths, err := listPendingCompletionManifests(m.CompletionDir)
+	if err != nil {
+		return fmt.Errorf("list pending completion manifests: %w", err)
+	}
+
+	cutoff := time.Now().Add(-orphanTimeout)
+	var swept, kept int
+	for _, path := range paths {
+		manifest, err := readCompletionManifest(path)
+		if err != nil {
+			// Unreadable manifests are suspicious but not this function's
+			// problem — log and leave them for operator inspection.
+			m.logger.Warn().Err(err).Str("path", path).Msg("Unreadable completion manifest during orphan sweep")
+			kept++
+			continue
+		}
+		// Only sweep manifests that are BOTH still in writing_output AND
+		// stale. Manifests in later states are pending watcher work.
+		if manifest.State != CompletionStateWritingOutput {
+			kept++
+			continue
+		}
+		if manifest.UpdatedAt.After(cutoff) {
+			kept++
+			continue
+		}
+		if err := deleteCompletionManifest(path); err != nil {
+			m.logger.Warn().Err(err).Str("path", path).Msg("Failed to delete orphaned completion manifest")
+			kept++
+			continue
+		}
+		m.logger.Info().
+			Str("job_id", manifest.JobID).
+			Time("updated_at", manifest.UpdatedAt).
+			Dur("age", time.Since(manifest.UpdatedAt)).
+			Msg("Swept orphaned completion manifest (stuck in writing_output)")
+		swept++
+	}
+
+	if swept > 0 {
+		m.logger.Info().
+			Int("swept", swept).
+			Int("kept", kept).
+			Msg("Orphaned completion manifest sweep completed")
 	}
 	return nil
 }
