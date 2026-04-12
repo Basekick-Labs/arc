@@ -306,8 +306,14 @@ func TestWatcher_ErrNotLeaderKeepsManifest(t *testing.T) {
 
 func TestWatcher_BridgeErrorKeepsManifestAndCounts(t *testing.T) {
 	dir := t.TempDir()
+	// Persistent error (repeated for multiple attempts including the
+	// shutdown drain pass) so the manifest is never removed.
 	bridge := &fakeBridge{
-		registerErrors: []error{errors.New("fake backend error")},
+		registerErrors: []error{
+			errors.New("fake backend error"),
+			errors.New("fake backend error"),
+			errors.New("fake backend error"),
+		},
 	}
 	w := newTestWatcher(t, dir, bridge)
 
@@ -339,8 +345,13 @@ func TestWatcher_BridgeErrorKeepsManifestAndCounts(t *testing.T) {
 
 func TestWatcher_DeleteFailureKeepsManifest(t *testing.T) {
 	dir := t.TempDir()
+	// Persistent error so the manifest survives the shutdown drain pass.
 	bridge := &fakeBridge{
-		deleteErrors: []error{errors.New("delete boom")},
+		deleteErrors: []error{
+			errors.New("delete boom"),
+			errors.New("delete boom"),
+			errors.New("delete boom"),
+		},
 	}
 	w := newTestWatcher(t, dir, bridge)
 

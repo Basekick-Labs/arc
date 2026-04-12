@@ -236,22 +236,27 @@ func (w *CompletionWatcher) loop() {
 	for {
 		select {
 		case <-w.ctx.Done():
-			// Final drain pass before exiting. If this pass hits ErrNotLeader
-			// or an error, the manifests stay on disk and the NEXT compactor
-			// start (same node or different) picks them up. This is the
-			// Phase 4 "eventually consistent on restart" guarantee.
-			w.poll()
+			// Final drain pass with a fresh context so bridge calls don't
+			// fail immediately with "context canceled". The 10s timeout
+			// bounds how long shutdown waits for the drain to finish. If
+			// this pass hits ErrNotLeader or an error, the manifests stay
+			// on disk and the NEXT compactor start picks them up.
+			drainCtx, drainCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			w.poll(drainCtx)
+			drainCancel()
 			return
 		case <-ticker.C:
-			w.poll()
+			w.poll(w.ctx)
 		}
 	}
 }
 
 // poll runs a single scan cycle: list pending manifests, apply each in
 // order, remove on success. Never panics; internal errors are logged and
-// counted but do not propagate out.
-func (w *CompletionWatcher) poll() {
+// counted but do not propagate out. The ctx argument is used for bridge
+// calls — during normal operation it's w.ctx; during shutdown drain it's
+// a fresh context with a bounded timeout.
+func (w *CompletionWatcher) poll(ctx context.Context) {
 	w.pollsTotal.Add(1)
 	defer w.lastPollAt.Store(time.Now().UnixNano())
 
@@ -268,16 +273,16 @@ func (w *CompletionWatcher) poll() {
 		// Check ctx between manifests so shutdown is responsive even on a
 		// large backlog. We don't check mid-apply because a single apply
 		// is bounded by ApplyTimeout and is expected to be sub-second.
-		if w.ctx.Err() != nil {
+		if ctx.Err() != nil {
 			return
 		}
-		w.applyOne(path)
+		w.applyOne(ctx, path)
 	}
 }
 
 // applyOne processes a single completion manifest: read, apply via bridge,
 // remove on success. On bridge error leaves the manifest in place.
-func (w *CompletionWatcher) applyOne(path string) {
+func (w *CompletionWatcher) applyOne(ctx context.Context, path string) {
 	manifest, err := readCompletionManifest(path)
 	if err != nil {
 		w.logger.Warn().Err(err).Str("path", path).Msg("Failed to read completion manifest; leaving in place")
@@ -328,7 +333,7 @@ func (w *CompletionWatcher) applyOne(path string) {
 		if alreadyRegistered {
 			break // Already applied on a previous tick; skip to delete phase.
 		}
-		applyCtx, cancel := context.WithTimeout(w.ctx, w.cfg.ApplyTimeout)
+		applyCtx, cancel := context.WithTimeout(ctx, w.cfg.ApplyTimeout)
 		err := w.cfg.Bridge.RegisterCompactedFile(applyCtx, CompactedFile{
 			Path:          output.Path,
 			SHA256:        output.SHA256,
@@ -382,7 +387,7 @@ func (w *CompletionWatcher) applyOne(path string) {
 	}
 
 	for _, source := range manifest.DeletedSources {
-		applyCtx, cancel := context.WithTimeout(w.ctx, w.cfg.ApplyTimeout)
+		applyCtx, cancel := context.WithTimeout(ctx, w.cfg.ApplyTimeout)
 		err := w.cfg.Bridge.DeleteCompactedSource(applyCtx, source, fmt.Sprintf("compaction:%s", manifest.JobID))
 		cancel()
 		w.deleteCalls.Add(1)

@@ -256,6 +256,27 @@ func (j *Job) Run(ctx context.Context) error {
 		Int("file_count", len(j.Files)).
 		Msg("Starting compaction job")
 
+	// Phase 4: write an initial completion manifest in writing_output state.
+	// This marks the job as in-progress so CleanupOrphanedCompletionManifests
+	// can sweep it if the subprocess crashes before reaching output_written.
+	if j.clusterMode() {
+		m := &CompletionManifest{
+			JobID:         j.JobID,
+			Database:      j.Database,
+			Measurement:   j.Measurement,
+			PartitionPath: j.PartitionPath,
+			Tier:          j.Tier,
+			State:         CompletionStateWritingOutput,
+			CreatedAt:     time.Now().UTC(),
+			UpdatedAt:     time.Now().UTC(),
+		}
+		if err := writeCompletionManifest(j.CompletionDir, m); err != nil {
+			j.logger.Warn().Err(err).Msg("Phase 4: failed to write writing_output manifest (non-fatal)")
+			// Non-fatal — the job can still succeed, just orphan cleanup
+			// won't know about this job if the subprocess crashes.
+		}
+	}
+
 	// Create temp directory for this job using configured base path
 	tempDir := filepath.Join(j.TempDirectory, j.JobID)
 	if err := os.MkdirAll(tempDir, 0700); err != nil {

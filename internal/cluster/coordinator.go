@@ -490,15 +490,6 @@ func (c *Coordinator) Stop() error {
 		c.puller = nil
 	}
 
-	// Drain and stop the bounded delete workers. Close the channel to
-	// signal workers to exit, then wait for them to finish any in-flight
-	// deletes. Workers respect c.ctx cancellation for the grace period.
-	if c.deleteQueue != nil {
-		close(c.deleteQueue)
-		c.deleteWg.Wait()
-		c.deleteQueue = nil
-	}
-
 	// Close the cached leader-forwarding connection.
 	c.forwardConnMu.Lock()
 	if c.forwardConn != nil {
@@ -515,11 +506,22 @@ func (c *Coordinator) Stop() error {
 		}
 	}
 
-	// Stop Raft node if running (Phase 3)
+	// Stop Raft node BEFORE closing the delete queue. The onDelete
+	// callback fires synchronously from the Raft FSM apply path — if
+	// we close the channel while Raft is still running, a late
+	// DeleteFile commit would send to a closed channel and panic.
 	if c.raftNode != nil {
 		if err := c.raftNode.Stop(); err != nil {
 			c.logger.Error().Err(err).Msg("Error stopping Raft node")
 		}
+	}
+
+	// Now safe to close the delete queue — Raft is stopped, no more
+	// FSM callbacks will fire.
+	if c.deleteQueue != nil {
+		close(c.deleteQueue)
+		c.deleteWg.Wait()
+		c.deleteQueue = nil
 	}
 
 	// Stop health checker
@@ -1794,16 +1796,17 @@ func (c *Coordinator) startFilePullerLocked() error {
 				Msg("Phase 4 local delete queue full; dropping (will reconcile on restart)")
 		}
 	}
-	fsm.SetFileCallbacks(onRegister, onDelete)
-
-	// Start the bounded delete-worker pool for onFileDeleted callbacks.
-	// Workers drain the queue with a 500ms grace period per item so
-	// in-flight queries can finish reading the file before it's unlinked.
+	// Initialize the delete-worker pool BEFORE registering FSM callbacks.
+	// The callbacks fire synchronously from Raft apply — if a DeleteFile
+	// command arrives between SetFileCallbacks and queue init, the
+	// onDelete closure would send to a nil channel.
 	c.deleteQueue = make(chan deleteRequest, deleteQueueSize)
 	for i := 0; i < deleteWorkerCount; i++ {
 		c.deleteWg.Add(1)
 		go c.runDeleteWorker()
 	}
+
+	fsm.SetFileCallbacks(onRegister, onDelete)
 
 	// Start the puller workers.
 	puller.Start(context.Background())
