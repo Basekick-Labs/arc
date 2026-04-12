@@ -153,15 +153,12 @@ func TestWatcher_HappyPath_OutputWrittenThenSourcesDeleted(t *testing.T) {
 	// Wait briefly for at least one poll cycle.
 	time.Sleep(50 * time.Millisecond)
 
-	// RegisterCompactedFile MUST have been called at least once (proving
-	// the watcher saw the output_written state). The watcher re-polls the
-	// manifest on every tick while it's in output_written state and calls
-	// RegisterCompactedFile each time — that's fine because the FSM
-	// handler is idempotent. What matters is that deletes have NOT been
-	// issued (the manifest hasn't advanced to sources_deleted yet) and
-	// the manifest is still on disk (not prematurely removed).
-	if bridge.registerCount.Load() < 1 {
-		t.Errorf("register calls after output_written: got %d, want >= 1", bridge.registerCount.Load())
+	// RegisterCompactedFile MUST have been called exactly once (proving
+	// the watcher saw the output_written state and applied it). The
+	// in-memory dedup tracker prevents redundant Raft traffic on
+	// subsequent ticks while the manifest stays in output_written state.
+	if bridge.registerCount.Load() != 1 {
+		t.Errorf("register calls after output_written: got %d, want 1 (dedup should prevent re-apply)", bridge.registerCount.Load())
 	}
 	if bridge.deleteCount.Load() != 0 {
 		t.Errorf("delete calls after output_written: got %d, want 0", bridge.deleteCount.Load())
@@ -196,11 +193,12 @@ func TestWatcher_HappyPath_OutputWrittenThenSourcesDeleted(t *testing.T) {
 	if _, err := readCompletionManifest(filepath.Join(dir, m.JobID+".json")); err == nil {
 		t.Error("manifest should have been removed after successful apply")
 	}
-	// One-shot happy path: register called exactly once across both ticks.
-	// (The watcher re-applies RegisterCompactedFile on each pickup, which
-	// is fine because the FSM handler is idempotent.)
-	if bridge.registerCount.Load() < 2 {
-		t.Errorf("register calls total: got %d, expected at least 2 (once per tick until applied)", bridge.registerCount.Load())
+	// Register called exactly once across both state transitions: the
+	// dedup tracker prevents re-application when the manifest is still
+	// in output_written, and the sources_deleted tick skips register
+	// because it was already applied.
+	if bridge.registerCount.Load() != 1 {
+		t.Errorf("register calls total: got %d, want 1 (dedup prevents re-apply)", bridge.registerCount.Load())
 	}
 }
 

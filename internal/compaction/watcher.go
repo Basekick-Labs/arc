@@ -125,6 +125,14 @@ type CompletionWatcher struct {
 	mu      sync.Mutex
 	started bool
 
+	// registeredOutputs tracks job IDs whose RegisterCompactedFile has
+	// already been applied while the manifest was in output_written state.
+	// This prevents redundant Raft traffic on every poll tick while
+	// waiting for the subprocess to advance the manifest to
+	// sources_deleted. The set is cleared when the manifest is removed
+	// (sources_deleted applied) or on watcher restart.
+	registeredOutputs map[string]struct{}
+
 	// Metrics (atomic for lock-free observability via Stats)
 	pollsTotal         atomic.Int64 // total scan cycles attempted
 	manifestsSeen      atomic.Int64 // manifests observed across all polls
@@ -152,8 +160,9 @@ func NewCompletionWatcher(cfg CompletionWatcherConfig) (*CompletionWatcher, erro
 		cfg.ApplyTimeout = 5 * time.Second
 	}
 	return &CompletionWatcher{
-		cfg:    cfg,
-		logger: cfg.Logger.With().Str("component", "compaction-completion-watcher").Logger(),
+		cfg:               cfg,
+		logger:            cfg.Logger.With().Str("component", "compaction-completion-watcher").Logger(),
+		registeredOutputs: make(map[string]struct{}),
 	}, nil
 }
 
@@ -285,6 +294,14 @@ func (w *CompletionWatcher) applyOne(path string) {
 		return
 	}
 
+	// Skip RegisterCompactedFile if we already applied it for this job on
+	// a previous tick. This happens when the manifest is in output_written
+	// state: the register succeeds, but we leave the manifest in place
+	// waiting for the subprocess to advance to sources_deleted. Without
+	// this check, every poll tick would re-issue the same RegisterFile
+	// commands (idempotent but wasteful Raft traffic).
+	_, alreadyRegistered := w.registeredOutputs[manifest.JobID]
+
 	// Apply RegisterCompactedFile for every output. We do these first because
 	// DeleteFile for sources is only safe AFTER the replacement is durable
 	// in the cluster manifest — otherwise a reader could see the source as
@@ -308,6 +325,9 @@ func (w *CompletionWatcher) applyOne(path string) {
 	// path; the leader-flap test exercises the retry path with the same
 	// FSM. Both would catch an accidental break of this contract.
 	for _, output := range manifest.Outputs {
+		if alreadyRegistered {
+			break // Already applied on a previous tick; skip to delete phase.
+		}
 		applyCtx, cancel := context.WithTimeout(w.ctx, w.cfg.ApplyTimeout)
 		err := w.cfg.Bridge.RegisterCompactedFile(applyCtx, CompactedFile{
 			Path:          output.Path,
@@ -340,6 +360,12 @@ func (w *CompletionWatcher) applyOne(path string) {
 				Msg("Bridge RegisterCompactedFile failed; leaving manifest for retry")
 			return
 		}
+	}
+
+	// Mark that we've applied RegisterFile for this job so subsequent
+	// ticks skip the redundant Raft calls.
+	if !alreadyRegistered {
+		w.registeredOutputs[manifest.JobID] = struct{}{}
 	}
 
 	// Only advance to DeleteFile once the subprocess has confirmed the
@@ -386,6 +412,9 @@ func (w *CompletionWatcher) applyOne(path string) {
 		w.applyErrors.Add(1)
 		return
 	}
+	// Clean up the in-memory dedup tracker — the manifest is gone from
+	// disk so no future tick will see it.
+	delete(w.registeredOutputs, manifest.JobID)
 	w.manifestsApplied.Add(1)
 	w.logger.Info().
 		Str("job_id", manifest.JobID).

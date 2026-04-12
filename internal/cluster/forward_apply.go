@@ -8,9 +8,9 @@ package cluster
 // This file holds the client-side (forwardApplyToLeader, called from any
 // non-leader coordinator method that needs to write to Raft) and the
 // server-side (handleForwardApply, dispatched from handlePeerConnection).
-// Both sides use the existing security.ComputeHMAC / security.ValidateHMAC
-// helpers — leader forwarding is a "trusted-peer" operation, not a
-// per-resource one, so the path-bound HMAC variant isn't needed.
+// Both sides use security.ComputeForwardHMAC / security.ValidateForwardHMAC
+// which bind the command payload into the signed material, preventing
+// on-wire command swapping even without TLS.
 //
 // Background and rationale: Phase 1 introduced the manifest with a
 // silent-skip on non-leader writers (coordinator.go's RegisterFileInManifest
@@ -109,16 +109,17 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 		return fmt.Errorf("forward apply: marshal command: %w", err)
 	}
 
-	// Build the HMAC-authenticated request. Same {nonce, nodeID,
-	// clusterName, timestamp} payload as the join handshake — leader
-	// forwarding is a trusted-peer operation, not a per-resource one,
-	// so the path-bound fetch HMAC variant isn't appropriate here.
+	// Build the HMAC-authenticated request. The HMAC covers the command
+	// payload (via SHA-256 digest) so an on-wire attacker cannot swap
+	// the command body while keeping the same MAC. This uses
+	// ComputeForwardHMAC which binds {nonce, nodeID, clusterName,
+	// sha256(cmdJSON), timestamp} into the signed material.
 	nonce, err := security.GenerateNonce()
 	if err != nil {
 		return fmt.Errorf("forward apply: generate nonce: %w", err)
 	}
 	ts := time.Now().Unix()
-	mac := security.ComputeHMAC(c.cfg.SharedSecret, nonce, c.localNode.ID, c.cfg.ClusterName, ts)
+	mac := security.ComputeForwardHMAC(c.cfg.SharedSecret, nonce, c.localNode.ID, c.cfg.ClusterName, cmdJSON, ts)
 
 	req := &protocol.ForwardApplyRequest{
 		CommandJSON: cmdJSON,
@@ -186,17 +187,17 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	defer conn.Close()
 	remoteAddr := conn.RemoteAddr().String()
 
-	// HMAC validation. Uses the join-handshake variant (no path binding)
-	// because the embedded command's contents are trusted between cluster
-	// peers — the HMAC's job is "this is a known peer" not "this peer is
-	// allowed to apply this specific command".
+	// HMAC validation. Uses the payload-bound variant (ComputeForwardHMAC)
+	// that includes SHA-256(CommandJSON) in the signed material. This
+	// prevents an on-wire attacker from swapping the command payload while
+	// keeping the same MAC, even without TLS.
 	if c.cfg.SharedSecret == "" {
 		c.sendForwardApplyError(conn, protocol.ForwardCodeAuth, "leader has no shared_secret configured")
 		return
 	}
-	if err := security.ValidateHMAC(
+	if err := security.ValidateForwardHMAC(
 		c.cfg.SharedSecret, req.Nonce, req.NodeID, c.cfg.ClusterName,
-		req.Timestamp, req.HMAC, 5*time.Minute,
+		req.CommandJSON, req.Timestamp, req.HMAC, 5*time.Minute,
 	); err != nil {
 		c.logger.Warn().
 			Err(err).
@@ -210,6 +211,25 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	if c.raftNode == nil {
 		c.sendForwardApplyError(conn, protocol.ForwardCodeRaftUnavailable, "raft not initialized")
 		return
+	}
+
+	// Authorization: ensure the requesting node's role is allowed to
+	// mutate the file manifest. Only writers (CanIngest — flush path)
+	// and compactors (CanCompact — compaction bridge) legitimately
+	// forward RegisterFile/DeleteFile commands. A compromised reader
+	// node should not be able to use its shared-secret credential to
+	// delete files from the cluster manifest.
+	if peerNode, ok := c.registry.Get(req.NodeID); ok {
+		caps := peerNode.Role.GetCapabilities()
+		if !caps.CanIngest && !caps.CanCompact {
+			c.logger.Warn().
+				Str("peer", remoteAddr).
+				Str("requesting_node", req.NodeID).
+				Str("role", string(peerNode.Role)).
+				Msg("ForwardApply rejected: node role not authorized for manifest mutations")
+			c.sendForwardApplyError(conn, protocol.ForwardCodeAuth, "unauthorized role")
+			return
+		}
 	}
 
 	// Confirm we're STILL the leader. The caller forwarded to us because
