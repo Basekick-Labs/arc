@@ -38,7 +38,7 @@ func NewNonceCache(ttl time.Duration) *NonceCache {
 // Returns false if the same (nodeID, nonce) pair was already seen within
 // the TTL window — the caller should reject the request as a replay.
 func (nc *NonceCache) Track(nodeID, nonce string) bool {
-	key := nodeID + ":" + nonce
+key := nodeID + "\x00" + nonce
 	now := time.Now()
 	expiry := now.Add(nc.ttl).UnixNano()
 
