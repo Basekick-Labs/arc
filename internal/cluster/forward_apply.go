@@ -139,6 +139,9 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 		return fmt.Errorf("forward apply: %w", err)
 	}
 
+	c.forwardMu.Lock()
+	defer c.forwardMu.Unlock()
+
 	// Set a per-call deadline on the shared connection.
 	roundTripDeadline := time.Now().Add(forwardApplyTimeout)
 	if deadline, ok := ctx.Deadline(); ok && deadline.Before(roundTripDeadline) {
