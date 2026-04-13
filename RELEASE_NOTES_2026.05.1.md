@@ -51,6 +51,10 @@ In clustered deployments, compaction now runs on exactly one node to prevent dup
 | `completion_dir` | auto-derived | Local directory for subprocess → parent handoff |
 | `completion_orphan_timeout_ms` | `600000` | Sweep stale manifests from crashed subprocesses |
 
+### Cluster Health Detection via Heartbeats (Enterprise)
+
+Cluster nodes now exchange periodic heartbeat messages over the coordinator protocol. The health checker uses heartbeat freshness to detect unresponsive peers — nodes that miss 3 consecutive heartbeats (~15s) are marked unhealthy, enabling automatic failover for both writers and compactors. Self-reported node state is propagated alongside heartbeats so peers can detect degraded nodes that are still reachable but unable to serve.
+
 ### Cluster TLS Encryption and Shared Secret Authentication (Enterprise)
 
 Arc Enterprise clustering now supports encrypted inter-node communication and authenticated cluster joins — bringing production-grade security to multi-node deployments.
