@@ -157,6 +157,55 @@ func (r *Registry) Get(nodeID string) (*Node, bool) {
 	return node.Clone(), true
 }
 
+// RecordHeartbeat updates the LastHeartbeat on the real node in the registry
+// (not a clone). This is called from handleHeartbeat when a peer sends us
+// a heartbeat message. Node.RecordHeartbeat is thread-safe via the node's
+// internal mutex.
+func (r *Registry) RecordHeartbeat(nodeID string, stats NodeStats) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	node, exists := r.nodes[nodeID]
+	if !exists {
+		return false
+	}
+	node.RecordHeartbeat(stats)
+	return true
+}
+
+// UpdateNodeState updates the state of the real node in the registry.
+// Called from handleHeartbeat to propagate the peer's self-reported state.
+func (r *Registry) UpdateNodeState(nodeID string, state NodeState) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if node, exists := r.nodes[nodeID]; exists {
+		node.UpdateState(state)
+	}
+}
+
+// GetLastHeartbeat returns the LastHeartbeat timestamp of the real node in
+// the registry. Returns zero time if the node doesn't exist.
+func (r *Registry) GetLastHeartbeat(nodeID string) time.Time {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	node, exists := r.nodes[nodeID]
+	if !exists {
+		return time.Time{}
+	}
+	return node.GetLastHeartbeat()
+}
+
+// ProcessHealthCheck runs a health check result against the real node in the
+// registry (not a clone). Returns the state transition if any occurred.
+func (r *Registry) ProcessHealthCheck(nodeID string, healthy bool, unhealthyThreshold, deadThreshold int) *StateTransition {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	node, exists := r.nodes[nodeID]
+	if !exists {
+		return nil
+	}
+	return node.ProcessHealthCheckResult(healthy, unhealthyThreshold, deadThreshold)
+}
+
 // filterNodes returns cloned nodes that match the predicate.
 // This is a helper to reduce code duplication across Get* methods.
 func (r *Registry) filterNodes(predicate func(*Node) bool) []*Node {

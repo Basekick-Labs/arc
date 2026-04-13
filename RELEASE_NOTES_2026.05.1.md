@@ -10,133 +10,50 @@ The `?p=` method continues to work but Arc now logs a one-time warning on first 
 
 ## New Features
 
-### Cluster File Manifest (Enterprise — Foundation for Peer Replication)
+### Peer File Replication (Enterprise)
 
-Arc Enterprise now maintains a cluster-wide file manifest in the Raft FSM. Every Parquet file flushed by a writer (or produced by compaction) is announced to the cluster via a new Raft command, producing an authoritative view of all files known to the cluster. This is the foundation for peer-to-peer file replication in bare-metal and VM deployments where nodes have their own local storage.
+Arc Enterprise clusters now replicate Parquet files between nodes automatically. When a writer flushes a file, all other nodes pull the bytes from the origin peer (or any healthy peer that already has a copy) and write them to their own local storage. This enables bare-metal, VM, and edge deployments where each node has its own local SSDs and shared storage (S3, MinIO, Azure) is not available.
 
-**What this delivers today:**
-- New Raft commands `CommandRegisterFile` and `CommandDeleteFile` added to `ClusterFSM`
-- File manifest persisted in Raft snapshots and replicated to all cluster members via standard Raft consensus
-- New API endpoint `GET /api/v1/cluster/files` returns the complete cluster file manifest (supports `?database=<name>` filter)
-- Async, non-blocking registration from the flush path — the file registrar enqueues entries and a background worker appends to Raft, so write latency is unaffected
-- Zero overhead for OSS / standalone deployments — no coordinator, no registrar, no manifest
+Every file is SHA-256 hashed at flush time and the hash is committed into a Raft-backed cluster manifest. Receivers verify the hash after download — checksum mismatches trigger automatic retry. When a node starts (or restarts), it walks the manifest and catches up on any files it missed, pulling from whichever healthy peer has them. The original writer doesn't need to be alive.
 
-### Peer File Replication (Enterprise — Phase 2)
+- Non-leader nodes forward manifest commands to the Raft leader automatically — no silent data loss if the writer isn't the Raft leader.
+- `GET /api/v1/cluster/files` returns the full cluster manifest (supports `?database=` filter).
+- Replication status and catch-up progress are surfaced via `/api/v1/cluster/status`.
+- Zero overhead for OSS / standalone deployments.
 
-Building on the cluster file manifest, Arc Enterprise now replicates **actual Parquet bytes** between cluster nodes. When a writer flushes a file, readers automatically pull the bytes from the origin peer over the existing coordinator TCP protocol and write them to their own local storage backend. This unlocks bare-metal, VM, and edge deployments where each node has its own local SSDs and shared storage (S3, MinIO, Azure) is not available — on-prem, aerospace, defense, and edge use cases.
+**Configuration** (`ARC_CLUSTER_REPLICATION_*` env vars or `cluster.replication_*` in `arc.toml`):
 
-**How it works:**
-- Every flushed Parquet file is SHA-256 hashed on the writer (on the in-memory buffer, before writing to the backend) and the hash is committed into the Raft manifest alongside the file metadata. Every node in the cluster learns the authoritative hash as soon as the Raft log replicates.
-- On each non-origin node, an `onFileRegistered` callback fires from the FSM when a new entry commits. A background `Puller` worker pool enqueues a fetch, skipping files that originated on the local node or already exist on the local backend.
-- Workers dial the origin peer using the cluster's existing TLS-wrapped coordinator connection and send a new `MsgFetchFile` request, authenticated with an HMAC that binds `{nonce, nodeID, clusterName, path, timestamp}` — including the path prevents a stolen MAC from being replayed to fetch a different file within the freshness window.
-- The origin validates the HMAC, sanitizes the path, confirms the file is in the cluster manifest (so peers cannot request arbitrary local files), and streams the body directly over the connection.
-- The puller streams body bytes through an `io.MultiWriter` tee into a `sha256.New()` hasher while writing into the local backend via `WriteReader`, and compares the computed hash against the manifest hash before accepting the file. On mismatch the partial file is deleted and the fetch retries.
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `replication_enabled` | `false` | Master switch; requires `shared_secret` |
+| `replication_pull_workers` | `4` | Concurrent fetch workers per node |
+| `replication_queue_size` | `1024` | Bounded queue; excess entries reconciled on restart |
+| `replication_fetch_timeout_ms` | `60000` | Per-fetch timeout (puller side) |
+| `replication_serve_timeout_ms` | `120000` | Body-stream timeout (origin side) |
+| `replication_retry_max_attempts` | `3` | Retry attempts before dropping an entry |
+| `replication_catchup_enabled` | `true` | Startup catch-up; disable for emergency |
+| `replication_catchup_barrier_timeout_ms` | `10000` | Raft barrier timeout before walking |
 
-**Configuration** (defaults shown, set via `ARC_CLUSTER_REPLICATION_*` env vars or `cluster.replication_*` in `arc.toml`):
-- `replication_enabled` — master switch; requires `cluster.shared_secret` to be set
-- `replication_pull_workers = 4` — concurrent fetch workers per node
-- `replication_queue_size = 1024` — bounded queue; excess entries are dropped with a rate-limited warning and reconciled later
-- `replication_fetch_timeout_ms = 60000` — puller-side per-fetch timeout
-- `replication_serve_timeout_ms = 120000` — origin-side body-stream timeout; raise for large Parquet files or slow links
-- `replication_retry_max_attempts = 3` — immediate retry attempts before dropping the entry
+### Dedicated Compactor Role with Automatic Failover (Enterprise)
 
-**Security:**
-- Peer replication is gated by `FeatureClustering` — a user without an enterprise license cannot construct the puller.
-- Shared secret is required at startup; Arc refuses to boot if `replication_enabled=true` and `shared_secret` is empty.
-- All fetch traffic flows over the cluster coordinator port (not the public API port), physically isolating replication bytes from client traffic.
-- When `cluster.tls_enabled=true`, the fetch client reuses the cluster TLS config for end-to-end encryption.
+In clustered deployments, compaction now runs on exactly one node to prevent duplicate outputs on shared storage and eliminate redundant CPU/IO work across nodes.
 
-**Scope of Phase 2:** async replication only. Phase 2 does **not** include: resume via HTTP Range, catch-up for nodes joining with existing data, quorum durability, multi-peer fanout, or compaction-aware routing. These land in Phases 3–5.
+- Set `ARC_CLUSTER_ROLE=compactor` on one node. Writers and readers automatically gate their compaction schedulers. OSS deployments are unaffected — compaction runs unconditionally.
+- Compacted outputs are registered in the Raft manifest and replicated to all peers automatically.
+- **Automatic failover**: when `cluster.failover_enabled=true`, the Raft leader monitors the active compactor and reassigns it to another healthy node after ~30s of unresponsiveness. No restart required. Prefers compactor-role nodes, falls back to writers. 60s cooldown prevents rapid cycling.
+- Health warnings surface when no compactor is elected or when multiple compactors are configured (misconfiguration that re-introduces duplicate outputs).
 
-**Design inspiration:** ClickHouse's ReplicatedMergeTree model — a Raft-equivalent op log + HTTP-pull-based file transfer. Research compared InfluxDB Enterprise (anti-entropy + HHQ), ClickHouse (log + HTTP pull), TimescaleDB (deprecated multi-node), Apache Pinot (peer fetcher fallback), and Apache Druid (metadata-driven assignment). ClickHouse's model is the cleanest fit for Arc's existing Raft + coordinator TCP infrastructure.
+**Compaction configuration** (`ARC_COMPACTION_*` env vars):
 
-### Peer File Replication — Catch-up on Join (Enterprise — Phase 3)
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `completion_watcher_interval_ms` | `1000` | How often the watcher scans for pending manifests |
+| `completion_dir` | auto-derived | Local directory for subprocess → parent handoff |
+| `completion_orphan_timeout_ms` | `600000` | Sweep stale manifests from crashed subprocesses |
 
-Phase 2 replicated files reactively — a node only pulled files that committed to Raft while its puller was running. That left two fatal gaps on Kubernetes: (1) a node that was down when a file was flushed never got the callback and had the file missing on restart, and (2) a brand-new reader joining a cluster with existing data received the Raft log but couldn't pull anything because `entry.OriginNodeID` often pointed to a pod that had been rescheduled and no longer existed. Queries against such nodes silently returned incomplete results.
+### Cluster Health Detection via Heartbeats (Enterprise)
 
-Phase 3 closes both gaps with a **startup reconciliation walker** and a **multi-peer fallback resolver**. A node that comes online now converges on the manifest within a bounded time, regardless of whether the original writer is still in the cluster.
-
-**How it works:**
-- After the puller starts, the coordinator spawns a background goroutine — guarded by `sync.Once` so it runs exactly once per coordinator lifetime — that waits for a Raft leader, issues a new `Node.Barrier` wrapper over `hraft.Raft.Barrier` so the local FSM reflects every committed entry, then feeds `fsm.GetAllFiles()` through a new `Puller.RunCatchUp` method. On `WaitForLeader` or `Barrier` timeout the walker proceeds against the follower's possibly-stale view — better a partial walk than no walk, and the reactive FSM callback path catches anything the walker missed as it applies.
-- The walker enqueues each manifest entry through the existing Phase 2 worker pool, so all the Phase 2 retry, backoff, checksum verification, and metrics apply automatically — catch-up is data flowing through the same code path as reactive pulls.
-- A per-path **inflight set** on the puller deduplicates enqueues: if the walker and a reactive FSM callback both try to enqueue path X during a write committing mid-walk, only the first call queues the entry and the rest are counted as `skipped_dup`. The slot is released via `defer` inside `processEntry` so the set stays bounded even on worker panic.
-- **Queue-depth backpressure** — when the queue is above `replication_catchup_queue_high_water` (default 0.8), the walker sleeps 50ms between enqueues to let workers drain. Prevents thundering-herd drop storms on large manifests without needing a second worker pool.
-
-**Multi-peer fallback resolver:** the Phase 2 `PeerResolver` interface returned a single `(addr, ok)` pair for the origin. Phase 3 changes it to `ResolvePeers(originNodeID, path string) []string` — the resolver takes just the two fields it needs (no `*raft.FileEntry` coupling), and returns an **ordered list**: origin first (if still healthy), then every other healthy peer excluding self. The `path` parameter is part of the signature so Phase 4+ can add shard-aware or compactor-aware routing without changing the interface; Phase 3 ignores it.
-
-The puller iterates the list within a single attempt and falls through to the next candidate on any per-peer failure **except** checksum mismatch. A corrupt body from peer-1 is a data integrity signal, not a "try another peer" signal — if the puller fell through on checksum mismatch it would pull-and-corrupt from every healthy peer in turn. `ErrChecksumMismatch` breaks out of the per-attempt peer loop and the attempt-level retry handles it via the existing delete-and-redownload path.
-
-**Typed ack error codes** — the ack header gained a new `protocol.AckErrorCode` typed field with constants (`AckCodeNotFound`, `AckCodeManifest`, `AckCodeAuth`, `AckCodeBackend`, `AckCodeRaft`, `AckCodeInvalidPath`) so the puller can distinguish "peer doesn't have this file" from "peer rejected me" without substring matching:
-
-| Code | Puller behavior |
-|---|---|
-| `not_found` / `manifest` | Fall through to next peer |
-| `auth` / `backend` / `raft` / `invalid_path` | Fail attempt (don't fall through) |
-
-The `Code` field is a JSON `omitempty` addition — **backward compatible** with Phase 2 peers. When `Code` is empty (Phase 2 peer), the client falls back to **exact-match** (not substring — an adversary can't craft an error string like `"file not found on local backend: /etc/passwd"` to confuse the check) against `protocol.ErrMsgFileNotInManifest` / `protocol.ErrMsgFileNotFound`. Both the typed codes and the Phase 2 fallback strings live together in `internal/cluster/protocol/messages.go` so a refactor of either touches both sites at once.
-
-**Configuration** (set via `ARC_CLUSTER_REPLICATION_CATCHUP_*` env vars or `cluster.replication_catchup_*` in `arc.toml`):
-- `replication_catchup_enabled = true` — master switch; disable as an emergency kill-switch on pathologically large manifests
-- `replication_catchup_barrier_timeout_ms = 10000` — Raft barrier timeout before walking
-- `replication_catchup_queue_high_water = 0.8` — walker pauses enqueueing when the queue is above this fraction
-
-No new worker-count knob — catch-up shares the Phase 2 `replication_pull_workers` pool.
-
-**Observability:** `Puller.Stats()` grew new counters surfaced through the coordinator:
-- `catchup_started_at` / `catchup_completed_at` (unix seconds; the latter goes non-zero once the walker has finished its pass, not once all queued pulls have drained)
-- `catchup_entries_walked` / `catchup_enqueued` / `catchup_skipped_local`
-- `skipped_dup` (new — counts Phase 3 dedup skips)
-
-New `Coordinator.ReplicationCatchUpStatus()` returns the catch-up-specific stats as a JSON-serializable map intended for `/api/v1/cluster/status`. New `Coordinator.ReplicationReady()` returns `true` once the walker has completed its pass — not currently consumed (queries can hit a node during catch-up and see eventually-consistent results), but Phase 5 will use it to hard-gate the query path so the accessor lands now and avoids another coordinator surface change later. Operators can use the status endpoint for external readiness probes in the meantime.
-
-**Security review:**
-- Multi-peer fallback expands the set of trusted peers from `OriginNodeID` to any healthy cluster member — but all peers are already mutually authenticated via shared secret + TLS, and the Phase 2 path-bound HMAC is preserved so a stolen MAC still can't fetch a different file. Regression-tested.
-- Checksum mismatch short-circuit is tested explicitly (`TestPullerMultiPeerChecksumMismatchDoesNotFallThrough`) to lock in the "one corrupt peer can't force every reader to pull-and-corrupt" invariant.
-- Every `sendFetchError` call site uses a typed `AckErrorCode` constant — no path where user input flows into `Code`.
-
-**Scope of Phase 3:** startup-only reconciliation with any-peer fallback. Phase 3 does **not** include: periodic reconciliation (reactive callbacks handle steady-state drift), orphan detection (Phase 4 compaction concern), paginated FSM walks (accepted O(N) snapshot copy — emergency kill-switch exists for 10M+ file deployments), hard query gating (Phase 5), bandwidth caps (Phase 5), or HTTP Range resume (Phase 5).
-
-**What's coming next** (separate PRs):
-- Phase 5: Optional write quorum for strong durability, hard query gating on catch-up, paginated FSM iteration, periodic reconciliation, bandwidth caps, resumable transfers via Range, automatic compactor failover, and proper leader forwarding for non-leader compactors.
-
-### Peer File Replication — Dedicated Compactor Role (Enterprise — Phase 4)
-
-Phase 2 and 3 replicated files correctly, but compaction still ran independently on every cluster node. On shared-storage deployments (S3, MinIO, Azure) this was a real correctness bug: two nodes picking up the same hour of source files would produce two distinct compacted outputs with unique filenames, both would land in the bucket, and queries would double-count rows until retention cleaned up. On local-storage deployments it was "only" wasteful — every node ran the same DuckDB merge on its own copy of the files, burning N× CPU and I/O for identical work.
-
-**Phase 4 introduces a dedicated `RoleCompactor`** that runs compaction on exactly one node per cluster, and wires the compacted output into the existing Raft manifest so Phase 2/3 replication automatically distributes it.
-
-**How it works:**
-- When `ARC_CLUSTER_ROLE=compactor` is set on a node, the compaction scheduler starts as today. On any other role (`writer`, `reader`) the scheduler logs `"Compaction scheduler gated: node role does not have CanCompact capability"` at Info and stays idle. OSS and standalone deployments pass no gate and are unaffected — compaction runs unconditionally, preserving the OSS feature contract.
-- Compaction still runs in a subprocess for memory isolation. Phase 4 adds a **completion-manifest handoff** on local disk at `{temp_directory}/.completion/pending/{job_id}.json`. The subprocess atomically writes the manifest in state `output_written` immediately after upload succeeds (the critical durability point), then advances it to `sources_deleted` once the source files are removed from storage.
-- A parent-side **`CompletionWatcher`** polls the directory on a 1-second tick, reads each pending manifest, and translates it to `RegisterFile` / `DeleteFile` Raft commands via a new `CompactionBridge`. Successful apply removes the manifest. Failure (including the leader-flap case) leaves the manifest in place for the next poll — Raft FSM handlers are already idempotent, so retries are safe.
-- The bridge checks `IsLeader()` before every Raft command and returns a new `ErrNotLeader` sentinel when the local compactor is not the Raft leader. The watcher recognizes this as a transient retry condition (not logged as an error). By the time leadership stabilizes (sub-second in practice), the retry succeeds.
-- On readers, the existing Phase 2/3 `onFileRegistered` callback fires automatically when the compacted file lands in the manifest, and the puller pulls the bytes from the compactor. No changes to the replication layer.
-- Phase 4 also activates the previously-logging-only `onFileDeleted` callback to **delete local copies** of source files after a 500ms grace period (giving in-flight queries time to finish reading). Local-storage readers shed their stale source copies; shared-storage deployments skip this entirely because the compactor already removed the shared object.
-
-**Two operator-visible health warnings** surface rate-limited (once per minute) via the cluster health checker when `cluster.enabled && cluster.replication_enabled && compaction.enabled`:
-
-```
-No compactor elected: compacted files will accumulate.
-  Set ARC_CLUSTER_ROLE=compactor on one node and restart.
-
-Multiple compactors elected (N): shared storage may see
-  duplicate outputs. Only one node should have
-  ARC_CLUSTER_ROLE=compactor.
-```
-
-Both are `Warn` (not Error) — Arc keeps running, queries still work, but operators should fix the configuration. The second warning is the Phase 4 safety net for the exact misconfiguration the feature is designed to prevent.
-
-**Configuration knobs** (all default to sensible values):
-- `compaction.completion_watcher_interval_ms = 1000` — how often the watcher scans for pending manifests
-- `compaction.completion_dir` (auto-derived from `compaction.temp_directory` when empty)
-- `compaction.completion_orphan_timeout_ms = 600000` — sweep `writing_output` manifests older than this on startup (indicates a crashed subprocess; later states are never swept)
-
-**No license flag for compaction.** Gating compaction would follow InfluxDB's well-known path and is explicitly rejected. The compactor-coordination mechanism is scoped under `FeatureClustering` because the `CompletionWatcher` and `CompactionBridge` only activate when clustering + peer replication are both enabled.
-
-**Known Phase 4 limitations, all targeted by Phase 5:**
-- **Single point of failure**: if the compactor node dies, compaction stalls until an operator sets another node's role to `compactor` and restarts. No automatic failover.
-- **Leader-flap stalls**: if the compactor is not the Raft leader, the bridge short-circuits with `ErrNotLeader` and the watcher retries. Prolonged leader elections pause compaction progress until leadership stabilizes. Phase 5 will add proper leader forwarding.
-- **Orphan compacted files**: if the subprocess crashes in the narrow window between `WriteReader` and writing the completion manifest (~1ms), a compacted file may exist in storage without a corresponding manifest entry. Operator cleanup required until Phase 5 adds automatic reconciliation.
+Cluster nodes now exchange periodic heartbeat messages over the coordinator protocol. The health checker uses heartbeat freshness to detect unresponsive peers — nodes that miss 3 consecutive heartbeats (~15s) are marked unhealthy, enabling automatic failover for both writers and compactors. Self-reported node state is propagated alongside heartbeats so peers can detect degraded nodes that are still reachable but unable to serve.
 
 ### Cluster TLS Encryption and Shared Secret Authentication (Enterprise)
 

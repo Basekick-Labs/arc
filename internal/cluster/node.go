@@ -273,9 +273,11 @@ func (n *Node) ProcessHealthCheckResult(healthy bool, unhealthyThreshold, deadTh
 	oldState := n.State
 
 	if healthy {
-		// Reset failed checks and mark healthy
+		// Reset failed checks. LastHeartbeat is updated by the heartbeat
+		// sender (RecordHeartbeat), not here — updating it here would
+		// create a self-sustaining loop where the health check keeps
+		// the heartbeat fresh even when no real heartbeats arrive.
 		n.FailedChecks = 0
-		n.LastHeartbeat = time.Now()
 
 		if oldState != StateHealthy && oldState != StateJoining {
 			n.State = StateHealthy

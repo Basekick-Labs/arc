@@ -31,6 +31,9 @@ const (
 	CommandRegisterFile
 	// CommandDeleteFile removes a file from the cluster manifest.
 	CommandDeleteFile
+	// CommandAssignCompactor designates a node as the active compactor.
+	// Used by the CompactorFailoverManager for automatic failover.
+	CommandAssignCompactor
 )
 
 // Command represents a command to be applied to the FSM.
@@ -112,11 +115,18 @@ type DeleteFilePayload struct {
 	Reason string `json:"reason,omitempty"` // "retention", "compaction", "manual"
 }
 
+// AssignCompactorPayload is the payload for CommandAssignCompactor.
+type AssignCompactorPayload struct {
+	NodeID         string `json:"node_id"`
+	OldCompactorID string `json:"old_compactor_id,omitempty"`
+}
+
 // FSMSnapshot represents a snapshot of the FSM state.
 type FSMSnapshot struct {
-	Nodes           map[string]*NodeInfo  `json:"nodes"`
-	PrimaryWriterID string                `json:"primary_writer_id,omitempty"`
-	Files           map[string]*FileEntry `json:"files,omitempty"` // File manifest (peer replication)
+	Nodes              map[string]*NodeInfo  `json:"nodes"`
+	PrimaryWriterID    string                `json:"primary_writer_id,omitempty"`
+	ActiveCompactorID  string                `json:"active_compactor_id,omitempty"`
+	Files              map[string]*FileEntry `json:"files,omitempty"` // File manifest (peer replication)
 }
 
 // ClusterFSM implements the raft.FSM interface for cluster state management.
@@ -124,8 +134,9 @@ type FSMSnapshot struct {
 type ClusterFSM struct {
 	mu              sync.RWMutex
 	nodes           map[string]*NodeInfo
-	primaryWriterID string                // ID of the current primary writer node
-	files           map[string]*FileEntry // File manifest (path → entry) for peer replication
+	primaryWriterID   string                // ID of the current primary writer node
+	activeCompactorID string                // ID of the node currently holding the compactor lease
+	files             map[string]*FileEntry // File manifest (path → entry) for peer replication
 	// Secondary index: database → set of file paths. Maintained alongside
 	// the primary `files` map on register/delete to avoid O(N) scans when
 	// filtering by database.
@@ -136,9 +147,10 @@ type ClusterFSM struct {
 	onNodeAdded      func(*NodeInfo)
 	onNodeRemoved    func(string)
 	onNodeUpdated    func(*NodeInfo)
-	onWriterPromoted func(newPrimaryID, oldPrimaryID string)
-	onFileRegistered func(*FileEntry)
-	onFileDeleted    func(path string, reason string)
+	onWriterPromoted   func(newPrimaryID, oldPrimaryID string)
+	onCompactorAssigned func(newCompactorID, oldCompactorID string)
+	onFileRegistered   func(*FileEntry)
+	onFileDeleted      func(path string, reason string)
 }
 
 // NewClusterFSM creates a new cluster FSM.
@@ -165,6 +177,20 @@ func (f *ClusterFSM) SetWriterPromotedCallback(cb func(newPrimaryID, oldPrimaryI
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.onWriterPromoted = cb
+}
+
+// SetCompactorAssignedCallback sets the callback for compactor assignment events.
+func (f *ClusterFSM) SetCompactorAssignedCallback(cb func(newCompactorID, oldCompactorID string)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onCompactorAssigned = cb
+}
+
+// GetActiveCompactorID returns the node ID currently holding the compactor lease.
+func (f *ClusterFSM) GetActiveCompactorID() string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.activeCompactorID
 }
 
 // SetFileCallbacks sets the callbacks for file manifest events (peer replication).
@@ -208,6 +234,8 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.applyRegisterFile(cmd.Payload, log.Index)
 	case CommandDeleteFile:
 		return f.applyDeleteFile(cmd.Payload)
+	case CommandAssignCompactor:
+		return f.applyAssignCompactor(cmd.Payload)
 	default:
 		return fmt.Errorf("unknown command type: %d", cmd.Type)
 	}
@@ -500,6 +528,34 @@ func (f *ClusterFSM) applyDeleteFile(payload []byte) interface{} {
 	return nil
 }
 
+func (f *ClusterFSM) applyAssignCompactor(payload []byte) interface{} {
+	var p AssignCompactorPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal assign compactor payload: %w", err)
+	}
+
+	if p.NodeID == "" {
+		return fmt.Errorf("assign compactor: node_id is required")
+	}
+
+	f.mu.Lock()
+	oldCompactorID := f.activeCompactorID
+	f.activeCompactorID = p.NodeID
+	callback := f.onCompactorAssigned
+	f.mu.Unlock()
+
+	f.logger.Info().
+		Str("new_compactor", p.NodeID).
+		Str("old_compactor", oldCompactorID).
+		Msg("Compactor lease assigned")
+
+	if callback != nil {
+		callback(p.NodeID, oldCompactorID)
+	}
+
+	return nil
+}
+
 // Snapshot returns a snapshot of the FSM state.
 func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 	f.mu.RLock()
@@ -519,7 +575,7 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 		files[path] = &fileCopy
 	}
 
-	return &fsmSnapshot{nodes: nodes, primaryWriterID: f.primaryWriterID, files: files}, nil
+	return &fsmSnapshot{nodes: nodes, primaryWriterID: f.primaryWriterID, activeCompactorID: f.activeCompactorID, files: files}, nil
 }
 
 // Restore restores the FSM from a snapshot.
@@ -534,6 +590,7 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	f.mu.Lock()
 	f.nodes = snapshot.Nodes
 	f.primaryWriterID = snapshot.PrimaryWriterID
+	f.activeCompactorID = snapshot.ActiveCompactorID
 	if snapshot.Files != nil {
 		f.files = snapshot.Files
 	} else {
@@ -555,6 +612,7 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		Int("node_count", len(snapshot.Nodes)).
 		Int("file_count", len(snapshot.Files)).
 		Str("primary_writer", snapshot.PrimaryWriterID).
+		Str("active_compactor", snapshot.ActiveCompactorID).
 		Msg("FSM restored from snapshot")
 
 	return nil
@@ -676,17 +734,19 @@ func (f *ClusterFSM) FileCount() int {
 
 // fsmSnapshot implements raft.FSMSnapshot.
 type fsmSnapshot struct {
-	nodes           map[string]*NodeInfo
-	primaryWriterID string
-	files           map[string]*FileEntry
+	nodes             map[string]*NodeInfo
+	primaryWriterID   string
+	activeCompactorID string
+	files             map[string]*FileEntry
 }
 
 // Persist writes the snapshot to the given sink.
 func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 	snapshot := FSMSnapshot{
-		Nodes:           s.nodes,
-		PrimaryWriterID: s.primaryWriterID,
-		Files:           s.files,
+		Nodes:             s.nodes,
+		PrimaryWriterID:   s.primaryWriterID,
+		ActiveCompactorID: s.activeCompactorID,
+		Files:             s.files,
 	}
 
 	data, err := json.Marshal(snapshot)

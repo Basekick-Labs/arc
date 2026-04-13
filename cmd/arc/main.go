@@ -899,29 +899,26 @@ func main() {
 						}, shutdown.PriorityBuffer)
 						log.Info().Msg("Cluster file manifest registrar enabled")
 
-						// Phase 4: start the compaction completion watcher on nodes that
-						// carry the compactor role. The watcher polls the local
-						// .completion/pending/ dir that compaction subprocesses write
-						// their handoff manifests to, and applies RegisterFile +
-						// DeleteFile to the Raft manifest via CompactionBridge.
+						// Phase 5: wire the dynamic compaction gate to the coordinator
+						// so CanCompact() checks the FSM's active compactor lease
+						// when failover is configured.
+						if compactionGate != nil {
+							if gate, ok := compactionGate.(*compactionClusterGate); ok {
+								gate.setCoordinator(clusterCoordinator)
+							}
+						}
+
+						// Phase 4+5: start the compaction completion watcher on
+						// nodes that can potentially compact. With Phase 5 failover,
+						// any node may become the active compactor at runtime, so we
+						// construct the watcher and schedulers on every node but only
+						// start them when the node holds the compactor lease.
 						//
-						// Only the compactor runs compaction, so only the compactor needs
-						// the watcher. Readers and writers that see an empty .completion
-						// dir do nothing, but we don't bother starting the watcher there
-						// because it would be a permanent no-op.
-						//
-						// Shutdown ordering: watcher stops at PriorityCompaction - 1 so
-						// it drains any pending manifests BEFORE the cluster coordinator
-						// tears down Raft. If the watcher stopped after Raft, the final
-						// RegisterFile calls would fail against a dead Raft node and the
-						// manifests would be lost.
-						if capabilities.CanCompact && completionDir != "" && cfg.Compaction.Enabled {
+						// Shutdown ordering: watcher stops at PriorityCompaction - 1
+						// so it drains any pending manifests BEFORE the coordinator
+						// tears down Raft.
+						if completionDir != "" && cfg.Compaction.Enabled {
 							bridge := cluster.NewCompactionBridge(clusterCoordinator)
-							// Honor the configured poll interval; fall back to 1s if
-							// the operator didn't set it (or set it to 0/negative).
-							// The watcher's NewCompletionWatcher also clamps defaults
-							// internally, but we prefer an explicit default here so
-							// the startup log reflects the effective value.
 							pollInterval := time.Duration(cfg.Compaction.CompletionWatcherIntervalMS) * time.Millisecond
 							if pollInterval <= 0 {
 								pollInterval = 1 * time.Second
@@ -936,15 +933,61 @@ func main() {
 							if werr != nil {
 								log.Warn().Err(werr).Msg("Failed to construct compaction completion watcher")
 							} else {
-								watcher.Start(context.Background())
+								// If this node is already the active compactor (static
+								// RoleCompactor with no failover, or failover already
+								// assigned us), start immediately. Otherwise the FSM
+								// callback will start it dynamically.
+								if capabilities.CanCompact || clusterCoordinator.IsActiveCompactor() {
+									watcher.Start(context.Background())
+									log.Info().
+										Str("completion_dir", completionDir).
+										Dur("poll_interval", pollInterval).
+										Msg("Phase 4 compaction completion watcher started")
+								}
+
 								shutdownCoordinator.RegisterHook("compaction-completion-watcher", func(ctx context.Context) error {
 									watcher.Stop()
 									return nil
 								}, shutdown.PriorityCompaction-1)
-								log.Info().
-									Str("completion_dir", completionDir).
-									Dur("poll_interval", pollInterval).
-									Msg("Phase 4 compaction completion watcher started")
+
+								// Phase 5: wire OnBecomeCompactor / OnLoseCompactor
+								// callbacks so the scheduler and watcher activate/deactivate
+								// dynamically when the compactor lease moves between nodes.
+								// Dedicated compactor nodes (CanCompact=true) keep the watcher
+								// running regardless of lease state to process orphaned manifests.
+								isDedicatedCompactor := capabilities.CanCompact
+								clusterCoordinator.SetCompactorCallbacks(
+									func() {
+										// OnBecomeCompactor: start scheduler + watcher
+										log.Info().Msg("Phase 5: this node became the active compactor — starting compaction")
+										if hourlyScheduler != nil {
+											if err := hourlyScheduler.Start(); err != nil {
+												log.Error().Err(err).Msg("Failed to start hourly scheduler after failover")
+											}
+										}
+										if dailyScheduler != nil {
+											if err := dailyScheduler.Start(); err != nil {
+												log.Error().Err(err).Msg("Failed to start daily scheduler after failover")
+											}
+										}
+										if !isDedicatedCompactor {
+											watcher.Start(context.Background())
+										}
+									},
+									func() {
+										// OnLoseCompactor: stop scheduler + watcher
+										log.Info().Msg("Phase 5: this node lost the active compactor lease — stopping compaction")
+										if hourlyScheduler != nil {
+											hourlyScheduler.Stop()
+										}
+										if dailyScheduler != nil {
+											dailyScheduler.Stop()
+										}
+										if !isDedicatedCompactor {
+											watcher.Stop()
+										}
+									},
+								)
 							}
 						}
 					}
@@ -1699,19 +1742,21 @@ func runCompactSubcommand(args []string) {
 	}
 }
 
-// compactionClusterGate implements compaction.ClusterGate by parsing the
-// local node's cluster role from config. It's constructed once at startup
-// with the role string — cfg.Cluster.Role — and the CanCompact check
-// consults the NodeRole capabilities the cluster package already exposes.
+// compactionClusterGate implements compaction.ClusterGate. When the
+// coordinator has a compactor failover manager (Phase 5), it checks the
+// FSM's active compactor lease instead of the static role. When failover
+// is not configured (no coordinator, or coordinator without failover),
+// it falls back to the static role check from Phase 4.
 //
-// This type sits in main.go (not in the cluster or compaction package) so
-// the compaction package has no compile-time dependency on the cluster
-// package, and the cluster package doesn't need to know about the
-// compaction scheduler. Both packages stay independent and the glue
-// lives at the one spot that already imports both — main.go.
+// This type sits in main.go so the compaction package has no compile-time
+// dependency on the cluster package.
 type compactionClusterGate struct {
 	role         cluster.NodeRole
 	capabilities cluster.RoleCapabilities
+	// coordinator is non-nil when clustering is enabled. When the
+	// coordinator has a compactor failover manager, CanCompact checks
+	// the FSM lease instead of the static role.
+	coordinator *cluster.Coordinator
 }
 
 func newCompactionClusterGate(roleString string) *compactionClusterGate {
@@ -1722,15 +1767,26 @@ func newCompactionClusterGate(roleString string) *compactionClusterGate {
 	}
 }
 
-// CanCompact reports whether the local node's role has the compact
-// capability. Only RoleCompactor returns true in cluster mode — writers
-// and readers return false and the scheduler stays idle on those nodes.
+// setCoordinator enables the dynamic FSM lease check for Phase 5 failover.
+// Called after the coordinator is created and started.
+func (g *compactionClusterGate) setCoordinator(c *cluster.Coordinator) {
+	g.coordinator = c
+}
+
+// CanCompact reports whether this node should run compaction.
+//
+// Phase 5 (failover enabled): checks the FSM's active compactor lease.
+// Phase 4 (no failover): checks the static role capability.
 func (g *compactionClusterGate) CanCompact() bool {
+	if g.coordinator != nil && g.coordinator.GetActiveCompactorID() != "" {
+		// Failover system is active — use the FSM lease.
+		return g.coordinator.IsActiveCompactor()
+	}
+	// No failover or no lease assigned yet — fall back to static role.
 	return g.capabilities.CanCompact
 }
 
-// Role returns the node's role string for log messages. Never used for
-// authorization — CanCompact is authoritative.
+// Role returns the node's role string for log messages.
 func (g *compactionClusterGate) Role() string {
 	return string(g.role)
 }
