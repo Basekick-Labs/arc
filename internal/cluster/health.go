@@ -283,9 +283,11 @@ func (h *HealthChecker) checkNode(node *Node) {
 
 	healthy := h.performHealthCheck(ctx, node)
 
-	// Use atomic state transition to prevent race conditions
+	// Process the health check against the REAL node in the registry (not
+	// the clone we received from GetAll). The clone's LastHeartbeat is a
+	// snapshot — the real node's LastHeartbeat is updated by handleHeartbeat.
 	deadThreshold := h.unhealthyThreshold * 2
-	transition := node.ProcessHealthCheckResult(healthy, h.unhealthyThreshold, deadThreshold)
+	transition := h.registry.ProcessHealthCheck(node.ID, healthy, h.unhealthyThreshold, deadThreshold)
 
 	// Handle state transitions
 	if transition != nil {
@@ -320,28 +322,20 @@ func (h *HealthChecker) checkNode(node *Node) {
 // For Phase 2, this checks heartbeat freshness.
 // Phase 3 will add active HTTP health endpoint checks.
 func (h *HealthChecker) performHealthCheck(ctx context.Context, node *Node) bool {
-	// Check if context is already cancelled
 	select {
 	case <-ctx.Done():
 		return false
 	default:
 	}
 
-	// Check heartbeat freshness
-	// Consider healthy if heartbeat within 3x check interval
-	lastHeartbeat := node.GetLastHeartbeat()
+	// Read the REAL node's LastHeartbeat from the registry, not the
+	// clone's snapshot. The heartbeat sender updates the real node
+	// via registry.RecordHeartbeat; the clone is stale by the time
+	// we run the health check.
+	lastHeartbeat := h.registry.GetLastHeartbeat(node.ID)
 	threshold := 3 * h.checkInterval
 
-	if time.Since(lastHeartbeat) < threshold {
-		return true
-	}
-
-	// TODO (Phase 3): Add active health check
-	// - HTTP GET to node's /health endpoint
-	// - TCP connection test to coordinator port
-	// - gRPC health check if using gRPC
-
-	return false
+	return !lastHeartbeat.IsZero() && time.Since(lastHeartbeat) < threshold
 }
 
 // CheckNow performs an immediate health check on a specific node.

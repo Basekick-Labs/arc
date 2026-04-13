@@ -434,6 +434,12 @@ func (c *Coordinator) Start() error {
 		go c.discoveryLoop()
 	}
 
+	// Start heartbeat sender — periodically sends heartbeat messages to
+	// all known peers so the health checker can detect node failures.
+	// Without this, all nodes show last_heartbeat=zero and the health
+	// checker never marks anyone as unhealthy.
+	go c.heartbeatLoop()
+
 	c.running = true
 	c.localNode.MarkJoined()
 
@@ -655,6 +661,80 @@ func (c *Coordinator) runDeleteWorker() {
 // Close implements the shutdown.Shutdownable interface.
 func (c *Coordinator) Close() error {
 	return c.Stop()
+}
+
+// heartbeatLoop periodically sends heartbeat messages to all known peers.
+// Without this, the health checker has no heartbeat timestamps to check
+// and can never detect node failures. Each tick dials each peer's
+// coordinator address, sends a Heartbeat, and closes the connection.
+func (c *Coordinator) heartbeatLoop() {
+	interval := time.Duration(c.cfg.HealthCheckInterval) * time.Second
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case <-ticker.C:
+			c.sendHeartbeats()
+		}
+	}
+}
+
+// sendHeartbeats sends a heartbeat to each known peer (excluding self).
+func (c *Coordinator) sendHeartbeats() {
+	nodes := c.registry.GetAll()
+	local := c.registry.Local()
+
+	isLeader := false
+	if c.raftNode != nil {
+		isLeader = c.raftNode.IsLeader()
+	}
+
+	hb := &protocol.Heartbeat{
+		NodeID:    c.localNode.ID,
+		State:     string(c.localNode.GetState()),
+		IsLeader:  isLeader,
+		Timestamp: time.Now(),
+	}
+
+	for _, node := range nodes {
+		if local != nil && node.ID == local.ID {
+			continue
+		}
+		if node.Address == "" {
+			continue
+		}
+		go c.sendHeartbeatToNode(node.Address, hb)
+	}
+}
+
+// sendHeartbeatToNode sends a single heartbeat to a peer. Best-effort:
+// failures are expected when peers are down. Dial errors are silent
+// (common during failover); send errors are logged at Debug.
+func (c *Coordinator) sendHeartbeatToNode(addr string, hb *protocol.Heartbeat) {
+	conn, err := security.Dial("tcp", addr, 3*time.Second, c.tlsConfig)
+	if err != nil {
+		// Peer is likely down — expected during failover scenarios.
+		// Not logged to avoid noise during normal operation.
+		return
+	}
+	defer conn.Close()
+
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	msg := protocol.NewHeartbeat(hb)
+	if err := protocol.SendMessage(conn, msg, 3*time.Second); err != nil {
+		c.logger.Debug().Err(err).Str("peer", addr).Msg("Failed to send heartbeat")
+		return
+	}
+	// Read ack — confirms the peer processed the heartbeat.
+	if _, err := protocol.ReceiveMessage(conn, 3*time.Second); err != nil {
+		c.logger.Debug().Err(err).Str("peer", addr).Msg("Failed to read heartbeat ack")
+	}
 }
 
 // discoveryLoop periodically discovers and connects to peer nodes.
@@ -1069,12 +1149,8 @@ func (c *Coordinator) sendJoinSuccess(conn net.Conn) {
 
 // handleHeartbeat processes a heartbeat from a peer.
 func (c *Coordinator) handleHeartbeat(conn net.Conn, hb *protocol.Heartbeat) {
-	// Update the node's last heartbeat time
-	if node, exists := c.registry.Get(hb.NodeID); exists {
-		// Record heartbeat with empty stats (stats could be added to heartbeat message later)
-		node.RecordHeartbeat(NodeStats{})
-		node.UpdateState(NodeState(hb.State))
-	}
+	// Update the real node's LastHeartbeat in the registry (not a clone).
+	c.registry.RecordHeartbeat(hb.NodeID, NodeStats{})
 
 	// Send acknowledgment
 	ack := protocol.NewHeartbeatAck(&protocol.HeartbeatAck{
@@ -1692,6 +1768,9 @@ func (c *Coordinator) onWriterPromoted(newPrimaryID, oldPrimaryID string) {
 // onCompactorAssigned is the FSM callback fired when a CommandAssignCompactor
 // is applied. It notifies main.go via the registered hooks so the scheduler
 // and watcher can be dynamically activated or deactivated.
+//
+// Callbacks are invoked asynchronously (go func) because this runs on the
+// Raft FSM Apply path — blocking here stalls all cluster state updates.
 func (c *Coordinator) onCompactorAssigned(newCompactorID, oldCompactorID string) {
 	c.logger.Info().
 		Str("new_compactor", newCompactorID).
@@ -1699,11 +1778,11 @@ func (c *Coordinator) onCompactorAssigned(newCompactorID, oldCompactorID string)
 		Str("local_node", c.localNode.ID).
 		Msg("Compactor lease assignment applied")
 
-	// If we just became the active compactor, start compaction.
-	if newCompactorID == c.localNode.ID {
+	// If we just became the active compactor (and weren't before), start compaction.
+	if newCompactorID == c.localNode.ID && oldCompactorID != c.localNode.ID {
 		c.logger.Info().Msg("This node is now the active compactor")
 		if c.onBecomeCompactor != nil {
-			c.onBecomeCompactor()
+			go c.onBecomeCompactor()
 		}
 	}
 
@@ -1711,7 +1790,7 @@ func (c *Coordinator) onCompactorAssigned(newCompactorID, oldCompactorID string)
 	if oldCompactorID == c.localNode.ID && newCompactorID != c.localNode.ID {
 		c.logger.Info().Msg("This node is no longer the active compactor")
 		if c.onLoseCompactor != nil {
-			c.onLoseCompactor()
+			go c.onLoseCompactor()
 		}
 	}
 }

@@ -953,6 +953,9 @@ func main() {
 								// Phase 5: wire OnBecomeCompactor / OnLoseCompactor
 								// callbacks so the scheduler and watcher activate/deactivate
 								// dynamically when the compactor lease moves between nodes.
+								// Dedicated compactor nodes (CanCompact=true) keep the watcher
+								// running regardless of lease state to process orphaned manifests.
+								isDedicatedCompactor := capabilities.CanCompact
 								clusterCoordinator.SetCompactorCallbacks(
 									func() {
 										// OnBecomeCompactor: start scheduler + watcher
@@ -967,7 +970,9 @@ func main() {
 												log.Error().Err(err).Msg("Failed to start daily scheduler after failover")
 											}
 										}
-										watcher.Start(context.Background())
+										if !isDedicatedCompactor {
+											watcher.Start(context.Background())
+										}
 									},
 									func() {
 										// OnLoseCompactor: stop scheduler + watcher
@@ -978,7 +983,9 @@ func main() {
 										if dailyScheduler != nil {
 											dailyScheduler.Stop()
 										}
-										watcher.Stop()
+										if !isDedicatedCompactor {
+											watcher.Stop()
+										}
 									},
 								)
 							}

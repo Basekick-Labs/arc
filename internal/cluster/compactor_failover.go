@@ -199,24 +199,30 @@ func (m *CompactorFailoverManager) checkCompactorHealth() {
 }
 
 // tryInitialAssignment attempts to assign a compactor when none is active.
-// Prefers nodes with RoleCompactor; falls back to RoleWriter.
+// Runs the Raft Apply asynchronously to avoid blocking the check loop.
 func (m *CompactorFailoverManager) tryInitialAssignment() {
 	newID := m.selectNewCompactor("")
 	if newID == "" {
-		// No eligible node — the health checker's "No compactor elected"
-		// warning handles operator visibility.
 		return
 	}
+
+	m.failoverInProg = true
 
 	m.logger.Info().
 		Str("node_id", newID).
 		Msg("Assigning initial compactor lease")
 
-	if err := m.cfg.RaftNode.AssignCompactor(newID, "", m.cfg.FailoverTimeout); err != nil {
-		m.logger.Error().Err(err).
-			Str("node_id", newID).
-			Msg("Failed to assign initial compactor")
-	}
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		err := m.cfg.RaftNode.AssignCompactor(newID, "", m.cfg.FailoverTimeout)
+		if err != nil {
+			m.logger.Error().Err(err).
+				Str("node_id", newID).
+				Msg("Failed to assign initial compactor")
+		}
+		m.completeFailover(newID, err == nil)
+	}()
 }
 
 // triggerFailoverLocked initiates failover (must hold m.mu).
@@ -306,8 +312,8 @@ func (m *CompactorFailoverManager) selectNewCompactor(excludeNodeID string) stri
 func (m *CompactorFailoverManager) completeFailover(newCompactorID string, success bool) {
 	m.mu.Lock()
 	m.failoverInProg = false
-	m.lastFailoverAt = time.Now()
 	if success {
+		m.lastFailoverAt = time.Now()
 		m.consecutiveFails = 0
 	}
 	completeCb := m.onFailoverComplete
