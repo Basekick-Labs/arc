@@ -725,7 +725,9 @@ func (c *Coordinator) sendHeartbeatToNode(addr string, hb *protocol.Heartbeat) {
 	}
 	defer conn.Close()
 
-	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		return
+	}
 	msg := protocol.NewHeartbeat(hb)
 	if err := protocol.SendMessage(conn, msg, 3*time.Second); err != nil {
 		c.logger.Debug().Err(err).Str("peer", addr).Msg("Failed to send heartbeat")
