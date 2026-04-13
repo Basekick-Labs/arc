@@ -131,6 +131,10 @@ type CompletionWatcher struct {
 	// waiting for the subprocess to advance the manifest to
 	// sources_deleted. The set is cleared when the manifest is removed
 	// (sources_deleted applied) or on watcher restart.
+	//
+	// Thread safety: accessed only from poll() → applyOne() within the
+	// single loop() goroutine. No lock needed. If applyOne is ever
+	// called from another goroutine, a lock must be added.
 	registeredOutputs map[string]struct{}
 
 	// Metrics (atomic for lock-free observability via Stats)

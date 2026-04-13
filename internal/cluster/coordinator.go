@@ -548,29 +548,57 @@ func (c *Coordinator) Stop() error {
 // (Stop() closes it during shutdown).
 func (c *Coordinator) runDeleteWorker() {
 	defer c.deleteWg.Done()
-	for req := range c.deleteQueue {
-		// Grace period: let in-flight queries finish reading the file.
+	for {
+		// Wait for the first item (or shutdown).
 		select {
 		case <-c.ctx.Done():
-			// Coordinator shutting down — abandon remaining deletes.
-			// Phase 3 catch-up reconciles on next startup.
 			return
-		case <-time.After(500 * time.Millisecond):
+		case req, ok := <-c.deleteQueue:
+			if !ok {
+				return
+			}
+			// Grace period: wait 500ms once, then drain all queued items
+			// without waiting. This amortizes the grace cost across a
+			// burst of deletions (e.g. compaction deleting 100 sources).
+			select {
+			case <-c.ctx.Done():
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
+
+			// Collect the first item plus any others already queued.
+			batch := []deleteRequest{req}
+		drain:
+			for {
+				select {
+				case r, ok := <-c.deleteQueue:
+					if !ok {
+						break drain
+					}
+					batch = append(batch, r)
+				default:
+					break drain
+				}
+			}
+
+			// Delete all items in the batch.
+			for _, item := range batch {
+				delCtx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
+				if err := c.storage.Delete(delCtx, item.path); err != nil {
+					c.logger.Warn().
+						Err(err).
+						Str("path", item.path).
+						Str("reason", item.reason).
+						Msg("Phase 4 local delete worker: backend.Delete failed")
+				} else {
+					c.logger.Debug().
+						Str("path", item.path).
+						Str("reason", item.reason).
+						Msg("Phase 4 local delete worker: removed local copy")
+				}
+				cancel()
+			}
 		}
-		delCtx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
-		if err := c.storage.Delete(delCtx, req.path); err != nil {
-			c.logger.Warn().
-				Err(err).
-				Str("path", req.path).
-				Str("reason", req.reason).
-				Msg("Phase 4 local delete worker: backend.Delete failed")
-		} else {
-			c.logger.Debug().
-				Str("path", req.path).
-				Str("reason", req.reason).
-				Msg("Phase 4 local delete worker: removed local copy")
-		}
-		cancel()
 	}
 }
 
