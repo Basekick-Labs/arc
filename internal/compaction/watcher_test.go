@@ -102,7 +102,7 @@ func TestNewCompletionWatcher_RequiresDir(t *testing.T) {
 	_, err := NewCompletionWatcher(CompletionWatcherConfig{
 		Bridge: &fakeBridge{},
 	})
-	if err == nil || !errors.Is(errors.Unwrap(err), nil) && err.Error() == "" {
+	if err == nil {
 		t.Fatal("expected error for missing Dir")
 	}
 }
