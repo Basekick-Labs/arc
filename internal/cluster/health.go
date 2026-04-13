@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/rs/zerolog"
 )
 
@@ -39,6 +40,12 @@ type HealthChecker struct {
 	warnIfNoCompactor         bool
 	lastNoCompactorWarnAt     atomic.Int64 // unix nanos; throttles "no compactor elected"
 	lastMultiCompactorWarnAt  atomic.Int64 // unix nanos; throttles "multiple compactors elected"
+
+	// Phase 5: raftFSM is set when compactor failover is configured. When
+	// non-nil, checkCompactorElected also checks the FSM's activeCompactorID
+	// to suppress the "no compactor" warning when failover has assigned
+	// the lease to a non-RoleCompactor node (e.g. a writer after failover).
+	raftFSM *raft.ClusterFSM
 
 	running bool
 	stopCh  chan struct{}
@@ -198,12 +205,25 @@ func (h *HealthChecker) checkAllNodes() {
 // CAS race silence the other for the whole interval — an operator
 // watching a log-tail could see only "no compactor" while "multiple
 // compactors" was the more recent condition.
+// SetRaftFSM wires the Raft FSM so checkCompactorElected can check the
+// Phase 5 active compactor lease. Called from coordinator wiring.
+func (h *HealthChecker) SetRaftFSM(fsm *raft.ClusterFSM) {
+	h.raftFSM = fsm
+}
+
 func (h *HealthChecker) checkCompactorElected() {
 	compactors := h.registry.GetCompactors()
-	if len(compactors) == 1 {
-		// Correctly configured. Reset BOTH timers so the next
-		// misconfiguration of either kind fires immediately without
-		// waiting the full interval.
+
+	// Phase 5: if the FSM has an active compactor lease assigned (via
+	// failover), that counts as "a compactor is elected" even if no
+	// RoleCompactor nodes are in the registry (e.g. a writer took over).
+	activeCompactorID := ""
+	if h.raftFSM != nil {
+		activeCompactorID = h.raftFSM.GetActiveCompactorID()
+	}
+
+	if len(compactors) == 1 || (len(compactors) == 0 && activeCompactorID != "") {
+		// Correctly configured (or failover is handling it).
 		h.lastNoCompactorWarnAt.Store(0)
 		h.lastMultiCompactorWarnAt.Store(0)
 		return
@@ -215,7 +235,8 @@ func (h *HealthChecker) checkCompactorElected() {
 		}
 		h.logger.Warn().
 			Msg("No compactor elected: compacted files will accumulate. " +
-				"Set ARC_CLUSTER_ROLE=compactor on one node and restart.")
+				"Set ARC_CLUSTER_ROLE=compactor on one node and restart, " +
+				"or enable automatic failover (cluster.failover_enabled).")
 		return
 	}
 

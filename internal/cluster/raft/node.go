@@ -569,6 +569,22 @@ func (n *Node) DeleteFile(path, reason string, timeout time.Duration) error {
 	return n.Apply(cmd, timeout)
 }
 
+// AssignCompactor designates a node as the active compactor via Raft consensus.
+// Used by the CompactorFailoverManager for automatic failover.
+func (n *Node) AssignCompactor(nodeID, oldCompactorID string, timeout time.Duration) error {
+	payload, err := json.Marshal(AssignCompactorPayload{NodeID: nodeID, OldCompactorID: oldCompactorID})
+	if err != nil {
+		return fmt.Errorf("failed to marshal assign compactor payload: %w", err)
+	}
+
+	cmd := &Command{
+		Type:    CommandAssignCompactor,
+		Payload: payload,
+	}
+
+	return n.Apply(cmd, timeout)
+}
+
 // LeaderCh returns a channel that signals leadership changes.
 // True means this node became leader, false means it lost leadership.
 func (n *Node) LeaderCh() <-chan bool {

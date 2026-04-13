@@ -71,6 +71,14 @@ type Coordinator struct {
 	// Writer failover (Phase 3)
 	writerFailoverMgr *WriterFailoverManager
 
+	// Compactor failover (Phase 5)
+	compactorFailoverMgr *CompactorFailoverManager
+
+	// Phase 5: callbacks set by main.go for dynamic compaction activation.
+	// Fired from the FSM's onCompactorAssigned callback on the local node.
+	onBecomeCompactor func()
+	onLoseCompactor   func()
+
 	// WAL Replication (Phase 3.3)
 	replicationSender   *replication.Sender   // Writer only: sends entries to readers
 	replicationReceiver *replication.Receiver // Reader only: receives entries from writer
@@ -291,6 +299,34 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		}
 	}
 
+	// Initialize compactor failover manager (Phase 5) — reuses the same
+	// FailoverEnabled toggle and license gate as writer failover.
+	if cfg.Config.FailoverEnabled && c.raftNode != nil {
+		if cfg.LicenseClient == nil || !cfg.LicenseClient.CanUseWriterFailover() {
+			c.logger.Warn().Msg("Compactor failover enabled but license does not include writer_failover feature — compactor failover disabled")
+		} else {
+			c.compactorFailoverMgr = NewCompactorFailoverManager(&CompactorFailoverConfig{
+				Registry:        registry,
+				RaftNode:        c.raftNode,
+				RaftFSM:         c.raftFSM,
+				FailoverTimeout: time.Duration(cfg.Config.FailoverTimeoutSeconds) * time.Second,
+				CooldownPeriod:  time.Duration(cfg.Config.FailoverCooldownSeconds) * time.Second,
+				Logger:          cfg.Logger,
+			})
+
+			// Wire FSM compactor assignment callback.
+			c.raftFSM.SetCompactorAssignedCallback(func(newCompactorID, oldCompactorID string) {
+				c.onCompactorAssigned(newCompactorID, oldCompactorID)
+			})
+
+			c.logger.Info().Msg("Compactor failover manager initialized")
+
+			// Wire the FSM into the health checker so checkCompactorElected
+			// can check the active compactor lease (Phase 5).
+			c.healthChecker.SetRaftFSM(c.raftFSM)
+		}
+	}
+
 	c.logger.Info().
 		Str("node_id", nodeID).
 		Str("role", string(role)).
@@ -383,6 +419,13 @@ func (c *Coordinator) Start() error {
 		})
 		if err := c.writerFailoverMgr.Start(context.Background()); err != nil {
 			c.logger.Error().Err(err).Msg("Failed to start writer failover manager")
+		}
+	}
+
+	// Start compactor failover manager if configured (Phase 5)
+	if c.compactorFailoverMgr != nil {
+		if err := c.compactorFailoverMgr.Start(context.Background()); err != nil {
+			c.logger.Error().Err(err).Msg("Failed to start compactor failover manager")
 		}
 	}
 
@@ -504,6 +547,13 @@ func (c *Coordinator) Stop() error {
 	if c.writerFailoverMgr != nil {
 		if err := c.writerFailoverMgr.Stop(); err != nil {
 			c.logger.Error().Err(err).Msg("Error stopping writer failover manager")
+		}
+	}
+
+	// Stop compactor failover manager (Phase 5)
+	if c.compactorFailoverMgr != nil {
+		if err := c.compactorFailoverMgr.Stop(); err != nil {
+			c.logger.Error().Err(err).Msg("Error stopping compactor failover manager")
 		}
 	}
 
@@ -1637,6 +1687,56 @@ func (c *Coordinator) onWriterPromoted(newPrimaryID, oldPrimaryID string) {
 		Str("new_primary", newPrimaryID).
 		Str("old_primary", oldPrimaryID).
 		Msg("Writer promotion applied to registry")
+}
+
+// onCompactorAssigned is the FSM callback fired when a CommandAssignCompactor
+// is applied. It notifies main.go via the registered hooks so the scheduler
+// and watcher can be dynamically activated or deactivated.
+func (c *Coordinator) onCompactorAssigned(newCompactorID, oldCompactorID string) {
+	c.logger.Info().
+		Str("new_compactor", newCompactorID).
+		Str("old_compactor", oldCompactorID).
+		Str("local_node", c.localNode.ID).
+		Msg("Compactor lease assignment applied")
+
+	// If we just became the active compactor, start compaction.
+	if newCompactorID == c.localNode.ID {
+		c.logger.Info().Msg("This node is now the active compactor")
+		if c.onBecomeCompactor != nil {
+			c.onBecomeCompactor()
+		}
+	}
+
+	// If we just lost the compactor lease, stop compaction.
+	if oldCompactorID == c.localNode.ID && newCompactorID != c.localNode.ID {
+		c.logger.Info().Msg("This node is no longer the active compactor")
+		if c.onLoseCompactor != nil {
+			c.onLoseCompactor()
+		}
+	}
+}
+
+// SetCompactorCallbacks sets the callbacks for dynamic compaction activation.
+// Called from main.go before Start() so the FSM callback has hooks to invoke.
+func (c *Coordinator) SetCompactorCallbacks(onBecome, onLose func()) {
+	c.onBecomeCompactor = onBecome
+	c.onLoseCompactor = onLose
+}
+
+// IsActiveCompactor returns true if this node currently holds the compactor lease.
+func (c *Coordinator) IsActiveCompactor() bool {
+	if c.raftFSM == nil {
+		return false
+	}
+	return c.raftFSM.GetActiveCompactorID() == c.localNode.ID
+}
+
+// GetActiveCompactorID returns the node ID currently holding the compactor lease.
+func (c *Coordinator) GetActiveCompactorID() string {
+	if c.raftFSM == nil {
+		return ""
+	}
+	return c.raftFSM.GetActiveCompactorID()
 }
 
 // GetRouter returns the request router.
