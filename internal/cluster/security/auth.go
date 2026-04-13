@@ -74,3 +74,39 @@ func ValidateFetchHMAC(sharedSecret, nonce, nodeID, clusterName, path string, ti
 	}
 	return nil
 }
+
+// ComputeForwardHMAC computes HMAC-SHA256 for a leader-forwarding request.
+// The message format binds the command payload into the signed material so
+// an attacker on the network cannot swap the command body while keeping the
+// same HMAC. Format: nonce:nodeID:clusterName:payloadSHA256:timestamp
+//
+// We hash the payload with SHA-256 before feeding it into the HMAC message
+// rather than including the raw bytes, so the HMAC input remains a
+// fixed-length string regardless of command size.
+func ComputeForwardHMAC(sharedSecret, nonce, nodeID, clusterName string, payload []byte, timestamp int64) string {
+	payloadHash := sha256.Sum256(payload)
+	payloadHex := hex.EncodeToString(payloadHash[:])
+	message := fmt.Sprintf("%s:%s:%s:%s:%d", nonce, nodeID, clusterName, payloadHex, timestamp)
+	h := hmac.New(sha256.New, []byte(sharedSecret))
+	h.Write([]byte(message))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// ValidateForwardHMAC validates a leader-forwarding HMAC and checks freshness.
+// The command payload is included in the signed material — see ComputeForwardHMAC.
+func ValidateForwardHMAC(sharedSecret, nonce, nodeID, clusterName string, payload []byte, timestamp int64, receivedMAC string, tolerance time.Duration) error {
+	now := time.Now().Unix()
+	drift := now - timestamp
+	if drift < 0 {
+		drift = -drift
+	}
+	if drift > int64(tolerance.Seconds()) {
+		return fmt.Errorf("forward auth timestamp expired (drift: %ds, tolerance: %ds)", drift, int64(tolerance.Seconds()))
+	}
+
+	expected := ComputeForwardHMAC(sharedSecret, nonce, nodeID, clusterName, payload, timestamp)
+	if !hmac.Equal([]byte(expected), []byte(receivedMAC)) {
+		return fmt.Errorf("forward HMAC validation failed: shared secret mismatch or payload tampered")
+	}
+	return nil
+}

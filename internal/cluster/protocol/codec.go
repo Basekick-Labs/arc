@@ -191,6 +191,20 @@ func unmarshalPayload(msgType MessageType, payload []byte) (interface{}, error) 
 		}
 		return &ack, nil
 
+	case MsgForwardApply:
+		var req ForwardApplyRequest
+		if err := json.Unmarshal(payload, &req); err != nil {
+			return nil, err
+		}
+		return &req, nil
+
+	case MsgForwardApplyAck:
+		var ack ForwardApplyAck
+		if err := json.Unmarshal(payload, &ack); err != nil {
+			return nil, err
+		}
+		return &ack, nil
+
 	default:
 		return nil, fmt.Errorf("unknown message type: %d", msgType)
 	}

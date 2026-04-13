@@ -97,8 +97,46 @@ New `Coordinator.ReplicationCatchUpStatus()` returns the catch-up-specific stats
 **Scope of Phase 3:** startup-only reconciliation with any-peer fallback. Phase 3 does **not** include: periodic reconciliation (reactive callbacks handle steady-state drift), orphan detection (Phase 4 compaction concern), paginated FSM walks (accepted O(N) snapshot copy — emergency kill-switch exists for 10M+ file deployments), hard query gating (Phase 5), bandwidth caps (Phase 5), or HTTP Range resume (Phase 5).
 
 **What's coming next** (separate PRs):
-- Phase 4: Integration with compaction (compactor role produces files, replicas pull the compacted output)
-- Phase 5: Optional write quorum for strong durability, hard query gating on catch-up, paginated FSM iteration, periodic reconciliation, bandwidth caps, and resumable transfers via Range
+- Phase 5: Optional write quorum for strong durability, hard query gating on catch-up, paginated FSM iteration, periodic reconciliation, bandwidth caps, resumable transfers via Range, automatic compactor failover, and proper leader forwarding for non-leader compactors.
+
+### Peer File Replication — Dedicated Compactor Role (Enterprise — Phase 4)
+
+Phase 2 and 3 replicated files correctly, but compaction still ran independently on every cluster node. On shared-storage deployments (S3, MinIO, Azure) this was a real correctness bug: two nodes picking up the same hour of source files would produce two distinct compacted outputs with unique filenames, both would land in the bucket, and queries would double-count rows until retention cleaned up. On local-storage deployments it was "only" wasteful — every node ran the same DuckDB merge on its own copy of the files, burning N× CPU and I/O for identical work.
+
+**Phase 4 introduces a dedicated `RoleCompactor`** that runs compaction on exactly one node per cluster, and wires the compacted output into the existing Raft manifest so Phase 2/3 replication automatically distributes it.
+
+**How it works:**
+- When `ARC_CLUSTER_ROLE=compactor` is set on a node, the compaction scheduler starts as today. On any other role (`writer`, `reader`) the scheduler logs `"Compaction scheduler gated: node role does not have CanCompact capability"` at Info and stays idle. OSS and standalone deployments pass no gate and are unaffected — compaction runs unconditionally, preserving the OSS feature contract.
+- Compaction still runs in a subprocess for memory isolation. Phase 4 adds a **completion-manifest handoff** on local disk at `{temp_directory}/.completion/pending/{job_id}.json`. The subprocess atomically writes the manifest in state `output_written` immediately after upload succeeds (the critical durability point), then advances it to `sources_deleted` once the source files are removed from storage.
+- A parent-side **`CompletionWatcher`** polls the directory on a 1-second tick, reads each pending manifest, and translates it to `RegisterFile` / `DeleteFile` Raft commands via a new `CompactionBridge`. Successful apply removes the manifest. Failure (including the leader-flap case) leaves the manifest in place for the next poll — Raft FSM handlers are already idempotent, so retries are safe.
+- The bridge checks `IsLeader()` before every Raft command and returns a new `ErrNotLeader` sentinel when the local compactor is not the Raft leader. The watcher recognizes this as a transient retry condition (not logged as an error). By the time leadership stabilizes (sub-second in practice), the retry succeeds.
+- On readers, the existing Phase 2/3 `onFileRegistered` callback fires automatically when the compacted file lands in the manifest, and the puller pulls the bytes from the compactor. No changes to the replication layer.
+- Phase 4 also activates the previously-logging-only `onFileDeleted` callback to **delete local copies** of source files after a 500ms grace period (giving in-flight queries time to finish reading). Local-storage readers shed their stale source copies; shared-storage deployments skip this entirely because the compactor already removed the shared object.
+
+**Two operator-visible health warnings** surface rate-limited (once per minute) via the cluster health checker when `cluster.enabled && cluster.replication_enabled && compaction.enabled`:
+
+```
+No compactor elected: compacted files will accumulate.
+  Set ARC_CLUSTER_ROLE=compactor on one node and restart.
+
+Multiple compactors elected (N): shared storage may see
+  duplicate outputs. Only one node should have
+  ARC_CLUSTER_ROLE=compactor.
+```
+
+Both are `Warn` (not Error) — Arc keeps running, queries still work, but operators should fix the configuration. The second warning is the Phase 4 safety net for the exact misconfiguration the feature is designed to prevent.
+
+**Configuration knobs** (all default to sensible values):
+- `compaction.completion_watcher_interval_ms = 1000` — how often the watcher scans for pending manifests
+- `compaction.completion_dir` (auto-derived from `compaction.temp_directory` when empty)
+- `compaction.completion_orphan_timeout_ms = 600000` — sweep `writing_output` manifests older than this on startup (indicates a crashed subprocess; later states are never swept)
+
+**No license flag for compaction.** Gating compaction would follow InfluxDB's well-known path and is explicitly rejected. The compactor-coordination mechanism is scoped under `FeatureClustering` because the `CompletionWatcher` and `CompactionBridge` only activate when clustering + peer replication are both enabled.
+
+**Known Phase 4 limitations, all targeted by Phase 5:**
+- **Single point of failure**: if the compactor node dies, compaction stalls until an operator sets another node's role to `compactor` and restarts. No automatic failover.
+- **Leader-flap stalls**: if the compactor is not the Raft leader, the bridge short-circuits with `ErrNotLeader` and the watcher retries. Prolonged leader elections pause compaction progress until leadership stabilizes. Phase 5 will add proper leader forwarding.
+- **Orphan compacted files**: if the subprocess crashes in the narrow window between `WriteReader` and writing the completion manifest (~1ms), a compacted file may exist in storage without a corresponding manifest entry. Operator cleanup required until Phase 5 adds automatic reconciliation.
 
 ### Cluster TLS Encryption and Shared Secret Authentication (Enterprise)
 

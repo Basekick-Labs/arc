@@ -10,16 +10,42 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// ClusterGate is the minimal interface the compaction scheduler needs to
+// decide whether the local node may run compaction. Phase 4 wires this to
+// a closure that checks RoleCompactor against cfg.Cluster.Role; OSS and
+// standalone nodes pass a nil gate (or construct without one) and are
+// allowed unconditionally.
+//
+// The interface lives here rather than in the cluster package so the
+// scheduler has no compile-time dependency on the cluster package — the
+// gate is a function pointer plus a tiny interface, not an import.
+type ClusterGate interface {
+	// CanCompact reports whether the local node may run compaction. When
+	// the scheduler sees false, it logs a clear "gated" message and stays
+	// idle (NOT running, NOT an error).
+	CanCompact() bool
+	// Role returns the current node's role string for log messages. The
+	// scheduler only uses this for human-readable output, never for
+	// decision-making — CanCompact is authoritative.
+	Role() string
+}
+
 // Scheduler schedules compaction jobs using cron-style schedules
 type Scheduler struct {
 	manager   *Manager
 	schedule  string
 	tierNames []string // Specific tiers to process (must be non-empty and enabled)
 	enabled   bool
+	// clusterGate is the Phase 4 role check. When non-nil, Start() and
+	// TriggerNow() both consult it and refuse to run when CanCompact is
+	// false. nil gate means "no check, allow" — used by OSS / standalone
+	// paths and by existing tests that predate Phase 4.
+	clusterGate ClusterGate
 
-	cron    *cron.Cron
-	running bool
-	stopCh  chan struct{}
+	cron       *cron.Cron
+	running    bool
+	roleGated  bool // true when Start found CanCompact=false; used by Status
+	stopCh     chan struct{}
 
 	logger zerolog.Logger
 	mu     sync.Mutex
@@ -27,11 +53,12 @@ type Scheduler struct {
 
 // SchedulerConfig holds configuration for creating a compaction scheduler
 type SchedulerConfig struct {
-	Manager   *Manager
-	Schedule  string   // Cron schedule string (e.g., "5 * * * *" for every hour at :05)
-	TierNames []string // Specific tiers to process (must be non-empty and enabled)
-	Enabled   bool     // Enable automatic scheduling
-	Logger    zerolog.Logger
+	Manager     *Manager
+	Schedule    string      // Cron schedule string (e.g., "5 * * * *" for every hour at :05)
+	TierNames   []string    // Specific tiers to process (must be non-empty and enabled)
+	Enabled     bool        // Enable automatic scheduling
+	ClusterGate ClusterGate // Optional Phase 4 role check; nil means "no gate, allow"
+	Logger      zerolog.Logger
 }
 
 // NewScheduler creates a new compaction scheduler
@@ -48,12 +75,13 @@ func NewScheduler(cfg *SchedulerConfig) (*Scheduler, error) {
 	}
 
 	s := &Scheduler{
-		manager:   cfg.Manager,
-		schedule:  cfg.Schedule,
-		tierNames: cfg.TierNames,
-		enabled:   cfg.Enabled,
-		stopCh:    make(chan struct{}),
-		logger:    cfg.Logger.With().Str("component", "compaction-scheduler").Logger(),
+		manager:     cfg.Manager,
+		schedule:    cfg.Schedule,
+		tierNames:   cfg.TierNames,
+		enabled:     cfg.Enabled,
+		clusterGate: cfg.ClusterGate,
+		stopCh:      make(chan struct{}),
+		logger:      cfg.Logger.With().Str("component", "compaction-scheduler").Logger(),
 	}
 
 	if cfg.Enabled {
@@ -88,6 +116,22 @@ func (s *Scheduler) Start() error {
 		s.logger.Warn().Msg("Compaction scheduler already running")
 		return nil
 	}
+
+	// Phase 4: role gate. When a cluster gate is wired and reports that
+	// the local node cannot compact, we stay idle (NOT running, NOT an
+	// error). This is the "only compactor nodes compact in cluster mode"
+	// enforcement, placed at the single chokepoint so scattered goroutines
+	// don't need individual checks. OSS/standalone pass no gate and
+	// short-circuit past this check.
+	if s.clusterGate != nil && !s.clusterGate.CanCompact() {
+		s.roleGated = true
+		s.logger.Info().
+			Str("role", s.clusterGate.Role()).
+			Str("expected_role", "compactor").
+			Msg("Compaction scheduler gated: node role does not have CanCompact capability. Scheduler idle.")
+		return nil
+	}
+	s.roleGated = false
 
 	// Create cron instance
 	s.cron = cron.New(cron.WithParser(cron.NewParser(
@@ -156,9 +200,29 @@ func (s *Scheduler) runCompaction() {
 		Msg("Scheduled compaction completed")
 }
 
+// ErrCompactionRoleGated is returned by TriggerNow on a node whose role
+// does not have CanCompact (Phase 4). It lets API handlers surface a
+// clear "this node is not the compactor" message instead of a generic
+// 500 or a silent no-op.
+var ErrCompactionRoleGated = fmt.Errorf("compaction: node role is not compactor")
+
 // TriggerNow triggers compaction immediately (manual trigger)
 // Returns the cycle ID and any error that occurred
 func (s *Scheduler) TriggerNow(ctx context.Context) (int64, error) {
+	// Phase 4: the same role gate applies to manual triggers as to the
+	// cron path — otherwise an operator could accidentally force a
+	// non-compactor node to run compaction and trip the shared-storage
+	// duplicate-output bug we just designed this to prevent.
+	s.mu.Lock()
+	gate := s.clusterGate
+	s.mu.Unlock()
+	if gate != nil && !gate.CanCompact() {
+		s.logger.Warn().
+			Str("role", gate.Role()).
+			Msg("Manual compaction trigger rejected: node role is not compactor")
+		return 0, ErrCompactionRoleGated
+	}
+
 	s.logger.Info().Msg("Manual compaction trigger")
 
 	startTime := time.Now()
@@ -199,6 +263,13 @@ func (s *Scheduler) Status() map[string]interface{} {
 
 	if s.running {
 		status["next_run"] = s.getNextRun().Format(time.RFC3339)
+	}
+
+	// Phase 4: expose role-gate state so operators hitting
+	// /api/v1/cluster/status can see why a node isn't compacting.
+	if s.clusterGate != nil {
+		status["role_gated"] = s.roleGated
+		status["gate_role"] = s.clusterGate.Role()
 	}
 
 	return status

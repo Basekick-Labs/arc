@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -36,6 +37,23 @@ import (
 // - Managing the node lifecycle (join, leave, fail)
 // - Leader election via Raft consensus (Phase 3)
 // - Request routing to appropriate nodes (Phase 3)
+
+// deleteRequest is an item for the bounded delete-worker queue.
+// Replaces the earlier unbounded go-func-per-deletion pattern.
+type deleteRequest struct {
+	path   string
+	reason string
+}
+
+// deleteQueueSize is the capacity of the buffered delete channel.
+// 1024 matches the puller's queue size — enough to absorb a full
+// compaction cycle's worth of source-file deletions without drops.
+const deleteQueueSize = 1024
+
+// deleteWorkerCount is the number of goroutines draining the delete queue.
+// 2 workers provide light parallelism without overwhelming local I/O.
+const deleteWorkerCount = 2
+
 type Coordinator struct {
 	cfg           *config.ClusterConfig
 	licenseClient *license.Client
@@ -71,6 +89,28 @@ type Coordinator struct {
 	// per coordinator lifetime, across repeated Start/Stop cycles in tests.
 	catchupOnce sync.Once
 
+	// deleteQueue is a bounded channel for local file deletions triggered
+	// by onFileDeleted FSM callbacks. Fixed workers drain the queue with a
+	// grace period before each delete. This replaces the earlier unbounded
+	// go func() pattern that could spawn thousands of goroutines during
+	// large compaction cycles.
+	deleteQueue chan deleteRequest
+	deleteWg    sync.WaitGroup
+
+	// nonceCache tracks recently seen nonces for replay protection on
+	// HMAC-authenticated messages (leader forwarding, and extensible to
+	// join/leave in the future). Initialized in Start().
+	nonceCache *security.NonceCache
+
+	// forwardConn caches a single TCP connection to the current Raft
+	// leader for forwarding commands. Reused across calls to avoid
+	// per-command dial + TLS overhead. Lazily reconnected on error or
+	// leader change.
+	forwardConn       net.Conn
+	forwardConnLeader string // nodeID of the leader this conn is dialed to
+	forwardConnMu     sync.Mutex
+	forwardMu         sync.Mutex // Phase 4: serializes round-trips on forwardConn
+
 	// Network
 	listener  net.Listener
 	tlsConfig *tls.Config // nil if cluster TLS disabled
@@ -92,6 +132,13 @@ type CoordinatorConfig struct {
 	Version       string // Arc version
 	APIAddress    string // HTTP API address for this node
 	Logger        zerolog.Logger
+
+	// Phase 4: when true, the embedded HealthChecker surfaces rate-limited
+	// Warn logs when the cluster has zero or >1 nodes in RoleCompactor.
+	// Main wires this to cfg.Cluster.Enabled && cfg.Cluster.ReplicationEnabled &&
+	// cfg.Compaction.Enabled so the warning only fires in deployments where
+	// a missing compactor is actually a problem.
+	WarnIfNoCompactor bool
 }
 
 // NewCoordinator creates a new cluster coordinator.
@@ -164,7 +211,10 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		CheckInterval:      time.Duration(cfg.Config.HealthCheckInterval) * time.Second,
 		CheckTimeout:       time.Duration(cfg.Config.HealthCheckTimeout) * time.Second,
 		UnhealthyThreshold: cfg.Config.UnhealthyThreshold,
-		Logger:             cfg.Logger,
+		// Phase 4: rate-limited compactor-election warning. Main passes
+		// this as cluster+replication+compaction enabled.
+		WarnIfNoCompactor: cfg.WarnIfNoCompactor,
+		Logger:            cfg.Logger,
 	})
 
 	// Initialize Raft FSM and node (Phase 3)
@@ -263,6 +313,20 @@ func (c *Coordinator) Start() error {
 	if err := validateClusteringLicense(c.licenseClient); err != nil {
 		return err
 	}
+
+	// Initialize the coordinator-wide context BEFORE anything else that
+	// might need it — notably the accept loop, which hands off connections
+	// to handleFetchFile and handleFetchFile derives its per-request
+	// contexts from c.ctx. Prior to this fix, c.ctx was only assigned
+	// inside StartReplication(), which runs later from main.go and isn't
+	// even called on nodes where WAL replication is disabled. A fetch
+	// request arriving before StartReplication() would panic on the nil
+	// parent context (Phase 4 integration-test discovery).
+	c.ctx, c.cancel = context.WithCancel(context.Background())
+
+	// Initialize the nonce cache for HMAC replay protection. The 5-minute
+	// TTL matches the HMAC timestamp tolerance in ValidateForwardHMAC.
+	c.nonceCache = security.NewNonceCache(5 * time.Minute)
 
 	// Start Raft node if configured (Phase 3)
 	if c.raftNode != nil {
@@ -409,6 +473,15 @@ func (c *Coordinator) Stop() error {
 	// Signal all goroutines to stop
 	close(c.stopCh)
 
+	// Cancel the coordinator-wide context so in-flight handlers
+	// (handleFetchFile, onFileDeleted's deferred local delete, catch-up
+	// walker, etc.) observe shutdown and drop out of their waits. c.cancel
+	// may be nil in tests that construct a bare Coordinator without
+	// calling Start, so guard it.
+	if c.cancel != nil {
+		c.cancel()
+	}
+
 	// Stop the peer file puller BEFORE Raft. The puller is a Raft FSM
 	// callback consumer — once Raft stops, new applyRegisterFile calls
 	// won't fire anyway, but in-flight pulls need to be cancelled promptly
@@ -418,6 +491,15 @@ func (c *Coordinator) Stop() error {
 		c.puller = nil
 	}
 
+	// Close the cached leader-forwarding connection.
+	c.forwardConnMu.Lock()
+	if c.forwardConn != nil {
+		c.forwardConn.Close()
+		c.forwardConn = nil
+		c.forwardConnLeader = ""
+	}
+	c.forwardConnMu.Unlock()
+
 	// Stop writer failover manager
 	if c.writerFailoverMgr != nil {
 		if err := c.writerFailoverMgr.Stop(); err != nil {
@@ -425,11 +507,22 @@ func (c *Coordinator) Stop() error {
 		}
 	}
 
-	// Stop Raft node if running (Phase 3)
+	// Stop Raft node BEFORE closing the delete queue. The onDelete
+	// callback fires synchronously from the Raft FSM apply path — if
+	// we close the channel while Raft is still running, a late
+	// DeleteFile commit would send to a closed channel and panic.
 	if c.raftNode != nil {
 		if err := c.raftNode.Stop(); err != nil {
 			c.logger.Error().Err(err).Msg("Error stopping Raft node")
 		}
+	}
+
+	// Now safe to close the delete queue — Raft is stopped, no more
+	// FSM callbacks will fire.
+	if c.deleteQueue != nil {
+		close(c.deleteQueue)
+		c.deleteWg.Wait()
+		c.deleteQueue = nil
 	}
 
 	// Stop health checker
@@ -447,6 +540,66 @@ func (c *Coordinator) Stop() error {
 
 	c.logger.Info().Msg("Cluster coordinator stopped")
 	return nil
+}
+
+// runDeleteWorker is a single goroutine that drains the deleteQueue channel.
+// Each item gets a 500ms grace period (for in-flight queries to finish), then
+// a bounded backend.Delete call. The worker exits when the channel is closed
+// (Stop() closes it during shutdown).
+func (c *Coordinator) runDeleteWorker() {
+	defer c.deleteWg.Done()
+	for {
+		// Wait for the first item (or shutdown).
+		select {
+		case <-c.ctx.Done():
+			return
+		case req, ok := <-c.deleteQueue:
+			if !ok {
+				return
+			}
+			// Grace period: wait 500ms once, then drain all queued items
+			// without waiting. This amortizes the grace cost across a
+			// burst of deletions (e.g. compaction deleting 100 sources).
+			select {
+			case <-c.ctx.Done():
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
+
+			// Collect the first item plus any others already queued.
+			batch := []deleteRequest{req}
+		drain:
+			for {
+				select {
+				case r, ok := <-c.deleteQueue:
+					if !ok {
+						break drain
+					}
+					batch = append(batch, r)
+				default:
+					break drain
+				}
+			}
+
+			// Delete all items in the batch.
+			for _, item := range batch {
+				delCtx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
+				if err := c.storage.Delete(delCtx, item.path); err != nil {
+					c.logger.Warn().
+						Err(err).
+						Str("path", item.path).
+						Str("reason", item.reason).
+						Msg("Phase 4 local delete worker: backend.Delete failed")
+				} else {
+					c.logger.Debug().
+						Str("path", item.path).
+						Str("reason", item.reason).
+						Msg("Phase 4 local delete worker: removed local copy")
+				}
+				cancel()
+			}
+		}
+	}
 }
 
 // Close implements the shutdown.Shutdownable interface.
@@ -672,6 +825,15 @@ func (c *Coordinator) handlePeerConnection(conn net.Conn) {
 		// response and closes the connection itself via defer. Hand off
 		// ownership so the dispatch loop doesn't close it a second time.
 		c.handleFetchFile(conn, msg.Payload.(*protocol.FetchFileRequest))
+		closeConn = false
+
+	case protocol.MsgForwardApply:
+		// Phase 4 leader forwarding: a non-leader peer is asking us to
+		// apply a Raft command on its behalf because we're (currently)
+		// the leader. handleForwardApplyLoop owns the connection and
+		// supports multiple commands on the same TCP connection (the
+		// client caches a single persistent leader connection).
+		c.handleForwardApplyLoop(conn, msg.Payload.(*protocol.ForwardApplyRequest))
 		closeConn = false
 
 	default:
@@ -1609,8 +1771,12 @@ func (c *Coordinator) startFilePullerLocked() error {
 	// calls on this same node. The puller's Enqueue handles origin-is-self
 	// and already-local skips, so there's no redundant check here.
 	//
-	// onFileDeleted is reserved for Phase 4 (compactor-initiated deletes).
-	// For now we log so operators can see deletion events flowing through.
+	// Phase 4: onFileDeleted now wires the local-delete hook. When the
+	// compactor issues DeleteFile for a source file after a successful
+	// compaction, readers need to drop their local copy of that source —
+	// otherwise per-node disk fills up with files the manifest says are
+	// gone, and Phase 3's catch-up path would attempt to pull them from
+	// peers that no longer have them (the orphan-fetch loop).
 	fsm := c.raftNode.FSM()
 	if fsm == nil {
 		return fmt.Errorf("Raft FSM not available")
@@ -1622,11 +1788,55 @@ func (c *Coordinator) startFilePullerLocked() error {
 		puller.Enqueue(entry)
 	}
 	onDelete := func(path string, reason string) {
-		c.logger.Debug().
-			Str("path", path).
-			Str("reason", reason).
-			Msg("Cluster manifest deletion observed (Phase 4 will act on this)")
+		// Phase 4: the callback runs synchronously from applyDeleteFile on
+		// the Raft apply hot path. It MUST NOT block. We spawn a goroutine
+		// with a short grace delay so in-flight queries scanning the old
+		// file can finish, then call backend.Delete. On non-local backends
+		// (S3, Azure) the compactor that issued DeleteFile has already
+		// removed the shared object, so the local-side Delete is a no-op.
+		c.mu.RLock()
+		backend := c.storage
+		c.mu.RUnlock()
+		if backend == nil {
+			return
+		}
+		// Local backends need an actual local unlink; shared backends
+		// don't — they're already deleted cluster-wide by the compactor's
+		// StorageBackend.Delete in deleteOldFiles.
+		if backend.Type() != "local" {
+			c.logger.Debug().
+				Str("path", path).
+				Str("reason", reason).
+				Str("backend", backend.Type()).
+				Msg("FSM delete observed; shared backend, no local action needed")
+			return
+		}
+		// Enqueue to the bounded delete-worker pool. Non-blocking send
+		// mirrors the puller's Enqueue pattern — if the queue is full we
+		// drop and log, same as Phase 2's file-pull overflow. The dropped
+		// file stays in the manifest, and Phase 3 catch-up reconciles it
+		// on the next restart.
+		select {
+		case c.deleteQueue <- deleteRequest{path: path, reason: reason}:
+		default:
+			c.logger.Warn().
+				Str("path", path).
+				Str("reason", reason).
+				Msg("Phase 4 local delete queue full; dropping (will reconcile on restart)")
+		}
 	}
+	// Initialize the delete-worker pool BEFORE registering FSM callbacks.
+	// The callbacks fire synchronously from Raft apply — if a DeleteFile
+	// command arrives between SetFileCallbacks and queue init, the
+	// onDelete closure would send to a nil channel.
+	if c.deleteQueue == nil {
+		c.deleteQueue = make(chan deleteRequest, deleteQueueSize)
+		for i := 0; i < deleteWorkerCount; i++ {
+			c.deleteWg.Add(1)
+			go c.runDeleteWorker()
+		}
+	}
+
 	fsm.SetFileCallbacks(onRegister, onDelete)
 
 	// Start the puller workers.
@@ -1636,6 +1846,8 @@ func (c *Coordinator) startFilePullerLocked() error {
 	c.logger.Info().
 		Int("workers", pullerCfg.Workers).
 		Int("queue_size", pullerCfg.QueueSize).
+		Int("delete_workers", deleteWorkerCount).
+		Int("delete_queue_size", deleteQueueSize).
 		Msg("Peer file replication puller started")
 
 	// Phase 3: kick off the catch-up walker in a background goroutine so
@@ -1768,8 +1980,16 @@ func (c *Coordinator) StartReplication() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Create context for replication
-	c.ctx, c.cancel = context.WithCancel(context.Background())
+	// c.ctx is initialized in Start() — we must NOT overwrite it here,
+	// otherwise handleFetchFile and other goroutines using the original
+	// context would end up with an orphan parent. StartReplication runs
+	// after Start so c.ctx is guaranteed non-nil.
+	if c.ctx == nil {
+		// Defensive: if a caller somehow invokes StartReplication without
+		// Start having run first, fall back to a fresh context so we
+		// don't crash on a nil parent.
+		c.ctx, c.cancel = context.WithCancel(context.Background())
+	}
 
 	if c.localNode.Role == RoleWriter || c.localNode.Role == RoleStandalone {
 		// Writer: start sender to stream entries to readers
@@ -2049,6 +2269,17 @@ func (c *Coordinator) IsLeader() bool {
 	return c.raftNode.IsLeader()
 }
 
+// LocalNodeID returns the local cluster node ID. Phase 4 uses this via
+// the CompactionBridge to set OriginNodeID on compacted-file Raft entries
+// so Phase 2/3's multi-peer resolver routes replica pulls back to the
+// compactor that produced the output.
+func (c *Coordinator) LocalNodeID() string {
+	if c.localNode == nil {
+		return ""
+	}
+	return c.localNode.ID
+}
+
 // LeaderAddr returns the address of the current Raft leader.
 // Returns empty string if Raft is not configured.
 func (c *Coordinator) LeaderAddr() string {
@@ -2140,49 +2371,90 @@ func (c *Coordinator) UpdateNodeStateViaRaft(nodeID string, state NodeState) err
 
 // RegisterFileInManifest appends a file entry to the cluster-wide manifest
 // via Raft. Returns nil if Raft is not initialized (standalone mode).
-// Only the Raft leader can append; non-leader nodes silently skip — the
-// manifest is not critical for correctness in Phase 1 since replication is
-// not yet active. A future phase will add forwarding to the leader.
+//
+// Phase 4: when the local node is not the Raft leader, the command is
+// forwarded to the current leader over the peer protocol instead of being
+// silently dropped. Prior to Phase 4 this method returned nil on
+// non-leader, which was a latent data-loss bug — writers that were not
+// the leader would silently lose all their file registrations and the
+// manifest would diverge from storage.
+//
+// On forwarding failure (no leader known, leader unreachable, or the
+// leader rejects the apply), the error is returned and the caller can
+// retry. The forwarding path is bounded by forwardApplyTimeout so a
+// stuck leader doesn't block the writer flush hot path indefinitely.
 func (c *Coordinator) RegisterFileInManifest(file raft.FileEntry) error {
 	if c.raftNode == nil {
 		// Standalone mode — no manifest needed
 		return nil
 	}
 
-	if !c.raftNode.IsLeader() {
-		// Non-leader writers can't append directly. In Phase 1 this is
-		// acceptable: the manifest is informational. Phase 2 will add
-		// leader forwarding for non-leader writers.
-		c.logger.Debug().
-			Str("path", file.Path).
-			Msg("Skipping manifest registration (not the Raft leader)")
+	if c.raftNode.IsLeader() {
+		if err := c.raftNode.RegisterFile(file, 5*time.Second); err != nil {
+			return fmt.Errorf("register file in manifest: %w", err)
+		}
 		return nil
 	}
 
-	if err := c.raftNode.RegisterFile(file, 5*time.Second); err != nil {
-		return fmt.Errorf("register file in manifest: %w", err)
+	// Phase 4: forward to the current Raft leader. Build the same Command
+	// shape Node.RegisterFile would build locally so the leader's
+	// Node.Apply call is identical to a local apply.
+	payload, err := json.Marshal(raft.RegisterFilePayload{File: file})
+	if err != nil {
+		return fmt.Errorf("register file in manifest: marshal payload: %w", err)
+	}
+	cmd := &raft.Command{Type: raft.CommandRegisterFile, Payload: payload}
+
+	forwardCtx, cancel := context.WithTimeout(c.ctxOrBackground(), forwardApplyTimeout)
+	defer cancel()
+	if err := c.forwardApplyToLeader(forwardCtx, cmd); err != nil {
+		return fmt.Errorf("register file in manifest (forwarded): %w", err)
 	}
 	return nil
 }
 
 // DeleteFileFromManifest removes a file from the cluster-wide manifest.
 // Called by retention and compaction cleanup.
+//
+// Phase 4: same leader-forwarding semantics as RegisterFileInManifest.
+// Non-leader callers no longer silently drop the command.
 func (c *Coordinator) DeleteFileFromManifest(path, reason string) error {
 	if c.raftNode == nil {
 		return nil
 	}
 
-	if !c.raftNode.IsLeader() {
-		c.logger.Debug().
-			Str("path", path).
-			Msg("Skipping manifest deletion (not the Raft leader)")
+	if c.raftNode.IsLeader() {
+		if err := c.raftNode.DeleteFile(path, reason, 5*time.Second); err != nil {
+			return fmt.Errorf("delete file from manifest: %w", err)
+		}
 		return nil
 	}
 
-	if err := c.raftNode.DeleteFile(path, reason, 5*time.Second); err != nil {
-		return fmt.Errorf("delete file from manifest: %w", err)
+	// Phase 4: forward to the current Raft leader.
+	payload, err := json.Marshal(raft.DeleteFilePayload{Path: path, Reason: reason})
+	if err != nil {
+		return fmt.Errorf("delete file from manifest: marshal payload: %w", err)
+	}
+	cmd := &raft.Command{Type: raft.CommandDeleteFile, Payload: payload}
+
+	forwardCtx, cancel := context.WithTimeout(c.ctxOrBackground(), forwardApplyTimeout)
+	defer cancel()
+	if err := c.forwardApplyToLeader(forwardCtx, cmd); err != nil {
+		return fmt.Errorf("delete file from manifest (forwarded): %w", err)
 	}
 	return nil
+}
+
+// ctxOrBackground returns the coordinator's lifecycle context if it has
+// been initialized (always the case after Start), or context.Background()
+// as a defensive fallback for callers that somehow reach these methods
+// before Start has run. Phase 4 forward-apply derives bounded contexts
+// from this so shutdown cancels in-flight forwards.
+func (c *Coordinator) ctxOrBackground() context.Context {
+	if c.ctx == nil {
+		return context.Background()
+	}
+	return c.ctx
 }
 
 // GetFileManifest returns the current file manifest from the Raft FSM.
