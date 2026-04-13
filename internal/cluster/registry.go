@@ -172,6 +172,16 @@ func (r *Registry) RecordHeartbeat(nodeID string, stats NodeStats) bool {
 	return true
 }
 
+// UpdateNodeState updates the state of the real node in the registry.
+// Called from handleHeartbeat to propagate the peer's self-reported state.
+func (r *Registry) UpdateNodeState(nodeID string, state NodeState) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if node, exists := r.nodes[nodeID]; exists {
+		node.UpdateState(state)
+	}
+}
+
 // GetLastHeartbeat returns the LastHeartbeat timestamp of the real node in
 // the registry. Returns zero time if the node doesn't exist.
 func (r *Registry) GetLastHeartbeat(nodeID string) time.Time {

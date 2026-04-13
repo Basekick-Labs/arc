@@ -1151,8 +1151,10 @@ func (c *Coordinator) sendJoinSuccess(conn net.Conn) {
 
 // handleHeartbeat processes a heartbeat from a peer.
 func (c *Coordinator) handleHeartbeat(conn net.Conn, hb *protocol.Heartbeat) {
-	// Update the real node's LastHeartbeat in the registry (not a clone).
+	// Update the real node's LastHeartbeat and self-reported state in the
+	// registry (not a clone).
 	c.registry.RecordHeartbeat(hb.NodeID, NodeStats{})
+	c.registry.UpdateNodeState(hb.NodeID, NodeState(hb.State))
 
 	// Send acknowledgment
 	ack := protocol.NewHeartbeatAck(&protocol.HeartbeatAck{
