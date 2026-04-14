@@ -226,13 +226,17 @@ func (b *AzureBlobBackend) ReadTo(ctx context.Context, path string, writer io.Wr
 
 // ReadToAt reads data from Azure Blob Storage starting at the given byte
 // offset and writes to writer. Uses blob.HTTPRange to skip already-transferred
-// bytes. offset=0 fetches the full blob (no range restriction).
+// bytes. offset=0 fetches the full blob without a Range header.
 func (b *AzureBlobBackend) ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error {
 	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(path)
 
-	resp, err := blobClient.DownloadStream(ctx, &blob.DownloadStreamOptions{
-		Range: blob.HTTPRange{Offset: offset},
-	})
+	var opts *blob.DownloadStreamOptions
+	if offset > 0 {
+		opts = &blob.DownloadStreamOptions{
+			Range: blob.HTTPRange{Offset: offset},
+		}
+	}
+	resp, err := blobClient.DownloadStream(ctx, opts)
 	if err != nil {
 		return fmt.Errorf("failed to read from Azure Blob Storage: %w", err)
 	}

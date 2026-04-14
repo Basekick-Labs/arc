@@ -139,9 +139,22 @@ func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) erro
 	return nil
 }
 
-// WriteReader writes data from a reader to the specified path (for large files)
+// partPath returns the persistent in-progress path for a file being written by
+// WriteReader or AppendReader. Using a deterministic name (rather than a
+// random .tmp) means a partial write that survives a crash or transport error
+// is discoverable by StatFile and ReadToAt, enabling the puller to resume from
+// the last committed byte on the next attempt.
+func partPath(fullPath string) string {
+	return fullPath + ".part"
+}
+
+// WriteReader writes data from a reader to the specified path (for large files).
+//
+// Writes proceed to a deterministic "<path>.part" staging file so that a
+// partial transfer interrupted by a transport error leaves recoverable bytes
+// on disk. On success the staging file is atomically renamed to the final path.
+// On error the staging file is left in place so the puller can resume from it.
 func (b *LocalBackend) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) error {
-	// Validate and sanitize the path to prevent path traversal
 	fullPath, err := b.validatePath(path)
 	if err != nil {
 		return fmt.Errorf("invalid path: %w", err)
@@ -152,10 +165,9 @@ func (b *LocalBackend) WriteReader(ctx context.Context, path string, reader io.R
 		return err
 	}
 
-	// Write to temporary file with cryptographically random name (prevents TOCTOU attacks)
-	tmpFile, err := os.CreateTemp(dir, ".arc-*.tmp")
+	stagingPath := partPath(fullPath)
+	stagingFile, err := os.OpenFile(stagingPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
-		// Directory might have been deleted externally — invalidate cache and retry
 		if os.IsNotExist(err) {
 			b.dirMu.Lock()
 			delete(b.dirCache, dir)
@@ -163,37 +175,34 @@ func (b *LocalBackend) WriteReader(ctx context.Context, path string, reader io.R
 			if err := b.ensureDir(dir); err != nil {
 				return err
 			}
-			tmpFile, err = os.CreateTemp(dir, ".arc-*.tmp")
+			stagingFile, err = os.OpenFile(stagingPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 			if err != nil {
-				return fmt.Errorf("failed to create temp file: %w", err)
+				return fmt.Errorf("failed to create staging file: %w", err)
 			}
 		} else {
-			return fmt.Errorf("failed to create temp file: %w", err)
+			return fmt.Errorf("failed to create staging file: %w", err)
 		}
 	}
-	tmpPath := tmpFile.Name()
 
-	// Copy data
-	written, err := io.Copy(tmpFile, reader)
-	closeErr := tmpFile.Close()
+	written, copyErr := io.Copy(stagingFile, reader)
+	closeErr := stagingFile.Close()
 
-	if err != nil {
-		os.Remove(tmpPath) // Clean up temp file on error
-		return fmt.Errorf("failed to write data: %w", err)
+	if copyErr != nil {
+		// Leave staging file in place — puller can resume from it.
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to write data: %w", copyErr)
 	}
 	if closeErr != nil {
-		os.Remove(tmpPath) // Clean up temp file on error
-		return fmt.Errorf("failed to close temp file: %w", closeErr)
-	}
-
-	// Atomic rename
-	if err := os.Rename(tmpPath, fullPath); err != nil {
-		os.Remove(tmpPath) // Clean up temp file on error
 		metrics.Get().IncStorageErrors()
-		return fmt.Errorf("failed to rename temp file: %w", err)
+		return fmt.Errorf("failed to close staging file: %w", closeErr)
 	}
 
-	// Record metrics
+	// Atomic promotion: rename staging → final.
+	if err := os.Rename(stagingPath, fullPath); err != nil {
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to promote staging file: %w", err)
+	}
+
 	metrics.Get().IncStorageWrites()
 	metrics.Get().IncStorageWriteBytes(written)
 
@@ -261,8 +270,10 @@ func (b *LocalBackend) ReadTo(ctx context.Context, path string, writer io.Writer
 	return nil
 }
 
-// ReadToAt reads data from the specified path starting at the given byte offset
-// and writes it to the writer. An offset of 0 is equivalent to ReadTo.
+// ReadToAt reads data from path starting at the given byte offset and writes
+// to writer. offset=0 starts at the beginning. Falls back to the ".part"
+// staging file if the final file does not exist (allows the puller to hash a
+// partial prefix before resuming a transfer).
 func (b *LocalBackend) ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error {
 	fullPath, err := b.validatePath(path)
 	if err != nil {
@@ -272,7 +283,14 @@ func (b *LocalBackend) ReadToAt(ctx context.Context, path string, writer io.Writ
 		return fmt.Errorf("negative offset: %d", offset)
 	}
 
-	file, err := os.Open(fullPath)
+	// Prefer the final file; fall back to the staging file so tryResumeFromPartial
+	// can hash a prefix even before the transfer completes.
+	openPath := fullPath
+	if _, statErr := os.Stat(fullPath); os.IsNotExist(statErr) {
+		openPath = partPath(fullPath)
+	}
+
+	file, err := os.Open(openPath)
 	if err != nil {
 		metrics.Get().IncStorageErrors()
 		if os.IsNotExist(err) {
@@ -287,7 +305,6 @@ func (b *LocalBackend) ReadToAt(ctx context.Context, path string, writer io.Writ
 			return fmt.Errorf("seek to offset %d: %w", offset, err)
 		}
 	}
-	// offset=0: no seek needed; file position is already at the start.
 
 	bytesRead, err := io.Copy(writer, file)
 	if err != nil {
@@ -300,34 +317,52 @@ func (b *LocalBackend) ReadToAt(ctx context.Context, path string, writer io.Writ
 	return nil
 }
 
-// StatFile returns the byte size of the file at path, or -1 if the file does
-// not exist. Returns a non-nil error only for unexpected failures.
+// StatFile returns the byte size of the file at path, or -1 if neither the
+// final file nor its ".part" staging file exist.
+// Returns a non-nil error only for unexpected failures.
+//
+// Checking the staging file allows the puller's pre-pull check to distinguish
+// a fully-received file (size == entry.SizeBytes → skip) from a partial one
+// (size < entry.SizeBytes → resume).
 func (b *LocalBackend) StatFile(ctx context.Context, path string) (int64, error) {
 	fullPath, err := b.validatePath(path)
 	if err != nil {
 		return -1, fmt.Errorf("invalid path: %w", err)
 	}
 	info, err := os.Stat(fullPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return -1, nil
-		}
+	if err == nil {
+		return info.Size(), nil
+	}
+	if !os.IsNotExist(err) {
 		return -1, fmt.Errorf("stat %s: %w", path, err)
 	}
-	return info.Size(), nil
+	// Final file absent — check the staging file.
+	info, err = os.Stat(partPath(fullPath))
+	if err == nil {
+		return info.Size(), nil
+	}
+	if os.IsNotExist(err) {
+		return -1, nil
+	}
+	return -1, fmt.Errorf("stat %s.part: %w", path, err)
 }
 
-// AppendReader appends appendSize bytes from reader to the existing file at path.
+// AppendReader appends bytes from reader to the ".part" staging file at path.
+// When all bytes have been appended (the transfer is complete), the caller
+// must call WriteReader (or the coordinator renames the file externally).
+//
+// This satisfies AppendingBackend, which the puller type-asserts before calling.
 func (b *LocalBackend) AppendReader(ctx context.Context, path string, reader io.Reader, appendSize int64) error {
 	fullPath, err := b.validatePath(path)
 	if err != nil {
 		return fmt.Errorf("invalid path: %w", err)
 	}
 
-	file, err := os.OpenFile(fullPath, os.O_WRONLY|os.O_APPEND, 0600)
+	stagingPath := partPath(fullPath)
+	file, err := os.OpenFile(stagingPath, os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		metrics.Get().IncStorageErrors()
-		return fmt.Errorf("failed to open file for append: %w", err)
+		return fmt.Errorf("failed to open staging file for append: %w", err)
 	}
 	defer file.Close()
 
@@ -335,6 +370,17 @@ func (b *LocalBackend) AppendReader(ctx context.Context, path string, reader io.
 	if err != nil {
 		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to append file data: %w", err)
+	}
+
+	// After appending, promote staging → final if we've received all expected bytes.
+	if written == appendSize {
+		if err := file.Close(); err != nil {
+			return fmt.Errorf("failed to close staging file: %w", err)
+		}
+		if err := os.Rename(stagingPath, fullPath); err != nil {
+			metrics.Get().IncStorageErrors()
+			return fmt.Errorf("failed to promote staging file after append: %w", err)
+		}
 	}
 
 	metrics.Get().IncStorageWrites()

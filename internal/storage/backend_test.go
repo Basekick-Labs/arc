@@ -3,6 +3,8 @@ package storage
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -414,7 +416,8 @@ func TestLocalBackend_ReadToAt(t *testing.T) {
 }
 
 // TestLocalBackend_AppendReader verifies that AppendingBackend is implemented,
-// and that AppendReader correctly appends bytes to an existing file.
+// and that AppendReader correctly appends bytes to a staging (.part) file
+// left by a failed WriteReader, then promotes it to the final path.
 func TestLocalBackend_AppendReader(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "arc-storage-appendreader-*")
 	if err != nil {
@@ -437,23 +440,44 @@ func TestLocalBackend_AppendReader(t *testing.T) {
 		t.Fatal("LocalBackend does not implement AppendingBackend")
 	}
 
-	prefix := []byte("hello ")
-	if err := backend.Write(ctx, "db/tbl/partial.parquet", prefix); err != nil {
-		t.Fatalf("Write: %v", err)
+	fullBody := []byte("hello world")
+	path := "db/tbl/partial.parquet"
+
+	// Simulate a failed WriteReader: use a pipe where we send only the prefix,
+	// then close with an error. This leaves a ".part" staging file on disk.
+	prefix := fullBody[:6] // "hello "
+	tail := fullBody[6:]   // "world"
+
+	pr, pw := io.Pipe()
+	writeErrCh := make(chan error, 1)
+	go func() {
+		writeErrCh <- backend.WriteReader(ctx, path, pr, int64(len(fullBody)))
+	}()
+	_, _ = pw.Write(prefix)
+	_ = pw.CloseWithError(errors.New("simulated transport failure"))
+	<-writeErrCh // ignore the error — we expect it
+
+	// Staging file should exist with the prefix bytes.
+	size, err := backend.StatFile(ctx, path)
+	if err != nil {
+		t.Fatalf("StatFile after partial write: %v", err)
+	}
+	if size != int64(len(prefix)) {
+		t.Fatalf("expected staging size %d, got %d", len(prefix), size)
 	}
 
-	tail := []byte("world")
-	if err := ab.AppendReader(ctx, "db/tbl/partial.parquet", bytes.NewReader(tail), int64(len(tail))); err != nil {
+	// AppendReader appends the tail to the staging file and promotes it.
+	if err := ab.AppendReader(ctx, path, bytes.NewReader(tail), int64(len(tail))); err != nil {
 		t.Fatalf("AppendReader: %v", err)
 	}
 
-	got, err := backend.Read(ctx, "db/tbl/partial.parquet")
+	// Final file should now contain the full body.
+	got, err := backend.Read(ctx, path)
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
-	want := "hello world"
-	if string(got) != want {
-		t.Errorf("got %q, want %q", got, want)
+	if string(got) != string(fullBody) {
+		t.Errorf("got %q, want %q", got, fullBody)
 	}
 }
 

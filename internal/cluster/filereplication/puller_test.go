@@ -54,10 +54,10 @@ func (f *fakeBackend) WriteReader(ctx context.Context, path string, reader io.Re
 	if writeErr != nil {
 		return writeErr
 	}
-	// Read whatever the reader provides. If the reader closes with an error
-	// (e.g. a broken pipe from a cancelled fetch), store the partial bytes and
-	// return the error — matching real backend behaviour where partial bytes
-	// are flushed to disk before the write fails.
+	// Atomic: read all bytes into a staging key. On success, promote to final key.
+	// On error, leave bytes in the ".part" staging key (same as real LocalBackend)
+	// so resume tests can discover them via StatFile/ReadTo.
+	stagingKey := path + ".part"
 	var buf []byte
 	tmp := make([]byte, 4096)
 	var readErr error
@@ -73,11 +73,17 @@ func (f *fakeBackend) WriteReader(ctx context.Context, path string, reader io.Re
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if len(buf) > 0 {
-		f.files[path] = buf
-	}
-	if readErr == io.EOF {
+	if readErr == io.EOF || readErr == nil {
+		// Full transfer: commit to final path and clear staging.
+		if len(buf) > 0 {
+			f.files[path] = buf
+		}
+		delete(f.files, stagingKey)
 		return nil
+	}
+	// Partial transfer: store under staging key; final key is not written.
+	if len(buf) > 0 {
+		f.files[stagingKey] = buf
 	}
 	return readErr
 }
@@ -93,34 +99,48 @@ func (f *fakeBackend) Read(ctx context.Context, path string) ([]byte, error) {
 }
 
 func (f *fakeBackend) ReadTo(ctx context.Context, path string, writer io.Writer) error {
-	data, err := f.Read(ctx, path)
-	if err != nil {
-		return err
+	// Fall back to staging file so tryResumeFromPartial can hash a partial prefix.
+	f.mu.Lock()
+	data, ok := f.files[path]
+	if !ok {
+		data, ok = f.files[path+".part"]
 	}
-	_, err = writer.Write(data)
+	f.mu.Unlock()
+	if !ok {
+		return errors.New("not found")
+	}
+	_, err := writer.Write(data)
 	return err
 }
 
 func (f *fakeBackend) ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error {
-	data, err := f.Read(ctx, path)
-	if err != nil {
-		return err
+	f.mu.Lock()
+	data, ok := f.files[path]
+	if !ok {
+		data, ok = f.files[path+".part"]
+	}
+	f.mu.Unlock()
+	if !ok {
+		return errors.New("not found")
 	}
 	if offset < 0 || offset > int64(len(data)) {
 		return fmt.Errorf("offset %d out of range for file size %d", offset, len(data))
 	}
-	_, err = writer.Write(data[offset:])
+	_, err := writer.Write(data[offset:])
 	return err
 }
 
 func (f *fakeBackend) StatFile(ctx context.Context, path string) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	data, ok := f.files[path]
-	if !ok {
-		return -1, nil
+	if data, ok := f.files[path]; ok {
+		return int64(len(data)), nil
 	}
-	return int64(len(data)), nil
+	// Check staging file (mirrors LocalBackend behaviour).
+	if data, ok := f.files[path+".part"]; ok {
+		return int64(len(data)), nil
+	}
+	return -1, nil
 }
 
 func (f *fakeBackend) AppendReader(ctx context.Context, path string, reader io.Reader, appendSize int64) error {
@@ -134,22 +154,31 @@ func (f *fakeBackend) AppendReader(ctx context.Context, path string, reader io.R
 	if err != nil {
 		return err
 	}
+	stagingKey := path + ".part"
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.files[path] = append(f.files[path], tail...)
+	merged := append(f.files[stagingKey], tail...)
+	if int64(len(tail)) == appendSize {
+		// Full tail received — promote staging → final.
+		f.files[path] = merged
+		delete(f.files, stagingKey)
+	} else {
+		f.files[stagingKey] = merged
+	}
 	return nil
-}
-
-func (f *fakeBackend) List(ctx context.Context, prefix string) ([]string, error) {
-	panic("not used")
 }
 
 func (f *fakeBackend) Delete(ctx context.Context, path string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.files, path)
+	delete(f.files, path+".part") // also clean up staging file
 	f.deletedPaths = append(f.deletedPaths, path)
 	return nil
+}
+
+func (f *fakeBackend) List(ctx context.Context, prefix string) ([]string, error) {
+	panic("not used")
 }
 
 func (f *fakeBackend) Exists(ctx context.Context, path string) (bool, error) {

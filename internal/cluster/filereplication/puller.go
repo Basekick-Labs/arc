@@ -599,6 +599,10 @@ func (p *Puller) writeFileTail(ctx context.Context, entry *raft.FileEntry, r io.
 // and, if so, hashes its bytes so the fetch client can continue the SHA-256
 // chain over the tail. Returns (offset, hasher) on success, or (0, nil) if
 // there is no usable partial file (not found, too large, or hash failed).
+//
+// Note: for backends that do not implement AppendingBackend, writeFileTail will
+// return ErrResumeNotSupported when called with a non-zero offset. This is
+// intentional — the puller increments bad_offset_backend and retries from zero.
 func (p *Puller) tryResumeFromPartial(log zerolog.Logger, entry *raft.FileEntry) (int64, hash.Hash) {
 	statCtx, statCancel := context.WithTimeout(p.ctx, 5*time.Second)
 	partial, statErr := p.cfg.Backend.StatFile(statCtx, entry.Path)
