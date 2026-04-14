@@ -545,6 +545,17 @@ func (p *Puller) pullOnce(log zerolog.Logger, entry *raft.FileEntry, peerAddr st
 	_ = pw.CloseWithError(fetchErr)
 	wg.Wait()
 
+	// ErrResumeNotSupported from the write goroutine is the root cause even when
+	// fetchErr is also set (the write goroutine closed the pipe, which caused the
+	// fetch side to see a broken-pipe error). Handle it before fetchErr so the
+	// puller deletes the partial and retries from zero rather than treating this
+	// as a generic transport failure.
+	if errors.Is(writeErr, storage.ErrResumeNotSupported) {
+		p.totalBadOffsetBackend.Add(1)
+		p.deleteFile(log, entry.Path)
+		return fmt.Errorf("backend append not supported, will retry from zero: %w", ErrBadOffset)
+	}
+
 	if fetchErr != nil {
 		if errors.Is(fetchErr, ErrChecksumMismatch) {
 			p.totalChecksumMismatch.Add(1)
@@ -558,12 +569,6 @@ func (p *Puller) pullOnce(log zerolog.Logger, entry *raft.FileEntry, peerAddr st
 		return fetchErr
 	}
 	if writeErr != nil {
-		if errors.Is(writeErr, storage.ErrResumeNotSupported) {
-			// Backend can't append — delete partial, retry from zero next attempt.
-			p.totalBadOffsetBackend.Add(1)
-			p.deleteFile(log, entry.Path)
-			return fmt.Errorf("backend append not supported, will retry from zero: %w", ErrBadOffset)
-		}
 		return fmt.Errorf("backend write: %w", writeErr)
 	}
 	if written != tailBytes {

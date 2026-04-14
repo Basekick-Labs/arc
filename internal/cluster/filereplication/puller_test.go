@@ -1141,3 +1141,104 @@ func TestPuller_BadOffsetDeletesPartialAndRetries(t *testing.T) {
 		t.Errorf("file content mismatch: got %q, want %q", data, fullBody)
 	}
 }
+
+// nonAppendingBackend delegates all Backend methods to fakeBackend but
+// deliberately omits AppendReader, so the puller's AppendingBackend
+// type-assertion fails and ErrResumeNotSupported is returned.
+type nonAppendingBackend struct {
+	inner *fakeBackend
+}
+
+func (b *nonAppendingBackend) Write(ctx context.Context, path string, data []byte) error {
+	return b.inner.Write(ctx, path, data)
+}
+func (b *nonAppendingBackend) WriteReader(ctx context.Context, path string, r io.Reader, size int64) error {
+	return b.inner.WriteReader(ctx, path, r, size)
+}
+func (b *nonAppendingBackend) Read(ctx context.Context, path string) ([]byte, error) {
+	return b.inner.Read(ctx, path)
+}
+func (b *nonAppendingBackend) ReadTo(ctx context.Context, path string, w io.Writer) error {
+	return b.inner.ReadTo(ctx, path, w)
+}
+func (b *nonAppendingBackend) ReadToAt(ctx context.Context, path string, w io.Writer, offset int64) error {
+	return b.inner.ReadToAt(ctx, path, w, offset)
+}
+func (b *nonAppendingBackend) StatFile(ctx context.Context, path string) (int64, error) {
+	return b.inner.StatFile(ctx, path)
+}
+func (b *nonAppendingBackend) List(ctx context.Context, prefix string) ([]string, error) {
+	return b.inner.List(ctx, prefix)
+}
+func (b *nonAppendingBackend) Delete(ctx context.Context, path string) error {
+	return b.inner.Delete(ctx, path)
+}
+func (b *nonAppendingBackend) Exists(ctx context.Context, path string) (bool, error) {
+	return b.inner.Exists(ctx, path)
+}
+func (b *nonAppendingBackend) Close() error       { return nil }
+func (b *nonAppendingBackend) Type() string       { return "non-appending" }
+func (b *nonAppendingBackend) ConfigJSON() string { return "{}" }
+
+// TestPuller_NonAppendingBackendFallback verifies that when the backend does
+// not implement AppendingBackend (e.g. S3/Azure), a resume attempt falls back
+// to a full re-fetch: the bad_offset_backend counter increments, the partial
+// file is deleted, and the next attempt fetches from offset 0.
+func TestPuller_NonAppendingBackendFallback(t *testing.T) {
+
+	inner := newFakeBackend()
+	backend := &nonAppendingBackend{inner: inner}
+
+	fullBody := bytes.Repeat([]byte("z"), 40)
+	entry := makeEntry("testdb/cpu/resume_fallback.parquet", "writer-1", int64(len(fullBody)))
+
+	// Attempt 1: transport error + partial write (simulates mid-transfer drop).
+	// Attempt 2: puller detects partial → type-asserts AppendingBackend → fails
+	//            → ErrResumeNotSupported → bad_offset_backend++ → partial deleted.
+	//            The fetcher is called but the write goroutine closes the pipe
+	//            immediately, so the fetcher gets a broken-pipe error (scripted).
+	// Attempt 3: no partial on disk → fresh full fetch from offset 0 → success.
+	fetcher := newResumeAwareFetcher(fullBody,
+		fmt.Errorf("transport error"),    // attempt 1: mid-transfer drop
+		fmt.Errorf("write: broken pipe"), // attempt 2: pipe closed by write side
+		nil,                              // attempt 3: success (fresh fetch from zero)
+	)
+
+	p, err := New(Config{
+		SelfNodeID:          "reader-1",
+		Backend:             backend,
+		Fetcher:             fetcher,
+		PeerResolver:        multiPeerResolver{addrs: []string{"peer-1:9999"}},
+		Workers:             1,
+		QueueSize:           8,
+		RetryMaxAttempts:    4,
+		RetryInitialBackoff: 1 * time.Millisecond,
+		FetchTimeout:        2 * time.Second,
+		Logger:              zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p.Start(context.Background())
+	defer p.Stop()
+
+	p.Enqueue(entry)
+
+	stats := waitStats(t, p, func(s map[string]int64) bool {
+		return s["pulled"] == 1
+	})
+
+	if stats["pulled"] != 1 {
+		t.Fatalf("expected pulled=1, got %v", stats)
+	}
+	if stats["bad_offset_backend"] != 1 {
+		t.Errorf("expected bad_offset_backend=1, got %v", stats)
+	}
+	data, readErr := inner.Read(context.Background(), entry.Path)
+	if readErr != nil {
+		t.Fatalf("Read: %v", readErr)
+	}
+	if string(data) != string(fullBody) {
+		t.Errorf("file content mismatch after fallback")
+	}
+}
