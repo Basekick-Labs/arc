@@ -182,6 +182,7 @@ func TestTimeSeriesCollector_CollectedMetrics(t *testing.T) {
 			"query_requests_total",
 			"buffer_queue_depth",
 			"buffer_flushes_total",
+			"buffer_flush_failures_total",
 			"storage_writes_total",
 			"storage_write_bytes_total",
 			"storage_reads_total",

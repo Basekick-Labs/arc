@@ -55,6 +55,7 @@ type Metrics struct {
 	bufferRecordsWritten  atomic.Int64
 	bufferFlushesTotal    atomic.Int64
 	bufferErrorsTotal     atomic.Int64
+	bufferFlushFailures   atomic.Int64
 	bufferQueueDepth      atomic.Int64
 
 	// Storage metrics
@@ -100,10 +101,10 @@ type Metrics struct {
 	auditWriteErrors atomic.Int64
 
 	// WAL metrics
-	walRecordsPreserved  atomic.Int64 // Records preserved in WAL for recovery (flush failures)
-	walRecoveryTotal     atomic.Int64 // Successful WAL recovery operations
-	walRecoveryRecords   atomic.Int64 // Total records recovered from WAL
-	walDroppedEntries    atomic.Int64 // Entries dropped due to full WAL buffer
+	walRecordsPreserved atomic.Int64 // Records preserved in WAL for recovery (flush failures)
+	walRecoveryTotal    atomic.Int64 // Successful WAL recovery operations
+	walRecoveryRecords  atomic.Int64 // Total records recovered from WAL
+	walDroppedEntries   atomic.Int64 // Entries dropped due to full WAL buffer
 
 	// Decompression pool metrics
 	decompBufferDiscards atomic.Int64 // Oversized buffers not returned to pool
@@ -224,6 +225,7 @@ func (m *Metrics) SetBufferRecordsBuffered(count int64) { m.bufferRecordsBuffere
 func (m *Metrics) SetBufferRecordsWritten(count int64)  { m.bufferRecordsWritten.Store(count) }
 func (m *Metrics) SetBufferFlushes(count int64)         { m.bufferFlushesTotal.Store(count) }
 func (m *Metrics) SetBufferErrors(count int64)          { m.bufferErrorsTotal.Store(count) }
+func (m *Metrics) IncBufferFlushFailures()              { m.bufferFlushFailures.Add(1) }
 func (m *Metrics) SetBufferQueueDepth(depth int64)      { m.bufferQueueDepth.Store(depth) }
 
 // Storage Metrics
@@ -357,11 +359,12 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"query_latency_count":  m.queryLatencyCount.Load(),
 
 		// Buffer
-		"buffer_records_buffered": m.bufferRecordsBuffered.Load(),
-		"buffer_records_written":  m.bufferRecordsWritten.Load(),
-		"buffer_flushes_total":    m.bufferFlushesTotal.Load(),
-		"buffer_errors_total":     m.bufferErrorsTotal.Load(),
-		"buffer_queue_depth":      m.bufferQueueDepth.Load(),
+		"buffer_records_buffered":     m.bufferRecordsBuffered.Load(),
+		"buffer_records_written":      m.bufferRecordsWritten.Load(),
+		"buffer_flushes_total":        m.bufferFlushesTotal.Load(),
+		"buffer_errors_total":         m.bufferErrorsTotal.Load(),
+		"buffer_flush_failures_total": m.bufferFlushFailures.Load(),
+		"buffer_queue_depth":          m.bufferQueueDepth.Load(),
 
 		// Storage
 		"storage_writes_total":      m.storageWritesTotal.Load(),
@@ -561,6 +564,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_buffer_flushes_total Total buffer flushes\n"...)
 	b = append(b, "# TYPE arc_buffer_flushes_total counter\n"...)
 	b = appendMetric(b, "arc_buffer_flushes_total", float64(m.bufferFlushesTotal.Load()))
+
+	b = append(b, "# HELP arc_buffer_flush_failures_total Total buffer flush failures preserved for WAL recovery\n"...)
+	b = append(b, "# TYPE arc_buffer_flush_failures_total counter\n"...)
+	b = appendMetric(b, "arc_buffer_flush_failures_total", float64(m.bufferFlushFailures.Load()))
 
 	b = append(b, "# HELP arc_buffer_queue_depth Current flush queue depth\n"...)
 	b = append(b, "# TYPE arc_buffer_queue_depth gauge\n"...)

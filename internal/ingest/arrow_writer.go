@@ -744,12 +744,12 @@ type ArrowBuffer struct {
 	shardCount uint32
 
 	// Background flush
-	ctx             context.Context
-	cancel          context.CancelFunc
-	flushTimer      *time.Timer // self-adjusting: fires when the oldest buffer is due to expire
-	flushDeadline   time.Time   // absolute time when flushTimer will fire; updated whenever the timer is (re)set
-	newBufferCh     chan struct{} // signals periodicFlush that a new buffer was created (used for idle→active wake-up)
-	wg              sync.WaitGroup
+	ctx           context.Context
+	cancel        context.CancelFunc
+	flushTimer    *time.Timer   // self-adjusting: fires when the oldest buffer is due to expire
+	flushDeadline time.Time     // absolute time when flushTimer will fire; updated whenever the timer is (re)set
+	newBufferCh   chan struct{} // signals periodicFlush that a new buffer was created (used for idle→active wake-up)
+	wg            sync.WaitGroup
 
 	// OPTIMIZATION: Worker pool for bounded flush concurrency
 	// Prevents goroutine explosion under sustained load
@@ -818,6 +818,14 @@ func (b *ArrowBuffer) HasFlushFailure() bool {
 // Called after successful WAL recovery replay.
 func (b *ArrowBuffer) ResetFlushFailure() {
 	b.hasFlushFailure.Store(false)
+}
+
+// markFlushFailure records that buffered data could not be persisted and must
+// be recovered from WAL.
+func (b *ArrowBuffer) markFlushFailure() {
+	b.totalErrors.Add(1)
+	b.hasFlushFailure.Store(true)
+	metrics.Get().IncBufferFlushFailures()
 }
 
 // getSortKeys returns sort keys for a measurement.
@@ -898,25 +906,25 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 	}
 
 	buffer := &ArrowBuffer{
-		config:          cfg,
-		storage:         storage,
-		writer:          NewArrowWriter(cfg, logger),
-		shards:          make([]*bufferShard, shardCount),
-		shardCount:      uint32(shardCount),
-		ctx:             ctx,
-		cancel:          cancel,
-		flushTimer:      time.NewTimer(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
-		flushDeadline:   time.Now().UTC().Add(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
-		newBufferCh:     make(chan struct{}, 1),
-		flushQueue:      make(chan flushTask, queueSize),
-		flushWorkers:    flushWorkers,
-		flushTimeout:    flushTimeout,
-		maxBufferAge:    time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond,
+		config:               cfg,
+		storage:              storage,
+		writer:               NewArrowWriter(cfg, logger),
+		shards:               make([]*bufferShard, shardCount),
+		shardCount:           uint32(shardCount),
+		ctx:                  ctx,
+		cancel:               cancel,
+		flushTimer:           time.NewTimer(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
+		flushDeadline:        time.Now().UTC().Add(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
+		newBufferCh:          make(chan struct{}, 1),
+		flushQueue:           make(chan flushTask, queueSize),
+		flushWorkers:         flushWorkers,
+		flushTimeout:         flushTimeout,
+		maxBufferAge:         time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond,
 		sortKeysConfig:       sortKeysConfig,
-		defaultSortKeys:     defaultSortKeys,
+		defaultSortKeys:      defaultSortKeys,
 		decimalConfig:        decimalConfig,
 		defaultDecimalConfig: defaultDecimalConfig,
-		logger:          logger.With().Str("component", "arrow-buffer").Logger(),
+		logger:               logger.With().Str("component", "arrow-buffer").Logger(),
 	}
 
 	// Initialize shards
@@ -2062,8 +2070,7 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 			Str("buffer_key", bufferKey).
 			Msg("Failed to merge batches during async flush")
 
-		b.totalErrors.Add(1)
-		b.hasFlushFailure.Store(true)
+		b.markFlushFailure()
 		// Data is already in WAL (written at ingest time) - no need to restore to buffer
 		// WAL will be replayed on restart or via periodic recovery
 		return
@@ -2076,8 +2083,7 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 			Str("buffer_key", bufferKey).
 			Int("records", recordCount).
 			Msg("Failed to flush - data preserved in WAL for recovery")
-		b.totalErrors.Add(1)
-		b.hasFlushFailure.Store(true)
+		b.markFlushFailure()
 		// Data is already in WAL (written at ingest time) - no memory growth
 		// WAL will be replayed on restart or via periodic recovery
 	}
@@ -2275,6 +2281,7 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 	merged, err := b.mergeBatches(recordsToFlush)
 	if err != nil {
 		shard.mu.Lock() // Re-acquire lock for caller
+		b.markFlushFailure()
 		return fmt.Errorf("failed to merge batches: %w", err)
 	}
 
@@ -2282,6 +2289,7 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 	startTime := time.Now().UTC()
 	if err := b.flushBufferLockedDataTime(ctx, bufferKey, database, measurement, merged, recordCount, startTime); err != nil {
 		shard.mu.Lock() // Re-acquire lock for caller
+		b.markFlushFailure()
 		b.logger.Warn().
 			Err(err).
 			Str("buffer_key", bufferKey).
