@@ -116,6 +116,16 @@ Applied defense-in-depth SQL escaping to DuckDB `SET memory_limit` (single-quote
 
 ## Bug Fixes
 
+### Row-Format MessagePack Flush Hardening
+
+Issue #401 reported that row-format MessagePack writes could be silently dropped at flush time with `no time data in batch`. The failure could not be reproduced end-to-end on current builds, but Arc now has explicit regression coverage for the affected path and better visibility if a future flush failure occurs.
+
+**Changes:**
+
+- Added end-to-end regression tests for row-format MessagePack writes covering direct row ingestion, decoder-driven ingestion, and age-based flush.
+- Added a dedicated Prometheus counter, `arc_buffer_flush_failures_total`, to surface flush failures that are preserved in WAL for recovery.
+- Exposed the new flush failure counter through the JSON metrics endpoints and internal time-series collector.
+
 ### RBACManager Goroutine Leak — No Close() Method
 
 The RBACManager background cache cleanup goroutine (`cacheCleanupLoop`) ran in an infinite loop with no shutdown mechanism, leaking a goroutine on every Arc restart.

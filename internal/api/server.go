@@ -318,11 +318,12 @@ func (s *Server) endpointMetricsHandler(c *fiber.Ctx) error {
 			"latency_avg_ms": queryLatencyAvgMs,
 		},
 		"buffer": fiber.Map{
-			"records_buffered": snapshot["buffer_records_buffered"],
-			"records_written":  snapshot["buffer_records_written"],
-			"flushes_total":    snapshot["buffer_flushes_total"],
-			"errors_total":     snapshot["buffer_errors_total"],
-			"queue_depth":      snapshot["buffer_queue_depth"],
+			"records_buffered":     snapshot["buffer_records_buffered"],
+			"records_written":      snapshot["buffer_records_written"],
+			"flushes_total":        snapshot["buffer_flushes_total"],
+			"errors_total":         snapshot["buffer_errors_total"],
+			"flush_failures_total": snapshot["buffer_flush_failures_total"],
+			"queue_depth":          snapshot["buffer_queue_depth"],
 		},
 		"storage": fiber.Map{
 			"writes_total":      snapshot["storage_writes_total"],
