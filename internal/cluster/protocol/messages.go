@@ -188,6 +188,10 @@ type FetchFileRequest struct {
 	Nonce     string `json:"nonce"`
 	Timestamp int64  `json:"timestamp"`
 	HMAC      string `json:"hmac"`
+	// ByteOffset is the byte position to resume from. Zero means start from the
+	// beginning (full fetch). The HMAC does NOT bind ByteOffset — binding it
+	// would invalidate the MAC on resume since the path is already bound.
+	ByteOffset int64 `json:"byte_offset,omitempty"`
 }
 
 // Phase 2 fetch-ack error reasons — human-readable strings the Phase 2
@@ -232,6 +236,11 @@ const (
 	// AckCodeInvalidPath: path sanitization rejected the request (null
 	// byte, absolute path, traversal). Does not fall through.
 	AckCodeInvalidPath AckErrorCode = "invalid_path"
+	// AckCodeBadOffset: the requested byte offset is invalid (negative,
+	// >= file size, or the backend does not support seeking). The puller
+	// should delete any partial file and retry from zero — not fall through
+	// to another peer.
+	AckCodeBadOffset AckErrorCode = "bad_offset"
 )
 
 // FetchFileAckHeader is the response header for a fetch request. If Status is
@@ -242,8 +251,11 @@ type FetchFileAckHeader struct {
 	Status    string       `json:"status"`          // "ok" or "error"
 	Code      AckErrorCode `json:"code,omitempty"`  // machine-readable error category (Phase 3)
 	Error     string       `json:"error,omitempty"` // populated when Status == "error"
-	SizeBytes int64        `json:"size_bytes"`
-	SHA256    string       `json:"sha256"` // hex-encoded; must match manifest SHA256
+	SizeBytes int64        `json:"size_bytes"`      // tail bytes being sent (total - ByteOffset)
+	SHA256    string       `json:"sha256"`          // hex-encoded whole-file hash from manifest
+	// ByteOffset echoes the byte offset the server will serve from. The puller
+	// validates this matches the requested offset before streaming the body.
+	ByteOffset int64 `json:"byte_offset,omitempty"`
 }
 
 // ForwardApplyRequest is sent by a non-leader node to ask the Raft leader

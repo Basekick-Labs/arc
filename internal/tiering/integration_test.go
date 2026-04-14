@@ -87,6 +87,13 @@ func (m *mockBackend) List(_ context.Context, prefix string) ([]string, error) {
 	return paths, nil
 }
 func (m *mockBackend) Close() error { return nil }
+func (m *mockBackend) ReadToAt(_ context.Context, _ string, _ io.Writer, _ int64) error {
+	return nil
+}
+func (m *mockBackend) StatFile(_ context.Context, _ string) (int64, error) { return -1, nil }
+func (m *mockBackend) AppendReader(_ context.Context, _ string, _ io.Reader, _ int64) error {
+	return nil
+}
 
 // mockLicenseClient implements enough of license.Client for testing
 type mockLicenseClient struct {

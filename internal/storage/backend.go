@@ -2,9 +2,15 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"io"
 	"time"
 )
+
+// ErrResumeNotSupported is returned by AppendingBackend.AppendReader on
+// backends that do not support append writes (S3, Azure Blob Storage).
+// Callers should delete any partial file and retry from byte zero.
+var ErrResumeNotSupported = errors.New("storage: resume not supported by this backend")
 
 // Backend defines the interface for storage backends (local, S3, MinIO)
 type Backend interface {
@@ -19,6 +25,16 @@ type Backend interface {
 
 	// ReadTo reads data from the specified path and writes it to the writer
 	ReadTo(ctx context.Context, path string, writer io.Writer) error
+
+	// ReadToAt reads data from path starting at the given byte offset and writes
+	// to writer. offset=0 starts at the beginning (equivalent to ReadTo).
+	// Returns an error if offset is negative or >= file size.
+	ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error
+
+	// StatFile returns the byte size of the file at path.
+	// Returns -1 (and nil error) if the file does not exist.
+	// Returns a non-nil error only for unexpected backend failures.
+	StatFile(ctx context.Context, path string) (int64, error)
 
 	// List lists all objects with the given prefix
 	List(ctx context.Context, prefix string) ([]string, error)
@@ -39,6 +55,23 @@ type Backend interface {
 	// ConfigJSON returns the configuration as JSON for subprocess recreation
 	// Used for subprocess serialization
 	ConfigJSON() string
+}
+
+// AppendingBackend is an optional extension of Backend for backends that
+// support appending bytes to an existing file. Callers type-assert Backend to
+// AppendingBackend before calling AppendReader; if the assertion fails, the
+// backend does not support resumable writes and the caller should fall back to
+// a full re-fetch.
+//
+// Only local-SSD backends implement this. S3 and Azure Blob Storage do not
+// support append on block objects and return ErrResumeNotSupported instead.
+type AppendingBackend interface {
+	Backend
+	// AppendReader appends bytes from reader to the existing file at path.
+	// appendSize is the number of bytes expected from reader (informational;
+	// implementations may ignore it). Returns ErrResumeNotSupported if the
+	// backend cannot append.
+	AppendReader(ctx context.Context, path string, reader io.Reader, appendSize int64) error
 }
 
 // DirectoryLister lists immediate subdirectories at a prefix.

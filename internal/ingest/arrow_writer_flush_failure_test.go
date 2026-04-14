@@ -43,6 +43,15 @@ func (s *failingStorageBackend) List(ctx context.Context, prefix string) ([]stri
 func (s *failingStorageBackend) Close() error       { return nil }
 func (s *failingStorageBackend) Type() string       { return "mock-failing" }
 func (s *failingStorageBackend) ConfigJSON() string { return "{}" }
+func (s *failingStorageBackend) ReadToAt(_ context.Context, _ string, _ io.Writer, _ int64) error {
+	return nil
+}
+func (s *failingStorageBackend) StatFile(_ context.Context, _ string) (int64, error) {
+	return -1, nil
+}
+func (s *failingStorageBackend) AppendReader(_ context.Context, _ string, _ io.Reader, _ int64) error {
+	return nil
+}
 
 func TestArrowBuffer_FlushFailureMetricOnAsyncStorageError(t *testing.T) {
 	cfg := &config.IngestConfig{

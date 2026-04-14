@@ -946,6 +946,13 @@ func (m *mockLocalBackend) Exists(ctx context.Context, path string) (bool, error
 func (m *mockLocalBackend) Close() error                                          { return nil }
 func (m *mockLocalBackend) Type() string                                          { return "mock" }
 func (m *mockLocalBackend) ConfigJSON() string                                    { return "{}" }
+func (m *mockLocalBackend) ReadToAt(_ context.Context, _ string, _ io.Writer, _ int64) error {
+	return nil
+}
+func (m *mockLocalBackend) StatFile(_ context.Context, _ string) (int64, error) { return -1, nil }
+func (m *mockLocalBackend) AppendReader(_ context.Context, _ string, _ io.Reader, _ int64) error {
+	return nil
+}
 
 func TestRewriteTimeBucket(t *testing.T) {
 	tests := []struct {

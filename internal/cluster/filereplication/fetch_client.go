@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"time"
 
@@ -68,12 +69,19 @@ func NewFetchClient(c FetchClient) (*FetchClient, error) {
 // streams body bytes into dst (while computing SHA-256), and verifies that
 // the computed hash matches the manifest SHA-256 from entry.SHA256.
 //
-// Returns the number of body bytes written and any error. On a checksum
-// mismatch the error wraps ErrChecksumMismatch so the puller can distinguish
-// mismatches from transport errors.
+// byteOffset is the byte position to resume from (0 = full fetch). When
+// byteOffset > 0, prefixHasher must be a hash.Hash pre-fed with bytes
+// [0, byteOffset) from the partial local file. Fetch streams bytes
+// [byteOffset, entry.SizeBytes) through the same hasher and verifies the
+// final digest against entry.SHA256. When byteOffset == 0, prefixHasher
+// must be nil; Fetch creates a fresh sha256 hasher internally.
+//
+// Returns the number of tail bytes written to dst and any error. On a
+// checksum mismatch the error wraps ErrChecksumMismatch. On a bad-offset
+// rejection from the peer the error wraps ErrBadOffset.
 //
 // The connection is always closed before returning.
-func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.FileEntry, dst io.Writer) (int64, error) {
+func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.FileEntry, dst io.Writer, byteOffset int64, prefixHasher hash.Hash) (int64, error) {
 	if entry == nil {
 		return 0, fmt.Errorf("fetch: entry is nil")
 	}
@@ -82,6 +90,15 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 	}
 	if entry.SizeBytes < 0 {
 		return 0, fmt.Errorf("fetch: entry has negative SizeBytes=%d", entry.SizeBytes)
+	}
+	if byteOffset < 0 {
+		return 0, fmt.Errorf("fetch: negative byteOffset=%d", byteOffset)
+	}
+	if byteOffset > 0 && prefixHasher == nil {
+		return 0, fmt.Errorf("fetch: byteOffset=%d but prefixHasher is nil", byteOffset)
+	}
+	if byteOffset == 0 && prefixHasher != nil {
+		return 0, fmt.Errorf("fetch: byteOffset=0 but prefixHasher is non-nil")
 	}
 
 	// Step 1: dial. Use security.Dial which wraps tls.DialWithDialer if TLS
@@ -104,7 +121,9 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 	// Step 2: build and send the MsgFetchFile request. The HMAC binds the
 	// request to this specific {nodeID, clusterName, path, timestamp} tuple
 	// so a stolen MAC can't be replayed — neither outside the ±5min freshness
-	// window nor to fetch a different file within it.
+	// window nor to fetch a different file within it. ByteOffset is NOT bound
+	// into the HMAC — binding it would invalidate the MAC on resume since the
+	// path is already bound; offset is positional within that file.
 	nonce, err := security.GenerateNonce()
 	if err != nil {
 		return 0, fmt.Errorf("generate nonce: %w", err)
@@ -113,11 +132,12 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 	mac := security.ComputeFetchHMAC(f.SharedSecret, nonce, f.SelfNodeID, f.ClusterName, entry.Path, ts)
 
 	req := &protocol.FetchFileRequest{
-		Path:      entry.Path,
-		NodeID:    f.SelfNodeID,
-		Nonce:     nonce,
-		Timestamp: ts,
-		HMAC:      mac,
+		Path:       entry.Path,
+		NodeID:     f.SelfNodeID,
+		Nonce:      nonce,
+		Timestamp:  ts,
+		HMAC:       mac,
+		ByteOffset: byteOffset,
 	}
 	if err := protocol.SendMessage(conn, &protocol.Message{
 		Type:    protocol.MsgFetchFile,
@@ -140,21 +160,28 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 		return 0, fmt.Errorf("ack payload has wrong type: %T", ackMsg.Payload)
 	}
 	if ack.Status != "ok" {
-		// Phase 3: if the peer reports "not_found" or "manifest" (i.e. this
-		// peer simply doesn't hold this file), return ErrFileNotOnPeer so
-		// the puller can fall through to the next candidate peer. Code is
-		// empty when talking to a Phase 2 peer that predates this field —
-		// in that case, fall back to matching known human-readable strings.
+		// bad_offset means the server rejected our resume offset. The puller
+		// should delete the partial file and retry from zero — not fall through
+		// to another peer (the file exists there, the offset is just stale).
+		if ack.Code == protocol.AckCodeBadOffset {
+			return 0, fmt.Errorf("%w: %s", ErrBadOffset, ack.Error)
+		}
+		// not_found or manifest: peer simply doesn't hold this file.
 		if isFileNotOnPeerAck(ack) {
 			return 0, fmt.Errorf("%w: %s", ErrFileNotOnPeer, ack.Error)
 		}
 		return 0, fmt.Errorf("peer rejected fetch: %s", ack.Error)
 	}
+	// Validate the ack's offset echo — confirms the server honored our offset.
+	if ack.ByteOffset != byteOffset {
+		return 0, fmt.Errorf("byte offset echo mismatch: requested=%d acked=%d", byteOffset, ack.ByteOffset)
+	}
+	expectedTail := entry.SizeBytes - byteOffset
 	if ack.SizeBytes < 0 {
 		return 0, fmt.Errorf("ack has negative SizeBytes=%d", ack.SizeBytes)
 	}
-	if ack.SizeBytes != entry.SizeBytes {
-		return 0, fmt.Errorf("ack size mismatch: peer=%d manifest=%d", ack.SizeBytes, entry.SizeBytes)
+	if ack.SizeBytes != expectedTail {
+		return 0, fmt.Errorf("ack size mismatch: peer tail=%d expected tail=%d (offset=%d)", ack.SizeBytes, expectedTail, byteOffset)
 	}
 	if ack.SHA256 != entry.SHA256 {
 		// Peer disagrees with our manifest about this file's hash — shouldn't
@@ -163,16 +190,24 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 		return 0, fmt.Errorf("%w: ack hash=%s manifest=%s", ErrChecksumMismatch, ack.SHA256, entry.SHA256)
 	}
 
-	// Step 4: stream exactly SizeBytes of raw body from the connection into
-	// dst, tee'ing through a SHA-256 hasher.
-	hasher := sha256.New()
+	// Step 4: stream exactly ack.SizeBytes (tail) of raw body from the
+	// connection into dst, tee'ing through the SHA-256 hasher.
+	// For a full fetch (byteOffset==0), create a fresh hasher.
+	// For a resume, reuse the caller-supplied prefixHasher which already
+	// absorbed the prefix bytes — so the final digest covers the whole file.
+	var hasher hash.Hash
+	if prefixHasher != nil {
+		hasher = prefixHasher
+	} else {
+		hasher = sha256.New()
+	}
 	mw := io.MultiWriter(dst, hasher)
 	written, err := io.CopyN(mw, conn, ack.SizeBytes)
 	if err != nil {
-		return written, fmt.Errorf("stream body: %w (wrote %d of %d)", err, written, ack.SizeBytes)
+		return written, fmt.Errorf("stream body: %w (wrote %d of %d tail bytes)", err, written, ack.SizeBytes)
 	}
 
-	// Step 5: verify the computed hash matches the expected hash.
+	// Step 5: verify the computed hash matches the expected whole-file hash.
 	computed := hex.EncodeToString(hasher.Sum(nil))
 	if computed != entry.SHA256 {
 		return written, fmt.Errorf("%w: computed=%s expected=%s", ErrChecksumMismatch, computed, entry.SHA256)

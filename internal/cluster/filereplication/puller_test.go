@@ -1,9 +1,11 @@
 package filereplication
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -52,15 +54,38 @@ func (f *fakeBackend) WriteReader(ctx context.Context, path string, reader io.Re
 	if writeErr != nil {
 		return writeErr
 	}
-	// Read the full body to simulate a real backend.
-	data, err := io.ReadAll(reader)
-	if err != nil {
-		return err
+	// Atomic: read all bytes into a staging key. On success, promote to final key.
+	// On error, leave bytes in the ".part" staging key (same as real LocalBackend)
+	// so resume tests can discover them via StatFile/ReadTo.
+	stagingKey := path + ".part"
+	var buf []byte
+	tmp := make([]byte, 4096)
+	var readErr error
+	for {
+		n, err := reader.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+		}
+		if err != nil {
+			readErr = err
+			break
+		}
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.files[path] = data
-	return nil
+	if readErr == io.EOF || readErr == nil {
+		// Full transfer: commit to final path and clear staging.
+		if len(buf) > 0 {
+			f.files[path] = buf
+		}
+		delete(f.files, stagingKey)
+		return nil
+	}
+	// Partial transfer: store under staging key; final key is not written.
+	if len(buf) > 0 {
+		f.files[stagingKey] = buf
+	}
+	return readErr
 }
 
 func (f *fakeBackend) Read(ctx context.Context, path string) ([]byte, error) {
@@ -74,24 +99,86 @@ func (f *fakeBackend) Read(ctx context.Context, path string) ([]byte, error) {
 }
 
 func (f *fakeBackend) ReadTo(ctx context.Context, path string, writer io.Writer) error {
-	data, err := f.Read(ctx, path)
-	if err != nil {
-		return err
+	// Fall back to staging file so tryResumeFromPartial can hash a partial prefix.
+	f.mu.Lock()
+	data, ok := f.files[path]
+	if !ok {
+		data, ok = f.files[path+".part"]
 	}
-	_, err = writer.Write(data)
+	f.mu.Unlock()
+	if !ok {
+		return errors.New("not found")
+	}
+	_, err := writer.Write(data)
 	return err
 }
 
-func (f *fakeBackend) List(ctx context.Context, prefix string) ([]string, error) {
-	panic("not used")
+func (f *fakeBackend) ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error {
+	f.mu.Lock()
+	data, ok := f.files[path]
+	if !ok {
+		data, ok = f.files[path+".part"]
+	}
+	f.mu.Unlock()
+	if !ok {
+		return errors.New("not found")
+	}
+	if offset < 0 || offset > int64(len(data)) {
+		return fmt.Errorf("offset %d out of range for file size %d", offset, len(data))
+	}
+	_, err := writer.Write(data[offset:])
+	return err
+}
+
+func (f *fakeBackend) StatFile(ctx context.Context, path string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if data, ok := f.files[path]; ok {
+		return int64(len(data)), nil
+	}
+	// Check staging file (mirrors LocalBackend behaviour).
+	if data, ok := f.files[path+".part"]; ok {
+		return int64(len(data)), nil
+	}
+	return -1, nil
+}
+
+func (f *fakeBackend) AppendReader(ctx context.Context, path string, reader io.Reader, appendSize int64) error {
+	f.mu.Lock()
+	writeErr := f.writeErr
+	f.mu.Unlock()
+	if writeErr != nil {
+		return writeErr
+	}
+	tail, err := io.ReadAll(reader)
+	if err != nil {
+		return err
+	}
+	stagingKey := path + ".part"
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	merged := append(f.files[stagingKey], tail...)
+	if int64(len(tail)) == appendSize {
+		// Full tail received — promote staging → final.
+		f.files[path] = merged
+		delete(f.files, stagingKey)
+	} else {
+		f.files[stagingKey] = merged
+	}
+	return nil
 }
 
 func (f *fakeBackend) Delete(ctx context.Context, path string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.files, path)
+	delete(f.files, path+".part") // also clean up staging file
 	f.deletedPaths = append(f.deletedPaths, path)
 	return nil
+}
+
+func (f *fakeBackend) List(ctx context.Context, prefix string) ([]string, error) {
+	panic("not used")
 }
 
 func (f *fakeBackend) Exists(ctx context.Context, path string) (bool, error) {
@@ -148,7 +235,7 @@ func newRepeatingFetcher(body []byte) *fakeFetcher {
 	}
 }
 
-func (f *fakeFetcher) Fetch(ctx context.Context, peerAddr string, entry *raft.FileEntry, dst io.Writer) (int64, error) {
+func (f *fakeFetcher) Fetch(ctx context.Context, peerAddr string, entry *raft.FileEntry, dst io.Writer, byteOffset int64, prefixHasher hash.Hash) (int64, error) {
 	idx := f.calls.Add(1) - 1
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -213,7 +300,7 @@ func (f *perPeerFetcher) callsFor(peerAddr string) int64 {
 	return 0
 }
 
-func (f *perPeerFetcher) Fetch(ctx context.Context, peerAddr string, entry *raft.FileEntry, dst io.Writer) (int64, error) {
+func (f *perPeerFetcher) Fetch(ctx context.Context, peerAddr string, entry *raft.FileEntry, dst io.Writer, byteOffset int64, prefixHasher hash.Hash) (int64, error) {
 	f.total.Add(1)
 	f.mu.Lock()
 	fn, ok := f.handlers[peerAddr]
@@ -366,8 +453,9 @@ func TestPullerSkipsSelfOrigin(t *testing.T) {
 
 func TestPullerSkipsAlreadyLocalFile(t *testing.T) {
 	backend := newFakeBackend()
-	// Pre-populate: the file already exists locally.
-	_ = backend.Write(context.Background(), "testdb/cpu/existing.parquet", []byte("old bytes"))
+	// Pre-populate: the file already exists locally, size matches entry.SizeBytes.
+	fileData := bytes.Repeat([]byte("x"), 100)
+	_ = backend.Write(context.Background(), "testdb/cpu/existing.parquet", fileData)
 	fetcher := newFakeFetcher() // should never be called
 	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
 
@@ -586,7 +674,7 @@ type blockingFetcher struct {
 	calls   atomic.Int64
 }
 
-func (b *blockingFetcher) Fetch(ctx context.Context, peerAddr string, entry *raft.FileEntry, dst io.Writer) (int64, error) {
+func (b *blockingFetcher) Fetch(ctx context.Context, peerAddr string, entry *raft.FileEntry, dst io.Writer, byteOffset int64, prefixHasher hash.Hash) (int64, error) {
 	b.calls.Add(1)
 	select {
 	case <-ctx.Done():
@@ -926,4 +1014,260 @@ func contains(haystack, needle string) bool {
 		}
 	}
 	return false
+}
+
+// --- Resume / ByteOffset tests -------------------------------------------
+
+// resumeAwareFetcher is a Fetcher that records the byteOffset passed to each
+// Fetch call and writes only the tail of body (body[byteOffset:]) into dst.
+// This lets puller resume tests verify that pullOnce passes the right offset
+// on the second attempt.
+type resumeAwareFetcher struct {
+	mu          sync.Mutex
+	body        []byte // full file bytes
+	offsets     []int64
+	errors      []error // per-call scripted errors; nil = success
+	callCount   atomic.Int64
+}
+
+func newResumeAwareFetcher(body []byte, errs ...error) *resumeAwareFetcher {
+	return &resumeAwareFetcher{body: body, errors: errs}
+}
+
+func (f *resumeAwareFetcher) Fetch(ctx context.Context, peerAddr string, entry *raft.FileEntry, dst io.Writer, byteOffset int64, prefixHasher hash.Hash) (int64, error) {
+	idx := int(f.callCount.Add(1) - 1)
+	f.mu.Lock()
+	f.offsets = append(f.offsets, byteOffset)
+	var fetchErr error
+	if idx < len(f.errors) {
+		fetchErr = f.errors[idx]
+	}
+	f.mu.Unlock()
+
+	// On a transport error (not ErrBadOffset/ErrChecksumMismatch), write a
+	// partial body before returning the error to simulate a mid-transfer drop.
+	if fetchErr != nil && !errors.Is(fetchErr, ErrBadOffset) && !errors.Is(fetchErr, ErrChecksumMismatch) {
+		partial := f.body[byteOffset:]
+		if len(partial) > 4 {
+			partial = partial[:len(partial)/2] // write half of the tail
+		}
+		_, _ = dst.Write(partial)
+		return int64(len(partial)), fetchErr
+	}
+	if fetchErr != nil {
+		return 0, fetchErr
+	}
+	tail := f.body[byteOffset:]
+	n, writeErr := dst.Write(tail)
+	return int64(n), writeErr
+}
+
+func (f *resumeAwareFetcher) lastOffset() int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.offsets) == 0 {
+		return -1
+	}
+	return f.offsets[len(f.offsets)-1]
+}
+
+// TestPuller_ResumeOnRetry verifies that when a partial file is already on
+// disk, the second Fetch call uses byteOffset == len(partial).
+func TestPuller_ResumeOnRetry(t *testing.T) {
+	fullBody := []byte("0123456789abcdefghijklmnopqrstuvwxyz") // 36 bytes
+	entry := makeEntry("db/cpu/resume.parquet", "writer-1", int64(len(fullBody)))
+
+	backend := newFakeBackend()
+
+	// Attempt 1: the fetcher writes half the tail then returns a transport error,
+	// leaving a partial file on disk. Attempt 2 resumes from the partial offset.
+	fetcher := newResumeAwareFetcher(fullBody, errors.New("transport: connection reset"))
+
+	p, err := New(Config{
+		SelfNodeID:          "reader-1",
+		Backend:             backend,
+		Fetcher:             fetcher,
+		PeerResolver:        multiPeerResolver{addrs: []string{"peer-1:9999"}},
+		Workers:             1,
+		QueueSize:           8,
+		RetryMaxAttempts:    2,
+		RetryInitialBackoff: 1 * time.Millisecond,
+		FetchTimeout:        2 * time.Second,
+		Logger:              zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p.Start(context.Background())
+	defer p.Stop()
+
+	p.Enqueue(entry)
+
+	// Wait for both Fetch calls.
+	waitStats(t, p, func(s map[string]int64) bool {
+		return fetcher.callCount.Load() >= 2
+	})
+
+	if fetcher.callCount.Load() < 2 {
+		t.Fatalf("expected at least 2 Fetch calls, got %d", fetcher.callCount.Load())
+	}
+	// Second call should use a non-zero byte offset (the partial written by attempt 1).
+	if fetcher.lastOffset() <= 0 {
+		t.Errorf("second Fetch offset: got %d, want > 0 (should resume from partial)", fetcher.lastOffset())
+	}
+}
+
+// TestPuller_BadOffsetDeletesPartialAndRetries verifies that when the fetcher
+// returns ErrBadOffset, the puller deletes the partial file, increments the
+// bad_offset counter, and continues to retry from zero.
+func TestPuller_BadOffsetDeletesPartialAndRetries(t *testing.T) {
+	fullBody := []byte("full file content here")
+	entry := makeEntry("db/cpu/badoffset.parquet", "writer-1", int64(len(fullBody)))
+
+	backend := newFakeBackend()
+
+	// First call returns ErrBadOffset (server rejects offset 0 — unusual but
+	// possible if the file was replaced between manifest registration and fetch).
+	// Second call succeeds from offset 0.
+	fetcher := newResumeAwareFetcher(fullBody, ErrBadOffset)
+
+	p, err := New(Config{
+		SelfNodeID:          "reader-1",
+		Backend:             backend,
+		Fetcher:             fetcher,
+		PeerResolver:        multiPeerResolver{addrs: []string{"peer-1:9999"}},
+		Workers:             1,
+		QueueSize:           8,
+		RetryMaxAttempts:    3,
+		RetryInitialBackoff: 1 * time.Millisecond,
+		FetchTimeout:        2 * time.Second,
+		Logger:              zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p.Start(context.Background())
+	defer p.Stop()
+
+	p.Enqueue(entry)
+
+	stats := waitStats(t, p, func(s map[string]int64) bool {
+		return s["pulled"] == 1
+	})
+
+	if stats["pulled"] != 1 {
+		t.Fatalf("expected pulled=1, got %v (stats=%v)", stats["pulled"], stats)
+	}
+	if stats["bad_offset_server"] != 1 {
+		t.Errorf("expected bad_offset_server=1, got %v", stats)
+	}
+	// Full file should be on disk after the successful second attempt.
+	data, readErr := backend.Read(context.Background(), entry.Path)
+	if readErr != nil {
+		t.Fatalf("Read after resume: %v", readErr)
+	}
+	if string(data) != string(fullBody) {
+		t.Errorf("file content mismatch: got %q, want %q", data, fullBody)
+	}
+}
+
+// nonAppendingBackend delegates all Backend methods to fakeBackend but
+// deliberately omits AppendReader, so the puller's AppendingBackend
+// type-assertion fails and ErrResumeNotSupported is returned.
+type nonAppendingBackend struct {
+	inner *fakeBackend
+}
+
+func (b *nonAppendingBackend) Write(ctx context.Context, path string, data []byte) error {
+	return b.inner.Write(ctx, path, data)
+}
+func (b *nonAppendingBackend) WriteReader(ctx context.Context, path string, r io.Reader, size int64) error {
+	return b.inner.WriteReader(ctx, path, r, size)
+}
+func (b *nonAppendingBackend) Read(ctx context.Context, path string) ([]byte, error) {
+	return b.inner.Read(ctx, path)
+}
+func (b *nonAppendingBackend) ReadTo(ctx context.Context, path string, w io.Writer) error {
+	return b.inner.ReadTo(ctx, path, w)
+}
+func (b *nonAppendingBackend) ReadToAt(ctx context.Context, path string, w io.Writer, offset int64) error {
+	return b.inner.ReadToAt(ctx, path, w, offset)
+}
+func (b *nonAppendingBackend) StatFile(ctx context.Context, path string) (int64, error) {
+	return b.inner.StatFile(ctx, path)
+}
+func (b *nonAppendingBackend) List(ctx context.Context, prefix string) ([]string, error) {
+	return b.inner.List(ctx, prefix)
+}
+func (b *nonAppendingBackend) Delete(ctx context.Context, path string) error {
+	return b.inner.Delete(ctx, path)
+}
+func (b *nonAppendingBackend) Exists(ctx context.Context, path string) (bool, error) {
+	return b.inner.Exists(ctx, path)
+}
+func (b *nonAppendingBackend) Close() error       { return nil }
+func (b *nonAppendingBackend) Type() string       { return "non-appending" }
+func (b *nonAppendingBackend) ConfigJSON() string { return "{}" }
+
+// TestPuller_NonAppendingBackendFallback verifies that when the backend does
+// not implement AppendingBackend (e.g. S3/Azure), a resume attempt falls back
+// to a full re-fetch: the bad_offset_backend counter increments, the partial
+// file is deleted, and the next attempt fetches from offset 0.
+func TestPuller_NonAppendingBackendFallback(t *testing.T) {
+
+	inner := newFakeBackend()
+	backend := &nonAppendingBackend{inner: inner}
+
+	fullBody := bytes.Repeat([]byte("z"), 40)
+	entry := makeEntry("testdb/cpu/resume_fallback.parquet", "writer-1", int64(len(fullBody)))
+
+	// Attempt 1: transport error + partial write (simulates mid-transfer drop).
+	// Attempt 2: puller detects partial → type-asserts AppendingBackend → fails
+	//            → ErrResumeNotSupported → bad_offset_backend++ → partial deleted.
+	//            The fetcher is called but the write goroutine closes the pipe
+	//            immediately, so the fetcher gets a broken-pipe error (scripted).
+	// Attempt 3: no partial on disk → fresh full fetch from offset 0 → success.
+	fetcher := newResumeAwareFetcher(fullBody,
+		fmt.Errorf("transport error"),    // attempt 1: mid-transfer drop
+		fmt.Errorf("write: broken pipe"), // attempt 2: pipe closed by write side
+		nil,                              // attempt 3: success (fresh fetch from zero)
+	)
+
+	p, err := New(Config{
+		SelfNodeID:          "reader-1",
+		Backend:             backend,
+		Fetcher:             fetcher,
+		PeerResolver:        multiPeerResolver{addrs: []string{"peer-1:9999"}},
+		Workers:             1,
+		QueueSize:           8,
+		RetryMaxAttempts:    4,
+		RetryInitialBackoff: 1 * time.Millisecond,
+		FetchTimeout:        2 * time.Second,
+		Logger:              zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p.Start(context.Background())
+	defer p.Stop()
+
+	p.Enqueue(entry)
+
+	stats := waitStats(t, p, func(s map[string]int64) bool {
+		return s["pulled"] == 1
+	})
+
+	if stats["pulled"] != 1 {
+		t.Fatalf("expected pulled=1, got %v", stats)
+	}
+	if stats["bad_offset_backend"] != 1 {
+		t.Errorf("expected bad_offset_backend=1, got %v", stats)
+	}
+	data, readErr := inner.Read(context.Background(), entry.Path)
+	if readErr != nil {
+		t.Fatalf("Read: %v", readErr)
+	}
+	if string(data) != string(fullBody) {
+		t.Errorf("file content mismatch after fallback")
+	}
 }

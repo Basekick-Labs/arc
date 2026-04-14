@@ -11,8 +11,10 @@ package filereplication
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -28,11 +30,19 @@ import (
 // unit-tested with a fake that returns deterministic bytes/errors without
 // opening real TCP connections.
 type Fetcher interface {
-	// Fetch downloads the file identified by entry from the given peer address
-	// and writes the body bytes into dst. It MUST verify that the peer's
-	// declared SHA-256 matches the expected value from the manifest and that
-	// the body length matches the declared size. Returns (bytesWritten, error).
-	Fetch(ctx context.Context, peerAddr string, entry *raft.FileEntry, dst io.Writer) (int64, error)
+	// Fetch downloads the file (or a tail of it) identified by entry from the
+	// given peer address and writes body bytes into dst.
+	//
+	// byteOffset is the byte position to resume from (0 = full fetch). When
+	// byteOffset > 0, prefixHasher must be a sha256.Hash pre-fed with bytes
+	// [0, byteOffset) from the partial local file. Fetch streams bytes
+	// [byteOffset, entry.SizeBytes) through the same hasher and verifies the
+	// final hash against entry.SHA256. When byteOffset == 0, prefixHasher must
+	// be nil; Fetch creates a fresh hasher internally.
+	//
+	// Returns (bytesWritten, error). bytesWritten counts only the tail bytes
+	// received in this call (not the prefix already on disk).
+	Fetch(ctx context.Context, peerAddr string, entry *raft.FileEntry, dst io.Writer, byteOffset int64, prefixHasher hash.Hash) (int64, error)
 }
 
 // PeerResolver returns an ordered list of peer coordinator addresses that
@@ -136,15 +146,17 @@ type Puller struct {
 	inflight   map[string]struct{}
 
 	// Metrics (atomic for lock-free observability)
-	totalEnqueued          atomic.Int64
-	totalSkippedSelf       atomic.Int64 // origin is self — no pull needed
-	totalSkippedLocal      atomic.Int64 // backend.Exists already true
-	totalSkippedDup        atomic.Int64 // already enqueued / in-flight
-	totalPulled            atomic.Int64 // successful pulls
-	totalFailed            atomic.Int64 // gave up after retries
-	totalDropped           atomic.Int64 // queue full
-	totalChecksumMismatch  atomic.Int64 // bytes didn't match manifest SHA256
-	totalPeerLookupFailure atomic.Int64 // no candidate peers available
+	totalEnqueued               atomic.Int64
+	totalSkippedSelf            atomic.Int64 // origin is self — no pull needed
+	totalSkippedLocal           atomic.Int64 // file fully present locally
+	totalSkippedDup             atomic.Int64 // already enqueued / in-flight
+	totalPulled                 atomic.Int64 // successful pulls
+	totalFailed                 atomic.Int64 // gave up after retries
+	totalDropped                atomic.Int64 // queue full
+	totalChecksumMismatch       atomic.Int64 // bytes didn't match manifest SHA256
+	totalPeerLookupFailure      atomic.Int64 // no candidate peers available
+	totalBadOffsetServer        atomic.Int64 // server rejected resume offset (AckCodeBadOffset)
+	totalBadOffsetBackend       atomic.Int64 // backend can't append (ErrResumeNotSupported)
 
 	// Catch-up metrics (Phase 3). Populated by RunCatchUp and read via Stats.
 	catchupStartedAt     atomic.Int64 // unix seconds; 0 if never started
@@ -326,8 +338,10 @@ func (p *Puller) Stats() map[string]int64 {
 		"pulled":                 p.totalPulled.Load(),
 		"failed":                 p.totalFailed.Load(),
 		"dropped":                p.totalDropped.Load(),
-		"checksum_mismatch":      p.totalChecksumMismatch.Load(),
-		"peer_lookup_failure":    p.totalPeerLookupFailure.Load(),
+		"checksum_mismatch":        p.totalChecksumMismatch.Load(),
+		"peer_lookup_failure":      p.totalPeerLookupFailure.Load(),
+		"bad_offset_server":        p.totalBadOffsetServer.Load(),
+		"bad_offset_backend":       p.totalBadOffsetBackend.Load(),
 		"queue_depth":            int64(len(p.queue)),
 		"catchup_started_at":     p.catchupStartedAt.Load(),
 		"catchup_completed_at":   p.catchupCompletedAt.Load(),
@@ -384,11 +398,13 @@ func (p *Puller) processEntry(log zerolog.Logger, entry *raft.FileEntry) {
 			return
 		}
 
-		// Pre-pull check: skip if already local.
-		existsCtx, cancel := context.WithTimeout(p.ctx, 5*time.Second)
-		exists, existsErr := p.cfg.Backend.Exists(existsCtx, entry.Path)
-		cancel()
-		if existsErr == nil && exists {
+		// Pre-pull check: skip only if the file is fully present locally
+		// (size matches the manifest). A partial file (size < SizeBytes) should
+		// fall through so pullOnce can resume from the byte offset.
+		statCtx, statCancel := context.WithTimeout(p.ctx, 5*time.Second)
+		localSize, statErr := p.cfg.Backend.StatFile(statCtx, entry.Path)
+		statCancel()
+		if statErr == nil && localSize == entry.SizeBytes {
 			p.totalSkippedLocal.Add(1)
 			return
 		}
@@ -486,74 +502,142 @@ func (p *Puller) processEntry(log zerolog.Logger, entry *raft.FileEntry) {
 	}
 }
 
-// pullOnce performs a single fetch attempt end-to-end: opens a pipe into the
-// local backend writer, runs Fetcher.Fetch which streams bytes into the pipe,
-// and verifies the total byte count on success. The Fetcher is expected to
-// verify the SHA-256 itself and return an error on mismatch — this function
-// only tracks the mismatch counter.
+// pullOnce performs a single fetch attempt end-to-end. On attempt > 1 it
+// checks for a partial file and resumes from the byte offset already written,
+// avoiding re-transferring bytes already on disk. The Fetcher verifies SHA-256
+// across the full file (prefix + tail); this function only tracks counters.
 func (p *Puller) pullOnce(log zerolog.Logger, entry *raft.FileEntry, peerAddr string, attempt int) error {
 	fetchCtx, cancel := context.WithTimeout(p.ctx, p.cfg.FetchTimeout)
 	defer cancel()
 
-	// Pipe: producer side (Fetcher writes) → consumer side (backend.WriteReader reads).
-	// This lets us stream body bytes from the peer into the backend without
-	// buffering the entire file in memory.
+	// On retries, attempt to resume from a partial file already on disk.
+	// byteOffset > 0 means [0, byteOffset) is written and only the tail is needed.
+	var byteOffset int64
+	var prefixHasher hash.Hash
+	if attempt > 1 {
+		byteOffset, prefixHasher = p.tryResumeFromPartial(log, entry)
+	}
+
+	tailBytes := entry.SizeBytes - byteOffset
+
+	// Pipe: Fetch writes tail bytes into pw; the write goroutine reads from pr
+	// and commits to the backend. Using a pipe keeps memory flat regardless of
+	// file size — bytes flow directly from the network connection to disk.
 	pr, pw := io.Pipe()
 
-	// Backend writer goroutine: reads from the pipe until EOF or error.
-	// WriteReader is expected to read exactly entry.SizeBytes bytes and then
-	// return.
-	var writeErr error
-	writeDone := make(chan struct{})
+	var (
+		writeErr error
+		wg       sync.WaitGroup
+	)
+	wg.Add(1)
 	go func() {
-		defer close(writeDone)
-		writeErr = p.cfg.Backend.WriteReader(fetchCtx, entry.Path, pr, entry.SizeBytes)
-		// Ensure any pending Fetch writes unblock if the backend aborts early.
-		// (Normal case: backend drains the full body then returns nil.)
+		defer wg.Done()
+		writeErr = p.writeFileTail(fetchCtx, entry, pr, byteOffset, tailBytes)
 		if writeErr != nil {
+			// Signal the fetch side to abort; it will stop writing into pw.
 			_ = pr.CloseWithError(writeErr)
 		}
 	}()
 
-	// Fetch: streams the body bytes into the pipe writer. When the fetcher
-	// finishes (or errors), we close the pipe writer so the backend goroutine
-	// sees EOF.
-	written, fetchErr := p.cfg.Fetcher.Fetch(fetchCtx, peerAddr, entry, pw)
-	// Always close the pipe writer — if fetchErr, propagate so the backend
-	// goroutine unblocks with an error instead of hanging on Read.
-	if fetchErr != nil {
-		_ = pw.CloseWithError(fetchErr)
-	} else {
-		_ = pw.Close()
+	written, fetchErr := p.cfg.Fetcher.Fetch(fetchCtx, peerAddr, entry, pw, byteOffset, prefixHasher)
+	// CloseWithError(nil) is equivalent to Close() — safe in both success and
+	// error paths. Closing pw unblocks the write goroutine's next read.
+	_ = pw.CloseWithError(fetchErr)
+	wg.Wait()
+
+	// ErrResumeNotSupported from the write goroutine is the root cause even when
+	// fetchErr is also set (the write goroutine closed the pipe, which caused the
+	// fetch side to see a broken-pipe error). Handle it before fetchErr so the
+	// puller deletes the partial and retries from zero rather than treating this
+	// as a generic transport failure.
+	if errors.Is(writeErr, storage.ErrResumeNotSupported) {
+		p.totalBadOffsetBackend.Add(1)
+		p.deleteFile(log, entry.Path)
+		return fmt.Errorf("backend append not supported, will retry from zero: %w", ErrBadOffset)
 	}
 
-	// Wait for the backend writer to finish so we observe its error.
-	<-writeDone
-
 	if fetchErr != nil {
-		// Track checksum mismatches separately so operators can see them in metrics.
 		if errors.Is(fetchErr, ErrChecksumMismatch) {
 			p.totalChecksumMismatch.Add(1)
-			// On a checksum mismatch the local file (if any) is corrupt — try to
-			// delete it so the next attempt writes from scratch.
-			delCtx, delCancel := context.WithTimeout(p.ctx, 5*time.Second)
-			if delErr := p.cfg.Backend.Delete(delCtx, entry.Path); delErr != nil {
-				log.Warn().
-					Err(delErr).
-					Str("path", entry.Path).
-					Msg("Failed to delete corrupt file after checksum mismatch")
-			}
-			delCancel()
+			p.deleteFile(log, entry.Path)
+		}
+		if errors.Is(fetchErr, ErrBadOffset) {
+			// Server rejected our resume offset — delete partial, retry from zero.
+			p.totalBadOffsetServer.Add(1)
+			p.deleteFile(log, entry.Path)
 		}
 		return fetchErr
 	}
 	if writeErr != nil {
 		return fmt.Errorf("backend write: %w", writeErr)
 	}
-	if written != entry.SizeBytes {
-		return fmt.Errorf("short body: wrote %d bytes, expected %d", written, entry.SizeBytes)
+	if written != tailBytes {
+		return fmt.Errorf("short body: wrote %d tail bytes, expected %d", written, tailBytes)
 	}
 	return nil
+}
+
+// writeFileTail commits tail bytes from r to the backend. When byteOffset > 0
+// it appends to the partial file via AppendingBackend; when byteOffset == 0 it
+// calls WriteReader for a fresh full-file write.
+//
+// The type-assertion to AppendingBackend is intentional: S3 and Azure Blob do
+// not implement AppendingBackend, so a non-zero offset on those backends
+// returns ErrResumeNotSupported and the puller falls back to a full re-fetch.
+func (p *Puller) writeFileTail(ctx context.Context, entry *raft.FileEntry, r io.Reader, byteOffset, tailBytes int64) error {
+	if byteOffset > 0 {
+		ab, ok := p.cfg.Backend.(storage.AppendingBackend)
+		if !ok {
+			return storage.ErrResumeNotSupported
+		}
+		return ab.AppendReader(ctx, entry.Path, r, tailBytes)
+	}
+	return p.cfg.Backend.WriteReader(ctx, entry.Path, r, entry.SizeBytes)
+}
+
+// tryResumeFromPartial checks whether a partial file exists on disk for entry
+// and, if so, hashes its bytes so the fetch client can continue the SHA-256
+// chain over the tail. Returns (offset, hasher) on success, or (0, nil) if
+// there is no usable partial file (not found, too large, or hash failed).
+//
+// Note: for backends that do not implement AppendingBackend, writeFileTail will
+// return ErrResumeNotSupported when called with a non-zero offset. This is
+// intentional — the puller increments bad_offset_backend and retries from zero.
+func (p *Puller) tryResumeFromPartial(log zerolog.Logger, entry *raft.FileEntry) (int64, hash.Hash) {
+	statCtx, statCancel := context.WithTimeout(p.ctx, 5*time.Second)
+	partial, statErr := p.cfg.Backend.StatFile(statCtx, entry.Path)
+	statCancel()
+	if statErr != nil || partial <= 0 || partial >= entry.SizeBytes {
+		return 0, nil
+	}
+
+	h := sha256.New()
+	hashCtx, hashCancel := context.WithTimeout(p.ctx, 30*time.Second)
+	hashErr := p.cfg.Backend.ReadToAt(hashCtx, entry.Path, h, 0)
+	hashCancel()
+	if hashErr != nil {
+		log.Debug().Err(hashErr).Str("path", entry.Path).
+			Msg("Failed to hash partial file prefix; retrying from zero")
+		p.deleteFile(log, entry.Path)
+		return 0, nil
+	}
+
+	log.Debug().
+		Str("path", entry.Path).
+		Int64("byte_offset", partial).
+		Int64("total_bytes", entry.SizeBytes).
+		Msg("Resuming partial file transfer")
+	return partial, h
+}
+
+// deleteFile is a helper that deletes a file from the local backend, logging
+// a warning if the deletion fails. Used after checksum mismatches and bad offsets.
+func (p *Puller) deleteFile(log zerolog.Logger, path string) {
+	delCtx, delCancel := context.WithTimeout(p.ctx, 5*time.Second)
+	if delErr := p.cfg.Backend.Delete(delCtx, path); delErr != nil {
+		log.Warn().Err(delErr).Str("path", path).Msg("Failed to delete file")
+	}
+	delCancel()
 }
 
 // sleepBackoff sleeps for an exponential backoff interval, honoring context
@@ -585,3 +669,10 @@ var ErrChecksumMismatch = errors.New("filereplication: checksum mismatch")
 // essential for Phase 3 catch-up after a Kubernetes pod rotation where the
 // original writer is gone but other peers still hold the file.
 var ErrFileNotOnPeer = errors.New("filereplication: file not on peer")
+
+// ErrBadOffset is returned by Fetcher implementations when the server rejects
+// the requested byte offset (negative, >= file size, or backend doesn't
+// support seeks). The puller should delete any partial file and retry from
+// zero — not fall through to another peer, since the file exists there and
+// the offset is simply invalid or stale.
+var ErrBadOffset = errors.New("filereplication: bad byte offset")

@@ -1,7 +1,10 @@
 package storage
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -307,6 +310,174 @@ func TestObjectInfo(t *testing.T) {
 	}
 	if info.LastModified.IsZero() {
 		t.Error("Expected non-zero LastModified")
+	}
+}
+
+// TestLocalBackend_StatFile covers the three StatFile cases: not found (-1),
+// exists (correct size), and invalid path (error).
+func TestLocalBackend_StatFile(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-storage-statfile-*")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	logger := zerolog.New(os.Stderr).Level(zerolog.Disabled)
+	backend, err := NewLocalBackend(tmpDir, logger)
+	if err != nil {
+		t.Fatalf("NewLocalBackend: %v", err)
+	}
+	defer backend.Close()
+
+	ctx := context.Background()
+
+	t.Run("not found returns -1", func(t *testing.T) {
+		size, err := backend.StatFile(ctx, "db/tbl/missing.parquet")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if size != -1 {
+			t.Errorf("got %d, want -1", size)
+		}
+	})
+
+	t.Run("existing file returns correct size", func(t *testing.T) {
+		data := []byte("hello world")
+		if err := backend.Write(ctx, "db/tbl/file.parquet", data); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		size, err := backend.StatFile(ctx, "db/tbl/file.parquet")
+		if err != nil {
+			t.Fatalf("StatFile: %v", err)
+		}
+		if size != int64(len(data)) {
+			t.Errorf("got %d, want %d", size, len(data))
+		}
+	})
+
+}
+
+// TestLocalBackend_ReadToAt covers full fetch (offset=0), partial read
+// (offset>0), and out-of-bounds offset.
+func TestLocalBackend_ReadToAt(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-storage-readtoat-*")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	logger := zerolog.New(os.Stderr).Level(zerolog.Disabled)
+	backend, err := NewLocalBackend(tmpDir, logger)
+	if err != nil {
+		t.Fatalf("NewLocalBackend: %v", err)
+	}
+	defer backend.Close()
+
+	ctx := context.Background()
+	content := []byte("abcdefghij") // 10 bytes
+	if err := backend.Write(ctx, "db/tbl/data.parquet", content); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	t.Run("offset=0 reads full file", func(t *testing.T) {
+		var buf bytes.Buffer
+		if err := backend.ReadToAt(ctx, "db/tbl/data.parquet", &buf, 0); err != nil {
+			t.Fatalf("ReadToAt: %v", err)
+		}
+		if buf.String() != string(content) {
+			t.Errorf("got %q, want %q", buf.String(), content)
+		}
+	})
+
+	t.Run("offset=5 reads tail", func(t *testing.T) {
+		var buf bytes.Buffer
+		if err := backend.ReadToAt(ctx, "db/tbl/data.parquet", &buf, 5); err != nil {
+			t.Fatalf("ReadToAt: %v", err)
+		}
+		want := "fghij"
+		if buf.String() != want {
+			t.Errorf("got %q, want %q", buf.String(), want)
+		}
+	})
+
+	t.Run("negative offset returns error", func(t *testing.T) {
+		var buf bytes.Buffer
+		if err := backend.ReadToAt(ctx, "db/tbl/data.parquet", &buf, -1); err == nil {
+			t.Error("expected error for negative offset, got nil")
+		}
+	})
+
+	t.Run("missing file returns error", func(t *testing.T) {
+		var buf bytes.Buffer
+		if err := backend.ReadToAt(ctx, "db/tbl/missing.parquet", &buf, 0); err == nil {
+			t.Error("expected error for missing file, got nil")
+		}
+	})
+}
+
+// TestLocalBackend_AppendReader verifies that AppendingBackend is implemented,
+// and that AppendReader correctly appends bytes to a staging (.part) file
+// left by a failed WriteReader, then promotes it to the final path.
+func TestLocalBackend_AppendReader(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-storage-appendreader-*")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	logger := zerolog.New(os.Stderr).Level(zerolog.Disabled)
+	backend, err := NewLocalBackend(tmpDir, logger)
+	if err != nil {
+		t.Fatalf("NewLocalBackend: %v", err)
+	}
+	defer backend.Close()
+
+	ctx := context.Background()
+
+	// LocalBackend must satisfy AppendingBackend — compile-time check.
+	ab, ok := (Backend)(backend).(AppendingBackend)
+	if !ok {
+		t.Fatal("LocalBackend does not implement AppendingBackend")
+	}
+
+	fullBody := []byte("hello world")
+	path := "db/tbl/partial.parquet"
+
+	// Simulate a failed WriteReader: use a pipe where we send only the prefix,
+	// then close with an error. This leaves a ".part" staging file on disk.
+	prefix := fullBody[:6] // "hello "
+	tail := fullBody[6:]   // "world"
+
+	pr, pw := io.Pipe()
+	writeErrCh := make(chan error, 1)
+	go func() {
+		writeErrCh <- backend.WriteReader(ctx, path, pr, int64(len(fullBody)))
+	}()
+	_, _ = pw.Write(prefix)
+	_ = pw.CloseWithError(errors.New("simulated transport failure"))
+	<-writeErrCh // ignore the error — we expect it
+
+	// Staging file should exist with the prefix bytes.
+	size, err := backend.StatFile(ctx, path)
+	if err != nil {
+		t.Fatalf("StatFile after partial write: %v", err)
+	}
+	if size != int64(len(prefix)) {
+		t.Fatalf("expected staging size %d, got %d", len(prefix), size)
+	}
+
+	// AppendReader appends the tail to the staging file and promotes it.
+	if err := ab.AppendReader(ctx, path, bytes.NewReader(tail), int64(len(tail))); err != nil {
+		t.Fatalf("AppendReader: %v", err)
+	}
+
+	// Final file should now contain the full body.
+	got, err := backend.Read(ctx, path)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if string(got) != string(fullBody) {
+		t.Errorf("got %q, want %q", got, fullBody)
 	}
 }
 

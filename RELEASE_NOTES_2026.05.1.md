@@ -20,6 +20,7 @@ Every file is SHA-256 hashed at flush time and the hash is committed into a Raft
 - `GET /api/v1/cluster/files` returns the full cluster manifest (supports `?database=` filter).
 - Replication status and catch-up progress are surfaced via `/api/v1/cluster/status`.
 - Zero overhead for OSS / standalone deployments.
+- **Resumable transfers**: interrupted pulls resume from the last committed byte instead of restarting from zero. Especially valuable for large compacted Parquet outputs on slow or flaky links. On retry the puller checks how many bytes are already on disk, hashes the prefix to continue the SHA-256 chain, and requests only the remaining tail from the peer. Full-file hash verification is still enforced. S3 and Azure Blob backends fall back to a full re-fetch on resume (append is not supported by those APIs); local-SSD nodes get complete resume support.
 
 **Configuration** (`ARC_CLUSTER_REPLICATION_*` env vars or `cluster.replication_*` in `arc.toml`):
 
