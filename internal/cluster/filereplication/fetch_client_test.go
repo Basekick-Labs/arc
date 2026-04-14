@@ -137,17 +137,27 @@ func (p *fakePeer) handleConn(conn net.Conn) {
 		}
 	}
 
+	// Echo the requested ByteOffset back in the ack so the client can validate it.
+	// For resume requests, also trim the body and adjust SizeBytes to the tail.
+	sendAck := ack
+	sendBody := body
+	if ack.Status == "ok" && req.ByteOffset > 0 && req.ByteOffset <= int64(len(body)) {
+		sendAck.ByteOffset = req.ByteOffset
+		sendAck.SizeBytes = int64(len(body)) - req.ByteOffset
+		sendBody = body[req.ByteOffset:]
+	}
+
 	if err := protocol.SendMessage(conn, &protocol.Message{
 		Type:    protocol.MsgFetchFileAck,
-		Payload: &ack,
+		Payload: &sendAck,
 	}, 2*time.Second); err != nil {
 		return
 	}
-	if ack.Status != "ok" {
+	if sendAck.Status != "ok" {
 		return
 	}
-	if len(body) > 0 {
-		_, _ = conn.Write(body)
+	if len(sendBody) > 0 {
+		_, _ = conn.Write(sendBody)
 	}
 }
 
@@ -188,7 +198,7 @@ func TestFetchClientHappyPath(t *testing.T) {
 		SHA256:    sum,
 	}
 	var dst bytes.Buffer
-	n, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst)
+	n, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst, 0, nil)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -219,7 +229,7 @@ func TestFetchClientChecksumMismatch(t *testing.T) {
 		SHA256:    manifestSum,
 	}
 	var dst bytes.Buffer
-	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst)
+	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst, 0, nil)
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
@@ -248,7 +258,7 @@ func TestFetchClientBodyHashMismatch(t *testing.T) {
 		SHA256:    claimedSum,
 	}
 	var dst bytes.Buffer
-	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst)
+	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst, 0, nil)
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
@@ -269,7 +279,7 @@ func TestFetchClientErrorAck(t *testing.T) {
 		SHA256:    sha256Hex([]byte("dummy")),
 	}
 	var dst bytes.Buffer
-	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst)
+	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst, 0, nil)
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
@@ -290,7 +300,7 @@ func TestFetchClientSizeMismatch(t *testing.T) {
 		SHA256:    sum,
 	}
 	var dst bytes.Buffer
-	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst)
+	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst, 0, nil)
 	if err == nil {
 		t.Fatalf("expected size mismatch error, got nil")
 	}
@@ -305,7 +315,7 @@ func TestFetchClientDialError(t *testing.T) {
 	}
 	var dst bytes.Buffer
 	// Port 1 on loopback should refuse connections.
-	_, err := fc.Fetch(context.Background(), "127.0.0.1:1", entry, &dst)
+	_, err := fc.Fetch(context.Background(), "127.0.0.1:1", entry, &dst, 0, nil)
 	if err == nil {
 		t.Fatalf("expected dial error, got nil")
 	}
@@ -333,7 +343,7 @@ func TestFetchClientHMACSent(t *testing.T) {
 		SHA256:    sum,
 	}
 	var dst bytes.Buffer
-	if _, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst); err != nil {
+	if _, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst, 0, nil); err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
 
@@ -369,7 +379,7 @@ func TestFetchClientPeerDropsBeforeReply(t *testing.T) {
 		SHA256:    sha256Hex([]byte("xxxxxxxxxx")),
 	}
 	var dst bytes.Buffer
-	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst)
+	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst, 0, nil)
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
@@ -422,7 +432,7 @@ func TestFetchClientLargeBody(t *testing.T) {
 		SHA256:    sum,
 	}
 	// Discard dst — we only care that the Fetch succeeds on a large body.
-	n, err := fc.Fetch(context.Background(), peer.addr(), entry, io.Discard)
+	n, err := fc.Fetch(context.Background(), peer.addr(), entry, io.Discard, 0, nil)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -449,7 +459,7 @@ func TestFetchClientErrFileNotOnPeerCodeNotFound(t *testing.T) {
 		SHA256:    sha256Hex([]byte("dummy")),
 	}
 	var dst bytes.Buffer
-	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst)
+	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst, 0, nil)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -473,7 +483,7 @@ func TestFetchClientErrFileNotOnPeerCodeManifest(t *testing.T) {
 		SHA256:    sha256Hex([]byte("dummy")),
 	}
 	var dst bytes.Buffer
-	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst)
+	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst, 0, nil)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -509,7 +519,7 @@ func TestFetchClientErrFileNotOnPeerPhase2Fallback(t *testing.T) {
 				SHA256:    sha256Hex([]byte("dummy")),
 			}
 			var dst bytes.Buffer
-			_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst)
+			_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst, 0, nil)
 			if err == nil {
 				t.Fatal("expected error, got nil")
 			}
@@ -536,7 +546,7 @@ func TestFetchClientAuthErrorIsNotFallback(t *testing.T) {
 		SHA256:    sha256Hex([]byte("dummy")),
 	}
 	var dst bytes.Buffer
-	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst)
+	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst, 0, nil)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -560,11 +570,115 @@ func TestFetchClientBackendErrorIsNotFallback(t *testing.T) {
 		SHA256:    sha256Hex([]byte("dummy")),
 	}
 	var dst bytes.Buffer
-	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst)
+	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst, 0, nil)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
 	if errors.Is(err, ErrFileNotOnPeer) {
 		t.Errorf("backend errors must NOT map to ErrFileNotOnPeer, got %v", err)
+	}
+}
+
+// --- Resume / ByteOffset tests -------------------------------------------
+
+// TestFetchClientResume_HappyPath verifies that a client can resume a partial
+// transfer. The peer serves only the tail bytes; the client chains the
+// provided prefixHasher and verifies the full-file SHA-256.
+func TestFetchClientResume_HappyPath(t *testing.T) {
+	fullBody := []byte("0123456789abcdefghij") // 20 bytes
+	prefix := fullBody[:10]
+	tail := fullBody[10:]
+	fullSum := sha256Hex(fullBody)
+
+	peer := startFakePeer(t)
+	defer peer.stop()
+	// Script the full body — the fake peer will slice it based on ByteOffset.
+	peer.scriptOK(fullSum, fullBody)
+
+	fc := newFetchClient(t, "reader-1", "shared-secret-xyz")
+	entry := &raft.FileEntry{
+		Path:      "db/cpu/resume.parquet",
+		SizeBytes: int64(len(fullBody)),
+		SHA256:    fullSum,
+	}
+
+	// Pre-seed the hasher with the prefix bytes, as the puller would.
+	prefixHasher := sha256.New()
+	prefixHasher.Write(prefix)
+
+	var dst bytes.Buffer
+	n, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst, int64(len(prefix)), prefixHasher)
+	if err != nil {
+		t.Fatalf("Fetch resume: %v", err)
+	}
+	if n != int64(len(tail)) {
+		t.Errorf("bytes written: got %d, want %d (tail only)", n, len(tail))
+	}
+	if !bytes.Equal(dst.Bytes(), tail) {
+		t.Errorf("body mismatch: got %q, want %q", dst.Bytes(), tail)
+	}
+}
+
+// TestFetchClientResume_BadOffsetAck verifies that AckCodeBadOffset maps to
+// ErrBadOffset — not ErrFileNotOnPeer (which would trigger peer fallback).
+func TestFetchClientResume_BadOffsetAck(t *testing.T) {
+	peer := startFakePeer(t)
+	defer peer.stop()
+	peer.scriptErrorCode(protocol.AckCodeBadOffset, "offset 999 >= file size 42")
+
+	fc := newFetchClient(t, "reader-1", "shared-secret-xyz")
+	entry := &raft.FileEntry{
+		Path:      "db/cpu/bad-offset.parquet",
+		SizeBytes: 42,
+		SHA256:    sha256Hex([]byte("dummy")),
+	}
+	prefixHasher := sha256.New()
+	prefixHasher.Write(make([]byte, 10))
+
+	var dst bytes.Buffer
+	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst, 10, prefixHasher)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, ErrBadOffset) {
+		t.Errorf("expected ErrBadOffset, got %v", err)
+	}
+	if errors.Is(err, ErrFileNotOnPeer) {
+		t.Errorf("ErrBadOffset must NOT map to ErrFileNotOnPeer")
+	}
+}
+
+// TestFetchClientResume_OffsetEchoMismatch verifies that if the peer echoes a
+// different ByteOffset than requested, Fetch returns a protocol error.
+func TestFetchClientResume_OffsetEchoMismatch(t *testing.T) {
+	fullBody := []byte("hello world full body")
+	fullSum := sha256Hex(fullBody)
+
+	peer := startFakePeer(t)
+	defer peer.stop()
+	// Script the ack with a different ByteOffset than the client will request.
+	peer.mu.Lock()
+	peer.ack = protocol.FetchFileAckHeader{
+		Status:     "ok",
+		SizeBytes:  int64(len(fullBody)) - 5,
+		SHA256:     fullSum,
+		ByteOffset: 999, // wrong echo
+	}
+	peer.body = fullBody[5:]
+	peer.mu.Unlock()
+
+	fc := newFetchClient(t, "reader-1", "shared-secret-xyz")
+	entry := &raft.FileEntry{
+		Path:      "db/cpu/echo-mismatch.parquet",
+		SizeBytes: int64(len(fullBody)),
+		SHA256:    fullSum,
+	}
+	prefixHasher := sha256.New()
+	prefixHasher.Write(fullBody[:5])
+
+	var dst bytes.Buffer
+	_, err := fc.Fetch(context.Background(), peer.addr(), entry, &dst, 5, prefixHasher)
+	if err == nil {
+		t.Fatal("expected error on offset echo mismatch, got nil")
 	}
 }

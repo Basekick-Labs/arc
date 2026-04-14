@@ -1360,11 +1360,24 @@ func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequ
 		return
 	}
 
-	// Step 5: Send the ack header with the size and checksum from the manifest.
+	// Step 5: Validate the byte offset (if any) and compute the tail size.
+	byteOffset := req.ByteOffset
+	if byteOffset < 0 || byteOffset >= entry.SizeBytes {
+		c.sendFetchError(conn, protocol.AckCodeBadOffset,
+			fmt.Sprintf("invalid byte offset %d for file size %d", byteOffset, entry.SizeBytes))
+		return
+	}
+	tailBytes := entry.SizeBytes - byteOffset
+
+	// Step 6: Send the ack header. SizeBytes is the tail size (bytes being
+	// sent), not the full file size — the puller reads exactly tailBytes.
+	// SHA256 is always the whole-file hash so the puller can verify integrity.
+	// ByteOffset echoes the requested offset so the puller can confirm it.
 	ack := &protocol.FetchFileAckHeader{
-		Status:    "ok",
-		SizeBytes: entry.SizeBytes,
-		SHA256:    entry.SHA256,
+		Status:     "ok",
+		SizeBytes:  tailBytes,
+		SHA256:     entry.SHA256,
+		ByteOffset: byteOffset,
 	}
 	// Short write timeout for the header itself — if the peer is slow reading,
 	// we want to fail fast rather than hold the goroutine.
@@ -1380,8 +1393,9 @@ func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequ
 		return
 	}
 
-	// Step 6: Stream the body directly on the raw connection. No further
-	// protocol framing — the peer reads exactly entry.SizeBytes bytes.
+	// Step 7: Stream the body directly on the raw connection. No further
+	// protocol framing — the peer reads exactly tailBytes bytes.
+	// Use ReadToAt when offset > 0; ReadTo for the full-file case.
 	// The write deadline bounds slow peers; the context is derived from the
 	// coordinator's lifetime so shutdown cancels any in-flight transfer.
 	// Operators serving large Parquet files or running on slow/constrained
@@ -1396,13 +1410,17 @@ func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequ
 	}
 	bodyCtx, bodyCancel := context.WithTimeout(c.ctx, bodyStreamTimeout)
 	defer bodyCancel()
-	if err := backend.ReadTo(bodyCtx, sanitized, conn); err != nil {
+
+	// ReadToAt handles both the full-fetch (offset=0) and resume cases uniformly.
+	bodyErr := backend.ReadToAt(bodyCtx, sanitized, conn, byteOffset)
+	if bodyErr != nil {
 		// The peer will detect a short body via its own size accounting; we
 		// can't meaningfully recover here since the ack has already been sent.
 		c.logger.Warn().
-			Err(err).
+			Err(bodyErr).
 			Str("peer", remoteAddr).
 			Str("path", sanitized).
+			Int64("byte_offset", byteOffset).
 			Msg("FetchFile: error streaming body")
 		return
 	}
@@ -1414,6 +1432,7 @@ func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequ
 		Str("peer", remoteAddr).
 		Str("path", sanitized).
 		Int64("size_bytes", entry.SizeBytes).
+		Int64("byte_offset", byteOffset).
 		Msg("FetchFile served successfully")
 }
 

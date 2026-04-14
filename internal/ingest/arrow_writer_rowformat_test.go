@@ -70,6 +70,15 @@ func (s *capturingStorageBackend) List(ctx context.Context, prefix string) ([]st
 func (s *capturingStorageBackend) Close() error       { return nil }
 func (s *capturingStorageBackend) Type() string       { return "mock-capturing" }
 func (s *capturingStorageBackend) ConfigJSON() string { return "{}" }
+func (s *capturingStorageBackend) ReadToAt(_ context.Context, _ string, _ io.Writer, _ int64) error {
+	return nil
+}
+func (s *capturingStorageBackend) StatFile(_ context.Context, _ string) (int64, error) {
+	return -1, nil
+}
+func (s *capturingStorageBackend) AppendReader(_ context.Context, _ string, _ io.Reader, _ int64) error {
+	return nil
+}
 
 func (s *capturingStorageBackend) writeCount() int {
 	s.mu.Lock()

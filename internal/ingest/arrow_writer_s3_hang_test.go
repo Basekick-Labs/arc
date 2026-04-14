@@ -78,6 +78,15 @@ func (h *hangingStorageBackend) Exists(ctx context.Context, path string) (bool, 
 func (h *hangingStorageBackend) Close() error       { return nil }
 func (h *hangingStorageBackend) Type() string       { return "mock-hanging" }
 func (h *hangingStorageBackend) ConfigJSON() string { return "{}" }
+func (h *hangingStorageBackend) ReadToAt(_ context.Context, _ string, _ io.Writer, _ int64) error {
+	return nil
+}
+func (h *hangingStorageBackend) StatFile(_ context.Context, _ string) (int64, error) {
+	return -1, nil
+}
+func (h *hangingStorageBackend) AppendReader(_ context.Context, _ string, _ io.Reader, _ int64) error {
+	return nil
+}
 
 // makeColumns builds a columnar batch with the given record count.
 func makeColumns(n int) map[string][]interface{} {

@@ -224,6 +224,44 @@ func (b *AzureBlobBackend) ReadTo(ctx context.Context, path string, writer io.Wr
 	return nil
 }
 
+// ReadToAt reads data from Azure Blob Storage starting at the given byte
+// offset and writes to writer. Uses blob.HTTPRange to skip already-transferred
+// bytes. offset=0 fetches the full blob (no range restriction).
+func (b *AzureBlobBackend) ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error {
+	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(path)
+
+	resp, err := blobClient.DownloadStream(ctx, &blob.DownloadStreamOptions{
+		Range: blob.HTTPRange{Offset: offset},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to read from Azure Blob Storage: %w", err)
+	}
+	defer resp.Body.Close()
+
+	_, err = io.Copy(writer, resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to copy Azure blob: %w", err)
+	}
+	return nil
+}
+
+// StatFile returns the byte size of the Azure blob at path, or -1 if not found.
+func (b *AzureBlobBackend) StatFile(ctx context.Context, path string) (int64, error) {
+	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(path)
+
+	resp, err := blobClient.GetProperties(ctx, nil)
+	if err != nil {
+		if isAzureNotFoundError(err) {
+			return -1, nil
+		}
+		return -1, fmt.Errorf("GetProperties %s: %w", path, err)
+	}
+	if resp.ContentLength == nil {
+		return 0, nil
+	}
+	return *resp.ContentLength, nil
+}
+
 // List lists blobs with the given prefix
 func (b *AzureBlobBackend) List(ctx context.Context, prefix string) ([]string, error) {
 	var blobs []string

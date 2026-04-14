@@ -58,6 +58,13 @@ func (m *mockStorageBackend) List(ctx context.Context, prefix string) ([]string,
 func (m *mockStorageBackend) Close() error       { return nil }
 func (m *mockStorageBackend) Type() string       { return "mock" }
 func (m *mockStorageBackend) ConfigJSON() string { return "{}" }
+func (m *mockStorageBackend) ReadToAt(_ context.Context, _ string, _ io.Writer, _ int64) error {
+	return nil
+}
+func (m *mockStorageBackend) StatFile(_ context.Context, _ string) (int64, error) { return -1, nil }
+func (m *mockStorageBackend) AppendReader(_ context.Context, _ string, _ io.Reader, _ int64) error {
+	return nil
+}
 
 func TestRowsToColumnar_SingleRecord(t *testing.T) {
 	buffer := createTestArrowBuffer(t)

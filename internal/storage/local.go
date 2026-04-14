@@ -261,6 +261,87 @@ func (b *LocalBackend) ReadTo(ctx context.Context, path string, writer io.Writer
 	return nil
 }
 
+// ReadToAt reads data from the specified path starting at the given byte offset
+// and writes it to the writer. An offset of 0 is equivalent to ReadTo.
+func (b *LocalBackend) ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error {
+	fullPath, err := b.validatePath(path)
+	if err != nil {
+		return fmt.Errorf("invalid path: %w", err)
+	}
+	if offset < 0 {
+		return fmt.Errorf("negative offset: %d", offset)
+	}
+
+	file, err := os.Open(fullPath)
+	if err != nil {
+		metrics.Get().IncStorageErrors()
+		if os.IsNotExist(err) {
+			return fmt.Errorf("file not found: %s", path)
+		}
+		return fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+
+	if offset > 0 {
+		if _, err := file.Seek(offset, io.SeekStart); err != nil {
+			return fmt.Errorf("seek to offset %d: %w", offset, err)
+		}
+	}
+	// offset=0: no seek needed; file position is already at the start.
+
+	bytesRead, err := io.Copy(writer, file)
+	if err != nil {
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to copy file data: %w", err)
+	}
+
+	metrics.Get().IncStorageReads()
+	metrics.Get().IncStorageReadBytes(bytesRead)
+	return nil
+}
+
+// StatFile returns the byte size of the file at path, or -1 if the file does
+// not exist. Returns a non-nil error only for unexpected failures.
+func (b *LocalBackend) StatFile(ctx context.Context, path string) (int64, error) {
+	fullPath, err := b.validatePath(path)
+	if err != nil {
+		return -1, fmt.Errorf("invalid path: %w", err)
+	}
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return -1, nil
+		}
+		return -1, fmt.Errorf("stat %s: %w", path, err)
+	}
+	return info.Size(), nil
+}
+
+// AppendReader appends appendSize bytes from reader to the existing file at path.
+func (b *LocalBackend) AppendReader(ctx context.Context, path string, reader io.Reader, appendSize int64) error {
+	fullPath, err := b.validatePath(path)
+	if err != nil {
+		return fmt.Errorf("invalid path: %w", err)
+	}
+
+	file, err := os.OpenFile(fullPath, os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to open file for append: %w", err)
+	}
+	defer file.Close()
+
+	written, err := io.Copy(file, reader)
+	if err != nil {
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to append file data: %w", err)
+	}
+
+	metrics.Get().IncStorageWrites()
+	metrics.Get().IncStorageWriteBytes(written)
+	return nil
+}
+
 // List lists all objects with the given prefix
 func (b *LocalBackend) List(ctx context.Context, prefix string) ([]string, error) {
 	// Validate and sanitize the prefix to prevent path traversal

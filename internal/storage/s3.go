@@ -288,6 +288,49 @@ func (b *S3Backend) ReadTo(ctx context.Context, path string, writer io.Writer) e
 	return nil
 }
 
+// ReadToAt reads data from S3 starting at the given byte offset and writes to
+// writer. Uses an HTTP Range header to skip already-transferred bytes.
+// offset=0 fetches the full object (no Range header sent).
+func (b *S3Backend) ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error {
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(b.bucket),
+		Key:    aws.String(b.prefixedKey(path)),
+	}
+	if offset > 0 {
+		input.Range = aws.String(fmt.Sprintf("bytes=%d-", offset))
+	}
+	result, err := b.client.GetObject(ctx, input)
+	if err != nil {
+		return fmt.Errorf("failed to read from S3: %w", err)
+	}
+	defer result.Body.Close()
+
+	_, err = io.Copy(writer, result.Body)
+	if err != nil {
+		return fmt.Errorf("failed to copy S3 object: %w", err)
+	}
+	return nil
+}
+
+// StatFile returns the byte size of the S3 object at path, or -1 if not found.
+func (b *S3Backend) StatFile(ctx context.Context, path string) (int64, error) {
+	result, err := b.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(b.bucket),
+		Key:    aws.String(b.prefixedKey(path)),
+	})
+	if err != nil {
+		if isNotFoundError(err) {
+			return -1, nil
+		}
+		return -1, fmt.Errorf("HeadObject %s: %w", path, err)
+	}
+	if result.ContentLength == nil {
+		return 0, nil
+	}
+	return *result.ContentLength, nil
+}
+
+
 // List lists objects with the given prefix
 func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 	var objects []string

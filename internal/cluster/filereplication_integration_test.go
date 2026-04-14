@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -126,6 +127,38 @@ func (m *memBackend) Exists(ctx context.Context, path string) (bool, error) {
 func (m *memBackend) Close() error       { return nil }
 func (m *memBackend) Type() string       { return "mem" }
 func (m *memBackend) ConfigJSON() string { return "{}" }
+func (m *memBackend) ReadToAt(_ context.Context, path string, w io.Writer, offset int64) error {
+	m.mu.Lock()
+	data, ok := m.files[path]
+	m.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("file not found: %s", path)
+	}
+	if offset > int64(len(data)) {
+		return fmt.Errorf("offset %d > file size %d", offset, len(data))
+	}
+	_, err := w.Write(data[offset:])
+	return err
+}
+func (m *memBackend) StatFile(_ context.Context, path string) (int64, error) {
+	m.mu.Lock()
+	data, ok := m.files[path]
+	m.mu.Unlock()
+	if !ok {
+		return -1, nil
+	}
+	return int64(len(data)), nil
+}
+func (m *memBackend) AppendReader(_ context.Context, path string, r io.Reader, _ int64) error {
+	tail, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.files[path] = append(m.files[path], tail...)
+	m.mu.Unlock()
+	return nil
+}
 
 // --- Minimal origin-side server ---
 
@@ -295,7 +328,7 @@ func TestPhase2FetchRoundtrip(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	n, fetchErr := fetchClient.Fetch(ctx, origin.addr(), entry, pw)
+	n, fetchErr := fetchClient.Fetch(ctx, origin.addr(), entry, pw, 0, nil)
 	if fetchErr != nil {
 		_ = pw.CloseWithError(fetchErr)
 		t.Fatalf("Fetch: %v", fetchErr)
@@ -370,7 +403,7 @@ func TestPhase2FetchRejectsBadHMAC(t *testing.T) {
 	entry := &raft.FileEntry{Path: path, SHA256: hashHex, SizeBytes: int64(len(body))}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, fetchErr := fetchClient.Fetch(ctx, origin.addr(), entry, io.Discard)
+	_, fetchErr := fetchClient.Fetch(ctx, origin.addr(), entry, io.Discard, 0, nil)
 	if fetchErr == nil {
 		t.Fatalf("expected auth error, got nil")
 	}
@@ -507,7 +540,7 @@ func TestPhase2FetchRejectsUnknownPath(t *testing.T) {
 	entry := &raft.FileEntry{Path: path, SHA256: hashHex, SizeBytes: int64(len(body))}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, fetchErr := fetchClient.Fetch(ctx, origin.addr(), entry, io.Discard)
+	_, fetchErr := fetchClient.Fetch(ctx, origin.addr(), entry, io.Discard, 0, nil)
 	if fetchErr == nil {
 		t.Fatalf("expected manifest lookup error, got nil")
 	}

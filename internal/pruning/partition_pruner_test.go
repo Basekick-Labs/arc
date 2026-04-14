@@ -49,6 +49,13 @@ func (m *mockS3Backend) Type() string {
 func (m *mockS3Backend) ConfigJSON() string {
 	return "{}"
 }
+func (m *mockS3Backend) ReadToAt(_ context.Context, _ string, _ io.Writer, _ int64) error {
+	return nil
+}
+func (m *mockS3Backend) StatFile(_ context.Context, _ string) (int64, error) { return -1, nil }
+func (m *mockS3Backend) AppendReader(_ context.Context, _ string, _ io.Reader, _ int64) error {
+	return nil
+}
 
 // ListDirectories implements storage.DirectoryLister
 func (m *mockS3Backend) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
