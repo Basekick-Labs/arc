@@ -25,7 +25,7 @@ import (
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/rs/zerolog"
-	"github.com/Basekick-Labs/msgpack/v6"
+	"github.com/basekick-labs/msgpack/v6"
 )
 
 // capturingStorageBackend records every Parquet write so tests can verify
