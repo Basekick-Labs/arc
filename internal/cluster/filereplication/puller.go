@@ -613,7 +613,7 @@ func (p *Puller) tryResumeFromPartial(log zerolog.Logger, entry *raft.FileEntry)
 
 	h := sha256.New()
 	hashCtx, hashCancel := context.WithTimeout(p.ctx, 30*time.Second)
-	hashErr := p.cfg.Backend.ReadTo(hashCtx, entry.Path, h)
+	hashErr := p.cfg.Backend.ReadToAt(hashCtx, entry.Path, h, 0)
 	hashCancel()
 	if hashErr != nil {
 		log.Debug().Err(hashErr).Str("path", entry.Path).
