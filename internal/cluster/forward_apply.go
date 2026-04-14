@@ -354,13 +354,15 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	}
 
 	// Security: allowlist the command types that may be forwarded. Only
-	// file-manifest operations (RegisterFile, DeleteFile) are expected
-	// via leader forwarding. Topology-mutating commands (AddNode,
+	// file-manifest operations (RegisterFile, DeleteFile, BatchFileOps) are
+	// expected via leader forwarding. Topology-mutating commands (AddNode,
 	// RemoveNode, PromoteWriter, etc.) must go through their dedicated
 	// join/leave handlers which have their own auth flow. Rejecting
 	// unexpected types prevents a compromised peer from escalating a
 	// shared-secret credential into topology mutations.
-	if cmd.Type != clusterraft.CommandRegisterFile && cmd.Type != clusterraft.CommandDeleteFile {
+	if cmd.Type != clusterraft.CommandRegisterFile &&
+		cmd.Type != clusterraft.CommandDeleteFile &&
+		cmd.Type != clusterraft.CommandBatchFileOps {
 		c.logger.Warn().
 			Str("requesting_node", req.NodeID).
 			Int("cmd_type", int(cmd.Type)).

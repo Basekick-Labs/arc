@@ -104,6 +104,28 @@ func (c *fsmCoordinator) DeleteFileFromManifest(path, reason string) error {
 	return nil
 }
 
+func (c *fsmCoordinator) BatchFileOpsInManifest(ops []raft.BatchFileOp) error {
+	if c.forwardingFailure != nil {
+		return c.forwardingFailure
+	}
+	payload, err := json.Marshal(raft.BatchFileOpsPayload{Ops: ops})
+	if err != nil {
+		return fmt.Errorf("marshal batch payload: %w", err)
+	}
+	cmd := raft.Command{Type: raft.CommandBatchFileOps, Payload: payload}
+	data, err := json.Marshal(cmd)
+	if err != nil {
+		return fmt.Errorf("marshal command: %w", err)
+	}
+	c.logIndex++
+	if res := c.fsm.Apply(&hraft.Log{Index: c.logIndex, Data: data}); res != nil {
+		if e, ok := res.(error); ok && e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
 // waitFSMHasFile polls the FSM until it contains the given path or the
 // deadline elapses. Reports failure with the final file list for debug.
 func waitFSMHasFile(t *testing.T, fsm *raft.ClusterFSM, path string, timeout time.Duration) *raft.FileEntry {

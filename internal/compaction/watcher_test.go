@@ -24,6 +24,7 @@ type fakeBridge struct {
 	// Scripted behavior. If nil/zero, bridge returns nil (success).
 	registerErrors []error // consumed per RegisterCompactedFile call
 	deleteErrors   []error // consumed per DeleteCompactedSource call
+	batchErrors    []error // consumed per BatchFileOps call
 
 	// Captured calls
 	registerCalls []CompactedFile
@@ -31,10 +32,12 @@ type fakeBridge struct {
 		Path   string
 		Reason string
 	}
+	batchOps []batchOp
 
 	// Counts (atomic for test assertions without taking the mutex)
 	registerCount atomic.Int64
 	deleteCount   atomic.Int64
+	batchCount    atomic.Int64
 }
 
 func (b *fakeBridge) RegisterCompactedFile(ctx context.Context, file CompactedFile) error {
@@ -60,6 +63,28 @@ func (b *fakeBridge) DeleteCompactedSource(ctx context.Context, path, reason str
 	idx := int(b.deleteCount.Load()) - 1
 	if idx < len(b.deleteErrors) {
 		return b.deleteErrors[idx]
+	}
+	return nil
+}
+
+// batchOp captures a single BatchFileOps call for assertions.
+type batchOp struct {
+	Registers []CompactedFile
+	Deletes   []DeleteSourceOp
+}
+
+func (b *fakeBridge) BatchFileOps(ctx context.Context, registers []CompactedFile, deletes []DeleteSourceOp) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.batchOps = append(b.batchOps, batchOp{Registers: registers, Deletes: deletes})
+	// Increment item-level counters so existing test assertions on
+	// registerCount / deleteCount remain valid without modification.
+	b.registerCount.Add(int64(len(registers)))
+	b.deleteCount.Add(int64(len(deletes)))
+	b.batchCount.Add(1)
+	idx := int(b.batchCount.Load()) - 1
+	if idx < len(b.batchErrors) {
+		return b.batchErrors[idx]
 	}
 	return nil
 }
@@ -267,10 +292,10 @@ func TestWatcher_IgnoresWritingOutputState(t *testing.T) {
 
 func TestWatcher_ErrNotLeaderKeepsManifest(t *testing.T) {
 	dir := t.TempDir()
-	// First N calls return ErrNotLeader, subsequent calls succeed. This
-	// simulates a brief leader flap that recovers.
+	// First N batch calls return ErrNotLeader, subsequent calls succeed.
+	// This simulates a brief leader flap that recovers.
 	bridge := &fakeBridge{
-		registerErrors: []error{
+		batchErrors: []error{
 			fmt.Errorf("wrapped: %w", ErrNotLeader),
 			fmt.Errorf("wrapped: %w", ErrNotLeader),
 		},
@@ -297,8 +322,8 @@ func TestWatcher_ErrNotLeaderKeepsManifest(t *testing.T) {
 	if stats["apply_errors"] != 0 {
 		t.Errorf("apply_errors: got %d, want 0 (ErrNotLeader is not an error)", stats["apply_errors"])
 	}
-	if bridge.registerCount.Load() < 3 {
-		t.Errorf("register calls: got %d, want >= 3 (2 failures + 1 success)", bridge.registerCount.Load())
+	if bridge.batchCount.Load() < 3 {
+		t.Errorf("batch calls: got %d, want >= 3 (2 failures + 1 success)", bridge.batchCount.Load())
 	}
 }
 
@@ -308,12 +333,9 @@ func TestWatcher_BridgeErrorKeepsManifestAndCounts(t *testing.T) {
 	dir := t.TempDir()
 	// Persistent error (repeated for multiple attempts including the
 	// shutdown drain pass) so the manifest is never removed.
+	backendErr := errors.New("fake backend error")
 	bridge := &fakeBridge{
-		registerErrors: []error{
-			errors.New("fake backend error"),
-			errors.New("fake backend error"),
-			errors.New("fake backend error"),
-		},
+		batchErrors: []error{backendErr, backendErr, backendErr, backendErr, backendErr},
 	}
 	w := newTestWatcher(t, dir, bridge)
 
@@ -346,12 +368,11 @@ func TestWatcher_BridgeErrorKeepsManifestAndCounts(t *testing.T) {
 func TestWatcher_DeleteFailureKeepsManifest(t *testing.T) {
 	dir := t.TempDir()
 	// Persistent error so the manifest survives the shutdown drain pass.
+	// The batch includes both registers and deletes; a failure keeps the
+	// manifest on disk regardless of which op caused it.
+	deleteErr := errors.New("delete boom")
 	bridge := &fakeBridge{
-		deleteErrors: []error{
-			errors.New("delete boom"),
-			errors.New("delete boom"),
-			errors.New("delete boom"),
-		},
+		batchErrors: []error{deleteErr, deleteErr, deleteErr, deleteErr, deleteErr},
 	}
 	w := newTestWatcher(t, dir, bridge)
 
@@ -372,9 +393,6 @@ func TestWatcher_DeleteFailureKeepsManifest(t *testing.T) {
 	stats := w.Stats()
 	if stats["apply_errors"] == 0 {
 		t.Errorf("apply_errors: got 0, want >= 1")
-	}
-	if bridge.registerCount.Load() < 1 {
-		t.Errorf("register calls: got %d, want >= 1", bridge.registerCount.Load())
 	}
 	// Manifest must still exist on disk.
 	if _, err := readCompletionManifest(filepath.Join(dir, m.JobID+".json")); err != nil {
@@ -488,4 +506,161 @@ func TestWatcher_StartIsIdempotent(t *testing.T) {
 	w.Stop()
 	// No assertion beyond "doesn't panic"; the goroutine count check is
 	// enforced by the race detector if something went wrong.
+}
+
+// --- BatchFileOps ---
+
+// TestWatcher_UsesBatchFileOps verifies that applyOne issues a single
+// BatchFileOps call (not individual register/delete calls) for a
+// sources_deleted manifest, and that the item counters are correct.
+func TestWatcher_UsesBatchFileOps(t *testing.T) {
+	dir := t.TempDir()
+	bridge := &fakeBridge{}
+	w := newTestWatcher(t, dir, bridge)
+
+	manifest := CompletionManifest{
+		JobID: "job-1",
+		State: CompletionStateSourcesDeleted,
+		Outputs: []CompactedOutput{
+			{Path: "db/cpu/out1.parquet", SHA256: "aa", SizeBytes: 100, Database: "db", Measurement: "cpu", Tier: "hot", CreatedAt: time.Now()},
+			{Path: "db/cpu/out2.parquet", SHA256: "bb", SizeBytes: 200, Database: "db", Measurement: "cpu", Tier: "hot", CreatedAt: time.Now()},
+		},
+		DeletedSources: []string{"db/cpu/src1.parquet", "db/cpu/src2.parquet", "db/cpu/src3.parquet"},
+	}
+	if err := writeCompletionManifest(dir, &manifest); err != nil {
+		t.Fatalf("writeCompletionManifest: %v", err)
+	}
+
+	w.Start(context.Background())
+	waitForApplied(t, w, 1, 200*time.Millisecond)
+	w.Stop()
+
+	if got := bridge.batchCount.Load(); got != 1 {
+		t.Errorf("batchCount: got %d, want 1 (one batch per manifest)", got)
+	}
+	if got := bridge.registerCount.Load(); got != 2 {
+		t.Errorf("registerCount: got %d, want 2", got)
+	}
+	if got := bridge.deleteCount.Load(); got != 3 {
+		t.Errorf("deleteCount: got %d, want 3", got)
+	}
+}
+
+// TestWatcher_BatchNotLeaderKeepsManifest verifies that an ErrNotLeader
+// response from BatchFileOps leaves the manifest on disk for retry.
+func TestWatcher_BatchNotLeaderKeepsManifest(t *testing.T) {
+	dir := t.TempDir()
+	notLeaderErr := fmt.Errorf("forwarding: %w", ErrNotLeader)
+	// Repeat enough times to cover multiple poll ticks during the test window.
+	bridge := &fakeBridge{batchErrors: []error{notLeaderErr, notLeaderErr, notLeaderErr, notLeaderErr, notLeaderErr, notLeaderErr, notLeaderErr, notLeaderErr, notLeaderErr, notLeaderErr}}
+	w := newTestWatcher(t, dir, bridge)
+
+	manifest := CompletionManifest{
+		JobID: "job-2",
+		State: CompletionStateSourcesDeleted,
+		Outputs: []CompactedOutput{
+			{Path: "db/m/out.parquet", SHA256: "cc", SizeBytes: 50, Database: "db", Measurement: "m", Tier: "hot", CreatedAt: time.Now()},
+		},
+		DeletedSources: []string{"db/m/src.parquet"},
+	}
+	if err := writeCompletionManifest(dir, &manifest); err != nil {
+		t.Fatalf("writeCompletionManifest: %v", err)
+	}
+
+	w.Start(context.Background())
+	// Give the watcher a few ticks to attempt the apply.
+	time.Sleep(50 * time.Millisecond)
+	w.Stop()
+
+	if w.Stats()["manifests_applied"] != 0 {
+		t.Error("manifest should NOT have been applied (not-leader error)")
+	}
+	manifests, err := listPendingCompletionManifests(dir)
+	if err != nil {
+		t.Fatalf("listPendingCompletionManifests: %v", err)
+	}
+	if len(manifests) == 0 {
+		t.Error("manifest should still be on disk after not-leader error")
+	}
+}
+
+// TestWatcher_BatchErrorKeepsManifest verifies that a non-transient error
+// increments apply_errors and leaves the manifest on disk.
+func TestWatcher_BatchErrorKeepsManifest(t *testing.T) {
+	dir := t.TempDir()
+	raftErr := errors.New("raft apply timeout")
+	// Repeat enough times to cover multiple poll ticks during the test window.
+	bridge := &fakeBridge{batchErrors: []error{raftErr, raftErr, raftErr, raftErr, raftErr, raftErr, raftErr, raftErr, raftErr, raftErr}}
+	w := newTestWatcher(t, dir, bridge)
+
+	manifest := CompletionManifest{
+		JobID: "job-3",
+		State: CompletionStateSourcesDeleted,
+		Outputs: []CompactedOutput{
+			{Path: "db/m/out.parquet", SHA256: "dd", SizeBytes: 50, Database: "db", Measurement: "m", Tier: "hot", CreatedAt: time.Now()},
+		},
+		DeletedSources: []string{"db/m/src.parquet"},
+	}
+	if err := writeCompletionManifest(dir, &manifest); err != nil {
+		t.Fatalf("writeCompletionManifest: %v", err)
+	}
+
+	w.Start(context.Background())
+	time.Sleep(50 * time.Millisecond)
+	w.Stop()
+
+	if w.Stats()["apply_errors"] == 0 {
+		t.Error("apply_errors should be > 0 after a batch error")
+	}
+	if w.Stats()["manifests_applied"] != 0 {
+		t.Error("manifest should NOT have been applied")
+	}
+}
+
+// TestWatcher_OutputWritten_BatchRegistersOnly verifies that for a manifest
+// in output_written state, BatchFileOps is called with registers only (no
+// deletes) and the manifest is kept on disk for the sources_deleted tick.
+func TestWatcher_OutputWritten_BatchRegistersOnly(t *testing.T) {
+	dir := t.TempDir()
+	bridge := &fakeBridge{}
+	w := newTestWatcher(t, dir, bridge)
+
+	manifest := CompletionManifest{
+		JobID: "job-4",
+		State: CompletionStateOutputWritten,
+		Outputs: []CompactedOutput{
+			{Path: "db/m/out.parquet", SHA256: "ee", SizeBytes: 50, Database: "db", Measurement: "m", Tier: "hot", CreatedAt: time.Now()},
+		},
+		DeletedSources: []string{"db/m/src.parquet"},
+	}
+	if err := writeCompletionManifest(dir, &manifest); err != nil {
+		t.Fatalf("writeCompletionManifest: %v", err)
+	}
+
+	w.Start(context.Background())
+	// Wait for at least one batch call but not for manifest removal.
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) && bridge.batchCount.Load() < 1 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	w.Stop()
+
+	bridge.mu.Lock()
+	ops := bridge.batchOps
+	bridge.mu.Unlock()
+
+	if len(ops) == 0 {
+		t.Fatal("expected at least one BatchFileOps call")
+	}
+	first := ops[0]
+	if len(first.Registers) == 0 {
+		t.Error("expected non-empty registers in output_written batch")
+	}
+	if len(first.Deletes) != 0 {
+		t.Errorf("expected empty deletes in output_written batch, got %d", len(first.Deletes))
+	}
+	// Manifest must still be on disk (waiting for sources_deleted state).
+	if w.Stats()["manifests_applied"] != 0 {
+		t.Error("manifest should NOT be removed in output_written state")
+	}
 }

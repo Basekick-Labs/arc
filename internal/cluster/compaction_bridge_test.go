@@ -8,6 +8,7 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -26,10 +27,13 @@ type stubBridgeCoordinator struct {
 	nodeID        string
 	registerErr   error
 	deleteErr     error
+	batchErr      error
 	registered    []raft.FileEntry
 	deleted       []struct{ Path, Reason string }
+	batched       []raft.BatchFileOp
 	registerCalls int
 	deleteCalls   int
+	batchCalls    int
 }
 
 func (s *stubBridgeCoordinator) LocalNodeID() string { return s.nodeID }
@@ -42,6 +46,11 @@ func (s *stubBridgeCoordinator) DeleteFileFromManifest(path, reason string) erro
 	s.deleteCalls++
 	s.deleted = append(s.deleted, struct{ Path, Reason string }{path, reason})
 	return s.deleteErr
+}
+func (s *stubBridgeCoordinator) BatchFileOpsInManifest(ops []raft.BatchFileOp) error {
+	s.batchCalls++
+	s.batched = append(s.batched, ops...)
+	return s.batchErr
 }
 
 // --- RegisterCompactedFile ---
@@ -253,4 +262,107 @@ func TestCompactionBridge_NilCoordinatorPanicsAtConstruction(t *testing.T) {
 		}
 	}()
 	NewCompactionBridge(nil)
+}
+
+// --- BatchFileOps ---
+
+// TestCompactionBridge_BatchFileOps_HappyPath verifies that BatchFileOps
+// builds the correct BatchFileOp slice, stamps OriginNodeID on register ops,
+// and makes exactly one coordinator call.
+func TestCompactionBridge_BatchFileOps_HappyPath(t *testing.T) {
+	stub := &stubBridgeCoordinator{nodeID: "compactor-1"}
+	bridge := NewCompactionBridge(stub)
+
+	registers := []compaction.CompactedFile{
+		{
+			Path:      "db/cpu/compacted.parquet",
+			SHA256:    "deadbeef",
+			SizeBytes: 2048,
+			Database:  "db",
+			Tier:      "hot",
+			CreatedAt: time.Date(2026, 4, 14, 10, 0, 0, 0, time.UTC),
+		},
+	}
+	deletes := []compaction.DeleteSourceOp{
+		{Path: "db/cpu/old.parquet", Reason: "compaction:job-1"},
+	}
+
+	if err := bridge.BatchFileOps(context.Background(), registers, deletes); err != nil {
+		t.Fatalf("BatchFileOps: %v", err)
+	}
+	if stub.batchCalls != 1 {
+		t.Fatalf("batchCalls: got %d, want 1", stub.batchCalls)
+	}
+	if len(stub.batched) != 2 {
+		t.Fatalf("batched ops: got %d, want 2", len(stub.batched))
+	}
+	// First op must be a register with OriginNodeID stamped.
+	if stub.batched[0].Type != raft.CommandRegisterFile {
+		t.Errorf("op[0].Type: got %d, want CommandRegisterFile", stub.batched[0].Type)
+	}
+	if stub.batched[1].Type != raft.CommandDeleteFile {
+		t.Errorf("op[1].Type: got %d, want CommandDeleteFile", stub.batched[1].Type)
+	}
+	// Verify OriginNodeID was stamped by decoding the register payload.
+	var regPayload raft.RegisterFilePayload
+	if err := decodePayload(stub.batched[0].Payload, &regPayload); err != nil {
+		t.Fatalf("decode register payload: %v", err)
+	}
+	if regPayload.File.OriginNodeID != "compactor-1" {
+		t.Errorf("OriginNodeID: got %q, want compactor-1", regPayload.File.OriginNodeID)
+	}
+}
+
+// TestCompactionBridge_BatchFileOps_EmptyOps returns nil without calling
+// the coordinator when both slices are empty.
+func TestCompactionBridge_BatchFileOps_EmptyOps(t *testing.T) {
+	stub := &stubBridgeCoordinator{nodeID: "c1"}
+	bridge := NewCompactionBridge(stub)
+
+	if err := bridge.BatchFileOps(context.Background(), nil, nil); err != nil {
+		t.Fatalf("expected nil for empty batch, got %v", err)
+	}
+	if stub.batchCalls != 0 {
+		t.Errorf("batchCalls: got %d, want 0 (empty batch must not call coordinator)", stub.batchCalls)
+	}
+}
+
+// TestCompactionBridge_BatchFileOps_MapsNoLeaderKnownToErrNotLeader verifies
+// transient leader-resolution errors surface as compaction.ErrNotLeader.
+func TestCompactionBridge_BatchFileOps_MapsNoLeaderKnownToErrNotLeader(t *testing.T) {
+	stub := &stubBridgeCoordinator{nodeID: "c1", batchErr: ErrNoLeaderKnown}
+	bridge := NewCompactionBridge(stub)
+
+	err := bridge.BatchFileOps(context.Background(),
+		[]compaction.CompactedFile{{Path: "x.parquet", CreatedAt: time.Now()}},
+		nil,
+	)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, compaction.ErrNotLeader) {
+		t.Errorf("expected ErrNotLeader, got %v", err)
+	}
+}
+
+// TestCompactionBridge_BatchFileOps_RespectsDeadline short-circuits on an
+// already-expired context before touching the coordinator.
+func TestCompactionBridge_BatchFileOps_RespectsDeadline(t *testing.T) {
+	stub := &stubBridgeCoordinator{nodeID: "c1"}
+	bridge := NewCompactionBridge(stub)
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	err := bridge.BatchFileOps(ctx, []compaction.CompactedFile{{Path: "x.parquet"}}, nil)
+	if err == nil {
+		t.Fatal("expected deadline error, got nil")
+	}
+	if stub.batchCalls != 0 {
+		t.Errorf("batchCalls: got %d, want 0 (expired ctx must short-circuit)", stub.batchCalls)
+	}
+}
+
+// decodePayload is a test helper that JSON-unmarshals a BatchFileOp payload.
+func decodePayload(data []byte, v interface{}) error {
+	return json.Unmarshal(data, v)
 }

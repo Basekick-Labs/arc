@@ -585,6 +585,17 @@ func (n *Node) AssignCompactor(nodeID, oldCompactorID string, timeout time.Durat
 	return n.Apply(cmd, timeout)
 }
 
+// BatchFileOps applies a batch of RegisterFile and DeleteFile operations as a
+// single Raft log entry. Reduces compaction manifest apply from O(N) to 1.
+func (n *Node) BatchFileOps(ops []BatchFileOp, timeout time.Duration) error {
+	payload, err := json.Marshal(BatchFileOpsPayload{Ops: ops})
+	if err != nil {
+		return fmt.Errorf("failed to marshal batch file ops payload: %w", err)
+	}
+
+	return n.Apply(&Command{Type: CommandBatchFileOps, Payload: payload}, timeout)
+}
+
 // LeaderCh returns a channel that signals leadership changes.
 // True means this node became leader, false means it lost leadership.
 func (n *Node) LeaderCh() <-chan bool {

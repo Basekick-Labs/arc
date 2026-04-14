@@ -60,6 +60,14 @@ type CompactedFile struct {
 	CreatedAt     time.Time
 }
 
+// DeleteSourceOp carries the arguments for a DeleteCompactedSource batch
+// operation. A struct rather than bare string fields keeps the batch call
+// signature extensible without breaking callers.
+type DeleteSourceOp struct {
+	Path   string
+	Reason string
+}
+
 // ManifestBridge is the narrow interface the compaction package imports
 // from the cluster package. It abstracts "append to the cluster manifest"
 // without pulling in the Raft types or the coordinator struct directly.
@@ -76,6 +84,11 @@ type CompactedFile struct {
 type ManifestBridge interface {
 	RegisterCompactedFile(ctx context.Context, file CompactedFile) error
 	DeleteCompactedSource(ctx context.Context, path, reason string) error
+	// BatchFileOps groups all register and delete operations for one manifest
+	// into a single Raft log entry. The watcher always calls this in applyOne
+	// instead of the individual methods — O(1) Raft applies per manifest
+	// regardless of file count.
+	BatchFileOps(ctx context.Context, registers []CompactedFile, deletes []DeleteSourceOp) error
 }
 
 // CompletionWatcherConfig bundles the watcher's dependencies and tunables.
@@ -143,8 +156,9 @@ type CompletionWatcher struct {
 	manifestsApplied   atomic.Int64 // successful full applies (removed after)
 	manifestsNotLeader atomic.Int64 // skipped because we're not the Raft leader
 	applyErrors        atomic.Int64 // bridge errors that are NOT ErrNotLeader
-	registerCalls      atomic.Int64 // total RegisterCompactedFile calls
-	deleteCalls        atomic.Int64 // total DeleteCompactedSource calls
+	registerCalls      atomic.Int64 // total files registered (items, not calls)
+	deleteCalls        atomic.Int64 // total files deleted (items, not calls)
+	batchCalls         atomic.Int64 // total BatchFileOps calls (one per manifest apply)
 	lastPollAt         atomic.Int64 // unix nanos of most recent poll end
 }
 
@@ -224,6 +238,7 @@ func (w *CompletionWatcher) Stats() map[string]int64 {
 		"apply_errors":         w.applyErrors.Load(),
 		"register_calls":       w.registerCalls.Load(),
 		"delete_calls":         w.deleteCalls.Load(),
+		"batch_calls":          w.batchCalls.Load(),
 		"last_poll_at":         w.lastPollAt.Load(),
 	}
 }
@@ -311,103 +326,81 @@ func (w *CompletionWatcher) applyOne(ctx context.Context, path string) {
 	// commands (idempotent but wasteful Raft traffic).
 	_, alreadyRegistered := w.registeredOutputs[manifest.JobID]
 
-	// Apply RegisterCompactedFile for every output. We do these first because
-	// DeleteFile for sources is only safe AFTER the replacement is durable
-	// in the cluster manifest — otherwise a reader could see the source as
-	// deleted before it sees the compacted replacement, and a mid-flight
-	// query could return incomplete results.
-	//
-	// IMPORTANT — idempotency contract: if one output's RegisterCompactedFile
-	// succeeds and the next one's Apply times out (or we crash), the watcher
-	// will retry from the beginning of the Outputs slice on the next tick.
-	// The bridge and the Raft FSM MUST treat duplicate RegisterFile commands
-	// for the same path as idempotent. This is enforced by:
-	//
-	//   - raft.applyRegisterFile (fsm.go:433) — overwrites the existing entry
-	//     unconditionally, so re-registration of the same file is a no-op.
-	//   - raft.applyDeleteFile (fsm.go:487-489) — explicitly returns nil on
-	//     "file not existed", so re-deletion is also a no-op.
-	//
-	// If either handler is refactored to become non-idempotent, the partial-
-	// apply retry path here will start producing errors. Integration test
-	// TestPhase4_CompletionManifestToFSM exercises the single-apply happy
-	// path; the leader-flap test exercises the retry path with the same
-	// FSM. Both would catch an accidental break of this contract.
-	for _, output := range manifest.Outputs {
-		if alreadyRegistered {
-			break // Already applied on a previous tick; skip to delete phase.
-		}
-		applyCtx, cancel := context.WithTimeout(ctx, w.cfg.ApplyTimeout)
-		err := w.cfg.Bridge.RegisterCompactedFile(applyCtx, CompactedFile{
-			Path:          output.Path,
-			SHA256:        output.SHA256,
-			SizeBytes:     output.SizeBytes,
-			Database:      output.Database,
-			Measurement:   output.Measurement,
-			PartitionTime: output.PartitionTime,
-			Tier:          output.Tier,
-			CreatedAt:     output.CreatedAt,
-		})
-		cancel()
-		w.registerCalls.Add(1)
-		if err != nil {
-			if errors.Is(err, ErrNotLeader) {
-				// Expected on non-leader compactors during leader flap.
-				// Silent at Info level, leave the manifest for next tick.
-				w.manifestsNotLeader.Add(1)
-				w.logger.Debug().
-					Str("path", output.Path).
-					Str("job_id", manifest.JobID).
-					Msg("Not leader; will retry completion manifest next tick")
-				return
-			}
-			w.applyErrors.Add(1)
-			w.logger.Error().
-				Err(err).
-				Str("path", output.Path).
-				Str("job_id", manifest.JobID).
-				Msg("Bridge RegisterCompactedFile failed; leaving manifest for retry")
-			return
-		}
-	}
-
-	// Mark that we've applied RegisterFile for this job so subsequent
-	// ticks skip the redundant Raft calls.
+	// Build the register slice. Skipped if RegisterFile was already applied
+	// on a previous tick (manifest in output_written waiting for the
+	// subprocess to advance to sources_deleted).
+	var registers []CompactedFile
 	if !alreadyRegistered {
-		w.registeredOutputs[manifest.JobID] = struct{}{}
+		for _, output := range manifest.Outputs {
+			registers = append(registers, CompactedFile{
+				Path:          output.Path,
+				SHA256:        output.SHA256,
+				SizeBytes:     output.SizeBytes,
+				Database:      output.Database,
+				Measurement:   output.Measurement,
+				PartitionTime: output.PartitionTime,
+				Tier:          output.Tier,
+				CreatedAt:     output.CreatedAt,
+			})
+		}
 	}
 
-	// Only advance to DeleteFile once the subprocess has confirmed the
-	// source files are actually gone from storage. In state output_written
-	// the sources still exist on disk — issuing DeleteFile here would make
-	// the manifest claim they're gone while they're still readable,
-	// breaking the "manifest is source of truth" invariant.
-	if manifest.State != CompletionStateSourcesDeleted {
-		// RegisterFile has been applied. Leave the manifest in place: the
-		// subprocess will rewrite it in state sources_deleted shortly, and
-		// the next tick will pick up that version and issue the deletes.
-		// This is NOT an error — it's the normal two-step progression.
+	// Build the delete slice. Only safe once the subprocess has confirmed
+	// sources are gone from storage (sources_deleted state). In
+	// output_written state the sources still exist on disk — issuing
+	// DeleteFile before that would make the manifest claim they're gone
+	// while they're still readable, breaking "manifest is source of truth".
+	var deletes []DeleteSourceOp
+	if manifest.State == CompletionStateSourcesDeleted {
+		for _, source := range manifest.DeletedSources {
+			deletes = append(deletes, DeleteSourceOp{
+				Path:   source,
+				Reason: fmt.Sprintf("compaction:%s", manifest.JobID),
+			})
+		}
+	}
+
+	// Nothing to do yet: registers already applied and not yet sources_deleted.
+	if len(registers) == 0 && len(deletes) == 0 {
 		return
 	}
 
-	for _, source := range manifest.DeletedSources {
-		applyCtx, cancel := context.WithTimeout(ctx, w.cfg.ApplyTimeout)
-		err := w.cfg.Bridge.DeleteCompactedSource(applyCtx, source, fmt.Sprintf("compaction:%s", manifest.JobID))
-		cancel()
-		w.deleteCalls.Add(1)
-		if err != nil {
-			if errors.Is(err, ErrNotLeader) {
-				w.manifestsNotLeader.Add(1)
-				return
-			}
-			w.applyErrors.Add(1)
-			w.logger.Error().
-				Err(err).
-				Str("source", source).
+	// One Raft log entry for the whole manifest — O(1) applies regardless
+	// of file count.
+	applyCtx, cancel := context.WithTimeout(ctx, w.cfg.ApplyTimeout)
+	err = w.cfg.Bridge.BatchFileOps(applyCtx, registers, deletes)
+	cancel()
+	w.batchCalls.Add(1)
+	w.registerCalls.Add(int64(len(registers)))
+	w.deleteCalls.Add(int64(len(deletes)))
+
+	if err != nil {
+		if errors.Is(err, ErrNotLeader) {
+			w.manifestsNotLeader.Add(1)
+			w.logger.Debug().
 				Str("job_id", manifest.JobID).
-				Msg("Bridge DeleteCompactedSource failed; leaving manifest for retry")
+				Msg("Not leader; will retry completion manifest next tick")
 			return
 		}
+		w.applyErrors.Add(1)
+		w.logger.Error().
+			Err(err).
+			Str("job_id", manifest.JobID).
+			Msg("Bridge BatchFileOps failed; leaving manifest for retry")
+		return
+	}
+
+	// Mark registers applied so the next tick skips the register phase
+	// while waiting for sources_deleted.
+	if len(registers) > 0 {
+		w.registeredOutputs[manifest.JobID] = struct{}{}
+	}
+
+	// If we only registered (no deletes yet), leave the manifest in place:
+	// the subprocess will rewrite it in sources_deleted state shortly.
+	// This is NOT an error — it's the normal two-step progression.
+	if manifest.State != CompletionStateSourcesDeleted {
+		return
 	}
 
 	// All bridge calls succeeded. Remove the manifest so the next tick
