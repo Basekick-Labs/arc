@@ -285,12 +285,10 @@ func (b *LocalBackend) ReadToAt(ctx context.Context, path string, writer io.Writ
 
 	// Prefer the final file; fall back to the staging file so tryResumeFromPartial
 	// can hash a prefix even before the transfer completes.
-	openPath := fullPath
-	if _, statErr := os.Stat(fullPath); os.IsNotExist(statErr) {
-		openPath = partPath(fullPath)
+	file, err := os.Open(fullPath)
+	if os.IsNotExist(err) {
+		file, err = os.Open(partPath(fullPath))
 	}
-
-	file, err := os.Open(openPath)
 	if err != nil {
 		metrics.Get().IncStorageErrors()
 		if os.IsNotExist(err) {
