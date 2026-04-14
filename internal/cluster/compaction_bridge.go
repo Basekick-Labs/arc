@@ -30,6 +30,7 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -49,6 +50,7 @@ type bridgeCoordinator interface {
 	LocalNodeID() string
 	RegisterFileInManifest(file raft.FileEntry) error
 	DeleteFileFromManifest(path, reason string) error
+	BatchFileOpsInManifest(ops []raft.BatchFileOp) error
 }
 
 // CompactionBridge adapts a bridgeCoordinator to compaction.ManifestBridge.
@@ -156,6 +158,55 @@ func checkContextDeadline(ctx context.Context, op string) error {
 // as-is so operators see the actual cause in logs.
 func isTransientLeaderError(err error) bool {
 	return errors.Is(err, ErrNoLeaderKnown) || errors.Is(err, ErrLeaderUnreachable)
+}
+
+// BatchFileOps groups all register and delete operations for one compaction
+// manifest into a single Raft log entry via the underlying coordinator.
+// Reduces Raft traffic from O(N) applies to 1 per manifest.
+func (b *CompactionBridge) BatchFileOps(ctx context.Context, registers []compaction.CompactedFile, deletes []compaction.DeleteSourceOp) error {
+	if err := checkContextDeadline(ctx, "batch file ops"); err != nil {
+		return err
+	}
+
+	ops := make([]raft.BatchFileOp, 0, len(registers)+len(deletes))
+
+	for _, file := range registers {
+		payload, err := json.Marshal(raft.RegisterFilePayload{File: raft.FileEntry{
+			Path:          file.Path,
+			SHA256:        file.SHA256,
+			SizeBytes:     file.SizeBytes,
+			Database:      file.Database,
+			Measurement:   file.Measurement,
+			PartitionTime: file.PartitionTime,
+			OriginNodeID:  b.coord.LocalNodeID(),
+			Tier:          file.Tier,
+			CreatedAt:     file.CreatedAt,
+		}})
+		if err != nil {
+			return fmt.Errorf("batch file ops: marshal register payload: %w", err)
+		}
+		ops = append(ops, raft.BatchFileOp{Type: raft.CommandRegisterFile, Payload: payload})
+	}
+
+	for _, del := range deletes {
+		payload, err := json.Marshal(raft.DeleteFilePayload{Path: del.Path, Reason: del.Reason})
+		if err != nil {
+			return fmt.Errorf("batch file ops: marshal delete payload: %w", err)
+		}
+		ops = append(ops, raft.BatchFileOp{Type: raft.CommandDeleteFile, Payload: payload})
+	}
+
+	if len(ops) == 0 {
+		return nil
+	}
+
+	if err := b.coord.BatchFileOpsInManifest(ops); err != nil {
+		if isTransientLeaderError(err) {
+			return fmt.Errorf("batch file ops: %w", compaction.ErrNotLeader)
+		}
+		return fmt.Errorf("batch file ops: %w", err)
+	}
+	return nil
 }
 
 // Compile-time assertion that CompactionBridge implements the interface.

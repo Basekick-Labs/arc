@@ -2628,6 +2628,38 @@ func (c *Coordinator) DeleteFileFromManifest(path, reason string) error {
 	return nil
 }
 
+// BatchFileOpsInManifest applies a batch of RegisterFile and DeleteFile
+// operations as a single Raft log entry. On the leader the command is applied
+// directly; on a non-leader it is forwarded to the current leader via the
+// peer protocol. This reduces Raft traffic for compaction manifests from
+// O(N) log entries to 1.
+func (c *Coordinator) BatchFileOpsInManifest(ops []raft.BatchFileOp) error {
+	if c.raftNode == nil {
+		return nil
+	}
+
+	if c.raftNode.IsLeader() {
+		if err := c.raftNode.BatchFileOps(ops, 5*time.Second); err != nil {
+			return fmt.Errorf("batch file ops in manifest: %w", err)
+		}
+		return nil
+	}
+
+	// Forward to leader using the same pattern as RegisterFileInManifest.
+	payload, err := json.Marshal(raft.BatchFileOpsPayload{Ops: ops})
+	if err != nil {
+		return fmt.Errorf("batch file ops in manifest: marshal payload: %w", err)
+	}
+	cmd := &raft.Command{Type: raft.CommandBatchFileOps, Payload: payload}
+
+	forwardCtx, cancel := context.WithTimeout(c.ctxOrBackground(), forwardApplyTimeout)
+	defer cancel()
+	if err := c.forwardApplyToLeader(forwardCtx, cmd); err != nil {
+		return fmt.Errorf("batch file ops in manifest (forwarded): %w", err)
+	}
+	return nil
+}
+
 // ctxOrBackground returns the coordinator's lifecycle context if it has
 // been initialized (always the case after Start), or context.Background()
 // as a defensive fallback for callers that somehow reach these methods

@@ -34,6 +34,9 @@ const (
 	// CommandAssignCompactor designates a node as the active compactor.
 	// Used by the CompactorFailoverManager for automatic failover.
 	CommandAssignCompactor
+	// CommandBatchFileOps groups multiple RegisterFile and DeleteFile operations
+	// into a single Raft log entry — one apply per compaction manifest instead of O(N).
+	CommandBatchFileOps
 )
 
 // Command represents a command to be applied to the FSM.
@@ -119,6 +122,19 @@ type DeleteFilePayload struct {
 type AssignCompactorPayload struct {
 	NodeID         string `json:"node_id"`
 	OldCompactorID string `json:"old_compactor_id,omitempty"`
+}
+
+// BatchFileOp is a single operation within a CommandBatchFileOps command.
+// Type must be CommandRegisterFile or CommandDeleteFile; any other value
+// causes the FSM to return an error when the batch is applied.
+type BatchFileOp struct {
+	Type    CommandType `json:"type"`    // CommandRegisterFile or CommandDeleteFile
+	Payload []byte      `json:"payload"` // Same payload shape as the corresponding single command
+}
+
+// BatchFileOpsPayload is the payload for CommandBatchFileOps.
+type BatchFileOpsPayload struct {
+	Ops []BatchFileOp `json:"ops"`
 }
 
 // FSMSnapshot represents a snapshot of the FSM state.
@@ -236,6 +252,8 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.applyDeleteFile(cmd.Payload)
 	case CommandAssignCompactor:
 		return f.applyAssignCompactor(cmd.Payload)
+	case CommandBatchFileOps:
+		return f.applyBatchFileOps(cmd.Payload, log.Index)
 	default:
 		return fmt.Errorf("unknown command type: %d", cmd.Type)
 	}
@@ -553,6 +571,37 @@ func (f *ClusterFSM) applyAssignCompactor(payload []byte) interface{} {
 		callback(p.NodeID, oldCompactorID)
 	}
 
+	return nil
+}
+
+func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interface{} {
+	var p BatchFileOpsPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal batch file ops payload: %w", err)
+	}
+
+	for i, op := range p.Ops {
+		var result interface{}
+		switch op.Type {
+		case CommandRegisterFile:
+			result = f.applyRegisterFile(op.Payload, logIndex)
+		case CommandDeleteFile:
+			result = f.applyDeleteFile(op.Payload)
+		default:
+			return fmt.Errorf("batch file ops: op[%d] unsupported type: %d", i, op.Type)
+		}
+		// applyRegisterFile and applyDeleteFile return nil on success or an
+		// error on failure — they never return a non-nil non-error value.
+		// The type-assert is defensive: if either handler is ever refactored
+		// to return something unexpected, we propagate it as an error rather
+		// than silently ignoring it.
+		if result != nil {
+			if err, ok := result.(error); ok {
+				return fmt.Errorf("batch file ops: op[%d] (type=%d): %w", i, op.Type, err)
+			}
+			return fmt.Errorf("batch file ops: op[%d] (type=%d): unexpected non-error result: %v", i, op.Type, result)
+		}
+	}
 	return nil
 }
 

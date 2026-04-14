@@ -728,3 +728,133 @@ func TestFSMSnapshotRestoreWithFiles(t *testing.T) {
 		t.Error("file2 should exist after restore")
 	}
 }
+
+// --- CommandBatchFileOps ---
+
+// makeBatchCommand builds a Raft log data blob for a CommandBatchFileOps.
+func makeBatchCommand(t *testing.T, ops []BatchFileOp) []byte {
+	t.Helper()
+	return makeCommand(t, CommandBatchFileOps, BatchFileOpsPayload{Ops: ops})
+}
+
+// makeBatchOp is a helper that marshals a typed payload into a BatchFileOp.
+func makeBatchOp(t *testing.T, typ CommandType, payload interface{}) BatchFileOp {
+	t.Helper()
+	b, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("makeBatchOp marshal: %v", err)
+	}
+	return BatchFileOp{Type: typ, Payload: b}
+}
+
+// TestFSMBatchFileOps applies a batch with 2 registers + 2 deletes and
+// verifies correct FSM state, LSN stamping, and idempotency.
+func TestFSMBatchFileOps(t *testing.T) {
+	fsm := newTestFSM()
+
+	// Pre-register the two files that will be deleted in the batch.
+	old1 := makeFileEntry("db/cpu/old1.parquet", "db", "cpu", 100)
+	old2 := makeFileEntry("db/cpu/old2.parquet", "db", "cpu", 200)
+	for i, f := range []FileEntry{old1, old2} {
+		fsm.Apply(&raft.Log{Index: uint64(i + 1), Data: makeCommand(t, CommandRegisterFile, RegisterFilePayload{File: f})})
+	}
+
+	new1 := makeFileEntry("db/cpu/new1.parquet", "db", "cpu", 300)
+	new2 := makeFileEntry("db/cpu/new2.parquet", "db", "cpu", 400)
+
+	ops := []BatchFileOp{
+		makeBatchOp(t, CommandRegisterFile, RegisterFilePayload{File: new1}),
+		makeBatchOp(t, CommandRegisterFile, RegisterFilePayload{File: new2}),
+		makeBatchOp(t, CommandDeleteFile, DeleteFilePayload{Path: old1.Path, Reason: "compaction"}),
+		makeBatchOp(t, CommandDeleteFile, DeleteFilePayload{Path: old2.Path, Reason: "compaction"}),
+	}
+
+	const batchIndex = uint64(10)
+	result := fsm.Apply(&raft.Log{Index: batchIndex, Data: makeBatchCommand(t, ops)})
+	if result != nil {
+		t.Fatalf("Apply batch returned error: %v", result)
+	}
+
+	// New files must be registered.
+	for _, path := range []string{new1.Path, new2.Path} {
+		got, exists := fsm.GetFile(path)
+		if !exists {
+			t.Fatalf("file %s should exist after batch register", path)
+		}
+		if got.LSN != batchIndex {
+			t.Errorf("%s LSN: got %d, want %d (batch log index)", path, got.LSN, batchIndex)
+		}
+	}
+
+	// Old files must be deleted.
+	for _, path := range []string{old1.Path, old2.Path} {
+		if _, exists := fsm.GetFile(path); exists {
+			t.Errorf("file %s should be deleted after batch", path)
+		}
+	}
+
+	if count := fsm.FileCount(); count != 2 {
+		t.Errorf("FileCount() = %d, want 2", count)
+	}
+
+	// Idempotency: re-applying the same batch must not error.
+	result = fsm.Apply(&raft.Log{Index: batchIndex, Data: makeBatchCommand(t, ops)})
+	if result != nil {
+		t.Errorf("Re-applying batch should be idempotent, got error: %v", result)
+	}
+}
+
+// TestFSMBatchFileOpsRegistersOnly applies a batch containing only register
+// operations and verifies they are all committed.
+func TestFSMBatchFileOpsRegistersOnly(t *testing.T) {
+	fsm := newTestFSM()
+
+	files := []FileEntry{
+		makeFileEntry("db/m/a.parquet", "db", "m", 10),
+		makeFileEntry("db/m/b.parquet", "db", "m", 20),
+	}
+	ops := make([]BatchFileOp, len(files))
+	for i, f := range files {
+		ops[i] = makeBatchOp(t, CommandRegisterFile, RegisterFilePayload{File: f})
+	}
+
+	result := fsm.Apply(&raft.Log{Index: 5, Data: makeBatchCommand(t, ops)})
+	if result != nil {
+		t.Fatalf("Apply returned error: %v", result)
+	}
+	if count := fsm.FileCount(); count != 2 {
+		t.Errorf("FileCount() = %d, want 2", count)
+	}
+}
+
+// TestFSMBatchFileOpsUnknownOpType verifies that a batch containing an
+// unsupported op type returns an error.
+func TestFSMBatchFileOpsUnknownOpType(t *testing.T) {
+	fsm := newTestFSM()
+
+	ops := []BatchFileOp{
+		// CommandAddNode is not a valid file-manifest op type.
+		makeBatchOp(t, CommandAddNode, AddNodePayload{Node: NodeInfo{ID: "n1"}}),
+	}
+
+	result := fsm.Apply(&raft.Log{Index: 1, Data: makeBatchCommand(t, ops)})
+	if result == nil {
+		t.Fatal("expected error for unsupported op type, got nil")
+	}
+	if _, ok := result.(error); !ok {
+		t.Fatalf("expected error result, got %T: %v", result, result)
+	}
+}
+
+// TestFSMBatchFileOpsEmpty verifies that a batch with zero ops is a no-op.
+func TestFSMBatchFileOpsEmpty(t *testing.T) {
+	fsm := newTestFSM()
+
+	result := fsm.Apply(&raft.Log{Index: 1, Data: makeBatchCommand(t, []BatchFileOp{})})
+	if result != nil {
+		t.Errorf("empty batch should return nil, got %v", result)
+	}
+	if count := fsm.FileCount(); count != 0 {
+		t.Errorf("FileCount() = %d, want 0", count)
+	}
+}
