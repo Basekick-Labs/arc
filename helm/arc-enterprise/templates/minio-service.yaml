@@ -1,0 +1,16 @@
+{{- if eq (include "arc-enterprise.minioBundled" .) "true" }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "arc-enterprise.minioName" . }}
+  labels:
+    {{- include "arc-enterprise.roleLabels" (dict "ctx" . "role" "minio") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: api
+      port: 9000
+      targetPort: 9000
+  selector:
+    {{- include "arc-enterprise.roleSelectorLabels" (dict "ctx" . "role" "minio") | nindent 4 }}
+{{- end }}

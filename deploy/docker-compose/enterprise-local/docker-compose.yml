@@ -1,0 +1,174 @@
+# =============================================================================
+# Arc Cluster — Local Storage with Peer Replication
+#
+# Each node has its own volume; files are replicated peer-to-peer with
+# SHA-256 verification. Raft-backed cluster manifest is the source of truth.
+# Traefik acts as a dynamic reverse proxy via the Docker provider.
+# =============================================================================
+
+x-arc-common: &arc-common
+  image: basekick/arc:latest
+  networks:
+    - arc-cluster
+
+x-arc-env: &arc-env
+  # Cluster
+  ARC_CLUSTER_ENABLED: "true"
+  ARC_CLUSTER_CLUSTER_NAME: "arc-dev"
+  ARC_CLUSTER_SEEDS: "arc-writer1:9100,arc-writer2:9100,arc-writer3:9100"
+  ARC_CLUSTER_COORDINATOR_ADDR: ":9100"
+  ARC_CLUSTER_RAFT_BIND_ADDR: ":9200"
+  # Storage — local filesystem + peer replication.
+  # Arc defaults storage.local_path to ./data/arc (resolves to /app/data/arc
+  # inside the container), which already lives under the mounted volume.
+  ARC_STORAGE_BACKEND: "local"
+  ARC_CLUSTER_REPLICATION_ENABLED: "true"
+  # License
+  ARC_LICENSE_KEY: "${ARC_LICENSE_KEY}"
+
+x-traefik-writer-labels: &traefik-writer-labels
+  traefik.enable: "true"
+  traefik.docker.network: "arc-cluster"
+  traefik.http.services.arc-writers.loadbalancer.server.port: "8000"
+  traefik.http.routers.arc-writers.rule: >-
+    PathPrefix(`/write`) ||
+    PathPrefix(`/api/v1/write`) ||
+    PathPrefix(`/api/v2/write`) ||
+    PathPrefix(`/api/v1/import`) ||
+    PathPrefix(`/api/v1/msgpack`) ||
+    PathPrefix(`/api/v1/cluster`) ||
+    PathPrefix(`/api/v1/databases`) ||
+    PathPrefix(`/api/v1/tokens`) ||
+    PathPrefix(`/api/v1/retention`) ||
+    PathPrefix(`/api/v1/continuous-queries`)
+  traefik.http.routers.arc-writers.entrypoints: "web"
+  traefik.http.routers.arc-writers.service: "arc-writers"
+  traefik.http.routers.arc-writers.priority: "100"
+
+x-traefik-reader-labels: &traefik-reader-labels
+  traefik.enable: "true"
+  traefik.docker.network: "arc-cluster"
+  traefik.http.services.arc-readers.loadbalancer.server.port: "8000"
+  traefik.http.routers.arc-readers.rule: "PathPrefix(`/api/v1/query`)"
+  traefik.http.routers.arc-readers.entrypoints: "web"
+  traefik.http.routers.arc-readers.service: "arc-readers"
+  traefik.http.routers.arc-readers.priority: "100"
+  traefik.http.services.arc-any.loadbalancer.server.port: "8000"
+  traefik.http.routers.arc-any.rule: "PathPrefix(`/health`) || PathPrefix(`/ready`) || PathPrefix(`/`)"
+  traefik.http.routers.arc-any.entrypoints: "web"
+  traefik.http.routers.arc-any.service: "arc-any"
+  traefik.http.routers.arc-any.priority: "1"
+
+services:
+  # =============================================================================
+  # Traefik — dynamic reverse proxy (Docker provider)
+  # =============================================================================
+  traefik:
+    image: traefik:v3.6
+    container_name: arc-traefik
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=arc-cluster
+      - --entrypoints.web.address=:80
+      - --api.dashboard=true
+      - --api.insecure=true    # dashboard on :8080 — disable in production
+      - --log.level=INFO
+      - --accesslog=true
+    ports:
+      - "8000:80"
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - arc-cluster
+    depends_on:
+      - arc-writer1
+      - arc-writer2
+      - arc-writer3
+      - arc-reader1
+
+  # =============================================================================
+  # Writers (3 nodes)
+  # =============================================================================
+  arc-writer1:
+    <<: *arc-common
+    container_name: arc-writer1
+    hostname: arc-writer1
+    volumes:
+      - arc-writer1-data:/app/data
+    environment:
+      <<: *arc-env
+      ARC_CLUSTER_NODE_ID: "arc-writer1"
+      ARC_CLUSTER_ROLE: "writer"
+      ARC_CLUSTER_ADVERTISE_ADDR: "arc-writer1:9100"
+      ARC_CLUSTER_RAFT_ADVERTISE_ADDR: "arc-writer1:9200"
+      ARC_CLUSTER_RAFT_BOOTSTRAP: "true"
+    labels:
+      <<: *traefik-writer-labels
+
+  arc-writer2:
+    <<: *arc-common
+    container_name: arc-writer2
+    hostname: arc-writer2
+    volumes:
+      - arc-writer2-data:/app/data
+    environment:
+      <<: *arc-env
+      ARC_CLUSTER_NODE_ID: "arc-writer2"
+      ARC_CLUSTER_ROLE: "writer"
+      ARC_CLUSTER_ADVERTISE_ADDR: "arc-writer2:9100"
+      ARC_CLUSTER_RAFT_ADVERTISE_ADDR: "arc-writer2:9200"
+      ARC_CLUSTER_RAFT_BOOTSTRAP: "false"
+    labels:
+      <<: *traefik-writer-labels
+    depends_on:
+      - arc-writer1
+
+  arc-writer3:
+    <<: *arc-common
+    container_name: arc-writer3
+    hostname: arc-writer3
+    volumes:
+      - arc-writer3-data:/app/data
+    environment:
+      <<: *arc-env
+      ARC_CLUSTER_NODE_ID: "arc-writer3"
+      ARC_CLUSTER_ROLE: "writer"
+      ARC_CLUSTER_ADVERTISE_ADDR: "arc-writer3:9100"
+      ARC_CLUSTER_RAFT_ADVERTISE_ADDR: "arc-writer3:9200"
+      ARC_CLUSTER_RAFT_BOOTSTRAP: "false"
+    labels:
+      <<: *traefik-writer-labels
+    depends_on:
+      - arc-writer1
+
+  # =============================================================================
+  # Reader (1 node) — receives peer replication
+  # =============================================================================
+  arc-reader1:
+    <<: *arc-common
+    container_name: arc-reader1
+    hostname: arc-reader1
+    volumes:
+      - arc-reader1-data:/app/data
+    environment:
+      <<: *arc-env
+      ARC_CLUSTER_NODE_ID: "arc-reader1"
+      ARC_CLUSTER_ROLE: "reader"
+      ARC_CLUSTER_ADVERTISE_ADDR: "arc-reader1:9100"
+    labels:
+      <<: *traefik-reader-labels
+    depends_on:
+      - arc-writer1
+
+volumes:
+  arc-writer1-data:
+  arc-writer2-data:
+  arc-writer3-data:
+  arc-reader1-data:
+
+networks:
+  arc-cluster:
+    name: arc-cluster
+    driver: bridge

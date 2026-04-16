@@ -1,0 +1,18 @@
+{{- if .Values.compactor.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "arc-enterprise.compactorHeadlessName" . }}
+  labels:
+    {{- include "arc-enterprise.roleLabels" (dict "ctx" . "role" "compactor") | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: http
+      port: 8000
+    - name: coordinator
+      port: 9100
+  selector:
+    {{- include "arc-enterprise.roleSelectorLabels" (dict "ctx" . "role" "compactor") | nindent 4 }}
+{{- end }}

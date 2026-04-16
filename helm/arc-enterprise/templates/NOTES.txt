@@ -1,0 +1,54 @@
+Arc Enterprise has been installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Deployment pattern: {{ .Values.storage.mode }}-storage
+{{- if eq .Values.storage.mode "shared" }}
+  {{- if not .Values.storage.shared.external }}
+Bundled MinIO: enabled ({{ .Values.minio.replicas }} replica{{ if ne (int .Values.minio.replicas) 1 }}s{{ end }})
+  {{- else }}
+External object storage: {{ .Values.storage.shared.endpoint }}
+  {{- end }}
+{{- end }}
+
+Cluster composition:
+  Writers:    {{ .Values.writer.replicas }}{{ if eq (int .Values.writer.replicas) 1 }} (single — no failover; set writer.replicas=3 for HA){{ end }}
+  Readers:    {{ .Values.reader.replicas }}
+  Compactor:  {{ if .Values.compactor.enabled }}{{ .Values.compactor.replicas }}{{ else }}disabled{{ end }}
+
+1. Wait for all pods to become ready:
+
+     kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "arc-enterprise.writerName" . }}
+     kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "arc-enterprise.readerName" . }}
+{{- if .Values.compactor.enabled }}
+     kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "arc-enterprise.compactorName" . }}
+{{- end }}
+
+2. Retrieve the initial admin token:
+{{- if or .Values.auth.bootstrapToken.existingSecret .Values.auth.bootstrapToken.value }}
+
+     kubectl -n {{ .Release.Namespace }} get secret {{ include "arc-enterprise.bootstrapTokenSecretName" . }} -o jsonpath='{.data.bootstrap-token}' | base64 -d
+{{- else }}
+
+     # Arc generated a random admin token on first boot — read it from writer-0 logs:
+     kubectl -n {{ .Release.Namespace }} logs {{ include "arc-enterprise.writerName" . }}-0 | grep -i "initial admin token"
+{{- end }}
+
+3. Port-forward the writer (ingest) and reader (query) services:
+
+     kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "arc-enterprise.writerName" . }} 8000:{{ .Values.service.writer.port }} &
+     kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "arc-enterprise.readerName" . }} 8001:{{ .Values.service.reader.port }} &
+
+4. Check cluster status:
+
+     curl -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:8000/api/v1/cluster | jq .
+
+{{- if and .Values.cluster.tls.enabled (not .Values.cluster.tls.existingSecret) }}
+
+WARNING: cluster.tls.enabled=true but cluster.tls.existingSecret is empty — install WILL fail.
+{{- end }}
+{{- if and (eq (int .Values.writer.replicas) 1) .Values.cluster.failover.enabled }}
+
+NOTE: writer.replicas=1 with failover enabled is a no-op — no standby target exists.
+Set writer.replicas=3 to activate writer failover.
+{{- end }}
+
+Documentation: https://docs.basekick.net/arc-enterprise/deployment-patterns

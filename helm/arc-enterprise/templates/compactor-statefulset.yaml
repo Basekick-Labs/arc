@@ -1,0 +1,95 @@
+{{- if .Values.compactor.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "arc-enterprise.compactorName" . }}
+  labels:
+    {{- include "arc-enterprise.roleLabels" (dict "ctx" . "role" "compactor") | nindent 4 }}
+spec:
+  serviceName: {{ include "arc-enterprise.compactorHeadlessName" . }}
+  replicas: {{ .Values.compactor.replicas }}
+  selector:
+    matchLabels:
+      {{- include "arc-enterprise.roleSelectorLabels" (dict "ctx" . "role" "compactor") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "arc-enterprise.roleLabels" (dict "ctx" . "role" "compactor") | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: arc
+          image: {{ include "arc-enterprise.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8000
+            - name: coordinator
+              containerPort: 9100
+          env:
+            {{- include "arc-enterprise.commonClusterEnv" . | nindent 12 }}
+            - name: ARC_CLUSTER_ROLE
+              value: "compactor"
+            - name: ARC_CLUSTER_ADVERTISE_ADDR
+              value: "$(POD_NAME).{{ include "arc-enterprise.compactorHeadlessName" . }}.{{ .Release.Namespace }}.svc.cluster.local:9100"
+            - name: ARC_CLUSTER_SEEDS
+              value: {{ include "arc-enterprise.writerSeeds" . | quote }}
+            - name: ARC_COMPACTION_ENABLED
+              value: "true"
+            {{- include "arc-enterprise.storageEnv" . | nindent 12 }}
+            {{- with .Values.compactor.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+            {{- if .Values.cluster.tls.enabled }}
+            - name: tls
+              mountPath: /etc/arc/tls
+              readOnly: true
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.compactor.resources | nindent 12 }}
+      {{- if .Values.cluster.tls.enabled }}
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ .Values.cluster.tls.existingSecret | quote }}
+      {{- end }}
+      {{- include "arc-enterprise.roleScheduling" (dict "ctx" . "role" "compactor") | nindent 6 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- $sc := .Values.compactor.persistence.storageClass | default .Values.storage.local.storageClass }}
+        {{- if $sc }}
+        storageClassName: {{ $sc | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.compactor.persistence.size | quote }}
+{{- end }}

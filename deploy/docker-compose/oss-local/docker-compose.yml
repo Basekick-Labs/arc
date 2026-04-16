@@ -1,0 +1,32 @@
+# =============================================================================
+# Arc OSS — single node, local filesystem storage
+#
+# Simplest possible Arc deployment: one container, one volume, HTTP on :8000.
+# No clustering, no replication, no license key required.
+#
+# Good for: local development, evaluation, embedded deployments, small
+# workloads where a single host is sufficient.
+# =============================================================================
+
+services:
+  arc:
+    image: basekick/arc:latest
+    container_name: arc
+    hostname: arc
+    ports:
+      - "8000:8000"
+    environment:
+      # Local filesystem storage — Arc defaults to ./data/arc under /app,
+      # which resolves to /app/data/arc inside the container.
+      ARC_STORAGE_BACKEND: "local"
+      # Durable ingest — commit to WAL before ack
+      ARC_WAL_ENABLED: "true"
+      # Pre-set the admin token (optional — comment out to let Arc generate
+      # one and print it in the logs on first boot).
+      ARC_AUTH_BOOTSTRAP_TOKEN: "${ARC_AUTH_BOOTSTRAP_TOKEN:-}"
+    volumes:
+      - arc-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  arc-data:

@@ -1,0 +1,233 @@
+# Arc Enterprise Helm Chart — default values.
+#
+# This chart supports two deployment patterns, toggled by `storage.mode`:
+#   - shared: all Arc nodes read/write the same object store (S3, MinIO, Azure).
+#             Set storage.mode=shared (with minio.enabled=true for bundled MinIO,
+#             or storage.shared.external=true to point at your own S3/Azure).
+#
+#   - local:  each Arc node has its own PersistentVolume and peer replication
+#             keeps the cluster in sync. Set storage.mode=local.
+#
+# Quick-start preset files are provided in the chart root:
+#   values-shared-storage.yaml   (MinIO bundled, ready to deploy)
+#   values-local-storage.yaml    (local PVCs + peer replication)
+
+# -----------------------------------------------------------------------------
+# Image
+# -----------------------------------------------------------------------------
+image:
+  repository: ghcr.io/basekick-labs/arc
+  tag: ""                          # defaults to Chart.appVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# -----------------------------------------------------------------------------
+# License — required for Enterprise features
+# -----------------------------------------------------------------------------
+license:
+  # If existingSecret is set, the chart uses that Secret (must contain a key
+  # named "license-key"). Otherwise the chart creates a Secret from `key`.
+  existingSecret: ""
+  key: ""                          # your ARC-ENT-... license key
+
+# -----------------------------------------------------------------------------
+# Authentication — initial admin token
+# -----------------------------------------------------------------------------
+auth:
+  # Pre-set the initial admin token at install time instead of scraping it
+  # from writer-0 logs on first boot. Must be 32+ chars. On re-install the
+  # value is a no-op (existing tokens are preserved).
+  #
+  # If existingSecret is set, must contain key "bootstrap-token".
+  bootstrapToken:
+    existingSecret: ""
+    value: ""                      # leave empty to let Arc generate one (check writer-0 logs)
+
+# -----------------------------------------------------------------------------
+# Cluster identity and security
+# -----------------------------------------------------------------------------
+cluster:
+  name: arc-prod
+
+  # Shared secret for peer authentication (HMAC). Required for replication.
+  # If existingSecret is set, must contain key "shared-secret".
+  sharedSecret:
+    existingSecret: ""
+    value: ""                      # REQUIRED — chart will refuse to install if empty
+
+  # TLS encryption between cluster nodes. Recommended for multi-writer /
+  # production deployments. Create the Secret yourself (kubectl create secret
+  # tls ... or an existing cert-manager Certificate).
+  tls:
+    enabled: false
+    existingSecret: ""             # must contain tls.crt, tls.key (and optionally ca.crt)
+
+  # Automatic failover — single switch that governs both writer and compactor
+  # failover in the binary (cfg.Cluster.FailoverEnabled).
+  failover:
+    enabled: true
+
+  # Peer replication tuning. Only consulted when storage.mode=local.
+  replication:
+    pullWorkers: 4                 # concurrent file-fetch workers per node
+    fetchTimeoutMs: 60000          # per-fetch timeout (puller side)
+    serveTimeoutMs: 120000         # body-stream timeout (origin side)
+    catchup:
+      enabled: true                # walk the manifest on startup to close gaps
+      barrierTimeoutMs: 10000      # Raft barrier wait before walking
+
+# -----------------------------------------------------------------------------
+# Storage mode: "shared" or "local"
+# -----------------------------------------------------------------------------
+storage:
+  mode: shared                     # "shared" or "local"
+
+  # Settings for shared mode (S3-compatible object storage).
+  shared:
+    external: false                # true = use existing S3/Azure; false = bundled MinIO
+    bucket: arc-data
+    region: us-east-1
+    endpoint: ""                   # auto-populated when bundled MinIO; set for external S3/Azure
+    prefix: ""                     # optional key prefix (multi-tenant bucket sharing)
+    usePathStyle: true             # true for MinIO and some S3-compatible services
+    useSSL: false                  # true for production S3 / Azure
+    credentials:
+      # If existingSecret is set, must contain keys "access-key" and "secret-key".
+      existingSecret: ""
+      accessKey: ""
+      secretKey: ""
+
+  # Settings for local mode (peer replication). `storageClass` here is a
+  # fallback used by any role that does not set its own persistence.storageClass.
+  local:
+    storageClass: ""
+
+# -----------------------------------------------------------------------------
+# Bundled MinIO (only rendered when storage.mode=shared && storage.shared.external=false)
+# -----------------------------------------------------------------------------
+minio:
+  enabled: true                    # auto-disabled when storage.mode=local or external=true
+  image: minio/minio:RELEASE.2025-04-03T14-56-28Z
+  replicas: 1                      # 1 for dev; distributed mode not yet supported by this chart
+  persistence:
+    size: 100Gi
+    storageClass: ""
+  credentials:
+    # If existingSecret is set, must contain "root-user" and "root-password".
+    # When empty (and no existingSecret), the chart refuses to install —
+    # weak defaults are not acceptable for the data-lake tier.
+    existingSecret: ""
+    rootUser: ""                   # REQUIRED — set at install time or via existingSecret
+    rootPassword: ""               # REQUIRED — set at install time or via existingSecret
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits:   { cpu: 2000m, memory: 4Gi }
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+
+# -----------------------------------------------------------------------------
+# Writer nodes — ingest data, flush to storage, run Raft leader election
+# -----------------------------------------------------------------------------
+writer:
+  replicas: 1                      # 3 enables failover; 2 creates a split-brain hazard with Raft
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits:   { cpu: 4000m, memory: 8Gi }
+  persistence:
+    # Writer always has a local PVC for WAL; size differs by storage mode.
+    # Shared mode: WAL only (~20Gi). Local mode: WAL + all local Parquet files.
+    size: 20Gi
+    storageClass: ""
+  wal:
+    enabled: true                  # durable ingest — strongly recommended for Enterprise
+    syncMode: fdatasync            # fdatasync | fsync | async
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []                     # additional env vars passed through to Arc
+
+# -----------------------------------------------------------------------------
+# Reader nodes — serve queries
+# -----------------------------------------------------------------------------
+reader:
+  replicas: 2                      # scale horizontally for query throughput
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits:   { cpu: 4000m, memory: 8Gi }
+  persistence:
+    # In shared mode: reader uses emptyDir (no local Parquet cache needed).
+    # In local mode: reader needs a PVC to hold replicated Parquet files.
+    size: 50Gi
+    storageClass: ""
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+
+# -----------------------------------------------------------------------------
+# Compactor — runs background Parquet compaction
+# -----------------------------------------------------------------------------
+compactor:
+  enabled: true
+  replicas: 1                      # exactly one active compactor — failover handles replacement
+  resources:
+    requests: { cpu: 1000m, memory: 4Gi }
+    limits:   { cpu: 4000m, memory: 16Gi }
+  persistence:
+    size: 50Gi                     # scratch space for compaction jobs
+    storageClass: ""
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+
+# -----------------------------------------------------------------------------
+# Services exposed to clients
+# -----------------------------------------------------------------------------
+service:
+  writer:
+    type: ClusterIP
+    port: 8000
+    annotations: {}
+  reader:
+    # Default ClusterIP — expose externally via an Ingress / a LoadBalancer
+    # Service you explicitly annotate (with source-IP restrictions and TLS).
+    type: ClusterIP
+    port: 8000
+    annotations: {}
+
+# -----------------------------------------------------------------------------
+# Telemetry — disable for air-gapped / defense deployments
+# -----------------------------------------------------------------------------
+telemetry:
+  enabled: true
+
+# -----------------------------------------------------------------------------
+# Pod security (applies to Arc pods; MinIO has its own section above)
+# -----------------------------------------------------------------------------
+podSecurityContext:
+  fsGroup: 1000
+  runAsNonRoot: true
+  runAsUser: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: false
+  runAsNonRoot: true
+  runAsUser: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+# -----------------------------------------------------------------------------
+# Global scheduling (role-level values above override these)
+# -----------------------------------------------------------------------------
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

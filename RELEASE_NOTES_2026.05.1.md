@@ -1,5 +1,35 @@
 # Arc v2026.05.1 Release Notes
 
+## Deployment
+
+### Arc Enterprise Helm Chart
+
+A production-ready Helm chart for Arc Enterprise ships in `helm/arc-enterprise/`. It covers both documented deployment patterns — shared object storage (bundled MinIO or bring-your-own S3/Azure) and local storage with peer replication — through a single `storage.mode` value.
+
+Highlights:
+
+- **Role-separated StatefulSets** for writer, reader, and compactor, with per-role scheduling (`writer.nodeSelector`, `writer.tolerations`, `writer.affinity`, and the same for reader and compactor), per-role resource sizing, and per-role PVCs sized for each deployment pattern.
+- **Correct HA bootstrap**: only pod ordinal `-0` bootstraps Raft. The chart refuses `writer.replicas=2` (Raft split-brain hazard) — use 1 for dev or 3+ for HA.
+- **Automatic failover wiring**: a single `cluster.failover.enabled` knob activates both writer and compactor failover in the binary.
+- **Durable ingest by default**: writers ship with WAL enabled (`writer.wal.enabled=true`), sync mode configurable.
+- **Peer-replication tuning exposed**: `cluster.replication.pullWorkers`, `cluster.replication.fetchTimeoutMs`, `cluster.replication.serveTimeoutMs`, and catch-up parameters are values, not opaque defaults.
+- **Fail-fast install validation**: missing license key, shared secret, TLS secret (when TLS is enabled), MinIO credentials, or external-S3 credentials all produce a clear error at `helm install` time instead of a `CreateContainerConfigError` pod stuck later.
+- **Secure defaults**: no default MinIO credentials (chart refuses to install without explicit values), reader `Service` defaults to `ClusterIP`, MinIO runs as non-root with the console disabled, bundled-MinIO pinned to a tagged release (not `:latest`), `seccompProfile: RuntimeDefault` and `allowPrivilegeEscalation: false` on Arc pods.
+- **Initial admin token plumbing**: `auth.bootstrapToken.value` or `auth.bootstrapToken.existingSecret` pre-sets the admin token, removing the first-boot log-scraping step from deploy automation.
+- **Cluster TLS**: when `cluster.tls.enabled=true`, the chart wires both the server cert/key and the CA certificate (for mutual TLS peer verification) from the referenced Kubernetes Secret.
+
+Quick-start preset files land in the chart root: `values-shared-storage.yaml` and `values-local-storage.yaml`.
+
+### Traefik-Based Docker Compose Examples
+
+The two docker-compose examples under `deploy/docker-compose/` (shared storage) and `deploy/docker-compose-local/` (local storage with peer replication) have switched from nginx to **Traefik v3.6** using the Docker provider. Routing is now declared via container labels — writers, readers, and any-node endpoints are discovered automatically, so adding a reader or writer is a single compose edit with no separate routing config to maintain. The Traefik dashboard is exposed on `:8080` for dev visibility (and documented off-by-default guidance for production).
+
+### Enterprise Deployment Patterns Documentation
+
+The docs site now includes a **Deployment Patterns** page comparing the two supported cluster topologies side by side — shared object storage vs. local storage with peer replication — with sizing guidance, operational trade-offs, and the security posture for each. The clustering and overview pages cross-link to the new page, and the hero architecture diagram was refreshed.
+
+See [Deployment Patterns](https://docs.basekick.net/arc-enterprise/deployment-patterns).
+
 ## Deprecations
 
 ### Authentication via `?p=` Query Parameter (InfluxDB 1.x Compatibility)

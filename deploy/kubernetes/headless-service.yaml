@@ -1,0 +1,43 @@
+---
+# Headless service for writer StatefulSet DNS
+apiVersion: v1
+kind: Service
+metadata:
+  name: arc-writer-headless
+  namespace: arc
+  labels:
+    app: arc
+    role: writer
+spec:
+  clusterIP: None
+  selector:
+    app: arc
+    role: writer
+  ports:
+    - port: 8000
+      name: http
+    - port: 9100
+      name: coordinator
+    - port: 9200
+      name: raft
+
+---
+# Headless service for reader StatefulSet DNS
+apiVersion: v1
+kind: Service
+metadata:
+  name: arc-reader-headless
+  namespace: arc
+  labels:
+    app: arc
+    role: reader
+spec:
+  clusterIP: None
+  selector:
+    app: arc
+    role: reader
+  ports:
+    - port: 8000
+      name: http
+    - port: 9100
+      name: coordinator

@@ -1,0 +1,55 @@
+---
+# LoadBalancer for writes - routes to writers only
+apiVersion: v1
+kind: Service
+metadata:
+  name: arc-write
+  namespace: arc
+  labels:
+    app: arc
+spec:
+  type: LoadBalancer
+  selector:
+    app: arc
+    role: writer
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http
+
+---
+# LoadBalancer for reads - routes to readers only
+apiVersion: v1
+kind: Service
+metadata:
+  name: arc-read
+  namespace: arc
+  labels:
+    app: arc
+spec:
+  type: LoadBalancer
+  selector:
+    app: arc
+    role: reader
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http
+
+---
+# ClusterIP for internal access (all nodes)
+apiVersion: v1
+kind: Service
+metadata:
+  name: arc
+  namespace: arc
+  labels:
+    app: arc
+spec:
+  type: ClusterIP
+  selector:
+    app: arc
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http

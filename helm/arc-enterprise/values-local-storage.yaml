@@ -1,0 +1,38 @@
+# Arc Enterprise — Local Storage with Peer Replication preset.
+#
+# Each Arc node has its own PersistentVolume and replicates files peer-to-peer.
+# Raft-backed cluster manifest is the source of truth for which files exist.
+# Suitable for bare metal, VMs, edge deployments, and environments where
+# shared object storage is not available.
+#
+# Required overrides:
+#   --set license.key=<your-license-key>
+#   --set cluster.sharedSecret.value=<strong-random-string>
+#
+# Usage:
+#   helm install arc-ent helm/arc-enterprise \
+#     -f helm/arc-enterprise/values-local-storage.yaml \
+#     --set license.key=ARC-ENT-... \
+#     --set cluster.sharedSecret.value=$(openssl rand -hex 32)
+
+storage:
+  mode: local
+
+minio:
+  enabled: false
+
+writer:
+  replicas: 1
+  persistence:
+    size: 50Gi                                 # local Parquet + WAL
+
+reader:
+  replicas: 2
+  persistence:
+    size: 50Gi                                 # reader needs full data replica
+
+compactor:
+  enabled: true
+  replicas: 1
+  persistence:
+    size: 50Gi                                 # local Parquet + scratch
