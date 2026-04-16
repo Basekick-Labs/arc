@@ -1,0 +1,94 @@
+{{- if eq (include "arc-enterprise.minioBundled" .) "true" }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "arc-enterprise.minioName" . }}
+  labels:
+    {{- include "arc-enterprise.roleLabels" (dict "ctx" . "role" "minio") | nindent 4 }}
+spec:
+  serviceName: {{ include "arc-enterprise.minioName" . }}
+  replicas: {{ .Values.minio.replicas }}
+  selector:
+    matchLabels:
+      {{- include "arc-enterprise.roleSelectorLabels" (dict "ctx" . "role" "minio") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "arc-enterprise.roleLabels" (dict "ctx" . "role" "minio") | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      securityContext:
+        {{- toYaml .Values.minio.securityContext | nindent 8 }}
+      containers:
+        - name: minio
+          image: {{ .Values.minio.image | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            runAsNonRoot: true
+            runAsUser: {{ .Values.minio.securityContext.runAsUser }}
+          args:
+            - server
+            - /data
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "arc-enterprise.minioSecretName" . }}
+                  key: root-user
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "arc-enterprise.minioSecretName" . }}
+                  key: root-password
+            - name: MINIO_BROWSER
+              value: "off"
+          ports:
+            - name: api
+              containerPort: 9000
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            {{- toYaml .Values.minio.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.minio.persistence.storageClass }}
+        storageClassName: {{ .Values.minio.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.minio.persistence.size | quote }}
+{{- end }}

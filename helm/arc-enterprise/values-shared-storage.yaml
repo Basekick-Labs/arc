@@ -1,0 +1,51 @@
+# Arc Enterprise — Shared Object Storage preset.
+#
+# Uses bundled MinIO as the shared S3-compatible backend. All Arc nodes
+# read and write the same bucket. Suitable for cloud-native Kubernetes
+# deployments where MinIO (or your own S3/Azure) is the durability layer.
+#
+# To point at external S3 or Azure instead, set storage.shared.external=true
+# and configure storage.shared.endpoint/region/credentials.
+#
+# Required overrides:
+#   --set license.key=<your-license-key>
+#   --set cluster.sharedSecret.value=<strong-random-string>
+#   --set minio.credentials.rootUser=<username>
+#   --set minio.credentials.rootPassword=<strong-random-string>
+#
+# Usage:
+#   helm install arc-ent helm/arc-enterprise \
+#     -f helm/arc-enterprise/values-shared-storage.yaml \
+#     --set license.key=ARC-ENT-... \
+#     --set cluster.sharedSecret.value=$(openssl rand -hex 32) \
+#     --set minio.credentials.rootUser=arcminio \
+#     --set minio.credentials.rootPassword=$(openssl rand -hex 32)
+
+storage:
+  mode: shared
+  shared:
+    external: false
+    bucket: arc-data
+    usePathStyle: true
+    useSSL: false
+
+minio:
+  enabled: true
+  replicas: 1
+  persistence:
+    size: 100Gi
+
+writer:
+  replicas: 1                                # bump to 3 for HA + failover
+  persistence:
+    size: 20Gi                               # WAL only; bucket holds Parquet
+
+reader:
+  replicas: 2
+  # In shared mode the reader uses emptyDir (no PVC created)
+
+compactor:
+  enabled: true
+  replicas: 1
+  persistence:
+    size: 20Gi                               # scratch only; bucket holds Parquet

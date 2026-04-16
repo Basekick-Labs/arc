@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "arc-enterprise.readerName" . }}
+  labels:
+    {{- include "arc-enterprise.roleLabels" (dict "ctx" . "role" "reader") | nindent 4 }}
+  {{- with .Values.service.reader.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.reader.type }}
+  ports:
+    - name: http
+      port: {{ .Values.service.reader.port }}
+      targetPort: 8000
+  selector:
+    {{- include "arc-enterprise.roleSelectorLabels" (dict "ctx" . "role" "reader") | nindent 4 }}

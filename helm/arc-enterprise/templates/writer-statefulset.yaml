@@ -1,0 +1,100 @@
+{{- include "arc-enterprise.validate" . -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "arc-enterprise.writerName" . }}
+  labels:
+    {{- include "arc-enterprise.roleLabels" (dict "ctx" . "role" "writer") | nindent 4 }}
+spec:
+  serviceName: {{ include "arc-enterprise.writerHeadlessName" . }}
+  replicas: {{ .Values.writer.replicas }}
+  selector:
+    matchLabels:
+      {{- include "arc-enterprise.roleSelectorLabels" (dict "ctx" . "role" "writer") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "arc-enterprise.roleLabels" (dict "ctx" . "role" "writer") | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: arc
+          image: {{ include "arc-enterprise.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          # Raft bootstrap is decided per-pod from POD_NAME (only writer-0 bootstraps).
+          {{- include "arc-enterprise.writerEntrypoint" . | nindent 10 }}
+          ports:
+            - name: http
+              containerPort: 8000
+            - name: coordinator
+              containerPort: 9100
+            - name: raft
+              containerPort: 9200
+          env:
+            {{- include "arc-enterprise.commonClusterEnv" . | nindent 12 }}
+            {{- include "arc-enterprise.writerRaftEnv" . | nindent 12 }}
+            {{- include "arc-enterprise.writerWalEnv" . | nindent 12 }}
+            - name: ARC_CLUSTER_ROLE
+              value: "writer"
+            - name: ARC_CLUSTER_ADVERTISE_ADDR
+              value: "$(POD_NAME).{{ include "arc-enterprise.writerHeadlessName" . }}.{{ .Release.Namespace }}.svc.cluster.local:9100"
+            - name: ARC_CLUSTER_RAFT_ADVERTISE_ADDR
+              value: "$(POD_NAME).{{ include "arc-enterprise.writerHeadlessName" . }}.{{ .Release.Namespace }}.svc.cluster.local:9200"
+            - name: ARC_CLUSTER_SEEDS
+              value: {{ include "arc-enterprise.writerSeeds" . | quote }}
+            {{- include "arc-enterprise.storageEnv" . | nindent 12 }}
+            {{- with .Values.writer.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+            {{- if .Values.cluster.tls.enabled }}
+            - name: tls
+              mountPath: /etc/arc/tls
+              readOnly: true
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.writer.resources | nindent 12 }}
+      {{- if .Values.cluster.tls.enabled }}
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ .Values.cluster.tls.existingSecret | quote }}
+      {{- end }}
+      {{- include "arc-enterprise.roleScheduling" (dict "ctx" . "role" "writer") | nindent 6 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- $sc := .Values.writer.persistence.storageClass | default .Values.storage.local.storageClass }}
+        {{- if $sc }}
+        storageClassName: {{ $sc | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.writer.persistence.size | quote }}

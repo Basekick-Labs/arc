@@ -1,0 +1,187 @@
+---
+# Writers StatefulSet - 3 replicas for Raft quorum
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: arc-writer
+  namespace: arc
+  labels:
+    app: arc
+    role: writer
+spec:
+  serviceName: arc-writer-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: arc
+      role: writer
+  template:
+    metadata:
+      labels:
+        app: arc
+        role: writer
+    spec:
+      containers:
+        - name: arc
+          image: basekick/arc:latest
+          ports:
+            - containerPort: 8000
+              name: http
+            - containerPort: 9100
+              name: coordinator
+            - containerPort: 9200
+              name: raft
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Cluster configuration
+            - name: ARC_CLUSTER_ENABLED
+              value: "true"
+            - name: ARC_CLUSTER_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: ARC_CLUSTER_ROLE
+              value: "writer"
+            - name: ARC_CLUSTER_CLUSTER_NAME
+              value: "arc-prod"
+            - name: ARC_CLUSTER_SEEDS
+              value: "arc-writer-0.arc-writer-headless.arc.svc.cluster.local:9100,arc-writer-1.arc-writer-headless.arc.svc.cluster.local:9100,arc-writer-2.arc-writer-headless.arc.svc.cluster.local:9100"
+            - name: ARC_CLUSTER_COORDINATOR_ADDR
+              value: ":9100"
+            - name: ARC_CLUSTER_ADVERTISE_ADDR
+              value: "$(POD_NAME).arc-writer-headless.arc.svc.cluster.local:9100"
+            - name: ARC_CLUSTER_RAFT_BIND_ADDR
+              value: ":9200"
+            - name: ARC_CLUSTER_RAFT_ADVERTISE_ADDR
+              value: "$(POD_NAME).arc-writer-headless.arc.svc.cluster.local:9200"
+            # License
+            - name: ARC_LICENSE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: arc-license
+                  key: license-key
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "2000m"
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+
+---
+# Readers StatefulSet - horizontally scalable
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: arc-reader
+  namespace: arc
+  labels:
+    app: arc
+    role: reader
+spec:
+  serviceName: arc-reader-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: arc
+      role: reader
+  template:
+    metadata:
+      labels:
+        app: arc
+        role: reader
+    spec:
+      containers:
+        - name: arc
+          image: basekick/arc:latest
+          ports:
+            - containerPort: 8000
+              name: http
+            - containerPort: 9100
+              name: coordinator
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Cluster configuration
+            - name: ARC_CLUSTER_ENABLED
+              value: "true"
+            - name: ARC_CLUSTER_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: ARC_CLUSTER_ROLE
+              value: "reader"
+            - name: ARC_CLUSTER_CLUSTER_NAME
+              value: "arc-prod"
+            - name: ARC_CLUSTER_SEEDS
+              value: "arc-writer-0.arc-writer-headless.arc.svc.cluster.local:9100,arc-writer-1.arc-writer-headless.arc.svc.cluster.local:9100,arc-writer-2.arc-writer-headless.arc.svc.cluster.local:9100"
+            - name: ARC_CLUSTER_COORDINATOR_ADDR
+              value: ":9100"
+            - name: ARC_CLUSTER_ADVERTISE_ADDR
+              value: "$(POD_NAME).arc-reader-headless.arc.svc.cluster.local:9100"
+            - name: ARC_CLUSTER_REPLICATION_ENABLED
+              value: "true"
+            # License
+            - name: ARC_LICENSE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: arc-license
+                  key: license-key
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "2000m"
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

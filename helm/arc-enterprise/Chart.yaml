@@ -1,0 +1,22 @@
+apiVersion: v2
+name: arc-enterprise
+description: Arc Enterprise — multi-node clustered analytical database with role separation, automatic failover, and flexible storage patterns (shared object storage or peer-replicated local disks).
+type: application
+version: 0.1.0
+appVersion: "26.05.1"
+kubeVersion: ">=1.24.0-0"
+icon: https://raw.githubusercontent.com/basekick-labs/arc/main/docs/arc-logo.png
+keywords:
+  - database
+  - analytical
+  - columnar
+  - duckdb
+  - parquet
+  - clustering
+  - enterprise
+home: https://github.com/basekick-labs/arc
+sources:
+  - https://github.com/basekick-labs/arc
+maintainers:
+  - name: Basekick Labs
+    email: enterprise@basekick.net
