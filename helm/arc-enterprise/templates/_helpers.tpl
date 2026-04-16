@@ -174,54 +174,20 @@ S3 endpoint — auto-populate when using bundled MinIO, otherwise use whatever t
 {{- end }}
 
 {{/*
-Chart-wide validation. Rendered from a dummy ConfigMap so `helm install` /
-`helm template` fails fast with a helpful message. Upgrade-safe: when a
-Secret already exists for a required value, the corresponding check is
-skipped (lookup returns nil in `helm template`, so required values are
-still enforced there).
+Chart-wide validation is implemented in two layers:
+
+  1. values.schema.json — types, enums, ranges, and shape checks. Helm
+     validates this automatically before any template renders (best UX
+     for typos and wrong types).
+
+  2. _validation.tpl — cross-field rules that depend on lookup() or the
+     combination of multiple values (e.g. "tls.existingSecret required
+     when tls.enabled=true"). Invoked from writer-statefulset.yaml via
+     {{- include "arc-enterprise.validate" . -}}.
+
+Keep "arc-enterprise.validate" (and friends) in _validation.tpl — do not
+add new fail() blocks in this file.
 */}}
-{{- define "arc-enterprise.validate" -}}
-{{- if not (has .Values.storage.mode (list "shared" "local")) -}}
-{{- fail (printf "storage.mode must be 'shared' or 'local' (got %q)" .Values.storage.mode) -}}
-{{- end -}}
-{{- if lt (int .Values.writer.replicas) 1 -}}
-{{- fail "writer.replicas must be >= 1" -}}
-{{- end -}}
-{{- if eq (int .Values.writer.replicas) 2 -}}
-{{- fail "writer.replicas=2 creates a Raft split-brain hazard (quorum of 2 requires both). Use 1 (dev) or 3+ (HA)." -}}
-{{- end -}}
-{{- if and (not .Values.license.existingSecret) (not .Values.license.key) -}}
-{{- $existing := lookup "v1" "Secret" .Release.Namespace (include "arc-enterprise.licenseSecretName" .) -}}
-{{- if not $existing -}}
-{{- fail "license.key is required (or set license.existingSecret)" -}}
-{{- end -}}
-{{- end -}}
-{{- if and (not .Values.cluster.sharedSecret.existingSecret) (not .Values.cluster.sharedSecret.value) -}}
-{{- $existing := lookup "v1" "Secret" .Release.Namespace (include "arc-enterprise.sharedSecretName" .) -}}
-{{- if not $existing -}}
-{{- fail "cluster.sharedSecret.value is required (or set cluster.sharedSecret.existingSecret)" -}}
-{{- end -}}
-{{- end -}}
-{{- if and .Values.cluster.tls.enabled (not .Values.cluster.tls.existingSecret) -}}
-{{- fail "cluster.tls.existingSecret is required when cluster.tls.enabled=true" -}}
-{{- end -}}
-{{- if eq (include "arc-enterprise.minioBundled" .) "true" -}}
-{{- if and (not .Values.minio.credentials.existingSecret) (or (not .Values.minio.credentials.rootUser) (not .Values.minio.credentials.rootPassword)) -}}
-{{- $existing := lookup "v1" "Secret" .Release.Namespace (include "arc-enterprise.minioSecretName" .) -}}
-{{- if not $existing -}}
-{{- fail "minio.credentials.rootUser and rootPassword are required (or set minio.credentials.existingSecret)" -}}
-{{- end -}}
-{{- end -}}
-{{- end -}}
-{{- if and (eq .Values.storage.mode "shared") .Values.storage.shared.external -}}
-{{- if and (not .Values.storage.shared.credentials.existingSecret) (or (not .Values.storage.shared.credentials.accessKey) (not .Values.storage.shared.credentials.secretKey)) -}}
-{{- $existing := lookup "v1" "Secret" .Release.Namespace (include "arc-enterprise.objectStorageSecretName" .) -}}
-{{- if not $existing -}}
-{{- fail "storage.shared.credentials.accessKey/secretKey are required when storage.shared.external=true (or set storage.shared.credentials.existingSecret)" -}}
-{{- end -}}
-{{- end -}}
-{{- end -}}
-{{- end }}
 
 {{/*
 Role-specific scheduling fields with fallback to the global top-level values.

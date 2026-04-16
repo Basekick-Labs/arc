@@ -1,0 +1,251 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Arc Enterprise Helm values",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag":        { "type": "string" },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "imagePullSecrets": { "type": "array", "items": { "type": "object" } },
+
+    "license": {
+      "type": "object",
+      "properties": {
+        "existingSecret": { "type": "string" },
+        "key":            { "type": "string" }
+      }
+    },
+
+    "auth": {
+      "type": "object",
+      "properties": {
+        "bootstrapToken": {
+          "type": "object",
+          "properties": {
+            "existingSecret": { "type": "string" },
+            "value":          { "type": "string" }
+          }
+        }
+      }
+    },
+
+    "cluster": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "sharedSecret": {
+          "type": "object",
+          "properties": {
+            "existingSecret": { "type": "string" },
+            "value":          { "type": "string" }
+          }
+        },
+        "tls": {
+          "type": "object",
+          "properties": {
+            "enabled":        { "type": "boolean" },
+            "existingSecret": { "type": "string" }
+          }
+        },
+        "failover": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" }
+          }
+        },
+        "replication": {
+          "type": "object",
+          "properties": {
+            "pullWorkers":    { "type": "integer", "minimum": 1,   "maximum": 256 },
+            "fetchTimeoutMs": { "type": "integer", "minimum": 1000 },
+            "serveTimeoutMs": { "type": "integer", "minimum": 1000 },
+            "catchup": {
+              "type": "object",
+              "properties": {
+                "enabled":          { "type": "boolean" },
+                "barrierTimeoutMs": { "type": "integer", "minimum": 1000 }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "storage": {
+      "type": "object",
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["shared", "local"],
+          "description": "shared = one object-storage bucket for the whole cluster; local = per-node disks with peer replication"
+        },
+        "shared": {
+          "type": "object",
+          "properties": {
+            "external":     { "type": "boolean" },
+            "bucket":       { "type": "string", "minLength": 1 },
+            "region":       { "type": "string" },
+            "endpoint":     { "type": "string" },
+            "prefix":       { "type": "string" },
+            "usePathStyle": { "type": "boolean" },
+            "useSSL":       { "type": "boolean" },
+            "credentials": {
+              "type": "object",
+              "properties": {
+                "existingSecret": { "type": "string" },
+                "accessKey":      { "type": "string" },
+                "secretKey":      { "type": "string" }
+              }
+            }
+          }
+        },
+        "local": {
+          "type": "object",
+          "properties": {
+            "storageClass": { "type": "string" }
+          }
+        }
+      }
+    },
+
+    "minio": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "image":   { "type": "string", "minLength": 1 },
+        "replicas": { "type": "integer", "minimum": 1 },
+        "persistence": {
+          "type": "object",
+          "properties": {
+            "size":         { "type": "string", "minLength": 1 },
+            "storageClass": { "type": "string" }
+          }
+        },
+        "credentials": {
+          "type": "object",
+          "properties": {
+            "existingSecret": { "type": "string" },
+            "rootUser":       { "type": "string" },
+            "rootPassword":   { "type": "string" }
+          }
+        },
+        "resources":       { "type": "object" },
+        "securityContext": { "type": "object" }
+      }
+    },
+
+    "writer": {
+      "type": "object",
+      "properties": {
+        "replicas": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "1 for dev, 3+ for HA. 2 is rejected (Raft split-brain hazard) via a cross-field check with a human-readable message."
+        },
+        "resources":   { "type": "object" },
+        "persistence": {
+          "type": "object",
+          "properties": {
+            "size":         { "type": "string", "minLength": 1 },
+            "storageClass": { "type": "string" }
+          }
+        },
+        "wal": {
+          "type": "object",
+          "properties": {
+            "enabled":  { "type": "boolean" },
+            "syncMode": { "type": "string", "enum": ["fdatasync", "fsync", "async"] }
+          }
+        },
+        "nodeSelector": { "type": "object" },
+        "tolerations":  { "type": "array" },
+        "affinity":     { "type": "object" },
+        "extraEnv":     { "type": "array" }
+      }
+    },
+
+    "reader": {
+      "type": "object",
+      "properties": {
+        "replicas":    { "type": "integer", "minimum": 1 },
+        "resources":   { "type": "object" },
+        "persistence": {
+          "type": "object",
+          "properties": {
+            "size":         { "type": "string", "minLength": 1 },
+            "storageClass": { "type": "string" }
+          }
+        },
+        "nodeSelector": { "type": "object" },
+        "tolerations":  { "type": "array" },
+        "affinity":     { "type": "object" },
+        "extraEnv":     { "type": "array" }
+      }
+    },
+
+    "compactor": {
+      "type": "object",
+      "properties": {
+        "enabled":     { "type": "boolean" },
+        "replicas":    { "type": "integer", "minimum": 1 },
+        "resources":   { "type": "object" },
+        "persistence": {
+          "type": "object",
+          "properties": {
+            "size":         { "type": "string", "minLength": 1 },
+            "storageClass": { "type": "string" }
+          }
+        },
+        "nodeSelector": { "type": "object" },
+        "tolerations":  { "type": "array" },
+        "affinity":     { "type": "object" },
+        "extraEnv":     { "type": "array" }
+      }
+    },
+
+    "service": {
+      "type": "object",
+      "properties": {
+        "writer": {
+          "type": "object",
+          "properties": {
+            "type":        { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer", "ExternalName"] },
+            "port":        { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "annotations": { "type": "object" }
+          }
+        },
+        "reader": {
+          "type": "object",
+          "properties": {
+            "type":        { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer", "ExternalName"] },
+            "port":        { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "annotations": { "type": "object" }
+          }
+        }
+      }
+    },
+
+    "telemetry": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" }
+      }
+    },
+
+    "podSecurityContext": { "type": "object" },
+    "securityContext":    { "type": "object" },
+    "nodeSelector":       { "type": "object" },
+    "tolerations":        { "type": "array" },
+    "affinity":           { "type": "object" },
+    "podAnnotations":     { "type": "object" },
+    "nameOverride":       { "type": "string" },
+    "fullnameOverride":   { "type": "string" }
+  }
+}
