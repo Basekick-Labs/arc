@@ -1,0 +1,59 @@
+# =============================================================================
+# Arc OSS — single node, local storage, fronted by Traefik
+#
+# One Arc container with Traefik v3.6 in front of it. Useful when you need
+# TLS termination, request logging, or an integration point for other
+# services on the same host — without the complexity of an Enterprise cluster.
+# =============================================================================
+
+services:
+  traefik:
+    image: traefik:v3.6
+    container_name: arc-traefik
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=arc-oss
+      - --entrypoints.web.address=:80
+      - --api.dashboard=true
+      - --api.insecure=true    # dashboard on :8080 — disable in production
+      - --log.level=INFO
+      - --accesslog=true
+    ports:
+      - "8000:80"
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - arc-oss
+    depends_on:
+      - arc
+
+  arc:
+    image: basekick/arc:latest
+    container_name: arc
+    hostname: arc
+    environment:
+      ARC_STORAGE_BACKEND: "local"
+      ARC_WAL_ENABLED: "true"
+      ARC_AUTH_BOOTSTRAP_TOKEN: "${ARC_AUTH_BOOTSTRAP_TOKEN:-}"
+    volumes:
+      - arc-data:/app/data
+    networks:
+      - arc-oss
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: "arc-oss"
+      traefik.http.services.arc.loadbalancer.server.port: "8000"
+      traefik.http.routers.arc.rule: "PathPrefix(`/`)"
+      traefik.http.routers.arc.entrypoints: "web"
+      traefik.http.routers.arc.service: "arc"
+    restart: unless-stopped
+
+volumes:
+  arc-data:
+
+networks:
+  arc-oss:
+    name: arc-oss
+    driver: bridge

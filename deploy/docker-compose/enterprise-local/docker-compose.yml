@@ -18,9 +18,10 @@ x-arc-env: &arc-env
   ARC_CLUSTER_SEEDS: "arc-writer1:9100,arc-writer2:9100,arc-writer3:9100"
   ARC_CLUSTER_COORDINATOR_ADDR: ":9100"
   ARC_CLUSTER_RAFT_BIND_ADDR: ":9200"
-  # Storage — local filesystem + peer replication
+  # Storage — local filesystem + peer replication.
+  # Arc defaults storage.local_path to ./data/arc (resolves to /app/data/arc
+  # inside the container), which already lives under the mounted volume.
   ARC_STORAGE_BACKEND: "local"
-  ARC_STORAGE_BASE_PATH: "/app/data/storage"
   ARC_CLUSTER_REPLICATION_ENABLED: "true"
   # License
   ARC_LICENSE_KEY: "${ARC_LICENSE_KEY}"

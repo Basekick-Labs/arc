@@ -1,0 +1,56 @@
+# =============================================================================
+# Arc OSS — single node, S3-backed storage (bundled MinIO)
+#
+# One Arc container backed by a bundled MinIO for S3-compatible storage.
+# No clustering; Arc still reads/writes a single bucket. Useful for testing
+# the S3 code path locally, or as a stepping stone to Enterprise clustered
+# deployments that share a bucket across nodes.
+#
+# To point at external S3 / R2 / Tigris / Azure, replace the MinIO creds
+# and endpoint with your own values and remove the `minio` service.
+# =============================================================================
+
+services:
+  arc:
+    image: basekick/arc:latest
+    container_name: arc
+    hostname: arc
+    ports:
+      - "8000:8000"
+    environment:
+      # S3-compatible storage
+      ARC_STORAGE_BACKEND: "s3"
+      ARC_STORAGE_S3_BUCKET: "arc-data"
+      ARC_STORAGE_S3_REGION: "us-east-1"
+      ARC_STORAGE_S3_ENDPOINT: "http://minio:9000"
+      ARC_STORAGE_S3_ACCESS_KEY: "${MINIO_ROOT_USER:-minioadmin}"
+      ARC_STORAGE_S3_SECRET_KEY: "${MINIO_ROOT_PASSWORD:-minioadmin}"
+      ARC_STORAGE_S3_FORCE_PATH_STYLE: "true"
+      ARC_STORAGE_S3_USE_SSL: "false"
+      # WAL stays local even with S3 storage — it's only for in-flight writes
+      ARC_WAL_ENABLED: "true"
+      ARC_AUTH_BOOTSTRAP_TOKEN: "${ARC_AUTH_BOOTSTRAP_TOKEN:-}"
+    volumes:
+      - arc-data:/app/data
+    depends_on:
+      minio:
+        condition: service_started
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:-minioadmin}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:-minioadmin}"
+    volumes:
+      - minio-data:/data
+    restart: unless-stopped
+
+volumes:
+  arc-data:
+  minio-data:
