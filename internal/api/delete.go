@@ -27,7 +27,7 @@ import (
 // the Raft manifest. nil = standalone mode (no gate, manifest not updated).
 type DeleteCoordinator interface {
 	BatchFileOpsInManifest(ops []raft.BatchFileOp) error
-	CanRunRetention() bool // "can run writer-only mutations"
+	IsPrimaryWriter() bool
 	Role() string
 }
 
@@ -38,6 +38,12 @@ var errManifestFailure = errors.New("cluster manifest update failed")
 // parquetRowGroupSize is the row group size used for Parquet rewrites during delete operations.
 // Matches compaction's row group size to limit DuckDB's internal write buffer per group.
 const parquetRowGroupSize = 122880
+
+// escapeDuckDBPath escapes single quotes in a path for safe interpolation into
+// DuckDB read_parquet() calls, which do not support parameterized queries.
+func escapeDuckDBPath(path string) string {
+	return strings.ReplaceAll(path, "'", "''")
+}
 
 // lastFreeOSMemoryNano is the last time freeOSMemoryThrottled fired, used to debounce GC calls.
 var lastFreeOSMemoryNano atomic.Int64
@@ -197,6 +203,30 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
+	// Reject path traversal in database/measurement names — these values are
+	// concatenated directly into storage prefixes and DuckDB paths.
+	if strings.ContainsAny(req.Database, "/\\") || strings.Contains(req.Database, "..") {
+		return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{
+			Success: false,
+			Error:   "database name contains invalid characters",
+		})
+	}
+	if strings.ContainsAny(req.Measurement, "/\\") || strings.Contains(req.Measurement, "..") {
+		return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{
+			Success: false,
+			Error:   "measurement name contains invalid characters",
+		})
+	}
+
+	// In cluster mode, only the primary writer may execute deletes. Check before
+	// findAffectedFiles to avoid running expensive DuckDB scans on reader nodes.
+	if !req.DryRun && h.coordinator != nil && !h.coordinator.IsPrimaryWriter() {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(DeleteResponse{
+			Success: false,
+			Error:   fmt.Sprintf("delete rejected: node role %q is not primary writer", h.coordinator.Role()),
+		})
+	}
+
 	// Validate WHERE clause
 	isFullTableDelete, err := h.validateWhereClause(req.Where)
 	if err != nil {
@@ -302,15 +332,6 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 			DryRun:          true,
 			FilesProcessed:  fileNames,
-		})
-	}
-
-	// In cluster mode, only the primary writer may execute deletes — reader
-	// nodes must not race with the writer over shared or local storage.
-	if h.coordinator != nil && !h.coordinator.CanRunRetention() {
-		return c.Status(fiber.StatusServiceUnavailable).JSON(DeleteResponse{
-			Success: false,
-			Error:   fmt.Sprintf("delete rejected: node role %q is not primary writer", h.coordinator.Role()),
 		})
 	}
 
@@ -509,7 +530,7 @@ func (h *DeleteHandler) countMatchingRowsInFiles(ctx context.Context, files []fi
 			pathList.WriteString(", ")
 		}
 		pathList.WriteString("'")
-		pathList.WriteString(strings.ReplaceAll(f.queryPath, "'", "''"))
+		pathList.WriteString(escapeDuckDBPath(f.queryPath))
 		pathList.WriteString("'")
 	}
 	pathList.WriteString("]")
@@ -580,7 +601,7 @@ func (h *DeleteHandler) countMatchingRowsIndividually(ctx context.Context, files
 	db := h.db.DB()
 
 	for _, f := range files {
-		query := fmt.Sprintf("SELECT COUNT(*) FROM read_parquet('%s') WHERE %s", strings.ReplaceAll(f.queryPath, "'", "''"), whereClause)
+		query := fmt.Sprintf("SELECT COUNT(*) FROM read_parquet('%s') WHERE %s", escapeDuckDBPath(f.queryPath), whereClause)
 		var count int64
 		if err := db.QueryRowContext(ctx, query).Scan(&count); err != nil {
 			h.logger.Warn().Err(err).Str("file", f.relativePath).Msg("Failed to count matching rows, skipping file")
@@ -615,7 +636,7 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 			COUNT(*) as total,
 			COUNT(*) FILTER (WHERE NOT (%s)) as remaining
 		FROM read_parquet('%s')`,
-		whereClause, strings.ReplaceAll(queryPath, "'", "''"))
+		whereClause, escapeDuckDBPath(queryPath))
 
 	if err := db.QueryRowContext(ctx, countQuery).Scan(&rowsBefore, &rowsAfter); err != nil {
 		return 0, fmt.Errorf("failed to count rows: %w", err)
@@ -682,7 +703,7 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, _, where
 			COMPRESSION ZSTD,
 			COMPRESSION_LEVEL 3,
 			ROW_GROUP_SIZE %d
-		)`, strings.ReplaceAll(filePath, "'", "''"), whereClause, strings.ReplaceAll(tempFile, "'", "''"), parquetRowGroupSize)
+		)`, escapeDuckDBPath(filePath), whereClause, escapeDuckDBPath(tempFile), parquetRowGroupSize)
 
 	if _, err := db.ExecContext(ctx, copyQuery); err != nil {
 		os.Remove(tempFile)
@@ -732,7 +753,7 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 			COMPRESSION ZSTD,
 			COMPRESSION_LEVEL 3,
 			ROW_GROUP_SIZE %d
-		)`, strings.ReplaceAll(s3Path, "'", "''"), whereClause, strings.ReplaceAll(tempPath, "'", "''"), parquetRowGroupSize)
+		)`, escapeDuckDBPath(s3Path), whereClause, escapeDuckDBPath(tempPath), parquetRowGroupSize)
 
 	if _, err := db.ExecContext(ctx, copyQuery); err != nil {
 		return 0, fmt.Errorf("failed to write filtered data: %w", err)

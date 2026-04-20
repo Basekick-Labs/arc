@@ -18,7 +18,7 @@ import (
 type RetentionClusterGate interface {
 	// CanRunRetention reports whether the local node may execute retention.
 	// When false, the scheduler stays idle — not running, not an error.
-	CanRunRetention() bool
+	IsPrimaryWriter() bool
 	// Role returns a human-readable role string for log messages only.
 	Role() string
 }
@@ -151,7 +151,7 @@ func (s *RetentionScheduler) runRetention() {
 	// Cluster gate: checked on every tick so role transitions (failover,
 	// demotion) take effect without a restart. clusterGate is immutable
 	// after construction so no lock is needed here.
-	if s.clusterGate != nil && !s.clusterGate.CanRunRetention() {
+	if s.clusterGate != nil && !s.clusterGate.IsPrimaryWriter() {
 		s.logger.Debug().Str("role", s.clusterGate.Role()).Msg("Retention tick skipped: node is not primary writer")
 		return
 	}
@@ -236,7 +236,7 @@ func (s *RetentionScheduler) TriggerNow(ctx context.Context) error {
 	// The same gate applies to manual triggers — a reader node must not
 	// run retention on demand either. clusterGate is immutable after
 	// construction so no lock is needed.
-	if s.clusterGate != nil && !s.clusterGate.CanRunRetention() {
+	if s.clusterGate != nil && !s.clusterGate.IsPrimaryWriter() {
 		s.logger.Warn().
 			Str("role", s.clusterGate.Role()).
 			Msg("Manual retention trigger rejected: node is not primary writer")
@@ -337,7 +337,7 @@ func (s *RetentionScheduler) Status() map[string]interface{} {
 	}
 
 	if s.clusterGate != nil {
-		status["can_run"] = s.clusterGate.CanRunRetention()
+		status["can_run"] = s.clusterGate.IsPrimaryWriter()
 		status["gate_role"] = s.clusterGate.Role()
 	}
 

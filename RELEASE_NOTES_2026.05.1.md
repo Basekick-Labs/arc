@@ -157,6 +157,14 @@ In clustered deployments, retention policies now run exclusively on the primary 
 - **Cluster manifest updates**: After each file is deleted from storage, the retention handler commits the deletion into the Raft log via `DeleteFileFromManifest`. This keeps the manifest consistent and prevents orphaned entries from interfering with peer replication catch-up.
 - **Reader node cleanup (local storage)**: The `onFileDeleted` FSM callback and delete-worker pool (shared with compaction) handle retention-triggered deletes on reader nodes, removing their local copy of the file and preventing unbounded disk growth on per-node storage deployments.
 
+### Cluster-Safe DELETE Endpoint (Enterprise)
+
+The `POST /api/v1/delete` endpoint is now cluster-aware. Reader nodes reject delete requests with `503 Service Unavailable` — only the primary writer may execute mutations.
+
+- **Writer-only gate**: Checked before any storage scan, so reader nodes are rejected immediately without running expensive DuckDB queries.
+- **Manifest-before-storage for full-file deletes**: When a DELETE removes an entire file (all rows match the WHERE clause), the path is committed to the Raft manifest before `storage.Delete`. All peer nodes learn about the removal via the `onFileDeleted` FSM hook and clean up their local copies. Partial rewrites (file overwritten in-place, path unchanged) require no manifest entry.
+- **Path traversal hardening**: `database` and `measurement` inputs are now validated to reject `..`, `/`, and `\` characters.
+
 ## Bug Fixes
 
 ### Row-Format MessagePack Flush Hardening

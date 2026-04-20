@@ -1511,9 +1511,9 @@ func (c *Coordinator) GetRole() NodeRole {
 	return c.localNode.Role
 }
 
-// CanRunRetention implements api.RetentionCoordinator: reports whether this
-// node is the primary writer and therefore permitted to execute retention.
-func (c *Coordinator) CanRunRetention() bool {
+// IsPrimaryWriter implements api.RetentionCoordinator and api.DeleteCoordinator:
+// reports whether this node is the primary writer and may execute writer-only mutations.
+func (c *Coordinator) IsPrimaryWriter() bool {
 	node := c.GetLocalNode()
 	if node == nil {
 		return false

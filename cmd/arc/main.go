@@ -1765,7 +1765,7 @@ func newRetentionClusterGate(c *cluster.Coordinator) *retentionClusterGate {
 	return &retentionClusterGate{coordinator: c}
 }
 
-func (g *retentionClusterGate) CanRunRetention() bool {
+func (g *retentionClusterGate) IsPrimaryWriter() bool {
 	node := g.coordinator.GetLocalNode()
 	if node == nil {
 		return false
