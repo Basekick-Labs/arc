@@ -22,10 +22,16 @@ import (
 )
 
 // RetentionCoordinator is the minimal cluster interface retention needs to
-// propagate file deletes to the Raft manifest. Using a minimal interface
-// avoids a compile-time dependency on the cluster package.
+// propagate file deletes to the Raft manifest and gate execution to the
+// primary writer. Using a minimal interface avoids a compile-time dependency
+// on the cluster package.
 type RetentionCoordinator interface {
 	BatchFileOpsInManifest(ops []raft.BatchFileOp) error
+	// CanRunRetention reports whether this node may execute retention.
+	// Returns true unconditionally for standalone (coordinator is nil).
+	CanRunRetention() bool
+	// Role returns a human-readable role string for log messages.
+	Role() string
 }
 
 // RetentionHandler handles retention policy operations
@@ -518,6 +524,14 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 	if !req.DryRun && !req.Confirm {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Confirmation required for retention policy execution. Set confirm=true",
+		})
+	}
+
+	// In cluster mode, only the primary writer may execute retention — reader
+	// nodes must not race with the writer over shared or local storage.
+	if !req.DryRun && h.coordinator != nil && !h.coordinator.CanRunRetention() {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": fmt.Sprintf("retention rejected: node role %q is not primary writer", h.coordinator.Role()),
 		})
 	}
 
