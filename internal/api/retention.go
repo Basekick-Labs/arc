@@ -420,6 +420,10 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 
 	for _, measurement := range measurements {
 		deleted, filesDeleted, err := h.deleteOldFiles(ctx, policy.Database, measurement, cutoffDate, false, fmt.Sprintf("retention:%d", policyID))
+		// Accumulate before error check: deleteOldFiles returns partial progress
+		// on abort so the execution record reflects all completed work accurately.
+		totalDeleted += deleted
+		totalFilesDeleted += filesDeleted
 		if err != nil {
 			h.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to process measurement")
 			// Abort on any error — manifest failures are non-transient (Raft quorum loss)
@@ -429,8 +433,6 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 			}
 			return nil, fmt.Errorf("retention aborted for policy %d: %w", policyID, err)
 		}
-		totalDeleted += deleted
-		totalFilesDeleted += filesDeleted
 	}
 
 	// Clear DuckDB parquet metadata/data cache and release memory back to OS.
@@ -576,6 +578,8 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 
 	for _, measurement := range measurements {
 		deleted, filesDeleted, err := h.deleteOldFiles(c.Context(), policy.Database, measurement, cutoffDate, req.DryRun, fmt.Sprintf("retention:%d", policyID))
+		totalDeleted += deleted
+		totalFilesDeleted += filesDeleted
 		if err != nil {
 			h.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to process measurement")
 			if !req.DryRun && executionID > 0 {
@@ -585,8 +589,6 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 				"error": fmt.Sprintf("retention aborted at measurement %q: %s", measurement, err.Error()),
 			})
 		}
-		totalDeleted += deleted
-		totalFilesDeleted += filesDeleted
 	}
 
 	// Clear DuckDB parquet metadata/data cache — dry runs also populate the cache via
