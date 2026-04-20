@@ -367,7 +367,6 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 
 	for _, f := range affected {
 		deleted, err := h.rewriteFileWithoutDeletedRows(ctx, f.path, f.relativePath, req.Where)
-		totalDeleted += deleted
 		if err != nil {
 			h.logger.Error().Err(err).Str("file", f.path).Msg("Failed to rewrite file")
 			// Manifest failures are non-transient (Raft quorum loss) — abort the
@@ -383,12 +382,14 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 					AffectedFiles:   len(affected),
 					RewrittenFiles:  rewrittenCount,
 					FilesProcessed:  processedFiles,
+					FailedFiles:     failedFiles,
 					ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 				})
 			}
 			failedFiles = append(failedFiles, filepath.Base(f.path))
 			continue
 		}
+		totalDeleted += deleted
 
 		rewrittenCount++
 		processedFiles = append(processedFiles, filepath.Base(f.path))
@@ -690,11 +691,11 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 		return deleted, nil
 	}
 
-	// For S3, we need to write to a temp file locally, then upload
+	// For remote backends (S3, Azure), write to a local temp file then upload.
 	var rewroteDeleted int64
 	var s3Result *s3RewriteResult
 	var rewriteErr error
-	if h.isS3Backend() {
+	if h.isRemoteBackend() {
 		rewroteDeleted, s3Result, rewriteErr = h.rewriteS3File(ctx, queryPath, relativePath, whereClause, rowsBefore, rowsAfter)
 	} else {
 		rewroteDeleted, rewriteErr = h.rewriteLocalFile(ctx, queryPath, relativePath, whereClause, rowsBefore, rowsAfter)
@@ -800,23 +801,26 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 		return 0, nil, fmt.Errorf("failed to write filtered data: %w", err)
 	}
 
-	// Compute size and SHA256 from the local temp file before uploading.
-	// This is the only moment we have the file available locally for free.
-	sizeBytes, sha256hex, err := fileMetadata(tempPath)
-	if err != nil {
-		return 0, nil, fmt.Errorf("failed to compute temp file metadata: %w", err)
-	}
-
-	// Stream temp file to S3 (avoids loading entire file into memory)
+	// Open temp file, compute SHA256 and size while streaming the upload via
+	// io.TeeReader — single pass over the file instead of two.
 	uploadFile, err := os.Open(tempPath)
 	if err != nil {
 		return 0, nil, fmt.Errorf("failed to open temp file for upload: %w", err)
 	}
 	defer uploadFile.Close()
 
-	if err := h.storage.WriteReader(ctx, relativePath, uploadFile, sizeBytes); err != nil {
-		return 0, nil, fmt.Errorf("failed to upload rewritten file to S3: %w", err)
+	info, err := uploadFile.Stat()
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to stat temp file: %w", err)
 	}
+	sizeBytes := info.Size()
+
+	h256 := sha256.New()
+	tee := io.TeeReader(uploadFile, h256)
+	if err := h.storage.WriteReader(ctx, relativePath, tee, sizeBytes); err != nil {
+		return 0, nil, fmt.Errorf("failed to upload rewritten file to remote storage: %w", err)
+	}
+	sha256hex := fmt.Sprintf("%x", h256.Sum(nil))
 
 	h.logger.Info().
 		Str("file", filepath.Base(relativePath)).
@@ -835,15 +839,21 @@ func (h *DeleteHandler) getQueryPath(relativePath string) string {
 		return filepath.Join(backend.GetBasePath(), relativePath)
 	case *storage.S3Backend:
 		return fmt.Sprintf("s3://%s/%s%s", backend.GetBucket(), backend.GetPrefix(), relativePath)
+	case *storage.AzureBlobBackend:
+		return fmt.Sprintf("azure://%s/%s", backend.GetContainer(), relativePath)
 	default:
 		return relativePath
 	}
 }
 
-// isS3Backend returns true if the storage backend is S3
-func (h *DeleteHandler) isS3Backend() bool {
-	_, ok := h.storage.(*storage.S3Backend)
-	return ok
+// isRemoteBackend returns true if the storage backend requires a remote rewrite
+// (download to local temp file, then re-upload). Covers S3 and Azure Blob.
+func (h *DeleteHandler) isRemoteBackend() bool {
+	switch h.storage.(type) {
+	case *storage.S3Backend, *storage.AzureBlobBackend:
+		return true
+	}
+	return false
 }
 
 // updateManifestAfterRewrite updates the cluster manifest entry for a partially
