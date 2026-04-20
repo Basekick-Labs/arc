@@ -419,7 +419,7 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 	var totalFilesDeleted int
 
 	for _, measurement := range measurements {
-		deleted, filesDeleted, err := h.deleteOldFiles(ctx, policy.Database, measurement, cutoffDate, false)
+		deleted, filesDeleted, err := h.deleteOldFiles(ctx, policy.Database, measurement, cutoffDate, false, fmt.Sprintf("retention:%d", policyID))
 		if err != nil {
 			h.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to process measurement")
 			// Abort on any error — manifest failures are non-transient (Raft quorum loss)
@@ -575,7 +575,7 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 	var totalFilesDeleted int
 
 	for _, measurement := range measurements {
-		deleted, filesDeleted, err := h.deleteOldFiles(c.Context(), policy.Database, measurement, cutoffDate, req.DryRun)
+		deleted, filesDeleted, err := h.deleteOldFiles(c.Context(), policy.Database, measurement, cutoffDate, req.DryRun, fmt.Sprintf("retention:%d", policyID))
 		if err != nil {
 			h.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to process measurement")
 			if !req.DryRun && executionID > 0 {
@@ -759,7 +759,7 @@ func (h *RetentionHandler) getMeasurementsToProcess(ctx context.Context, policy 
 
 // deleteOldFiles deletes Parquet files where ALL rows are older than cutoffDate
 // Supports all storage backends: local, S3, and Azure
-func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measurement string, cutoffDate time.Time, dryRun bool) (int64, int, error) {
+func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measurement string, cutoffDate time.Time, dryRun bool, reason string) (int64, int, error) {
 	// List all files for this measurement using storage backend
 	prefix := database + "/" + measurement + "/"
 	files, err := h.storage.List(ctx, prefix)
@@ -842,7 +842,7 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 			subPaths = make([]string, 0, len(chunk))
 			subRows = make([]int64, 0, len(chunk))
 			for j, p := range chunk {
-				payload, err := json.Marshal(raft.DeleteFilePayload{Path: p, Reason: "retention"})
+				payload, err := json.Marshal(raft.DeleteFilePayload{Path: p, Reason: reason})
 				if err != nil {
 					h.logger.Warn().Err(err).Str("file", p).Msg("Failed to marshal manifest delete op; skipping file")
 					continue
@@ -865,7 +865,9 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 
 		for j, relativePath := range subPaths {
 			if err := h.storage.Delete(ctx, relativePath); err != nil {
-				h.logger.Error().Err(err).Str("file", relativePath).Msg("Failed to delete file from storage")
+				// Storage errors are transient (network blip, file already gone) —
+				// log as Warn and continue so one bad file doesn't abort the cycle.
+				h.logger.Warn().Err(err).Str("file", relativePath).Msg("Failed to delete file from storage; skipping")
 				continue
 			}
 			deletedFilePaths = append(deletedFilePaths, relativePath)
