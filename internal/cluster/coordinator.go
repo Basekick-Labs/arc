@@ -2707,6 +2707,41 @@ func (c *Coordinator) ctxOrBackground() context.Context {
 	return c.ctx
 }
 
+// UpdateFileInManifest updates an existing file's metadata in the cluster manifest
+// after a partial rewrite that changes size/checksum but keeps the same path.
+// Same leader-forwarding semantics as RegisterFileInManifest.
+func (c *Coordinator) UpdateFileInManifest(file raft.FileEntry) error {
+	if c.raftNode == nil {
+		return nil
+	}
+	if c.raftNode.IsLeader() {
+		if err := c.raftNode.UpdateFile(file, 5*time.Second); err != nil {
+			return fmt.Errorf("update file in manifest: %w", err)
+		}
+		return nil
+	}
+	payload, err := json.Marshal(raft.UpdateFilePayload{File: file})
+	if err != nil {
+		return fmt.Errorf("update file in manifest: marshal payload: %w", err)
+	}
+	cmd := &raft.Command{Type: raft.CommandUpdateFile, Payload: payload}
+	forwardCtx, cancel := context.WithTimeout(c.ctxOrBackground(), forwardApplyTimeout)
+	defer cancel()
+	if err := c.forwardApplyToLeader(forwardCtx, cmd); err != nil {
+		return fmt.Errorf("update file in manifest (forwarded): %w", err)
+	}
+	return nil
+}
+
+// GetFileEntry returns the manifest entry for a given relative path.
+// Returns false if the file is not in the manifest (standalone mode or pre-cluster file).
+func (c *Coordinator) GetFileEntry(path string) (*raft.FileEntry, bool) {
+	if c.raftFSM == nil {
+		return nil, false
+	}
+	return c.raftFSM.GetFile(path)
+}
+
 // GetFileManifest returns the current file manifest from the Raft FSM.
 // Returns nil if Raft is not initialized.
 func (c *Coordinator) GetFileManifest() []*raft.FileEntry {

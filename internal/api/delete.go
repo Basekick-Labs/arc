@@ -2,9 +2,11 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -23,10 +25,12 @@ import (
 )
 
 // DeleteCoordinator is the minimal cluster interface the delete handler needs
-// to gate execution to the primary writer and propagate full-file deletes to
-// the Raft manifest. nil = standalone mode (no gate, manifest not updated).
+// to gate execution to the primary writer and propagate file manifest changes.
+// nil = standalone mode (no gate, manifest not updated).
 type DeleteCoordinator interface {
 	BatchFileOpsInManifest(ops []raft.BatchFileOp) error
+	UpdateFileInManifest(file raft.FileEntry) error
+	GetFileEntry(path string) (*raft.FileEntry, bool)
 	IsPrimaryWriter() bool
 	Role() string
 }
@@ -43,6 +47,21 @@ const parquetRowGroupSize = 122880
 // DuckDB read_parquet() calls, which do not support parameterized queries.
 func escapeDuckDBPath(path string) string {
 	return strings.ReplaceAll(path, "'", "''")
+}
+
+// fileMetadata returns the byte size and hex-encoded SHA-256 of the file at path.
+func fileMetadata(path string) (sizeBytes int64, sha256hex string, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return 0, "", err
+	}
+	return n, fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
 // lastFreeOSMemoryNano is the last time freeOSMemoryThrottled fired, used to debounce GC calls.
@@ -672,12 +691,27 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 	}
 
 	// For S3, we need to write to a temp file locally, then upload
+	var rewroteDeleted int64
+	var rewriteErr error
 	if h.isS3Backend() {
-		return h.rewriteS3File(ctx, queryPath, relativePath, whereClause, rowsBefore, rowsAfter)
+		rewroteDeleted, rewriteErr = h.rewriteS3File(ctx, queryPath, relativePath, whereClause, rowsBefore, rowsAfter)
+	} else {
+		rewroteDeleted, rewriteErr = h.rewriteLocalFile(ctx, queryPath, relativePath, whereClause, rowsBefore, rowsAfter)
+	}
+	if rewriteErr != nil {
+		return 0, rewriteErr
 	}
 
-	// Local storage: use atomic rename strategy
-	return h.rewriteLocalFile(ctx, queryPath, relativePath, whereClause, rowsBefore, rowsAfter)
+	// Notify the cluster manifest that this file's content changed. Non-fatal:
+	// the rewrite succeeded in storage; a stale manifest entry is eventually
+	// consistent and does not affect query correctness.
+	if h.coordinator != nil {
+		if err := h.updateManifestAfterRewrite(relativePath); err != nil {
+			h.logger.Warn().Err(err).Str("file", relativePath).Msg("Failed to update manifest after partial rewrite")
+		}
+	}
+
+	return rewroteDeleted, nil
 }
 
 // rewriteLocalFile handles file rewrite for local storage using atomic rename
@@ -801,4 +835,41 @@ func (h *DeleteHandler) getQueryPath(relativePath string) string {
 func (h *DeleteHandler) isS3Backend() bool {
 	_, ok := h.storage.(*storage.S3Backend)
 	return ok
+}
+
+// updateManifestAfterRewrite updates the cluster manifest entry for a partially
+// rewritten file. It reads the existing entry to preserve all immutable fields
+// (database, measurement, origin node, tier, etc.) and updates only the mutable
+// metadata: SizeBytes and SHA256.
+//
+// For local storage, the new size and checksum are computed from the rewritten
+// file on disk. For S3, size/checksum are not re-read (would require an extra
+// round-trip) — the manifest entry is still re-committed so peers know the file
+// changed, but SizeBytes and SHA256 will be stale until the next register.
+//
+// Failure is non-fatal: the rewrite already succeeded in storage; a stale
+// manifest entry is eventually consistent and does not affect query correctness.
+func (h *DeleteHandler) updateManifestAfterRewrite(relativePath string) error {
+	existing, ok := h.coordinator.GetFileEntry(relativePath)
+	if !ok {
+		// File not in manifest (standalone-registered or pre-cluster file) — skip.
+		return nil
+	}
+
+	entry := *existing // copy all fields to preserve immutable metadata
+
+	if lb, ok := h.storage.(*storage.LocalBackend); ok {
+		fullPath := filepath.Join(lb.GetBasePath(), relativePath)
+		size, sha, err := fileMetadata(fullPath)
+		if err != nil {
+			return fmt.Errorf("failed to read rewritten file metadata: %w", err)
+		}
+		entry.SizeBytes = size
+		entry.SHA256 = sha
+	}
+	// For S3: SizeBytes/SHA256 remain from the original entry until the next
+	// explicit register. The manifest update still signals to peers that the
+	// file's content changed (LSN advances on apply).
+
+	return h.coordinator.UpdateFileInManifest(entry)
 }
