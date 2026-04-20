@@ -747,10 +747,10 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 
 	var deletedRows int64
 	var deletedFiles int
-	var deletedFilePaths []string
+	var eligiblePaths []string // paths eligible for deletion (used for manifest + storage ops)
+	var eligibleRows []int64   // row counts parallel to eligiblePaths
 
 	for _, relativePath := range parquetFiles {
-		// Build full path for DuckDB to read (s3://, azure://, or local path)
 		fullPath := h.buildParquetPath(relativePath)
 
 		maxTime, rowCount, err := h.getFileMaxTimeAndRowCount(ctx, fullPath)
@@ -759,7 +759,6 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 			continue
 		}
 
-		// If ALL rows in file are older than cutoff, delete the file
 		if maxTime.Before(cutoffDate) {
 			h.logger.Info().
 				Str("file", filepath.Base(relativePath)).
@@ -769,32 +768,35 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 				Msg("File eligible for deletion")
 
 			if !dryRun {
-				if err := h.storage.Delete(ctx, relativePath); err != nil {
-					h.logger.Error().Err(err).Str("file", relativePath).Msg("Failed to delete file")
-					continue
-				}
-				deletedFilePaths = append(deletedFilePaths, relativePath)
+				eligiblePaths = append(eligiblePaths, relativePath)
+				eligibleRows = append(eligibleRows, rowCount)
+			} else {
+				deletedRows += rowCount
+				deletedFiles++
 			}
-
-			deletedRows += rowCount
-			deletedFiles++
 		}
 	}
 
-	// Batch-update the cluster manifest in chunks of 1000. Chunking prevents
-	// a single oversized Raft log entry when retention removes a large number
-	// of files. If a chunk fails, those paths become orphaned in the manifest
-	// (files are already gone from storage). There is no automatic reconciliation
-	// today — Phase 5 will add periodic manifest-vs-storage reconciliation to
-	// clean these up.
+	if dryRun || len(eligiblePaths) == 0 {
+		return deletedRows, deletedFiles, nil
+	}
+
+	// Step 1 — update the cluster manifest before touching storage. Chunked at
+	// 1000 ops to keep individual Raft log entries within a reasonable size.
+	// Ordering matters: if the manifest update fails, the file still exists in
+	// storage and the next retention run will retry it. The reverse order (delete
+	// storage first) would leave permanent orphan entries with no retry path.
+	// On manifest failure we abort the whole cycle — a Raft quorum loss is not
+	// transient, and continuing would produce more orphans for the same underlying
+	// cause. Phase 5 will add periodic manifest-vs-storage reconciliation.
 	const manifestBatchSize = 1000
-	if !dryRun && h.coordinator != nil && len(deletedFilePaths) > 0 {
-		for i := 0; i < len(deletedFilePaths); i += manifestBatchSize {
+	if h.coordinator != nil {
+		for i := 0; i < len(eligiblePaths); i += manifestBatchSize {
 			end := i + manifestBatchSize
-			if end > len(deletedFilePaths) {
-				end = len(deletedFilePaths)
+			if end > len(eligiblePaths) {
+				end = len(eligiblePaths)
 			}
-			chunk := deletedFilePaths[i:end]
+			chunk := eligiblePaths[i:end]
 			ops := make([]raft.BatchFileOp, 0, len(chunk))
 			for _, p := range chunk {
 				payload, err := json.Marshal(raft.DeleteFilePayload{Path: p, Reason: "retention"})
@@ -809,13 +811,28 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 			}
 			if err := h.coordinator.BatchFileOpsInManifest(ops); err != nil {
 				h.logger.Error().Err(err).Int("count", len(ops)).Int("chunk_start", i).
-					Msg("Failed to update cluster manifest after retention delete; affected files are orphaned in manifest until Phase 5 reconciliation")
+					Msg("Failed to update cluster manifest; aborting retention cycle to avoid orphaned manifest entries")
+				return deletedRows, deletedFiles, fmt.Errorf("failed to update cluster manifest: %w", err)
 			}
 		}
 	}
 
+	// Step 2 — delete from storage. If a delete fails the file is now a harmless
+	// ghost: invisible to the cluster (manifest entry is gone) but still on disk.
+	// It will be cleaned up by the next compaction pass or operator action.
+	var deletedFilePaths []string
+	for i, relativePath := range eligiblePaths {
+		if err := h.storage.Delete(ctx, relativePath); err != nil {
+			h.logger.Error().Err(err).Str("file", relativePath).Msg("Failed to delete file from storage")
+			continue
+		}
+		deletedFilePaths = append(deletedFilePaths, relativePath)
+		deletedRows += eligibleRows[i]
+		deletedFiles++
+	}
+
 	// Clean up empty directories after deletion (only for local storage)
-	if !dryRun && len(deletedFilePaths) > 0 {
+	if len(deletedFilePaths) > 0 {
 		h.cleanupEmptyDirectories(ctx, deletedFilePaths)
 	}
 
