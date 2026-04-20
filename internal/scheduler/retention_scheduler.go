@@ -243,13 +243,27 @@ func (s *RetentionScheduler) TriggerNow(ctx context.Context) error {
 		return ErrRetentionRoleGated
 	}
 
-	s.logger.Info().Msg("Manual retention trigger")
-
 	// Check license - require valid license for retention scheduler
 	if s.licenseClient == nil || !s.licenseClient.CanUseRetentionScheduler() {
 		s.logger.Warn().Msg("Valid enterprise license required for retention trigger")
 		return nil
 	}
+
+	s.mu.Lock()
+	if s.runningJob {
+		s.mu.Unlock()
+		s.logger.Warn().Msg("Manual retention trigger rejected: a cycle is already running")
+		return fmt.Errorf("retention cycle already in progress")
+	}
+	s.runningJob = true
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.runningJob = false
+		s.mu.Unlock()
+	}()
+
+	s.logger.Info().Msg("Manual retention trigger")
 
 	startTime := time.Now()
 
