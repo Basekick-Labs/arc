@@ -149,6 +149,14 @@ Directories containing sensitive data (auth database, continuous query definitio
 
 Applied defense-in-depth SQL escaping to DuckDB `SET memory_limit` (single-quote escaping) and compaction `ORDER BY` sort key names (double-quote identifier escaping). Both already had config-level validation, but the runtime escaping provides an additional safety layer.
 
+### Cluster-Safe Retention Policy Execution (Enterprise)
+
+In clustered deployments, retention policies now run exclusively on the primary writer node and propagate file deletions through the Raft manifest to all peers.
+
+- **Writer-only execution**: The retention scheduler checks a cluster gate before starting. Only the primary writer node runs — reader and compactor nodes stay idle and log a clear message. On writer failover, the newly promoted primary picks up on the next cron tick. Standalone deployments are unaffected.
+- **Cluster manifest updates**: After each file is deleted from storage, the retention handler commits the deletion into the Raft log via `DeleteFileFromManifest`. This keeps the manifest consistent and prevents orphaned entries from interfering with peer replication catch-up.
+- **Reader node cleanup (local storage)**: The `onFileDeleted` FSM callback and delete-worker pool (shared with compaction) handle retention-triggered deletes on reader nodes, removing their local copy of the file and preventing unbounded disk growth on per-node storage deployments.
+
 ## Bug Fixes
 
 ### Row-Format MessagePack Flush Hardening

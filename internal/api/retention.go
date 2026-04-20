@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,22 +11,39 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
+	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
 )
 
+// RetentionCoordinator is the minimal cluster interface retention needs to
+// propagate file deletes to the Raft manifest and gate execution to the
+// primary writer. Using a minimal interface avoids a compile-time dependency
+// on the cluster package.
+type RetentionCoordinator interface {
+	BatchFileOpsInManifest(ops []raft.BatchFileOp) error
+	// CanRunRetention reports whether this node may execute retention.
+	// Returns true unconditionally for standalone (coordinator is nil).
+	CanRunRetention() bool
+	// Role returns a human-readable role string for log messages.
+	Role() string
+}
+
 // RetentionHandler handles retention policy operations
 type RetentionHandler struct {
-	storage     storage.Backend
-	config      *config.RetentionConfig
-	db          *sql.DB          // SQLite for policy metadata
-	duckdb      *database.DuckDB // Shared DuckDB for parquet queries
-	authManager *auth.AuthManager
-	logger      zerolog.Logger
+	storage       storage.Backend
+	config        *config.RetentionConfig
+	db            *sql.DB              // SQLite for policy metadata
+	duckdb        *database.DuckDB     // Shared DuckDB for parquet queries
+	coordinator   RetentionCoordinator // nil in standalone mode
+	licenseClient *license.Client      // nil when auth/licensing is disabled
+	authManager   *auth.AuthManager
+	logger        zerolog.Logger
 }
 
 // RetentionPolicy represents a retention policy
@@ -85,7 +103,7 @@ type RetentionExecution struct {
 }
 
 // NewRetentionHandler creates a new retention handler
-func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *config.RetentionConfig, authManager *auth.AuthManager, logger zerolog.Logger) (*RetentionHandler, error) {
+func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *config.RetentionConfig, licenseClient *license.Client, authManager *auth.AuthManager, logger zerolog.Logger) (*RetentionHandler, error) {
 	// Ensure directory exists
 	dir := filepath.Dir(cfg.DBPath)
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -99,12 +117,13 @@ func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *
 	}
 
 	h := &RetentionHandler{
-		storage:     storage,
-		config:      cfg,
-		db:          db,
-		duckdb:      duckdb,
-		authManager: authManager,
-		logger:      logger.With().Str("component", "retention-handler").Logger(),
+		storage:       storage,
+		config:        cfg,
+		db:            db,
+		duckdb:        duckdb,
+		licenseClient: licenseClient,
+		authManager:   authManager,
+		logger:        logger.With().Str("component", "retention-handler").Logger(),
 	}
 
 	// Initialize tables
@@ -114,6 +133,12 @@ func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *
 	}
 
 	return h, nil
+}
+
+// SetCoordinator wires the cluster coordinator for manifest updates.
+// Called after construction when cluster mode is enabled.
+func (h *RetentionHandler) SetCoordinator(c RetentionCoordinator) {
+	h.coordinator = c
 }
 
 // initTables creates the retention policy tables
@@ -355,6 +380,11 @@ func (h *RetentionHandler) handleDelete(c *fiber.Ctx) error {
 func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*ExecuteRetentionResponse, error) {
 	start := time.Now()
 
+	// License check: guards direct programmatic calls that bypass the scheduler.
+	if h.licenseClient != nil && !h.licenseClient.CanUseRetentionScheduler() {
+		return nil, fmt.Errorf("valid enterprise license required for retention policy execution")
+	}
+
 	// Get policy
 	policy, err := h.getPolicy(policyID)
 	if err != nil {
@@ -389,13 +419,20 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 	var totalFilesDeleted int
 
 	for _, measurement := range measurements {
-		deleted, filesDeleted, err := h.deleteOldFiles(ctx, policy.Database, measurement, cutoffDate, false)
-		if err != nil {
-			h.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to process measurement")
-			continue
-		}
+		deleted, filesDeleted, err := h.deleteOldFiles(ctx, policy.Database, measurement, cutoffDate, false, fmt.Sprintf("retention:%d", policyID))
+		// Accumulate before error check: deleteOldFiles returns partial progress
+		// on abort so the execution record reflects all completed work accurately.
 		totalDeleted += deleted
 		totalFilesDeleted += filesDeleted
+		if err != nil {
+			h.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to process measurement")
+			// Abort on any error — manifest failures are non-transient (Raft quorum loss)
+			// and continuing would produce orphaned manifest entries with no retry path.
+			if executionID > 0 {
+				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), err.Error())
+			}
+			return nil, fmt.Errorf("retention aborted for policy %d: %w", policyID, err)
+		}
 	}
 
 	// Clear DuckDB parquet metadata/data cache and release memory back to OS.
@@ -492,6 +529,14 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 		})
 	}
 
+	// In cluster mode, only the primary writer may execute retention — reader
+	// nodes must not race with the writer over shared or local storage.
+	if !req.DryRun && h.coordinator != nil && !h.coordinator.CanRunRetention() {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": fmt.Sprintf("retention rejected: node role %q is not primary writer", h.coordinator.Role()),
+		})
+	}
+
 	// Get policy
 	policy, err := h.getPolicy(int64(policyID))
 	if err != nil {
@@ -532,13 +577,18 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 	var totalFilesDeleted int
 
 	for _, measurement := range measurements {
-		deleted, filesDeleted, err := h.deleteOldFiles(context.Background(), policy.Database, measurement, cutoffDate, req.DryRun)
-		if err != nil {
-			h.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to process measurement")
-			continue
-		}
+		deleted, filesDeleted, err := h.deleteOldFiles(c.Context(), policy.Database, measurement, cutoffDate, req.DryRun, fmt.Sprintf("retention:%d", policyID))
 		totalDeleted += deleted
 		totalFilesDeleted += filesDeleted
+		if err != nil {
+			h.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to process measurement")
+			if !req.DryRun && executionID > 0 {
+				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), err.Error())
+			}
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": fmt.Sprintf("retention aborted at measurement %q: %s", measurement, err.Error()),
+			})
+		}
 	}
 
 	// Clear DuckDB parquet metadata/data cache — dry runs also populate the cache via
@@ -711,7 +761,7 @@ func (h *RetentionHandler) getMeasurementsToProcess(ctx context.Context, policy 
 
 // deleteOldFiles deletes Parquet files where ALL rows are older than cutoffDate
 // Supports all storage backends: local, S3, and Azure
-func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measurement string, cutoffDate time.Time, dryRun bool) (int64, int, error) {
+func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measurement string, cutoffDate time.Time, dryRun bool, reason string) (int64, int, error) {
 	// List all files for this measurement using storage backend
 	prefix := database + "/" + measurement + "/"
 	files, err := h.storage.List(ctx, prefix)
@@ -731,10 +781,10 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 
 	var deletedRows int64
 	var deletedFiles int
-	var deletedFilePaths []string
+	var eligiblePaths []string // paths eligible for deletion (used for manifest + storage ops)
+	var eligibleRows []int64   // row counts parallel to eligiblePaths
 
 	for _, relativePath := range parquetFiles {
-		// Build full path for DuckDB to read (s3://, azure://, or local path)
 		fullPath := h.buildParquetPath(relativePath)
 
 		maxTime, rowCount, err := h.getFileMaxTimeAndRowCount(ctx, fullPath)
@@ -743,7 +793,6 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 			continue
 		}
 
-		// If ALL rows in file are older than cutoff, delete the file
 		if maxTime.Before(cutoffDate) {
 			h.logger.Info().
 				Str("file", filepath.Base(relativePath)).
@@ -753,20 +802,83 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 				Msg("File eligible for deletion")
 
 			if !dryRun {
-				if err := h.storage.Delete(ctx, relativePath); err != nil {
-					h.logger.Error().Err(err).Str("file", relativePath).Msg("Failed to delete file")
+				eligiblePaths = append(eligiblePaths, relativePath)
+				eligibleRows = append(eligibleRows, rowCount)
+			} else {
+				deletedRows += rowCount
+				deletedFiles++
+			}
+		}
+	}
+
+	if dryRun || len(eligiblePaths) == 0 {
+		return deletedRows, deletedFiles, nil
+	}
+
+	// Process in chunks of 1000: update manifest first, then delete from storage.
+	// Interleaving per-chunk limits orphan blast radius — a mid-run manifest
+	// failure only affects the current chunk, not all remaining files.
+	// Manifest-before-storage ordering ensures failures are retryable: if the
+	// manifest update fails, the file still exists in storage and the next
+	// retention run will pick it up. A storage delete failure after a successful
+	// manifest update leaves a harmless ghost on disk (compaction will clean it).
+	// On manifest failure we abort — a Raft quorum loss is not transient.
+	// Phase 5 will add periodic manifest-vs-storage reconciliation.
+	const manifestBatchSize = 1000
+	var deletedFilePaths []string
+	for i := 0; i < len(eligiblePaths); i += manifestBatchSize {
+		end := i + manifestBatchSize
+		if end > len(eligiblePaths) {
+			end = len(eligiblePaths)
+		}
+		chunk := eligiblePaths[i:end]
+
+		// subPaths/subRows track only the files that were successfully marshalled
+		// into ops. The storage delete loop uses this subset so a marshal failure
+		// never causes a file to be deleted from storage without a manifest entry.
+		var ops []raft.BatchFileOp
+		subPaths := chunk          // default: all chunk paths (no coordinator)
+		subRows := eligibleRows[i:end]
+		if h.coordinator != nil {
+			ops = make([]raft.BatchFileOp, 0, len(chunk))
+			subPaths = make([]string, 0, len(chunk))
+			subRows = make([]int64, 0, len(chunk))
+			for j, p := range chunk {
+				payload, err := json.Marshal(raft.DeleteFilePayload{Path: p, Reason: reason})
+				if err != nil {
+					h.logger.Warn().Err(err).Str("file", p).Msg("Failed to marshal manifest delete op; skipping file")
 					continue
 				}
-				deletedFilePaths = append(deletedFilePaths, relativePath)
+				ops = append(ops, raft.BatchFileOp{Type: raft.CommandDeleteFile, Payload: payload})
+				subPaths = append(subPaths, p)
+				subRows = append(subRows, eligibleRows[i+j])
 			}
+			if len(ops) > 0 {
+				if err := h.coordinator.BatchFileOpsInManifest(ops); err != nil {
+					h.logger.Error().Err(err).Int("count", len(ops)).Int("chunk_start", i).
+						Msg("Failed to update cluster manifest; aborting retention cycle")
+					if len(deletedFilePaths) > 0 {
+						h.cleanupEmptyDirectories(ctx, deletedFilePaths)
+					}
+					return deletedRows, deletedFiles, fmt.Errorf("failed to update cluster manifest: %w", err)
+				}
+			}
+		}
 
-			deletedRows += rowCount
+		for j, relativePath := range subPaths {
+			if err := h.storage.Delete(ctx, relativePath); err != nil {
+				// Storage errors are transient (network blip, file already gone) —
+				// log as Warn and continue so one bad file doesn't abort the cycle.
+				h.logger.Warn().Err(err).Str("file", relativePath).Msg("Failed to delete file from storage; skipping")
+				continue
+			}
+			deletedFilePaths = append(deletedFilePaths, relativePath)
+			deletedRows += subRows[j]
 			deletedFiles++
 		}
 	}
 
-	// Clean up empty directories after deletion (only for local storage)
-	if !dryRun && len(deletedFilePaths) > 0 {
+	if len(deletedFilePaths) > 0 {
 		h.cleanupEmptyDirectories(ctx, deletedFilePaths)
 	}
 
@@ -778,8 +890,10 @@ func (h *RetentionHandler) getFileMaxTimeAndRowCount(ctx context.Context, filePa
 	// Use the shared DuckDB connection to avoid memory retention from temporary connections
 	db := h.duckdb.DB()
 
-	// Get max time and count
-	query := fmt.Sprintf("SELECT MAX(time) as max_time, COUNT(*) as cnt FROM read_parquet('%s')", filePath)
+	// read_parquet() does not support parameterized queries, so escape single
+	// quotes in the path to prevent SQL injection via crafted file paths.
+	safePath := strings.ReplaceAll(filePath, "'", "''")
+	query := fmt.Sprintf("SELECT MAX(time) as max_time, COUNT(*) as cnt FROM read_parquet('%s')", safePath)
 	row := db.QueryRowContext(ctx, query)
 
 	var maxTime time.Time

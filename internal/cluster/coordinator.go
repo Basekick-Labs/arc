@@ -1511,6 +1511,22 @@ func (c *Coordinator) GetRole() NodeRole {
 	return c.localNode.Role
 }
 
+// CanRunRetention implements api.RetentionCoordinator: reports whether this
+// node is the primary writer and therefore permitted to execute retention.
+func (c *Coordinator) CanRunRetention() bool {
+	node := c.GetLocalNode()
+	if node == nil {
+		return false
+	}
+	return node.IsPrimaryWriter()
+}
+
+// Role implements api.RetentionCoordinator: returns a human-readable role
+// string for log messages.
+func (c *Coordinator) Role() string {
+	return string(c.GetRole())
+}
+
 // GetCapabilities returns the capabilities of the local node.
 func (c *Coordinator) GetCapabilities() RoleCapabilities {
 	return c.localNode.GetCapabilities()

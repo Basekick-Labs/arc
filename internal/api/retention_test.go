@@ -46,7 +46,7 @@ func setupTestRetentionHandler(t *testing.T) (*RetentionHandler, string) {
 		DBPath:  filepath.Join(tmpDir, "retention.db"),
 	}
 
-	handler, err := NewRetentionHandler(backend, duckdb, retentionCfg, nil, logger)
+	handler, err := NewRetentionHandler(backend, duckdb, retentionCfg, nil, nil, logger)
 	if err != nil {
 		duckdb.Close()
 		os.RemoveAll(tmpDir)
@@ -199,7 +199,7 @@ func TestDeleteOldFiles_NoFiles(t *testing.T) {
 	handler, _ := setupTestRetentionHandler(t)
 
 	cutoff := time.Now().Add(-24 * time.Hour)
-	deletedRows, deletedFiles, err := handler.deleteOldFiles(context.Background(), "testdb", "nonexistent", cutoff, false)
+	deletedRows, deletedFiles, err := handler.deleteOldFiles(context.Background(), "testdb", "nonexistent", cutoff, false, "retention:test")
 
 	if err != nil {
 		t.Fatalf("deleteOldFiles() error = %v", err)
@@ -242,7 +242,7 @@ func TestDeleteOldFiles_DryRun(t *testing.T) {
 
 	// Run dry-run deletion with a cutoff date after the data
 	cutoff := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
-	deletedRows, deletedFiles, err := handler.deleteOldFiles(context.Background(), "testdb", "logs", cutoff, true)
+	deletedRows, deletedFiles, err := handler.deleteOldFiles(context.Background(), "testdb", "logs", cutoff, true, "retention:test")
 
 	if err != nil {
 		t.Fatalf("deleteOldFiles() error = %v", err)
@@ -295,7 +295,7 @@ func TestDeleteOldFiles_ActualDelete(t *testing.T) {
 
 	// Run actual deletion with a cutoff date after the data
 	cutoff := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
-	deletedRows, deletedFiles, err := handler.deleteOldFiles(context.Background(), "testdb", "logs", cutoff, false)
+	deletedRows, deletedFiles, err := handler.deleteOldFiles(context.Background(), "testdb", "logs", cutoff, false, "retention:test")
 
 	if err != nil {
 		t.Fatalf("deleteOldFiles() error = %v", err)
@@ -343,7 +343,7 @@ func TestDeleteOldFiles_KeepsRecentFiles(t *testing.T) {
 
 	// Run deletion with a cutoff date before the data
 	cutoff := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-	deletedRows, deletedFiles, err := handler.deleteOldFiles(context.Background(), "testdb", "logs", cutoff, false)
+	deletedRows, deletedFiles, err := handler.deleteOldFiles(context.Background(), "testdb", "logs", cutoff, false, "retention:test")
 
 	if err != nil {
 		t.Fatalf("deleteOldFiles() error = %v", err)
@@ -397,7 +397,7 @@ func TestDeleteOldFiles_CleansUpEmptyDirectories(t *testing.T) {
 
 	// Run actual deletion with a cutoff date after the data
 	cutoff := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
-	_, _, err := handler.deleteOldFiles(context.Background(), "testdb", "logs", cutoff, false)
+	_, _, err := handler.deleteOldFiles(context.Background(), "testdb", "logs", cutoff, false, "retention:test")
 
 	if err != nil {
 		t.Fatalf("deleteOldFiles() error = %v", err)

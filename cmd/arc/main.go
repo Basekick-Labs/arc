@@ -1320,11 +1320,14 @@ func main() {
 	var retentionHandler *api.RetentionHandler
 	if cfg.Retention.Enabled {
 		var err error
-		retentionHandler, err = api.NewRetentionHandler(storageBackend, db, &cfg.Retention, authManager, logger.Get("retention"))
+		retentionHandler, err = api.NewRetentionHandler(storageBackend, db, &cfg.Retention, licenseClient, authManager, logger.Get("retention"))
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize retention handler")
 		}
 		retentionHandler.RegisterRoutes(server.GetApp())
+		if clusterCoordinator != nil {
+			retentionHandler.SetCoordinator(clusterCoordinator)
+		}
 		shutdownCoordinator.RegisterHook("retention", func(ctx context.Context) error {
 			return retentionHandler.Close()
 		}, shutdown.PriorityDatabase)
@@ -1388,9 +1391,14 @@ func main() {
 	if cfg.Retention.Enabled && retentionHandler != nil {
 		if licenseClient != nil && licenseClient.CanUseRetentionScheduler() {
 			var err error
+			var retentionGate scheduler.RetentionClusterGate
+			if clusterCoordinator != nil {
+				retentionGate = newRetentionClusterGate(clusterCoordinator)
+			}
 			retentionScheduler, err = scheduler.NewRetentionScheduler(&scheduler.RetentionSchedulerConfig{
 				RetentionHandler: retentionHandler,
 				LicenseClient:    licenseClient,
+				ClusterGate:      retentionGate,
 				Schedule:         cfg.Scheduler.RetentionSchedule,
 				Logger:           logger.Get("retention-scheduler"),
 			})
@@ -1740,6 +1748,30 @@ func runCompactSubcommand(args []string) {
 		fmt.Fprintf(os.Stderr, "error: failed to encode result: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// retentionClusterGate implements scheduler.RetentionClusterGate.
+// Only the primary writer node runs retention to prevent races on shared
+// or per-node storage. This type sits in main.go to avoid a compile-time
+// dependency between the scheduler and cluster packages.
+type retentionClusterGate struct {
+	coordinator *cluster.Coordinator
+}
+
+func newRetentionClusterGate(c *cluster.Coordinator) *retentionClusterGate {
+	return &retentionClusterGate{coordinator: c}
+}
+
+func (g *retentionClusterGate) CanRunRetention() bool {
+	node := g.coordinator.GetLocalNode()
+	if node == nil {
+		return false
+	}
+	return node.IsPrimaryWriter()
+}
+
+func (g *retentionClusterGate) Role() string {
+	return string(g.coordinator.GetRole())
 }
 
 // compactionClusterGate implements compaction.ClusterGate. When the
