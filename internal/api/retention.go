@@ -18,12 +18,20 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// RetentionCoordinator is the minimal cluster interface retention needs to
+// propagate file deletes to the Raft manifest. Using a minimal interface
+// avoids a compile-time dependency on the cluster package.
+type RetentionCoordinator interface {
+	DeleteFileFromManifest(path, reason string) error
+}
+
 // RetentionHandler handles retention policy operations
 type RetentionHandler struct {
 	storage     storage.Backend
 	config      *config.RetentionConfig
-	db          *sql.DB          // SQLite for policy metadata
-	duckdb      *database.DuckDB // Shared DuckDB for parquet queries
+	db          *sql.DB               // SQLite for policy metadata
+	duckdb      *database.DuckDB      // Shared DuckDB for parquet queries
+	coordinator RetentionCoordinator  // nil in standalone mode
 	authManager *auth.AuthManager
 	logger      zerolog.Logger
 }
@@ -114,6 +122,12 @@ func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *
 	}
 
 	return h, nil
+}
+
+// SetCoordinator wires the cluster coordinator for manifest updates.
+// Called after construction when cluster mode is enabled.
+func (h *RetentionHandler) SetCoordinator(c RetentionCoordinator) {
+	h.coordinator = c
 }
 
 // initTables creates the retention policy tables
@@ -758,6 +772,13 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 					continue
 				}
 				deletedFilePaths = append(deletedFilePaths, relativePath)
+				if h.coordinator != nil {
+					if err := h.coordinator.DeleteFileFromManifest(relativePath, "retention"); err != nil {
+						// Non-fatal: file is already gone from storage; manifest will
+						// self-heal on next compaction or node restart.
+						h.logger.Warn().Err(err).Str("file", relativePath).Msg("Failed to update cluster manifest after retention delete")
+					}
+				}
 			}
 
 			deletedRows += rowCount

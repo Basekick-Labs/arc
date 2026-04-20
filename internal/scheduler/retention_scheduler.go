@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -11,13 +12,30 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// RetentionClusterGate is the minimal interface the retention scheduler needs
+// to decide whether this node may run retention. A nil gate means no check
+// (standalone/OSS mode — retention always runs).
+type RetentionClusterGate interface {
+	// CanRunRetention reports whether the local node may execute retention.
+	// When false, the scheduler stays idle — not running, not an error.
+	CanRunRetention() bool
+	// Role returns a human-readable role string for log messages only.
+	Role() string
+}
+
+// ErrRetentionRoleGated is returned by TriggerNow when the node's role does
+// not permit running retention (e.g. it is a reader, not the primary writer).
+var ErrRetentionRoleGated = fmt.Errorf("retention: node role is not primary writer")
+
 // RetentionScheduler manages automatic execution of retention policies on a schedule
 type RetentionScheduler struct {
 	retentionHandler *api.RetentionHandler
 	licenseClient    *license.Client
+	clusterGate      RetentionClusterGate
 	schedule         string // Cron schedule (e.g., "0 3 * * *" = 3am daily)
 	cron             *cron.Cron
 	running          bool
+	roleGated        bool // true when Start found CanRunRetention=false
 	mu               sync.Mutex
 	logger           zerolog.Logger
 }
@@ -26,7 +44,8 @@ type RetentionScheduler struct {
 type RetentionSchedulerConfig struct {
 	RetentionHandler *api.RetentionHandler
 	LicenseClient    *license.Client
-	Schedule         string // Cron schedule string (e.g., "0 3 * * *")
+	ClusterGate      RetentionClusterGate // nil = standalone, no gate
+	Schedule         string               // Cron schedule string (e.g., "0 3 * * *")
 	Logger           zerolog.Logger
 }
 
@@ -47,6 +66,7 @@ func NewRetentionScheduler(cfg *RetentionSchedulerConfig) (*RetentionScheduler, 
 	s := &RetentionScheduler{
 		retentionHandler: cfg.RetentionHandler,
 		licenseClient:    cfg.LicenseClient,
+		clusterGate:      cfg.ClusterGate,
 		schedule:         schedule,
 		logger:           cfg.Logger.With().Str("component", "retention-scheduler").Logger(),
 	}
@@ -73,6 +93,17 @@ func (s *RetentionScheduler) Start() error {
 		s.logger.Warn().Msg("Valid enterprise license required for retention scheduler - not starting")
 		return nil
 	}
+
+	// Cluster gate: only the primary writer runs retention. Reader nodes
+	// stay idle so they don't race with the writer on shared or local storage.
+	if s.clusterGate != nil && !s.clusterGate.CanRunRetention() {
+		s.roleGated = true
+		s.logger.Info().
+			Str("role", s.clusterGate.Role()).
+			Msg("Retention scheduler gated: node is not primary writer. Scheduler idle.")
+		return nil
+	}
+	s.roleGated = false
 
 	// Create cron instance
 	s.cron = cron.New(cron.WithParser(cron.NewParser(
@@ -189,6 +220,18 @@ func (s *RetentionScheduler) runRetention() {
 
 // TriggerNow triggers retention execution immediately
 func (s *RetentionScheduler) TriggerNow(ctx context.Context) error {
+	// The same gate applies to manual triggers — a reader node must not
+	// run retention on demand either.
+	s.mu.Lock()
+	gate := s.clusterGate
+	s.mu.Unlock()
+	if gate != nil && !gate.CanRunRetention() {
+		s.logger.Warn().
+			Str("role", gate.Role()).
+			Msg("Manual retention trigger rejected: node is not primary writer")
+		return ErrRetentionRoleGated
+	}
+
 	s.logger.Info().Msg("Manual retention trigger")
 
 	// Check license - require valid license for retention scheduler
@@ -266,6 +309,11 @@ func (s *RetentionScheduler) Status() map[string]interface{} {
 
 	if s.running {
 		status["next_run"] = s.getNextRun().Format(time.RFC3339)
+	}
+
+	if s.clusterGate != nil {
+		status["role_gated"] = s.roleGated
+		status["gate_role"] = s.clusterGate.Role()
 	}
 
 	return status
