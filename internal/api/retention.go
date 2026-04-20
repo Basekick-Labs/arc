@@ -799,15 +799,25 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 		}
 		chunk := eligiblePaths[i:end]
 
+		// subPaths/subRows track only the files that were successfully marshalled
+		// into ops. The storage delete loop uses this subset so a marshal failure
+		// never causes a file to be deleted from storage without a manifest entry.
+		var ops []raft.BatchFileOp
+		subPaths := chunk          // default: all chunk paths (no coordinator)
+		subRows := eligibleRows[i:end]
 		if h.coordinator != nil {
-			ops := make([]raft.BatchFileOp, 0, len(chunk))
-			for _, p := range chunk {
+			ops = make([]raft.BatchFileOp, 0, len(chunk))
+			subPaths = subPaths[:0:0] // reset; will be rebuilt in parallel with ops
+			subRows = subRows[:0:0]
+			for j, p := range chunk {
 				payload, err := json.Marshal(raft.DeleteFilePayload{Path: p, Reason: "retention"})
 				if err != nil {
-					h.logger.Warn().Err(err).Str("file", p).Msg("Failed to marshal manifest delete op")
+					h.logger.Warn().Err(err).Str("file", p).Msg("Failed to marshal manifest delete op; skipping file")
 					continue
 				}
 				ops = append(ops, raft.BatchFileOp{Type: raft.CommandDeleteFile, Payload: payload})
+				subPaths = append(subPaths, p)
+				subRows = append(subRows, eligibleRows[i+j])
 			}
 			if len(ops) > 0 {
 				if err := h.coordinator.BatchFileOpsInManifest(ops); err != nil {
@@ -821,13 +831,13 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 			}
 		}
 
-		for j, relativePath := range chunk {
+		for j, relativePath := range subPaths {
 			if err := h.storage.Delete(ctx, relativePath); err != nil {
 				h.logger.Error().Err(err).Str("file", relativePath).Msg("Failed to delete file from storage")
 				continue
 			}
 			deletedFilePaths = append(deletedFilePaths, relativePath)
-			deletedRows += eligibleRows[i+j]
+			deletedRows += subRows[j]
 			deletedFiles++
 		}
 	}
