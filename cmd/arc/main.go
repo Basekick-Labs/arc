@@ -1303,6 +1303,9 @@ func main() {
 	// Register Delete handler
 	deleteHandler := api.NewDeleteHandler(db, storageBackend, &cfg.Delete, authManager, logger.Get("delete"))
 	deleteHandler.RegisterRoutes(server.GetApp())
+	if clusterCoordinator != nil {
+		deleteHandler.SetCoordinator(clusterCoordinator)
+	}
 	if cfg.Delete.Enabled {
 		log.Info().
 			Int("confirmation_threshold", cfg.Delete.ConfirmationThreshold).
