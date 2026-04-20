@@ -37,6 +37,9 @@ const (
 	// CommandBatchFileOps groups multiple RegisterFile and DeleteFile operations
 	// into a single Raft log entry — one apply per compaction manifest instead of O(N).
 	CommandBatchFileOps
+	// CommandUpdateFile replaces an existing file's metadata in the cluster manifest.
+	// Used after partial rewrites that change size/checksum but keep the same path.
+	CommandUpdateFile
 )
 
 // Command represents a command to be applied to the FSM.
@@ -118,6 +121,11 @@ type DeleteFilePayload struct {
 	Reason string `json:"reason,omitempty"` // "retention", "compaction", "manual"
 }
 
+// UpdateFilePayload is the payload for CommandUpdateFile.
+type UpdateFilePayload struct {
+	File FileEntry `json:"file"`
+}
+
 // AssignCompactorPayload is the payload for CommandAssignCompactor.
 type AssignCompactorPayload struct {
 	NodeID         string `json:"node_id"`
@@ -125,10 +133,10 @@ type AssignCompactorPayload struct {
 }
 
 // BatchFileOp is a single operation within a CommandBatchFileOps command.
-// Type must be CommandRegisterFile or CommandDeleteFile; any other value
-// causes the FSM to return an error when the batch is applied.
+// Type must be CommandRegisterFile, CommandDeleteFile, or CommandUpdateFile;
+// any other value causes the FSM to return an error when the batch is applied.
 type BatchFileOp struct {
-	Type    CommandType `json:"type"`    // CommandRegisterFile or CommandDeleteFile
+	Type    CommandType `json:"type"`    // CommandRegisterFile, CommandDeleteFile, or CommandUpdateFile
 	Payload []byte      `json:"payload"` // Same payload shape as the corresponding single command
 }
 
@@ -254,6 +262,8 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.applyAssignCompactor(cmd.Payload)
 	case CommandBatchFileOps:
 		return f.applyBatchFileOps(cmd.Payload, log.Index)
+	case CommandUpdateFile:
+		return f.applyUpdateFile(cmd.Payload)
 	default:
 		return fmt.Errorf("unknown command type: %d", cmd.Type)
 	}
@@ -546,6 +556,55 @@ func (f *ClusterFSM) applyDeleteFile(payload []byte) interface{} {
 	return nil
 }
 
+func (f *ClusterFSM) applyUpdateFile(payload []byte) interface{} {
+	var p UpdateFilePayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal update file payload: %w", err)
+	}
+	if p.File.Path == "" {
+		return fmt.Errorf("update file: path is required")
+	}
+
+	f.mu.Lock()
+	entry := p.File
+	// If the database changed (defensive), remove the old secondary index entry first.
+	if old, existed := f.files[entry.Path]; existed && old.Database != entry.Database {
+		if oldIdx, ok := f.filesByDB[old.Database]; ok {
+			delete(oldIdx, old.Path)
+			if len(oldIdx) == 0 {
+				delete(f.filesByDB, old.Database)
+			}
+		}
+	}
+	f.files[entry.Path] = &entry
+	if entry.Database != "" {
+		idx, ok := f.filesByDB[entry.Database]
+		if !ok {
+			idx = make(map[string]struct{})
+			f.filesByDB[entry.Database] = idx
+		}
+		idx[entry.Path] = struct{}{}
+	}
+	callback := f.onFileRegistered
+	f.mu.Unlock()
+
+	f.logger.Debug().
+		Str("path", entry.Path).
+		Int64("size_bytes", entry.SizeBytes).
+		Str("sha256", entry.SHA256).
+		Msg("File updated in cluster manifest")
+
+	// Trigger onFileRegistered so reader nodes detect the content change and
+	// pull the updated file from the writer. The file path is the same but the
+	// content (and checksum) changed, so readers must re-fetch it.
+	if callback != nil {
+		entryCopy := entry
+		callback(&entryCopy)
+	}
+
+	return nil
+}
+
 func (f *ClusterFSM) applyAssignCompactor(payload []byte) interface{} {
 	var p AssignCompactorPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
@@ -587,6 +646,8 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 			result = f.applyRegisterFile(op.Payload, logIndex)
 		case CommandDeleteFile:
 			result = f.applyDeleteFile(op.Payload)
+		case CommandUpdateFile:
+			result = f.applyUpdateFile(op.Payload)
 		default:
 			return fmt.Errorf("batch file ops: op[%d] unsupported type: %d", i, op.Type)
 		}

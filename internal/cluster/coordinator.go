@@ -1511,9 +1511,9 @@ func (c *Coordinator) GetRole() NodeRole {
 	return c.localNode.Role
 }
 
-// CanRunRetention implements api.RetentionCoordinator: reports whether this
-// node is the primary writer and therefore permitted to execute retention.
-func (c *Coordinator) CanRunRetention() bool {
+// IsPrimaryWriter implements api.RetentionCoordinator and api.DeleteCoordinator:
+// reports whether this node is the primary writer and may execute writer-only mutations.
+func (c *Coordinator) IsPrimaryWriter() bool {
 	node := c.GetLocalNode()
 	if node == nil {
 		return false
@@ -2705,6 +2705,41 @@ func (c *Coordinator) ctxOrBackground() context.Context {
 		return context.Background()
 	}
 	return c.ctx
+}
+
+// UpdateFileInManifest updates an existing file's metadata in the cluster manifest
+// after a partial rewrite that changes size/checksum but keeps the same path.
+// Same leader-forwarding semantics as RegisterFileInManifest.
+func (c *Coordinator) UpdateFileInManifest(file raft.FileEntry) error {
+	if c.raftNode == nil {
+		return nil
+	}
+	if c.raftNode.IsLeader() {
+		if err := c.raftNode.UpdateFile(file, 5*time.Second); err != nil {
+			return fmt.Errorf("update file in manifest: %w", err)
+		}
+		return nil
+	}
+	payload, err := json.Marshal(raft.UpdateFilePayload{File: file})
+	if err != nil {
+		return fmt.Errorf("update file in manifest: marshal payload: %w", err)
+	}
+	cmd := &raft.Command{Type: raft.CommandUpdateFile, Payload: payload}
+	forwardCtx, cancel := context.WithTimeout(c.ctxOrBackground(), forwardApplyTimeout)
+	defer cancel()
+	if err := c.forwardApplyToLeader(forwardCtx, cmd); err != nil {
+		return fmt.Errorf("update file in manifest (forwarded): %w", err)
+	}
+	return nil
+}
+
+// GetFileEntry returns the manifest entry for a given relative path.
+// Returns false if the file is not in the manifest (standalone mode or pre-cluster file).
+func (c *Coordinator) GetFileEntry(path string) (*raft.FileEntry, bool) {
+	if c.raftFSM == nil {
+		return nil, false
+	}
+	return c.raftFSM.GetFile(path)
 }
 
 // GetFileManifest returns the current file manifest from the Raft FSM.

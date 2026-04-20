@@ -1303,6 +1303,9 @@ func main() {
 	// Register Delete handler
 	deleteHandler := api.NewDeleteHandler(db, storageBackend, &cfg.Delete, authManager, logger.Get("delete"))
 	deleteHandler.RegisterRoutes(server.GetApp())
+	if clusterCoordinator != nil {
+		deleteHandler.SetCoordinator(clusterCoordinator)
+	}
 	if cfg.Delete.Enabled {
 		log.Info().
 			Int("confirmation_threshold", cfg.Delete.ConfirmationThreshold).
@@ -1762,7 +1765,7 @@ func newRetentionClusterGate(c *cluster.Coordinator) *retentionClusterGate {
 	return &retentionClusterGate{coordinator: c}
 }
 
-func (g *retentionClusterGate) CanRunRetention() bool {
+func (g *retentionClusterGate) IsPrimaryWriter() bool {
 	node := g.coordinator.GetLocalNode()
 	if node == nil {
 		return false

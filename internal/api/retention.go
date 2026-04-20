@@ -27,9 +27,9 @@ import (
 // on the cluster package.
 type RetentionCoordinator interface {
 	BatchFileOpsInManifest(ops []raft.BatchFileOp) error
-	// CanRunRetention reports whether this node may execute retention.
+	// IsPrimaryWriter reports whether this node may execute writer-only mutations.
 	// Returns true unconditionally for standalone (coordinator is nil).
-	CanRunRetention() bool
+	IsPrimaryWriter() bool
 	// Role returns a human-readable role string for log messages.
 	Role() string
 }
@@ -531,7 +531,7 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 
 	// In cluster mode, only the primary writer may execute retention — reader
 	// nodes must not race with the writer over shared or local storage.
-	if !req.DryRun && h.coordinator != nil && !h.coordinator.CanRunRetention() {
+	if !req.DryRun && h.coordinator != nil && !h.coordinator.IsPrimaryWriter() {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 			"error": fmt.Sprintf("retention rejected: node role %q is not primary writer", h.coordinator.Role()),
 		})

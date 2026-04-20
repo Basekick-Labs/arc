@@ -596,6 +596,16 @@ func (n *Node) BatchFileOps(ops []BatchFileOp, timeout time.Duration) error {
 	return n.Apply(&Command{Type: CommandBatchFileOps, Payload: payload}, timeout)
 }
 
+// UpdateFile updates an existing file's metadata in the cluster manifest.
+// Called after partial rewrites that change size/checksum but keep the same path.
+func (n *Node) UpdateFile(file FileEntry, timeout time.Duration) error {
+	payload, err := json.Marshal(UpdateFilePayload{File: file})
+	if err != nil {
+		return fmt.Errorf("failed to marshal update file payload: %w", err)
+	}
+	return n.Apply(&Command{Type: CommandUpdateFile, Payload: payload}, timeout)
+}
+
 // LeaderCh returns a channel that signals leadership changes.
 // True means this node became leader, false means it lost leadership.
 func (n *Node) LeaderCh() <-chan bool {

@@ -2,7 +2,11 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -12,6 +16,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -19,9 +24,45 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// DeleteCoordinator is the minimal cluster interface the delete handler needs
+// to gate execution to the primary writer and propagate file manifest changes.
+// nil = standalone mode (no gate, manifest not updated).
+type DeleteCoordinator interface {
+	BatchFileOpsInManifest(ops []raft.BatchFileOp) error
+	UpdateFileInManifest(file raft.FileEntry) error
+	GetFileEntry(path string) (*raft.FileEntry, bool)
+	IsPrimaryWriter() bool
+	Role() string
+}
+
+// errManifestFailure is returned when a Raft manifest update fails.
+// This is non-transient (e.g. Raft quorum loss) and aborts the delete operation.
+var errManifestFailure = errors.New("cluster manifest update failed")
+
 // parquetRowGroupSize is the row group size used for Parquet rewrites during delete operations.
 // Matches compaction's row group size to limit DuckDB's internal write buffer per group.
 const parquetRowGroupSize = 122880
+
+// escapeDuckDBPath escapes single quotes in a path for safe interpolation into
+// DuckDB read_parquet() calls, which do not support parameterized queries.
+func escapeDuckDBPath(path string) string {
+	return strings.ReplaceAll(path, "'", "''")
+}
+
+// fileMetadata returns the byte size and hex-encoded SHA-256 of the file at path.
+func fileMetadata(path string) (sizeBytes int64, sha256hex string, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return 0, "", err
+	}
+	return n, fmt.Sprintf("%x", h.Sum(nil)), nil
+}
 
 // lastFreeOSMemoryNano is the last time freeOSMemoryThrottled fired, used to debounce GC calls.
 var lastFreeOSMemoryNano atomic.Int64
@@ -45,6 +86,7 @@ type DeleteHandler struct {
 	storage     storage.Backend
 	config      *config.DeleteConfig
 	authManager *auth.AuthManager
+	coordinator DeleteCoordinator // nil in standalone mode
 	logger      zerolog.Logger
 }
 
@@ -114,6 +156,12 @@ func NewDeleteHandler(db *database.DuckDB, storage storage.Backend, cfg *config.
 	}
 }
 
+// SetCoordinator wires the cluster coordinator for manifest updates and role
+// gating. Called after construction when cluster mode is enabled.
+func (h *DeleteHandler) SetCoordinator(c DeleteCoordinator) {
+	h.coordinator = c
+}
+
 // RegisterRoutes registers delete endpoints
 func (h *DeleteHandler) RegisterRoutes(app *fiber.App) {
 	group := app.Group("/api/v1/delete")
@@ -174,6 +222,30 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
+	// Reject path traversal in database/measurement names — these values are
+	// concatenated directly into storage prefixes and DuckDB paths.
+	if strings.ContainsAny(req.Database, "/\\") || strings.Contains(req.Database, "..") {
+		return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{
+			Success: false,
+			Error:   "database name contains invalid characters",
+		})
+	}
+	if strings.ContainsAny(req.Measurement, "/\\") || strings.Contains(req.Measurement, "..") {
+		return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{
+			Success: false,
+			Error:   "measurement name contains invalid characters",
+		})
+	}
+
+	// In cluster mode, only the primary writer may execute deletes. Check before
+	// findAffectedFiles to avoid running expensive DuckDB scans on reader nodes.
+	if !req.DryRun && h.coordinator != nil && !h.coordinator.IsPrimaryWriter() {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(DeleteResponse{
+			Success: false,
+			Error:   fmt.Sprintf("delete rejected: node role %q is not primary writer", h.coordinator.Role()),
+		})
+	}
+
 	// Validate WHERE clause
 	isFullTableDelete, err := h.validateWhereClause(req.Where)
 	if err != nil {
@@ -207,7 +279,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		Msg("Processing delete request")
 
 	// Find affected files
-	ctx := context.Background()
+	ctx := c.Context()
 	affected, err := h.findAffectedFiles(ctx, req.Database, req.Measurement, req.Where)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to find affected files")
@@ -297,11 +369,28 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		deleted, err := h.rewriteFileWithoutDeletedRows(ctx, f.path, f.relativePath, req.Where)
 		if err != nil {
 			h.logger.Error().Err(err).Str("file", f.path).Msg("Failed to rewrite file")
+			// Manifest failures are non-transient (Raft quorum loss) — abort the
+			// entire operation to avoid deleting files from storage without a
+			// corresponding manifest record.
+			if errors.Is(err, errManifestFailure) {
+				h.db.ClearHTTPCache()
+				freeOSMemoryThrottled()
+				return c.Status(fiber.StatusInternalServerError).JSON(DeleteResponse{
+					Success:         false,
+					Error:           "Delete aborted: " + err.Error(),
+					DeletedCount:    totalDeleted,
+					AffectedFiles:   len(affected),
+					RewrittenFiles:  rewrittenCount,
+					FilesProcessed:  processedFiles,
+					FailedFiles:     failedFiles,
+					ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+				})
+			}
 			failedFiles = append(failedFiles, filepath.Base(f.path))
 			continue
 		}
-
 		totalDeleted += deleted
+
 		rewrittenCount++
 		processedFiles = append(processedFiles, filepath.Base(f.path))
 
@@ -453,7 +542,7 @@ func (h *DeleteHandler) countMatchingRowsInFiles(ctx context.Context, files []fi
 
 	db := h.db.DB()
 
-	// Build array of file paths for DuckDB
+	// Build array of file paths for DuckDB, escaping single quotes in paths.
 	var pathList strings.Builder
 	pathList.WriteString("[")
 	for i, f := range files {
@@ -461,7 +550,7 @@ func (h *DeleteHandler) countMatchingRowsInFiles(ctx context.Context, files []fi
 			pathList.WriteString(", ")
 		}
 		pathList.WriteString("'")
-		pathList.WriteString(f.queryPath)
+		pathList.WriteString(escapeDuckDBPath(f.queryPath))
 		pathList.WriteString("'")
 	}
 	pathList.WriteString("]")
@@ -532,7 +621,7 @@ func (h *DeleteHandler) countMatchingRowsIndividually(ctx context.Context, files
 	db := h.db.DB()
 
 	for _, f := range files {
-		query := fmt.Sprintf("SELECT COUNT(*) FROM read_parquet('%s') WHERE %s", f.queryPath, whereClause)
+		query := fmt.Sprintf("SELECT COUNT(*) FROM read_parquet('%s') WHERE %s", escapeDuckDBPath(f.queryPath), whereClause)
 		var count int64
 		if err := db.QueryRowContext(ctx, query).Scan(&count); err != nil {
 			h.logger.Warn().Err(err).Str("file", f.relativePath).Msg("Failed to count matching rows, skipping file")
@@ -567,7 +656,7 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 			COUNT(*) as total,
 			COUNT(*) FILTER (WHERE NOT (%s)) as remaining
 		FROM read_parquet('%s')`,
-		whereClause, queryPath)
+		whereClause, escapeDuckDBPath(queryPath))
 
 	if err := db.QueryRowContext(ctx, countQuery).Scan(&rowsBefore, &rowsAfter); err != nil {
 		return 0, fmt.Errorf("failed to count rows: %w", err)
@@ -575,22 +664,56 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 
 	deleted := rowsBefore - rowsAfter
 
-	// If all rows would be deleted, just delete the file
+	// If all rows would be deleted, remove the file entirely.
 	if rowsAfter == 0 {
 		h.logger.Info().Str("file", filepath.Base(relativePath)).Int64("deleted", deleted).Msg("All rows deleted, removing file")
+
+		// Manifest-before-storage: record the delete in the Raft manifest before
+		// removing from storage. If the manifest update fails (Raft quorum loss),
+		// abort — the file still exists in storage and the next delete will retry.
+		if h.coordinator != nil {
+			payload, err := json.Marshal(raft.DeleteFilePayload{Path: relativePath, Reason: "delete"})
+			if err != nil {
+				return 0, fmt.Errorf("%w: marshal failed for %s: %v", errManifestFailure, relativePath, err)
+			}
+			if err := h.coordinator.BatchFileOpsInManifest([]raft.BatchFileOp{{Type: raft.CommandDeleteFile, Payload: payload}}); err != nil {
+				return 0, fmt.Errorf("%w: %v", errManifestFailure, err)
+			}
+		}
+
 		if err := h.storage.Delete(ctx, relativePath); err != nil {
-			return 0, fmt.Errorf("failed to delete file: %w", err)
+			// Manifest is already committed — storage failure is transient (network
+			// blip, file already gone). Log as Warn and return the deleted count;
+			// Phase 5 reconciliation will clean up the orphaned storage entry.
+			h.logger.Warn().Err(err).Str("file", relativePath).Msg("Failed to delete file from storage after manifest update")
+			return deleted, nil
 		}
 		return deleted, nil
 	}
 
-	// For S3, we need to write to a temp file locally, then upload
-	if h.isS3Backend() {
-		return h.rewriteS3File(ctx, queryPath, relativePath, whereClause, rowsBefore, rowsAfter)
+	// For remote backends (S3, Azure), write to a local temp file then upload.
+	var rewroteDeleted int64
+	var s3Result *s3RewriteResult
+	var rewriteErr error
+	if h.isRemoteBackend() {
+		rewroteDeleted, s3Result, rewriteErr = h.rewriteS3File(ctx, queryPath, relativePath, whereClause, rowsBefore, rowsAfter)
+	} else {
+		rewroteDeleted, rewriteErr = h.rewriteLocalFile(ctx, queryPath, relativePath, whereClause, rowsBefore, rowsAfter)
+	}
+	if rewriteErr != nil {
+		return 0, rewriteErr
 	}
 
-	// Local storage: use atomic rename strategy
-	return h.rewriteLocalFile(ctx, queryPath, relativePath, whereClause, rowsBefore, rowsAfter)
+	// Notify the cluster manifest that this file's content changed. Non-fatal:
+	// the rewrite succeeded in storage; a stale manifest entry is eventually
+	// consistent and does not affect query correctness.
+	if h.coordinator != nil {
+		if err := h.updateManifestAfterRewrite(relativePath, s3Result); err != nil {
+			h.logger.Warn().Err(err).Str("file", relativePath).Msg("Failed to update manifest after partial rewrite")
+		}
+	}
+
+	return rewroteDeleted, nil
 }
 
 // rewriteLocalFile handles file rewrite for local storage using atomic rename
@@ -616,7 +739,7 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, _, where
 			COMPRESSION ZSTD,
 			COMPRESSION_LEVEL 3,
 			ROW_GROUP_SIZE %d
-		)`, filePath, whereClause, tempFile, parquetRowGroupSize)
+		)`, escapeDuckDBPath(filePath), whereClause, escapeDuckDBPath(tempFile), parquetRowGroupSize)
 
 	if _, err := db.ExecContext(ctx, copyQuery); err != nil {
 		os.Remove(tempFile)
@@ -642,16 +765,22 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, _, where
 	return deleted, nil
 }
 
+// s3RewriteResult holds the outcome of rewriteS3File for manifest update.
+type s3RewriteResult struct {
+	sizeBytes int64
+	sha256    string
+}
+
 // rewriteS3File handles file rewrite for S3 storage
 // DuckDB can read from S3 directly, then we write to a temp file and upload
-func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath, whereClause string, rowsBefore, rowsAfter int64) (int64, error) {
+func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath, whereClause string, rowsBefore, rowsAfter int64) (int64, *s3RewriteResult, error) {
 	db := h.db.DB()
 	deleted := rowsBefore - rowsAfter
 
 	// Create temp file locally for the rewritten data
 	tempFile, err := os.CreateTemp("", "arc-delete-*.parquet")
 	if err != nil {
-		return 0, fmt.Errorf("failed to create temp file: %w", err)
+		return 0, nil, fmt.Errorf("failed to create temp file: %w", err)
 	}
 	tempPath := tempFile.Name()
 	tempFile.Close()
@@ -666,27 +795,32 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 			COMPRESSION ZSTD,
 			COMPRESSION_LEVEL 3,
 			ROW_GROUP_SIZE %d
-		)`, s3Path, whereClause, tempPath, parquetRowGroupSize)
+		)`, escapeDuckDBPath(s3Path), whereClause, escapeDuckDBPath(tempPath), parquetRowGroupSize)
 
 	if _, err := db.ExecContext(ctx, copyQuery); err != nil {
-		return 0, fmt.Errorf("failed to write filtered data: %w", err)
+		return 0, nil, fmt.Errorf("failed to write filtered data: %w", err)
 	}
 
-	// Stream temp file to S3 (avoids loading entire file into memory)
+	// Open temp file, compute SHA256 and size while streaming the upload via
+	// io.TeeReader — single pass over the file instead of two.
 	uploadFile, err := os.Open(tempPath)
 	if err != nil {
-		return 0, fmt.Errorf("failed to open temp file for upload: %w", err)
+		return 0, nil, fmt.Errorf("failed to open temp file for upload: %w", err)
 	}
 	defer uploadFile.Close()
 
 	info, err := uploadFile.Stat()
 	if err != nil {
-		return 0, fmt.Errorf("failed to stat temp file: %w", err)
+		return 0, nil, fmt.Errorf("failed to stat temp file: %w", err)
 	}
+	sizeBytes := info.Size()
 
-	if err := h.storage.WriteReader(ctx, relativePath, uploadFile, info.Size()); err != nil {
-		return 0, fmt.Errorf("failed to upload rewritten file to S3: %w", err)
+	h256 := sha256.New()
+	tee := io.TeeReader(uploadFile, h256)
+	if err := h.storage.WriteReader(ctx, relativePath, tee, sizeBytes); err != nil {
+		return 0, nil, fmt.Errorf("failed to upload rewritten file to remote storage: %w", err)
 	}
+	sha256hex := fmt.Sprintf("%x", h256.Sum(nil))
 
 	h.logger.Info().
 		Str("file", filepath.Base(relativePath)).
@@ -695,7 +829,7 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 		Int64("deleted", deleted).
 		Msg("Rewrote S3 file")
 
-	return deleted, nil
+	return deleted, &s3RewriteResult{sizeBytes: sizeBytes, sha256: sha256hex}, nil
 }
 
 // getQueryPath converts a storage-relative path to a DuckDB-compatible path
@@ -705,13 +839,63 @@ func (h *DeleteHandler) getQueryPath(relativePath string) string {
 		return filepath.Join(backend.GetBasePath(), relativePath)
 	case *storage.S3Backend:
 		return fmt.Sprintf("s3://%s/%s%s", backend.GetBucket(), backend.GetPrefix(), relativePath)
+	case *storage.AzureBlobBackend:
+		return fmt.Sprintf("azure://%s/%s", backend.GetContainer(), relativePath)
 	default:
 		return relativePath
 	}
 }
 
-// isS3Backend returns true if the storage backend is S3
-func (h *DeleteHandler) isS3Backend() bool {
-	_, ok := h.storage.(*storage.S3Backend)
-	return ok
+// isRemoteBackend returns true if the storage backend requires a remote rewrite
+// (download to local temp file, then re-upload). Covers S3 and Azure Blob.
+func (h *DeleteHandler) isRemoteBackend() bool {
+	switch h.storage.(type) {
+	case *storage.S3Backend, *storage.AzureBlobBackend:
+		return true
+	}
+	return false
+}
+
+// updateManifestAfterRewrite updates the cluster manifest entry for a partially
+// rewritten file. It reads the existing entry to preserve all immutable fields
+// (database, measurement, origin node, tier, etc.) and updates only the mutable
+// metadata: SizeBytes and SHA256.
+//
+// For local storage, the new size and checksum are computed from the rewritten
+// file on disk. For S3, size/checksum are not re-read (would require an extra
+// round-trip) — the manifest entry is still re-committed so peers know the file
+// changed, but SizeBytes and SHA256 will be stale until the next register.
+//
+// Failure is non-fatal: the rewrite already succeeded in storage; a stale
+// manifest entry is eventually consistent and does not affect query correctness.
+func (h *DeleteHandler) updateManifestAfterRewrite(relativePath string, s3 *s3RewriteResult) error {
+	existing, ok := h.coordinator.GetFileEntry(relativePath)
+	if !ok {
+		// File not in manifest (standalone-registered or pre-cluster file) — skip.
+		return nil
+	}
+
+	entry := *existing // copy all fields to preserve immutable metadata
+
+	if lb, ok := h.storage.(*storage.LocalBackend); ok {
+		basePath := lb.GetBasePath()
+		fullPath := filepath.Join(basePath, relativePath)
+		// Containment check: relativePath is already validated upstream, but
+		// guard here too since fileMetadata opens the file for reading.
+		if !strings.HasPrefix(fullPath, basePath+string(filepath.Separator)) {
+			return fmt.Errorf("path escapes storage root: %s", relativePath)
+		}
+		size, sha, err := fileMetadata(fullPath)
+		if err != nil {
+			return fmt.Errorf("failed to read rewritten file metadata: %w", err)
+		}
+		entry.SizeBytes = size
+		entry.SHA256 = sha
+	} else if s3 != nil {
+		// For S3: size and SHA256 were computed from the local temp file before upload.
+		entry.SizeBytes = s3.sizeBytes
+		entry.SHA256 = s3.sha256
+	}
+
+	return h.coordinator.UpdateFileInManifest(entry)
 }
