@@ -781,23 +781,35 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 		}
 	}
 
-	// Batch-update the cluster manifest for all deleted files in a single
-	// Raft proposal instead of one proposal per file.
+	// Batch-update the cluster manifest in chunks of 1000. Chunking prevents
+	// a single oversized Raft log entry when retention removes a large number
+	// of files. If a chunk fails, those paths become orphaned in the manifest
+	// (files are already gone from storage). There is no automatic reconciliation
+	// today — Phase 5 will add periodic manifest-vs-storage reconciliation to
+	// clean these up.
+	const manifestBatchSize = 1000
 	if !dryRun && h.coordinator != nil && len(deletedFilePaths) > 0 {
-		ops := make([]raft.BatchFileOp, 0, len(deletedFilePaths))
-		for _, p := range deletedFilePaths {
-			payload, err := json.Marshal(raft.DeleteFilePayload{Path: p, Reason: "retention"})
-			if err != nil {
-				h.logger.Warn().Err(err).Str("file", p).Msg("Failed to marshal manifest delete op")
+		for i := 0; i < len(deletedFilePaths); i += manifestBatchSize {
+			end := i + manifestBatchSize
+			if end > len(deletedFilePaths) {
+				end = len(deletedFilePaths)
+			}
+			chunk := deletedFilePaths[i:end]
+			ops := make([]raft.BatchFileOp, 0, len(chunk))
+			for _, p := range chunk {
+				payload, err := json.Marshal(raft.DeleteFilePayload{Path: p, Reason: "retention"})
+				if err != nil {
+					h.logger.Warn().Err(err).Str("file", p).Msg("Failed to marshal manifest delete op")
+					continue
+				}
+				ops = append(ops, raft.BatchFileOp{Type: raft.CommandDeleteFile, Payload: payload})
+			}
+			if len(ops) == 0 {
 				continue
 			}
-			ops = append(ops, raft.BatchFileOp{Type: raft.CommandDeleteFile, Payload: payload})
-		}
-		if len(ops) > 0 {
 			if err := h.coordinator.BatchFileOpsInManifest(ops); err != nil {
-				// Non-fatal: files are already gone from storage; manifest
-				// will self-heal on next compaction or node restart.
-				h.logger.Warn().Err(err).Int("count", len(ops)).Msg("Failed to batch-update cluster manifest after retention delete")
+				h.logger.Error().Err(err).Int("count", len(ops)).Int("chunk_start", i).
+					Msg("Failed to update cluster manifest after retention delete; affected files are orphaned in manifest until Phase 5 reconciliation")
 			}
 		}
 	}

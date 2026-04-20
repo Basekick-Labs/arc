@@ -150,13 +150,10 @@ func (s *RetentionScheduler) runRetention() {
 	}
 
 	// Cluster gate: checked on every tick so role transitions (failover,
-	// demotion) take effect without a restart. A node that is not the
-	// primary writer silently skips this tick.
-	s.mu.Lock()
-	gate := s.clusterGate
-	s.mu.Unlock()
-	if gate != nil && !gate.CanRunRetention() {
-		s.logger.Debug().Str("role", gate.Role()).Msg("Retention tick skipped: node is not primary writer")
+	// demotion) take effect without a restart. clusterGate is immutable
+	// after construction so no lock is needed here.
+	if s.clusterGate != nil && !s.clusterGate.CanRunRetention() {
+		s.logger.Debug().Str("role", s.clusterGate.Role()).Msg("Retention tick skipped: node is not primary writer")
 		return
 	}
 
@@ -221,13 +218,11 @@ func (s *RetentionScheduler) runRetention() {
 // TriggerNow triggers retention execution immediately
 func (s *RetentionScheduler) TriggerNow(ctx context.Context) error {
 	// The same gate applies to manual triggers — a reader node must not
-	// run retention on demand either.
-	s.mu.Lock()
-	gate := s.clusterGate
-	s.mu.Unlock()
-	if gate != nil && !gate.CanRunRetention() {
+	// run retention on demand either. clusterGate is immutable after
+	// construction so no lock is needed.
+	if s.clusterGate != nil && !s.clusterGate.CanRunRetention() {
 		s.logger.Warn().
-			Str("role", gate.Role()).
+			Str("role", s.clusterGate.Role()).
 			Msg("Manual retention trigger rejected: node is not primary writer")
 		return ErrRetentionRoleGated
 	}
