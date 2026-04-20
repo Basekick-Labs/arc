@@ -859,7 +859,13 @@ func (h *DeleteHandler) updateManifestAfterRewrite(relativePath string) error {
 	entry := *existing // copy all fields to preserve immutable metadata
 
 	if lb, ok := h.storage.(*storage.LocalBackend); ok {
-		fullPath := filepath.Join(lb.GetBasePath(), relativePath)
+		basePath := lb.GetBasePath()
+		fullPath := filepath.Join(basePath, relativePath)
+		// Containment check: relativePath is already validated upstream, but
+		// guard here too since fileMetadata opens the file for reading.
+		if !strings.HasPrefix(fullPath, basePath+string(filepath.Separator)) {
+			return fmt.Errorf("path escapes storage root: %s", relativePath)
+		}
 		size, sha, err := fileMetadata(fullPath)
 		if err != nil {
 			return fmt.Errorf("failed to read rewritten file metadata: %w", err)
