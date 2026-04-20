@@ -585,6 +585,7 @@ func (f *ClusterFSM) applyUpdateFile(payload []byte) interface{} {
 		}
 		idx[entry.Path] = struct{}{}
 	}
+	callback := f.onFileRegistered
 	f.mu.Unlock()
 
 	f.logger.Debug().
@@ -593,8 +594,14 @@ func (f *ClusterFSM) applyUpdateFile(payload []byte) interface{} {
 		Str("sha256", entry.SHA256).
 		Msg("File updated in cluster manifest")
 
-	// No onFileRegistered callback — the file already exists on disk; peers
-	// do not need to pull it again. Only metadata (size/checksum) changed.
+	// Trigger onFileRegistered so reader nodes detect the content change and
+	// pull the updated file from the writer. The file path is the same but the
+	// content (and checksum) changed, so readers must re-fetch it.
+	if callback != nil {
+		entryCopy := entry
+		callback(&entryCopy)
+	}
+
 	return nil
 }
 

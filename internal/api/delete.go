@@ -692,9 +692,10 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 
 	// For S3, we need to write to a temp file locally, then upload
 	var rewroteDeleted int64
+	var s3Result *s3RewriteResult
 	var rewriteErr error
 	if h.isS3Backend() {
-		rewroteDeleted, rewriteErr = h.rewriteS3File(ctx, queryPath, relativePath, whereClause, rowsBefore, rowsAfter)
+		rewroteDeleted, s3Result, rewriteErr = h.rewriteS3File(ctx, queryPath, relativePath, whereClause, rowsBefore, rowsAfter)
 	} else {
 		rewroteDeleted, rewriteErr = h.rewriteLocalFile(ctx, queryPath, relativePath, whereClause, rowsBefore, rowsAfter)
 	}
@@ -706,7 +707,7 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 	// the rewrite succeeded in storage; a stale manifest entry is eventually
 	// consistent and does not affect query correctness.
 	if h.coordinator != nil {
-		if err := h.updateManifestAfterRewrite(relativePath); err != nil {
+		if err := h.updateManifestAfterRewrite(relativePath, s3Result); err != nil {
 			h.logger.Warn().Err(err).Str("file", relativePath).Msg("Failed to update manifest after partial rewrite")
 		}
 	}
@@ -763,16 +764,22 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, _, where
 	return deleted, nil
 }
 
+// s3RewriteResult holds the outcome of rewriteS3File for manifest update.
+type s3RewriteResult struct {
+	sizeBytes int64
+	sha256    string
+}
+
 // rewriteS3File handles file rewrite for S3 storage
 // DuckDB can read from S3 directly, then we write to a temp file and upload
-func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath, whereClause string, rowsBefore, rowsAfter int64) (int64, error) {
+func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath, whereClause string, rowsBefore, rowsAfter int64) (int64, *s3RewriteResult, error) {
 	db := h.db.DB()
 	deleted := rowsBefore - rowsAfter
 
 	// Create temp file locally for the rewritten data
 	tempFile, err := os.CreateTemp("", "arc-delete-*.parquet")
 	if err != nil {
-		return 0, fmt.Errorf("failed to create temp file: %w", err)
+		return 0, nil, fmt.Errorf("failed to create temp file: %w", err)
 	}
 	tempPath := tempFile.Name()
 	tempFile.Close()
@@ -790,23 +797,25 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 		)`, escapeDuckDBPath(s3Path), whereClause, escapeDuckDBPath(tempPath), parquetRowGroupSize)
 
 	if _, err := db.ExecContext(ctx, copyQuery); err != nil {
-		return 0, fmt.Errorf("failed to write filtered data: %w", err)
+		return 0, nil, fmt.Errorf("failed to write filtered data: %w", err)
+	}
+
+	// Compute size and SHA256 from the local temp file before uploading.
+	// This is the only moment we have the file available locally for free.
+	sizeBytes, sha256hex, err := fileMetadata(tempPath)
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to compute temp file metadata: %w", err)
 	}
 
 	// Stream temp file to S3 (avoids loading entire file into memory)
 	uploadFile, err := os.Open(tempPath)
 	if err != nil {
-		return 0, fmt.Errorf("failed to open temp file for upload: %w", err)
+		return 0, nil, fmt.Errorf("failed to open temp file for upload: %w", err)
 	}
 	defer uploadFile.Close()
 
-	info, err := uploadFile.Stat()
-	if err != nil {
-		return 0, fmt.Errorf("failed to stat temp file: %w", err)
-	}
-
-	if err := h.storage.WriteReader(ctx, relativePath, uploadFile, info.Size()); err != nil {
-		return 0, fmt.Errorf("failed to upload rewritten file to S3: %w", err)
+	if err := h.storage.WriteReader(ctx, relativePath, uploadFile, sizeBytes); err != nil {
+		return 0, nil, fmt.Errorf("failed to upload rewritten file to S3: %w", err)
 	}
 
 	h.logger.Info().
@@ -816,7 +825,7 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 		Int64("deleted", deleted).
 		Msg("Rewrote S3 file")
 
-	return deleted, nil
+	return deleted, &s3RewriteResult{sizeBytes: sizeBytes, sha256: sha256hex}, nil
 }
 
 // getQueryPath converts a storage-relative path to a DuckDB-compatible path
@@ -849,7 +858,7 @@ func (h *DeleteHandler) isS3Backend() bool {
 //
 // Failure is non-fatal: the rewrite already succeeded in storage; a stale
 // manifest entry is eventually consistent and does not affect query correctness.
-func (h *DeleteHandler) updateManifestAfterRewrite(relativePath string) error {
+func (h *DeleteHandler) updateManifestAfterRewrite(relativePath string, s3 *s3RewriteResult) error {
 	existing, ok := h.coordinator.GetFileEntry(relativePath)
 	if !ok {
 		// File not in manifest (standalone-registered or pre-cluster file) — skip.
@@ -872,10 +881,11 @@ func (h *DeleteHandler) updateManifestAfterRewrite(relativePath string) error {
 		}
 		entry.SizeBytes = size
 		entry.SHA256 = sha
+	} else if s3 != nil {
+		// For S3: size and SHA256 were computed from the local temp file before upload.
+		entry.SizeBytes = s3.sizeBytes
+		entry.SHA256 = s3.sha256
 	}
-	// For S3: SizeBytes/SHA256 remain from the original entry until the next
-	// explicit register. The manifest update still signals to peers that the
-	// file's content changed (LSN advances on apply).
 
 	return h.coordinator.UpdateFileInManifest(entry)
 }
