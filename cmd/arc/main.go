@@ -1320,7 +1320,7 @@ func main() {
 	var retentionHandler *api.RetentionHandler
 	if cfg.Retention.Enabled {
 		var err error
-		retentionHandler, err = api.NewRetentionHandler(storageBackend, db, &cfg.Retention, authManager, logger.Get("retention"))
+		retentionHandler, err = api.NewRetentionHandler(storageBackend, db, &cfg.Retention, licenseClient, authManager, logger.Get("retention"))
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize retention handler")
 		}

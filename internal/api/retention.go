@@ -14,6 +14,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
+	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	_ "github.com/mattn/go-sqlite3"
@@ -29,13 +30,14 @@ type RetentionCoordinator interface {
 
 // RetentionHandler handles retention policy operations
 type RetentionHandler struct {
-	storage     storage.Backend
-	config      *config.RetentionConfig
-	db          *sql.DB               // SQLite for policy metadata
-	duckdb      *database.DuckDB      // Shared DuckDB for parquet queries
-	coordinator RetentionCoordinator  // nil in standalone mode
-	authManager *auth.AuthManager
-	logger      zerolog.Logger
+	storage       storage.Backend
+	config        *config.RetentionConfig
+	db            *sql.DB              // SQLite for policy metadata
+	duckdb        *database.DuckDB     // Shared DuckDB for parquet queries
+	coordinator   RetentionCoordinator // nil in standalone mode
+	licenseClient *license.Client      // nil when auth/licensing is disabled
+	authManager   *auth.AuthManager
+	logger        zerolog.Logger
 }
 
 // RetentionPolicy represents a retention policy
@@ -95,7 +97,7 @@ type RetentionExecution struct {
 }
 
 // NewRetentionHandler creates a new retention handler
-func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *config.RetentionConfig, authManager *auth.AuthManager, logger zerolog.Logger) (*RetentionHandler, error) {
+func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *config.RetentionConfig, licenseClient *license.Client, authManager *auth.AuthManager, logger zerolog.Logger) (*RetentionHandler, error) {
 	// Ensure directory exists
 	dir := filepath.Dir(cfg.DBPath)
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -109,12 +111,13 @@ func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *
 	}
 
 	h := &RetentionHandler{
-		storage:     storage,
-		config:      cfg,
-		db:          db,
-		duckdb:      duckdb,
-		authManager: authManager,
-		logger:      logger.With().Str("component", "retention-handler").Logger(),
+		storage:       storage,
+		config:        cfg,
+		db:            db,
+		duckdb:        duckdb,
+		licenseClient: licenseClient,
+		authManager:   authManager,
+		logger:        logger.With().Str("component", "retention-handler").Logger(),
 	}
 
 	// Initialize tables
@@ -371,6 +374,11 @@ func (h *RetentionHandler) handleDelete(c *fiber.Ctx) error {
 func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*ExecuteRetentionResponse, error) {
 	start := time.Now()
 
+	// License check: guards direct programmatic calls that bypass the scheduler.
+	if h.licenseClient != nil && !h.licenseClient.CanUseRetentionScheduler() {
+		return nil, fmt.Errorf("valid enterprise license required for retention policy execution")
+	}
+
 	// Get policy
 	policy, err := h.getPolicy(policyID)
 	if err != nil {
@@ -408,6 +416,14 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 		deleted, filesDeleted, err := h.deleteOldFiles(ctx, policy.Database, measurement, cutoffDate, false)
 		if err != nil {
 			h.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to process measurement")
+			// Manifest failures are non-transient (e.g. Raft quorum loss) — abort
+			// the entire policy to avoid creating more orphaned manifest entries.
+			if h.coordinator != nil {
+				if executionID > 0 {
+					h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), err.Error())
+				}
+				return nil, fmt.Errorf("retention aborted for policy %d: %w", policyID, err)
+			}
 			continue
 		}
 		totalDeleted += deleted

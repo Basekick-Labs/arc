@@ -34,9 +34,10 @@ type RetentionScheduler struct {
 	clusterGate      RetentionClusterGate
 	schedule         string // Cron schedule (e.g., "0 3 * * *" = 3am daily)
 	cron             *cron.Cron
-	running bool
-	mu      sync.Mutex
-	logger           zerolog.Logger
+	running    bool
+	runningJob bool // true while a retention cycle is in progress; prevents overlap
+	mu         sync.Mutex
+	logger     zerolog.Logger
 }
 
 // RetentionSchedulerConfig holds configuration for the retention scheduler
@@ -141,8 +142,6 @@ func (s *RetentionScheduler) Stop() {
 
 // runRetention runs one retention cycle for all active policies
 func (s *RetentionScheduler) runRetention() {
-	startTime := time.Now()
-
 	// Check license before execution
 	if s.licenseClient == nil || !s.licenseClient.CanUseRetentionScheduler() {
 		s.logger.Warn().Msg("Valid enterprise license required, skipping retention execution")
@@ -157,6 +156,23 @@ func (s *RetentionScheduler) runRetention() {
 		return
 	}
 
+	// Prevent concurrent execution: if a previous cycle is still running
+	// (e.g. slow storage or large dataset), skip this tick entirely.
+	s.mu.Lock()
+	if s.runningJob {
+		s.mu.Unlock()
+		s.logger.Warn().Msg("Retention tick skipped: previous cycle still running")
+		return
+	}
+	s.runningJob = true
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.runningJob = false
+		s.mu.Unlock()
+	}()
+
+	startTime := time.Now()
 	s.logger.Info().Msg("Triggering scheduled retention")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
