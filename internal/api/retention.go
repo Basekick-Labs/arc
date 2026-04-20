@@ -807,8 +807,8 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 		subRows := eligibleRows[i:end]
 		if h.coordinator != nil {
 			ops = make([]raft.BatchFileOp, 0, len(chunk))
-			subPaths = subPaths[:0:0] // reset; will be rebuilt in parallel with ops
-			subRows = subRows[:0:0]
+			subPaths = make([]string, 0, len(chunk))
+			subRows = make([]int64, 0, len(chunk))
 			for j, p := range chunk {
 				payload, err := json.Marshal(raft.DeleteFilePayload{Path: p, Reason: "retention"})
 				if err != nil {
