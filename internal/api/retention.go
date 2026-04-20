@@ -416,15 +416,12 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 		deleted, filesDeleted, err := h.deleteOldFiles(ctx, policy.Database, measurement, cutoffDate, false)
 		if err != nil {
 			h.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to process measurement")
-			// Manifest failures are non-transient (e.g. Raft quorum loss) — abort
-			// the entire policy to avoid creating more orphaned manifest entries.
-			if h.coordinator != nil {
-				if executionID > 0 {
-					h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), err.Error())
-				}
-				return nil, fmt.Errorf("retention aborted for policy %d: %w", policyID, err)
+			// Abort on any error — manifest failures are non-transient (Raft quorum loss)
+			// and continuing would produce orphaned manifest entries with no retry path.
+			if executionID > 0 {
+				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), err.Error())
 			}
-			continue
+			return nil, fmt.Errorf("retention aborted for policy %d: %w", policyID, err)
 		}
 		totalDeleted += deleted
 		totalFilesDeleted += filesDeleted
@@ -564,10 +561,15 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 	var totalFilesDeleted int
 
 	for _, measurement := range measurements {
-		deleted, filesDeleted, err := h.deleteOldFiles(context.Background(), policy.Database, measurement, cutoffDate, req.DryRun)
+		deleted, filesDeleted, err := h.deleteOldFiles(c.Context(), policy.Database, measurement, cutoffDate, req.DryRun)
 		if err != nil {
 			h.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to process measurement")
-			continue
+			if !req.DryRun && executionID > 0 {
+				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), err.Error())
+			}
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": fmt.Sprintf("retention aborted at measurement %q: %s", measurement, err.Error()),
+			})
 		}
 		totalDeleted += deleted
 		totalFilesDeleted += filesDeleted

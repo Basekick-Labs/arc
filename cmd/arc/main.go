@@ -1763,7 +1763,11 @@ func newRetentionClusterGate(c *cluster.Coordinator) *retentionClusterGate {
 }
 
 func (g *retentionClusterGate) CanRunRetention() bool {
-	return g.coordinator.GetLocalNode().IsPrimaryWriter()
+	node := g.coordinator.GetLocalNode()
+	if node == nil {
+		return false
+	}
+	return node.IsPrimaryWriter()
 }
 
 func (g *retentionClusterGate) Role() string {
