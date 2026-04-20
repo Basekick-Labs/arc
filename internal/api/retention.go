@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -22,7 +24,7 @@ import (
 // propagate file deletes to the Raft manifest. Using a minimal interface
 // avoids a compile-time dependency on the cluster package.
 type RetentionCoordinator interface {
-	DeleteFileFromManifest(path, reason string) error
+	BatchFileOpsInManifest(ops []raft.BatchFileOp) error
 }
 
 // RetentionHandler handles retention policy operations
@@ -772,17 +774,31 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 					continue
 				}
 				deletedFilePaths = append(deletedFilePaths, relativePath)
-				if h.coordinator != nil {
-					if err := h.coordinator.DeleteFileFromManifest(relativePath, "retention"); err != nil {
-						// Non-fatal: file is already gone from storage; manifest will
-						// self-heal on next compaction or node restart.
-						h.logger.Warn().Err(err).Str("file", relativePath).Msg("Failed to update cluster manifest after retention delete")
-					}
-				}
 			}
 
 			deletedRows += rowCount
 			deletedFiles++
+		}
+	}
+
+	// Batch-update the cluster manifest for all deleted files in a single
+	// Raft proposal instead of one proposal per file.
+	if !dryRun && h.coordinator != nil && len(deletedFilePaths) > 0 {
+		ops := make([]raft.BatchFileOp, 0, len(deletedFilePaths))
+		for _, p := range deletedFilePaths {
+			payload, err := json.Marshal(raft.DeleteFilePayload{Path: p, Reason: "retention"})
+			if err != nil {
+				h.logger.Warn().Err(err).Str("file", p).Msg("Failed to marshal manifest delete op")
+				continue
+			}
+			ops = append(ops, raft.BatchFileOp{Type: raft.CommandDeleteFile, Payload: payload})
+		}
+		if len(ops) > 0 {
+			if err := h.coordinator.BatchFileOpsInManifest(ops); err != nil {
+				// Non-fatal: files are already gone from storage; manifest
+				// will self-heal on next compaction or node restart.
+				h.logger.Warn().Err(err).Int("count", len(ops)).Msg("Failed to batch-update cluster manifest after retention delete")
+			}
 		}
 	}
 

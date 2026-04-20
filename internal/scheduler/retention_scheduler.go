@@ -34,9 +34,8 @@ type RetentionScheduler struct {
 	clusterGate      RetentionClusterGate
 	schedule         string // Cron schedule (e.g., "0 3 * * *" = 3am daily)
 	cron             *cron.Cron
-	running          bool
-	roleGated        bool // true when Start found CanRunRetention=false
-	mu               sync.Mutex
+	running bool
+	mu      sync.Mutex
 	logger           zerolog.Logger
 }
 
@@ -94,17 +93,6 @@ func (s *RetentionScheduler) Start() error {
 		return nil
 	}
 
-	// Cluster gate: only the primary writer runs retention. Reader nodes
-	// stay idle so they don't race with the writer on shared or local storage.
-	if s.clusterGate != nil && !s.clusterGate.CanRunRetention() {
-		s.roleGated = true
-		s.logger.Info().
-			Str("role", s.clusterGate.Role()).
-			Msg("Retention scheduler gated: node is not primary writer. Scheduler idle.")
-		return nil
-	}
-	s.roleGated = false
-
 	// Create cron instance
 	s.cron = cron.New(cron.WithParser(cron.NewParser(
 		cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow,
@@ -154,13 +142,25 @@ func (s *RetentionScheduler) Stop() {
 // runRetention runs one retention cycle for all active policies
 func (s *RetentionScheduler) runRetention() {
 	startTime := time.Now()
-	s.logger.Info().Msg("Triggering scheduled retention")
 
 	// Check license before execution
 	if s.licenseClient == nil || !s.licenseClient.CanUseRetentionScheduler() {
 		s.logger.Warn().Msg("Valid enterprise license required, skipping retention execution")
 		return
 	}
+
+	// Cluster gate: checked on every tick so role transitions (failover,
+	// demotion) take effect without a restart. A node that is not the
+	// primary writer silently skips this tick.
+	s.mu.Lock()
+	gate := s.clusterGate
+	s.mu.Unlock()
+	if gate != nil && !gate.CanRunRetention() {
+		s.logger.Debug().Str("role", gate.Role()).Msg("Retention tick skipped: node is not primary writer")
+		return
+	}
+
+	s.logger.Info().Msg("Triggering scheduled retention")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
@@ -312,7 +312,7 @@ func (s *RetentionScheduler) Status() map[string]interface{} {
 	}
 
 	if s.clusterGate != nil {
-		status["role_gated"] = s.roleGated
+		status["can_run"] = s.clusterGate.CanRunRetention()
 		status["gate_role"] = s.clusterGate.Role()
 	}
 
