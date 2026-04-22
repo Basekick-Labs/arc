@@ -308,22 +308,3 @@ func TestCQScheduler_ClusterGate_FailoverTransition(t *testing.T) {
 	}
 }
 
-// TestCQScheduler_OverlapGuard_ExecutingFlag verifies the per-job executing flag
-// is initialized to false on job creation.
-func TestCQScheduler_OverlapGuard_ExecutingFlag(t *testing.T) {
-	job := &cqJob{
-		cqID:   1,
-		cqName: "test",
-		ticker: time.NewTicker(time.Hour),
-		stopCh: make(chan struct{}),
-	}
-	defer job.ticker.Stop()
-
-	job.executeMu.Lock()
-	executing := job.executing
-	job.executeMu.Unlock()
-
-	if executing {
-		t.Error("executing flag should be false at creation")
-	}
-}

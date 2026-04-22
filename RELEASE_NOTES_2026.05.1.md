@@ -235,6 +235,26 @@ Fixed a memory retention issue where running a retention policy or the delete AP
 
 **Impact:** Memory usage should return to baseline after a retention policy run or delete operation, instead of climbing GBs per execution. Particularly noticeable in Docker/Kubernetes deployments with memory limits, where this could cause OOM kills during nightly retention runs.
 
+### Writer-Only Schedulers Skipped All Ticks Without Failover Enabled (Enterprise)
+
+Fixed a bug where the CQ and retention schedulers skipped execution on every tick when `cluster.failover_enabled=false` — which is the default and the typical single-writer cluster configuration.
+
+**Root cause:** `IsPrimaryWriter()` on a cluster node returns `true` only when `WriterState == WriterStatePrimary`. That state is set exclusively via the writer failover manager's `CommandPromoteWriter` Raft entry. When failover is disabled, no promotion command is ever issued, so `WriterState` remains at its zero value and `IsPrimaryWriter()` always returns `false` — even on writer nodes. Both the retention and CQ gate adapters in `main.go` (`retentionClusterGate`, `cqClusterGate`) called `node.IsPrimaryWriter()` directly, bypassing the coordinator entirely.
+
+**Fix:**
+- `Coordinator.IsPrimaryWriter()` now falls back to a role check (`node.Role == RoleWriter`) when no failover manager is configured. With failover enabled, the existing `WriterState == WriterStatePrimary` semantics are preserved.
+- `retentionClusterGate` and `cqClusterGate` now delegate to `coordinator.IsPrimaryWriter()` instead of calling `node.IsPrimaryWriter()` directly, so the fallback is respected.
+
+**Impact:** Retention policies and continuous query schedules now execute correctly on writer nodes in clusters running without automatic failover. Previously both would silently skip every scheduled tick, meaning retention was never applied and CQs never ran in the default cluster configuration.
+
+### Continuous Query Not Scheduled After API Creation
+
+Fixed a bug where a CQ created via `POST /api/v1/continuous_queries` was not picked up by the scheduler until the node was restarted.
+
+**Root cause:** `handleCreate` inserted the CQ into SQLite but did not notify the scheduler. The scheduler's `ReloadCQ` was only called from `handleUpdate`.
+
+**Fix:** `handleCreate` now calls `scheduler.ReloadCQ(queryID)` after a successful insert. If the scheduler is not running (no license, or standalone without license), the call is a no-op.
+
 ## Dependencies
 
 ### DuckDB v1.5.1

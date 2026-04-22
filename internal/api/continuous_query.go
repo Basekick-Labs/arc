@@ -305,6 +305,13 @@ func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
 	queryID, _ := result.LastInsertId()
 	h.logger.Info().Int64("query_id", queryID).Str("name", req.Name).Msg("Created continuous query")
 
+	// Kick the scheduler so the new CQ starts running without a restart.
+	if h.scheduler != nil {
+		if err := h.scheduler.ReloadCQ(queryID); err != nil {
+			h.logger.Warn().Err(err).Int64("query_id", queryID).Msg("Failed to start CQ job after create")
+		}
+	}
+
 	// Return created query
 	cq, err := h.getQuery(queryID)
 	if err != nil {

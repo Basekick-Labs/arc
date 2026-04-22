@@ -33,13 +33,11 @@ type CQScheduler struct {
 
 // cqJob represents a scheduled CQ job
 type cqJob struct {
-	cqID       int64
-	cqName     string
-	interval   time.Duration
-	ticker     *time.Ticker
-	stopCh     chan struct{}
-	executing  bool       // true while a CQ execution is in progress; prevents tick overlap
-	executeMu  sync.Mutex // guards executing
+	cqID     int64
+	cqName   string
+	interval time.Duration
+	ticker   *time.Ticker
+	stopCh   chan struct{}
 }
 
 // CQSchedulerConfig holds configuration for the CQ scheduler
@@ -269,24 +267,7 @@ func (s *CQScheduler) runJob(job *cqJob) {
 				continue
 			}
 
-			// Overlap guard: skip this tick if the previous execution is still running.
-			job.executeMu.Lock()
-			if job.executing {
-				job.executeMu.Unlock()
-				s.logger.Warn().
-					Int64("cq_id", job.cqID).
-					Str("cq_name", job.cqName).
-					Msg("CQ tick skipped: previous execution still running")
-				continue
-			}
-			job.executing = true
-			job.executeMu.Unlock()
-
 			s.executeJob(job)
-
-			job.executeMu.Lock()
-			job.executing = false
-			job.executeMu.Unlock()
 		case <-job.stopCh:
 			return
 		}

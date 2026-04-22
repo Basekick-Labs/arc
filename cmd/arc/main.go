@@ -1774,11 +1774,7 @@ func newRetentionClusterGate(c *cluster.Coordinator) *retentionClusterGate {
 }
 
 func (g *retentionClusterGate) IsPrimaryWriter() bool {
-	node := g.coordinator.GetLocalNode()
-	if node == nil {
-		return false
-	}
-	return node.IsPrimaryWriter()
+	return g.coordinator.IsPrimaryWriter()
 }
 
 func (g *retentionClusterGate) Role() string {
@@ -1798,11 +1794,7 @@ func newCQClusterGate(c *cluster.Coordinator) *cqClusterGate {
 }
 
 func (g *cqClusterGate) IsPrimaryWriter() bool {
-	node := g.coordinator.GetLocalNode()
-	if node == nil {
-		return false
-	}
-	return node.IsPrimaryWriter()
+	return g.coordinator.IsPrimaryWriter()
 }
 
 func (g *cqClusterGate) Role() string {
