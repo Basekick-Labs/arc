@@ -10,8 +10,8 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// CQClusterGate is an alias for WriterGate kept for backwards compatibility.
-// Deprecated: use WriterGate directly.
+// CQClusterGate is an alias for WriterGate. Both schedulers share the same
+// interface; this alias lets existing code compile without changes.
 type CQClusterGate = WriterGate
 
 // CQScheduler manages automatic execution of continuous queries based on their intervals
@@ -34,6 +34,7 @@ type cqJob struct {
 	interval time.Duration
 	ticker   *time.Ticker
 	stopCh   chan struct{}
+	done     chan struct{} // closed by runJob when the goroutine exits
 }
 
 // CQSchedulerConfig holds configuration for the CQ scheduler
@@ -123,32 +124,45 @@ func (s *CQScheduler) Stop() {
 	s.logger.Info().Msg("CQ scheduler stopped")
 }
 
-// stopJobLocked stops and removes the job for cqID if one exists.
+// stopJobLocked signals the job goroutine to stop and removes it from the map.
+// It returns the job's done channel so callers that need to wait for the
+// goroutine to fully exit (e.g. before starting a replacement) can do so
+// outside the lock. Returns nil when no job was running for cqID.
 // Caller must hold s.mu.
-func (s *CQScheduler) stopJobLocked(cqID int64) {
+func (s *CQScheduler) stopJobLocked(cqID int64) chan struct{} {
 	if job, exists := s.jobs[cqID]; exists {
 		close(job.stopCh)
 		job.ticker.Stop()
 		delete(s.jobs, cqID)
-		s.logger.Debug().Int64("cq_id", cqID).Msg("Stopped CQ job")
+		s.logger.Debug().Int64("cq_id", cqID).Str("cq_name", job.cqName).Msg("Stopped CQ job")
+		return job.done
 	}
+	return nil
 }
 
 // ReloadCQ reloads a specific CQ (call after CQ update)
 func (s *CQScheduler) ReloadCQ(cqID int64) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if !s.running {
+		s.mu.Unlock()
 		return nil
 	}
 
-	s.stopJobLocked(cqID)
+	done := s.stopJobLocked(cqID)
 
-	// Get updated CQ
+	// Get updated CQ while still holding the lock
 	cq, err := s.cqHandler.GetCQ(cqID)
+	s.mu.Unlock()
+
 	if err != nil {
 		return err
+	}
+
+	// Wait for the old goroutine to exit before starting a replacement so that
+	// a long-running executeJob cannot overlap with the new job.
+	if done != nil {
+		<-done
 	}
 
 	if !cq.IsActive {
@@ -156,6 +170,8 @@ func (s *CQScheduler) ReloadCQ(cqID int64) error {
 		return nil
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.startJob(cq.ID, cq.Name, cq.Interval)
 }
 
@@ -164,30 +180,54 @@ func (s *CQScheduler) ReloadCQ(cqID int64) error {
 // scheduler never races against an uncommitted or not-yet-visible row.
 func (s *CQScheduler) StartJobDirect(cqID int64, name, interval string, isActive bool) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if !s.running {
+		s.mu.Unlock()
 		return nil
 	}
 
-	s.stopJobLocked(cqID)
+	done := s.stopJobLocked(cqID)
+	s.mu.Unlock()
+
+	// Wait for any in-flight execution to finish before starting the new job.
+	if done != nil {
+		<-done
+	}
 
 	if !isActive {
 		return nil
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.startJob(cqID, name, interval)
 }
 
 // ReloadAll reloads all CQ schedules from the database
 func (s *CQScheduler) ReloadAll() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	// Stop all existing jobs
-	for id := range s.jobs {
-		s.stopJobLocked(id)
+	if !s.running {
+		s.mu.Unlock()
+		return nil
 	}
+
+	// Collect done channels before releasing the lock so we can wait for
+	// in-flight executions to finish without holding the lock.
+	var doneChans []chan struct{}
+	for id := range s.jobs {
+		if ch := s.stopJobLocked(id); ch != nil {
+			doneChans = append(doneChans, ch)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, ch := range doneChans {
+		<-ch
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	// Check license - require valid license for CQ scheduler
 	if s.licenseClient == nil || !s.licenseClient.CanUseCQScheduler() {
@@ -238,6 +278,7 @@ func (s *CQScheduler) startJob(cqID int64, cqName, intervalStr string) error {
 		interval: interval,
 		ticker:   time.NewTicker(interval),
 		stopCh:   make(chan struct{}),
+		done:     make(chan struct{}),
 	}
 
 	s.jobs[cqID] = job
@@ -257,6 +298,7 @@ func (s *CQScheduler) startJob(cqID int64, cqName, intervalStr string) error {
 
 // runJob runs a single CQ job on its interval
 func (s *CQScheduler) runJob(job *cqJob) {
+	defer close(job.done)
 	defer s.wg.Done()
 	for {
 		select {
