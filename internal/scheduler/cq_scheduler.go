@@ -10,10 +10,15 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// CQClusterGate is an alias for WriterGate. Both schedulers share the same
+// interface; this alias lets existing code compile without changes.
+type CQClusterGate = WriterGate
+
 // CQScheduler manages automatic execution of continuous queries based on their intervals
 type CQScheduler struct {
 	cqHandler     *api.ContinuousQueryHandler
 	licenseClient *license.Client
+	clusterGate   WriterGate
 	jobs          map[int64]*cqJob // CQ ID → job info
 	mu            sync.RWMutex
 	wg            sync.WaitGroup
@@ -29,12 +34,14 @@ type cqJob struct {
 	interval time.Duration
 	ticker   *time.Ticker
 	stopCh   chan struct{}
+	done     chan struct{} // closed by runJob when the goroutine exits
 }
 
 // CQSchedulerConfig holds configuration for the CQ scheduler
 type CQSchedulerConfig struct {
 	CQHandler     *api.ContinuousQueryHandler
 	LicenseClient *license.Client
+	ClusterGate   WriterGate // nil = standalone, no gate
 	Logger        zerolog.Logger
 }
 
@@ -43,6 +50,7 @@ func NewCQScheduler(cfg *CQSchedulerConfig) (*CQScheduler, error) {
 	s := &CQScheduler{
 		cqHandler:     cfg.CQHandler,
 		licenseClient: cfg.LicenseClient,
+		clusterGate:   cfg.ClusterGate,
 		jobs:          make(map[int64]*cqJob),
 		stopCh:        make(chan struct{}),
 		logger:        cfg.Logger.With().Str("component", "cq-scheduler").Logger(),
@@ -104,15 +112,9 @@ func (s *CQScheduler) Stop() {
 	}
 
 	// Stop all jobs
-	for id, job := range s.jobs {
-		close(job.stopCh)
-		job.ticker.Stop()
-		s.logger.Debug().
-			Int64("cq_id", id).
-			Str("cq_name", job.cqName).
-			Msg("Stopped CQ job")
+	for id := range s.jobs {
+		s.stopJobLocked(id)
 	}
-	s.jobs = make(map[int64]*cqJob)
 	s.running = false
 	s.mu.Unlock()
 
@@ -122,46 +124,110 @@ func (s *CQScheduler) Stop() {
 	s.logger.Info().Msg("CQ scheduler stopped")
 }
 
-// ReloadCQ reloads a specific CQ (call after CQ update)
-func (s *CQScheduler) ReloadCQ(cqID int64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Stop existing job if any
+// stopJobLocked signals the job goroutine to stop and removes it from the map.
+// It returns the job's done channel so callers that need to wait for the
+// goroutine to fully exit (e.g. before starting a replacement) can do so
+// outside the lock. Returns nil when no job was running for cqID.
+// Caller must hold s.mu.
+func (s *CQScheduler) stopJobLocked(cqID int64) chan struct{} {
 	if job, exists := s.jobs[cqID]; exists {
 		close(job.stopCh)
 		job.ticker.Stop()
 		delete(s.jobs, cqID)
-		s.logger.Debug().Int64("cq_id", cqID).Msg("Stopped existing CQ job for reload")
+		s.logger.Debug().Int64("cq_id", cqID).Str("cq_name", job.cqName).Msg("Stopped CQ job")
+		return job.done
+	}
+	return nil
+}
+
+// ReloadCQ reloads a specific CQ (call after CQ update)
+func (s *CQScheduler) ReloadCQ(cqID int64) error {
+	s.mu.Lock()
+
+	if !s.running {
+		s.mu.Unlock()
+		return nil
 	}
 
-	// Get updated CQ
+	done := s.stopJobLocked(cqID)
+
+	// Get updated CQ while still holding the lock
 	cq, err := s.cqHandler.GetCQ(cqID)
+	s.mu.Unlock()
+
 	if err != nil {
 		return err
 	}
 
-	// Only restart if active
+	// Wait for the old goroutine to exit before starting a replacement so that
+	// a long-running executeJob cannot overlap with the new job.
+	if done != nil {
+		<-done
+	}
+
 	if !cq.IsActive {
 		s.logger.Debug().Int64("cq_id", cqID).Msg("CQ is not active, not restarting job")
 		return nil
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.startJob(cq.ID, cq.Name, cq.Interval)
+}
+
+// StartJobDirect schedules a job using caller-supplied data, avoiding a
+// redundant SQLite read. Used by handleCreate immediately after INSERT so the
+// scheduler never races against an uncommitted or not-yet-visible row.
+func (s *CQScheduler) StartJobDirect(cqID int64, name, interval string, isActive bool) error {
+	s.mu.Lock()
+
+	if !s.running {
+		s.mu.Unlock()
+		return nil
+	}
+
+	done := s.stopJobLocked(cqID)
+	s.mu.Unlock()
+
+	// Wait for any in-flight execution to finish before starting the new job.
+	if done != nil {
+		<-done
+	}
+
+	if !isActive {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.startJob(cqID, name, interval)
 }
 
 // ReloadAll reloads all CQ schedules from the database
 func (s *CQScheduler) ReloadAll() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	// Stop all existing jobs
-	for id, job := range s.jobs {
-		close(job.stopCh)
-		job.ticker.Stop()
-		s.logger.Debug().Int64("cq_id", id).Msg("Stopped CQ job for full reload")
+	if !s.running {
+		s.mu.Unlock()
+		return nil
 	}
-	s.jobs = make(map[int64]*cqJob)
+
+	// Collect done channels before releasing the lock so we can wait for
+	// in-flight executions to finish without holding the lock.
+	var doneChans []chan struct{}
+	for id := range s.jobs {
+		if ch := s.stopJobLocked(id); ch != nil {
+			doneChans = append(doneChans, ch)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, ch := range doneChans {
+		<-ch
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	// Check license - require valid license for CQ scheduler
 	if s.licenseClient == nil || !s.licenseClient.CanUseCQScheduler() {
@@ -212,6 +278,7 @@ func (s *CQScheduler) startJob(cqID int64, cqName, intervalStr string) error {
 		interval: interval,
 		ticker:   time.NewTicker(interval),
 		stopCh:   make(chan struct{}),
+		done:     make(chan struct{}),
 	}
 
 	s.jobs[cqID] = job
@@ -231,6 +298,7 @@ func (s *CQScheduler) startJob(cqID int64, cqName, intervalStr string) error {
 
 // runJob runs a single CQ job on its interval
 func (s *CQScheduler) runJob(job *cqJob) {
+	defer close(job.done)
 	defer s.wg.Done()
 	for {
 		select {
@@ -241,6 +309,18 @@ func (s *CQScheduler) runJob(job *cqJob) {
 					Int64("cq_id", job.cqID).
 					Str("cq_name", job.cqName).
 					Msg("Valid enterprise license required, skipping CQ execution")
+				continue
+			}
+
+			// Cluster gate: checked on every tick so role transitions (failover,
+			// demotion) take effect without a restart. clusterGate is immutable
+			// after construction so no lock is needed here.
+			if s.clusterGate != nil && !s.clusterGate.IsPrimaryWriter() {
+				s.logger.Debug().
+					Str("role", s.clusterGate.Role()).
+					Int64("cq_id", job.cqID).
+					Str("cq_name", job.cqName).
+					Msg("CQ tick skipped: node is not primary writer")
 				continue
 			}
 

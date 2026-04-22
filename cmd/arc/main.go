@@ -1347,6 +1347,9 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize continuous query handler")
 		}
+		if clusterCoordinator != nil {
+			cqHandler.SetCoordinator(clusterCoordinator)
+		}
 		cqHandler.RegisterRoutes(server.GetApp())
 		shutdownCoordinator.RegisterHook("continuous-query", func(ctx context.Context) error {
 			return cqHandler.Close()
@@ -1362,9 +1365,14 @@ func main() {
 	if cfg.ContinuousQuery.Enabled && cqHandler != nil {
 		if licenseClient != nil && licenseClient.CanUseCQScheduler() {
 			var err error
+			var cqGate scheduler.WriterGate
+			if clusterCoordinator != nil {
+				cqGate = newWriterClusterGate(clusterCoordinator)
+			}
 			cqScheduler, err = scheduler.NewCQScheduler(&scheduler.CQSchedulerConfig{
 				CQHandler:     cqHandler,
 				LicenseClient: licenseClient,
+				ClusterGate:   cqGate,
 				Logger:        logger.Get("cq-scheduler"),
 			})
 			if err != nil {
@@ -1394,9 +1402,9 @@ func main() {
 	if cfg.Retention.Enabled && retentionHandler != nil {
 		if licenseClient != nil && licenseClient.CanUseRetentionScheduler() {
 			var err error
-			var retentionGate scheduler.RetentionClusterGate
+			var retentionGate scheduler.WriterGate
 			if clusterCoordinator != nil {
-				retentionGate = newRetentionClusterGate(clusterCoordinator)
+				retentionGate = newWriterClusterGate(clusterCoordinator)
 			}
 			retentionScheduler, err = scheduler.NewRetentionScheduler(&scheduler.RetentionSchedulerConfig{
 				RetentionHandler: retentionHandler,
@@ -1753,27 +1761,24 @@ func runCompactSubcommand(args []string) {
 	}
 }
 
-// retentionClusterGate implements scheduler.RetentionClusterGate.
-// Only the primary writer node runs retention to prevent races on shared
-// or per-node storage. This type sits in main.go to avoid a compile-time
+// writerClusterGate implements scheduler.WriterGate (satisfies both
+// scheduler.RetentionClusterGate and scheduler.CQClusterGate aliases).
+// Only the primary writer node runs scheduled mutations (retention, CQ) to
+// prevent duplicate writes. Lives in main.go to avoid a compile-time
 // dependency between the scheduler and cluster packages.
-type retentionClusterGate struct {
+type writerClusterGate struct {
 	coordinator *cluster.Coordinator
 }
 
-func newRetentionClusterGate(c *cluster.Coordinator) *retentionClusterGate {
-	return &retentionClusterGate{coordinator: c}
+func newWriterClusterGate(c *cluster.Coordinator) *writerClusterGate {
+	return &writerClusterGate{coordinator: c}
 }
 
-func (g *retentionClusterGate) IsPrimaryWriter() bool {
-	node := g.coordinator.GetLocalNode()
-	if node == nil {
-		return false
-	}
-	return node.IsPrimaryWriter()
+func (g *writerClusterGate) IsPrimaryWriter() bool {
+	return g.coordinator.IsPrimaryWriter()
 }
 
-func (g *retentionClusterGate) Role() string {
+func (g *writerClusterGate) Role() string {
 	return string(g.coordinator.GetRole())
 }
 

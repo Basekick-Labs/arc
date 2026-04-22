@@ -1511,12 +1511,20 @@ func (c *Coordinator) GetRole() NodeRole {
 	return c.localNode.Role
 }
 
-// IsPrimaryWriter implements api.RetentionCoordinator and api.DeleteCoordinator:
-// reports whether this node is the primary writer and may execute writer-only mutations.
+// IsPrimaryWriter implements api.RetentionCoordinator, api.DeleteCoordinator,
+// api.CQCoordinator, and scheduler.WriterGate: reports whether this node is
+// the primary writer and may execute writer-only mutations.
+// When failover is disabled there is no promoted primary — any writer node is
+// authoritative, so we fall back to a role check.
 func (c *Coordinator) IsPrimaryWriter() bool {
 	node := c.GetLocalNode()
 	if node == nil {
 		return false
+	}
+	// Without a failover manager no CommandPromoteWriter is ever issued, so
+	// WriterState stays at its zero value. Treat any writer as primary.
+	if c.writerFailoverMgr == nil {
+		return node.Role == RoleWriter
 	}
 	return node.IsPrimaryWriter()
 }

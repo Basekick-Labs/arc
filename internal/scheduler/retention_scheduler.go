@@ -12,16 +12,19 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// RetentionClusterGate is the minimal interface the retention scheduler needs
-// to decide whether this node may run retention. A nil gate means no check
-// (standalone/OSS mode — retention always runs).
-type RetentionClusterGate interface {
-	// CanRunRetention reports whether the local node may execute retention.
-	// When false, the scheduler stays idle — not running, not an error.
+// WriterGate is the minimal interface both the retention and CQ schedulers need
+// to decide whether this node may execute writer-only operations. A nil gate
+// means no check (standalone/OSS mode — operations always run).
+type WriterGate interface {
+	// IsPrimaryWriter reports whether the local node is the active primary writer.
 	IsPrimaryWriter() bool
 	// Role returns a human-readable role string for log messages only.
 	Role() string
 }
+
+// RetentionClusterGate is an alias for WriterGate kept for backwards compatibility.
+// Deprecated: use WriterGate directly.
+type RetentionClusterGate = WriterGate
 
 // ErrRetentionRoleGated is returned by TriggerNow when the node's role does
 // not permit running retention (e.g. it is a reader, not the primary writer).
