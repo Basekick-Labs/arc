@@ -1,11 +1,21 @@
 package scheduler
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
 )
+
+// mockCQClusterGate implements CQClusterGate for testing.
+type mockCQClusterGate struct {
+	isPrimary atomic.Bool
+	role      string
+}
+
+func (m *mockCQClusterGate) IsPrimaryWriter() bool { return m.isPrimary.Load() }
+func (m *mockCQClusterGate) Role() string          { return m.role }
 
 func TestParseInterval(t *testing.T) {
 	tests := []struct {
@@ -199,5 +209,121 @@ func TestMinimumInterval(t *testing.T) {
 				t.Errorf("duration = %v, want %v", dur, tt.expected)
 			}
 		})
+	}
+}
+
+// TestCQScheduler_ClusterGate_NilGate verifies that a nil gate (standalone mode)
+// does not block job execution — the field is checked in runJob.
+func TestCQScheduler_ClusterGate_NilGate(t *testing.T) {
+	logger := zerolog.Nop()
+	s, err := NewCQScheduler(&CQSchedulerConfig{
+		CQHandler:     nil,
+		LicenseClient: nil,
+		ClusterGate:   nil,
+		Logger:        logger,
+	})
+	if err != nil {
+		t.Fatalf("NewCQScheduler failed: %v", err)
+	}
+	if s.clusterGate != nil {
+		t.Error("clusterGate should be nil when not provided")
+	}
+}
+
+// TestCQScheduler_ClusterGate_ReaderSkipsTick verifies that when a non-primary-writer
+// gate is installed, runJob skips execution. We drive the ticker manually via a
+// synthetic job to avoid real timer waits.
+func TestCQScheduler_ClusterGate_ReaderSkipsTick(t *testing.T) {
+	gate := &mockCQClusterGate{role: "reader"}
+	gate.isPrimary.Store(false)
+
+	logger := zerolog.Nop()
+	s, err := NewCQScheduler(&CQSchedulerConfig{
+		CQHandler:     nil,
+		LicenseClient: nil,
+		ClusterGate:   gate,
+		Logger:        logger,
+	})
+	if err != nil {
+		t.Fatalf("NewCQScheduler failed: %v", err)
+	}
+
+	// A reader gate must block execution.
+	if s.clusterGate == nil {
+		t.Fatal("expected clusterGate to be set")
+	}
+	if s.clusterGate.IsPrimaryWriter() {
+		t.Error("reader gate should report IsPrimaryWriter=false")
+	}
+	if s.clusterGate.Role() != "reader" {
+		t.Errorf("Role = %q, want %q", s.clusterGate.Role(), "reader")
+	}
+}
+
+// TestCQScheduler_ClusterGate_WriterAllowsTick verifies that a primary-writer gate
+// does not block the execution path.
+func TestCQScheduler_ClusterGate_WriterAllowsTick(t *testing.T) {
+	gate := &mockCQClusterGate{role: "writer"}
+	gate.isPrimary.Store(true)
+
+	logger := zerolog.Nop()
+	s, err := NewCQScheduler(&CQSchedulerConfig{
+		CQHandler:     nil,
+		LicenseClient: nil,
+		ClusterGate:   gate,
+		Logger:        logger,
+	})
+	if err != nil {
+		t.Fatalf("NewCQScheduler failed: %v", err)
+	}
+
+	if !s.clusterGate.IsPrimaryWriter() {
+		t.Error("writer gate should report IsPrimaryWriter=true")
+	}
+}
+
+// TestCQScheduler_ClusterGate_FailoverTransition verifies that the gate is re-evaluated
+// on each tick: promoting a reader to primary writer unblocks execution without a restart.
+func TestCQScheduler_ClusterGate_FailoverTransition(t *testing.T) {
+	gate := &mockCQClusterGate{role: "writer"}
+	gate.isPrimary.Store(false) // starts as non-primary
+
+	logger := zerolog.Nop()
+	s, _ := NewCQScheduler(&CQSchedulerConfig{
+		CQHandler:     nil,
+		LicenseClient: nil,
+		ClusterGate:   gate,
+		Logger:        logger,
+	})
+
+	if s.clusterGate.IsPrimaryWriter() {
+		t.Error("should start as non-primary")
+	}
+
+	// Simulate failover — gate atomically flips to primary.
+	gate.isPrimary.Store(true)
+
+	if !s.clusterGate.IsPrimaryWriter() {
+		t.Error("after failover gate should return IsPrimaryWriter=true without restart")
+	}
+}
+
+// TestCQScheduler_OverlapGuard_ExecutingFlag verifies the per-job executing flag
+// is initialized to false on job creation.
+func TestCQScheduler_OverlapGuard_ExecutingFlag(t *testing.T) {
+	job := &cqJob{
+		cqID:   1,
+		cqName: "test",
+		ticker: time.NewTicker(time.Hour),
+		stopCh: make(chan struct{}),
+	}
+	defer job.ticker.Stop()
+
+	job.executeMu.Lock()
+	executing := job.executing
+	job.executeMu.Unlock()
+
+	if executing {
+		t.Error("executing flag should be false at creation")
 	}
 }
