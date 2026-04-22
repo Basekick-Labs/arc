@@ -253,7 +253,7 @@ Fixed a bug where a CQ created via `POST /api/v1/continuous_queries` was not pic
 
 **Root cause:** `handleCreate` inserted the CQ into SQLite but did not notify the scheduler. The scheduler's `ReloadCQ` was only called from `handleUpdate`.
 
-**Fix:** `handleCreate` now calls `scheduler.ReloadCQ(queryID)` after a successful insert. If the scheduler is not running (no license, or standalone without license), the call is a no-op.
+**Fix:** `handleCreate` now calls `scheduler.StartJobDirect(queryID, name, interval, isActive)` after a successful insert, passing the data already in hand to avoid a redundant SQLite re-read. If the scheduler is not running (no license, or standalone without license), the call is a no-op.
 
 ## Dependencies
 

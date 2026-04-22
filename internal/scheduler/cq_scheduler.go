@@ -139,6 +139,10 @@ func (s *CQScheduler) ReloadCQ(cqID int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if !s.running {
+		return nil
+	}
+
 	s.stopJobLocked(cqID)
 
 	// Get updated CQ
@@ -161,6 +165,10 @@ func (s *CQScheduler) ReloadCQ(cqID int64) error {
 func (s *CQScheduler) StartJobDirect(cqID int64, name, interval string, isActive bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if !s.running {
+		return nil
+	}
 
 	s.stopJobLocked(cqID)
 
