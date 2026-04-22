@@ -10,19 +10,15 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// CQClusterGate is the minimal interface the CQ scheduler needs to decide
-// whether this node may execute continuous queries. A nil gate means no check
-// (standalone/OSS mode — CQs always run).
-type CQClusterGate interface {
-	IsPrimaryWriter() bool
-	Role() string
-}
+// CQClusterGate is an alias for WriterGate kept for backwards compatibility.
+// Deprecated: use WriterGate directly.
+type CQClusterGate = WriterGate
 
 // CQScheduler manages automatic execution of continuous queries based on their intervals
 type CQScheduler struct {
 	cqHandler     *api.ContinuousQueryHandler
 	licenseClient *license.Client
-	clusterGate   CQClusterGate
+	clusterGate   WriterGate
 	jobs          map[int64]*cqJob // CQ ID → job info
 	mu            sync.RWMutex
 	wg            sync.WaitGroup
@@ -44,7 +40,7 @@ type cqJob struct {
 type CQSchedulerConfig struct {
 	CQHandler     *api.ContinuousQueryHandler
 	LicenseClient *license.Client
-	ClusterGate   CQClusterGate // nil = standalone, no gate
+	ClusterGate   WriterGate // nil = standalone, no gate
 	Logger        zerolog.Logger
 }
 
@@ -115,15 +111,9 @@ func (s *CQScheduler) Stop() {
 	}
 
 	// Stop all jobs
-	for id, job := range s.jobs {
-		close(job.stopCh)
-		job.ticker.Stop()
-		s.logger.Debug().
-			Int64("cq_id", id).
-			Str("cq_name", job.cqName).
-			Msg("Stopped CQ job")
+	for id := range s.jobs {
+		s.stopJobLocked(id)
 	}
-	s.jobs = make(map[int64]*cqJob)
 	s.running = false
 	s.mu.Unlock()
 
@@ -133,18 +123,23 @@ func (s *CQScheduler) Stop() {
 	s.logger.Info().Msg("CQ scheduler stopped")
 }
 
+// stopJobLocked stops and removes the job for cqID if one exists.
+// Caller must hold s.mu.
+func (s *CQScheduler) stopJobLocked(cqID int64) {
+	if job, exists := s.jobs[cqID]; exists {
+		close(job.stopCh)
+		job.ticker.Stop()
+		delete(s.jobs, cqID)
+		s.logger.Debug().Int64("cq_id", cqID).Msg("Stopped CQ job")
+	}
+}
+
 // ReloadCQ reloads a specific CQ (call after CQ update)
 func (s *CQScheduler) ReloadCQ(cqID int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Stop existing job if any
-	if job, exists := s.jobs[cqID]; exists {
-		close(job.stopCh)
-		job.ticker.Stop()
-		delete(s.jobs, cqID)
-		s.logger.Debug().Int64("cq_id", cqID).Msg("Stopped existing CQ job for reload")
-	}
+	s.stopJobLocked(cqID)
 
 	// Get updated CQ
 	cq, err := s.cqHandler.GetCQ(cqID)
@@ -152,7 +147,6 @@ func (s *CQScheduler) ReloadCQ(cqID int64) error {
 		return err
 	}
 
-	// Only restart if active
 	if !cq.IsActive {
 		s.logger.Debug().Int64("cq_id", cqID).Msg("CQ is not active, not restarting job")
 		return nil
@@ -168,12 +162,7 @@ func (s *CQScheduler) StartJobDirect(cqID int64, name, interval string, isActive
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Stop any existing job with this ID (shouldn't exist on create, but be safe).
-	if job, exists := s.jobs[cqID]; exists {
-		close(job.stopCh)
-		job.ticker.Stop()
-		delete(s.jobs, cqID)
-	}
+	s.stopJobLocked(cqID)
 
 	if !isActive {
 		return nil
@@ -188,12 +177,9 @@ func (s *CQScheduler) ReloadAll() error {
 	defer s.mu.Unlock()
 
 	// Stop all existing jobs
-	for id, job := range s.jobs {
-		close(job.stopCh)
-		job.ticker.Stop()
-		s.logger.Debug().Int64("cq_id", id).Msg("Stopped CQ job for full reload")
+	for id := range s.jobs {
+		s.stopJobLocked(id)
 	}
-	s.jobs = make(map[int64]*cqJob)
 
 	// Check license - require valid license for CQ scheduler
 	if s.licenseClient == nil || !s.licenseClient.CanUseCQScheduler() {
