@@ -161,6 +161,27 @@ func (s *CQScheduler) ReloadCQ(cqID int64) error {
 	return s.startJob(cq.ID, cq.Name, cq.Interval)
 }
 
+// StartJobDirect schedules a job using caller-supplied data, avoiding a
+// redundant SQLite read. Used by handleCreate immediately after INSERT so the
+// scheduler never races against an uncommitted or not-yet-visible row.
+func (s *CQScheduler) StartJobDirect(cqID int64, name, interval string, isActive bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Stop any existing job with this ID (shouldn't exist on create, but be safe).
+	if job, exists := s.jobs[cqID]; exists {
+		close(job.stopCh)
+		job.ticker.Stop()
+		delete(s.jobs, cqID)
+	}
+
+	if !isActive {
+		return nil
+	}
+
+	return s.startJob(cqID, name, interval)
+}
+
 // ReloadAll reloads all CQ schedules from the database
 func (s *CQScheduler) ReloadAll() error {
 	s.mu.Lock()

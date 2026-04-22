@@ -25,6 +25,9 @@ import (
 // This avoids a circular import between api and scheduler packages.
 type CQSchedulerReloader interface {
 	ReloadCQ(cqID int64) error
+	// StartJobDirect schedules a job using data already in hand, avoiding a
+	// redundant SQLite read that could race with the just-committed INSERT.
+	StartJobDirect(cqID int64, name, interval string, isActive bool) error
 }
 
 // CQCoordinator is the minimal cluster interface the CQ handler needs to gate
@@ -305,9 +308,11 @@ func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
 	queryID, _ := result.LastInsertId()
 	h.logger.Info().Int64("query_id", queryID).Str("name", req.Name).Msg("Created continuous query")
 
-	// Kick the scheduler so the new CQ starts running without a restart.
+	// Kick the scheduler using the data we already have — avoids a redundant
+	// SQLite read that could race with the just-committed INSERT on a
+	// multi-connection pool.
 	if h.scheduler != nil {
-		if err := h.scheduler.ReloadCQ(queryID); err != nil {
+		if err := h.scheduler.StartJobDirect(queryID, req.Name, req.Interval, req.IsActive); err != nil {
 			h.logger.Warn().Err(err).Int64("query_id", queryID).Msg("Failed to start CQ job after create")
 		}
 	}
