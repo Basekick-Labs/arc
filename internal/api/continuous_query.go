@@ -27,6 +27,13 @@ type CQSchedulerReloader interface {
 	ReloadCQ(cqID int64) error
 }
 
+// CQCoordinator is the minimal cluster interface the CQ handler needs to gate
+// manual execute requests to the primary writer. nil = standalone mode (no gate).
+type CQCoordinator interface {
+	IsPrimaryWriter() bool
+	Role() string
+}
+
 // ContinuousQueryHandler handles continuous query operations
 type ContinuousQueryHandler struct {
 	db          *database.DuckDB
@@ -36,6 +43,7 @@ type ContinuousQueryHandler struct {
 	sqliteDB    *sql.DB
 	authManager *auth.AuthManager
 	scheduler   CQSchedulerReloader
+	coordinator CQCoordinator
 	logger      zerolog.Logger
 }
 
@@ -43,6 +51,12 @@ type ContinuousQueryHandler struct {
 // Called after scheduler creation since it depends on the handler.
 func (h *ContinuousQueryHandler) SetScheduler(s CQSchedulerReloader) {
 	h.scheduler = s
+}
+
+// SetCoordinator sets the cluster coordinator for writer-gate checks.
+// Called after coordinator creation since it depends on the handler.
+func (h *ContinuousQueryHandler) SetCoordinator(c CQCoordinator) {
+	h.coordinator = c
 }
 
 // ContinuousQuery represents a continuous query definition
@@ -513,6 +527,13 @@ func (h *ContinuousQueryHandler) GetCQ(queryID int64) (*ContinuousQuery, error) 
 // handleExecute executes a continuous query
 func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 	start := time.Now()
+
+	// Cluster gate: only the primary writer may execute CQs.
+	if h.coordinator != nil && !h.coordinator.IsPrimaryWriter() {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": fmt.Sprintf("CQ execution rejected: node role %q is not primary writer", h.coordinator.Role()),
+		})
+	}
 
 	queryID, err := c.ParamsInt("id")
 	if err != nil {

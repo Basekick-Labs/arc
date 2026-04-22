@@ -157,6 +157,12 @@ In clustered deployments, retention policies now run exclusively on the primary 
 - **Cluster manifest updates**: After each file is deleted from storage, the retention handler commits the deletion into the Raft log via `DeleteFileFromManifest`. This keeps the manifest consistent and prevents orphaned entries from interfering with peer replication catch-up.
 - **Reader node cleanup (local storage)**: The `onFileDeleted` FSM callback and delete-worker pool (shared with compaction) handle retention-triggered deletes on reader nodes, removing their local copy of the file and preventing unbounded disk growth on per-node storage deployments.
 
+### Cluster-Safe Continuous Queries (Enterprise)
+
+The CQ scheduler now gates execution on the primary writer role. In a cluster, only the primary writer executes scheduled continuous queries — reader nodes skip each tick and log a `DEBUG` message. Role transitions (failover, demotion) take effect on the next tick without a restart.
+
+Previously, all nodes ran the CQ scheduler independently, causing duplicate records to be written to destination measurements and `last_processed_time` to diverge across nodes.
+
 ### Cluster-Safe DELETE Endpoint (Enterprise)
 
 The `POST /api/v1/delete` endpoint is now cluster-aware. Reader nodes reject delete requests with `503 Service Unavailable` — only the primary writer may execute mutations.

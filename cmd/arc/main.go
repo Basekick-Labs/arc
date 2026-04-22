@@ -1347,6 +1347,9 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize continuous query handler")
 		}
+		if clusterCoordinator != nil {
+			cqHandler.SetCoordinator(clusterCoordinator)
+		}
 		cqHandler.RegisterRoutes(server.GetApp())
 		shutdownCoordinator.RegisterHook("continuous-query", func(ctx context.Context) error {
 			return cqHandler.Close()
@@ -1362,9 +1365,14 @@ func main() {
 	if cfg.ContinuousQuery.Enabled && cqHandler != nil {
 		if licenseClient != nil && licenseClient.CanUseCQScheduler() {
 			var err error
+			var cqGate scheduler.CQClusterGate
+			if clusterCoordinator != nil {
+				cqGate = newCQClusterGate(clusterCoordinator)
+			}
 			cqScheduler, err = scheduler.NewCQScheduler(&scheduler.CQSchedulerConfig{
 				CQHandler:     cqHandler,
 				LicenseClient: licenseClient,
+				ClusterGate:   cqGate,
 				Logger:        logger.Get("cq-scheduler"),
 			})
 			if err != nil {
@@ -1774,6 +1782,30 @@ func (g *retentionClusterGate) IsPrimaryWriter() bool {
 }
 
 func (g *retentionClusterGate) Role() string {
+	return string(g.coordinator.GetRole())
+}
+
+// cqClusterGate implements scheduler.CQClusterGate.
+// Only the primary writer runs CQs to prevent duplicate writes to the
+// destination measurement. Lives in main.go to avoid a compile-time
+// dependency between the scheduler and cluster packages.
+type cqClusterGate struct {
+	coordinator *cluster.Coordinator
+}
+
+func newCQClusterGate(c *cluster.Coordinator) *cqClusterGate {
+	return &cqClusterGate{coordinator: c}
+}
+
+func (g *cqClusterGate) IsPrimaryWriter() bool {
+	node := g.coordinator.GetLocalNode()
+	if node == nil {
+		return false
+	}
+	return node.IsPrimaryWriter()
+}
+
+func (g *cqClusterGate) Role() string {
 	return string(g.coordinator.GetRole())
 }
 

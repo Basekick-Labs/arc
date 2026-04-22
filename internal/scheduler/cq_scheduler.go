@@ -10,10 +10,19 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// CQClusterGate is the minimal interface the CQ scheduler needs to decide
+// whether this node may execute continuous queries. A nil gate means no check
+// (standalone/OSS mode — CQs always run).
+type CQClusterGate interface {
+	IsPrimaryWriter() bool
+	Role() string
+}
+
 // CQScheduler manages automatic execution of continuous queries based on their intervals
 type CQScheduler struct {
 	cqHandler     *api.ContinuousQueryHandler
 	licenseClient *license.Client
+	clusterGate   CQClusterGate
 	jobs          map[int64]*cqJob // CQ ID → job info
 	mu            sync.RWMutex
 	wg            sync.WaitGroup
@@ -24,17 +33,20 @@ type CQScheduler struct {
 
 // cqJob represents a scheduled CQ job
 type cqJob struct {
-	cqID     int64
-	cqName   string
-	interval time.Duration
-	ticker   *time.Ticker
-	stopCh   chan struct{}
+	cqID       int64
+	cqName     string
+	interval   time.Duration
+	ticker     *time.Ticker
+	stopCh     chan struct{}
+	executing  bool       // true while a CQ execution is in progress; prevents tick overlap
+	executeMu  sync.Mutex // guards executing
 }
 
 // CQSchedulerConfig holds configuration for the CQ scheduler
 type CQSchedulerConfig struct {
 	CQHandler     *api.ContinuousQueryHandler
 	LicenseClient *license.Client
+	ClusterGate   CQClusterGate // nil = standalone, no gate
 	Logger        zerolog.Logger
 }
 
@@ -43,6 +55,7 @@ func NewCQScheduler(cfg *CQSchedulerConfig) (*CQScheduler, error) {
 	s := &CQScheduler{
 		cqHandler:     cfg.CQHandler,
 		licenseClient: cfg.LicenseClient,
+		clusterGate:   cfg.ClusterGate,
 		jobs:          make(map[int64]*cqJob),
 		stopCh:        make(chan struct{}),
 		logger:        cfg.Logger.With().Str("component", "cq-scheduler").Logger(),
@@ -244,7 +257,36 @@ func (s *CQScheduler) runJob(job *cqJob) {
 				continue
 			}
 
+			// Cluster gate: checked on every tick so role transitions (failover,
+			// demotion) take effect without a restart. clusterGate is immutable
+			// after construction so no lock is needed here.
+			if s.clusterGate != nil && !s.clusterGate.IsPrimaryWriter() {
+				s.logger.Debug().
+					Str("role", s.clusterGate.Role()).
+					Int64("cq_id", job.cqID).
+					Str("cq_name", job.cqName).
+					Msg("CQ tick skipped: node is not primary writer")
+				continue
+			}
+
+			// Overlap guard: skip this tick if the previous execution is still running.
+			job.executeMu.Lock()
+			if job.executing {
+				job.executeMu.Unlock()
+				s.logger.Warn().
+					Int64("cq_id", job.cqID).
+					Str("cq_name", job.cqName).
+					Msg("CQ tick skipped: previous execution still running")
+				continue
+			}
+			job.executing = true
+			job.executeMu.Unlock()
+
 			s.executeJob(job)
+
+			job.executeMu.Lock()
+			job.executing = false
+			job.executeMu.Unlock()
 		case <-job.stopCh:
 			return
 		}
