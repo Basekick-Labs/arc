@@ -139,6 +139,24 @@ The CompletionWatcher now applies all RegisterFile and DeleteFile operations for
 
 ## Hardening
 
+### Ingestion Pipeline Hardening and Performance
+
+A focused audit and optimization pass across all three ingestion paths (MessagePack columnar, MessagePack row, and Line Protocol) produced the following improvements:
+
+**Reliability**
+
+- **Multi-hour flush atomicity**: When a write spans multiple hour buckets, tiering metadata and the Raft cluster manifest are now updated only after all Parquet files have been successfully written to storage. Previously, the manifest could be updated for completed hours even if a later hour's write failed, requiring manual reconciliation. The fix uses a collect-then-register pattern — all hour buckets write first, then all registrations proceed.
+- **WAL error observability**: WAL write failures (disk full, permission errors) were already logged at ERROR level but were not counted. A new `total_wal_errors` counter is now exposed in the stats endpoint so operators can alert on WAL degradation without grepping logs.
+- **Line protocol timestamp validation**: The parser now enforces upper and lower bounds on raw timestamp values before applying precision multipliers (`ms`, `s`). Values that would overflow `int64` after multiplication are replaced with the server's current time, preventing silently mis-timestamped records in edge cases. Pre-epoch (negative) timestamps remain valid and pass through unchanged.
+- **Validity bitmap contract honored across sort, slice, and merge**: `TypedColumnBatch` documents that a `nil` validity entry for a column means "all values valid". Three paths that reorder or combine batches (`sortTypedColumnBatchByKeys`, `sliceTypedColumnBatchByIndices`, `mergeBatches`) now preserve this semantic — previously a `nil` entry could be silently converted to all-null, or cause an index-out-of-range panic if an external caller provided one. All internal producers already avoid the pattern, so no live workload was affected, but the code is now robust against third-party batch construction.
+
+**Performance**
+
+- **Column signature caching and type-aware detection**: Schema change detection previously recomputed a sorted, joined column name string on every write. The signature is now computed once when the typed column batch is constructed and cached as a field, so hot-path schema checks are a field read with zero allocation. The signature also encodes each column's Go type (`i64`, `f64`, `str`, `bool`, `dec`), so a type change on the same column name (e.g. `int64`→`float64`) is now detected as schema evolution and triggers a flush before the new-schema data is appended.
+- **Pre-built Parquet writer properties**: `parquet.WriterProperties` and `pqarrow.ArrowWriterProperties` were reconstructed on every Parquet flush. These are stateless configuration objects that cannot change after startup and are now built once in `NewArrowWriter` and reused across all flushes.
+- **Sort permutation reuse**: `sortTypedColumnBatchByKeys` previously sorted the main column data and then sorted again to reorder validity bitmaps. It now computes the permutation index once from the first sort pass and applies it directly to validity bitmaps, eliminating the duplicate sort.
+- **`mergeBatches` value types**: The `colInfo` structs in `mergeBatches` were heap-allocated as pointers. Changed to value semantics (`map[string]colInfo`), removing per-column heap allocation during batch merges.
+
 ### Directory Permissions
 
 Directories containing sensitive data (auth database, continuous query definitions, retention policies, Raft consensus state, telemetry, and import output) now use 0700 (owner-only) permissions, consistent with WAL and local storage directories.

@@ -14,6 +14,7 @@ package ingest
 
 import (
 	"bytes"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -107,15 +108,28 @@ func (p *LineProtocolParser) parseLineWithPrecision(line []byte, precision strin
 		if err != nil {
 			timestamp = time.Now().UnixMicro()
 		} else {
+			// Guard against multiplication overflow for ms and s precisions.
+			// strconv.ParseInt already returns ErrRange (handled above) for values
+			// outside [MinInt64, MaxInt64], so rawTs is always a valid int64 here.
+			// Negative timestamps are valid Line Protocol (pre-epoch dates).
+			// us and ns need no guard: us is stored as-is, ns is divided (never overflows).
 			switch precision {
 			case "us":
 				timestamp = rawTs
 			case "ms":
-				timestamp = rawTs * 1000
+				if rawTs <= math.MaxInt64/1000 && rawTs >= math.MinInt64/1000 {
+					timestamp = rawTs * 1000
+				} else {
+					timestamp = time.Now().UnixMicro()
+				}
 			case "s":
-				timestamp = rawTs * 1_000_000
-			default:
-				timestamp = rawTs / 1000 // ns → μs (fallback)
+				if rawTs <= math.MaxInt64/1_000_000 && rawTs >= math.MinInt64/1_000_000 {
+					timestamp = rawTs * 1_000_000
+				} else {
+					timestamp = time.Now().UnixMicro()
+				}
+			default: // ns → μs
+				timestamp = rawTs / 1000
 			}
 		}
 	} else {

@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"testing"
+	"time"
 )
 
 func TestLineProtocolParser_ParseLine_Basic(t *testing.T) {
@@ -361,6 +362,95 @@ func TestLineProtocolParser_ParseTimestamp(t *testing.T) {
 
 			if record.Timestamp != tt.wantMicro {
 				t.Errorf("timestamp: got %d, want %d", record.Timestamp, tt.wantMicro)
+			}
+		})
+	}
+}
+
+// TestLineProtocolParser_ParseTimestamp_Precisions exercises the precision-aware
+// parse path, including overflow guards and pre-epoch (negative) timestamps.
+func TestLineProtocolParser_ParseTimestamp_Precisions(t *testing.T) {
+	parser := NewLineProtocolParser()
+
+	tests := []struct {
+		name      string
+		input     string
+		precision string
+		wantMicro int64 // 0 sentinel = "approximately server time"
+		useServer bool  // if true, wantMicro is ignored; just verify it's "recent"
+	}{
+		{
+			name:      "us precision passes through",
+			input:     "test value=1 1609459200000000",
+			precision: "us",
+			wantMicro: 1609459200000000,
+		},
+		{
+			name:      "ms precision multiplies by 1000",
+			input:     "test value=1 1609459200000",
+			precision: "ms",
+			wantMicro: 1609459200000000,
+		},
+		{
+			name:      "s precision multiplies by 1_000_000",
+			input:     "test value=1 1609459200",
+			precision: "s",
+			wantMicro: 1609459200000000,
+		},
+		{
+			name:      "negative ns timestamp preserved (pre-epoch)",
+			input:     "test value=1 -1000000000",
+			precision: "ns",
+			wantMicro: -1000000, // -1s in µs
+		},
+		{
+			name:      "negative us timestamp preserved",
+			input:     "test value=1 -1000000",
+			precision: "us",
+			wantMicro: -1000000,
+		},
+		{
+			name:      "negative ms timestamp preserved",
+			input:     "test value=1 -1000",
+			precision: "ms",
+			wantMicro: -1000000,
+		},
+		{
+			name:      "s overflow falls back to server time",
+			input:     "test value=1 10000000000000", // 10^13 s ≫ safe bound
+			precision: "s",
+			useServer: true,
+		},
+		{
+			name:      "ms overflow falls back to server time",
+			input:     "test value=1 10000000000000000000", // 10^19 ms ≫ safe bound; parse errors anyway
+			precision: "ms",
+			useServer: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			batch := parser.ParseBatchWithPrecision([]byte(tt.input), tt.precision)
+			if len(batch) != 1 {
+				t.Fatalf("expected 1 record, got %d", len(batch))
+			}
+			got := batch[0].Timestamp
+
+			if tt.useServer {
+				now := time.Now().UnixMicro()
+				delta := now - got
+				if delta < 0 {
+					delta = -delta
+				}
+				// Allow 10s skew to be safe in CI
+				if delta > 10_000_000 {
+					t.Errorf("expected server-time fallback near now=%d, got %d (delta %d µs)", now, got, delta)
+				}
+			} else {
+				if got != tt.wantMicro {
+					t.Errorf("timestamp: got %d, want %d", got, tt.wantMicro)
+				}
 			}
 		})
 	}
