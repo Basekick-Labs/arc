@@ -800,6 +800,7 @@ type ArrowBuffer struct {
 func getColumnSignature(columns map[string]interface{}) string {
 	type colEntry struct{ name, typ string }
 	entries := make([]colEntry, 0, len(columns))
+	size := -1 // will add 1 per comma; starts at -1 so the first entry adds 0 commas
 	for name, val := range columns {
 		if len(name) > 0 && name[0] == '_' {
 			continue // skip internal columns
@@ -820,16 +821,12 @@ func getColumnSignature(columns map[string]interface{}) string {
 			typ = "unk"
 		}
 		entries = append(entries, colEntry{name, typ})
+		size += 1 + len(name) + 1 + len(typ) // comma + name + colon + typ
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
 	if len(entries) == 0 {
 		return ""
 	}
-	// Pre-compute exact capacity to avoid Builder growth re-allocations.
-	size := len(entries) - 1 // commas between entries
-	for _, e := range entries {
-		size += len(e.name) + 1 + len(e.typ) // "name:typ"
-	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
 	var sb strings.Builder
 	sb.Grow(size)
 	for i, e := range entries {
@@ -1342,6 +1339,9 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 
 	// Column signature for schema evolution detection (pre-computed in convertColumnsToTyped)
 	newSignature := typedColumns.Signature
+	if newSignature == "" && len(typedColumns.Data) > 0 {
+		newSignature = getColumnSignature(typedColumns.Data)
+	}
 
 	// OPTIMIZATION: Get shard for this buffer key (lock sharding)
 	shard := b.getShard(bufferKey)
@@ -1496,6 +1496,9 @@ func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, 
 
 	// Column signature for schema evolution detection (pre-computed in convertColumnsToTyped)
 	newSignature := typedColumns.Signature
+	if newSignature == "" && len(typedColumns.Data) > 0 {
+		newSignature = getColumnSignature(typedColumns.Data)
+	}
 
 	// Get shard for this buffer key (lock sharding)
 	shard := b.getShard(bufferKey)
