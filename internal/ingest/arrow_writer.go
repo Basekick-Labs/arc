@@ -802,8 +802,8 @@ func getColumnSignature(columns map[string]interface{}) string {
 	entries := make([]colEntry, 0, len(columns))
 	size := -1 // will add 1 per comma; starts at -1 so the first entry adds 0 commas
 	for name, val := range columns {
-		if len(name) > 0 && name[0] == '_' {
-			continue // skip internal columns
+		if len(name) == 0 || name[0] == '_' {
+			continue // skip empty and internal columns
 		}
 		var typ string
 		switch val.(type) {

@@ -624,6 +624,14 @@ func TestGetColumnSignature(t *testing.T) {
 			expected: "time:i64,value:f64",
 		},
 		{
+			name: "skips empty column names",
+			columns: map[string]interface{}{
+				"value": []float64{1.0},
+				"":      []int64{1},
+			},
+			expected: "value:f64",
+		},
+		{
 			name: "type change detected — same name different type",
 			columns: map[string]interface{}{
 				"cpu": []float64{1.0},
