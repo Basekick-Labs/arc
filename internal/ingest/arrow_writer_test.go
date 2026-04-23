@@ -601,27 +601,34 @@ func TestGetColumnSignature(t *testing.T) {
 		{
 			name: "single column",
 			columns: map[string]interface{}{
-				"value": nil,
+				"value": []float64{1.0},
 			},
-			expected: "value",
+			expected: "value:f64",
 		},
 		{
 			name: "multiple columns sorted",
 			columns: map[string]interface{}{
-				"zebra": nil,
-				"apple": nil,
-				"mango": nil,
+				"zebra": []string{"a"},
+				"apple": []int64{1},
+				"mango": []float64{1.0},
 			},
-			expected: "apple,mango,zebra",
+			expected: "apple:i64,mango:f64,zebra:str",
 		},
 		{
 			name: "skips internal columns",
 			columns: map[string]interface{}{
-				"value":   nil,
-				"time":    nil,
-				"_hidden": nil,
+				"value":   []float64{1.0},
+				"time":    []int64{1},
+				"_hidden": []string{"x"},
 			},
-			expected: "time,value",
+			expected: "time:i64,value:f64",
+		},
+		{
+			name: "type change detected — same name different type",
+			columns: map[string]interface{}{
+				"cpu": []float64{1.0},
+			},
+			expected: "cpu:f64",
 		},
 	}
 
@@ -633,6 +640,15 @@ func TestGetColumnSignature(t *testing.T) {
 			}
 		})
 	}
+
+	// Verify that a type change on the same column name produces a different signature
+	t.Run("type change produces different signature", func(t *testing.T) {
+		sig1 := getColumnSignature(map[string]interface{}{"cpu": []int64{1}})
+		sig2 := getColumnSignature(map[string]interface{}{"cpu": []float64{1.0}})
+		if sig1 == sig2 {
+			t.Errorf("Expected different signatures for int64 vs float64, both got %q", sig1)
+		}
+	})
 }
 
 // BenchmarkRowsToColumnar benchmarks the row-to-columnar conversion

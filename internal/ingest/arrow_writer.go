@@ -793,17 +793,40 @@ type ArrowBuffer struct {
 	logger zerolog.Logger
 }
 
-// getColumnSignature returns a sorted string of column names for schema comparison.
-// Used to detect schema evolution when columns appear/disappear between batches.
+// getColumnSignature returns a sorted string of "name:type" pairs for schema comparison.
+// Encodes both column names and their Go slice types so that a type change (e.g.
+// int64→float64 on the same column) is detected as schema evolution and triggers a
+// flush before the new-schema data is appended.
 func getColumnSignature(columns map[string]interface{}) string {
-	names := make([]string, 0, len(columns))
-	for name := range columns {
-		if len(name) > 0 && name[0] != '_' { // Skip internal columns
-			names = append(names, name)
+	type colEntry struct{ name, typ string }
+	entries := make([]colEntry, 0, len(columns))
+	for name, val := range columns {
+		if len(name) > 0 && name[0] == '_' {
+			continue // skip internal columns
 		}
+		var typ string
+		switch val.(type) {
+		case []int64:
+			typ = "i64"
+		case []float64:
+			typ = "f64"
+		case []string:
+			typ = "str"
+		case []bool:
+			typ = "bool"
+		case []decimal128.Num:
+			typ = "dec"
+		default:
+			typ = "unk"
+		}
+		entries = append(entries, colEntry{name, typ})
 	}
-	sort.Strings(names)
-	return strings.Join(names, ",")
+	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
+	parts := make([]string, len(entries))
+	for i, e := range entries {
+		parts[i] = e.name + ":" + e.typ
+	}
+	return strings.Join(parts, ",")
 }
 
 // getShard returns the shard for a given buffer key using FNV-1a hash

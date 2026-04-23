@@ -107,36 +107,30 @@ func (p *LineProtocolParser) parseLineWithPrecision(line []byte, precision strin
 		if err != nil {
 			timestamp = time.Now().UnixMicro()
 		} else {
-			// Guard against silent overflow: a multiplied timestamp must not wrap.
-			// maxInt64 / multiplier is the largest safe rawTs for each precision.
-			// Negative timestamps are also rejected (strconv.ParseInt can return
-			// negative for large unsigned values that exceed math.MaxInt64).
+			// Guard against multiplication overflow for ms and s precisions.
+			// strconv.ParseInt already returns ErrRange (handled above) for values
+			// outside [MinInt64, MaxInt64], so rawTs is always a valid int64 here.
+			// Negative timestamps are valid Line Protocol (pre-epoch dates).
+			// us and ns need no guard: us is stored as-is, ns is divided (never overflows).
 			const maxInt64 = int64(1<<63 - 1)
+			const minInt64 = int64(-1 << 63)
 			switch precision {
 			case "us":
-				if rawTs >= 0 {
-					timestamp = rawTs
-				} else {
-					timestamp = time.Now().UnixMicro()
-				}
+				timestamp = rawTs
 			case "ms":
-				if rawTs >= 0 && rawTs <= maxInt64/1000 {
+				if rawTs <= maxInt64/1000 && rawTs >= minInt64/1000 {
 					timestamp = rawTs * 1000
 				} else {
 					timestamp = time.Now().UnixMicro()
 				}
 			case "s":
-				if rawTs >= 0 && rawTs <= maxInt64/1_000_000 {
+				if rawTs <= maxInt64/1_000_000 && rawTs >= minInt64/1_000_000 {
 					timestamp = rawTs * 1_000_000
 				} else {
 					timestamp = time.Now().UnixMicro()
 				}
 			default: // ns → μs
-				if rawTs >= 0 {
-					timestamp = rawTs / 1000
-				} else {
-					timestamp = time.Now().UnixMicro()
-				}
+				timestamp = rawTs / 1000
 			}
 		}
 	} else {
@@ -391,15 +385,12 @@ func BatchToColumnar(records []*models.Record) map[string]*models.ColumnarRecord
 		allTags := make(map[string]struct{})
 
 		for _, record := range measurementRecords {
-			// Build a per-record tag set once to avoid repeated map lookups below.
-			tagSet := make(map[string]struct{}, len(record.Tags))
 			for key := range record.Tags {
 				columns[key] = true
 				allTags[key] = struct{}{}
-				tagSet[key] = struct{}{}
 			}
 			for key := range record.Fields {
-				if _, hasTag := tagSet[key]; hasTag {
+				if _, hasTag := record.Tags[key]; hasTag {
 					columns[key+"_value"] = true
 				} else {
 					columns[key] = true
@@ -417,15 +408,12 @@ func BatchToColumnar(records []*models.Record) map[string]*models.ColumnarRecord
 		for i, record := range measurementRecords {
 			columnarData["time"][i] = record.Timestamp
 
-			// Build per-record tag set once for the field-conflict check below.
-			tagSet := make(map[string]struct{}, len(record.Tags))
 			for key, value := range record.Tags {
 				columnarData[key][i] = value
-				tagSet[key] = struct{}{}
 			}
 
 			for key, value := range record.Fields {
-				if _, hasTag := tagSet[key]; hasTag {
+				if _, hasTag := record.Tags[key]; hasTag {
 					columnarData[key+"_value"][i] = value
 				} else {
 					columnarData[key][i] = value
