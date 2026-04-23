@@ -822,11 +822,25 @@ func getColumnSignature(columns map[string]interface{}) string {
 		entries = append(entries, colEntry{name, typ})
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
-	parts := make([]string, len(entries))
-	for i, e := range entries {
-		parts[i] = e.name + ":" + e.typ
+	if len(entries) == 0 {
+		return ""
 	}
-	return strings.Join(parts, ",")
+	// Pre-compute exact capacity to avoid Builder growth re-allocations.
+	size := len(entries) - 1 // commas between entries
+	for _, e := range entries {
+		size += len(e.name) + 1 + len(e.typ) // "name:typ"
+	}
+	var sb strings.Builder
+	sb.Grow(size)
+	for i, e := range entries {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(e.name)
+		sb.WriteByte(':')
+		sb.WriteString(e.typ)
+	}
+	return sb.String()
 }
 
 // getShard returns the shard for a given buffer key using FNV-1a hash
