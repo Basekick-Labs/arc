@@ -43,6 +43,11 @@ var sharedArrowAllocator = memory.NewGoAllocator()
 // int64SliceToTimestamps converts []int64 to []arrow.Timestamp without allocation.
 // This is safe because arrow.Timestamp is defined as `type Timestamp int64`.
 // The conversion is a simple reinterpretation of the slice header.
+// int64SliceToTimestamps reinterprets a []int64 as []arrow.Timestamp without copying.
+// Safe because arrow.Timestamp is defined as `type Timestamp int64` (identical layout).
+// LIFETIME: the caller must ensure src is not GC'd or reallocated while the returned
+// slice or any Arrow array/builder built from it is still alive. Use only within the
+// same stack frame as src.
 func int64SliceToTimestamps(src []int64) []arrow.Timestamp {
 	return *(*[]arrow.Timestamp)(unsafe.Pointer(&src))
 }
@@ -193,6 +198,10 @@ type ArrowWriter struct {
 	writeStatistics bool
 	dataPageVersion string
 
+	// Pre-built Parquet writer properties (immutable after construction)
+	writerProps *parquet.WriterProperties
+	arrowProps  pqarrow.ArrowWriterProperties
+
 	// LRU Schema cache (measurement -> schema) with bounded size
 	schemaCache *schemaLRUCache
 
@@ -218,11 +227,24 @@ func NewArrowWriter(cfg *config.IngestConfig, logger zerolog.Logger) *ArrowWrite
 	// Most deployments have <100 unique measurement/schema combinations
 	const schemaCacheCapacity = 1000
 
+	// Pre-build Parquet writer properties once — they are immutable config objects
+	// that do not change after startup. Rebuilding them on every flush wastes CPU.
+	writerOpts := []parquet.WriterProperty{
+		parquet.WithCompression(comp),
+		parquet.WithDictionaryDefault(cfg.UseDictionary),
+		parquet.WithStats(cfg.WriteStatistics),
+	}
+	if cfg.DataPageVersion == "2.0" {
+		writerOpts = append(writerOpts, parquet.WithDataPageVersion(parquet.DataPageV2))
+	}
+
 	return &ArrowWriter{
 		compression:     comp,
 		useDictionary:   cfg.UseDictionary,
 		writeStatistics: cfg.WriteStatistics,
 		dataPageVersion: cfg.DataPageVersion,
+		writerProps:     parquet.NewWriterProperties(writerOpts...),
+		arrowProps:      pqarrow.NewArrowWriterProperties(pqarrow.WithStoreSchema()),
 		schemaCache:     newSchemaLRUCache(schemaCacheCapacity),
 		logger:          logger.With().Str("component", "arrow-writer").Logger(),
 	}
@@ -624,26 +646,12 @@ func (w *ArrowWriter) writeRecordToParquet(schema *arrow.Schema, arrays []arrow.
 	// Write to Parquet
 	var buf bytes.Buffer
 
-	// Configure Parquet writer properties (built once with all options)
-	writerOpts := []parquet.WriterProperty{
-		parquet.WithCompression(w.compression),
-		parquet.WithDictionaryDefault(w.useDictionary),
-		parquet.WithStats(w.writeStatistics),
-	}
-	if w.dataPageVersion == "2.0" {
-		writerOpts = append(writerOpts, parquet.WithDataPageVersion(parquet.DataPageV2))
-	}
-	writerProps := parquet.NewWriterProperties(writerOpts...)
-
-	// Create Arrow writer properties
-	arrowProps := pqarrow.NewArrowWriterProperties(pqarrow.WithStoreSchema())
-
-	// Create Parquet writer
+	// Use pre-built writer properties (constructed once at startup, immutable)
 	writer, err := pqarrow.NewFileWriter(
 		schema,
 		&buf,
-		writerProps,
-		arrowProps,
+		w.writerProps,
+		w.arrowProps,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Parquet writer: %w", err)
@@ -677,6 +685,7 @@ type TypedColumnBatch struct {
 	Data       map[string]interface{} // typed arrays ([]int64, []float64, []string, []bool)
 	Validity   map[string][]bool      // per-column null bitmap; nil entry = all valid
 	TagColumns []string               // tag column names (for Parquet metadata, enables auto-dedup)
+	Signature  string                 // sorted column-name string; cached to avoid per-write recomputation
 }
 
 type bufferShard struct {
@@ -773,6 +782,7 @@ type ArrowBuffer struct {
 	totalRecordsWritten  atomic.Int64
 	totalFlushes         atomic.Int64
 	totalErrors          atomic.Int64
+	totalWALErrors       atomic.Int64 // WAL write failures; data still buffered but not durable
 	queueDepth           atomic.Int64 // Current flush queue depth
 
 	// Flush failure tracking for WAL maintenance.
@@ -1258,7 +1268,9 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 		// ZERO-COPY PATH: Use raw msgpack bytes if available (avoids re-serialization)
 		if len(record.RawPayload) > 0 {
 			if err := b.wal.AppendRawWithMeta(database, record.RawPayload); err != nil {
-				// Log error but don't fail the write - WAL is for durability, not correctness
+				// Don't fail the write — WAL is for durability, not correctness.
+				// Increment metric so operators can alert on sustained WAL failures.
+				b.totalWALErrors.Add(1)
 				b.logger.Error().Err(err).
 					Str("database", database).
 					Str("measurement", record.Measurement).
@@ -1271,6 +1283,7 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 			walRecords := b.columnarToWALRecords(database, record)
 			if len(walRecords) > 0 {
 				if err := b.wal.Append(walRecords); err != nil {
+					b.totalWALErrors.Add(1)
 					b.logger.Error().Err(err).
 						Str("database", database).
 						Str("measurement", record.Measurement).
@@ -1290,8 +1303,8 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 	// Propagate tag column names for Parquet metadata (enables auto-dedup in compaction)
 	typedColumns.TagColumns = record.TagColumns
 
-	// Get column signature for schema evolution detection
-	newSignature := getColumnSignature(typedColumns.Data)
+	// Column signature for schema evolution detection (pre-computed in convertColumnsToTyped)
+	newSignature := typedColumns.Signature
 
 	// OPTIMIZATION: Get shard for this buffer key (lock sharding)
 	shard := b.getShard(bufferKey)
@@ -1444,8 +1457,8 @@ func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, 
 		}
 	}
 
-	// Column signature for schema evolution detection
-	newSignature := getColumnSignature(typedColumns.Data)
+	// Column signature for schema evolution detection (pre-computed in convertColumnsToTyped)
+	newSignature := typedColumns.Signature
 
 	// Get shard for this buffer key (lock sharding)
 	shard := b.getShard(bufferKey)
@@ -1758,7 +1771,7 @@ func (b *ArrowBuffer) convertColumnsToTyped(measurement string, columns map[stri
 		}
 	}
 
-	batch := &TypedColumnBatch{Data: typed, Validity: validity}
+	batch := &TypedColumnBatch{Data: typed, Validity: validity, Signature: getColumnSignature(typed)}
 	return batch, numRecords, nil
 }
 
@@ -1828,25 +1841,26 @@ func convertToDecimal128Slice(col []interface{}, precision, scale int32) ([]deci
 
 // ZERO-COPY HELPERS: Try bulk type assertion for homogeneous arrays
 
-// tryInt64ZeroCopy attempts zero-copy conversion for int64 arrays
-// OPTIMIZATION: Single-pass check + conversion to reduce CPU cache thrashing
+// tryInt64ZeroCopy attempts zero-copy conversion for homogeneous int64 arrays.
+// Single-pass: allocates and fills in one scan. Returns nil on first nil/type-mismatch,
+// paying only the GC cost of discarding the partial allocation — which is rare in practice.
 func (b *ArrowBuffer) tryInt64ZeroCopy(col []interface{}) ([]int64, bool) {
 	arr := make([]int64, len(col))
 	for i, v := range col {
 		if v == nil {
-			return nil, false // Has nils, need element-by-element
+			return nil, false
 		}
 		val, ok := v.(int64)
 		if !ok {
-			return nil, false // Mixed types, need conversion
+			return nil, false
 		}
 		arr[i] = val
 	}
 	return arr, true
 }
 
-// tryFloat64ZeroCopy attempts zero-copy conversion for float64 arrays
-// OPTIMIZATION: Single-pass check + conversion to reduce CPU cache thrashing
+// tryFloat64ZeroCopy attempts zero-copy conversion for homogeneous float64 arrays.
+// Single-pass: allocates and fills in one scan.
 func (b *ArrowBuffer) tryFloat64ZeroCopy(col []interface{}) ([]float64, bool) {
 	arr := make([]float64, len(col))
 	for i, v := range col {
@@ -1862,8 +1876,8 @@ func (b *ArrowBuffer) tryFloat64ZeroCopy(col []interface{}) ([]float64, bool) {
 	return arr, true
 }
 
-// tryStringZeroCopy attempts zero-copy conversion for string arrays
-// OPTIMIZATION: Single-pass check + conversion to reduce CPU cache thrashing
+// tryStringZeroCopy attempts zero-copy conversion for homogeneous string arrays.
+// Single-pass: allocates and fills in one scan.
 func (b *ArrowBuffer) tryStringZeroCopy(col []interface{}) ([]string, bool) {
 	arr := make([]string, len(col))
 	for i, v := range col {
@@ -1879,8 +1893,8 @@ func (b *ArrowBuffer) tryStringZeroCopy(col []interface{}) ([]string, bool) {
 	return arr, true
 }
 
-// tryBoolZeroCopy attempts zero-copy conversion for bool arrays
-// OPTIMIZATION: Single-pass check + conversion to reduce CPU cache thrashing
+// tryBoolZeroCopy attempts zero-copy conversion for homogeneous bool arrays.
+// Single-pass: allocates and fills in one scan.
 func (b *ArrowBuffer) tryBoolZeroCopy(col []interface{}) ([]bool, bool) {
 	arr := make([]bool, len(col))
 	for i, v := range col {
@@ -2188,8 +2202,19 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		Int("total_records", recordCount).
 		Msg("Splitting batch across multiple hour partitions")
 
-	// Write one file per hour
-	totalWritten := 0
+	// Collect registration entries after all storage writes succeed.
+	// registerFileInTiering is called only after every hour's storage.Write succeeds
+	// to avoid leaving stale manifest entries when a later hour fails — WAL replay
+	// would otherwise create a duplicate file for the already-registered hour.
+	type tieringEntry struct {
+		storagePath string
+		bucketTime  time.Time
+		sizeBytes   int64
+		sha256Hex   string
+		records     int
+	}
+	written := make([]tieringEntry, 0, len(hourBuckets))
+
 	for hourID, bucket := range hourBuckets {
 		// Save count before clearing indices
 		splitRecordCount := len(bucket.indices)
@@ -2219,10 +2244,13 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 			return fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err)
 		}
 
-		// Register file in tiering metadata for query routing
-		b.registerFileInTiering(ctx, database, measurement, storagePath, bucketTime, int64(len(parquetData)), parquetSumHex)
-
-		totalWritten += splitRecordCount
+		written = append(written, tieringEntry{
+			storagePath: storagePath,
+			bucketTime:  bucketTime,
+			sizeBytes:   int64(len(parquetData)),
+			sha256Hex:   parquetSumHex,
+			records:     splitRecordCount,
+		})
 
 		b.logger.Info().
 			Str("buffer_key", bufferKey).
@@ -2231,6 +2259,13 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 			Int("records", splitRecordCount).
 			Int("size_bytes", len(parquetData)).
 			Msg("Wrote hour partition")
+	}
+
+	// All hours written successfully — now register in tiering and cluster manifest.
+	totalWritten := 0
+	for _, e := range written {
+		b.registerFileInTiering(ctx, database, measurement, e.storagePath, e.bucketTime, e.sizeBytes, e.sha256Hex)
+		totalWritten += e.records
 	}
 
 	b.totalRecordsWritten.Add(int64(totalWritten))
@@ -2333,9 +2368,9 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 
 	// PHASE 1: Calculate total rows from time column and collect column type info
 	type colInfo struct {
-		colType string // "int64", "float64", "string", "bool"
+		colType string // "int64", "float64", "string", "bool", "decimal128"
 	}
-	colTypes := make(map[string]*colInfo)
+	colTypes := make(map[string]colInfo)
 	totalRows := 0
 
 	// Track which columns have validity bitmaps and which batches have which columns
@@ -2369,23 +2404,23 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 
 		// Collect column types
 		for name, col := range cols {
-			if colTypes[name] == nil {
-				info := &colInfo{}
+			if _, seen := colTypes[name]; !seen {
+				var ct string
 				switch col.(type) {
 				case []int64:
-					info.colType = "int64"
+					ct = "int64"
 				case []float64:
-					info.colType = "float64"
+					ct = "float64"
 				case []string:
-					info.colType = "string"
+					ct = "string"
 				case []bool:
-					info.colType = "bool"
+					ct = "bool"
 				case []decimal128.Num:
-					info.colType = "decimal128"
+					ct = "decimal128"
 				default:
 					return nil, fmt.Errorf("unsupported column type: %T", col)
 				}
-				colTypes[name] = info
+				colTypes[name] = colInfo{colType: ct}
 			}
 		}
 	}
@@ -2537,13 +2572,22 @@ func sortColumnsByTime(columns map[string]interface{}) (map[string]interface{}, 
 // sortColumnsByKeys sorts columns by multiple keys (e.g., sensor_id, then time)
 // Returns the sorted columns and any error encountered
 func sortColumnsByKeys(columns map[string]interface{}, sortKeys []string) (map[string]interface{}, error) {
+	sorted, _, err := sortColumnsByKeysWithPermutation(columns, sortKeys)
+	return sorted, err
+}
+
+// sortColumnsByKeysWithPermutation sorts columns and returns the permutation indices used.
+// The permutation can be applied to validity bitmaps or other parallel arrays by the caller,
+// avoiding a second sort pass.
+func sortColumnsByKeysWithPermutation(columns map[string]interface{}, sortKeys []string) (map[string]interface{}, []int, error) {
 	if len(sortKeys) == 0 {
-		return nil, fmt.Errorf("no sort keys provided")
+		return nil, nil, fmt.Errorf("no sort keys provided")
 	}
 
 	// FAST PATH: Time-only sort (most common case) - avoid multi-key overhead
 	if len(sortKeys) == 1 && sortKeys[0] == "time" {
-		return sortColumnsByTimeOnly(columns)
+		sorted, indices, err := sortColumnsByTimeOnlyWithPermutation(columns)
+		return sorted, indices, err
 	}
 
 	// Validate all sort keys exist and cache column pointers
@@ -2551,7 +2595,7 @@ func sortColumnsByKeys(columns map[string]interface{}, sortKeys []string) (map[s
 	for i, key := range sortKeys {
 		col, exists := columns[key]
 		if !exists {
-			return nil, fmt.Errorf("sort key column not found: %s", key)
+			return nil, nil, fmt.Errorf("sort key column not found: %s", key)
 		}
 		cachedCols[i] = col
 	}
@@ -2577,7 +2621,7 @@ func sortColumnsByKeys(columns map[string]interface{}, sortKeys []string) (map[s
 	}
 
 	if n == 0 {
-		return columns, nil
+		return columns, nil, nil
 	}
 
 	// Create permutation indices [0, 1, 2, ..., n-1]
@@ -2597,25 +2641,32 @@ func sortColumnsByKeys(columns map[string]interface{}, sortKeys []string) (map[s
 		result[colName] = applyPermutation(colData, indices)
 	}
 
-	return result, nil
+	return result, indices, nil
 }
 
-// sortColumnsByTimeOnly is an optimized path for time-only sorting
-// Avoids the multi-key comparator overhead for the common case
+// sortColumnsByTimeOnly is an optimized path for time-only sorting.
+// Avoids the multi-key comparator overhead for the common case.
 func sortColumnsByTimeOnly(columns map[string]interface{}) (map[string]interface{}, error) {
+	sorted, _, err := sortColumnsByTimeOnlyWithPermutation(columns)
+	return sorted, err
+}
+
+// sortColumnsByTimeOnlyWithPermutation sorts by time and returns the permutation used.
+// Returns nil indices when data is already sorted (no permutation needed).
+func sortColumnsByTimeOnlyWithPermutation(columns map[string]interface{}) (map[string]interface{}, []int, error) {
 	timeCol, exists := columns["time"]
 	if !exists {
-		return nil, fmt.Errorf("time column not found")
+		return nil, nil, fmt.Errorf("time column not found")
 	}
 
 	times, ok := timeCol.([]int64)
 	if !ok {
-		return nil, fmt.Errorf("time column is not []int64")
+		return nil, nil, fmt.Errorf("time column is not []int64")
 	}
 
 	n := len(times)
 	if n == 0 {
-		return columns, nil
+		return columns, nil, nil
 	}
 
 	// FAST PATH: Check if already sorted (common case for time-series producers)
@@ -2628,7 +2679,7 @@ func sortColumnsByTimeOnly(columns map[string]interface{}) (map[string]interface
 		}
 	}
 	if alreadySorted {
-		return columns, nil // No work needed - data is already in time order
+		return columns, nil, nil // nil indices signals identity permutation
 	}
 
 	// Create permutation indices
@@ -2648,7 +2699,7 @@ func sortColumnsByTimeOnly(columns map[string]interface{}) (map[string]interface
 		result[colName] = applyPermutation(colData, indices)
 	}
 
-	return result, nil
+	return result, indices, nil
 }
 
 // compareMultiKeyCached compares two rows by multiple sort keys using cached column pointers
@@ -2748,98 +2799,30 @@ func applyPermutation(colData interface{}, indices []int) interface{} {
 
 // sortTypedColumnBatchByKeys sorts a TypedColumnBatch by the given keys,
 // keeping validity bitmaps aligned with the reordered data.
+// Uses the permutation returned by sortColumnsByKeysWithPermutation to avoid
+// a second sort pass when validity bitmaps need reordering.
 func sortTypedColumnBatchByKeys(batch *TypedColumnBatch, sortKeys []string) *TypedColumnBatch {
-	sorted, err := sortColumnsByKeys(batch.Data, sortKeys)
+	sorted, indices, err := sortColumnsByKeysWithPermutation(batch.Data, sortKeys)
 	if err != nil {
-		// sortColumnsByKeys only errors on missing sort key or empty keys,
-		// which shouldn't happen at this point. Return unsorted on error.
 		return batch
 	}
 
-	if batch.Validity == nil {
-		return &TypedColumnBatch{Data: sorted, Validity: nil, TagColumns: batch.TagColumns}
+	// nil indices means data was already sorted — no permutation needed
+	if indices == nil || batch.Validity == nil {
+		return &TypedColumnBatch{Data: sorted, Validity: batch.Validity, TagColumns: batch.TagColumns, Signature: batch.Signature}
 	}
 
-	// The sort produced a permutation — we need to apply the same permutation to validity.
-	// sortColumnsByKeys uses applyPermutation internally via indices.
-	// We need to derive the same permutation to reorder validity.
-	// Since sortColumnsByKeys returns already-permuted data, we recover the permutation
-	// by comparing the time column order.
-	//
-	// Optimization: extract the permutation directly by sorting indices ourselves.
-	// This duplicates the sort but avoids modifying sortColumnsByKeys's signature.
-
-	// Get row count
-	var n int
-	for _, col := range batch.Data {
-		switch c := col.(type) {
-		case []int64:
-			n = len(c)
-		case []float64:
-			n = len(c)
-		case []string:
-			n = len(c)
-		case []bool:
-			n = len(c)
-		case []decimal128.Num:
-			n = len(c)
-		}
-		if n > 0 {
-			break
-		}
-	}
-
-	if n == 0 {
-		return &TypedColumnBatch{Data: sorted, Validity: batch.Validity, TagColumns: batch.TagColumns}
-	}
-
-	// Build permutation indices (same logic as sortColumnsByKeys)
-	indices := make([]int, n)
-	for i := range indices {
-		indices[i] = i
-	}
-
-	// Sort indices by the same keys
-	if len(sortKeys) == 1 && sortKeys[0] == "time" {
-		if times, ok := batch.Data["time"].([]int64); ok {
-			// Check if already sorted
-			alreadySorted := true
-			for i := 1; i < n; i++ {
-				if times[i] < times[i-1] {
-					alreadySorted = false
-					break
-				}
-			}
-			if alreadySorted {
-				return &TypedColumnBatch{Data: sorted, Validity: batch.Validity, TagColumns: batch.TagColumns}
-			}
-			sort.Slice(indices, func(i, j int) bool {
-				return times[indices[i]] < times[indices[j]]
-			})
-		}
-	} else {
-		cachedCols := make([]interface{}, 0, len(sortKeys))
-		for _, key := range sortKeys {
-			if col, exists := batch.Data[key]; exists {
-				cachedCols = append(cachedCols, col)
-			}
-		}
-		sort.Slice(indices, func(i, j int) bool {
-			return compareMultiKeyCached(cachedCols, indices[i], indices[j])
-		})
-	}
-
-	// Apply permutation to validity bitmaps
+	// Apply the same permutation to validity bitmaps (no second sort)
 	sortedValidity := make(map[string][]bool, len(batch.Validity))
 	for name, valid := range batch.Validity {
-		newValid := make([]bool, n)
+		newValid := make([]bool, len(indices))
 		for i, idx := range indices {
 			newValid[i] = valid[idx]
 		}
 		sortedValidity[name] = newValid
 	}
 
-	return &TypedColumnBatch{Data: sorted, Validity: sortedValidity, TagColumns: batch.TagColumns}
+	return &TypedColumnBatch{Data: sorted, Validity: sortedValidity, TagColumns: batch.TagColumns, Signature: batch.Signature}
 }
 
 // sliceTypedColumnBatchByIndices extracts rows from a TypedColumnBatch by index list,
@@ -3143,6 +3126,7 @@ func (b *ArrowBuffer) GetStats() map[string]interface{} {
 		"total_records_written":  b.totalRecordsWritten.Load(),
 		"total_flushes":          b.totalFlushes.Load(),
 		"total_errors":           b.totalErrors.Load(),
+		"total_wal_errors":       b.totalWALErrors.Load(),
 		"active_buffers":         activeBuffers,
 		"flush_queue_depth":      b.queueDepth.Load(),
 		"flush_workers":          b.flushWorkers,
