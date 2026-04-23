@@ -890,3 +890,81 @@ func TestSliceColumnsByIndices_BoundsCheck(t *testing.T) {
 		}
 	}
 }
+
+// TestSortTypedColumnBatchByKeys_NilValidityEntry verifies that a nil validity entry
+// is preserved as nil per the TypedColumnBatch contract (nil = "all valid").
+// Without the nil guard, the reorder loop would panic with index out of range.
+func TestSortTypedColumnBatchByKeys_NilValidityEntry(t *testing.T) {
+	batch := &TypedColumnBatch{
+		Data: map[string]interface{}{
+			"time": []int64{3, 1, 2},
+			"val":  []float64{30.0, 10.0, 20.0},
+		},
+		Validity: map[string][]bool{
+			"val": nil, // contract: nil = all valid
+		},
+		TagColumns: []string{},
+		Signature:  "time:i64,val:f64",
+	}
+
+	sorted := sortTypedColumnBatchByKeys(batch, []string{"time"})
+
+	// Data should be sorted ascending
+	sortedTime := sorted.Data["time"].([]int64)
+	expected := []int64{1, 2, 3}
+	for i, v := range expected {
+		if sortedTime[i] != v {
+			t.Errorf("sorted time[%d] = %d, want %d", i, sortedTime[i], v)
+		}
+	}
+
+	// Validity entry for "val" must remain nil (not a zero-initialized false slice)
+	if got, ok := sorted.Validity["val"]; !ok {
+		t.Errorf("validity entry for 'val' missing")
+	} else if got != nil {
+		t.Errorf("validity entry for 'val' = %v, want nil (all-valid contract)", got)
+	}
+
+	// Signature should be preserved
+	if sorted.Signature != batch.Signature {
+		t.Errorf("signature = %q, want %q", sorted.Signature, batch.Signature)
+	}
+}
+
+// TestSliceTypedColumnBatchByIndices_NilValidityEntry verifies that a nil validity
+// entry is preserved as nil per the TypedColumnBatch contract. Without the nil
+// guard, the original loop would produce an all-false slice (meaning "all null"),
+// incorrectly converting valid data to null.
+func TestSliceTypedColumnBatchByIndices_NilValidityEntry(t *testing.T) {
+	batch := &TypedColumnBatch{
+		Data: map[string]interface{}{
+			"time": []int64{1, 2, 3, 4},
+			"val":  []float64{10.0, 20.0, 30.0, 40.0},
+		},
+		Validity: map[string][]bool{
+			"val": nil, // contract: nil = all valid
+		},
+		TagColumns: []string{},
+		Signature:  "time:i64,val:f64",
+	}
+
+	sliced := sliceTypedColumnBatchByIndices(batch, []int{0, 2})
+
+	// Data should be sliced to indices 0, 2
+	slicedTime := sliced.Data["time"].([]int64)
+	if len(slicedTime) != 2 || slicedTime[0] != 1 || slicedTime[1] != 3 {
+		t.Errorf("sliced time = %v, want [1 3]", slicedTime)
+	}
+
+	// Validity entry for "val" must remain nil
+	if got, ok := sliced.Validity["val"]; !ok {
+		t.Errorf("validity entry for 'val' missing")
+	} else if got != nil {
+		t.Errorf("validity entry for 'val' = %v, want nil (all-valid contract)", got)
+	}
+
+	// Signature should be preserved
+	if sliced.Signature != batch.Signature {
+		t.Errorf("signature = %q, want %q", sliced.Signature, batch.Signature)
+	}
+}

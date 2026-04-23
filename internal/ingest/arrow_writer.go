@@ -40,9 +40,6 @@ const (
 // Using a shared instance avoids allocator overhead per-write operation.
 var sharedArrowAllocator = memory.NewGoAllocator()
 
-// int64SliceToTimestamps converts []int64 to []arrow.Timestamp without allocation.
-// This is safe because arrow.Timestamp is defined as `type Timestamp int64`.
-// The conversion is a simple reinterpretation of the slice header.
 // int64SliceToTimestamps reinterprets a []int64 as []arrow.Timestamp without copying.
 // Safe because arrow.Timestamp is defined as `type Timestamp int64` (identical layout).
 // LIFETIME: the caller must ensure src is not GC'd or reallocated while the returned
@@ -1485,6 +1482,7 @@ func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, 
 		walRecords := typedBatchToWALRecords(database, measurement, typedColumns, numRecords, b.getDecimalColumns(measurement))
 		if len(walRecords) > 0 {
 			if err := b.wal.Append(walRecords); err != nil {
+				b.totalWALErrors.Add(1)
 				b.logger.Error().Err(err).
 					Str("database", database).
 					Str("measurement", measurement).
@@ -2548,11 +2546,13 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 			if needsValidity {
 				dest := mergedValidity[name][rowOffset : rowOffset+batchRows]
 				if batchValidity != nil {
-					if srcValid, ok := batchValidity[name]; ok {
+					srcValid, ok := batchValidity[name]
+					if ok && srcValid != nil {
 						// Batch has explicit validity for this column — copy it
 						copy(dest, srcValid)
 					} else {
-						// Batch has validity tracking but not for this column → all valid
+						// Either the column has no validity entry, or entry is nil
+						// (contract: nil entry = all valid). Either way: all valid.
 						for i := range dest {
 							dest[i] = true
 						}
@@ -2855,6 +2855,11 @@ func sortTypedColumnBatchByKeys(batch *TypedColumnBatch, sortKeys []string) *Typ
 	// Apply the same permutation to validity bitmaps (no second sort)
 	sortedValidity := make(map[string][]bool, len(batch.Validity))
 	for name, valid := range batch.Validity {
+		// Per TypedColumnBatch contract, a nil entry means "all valid" — preserve as nil.
+		if valid == nil {
+			sortedValidity[name] = nil
+			continue
+		}
 		newValid := make([]bool, len(indices))
 		for i, idx := range indices {
 			newValid[i] = valid[idx]
@@ -2871,11 +2876,16 @@ func sliceTypedColumnBatchByIndices(batch *TypedColumnBatch, indices []int) *Typ
 	slicedData := sliceColumnsByIndices(batch.Data, indices)
 
 	if batch.Validity == nil {
-		return &TypedColumnBatch{Data: slicedData, Validity: nil, TagColumns: batch.TagColumns}
+		return &TypedColumnBatch{Data: slicedData, Validity: nil, TagColumns: batch.TagColumns, Signature: batch.Signature}
 	}
 
 	slicedValidity := make(map[string][]bool, len(batch.Validity))
 	for name, valid := range batch.Validity {
+		// Per TypedColumnBatch contract, a nil entry means "all valid" — preserve as nil.
+		if valid == nil {
+			slicedValidity[name] = nil
+			continue
+		}
 		newValid := make([]bool, len(indices))
 		validLen := len(valid)
 		for i, idx := range indices {
@@ -2887,7 +2897,7 @@ func sliceTypedColumnBatchByIndices(batch *TypedColumnBatch, indices []int) *Typ
 		slicedValidity[name] = newValid
 	}
 
-	return &TypedColumnBatch{Data: slicedData, Validity: slicedValidity, TagColumns: batch.TagColumns}
+	return &TypedColumnBatch{Data: slicedData, Validity: slicedValidity, TagColumns: batch.TagColumns, Signature: batch.Signature}
 }
 
 // microPerHour is the number of microseconds in one hour (3600 * 1,000,000)
