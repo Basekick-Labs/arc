@@ -2,6 +2,7 @@ package reconciliation
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -9,6 +10,13 @@ import (
 	"github.com/robfig/cron/v3"
 	"github.com/rs/zerolog"
 )
+
+// cronParser is the single shared cron parser used to validate the
+// schedule string at construction and to compute the next run time
+// for status reporting. Sharing it across NewScheduler / Start /
+// nextRun avoids re-allocating an identical parser on every Status()
+// call (an API hot path).
+var cronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 
 // Scheduler wraps a Reconciler with cron + lifecycle + status, mirroring
 // internal/scheduler/retention_scheduler.go almost exactly. The split
@@ -21,10 +29,11 @@ import (
 // operators with the safety bridge enabled get report-only runs even on
 // the cron path.
 type Scheduler struct {
-	reconciler *Reconciler
-	schedule   string
-	cron       *cron.Cron
-	logger     zerolog.Logger
+	reconciler  *Reconciler
+	schedule    string
+	scheduleObj cron.Schedule // parsed once in NewScheduler; reused by Start + nextRun
+	cron        *cron.Cron
+	logger      zerolog.Logger
 
 	mu      sync.Mutex
 	running bool
@@ -41,7 +50,10 @@ type SchedulerConfig struct {
 }
 
 // NewScheduler constructs a scheduler. The reconciler is required; a
-// default cron schedule is filled in if the caller passes empty.
+// default cron schedule is filled in if the caller passes empty. The
+// parsed cron.Schedule is cached on the struct so Start and nextRun
+// don't re-parse on every call (Status() hits nextRun on every API
+// request).
 func NewScheduler(cfg SchedulerConfig) (*Scheduler, error) {
 	if cfg.Reconciler == nil {
 		return nil, fmt.Errorf("reconciliation: reconciler is required")
@@ -50,14 +62,15 @@ func NewScheduler(cfg SchedulerConfig) (*Scheduler, error) {
 	if schedule == "" {
 		schedule = "17 4 * * *"
 	}
-	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-	if _, err := parser.Parse(schedule); err != nil {
+	parsed, err := cronParser.Parse(schedule)
+	if err != nil {
 		return nil, fmt.Errorf("reconciliation: invalid cron schedule %q: %w", schedule, err)
 	}
 	return &Scheduler{
-		reconciler: cfg.Reconciler,
-		schedule:   schedule,
-		logger:     cfg.Logger.With().Str("component", "reconciliation-scheduler").Logger(),
+		reconciler:  cfg.Reconciler,
+		schedule:    schedule,
+		scheduleObj: parsed,
+		logger:      cfg.Logger.With().Str("component", "reconciliation-scheduler").Logger(),
 	}, nil
 }
 
@@ -76,9 +89,7 @@ func (s *Scheduler) Start() error {
 		return nil
 	}
 
-	s.cron = cron.New(cron.WithParser(cron.NewParser(
-		cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow,
-	)))
+	s.cron = cron.New(cron.WithParser(cronParser))
 	if _, err := s.cron.AddFunc(s.schedule, s.tick); err != nil {
 		return fmt.Errorf("reconciliation: add cron func: %w", err)
 	}
@@ -136,8 +147,11 @@ func (s *Scheduler) tick() {
 	_, err := s.reconciler.Reconcile(ctx, dryRun)
 	if err != nil {
 		// ErrAlreadyRunning is expected during long runs; ErrGated is
-		// expected on non-eligible nodes. Both are debug-level.
-		if err == ErrAlreadyRunning || err == ErrGated || err == ErrDisabled {
+		// expected on non-eligible nodes. Both are debug-level. Use
+		// errors.Is so a future code path that wraps these sentinels
+		// still classifies correctly — direct == comparison breaks
+		// silently the moment anyone wraps the sentinel.
+		if errors.Is(err, ErrAlreadyRunning) || errors.Is(err, ErrGated) || errors.Is(err, ErrDisabled) {
 			s.logger.Debug().Err(err).Msg("Reconciliation tick skipped")
 			return
 		}
@@ -203,11 +217,14 @@ func (s *Scheduler) Schedule() string { return s.schedule }
 // to surface lower-level state where the scheduler doesn't add value.
 func (s *Scheduler) Reconciler() *Reconciler { return s.reconciler }
 
+// nextRun returns the time of the next scheduled tick. Uses the
+// cached cron.Schedule parsed in NewScheduler — the previous
+// implementation re-parsed the cron expression on every call, which
+// was a hot-path waste because Status() (an authenticated API
+// endpoint) calls nextRun on every request.
 func (s *Scheduler) nextRun() time.Time {
-	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-	sched, err := parser.Parse(s.schedule)
-	if err != nil {
+	if s.scheduleObj == nil {
 		return time.Time{}
 	}
-	return sched.Next(time.Now())
+	return s.scheduleObj.Next(time.Now())
 }

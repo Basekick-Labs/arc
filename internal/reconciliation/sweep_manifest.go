@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
+	"strconv"
 	"sync"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
@@ -57,14 +57,14 @@ func (r *Reconciler) sweepOrphanManifest(
 		// Re-gate at every chunk boundary so a lost lease/leadership
 		// stops the run promptly without orphaning new manifest writes.
 		if r.gate != nil && !r.gate.ShouldRunManifestSweep() {
-			return fmt.Errorf("reconciliation: manifest sweep gate revoked mid-run")
+			return fmt.Errorf("manifest sweep: %w", ErrGateRevoked)
 		}
 		// Blast cap.
 		if run.ManifestDeletes+run.StorageDeletes >= r.cfg.MaxDeletesPerRun {
 			run.CapHit = true
 			r.emitAudit("reconcile.cap_hit", run, map[string]string{
 				"run_id":         run.ID,
-				"deletes_so_far": fmt.Sprintf("%d", run.ManifestDeletes+run.StorageDeletes),
+				"deletes_so_far": strconv.Itoa(run.ManifestDeletes + run.StorageDeletes),
 			})
 			r.logger.Warn().
 				Str("run_id", run.ID).
@@ -144,7 +144,28 @@ func (r *Reconciler) sweepOrphanManifest(
 				Msg("Reconciliation: storage.Exists failures during manifest sweep — affected files skipped (next run retries)")
 		}
 
+		// If len(ops)==0 we have no Raft work for this chunk (every file
+		// was recheck-skipped, errored, or marshal-failed). Apply the
+		// cap+audit BEFORE the skip, otherwise a chunk that only shrunk
+		// down via recheck-skip silently bypasses CapHit reporting and
+		// the reconciler keeps doing recheck I/O on subsequent chunks.
+		if capReachedInChunk {
+			run.CapHit = true
+			r.emitAudit("reconcile.cap_hit", run, map[string]string{
+				"run_id":         run.ID,
+				"deletes_so_far": strconv.Itoa(run.ManifestDeletes + run.StorageDeletes),
+			})
+			r.logger.Warn().
+				Str("run_id", run.ID).
+				Int("manifest_deletes", run.ManifestDeletes).
+				Int("ops_in_chunk", len(ops)).
+				Int("cap", r.cfg.MaxDeletesPerRun).
+				Msg("Reconciliation: per-run blast cap hit; stopping manifest sweep")
+		}
 		if len(ops) == 0 {
+			if capReachedInChunk {
+				return nil
+			}
 			continue
 		}
 		if dryRun {
@@ -152,10 +173,13 @@ func (r *Reconciler) sweepOrphanManifest(
 			run.ManifestDeletes += len(ops)
 			r.emitAudit("reconcile.manifest_batch_deleted", run, map[string]string{
 				"run_id": run.ID,
-				"count":  fmt.Sprintf("%d", len(ops)),
+				"count":  strconv.Itoa(len(ops)),
 				"sample": joinSample(applied, r.cfg.SamplePathsCap),
 				"mode":   "dry_run",
 			})
+			if capReachedInChunk {
+				return nil
+			}
 			continue
 		}
 		if err := r.coord.BatchFileOpsInManifest(ops); err != nil {
@@ -167,20 +191,10 @@ func (r *Reconciler) sweepOrphanManifest(
 		run.ManifestDeletes += len(ops)
 		r.emitAudit("reconcile.manifest_batch_deleted", run, map[string]string{
 			"run_id": run.ID,
-			"count":  fmt.Sprintf("%d", len(ops)),
+			"count":  strconv.Itoa(len(ops)),
 			"sample": joinSample(applied, r.cfg.SamplePathsCap),
 		})
 		if capReachedInChunk {
-			run.CapHit = true
-			r.emitAudit("reconcile.cap_hit", run, map[string]string{
-				"run_id":         run.ID,
-				"deletes_so_far": fmt.Sprintf("%d", run.ManifestDeletes+run.StorageDeletes),
-			})
-			r.logger.Warn().
-				Str("run_id", run.ID).
-				Int("manifest_deletes", run.ManifestDeletes).
-				Int("cap", r.cfg.MaxDeletesPerRun).
-				Msg("Reconciliation: per-run blast cap hit; stopping manifest sweep")
 			return nil
 		}
 	}
@@ -253,18 +267,4 @@ func (r *Reconciler) parallelExists(ctx context.Context, paths []string) []exist
 	}
 	wg.Wait()
 	return results
-}
-
-// joinSample concatenates a bounded list of paths into a single string
-// (newline-separated) for inclusion in the audit Detail map. The audit
-// schema stores Detail as JSON-encoded values, so this keeps the wire
-// format simple.
-func joinSample(paths []string, limit int) string {
-	if limit <= 0 || limit > len(paths) {
-		limit = len(paths)
-	}
-	if limit == 0 {
-		return ""
-	}
-	return strings.Join(paths[:limit], "\n")
 }

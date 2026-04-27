@@ -3,6 +3,7 @@ package reconciliation
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/basekick-labs/arc/internal/storage"
@@ -78,13 +79,13 @@ func (r *Reconciler) sweepOrphanStorage(
 			return err
 		}
 		if r.gate != nil && !r.gate.ShouldRunStorageScan() {
-			return fmt.Errorf("reconciliation: storage scan gate revoked mid-run")
+			return fmt.Errorf("storage scan: %w", ErrGateRevoked)
 		}
 		if run.ManifestDeletes+run.StorageDeletes >= r.cfg.MaxDeletesPerRun {
 			run.CapHit = true
 			r.emitAudit("reconcile.cap_hit", run, map[string]string{
 				"run_id":         run.ID,
-				"deletes_so_far": fmt.Sprintf("%d", run.ManifestDeletes+run.StorageDeletes),
+				"deletes_so_far": strconv.Itoa(run.ManifestDeletes + run.StorageDeletes),
 			})
 			r.logger.Warn().
 				Str("run_id", run.ID).
@@ -121,9 +122,28 @@ func (r *Reconciler) sweepOrphanStorage(
 			toDelete = append(toDelete, c.path)
 		}
 
+		// Apply the cap+audit BEFORE the empty-chunk skip — otherwise a
+		// chunk where every candidate raced (all SkippedRecheck) at the
+		// cap boundary would silently drop CapHit and the sweep would
+		// keep doing recheck I/O on subsequent chunks. Mirrors the
+		// equivalent fix in sweep_manifest.go.
+		emitCapAudit := func() {
+			run.CapHit = true
+			r.emitAudit("reconcile.cap_hit", run, map[string]string{
+				"run_id":         run.ID,
+				"deletes_so_far": strconv.Itoa(run.ManifestDeletes + run.StorageDeletes),
+			})
+			r.logger.Warn().
+				Str("run_id", run.ID).
+				Int("storage_deletes", run.StorageDeletes).
+				Int("cap", r.cfg.MaxDeletesPerRun).
+				Msg("Reconciliation: per-run blast cap hit; stopping storage sweep")
+		}
+
 		if len(toDelete) == 0 {
 			if capReachedInChunk {
-				run.CapHit = true
+				emitCapAudit()
+				return nil
 			}
 			continue
 		}
@@ -132,12 +152,12 @@ func (r *Reconciler) sweepOrphanStorage(
 			run.StorageDeletes += len(toDelete)
 			r.emitAudit("reconcile.storage_batch_deleted", run, map[string]string{
 				"run_id": run.ID,
-				"count":  fmt.Sprintf("%d", len(toDelete)),
+				"count":  strconv.Itoa(len(toDelete)),
 				"sample": joinSample(toDelete, r.cfg.SamplePathsCap),
 				"mode":   "dry_run",
 			})
 			if capReachedInChunk {
-				run.CapHit = true
+				emitCapAudit()
 				return nil
 			}
 			continue
@@ -147,20 +167,11 @@ func (r *Reconciler) sweepOrphanStorage(
 		run.StorageDeletes += applied
 		r.emitAudit("reconcile.storage_batch_deleted", run, map[string]string{
 			"run_id": run.ID,
-			"count":  fmt.Sprintf("%d", applied),
+			"count":  strconv.Itoa(applied),
 			"sample": joinSample(toDelete, r.cfg.SamplePathsCap),
 		})
 		if capReachedInChunk {
-			run.CapHit = true
-			r.emitAudit("reconcile.cap_hit", run, map[string]string{
-				"run_id":         run.ID,
-				"deletes_so_far": fmt.Sprintf("%d", run.ManifestDeletes+run.StorageDeletes),
-			})
-			r.logger.Warn().
-				Str("run_id", run.ID).
-				Int("storage_deletes", run.StorageDeletes).
-				Int("cap", r.cfg.MaxDeletesPerRun).
-				Msg("Reconciliation: per-run blast cap hit; stopping storage sweep")
+			emitCapAudit()
 			return nil
 		}
 	}
@@ -240,13 +251,4 @@ func looksLikeManagedPath(p string) bool {
 		}
 	}
 	return true
-}
-
-// appendBounded appends to a string slice but caps growth to keep the
-// Run summary memory bounded under pathological failure conditions.
-func appendBounded(s []string, msg string, cap int) []string {
-	if cap > 0 && len(s) >= cap {
-		return s
-	}
-	return append(s, msg)
 }

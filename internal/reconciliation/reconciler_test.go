@@ -1181,6 +1181,34 @@ func TestReconcile_RootWalkBoundsInitialDirListIteration(t *testing.T) {
 	}
 }
 
+func TestApplyDefaults_ClampsOperatorOverridesToCeilings(t *testing.T) {
+	// Belt-and-braces: an operator who sets MaxRootWalkDatabases or
+	// RecheckConcurrency to absurd values should be clamped. Both
+	// ceilings exist to defend against integer overflow in the
+	// downstream `× 4` arithmetic and to bound goroutine fan-out.
+	cfg := Config{
+		Enabled:              true,
+		BackendKind:          BackendShared,
+		MaxRootWalkDatabases: 999_999_999_999, // way over the cap
+		RecheckConcurrency:   100_000,         // way over the cap
+	}.applyDefaults()
+	if cfg.MaxRootWalkDatabases != maxRootWalkDatabasesCap {
+		t.Errorf("expected MaxRootWalkDatabases clamped to %d, got %d", maxRootWalkDatabasesCap, cfg.MaxRootWalkDatabases)
+	}
+	if cfg.RecheckConcurrency != maxRecheckConcurrency {
+		t.Errorf("expected RecheckConcurrency clamped to %d, got %d", maxRecheckConcurrency, cfg.RecheckConcurrency)
+	}
+	// Negative deletes-per-run gets the default, not a panic.
+	cfg2 := Config{
+		Enabled:          true,
+		BackendKind:      BackendShared,
+		MaxDeletesPerRun: -1,
+	}.applyDefaults()
+	if cfg2.MaxDeletesPerRun != 10_000 {
+		t.Errorf("expected MaxDeletesPerRun=-1 to default to 10000, got %d", cfg2.MaxDeletesPerRun)
+	}
+}
+
 func TestReconcile_RootWalkCapZeroDisablesRootWalk(t *testing.T) {
 	now := time.Now().UTC()
 	store := newFakeBackend()

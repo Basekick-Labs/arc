@@ -27,7 +27,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -69,6 +69,12 @@ var (
 	ErrGated = errors.New("reconciliation: node role is not permitted to run")
 	// ErrDisabled indicates the reconciler was constructed with cfg.Enabled=false.
 	ErrDisabled = errors.New("reconciliation: feature is disabled")
+	// ErrGateRevoked is wrapped by both sweeps when the cluster gate
+	// returns false at a chunk boundary mid-run (e.g. compactor lease
+	// transferred, primary writer demoted). Used by markAborted to
+	// classify this as AbortLeaseLost without depending on log-string
+	// matching.
+	ErrGateRevoked = errors.New("reconciliation: gate revoked mid-run")
 )
 
 // Coordinator is the minimal interface the reconciler needs from the
@@ -172,40 +178,73 @@ type Config struct {
 }
 
 // applyDefaults fills in zero-value config fields with the documented
-// defaults. Returns the updated copy.
+// defaults AND clamps operator-tunable knobs to sane bounds. The
+// clamps are belt-and-braces against config-driven foot-guns:
+//   - Negative values would otherwise panic (negative slice index in
+//     chunk[:remainingCap] when MaxDeletesPerRun<0).
+//   - Unbounded large values could OOM (RecheckConcurrency=100k spawns
+//     that many goroutines per chunk) or overflow arithmetic
+//     (MaxRootWalkDatabases × 4 exceeds MaxInt for very large cfgs).
+// Negative inputs are treated as "operator wants the default" and
+// reset; over-large inputs are clamped to a documented ceiling.
 func (c Config) applyDefaults() Config {
-	if c.GraceWindow == 0 {
+	if c.GraceWindow <= 0 {
 		c.GraceWindow = 24 * time.Hour
 	}
-	if c.ClockSkewAllowance == 0 {
+	if c.ClockSkewAllowance <= 0 {
 		c.ClockSkewAllowance = 5 * time.Minute
 	}
-	if c.PerPrefixTimeout == 0 {
+	if c.PerPrefixTimeout <= 0 {
 		c.PerPrefixTimeout = 5 * time.Minute
 	}
-	if c.MaxRunDuration == 0 {
+	if c.MaxRunDuration <= 0 {
 		c.MaxRunDuration = 30 * time.Minute
 	}
-	if c.MaxManifestSize == 0 {
+	if c.MaxManifestSize <= 0 {
 		c.MaxManifestSize = 200_000
 	}
-	if c.MaxDeletesPerRun == 0 {
+	if c.MaxDeletesPerRun <= 0 {
 		c.MaxDeletesPerRun = 10_000
 	}
-	if c.BatchSize == 0 {
+	if c.BatchSize <= 0 {
 		c.BatchSize = 1000
 	}
-	if c.SamplePathsCap == 0 {
+	if c.SamplePathsCap <= 0 {
 		c.SamplePathsCap = 10
 	}
 	if c.MaxRootWalkDatabases == 0 {
 		c.MaxRootWalkDatabases = 1000
+	} else if c.MaxRootWalkDatabases > maxRootWalkDatabasesCap {
+		// Clamp against the int-overflow risk in the `× 4` scan-limit
+		// computation in walk.go. Operators with truly enormous tenancy
+		// can raise the ceiling here, but the realistic upper bound for
+		// "unknown databases inspected per tick" is well below this.
+		c.MaxRootWalkDatabases = maxRootWalkDatabasesCap
 	}
-	if c.RecheckConcurrency == 0 {
+	// Negative values are treated as "disable root walk" downstream
+	// (the `if r.cfg.MaxRootWalkDatabases <= 0` guard in derivePrefixes).
+	// We don't normalize them to a positive number because the tests
+	// rely on the explicit "set to 0 post-construction → disabled"
+	// pattern; -1 from operator config takes the same path.
+	if c.RecheckConcurrency <= 0 {
 		c.RecheckConcurrency = 8
+	} else if c.RecheckConcurrency > maxRecheckConcurrency {
+		// Clamp the goroutine fan-out per chunk. Going above 64 trades
+		// cloud per-second rate-limit budget for negligible latency
+		// improvement and risks SDK connection-pool exhaustion.
+		c.RecheckConcurrency = maxRecheckConcurrency
 	}
 	return c
 }
+
+// Tunable upper bounds. Exported as private constants because operators
+// who legitimately need to override them should be raising these in
+// source rather than via runtime config — both ceilings exist to defend
+// against accidental misconfiguration, not as policy limits.
+const (
+	maxRootWalkDatabasesCap = 1_000_000
+	maxRecheckConcurrency   = 64
+)
 
 // AbortReason categorizes early-exit conditions for a run. Stable string
 // values are documented because audit consumers depend on them.
@@ -538,13 +577,15 @@ func fileEntriesToKeys(entries []*raft.FileEntry) []*ObjectKey {
 }
 
 // manifestToKeys filters the manifest to files this node is responsible
-// for. In BackendShared mode the local node owns nothing exclusively and
-// the full manifest is returned. In BackendLocal mode it filters to
-// files this node owns — a file owned by another node lives on that
-// node's disk and is invisible to our walk anyway, so leaving it in the
-// manifest set would produce a false orphan-manifest signal.
+// for. In BackendShared and BackendStandalone the local node owns
+// nothing exclusively and the full manifest is returned. In
+// BackendLocal mode it filters to files this node owns — a file owned
+// by another node lives on that node's disk and is invisible to our
+// walk anyway, so leaving it in the manifest set would produce a false
+// orphan-manifest signal. NewReconciler rejects BackendLocal with an
+// empty LocalNodeID, so we don't need to defend against that here.
 func (r *Reconciler) manifestToKeys(manifest []*ObjectKey) []*ObjectKey {
-	if r.cfg.BackendKind != BackendLocal || r.cfg.LocalNodeID == "" {
+	if r.cfg.BackendKind != BackendLocal {
 		return manifest
 	}
 	out := make([]*ObjectKey, 0, len(manifest))
@@ -552,37 +593,6 @@ func (r *Reconciler) manifestToKeys(manifest []*ObjectKey) []*ObjectKey {
 		if e.OriginNodeID == "" || e.OriginNodeID == r.cfg.LocalNodeID {
 			out = append(out, e)
 		}
-	}
-	return out
-}
-
-// sampleStrings caps a string slice to n entries for inclusion in audit
-// events and Run summaries. Returns nil when the input is empty.
-func sampleStrings(in []string, n int) []string {
-	if len(in) == 0 {
-		return nil
-	}
-	if n <= 0 || n >= len(in) {
-		out := make([]string, len(in))
-		copy(out, in)
-		return out
-	}
-	out := make([]string, n)
-	copy(out, in[:n])
-	return out
-}
-
-func sampleCandidatePaths(in []orphanStorageCandidate, n int) []string {
-	if len(in) == 0 {
-		return nil
-	}
-	limit := n
-	if limit <= 0 || limit > len(in) {
-		limit = len(in)
-	}
-	out := make([]string, limit)
-	for i := 0; i < limit; i++ {
-		out[i] = in[i].path
 	}
 	return out
 }
@@ -632,20 +642,35 @@ func (r *Reconciler) finalizeRun(run *Run) {
 	}
 	logEv.Msg("Reconciliation run completed")
 
+	// SIEM/dashboard consumers depend on these audit fields to tell
+	// "0 orphans found, all clean" apart from "blind walk produced 0
+	// candidates" or "we hit the per-run cap and stopped early."
+	// Threading walk_partial / cap_hit / backend_kind through both
+	// completed and aborted detail maps keeps the two run states
+	// queryable on the same shape.
 	if run.Aborted {
 		r.emitAudit("reconcile.run_aborted", run, map[string]string{
-			"run_id":        run.ID,
-			"abort_reason":  string(run.AbortReason),
-			"abort_message": run.AbortMessage,
-			"duration_ms":   fmt.Sprintf("%d", duration.Milliseconds()),
+			"run_id":           run.ID,
+			"backend_kind":     string(run.BackendKind),
+			"abort_reason":    string(run.AbortReason),
+			"abort_message":   run.AbortMessage,
+			"manifest_deletes": strconv.Itoa(run.ManifestDeletes),
+			"storage_deletes":  strconv.Itoa(run.StorageDeletes),
+			"walk_partial":    boolStr(run.WalkPartial),
+			"cap_hit":         boolStr(run.CapHit),
+			"duration_ms":     strconv.FormatInt(duration.Milliseconds(), 10),
 		})
 	} else {
 		r.emitAudit("reconcile.run_completed", run, map[string]string{
 			"run_id":           run.ID,
-			"manifest_deletes": fmt.Sprintf("%d", run.ManifestDeletes),
-			"storage_deletes":  fmt.Sprintf("%d", run.StorageDeletes),
-			"skipped_grace":    fmt.Sprintf("%d", run.SkippedGrace),
-			"duration_ms":      fmt.Sprintf("%d", duration.Milliseconds()),
+			"backend_kind":     string(run.BackendKind),
+			"manifest_deletes": strconv.Itoa(run.ManifestDeletes),
+			"storage_deletes":  strconv.Itoa(run.StorageDeletes),
+			"skipped_grace":    strconv.Itoa(run.SkippedGrace),
+			"skipped_recheck":  strconv.Itoa(run.SkippedRecheck),
+			"walk_partial":     boolStr(run.WalkPartial),
+			"cap_hit":          boolStr(run.CapHit),
+			"duration_ms":      strconv.FormatInt(duration.Milliseconds(), 10),
 		})
 	}
 
@@ -677,15 +702,10 @@ func (r *Reconciler) markAborted(run *Run, err error) {
 }
 
 // isLeaseLostError reports whether the error came from the per-chunk
-// gate re-check inside a sweep (lease handoff mid-run). The sweeps
-// raise these via fmt.Errorf with a stable prefix so we can recognize
-// them without coupling to the cluster package.
+// gate re-check inside a sweep (lease handoff mid-run). Both sweeps
+// wrap ErrGateRevoked, so errors.Is is robust to log-string changes.
 func isLeaseLostError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "gate revoked mid-run")
+	return errors.Is(err, ErrGateRevoked)
 }
 
 // isRaftError reports whether an error originated from a Raft manifest
@@ -712,11 +732,4 @@ func (r *Reconciler) emitAudit(eventType string, run *Run, detail map[string]str
 		StatusCode: 200,
 		Detail:     detail,
 	})
-}
-
-func boolStr(b bool) string {
-	if b {
-		return "true"
-	}
-	return "false"
 }

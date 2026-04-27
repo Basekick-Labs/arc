@@ -48,7 +48,8 @@ type walkResult struct {
 // a backend without ObjectLister doesn't flood operator dashboards on
 // large schemas.
 func (r *Reconciler) walkStorage(ctx context.Context, manifest []*ObjectKey) (walkResult, error) {
-	prefixes := r.derivePrefixes(ctx, manifest)
+	discovery := r.derivePrefixes(ctx, manifest)
+	prefixes := discovery.prefixes
 
 	if _, hasObjectLister := r.storage.(storage.ObjectLister); !hasObjectLister {
 		r.logger.Warn().
@@ -58,7 +59,9 @@ func (r *Reconciler) walkStorage(ctx context.Context, manifest []*ObjectKey) (wa
 	}
 
 	res := walkResult{
-		records: make([]objectRecord, 0, len(manifest)),
+		records:      make([]objectRecord, 0, len(manifest)),
+		partial:      discovery.partial,
+		prefixErrors: append([]string{}, discovery.errors...),
 	}
 	seen := make(map[string]struct{}, len(manifest))
 
@@ -94,6 +97,17 @@ func (r *Reconciler) walkStorage(ctx context.Context, manifest []*ObjectKey) (wa
 	return res, nil
 }
 
+// prefixDiscovery is the result of derivePrefixes. partial=true and/or
+// non-nil errors indicate the prefix set is not authoritative — the
+// caller surfaces both into Run.WalkPartial / Run.Errors so a "0
+// orphans found" run that was actually blind to part of the bucket
+// is unambiguous on dashboards.
+type prefixDiscovery struct {
+	prefixes []string
+	partial  bool
+	errors   []string
+}
+
 // derivePrefixes returns the unique "<database>/<measurement>/" prefixes
 // represented in the manifest plus an extra root walk for orphan
 // pre-Phase-1 files. The result is sorted+deduplicated.
@@ -107,8 +121,11 @@ func (r *Reconciler) walkStorage(ctx context.Context, manifest []*ObjectKey) (wa
 //
 // ctx is threaded through ListDirectories so MaxRunDuration applies to
 // the discovery walk too — without this, a stuck top-level list could
-// block past the run budget.
-func (r *Reconciler) derivePrefixes(ctx context.Context, manifest []*ObjectKey) []string {
+// block past the run budget. Inner ListDirectories failures (e.g.
+// permission denied on a single tenant prefix) flip the partial flag
+// and append to errors so the caller can stamp Run.WalkPartial; this
+// pairs with the per-prefix error surfacing in walkStorage.
+func (r *Reconciler) derivePrefixes(ctx context.Context, manifest []*ObjectKey) prefixDiscovery {
 	// Two sets sized to typical production schema cardinality:
 	//   set:   "database/measurement/" — drives the per-prefix walk
 	//   dbSet: "database/"             — used by the root-walk fallback
@@ -131,9 +148,11 @@ func (r *Reconciler) derivePrefixes(ctx context.Context, manifest []*ObjectKey) 
 		dbSet[e.Database+"/"] = struct{}{}
 	}
 
-	prefixes := make([]string, 0, len(set)+1)
+	out := prefixDiscovery{
+		prefixes: make([]string, 0, len(set)+1),
+	}
 	for p := range set {
-		prefixes = append(prefixes, p)
+		out.prefixes = append(out.prefixes, p)
 	}
 
 	// Root walk catches pre-Phase-1 files and any file in a database the
@@ -143,68 +162,95 @@ func (r *Reconciler) derivePrefixes(ctx context.Context, manifest []*ObjectKey) 
 	// cluster (or a shared bucket with unrelated top-level dirs) can't
 	// trigger thousands of metadata calls per tick. Set the cap to 0
 	// in config to disable the root walk entirely.
-	if r.cfg.MaxRootWalkDatabases > 0 {
-		if dl, ok := r.storage.(storage.DirectoryLister); ok {
-			dirs, err := dl.ListDirectories(ctx, "")
-			if err == nil {
-				// Bound the iteration over the returned slice itself,
-				// not just the inspected count. A shared bucket with
-				// many unrelated top-level prefixes could otherwise
-				// pin megabytes of dirnames and burn CPU on the dbSet
-				// lookup loop even when every entry is already known.
-				// Headroom of 4× over the inspection cap covers normal
-				// cases where most top-level entries are known
-				// databases the dbSet check skips.
-				scanLimit := r.cfg.MaxRootWalkDatabases * 4
-				if scanLimit > len(dirs) {
-					scanLimit = len(dirs)
-				}
-				if scanLimit < len(dirs) {
-					r.logger.Warn().
-						Int("returned", len(dirs)).
-						Int("scan_limit", scanLimit).
-						Int("cap", r.cfg.MaxRootWalkDatabases).
-						Msg("Reconciliation: top-level directory count exceeds 4× root-walk cap; suffix entries skipped this tick")
-				}
-				inspected := 0
-				for i := 0; i < scanLimit; i++ {
-					d := dirs[i]
-					if inspected >= r.cfg.MaxRootWalkDatabases {
-						r.logger.Warn().
-							Int("inspected", inspected).
-							Int("scan_limit", scanLimit).
-							Int("cap", r.cfg.MaxRootWalkDatabases).
-							Msg("Reconciliation: root walk cap reached; remaining unknown databases skipped this tick")
-						break
-					}
-					// Top-level directories are databases. We add each as a
-					// separate prefix so the per-prefix List below picks up
-					// any (database, measurement) pair not in the manifest.
-					key := strings.TrimSuffix(d, "/") + "/"
-					if _, exists := dbSet[key]; exists {
-						// Already covered by the manifest-derived dbSet;
-						// don't count toward the inspection cap.
-						continue
-					}
-					inspected++
-					// d is a database; we don't know its measurements yet.
-					// Walk one level deeper to get measurements.
-					innerDirs, innerErr := dl.ListDirectories(ctx, key)
-					if innerErr != nil {
-						continue
-					}
-					for _, m := range innerDirs {
-						subKey := strings.TrimSuffix(d, "/") + "/" + strings.TrimSuffix(m, "/") + "/"
-						if _, exists := set[subKey]; !exists {
-							prefixes = append(prefixes, subKey)
-						}
-					}
-				}
+	if r.cfg.MaxRootWalkDatabases <= 0 {
+		return out
+	}
+	dl, ok := r.storage.(storage.DirectoryLister)
+	if !ok {
+		return out
+	}
+	dirs, err := dl.ListDirectories(ctx, "")
+	if err != nil {
+		// Top-level discovery itself failed — partial walk; orphan
+		// detection for unknown databases is degraded for this tick.
+		out.partial = true
+		out.errors = append(out.errors, fmt.Sprintf("root list_directories: %v", err))
+		return out
+	}
+	// Bound the iteration over the returned slice itself, not just the
+	// inspected count. A shared bucket with many unrelated top-level
+	// prefixes could otherwise pin megabytes of dirnames and burn CPU
+	// on the dbSet lookup loop even when every entry is already known.
+	// Headroom of 4× over the inspection cap covers normal cases where
+	// most top-level entries are known databases the dbSet check skips.
+	scanLimit := r.cfg.MaxRootWalkDatabases * 4
+	if scanLimit < r.cfg.MaxRootWalkDatabases {
+		// Defensive against integer overflow if MaxRootWalkDatabases is
+		// set to a value > MaxInt/4; clamp to len(dirs) directly.
+		scanLimit = len(dirs)
+	}
+	if scanLimit > len(dirs) {
+		scanLimit = len(dirs)
+	}
+	if scanLimit < len(dirs) {
+		out.partial = true
+		r.logger.Warn().
+			Int("returned", len(dirs)).
+			Int("scan_limit", scanLimit).
+			Int("cap", r.cfg.MaxRootWalkDatabases).
+			Msg("Reconciliation: top-level directory count exceeds 4× root-walk cap; suffix entries skipped this tick")
+	}
+	inspected := 0
+	for i := 0; i < scanLimit; i++ {
+		// ctx-aware loop: a misbehaving backend that returns instantly
+		// on canceled ctx would otherwise burn through scanLimit
+		// iterations of dbSet checks after cancel. Bail at the top so
+		// the caller gets a partial discovery, not a wasted budget.
+		if ctx.Err() != nil {
+			out.partial = true
+			out.errors = append(out.errors, fmt.Sprintf("root walk canceled at %d/%d: %v", i, scanLimit, ctx.Err()))
+			return out
+		}
+		d := dirs[i]
+		if inspected >= r.cfg.MaxRootWalkDatabases {
+			out.partial = true
+			r.logger.Warn().
+				Int("inspected", inspected).
+				Int("scan_limit", scanLimit).
+				Int("cap", r.cfg.MaxRootWalkDatabases).
+				Msg("Reconciliation: root walk cap reached; remaining unknown databases skipped this tick")
+			break
+		}
+		// Top-level directories are databases. We add each as a
+		// separate prefix so the per-prefix List below picks up
+		// any (database, measurement) pair not in the manifest.
+		key := strings.TrimSuffix(d, "/") + "/"
+		if _, exists := dbSet[key]; exists {
+			// Already covered by the manifest-derived dbSet;
+			// don't count toward the inspection cap.
+			continue
+		}
+		inspected++
+		// d is a database; we don't know its measurements yet.
+		// Walk one level deeper to get measurements.
+		innerDirs, innerErr := dl.ListDirectories(ctx, key)
+		if innerErr != nil {
+			// Inner listing failed (e.g. permissions on a tenant
+			// prefix). Mark partial so operators can disambiguate
+			// "0 orphans found" from "we couldn't see this database."
+			out.partial = true
+			out.errors = append(out.errors, fmt.Sprintf("list_directories %q: %v", key, innerErr))
+			continue
+		}
+		for _, m := range innerDirs {
+			subKey := strings.TrimSuffix(d, "/") + "/" + strings.TrimSuffix(m, "/") + "/"
+			if _, exists := set[subKey]; !exists {
+				out.prefixes = append(out.prefixes, subKey)
 			}
 		}
 	}
 
-	return prefixes
+	return out
 }
 
 // listPrefix lists objects under one prefix. Prefers ObjectLister so we

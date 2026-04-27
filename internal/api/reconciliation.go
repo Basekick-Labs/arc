@@ -49,14 +49,33 @@ func NewReconciliationHandler(
 	}
 }
 
+// requireClusteringLicense re-validates the FeatureClustering license
+// on every request so a license expiry mid-process kicks in without
+// restart. Mirrors the requireTieringLicense pattern at
+// internal/api/tiering.go:191. Skipped for the status endpoint so an
+// expired-license cluster can still surface the disabled state in
+// operator dashboards.
+func (h *ReconciliationHandler) requireClusteringLicense(c *fiber.Ctx) error {
+	if h.licenseClient == nil || !h.licenseClient.CanUseClustering() {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": "Reconciliation requires an enterprise license with the 'clustering' feature enabled",
+		})
+	}
+	return c.Next()
+}
+
 // RegisterRoutes wires the routes under /api/v1/reconciliation. Every
 // route is gated by an explicit auth middleware per CLAUDE.md's "every
-// new API endpoint MUST have auth middleware" rule:
+// new API endpoint MUST have auth middleware" rule, then by a license
+// re-check (per CLAUDE.md "License middleware goes after auth
+// middleware") on the mutating routes:
 //
-//   - /status      — RequireRead (operational state leaks tenant database
-//     names + cron timing if exposed unauthenticated)
-//   - /trigger     — RequireAdmin (kicks off destructive cluster-wide deletes)
-//   - /runs/:id    — RequireAdmin (run details include sample paths)
+//   - /status      — RequireRead. NOT license-gated so an expired cluster
+//     can still report its disabled state to the dashboard.
+//   - /trigger     — RequireAdmin + requireClusteringLicense (kicks off
+//     destructive cluster-wide deletes).
+//   - /runs/:id    — RequireAdmin + requireClusteringLicense (run details
+//     include sample paths).
 //
 // The authManager-nil branch exists for tests and OSS no-auth deployments
 // where the operator has explicitly disabled auth.
@@ -65,12 +84,12 @@ func (h *ReconciliationHandler) RegisterRoutes(app *fiber.App) {
 
 	if h.authManager != nil {
 		group.Get("/status", auth.RequireRead(h.authManager), h.handleStatus)
-		group.Post("/trigger", auth.RequireAdmin(h.authManager), h.handleTrigger)
-		group.Get("/runs/:id", auth.RequireAdmin(h.authManager), h.handleGetRun)
+		group.Post("/trigger", auth.RequireAdmin(h.authManager), h.requireClusteringLicense, h.handleTrigger)
+		group.Get("/runs/:id", auth.RequireAdmin(h.authManager), h.requireClusteringLicense, h.handleGetRun)
 	} else {
 		group.Get("/status", h.handleStatus)
-		group.Post("/trigger", h.handleTrigger)
-		group.Get("/runs/:id", h.handleGetRun)
+		group.Post("/trigger", h.requireClusteringLicense, h.handleTrigger)
+		group.Get("/runs/:id", h.requireClusteringLicense, h.handleGetRun)
 	}
 }
 

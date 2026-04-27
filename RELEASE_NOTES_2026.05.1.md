@@ -166,7 +166,7 @@ The reconciler ships **off by default**. Once enabled (`reconciliation.enabled=t
 | `max_root_walk_databases` | `1000` | Cap on unknown databases the root-walk fallback descends into per tick (0 disables) |
 | `recheck_concurrency` | `8` | Worker count for parallel `storage.Exists` re-checks during the manifest sweep (1 forces sequential) |
 | `manifest_only_dry_run` | `false` | Force every cron run to dry-run (safety bridge for operators staging the rollout) |
-| `delete_pre_manifest_orphans` | `true` | Delete files that don't conform to the 7-segment `db/m/yyyy/mm/dd/hh/file` layout |
+| `delete_pre_manifest_orphans` | `true` | When `true`, orphan storage files are eligible for deletion regardless of path shape. When `false`, only paths matching Arc's standard 7-segment layout `database/measurement/yyyy/mm/dd/hh/file.parquet` (with `.` / `..` segments rejected) are eligible — useful for shared buckets where unrelated stray files must be left alone. |
 
 ## Hardening
 
