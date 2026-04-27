@@ -149,6 +149,17 @@ type Config struct {
 	// SamplePathsCap caps the number of sample paths included in audit
 	// events and Run summaries. Default 10.
 	SamplePathsCap int
+
+	// MaxRootWalkDatabases caps the number of unknown databases the
+	// root-walk fallback will descend into when searching for files in
+	// databases the manifest doesn't know about. Each unknown database
+	// triggers a second-level ListDirectories to enumerate its
+	// measurements. On clusters with thousands of databases (or a
+	// shared bucket leaking unrelated top-level dirs), an unbounded
+	// walk would issue thousands of metadata calls per tick. Default
+	// 1000; cluster operators with very wide tenancy can raise it.
+	// Set to 0 to disable the root walk entirely.
+	MaxRootWalkDatabases int
 }
 
 // applyDefaults fills in zero-value config fields with the documented
@@ -177,6 +188,9 @@ func (c Config) applyDefaults() Config {
 	}
 	if c.SamplePathsCap == 0 {
 		c.SamplePathsCap = 10
+	}
+	if c.MaxRootWalkDatabases == 0 {
+		c.MaxRootWalkDatabases = 1000
 	}
 	return c
 }
@@ -411,6 +425,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, dryRun bool) (*Run, error) {
 	// diff so a file owned by node-B (and physically present on node-B's
 	// disk) doesn't show up as orphan-storage on node-A.
 	keys := r.manifestToKeys(fileEntriesToKeys(manifest))
+	// Drop the full FileEntry slice now that we've reduced to ObjectKeys.
+	// At MaxManifestSize=200k entries this releases ~40 MB of pinned
+	// FileEntry data (SHA256, SizeBytes, CreatedAt, etc.) for GC during
+	// the rest of the run. The walk + sweeps only need the lighter
+	// ObjectKey form going forward.
+	manifest = nil
 
 	// Step 2-3: walk storage by per-prefix listing, then compute the diff.
 	walkRes, walkErr := r.walkStorage(runCtx, keys)
@@ -628,23 +648,14 @@ func isLeaseLostError(err error) bool {
 	return strings.Contains(msg, "gate revoked mid-run")
 }
 
-// isRaftError reports whether an error originated from the cluster Raft
-// surface. The reconciler does not import the cluster package, so we
-// match by substring on well-known wrap prefixes from coordinator.go.
-// This is brittle (a future rename in coordinator.go silently downgrades
-// the classification to AbortUnknown) — accepted because misclassifying
-// is recoverable: the abort_message field still carries the full error
-// for forensic inspection, and an unrecognized message at least doesn't
-// pollute Raft-failure dashboards with spurious entries.
+// isRaftError reports whether an error originated from a Raft manifest
+// apply failure. Uses errors.Is against raft.ErrManifestApply, which
+// the cluster.Coordinator wraps into every manifest-write error
+// (RegisterFileInManifest, DeleteFileFromManifest, BatchFileOpsInManifest,
+// UpdateFileInManifest). Lives in the leaf raft package so consumers
+// can import it without an import cycle.
 func isRaftError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "batch file ops in manifest") ||
-		strings.Contains(msg, "delete file from manifest") ||
-		strings.Contains(msg, "register file in manifest") ||
-		strings.Contains(msg, "raft")
+	return errors.Is(err, raft.ErrManifestApply)
 }
 
 // emitAudit sends an audit event if the audit logger is configured. The

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -2619,7 +2620,7 @@ func (c *Coordinator) RegisterFileInManifest(file raft.FileEntry) error {
 
 	if c.raftNode.IsLeader() {
 		if err := c.raftNode.RegisterFile(file, 5*time.Second); err != nil {
-			return fmt.Errorf("register file in manifest: %w", err)
+			return errors.Join(raft.ErrManifestApply, fmt.Errorf("register file in manifest: %w", err))
 		}
 		return nil
 	}
@@ -2636,7 +2637,7 @@ func (c *Coordinator) RegisterFileInManifest(file raft.FileEntry) error {
 	forwardCtx, cancel := context.WithTimeout(c.ctxOrBackground(), forwardApplyTimeout)
 	defer cancel()
 	if err := c.forwardApplyToLeader(forwardCtx, cmd); err != nil {
-		return fmt.Errorf("register file in manifest (forwarded): %w", err)
+		return errors.Join(raft.ErrManifestApply, fmt.Errorf("register file in manifest (forwarded): %w", err))
 	}
 	return nil
 }
@@ -2653,7 +2654,7 @@ func (c *Coordinator) DeleteFileFromManifest(path, reason string) error {
 
 	if c.raftNode.IsLeader() {
 		if err := c.raftNode.DeleteFile(path, reason, 5*time.Second); err != nil {
-			return fmt.Errorf("delete file from manifest: %w", err)
+			return errors.Join(raft.ErrManifestApply, fmt.Errorf("delete file from manifest: %w", err))
 		}
 		return nil
 	}
@@ -2668,7 +2669,7 @@ func (c *Coordinator) DeleteFileFromManifest(path, reason string) error {
 	forwardCtx, cancel := context.WithTimeout(c.ctxOrBackground(), forwardApplyTimeout)
 	defer cancel()
 	if err := c.forwardApplyToLeader(forwardCtx, cmd); err != nil {
-		return fmt.Errorf("delete file from manifest (forwarded): %w", err)
+		return errors.Join(raft.ErrManifestApply, fmt.Errorf("delete file from manifest (forwarded): %w", err))
 	}
 	return nil
 }
@@ -2685,7 +2686,7 @@ func (c *Coordinator) BatchFileOpsInManifest(ops []raft.BatchFileOp) error {
 
 	if c.raftNode.IsLeader() {
 		if err := c.raftNode.BatchFileOps(ops, 5*time.Second); err != nil {
-			return fmt.Errorf("batch file ops in manifest: %w", err)
+			return errors.Join(raft.ErrManifestApply, fmt.Errorf("batch file ops in manifest: %w", err))
 		}
 		return nil
 	}
@@ -2700,7 +2701,7 @@ func (c *Coordinator) BatchFileOpsInManifest(ops []raft.BatchFileOp) error {
 	forwardCtx, cancel := context.WithTimeout(c.ctxOrBackground(), forwardApplyTimeout)
 	defer cancel()
 	if err := c.forwardApplyToLeader(forwardCtx, cmd); err != nil {
-		return fmt.Errorf("batch file ops in manifest (forwarded): %w", err)
+		return errors.Join(raft.ErrManifestApply, fmt.Errorf("batch file ops in manifest (forwarded): %w", err))
 	}
 	return nil
 }
@@ -2726,7 +2727,7 @@ func (c *Coordinator) UpdateFileInManifest(file raft.FileEntry) error {
 	}
 	if c.raftNode.IsLeader() {
 		if err := c.raftNode.UpdateFile(file, 5*time.Second); err != nil {
-			return fmt.Errorf("update file in manifest: %w", err)
+			return errors.Join(raft.ErrManifestApply, fmt.Errorf("update file in manifest: %w", err))
 		}
 		return nil
 	}
@@ -2738,7 +2739,7 @@ func (c *Coordinator) UpdateFileInManifest(file raft.FileEntry) error {
 	forwardCtx, cancel := context.WithTimeout(c.ctxOrBackground(), forwardApplyTimeout)
 	defer cancel()
 	if err := c.forwardApplyToLeader(forwardCtx, cmd); err != nil {
-		return fmt.Errorf("update file in manifest (forwarded): %w", err)
+		return errors.Join(raft.ErrManifestApply, fmt.Errorf("update file in manifest (forwarded): %w", err))
 	}
 	return nil
 }

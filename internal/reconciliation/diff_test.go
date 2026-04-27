@@ -77,21 +77,22 @@ func TestComputeDiff_GraceWindowProtectsYoungFiles(t *testing.T) {
 	}
 }
 
-func TestComputeDiff_ZeroMtimeTreatedAsOld(t *testing.T) {
+func TestComputeDiff_ZeroMtimeTreatedAsYoung(t *testing.T) {
+	// Conservative safety net: when the backend doesn't expose mtime
+	// (List+StatFile fallback path), treat the file as YOUNG (protected)
+	// rather than eligible. Better to leak an orphan than to delete a
+	// file we can't age-check.
 	now := time.Now().UTC()
 	manifest := []*ObjectKey{}
 	storage := []objectRecord{
-		// No mtime — backend doesn't implement ObjectLister and we fell
-		// back to plain List. Treat as eligible (re-check before delete
-		// will catch any race).
-		{path: "db/m/no-mtime.parquet"},
+		{path: "db/m/no-mtime.parquet"}, // zero LastModified
 	}
 	d := computeDiff(manifest, storage, now, 24*time.Hour)
-	if len(d.orphanStorage) != 1 {
-		t.Fatalf("expected zero-mtime to be eligible, got: %+v", d.orphanStorage)
+	if len(d.orphanStorage) != 0 {
+		t.Fatalf("zero-mtime files must be protected, got orphans: %+v", d.orphanStorage)
 	}
-	if d.skippedGraceCount != 0 {
-		t.Fatalf("expected 0 skipped, got %d", d.skippedGraceCount)
+	if d.skippedGraceCount != 1 {
+		t.Fatalf("zero-mtime should count as skipped-grace, got %d", d.skippedGraceCount)
 	}
 }
 

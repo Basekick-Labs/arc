@@ -230,6 +230,7 @@ type ReconciliationConfig struct {
 	DeletePreManifestOrphans bool   // Delete files outside the db/measurement/... layout (default: true)
 	ManifestOnlyDryRun       bool   // Force every cron run to be dry-run (safety bridge; default: false)
 	SamplePathsCap           int    // Bound on sample paths in audit events / Run summaries (default: 10)
+	MaxRootWalkDatabases     int    // Cap on unknown databases the root-walk fallback descends into (default: 1000; 0 disables)
 }
 
 // TieredStorageConfig holds configuration for tiered storage (Enterprise feature)
@@ -589,6 +590,7 @@ func Load() (*Config, error) {
 			DeletePreManifestOrphans:  v.GetBool("reconciliation.delete_pre_manifest_orphans"),
 			ManifestOnlyDryRun:        v.GetBool("reconciliation.manifest_only_dry_run"),
 			SamplePathsCap:            v.GetInt("reconciliation.sample_paths_cap"),
+			MaxRootWalkDatabases:      v.GetInt("reconciliation.max_root_walk_databases"),
 		},
 		Cluster: ClusterConfig{
 			Enabled:             v.GetBool("cluster.enabled"),
@@ -843,6 +845,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("reconciliation.delete_pre_manifest_orphans", true)
 	v.SetDefault("reconciliation.manifest_only_dry_run", false)
 	v.SetDefault("reconciliation.sample_paths_cap", 10)
+	v.SetDefault("reconciliation.max_root_walk_databases", 1000)
 
 	// Cluster defaults (Enterprise feature)
 	v.SetDefault("cluster.enabled", false)              // Disabled by default (standalone mode)

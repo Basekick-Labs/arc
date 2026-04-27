@@ -37,10 +37,14 @@ type orphanStorageCandidate struct {
 // transformation. Easy to unit test.
 //
 // The grace window is `cfg.GraceWindow + cfg.ClockSkewAllowance`. Files
-// with a zero LastModified are treated as "old enough" — production
-// backends always populate this; only the List-fallback path produces
-// zero values, and falling through means we trust the operator's
-// backend choice rather than silently skipping every file.
+// with a zero LastModified are treated as "still young" — i.e. PROTECTED
+// from deletion. The fallback `List`+`StatFile` path produces zero
+// mtimes when a backend doesn't implement `ObjectLister`; we'd rather
+// leak orphan storage than risk deleting a file we can't age-check.
+// Production backends (S3, Azure, Local) all implement ObjectLister and
+// won't hit this branch; this is purely a safety net for custom
+// backends and a hint to operators that they should implement
+// ObjectLister to get full reconciliation coverage.
 //
 // In BackendLocal mode the per-node OriginNodeID filter applies to
 // orphan-storage candidates: files whose manifest twin (if any) named
@@ -106,13 +110,14 @@ func computeDiff(
 	return out
 }
 
-// isYoungerThan returns true when the given mtime is non-zero and within
-// `grace` of now. A zero mtime means "we don't know how old this is" —
-// returning false (treat as old) lets the run proceed; the per-file
-// re-check before deletion will catch any race.
+// isYoungerThan reports whether a file at `mtime` should be considered
+// younger than the grace window relative to `now`. Zero mtime is
+// treated as YOUNG (protected) — see the rationale in computeDiff's
+// docstring. The conservative choice prevents data loss on backends
+// that don't expose modification times.
 func isYoungerThan(mtime, now time.Time, grace time.Duration) bool {
 	if mtime.IsZero() {
-		return false
+		return true
 	}
 	return now.Sub(mtime) < grace
 }

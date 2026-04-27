@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 )
@@ -162,16 +163,12 @@ func (r *Reconciler) sweepOrphanManifest(
 // (newline-separated) for inclusion in the audit Detail map. The audit
 // schema stores Detail as JSON-encoded values, so this keeps the wire
 // format simple.
-func joinSample(paths []string, cap int) string {
-	if cap <= 0 || cap > len(paths) {
-		cap = len(paths)
+func joinSample(paths []string, limit int) string {
+	if limit <= 0 || limit > len(paths) {
+		limit = len(paths)
 	}
-	if cap == 0 {
+	if limit == 0 {
 		return ""
 	}
-	out := paths[0]
-	for i := 1; i < cap; i++ {
-		out += "\n" + paths[i]
-	}
-	return out
+	return strings.Join(paths[:limit], "\n")
 }

@@ -60,7 +60,11 @@ func (f *fakeCoordinator) BatchFileOpsInManifest(ops []raft.BatchFileOp) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.batchErr != nil {
-		return f.batchErr
+		// Wrap with raft.ErrManifestApply so consumers using
+		// errors.Is(err, raft.ErrManifestApply) — including the
+		// reconciler's isRaftError — see this exactly as the real
+		// cluster.Coordinator would surface a quorum loss.
+		return errors.Join(raft.ErrManifestApply, f.batchErr)
 	}
 	f.batchCalls = append(f.batchCalls, ops)
 	for _, op := range ops {
@@ -885,6 +889,76 @@ func TestLooksLikeManagedPath(t *testing.T) {
 		if got != c.want {
 			t.Errorf("looksLikeManagedPath(%q) = %v, want %v", c.path, got, c.want)
 		}
+	}
+}
+
+func TestReconcile_RootWalkCapBoundsListDirectories(t *testing.T) {
+	// Plant 5 unknown databases on the backend; cap root walk at 2.
+	// Only 2 should be inspected; the rest skipped (logged Warn).
+	now := time.Now().UTC()
+	store := newFakeBackend()
+	for _, db := range []string{"db1", "db2", "db3", "db4", "db5"} {
+		store.put(db+"/m/2026/04/27/12/x.parquet", now.Add(-48*time.Hour))
+	}
+	// Manifest empty so all 5 are unknown.
+	coord := newFakeCoordinator()
+
+	r, err := NewReconciler(
+		Config{
+			Enabled:                  true,
+			BackendKind:              BackendShared,
+			DeletePreManifestOrphans: true,
+			MaxRootWalkDatabases:     2,
+		},
+		coord, store, &fakeGate{scan: true, sweep: true}, nil, zerolog.Nop(),
+	)
+	if err != nil {
+		t.Fatalf("NewReconciler: %v", err)
+	}
+	run, err := r.Reconcile(context.Background(), false)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	// Only 2 of the 5 unknown databases should have been walked into,
+	// so at most 2 storage deletes (the file under each inspected db).
+	if run.StorageDeletes > 2 {
+		t.Errorf("MaxRootWalkDatabases=2 should cap deletes at 2, got %d", run.StorageDeletes)
+	}
+	if run.StorageDeletes == 0 {
+		t.Errorf("expected at least 1 delete from inspected databases, got 0")
+	}
+}
+
+func TestReconcile_RootWalkCapZeroDisablesRootWalk(t *testing.T) {
+	now := time.Now().UTC()
+	store := newFakeBackend()
+	store.put("unknowndb/m/2026/04/27/12/x.parquet", now.Add(-48*time.Hour))
+	coord := newFakeCoordinator()
+
+	r, err := NewReconciler(
+		Config{
+			Enabled:                  true,
+			BackendKind:              BackendShared,
+			DeletePreManifestOrphans: true,
+			MaxRootWalkDatabases:     -1, // explicit; applyDefaults won't overwrite
+		},
+		coord, store, &fakeGate{scan: true, sweep: true}, nil, zerolog.Nop(),
+	)
+	if err != nil {
+		t.Fatalf("NewReconciler: %v", err)
+	}
+	// Force the cap to 0 *after* applyDefaults to test the disable path.
+	r.cfg.MaxRootWalkDatabases = 0
+	run, err := r.Reconcile(context.Background(), false)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if run.StorageDeletes != 0 {
+		t.Errorf("MaxRootWalkDatabases=0 should disable root walk, got %d deletes", run.StorageDeletes)
+	}
+	exists, _ := store.Exists(context.Background(), "unknowndb/m/2026/04/27/12/x.parquet")
+	if !exists {
+		t.Error("file should NOT have been deleted with root walk disabled")
 	}
 }
 

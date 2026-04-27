@@ -98,7 +98,11 @@ func (r *Reconciler) walkStorage(ctx context.Context, manifest []*ObjectKey) (wa
 // the discovery walk too — without this, a stuck top-level list could
 // block past the run budget.
 func (r *Reconciler) derivePrefixes(ctx context.Context, manifest []*ObjectKey) []string {
-	set := make(map[string]struct{}, 32)
+	// Initial capacity sized to a typical production schema's
+	// (database, measurement) cardinality. Per-iteration reallocs on
+	// large manifests are noisy on profiling — 128 covers most real
+	// deployments without over-allocating on small clusters.
+	set := make(map[string]struct{}, 128)
 	for _, e := range manifest {
 		if e.Database == "" || e.Measurement == "" {
 			// Pre-Phase-1 file in the manifest with no metadata. The
@@ -115,26 +119,45 @@ func (r *Reconciler) derivePrefixes(ctx context.Context, manifest []*ObjectKey) 
 
 	// Root walk catches pre-Phase-1 files and any file in a database the
 	// manifest doesn't know about. The cost is one extra List of the
-	// top-level directories — DirectoryLister returns those without
-	// recursing, so this is cheap on every backend.
-	if dl, ok := r.storage.(storage.DirectoryLister); ok {
-		dirs, err := dl.ListDirectories(ctx, "")
-		if err == nil {
-			for _, d := range dirs {
-				// Top-level directories are databases. We add each as a
-				// separate prefix so the per-prefix List below picks up
-				// any (database, measurement) pair not in the manifest.
-				key := strings.TrimSuffix(d, "/") + "/"
-				if _, exists := set[key]; !exists {
+	// top-level directories plus one ListDirectories per unknown
+	// database — bounded by cfg.MaxRootWalkDatabases so a sprawling
+	// cluster (or a shared bucket with unrelated top-level dirs) can't
+	// trigger thousands of metadata calls per tick. Set the cap to 0
+	// in config to disable the root walk entirely.
+	if r.cfg.MaxRootWalkDatabases > 0 {
+		if dl, ok := r.storage.(storage.DirectoryLister); ok {
+			dirs, err := dl.ListDirectories(ctx, "")
+			if err == nil {
+				inspected := 0
+				for _, d := range dirs {
+					if inspected >= r.cfg.MaxRootWalkDatabases {
+						r.logger.Warn().
+							Int("inspected", inspected).
+							Int("total", len(dirs)).
+							Int("cap", r.cfg.MaxRootWalkDatabases).
+							Msg("Reconciliation: root walk cap reached; remaining unknown databases skipped this tick")
+						break
+					}
+					// Top-level directories are databases. We add each as a
+					// separate prefix so the per-prefix List below picks up
+					// any (database, measurement) pair not in the manifest.
+					key := strings.TrimSuffix(d, "/") + "/"
+					if _, exists := set[key]; exists {
+						// Already covered by the manifest-derived set;
+						// don't count toward the inspection cap.
+						continue
+					}
+					inspected++
 					// d is a database; we don't know its measurements yet.
 					// Walk one level deeper to get measurements.
 					innerDirs, innerErr := dl.ListDirectories(ctx, key)
-					if innerErr == nil {
-						for _, m := range innerDirs {
-							subKey := strings.TrimSuffix(d, "/") + "/" + strings.TrimSuffix(m, "/") + "/"
-							if _, exists := set[subKey]; !exists {
-								prefixes = append(prefixes, subKey)
-							}
+					if innerErr != nil {
+						continue
+					}
+					for _, m := range innerDirs {
+						subKey := strings.TrimSuffix(d, "/") + "/" + strings.TrimSuffix(m, "/") + "/"
+						if _, exists := set[subKey]; !exists {
+							prefixes = append(prefixes, subKey)
 						}
 					}
 				}
@@ -171,6 +194,17 @@ func (r *Reconciler) listPrefix(ctx context.Context, prefix string) ([]objectRec
 		return out, nil
 	}
 
+	// Backend doesn't implement ObjectLister. Files come back without
+	// mtime, so the grace window check in computeDiff will treat them
+	// as YOUNG (protected) — orphan-storage cleanup degrades to a
+	// no-op for these files, but no data loss is possible. Log Warn
+	// once-per-tick (a tick that hits this path produces one warning,
+	// not one per file) so operators see the safety net engaged.
+	r.logger.Warn().
+		Str("backend_type", r.storage.Type()).
+		Str("prefix", prefix).
+		Msg("Reconciliation: backend does not implement ObjectLister; orphan-storage detection is degraded (files protected by grace window)")
+
 	paths, err := r.storage.List(prefixCtx, prefix)
 	if err != nil {
 		return nil, fmt.Errorf("list %q: %w", prefix, err)
@@ -180,9 +214,6 @@ func (r *Reconciler) listPrefix(ctx context.Context, prefix string) ([]objectRec
 		if !isParquetCandidate(p) {
 			continue
 		}
-		// Without ObjectLister we have no mtime — set the zero value;
-		// the grace window check treats time.Time{} as "infinitely old"
-		// since IsZero() is checked before the time-since math runs.
 		out = append(out, objectRecord{path: p})
 	}
 	return out, nil
