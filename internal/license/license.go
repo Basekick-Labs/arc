@@ -127,6 +127,13 @@ func (l *License) CanUseQueryManagement() bool {
 	return l.HasFeature(FeatureQueryManagement)
 }
 
+// CanUseClustering returns true if the license allows multi-node
+// clustering (Raft consensus, peer file replication, manifest
+// reconciliation). Requires the clustering feature flag.
+func (l *License) CanUseClustering() bool {
+	return l.HasFeature(FeatureClustering)
+}
+
 // TierFromString converts a string to a Tier
 func TierFromString(s string) Tier {
 	switch s {

@@ -38,6 +38,7 @@ type Config struct {
 	Backup          BackupConfig
 	Governance      GovernanceConfig
 	QueryManagement QueryManagementConfig
+	Reconciliation  ReconciliationConfig
 }
 
 type ServerConfig struct {
@@ -210,6 +211,27 @@ type LicenseConfig struct {
 // are enabled (continuous_query.enabled, retention.enabled) AND a valid license is present.
 type SchedulerConfig struct {
 	RetentionSchedule string // Cron schedule for retention (default: "0 3 * * *" = 3am daily)
+}
+
+// ReconciliationConfig holds configuration for the Phase 5 manifest-vs-storage
+// reconciler (Enterprise feature, requires clustering). Default off; once
+// enabled, the reconciler runs on cron and auto-acts on drift older than the
+// grace window, with a per-run blast cap.
+type ReconciliationConfig struct {
+	Enabled                  bool   // Off by default — explicit operator opt-in
+	Schedule                 string // Cron schedule (default: "17 4 * * *" = 04:17 daily)
+	GraceWindowSeconds       int    // Orphan storage files younger than this are NEVER deleted (default: 86400 = 24h)
+	ClockSkewAllowanceSeconds int   // Added to grace window (default: 300 = 5m)
+	PerPrefixTimeoutSeconds  int    // Per-prefix List timeout (default: 300 = 5m)
+	MaxRunDurationSeconds    int    // Overall run timeout (default: 1800 = 30m)
+	MaxManifestSize          int    // Largest FSM manifest the reconciler will operate on (default: 200000)
+	MaxDeletesPerRun         int    // Per-run blast cap, manifest+storage combined (default: 10000)
+	BatchSize                int    // Chunk size for Raft batches and BatchDelete (default: 1000)
+	DeletePreManifestOrphans bool   // Allow deleting orphan files outside the 7-segment Arc layout. Default: false (secure-by-default for shared buckets). Set to true ONLY if you intentionally want pre-Phase-1 / migration-residual cleanup.
+	ManifestOnlyDryRun       bool   // Force every cron run to be dry-run. Default: true (safe first-run posture). Operators flip to false after reviewing dry-run audits.
+	SamplePathsCap           int    // Bound on sample paths in audit events / Run summaries (default: 10)
+	MaxRootWalkDatabases     int    // Cap on unknown databases the root-walk fallback descends into (default: 1000; 0 disables)
+	RecheckConcurrency       int    // Worker count for parallel storage.Exists re-check during manifest sweep (default: 8; 1 forces sequential)
 }
 
 // TieredStorageConfig holds configuration for tiered storage (Enterprise feature)
@@ -556,6 +578,22 @@ func Load() (*Config, error) {
 		Scheduler: SchedulerConfig{
 			RetentionSchedule: v.GetString("scheduler.retention_schedule"),
 		},
+		Reconciliation: ReconciliationConfig{
+			Enabled:                   v.GetBool("reconciliation.enabled"),
+			Schedule:                  v.GetString("reconciliation.schedule"),
+			GraceWindowSeconds:        v.GetInt("reconciliation.grace_window_seconds"),
+			ClockSkewAllowanceSeconds: v.GetInt("reconciliation.clock_skew_allowance_seconds"),
+			PerPrefixTimeoutSeconds:   v.GetInt("reconciliation.per_prefix_timeout_seconds"),
+			MaxRunDurationSeconds:     v.GetInt("reconciliation.max_run_duration_seconds"),
+			MaxManifestSize:           v.GetInt("reconciliation.max_manifest_size"),
+			MaxDeletesPerRun:          v.GetInt("reconciliation.max_deletes_per_run"),
+			BatchSize:                 v.GetInt("reconciliation.batch_size"),
+			DeletePreManifestOrphans:  v.GetBool("reconciliation.delete_pre_manifest_orphans"),
+			ManifestOnlyDryRun:        v.GetBool("reconciliation.manifest_only_dry_run"),
+			SamplePathsCap:            v.GetInt("reconciliation.sample_paths_cap"),
+			MaxRootWalkDatabases:      v.GetInt("reconciliation.max_root_walk_databases"),
+			RecheckConcurrency:        v.GetInt("reconciliation.recheck_concurrency"),
+		},
 		Cluster: ClusterConfig{
 			Enabled:             v.GetBool("cluster.enabled"),
 			NodeID:              v.GetString("cluster.node_id"),
@@ -794,6 +832,33 @@ func setDefaults(v *viper.Viper) {
 	// Scheduler defaults (Enterprise features)
 	// Note: CQ and retention schedulers are auto-enabled when their features are enabled AND license allows
 	v.SetDefault("scheduler.retention_schedule", "0 3 * * *") // 3am daily
+
+	// Reconciliation (Phase 5 manifest-vs-storage drift cleanup).
+	// Off by default; conservative grace window + blast cap when enabled.
+	v.SetDefault("reconciliation.enabled", false)
+	v.SetDefault("reconciliation.schedule", "17 4 * * *") // 04:17 daily, offset from retention/compaction
+	v.SetDefault("reconciliation.grace_window_seconds", 86400)
+	v.SetDefault("reconciliation.clock_skew_allowance_seconds", 300)
+	v.SetDefault("reconciliation.per_prefix_timeout_seconds", 300)
+	v.SetDefault("reconciliation.max_run_duration_seconds", 1800)
+	v.SetDefault("reconciliation.max_manifest_size", 200000)
+	v.SetDefault("reconciliation.max_deletes_per_run", 10000)
+	v.SetDefault("reconciliation.batch_size", 1000)
+	// Secure-by-default: pre-manifest orphans are off. An operator on a
+	// shared bucket with stray non-Arc files would otherwise see those
+	// files deleted on first cron run. Operators who actually want
+	// pre-manifest cleanup must opt in explicitly.
+	v.SetDefault("reconciliation.delete_pre_manifest_orphans", false)
+	// Secure-by-default: report-only on the first run. Even though the
+	// feature itself is opt-in via reconciliation.enabled, flipping
+	// enabled=true alone should not auto-delete on the very first cron
+	// tick. Operators review the dry-run audit, then explicitly flip
+	// manifest_only_dry_run=false to allow real deletes. Druid and
+	// Iceberg ship the same posture.
+	v.SetDefault("reconciliation.manifest_only_dry_run", true)
+	v.SetDefault("reconciliation.sample_paths_cap", 10)
+	v.SetDefault("reconciliation.max_root_walk_databases", 1000)
+	v.SetDefault("reconciliation.recheck_concurrency", 8)
 
 	// Cluster defaults (Enterprise feature)
 	v.SetDefault("cluster.enabled", false)              // Disabled by default (standalone mode)
