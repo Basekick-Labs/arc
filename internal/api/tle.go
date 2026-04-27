@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"sync/atomic"
@@ -116,7 +117,12 @@ localProcessing:
 	// uncapped — a 1MB gzip payload that decompresses to 50GB would OOM
 	// the process before our handler-level size check fires. The
 	// msgpack handler uses the same pattern; we now mirror it for TLE.
-	body := c.Request().Body()
+	//
+	// Defensive copy: see lineprotocol.go for full rationale. The TLE
+	// parser produces fresh strings today, but a defensive copy at the
+	// boundary closes the silent-aliasing footgun if anyone ever adds a
+	// fast-path that retains a sub-slice of the request body.
+	body := append([]byte(nil), c.Request().Body()...)
 	originalSize := len(body)
 	h.totalBytes.Add(int64(originalSize))
 
@@ -204,6 +210,12 @@ localProcessing:
 			Str("measurement", measurement).
 			Int("records", len(tleRecords)).
 			Msg("Failed to write TLE data to Arrow buffer")
+		// See lineprotocol.go for ErrSchemaChurnExceeded → 503 rationale.
+		if errors.Is(err, ingest.ErrSchemaChurnExceeded) {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"error": "Write rejected (schema churn): " + err.Error(),
+			})
+		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Write failed: " + err.Error(),
 		})

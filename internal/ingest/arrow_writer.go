@@ -789,7 +789,13 @@ type ArrowBuffer struct {
 	totalErrors          atomic.Int64
 	totalWALErrors       atomic.Int64 // WAL write failures (real I/O / serialization errors)
 	totalWALDropped      atomic.Int64 // WAL backpressure drops (entry queued but channel full)
-	queueDepth           atomic.Int64 // Current flush queue depth
+	// totalSchemaChurnExceeded counts requests rejected because the
+	// schema-evolution flush loop hit schemaEvolutionMaxIters under
+	// sustained concurrent schema rotation against the same
+	// (database, measurement) buffer. Pathological signal — operators
+	// alert on a non-zero rate.
+	totalSchemaChurnExceeded atomic.Int64
+	queueDepth               atomic.Int64 // Current flush queue depth
 
 	// walDropLogSampler debounces the WAL-dropped Warn so a sustained
 	// burst of backpressure produces ~one log line per second instead
@@ -1423,10 +1429,24 @@ func (b *ArrowBuffer) tryEnqueueFlush(
 // Steady state: 1 iteration (no schema change). Adversarial state:
 // rotating-schema writers could in principle trigger an unbounded
 // loop because flushBufferLocked releases shard.mu for I/O and a
-// concurrent writer can install a fresh schema in that window. The
-// bound exists to break out of pathological cases — at the cost of
-// one schema-mixed flush, which the next periodic flush corrects.
+// concurrent writer can install a fresh schema in that window.
+//
+// Hitting the cap means at least 8 distinct schemas raced through
+// the same (database, measurement) buffer in the time window of one
+// flush — a sustained-churn signal, not transient. Surfacing this as
+// ErrSchemaChurnExceeded lets the caller fail the request with a 503
+// rather than committing a wide schema-mixed buffer to disk that
+// query-side schema-on-read would then have to reconcile.
 const schemaEvolutionMaxIters = 8
+
+// ErrSchemaChurnExceeded is returned by flushOnSchemaChangeLocked when
+// schemaEvolutionMaxIters is reached. Treat as a transient backpressure
+// signal: the caller should reject the write with a retryable status
+// (503) so upstream senders back off; the in-buffer rows for the older
+// schemas have already been flushed to durable Parquet by the loop's
+// per-iteration flushes, so there is no data loss — only a per-request
+// failure under sustained schema-rotation churn.
+var ErrSchemaChurnExceeded = errors.New("schema-evolution loop exceeded max iterations: sustained concurrent schema churn against the same (database, measurement)")
 
 // flushOnSchemaChangeLocked is the shared helper used by both columnar
 // write paths to handle schema evolution under the shard lock.
@@ -1473,15 +1493,18 @@ func (b *ArrowBuffer) flushOnSchemaChangeLocked(
 			// error — the next iteration sees !exists and exits.
 		}
 	}
-	// Reached the iteration cap. Log loudly: this only happens under
-	// adversarial concurrent schema rotation. The next periodic flush
-	// will produce a column-mismatch error which retention/compaction
-	// surfaces; data is still in WAL.
+	// Reached the iteration cap. Surface as a typed error so callers can
+	// reject the request with a retryable 503 rather than silently
+	// committing a wide schema-mixed buffer to disk. The per-iteration
+	// flushes inside the loop already wrote the older schemas' rows to
+	// durable Parquet, so there is no data loss — only this single
+	// request fails under sustained schema-rotation churn.
+	b.totalSchemaChurnExceeded.Add(1)
 	b.logger.Warn().
 		Str("buffer_key", bufferKey).
 		Int("max_iters", schemaEvolutionMaxIters).
-		Msg("Schema-evolution loop hit max iterations; proceeding (data in WAL, schema mixing possible until next flush)")
-	return nil
+		Msg("Schema-evolution loop hit max iterations; rejecting write with ErrSchemaChurnExceeded")
+	return ErrSchemaChurnExceeded
 }
 
 // writeColumnar writes a columnar record to the buffer
@@ -3341,6 +3364,7 @@ func (b *ArrowBuffer) GetStats() map[string]interface{} {
 		"total_errors":           b.totalErrors.Load(),
 		"total_wal_errors":       b.totalWALErrors.Load(),
 		"total_wal_dropped":      b.totalWALDropped.Load(),
+		"total_schema_churn_exceeded": b.totalSchemaChurnExceeded.Load(),
 		"active_buffers":         activeBuffers,
 		"flush_queue_depth":      b.queueDepth.Load(),
 		"flush_workers":          b.flushWorkers,

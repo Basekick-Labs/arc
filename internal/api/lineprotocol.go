@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
@@ -211,7 +212,16 @@ localProcessing:
 	// uncapped — a 1MB gzip payload that decompresses to 50GB would OOM
 	// the process before our handler-level size check fires. The
 	// msgpack handler uses the same pattern; we now mirror it for LP.
-	body := c.Request().Body()
+	//
+	// Defensive copy of the raw fasthttp body: c.Request().Body() returns
+	// a slice owned by fasthttp and reused after the handler returns.
+	// The current parser path produces fresh strings (no aliasing into
+	// the byte slice), so today's behavior is safe — but documenting that
+	// "no future change may retain a sub-slice of body" is brittle. One
+	// memcpy at the boundary is dwarfed by per-record allocations and
+	// closes the silent-aliasing footgun gemini flagged on PR #413.
+	// The decompression branches below already return fresh slices.
+	body := append([]byte(nil), c.Request().Body()...)
 	originalSize := len(body)
 	h.totalBytes.Add(int64(originalSize))
 
@@ -307,6 +317,14 @@ localProcessing:
 				Str("measurement", measurement).
 				Int("records", len(record.Columns["time"])).
 				Msg("Failed to write to Arrow buffer")
+			// Schema-churn rejection is retryable — surface as 503 so
+			// upstream senders back off rather than treating this as a
+			// permanent server error. See ingest.ErrSchemaChurnExceeded.
+			if errors.Is(err, ingest.ErrSchemaChurnExceeded) {
+				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+					"error": "Write rejected (schema churn): " + err.Error(),
+				})
+			}
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"error": "Write failed: " + err.Error(),
 			})
