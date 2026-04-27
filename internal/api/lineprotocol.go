@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
@@ -26,8 +27,11 @@ type LineProtocolHandler struct {
 	parser *ingest.LineProtocolParser
 	logger zerolog.Logger
 
-	// RBAC support
-	authManager AuthManager
+	// authManager holds the concrete *auth.AuthManager so route-level
+	// auth.RequireWrite / RequireAdmin can be wired without the
+	// silent-miss type-assert pattern. See MsgPackHandler.authManager
+	// for full rationale. nil = OSS no-auth.
+	authManager *auth.AuthManager
 	rbacManager RBACChecker
 
 	// Cluster routing support
@@ -62,8 +66,9 @@ func NewLineProtocolHandler(buffer *ingest.ArrowBuffer, logger zerolog.Logger) *
 	}
 }
 
-// SetAuthAndRBAC sets the auth and RBAC managers for permission checking
-func (h *LineProtocolHandler) SetAuthAndRBAC(authManager AuthManager, rbacManager RBACChecker) {
+// SetAuthAndRBAC sets the auth and RBAC managers. See
+// MsgPackHandler.SetAuthAndRBAC for the full rationale.
+func (h *LineProtocolHandler) SetAuthAndRBAC(authManager *auth.AuthManager, rbacManager RBACChecker) {
 	h.authManager = authManager
 	h.rbacManager = rbacManager
 }
@@ -79,25 +84,27 @@ func (h *LineProtocolHandler) checkWritePermissions(c *fiber.Ctx, database strin
 	return CheckWritePermissions(c, h.rbacManager, h.logger, database, measurements)
 }
 
-// RegisterRoutes registers Line Protocol routes
+// RegisterRoutes registers Line Protocol routes. All write endpoints
+// are gated by auth.RequireWrite when auth is enabled; the /flush
+// endpoint is admin-gated because it forces a global flush across
+// all shards (operationally heavy + spammable). Per CLAUDE.md,
+// mutating endpoints MUST have an explicit auth middleware.
 func (h *LineProtocolHandler) RegisterRoutes(app *fiber.App) {
-	// InfluxDB 1.x compatible endpoint (matches InfluxDB API)
-	app.Post("/write", h.WriteV1)
+	writeAuth := withWriteAuth(h.authManager)
+	adminAuth := withAdminAuth(h.authManager)
 
-	// InfluxDB 2.x compatible endpoint (matches InfluxDB API)
-	app.Post("/api/v2/write", h.WriteInfluxDB)
+	// InfluxDB 1.x compatible endpoint
+	app.Post("/write", writeAuth, h.WriteV1)
+	// InfluxDB 2.x compatible endpoint
+	app.Post("/api/v2/write", writeAuth, h.WriteInfluxDB)
+	// Arc native endpoint (uses x-arc-database header)
+	app.Post("/api/v1/write/line-protocol", writeAuth, h.WriteSimple)
+	// Flush endpoint — admin-gated.
+	app.Post("/api/v1/write/line-protocol/flush", adminAuth, h.Flush)
 
-	// Arc native endpoint (no query parameters, uses x-arc-database header)
-	app.Post("/api/v1/write/line-protocol", h.WriteSimple)
-
-	// Stats endpoint
+	// Stats and health remain at any-authenticated-token level.
 	app.Get("/api/v1/write/line-protocol/stats", h.Stats)
-
-	// Health endpoint
 	app.Get("/api/v1/write/line-protocol/health", h.Health)
-
-	// Flush endpoint
-	app.Post("/api/v1/write/line-protocol/flush", h.Flush)
 
 	h.logger.Info().Msg("Line Protocol routes registered")
 }
@@ -199,13 +206,18 @@ func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string, precisi
 	}
 
 localProcessing:
-	// Get request body
-	body := c.Body()
+	// CRITICAL: use c.Request().Body() (raw) instead of c.Body() to avoid
+	// fasthttp's transparent gunzip. fasthttp's BodyGunzip path is
+	// uncapped — a 1MB gzip payload that decompresses to 50GB would OOM
+	// the process before our handler-level size check fires. The
+	// msgpack handler uses the same pattern; we now mirror it for LP.
+	body := c.Request().Body()
 	originalSize := len(body)
 	h.totalBytes.Add(int64(originalSize))
 
-	// Check for gzip compression (magic number: 0x1f 0x8b)
-	// Uses pooled gzip.Reader to avoid ~32KB allocation per request
+	// Check for gzip compression (magic number: 0x1f 0x8b).
+	// decompressGzip applies a hard 100MB decompressed cap so an
+	// adversarial gzip bomb is rejected before allocation.
 	if len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b {
 		h.totalBytesGzipped.Add(int64(originalSize))
 
@@ -214,7 +226,7 @@ localProcessing:
 			h.totalErrors.Add(1)
 			h.logger.Error().Err(err).Msg("Failed to decompress gzip data")
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": "Failed to decompress gzip data: " + err.Error(),
+				"error": "Failed to decompress gzip data",
 			})
 		}
 

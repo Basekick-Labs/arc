@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
@@ -81,8 +82,14 @@ type MsgPackHandler struct {
 	logger         zerolog.Logger
 	maxPayloadSize int64 // Maximum payload size in bytes (applies to both compressed and decompressed)
 
-	// RBAC support
-	authManager AuthManager
+	// authManager holds the concrete *auth.AuthManager so we can wire
+	// auth.RequireWrite as route-level middleware AND so RBAC checks
+	// at request time use the same instance. Concrete (not the local
+	// AuthManager interface) because auth.RequireWrite is implemented
+	// against the struct; using the interface required a type
+	// assertion that could silently miss on a mock and disable route
+	// protection.
+	authManager *auth.AuthManager
 	rbacManager RBACChecker
 
 	// Cluster routing support
@@ -99,8 +106,12 @@ func NewMsgPackHandler(logger zerolog.Logger, arrowBuffer *ingest.ArrowBuffer, m
 	}
 }
 
-// SetAuthAndRBAC sets the auth and RBAC managers for permission checking
-func (h *MsgPackHandler) SetAuthAndRBAC(authManager AuthManager, rbacManager RBACChecker) {
+// SetAuthAndRBAC sets the auth and RBAC managers. Takes the concrete
+// *auth.AuthManager (not the local AuthManager interface) so route-
+// level auth.RequireWrite middleware can be wired without a type
+// assertion that could silently miss on a mock and disable
+// protection. nil = auth disabled (OSS default).
+func (h *MsgPackHandler) SetAuthAndRBAC(authManager *auth.AuthManager, rbacManager RBACChecker) {
 	h.authManager = authManager
 	h.rbacManager = rbacManager
 }
@@ -147,9 +158,13 @@ func (h *MsgPackHandler) checkWritePermissions(c *fiber.Ctx, database string, me
 	return CheckWritePermissions(c, h.rbacManager, h.logger, database, measurements)
 }
 
-// RegisterRoutes registers MessagePack endpoints
+// RegisterRoutes registers MessagePack endpoints. The write endpoint
+// is gated by auth.RequireWrite when an auth manager is configured —
+// per CLAUDE.md, mutating endpoints MUST have an explicit write-tier
+// auth middleware. Stats and spec remain at any-authenticated-token
+// level (gated by the global auth middleware in main.go).
 func (h *MsgPackHandler) RegisterRoutes(app *fiber.App) {
-	app.Post("/api/v1/write/msgpack", h.writeMsgPack)
+	app.Post("/api/v1/write/msgpack", withWriteAuth(h.authManager), h.writeMsgPack)
 	app.Get("/api/v1/write/msgpack/stats", h.msgPackStats)
 	app.Get("/api/v1/write/msgpack/spec", h.msgPackSpec)
 }

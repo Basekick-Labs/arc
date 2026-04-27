@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync/atomic"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
@@ -22,8 +23,9 @@ type TLEHandler struct {
 	parser *ingest.TLEParser
 	logger zerolog.Logger
 
-	// RBAC support
-	authManager AuthManager
+	// authManager holds the concrete *auth.AuthManager. See
+	// MsgPackHandler.authManager for the full rationale.
+	authManager *auth.AuthManager
 	rbacManager RBACChecker
 
 	// Cluster routing support
@@ -45,8 +47,9 @@ func NewTLEHandler(buffer *ingest.ArrowBuffer, logger zerolog.Logger) *TLEHandle
 	}
 }
 
-// SetAuthAndRBAC sets the auth and RBAC managers for permission checking
-func (h *TLEHandler) SetAuthAndRBAC(authManager AuthManager, rbacManager RBACChecker) {
+// SetAuthAndRBAC sets the auth and RBAC managers. See
+// MsgPackHandler.SetAuthAndRBAC for the full rationale.
+func (h *TLEHandler) SetAuthAndRBAC(authManager *auth.AuthManager, rbacManager RBACChecker) {
 	h.authManager = authManager
 	h.rbacManager = rbacManager
 }
@@ -57,9 +60,11 @@ func (h *TLEHandler) SetRouter(router *cluster.Router) {
 	h.router = router
 }
 
-// RegisterRoutes registers TLE routes
+// RegisterRoutes registers TLE routes. The write endpoint is gated by
+// auth.RequireWrite when auth is enabled — per CLAUDE.md, mutating
+// endpoints MUST have an explicit write-tier auth middleware.
 func (h *TLEHandler) RegisterRoutes(app *fiber.App) {
-	app.Post("/api/v1/write/tle", h.handleWrite)
+	app.Post("/api/v1/write/tle", withWriteAuth(h.authManager), h.handleWrite)
 	app.Get("/api/v1/write/tle/stats", h.Stats)
 
 	h.logger.Info().Msg("TLE routes registered")
@@ -105,19 +110,25 @@ func (h *TLEHandler) handleWrite(c *fiber.Ctx) error {
 	}
 
 localProcessing:
-	body := c.Body()
+	// CRITICAL: use c.Request().Body() (raw) instead of c.Body() to avoid
+	// fasthttp's transparent gunzip. fasthttp's BodyGunzip path is
+	// uncapped — a 1MB gzip payload that decompresses to 50GB would OOM
+	// the process before our handler-level size check fires. The
+	// msgpack handler uses the same pattern; we now mirror it for TLE.
+	body := c.Request().Body()
 	originalSize := len(body)
 	h.totalBytes.Add(int64(originalSize))
 
-	// Check for gzip compression (magic number: 0x1f 0x8b)
-	// Reuses the LP gzip reader pool to share pooled readers across handlers
+	// Check for gzip compression (magic number: 0x1f 0x8b).
+	// decompressGzipPooled applies a hard decompressed-size cap so an
+	// adversarial gzip bomb is rejected before allocation.
 	if len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b {
 		decompressed, err := decompressGzipPooled(body, 0)
 		if err != nil {
 			h.totalErrors.Add(1)
 			h.logger.Error().Err(err).Msg("Failed to decompress gzip data")
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": "Failed to decompress gzip data: " + err.Error(),
+				"error": "Failed to decompress gzip data",
 			})
 		}
 		body = decompressed
