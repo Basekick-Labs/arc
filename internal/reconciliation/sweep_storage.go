@@ -169,8 +169,10 @@ func (r *Reconciler) sweepOrphanStorage(
 
 // applyStorageDeletes executes the actual deletes. Prefers BatchDeleter
 // when the backend supports it (S3, Azure both do via DeleteObjects).
-// On per-file Delete failures we log Warn and continue — the file may
-// have been deleted by another path; the next run will see it gone.
+// Per-file Delete failures are recorded in run.Errors and summarized
+// in a single Warn at the end of the batch — emitting one Warn per
+// failure floods operator dashboards under transient backend issues.
+// The next reconcile run will see the file again and retry.
 //
 // Returns the count of files we believe we deleted. Backends that
 // silently succeed on a non-existent file (S3) inflate this count
@@ -196,16 +198,23 @@ func (r *Reconciler) applyStorageDeletes(
 		}
 	}
 	applied := 0
+	deleteErrCount := 0
+	var deleteLastErr error
 	for _, p := range paths {
 		if err := r.storage.Delete(ctx, p); err != nil {
-			r.logger.Warn().
-				Err(err).
-				Str("path", p).
-				Msg("Reconciliation: storage.Delete failed; will retry on next run")
+			deleteErrCount++
+			deleteLastErr = err
 			run.Errors = appendBounded(run.Errors, fmt.Sprintf("delete %q: %v", p, err), 32)
 			continue
 		}
 		applied++
+	}
+	if deleteErrCount > 0 {
+		r.logger.Warn().
+			Err(deleteLastErr).
+			Int("batch_failed_deletes", deleteErrCount).
+			Int("batch_size", len(paths)).
+			Msg("Reconciliation: storage.Delete failures — affected files will retry on next run")
 	}
 	return applied
 }

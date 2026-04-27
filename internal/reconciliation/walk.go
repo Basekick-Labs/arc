@@ -43,8 +43,19 @@ type walkResult struct {
 // The returned slice is in arbitrary order. Callers should expect
 // duplicates only if List itself returns duplicates (none of the
 // production backends do).
+//
+// Logs the ObjectLister-missing Warn once per run (not per prefix) so
+// a backend without ObjectLister doesn't flood operator dashboards on
+// large schemas.
 func (r *Reconciler) walkStorage(ctx context.Context, manifest []*ObjectKey) (walkResult, error) {
 	prefixes := r.derivePrefixes(ctx, manifest)
+
+	if _, hasObjectLister := r.storage.(storage.ObjectLister); !hasObjectLister {
+		r.logger.Warn().
+			Str("backend_type", r.storage.Type()).
+			Int("prefix_count", len(prefixes)).
+			Msg("Reconciliation: backend does not implement ObjectLister; orphan-storage detection is degraded (files protected by grace window)")
+	}
 
 	res := walkResult{
 		records: make([]objectRecord, 0, len(manifest)),
@@ -98,11 +109,18 @@ func (r *Reconciler) walkStorage(ctx context.Context, manifest []*ObjectKey) (wa
 // the discovery walk too — without this, a stuck top-level list could
 // block past the run budget.
 func (r *Reconciler) derivePrefixes(ctx context.Context, manifest []*ObjectKey) []string {
-	// Initial capacity sized to a typical production schema's
-	// (database, measurement) cardinality. Per-iteration reallocs on
-	// large manifests are noisy on profiling — 128 covers most real
-	// deployments without over-allocating on small clusters.
+	// Two sets sized to typical production schema cardinality:
+	//   set:   "database/measurement/" — drives the per-prefix walk
+	//   dbSet: "database/"             — used by the root-walk fallback
+	//                                    to skip databases the manifest
+	//                                    already covers, without burning
+	//                                    inspection budget on them.
+	// Keeping them separate fixes a real bug: a previous version checked
+	// the database-only key against `set` and always missed, causing
+	// known databases to consume the MaxRootWalkDatabases budget and
+	// prematurely cut off discovery of truly-unknown databases.
 	set := make(map[string]struct{}, 128)
+	dbSet := make(map[string]struct{}, 128)
 	for _, e := range manifest {
 		if e.Database == "" || e.Measurement == "" {
 			// Pre-Phase-1 file in the manifest with no metadata. The
@@ -110,6 +128,7 @@ func (r *Reconciler) derivePrefixes(ctx context.Context, manifest []*ObjectKey) 
 			continue
 		}
 		set[e.Database+"/"+e.Measurement+"/"] = struct{}{}
+		dbSet[e.Database+"/"] = struct{}{}
 	}
 
 	prefixes := make([]string, 0, len(set)+1)
@@ -142,8 +161,8 @@ func (r *Reconciler) derivePrefixes(ctx context.Context, manifest []*ObjectKey) 
 					// separate prefix so the per-prefix List below picks up
 					// any (database, measurement) pair not in the manifest.
 					key := strings.TrimSuffix(d, "/") + "/"
-					if _, exists := set[key]; exists {
-						// Already covered by the manifest-derived set;
+					if _, exists := dbSet[key]; exists {
+						// Already covered by the manifest-derived dbSet;
 						// don't count toward the inspection cap.
 						continue
 					}
@@ -197,14 +216,9 @@ func (r *Reconciler) listPrefix(ctx context.Context, prefix string) ([]objectRec
 	// Backend doesn't implement ObjectLister. Files come back without
 	// mtime, so the grace window check in computeDiff will treat them
 	// as YOUNG (protected) — orphan-storage cleanup degrades to a
-	// no-op for these files, but no data loss is possible. Log Warn
-	// once-per-tick (a tick that hits this path produces one warning,
-	// not one per file) so operators see the safety net engaged.
-	r.logger.Warn().
-		Str("backend_type", r.storage.Type()).
-		Str("prefix", prefix).
-		Msg("Reconciliation: backend does not implement ObjectLister; orphan-storage detection is degraded (files protected by grace window)")
-
+	// no-op for these files, but no data loss is possible. The
+	// ObjectLister-missing Warn fires once at the top of walkStorage,
+	// not per prefix, to avoid log flooding on large schemas.
 	paths, err := r.storage.List(prefixCtx, prefix)
 	if err != nil {
 		return nil, fmt.Errorf("list %q: %w", prefix, err)

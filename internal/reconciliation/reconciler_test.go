@@ -929,6 +929,60 @@ func TestReconcile_RootWalkCapBoundsListDirectories(t *testing.T) {
 	}
 }
 
+func TestReconcile_RootWalkCapDoesNotCountKnownDatabases(t *testing.T) {
+	// Regression: a previous version of derivePrefixes checked the
+	// database-only key against the database/measurement set, which
+	// always missed — causing every known database to burn through
+	// the MaxRootWalkDatabases budget and starve the discovery of
+	// truly unknown databases.
+	//
+	// Setup: 3 known databases (in manifest) + 2 unknown databases.
+	// Cap = 2. Both unknown databases should be inspected; the known
+	// ones must not consume budget.
+	now := time.Now().UTC()
+	store := newFakeBackend()
+	for _, db := range []string{"known1", "known2", "known3"} {
+		store.put(db+"/m/2026/04/27/12/x.parquet", now.Add(-2*time.Hour))
+	}
+	for _, db := range []string{"unknown1", "unknown2"} {
+		store.put(db+"/m/2026/04/27/12/x.parquet", now.Add(-48*time.Hour))
+	}
+	coord := newFakeCoordinator(
+		fileEntry("known1/m/2026/04/27/12/x.parquet", "node-a"),
+		fileEntry("known2/m/2026/04/27/12/x.parquet", "node-a"),
+		fileEntry("known3/m/2026/04/27/12/x.parquet", "node-a"),
+	)
+
+	r, err := NewReconciler(
+		Config{
+			Enabled:                  true,
+			BackendKind:              BackendShared,
+			DeletePreManifestOrphans: true,
+			MaxRootWalkDatabases:     2,
+		},
+		coord, store, &fakeGate{scan: true, sweep: true}, nil, zerolog.Nop(),
+	)
+	if err != nil {
+		t.Fatalf("NewReconciler: %v", err)
+	}
+	run, err := r.Reconcile(context.Background(), false)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	// Both unknown databases should be discovered (they're old enough)
+	// and their files deleted. Known databases must not be touched.
+	if run.StorageDeletes != 2 {
+		t.Errorf("expected both unknown orphans deleted (cap should not count known dbs), got StorageDeletes=%d", run.StorageDeletes)
+	}
+	for _, db := range []string{"known1", "known2", "known3"} {
+		path := db + "/m/2026/04/27/12/x.parquet"
+		exists, _ := store.Exists(context.Background(), path)
+		if !exists {
+			t.Errorf("known-db file %q should NOT have been deleted", path)
+		}
+	}
+}
+
 func TestReconcile_RootWalkCapZeroDisablesRootWalk(t *testing.T) {
 	now := time.Now().UTC()
 	store := newFakeBackend()

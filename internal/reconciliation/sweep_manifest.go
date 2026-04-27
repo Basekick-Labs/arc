@@ -87,6 +87,13 @@ func (r *Reconciler) sweepOrphanManifest(
 		applied := make([]string, 0, len(chunk))
 		remainingCap := r.cfg.MaxDeletesPerRun - (run.ManifestDeletes + run.StorageDeletes)
 		capReachedInChunk := false
+		// Per-batch counters for log-spam control: a transient backend
+		// hiccup can fail Exists for hundreds of files in a row, and
+		// printing one Warn per file drowns operator dashboards.
+		// Collect into run.Errors (capped at 32) and emit a single
+		// summary Warn at the end of the batch.
+		existsErrCount := 0
+		var existsLastErr error
 		for _, p := range chunk {
 			if len(ops) >= remainingCap {
 				// Stop building this batch at the cap. Mark CapHit so
@@ -100,7 +107,9 @@ func (r *Reconciler) sweepOrphanManifest(
 			if err != nil {
 				// Treat exists-check failures as "skip and let the
 				// next run retry" — better than risking a wrong delete.
-				r.logger.Warn().Err(err).Str("path", p).Msg("Reconciliation: storage.Exists failed during manifest sweep; skipping")
+				existsErrCount++
+				existsLastErr = err
+				run.Errors = appendBounded(run.Errors, fmt.Sprintf("Exists %q: %v", p, err), 32)
 				continue
 			}
 			if exists {
@@ -114,6 +123,17 @@ func (r *Reconciler) sweepOrphanManifest(
 			}
 			ops = append(ops, raft.BatchFileOp{Type: raft.CommandDeleteFile, Payload: payload})
 			applied = append(applied, p)
+		}
+
+		// Per-batch summary log so a transient backend hiccup that
+		// fails Exists across the chunk produces ONE Warn, not N.
+		// Per-file detail still lives in run.Errors (bounded at 32).
+		if existsErrCount > 0 {
+			r.logger.Warn().
+				Err(existsLastErr).
+				Int("batch_failed_exists", existsErrCount).
+				Int("batch_size", len(chunk)).
+				Msg("Reconciliation: storage.Exists failures during manifest sweep — affected files skipped (next run retries)")
 		}
 
 		if len(ops) == 0 {
