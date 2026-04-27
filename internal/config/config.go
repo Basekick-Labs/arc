@@ -227,8 +227,8 @@ type ReconciliationConfig struct {
 	MaxManifestSize          int    // Largest FSM manifest the reconciler will operate on (default: 200000)
 	MaxDeletesPerRun         int    // Per-run blast cap, manifest+storage combined (default: 10000)
 	BatchSize                int    // Chunk size for Raft batches and BatchDelete (default: 1000)
-	DeletePreManifestOrphans bool   // Delete files outside the db/measurement/... layout (default: true)
-	ManifestOnlyDryRun       bool   // Force every cron run to be dry-run (safety bridge; default: false)
+	DeletePreManifestOrphans bool   // Allow deleting orphan files outside the 7-segment Arc layout. Default: false (secure-by-default for shared buckets). Set to true ONLY if you intentionally want pre-Phase-1 / migration-residual cleanup.
+	ManifestOnlyDryRun       bool   // Force every cron run to be dry-run. Default: true (safe first-run posture). Operators flip to false after reviewing dry-run audits.
 	SamplePathsCap           int    // Bound on sample paths in audit events / Run summaries (default: 10)
 	MaxRootWalkDatabases     int    // Cap on unknown databases the root-walk fallback descends into (default: 1000; 0 disables)
 	RecheckConcurrency       int    // Worker count for parallel storage.Exists re-check during manifest sweep (default: 8; 1 forces sequential)
@@ -844,8 +844,18 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("reconciliation.max_manifest_size", 200000)
 	v.SetDefault("reconciliation.max_deletes_per_run", 10000)
 	v.SetDefault("reconciliation.batch_size", 1000)
-	v.SetDefault("reconciliation.delete_pre_manifest_orphans", true)
-	v.SetDefault("reconciliation.manifest_only_dry_run", false)
+	// Secure-by-default: pre-manifest orphans are off. An operator on a
+	// shared bucket with stray non-Arc files would otherwise see those
+	// files deleted on first cron run. Operators who actually want
+	// pre-manifest cleanup must opt in explicitly.
+	v.SetDefault("reconciliation.delete_pre_manifest_orphans", false)
+	// Secure-by-default: report-only on the first run. Even though the
+	// feature itself is opt-in via reconciliation.enabled, flipping
+	// enabled=true alone should not auto-delete on the very first cron
+	// tick. Operators review the dry-run audit, then explicitly flip
+	// manifest_only_dry_run=false to allow real deletes. Druid and
+	// Iceberg ship the same posture.
+	v.SetDefault("reconciliation.manifest_only_dry_run", true)
 	v.SetDefault("reconciliation.sample_paths_cap", 10)
 	v.SetDefault("reconciliation.max_root_walk_databases", 1000)
 	v.SetDefault("reconciliation.recheck_concurrency", 8)

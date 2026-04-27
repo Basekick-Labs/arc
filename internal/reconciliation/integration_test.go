@@ -160,6 +160,7 @@ func TestIntegration_LocalBackendDirectoryListerFallback(t *testing.T) {
 			BackendKind:              BackendShared,
 			GraceWindow:              1 * time.Hour,
 			DeletePreManifestOrphans: true,
+			MaxRootWalkDatabases:     -1, // enable root walk with default cap
 		},
 		newFakeCoordinator(), backend, &fakeGate{scan: true, sweep: true}, nil, zerolog.Nop(),
 	)

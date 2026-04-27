@@ -141,15 +141,22 @@ type Config struct {
 	// and BatchDeleter calls. Default 1000 (matches retention).
 	BatchSize int
 
-	// DeletePreManifestOrphans controls whether orphan-storage files with
-	// no Database/Measurement metadata (typical of pre-Phase-1 history)
-	// are eligible for deletion. Default true.
+	// DeletePreManifestOrphans controls whether orphan-storage files
+	// outside the standard Arc layout (`db/m/yyyy/mm/dd/hh/file.parquet`,
+	// 7 segments) are eligible for deletion. Default false — secure by
+	// default for shared-bucket deployments where stray non-Arc files
+	// must be left untouched. Operators who deliberately want
+	// pre-Phase-1 cleanup or migration-residual cleanup must explicitly
+	// opt in.
 	DeletePreManifestOrphans bool
 
-	// ManifestOnlyDryRun forces every cron run to be dry-run regardless of
-	// the cron's normal act-on-completion behavior. Acts as a safety
-	// bridge for operators who want a few weeks of report-only runs
-	// before flipping to full auto. Default false (auto-act).
+	// ManifestOnlyDryRun forces every cron run to be dry-run regardless
+	// of the cron's normal act-on-completion behavior. Default true —
+	// even though the feature itself is opt-in via cfg.Enabled,
+	// operators get a clean dry-run audit on the first cron tick so
+	// they can verify the diff before flipping this to false to allow
+	// real deletes. Mirrors Druid's coordinator kill task and Iceberg's
+	// remove_orphan_files posture.
 	ManifestOnlyDryRun bool
 
 	// SamplePathsCap caps the number of sample paths included in audit
@@ -178,15 +185,26 @@ type Config struct {
 }
 
 // applyDefaults fills in zero-value config fields with the documented
-// defaults AND clamps operator-tunable knobs to sane bounds. The
-// clamps are belt-and-braces against config-driven foot-guns:
-//   - Negative values would otherwise panic (negative slice index in
-//     chunk[:remainingCap] when MaxDeletesPerRun<0).
-//   - Unbounded large values could OOM (RecheckConcurrency=100k spawns
-//     that many goroutines per chunk) or overflow arithmetic
-//     (MaxRootWalkDatabases × 4 exceeds MaxInt for very large cfgs).
-// Negative inputs are treated as "operator wants the default" and
-// reset; over-large inputs are clamped to a documented ceiling.
+// defaults AND clamps operator-tunable knobs to sane bounds.
+//
+// One field has shape-#1 "0 is meaningful" semantics:
+//
+//   - MaxRootWalkDatabases: 0 explicitly disables the root-walk
+//     fallback. The downstream guard at walk.go's derivePrefixes uses
+//     `<= 0` to skip the walk, and operators set `0` in arc.toml to
+//     reach that state. Negative values mean "operator did not set
+//     this, fill default."
+//
+// All other fields: zero/negative folds into the default. The audit-
+// only / report-only operating mode is reachable via
+// ManifestOnlyDryRun=true (which also matches the production
+// secure-by-default posture), so MaxDeletesPerRun=0 is NOT overloaded
+// to mean "audit-only" — that would diverge from the behavioral knob
+// already documented for that purpose.
+//
+// Over-large inputs are clamped at documented ceilings to defend
+// against integer overflow (MaxRootWalkDatabases × 4 in walk.go) and
+// goroutine fan-out (RecheckConcurrency).
 func (c Config) applyDefaults() Config {
 	if c.GraceWindow <= 0 {
 		c.GraceWindow = 24 * time.Hour
@@ -212,20 +230,6 @@ func (c Config) applyDefaults() Config {
 	if c.SamplePathsCap <= 0 {
 		c.SamplePathsCap = 10
 	}
-	if c.MaxRootWalkDatabases == 0 {
-		c.MaxRootWalkDatabases = 1000
-	} else if c.MaxRootWalkDatabases > maxRootWalkDatabasesCap {
-		// Clamp against the int-overflow risk in the `× 4` scan-limit
-		// computation in walk.go. Operators with truly enormous tenancy
-		// can raise the ceiling here, but the realistic upper bound for
-		// "unknown databases inspected per tick" is well below this.
-		c.MaxRootWalkDatabases = maxRootWalkDatabasesCap
-	}
-	// Negative values are treated as "disable root walk" downstream
-	// (the `if r.cfg.MaxRootWalkDatabases <= 0` guard in derivePrefixes).
-	// We don't normalize them to a positive number because the tests
-	// rely on the explicit "set to 0 post-construction → disabled"
-	// pattern; -1 from operator config takes the same path.
 	if c.RecheckConcurrency <= 0 {
 		c.RecheckConcurrency = 8
 	} else if c.RecheckConcurrency > maxRecheckConcurrency {
@@ -233,6 +237,19 @@ func (c Config) applyDefaults() Config {
 		// cloud per-second rate-limit budget for negligible latency
 		// improvement and risks SDK connection-pool exhaustion.
 		c.RecheckConcurrency = maxRecheckConcurrency
+	}
+
+	// MaxRootWalkDatabases: shape-#1 "0 is meaningful" — only this one
+	// field uses the `< 0 = default, 0 = disabled, > 0 = use as cap`
+	// convention. The downstream guard at walk.go's derivePrefixes
+	// gates root walk on `MaxRootWalkDatabases > 0`.
+	if c.MaxRootWalkDatabases < 0 {
+		c.MaxRootWalkDatabases = 1000
+	} else if c.MaxRootWalkDatabases > maxRootWalkDatabasesCap {
+		// Defend against integer overflow in the `× 4` scan-limit math
+		// in walk.go. The realistic upper bound for "unknown databases
+		// inspected per tick" is well below this ceiling.
+		c.MaxRootWalkDatabases = maxRootWalkDatabasesCap
 	}
 	return c
 }

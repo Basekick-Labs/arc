@@ -277,8 +277,22 @@ func (g *fakeGate) Role() string                 { return g.role }
 
 // ---- Lifecycle tests ----
 
+// newReconciler is the test-helper constructor. Tests that pass a
+// fully-zeroed Config (or one that doesn't explicitly set
+// MaxRootWalkDatabases) get the root walk enabled with the default
+// cap, because applyDefaults treats zero-value `0` as "operator did
+// not set this — fill default" via the `< 0` shape-#1 convention.
+// The helper sets MaxRootWalkDatabases=-1 in that case so the test
+// path matches the operator-opt-in path; tests that want to verify
+// the disable path set the value to 0 explicitly.
+//
+// DeletePreManifestOrphans / ManifestOnlyDryRun are NOT touched —
+// individual tests opt in/out per their behavior under test.
 func newReconciler(t *testing.T, cfg Config, coord Coordinator, store storage.Backend, gate Gate) *Reconciler {
 	t.Helper()
+	if cfg.MaxRootWalkDatabases == 0 {
+		cfg.MaxRootWalkDatabases = -1
+	}
 	r, err := NewReconciler(cfg, coord, store, gate, nil, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("NewReconciler: %v", err)
@@ -866,7 +880,12 @@ func TestReconcile_StorageSweepRecheckCatchesRace(t *testing.T) {
 	wrapped := &racingCoordinator{inner: coord, hidePath: "db/m/raced.parquet"}
 
 	r, err := NewReconciler(
-		Config{Enabled: true, BackendKind: BackendShared, DeletePreManifestOrphans: true},
+		Config{
+			Enabled:                  true,
+			BackendKind:              BackendShared,
+			DeletePreManifestOrphans: true,
+			MaxRootWalkDatabases:     -1, // helper-equivalent: enable root walk with default cap
+		},
 		wrapped, store, &fakeGate{scan: true, sweep: true}, nil, zerolog.Nop(),
 	)
 	if err != nil {
@@ -1178,6 +1197,47 @@ func TestReconcile_RootWalkBoundsInitialDirListIteration(t *testing.T) {
 	// map-derived dir list — assert it's at most 1 (the cap), not 5.
 	if run.StorageDeletes > 1 {
 		t.Errorf("scan_limit=4 + cap=1 should yield at most 1 delete, got %d", run.StorageDeletes)
+	}
+}
+
+func TestApplyDefaults_MaxRootWalkDatabasesZeroFromConfigDisablesRootWalk(t *testing.T) {
+	// Regression for gemini-code-assist round 6: a config-driven
+	// MaxRootWalkDatabases=0 (i.e. an operator setting it to 0 in
+	// arc.toml) must reach the disabled state. Earlier rounds used
+	// `if c.MaxRootWalkDatabases == 0 { c.MaxRootWalkDatabases = 1000 }`
+	// which silently overrode operator intent. The new convention:
+	// `< 0` means "operator did not set this, fill default"; `0` means
+	// "explicitly disabled" and passes through to the downstream guard.
+	cfg := Config{
+		Enabled:              true,
+		BackendKind:          BackendShared,
+		MaxRootWalkDatabases: 0, // operator-set in config
+	}.applyDefaults()
+	if cfg.MaxRootWalkDatabases != 0 {
+		t.Fatalf("config-driven MaxRootWalkDatabases=0 must remain 0 after applyDefaults; got %d", cfg.MaxRootWalkDatabases)
+	}
+
+	// Sanity: a fully-zero Config (i.e. no operator override at all)
+	// reaches the same disabled state. This is the legitimate
+	// behavioral consequence of the convention — operators who want
+	// the default 1000 cap can either set the value explicitly OR
+	// pass through viper which uses SetDefault to populate it.
+	cfgZero := Config{
+		Enabled:     true,
+		BackendKind: BackendShared,
+	}.applyDefaults()
+	if cfgZero.MaxRootWalkDatabases != 0 {
+		t.Fatalf("zero Config MaxRootWalkDatabases must remain 0 (caller-or-viper supplies default); got %d", cfgZero.MaxRootWalkDatabases)
+	}
+
+	// Negative: operator did NOT set anything → fill default.
+	cfgNeg := Config{
+		Enabled:              true,
+		BackendKind:          BackendShared,
+		MaxRootWalkDatabases: -1,
+	}.applyDefaults()
+	if cfgNeg.MaxRootWalkDatabases != 1000 {
+		t.Fatalf("MaxRootWalkDatabases=-1 must default to 1000; got %d", cfgNeg.MaxRootWalkDatabases)
 	}
 }
 
