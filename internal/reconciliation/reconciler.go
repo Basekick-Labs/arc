@@ -487,7 +487,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, dryRun bool) (*Run, error) {
 	run := &Run{
 		ID:          uuid.NewString(),
 		StartedAt:   time.Now().UTC(),
-		DryRun:      dryRun || r.cfg.ManifestOnlyDryRun,
+		// Honor the caller's dryRun exactly. The cron path
+		// (scheduler.tick) already passes cfg.ManifestOnlyDryRun, so the
+		// safety policy is enforced upstream. OR'ing it back in here
+		// silently suppresses legitimate manual API overrides — an
+		// operator hitting POST /trigger?dry_run=false&act=true would
+		// otherwise be forced into dry-run with no diagnostic, which
+		// blocks on-demand repairs.
+		DryRun:      dryRun,
 		BackendKind: r.cfg.BackendKind,
 	}
 	if r.gate != nil {

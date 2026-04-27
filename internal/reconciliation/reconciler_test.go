@@ -1200,6 +1200,80 @@ func TestReconcile_RootWalkBoundsInitialDirListIteration(t *testing.T) {
 	}
 }
 
+func TestReconcile_ManualOverrideHonorsDryRunFalseEvenWithCfgDryRunOnly(t *testing.T) {
+	// Round-7 regression: previously Reconcile did
+	// `DryRun = dryRun || cfg.ManifestOnlyDryRun`, which silently forced
+	// every call into dry-run when the cfg knob was true. That defeats
+	// the manual API path: an operator hitting POST /trigger with
+	// dry_run=false&act=true sends `false` through to TriggerNow, but
+	// the OR re-applied the cron-time policy and ignored the operator's
+	// explicit override. Cron path still passes cfg.ManifestOnlyDryRun
+	// directly (scheduler.tick), so this fix doesn't weaken cron safety.
+	coord := newFakeCoordinator(
+		fileEntry("db/m/2026/04/27/12/missing.parquet", "node-a"),
+	)
+	store := newFakeBackend()
+	// Note: the ONLY storage file is missing from this manifest entry,
+	// so missing.parquet is orphan-manifest. With dry_run=false (manual
+	// override), we expect a real Raft delete.
+
+	r := newReconciler(t,
+		Config{
+			Enabled:            true,
+			BackendKind:        BackendShared,
+			ManifestOnlyDryRun: true, // cron policy says always dry-run
+		},
+		coord, store, &fakeGate{scan: true, sweep: true})
+
+	// Manual API path: caller already evaluated dry_run=false&act=true
+	// and is passing dryRun=false to honor the operator's explicit
+	// confirmation.
+	run, err := r.Reconcile(context.Background(), false)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if run.DryRun {
+		t.Fatalf("manual override (dryRun=false) must NOT be silently forced to dry-run by ManifestOnlyDryRun=true; run.DryRun=%v", run.DryRun)
+	}
+	if run.ManifestDeletes != 1 {
+		t.Errorf("expected 1 manifest delete on real act path, got %d", run.ManifestDeletes)
+	}
+	if len(coord.batchCalls) != 1 {
+		t.Errorf("expected 1 batch call to coordinator, got %d", len(coord.batchCalls))
+	}
+}
+
+func TestReconcile_CronPathDryRunStillRespectsCfg(t *testing.T) {
+	// Sibling test pinning the cron behavior: when the SCHEDULER calls
+	// Reconcile with dryRun=cfg.ManifestOnlyDryRun=true, the run must
+	// be dry-run. This is what scheduler.tick does at line 146.
+	coord := newFakeCoordinator(
+		fileEntry("db/m/2026/04/27/12/missing.parquet", "node-a"),
+	)
+	store := newFakeBackend()
+
+	r := newReconciler(t,
+		Config{
+			Enabled:            true,
+			BackendKind:        BackendShared,
+			ManifestOnlyDryRun: true,
+		},
+		coord, store, &fakeGate{scan: true, sweep: true})
+
+	// Caller (cron) passes dryRun=true.
+	run, err := r.Reconcile(context.Background(), true)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !run.DryRun {
+		t.Errorf("cron path with dryRun=true must produce a dry-run cycle; got run.DryRun=%v", run.DryRun)
+	}
+	// No real Raft writes during dry-run.
+	if len(coord.batchCalls) != 0 {
+		t.Errorf("dry-run must not write to Raft; got %d batch calls", len(coord.batchCalls))
+	}
+}
+
 func TestApplyDefaults_MaxRootWalkDatabasesZeroFromConfigDisablesRootWalk(t *testing.T) {
 	// Regression for gemini-code-assist round 6: a config-driven
 	// MaxRootWalkDatabases=0 (i.e. an operator setting it to 0 in

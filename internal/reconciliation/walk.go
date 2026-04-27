@@ -303,9 +303,16 @@ func (r *Reconciler) listPrefix(ctx context.Context, prefix string) ([]objectRec
 // reconciler is allowed to act on. We deliberately ignore:
 //
 //   - Anything not ending in `.parquet`  — query-relevant data only
-//   - Files in `_compaction_state/`     — owned by the compaction watcher
+//   - Files in a `_compaction_state` path segment — owned by the
+//     compaction watcher (the actual reserved directory is
+//     `_compaction_state/...` per internal/compaction/manifest.go)
 //   - `.tmp.*` files                    — in-flight writes
 //   - hidden files (`.something`)       — never reconciler's concern
+//
+// The `_compaction_state` check is segment-aware (split on `/`)
+// rather than substring-aware: a database or measurement name
+// containing `_compaction_state` (e.g. `db/m_compaction_state_logs`)
+// must NOT have all its valid data files filtered out.
 func isParquetCandidate(p string) bool {
 	if !strings.HasSuffix(p, ".parquet") {
 		return false
@@ -314,8 +321,10 @@ func isParquetCandidate(p string) bool {
 	if strings.HasPrefix(base, ".tmp.") || strings.HasPrefix(base, ".") {
 		return false
 	}
-	if strings.Contains(p, "_compaction_state/") {
-		return false
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "_compaction_state" {
+			return false
+		}
 	}
 	return true
 }
