@@ -226,7 +226,22 @@ localProcessing:
 			h.totalErrors.Add(1)
 			h.logger.Error().Err(err).Msg("Failed to decompress gzip data")
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": "Failed to decompress gzip data",
+				"error": "Failed to decompress gzip data: " + err.Error(),
+			})
+		}
+
+		body = decompressed
+	} else if len(body) >= 4 && body[0] == 0x28 && body[1] == 0xB5 && body[2] == 0x2F && body[3] == 0xFD {
+		// zstd magic number 0x28 0xB5 0x2F 0xFD — same 100MB cap as gzip,
+		// pooled decoder reused via the package-level zstdDecoderPool.
+		h.totalBytesGzipped.Add(int64(originalSize))
+
+		decompressed, err := decompressZstdPooled(body, 0)
+		if err != nil {
+			h.totalErrors.Add(1)
+			h.logger.Error().Err(err).Msg("Failed to decompress zstd data")
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Failed to decompress zstd data: " + err.Error(),
 			})
 		}
 

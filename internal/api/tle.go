@@ -12,6 +12,7 @@ import (
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/gofiber/fiber/v2"
 	"github.com/klauspost/compress/gzip"
+	"github.com/klauspost/compress/zstd"
 	"github.com/rs/zerolog"
 )
 
@@ -128,7 +129,19 @@ localProcessing:
 			h.totalErrors.Add(1)
 			h.logger.Error().Err(err).Msg("Failed to decompress gzip data")
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": "Failed to decompress gzip data",
+				"error": "Failed to decompress gzip data: " + err.Error(),
+			})
+		}
+		body = decompressed
+	} else if len(body) >= 4 && body[0] == 0x28 && body[1] == 0xB5 && body[2] == 0x2F && body[3] == 0xFD {
+		// zstd magic number — mirrors the LP and msgpack handlers so
+		// satellite-fleet senders can use the faster codec on TLE too.
+		decompressed, err := decompressZstdPooled(body, 0)
+		if err != nil {
+			h.totalErrors.Add(1)
+			h.logger.Error().Err(err).Msg("Failed to decompress zstd data")
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Failed to decompress zstd data: " + err.Error(),
 			})
 		}
 		body = decompressed
@@ -254,4 +267,67 @@ func decompressGzipPooled(data []byte, maxSize int) ([]byte, error) {
 
 	lpGzipReaderPool.Put(reader)
 	return result, nil
+}
+
+// decompressZstdPooled decompresses zstd data using the package-level
+// zstdDecoderPool (declared in msgpack.go). Returns a freshly-copied
+// []byte (not a PooledBuffer) so LP and TLE callers can keep their
+// existing flat-byte handler shape — the decode buffer itself is
+// returned to decompressBufferPool inside this function.
+//
+// maxSize limits the decompressed output; pass 0 for the default 100MB.
+// Mirrors the gzip helper above and the msgpack zstd path.
+func decompressZstdPooled(data []byte, maxSize int) ([]byte, error) {
+	if maxSize <= 0 {
+		maxSize = 100 * 1024 * 1024 // 100MB default
+	}
+
+	var decoder *zstd.Decoder
+	var err error
+	if pooled := zstdDecoderPool.Get(); pooled != nil {
+		decoder = pooled.(*zstd.Decoder)
+	} else {
+		decoder, err = zstd.NewReader(nil, zstd.WithDecoderMaxMemory(uint64(maxSize)+1024))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
+		}
+	}
+
+	bufPtr := decompressBufferPool.Get().(*[]byte)
+	buf := (*bufPtr)[:0]
+
+	buf, err = decoder.DecodeAll(data, buf)
+	if err != nil {
+		zstdDecoderPool.Put(decoder)
+		*bufPtr = (*bufPtr)[:0]
+		decompressBufferPool.Put(bufPtr)
+		return nil, fmt.Errorf("failed to decompress zstd: %w", err)
+	}
+
+	zstdDecoderPool.Put(decoder)
+
+	if len(buf) > maxSize {
+		*bufPtr = (*bufPtr)[:0]
+		decompressBufferPool.Put(bufPtr)
+		return nil, fmt.Errorf("decompressed payload exceeds %dMB limit", maxSize/(1024*1024))
+	}
+
+	// Copy out so the pooled buffer can be returned immediately — LP/TLE
+	// callers operate on the result for the rest of the request and don't
+	// follow the PooledBuffer.Release contract used by msgpack.
+	out := make([]byte, len(buf))
+	copy(out, buf)
+
+	if cap(buf) > maxPooledBufferSize {
+		// Don't pollute the pool with oversized buffers; mirrors msgpack.
+		decompBufferDiscards.Add(1)
+		metrics.Get().IncDecompBufferDiscards()
+		freshBuf := make([]byte, 0, initialBufferSize)
+		*bufPtr = freshBuf
+	} else {
+		*bufPtr = buf[:0]
+	}
+	decompressBufferPool.Put(bufPtr)
+
+	return out, nil
 }
