@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 )
@@ -87,32 +88,39 @@ func (r *Reconciler) sweepOrphanManifest(
 		applied := make([]string, 0, len(chunk))
 		remainingCap := r.cfg.MaxDeletesPerRun - (run.ManifestDeletes + run.StorageDeletes)
 		capReachedInChunk := false
+
+		// Slice the chunk down to the cap before doing any I/O — no point
+		// running parallel Exists checks on files we'd never act on.
+		chunkLimit := len(chunk)
+		if chunkLimit > remainingCap {
+			chunkLimit = remainingCap
+			capReachedInChunk = true
+		}
+		recheckPaths := chunk[:chunkLimit]
+
+		// Re-check storage in parallel: each Exists is one HEAD on S3/Azure
+		// (network RTT) and the chunk can be up to BatchSize=1000 paths.
+		// Sequential would be unacceptably slow on remote backends.
+		// Bounded concurrency (default 8) stays under cloud rate limits.
 		// Per-batch counters for log-spam control: a transient backend
 		// hiccup can fail Exists for hundreds of files in a row, and
 		// printing one Warn per file drowns operator dashboards.
 		// Collect into run.Errors (capped at 32) and emit a single
 		// summary Warn at the end of the batch.
+		recheckResults := r.parallelExists(ctx, recheckPaths)
 		existsErrCount := 0
 		var existsLastErr error
-		for _, p := range chunk {
-			if len(ops) >= remainingCap {
-				// Stop building this batch at the cap. Mark CapHit so
-				// the run report tells operators we did not finish.
-				capReachedInChunk = true
-				break
-			}
-			// Re-check storage. If the file came back, the manifest
-			// entry is no longer orphaned and we leave it alone.
-			exists, err := r.storage.Exists(ctx, p)
-			if err != nil {
+		for idx, res := range recheckResults {
+			p := recheckPaths[idx]
+			if res.err != nil {
 				// Treat exists-check failures as "skip and let the
 				// next run retry" — better than risking a wrong delete.
 				existsErrCount++
-				existsLastErr = err
-				run.Errors = appendBounded(run.Errors, fmt.Sprintf("Exists %q: %v", p, err), 32)
+				existsLastErr = res.err
+				run.Errors = appendBounded(run.Errors, fmt.Sprintf("Exists %q: %v", p, res.err), 32)
 				continue
 			}
-			if exists {
+			if res.exists {
 				run.SkippedRecheck++
 				continue
 			}
@@ -177,6 +185,74 @@ func (r *Reconciler) sweepOrphanManifest(
 		}
 	}
 	return nil
+}
+
+// existsResult is one slot in the output of parallelExists. Index in
+// the result slice matches the index in the input paths slice so the
+// caller can build ops in the original order without sorting.
+type existsResult struct {
+	exists bool
+	err    error
+}
+
+// parallelExists runs storage.Exists across `paths` with bounded
+// concurrency. The result slice has the same length and order as
+// `paths`. Sequential when RecheckConcurrency is 1 or paths is short
+// enough that the goroutine overhead would outweigh the I/O savings.
+//
+// Each Exists call uses the run's ctx so a canceled run aborts in
+// flight checks. The dispatch loop honors ctx cancellation between
+// jobs; in-flight HEAD requests are cut by the storage backend's own
+// ctx-aware client.
+func (r *Reconciler) parallelExists(ctx context.Context, paths []string) []existsResult {
+	results := make([]existsResult, len(paths))
+	if len(paths) == 0 {
+		return results
+	}
+	workers := r.cfg.RecheckConcurrency
+	if workers <= 1 || len(paths) < 2 {
+		// Sequential fast path: avoid the goroutine + channel overhead
+		// for trivially small chunks or operator-forced sequential mode.
+		for i, p := range paths {
+			if ctx.Err() != nil {
+				results[i] = existsResult{err: ctx.Err()}
+				continue
+			}
+			exists, err := r.storage.Exists(ctx, p)
+			results[i] = existsResult{exists: exists, err: err}
+		}
+		return results
+	}
+	if workers > len(paths) {
+		workers = len(paths)
+	}
+
+	// jobs feeds indexes (not paths) so workers can write directly into
+	// the results slice at the right slot. Channel is buffered to the
+	// total job count so the dispatcher never blocks.
+	jobs := make(chan int, len(paths))
+	for i := range paths {
+		jobs <- i
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				if ctx.Err() != nil {
+					results[idx] = existsResult{err: ctx.Err()}
+					continue
+				}
+				exists, err := r.storage.Exists(ctx, paths[idx])
+				results[idx] = existsResult{exists: exists, err: err}
+			}
+		}()
+	}
+	wg.Wait()
+	return results
 }
 
 // joinSample concatenates a bounded list of paths into a single string

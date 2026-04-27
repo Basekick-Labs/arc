@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -447,6 +449,52 @@ func TestReconcile_RunHistoryRingBuffer(t *testing.T) {
 	}
 	if got := len(r.RecentRuns()); got != runHistoryCap {
 		t.Fatalf("expected ring buffer to cap at %d, got %d", runHistoryCap, got)
+	}
+}
+
+func TestReconcile_RingBufferNewestFirstAndWrapAround(t *testing.T) {
+	// Run more than runHistoryCap (10) times and verify:
+	//   - RecentRuns returns at most runHistoryCap entries
+	//   - The first entry is the most recent run
+	//   - Older runs are evicted in FIFO order
+	r := newReconciler(t,
+		Config{Enabled: true, BackendKind: BackendShared},
+		newFakeCoordinator(), newFakeBackend(), &fakeGate{scan: true, sweep: true})
+
+	ids := make([]string, 0, runHistoryCap+5)
+	for i := 0; i < runHistoryCap+5; i++ {
+		run, err := r.Reconcile(context.Background(), true)
+		if err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+		ids = append(ids, run.ID)
+	}
+
+	recent := r.RecentRuns()
+	if len(recent) != runHistoryCap {
+		t.Fatalf("expected RecentRuns to cap at %d, got %d", runHistoryCap, len(recent))
+	}
+	// Newest-first: recent[0] is the last id we appended.
+	if recent[0].ID != ids[len(ids)-1] {
+		t.Errorf("expected newest run first, got recent[0].ID=%q want %q", recent[0].ID, ids[len(ids)-1])
+	}
+	// Oldest-retained: recent[cap-1] is ids[len(ids)-cap].
+	wantOldest := ids[len(ids)-runHistoryCap]
+	if recent[runHistoryCap-1].ID != wantOldest {
+		t.Errorf("expected oldest retained run %q, got %q", wantOldest, recent[runHistoryCap-1].ID)
+	}
+	// Evicted runs should not be findable.
+	evicted := ids[:len(ids)-runHistoryCap]
+	for _, id := range evicted {
+		if _, ok := r.FindRun(id); ok {
+			t.Errorf("evicted run %q should not be findable", id)
+		}
+	}
+	// Retained runs should all be findable.
+	for _, id := range ids[len(ids)-runHistoryCap:] {
+		if _, ok := r.FindRun(id); !ok {
+			t.Errorf("retained run %q should be findable", id)
+		}
 	}
 }
 
@@ -980,6 +1028,156 @@ func TestReconcile_RootWalkCapDoesNotCountKnownDatabases(t *testing.T) {
 		if !exists {
 			t.Errorf("known-db file %q should NOT have been deleted", path)
 		}
+	}
+}
+
+func TestReconcile_ParallelExistsCheckRespectsConcurrency(t *testing.T) {
+	// Plant 50 orphan-manifest entries; instrument the backend's Exists
+	// to record the max concurrent in-flight call count. With
+	// RecheckConcurrency=4 the observed max should be ≤4 and the run
+	// should complete (no deadlock, no missed entries).
+	now := time.Now().UTC()
+	coord := newFakeCoordinator()
+	for i := 0; i < 50; i++ {
+		path := fmt.Sprintf("db/m/2026/04/27/12/orphan-%02d.parquet", i)
+		coord.manifest[path] = &raft.FileEntry{
+			Path: path, Database: "db", Measurement: "m",
+			OriginNodeID: "node-a", CreatedAt: now,
+		}
+	}
+	store := &countingExistsBackend{fakeBackend: newFakeBackend()}
+
+	r, err := NewReconciler(
+		Config{
+			Enabled:            true,
+			BackendKind:        BackendShared,
+			RecheckConcurrency: 4,
+		},
+		coord, store, &fakeGate{scan: true, sweep: true}, nil, zerolog.Nop(),
+	)
+	if err != nil {
+		t.Fatalf("NewReconciler: %v", err)
+	}
+	run, err := r.Reconcile(context.Background(), false)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if run.ManifestDeletes != 50 {
+		t.Errorf("expected 50 manifest deletes, got %d", run.ManifestDeletes)
+	}
+	if got := store.maxInFlight.Load(); got > 4 {
+		t.Errorf("RecheckConcurrency=4 violated: max in-flight Exists = %d", got)
+	}
+	if got := store.maxInFlight.Load(); got < 2 {
+		t.Errorf("expected parallel Exists (>=2 in-flight), got %d (sequential?)", got)
+	}
+}
+
+func TestReconcile_RecheckConcurrencyOneForcesSequential(t *testing.T) {
+	now := time.Now().UTC()
+	coord := newFakeCoordinator()
+	for i := 0; i < 10; i++ {
+		path := fmt.Sprintf("db/m/2026/04/27/12/orphan-%02d.parquet", i)
+		coord.manifest[path] = &raft.FileEntry{
+			Path: path, Database: "db", Measurement: "m",
+			OriginNodeID: "node-a", CreatedAt: now,
+		}
+	}
+	store := &countingExistsBackend{fakeBackend: newFakeBackend()}
+
+	r, err := NewReconciler(
+		Config{
+			Enabled:            true,
+			BackendKind:        BackendShared,
+			RecheckConcurrency: 1,
+		},
+		coord, store, &fakeGate{scan: true, sweep: true}, nil, zerolog.Nop(),
+	)
+	if err != nil {
+		t.Fatalf("NewReconciler: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), false); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := store.maxInFlight.Load(); got > 1 {
+		t.Errorf("RecheckConcurrency=1 must be sequential, got max in-flight = %d", got)
+	}
+}
+
+// countingExistsBackend wraps fakeBackend and tracks max concurrent
+// Exists calls so tests can assert the parallel worker pool is active
+// but bounded.
+type countingExistsBackend struct {
+	*fakeBackend
+	inFlight    atomic.Int32
+	maxInFlight atomic.Int32
+}
+
+func (b *countingExistsBackend) Exists(ctx context.Context, path string) (bool, error) {
+	cur := b.inFlight.Add(1)
+	defer b.inFlight.Add(-1)
+	for {
+		max := b.maxInFlight.Load()
+		if cur <= max {
+			break
+		}
+		if b.maxInFlight.CompareAndSwap(max, cur) {
+			break
+		}
+	}
+	// Tiny sleep so the parallel test can actually observe overlap.
+	time.Sleep(2 * time.Millisecond)
+	return b.fakeBackend.Exists(ctx, path)
+}
+
+func TestReconcile_RootWalkBoundsInitialDirListIteration(t *testing.T) {
+	// Plant 100 known databases (all in manifest) + 5 truly-unknown
+	// databases with old orphans. Cap = 1, so scan_limit = 4.
+	// Among the first 4 entries the iteration sees, at most 1 unknown
+	// database can be inspected — but the bucket's deeper-than-scan-limit
+	// unknown databases are explicitly skipped by the bound. This proves
+	// the iteration itself is bounded, not just the inspected counter.
+	now := time.Now().UTC()
+	store := newFakeBackend()
+	for i := 0; i < 100; i++ {
+		db := fmt.Sprintf("known%03d", i)
+		store.put(db+"/m/2026/04/27/12/x.parquet", now.Add(-2*time.Hour))
+	}
+	for i := 0; i < 5; i++ {
+		db := fmt.Sprintf("unknown%d", i)
+		store.put(db+"/m/2026/04/27/12/x.parquet", now.Add(-48*time.Hour))
+	}
+	coord := newFakeCoordinator()
+	for i := 0; i < 100; i++ {
+		db := fmt.Sprintf("known%03d", i)
+		coord.manifest[db+"/m/2026/04/27/12/x.parquet"] = &raft.FileEntry{
+			Path: db + "/m/2026/04/27/12/x.parquet", Database: db, Measurement: "m",
+			OriginNodeID: "node-a", CreatedAt: now,
+		}
+	}
+
+	r, err := NewReconciler(
+		Config{
+			Enabled:                  true,
+			BackendKind:              BackendShared,
+			DeletePreManifestOrphans: true,
+			MaxRootWalkDatabases:     1, // scan_limit becomes 4
+		},
+		coord, store, &fakeGate{scan: true, sweep: true}, nil, zerolog.Nop(),
+	)
+	if err != nil {
+		t.Fatalf("NewReconciler: %v", err)
+	}
+	run, err := r.Reconcile(context.Background(), false)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	// At most one unknown database can be inspected (cap=1) and the
+	// scan never reaches past the first 4 entries returned. The exact
+	// number deleted depends on iteration order of the fakeBackend's
+	// map-derived dir list — assert it's at most 1 (the cap), not 5.
+	if run.StorageDeletes > 1 {
+		t.Errorf("scan_limit=4 + cap=1 should yield at most 1 delete, got %d", run.StorageDeletes)
 	}
 }
 

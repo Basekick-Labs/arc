@@ -1470,6 +1470,7 @@ func main() {
 			ManifestOnlyDryRun:       cfg.Reconciliation.ManifestOnlyDryRun,
 			SamplePathsCap:           cfg.Reconciliation.SamplePathsCap,
 			MaxRootWalkDatabases:     cfg.Reconciliation.MaxRootWalkDatabases,
+			RecheckConcurrency:       cfg.Reconciliation.RecheckConcurrency,
 		}
 		reconciler, err := reconciliation.NewReconciler(recCfg, clusterCoordinator, storageBackend, gate, auditLogger, logger.Get("reconciliation"))
 		if err != nil {

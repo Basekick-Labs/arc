@@ -160,6 +160,15 @@ type Config struct {
 	// 1000; cluster operators with very wide tenancy can raise it.
 	// Set to 0 to disable the root walk entirely.
 	MaxRootWalkDatabases int
+
+	// RecheckConcurrency is the worker count for the per-file
+	// storage.Exists re-check during the orphan-manifest sweep. Each
+	// re-check is one HEAD request on S3/Azure; sequential is slow
+	// (one RTT per file) and parallel is bounded so we can't overrun
+	// the backend's per-second rate limit. Default 8 is conservative
+	// for both cloud rate limits and local-disk syscall thrash. Set
+	// to 1 to force sequential.
+	RecheckConcurrency int
 }
 
 // applyDefaults fills in zero-value config fields with the documented
@@ -191,6 +200,9 @@ func (c Config) applyDefaults() Config {
 	}
 	if c.MaxRootWalkDatabases == 0 {
 		c.MaxRootWalkDatabases = 1000
+	}
+	if c.RecheckConcurrency == 0 {
+		c.RecheckConcurrency = 8
 	}
 	return c
 }
@@ -269,10 +281,17 @@ type Reconciler struct {
 	// trigger), so we belt-and-braces here.
 	runState atomic.Bool
 
-	// History is a small ring buffer of recent runs.
-	mu         sync.RWMutex
-	runHistory []*Run
-	lastRun    *Run
+	// History is a small fixed-size ring buffer of recent runs. All
+	// access goes through mu. Layout: history is allocated to
+	// runHistoryCap at construction; writes land at history[head] and
+	// head advances modulo cap. size tracks how many slots are
+	// populated (saturates at cap). This gives O(1) record + O(N)
+	// read where N <= cap, vs the previous O(N) prepend.
+	mu          sync.RWMutex
+	history     []*Run
+	historyHead int
+	historySize int
+	lastRun     *Run
 }
 
 const runHistoryCap = 10
@@ -328,13 +347,12 @@ func (r *Reconciler) LastRun() *Run {
 }
 
 // RecentRuns returns up to runHistoryCap recent runs in reverse chronological
-// order (newest first).
+// order (newest first). The result is a freshly allocated slice; callers may
+// safely retain it.
 func (r *Reconciler) RecentRuns() []*Run {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	out := make([]*Run, len(r.runHistory))
-	copy(out, r.runHistory)
-	return out
+	return r.snapshotHistoryLocked()
 }
 
 // FindRun returns the run with the given ID from the recent-runs ring
@@ -342,9 +360,12 @@ func (r *Reconciler) RecentRuns() []*Run {
 func (r *Reconciler) FindRun(id string) (*Run, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	for _, run := range r.runHistory {
-		if run.ID == id {
-			return run, true
+	// Walk the ring newest-first so a callback that happens to know the
+	// id of a recent run finds it on the first slot.
+	for i := 0; i < r.historySize; i++ {
+		idx := (r.historyHead - 1 - i + runHistoryCap) % runHistoryCap
+		if r.history[idx] != nil && r.history[idx].ID == id {
+			return r.history[idx], true
 		}
 	}
 	return nil, false
@@ -355,15 +376,34 @@ func (r *Reconciler) IsRunning() bool {
 	return r.runState.Load()
 }
 
-// recordRun appends to the ring buffer and updates lastRun.
+// recordRun writes the run into the ring buffer and updates lastRun.
+// O(1): one slot write, two integer updates. The previous prepend
+// implementation was O(N).
 func (r *Reconciler) recordRun(run *Run) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.lastRun = run
-	r.runHistory = append([]*Run{run}, r.runHistory...)
-	if len(r.runHistory) > runHistoryCap {
-		r.runHistory = r.runHistory[:runHistoryCap]
+	if r.history == nil {
+		r.history = make([]*Run, runHistoryCap)
 	}
+	r.history[r.historyHead] = run
+	r.historyHead = (r.historyHead + 1) % runHistoryCap
+	if r.historySize < runHistoryCap {
+		r.historySize++
+	}
+}
+
+// snapshotHistoryLocked materializes the ring as a newest-first slice.
+// Caller must hold mu (read or write).
+func (r *Reconciler) snapshotHistoryLocked() []*Run {
+	out := make([]*Run, 0, r.historySize)
+	for i := 0; i < r.historySize; i++ {
+		idx := (r.historyHead - 1 - i + runHistoryCap) % runHistoryCap
+		if r.history[idx] != nil {
+			out = append(out, r.history[idx])
+		}
+	}
+	return out
 }
 
 // Reconcile runs a single reconciliation cycle. Steps 2–7 of the algorithm

@@ -231,6 +231,7 @@ type ReconciliationConfig struct {
 	ManifestOnlyDryRun       bool   // Force every cron run to be dry-run (safety bridge; default: false)
 	SamplePathsCap           int    // Bound on sample paths in audit events / Run summaries (default: 10)
 	MaxRootWalkDatabases     int    // Cap on unknown databases the root-walk fallback descends into (default: 1000; 0 disables)
+	RecheckConcurrency       int    // Worker count for parallel storage.Exists re-check during manifest sweep (default: 8; 1 forces sequential)
 }
 
 // TieredStorageConfig holds configuration for tiered storage (Enterprise feature)
@@ -591,6 +592,7 @@ func Load() (*Config, error) {
 			ManifestOnlyDryRun:        v.GetBool("reconciliation.manifest_only_dry_run"),
 			SamplePathsCap:            v.GetInt("reconciliation.sample_paths_cap"),
 			MaxRootWalkDatabases:      v.GetInt("reconciliation.max_root_walk_databases"),
+			RecheckConcurrency:        v.GetInt("reconciliation.recheck_concurrency"),
 		},
 		Cluster: ClusterConfig{
 			Enabled:             v.GetBool("cluster.enabled"),
@@ -846,6 +848,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("reconciliation.manifest_only_dry_run", false)
 	v.SetDefault("reconciliation.sample_paths_cap", 10)
 	v.SetDefault("reconciliation.max_root_walk_databases", 1000)
+	v.SetDefault("reconciliation.recheck_concurrency", 8)
 
 	// Cluster defaults (Enterprise feature)
 	v.SetDefault("cluster.enabled", false)              // Disabled by default (standalone mode)

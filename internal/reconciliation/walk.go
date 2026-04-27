@@ -147,12 +147,32 @@ func (r *Reconciler) derivePrefixes(ctx context.Context, manifest []*ObjectKey) 
 		if dl, ok := r.storage.(storage.DirectoryLister); ok {
 			dirs, err := dl.ListDirectories(ctx, "")
 			if err == nil {
+				// Bound the iteration over the returned slice itself,
+				// not just the inspected count. A shared bucket with
+				// many unrelated top-level prefixes could otherwise
+				// pin megabytes of dirnames and burn CPU on the dbSet
+				// lookup loop even when every entry is already known.
+				// Headroom of 4× over the inspection cap covers normal
+				// cases where most top-level entries are known
+				// databases the dbSet check skips.
+				scanLimit := r.cfg.MaxRootWalkDatabases * 4
+				if scanLimit > len(dirs) {
+					scanLimit = len(dirs)
+				}
+				if scanLimit < len(dirs) {
+					r.logger.Warn().
+						Int("returned", len(dirs)).
+						Int("scan_limit", scanLimit).
+						Int("cap", r.cfg.MaxRootWalkDatabases).
+						Msg("Reconciliation: top-level directory count exceeds 4× root-walk cap; suffix entries skipped this tick")
+				}
 				inspected := 0
-				for _, d := range dirs {
+				for i := 0; i < scanLimit; i++ {
+					d := dirs[i]
 					if inspected >= r.cfg.MaxRootWalkDatabases {
 						r.logger.Warn().
 							Int("inspected", inspected).
-							Int("total", len(dirs)).
+							Int("scan_limit", scanLimit).
 							Int("cap", r.cfg.MaxRootWalkDatabases).
 							Msg("Reconciliation: root walk cap reached; remaining unknown databases skipped this tick")
 						break
