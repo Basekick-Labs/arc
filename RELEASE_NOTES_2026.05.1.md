@@ -146,11 +146,12 @@ A periodic reconciler now detects and repairs drift between the Raft-replicated 
 
 The reconciler ships **off by default**. Once enabled (`reconciliation.enabled=true`), it runs on cron (default 04:17 daily) and **auto-acts** on drift older than a 24-hour grace window, with a 10,000-deletion per-run blast cap. This matches the operational shape of Druid's coordinator kill task and Pinot's retention manager: opt-in, then anti-entropy that doesn't require babysitting.
 
-- **Cluster gating**: on shared storage (S3, Azure, MinIO) the reconciler runs on the active compactor only — reusing the failover-managed lease as a single-sweeper election. On local storage every node walks its own backend filtered by `OriginNodeID == self`.
-- **Manifest-before-storage invariant**: orphan-manifest sweep runs first; orphan-storage sweep runs only if the first half completes cleanly. Raft quorum loss aborts the run before any storage bytes are touched.
-- **Re-checks before every delete** catch concurrent writer/retention/compaction races. A file that re-appears between snapshot and apply is skipped, never deleted.
-- **Bounded blast radius**: the per-run cap, the 24-hour grace window, the manifest-size ceiling (200,000 entries default), and the per-prefix list timeout all default to conservative values.
-- **Operator visibility**: every run produces an audit trail (`reconcile.run_started/completed/aborted/manifest_batch_deleted/storage_batch_deleted/cap_hit`). The most recent 10 runs are queryable via `GET /api/v1/reconciliation/status`. Manual `POST /api/v1/reconciliation/trigger` defaults to dry-run; `dry_run=false&act=true` is required to act.
+- **Cluster gating**: on shared storage (S3, Azure, MinIO) the reconciler runs on the active compactor only — reusing the failover-managed lease as a single-sweeper election. On local storage every node walks its own backend filtered by `OriginNodeID == self`. In standalone Arc the orphan-storage sweep refuses to act (no manifest to reconcile against).
+- **Manifest-before-storage invariant**: orphan-manifest sweep runs first; orphan-storage sweep runs only if the first half completes cleanly. Raft quorum loss aborts the run before any storage bytes are touched. Manifest-write errors are classified via a typed sentinel (`raft.ErrManifestApply`) instead of brittle log-string matching, so audit dashboards report `raft_quorum_loss` / `lease_lost` / `unknown` distinctly.
+- **Re-checks before every delete** catch concurrent writer/retention/compaction races. A file that re-appears between snapshot and apply is skipped, never deleted. Re-checks run in parallel (default 8 workers, configurable) so HEAD-per-file on remote backends doesn't bottleneck large sweeps.
+- **Bounded blast radius**: per-run cap, 24-hour grace window, manifest-size ceiling (200,000 entries default), per-prefix list timeout, and a root-walk fan-out cap (1,000 unknown databases per tick) all default to conservative values. The strict `delete_pre_manifest_orphans=false` mode requires the full 7-segment Arc layout (`db/m/yyyy/mm/dd/hh/file`) and rejects `.`/`..` segments to keep stray files in shared buckets untouched.
+- **Conservative on un-mtime'd backends**: when a backend doesn't expose `LastModified` via the `ObjectLister` interface (custom or future implementations), files are treated as YOUNG (protected) rather than eligible — a deliberate trade-off favoring leaked orphans over data loss. A single Warn per run signals the safety net engaged.
+- **Operator visibility**: every run produces an audit trail (`reconcile.run_started/completed/aborted/manifest_batch_deleted/storage_batch_deleted/cap_hit`). The most recent 10 runs are queryable via `GET /api/v1/reconciliation/status` (auth-required, `RequireRead`). Run summaries include a `walk_partial` flag and per-prefix errors so a "0 orphans found" run that was actually blind to most of the bucket is unambiguous. Manual `POST /api/v1/reconciliation/trigger` (`RequireAdmin`) defaults to dry-run; `dry_run=false&act=true` is required to act.
 
 **Configuration** (`ARC_RECONCILIATION_*` env vars or `reconciliation.*` in `arc.toml`):
 
@@ -162,8 +163,10 @@ The reconciler ships **off by default**. Once enabled (`reconciliation.enabled=t
 | `clock_skew_allowance_seconds` | `300` | Added to grace window |
 | `max_deletes_per_run` | `10000` | Per-run blast cap (manifest + storage combined) |
 | `max_manifest_size` | `200000` | Aborts the run if the FSM is larger |
+| `max_root_walk_databases` | `1000` | Cap on unknown databases the root-walk fallback descends into per tick (0 disables) |
+| `recheck_concurrency` | `8` | Worker count for parallel `storage.Exists` re-checks during the manifest sweep (1 forces sequential) |
 | `manifest_only_dry_run` | `false` | Force every cron run to dry-run (safety bridge for operators staging the rollout) |
-| `delete_pre_manifest_orphans` | `true` | Delete files that don't conform to `database/measurement/...` layout |
+| `delete_pre_manifest_orphans` | `true` | Delete files that don't conform to the 7-segment `db/m/yyyy/mm/dd/hh/file` layout |
 
 ## Hardening
 
