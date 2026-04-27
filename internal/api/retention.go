@@ -823,7 +823,8 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 	// retention run will pick it up. A storage delete failure after a successful
 	// manifest update leaves a harmless ghost on disk (compaction will clean it).
 	// On manifest failure we abort — a Raft quorum loss is not transient.
-	// Phase 5 will add periodic manifest-vs-storage reconciliation.
+	// The Phase 5 reconciler at /api/v1/reconciliation cleans up any drift
+	// from partial-failure scenarios on its periodic cron run.
 	const manifestBatchSize = 1000
 	var deletedFilePaths []string
 	for i := 0; i < len(eligiblePaths); i += manifestBatchSize {

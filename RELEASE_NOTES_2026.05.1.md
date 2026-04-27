@@ -137,6 +137,34 @@ RBACManager now has proper lifecycle management and bounded memory usage:
 
 The CompletionWatcher now applies all RegisterFile and DeleteFile operations for a single compaction manifest in **one Raft log entry** (`CommandBatchFileOps`) instead of one entry per file. For a typical manifest with 20 outputs and 20 deleted sources this reduces the Raft round-trips from 40 to 1, cutting manifest apply latency from ~200ms to ~5ms. The two-phase write-then-delete ordering invariant is preserved, and the batch command is fully idempotent (replaying it on restart is a no-op).
 
+### Manifest-vs-Storage Reconciliation (Enterprise)
+
+A periodic reconciler now detects and repairs drift between the Raft-replicated cluster file manifest and physical storage. Two kinds of drift are addressed:
+
+- **Orphan manifest entries** — manifest references a file path that no longer exists in storage. Caused by retention/compaction/delete succeeding storage-side then losing Raft quorum before the manifest update commits. Today these entries waste FSM memory and can cause `ErrFileNotOnPeer` errors on peer-replication catch-up.
+- **Orphan storage files** — file exists in storage but no manifest entry references it. Caused by a crash between `storage.Write` and the file-registrar Raft propose, or by files predating the Phase 1 manifest.
+
+The reconciler ships **off by default**. Once enabled (`reconciliation.enabled=true`), it runs on cron (default 04:17 daily) and **auto-acts** on drift older than a 24-hour grace window, with a 10,000-deletion per-run blast cap. This matches the operational shape of Druid's coordinator kill task and Pinot's retention manager: opt-in, then anti-entropy that doesn't require babysitting.
+
+- **Cluster gating**: on shared storage (S3, Azure, MinIO) the reconciler runs on the active compactor only — reusing the failover-managed lease as a single-sweeper election. On local storage every node walks its own backend filtered by `OriginNodeID == self`.
+- **Manifest-before-storage invariant**: orphan-manifest sweep runs first; orphan-storage sweep runs only if the first half completes cleanly. Raft quorum loss aborts the run before any storage bytes are touched.
+- **Re-checks before every delete** catch concurrent writer/retention/compaction races. A file that re-appears between snapshot and apply is skipped, never deleted.
+- **Bounded blast radius**: the per-run cap, the 24-hour grace window, the manifest-size ceiling (200,000 entries default), and the per-prefix list timeout all default to conservative values.
+- **Operator visibility**: every run produces an audit trail (`reconcile.run_started/completed/aborted/manifest_batch_deleted/storage_batch_deleted/cap_hit`). The most recent 10 runs are queryable via `GET /api/v1/reconciliation/status`. Manual `POST /api/v1/reconciliation/trigger` defaults to dry-run; `dry_run=false&act=true` is required to act.
+
+**Configuration** (`ARC_RECONCILIATION_*` env vars or `reconciliation.*` in `arc.toml`):
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `false` | Master switch — explicit operator opt-in |
+| `schedule` | `17 4 * * *` | Cron expression (daily 04:17) |
+| `grace_window_seconds` | `86400` | Orphan storage files younger than this are NEVER deleted |
+| `clock_skew_allowance_seconds` | `300` | Added to grace window |
+| `max_deletes_per_run` | `10000` | Per-run blast cap (manifest + storage combined) |
+| `max_manifest_size` | `200000` | Aborts the run if the FSM is larger |
+| `manifest_only_dry_run` | `false` | Force every cron run to dry-run (safety bridge for operators staging the rollout) |
+| `delete_pre_manifest_orphans` | `true` | Delete files that don't conform to `database/measurement/...` layout |
+
 ## Hardening
 
 ### Ingestion Pipeline Hardening and Performance

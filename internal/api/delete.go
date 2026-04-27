@@ -684,7 +684,9 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 		if err := h.storage.Delete(ctx, relativePath); err != nil {
 			// Manifest is already committed — storage failure is transient (network
 			// blip, file already gone). Log as Warn and return the deleted count;
-			// Phase 5 reconciliation will clean up the orphaned storage entry.
+			// the Phase 5 reconciler at /api/v1/reconciliation cleans up the
+			// orphaned manifest entry (manifest-references-missing-file is the
+			// orphan-manifest case).
 			h.logger.Warn().Err(err).Str("file", relativePath).Msg("Failed to delete file from storage after manifest update")
 			return deleted, nil
 		}

@@ -824,7 +824,8 @@ func (j *Job) writeOutputWrittenManifest(_ context.Context, localPath, storageKe
 // fire. That's a cluster-wide manifest leak — source entries stay in the
 // Raft manifest even though the files are gone from storage, and Phase 3
 // catch-up pulls for them will return ErrFileNotOnPeer forever until
-// operator intervention or Phase 5's orphan reconciliation.
+// operator intervention or the periodic Phase 5 reconciler at
+// /api/v1/reconciliation cleans them up.
 //
 // Accepting this trade-off because (a) the failure mode requires a local
 // disk write to fail after a storage delete succeeded, which is rare, and

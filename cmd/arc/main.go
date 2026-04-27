@@ -28,6 +28,7 @@ import (
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/mqtt"
 	"github.com/basekick-labs/arc/internal/queryregistry"
+	"github.com/basekick-labs/arc/internal/reconciliation"
 	"github.com/basekick-labs/arc/internal/scheduler"
 	"github.com/basekick-labs/arc/internal/shutdown"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -1447,6 +1448,67 @@ func main() {
 	schedulerHandler := api.NewSchedulerHandler(cqSchedulerInterface, retentionSchedulerInterface, licenseClient, authManager, logger.Get("scheduler-api"))
 	schedulerHandler.RegisterRoutes(server.GetApp())
 
+	// Initialize Reconciliation (Phase 5 manifest-vs-storage drift cleanup).
+	// Enterprise feature riding on FeatureClustering — no separate license
+	// flag, since standalone Arc has no manifest. Off by default; once
+	// enabled, runs on cron with conservative grace window + blast cap.
+	var reconciliationScheduler *reconciliation.Scheduler
+	if cfg.Reconciliation.Enabled && clusterCoordinator != nil {
+		gate := newReconciliationClusterGate(clusterCoordinator, cfg.Storage.Backend)
+		recCfg := reconciliation.Config{
+			Enabled:                  true,
+			BackendKind:              reconciliationBackendKind(cfg.Storage.Backend),
+			LocalNodeID:              cfg.Cluster.NodeID,
+			GraceWindow:              time.Duration(cfg.Reconciliation.GraceWindowSeconds) * time.Second,
+			ClockSkewAllowance:       time.Duration(cfg.Reconciliation.ClockSkewAllowanceSeconds) * time.Second,
+			PerPrefixTimeout:         time.Duration(cfg.Reconciliation.PerPrefixTimeoutSeconds) * time.Second,
+			MaxRunDuration:           time.Duration(cfg.Reconciliation.MaxRunDurationSeconds) * time.Second,
+			MaxManifestSize:          cfg.Reconciliation.MaxManifestSize,
+			MaxDeletesPerRun:         cfg.Reconciliation.MaxDeletesPerRun,
+			BatchSize:                cfg.Reconciliation.BatchSize,
+			DeletePreManifestOrphans: cfg.Reconciliation.DeletePreManifestOrphans,
+			ManifestOnlyDryRun:       cfg.Reconciliation.ManifestOnlyDryRun,
+			SamplePathsCap:           cfg.Reconciliation.SamplePathsCap,
+		}
+		reconciler, err := reconciliation.NewReconciler(recCfg, clusterCoordinator, storageBackend, gate, auditLogger, logger.Get("reconciliation"))
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to create reconciler — feature disabled")
+		} else {
+			reconciliationScheduler, err = reconciliation.NewScheduler(reconciliation.SchedulerConfig{
+				Reconciler: reconciler,
+				Schedule:   cfg.Reconciliation.Schedule,
+				Logger:     logger.Get("reconciliation-scheduler"),
+			})
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to create reconciliation scheduler")
+				reconciliationScheduler = nil
+			} else if err := reconciliationScheduler.Start(); err != nil {
+				log.Error().Err(err).Msg("Failed to start reconciliation scheduler")
+				reconciliationScheduler = nil
+			} else {
+				shutdownCoordinator.RegisterHook("reconciliation-scheduler", func(ctx context.Context) error {
+					reconciliationScheduler.Stop()
+					return nil
+				}, shutdown.PriorityCompaction)
+				log.Info().Str("schedule", cfg.Reconciliation.Schedule).
+					Str("backend_kind", string(recCfg.BackendKind)).
+					Bool("dry_run_only", cfg.Reconciliation.ManifestOnlyDryRun).
+					Msg("Reconciliation scheduler started")
+			}
+		}
+	} else if cfg.Reconciliation.Enabled && clusterCoordinator == nil {
+		log.Warn().Msg("Reconciliation requires Enterprise clustering (cluster.enabled=true) — feature disabled")
+	}
+
+	// Always register the handler so /api/v1/reconciliation/status reports
+	// the disabled state when the scheduler isn't running.
+	var reconciliationSchedulerInterface api.ReconciliationSchedulerInterface
+	if reconciliationScheduler != nil {
+		reconciliationSchedulerInterface = reconciliationScheduler
+	}
+	reconciliationHandler := api.NewReconciliationHandler(reconciliationSchedulerInterface, licenseClient, authManager, logger.Get("reconciliation-api"))
+	reconciliationHandler.RegisterRoutes(server.GetApp())
+
 	// Register Cluster handler (always register, shows status even if clustering not enabled)
 	clusterHandler := api.NewClusterHandler(clusterCoordinator, authManager, licenseClient, logger.Get("cluster-api"))
 	clusterHandler.RegisterRoutes(server.GetApp())
@@ -1829,4 +1891,68 @@ func (g *compactionClusterGate) CanCompact() bool {
 // Role returns the node's role string for log messages.
 func (g *compactionClusterGate) Role() string {
 	return string(g.role)
+}
+
+// reconciliationClusterGate implements reconciliation.Gate. The two halves
+// of a reconcile run (storage scan, manifest sweep) have different gating
+// rules depending on the storage backend topology:
+//
+//   - Shared storage (S3, Azure, MinIO): one node sweeps the bucket. Both
+//     halves gate on IsActiveCompactor — reuses the failover-managed
+//     compactor lease as a single-sweeper election with no new state.
+//   - Local storage: every node walks its own disks; the per-file
+//     OriginNodeID filter inside the reconciler handles scoping.
+//     BatchFileOpsInManifest leader-forwards on its own, so the
+//     manifest-sweep gate is also "always".
+//
+// This type lives in main.go so the reconciliation package has no
+// compile-time dependency on the cluster package.
+type reconciliationClusterGate struct {
+	coordinator *cluster.Coordinator
+	shared      bool // true for s3/azure backends — one-node-sweeps semantics
+}
+
+func newReconciliationClusterGate(c *cluster.Coordinator, backendKind string) *reconciliationClusterGate {
+	return &reconciliationClusterGate{
+		coordinator: c,
+		shared:      isSharedBackend(backendKind),
+	}
+}
+
+func (g *reconciliationClusterGate) ShouldRunStorageScan() bool {
+	if g.shared {
+		return g.coordinator.IsActiveCompactor()
+	}
+	return true
+}
+
+func (g *reconciliationClusterGate) ShouldRunManifestSweep() bool {
+	if g.shared {
+		return g.coordinator.IsActiveCompactor()
+	}
+	return true
+}
+
+func (g *reconciliationClusterGate) Role() string {
+	return string(g.coordinator.GetRole())
+}
+
+// reconciliationBackendKind maps the config storage backend string to
+// the reconciliation package's typed BackendKind.
+func reconciliationBackendKind(backend string) reconciliation.BackendKind {
+	if isSharedBackend(backend) {
+		return reconciliation.BackendShared
+	}
+	return reconciliation.BackendLocal
+}
+
+// isSharedBackend reports whether the configured storage backend is
+// shared across cluster nodes (one source of truth on disk).
+func isSharedBackend(backend string) bool {
+	switch backend {
+	case "s3", "minio", "azure":
+		return true
+	default:
+		return false
+	}
 }

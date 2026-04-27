@@ -2098,8 +2098,10 @@ func (c *Coordinator) startFilePullerLocked() error {
 // repeated Start/Stop cycles in tests do NOT re-run catch-up — a fresh walk
 // requires a fresh Coordinator instance. This is intentional: in production
 // a node that wants to re-reconcile the manifest should restart the process.
-// If Phase 5 adds periodic reconciliation, it will live alongside this
-// startup-only path, not replace it.
+// The Phase 5 reconciler at internal/reconciliation runs alongside this
+// startup-only path; it operates on the same FSM snapshot but covers the
+// drift the startup walker can't see (orphan-storage on shared backends,
+// orphan-manifest entries from partial-failure scenarios).
 //
 // Errors from WaitForLeader and Barrier are logged as warnings and the
 // walker proceeds against a possibly-stale FSM snapshot. A partial walk is
