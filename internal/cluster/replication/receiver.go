@@ -89,9 +89,20 @@ type Receiver struct {
 	// the in-memory ingest buffer. Treated as non-fatal — the primary
 	// retains the data and follower-side durability is restored on next
 	// flush via Parquet replication. See applyEntry for full rationale.
+	walDropLastLogNano atomic.Int64 // Sampled-Warn timestamp for WAL drops:
+	// sustained follower-side backpressure can produce a dropped entry
+	// per record; without sampling that becomes a Warn flood. Operators
+	// get the rate from totalLocalWALDropped — the log line just signals
+	// "the degraded state is in effect, look at the counter." Mirrors
+	// ArrowBuffer.walDropLastLogNano.
 	lastReceiveTime atomic.Int64 // Unix nano
 	connectTime     atomic.Int64 // Unix nano
 }
+
+// walDropLogIntervalNano caps the WAL-drop Warn rate to one line per
+// second per receiver. Same semantics as ArrowBuffer's identically
+// named const.
+const walDropLogIntervalNano = int64(time.Second)
 
 // NewReceiver creates a new replication receiver.
 func NewReceiver(cfg *ReceiverConfig) *Receiver {
@@ -360,10 +371,18 @@ func (r *Receiver) applyEntry(entry *ReplicateEntry) error {
 		if err := r.cfg.LocalWAL.AppendRaw(entry.Payload); err != nil {
 			if errors.Is(err, wal.ErrWALDropped) {
 				r.totalLocalWALDropped.Add(1)
-				r.logger.Warn().
-					Uint64("sequence", entry.Sequence).
-					Int("payload_size", len(entry.Payload)).
-					Msg("Replication: follower LocalWAL dropped entry on backpressure; applying to ingest buffer anyway (durability via primary + peer Parquet replication)")
+				// Sampled Warn — at most one line per walDropLogIntervalNano.
+				// Sustained backpressure can drop one entry per replicated
+				// record; an unsampled Warn drowns operator dashboards.
+				now := time.Now().UnixNano()
+				last := r.walDropLastLogNano.Load()
+				if now-last >= walDropLogIntervalNano && r.walDropLastLogNano.CompareAndSwap(last, now) {
+					r.logger.Warn().
+						Uint64("sequence", entry.Sequence).
+						Int("payload_size", len(entry.Payload)).
+						Int64("total_dropped", r.totalLocalWALDropped.Load()).
+						Msg("Replication: follower LocalWAL dropped entry on backpressure; applying to ingest buffer anyway (durability via primary + peer Parquet replication)")
+				}
 			} else {
 				return fmt.Errorf("write to local WAL: %w", err)
 			}

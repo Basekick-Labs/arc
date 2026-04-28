@@ -79,9 +79,15 @@ type ShardReceiver struct {
 	totalEntriesApplied  atomic.Int64
 	totalErrors          atomic.Int64
 	totalLocalWALDropped atomic.Int64 // See replication.Receiver.totalLocalWALDropped — same semantics.
+	walDropLastLogNano   atomic.Int64 // Sampled-Warn timestamp; see replication.Receiver.walDropLastLogNano.
 	lastReceiveTime      atomic.Int64
 	connectTime          atomic.Int64
 }
+
+// walDropLogIntervalNano caps the WAL-drop Warn rate to one line per
+// second per shard receiver. Same semantics as ArrowBuffer's identically
+// named const.
+const walDropLogIntervalNano = int64(time.Second)
 
 // NewShardReceiverManager creates a new per-shard receiver manager.
 func NewShardReceiverManager(cfg *ShardReceiverConfig) *ShardReceiverManager {
@@ -472,11 +478,19 @@ func (r *ShardReceiver) applyEntry(entry *replication.ReplicateEntry) error {
 		if err := r.cfg.LocalWAL.AppendRaw(entry.Payload); err != nil {
 			if errors.Is(err, wal.ErrWALDropped) {
 				r.totalLocalWALDropped.Add(1)
-				r.logger.Warn().
-					Int("shard_id", r.shardID).
-					Uint64("sequence", entry.Sequence).
-					Int("payload_size", len(entry.Payload)).
-					Msg("Shard replication: follower LocalWAL dropped entry on backpressure; applying to ingest buffer anyway")
+				// Sampled Warn — at most one line per walDropLogIntervalNano
+				// per shard. Sustained backpressure on a busy shard would
+				// otherwise produce a Warn per replicated record.
+				now := time.Now().UnixNano()
+				last := r.walDropLastLogNano.Load()
+				if now-last >= walDropLogIntervalNano && r.walDropLastLogNano.CompareAndSwap(last, now) {
+					r.logger.Warn().
+						Int("shard_id", r.shardID).
+						Uint64("sequence", entry.Sequence).
+						Int("payload_size", len(entry.Payload)).
+						Int64("total_dropped", r.totalLocalWALDropped.Load()).
+						Msg("Shard replication: follower LocalWAL dropped entry on backpressure; applying to ingest buffer anyway")
+				}
 			} else {
 				return fmt.Errorf("write to local WAL: %w", err)
 			}

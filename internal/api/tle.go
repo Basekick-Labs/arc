@@ -280,7 +280,7 @@ func decompressGzipPooled(data []byte, maxSize int) ([]byte, error) {
 
 	if len(result) > maxSize {
 		lpGzipReaderPool.Put(reader)
-		return nil, fmt.Errorf("decompressed payload exceeds %dMB limit", maxSize/(1024*1024))
+		return nil, fmt.Errorf("decompressed payload exceeds %s limit", formatBytes(int64(maxSize)))
 	}
 
 	lpGzipReaderPool.Put(reader)
@@ -345,7 +345,7 @@ func decompressZstdPooled(data []byte, maxSize int) ([]byte, error) {
 	zstdDecoderPool.Put(decoder)
 
 	if len(out) > maxSize {
-		return nil, fmt.Errorf("decompressed payload exceeds %dMB limit", maxSize/(1024*1024))
+		return nil, fmt.Errorf("decompressed payload exceeds %s limit", formatBytes(int64(maxSize)))
 	}
 
 	return out, nil
