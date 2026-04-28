@@ -353,10 +353,12 @@ func decompressZstdPooled(data []byte, maxSize int) ([]byte, error) {
 	limited := io.LimitReader(decoder, int64(maxSize)+1)
 	out, err := io.ReadAll(limited)
 	if err != nil {
-		// Drain any pending state so the decoder can be safely reused
-		// by a future request. Reset(nil) is the documented release.
-		_ = decoder.Reset(nil)
-		zstdDecoderPool.Put(decoder)
+		// Decoder may be in an indeterminate state after a partial-decode
+		// error — corrupted internal frame state can't be safely reset.
+		// Drop the decoder entirely (Close releases its goroutines and
+		// buffers) rather than risk poisoning the pool. The pool's Get()
+		// will allocate a fresh one on the next request. Per gemini r7.
+		decoder.Close()
 		return nil, fmt.Errorf("failed to decompress zstd: %w", err)
 	}
 

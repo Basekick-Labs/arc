@@ -219,22 +219,52 @@ localProcessing:
 		})
 	}
 
-	// Shared dispatch: gzip / zstd / uncompressed, with the streaming
-	// LimitReader bound on compressed paths and a defensive copy +
-	// size cap on the uncompressed path. See tle.go for the helper
-	// definition. Mirrors what LP and TLE do.
-	payload, compressionType, err := decompressRequest(rawBody, int(h.maxPayloadSize))
-	if err != nil {
-		h.logger.Error().Err(err).Str("codec", compressionType).Msg("Failed to accept request body")
-		// Match LP/TLE shape: codec="" for uncompressed-rejection,
-		// "gzip"/"zstd" for decoder errors.
-		errMsg := "Failed to read request body: " + err.Error()
-		if compressionType != "" {
-			errMsg = fmt.Sprintf("Invalid %s compression: %v", compressionType, err)
+	// HOT PATH: msgpack-columnar ingest sustains ~19M rec/s in benchmark,
+	// so this dispatch is performance-critical. We do NOT use the shared
+	// decompressRequest helper for the uncompressed branch because that
+	// helper makes a defensive memcpy of rawBody — at 18M+ rec/s with
+	// large batches that costs ~1M rec/s of throughput. The msgpack
+	// decoder (Basekick-Labs/msgpack/v6) is *synchronous* and copies
+	// every string field via `string(b)` and every []byte field via
+	// `io.ReadFull` into a fresh slice — so by the time h.decoder.Decode
+	// returns, no decoded value still aliases rawBody. fasthttp can
+	// safely reuse the buffer once this handler returns. The compressed
+	// branches still go through the shared helpers because those produce
+	// fresh allocations regardless and the bomb-mitigation matters.
+	//
+	// LP and TLE use the helper unmodified — their throughput targets
+	// are lower and the consistency wins.
+	var (
+		payload         []byte
+		compressionType string
+	)
+	switch {
+	case len(rawBody) >= 2 && rawBody[0] == 0x1f && rawBody[1] == 0x8b:
+		decompressed, derr := decompressGzipPooled(rawBody, int(h.maxPayloadSize))
+		if derr != nil {
+			h.logger.Error().Err(derr).Msg("Failed to decompress gzip data")
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": fmt.Sprintf("Invalid gzip compression: %v", derr),
+			})
 		}
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": errMsg,
-		})
+		payload = decompressed
+		compressionType = "gzip"
+	case len(rawBody) >= 4 && rawBody[0] == 0x28 && rawBody[1] == 0xB5 && rawBody[2] == 0x2F && rawBody[3] == 0xFD:
+		decompressed, derr := decompressZstdPooled(rawBody, int(h.maxPayloadSize))
+		if derr != nil {
+			h.logger.Error().Err(derr).Msg("Failed to decompress zstd data")
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": fmt.Sprintf("Invalid zstd compression: %v", derr),
+			})
+		}
+		payload = decompressed
+		compressionType = "zstd"
+	default:
+		// Uncompressed: hand rawBody directly to the synchronous decoder.
+		// No defensive copy because Decode finishes before the handler
+		// returns. The pre-decompression maxPayloadSize check above
+		// already capped the input size.
+		payload = rawBody
 	}
 	if compressionType != "" {
 		h.logger.Debug().
