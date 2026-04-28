@@ -222,9 +222,17 @@ localProcessing:
 	body, codec, err := decompressRequest(rawBody, 0)
 	if err != nil {
 		h.totalErrors.Add(1)
-		h.logger.Error().Err(err).Str("codec", codec).Msg("Failed to decompress request body")
+		h.logger.Error().Err(err).Str("codec", codec).Msg("Failed to accept request body")
+		// codec=="" when the uncompressed branch rejected an over-cap
+		// body; codec="gzip"/"zstd" when a decoder errored. Use the
+		// codec label only when present so the client message stays
+		// readable in both cases.
+		errMsg := "Failed to read request body: " + err.Error()
+		if codec != "" {
+			errMsg = "Failed to decompress " + codec + " data: " + err.Error()
+		}
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Failed to decompress " + codec + " data: " + err.Error(),
+			"error": errMsg,
 		})
 	}
 	if codec != "" {

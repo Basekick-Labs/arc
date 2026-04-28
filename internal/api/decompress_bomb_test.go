@@ -85,6 +85,49 @@ func TestDecompressZstdPooled_RejectsBenignOversizedPayload(t *testing.T) {
 	}
 }
 
+// TestDecompressRequest_UncompressedRejectsOverCap is a regression
+// test for the round-6 gemini finding: the uncompressed branch of
+// decompressRequest had no maxSize check, so a multi-GB raw body
+// would be both accepted AND defensively copied, doubling the
+// allocation in the uncompressed-OOM vector. The fix applies the
+// same maxSize cap to all three branches.
+func TestDecompressRequest_UncompressedRejectsOverCap(t *testing.T) {
+	const cap = 1024
+	rawBody := bytes.Repeat([]byte{'x'}, cap+1)
+	body, codec, err := decompressRequest(rawBody, cap)
+	if err == nil {
+		t.Fatalf("decompressRequest: expected over-cap error, got %d bytes (codec=%q)", len(body), codec)
+	}
+	if codec != "" {
+		t.Fatalf("decompressRequest: expected codec=\"\" for uncompressed-rejection, got %q", codec)
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("decompressRequest: expected 'exceeds' in error, got: %v", err)
+	}
+}
+
+// TestDecompressRequest_UncompressedAcceptsAtCap pins the boundary:
+// a body exactly at maxSize is accepted. Catches off-by-one.
+func TestDecompressRequest_UncompressedAcceptsAtCap(t *testing.T) {
+	const capSize = 1024
+	rawBody := bytes.Repeat([]byte{'y'}, capSize)
+	body, codec, err := decompressRequest(rawBody, capSize)
+	if err != nil {
+		t.Fatalf("decompressRequest: unexpected error at boundary: %v", err)
+	}
+	if codec != "" {
+		t.Fatalf("decompressRequest: expected codec=\"\", got %q", codec)
+	}
+	if len(body) != capSize {
+		t.Fatalf("decompressRequest: expected %d bytes, got %d", capSize, len(body))
+	}
+	// Defensive copy: body must not alias rawBody.
+	body[0] = 'Z'
+	if rawBody[0] != 'y' {
+		t.Fatalf("decompressRequest: body aliased rawBody — defensive copy regressed")
+	}
+}
+
 // TestDecompressZstdPooled_HappyPath_RoundTrip pins the non-adversarial
 // success path: small payload below the cap decodes cleanly to the
 // original bytes. Catches regressions where the streaming-Reset fix

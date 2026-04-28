@@ -124,9 +124,13 @@ localProcessing:
 	body, codec, err := decompressRequest(rawBody, 0)
 	if err != nil {
 		h.totalErrors.Add(1)
-		h.logger.Error().Err(err).Str("codec", codec).Msg("Failed to decompress request body")
+		h.logger.Error().Err(err).Str("codec", codec).Msg("Failed to accept request body")
+		errMsg := "Failed to read request body: " + err.Error()
+		if codec != "" {
+			errMsg = "Failed to decompress " + codec + " data: " + err.Error()
+		}
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Failed to decompress " + codec + " data: " + err.Error(),
+			"error": errMsg,
 		})
 	}
 
@@ -231,10 +235,20 @@ func (h *TLEHandler) Stats(c *fiber.Ctx) error {
 // owned rawBody (see lineprotocol.go for the silent-aliasing
 // rationale).
 //
-// maxSize limits the decompressed output; pass 0 for the default
-// 100MB. err carries the wrapped underlying decoder error so handlers
-// can include it in the JSON response for client diagnosis.
+// maxSize is a hard ceiling on the *post-decompression* size and is
+// applied symmetrically to all three branches:
+//   - gzip / zstd: enforced inside the streaming decoder via LimitReader
+//     so a bomb is rejected before allocation.
+//   - uncompressed: enforced before the defensive copy so an attacker
+//     cannot force a multi-GB allocation by sending a giant raw body.
+//
+// Pass 0 for the default 100MB cap. err carries the wrapped underlying
+// decoder error so handlers can include it in the JSON response for
+// client diagnosis.
 func decompressRequest(rawBody []byte, maxSize int) (body []byte, codec string, err error) {
+	if maxSize <= 0 {
+		maxSize = 100 * 1024 * 1024 // 100MB default — must match the codec helpers
+	}
 	switch {
 	case len(rawBody) >= 2 && rawBody[0] == 0x1f && rawBody[1] == 0x8b:
 		body, err = decompressGzipPooled(rawBody, maxSize)
@@ -243,7 +257,14 @@ func decompressRequest(rawBody []byte, maxSize int) (body []byte, codec string, 
 		body, err = decompressZstdPooled(rawBody, maxSize)
 		return body, "zstd", err
 	default:
-		// Uncompressed — defensive copy out of fasthttp-owned buffer.
+		// Uncompressed — enforce the same maxSize cap as the codec
+		// branches before making the defensive copy. Without this
+		// check, an uncompressed multi-GB body would be both accepted
+		// AND copied (the defensive copy is the OOM vector). Symmetric
+		// hardening per gemini round 6.
+		if len(rawBody) > maxSize {
+			return nil, "", fmt.Errorf("payload exceeds %s limit", formatBytes(int64(maxSize)))
+		}
 		out := append([]byte(nil), rawBody...)
 		return out, "", nil
 	}
