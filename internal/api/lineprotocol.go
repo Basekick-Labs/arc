@@ -1,10 +1,8 @@
 package api
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"regexp"
 	"sync"
 	"sync/atomic"
@@ -14,7 +12,6 @@ import (
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/gofiber/fiber/v2"
-	"github.com/klauspost/compress/gzip"
 	"github.com/rs/zerolog"
 )
 
@@ -207,61 +204,31 @@ func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string, precisi
 	}
 
 localProcessing:
-	// CRITICAL: use c.Request().Body() (raw) instead of c.Body() to avoid
-	// fasthttp's transparent gunzip. fasthttp's BodyGunzip path is
-	// uncapped — a 1MB gzip payload that decompresses to 50GB would OOM
-	// the process before our handler-level size check fires. The
-	// msgpack handler uses the same pattern; we now mirror it for LP.
-	//
-	// rawBody is owned by fasthttp and reused after this handler
-	// returns. The decompression branches return fresh slices (decoded
-	// into a pooled buffer and then copied out), so they need no
-	// defensive copy. The uncompressed branch DOES need a defensive
-	// copy: the LP parser produces fresh strings today, but documenting
-	// "no future change may retain a sub-slice of body" is brittle, and
-	// the silent-aliasing footgun is real (gemini round 2 finding).
-	// One memcpy on the uncompressed path is the right cost; doubling
-	// the memory of large compressed payloads is not (gemini round 3).
+	// Shared decompressRequest (in tle.go) handles gzip/zstd/uncompressed
+	// dispatch with a hard 100MB output cap. CRITICAL invariants kept by
+	// that helper:
+	//   1. fasthttp's transparent gunzip is bypassed — using rawBody
+	//      avoids the uncapped BodyGunzip path that would OOM on a
+	//      bomb (1MB compressed → 50GB decompressed).
+	//   2. zstd path uses streaming Reset+LimitReader, not DecodeAll —
+	//      WithDecoderMaxMemory only bounds decoder window state, not
+	//      output buffer growth.
+	//   3. Uncompressed branch defensively copies out of the fasthttp-
+	//      owned buffer so retained sub-slices stay valid post-handler.
 	rawBody := c.Request().Body()
 	originalSize := len(rawBody)
 	h.totalBytes.Add(int64(originalSize))
 
-	var body []byte
-	switch {
-	case len(rawBody) >= 2 && rawBody[0] == 0x1f && rawBody[1] == 0x8b:
-		// gzip — decompressGzip applies a hard 100MB decompressed cap so
-		// an adversarial gzip bomb is rejected before allocation.
+	body, codec, err := decompressRequest(rawBody, 0)
+	if err != nil {
+		h.totalErrors.Add(1)
+		h.logger.Error().Err(err).Str("codec", codec).Msg("Failed to decompress request body")
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Failed to decompress " + codec + " data: " + err.Error(),
+		})
+	}
+	if codec != "" {
 		h.totalBytesGzipped.Add(int64(originalSize))
-		decompressed, err := h.decompressGzip(rawBody)
-		if err != nil {
-			h.totalErrors.Add(1)
-			h.logger.Error().Err(err).Msg("Failed to decompress gzip data")
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": "Failed to decompress gzip data: " + err.Error(),
-			})
-		}
-		body = decompressed
-
-	case len(rawBody) >= 4 && rawBody[0] == 0x28 && rawBody[1] == 0xB5 && rawBody[2] == 0x2F && rawBody[3] == 0xFD:
-		// zstd magic number 0x28 0xB5 0x2F 0xFD — same 100MB cap as gzip,
-		// pooled decoder reused via the package-level zstdDecoderPool.
-		h.totalBytesGzipped.Add(int64(originalSize))
-		decompressed, err := decompressZstdPooled(rawBody, 0)
-		if err != nil {
-			h.totalErrors.Add(1)
-			h.logger.Error().Err(err).Msg("Failed to decompress zstd data")
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": "Failed to decompress zstd data: " + err.Error(),
-			})
-		}
-		body = decompressed
-
-	default:
-		// Uncompressed payload — defensive copy out of the fasthttp-owned
-		// buffer so anything downstream that retains a sub-slice (today
-		// nothing does, but the contract is undocumented) stays valid
-		// after the handler returns.
-		body = append([]byte(nil), rawBody...)
 	}
 
 	// Check for empty body
@@ -398,42 +365,10 @@ func (h *LineProtocolHandler) GetStats() map[string]int64 {
 	}
 }
 
-// decompressGzip decompresses gzip data using pooled readers to minimize allocations
-// klauspost gzip.Reader has ~32KB internal state that can be reused via Reset()
-func (h *LineProtocolHandler) decompressGzip(data []byte) ([]byte, error) {
-	const maxDecompressedSize = 100 * 1024 * 1024 // 100MB
-
-	// Get pooled gzip reader or create new one
-	var reader *gzip.Reader
-	var err error
-	if pooled := lpGzipReaderPool.Get(); pooled != nil {
-		reader = pooled.(*gzip.Reader)
-		err = reader.Reset(bytes.NewReader(data))
-	} else {
-		reader, err = gzip.NewReader(bytes.NewReader(data))
-	}
-	if err != nil {
-		if reader != nil {
-			lpGzipReaderPool.Put(reader)
-		}
-		return nil, err
-	}
-
-	// Read with size limit
-	result, err := io.ReadAll(io.LimitReader(reader, maxDecompressedSize+1))
-	if err != nil {
-		lpGzipReaderPool.Put(reader)
-		return nil, err
-	}
-
-	// Check size limit
-	if len(result) > maxDecompressedSize {
-		lpGzipReaderPool.Put(reader)
-		return nil, fmt.Errorf("decompressed payload exceeds 100MB limit")
-	}
-
-	// Return reader to pool for reuse
-	lpGzipReaderPool.Put(reader)
-
-	return result, nil
-}
+// decompressGzip was the LP-specific gzip decoder. It duplicated the
+// package-level decompressGzipPooled helper in tle.go (same pool,
+// same shape) — gemini round 4 finding. The method is now removed
+// and all call sites go through decompressRequest, which delegates
+// to decompressGzipPooled. Keeping this comment as a tombstone so
+// future code review sees the decision rather than wondering why LP
+// has its own pooled-gzip helper next door (it doesn't anymore).

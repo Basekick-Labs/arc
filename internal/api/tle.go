@@ -112,50 +112,22 @@ func (h *TLEHandler) handleWrite(c *fiber.Ctx) error {
 	}
 
 localProcessing:
-	// CRITICAL: use c.Request().Body() (raw) instead of c.Body() to avoid
-	// fasthttp's transparent gunzip. fasthttp's BodyGunzip path is
-	// uncapped — a 1MB gzip payload that decompresses to 50GB would OOM
-	// the process before our handler-level size check fires. The
-	// msgpack handler uses the same pattern; we now mirror it for TLE.
-	//
-	// Defensive copy lives only in the uncompressed branch — see
-	// lineprotocol.go for full rationale. The decompression branches
-	// already return fresh slices, so doubling the memory by copying
-	// the compressed input first is wasteful for large TLE catalog
-	// refreshes.
+	// Shared decompressRequest helper (below) handles gzip/zstd/
+	// uncompressed dispatch with a hard 100MB output cap, the streaming
+	// LimitReader-bounded zstd path, and the defensive copy of fasthttp-
+	// owned bytes on the uncompressed branch. See lineprotocol.go for
+	// the security rationale of each invariant.
 	rawBody := c.Request().Body()
 	originalSize := len(rawBody)
 	h.totalBytes.Add(int64(originalSize))
 
-	var body []byte
-	switch {
-	case len(rawBody) >= 2 && rawBody[0] == 0x1f && rawBody[1] == 0x8b:
-		// gzip — pooled, hard decompressed-size cap (100MB).
-		decompressed, err := decompressGzipPooled(rawBody, 0)
-		if err != nil {
-			h.totalErrors.Add(1)
-			h.logger.Error().Err(err).Msg("Failed to decompress gzip data")
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": "Failed to decompress gzip data: " + err.Error(),
-			})
-		}
-		body = decompressed
-
-	case len(rawBody) >= 4 && rawBody[0] == 0x28 && rawBody[1] == 0xB5 && rawBody[2] == 0x2F && rawBody[3] == 0xFD:
-		// zstd — same 100MB cap, mirrors LP and msgpack handlers.
-		decompressed, err := decompressZstdPooled(rawBody, 0)
-		if err != nil {
-			h.totalErrors.Add(1)
-			h.logger.Error().Err(err).Msg("Failed to decompress zstd data")
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": "Failed to decompress zstd data: " + err.Error(),
-			})
-		}
-		body = decompressed
-
-	default:
-		// Uncompressed — defensive copy out of fasthttp-owned buffer.
-		body = append([]byte(nil), rawBody...)
+	body, codec, err := decompressRequest(rawBody, 0)
+	if err != nil {
+		h.totalErrors.Add(1)
+		h.logger.Error().Err(err).Str("codec", codec).Msg("Failed to decompress request body")
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Failed to decompress " + codec + " data: " + err.Error(),
+		})
 	}
 
 	if len(body) == 0 {
@@ -248,6 +220,35 @@ func (h *TLEHandler) Stats(c *fiber.Ctx) error {
 	})
 }
 
+// decompressRequest dispatches on the compression magic bytes at the
+// head of rawBody and returns a fresh, hard-capped []byte plus a
+// short codec label ("gzip", "zstd", or "" for uncompressed) suitable
+// for structured logging.
+//
+// All three branches return slices that are safe to retain past
+// handler return — the gzip and zstd helpers allocate fresh, and the
+// uncompressed branch makes a defensive copy out of the fasthttp-
+// owned rawBody (see lineprotocol.go for the silent-aliasing
+// rationale).
+//
+// maxSize limits the decompressed output; pass 0 for the default
+// 100MB. err carries the wrapped underlying decoder error so handlers
+// can include it in the JSON response for client diagnosis.
+func decompressRequest(rawBody []byte, maxSize int) (body []byte, codec string, err error) {
+	switch {
+	case len(rawBody) >= 2 && rawBody[0] == 0x1f && rawBody[1] == 0x8b:
+		body, err = decompressGzipPooled(rawBody, maxSize)
+		return body, "gzip", err
+	case len(rawBody) >= 4 && rawBody[0] == 0x28 && rawBody[1] == 0xB5 && rawBody[2] == 0x2F && rawBody[3] == 0xFD:
+		body, err = decompressZstdPooled(rawBody, maxSize)
+		return body, "zstd", err
+	default:
+		// Uncompressed — defensive copy out of fasthttp-owned buffer.
+		out := append([]byte(nil), rawBody...)
+		return out, "", nil
+	}
+}
+
 // decompressGzipPooled decompresses gzip data using pooled readers to minimize allocations.
 // Shared across handlers — uses lpGzipReaderPool (declared in lineprotocol.go).
 // maxSize limits the decompressed output; pass 0 for the default 100MB limit.
@@ -288,12 +289,21 @@ func decompressGzipPooled(data []byte, maxSize int) ([]byte, error) {
 
 // decompressZstdPooled decompresses zstd data using the package-level
 // zstdDecoderPool (declared in msgpack.go). Returns a freshly-copied
-// []byte (not a PooledBuffer) so LP and TLE callers can keep their
-// existing flat-byte handler shape — the decode buffer itself is
-// returned to decompressBufferPool inside this function.
+// []byte so LP and TLE callers can keep their flat-byte handler shape.
 //
-// maxSize limits the decompressed output; pass 0 for the default 100MB.
-// Mirrors the gzip helper above and the msgpack zstd path.
+// maxSize is a hard ceiling on the *decompressed output*; pass 0 for
+// the default 100MB. Critical: the bound is enforced by reading the
+// decoder via io.LimitReader, NOT by checking len after DecodeAll.
+// zstd.WithDecoderMaxMemory only bounds the decoder's per-frame
+// window state, not the output buffer growth — DecodeAll on a high-
+// ratio bomb (e.g. 100KB → 100GB) would OOM the process before any
+// post-hoc length check could fire. The streaming Reset+LimitReader+
+// ReadAll pattern matches the gzip helper above and is the same
+// shape klauspost recommends for untrusted input.
+//
+// Reads up to maxSize+1 bytes; if exactly maxSize+1 bytes were read,
+// the input was over-limit and we return an error (a single read of
+// maxSize+1 is still bounded so the bomb cannot OOM).
 func decompressZstdPooled(data []byte, maxSize int) ([]byte, error) {
 	if maxSize <= 0 {
 		maxSize = 100 * 1024 * 1024 // 100MB default
@@ -303,48 +313,40 @@ func decompressZstdPooled(data []byte, maxSize int) ([]byte, error) {
 	var err error
 	if pooled := zstdDecoderPool.Get(); pooled != nil {
 		decoder = pooled.(*zstd.Decoder)
+		if err = decoder.Reset(bytes.NewReader(data)); err != nil {
+			// Pool entry's internal state is now poisoned — drop it.
+			decoder.Close()
+			return nil, fmt.Errorf("failed to reset zstd decoder: %w", err)
+		}
 	} else {
-		decoder, err = zstd.NewReader(nil, zstd.WithDecoderMaxMemory(uint64(maxSize)+1024))
+		decoder, err = zstd.NewReader(bytes.NewReader(data), zstd.WithDecoderMaxMemory(uint64(maxSize)+1024))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
 		}
 	}
 
-	bufPtr := decompressBufferPool.Get().(*[]byte)
-	buf := (*bufPtr)[:0]
-
-	buf, err = decoder.DecodeAll(data, buf)
+	// Bounded read: io.LimitReader caps the bytes we will pull from the
+	// decoder regardless of compression ratio. Reading maxSize+1 lets us
+	// distinguish "exactly at limit" from "over limit" with a single
+	// allocation — no unbounded buffer growth is possible.
+	limited := io.LimitReader(decoder, int64(maxSize)+1)
+	out, err := io.ReadAll(limited)
 	if err != nil {
+		// Drain any pending state so the decoder can be safely reused
+		// by a future request. Reset(nil) is the documented release.
+		_ = decoder.Reset(nil)
 		zstdDecoderPool.Put(decoder)
-		*bufPtr = (*bufPtr)[:0]
-		decompressBufferPool.Put(bufPtr)
 		return nil, fmt.Errorf("failed to decompress zstd: %w", err)
 	}
 
+	// Release the decoder's internal buffers (it may be holding the
+	// last decoded frame) before returning to the pool.
+	_ = decoder.Reset(nil)
 	zstdDecoderPool.Put(decoder)
 
-	if len(buf) > maxSize {
-		*bufPtr = (*bufPtr)[:0]
-		decompressBufferPool.Put(bufPtr)
+	if len(out) > maxSize {
 		return nil, fmt.Errorf("decompressed payload exceeds %dMB limit", maxSize/(1024*1024))
 	}
-
-	// Copy out so the pooled buffer can be returned immediately — LP/TLE
-	// callers operate on the result for the rest of the request and don't
-	// follow the PooledBuffer.Release contract used by msgpack.
-	out := make([]byte, len(buf))
-	copy(out, buf)
-
-	if cap(buf) > maxPooledBufferSize {
-		// Don't pollute the pool with oversized buffers; mirrors msgpack.
-		decompBufferDiscards.Add(1)
-		metrics.Get().IncDecompBufferDiscards()
-		freshBuf := make([]byte, 0, initialBufferSize)
-		*bufPtr = freshBuf
-	} else {
-		*bufPtr = buf[:0]
-	}
-	decompressBufferPool.Put(bufPtr)
 
 	return out, nil
 }

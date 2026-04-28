@@ -444,70 +444,60 @@ func (h *MsgPackHandler) decompressGzip(data []byte) (*PooledBuffer, error) {
 	}, nil
 }
 
-// decompressZstd decompresses zstd data with size limits
-// Uses sync.Pool for zstd decoder and output buffer to minimize allocations
-// Zstd is 3-5x faster than gzip for decompression
-// ZERO-COPY: Returns a PooledBuffer that caller MUST Release() after use
+// decompressZstd decompresses zstd data with size limits.
+// Returns a PooledBuffer that caller MUST Release() after use.
+//
+// SECURITY: Uses streaming Reset + io.LimitReader + io.ReadAll instead
+// of DecodeAll because WithDecoderMaxMemory only bounds the decoder's
+// per-frame window state, not the output buffer growth. A high-ratio
+// zstd bomb (e.g. 100KB → 100GB) would have OOM'd the process under
+// DecodeAll before the post-hoc length check could fire. The streaming
+// form caps output bytes during decoding (a bounded read of
+// maxDecompressedSize+1 is safe regardless of compression ratio).
+//
+// The output is io.ReadAll'd into a fresh slice rather than the pooled
+// decompressBufferPool because ReadAll's growth pattern fights the
+// pool's fixed-capacity contract — for safety on untrusted input we
+// trade a small allocation per request for hard bounded memory.
+// Decoder pooling is preserved (the decoder's per-frame state is
+// the expensive part to allocate; the output slice is cheap).
 func (h *MsgPackHandler) decompressZstd(data []byte) (*PooledBuffer, error) {
 	maxDecompressedSize := h.maxPayloadSize
 
-	// Get pooled zstd decoder or create new one
 	var decoder *zstd.Decoder
 	var err error
 	if pooled := zstdDecoderPool.Get(); pooled != nil {
 		decoder = pooled.(*zstd.Decoder)
+		if err = decoder.Reset(bytes.NewReader(data)); err != nil {
+			decoder.Close()
+			return nil, fmt.Errorf("failed to reset zstd decoder: %w", err)
+		}
 	} else {
-		// No decoder in pool, create new one with memory limit
-		decoder, err = zstd.NewReader(nil, zstd.WithDecoderMaxMemory(uint64(maxDecompressedSize)+1024))
+		decoder, err = zstd.NewReader(bytes.NewReader(data), zstd.WithDecoderMaxMemory(uint64(maxDecompressedSize)+1024))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
 		}
 	}
 
-	// Get output buffer from pool
-	bufPtr := decompressBufferPool.Get().(*[]byte)
-	buf := (*bufPtr)[:0] // Reset length but keep capacity (256KB)
-
-	// Decompress directly into pooled buffer
-	// zstd.Decoder.DecodeAll is very fast and handles buffer growth internally
-	buf, err = decoder.DecodeAll(data, buf)
+	// Bounded streaming decode.
+	out, err := io.ReadAll(io.LimitReader(decoder, maxDecompressedSize+1))
+	// Always release decoder buffers and return to pool, even on error.
+	_ = decoder.Reset(nil)
+	zstdDecoderPool.Put(decoder)
 	if err != nil {
-		zstdDecoderPool.Put(decoder)
-		*bufPtr = (*bufPtr)[:0]
-		decompressBufferPool.Put(bufPtr)
 		return nil, fmt.Errorf("failed to decompress zstd: %w", err)
 	}
 
-	// Return decoder to pool
-	zstdDecoderPool.Put(decoder)
-
-	// Check size limit
-	if int64(len(buf)) > maxDecompressedSize {
-		*bufPtr = (*bufPtr)[:0]
-		decompressBufferPool.Put(bufPtr)
+	if int64(len(out)) > maxDecompressedSize {
 		return nil, fmt.Errorf("decompressed payload exceeds %s limit", formatBytes(maxDecompressedSize))
 	}
 
-	// MEMORY FIX: Cap buffer size before returning to pool
-	// If the buffer grew beyond maxPooledBufferSize during decompression,
-	// allocate a fresh small buffer for the pool to prevent memory accumulation.
-	// The oversized buffer will be GC'd after this request completes.
-	if cap(buf) > maxPooledBufferSize {
-		// Don't pollute pool with oversized buffers
-		decompBufferDiscards.Add(1)
-		metrics.Get().IncDecompBufferDiscards()
-		// Create fresh buffer for pool return
-		freshBuf := make([]byte, 0, initialBufferSize)
-		bufPtr = &freshBuf
-	} else {
-		// Buffer is within limits, update pointer for pool return
-		*bufPtr = buf
-	}
-
-	// ZERO-COPY: Return pooled buffer directly - caller MUST call Release()
+	// PooledBuffer wraps the decoded bytes. The bufPtr is nil because
+	// we did not draw the slice from decompressBufferPool — Release()
+	// is a no-op on nil bufPtr, preserving the caller contract.
 	return &PooledBuffer{
-		Data:   buf,
-		bufPtr: bufPtr,
+		Data:   out,
+		bufPtr: nil,
 	}, nil
 }
 
