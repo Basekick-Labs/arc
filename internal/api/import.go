@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -58,8 +59,10 @@ type ImportHandler struct {
 	// ArrowBuffer for LP import (uses the streaming ingest pipeline)
 	arrowBuffer *ingest.ArrowBuffer
 
-	// RBAC support
-	authManager AuthManager
+	// authManager holds the concrete *auth.AuthManager. See
+	// MsgPackHandler.authManager for the full rationale. Imports use
+	// admin-tier auth because they rewrite historical data.
+	authManager *auth.AuthManager
 	rbacManager RBACChecker
 
 	// Stats
@@ -82,18 +85,24 @@ func (h *ImportHandler) SetArrowBuffer(buf *ingest.ArrowBuffer) {
 	h.arrowBuffer = buf
 }
 
-// SetAuthAndRBAC sets the auth and RBAC managers for permission checking
-func (h *ImportHandler) SetAuthAndRBAC(authManager AuthManager, rbacManager RBACChecker) {
+// SetAuthAndRBAC sets the auth and RBAC managers. See
+// MsgPackHandler.SetAuthAndRBAC for the full rationale.
+func (h *ImportHandler) SetAuthAndRBAC(authManager *auth.AuthManager, rbacManager RBACChecker) {
 	h.authManager = authManager
 	h.rbacManager = rbacManager
 }
 
-// RegisterRoutes registers import API routes
+// RegisterRoutes registers import API routes. Import endpoints write
+// historical data and use admin-tier auth (not write-tier) — bulk
+// imports can rewrite or supplant existing partitions, so the
+// stricter gate is appropriate.
 func (h *ImportHandler) RegisterRoutes(app *fiber.App) {
-	app.Post("/api/v1/import/csv", h.handleCSVImport)
-	app.Post("/api/v1/import/parquet", h.handleParquetImport)
-	app.Post("/api/v1/import/lp", h.handleLineProtocolImport)
-	app.Post("/api/v1/import/tle", h.handleTLEImport)
+	adminAuth := withAdminAuth(h.authManager)
+
+	app.Post("/api/v1/import/csv", adminAuth, h.handleCSVImport)
+	app.Post("/api/v1/import/parquet", adminAuth, h.handleParquetImport)
+	app.Post("/api/v1/import/lp", adminAuth, h.handleLineProtocolImport)
+	app.Post("/api/v1/import/tle", adminAuth, h.handleTLEImport)
 	app.Get("/api/v1/import/stats", h.Stats)
 
 	h.logger.Info().Msg("Import routes registered")

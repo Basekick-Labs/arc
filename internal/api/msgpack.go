@@ -1,19 +1,17 @@
 package api
 
 import (
-	"bytes"
+	"errors"
 	"fmt"
-	"io"
 	"sync"
 	"sync/atomic"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/gofiber/fiber/v2"
-	"github.com/klauspost/compress/gzip"
-	"github.com/klauspost/compress/zstd"
 	"github.com/rs/zerolog"
 )
 
@@ -81,8 +79,14 @@ type MsgPackHandler struct {
 	logger         zerolog.Logger
 	maxPayloadSize int64 // Maximum payload size in bytes (applies to both compressed and decompressed)
 
-	// RBAC support
-	authManager AuthManager
+	// authManager holds the concrete *auth.AuthManager so we can wire
+	// auth.RequireWrite as route-level middleware AND so RBAC checks
+	// at request time use the same instance. Concrete (not the local
+	// AuthManager interface) because auth.RequireWrite is implemented
+	// against the struct; using the interface required a type
+	// assertion that could silently miss on a mock and disable route
+	// protection.
+	authManager *auth.AuthManager
 	rbacManager RBACChecker
 
 	// Cluster routing support
@@ -99,8 +103,12 @@ func NewMsgPackHandler(logger zerolog.Logger, arrowBuffer *ingest.ArrowBuffer, m
 	}
 }
 
-// SetAuthAndRBAC sets the auth and RBAC managers for permission checking
-func (h *MsgPackHandler) SetAuthAndRBAC(authManager AuthManager, rbacManager RBACChecker) {
+// SetAuthAndRBAC sets the auth and RBAC managers. Takes the concrete
+// *auth.AuthManager (not the local AuthManager interface) so route-
+// level auth.RequireWrite middleware can be wired without a type
+// assertion that could silently miss on a mock and disable
+// protection. nil = auth disabled (OSS default).
+func (h *MsgPackHandler) SetAuthAndRBAC(authManager *auth.AuthManager, rbacManager RBACChecker) {
 	h.authManager = authManager
 	h.rbacManager = rbacManager
 }
@@ -147,9 +155,13 @@ func (h *MsgPackHandler) checkWritePermissions(c *fiber.Ctx, database string, me
 	return CheckWritePermissions(c, h.rbacManager, h.logger, database, measurements)
 }
 
-// RegisterRoutes registers MessagePack endpoints
+// RegisterRoutes registers MessagePack endpoints. The write endpoint
+// is gated by auth.RequireWrite when an auth manager is configured —
+// per CLAUDE.md, mutating endpoints MUST have an explicit write-tier
+// auth middleware. Stats and spec remain at any-authenticated-token
+// level (gated by the global auth middleware in main.go).
 func (h *MsgPackHandler) RegisterRoutes(app *fiber.App) {
-	app.Post("/api/v1/write/msgpack", h.writeMsgPack)
+	app.Post("/api/v1/write/msgpack", withWriteAuth(h.authManager), h.writeMsgPack)
 	app.Get("/api/v1/write/msgpack/stats", h.msgPackStats)
 	app.Get("/api/v1/write/msgpack/spec", h.msgPackSpec)
 }
@@ -184,69 +196,81 @@ func (h *MsgPackHandler) writeMsgPack(c *fiber.Ctx) error {
 
 localProcessing:
 	// CRITICAL: Use BodyRaw() instead of Body() to avoid fasthttp's automatic gzip decompression
-	// c.Body() triggers tryDecodeBodyInOrder → gunzipData which is NOT pooled and causes high latency
-	// By using BodyRaw() we handle decompression ourselves with pooled gzip readers
-	payload := c.Request().Body()
+	// c.Body() triggers tryDecodeBodyInOrder → gunzipData which is NOT pooled and causes high latency.
+	// rawBody is owned by fasthttp and reused after this handler returns; the
+	// shared decompressRequest helper handles the defensive copy for the
+	// uncompressed branch and produces fresh slices on the gzip/zstd paths,
+	// so payload below is always safe to retain past handler return.
+	rawBody := c.Request().Body()
 
-	// Validate payload size
-	if len(payload) == 0 {
+	// Reject empty bodies up front.
+	if len(rawBody) == 0 {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Empty payload",
 		})
 	}
 
-	if int64(len(payload)) > h.maxPayloadSize {
+	// Pre-decompression size check on the *compressed* payload — rejects
+	// oversized request bodies before any decode work. The post-
+	// decompression cap is applied inside decompressRequest.
+	if int64(len(rawBody)) > h.maxPayloadSize {
 		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
 			"error": fmt.Sprintf("Payload too large (max %s). Consider batching into smaller requests.", formatBytes(h.maxPayloadSize)),
 		})
 	}
 
-	// Handle compression using pooled readers
-	// We use c.Request().Body() above to get raw bytes and decompress ourselves
-	// This avoids fasthttp's non-pooled gunzipData which causes high tail latency
-	// Supported: gzip (0x1f 0x8b) and zstd (0x28 0xB5 0x2F 0xFD)
-	var pooledBuf *PooledBuffer
-	var compressionType string
-	isGzip := len(payload) >= 2 && payload[0] == 0x1f && payload[1] == 0x8b
-	isZstd := len(payload) >= 4 && payload[0] == 0x28 && payload[1] == 0xB5 && payload[2] == 0x2F && payload[3] == 0xFD
-
-	if isZstd {
-		compressionType = "zstd"
-		var err error
-		pooledBuf, err = h.decompressZstd(payload)
-		if err != nil {
-			h.logger.Error().Err(err).Msg("Failed to decompress zstd payload")
+	// HOT PATH: msgpack-columnar ingest sustains ~19M rec/s in benchmark,
+	// so this dispatch is performance-critical. We do NOT use the shared
+	// decompressRequest helper for the uncompressed branch because that
+	// helper makes a defensive memcpy of rawBody — at 18M+ rec/s with
+	// large batches that costs ~1M rec/s of throughput. The msgpack
+	// decoder (Basekick-Labs/msgpack/v6) is *synchronous* and copies
+	// every string field via `string(b)` and every []byte field via
+	// `io.ReadFull` into a fresh slice — so by the time h.decoder.Decode
+	// returns, no decoded value still aliases rawBody. fasthttp can
+	// safely reuse the buffer once this handler returns. The compressed
+	// branches still go through the shared helpers because those produce
+	// fresh allocations regardless and the bomb-mitigation matters.
+	//
+	// LP and TLE use the helper unmodified — their throughput targets
+	// are lower and the consistency wins.
+	var (
+		payload         []byte
+		compressionType string
+	)
+	switch {
+	case len(rawBody) >= 2 && rawBody[0] == 0x1f && rawBody[1] == 0x8b:
+		decompressed, derr := decompressGzipPooled(rawBody, int(h.maxPayloadSize))
+		if derr != nil {
+			h.logger.Error().Err(derr).Msg("Failed to decompress gzip data")
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": fmt.Sprintf("Invalid zstd compression: %v", err),
+				"error": fmt.Sprintf("Invalid gzip compression: %v", derr),
 			})
 		}
-		defer pooledBuf.Release()
-
-		compressedSize := len(payload)
-		payload = pooledBuf.Data
-		h.logger.Debug().
-			Int("compressed_size", compressedSize).
-			Int("decompressed_size", len(payload)).
-			Str("compression", "zstd").
-			Msg("Decompressed payload")
-	} else if isGzip {
+		payload = decompressed
 		compressionType = "gzip"
-		var err error
-		pooledBuf, err = h.decompressGzip(payload)
-		if err != nil {
-			h.logger.Error().Err(err).Msg("Failed to decompress gzip payload")
+	case len(rawBody) >= 4 && rawBody[0] == 0x28 && rawBody[1] == 0xB5 && rawBody[2] == 0x2F && rawBody[3] == 0xFD:
+		decompressed, derr := decompressZstdPooled(rawBody, int(h.maxPayloadSize))
+		if derr != nil {
+			h.logger.Error().Err(derr).Msg("Failed to decompress zstd data")
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": fmt.Sprintf("Invalid gzip compression: %v", err),
+				"error": fmt.Sprintf("Invalid zstd compression: %v", derr),
 			})
 		}
-		defer pooledBuf.Release()
-
-		compressedSize := len(payload)
-		payload = pooledBuf.Data
+		payload = decompressed
+		compressionType = "zstd"
+	default:
+		// Uncompressed: hand rawBody directly to the synchronous decoder.
+		// No defensive copy because Decode finishes before the handler
+		// returns. The pre-decompression maxPayloadSize check above
+		// already capped the input size.
+		payload = rawBody
+	}
+	if compressionType != "" {
 		h.logger.Debug().
-			Int("compressed_size", compressedSize).
+			Int("compressed_size", len(rawBody)).
 			Int("decompressed_size", len(payload)).
-			Str("compression", "gzip").
+			Str("compression", compressionType).
 			Msg("Decompressed payload")
 	}
 
@@ -314,8 +338,16 @@ localProcessing:
 	if err := h.arrowBuffer.Write(ctx, database, records); err != nil {
 		h.logger.Error().Err(err).Msg("Failed to write to Arrow buffer")
 		metrics.Get().IncIngestErrors()
+		// Schema-churn rejection is retryable — surface as 503 so
+		// upstream senders back off, mirroring the LP and TLE handlers.
+		// See ingest.ErrSchemaChurnExceeded.
+		if errors.Is(err, ingest.ErrSchemaChurnExceeded) {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"error": "Write rejected (schema churn): " + err.Error(),
+			})
+		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to write records",
+			"error": "Failed to write records: " + err.Error(),
 		})
 	}
 
@@ -332,160 +364,18 @@ localProcessing:
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
-// decompressGzip decompresses gzip data with size limits
-// Uses sync.Pool for gzip reader and output buffer to minimize allocations
-// ZERO-COPY: Returns a PooledBuffer that caller MUST Release() after use
-func (h *MsgPackHandler) decompressGzip(data []byte) (*PooledBuffer, error) {
-	maxDecompressedSize := h.maxPayloadSize
-	const readChunkSize = 32 * 1024 // 32KB chunks
-
-	// Get pooled gzip reader or create new one
-	var reader *gzip.Reader
-	var err error
-	if pooled := gzipReaderPool.Get(); pooled != nil {
-		reader = pooled.(*gzip.Reader)
-		err = reader.Reset(bytes.NewReader(data))
-	} else {
-		// No reader in pool, create new one
-		reader, err = gzip.NewReader(bytes.NewReader(data))
-	}
-	if err != nil {
-		if reader != nil {
-			gzipReaderPool.Put(reader)
-		}
-		return nil, fmt.Errorf("failed to initialize gzip reader: %w", err)
-	}
-
-	// Get output buffer from pool
-	bufPtr := decompressBufferPool.Get().(*[]byte)
-	buf := (*bufPtr)[:0] // Reset length but keep capacity (256KB)
-
-	// Read directly into pooled buffer in chunks
-	limitedReader := io.LimitReader(reader, maxDecompressedSize+1)
-	for {
-		// Ensure we have room to read
-		if cap(buf)-len(buf) < readChunkSize {
-			// Need to grow - double capacity
-			newBuf := make([]byte, len(buf), cap(buf)*2+readChunkSize)
-			copy(newBuf, buf)
-			buf = newBuf
-		}
-
-		// Read into available capacity
-		n, readErr := limitedReader.Read(buf[len(buf) : len(buf)+readChunkSize])
-		buf = buf[:len(buf)+n]
-
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			gzipReaderPool.Put(reader)
-			*bufPtr = (*bufPtr)[:0]
-			decompressBufferPool.Put(bufPtr)
-			return nil, fmt.Errorf("failed to decompress: %w", readErr)
-		}
-	}
-
-	// Return reader to pool (Close() is called internally by Reset on next use)
-	gzipReaderPool.Put(reader)
-
-	// Check size limit
-	if int64(len(buf)) > maxDecompressedSize {
-		*bufPtr = (*bufPtr)[:0]
-		decompressBufferPool.Put(bufPtr)
-		return nil, fmt.Errorf("decompressed payload exceeds %s limit", formatBytes(maxDecompressedSize))
-	}
-
-	// MEMORY FIX: Cap buffer size before returning to pool
-	// If the buffer grew beyond maxPooledBufferSize during decompression,
-	// allocate a fresh small buffer for the pool to prevent memory accumulation.
-	// The oversized buffer will be GC'd after this request completes.
-	if cap(buf) > maxPooledBufferSize {
-		// Don't pollute pool with oversized buffers
-		decompBufferDiscards.Add(1)
-		metrics.Get().IncDecompBufferDiscards()
-		// Create fresh buffer for pool return
-		freshBuf := make([]byte, 0, initialBufferSize)
-		bufPtr = &freshBuf
-	} else {
-		// Buffer is within limits, update pointer for pool return
-		*bufPtr = buf
-	}
-
-	// ZERO-COPY: Return pooled buffer directly - caller MUST call Release()
-	// This eliminates the ~45KB allocation per request that was causing GC pressure
-	return &PooledBuffer{
-		Data:   buf,
-		bufPtr: bufPtr,
-	}, nil
-}
-
-// decompressZstd decompresses zstd data with size limits
-// Uses sync.Pool for zstd decoder and output buffer to minimize allocations
-// Zstd is 3-5x faster than gzip for decompression
-// ZERO-COPY: Returns a PooledBuffer that caller MUST Release() after use
-func (h *MsgPackHandler) decompressZstd(data []byte) (*PooledBuffer, error) {
-	maxDecompressedSize := h.maxPayloadSize
-
-	// Get pooled zstd decoder or create new one
-	var decoder *zstd.Decoder
-	var err error
-	if pooled := zstdDecoderPool.Get(); pooled != nil {
-		decoder = pooled.(*zstd.Decoder)
-	} else {
-		// No decoder in pool, create new one with memory limit
-		decoder, err = zstd.NewReader(nil, zstd.WithDecoderMaxMemory(uint64(maxDecompressedSize)+1024))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
-		}
-	}
-
-	// Get output buffer from pool
-	bufPtr := decompressBufferPool.Get().(*[]byte)
-	buf := (*bufPtr)[:0] // Reset length but keep capacity (256KB)
-
-	// Decompress directly into pooled buffer
-	// zstd.Decoder.DecodeAll is very fast and handles buffer growth internally
-	buf, err = decoder.DecodeAll(data, buf)
-	if err != nil {
-		zstdDecoderPool.Put(decoder)
-		*bufPtr = (*bufPtr)[:0]
-		decompressBufferPool.Put(bufPtr)
-		return nil, fmt.Errorf("failed to decompress zstd: %w", err)
-	}
-
-	// Return decoder to pool
-	zstdDecoderPool.Put(decoder)
-
-	// Check size limit
-	if int64(len(buf)) > maxDecompressedSize {
-		*bufPtr = (*bufPtr)[:0]
-		decompressBufferPool.Put(bufPtr)
-		return nil, fmt.Errorf("decompressed payload exceeds %s limit", formatBytes(maxDecompressedSize))
-	}
-
-	// MEMORY FIX: Cap buffer size before returning to pool
-	// If the buffer grew beyond maxPooledBufferSize during decompression,
-	// allocate a fresh small buffer for the pool to prevent memory accumulation.
-	// The oversized buffer will be GC'd after this request completes.
-	if cap(buf) > maxPooledBufferSize {
-		// Don't pollute pool with oversized buffers
-		decompBufferDiscards.Add(1)
-		metrics.Get().IncDecompBufferDiscards()
-		// Create fresh buffer for pool return
-		freshBuf := make([]byte, 0, initialBufferSize)
-		bufPtr = &freshBuf
-	} else {
-		// Buffer is within limits, update pointer for pool return
-		*bufPtr = buf
-	}
-
-	// ZERO-COPY: Return pooled buffer directly - caller MUST call Release()
-	return &PooledBuffer{
-		Data:   buf,
-		bufPtr: bufPtr,
-	}, nil
-}
+// MsgPackHandler.decompressGzip and decompressZstd were the per-handler
+// pooled-buffer codecs. They are now replaced by the package-level
+// decompressGzipPooled / decompressZstdPooled (in tle.go), used through
+// the shared decompressRequest helper. This keeps the LP, TLE, and
+// msgpack ingest paths on a single dispatch surface and consolidates
+// the streaming-LimitReader bomb-mitigation in one place. Removed in
+// gemini round 6.
+//
+// PooledBuffer remains in the package because TestPooledBufferRelease
+// still exercises Release() idempotency. The decompressBufferPool /
+// gzipReaderPool that PooledBuffer uses are unused at runtime now
+// but remain available for future pooled paths.
 
 // msgPackStats returns MessagePack decoder statistics
 func (h *MsgPackHandler) msgPackStats(c *fiber.Ctx) error {

@@ -1,18 +1,17 @@
 package api
 
 import (
-	"bytes"
+	"errors"
 	"fmt"
-	"io"
 	"regexp"
 	"sync"
 	"sync/atomic"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/gofiber/fiber/v2"
-	"github.com/klauspost/compress/gzip"
 	"github.com/rs/zerolog"
 )
 
@@ -26,8 +25,11 @@ type LineProtocolHandler struct {
 	parser *ingest.LineProtocolParser
 	logger zerolog.Logger
 
-	// RBAC support
-	authManager AuthManager
+	// authManager holds the concrete *auth.AuthManager so route-level
+	// auth.RequireWrite / RequireAdmin can be wired without the
+	// silent-miss type-assert pattern. See MsgPackHandler.authManager
+	// for full rationale. nil = OSS no-auth.
+	authManager *auth.AuthManager
 	rbacManager RBACChecker
 
 	// Cluster routing support
@@ -62,8 +64,9 @@ func NewLineProtocolHandler(buffer *ingest.ArrowBuffer, logger zerolog.Logger) *
 	}
 }
 
-// SetAuthAndRBAC sets the auth and RBAC managers for permission checking
-func (h *LineProtocolHandler) SetAuthAndRBAC(authManager AuthManager, rbacManager RBACChecker) {
+// SetAuthAndRBAC sets the auth and RBAC managers. See
+// MsgPackHandler.SetAuthAndRBAC for the full rationale.
+func (h *LineProtocolHandler) SetAuthAndRBAC(authManager *auth.AuthManager, rbacManager RBACChecker) {
 	h.authManager = authManager
 	h.rbacManager = rbacManager
 }
@@ -79,25 +82,27 @@ func (h *LineProtocolHandler) checkWritePermissions(c *fiber.Ctx, database strin
 	return CheckWritePermissions(c, h.rbacManager, h.logger, database, measurements)
 }
 
-// RegisterRoutes registers Line Protocol routes
+// RegisterRoutes registers Line Protocol routes. All write endpoints
+// are gated by auth.RequireWrite when auth is enabled; the /flush
+// endpoint is admin-gated because it forces a global flush across
+// all shards (operationally heavy + spammable). Per CLAUDE.md,
+// mutating endpoints MUST have an explicit auth middleware.
 func (h *LineProtocolHandler) RegisterRoutes(app *fiber.App) {
-	// InfluxDB 1.x compatible endpoint (matches InfluxDB API)
-	app.Post("/write", h.WriteV1)
+	writeAuth := withWriteAuth(h.authManager)
+	adminAuth := withAdminAuth(h.authManager)
 
-	// InfluxDB 2.x compatible endpoint (matches InfluxDB API)
-	app.Post("/api/v2/write", h.WriteInfluxDB)
+	// InfluxDB 1.x compatible endpoint
+	app.Post("/write", writeAuth, h.WriteV1)
+	// InfluxDB 2.x compatible endpoint
+	app.Post("/api/v2/write", writeAuth, h.WriteInfluxDB)
+	// Arc native endpoint (uses x-arc-database header)
+	app.Post("/api/v1/write/line-protocol", writeAuth, h.WriteSimple)
+	// Flush endpoint — admin-gated.
+	app.Post("/api/v1/write/line-protocol/flush", adminAuth, h.Flush)
 
-	// Arc native endpoint (no query parameters, uses x-arc-database header)
-	app.Post("/api/v1/write/line-protocol", h.WriteSimple)
-
-	// Stats endpoint
+	// Stats and health remain at any-authenticated-token level.
 	app.Get("/api/v1/write/line-protocol/stats", h.Stats)
-
-	// Health endpoint
 	app.Get("/api/v1/write/line-protocol/health", h.Health)
-
-	// Flush endpoint
-	app.Post("/api/v1/write/line-protocol/flush", h.Flush)
 
 	h.logger.Info().Msg("Line Protocol routes registered")
 }
@@ -199,26 +204,39 @@ func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string, precisi
 	}
 
 localProcessing:
-	// Get request body
-	body := c.Body()
-	originalSize := len(body)
+	// Shared decompressRequest (in tle.go) handles gzip/zstd/uncompressed
+	// dispatch with a hard 100MB output cap. CRITICAL invariants kept by
+	// that helper:
+	//   1. fasthttp's transparent gunzip is bypassed — using rawBody
+	//      avoids the uncapped BodyGunzip path that would OOM on a
+	//      bomb (1MB compressed → 50GB decompressed).
+	//   2. zstd path uses streaming Reset+LimitReader, not DecodeAll —
+	//      WithDecoderMaxMemory only bounds decoder window state, not
+	//      output buffer growth.
+	//   3. Uncompressed branch defensively copies out of the fasthttp-
+	//      owned buffer so retained sub-slices stay valid post-handler.
+	rawBody := c.Request().Body()
+	originalSize := len(rawBody)
 	h.totalBytes.Add(int64(originalSize))
 
-	// Check for gzip compression (magic number: 0x1f 0x8b)
-	// Uses pooled gzip.Reader to avoid ~32KB allocation per request
-	if len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b {
-		h.totalBytesGzipped.Add(int64(originalSize))
-
-		decompressed, err := h.decompressGzip(body)
-		if err != nil {
-			h.totalErrors.Add(1)
-			h.logger.Error().Err(err).Msg("Failed to decompress gzip data")
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": "Failed to decompress gzip data: " + err.Error(),
-			})
+	body, codec, err := decompressRequest(rawBody, 0)
+	if err != nil {
+		h.totalErrors.Add(1)
+		h.logger.Error().Err(err).Str("codec", codec).Msg("Failed to accept request body")
+		// codec=="" when the uncompressed branch rejected an over-cap
+		// body; codec="gzip"/"zstd" when a decoder errored. Use the
+		// codec label only when present so the client message stays
+		// readable in both cases.
+		errMsg := "Failed to read request body: " + err.Error()
+		if codec != "" {
+			errMsg = "Failed to decompress " + codec + " data: " + err.Error()
 		}
-
-		body = decompressed
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": errMsg,
+		})
+	}
+	if codec != "" {
+		h.totalBytesGzipped.Add(int64(originalSize))
 	}
 
 	// Check for empty body
@@ -280,6 +298,14 @@ localProcessing:
 				Str("measurement", measurement).
 				Int("records", len(record.Columns["time"])).
 				Msg("Failed to write to Arrow buffer")
+			// Schema-churn rejection is retryable — surface as 503 so
+			// upstream senders back off rather than treating this as a
+			// permanent server error. See ingest.ErrSchemaChurnExceeded.
+			if errors.Is(err, ingest.ErrSchemaChurnExceeded) {
+				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+					"error": "Write rejected (schema churn): " + err.Error(),
+				})
+			}
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"error": "Write failed: " + err.Error(),
 			})
@@ -347,42 +373,10 @@ func (h *LineProtocolHandler) GetStats() map[string]int64 {
 	}
 }
 
-// decompressGzip decompresses gzip data using pooled readers to minimize allocations
-// klauspost gzip.Reader has ~32KB internal state that can be reused via Reset()
-func (h *LineProtocolHandler) decompressGzip(data []byte) ([]byte, error) {
-	const maxDecompressedSize = 100 * 1024 * 1024 // 100MB
-
-	// Get pooled gzip reader or create new one
-	var reader *gzip.Reader
-	var err error
-	if pooled := lpGzipReaderPool.Get(); pooled != nil {
-		reader = pooled.(*gzip.Reader)
-		err = reader.Reset(bytes.NewReader(data))
-	} else {
-		reader, err = gzip.NewReader(bytes.NewReader(data))
-	}
-	if err != nil {
-		if reader != nil {
-			lpGzipReaderPool.Put(reader)
-		}
-		return nil, err
-	}
-
-	// Read with size limit
-	result, err := io.ReadAll(io.LimitReader(reader, maxDecompressedSize+1))
-	if err != nil {
-		lpGzipReaderPool.Put(reader)
-		return nil, err
-	}
-
-	// Check size limit
-	if len(result) > maxDecompressedSize {
-		lpGzipReaderPool.Put(reader)
-		return nil, fmt.Errorf("decompressed payload exceeds 100MB limit")
-	}
-
-	// Return reader to pool for reuse
-	lpGzipReaderPool.Put(reader)
-
-	return result, nil
-}
+// decompressGzip was the LP-specific gzip decoder. It duplicated the
+// package-level decompressGzipPooled helper in tle.go (same pool,
+// same shape) — gemini round 4 finding. The method is now removed
+// and all call sites go through decompressRequest, which delegates
+// to decompressGzipPooled. Keeping this comment as a tombstone so
+// future code review sees the decision rather than wondering why LP
+// has its own pooled-gzip helper next door (it doesn't anymore).

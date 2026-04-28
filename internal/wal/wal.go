@@ -66,6 +66,15 @@ const (
 // ErrPayloadTooLarge indicates the payload exceeds MaxWALPayloadSize.
 var ErrPayloadTooLarge = errors.New("WAL payload exceeds maximum allowed size")
 
+// ErrWALDropped is returned by Append/AppendRaw/AppendRawWithMeta when the
+// async entry channel is full and the entry is dropped. Previous behavior
+// returned nil and silently incremented DroppedEntries — callers logging
+// "data preserved in WAL for recovery" downstream were reporting durability
+// they did not actually have. Returning a sentinel lets callers (the
+// ingestion buffer in particular) increment their own error counters and
+// surface accurate operator-facing messages. Use errors.Is to detect.
+var ErrWALDropped = errors.New("WAL entry dropped: async buffer full")
+
 // walEntry is a pre-serialized WAL entry ready for writing
 type walEntry struct {
 	data []byte // Complete entry: header + payload
@@ -386,13 +395,23 @@ func (w *Writer) AppendRawWithMeta(database string, payload []byte) error {
 	copy(entryData[WALEntryHeaderSize:], envHeader[:envelopeHeaderLen])
 	copy(entryData[WALEntryHeaderSize+envelopeHeaderLen:], payload)
 
+	return w.tryEnqueue(entryData)
+}
+
+// tryEnqueue is the shared non-blocking send into entryChan used by
+// every Append variant. On channel-full it bumps the dropped counter
+// (both on the Writer and the global metrics package) and returns
+// ErrWALDropped — callers use errors.Is to differentiate from real
+// I/O errors. Centralized so the drop accounting is impossible to
+// drift across the multiple append paths.
+func (w *Writer) tryEnqueue(entryData []byte) error {
 	select {
 	case w.entryChan <- walEntry{data: entryData}:
 		return nil
 	default:
 		atomic.AddInt64(&w.DroppedEntries, 1)
 		metrics.Get().IncWALDroppedEntries()
-		return nil
+		return ErrWALDropped
 	}
 }
 
@@ -433,17 +452,7 @@ func (w *Writer) AppendRaw(payload []byte) error {
 	binary.BigEndian.PutUint32(entryData[12:16], checksum)
 	copy(entryData[WALEntryHeaderSize:], payload)
 
-	// Non-blocking send to channel
-	select {
-	case w.entryChan <- walEntry{data: entryData}:
-		// Successfully queued
-		return nil
-	default:
-		// Buffer full - drop entry (trade durability for throughput)
-		atomic.AddInt64(&w.DroppedEntries, 1)
-		metrics.Get().IncWALDroppedEntries()
-		return nil // Don't return error to avoid slowing down the caller
-	}
+	return w.tryEnqueue(entryData)
 }
 
 // sync syncs the WAL file to disk based on sync mode

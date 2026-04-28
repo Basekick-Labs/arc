@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -26,6 +27,7 @@ import (
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
+	"github.com/basekick-labs/arc/internal/wal"
 	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/rs/zerolog"
 )
@@ -762,6 +764,12 @@ type ArrowBuffer struct {
 	flushQueue   chan flushTask
 	flushWorkers int
 
+	// closing is the shutdown short-circuit checked by tryEnqueueFlush.
+	// See Close() for the full ordering rationale; senders see this
+	// flag set before the channel could be closed (the channel is
+	// never closed; workers exit on b.ctx.Done()).
+	closing atomic.Bool
+
 	// Sort key configuration (for multi-column sorting)
 	sortKeysConfig  map[string][]string // measurement -> sort keys
 	defaultSortKeys []string            // default sort keys
@@ -779,8 +787,23 @@ type ArrowBuffer struct {
 	totalRecordsWritten  atomic.Int64
 	totalFlushes         atomic.Int64
 	totalErrors          atomic.Int64
-	totalWALErrors       atomic.Int64 // WAL write failures; data still buffered but not durable
-	queueDepth           atomic.Int64 // Current flush queue depth
+	totalWALErrors       atomic.Int64 // WAL write failures (real I/O / serialization errors)
+	totalWALDropped      atomic.Int64 // WAL backpressure drops (entry queued but channel full)
+	// totalSchemaChurnExceeded counts requests rejected because the
+	// schema-evolution flush loop hit schemaEvolutionMaxIters under
+	// sustained concurrent schema rotation against the same
+	// (database, measurement) buffer. Pathological signal — operators
+	// alert on a non-zero rate.
+	totalSchemaChurnExceeded atomic.Int64
+	queueDepth               atomic.Int64 // Current flush queue depth
+
+	// walDropLogSampler debounces the WAL-dropped Warn so a sustained
+	// burst of backpressure produces ~one log line per second instead
+	// of one per dropped record. Operators get the rate via the
+	// totalWALDropped counter and the underlying metrics.IncWALDroppedEntries
+	// counter; the log line is for human-readable signal that the
+	// degraded state is in effect.
+	walDropLastLogNano atomic.Int64
 
 	// Flush failure tracking for WAL maintenance.
 	// Set when a storage write fails (S3 outage etc.), cleared after successful recovery.
@@ -1283,6 +1306,211 @@ func (b *ArrowBuffer) WriteTypedColumnarDirect(ctx context.Context, database, me
 	return b.writeTypedColumnarInternal(ctx, database, measurement, batch, numRecords, false)
 }
 
+// walDropLogIntervalNano is the minimum interval between successive
+// WAL-dropped Warn log emissions. Backpressure on a busy node can
+// produce hundreds of dropped entries per second; one Warn per drop
+// is log-spam. Operators get the rate from the totalWALDropped
+// counter; the log line just signals "the degraded state is in
+// effect, look at the counter."
+const walDropLogIntervalNano = int64(time.Second)
+
+// recordWALError classifies the error from a WAL append: a backpressure
+// drop (wal.ErrWALDropped) is operationally distinct from a real I/O
+// failure. Backpressure increments the dedicated totalWALDropped
+// counter and emits a sampled Warn; other errors hit totalWALErrors
+// and an unsampled Error log. The caller must NOT propagate the
+// error — both paths leave the data buffered and the caller continues.
+//
+// fields is a small closure that adds context (db/measurement/size)
+// to whichever logger ends up firing — keeps the call sites clean.
+func (b *ArrowBuffer) recordWALError(err error, fields func(*zerolog.Event)) {
+	if errors.Is(err, wal.ErrWALDropped) {
+		b.totalWALDropped.Add(1)
+		// Sampled Warn — at most one log line per walDropLogIntervalNano.
+		now := time.Now().UnixNano()
+		last := b.walDropLastLogNano.Load()
+		if now-last >= walDropLogIntervalNano && b.walDropLastLogNano.CompareAndSwap(last, now) {
+			ev := b.logger.Warn().Err(err).
+				Int64("total_dropped", b.totalWALDropped.Load())
+			if fields != nil {
+				fields(ev)
+			}
+			ev.Msg("WAL backpressure: entries dropped on full async channel; data buffered in memory and will flush, but follower-side durability is degraded until backpressure clears")
+		}
+		return
+	}
+	b.totalWALErrors.Add(1)
+	ev := b.logger.Error().Err(err)
+	if fields != nil {
+		fields(ev)
+	}
+	ev.Msg("WAL write failed - data may be lost on crash")
+}
+
+// flushSendOutcome tells callers whether tryEnqueueFlush actually
+// queued the task. Callers don't need to do anything different on
+// queued vs dropped today (data is in WAL either way), but having a
+// distinct outcome makes the audit trail and metrics readable.
+type flushSendOutcome int
+
+const (
+	flushQueued       flushSendOutcome = iota // task accepted on flushQueue
+	flushSkipClosing                          // buffer is closing — short-circuit
+	flushCtxCanceled                          // ctx fired during the select (defense-in-depth vs the closing flag)
+	flushQueueFull                            // queue at capacity, drop relying on WAL replay
+)
+
+// tryEnqueueFlush is the shared non-blocking send into b.flushQueue
+// used by both writeColumnarInternal and writeTypedColumnarInternal.
+// It encapsulates:
+//   1. The closing-flag short-circuit (Close() set the flag; data
+//      stays in WAL, no panic from a closed channel).
+//   2. The ctx.Done() defense-in-depth select arm (covers the narrow
+//      window between flag-load and select-eval where Close()'s
+//      cancel could fire).
+//   3. The queue-full default arm (queue at capacity; data stays in
+//      WAL for recovery).
+//
+// The caller MUST already have built `task` and called flushCancel
+// to register the timeout context — tryEnqueueFlush does not own
+// that lifecycle. flushCancel is invoked here on every non-queued
+// outcome so the ctx is cleaned up promptly.
+//
+// Returns the outcome so the caller can pass it to metrics/logging
+// uniformly. All non-queued outcomes increment the same
+// IncWALRecordsPreserved counter to keep the operator-visible
+// "records that fell back to WAL" rate authoritative.
+func (b *ArrowBuffer) tryEnqueueFlush(
+	task flushTask,
+	flushCancel context.CancelFunc,
+	bufferKey string,
+	totalBuffered int,
+) flushSendOutcome {
+	if b.closing.Load() {
+		flushCancel()
+		b.logger.Warn().
+			Str("buffer_key", bufferKey).
+			Int("records", totalBuffered).
+			Msg("Flush queue send skipped: buffer is closing (data preserved in WAL)")
+		metrics.Get().IncWALRecordsPreserved(int64(totalBuffered))
+		return flushSkipClosing
+	}
+	select {
+	case b.flushQueue <- task:
+		b.queueDepth.Add(1)
+		b.logger.Info().
+			Str("buffer_key", bufferKey).
+			Int("total_records", totalBuffered).
+			Int64("queue_depth", b.queueDepth.Load()).
+			Msg("Buffer size exceeded, queued flush to worker pool")
+		return flushQueued
+	case <-b.ctx.Done():
+		flushCancel()
+		b.logger.Warn().
+			Str("buffer_key", bufferKey).
+			Int("records", totalBuffered).
+			Msg("Flush queue send aborted: ArrowBuffer ctx canceled (data preserved in WAL)")
+		metrics.Get().IncWALRecordsPreserved(int64(totalBuffered))
+		return flushCtxCanceled
+	default:
+		flushCancel()
+		b.logger.Warn().
+			Str("buffer_key", bufferKey).
+			Int("records", totalBuffered).
+			Int64("queue_depth", b.queueDepth.Load()).
+			Msg("Flush queue full - data preserved in WAL for recovery")
+		b.totalErrors.Add(1)
+		metrics.Get().IncWALRecordsPreserved(int64(totalBuffered))
+		return flushQueueFull
+	}
+}
+
+// schemaEvolutionMaxIters bounds the schema-evolution flush loop.
+// Steady state: 1 iteration (no schema change). Adversarial state:
+// rotating-schema writers could in principle trigger an unbounded
+// loop because flushBufferLocked releases shard.mu for I/O and a
+// concurrent writer can install a fresh schema in that window.
+//
+// Hitting the cap means at least 8 distinct schemas raced through
+// the same (database, measurement) buffer in the time window of one
+// flush — a sustained-churn signal, not transient. Surfacing this as
+// ErrSchemaChurnExceeded lets the caller fail the request with a 503
+// rather than committing a wide schema-mixed buffer to disk that
+// query-side schema-on-read would then have to reconcile.
+const schemaEvolutionMaxIters = 8
+
+// ErrSchemaChurnExceeded is returned by flushOnSchemaChangeLocked when
+// schemaEvolutionMaxIters is reached. Treat as a transient backpressure
+// signal: the caller should reject the write with a retryable status
+// (503) so upstream senders back off; the in-buffer rows for the older
+// schemas have already been flushed to durable Parquet by the loop's
+// per-iteration flushes, so there is no data loss — only a per-request
+// failure under sustained schema-rotation churn.
+var ErrSchemaChurnExceeded = errors.New("schema-evolution loop exceeded max iterations: sustained concurrent schema churn against the same (database, measurement)")
+
+// flushOnSchemaChangeLocked is the shared helper used by both columnar
+// write paths to handle schema evolution under the shard lock.
+//
+// Caller MUST hold shard.mu. The loop terminates when either:
+//   1. The bufferSchemas entry is absent or matches newSignature (steady
+//      state — single iteration).
+//   2. ctx is cancelled — return ctx.Err() so the caller can abort the
+//      write entirely.
+//   3. schemaEvolutionMaxIters is reached — return ErrSchemaChurnExceeded
+//      so the caller can reject the write with a retryable status (HTTP
+//      503). The per-iteration flushes inside the loop already wrote
+//      older schemas' rows to durable Parquet, so there is no data loss —
+//      only the current request fails under sustained schema-rotation
+//      churn.
+//
+// flushBufferLocked is called inside the loop; it releases-and-
+// reacquires shard.mu around its I/O. On flush error the buffer
+// entry is still deleted, so the next iteration sees !exists and
+// terminates cleanly.
+func (b *ArrowBuffer) flushOnSchemaChangeLocked(
+	ctx context.Context,
+	shard *bufferShard,
+	bufferKey, database, measurement, newSignature string,
+) error {
+	for i := 0; i < schemaEvolutionMaxIters; i++ {
+		// ctx-aware: a cancelled request shouldn't be starved by
+		// rotating-schema racers. Caller releases lock before
+		// surfacing the error.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		existingSignature, exists := shard.bufferSchemas[bufferKey]
+		if !exists || existingSignature == newSignature {
+			return nil
+		}
+		b.logger.Debug().
+			Str("buffer_key", bufferKey).
+			Str("old_schema", existingSignature).
+			Str("new_schema", newSignature).
+			Msg("Schema evolution detected, flushing buffer")
+
+		if err := b.flushBufferLocked(ctx, shard, bufferKey, database, measurement); err != nil {
+			b.logger.Error().Err(err).
+				Str("buffer_key", bufferKey).
+				Msg("Failed to flush buffer on schema change")
+			// flushBufferLocked deletes the buffer entry even on
+			// error — the next iteration sees !exists and exits.
+		}
+	}
+	// Reached the iteration cap. Surface as a typed error so callers can
+	// reject the request with a retryable 503 rather than silently
+	// committing a wide schema-mixed buffer to disk. The per-iteration
+	// flushes inside the loop already wrote the older schemas' rows to
+	// durable Parquet, so there is no data loss — only this single
+	// request fails under sustained schema-rotation churn.
+	b.totalSchemaChurnExceeded.Add(1)
+	b.logger.Warn().
+		Str("buffer_key", bufferKey).
+		Int("max_iters", schemaEvolutionMaxIters).
+		Msg("Schema-evolution loop hit max iterations; rejecting write with ErrSchemaChurnExceeded")
+	return ErrSchemaChurnExceeded
+}
+
 // writeColumnar writes a columnar record to the buffer
 func (b *ArrowBuffer) writeColumnar(ctx context.Context, database string, record *models.ColumnarRecord) error {
 	return b.writeColumnarInternal(ctx, database, record, false)
@@ -1299,14 +1527,15 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 		// ZERO-COPY PATH: Use raw msgpack bytes if available (avoids re-serialization)
 		if len(record.RawPayload) > 0 {
 			if err := b.wal.AppendRawWithMeta(database, record.RawPayload); err != nil {
-				// Don't fail the write — WAL is for durability, not correctness.
-				// Increment metric so operators can alert on sustained WAL failures.
-				b.totalWALErrors.Add(1)
-				b.logger.Error().Err(err).
-					Str("database", database).
-					Str("measurement", record.Measurement).
-					Int("payload_size", len(record.RawPayload)).
-					Msg("WAL write failed (zero-copy) - data may be lost on crash")
+				// Don't fail the write — WAL is for durability, not
+				// correctness. recordWALError differentiates backpressure
+				// drops (sampled Warn) from real I/O failures (unsampled
+				// Error) so operators can alert on the right signal.
+				b.recordWALError(err, func(ev *zerolog.Event) {
+					ev.Str("database", database).
+						Str("measurement", record.Measurement).
+						Int("payload_size", len(record.RawPayload))
+				})
 			}
 		} else {
 			// FALLBACK: Convert columnar to row format for WAL storage
@@ -1314,12 +1543,11 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 			walRecords := b.columnarToWALRecords(database, record)
 			if len(walRecords) > 0 {
 				if err := b.wal.Append(walRecords); err != nil {
-					b.totalWALErrors.Add(1)
-					b.logger.Error().Err(err).
-						Str("database", database).
-						Str("measurement", record.Measurement).
-						Int("records", len(walRecords)).
-						Msg("WAL write failed - data may be lost on crash")
+					b.recordWALError(err, func(ev *zerolog.Event) {
+						ev.Str("database", database).
+							Str("measurement", record.Measurement).
+							Int("records", len(walRecords))
+					})
 				}
 			}
 		}
@@ -1350,24 +1578,13 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 
 	shard.mu.Lock()
 
-	// Schema evolution detection: flush buffer if columns changed
-	if existingSignature, exists := shard.bufferSchemas[bufferKey]; exists {
-		if existingSignature != newSignature {
-			// Schema changed - flush existing buffer first to avoid column mismatch
-			b.logger.Debug().
-				Str("buffer_key", bufferKey).
-				Str("old_schema", existingSignature).
-				Str("new_schema", newSignature).
-				Msg("Schema evolution detected, flushing buffer")
-
-			if err := b.flushBufferLocked(ctx, shard, bufferKey, database, record.Measurement); err != nil {
-				b.logger.Error().Err(err).
-					Str("buffer_key", bufferKey).
-					Msg("Failed to flush buffer on schema change")
-				// Continue anyway - the buffer is cleared by flushBufferLocked
-			}
-			// Buffer is now empty, will be re-initialized below
-		}
+	// Schema evolution detection: flush buffer if columns changed.
+	// The loop guards against the I/O window inside flushBufferLocked
+	// where a concurrent writer can install a third schema; see
+	// flushOnSchemaChangeLocked for the full rationale.
+	if err := b.flushOnSchemaChangeLocked(ctx, shard, bufferKey, database, record.Measurement, newSignature); err != nil {
+		shard.mu.Unlock()
+		return err
 	}
 
 	// Initialize buffer and record count if needed
@@ -1440,29 +1657,13 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 			recordCount: totalBuffered,
 		}
 
-		// Non-blocking send to queue
-		select {
-		case b.flushQueue <- task:
-			b.queueDepth.Add(1)
-			b.logger.Info().
-				Str("buffer_key", bufferKey).
-				Int("total_records", totalBuffered).
-				Int64("queue_depth", b.queueDepth.Load()).
-				Msg("Buffer size exceeded, queued flush to worker pool")
-		default:
-			// Queue full - cancel the unused context to avoid leak
-			flushCancel()
-			// Queue full - data is already in WAL, don't grow memory
-			b.logger.Warn().
-				Str("buffer_key", bufferKey).
-				Int("records", totalBuffered).
-				Int64("queue_depth", b.queueDepth.Load()).
-				Msg("Flush queue full - data preserved in WAL for recovery")
-			b.totalErrors.Add(1)
-			// Track records preserved in WAL for operator visibility
-			metrics.Get().IncWALRecordsPreserved(int64(totalBuffered))
-			// Data is already in WAL (written at ingest time) - no memory growth
-			// WAL will be replayed on restart or via periodic recovery
+		// Non-blocking enqueue. tryEnqueueFlush handles the closing-
+		// flag short-circuit, the ctx.Done() defense-in-depth, and
+		// the queue-full path uniformly across both write paths.
+		// The flushSkipClosing outcome short-circuits the rest of
+		// the write — Close() is in progress, no point continuing.
+		if b.tryEnqueueFlush(task, flushCancel, bufferKey, totalBuffered) == flushSkipClosing {
+			return nil
 		}
 	}
 
@@ -1482,12 +1683,11 @@ func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, 
 		walRecords := typedBatchToWALRecords(database, measurement, typedColumns, numRecords, b.getDecimalColumns(measurement))
 		if len(walRecords) > 0 {
 			if err := b.wal.Append(walRecords); err != nil {
-				b.totalWALErrors.Add(1)
-				b.logger.Error().Err(err).
-					Str("database", database).
-					Str("measurement", measurement).
-					Int("records", len(walRecords)).
-					Msg("WAL write failed - data may be lost on crash")
+				b.recordWALError(err, func(ev *zerolog.Event) {
+					ev.Str("database", database).
+						Str("measurement", measurement).
+						Int("records", len(walRecords))
+				})
 			}
 		}
 	}
@@ -1506,21 +1706,10 @@ func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, 
 
 	shard.mu.Lock()
 
-	// Schema evolution detection: flush buffer if columns changed
-	if existingSignature, exists := shard.bufferSchemas[bufferKey]; exists {
-		if existingSignature != newSignature {
-			b.logger.Debug().
-				Str("buffer_key", bufferKey).
-				Str("old_schema", existingSignature).
-				Str("new_schema", newSignature).
-				Msg("Schema evolution detected, flushing buffer")
-
-			if err := b.flushBufferLocked(ctx, shard, bufferKey, database, measurement); err != nil {
-				b.logger.Error().Err(err).
-					Str("buffer_key", bufferKey).
-					Msg("Failed to flush buffer on schema change")
-			}
-		}
+	// Schema evolution detection: see flushOnSchemaChangeLocked.
+	if err := b.flushOnSchemaChangeLocked(ctx, shard, bufferKey, database, measurement, newSignature); err != nil {
+		shard.mu.Unlock()
+		return err
 	}
 
 	// Initialize buffer and record count if needed
@@ -1583,23 +1772,8 @@ func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, 
 			recordCount: totalBuffered,
 		}
 
-		select {
-		case b.flushQueue <- task:
-			b.queueDepth.Add(1)
-			b.logger.Info().
-				Str("buffer_key", bufferKey).
-				Int("total_records", totalBuffered).
-				Int64("queue_depth", b.queueDepth.Load()).
-				Msg("Buffer size exceeded, queued flush to worker pool")
-		default:
-			flushCancel()
-			b.logger.Warn().
-				Str("buffer_key", bufferKey).
-				Int("records", totalBuffered).
-				Int64("queue_depth", b.queueDepth.Load()).
-				Msg("Flush queue full - data preserved in WAL for recovery")
-			b.totalErrors.Add(1)
-			metrics.Get().IncWALRecordsPreserved(int64(totalBuffered))
+		if b.tryEnqueueFlush(task, flushCancel, bufferKey, totalBuffered) == flushSkipClosing {
+			return nil
 		}
 	}
 
@@ -3105,17 +3279,33 @@ func (b *ArrowBuffer) FlushAll(ctx context.Context) error {
 }
 
 // Close stops the buffer and flushes remaining data
+//
+// Shutdown ordering matters here:
+//  1. Set b.closing so writer goroutines short-circuit before reaching
+//     the channel send. Writers past shard.mu.Unlock() but not yet at
+//     the select would otherwise race a closed channel.
+//  2. Cancel b.ctx so flush workers exit via the <-b.ctx.Done() arm of
+//     their select. Data already enqueued is dropped in favor of WAL
+//     replay — that's the correct trade-off given a graceful shutdown
+//     should be quick.
+//  3. We deliberately do NOT close(b.flushQueue). Workers exit on ctx
+//     cancellation; closing the channel would re-introduce the
+//     send-on-closed-channel race the closing flag was added to fix.
+//  4. Wait for workers to drain. Then take shard locks to flush any
+//     in-memory buffers synchronously.
 func (b *ArrowBuffer) Close() error {
 	b.logger.Info().Msg("Closing ArrowBuffer...")
+
+	// Mark closing BEFORE cancelling so any writer past the shard
+	// unlock observes either the flag (skips send) or the cancelled
+	// ctx (Done arm fires). Either path avoids the panic.
+	b.closing.Store(true)
 
 	// Stop periodic flush
 	b.cancel()
 	b.flushTimer.Stop()
 
-	// Close flush queue (workers will exit when queue is drained)
-	close(b.flushQueue)
-
-	// Wait for all workers to finish
+	// Wait for all workers to finish (they exit via b.ctx.Done())
 	b.wg.Wait()
 
 	b.logger.Info().Msg("All flush workers stopped, flushing remaining buffers")
@@ -3177,6 +3367,8 @@ func (b *ArrowBuffer) GetStats() map[string]interface{} {
 		"total_flushes":          b.totalFlushes.Load(),
 		"total_errors":           b.totalErrors.Load(),
 		"total_wal_errors":       b.totalWALErrors.Load(),
+		"total_wal_dropped":      b.totalWALDropped.Load(),
+		"total_schema_churn_exceeded": b.totalSchemaChurnExceeded.Load(),
 		"active_buffers":         activeBuffers,
 		"flush_queue_depth":      b.queueDepth.Load(),
 		"flush_workers":          b.flushWorkers,

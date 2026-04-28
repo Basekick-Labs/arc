@@ -3,6 +3,7 @@ package sharding
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster/replication"
 	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/wal"
 	"github.com/rs/zerolog"
 )
 
@@ -76,9 +78,16 @@ type ShardReceiver struct {
 	totalBytesReceived   atomic.Int64
 	totalEntriesApplied  atomic.Int64
 	totalErrors          atomic.Int64
+	totalLocalWALDropped atomic.Int64 // See replication.Receiver.totalLocalWALDropped — same semantics.
+	walDropLastLogNano   atomic.Int64 // Sampled-Warn timestamp; see replication.Receiver.walDropLastLogNano.
 	lastReceiveTime      atomic.Int64
 	connectTime          atomic.Int64
 }
+
+// walDropLogIntervalNano caps the WAL-drop Warn rate to one line per
+// second per shard receiver. Same semantics as ArrowBuffer's identically
+// named const.
+const walDropLogIntervalNano = int64(time.Second)
 
 // NewShardReceiverManager creates a new per-shard receiver manager.
 func NewShardReceiverManager(cfg *ShardReceiverConfig) *ShardReceiverManager {
@@ -455,11 +464,36 @@ func (r *ShardReceiver) receiveLoop() {
 }
 
 // applyEntry applies a received entry to local storage.
+//
+// LocalWAL.AppendRaw can return wal.ErrWALDropped when the follower's
+// async WAL channel is saturated. We treat that as NON-FATAL — the
+// entry is still applied to the in-memory ingest buffer; the primary
+// retains the data; peer Parquet replication closes the durability
+// loop on next flush. See replication.Receiver.applyEntry for the
+// full rationale.
 func (r *ShardReceiver) applyEntry(entry *replication.ReplicateEntry) error {
-	// Write to local WAL first (if configured)
+	// Write to local WAL first (if configured). Drop on backpressure
+	// is non-fatal — see function doc.
 	if r.cfg.LocalWAL != nil {
 		if err := r.cfg.LocalWAL.AppendRaw(entry.Payload); err != nil {
-			return fmt.Errorf("write to local WAL: %w", err)
+			if errors.Is(err, wal.ErrWALDropped) {
+				r.totalLocalWALDropped.Add(1)
+				// Sampled Warn — at most one line per walDropLogIntervalNano
+				// per shard. Sustained backpressure on a busy shard would
+				// otherwise produce a Warn per replicated record.
+				now := time.Now().UnixNano()
+				last := r.walDropLastLogNano.Load()
+				if now-last >= walDropLogIntervalNano && r.walDropLastLogNano.CompareAndSwap(last, now) {
+					r.logger.Warn().
+						Int("shard_id", r.shardID).
+						Uint64("sequence", entry.Sequence).
+						Int("payload_size", len(entry.Payload)).
+						Int64("total_dropped", r.totalLocalWALDropped.Load()).
+						Msg("Shard replication: follower LocalWAL dropped entry on backpressure; applying to ingest buffer anyway")
+				}
+			} else {
+				return fmt.Errorf("write to local WAL: %w", err)
+			}
 		}
 	}
 
@@ -542,6 +576,7 @@ func (r *ShardReceiver) Stats() map[string]interface{} {
 		"total_bytes_received":    r.totalBytesReceived.Load(),
 		"total_entries_applied":   r.totalEntriesApplied.Load(),
 		"total_errors":            r.totalErrors.Load(),
+		"total_local_wal_dropped": r.totalLocalWALDropped.Load(),
 		"last_receive_time":       lastReceive.Format(time.RFC3339),
 		"connected_since":         connectTime.Format(time.RFC3339),
 		"connection_duration_sec": time.Since(connectTime).Seconds(),

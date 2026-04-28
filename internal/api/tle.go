@@ -2,15 +2,18 @@ package api
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"sync/atomic"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/gofiber/fiber/v2"
 	"github.com/klauspost/compress/gzip"
+	"github.com/klauspost/compress/zstd"
 	"github.com/rs/zerolog"
 )
 
@@ -22,8 +25,9 @@ type TLEHandler struct {
 	parser *ingest.TLEParser
 	logger zerolog.Logger
 
-	// RBAC support
-	authManager AuthManager
+	// authManager holds the concrete *auth.AuthManager. See
+	// MsgPackHandler.authManager for the full rationale.
+	authManager *auth.AuthManager
 	rbacManager RBACChecker
 
 	// Cluster routing support
@@ -45,8 +49,9 @@ func NewTLEHandler(buffer *ingest.ArrowBuffer, logger zerolog.Logger) *TLEHandle
 	}
 }
 
-// SetAuthAndRBAC sets the auth and RBAC managers for permission checking
-func (h *TLEHandler) SetAuthAndRBAC(authManager AuthManager, rbacManager RBACChecker) {
+// SetAuthAndRBAC sets the auth and RBAC managers. See
+// MsgPackHandler.SetAuthAndRBAC for the full rationale.
+func (h *TLEHandler) SetAuthAndRBAC(authManager *auth.AuthManager, rbacManager RBACChecker) {
 	h.authManager = authManager
 	h.rbacManager = rbacManager
 }
@@ -57,9 +62,11 @@ func (h *TLEHandler) SetRouter(router *cluster.Router) {
 	h.router = router
 }
 
-// RegisterRoutes registers TLE routes
+// RegisterRoutes registers TLE routes. The write endpoint is gated by
+// auth.RequireWrite when auth is enabled — per CLAUDE.md, mutating
+// endpoints MUST have an explicit write-tier auth middleware.
 func (h *TLEHandler) RegisterRoutes(app *fiber.App) {
-	app.Post("/api/v1/write/tle", h.handleWrite)
+	app.Post("/api/v1/write/tle", withWriteAuth(h.authManager), h.handleWrite)
 	app.Get("/api/v1/write/tle/stats", h.Stats)
 
 	h.logger.Info().Msg("TLE routes registered")
@@ -105,22 +112,26 @@ func (h *TLEHandler) handleWrite(c *fiber.Ctx) error {
 	}
 
 localProcessing:
-	body := c.Body()
-	originalSize := len(body)
+	// Shared decompressRequest helper (below) handles gzip/zstd/
+	// uncompressed dispatch with a hard 100MB output cap, the streaming
+	// LimitReader-bounded zstd path, and the defensive copy of fasthttp-
+	// owned bytes on the uncompressed branch. See lineprotocol.go for
+	// the security rationale of each invariant.
+	rawBody := c.Request().Body()
+	originalSize := len(rawBody)
 	h.totalBytes.Add(int64(originalSize))
 
-	// Check for gzip compression (magic number: 0x1f 0x8b)
-	// Reuses the LP gzip reader pool to share pooled readers across handlers
-	if len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b {
-		decompressed, err := decompressGzipPooled(body, 0)
-		if err != nil {
-			h.totalErrors.Add(1)
-			h.logger.Error().Err(err).Msg("Failed to decompress gzip data")
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": "Failed to decompress gzip data: " + err.Error(),
-			})
+	body, codec, err := decompressRequest(rawBody, 0)
+	if err != nil {
+		h.totalErrors.Add(1)
+		h.logger.Error().Err(err).Str("codec", codec).Msg("Failed to accept request body")
+		errMsg := "Failed to read request body: " + err.Error()
+		if codec != "" {
+			errMsg = "Failed to decompress " + codec + " data: " + err.Error()
 		}
-		body = decompressed
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": errMsg,
+		})
 	}
 
 	if len(body) == 0 {
@@ -180,6 +191,12 @@ localProcessing:
 			Str("measurement", measurement).
 			Int("records", len(tleRecords)).
 			Msg("Failed to write TLE data to Arrow buffer")
+		// See lineprotocol.go for ErrSchemaChurnExceeded → 503 rationale.
+		if errors.Is(err, ingest.ErrSchemaChurnExceeded) {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"error": "Write rejected (schema churn): " + err.Error(),
+			})
+		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Write failed: " + err.Error(),
 		})
@@ -205,6 +222,52 @@ func (h *TLEHandler) Stats(c *fiber.Ctx) error {
 			"total_errors":   h.totalErrors.Load(),
 		},
 	})
+}
+
+// decompressRequest dispatches on the compression magic bytes at the
+// head of rawBody and returns a fresh, hard-capped []byte plus a
+// short codec label ("gzip", "zstd", or "" for uncompressed) suitable
+// for structured logging.
+//
+// All three branches return slices that are safe to retain past
+// handler return — the gzip and zstd helpers allocate fresh, and the
+// uncompressed branch makes a defensive copy out of the fasthttp-
+// owned rawBody (see lineprotocol.go for the silent-aliasing
+// rationale).
+//
+// maxSize is a hard ceiling on the *post-decompression* size and is
+// applied symmetrically to all three branches:
+//   - gzip / zstd: enforced inside the streaming decoder via LimitReader
+//     so a bomb is rejected before allocation.
+//   - uncompressed: enforced before the defensive copy so an attacker
+//     cannot force a multi-GB allocation by sending a giant raw body.
+//
+// Pass 0 for the default 100MB cap. err carries the wrapped underlying
+// decoder error so handlers can include it in the JSON response for
+// client diagnosis.
+func decompressRequest(rawBody []byte, maxSize int) (body []byte, codec string, err error) {
+	if maxSize <= 0 {
+		maxSize = 100 * 1024 * 1024 // 100MB default — must match the codec helpers
+	}
+	switch {
+	case len(rawBody) >= 2 && rawBody[0] == 0x1f && rawBody[1] == 0x8b:
+		body, err = decompressGzipPooled(rawBody, maxSize)
+		return body, "gzip", err
+	case len(rawBody) >= 4 && rawBody[0] == 0x28 && rawBody[1] == 0xB5 && rawBody[2] == 0x2F && rawBody[3] == 0xFD:
+		body, err = decompressZstdPooled(rawBody, maxSize)
+		return body, "zstd", err
+	default:
+		// Uncompressed — enforce the same maxSize cap as the codec
+		// branches before making the defensive copy. Without this
+		// check, an uncompressed multi-GB body would be both accepted
+		// AND copied (the defensive copy is the OOM vector). Symmetric
+		// hardening per gemini round 6.
+		if len(rawBody) > maxSize {
+			return nil, "", fmt.Errorf("payload exceeds %s limit", formatBytes(int64(maxSize)))
+		}
+		out := append([]byte(nil), rawBody...)
+		return out, "", nil
+	}
 }
 
 // decompressGzipPooled decompresses gzip data using pooled readers to minimize allocations.
@@ -238,9 +301,75 @@ func decompressGzipPooled(data []byte, maxSize int) ([]byte, error) {
 
 	if len(result) > maxSize {
 		lpGzipReaderPool.Put(reader)
-		return nil, fmt.Errorf("decompressed payload exceeds %dMB limit", maxSize/(1024*1024))
+		return nil, fmt.Errorf("decompressed payload exceeds %s limit", formatBytes(int64(maxSize)))
 	}
 
 	lpGzipReaderPool.Put(reader)
 	return result, nil
+}
+
+// decompressZstdPooled decompresses zstd data using the package-level
+// zstdDecoderPool (declared in msgpack.go). Returns a freshly-copied
+// []byte so LP and TLE callers can keep their flat-byte handler shape.
+//
+// maxSize is a hard ceiling on the *decompressed output*; pass 0 for
+// the default 100MB. Critical: the bound is enforced by reading the
+// decoder via io.LimitReader, NOT by checking len after DecodeAll.
+// zstd.WithDecoderMaxMemory only bounds the decoder's per-frame
+// window state, not the output buffer growth — DecodeAll on a high-
+// ratio bomb (e.g. 100KB → 100GB) would OOM the process before any
+// post-hoc length check could fire. The streaming Reset+LimitReader+
+// ReadAll pattern matches the gzip helper above and is the same
+// shape klauspost recommends for untrusted input.
+//
+// Reads up to maxSize+1 bytes; if exactly maxSize+1 bytes were read,
+// the input was over-limit and we return an error (a single read of
+// maxSize+1 is still bounded so the bomb cannot OOM).
+func decompressZstdPooled(data []byte, maxSize int) ([]byte, error) {
+	if maxSize <= 0 {
+		maxSize = 100 * 1024 * 1024 // 100MB default
+	}
+
+	var decoder *zstd.Decoder
+	var err error
+	if pooled := zstdDecoderPool.Get(); pooled != nil {
+		decoder = pooled.(*zstd.Decoder)
+		if err = decoder.Reset(bytes.NewReader(data)); err != nil {
+			// Pool entry's internal state is now poisoned — drop it.
+			decoder.Close()
+			return nil, fmt.Errorf("failed to reset zstd decoder: %w", err)
+		}
+	} else {
+		decoder, err = zstd.NewReader(bytes.NewReader(data), zstd.WithDecoderMaxMemory(uint64(maxSize)+1024))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
+		}
+	}
+
+	// Bounded read: io.LimitReader caps the bytes we will pull from the
+	// decoder regardless of compression ratio. Reading maxSize+1 lets us
+	// distinguish "exactly at limit" from "over limit" with a single
+	// allocation — no unbounded buffer growth is possible.
+	limited := io.LimitReader(decoder, int64(maxSize)+1)
+	out, err := io.ReadAll(limited)
+	if err != nil {
+		// Decoder may be in an indeterminate state after a partial-decode
+		// error — corrupted internal frame state can't be safely reset.
+		// Drop the decoder entirely (Close releases its goroutines and
+		// buffers) rather than risk poisoning the pool. The pool's Get()
+		// will allocate a fresh one on the next request. Per gemini r7.
+		decoder.Close()
+		return nil, fmt.Errorf("failed to decompress zstd: %w", err)
+	}
+
+	// Release the decoder's internal buffers (it may be holding the
+	// last decoded frame) before returning to the pool.
+	_ = decoder.Reset(nil)
+	zstdDecoderPool.Put(decoder)
+
+	if len(out) > maxSize {
+		return nil, fmt.Errorf("decompressed payload exceeds %s limit", formatBytes(int64(maxSize)))
+	}
+
+	return out, nil
 }

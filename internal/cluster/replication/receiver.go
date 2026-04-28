@@ -3,6 +3,7 @@ package replication
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/basekick-labs/arc/internal/cluster/protocol"
 	"github.com/basekick-labs/arc/internal/cluster/security"
+	"github.com/basekick-labs/arc/internal/wal"
 	"github.com/rs/zerolog"
 )
 
@@ -82,9 +84,25 @@ type Receiver struct {
 	totalBytesReceived   atomic.Int64
 	totalEntriesApplied  atomic.Int64
 	totalErrors          atomic.Int64
-	lastReceiveTime      atomic.Int64 // Unix nano
-	connectTime          atomic.Int64 // Unix nano
+	totalLocalWALDropped atomic.Int64 // Count of entries where the follower's
+	// LocalWAL dropped on backpressure but the entry was still applied to
+	// the in-memory ingest buffer. Treated as non-fatal — the primary
+	// retains the data and follower-side durability is restored on next
+	// flush via Parquet replication. See applyEntry for full rationale.
+	walDropLastLogNano atomic.Int64 // Sampled-Warn timestamp for WAL drops:
+	// sustained follower-side backpressure can produce a dropped entry
+	// per record; without sampling that becomes a Warn flood. Operators
+	// get the rate from totalLocalWALDropped — the log line just signals
+	// "the degraded state is in effect, look at the counter." Mirrors
+	// ArrowBuffer.walDropLastLogNano.
+	lastReceiveTime atomic.Int64 // Unix nano
+	connectTime     atomic.Int64 // Unix nano
 }
+
+// walDropLogIntervalNano caps the WAL-drop Warn rate to one line per
+// second per receiver. Same semantics as ArrowBuffer's identically
+// named const.
+const walDropLogIntervalNano = int64(time.Second)
 
 // NewReceiver creates a new replication receiver.
 func NewReceiver(cfg *ReceiverConfig) *Receiver {
@@ -327,11 +345,47 @@ func (r *Receiver) receiveLoop() {
 }
 
 // applyEntry applies a received entry to local storage.
+//
+// LocalWAL.AppendRaw can return wal.ErrWALDropped when the follower's
+// async WAL channel is saturated. We treat that as NON-FATAL and
+// continue to apply to the ingest handler:
+//
+//   1. The primary still has the entry — it didn't fail there.
+//   2. The follower's in-memory ingest buffer accepts the data and
+//      will eventually flush it to Parquet, which is replicated to
+//      peers via Phase 2 file replication.
+//   3. The brief gap is "if the follower crashes before its next
+//      Parquet flush, this entry is lost from the follower's WAL but
+//      survives on the primary." On restart the follower's
+//      Phase 3 catch-up reconciles the manifest with peer storage.
+//
+// Treating the drop as fatal would either stall the receive loop on
+// the same entry (no retry mechanism today) or cause silent
+// divergence — primary advances, follower lastSeq stays behind, the
+// failed entry never reapplies. Both are worse than the brief
+// durability gap we accept here.
 func (r *Receiver) applyEntry(entry *ReplicateEntry) error {
-	// Write to local WAL first (if configured)
+	// Write to local WAL first (if configured). A drop on backpressure
+	// is non-fatal — see function doc.
 	if r.cfg.LocalWAL != nil {
 		if err := r.cfg.LocalWAL.AppendRaw(entry.Payload); err != nil {
-			return fmt.Errorf("write to local WAL: %w", err)
+			if errors.Is(err, wal.ErrWALDropped) {
+				r.totalLocalWALDropped.Add(1)
+				// Sampled Warn — at most one line per walDropLogIntervalNano.
+				// Sustained backpressure can drop one entry per replicated
+				// record; an unsampled Warn drowns operator dashboards.
+				now := time.Now().UnixNano()
+				last := r.walDropLastLogNano.Load()
+				if now-last >= walDropLogIntervalNano && r.walDropLastLogNano.CompareAndSwap(last, now) {
+					r.logger.Warn().
+						Uint64("sequence", entry.Sequence).
+						Int("payload_size", len(entry.Payload)).
+						Int64("total_dropped", r.totalLocalWALDropped.Load()).
+						Msg("Replication: follower LocalWAL dropped entry on backpressure; applying to ingest buffer anyway (durability via primary + peer Parquet replication)")
+				}
+			} else {
+				return fmt.Errorf("write to local WAL: %w", err)
+			}
 		}
 	}
 
@@ -413,6 +467,7 @@ func (r *Receiver) Stats() map[string]interface{} {
 		"total_bytes_received":    r.totalBytesReceived.Load(),
 		"total_entries_applied":   r.totalEntriesApplied.Load(),
 		"total_errors":            r.totalErrors.Load(),
+		"total_local_wal_dropped": r.totalLocalWALDropped.Load(),
 		"last_receive_time":       lastReceive.Format(time.RFC3339),
 		"connected_since":         connectTime.Format(time.RFC3339),
 		"connection_duration_sec": time.Since(connectTime).Seconds(),
