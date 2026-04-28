@@ -2,8 +2,10 @@ package api
 
 import (
 	"bufio"
+	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"math"
 	"strconv"
 	"strings"
@@ -76,8 +78,24 @@ func mapColumnType(dbType string) colType {
 // streamTypedJSON writes a complete JSON query response directly to a
 // bufio.Writer (typically the HTTP response), avoiding any full-response
 // buffering. Rows are flushed incrementally every jsonFlushInterval rows.
-// Returns the number of rows written.
+//
+// Returns (rowsWritten, err). Errors that may occur after the response
+// envelope has been opened (and possibly partially flushed) cannot
+// retroactively change the HTTP status — but the caller MUST surface
+// them to logs / metrics / query-registry so operators see that the
+// stream truncated, instead of the previous behaviour of silently
+// `continue`'ing past Scan errors and reporting Complete(rowCount).
+// See review/query-path-criticals C5.
+//
+// Returned error sources:
+//   - ctx cancellation observed at a row boundary (timeout / client-
+//     disconnect). Surfaces ctx.Err().
+//   - scanner.Scan failure on any row. The row is NOT written; the
+//     stream stops. Operator must treat this as a partial-result failure.
+//   - scanner.Err() after the row loop exits cleanly (e.g. underlying
+//     *sql.Rows ran into a deferred error). Same partial-result class.
 func streamTypedJSON(
+	ctx context.Context,
 	w *bufio.Writer,
 	columns []string,
 	colTypes []colType,
@@ -86,7 +104,7 @@ func streamTypedJSON(
 	profile *database.QueryProfile,
 	start time.Time,
 	timestamp string,
-) int {
+) (int, error) {
 	numCols := len(columns)
 
 	// Scan buffer — reused for every row
@@ -105,10 +123,23 @@ func streamTypedJSON(
 	w.WriteString(`,"data":[`)
 
 	rowCount := 0
+	var streamErr error
 
 	for scanner.Next() {
+		// Per-row ctx check: a timeout firing mid-stream must short-
+		// circuit instead of being silently absorbed by the next
+		// Scan/Err round (which the prior code did via `continue`).
+		if err := ctx.Err(); err != nil {
+			streamErr = fmt.Errorf("stream cancelled at row %d: %w", rowCount, err)
+			break
+		}
+
 		if err := scanner.Scan(valuePtrs...); err != nil {
-			continue
+			// SCAN error on this row. We refuse to silently drop rows
+			// (companion to #330) — surface to caller so the request
+			// is recorded as a failure.
+			streamErr = fmt.Errorf("scan failed at row %d: %w", rowCount, err)
+			break
 		}
 
 		// Row separator
@@ -138,7 +169,20 @@ func streamTypedJSON(
 		}
 	}
 
+	// Check for deferred iterator errors (e.g. row-fetch failure
+	// from the underlying *sql.Rows after the loop terminates).
+	if streamErr == nil {
+		if err := scanner.Err(); err != nil {
+			streamErr = fmt.Errorf("iterator error after %d rows: %w", rowCount, err)
+		}
+	}
+
 	// --- Write envelope close ---
+	// We close the JSON document regardless of whether streamErr is set
+	// — the response headers are already committed so we cannot change
+	// the status code, and emitting valid JSON is friendlier to clients
+	// that may have already started parsing. The caller logs/metrics
+	// the error.
 	w.WriteString(`],"row_count":`)
 	scratch = strconv.AppendInt(scratch[:0], int64(rowCount), 10)
 	w.Write(scratch)
@@ -163,7 +207,7 @@ func streamTypedJSON(
 
 	w.WriteByte('}')
 
-	return rowCount
+	return rowCount, streamErr
 }
 
 // writeJSONValue writes a single value using type-specific serialization.

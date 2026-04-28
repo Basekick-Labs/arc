@@ -3,8 +3,10 @@ package api
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"math"
 	"testing"
 	"time"
@@ -48,7 +50,7 @@ func streamToBytes(
 	var buf bytes.Buffer
 	w := bufio.NewWriter(&buf)
 	start := time.Now()
-	rowCount := streamTypedJSON(w, columns, colTypes, scanner, governanceMaxRows, profile, start, "2024-01-15T12:00:00Z")
+	rowCount, _ := streamTypedJSON(context.Background(), w, columns, colTypes, scanner, governanceMaxRows, profile, start, "2024-01-15T12:00:00Z")
 	w.Flush()
 	return buf.Bytes(), rowCount
 }
@@ -395,6 +397,73 @@ func TestWriteJSONString_Escaping(t *testing.T) {
 	}
 }
 
+// TestStreamTypedJSON_ReturnsErrorOnScanFailure pins C5 contract:
+// previously a row scan error inside the loop was silently `continue`'d
+// and the caller marked the query Complete(rowCount). Now Scan errors
+// must terminate the loop and surface via the (int, error) return so
+// the caller can record IncQueryErrors() and registry.Fail().
+func TestStreamTypedJSON_ReturnsErrorOnScanFailure(t *testing.T) {
+	scanner := &mockRowScanner{
+		rows: [][]interface{}{
+			{int64(1), "a"},
+			{int64(2), "b"},
+			{int64(3), "c"},
+		},
+		// Note: mockRowScanner returns scanErr on every Scan; with rows
+		// pre-populated and idx=0, the first Scan call sees this error
+		// and the row never gets written.
+		scanErr: errSimulatedScan,
+	}
+	columns := []string{"id", "name"}
+	colTypes := []colType{colInt64, colString}
+
+	var buf bytes.Buffer
+	w := bufio.NewWriter(&buf)
+	rowCount, err := streamTypedJSON(context.Background(), w, columns, colTypes, scanner, 0, nil, time.Now(), "ts")
+	w.Flush()
+
+	if err == nil {
+		t.Fatal("expected non-nil error from streamTypedJSON when Scan fails; got nil — C5 regression")
+	}
+	if rowCount != 0 {
+		t.Errorf("expected 0 rows written when first Scan errors, got %d", rowCount)
+	}
+}
+
+// TestStreamTypedJSON_ReturnsErrorOnCtxCancel pins the per-row ctx
+// check added for C5: a cancelled ctx must terminate the loop with
+// ctx.Err() rather than silently completing as success.
+func TestStreamTypedJSON_ReturnsErrorOnCtxCancel(t *testing.T) {
+	scanner := &mockRowScanner{
+		rows: [][]interface{}{{int64(1), "a"}, {int64(2), "b"}, {int64(3), "c"}},
+	}
+	columns := []string{"id", "name"}
+	colTypes := []colType{colInt64, colString}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled
+
+	var buf bytes.Buffer
+	w := bufio.NewWriter(&buf)
+	_, err := streamTypedJSON(ctx, w, columns, colTypes, scanner, 0, nil, time.Now(), "ts")
+	w.Flush()
+
+	if err == nil {
+		t.Fatal("expected non-nil error from streamTypedJSON when ctx is cancelled before first row")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected error to wrap context.Canceled, got: %v", err)
+	}
+}
+
+// errSimulatedScan is the sentinel used by TestStreamTypedJSON_*
+// to simulate a row-scan failure.
+var errSimulatedScan = errSentinel("simulated scan failure")
+
+type errSentinel string
+
+func (e errSentinel) Error() string { return string(e) }
+
 // BenchmarkStreamTypedJSON benchmarks the typed writer against json.Marshal.
 func BenchmarkStreamTypedJSON(b *testing.B) {
 	// Build 10K rows of mixed types
@@ -420,7 +489,7 @@ func BenchmarkStreamTypedJSON(b *testing.B) {
 			buf.Reset()
 			w := bufio.NewWriter(&buf)
 			scanner := &mockRowScanner{rows: rows}
-			streamTypedJSON(w, columns, colTypes, scanner, 0, nil, time.Now(), "ts")
+			streamTypedJSON(context.Background(), w, columns, colTypes, scanner, 0, nil, time.Now(), "ts")
 			w.Flush()
 		}
 	})

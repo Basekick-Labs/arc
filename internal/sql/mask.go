@@ -92,3 +92,18 @@ func UnmaskStringLiterals(sql string, masks []StringMask) string {
 func HasQuotes(sql string) bool {
 	return strings.ContainsAny(sql, "'\"")
 }
+
+// EscapeStringLiteral escapes single quotes for safe use as a DuckDB
+// single-quoted string literal: 'foo' → 'foo', 'it's' → 'it''s'.
+// Use this for every interpolation into a DuckDB SQL fragment that
+// cannot be parameterised — most importantly `read_parquet('PATH')`,
+// where the path comes from user-controlled inputs (database header,
+// measurement name, manifest entries).
+//
+// SECURITY: This is the single source of truth for DuckDB string-
+// literal escaping in the API layer. Sites that interpolate paths
+// must call this helper. See internal/api/query.go convertSQL* and
+// buildReadParquetExpr for the call sites.
+func EscapeStringLiteral(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
