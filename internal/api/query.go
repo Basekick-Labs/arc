@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -71,7 +72,15 @@ var (
 	patternJoinSimpleTable = regexp.MustCompile(`(?i)\b(?:(?:LEFT|RIGHT|INNER|OUTER|CROSS|NATURAL)?\s*)?(?:LATERAL\s+)?JOIN\s+(?:LATERAL\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b`)
 	// Pattern to extract CTE names from WITH clauses
 	// Matches: WITH name AS, WITH RECURSIVE name AS, and comma-separated CTEs
-	patternCTENames = regexp.MustCompile(`(?i)\bWITH\s+(?:RECURSIVE\s+)?(\w+)\s+AS\s*\(|,\s*(\w+)\s+AS\s*\(`)
+	// CTE name extraction. DuckDB allows `WITH foo AS (...)` and
+	// `WITH foo(col1, col2) AS (...)` (parenthesized column lists);
+	// both forms must be recognised so the table-resolver doesn't
+	// treat the CTE name as a real measurement and either (a) try to
+	// rewrite `FROM foo` to a non-existent storage path, or (b) leak
+	// the CTE name through RBAC as if it were a real table. The
+	// optional `(...)` between the name and AS is matched non-greedily
+	// to avoid swallowing too much. See review/query-path-criticals C3.
+	patternCTENames = regexp.MustCompile(`(?i)\bWITH\s+(?:RECURSIVE\s+)?(\w+)(?:\s*\([^)]*\))?\s+AS\s*\(|,\s*(\w+)(?:\s*\([^)]*\))?\s+AS\s*\(`)
 
 	// skipPrefixes are table name prefixes that should not be converted to storage paths
 	skipPrefixes = []string{"read_parquet", "information_schema", "pg_", "duckdb_"}
@@ -503,17 +512,72 @@ type QueryResponse struct {
 	Profile         *database.QueryProfile `json:"profile,omitempty"`
 }
 
-// dangerousSQLPattern is a single combined regex for all dangerous SQL operations.
-// Using one pattern instead of 7 separate ones reduces regex matching to a single pass.
-var dangerousSQLPattern = regexp.MustCompile(`(?i)\b(?:` +
-	`DROP\s+(?:TABLE|DATABASE|INDEX|VIEW)` +
+// dangerousSQLPattern is a single combined regex for all dangerous SQL
+// operations. Using one pattern instead of N separate ones reduces regex
+// matching to a single pass. Run AFTER comment-stripping and string-
+// literal masking via ValidateSQLRequest — `DROP /* */ TABLE` would slip
+// past a `\b...\b` regex without comment removal, and `SELECT 'DROP
+// TABLE x'` would false-positive without literal masking.
+//
+// Beyond classic DDL/DML, the following RCE-class operations are
+// blocked because the user-facing query API is read-only:
+//   - ATTACH/DETACH: mount remote DBs / extensions; can be used to
+//     pivot to attacker-controlled storage.
+//   - COPY (... TO ...): write query result to an arbitrary
+//     filesystem path. Direct exfiltration vector.
+//   - EXPORT/IMPORT DATABASE: bulk-export the catalog or pull
+//     attacker-controlled DDL/DML.
+//   - PRAGMA: many DuckDB pragmas are state-changing (memory_limit,
+//     extension_directory, profile_output, etc.).
+//   - SET (any session var): includes enable_external_access,
+//     extension_directory, custom credentials.
+//   - LOAD/INSTALL: load extensions (e.g. shellfs, httpfs) which
+//     introduce arbitrary RCE.
+//   - CALL: invoke extension procedures.
+//
+// Arc's internal startup code (configureDatabase, configureS3Access,
+// configureAzureAccess in internal/database/duckdb.go) issues these
+// commands directly via db.Exec without going through ValidateSQLRequest,
+// so the denylist does not block legitimate Arc operations. Only user-
+// supplied SQL via the /api/v1/query* endpoints is gated.
+// The pattern is split so each alternative is anchored to its own
+// boundary. Original DDL/DML keywords keep their trailing `\b` (they
+// end at an identifier word). The RCE-class additions are anchored at
+// the START with `\b` and terminate naturally because they are
+// followed by mandatory whitespace/parentheses/equals — using a
+// trailing `\b` there fails for `COPY (SELECT...)` because `\s` →
+// `(` is a non-word→non-word transition.
+var dangerousSQLPattern = regexp.MustCompile(`(?i)(?:` +
+	// Classic DDL/DML — keyword followed by another word.
+	`\b(?:DROP\s+(?:TABLE|DATABASE|INDEX|VIEW)` +
 	`|DELETE\s+FROM` +
 	`|TRUNCATE\s+TABLE` +
 	`|ALTER\s+TABLE` +
 	`|CREATE\s+(?:TABLE|DATABASE|INDEX)` +
 	`|INSERT\s+INTO` +
-	`|UPDATE\s+\w+\s+SET` +
-	`)\b`)
+	`|UPDATE\s+\w+\s+SET)\b` +
+	// RCE / file-system / extension-loading class. Anchored at start
+	// with \b; the terminator is whatever the keyword's argument shape
+	// requires (quote, paren, equals, or whitespace+identifier).
+	`|\bATTACH\b` +
+	`|\bDETACH\b` +
+	`|\bCOPY\b` +
+	`|\bEXPORT\s+DATABASE\b` +
+	`|\bIMPORT\s+DATABASE\b` +
+	`|\bPRAGMA\b` +
+	// SET / RESET match the bare keyword (any session-state mutation
+	// is forbidden in the read-only API). The previous "\s+\w+\s*=" form
+	// was bypassable via DuckDB's `SET x TO 1`, `SET VARIABLE x = 1`,
+	// and `RESET x` syntax — gemini round 1.
+	`|\bSET\b` +
+	`|\bRESET\b` +
+	`|\bLOAD\b` +
+	`|\bINSTALL\b` +
+	// CALL matches the bare keyword. The previous "\s+\w+" form was
+	// bypassable via `CALL(proc)` (no whitespace before paren) — gemini
+	// round 1.
+	`|\bCALL\b` +
+	`)`)
 
 // Patterns for SQL injection prevention in queryMeasurement endpoint
 var (
@@ -556,6 +620,25 @@ func validateIdentifier(name string) error {
 		return fmt.Errorf("name contains invalid characters (allowed: alphanumeric, underscore, hyphen)")
 	}
 	return nil
+}
+
+// validateHeaderDatabase validates the value of the x-arc-database HTTP
+// header before it is interpolated into storage paths. The header
+// content lands in `read_parquet('<base>/<database>/.../*.parquet')`
+// — without validation, an attacker controls the path and can inject
+// SQL via single-quote breakout, control characters, or path
+// traversal. Empty header is allowed (handlers fall back to default-
+// database behaviour).
+//
+// SECURITY: Defense-in-depth — the read_parquet interpolation sites
+// also escape via sql.EscapeStringLiteral, but rejecting bad headers
+// at the entry point produces a clear 400 instead of an obscure
+// downstream SQL error. See review/query-path-criticals C2.
+func validateHeaderDatabase(name string) error {
+	if name == "" {
+		return nil // empty header is allowed
+	}
+	return validateIdentifier(name)
 }
 
 // validateOrderByClause validates ORDER BY clause to prevent SQL injection
@@ -1048,6 +1131,14 @@ localProcessing:
 
 	// Extract x-arc-database header for optimized query path
 	headerDB := c.Get("x-arc-database")
+	if err := validateHeaderDatabase(headerDB); err != nil {
+		m.IncQueryErrors()
+		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
+			Success:   false,
+			Error:     "invalid x-arc-database header: " + err.Error(),
+			Timestamp: timestamp,
+		})
+	}
 
 	// If header is set, reject cross-database syntax (db.table not allowed)
 	if headerDB != "" && hasCrossDatabaseSyntax(req.SQL) {
@@ -1115,7 +1206,6 @@ localProcessing:
 	}
 
 	var columns []string
-	var rowCount int
 	var profile *database.QueryProfile
 
 	// Register query with management registry if available
@@ -1190,6 +1280,64 @@ localProcessing:
 			})
 		}
 
+		// CRITICAL: per-partition error inspection. ExecutePartitioned
+		// returns successfully even if individual partitions errored
+		// (PartitionResult.Error != nil). NewMergedRowIterator below
+		// would happily ignore errored partitions and return rows from
+		// the surviving ones, producing a 200 with `success:true` and
+		// silently dropping a fraction of the result. That is exactly
+		// the silent-data-loss class CLAUDE.md prohibits — fail loudly
+		// instead. See review/query-path-criticals C4.
+		var erroredPaths []string
+		var firstPartitionErr error
+		for _, r := range results {
+			if r.Error != nil {
+				erroredPaths = append(erroredPaths, r.Path)
+				if firstPartitionErr == nil {
+					firstPartitionErr = r.Error
+				}
+			}
+		}
+		if len(erroredPaths) > 0 {
+			// Close any rows that DID succeed before bailing.
+			for _, r := range results {
+				if r.Rows != nil {
+					r.Rows.Close()
+				}
+			}
+			if cancelTimeout != nil {
+				cancelTimeout()
+			}
+			m.IncQueryErrors()
+			if h.queryRegistry != nil && queryID != "" {
+				if execCtx.Err() == context.DeadlineExceeded {
+					h.queryRegistry.TimedOut(queryID)
+				} else {
+					h.queryRegistry.Fail(queryID, fmt.Sprintf("%d/%d partitions failed: %v",
+						len(erroredPaths), len(results), firstPartitionErr))
+				}
+			}
+			// Sample paths at log level — full list could be hundreds.
+			samplePaths := erroredPaths
+			if len(samplePaths) > 5 {
+				samplePaths = samplePaths[:5]
+			}
+			h.logger.Error().
+				Err(firstPartitionErr).
+				Int("errored_partitions", len(erroredPaths)).
+				Int("total_partitions", len(results)).
+				Strs("sample_paths", samplePaths).
+				Str("sql", req.SQL).
+				Msg("Parallel query: partition error(s) — failing whole request to avoid silent partial result")
+			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
+				Success: false,
+				Error: fmt.Sprintf("parallel query: %d of %d partitions failed (first error: %v)",
+					len(erroredPaths), len(results), firstPartitionErr),
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+				Timestamp:       timestamp,
+			})
+		}
+
 		// Create merged iterator
 		iter, err := query.NewMergedRowIterator(results, h.logger)
 		if err != nil {
@@ -1235,10 +1383,15 @@ localProcessing:
 		// Capture token name before async callback (Fiber context not safe in callbacks)
 		tokenName := getTokenName(c)
 
-		// Stream typed JSON response directly to HTTP — no full-response buffering
+		// Stream typed JSON response directly to HTTP — no full-response buffering.
+		// streamCtx captures the timeout-aware context for per-row cancellation
+		// inside the streaming callback. The callback runs async after this
+		// handler returns; closing over execCtx is fine because cancelTimeout
+		// is fired inside the callback after streaming completes.
+		streamCtx := execCtx
 		c.Set("Content-Type", "application/json")
 		c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
-			rowCount = streamTypedJSON(w, columns, colTypes, iter, governanceMaxRows, profile, start, timestamp)
+			rowCount, streamErr := streamTypedJSON(streamCtx, w, columns, colTypes, iter, governanceMaxRows, profile, start, timestamp)
 			w.Flush()
 
 			iter.Close()
@@ -1246,7 +1399,25 @@ localProcessing:
 				cancelTimeout()
 			}
 
-			// Record metrics after streaming completes
+			// Record metrics after streaming completes. If the stream
+			// terminated mid-flight (Scan / Err / ctx cancel), record as
+			// a failure even though the JSON envelope was already sent —
+			// operators must see the partial-result signal. See C5.
+			if streamErr != nil {
+				m.IncQueryErrors()
+				if h.queryRegistry != nil && queryID != "" {
+					if errors.Is(streamErr, context.DeadlineExceeded) {
+						h.queryRegistry.TimedOut(queryID)
+					} else {
+						h.queryRegistry.Fail(queryID, streamErr.Error())
+					}
+				}
+				h.logger.Error().Err(streamErr).
+					Int("rows_sent", rowCount).
+					Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
+					Msg("Query stream truncated after headers committed; client received partial result")
+				return
+			}
 			if h.queryRegistry != nil && queryID != "" {
 				h.queryRegistry.Complete(queryID, rowCount)
 			}
@@ -1396,10 +1567,13 @@ localProcessing:
 		// Capture token name before async callback (Fiber context not safe in callbacks)
 		tokenName := getTokenName(c)
 
-		// Stream typed JSON response directly to HTTP — no full-response buffering
+		// Stream typed JSON response directly to HTTP — no full-response buffering.
+		// streamCtx captures the timeout-aware context so per-row cancellation
+		// can fire inside the streaming callback. See C5.
+		streamCtx := ctx
 		c.Set("Content-Type", "application/json")
 		c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
-			rowCount = streamTypedJSON(w, columns, colTypes, rows, governanceMaxRows, profile, start, timestamp)
+			rowCount, streamErr := streamTypedJSON(streamCtx, w, columns, colTypes, rows, governanceMaxRows, profile, start, timestamp)
 			w.Flush()
 
 			rows.Close()
@@ -1410,7 +1584,26 @@ localProcessing:
 				cancel()
 			}
 
-			// Record metrics after streaming completes
+			// If the stream terminated mid-flight (Scan / Err / ctx
+			// cancel) record as failure even though the JSON envelope
+			// was already sent — operators must see the partial-result
+			// signal. See review/query-path-criticals C5.
+			if streamErr != nil {
+				m.IncQueryErrors()
+				if h.queryRegistry != nil && queryID != "" {
+					if errors.Is(streamErr, context.DeadlineExceeded) {
+						h.queryRegistry.TimedOut(queryID)
+					} else {
+						h.queryRegistry.Fail(queryID, streamErr.Error())
+					}
+				}
+				h.logger.Error().Err(streamErr).
+					Int("rows_sent", rowCount).
+					Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
+					Msg("Query stream truncated after headers committed; client received partial result")
+				return
+			}
+
 			if h.queryRegistry != nil && queryID != "" {
 				h.queryRegistry.Complete(queryID, rowCount)
 			}
@@ -1448,6 +1641,12 @@ func (e *SQLValidationError) Error() string {
 // ValidateSQLRequest validates an SQL query for common issues.
 // Returns nil if valid, or an error with appropriate message.
 // This is a shared function used by multiple query endpoints.
+//
+// SECURITY: The denylist regex must run on a normalised version of the
+// SQL — comments stripped (so `DROP /* */ TABLE x` does not bypass the
+// `\b...\b` token boundary) and string literals masked (so `SELECT
+// 'DROP TABLE x'` does not false-positive). The cost is one full pass
+// over the SQL; for the 10KB cap that's microseconds.
 func ValidateSQLRequest(sql string) error {
 	if strings.TrimSpace(sql) == "" {
 		return &SQLValidationError{Message: "SQL query is required"}
@@ -1457,21 +1656,37 @@ func ValidateSQLRequest(sql string) error {
 		return &SQLValidationError{Message: "SQL query exceeds maximum length (10000 characters)"}
 	}
 
-	// Check for dangerous SQL patterns (single-pass combined regex)
-	if dangerousSQLPattern.MatchString(sql) {
+	// Normalise before denylist check: mask string literals so keywords
+	// inside literals don't false-positive, then strip comments so
+	// keywords interleaved with comments don't slip past token
+	// boundaries (`DROP /* */ TABLE x`).
+	features := scanSQLFeatures(sql)
+	normalised, _ := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
+	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
+
+	if dangerousSQLPattern.MatchString(normalised) {
 		return &SQLValidationError{Message: "Dangerous SQL operation not allowed"}
 	}
 
+	// SECURITY: reject user SQL that calls read_parquet() directly.
+	// Only Arc's transformation layer (convertSQLToStoragePaths and
+	// related) emits read_parquet — any occurrence in user input is a
+	// RBAC bypass vector: a user scoped to db1.m1 could read
+	// /data/db2/secrets/**/*.parquet by routing around the table-name
+	// → path mapping that RBAC depends on. See review/query-path-
+	// criticals C3.
+	if userSQLReadParquetPattern.MatchString(normalised) {
+		return &SQLValidationError{Message: "Direct read_parquet() calls are not allowed in user SQL"}
+	}
+
 	return nil
 }
 
-// validateSQL checks for dangerous SQL patterns
-func (h *QueryHandler) validateSQL(sql string) error {
-	if dangerousSQLPattern.MatchString(sql) {
-		return fiber.NewError(fiber.StatusBadRequest, "Dangerous SQL operation not allowed")
-	}
-	return nil
-}
+// userSQLReadParquetPattern matches `read_parquet(` as a function call
+// (case-insensitive, allowing whitespace before the open paren). Only
+// runs against masked/comment-stripped SQL so a literal containing
+// "read_parquet" or a comment is fine.
+var userSQLReadParquetPattern = regexp.MustCompile(`(?i)\bread_parquet\s*\(`)
 
 // getTransformedSQL returns the transformed SQL with caching.
 // If headerDB is non-empty, uses the optimized path with that database for all tables.
@@ -1693,6 +1908,17 @@ func (h *QueryHandler) getStoragePath(database, table string) string {
 	return storage.GetStoragePath(h.storage, database, table)
 }
 
+// quotePath returns a safe single-quoted DuckDB string literal for use
+// inside read_parquet('PATH', ...) interpolations. Single quotes inside
+// the path are doubled per DuckDB's literal-escape rule. This is the
+// single source of truth for path interpolation in the query layer —
+// every `read_parquet('` site goes through this helper to close the
+// SQL-injection vector via the x-arc-database header / measurement
+// names / manifest entries (review/query-path-criticals C2).
+func quotePath(path string) string {
+	return "'" + sqlutil.EscapeStringLiteral(path) + "'"
+}
+
 // buildReadParquetOptions builds the read_parquet options string.
 // Returns options like "union_by_name=true"
 // Note: column pruning via 'columns' parameter is not supported in current DuckDB version.
@@ -1754,20 +1980,18 @@ func (h *QueryHandler) buildReadParquetExpr(path, originalSQL, keyword string) s
 				if i > 0 {
 					pathsStr.WriteString(", ")
 				}
-				pathsStr.WriteString("'")
-				pathsStr.WriteString(p)
-				pathsStr.WriteString("'")
+				pathsStr.WriteString(quotePath(p))
 			}
 			pathsStr.WriteString("]")
 			h.logger.Info().Int("partition_count", len(pathList)).Str("keyword", keyword).Msg("Partition pruning: Using targeted paths")
 			return keyword + " read_parquet(" + pathsStr.String() + ", " + options + ")"
 		} else if pathStr, ok := optimizedPath.(string); ok {
 			h.logger.Info().Str("optimized_path", pathStr).Str("keyword", keyword).Msg("Partition pruning: Using optimized path")
-			return keyword + " read_parquet('" + pathStr + "', " + options + ")"
+			return keyword + " read_parquet(" + quotePath(pathStr) + ", " + options + ")"
 		}
 	}
 
-	return keyword + " read_parquet('" + path + "', " + options + ")"
+	return keyword + " read_parquet(" + quotePath(path) + ", " + options + ")"
 }
 
 // buildReadParquetExprForMeasurement builds a read_parquet expression for a database/measurement pair.
@@ -1829,20 +2053,18 @@ func (h *QueryHandler) buildReadParquetExprForParallel(path, originalSQL, keywor
 				if i > 0 {
 					pathsStr.WriteString(", ")
 				}
-				pathsStr.WriteString("'")
-				pathsStr.WriteString(p)
-				pathsStr.WriteString("'")
+				pathsStr.WriteString(quotePath(p))
 			}
 			pathsStr.WriteString("]")
 			h.logger.Info().Int("partition_count", len(pathList)).Str("keyword", keyword).Msg("Partition pruning: Using targeted paths")
 			return keyword + " read_parquet(" + pathsStr.String() + ", " + options + ")", nil
 		} else if pathStr, ok := optimizedPath.(string); ok {
 			h.logger.Info().Str("optimized_path", pathStr).Str("keyword", keyword).Msg("Partition pruning: Using optimized path")
-			return keyword + " read_parquet('" + pathStr + "', " + options + ")", nil
+			return keyword + " read_parquet(" + quotePath(pathStr) + ", " + options + ")", nil
 		}
 	}
 
-	return keyword + " read_parquet('" + path + "', " + options + ")", nil
+	return keyword + " read_parquet(" + quotePath(path) + ", " + options + ")", nil
 }
 
 // shouldSkipTableConversion returns true if the table name should not be converted to a storage path
@@ -1931,7 +2153,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(database, measurement string, t
 			Str("measurement", measurement).
 			Msg("Failed to query tier metadata, falling back to hot tier only")
 		// Fall back to hot tier only on error
-		return keyword + fmt.Sprintf(" read_parquet('%s', %s)", h.getStoragePath(database, measurement), options)
+		return keyword + " read_parquet(" + quotePath(h.getStoragePath(database, measurement)) + ", " + options + ")"
 	}
 
 	// If no metadata found, fall back to hot tier (data might not be registered yet)
@@ -1940,7 +2162,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(database, measurement string, t
 			Str("database", database).
 			Str("measurement", measurement).
 			Msg("No tier metadata found, using hot tier")
-		return keyword + fmt.Sprintf(" read_parquet('%s', %s)", h.getStoragePath(database, measurement), options)
+		return keyword + " read_parquet(" + quotePath(h.getStoragePath(database, measurement)) + ", " + options + ")"
 	}
 
 	// Collect paths only for tiers that actually have data
@@ -1981,7 +2203,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(database, measurement string, t
 			Str("measurement", measurement).
 			Str("path", paths[0]).
 			Msg("Single-tier query")
-		return keyword + fmt.Sprintf(" read_parquet('%s', %s)", paths[0], options)
+		return keyword + " read_parquet(" + quotePath(paths[0]) + ", " + options + ")"
 	}
 
 	// Multiple tiers: use read_parquet with a list of paths
@@ -1999,9 +2221,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(database, measurement string, t
 		if i > 0 {
 			pathList.WriteString(", ")
 		}
-		pathList.WriteString("'")
-		pathList.WriteString(p)
-		pathList.WriteString("'")
+		pathList.WriteString(quotePath(p))
 	}
 	pathList.WriteString("]")
 
@@ -2660,6 +2880,13 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 
 	// Extract x-arc-database header for optimized query path
 	headerDB := c.Get("x-arc-database")
+	if err := validateHeaderDatabase(headerDB); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(EstimateResponse{
+			Success:      false,
+			Error:        "invalid x-arc-database header: " + err.Error(),
+			WarningLevel: "error",
+		})
+	}
 
 	// Convert SQL to storage paths (with caching)
 	convertedSQL, _ := h.getTransformedSQL(req.SQL, headerDB)
@@ -3054,13 +3281,27 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	// Capture token name before async callback (Fiber context not safe in callbacks)
 	tokenName := getTokenName(c)
 
-	// Stream typed JSON response directly to HTTP
+	// Stream typed JSON response directly to HTTP. Use c.UserContext()
+	// so client disconnects propagate to per-row cancellation — fasthttp
+	// keeps c.Context() alive across the SetBodyStreamWriter boundary,
+	// per gemini r1. queryMeasurement has no server-side timeout today
+	// (#308 follow-up); when #308 adds one, derive from this ctx.
+	streamCtx := c.UserContext()
 	c.Set("Content-Type", "application/json")
 	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
-		rowCount := streamTypedJSON(w, columns, colTypes, rows, 0, nil, start, timestamp)
+		rowCount, streamErr := streamTypedJSON(streamCtx, w, columns, colTypes, rows, 0, nil, start, timestamp)
 		w.Flush()
 
 		rows.Close()
+
+		if streamErr != nil {
+			m.IncQueryErrors()
+			h.logger.Error().Err(streamErr).
+				Str("measurement", measurement).
+				Int("rows_sent", rowCount).
+				Msg("queryMeasurement stream truncated after headers committed")
+			return
+		}
 
 		// Record success metrics
 		m.IncQuerySuccess()

@@ -5,6 +5,7 @@ package api
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
@@ -93,7 +94,7 @@ func arrowStreamToBytes(
 	var buf bytes.Buffer
 	w := bufio.NewWriter(&buf)
 	start := time.Now()
-	rowCount := streamArrowJSON(w, reader, governanceMaxRows, profile, start, "2024-01-15T12:00:00Z")
+	rowCount, _ := streamArrowJSON(context.Background(), w, reader, governanceMaxRows, profile, start, "2024-01-15T12:00:00Z")
 	w.Flush()
 	return buf.Bytes(), rowCount
 }

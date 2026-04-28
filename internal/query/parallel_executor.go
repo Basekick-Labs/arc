@@ -94,27 +94,44 @@ func (e *ParallelExecutor) ExecutePartitioned(
 		sem = make(chan struct{}, e.config.MaxConcurrentPartitions)
 	}
 
-	// Execute partition queries in parallel
+	// Execute partition queries in parallel.
+	//
+	// CRITICAL: acquire the semaphore in the LAUNCH loop, not inside each
+	// spawned goroutine. The previous shape (`for path { wg.Add(1); go
+	// func() { sem <- struct{}{} ...` ) spawned one goroutine per path
+	// up-front — for a 10K-path query that's 10K goroutines parked on
+	// a 4-slot semaphore. The launch loop now blocks on the semaphore
+	// itself, so concurrent in-flight goroutines are bounded by
+	// MaxConcurrentPartitions regardless of paths length. See
+	// review/query-path-criticals C4 (parallel-executor fan-out DoS).
 	results := make([]*PartitionResult, len(paths))
 	var wg sync.WaitGroup
 
+LaunchLoop:
 	for i, path := range paths {
+		// Acquire semaphore in the launch loop. ctx-cancellation
+		// observed here aborts before more goroutines are spawned.
+		if sem != nil {
+			select {
+			case sem <- struct{}{}:
+				// acquired — fall through to launch
+			case <-ctx.Done():
+				// Mark this and all remaining paths as cancelled.
+				for j := i; j < len(paths); j++ {
+					results[j] = &PartitionResult{
+						Error: ctx.Err(),
+						Path:  paths[j],
+					}
+				}
+				break LaunchLoop
+			}
+		}
+
 		wg.Add(1)
 		go func(idx int, partitionPath string) {
 			defer wg.Done()
-
-			// Acquire semaphore
 			if sem != nil {
-				select {
-				case sem <- struct{}{}:
-					defer func() { <-sem }()
-				case <-ctx.Done():
-					results[idx] = &PartitionResult{
-						Error: ctx.Err(),
-						Path:  partitionPath,
-					}
-					return
-				}
+				defer func() { <-sem }()
 			}
 
 			// Build partition-specific query

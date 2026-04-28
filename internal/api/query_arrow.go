@@ -50,6 +50,13 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 
 	// Extract x-arc-database header for optimized query path
 	headerDB := c.Get("x-arc-database")
+	if err := validateHeaderDatabase(headerDB); err != nil {
+		m.IncQueryErrors()
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   "invalid x-arc-database header: " + err.Error(),
+		})
+	}
 
 	// If header is set, reject cross-database syntax (db.table not allowed)
 	if headerDB != "" && hasCrossDatabaseSyntax(req.SQL) {
@@ -125,29 +132,59 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 
 	c.Set("Content-Type", "application/vnd.apache.arrow.stream")
 
+	streamCtx := ctx
 	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
 		ipcWriter := ipc.NewWriter(w, ipc.WithSchema(schema))
 
 		var totalRows int64
+	streamLoop:
 		for reader.Next() {
+			// Per-batch ctx check: a timeout firing or client disconnect
+			// must short-circuit instead of draining DuckDB into a
+			// buffer the client is no longer reading. See review/
+			// query-path-criticals C5. Non-blocking select with labeled
+			// break is the idiomatic Go cancellation pattern (gemini r1).
+			select {
+			case <-streamCtx.Done():
+				h.logger.Warn().
+					Err(streamCtx.Err()).
+					Int64("rows_sent", totalRows).
+					Msg("Arrow IPC stream cancelled mid-stream")
+				break streamLoop
+			default:
+			}
+
 			batch := reader.Record()
 			if batch == nil {
 				break
 			}
 			totalRows += batch.NumRows()
 
+			// CRITICAL: when castInfo!=nil we replace `batch` with a new
+			// arrow.Record that we own and must Release before the next
+			// iteration. The previous code used `defer batch.Release()`
+			// inside the loop, which holds every casted batch alive
+			// until the closure exits — pinning all Arrow buffers and
+			// defeating the streaming contract. Explicit release after
+			// Write is the right pattern for per-iteration ownership.
+			// The original reader.Record() does NOT need releasing here:
+			// reader.Next() releases the prior record automatically.
+			var castedBatch arrow.Record
 			if castInfo != nil {
 				var castErr error
-				batch, castErr = castDecimalBatch(batch, castInfo)
+				castedBatch, castErr = castDecimalBatch(batch, castInfo)
 				if castErr != nil {
 					h.logger.Error().Err(castErr).Msg("Failed to cast decimal columns in Arrow batch")
-					batch.Release()
 					break
 				}
-				defer batch.Release()
+				batch = castedBatch
 			}
 
-			if err := ipcWriter.Write(batch); err != nil {
+			err := ipcWriter.Write(batch)
+			if castedBatch != nil {
+				castedBatch.Release()
+			}
+			if err != nil {
 				h.logger.Error().Err(err).Msg("Failed to write Arrow batch")
 				break
 			}

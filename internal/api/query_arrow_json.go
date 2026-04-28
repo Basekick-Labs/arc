@@ -6,6 +6,8 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"math"
 	"strconv"
 	"strings"
@@ -131,15 +133,33 @@ func executeArrowJSONQuery(
 
 	// Stream Arrow JSON response.
 	// SetBodyStreamWriter runs asynchronously — metrics are recorded in the callback.
+	streamCtx := ctx
 	c.Set("Content-Type", "application/json")
 	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
-		rc := streamArrowJSON(w, reader, governanceMaxRows, profile, start, timestamp)
+		rc, streamErr := streamArrowJSON(streamCtx, w, reader, governanceMaxRows, profile, start, timestamp)
 		w.Flush()
 
 		reader.Release()
 		conn.Close()
 		if cancel != nil {
 			cancel()
+		}
+
+		if streamErr != nil {
+			m.IncQueryErrors()
+			if errors.Is(streamErr, context.DeadlineExceeded) {
+				m.IncQueryTimeouts()
+				if onTimeout != nil {
+					onTimeout()
+				}
+			} else if onFail != nil {
+				onFail(streamErr.Error())
+			}
+			h.logger.Error().Err(streamErr).
+				Int("rows_sent", rc).
+				Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
+				Msg("Arrow JSON stream truncated after headers committed; client received partial result")
+			return
 		}
 
 		m.IncQuerySuccess()
@@ -165,15 +185,27 @@ func executeArrowJSONQuery(
 // streamArrowJSON writes a complete JSON query response from Arrow record
 // batches directly to a bufio.Writer. Values are read from typed Arrow column
 // arrays — no interface{} boxing, no Scan overhead.
-// Returns the number of rows written.
+//
+// Returns (rowsWritten, err). Errors that may occur after the response
+// envelope has been opened cannot retroactively change the HTTP status —
+// but the caller MUST surface them so operators see the partial-result
+// signal instead of recording Complete(rowCount). See review/query-path-
+// criticals C5.
+//
+// Returned error sources:
+//   - ctx cancellation observed at a batch boundary (timeout / client-
+//     disconnect mid-stream).
+//   - reader.Err() after the batch loop exits — Arrow IPC reader
+//     surfaces deferred read failures here.
 func streamArrowJSON(
+	ctx context.Context,
 	w *bufio.Writer,
 	reader array.RecordReader,
 	governanceMaxRows int,
 	profile *database.QueryProfile,
 	start time.Time,
 	timestamp string,
-) int {
+) (int, error) {
 	schema := reader.Schema()
 	fields := schema.Fields()
 	numCols := len(fields)
@@ -191,8 +223,21 @@ func streamArrowJSON(
 	w.WriteString(`,"data":[`)
 
 	rowCount := 0
+	var streamErr error
 
+batchLoop:
 	for reader.Next() {
+		// Per-batch ctx check: a timeout firing or client disconnect
+		// must short-circuit instead of draining DuckDB into a buffer
+		// nobody reads. Non-blocking select with labeled break is the
+		// idiomatic Go cancellation pattern (gemini r1).
+		select {
+		case <-ctx.Done():
+			streamErr = fmt.Errorf("stream cancelled at row %d: %w", rowCount, ctx.Err())
+			break batchLoop
+		default:
+		}
+
 		batch := reader.Record()
 		if batch == nil {
 			break
@@ -230,8 +275,16 @@ func streamArrowJSON(
 		}
 	}
 
+	if streamErr == nil {
+		if err := reader.Err(); err != nil {
+			streamErr = fmt.Errorf("arrow reader error after %d rows: %w", rowCount, err)
+		}
+	}
+
 done:
 	// --- Write envelope close ---
+	// Emit a valid JSON document regardless of whether streamErr is set
+	// (headers are already committed). Caller logs/metrics the error.
 	w.WriteString(`],"row_count":`)
 	scratch = strconv.AppendInt(scratch[:0], int64(rowCount), 10)
 	w.Write(scratch)
@@ -255,7 +308,7 @@ done:
 
 	w.WriteByte('}')
 
-	return rowCount
+	return rowCount, streamErr
 }
 
 // writeArrowValue writes a single value from a typed Arrow column array.
