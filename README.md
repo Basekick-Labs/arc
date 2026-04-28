@@ -92,10 +92,10 @@ Test config: 12 concurrent workers, 1000-record batches, columnar data.
 
 | Protocol | Throughput | p50 Latency | p99 Latency |
 |----------|------------|-------------|-------------|
-| MessagePack Columnar | **19.0M rec/s** | 0.46ms | 3.13ms |
-| MessagePack + Zstd | 16.8M rec/s | 0.55ms | 3.23ms |
-| MessagePack + GZIP | 15.4M rec/s | 0.63ms | 3.17ms |
-| Line Protocol | 3.7M rec/s | 2.63ms | 10.63ms |
+| MessagePack Columnar | **19.9M rec/s** | 0.43ms | 2.95ms |
+| MessagePack + Zstd | 16.5M rec/s | 0.60ms | 2.70ms |
+| MessagePack + GZIP | 16.5M rec/s | 0.60ms | 2.71ms |
+| Line Protocol | 4.1M rec/s | 2.41ms | 8.85ms |
 
 ### Compaction
 

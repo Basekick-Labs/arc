@@ -1707,7 +1707,7 @@ func worker(id int, cfg *Config, batches [][]byte, stats *Stats, client *http.Cl
 	}
 
 	if cfg.Protocol == "lineprotocol" {
-		url = fmt.Sprintf("%s://%s:%d/api/v1/write", scheme, cfg.Host, cfg.Port)
+		url = fmt.Sprintf("%s://%s:%d/api/v1/write/line-protocol", scheme, cfg.Host, cfg.Port)
 		contentType = "text/plain"
 	} else {
 		url = fmt.Sprintf("%s://%s:%d/api/v1/write/msgpack", scheme, cfg.Host, cfg.Port)
@@ -1826,7 +1826,7 @@ func main() {
 	endpoint := "/api/v1/write/msgpack"
 	if cfg.Protocol == "lineprotocol" {
 		protocolLabel = "Line Protocol"
-		endpoint = "/api/v1/write"
+		endpoint = "/api/v1/write/line-protocol"
 	}
 
 	fmt.Println("================================================================================")
