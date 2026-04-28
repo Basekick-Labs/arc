@@ -118,19 +118,20 @@ localProcessing:
 	// the process before our handler-level size check fires. The
 	// msgpack handler uses the same pattern; we now mirror it for TLE.
 	//
-	// Defensive copy: see lineprotocol.go for full rationale. The TLE
-	// parser produces fresh strings today, but a defensive copy at the
-	// boundary closes the silent-aliasing footgun if anyone ever adds a
-	// fast-path that retains a sub-slice of the request body.
-	body := append([]byte(nil), c.Request().Body()...)
-	originalSize := len(body)
+	// Defensive copy lives only in the uncompressed branch — see
+	// lineprotocol.go for full rationale. The decompression branches
+	// already return fresh slices, so doubling the memory by copying
+	// the compressed input first is wasteful for large TLE catalog
+	// refreshes.
+	rawBody := c.Request().Body()
+	originalSize := len(rawBody)
 	h.totalBytes.Add(int64(originalSize))
 
-	// Check for gzip compression (magic number: 0x1f 0x8b).
-	// decompressGzipPooled applies a hard decompressed-size cap so an
-	// adversarial gzip bomb is rejected before allocation.
-	if len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b {
-		decompressed, err := decompressGzipPooled(body, 0)
+	var body []byte
+	switch {
+	case len(rawBody) >= 2 && rawBody[0] == 0x1f && rawBody[1] == 0x8b:
+		// gzip — pooled, hard decompressed-size cap (100MB).
+		decompressed, err := decompressGzipPooled(rawBody, 0)
 		if err != nil {
 			h.totalErrors.Add(1)
 			h.logger.Error().Err(err).Msg("Failed to decompress gzip data")
@@ -139,10 +140,10 @@ localProcessing:
 			})
 		}
 		body = decompressed
-	} else if len(body) >= 4 && body[0] == 0x28 && body[1] == 0xB5 && body[2] == 0x2F && body[3] == 0xFD {
-		// zstd magic number — mirrors the LP and msgpack handlers so
-		// satellite-fleet senders can use the faster codec on TLE too.
-		decompressed, err := decompressZstdPooled(body, 0)
+
+	case len(rawBody) >= 4 && rawBody[0] == 0x28 && rawBody[1] == 0xB5 && rawBody[2] == 0x2F && rawBody[3] == 0xFD:
+		// zstd — same 100MB cap, mirrors LP and msgpack handlers.
+		decompressed, err := decompressZstdPooled(rawBody, 0)
 		if err != nil {
 			h.totalErrors.Add(1)
 			h.logger.Error().Err(err).Msg("Failed to decompress zstd data")
@@ -151,6 +152,10 @@ localProcessing:
 			})
 		}
 		body = decompressed
+
+	default:
+		// Uncompressed — defensive copy out of fasthttp-owned buffer.
+		body = append([]byte(nil), rawBody...)
 	}
 
 	if len(body) == 0 {

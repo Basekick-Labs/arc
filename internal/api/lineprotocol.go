@@ -213,25 +213,26 @@ localProcessing:
 	// the process before our handler-level size check fires. The
 	// msgpack handler uses the same pattern; we now mirror it for LP.
 	//
-	// Defensive copy of the raw fasthttp body: c.Request().Body() returns
-	// a slice owned by fasthttp and reused after the handler returns.
-	// The current parser path produces fresh strings (no aliasing into
-	// the byte slice), so today's behavior is safe — but documenting that
-	// "no future change may retain a sub-slice of body" is brittle. One
-	// memcpy at the boundary is dwarfed by per-record allocations and
-	// closes the silent-aliasing footgun gemini flagged on PR #413.
-	// The decompression branches below already return fresh slices.
-	body := append([]byte(nil), c.Request().Body()...)
-	originalSize := len(body)
+	// rawBody is owned by fasthttp and reused after this handler
+	// returns. The decompression branches return fresh slices (decoded
+	// into a pooled buffer and then copied out), so they need no
+	// defensive copy. The uncompressed branch DOES need a defensive
+	// copy: the LP parser produces fresh strings today, but documenting
+	// "no future change may retain a sub-slice of body" is brittle, and
+	// the silent-aliasing footgun is real (gemini round 2 finding).
+	// One memcpy on the uncompressed path is the right cost; doubling
+	// the memory of large compressed payloads is not (gemini round 3).
+	rawBody := c.Request().Body()
+	originalSize := len(rawBody)
 	h.totalBytes.Add(int64(originalSize))
 
-	// Check for gzip compression (magic number: 0x1f 0x8b).
-	// decompressGzip applies a hard 100MB decompressed cap so an
-	// adversarial gzip bomb is rejected before allocation.
-	if len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b {
+	var body []byte
+	switch {
+	case len(rawBody) >= 2 && rawBody[0] == 0x1f && rawBody[1] == 0x8b:
+		// gzip — decompressGzip applies a hard 100MB decompressed cap so
+		// an adversarial gzip bomb is rejected before allocation.
 		h.totalBytesGzipped.Add(int64(originalSize))
-
-		decompressed, err := h.decompressGzip(body)
+		decompressed, err := h.decompressGzip(rawBody)
 		if err != nil {
 			h.totalErrors.Add(1)
 			h.logger.Error().Err(err).Msg("Failed to decompress gzip data")
@@ -239,14 +240,13 @@ localProcessing:
 				"error": "Failed to decompress gzip data: " + err.Error(),
 			})
 		}
-
 		body = decompressed
-	} else if len(body) >= 4 && body[0] == 0x28 && body[1] == 0xB5 && body[2] == 0x2F && body[3] == 0xFD {
+
+	case len(rawBody) >= 4 && rawBody[0] == 0x28 && rawBody[1] == 0xB5 && rawBody[2] == 0x2F && rawBody[3] == 0xFD:
 		// zstd magic number 0x28 0xB5 0x2F 0xFD — same 100MB cap as gzip,
 		// pooled decoder reused via the package-level zstdDecoderPool.
 		h.totalBytesGzipped.Add(int64(originalSize))
-
-		decompressed, err := decompressZstdPooled(body, 0)
+		decompressed, err := decompressZstdPooled(rawBody, 0)
 		if err != nil {
 			h.totalErrors.Add(1)
 			h.logger.Error().Err(err).Msg("Failed to decompress zstd data")
@@ -254,8 +254,14 @@ localProcessing:
 				"error": "Failed to decompress zstd data: " + err.Error(),
 			})
 		}
-
 		body = decompressed
+
+	default:
+		// Uncompressed payload — defensive copy out of the fasthttp-owned
+		// buffer so anything downstream that retains a sub-slice (today
+		// nothing does, but the contract is undocumented) stays valid
+		// after the handler returns.
+		body = append([]byte(nil), rawBody...)
 	}
 
 	// Check for empty body

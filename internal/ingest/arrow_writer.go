@@ -1456,8 +1456,12 @@ var ErrSchemaChurnExceeded = errors.New("schema-evolution loop exceeded max iter
 //      state — single iteration).
 //   2. ctx is cancelled — return ctx.Err() so the caller can abort the
 //      write entirely.
-//   3. schemaEvolutionMaxIters is reached — return nil (best-effort);
-//      the next flush will correct any column mismatch.
+//   3. schemaEvolutionMaxIters is reached — return ErrSchemaChurnExceeded
+//      so the caller can reject the write with a retryable status (HTTP
+//      503). The per-iteration flushes inside the loop already wrote
+//      older schemas' rows to durable Parquet, so there is no data loss —
+//      only the current request fails under sustained schema-rotation
+//      churn.
 //
 // flushBufferLocked is called inside the loop; it releases-and-
 // reacquires shard.mu around its I/O. On flush error the buffer
