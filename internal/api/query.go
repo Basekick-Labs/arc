@@ -565,10 +565,18 @@ var dangerousSQLPattern = regexp.MustCompile(`(?i)(?:` +
 	`|\bEXPORT\s+DATABASE\b` +
 	`|\bIMPORT\s+DATABASE\b` +
 	`|\bPRAGMA\b` +
-	`|\bSET\s+(?:GLOBAL\s+|SESSION\s+|LOCAL\s+)?\w+\s*=` +
+	// SET / RESET match the bare keyword (any session-state mutation
+	// is forbidden in the read-only API). The previous "\s+\w+\s*=" form
+	// was bypassable via DuckDB's `SET x TO 1`, `SET VARIABLE x = 1`,
+	// and `RESET x` syntax — gemini round 1.
+	`|\bSET\b` +
+	`|\bRESET\b` +
 	`|\bLOAD\b` +
 	`|\bINSTALL\b` +
-	`|\bCALL\s+\w+` +
+	// CALL matches the bare keyword. The previous "\s+\w+" form was
+	// bypassable via `CALL(proc)` (no whitespace before paren) — gemini
+	// round 1.
+	`|\bCALL\b` +
 	`)`)
 
 // Patterns for SQL injection prevention in queryMeasurement endpoint
@@ -3273,11 +3281,12 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	// Capture token name before async callback (Fiber context not safe in callbacks)
 	tokenName := getTokenName(c)
 
-	// Stream typed JSON response directly to HTTP. queryMeasurement has
-	// no timeout-bound ctx today (#308 follow-up); use background ctx
-	// so per-row ctx checks at least don't fire spuriously. When #308
-	// adds a timeout, plumb that ctx in here.
-	streamCtx := context.Background()
+	// Stream typed JSON response directly to HTTP. Use c.UserContext()
+	// so client disconnects propagate to per-row cancellation — fasthttp
+	// keeps c.Context() alive across the SetBodyStreamWriter boundary,
+	// per gemini r1. queryMeasurement has no server-side timeout today
+	// (#308 follow-up); when #308 adds one, derive from this ctx.
+	streamCtx := c.UserContext()
 	c.Set("Content-Type", "application/json")
 	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
 		rowCount, streamErr := streamTypedJSON(streamCtx, w, columns, colTypes, rows, 0, nil, start, timestamp)

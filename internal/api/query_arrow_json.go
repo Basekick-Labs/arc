@@ -225,13 +225,17 @@ func streamArrowJSON(
 	rowCount := 0
 	var streamErr error
 
+batchLoop:
 	for reader.Next() {
 		// Per-batch ctx check: a timeout firing or client disconnect
 		// must short-circuit instead of draining DuckDB into a buffer
-		// nobody reads.
-		if err := ctx.Err(); err != nil {
-			streamErr = fmt.Errorf("stream cancelled at row %d: %w", rowCount, err)
-			break
+		// nobody reads. Non-blocking select with labeled break is the
+		// idiomatic Go cancellation pattern (gemini r1).
+		select {
+		case <-ctx.Done():
+			streamErr = fmt.Errorf("stream cancelled at row %d: %w", rowCount, ctx.Err())
+			break batchLoop
+		default:
 		}
 
 		batch := reader.Record()

@@ -137,17 +137,21 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		ipcWriter := ipc.NewWriter(w, ipc.WithSchema(schema))
 
 		var totalRows int64
+	streamLoop:
 		for reader.Next() {
 			// Per-batch ctx check: a timeout firing or client disconnect
 			// must short-circuit instead of draining DuckDB into a
 			// buffer the client is no longer reading. See review/
-			// query-path-criticals C5.
-			if streamCtx.Err() != nil {
+			// query-path-criticals C5. Non-blocking select with labeled
+			// break is the idiomatic Go cancellation pattern (gemini r1).
+			select {
+			case <-streamCtx.Done():
 				h.logger.Warn().
 					Err(streamCtx.Err()).
 					Int64("rows_sent", totalRows).
 					Msg("Arrow IPC stream cancelled mid-stream")
-				break
+				break streamLoop
+			default:
 			}
 
 			batch := reader.Record()

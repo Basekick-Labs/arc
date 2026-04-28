@@ -125,13 +125,18 @@ func streamTypedJSON(
 	rowCount := 0
 	var streamErr error
 
+scanLoop:
 	for scanner.Next() {
 		// Per-row ctx check: a timeout firing mid-stream must short-
 		// circuit instead of being silently absorbed by the next
 		// Scan/Err round (which the prior code did via `continue`).
-		if err := ctx.Err(); err != nil {
-			streamErr = fmt.Errorf("stream cancelled at row %d: %w", rowCount, err)
-			break
+		// Non-blocking select with labeled break is the idiomatic Go
+		// cancellation pattern (gemini r1).
+		select {
+		case <-ctx.Done():
+			streamErr = fmt.Errorf("stream cancelled at row %d: %w", rowCount, ctx.Err())
+			break scanLoop
+		default:
 		}
 
 		if err := scanner.Scan(valuePtrs...); err != nil {
