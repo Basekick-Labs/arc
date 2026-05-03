@@ -472,7 +472,7 @@ func (m *SubscriptionManager) GetAllStats(ctx context.Context) ([]*SubscriptionS
 
 	stats := make([]*SubscriptionStats, 0, len(subscriptions))
 	for _, sub := range subscriptions {
-		if subscriber, ok := m.subscribers[sub.ID]; ok {
+		if subscriber, ok := m.subscribers[sub.ID]; ok && subscriber != nil {
 			stats = append(stats, subscriber.GetStats())
 		} else {
 			stats = append(stats, &SubscriptionStats{
