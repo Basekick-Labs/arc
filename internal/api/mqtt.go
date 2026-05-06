@@ -97,6 +97,12 @@ func (h *MQTTHandler) handleHealth(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 			"status":  "disabled",
 			"healthy": false,
+			"subscriptions": fiber.Map{
+				"total":   0,
+				"running": 0,
+				"stopped": 0,
+				"errors":  0,
+			},
 		})
 	}
 	stats, err := h.manager.GetAllStats(c.Context())
