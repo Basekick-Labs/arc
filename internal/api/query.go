@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -478,6 +479,21 @@ type QueryHandler struct {
 	// Cluster routing support
 	router *cluster.Router
 
+	// Cluster catch-up gating (#392). nil/false in OSS / standalone — gate is
+	// a no-op. The interface keeps the gate testable without a real
+	// coordinator stack.
+	coordinator        replicationReadiness
+	queryGateOnCatchup bool
+
+	// gate503LogLastNano rate-limits the "gate fired" Warn to at most one per
+	// second under sustained 503 storms. Without sampling a high-RPS catch-up
+	// would flood operator logs.
+	gate503LogLastNano atomic.Int64
+	// gate503Total counts every gated 503 since startup. Exposed via the
+	// query handler's Stats endpoint and as a Prometheus counter so operators
+	// can alert on a non-zero rate without inferring from HTTP error logs.
+	gate503Total atomic.Int64
+
 	// Tiering support for multi-tier query routing (hot/cold)
 	tieringManager *tiering.Manager
 
@@ -764,6 +780,102 @@ func (h *QueryHandler) SetRouter(router *cluster.Router) {
 	h.router = router
 }
 
+// replicationReadiness is the subset of cluster.Coordinator the query gate
+// consumes. Defining the interface here (rather than depending on the
+// concrete *cluster.Coordinator) keeps the gate independently testable —
+// query_gate_test.go injects a fake without spinning up a real coordinator.
+// The concrete *cluster.Coordinator satisfies this interface implicitly.
+type replicationReadiness interface {
+	ReplicationReady() bool
+	ReplicationCatchUpStatus() map[string]int64
+}
+
+// SetCluster wires the cluster coordinator and the query-gate-on-catchup
+// behavior flag into the query handler. Consulted by checkReplicationReady
+// to short-circuit queries with 503 while peer file replication is still
+// draining (#392). Both arguments are optional — nil coordinator OR
+// gate=false makes the gate a no-op.
+//
+// SetCluster must be called before RegisterRoutes; the fields are read
+// lock-free per request and not safe for concurrent re-wiring.
+//
+// The explicit nil branch protects against the typed-nil interface trap:
+// assigning a nil *cluster.Coordinator to an interface field yields a
+// non-nil interface that panics on method call. The current caller in
+// main.go is gated on clusterCoordinator != nil so the branch is dead
+// today, but we keep it so a future caller passing nil literally can't
+// break the gate.
+func (h *QueryHandler) SetCluster(coordinator *cluster.Coordinator, queryGateOnCatchup bool) {
+	if coordinator == nil {
+		h.coordinator = nil
+	} else {
+		h.coordinator = coordinator
+	}
+	h.queryGateOnCatchup = queryGateOnCatchup
+}
+
+// gate503RetryAfterSeconds is the Retry-After header value returned with
+// 503s from the catch-up gate. Conservative; load balancers honor this
+// automatically and well-behaved clients back off before retrying.
+const gate503RetryAfterSeconds = "5"
+
+// gate503LogIntervalNanos rate-limits the "gate fired" Warn to one per
+// second to prevent log floods during sustained catch-up.
+const gate503LogIntervalNanos = int64(time.Second)
+
+// checkReplicationReady is Fiber middleware that short-circuits user-facing
+// read endpoints with 503 when peer file replication is still draining and
+// the operator has opted into the gate via cluster.query_gate_on_catchup.
+//
+// Returns c.Next() (no-op pass-through) when:
+//   - the gate is disabled (queryGateOnCatchup=false), OR
+//   - the coordinator is nil (OSS / standalone), OR
+//   - Coordinator.ReplicationReady() reports the puller is fully drained.
+//
+// Returns 503 with a structured body and Retry-After header otherwise. The
+// body includes the puller's catch-up status so clients can implement
+// bounded retry without scraping logs or polling /api/v1/cluster separately.
+// Each gated 503 increments gate503Total and emits at most one sampled Warn
+// per second so operators can alert on a non-zero rate. See #392.
+func (h *QueryHandler) checkReplicationReady(c *fiber.Ctx) error {
+	if !h.queryGateOnCatchup || h.coordinator == nil {
+		return c.Next()
+	}
+	if h.coordinator.ReplicationReady() {
+		return c.Next()
+	}
+
+	// Track + log the gate fire.
+	total := h.gate503Total.Add(1)
+	now := time.Now().UnixNano()
+	last := h.gate503LogLastNano.Load()
+	if now-last >= gate503LogIntervalNanos && h.gate503LogLastNano.CompareAndSwap(last, now) {
+		h.logger.Warn().
+			Int64("gate_503_total", total).
+			Str("path", c.Path()).
+			Msg("Query gate fired: peer replication still draining (sampled at 1Hz)")
+	}
+
+	body := fiber.Map{
+		"success": false,
+		"error":   "replication_catch_up_in_progress",
+		"message": "Reader is still catching up on replicated files. Retry shortly or check /api/v1/cluster for catch-up progress.",
+	}
+	if status := h.coordinator.ReplicationCatchUpStatus(); status != nil {
+		body["catchup_status"] = status
+	}
+	c.Set("Retry-After", gate503RetryAfterSeconds)
+	return c.Status(fiber.StatusServiceUnavailable).JSON(body)
+}
+
+// QueryGate503Total returns the total number of times the catch-up gate has
+// fired since process start. Zero when the gate is disabled or has never
+// fired. Exposed for Prometheus / metrics dashboards to alert on a non-zero
+// rate without inferring from HTTP error logs.
+func (h *QueryHandler) QueryGate503Total() int64 {
+	return h.gate503Total.Load()
+}
+
 // SetTieringManager sets the tiering manager for multi-tier query routing.
 // When set, queries will check both hot and cold tiers for data.
 func (h *QueryHandler) SetTieringManager(manager *tiering.Manager) {
@@ -1004,14 +1116,20 @@ func (h *QueryHandler) checkMeasurementPermission(c *fiber.Ctx, database, measur
 
 // RegisterRoutes registers query endpoints
 func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
-	app.Post("/api/v1/query", h.executeQuery)
-	app.Post("/api/v1/query/estimate", h.estimateQuery)
-	app.Get("/api/v1/measurements", h.listMeasurements)
-	app.Get("/api/v1/query/:measurement", h.queryMeasurement)
+	// User-facing read endpoints get the catch-up gate (#392) as route-level
+	// middleware. The middleware is a no-op unless cluster.query_gate_on_catchup
+	// is true AND the coordinator reports peer file replication is still draining.
+	app.Post("/api/v1/query", h.checkReplicationReady, h.executeQuery)
+	app.Post("/api/v1/query/estimate", h.checkReplicationReady, h.estimateQuery)
+	app.Get("/api/v1/measurements", h.checkReplicationReady, h.listMeasurements)
+	app.Get("/api/v1/query/:measurement", h.checkReplicationReady, h.queryMeasurement)
 	h.registerArrowRoutes(app)
 
 	// Internal endpoint for distributed cache invalidation (enterprise clustering).
-	// Called by compactor/writer nodes after compaction to clear stale caches on readers.
+	// Called by compactor/writer nodes after compaction to clear stale caches on
+	// readers. Deliberately NOT gated by checkReplicationReady — peer nodes need
+	// to invalidate caches while we're catching up, and rejecting these calls
+	// would break the cache-invalidation protocol exactly when it matters most.
 	app.Post("/api/v1/internal/cache/invalidate", h.handleCacheInvalidate)
 }
 

@@ -1271,3 +1271,195 @@ func TestPuller_NonAppendingBackendFallback(t *testing.T) {
 		t.Errorf("file content mismatch after fallback")
 	}
 }
+
+// --- FullyCaughtUp tests -----------------------------------------------------
+
+// TestPuller_FullyCaughtUp_FalseBeforeWalker covers the trivial case: a fresh
+// puller with no startup catch-up run is not "fully caught up" because we have
+// no signal that the walker has even seen the manifest yet.
+func TestPuller_FullyCaughtUp_FalseBeforeWalker(t *testing.T) {
+	backend := newFakeBackend()
+	fetcher := newFakeFetcher(fakeFetchResult{body: []byte("ignored")})
+	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
+
+	p := newTestPuller(t, backend, fetcher, resolver)
+
+	if p.FullyCaughtUp() {
+		t.Errorf("FullyCaughtUp before walker run: got true, want false")
+	}
+}
+
+// TestPuller_FullyCaughtUp_FalseWhilePullsInflight covers the residual gap that
+// shipped in Phase 3: CatchUpCompleted only signals that the walker is done
+// enqueueing — it does not wait for the queue or in-flight pulls to settle.
+// A reader in this state would still serve incomplete results if the query
+// path consulted only CatchUpCompleted. FullyCaughtUp must return false while
+// any path is still inflight (queued or being processed). inflightCount is
+// the source of truth; queue depth is implied (every queued entry is inflight).
+func TestPuller_FullyCaughtUp_FalseWhilePullsInflight(t *testing.T) {
+	backend := newFakeBackend()
+	// Blocking fetcher: the worker grabs one entry off the queue and stalls
+	// inside Fetch(). Subsequent enqueues sit in the channel buffer.
+	blockCh := make(chan struct{})
+	fetcher := &blockingFetcher{release: blockCh}
+	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
+
+	p, err := New(Config{
+		SelfNodeID:          "reader-1",
+		Backend:             backend,
+		Fetcher:             fetcher,
+		PeerResolver:        resolver,
+		Workers:             1,
+		QueueSize:           16,
+		RetryMaxAttempts:    1,
+		RetryInitialBackoff: 10 * time.Millisecond,
+		FetchTimeout:        5 * time.Second,
+		Logger:              zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p.Start(context.Background())
+	defer func() {
+		close(blockCh)
+		p.Stop()
+	}()
+
+	// Simulate the walker finishing.
+	p.catchupCompletedAt.Store(time.Now().Unix())
+
+	// Enqueue several distinct files. Worker grabs one and blocks; the rest
+	// sit in the queue.
+	for i := 0; i < 5; i++ {
+		p.Enqueue(makeEntry(fmt.Sprintf("testdb/cpu/q-%d.parquet", i), "writer-1", int64(100+i)))
+	}
+
+	// Spin briefly for the worker to actually pick up its entry so the queue
+	// settles into "1 inflight + N queued".
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if fetcher.calls.Load() > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if p.FullyCaughtUp() {
+		t.Errorf("FullyCaughtUp with inflight pulls + walker done: got true, want false (inflightCount should be > 0)")
+	}
+	if got := p.inflightCount.Load(); got == 0 {
+		t.Errorf("inflightCount: got 0, want > 0 (workers should have at least one entry inflight)")
+	}
+}
+
+// TestPuller_FullyCaughtUp_FalseAfterFailedPull covers the silent-partial-
+// results condition #392 closes: a pull that exhausted retries and gave up
+// means the file is missing on this reader, but processEntry's defer cleared
+// the inflight slot. A naive "inflight==0" predicate would say "ready" while
+// data is missing. FullyCaughtUp must check totalFailed == 0.
+func TestPuller_FullyCaughtUp_FalseAfterFailedPull(t *testing.T) {
+	backend := newFakeBackend()
+	fetcher := newFakeFetcher(fakeFetchResult{body: []byte("ignored")})
+	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
+
+	p := newTestPuller(t, backend, fetcher, resolver)
+
+	// Walker finished, no inflight, but a previous pull gave up after retries.
+	p.catchupCompletedAt.Store(time.Now().Unix())
+	p.totalFailed.Store(1)
+
+	if p.FullyCaughtUp() {
+		t.Errorf("FullyCaughtUp with totalFailed=1: got true, want false (file missing on reader)")
+	}
+}
+
+// TestPuller_FullyCaughtUp_FalseAfterDroppedPull covers the same silent-
+// partial-results gap from a different cause: an entry was dropped because
+// the queue was full. The inflight slot was released, but the file was never
+// pulled. FullyCaughtUp must check totalDropped == 0.
+func TestPuller_FullyCaughtUp_FalseAfterDroppedPull(t *testing.T) {
+	backend := newFakeBackend()
+	fetcher := newFakeFetcher(fakeFetchResult{body: []byte("ignored")})
+	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
+
+	p := newTestPuller(t, backend, fetcher, resolver)
+
+	// Walker finished, nothing inflight, but a queue-full drop happened earlier.
+	p.catchupCompletedAt.Store(time.Now().Unix())
+	p.totalDropped.Store(1)
+
+	if p.FullyCaughtUp() {
+		t.Errorf("FullyCaughtUp with totalDropped=1: got true, want false (file missing on reader)")
+	}
+}
+
+// TestPuller_FullyCaughtUp_TrueWhenAllSettled covers the success path: walker
+// done, no inflight entries, no failures, no drops. This is the steady state
+// that the query gate consumes.
+func TestPuller_FullyCaughtUp_TrueWhenAllSettled(t *testing.T) {
+	backend := newFakeBackend()
+	fetcher := newFakeFetcher(fakeFetchResult{body: []byte("ignored")})
+	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
+
+	p := newTestPuller(t, backend, fetcher, resolver)
+
+	// Mark walker complete with no work ever enqueued: inflightCount is 0,
+	// totalFailed is 0, totalDropped is 0. FullyCaughtUp should be true.
+	p.catchupCompletedAt.Store(time.Now().Unix())
+
+	if !p.FullyCaughtUp() {
+		t.Errorf("FullyCaughtUp with walker done + clean counters: got false, want true")
+	}
+}
+
+// TestPuller_InflightCount_MirrorsMap verifies the atomic counter and the
+// inflight map cannot diverge under add/remove. The atomic is the hot-path
+// reader for FullyCaughtUp and Stats; if it drifts from the map the gate's
+// correctness guarantee is broken.
+func TestPuller_InflightCount_MirrorsMap(t *testing.T) {
+	backend := newFakeBackend()
+	fetcher := newFakeFetcher(fakeFetchResult{body: []byte("ignored")})
+	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
+
+	p := newTestPuller(t, backend, fetcher, resolver)
+
+	// Empty: counter == map.
+	if got := p.inflightCount.Load(); got != 0 {
+		t.Errorf("inflightCount on empty puller: got %d, want 0", got)
+	}
+
+	// Add three distinct paths.
+	p.inflightAdd("a")
+	p.inflightAdd("b")
+	p.inflightAdd("c")
+	if got := p.inflightCount.Load(); got != 3 {
+		t.Errorf("inflightCount after 3 adds: got %d, want 3", got)
+	}
+
+	// Re-add one (dedup): counter must not double-count.
+	if added := p.inflightAdd("a"); added {
+		t.Errorf("inflightAdd duplicate: got true, want false")
+	}
+	if got := p.inflightCount.Load(); got != 3 {
+		t.Errorf("inflightCount after duplicate add: got %d, want 3 (dedup)", got)
+	}
+
+	// Remove existing.
+	p.inflightRemove("a")
+	if got := p.inflightCount.Load(); got != 2 {
+		t.Errorf("inflightCount after remove: got %d, want 2", got)
+	}
+
+	// Remove non-existent: must not decrement below current.
+	p.inflightRemove("missing")
+	if got := p.inflightCount.Load(); got != 2 {
+		t.Errorf("inflightCount after no-op remove: got %d, want 2", got)
+	}
+
+	// Drain.
+	p.inflightRemove("b")
+	p.inflightRemove("c")
+	if got := p.inflightCount.Load(); got != 0 {
+		t.Errorf("inflightCount after drain: got %d, want 0", got)
+	}
+}

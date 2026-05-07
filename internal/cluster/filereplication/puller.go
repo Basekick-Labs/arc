@@ -142,8 +142,15 @@ type Puller struct {
 	// walker (both can enqueue the same path during a race), and workers
 	// remove the entry via defer in processEntry so the set stays bounded
 	// even on panic.
-	inflightMu sync.Mutex
-	inflight   map[string]struct{}
+	//
+	// inflightCount mirrors len(inflight) as an atomic so hot-path readers
+	// (FullyCaughtUp, Stats during a 503 storm) don't take inflightMu and
+	// contend with the workers. The map is the source of truth for dedup;
+	// the counter is updated under inflightMu in the same critical section
+	// so they cannot diverge.
+	inflightMu    sync.Mutex
+	inflight      map[string]struct{}
+	inflightCount atomic.Int64
 
 	// Metrics (atomic for lock-free observability)
 	totalEnqueued               atomic.Int64
@@ -221,7 +228,9 @@ func New(cfg Config) (*Puller, error) {
 
 // inflightAdd records a path as in-flight (enqueued or being processed).
 // Returns false if the path was already in the set — caller should treat
-// this as "already handled, skip".
+// this as "already handled, skip". Updates inflightCount in the same
+// critical section as the map so atomic readers cannot observe a state
+// where the count and the map disagree.
 func (p *Puller) inflightAdd(path string) bool {
 	p.inflightMu.Lock()
 	defer p.inflightMu.Unlock()
@@ -229,15 +238,20 @@ func (p *Puller) inflightAdd(path string) bool {
 		return false
 	}
 	p.inflight[path] = struct{}{}
+	p.inflightCount.Add(1)
 	return true
 }
 
 // inflightRemove clears a path from the in-flight set. Safe to call on a
 // path that's not in the set (no-op). Called from processEntry via defer so
-// it runs on panic unwind too.
+// it runs on panic unwind too. Updates inflightCount only when an entry is
+// actually deleted to keep the counter exact.
 func (p *Puller) inflightRemove(path string) {
 	p.inflightMu.Lock()
-	delete(p.inflight, path)
+	if _, ok := p.inflight[path]; ok {
+		delete(p.inflight, path)
+		p.inflightCount.Add(-1)
+	}
 	p.inflightMu.Unlock()
 }
 
@@ -328,7 +342,9 @@ func (p *Puller) Enqueue(entry *raft.FileEntry) {
 }
 
 // Stats returns a point-in-time snapshot of the puller's metrics,
-// including Phase 3 catch-up counters.
+// including Phase 3 catch-up counters and the live queue / inflight depths
+// the catch-up gate (#392) consumes. Lock-free: inflight count is read from
+// inflightCount, queue depth from len() on the buffered channel.
 func (p *Puller) Stats() map[string]int64 {
 	return map[string]int64{
 		"enqueued":               p.totalEnqueued.Load(),
@@ -343,6 +359,7 @@ func (p *Puller) Stats() map[string]int64 {
 		"bad_offset_server":        p.totalBadOffsetServer.Load(),
 		"bad_offset_backend":       p.totalBadOffsetBackend.Load(),
 		"queue_depth":            int64(len(p.queue)),
+		"inflight_count":         p.inflightCount.Load(),
 		"catchup_started_at":     p.catchupStartedAt.Load(),
 		"catchup_completed_at":   p.catchupCompletedAt.Load(),
 		"catchup_entries_walked": p.catchupEntriesWalked.Load(),
@@ -351,12 +368,73 @@ func (p *Puller) Stats() map[string]int64 {
 	}
 }
 
-// CatchUpCompleted reports whether the startup catch-up walker has finished.
-// Returns true once RunCatchUp has completed its pass over the manifest (not
-// once all queued pulls have drained — that's a separate signal). Phase 5
-// will use this to hard-gate the query path during startup.
+// CatchUpCompleted reports whether the startup catch-up walker has finished
+// enqueueing. Preserved for operators reading puller stats directly; the
+// query gate uses the stronger FullyCaughtUp predicate, which also requires
+// the queue/inflight to be drained AND no failed/dropped pulls outstanding.
 func (p *Puller) CatchUpCompleted() bool {
 	return p.catchupCompletedAt.Load() > 0
+}
+
+// FullyCaughtUp reports whether the puller has converged: the startup
+// catch-up walker has finished, every enqueued entry has been processed
+// (no in-flight pulls), and no pulls have failed or been dropped since the
+// puller started. This is the signal the query gate consumes — it
+// guarantees the reader's local storage reflects the manifest within the
+// limits of what the puller has observed.
+//
+// The check is lock-free: inflightCount is an atomic mirror of len(inflight)
+// updated under inflightMu in the same critical section as the map. The
+// len(queue) check is intentionally omitted — every entry on the queue was
+// added to inflight before being sent (see Enqueue), so inflightCount == 0
+// already implies the queue is drained.
+//
+// Returns false (not ready) if any pull has failed after retries
+// (totalFailed > 0) or been dropped due to queue saturation (totalDropped
+// > 0): both indicate files the manifest promised but this reader does not
+// have, which is exactly the silent-partial-results condition the gate
+// closes (#392). Operators see the deception via the failed/dropped fields
+// in the 503 body. Re-converging requires either a restart (re-runs
+// catch-up) or a new FSM callback for the missing path.
+//
+// Returning true on a node where the puller never ran (OSS / standalone) is
+// the caller's responsibility — see Coordinator.ReplicationReady, which
+// short-circuits when the puller is nil.
+func (p *Puller) FullyCaughtUp() bool {
+	if p.catchupCompletedAt.Load() == 0 {
+		return false
+	}
+	if p.inflightCount.Load() != 0 {
+		return false
+	}
+	if p.totalFailed.Load() != 0 {
+		return false
+	}
+	if p.totalDropped.Load() != 0 {
+		return false
+	}
+	return true
+}
+
+// CatchUpStatus returns the subset of puller metrics that operators and the
+// query gate's 503 body care about. Built directly rather than projecting
+// Stats() so the gate path doesn't allocate a 17-key map on every blocked
+// request just to extract 11 fields. Returns a fresh map per call so the
+// caller can mutate the result without affecting subsequent callers.
+func (p *Puller) CatchUpStatus() map[string]int64 {
+	return map[string]int64{
+		"started_at":     p.catchupStartedAt.Load(),
+		"completed_at":   p.catchupCompletedAt.Load(),
+		"entries_walked": p.catchupEntriesWalked.Load(),
+		"enqueued":       p.catchupEnqueued.Load(),
+		"skipped_local":  p.catchupSkippedLocal.Load(),
+		"pulled":         p.totalPulled.Load(),
+		"failed":         p.totalFailed.Load(),
+		"dropped":        p.totalDropped.Load(),
+		"skipped_dup":    p.totalSkippedDup.Load(),
+		"queue_depth":    int64(len(p.queue)),
+		"inflight_count": p.inflightCount.Load(),
+	}
 }
 
 func (p *Puller) worker(id int) {

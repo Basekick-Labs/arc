@@ -380,6 +380,15 @@ type ClusterConfig struct {
 	ReplicationCatchUpBarrierTimeoutMs  int     // Raft barrier timeout before walking the manifest — ensures the local FSM has applied every committed entry. (default: 10000)
 	ReplicationCatchUpQueueHighWater    float64 // Queue-depth fraction above which the walker pauses enqueueing. Keeps the walker from racing workers on large manifests. (default: 0.8)
 
+	// Hard query gating during catch-up (#392). When true, the query path
+	// rejects reads with 503 until Coordinator.ReplicationReady() is true
+	// (catch-up walker done AND puller queue empty AND no inflight pulls).
+	// Closes the silent-partial-results window where a reader serves queries
+	// before background replication has caught up. Off by default — operators
+	// who want correctness over availability flip it on. OSS / standalone
+	// deployments are unaffected (no puller → always ready). (default: false)
+	QueryGateOnCatchup bool
+
 	// Sharding configuration (Phase 4)
 	ShardingEnabled           bool   // Enable sharding for horizontal write scaling (default: false)
 	ShardingNumShards         int    // Number of shards (default: 3)
@@ -633,6 +642,8 @@ func Load() (*Config, error) {
 			ReplicationCatchUpEnabled:          v.GetBool("cluster.replication_catchup_enabled"),
 			ReplicationCatchUpBarrierTimeoutMs: v.GetInt("cluster.replication_catchup_barrier_timeout_ms"),
 			ReplicationCatchUpQueueHighWater:   v.GetFloat64("cluster.replication_catchup_queue_high_water"),
+			// Hard query gating during catch-up (#392)
+			QueryGateOnCatchup: v.GetBool("cluster.query_gate_on_catchup"),
 			// Sharding configuration (Phase 4)
 			ShardingEnabled:           v.GetBool("cluster.sharding_enabled"),
 			ShardingNumShards:         v.GetInt("cluster.sharding_num_shards"),
@@ -903,6 +914,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.replication_catchup_enabled", true)            // Walk the manifest on startup to reconcile missing files
 	v.SetDefault("cluster.replication_catchup_barrier_timeout_ms", 10000) // 10s Raft barrier before walking
 	v.SetDefault("cluster.replication_catchup_queue_high_water", 0.8)     // Pause walker when queue is >80% full
+	v.SetDefault("cluster.query_gate_on_catchup", false)                  // Off by default; opt-in correctness gate (#392)
 
 	// Sharding defaults (Phase 4)
 	v.SetDefault("cluster.sharding_enabled", false)        // Disabled by default

@@ -1163,6 +1163,16 @@ func main() {
 			queryHandler.SetRouter(router)
 			log.Info().Msg("Cluster router wired to API handlers for request forwarding")
 		}
+
+		// Wire the catch-up gate (#392). When cfg.Cluster.QueryGateOnCatchup is
+		// true, user-facing read endpoints will 503 until peer file replication
+		// is fully drained. The flag is off by default; the SetCluster call is
+		// always made so the handler has a coordinator reference for any future
+		// cluster-aware behavior even when the gate is off.
+		queryHandler.SetCluster(clusterCoordinator, cfg.Cluster.QueryGateOnCatchup)
+		if cfg.Cluster.QueryGateOnCatchup {
+			log.Info().Msg("Query catch-up gate enabled — read endpoints will return 503 until peer replication is fully drained")
+		}
 	}
 
 	// Initialize Query Governance (Enterprise feature - requires valid license)

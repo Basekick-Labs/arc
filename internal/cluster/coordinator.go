@@ -2161,39 +2161,50 @@ func (c *Coordinator) runCatchUpOnce() {
 }
 
 // ReplicationCatchUpStatus returns the puller's catch-up-specific stats as a
-// JSON-serializable map, or nil when the puller is not running. Intended for
-// /api/v1/cluster/status. The keys mirror what Phase 5 will hard-gate the
-// query path on.
+// JSON-serializable map, or nil when the puller is not running. Consumed by
+// /api/v1/cluster/status (operator visibility) and the query gate's 503 body
+// (so clients can implement bounded retry without a separate probe). The
+// queue_depth, inflight_count, failed, and dropped keys are the live signals
+// — non-zero on any means the gate will keep firing.
 func (c *Coordinator) ReplicationCatchUpStatus() map[string]int64 {
-	if c.puller == nil {
+	puller := c.puller
+	if puller == nil {
 		return nil
 	}
-	full := c.puller.Stats()
-	return map[string]int64{
-		"started_at":     full["catchup_started_at"],
-		"completed_at":   full["catchup_completed_at"],
-		"entries_walked": full["catchup_entries_walked"],
-		"enqueued":       full["catchup_enqueued"],
-		"skipped_local":  full["catchup_skipped_local"],
-		"pulled":         full["pulled"],
-		"failed":         full["failed"],
-		"dropped":        full["dropped"],
-		"skipped_dup":    full["skipped_dup"],
-	}
+	return puller.CatchUpStatus()
 }
 
-// ReplicationReady reports whether the Phase 3 catch-up walker has finished
-// its pass over the cluster manifest. Not currently consumed — Phase 5 will
-// use this to hard-gate the query path during startup so readers can't
-// return eventually-consistent results during catch-up. Lands now so the
-// coordinator surface doesn't need another change in Phase 5.
+// ReplicationReady reports whether peer file replication has converged on
+// this node: catch-up walker done, puller queue and inflight set drained,
+// no failed or dropped pulls outstanding. Consumed by the query-path gate
+// (cluster.query_gate_on_catchup) to short-circuit reads with 503 while the
+// reader is still missing manifest-known files. Standalone / OSS deployments
+// (no puller) are always ready, so the gate is a no-op there.
+//
+// Stronger than Puller.CatchUpCompleted, which only signals walker-done.
+// Walker-done is not sufficient to prevent silent partial results; the full
+// predicate is in Puller.FullyCaughtUp.
+//
+// Known limitation (#392 follow-up): there is a sub-millisecond window
+// between an FSM applyRegisterFile committing a manifest entry and the
+// onRegister callback firing puller.Enqueue. A query landing in that
+// window can observe ReplicationReady() == true while a manifest entry
+// the same Raft commit produced is not yet in the inflight set. Closing
+// this gap requires a per-query Raft LastApplied() barrier on the query
+// path, which is out of scope for this gate. The gate's contract is
+// "every file the puller has observed has been pulled," not "every file
+// the manifest currently contains has been pulled."
+//
+// Snapshot puller into a local before nil-checking to close the
+// shutdown-time TOCTOU window where Stop() nils c.puller.
 func (c *Coordinator) ReplicationReady() bool {
-	if c.puller == nil {
+	puller := c.puller
+	if puller == nil {
 		// No puller means peer replication is off — treat as always ready
-		// so future Phase 5 gates don't block OSS / standalone paths.
+		// so the gate is a no-op for OSS / standalone paths.
 		return true
 	}
-	return c.puller.CatchUpCompleted()
+	return puller.FullyCaughtUp()
 }
 
 // StartReplication starts WAL replication based on node role.
