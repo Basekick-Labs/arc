@@ -35,18 +35,22 @@ Reader nodes in a clustered Arc Enterprise deployment previously accepted querie
 
 - `cluster.query_gate_on_catchup` (default `false`) — when true, all user-facing read endpoints (`/api/v1/query`, `/api/v1/query/arrow`, `/api/v1/query/estimate`, `/api/v1/query/:measurement`, `/api/v1/measurements`) return `503 Service Unavailable` until peer file replication has fully converged. Off by default to preserve existing behavior; operators who want correctness over availability flip it on.
 
-**Readiness signal:** the gate consumes a stronger predicate than the Phase 3 plumbing originally exposed. `Puller.CatchUpCompleted()` only signaled that the manifest walker finished *enqueueing* — it did NOT wait for pulls to complete and did NOT account for failed or dropped pulls. Wiring that as-is would have let through the same silent-partial-results condition the gate exists to prevent.
+**Readiness signal:** the gate consumes a predicate scoped specifically to the **startup catch-up batch**, not to all puller activity. This is the load-bearing detail. A naive "wait for everything to settle" predicate would mean the reader returns 503 every few seconds in normal operation, since steady-state ingest constantly puts new files in flight. The gate's job is "the reader has finished bootstrapping its view of the manifest as of startup," not "no pulls are happening anywhere right now."
 
 26.06.1 introduces `Puller.FullyCaughtUp()`, which requires:
 
 1. The startup catch-up walker has completed (`catchupCompletedAt > 0`).
-2. The in-flight set is empty (`inflightCount == 0`) — every queued or processing pull has settled. The previously-checked `len(queue) == 0` is implied: every queued entry was added to the in-flight set before being sent to the channel, so the queue is necessarily drained when in-flight is empty. The redundant check was removed.
-3. No pulls have failed after retries (`totalFailed == 0`).
-4. No pulls have been dropped due to queue saturation (`totalDropped == 0`).
+2. No paths the walker tagged are still in flight (`catchupInflight == 0`). Steady-state pulls from reactive FSM callbacks are deliberately excluded — they're tracked separately and don't affect the gate.
+3. No catch-up-batch pulls failed after retries (`catchupFailed == 0`).
+4. No catch-up-batch pulls were dropped due to queue saturation (`catchupDropped == 0`).
 
-`Coordinator.ReplicationReady()` now delegates to `FullyCaughtUp()`. OSS / standalone deployments (no puller) are still always ready, so the gate is a no-op there.
+The walker tags each path it enqueues so workers can attribute outcomes correctly. Failures and drops outside the catch-up window do not affect the gate — they're operational concerns surfaced via `Stats()` but not correctness blockers, since by the time the catch-up batch has settled the reader has reconciled its view of the manifest as of walker start.
 
-**Performance**: `Puller.inflightCount` is an `atomic.Int64` mirror of `len(inflight)`, updated under `inflightMu` in the same critical section as the map. Hot-path readers (the gate middleware, the `/api/v1/cluster` status endpoint) are lock-free and don't contend with puller workers under sustained 503 storms.
+`Coordinator.ReplicationReady()` delegates to `FullyCaughtUp()`. OSS / standalone deployments (no puller) are always ready, so the gate is a no-op there.
+
+**Configuration validation**: when `cluster.query_gate_on_catchup=true` is set together with `cluster.replication_catchup_enabled=false` (the emergency off-switch for pathologically large manifests), the catch-up walker never runs and the gate would never clear. Arc detects this combination at startup, logs a `WARN`, and auto-disables the gate so the deployment isn't bricked by the conflict. Operators see a clear log line and can fix the configuration at their leisure.
+
+**Performance**: `Puller.inflightCount` and `Puller.catchupInflight` are `atomic.Int64` mirrors of their respective map sizes, updated under their respective mutexes in the same critical section as the map. Hot-path readers (the gate middleware, the `/api/v1/cluster` status endpoint) are lock-free and don't contend with puller workers under sustained 503 storms.
 
 **503 response shape**: structured for client-side bounded retry, no log scraping required:
 
@@ -56,11 +60,13 @@ Reader nodes in a clustered Arc Enterprise deployment previously accepted querie
   "error": "replication_catch_up_in_progress",
   "message": "Reader is still catching up on replicated files. Retry shortly or check /api/v1/cluster for catch-up progress.",
   "catchup_status": {
+    "completed_at": 0,
+    "catchup_inflight": 2,
+    "catchup_failed": 0,
+    "catchup_dropped": 0,
     "queue_depth": 7,
     "inflight_count": 2,
-    "failed": 0,
-    "dropped": 0,
-    "completed_at": 0,
+    "pulled": 1278,
     ...
   }
 }

@@ -1165,13 +1165,26 @@ func main() {
 		}
 
 		// Wire the catch-up gate (#392). When cfg.Cluster.QueryGateOnCatchup is
-		// true, user-facing read endpoints will 503 until peer file replication
-		// is fully drained. The flag is off by default; the SetCluster call is
-		// always made so the handler has a coordinator reference for any future
-		// cluster-aware behavior even when the gate is off.
-		queryHandler.SetCluster(clusterCoordinator, cfg.Cluster.QueryGateOnCatchup)
-		if cfg.Cluster.QueryGateOnCatchup {
-			log.Info().Msg("Query catch-up gate enabled — read endpoints will return 503 until peer replication is fully drained")
+		// true, user-facing read endpoints will 503 until the catch-up walker's
+		// batch has fully settled. The flag is off by default; the SetCluster
+		// call is always made so the handler has a coordinator reference for
+		// any future cluster-aware behavior even when the gate is off.
+		//
+		// Validate the gate × catch-up-walker combination at startup. If the
+		// walker is disabled (replication_catchup_enabled=false, the emergency
+		// off-switch for pathologically large manifests), the gate has nothing
+		// to wait for and would 503 forever. Auto-disable the gate with a WARN
+		// rather than panicking — the operator's intent is clear: they don't
+		// want catch-up bootstrapping, so they implicitly don't want a gate
+		// that depends on it.
+		gateEnabled := cfg.Cluster.QueryGateOnCatchup
+		if gateEnabled && !cfg.Cluster.ReplicationCatchUpEnabled {
+			log.Warn().Msg("cluster.query_gate_on_catchup=true requires cluster.replication_catchup_enabled=true; the catch-up walker is disabled, so the gate would never clear. Auto-disabling the gate.")
+			gateEnabled = false
+		}
+		queryHandler.SetCluster(clusterCoordinator, gateEnabled)
+		if gateEnabled {
+			log.Info().Msg("Query catch-up gate enabled — read endpoints will return 503 until the startup catch-up batch settles")
 		}
 	}
 

@@ -796,8 +796,11 @@ type replicationReadiness interface {
 // draining (#392). Both arguments are optional — nil coordinator OR
 // gate=false makes the gate a no-op.
 //
-// SetCluster must be called before RegisterRoutes; the fields are read
-// lock-free per request and not safe for concurrent re-wiring.
+// Initialization-only: must be called once during process startup before
+// the HTTP server starts accepting requests. Order relative to
+// RegisterRoutes does not matter (Fiber resolves field reads at request
+// time, and request handling does not begin until server.Start). Runtime
+// re-wiring is not supported — the fields are read lock-free per request.
 //
 // The explicit nil branch protects against the typed-nil interface trap:
 // assigning a nil *cluster.Coordinator to an interface field yields a

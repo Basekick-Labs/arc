@@ -169,6 +169,16 @@ func TestSenderBroadcastToMultipleReaders(t *testing.T) {
 
 	assert.Equal(t, 2, sender.ReaderCount())
 
+	// Set read deadlines BEFORE Replicate so both conns are ready to drain
+	// the broadcast as soon as the writes start. Broadcast iterates readers
+	// in map order (non-deterministic); if we drain serially we head-of-
+	// line-block whichever conn the broadcast picks second, the
+	// distributionLoop's per-reader WriteTimeout (1s) trips, and that
+	// reader gets removed via RemoveReader → conn.Close, leaving the test
+	// to read EOF from the now-closed pipe. Drain both in parallel.
+	clientConn1.SetReadDeadline(time.Now().Add(2 * time.Second))
+	clientConn2.SetReadDeadline(time.Now().Add(2 * time.Second))
+
 	// Send entry
 	testPayload := []byte(`{"test": "broadcast"}`)
 	sender.Replicate(&ReplicateEntry{
@@ -176,20 +186,35 @@ func TestSenderBroadcastToMultipleReaders(t *testing.T) {
 		Payload:     testPayload,
 	})
 
-	// Both readers should receive the entry
-	clientConn1.SetReadDeadline(time.Now().Add(2 * time.Second))
-	clientConn2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	// Read both conns concurrently to avoid head-of-line blocking the
+	// broadcast loop.
+	type readResult struct {
+		msgType byte
+		payload []byte
+		err     error
+	}
+	read := func(conn net.Conn) <-chan readResult {
+		ch := make(chan readResult, 1)
+		go func() {
+			msgType, payload, err := ReadMessage(conn)
+			ch <- readResult{msgType, payload, err}
+		}()
+		return ch
+	}
 
-	msgType1, payload1, err1 := ReadMessage(clientConn1)
-	require.NoError(t, err1)
-	assert.Equal(t, MsgReplicateEntry, msgType1)
-	entry1, _ := ParseEntry(payload1)
+	r1 := read(clientConn1)
+	r2 := read(clientConn2)
+
+	res1 := <-r1
+	require.NoError(t, res1.err)
+	assert.Equal(t, MsgReplicateEntry, res1.msgType)
+	entry1, _ := ParseEntry(res1.payload)
 	assert.Equal(t, testPayload, entry1.Payload)
 
-	msgType2, payload2, err2 := ReadMessage(clientConn2)
-	require.NoError(t, err2)
-	assert.Equal(t, MsgReplicateEntry, msgType2)
-	entry2, _ := ParseEntry(payload2)
+	res2 := <-r2
+	require.NoError(t, res2.err)
+	assert.Equal(t, MsgReplicateEntry, res2.msgType)
+	entry2, _ := ParseEntry(res2.payload)
 	assert.Equal(t, testPayload, entry2.Payload)
 }
 

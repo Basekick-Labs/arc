@@ -102,10 +102,18 @@ func (p *Puller) RunCatchUp(ctx context.Context, entries []*raft.FileEntry) {
 		switch {
 		case p.totalEnqueued.Load() > beforeEnqueued:
 			p.catchupEnqueued.Add(1)
+			// Tag this path as catch-up so FullyCaughtUp can scope its
+			// "still draining" check to the cold-start batch and ignore
+			// steady-state ingest. Tag fires only when Enqueue accepted
+			// the entry (it's now in inflight); workers clear the tag on
+			// processEntry's defer.
+			p.markCatchUp(entry.Path)
 		case p.totalSkippedDup.Load() > beforeSkippedDup:
 			// Already enqueued (by a reactive callback or a prior walker
 			// entry with the same path) — count as skipped so the caller
-			// can see it happened.
+			// can see it happened. The path is already in inflight so
+			// FullyCaughtUp will see it through inflightCount; no extra
+			// tagging needed.
 			p.catchupSkippedLocal.Add(1)
 		case p.totalSkippedSelf.Load() > beforeSkippedSelf:
 			// Origin is self — file is already local by construction.
@@ -113,6 +121,9 @@ func (p *Puller) RunCatchUp(ctx context.Context, entries []*raft.FileEntry) {
 		case p.totalDropped.Load() > beforeDropped:
 			// Queue full even after backpressure sleep — give up on this
 			// entry; a future restart or reactive callback will retry.
+			// Bump the catch-up-scoped counter so FullyCaughtUp sees the
+			// gap (steady-state drops don't count against the gate).
+			p.catchupDropped.Add(1)
 		}
 	}
 
