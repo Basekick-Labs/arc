@@ -17,11 +17,11 @@ import (
 // nil-guard policy so all MQTT API endpoints have one consistent
 // disabled-response shape.
 //
-// This test is load-bearing: if a future contributor adds a new handler to
-// MQTTSubscriptionHandler and forgets to call h.requireEnabled at the top, the
-// test will not catch it directly (we only sample representative routes), but
-// the helper's existence and the comment on requireEnabled make the policy
-// discoverable.
+// Protection is applied as Fiber middleware (subs.Use(h.requireEnabled) in
+// RegisterRoutes), so any new route added to the /api/v1/mqtt/subscriptions
+// group is automatically guarded — no per-handler boilerplate to forget. The
+// representative sample below exercises the shared middleware path across
+// CRUD, lifecycle, and stats endpoints.
 func TestMQTTSubscriptionHandler_DisabledManager(t *testing.T) {
 	h := &MQTTSubscriptionHandler{
 		manager: nil,
