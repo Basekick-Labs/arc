@@ -44,7 +44,9 @@ Reader nodes in a clustered Arc Enterprise deployment previously accepted querie
 3. No catch-up-batch pulls failed after retries (`catchupFailed == 0`).
 4. No catch-up-batch pulls were dropped due to queue saturation (`catchupDropped == 0`).
 
-The walker tags each path it enqueues so workers can attribute outcomes correctly. Failures and drops outside the catch-up window do not affect the gate — they're operational concerns surfaced via `Stats()` but not correctness blockers, since by the time the catch-up batch has settled the reader has reconciled its view of the manifest as of walker start.
+The walker tags each path it enqueues so workers can attribute outcomes correctly. Each worker tracks its own success/failure outcome in a local variable (not a global counter delta) so concurrent workers cannot cross-pollinate failures. Failures and drops outside the catch-up window do not affect the gate — they're operational concerns surfaced via `Stats()` but not correctness blockers, since by the time the catch-up batch has settled the reader has reconciled its view of the manifest as of walker start.
+
+**Self-heal**: a catch-up failure does not require a process restart to clear. When a later pull succeeds for a previously-failed path (a reactive FSM callback re-enqueueing the same path after the underlying issue resolves, or a subsequent catch-up scan), `catchupFailed` is decremented and the gate re-opens automatically. Catch-up *drops* (queue-saturation events during the walker pass) do not self-heal in the same way, since a drop means no inflight slot was ever taken; recovery in that case requires either a node restart that re-runs the walker or an operator-initiated retry.
 
 `Coordinator.ReplicationReady()` delegates to `FullyCaughtUp()`. OSS / standalone deployments (no puller) are always ready, so the gate is a no-op there.
 

@@ -186,17 +186,27 @@ type Puller struct {
 	// while the cold-start batch is settling. Workers remove paths from this
 	// set when they finish processing (success or failure); catchupInflight
 	// is the atomic counterpart for lock-free reads.
-	catchupPathsMu  sync.Mutex
-	catchupPaths    map[string]struct{}
-	catchupInflight atomic.Int64
+	//
+	// catchupFailedPaths holds catch-up paths whose pull permanently gave up
+	// after retries. Tracked so a later successful pull (reactive FSM
+	// callback after the underlying issue clears) can decrement
+	// catchupFailed and let the gate self-heal without a process restart.
+	// Both sets share catchupPathsMu — they're both catch-up bookkeeping
+	// and the lock is only ever held for tiny critical sections.
+	catchupPathsMu     sync.Mutex
+	catchupPaths       map[string]struct{}
+	catchupFailedPaths map[string]struct{}
+	catchupInflight    atomic.Int64
 
 	// catchupFailed / catchupDropped count failures and drops scoped to the
 	// catch-up batch only. FullyCaughtUp uses these (not the cumulative
 	// totalFailed / totalDropped) so transient steady-state failures don't
-	// keep the gate red forever. A non-zero value means a file the walker
-	// tried to pull was permanently missed and the gate stays closed until
-	// the node restarts (re-runs catch-up) or a reactive FSM callback
-	// re-enqueues the same path successfully.
+	// keep the gate red forever. catchupFailed self-heals when a later pull
+	// (reactive or otherwise) succeeds for a previously-failed path; see
+	// clearCatchUpFailure. catchupDropped does NOT self-heal — a drop means
+	// the walker never enqueued the entry, so there's no inflight slot to
+	// later decrement; the path will be retried by a reactive FSM callback
+	// or the next catch-up scan.
 	catchupFailed  atomic.Int64
 	catchupDropped atomic.Int64
 }
@@ -240,11 +250,12 @@ func New(cfg Config) (*Puller, error) {
 	}
 
 	return &Puller{
-		cfg:          cfg,
-		queue:        make(chan *raft.FileEntry, cfg.QueueSize),
-		inflight:     make(map[string]struct{}),
-		catchupPaths: make(map[string]struct{}),
-		logger:       cfg.Logger.With().Str("component", "file-puller").Logger(),
+		cfg:                cfg,
+		queue:              make(chan *raft.FileEntry, cfg.QueueSize),
+		inflight:           make(map[string]struct{}),
+		catchupPaths:       make(map[string]struct{}),
+		catchupFailedPaths: make(map[string]struct{}),
+		logger:             cfg.Logger.With().Str("component", "file-puller").Logger(),
 	}, nil
 }
 
@@ -302,12 +313,43 @@ func (p *Puller) markCatchUp(path string) {
 // isCatchUpPath reports whether a path is currently tagged as catch-up-
 // enqueued. Used by processEntry to decide whether a permanent failure
 // should bump catchupFailed (and therefore keep the query gate red until
-// the node restarts).
+// a successful retry resolves the missing file).
 func (p *Puller) isCatchUpPath(path string) bool {
 	p.catchupPathsMu.Lock()
 	defer p.catchupPathsMu.Unlock()
 	_, ok := p.catchupPaths[path]
 	return ok
+}
+
+// recordCatchUpFailure adds a path to the failed-catch-up set and increments
+// the catch-up failure counter. Called from processEntry's defer when a
+// catch-up-tagged path gives up after retries. Idempotent: a duplicate
+// failure for the same path (which would only happen via re-enqueue +
+// re-failure) does not double-count, so the gate's self-heal accounting
+// stays correct.
+func (p *Puller) recordCatchUpFailure(path string) {
+	p.catchupPathsMu.Lock()
+	defer p.catchupPathsMu.Unlock()
+	if _, ok := p.catchupFailedPaths[path]; ok {
+		return
+	}
+	p.catchupFailedPaths[path] = struct{}{}
+	p.catchupFailed.Add(1)
+}
+
+// clearCatchUpFailure decrements the catch-up failure counter if the given
+// path was previously recorded as failed. Called from processEntry's
+// success path so a reactive FSM callback (or any later successful pull)
+// can heal the gate without a process restart. No-op if the path was not
+// previously failed.
+func (p *Puller) clearCatchUpFailure(path string) {
+	p.catchupPathsMu.Lock()
+	defer p.catchupPathsMu.Unlock()
+	if _, ok := p.catchupFailedPaths[path]; !ok {
+		return
+	}
+	delete(p.catchupFailedPaths, path)
+	p.catchupFailed.Add(-1)
 }
 
 // Start launches the worker pool. Safe to call multiple times — subsequent
@@ -436,8 +478,8 @@ func (p *Puller) CatchUpCompleted() bool {
 
 // FullyCaughtUp reports whether the startup catch-up batch has fully
 // converged on this node: the walker has finished its pass, every entry it
-// specifically enqueued has settled (success OR failure), and no failures
-// or drops occurred during the batch. This is the signal the query gate
+// specifically enqueued has settled, no catch-up failures are outstanding,
+// and no catch-up entries were dropped. This is the signal the query gate
 // consumes — it scopes "ready" to the cold-start window, not to whatever
 // is in flight at any given moment.
 //
@@ -450,11 +492,22 @@ func (p *Puller) CatchUpCompleted() bool {
 // has finished bootstrapping its view of the cluster manifest," not
 // "no pulls are happening anywhere right now."
 //
+// Self-heal: catchupFailed is decremented when a later pull (reactive FSM
+// callback or otherwise) succeeds for a previously-failed path, so a
+// transient peer outage that resolves itself doesn't require a process
+// restart to clear the gate. catchupDropped does NOT self-heal — a drop
+// means the walker never enqueued the entry, so there's no inflight slot
+// to later resolve; recovery in that case is via a reactive FSM callback
+// re-enqueueing the path (which on success will not affect catchupDropped
+// but means the file is now present and the next catch-up scan or
+// restart will clear the count).
+//
 // Returns false (not ready) if:
 //   - the catch-up walker never ran or hasn't completed, OR
 //   - any path the walker enqueued is still in flight, OR
-//   - a pull failed or was dropped during the catch-up batch (delta from
-//     the snapshots taken at RunCatchUp start).
+//   - a catch-up-tagged pull failed (catchupFailed > 0) and hasn't been
+//     resolved by a later success, OR
+//   - a catch-up entry was dropped (catchupDropped > 0).
 //
 // Failures and drops outside the catch-up window do NOT keep the gate red.
 // They're operational concerns surfaced via Stats() but not correctness
@@ -550,18 +603,30 @@ func (p *Puller) processEntry(log zerolog.Logger, entry *raft.FileEntry) {
 	// signal FullyCaughtUp consumes to keep the gate red, scoped to the
 	// cold-start batch only.
 	wasCatchUp := p.isCatchUpPath(entry.Path)
-	failedAtEntry := p.totalFailed.Load()
+	// failed and succeeded are local to this worker so a concurrent worker
+	// processing a different entry doesn't trip our defer — using a global
+	// counter delta would cross-pollinate outcomes across workers. Set by
+	// the give-up path (after RetryMaxAttempts) and the success path
+	// (pulledFromPeer) respectively. They're never both true.
+	var failed, succeeded bool
 
 	// Remove from the inflight set when we're done, whether success or failure.
 	// This keeps the set bounded even if a worker panics — Go's defer runs on
 	// panic unwind — and makes repeated catch-up walks idempotent with the
 	// reactive enqueue path.
 	defer func() {
-		if wasCatchUp && p.totalFailed.Load() > failedAtEntry {
-			// This catch-up-tagged pull gave up after all retries. Bump the
-			// catch-up-scoped failure counter; the gate stays red until a
-			// restart or a reactive re-enqueue resolves the missing file.
-			p.catchupFailed.Add(1)
+		switch {
+		case wasCatchUp && failed:
+			// Catch-up-tagged pull gave up after all retries. Record the
+			// failure; the gate stays red until a later successful pull
+			// (reactive or otherwise) calls clearCatchUpFailure.
+			p.recordCatchUpFailure(entry.Path)
+		case succeeded:
+			// Pull succeeded. If this path had a prior catch-up failure,
+			// heal it so the gate can clear without a process restart.
+			// No-op when the path was never in the failed set, so safe to
+			// call on every success.
+			p.clearCatchUpFailure(entry.Path)
 		}
 		p.inflightRemove(entry.Path)
 	}()
@@ -579,6 +644,7 @@ func (p *Puller) processEntry(log zerolog.Logger, entry *raft.FileEntry) {
 		statCancel()
 		if statErr == nil && localSize == entry.SizeBytes {
 			p.totalSkippedLocal.Add(1)
+			succeeded = true // File is already here — same as a fresh pull from the gate's perspective.
 			return
 		}
 
@@ -614,6 +680,7 @@ func (p *Puller) processEntry(log zerolog.Logger, entry *raft.FileEntry) {
 					Int("attempts", attempt).
 					Msg("File pulled from peer")
 				pulledFromPeer = true
+				succeeded = true // Signal to processEntry's defer to clear any prior catch-up failure for this path.
 				break
 			}
 			lastErr = err
@@ -663,6 +730,7 @@ func (p *Puller) processEntry(log zerolog.Logger, entry *raft.FileEntry) {
 
 		if attempt >= p.cfg.RetryMaxAttempts {
 			p.totalFailed.Add(1)
+			failed = true // Signal to processEntry's defer that THIS entry failed.
 			log.Error().
 				Err(lastErr).
 				Str("path", entry.Path).
