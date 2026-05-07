@@ -1515,15 +1515,20 @@ func main() {
 	clusterHandler := api.NewClusterHandler(clusterCoordinator, authManager, licenseClient, logger.Get("cluster-api"))
 	clusterHandler.RegisterRoutes(server.GetApp())
 
-	// Register MQTT handlers (always register, handlers check if manager is nil)
+	// MQTT API handlers are registered unconditionally. Both MQTTHandler
+	// (stats/health) and MQTTSubscriptionHandler (CRUD/lifecycle) nil-guard
+	// every endpoint when manager is nil, returning a stable, documented shape
+	// instead of letting some routes 404 and others 503. Most return 503 with
+	// "MQTT subsystem disabled" — except MQTTHandler.handleHealth, which
+	// returns 200 with `{"status":"disabled","healthy":false}` so uptime
+	// monitors don't page operators about a configured-off subsystem.
+	// Regression tests in internal/api/mqtt_test.go and
+	// internal/api/mqtt_subscriptions_test.go pin the disabled-response shape.
 	mqttHandler := api.NewMQTTHandler(mqttManager, authManager, logger.Get("mqtt-api"))
 	mqttHandler.RegisterRoutes(server.GetApp())
 
-	// Register MQTT subscription management API (if MQTT is enabled)
-	if mqttManager != nil {
-		mqttSubHandler := api.NewMQTTSubscriptionHandler(mqttManager, authManager, logger.Get("mqtt-subscriptions-api"))
-		mqttSubHandler.RegisterRoutes(server.GetApp())
-	}
+	mqttSubHandler := api.NewMQTTSubscriptionHandler(mqttManager, authManager, logger.Get("mqtt-subscriptions-api"))
+	mqttSubHandler.RegisterRoutes(server.GetApp())
 
 	// Initialize Tiered Storage (Enterprise feature - requires valid license)
 	// 2-tier system: Hot (local) -> Cold (S3/Azure archive)
