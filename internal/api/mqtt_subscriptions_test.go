@@ -62,10 +62,15 @@ func TestMQTTSubscriptionHandler_DisabledManager(t *testing.T) {
 			if err != nil {
 				t.Fatalf("app.Test: %v", err)
 			}
+			defer resp.Body.Close()
+
 			if resp.StatusCode != fiber.StatusServiceUnavailable {
 				t.Errorf("status: got %d, want 503", resp.StatusCode)
 			}
-			body, _ := io.ReadAll(resp.Body)
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("io.ReadAll: %v", err)
+			}
 			var got map[string]any
 			if err := json.Unmarshal(body, &got); err != nil {
 				t.Fatalf("json.Unmarshal: %v (body=%s)", err, body)

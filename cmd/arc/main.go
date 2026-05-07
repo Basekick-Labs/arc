@@ -1515,12 +1515,14 @@ func main() {
 	clusterHandler := api.NewClusterHandler(clusterCoordinator, authManager, licenseClient, logger.Get("cluster-api"))
 	clusterHandler.RegisterRoutes(server.GetApp())
 
-	// MQTT API handlers are registered unconditionally — both MQTTHandler
+	// MQTT API handlers are registered unconditionally. Both MQTTHandler
 	// (stats/health) and MQTTSubscriptionHandler (CRUD/lifecycle) nil-guard
-	// every endpoint and return 503 with a "MQTT subsystem disabled" body when
-	// manager is nil. This gives monitors and ops dashboards a stable, documented
-	// response shape across all MQTT routes instead of a 404 on some and 503 on
-	// others. Regression tests in internal/api/mqtt_test.go and
+	// every endpoint when manager is nil, returning a stable, documented shape
+	// instead of letting some routes 404 and others 503. Most return 503 with
+	// "MQTT subsystem disabled" — except MQTTHandler.handleHealth, which
+	// returns 200 with `{"status":"disabled","healthy":false}` so uptime
+	// monitors don't page operators about a configured-off subsystem.
+	// Regression tests in internal/api/mqtt_test.go and
 	// internal/api/mqtt_subscriptions_test.go pin the disabled-response shape.
 	mqttHandler := api.NewMQTTHandler(mqttManager, authManager, logger.Get("mqtt-api"))
 	mqttHandler.RegisterRoutes(server.GetApp())

@@ -24,7 +24,11 @@ func NewMQTTSubscriptionHandler(manager mqtt.Manager, authManager *auth.AuthMana
 	}
 }
 
-// RegisterRoutes registers the MQTT subscription API routes
+// RegisterRoutes registers the MQTT subscription API routes.
+//
+// The requireEnabled middleware is applied to the route group so every current
+// and future endpoint is automatically guarded against a nil manager. This is
+// the project policy for MQTT API surfaces — see also MQTTHandler in mqtt.go.
 func (h *MQTTSubscriptionHandler) RegisterRoutes(app *fiber.App) {
 	subs := app.Group("/api/v1/mqtt/subscriptions")
 
@@ -32,6 +36,11 @@ func (h *MQTTSubscriptionHandler) RegisterRoutes(app *fiber.App) {
 	if h.authManager != nil {
 		subs.Use(auth.RequireAdmin(h.authManager))
 	}
+
+	// Short-circuit with 503 when MQTT is disabled at wiring time. Applied as
+	// middleware so future handlers are protected automatically, no per-handler
+	// boilerplate required.
+	subs.Use(h.requireEnabled)
 
 	// CRUD endpoints
 	subs.Post("/", h.handleCreate)
@@ -50,34 +59,23 @@ func (h *MQTTSubscriptionHandler) RegisterRoutes(app *fiber.App) {
 	subs.Get("/:id/stats", h.handleStats)
 }
 
-// requireEnabled short-circuits a handler with 503 when the MQTT subsystem is
-// disabled at wiring time (manager is nil). Mirrors the MQTTHandler nil-guard
-// policy so all MQTT API endpoints have one consistent disabled-response shape.
-//
-// Each handler must call this as its first statement:
-//
-//	if handled, err := h.requireEnabled(c); handled {
-//	    return err
-//	}
-//
-// The two-return form is required because Fiber response writes return nil on
-// success — a single-error return can't distinguish "I wrote the 503, stop"
-// from "MQTT is enabled, proceed". Regression coverage in mqtt_subscriptions_test.go.
-func (h *MQTTSubscriptionHandler) requireEnabled(c *fiber.Ctx) (handled bool, err error) {
+// requireEnabled is Fiber middleware that short-circuits the request chain with
+// 503 + "MQTT subsystem disabled" body when the manager is nil. When MQTT is
+// enabled it calls c.Next() so the actual handler runs. Mirrors the
+// MQTTHandler nil-guard policy so all MQTT API endpoints share one consistent
+// disabled-response shape. Regression coverage in mqtt_subscriptions_test.go.
+func (h *MQTTSubscriptionHandler) requireEnabled(c *fiber.Ctx) error {
 	if h.manager == nil {
-		return true, c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 			"success": false,
 			"error":   "MQTT subsystem disabled",
 		})
 	}
-	return false, nil
+	return c.Next()
 }
 
 // handleCreate creates a new subscription
 func (h *MQTTSubscriptionHandler) handleCreate(c *fiber.Ctx) error {
-	if handled, err := h.requireEnabled(c); handled {
-		return err
-	}
 	var req mqtt.CreateSubscriptionRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -111,9 +109,6 @@ func (h *MQTTSubscriptionHandler) handleCreate(c *fiber.Ctx) error {
 
 // handleList lists all subscriptions
 func (h *MQTTSubscriptionHandler) handleList(c *fiber.Ctx) error {
-	if handled, err := h.requireEnabled(c); handled {
-		return err
-	}
 	subscriptions, err := h.manager.List(c.Context())
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to list subscriptions")
@@ -132,9 +127,6 @@ func (h *MQTTSubscriptionHandler) handleList(c *fiber.Ctx) error {
 
 // handleGet retrieves a subscription by ID
 func (h *MQTTSubscriptionHandler) handleGet(c *fiber.Ctx) error {
-	if handled, err := h.requireEnabled(c); handled {
-		return err
-	}
 	id := c.Params("id")
 
 	sub, err := h.manager.Get(c.Context(), id)
@@ -154,9 +146,6 @@ func (h *MQTTSubscriptionHandler) handleGet(c *fiber.Ctx) error {
 
 // handleUpdate updates a subscription
 func (h *MQTTSubscriptionHandler) handleUpdate(c *fiber.Ctx) error {
-	if handled, err := h.requireEnabled(c); handled {
-		return err
-	}
 	id := c.Params("id")
 
 	var req mqtt.UpdateSubscriptionRequest
@@ -195,9 +184,6 @@ func (h *MQTTSubscriptionHandler) handleUpdate(c *fiber.Ctx) error {
 
 // handleDelete deletes a subscription
 func (h *MQTTSubscriptionHandler) handleDelete(c *fiber.Ctx) error {
-	if handled, err := h.requireEnabled(c); handled {
-		return err
-	}
 	id := c.Params("id")
 
 	if err := h.manager.Delete(c.Context(), id); err != nil {
@@ -218,9 +204,6 @@ func (h *MQTTSubscriptionHandler) handleDelete(c *fiber.Ctx) error {
 
 // handleStart starts a subscription
 func (h *MQTTSubscriptionHandler) handleStart(c *fiber.Ctx) error {
-	if handled, err := h.requireEnabled(c); handled {
-		return err
-	}
 	id := c.Params("id")
 
 	if err := h.manager.StartSubscription(c.Context(), id); err != nil {
@@ -249,9 +232,6 @@ func (h *MQTTSubscriptionHandler) handleStart(c *fiber.Ctx) error {
 
 // handleStop stops a subscription
 func (h *MQTTSubscriptionHandler) handleStop(c *fiber.Ctx) error {
-	if handled, err := h.requireEnabled(c); handled {
-		return err
-	}
 	id := c.Params("id")
 
 	if err := h.manager.StopSubscription(c.Context(), id); err != nil {
@@ -280,9 +260,6 @@ func (h *MQTTSubscriptionHandler) handleStop(c *fiber.Ctx) error {
 
 // handlePause pauses a subscription
 func (h *MQTTSubscriptionHandler) handlePause(c *fiber.Ctx) error {
-	if handled, err := h.requireEnabled(c); handled {
-		return err
-	}
 	id := c.Params("id")
 
 	if err := h.manager.PauseSubscription(c.Context(), id); err != nil {
@@ -311,9 +288,6 @@ func (h *MQTTSubscriptionHandler) handlePause(c *fiber.Ctx) error {
 
 // handleRestart restarts a subscription (stop + start)
 func (h *MQTTSubscriptionHandler) handleRestart(c *fiber.Ctx) error {
-	if handled, err := h.requireEnabled(c); handled {
-		return err
-	}
 	id := c.Params("id")
 
 	if err := h.manager.RestartSubscription(c.Context(), id); err != nil {
@@ -335,9 +309,6 @@ func (h *MQTTSubscriptionHandler) handleRestart(c *fiber.Ctx) error {
 
 // handleStats returns statistics for a subscription
 func (h *MQTTSubscriptionHandler) handleStats(c *fiber.Ctx) error {
-	if handled, err := h.requireEnabled(c); handled {
-		return err
-	}
 	id := c.Params("id")
 
 	stats, err := h.manager.GetStats(c.Context(), id)
