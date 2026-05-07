@@ -1598,3 +1598,156 @@ func TestPuller_CatchUpFailure_ConcurrentWorkerIsolation(t *testing.T) {
 		t.Errorf("catchupFailed after recordCatchUpFailure: got %d, want 1", got)
 	}
 }
+
+// TestPuller_MarkCatchUp_DropCompensation pins the CRITICAL fix from PR
+// #419 review pass 4: when RunCatchUp pre-marks a path then Enqueue
+// returns "dropped" (queue full), the walker must unmark the catch-up
+// tag — otherwise no worker will ever run inflightRemove for that path,
+// catchupInflight leaks upward, and FullyCaughtUp never returns true
+// (gate permanently closed).
+func TestPuller_MarkCatchUp_DropCompensation(t *testing.T) {
+	p := newTestPuller(t, newFakeBackend(),
+		newFakeFetcher(fakeFetchResult{body: []byte("ignored")}),
+		staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+
+	const path = "db/m/2026/05/07/14/dropped.parquet"
+
+	// Walker pre-marks the path.
+	added := p.markCatchUp(path)
+	if !added {
+		t.Fatalf("markCatchUp first call: got false, want true (path was not previously tagged)")
+	}
+	if got := p.catchupInflight.Load(); got != 1 {
+		t.Fatalf("catchupInflight after mark: got %d, want 1", got)
+	}
+
+	// Simulate Enqueue dropping (queue full). Walker must compensate by
+	// unmarking. Without this, catchupInflight stays at 1 forever.
+	p.unmarkCatchUp(path)
+	if got := p.catchupInflight.Load(); got != 0 {
+		t.Errorf("catchupInflight after unmark on drop: got %d, want 0 (compensation must succeed)", got)
+	}
+
+	// Walker also records the drop separately so the gate stays red until
+	// a reactive callback resolves the missing file. The unmark and the
+	// drop record are independent bookkeeping — gate closes via
+	// catchupDropped, not via catchupInflight.
+	p.recordCatchUpDrop(path)
+	if got := p.catchupDropped.Load(); got != 1 {
+		t.Errorf("catchupDropped after recordCatchUpDrop: got %d, want 1", got)
+	}
+}
+
+// TestPuller_CatchUpDrop_SelfHeals pins the MEDIUM fix from PR #419
+// review pass 4: a catch-up drop must not require a process restart to
+// clear. When a reactive FSM callback later succeeds for a previously-
+// dropped path, catchupDropped decrements and the gate re-opens.
+func TestPuller_CatchUpDrop_SelfHeals(t *testing.T) {
+	p := newTestPuller(t, newFakeBackend(),
+		newFakeFetcher(fakeFetchResult{body: []byte("ignored")}),
+		staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+
+	const path = "db/m/2026/05/07/14/dropped.parquet"
+
+	// Walker recorded the path as dropped during catch-up.
+	p.catchupCompletedAt.Store(time.Now().Unix())
+	p.recordCatchUpDrop(path)
+
+	if got := p.catchupDropped.Load(); got != 1 {
+		t.Fatalf("catchupDropped after record: got %d, want 1", got)
+	}
+	if p.FullyCaughtUp() {
+		t.Errorf("FullyCaughtUp with catchupDropped=1: got true, want false")
+	}
+
+	// Reactive FSM callback later succeeds for the same path. Self-heal
+	// fires — the gate clears without a process restart.
+	p.clearCatchUpDrop(path)
+
+	if got := p.catchupDropped.Load(); got != 0 {
+		t.Errorf("catchupDropped after self-heal: got %d, want 0", got)
+	}
+	if !p.FullyCaughtUp() {
+		t.Errorf("FullyCaughtUp after clearCatchUpDrop: got false, want true")
+	}
+}
+
+// TestPuller_CatchUpDrop_RecordIsIdempotent verifies that recording the
+// same drop twice does not double-count. Mirrors the failure-path
+// idempotency contract.
+func TestPuller_CatchUpDrop_RecordIsIdempotent(t *testing.T) {
+	p := newTestPuller(t, newFakeBackend(),
+		newFakeFetcher(fakeFetchResult{body: []byte("ignored")}),
+		staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+
+	const path = "db/m/file.parquet"
+
+	p.recordCatchUpDrop(path)
+	p.recordCatchUpDrop(path)
+
+	if got := p.catchupDropped.Load(); got != 1 {
+		t.Errorf("catchupDropped after duplicate record: got %d, want 1 (idempotent)", got)
+	}
+
+	p.clearCatchUpDrop(path)
+	if got := p.catchupDropped.Load(); got != 0 {
+		t.Errorf("catchupDropped after clear: got %d, want 0", got)
+	}
+
+	// Clearing a path that is not dropped must not underflow.
+	p.clearCatchUpDrop(path)
+	if got := p.catchupDropped.Load(); got != 0 {
+		t.Errorf("catchupDropped after clear of non-dropped path: got %d, want 0 (must not underflow)", got)
+	}
+}
+
+// TestPuller_CatchUpStatus_BackwardCompatibleKeys pins the API contract
+// from PR #419 review pass 4: /api/v1/cluster/status consumers from
+// pre-#392 releases relied on `failed` / `dropped` / `skipped_dup` keys.
+// Those keys must still be present (now carrying catch-up-scoped values),
+// alongside the new explicit catchup_* keys and total_* cumulative keys.
+func TestPuller_CatchUpStatus_BackwardCompatibleKeys(t *testing.T) {
+	p := newTestPuller(t, newFakeBackend(),
+		newFakeFetcher(fakeFetchResult{body: []byte("ignored")}),
+		staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+
+	// Set distinguishable values so we can verify which counter populates which key.
+	p.catchupFailed.Store(3)
+	p.catchupDropped.Store(5)
+	p.totalFailed.Store(10)
+	p.totalDropped.Store(20)
+
+	status := p.CatchUpStatus()
+
+	// Backward-compat keys must exist and carry catch-up-scoped values.
+	for _, k := range []string{"started_at", "completed_at", "entries_walked", "enqueued", "skipped_local", "skipped_dup", "pulled", "failed", "dropped"} {
+		if _, ok := status[k]; !ok {
+			t.Errorf("CatchUpStatus missing backward-compat key %q", k)
+		}
+	}
+	if got := status["failed"]; got != 3 {
+		t.Errorf("status[failed]: got %d, want 3 (catch-up-scoped value)", got)
+	}
+	if got := status["dropped"]; got != 5 {
+		t.Errorf("status[dropped]: got %d, want 5 (catch-up-scoped value)", got)
+	}
+
+	// New scoped keys.
+	if got := status["catchup_failed"]; got != 3 {
+		t.Errorf("status[catchup_failed]: got %d, want 3", got)
+	}
+	if got := status["catchup_dropped"]; got != 5 {
+		t.Errorf("status[catchup_dropped]: got %d, want 5", got)
+	}
+	if _, ok := status["catchup_inflight"]; !ok {
+		t.Errorf("CatchUpStatus missing catchup_inflight key")
+	}
+
+	// Cumulative keys: distinguish from catch-up-scoped via different values.
+	if got := status["total_failed"]; got != 10 {
+		t.Errorf("status[total_failed]: got %d, want 10 (cumulative)", got)
+	}
+	if got := status["total_dropped"]; got != 20 {
+		t.Errorf("status[total_dropped]: got %d, want 20 (cumulative)", got)
+	}
+}

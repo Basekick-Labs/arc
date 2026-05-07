@@ -188,25 +188,25 @@ type Puller struct {
 	// is the atomic counterpart for lock-free reads.
 	//
 	// catchupFailedPaths holds catch-up paths whose pull permanently gave up
-	// after retries. Tracked so a later successful pull (reactive FSM
-	// callback after the underlying issue clears) can decrement
-	// catchupFailed and let the gate self-heal without a process restart.
-	// Both sets share catchupPathsMu — they're both catch-up bookkeeping
-	// and the lock is only ever held for tiny critical sections.
-	catchupPathsMu     sync.Mutex
-	catchupPaths       map[string]struct{}
-	catchupFailedPaths map[string]struct{}
-	catchupInflight    atomic.Int64
+	// after retries. catchupDroppedPaths holds catch-up paths the walker
+	// could not enqueue because the queue was full. Both are tracked so a
+	// later successful pull (reactive FSM callback after the underlying
+	// issue clears, or a subsequent catch-up scan) can decrement the
+	// corresponding scoped counter and let the gate self-heal without a
+	// process restart. All three sets share catchupPathsMu — they're all
+	// catch-up bookkeeping and the lock is only ever held for tiny critical
+	// sections.
+	catchupPathsMu      sync.Mutex
+	catchupPaths        map[string]struct{}
+	catchupFailedPaths  map[string]struct{}
+	catchupDroppedPaths map[string]struct{}
+	catchupInflight     atomic.Int64
 
 	// catchupFailed / catchupDropped count failures and drops scoped to the
 	// catch-up batch only. FullyCaughtUp uses these (not the cumulative
 	// totalFailed / totalDropped) so transient steady-state failures don't
-	// keep the gate red forever. catchupFailed self-heals when a later pull
-	// (reactive or otherwise) succeeds for a previously-failed path; see
-	// clearCatchUpFailure. catchupDropped does NOT self-heal — a drop means
-	// the walker never enqueued the entry, so there's no inflight slot to
-	// later decrement; the path will be retried by a reactive FSM callback
-	// or the next catch-up scan.
+	// keep the gate red forever. Both self-heal when a later pull succeeds
+	// for the affected path — see clearCatchUpFailure / clearCatchUpDrop.
 	catchupFailed  atomic.Int64
 	catchupDropped atomic.Int64
 }
@@ -250,12 +250,13 @@ func New(cfg Config) (*Puller, error) {
 	}
 
 	return &Puller{
-		cfg:                cfg,
-		queue:              make(chan *raft.FileEntry, cfg.QueueSize),
-		inflight:           make(map[string]struct{}),
-		catchupPaths:       make(map[string]struct{}),
-		catchupFailedPaths: make(map[string]struct{}),
-		logger:             cfg.Logger.With().Str("component", "file-puller").Logger(),
+		cfg:                 cfg,
+		queue:               make(chan *raft.FileEntry, cfg.QueueSize),
+		inflight:            make(map[string]struct{}),
+		catchupPaths:        make(map[string]struct{}),
+		catchupFailedPaths:  make(map[string]struct{}),
+		catchupDroppedPaths: make(map[string]struct{}),
+		logger:              cfg.Logger.With().Str("component", "file-puller").Logger(),
 	}, nil
 }
 
@@ -297,17 +298,40 @@ func (p *Puller) inflightRemove(path string) {
 	p.catchupPathsMu.Unlock()
 }
 
-// markCatchUp records that a path was specifically enqueued by the catch-up
-// walker (not by a steady-state FSM callback). Called from RunCatchUp after
-// a successful Enqueue. Idempotent: a duplicate add is a no-op.
-func (p *Puller) markCatchUp(path string) {
+// markCatchUp records that a path is being enqueued by the catch-up walker
+// (not by a steady-state FSM callback). Must be called BEFORE p.Enqueue —
+// Enqueue is non-blocking and a fast worker can complete the pull and call
+// inflightRemove (which clears the tag) before the walker's call to
+// markCatchUp ran. Marking after Enqueue would leak a stale tag and
+// permanently bump catchupInflight, bricking the gate.
+//
+// Returns true when this call actually added the tag (and incremented
+// catchupInflight). Returns false when the path was already tagged
+// (idempotent re-mark). RunCatchUp uses the return value to compensate
+// the increment if Enqueue ends up dropping the entry.
+func (p *Puller) markCatchUp(path string) bool {
 	p.catchupPathsMu.Lock()
 	defer p.catchupPathsMu.Unlock()
 	if _, ok := p.catchupPaths[path]; ok {
-		return
+		return false
 	}
 	p.catchupPaths[path] = struct{}{}
 	p.catchupInflight.Add(1)
+	return true
+}
+
+// unmarkCatchUp removes a catch-up tag and decrements catchupInflight.
+// Called by RunCatchUp to compensate when Enqueue drops an entry that was
+// pre-marked: with no inflight slot taken, no future inflightRemove will
+// run for this path, so the tag would otherwise leak.
+func (p *Puller) unmarkCatchUp(path string) {
+	p.catchupPathsMu.Lock()
+	defer p.catchupPathsMu.Unlock()
+	if _, ok := p.catchupPaths[path]; !ok {
+		return
+	}
+	delete(p.catchupPaths, path)
+	p.catchupInflight.Add(-1)
 }
 
 // isCatchUpPath reports whether a path is currently tagged as catch-up-
@@ -350,6 +374,36 @@ func (p *Puller) clearCatchUpFailure(path string) {
 	}
 	delete(p.catchupFailedPaths, path)
 	p.catchupFailed.Add(-1)
+}
+
+// recordCatchUpDrop adds a path to the dropped-catch-up set and increments
+// the catch-up drop counter. Called from RunCatchUp when the queue is full
+// and the walker can't enqueue an entry — there's no inflight slot to
+// later decrement, so we track the path here and rely on a reactive FSM
+// callback (or subsequent catch-up scan) to eventually pull it. Idempotent.
+func (p *Puller) recordCatchUpDrop(path string) {
+	p.catchupPathsMu.Lock()
+	defer p.catchupPathsMu.Unlock()
+	if _, ok := p.catchupDroppedPaths[path]; ok {
+		return
+	}
+	p.catchupDroppedPaths[path] = struct{}{}
+	p.catchupDropped.Add(1)
+}
+
+// clearCatchUpDrop decrements the catch-up drop counter if the given path
+// was previously recorded as dropped. Called from processEntry's success
+// path so a reactive FSM callback succeeding for a previously-dropped
+// path can heal the gate without a process restart. No-op if the path
+// was not previously dropped.
+func (p *Puller) clearCatchUpDrop(path string) {
+	p.catchupPathsMu.Lock()
+	defer p.catchupPathsMu.Unlock()
+	if _, ok := p.catchupDroppedPaths[path]; !ok {
+		return
+	}
+	delete(p.catchupDroppedPaths, path)
+	p.catchupDropped.Add(-1)
 }
 
 // Start launches the worker pool. Safe to call multiple times — subsequent
@@ -492,15 +546,15 @@ func (p *Puller) CatchUpCompleted() bool {
 // has finished bootstrapping its view of the cluster manifest," not
 // "no pulls are happening anywhere right now."
 //
-// Self-heal: catchupFailed is decremented when a later pull (reactive FSM
-// callback or otherwise) succeeds for a previously-failed path, so a
-// transient peer outage that resolves itself doesn't require a process
-// restart to clear the gate. catchupDropped does NOT self-heal — a drop
-// means the walker never enqueued the entry, so there's no inflight slot
-// to later resolve; recovery in that case is via a reactive FSM callback
-// re-enqueueing the path (which on success will not affect catchupDropped
-// but means the file is now present and the next catch-up scan or
-// restart will clear the count).
+// Self-heal: catchupFailed and catchupDropped both decrement when a later
+// pull (reactive FSM callback or otherwise) succeeds for a previously-
+// affected path, so transient peer outages or queue-saturation events
+// during catch-up don't require a process restart to clear the gate. The
+// puller tracks the affected paths in catchupFailedPaths and
+// catchupDroppedPaths respectively; processEntry's success path calls
+// clearCatchUpFailure and clearCatchUpDrop unconditionally (both are no-
+// ops when the path was never recorded), so any successful pull is a
+// recovery event regardless of the original failure mode.
 //
 // Returns false (not ready) if:
 //   - the catch-up walker never ran or hasn't completed, OR
@@ -547,25 +601,44 @@ func (p *Puller) FullyCaughtUp() bool {
 // per call so the caller can mutate the result without affecting subsequent
 // callers.
 //
-// Fields are scoped to the catch-up batch where it matters: catchup_inflight,
-// catchup_failed, and catchup_dropped reflect only the walker-enqueued
-// entries (the values FullyCaughtUp consults), so a 503 body shows operators
-// the actual cold-start state, not steady-state ingest churn. Cumulative
-// counters (pulled, queue_depth, inflight_count) are still included for
-// dashboards and live progress checks.
+// Backward-compatible key names are preserved for /api/v1/cluster/status
+// consumers that landed in earlier releases (failed, dropped, skipped_dup).
+// New catch-up-scoped keys (catchup_failed, catchup_dropped, catchup_inflight)
+// are added alongside; they're the values FullyCaughtUp consumes. Cumulative
+// counters (total_failed, total_dropped) are exposed under their own keys
+// so dashboards can distinguish "catch-up batch had a hiccup" from
+// "steady-state has been having problems for hours."
 func (p *Puller) CatchUpStatus() map[string]int64 {
 	return map[string]int64{
-		"started_at":       p.catchupStartedAt.Load(),
-		"completed_at":     p.catchupCompletedAt.Load(),
-		"entries_walked":   p.catchupEntriesWalked.Load(),
-		"enqueued":         p.catchupEnqueued.Load(),
-		"skipped_local":    p.catchupSkippedLocal.Load(),
-		"pulled":           p.totalPulled.Load(),
+		// Catch-up walker progress (unchanged keys).
+		"started_at":     p.catchupStartedAt.Load(),
+		"completed_at":   p.catchupCompletedAt.Load(),
+		"entries_walked": p.catchupEntriesWalked.Load(),
+		"enqueued":       p.catchupEnqueued.Load(),
+		"skipped_local":  p.catchupSkippedLocal.Load(),
+		"skipped_dup":    p.totalSkippedDup.Load(),
+		"pulled":         p.totalPulled.Load(),
+
+		// Backward-compat aliases: in 26.06.1 these keys carry the
+		// catch-up-scoped values (matching what FullyCaughtUp uses) so
+		// pre-#392 dashboards naturally start showing the gate-relevant
+		// numbers without code changes. The cumulative counterparts are
+		// exposed below under total_*.
+		"failed":  p.catchupFailed.Load(),
+		"dropped": p.catchupDropped.Load(),
+
+		// New scoped keys: explicit names for new dashboards.
 		"catchup_inflight": p.catchupInflight.Load(),
 		"catchup_failed":   p.catchupFailed.Load(),
 		"catchup_dropped":  p.catchupDropped.Load(),
-		"queue_depth":      int64(len(p.queue)),
-		"inflight_count":   p.inflightCount.Load(),
+
+		// Cumulative counters (whole puller lifetime, not catch-up-scoped).
+		"total_failed":  p.totalFailed.Load(),
+		"total_dropped": p.totalDropped.Load(),
+
+		// Live queue/inflight depth.
+		"queue_depth":    int64(len(p.queue)),
+		"inflight_count": p.inflightCount.Load(),
 	}
 }
 
@@ -622,11 +695,12 @@ func (p *Puller) processEntry(log zerolog.Logger, entry *raft.FileEntry) {
 			// (reactive or otherwise) calls clearCatchUpFailure.
 			p.recordCatchUpFailure(entry.Path)
 		case succeeded:
-			// Pull succeeded. If this path had a prior catch-up failure,
-			// heal it so the gate can clear without a process restart.
-			// No-op when the path was never in the failed set, so safe to
-			// call on every success.
+			// Pull succeeded. If this path had a prior catch-up failure or
+			// drop, heal it so the gate can clear without a process restart.
+			// Both are no-ops when the path was never in the corresponding
+			// set, so safe to call on every success regardless of history.
 			p.clearCatchUpFailure(entry.Path)
+			p.clearCatchUpDrop(entry.Path)
 		}
 		p.inflightRemove(entry.Path)
 	}()

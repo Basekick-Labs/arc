@@ -89,12 +89,31 @@ func (p *Puller) RunCatchUp(ctx context.Context, entries []*raft.FileEntry) {
 			}
 		}
 
+		// Fast-path: if origin is self, Enqueue would skip and we don't
+		// want to leak a catch-up tag for a file that's already local by
+		// construction. Mirror the check Enqueue does internally to keep
+		// the path-tagging semantics clean.
+		if entry.OriginNodeID == p.cfg.SelfNodeID {
+			p.totalSkippedSelf.Add(1)
+			p.catchupSkippedLocal.Add(1)
+			continue
+		}
+
+		// Mark BEFORE Enqueue. Enqueue is non-blocking and a fast worker
+		// could pick up the entry, complete the pull, and call
+		// inflightRemove (which clears catch-up tags) before the walker's
+		// markCatchUp runs. Marking before closes that race: by the time
+		// the worker can reach inflightRemove, the tag is already in
+		// catchupPaths and inflightRemove will clean it up correctly.
+		// markCatchUp is idempotent; a re-mark of a path already in the
+		// set is a no-op so duplicate paths don't drift catchupInflight.
+		marked := p.markCatchUp(entry.Path)
+
 		// Snapshot Enqueue-side counters so we can tell why this entry was
 		// accepted, deduped, or dropped. Counters are monotonic atomics so a
 		// simple before/after comparison is race-free.
 		beforeEnqueued := p.totalEnqueued.Load()
 		beforeSkippedDup := p.totalSkippedDup.Load()
-		beforeSkippedSelf := p.totalSkippedSelf.Load()
 		beforeDropped := p.totalDropped.Load()
 
 		p.Enqueue(entry)
@@ -102,28 +121,23 @@ func (p *Puller) RunCatchUp(ctx context.Context, entries []*raft.FileEntry) {
 		switch {
 		case p.totalEnqueued.Load() > beforeEnqueued:
 			p.catchupEnqueued.Add(1)
-			// Tag this path as catch-up so FullyCaughtUp can scope its
-			// "still draining" check to the cold-start batch and ignore
-			// steady-state ingest. Tag fires only when Enqueue accepted
-			// the entry (it's now in inflight); workers clear the tag on
-			// processEntry's defer.
-			p.markCatchUp(entry.Path)
 		case p.totalSkippedDup.Load() > beforeSkippedDup:
 			// Already enqueued (by a reactive callback or a prior walker
 			// entry with the same path) — count as skipped so the caller
-			// can see it happened. The path is already in inflight so
-			// FullyCaughtUp will see it through inflightCount; no extra
-			// tagging needed.
-			p.catchupSkippedLocal.Add(1)
-		case p.totalSkippedSelf.Load() > beforeSkippedSelf:
-			// Origin is self — file is already local by construction.
+			// can see it happened. The path is already in inflight; if
+			// markCatchUp added a tag here it stays valid because
+			// inflightRemove will clean it on whichever pull resolves.
 			p.catchupSkippedLocal.Add(1)
 		case p.totalDropped.Load() > beforeDropped:
-			// Queue full even after backpressure sleep — give up on this
-			// entry; a future restart or reactive callback will retry.
-			// Bump the catch-up-scoped counter so FullyCaughtUp sees the
-			// gap (steady-state drops don't count against the gate).
-			p.catchupDropped.Add(1)
+			// Queue full even after backpressure sleep. No worker will run
+			// inflightRemove for this path, so we have to compensate the
+			// tag and counter ourselves to avoid leaking a stale catch-up
+			// inflight slot. Then record the drop with the path so it can
+			// self-heal when a reactive FSM callback later succeeds.
+			if marked {
+				p.unmarkCatchUp(entry.Path)
+			}
+			p.recordCatchUpDrop(entry.Path)
 		}
 	}
 
