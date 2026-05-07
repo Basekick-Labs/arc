@@ -94,15 +94,11 @@ func (h *MQTTHandler) handleStats(c *fiber.Ctx) error {
 // handleHealth returns MQTT subsystem health status
 func (h *MQTTHandler) handleHealth(c *fiber.Ctx) error {
 	if h.manager == nil {
-		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+		// "disabled" is a steady state, not a degraded one — return 200 so
+		// uptime checks don't page operators about a configured-off subsystem.
+		return c.JSON(fiber.Map{
 			"status":  "disabled",
 			"healthy": false,
-			"subscriptions": fiber.Map{
-				"total":   0,
-				"running": 0,
-				"stopped": 0,
-				"errors":  0,
-			},
 		})
 	}
 	stats, err := h.manager.GetAllStats(c.Context())
