@@ -40,6 +40,12 @@ func (h *MQTTHandler) RegisterRoutes(app *fiber.App) {
 
 // handleStats returns statistics for all MQTT subscriptions
 func (h *MQTTHandler) handleStats(c *fiber.Ctx) error {
+	if h.manager == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"success": false,
+			"error":   "MQTT subsystem disabled",
+		})
+	}
 	stats, err := h.manager.GetAllStats(c.Context())
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to get MQTT stats")
@@ -87,6 +93,14 @@ func (h *MQTTHandler) handleStats(c *fiber.Ctx) error {
 
 // handleHealth returns MQTT subsystem health status
 func (h *MQTTHandler) handleHealth(c *fiber.Ctx) error {
+	if h.manager == nil {
+		// "disabled" is a steady state, not a degraded one — return 200 so
+		// uptime checks don't page operators about a configured-off subsystem.
+		return c.JSON(fiber.Map{
+			"status":  "disabled",
+			"healthy": false,
+		})
+	}
 	stats, err := h.manager.GetAllStats(c.Context())
 	if err != nil {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
