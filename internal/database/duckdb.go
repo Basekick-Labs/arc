@@ -44,22 +44,30 @@ func escapeSQLString(s string) string {
 	return strings.ReplaceAll(s, "'", "''")
 }
 
-// stripURLScheme removes a leading "http://" or "https://" prefix
-// (case-insensitive — RFC 3986 schemes are case-insensitive and users
-// routinely paste mixed-case from docs or IDE autocomplete).
-// DuckDB's httpfs extension expects a bare "host:port" in s3_endpoint and
-// prepends scheme based on s3_use_ssl. The AWS SDK accepts either form, so
-// users routinely include the scheme — passing it verbatim to DuckDB
-// produces "http://http://host:port/..." URLs that fail to resolve.
+// stripURLScheme normalises an S3 endpoint into the bare "host:port" form
+// that DuckDB's httpfs extension expects. The AWS SDK accepts either
+// "host:port" or "scheme://host:port[/]"; DuckDB does not. Passing scheme'd
+// or trailing-slashed input through verbatim produces "http://http://..."
+// URLs that fail to resolve.
+//
+// Strips, in order:
+//  - leading and trailing whitespace (paste artefacts),
+//  - leading "http://" or "https://" (case-insensitive — RFC 3986 schemes
+//    are case-insensitive and users routinely paste mixed-case),
+//  - trailing slashes ("host:port/" → "host:port").
+//
+// The case of the remainder is preserved (bucket names and path components
+// can be case-sensitive depending on the S3 implementation).
 func stripURLScheme(endpoint string) string {
+	endpoint = strings.TrimSpace(endpoint)
 	lower := strings.ToLower(endpoint)
-	if strings.HasPrefix(lower, "https://") {
-		return endpoint[len("https://"):]
+	switch {
+	case strings.HasPrefix(lower, "https://"):
+		endpoint = endpoint[len("https://"):]
+	case strings.HasPrefix(lower, "http://"):
+		endpoint = endpoint[len("http://"):]
 	}
-	if strings.HasPrefix(lower, "http://") {
-		return endpoint[len("http://"):]
-	}
-	return endpoint
+	return strings.TrimRight(endpoint, "/")
 }
 
 // Config holds DuckDB configuration

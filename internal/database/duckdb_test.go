@@ -87,7 +87,7 @@ func TestStripURLScheme(t *testing.T) {
 			expected: "",
 		},
 		{
-			name:     "https with path",
+			name:     "https with port",
 			input:    "https://garage.example.com:3900",
 			expected: "garage.example.com:3900",
 		},
@@ -120,6 +120,36 @@ func TestStripURLScheme(t *testing.T) {
 			name:     "preserve case in remainder",
 			input:    "http://MyBucket.example.com",
 			expected: "MyBucket.example.com",
+		},
+		{
+			name:     "trim trailing slash",
+			input:    "http://minio:9000/",
+			expected: "minio:9000",
+		},
+		{
+			name:     "trim multiple trailing slashes",
+			input:    "https://s3.amazonaws.com///",
+			expected: "s3.amazonaws.com",
+		},
+		{
+			name:     "trim trailing slash with no scheme",
+			input:    "minio:9000/",
+			expected: "minio:9000",
+		},
+		{
+			name:     "trim leading and trailing whitespace",
+			input:    "  http://minio:9000  ",
+			expected: "minio:9000",
+		},
+		{
+			name:     "trim whitespace and trailing slash combined",
+			input:    "  https://s3.amazonaws.com/  ",
+			expected: "s3.amazonaws.com",
+		},
+		{
+			name:     "whitespace only is empty",
+			input:    "   ",
+			expected: "",
 		},
 	}
 
