@@ -579,19 +579,10 @@ func (p *Puller) CatchUpCompleted() bool {
 // coordinator should treat ReplicationReady() as always true (the
 // configuration check in main.go enforces this).
 func (p *Puller) FullyCaughtUp() bool {
-	if p.catchupCompletedAt.Load() == 0 {
-		return false
-	}
-	if p.catchupInflight.Load() != 0 {
-		return false
-	}
-	if p.catchupFailed.Load() != 0 {
-		return false
-	}
-	if p.catchupDropped.Load() != 0 {
-		return false
-	}
-	return true
+	return p.catchupCompletedAt.Load() != 0 &&
+		p.catchupInflight.Load() == 0 &&
+		p.catchupFailed.Load() == 0 &&
+		p.catchupDropped.Load() == 0
 }
 
 // CatchUpStatus returns the subset of puller metrics that operators and the
