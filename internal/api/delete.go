@@ -809,8 +809,16 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 		return 0, nil, fmt.Errorf("failed to write filtered data: %w", err)
 	}
 
-	// Open temp file, compute SHA256 and size while streaming the upload via
-	// io.TeeReader — single pass over the file instead of two.
+	// Compute SHA256 by full-reading the temp file, then Seek(0,0) and pass
+	// the seekable *os.File to the storage backend. Two reads of the same
+	// file, but the second hits OS page cache so disk is touched once.
+	//
+	// We can't use io.TeeReader here (one pass instead of two): AWS SDK Go v2
+	// requires either TLS or a seekable body to compute the mandatory request
+	// checksum. TeeReader-wrapping an *os.File is non-seekable and breaks
+	// uploads to plain-HTTP S3 (MinIO, Garage) with:
+	//   "compute input header checksum failed, unseekable stream is not
+	//    supported without TLS and trailing checksum"
 	uploadFile, err := os.Open(tempPath)
 	if err != nil {
 		return 0, nil, fmt.Errorf("failed to open temp file for upload: %w", err)
@@ -824,11 +832,18 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 	sizeBytes := info.Size()
 
 	h256 := sha256.New()
-	tee := io.TeeReader(uploadFile, h256)
-	if err := h.storage.WriteReader(ctx, relativePath, tee, sizeBytes); err != nil {
-		return 0, nil, fmt.Errorf("failed to upload rewritten file to remote storage: %w", err)
+	if _, err := io.Copy(h256, uploadFile); err != nil {
+		return 0, nil, fmt.Errorf("failed to compute SHA256 of rewritten file: %w", err)
 	}
 	sha256hex := fmt.Sprintf("%x", h256.Sum(nil))
+
+	if _, err := uploadFile.Seek(0, io.SeekStart); err != nil {
+		return 0, nil, fmt.Errorf("failed to rewind rewritten file for upload: %w", err)
+	}
+
+	if err := h.storage.WriteReader(ctx, relativePath, uploadFile, sizeBytes); err != nil {
+		return 0, nil, fmt.Errorf("failed to upload rewritten file to remote storage: %w", err)
+	}
 
 	h.logger.Info().
 		Str("file", filepath.Base(relativePath)).
