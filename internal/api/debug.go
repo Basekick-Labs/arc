@@ -172,12 +172,18 @@ func (h *DebugHandler) handleFreeOSMemory(c *fiber.Ctx) error {
 	last := debugFreeOSMemoryLastNanos.Load()
 	// last==0 means "never fired" — first call always proceeds.
 	if last != 0 && now-last < int64(freeOSMemoryDebounce) {
-		// Compute remaining wait in time.Duration first so the conversion to
-		// seconds is a single rounding step instead of two truncating divisions.
+		// Round the remaining wait UP to the next whole second so a client
+		// retrying after retry_after_seconds is past the throttle window.
+		// Truncating could return 0 when 500ms remains and cause immediate
+		// retry storms.
 		remaining := freeOSMemoryDebounce - time.Duration(now-last)
+		retryAfter := int64(remaining / time.Second)
+		if remaining%time.Second != 0 {
+			retryAfter++
+		}
 		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
 			"error":               "throttled",
-			"retry_after_seconds": int64(remaining.Seconds()),
+			"retry_after_seconds": retryAfter,
 		})
 	}
 	if !debugFreeOSMemoryLastNanos.CompareAndSwap(last, now) {
