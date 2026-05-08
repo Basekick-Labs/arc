@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/rs/zerolog"
 )
 
@@ -27,6 +29,23 @@ const (
 	multipartPartSize = 16 * 1024 * 1024
 	// Concurrency for multipart upload
 	multipartConcurrency = 5
+)
+
+// HTTP transport bounds for the AWS SDK client. These cap the per-process
+// idle-connection state — the leak we care about is HTTP/2 frame buffers and
+// keep-alive metadata accumulating across long retention/delete sweeps. We do
+// not touch dial / handshake / response timeouts: those are already correct at
+// SDK defaults, and shortening them regresses cold-start and high-RTT setups.
+const (
+	// Total idle-conn cap across all hosts. Default Go is 100; we lower to bound
+	// memory growth on multi-bucket deployments.
+	s3MaxIdleConns = 100
+	// Per-host idle-conn cap. Sized to comfortably accommodate two concurrent
+	// multipart uploads (each at multipartConcurrency=5) without churning the
+	// pool — at least 2*multipartConcurrency, with headroom.
+	s3MaxIdleConnsPerHost = 16
+	// How long an idle connection survives in the pool. Matches Go default.
+	s3IdleConnTimeout = 90 * time.Second
 )
 
 // S3Backend implements the Backend interface for S3 and MinIO storage
@@ -94,6 +113,18 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 	} else {
 		log.Info().Msg("Using default credential chain for S3 (environment, IAM role, etc.)")
 	}
+
+	// Bounded HTTP transport: caps the idle-connection pool so per-connection
+	// HTTP/2 frame buffers and keep-alive metadata don't accumulate across
+	// long retention/delete sweeps. Honours AWS_CA_BUNDLE / proxy env vars
+	// because awshttp.NewBuildableClient builds on http.DefaultTransport.
+	httpClient := awshttp.NewBuildableClient().
+		WithTransportOptions(func(t *http.Transport) {
+			t.MaxIdleConns = s3MaxIdleConns
+			t.MaxIdleConnsPerHost = s3MaxIdleConnsPerHost
+			t.IdleConnTimeout = s3IdleConnTimeout
+		})
+	opts = append(opts, config.WithHTTPClient(httpClient))
 
 	// Load AWS config
 	awsCfg, err := config.LoadDefaultConfig(context.Background(), opts...)

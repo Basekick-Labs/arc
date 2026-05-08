@@ -1343,6 +1343,10 @@ func main() {
 	databasesHandler := api.NewDatabasesHandler(storageBackend, &cfg.Delete, authManager, logger.Get("databases"))
 	databasesHandler.RegisterRoutes(server.GetApp())
 
+	// Register Debug handler — admin-auth memory diagnostics
+	debugHandler := api.NewDebugHandler(db, authManager, logger.Get("debug"))
+	debugHandler.RegisterRoutes(server.GetApp())
+
 	// Register Retention handler
 	var retentionHandler *api.RetentionHandler
 	if cfg.Retention.Enabled {
