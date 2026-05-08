@@ -44,6 +44,32 @@ func escapeSQLString(s string) string {
 	return strings.ReplaceAll(s, "'", "''")
 }
 
+// stripURLScheme normalises an S3 endpoint into the bare "host:port" form
+// that DuckDB's httpfs extension expects. The AWS SDK accepts either
+// "host:port" or "scheme://host:port[/]"; DuckDB does not. Passing scheme'd
+// or trailing-slashed input through verbatim produces "http://http://..."
+// URLs that fail to resolve.
+//
+// Strips, in order:
+//  - leading and trailing whitespace (paste artefacts),
+//  - leading "http://" or "https://" (case-insensitive — RFC 3986 schemes
+//    are case-insensitive and users routinely paste mixed-case),
+//  - trailing slashes ("host:port/" → "host:port").
+//
+// The case of the remainder is preserved (bucket names and path components
+// can be case-sensitive depending on the S3 implementation).
+func stripURLScheme(endpoint string) string {
+	endpoint = strings.TrimSpace(endpoint)
+	lower := strings.ToLower(endpoint)
+	switch {
+	case strings.HasPrefix(lower, "https://"):
+		endpoint = endpoint[len("https://"):]
+	case strings.HasPrefix(lower, "http://"):
+		endpoint = endpoint[len("http://"):]
+	}
+	return strings.TrimRight(endpoint, "/")
+}
+
 // Config holds DuckDB configuration
 type Config struct {
 	MaxConnections int
@@ -195,7 +221,7 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 
 	// Set custom endpoint for MinIO or S3-compatible services
 	if cfg.S3Endpoint != "" {
-		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", escapeSQLString(cfg.S3Endpoint))); err != nil {
+		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", escapeSQLString(stripURLScheme(cfg.S3Endpoint)))); err != nil {
 			return fmt.Errorf("failed to set s3_endpoint: %w", err)
 		}
 	}
@@ -325,7 +351,7 @@ func (d *DuckDB) ConfigureS3(s3cfg *S3Config) error {
 
 	// Set custom endpoint for MinIO or S3-compatible services
 	if s3cfg.Endpoint != "" {
-		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", escapeSQLString(s3cfg.Endpoint))); err != nil {
+		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", escapeSQLString(stripURLScheme(s3cfg.Endpoint)))); err != nil {
 			return fmt.Errorf("failed to set s3_endpoint: %w", err)
 		}
 	}
