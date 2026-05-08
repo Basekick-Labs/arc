@@ -187,9 +187,10 @@ func (h *DebugHandler) handleFreeOSMemory(c *fiber.Ctx) error {
 	dur := time.Since(start)
 	runtime.ReadMemStats(&after)
 
-	// Use signed math so a transient drop in HeapReleased between calls does
-	// not wrap to ~2^64.
-	delta := int64(after.HeapReleased) - int64(before.HeapReleased)
+	// Subtract on the uint64s first then reinterpret as int64. For realistic
+	// HeapReleased values (well under 2^63) this produces the correct signed
+	// delta, including a negative value if the counter went backwards.
+	delta := int64(after.HeapReleased - before.HeapReleased)
 
 	return c.JSON(fiber.Map{
 		"timestamp":            time.Now().UTC().Format(time.RFC3339Nano),
