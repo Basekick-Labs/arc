@@ -54,3 +54,56 @@ func TestEscapeSQLString(t *testing.T) {
 		})
 	}
 }
+
+func TestStripURLScheme(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "http scheme",
+			input:    "http://minio:9000",
+			expected: "minio:9000",
+		},
+		{
+			name:     "https scheme",
+			input:    "https://s3.amazonaws.com",
+			expected: "s3.amazonaws.com",
+		},
+		{
+			name:     "no scheme passthrough",
+			input:    "minio:9000",
+			expected: "minio:9000",
+		},
+		{
+			name:     "localhost no scheme",
+			input:    "localhost:9000",
+			expected: "localhost:9000",
+		},
+		{
+			name:     "empty string",
+			input:    "",
+			expected: "",
+		},
+		{
+			name:     "https with path",
+			input:    "https://garage.example.com:3900",
+			expected: "garage.example.com:3900",
+		},
+		{
+			name:     "scheme not at start does not match",
+			input:    "weird-host-http://name",
+			expected: "weird-host-http://name",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := stripURLScheme(tt.input)
+			if result != tt.expected {
+				t.Errorf("stripURLScheme(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}

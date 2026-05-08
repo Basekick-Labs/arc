@@ -44,6 +44,17 @@ func escapeSQLString(s string) string {
 	return strings.ReplaceAll(s, "'", "''")
 }
 
+// stripURLScheme removes a leading "http://" or "https://" prefix.
+// DuckDB's httpfs extension expects a bare "host:port" in s3_endpoint and
+// prepends scheme based on s3_use_ssl. The AWS SDK accepts either form, so
+// users routinely include the scheme — passing it verbatim to DuckDB
+// produces "http://http://host:port/..." URLs that fail to resolve.
+func stripURLScheme(endpoint string) string {
+	endpoint = strings.TrimPrefix(endpoint, "https://")
+	endpoint = strings.TrimPrefix(endpoint, "http://")
+	return endpoint
+}
+
 // Config holds DuckDB configuration
 type Config struct {
 	MaxConnections int
@@ -195,7 +206,7 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 
 	// Set custom endpoint for MinIO or S3-compatible services
 	if cfg.S3Endpoint != "" {
-		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", escapeSQLString(cfg.S3Endpoint))); err != nil {
+		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", escapeSQLString(stripURLScheme(cfg.S3Endpoint)))); err != nil {
 			return fmt.Errorf("failed to set s3_endpoint: %w", err)
 		}
 	}
@@ -325,7 +336,7 @@ func (d *DuckDB) ConfigureS3(s3cfg *S3Config) error {
 
 	// Set custom endpoint for MinIO or S3-compatible services
 	if s3cfg.Endpoint != "" {
-		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", escapeSQLString(s3cfg.Endpoint))); err != nil {
+		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", escapeSQLString(stripURLScheme(s3cfg.Endpoint)))); err != nil {
 			return fmt.Errorf("failed to set s3_endpoint: %w", err)
 		}
 	}
