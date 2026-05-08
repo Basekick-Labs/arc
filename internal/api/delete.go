@@ -64,18 +64,24 @@ func fileMetadata(path string) (sizeBytes int64, sha256hex string, err error) {
 	return n, fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
-// lastFreeOSMemoryNano is the last time freeOSMemoryThrottled fired, used to debounce GC calls.
-var lastFreeOSMemoryNano atomic.Int64
+// freeOSMemoryProcessStart anchors the throttle to the monotonic clock so wall
+// clock adjustments (NTP steps, manual `date` changes) cannot misbehave.
+var freeOSMemoryProcessStart = time.Now()
+
+// lastFreeOSMemoryNanos is the time freeOSMemoryThrottled last fired, stored
+// as nanoseconds since freeOSMemoryProcessStart (monotonic).
+var lastFreeOSMemoryNanos atomic.Int64
 
 // freeOSMemoryThrottled fires debug.FreeOSMemory in a goroutine at most once every 30 seconds.
 // This prevents GC storms when multiple concurrent delete/retention requests complete together.
 func freeOSMemoryThrottled() {
-	now := time.Now().UnixNano()
-	last := lastFreeOSMemoryNano.Load()
-	if now-last < int64(30*time.Second) {
+	now := time.Since(freeOSMemoryProcessStart).Nanoseconds()
+	last := lastFreeOSMemoryNanos.Load()
+	// last==0 means "never fired" — first call always proceeds.
+	if last != 0 && now-last < int64(30*time.Second) {
 		return
 	}
-	if lastFreeOSMemoryNano.CompareAndSwap(last, now) {
+	if lastFreeOSMemoryNanos.CompareAndSwap(last, now) {
 		go debug.FreeOSMemory()
 	}
 }
