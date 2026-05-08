@@ -96,6 +96,31 @@ func TestStripURLScheme(t *testing.T) {
 			input:    "weird-host-http://name",
 			expected: "weird-host-http://name",
 		},
+		{
+			name:     "uppercase HTTP scheme",
+			input:    "HTTP://minio:9000",
+			expected: "minio:9000",
+		},
+		{
+			name:     "uppercase HTTPS scheme",
+			input:    "HTTPS://s3.amazonaws.com",
+			expected: "s3.amazonaws.com",
+		},
+		{
+			name:     "mixed case Http scheme",
+			input:    "Http://minio:9000",
+			expected: "minio:9000",
+		},
+		{
+			name:     "mixed case Https scheme",
+			input:    "Https://s3.amazonaws.com",
+			expected: "s3.amazonaws.com",
+		},
+		{
+			name:     "preserve case in remainder",
+			input:    "http://MyBucket.example.com",
+			expected: "MyBucket.example.com",
+		},
 	}
 
 	for _, tt := range tests {
