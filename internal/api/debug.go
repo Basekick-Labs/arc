@@ -1,10 +1,7 @@
 package api
 
 import (
-	"bufio"
 	"context"
-	"fmt"
-	"os"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -131,8 +128,8 @@ func (h *DebugHandler) handleMemstats(c *fiber.Ctx) error {
 			NextGCBytes:       ms.NextGC,
 			NumGoroutine:      runtime.NumGoroutine(),
 		},
-		Process:       readProcStatus(),
-		GlibcHeap:     readGlibcHeap(),
+		Process:       readProcStatus(h.logger),
+		GlibcHeap:     readGlibcHeap(h.logger),
 		DuckDBSummary: h.duckdbMemSummary(ctx),
 	}
 
@@ -250,55 +247,11 @@ func (h *DebugHandler) duckdbMemSummary(parent context.Context) *duckdbMemSummar
 	return out
 }
 
-// readProcStatus parses /proc/self/status. Linux-only; returns nil elsewhere
-// or if the read failed (errors are logged at trace via the file handle and
-// surfaced as a missing Process field in the response).
-func readProcStatus() *processMemStats {
-	f, err := os.Open("/proc/self/status")
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-
-	out := &processMemStats{}
-	scanner := bufio.NewScanner(f)
-	// Match the buffer size used by readGlibcHeap so a future kernel that
-	// adds a long line to /proc/self/status doesn't silently truncate.
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := scanner.Text()
-		colon := strings.IndexByte(line, ':')
-		if colon < 0 {
-			continue
-		}
-		key := line[:colon]
-		val := strings.TrimSpace(line[colon+1:])
-		switch key {
-		case "VmRSS":
-			out.VmRSSBytes = parseKBLine(val)
-		case "VmSize":
-			out.VmSizeBytes = parseKBLine(val)
-		case "VmHWM":
-			out.VmHWMBytes = parseKBLine(val)
-		case "VmData":
-			out.VmDataBytes = parseKBLine(val)
-		case "RssAnon":
-			out.RssAnon = parseKBLine(val)
-		case "RssFile":
-			out.RssFile = parseKBLine(val)
-		}
-	}
-	// Scanner errors (truncated read, EIO, LSM denial mid-stream) are
-	// swallowed silently — this is a diagnostic-only path and partial data
-	// is still useful. Caller sees a partially-populated struct.
-	_ = scanner.Err()
-	return out
-}
-
 // parseKBLine parses "1234 kB" → 1234*1024. Returns 0 unless the line is in
 // the exact "<int> kB" shape that /proc/self/status emits — silently
 // rescaling a different-unit line (e.g. a future "1234 mB") would mis-report
-// memory by orders of magnitude on dashboards.
+// memory by orders of magnitude on dashboards. Used by the linux-only
+// readProcStatus implementation in debug_proc_linux.go.
 func parseKBLine(v string) uint64 {
 	fields := strings.Fields(v)
 	if len(fields) != 2 || fields[1] != "kB" {
@@ -309,54 +262,4 @@ func parseKBLine(v string) uint64 {
 		return 0
 	}
 	return n * 1024
-}
-
-// readGlibcHeap walks /proc/self/maps for the [heap] segment so we can see
-// the size of the program break — distinct from the mmap'd glibc arenas.
-// Together with VmRSS, this lets us tell whether RSS bloat is in [heap]
-// (single arena) or in mmap'd anonymous regions (multiple arenas).
-// Linux-only; returns nil elsewhere.
-func readGlibcHeap() *glibcHeapStats {
-	f, err := os.Open("/proc/self/maps")
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	// /proc/self/maps lines for some kernels exceed bufio's default 64 KiB
-	// when paths are deep. Give the scanner a 1 MiB ceiling.
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := scanner.Text()
-		// /proc/<pid>/maps emits "[heap]" as the trailing pseudo-pathname for the
-		// program-break segment (kernel fs/proc/task_mmu.c). Hardened kernels can
-		// strip pseudo-pathnames altogether — the function then silently returns
-		// nil and the response omits the glibc_heap field, which is fine.
-		fields := strings.Fields(line)
-		if len(fields) == 0 || fields[len(fields)-1] != "[heap]" {
-			continue
-		}
-		// fields[0] is "<startHex>-<endHex>"
-		dash := strings.IndexByte(fields[0], '-')
-		if dash < 0 {
-			continue
-		}
-		startHex := fields[0][:dash]
-		endHex := fields[0][dash+1:]
-		start, err1 := strconv.ParseUint(startHex, 16, 64)
-		end, err2 := strconv.ParseUint(endHex, 16, 64)
-		if err1 != nil || err2 != nil || end < start {
-			continue
-		}
-		return &glibcHeapStats{
-			HeapStartHex: fmt.Sprintf("0x%s", startHex),
-			HeapEndHex:   fmt.Sprintf("0x%s", endHex),
-			HeapSizeKB:   (end - start) / 1024,
-		}
-	}
-	// No [heap] segment found, or scanner errored mid-read. Both cases
-	// produce nil — diagnostic-only path, JSON omits glibc_heap.
-	_ = scanner.Err()
-	return nil
 }

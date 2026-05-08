@@ -37,8 +37,10 @@ const (
 // not touch dial / handshake / response timeouts: those are already correct at
 // SDK defaults, and shortening them regresses cold-start and high-RTT setups.
 const (
-	// Total idle-conn cap across all hosts. Default Go is 100; we lower to bound
-	// memory growth on multi-bucket deployments.
+	// Total idle-conn cap across all hosts. Matches Go's http.DefaultTransport
+	// default — the actual leak is bounded by MaxIdleConnsPerHost+IdleConnTimeout
+	// below; this is set explicitly so the bounds are self-documenting on the
+	// transport we ship rather than inherited from a future Go default change.
 	s3MaxIdleConns = 100
 	// Per-host idle-conn cap. Sized to comfortably accommodate two concurrent
 	// multipart uploads (each at multipartConcurrency=5) without churning the
