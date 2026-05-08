@@ -1271,3 +1271,556 @@ func TestPuller_NonAppendingBackendFallback(t *testing.T) {
 		t.Errorf("file content mismatch after fallback")
 	}
 }
+
+// --- FullyCaughtUp tests -----------------------------------------------------
+
+// TestPuller_FullyCaughtUp_FalseBeforeWalker covers the trivial case: a fresh
+// puller with no startup catch-up run is not "fully caught up" because we have
+// no signal that the walker has even seen the manifest yet.
+func TestPuller_FullyCaughtUp_FalseBeforeWalker(t *testing.T) {
+	backend := newFakeBackend()
+	fetcher := newFakeFetcher(fakeFetchResult{body: []byte("ignored")})
+	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
+
+	p := newTestPuller(t, backend, fetcher, resolver)
+
+	if p.FullyCaughtUp() {
+		t.Errorf("FullyCaughtUp before walker run: got true, want false")
+	}
+}
+
+// TestPuller_FullyCaughtUp_FalseWhileCatchupBatchInflight covers the
+// residual gap that shipped in Phase 3: CatchUpCompleted only signals that
+// the walker is done enqueueing — it does not wait for the catch-up
+// batch to settle. A reader in this state would still serve incomplete
+// results if the query path consulted only CatchUpCompleted. FullyCaughtUp
+// must return false while any catch-up-tagged path is still in flight.
+//
+// Note: only catch-up-tagged paths trigger the gate — see
+// TestPuller_FullyCaughtUp_IgnoresSteadyStateInflight for the
+// complementary case.
+func TestPuller_FullyCaughtUp_FalseWhileCatchupBatchInflight(t *testing.T) {
+	backend := newFakeBackend()
+	fetcher := newFakeFetcher(fakeFetchResult{body: []byte("ignored")})
+	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
+
+	p := newTestPuller(t, backend, fetcher, resolver)
+
+	// Simulate the walker finishing and tagging two paths as catch-up.
+	p.catchupCompletedAt.Store(time.Now().Unix())
+	p.markCatchUp("db/cpu/2026/05/07/14/file-1.parquet")
+	p.markCatchUp("db/cpu/2026/05/07/14/file-2.parquet")
+
+	if got := p.catchupInflight.Load(); got != 2 {
+		t.Fatalf("catchupInflight: got %d, want 2 (two tagged paths still in flight)", got)
+	}
+	if p.FullyCaughtUp() {
+		t.Errorf("FullyCaughtUp with 2 catch-up paths in flight: got true, want false")
+	}
+}
+
+// TestPuller_FullyCaughtUp_FalseAfterCatchupFailedPull covers the silent-
+// partial-results condition #392 closes: a walker-enqueued pull that
+// exhausted retries and gave up means the file is missing on this reader,
+// but processEntry's defer cleared the inflight slot. A naive "inflight==0"
+// predicate would say "ready" while data is missing. FullyCaughtUp must
+// check catchupFailed == 0.
+func TestPuller_FullyCaughtUp_FalseAfterCatchupFailedPull(t *testing.T) {
+	backend := newFakeBackend()
+	fetcher := newFakeFetcher(fakeFetchResult{body: []byte("ignored")})
+	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
+
+	p := newTestPuller(t, backend, fetcher, resolver)
+
+	// Walker finished, no catch-up inflight, but a catch-up-tagged pull gave
+	// up after retries.
+	p.catchupCompletedAt.Store(time.Now().Unix())
+	p.catchupFailed.Store(1)
+
+	if p.FullyCaughtUp() {
+		t.Errorf("FullyCaughtUp with catchupFailed=1: got true, want false (file missing on reader)")
+	}
+}
+
+// TestPuller_FullyCaughtUp_FalseAfterCatchupDroppedPull covers the same
+// silent-partial-results gap from a different cause: a walker-enqueued
+// entry was dropped because the queue was full. The inflight slot was
+// released, but the file was never pulled. FullyCaughtUp must check
+// catchupDropped == 0.
+func TestPuller_FullyCaughtUp_FalseAfterCatchupDroppedPull(t *testing.T) {
+	backend := newFakeBackend()
+	fetcher := newFakeFetcher(fakeFetchResult{body: []byte("ignored")})
+	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
+
+	p := newTestPuller(t, backend, fetcher, resolver)
+
+	// Walker finished, nothing in catch-up inflight, but a catch-up entry was
+	// dropped earlier when the queue was full.
+	p.catchupCompletedAt.Store(time.Now().Unix())
+	p.catchupDropped.Store(1)
+
+	if p.FullyCaughtUp() {
+		t.Errorf("FullyCaughtUp with catchupDropped=1: got true, want false (file missing on reader)")
+	}
+}
+
+// TestPuller_FullyCaughtUp_IgnoresSteadyStateFailures covers the gemini
+// review finding (PR #419, MEDIUM) that gating on cumulative totalFailed /
+// totalDropped would keep the gate red forever after any transient
+// steady-state failure. The catch-up-scoped counters fix this: cumulative
+// failures/drops outside the catch-up batch must NOT close the gate once
+// it has cleared.
+func TestPuller_FullyCaughtUp_IgnoresSteadyStateFailures(t *testing.T) {
+	backend := newFakeBackend()
+	fetcher := newFakeFetcher(fakeFetchResult{body: []byte("ignored")})
+	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
+
+	p := newTestPuller(t, backend, fetcher, resolver)
+
+	// Catch-up batch has settled cleanly.
+	p.catchupCompletedAt.Store(time.Now().Unix())
+
+	// A steady-state pull failed (e.g. transient network issue, peer rebooted).
+	// totalFailed bumps but the catch-up-scoped counter does not.
+	p.totalFailed.Store(3)
+	p.totalDropped.Store(2)
+
+	if !p.FullyCaughtUp() {
+		t.Errorf("FullyCaughtUp with steady-state totalFailed=3 / totalDropped=2 but clean catch-up batch: got false, want true (gate must not be sticky on cumulative counters)")
+	}
+}
+
+// TestPuller_FullyCaughtUp_IgnoresSteadyStateInflight covers the most
+// important behavioral change from the gemini review: in a busy cluster a
+// writer flushes files constantly, the puller enqueues steady-state pulls
+// continuously, and a naive "inflightCount == 0" predicate would mean the
+// reader returns 503 every few seconds in normal operation. The gate must
+// scope its inflight check to the catch-up batch only.
+func TestPuller_FullyCaughtUp_IgnoresSteadyStateInflight(t *testing.T) {
+	backend := newFakeBackend()
+	fetcher := newFakeFetcher(fakeFetchResult{body: []byte("ignored")})
+	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
+
+	p := newTestPuller(t, backend, fetcher, resolver)
+
+	// Catch-up batch has settled cleanly; inflightCount is 0 and so is the
+	// catch-up subset.
+	p.catchupCompletedAt.Store(time.Now().Unix())
+
+	// Simulate steady-state ingest: a reactive FSM callback fires Enqueue,
+	// which adds a path to inflight. catchupInflight stays 0 because this
+	// path was NOT walker-enqueued.
+	p.inflightAdd("steady-state/db/m/2026/05/07/14/file.parquet")
+	if got := p.inflightCount.Load(); got != 1 {
+		t.Fatalf("inflightCount: got %d, want 1 (steady-state add)", got)
+	}
+	if got := p.catchupInflight.Load(); got != 0 {
+		t.Fatalf("catchupInflight: got %d, want 0 (steady-state add must not affect catch-up scope)", got)
+	}
+
+	if !p.FullyCaughtUp() {
+		t.Errorf("FullyCaughtUp with steady-state inflight=1 but catchupInflight=0: got false, want true (gate must ignore steady-state ingest)")
+	}
+}
+
+// TestPuller_FullyCaughtUp_TrueWhenAllSettled covers the success path: walker
+// done, no inflight entries, no failures, no drops. This is the steady state
+// that the query gate consumes.
+func TestPuller_FullyCaughtUp_TrueWhenAllSettled(t *testing.T) {
+	backend := newFakeBackend()
+	fetcher := newFakeFetcher(fakeFetchResult{body: []byte("ignored")})
+	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
+
+	p := newTestPuller(t, backend, fetcher, resolver)
+
+	// Mark walker complete with no work ever enqueued: inflightCount is 0,
+	// totalFailed is 0, totalDropped is 0. FullyCaughtUp should be true.
+	p.catchupCompletedAt.Store(time.Now().Unix())
+
+	if !p.FullyCaughtUp() {
+		t.Errorf("FullyCaughtUp with walker done + clean counters: got false, want true")
+	}
+}
+
+// TestPuller_InflightCount_MirrorsMap verifies the atomic counter and the
+// inflight map cannot diverge under add/remove. The atomic is the hot-path
+// reader for FullyCaughtUp and Stats; if it drifts from the map the gate's
+// correctness guarantee is broken.
+func TestPuller_InflightCount_MirrorsMap(t *testing.T) {
+	backend := newFakeBackend()
+	fetcher := newFakeFetcher(fakeFetchResult{body: []byte("ignored")})
+	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
+
+	p := newTestPuller(t, backend, fetcher, resolver)
+
+	// Empty: counter == map.
+	if got := p.inflightCount.Load(); got != 0 {
+		t.Errorf("inflightCount on empty puller: got %d, want 0", got)
+	}
+
+	// Add three distinct paths.
+	p.inflightAdd("a")
+	p.inflightAdd("b")
+	p.inflightAdd("c")
+	if got := p.inflightCount.Load(); got != 3 {
+		t.Errorf("inflightCount after 3 adds: got %d, want 3", got)
+	}
+
+	// Re-add one (dedup): counter must not double-count.
+	if added := p.inflightAdd("a"); added {
+		t.Errorf("inflightAdd duplicate: got true, want false")
+	}
+	if got := p.inflightCount.Load(); got != 3 {
+		t.Errorf("inflightCount after duplicate add: got %d, want 3 (dedup)", got)
+	}
+
+	// Remove existing.
+	p.inflightRemove("a")
+	if got := p.inflightCount.Load(); got != 2 {
+		t.Errorf("inflightCount after remove: got %d, want 2", got)
+	}
+
+	// Remove non-existent: must not decrement below current.
+	p.inflightRemove("missing")
+	if got := p.inflightCount.Load(); got != 2 {
+		t.Errorf("inflightCount after no-op remove: got %d, want 2", got)
+	}
+
+	// Drain.
+	p.inflightRemove("b")
+	p.inflightRemove("c")
+	if got := p.inflightCount.Load(); got != 0 {
+		t.Errorf("inflightCount after drain: got %d, want 0", got)
+	}
+}
+
+// TestPuller_CatchUpFailure_SelfHeals verifies that a successful pull for
+// a previously-failed catch-up path decrements catchupFailed, so the gate
+// can clear without a process restart. Pins the recovery semantics gemini
+// flagged on the third review pass.
+func TestPuller_CatchUpFailure_SelfHeals(t *testing.T) {
+	backend := newFakeBackend()
+	fetcher := newFakeFetcher(fakeFetchResult{body: []byte("ignored")})
+	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
+
+	p := newTestPuller(t, backend, fetcher, resolver)
+
+	const path = "db/m/2026/05/07/14/flaky.parquet"
+
+	// Walker finished. Catch-up-tagged pull failed.
+	p.catchupCompletedAt.Store(time.Now().Unix())
+	p.recordCatchUpFailure(path)
+
+	if got := p.catchupFailed.Load(); got != 1 {
+		t.Fatalf("catchupFailed after first failure: got %d, want 1", got)
+	}
+	if p.FullyCaughtUp() {
+		t.Errorf("FullyCaughtUp with catchupFailed=1: got true, want false")
+	}
+
+	// A reactive FSM callback fires later, the underlying issue has cleared,
+	// and the pull succeeds. The gate must self-heal.
+	p.clearCatchUpFailure(path)
+
+	if got := p.catchupFailed.Load(); got != 0 {
+		t.Errorf("catchupFailed after self-heal: got %d, want 0", got)
+	}
+	if !p.FullyCaughtUp() {
+		t.Errorf("FullyCaughtUp after clearCatchUpFailure: got false, want true (gate must self-heal)")
+	}
+}
+
+// TestPuller_CatchUpFailure_RecordIsIdempotent verifies that recording the
+// same failure twice (which can happen if a path is re-enqueued, fails
+// again, and the worker calls recordCatchUpFailure a second time) does not
+// double-count. Without this, the counter could drift above the actual
+// number of failed paths and clearCatchUpFailure would never bring it
+// back to zero.
+func TestPuller_CatchUpFailure_RecordIsIdempotent(t *testing.T) {
+	p := newTestPuller(t, newFakeBackend(),
+		newFakeFetcher(fakeFetchResult{body: []byte("ignored")}),
+		staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+
+	const path = "db/m/2026/05/07/14/file.parquet"
+
+	p.recordCatchUpFailure(path)
+	p.recordCatchUpFailure(path)
+
+	if got := p.catchupFailed.Load(); got != 1 {
+		t.Errorf("catchupFailed after duplicate record: got %d, want 1 (idempotent)", got)
+	}
+
+	p.clearCatchUpFailure(path)
+	if got := p.catchupFailed.Load(); got != 0 {
+		t.Errorf("catchupFailed after clear: got %d, want 0", got)
+	}
+
+	// Clearing a path that is not failed must not underflow.
+	p.clearCatchUpFailure(path)
+	if got := p.catchupFailed.Load(); got != 0 {
+		t.Errorf("catchupFailed after clear of non-failed path: got %d, want 0 (must not underflow)", got)
+	}
+}
+
+// TestPuller_CatchUpFailure_ConcurrentWorkerIsolation verifies that a
+// catchupFailed bump is attributable to the specific worker that hit the
+// give-up path, not to whichever worker happens to be in processEntry's
+// defer when ANY worker increments totalFailed. This is the bug gemini's
+// HIGH-priority finding caught: using totalFailed.Load() > snapshot would
+// cause cross-pollination between workers.
+//
+// The test exercises the helper directly rather than racing real workers
+// so it's deterministic. Pins the contract: catchupFailed only increments
+// for paths recorded via recordCatchUpFailure.
+func TestPuller_CatchUpFailure_ConcurrentWorkerIsolation(t *testing.T) {
+	p := newTestPuller(t, newFakeBackend(),
+		newFakeFetcher(fakeFetchResult{body: []byte("ignored")}),
+		staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+
+	// Simulate the racey scenario: a steady-state worker bumps totalFailed
+	// (a non-catch-up path failed). Another worker is concurrently in its
+	// defer for a catch-up-tagged path that succeeded — the global counter
+	// has changed, but the local 'failed' bool is false, so the defer must
+	// not bump catchupFailed.
+	//
+	// We model this by directly mirroring what the defer does today: only
+	// bumping when the local 'failed' is true, regardless of any global
+	// counter motion.
+	p.totalFailed.Add(1) // Pretend worker B failed a steady-state path.
+
+	if got := p.catchupFailed.Load(); got != 0 {
+		t.Errorf("catchupFailed after totalFailed bump from non-catch-up worker: got %d, want 0 (no recordCatchUpFailure called)", got)
+	}
+
+	// Now record an actual catch-up failure and confirm it lands.
+	p.recordCatchUpFailure("catchup/path.parquet")
+	if got := p.catchupFailed.Load(); got != 1 {
+		t.Errorf("catchupFailed after recordCatchUpFailure: got %d, want 1", got)
+	}
+}
+
+// TestPuller_MarkCatchUp_DropCompensation pins the CRITICAL fix from PR
+// #419 review pass 4: when RunCatchUp pre-marks a path then Enqueue
+// returns "dropped" (queue full), the walker must unmark the catch-up
+// tag — otherwise no worker will ever run inflightRemove for that path,
+// catchupInflight leaks upward, and FullyCaughtUp never returns true
+// (gate permanently closed).
+func TestPuller_MarkCatchUp_DropCompensation(t *testing.T) {
+	p := newTestPuller(t, newFakeBackend(),
+		newFakeFetcher(fakeFetchResult{body: []byte("ignored")}),
+		staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+
+	const path = "db/m/2026/05/07/14/dropped.parquet"
+
+	// Walker pre-marks the path.
+	added := p.markCatchUp(path)
+	if !added {
+		t.Fatalf("markCatchUp first call: got false, want true (path was not previously tagged)")
+	}
+	if got := p.catchupInflight.Load(); got != 1 {
+		t.Fatalf("catchupInflight after mark: got %d, want 1", got)
+	}
+
+	// Simulate Enqueue dropping (queue full). Walker must compensate by
+	// unmarking. Without this, catchupInflight stays at 1 forever.
+	p.unmarkCatchUp(path)
+	if got := p.catchupInflight.Load(); got != 0 {
+		t.Errorf("catchupInflight after unmark on drop: got %d, want 0 (compensation must succeed)", got)
+	}
+
+	// Walker also records the drop separately so the gate stays red until
+	// a reactive callback resolves the missing file. The unmark and the
+	// drop record are independent bookkeeping — gate closes via
+	// catchupDropped, not via catchupInflight.
+	p.recordCatchUpDrop(path)
+	if got := p.catchupDropped.Load(); got != 1 {
+		t.Errorf("catchupDropped after recordCatchUpDrop: got %d, want 1", got)
+	}
+}
+
+// TestPuller_CatchUpDrop_SelfHeals pins the MEDIUM fix from PR #419
+// review pass 4: a catch-up drop must not require a process restart to
+// clear. When a reactive FSM callback later succeeds for a previously-
+// dropped path, catchupDropped decrements and the gate re-opens.
+func TestPuller_CatchUpDrop_SelfHeals(t *testing.T) {
+	p := newTestPuller(t, newFakeBackend(),
+		newFakeFetcher(fakeFetchResult{body: []byte("ignored")}),
+		staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+
+	const path = "db/m/2026/05/07/14/dropped.parquet"
+
+	// Walker recorded the path as dropped during catch-up.
+	p.catchupCompletedAt.Store(time.Now().Unix())
+	p.recordCatchUpDrop(path)
+
+	if got := p.catchupDropped.Load(); got != 1 {
+		t.Fatalf("catchupDropped after record: got %d, want 1", got)
+	}
+	if p.FullyCaughtUp() {
+		t.Errorf("FullyCaughtUp with catchupDropped=1: got true, want false")
+	}
+
+	// Reactive FSM callback later succeeds for the same path. Self-heal
+	// fires — the gate clears without a process restart.
+	p.clearCatchUpDrop(path)
+
+	if got := p.catchupDropped.Load(); got != 0 {
+		t.Errorf("catchupDropped after self-heal: got %d, want 0", got)
+	}
+	if !p.FullyCaughtUp() {
+		t.Errorf("FullyCaughtUp after clearCatchUpDrop: got false, want true")
+	}
+}
+
+// TestPuller_CatchUpDrop_RecordIsIdempotent verifies that recording the
+// same drop twice does not double-count. Mirrors the failure-path
+// idempotency contract.
+func TestPuller_CatchUpDrop_RecordIsIdempotent(t *testing.T) {
+	p := newTestPuller(t, newFakeBackend(),
+		newFakeFetcher(fakeFetchResult{body: []byte("ignored")}),
+		staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+
+	const path = "db/m/file.parquet"
+
+	p.recordCatchUpDrop(path)
+	p.recordCatchUpDrop(path)
+
+	if got := p.catchupDropped.Load(); got != 1 {
+		t.Errorf("catchupDropped after duplicate record: got %d, want 1 (idempotent)", got)
+	}
+
+	p.clearCatchUpDrop(path)
+	if got := p.catchupDropped.Load(); got != 0 {
+		t.Errorf("catchupDropped after clear: got %d, want 0", got)
+	}
+
+	// Clearing a path that is not dropped must not underflow.
+	p.clearCatchUpDrop(path)
+	if got := p.catchupDropped.Load(); got != 0 {
+		t.Errorf("catchupDropped after clear of non-dropped path: got %d, want 0 (must not underflow)", got)
+	}
+}
+
+// TestPuller_ProcessEntry_LateCatchUpTag pins gemini's HIGH-priority race
+// fix from PR #419 review pass 5. Scenario:
+//
+//  1. A reactive FSM callback enqueues path X. Worker A starts processEntry.
+//  2. The catch-up walker starts iterating, sees X in the manifest, calls
+//     markCatchUp(X). The tag is added AFTER worker A's processEntry began.
+//  3. Worker A's pull fails.
+//
+// Buggy (snapshot-at-entry) behavior: wasCatchUp captured at step 1 was
+// false; defer doesn't call recordCatchUpFailure even though the path is
+// now a catch-up path. inflightRemove decrements catchupInflight (which
+// markCatchUp incremented) but no failure is recorded — the file is
+// missing AND the gate clears. Silent partial results, exactly the
+// condition #392 closes.
+//
+// Fixed (check-in-defer) behavior: defer reads isCatchUpPath at outcome
+// time, sees the late tag, calls recordCatchUpFailure. Gate stays red.
+//
+// Test exercises the helper sequence directly to be deterministic — the
+// race is real but observing it with goroutines is flaky.
+func TestPuller_ProcessEntry_LateCatchUpTag(t *testing.T) {
+	p := newTestPuller(t, newFakeBackend(),
+		newFakeFetcher(fakeFetchResult{body: []byte("ignored")}),
+		staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+
+	const path = "db/m/2026/05/07/14/late-tag.parquet"
+
+	// Step 1: reactive enqueue puts the path in inflight (no catch-up tag).
+	p.inflightAdd(path)
+	if p.isCatchUpPath(path) {
+		t.Fatalf("path tagged as catch-up before walker ran: precondition violated")
+	}
+
+	// Step 2: walker tags the path AFTER the worker has begun processing.
+	// (Modeling the late-arriving markCatchUp call.)
+	p.markCatchUp(path)
+	if !p.isCatchUpPath(path) {
+		t.Fatalf("markCatchUp did not tag the path")
+	}
+
+	// Step 3: worker's pull fails. The defer's check-in-defer logic must
+	// see the late tag and call recordCatchUpFailure.
+	//
+	// We model the defer's exact decision: if isCatchUpPath returns true
+	// at outcome-time, recordCatchUpFailure runs. (The whole processEntry
+	// flow is exercised by other tests; here we're pinning the late-tag
+	// observation specifically.)
+	if p.isCatchUpPath(path) {
+		p.recordCatchUpFailure(path)
+	}
+
+	if got := p.catchupFailed.Load(); got != 1 {
+		t.Errorf("catchupFailed after late-tag failure: got %d, want 1 (defer must see late tag)", got)
+	}
+
+	// Cleanup parity: the worker's defer also runs inflightRemove which
+	// would clear the tag. Verify that inflightRemove drains both inflight
+	// AND catchupPaths so subsequent FullyCaughtUp checks are correct.
+	p.inflightRemove(path)
+	if p.isCatchUpPath(path) {
+		t.Errorf("isCatchUpPath after inflightRemove: got true, want false (tag must clear)")
+	}
+	if got := p.catchupInflight.Load(); got != 0 {
+		t.Errorf("catchupInflight after inflightRemove: got %d, want 0", got)
+	}
+	// catchupFailed remains 1 — the failure stuck. Self-heal happens via
+	// a subsequent successful pull, not via inflightRemove.
+	if got := p.catchupFailed.Load(); got != 1 {
+		t.Errorf("catchupFailed after inflightRemove: got %d, want 1 (failure must persist)", got)
+	}
+}
+
+// TestPuller_CatchUpStatus_KeySemantics pins the API contract for
+// /api/v1/cluster/status: pre-#392 keys (failed, dropped, skipped_dup,
+// pulled) keep their original cumulative whole-puller-lifetime semantics
+// so existing dashboards don't silently lose visibility into steady-state
+// problems. New catchup_* keys carry the catch-up-batch-scoped values
+// FullyCaughtUp consumes.
+func TestPuller_CatchUpStatus_KeySemantics(t *testing.T) {
+	p := newTestPuller(t, newFakeBackend(),
+		newFakeFetcher(fakeFetchResult{body: []byte("ignored")}),
+		staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+
+	// Distinguishable values so we can verify which counter populates which key.
+	p.catchupFailed.Store(3)
+	p.catchupDropped.Store(5)
+	p.totalFailed.Store(10)
+	p.totalDropped.Store(20)
+
+	status := p.CatchUpStatus()
+
+	// Pre-#392 keys must exist with cumulative semantics intact.
+	for _, k := range []string{"started_at", "completed_at", "entries_walked", "enqueued", "skipped_local", "skipped_dup", "pulled", "failed", "dropped"} {
+		if _, ok := status[k]; !ok {
+			t.Errorf("CatchUpStatus missing pre-#392 key %q", k)
+		}
+	}
+	if got := status["failed"]; got != 10 {
+		t.Errorf("status[failed]: got %d, want 10 (cumulative — pre-#392 dashboards rely on this)", got)
+	}
+	if got := status["dropped"]; got != 20 {
+		t.Errorf("status[dropped]: got %d, want 20 (cumulative — pre-#392 dashboards rely on this)", got)
+	}
+
+	// New catch-up-scoped keys for the gate.
+	if got := status["catchup_failed"]; got != 3 {
+		t.Errorf("status[catchup_failed]: got %d, want 3 (catch-up-scoped)", got)
+	}
+	if got := status["catchup_dropped"]; got != 5 {
+		t.Errorf("status[catchup_dropped]: got %d, want 5 (catch-up-scoped)", got)
+	}
+	if _, ok := status["catchup_inflight"]; !ok {
+		t.Errorf("CatchUpStatus missing catchup_inflight key")
+	}
+
+	// Live depths.
+	if _, ok := status["queue_depth"]; !ok {
+		t.Errorf("CatchUpStatus missing queue_depth key")
+	}
+	if _, ok := status["inflight_count"]; !ok {
+		t.Errorf("CatchUpStatus missing inflight_count key")
+	}
+}

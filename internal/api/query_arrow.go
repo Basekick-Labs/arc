@@ -392,7 +392,9 @@ func appendValueToBuilder(builder array.Builder, val interface{}, _ arrow.DataTy
 	}
 }
 
-// registerArrowRoutes registers Arrow-specific query endpoints
+// registerArrowRoutes registers Arrow-specific query endpoints. The Arrow path
+// is a user-facing read endpoint and gets the catch-up gate (#392) like the
+// JSON paths.
 func (h *QueryHandler) registerArrowRoutes(app *fiber.App) {
-	app.Post("/api/v1/query/arrow", h.executeQueryArrow)
+	app.Post("/api/v1/query/arrow", h.checkReplicationReady, h.executeQueryArrow)
 }
