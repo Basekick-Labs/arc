@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -171,9 +172,12 @@ func (h *DebugHandler) handleFreeOSMemory(c *fiber.Ctx) error {
 	last := debugFreeOSMemoryLastNanos.Load()
 	// last==0 means "never fired" — first call always proceeds.
 	if last != 0 && now-last < int64(freeOSMemoryDebounce) {
+		// Compute remaining wait in time.Duration first so the conversion to
+		// seconds is a single rounding step instead of two truncating divisions.
+		remaining := freeOSMemoryDebounce - time.Duration(now-last)
 		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
-			"error":              "throttled",
-			"retry_after_seconds": int64(freeOSMemoryDebounce/time.Second) - (now-last)/int64(time.Second),
+			"error":               "throttled",
+			"retry_after_seconds": int64(remaining.Seconds()),
 		})
 	}
 	if !debugFreeOSMemoryLastNanos.CompareAndSwap(last, now) {
@@ -214,16 +218,15 @@ func (h *DebugHandler) handleFreeOSMemory(c *fiber.Ctx) error {
 }
 
 // duckdbMemSummary queries duckdb_memory() and returns the aggregated view.
-// Returns nil if the parent context is already cancelled, otherwise an error
-// is reported via the Error field on the returned struct (so the JSON shape
-// stays consistent for callers).
+// Returns nil if the parent context was cancelled or its deadline expired
+// (the handler maps nil to 504); other errors set the Error field on the
+// returned struct so the JSON shape stays consistent for callers.
 func (h *DebugHandler) duckdbMemSummary(parent context.Context) *duckdbMemSummary {
-	if err := parent.Err(); err != nil {
-		return nil
-	}
-
 	rows, err := h.db.QueryContext(parent, "SELECT tag, memory_usage_bytes, temporary_storage_bytes FROM duckdb_memory()")
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil
+		}
 		h.logger.Error().Err(err).Msg("duckdb_memory query failed")
 		return &duckdbMemSummary{Error: "query failed"}
 	}
