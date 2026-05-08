@@ -601,40 +601,37 @@ func (p *Puller) FullyCaughtUp() bool {
 // per call so the caller can mutate the result without affecting subsequent
 // callers.
 //
-// Backward-compatible key names are preserved for /api/v1/cluster/status
-// consumers that landed in earlier releases (failed, dropped, skipped_dup).
-// New catch-up-scoped keys (catchup_failed, catchup_dropped, catchup_inflight)
-// are added alongside; they're the values FullyCaughtUp consumes. Cumulative
-// counters (total_failed, total_dropped) are exposed under their own keys
-// so dashboards can distinguish "catch-up batch had a hiccup" from
-// "steady-state has been having problems for hours."
+// Key semantics: cumulative counters (failed, dropped, pulled, skipped_dup)
+// keep their original whole-puller-lifetime meaning — operators have been
+// monitoring those keys since pre-#392 and changing semantics under them
+// would silently hide steady-state problems. The new catchup_* keys carry
+// the catch-up-batch-scoped values FullyCaughtUp consumes; dashboards that
+// want gate-relevant numbers consume those explicitly.
 func (p *Puller) CatchUpStatus() map[string]int64 {
 	return map[string]int64{
-		// Catch-up walker progress (unchanged keys).
+		// Catch-up walker progress.
 		"started_at":     p.catchupStartedAt.Load(),
 		"completed_at":   p.catchupCompletedAt.Load(),
 		"entries_walked": p.catchupEntriesWalked.Load(),
 		"enqueued":       p.catchupEnqueued.Load(),
 		"skipped_local":  p.catchupSkippedLocal.Load(),
-		"skipped_dup":    p.totalSkippedDup.Load(),
-		"pulled":         p.totalPulled.Load(),
 
-		// Backward-compat aliases: in 26.06.1 these keys carry the
-		// catch-up-scoped values (matching what FullyCaughtUp uses) so
-		// pre-#392 dashboards naturally start showing the gate-relevant
-		// numbers without code changes. The cumulative counterparts are
-		// exposed below under total_*.
-		"failed":  p.catchupFailed.Load(),
-		"dropped": p.catchupDropped.Load(),
+		// Cumulative whole-puller-lifetime counters (unchanged semantics
+		// since the original /api/v1/cluster/status surface). Keep these
+		// for steady-state observability — a non-zero rate here means the
+		// puller has been having problems regardless of where in the
+		// puller's life they happened.
+		"skipped_dup": p.totalSkippedDup.Load(),
+		"pulled":      p.totalPulled.Load(),
+		"failed":      p.totalFailed.Load(),
+		"dropped":     p.totalDropped.Load(),
 
-		// New scoped keys: explicit names for new dashboards.
+		// Catch-up-batch-scoped counters (added in 26.06.1 for the query
+		// gate). Non-zero means the gate is closed for a reason FullyCaughtUp
+		// can attribute to the cold-start batch specifically.
 		"catchup_inflight": p.catchupInflight.Load(),
 		"catchup_failed":   p.catchupFailed.Load(),
 		"catchup_dropped":  p.catchupDropped.Load(),
-
-		// Cumulative counters (whole puller lifetime, not catch-up-scoped).
-		"total_failed":  p.totalFailed.Load(),
-		"total_dropped": p.totalDropped.Load(),
 
 		// Live queue/inflight depth.
 		"queue_depth":    int64(len(p.queue)),
@@ -670,12 +667,6 @@ func (p *Puller) worker(id int) {
 // integrity problem and shouldn't trigger pull-and-corrupt from every other
 // healthy peer in turn.
 func (p *Puller) processEntry(log zerolog.Logger, entry *raft.FileEntry) {
-	// Snapshot whether this path was enqueued by the catch-up walker (vs a
-	// reactive FSM callback). Used by the defer below to bump catchupFailed
-	// when a walker-enqueued path gives up after retries — that's the
-	// signal FullyCaughtUp consumes to keep the gate red, scoped to the
-	// cold-start batch only.
-	wasCatchUp := p.isCatchUpPath(entry.Path)
 	// failed and succeeded are local to this worker so a concurrent worker
 	// processing a different entry doesn't trip our defer — using a global
 	// counter delta would cross-pollinate outcomes across workers. Set by
@@ -687,9 +678,18 @@ func (p *Puller) processEntry(log zerolog.Logger, entry *raft.FileEntry) {
 	// This keeps the set bounded even if a worker panics — Go's defer runs on
 	// panic unwind — and makes repeated catch-up walks idempotent with the
 	// reactive enqueue path.
+	//
+	// The catch-up tag check happens INSIDE the defer (not snapshotted at
+	// function entry) to close a race: a reactive pull may already be in
+	// flight when RunCatchUp starts, in which case the walker tags the
+	// path AFTER this worker began processing it. Reading isCatchUpPath
+	// at entry would miss that late tag and we'd silently drop the
+	// catch-up-failure signal — opening the gate while the file is
+	// missing. Reading it inside the defer (before inflightRemove clears
+	// the tag) sees whatever state the walker has converged on.
 	defer func() {
 		switch {
-		case wasCatchUp && failed:
+		case failed && p.isCatchUpPath(entry.Path):
 			// Catch-up-tagged pull gave up after all retries. Record the
 			// failure; the gate stays red until a later successful pull
 			// (reactive or otherwise) calls clearCatchUpFailure.

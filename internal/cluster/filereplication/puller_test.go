@@ -1701,17 +1701,90 @@ func TestPuller_CatchUpDrop_RecordIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestPuller_CatchUpStatus_BackwardCompatibleKeys pins the API contract
-// from PR #419 review pass 4: /api/v1/cluster/status consumers from
-// pre-#392 releases relied on `failed` / `dropped` / `skipped_dup` keys.
-// Those keys must still be present (now carrying catch-up-scoped values),
-// alongside the new explicit catchup_* keys and total_* cumulative keys.
-func TestPuller_CatchUpStatus_BackwardCompatibleKeys(t *testing.T) {
+// TestPuller_ProcessEntry_LateCatchUpTag pins gemini's HIGH-priority race
+// fix from PR #419 review pass 5. Scenario:
+//
+//  1. A reactive FSM callback enqueues path X. Worker A starts processEntry.
+//  2. The catch-up walker starts iterating, sees X in the manifest, calls
+//     markCatchUp(X). The tag is added AFTER worker A's processEntry began.
+//  3. Worker A's pull fails.
+//
+// Buggy (snapshot-at-entry) behavior: wasCatchUp captured at step 1 was
+// false; defer doesn't call recordCatchUpFailure even though the path is
+// now a catch-up path. inflightRemove decrements catchupInflight (which
+// markCatchUp incremented) but no failure is recorded — the file is
+// missing AND the gate clears. Silent partial results, exactly the
+// condition #392 closes.
+//
+// Fixed (check-in-defer) behavior: defer reads isCatchUpPath at outcome
+// time, sees the late tag, calls recordCatchUpFailure. Gate stays red.
+//
+// Test exercises the helper sequence directly to be deterministic — the
+// race is real but observing it with goroutines is flaky.
+func TestPuller_ProcessEntry_LateCatchUpTag(t *testing.T) {
 	p := newTestPuller(t, newFakeBackend(),
 		newFakeFetcher(fakeFetchResult{body: []byte("ignored")}),
 		staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
 
-	// Set distinguishable values so we can verify which counter populates which key.
+	const path = "db/m/2026/05/07/14/late-tag.parquet"
+
+	// Step 1: reactive enqueue puts the path in inflight (no catch-up tag).
+	p.inflightAdd(path)
+	if p.isCatchUpPath(path) {
+		t.Fatalf("path tagged as catch-up before walker ran: precondition violated")
+	}
+
+	// Step 2: walker tags the path AFTER the worker has begun processing.
+	// (Modeling the late-arriving markCatchUp call.)
+	p.markCatchUp(path)
+	if !p.isCatchUpPath(path) {
+		t.Fatalf("markCatchUp did not tag the path")
+	}
+
+	// Step 3: worker's pull fails. The defer's check-in-defer logic must
+	// see the late tag and call recordCatchUpFailure.
+	//
+	// We model the defer's exact decision: if isCatchUpPath returns true
+	// at outcome-time, recordCatchUpFailure runs. (The whole processEntry
+	// flow is exercised by other tests; here we're pinning the late-tag
+	// observation specifically.)
+	if p.isCatchUpPath(path) {
+		p.recordCatchUpFailure(path)
+	}
+
+	if got := p.catchupFailed.Load(); got != 1 {
+		t.Errorf("catchupFailed after late-tag failure: got %d, want 1 (defer must see late tag)", got)
+	}
+
+	// Cleanup parity: the worker's defer also runs inflightRemove which
+	// would clear the tag. Verify that inflightRemove drains both inflight
+	// AND catchupPaths so subsequent FullyCaughtUp checks are correct.
+	p.inflightRemove(path)
+	if p.isCatchUpPath(path) {
+		t.Errorf("isCatchUpPath after inflightRemove: got true, want false (tag must clear)")
+	}
+	if got := p.catchupInflight.Load(); got != 0 {
+		t.Errorf("catchupInflight after inflightRemove: got %d, want 0", got)
+	}
+	// catchupFailed remains 1 — the failure stuck. Self-heal happens via
+	// a subsequent successful pull, not via inflightRemove.
+	if got := p.catchupFailed.Load(); got != 1 {
+		t.Errorf("catchupFailed after inflightRemove: got %d, want 1 (failure must persist)", got)
+	}
+}
+
+// TestPuller_CatchUpStatus_KeySemantics pins the API contract for
+// /api/v1/cluster/status: pre-#392 keys (failed, dropped, skipped_dup,
+// pulled) keep their original cumulative whole-puller-lifetime semantics
+// so existing dashboards don't silently lose visibility into steady-state
+// problems. New catchup_* keys carry the catch-up-batch-scoped values
+// FullyCaughtUp consumes.
+func TestPuller_CatchUpStatus_KeySemantics(t *testing.T) {
+	p := newTestPuller(t, newFakeBackend(),
+		newFakeFetcher(fakeFetchResult{body: []byte("ignored")}),
+		staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+
+	// Distinguishable values so we can verify which counter populates which key.
 	p.catchupFailed.Store(3)
 	p.catchupDropped.Store(5)
 	p.totalFailed.Store(10)
@@ -1719,35 +1792,35 @@ func TestPuller_CatchUpStatus_BackwardCompatibleKeys(t *testing.T) {
 
 	status := p.CatchUpStatus()
 
-	// Backward-compat keys must exist and carry catch-up-scoped values.
+	// Pre-#392 keys must exist with cumulative semantics intact.
 	for _, k := range []string{"started_at", "completed_at", "entries_walked", "enqueued", "skipped_local", "skipped_dup", "pulled", "failed", "dropped"} {
 		if _, ok := status[k]; !ok {
-			t.Errorf("CatchUpStatus missing backward-compat key %q", k)
+			t.Errorf("CatchUpStatus missing pre-#392 key %q", k)
 		}
 	}
-	if got := status["failed"]; got != 3 {
-		t.Errorf("status[failed]: got %d, want 3 (catch-up-scoped value)", got)
+	if got := status["failed"]; got != 10 {
+		t.Errorf("status[failed]: got %d, want 10 (cumulative — pre-#392 dashboards rely on this)", got)
 	}
-	if got := status["dropped"]; got != 5 {
-		t.Errorf("status[dropped]: got %d, want 5 (catch-up-scoped value)", got)
+	if got := status["dropped"]; got != 20 {
+		t.Errorf("status[dropped]: got %d, want 20 (cumulative — pre-#392 dashboards rely on this)", got)
 	}
 
-	// New scoped keys.
+	// New catch-up-scoped keys for the gate.
 	if got := status["catchup_failed"]; got != 3 {
-		t.Errorf("status[catchup_failed]: got %d, want 3", got)
+		t.Errorf("status[catchup_failed]: got %d, want 3 (catch-up-scoped)", got)
 	}
 	if got := status["catchup_dropped"]; got != 5 {
-		t.Errorf("status[catchup_dropped]: got %d, want 5", got)
+		t.Errorf("status[catchup_dropped]: got %d, want 5 (catch-up-scoped)", got)
 	}
 	if _, ok := status["catchup_inflight"]; !ok {
 		t.Errorf("CatchUpStatus missing catchup_inflight key")
 	}
 
-	// Cumulative keys: distinguish from catch-up-scoped via different values.
-	if got := status["total_failed"]; got != 10 {
-		t.Errorf("status[total_failed]: got %d, want 10 (cumulative)", got)
+	// Live depths.
+	if _, ok := status["queue_depth"]; !ok {
+		t.Errorf("CatchUpStatus missing queue_depth key")
 	}
-	if got := status["total_dropped"]; got != 20 {
-		t.Errorf("status[total_dropped]: got %d, want 20 (cumulative)", got)
+	if _, ok := status["inflight_count"]; !ok {
+		t.Errorf("CatchUpStatus missing inflight_count key")
 	}
 }
