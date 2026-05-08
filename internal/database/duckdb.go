@@ -370,9 +370,13 @@ func (d *DuckDB) ClearHTTPCache() {
 		d.logger.Info().Msg("Cleared cache_httpfs cache")
 	}
 
+	// Toggle disable then re-enable — always attempt the re-enable even if
+	// disable failed, so a transient disable error doesn't leave the cache
+	// in an unintended off state on a connection.
 	if _, err := d.db.Exec("SET GLOBAL parquet_metadata_cache=false"); err != nil {
 		d.logger.Debug().Err(err).Msg("Failed to disable parquet_metadata_cache")
-	} else if _, err := d.db.Exec("SET GLOBAL parquet_metadata_cache=true"); err != nil {
+	}
+	if _, err := d.db.Exec("SET GLOBAL parquet_metadata_cache=true"); err != nil {
 		d.logger.Warn().Err(err).Msg("Failed to re-enable parquet_metadata_cache")
 	} else {
 		d.logger.Info().Msg("Reset parquet_metadata_cache")

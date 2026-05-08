@@ -273,16 +273,20 @@ func readProcStatus() *processMemStats {
 			out.RssFile = parseKBLine(val)
 		}
 	}
-	if scanner.Err() != nil {
-		return nil
-	}
+	// Scanner errors (truncated read, EIO, LSM denial mid-stream) are
+	// swallowed silently — this is a diagnostic-only path and partial data
+	// is still useful. Caller sees a partially-populated struct.
+	_ = scanner.Err()
 	return out
 }
 
-// parseKBLine parses "1234 kB" → 1234*1024. Robust against extra whitespace.
+// parseKBLine parses "1234 kB" → 1234*1024. Returns 0 unless the line is in
+// the exact "<int> kB" shape that /proc/self/status emits — silently
+// rescaling a different-unit line (e.g. a future "1234 mB") would mis-report
+// memory by orders of magnitude on dashboards.
 func parseKBLine(v string) uint64 {
 	fields := strings.Fields(v)
-	if len(fields) == 0 {
+	if len(fields) != 2 || fields[1] != "kB" {
 		return 0
 	}
 	n, err := strconv.ParseUint(fields[0], 10, 64)
@@ -310,6 +314,10 @@ func readGlibcHeap() *glibcHeapStats {
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
+		// /proc/<pid>/maps emits "[heap]" as the trailing pseudo-pathname for the
+		// program-break segment (kernel fs/proc/task_mmu.c). Hardened kernels can
+		// strip pseudo-pathnames altogether — the function then silently returns
+		// nil and the response omits the glibc_heap field, which is fine.
 		fields := strings.Fields(line)
 		if len(fields) == 0 || fields[len(fields)-1] != "[heap]" {
 			continue
@@ -332,8 +340,8 @@ func readGlibcHeap() *glibcHeapStats {
 			HeapSizeKB:   (end - start) / 1024,
 		}
 	}
-	if scanner.Err() != nil {
-		return nil
-	}
+	// No [heap] segment found, or scanner errored mid-read. Both cases
+	// produce nil — diagnostic-only path, JSON omits glibc_heap.
+	_ = scanner.Err()
 	return nil
 }
