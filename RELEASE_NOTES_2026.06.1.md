@@ -1,27 +1,6 @@
 # Arc v2026.06.1 Release Notes
 
-> **Status:** In progress. This file is the working draft for the 26.06.1 release. Sections below seed expected scope; entries are filled in as PRs land.
-
-## Theme
-
-_TBD as the release takes shape. Current candidate themes:_
-
-- _Continuous-Queries cluster-safety hardening (next session, same pattern as retention #407 and DELETE #408 — see [memory/project_next_cq.md](memory/project_next_cq.md))._
-- _Phase 5 anti-entropy follow-ups (post-26.05.1 reconciliation operational lessons)._
-- _Cluster auth convergence (auth state per-node SQLite → Raft-backed cluster-wide; see [memory/project_cluster_auth.md](memory/project_cluster_auth.md))._
-- _Arc Enterprise GA polish from first-customer (Astra) production feedback._
-
-## Deployment
-
-_None yet._
-
-## Deprecations
-
-_None yet._
-
-## New Features
-
-_None yet._
+> **Status:** In progress. Entries are added as PRs land.
 
 ## Hardening
 
