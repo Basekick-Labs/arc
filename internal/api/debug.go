@@ -138,14 +138,18 @@ func (h *DebugHandler) handleDuckDBMemory(c *fiber.Ctx) error {
 	defer cancel()
 
 	summary := h.duckdbMemSummary(ctx)
-	if summary != nil && summary.Error != "" {
+	if summary == nil {
+		// duckdbMemSummary returns nil only when the parent context is
+		// already cancelled or expired before the query could run. Surface
+		// it as 504 instead of pretending the heap is empty.
+		return c.Status(fiber.StatusGatewayTimeout).JSON(fiber.Map{
+			"error": "Context cancelled before DuckDB memory query",
+		})
+	}
+	if summary.Error != "" {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to query DuckDB memory",
 		})
-	}
-
-	if summary == nil {
-		summary = &duckdbMemSummary{}
 	}
 
 	return c.JSON(fiber.Map{
@@ -251,6 +255,9 @@ func readProcStatus() *processMemStats {
 
 	out := &processMemStats{}
 	scanner := bufio.NewScanner(f)
+	// Match the buffer size used by readGlibcHeap so a future kernel that
+	// adds a long line to /proc/self/status doesn't silently truncate.
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
 		colon := strings.IndexByte(line, ':')
