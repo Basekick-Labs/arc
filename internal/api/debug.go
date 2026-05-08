@@ -18,11 +18,17 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// freeOSMemoryDebounceNano debounces /debug/free-os-memory so polled callers
+// freeOSMemoryDebounce debounces /debug/free-os-memory so polled callers
 // can't pin the runtime in stop-the-world GC.
 const freeOSMemoryDebounce = 30 * time.Second
 
-var debugFreeOSMemoryLastNano atomic.Int64
+// debugProcessStart anchors the debounce to the monotonic clock so wall-clock
+// adjustments (NTP steps, manual `date` changes) cannot misbehave.
+var debugProcessStart = time.Now()
+
+// debugFreeOSMemoryLastNanos stores nanoseconds since debugProcessStart
+// (monotonic) of the last /debug/free-os-memory call that wasn't throttled.
+var debugFreeOSMemoryLastNanos atomic.Int64
 
 // DebugHandler exposes process- and DuckDB-level memory diagnostics. Used to
 // attribute RSS to Go heap, DuckDB native heap, or glibc arenas during
@@ -164,15 +170,16 @@ func (h *DebugHandler) handleDuckDBMemory(c *fiber.Ctx) error {
 // OS. Throttled to one call per freeOSMemoryDebounce; debug.FreeOSMemory is
 // stop-the-world and a tight polling loop would tank ingest throughput.
 func (h *DebugHandler) handleFreeOSMemory(c *fiber.Ctx) error {
-	now := time.Now().UnixNano()
-	last := debugFreeOSMemoryLastNano.Load()
-	if now-last < int64(freeOSMemoryDebounce) {
+	now := time.Since(debugProcessStart).Nanoseconds()
+	last := debugFreeOSMemoryLastNanos.Load()
+	// last==0 means "never fired" — first call always proceeds.
+	if last != 0 && now-last < int64(freeOSMemoryDebounce) {
 		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
 			"error":              "throttled",
 			"retry_after_seconds": int64(freeOSMemoryDebounce/time.Second) - (now-last)/int64(time.Second),
 		})
 	}
-	if !debugFreeOSMemoryLastNano.CompareAndSwap(last, now) {
+	if !debugFreeOSMemoryLastNanos.CompareAndSwap(last, now) {
 		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
 			"error": "throttled",
 		})

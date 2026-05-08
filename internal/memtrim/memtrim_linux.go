@@ -22,7 +22,13 @@ import (
 // callers can't serialize the process under glibc's allocator lock.
 const minTrimInterval = 30 * time.Second
 
-var lastTrimNano atomic.Int64
+// processStart anchors the throttle to the monotonic clock so wall-clock
+// adjustments (NTP steps, daylight saving, manual `date` changes) cannot
+// cause the throttle window to misbehave.
+var processStart = time.Now()
+
+// lastTrimNanos stores nanoseconds since processStart (monotonic).
+var lastTrimNanos atomic.Int64
 
 // ReleaseToOS asks glibc to return free heap pages to the OS via malloc_trim(0).
 // debug.FreeOSMemory only releases Go-managed memory; CGo allocations from the
@@ -33,12 +39,15 @@ var lastTrimNano atomic.Int64
 // On non-glibc Linux libcs (musl, uClibc) the C call is a stub and always
 // returns 0; outside Linux see memtrim_other.go.
 func ReleaseToOS() bool {
-	now := time.Now().UnixNano()
-	last := lastTrimNano.Load()
-	if now-last < int64(minTrimInterval) {
+	now := time.Since(processStart).Nanoseconds()
+	last := lastTrimNanos.Load()
+	// last==0 means "never fired" — that's not a real moment in monotonic
+	// time on a process that has been alive for any nonzero duration, so
+	// we treat it as eligible.
+	if last != 0 && now-last < int64(minTrimInterval) {
 		return false
 	}
-	if !lastTrimNano.CompareAndSwap(last, now) {
+	if !lastTrimNanos.CompareAndSwap(last, now) {
 		return false
 	}
 	return C.malloc_trim(0) == 1
