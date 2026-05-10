@@ -402,16 +402,25 @@ func TestStreamArrowJSON_FlushErrorBreaksLoop(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected streamArrowJSON to return an error on client disconnect; got nil (rows=%d)", rowCount)
 	}
+	// The underlying I/O sentinel must be in the error chain so future
+	// debugging can identify the actual cause.
 	if !errors.Is(err, sentinel) {
-		t.Errorf("expected error to wrap sentinel %v, got %v", sentinel, err)
+		t.Errorf("expected error to wrap underlying I/O sentinel %v, got %v", sentinel, err)
+	}
+	// The errClientDisconnected sentinel must also be in the error chain
+	// so callers can use errors.Is to disambiguate this from genuine
+	// server-side stream failures (and log at Warn instead of Error).
+	if !errors.Is(err, errClientDisconnected) {
+		t.Errorf("expected error to wrap errClientDisconnected, got %v", err)
 	}
 
 	// The break must fire at the FIRST explicit Flush after the writer's
 	// 256-byte limit is exceeded. bufio's internal 4 KiB auto-flush hits
-	// the failing writer well before row 5000, sets the sticky error, and
-	// subsequent WriteByte/WriteString calls silently no-op. At row 5000
-	// the explicit Flush() returns the stored error and the loop breaks.
-	// So rowCount should be EXACTLY jsonFlushInterval.
+	// the failing writer well before row jsonFlushInterval, sets the
+	// sticky error, and subsequent WriteByte/WriteString calls silently
+	// no-op. At row jsonFlushInterval the explicit Flush() returns the
+	// stored error and the loop breaks. So rowCount should be EXACTLY
+	// jsonFlushInterval.
 	if rowCount != jsonFlushInterval {
 		t.Errorf("loop did not break exactly at flush boundary: emitted %d rows, expected %d", rowCount, jsonFlushInterval)
 	}
