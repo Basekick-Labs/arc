@@ -370,11 +370,12 @@ func TestStreamArrowJSON_FlushErrorBreaksLoop(t *testing.T) {
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
 	}, nil)
 
-	// Need more than jsonFlushInterval (5000) rows total so the explicit
-	// Flush() is hit at row 5000. The errAfterNBytes failure point (256
-	// bytes) makes the failure happen sometime during the first batch,
-	// but bufio's internal 4 KiB buffer means the sticky error doesn't
-	// surface until the per-5000-row Flush() call.
+	// Need more than jsonFlushInterval rows total so the explicit Flush()
+	// fires at least once. The errAfterNBytes failure point (256 bytes)
+	// makes the failure happen sometime during the first batch, but
+	// bufio's internal 4 KiB buffer absorbs the sticky error until the
+	// next per-jsonFlushInterval Flush() returns it. With jsonFlushInterval
+	// = 1000 (see query_json_writer.go), 6 × 1024 = 6144 rows is plenty.
 	const (
 		batchRows  = 1024
 		numBatches = 6

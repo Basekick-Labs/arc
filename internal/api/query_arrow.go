@@ -5,7 +5,6 @@ package api
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -224,13 +223,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			// Warn for client-disconnect / timeout (expected ops noise);
 			// Error for everything else (real server-side problem worth
 			// alerting on).
-			ev := h.logger.Error()
-			if errors.Is(streamErr, errClientDisconnected) ||
-				errors.Is(streamErr, context.DeadlineExceeded) ||
-				errors.Is(streamErr, context.Canceled) {
-				ev = h.logger.Warn()
-			}
-			ev.Err(streamErr).
+			h.streamErrEvent(streamErr).Err(streamErr).
 				Int64("rows_sent", totalRows).
 				Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 				Msg("Arrow IPC stream truncated after headers committed; client received partial result")

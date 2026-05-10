@@ -159,13 +159,7 @@ func executeArrowJSONQuery(
 			// — headers were already committed, the client got partial bytes).
 			// Error for everything else: scanner/reader failures are real
 			// server-side problems worth alerting on.
-			ev := h.logger.Error()
-			if errors.Is(streamErr, errClientDisconnected) ||
-				errors.Is(streamErr, context.DeadlineExceeded) ||
-				errors.Is(streamErr, context.Canceled) {
-				ev = h.logger.Warn()
-			}
-			ev.Err(streamErr).
+			h.streamErrEvent(streamErr).Err(streamErr).
 				Int("rows_sent", rc).
 				Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 				Msg("Arrow JSON stream truncated after headers committed; client received partial result")
