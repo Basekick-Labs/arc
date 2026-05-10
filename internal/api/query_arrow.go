@@ -206,7 +206,13 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		}
 
 		if err := ipcWriter.Close(); err != nil {
-			h.logger.Error().Err(err).Msg("Failed to close Arrow IPC writer")
+			// Warn (not Error): when the loop broke because the client
+			// disconnected, ipcWriter.Close is guaranteed to fail flushing
+			// trailing IPC metadata over the already-closed connection.
+			// That's the same client-disconnect event we already logged at
+			// Warn — emitting Error here would defeat the ops-noise
+			// reduction.
+			h.logger.Warn().Err(err).Msg("Failed to close Arrow IPC writer")
 		}
 		reader.Release()
 		conn.Close()

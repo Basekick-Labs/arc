@@ -406,13 +406,13 @@ func TestStreamArrowJSON_FlushErrorBreaksLoop(t *testing.T) {
 		t.Errorf("expected error to wrap sentinel %v, got %v", sentinel, err)
 	}
 
-	// The break must fire at the next jsonFlushInterval boundary after
-	// the writer's 256-byte limit is exceeded — so rowCount should equal
-	// jsonFlushInterval (5000) when the first explicit Flush() returns
-	// the sticky error. Allow one extra batch of slack for bufio's
-	// internal 4 KiB buffer auto-flush timing.
-	const tighterBound = jsonFlushInterval + batchRows
-	if rowCount > tighterBound {
-		t.Errorf("loop did not break promptly on flush error: emitted %d rows, expected <= %d", rowCount, tighterBound)
+	// The break must fire at the FIRST explicit Flush after the writer's
+	// 256-byte limit is exceeded. bufio's internal 4 KiB auto-flush hits
+	// the failing writer well before row 5000, sets the sticky error, and
+	// subsequent WriteByte/WriteString calls silently no-op. At row 5000
+	// the explicit Flush() returns the stored error and the loop breaks.
+	// So rowCount should be EXACTLY jsonFlushInterval.
+	if rowCount != jsonFlushInterval {
+		t.Errorf("loop did not break exactly at flush boundary: emitted %d rows, expected %d", rowCount, jsonFlushInterval)
 	}
 }
