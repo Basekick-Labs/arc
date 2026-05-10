@@ -1,7 +1,7 @@
 # Arc
 
 [![Ingestion](https://img.shields.io/badge/ingestion-19M%2B%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
-[![Query](https://img.shields.io/badge/query-7.18M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
+[![Query](https://img.shields.io/badge/query-8.42M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
 [![Go](https://img.shields.io/badge/go-1.26+-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
@@ -10,7 +10,7 @@
 [![Discord](https://img.shields.io/badge/discord-join-7289da?logo=discord)](https://discord.gg/nxnWfUxsdm)
 [![GitHub](https://img.shields.io/github/stars/basekick-labs/arc?style=social)](https://github.com/basekick-labs/arc)
 
-High-performance columnar analytical database. 19M+ records/sec ingestion, 7M+ rows/sec queries. Built on DuckDB + Parquet + Arrow. Use for product analytics, observability, AI agents, IoT, logs, or data warehousing. Single binary. No vendor lock-in. AGPL-3.0
+High-performance columnar analytical database. 19M+ records/sec ingestion, 8M+ rows/sec queries. Built on DuckDB + Parquet + Arrow. Use for product analytics, observability, AI agents, IoT, logs, or data warehousing. Single binary. No vendor lock-in. AGPL-3.0
 
 ---
 
@@ -113,27 +113,27 @@ Benefits:
 
 ### Query (May 2026)
 
-Arrow IPC format provides up to 2.5x throughput vs JSON for large result sets. Both protocols hit the same DuckDB engine; the speedup comes from skipping JSON encoding for typed columnar batches.
+Arrow IPC format provides up to 2.9x throughput vs JSON for large result sets. Both protocols hit the same DuckDB engine; the speedup comes from skipping JSON encoding for typed columnar batches.
 
-Benchmark: 544M-row `cpu` measurement, 5 iterations per query.
+Benchmark: 393.7M-row `cpu` measurement, 5 iterations per query, DuckDB 1.5.1.
 
 | Query | Arrow (ms) | JSON (ms) | Speedup |
 |-------|------------|-----------|---------|
-| COUNT(*) - 544M rows | 4.4 | 4.3 | 0.98x |
-| SELECT LIMIT 10K | 10.0 | 10.9 | 1.09x |
-| SELECT LIMIT 100K | 27.7 | 42.3 | 1.53x |
-| SELECT LIMIT 500K | 77.8 | 175.7 | **2.26x** |
-| SELECT LIMIT 1M | 139.3 | 352.2 | **2.53x** |
-| Time Range (7d) LIMIT 10K | 6.0 | 5.5 | 0.91x |
-| Time Bucket (1h, 7d) | 5.1 | 4.6 | 0.91x |
-| Date Trunc (day, 30d) | 966 | 971 | 1.01x |
-| GROUP BY host | 646 | 652 | 1.01x |
-| GROUP BY host + hour | 1397 | 1383 | 0.99x |
+| COUNT(*) - 393.7M rows | 0.86 | 1.03 | 1.20x |
+| SELECT LIMIT 10K | 15.0 | 18.0 | 1.20x |
+| SELECT LIMIT 100K | 32.2 | 50.0 | 1.55x |
+| SELECT LIMIT 500K | 70.5 | 177.1 | **2.51x** |
+| SELECT LIMIT 1M | 118.7 | 339.2 | **2.86x** |
+| Time Range (7d) LIMIT 10K | 15.5 | 15.0 | 0.97x |
+| Time Bucket (1h, 7d) | 4.7 | 4.7 | 1.00x |
+| Date Trunc (day, 30d) | 413 | 416 | 1.01x |
+| GROUP BY host | 450 | 452 | 1.00x |
+| GROUP BY host + hour | 672 | 645 | 0.96x |
 
 **Best throughput:**
-- Arrow: **7.18M rows/sec** (1M row SELECT, 139ms)
-- JSON: **2.84M rows/sec** (1M row SELECT, 352ms)
-- COUNT(*): **~124B rows/sec** (544M rows, 4.4ms)
+- Arrow: **8.42M rows/sec** (1M row SELECT, 118.7ms)
+- JSON: **2.95M rows/sec** (1M row SELECT, 339.2ms)
+- COUNT(*): **458B rows/sec equivalent** (393.7M rows in 0.86ms — parquet footer reads, not a row scan)
 
 **Notes on the table:** the Arrow-vs-JSON speedup is most visible on large result sets where JSON encoding dominates latency. For small results, server-side query execution time (DuckDB) dominates and the two protocols converge. Aggregation queries (Time Bucket, Date Trunc, GROUP BY) are bottlenecked on the query engine, not the response encoder, so the speedup ratio is near 1.0x for those.
 
