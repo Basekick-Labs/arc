@@ -147,7 +147,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			// break is the idiomatic Go cancellation pattern (gemini r1).
 			select {
 			case <-streamCtx.Done():
-streamErr = fmt.Errorf("stream cancelled at row %d: %w", totalRows, streamCtx.Err())
+				streamErr = fmt.Errorf("stream cancelled at row %d: %w", totalRows, streamCtx.Err())
 				break streamLoop
 			default:
 			}
