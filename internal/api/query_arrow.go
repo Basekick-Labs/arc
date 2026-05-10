@@ -137,6 +137,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		ipcWriter := ipc.NewWriter(w, ipc.WithSchema(schema))
 
 		var totalRows int64
+		var streamErr error
 	streamLoop:
 		for reader.Next() {
 			// Per-batch ctx check: a timeout firing or client disconnect
@@ -146,10 +147,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			// break is the idiomatic Go cancellation pattern (gemini r1).
 			select {
 			case <-streamCtx.Done():
-				h.logger.Warn().
-					Err(streamCtx.Err()).
-					Int64("rows_sent", totalRows).
-					Msg("Arrow IPC stream cancelled mid-stream")
+streamErr = fmt.Errorf("stream cancelled at row %d: %w", totalRows, streamCtx.Err())
 				break streamLoop
 			default:
 			}
@@ -174,8 +172,8 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 				var castErr error
 				castedBatch, castErr = castDecimalBatch(batch, castInfo)
 				if castErr != nil {
-					h.logger.Error().Err(castErr).Msg("Failed to cast decimal columns in Arrow batch")
-					break
+					streamErr = fmt.Errorf("failed to cast decimal columns at row %d: %w", totalRows, castErr)
+					break streamLoop
 				}
 				batch = castedBatch
 			}
@@ -185,23 +183,51 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 				castedBatch.Release()
 			}
 			if err != nil {
-				h.logger.Error().Err(err).Msg("Failed to write Arrow batch")
-				break
+				streamErr = fmt.Errorf("failed to write arrow batch at row %d: %w", totalRows, err)
+				break streamLoop
 			}
-			w.Flush()
+			// Capture Flush error: fasthttp's RequestCtx.Done() only fires on
+			// server shutdown (not per-request client disconnect), so the
+			// underlying bufio.Writer's error on the closed connection is our
+			// signal that the client has gone away. Wrap with the sentinel so
+			// the caller logs at Warn (not Error) for this expected ops noise.
+			if err := w.Flush(); err != nil {
+				streamErr = fmt.Errorf("stream flush failed at row %d: %w: %w", totalRows, errClientDisconnected, err)
+				break streamLoop
+			}
 		}
 
-		if err := reader.Err(); err != nil {
-			h.logger.Error().Err(err).Msg("Error iterating Arrow batches")
+		if streamErr == nil {
+			if err := reader.Err(); err != nil {
+				streamErr = fmt.Errorf("arrow reader error after %d rows: %w", totalRows, err)
+			}
 		}
 
 		if err := ipcWriter.Close(); err != nil {
-			h.logger.Error().Err(err).Msg("Failed to close Arrow IPC writer")
+			// Warn (not Error): when the loop broke because the client
+			// disconnected, ipcWriter.Close is guaranteed to fail flushing
+			// trailing IPC metadata over the already-closed connection.
+			// That's the same client-disconnect event already captured in
+			// streamErr — emitting Error here would defeat the ops-noise
+			// reduction.
+			h.logger.Warn().Err(err).Msg("Failed to close Arrow IPC writer")
 		}
 		reader.Release()
 		conn.Close()
 		if cancel != nil {
 			cancel()
+		}
+
+		if streamErr != nil {
+			m.IncQueryErrors()
+			// Warn for client-disconnect / timeout (expected ops noise);
+			// Error for everything else (real server-side problem worth
+			// alerting on).
+			h.streamErrEvent(streamErr).Err(streamErr).
+				Int64("rows_sent", totalRows).
+				Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
+				Msg("Arrow IPC stream truncated after headers committed; client received partial result")
+			return
 		}
 
 		h.logger.Info().

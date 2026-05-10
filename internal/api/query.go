@@ -107,6 +107,33 @@ var (
 // Returns (rowCount, handled). If handled is false, the caller falls back to database/sql.
 var arrowJSONQueryFunc func(h *QueryHandler, c *fiber.Ctx, ctx context.Context, cancel context.CancelFunc, convertedSQL string, profileMode bool, governanceMaxRows int, start time.Time, timestamp string, onComplete func(int), onFail func(string), onTimeout func()) (int, bool)
 
+// errClientDisconnected is wrapped into streamErr by the streaming query
+// handlers when bufio.Writer.Write or Flush fails mid-stream — the canonical
+// signal in fasthttp's streaming model that the underlying TCP connection
+// has been closed by the client. Callers use errors.Is to disambiguate
+// client-side disconnect (operational noise, log at Warn) from server-side
+// stream failures (genuine bug, log at Error).
+var errClientDisconnected = errors.New("client disconnected mid-stream")
+
+// isClientError reports whether err originated from the client side — either
+// the connection was closed mid-stream, the request's deadline elapsed, or
+// the request context was cancelled. These are expected operational events
+// and should be logged at Warn, not Error.
+func isClientError(err error) bool {
+	return errors.Is(err, errClientDisconnected) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled)
+}
+
+// streamErrEvent picks the right zerolog level for a stream-truncation
+// error: Warn for client-side events, Error for server-side failures.
+func (h *QueryHandler) streamErrEvent(err error) *zerolog.Event {
+	if isClientError(err) {
+		return h.logger.Warn()
+	}
+	return h.logger.Error()
+}
+
 // isIdentChar returns true if c is a valid SQL identifier character (a-z, A-Z, 0-9, _)
 func isIdentChar(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
@@ -1533,7 +1560,10 @@ localProcessing:
 						h.queryRegistry.Fail(queryID, streamErr.Error())
 					}
 				}
-				h.logger.Error().Err(streamErr).
+				// Warn for client-disconnect / context expiry (headers already
+				// committed, partial result was delivered). Error for genuine
+				// server-side failures (scanner, db iteration).
+				h.streamErrEvent(streamErr).Err(streamErr).
 					Int("rows_sent", rowCount).
 					Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 					Msg("Query stream truncated after headers committed; client received partial result")
@@ -1718,7 +1748,10 @@ localProcessing:
 						h.queryRegistry.Fail(queryID, streamErr.Error())
 					}
 				}
-				h.logger.Error().Err(streamErr).
+				// Warn for client-disconnect / context expiry (headers already
+				// committed, partial result was delivered). Error for genuine
+				// server-side failures (scanner, db iteration).
+				h.streamErrEvent(streamErr).Err(streamErr).
 					Int("rows_sent", rowCount).
 					Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 					Msg("Query stream truncated after headers committed; client received partial result")
@@ -3417,7 +3450,10 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 
 		if streamErr != nil {
 			m.IncQueryErrors()
-			h.logger.Error().Err(streamErr).
+			// Warn for client-disconnect / context expiry (headers already
+			// committed, partial result was delivered). Error for genuine
+			// server-side failures.
+			h.streamErrEvent(streamErr).Err(streamErr).
 				Str("measurement", measurement).
 				Int("rows_sent", rowCount).
 				Msg("queryMeasurement stream truncated after headers committed")

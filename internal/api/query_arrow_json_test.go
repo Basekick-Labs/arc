@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -325,5 +326,103 @@ func TestStreamArrowJSON_SpecialChars(t *testing.T) {
 		if row[0].(string) != exp {
 			t.Errorf("row[%d] expected %q, got %q", i, exp, row[0])
 		}
+	}
+}
+
+// errAfterNBytes is an io.Writer that succeeds for the first n bytes then
+// returns an error. Models a TCP connection that the client closed mid-stream.
+type errAfterNBytes struct {
+	limit int
+	wrote int
+	err   error
+}
+
+func (e *errAfterNBytes) Write(p []byte) (int, error) {
+	if e.wrote >= e.limit {
+		return 0, e.err
+	}
+	remaining := e.limit - e.wrote
+	if len(p) <= remaining {
+		e.wrote += len(p)
+		return len(p), nil
+	}
+	e.wrote = e.limit
+	return remaining, e.err
+}
+
+// TestStreamArrowJSON_FlushErrorBreaksLoop verifies that when the underlying
+// connection fails (client disconnect mid-stream), streamArrowJSON stops
+// iterating record batches instead of draining the entire result set into a
+// buffer nobody is reading. Regression test for the fasthttp-RequestCtx.Done
+// limitation: that channel only fires on server shutdown, so Flush errors are
+// our only signal that the client has gone away.
+func TestStreamArrowJSON_FlushErrorBreaksLoop(t *testing.T) {
+	// Note: this test uses NewGoAllocator (not CheckedAllocator) to match
+	// the rest of the test file. The buildArrowBatch helper creates Arrow
+	// builders that aren't explicitly Released — CheckedAllocator would
+	// flag those as leaks, but they're pre-existing and out of scope for
+	// the disconnect-handling fix this test verifies. The actual code path
+	// being tested (streamArrowJSON's break-on-Flush-error) does not itself
+	// retain any Arrow memory beyond what simpleRecordReader.Release frees.
+	alloc := memory.NewGoAllocator()
+
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
+	}, nil)
+
+	// Need more than jsonFlushInterval rows total so the explicit Flush()
+	// fires at least once. The errAfterNBytes failure point (256 bytes)
+	// makes the failure happen sometime during the first batch, but
+	// bufio's internal 4 KiB buffer absorbs the sticky error until the
+	// next per-jsonFlushInterval Flush() returns it. With jsonFlushInterval
+	// = 1000 (see query_json_writer.go), 6 × 1024 = 6144 rows is plenty.
+	const (
+		batchRows  = 1024
+		numBatches = 6
+	)
+	records := make([]arrow.Record, numBatches)
+	for b := 0; b < numBatches; b++ {
+		rows := make([][]interface{}, batchRows)
+		for i := range rows {
+			rows[i] = []interface{}{int64(b*batchRows + i)}
+		}
+		records[b] = buildArrowBatch(alloc, schema, rows)
+	}
+	reader := newSimpleRecordReader(schema, records)
+	defer reader.Release()
+
+	sentinel := errors.New("client disconnected")
+	failingWriter := &errAfterNBytes{limit: 256, err: sentinel}
+	w := bufio.NewWriter(failingWriter)
+
+	rowCount, err := streamArrowJSON(
+		context.Background(), w, reader, 0, nil,
+		time.Now(), "2024-01-15T12:00:00Z",
+	)
+
+	if err == nil {
+		t.Fatalf("expected streamArrowJSON to return an error on client disconnect; got nil (rows=%d)", rowCount)
+	}
+	// The underlying I/O sentinel must be in the error chain so future
+	// debugging can identify the actual cause.
+	if !errors.Is(err, sentinel) {
+		t.Errorf("expected error to wrap underlying I/O sentinel %v, got %v", sentinel, err)
+	}
+	// The errClientDisconnected sentinel must also be in the error chain
+	// so callers can use errors.Is to disambiguate this from genuine
+	// server-side stream failures (and log at Warn instead of Error).
+	if !errors.Is(err, errClientDisconnected) {
+		t.Errorf("expected error to wrap errClientDisconnected, got %v", err)
+	}
+
+	// The break must fire at the FIRST explicit Flush after the writer's
+	// 256-byte limit is exceeded. bufio's internal 4 KiB auto-flush hits
+	// the failing writer well before row jsonFlushInterval, sets the
+	// sticky error, and subsequent WriteByte/WriteString calls silently
+	// no-op. At row jsonFlushInterval the explicit Flush() returns the
+	// stored error and the loop breaks. So rowCount should be EXACTLY
+	// jsonFlushInterval.
+	if rowCount != jsonFlushInterval {
+		t.Errorf("loop did not break exactly at flush boundary: emitted %d rows, expected %d", rowCount, jsonFlushInterval)
 	}
 }

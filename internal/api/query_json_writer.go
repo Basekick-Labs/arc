@@ -27,8 +27,13 @@ const (
 
 // jsonFlushInterval controls how often we flush the bufio.Writer to the
 // HTTP response during streaming. Flushing every N rows keeps memory bounded
-// while avoiding per-row flush overhead.
-const jsonFlushInterval = 5000
+// while avoiding per-row flush overhead. The Flush also doubles as the
+// client-disconnect detection point (see errClientDisconnected) — at 1000
+// rows the worst-case wasted formatting work after a disconnect is ~1000
+// rows of CPU, which is acceptable for typical query rates (~10-100µs).
+// Per-row Flush would be cleaner for fast disconnect detection but doubles
+// as forced syscalls on a healthy connection; 1000 is the compromise.
+const jsonFlushInterval = 1000
 
 // rowScanner is the interface satisfied by both *sql.Rows and *MergedRowIterator.
 type rowScanner interface {
@@ -164,9 +169,17 @@ scanLoop:
 
 		rowCount++
 
-		// Flush periodically to keep memory bounded
+		// Flush periodically to keep memory bounded. fasthttp's RequestCtx.Done
+		// only fires on server shutdown, so the bufio.Writer error on the closed
+		// connection is our only signal that the client has disconnected
+		// mid-stream. Break out so the underlying *sql.Rows isn't drained into
+		// a buffer nobody reads. Wrap with errClientDisconnected so the caller
+		// can log at Warn (not Error) for this expected ops noise.
 		if rowCount%jsonFlushInterval == 0 {
-			w.Flush()
+			if err := w.Flush(); err != nil {
+				streamErr = fmt.Errorf("stream flush failed at row %d: %w: %w", rowCount, errClientDisconnected, err)
+				break scanLoop
+			}
 		}
 
 		if governanceMaxRows > 0 && rowCount >= governanceMaxRows {
