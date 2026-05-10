@@ -188,7 +188,17 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 				h.logger.Error().Err(err).Msg("Failed to write Arrow batch")
 				break
 			}
-			w.Flush()
+			// Capture Flush error: fasthttp's RequestCtx.Done() only fires on
+			// server shutdown (not per-request client disconnect), so the
+			// underlying bufio.Writer's error on the closed connection is our
+			// signal that the client has gone away. Breaking here stops
+			// DuckDB from draining the rest of the result set into a buffer
+			// nobody reads — the per-batch memory pressure that the user
+			// reported on heavy GROUP BYs.
+			if err := w.Flush(); err != nil {
+				h.logger.Warn().Err(err).Int64("rows_sent", totalRows).Msg("Arrow IPC stream client disconnected mid-stream")
+				break streamLoop
+			}
 		}
 
 		if err := reader.Err(); err != nil {

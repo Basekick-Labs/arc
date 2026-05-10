@@ -155,7 +155,12 @@ func executeArrowJSONQuery(
 			} else if onFail != nil {
 				onFail(streamErr.Error())
 			}
-			h.logger.Error().Err(streamErr).
+			// Warn (not Error): the response headers were already committed
+			// when this fired, so by definition the client got a partial
+			// result. The common cause is the client disconnecting mid-
+			// stream (Grafana panel close, browser tab kill). That's
+			// expected ops noise, not an Arc fault.
+			h.logger.Warn().Err(streamErr).
 				Int("rows_sent", rc).
 				Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 				Msg("Arrow JSON stream truncated after headers committed; client received partial result")
@@ -270,7 +275,16 @@ batchLoop:
 			rowCount++
 
 			if rowCount%jsonFlushInterval == 0 {
-				w.Flush()
+				// Capture Flush error: fasthttp's RequestCtx.Done() only fires
+				// on server shutdown (not per-request client disconnect), so
+				// the bufio.Writer's error on the closed connection is our
+				// signal that the client has gone away. Breaking out of both
+				// nested loops stops DuckDB from draining the rest of the
+				// result set into a buffer nobody reads.
+				if err := w.Flush(); err != nil {
+					streamErr = fmt.Errorf("stream flush failed at row %d (client likely disconnected): %w", rowCount, err)
+					break batchLoop
+				}
 			}
 		}
 	}

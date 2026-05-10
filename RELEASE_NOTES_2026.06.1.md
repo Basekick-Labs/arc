@@ -112,6 +112,28 @@ The eliminated +72 MB-during-idle growth is the customer's exact symptom — RSS
 
 **Note on `MALLOC_ARENA_MAX=2`.** A separate experiment with `MALLOC_ARENA_MAX=2` cut residue further but caused 25–100% latency regression across the standard query suite, so it was not adopted. The 30s throttle on `ReleaseToOS()` keeps allocator-lock contention bounded without restricting glibc's per-thread arena count.
 
+### Query Path: Abort Streaming on Client Disconnect (PR #TBD)
+
+The Arrow-based streaming query handlers (`/api/v1/query` and `/api/v1/query/arrow`) write results to the client via Fiber's async `SetBodyStreamWriter`. When a client closed the connection mid-stream — closing a Grafana panel, killing a browser tab, Cmd-W on a dashboard — the streaming goroutine had no way to learn the client had gone away. fasthttp's `RequestCtx.Done()` only fires on server shutdown, not per-request disconnect ([fasthttp@v1.51.0/server.go:2719-2745](https://github.com/valyala/fasthttp/blob/v1.51.0/server.go#L2719-L2745)), and the streaming code used `context.Background()` deliberately because `c.UserContext()` is cancelled when the handler returns (before the async stream writer runs).
+
+The streaming loop would keep calling `reader.Next()` on the Arrow record reader, draining DuckDB result batches into a buffer nobody was reading, until either the query naturally completed or the per-request `queryTimeout` (default 300s) fired. For heavy time-bucket aggregations and wide GROUP BYs on long time ranges, that's tens of MB of result-set memory held per cancelled query.
+
+The fix is mechanical: capture the error from `bufio.Writer.Flush()` and break the streaming loop on the first failed flush, which is the canonical signal in fasthttp's streaming model that the underlying TCP connection has been closed. Six lines of change per handler in [internal/api/query_arrow.go](internal/api/query_arrow.go) and [internal/api/query_arrow_json.go](internal/api/query_arrow_json.go). Regression test in `query_arrow_json_test.go` uses an `io.Writer` that fails after N bytes and asserts the loop breaks before draining the full result set.
+
+This is **complementary to but distinct from** the #420 retention/delete leak: that fix targeted DuckDB native heap residue after S3 reads; this one targets in-flight Arrow record batches held on the goroutine stack when the client abandons a query mid-stream.
+
+### S3 Endpoint Scheme Normalization for DuckDB (PR #422)
+
+The AWS SDK Go v2 accepts `s3_endpoint` with or without an `http(s)://` prefix; DuckDB's `httpfs` extension expects a bare `host:port` and prepends scheme based on `s3_use_ssl`. With `s3_endpoint = "http://host:port"` in `arc.toml` (matching the AWS SDK convention), DuckDB built malformed URLs of the form `http://http://host:port/...` and every `read_parquet()` against S3 failed with `Could not resolve hostname`.
+
+Added a small `stripURLScheme` helper in [internal/database/duckdb.go](internal/database/duckdb.go), called at both `SET GLOBAL s3_endpoint` sites (startup and runtime reconfigure for tiered storage). Case-insensitive, also trims whitespace and trailing slashes — accepts `http://host:port`, `https://host:port/`, `HTTP://host:port`, ` host:port `, and the bare `host:port` form transparently. 18 unit test cases.
+
+### DELETE Rewrite on Non-TLS S3 (PR #423)
+
+The DELETE API rewrites parquet files to remove rows matching a WHERE clause and uploads them back to S3. Against plain-HTTP S3 (MinIO, Garage), every rewrite failed with `compute input header checksum failed, unseekable stream is not supported without TLS and trailing checksum`. AWS SDK Go v2 (`aws-sdk-go-v2/service/s3 v1.99.0`, post-Feb 2025) requires either TLS or a seekable body for the mandatory request checksum, and the previous `io.TeeReader` single-pass SHA256+upload pattern lost the underlying `*os.File`'s seekability.
+
+Replaced the TeeReader with a two-step "hash, then seek-and-upload": `io.Copy` into the SHA256 hasher, `Seek(0, io.SeekStart)`, pass the seekable `*os.File` directly to `storage.WriteReader`. The second read hits OS page cache so disk I/O is unchanged. Validated against MinIO over plain HTTP: 199/199 files rewritten (pre-fix: 0/200).
+
 ---
 
 _Maintainer notes: keep this file at the repo root (per [memory/project_release_strategy.md](memory/project_release_strategy.md)); do not write to `docs/RELEASE_NOTES_*` (that path is stale)._

@@ -1533,7 +1533,7 @@ localProcessing:
 						h.queryRegistry.Fail(queryID, streamErr.Error())
 					}
 				}
-				h.logger.Error().Err(streamErr).
+				h.logger.Warn().Err(streamErr).
 					Int("rows_sent", rowCount).
 					Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 					Msg("Query stream truncated after headers committed; client received partial result")
@@ -1718,7 +1718,7 @@ localProcessing:
 						h.queryRegistry.Fail(queryID, streamErr.Error())
 					}
 				}
-				h.logger.Error().Err(streamErr).
+				h.logger.Warn().Err(streamErr).
 					Int("rows_sent", rowCount).
 					Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 					Msg("Query stream truncated after headers committed; client received partial result")
@@ -3417,7 +3417,10 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 
 		if streamErr != nil {
 			m.IncQueryErrors()
-			h.logger.Error().Err(streamErr).
+			// Warn (not Error): headers were already committed when this
+			// fired, so the client got a partial result. The common cause
+			// is client disconnect mid-stream (expected ops noise).
+			h.logger.Warn().Err(streamErr).
 				Str("measurement", measurement).
 				Int("rows_sent", rowCount).
 				Msg("queryMeasurement stream truncated after headers committed")

@@ -164,9 +164,16 @@ scanLoop:
 
 		rowCount++
 
-		// Flush periodically to keep memory bounded
+		// Flush periodically to keep memory bounded. fasthttp's RequestCtx.Done
+		// only fires on server shutdown, so the bufio.Writer error on the closed
+		// connection is our only signal that the client has disconnected
+		// mid-stream. Break out so the underlying *sql.Rows isn't drained into
+		// a buffer nobody reads.
 		if rowCount%jsonFlushInterval == 0 {
-			w.Flush()
+			if err := w.Flush(); err != nil {
+				streamErr = fmt.Errorf("stream flush failed at row %d (client likely disconnected): %w", rowCount, err)
+				break scanLoop
+			}
 		}
 
 		if governanceMaxRows > 0 && rowCount >= governanceMaxRows {
