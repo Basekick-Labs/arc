@@ -457,6 +457,224 @@ func TestConvertSQLWithCTE(t *testing.T) {
 	}
 }
 
+// TestConvertSQLToStoragePaths_FromKeywordFunctions verifies that the table
+// rewriter no longer mis-resolves a column reference inside EXTRACT /
+// SUBSTRING / TRIM / OVERLAY as a measurement. Regression for the issue
+// where `SELECT EXTRACT(YEAR FROM time) FROM citibike_trips` produced
+// `Binder Error: read_parquet used as scalar`.
+func TestConvertSQLToStoragePaths_FromKeywordFunctions(t *testing.T) {
+	h := &QueryHandler{
+		storage: &mockLocalBackend{basePath: "./data"},
+		pruner:  pruning.NewPartitionPruner(zerolog.Nop()),
+		logger:  zerolog.Nop(),
+	}
+
+	tests := []struct {
+		name             string
+		input            string
+		shouldContain    []string
+		shouldNotContain []string
+	}{
+		{
+			name:  "EXTRACT(YEAR FROM time) FROM table",
+			input: "SELECT EXTRACT(YEAR FROM time) FROM citibike_trips",
+			shouldContain: []string{
+				"EXTRACT(YEAR FROM time)",                              // expression preserved verbatim
+				"read_parquet('./data/default/citibike_trips/**/*.parquet'", // outer FROM rewritten
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/default/time/", // inner FROM must NOT be rewritten
+			},
+		},
+		{
+			name:  "EXTRACT lowercase",
+			input: "select extract(year from time) from cpu",
+			shouldContain: []string{
+				"extract(year from time)",
+				"read_parquet('./data/default/cpu/**/*.parquet'",
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/default/time/",
+			},
+		},
+		{
+			name:  "SUBSTRING(s FROM 1 FOR 3)",
+			input: "SELECT SUBSTRING(name FROM 1 FOR 3) FROM users",
+			shouldContain: []string{
+				"SUBSTRING(name FROM 1 FOR 3)",
+				"read_parquet('./data/default/users/**/*.parquet'",
+			},
+		},
+		{
+			name:  "TRIM(LEADING '0' FROM x)",
+			input: "SELECT TRIM(LEADING '0' FROM zipcode) FROM addresses",
+			shouldContain: []string{
+				"TRIM(LEADING '0' FROM zipcode)",
+				"read_parquet('./data/default/addresses/**/*.parquet'",
+			},
+		},
+		{
+			name:  "OVERLAY(s PLACING 'x' FROM 2)",
+			input: "SELECT OVERLAY(label PLACING 'X' FROM 2) FROM items",
+			shouldContain: []string{
+				"OVERLAY(label PLACING 'X' FROM 2)",
+				"read_parquet('./data/default/items/**/*.parquet'",
+			},
+		},
+		{
+			name:  "nested EXTRACT + CAST",
+			input: "SELECT EXTRACT(YEAR FROM CAST(t AS DATE)) FROM trips",
+			shouldContain: []string{
+				"EXTRACT(YEAR FROM CAST(t AS DATE))",
+				"read_parquet('./data/default/trips/**/*.parquet'",
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/default/cast/",
+			},
+		},
+		{
+			name:  "measurement literally named extract still rewritten",
+			input: "SELECT * FROM extract",
+			shouldContain: []string{
+				"read_parquet('./data/default/extract/**/*.parquet'",
+			},
+		},
+		{
+			name:  "EXTRACT plus database-qualified table",
+			input: "SELECT EXTRACT(MONTH FROM time) FROM analytics.events",
+			shouldContain: []string{
+				"EXTRACT(MONTH FROM time)",
+				"read_parquet('./data/analytics/events/**/*.parquet'",
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/default/time/",
+			},
+		},
+		{
+			name:  "two EXTRACTs same query",
+			input: "SELECT EXTRACT(YEAR FROM time), EXTRACT(MONTH FROM time) FROM cpu WHERE host = 'a'",
+			shouldContain: []string{
+				"EXTRACT(YEAR FROM time)",
+				"EXTRACT(MONTH FROM time)",
+				"read_parquet('./data/default/cpu/**/*.parquet'",
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/default/time/",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := h.convertSQLToStoragePaths(tt.input)
+			for _, substr := range tt.shouldContain {
+				if !strings.Contains(result, substr) {
+					t.Errorf("Result should contain %q.\nInput:  %s\nResult: %s", substr, tt.input, result)
+				}
+			}
+			for _, substr := range tt.shouldNotContain {
+				if strings.Contains(result, substr) {
+					t.Errorf("Result should NOT contain %q.\nInput:  %s\nResult: %s", substr, tt.input, result)
+				}
+			}
+		})
+	}
+}
+
+// TestConvertSQLToStoragePaths_ExtractAfterFrom verifies the rewrite still
+// works when EXTRACT appears AFTER the outer FROM/JOIN — the position where
+// the table-rewrite regex would shift every downstream byte and (if the
+// mask helper restored by absolute pre-rewrite offsets) would corrupt the
+// rewritten read_parquet call. This was a security finding flagged by the
+// post-implementation review.
+func TestConvertSQLToStoragePaths_ExtractAfterFrom(t *testing.T) {
+	h := &QueryHandler{
+		storage: &mockLocalBackend{basePath: "./data"},
+		pruner:  pruning.NewPartitionPruner(zerolog.Nop()),
+		logger:  zerolog.Nop(),
+	}
+
+	tests := []struct {
+		name             string
+		input            string
+		shouldContain    []string
+		shouldNotContain []string
+	}{
+		{
+			name:  "EXTRACT in WHERE clause after FROM",
+			input: "SELECT * FROM cpu WHERE EXTRACT(YEAR FROM ts) = 2024",
+			shouldContain: []string{
+				"read_parquet('./data/default/cpu/**/*.parquet'",
+				"EXTRACT(YEAR FROM ts)",
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/default/ts/",
+			},
+		},
+		{
+			name:  "EXTRACT in HAVING after GROUP BY",
+			input: "SELECT host, count(*) FROM cpu GROUP BY host HAVING EXTRACT(HOUR FROM max(ts)) > 12",
+			shouldContain: []string{
+				"read_parquet('./data/default/cpu/**/*.parquet'",
+				"EXTRACT(HOUR FROM max(ts))",
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/default/ts/",
+			},
+		},
+		{
+			name:  "two FROMs then EXTRACT in WHERE",
+			input: "SELECT * FROM cpu, memory WHERE EXTRACT(YEAR FROM ts) = 2024",
+			shouldContain: []string{
+				"read_parquet('./data/default/cpu/**/*.parquet'",
+				"EXTRACT(YEAR FROM ts)",
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/default/ts/",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := h.convertSQLToStoragePaths(tt.input)
+			for _, substr := range tt.shouldContain {
+				if !strings.Contains(result, substr) {
+					t.Errorf("Result should contain %q.\nInput:  %s\nResult: %s", substr, tt.input, result)
+				}
+			}
+			for _, substr := range tt.shouldNotContain {
+				if strings.Contains(result, substr) {
+					t.Errorf("Result should NOT contain %q.\nInput:  %s\nResult: %s", substr, tt.input, result)
+				}
+			}
+		})
+	}
+}
+
+// TestConvertSQLToStoragePathsWithHeaderDB_FromKeywordFunctions covers the
+// same bug class on the header-DB optimized path.
+func TestConvertSQLToStoragePathsWithHeaderDB_FromKeywordFunctions(t *testing.T) {
+	h := &QueryHandler{
+		storage: &mockLocalBackend{basePath: "./data"},
+		pruner:  pruning.NewPartitionPruner(zerolog.Nop()),
+		logger:  zerolog.Nop(),
+	}
+
+	input := "SELECT EXTRACT(YEAR FROM time) FROM citibike_trips"
+	result := h.convertSQLToStoragePathsWithHeaderDB(input, "mydb")
+
+	if !strings.Contains(result, "EXTRACT(YEAR FROM time)") {
+		t.Errorf("inner EXTRACT expression was mutated.\nGot: %s", result)
+	}
+	if !strings.Contains(result, "read_parquet('./data/mydb/citibike_trips/**/*.parquet'") {
+		t.Errorf("outer FROM was not rewritten to header DB path.\nGot: %s", result)
+	}
+	if strings.Contains(result, "read_parquet('./data/mydb/time/") {
+		t.Errorf("inner FROM was incorrectly rewritten as measurement.\nGot: %s", result)
+	}
+}
+
 func TestJoinClausePatterns(t *testing.T) {
 	tests := []struct {
 		name        string
