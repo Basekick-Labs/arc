@@ -144,14 +144,23 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 
 	c.Set("Content-Type", "application/vnd.apache.arrow.stream")
 
-	// Declare the execution-time trailer in the response head. fasthttp
-	// requires AddTrailer before the stream writer runs so the `Trailer:`
-	// response header is emitted before the chunked body starts. Clients
-	// that don't read trailers degrade gracefully to wall-clock timing.
-	// The Warn is sync.Once-gated because the trailer name is constant
-	// and a per-request log would be operational noise if a future
-	// fasthttp release ever rejects it.
-	if err := c.Context().Response.Header.AddTrailer(arrowExecutionTimeTrailer); err != nil {
+	// Capture the fasthttp RequestCtx once. c *fiber.Ctx is pooled and
+	// reset after this handler returns; the SetBodyStreamWriter callback
+	// runs asynchronously after the handler exits, so any call to
+	// c.Context() inside the closure observes a recycled context (nil
+	// pointer panic in practice — verified by integration test against
+	// clickbench). The fasthttp RequestCtx itself stays valid until the
+	// stream writer returns.
+	fctx := c.Context()
+	respHeader := &fctx.Response.Header
+
+	// Declare the execution-time trailer in the response head before
+	// SetBodyStreamWriter runs so the `Trailer:` response header is
+	// emitted before the chunked body starts. Clients that don't read
+	// trailers degrade gracefully to wall-clock timing. The Warn is
+	// sync.Once-gated against per-request log spam if a future fasthttp
+	// release ever rejects the trailer name.
+	if err := respHeader.AddTrailer(arrowExecutionTimeTrailer); err != nil {
 		arrowTrailerWarnOnce.Do(func() {
 			h.logger.Warn().Err(err).Str("trailer", arrowExecutionTimeTrailer).
 				Msg("Failed to register Arrow execution-time trailer; clients will not see server-side timing")
@@ -159,7 +168,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	}
 
 	streamCtx := ctx
-	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+	fctx.SetBodyStreamWriter(func(w *bufio.Writer) {
 		ipcWriter := ipc.NewWriter(w, ipc.WithSchema(schema))
 
 		var totalRows int64
@@ -244,15 +253,15 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			cancel()
 		}
 
-		// Publish authoritative server-side timing to the client as a
-		// chunked-transfer trailer. The value is set even on the error
-		// path so clients see the time-until-failure for partial results
-		// (the trailer arrives after the truncated body, ahead of the
-		// connection close on a clean disconnect). On a hard client
-		// disconnect the trailer is silently dropped, same as any other
-		// post-body byte.
+		// Publish authoritative server-side timing as a chunked-transfer
+		// trailer. Set even on the error path so partial results carry
+		// time-until-failure. On a hard client disconnect the trailer is
+		// silently dropped, same as any other post-body byte.
+		//
+		// Use the captured respHeader, NOT c.Context().Response.Header —
+		// fiber.Ctx is pooled and reset before this closure runs.
 		execMs := time.Since(start).Milliseconds()
-		c.Context().Response.Header.Set(arrowExecutionTimeTrailer, strconv.FormatInt(execMs, 10))
+		respHeader.Set(arrowExecutionTimeTrailer, strconv.FormatInt(execMs, 10))
 
 		if streamErr != nil {
 			m.IncQueryErrors()
