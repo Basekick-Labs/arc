@@ -6,7 +6,9 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -17,6 +19,16 @@ import (
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/gofiber/fiber/v2"
 )
+
+// arrowTrailerWarnOnce gates the AddTrailer failure log so a fasthttp
+// upgrade that ever rejects the trailer name does not produce a Warn per
+// request.
+var arrowTrailerWarnOnce sync.Once
+
+// arrowExecutionTimeTrailer is the HTTP response trailer carrying server-
+// side query execution time (milliseconds) on the Arrow IPC endpoint.
+// Clients consume the full Arrow stream then read this trailer.
+const arrowExecutionTimeTrailer = "Arc-Execution-Time-Ms"
 
 // arrowBatchSize is the number of rows per Arrow record batch.
 // Smaller batches reduce peak memory usage and enable streaming.
@@ -132,6 +144,20 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 
 	c.Set("Content-Type", "application/vnd.apache.arrow.stream")
 
+	// Declare the execution-time trailer in the response head. fasthttp
+	// requires AddTrailer before the stream writer runs so the `Trailer:`
+	// response header is emitted before the chunked body starts. Clients
+	// that don't read trailers degrade gracefully to wall-clock timing.
+	// The Warn is sync.Once-gated because the trailer name is constant
+	// and a per-request log would be operational noise if a future
+	// fasthttp release ever rejects it.
+	if err := c.Context().Response.Header.AddTrailer(arrowExecutionTimeTrailer); err != nil {
+		arrowTrailerWarnOnce.Do(func() {
+			h.logger.Warn().Err(err).Str("trailer", arrowExecutionTimeTrailer).
+				Msg("Failed to register Arrow execution-time trailer; clients will not see server-side timing")
+		})
+	}
+
 	streamCtx := ctx
 	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
 		ipcWriter := ipc.NewWriter(w, ipc.WithSchema(schema))
@@ -218,6 +244,16 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			cancel()
 		}
 
+		// Publish authoritative server-side timing to the client as a
+		// chunked-transfer trailer. The value is set even on the error
+		// path so clients see the time-until-failure for partial results
+		// (the trailer arrives after the truncated body, ahead of the
+		// connection close on a clean disconnect). On a hard client
+		// disconnect the trailer is silently dropped, same as any other
+		// post-body byte.
+		execMs := time.Since(start).Milliseconds()
+		c.Context().Response.Header.Set(arrowExecutionTimeTrailer, strconv.FormatInt(execMs, 10))
+
 		if streamErr != nil {
 			m.IncQueryErrors()
 			// Warn for client-disconnect / timeout (expected ops noise);
@@ -225,14 +261,14 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			// alerting on).
 			h.streamErrEvent(streamErr).Err(streamErr).
 				Int64("rows_sent", totalRows).
-				Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
+				Int64("execution_time_ms", execMs).
 				Msg("Arrow IPC stream truncated after headers committed; client received partial result")
 			return
 		}
 
 		h.logger.Info().
 			Int64("row_count", totalRows).
-			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
+			Int64("execution_time_ms", execMs).
 			Msg("Arrow streaming query completed")
 	})
 

@@ -1903,9 +1903,10 @@ func (h *QueryHandler) getTransformedSQLForParallel(sql string, headerDB string)
 		return transformed, nil, cached
 	}
 
-	// Check for features that prevent fast path
+	// Bail to slow path for features the fast path can't handle. EXTRACT/
+	// SUBSTRING/TRIM/OVERLAY need the slow path's FROM-keyword mask.
 	features := scanSQLFeatures(sql)
-	if features.hasQuotes || features.hasDashComment || features.hasBlockComment {
+	if features.hasQuotes || features.hasDashComment || features.hasBlockComment || sqlutil.ContainsFromKeywordFunction(sql) {
 		transformed, cached := h.getTransformedSQL(sql, headerDB)
 		return transformed, nil, cached
 	}
@@ -1954,6 +1955,11 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 	// Phase 1: Mask string literals to prevent regex from matching inside them
 	// e.g., WHERE msg = 'SELECT * FROM mydb.cpu' should not convert the string content
 	sql, masks := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
+
+	// Phase 1b: Mask bare FROM inside EXTRACT/SUBSTRING/TRIM/OVERLAY so the
+	// table-rewriter regex below does not treat e.g. `time` in
+	// `EXTRACT(YEAR FROM time)` as a measurement.
+	sql, fromMasks := sqlutil.MaskFromKeywordsInFunctionBodies(sql)
 
 	// Phase 2: Strip SQL comments (after masking to preserve comments inside strings)
 	// e.g., "-- FROM mydb.cpu" should not be converted
@@ -2051,7 +2057,10 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 		return h.buildReadParquetExpr(path, originalSQL, "JOIN")
 	})
 
-	// Restore original string literals
+	// Restore masked FROM keywords and string literals. Both use content-
+	// addressed placeholders, so the intermediate length-changing regex
+	// rewrites above are safe.
+	sql = sqlutil.UnmaskFromKeywordsInFunctionBodies(sql, fromMasks)
 	sql = sqlutil.UnmaskStringLiterals(sql, masks)
 
 	return sql
@@ -2495,9 +2504,11 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database
 		sqlLower = strings.ToLower(sql)
 	}
 
-	// FAST PATH: For simple single-table queries without special SQL features,
-	// skip all the regex machinery and use direct string manipulation
-	if isSingleTableQuery(sqlLower) && !strings.Contains(sqlLower, "with ") {
+	// FAST PATH: skip all regex machinery for simple single-table queries.
+	// Bail when the SQL has a bare FROM inside EXTRACT/SUBSTRING/TRIM/OVERLAY
+	// — `SELECT EXTRACT(YEAR FROM CURRENT_DATE)` slips past isSingleTableQuery
+	// with fromCount==1, so the slow path's mask helper must run.
+	if isSingleTableQuery(sqlLower) && !strings.Contains(sqlLower, "with ") && !sqlutil.ContainsFromKeywordFunction(sql) {
 		features := scanSQLFeatures(sql)
 		if !features.hasQuotes && !features.hasDashComment && !features.hasBlockComment {
 			// Also need to rewrite time functions if present
@@ -2522,6 +2533,9 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database
 
 	// Phase 1: Mask string literals to prevent regex from matching inside them
 	sql, masks := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
+
+	// Phase 1b: see convertSQLToStoragePaths.
+	sql, fromMasks := sqlutil.MaskFromKeywordsInFunctionBodies(sql)
 
 	// Phase 2: Strip SQL comments
 	sql = stripSQLComments(sql, features.hasDashComment || features.hasBlockComment)
@@ -2606,7 +2620,8 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database
 		return h.buildReadParquetExpr(path, originalSQL, "JOIN")
 	})
 
-	// Restore original string literals
+	// Restore masked FROM keywords and original string literals.
+	sql = sqlutil.UnmaskFromKeywordsInFunctionBodies(sql, fromMasks)
 	sql = sqlutil.UnmaskStringLiterals(sql, masks)
 
 	return sql

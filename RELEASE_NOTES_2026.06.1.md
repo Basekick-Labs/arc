@@ -2,6 +2,59 @@
 
 > **Status:** In progress. Entries are added as PRs land.
 
+## Bug fixes
+
+### Parser no longer mis-resolves bare `time` column inside `EXTRACT(YEAR FROM time)`
+
+The regex-based query rewriter previously matched the `FROM` keyword inside `EXTRACT(YEAR FROM time)` (and the same shape in `SUBSTRING(s FROM 1 FOR 3)`, `TRIM(LEADING '0' FROM x)`, `OVERLAY(s PLACING 'x' FROM 2)`) and rewrote the column reference as a measurement, producing:
+
+```
+Binder Error: Function "read_parquet" is a table function but it was used as a scalar function.
+LINE 1: SELECT EXTRACT(YEAR FROM read_parquet('/app/data/arc/.../time/**/*.parquet'...
+```
+
+`time` is the canonical column name across InfluxDB / Telegraf / Prometheus-derived schemas, so every customer migrating from those systems hit this. Workarounds were `YEAR(time)`, `date_trunc('year', time)`, or quoting / qualifying the column.
+
+26.06.1 adds a pre-pass that masks `FROM` keywords inside the argument list of `EXTRACT`, `SUBSTRING`, `TRIM`, and `OVERLAY` before the table-rewrite regex runs, then restores them afterwards. The masker tracks paren depth so nested calls like `EXTRACT(YEAR FROM CAST(t AS DATE))` are handled correctly. Both the standard and `x-arc-database` header-optimized rewriter paths are covered, and the fast paths bail to the masking path when these functions are present. The single-table query optimization continues to apply for queries that don't use these functions.
+
+**Overhead** (per cache-miss query — cached queries skip the entire rewriter): ~350 ns and **0 allocations** for queries that don't use these functions (the common case); ~625 ns and ~900 bytes for queries that do. The rewriter cache absorbs repeated identical queries, so this is paid once per unique SQL string. Bench numbers from `internal/sql/mask_test.go` on an M3 Max:
+
+```
+BenchmarkContainsFromKeywordFunction_Miss        348 ns/op      0 B/op   0 allocs/op
+BenchmarkContainsFromKeywordFunction_Hit          21 ns/op      0 B/op   0 allocs/op
+BenchmarkMaskFromKeywordsInFunctionBodies_Miss   348 ns/op      0 B/op   0 allocs/op
+BenchmarkMaskFromKeywordsInFunctionBodies_Hit    316 ns/op    336 B/op   4 allocs/op
+BenchmarkUnmaskFromKeywordsInFunctionBodies      285 ns/op    560 B/op   3 allocs/op
+```
+
+Tests added: `TestMaskFromKeywordsInFunctionBodies`, `TestUnmaskAfterLengthChangingRewrite`, `TestContainsFromKeywordFunction` in `internal/sql/mask_test.go`; `TestConvertSQLToStoragePaths_FromKeywordFunctions`, `TestConvertSQLToStoragePaths_ExtractAfterFrom`, `TestConvertSQLToStoragePathsWithHeaderDB_FromKeywordFunctions` in `internal/api/query_test.go`.
+
+This is a narrow regex pre-pass, not a full SQL-parser swap. The fix triggered an evaluation of replacing the regex rewriter with a real SQL parser — no Go SQL parser currently handles DuckDB's full syntax (lambdas `x -> y`, list literals `[1,2,3]`, `QUALIFY`, `EXCLUDE`/`REPLACE`, FROM-first, `:=` named args, `PIVOT`/`UNPIVOT`). A proper parser migration is tracked as a separate, larger initiative.
+
+### Arrow IPC responses now carry server-side execution time
+
+The HTTP/JSON query endpoint already reports `execution_time_ms` in the response body, but the Arrow IPC endpoint (`/api/v1/query/arrow`) exposed no server-side timing. Clients had to rely on wall-clock measurement, which overstates Arc's actual performance when the network is in the way — a 2,830ms server-side aggregation looked like 4,014ms from Costa Rica against a US-hosted demo box.
+
+26.06.1 publishes an `Arc-Execution-Time-Ms` HTTP response trailer at the end of every Arrow IPC stream. The trailer carries the same integer that the server logs internally. Clients consume the full Arrow stream and then read the trailer — e.g. in Python:
+
+```python
+import pyarrow as pa, requests
+r = requests.post(
+    "http://arc:8000/api/v1/query/arrow",
+    json={"sql": "SELECT count(*) FROM cpu WHERE time >= now() - INTERVAL 1 DAY"},
+    headers={"Authorization": f"Bearer {TOKEN}", "x-arc-database": "default"},
+    stream=True,
+)
+reader = pa.ipc.open_stream(r.raw)
+for batch in reader:
+    ...
+print("server-side ms:", r.headers.get("Arc-Execution-Time-Ms"))
+```
+
+The trailer is also emitted on the error path (with time-until-failure) so partial-stream timing is still observable. Trailers require HTTP/1.1 chunked transfer or HTTP/2 — both already in use by Arc's fasthttp-backed Fiber stack. Clients that ignore trailers degrade gracefully to wall-clock measurement.
+
+The JSON path (`/api/v1/query`) is unchanged — `execution_time_ms` was already in the response body.
+
 ## Hardening
 
 ### Hard Query Gating During Replication Catch-Up (Enterprise, opt-in) — closes #392
