@@ -103,6 +103,59 @@ func TestMaskFromKeywordsInFunctionBodies(t *testing.T) {
 			mustContainOuterFROM:    []string{"FROM cpu"},
 			mustNotContainInnerFROM: []string{"FROM ts"},
 		},
+		{
+			// Gemini finding: comment between function name and paren
+			// must not defeat the scanner. Verified to reproduce the
+			// original Binder Error against the live clickbench dataset
+			// before this fix.
+			name:                    "block comment between EXTRACT and paren",
+			input:                   "SELECT EXTRACT /* c */ (YEAR FROM ts) FROM cpu",
+			wantMasks:               1,
+			mustContainOuterFROM:    []string{"FROM cpu"},
+			mustNotContainInnerFROM: []string{"FROM ts"},
+		},
+		{
+			name:                    "block comment with newlines and trailing whitespace",
+			input:                   "SELECT EXTRACT\n\t/* multi-\n   line */ \t (YEAR FROM ts) FROM cpu",
+			wantMasks:               1,
+			mustContainOuterFROM:    []string{"FROM cpu"},
+			mustNotContainInnerFROM: []string{"FROM ts"},
+		},
+		{
+			name:                    "line comment between SUBSTRING and paren",
+			input:                   "SELECT SUBSTRING -- inline comment\n(s FROM 1 FOR 3) FROM t",
+			wantMasks:               1,
+			mustContainOuterFROM:    []string{"FROM t"},
+			mustNotContainInnerFROM: []string{"FROM 1"},
+		},
+		{
+			// Gemini finding: backtick-quoted identifier is a column,
+			// not the EXTRACT builtin. DuckDB itself rejects backticks
+			// today, but the defensive check costs nothing.
+			name:      "backticked EXTRACT identifier is a column, not the builtin",
+			input:     "SELECT `EXTRACT`(a, b) FROM t",
+			wantMasks: 0,
+		},
+		{
+			// Gemini finding (round 2): subquery inside the trigger's
+			// argument list — the inner FROM must NOT be masked, or
+			// the regex rewriter cannot convert `cpu` to read_parquet.
+			// Verified to reproduce a "Table with name cpu does not
+			// exist" Catalog Error against the live clickbench dataset
+			// before this fix.
+			name:                    "subquery FROM inside EXTRACT must not be masked",
+			input:                   "SELECT EXTRACT(YEAR FROM (SELECT MIN(ts) FROM cpu)) FROM events",
+			wantMasks:               1,
+			mustContainOuterFROM:    []string{"FROM cpu", "FROM events"},
+			mustNotContainInnerFROM: []string{"FROM (SELECT MIN(ts)"},
+		},
+		{
+			name:                    "deeply nested subquery — both inner FROMs survive",
+			input:                   "SELECT EXTRACT(YEAR FROM (SELECT a FROM (SELECT b FROM t))) FROM o",
+			wantMasks:               1,
+			mustContainOuterFROM:    []string{"FROM t", "FROM o", "FROM (SELECT b"},
+			mustNotContainInnerFROM: []string{"FROM (SELECT a"},
+		},
 	}
 
 	for _, tt := range tests {
