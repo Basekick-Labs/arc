@@ -137,7 +137,15 @@ Closed issue #304: `MQTTHandler.handleStats` and `handleHealth` previously panic
 
 ## Dependencies
 
-_None yet._
+### Dependabot group bump — fiber, thrift, otel (PR #430)
+
+Dependabot-grouped go.mod refresh. Three updates, +17/-16 across `go.mod` and `go.sum`. Full module test suite (35 packages, `-tags duckdb_arrow`) passed locally before merge.
+
+- **`github.com/gofiber/fiber/v2`** 2.52.12 → 2.52.13 — direct. Single change: escape HTML output in `Ctx.Format` (gofiber/fiber#4232). Arc does not call `ctx.Format`, so no behavior change, but the bump closes a defense-in-depth gap.
+- **`github.com/apache/thrift`** 0.22.0 → 0.23.0 — indirect (via `arrow-go`). Go-side change is THRIFT-5896 (race in `TServerSocket.Addr()`), irrelevant to Arc since we don't expose a Thrift server. Bulk of the changelog is cross-language and doesn't affect the Go module.
+- **`go.opentelemetry.io/otel`** 1.39.0 → 1.41.0 — indirect (via `arrow-go/parquet → grpc`). 1.41 is the last release supporting Go 1.24; Arc is on Go 1.26 so the upcoming Go 1.25 floor is already cleared. 1.41 also tightens `Baggage.New`/`Parse` validation and rejects `insecure + TLS` exporter configs — Arc does not wire OTel exporters, so this is benign.
+
+One new transitive entry in `go.sum`: `github.com/rogpeppe/go-internal v1.14.1` (test infra pulled by OTel).
 
 ## Bug Fixes
 
