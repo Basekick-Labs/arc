@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/memtrim"
@@ -197,14 +198,23 @@ func openDuckDB(dsn string, cfg *Config, logger zerolog.Logger) (*sql.DB, error)
 	// real loads are tens of milliseconds.
 	const arcxLoadTimeout = 30 * time.Second
 
+	// loadErrLogOnce gates the Error log to once per process. The error
+	// itself still propagates to database/sql on every connInitFn call —
+	// only the log line is throttled. Without this, a misconfigured path
+	// (missing file, ABI mismatch) under load would emit one Error per
+	// connection-acquire attempt — easily hundreds per second.
+	var loadErrLogOnce sync.Once
+
 	connector, err := duckdb.NewConnector(dsn, func(execer driver.ExecerContext) error {
 		ctx, cancel := context.WithTimeout(context.Background(), arcxLoadTimeout)
 		defer cancel()
 		_, execErr := execer.ExecContext(ctx, loadSQL, nil)
 		if execErr != nil {
-			componentLogger.Error().Err(execErr).
-				Str("path", path).
-				Msg("arcx LOAD failed on new DuckDB connection")
+			loadErrLogOnce.Do(func() {
+				componentLogger.Error().Err(execErr).
+					Str("path", path).
+					Msg("arcx LOAD failed on new DuckDB connection (subsequent failures suppressed for log hygiene)")
+			})
 			return fmt.Errorf("arcx LOAD on new connection: %w", execErr)
 		}
 		return nil

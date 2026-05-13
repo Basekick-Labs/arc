@@ -1,6 +1,8 @@
 package database
 
 import (
+	"context"
+	"database/sql"
 	"os"
 	"testing"
 
@@ -35,9 +37,13 @@ func TestBuildDSN_ArcxEnabled(t *testing.T) {
 // `make` in the arcx repo.
 //
 // Exercises the real wiring: openDuckDB (which registers the connInitFn),
-// configureDatabase (which runs verifyArcxLoaded), and the
-// connection-pool path so we get evidence that LOAD took effect on a
-// fresh connection rather than the implicit first one.
+// configureDatabase (which runs verifyArcxLoaded), and most importantly
+// **distinct concurrent pool connections** — sequential QueryRow calls
+// share an idle connection, so they would all pass even if connInitFn
+// only fired on the first connection. Holding 4 concurrent *sql.Conn
+// forces database/sql to open 4 distinct connections; if the
+// per-connection LOAD ever regresses, iter 2+ fails with
+// "function arcx_version does not exist".
 func TestArcxLoadsAndReportsVersion(t *testing.T) {
 	path := os.Getenv("ARCX_TEST_PATH")
 	if path == "" {
@@ -49,7 +55,7 @@ func TestArcxLoadsAndReportsVersion(t *testing.T) {
 
 	cfg := &Config{
 		ArcxExtensionPath: path,
-		MaxConnections:    4, // > 1 so we exercise the pool, not just one connection
+		MaxConnections:    4,
 		MemoryLimit:       "1GB",
 		ThreadCount:       2,
 	}
@@ -59,17 +65,36 @@ func TestArcxLoadsAndReportsVersion(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Force at least a few distinct pool connections to exercise the
-	// connInitFn — if LOAD only ran on the first one, the second
-	// arcx_version() call would fail with "function does not exist".
-	for i := 0; i < 4; i++ {
+	ctx := context.Background()
+	const n = 4
+	conns := make([]*sql.Conn, 0, n)
+	defer func() {
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	}()
+
+	// Hold n concurrent connections so the pool is forced to open n
+	// distinct ones (database/sql will not reuse an idle conn while
+	// another caller still holds it).
+	for i := 0; i < n; i++ {
+		c, err := db.DB().Conn(ctx)
+		if err != nil {
+			t.Fatalf("iter %d: acquire conn: %v", i, err)
+		}
+		conns = append(conns, c)
+	}
+
+	// Each pinned connection must have arcx_version() available — proves
+	// connInitFn fired on every pool member, not just the first.
+	for i, c := range conns {
 		var ver string
-		if err := db.DB().QueryRow("SELECT arcx_version()").Scan(&ver); err != nil {
-			t.Fatalf("iter %d: SELECT arcx_version(): %v", i, err)
+		if err := c.QueryRowContext(ctx, "SELECT arcx_version()").Scan(&ver); err != nil {
+			t.Fatalf("conn %d: SELECT arcx_version(): %v", i, err)
 		}
 		if ver == "" {
-			t.Errorf("iter %d: arcx_version returned empty string", i)
+			t.Errorf("conn %d: arcx_version returned empty string", i)
 		}
-		t.Logf("iter %d: %s", i, ver)
+		t.Logf("conn %d: %s", i, ver)
 	}
 }
