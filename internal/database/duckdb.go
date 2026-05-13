@@ -176,15 +176,26 @@ func openDuckDB(dsn string, cfg *Config, logger zerolog.Logger) (*sql.DB, error)
 		return sql.Open("duckdb", dsn)
 	}
 
-	// Capture the path once so the closure does not retain the *Config.
-	loadSQL := fmt.Sprintf("LOAD '%s'", escapeSQLString(cfg.ArcxExtensionPath))
+	// Capture the path into a local so the closure does not retain the
+	// whole *Config (the logger field below would otherwise pull cfg in
+	// for its entire lifetime — gemini round 1).
+	path := cfg.ArcxExtensionPath
+	loadSQL := fmt.Sprintf("LOAD '%s'", escapeSQLString(path))
 	componentLogger := logger.With().Str("component", "duckdb").Logger()
 
+	// arcxLoadTimeout bounds the connection-init LOAD so a corrupt or
+	// network-mounted extension file cannot hang pool acquisition
+	// indefinitely. 30s is generous for dlopen + DuckDB's Load() hook;
+	// real loads are tens of milliseconds.
+	const arcxLoadTimeout = 30 * time.Second
+
 	connector, err := duckdb.NewConnector(dsn, func(execer driver.ExecerContext) error {
-		_, execErr := execer.ExecContext(context.Background(), loadSQL, nil)
+		ctx, cancel := context.WithTimeout(context.Background(), arcxLoadTimeout)
+		defer cancel()
+		_, execErr := execer.ExecContext(ctx, loadSQL, nil)
 		if execErr != nil {
 			componentLogger.Error().Err(execErr).
-				Str("path", cfg.ArcxExtensionPath).
+				Str("path", path).
 				Msg("arcx LOAD failed on new DuckDB connection")
 			return fmt.Errorf("arcx LOAD on new connection: %w", execErr)
 		}
