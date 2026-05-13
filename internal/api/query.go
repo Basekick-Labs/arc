@@ -1833,6 +1833,17 @@ func ValidateSQLRequest(sql string) error {
 		return &SQLValidationError{Message: "Direct read_parquet() calls are not allowed in user SQL"}
 	}
 
+	// SECURITY: reject user SQL that calls arcx's table functions
+	// directly. arc_partition_agg(db, m, unit) takes raw database and
+	// measurement strings and globs the filesystem; without this block,
+	// a user authenticated for db1 could call
+	// arc_partition_agg('db2', 'mem', 'hour') and learn row counts in
+	// db2. Same RBAC bypass shape as read_parquet — only Arc's query
+	// rewriter, which has the user's identity, may emit calls to it.
+	if userSQLArcPartitionAggPattern.MatchString(normalised) {
+		return &SQLValidationError{Message: "Direct arc_partition_agg() calls are not allowed in user SQL"}
+	}
+
 	return nil
 }
 
@@ -1841,6 +1852,11 @@ func ValidateSQLRequest(sql string) error {
 // runs against masked/comment-stripped SQL so a literal containing
 // "read_parquet" or a comment is fine.
 var userSQLReadParquetPattern = regexp.MustCompile(`(?i)\bread_parquet\s*\(`)
+
+// userSQLArcPartitionAggPattern matches `arc_partition_agg(` as a
+// function call. arcx exposes filesystem-anchored row counts; user SQL
+// must route through Arc's rewriter so RBAC stays load-bearing.
+var userSQLArcPartitionAggPattern = regexp.MustCompile(`(?i)\barc_partition_agg\s*\(`)
 
 // getTransformedSQL returns the transformed SQL with caching.
 // If headerDB is non-empty, uses the optimized path with that database for all tables.
