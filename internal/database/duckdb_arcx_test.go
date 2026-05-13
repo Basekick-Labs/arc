@@ -1,7 +1,6 @@
 package database
 
 import (
-	"database/sql"
 	"os"
 	"testing"
 
@@ -11,6 +10,7 @@ import (
 // TestBuildDSN_ArcxDisabled confirms that when no arcx path is configured
 // the DSN stays empty and DuckDB opens with default (signed-only) settings.
 func TestBuildDSN_ArcxDisabled(t *testing.T) {
+	t.Parallel()
 	cfg := &Config{}
 	if dsn := buildDSN(cfg); dsn != "" {
 		t.Errorf("buildDSN with no arcx path = %q, want empty", dsn)
@@ -21,6 +21,7 @@ func TestBuildDSN_ArcxDisabled(t *testing.T) {
 // to allow_unsigned_extensions, which is required for LOAD on a private,
 // unsigned arcx binary.
 func TestBuildDSN_ArcxEnabled(t *testing.T) {
+	t.Parallel()
 	cfg := &Config{ArcxExtensionPath: "/opt/arcx/arcx.duckdb_extension"}
 	want := "?allow_unsigned_extensions=true"
 	if dsn := buildDSN(cfg); dsn != want {
@@ -28,27 +29,16 @@ func TestBuildDSN_ArcxEnabled(t *testing.T) {
 	}
 }
 
-// TestConfigureArcxExtension_DisabledNoOp confirms the loader is a no-op
-// when ArcxExtensionPath is empty. The test doesn't open a real DuckDB
-// connection because configureDatabase's caller already guards on the
-// path being non-empty before invoking configureArcxExtension; this is
-// belt-and-suspenders for the helper itself, which we never call with an
-// empty path in production.
-func TestConfigureArcxExtension_DisabledNoOp(t *testing.T) {
-	// This guards the precondition. configureArcxExtension does not check
-	// cfg.ArcxExtensionPath itself; the caller (configureDatabase) does.
-	// If the caller's check ever regresses, this test will keep passing
-	// silently — so we rely on TestConfigureDatabase_ArcxDisabled below
-	// for the real check.
-	t.Skip("covered by configureDatabase precondition check; see TestConfigureDatabase_ArcxDisabled")
-}
-
-// TestConfigureArcxExtension_LoadsAndReportsVersion is an opt-in end-to-end
-// test that requires the arcx extension to be built locally. Skips when
-// ARCX_TEST_PATH is unset; CI does NOT set it, so this test only runs
-// when a developer points it at a freshly-built .duckdb_extension after
+// TestArcxLoadsAndReportsVersion is an opt-in end-to-end test that
+// requires the arcx extension to be built locally. Skips when
+// ARCX_TEST_PATH is unset; CI does NOT set it. Local devs run after
 // `make` in the arcx repo.
-func TestConfigureArcxExtension_LoadsAndReportsVersion(t *testing.T) {
+//
+// Exercises the real wiring: openDuckDB (which registers the connInitFn),
+// configureDatabase (which runs verifyArcxLoaded), and the
+// connection-pool path so we get evidence that LOAD took effect on a
+// fresh connection rather than the implicit first one.
+func TestArcxLoadsAndReportsVersion(t *testing.T) {
 	path := os.Getenv("ARCX_TEST_PATH")
 	if path == "" {
 		t.Skip("set ARCX_TEST_PATH to the path of arcx.duckdb_extension to run this test")
@@ -57,31 +47,29 @@ func TestConfigureArcxExtension_LoadsAndReportsVersion(t *testing.T) {
 		t.Fatalf("ARCX_TEST_PATH=%q: %v", path, err)
 	}
 
-	cfg := &Config{ArcxExtensionPath: path}
-	dsn := buildDSN(cfg)
-	if dsn != "?allow_unsigned_extensions=true" {
-		t.Fatalf("buildDSN returned %q, expected allow_unsigned_extensions", dsn)
+	cfg := &Config{
+		ArcxExtensionPath: path,
+		MaxConnections:    4, // > 1 so we exercise the pool, not just one connection
+		MemoryLimit:       "1GB",
+		ThreadCount:       2,
 	}
-
-	db, err := sql.Open("duckdb", dsn)
+	db, err := New(cfg, zerolog.Nop())
 	if err != nil {
-		t.Fatalf("sql.Open: %v", err)
+		t.Fatalf("database.New: %v", err)
 	}
 	defer db.Close()
-	if err := db.Ping(); err != nil {
-		t.Fatalf("db.Ping: %v", err)
-	}
 
-	if err := configureArcxExtension(db, cfg, zerolog.Nop()); err != nil {
-		t.Fatalf("configureArcxExtension: %v", err)
+	// Force at least a few distinct pool connections to exercise the
+	// connInitFn — if LOAD only ran on the first one, the second
+	// arcx_version() call would fail with "function does not exist".
+	for i := 0; i < 4; i++ {
+		var ver string
+		if err := db.DB().QueryRow("SELECT arcx_version()").Scan(&ver); err != nil {
+			t.Fatalf("iter %d: SELECT arcx_version(): %v", i, err)
+		}
+		if ver == "" {
+			t.Errorf("iter %d: arcx_version returned empty string", i)
+		}
+		t.Logf("iter %d: %s", i, ver)
 	}
-
-	var ver string
-	if err := db.QueryRow("SELECT arcx_version()").Scan(&ver); err != nil {
-		t.Fatalf("SELECT arcx_version(): %v", err)
-	}
-	if ver == "" {
-		t.Errorf("arcx_version returned empty string")
-	}
-	t.Logf("arcx loaded: %s", ver)
 }

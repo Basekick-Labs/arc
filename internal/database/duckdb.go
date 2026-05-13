@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,7 +12,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/memtrim"
-	_ "github.com/duckdb/duckdb-go/v2"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 	"github.com/rs/zerolog"
 )
 
@@ -100,10 +101,14 @@ type Config struct {
 
 // New creates a new DuckDB instance
 func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
-	// Build connection string with configuration
 	dsn := buildDSN(cfg)
 
-	db, err := sql.Open("duckdb", dsn)
+	// Open the *sql.DB. When arcx is configured we route through
+	// duckdb.NewConnector + connInitFn so the LOAD runs on every pooled
+	// connection (DuckDB's LOAD is per-connection — there is no SET GLOBAL
+	// equivalent, so a bare `db.Exec("LOAD …")` would only register the
+	// extension on whichever pool member database/sql happened to hand us).
+	db, err := openDuckDB(dsn, cfg, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open duckdb: %w", err)
 	}
@@ -155,10 +160,40 @@ func buildDSN(cfg *Config) string {
 	// flipped via SET after the connection is open. We pass it via the
 	// duckdb-go driver's DSN query-string. When arcx is disabled, return
 	// the empty DSN (in-memory database, default settings).
-	if cfg != nil && cfg.ArcxExtensionPath != "" {
+	if cfg.ArcxExtensionPath != "" {
 		return "?allow_unsigned_extensions=true"
 	}
 	return ""
+}
+
+// openDuckDB returns a *sql.DB. When arcx is configured we go through
+// duckdb.NewConnector with an init callback that runs `LOAD '…'` on every
+// new pooled connection — DuckDB's LOAD is per-connection, so this is the
+// only correct way to make arcx available across the whole pool. When
+// arcx is disabled we use the simpler driver-registered sql.Open path.
+func openDuckDB(dsn string, cfg *Config, logger zerolog.Logger) (*sql.DB, error) {
+	if cfg.ArcxExtensionPath == "" {
+		return sql.Open("duckdb", dsn)
+	}
+
+	// Capture the path once so the closure does not retain the *Config.
+	loadSQL := fmt.Sprintf("LOAD '%s'", escapeSQLString(cfg.ArcxExtensionPath))
+	componentLogger := logger.With().Str("component", "duckdb").Logger()
+
+	connector, err := duckdb.NewConnector(dsn, func(execer driver.ExecerContext) error {
+		_, execErr := execer.ExecContext(context.Background(), loadSQL, nil)
+		if execErr != nil {
+			componentLogger.Error().Err(execErr).
+				Str("path", cfg.ArcxExtensionPath).
+				Msg("arcx LOAD failed on new DuckDB connection")
+			return fmt.Errorf("arcx LOAD on new connection: %w", execErr)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create duckdb connector for arcx: %w", err)
+	}
+	return sql.OpenDB(connector), nil
 }
 
 // configureDatabase sets DuckDB configuration after connection
@@ -201,39 +236,54 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		}
 	}
 
-	// Configure the proprietary arcx extension for Arc Enterprise. License
+	// Verify the proprietary arcx extension is loaded into the pool. The
+	// LOAD itself happens inside the connInitFn registered with
+	// duckdb.NewConnector (see openDuckDB) — that callback fires on every
+	// new pool connection so the extension is available across the whole
+	// pool, not just the connection that happened to receive the first
+	// db.Exec("LOAD …") call. Here we pin one connection and ask it for
+	// arcx_version() to confirm the load actually took effect. License
 	// gating happens upstream (cmd/arc/main.go clears ArcxExtensionPath
-	// when the license does not permit it), so the DB layer only checks
-	// presence here.
+	// when the license does not permit it), so an empty path means arcx
+	// is intentionally disabled.
 	if cfg.ArcxExtensionPath != "" {
-		if err := configureArcxExtension(db, cfg, logger); err != nil {
-			return fmt.Errorf("failed to configure arcx extension: %w", err)
+		if err := verifyArcxLoaded(db, cfg, logger); err != nil {
+			return fmt.Errorf("failed to verify arcx extension: %w", err)
 		}
 	}
 
 	return nil
 }
 
-// configureArcxExtension loads the proprietary arcx DuckDB extension and
-// verifies it responded via the arcx_version() proof-of-life UDF. The
-// extension binary is internal-only — Arc treats its presence on disk
-// (cfg.ArcxExtensionPath) as the licensing perimeter, and Arc's license
-// client has already verified the host is permitted to load it before
-// this function is called.
+// verifyArcxLoaded confirms the proprietary arcx DuckDB extension is
+// available on a pool connection. The LOAD itself runs in the connInitFn
+// registered with duckdb.NewConnector for every new connection; this
+// function only proves that one of those connections actually responded
+// to arcx_version(). An empty version string signals an ABI mismatch or
+// a buggy build of arcx — fail-fast rather than limping along.
 //
-// allow_unsigned_extensions must already be set in the DSN — buildDSN
-// handles that when cfg.ArcxExtensionPath is set.
-func configureArcxExtension(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
-	escaped := escapeSQLString(cfg.ArcxExtensionPath)
-	if _, err := db.Exec(fmt.Sprintf("LOAD '%s'", escaped)); err != nil {
-		return fmt.Errorf("LOAD '%s': %w", cfg.ArcxExtensionPath, err)
+// Pinned via db.Conn(ctx) so the verify query lands on a connection
+// that has gone through the init callback (any connection from the
+// pool would, but pinning is defensive against future driver changes).
+func verifyArcxLoaded(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
+	if cfg.ArcxExtensionPath == "" {
+		return nil // belt-and-suspenders; caller already guards this
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire pinned connection: %w", err)
+	}
+	defer conn.Close()
+
 	var ver string
-	if err := db.QueryRow("SELECT arcx_version()").Scan(&ver); err != nil {
-		return fmt.Errorf("arcx_version() proof-of-life failed: %w", err)
+	if err := conn.QueryRowContext(ctx, "SELECT arcx_version()").Scan(&ver); err != nil {
+		return fmt.Errorf("arcx_version() proof-of-life: %w", err)
 	}
-	if ver == "" {
-		return fmt.Errorf("arcx_version() returned empty string — extension binary may be corrupt or built against the wrong DuckDB version")
+	if strings.TrimSpace(ver) == "" {
+		return fmt.Errorf("arcx_version() returned empty string (extension binary corrupt or ABI mismatch?)")
 	}
 	logger.Info().
 		Str("component", "duckdb").

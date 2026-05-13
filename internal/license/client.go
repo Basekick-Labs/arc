@@ -397,9 +397,11 @@ func (c *Client) CanUseQueryManagement() bool {
 
 // CanUseArcx returns true if loading the proprietary arcx DuckDB
 // extension is allowed. Read at process startup before issuing `LOAD`;
-// not currently re-validated per request (arcx loads once into the
-// DuckDB instance and the operators it registers stay registered for
-// the process lifetime).
+// **license expiry mid-process does NOT unload arcx by design** —
+// the extension lives in DuckDB's process memory after LOAD, and
+// there is no symmetric `UNLOAD` we can issue from re-validation
+// middleware. An operator who needs to revoke arcx must restart Arc.
+// The runtime perimeter is binary distribution (see arcx repo README).
 func (c *Client) CanUseArcx() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
