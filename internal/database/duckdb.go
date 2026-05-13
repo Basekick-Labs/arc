@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -179,7 +180,14 @@ func openDuckDB(dsn string, cfg *Config, logger zerolog.Logger) (*sql.DB, error)
 	// Capture the path into a local so the closure does not retain the
 	// whole *Config (the logger field below would otherwise pull cfg in
 	// for its entire lifetime — gemini round 1).
-	path := cfg.ArcxExtensionPath
+	//
+	// filepath.ToSlash normalises Windows-style backslashes to forward
+	// slashes. DuckDB's LOAD parses the path as a single-quoted SQL
+	// string literal, where backslashes are not interpreted as escapes
+	// but Windows paths like `C:\Program Files\arcx\arcx.duckdb_extension`
+	// have been observed to confuse the loader on some Windows builds.
+	// Forward slashes are accepted on every platform DuckDB supports.
+	path := filepath.ToSlash(cfg.ArcxExtensionPath)
 	loadSQL := fmt.Sprintf("LOAD '%s'", escapeSQLString(path))
 	componentLogger := logger.With().Str("component", "duckdb").Logger()
 
