@@ -91,6 +91,11 @@ type Config struct {
 	EnableS3Cache     bool  // Enable S3 file caching via cache_httpfs extension
 	S3CacheSize       int64 // Cache size in bytes
 	S3CacheTTLSeconds int   // Cache entry TTL in seconds (default: 3600)
+	// ArcxExtensionPath is the absolute path to arcx.duckdb_extension.
+	// Empty disables the loader. Arc Enterprise only — the caller
+	// (cmd/arc/main.go) clears this field when the license does not
+	// permit arcx, so the DB layer trusts presence.
+	ArcxExtensionPath string
 }
 
 // New creates a new DuckDB instance
@@ -144,8 +149,15 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 
 // buildDSN constructs the DuckDB connection string
 // NOTE: DuckDB memory_limit and threads must be set via SET commands after connection
-func buildDSN(_ *Config) string {
-	// In-memory database - settings applied via configureDatabase()
+func buildDSN(cfg *Config) string {
+	// Loading arcx (or any unsigned extension) requires the DuckDB
+	// allow_unsigned_extensions flag at connection time — it cannot be
+	// flipped via SET after the connection is open. We pass it via the
+	// duckdb-go driver's DSN query-string. When arcx is disabled, return
+	// the empty DSN (in-memory database, default settings).
+	if cfg != nil && cfg.ArcxExtensionPath != "" {
+		return "?allow_unsigned_extensions=true"
+	}
 	return ""
 }
 
@@ -189,6 +201,45 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		}
 	}
 
+	// Configure the proprietary arcx extension for Arc Enterprise. License
+	// gating happens upstream (cmd/arc/main.go clears ArcxExtensionPath
+	// when the license does not permit it), so the DB layer only checks
+	// presence here.
+	if cfg.ArcxExtensionPath != "" {
+		if err := configureArcxExtension(db, cfg, logger); err != nil {
+			return fmt.Errorf("failed to configure arcx extension: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// configureArcxExtension loads the proprietary arcx DuckDB extension and
+// verifies it responded via the arcx_version() proof-of-life UDF. The
+// extension binary is internal-only — Arc treats its presence on disk
+// (cfg.ArcxExtensionPath) as the licensing perimeter, and Arc's license
+// client has already verified the host is permitted to load it before
+// this function is called.
+//
+// allow_unsigned_extensions must already be set in the DSN — buildDSN
+// handles that when cfg.ArcxExtensionPath is set.
+func configureArcxExtension(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
+	escaped := escapeSQLString(cfg.ArcxExtensionPath)
+	if _, err := db.Exec(fmt.Sprintf("LOAD '%s'", escaped)); err != nil {
+		return fmt.Errorf("LOAD '%s': %w", cfg.ArcxExtensionPath, err)
+	}
+	var ver string
+	if err := db.QueryRow("SELECT arcx_version()").Scan(&ver); err != nil {
+		return fmt.Errorf("arcx_version() proof-of-life failed: %w", err)
+	}
+	if ver == "" {
+		return fmt.Errorf("arcx_version() returned empty string — extension binary may be corrupt or built against the wrong DuckDB version")
+	}
+	logger.Info().
+		Str("component", "duckdb").
+		Str("path", cfg.ArcxExtensionPath).
+		Str("arcx_version", ver).
+		Msg("arcx extension loaded")
 	return nil
 }
 

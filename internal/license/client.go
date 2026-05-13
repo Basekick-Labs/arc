@@ -395,6 +395,17 @@ func (c *Client) CanUseQueryManagement() bool {
 	return c.license != nil && c.license.CanUseQueryManagement()
 }
 
+// CanUseArcx returns true if loading the proprietary arcx DuckDB
+// extension is allowed. Read at process startup before issuing `LOAD`;
+// not currently re-validated per request (arcx loads once into the
+// DuckDB instance and the operators it registers stay registered for
+// the process lifetime).
+func (c *Client) CanUseArcx() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.license != nil && c.license.CanUseArcx()
+}
+
 // GetFingerprint returns the machine fingerprint
 func (c *Client) GetFingerprint() string {
 	return c.fingerprint

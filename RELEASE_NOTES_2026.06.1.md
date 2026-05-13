@@ -147,6 +147,20 @@ Dependabot-grouped go.mod refresh. Three updates, +17/-16 across `go.mod` and `g
 
 One new transitive entry in `go.sum`: `github.com/rogpeppe/go-internal v1.14.1` (test infra pulled by OTel).
 
+## Enterprise
+
+### arcx — proprietary DuckDB extension loader (scaffold)
+
+Arc Enterprise can now load the proprietary **arcx** DuckDB extension at startup. The extension lives in a separate private repo (`Basekick-Labs/arcx`, not yet public) and will host operators that bypass DuckDB's general-purpose query path for workloads where profiling showed DuckDB itself is the bottleneck — partition-aware scans, manifest-backed `read_parquet`, partition-aligned aggregation fast paths. v0.1 ships only a `arcx_version()` proof-of-life UDF; real operators land in follow-up releases.
+
+**Configuration.** Set `database.arcx_extension_path` (env: `ARC_DATABASE_ARCX_EXTENSION_PATH`) to the absolute path of the `arcx.duckdb_extension` binary. The loader is gated by the new `arcx` license feature — Arc refuses to issue `LOAD` if the license does not include it. OSS Arc deployments never load arcx (no path configured by default, no license gate to satisfy).
+
+**Wiring.** New `configureArcxExtension()` in [internal/database/duckdb.go](internal/database/duckdb.go) runs after `configureDatabase`'s S3/Azure setup, issues `LOAD '...'`, and verifies `SELECT arcx_version()` returns a non-empty string before considering the extension ready. The DSN now includes `?allow_unsigned_extensions=true` when arcx is configured (the extension is unsigned by design — see the arcx repo README for the security model).
+
+**License enforcement** is entirely Arc-side. The extension binary does no in-process verification; Arc's `licenseClient.CanUseArcx()` is the sole authority. The licensing perimeter is binary distribution — the `.duckdb_extension` file is internal-only and ships bundled with Arc Enterprise builds.
+
+**Security note.** `allow_unsigned_extensions=true` in the DSN relaxes DuckDB's signed-extension policy *for that connection*; only arcx is loaded by Arc, but the flag in principle permits other unsigned extensions if loaded via raw SQL. Out of scope for v1 since user SQL is denied `LOAD` by the existing `dangerousSQLPattern` validator.
+
 ## Bug Fixes
 
 ### S3-Backed Retention/Delete: RSS Recovery After Long Sweeps (PR #420)
