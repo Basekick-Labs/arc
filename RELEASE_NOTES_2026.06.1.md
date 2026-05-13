@@ -161,6 +161,28 @@ Arc Enterprise can now load the proprietary **arcx** DuckDB extension at startup
 
 **Security note.** `allow_unsigned_extensions=true` in the DSN relaxes DuckDB's signed-extension policy at the **database** level — that is, every connection in the pool runs with the relaxed policy for its lifetime, not just the connection that loads arcx. Only arcx is loaded by Arc, but the flag in principle permits other unsigned extensions if loaded via raw SQL. Out of scope for v1 since user SQL is denied `LOAD`/`INSTALL` by the existing `dangerousSQLPattern` validator (regression test at `internal/api/query_test.go`).
 
+### arcx — `arc_partition_agg` operator wiring (Arc-side companion to arcx PR #1)
+
+The first real arcx operator, `arc_partition_agg(database, measurement, unit)`, ships in the private arcx repo with the v0.2 binary. It answers `SELECT date_trunc(unit, time), COUNT(*) FROM <measurement> GROUP BY 1` (`unit` ∈ `{year, month, day, hour}`) from parquet footers — no row scan. Measured on a local M1 against real Arc data:
+
+| Workload                              | Files  |   Rows | Speedup |
+| ------------------------------------- | -----: | -----: | ------: |
+| citibike (14 yr, daily-compacted)     | 4,782  | 137 M  |    5.1× |
+| production (1 hr, hourly compacted)   |     5  | 393 M  |     35× |
+| synth (20 days × 24 hr × 5/hr)        | 2,400  | 189 B  |     76× |
+
+The cost model is linear in **file count**, not row count — so the speedup grows with dataset size at fixed file density.
+
+26.06.1 ships the **Arc-side wiring** required to make the operator usable from Arc's DuckDB pool:
+
+- **`arcx.storage_root` setting.** The operator needs to resolve `{database}/{measurement}/...` paths to absolute filesystem paths without taking the storage root as an argument (which would be ugly and would surface internal paths in user-visible function signatures). Arc's `connInitFn` now runs `SET arcx.storage_root = '<cfg.Storage.LocalPath>'` immediately after the existing `LOAD '<path>'`, on every pooled connection. The setting is registered by the arcx extension at LOAD time; Arc populates it from `cfg.Storage.LocalPath` (the local backend's data root). When `database.arcx_extension_path` is empty (OSS or license-disabled), the SET is skipped entirely.
+- **`database.Config.ArcxStorageRoot`.** New field, set from `cfg.Storage.LocalPath` in `cmd/arc/main.go` only when the arcx loader is enabled — same guard as `ArcxExtensionPath`. The DB layer ignores the field when arcx isn't configured.
+- **`ValidateSQLRequest` denylist for `arc_partition_agg(`.** Matching the existing `read_parquet(` block, raw user SQL containing a call to `arc_partition_agg(...)` is rejected as a SQL validation error. The operator takes raw `(database, measurement)` strings and globs the filesystem; without this denylist, an authenticated user scoped to `db1` could call `arc_partition_agg('db2', 'mem', 'hour')` and enumerate row counts in databases they don't own — the same RBAC-bypass shape that `read_parquet` was denylisted to close in an earlier release. The denylist runs on string-literal-masked, comment-stripped SQL — literals containing the text `arc_partition_agg` are not false-positives. Five new test cases at `internal/api/query_test.go#TestValidateSQLRequest_BypassesAndFalsePositives` cover direct calls, uppercase, whitespace-before-paren, inside CTE, and the literal-text false-positive.
+
+**The operator is reachable today only via raw SQL (now blocked)** — Arc's query rewriter does not yet detect the eligible shape and emit `arc_partition_agg(...)` automatically. The full productisation step is tracked in the arcx repo's roadmap (`docs/arcx-roadmap.md` in the arcx tree) as the v1.1 blocker. Until then, the operator exists for internal benchmarking and for customer trials that manually opt in. Single-tenant Enterprise deployments can begin evaluating perf gains against their own workloads with no risk of cross-tenant leakage.
+
+Tests added: `TestArcxStorageRootIsSetOnEveryConn` (opt-in integration test, requires `ARCX_TEST_PATH`; CI does not set it) confirms the setting is applied across **distinct pool connections** so a rolling failover to a fresh pool member doesn't break the function. Five validation tests cover the denylist behavior.
+
 ## Bug Fixes
 
 ### S3-Backed Retention/Delete: RSS Recovery After Long Sweeps (PR #420)

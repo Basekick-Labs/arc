@@ -98,3 +98,52 @@ func TestArcxLoadsAndReportsVersion(t *testing.T) {
 		t.Logf("conn %d: %s", i, ver)
 	}
 }
+
+// TestArcxStorageRootIsSetOnEveryConn confirms the SET arcx.storage_root
+// statement runs alongside LOAD in connInitFn so every pool connection has
+// the setting available — without it, arc_partition_agg errors at Bind.
+func TestArcxStorageRootIsSetOnEveryConn(t *testing.T) {
+	path := os.Getenv("ARCX_TEST_PATH")
+	if path == "" {
+		t.Skip("set ARCX_TEST_PATH to the path of arcx.duckdb_extension to run this test")
+	}
+	const want = "/tmp/arc-test-storage"
+
+	cfg := &Config{
+		ArcxExtensionPath: path,
+		ArcxStorageRoot:   want,
+		MaxConnections:    3,
+		MemoryLimit:       "1GB",
+		ThreadCount:       2,
+	}
+	db, err := New(cfg, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	const n = 3
+	conns := make([]*sql.Conn, 0, n)
+	defer func() {
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	}()
+	for i := 0; i < n; i++ {
+		c, err := db.DB().Conn(ctx)
+		if err != nil {
+			t.Fatalf("iter %d: acquire conn: %v", i, err)
+		}
+		conns = append(conns, c)
+	}
+	for i, c := range conns {
+		var got string
+		if err := c.QueryRowContext(ctx, "SELECT current_setting('arcx.storage_root')").Scan(&got); err != nil {
+			t.Fatalf("conn %d: SELECT current_setting: %v", i, err)
+		}
+		if got != want {
+			t.Errorf("conn %d: arcx.storage_root = %q, want %q", i, got, want)
+		}
+	}
+}

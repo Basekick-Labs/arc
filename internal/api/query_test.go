@@ -1028,6 +1028,16 @@ func TestValidateSQLRequest_BypassesAndFalsePositives(t *testing.T) {
 		{name: "user read_parquet in JOIN", sql: "SELECT * FROM cpu JOIN read_parquet('/data/x/*.parquet') ON cpu.id = x.id", shouldFail: true},
 		// Allow read_parquet inside a string literal (it'd be a column value).
 		{name: "literal containing read_parquet text", sql: "SELECT * FROM logs WHERE msg = 'read_parquet failed'", shouldFail: false},
+
+		// Same RBAC-bypass shape as read_parquet: user SQL calling
+		// arc_partition_agg directly lets a caller scoped to db1 read
+		// row counts in db2 because the function takes raw db/measurement
+		// strings and globs the filesystem. Only Arc's rewriter emits it.
+		{name: "user arc_partition_agg direct", sql: "SELECT * FROM arc_partition_agg('db2', 'mem', 'hour')", shouldFail: true},
+		{name: "user ARC_PARTITION_AGG uppercase", sql: "SELECT * FROM ARC_PARTITION_AGG('db2', 'mem', 'hour')", shouldFail: true},
+		{name: "user arc_partition_agg whitespace", sql: "SELECT * FROM arc_partition_agg  ('db2', 'mem', 'hour')", shouldFail: true},
+		{name: "user arc_partition_agg in CTE", sql: "WITH x AS (SELECT * FROM arc_partition_agg('db2', 'mem', 'hour')) SELECT * FROM x", shouldFail: true},
+		{name: "literal containing arc_partition_agg text", sql: "SELECT * FROM logs WHERE msg = 'arc_partition_agg failed'", shouldFail: false},
 	}
 
 	for _, tt := range tests {

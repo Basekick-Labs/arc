@@ -99,6 +99,10 @@ type Config struct {
 	// (cmd/arc/main.go) clears this field when the license does not
 	// permit arcx, so the DB layer trusts presence.
 	ArcxExtensionPath string
+	// ArcxStorageRoot is the filesystem root arcx's arc_partition_agg
+	// table function uses to locate parquet files. Set to the local
+	// storage backend's root path; ignored when ArcxExtensionPath is empty.
+	ArcxStorageRoot string
 }
 
 // New creates a new DuckDB instance
@@ -190,6 +194,15 @@ func openDuckDB(dsn string, cfg *Config, logger zerolog.Logger) (*sql.DB, error)
 	// Forward slashes are accepted on every platform DuckDB supports.
 	path := filepath.ToSlash(cfg.ArcxExtensionPath)
 	loadSQL := fmt.Sprintf("LOAD '%s'", escapeSQLString(path))
+	// Set arcx.storage_root in the same connInitFn so the operator can
+	// resolve filesystem paths without taking them as arguments. The setting
+	// is registered by the extension at LOAD time; SET runs in the same
+	// statement after LOAD via a semicolon separator.
+	connInitSQL := loadSQL
+	if cfg.ArcxStorageRoot != "" {
+		storageRoot := filepath.ToSlash(cfg.ArcxStorageRoot)
+		connInitSQL = fmt.Sprintf("%s; SET arcx.storage_root = '%s'", loadSQL, escapeSQLString(storageRoot))
+	}
 	componentLogger := logger.With().Str("component", "duckdb").Logger()
 
 	// arcxLoadTimeout bounds the connection-init LOAD so a corrupt or
@@ -208,7 +221,7 @@ func openDuckDB(dsn string, cfg *Config, logger zerolog.Logger) (*sql.DB, error)
 	connector, err := duckdb.NewConnector(dsn, func(execer driver.ExecerContext) error {
 		ctx, cancel := context.WithTimeout(context.Background(), arcxLoadTimeout)
 		defer cancel()
-		_, execErr := execer.ExecContext(ctx, loadSQL, nil)
+		_, execErr := execer.ExecContext(ctx, connInitSQL, nil)
 		if execErr != nil {
 			loadErrLogOnce.Do(func() {
 				componentLogger.Error().Err(execErr).

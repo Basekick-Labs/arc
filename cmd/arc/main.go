@@ -198,6 +198,14 @@ func main() {
 		S3CacheTTLSeconds: cfg.Query.S3CacheTTLSeconds,
 		// arcx loader (cleared above when license does not permit)
 		ArcxExtensionPath: arcxPath,
+		// arcx storage root for the partition_agg table function. Only set
+		// when the loader is enabled; the DB layer ignores it otherwise.
+		ArcxStorageRoot: func() string {
+			if arcxPath == "" {
+				return ""
+			}
+			return cfg.Storage.LocalPath
+		}(),
 	}
 
 	db, err := database.New(dbConfig, logger.Get("database"))
