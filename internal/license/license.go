@@ -26,6 +26,11 @@ const (
 	FeatureWriterFailover     = "writer_failover"
 	FeatureQueryGovernance    = "query_governance"
 	FeatureQueryManagement    = "query_management"
+	// FeatureArcx gates the proprietary arcx DuckDB extension. Arc Enterprise
+	// only — when set, Arc loads /path/to/arcx.duckdb_extension into the
+	// DuckDB connection at startup. The extension binary is the licensing
+	// perimeter; this flag is the only runtime check (no in-extension gate).
+	FeatureArcx = "arcx"
 )
 
 // License represents a validated license
@@ -132,6 +137,13 @@ func (l *License) CanUseQueryManagement() bool {
 // reconciliation). Requires the clustering feature flag.
 func (l *License) CanUseClustering() bool {
 	return l.HasFeature(FeatureClustering)
+}
+
+// CanUseArcx returns true if the license allows loading the proprietary
+// arcx DuckDB extension. Without this flag, Arc never issues `LOAD` for
+// arcx even if database.arcx_extension_path is set in config.
+func (l *License) CanUseArcx() bool {
+	return l.HasFeature(FeatureArcx)
 }
 
 // TierFromString converts a string to a Tier

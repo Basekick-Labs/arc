@@ -154,11 +154,26 @@ func main() {
 	// Initialize shutdown coordinator
 	shutdownCoordinator := shutdown.New(30*time.Second, logger.Get("shutdown"))
 
+	// arcx (Arc Enterprise DuckDB extension): gate via license before
+	// passing the path down to the DB layer. The extension binary is the
+	// licensing perimeter, but having Arc refuse to LOAD without a valid
+	// license is the operator-friendly behavior.
+	arcxPath := cfg.Database.ArcxExtensionPath
+	if arcxPath != "" {
+		if licenseClient == nil || !licenseClient.CanUseArcx() {
+			log.Warn().
+				Str("arcx_extension_path", arcxPath).
+				Msg("arcx extension configured but license does not include 'arcx' feature — extension will not load")
+			arcxPath = ""
+		}
+	}
+
 	// Initialize DuckDB
 	log.Info().
 		Int("thread_count", cfg.Database.ThreadCount).
 		Int("max_connections", cfg.Database.MaxConnections).
 		Str("memory_limit", cfg.Database.MemoryLimit).
+		Bool("arcx_enabled", arcxPath != "").
 		Int("machine_cpus", runtime.NumCPU()).
 		Msg("Initializing DuckDB with database config")
 	dbConfig := &database.Config{
@@ -181,6 +196,8 @@ func main() {
 		EnableS3Cache:     cfg.Query.EnableS3Cache,
 		S3CacheSize:       cfg.Query.S3CacheSize,
 		S3CacheTTLSeconds: cfg.Query.S3CacheTTLSeconds,
+		// arcx loader (cleared above when license does not permit)
+		ArcxExtensionPath: arcxPath,
 	}
 
 	db, err := database.New(dbConfig, logger.Get("database"))
