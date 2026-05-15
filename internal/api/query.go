@@ -2742,13 +2742,20 @@ func (h *QueryHandler) convertValue(v interface{}) interface{} {
 func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error {
 	h.logger.Debug().Msg("Handling SHOW DATABASES")
 
-	// Include tier column if tiering is enabled
+	// Include tier column if tiering is enabled. The types slice is
+	// parallel to columns and feeds the msgpack envelope's "types"
+	// field — SHOW results are schema-known by construction, so we
+	// declare types explicitly rather than infer them from cell
+	// content (which is brittle when leading rows are nil).
 	var columns []string
+	var types []string
 	hasTiering := h.tieringManager != nil
 	if hasTiering {
 		columns = []string{"database", "tier"}
+		types = []string{"utf8", "utf8"}
 	} else {
 		columns = []string{"database"}
+		types = []string{"utf8"}
 	}
 	data := make([][]interface{}, 0)
 
@@ -2837,7 +2844,7 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 		Float64("execution_time_ms", executionTime).
 		Msg("SHOW DATABASES completed")
 
-	return respondSuccessRows(c, columns, data, time.Now().UTC().Format(time.RFC3339), start)
+	return respondSuccessRows(c, columns, types, data, time.Now().UTC().Format(time.RFC3339), start)
 }
 
 // handleShowTables handles SHOW TABLES/MEASUREMENTS command by scanning storage
@@ -2845,6 +2852,10 @@ func (h *QueryHandler) handleShowTables(c *fiber.Ctx, start time.Time, database 
 	h.logger.Debug().Str("database", database).Msg("Handling SHOW TABLES")
 
 	columns := []string{"database", "table_name", "storage_path", "file_count", "total_size_mb"}
+	// types parallel to columns: SHOW TABLES emits two text columns,
+	// a text path, an int file count, and a float size. Declared
+	// explicitly rather than inferred from row content.
+	types := []string{"utf8", "utf8", "utf8", "int64", "float64"}
 	data := make([][]interface{}, 0)
 
 	ctx := context.Background()
@@ -2937,7 +2948,7 @@ func (h *QueryHandler) handleShowTables(c *fiber.Ctx, start time.Time, database 
 		Float64("execution_time_ms", executionTime).
 		Msg("SHOW TABLES completed")
 
-	return respondSuccessRows(c, columns, data, time.Now().UTC().Format(time.RFC3339), start)
+	return respondSuccessRows(c, columns, types, data, time.Now().UTC().Format(time.RFC3339), start)
 }
 
 // extractTableNames extracts unique table names from file paths within a database

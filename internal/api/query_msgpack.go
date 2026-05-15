@@ -153,7 +153,12 @@ func executeArrowMsgPackQuery(
 		w.Flush()
 
 		reader.Release()
-		conn.Close()
+		// Defensive nil-check: the driver contract returns a non-nil
+		// conn when err == nil, but a driver bug shouldn't crash a
+		// streaming response that has already committed headers.
+		if conn != nil {
+			conn.Close()
+		}
 		if cancel != nil {
 			cancel()
 		}
@@ -415,7 +420,7 @@ batchLoop:
 	if err := enc.EncodeString("execution_time_ms"); err != nil {
 		return rowCount, err
 	}
-	if err := enc.EncodeUint(uint64(time.Since(start).Milliseconds())); err != nil {
+	if err := enc.EncodeUint(elapsedMsUint(start)); err != nil {
 		return rowCount, err
 	}
 

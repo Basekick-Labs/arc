@@ -26,6 +26,19 @@ func isMsgPackWire(c *fiber.Ctx) bool {
 	return ok && v == wireFormatMsgPack
 }
 
+// elapsedMsUint returns the milliseconds elapsed since start as a
+// uint64, clamped to 0 below. time.Since uses the monotonic clock so
+// the value cannot actually go negative on Go ≥ 1.9, but the cast to
+// uint64 of any negative int64 produces a very large wire value — the
+// max(0, ...) is a belt-and-suspenders guard that costs nothing.
+func elapsedMsUint(start time.Time) uint64 {
+	ms := time.Since(start).Milliseconds()
+	if ms < 0 {
+		return 0
+	}
+	return uint64(ms)
+}
+
 // respondError emits a structured error response in the wire format the
 // caller requested. Used in place of c.Status(status).JSON(QueryResponse{
 // Success:false, Error:msg, Timestamp:ts}) at every error site in the
@@ -50,7 +63,23 @@ func respondError(c *fiber.Ctx, status int, errMsg, timestamp string, start time
 // the row-major data slice in hand. For msgpack the data slice is
 // transposed to the columnar wire format on the fly; for JSON it
 // passes through unchanged.
-func respondSuccessRows(c *fiber.Ctx, columns []string, data [][]interface{}, timestamp string, start time.Time) error {
+//
+// types is parallel to columns and carries the wire-level type name
+// per column (matching the streaming hot path's arrow.DataType.String()
+// output for the comparable Arrow type). Passed explicitly by the
+// caller rather than inferred from cell content, because:
+//
+//  1. SHOW handlers know the schema by construction — the row-major
+//     []interface{} representation is for JSON convenience, not type
+//     ground-truth.
+//  2. First-non-nil-cell inference is fragile when leading rows are
+//     nil for a column that later carries data.
+//
+// types may be nil, in which case the JSON path doesn't emit a types
+// field (the JSON envelope shape never had one) and the msgpack path
+// falls back to empty strings — a deliberate signal to the client that
+// the schema is unknown.
+func respondSuccessRows(c *fiber.Ctx, columns []string, types []string, data [][]interface{}, timestamp string, start time.Time) error {
 	if !isMsgPackWire(c) {
 		return c.JSON(QueryResponse{
 			Success:         true,
@@ -61,7 +90,7 @@ func respondSuccessRows(c *fiber.Ctx, columns []string, data [][]interface{}, ti
 			Timestamp:       timestamp,
 		})
 	}
-	writeMsgPackRowsColumnar(c, columns, data, start, timestamp)
+	writeMsgPackRowsColumnar(c, columns, types, data, start, timestamp)
 	return nil
 }
 
@@ -91,7 +120,7 @@ func respondEmptySuccess(c *fiber.Ctx, timestamp string, start time.Time) error 
 // from the first non-nil cell in each column). Bounded payload — SHOW
 // results are small (databases/measurements) — so direct in-memory
 // encode without streaming.
-func writeMsgPackRowsColumnar(c *fiber.Ctx, columns []string, data [][]interface{}, start time.Time, timestamp string) {
+func writeMsgPackRowsColumnar(c *fiber.Ctx, columns []string, types []string, data [][]interface{}, start time.Time, timestamp string) {
 	c.Set(fiber.HeaderContentType, msgpackContentType)
 	enc := msgpack.GetEncoder()
 	enc.Reset(c.Response().BodyWriter())
@@ -115,36 +144,16 @@ func writeMsgPackRowsColumnar(c *fiber.Ctx, columns []string, data [][]interface
 		_ = enc.EncodeString(col)
 	}
 
-	// "types": infer per-column from the first non-nil cell. SHOW
-	// responses use Go-native types (string for names, int64 for
-	// counts, float64 for sizes) so the rendered names mirror what
-	// the streaming path emits via arrow.DataType.String(). Nil-only
-	// columns fall back to "null".
+	// "types": parallel to columns. Caller passes them explicitly
+	// (SHOW handlers know the schema by construction). When nil or
+	// short, missing entries fall back to "" so the array length
+	// invariant (len(types) == len(columns)) holds on the wire.
 	_ = enc.EncodeString("types")
 	_ = enc.EncodeArrayLen(numCols)
 	for colIdx := 0; colIdx < numCols; colIdx++ {
-		typeName := "null"
-		for _, row := range data {
-			if colIdx >= len(row) || row[colIdx] == nil {
-				continue
-			}
-			switch row[colIdx].(type) {
-			case bool:
-				typeName = "bool"
-			case int, int32, int64:
-				typeName = "int64"
-			case uint, uint32, uint64:
-				typeName = "uint64"
-			case float32, float64:
-				typeName = "float64"
-			case string:
-				typeName = "string"
-			case []byte:
-				typeName = "binary"
-			default:
-				typeName = "string"
-			}
-			break
+		var typeName string
+		if colIdx < len(types) {
+			typeName = types[colIdx]
 		}
 		_ = enc.EncodeString(typeName)
 	}
@@ -196,7 +205,7 @@ func writeMsgPackRowsColumnar(c *fiber.Ctx, columns []string, data [][]interface
 	_ = enc.EncodeUint(uint64(numRows))
 
 	_ = enc.EncodeString("execution_time_ms")
-	_ = enc.EncodeUint(uint64(time.Since(start).Milliseconds()))
+	_ = enc.EncodeUint(elapsedMsUint(start))
 
 	_ = enc.EncodeString("timestamp")
 	_ = enc.EncodeString(timestamp)
@@ -229,7 +238,7 @@ func writeMsgPackEmpty(c *fiber.Ctx, start time.Time, timestamp string) {
 	_ = enc.EncodeString("row_count")
 	_ = enc.EncodeUint(0)
 	_ = enc.EncodeString("execution_time_ms")
-	_ = enc.EncodeUint(uint64(time.Since(start).Milliseconds()))
+	_ = enc.EncodeUint(elapsedMsUint(start))
 	_ = enc.EncodeString("timestamp")
 	_ = enc.EncodeString(timestamp)
 }
@@ -251,7 +260,7 @@ func writeMsgPackError(c *fiber.Ctx, errMsg string, start time.Time, timestamp s
 	_ = enc.EncodeString("error")
 	_ = enc.EncodeString(errMsg)
 	_ = enc.EncodeString("execution_time_ms")
-	_ = enc.EncodeUint(uint64(time.Since(start).Milliseconds()))
+	_ = enc.EncodeUint(elapsedMsUint(start))
 	_ = enc.EncodeString("timestamp")
 	_ = enc.EncodeString(timestamp)
 }
