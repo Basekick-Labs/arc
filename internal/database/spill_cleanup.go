@@ -57,13 +57,13 @@ func CleanupOrphanedSpillFiles(tempDir string, logger zerolog.Logger) error {
 
 	now := time.Now()
 	var (
-		removed       int
-		bytesFreed    int64
-		skippedRecent int
-		statFailures  int
+		removed        int
+		bytesFreed     int64
+		skippedRecent  int
+		statFailures   int
 		removeFailures int
-		firstErr      error
-		firstErrFile  string
+		firstErr       error
+		firstErrFile   string
 	)
 
 	for _, entry := range entries {
@@ -108,14 +108,25 @@ func CleanupOrphanedSpillFiles(tempDir string, logger zerolog.Logger) error {
 		bytesFreed += size
 	}
 
+	// Pick the right level once: Warn if anything went wrong, Info if
+	// there was work to summarize (so operators see the leak recovery),
+	// Debug if the sweep was a no-op (so healthy clusters with frequent
+	// restarts don't spam logs). Only one zerolog event is acquired from
+	// the pool — branching the assignment avoids leaking an orphaned
+	// event that never gets Msg'd.
 	failures := statFailures + removeFailures
-	logEvt := logger.Info()
-	if failures > 0 {
+	var logEvt *zerolog.Event
+	switch {
+	case failures > 0:
 		logEvt = logger.Warn().
 			Err(firstErr).
 			Str("first_failure_file", firstErrFile).
 			Int("stat_failures", statFailures).
 			Int("remove_failures", removeFailures)
+	case removed > 0 || skippedRecent > 0:
+		logEvt = logger.Info()
+	default:
+		logEvt = logger.Debug()
 	}
 	logEvt.
 		Str("temp_directory", tempDir).
