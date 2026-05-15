@@ -213,11 +213,16 @@ func main() {
 	// internally and the path the sweep walks are the same regardless of
 	// the process CWD (matters for systemd units with WorkingDirectory=/
 	// and for docker entrypoints rooted at /). Falls back to the
-	// configured value if Abs fails.
+	// configured value if Abs fails. Normalize to forward slashes so the
+	// path is safe to interpolate into a DuckDB SQL string on Windows
+	// (backslashes would become escape sequences if standard_conforming_
+	// strings is ever disabled) and so the SQL value matches the sweep
+	// path byte-for-byte. Matches the pattern used by ArcxExtensionPath.
 	if dbConfig.TempDirectory != "" {
 		if abs, err := filepath.Abs(dbConfig.TempDirectory); err == nil {
 			dbConfig.TempDirectory = abs
 		}
+		dbConfig.TempDirectory = filepath.ToSlash(dbConfig.TempDirectory)
 	}
 
 	// Sweep orphaned DuckDB spill files from a previous run (kill -9,
