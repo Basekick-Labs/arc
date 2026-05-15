@@ -181,6 +181,7 @@ func main() {
 		MemoryLimit:    cfg.Database.MemoryLimit,
 		ThreadCount:    cfg.Database.ThreadCount,
 		EnableWAL:      cfg.Database.EnableWAL,
+		TempDirectory:  cfg.Database.TempDirectory,
 		// S3 configuration for httpfs extension (enables DuckDB to query S3 directly)
 		S3Region:    cfg.Storage.S3Region,
 		S3AccessKey: cfg.Storage.S3AccessKey,
@@ -206,6 +207,33 @@ func main() {
 			}
 			return cfg.Storage.LocalPath
 		}(),
+	}
+
+	// Resolve temp_directory to an absolute path so the value DuckDB stores
+	// internally and the path the sweep walks are the same regardless of
+	// the process CWD (matters for systemd units with WorkingDirectory=/
+	// and for docker entrypoints rooted at /). Falls back to the
+	// configured value if Abs fails. Normalize to forward slashes so the
+	// path is safe to interpolate into a DuckDB SQL string on Windows
+	// (backslashes would become escape sequences if standard_conforming_
+	// strings is ever disabled) and so the SQL value matches the sweep
+	// path byte-for-byte. Matches the pattern used by ArcxExtensionPath.
+	if dbConfig.TempDirectory != "" {
+		if abs, err := filepath.Abs(dbConfig.TempDirectory); err == nil {
+			dbConfig.TempDirectory = abs
+		}
+		dbConfig.TempDirectory = filepath.ToSlash(dbConfig.TempDirectory)
+	}
+
+	// Sweep orphaned DuckDB spill files from a previous run (kill -9,
+	// OOM-kill, crash). DuckDB unlinks these on graceful close, but
+	// otherwise they survive and accumulate. Runs BEFORE database.New so
+	// we never race with our own DuckDB process. Files younger than
+	// spillFileLiveThreshold are skipped to protect any concurrent arc;
+	// the durable invariant is "no two arc instances share a
+	// temp_directory" — document this in the operator config.
+	if err := database.CleanupOrphanedSpillFiles(dbConfig.TempDirectory, logger.Get("database")); err != nil {
+		log.Warn().Err(err).Msg("Failed to sweep orphaned DuckDB spill files; continuing")
 	}
 
 	db, err := database.New(dbConfig, logger.Get("database"))

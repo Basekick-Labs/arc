@@ -79,6 +79,11 @@ type Config struct {
 	MemoryLimit    string
 	ThreadCount    int
 	EnableWAL      bool
+	// TempDirectory is where DuckDB writes query spill files (HASH_GROUP_BY
+	// overflow, large sorts, joins). Empty leaves DuckDB's default
+	// (CWD-relative). Orphans from a crashed previous run are swept by
+	// CleanupOrphanedSpillFiles at startup.
+	TempDirectory string
 	// S3 configuration for httpfs extension
 	S3Region    string
 	S3AccessKey string
@@ -251,6 +256,24 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		logger.Info().Int("threads", cfg.ThreadCount).Msg("Setting DuckDB thread count")
 		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL threads=%d", cfg.ThreadCount)); err != nil {
 			return fmt.Errorf("failed to set threads: %w", err)
+		}
+	}
+	// Pin DuckDB's spill location so operators can place it on fast scratch
+	// storage AND so CleanupOrphanedSpillFiles can sweep a known path at
+	// startup. Empty leaves DuckDB's default (CWD-relative). The directory
+	// must exist before DuckDB tries to write a spill file; create it with
+	// 0o700 so intermediate query state is not world-readable on shared
+	// hosts. escapeSQLString is sufficient defense against the path
+	// reaching DuckDB's parser because Arc relies on DuckDB's default
+	// standard_conforming_strings=on (single-quote doubling is the only
+	// in-band escape).
+	if cfg.TempDirectory != "" {
+		if err := os.MkdirAll(cfg.TempDirectory, 0o700); err != nil {
+			return fmt.Errorf("failed to create temp_directory %q: %w", cfg.TempDirectory, err)
+		}
+		logger.Info().Str("temp_directory", cfg.TempDirectory).Msg("Setting DuckDB temp directory")
+		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL temp_directory='%s'", escapeSQLString(cfg.TempDirectory))); err != nil {
+			return fmt.Errorf("failed to set temp_directory: %w", err)
 		}
 	}
 
@@ -679,7 +702,13 @@ func (d *DuckDB) Exec(query string, args ...interface{}) (sql.Result, error) {
 	return result, nil
 }
 
-// Close closes the database connection
+// Close closes the database connection. DuckDB unlinks spill files in its
+// own Close path; we deliberately do NOT re-sweep here. Re-review thread:
+// (a) on the happy path it's a no-op; (b) the 60s mtime guard would skip
+// freshly-written files anyway; (c) running it from a SIGTERM handler
+// risks stalling shutdown past systemd's TimeoutStopSec. The startup
+// sweep in cmd/arc/main.go covers the crash case, which is the only path
+// that actually leaks.
 func (d *DuckDB) Close() error {
 	if err := d.db.Close(); err != nil {
 		return fmt.Errorf("failed to close database: %w", err)

@@ -55,6 +55,20 @@ The trailer is also emitted on the error path (with time-until-failure) so parti
 
 The JSON path (`/api/v1/query`) is unchanged — `execution_time_ms` was already in the response body.
 
+### Orphaned DuckDB spill files now cleaned at startup
+
+DuckDB writes query spill files (`duckdb_temp_storage_*.tmp`) when intermediate state for a HASH_GROUP_BY, sort, or join exceeds `memory_limit`. On graceful close DuckDB unlinks them itself. On `kill -9`, OOM-kill, container restart, or crash the unlink never runs and the files survive — they are not `O_TMPFILE`. A development machine accumulated **40 GB** of orphaned spill files across 17 days; the largest single file was 8.83 GB.
+
+26.06.1 adds the missing cleanup:
+
+- **New config: `database.temp_directory`** (default `./.tmp`, resolved to an absolute path at startup). DuckDB is pinned to this directory via `SET GLOBAL temp_directory`, so the path the engine spills to and the path the sweep walks are guaranteed to match. The directory is created with `0o700` so intermediate query state — which can contain post-filter, post-join rows — is not world-readable on shared hosts.
+- **Startup sweep:** before `database.New` opens the connection pool, Arc walks `temp_directory` and removes regular files matching `duckdb_temp_storage_*.tmp` that are older than 60 seconds. The age threshold protects any concurrent arc instance; the durable invariant is "one arc per `temp_directory`," which operators should preserve.
+- **Single summary log:** per-file failures (permission denied, race with a concurrent unlink) are counted and surfaced as one Warn line with a sample, not one Warn per file. On a recovery from a large leak this is the difference between five thousand log lines and one.
+
+Subdirectories are deliberately ignored — DuckDB 1.5.1 uses a flat layout. If a future DuckDB version nests per-query subdirs, the regression will surface as orphans reappearing, and the sweep will need to switch to `filepath.WalkDir`. A test in `internal/database/spill_cleanup_test.go` pins this expectation.
+
+The previous draft also added a post-`db.Close()` sweep; review caught that it was effectively dead code (DuckDB had already unlinked, and the 60 s mtime guard would skip anything still in flight) and risked stalling shutdown past `systemd`'s `TimeoutStopSec`. It was dropped before merge.
+
 ## Hardening
 
 ### Hard Query Gating During Replication Catch-Up (Enterprise, opt-in) — closes #392
