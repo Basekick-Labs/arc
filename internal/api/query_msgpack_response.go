@@ -172,6 +172,13 @@ func writeMsgPackRowsColumnar(c *fiber.Ctx, columns []string, types []string, da
 				_ = enc.EncodeNil()
 				continue
 			}
+			// int64 / uint64 columns use EncodeInt64 / EncodeUint64 (always
+			// 9 bytes on the wire) for consistency with the streaming hot
+			// path in query_msgpack.go. The narrower int/int32/uint/uint32
+			// types keep EncodeInt / EncodeUint so small values benefit
+			// from fixint compaction (1 byte for 0-127) — they're outside
+			// the "predictable 9-byte int64" guarantee clients rely on for
+			// the typed-by-column wire shape.
 			switch x := v.(type) {
 			case bool:
 				_ = enc.EncodeBool(x)
@@ -180,13 +187,13 @@ func writeMsgPackRowsColumnar(c *fiber.Ctx, columns []string, types []string, da
 			case int32:
 				_ = enc.EncodeInt(int64(x))
 			case int64:
-				_ = enc.EncodeInt(x)
+				_ = enc.EncodeInt64(x)
 			case uint:
 				_ = enc.EncodeUint(uint64(x))
 			case uint32:
 				_ = enc.EncodeUint(uint64(x))
 			case uint64:
-				_ = enc.EncodeUint(x)
+				_ = enc.EncodeUint64(x)
 			case float32:
 				_ = enc.EncodeFloat32(x)
 			case float64:
