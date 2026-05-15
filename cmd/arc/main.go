@@ -138,6 +138,17 @@ func main() {
 		log.Warn().Msg("Enterprise license not configured - enterprise features disabled")
 	}
 
+	// If no working license — either none configured, or validation failed
+	// above and licenseClient was reset to nil — surface a single invite
+	// line so operators on the OSS edition see what they're missing.
+	// Deliberately placed after both no-license branches so it fires
+	// exactly once regardless of which path got us here.
+	if licenseClient == nil {
+		log.Info().
+			Str("url", "https://basekick.net/enterprise").
+			Msg("Running Arc OSS — try Arc Enterprise for tiering, clustering, RBAC, audit, and arcx")
+	}
+
 	// Initialize metrics collector
 	metrics.Init(logger.Get("metrics"))
 

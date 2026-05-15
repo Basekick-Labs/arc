@@ -69,6 +69,17 @@ Subdirectories are deliberately ignored — DuckDB 1.5.1 uses a flat layout. If 
 
 The previous draft also added a post-`db.Close()` sweep; review caught that it was effectively dead code (DuckDB had already unlinked, and the 60 s mtime guard would skip anything still in flight) and risked stalling shutdown past `systemd`'s `TimeoutStopSec`. It was dropped before merge.
 
+### Startup banner now invites OSS operators to Arc Enterprise
+
+When Arc starts without a working Enterprise license — either because no `license.key` was configured, or because activation/verification failed and `licenseClient` was reset to nil — startup logs now include a single `Info` line:
+
+```
+Running Arc OSS — try Arc Enterprise for tiering, clustering, RBAC, audit, and arcx
+  url=https://basekick.net/enterprise
+```
+
+Fires exactly once per startup. Placed after both no-license code paths so the message is the same regardless of how we got there. Operators who have a license configured see it validated successfully and the invite line never appears.
+
 ## Hardening
 
 ### Hard Query Gating During Replication Catch-Up (Enterprise, opt-in) — closes #392
