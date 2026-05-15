@@ -8,6 +8,7 @@
 // Examples:
 //   go run benchmarks/query_suite/main.go --database production --measurement cpu
 //   go run benchmarks/query_suite/main.go --target arc-arrow --database production --measurement cpu
+//   go run benchmarks/query_suite/main.go --target arc-msgpack --database production --measurement cpu
 //   go run benchmarks/query_suite/main.go --preset logs --database logs --measurement logs
 //   go run benchmarks/query_suite/main.go --target cratedb --measurement cpu
 
@@ -15,6 +16,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -25,11 +27,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 )
 
 type Config struct {
-	Target      string // "arc", "arc-arrow", or "cratedb"
+	Target      string // "arc", "arc-arrow", "arc-msgpack", or "cratedb"
 	Preset      string // "generic" or "logs"
 	Measurement string
 	Database    string
@@ -206,6 +209,101 @@ func runArcArrowQuery(cfg *Config, sql string, client *http.Client) (latencyMs f
 	return latencyMs, rows, nil
 }
 
+// runArcMsgPackQuery executes a query via the experimental MessagePack
+// endpoint and decodes the body to count rows. The endpoint is gated by
+// the duckdb_arrow build tag; if Arc was built without it, the request
+// returns 501 and we surface that to the caller.
+func runArcMsgPackQuery(cfg *Config, sql string, client *http.Client) (latencyMs float64, rows int64, err error) {
+	url := fmt.Sprintf("http://%s:%d/api/v1/query/msgpack", cfg.Host, cfg.Port)
+
+	body, _ := json.Marshal(map[string]string{"sql": sql})
+	start := time.Now()
+
+	// NewRequestWithContext lets a parent ctx cancel an in-flight
+	// request — useful during long bench runs with interactive cancel
+	// (Ctrl-C). Sibling runArcArrowQuery uses NewRequest with no
+	// context; not propagated here.
+	req, err := http.NewRequestWithContext(context.Background(), "POST", url, bytes.NewReader(body))
+	if err != nil {
+		return 0, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-arc-database", cfg.Database)
+	if cfg.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.Token)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	latencyMs = float64(time.Since(start).Microseconds()) / 1000.0
+
+	if resp.StatusCode != 200 {
+		return latencyMs, 0, fmt.Errorf("status %d: %s", resp.StatusCode, string(respBody[:min(200, len(respBody))]))
+	}
+
+	// Decode the msgpack envelope to count rows. The columnar wire
+	// format puts numCols arrays in `data`, each of length numRows —
+	// row count is the inner length (column 0), not the outer. For
+	// COUNT(*) queries the result is one column × one row containing
+	// the unwrapped count value.
+	var result map[string]interface{}
+	if err := msgpack.Unmarshal(respBody, &result); err == nil {
+		if data, ok := result["data"].([]interface{}); ok && len(data) > 0 {
+			if col0, ok := data[0].([]interface{}); ok {
+				rows = int64(len(col0))
+				// For single-column, single-row results (COUNT(*) etc),
+				// return the unwrapped value as the row count to match
+				// the JSON path's behavior.
+				if len(data) == 1 && len(col0) == 1 {
+					rows = toInt64(col0[0])
+				}
+			}
+		}
+	}
+
+	return latencyMs, rows, nil
+}
+
+// toInt64 normalises the various integer types a msgpack decoder may
+// surface (the Basekick-Labs library picks the smallest fitting integer)
+// into a single int64 the bench can use for row counts.
+func toInt64(v interface{}) int64 {
+	switch x := v.(type) {
+	case int:
+		return int64(x)
+	case int64:
+		return x
+	case int32:
+		return int64(x)
+	case int16:
+		return int64(x)
+	case int8:
+		return int64(x)
+	case uint:
+		return int64(x)
+	case uint64:
+		return int64(x)
+	case uint32:
+		return int64(x)
+	case uint16:
+		return int64(x)
+	case uint8:
+		return int64(x)
+	case float64:
+		return int64(x)
+	}
+	return 0
+}
+
 // runCrateDBQuery executes a query via CrateDB's /_sql HTTP endpoint.
 func runCrateDBQuery(cfg *Config, sql string, client *http.Client) (latencyMs float64, rows int64, err error) {
 	url := fmt.Sprintf("http://%s:%d/_sql", cfg.Host, cfg.CrateDBPort)
@@ -258,6 +356,8 @@ func runQuery(cfg *Config, q BenchmarkQuery, client *http.Client) (float64, int6
 	switch cfg.Target {
 	case "arc-arrow":
 		return runArcArrowQuery(cfg, q.SQL, client)
+	case "arc-msgpack":
+		return runArcMsgPackQuery(cfg, q.SQL, client)
 	case "cratedb":
 		return runCrateDBQuery(cfg, q.SQL, client)
 	default:
@@ -341,7 +441,7 @@ func cratedbGenericQueries(m string) []BenchmarkQuery {
 func main() {
 	cfg := Config{}
 
-	flag.StringVar(&cfg.Target, "target", "arc", "Target: arc (JSON), arc-arrow (Arrow IPC), or cratedb")
+	flag.StringVar(&cfg.Target, "target", "arc", "Target: arc (JSON), arc-arrow (Arrow IPC), arc-msgpack (MessagePack, experimental), or cratedb")
 	flag.StringVar(&cfg.Preset, "preset", "generic", "Query preset: generic or logs")
 	flag.StringVar(&cfg.Measurement, "measurement", "cpu", "Measurement/table name")
 	flag.StringVar(&cfg.Database, "database", "default", "Database name (Arc only)")
@@ -355,10 +455,10 @@ func main() {
 	cfg.Token = os.Getenv("ARC_TOKEN")
 
 	switch cfg.Target {
-	case "arc", "arc-arrow", "cratedb":
+	case "arc", "arc-arrow", "arc-msgpack", "cratedb":
 		// valid
 	default:
-		fmt.Printf("Unknown target: %s (use arc, arc-arrow, or cratedb)\n", cfg.Target)
+		fmt.Printf("Unknown target: %s (use arc, arc-arrow, arc-msgpack, or cratedb)\n", cfg.Target)
 		os.Exit(1)
 	}
 
@@ -382,6 +482,8 @@ func main() {
 	switch cfg.Target {
 	case "arc-arrow":
 		targetLabel = "ARC (Arrow IPC)"
+	case "arc-msgpack":
+		targetLabel = "ARC (MessagePack, experimental)"
 	case "cratedb":
 		targetLabel = "CRATEDB"
 	}

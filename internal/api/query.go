@@ -107,6 +107,13 @@ var (
 // Returns (rowCount, handled). If handled is false, the caller falls back to database/sql.
 var arrowJSONQueryFunc func(h *QueryHandler, c *fiber.Ctx, ctx context.Context, cancel context.CancelFunc, convertedSQL string, profileMode bool, governanceMaxRows int, start time.Time, timestamp string, onComplete func(int), onFail func(string), onTimeout func()) (int, bool)
 
+// arrowMsgPackQueryFunc is set by query_msgpack.go init() when compiled with duckdb_arrow tag.
+// It executes a query via DuckDB's native Arrow API and streams a MessagePack response.
+// Returns (rowCount, handled). If handled is false, the caller MUST treat the request as
+// unsupported and return 501 — the msgpack endpoint has no database/sql fallback because
+// the Arrow path is the entire reason for its existence.
+var arrowMsgPackQueryFunc func(h *QueryHandler, c *fiber.Ctx, ctx context.Context, cancel context.CancelFunc, convertedSQL string, profileMode bool, governanceMaxRows int, start time.Time, timestamp string, onComplete func(int), onFail func(string), onTimeout func()) (int, bool)
+
 // errClientDisconnected is wrapped into streamErr by the streaming query
 // handlers when bufio.Writer.Write or Flush fails mid-stream — the canonical
 // signal in fasthttp's streaming model that the underlying TCP connection
@@ -1150,6 +1157,11 @@ func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 	// middleware. The middleware is a no-op unless cluster.query_gate_on_catchup
 	// is true AND the coordinator reports peer file replication is still draining.
 	app.Post("/api/v1/query", h.checkReplicationReady, h.executeQuery)
+	// Experimental: same execution pipeline as /api/v1/query, but the
+	// response is streamed as MessagePack instead of JSON. Gated by the
+	// duckdb_arrow build tag (no database/sql fallback — see the
+	// wire-format dispatch in executeQuery).
+	app.Post("/api/v1/query/msgpack", h.checkReplicationReady, h.executeQueryMsgPack)
 	app.Post("/api/v1/query/estimate", h.checkReplicationReady, h.estimateQuery)
 	app.Get("/api/v1/measurements", h.checkReplicationReady, h.listMeasurements)
 	app.Get("/api/v1/query/:measurement", h.checkReplicationReady, h.queryMeasurement)
@@ -1175,6 +1187,22 @@ func (h *QueryHandler) handleCacheInvalidate(c *fiber.Ctx) error {
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
+// executeQueryMsgPack handles POST /api/v1/query/msgpack. It is a thin
+// wrapper that sets the "wire_format" request-local to "msgpack" and
+// delegates to executeQuery — every step (auth, RBAC, governance,
+// forwarding, transform, timeout, registry, slow-query logging) is
+// identical to the JSON path. The wire-format selector is consumed at
+// the Arrow dispatch site to route the response stream through the
+// msgpack encoder instead of JSON.
+//
+// Experimental. The endpoint may move or be removed based on benchmark
+// results; clients should not hard-code against it for production
+// traffic yet.
+func (h *QueryHandler) executeQueryMsgPack(c *fiber.Ctx) error {
+	c.Locals(wireFormatLocalsKey, wireFormatMsgPack)
+	return h.executeQuery(c)
+}
+
 // executeQuery handles POST /api/v1/query - returns JSON response
 func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 	start := time.Now()
@@ -1192,11 +1220,7 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 		if err != nil {
 			h.logger.Error().Err(err).Msg("Failed to build HTTP request for forwarding")
 			m.IncQueryErrors()
-			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
-				Success:   false,
-				Error:     "Failed to prepare request for forwarding",
-				Timestamp: timestamp,
-			})
+			return respondError(c, fiber.StatusInternalServerError, "Failed to prepare request for forwarding", timestamp, start)
 		}
 
 		resp, err := h.router.RouteQuery(c.Context(), httpReq)
@@ -1230,11 +1254,7 @@ localProcessing:
 					Str("reason", result.Reason).
 					Int("retry_after_sec", result.RetryAfterSec).
 					Msg("Query rejected: rate limit exceeded")
-				return c.Status(fiber.StatusTooManyRequests).JSON(QueryResponse{
-					Success:   false,
-					Error:     result.Reason,
-					Timestamp: timestamp,
-				})
+				return respondError(c, fiber.StatusTooManyRequests, result.Reason, timestamp, start)
 			}
 			if result := h.governanceManager.CheckQuota(tokenInfo.ID); !result.Allowed {
 				m.IncQueryErrors()
@@ -1244,11 +1264,7 @@ localProcessing:
 					Str("token_name", tokenInfo.Name).
 					Str("reason", result.Reason).
 					Msg("Query rejected: quota exhausted")
-				return c.Status(fiber.StatusTooManyRequests).JSON(QueryResponse{
-					Success:   false,
-					Error:     result.Reason,
-					Timestamp: timestamp,
-				})
+				return respondError(c, fiber.StatusTooManyRequests, result.Reason, timestamp, start)
 			} else {
 				governanceMaxRows = result.MaxRows
 				governanceTimeout = result.MaxDuration
@@ -1260,42 +1276,26 @@ localProcessing:
 	var req QueryRequest
 	if err := c.BodyParser(&req); err != nil {
 		m.IncQueryErrors()
-		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
-			Success:   false,
-			Error:     "Invalid request body: " + err.Error(),
-			Timestamp: timestamp,
-		})
+		return respondError(c, fiber.StatusBadRequest, "Invalid request body: "+err.Error(), timestamp, start)
 	}
 
 	// Validate SQL (empty, max length, dangerous patterns)
 	if err := ValidateSQLRequest(req.SQL); err != nil {
 		m.IncQueryErrors()
-		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
-			Success:   false,
-			Error:     err.Error(),
-			Timestamp: timestamp,
-		})
+		return respondError(c, fiber.StatusBadRequest, err.Error(), timestamp, start)
 	}
 
 	// Extract x-arc-database header for optimized query path
 	headerDB := c.Get("x-arc-database")
 	if err := validateHeaderDatabase(headerDB); err != nil {
 		m.IncQueryErrors()
-		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
-			Success:   false,
-			Error:     "invalid x-arc-database header: " + err.Error(),
-			Timestamp: timestamp,
-		})
+		return respondError(c, fiber.StatusBadRequest, "invalid x-arc-database header: "+err.Error(), timestamp, start)
 	}
 
 	// If header is set, reject cross-database syntax (db.table not allowed)
 	if headerDB != "" && hasCrossDatabaseSyntax(req.SQL) {
 		m.IncQueryErrors()
-		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
-			Success:   false,
-			Error:     "Cross-database queries (db.table syntax) not allowed when x-arc-database header is set",
-			Timestamp: timestamp,
-		})
+		return respondError(c, fiber.StatusBadRequest, "Cross-database queries (db.table syntax) not allowed when x-arc-database header is set", timestamp, start)
 	}
 
 	// Handle SHOW DATABASES command
@@ -1303,11 +1303,7 @@ localProcessing:
 		// Check RBAC - user needs at least some read permission to see databases
 		if err := h.checkMeasurementPermission(c, "*", "*", "read"); err != nil {
 			m.IncQueryErrors()
-			return c.Status(fiber.StatusForbidden).JSON(QueryResponse{
-				Success:   false,
-				Error:     "access denied: no read permission to list databases",
-				Timestamp: timestamp,
-			})
+			return respondError(c, fiber.StatusForbidden, "access denied: no read permission to list databases", timestamp, start)
 		}
 		return h.handleShowDatabases(c, start)
 	}
@@ -1321,11 +1317,7 @@ localProcessing:
 		// Check RBAC - user needs read permission on the specific database
 		if err := h.checkMeasurementPermission(c, database, "*", "read"); err != nil {
 			m.IncQueryErrors()
-			return c.Status(fiber.StatusForbidden).JSON(QueryResponse{
-				Success:   false,
-				Error:     fmt.Sprintf("access denied: no read permission for database '%s'", database),
-				Timestamp: timestamp,
-			})
+			return respondError(c, fiber.StatusForbidden, fmt.Sprintf("access denied: no read permission for database '%s'", database), timestamp, start)
 		}
 		return h.handleShowTables(c, start, database)
 	}
@@ -1333,11 +1325,7 @@ localProcessing:
 	// Check RBAC permissions for all tables referenced in the query
 	if err := h.checkQueryPermissions(c, req.SQL, "read"); err != nil {
 		m.IncQueryErrors()
-		return c.Status(fiber.StatusForbidden).JSON(QueryResponse{
-			Success:   false,
-			Error:     err.Error(),
-			Timestamp: timestamp,
-		})
+		return respondError(c, fiber.StatusForbidden, err.Error(), timestamp, start)
 	}
 
 	// Convert SQL to storage paths and check for parallel execution opportunity
@@ -1387,7 +1375,11 @@ localProcessing:
 	profileMode := c.Get("x-arc-profile") == "true"
 
 	// Execute query - use parallel path if available
-	if parallelInfo != nil && h.parallelExecutor != nil {
+	// (msgpack endpoint deliberately bypasses the parallel-partition
+	// executor: its response shape and per-partition merging is wired
+	// for JSON streaming. The msgpack experiment routes only through
+	// the standard Arrow dispatch below.)
+	if parallelInfo != nil && h.parallelExecutor != nil && !isMsgPackWire(c) {
 		// Parallel partition execution — use registry context if available
 		execCtx := c.UserContext()
 		if queryCtx != nil {
@@ -1600,7 +1592,33 @@ localProcessing:
 
 		// Arrow-native path: bypasses database/sql row scanning entirely — reads typed
 		// values directly from DuckDB's internal Arrow columnar chunks.
-		if arrowJSONQueryFunc != nil {
+		//
+		// Wire-format selector: the experimental msgpack endpoint
+		// (POST /api/v1/query/msgpack) sets c.Locals("wire_format", "msgpack")
+		// in its wrapper handler so this dispatch can route to the msgpack
+		// streamer instead of JSON. Unknown / missing values default to JSON.
+		// When the msgpack dispatch fails ("handled=false", e.g. driver
+		// doesn't implement Arrow), we return 501 instead of falling back
+		// to database/sql — the entire reason for the msgpack endpoint is
+		// the typed Arrow encode, and a Scan-based fallback would silently
+		// defeat that contract.
+		arrowDispatch := arrowJSONQueryFunc
+		isMsgPack := isMsgPackWire(c)
+		if isMsgPack {
+			arrowDispatch = arrowMsgPackQueryFunc
+		}
+		// When built without -tags=duckdb_arrow, arrowMsgPackQueryFunc
+		// is nil; the JSON path would silently fall through to the
+		// database/sql route, but a msgpack client must NOT receive
+		// JSON. Short-circuit to 501 here so the wire-format contract
+		// is preserved end-to-end.
+		if isMsgPack && arrowDispatch == nil {
+			if cancel != nil {
+				cancel()
+			}
+			return respondError(c, fiber.StatusNotImplemented, "msgpack query path requires the duckdb_arrow build tag", timestamp, start)
+		}
+		if arrowDispatch != nil {
 			var onComplete func(int)
 			var onFail func(string)
 			var onTimeout func()
@@ -1609,12 +1627,20 @@ localProcessing:
 				onFail = func(msg string) { h.queryRegistry.Fail(queryID, msg) }
 				onTimeout = func() { h.queryRegistry.TimedOut(queryID) }
 			}
-			_, handled := arrowJSONQueryFunc(h, c, ctx, cancel, convertedSQL, profileMode, governanceMaxRows, start, timestamp, onComplete, onFail, onTimeout)
+			_, handled := arrowDispatch(h, c, ctx, cancel, convertedSQL, profileMode, governanceMaxRows, start, timestamp, onComplete, onFail, onTimeout)
 			if handled {
 				// Arrow path handled the response — registry callbacks are invoked
-				// inside executeArrowJSONQuery (either directly for errors, or via
-				// the async stream writer callback for success).
+				// inside executeArrowJSONQuery / executeArrowMsgPackQuery (either
+				// directly for errors, or via the async stream writer callback
+				// for success).
 				return nil
+			}
+			if isMsgPack {
+				// No database/sql fallback for the msgpack endpoint — return 501.
+				if cancel != nil {
+					cancel()
+				}
+				return respondError(c, fiber.StatusNotImplemented, "msgpack query path requires the duckdb_arrow build tag", timestamp, start)
 			}
 			// handled=false means Arrow path declined (e.g., driver issue).
 			// Fall through to database/sql path.
@@ -2746,12 +2772,7 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to list databases")
-		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
-			Success:         false,
-			Error:           "Failed to read storage: " + err.Error(),
-			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
-			Timestamp:       time.Now().UTC().Format(time.RFC3339),
-		})
+		return respondError(c, fiber.StatusInternalServerError, "Failed to read storage: "+err.Error(), time.Now().UTC().Format(time.RFC3339), start)
 	}
 
 	// Also get databases from tiering metadata (for cold-only databases)
@@ -2816,14 +2837,7 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 		Float64("execution_time_ms", executionTime).
 		Msg("SHOW DATABASES completed")
 
-	return c.JSON(QueryResponse{
-		Success:         true,
-		Columns:         columns,
-		Data:            data,
-		RowCount:        len(data),
-		ExecutionTimeMs: executionTime,
-		Timestamp:       time.Now().UTC().Format(time.RFC3339),
-	})
+	return respondSuccessRows(c, columns, data, time.Now().UTC().Format(time.RFC3339), start)
 }
 
 // handleShowTables handles SHOW TABLES/MEASUREMENTS command by scanning storage
@@ -2854,12 +2868,7 @@ func (h *QueryHandler) handleShowTables(c *fiber.Ctx, start time.Time, database 
 
 	if err != nil {
 		h.logger.Error().Err(err).Str("database", database).Msg("Failed to list tables")
-		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
-			Success:         false,
-			Error:           "Failed to read database: " + err.Error(),
-			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
-			Timestamp:       time.Now().UTC().Format(time.RFC3339),
-		})
+		return respondError(c, fiber.StatusInternalServerError, "Failed to read database: "+err.Error(), time.Now().UTC().Format(time.RFC3339), start)
 	}
 
 	// Also get tables from tiering metadata (for cold-only tables)
@@ -2928,14 +2937,7 @@ func (h *QueryHandler) handleShowTables(c *fiber.Ctx, start time.Time, database 
 		Float64("execution_time_ms", executionTime).
 		Msg("SHOW TABLES completed")
 
-	return c.JSON(QueryResponse{
-		Success:         true,
-		Columns:         columns,
-		Data:            data,
-		RowCount:        len(data),
-		ExecutionTimeMs: executionTime,
-		Timestamp:       time.Now().UTC().Format(time.RFC3339),
-	})
+	return respondSuccessRows(c, columns, data, time.Now().UTC().Format(time.RFC3339), start)
 }
 
 // extractTableNames extracts unique table names from file paths within a database
