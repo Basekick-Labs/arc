@@ -126,6 +126,9 @@ func writeMsgPackRowsColumnar(c *fiber.Ctx, columns []string, types []string, da
 	enc.Reset(c.Response().BodyWriter())
 	enc.SetCustomStructTag("json")
 	defer func() {
+		// Reset to the library default before returning to the pool
+		// so the next consumer doesn't inherit our `json` tag mapping.
+		enc.SetCustomStructTag("msgpack")
 		enc.Reset(nil)
 		msgpack.PutEncoder(enc)
 	}()

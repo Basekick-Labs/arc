@@ -25,9 +25,12 @@ func TestArrowMsgPackQueryFunc_RegisteredWithTag(t *testing.T) {
 	}
 }
 
-// msgpackStreamToBytes runs the columnar streamer against the provided
-// reader and returns the encoded msgpack bytes plus the rowCount the
-// streamer reported.
+// msgpackStreamToBytes runs the columnar streamer end-to-end (drain +
+// encode) against the provided reader and returns the encoded msgpack
+// bytes plus the rowCount the streamer reported. Mirrors the production
+// pipeline: drainArrowBatches first (sync, can fail), then
+// streamMsgPackFromBatches (encode-only). Tests that exercise drain
+// errors should call drainArrowBatches directly.
 func msgpackStreamToBytes(
 	reader array.RecordReader,
 	governanceMaxRows int,
@@ -35,9 +38,21 @@ func msgpackStreamToBytes(
 	var buf bytes.Buffer
 	w := bufio.NewWriter(&buf)
 	start := time.Now()
-	rowCount, _ := streamArrowMsgPackColumnar(context.Background(), w, reader, governanceMaxRows, nil, start, "2024-01-15T12:00:00Z")
+	ctx := context.Background()
+	schema := reader.Schema()
+	batches, rowCount, drainErr := drainArrowBatches(ctx, reader, governanceMaxRows)
+	defer func() {
+		for _, b := range batches {
+			b.Release()
+		}
+	}()
+	if drainErr != nil {
+		w.Flush()
+		return buf.Bytes(), rowCount
+	}
+	rc, _ := streamMsgPackFromBatches(ctx, w, schema, batches, rowCount, nil, start, "2024-01-15T12:00:00Z")
 	w.Flush()
-	return buf.Bytes(), rowCount
+	return buf.Bytes(), rc
 }
 
 func decodeMsgpack(t *testing.T, data []byte) map[string]interface{} {

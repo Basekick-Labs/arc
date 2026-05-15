@@ -137,28 +137,77 @@ func executeArrowMsgPackQuery(
 
 	tokenName := getTokenName(c)
 
+	// Materialize all Arrow batches synchronously BEFORE committing
+	// HTTP headers. The columnar msgpack wire format buffers every
+	// batch in memory anyway (array length prefix); doing the drain
+	// here lets us return a proper 5xx via respondError when DuckDB
+	// errors mid-materialization, instead of streaming a truncated
+	// body under a 200 status that's already been sent. Gemini r3
+	// flagged this; the JSON path has the same shape but its row-by-
+	// row stream can produce partial JSON-valid output, so the
+	// failure mode is less harmful there.
+	schema := reader.Schema()
+	batches, rowCount, drainErr := drainArrowBatches(ctx, reader, governanceMaxRows)
+	// reader and conn are no longer needed after the drain — release
+	// them before either the error or the streaming branch.
+	reader.Release()
+	if conn != nil {
+		conn.Close()
+	}
+
+	if drainErr != nil {
+		// Release any batches we did retain before bailing.
+		for _, b := range batches {
+			b.Release()
+		}
+		if cancel != nil {
+			cancel()
+		}
+		// Timeout vs generic error: same shape as the up-front error
+		// branch above, just driven by ctx state after the drain
+		// attempt.
+		if errors.Is(drainErr, context.DeadlineExceeded) {
+			m.IncQueryErrors()
+			m.IncQueryTimeouts()
+			if onTimeout != nil {
+				onTimeout()
+			}
+			_ = respondError(c, fiber.StatusGatewayTimeout, "Query timed out", timestamp, start)
+			return -1, true
+		}
+		m.IncQueryErrors()
+		if onFail != nil {
+			onFail(drainErr.Error())
+		}
+		h.logger.Error().Err(drainErr).Str("format", "msgpack").
+			Str("sql", convertedSQL).Msg("Arrow MsgPack drain failed")
+		_ = respondError(c, fiber.StatusInternalServerError, drainErr.Error(), timestamp, start)
+		return -1, true
+	}
+
+	// From here the response WILL be 200 — all batches are materialized
+	// in memory, encode is the only remaining work and can only fail
+	// via client disconnect (no DuckDB or context-deadline path).
 	c.Set(fiber.HeaderContentType, msgpackContentType)
 	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+		// Release retained batches when the stream finishes (or fails).
+		defer func() {
+			for _, b := range batches {
+				b.Release()
+			}
+		}()
+
 		// Wrap the 4KiB-default bufio.Writer Fiber hands us with a
 		// 256 KiB layer. The msgpack encoder writes one primitive at a
 		// time (~9 bytes per int64), so on a 1M-row response the
 		// default bufio fills and flushes ~15k times — each flush is a
 		// channel-send to fasthttp's chunked-transfer goroutine. The
-		// larger buffer cuts that to ~250 sends. This is the single
-		// structural cost where columnar msgpack lagged Arrow IPC: not
-		// the encode loop, but the per-flush HTTP transport overhead.
+		// larger buffer cuts that to ~250 sends.
 		bw := bufio.NewWriterSize(w, 256*1024)
-		rc, streamErr := streamArrowMsgPackColumnar(ctx, bw, reader, governanceMaxRows, profile, start, timestamp)
+		rc, streamErr := streamMsgPackFromBatches(ctx, bw, schema, batches, rowCount, profile, start, timestamp)
 		bw.Flush()
 		w.Flush()
 
-		reader.Release()
-		// Defensive nil-check: the driver contract returns a non-nil
-		// conn when err == nil, but a driver bug shouldn't crash a
-		// streaming response that has already committed headers.
-		if conn != nil {
-			conn.Close()
-		}
 		if cancel != nil {
 			cancel()
 		}
@@ -200,8 +249,55 @@ func executeArrowMsgPackQuery(
 	return 0, true
 }
 
-// streamArrowMsgPackColumnar writes the query response as a single
-// msgpack map with a **columnar** data array. Shape:
+// drainArrowBatches reads all batches from the Arrow reader into a
+// retained slice. governanceMaxRows (when > 0) trims the trailing batch
+// to fit. Returns the batches, total row count, and an error if ctx
+// fires or the reader surfaces a deferred error. Callers MUST Release()
+// the returned batches when done.
+func drainArrowBatches(ctx context.Context, reader array.RecordReader, governanceMaxRows int) ([]arrow.Record, int, error) {
+	rowCap := 0
+	if governanceMaxRows > 0 {
+		rowCap = governanceMaxRows
+	}
+
+	var batches []arrow.Record
+	rowCount := 0
+
+	for reader.Next() {
+		select {
+		case <-ctx.Done():
+			return batches, rowCount, fmt.Errorf("drain cancelled at row %d: %w", rowCount, ctx.Err())
+		default:
+		}
+		batch := reader.Record()
+		if batch == nil {
+			break
+		}
+		n := int(batch.NumRows())
+		if rowCap > 0 {
+			if rowCount >= rowCap {
+				break
+			}
+			if rowCount+n > rowCap {
+				keep := rowCap - rowCount
+				trimmed := batch.NewSlice(0, int64(keep))
+				batches = append(batches, trimmed)
+				rowCount = rowCap
+				break
+			}
+		}
+		batch.Retain()
+		batches = append(batches, batch)
+		rowCount += n
+	}
+	if err := reader.Err(); err != nil {
+		return batches, rowCount, fmt.Errorf("arrow reader error after %d rows: %w", rowCount, err)
+	}
+	return batches, rowCount, nil
+}
+
+// streamMsgPackFromBatches writes the query response as a single
+// msgpack map over a pre-drained slice of Arrow record batches. Shape:
 //
 //	map(7 or 8) {
 //	  "success":           bool
@@ -218,19 +314,22 @@ func executeArrowMsgPackQuery(
 // runs a tight typed loop over the column buffer. This eliminates the
 // per-cell type-switch that dominates row-oriented encode cost.
 //
-// Buffering: msgpack array lengths must precede entries, so we drain
-// all Arrow batches into memory before emitting any column. governance
-// MaxRows (when set) trims the last batch; no other cap is enforced —
-// the experiment is honest about the cost of the wire format.
+// The drain phase (reading batches from the Arrow reader, governanceMaxRows
+// trimming) is the caller's responsibility via drainArrowBatches — done
+// BEFORE the HTTP body stream opens, so DuckDB errors produce clean 5xx
+// responses instead of truncated 200s. This function only encodes; the
+// errors it returns are wire-write failures (client disconnect during
+// encode) or ctx cancellation observed mid-column.
 //
 // Returns (rowsWritten, err). An error after the envelope has opened
 // cannot change HTTP status, but the caller records it so operators
 // see the partial-result signal.
-func streamArrowMsgPackColumnar(
+func streamMsgPackFromBatches(
 	ctx context.Context,
 	w *bufio.Writer,
-	reader array.RecordReader,
-	governanceMaxRows int,
+	schema *arrow.Schema,
+	batches []arrow.Record,
+	rowCount int,
 	profile *database.QueryProfile,
 	start time.Time,
 	timestamp string,
@@ -245,26 +344,19 @@ func streamArrowMsgPackColumnar(
 	// before any Encode call.
 	enc.SetCustomStructTag("json")
 	defer func() {
+		// Reset the struct tag back to the library default before
+		// returning the encoder to the shared pool — otherwise the
+		// next consumer (potentially the ingest path or cluster
+		// replication, which expect `msgpack:` tags) silently
+		// inherits our `json` setting. Gemini r3 flagged this as
+		// pool poisoning.
+		enc.SetCustomStructTag("msgpack")
 		enc.Reset(nil)
 		msgpack.PutEncoder(enc)
 	}()
 
-	schema := reader.Schema()
 	fields := schema.Fields()
 	numCols := len(fields)
-
-	// Effective row cap. governanceMaxRows is the only ceiling — when
-	// the operator sets a token-level policy we honor it; otherwise we
-	// stream whatever the query returns. The columnar shape inherently
-	// buffers every Arrow batch in memory before emitting any column
-	// (msgpack array length must precede entries), so an unbounded
-	// SELECT * materializes the full result set. This is the honest
-	// cost of the wire format; the experiment exposes it rather than
-	// hiding it behind a fixed cap.
-	rowCap := 0
-	if governanceMaxRows > 0 {
-		rowCap = governanceMaxRows
-	}
 
 	// Decide map size up front: 7 base keys + 1 if profile attached.
 	mapLen := 7
@@ -315,56 +407,6 @@ func streamArrowMsgPackColumnar(
 	// "data": [[col0_values...], [col1_values...], ...]
 	if err := enc.EncodeString("data"); err != nil {
 		return 0, err
-	}
-
-	// Drain all batches before emitting any column. We need the total
-	// row count for the per-column array length prefix, and we need
-	// every batch's slice of each column to encode the column end-to-
-	// end. Trimming the trailing batch to fit rowCap preserves the
-	// invariant "buffered rows == rowCount".
-	var batches []arrow.Record
-	defer func() {
-		for _, b := range batches {
-			b.Release()
-		}
-	}()
-
-	rowCount := 0
-	var streamErr error
-
-batchLoop:
-	for reader.Next() {
-		select {
-		case <-ctx.Done():
-			streamErr = fmt.Errorf("stream cancelled at row %d: %w", rowCount, ctx.Err())
-			break batchLoop
-		default:
-		}
-		batch := reader.Record()
-		if batch == nil {
-			break
-		}
-		n := int(batch.NumRows())
-		if rowCap > 0 {
-			if rowCount >= rowCap {
-				break
-			}
-			if rowCount+n > rowCap {
-				keep := rowCap - rowCount
-				trimmed := batch.NewSlice(0, int64(keep))
-				batches = append(batches, trimmed)
-				rowCount = rowCap
-				break
-			}
-		}
-		batch.Retain()
-		batches = append(batches, batch)
-		rowCount += n
-	}
-	if streamErr == nil {
-		if err := reader.Err(); err != nil {
-			streamErr = fmt.Errorf("arrow reader error after %d rows: %w", rowCount, err)
-		}
 	}
 
 	// Outer data array: one entry per column.
@@ -443,7 +485,7 @@ batchLoop:
 		}
 	}
 
-	return rowCount, streamErr
+	return rowCount, nil
 }
 
 // encodeColumn dispatches once on the Arrow concrete type and runs a
