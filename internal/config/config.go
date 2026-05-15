@@ -60,6 +60,11 @@ type DatabaseConfig struct {
 	MemoryLimit    string
 	ThreadCount    int
 	EnableWAL      bool
+	// TempDirectory is where DuckDB writes query spill files (HASH_GROUP_BY
+	// overflow, large sorts, joins). Should be on local fast storage. Files
+	// here are NOT durable state; orphans from a crashed previous run are
+	// swept at startup. Empty leaves DuckDB's default behavior (CWD-relative).
+	TempDirectory string
 	// ArcxExtensionPath is the absolute path to the arcx.duckdb_extension
 	// binary. Empty disables the loader. Arc Enterprise only — gated by
 	// licenseClient.CanUseArcx() before this value reaches the DB layer.
@@ -471,6 +476,7 @@ func Load() (*Config, error) {
 			MemoryLimit:       v.GetString("database.memory_limit"),
 			ThreadCount:       v.GetInt("database.thread_count"),
 			EnableWAL:         v.GetBool("database.enable_wal"),
+			TempDirectory:     v.GetString("database.temp_directory"),
 			ArcxExtensionPath: v.GetString("database.arcx_extension_path"),
 		},
 		Storage: StorageConfig{
@@ -741,7 +747,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("database.memory_limit", getDefaultMemoryLimit())
 	v.SetDefault("database.thread_count", getDefaultThreadCount())
 	v.SetDefault("database.enable_wal", true)
-	v.SetDefault("database.arcx_extension_path", "") // Enterprise-only; gated by licenseClient.CanUseArcx()
+	v.SetDefault("database.temp_directory", "./.tmp") // DuckDB query spill files (overflow, sort, join). Orphans swept at startup.
+	v.SetDefault("database.arcx_extension_path", "")  // Enterprise-only; gated by licenseClient.CanUseArcx()
 
 	// Storage defaults
 	v.SetDefault("storage.backend", "local")
