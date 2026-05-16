@@ -80,6 +80,127 @@ Running Arc OSS — try Arc Enterprise for tiering, clustering, RBAC, audit, and
 
 Fires exactly once per startup. Placed after both no-license code paths so the message is the same regardless of how we got there. Operators who have a license configured see it validated successfully and the invite line never appears.
 
+## Experiments
+
+### `POST /api/v1/query/msgpack` — columnar MessagePack query response (experimental)
+
+A new endpoint streams query results as **columnar MessagePack** — `data` is an array of per-column arrays, not the row-oriented `[[v,v,v], [v,v,v]]` shape clients usually expect. Arc's storage, ingest, and DuckDB execution are all columnar; the query response now matches. Same execution pipeline as `POST /api/v1/query` (auth, RBAC, governance, ctx-timeout, profile, slow-query logging, query-registry callbacks); only the response serialization differs. Gated by the `duckdb_arrow` build tag; without it the route returns 501.
+
+**End-to-end head-to-head** (same query suite via `benchmarks/query_suite/main.go`, 5 iterations per query, against a 393M-row `cpu` measurement on a single Arc instance, p50 latency in milliseconds):
+
+| Query | JSON | msgpack (columnar) | Arrow IPC | msgpack vs JSON | msgpack vs Arrow IPC |
+|---|---:|---:|---:|---:|---:|
+| `LIMIT 1K`   |  14.8 |  18.2 |  14.0 | (noise floor) | (noise floor) |
+| `LIMIT 10K`  |  18.4 |  16.6 |  14.7 | 1.11×         | 0.89× |
+| `LIMIT 100K` |  48.1 |  33.2 |  31.0 | **1.45×**     | 0.93× |
+| `LIMIT 500K` | 173.2 |  81.1 |  61.1 | **2.14×**     | 0.75× |
+| `LIMIT 1M`   | 334.2 | **133.6** | 105.4 | **2.49×** | **0.78× of Arrow IPC** |
+
+DuckDB-bound queries (`SUM/AVG/MIN/MAX`, `Percentile (p95)`, `GROUP BY host + hour`, etc.) are within run-to-run noise across all three wire formats — serialization is sub-millisecond and DuckDB execution dominates.
+
+**The columnar shape was the win.** An earlier draft of this endpoint used a row-oriented envelope (`data: [[v,v,v], ...]`) and delivered 1.74× over JSON on `LIMIT 1M`. The per-cell type-switch dominated encode CPU: 1M rows × 7 cols = 7M type assertions. The columnar redesign hoists the type-switch outside the row loop — one switch per *column*, then a typed loop over the column's values — and delivered 2.49× over JSON, closing 78% of the gap to Arrow IPC.
+
+**Encoder microbench** (added under `benchmarks/msgpack_bench/msgpack_query_test.go`, M3 Max, columnar shape, against the same `QueryResponse` fixtures used by the JSON benchmarks):
+
+```
+BenchmarkJSON_Segmentio_Marshal_SmallQuery     1955 ns/op    1120 B/op  2 allocs
+BenchmarkMsgpack_Stream_SmallQuery              441 ns/op  1680 MB/s   0 B/op  0 allocs   (4.4× faster)
+BenchmarkJSON_Segmentio_Marshal_LargeQuery   325532 ns/op  140010 B/op  2 allocs
+BenchmarkMsgpack_Stream_LargeQuery            44349 ns/op  1897 MB/s   9 B/op  0 allocs   (7.3× faster)
+```
+
+Wire size shrinks 1.34× (small, 992→739 bytes) and 1.57× (large, 131784→84159 bytes) vs JSON. The microbench overstates the production win because it doesn't model DuckDB Arrow record iteration, Fiber chunked-transfer, or TCP — see the next section.
+
+**Why the production gap doesn't match the microbench (and why we stopped optimizing).** A CPU profile (`go tool pprof` against the live server under 100 concurrent `LIMIT 1M` queries on a 14-core box) shows the Go-side encoder accounts for **zero measurable samples**. The 25-second profile captured 100ms of total Go-side work; 30ms of that is `runtime.cgocall` (DuckDB query execution through the Go/C boundary, opaque to Go pprof) and 30ms is `syscall.rawsyscalln` (TCP writes through fasthttp's chunked encoder). The msgpack encode loop, the type-switches, the bufio writes — all of them rounded to zero on the profile.
+
+So the 28ms gap to Arrow IPC on `LIMIT 1M` lives on the **C++ side of DuckDB**, in how the Arrow record materialization differs between the two endpoints. Arrow IPC writes DuckDB's internal column buffers via `ipcWriter.Write(batch)` — effectively a memcpy of the column buffer plus a small framing header. The msgpack endpoint forces DuckDB to walk each record's cells via `c.Value(i)`, which makes DuckDB do per-cell materialization work that Arrow IPC's batch-buffer write skips entirely. **No amount of Go-side optimization closes that gap; it's structural to the columnar-encode-per-cell vs columnar-buffer-write difference.**
+
+Three optimization rounds confirmed this empirically:
+
+| Change | Saved on `LIMIT 1M` |
+|---|---:|
+| Row-oriented → columnar envelope | **56 ms** (193 → 137) |
+| 4 KiB → 256 KiB `bufio.Writer` | ~4 ms (137 → 133) |
+| Inner-loop tweaks (per-batch ctx check, `EncodeInt64` direct, `enc.EncodeTime` for timestamps, drop NaN check, no per-column flush) | ~0 ms (within run-to-run noise) |
+
+The columnar redesign was the single change that mattered. Everything else was diminishing returns. The pprof data is the receipt.
+
+**Where Arrow IPC still wins.** `LIMIT 1M` Arrow IPC 105ms vs columnar msgpack 133ms — Arrow IPC is **1.27× faster than msgpack**, **3.18× faster than JSON**. Arrow IPC remains the right choice for analytical clients (Grafana, pyarrow, polars) that can take an Arrow dependency. The msgpack endpoint targets clients that already speak msgpack or want a smaller wire than JSON without adding Arrow.
+
+**Why "experimental".** The endpoint may move, change shape, or be removed based on production feedback. There's no operator-configurable row cap yet (governance policy is the only ceiling); if msgpack graduates we'll re-introduce a `database.msgpack_max_buffered_rows` knob. Use `--target arc-msgpack` in `query_suite/main.go` to measure against your own data and workloads before committing client code to it.
+
+**Wire format spec.** Single msgpack map per response; `data` is columnar:
+
+```
+map(7 or 8) {
+  "success":           bool                                    // true on success
+  "columns":           [string, ...]                           // column names (numCols entries)
+  "types":             [string, ...]                           // arrow.DataType.String() per column, parallel to columns
+  "data":              [[col0_v, col0_v, ...], [col1_v, ...]]  // numCols outer entries, numRows inner
+  "row_count":         uint                                    // = inner length, redundant for client convenience
+  "execution_time_ms": uint                                    // millisecond integer (JSON sends a float)
+  "timestamp":         string                                  // RFC3339
+  "profile":           map                                     // only when ?profile=true (json-tagged QueryProfile struct)
+}
+```
+
+Per-column primitive encoding:
+- **Int8/16/32/64, Uint8/16/32/64**: msgpack int / uint. `Int64`/`Uint64` use `EncodeInt64`/`EncodeUint64` (always 9 bytes) to skip the library's size-class branching.
+- **Float32/Float64**: msgpack float. NaN / ±Inf are emitted as IEEE 754 bits — clients receive them natively, not coerced to nil.
+- **Boolean**: msgpack bool.
+- **Timestamp / Date32**: msgpack native **timestamp Ext type** (4/8/12 bytes, no RFC3339 round-trip). Saves ~25 bytes per cell vs the row-oriented draft's RFC3339Nano string.
+- **String / LargeString**: msgpack str.
+- **Binary**: msgpack **bin** (native). Clients should treat `bin` values as untrusted bytes — they may contain terminal escape sequences depending on the column source. Do not write directly to a TTY or text log.
+- **Null cells**: msgpack nil. Per-column null bitmap is encoded inline (one nil per missing cell) so clients with column-mode decoders can treat each entry uniformly.
+
+**Important operational constraints.**
+
+- **Buffered, not streamed.** msgpack arrays require an explicit length prefix, so the endpoint drains every Arrow batch into memory before emitting the data array. The only row ceiling is `governance.max_rows` (Enterprise token policy); without it, the response is unbounded — same hazard the JSON `database/sql` fallback carries, just sharper because msgpack materializes the whole result before sending the first byte. If msgpack graduates we'll re-introduce an operator-configurable ceiling.
+- **Parallel-partition execution is bypassed.** The msgpack endpoint forces the standard Arrow dispatch even when the query would otherwise be eligible for the parallel-partition executor. Parallel queries route through the JSON-streaming merge iterator and don't share the msgpack encode path; coupling them would multiply the experimental surface area.
+- **No `database/sql` fallback.** The Arrow path is the entire reason for the endpoint; falling back to `Scan`-based row iteration would defeat the contract. When the Arrow driver is unavailable (build without `duckdb_arrow`, or driver capability mismatch), the route returns `501 Not Implemented` rather than silently downgrading.
+- **Errors, `SHOW DATABASES`, `SHOW TABLES`** are also encoded as columnar msgpack. The same `wire_format` request-local that routes the streaming hot path also drives a `respondError` / `respondSuccessRows` / `respondEmptySuccess` helper trio so every response from the shared `executeQuery` pipeline matches the content type the caller asked for.
+- **`profile` struct tag.** The msgpack library defaults to reading `msgpack:"..."` struct tags. `QueryProfile` has only `json:"..."` tags, so the encoder calls `SetCustomStructTag("json")` once at the top of the stream to keep field names in `snake_case` on the wire. Without this the profile field ships in `CamelCase`.
+
+**Client decode example (Python):**
+
+```python
+import msgpack, requests
+r = requests.post("http://arc:8000/api/v1/query/msgpack",
+                  json={"sql": "SELECT * FROM cpu LIMIT 1000"},
+                  headers={"Authorization": f"Bearer {TOKEN}", "x-arc-database": "default"})
+resp = msgpack.unpackb(r.content, raw=False, timestamp=3)  # timestamp=3 → datetime
+ncols = len(resp["columns"])
+nrows = resp["row_count"]
+print(f"{nrows} rows × {ncols} cols in {resp['execution_time_ms']} ms")
+# Iterate row-major if your application code expects rows:
+for row_idx in range(nrows):
+    row = [resp["data"][c][row_idx] for c in range(ncols)]
+    ...
+# Or operate column-major (faster — matches the wire format):
+for col_idx, col_name in enumerate(resp["columns"]):
+    values = resp["data"][col_idx]
+    ...
+```
+
+**To reproduce the numbers.** Encoder microbench + wire sizes:
+
+```
+cd benchmarks/msgpack_bench
+go test -v -run TestWireSize                                # prints byte sizes
+go test -bench='Marshal_|Stream_|Unmarshal_' -benchmem -benchtime=1s
+```
+
+End-to-end against a running Arc server:
+
+```
+go build -tags=duckdb_arrow -o arc ./cmd/arc
+ARC_AUTH_ENABLED=false ./arc &
+go run benchmarks/query_suite/main.go --target arc-msgpack --measurement cpu --iterations 5
+# Compare to:
+go run benchmarks/query_suite/main.go --target arc        --measurement cpu --iterations 5  # JSON
+go run benchmarks/query_suite/main.go --target arc-arrow  --measurement cpu --iterations 5  # Arrow IPC
+```
+
 ## Hardening
 
 ### Hard Query Gating During Replication Catch-Up (Enterprise, opt-in) — closes #392
