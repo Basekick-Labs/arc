@@ -395,8 +395,11 @@ func (s *Server) Start() error {
 
 	// Wildcard variants read differently in logs so an operator
 	// debugging "why can't IPv6 clients connect" can see at a
-	// glance whether they're on dual-stack, v4-only, or v6-only.
-	// Other values are logged verbatim.
+	// glance which wildcard is in effect. The "::" case binds
+	// platform-default (dual-stack on modern Linux with
+	// bindv6only=0, v6-only on systems where IPV6_V6ONLY is
+	// set) — don't overclaim the family. Other values are
+	// logged verbatim.
 	var loggedHost string
 	switch host {
 	case "":
@@ -404,7 +407,7 @@ func (s *Server) Start() error {
 	case "0.0.0.0":
 		loggedHost = "0.0.0.0 (wildcard, IPv4-only)"
 	case "::":
-		loggedHost = ":: (wildcard, IPv6-only)"
+		loggedHost = ":: (wildcard, platform default)"
 	default:
 		loggedHost = host
 	}
