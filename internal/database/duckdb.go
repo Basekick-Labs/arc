@@ -837,7 +837,9 @@ func (d *DuckDB) QueryWithProfileContext(ctx context.Context, query string) (*sq
 	// prefix; escape it the same way SET GLOBAL temp_directory does above
 	// to neutralise any embedded single quote (operator config like
 	// "/data/arc/it's-folder" would otherwise break out of the SQL literal).
-	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA profiling_output='%s'", escapeSQLString(profilePath))); err != nil {
+	// ToSlash so Windows backslashes from os.CreateTemp match the sandbox
+	// allowlist (allowed_directories stores forward-slash entries).
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA profiling_output='%s'", escapeSQLString(filepath.ToSlash(profilePath)))); err != nil {
 		d.logger.Warn().Err(err).Msg("Failed to set profiling output")
 	}
 	// Enable planner timing metrics

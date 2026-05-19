@@ -1377,7 +1377,7 @@ func main() {
 	// Register Import handler (CSV, Parquet, Line Protocol, TLE bulk import).
 	// uploadDir is the same path that database.New added to the DuckDB
 	// sandbox's allowed_directories — staying in sync keeps imports working.
-	importHandler := api.NewImportHandler(db, storageBackend, uploadDir, logger.Get("import"))
+	importHandler := api.NewImportHandler(db, storageBackend, dbConfig.UploadDir, logger.Get("import"))
 	importHandler.SetArrowBuffer(arrowBuffer)
 	if authManager != nil && rbacManager != nil {
 		importHandler.SetAuthAndRBAC(authManager, rbacManager)
@@ -1571,7 +1571,7 @@ func main() {
 	// already allowlisted and lifecycle-managed (the file is unlinked after
 	// upload). Cross-handler reuse is fine because the filenames are unique
 	// via os.CreateTemp.
-	deleteHandler := api.NewDeleteHandler(db, storageBackend, &cfg.Delete, authManager, uploadDir, logger.Get("delete"))
+	deleteHandler := api.NewDeleteHandler(db, storageBackend, &cfg.Delete, authManager, dbConfig.UploadDir, logger.Get("delete"))
 	deleteHandler.RegisterRoutes(server.GetApp())
 	if clusterCoordinator != nil {
 		deleteHandler.SetCoordinator(clusterCoordinator)

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -116,7 +117,9 @@ func (d *DuckDB) ArrowQueryWithProfileContext(ctx context.Context, query string)
 	}
 	// Escape profilePath against the same SQL-injection surface duckdb.go
 	// guards (operator's TempDirectory could contain a single quote).
-	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA profiling_output='%s'", escapeSQLString(profilePath))); err != nil {
+	// ToSlash so Windows backslashes from os.CreateTemp match the sandbox
+	// allowlist (allowed_directories stores forward-slash entries).
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA profiling_output='%s'", escapeSQLString(filepath.ToSlash(profilePath)))); err != nil {
 		d.logger.Warn().Err(err).Msg("Failed to set profiling output")
 	}
 	if _, err := conn.ExecContext(ctx, "SET custom_profiling_settings='{\"PLANNER\": \"true\", \"PLANNER_BINDING\": \"true\", \"PHYSICAL_PLANNER\": \"true\", \"OPERATOR_TIMING\": \"true\", \"OPERATOR_CARDINALITY\": \"true\"}'"); err != nil {
