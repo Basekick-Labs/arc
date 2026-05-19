@@ -3,18 +3,16 @@ package database
 import (
 	"context"
 	"database/sql"
-	"database/sql/driver"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/memtrim"
-	duckdb "github.com/duckdb/duckdb-go/v2"
+	_ "github.com/duckdb/duckdb-go/v2" // duckdb driver registration
 	"github.com/rs/zerolog"
 )
 
@@ -47,6 +45,15 @@ func escapeSQLString(s string) string {
 	return strings.ReplaceAll(s, "'", "''")
 }
 
+// quoteDuckDBIdent quotes a DuckDB identifier (table, column, setting name)
+// for safe interpolation into SQL. DuckDB identifier quoting uses double
+// quotes; embedded double quotes are doubled (`"foo""bar"`), matching the
+// SQL standard. This is distinct from Go's %q verb, which uses Go-style
+// backslash escapes that DuckDB's parser rejects.
+func quoteDuckDBIdent(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
 // stripURLScheme normalises an S3 endpoint into the bare "host:port" form
 // that DuckDB's httpfs extension expects. The AWS SDK accepts either
 // "host:port" or "scheme://host:port[/]"; DuckDB does not. Passing scheme'd
@@ -54,10 +61,10 @@ func escapeSQLString(s string) string {
 // URLs that fail to resolve.
 //
 // Strips, in order:
-//  - leading and trailing whitespace (paste artefacts),
-//  - leading "http://" or "https://" (case-insensitive — RFC 3986 schemes
-//    are case-insensitive and users routinely paste mixed-case),
-//  - trailing slashes ("host:port/" → "host:port").
+//   - leading and trailing whitespace (paste artefacts),
+//   - leading "http://" or "https://" (case-insensitive — RFC 3986 schemes
+//     are case-insensitive and users routinely paste mixed-case),
+//   - trailing slashes ("host:port/" → "host:port").
 //
 // The case of the remainder is preserved (bucket names and path components
 // can be case-sensitive depending on the S3 implementation).
@@ -90,11 +97,47 @@ type Config struct {
 	S3SecretKey string
 	S3Endpoint  string // Custom endpoint for MinIO or S3-compatible services
 	S3UseSSL    bool
-	S3PathStyle bool // Use path-style addressing (required for MinIO)
+	S3PathStyle bool   // Use path-style addressing (required for MinIO)
+	S3Bucket    string // Bucket name; used to build the allowed_directories prefix for the sandbox
+	S3Prefix    string // Key prefix under the bucket; used with S3Bucket to scope sandbox access
 	// Azure Blob Storage configuration for azure extension
 	AzureAccountName string
 	AzureAccountKey  string
 	AzureEndpoint    string // Custom endpoint (optional)
+	AzureContainer   string // Container name; used to build the allowed_directories prefix for the sandbox
+	// Cold-tier sandbox allowlist entries. Independent from S3Bucket /
+	// AzureContainer (which describe Arc's primary/hot storage) because
+	// Enterprise tiered storage routinely combines hot=local with cold=S3 —
+	// hot S3 fields would then be empty and a hot-only allowlist would
+	// block every cold-tier query. Populated from cfg.TieredStorage.Cold
+	// by cmd/arc/main.go when tiering is enabled.
+	ColdS3Bucket       string
+	ColdS3Prefix       string
+	ColdAzureContainer string
+	// LocalStorageRoot is the absolute path of the local-storage backend root,
+	// used to whitelist Arc-managed files in the DuckDB sandbox. Equals
+	// ArcxStorageRoot when arcx is enabled; populated independently so the
+	// sandbox keeps a working entry even on deployments without arcx.
+	LocalStorageRoot string
+	// UploadDir is the dedicated directory the API layer uses for multipart
+	// uploads (CSV/Parquet imports) and the DELETE handler's S3-rewrite
+	// staging. Added to allowed_directories so DuckDB can read/write via
+	// read_csv/read_parquet/COPY. Distinct from TempDirectory (DuckDB spill)
+	// for clean separation; main.go usually places it under TempDirectory
+	// so operators get a single config knob.
+	UploadDir string
+	// CompactionTempDirectory is the operator-configured base path
+	// compaction jobs use to stage rewritten parquet files
+	// (cfg.Compaction.TempDirectory, default ./data/compaction).
+	//
+	// Compaction currently runs in a subprocess (internal/compaction/
+	// subprocess.go) that opens its OWN DuckDB outside this package's
+	// configureDatabase, so the subprocess is NOT subject to this sandbox
+	// and does not need the entry to function today. Allowlisting it
+	// anyway is defensive: any future refactor moving compaction back
+	// in-process would otherwise fail post-lockdown with a confusing
+	// permission error on COPY ... TO. Empty disables the entry.
+	CompactionTempDirectory string
 	// Query optimization configuration
 	EnableS3Cache     bool  // Enable S3 file caching via cache_httpfs extension
 	S3CacheSize       int64 // Cache size in bytes
@@ -114,12 +157,10 @@ type Config struct {
 func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 	dsn := buildDSN(cfg)
 
-	// Open the *sql.DB. When arcx is configured we route through
-	// duckdb.NewConnector + connInitFn so the LOAD runs on every pooled
-	// connection (DuckDB's LOAD is per-connection — there is no SET GLOBAL
-	// equivalent, so a bare `db.Exec("LOAD …")` would only register the
-	// extension on whichever pool member database/sql happened to hand us).
-	db, err := openDuckDB(dsn, cfg, logger)
+	// Open the *sql.DB. Extension registration in DuckDB is per-database
+	// (ExtensionManager lives on DatabaseInstance), so a single LOAD inside
+	// configureDatabase suffices for the whole pool — no connInitFn needed.
+	db, err := sql.Open("duckdb", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open duckdb: %w", err)
 	}
@@ -177,70 +218,72 @@ func buildDSN(cfg *Config) string {
 	return ""
 }
 
-// openDuckDB returns a *sql.DB. When arcx is configured we go through
-// duckdb.NewConnector with an init callback that runs `LOAD '…'` on every
-// new pooled connection — DuckDB's LOAD is per-connection, so this is the
-// only correct way to make arcx available across the whole pool. When
-// arcx is disabled we use the simpler driver-registered sql.Open path.
-func openDuckDB(dsn string, cfg *Config, logger zerolog.Logger) (*sql.DB, error) {
-	if cfg.ArcxExtensionPath == "" {
-		return sql.Open("duckdb", dsn)
-	}
+// arcxLoadTimeout bounds the LOAD '<path>' call so a corrupt or
+// network-mounted extension file cannot hang DuckDB initialization
+// indefinitely. 30s is generous for dlopen + DuckDB's Load() hook; real
+// loads are tens of milliseconds.
+const arcxLoadTimeout = 30 * time.Second
 
-	// Capture the path into a local so the closure does not retain the
-	// whole *Config (the logger field below would otherwise pull cfg in
-	// for its entire lifetime — gemini round 1).
-	//
-	// filepath.ToSlash normalises Windows-style backslashes to forward
-	// slashes. DuckDB's LOAD parses the path as a single-quoted SQL
-	// string literal, where backslashes are not interpreted as escapes
-	// but Windows paths like `C:\Program Files\arcx\arcx.duckdb_extension`
-	// have been observed to confuse the loader on some Windows builds.
-	// Forward slashes are accepted on every platform DuckDB supports.
-	path := filepath.ToSlash(cfg.ArcxExtensionPath)
-	loadSQL := fmt.Sprintf("LOAD '%s'", escapeSQLString(path))
-	// Set arcx.storage_root in the same connInitFn so the operator can
-	// resolve filesystem paths without taking them as arguments. The setting
-	// is registered by the extension at LOAD time; SET runs in the same
-	// statement after LOAD via a semicolon separator.
-	connInitSQL := loadSQL
-	if cfg.ArcxStorageRoot != "" {
-		storageRoot := filepath.ToSlash(cfg.ArcxStorageRoot)
-		connInitSQL = fmt.Sprintf("%s; SET arcx.storage_root = '%s'", loadSQL, escapeSQLString(storageRoot))
+// arcxVerifyTimeout bounds the post-LOAD `SELECT arcx_version()` proof-
+// of-life. Pure metadata read; ten seconds is generous to cover transient
+// pool contention during startup while still bounding a hung DuckDB.
+const arcxVerifyTimeout = 10 * time.Second
+
+// arcxStorageRootSetting is the dotted extension-registered global setting
+// arcx exposes for the partition_agg table function's filesystem root.
+// SET GLOBAL "arcx.storage_root" = '<path>' propagates database-wide.
+const arcxStorageRootSetting = "arcx.storage_root"
+
+// loadArcxExtension performs a one-shot LOAD of the proprietary arcx
+// extension and configures its global storage root. Extension registration
+// is database-wide in DuckDB (ExtensionManager lives on DatabaseInstance),
+// so a single LOAD registers arcx for every pool connection; SET GLOBAL on
+// arcx-registered settings propagates the same way. Called once during
+// configureDatabase. Idempotent — re-LOAD of an already-registered
+// extension is a no-op success even after the sandbox lockdown.
+func loadArcxExtension(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
+	if cfg.ArcxExtensionPath == "" {
+		return nil
 	}
 	componentLogger := logger.With().Str("component", "duckdb").Logger()
 
-	// arcxLoadTimeout bounds the connection-init LOAD so a corrupt or
-	// network-mounted extension file cannot hang pool acquisition
-	// indefinitely. 30s is generous for dlopen + DuckDB's Load() hook;
-	// real loads are tens of milliseconds.
-	const arcxLoadTimeout = 30 * time.Second
+	// filepath.ToSlash normalises Windows-style backslashes. DuckDB's LOAD
+	// parses the path as a single-quoted SQL string literal where backslashes
+	// are not interpreted as escapes, but Windows paths like
+	// `C:\Program Files\arcx\arcx.duckdb_extension` have been observed to
+	// confuse the loader on some Windows builds. Forward slashes work
+	// everywhere DuckDB runs.
+	path := filepath.ToSlash(cfg.ArcxExtensionPath)
 
-	// loadErrLogOnce gates the Error log to once per process. The error
-	// itself still propagates to database/sql on every connInitFn call —
-	// only the log line is throttled. Without this, a misconfigured path
-	// (missing file, ABI mismatch) under load would emit one Error per
-	// connection-acquire attempt — easily hundreds per second.
-	var loadErrLogOnce sync.Once
+	ctx, cancel := context.WithTimeout(context.Background(), arcxLoadTimeout)
+	defer cancel()
 
-	connector, err := duckdb.NewConnector(dsn, func(execer driver.ExecerContext) error {
-		ctx, cancel := context.WithTimeout(context.Background(), arcxLoadTimeout)
-		defer cancel()
-		_, execErr := execer.ExecContext(ctx, connInitSQL, nil)
-		if execErr != nil {
-			loadErrLogOnce.Do(func() {
-				componentLogger.Error().Err(execErr).
-					Str("path", path).
-					Msg("arcx LOAD failed on new DuckDB connection (subsequent failures suppressed for log hygiene)")
-			})
-			return fmt.Errorf("arcx LOAD on new connection: %w", execErr)
-		}
-		return nil
-	})
+	// Pinned connection: DuckDB's LOAD registers the extension on the
+	// database-wide ExtensionManager, but we pin a connection anyway so
+	// the LOAD and the immediately-following SET GLOBAL land on the same
+	// underlying handle. Defensive against future driver changes.
+	conn, err := db.Conn(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("create duckdb connector for arcx: %w", err)
+		return fmt.Errorf("acquire pinned connection for arcx LOAD: %w", err)
 	}
-	return sql.OpenDB(connector), nil
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("LOAD '%s'", escapeSQLString(path))); err != nil {
+		return fmt.Errorf("arcx LOAD: %w", err)
+	}
+	if cfg.ArcxStorageRoot != "" {
+		storageRoot := filepath.ToSlash(cfg.ArcxStorageRoot)
+		// SET GLOBAL because arcx.storage_root is an extension-registered
+		// global setting; verified empirically in Phase 0 that the value
+		// propagates to fresh pool connections. Double-quoted because the
+		// setting name contains a dot — bare identifiers with dots are
+		// parsed as table-qualified column refs by DuckDB.
+		if _, err := conn.ExecContext(ctx, "SET GLOBAL "+quoteDuckDBIdent(arcxStorageRootSetting)+" = '"+escapeSQLString(storageRoot)+"'"); err != nil {
+			return fmt.Errorf("SET arcx.storage_root: %w", err)
+		}
+	}
+	componentLogger.Info().Str("path", path).Msg("arcx extension loaded (database-wide)")
+	return nil
 }
 
 // configureDatabase sets DuckDB configuration after connection
@@ -301,40 +344,43 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		}
 	}
 
-	// Verify the proprietary arcx extension is loaded into the pool. The
-	// LOAD itself happens inside the connInitFn registered with
-	// duckdb.NewConnector (see openDuckDB) — that callback fires on every
-	// new pool connection so the extension is available across the whole
-	// pool, not just the connection that happened to receive the first
-	// db.Exec("LOAD …") call. Here we pin one connection and ask it for
-	// arcx_version() to confirm the load actually took effect. License
-	// gating happens upstream (cmd/arc/main.go clears ArcxExtensionPath
-	// when the license does not permit it), so an empty path means arcx
-	// is intentionally disabled.
+	// Load the proprietary arcx extension once for the whole pool. Extension
+	// registration is database-wide, so a single LOAD covers every connection.
+	// License gating happens upstream (cmd/arc/main.go clears
+	// ArcxExtensionPath when the license does not permit it), so an empty
+	// path means arcx is intentionally disabled.
 	if cfg.ArcxExtensionPath != "" {
+		if err := loadArcxExtension(db, cfg, logger); err != nil {
+			return fmt.Errorf("failed to load arcx extension: %w", err)
+		}
 		if err := verifyArcxLoaded(db, cfg, logger); err != nil {
 			return fmt.Errorf("failed to verify arcx extension: %w", err)
 		}
+	}
+
+	// Final step: lock down DuckDB's file-access surface so user-supplied SQL
+	// cannot reach arbitrary local files or remote URLs. Must run AFTER every
+	// INSTALL/LOAD above (enable_external_access=false blocks future LOADs).
+	if err := lockdownExternalAccess(db, cfg, logger); err != nil {
+		return fmt.Errorf("failed to lock down DuckDB external access: %w", err)
 	}
 
 	return nil
 }
 
 // verifyArcxLoaded confirms the proprietary arcx DuckDB extension is
-// available on a pool connection. The LOAD itself runs in the connInitFn
-// registered with duckdb.NewConnector for every new connection; this
-// function only proves that one of those connections actually responded
-// to arcx_version(). An empty version string signals an ABI mismatch or
-// a buggy build of arcx — fail-fast rather than limping along.
+// callable on a pool connection. An empty version string signals an ABI
+// mismatch or a buggy build of arcx — fail-fast rather than limping along.
 //
-// Pinned via db.Conn(ctx) so the verify query lands on a connection
-// that has gone through the init callback (any connection from the
-// pool would, but pinning is defensive against future driver changes).
+// Pinned via db.Conn(ctx) so the verify query lands on a specific connection
+// (defensive against future driver changes — extension state is currently
+// database-wide on DuckDB but pinning costs nothing and survives reorgs).
 func verifyArcxLoaded(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	if cfg.ArcxExtensionPath == "" {
 		return nil // belt-and-suspenders; caller already guards this
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	componentLogger := logger.With().Str("component", "duckdb").Logger()
+	ctx, cancel := context.WithTimeout(context.Background(), arcxVerifyTimeout)
 	defer cancel()
 
 	conn, err := db.Conn(ctx)
@@ -350,11 +396,10 @@ func verifyArcxLoaded(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	if strings.TrimSpace(ver) == "" {
 		return fmt.Errorf("arcx_version() returned empty string (extension binary corrupt or ABI mismatch?)")
 	}
-	logger.Info().
-		Str("component", "duckdb").
+	componentLogger.Info().
 		Str("path", cfg.ArcxExtensionPath).
 		Str("arcx_version", ver).
-		Msg("arcx extension loaded")
+		Msg("arcx extension verified")
 	return nil
 }
 
@@ -753,10 +798,25 @@ func (d *DuckDB) QueryWithProfileContext(ctx context.Context, query string) (*sq
 		return nil, nil, nil, fmt.Errorf("failed to acquire connection: %w", err)
 	}
 
-	// Create a temporary file for profiling output
-	tmpFile, err := os.CreateTemp("", "duckdb_profile_*.json")
-	if err != nil {
-		// Fall back to regular query if we can't create temp file
+	// Create a temporary file for profiling output. MUST land inside the
+	// DuckDB sandbox's allowed_directories — d.config.TempDirectory is
+	// always allowlisted (see buildAllowedDirectories), os.TempDir() is
+	// not. An empty TempDirectory would make CreateTemp fall back to
+	// os.TempDir() which the sandbox rejects, so explicitly fall through
+	// to the non-profile path without even attempting the file create.
+	var tmpFile *os.File
+	if d.config.TempDirectory == "" {
+		d.logger.Debug().Msg("Profile mode requested but TempDirectory is unset; returning result without profile data")
+	} else {
+		var err error
+		tmpFile, err = os.CreateTemp(d.config.TempDirectory, "duckdb_profile_*.json")
+		if err != nil {
+			d.logger.Warn().Err(err).Str("temp_dir", d.config.TempDirectory).Msg("Failed to create profile temp file; falling back to non-profile query path")
+			tmpFile = nil
+		}
+	}
+	if tmpFile == nil {
+		// No usable temp dir — return a regular query result without profile data.
 		rows, err := conn.QueryContext(ctx, query)
 		if err != nil {
 			conn.Close()
@@ -773,7 +833,11 @@ func (d *DuckDB) QueryWithProfileContext(ctx context.Context, query string) (*sq
 	if _, err := conn.ExecContext(ctx, "PRAGMA enable_profiling='json'"); err != nil {
 		d.logger.Warn().Err(err).Msg("Failed to enable profiling")
 	}
-	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA profiling_output='%s'", profilePath)); err != nil {
+	// profilePath includes the operator-controlled d.config.TempDirectory
+	// prefix; escape it the same way SET GLOBAL temp_directory does above
+	// to neutralise any embedded single quote (operator config like
+	// "/data/arc/it's-folder" would otherwise break out of the SQL literal).
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA profiling_output='%s'", escapeSQLString(profilePath))); err != nil {
 		d.logger.Warn().Err(err).Msg("Failed to set profiling output")
 	}
 	// Enable planner timing metrics
