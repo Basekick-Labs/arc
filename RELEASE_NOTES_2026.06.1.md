@@ -207,7 +207,7 @@ go run benchmarks/query_suite/main.go --target arc-arrow  --measurement cpu --it
 
 The HTTP listener has always bound the wildcard address (`":<port>"`), giving operators no way to restrict the bind from the config file. Deployments wanting loopback-only behavior (Arc fronted by a sidecar adapter on the same host) reached for `systemd` `IPAddressDeny`, `ufw`, or a reverse proxy. The `[server]` config block was missing the corresponding knob.
 
-26.06.1 adds `server.host` to the `[server]` config block, plumbed through to the Fiber listener via `net.JoinHostPort`. Any address Go's `net` package recognizes works — IPv4 literals, IPv6 literals (with correct bracketing), hostnames, the explicit IPv4 wildcard `0.0.0.0`, the explicit IPv6 wildcard `::`. The matching env override is `ARC_SERVER_HOST`.
+26.06.1 adds `server.host` to the `[server]` config block, plumbed through to the Fiber listener via `net.JoinHostPort`. Any address Go's `net` package recognizes works — IPv4 literals, IPv6 literals (write them without brackets — the server adds them when constructing the listen address; surrounding brackets in user input are stripped defensively), hostnames, the explicit IPv4 wildcard `0.0.0.0`, the explicit IPv6 wildcard `::`. The matching env override is `ARC_SERVER_HOST`.
 
 **Default is empty string** — the listener constructs `":<port>"`, byte-identical to the historical `fmt.Sprintf(":%d", port)`. This preserves Linux dual-stack wildcard behavior (IPv4 + IPv6 via IPv4-mapped addresses); explicit `"0.0.0.0"` would force IPv4-only and silently break IPv6 clients on upgrade, so it's an opt-in. **Zero behavioral change on the listener for operators who don't touch their config.**
 

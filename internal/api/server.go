@@ -64,6 +64,24 @@ func DefaultServerConfig() *ServerConfig {
 	}
 }
 
+// listenAddr returns the canonicalized host and the full host:port
+// string we hand to Fiber. Behavior:
+//
+//   - host="" preserves the historical wildcard (":<port>") so existing
+//     deployments keep dual-stack binding on Linux on upgrade.
+//   - net.JoinHostPort adds IPv6 brackets when needed; surrounding
+//     brackets in user input are stripped first so we never produce
+//     an invalid double-bracketed address like "[[::1]]:8000".
+//
+// The canonicalized host is returned alongside the address so callers
+// can use it for logging without re-parsing.
+func listenAddr(host string, port int) (string, string) {
+	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1]
+	}
+	return host, net.JoinHostPort(host, strconv.Itoa(port))
+}
+
 // NewServer creates a new HTTP server with Fiber
 func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	if config == nil {
@@ -367,19 +385,22 @@ func (s *Server) Start() error {
 		protocol = "HTTPS"
 	}
 
-	// net.JoinHostPort("", "8000") returns ":8000" — byte-identical
-	// to the historical fmt.Sprintf(":%d", port), which preserves
-	// dual-stack wildcard binding on Linux. An explicit host
-	// ("127.0.0.1", "::1", "0.0.0.0", "192.0.2.1", …) is honored
-	// as-is, with correct IPv6 bracketing.
-	addr := net.JoinHostPort(s.host, strconv.Itoa(s.port))
+	host, addr := listenAddr(s.host, s.port)
 
-	// host="" reads better in logs as "wildcard (dual-stack)"; an
-	// explicit value is logged verbatim so ops can see what we
-	// actually bound to without having to grep config files.
-	loggedHost := s.host
-	if loggedHost == "" {
-		loggedHost = "* (wildcard)"
+	// Wildcard variants read differently in logs so an operator
+	// debugging "why can't IPv6 clients connect" can see at a
+	// glance whether they're on dual-stack, v4-only, or v6-only.
+	// Other values are logged verbatim.
+	var loggedHost string
+	switch host {
+	case "":
+		loggedHost = "* (wildcard, dual-stack)"
+	case "0.0.0.0":
+		loggedHost = "0.0.0.0 (wildcard, IPv4-only)"
+	case "::":
+		loggedHost = ":: (wildcard, IPv6-only)"
+	default:
+		loggedHost = host
 	}
 	s.logger.Info().
 		Str("host", loggedHost).

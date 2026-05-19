@@ -1,23 +1,24 @@
 package api
 
 import (
-	"net"
-	"strconv"
 	"testing"
 
 	"github.com/rs/zerolog"
 )
 
-// TestListenAddrForHost pins the listener-address construction shape. The
-// production listener uses net.JoinHostPort(s.host, strconv.Itoa(s.port))
-// at server.go's Start path; this test asserts the addresses produced
-// for every shape an operator might configure.
+// TestListenAddrForHost pins the listener-address construction shape
+// the Start path uses. Every shape an operator might configure is
+// exercised here.
 //
 // The "" case is load-bearing for backward compatibility: it must
 // produce ":<port>" (byte-identical to the historical fmt.Sprintf(":%d",
 // port)) so existing deployments upgrade with zero behavioral change
 // on the listener — specifically preserving Linux dual-stack
 // (IPv4 + IPv6 via IPv4-mapped addresses) binding semantics.
+//
+// The bracketed-IPv6 case is the defensive strip: a user who follows
+// docs that show bracketed addresses (or copies one from `ss`/`netstat`
+// output) must not produce an invalid "[[::1]]:8000".
 func TestListenAddrForHost(t *testing.T) {
 	const port = 8000
 	cases := []struct {
@@ -51,6 +52,16 @@ func TestListenAddrForHost(t *testing.T) {
 			want: "[::1]:8000",
 		},
 		{
+			name: "already-bracketed ipv6 is stripped before joining",
+			host: "[::1]",
+			want: "[::1]:8000",
+		},
+		{
+			name: "already-bracketed ipv6 wildcard is stripped before joining",
+			host: "[::]",
+			want: "[::]:8000",
+		},
+		{
 			name: "named host passed through",
 			host: "arc.internal",
 			want: "arc.internal:8000",
@@ -63,9 +74,9 @@ func TestListenAddrForHost(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := net.JoinHostPort(tc.host, strconv.Itoa(port))
+			_, got := listenAddr(tc.host, port)
 			if got != tc.want {
-				t.Errorf("net.JoinHostPort(%q, %q) = %q; want %q", tc.host, strconv.Itoa(port), got, tc.want)
+				t.Errorf("listenAddr(%q, %d) = %q; want %q", tc.host, port, got, tc.want)
 			}
 		})
 	}
