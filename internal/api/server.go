@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"runtime"
@@ -23,6 +24,7 @@ import (
 type Server struct {
 	app            *fiber.App
 	logger         zerolog.Logger
+	host           string
 	port           int
 	maxPayloadSize int64
 	tlsEnabled     bool
@@ -32,6 +34,12 @@ type Server struct {
 
 // ServerConfig holds server configuration
 type ServerConfig struct {
+	// Host is the bind address. Empty preserves the historical
+	// dual-stack wildcard (":<port>" on Linux binds both IPv4 and
+	// IPv6 via IPv4-mapped addresses). Set to a specific address
+	// (e.g. "127.0.0.1", "::1", "192.0.2.10") to restrict the bind.
+	// Explicit "0.0.0.0" forces IPv4-only.
+	Host            string
 	Port            int
 	ReadTimeout     time.Duration
 	WriteTimeout    time.Duration
@@ -104,6 +112,7 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	return &Server{
 		app:            app,
 		logger:         logger.With().Str("component", "api-server").Logger(),
+		host:           config.Host,
 		port:           config.Port,
 		maxPayloadSize: config.MaxPayloadSize,
 		tlsEnabled:     config.TLSEnabled,
@@ -358,7 +367,22 @@ func (s *Server) Start() error {
 		protocol = "HTTPS"
 	}
 
+	// net.JoinHostPort("", "8000") returns ":8000" — byte-identical
+	// to the historical fmt.Sprintf(":%d", port), which preserves
+	// dual-stack wildcard binding on Linux. An explicit host
+	// ("127.0.0.1", "::1", "0.0.0.0", "192.0.2.1", …) is honored
+	// as-is, with correct IPv6 bracketing.
+	addr := net.JoinHostPort(s.host, strconv.Itoa(s.port))
+
+	// host="" reads better in logs as "wildcard (dual-stack)"; an
+	// explicit value is logged verbatim so ops can see what we
+	// actually bound to without having to grep config files.
+	loggedHost := s.host
+	if loggedHost == "" {
+		loggedHost = "* (wildcard)"
+	}
 	s.logger.Info().
+		Str("host", loggedHost).
 		Int("port", s.port).
 		Bool("tls_enabled", s.tlsEnabled).
 		Str("protocol", protocol).
@@ -366,9 +390,7 @@ func (s *Server) Start() error {
 
 	// Start server in goroutine
 	go func() {
-		addr := fmt.Sprintf(":%d", s.port)
 		var err error
-
 		if s.tlsEnabled {
 			s.logger.Info().
 				Str("cert_file", s.tlsCert).

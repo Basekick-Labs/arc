@@ -728,8 +728,15 @@ func Load() (*Config, error) {
 }
 
 func setDefaults(v *viper.Viper) {
-	// Server defaults
-	v.SetDefault("server.host", "0.0.0.0")
+	// Server defaults.
+	//
+	// server.host default is empty (not "0.0.0.0") so the listener
+	// invocation builds ":<port>" via net.JoinHostPort and preserves
+	// today's dual-stack wildcard behavior on Linux (IPv4 + IPv6
+	// via IPv4-mapped addresses). Explicit "0.0.0.0" forces
+	// IPv4-only and would silently break IPv6 clients on upgrade —
+	// see internal/api/server.go.
+	v.SetDefault("server.host", "")
 	v.SetDefault("server.port", 8000)
 	v.SetDefault("server.read_timeout", 30)
 	v.SetDefault("server.write_timeout", 30)

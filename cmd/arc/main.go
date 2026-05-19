@@ -1089,6 +1089,7 @@ func main() {
 
 	// Initialize HTTP server
 	serverConfig := &api.ServerConfig{
+		Host:            cfg.Server.Host,
 		Port:            cfg.Server.Port,
 		ReadTimeout:     time.Duration(cfg.Server.ReadTimeout) * time.Second,
 		WriteTimeout:    time.Duration(cfg.Server.WriteTimeout) * time.Second,

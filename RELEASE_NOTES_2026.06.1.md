@@ -203,6 +203,32 @@ go run benchmarks/query_suite/main.go --target arc-arrow  --measurement cpu --it
 
 ## Hardening
 
+### HTTP server now supports binding to a specific host/address — closes #439
+
+The HTTP listener has always bound the wildcard address (`":<port>"`), giving operators no way to restrict the bind from the config file. Deployments wanting loopback-only behavior (Arc fronted by a sidecar adapter on the same host) reached for `systemd` `IPAddressDeny`, `ufw`, or a reverse proxy. The `[server]` config block was missing the corresponding knob.
+
+26.06.1 adds `server.host` to the `[server]` config block, plumbed through to the Fiber listener via `net.JoinHostPort`. Any address Go's `net` package recognizes works — IPv4 literals, IPv6 literals (with correct bracketing), hostnames, the explicit IPv4 wildcard `0.0.0.0`, the explicit IPv6 wildcard `::`. The matching env override is `ARC_SERVER_HOST`.
+
+**Default is empty string** — the listener constructs `":<port>"`, byte-identical to the historical `fmt.Sprintf(":%d", port)`. This preserves Linux dual-stack wildcard behavior (IPv4 + IPv6 via IPv4-mapped addresses); explicit `"0.0.0.0"` would force IPv4-only and silently break IPv6 clients on upgrade, so it's an opt-in. **Zero behavioral change on the listener for operators who don't touch their config.**
+
+```toml
+[server]
+host = "127.0.0.1"   # loopback-only
+# host = "::1"        # IPv6 loopback
+# host = "192.0.2.10" # specific NIC
+# host = "0.0.0.0"    # explicit IPv4-only wildcard
+# host = "::"         # explicit IPv6-only wildcard
+# host = ""           # default; dual-stack wildcard (matches pre-26.06.1 behavior)
+```
+
+The startup log line now also reports the bound host, so `journalctl -u arc | grep 'Starting Arc server'` answers "what did we bind to?" without grepping config files:
+
+```
+INF Starting Arc server component=api-server host=127.0.0.1 port=8000 tls_enabled=false protocol=HTTP
+```
+
+Operators currently relying on the `systemd` `IPAddressDeny` workaround can keep it — `ss -ltnp` will now show the bind address Arc actually opened, but the systemd filter remains valid defense-in-depth.
+
 ### Hard Query Gating During Replication Catch-Up (Enterprise, opt-in) — closes #392
 
 Reader nodes in a clustered Arc Enterprise deployment previously accepted queries the moment they started, even while peer file replication was still pulling Parquet files the rest of the cluster already had. The Raft manifest knew about the missing files; the local storage didn't have them yet; `read_parquet()` globbed against local storage rather than the manifest. The result was **silent partial results** during the catch-up window. The Phase 3 release explicitly deferred this fix; 26.05.1 closed half the gap (WAL replication makes unflushed writer data queryable on readers within milliseconds), but flushed Parquet files still depended on async background pullers.
