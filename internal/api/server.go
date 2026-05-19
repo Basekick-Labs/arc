@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"runtime"
@@ -23,6 +24,7 @@ import (
 type Server struct {
 	app            *fiber.App
 	logger         zerolog.Logger
+	host           string
 	port           int
 	maxPayloadSize int64
 	tlsEnabled     bool
@@ -32,6 +34,12 @@ type Server struct {
 
 // ServerConfig holds server configuration
 type ServerConfig struct {
+	// Host is the bind address. Empty preserves the historical
+	// dual-stack wildcard (":<port>" on Linux binds both IPv4 and
+	// IPv6 via IPv4-mapped addresses). Set to a specific address
+	// (e.g. "127.0.0.1", "::1", "192.0.2.10") to restrict the bind.
+	// Explicit "0.0.0.0" forces IPv4-only.
+	Host            string
 	Port            int
 	ReadTimeout     time.Duration
 	WriteTimeout    time.Duration
@@ -54,6 +62,30 @@ func DefaultServerConfig() *ServerConfig {
 		ShutdownTimeout: 30 * time.Second,
 		MaxPayloadSize:  1024 * 1024 * 1024, // 1GB default
 	}
+}
+
+// ListenAddr canonicalizes (host, port) into the host:port string
+// callers hand to a listener — Fiber on the HTTP path, the cluster
+// coordinator's advertise/peer logic on the cluster path.
+//
+// Behavior:
+//
+//   - host="" preserves the historical wildcard (":<port>") so existing
+//     deployments keep dual-stack binding on Linux on upgrade.
+//   - net.JoinHostPort adds IPv6 brackets when needed; surrounding
+//     brackets in user input are stripped first so we never produce
+//     an invalid double-bracketed address like "[[::1]]:8000".
+//
+// The canonicalized host is returned alongside the address so callers
+// can use it for logging without re-parsing. Exported so non-api
+// callers (cmd/arc) format the same address shape this server does
+// — historically this was duplicated with fmt.Sprintf("%s:%d", …)
+// which mis-formatted IPv6 literals.
+func ListenAddr(host string, port int) (string, string) {
+	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1]
+	}
+	return host, net.JoinHostPort(host, strconv.Itoa(port))
 }
 
 // NewServer creates a new HTTP server with Fiber
@@ -104,6 +136,7 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	return &Server{
 		app:            app,
 		logger:         logger.With().Str("component", "api-server").Logger(),
+		host:           config.Host,
 		port:           config.Port,
 		maxPayloadSize: config.MaxPayloadSize,
 		tlsEnabled:     config.TLSEnabled,
@@ -358,7 +391,28 @@ func (s *Server) Start() error {
 		protocol = "HTTPS"
 	}
 
+	host, addr := ListenAddr(s.host, s.port)
+
+	// Wildcard variants read differently in logs so an operator
+	// debugging "why can't IPv6 clients connect" can see at a
+	// glance which wildcard is in effect. The "::" case binds
+	// platform-default (dual-stack on modern Linux with
+	// bindv6only=0, v6-only on systems where IPV6_V6ONLY is
+	// set) — don't overclaim the family. Other values are
+	// logged verbatim.
+	var loggedHost string
+	switch host {
+	case "":
+		loggedHost = "* (wildcard, dual-stack)"
+	case "0.0.0.0":
+		loggedHost = "0.0.0.0 (wildcard, IPv4-only)"
+	case "::":
+		loggedHost = ":: (wildcard, platform default)"
+	default:
+		loggedHost = host
+	}
 	s.logger.Info().
+		Str("host", loggedHost).
 		Int("port", s.port).
 		Bool("tls_enabled", s.tlsEnabled).
 		Str("protocol", protocol).
@@ -366,9 +420,7 @@ func (s *Server) Start() error {
 
 	// Start server in goroutine
 	go func() {
-		addr := fmt.Sprintf(":%d", s.port)
 		var err error
-
 		if s.tlsEnabled {
 			s.logger.Info().
 				Str("cert_file", s.tlsCert).

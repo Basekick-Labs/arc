@@ -860,10 +860,15 @@ func main() {
 			if lic == nil || !lic.HasFeature(license.FeatureClustering) {
 				log.Warn().Msg("License does not include clustering feature - running in standalone mode")
 			} else {
-				// Determine API address for this node
-				apiAddr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
-				if cfg.Server.Host == "0.0.0.0" {
-					apiAddr = fmt.Sprintf(":%d", cfg.Server.Port)
+				// Determine API address for this node. Use api.ListenAddr
+				// so IPv6 literals are bracketed correctly (the previous
+				// fmt.Sprintf("%s:%d", …) produced "::1:8000" which is
+				// not a valid address). The 0.0.0.0 special-case keeps
+				// the historical advertise-address shape (":<port>") for
+				// operators who explicitly bound the IPv4 wildcard.
+				apiAddr := fmt.Sprintf(":%d", cfg.Server.Port)
+				if cfg.Server.Host != "" && cfg.Server.Host != "0.0.0.0" {
+					_, apiAddr = api.ListenAddr(cfg.Server.Host, cfg.Server.Port)
 				}
 
 				// Peer replication (Enterprise Phase 2) requires shared-secret auth
@@ -1089,6 +1094,7 @@ func main() {
 
 	// Initialize HTTP server
 	serverConfig := &api.ServerConfig{
+		Host:            cfg.Server.Host,
 		Port:            cfg.Server.Port,
 		ReadTimeout:     time.Duration(cfg.Server.ReadTimeout) * time.Second,
 		WriteTimeout:    time.Duration(cfg.Server.WriteTimeout) * time.Second,

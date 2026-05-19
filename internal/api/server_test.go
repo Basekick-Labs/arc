@@ -1,0 +1,116 @@
+package api
+
+import (
+	"testing"
+
+	"github.com/rs/zerolog"
+)
+
+// TestListenAddrForHost pins the listener-address construction shape
+// the Start path uses. Every shape an operator might configure is
+// exercised here.
+//
+// The "" case is load-bearing for backward compatibility: it must
+// produce ":<port>" (byte-identical to the historical fmt.Sprintf(":%d",
+// port)) so existing deployments upgrade with zero behavioral change
+// on the listener — specifically preserving Linux dual-stack
+// (IPv4 + IPv6 via IPv4-mapped addresses) binding semantics.
+//
+// The bracketed-IPv6 case is the defensive strip: a user who follows
+// docs that show bracketed addresses (or copies one from `ss`/`netstat`
+// output) must not produce an invalid "[[::1]]:8000".
+func TestListenAddrForHost(t *testing.T) {
+	const port = 8000
+	cases := []struct {
+		name string
+		host string
+		want string
+	}{
+		{
+			name: "empty preserves historical wildcard (dual-stack)",
+			host: "",
+			want: ":8000",
+		},
+		{
+			name: "explicit ipv4 wildcard binds v4 only",
+			host: "0.0.0.0",
+			want: "0.0.0.0:8000",
+		},
+		{
+			name: "explicit ipv6 wildcard with bracketing",
+			host: "::",
+			want: "[::]:8000",
+		},
+		{
+			name: "ipv4 loopback",
+			host: "127.0.0.1",
+			want: "127.0.0.1:8000",
+		},
+		{
+			name: "ipv6 loopback bracketed correctly",
+			host: "::1",
+			want: "[::1]:8000",
+		},
+		{
+			name: "already-bracketed ipv6 is stripped before joining",
+			host: "[::1]",
+			want: "[::1]:8000",
+		},
+		{
+			name: "already-bracketed ipv6 wildcard is stripped before joining",
+			host: "[::]",
+			want: "[::]:8000",
+		},
+		{
+			name: "named host passed through",
+			host: "arc.internal",
+			want: "arc.internal:8000",
+		},
+		{
+			name: "specific ipv4 interface",
+			host: "192.0.2.10",
+			want: "192.0.2.10:8000",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, got := ListenAddr(tc.host, port)
+			if got != tc.want {
+				t.Errorf("ListenAddr(%q, %d) = %q; want %q", tc.host, port, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestServerCapturesHostFromConfig pins that NewServer threads
+// ServerConfig.Host through to the Server struct's host field —
+// without this, the listener at Start() would always see the zero
+// value and silently fall back to wildcard regardless of what the
+// operator configured.
+func TestServerCapturesHostFromConfig(t *testing.T) {
+	cases := []struct {
+		name string
+		host string
+	}{
+		{"empty default", ""},
+		{"ipv4 loopback", "127.0.0.1"},
+		{"ipv6 loopback", "::1"},
+		{"explicit v4 wildcard", "0.0.0.0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &ServerConfig{
+				Host:           tc.host,
+				Port:           0,
+				MaxPayloadSize: 1024 * 1024,
+			}
+			// NewServer's logger argument is required but we don't
+			// care about its output here — zerolog.Nop() is the
+			// convention used by every other test in this package.
+			s := NewServer(cfg, zerolog.Nop())
+			if s.host != tc.host {
+				t.Errorf("Server.host = %q; want %q (NewServer dropped Host on the floor)", s.host, tc.host)
+			}
+		})
+	}
+}
