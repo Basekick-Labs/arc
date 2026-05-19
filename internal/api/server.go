@@ -64,8 +64,11 @@ func DefaultServerConfig() *ServerConfig {
 	}
 }
 
-// listenAddr returns the canonicalized host and the full host:port
-// string we hand to Fiber. Behavior:
+// ListenAddr canonicalizes (host, port) into the host:port string
+// callers hand to a listener — Fiber on the HTTP path, the cluster
+// coordinator's advertise/peer logic on the cluster path.
+//
+// Behavior:
 //
 //   - host="" preserves the historical wildcard (":<port>") so existing
 //     deployments keep dual-stack binding on Linux on upgrade.
@@ -74,8 +77,11 @@ func DefaultServerConfig() *ServerConfig {
 //     an invalid double-bracketed address like "[[::1]]:8000".
 //
 // The canonicalized host is returned alongside the address so callers
-// can use it for logging without re-parsing.
-func listenAddr(host string, port int) (string, string) {
+// can use it for logging without re-parsing. Exported so non-api
+// callers (cmd/arc) format the same address shape this server does
+// — historically this was duplicated with fmt.Sprintf("%s:%d", …)
+// which mis-formatted IPv6 literals.
+func ListenAddr(host string, port int) (string, string) {
 	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
 		host = host[1 : len(host)-1]
 	}
@@ -385,7 +391,7 @@ func (s *Server) Start() error {
 		protocol = "HTTPS"
 	}
 
-	host, addr := listenAddr(s.host, s.port)
+	host, addr := ListenAddr(s.host, s.port)
 
 	// Wildcard variants read differently in logs so an operator
 	// debugging "why can't IPv6 clients connect" can see at a

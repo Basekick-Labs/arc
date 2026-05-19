@@ -74,9 +74,9 @@ func TestListenAddrForHost(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, got := listenAddr(tc.host, port)
+			_, got := ListenAddr(tc.host, port)
 			if got != tc.want {
-				t.Errorf("listenAddr(%q, %d) = %q; want %q", tc.host, port, got, tc.want)
+				t.Errorf("ListenAddr(%q, %d) = %q; want %q", tc.host, port, got, tc.want)
 			}
 		})
 	}
