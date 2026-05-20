@@ -35,6 +35,35 @@ The arcx loader was simplified: the previous per-connection `connInitFn` (which 
 
 Tests added: `TestSandbox` (CVE reproduction + full I/O family + SSRF + `COPY TO` local + `COPY TO 's3://...'` + `EXPORT DATABASE` outside allowlist + `INSTALL` after lockdown + cross-connection enforcement + `range()` remains callable + lockdown is one-way), `TestBuildAllowedDirectories` (12 table cases covering hot/cold S3 dedup, leading/interior-slash collapse, trailing-slash idempotence, empty-config behavior), `TestSandboxEmptyAllowlistLogsButDoesNotPanic`. The existing arcx tests confirm `arcx_version()` and `SET GLOBAL arcx.storage_root` propagate across 3–4 concurrent pool connections.
 
+### Go pprof endpoints no longer reachable from the public API port
+
+Reported by [Alex Manson](https://neurowinter.com/) ([@NeuroWinter](https://github.com/NeuroWinter)) — thank you for the detailed report.
+
+Pre-26.06.1, `internal/api/server.go` called `app.Use(pprof.New())` unconditionally on the public Fiber app, and `cmd/arc/main.go` added `/debug/pprof` to the auth middleware's `PublicPrefixes` list. The combined effect: any network-reachable caller — no token, no auth header, no anything — could fetch:
+
+- `GET /debug/pprof/heap` — leaks in-memory state (live SQL strings, decoded msgpack records, decompressed request bodies, cached `*TokenInfo` derived from plaintext-token hashes in the auth cache).
+- `GET /debug/pprof/goroutine?debug=2` — leaks every goroutine's call stack, identifying internal code paths and surfaces.
+- `GET /debug/pprof/profile?seconds=N` — pins a CPU core for arbitrary duration. One request = minutes of server CPU. Trivial DoS amplification.
+- `GET /debug/pprof/trace?seconds=N` — same CPU-burn profile via a different handler.
+
+26.06.1 removes pprof from the public Fiber app entirely. The endpoints are now opt-in via `ARC_DEBUG_PPROF=1`, and when enabled they bind to a separate `127.0.0.1:6060` listener (override via `ARC_DEBUG_PPROF_ADDR`; a non-loopback bind additionally requires `ARC_DEBUG_PPROF_ALLOW_NON_LOOPBACK=1` so a single typo in the address knob cannot expose pprof to the network). The localhost listener registers its handlers on a private `*http.ServeMux`, NOT on `http.DefaultServeMux` — so even if a future PR adds an `http.Server` somewhere with `Handler: nil`, that server will not unintentionally serve pprof (verified at merge time that no such caller exists in the binary). The listener is wired into the existing shutdown coordinator at `PriorityHTTPServer` and shuts down via `srv.Close()` (force-close, not `srv.Shutdown`) so an in-flight long-running `/debug/pprof/profile?seconds=N` capture cannot pin the coordinator's shared 30-second shutdown budget and starve downstream shutdown hooks. Server-side timeouts (`ReadHeaderTimeout=5s`, `WriteTimeout=10m`, `IdleTimeout=60s`) bound slow-client attacks on the debug surface.
+
+Operator-facing changes:
+
+- **Default behavior changed**: pprof is no longer reachable on Arc's API port (`:8000` by default). Existing deployments that relied on `curl http://arc:8000/debug/pprof/heap` will start getting `404 Not Found`. Set `ARC_DEBUG_PPROF=1` and reach pprof on `127.0.0.1:6060` instead.
+- **`/metrics` is unchanged**: Prometheus scrapers continue to work as before. Only `/debug/pprof/*` moved.
+- **Non-loopback bind requires a second opt-in**: `ARC_DEBUG_PPROF_ADDR` accepts any bind string Go's `net.Listen` understands, but a non-loopback override (e.g. `0.0.0.0:6060`) additionally requires `ARC_DEBUG_PPROF_ALLOW_NON_LOOPBACK=1`. Without that second env var Arc logs an `Error` and refuses to start the pprof listener; with it, Arc logs an `Error` (not Warn) at startup naming the bound address so cross-host exposure shows up in default alerting policies.
+
+A **defense-in-depth fix to the auth middleware's `PublicPrefixes` matcher** is also included. The previous `strings.HasPrefix(path, prefix)` would match `/metrics` against `/metrics`, `/metrics/prometheus`, AND `/metricsX`, `/metrics-secret`, etc. — any byte-prefix match silently bypassed auth. Three changes:
+
+1. **Anchored prefix match**: the matcher now requires exact-equal or true-subdirectory (`prefix + "/"`); a sibling path with the same prefix bytes no longer slips through. Same shape as the prefix-match gap gemini-code-assist flagged on PR #442's `deniedRoots` check.
+2. **Path normalisation before match**: the matcher runs `path.Clean(c.Path())` first, so non-canonical request shapes like `/metrics//foo`, `/metrics/./x`, `/metrics/../sensitive` are normalised to their canonical form before the bypass branch checks them. Without normalisation, an attacker-controlled `/metrics/../api/v1/query` lexically starts with `/metrics/` and would slip past the anchored check; after normalisation it becomes `/api/v1/query` and correctly requires auth.
+3. **Empty-prefix guard**: an empty string in `PublicPrefixes` (no legitimate config has one, but a future bug — e.g. an env-var split producing an empty slice entry — could) would otherwise short-circuit every request because `HasPrefix(anyPath, "")` is true. The matcher now skips empty entries.
+
+With `/debug/pprof` removed from the public prefix list, items 1 and 2 are not currently reachable for any production route — the fixes are guards for any prefix added in the future.
+
+Tests added: `TestServer_PprofNotRegisteredOnPublicApp` (12 pprof paths against the public Fiber app, all must 404), `TestMiddleware_PublicPrefixes_AnchoredMatch` (10 subtests: exact match + trailing-slash match + true subdir + deep subdir bypass + 3 sibling-byte-prefix shapes that must require auth + 2 parent-traversal escape shapes that must require auth + empty-prefix guard), plus the new `cmd/arc/debug_pprof_test.go` (no-op when disabled, binds-and-serves when enabled, `isTruthy` env-var contract, `isLoopbackBindAddr` detection incl. fail-closed on unresolvable hosts).
+
 ## Bug fixes
 
 ### Parser no longer mis-resolves bare `time` column inside `EXTRACT(YEAR FROM time)`

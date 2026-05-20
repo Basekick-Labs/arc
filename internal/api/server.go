@@ -15,7 +15,6 @@ import (
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
-	"github.com/gofiber/fiber/v2/middleware/pprof"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/rs/zerolog"
 )
@@ -127,8 +126,12 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	// This prevents double-decompression issues with gzip-compressed MessagePack payloads
 	// Response compression is still available via Accept-Encoding handling
 
-	// pprof profiling endpoints
-	app.Use(pprof.New())
+	// pprof is NOT registered on the public Fiber app. It used to be —
+	// `app.Use(pprof.New())` — but that exposed `/debug/pprof/*` to any
+	// network-reachable caller (auth middleware short-circuited it via
+	// PublicPrefixes). See cmd/arc/main.go for the opt-in localhost-bound
+	// pprof listener started only when ARC_DEBUG_PPROF=1.
+	// Closes audit finding #2 from 2026-05-19 (GHSA-j93g-rp6m-j32m).
 
 	// Request logging middleware
 	app.Use(requestLogger(logger))
