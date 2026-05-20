@@ -337,13 +337,14 @@ Operators currently relying on the `systemd` `IPAddressDeny` workaround can keep
 
 ### Inter-node HTTP traffic now respects `server.tls_enabled`
 
-Before this release, three inter-node HTTP call sites silently hardcoded `http://`:
+Before this release, two **wired** inter-node HTTP call sites silently hardcoded `http://`:
 
 - The post-compaction cache-invalidate fan-out (introduced in PR #444 — same release).
 - `internal/cluster/router.go` leader-forwarding (long-standing).
-- `internal/cluster/sharding/router.go` scatter-gather scaffolding (currently unwired; fixed structurally for when it gets wired).
 
-When an operator ran Arc in cluster mode with `server.tls_enabled = true`, every peer's Fiber listener served HTTPS — and these senders dialed plaintext, failing the TLS handshake with no useful error. The cluster fan-out, leader-forwarding, and write routing were all effectively broken in that configuration.
+(`internal/cluster/sharding/router.go` has the same shape but no production caller today; it will be addressed when the sharding path is wired in.)
+
+When an operator ran Arc in cluster mode with `server.tls_enabled = true`, every peer's Fiber listener served HTTPS — and these senders dialed plaintext, failing the TLS handshake with no useful error. Cluster fan-out and leader-forwarding were both effectively broken in that configuration.
 
 26.06.1 adds two helpers in `internal/cluster/security/tls.go`:
 
