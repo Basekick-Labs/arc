@@ -92,6 +92,30 @@ func TestStartDebugPprofIfEnabled_BindsAndServes(t *testing.T) {
 		t.Errorf("/debug/pprof/ body does not look like the pprof index page: %q", string(body[:min(200, len(body))]))
 	}
 
+	// The four non-runtime-profile endpoints (cmdline, profile, symbol,
+	// trace) MUST be reachable. These do NOT live in the runtime/pprof
+	// Lookup table, so pprof.Index alone would return 404 "Unknown
+	// profile" for them — they need explicit HandleFunc registrations
+	// next to pprof.Index. This sub-test prevents a future "simplification"
+	// that drops the explicit registrations (e.g. PR #443 review G3
+	// suggested it; empirically refuted).
+	//
+	// Skip /debug/pprof/profile and /debug/pprof/trace because those
+	// actively capture data over seconds; the test would either take
+	// 30+s or have to fight the seconds query param. Cmdline and symbol
+	// are O(1) and prove the registrations work.
+	for _, p := range []string{"/debug/pprof/cmdline", "/debug/pprof/symbol"} {
+		r, err := client.Get("http://" + addr + p)
+		if err != nil {
+			t.Errorf("GET %s on pprof listener: %v", p, err)
+			continue
+		}
+		_ = r.Body.Close()
+		if r.StatusCode == http.StatusNotFound {
+			t.Errorf("GET %s on pprof listener: 404 — pprof.Index alone does not cover this endpoint; explicit HandleFunc(%q, ...) registration is required", p, p)
+		}
+	}
+
 	// Non-pprof path must NOT be served by this listener: we registered a
 	// fresh *http.ServeMux, not the default mux. A request for
 	// "/something-else" must 404, proving we did not leak handlers onto

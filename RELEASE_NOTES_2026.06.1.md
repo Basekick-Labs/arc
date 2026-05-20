@@ -52,7 +52,7 @@ Operator-facing changes:
 
 - **Default behavior changed**: pprof is no longer reachable on Arc's API port (`:8000` by default). Existing deployments that relied on `curl http://arc:8000/debug/pprof/heap` will start getting `404 Not Found`. Set `ARC_DEBUG_PPROF=1` and reach pprof on `127.0.0.1:6060` instead.
 - **`/metrics` is unchanged**: Prometheus scrapers continue to work as before. Only `/debug/pprof/*` moved.
-- **Override-only-for-explicit-opt-in**: `ARC_DEBUG_PPROF_ADDR` accepts any bind string Go's `net.Listen` understands. Setting it to `0.0.0.0:6060` is the operator opting into cross-host pprof exposure — Arc logs a Warn at startup naming the bound address so the choice is visible in logs.
+- **Non-loopback bind requires a second opt-in**: `ARC_DEBUG_PPROF_ADDR` accepts any bind string Go's `net.Listen` understands, but a non-loopback override (e.g. `0.0.0.0:6060`) additionally requires `ARC_DEBUG_PPROF_ALLOW_NON_LOOPBACK=1`. Without that second env var Arc logs an `Error` and refuses to start the pprof listener; with it, Arc logs an `Error` (not Warn) at startup naming the bound address so cross-host exposure shows up in default alerting policies.
 
 A **defense-in-depth fix to the auth middleware's `PublicPrefixes` matcher** is also included. The previous `strings.HasPrefix(path, prefix)` would match `/metrics` against `/metrics`, `/metrics/prometheus`, AND `/metricsX`, `/metrics-secret`, etc. — any byte-prefix match silently bypassed auth. Three changes:
 
@@ -62,7 +62,7 @@ A **defense-in-depth fix to the auth middleware's `PublicPrefixes` matcher** is 
 
 With `/debug/pprof` removed from the public prefix list, items 1 and 2 are not currently reachable for any production route — the fixes are guards for any prefix added in the future.
 
-Tests added: `TestServer_PprofNotRegisteredOnPublicApp` (12 pprof paths against the public Fiber app, all must 404), `TestMiddleware_PublicPrefixes_AnchoredMatch` (7 paths covering exact match, true subdirectories, and three sibling-shaped paths that must NOT bypass auth), plus the new `cmd/arc/debug_pprof_test.go` (no-op when disabled, binds-and-serves when enabled, isTruthy contract).
+Tests added: `TestServer_PprofNotRegisteredOnPublicApp` (12 pprof paths against the public Fiber app, all must 404), `TestMiddleware_PublicPrefixes_AnchoredMatch` (10 subtests: exact match + trailing-slash match + true subdir + deep subdir bypass + 3 sibling-byte-prefix shapes that must require auth + 2 parent-traversal escape shapes that must require auth + empty-prefix guard), plus the new `cmd/arc/debug_pprof_test.go` (no-op when disabled, binds-and-serves when enabled, `isTruthy` env-var contract, `isLoopbackBindAddr` detection incl. fail-closed on unresolvable hosts).
 
 ## Bug fixes
 
