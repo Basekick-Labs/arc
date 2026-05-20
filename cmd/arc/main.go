@@ -11,7 +11,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -20,6 +22,7 @@ import (
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/backup"
 	"github.com/basekick-labs/arc/internal/cluster"
+	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/basekick-labs/arc/internal/compaction"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
@@ -54,6 +57,14 @@ var Version = "dev"
 // path the DB layer adds to allowed_directories, otherwise reads of
 // uploaded files fail with a permission error.
 const uploadSubdirName = "arc-uploads"
+
+// cacheInvalidateHMACTolerance is the freshness window for HMACs on the
+// cluster cache-invalidate fan-out. Matches the project-wide 5-minute
+// convention used by leader-forward, peer-fetch, and join HMACs (see
+// internal/cluster/coordinator.go). Shared between the NonceCache TTL and
+// the receiver-side ValidateCacheInvalidateHMAC call so a nonce expires
+// from the cache at the same instant its MAC would be rejected as stale.
+const cacheInvalidateHMACTolerance = 5 * time.Minute
 
 func main() {
 	// Check for subcommands before loading full config
@@ -1404,9 +1415,10 @@ func main() {
 		middlewareConfig := auth.DefaultMiddlewareConfig()
 		middlewareConfig.AuthManager = authManager
 		// Add public routes that don't need auth
-		// Note: /api/v1/internal/cache/invalidate is public because cluster peers call it
-		// without auth tokens after compaction. Access is gated by X-Arc-Internal header
-		// validation in the handler. Cluster nodes should be on a private network.
+		// Note: /api/v1/internal/cache/invalidate is public because cluster peers
+		// call it without an auth token after compaction. Access is gated by
+		// HMAC-SHA256 validation in the handler (see handleCacheInvalidate); the
+		// receiver refuses every request when cluster.shared_secret is empty.
 		middlewareConfig.PublicRoutes = append(middlewareConfig.PublicRoutes, "/health", "/ready", "/api/v1/auth/verify", "/api/v1/internal/cache/invalidate")
 		// /metrics stays public — Prometheus scrapers expect it. It is
 		// already in auth.DefaultMiddlewareConfig().PublicPrefixes, so no
@@ -1550,6 +1562,27 @@ func main() {
 		if gateEnabled {
 			log.Info().Msg("Query catch-up gate enabled — read endpoints will return 503 until the startup catch-up batch settles")
 		}
+
+		// Wire HMAC auth for the post-compaction cache-invalidate endpoint.
+		// Without a cluster shared secret the endpoint refuses everything;
+		// the only legitimate sender is a cluster peer doing post-compaction
+		// fan-out (see SetOnCompactionComplete below), which by definition
+		// needs the secret to compute the MAC. Tolerance matches the project
+		// default for HMAC freshness windows (see internal/cluster/security).
+		if cfg.Cluster.SharedSecret != "" {
+			localNode := clusterCoordinator.GetRegistry().Local()
+			if localNode != nil {
+				queryHandler.SetClusterAuth(
+					cfg.Cluster.SharedSecret,
+					cfg.Cluster.ClusterName,
+					localNode.ID,
+					security.NewNonceCache(cacheInvalidateHMACTolerance),
+					cacheInvalidateHMACTolerance,
+				)
+			} else {
+				log.Warn().Msg("cluster.shared_secret set but local node not in registry yet; cache-invalidate endpoint will refuse all requests until the next restart")
+			}
+		}
 	}
 
 	// Initialize Query Governance (Enterprise feature - requires valid license)
@@ -1635,6 +1668,11 @@ func main() {
 		// cached glob results (directory listings) pointing to deleted files, causing 404s.
 		// This callback clears all relevant caches in the parent process after each
 		// successful compaction job. See: https://github.com/Basekick-Labs/arc/issues/204
+		// Logged exactly once per process when cluster mode is up but
+		// cluster.shared_secret is empty — the per-compaction Warn would
+		// otherwise spam the log every compaction (hourly + daily).
+		var fanOutSkipLogOnce sync.Once
+
 		compactionManager.SetOnCompactionComplete(func() {
 			// Local invalidation
 			db.ClearHTTPCache()
@@ -1649,6 +1687,19 @@ func main() {
 					return
 				}
 
+				// Skip the HTTP fan-out entirely when no cluster shared
+				// secret is configured. The receiving end refuses every
+				// request in that state (see handleCacheInvalidate), so
+				// sending would be a waste. Wrapped in sync.Once so the
+				// operator sees the explanation exactly once at first
+				// compaction, not on every subsequent run.
+				if cfg.Cluster.SharedSecret == "" {
+					fanOutSkipLogOnce.Do(func() {
+						log.Warn().Msg("post-compaction cluster cache invalidation skipped: cluster.shared_secret is not configured; each node's local in-process invalidation already ran. Set cluster.shared_secret to enable fan-out.")
+					})
+					return
+				}
+
 				targets := registry.GetReaders()
 				targets = append(targets, registry.GetWriters()...)
 
@@ -1660,13 +1711,32 @@ func main() {
 						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 						defer cancel()
 
+						// Compute the HMAC once per request: a fresh nonce
+						// (32 random bytes, hex-encoded) binds the MAC to a
+						// single attempt; the timestamp binds it to a
+						// 5-minute freshness window. Receiver replay-checks
+						// (nonce, sender nodeID) against its NonceCache.
+						nonce, err := security.GenerateNonce()
+						if err != nil {
+							log.Warn().Err(err).Str("node_id", n.ID).Msg("Failed to generate nonce for cache invalidation")
+							return
+						}
+						ts := time.Now().Unix()
+						mac := security.ComputeCacheInvalidateHMAC(
+							cfg.Cluster.SharedSecret, nonce, localNode.ID, cfg.Cluster.ClusterName, ts,
+						)
+
 						url := fmt.Sprintf("http://%s/api/v1/internal/cache/invalidate", n.APIAddress)
 						req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
 						if err != nil {
 							log.Warn().Err(err).Str("node_id", n.ID).Msg("Failed to create cache invalidation request")
 							return
 						}
-						req.Header.Set("X-Arc-Internal", "cache-invalidate")
+						req.Header.Set("X-Arc-Node-ID", localNode.ID)
+						req.Header.Set("X-Arc-Cluster", cfg.Cluster.ClusterName)
+						req.Header.Set("X-Arc-Nonce", nonce)
+						req.Header.Set("X-Arc-Timestamp", strconv.FormatInt(ts, 10))
+						req.Header.Set("X-Arc-HMAC", mac)
 
 						resp, err := http.DefaultClient.Do(req)
 						if err != nil {
@@ -1674,9 +1744,9 @@ func main() {
 								Msg("Failed to invalidate cache on remote node")
 							return
 						}
-						io.Copy(io.Discard, resp.Body)
-						resp.Body.Close()
-						if resp.StatusCode != 204 {
+						defer resp.Body.Close()
+						_, _ = io.Copy(io.Discard, resp.Body)
+						if resp.StatusCode != http.StatusNoContent {
 							log.Warn().Int("status", resp.StatusCode).Str("node_id", n.ID).
 								Msg("Unexpected status from cache invalidation")
 						} else {

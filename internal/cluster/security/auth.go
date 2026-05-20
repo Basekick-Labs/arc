@@ -110,3 +110,42 @@ func ValidateForwardHMAC(sharedSecret, nonce, nodeID, clusterName string, payloa
 	}
 	return nil
 }
+
+// ComputeCacheInvalidateHMAC computes HMAC-SHA256 for the post-compaction
+// cluster cache-invalidation broadcast (POST /api/v1/internal/cache/invalidate).
+// The request body is empty by design — the only state the endpoint needs is
+// "clear your caches now" — so the signed material binds sender identity and
+// freshness rather than payload bytes. Format: nonce:nodeID:clusterName:timestamp
+//
+// Distinct label from Forward/Fetch/JoinHMAC so a leaked MAC for one endpoint
+// cannot be replayed against another, even within the freshness window.
+func ComputeCacheInvalidateHMAC(sharedSecret, nonce, nodeID, clusterName string, timestamp int64) string {
+	message := fmt.Sprintf("cache-invalidate:%s:%s:%s:%d", nonce, nodeID, clusterName, timestamp)
+	h := hmac.New(sha256.New, []byte(sharedSecret))
+	h.Write([]byte(message))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// ValidateCacheInvalidateHMAC validates a cache-invalidate HMAC and checks
+// freshness. The message format is intentionally label-distinct from
+// ComputeForwardHMAC / ComputeFetchHMAC / ComputeHMAC so cross-endpoint
+// replay is impossible even if a MAC leaks within the freshness window.
+func ValidateCacheInvalidateHMAC(sharedSecret, nonce, nodeID, clusterName string, timestamp int64, receivedMAC string, tolerance time.Duration) error {
+	now := time.Now().Unix()
+	drift := now - timestamp
+	if drift < 0 {
+		drift = -drift
+	}
+	if drift > int64(tolerance.Seconds()) {
+		// Symmetric: covers both stale (past) and future-dated drift.
+		// Existing tests still match on "timestamp expired" — do not
+		// rename without updating the test substring match.
+		return fmt.Errorf("cache-invalidate auth timestamp expired or out of tolerance (drift: %ds, tolerance: %ds)", drift, int64(tolerance.Seconds()))
+	}
+
+	expected := ComputeCacheInvalidateHMAC(sharedSecret, nonce, nodeID, clusterName, timestamp)
+	if !hmac.Equal([]byte(expected), []byte(receivedMAC)) {
+		return fmt.Errorf("cache-invalidate HMAC validation failed: shared secret mismatch")
+	}
+	return nil
+}

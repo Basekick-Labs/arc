@@ -64,6 +64,34 @@ With `/debug/pprof` removed from the public prefix list, items 1 and 2 are not c
 
 Tests added: `TestServer_PprofNotRegisteredOnPublicApp` (12 pprof paths against the public Fiber app, all must 404), `TestMiddleware_PublicPrefixes_AnchoredMatch` (10 subtests: exact match + trailing-slash match + true subdir + deep subdir bypass + 3 sibling-byte-prefix shapes that must require auth + 2 parent-traversal escape shapes that must require auth + empty-prefix guard), plus the new `cmd/arc/debug_pprof_test.go` (no-op when disabled, binds-and-serves when enabled, `isTruthy` env-var contract, `isLoopbackBindAddr` detection incl. fail-closed on unresolvable hosts).
 
+### `/api/v1/internal/cache/invalidate` now requires HMAC-SHA256 cluster auth
+
+Reported by [Alex Manson](https://neurowinter.com/) ([@NeuroWinter](https://github.com/NeuroWinter)) — closes audit finding #3.
+
+Pre-26.06.1 the post-compaction cluster cache-invalidate endpoint was gated by a static header (`X-Arc-Internal: cache-invalidate`). Any network-reachable caller — no token, no credentials — could spam the endpoint, forcing DuckDB's `cache_httpfs` glob results, metadata cache, and file-handle cache to repopulate. On S3-backed deployments this is a cost-amplification surface (`ListObjectsV2` calls multiply) and a latency-amplification surface (p99 spikes during repopulation). The static header carried no secret and was logged in the cluster fan-out code, so it offered no protection beyond raising the bar for someone reading network traces.
+
+26.06.1 replaces the static header with HMAC-SHA256 over `{nonce, sender nodeID, clusterName, timestamp}` keyed by the cluster shared secret (`cluster.shared_secret` in `arc.toml`). Five request headers carry the auth state:
+
+- `X-Arc-Node-ID` — sender's node ID, bound into the MAC.
+- `X-Arc-Cluster` — cluster name, bound into the MAC; receiver also checks it matches its own cluster name before HMAC computation (cluster A's MAC cannot be replayed against cluster B).
+- `X-Arc-Nonce` — 32 random bytes, hex-encoded.
+- `X-Arc-Timestamp` — unix seconds; ±5-minute freshness window matches the project's other HMAC endpoints.
+- `X-Arc-HMAC` — `hex(HMAC-SHA256(secret, "cache-invalidate:" + nonce + ":" + nodeID + ":" + clusterName + ":" + timestamp))`.
+
+The label prefix `cache-invalidate:` in the signed message is distinct from `ComputeForwardHMAC` (no prefix) / `ComputeFetchHMAC` (path-bound) / `ComputeHMAC` (no prefix). A leaked MAC for one endpoint can NOT be replayed against another even within the freshness window — verified by `TestCacheInvalidateHMAC_LabelBinding_NoCrossEndpointReplay`. Replay within the same endpoint is blocked by an in-process `NonceCache` (5-minute TTL, lazy eviction).
+
+Operator-facing changes:
+
+- **OSS deployments are unaffected.** Post-compaction cache invalidation in OSS happens in-process (`db.ClearHTTPCache()` + `queryHandler.InvalidateCaches()` are called directly from the compaction callback). No HTTP request is issued; no cluster-internal endpoint is touched. The `/api/v1/internal/cache/invalidate` route exists but refuses every request with 403 when `cluster.shared_secret` is unset.
+- **Cluster deployments without `cluster.shared_secret` configured**: the post-compaction fan-out is now SKIPPED instead of sending the static-header request that would have been refused anyway. The skip is logged once per process at the first post-compaction trigger (via `sync.Once`) so the message does not repeat per compaction. Set `cluster.shared_secret` to re-enable cross-node cache invalidation.
+- **Cluster deployments WITH `cluster.shared_secret` configured**: no change from the operator's side — every node already uses the same secret for leader-forwarding and peer-fetch HMACs; this endpoint now uses the same secret.
+- The receiver returns 403 (not 401) for every rejection path — missing headers, wrong secret, stale timestamp, future timestamp, self-addressed request, wrong cluster name, replay. Uniform rejection prevents an attacker from probing to distinguish "no secret configured" from "wrong MAC". Every rejection path emits a Debug log including the remote IP plus whatever non-secret context is known (cluster name, node ID, timestamp string); operators chasing a misconfiguration can flip `internal/api`'s logger to Debug. Debug-level on purpose: at Warn the endpoint would amplify a network flooder into a log-DoS.
+- A request claiming `X-Arc-Node-ID` equal to the receiver's own node ID is refused: local invalidation runs in-process, never over HTTP, so a self-addressed HTTP request is either a misconfiguration or a confused attacker.
+
+**Rolling upgrade.** During a rolling restart from 26.05.x → 26.06.1, cross-node cache invalidation is briefly disrupted in both directions: 26.05.x senders use the static `X-Arc-Internal` header that 26.06.1 receivers now reject, and 26.06.1 senders emit five HMAC headers that 26.05.x receivers never check. Practical impact is bounded by the duration of the rolling restart — for each affected reader, the worst case is one compaction cycle of stale `cache_httpfs` glob results, which surfaces as a brief uptick in 404s and p99 on that node until the next compaction (the in-process invalidation on each node still runs locally). Either ramp through the upgrade quickly or schedule it during a low-write window so compaction triggers are infrequent.
+
+Tests added: `TestComputeCacheInvalidateHMAC_Determinism` (pins the wire format + MAC reference value so a future refactor that breaks wire-compat fails CI), `TestValidateCacheInvalidateHMAC_{Valid, WrongSecret, StaleTimestamp, FutureTimestamp, FieldBinding}`, `TestCacheInvalidateHMAC_LabelBinding_NoCrossEndpointReplay` (cross-endpoint replay protection, now covers Forward + Fetch + Join in both directions), and 9 handler-level tests covering every rejection path plus the valid-auth proxy + replay-after-success.
+
 ## Bug fixes
 
 ### Parser no longer mis-resolves bare `time` column inside `EXTRACT(YEAR FROM time)`
