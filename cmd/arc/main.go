@@ -1419,7 +1419,7 @@ func main() {
 		// call it without an auth token after compaction. Access is gated by
 		// HMAC-SHA256 validation in the handler (see handleCacheInvalidate); the
 		// receiver refuses every request when cluster.shared_secret is empty.
-		middlewareConfig.PublicRoutes = append(middlewareConfig.PublicRoutes, "/health", "/ready", "/api/v1/auth/verify", "/api/v1/internal/cache/invalidate")
+		middlewareConfig.PublicRoutes = append(middlewareConfig.PublicRoutes, "/health", "/ready", "/api/v1/auth/verify", api.CacheInvalidatePath)
 		// /metrics stays public — Prometheus scrapers expect it. It is
 		// already in auth.DefaultMiddlewareConfig().PublicPrefixes, so no
 		// further append is needed here. /debug/pprof is intentionally NOT
@@ -1726,7 +1726,7 @@ func main() {
 							cfg.Cluster.SharedSecret, nonce, localNode.ID, cfg.Cluster.ClusterName, ts,
 						)
 
-						url := fmt.Sprintf("http://%s/api/v1/internal/cache/invalidate", n.APIAddress)
+						url := fmt.Sprintf("http://%s%s", n.APIAddress, api.CacheInvalidatePath)
 						req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
 						if err != nil {
 							log.Warn().Err(err).Str("node_id", n.ID).Msg("Failed to create cache invalidation request")

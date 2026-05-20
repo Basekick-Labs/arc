@@ -2,13 +2,23 @@ package security
 
 // NonceCache provides replay protection for HMAC-authenticated messages.
 // It tracks (nodeID:nonce) pairs and rejects duplicates within a configurable
-// time window. The cache uses lazy eviction on Track calls — expired entries
-// are cleaned up periodically without a background goroutine.
+// time window. The cache uses lazy eviction driven by Track calls — there
+// is no background goroutine, so expired entries linger until the next Track.
+// Memory is bounded by peak nonce-rate within the prior TTL window.
 
 import (
 	"sync"
 	"time"
 )
+
+// nonceCacheEvictInterval bounds how often lazy eviction runs from
+// inside Track(). The cache walks all entries under the mutex during
+// eviction; running on every call would be expensive under load, so
+// we amortize over this window. Eviction is *only* driven by Track
+// calls — if no traffic arrives, expired entries linger until the
+// next Track (memory cost is bounded by peak nonce-rate within the
+// prior TTL window, so it bleeds off naturally on the next burst).
+const nonceCacheEvictInterval = 60 * time.Second
 
 // NonceCache tracks recently seen nonces to prevent replay attacks.
 // Safe for concurrent use from multiple goroutines.
@@ -17,9 +27,9 @@ type NonceCache struct {
 	entries map[string]int64 // key: "nodeID:nonce", value: expiry unix nanos
 	ttl     time.Duration
 
-	// evictInterval controls how often lazy eviction runs. We don't evict
-	// on every Track call (too expensive under load) — only when this
-	// many seconds have passed since the last eviction.
+	// lastEvict is the wall-clock time of the last full sweep. Track()
+	// runs evictExpiredLocked when more than nonceCacheEvictInterval
+	// has passed since this value.
 	lastEvict time.Time
 }
 
@@ -57,8 +67,10 @@ func (nc *NonceCache) Track(nodeID, nonce string) bool {
 
 	nc.entries[key] = expiry
 
-	// Lazy eviction: clean up expired entries every 60 seconds.
-	if now.Sub(nc.lastEvict) > 60*time.Second {
+	// Lazy eviction: clean up expired entries at most every
+	// nonceCacheEvictInterval (gated to keep Track's hot path O(1)
+	// amortized; the occasional sweep is O(N) under the mutex).
+	if now.Sub(nc.lastEvict) > nonceCacheEvictInterval {
 		nc.evictExpiredLocked(now)
 		nc.lastEvict = now
 	}

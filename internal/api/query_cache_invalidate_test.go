@@ -101,12 +101,14 @@ func TestCacheInvalidate_NoSharedSecret_AlwaysRefuses(t *testing.T) {
 }
 
 // TestCacheInvalidate_ValidAuth_ReachesDB is the positive-path proxy:
-// when auth passes, the handler reaches into h.db which is nil here, so
-// Fiber's recover middleware turns the resulting panic into a 500. The
-// test asserts NOT-403, confirming the rejection branches did NOT fire
-// — meaning the HMAC validated and the request "would have" succeeded
-// against a real db. This is the only way to prove the positive path
-// from inside this package without spinning up a real DuckDB.
+// when auth passes, the handler reaches into h.db.ClearHTTPCache() which
+// panics on nil-db; Fiber's recover middleware catches the panic and
+// returns 500. We assert exactly 500 so the test fails loudly if a
+// future refactor makes ClearHTTPCache nil-safe or moves the call past
+// an early-return — in which case this test would silently pass for the
+// wrong reason ("no 403" without actually exercising the success path).
+// Asserting the concrete 500 pins the post-auth code flow to the panic
+// site, giving the test something specific to break against.
 func TestCacheInvalidate_ValidAuth_ReachesDB(t *testing.T) {
 	t.Parallel()
 	const secret = "test-shared-secret"
@@ -120,11 +122,9 @@ func TestCacheInvalidate_ValidAuth_ReachesDB(t *testing.T) {
 
 	headers := validHeaders(t, secret, peerNodeID, clusterName)
 	got := sendInvalidate(t, app, headers)
-	if got == fiber.StatusForbidden {
-		t.Errorf("valid HMAC was rejected as 403 — auth flow is broken")
+	if got != fiber.StatusInternalServerError {
+		t.Errorf("expected 500 (recover-from-nil-db-panic on valid auth), got %d", got)
 	}
-	// We don't assert the specific non-403 code; what we care about is
-	// that the rejection paths did NOT fire on a valid request.
 }
 
 // TestCacheInvalidate_MissingHeaders covers the early-return guards
@@ -149,7 +149,6 @@ func TestCacheInvalidate_MissingHeaders(t *testing.T) {
 		{"missing X-Arc-HMAC", "X-Arc-HMAC"},
 	}
 	for _, c := range cases {
-		c := c
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			app := cacheInvalidateTestSetup(t, func(h *QueryHandler) {
@@ -281,10 +280,12 @@ func TestCacheInvalidate_NonNumericTimestamp(t *testing.T) {
 // TestCacheInvalidate_Replay pins the nonce-cache check: a valid request
 // that succeeds once must fail when replayed within the TTL window.
 //
-// Trick: the FIRST send hits the nil-db crash path (200-status doesn't
-// matter, what matters is the nonce got tracked). The SECOND send with
-// the same headers must hit the replay path (403) without ever reaching
-// the db. The test asserts: first send is NOT 403; second send IS 403.
+// Trick: the FIRST send passes auth, reaches the nil-db panic site, and
+// Fiber's recover middleware turns that into a 500 (the nonce is tracked
+// regardless of the post-auth panic). The SECOND send with the same
+// headers must hit the replay path (403) without ever reaching the db.
+// We assert: first send is 500 (exact, pins the nonce-tracked code-flow
+// past auth), second send is 403 (replay reject).
 func TestCacheInvalidate_Replay(t *testing.T) {
 	t.Parallel()
 	const secret = "secret"
@@ -301,11 +302,59 @@ func TestCacheInvalidate_Replay(t *testing.T) {
 
 	headers := validHeaders(t, secret, peerNodeID, clusterName)
 	first := sendInvalidate(t, app, headers)
-	if first == fiber.StatusForbidden {
-		t.Fatalf("first request was 403, meaning auth itself failed — replay can't be tested. Auth setup is broken.")
+	if first != fiber.StatusInternalServerError {
+		t.Fatalf("first request: expected 500 (auth passed, hit nil-db panic), got %d — auth setup may be broken", first)
 	}
 	second := sendInvalidate(t, app, headers)
 	if second != fiber.StatusForbidden {
 		t.Errorf("replay of valid request was accepted (got %d) — nonce cache is not preventing replay", second)
+	}
+}
+
+// TestCacheInvalidate_NonceNotBurnedByBadMAC pins the ordering invariant
+// in handleCacheInvalidate: the nonce-cache Track() runs AFTER HMAC
+// validation, so a flood of bad-MAC requests cannot consume cache
+// entries for a nonce that a legitimate peer might later use. A future
+// refactor that swaps the order would let an off-path attacker (no
+// secret) deny service by burning nonces a real peer is about to
+// present.
+//
+// Shape: send N requests with the SAME nonce but a bad MAC — each must
+// 403 at the HMAC stage without tracking the nonce. Then send ONE
+// request with the same nonce but a valid MAC — must reach the success
+// path (500 here, recovered from nil-db panic). If the order were
+// inverted, the bad-MAC requests would Track the nonce first and the
+// valid request would 403 as a replay.
+func TestCacheInvalidate_NonceNotBurnedByBadMAC(t *testing.T) {
+	t.Parallel()
+	const secret = "secret"
+	const clusterName = "cluster-A"
+	const localNodeID = "local-node"
+	const peerNodeID = "peer-1"
+
+	cache := security.NewNonceCache(5 * time.Minute)
+	app := cacheInvalidateTestSetup(t, func(h *QueryHandler) {
+		h.SetClusterAuth(secret, clusterName, localNodeID, cache, 5*time.Minute)
+	})
+
+	// Build a valid header set, then keep the nonce/timestamp but
+	// corrupt the MAC. Send several bad-MAC requests with the SAME nonce.
+	headers := validHeaders(t, secret, peerNodeID, clusterName)
+	originalMAC := headers["X-Arc-HMAC"]
+	headers["X-Arc-HMAC"] = "deadbeef" + originalMAC[8:] // wrong bytes, same length shape
+
+	const badAttempts = 5
+	for i := 0; i < badAttempts; i++ {
+		if got := sendInvalidate(t, app, headers); got != fiber.StatusForbidden {
+			t.Fatalf("bad-MAC attempt %d returned %d, expected 403", i, got)
+		}
+	}
+
+	// Restore the valid MAC and send the request — the nonce must NOT
+	// have been tracked by the bad-MAC attempts above, so this is a
+	// fresh-nonce success path (not a replay).
+	headers["X-Arc-HMAC"] = originalMAC
+	if got := sendInvalidate(t, app, headers); got != fiber.StatusInternalServerError {
+		t.Errorf("valid-MAC request after bad-MAC flood returned %d, expected 500 (nonce was burned by bad-MAC attacker — ordering bug)", got)
 	}
 }

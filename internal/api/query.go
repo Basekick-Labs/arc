@@ -959,12 +959,25 @@ func (h *QueryHandler) SetQueryRegistry(registry *queryregistry.Registry) {
 // the HMAC timestamp tolerance; 5 minutes is the project-wide convention
 // (matches the peer-fetch / leader-forward defaults).
 //
-// Callers MUST pass a positive tolerance: a zero or negative tolerance
-// would reject every well-formed request (the symmetric drift check in
-// ValidateCacheInvalidateHMAC compares against `int64(tolerance.Seconds())`).
+// Callers MUST pass a positive tolerance and a non-nil nonceCache:
+//   - A zero/negative tolerance would reject every well-formed request
+//     (the symmetric drift check in ValidateCacheInvalidateHMAC compares
+//     against `int64(tolerance.Seconds())`).
+//   - A nil nonceCache would silently skip replay protection (see the
+//     `if h.clusterNonceCache != nil` guard in handleCacheInvalidate).
+//
 // Callers MUST also invoke this before the HTTP server starts accepting
 // traffic; the QueryHandler reads these fields without a mutex.
+//
+// The guards below fail fast at startup so a misconfigured caller is
+// loudly broken instead of producing a silently-half-armed endpoint.
 func (h *QueryHandler) SetClusterAuth(sharedSecret, clusterName, localNodeID string, nonceCache *security.NonceCache, tolerance time.Duration) {
+	if tolerance <= 0 {
+		panic(fmt.Sprintf("QueryHandler.SetClusterAuth: tolerance must be positive, got %v", tolerance))
+	}
+	if nonceCache == nil {
+		panic("QueryHandler.SetClusterAuth: nonceCache must be non-nil (replay protection cannot be disabled)")
+	}
 	h.clusterSharedSecret = sharedSecret
 	h.clusterName = clusterName
 	h.clusterLocalNodeID = localNodeID
@@ -1214,8 +1227,15 @@ func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 	// readers. Deliberately NOT gated by checkReplicationReady — peer nodes need
 	// to invalidate caches while we're catching up, and rejecting these calls
 	// would break the cache-invalidation protocol exactly when it matters most.
-	app.Post("/api/v1/internal/cache/invalidate", h.handleCacheInvalidate)
+	app.Post(CacheInvalidatePath, h.handleCacheInvalidate)
 }
+
+// CacheInvalidatePath is the single source of truth for the
+// /api/v1/internal/cache/invalidate route. The receiver registers it
+// above; the cluster post-compaction sender in cmd/arc/main.go and the
+// auth middleware's PublicRoutes config both reference this constant
+// so a future typo cannot silently break fan-out.
+const CacheInvalidatePath = "/api/v1/internal/cache/invalidate"
 
 // handleCacheInvalidate handles POST /api/v1/internal/cache/invalidate.
 //
@@ -1309,8 +1329,11 @@ func (h *QueryHandler) handleCacheInvalidate(c *fiber.Ctx) error {
 	}
 
 	// Replay check AFTER HMAC validation: don't burn a nonce-cache entry
-	// on an attacker who can't even produce a valid MAC.
-	if h.clusterNonceCache != nil && !h.clusterNonceCache.Track(nodeID, nonce) {
+	// on an attacker who can't even produce a valid MAC. The cache is
+	// guaranteed non-nil here because SetClusterAuth panics on nil at
+	// wiring time, and the empty-secret branch above short-circuits
+	// requests that arrive before SetClusterAuth has run.
+	if !h.clusterNonceCache.Track(nodeID, nonce) {
 		h.logger.Debug().Str("remote_ip", c.IP()).Str("node_id", nodeID).
 			Msg("cache-invalidate rejected: replay (nonce already seen)")
 		return c.SendStatus(fiber.StatusForbidden)

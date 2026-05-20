@@ -166,6 +166,7 @@ func TestValidateCacheInvalidateHMAC_FieldBinding(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
 			err := ValidateCacheInvalidateHMAC("secret", c.nonce, c.nodeID, c.cluster, ts, mac, 5*time.Minute)
 			if err == nil {
 				t.Errorf("%s: tampered input accepted", c.name)
