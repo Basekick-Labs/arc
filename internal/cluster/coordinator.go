@@ -374,19 +374,26 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	return c, nil
 }
 
-// ClusterTLSConfig returns the *tls.Config loaded from cluster.tls_*
-// during coordinator construction, or nil when cluster.tls_enabled is
-// false. Callers that need to build additional cluster-internal HTTP
-// or TCP clients (e.g. the post-compaction cache-invalidate fan-out
-// wired in cmd/arc/main.go) can reuse this config rather than calling
-// security.ClusterTLSConfig again — which would re-read cert/key/CA
-// from disk and re-emit the "certificate expires in N days" warning.
+// ClusterTLSConfig returns a clone of the *tls.Config loaded from
+// cluster.tls_* during coordinator construction, or nil when
+// cluster.tls_enabled is false. Callers that need to build additional
+// cluster-internal HTTP or TCP clients (e.g. the post-compaction
+// cache-invalidate fan-out wired in cmd/arc/main.go) can reuse this
+// config rather than calling security.ClusterTLSConfig again — which
+// would re-read cert/key/CA from disk and re-emit the "certificate
+// expires in N days" warning.
 //
-// The returned pointer must be treated as read-only; net/http and
-// crypto/tls clone defensively before mutating, but a caller that
-// reaches in and mutates fields would corrupt every other consumer.
+// We Clone() on the way out so a misbehaving caller that mutates the
+// returned struct cannot corrupt the coordinator's internal state.
+// Clone is shallow: RootCAs, Certificates, and ClientSessionCache are
+// shared via pointer, so session resumption still works across every
+// consumer of this config. Per-call clone cost is negligible because
+// the function is invoked once at startup wiring time.
 func (c *Coordinator) ClusterTLSConfig() *tls.Config {
-	return c.tlsConfig
+	if c.tlsConfig == nil {
+		return nil
+	}
+	return c.tlsConfig.Clone()
 }
 
 // Start starts the cluster coordinator.
