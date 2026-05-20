@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 	"unicode"
 
@@ -342,15 +343,23 @@ func main() {
 	// allowlist. TempDirectory and CompactionTempDirectory are also added
 	// verbatim to allowed_directories, so a typo there would grant the same
 	// kind of broad access as a misconfigured LocalStorageRoot.
-	deniedRoots := map[string]bool{
-		"/": true, "/etc": true, "/etc/": true, "/usr": true, "/usr/": true,
-		"/bin": true, "/bin/": true, "/sbin": true, "/sbin/": true,
-		"/boot": true, "/boot/": true, "/proc": true, "/proc/": true,
-		"/sys": true, "/sys/": true, "/dev": true, "/dev/": true,
-		"/tmp": true, "/tmp/": true, "/var": true, "/var/": true,
-		"/var/tmp": true, "/var/tmp/": true,
-		"/home": true, "/home/": true, "/root": true, "/root/": true,
-		"/Users": true, "/Users/": true,
+	//
+	// Prefix-match (not exact-match) so a configured path like
+	// "/etc/arc-data" is rejected too — its allowlist entry would be
+	// "/etc/arc-data/" which is still inside /etc and would let any reader
+	// drop a file under /etc/arc-data to be exfiltrated through Arc. Same
+	// reasoning for /root/.ssh, /proc/<pid>/, /sys/class/, etc.
+	deniedRoots := []string{
+		"/etc", "/usr", "/bin", "/sbin", "/boot",
+		"/proc", "/sys", "/dev",
+		"/root",
+	}
+	// pathStartsWithRoot returns true when `path` is exactly `root`, is
+	// `root` with a trailing slash, or has `root + "/"` as a prefix.
+	// Anchored so "/etcd-data" is NOT matched by "/etc" — only true
+	// subdirectories or the bare directory itself.
+	pathStartsWithRoot := func(path, root string) bool {
+		return path == root || path == root+"/" || strings.HasPrefix(path, root+"/")
 	}
 	for _, pair := range []struct {
 		name, value string
@@ -359,8 +368,17 @@ func main() {
 		{"database.temp_directory", dbConfig.TempDirectory},
 		{"compaction.temp_directory", dbConfig.CompactionTempDirectory},
 	} {
-		if pair.value != "" && deniedRoots[pair.value] {
-			log.Fatal().Str("setting", pair.name).Str("path", pair.value).Msg("Configured path refuses to start with a system root, shared-tmp, or user-home root; pick a dedicated data directory")
+		if pair.value == "" {
+			continue
+		}
+		// Reject the root filesystem outright — never legitimate.
+		if pair.value == "/" {
+			log.Fatal().Str("setting", pair.name).Str("path", pair.value).Msg("Configured path refuses to be the filesystem root; pick a dedicated data directory")
+		}
+		for _, root := range deniedRoots {
+			if pathStartsWithRoot(pair.value, root) {
+				log.Fatal().Str("setting", pair.name).Str("path", pair.value).Str("denied_root", root).Msg("Configured path is inside a system root; pick a dedicated data directory")
+			}
 		}
 	}
 
