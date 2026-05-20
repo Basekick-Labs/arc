@@ -658,6 +658,16 @@ func (f *ClusterFSM) applyUpdateFileStruct(p UpdateFilePayload, logIndex uint64)
 	if err := ValidateManifestPath(p.File.Path); err != nil {
 		return f.rejectManifestPath("update", p.File.Path, logIndex, err)
 	}
+	if p.File.CreatedAt.IsZero() {
+		// Same reasoning as applyRegisterFileStruct: the caller is
+		// responsible for setting CreatedAt before appending to Raft.
+		// Apply MUST NOT stamp it from time.Now() because that would
+		// be non-deterministic across nodes during log replay. An
+		// Update payload with a zero CreatedAt is a caller bug — it
+		// would clobber the original entry's creation timestamp with
+		// the JSON zero value.
+		return fmt.Errorf("update file: created_at is required")
+	}
 
 	// Stamp the LSN from the current Raft log index so consumers that
 	// watch f.files for "did this entry change" can detect the update.
@@ -777,6 +787,12 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 					Msg("manifest path validation failed during batch pre-check — entire batch refused")
 				return fmt.Errorf("batch file ops: op[%d]: %w", i, err)
 			}
+			// Mirror applyRegisterFileStruct's CreatedAt requirement
+			// in the pre-pass so a batch that would fail mid-apply on
+			// this check is refused atomically up front.
+			if rp.File.CreatedAt.IsZero() {
+				return fmt.Errorf("batch file ops: op[%d]: register file: created_at is required", i)
+			}
 			decoded[i] = rp
 		case CommandUpdateFile:
 			var up UpdateFilePayload
@@ -793,6 +809,10 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 					Int("batch_index", i).
 					Msg("manifest path validation failed during batch pre-check — entire batch refused")
 				return fmt.Errorf("batch file ops: op[%d]: %w", i, err)
+			}
+			// Mirror applyUpdateFileStruct's CreatedAt requirement.
+			if up.File.CreatedAt.IsZero() {
+				return fmt.Errorf("batch file ops: op[%d]: update file: created_at is required", i)
 			}
 			decoded[i] = up
 		case CommandDeleteFile:

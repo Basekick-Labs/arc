@@ -1124,3 +1124,119 @@ func TestApplyBatchFileOps_RejectsMaliciousPath_AtomicPrevalidation(t *testing.T
 		t.Errorf("expected RejectedPathsCount=1 (one malicious op), got %d", c)
 	}
 }
+
+// TestApplyBatchFileOps_RejectsZeroCreatedAt_AtomicPrevalidation pins
+// that the batch pre-validation pass mirrors applyRegisterFileStruct's
+// CreatedAt requirement. Without this, a batch containing a legit op
+// followed by an op with zero CreatedAt would pass path-validation
+// pre-pass → the legit op would land in f.files → the second op
+// would fail mid-apply → batch atomicity violated. Gemini #446-r2.
+func TestApplyBatchFileOps_RejectsZeroCreatedAt_AtomicPrevalidation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("register with zero CreatedAt", func(t *testing.T) {
+		t.Parallel()
+		fsm := newTestFSM()
+
+		legitFile := makeFileEntry("db/cpu/2026/05/20/15/legit.parquet", "db", "cpu", 100)
+		// CreatedAt deliberately left zero.
+		badFile := FileEntry{
+			Path:         "db/cpu/2026/05/20/15/bad.parquet",
+			Database:     "db",
+			Measurement:  "cpu",
+			SizeBytes:    100,
+			OriginNodeID: "writer-1",
+			Tier:         "hot",
+		}
+
+		legitPayload, _ := json.Marshal(RegisterFilePayload{File: legitFile})
+		badPayload, _ := json.Marshal(RegisterFilePayload{File: badFile})
+
+		batchData := makeCommand(t, CommandBatchFileOps, BatchFileOpsPayload{
+			Ops: []BatchFileOp{
+				{Type: CommandRegisterFile, Payload: legitPayload},
+				{Type: CommandRegisterFile, Payload: badPayload},
+			},
+		})
+		result := fsm.Apply(&raft.Log{Index: 1, Data: batchData})
+		if result == nil {
+			t.Fatal("batch with zero-CreatedAt op should error")
+		}
+		if _, ok := result.(error); !ok {
+			t.Fatalf("expected error result, got %T", result)
+		}
+		// Atomic: legit op preceding bad op MUST NOT land.
+		if fsm.FileCount() != 0 {
+			t.Errorf("batch atomicity violated: f.files has %d entries (expected 0)", fsm.FileCount())
+		}
+	})
+
+	t.Run("update with zero CreatedAt", func(t *testing.T) {
+		t.Parallel()
+		fsm := newTestFSM()
+
+		// Pre-register an entry so the update has something to mutate.
+		preReg := makeFileEntry("db/cpu/2026/05/20/15/pre.parquet", "db", "cpu", 100)
+		fsm.Apply(&raft.Log{Index: 1, Data: makeCommand(t, CommandRegisterFile, RegisterFilePayload{File: preReg})})
+
+		legitUpd := preReg
+		legitUpd.SizeBytes = 999
+		badUpd := FileEntry{
+			Path:         "db/cpu/2026/05/20/15/other.parquet",
+			Database:     "db",
+			Measurement:  "cpu",
+			SizeBytes:    200,
+			OriginNodeID: "writer-1",
+			Tier:         "hot",
+			// CreatedAt zero.
+		}
+
+		legitPayload, _ := json.Marshal(UpdateFilePayload{File: legitUpd})
+		badPayload, _ := json.Marshal(UpdateFilePayload{File: badUpd})
+
+		batchData := makeCommand(t, CommandBatchFileOps, BatchFileOpsPayload{
+			Ops: []BatchFileOp{
+				{Type: CommandUpdateFile, Payload: legitPayload},
+				{Type: CommandUpdateFile, Payload: badPayload},
+			},
+		})
+		result := fsm.Apply(&raft.Log{Index: 2, Data: batchData})
+		if result == nil {
+			t.Fatal("batch with zero-CreatedAt update should error")
+		}
+		// Pre-existing entry must keep its original SizeBytes — the
+		// legit update preceding the bad one MUST NOT have landed.
+		got, _ := fsm.GetFile(preReg.Path)
+		if got.SizeBytes != 100 {
+			t.Errorf("batch atomicity violated: legit update landed (SizeBytes=%d, want pre-batch value 100)", got.SizeBytes)
+		}
+	})
+}
+
+// TestApplyUpdateFile_RejectsZeroCreatedAt pins the standalone (non-batch)
+// path's CreatedAt requirement on Update. Gemini #446-r2.
+func TestApplyUpdateFile_RejectsZeroCreatedAt(t *testing.T) {
+	t.Parallel()
+	fsm := newTestFSM()
+
+	bad := FileEntry{
+		Path:         "db/cpu/2026/05/20/15/file.parquet",
+		Database:     "db",
+		Measurement:  "cpu",
+		SizeBytes:    100,
+		OriginNodeID: "writer-1",
+		Tier:         "hot",
+		// CreatedAt zero.
+	}
+	data := makeCommand(t, CommandUpdateFile, UpdateFilePayload{File: bad})
+	result := fsm.Apply(&raft.Log{Index: 1, Data: data})
+	if result == nil {
+		t.Fatal("update with zero CreatedAt should error")
+	}
+	if _, ok := result.(error); !ok {
+		t.Fatalf("expected error result, got %T", result)
+	}
+	if fsm.FileCount() != 0 {
+		t.Errorf("zero-CreatedAt update should not land in files (count=%d)", fsm.FileCount())
+	}
+}
