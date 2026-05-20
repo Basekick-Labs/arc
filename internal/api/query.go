@@ -1167,24 +1167,11 @@ func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 	app.Get("/api/v1/query/:measurement", h.checkReplicationReady, h.queryMeasurement)
 	h.registerArrowRoutes(app)
 
-	// Internal endpoint for distributed cache invalidation (enterprise clustering).
-	// Called by compactor/writer nodes after compaction to clear stale caches on
-	// readers. Deliberately NOT gated by checkReplicationReady — peer nodes need
-	// to invalidate caches while we're catching up, and rejecting these calls
-	// would break the cache-invalidation protocol exactly when it matters most.
-	app.Post("/api/v1/internal/cache/invalidate", h.handleCacheInvalidate)
-}
-
-// handleCacheInvalidate handles POST /api/v1/internal/cache/invalidate
-// This is an internal endpoint called by cluster peers after compaction
-// to clear stale glob results and partition metadata from DuckDB caches.
-func (h *QueryHandler) handleCacheInvalidate(c *fiber.Ctx) error {
-	if c.Get("X-Arc-Internal") != "cache-invalidate" {
-		return c.SendStatus(fiber.StatusForbidden)
-	}
-	h.db.ClearHTTPCache()
-	h.InvalidateCaches()
-	return c.SendStatus(fiber.StatusNoContent)
+	// The distributed cache-invalidate endpoint
+	// (POST CacheInvalidatePath) is wired separately in cmd/arc/main.go,
+	// conditionally on cluster.shared_secret being configured. It lives
+	// in its own file (cache_invalidate.go) because its auth model is
+	// HMAC-only, distinct from the user-token auth applied here.
 }
 
 // executeQueryMsgPack handles POST /api/v1/query/msgpack. It is a thin
