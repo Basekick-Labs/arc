@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/rs/zerolog"
 )
 
@@ -64,6 +66,20 @@ type RouterConfig struct {
 
 	// Logger for routing events
 	Logger zerolog.Logger
+
+	// Transport is the http.Transport to use for forwarded requests.
+	// When nil, NewRouter builds a default plain-HTTP transport
+	// (back-compat). Callers that run with server.tls_enabled OR
+	// cluster.tls_enabled MUST pass a TLS-aware transport built via
+	// security.ClusterHTTPTransport; otherwise inter-node forwarding
+	// fails the TLS handshake at every peer.
+	Transport *http.Transport
+
+	// Scheme is "http" or "https" — must match what the receiving
+	// peer's Fiber listener serves (driven by server.tls_enabled,
+	// identical on every cluster node). When empty, defaults to
+	// "http" (back-compat).
+	Scheme string
 }
 
 // Router routes requests to appropriate nodes in the cluster.
@@ -92,16 +108,24 @@ func NewRouter(cfg *RouterConfig) *Router {
 	if cfg.Strategy == "" {
 		cfg.Strategy = LoadBalanceRoundRobin
 	}
+	if cfg.Scheme == "" {
+		cfg.Scheme = "http"
+	}
+
+	transport := cfg.Transport
+	if transport == nil {
+		// Back-compat: tests and callers that don't pre-build a TLS
+		// transport get the default plaintext one. Going through
+		// NewClusterHTTPTransport keeps the pool defaults in one
+		// place (see clusterHTTP* constants in security/tls.go).
+		transport = security.NewClusterHTTPTransport(nil)
+	}
 
 	r := &Router{
 		cfg: cfg,
 		httpClient: &http.Client{
-			Timeout: cfg.Timeout,
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     90 * time.Second,
-			},
+			Timeout:   cfg.Timeout,
+			Transport: transport,
 		},
 		logger:      cfg.Logger.With().Str("component", "cluster-router").Logger(),
 		activeConns: make(map[string]*atomic.Int64),
@@ -250,11 +274,22 @@ func (r *Router) doForward(ctx context.Context, node *Node, originalReq *http.Re
 	r.incrementConns(node.ID)
 	defer r.decrementConns(node.ID)
 
-	// Build target URL
-	targetURL := fmt.Sprintf("http://%s%s", node.APIAddress, originalReq.URL.Path)
-	if originalReq.URL.RawQuery != "" {
-		targetURL += "?" + originalReq.URL.RawQuery
-	}
+	// Build target URL via *url.URL so an IPv6 literal in
+	// node.APIAddress (e.g. "[::1]:8000") survives unmangled. We don't
+	// rely on the upstream contract that ListenAddr always brackets
+	// IPv6 — using url.URL is correct by construction and the one
+	// allocation per request is dwarfed by the network round-trip.
+	// RawPath carries the original on-the-wire encoding (RawPath !=
+	// "" only when the path required escaping); Path is the decoded
+	// form. url.URL.String() prefers RawPath when set, so paths
+	// containing spaces or non-ASCII bytes are forwarded intact.
+	targetURL := (&url.URL{
+		Scheme:   r.cfg.Scheme,
+		Host:     node.APIAddress,
+		Path:     originalReq.URL.Path,
+		RawPath:  originalReq.URL.RawPath,
+		RawQuery: originalReq.URL.RawQuery,
+	}).String()
 
 	// Read and buffer the body so it can be retried
 	var bodyBytes []byte

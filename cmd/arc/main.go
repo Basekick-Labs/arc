@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1185,6 +1186,11 @@ func main() {
 					Version:       Version,
 					APIAddress:    apiAddr,
 					Logger:        logger.Get("cluster"),
+					// Mirror the Fiber listener's TLS posture so the
+					// internal request Router uses https:// when peers
+					// serve TLS. All cluster nodes are expected to be
+					// configured identically.
+					ServerTLSEnabled: cfg.Server.TLSEnabled,
 					// Phase 4: surface the "no compactor elected" and
 					// "multiple compactors elected" warnings only when
 					// this deployment actually needs a compactor (cluster
@@ -1681,6 +1687,32 @@ func main() {
 		// otherwise spam the log every compaction (hourly + daily).
 		var fanOutSkipLogOnce sync.Once
 
+		// Build a single shared *http.Client for the cache-invalidate
+		// fan-out so connection pooling actually reuses sockets across
+		// compactions. Only constructed when cluster mode is on —
+		// compaction itself works in OSS/standalone, but the fan-out
+		// path is cluster-only (the per-call `if clusterCoordinator
+		// != nil` guard inside the callback is what actually decides
+		// whether to send). We reuse the coordinator's already-loaded
+		// *tls.Config rather than re-reading cert/key/CA from disk;
+		// when cluster.tls_enabled is false the getter returns nil
+		// and the transport falls back to plaintext (or system roots
+		// if the URL is https://). No Client.Timeout: the per-request
+		// context.WithTimeout below is the policy bound; an extra
+		// Client.Timeout would be redundant dead config.
+		var clusterHTTPClient *http.Client
+		var clusterScheme string
+		if clusterCoordinator != nil {
+			clusterHTTPClient = &http.Client{
+				Transport: security.NewClusterHTTPTransport(clusterCoordinator.ClusterTLSConfig()),
+			}
+			clusterScheme = security.SchemeForServer(cfg.Server.TLSEnabled)
+			log.Info().
+				Str("scheme", clusterScheme).
+				Bool("cluster_tls", cfg.Cluster.TLSEnabled).
+				Msg("Post-compaction cache-invalidate fan-out transport initialised")
+		}
+
 		compactionManager.SetOnCompactionComplete(func() {
 			// Local invalidation
 			db.ClearHTTPCache()
@@ -1734,8 +1766,16 @@ func main() {
 							cfg.Cluster.SharedSecret, nonce, localNode.ID, cfg.Cluster.ClusterName, ts,
 						)
 
-						url := fmt.Sprintf("http://%s%s", n.APIAddress, api.CacheInvalidatePath)
-						req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+						// Build via *url.URL so an IPv6 literal in
+						// n.APIAddress (e.g. "[::1]:8000") survives
+						// unmangled. CacheInvalidatePath is a known-safe
+						// constant path, so we don't need to escape it.
+						peerURL := (&url.URL{
+							Scheme: clusterScheme,
+							Host:   n.APIAddress,
+							Path:   api.CacheInvalidatePath,
+						}).String()
+						req, err := http.NewRequestWithContext(ctx, http.MethodPost, peerURL, nil)
 						if err != nil {
 							log.Warn().Err(err).Str("node_id", n.ID).Msg("Failed to create cache invalidation request")
 							return
@@ -1746,7 +1786,7 @@ func main() {
 						req.Header.Set("X-Arc-Timestamp", strconv.FormatInt(ts, 10))
 						req.Header.Set("X-Arc-HMAC", mac)
 
-						resp, err := http.DefaultClient.Do(req)
+						resp, err := clusterHTTPClient.Do(req)
 						if err != nil {
 							log.Warn().Err(err).Str("node_id", n.ID).Str("address", n.APIAddress).
 								Msg("Failed to invalidate cache on remote node")

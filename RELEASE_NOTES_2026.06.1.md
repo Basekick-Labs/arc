@@ -335,6 +335,33 @@ INF Starting Arc server component=api-server host=127.0.0.1 port=8000 tls_enable
 
 Operators currently relying on the `systemd` `IPAddressDeny` workaround can keep it — `ss -ltnp` will now show the bind address Arc actually opened, but the systemd filter remains valid defense-in-depth.
 
+### Inter-node HTTP traffic now respects `server.tls_enabled`
+
+Before this release, two **wired** inter-node HTTP call sites silently hardcoded `http://`:
+
+- The post-compaction cache-invalidate fan-out (introduced in PR #444 — same release).
+- `internal/cluster/router.go` leader-forwarding (long-standing).
+
+(`internal/cluster/sharding/router.go` has the same shape but no production caller today; it will be addressed when the sharding path is wired in.)
+
+When an operator ran Arc in cluster mode with `server.tls_enabled = true`, every peer's Fiber listener served HTTPS — and these senders dialed plaintext, failing the TLS handshake with no useful error. Cluster fan-out and leader-forwarding were both effectively broken in that configuration.
+
+26.06.1 adds two helpers in `internal/cluster/security/tls.go`:
+
+- `NewClusterHTTPTransport(*tls.Config) *http.Transport` — returns a transport with the supplied `*tls.Config` (cloned) on its `TLSClientConfig`, and the historical pool defaults (`MaxIdleConns=100`, `MaxIdleConnsPerHost=10`, `IdleConnTimeout=90s`) extracted to shared constants. Passing nil yields a plaintext transport.
+- `SchemeForServer(serverTLSEnabled bool) string` — returns `"http"` or `"https"` based on the operator's `server.tls_enabled`. All cluster nodes are expected to be configured identically (heterogeneous clusters are unsupported).
+
+The cluster `Coordinator` now loads cluster TLS once at construction and exposes it via `Coordinator.ClusterTLSConfig()`. The request router and the cache-invalidate fan-out both consume that single `*tls.Config`, so cert/key/CA are read from disk once at startup (the previous shape would have re-read them per consumer and re-emitted the "certificate expires in N days" warning multiple times).
+
+Two new coordinator-startup Warns surface common misconfigurations:
+
+- **`server.tls_enabled=true` with `cluster.tls_enabled=false`**: inter-node HTTP will verify peers against the system root CA pool, not a private cluster CA. An attacker who can present any system-trusted cert for the peer's address can MitM. The Warn recommends setting `cluster.tls_enabled` + `cluster.tls_ca_file`.
+- **`cluster.tls_enabled=true` with empty `cluster.tls_ca_file`**: verification falls back to system roots, and self-signed cluster certs will fail every handshake. The Warn recommends pointing `cluster.tls_ca_file` at the CA that signed `cluster.tls_cert_file`.
+
+**Operator action:** if you run Arc with `server.tls_enabled=true` in cluster mode, set `cluster.tls_enabled=true` + `cluster.tls_ca_file=/path/to/cluster/ca.pem` to pin inter-node TLS verification to a private cluster CA. Without this, peer cert verification uses the system root pool, which is a weaker (but functional) posture.
+
+Tests: `TestNewClusterHTTPTransport_{PlainHTTP, TLSConfigCloned}` cover the back-compat and happy paths (the latter generates a self-signed ECDSA cert in `t.TempDir()` and asserts the cloned `TLSClientConfig` carries `Certificates`, `RootCAs`, `MinVersion=TLS12`, and `InsecureSkipVerify=false`). `TestClusterTLSConfig_MissingFiles` asserts fail-loud via both substring match on the wrapped error and `errors.Is(err, fs.ErrNotExist)`. `TestSchemeForServer` pins the http/https switch.
+
 ### Hard Query Gating During Replication Catch-Up (Enterprise, opt-in) — closes #392
 
 Reader nodes in a clustered Arc Enterprise deployment previously accepted queries the moment they started, even while peer file replication was still pulling Parquet files the rest of the cluster already had. The Raft manifest knew about the missing files; the local storage didn't have them yet; `read_parquet()` globbed against local storage rather than the manifest. The result was **silent partial results** during the catch-up window. The Phase 3 release explicitly deferred this fix; 26.05.1 closed half the gap (WAL replication makes unflushed writer data queryable on readers within milliseconds), but flushed Parquet files still depended on async background pullers.
