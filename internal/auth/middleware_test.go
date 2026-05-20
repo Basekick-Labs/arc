@@ -309,6 +309,60 @@ func TestMiddleware_PublicPrefixes_AnchoredMatch(t *testing.T) {
 	}
 }
 
+// TestMiddleware_PublicPrefixes_TrailingSlashNormalisation is the
+// regression test for the gemini-r2 finding: a configured prefix with a
+// trailing slash (e.g. `/metrics/`) used to break the anchored match
+// because `prefix + "/"` produced `/metrics//`, which lexically matches
+// no real request path. The fix strips exactly one trailing slash from
+// the prefix before the anchored check, so configured `/metrics/` and
+// configured `/metrics` are byte-identical at match time. Test both
+// shapes against the same set of request paths to pin that equivalence.
+func TestMiddleware_PublicPrefixes_TrailingSlashNormalisation(t *testing.T) {
+	configs := []struct {
+		name    string
+		prefix  string
+	}{
+		{"prefix without trailing slash", "/metrics"},
+		{"prefix WITH trailing slash", "/metrics/"},
+	}
+	for _, cfg := range configs {
+		cfg := cfg // capture for parallel subtests
+		t.Run(cfg.name, func(t *testing.T) {
+			mw := DefaultMiddlewareConfig()
+			mw.PublicPrefixes = []string{cfg.prefix}
+
+			_, app, cleanup := setupMiddlewareTest(t, mw)
+			defer cleanup()
+			app.Get("/metrics", func(c *fiber.Ctx) error { return c.SendString("ok") })
+			app.Get("/metrics/prometheus", func(c *fiber.Ctx) error { return c.SendString("ok") })
+
+			tests := []struct {
+				name           string
+				path           string
+				expectedStatus int
+			}{
+				{"exact match", "/metrics", fiber.StatusOK},
+				{"true subdirectory", "/metrics/prometheus", fiber.StatusOK},
+				{"sibling byte-prefix", "/metricsX", fiber.StatusUnauthorized},
+				{"parent traversal escape", "/metrics/../sensitive", fiber.StatusUnauthorized},
+			}
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					req := httptest.NewRequest("GET", tt.path, nil)
+					resp, err := app.Test(req)
+					if err != nil {
+						t.Fatalf("Request failed: %v", err)
+					}
+					if resp.StatusCode != tt.expectedStatus {
+						t.Errorf("prefix=%q path=%q: expected status %d, got %d",
+							cfg.prefix, tt.path, tt.expectedStatus, resp.StatusCode)
+					}
+				})
+			}
+		})
+	}
+}
+
 // TestMiddleware_NoToken tests request without any token
 func TestMiddleware_NoToken(t *testing.T) {
 	config := DefaultMiddlewareConfig()

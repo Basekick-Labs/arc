@@ -80,11 +80,23 @@ func NewMiddleware(config MiddlewareConfig) fiber.Handler {
 			}
 		}
 		for _, prefix := range config.PublicPrefixes {
-			// Guard against empty-string entries. `HasPrefix(reqPath, "/")`
+			// Normalise prefix: strip exactly one trailing slash. An
+			// operator who reads "this is a directory prefix" and writes
+			// `/metrics/` in their config would otherwise silently break
+			// the anchored match: prefix+"/" becomes "/metrics//" which
+			// matches no real path. Symmetric with the request-path
+			// normalisation above; both sides should be in canonical form
+			// before the equality and HasPrefix checks. We deliberately
+			// don't `path.Clean` the prefix because (a) it's
+			// operator-supplied static config, not attacker-controlled,
+			// and (b) Clean would also collapse a configured `//foo` to
+			// `/foo`, hiding the misconfiguration instead of treating it
+			// as the same prefix the operator wrote.
+			prefix = strings.TrimSuffix(prefix, "/")
+			// Guard against empty-prefix entries (including a configured
+			// `/` that the TrimSuffix above just emptied). `HasPrefix(p, "/")`
 			// is true for every real HTTP path, so an empty prefix would
-			// disable auth wholesale. No legitimate config has one, but a
-			// future bug (e.g. an env-var split landing an empty entry)
-			// would silently open the whole API.
+			// disable auth wholesale.
 			if prefix == "" {
 				continue
 			}
