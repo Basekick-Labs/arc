@@ -142,6 +142,14 @@ type CoordinatorConfig struct {
 	APIAddress    string // HTTP API address for this node
 	Logger        zerolog.Logger
 
+	// ServerTLSEnabled mirrors cfg.Server.TLSEnabled so the request
+	// Router knows whether peer Fiber listeners serve HTTPS. The
+	// cluster API is hosted on the same Fiber app as the public API,
+	// so its TLS posture is determined by server.tls_enabled, not by
+	// cluster.tls_enabled (the latter gates Raft RPC + raw-TCP
+	// peer-fetch). All nodes are expected to be configured identically.
+	ServerTLSEnabled bool
+
 	// Phase 4: when true, the embedded HealthChecker surfaces rate-limited
 	// Warn logs when the cluster has zero or >1 nodes in RoleCompactor.
 	// Main wires this to cfg.Cluster.Enabled && cfg.Cluster.ReplicationEnabled &&
@@ -198,6 +206,27 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	// Warn if shared secret is used without TLS (HMAC is visible on the wire)
 	if cfg.Config.SharedSecret != "" && !cfg.Config.TLSEnabled {
 		logger.Warn().Msg("Cluster shared_secret configured without TLS — HMAC tokens are visible on the network. Enable cluster.tls_enabled for full security.")
+	}
+
+	// Warn when the public Fiber listener serves HTTPS but cluster TLS
+	// is off: the cache-invalidate fan-out and the request router will
+	// dial https:// against peers using SYSTEM ROOT CAs (no cluster CA
+	// pinning), so an attacker who can present any system-trusted cert
+	// for the peer's address can MitM inter-node HTTP. Enabling
+	// cluster.tls_enabled with cluster.tls_ca_file pins verification to
+	// a private CA and closes that gap.
+	if cfg.ServerTLSEnabled && !cfg.Config.TLSEnabled {
+		logger.Warn().Msg("server.tls_enabled is on but cluster.tls_enabled is off — inter-node HTTP will verify peers against system root CAs. Set cluster.tls_enabled + cluster.tls_ca_file to pin verification to a private cluster CA.")
+	}
+
+	// Warn when cluster TLS is on but no CA file is configured: the
+	// client side of inter-node HTTP (and the raw-TCP cluster dial)
+	// then verifies peers against system roots, which will fail for
+	// any self-signed cluster cert. Operators usually mean to set
+	// cluster.tls_ca_file pointing at the same CA that signs
+	// cluster.tls_cert_file.
+	if cfg.Config.TLSEnabled && cfg.Config.TLSCAFile == "" {
+		logger.Warn().Msg("cluster.tls_enabled is on but cluster.tls_ca_file is empty — peer cert verification falls back to system root CAs. Self-signed cluster certs will fail. Set cluster.tls_ca_file to the CA that signed cluster.tls_cert_file.")
 	}
 
 	c := &Coordinator{
@@ -269,6 +298,12 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	if routeTimeout == 0 {
 		routeTimeout = 5 * time.Second
 	}
+	// Build a TLS-aware HTTP transport for the request router so it
+	// can reach HTTPS peers when the cluster API serves TLS. We reuse
+	// the *tls.Config loaded above (line ~199), so cert/key/CA are
+	// read from disk once at coordinator startup rather than once
+	// per consumer. Scheme is keyed off server.tls_enabled (the Fiber
+	// listener flag), not cluster TLS — the two flags are independent.
 	c.router = NewRouter(&RouterConfig{
 		Timeout:   routeTimeout,
 		Retries:   cfg.Config.RouteRetries,
@@ -276,6 +311,8 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		Registry:  registry,
 		LocalNode: localNode,
 		Logger:    cfg.Logger,
+		Transport: security.NewClusterHTTPTransport(tlsCfg),
+		Scheme:    security.SchemeForServer(cfg.ServerTLSEnabled),
 	})
 
 	// Initialize writer failover manager (Phase 3) — requires license and Raft
@@ -335,6 +372,21 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		Msg("Cluster coordinator initialized")
 
 	return c, nil
+}
+
+// ClusterTLSConfig returns the *tls.Config loaded from cluster.tls_*
+// during coordinator construction, or nil when cluster.tls_enabled is
+// false. Callers that need to build additional cluster-internal HTTP
+// or TCP clients (e.g. the post-compaction cache-invalidate fan-out
+// wired in cmd/arc/main.go) can reuse this config rather than calling
+// security.ClusterTLSConfig again — which would re-read cert/key/CA
+// from disk and re-emit the "certificate expires in N days" warning.
+//
+// The returned pointer must be treated as read-only; net/http and
+// crypto/tls clone defensively before mutating, but a caller that
+// reaches in and mutates fields would corrupt every other consumer.
+func (c *Coordinator) ClusterTLSConfig() *tls.Config {
+	return c.tlsConfig
 }
 
 // Start starts the cluster coordinator.

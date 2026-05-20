@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/rs/zerolog"
 )
 
@@ -64,6 +65,20 @@ type RouterConfig struct {
 
 	// Logger for routing events
 	Logger zerolog.Logger
+
+	// Transport is the http.Transport to use for forwarded requests.
+	// When nil, NewRouter builds a default plain-HTTP transport
+	// (back-compat). Callers that run with server.tls_enabled OR
+	// cluster.tls_enabled MUST pass a TLS-aware transport built via
+	// security.ClusterHTTPTransport; otherwise inter-node forwarding
+	// fails the TLS handshake at every peer.
+	Transport *http.Transport
+
+	// Scheme is "http" or "https" — must match what the receiving
+	// peer's Fiber listener serves (driven by server.tls_enabled,
+	// identical on every cluster node). When empty, defaults to
+	// "http" (back-compat).
+	Scheme string
 }
 
 // Router routes requests to appropriate nodes in the cluster.
@@ -92,16 +107,24 @@ func NewRouter(cfg *RouterConfig) *Router {
 	if cfg.Strategy == "" {
 		cfg.Strategy = LoadBalanceRoundRobin
 	}
+	if cfg.Scheme == "" {
+		cfg.Scheme = "http"
+	}
+
+	transport := cfg.Transport
+	if transport == nil {
+		// Back-compat: tests and callers that don't pre-build a TLS
+		// transport get the default plaintext one. Going through
+		// NewClusterHTTPTransport keeps the pool defaults in one
+		// place (see clusterHTTP* constants in security/tls.go).
+		transport = security.NewClusterHTTPTransport(nil)
+	}
 
 	r := &Router{
 		cfg: cfg,
 		httpClient: &http.Client{
-			Timeout: cfg.Timeout,
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     90 * time.Second,
-			},
+			Timeout:   cfg.Timeout,
+			Transport: transport,
 		},
 		logger:      cfg.Logger.With().Str("component", "cluster-router").Logger(),
 		activeConns: make(map[string]*atomic.Int64),
@@ -250,8 +273,11 @@ func (r *Router) doForward(ctx context.Context, node *Node, originalReq *http.Re
 	r.incrementConns(node.ID)
 	defer r.decrementConns(node.ID)
 
-	// Build target URL
-	targetURL := fmt.Sprintf("http://%s%s", node.APIAddress, originalReq.URL.Path)
+	// Build target URL. Scheme is taken from RouterConfig.Scheme so
+	// inter-node forwarding correctly hits HTTPS peers when the
+	// cluster API serves TLS. String concat (rather than Sprintf)
+	// because this is on the hot path of every routed write.
+	targetURL := r.cfg.Scheme + "://" + node.APIAddress + originalReq.URL.Path
 	if originalReq.URL.RawQuery != "" {
 		targetURL += "?" + originalReq.URL.RawQuery
 	}
