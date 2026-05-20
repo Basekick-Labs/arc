@@ -322,22 +322,96 @@ func main() {
 	if dbConfig.ArcxStorageRoot != "" {
 		dbConfig.ArcxStorageRoot = resolveAbsPath("arcx.storage_root", dbConfig.ArcxStorageRoot)
 	}
+	// arcx.extension_path is interpolated into a `LOAD '<path>'` statement;
+	// normalise it the same way every other operator-supplied path is
+	// (control-char rejection + Abs + ToSlash) so the LOAD is robust against
+	// CWD changes and so the path cannot smuggle SQL through escapeSQLString.
+	if dbConfig.ArcxExtensionPath != "" {
+		dbConfig.ArcxExtensionPath = resolveAbsPath("database.arcx_extension_path", dbConfig.ArcxExtensionPath)
+	}
 
 	// Refuse obviously-wrong storage roots that would neuter the sandbox
 	// (allowing every local file). Operator owns the config so this is
-	// protection against a typo (e.g. "/" instead of "/data") rather than
-	// a malicious config. Covers POSIX system roots, the OS temp tree
-	// (sharing /tmp with other processes is never what an operator wants
-	// for Arc data), and common shared-state roots. Windows roots like
-	// C:\ are not enumerated — Windows-on-server-with-Arc is an unusual
-	// deployment and the deny-list trades off completeness for clarity.
-	switch dbConfig.LocalStorageRoot {
-	case "/", "/etc", "/etc/", "/usr", "/usr/", "/bin", "/bin/", "/sbin", "/sbin/",
-		"/boot", "/boot/", "/proc", "/proc/", "/sys", "/sys/", "/dev", "/dev/",
-		"/tmp", "/tmp/", "/var", "/var/", "/var/tmp", "/var/tmp/",
-		"/home", "/home/", "/root", "/root/", "/Users", "/Users/":
-		log.Fatal().Str("path", dbConfig.LocalStorageRoot).Msg("storage.local_path refuses to start with a system root, shared-tmp, or user-home root; pick a dedicated data directory")
+	// protection against a typo (e.g. "/" instead of "/data") rather than a
+	// malicious config. Covers POSIX system roots, the OS temp tree (sharing
+	// /tmp with other processes is never what an operator wants for Arc
+	// data), and common shared-state roots. Windows roots like C:\ are not
+	// enumerated — Windows-on-server-with-Arc is an unusual deployment.
+	//
+	// Apply to ALL local-directory configurations that end up in the sandbox
+	// allowlist. TempDirectory and CompactionTempDirectory are also added
+	// verbatim to allowed_directories, so a typo there would grant the same
+	// kind of broad access as a misconfigured LocalStorageRoot.
+	deniedRoots := map[string]bool{
+		"/": true, "/etc": true, "/etc/": true, "/usr": true, "/usr/": true,
+		"/bin": true, "/bin/": true, "/sbin": true, "/sbin/": true,
+		"/boot": true, "/boot/": true, "/proc": true, "/proc/": true,
+		"/sys": true, "/sys/": true, "/dev": true, "/dev/": true,
+		"/tmp": true, "/tmp/": true, "/var": true, "/var/": true,
+		"/var/tmp": true, "/var/tmp/": true,
+		"/home": true, "/home/": true, "/root": true, "/root/": true,
+		"/Users": true, "/Users/": true,
 	}
+	for _, pair := range []struct {
+		name, value string
+	}{
+		{"storage.local_path", dbConfig.LocalStorageRoot},
+		{"database.temp_directory", dbConfig.TempDirectory},
+		{"compaction.temp_directory", dbConfig.CompactionTempDirectory},
+	} {
+		if pair.value != "" && deniedRoots[pair.value] {
+			log.Fatal().Str("setting", pair.name).Str("path", pair.value).Msg("Configured path refuses to start with a system root, shared-tmp, or user-home root; pick a dedicated data directory")
+		}
+	}
+
+	// Resolve symlinks on every local directory that lands in the sandbox
+	// allowlist. filepath.Abs does NOT resolve symlinks; the kernel will,
+	// so without EvalSymlinks the sandbox literal-string can mismatch the
+	// real path the kernel opens (most common cause: macOS /var → /private/var,
+	// Docker bind mounts, K8s subPath). Same Warn-and-substitute policy as
+	// the upload-dir handling below — never hard-Fatal on a symlinked
+	// ancestor; instead use the resolved path so the allowlist and the
+	// kernel agree. EvalSymlinks errors only on missing paths, which is a
+	// real misconfiguration we should fail on.
+	resolveLocalDirSymlinks := func(name string, p *string) {
+		if *p == "" {
+			return
+		}
+		resolved, err := filepath.EvalSymlinks(*p)
+		if err != nil {
+			log.Fatal().Err(err).Str("setting", name).Str("path", *p).Msg("Failed to resolve configured path symlinks; refusing to start")
+		}
+		resolved = filepath.ToSlash(resolved)
+		if resolved != *p {
+			log.Warn().
+				Str("setting", name).
+				Str("original", *p).
+				Str("resolved", resolved).
+				Msg("Configured path resolves through a symlink; using the resolved path as the sandbox allowlist entry")
+			*p = resolved
+		}
+	}
+	// TempDirectory and CompactionTempDirectory must exist on disk before
+	// EvalSymlinks is called — config-load defaults them to "./.tmp" and
+	// "./data/compaction" respectively, neither of which exists at first
+	// boot. Create them with 0o700 first so the symlink-resolution check
+	// has something to resolve.
+	if err := os.MkdirAll(dbConfig.TempDirectory, 0o700); err != nil {
+		log.Fatal().Err(err).Str("path", dbConfig.TempDirectory).Msg("Failed to create database.temp_directory")
+	}
+	if dbConfig.CompactionTempDirectory != "" {
+		if err := os.MkdirAll(dbConfig.CompactionTempDirectory, 0o700); err != nil {
+			log.Fatal().Err(err).Str("path", dbConfig.CompactionTempDirectory).Msg("Failed to create compaction.temp_directory")
+		}
+	}
+	if dbConfig.LocalStorageRoot != "" {
+		if err := os.MkdirAll(dbConfig.LocalStorageRoot, 0o700); err != nil {
+			log.Fatal().Err(err).Str("path", dbConfig.LocalStorageRoot).Msg("Failed to create storage.local_path")
+		}
+	}
+	resolveLocalDirSymlinks("storage.local_path", &dbConfig.LocalStorageRoot)
+	resolveLocalDirSymlinks("database.temp_directory", &dbConfig.TempDirectory)
+	resolveLocalDirSymlinks("compaction.temp_directory", &dbConfig.CompactionTempDirectory)
 
 	// Compute and create the import-upload directory. Lives under the
 	// operator-configured TempDirectory (always non-empty by this point —
