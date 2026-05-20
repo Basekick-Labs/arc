@@ -73,11 +73,20 @@ func ValidateManifestPath(path string) error {
 	if strings.ContainsRune(path, 0) {
 		return ErrPathNullByte
 	}
-	// Reject URL schemes before checking absolute paths so the
-	// distinguishing rejection reason logged is the more specific one
-	// (`scheme` rather than `absolute`) for paths like `file:///etc/passwd`.
-	if strings.Contains(path, "://") {
-		return ErrPathScheme
+	// Reject any colon in the path EXCEPT the Windows drive-letter
+	// case at exactly index 1 (e.g. `C:\Windows\...`). This catches
+	// not only `s3://...` (which the prior `://` substring check
+	// covered) but also single-slash URIs like `file:/etc/passwd`
+	// and scheme-only URIs like `mailto:foo` or `data:...`. Legit
+	// Arc storage paths never contain `:` — the partition format is
+	// `{db}/{measurement}/{YYYY}/{MM}/{DD}/{HH}/{filename}.parquet`,
+	// none of which can legitimately carry a colon. The Windows-drive
+	// exception falls through to the absolute-path check below, which
+	// rejects with the more specific ErrPathAbsolute reason.
+	if idx := strings.Index(path, ":"); idx != -1 {
+		if idx != 1 || !isAbsolutePath(path) {
+			return ErrPathScheme
+		}
 	}
 	if isAbsolutePath(path) {
 		return ErrPathAbsolute

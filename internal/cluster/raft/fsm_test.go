@@ -977,6 +977,51 @@ func TestApplyUpdateFile_RejectsMaliciousPath(t *testing.T) {
 	}
 }
 
+// TestApplyUpdateFile_BumpsLSN pins that applyUpdateFile stamps the
+// current Raft log index into the entry's LSN, matching the contract
+// applyRegisterFile already satisfies. Without this, an Update that
+// mutates an existing entry would leave the LSN at its
+// registration-time value, and downstream consumers that watch LSN
+// for "did this entry change" (e.g. compaction watchers) couldn't
+// distinguish a fresh state from a stale one. Gemini #446-r1 #1.
+func TestApplyUpdateFile_BumpsLSN(t *testing.T) {
+	t.Parallel()
+	fsm := newTestFSM()
+
+	// Register at log index 10 → LSN should be 10.
+	legit := makeFileEntry("db/cpu/2026/05/20/15/file.parquet", "db", "cpu", 100)
+	regData := makeCommand(t, CommandRegisterFile, RegisterFilePayload{File: legit})
+	if result := fsm.Apply(&raft.Log{Index: 10, Data: regData}); result != nil {
+		t.Fatalf("legit register failed: %v", result)
+	}
+	got, exists := fsm.GetFile(legit.Path)
+	if !exists {
+		t.Fatal("entry should exist after register")
+	}
+	if got.LSN != 10 {
+		t.Fatalf("post-register LSN: got %d, want 10", got.LSN)
+	}
+
+	// Update at log index 42 with same path but different size.
+	updated := legit
+	updated.SizeBytes = 999
+	updateData := makeCommand(t, CommandUpdateFile, UpdateFilePayload{File: updated})
+	if result := fsm.Apply(&raft.Log{Index: 42, Data: updateData}); result != nil {
+		t.Fatalf("legit update failed: %v", result)
+	}
+
+	got, exists = fsm.GetFile(legit.Path)
+	if !exists {
+		t.Fatal("entry should still exist after update")
+	}
+	if got.LSN != 42 {
+		t.Errorf("post-update LSN: got %d, want 42 (Update must stamp LSN from log index, not preserve registration-time value)", got.LSN)
+	}
+	if got.SizeBytes != 999 {
+		t.Errorf("post-update SizeBytes: got %d, want 999 (update should land)", got.SizeBytes)
+	}
+}
+
 // TestFSMRestore_QuarantinesMaliciousSnapshotEntries pins the
 // snapshot-restore quarantine path. A snapshot containing 3 legit +
 // 2 malicious entries must round-trip with only the 3 legit entries

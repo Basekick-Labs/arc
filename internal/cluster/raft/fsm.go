@@ -524,7 +524,15 @@ func (f *ClusterFSM) applyRegisterFile(payload []byte, logIndex uint64) interfac
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fmt.Errorf("failed to unmarshal register file payload: %w", err)
 	}
+	return f.applyRegisterFileStruct(p, logIndex)
+}
 
+// applyRegisterFileStruct is the struct-taking variant of applyRegisterFile.
+// applyBatchFileOps calls this directly after unmarshalling the payload
+// once in its pre-validation pass, avoiding a second unmarshal in the
+// apply loop. Non-batch callers go through applyRegisterFile, which
+// unmarshals + dispatches here.
+func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uint64) interface{} {
 	// Validate the path BEFORE any state mutation. See GHSA-f85q-mvg8-qf37:
 	// historically the only check was empty-string, which let an attacker
 	// register arbitrary paths (/etc/passwd, s3://attacker-bucket/..., etc.)
@@ -633,6 +641,13 @@ func (f *ClusterFSM) applyUpdateFile(payload []byte, logIndex uint64) interface{
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fmt.Errorf("failed to unmarshal update file payload: %w", err)
 	}
+	return f.applyUpdateFileStruct(p, logIndex)
+}
+
+// applyUpdateFileStruct is the struct-taking variant of applyUpdateFile.
+// applyBatchFileOps calls this directly after unmarshalling once during
+// pre-validation, avoiding a second unmarshal in the apply loop.
+func (f *ClusterFSM) applyUpdateFileStruct(p UpdateFilePayload, logIndex uint64) interface{} {
 	// Same validation as applyRegisterFile — an attacker who can submit
 	// Update commands could otherwise insert a new manifest entry at a
 	// malicious path (Update writes f.files[entry.Path] = &entry, so a
@@ -643,6 +658,14 @@ func (f *ClusterFSM) applyUpdateFile(payload []byte, logIndex uint64) interface{
 	if err := ValidateManifestPath(p.File.Path); err != nil {
 		return f.rejectManifestPath("update", p.File.Path, logIndex, err)
 	}
+
+	// Stamp the LSN from the current Raft log index so consumers that
+	// watch f.files for "did this entry change" can detect the update.
+	// Without this, an Update that mutates an existing entry would
+	// leave the LSN at its registration-time value, and downstream
+	// consumers (e.g. compaction watchers) couldn't distinguish a
+	// fresh state from a stale one.
+	p.File.LSN = logIndex
 
 	f.mu.Lock()
 	entry := p.File
@@ -730,36 +753,53 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 	// uses the path as a map key (delete of a non-existent key is a
 	// no-op); validating delete paths would change existing semantics
 	// for callers that legitimately race delete-then-register.
+	//
+	// We store each decoded Register/Update payload in parallel slots
+	// (decoded[i]) so the apply loop below can call the *Struct apply
+	// variants directly without re-unmarshalling. Each payload is
+	// decoded exactly once; Delete ops keep nil decoded slots.
+	decoded := make([]any, len(p.Ops))
 	for i, op := range p.Ops {
-		var pathToValidate string
 		switch op.Type {
 		case CommandRegisterFile:
 			var rp RegisterFilePayload
 			if err := json.Unmarshal(op.Payload, &rp); err != nil {
 				return fmt.Errorf("batch file ops: op[%d] unmarshal: %w", i, err)
 			}
-			pathToValidate = rp.File.Path
+			if err := ValidateManifestPath(rp.File.Path); err != nil {
+				f.rejectedPaths.Add(1)
+				f.logger.Error().
+					Err(err).
+					Str("op", "batch-prevalidate").
+					Str("path", rp.File.Path).
+					Uint64("log_index", logIndex).
+					Int("batch_index", i).
+					Msg("manifest path validation failed during batch pre-check — entire batch refused")
+				return fmt.Errorf("batch file ops: op[%d]: %w", i, err)
+			}
+			decoded[i] = rp
 		case CommandUpdateFile:
 			var up UpdateFilePayload
 			if err := json.Unmarshal(op.Payload, &up); err != nil {
 				return fmt.Errorf("batch file ops: op[%d] unmarshal: %w", i, err)
 			}
-			pathToValidate = up.File.Path
+			if err := ValidateManifestPath(up.File.Path); err != nil {
+				f.rejectedPaths.Add(1)
+				f.logger.Error().
+					Err(err).
+					Str("op", "batch-prevalidate").
+					Str("path", up.File.Path).
+					Uint64("log_index", logIndex).
+					Int("batch_index", i).
+					Msg("manifest path validation failed during batch pre-check — entire batch refused")
+				return fmt.Errorf("batch file ops: op[%d]: %w", i, err)
+			}
+			decoded[i] = up
 		case CommandDeleteFile:
-			continue
+			// no decode/validate here; applyDeleteFile handles the path
+			// as a map key (no-op for unknown keys).
 		default:
 			return fmt.Errorf("batch file ops: op[%d] unsupported type: %d", i, op.Type)
-		}
-		if err := ValidateManifestPath(pathToValidate); err != nil {
-			f.rejectedPaths.Add(1)
-			f.logger.Error().
-				Err(err).
-				Str("op", "batch-prevalidate").
-				Str("path", pathToValidate).
-				Uint64("log_index", logIndex).
-				Int("batch_index", i).
-				Msg("manifest path validation failed during batch pre-check — entire batch refused")
-			return fmt.Errorf("batch file ops: op[%d]: %w", i, err)
 		}
 	}
 
@@ -767,19 +807,19 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 		var result interface{}
 		switch op.Type {
 		case CommandRegisterFile:
-			result = f.applyRegisterFile(op.Payload, logIndex)
+			result = f.applyRegisterFileStruct(decoded[i].(RegisterFilePayload), logIndex)
 		case CommandDeleteFile:
 			result = f.applyDeleteFile(op.Payload)
 		case CommandUpdateFile:
-			result = f.applyUpdateFile(op.Payload, logIndex)
+			result = f.applyUpdateFileStruct(decoded[i].(UpdateFilePayload), logIndex)
 		default:
 			return fmt.Errorf("batch file ops: op[%d] unsupported type: %d", i, op.Type)
 		}
-		// applyRegisterFile and applyDeleteFile return nil on success or an
-		// error on failure — they never return a non-nil non-error value.
-		// The type-assert is defensive: if either handler is ever refactored
-		// to return something unexpected, we propagate it as an error rather
-		// than silently ignoring it.
+		// apply*FileStruct and applyDeleteFile return nil on success or
+		// an error on failure — they never return a non-nil non-error
+		// value. The type-assert is defensive: if either handler is ever
+		// refactored to return something unexpected, we propagate it as
+		// an error rather than silently ignoring it.
 		if result != nil {
 			if err, ok := result.(error); ok {
 				return fmt.Errorf("batch file ops: op[%d] (type=%d): %w", i, op.Type, err)

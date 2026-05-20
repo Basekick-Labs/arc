@@ -37,9 +37,22 @@ func TestValidateManifestPath_RejectionMatrix(t *testing.T) {
 		{"s3 scheme", "s3://attacker-bucket/poisoned.parquet", ErrPathScheme},
 		{"http scheme", "http://evil.example.com/payload", ErrPathScheme},
 		{"https scheme", "https://evil.example.com/payload", ErrPathScheme},
-		{"file scheme", "file:///etc/passwd", ErrPathScheme},
+		{"file scheme triple slash", "file:///etc/passwd", ErrPathScheme},
+		{"file scheme single slash", "file:/etc/passwd", ErrPathScheme},
 		{"azure scheme", "azure://container/blob", ErrPathScheme},
 		{"scheme inside", "db/m/x://y/file.parquet", ErrPathScheme},
+		// Scheme-only URI shapes (no `//` after the colon) — still
+		// rejected as scheme because no legit Arc path contains `:`.
+		{"mailto scheme", "mailto:victim@example.com", ErrPathScheme},
+		{"data scheme", "data:text/plain,exfil", ErrPathScheme},
+		{"colon-only at zero", "x:y", ErrPathScheme},
+		{"colon mid path", "db/m/foo:bar/file.parquet", ErrPathScheme},
+		// Edge case: single-char prefix with colon at index 1 that is
+		// NOT a Windows drive letter (digit, symbol). The Windows
+		// drive-letter exception requires [A-Za-z] AND a path-separator
+		// at index 2; a bare `0:foo` matches neither and is rejected
+		// as scheme.
+		{"digit colon", "0:foo", ErrPathScheme},
 
 		// Absolute paths.
 		{"posix absolute", "/etc/passwd", ErrPathAbsolute},
