@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -273,17 +274,22 @@ func (r *Router) doForward(ctx context.Context, node *Node, originalReq *http.Re
 	r.incrementConns(node.ID)
 	defer r.decrementConns(node.ID)
 
-	// Build target URL. Scheme is taken from RouterConfig.Scheme so
-	// inter-node forwarding correctly hits HTTPS peers when the
-	// cluster API serves TLS. String concat (rather than Sprintf)
-	// because this is on the hot path of every routed write.
-	// EscapedPath() re-emits the original on-the-wire encoding —
-	// URL.Path is the decoded form, so paths containing spaces or
-	// non-ASCII bytes would otherwise produce an invalid forwarded URL.
-	targetURL := r.cfg.Scheme + "://" + node.APIAddress + originalReq.URL.EscapedPath()
-	if originalReq.URL.RawQuery != "" {
-		targetURL += "?" + originalReq.URL.RawQuery
-	}
+	// Build target URL via *url.URL so an IPv6 literal in
+	// node.APIAddress (e.g. "[::1]:8000") survives unmangled. We don't
+	// rely on the upstream contract that ListenAddr always brackets
+	// IPv6 — using url.URL is correct by construction and the one
+	// allocation per request is dwarfed by the network round-trip.
+	// RawPath carries the original on-the-wire encoding (RawPath !=
+	// "" only when the path required escaping); Path is the decoded
+	// form. url.URL.String() prefers RawPath when set, so paths
+	// containing spaces or non-ASCII bytes are forwarded intact.
+	targetURL := (&url.URL{
+		Scheme:   r.cfg.Scheme,
+		Host:     node.APIAddress,
+		Path:     originalReq.URL.Path,
+		RawPath:  originalReq.URL.RawPath,
+		RawQuery: originalReq.URL.RawQuery,
+	}).String()
 
 	// Read and buffer the body so it can be retried
 	var bodyBytes []byte

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1765,8 +1766,16 @@ func main() {
 							cfg.Cluster.SharedSecret, nonce, localNode.ID, cfg.Cluster.ClusterName, ts,
 						)
 
-						url := fmt.Sprintf("%s://%s%s", clusterScheme, n.APIAddress, api.CacheInvalidatePath)
-						req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+						// Build via *url.URL so an IPv6 literal in
+						// n.APIAddress (e.g. "[::1]:8000") survives
+						// unmangled. CacheInvalidatePath is a known-safe
+						// constant path, so we don't need to escape it.
+						peerURL := (&url.URL{
+							Scheme: clusterScheme,
+							Host:   n.APIAddress,
+							Path:   api.CacheInvalidatePath,
+						}).String()
+						req, err := http.NewRequestWithContext(ctx, http.MethodPost, peerURL, nil)
 						if err != nil {
 							log.Warn().Err(err).Str("node_id", n.ID).Msg("Failed to create cache invalidation request")
 							return
