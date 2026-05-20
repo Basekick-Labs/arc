@@ -228,6 +228,12 @@ func (h *ImportHandler) handleFileImport(c *fiber.Ctx, format string, buildOpts 
 			"error": "failed to create temp directory: " + err.Error(),
 		})
 	}
+	// ToSlash so Windows backslashes from os.MkdirTemp match the
+	// forward-slash sandbox allowlist entry (h.uploadDir is already
+	// normalized by main.go). Without this, reads of the uploaded file
+	// via read_csv/read_parquet would fail with a permission error on
+	// Windows even though the upload landed inside the allowlisted prefix.
+	tempDir = filepath.ToSlash(tempDir)
 	defer os.RemoveAll(tempDir)
 
 	tempFile := filepath.Join(tempDir, "import."+format)

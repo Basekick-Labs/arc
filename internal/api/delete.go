@@ -818,7 +818,12 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 	if err != nil {
 		return 0, nil, fmt.Errorf("failed to create temp file: %w", err)
 	}
-	tempPath := tempFile.Name()
+	// ToSlash so Windows backslashes from os.CreateTemp match the
+	// forward-slash sandbox allowlist entry (h.tempDir is already
+	// normalized by main.go). The COPY ... TO statement below
+	// interpolates tempPath verbatim into SQL, so a backslash form
+	// would mismatch allowed_directories and the rewrite would fail.
+	tempPath := filepath.ToSlash(tempFile.Name())
 	tempFile.Close()
 	defer os.Remove(tempPath)
 
