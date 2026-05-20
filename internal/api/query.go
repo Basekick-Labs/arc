@@ -18,7 +18,6 @@ import (
 
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
-	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/governance"
 	"github.com/basekick-labs/arc/internal/license"
@@ -538,23 +537,6 @@ type QueryHandler struct {
 
 	// Query management (Enterprise feature - active query tracking and cancellation)
 	queryRegistry *queryregistry.Registry
-
-	// Cluster authentication state for the post-compaction
-	// /api/v1/internal/cache/invalidate endpoint. Populated by
-	// SetClusterAuth when cluster mode is enabled AND a SharedSecret is
-	// configured; otherwise the receiver refuses every request (the
-	// endpoint has no legitimate caller without a cluster shared secret).
-	// See handleCacheInvalidate for the validation flow.
-	//
-	// These fields are set once via SetClusterAuth before the HTTP server
-	// starts accepting traffic and are never mutated afterward, so reads
-	// from request goroutines do not need a mutex. A future refactor that
-	// hot-reloads the shared secret at runtime MUST add synchronization.
-	clusterSharedSecret  string
-	clusterName          string
-	clusterLocalNodeID   string
-	clusterNonceCache    *security.NonceCache
-	clusterAuthTolerance time.Duration
 }
 
 // isDebugEnabled returns true if debug logging is enabled.
@@ -948,43 +930,6 @@ func (h *QueryHandler) SetQueryRegistry(registry *queryregistry.Registry) {
 	h.queryRegistry = registry
 }
 
-// SetClusterAuth wires the HMAC-validation context for the post-compaction
-// /api/v1/internal/cache/invalidate endpoint. Called by cmd/arc/main.go when
-// cluster mode is enabled AND cfg.Cluster.SharedSecret is non-empty.
-//
-// Without this wiring (OSS, standalone, or cluster without shared secret)
-// the endpoint refuses every request — the only legitimate caller is a
-// cluster peer issuing a post-compaction fan-out, which by definition needs
-// the shared secret to compute the HMAC. The nonce cache TTL should match
-// the HMAC timestamp tolerance; 5 minutes is the project-wide convention
-// (matches the peer-fetch / leader-forward defaults).
-//
-// Callers MUST pass a positive tolerance and a non-nil nonceCache:
-//   - A zero/negative tolerance would reject every well-formed request
-//     (the symmetric drift check in ValidateCacheInvalidateHMAC compares
-//     against `int64(tolerance.Seconds())`).
-//   - A nil nonceCache would silently skip replay protection (see the
-//     `if h.clusterNonceCache != nil` guard in handleCacheInvalidate).
-//
-// Callers MUST also invoke this before the HTTP server starts accepting
-// traffic; the QueryHandler reads these fields without a mutex.
-//
-// The guards below fail fast at startup so a misconfigured caller is
-// loudly broken instead of producing a silently-half-armed endpoint.
-func (h *QueryHandler) SetClusterAuth(sharedSecret, clusterName, localNodeID string, nonceCache *security.NonceCache, tolerance time.Duration) {
-	if tolerance <= 0 {
-		panic(fmt.Sprintf("QueryHandler.SetClusterAuth: tolerance must be positive, got %v", tolerance))
-	}
-	if nonceCache == nil {
-		panic("QueryHandler.SetClusterAuth: nonceCache must be non-nil (replay protection cannot be disabled)")
-	}
-	h.clusterSharedSecret = sharedSecret
-	h.clusterName = clusterName
-	h.clusterLocalNodeID = localNodeID
-	h.clusterNonceCache = nonceCache
-	h.clusterAuthTolerance = tolerance
-}
-
 // InvalidateCaches clears all internal caches (partition pruner and SQL transform cache).
 // This should be called after compaction to prevent stale file references.
 func (h *QueryHandler) InvalidateCaches() {
@@ -1222,126 +1167,11 @@ func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 	app.Get("/api/v1/query/:measurement", h.checkReplicationReady, h.queryMeasurement)
 	h.registerArrowRoutes(app)
 
-	// Internal endpoint for distributed cache invalidation (enterprise clustering).
-	// Called by compactor/writer nodes after compaction to clear stale caches on
-	// readers. Deliberately NOT gated by checkReplicationReady — peer nodes need
-	// to invalidate caches while we're catching up, and rejecting these calls
-	// would break the cache-invalidation protocol exactly when it matters most.
-	app.Post(CacheInvalidatePath, h.handleCacheInvalidate)
-}
-
-// CacheInvalidatePath is the single source of truth for the
-// /api/v1/internal/cache/invalidate route. The receiver registers it
-// above; the cluster post-compaction sender in cmd/arc/main.go and the
-// auth middleware's PublicRoutes config both reference this constant
-// so a future typo cannot silently break fan-out.
-const CacheInvalidatePath = "/api/v1/internal/cache/invalidate"
-
-// handleCacheInvalidate handles POST /api/v1/internal/cache/invalidate.
-//
-// Closes audit finding #3 from 2026-05-19: the previous gate was a static
-// header (`X-Arc-Internal: cache-invalidate`) which any network-reachable
-// caller could replay, forcing DuckDB's cache_httpfs glob results to
-// repopulate from S3 — cost amplification + p99 spikes with no auth.
-//
-// Behaviour:
-//   - Refuses every request when SetClusterAuth has not been called (no
-//     cluster shared secret configured). In that mode there is no
-//     legitimate caller — OSS post-compaction does its invalidation
-//     in-process at cmd/arc/main.go's SetOnCompactionComplete callback,
-//     without going through HTTP.
-//   - Validates HMAC over (nonce, nodeID, clusterName, timestamp) using
-//     the cluster shared secret. Uses the same shared secret and 5-minute
-//     freshness window as the leader-forward and peer-fetch endpoints,
-//     with a "cache-invalidate:" label prefix as the endpoint
-//     discriminator (no payload or path to bind, so the label is what
-//     prevents cross-endpoint MAC replay).
-//   - Replay-protects via the cluster nonce cache (5-minute TTL matches
-//     the HMAC freshness tolerance, so a nonce expires from the cache at
-//     the same instant its MAC would be rejected as stale).
-//   - Rejects a request that claims to come from this node's own ID —
-//     local invalidation happens in-process, never over HTTP.
-//
-// Per-decision: the audit deliberately assigned NO CVE to this finding
-// because OSS does not reach the endpoint (post-compaction invalidation
-// is in-process via db.ClearHTTPCache) and the endpoint carries no
-// secrets — it is only a cluster-mode "clear your caches now" signal.
-// Do NOT retroactively file a CVE without re-evaluating the threat model.
-func (h *QueryHandler) handleCacheInvalidate(c *fiber.Ctx) error {
-	// Every rejection path returns fiber.StatusForbidden with no body so
-	// an attacker cannot probe to distinguish "unconfigured" from
-	// "missing headers" from "bad MAC". Rejection logging uses Debug
-	// level on purpose: at Warn the endpoint would amplify a flooder
-	// into a log-DoS, while operators chasing a real misconfiguration
-	// can flip the level on the api/query handler.
-
-	// No cluster shared secret → no legitimate caller (see doc comment).
-	if h.clusterSharedSecret == "" {
-		h.logger.Debug().Str("remote_ip", c.IP()).
-			Msg("cache-invalidate rejected: cluster.shared_secret not configured")
-		return c.SendStatus(fiber.StatusForbidden)
-	}
-
-	nodeID := c.Get("X-Arc-Node-ID")
-	clusterName := c.Get("X-Arc-Cluster")
-	nonce := c.Get("X-Arc-Nonce")
-	mac := c.Get("X-Arc-HMAC")
-	tsStr := c.Get("X-Arc-Timestamp")
-	if nodeID == "" || clusterName == "" || nonce == "" || mac == "" || tsStr == "" {
-		h.logger.Debug().Str("remote_ip", c.IP()).
-			Msg("cache-invalidate rejected: missing one or more required headers")
-		return c.SendStatus(fiber.StatusForbidden)
-	}
-
-	// Reject requests claiming the local node ID: local cache invalidation
-	// runs in-process (db.ClearHTTPCache + InvalidateCaches called
-	// directly from the compaction callback), so a self-addressed HTTP
-	// request is either a misconfiguration or a confused attacker.
-	// (localNodeID is not secret — constant-time compare not required.)
-	if nodeID == h.clusterLocalNodeID {
-		h.logger.Debug().Str("remote_ip", c.IP()).Str("node_id", nodeID).
-			Msg("cache-invalidate rejected: self-addressed request")
-		return c.SendStatus(fiber.StatusForbidden)
-	}
-
-	// Fast-path reject before HMAC computation. The HMAC itself also
-	// binds clusterName (tamper-proof), but checking the header first
-	// avoids a useless hash compute for cross-cluster requests.
-	if clusterName != h.clusterName {
-		h.logger.Debug().Str("remote_ip", c.IP()).Str("cluster_name", clusterName).
-			Msg("cache-invalidate rejected: cluster name mismatch")
-		return c.SendStatus(fiber.StatusForbidden)
-	}
-
-	ts, err := strconv.ParseInt(tsStr, 10, 64)
-	if err != nil {
-		h.logger.Debug().Err(err).Str("remote_ip", c.IP()).Str("timestamp", tsStr).
-			Msg("cache-invalidate rejected: non-numeric timestamp")
-		return c.SendStatus(fiber.StatusForbidden)
-	}
-
-	if err := security.ValidateCacheInvalidateHMAC(
-		h.clusterSharedSecret, nonce, nodeID, clusterName, ts, mac, h.clusterAuthTolerance,
-	); err != nil {
-		h.logger.Debug().Err(err).Str("remote_ip", c.IP()).Str("node_id", nodeID).
-			Msg("cache-invalidate rejected: HMAC validation failed")
-		return c.SendStatus(fiber.StatusForbidden)
-	}
-
-	// Replay check AFTER HMAC validation: don't burn a nonce-cache entry
-	// on an attacker who can't even produce a valid MAC. The cache is
-	// guaranteed non-nil here because SetClusterAuth panics on nil at
-	// wiring time, and the empty-secret branch above short-circuits
-	// requests that arrive before SetClusterAuth has run.
-	if !h.clusterNonceCache.Track(nodeID, nonce) {
-		h.logger.Debug().Str("remote_ip", c.IP()).Str("node_id", nodeID).
-			Msg("cache-invalidate rejected: replay (nonce already seen)")
-		return c.SendStatus(fiber.StatusForbidden)
-	}
-
-	h.db.ClearHTTPCache()
-	h.InvalidateCaches()
-	return c.SendStatus(fiber.StatusNoContent)
+	// The distributed cache-invalidate endpoint
+	// (POST CacheInvalidatePath) is wired separately in cmd/arc/main.go,
+	// conditionally on cluster.shared_secret being configured. It lives
+	// in its own file (cache_invalidate.go) because its auth model is
+	// HMAC-only, distinct from the user-token auth applied here.
 }
 
 // executeQueryMsgPack handles POST /api/v1/query/msgpack. It is a thin

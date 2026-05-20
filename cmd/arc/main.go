@@ -1563,25 +1563,33 @@ func main() {
 			log.Info().Msg("Query catch-up gate enabled — read endpoints will return 503 until the startup catch-up batch settles")
 		}
 
-		// Wire HMAC auth for the post-compaction cache-invalidate endpoint.
-		// Without a cluster shared secret the endpoint refuses everything;
+		// Wire the post-compaction cache-invalidate endpoint, conditionally.
+		// The endpoint is registered ONLY when cluster.shared_secret is set —
 		// the only legitimate sender is a cluster peer doing post-compaction
 		// fan-out (see SetOnCompactionComplete below), which by definition
-		// needs the secret to compute the MAC. Tolerance matches the project
-		// default for HMAC freshness windows (see internal/cluster/security).
+		// needs the secret to compute the MAC. Without the secret there is no
+		// caller, so we don't register the route at all (Fiber returns 404).
+		// This eliminates a runtime check on every request and makes the
+		// "not configured" state impossible to confuse with a misauth.
+		// Tolerance matches the project default for HMAC freshness windows.
 		if cfg.Cluster.SharedSecret != "" {
 			localNode := clusterCoordinator.GetRegistry().Local()
-			if localNode != nil {
-				queryHandler.SetClusterAuth(
-					cfg.Cluster.SharedSecret,
-					cfg.Cluster.ClusterName,
-					localNode.ID,
-					security.NewNonceCache(cacheInvalidateHMACTolerance),
-					cacheInvalidateHMACTolerance,
-				)
-			} else {
-				log.Warn().Msg("cluster.shared_secret set but local node not in registry yet; cache-invalidate endpoint will refuse all requests until the next restart")
+			if localNode == nil {
+				log.Fatal().Msg("cluster.shared_secret is configured but local node missing from registry — coordinator wiring is broken")
 			}
+			cacheInvalidateHandler := api.NewCacheInvalidateHandler(
+				cfg.Cluster.SharedSecret,
+				cfg.Cluster.ClusterName,
+				localNode.ID,
+				security.NewNonceCache(cacheInvalidateHMACTolerance),
+				cacheInvalidateHMACTolerance,
+				func() {
+					db.ClearHTTPCache()
+					queryHandler.InvalidateCaches()
+				},
+				log.With().Str("component", "cache-invalidate").Logger(),
+			)
+			cacheInvalidateHandler.Register(server.GetApp())
 		}
 	}
 
