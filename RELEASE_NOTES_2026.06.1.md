@@ -2,6 +2,39 @@
 
 > **Status:** In progress. Entries are added as PRs land.
 
+## Security fixes
+
+### DuckDB I/O sandbox closes arbitrary file-read by any authenticated caller
+
+Reported by [Alex Manson](https://neurowinter.com/) ([@NeuroWinter](https://github.com/NeuroWinter)) — thank you for the detailed report and proof-of-concept.
+
+An external security report against the v26.05.1 main branch found that any token holding even an empty `permissions: []` set could read arbitrary local files through DuckDB's I/O function family — `read_csv_auto`, `read_json`, `read_text`, `read_blob`, `glob`, `parquet_metadata`, `parquet_schema`, `read_xlsx`, etc. The existing user-SQL denylist blocked only `read_parquet(` and `arc_partition_agg(`, and RBAC table-level checks inspected `FROM`/`JOIN` clauses, so a scalar table function in the `SELECT` list slipped past both layers.
+
+Impact on a deployment with auth enabled but RBAC not subscribed: a single-line POST to `/api/v1/query` returned the contents of `auth.db` (bcrypt hashes plus legacy SHA-256 rows), `arc.toml` (S3 secrets), TLS private keys, `/proc/self/environ`, cross-tenant Parquet files, and — when `httpfs` was loaded — instance-metadata IPs over SSRF.
+
+26.06.1 replaces the denylist with a structural fix at the DuckDB layer: after every `INSTALL`/`LOAD` and every `SET GLOBAL` Arc itself needs has run, the startup path sets
+
+```sql
+SET GLOBAL allowed_directories = ['<local_storage_root>/', '<temp_directory>/', '<upload_dir>/', '<compaction_temp>/', 's3://<hot_bucket>/<prefix>/', 's3://<cold_bucket>/<prefix>/', 'azure://<container>/', 'azure://<cold_container>/']
+SET GLOBAL enable_external_access = false
+```
+
+After this flip DuckDB refuses to open any file outside the allowlist, refuses any further `INSTALL`/`LOAD`, and rejects attempts to re-enable external access at runtime. Already-loaded extensions (httpfs, azure, cache_httpfs, arcx) remain fully callable — `enable_external_access` is checked at extension-load time, file access at file-open time. The allowlist is enforced uniformly across every pool connection (DuckDB's `ExtensionManager` and `SET GLOBAL` propagate database-wide), so a per-connection regression is not possible. The flip is read back and verified at startup so a future DuckDB release silently rejecting it would surface as a startup error rather than a silently-broken sandbox.
+
+A startup-time guard rejects operator-supplied paths that contain any Unicode control character (Cc — `\0`, `\n`, `\r`, `\t`, vertical tab, form feed, 0x7F), formatting character (Cf — LRM/RLM/LRE/RLE/PDF/LRO/RLO/LRI/RLI/FSI/PDI, ZWSP/ZWNJ/ZWJ, BOM, soft hyphen), or line/paragraph separator (Zl/Zp — U+2028/U+2029) before they reach the SQL literal — closing both newline injection and bidi-override log-spoofing surfaces. The upload directory used for multipart imports is created with mode `0700`, chmod'd back to `0700` if it already existed with looser permissions, and rejected at startup if a symlink has been pre-staged in its place.
+
+**Operator-facing change — paths must resolve to absolute**: `storage.local_path`, `database.temp_directory`, `compaction.temp_directory`, and (when arcx is enabled) the arcx storage root are now all resolved to absolute, forward-slash paths before being passed to DuckDB's allowlist. The defaults (`./data/arc`, `./.tmp`, `./data/compaction`) continue to work — they're resolved against the process working directory at startup. Operators who set these to a non-absolute path in `arc.toml` will see the resolved absolute path in the startup log line `DuckDB external access locked down (sandbox active)`.
+
+**Import upload directory moved**: multipart uploads landed in `os.TempDir()` (typically `/tmp` or `/var/folders/.../T/`) before 26.06.1. They now land in a dedicated `arc-uploads` subdirectory under the operator-configured temp directory — `${database.temp_directory}/arc-uploads`. Existing imports continue to work; deployments that scrape `/tmp` for monitoring no longer see Arc upload files.
+
+**Compaction and DELETE on S3 backends use the same allowlisted staging area** so their `COPY ... TO` writes succeed under the sandbox. No operator action required — the wiring is internal.
+
+**Profile-mode queries** write the JSON profiling output under `${database.temp_directory}` instead of `os.TempDir()` so `PRAGMA profiling_output` writes through an allowlisted path. Profile data was already silently empty in some DuckDB releases that route the profile writer through `OpenerFileSystem`; this fix is preemptive.
+
+The arcx loader was simplified: the previous per-connection `connInitFn` (which executed `LOAD '<arcx-path>'` on every new pooled connection) has been replaced with a one-shot LOAD during `configureDatabase`, plus `SET GLOBAL "arcx.storage_root" = '<path>'`. Both propagate database-wide. The per-connection LOAD was a leftover from before we'd verified DuckDB's extension model; functionally identical, simpler to reason about.
+
+Tests added: `TestSandbox` (CVE reproduction + full I/O family + SSRF + `COPY TO` local + `COPY TO 's3://...'` + `EXPORT DATABASE` outside allowlist + `INSTALL` after lockdown + cross-connection enforcement + `range()` remains callable + lockdown is one-way), `TestBuildAllowedDirectories` (12 table cases covering hot/cold S3 dedup, leading/interior-slash collapse, trailing-slash idempotence, empty-config behavior), `TestSandboxEmptyAllowlistLogsButDoesNotPanic`. The existing arcx tests confirm `arcx_version()` and `SET GLOBAL arcx.storage_root` propagate across 3–4 concurrent pool connections.
+
 ## Bug fixes
 
 ### Parser no longer mis-resolves bare `time` column inside `EXTRACT(YEAR FROM time)`

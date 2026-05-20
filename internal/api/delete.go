@@ -93,7 +93,15 @@ type DeleteHandler struct {
 	config      *config.DeleteConfig
 	authManager *auth.AuthManager
 	coordinator DeleteCoordinator // nil in standalone mode
-	logger      zerolog.Logger
+	// tempDir is the absolute, sandbox-allowlisted directory used by
+	// rewriteS3File to stage the COPY-rewritten parquet locally before
+	// uploading. MUST match one of the prefixes added to DuckDB's
+	// allowed_directories in cmd/arc/main.go, otherwise the COPY ... TO
+	// fails with a permission error and DELETE on S3 backends silently
+	// breaks. main.go passes the same path as the import handler's upload
+	// dir; the two flows have identical sandbox requirements.
+	tempDir string
+	logger  zerolog.Logger
 }
 
 // DeleteRequest represents a delete operation request
@@ -151,14 +159,23 @@ var dangerousPrefixPatterns = []string{
 	"sp_",
 }
 
-// NewDeleteHandler creates a new delete handler
-func NewDeleteHandler(db *database.DuckDB, storage storage.Backend, cfg *config.DeleteConfig, authManager *auth.AuthManager, logger zerolog.Logger) *DeleteHandler {
+// NewDeleteHandler creates a new delete handler. tempDir MUST be the same
+// path cmd/arc/main.go added to the DuckDB sandbox's allowed_directories,
+// otherwise the COPY ... TO inside rewriteS3File fails on S3-backed
+// deployments. Logs a Warn on empty tempDir so misconfigured deployments
+// surface the issue at startup rather than at the first DELETE.
+func NewDeleteHandler(db *database.DuckDB, storage storage.Backend, cfg *config.DeleteConfig, authManager *auth.AuthManager, tempDir string, logger zerolog.Logger) *DeleteHandler {
+	componentLogger := logger.With().Str("component", "delete-handler").Logger()
+	if tempDir == "" {
+		componentLogger.Warn().Msg("NewDeleteHandler called with empty tempDir — DELETE on S3 backends will fail under the DuckDB sandbox; cmd/arc/main.go should pass the sandbox-allowlisted upload directory")
+	}
 	return &DeleteHandler{
 		db:          db,
 		storage:     storage,
 		config:      cfg,
 		authManager: authManager,
-		logger:      logger.With().Str("component", "delete-handler").Logger(),
+		tempDir:     tempDir,
+		logger:      componentLogger,
 	}
 }
 
@@ -463,7 +480,6 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	if match := dangerousKeywordPattern.FindString(where); match != "" {
 		return false, fmt.Errorf("WHERE clause contains forbidden keyword: %s", strings.ToUpper(match))
 	}
-
 
 	// Check for dangerous prefixes
 	for _, pattern := range dangerousPrefixPatterns {
@@ -782,15 +798,32 @@ type s3RewriteResult struct {
 // rewriteS3File handles file rewrite for S3 storage
 // DuckDB can read from S3 directly, then we write to a temp file and upload
 func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath, whereClause string, rowsBefore, rowsAfter int64) (int64, *s3RewriteResult, error) {
+	// Fail-closed when the handler was constructed without a sandbox-
+	// allowlisted tempDir. Without this guard, os.CreateTemp("", ...) would
+	// fall back to os.TempDir() — outside the sandbox — and the subsequent
+	// COPY ... TO would fail with a confusing DuckDB permission error. The
+	// constructor Warn surfaces the misconfiguration at startup; this
+	// fail-fast at request time provides a clearer signal in the response
+	// body for the (rare) case where a constructor warning was missed.
+	if h.tempDir == "" {
+		return 0, nil, fmt.Errorf("delete handler is misconfigured: tempDir is empty; the DELETE-on-S3 staging directory must be allowlisted in the DuckDB sandbox (see cmd/arc/main.go uploadDir wiring)")
+	}
 	db := h.db.DB()
 	deleted := rowsBefore - rowsAfter
 
-	// Create temp file locally for the rewritten data
-	tempFile, err := os.CreateTemp("", "arc-delete-*.parquet")
+	// Create temp file locally for the rewritten data. The destination
+	// directory MUST be inside DuckDB's allowed_directories — main.go
+	// passes the same sandbox-allowlisted path as the import-upload dir.
+	tempFile, err := os.CreateTemp(h.tempDir, "arc-delete-*.parquet")
 	if err != nil {
 		return 0, nil, fmt.Errorf("failed to create temp file: %w", err)
 	}
-	tempPath := tempFile.Name()
+	// ToSlash so Windows backslashes from os.CreateTemp match the
+	// forward-slash sandbox allowlist entry (h.tempDir is already
+	// normalized by main.go). The COPY ... TO statement below
+	// interpolates tempPath verbatim into SQL, so a backslash form
+	// would mismatch allowed_directories and the rewrite would fail.
+	tempPath := filepath.ToSlash(tempFile.Name())
 	tempFile.Close()
 	defer os.Remove(tempPath)
 

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -76,9 +77,23 @@ func (d *DuckDB) ArrowQueryWithProfileContext(ctx context.Context, query string)
 		return nil, nil, nil, fmt.Errorf("failed to acquire connection: %w", err)
 	}
 
-	// Create temp file for profiling output
-	tmpFile, err := os.CreateTemp("", "duckdb_profile_*.json")
-	if err != nil {
+	// Create temp file for profiling output. MUST land inside the DuckDB
+	// sandbox's allowed_directories — d.config.TempDirectory is always
+	// allowlisted, os.TempDir() is not. Empty TempDirectory short-circuits
+	// to the non-profile path without attempting the file create (CreateTemp
+	// with empty dir falls back to os.TempDir which the sandbox rejects).
+	var tmpFile *os.File
+	if d.config.TempDirectory == "" {
+		d.logger.Debug().Msg("Profile mode requested but TempDirectory is unset; returning Arrow result without profile data")
+	} else {
+		var err error
+		tmpFile, err = os.CreateTemp(d.config.TempDirectory, "duckdb_profile_*.json")
+		if err != nil {
+			d.logger.Warn().Err(err).Str("temp_dir", d.config.TempDirectory).Msg("Failed to create profile temp file; falling back to non-profile Arrow path")
+			tmpFile = nil
+		}
+	}
+	if tmpFile == nil {
 		// Fall back to non-profile Arrow query
 		var reader array.RecordReader
 		rawErr := conn.Raw(func(driverConn any) error {
@@ -100,7 +115,11 @@ func (d *DuckDB) ArrowQueryWithProfileContext(ctx context.Context, query string)
 	if _, err := conn.ExecContext(ctx, "PRAGMA enable_profiling='json'"); err != nil {
 		d.logger.Warn().Err(err).Msg("Failed to enable profiling")
 	}
-	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA profiling_output='%s'", profilePath)); err != nil {
+	// Escape profilePath against the same SQL-injection surface duckdb.go
+	// guards (operator's TempDirectory could contain a single quote).
+	// ToSlash so Windows backslashes from os.CreateTemp match the sandbox
+	// allowlist (allowed_directories stores forward-slash entries).
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA profiling_output='%s'", escapeSQLString(filepath.ToSlash(profilePath)))); err != nil {
 		d.logger.Warn().Err(err).Msg("Failed to set profiling output")
 	}
 	if _, err := conn.ExecContext(ctx, "SET custom_profiling_settings='{\"PLANNER\": \"true\", \"PLANNER_BINDING\": \"true\", \"PHYSICAL_PLANNER\": \"true\", \"OPERATOR_TIMING\": \"true\", \"OPERATOR_CARDINALITY\": \"true\"}'"); err != nil {

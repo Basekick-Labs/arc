@@ -36,14 +36,12 @@ func TestBuildDSN_ArcxEnabled(t *testing.T) {
 // ARCX_TEST_PATH is unset; CI does NOT set it. Local devs run after
 // `make` in the arcx repo.
 //
-// Exercises the real wiring: openDuckDB (which registers the connInitFn),
-// configureDatabase (which runs verifyArcxLoaded), and most importantly
-// **distinct concurrent pool connections** — sequential QueryRow calls
-// share an idle connection, so they would all pass even if connInitFn
-// only fired on the first connection. Holding 4 concurrent *sql.Conn
-// forces database/sql to open 4 distinct connections; if the
-// per-connection LOAD ever regresses, iter 2+ fails with
-// "function arcx_version does not exist".
+// Exercises the real wiring: configureDatabase runs loadArcxExtension
+// once for the whole pool (extension registration is database-wide in
+// DuckDB), then verifyArcxLoaded confirms the function is callable.
+// Holding 4 concurrent *sql.Conn forces database/sql to open 4 distinct
+// connections; if the database-wide LOAD ever regresses to per-connection,
+// iter 2+ fails with "function arcx_version does not exist".
 func TestArcxLoadsAndReportsVersion(t *testing.T) {
 	path := os.Getenv("ARCX_TEST_PATH")
 	if path == "" {
@@ -86,7 +84,8 @@ func TestArcxLoadsAndReportsVersion(t *testing.T) {
 	}
 
 	// Each pinned connection must have arcx_version() available — proves
-	// connInitFn fired on every pool member, not just the first.
+	// the database-wide LOAD propagated to every pool member, not just the
+	// connection that hosted the one-shot LOAD.
 	for i, c := range conns {
 		var ver string
 		if err := c.QueryRowContext(ctx, "SELECT arcx_version()").Scan(&ver); err != nil {
@@ -99,9 +98,10 @@ func TestArcxLoadsAndReportsVersion(t *testing.T) {
 	}
 }
 
-// TestArcxStorageRootIsSetOnEveryConn confirms the SET arcx.storage_root
-// statement runs alongside LOAD in connInitFn so every pool connection has
-// the setting available — without it, arc_partition_agg errors at Bind.
+// TestArcxStorageRootIsSetOnEveryConn confirms that SET GLOBAL arcx.storage_root
+// (set once by loadArcxExtension) propagates to every pool connection —
+// without it, arc_partition_agg errors at Bind on connections that never
+// happened to host the SET.
 func TestArcxStorageRootIsSetOnEveryConn(t *testing.T) {
 	path := os.Getenv("ARCX_TEST_PATH")
 	if path == "" {

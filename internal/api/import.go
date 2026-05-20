@@ -65,18 +65,37 @@ type ImportHandler struct {
 	authManager *auth.AuthManager
 	rbacManager RBACChecker
 
+	// uploadDir is the directory under which multipart uploads land. Must
+	// be one of the prefixes in the DuckDB sandbox's allowed_directories
+	// list, otherwise read_csv/read_parquet on the uploaded file fails.
+	// Empty means use the OS default (only safe before the sandbox lockdown
+	// was introduced — kept for legacy/test paths that don't go through
+	// main.go).
+	uploadDir string
+
 	// Stats
 	totalRequests atomic.Int64
 	totalRecords  atomic.Int64
 	totalErrors   atomic.Int64
 }
 
-// NewImportHandler creates a new ImportHandler
-func NewImportHandler(db *database.DuckDB, storage storage.Backend, logger zerolog.Logger) *ImportHandler {
+// NewImportHandler creates a new ImportHandler. uploadDir must be the same
+// path cmd/arc/main.go added to the DuckDB sandbox's allowed_directories,
+// otherwise read_csv/read_parquet on the uploaded file fails post-lockdown.
+// Logs a Warn on empty uploadDir; the request handler also fails-closed at
+// every POST so misconfiguration surfaces both at startup and at the first
+// import attempt. Tests that exercise the handler should pass a non-empty
+// path (typically a t.TempDir() inside LocalStorageRoot).
+func NewImportHandler(db *database.DuckDB, storage storage.Backend, uploadDir string, logger zerolog.Logger) *ImportHandler {
+	componentLogger := logger.With().Str("component", "import-handler").Logger()
+	if uploadDir == "" {
+		componentLogger.Warn().Msg("NewImportHandler called with empty uploadDir — imports will fail under the DuckDB sandbox; cmd/arc/main.go should pass the sandbox-allowlisted upload directory")
+	}
 	return &ImportHandler{
-		db:      db,
-		storage: storage,
-		logger:  logger.With().Str("component", "import-handler").Logger(),
+		db:        db,
+		storage:   storage,
+		uploadDir: uploadDir,
+		logger:    componentLogger,
 	}
 }
 
@@ -189,14 +208,32 @@ func (h *ImportHandler) handleFileImport(c *fiber.Ctx, format string, buildOpts 
 		})
 	}
 
-	// Save to temp file
-	tempDir, err := os.MkdirTemp("", "arc-import-*")
+	// Fail-closed when the handler was constructed without a sandbox-
+	// allowlisted uploadDir. Without this guard, os.MkdirTemp("", ...) would
+	// fall back to os.TempDir() — outside the DuckDB sandbox — and the
+	// post-upload read_csv/read_parquet would fail with a confusing
+	// permission error. The constructor Warn surfaces the misconfiguration
+	// at startup; this fail-fast at request time provides a clearer signal.
+	if h.uploadDir == "" {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "import handler is misconfigured: uploadDir is empty; the upload directory must be allowlisted in the DuckDB sandbox (see cmd/arc/main.go uploadDir wiring)",
+		})
+	}
+	// Save to temp file inside the sandbox-allowlisted upload directory.
+	tempDir, err := os.MkdirTemp(h.uploadDir, "arc-import-*")
 	if err != nil {
 		h.totalErrors.Add(1)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "failed to create temp directory: " + err.Error(),
 		})
 	}
+	// ToSlash so Windows backslashes from os.MkdirTemp match the
+	// forward-slash sandbox allowlist entry (h.uploadDir is already
+	// normalized by main.go). Without this, reads of the uploaded file
+	// via read_csv/read_parquet would fail with a permission error on
+	// Windows even though the upload landed inside the allowlisted prefix.
+	tempDir = filepath.ToSlash(tempDir)
 	defer os.RemoveAll(tempDir)
 
 	tempFile := filepath.Join(tempDir, "import."+format)
