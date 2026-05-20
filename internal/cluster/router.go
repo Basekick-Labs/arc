@@ -277,7 +277,10 @@ func (r *Router) doForward(ctx context.Context, node *Node, originalReq *http.Re
 	// inter-node forwarding correctly hits HTTPS peers when the
 	// cluster API serves TLS. String concat (rather than Sprintf)
 	// because this is on the hot path of every routed write.
-	targetURL := r.cfg.Scheme + "://" + node.APIAddress + originalReq.URL.Path
+	// EscapedPath() re-emits the original on-the-wire encoding —
+	// URL.Path is the decoded form, so paths containing spaces or
+	// non-ASCII bytes would otherwise produce an invalid forwarded URL.
+	targetURL := r.cfg.Scheme + "://" + node.APIAddress + originalReq.URL.EscapedPath()
 	if originalReq.URL.RawQuery != "" {
 		targetURL += "?" + originalReq.URL.RawQuery
 	}

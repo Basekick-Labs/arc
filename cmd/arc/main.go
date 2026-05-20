@@ -1688,21 +1688,29 @@ func main() {
 
 		// Build a single shared *http.Client for the cache-invalidate
 		// fan-out so connection pooling actually reuses sockets across
-		// compactions. We reuse the coordinator's already-loaded
-		// *tls.Config rather than re-reading cert/key/CA from disk; when
-		// cluster.tls_enabled is false the getter returns nil and the
-		// transport falls back to plaintext (or system roots if the URL
-		// is https://). No Client.Timeout: the per-request
+		// compactions. Only constructed when cluster mode is on —
+		// compaction itself works in OSS/standalone, but the fan-out
+		// path is cluster-only (the per-call `if clusterCoordinator
+		// != nil` guard inside the callback is what actually decides
+		// whether to send). We reuse the coordinator's already-loaded
+		// *tls.Config rather than re-reading cert/key/CA from disk;
+		// when cluster.tls_enabled is false the getter returns nil
+		// and the transport falls back to plaintext (or system roots
+		// if the URL is https://). No Client.Timeout: the per-request
 		// context.WithTimeout below is the policy bound; an extra
 		// Client.Timeout would be redundant dead config.
-		clusterHTTPClient := &http.Client{
-			Transport: security.NewClusterHTTPTransport(clusterCoordinator.ClusterTLSConfig()),
+		var clusterHTTPClient *http.Client
+		var clusterScheme string
+		if clusterCoordinator != nil {
+			clusterHTTPClient = &http.Client{
+				Transport: security.NewClusterHTTPTransport(clusterCoordinator.ClusterTLSConfig()),
+			}
+			clusterScheme = security.SchemeForServer(cfg.Server.TLSEnabled)
+			log.Info().
+				Str("scheme", clusterScheme).
+				Bool("cluster_tls", cfg.Cluster.TLSEnabled).
+				Msg("Post-compaction cache-invalidate fan-out transport initialised")
 		}
-		clusterScheme := security.SchemeForServer(cfg.Server.TLSEnabled)
-		log.Info().
-			Str("scheme", clusterScheme).
-			Bool("cluster_tls", cfg.Cluster.TLSEnabled).
-			Msg("Post-compaction cache-invalidate fan-out transport initialised")
 
 		compactionManager.SetOnCompactionComplete(func() {
 			// Local invalidation
