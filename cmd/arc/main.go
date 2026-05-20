@@ -431,6 +431,25 @@ func main() {
 	resolveLocalDirSymlinks("database.temp_directory", &dbConfig.TempDirectory)
 	resolveLocalDirSymlinks("compaction.temp_directory", &dbConfig.CompactionTempDirectory)
 
+	// Production safety net: if every path contributing to the sandbox
+	// allowlist is empty, DuckDB will refuse every file-touching query.
+	// internal/database.lockdownExternalAccess logs a Warn in that case
+	// (it's library code that test fixtures and embeddings also call), but
+	// for the production binary an empty allowlist is unrecoverable
+	// misconfiguration — fail-fast at startup rather than serving 500s on
+	// every query. main.go's "./.tmp" fallback for TempDirectory makes this
+	// branch effectively unreachable today; this guard is here to catch a
+	// future refactor that drops the fallback.
+	if dbConfig.LocalStorageRoot == "" &&
+		dbConfig.TempDirectory == "" &&
+		dbConfig.CompactionTempDirectory == "" &&
+		dbConfig.S3Bucket == "" &&
+		dbConfig.ColdS3Bucket == "" &&
+		dbConfig.AzureContainer == "" &&
+		dbConfig.ColdAzureContainer == "" {
+		log.Fatal().Msg("sandbox allowlist would be empty — every file-touching query would fail; check arc.toml [storage] and [database] config")
+	}
+
 	// Compute and create the import-upload directory. Lives under the
 	// operator-configured TempDirectory (always non-empty by this point —
 	// see the "./.tmp" fallback above). The DB sandbox whitelists exactly
