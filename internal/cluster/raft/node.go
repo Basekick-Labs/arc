@@ -207,10 +207,29 @@ func (n *Node) Start() error {
 	}
 	n.snapStore = snapStore
 
-	// Create Raft instance
+	// Create Raft instance. Inside NewRaft, hashicorp/raft synchronously
+	// calls fsm.Restore (if a snapshot exists) — path validation in
+	// Restore logs+skips malicious entries and increments
+	// rejectedPaths. Post-NewRaft, log replay runs on the runFSM
+	// goroutine; ClusterFSM.Apply rejects malicious entries via the
+	// same path-validation helper (the Apply error is silently
+	// swallowed for replayed entries because req.future == nil, but
+	// the entry doesn't land in f.files and the counter still
+	// increments — see GHSA-f85q-mvg8-qf37 design notes on
+	// rejectManifestPath).
 	ra, err := raft.NewRaft(raftConfig, n.fsm, logStore, stableStore, snapStore, transport)
 	if err != nil {
 		return fmt.Errorf("failed to create raft instance: %w", err)
+	}
+	if count := n.fsm.RejectedPathsCount(); count > 0 {
+		// Only fires for snapshot Restore rejections (synchronous
+		// inside NewRaft). Log-replay rejections happen on runFSM
+		// post-NewRaft and surface via the per-entry Error log lines
+		// emitted by rejectManifestPath. Operators alerting on
+		// rejectedPaths metric scrape will see both.
+		n.logger.Error().
+			Int64("count", count).
+			Msg("manifest path validation refused entries during snapshot restore — see per-entry Error logs tagged 'manifest path validation failed' for the offending paths. Sources: pre-validation Arc version, OR prior compromise. Audit and verify they are not present in active queries.")
 	}
 	n.raft = ra
 
