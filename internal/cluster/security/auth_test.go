@@ -24,9 +24,73 @@ func TestComputeCacheInvalidateHMAC_Determinism(t *testing.T) {
 	// caught immediately. If this hash changes, you are breaking the
 	// on-wire format the receiver expects — bump the protocol version and
 	// document the migration before changing the constant.
-	const want = "0babfa3cf90d1a85e9f55f37a896f489833470f1a39af0ffa9215e834eed15eb"
+	const want = "6740a471e27f9657323ef9cb0013e50c42cd4a31e36ced84489e970697559878"
 	if mac1 != want {
 		t.Errorf("MAC drift detected:\n  got  %s\n  want %s\nIf this test fails, the message format changed — coordinate with the deployed-version matrix before merging.", mac1, want)
+	}
+}
+
+// TestComputeHMAC_Determinism pins the on-wire format for the join HMAC
+// (used by cluster.AuthenticatePeer). Same purpose as the cache-invalidate
+// determinism test: a silent format change across an Arc upgrade silently
+// breaks peer joins. Bump the protocol version and document the migration
+// before changing the constant.
+func TestComputeHMAC_Determinism(t *testing.T) {
+	t.Parallel()
+	got := ComputeHMAC("secret", "nonce-abc", "node-1", "cluster-A", 1700000000)
+	const want = "49f7533612fce7403bc6496e7de19132b6f9812e5e6731bafeb6c3f5f18df2e4"
+	if got != want {
+		t.Errorf("join MAC drift detected:\n  got  %s\n  want %s\nIf this test fails, the join-endpoint message format changed — coordinate with the deployed-version matrix before merging.", got, want)
+	}
+}
+
+// TestComputeFetchHMAC_Determinism pins the on-wire format for the
+// peer-fetch HMAC (used by internal/cluster/filereplication.go).
+func TestComputeFetchHMAC_Determinism(t *testing.T) {
+	t.Parallel()
+	got := ComputeFetchHMAC("secret", "nonce-abc", "node-1", "cluster-A", "/some/path", 1700000000)
+	const want = "34181b01d618592db8955341970c40d1cefb7a8e624be25ab061d8b2e84f1c0a"
+	if got != want {
+		t.Errorf("fetch MAC drift detected:\n  got  %s\n  want %s\nIf this test fails, the fetch-endpoint message format changed — coordinate with the deployed-version matrix before merging.", got, want)
+	}
+}
+
+// TestComputeForwardHMAC_Determinism pins the on-wire format for the
+// leader-forwarding HMAC (used by internal/cluster/forward_apply.go).
+// The payload "hello" hashes to a fixed SHA-256, which then feeds the
+// outer HMAC, so this also indirectly pins that we still SHA-256 the
+// payload before binding it (rather than e.g. switching to BLAKE3).
+func TestComputeForwardHMAC_Determinism(t *testing.T) {
+	t.Parallel()
+	got := ComputeForwardHMAC("secret", "nonce-abc", "node-1", "cluster-A", []byte("hello"), 1700000000)
+	const want = "f1bd7574435144fd4741832cc4985d31aa87d6d5e99f25a0434b6482a6c8b7cf"
+	if got != want {
+		t.Errorf("forward MAC drift detected:\n  got  %s\n  want %s\nIf this test fails, the forward-endpoint message format changed — coordinate with the deployed-version matrix before merging.", got, want)
+	}
+}
+
+// TestValidate_RejectsMalformedHexMAC pins the new fail-closed behaviour
+// of the hex-decode step in every Validate*HMAC. A non-hex receivedMAC
+// must reject; previously the code compared hex strings directly, which
+// also rejected, but now we explicitly decode hex first — the test pins
+// that invalid hex doesn't slip through to hmac.Equal as raw bytes that
+// might inadvertently match a recompute.
+func TestValidate_RejectsMalformedHexMAC(t *testing.T) {
+	t.Parallel()
+	ts := time.Now().Unix()
+	const malformed = "not-hex-at-all-zzzzzzzzzzzzzzzz"
+
+	if err := ValidateHMAC("s", "n", "id", "c", ts, malformed, 5*time.Minute); err == nil {
+		t.Error("ValidateHMAC accepted a non-hex MAC")
+	}
+	if err := ValidateFetchHMAC("s", "n", "id", "c", "/p", ts, malformed, 5*time.Minute); err == nil {
+		t.Error("ValidateFetchHMAC accepted a non-hex MAC")
+	}
+	if err := ValidateForwardHMAC("s", "n", "id", "c", []byte("x"), ts, malformed, 5*time.Minute); err == nil {
+		t.Error("ValidateForwardHMAC accepted a non-hex MAC")
+	}
+	if err := ValidateCacheInvalidateHMAC("s", "n", "id", "c", ts, malformed, 5*time.Minute); err == nil {
+		t.Error("ValidateCacheInvalidateHMAC accepted a non-hex MAC")
 	}
 }
 
