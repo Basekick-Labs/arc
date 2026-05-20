@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"path"
 	"strings"
 	"sync"
 
@@ -51,15 +52,49 @@ func NewMiddleware(config MiddlewareConfig) fiber.Handler {
 			return c.Next()
 		}
 
-		// Check if route is public
-		path := c.Path()
+		// Normalize the request path before public-route / prefix matching.
+		// c.Path() is the raw fasthttp PathOriginal — Fiber does NOT
+		// resolve `..`, `.`, or `//` before handing it to middleware. Two
+		// concrete failure modes the un-normalized form admits:
+		//
+		//   - `/metrics//foo` lexically starts with `/metrics/`, so the
+		//     anchored HasPrefix below admits it; today it falls through
+		//     to a Fiber 404 because the router also doesn't normalize,
+		//     but the day someone wires up a wildcard route this becomes
+		//     a real bypass.
+		//   - `/metrics/../api/v1/query` lexically starts with `/metrics/`
+		//     and the bypass branch fires; same dead-end on routing today,
+		//     same future hazard.
+		//
+		// path.Clean collapses `//` into `/`, removes `/.` segments, and
+		// resolves `/..` against the preceding segment, so the matching
+		// below operates on the canonical form a downstream router would
+		// see. This is also belt-and-suspenders against the audit-log
+		// pollution surface — the audit middleware logs c.Path() verbatim,
+		// so an attacker who can pollute lookup with weird paths can also
+		// pollute the audit trail.
+		reqPath := path.Clean(c.Path())
 		for _, route := range config.PublicRoutes {
-			if path == route {
+			if reqPath == route {
 				return c.Next()
 			}
 		}
 		for _, prefix := range config.PublicPrefixes {
-			if strings.HasPrefix(path, prefix) {
+			// Guard against empty-string entries. `HasPrefix(reqPath, "/")`
+			// is true for every real HTTP path, so an empty prefix would
+			// disable auth wholesale. No legitimate config has one, but a
+			// future bug (e.g. an env-var split landing an empty entry)
+			// would silently open the whole API.
+			if prefix == "" {
+				continue
+			}
+			// Anchor the match: require exact path or true subdirectory
+			// (`prefix + "/"`). Without this, a configured prefix `/metrics`
+			// also matches `/metricsX`, `/metrics-secret`, etc. — any route
+			// happening to share the same byte prefix would silently bypass
+			// auth. Matches the same shape gemini-code-assist flagged on
+			// PR #442's deniedRoots check.
+			if reqPath == prefix || strings.HasPrefix(reqPath, prefix+"/") {
 				return c.Next()
 			}
 		}

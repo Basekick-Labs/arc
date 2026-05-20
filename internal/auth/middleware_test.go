@@ -226,6 +226,89 @@ func TestMiddleware_PublicPrefixes(t *testing.T) {
 	}
 }
 
+// TestMiddleware_PublicPrefixes_AnchoredMatch is the regression test for the
+// gemini-flagged anchoring gap. Before the fix, strings.HasPrefix(path, "/metrics")
+// would silently let /metricsX, /metrics-secret, /metricsadmin bypass auth —
+// any route happening to share the byte prefix slipped through. The fix
+// requires exact-equal or true-subdirectory (`prefix + "/"`) matching after
+// path.Clean normalisation, so non-canonical shapes like `/metrics//foo`,
+// `/metrics/./x`, and `/metrics/../X` cannot pollute the bypass branch
+// either.
+//
+// We assert against status, not against registered handlers. Bypass paths
+// (200 == handler ran) get a real handler; non-bypass paths (401 == auth
+// returned without c.Next) do not — Fiber's middleware short-circuits
+// before route lookup.
+func TestMiddleware_PublicPrefixes_AnchoredMatch(t *testing.T) {
+	config := DefaultMiddlewareConfig()
+	// Inject an empty string and a non-empty prefix together. The empty
+	// entry tests the empty-prefix guard (must NOT make every request a
+	// bypass); the non-empty entry tests the anchored-match contract.
+	config.PublicPrefixes = []string{"", "/metrics"}
+
+	_, app, cleanup := setupMiddlewareTest(t, config)
+	defer cleanup()
+
+	// Only register the bypass paths — 401 paths short-circuit before
+	// route dispatch, so handlers aren't required.
+	for _, p := range []string{
+		"/metrics", "/metrics/", "/metrics/prometheus", "/metrics/sub/leaf",
+	} {
+		app.Get(p, func(c *fiber.Ctx) error { return c.SendString("ok") })
+	}
+
+	tests := []struct {
+		name           string
+		path           string
+		expectedStatus int
+		why            string
+	}{
+		// Positive: must bypass.
+		{"exact match", "/metrics", fiber.StatusOK, "exact-equal must bypass"},
+		{"trailing-slash match", "/metrics/", fiber.StatusOK, "prefix + '/' must bypass"},
+		{"true subdirectory", "/metrics/prometheus", fiber.StatusOK, "true subdir must bypass"},
+		{"deep subdirectory", "/metrics/sub/leaf", fiber.StatusOK, "deep subdir must bypass"},
+
+		// Negative: sibling shapes that share the prefix bytes but aren't subdirectories.
+		{"sibling path with same prefix bytes", "/metricsX", fiber.StatusUnauthorized, "/metricsX is NOT a subdir of /metrics"},
+		{"sibling with separator-shaped suffix", "/metrics-secret", fiber.StatusUnauthorized, "/metrics-secret is NOT a subdir of /metrics"},
+		{"sibling alphanum suffix", "/metricsadmin", fiber.StatusUnauthorized, "/metricsadmin is NOT a subdir of /metrics"},
+
+		// Negative: parent-traversal shapes that path.Clean must normalise
+		// AWAY from the /metrics tree before the bypass branch checks
+		// them. The middleware sees the normalised form and correctly
+		// rejects the request (401). We only test escape-the-prefix
+		// shapes here because non-escaping shapes like `/metrics//foo` and
+		// `/metrics/./foo` — while correctly bypassed by the middleware —
+		// hit a Fiber router that DOES NOT normalise, so they 404 instead
+		// of reaching the registered handler. Asserting 404 would couple
+		// the test to Fiber's routing behaviour; asserting NOT-401 (i.e.
+		// auth bypass happened) is what we actually care about, and the
+		// security-relevant assertion is that escape shapes return 401.
+		{"parent-traversal escapes the prefix", "/metrics/../sensitive", fiber.StatusUnauthorized, "after path.Clean → /sensitive, NOT under /metrics"},
+		{"parent-traversal escapes via leading dot-dot", "/metrics/sub/../../etc", fiber.StatusUnauthorized, "after path.Clean → /etc, NOT under /metrics"},
+
+		// Empty-prefix guard: an empty entry in PublicPrefixes must NOT
+		// cause `/any-path` to be treated as bypass. If the guard breaks,
+		// /any-other-path would return 200 instead of 401.
+		{"empty prefix entry does not match unrelated paths", "/some/random/api", fiber.StatusUnauthorized, "empty-string prefix must be skipped, NOT match every path"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", tt.path, nil)
+			resp, err := app.Test(req)
+			if err != nil {
+				t.Fatalf("Request failed: %v", err)
+			}
+			if resp.StatusCode != tt.expectedStatus {
+				t.Errorf("path %q: expected status %d, got %d (%s)",
+					tt.path, tt.expectedStatus, resp.StatusCode, tt.why)
+			}
+		})
+	}
+}
+
 // TestMiddleware_NoToken tests request without any token
 func TestMiddleware_NoToken(t *testing.T) {
 	config := DefaultMiddlewareConfig()

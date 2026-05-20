@@ -177,6 +177,14 @@ func main() {
 	// Initialize shutdown coordinator
 	shutdownCoordinator := shutdown.New(30*time.Second, logger.Get("shutdown"))
 
+	// Opt-in pprof on a localhost listener (no-op unless ARC_DEBUG_PPROF=1).
+	// Replaces the previous behaviour where pprof was unconditionally
+	// mounted on the public Fiber app and any network-reachable caller
+	// could fetch heap dumps or pin a CPU core via /debug/pprof/profile.
+	// See cmd/arc/debug_pprof.go for the rationale. Closes audit #2
+	// (GHSA-j93g-rp6m-j32m) from 2026-05-19.
+	startDebugPprofIfEnabled(shutdownCoordinator, logger.Get("debug-pprof"))
+
 	// arcx (Arc Enterprise DuckDB extension): gate via license before
 	// passing the path down to the DB layer. The extension binary is the
 	// licensing perimeter, but having Arc refuse to LOAD without a valid
@@ -1400,7 +1408,12 @@ func main() {
 		// without auth tokens after compaction. Access is gated by X-Arc-Internal header
 		// validation in the handler. Cluster nodes should be on a private network.
 		middlewareConfig.PublicRoutes = append(middlewareConfig.PublicRoutes, "/health", "/ready", "/api/v1/auth/verify", "/api/v1/internal/cache/invalidate")
-		middlewareConfig.PublicPrefixes = append(middlewareConfig.PublicPrefixes, "/metrics", "/debug/pprof")
+		// /metrics stays public — Prometheus scrapers expect it. It is
+		// already in auth.DefaultMiddlewareConfig().PublicPrefixes, so no
+		// further append is needed here. /debug/pprof is intentionally NOT
+		// here: pprof is no longer mounted on the public Fiber app
+		// (internal/api/server.go). The opt-in localhost pprof listener
+		// runs on a separate port; see startDebugPprofIfEnabled.
 		server.GetApp().Use(auth.NewMiddleware(middlewareConfig))
 
 		// Initialize RBAC Manager (Enterprise feature)
@@ -2062,7 +2075,15 @@ func main() {
 		auditHandler.RegisterRoutes(server.GetApp())
 	}
 
-	// Register HTTP server shutdown hook (first to stop accepting new requests)
+	// Register HTTP server shutdown hook (first to stop accepting new
+	// requests). The 30-second arg is the HTTP server's INTERNAL drain
+	// timeout — independent of shutdownCoordinator's own 30-second
+	// budget. If the coordinator ctx expires before this hook completes,
+	// the coordinator skips remaining hooks; the internal timeout is a
+	// best-effort upper bound on this hook's slice of that budget. The
+	// debug-pprof hook (registered earlier in main, same priority) uses
+	// srv.Close() instead of Shutdown(ctx) to avoid letting a long
+	// /debug/pprof/profile?seconds=N capture starve this hook.
 	shutdownCoordinator.RegisterHook("http-server", func(ctx context.Context) error {
 		return server.Shutdown(30 * time.Second)
 	}, shutdown.PriorityHTTPServer)
