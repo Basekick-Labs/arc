@@ -6,10 +6,12 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster"
+	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/rs/zerolog"
 )
 
@@ -26,6 +28,7 @@ type ShardRouter struct {
 	shardMap   *ShardMap
 	localNode  *cluster.Node
 	httpClient *http.Client
+	scheme     string
 	logger     zerolog.Logger
 
 	// Stats
@@ -42,6 +45,20 @@ type ShardRouterConfig struct {
 	LocalNode *cluster.Node
 	Timeout   time.Duration
 	Logger    zerolog.Logger
+
+	// Transport is the http.Transport to use for forwarded requests.
+	// When nil, NewShardRouter builds a default plaintext transport via
+	// security.NewClusterHTTPTransport(nil). Callers running with
+	// server.tls_enabled OR cluster.tls_enabled MUST pass a TLS-aware
+	// transport built via security.NewClusterHTTPTransport(tlsCfg);
+	// otherwise inter-shard forwarding fails the TLS handshake at every
+	// peer.
+	Transport *http.Transport
+
+	// Scheme is "http" or "https" — must match what the receiving
+	// peer's Fiber listener serves (driven by server.tls_enabled,
+	// identical on every cluster node). When empty, defaults to "http".
+	Scheme string
 }
 
 // NewShardRouter creates a new shard router.
@@ -50,18 +67,28 @@ func NewShardRouter(cfg *ShardRouterConfig) *ShardRouter {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
+	scheme := cfg.Scheme
+	if scheme == "" {
+		scheme = "http"
+	}
+
+	transport := cfg.Transport
+	if transport == nil {
+		// Default pool settings (MaxIdleConns/MaxIdleConnsPerHost/
+		// IdleConnTimeout) live as shared constants in security/tls.go
+		// so any tuning change lands across every cluster-internal HTTP
+		// client at once.
+		transport = security.NewClusterHTTPTransport(nil)
+	}
 
 	return &ShardRouter{
 		shardMap:  cfg.ShardMap,
 		localNode: cfg.LocalNode,
 		httpClient: &http.Client{
-			Timeout: timeout,
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     90 * time.Second,
-			},
+			Timeout:   timeout,
+			Transport: transport,
 		},
+		scheme: scheme,
 		logger: cfg.Logger.With().Str("component", "shard-router").Logger(),
 	}
 }
@@ -200,11 +227,20 @@ func (r *ShardRouter) GetShardForDatabase(database string) int {
 
 // forward sends a request to another node.
 func (r *ShardRouter) forward(ctx context.Context, node *cluster.Node, originalReq *http.Request) (*http.Response, error) {
-	// Build target URL
-	targetURL := "http://" + node.APIAddress + originalReq.URL.Path
-	if originalReq.URL.RawQuery != "" {
-		targetURL += "?" + originalReq.URL.RawQuery
-	}
+	// Build target URL via *url.URL so an IPv6 literal in
+	// node.APIAddress round-trips bracketed, and so paths with
+	// percent-encoded bytes or non-ASCII characters land intact at
+	// the peer (RawPath carries the on-the-wire encoding; Path is the
+	// decoded form; url.URL.String() prefers RawPath when set). Scheme
+	// is taken from ShardRouter.scheme so inter-shard forwarding hits
+	// HTTPS peers when the cluster API serves TLS.
+	targetURL := (&url.URL{
+		Scheme:   r.scheme,
+		Host:     node.APIAddress,
+		Path:     originalReq.URL.Path,
+		RawPath:  originalReq.URL.RawPath,
+		RawQuery: originalReq.URL.RawQuery,
+	}).String()
 
 	// Read and buffer body for forwarding
 	var bodyReader io.Reader
