@@ -1213,6 +1213,74 @@ func TestApplyBatchFileOps_RejectsZeroCreatedAt_AtomicPrevalidation(t *testing.T
 	})
 }
 
+// TestApplyBatchFileOps_RejectsEmptyDeletePath_AtomicPrevalidation pins
+// that the batch pre-pass also catches structural invariants for
+// Delete ops (unmarshal success + non-empty path). Without this, a
+// batch with [legit, delete-with-empty-path] would have applied the
+// legit op before applyDeleteFile rejected the second — violating
+// batch atomicity. Gemini #446-r4.
+func TestApplyBatchFileOps_RejectsEmptyDeletePath_AtomicPrevalidation(t *testing.T) {
+	t.Parallel()
+	fsm := newTestFSM()
+
+	legitFile := makeFileEntry("db/cpu/2026/05/20/15/legit.parquet", "db", "cpu", 100)
+	legitPayload, _ := json.Marshal(RegisterFilePayload{File: legitFile})
+	emptyDelPayload, _ := json.Marshal(DeleteFilePayload{Path: "", Reason: "test"})
+
+	batchData := makeCommand(t, CommandBatchFileOps, BatchFileOpsPayload{
+		Ops: []BatchFileOp{
+			{Type: CommandRegisterFile, Payload: legitPayload},
+			{Type: CommandDeleteFile, Payload: emptyDelPayload},
+		},
+	})
+	result := fsm.Apply(&raft.Log{Index: 1, Data: batchData})
+	if result == nil {
+		t.Fatal("batch with empty-path Delete should error")
+	}
+	if _, ok := result.(error); !ok {
+		t.Fatalf("expected error result, got %T", result)
+	}
+	// Atomic: legit Register MUST NOT land.
+	if fsm.FileCount() != 0 {
+		t.Errorf("batch atomicity violated: f.files has %d entries (expected 0)", fsm.FileCount())
+	}
+	if _, exists := fsm.GetFile(legitFile.Path); exists {
+		t.Error("legit op preceding empty-path Delete MUST NOT land")
+	}
+	// Delete path is not validated for shape (it's a map-key lookup),
+	// so the rejectedPaths counter is NOT incremented by this case —
+	// only by ValidateManifestPath rejections.
+	if c := fsm.RejectedPathsCount(); c != 0 {
+		t.Errorf("empty-Delete-path rejection should NOT touch rejectedPaths counter (got %d)", c)
+	}
+}
+
+// TestApplyBatchFileOps_RejectsMalformedDeletePayload_AtomicPrevalidation
+// pins the second half of the Delete pre-check: if op.Payload doesn't
+// even unmarshal as a DeleteFilePayload, refuse the whole batch.
+// Gemini #446-r4.
+func TestApplyBatchFileOps_RejectsMalformedDeletePayload_AtomicPrevalidation(t *testing.T) {
+	t.Parallel()
+	fsm := newTestFSM()
+
+	legitFile := makeFileEntry("db/cpu/2026/05/20/15/legit.parquet", "db", "cpu", 100)
+	legitPayload, _ := json.Marshal(RegisterFilePayload{File: legitFile})
+
+	batchData := makeCommand(t, CommandBatchFileOps, BatchFileOpsPayload{
+		Ops: []BatchFileOp{
+			{Type: CommandRegisterFile, Payload: legitPayload},
+			{Type: CommandDeleteFile, Payload: []byte("not-valid-json{")},
+		},
+	})
+	result := fsm.Apply(&raft.Log{Index: 1, Data: batchData})
+	if result == nil {
+		t.Fatal("batch with malformed Delete payload should error")
+	}
+	if fsm.FileCount() != 0 {
+		t.Errorf("batch atomicity violated: legit op landed despite malformed Delete (count=%d)", fsm.FileCount())
+	}
+}
+
 // TestApplyUpdateFile_RejectsZeroCreatedAt pins the standalone (non-batch)
 // path's CreatedAt requirement on Update. Gemini #446-r2.
 func TestApplyUpdateFile_RejectsZeroCreatedAt(t *testing.T) {

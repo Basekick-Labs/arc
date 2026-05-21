@@ -832,8 +832,24 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 			}
 			decoded[i] = up
 		case CommandDeleteFile:
-			// no decode/validate here; applyDeleteFile handles the path
-			// as a map key (no-op for unknown keys).
+			// Delete paths intentionally bypass ValidateManifestPath
+			// (applyDeleteFile only uses the path as a map key — delete
+			// of a non-existent key is a no-op). BUT we still must
+			// pre-check the basic structural invariants that
+			// applyDeleteFile enforces: unmarshal success and non-empty
+			// path. Without this, a malformed Delete payload would pass
+			// the pre-pass and fail mid-apply, violating the batch
+			// atomicity invariant. (We decode for the structural check
+			// but don't store the result — the apply loop re-decodes
+			// from op.Payload since applyDeleteFile has no *Struct
+			// variant.)
+			var dp DeleteFilePayload
+			if err := json.Unmarshal(op.Payload, &dp); err != nil {
+				return fmt.Errorf("batch file ops: op[%d] unmarshal: %w", i, err)
+			}
+			if dp.Path == "" {
+				return fmt.Errorf("batch file ops: op[%d]: delete file: path is required", i)
+			}
 		default:
 			return fmt.Errorf("batch file ops: op[%d] unsupported type: %d", i, op.Type)
 		}
