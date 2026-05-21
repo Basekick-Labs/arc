@@ -613,7 +613,13 @@ func (f *ClusterFSM) applyDeleteFile(payload []byte) interface{} {
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fmt.Errorf("failed to unmarshal delete file payload: %w", err)
 	}
+	return f.applyDeleteFileStruct(p)
+}
 
+// applyDeleteFileStruct is the struct-taking variant of applyDeleteFile.
+// applyBatchFileOps calls this directly after unmarshalling once during
+// pre-validation, avoiding a second unmarshal in the apply loop.
+func (f *ClusterFSM) applyDeleteFileStruct(p DeleteFilePayload) interface{} {
 	if p.Path == "" {
 		return fmt.Errorf("delete file: path is required")
 	}
@@ -834,15 +840,13 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 		case CommandDeleteFile:
 			// Delete paths intentionally bypass ValidateManifestPath
 			// (applyDeleteFile only uses the path as a map key — delete
-			// of a non-existent key is a no-op). BUT we still must
-			// pre-check the basic structural invariants that
-			// applyDeleteFile enforces: unmarshal success and non-empty
-			// path. Without this, a malformed Delete payload would pass
-			// the pre-pass and fail mid-apply, violating the batch
-			// atomicity invariant. (We decode for the structural check
-			// but don't store the result — the apply loop re-decodes
-			// from op.Payload since applyDeleteFile has no *Struct
-			// variant.)
+			// of a non-existent key is a no-op). BUT we still pre-check
+			// the structural invariants that applyDeleteFile enforces:
+			// unmarshal success and non-empty path. Without this, a
+			// malformed Delete payload would pass the pre-pass and fail
+			// mid-apply, violating the batch atomicity invariant. The
+			// decoded payload is stored in decoded[i] so the apply loop
+			// reuses it (one unmarshal per Delete op instead of two).
 			var dp DeleteFilePayload
 			if err := json.Unmarshal(op.Payload, &dp); err != nil {
 				return fmt.Errorf("batch file ops: op[%d] unmarshal: %w", i, err)
@@ -850,6 +854,7 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 			if dp.Path == "" {
 				return fmt.Errorf("batch file ops: op[%d]: delete file: path is required", i)
 			}
+			decoded[i] = dp
 		default:
 			return fmt.Errorf("batch file ops: op[%d] unsupported type: %d", i, op.Type)
 		}
@@ -867,7 +872,7 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 		case CommandRegisterFile:
 			result = f.applyRegisterFileStruct(decoded[i].(RegisterFilePayload), logIndex)
 		case CommandDeleteFile:
-			result = f.applyDeleteFile(op.Payload)
+			result = f.applyDeleteFileStruct(decoded[i].(DeleteFilePayload))
 		case CommandUpdateFile:
 			result = f.applyUpdateFileStruct(decoded[i].(UpdateFilePayload), logIndex)
 		default:
@@ -876,11 +881,11 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 			// missing the default arm.
 			return fmt.Errorf("batch file ops: op[%d] unsupported type: %d", i, op.Type)
 		}
-		// apply*FileStruct and applyDeleteFile return nil on success or
-		// an error on failure — they never return a non-nil non-error
-		// value. The type-assert is defensive: if either handler is ever
-		// refactored to return something unexpected, we propagate it as
-		// an error rather than silently ignoring it.
+		// apply*FileStruct return nil on success or an error on failure
+		// — they never return a non-nil non-error value. The type-assert
+		// is defensive: if any handler is ever refactored to return
+		// something unexpected, we propagate it as an error rather than
+		// silently ignoring it.
 		if result != nil {
 			if err, ok := result.(error); ok {
 				return fmt.Errorf("batch file ops: op[%d] (type=%d): %w", i, op.Type, err)
