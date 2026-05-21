@@ -1264,10 +1264,81 @@ func (c *Coordinator) handleLeaveNotify(leave *protocol.LeaveNotify) {
 // This is called when a reader connects to start receiving WAL entries.
 // NOTE: We don't close the connection here - the sender takes ownership.
 func (c *Coordinator) handleReplicateSync(conn net.Conn, syncReq *protocol.ReplicateSync) {
+	remoteAddr := conn.RemoteAddr().String()
+
+	// Authentication: validate the HMAC against the cluster shared secret
+	// BEFORE accepting the connection into the replication sender. See
+	// GHSA-wfgr-8x84-22q7 / CVE-2026-48106 (audit X1).
+	//
+	// Refuse-when-unconfigured posture: when cluster.shared_secret is
+	// empty, replication has no legitimate authenticated caller — refuse
+	// every request uniformly so an attacker can't probe to distinguish
+	// "no secret configured" from "wrong MAC". Same shape as the
+	// cache-invalidate endpoint (PR #444).
+	if c.cfg.SharedSecret == "" {
+		c.logger.Warn().
+			Str("peer", remoteAddr).
+			Str("reader_id", syncReq.ReaderID).
+			Msg("Replication sync rejected: cluster.shared_secret not configured (peer replication requires it)")
+		c.sendReplicationSyncError(conn, "peer replication is not configured on this node")
+		return
+	}
+	if syncReq.HMAC == "" || syncReq.Nonce == "" || syncReq.ClusterName == "" || syncReq.Timestamp == 0 {
+		c.logger.Warn().
+			Str("peer", remoteAddr).
+			Str("reader_id", syncReq.ReaderID).
+			Msg("Replication sync rejected: missing one or more auth fields (nonce, cluster_name, timestamp, hmac)")
+		c.sendReplicationSyncError(conn, "missing authentication fields")
+		return
+	}
+	// Reject requests claiming to be from this node itself: replication
+	// sender → receiver is a peer-to-peer flow; a self-addressed request
+	// is either a misconfiguration or a confused attacker.
+	if c.localNode != nil && syncReq.ReaderID == c.localNode.ID {
+		c.logger.Warn().
+			Str("peer", remoteAddr).
+			Str("reader_id", syncReq.ReaderID).
+			Msg("Replication sync rejected: self-addressed request")
+		c.sendReplicationSyncError(conn, "authentication failed")
+		return
+	}
+	// Fast-path cluster name reject before HMAC compute.
+	if syncReq.ClusterName != c.cfg.ClusterName {
+		c.logger.Warn().
+			Str("peer", remoteAddr).
+			Str("reader_id", syncReq.ReaderID).
+			Str("their_cluster", syncReq.ClusterName).
+			Msg("Replication sync rejected: cluster name mismatch")
+		c.sendReplicationSyncError(conn, "authentication failed")
+		return
+	}
+	if err := security.ValidateReplicateSyncHMAC(
+		c.cfg.SharedSecret, syncReq.Nonce, syncReq.ReaderID, syncReq.ClusterName,
+		syncReq.LastKnownSequence, syncReq.Timestamp, syncReq.HMAC, 5*time.Minute,
+	); err != nil {
+		c.logger.Warn().
+			Err(err).
+			Str("peer", remoteAddr).
+			Str("reader_id", syncReq.ReaderID).
+			Msg("Replication sync rejected: HMAC validation failed")
+		c.sendReplicationSyncError(conn, "authentication failed")
+		return
+	}
+	// Replay check AFTER HMAC validation: don't burn a nonce-cache slot
+	// on an attacker who can't even produce a valid MAC.
+	if c.nonceCache != nil && !c.nonceCache.Track(syncReq.ReaderID, syncReq.Nonce) {
+		c.logger.Warn().
+			Str("peer", remoteAddr).
+			Str("reader_id", syncReq.ReaderID).
+			Msg("Replication sync rejected: replay (nonce already seen)")
+		c.sendReplicationSyncError(conn, "authentication failed")
+		return
+	}
+
 	c.logger.Info().
 		Str("reader_id", syncReq.ReaderID).
 		Uint64("last_known_seq", syncReq.LastKnownSequence).
-		Msg("Received replication sync request")
+		Msg("Received authenticated replication sync request")
 
 	// Check if we have a replication sender (we're a writer with replication enabled)
 	c.mu.RLock()
@@ -1292,10 +1363,13 @@ func (c *Coordinator) handleReplicateSync(conn net.Conn, syncReq *protocol.Repli
 		return
 	}
 
-	// Convert protocol types to replication types and accept the reader
+	// Convert protocol types to replication types and accept the reader.
+	// Carry the handshake nonce through so the sender can derive the
+	// same HKDF session key the receiver derived (GHSA-wfgr-8x84-22q7).
 	replSyncReq := &replication.ReplicateSync{
 		ReaderID:          syncReq.ReaderID,
 		LastKnownSequence: syncReq.LastKnownSequence,
+		HandshakeNonce:    syncReq.Nonce,
 	}
 
 	if err := c.AcceptReplicationConnection(conn, replSyncReq); err != nil {
@@ -1510,6 +1584,29 @@ func (c *Coordinator) sendFetchError(conn net.Conn, code protocol.AckErrorCode, 
 	}, 5*time.Second); err != nil {
 		c.logger.Debug().Err(err).Msg("FetchFile: failed to send error ack")
 	}
+}
+
+// sendReplicationSyncError writes a uniform ReplicateSyncAck error
+// response on the connection and closes it. Used by handleReplicateSync
+// for every rejection path (missing/bad HMAC, self-addressed, wrong
+// cluster name, replay, shared secret unconfigured) so an attacker
+// cannot probe to distinguish rejection reasons. See
+// GHSA-wfgr-8x84-22q7 / CVE-2026-48106.
+func (c *Coordinator) sendReplicationSyncError(conn net.Conn, reason string) {
+	ack := &protocol.ReplicateSyncAck{
+		CurrentSequence: 0,
+		CanResume:       false,
+		Error:           reason,
+	}
+	if err := protocol.SendMessage(conn, &protocol.Message{
+		Type:    protocol.MsgReplicateSyncAck,
+		Payload: ack,
+	}, 5*time.Second); err != nil {
+		c.logger.Debug().Err(err).Msg("Replication sync: failed to send error ack")
+	}
+	// Close the connection — caller's deferred close in handlePeerConnection
+	// will also fire, double-close is safe.
+	_ = conn.Close()
 }
 
 // sanitizeFetchPath validates a path supplied in a MsgFetchFile request.
@@ -2291,11 +2388,19 @@ func (c *Coordinator) StartReplication() error {
 	}
 
 	if c.localNode.Role == RoleWriter || c.localNode.Role == RoleStandalone {
-		// Writer: start sender to stream entries to readers
+		// Writer: start sender to stream entries to readers.
+		// Plumb the cluster shared secret + identity into the sender
+		// for stream authentication (GHSA-wfgr-8x84-22q7). Without
+		// SharedSecret the sender refuses every reader at AcceptReader
+		// time, matching the refuse-when-unconfigured posture of
+		// handleReplicateSync.
 		c.replicationSender = replication.NewSender(&replication.SenderConfig{
 			BufferSize:   c.cfg.ReplicationBufferSize,
 			WriteTimeout: 5 * time.Second,
 			Logger:       c.logger,
+			SharedSecret: c.cfg.SharedSecret,
+			ClusterName:  c.cfg.ClusterName,
+			LocalNodeID:  c.localNode.ID,
 		})
 
 		if err := c.replicationSender.Start(c.ctx); err != nil {
@@ -2382,6 +2487,17 @@ func (c *Coordinator) startReceiverWithAddr(writerAddr string) error {
 		ingestHandler = c.buildReplicationIngestHandler()
 	}
 
+	// Stream-auth wiring (GHSA-wfgr-8x84-22q7): the receiver computes
+	// the handshake HMAC from SharedSecret + ClusterName + ReaderID
+	// and derives the per-connection session key for tag verification.
+	// Without SharedSecret the receiver refuses to dial.
+	//
+	// Asymmetry vs. sender wiring: the sender takes a distinct
+	// LocalNodeID because it signs MsgReplicateCheckpoint as the
+	// originating node ID. The receiver's identity in both the
+	// handshake HMAC and per-entry derivation is ReaderID, which is
+	// the same c.localNode.ID — so we do NOT plumb a separate
+	// LocalNodeID field here.
 	c.replicationReceiver = replication.NewReceiver(&replication.ReceiverConfig{
 		ReaderID:          c.localNode.ID,
 		WriterAddr:        writerAddr,
@@ -2391,6 +2507,8 @@ func (c *Coordinator) startReceiverWithAddr(writerAddr string) error {
 		AckInterval:       time.Duration(c.cfg.ReplicationAckInterval) * time.Millisecond,
 		Logger:            c.logger,
 		TLSConfig:         c.tlsConfig,
+		SharedSecret:      c.cfg.SharedSecret,
+		ClusterName:       c.cfg.ClusterName,
 	})
 
 	if err := c.replicationReceiver.Start(c.ctx); err != nil {
@@ -2536,6 +2654,15 @@ func (c *Coordinator) GetReplicationStats() map[string]interface{} {
 
 // AcceptReplicationConnection handles a replication connection from a reader.
 // This is called when a reader sends a MsgReplicateSync message.
+//
+// On success the coordinator sends the cluster-protocol-framed
+// MsgReplicateSyncAck *after* the sender has accepted the reader. The
+// ack used to be sent inside replication.Sender.AcceptReader via the
+// replication-package wire format (0x13), but the receiver reads with
+// protocol.ReceiveMessage (cluster-protocol format), which made the
+// handshake silently fail with "unknown message type: 19". Moving the
+// framing here closes that gap and keeps the wire contract symmetric
+// with the rejection paths in handleReplicateSync.
 func (c *Coordinator) AcceptReplicationConnection(conn net.Conn, syncReq *replication.ReplicateSync) error {
 	c.mu.RLock()
 	sender := c.replicationSender
@@ -2551,7 +2678,33 @@ func (c *Coordinator) AcceptReplicationConnection(conn net.Conn, syncReq *replic
 		return fmt.Errorf("replication connection rejected: not a writer")
 	}
 
-	return sender.AcceptReader(conn, syncReq.ReaderID, syncReq.LastKnownSequence)
+	if err := sender.AcceptReader(conn, syncReq.ReaderID, syncReq.HandshakeNonce, syncReq.LastKnownSequence); err != nil {
+		return err
+	}
+
+	// Send success ack via the cluster-protocol wire format so the
+	// receiver's protocol.ReceiveMessage can decode it. If the write
+	// fails the reader will time out the handshake and reconnect; we
+	// remove the reader from the sender's bookkeeping so its state
+	// reflects reality.
+	currentSeq, canResume := sender.CurrentSequenceAndCanResume(syncReq.LastKnownSequence)
+	ack := &protocol.ReplicateSyncAck{
+		CurrentSequence: currentSeq,
+		CanResume:       canResume,
+	}
+	if err := protocol.SendMessage(conn, &protocol.Message{
+		Type:    protocol.MsgReplicateSyncAck,
+		Payload: ack,
+	}, 5*time.Second); err != nil {
+		c.logger.Warn().
+			Err(err).
+			Str("reader_id", syncReq.ReaderID).
+			Msg("Replication: failed to send success sync ack to reader (connection will be torn down)")
+		sender.RemoveReader(syncReq.ReaderID)
+		return fmt.Errorf("write sync ack: %w", err)
+	}
+
+	return nil
 }
 
 // GetRaftNode returns the Raft node (may be nil if Raft is not configured).

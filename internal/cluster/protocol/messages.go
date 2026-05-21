@@ -93,9 +93,28 @@ func (m MessageType) String() string {
 }
 
 // ReplicateSync is sent by a reader node to request WAL replication.
+//
+// The five auth fields (Nonce / Timestamp / HMAC / ClusterName / and
+// the existing ReaderID acting as senderID) carry the application-layer
+// HMAC over the handshake. Computed by security.ComputeReplicateSyncHMAC
+// at the reader, validated by security.ValidateReplicateSyncHMAC at
+// the writer before the connection is accepted. See GHSA-wfgr-8x84-22q7
+// / CVE-2026-48106.
+//
+// The auth fields are required when cluster.shared_secret is configured;
+// when it's empty the receiver refuses every request (refuse-when-
+// unconfigured posture, same as cache-invalidate from PR #444).
 type ReplicateSync struct {
 	ReaderID          string `json:"reader_id"`
 	LastKnownSequence uint64 `json:"last_known_seq"`
+
+	// Application-layer authentication fields (GHSA-wfgr-8x84-22q7).
+	// Validated against cluster.shared_secret by the writer before
+	// the connection is accepted into the replication sender.
+	Nonce       string `json:"nonce,omitempty"`
+	ClusterName string `json:"cluster_name,omitempty"`
+	Timestamp   int64  `json:"timestamp,omitempty"`
+	HMAC        string `json:"hmac,omitempty"`
 }
 
 // ReplicateSyncAck is sent by the writer in response to a sync request.
@@ -290,9 +309,9 @@ type ForwardApplyRequest struct {
 // "the recipient is no longer the leader, retry with the new leader" from
 // "auth failed, give up" without substring-matching the error text.
 type ForwardApplyAck struct {
-	Status string             `json:"status"`          // "ok" or "error"
-	Code   ForwardApplyCode   `json:"code,omitempty"`  // machine-readable error category
-	Error  string             `json:"error,omitempty"` // human-readable detail
+	Status string           `json:"status"`          // "ok" or "error"
+	Code   ForwardApplyCode `json:"code,omitempty"`  // machine-readable error category
+	Error  string           `json:"error,omitempty"` // human-readable detail
 }
 
 // ForwardApplyCode is the typed error category for ForwardApplyAck. Same

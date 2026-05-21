@@ -2,7 +2,10 @@ package replication
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -61,6 +64,18 @@ type ReceiverConfig struct {
 
 	// TLSConfig for encrypted inter-node communication (nil = plain TCP)
 	TLSConfig *tls.Config
+
+	// SharedSecret is the cluster shared secret used to authenticate the
+	// replication handshake (MsgReplicateSync) and derive the per-
+	// connection session key for stream MAC tags. Required for
+	// authenticated replication; without it, the writer will refuse
+	// every connection. See GHSA-wfgr-8x84-22q7 / CVE-2026-48106.
+	SharedSecret string
+
+	// ClusterName is bound into the handshake HMAC so a leaked MAC from
+	// cluster A cannot be replayed against cluster B sharing the same
+	// network. Must match the writer's cluster name.
+	ClusterName string
 }
 
 // Receiver receives WAL entries from the writer node and applies them locally.
@@ -71,6 +86,13 @@ type Receiver struct {
 	lastSeq atomic.Uint64 // Last received sequence
 	mu      sync.Mutex
 	logger  zerolog.Logger
+
+	// sessionKey is the per-connection HKDF-derived key used to verify
+	// per-entry MAC tags and periodic checkpoint HMACs. Set inside
+	// connect() once the handshake completes; cleared on disconnect.
+	// Protected by mu — receiveLoop reads it under the same lock that
+	// guards conn so it observes a consistent (conn, sessionKey) pair.
+	sessionKey []byte
 
 	// Lifecycle
 	ctx        context.Context
@@ -151,6 +173,7 @@ func (r *Receiver) Stop() error {
 		r.conn.Close()
 		r.conn = nil
 	}
+	r.sessionKey = nil
 	r.mu.Unlock()
 
 	// Wait for goroutines
@@ -191,8 +214,14 @@ func (r *Receiver) connectionLoop() {
 		// Connected, start receiving
 		r.receiveLoop()
 
-		// Disconnected, wait before reconnecting
+		// Disconnected, wait before reconnecting. Clear the session
+		// key so the next connect() derives a fresh one — never reuse
+		// a session key across reconnects (each handshake nonce is
+		// single-use; reusing the key would defeat replay protection).
 		r.connected.Store(false)
+		r.mu.Lock()
+		r.sessionKey = nil
+		r.mu.Unlock()
 		r.logger.Info().
 			Dur("retry_in", r.cfg.ReconnectInterval).
 			Msg("Disconnected from writer, will reconnect")
@@ -209,16 +238,41 @@ func (r *Receiver) connectionLoop() {
 func (r *Receiver) connect() error {
 	r.logger.Debug().Str("writer_addr", r.cfg.WriterAddr).Msg("Connecting to writer")
 
+	// Refuse-when-unconfigured: don't even dial if no shared secret is
+	// configured. The writer would reject every handshake anyway (see
+	// GHSA-wfgr-8x84-22q7 / coordinator.handleReplicateSync); failing
+	// here avoids burning a TCP connection and surfaces the
+	// misconfiguration on the reader's logs with the actual cause.
+	if r.cfg.SharedSecret == "" {
+		return fmt.Errorf("replication requires cluster.shared_secret to be configured")
+	}
+
 	// Connect with timeout (TLS if configured)
 	conn, err := security.Dial("tcp", r.cfg.WriterAddr, 10*time.Second, r.cfg.TLSConfig)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
 
-	// Send sync request using cluster protocol (same format as peer messages)
+	// Build the authenticated sync request (GHSA-wfgr-8x84-22q7).
+	// Nonce binds this handshake to a single attempt and seeds the
+	// per-connection session key via HKDF on both ends.
+	nonce, err := security.GenerateNonce()
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("generate handshake nonce: %w", err)
+	}
+	lastKnownSeq := r.lastSeq.Load()
+	timestamp := time.Now().Unix()
 	syncReq := &protocol.ReplicateSync{
 		ReaderID:          r.cfg.ReaderID,
-		LastKnownSequence: r.lastSeq.Load(),
+		LastKnownSequence: lastKnownSeq,
+		Nonce:             nonce,
+		ClusterName:       r.cfg.ClusterName,
+		Timestamp:         timestamp,
+		HMAC: security.ComputeReplicateSyncHMAC(
+			r.cfg.SharedSecret, nonce, r.cfg.ReaderID, r.cfg.ClusterName,
+			lastKnownSeq, timestamp,
+		),
 	}
 
 	if err := protocol.SendMessage(conn, &protocol.Message{
@@ -252,9 +306,20 @@ func (r *Receiver) connect() error {
 		return fmt.Errorf("sync rejected: %s", syncAck.Error)
 	}
 
-	// Store connection
+	// Handshake accepted — derive the per-connection session key from
+	// the same nonce both sides agreed on. Used to verify per-entry
+	// MAC tags and periodic checkpoint HMACs.
+	sessionKey, err := security.DeriveReplicationSessionKey(r.cfg.SharedSecret, nonce)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("derive session key: %w", err)
+	}
+
+	// Store connection + session key under the same lock so receiveLoop
+	// observes a consistent (conn, sessionKey) pair.
 	r.mu.Lock()
 	r.conn = conn
+	r.sessionKey = sessionKey
 	r.mu.Unlock()
 
 	r.connected.Store(true)
@@ -271,6 +336,16 @@ func (r *Receiver) connect() error {
 }
 
 // receiveLoop receives and processes entries from the writer.
+//
+// Stream authentication state (GHSA-wfgr-8x84-22q7) is held locally on
+// the goroutine stack so it is reset on every reconnect:
+//
+//   - sessionKey is snapshotted from r.sessionKey once at the top
+//     (set by connect() under r.mu).
+//   - cumulativeHash is a fresh sha256.New() per connection. It mirrors
+//     the sender's running hash; every entry payload feeds both ends.
+//     A checkpoint message proves both sides see the same hash; a
+//     mismatch tears down the connection.
 func (r *Receiver) receiveLoop() {
 	// Start ack sender goroutine
 	ackCtx, ackCancel := context.WithCancel(r.ctx)
@@ -278,6 +353,18 @@ func (r *Receiver) receiveLoop() {
 
 	r.wg.Add(1)
 	go r.ackLoop(ackCtx)
+
+	r.mu.Lock()
+	sessionKey := r.sessionKey
+	r.mu.Unlock()
+	if len(sessionKey) == 0 {
+		// connect() guarantees sessionKey is set before returning; this
+		// is a defensive check so a future refactor can't silently
+		// degrade the stream to unauthenticated.
+		r.logger.Error().Msg("Replication receive loop started without session key, refusing to process stream")
+		return
+	}
+	cumulativeHash := sha256.New()
 
 	for r.running.Load() {
 		select {
@@ -299,8 +386,14 @@ func (r *Receiver) receiveLoop() {
 
 		msgType, payload, err := ReadMessage(conn)
 		if err != nil {
-			// Check for timeout (expected during low activity)
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			// Check for timeout (expected during low activity).
+			// ReadMessage wraps the underlying net error with
+			// fmt.Errorf("...: %w", err), so a plain type
+			// assertion would miss it — use errors.As to unwrap.
+			// Pre-X1 this incorrectly tripped a full reconnect
+			// every 30s on an idle stream.
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
 				continue
 			}
 			r.logger.Debug().Err(err).Msg("Connection closed")
@@ -313,8 +406,54 @@ func (r *Receiver) receiveLoop() {
 			if err != nil {
 				r.totalErrors.Add(1)
 				r.logger.Error().Err(err).Msg("Failed to parse entry")
-				continue
+				return
 			}
+
+			// Stream-auth: verify the per-entry truncated MAC tag
+			// under the session key. A missing or mismatched tag is
+			// fatal — drop the connection rather than continue with
+			// a poisoned stream. See GHSA-wfgr-8x84-22q7.
+			if entry.Tag == "" {
+				r.totalErrors.Add(1)
+				r.logger.Error().
+					Uint64("sequence", entry.Sequence).
+					Msg("Replication entry missing MAC tag; dropping connection")
+				return
+			}
+			tagBytes, err := hex.DecodeString(entry.Tag)
+			if err != nil || len(tagBytes) != security.ReplicationEntryTagLen {
+				r.totalErrors.Add(1)
+				r.logger.Error().
+					Err(err).
+					Uint64("sequence", entry.Sequence).
+					Msg("Replication entry tag malformed; dropping connection")
+				return
+			}
+			if err := security.ValidateReplicationEntryTag(sessionKey, entry.Sequence, entry.Payload, tagBytes); err != nil {
+				r.totalErrors.Add(1)
+				r.logger.Error().
+					Err(err).
+					Uint64("sequence", entry.Sequence).
+					Msg("Replication entry MAC tag verification failed; dropping connection")
+				return
+			}
+
+			// Sequence-based replay protection: every entry must
+			// strictly advance lastSeq. A repeated or backwards
+			// sequence indicates either a misbehaving writer or a
+			// tampered stream — drop the connection.
+			if entry.Sequence <= r.lastSeq.Load() {
+				r.totalErrors.Add(1)
+				r.logger.Error().
+					Uint64("sequence", entry.Sequence).
+					Uint64("last_seq", r.lastSeq.Load()).
+					Msg("Replication entry sequence did not advance; dropping connection")
+				return
+			}
+
+			// Both ends feed the running hash with the verified
+			// payload. The next checkpoint must agree.
+			cumulativeHash.Write(entry.Payload)
 
 			if err := r.applyEntry(entry); err != nil {
 				r.totalErrors.Add(1)
@@ -329,6 +468,70 @@ func (r *Receiver) receiveLoop() {
 			r.totalEntriesReceived.Add(1)
 			r.totalBytesReceived.Add(int64(len(entry.Payload)))
 			r.lastReceiveTime.Store(time.Now().UnixNano())
+
+		case MsgReplicateCheckpoint:
+			cp, err := ParseCheckpoint(payload)
+			if err != nil {
+				r.totalErrors.Add(1)
+				r.logger.Error().Err(err).Msg("Replication checkpoint parse failed; dropping connection")
+				return
+			}
+			// Cluster name mismatch is a fast fail before HMAC compute.
+			if cp.ClusterName != r.cfg.ClusterName {
+				r.totalErrors.Add(1)
+				r.logger.Error().
+					Str("their_cluster", cp.ClusterName).
+					Msg("Replication checkpoint cluster name mismatch; dropping connection")
+				return
+			}
+			// Sequence sanity: checkpoint can't claim coverage of an
+			// entry we haven't seen yet.
+			if cp.LastSequence > r.lastSeq.Load() {
+				r.totalErrors.Add(1)
+				r.logger.Error().
+					Uint64("checkpoint_seq", cp.LastSequence).
+					Uint64("our_last_seq", r.lastSeq.Load()).
+					Msg("Replication checkpoint claims unseen sequence; dropping connection")
+				return
+			}
+			// Validate the hash matches what we've computed.
+			ourHash := cumulativeHash.Sum(nil)
+			theirHash, err := hex.DecodeString(cp.CumulativePayloadHashHex)
+			if err != nil || len(theirHash) != sha256.Size {
+				r.totalErrors.Add(1)
+				r.logger.Error().Err(err).Msg("Replication checkpoint hash malformed; dropping connection")
+				return
+			}
+			if subtle.ConstantTimeCompare(ourHash, theirHash) != 1 {
+				r.totalErrors.Add(1)
+				r.logger.Error().Msg("Replication checkpoint hash mismatch; dropping connection")
+				return
+			}
+			// Full HMAC validation against the cluster shared
+			// secret. Validates the timestamp window and the MAC.
+			//
+			// Note: no nonce-cache replay check here. A replayed
+			// checkpoint carries a hash captured from a past window;
+			// our local running hash has since advanced, so the
+			// equality check above (line 499) rejects it first.
+			// A NonceCache pass would only matter if an attacker
+			// could MITM TLS (already cluster-CA protected) AND
+			// reorder the stream such that a replay arrives at the
+			// exact moment our hash matches — outside the threat
+			// model we're solving here.
+			var hashArr [32]byte
+			copy(hashArr[:], theirHash)
+			if err := security.ValidateReplicationCheckpointHMAC(
+				r.cfg.SharedSecret, cp.Nonce, cp.SenderNodeID, cp.ClusterName,
+				hashArr, cp.LastSequence, cp.Timestamp, cp.HMAC, 5*time.Minute,
+			); err != nil {
+				r.totalErrors.Add(1)
+				r.logger.Error().Err(err).Msg("Replication checkpoint HMAC validation failed; dropping connection")
+				return
+			}
+			r.logger.Debug().
+				Uint64("last_seq", cp.LastSequence).
+				Msg("Replication checkpoint verified")
 
 		case MsgReplicateError:
 			errMsg, _ := ParseError(payload)
@@ -350,14 +553,14 @@ func (r *Receiver) receiveLoop() {
 // async WAL channel is saturated. We treat that as NON-FATAL and
 // continue to apply to the ingest handler:
 //
-//   1. The primary still has the entry — it didn't fail there.
-//   2. The follower's in-memory ingest buffer accepts the data and
-//      will eventually flush it to Parquet, which is replicated to
-//      peers via Phase 2 file replication.
-//   3. The brief gap is "if the follower crashes before its next
-//      Parquet flush, this entry is lost from the follower's WAL but
-//      survives on the primary." On restart the follower's
-//      Phase 3 catch-up reconciles the manifest with peer storage.
+//  1. The primary still has the entry — it didn't fail there.
+//  2. The follower's in-memory ingest buffer accepts the data and
+//     will eventually flush it to Parquet, which is replicated to
+//     peers via Phase 2 file replication.
+//  3. The brief gap is "if the follower crashes before its next
+//     Parquet flush, this entry is lost from the follower's WAL but
+//     survives on the primary." On restart the follower's
+//     Phase 3 catch-up reconciles the manifest with peer storage.
 //
 // Treating the drop as fatal would either stall the receive loop on
 // the same entry (no retry mechanism today) or cause silent

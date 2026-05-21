@@ -1,6 +1,7 @@
 package security
 
 import (
+	"encoding/hex"
 	"strings"
 	"testing"
 	"time"
@@ -236,5 +237,225 @@ func TestValidateCacheInvalidateHMAC_FieldBinding(t *testing.T) {
 				t.Errorf("%s: tampered input accepted", c.name)
 			}
 		})
+	}
+}
+
+// ----------------------------------------------------------------------
+// Replication protocol HMAC tests (GHSA-wfgr-8x84-22q7 / CVE-2026-48106)
+// ----------------------------------------------------------------------
+
+// TestComputeReplicateSyncHMAC_Determinism pins the handshake MAC
+// wire format with a reference value. If this hash changes, a
+// rolling-upgrade between Arc versions stops being able to handshake
+// across mismatched-version peers — silent breakage in production.
+// Bump protocol version + document migration before changing the
+// constant.
+func TestComputeReplicateSyncHMAC_Determinism(t *testing.T) {
+	t.Parallel()
+	got := ComputeReplicateSyncHMAC("secret", "nonce-abc", "reader-1", "cluster-A", 42, 1700000000)
+	const want = "3fd418a80d9d94b8b36765a1026f3cabc360a5be2e4eb27c0f6ea6b190119d8c"
+	if got != want {
+		t.Errorf("replicate-sync MAC drift detected:\n  got  %s\n  want %s\nIf this fails, the handshake message format changed — coordinate with the deployed-version matrix before merging.", got, want)
+	}
+}
+
+// TestDeriveReplicationSessionKey_Determinism pins the HKDF output so
+// both ends of a replication connection derive the same session key
+// from the same {sharedSecret, nonce} pair. Catches a drift in HKDF
+// salt/info ordering, hash family, or output length.
+func TestDeriveReplicationSessionKey_Determinism(t *testing.T) {
+	t.Parallel()
+	key, err := DeriveReplicationSessionKey("secret", "nonce-abc")
+	if err != nil {
+		t.Fatalf("DeriveReplicationSessionKey: %v", err)
+	}
+	if len(key) != 32 {
+		t.Fatalf("expected 32-byte session key, got %d", len(key))
+	}
+	gotHex := hex.EncodeToString(key)
+	const wantHex = "5dfccf4ac494b76adb1796684cc3a3db3bbd959078065602171b7ae01818fe79"
+	if gotHex != wantHex {
+		t.Errorf("HKDF session-key drift:\n  got  %s\n  want %s\n— both ends must derive the same key from the same inputs", gotHex, wantHex)
+	}
+
+	// Same inputs → same key. Different nonce → different key.
+	key2, _ := DeriveReplicationSessionKey("secret", "nonce-abc")
+	if hex.EncodeToString(key2) != wantHex {
+		t.Error("DeriveReplicationSessionKey is non-deterministic")
+	}
+	key3, _ := DeriveReplicationSessionKey("secret", "nonce-different")
+	if hex.EncodeToString(key3) == wantHex {
+		t.Error("different nonce produced the same key")
+	}
+}
+
+// TestComputeReplicationEntryTag_Determinism pins the per-entry tag
+// wire format. An attacker observing one valid entry can't recover
+// the session key (HMAC is one-way), but they could try to forge the
+// tag if the format drifts.
+func TestComputeReplicationEntryTag_Determinism(t *testing.T) {
+	t.Parallel()
+	// Derive session key from the same inputs as the determinism test
+	// above so this test pins both the key derivation AND the tag
+	// computation chain end-to-end.
+	key, _ := DeriveReplicationSessionKey("secret", "nonce-abc")
+	tag := ComputeReplicationEntryTag(key, 100, []byte("hello world"))
+	if len(tag) != ReplicationEntryTagLen {
+		t.Fatalf("expected %d-byte tag, got %d", ReplicationEntryTagLen, len(tag))
+	}
+	gotHex := hex.EncodeToString(tag)
+	const wantHex = "d775a32a8f326c20"
+	if gotHex != wantHex {
+		t.Errorf("entry tag drift:\n  got  %s\n  want %s", gotHex, wantHex)
+	}
+}
+
+// TestValidateReplicationEntryTag_RejectsTamperedPayload pins that
+// flipping a single byte of the payload invalidates the tag — that's
+// the load-bearing property that prevents an attacker from swapping
+// payload bytes on an in-flight entry while keeping the tag.
+func TestValidateReplicationEntryTag_RejectsTamperedPayload(t *testing.T) {
+	t.Parallel()
+	key, _ := DeriveReplicationSessionKey("secret", "nonce-abc")
+	payload := []byte("hello world")
+	tag := ComputeReplicationEntryTag(key, 100, payload)
+
+	// Sanity: original payload validates.
+	if err := ValidateReplicationEntryTag(key, 100, payload, tag); err != nil {
+		t.Fatalf("untampered tag rejected: %v", err)
+	}
+
+	// Flip one byte → tag must reject.
+	tampered := []byte("hello worle")
+	if err := ValidateReplicationEntryTag(key, 100, tampered, tag); err == nil {
+		t.Error("tampered payload accepted — tag is not bound to payload")
+	}
+
+	// Wrong sequence → tag must reject.
+	if err := ValidateReplicationEntryTag(key, 101, payload, tag); err == nil {
+		t.Error("wrong sequence accepted — tag is not bound to sequence")
+	}
+
+	// Wrong-length tag → reject (defense against truncation attacks).
+	if err := ValidateReplicationEntryTag(key, 100, payload, tag[:7]); err == nil {
+		t.Error("short tag accepted — length check is broken")
+	}
+}
+
+// TestComputeReplicationCheckpointHMAC_Determinism pins the periodic
+// checkpoint wire format.
+func TestComputeReplicationCheckpointHMAC_Determinism(t *testing.T) {
+	t.Parallel()
+	var cumHash [32]byte
+	for i := range cumHash {
+		cumHash[i] = byte(i)
+	}
+	got := ComputeReplicationCheckpointHMAC("secret", "nonce-abc", "writer-1", "cluster-A", cumHash, 42, 1700000000)
+	const want = "88ef7b1bddf644a0eaa05487ae9aa3e26c9bf00888743a71f6d7d7f635dc3963"
+	if got != want {
+		t.Errorf("checkpoint MAC drift:\n  got  %s\n  want %s", got, want)
+	}
+}
+
+// TestReplicationHMAC_LabelBinding_NoCrossEndpointReplay extends the
+// cross-endpoint replay property to the new replication HMAC families.
+// A MAC computed for one endpoint must NOT validate against the verifier
+// for a different endpoint, even with identical (nonce, nodeID,
+// clusterName, timestamp) inputs.
+func TestReplicationHMAC_LabelBinding_NoCrossEndpointReplay(t *testing.T) {
+	t.Parallel()
+	const (
+		secret      = "secret"
+		nonce       = "nonce-abc"
+		nodeID      = "node-1"
+		clusterName = "cluster-A"
+		fetchPath   = "/some/path"
+		lastSeq     = uint64(42)
+	)
+	ts := time.Now().Unix()
+	var cumHash [32]byte
+	for i := range cumHash {
+		cumHash[i] = byte(i)
+	}
+
+	syncMAC := ComputeReplicateSyncHMAC(secret, nonce, nodeID, clusterName, lastSeq, ts)
+	checkpointMAC := ComputeReplicationCheckpointHMAC(secret, nonce, nodeID, clusterName, cumHash, lastSeq, ts)
+	cacheMAC := ComputeCacheInvalidateHMAC(secret, nonce, nodeID, clusterName, ts)
+	forwardMAC := ComputeForwardHMAC(secret, nonce, nodeID, clusterName, []byte{}, ts)
+	fetchMAC := ComputeFetchHMAC(secret, nonce, nodeID, clusterName, fetchPath, ts)
+	joinMAC := ComputeHMAC(secret, nonce, nodeID, clusterName, ts)
+
+	// All MAC families must produce distinct values for identical-ish inputs.
+	macs := map[string]string{
+		"sync": syncMAC, "checkpoint": checkpointMAC, "cache": cacheMAC,
+		"forward": forwardMAC, "fetch": fetchMAC, "join": joinMAC,
+	}
+	for nameA, macA := range macs {
+		for nameB, macB := range macs {
+			if nameA >= nameB {
+				continue
+			}
+			if macA == macB {
+				t.Errorf("MAC collision: %s == %s — cross-endpoint replay possible", nameA, nameB)
+			}
+		}
+	}
+
+	// sync validator rejects MACs from other endpoints.
+	for name, mac := range macs {
+		if name == "sync" {
+			continue
+		}
+		if err := ValidateReplicateSyncHMAC(secret, nonce, nodeID, clusterName, lastSeq, ts, mac, 5*time.Minute); err == nil {
+			t.Errorf("%s MAC accepted by replicate-sync validator — label binding broken", name)
+		}
+	}
+
+	// checkpoint validator rejects MACs from other endpoints.
+	for name, mac := range macs {
+		if name == "checkpoint" {
+			continue
+		}
+		if err := ValidateReplicationCheckpointHMAC(secret, nonce, nodeID, clusterName, cumHash, lastSeq, ts, mac, 5*time.Minute); err == nil {
+			t.Errorf("%s MAC accepted by replicate-checkpoint validator — label binding broken", name)
+		}
+	}
+
+	// Reverse direction: sync/checkpoint MACs must not be accepted by
+	// any other validator.
+	if err := ValidateCacheInvalidateHMAC(secret, nonce, nodeID, clusterName, ts, syncMAC, 5*time.Minute); err == nil {
+		t.Error("sync MAC accepted by cache-invalidate validator")
+	}
+	if err := ValidateForwardHMAC(secret, nonce, nodeID, clusterName, []byte{}, ts, syncMAC, 5*time.Minute); err == nil {
+		t.Error("sync MAC accepted by forward validator")
+	}
+	if err := ValidateFetchHMAC(secret, nonce, nodeID, clusterName, fetchPath, ts, checkpointMAC, 5*time.Minute); err == nil {
+		t.Error("checkpoint MAC accepted by fetch validator")
+	}
+}
+
+// TestValidateReplicateSyncHMAC_StaleAndFuture pins symmetric drift
+// rejection on the handshake validator. Both stale-past and
+// future-dated timestamps fail.
+func TestValidateReplicateSyncHMAC_StaleAndFuture(t *testing.T) {
+	t.Parallel()
+	const (
+		secret      = "secret"
+		nonce       = "nonce-abc"
+		readerID    = "reader-1"
+		clusterName = "cluster-A"
+		lastSeq     = uint64(42)
+	)
+
+	staleTS := time.Now().Add(-10 * time.Minute).Unix()
+	mac := ComputeReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, staleTS)
+	if err := ValidateReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, staleTS, mac, 5*time.Minute); err == nil {
+		t.Error("stale timestamp accepted by replicate-sync validator")
+	}
+
+	futureTS := time.Now().Add(10 * time.Minute).Unix()
+	mac = ComputeReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, futureTS)
+	if err := ValidateReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, futureTS, mac, 5*time.Minute); err == nil {
+		t.Error("future timestamp accepted by replicate-sync validator")
 	}
 }

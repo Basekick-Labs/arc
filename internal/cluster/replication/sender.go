@@ -2,14 +2,38 @@ package replication
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"hash"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
+
+// Sentinel errors for sender refusal paths. Exposed as package-level
+// vars so callers (coordinator, tests) can errors.Is() on them.
+var (
+	// errSharedSecretRequired is returned by AcceptReader when the
+	// sender has no shared secret configured. Refuse-when-unconfigured.
+	errSharedSecretRequired = errors.New("replication sender refuses connection: cluster.shared_secret not configured")
+	// errHandshakeNonceRequired is returned when the handshake nonce is
+	// empty. Should never happen if the coordinator validated the
+	// MsgReplicateSync before calling AcceptReader; defensive.
+	errHandshakeNonceRequired = errors.New("replication sender refuses connection: missing handshake nonce")
+)
+
+// defaultCheckpointInterval is how many entries the sender streams
+// between full-HMAC checkpoint messages. 1024 keeps the checkpoint
+// itself ≤ 0.1% of the message volume at 19.9M records/sec while
+// bounding the window an attacker would need to forge truncated tags
+// within. Operators can override via SenderConfig.CheckpointInterval.
+const defaultCheckpointInterval = 1024
 
 // SenderConfig holds configuration for the replication sender.
 type SenderConfig struct {
@@ -21,6 +45,26 @@ type SenderConfig struct {
 
 	// Logger for sender events
 	Logger zerolog.Logger
+
+	// SharedSecret is the cluster shared secret. Required to authenticate
+	// the replication stream (GHSA-wfgr-8x84-22q7); when empty the sender
+	// refuses every reader at AcceptReader time (refuse-when-unconfigured,
+	// matching coordinator.handleReplicateSync).
+	SharedSecret string
+
+	// ClusterName is bound into the checkpoint HMAC so a leaked MAC from
+	// cluster A cannot be replayed against cluster B.
+	ClusterName string
+
+	// LocalNodeID is the sender's node ID, bound into the checkpoint HMAC
+	// so receivers can pin checkpoints to a specific peer if needed.
+	LocalNodeID string
+
+	// CheckpointInterval is the number of entries between full-HMAC
+	// checkpoint messages. Defaults to defaultCheckpointInterval (1024).
+	// Operators may shorten it to detect a forged-tag stream sooner at
+	// the cost of slightly higher overhead; never shorter than 1.
+	CheckpointInterval int
 }
 
 // ReaderConnection represents a connected reader receiving replication data.
@@ -31,6 +75,17 @@ type ReaderConnection struct {
 	writeMu    sync.Mutex    // Serialize writes to connection
 	cancelFunc context.CancelFunc
 	ctx        context.Context
+
+	// Stream authentication state (GHSA-wfgr-8x84-22q7). All three
+	// fields are protected by writeMu — every send path that touches
+	// them already holds it. sessionKey is the HKDF-derived per-
+	// connection key, cumulativeHash is the running SHA-256 over
+	// every payload streamed since the handshake (matches the
+	// receiver's running hash), and entriesSinceCheckpoint is the
+	// counter that triggers the next checkpoint emission.
+	sessionKey             []byte
+	cumulativeHash         hash.Hash
+	entriesSinceCheckpoint int
 
 	// Stats
 	entriesSent  atomic.Int64
@@ -69,6 +124,9 @@ func NewSender(cfg *SenderConfig) *Sender {
 	}
 	if cfg.WriteTimeout <= 0 {
 		cfg.WriteTimeout = 5 * time.Second
+	}
+	if cfg.CheckpointInterval <= 0 {
+		cfg.CheckpointInterval = defaultCheckpointInterval
 	}
 
 	return &Sender{
@@ -121,8 +179,33 @@ func (s *Sender) Stop() error {
 }
 
 // AcceptReader registers a new reader connection for replication.
-// Called when a reader connects and sends a sync request.
-func (s *Sender) AcceptReader(conn net.Conn, readerID string, lastKnownSeq uint64) error {
+// Called when a reader connects and sends a sync request. handshakeNonce
+// is the nonce the reader sent in MsgReplicateSync — both ends use it to
+// derive the same per-connection session key via HKDF
+// (GHSA-wfgr-8x84-22q7).
+func (s *Sender) AcceptReader(conn net.Conn, readerID, handshakeNonce string, lastKnownSeq uint64) error {
+	// Refuse-when-unconfigured: an unauthenticated sender is a footgun
+	// (anyone who reaches AcceptReader bypassed the coordinator's auth
+	// check, but defense in depth — we won't stream entries without a
+	// shared secret to MAC them with). Matches the coordinator-level
+	// refusal in handleReplicateSync.
+	if s.cfg.SharedSecret == "" {
+		conn.Close()
+		return errSharedSecretRequired
+	}
+	if handshakeNonce == "" {
+		conn.Close()
+		return errHandshakeNonceRequired
+	}
+
+	// Derive the per-connection session key from the handshake nonce.
+	// The receiver derives the identical key from the same nonce.
+	sessionKey, err := security.DeriveReplicationSessionKey(s.cfg.SharedSecret, handshakeNonce)
+	if err != nil {
+		conn.Close()
+		return err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -137,10 +220,12 @@ func (s *Sender) AcceptReader(conn net.Conn, readerID string, lastKnownSeq uint6
 	readerCtx, cancel := context.WithCancel(s.ctx)
 
 	reader := &ReaderConnection{
-		id:         readerID,
-		conn:       conn,
-		cancelFunc: cancel,
-		ctx:        readerCtx,
+		id:             readerID,
+		conn:           conn,
+		cancelFunc:     cancel,
+		ctx:            readerCtx,
+		sessionKey:     sessionKey,
+		cumulativeHash: sha256.New(),
 	}
 	reader.lastAck.Store(lastKnownSeq)
 	reader.lastSendTime.Store(time.Now().UnixNano())
@@ -151,31 +236,34 @@ func (s *Sender) AcceptReader(conn net.Conn, readerID string, lastKnownSeq uint6
 	s.wg.Add(1)
 	go s.receiveLoop(reader)
 
-	// Send sync ack to reader
-	currentSeq := s.sequence.Load()
-	canResume := lastKnownSeq == 0 || lastKnownSeq >= currentSeq-uint64(s.cfg.BufferSize)
-
-	syncAck := &ReplicateSyncAck{
-		CurrentSequence: currentSeq,
-		CanResume:       canResume,
-	}
-
-	if err := WriteSyncAck(conn, syncAck); err != nil {
-		s.logger.Error().Err(err).Str("reader_id", readerID).Msg("Failed to send sync ack")
-		reader.cancelFunc()
-		conn.Close()
-		delete(s.readers, readerID)
-		return err
-	}
+	// Note: the success-ack to the reader is sent by the caller
+	// (Coordinator.handleReplicateSync) via the cluster-protocol
+	// wire format, NOT here. AcceptReader used to write the ack
+	// via replication.WriteSyncAck (replication-package wire format,
+	// 0x13) but the receiver reads with protocol.ReceiveMessage
+	// (cluster-protocol wire format), so the two-byte-type mismatch
+	// silently broke handshake completion. The coordinator now
+	// owns the wire framing for both error AND success acks.
 
 	s.logger.Info().
 		Str("reader_id", readerID).
 		Uint64("last_known_seq", lastKnownSeq).
-		Uint64("current_seq", currentSeq).
-		Bool("can_resume", canResume).
+		Uint64("current_seq", s.sequence.Load()).
 		Msg("Reader connected for replication")
 
 	return nil
+}
+
+// CurrentSequenceAndCanResume returns the writer's current sequence
+// and whether the reader's lastKnownSeq is within the buffer window
+// for resume. The coordinator calls this after a successful
+// AcceptReader to build the protocol-level success ack. Exposed
+// because the framing now lives in the coordinator (see
+// AcceptReader comment).
+func (s *Sender) CurrentSequenceAndCanResume(lastKnownSeq uint64) (uint64, bool) {
+	currentSeq := s.sequence.Load()
+	canResume := lastKnownSeq == 0 || lastKnownSeq >= currentSeq-uint64(s.cfg.BufferSize)
+	return currentSeq, canResume
 }
 
 // RemoveReader disconnects a reader from replication.
@@ -257,6 +345,13 @@ func (s *Sender) broadcastEntry(entry *ReplicateEntry) {
 }
 
 // sendToReader sends an entry to a specific reader.
+//
+// GHSA-wfgr-8x84-22q7: the entry is stamped with a per-entry truncated
+// MAC tag using the per-connection session key, and every payload feeds
+// the running SHA-256 used by the periodic checkpoint message. After
+// CheckpointInterval entries the sender emits a MsgReplicateCheckpoint
+// signed with the full cluster shared secret, anchoring the truncated
+// tags against a full-strength HMAC.
 func (s *Sender) sendToReader(reader *ReaderConnection, entry *ReplicateEntry) error {
 	reader.writeMu.Lock()
 	defer reader.writeMu.Unlock()
@@ -267,6 +362,17 @@ func (s *Sender) sendToReader(reader *ReaderConnection, entry *ReplicateEntry) e
 		return context.Canceled
 	default:
 	}
+
+	// Stamp the per-entry MAC tag under the session key. Cheap (~1µs):
+	// SHA-256 of payload truncated to 8 bytes mixed into a tiny HMAC.
+	tag := security.ComputeReplicationEntryTag(reader.sessionKey, entry.Sequence, entry.Payload)
+	entry.Tag = hex.EncodeToString(tag)
+
+	// Feed the running cumulative hash that the checkpoint will sign.
+	// We hash the payload (not the tag) so both ends compute the same
+	// hash without having to agree on tag encoding.
+	reader.cumulativeHash.Write(entry.Payload)
+	reader.entriesSinceCheckpoint++
 
 	// Set write deadline
 	if err := reader.conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout)); err != nil {
@@ -285,6 +391,64 @@ func (s *Sender) sendToReader(reader *ReaderConnection, entry *ReplicateEntry) e
 	s.totalEntriesSent.Add(1)
 	s.totalBytesSent.Add(int64(len(entry.Payload)))
 
+	// Emit checkpoint if interval reached. Same writeMu held, same
+	// connection, no separate deadline — the checkpoint piggybacks
+	// the entry's WriteTimeout budget. A checkpoint failure tears
+	// down the connection just like an entry failure would.
+	if reader.entriesSinceCheckpoint >= s.cfg.CheckpointInterval {
+		if err := s.emitCheckpointLocked(reader, entry.Sequence); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// emitCheckpointLocked sends a full-HMAC checkpoint covering every entry
+// streamed since the last checkpoint (or since the handshake for the
+// first checkpoint). Caller must hold reader.writeMu.
+//
+// Resets entriesSinceCheckpoint to 0 on successful send but does NOT
+// reset cumulativeHash — the receiver verifies against the running
+// hash from the start of the connection, not a per-checkpoint window.
+// Resetting the hash here would force the receiver to also reset and
+// open a 1-entry desync window if the checkpoint is dropped after the
+// sender reset but before the receiver acknowledged.
+func (s *Sender) emitCheckpointLocked(reader *ReaderConnection, lastSeq uint64) error {
+	if s.cfg.SharedSecret == "" {
+		// Refuse-when-unconfigured should have caught this at
+		// AcceptReader, but defensive — never sign with an empty key.
+		return errSharedSecretRequired
+	}
+	nonce, err := security.GenerateNonce()
+	if err != nil {
+		return err
+	}
+	// Snapshot the running hash. sha256's Sum(nil) returns a new slice
+	// without mutating the internal state, so the cumulative hash keeps
+	// accumulating across checkpoints.
+	var hashSnap [32]byte
+	copy(hashSnap[:], reader.cumulativeHash.Sum(nil))
+	timestamp := time.Now().Unix()
+	cp := &ReplicateCheckpoint{
+		CumulativePayloadHashHex: hex.EncodeToString(hashSnap[:]),
+		LastSequence:             lastSeq,
+		Nonce:                    nonce,
+		SenderNodeID:             s.cfg.LocalNodeID,
+		ClusterName:              s.cfg.ClusterName,
+		Timestamp:                timestamp,
+		HMAC: security.ComputeReplicationCheckpointHMAC(
+			s.cfg.SharedSecret, nonce, s.cfg.LocalNodeID, s.cfg.ClusterName,
+			hashSnap, lastSeq, timestamp,
+		),
+	}
+	if err := reader.conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout)); err != nil {
+		return err
+	}
+	if err := WriteCheckpoint(reader.conn, cp); err != nil {
+		return err
+	}
+	reader.entriesSinceCheckpoint = 0
 	return nil
 }
 
@@ -305,8 +469,14 @@ func (s *Sender) receiveLoop(reader *ReaderConnection) {
 
 		msgType, payload, err := ReadMessage(reader.conn)
 		if err != nil {
-			// Check if it's just a timeout (expected)
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			// Check if it's just a timeout (expected during low
+			// activity). ReadMessage wraps the underlying net
+			// error with fmt.Errorf("...: %w", err), so a plain
+			// type assertion misses it — use errors.As to unwrap.
+			// Pre-X1 this dropped every reader connection every
+			// 30s on an idle ack channel.
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
 				continue
 			}
 			s.logger.Debug().
