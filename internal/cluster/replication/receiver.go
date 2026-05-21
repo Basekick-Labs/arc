@@ -455,8 +455,14 @@ func (r *Receiver) receiveLoop() {
 					Msg("Replication entry tag length mismatch; dropping connection")
 				return
 			}
-			tagBytes, err := hex.DecodeString(entry.Tag)
-			if err != nil {
+			// Stack-allocate the decoded tag — hex.DecodeString
+			// would heap-allocate twice per entry (source + dest)
+			// at 200k+ entries/sec; hex.Decode into a fixed-size
+			// array eliminates the destination allocation, and
+			// Go optimises the []byte(entry.Tag) source conversion
+			// here. Gemini round 5 / PR #449.
+			var tagBytes [security.ReplicationEntryTagLen]byte
+			if _, err := hex.Decode(tagBytes[:], []byte(entry.Tag)); err != nil {
 				r.totalErrors.Add(1)
 				llog.Error().
 					Err(err).
@@ -464,7 +470,7 @@ func (r *Receiver) receiveLoop() {
 					Msg("Replication entry tag malformed; dropping connection")
 				return
 			}
-			if err := security.ValidateReplicationEntryTag(sessionKey, entry.Sequence, entry.Payload, tagBytes); err != nil {
+			if err := security.ValidateReplicationEntryTag(sessionKey, entry.Sequence, entry.Payload, tagBytes[:]); err != nil {
 				r.totalErrors.Add(1)
 				llog.Error().
 					Err(err).
@@ -548,14 +554,21 @@ func (r *Receiver) receiveLoop() {
 					Msg("Replication checkpoint hash length mismatch; dropping connection")
 				return
 			}
-			ourHash := cumulativeHash.Sum(nil)
-			theirHash, err := hex.DecodeString(cp.CumulativePayloadHashHex)
-			if err != nil {
+			// Stack-allocate both hashes — hash.Hash.Sum(nil) and
+			// hex.DecodeString each heap-allocate; Sum(buf[:0])
+			// and hex.Decode reuse the stack arrays. (Gemini
+			// round 5 / PR #449.) The cumulativeHash itself
+			// keeps accumulating across checkpoints, so
+			// snapshotting via Sum doesn't disturb its state.
+			var ourHashBuf [sha256.Size]byte
+			ourHash := cumulativeHash.Sum(ourHashBuf[:0])
+			var theirHash [sha256.Size]byte
+			if _, err := hex.Decode(theirHash[:], []byte(cp.CumulativePayloadHashHex)); err != nil {
 				r.totalErrors.Add(1)
 				llog.Error().Err(err).Msg("Replication checkpoint hash malformed; dropping connection")
 				return
 			}
-			if subtle.ConstantTimeCompare(ourHash, theirHash) != 1 {
+			if subtle.ConstantTimeCompare(ourHash, theirHash[:]) != 1 {
 				r.totalErrors.Add(1)
 				llog.Error().Msg("Replication checkpoint hash mismatch; dropping connection")
 				return
@@ -573,11 +586,9 @@ func (r *Receiver) receiveLoop() {
 			// reorder the stream such that a replay arrives at the
 			// exact moment our hash matches — outside the threat
 			// model we're solving here.
-			var hashArr [32]byte
-			copy(hashArr[:], theirHash)
 			if err := security.ValidateReplicationCheckpointHMAC(
 				r.cfg.SharedSecret, cp.Nonce, cp.SenderNodeID, cp.ClusterName,
-				hashArr, cp.LastSequence, cp.Timestamp, cp.HMAC, security.HMACTimestampTolerance,
+				theirHash, cp.LastSequence, cp.Timestamp, cp.HMAC, security.HMACTimestampTolerance,
 			); err != nil {
 				r.totalErrors.Add(1)
 				llog.Error().Err(err).Msg("Replication checkpoint HMAC validation failed; dropping connection")

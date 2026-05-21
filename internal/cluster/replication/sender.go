@@ -490,11 +490,14 @@ func (s *Sender) emitCheckpointLocked(reader *ReaderConnection, lastSeq uint64) 
 	if err != nil {
 		return err
 	}
-	// Snapshot the running hash. sha256's Sum(nil) returns a new slice
-	// without mutating the internal state, so the cumulative hash keeps
-	// accumulating across checkpoints.
-	var hashSnap [32]byte
-	copy(hashSnap[:], reader.cumulativeHash.Sum(nil))
+	// Snapshot the running hash into a stack-allocated array.
+	// Sum(buf[:0]) appends to the buffer without allocating when the
+	// capacity is sufficient — vs Sum(nil) + copy which would heap-
+	// allocate the intermediate slice. sha256's Sum doesn't mutate
+	// internal state, so the cumulative hash keeps accumulating
+	// across checkpoints. (Gemini round 5 / PR #449.)
+	var hashSnap [sha256.Size]byte
+	reader.cumulativeHash.Sum(hashSnap[:0])
 	timestamp := time.Now().Unix()
 	cp := &ReplicateCheckpoint{
 		CumulativePayloadHashHex: hex.EncodeToString(hashSnap[:]),
