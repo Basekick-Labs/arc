@@ -1077,6 +1077,44 @@ func TestFSMRestore_QuarantinesMaliciousSnapshotEntries(t *testing.T) {
 	}
 }
 
+// TestFSMRestore_HandlesNilFileEntry pins the defensive nil-check on
+// snapshot restore: a corrupted/crafted snapshot with `null` map
+// values must NOT panic the boot (would otherwise deref entry.Database
+// in the secondary-index rebuild). Nil entries are quarantined,
+// counter incremented, boot continues. Gemini #446-r6.
+func TestFSMRestore_HandlesNilFileEntry(t *testing.T) {
+	t.Parallel()
+	snapshot := FSMSnapshot{
+		Nodes: map[string]*NodeInfo{},
+		Files: map[string]*FileEntry{
+			"db/cpu/2026/05/20/15/legit.parquet":   {Path: "db/cpu/2026/05/20/15/legit.parquet", Database: "db", Measurement: "cpu", CreatedAt: time.Now()},
+			"db/cpu/2026/05/20/15/corrupt.parquet": nil, // explicit nil entry
+		},
+	}
+	snapshotBytes, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+
+	fsm := newTestFSM()
+	if err := fsm.Restore(io.NopCloser(bytes.NewReader(snapshotBytes))); err != nil {
+		t.Fatalf("Restore should not error on nil entry (got %v)", err)
+	}
+
+	if fsm.FileCount() != 1 {
+		t.Errorf("expected 1 legit entry restored, got %d", fsm.FileCount())
+	}
+	if c := fsm.RejectedPathsCount(); c != 1 {
+		t.Errorf("expected 1 quarantined entry (nil entry), got %d", c)
+	}
+	if _, exists := fsm.GetFile("db/cpu/2026/05/20/15/corrupt.parquet"); exists {
+		t.Error("nil entry should not have been restored")
+	}
+	if _, exists := fsm.GetFile("db/cpu/2026/05/20/15/legit.parquet"); !exists {
+		t.Error("legit entry should still be restored alongside nil entry")
+	}
+}
+
 // TestApplyBatchFileOps_RejectsMaliciousPath_AtomicPrevalidation pins
 // the atomicity invariant: when a batch contains a malicious entry —
 // even mid-batch — NO ops from the batch have side-effects. The

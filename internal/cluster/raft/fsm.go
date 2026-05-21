@@ -941,6 +941,21 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	// subsequent reads.
 	restoredFiles := make(map[string]*FileEntry, len(snapshot.Files))
 	for path, entry := range snapshot.Files {
+		// Defensive nil-check: f.files is map[string]*FileEntry, so a
+		// corrupted or attacker-crafted snapshot with `null` values
+		// would deserialize to nil pointers here. Without this skip,
+		// the secondary-index rebuild below (entry.Database) would
+		// panic — bricking the node's boot. Treat as a quarantine.
+		// See Gemini PR #446 r6.
+		if entry == nil {
+			f.rejectedPaths.Add(1)
+			metrics.Get().IncClusterManifestRejectedPaths()
+			f.logger.Error().
+				Str("path", path).
+				Str("source", "snapshot").
+				Msg("manifest entry is nil during snapshot restore — entry refused, not added to f.files")
+			continue
+		}
 		if err := ValidateManifestPath(path); err != nil {
 			f.rejectedPaths.Add(1)
 			metrics.Get().IncClusterManifestRejectedPaths()
