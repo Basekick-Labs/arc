@@ -1275,12 +1275,19 @@ func (c *Coordinator) handleReplicateSync(conn net.Conn, syncReq *protocol.Repli
 	// every request uniformly so an attacker can't probe to distinguish
 	// "no secret configured" from "wrong MAC". Same shape as the
 	// cache-invalidate endpoint (PR #444).
+	// All rejection paths return the SAME generic "authentication
+	// failed" string so an attacker cannot probe the wire response
+	// to distinguish "no secret configured" from "missing fields"
+	// from "wrong MAC" from "wrong cluster name". The specific
+	// reason is in the server log for operator debugging — see the
+	// .Msg(...) on each branch's logger.Warn().
+	// (Gemini round 8 / PR #449.)
 	if c.cfg.SharedSecret == "" {
 		c.logger.Warn().
 			Str("peer", remoteAddr).
 			Str("reader_id", syncReq.ReaderID).
 			Msg("Replication sync rejected: cluster.shared_secret not configured (peer replication requires it)")
-		c.sendReplicationSyncError(conn, "peer replication is not configured on this node")
+		c.sendReplicationSyncError(conn, "authentication failed")
 		return
 	}
 	if syncReq.HMAC == "" || syncReq.Nonce == "" || syncReq.ClusterName == "" || syncReq.Timestamp == 0 {
@@ -1288,7 +1295,7 @@ func (c *Coordinator) handleReplicateSync(conn net.Conn, syncReq *protocol.Repli
 			Str("peer", remoteAddr).
 			Str("reader_id", syncReq.ReaderID).
 			Msg("Replication sync rejected: missing one or more auth fields (nonce, cluster_name, timestamp, hmac)")
-		c.sendReplicationSyncError(conn, "missing authentication fields")
+		c.sendReplicationSyncError(conn, "authentication failed")
 		return
 	}
 	// Reject requests claiming to be from this node itself: replication

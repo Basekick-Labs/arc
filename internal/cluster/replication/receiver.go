@@ -611,11 +611,20 @@ func (r *Receiver) receiveLoop() {
 				llog.Error().Err(err).Msg("Failed to parse error message from writer; dropping connection")
 				return
 			}
+			// Even on a clean parse, an error frame on an
+			// authenticated stream means the writer signalled a
+			// fatal protocol state (sequence gap too large, WAL
+			// rotated, apply failed, etc.). Drop the connection so
+			// the next reconnect re-handshakes with a fresh session
+			// key — continuing would process further entries on a
+			// stream the sender already declared unhealthy.
+			// Gemini round 8 / PR #449.
+			r.totalErrors.Add(1)
 			llog.Error().
 				Str("code", errMsg.Code).
 				Str("message", errMsg.Message).
-				Msg("Error from writer")
-			r.totalErrors.Add(1)
+				Msg("Error from writer; dropping connection")
+			return
 
 		default:
 			// On an authenticated stream an unknown message type
