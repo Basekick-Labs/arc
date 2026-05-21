@@ -245,8 +245,7 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 // op is "register" or "update" for log disambiguation. errors.Is(err,
 // ErrPath*) gives the rejection reason. See GHSA-f85q-mvg8-qf37.
 func (f *ClusterFSM) rejectManifestPath(op, path string, logIndex uint64, err error) error {
-	f.rejectedPaths.Add(1)
-	metrics.Get().IncClusterManifestRejectedPaths()
+	f.incRejectedPaths()
 	f.logger.Error().
 		Err(err).
 		Str("op", op).
@@ -254,6 +253,18 @@ func (f *ClusterFSM) rejectManifestPath(op, path string, logIndex uint64, err er
 		Uint64("log_index", logIndex).
 		Msg("manifest path validation failed — entry refused, not added to f.files")
 	return fmt.Errorf("%s file: %w", op, err)
+}
+
+// incRejectedPaths increments both the per-FSM rejectedPaths counter
+// (consumed by Node.Start's end-of-boot summary log + tests) and the
+// process-wide metrics-package counter (exposed via /metrics and
+// /api/v1/metrics as arc_cluster_manifest_rejected_paths_total).
+// Every site that refuses a manifest entry — runtime apply, batch
+// pre-pass, snapshot Restore — calls through here so the two
+// counters stay in sync. See GHSA-f85q-mvg8-qf37.
+func (f *ClusterFSM) incRejectedPaths() {
+	f.rejectedPaths.Add(1)
+	metrics.Get().IncClusterManifestRejectedPaths()
 }
 
 // RejectedPathsCount returns the count of manifest entries refused by
@@ -797,8 +808,7 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 				return fmt.Errorf("batch file ops: op[%d] unmarshal: %w", i, err)
 			}
 			if err := ValidateManifestPath(rp.File.Path); err != nil {
-				f.rejectedPaths.Add(1)
-				metrics.Get().IncClusterManifestRejectedPaths()
+				f.incRejectedPaths()
 				f.logger.Error().
 					Err(err).
 					Str("op", "batch-prevalidate").
@@ -821,8 +831,7 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 				return fmt.Errorf("batch file ops: op[%d] unmarshal: %w", i, err)
 			}
 			if err := ValidateManifestPath(up.File.Path); err != nil {
-				f.rejectedPaths.Add(1)
-				metrics.Get().IncClusterManifestRejectedPaths()
+				f.incRejectedPaths()
 				f.logger.Error().
 					Err(err).
 					Str("op", "batch-prevalidate").
@@ -948,8 +957,7 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		// panic — bricking the node's boot. Treat as a quarantine.
 		// See Gemini PR #446 r6.
 		if entry == nil {
-			f.rejectedPaths.Add(1)
-			metrics.Get().IncClusterManifestRejectedPaths()
+			f.incRejectedPaths()
 			f.logger.Error().
 				Str("path", path).
 				Str("source", "snapshot").
@@ -957,8 +965,7 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 			continue
 		}
 		if err := ValidateManifestPath(path); err != nil {
-			f.rejectedPaths.Add(1)
-			metrics.Get().IncClusterManifestRejectedPaths()
+			f.incRejectedPaths()
 			f.logger.Error().
 				Err(err).
 				Str("path", path).
