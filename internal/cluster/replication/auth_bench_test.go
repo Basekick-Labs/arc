@@ -6,6 +6,7 @@
 package replication
 
 import (
+	"crypto/sha256"
 	"testing"
 
 	"github.com/basekick-labs/arc/internal/cluster/security"
@@ -38,6 +39,34 @@ func BenchmarkComputeReplicationEntryTag(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		_ = security.ComputeReplicationEntryTag(sessionKey, uint64(i), payload)
+	}
+}
+
+// BenchmarkComputeReplicationEntryTagFromHash measures the hot-path
+// variant used by broadcastEntry: SHA-256 is computed once per
+// broadcast and reused across every reader's tag. At N readers this
+// drops the per-broadcast hash cost from N × sha256(payload) to 1 ×
+// sha256(payload). Expect ~half the per-call cost of
+// ComputeReplicationEntryTag (skips the SHA-256 over payload).
+func BenchmarkComputeReplicationEntryTagFromHash(b *testing.B) {
+	sessionKey, err := security.DeriveReplicationSessionKey(
+		"test-shared-secret", "test-handshake-nonce-aaaaaaaaaaaa",
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	payload := make([]byte, 256)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	payloadHash := sha256.Sum256(payload)
+
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = security.ComputeReplicationEntryTagFromHash(sessionKey, uint64(i), payloadHash)
 	}
 }
 

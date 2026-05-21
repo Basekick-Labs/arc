@@ -329,8 +329,14 @@ func (s *Sender) broadcastEntry(entry *ReplicateEntry) {
 	}
 	s.mu.RUnlock()
 
+	// Hash the payload once for the whole broadcast — every reader's
+	// per-entry tag uses the same SHA-256 over the payload. Without
+	// this we'd pay sha256(payload) per reader; with it we pay once
+	// per entry regardless of reader count. (Gemini round 1 / PR #449.)
+	payloadHash := sha256.Sum256(entry.Payload)
+
 	for _, reader := range readers {
-		if err := s.sendToReader(reader, entry); err != nil {
+		if err := s.sendToReader(reader, entry, payloadHash); err != nil {
 			reader.errors.Add(1)
 			s.logger.Error().
 				Err(err).
@@ -346,13 +352,18 @@ func (s *Sender) broadcastEntry(entry *ReplicateEntry) {
 
 // sendToReader sends an entry to a specific reader.
 //
+// payloadHash is the SHA-256 over entry.Payload, pre-computed once per
+// broadcast by broadcastEntry and shared across every reader (the hash
+// is independent of the per-connection session key, so reusing it is
+// safe). See ComputeReplicationEntryTagFromHash for the rationale.
+//
 // GHSA-wfgr-8x84-22q7: the entry is stamped with a per-entry truncated
 // MAC tag using the per-connection session key, and every payload feeds
 // the running SHA-256 used by the periodic checkpoint message. After
 // CheckpointInterval entries the sender emits a MsgReplicateCheckpoint
 // signed with the full cluster shared secret, anchoring the truncated
 // tags against a full-strength HMAC.
-func (s *Sender) sendToReader(reader *ReaderConnection, entry *ReplicateEntry) error {
+func (s *Sender) sendToReader(reader *ReaderConnection, entry *ReplicateEntry, payloadHash [sha256.Size]byte) error {
 	reader.writeMu.Lock()
 	defer reader.writeMu.Unlock()
 
@@ -363,9 +374,9 @@ func (s *Sender) sendToReader(reader *ReaderConnection, entry *ReplicateEntry) e
 	default:
 	}
 
-	// Stamp the per-entry MAC tag under the session key. Cheap (~1µs):
-	// SHA-256 of payload truncated to 8 bytes mixed into a tiny HMAC.
-	tag := security.ComputeReplicationEntryTag(reader.sessionKey, entry.Sequence, entry.Payload)
+	// Stamp the per-entry MAC tag under the session key, using the
+	// hash broadcastEntry already computed once for the whole fan-out.
+	tag := security.ComputeReplicationEntryTagFromHash(reader.sessionKey, entry.Sequence, payloadHash)
 	entry.Tag = hex.EncodeToString(tag)
 
 	// Feed the running cumulative hash that the checkpoint will sign.

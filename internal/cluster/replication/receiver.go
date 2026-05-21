@@ -214,12 +214,23 @@ func (r *Receiver) connectionLoop() {
 		// Connected, start receiving
 		r.receiveLoop()
 
-		// Disconnected, wait before reconnecting. Clear the session
-		// key so the next connect() derives a fresh one — never reuse
-		// a session key across reconnects (each handshake nonce is
-		// single-use; reusing the key would defeat replay protection).
+		// Disconnected. Close the socket and clear the session key
+		// so the next connect() opens a fresh conn and derives a
+		// fresh key — never reuse a session key across reconnects
+		// (each handshake nonce is single-use; reusing the key would
+		// defeat replay protection).
+		//
+		// receiveLoop returns on read error (Connection closed,
+		// HMAC fail, malformed entry, etc.) without closing r.conn
+		// itself. Without this close, the next connect() would
+		// overwrite r.conn and leak the previous socket — flagged
+		// by Gemini round 1 on PR #449.
 		r.connected.Store(false)
 		r.mu.Lock()
+		if r.conn != nil {
+			r.conn.Close()
+			r.conn = nil
+		}
 		r.sessionKey = nil
 		r.mu.Unlock()
 		r.logger.Info().

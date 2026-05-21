@@ -316,6 +316,19 @@ const ReplicationEntryTagLen = 8
 // past the point where this matters.
 func ComputeReplicationEntryTag(sessionKey []byte, sequence uint64, payload []byte) []byte {
 	payloadHash := sha256.Sum256(payload)
+	return ComputeReplicationEntryTagFromHash(sessionKey, sequence, payloadHash)
+}
+
+// ComputeReplicationEntryTagFromHash is the broadcast-friendly variant
+// of ComputeReplicationEntryTag: it takes a pre-computed SHA-256 over
+// the payload instead of computing it internally. The broadcaster hashes
+// the payload once (SHA-256 is the dominant cost in
+// ComputeReplicationEntryTag) and passes the same hash to every
+// reader's per-entry tag computation — at N readers, this drops the
+// per-broadcast hash cost from N × sha256(payload) to 1 ×
+// sha256(payload). Flagged by Gemini round 1 on PR #449 as a hot-path
+// optimization for multi-reader deployments.
+func ComputeReplicationEntryTagFromHash(sessionKey []byte, sequence uint64, payloadHash [sha256.Size]byte) []byte {
 	mac := hmac.New(sha256.New, sessionKey)
 	// Sequence as big-endian uint64, then first 8 bytes of payload hash.
 	var seqBuf [8]byte
