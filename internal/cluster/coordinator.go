@@ -2683,25 +2683,38 @@ func (c *Coordinator) AcceptReplicationConnection(conn net.Conn, syncReq *replic
 	}
 
 	// Send success ack via the cluster-protocol wire format so the
-	// receiver's protocol.ReceiveMessage can decode it. If the write
-	// fails the reader will time out the handshake and reconnect; we
-	// remove the reader from the sender's bookkeeping so its state
-	// reflects reality.
+	// receiver's protocol.ReceiveMessage can decode it.
+	//
+	// IMPORTANT: hold the per-reader writeMu via DoWithReaderWriteLock
+	// for the ack write. AcceptReader publishes the reader to
+	// sender.readers BEFORE returning, so the moment we get here the
+	// distributionLoop is free to call sendToReader and start writing
+	// entry frames to the same conn. net.TCPConn per-Write is goroutine-
+	// safe, but a 3-write protocol frame ([4-byte len][1-byte type][JSON
+	// payload]) from each side would interleave at the byte level and
+	// corrupt the stream — the receiver would read garbage and tear the
+	// connection down. Holding writeMu for the ack write serialises it
+	// against any concurrent broadcast on the same reader.
+	//
+	// Final-review finding on PR #449 (post-Gemini round 3 sanity pass).
 	currentSeq, canResume := sender.CurrentSequenceAndCanResume(syncReq.LastKnownSequence)
 	ack := &protocol.ReplicateSyncAck{
 		CurrentSequence: currentSeq,
 		CanResume:       canResume,
 	}
-	if err := protocol.SendMessage(conn, &protocol.Message{
-		Type:    protocol.MsgReplicateSyncAck,
-		Payload: ack,
-	}, 5*time.Second); err != nil {
+	ackErr := sender.DoWithReaderWriteLock(syncReq.ReaderID, func(c net.Conn) error {
+		return protocol.SendMessage(c, &protocol.Message{
+			Type:    protocol.MsgReplicateSyncAck,
+			Payload: ack,
+		}, 5*time.Second)
+	})
+	if ackErr != nil {
 		c.logger.Warn().
-			Err(err).
+			Err(ackErr).
 			Str("reader_id", syncReq.ReaderID).
 			Msg("Replication: failed to send success sync ack to reader (connection will be torn down)")
 		sender.RemoveReader(syncReq.ReaderID)
-		return fmt.Errorf("write sync ack: %w", err)
+		return fmt.Errorf("write sync ack: %w", ackErr)
 	}
 
 	return nil

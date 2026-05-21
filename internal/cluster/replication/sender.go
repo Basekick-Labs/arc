@@ -26,6 +26,12 @@ var (
 	// empty. Should never happen if the coordinator validated the
 	// MsgReplicateSync before calling AcceptReader; defensive.
 	errHandshakeNonceRequired = errors.New("replication sender refuses connection: missing handshake nonce")
+	// errReaderUnknown is returned by DoWithReaderWriteLock when the
+	// readerID is no longer in s.readers (the reader was removed
+	// between AcceptReader and the ack write — e.g. concurrent
+	// RemoveReader from a broadcast failure). The caller should
+	// treat this as a tear-down signal, same as a write error.
+	errReaderUnknown = errors.New("replication sender: reader no longer registered")
 )
 
 // defaultCheckpointInterval is how many entries the sender streams
@@ -264,6 +270,31 @@ func (s *Sender) CurrentSequenceAndCanResume(lastKnownSeq uint64) (uint64, bool)
 	currentSeq := s.sequence.Load()
 	canResume := lastKnownSeq == 0 || lastKnownSeq >= currentSeq-uint64(s.cfg.BufferSize)
 	return currentSeq, canResume
+}
+
+// DoWithReaderWriteLock runs fn while holding the per-reader writeMu —
+// the same lock sendToReader takes for entry framing. The coordinator
+// uses this to write the post-AcceptReader success ack onto the same
+// conn that the distributionLoop's broadcast can ALSO start writing to
+// the instant AcceptReader returns (the reader is published to
+// s.readers under s.mu before AcceptReader returns, so the broadcast
+// path can race the unlocked ack write at the byte level — see the
+// final-review finding on PR #449). Holding writeMu for the ack write
+// serialises it against any concurrent sendToReader on the same conn.
+//
+// Returns the error fn returns, or sender.errReaderUnknown if the
+// readerID is no longer in the sender's map (concurrent RemoveReader
+// or a stale call after disconnect).
+func (s *Sender) DoWithReaderWriteLock(readerID string, fn func(net.Conn) error) error {
+	s.mu.RLock()
+	reader, ok := s.readers[readerID]
+	s.mu.RUnlock()
+	if !ok {
+		return errReaderUnknown
+	}
+	reader.writeMu.Lock()
+	defer reader.writeMu.Unlock()
+	return fn(reader.conn)
 }
 
 // RemoveReader disconnects a reader from replication.
