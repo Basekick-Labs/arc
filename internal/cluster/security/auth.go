@@ -4,9 +4,14 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"hash"
+	"io"
 	"time"
+
+	"golang.org/x/crypto/hkdf"
 )
 
 // ComputeHMAC computes HMAC-SHA256 over the join parameters.
@@ -194,6 +199,269 @@ func ValidateCacheInvalidateHMAC(sharedSecret, nonce, nodeID, clusterName string
 	expected := computeCacheInvalidateHMACRaw(sharedSecret, nonce, nodeID, clusterName, timestamp)
 	if !constantTimeHexEqual(expected, receivedMAC) {
 		return fmt.Errorf("cache-invalidate HMAC validation failed: shared secret mismatch or malformed MAC")
+	}
+	return nil
+}
+
+// ----------------------------------------------------------------------
+// Replication protocol HMAC + session key derivation
+// ----------------------------------------------------------------------
+//
+// Closes GHSA-wfgr-8x84-22q7 / CVE-2026-48106 (audit X1, 2026-05-19).
+//
+// The replication protocol has three trust boundaries:
+//
+//   1. Handshake (MsgReplicateSync): reader announces itself to the
+//      writer, requests stream-from-position. Authenticated with a
+//      full HMAC over {nonce, readerID, clusterName, lastKnownSeq,
+//      timestamp} keyed by the cluster shared secret. Same shape as
+//      ComputeFetchHMAC / ComputeForwardHMAC / ComputeCacheInvalidateHMAC,
+//      with the "replicate-sync" label prefix to prevent cross-endpoint
+//      MAC replay.
+//
+//   2. Per-entry stream (MsgReplicateEntry): hundreds-to-thousands per
+//      second under load. We can't afford a full HMAC + nonce-cache
+//      lookup per entry. Instead, on successful handshake both sides
+//      derive a session key from the handshake nonce + cluster shared
+//      secret (HKDF). Each entry carries an 8-byte truncated MAC tag
+//      computed over the session key + sequence + payload hash. Forging
+//      requires knowing the session key, which requires having
+//      witnessed the handshake — which requires having the cluster
+//      shared secret.
+//
+//   3. Periodic checkpoint (MsgReplicateCheckpoint): every N entries
+//      the sender emits a full HMAC over the cumulative payload hash
+//      + last seq + last ts + nonce, keyed by the cluster shared
+//      secret (NOT the session key). Defense-in-depth against session
+//      key compromise mid-stream and against any catastrophic tag
+//      collision sequence.
+
+// ComputeReplicateSyncHMAC computes the handshake HMAC for the
+// replication MsgReplicateSync message. The "replicate-sync" label
+// distinguishes this MAC from other cluster HMACs so a leaked MAC for
+// one endpoint cannot be replayed against another.
+// Format: "replicate-sync" \x00 nonce \x00 readerID \x00 clusterName \x00 lastKnownSeq \x00 timestamp
+func ComputeReplicateSyncHMAC(sharedSecret, nonce, readerID, clusterName string, lastKnownSeq uint64, timestamp int64) string {
+	return hex.EncodeToString(computeReplicateSyncHMACRaw(sharedSecret, nonce, readerID, clusterName, lastKnownSeq, timestamp))
+}
+
+func computeReplicateSyncHMACRaw(sharedSecret, nonce, readerID, clusterName string, lastKnownSeq uint64, timestamp int64) []byte {
+	message := fmt.Sprintf("replicate-sync\x00%s\x00%s\x00%s\x00%d\x00%d", nonce, readerID, clusterName, lastKnownSeq, timestamp)
+	return computeRawHMAC(sharedSecret, message)
+}
+
+// ValidateReplicateSyncHMAC validates the handshake HMAC and checks
+// freshness. Same symmetric-drift semantics as the other validators —
+// both stale-past and future-dated timestamps are refused.
+func ValidateReplicateSyncHMAC(sharedSecret, nonce, readerID, clusterName string, lastKnownSeq uint64, timestamp int64, receivedMAC string, tolerance time.Duration) error {
+	now := time.Now().Unix()
+	drift := now - timestamp
+	if drift < 0 {
+		drift = -drift
+	}
+	if drift > int64(tolerance.Seconds()) {
+		return fmt.Errorf("replicate-sync auth timestamp expired or out of tolerance (drift: %ds, tolerance: %ds)", drift, int64(tolerance.Seconds()))
+	}
+
+	expected := computeReplicateSyncHMACRaw(sharedSecret, nonce, readerID, clusterName, lastKnownSeq, timestamp)
+	if !constantTimeHexEqual(expected, receivedMAC) {
+		return fmt.Errorf("replicate-sync HMAC validation failed: shared secret mismatch or malformed MAC")
+	}
+	return nil
+}
+
+// DeriveReplicationSessionKey derives a 32-byte per-connection session
+// key from the cluster shared secret + handshake nonce via HKDF-SHA256.
+// Both sides see the handshake nonce, so both derive the same key.
+//
+// The session key is ephemeral — it lives only for the duration of
+// the TCP connection. Reconnect requires a fresh handshake with a
+// fresh nonce, which derives a fresh key. An attacker who didn't
+// witness the handshake (didn't see the nonce on the wire) can't
+// derive the session key from the cluster shared secret alone.
+//
+// The info string "arc-replication-session:" namespaces this KDF
+// output from any other future use of HKDF with the same cluster
+// shared secret + nonce inputs.
+func DeriveReplicationSessionKey(sharedSecret string, handshakeNonce string) ([]byte, error) {
+	// HKDF-Extract uses the nonce as salt and the shared secret as IKM.
+	// HKDF-Expand pulls 32 bytes of output keyed with the namespace
+	// info string.
+	r := hkdf.New(sha256.New, []byte(sharedSecret), []byte(handshakeNonce), []byte("arc-replication-session:"))
+	key := make([]byte, 32)
+	if _, err := io.ReadFull(r, key); err != nil {
+		return nil, fmt.Errorf("derive replication session key: %w", err)
+	}
+	return key, nil
+}
+
+// ReplicationEntryTagLen is the byte length of the per-entry MAC tag
+// on the wire. 8 bytes = 64-bit MAC. Forgery probability per attempt
+// is 2^-64 — effectively unforgeable for the threat model. Smaller
+// than the full 32-byte HMAC because the data stream is high-rate
+// and the security argument is "attacker must have witnessed the
+// handshake" rather than "attacker is trying random forgeries."
+const ReplicationEntryTagLen = 8
+
+// HMACTimestampTolerance is the symmetric window (past and future) the
+// cluster HMAC validators accept on a signed timestamp. Five minutes
+// is the same window enforced by every Compute*HMAC consumer in this
+// package (join, leave, fetch, forward-apply, cache-invalidate,
+// replicate-sync, replicate-checkpoint) AND the NonceCache TTL the
+// coordinator constructs at startup — keep them aligned so a replayed
+// HMAC can never outlive its nonce-cache slot. Centralized here so a
+// future operator can tune all sites in one place; Gemini round 1 on
+// PR #449 flagged the hardcoded 5*time.Minute scattered across
+// coordinator.go.
+const HMACTimestampTolerance = 5 * time.Minute
+
+// ComputeReplicationEntryTag returns the 8-byte per-entry MAC tag
+// computed over the session key + sequence + first 8 bytes of the
+// payload SHA-256. The payload binding prevents an attacker from
+// swapping the payload bytes of an in-flight entry while keeping the
+// tag. The sequence binding prevents replay of a previously-seen tag
+// against a different entry.
+//
+// We use the first 8 bytes of the payload SHA-256 (not the full 32)
+// because (a) the tag itself is only 8 bytes, so a full payload hash
+// would be wasted entropy, and (b) the goal is binding, not collision
+// resistance — an attacker who can find a SHA-256 prefix collision is
+// past the point where this matters.
+func ComputeReplicationEntryTag(sessionKey []byte, sequence uint64, payload []byte) []byte {
+	payloadHash := sha256.Sum256(payload)
+	return ComputeReplicationEntryTagFromHash(sessionKey, sequence, payloadHash)
+}
+
+// ComputeReplicationEntryTagFromHash is the broadcast-friendly variant
+// of ComputeReplicationEntryTag: it takes a pre-computed SHA-256 over
+// the payload instead of computing it internally. The broadcaster hashes
+// the payload once (SHA-256 is the dominant cost in
+// ComputeReplicationEntryTag) and passes the same hash to every
+// reader's per-entry tag computation — at N readers, this drops the
+// per-broadcast hash cost from N × sha256(payload) to 1 ×
+// sha256(payload). Flagged by Gemini round 1 on PR #449 as a hot-path
+// optimization for multi-reader deployments.
+//
+// Prefer ComputeReplicationEntryTagWithMAC on the hot path — it lets
+// the caller reuse a per-reader hmac.Hash and avoids allocating a
+// fresh HMAC context per entry.
+func ComputeReplicationEntryTagFromHash(sessionKey []byte, sequence uint64, payloadHash [sha256.Size]byte) []byte {
+	mac := hmac.New(sha256.New, sessionKey)
+	tag := make([]byte, ReplicationEntryTagLen)
+	ComputeReplicationEntryTagWithMAC(mac, sequence, payloadHash, tag)
+	return tag
+}
+
+// NewReplicationEntryHMAC builds a fresh hmac.Hash keyed by the session
+// key, sized for SHA-256. Callers should construct one per reader
+// connection (the session key is stable for the connection's lifetime)
+// and reuse it via ComputeReplicationEntryTagWithMAC + mac.Reset()
+// across every entry to avoid the per-entry HMAC allocation.
+func NewReplicationEntryHMAC(sessionKey []byte) hash.Hash {
+	return hmac.New(sha256.New, sessionKey)
+}
+
+// ComputeReplicationEntryTagWithMAC writes the per-entry MAC tag into
+// dst (which MUST be at least ReplicationEntryTagLen bytes). The mac
+// argument must have been constructed with NewReplicationEntryHMAC
+// using the same session key both ends agreed on at handshake. This
+// function calls mac.Reset() before writing — callers can keep the
+// same mac across every entry without managing reset themselves.
+//
+// At Arc's 200k+ entries/sec ingest profile, reusing a per-reader
+// hmac.Hash drops the entry-tag allocations from ~8 per entry to ~3
+// (the persistent HMAC context replaces the per-call hmac.New
+// allocation). Flagged by Gemini round 6 on PR #449.
+func ComputeReplicationEntryTagWithMAC(mac hash.Hash, sequence uint64, payloadHash [sha256.Size]byte, dst []byte) {
+	mac.Reset()
+	var seqBuf [8]byte
+	binary.BigEndian.PutUint64(seqBuf[:], sequence)
+	mac.Write(entryFrameLabel)
+	mac.Write(seqBuf[:])
+	mac.Write(payloadHash[:8])
+	// Sum into a stack buffer, then copy the truncated tag into dst.
+	// We don't pass dst directly to Sum because Sum APPENDS, not
+	// overwrites — passing dst[:0] would also overwrite the underlying
+	// array but only up to the appended length, which is the same
+	// thing as truncating after the copy. The two-line form is
+	// clearer.
+	var full [sha256.Size]byte
+	mac.Sum(full[:0])
+	copy(dst, full[:ReplicationEntryTagLen])
+}
+
+// entryFrameLabel is the domain-separation label baked into every
+// per-entry MAC tag. Hoisted to a package-level var so each
+// ComputeReplicationEntryTag call avoids a per-call []byte conversion.
+var entryFrameLabel = []byte("entry-frame:")
+
+// ValidateReplicationEntryTag recomputes the tag and compares
+// constant-time. Returns nil on match, an error on mismatch.
+// Caller (the receiver) must drop the connection on any error —
+// a tag mismatch means either the session key is wrong or the
+// payload was tampered. Either way the session is poisoned.
+//
+// Prefer ValidateReplicationEntryTagWithMAC on the hot path — it
+// lets the receiver reuse a per-connection hmac.Hash and avoids
+// allocating a fresh HMAC context per entry.
+func ValidateReplicationEntryTag(sessionKey []byte, sequence uint64, payload []byte, receivedTag []byte) error {
+	if len(receivedTag) != ReplicationEntryTagLen {
+		return fmt.Errorf("replication entry tag: wrong length (got %d, want %d)", len(receivedTag), ReplicationEntryTagLen)
+	}
+	payloadHash := sha256.Sum256(payload)
+	mac := hmac.New(sha256.New, sessionKey)
+	return ValidateReplicationEntryTagWithMAC(mac, sequence, payloadHash, receivedTag)
+}
+
+// ValidateReplicationEntryTagWithMAC is the hot-path variant: caller
+// supplies a long-lived hmac.Hash (constructed once per connection
+// via NewReplicationEntryHMAC) and the pre-computed payload SHA-256.
+// At Arc's 200k+ entries/sec ingest rate this saves both the hmac.New
+// allocation per entry AND the sha256(payload) work the receiver
+// already does for cumulativeHash. Flagged by Gemini round 9 on PR #449.
+func ValidateReplicationEntryTagWithMAC(mac hash.Hash, sequence uint64, payloadHash [sha256.Size]byte, receivedTag []byte) error {
+	if len(receivedTag) != ReplicationEntryTagLen {
+		return fmt.Errorf("replication entry tag: wrong length (got %d, want %d)", len(receivedTag), ReplicationEntryTagLen)
+	}
+	var expected [ReplicationEntryTagLen]byte
+	ComputeReplicationEntryTagWithMAC(mac, sequence, payloadHash, expected[:])
+	if !hmac.Equal(expected[:], receivedTag) {
+		return fmt.Errorf("replication entry tag mismatch: session key wrong or payload tampered")
+	}
+	return nil
+}
+
+// ComputeReplicationCheckpointHMAC returns the full HMAC for a
+// periodic checkpoint message. Keyed by the cluster shared secret
+// (NOT the session key) so a session-key compromise mid-stream can't
+// forge checkpoints. Same NUL-delimited format as the other Compute*HMAC
+// functions, with the "replicate-checkpoint" label.
+// Format: "replicate-checkpoint" \x00 nonce \x00 senderNodeID \x00 clusterName \x00 cumulativePayloadHashHex \x00 lastSeq \x00 timestamp
+func ComputeReplicationCheckpointHMAC(sharedSecret, nonce, senderNodeID, clusterName string, cumulativePayloadHash [32]byte, lastSeq uint64, timestamp int64) string {
+	return hex.EncodeToString(computeReplicationCheckpointHMACRaw(sharedSecret, nonce, senderNodeID, clusterName, cumulativePayloadHash, lastSeq, timestamp))
+}
+
+func computeReplicationCheckpointHMACRaw(sharedSecret, nonce, senderNodeID, clusterName string, cumulativePayloadHash [32]byte, lastSeq uint64, timestamp int64) []byte {
+	hashHex := hex.EncodeToString(cumulativePayloadHash[:])
+	message := fmt.Sprintf("replicate-checkpoint\x00%s\x00%s\x00%s\x00%s\x00%d\x00%d", nonce, senderNodeID, clusterName, hashHex, lastSeq, timestamp)
+	return computeRawHMAC(sharedSecret, message)
+}
+
+// ValidateReplicationCheckpointHMAC validates a checkpoint MAC + checks
+// freshness. Caller drops the connection on any error.
+func ValidateReplicationCheckpointHMAC(sharedSecret, nonce, senderNodeID, clusterName string, cumulativePayloadHash [32]byte, lastSeq uint64, timestamp int64, receivedMAC string, tolerance time.Duration) error {
+	now := time.Now().Unix()
+	drift := now - timestamp
+	if drift < 0 {
+		drift = -drift
+	}
+	if drift > int64(tolerance.Seconds()) {
+		return fmt.Errorf("replicate-checkpoint timestamp expired or out of tolerance (drift: %ds, tolerance: %ds)", drift, int64(tolerance.Seconds()))
+	}
+
+	expected := computeReplicationCheckpointHMACRaw(sharedSecret, nonce, senderNodeID, clusterName, cumulativePayloadHash, lastSeq, timestamp)
+	if !constantTimeHexEqual(expected, receivedMAC) {
+		return fmt.Errorf("replicate-checkpoint HMAC validation failed: shared secret mismatch, payload tampered, or malformed MAC")
 	}
 	return nil
 }

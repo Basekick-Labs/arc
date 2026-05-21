@@ -272,7 +272,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	}
 	if err := security.ValidateForwardHMAC(
 		c.cfg.SharedSecret, req.Nonce, req.NodeID, c.cfg.ClusterName,
-		req.CommandJSON, req.Timestamp, req.HMAC, 5*time.Minute,
+		req.CommandJSON, req.Timestamp, req.HMAC, security.HMACTimestampTolerance,
 	); err != nil {
 		c.logger.Warn().
 			Err(err).

@@ -21,6 +21,19 @@ const (
 	// MsgReplicateSyncAck responds with current replication position
 	MsgReplicateSyncAck byte = 0x13
 
+	// MsgReplicateCheckpoint is a periodic full-HMAC checkpoint sent by
+	// the writer every N entries (N = SenderConfig.CheckpointInterval,
+	// defaults to defaultCheckpointInterval = 1024 — see sender.go). It
+	// carries the running SHA-256 hash of every entry payload observed
+	// since the connection's handshake plus the last sequence covered,
+	// signed with the cluster shared secret. The receiver verifies it
+	// against its own running hash; mismatch drops the connection. This
+	// anchors the per-entry truncated MAC tags (which are 8-byte
+	// session-keyed) against a full-strength HMAC so an attacker who
+	// somehow forges a stream-tag still gets caught at the next
+	// checkpoint. See GHSA-wfgr-8x84-22q7.
+	MsgReplicateCheckpoint byte = 0x14
+
 	// MsgReplicateError indicates a replication error
 	MsgReplicateError byte = 0x1F
 )
@@ -36,6 +49,51 @@ type ReplicateEntry struct {
 
 	// Payload is the raw msgpack payload (zero-copy from WAL)
 	Payload []byte `json:"payload"`
+
+	// Tag is the per-entry truncated MAC tag (8 bytes, hex-encoded) over
+	// (label, sequence, sha256(payload)[:8]) using the per-connection
+	// HKDF-derived session key. Required when shared_secret is
+	// configured; receivers refuse entries with a missing or invalid
+	// tag. The cost is ~1µs per entry on commodity hardware vs. ~5µs
+	// for a full HMAC — chosen to keep per-record overhead negligible
+	// at 19.9M records/sec ingest. The 8-byte truncation gives 2^-64
+	// forgery probability per entry; the periodic checkpoint message
+	// (MsgReplicateCheckpoint) is the full-strength backstop.
+	// See GHSA-wfgr-8x84-22q7 / CVE-2026-48106.
+	//
+	// Thread safety: the sender stamps Tag on a shallow copy of the
+	// shared *ReplicateEntry inside sendToReader (see sender.go),
+	// never on the broadcast-shared pointer — so a future parallel
+	// broadcastEntry can stamp distinct tags into distinct
+	// ReplicateEntry values without a race.
+	Tag string `json:"tag,omitempty"`
+}
+
+// ReplicateCheckpoint is a periodic full-HMAC checkpoint covering every
+// entry payload observed since the connection's handshake. The sender
+// keeps a running SHA-256 hash (cumulativePayloadHash) of every payload
+// it has streamed and signs (cumulativePayloadHash, lastSeq) plus the
+// usual (nonce, senderNodeID, clusterName, timestamp) tuple with the
+// cluster shared secret. The receiver maintains its own running hash and
+// verifies the checkpoint against it; on mismatch the connection is
+// dropped. This is the full-HMAC backstop for the truncated per-entry
+// tag. See GHSA-wfgr-8x84-22q7 / CVE-2026-48106.
+type ReplicateCheckpoint struct {
+	// CumulativePayloadHashHex is the running SHA-256 over every entry
+	// payload observed on this connection since the handshake, hex-encoded.
+	CumulativePayloadHashHex string `json:"cumulative_payload_hash"`
+
+	// LastSequence is the last entry sequence covered by this checkpoint.
+	LastSequence uint64 `json:"last_seq"`
+
+	// Nonce, SenderNodeID, ClusterName, Timestamp, HMAC bind the
+	// checkpoint to a single emission. ValidateReplicationCheckpointHMAC
+	// at the receiver re-binds them against the cluster shared secret.
+	Nonce        string `json:"nonce"`
+	SenderNodeID string `json:"sender_node_id"`
+	ClusterName  string `json:"cluster_name"`
+	Timestamp    int64  `json:"timestamp"`
+	HMAC         string `json:"hmac"`
 }
 
 // ReplicateAck acknowledges receipt of entries up to a sequence number.
@@ -50,12 +108,24 @@ type ReplicateAck struct {
 
 // ReplicateSync requests the current replication position.
 // Sent by readers when connecting or reconnecting to sync state.
+//
+// HandshakeNonce is the same nonce the reader sent in the protocol-
+// level MsgReplicateSync (it is the input to HKDF on both ends).
+// Carrying it through this internal struct lets the sender derive the
+// per-connection session key without re-parsing the protocol message.
+// Not serialized — this struct is the internal hand-off shape, not
+// the wire format.
 type ReplicateSync struct {
 	// ReaderID identifies the reader requesting sync
 	ReaderID string `json:"reader_id"`
 
 	// LastKnownSequence is the last sequence the reader has (0 if new)
 	LastKnownSequence uint64 `json:"last_known_seq"`
+
+	// HandshakeNonce is the nonce from the protocol-level
+	// MsgReplicateSync. Used to derive the HKDF session key. Not
+	// serialized — internal hand-off only.
+	HandshakeNonce string `json:"-"`
 }
 
 // ReplicateSyncAck responds with the writer's current position.
@@ -200,6 +270,11 @@ func WriteError(w io.Writer, err *ReplicateError) error {
 	return WriteMessage(w, MsgReplicateError, err)
 }
 
+// WriteCheckpoint writes a ReplicateCheckpoint to the writer.
+func WriteCheckpoint(w io.Writer, cp *ReplicateCheckpoint) error {
+	return WriteMessage(w, MsgReplicateCheckpoint, cp)
+}
+
 // ParseEntry parses a ReplicateEntry from JSON payload.
 func ParseEntry(payload []byte) (*ReplicateEntry, error) {
 	var entry ReplicateEntry
@@ -243,4 +318,13 @@ func ParseError(payload []byte) (*ReplicateError, error) {
 		return nil, fmt.Errorf("parse error: %w", err)
 	}
 	return &errMsg, nil
+}
+
+// ParseCheckpoint parses a ReplicateCheckpoint from JSON payload.
+func ParseCheckpoint(payload []byte) (*ReplicateCheckpoint, error) {
+	var cp ReplicateCheckpoint
+	if err := json.Unmarshal(payload, &cp); err != nil {
+		return nil, fmt.Errorf("parse checkpoint: %w", err)
+	}
+	return &cp, nil
 }

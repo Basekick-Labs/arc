@@ -60,12 +60,14 @@ var Version = "dev"
 const uploadSubdirName = "arc-uploads"
 
 // cacheInvalidateHMACTolerance is the freshness window for HMACs on the
-// cluster cache-invalidate fan-out. Matches the project-wide 5-minute
-// convention used by leader-forward, peer-fetch, and join HMACs (see
-// internal/cluster/coordinator.go). Shared between the NonceCache TTL and
-// the receiver-side ValidateCacheInvalidateHMAC call so a nonce expires
-// from the cache at the same instant its MAC would be rejected as stale.
-const cacheInvalidateHMACTolerance = 5 * time.Minute
+// cluster cache-invalidate fan-out. Aliased to the package-wide
+// security.HMACTimestampTolerance so a future change to the cluster's
+// HMAC freshness window propagates here automatically — Gemini round 1
+// on PR #449 flagged the hardcoded constants scattered across the
+// codebase. Shared between the NonceCache TTL and the receiver-side
+// ValidateCacheInvalidateHMAC call so a nonce expires from the cache
+// at the same instant its MAC would be rejected as stale.
+const cacheInvalidateHMACTolerance = security.HMACTimestampTolerance
 
 func main() {
 	// Check for subcommands before loading full config
