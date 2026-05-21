@@ -422,7 +422,7 @@ func (c *Coordinator) Start() error {
 
 	// Initialize the nonce cache for HMAC replay protection. The 5-minute
 	// TTL matches the HMAC timestamp tolerance in ValidateForwardHMAC.
-	c.nonceCache = security.NewNonceCache(5 * time.Minute)
+	c.nonceCache = security.NewNonceCache(security.HMACTimestampTolerance)
 
 	// Start Raft node if configured (Phase 3)
 	if c.raftNode != nil {
@@ -1064,7 +1064,7 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 		}
 		if err := security.ValidateHMAC(
 			c.cfg.SharedSecret, req.AuthNonce, req.NodeID, req.ClusterName,
-			req.AuthTimestamp, req.AuthHMAC, 5*time.Minute,
+			req.AuthTimestamp, req.AuthHMAC, security.HMACTimestampTolerance,
 		); err != nil {
 			c.logger.Warn().Err(err).Str("node_id", req.NodeID).Msg("Join rejected: authentication failed")
 			c.sendJoinError(conn, "authentication failed: invalid shared secret")
@@ -1234,7 +1234,7 @@ func (c *Coordinator) handleLeaveNotify(leave *protocol.LeaveNotify) {
 		}
 		if err := security.ValidateHMAC(
 			c.cfg.SharedSecret, leave.AuthNonce, leave.NodeID, c.cfg.ClusterName,
-			leave.AuthTimestamp, leave.AuthHMAC, 5*time.Minute,
+			leave.AuthTimestamp, leave.AuthHMAC, security.HMACTimestampTolerance,
 		); err != nil {
 			c.logger.Warn().Err(err).Str("node_id", leave.NodeID).Msg("Leave rejected: authentication failed")
 			return
@@ -1314,7 +1314,7 @@ func (c *Coordinator) handleReplicateSync(conn net.Conn, syncReq *protocol.Repli
 	}
 	if err := security.ValidateReplicateSyncHMAC(
 		c.cfg.SharedSecret, syncReq.Nonce, syncReq.ReaderID, syncReq.ClusterName,
-		syncReq.LastKnownSequence, syncReq.Timestamp, syncReq.HMAC, 5*time.Minute,
+		syncReq.LastKnownSequence, syncReq.Timestamp, syncReq.HMAC, security.HMACTimestampTolerance,
 	); err != nil {
 		c.logger.Warn().
 			Err(err).
@@ -1418,7 +1418,7 @@ func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequ
 	// within the freshness window.
 	if err := security.ValidateFetchHMAC(
 		c.cfg.SharedSecret, req.Nonce, req.NodeID, c.cfg.ClusterName, req.Path,
-		req.Timestamp, req.HMAC, 5*time.Minute,
+		req.Timestamp, req.HMAC, security.HMACTimestampTolerance,
 	); err != nil {
 		c.logger.Warn().
 			Err(err).

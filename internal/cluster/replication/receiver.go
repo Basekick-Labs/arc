@@ -367,6 +367,7 @@ func (r *Receiver) receiveLoop() {
 
 	r.mu.Lock()
 	sessionKey := r.sessionKey
+	conn0 := r.conn
 	r.mu.Unlock()
 	if len(sessionKey) == 0 {
 		// connect() guarantees sessionKey is set before returning; this
@@ -375,6 +376,15 @@ func (r *Receiver) receiveLoop() {
 		r.logger.Error().Msg("Replication receive loop started without session key, refusing to process stream")
 		return
 	}
+	// Snapshot remoteAddr once for the lifetime of this connection so
+	// every error log carries enough context for an operator to
+	// triage which peer is misbehaving (Gemini round 1 / PR #449).
+	// Cheap: RemoteAddr() reads a cached value on the conn.
+	var remoteAddr string
+	if conn0 != nil && conn0.RemoteAddr() != nil {
+		remoteAddr = conn0.RemoteAddr().String()
+	}
+	llog := r.logger.With().Str("remote_addr", remoteAddr).Logger()
 	cumulativeHash := sha256.New()
 
 	for r.running.Load() {
@@ -407,7 +417,7 @@ func (r *Receiver) receiveLoop() {
 			if errors.As(err, &netErr) && netErr.Timeout() {
 				continue
 			}
-			r.logger.Debug().Err(err).Msg("Connection closed")
+			llog.Debug().Err(err).Msg("Connection closed")
 			return
 		}
 
@@ -416,7 +426,7 @@ func (r *Receiver) receiveLoop() {
 			entry, err := ParseEntry(payload)
 			if err != nil {
 				r.totalErrors.Add(1)
-				r.logger.Error().Err(err).Msg("Failed to parse entry")
+				llog.Error().Err(err).Msg("Failed to parse entry")
 				return
 			}
 
@@ -426,7 +436,7 @@ func (r *Receiver) receiveLoop() {
 			// a poisoned stream. See GHSA-wfgr-8x84-22q7.
 			if entry.Tag == "" {
 				r.totalErrors.Add(1)
-				r.logger.Error().
+				llog.Error().
 					Uint64("sequence", entry.Sequence).
 					Msg("Replication entry missing MAC tag; dropping connection")
 				return
@@ -434,7 +444,7 @@ func (r *Receiver) receiveLoop() {
 			tagBytes, err := hex.DecodeString(entry.Tag)
 			if err != nil || len(tagBytes) != security.ReplicationEntryTagLen {
 				r.totalErrors.Add(1)
-				r.logger.Error().
+				llog.Error().
 					Err(err).
 					Uint64("sequence", entry.Sequence).
 					Msg("Replication entry tag malformed; dropping connection")
@@ -442,7 +452,7 @@ func (r *Receiver) receiveLoop() {
 			}
 			if err := security.ValidateReplicationEntryTag(sessionKey, entry.Sequence, entry.Payload, tagBytes); err != nil {
 				r.totalErrors.Add(1)
-				r.logger.Error().
+				llog.Error().
 					Err(err).
 					Uint64("sequence", entry.Sequence).
 					Msg("Replication entry MAC tag verification failed; dropping connection")
@@ -455,7 +465,7 @@ func (r *Receiver) receiveLoop() {
 			// tampered stream — drop the connection.
 			if entry.Sequence <= r.lastSeq.Load() {
 				r.totalErrors.Add(1)
-				r.logger.Error().
+				llog.Error().
 					Uint64("sequence", entry.Sequence).
 					Uint64("last_seq", r.lastSeq.Load()).
 					Msg("Replication entry sequence did not advance; dropping connection")
@@ -468,7 +478,7 @@ func (r *Receiver) receiveLoop() {
 
 			if err := r.applyEntry(entry); err != nil {
 				r.totalErrors.Add(1)
-				r.logger.Error().
+				llog.Error().
 					Err(err).
 					Uint64("sequence", entry.Sequence).
 					Msg("Failed to apply entry")
@@ -484,13 +494,13 @@ func (r *Receiver) receiveLoop() {
 			cp, err := ParseCheckpoint(payload)
 			if err != nil {
 				r.totalErrors.Add(1)
-				r.logger.Error().Err(err).Msg("Replication checkpoint parse failed; dropping connection")
+				llog.Error().Err(err).Msg("Replication checkpoint parse failed; dropping connection")
 				return
 			}
 			// Cluster name mismatch is a fast fail before HMAC compute.
 			if cp.ClusterName != r.cfg.ClusterName {
 				r.totalErrors.Add(1)
-				r.logger.Error().
+				llog.Error().
 					Str("their_cluster", cp.ClusterName).
 					Msg("Replication checkpoint cluster name mismatch; dropping connection")
 				return
@@ -499,7 +509,7 @@ func (r *Receiver) receiveLoop() {
 			// entry we haven't seen yet.
 			if cp.LastSequence > r.lastSeq.Load() {
 				r.totalErrors.Add(1)
-				r.logger.Error().
+				llog.Error().
 					Uint64("checkpoint_seq", cp.LastSequence).
 					Uint64("our_last_seq", r.lastSeq.Load()).
 					Msg("Replication checkpoint claims unseen sequence; dropping connection")
@@ -510,12 +520,12 @@ func (r *Receiver) receiveLoop() {
 			theirHash, err := hex.DecodeString(cp.CumulativePayloadHashHex)
 			if err != nil || len(theirHash) != sha256.Size {
 				r.totalErrors.Add(1)
-				r.logger.Error().Err(err).Msg("Replication checkpoint hash malformed; dropping connection")
+				llog.Error().Err(err).Msg("Replication checkpoint hash malformed; dropping connection")
 				return
 			}
 			if subtle.ConstantTimeCompare(ourHash, theirHash) != 1 {
 				r.totalErrors.Add(1)
-				r.logger.Error().Msg("Replication checkpoint hash mismatch; dropping connection")
+				llog.Error().Msg("Replication checkpoint hash mismatch; dropping connection")
 				return
 			}
 			// Full HMAC validation against the cluster shared
@@ -534,26 +544,26 @@ func (r *Receiver) receiveLoop() {
 			copy(hashArr[:], theirHash)
 			if err := security.ValidateReplicationCheckpointHMAC(
 				r.cfg.SharedSecret, cp.Nonce, cp.SenderNodeID, cp.ClusterName,
-				hashArr, cp.LastSequence, cp.Timestamp, cp.HMAC, 5*time.Minute,
+				hashArr, cp.LastSequence, cp.Timestamp, cp.HMAC, security.HMACTimestampTolerance,
 			); err != nil {
 				r.totalErrors.Add(1)
-				r.logger.Error().Err(err).Msg("Replication checkpoint HMAC validation failed; dropping connection")
+				llog.Error().Err(err).Msg("Replication checkpoint HMAC validation failed; dropping connection")
 				return
 			}
-			r.logger.Debug().
+			llog.Debug().
 				Uint64("last_seq", cp.LastSequence).
 				Msg("Replication checkpoint verified")
 
 		case MsgReplicateError:
 			errMsg, _ := ParseError(payload)
-			r.logger.Error().
+			llog.Error().
 				Str("code", errMsg.Code).
 				Str("message", errMsg.Message).
 				Msg("Error from writer")
 			r.totalErrors.Add(1)
 
 		default:
-			r.logger.Warn().Uint8("msg_type", msgType).Msg("Unexpected message type")
+			llog.Warn().Uint8("msg_type", msgType).Msg("Unexpected message type")
 		}
 	}
 }

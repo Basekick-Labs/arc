@@ -302,6 +302,18 @@ func DeriveReplicationSessionKey(sharedSecret string, handshakeNonce string) ([]
 // handshake" rather than "attacker is trying random forgeries."
 const ReplicationEntryTagLen = 8
 
+// HMACTimestampTolerance is the symmetric window (past and future) the
+// cluster HMAC validators accept on a signed timestamp. Five minutes
+// is the same window enforced by every Compute*HMAC consumer in this
+// package (join, leave, fetch, forward-apply, cache-invalidate,
+// replicate-sync, replicate-checkpoint) AND the NonceCache TTL the
+// coordinator constructs at startup — keep them aligned so a replayed
+// HMAC can never outlive its nonce-cache slot. Centralized here so a
+// future operator can tune all sites in one place; Gemini round 1 on
+// PR #449 flagged the hardcoded 5*time.Minute scattered across
+// coordinator.go.
+const HMACTimestampTolerance = 5 * time.Minute
+
 // ComputeReplicationEntryTag returns the 8-byte per-entry MAC tag
 // computed over the session key + sequence + first 8 bytes of the
 // payload SHA-256. The payload binding prevents an attacker from

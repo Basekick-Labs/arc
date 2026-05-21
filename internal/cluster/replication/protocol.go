@@ -22,14 +22,16 @@ const (
 	MsgReplicateSyncAck byte = 0x13
 
 	// MsgReplicateCheckpoint is a periodic full-HMAC checkpoint sent by
-	// the writer every N entries. It carries the running SHA-256 hash of
-	// every entry payload observed since the connection's handshake plus
-	// the last sequence covered, signed with the cluster shared secret.
-	// The receiver verifies it against its own running hash; mismatch
-	// drops the connection. This anchors the per-entry truncated MAC
-	// tags (which are 8-byte session-keyed) against a full-strength
-	// HMAC so an attacker who somehow forges a stream-tag still gets
-	// caught at the next checkpoint. See GHSA-wfgr-8x84-22q7.
+	// the writer every N entries (N = SenderConfig.CheckpointInterval,
+	// defaults to defaultCheckpointInterval = 1024 — see sender.go). It
+	// carries the running SHA-256 hash of every entry payload observed
+	// since the connection's handshake plus the last sequence covered,
+	// signed with the cluster shared secret. The receiver verifies it
+	// against its own running hash; mismatch drops the connection. This
+	// anchors the per-entry truncated MAC tags (which are 8-byte
+	// session-keyed) against a full-strength HMAC so an attacker who
+	// somehow forges a stream-tag still gets caught at the next
+	// checkpoint. See GHSA-wfgr-8x84-22q7.
 	MsgReplicateCheckpoint byte = 0x14
 
 	// MsgReplicateError indicates a replication error
