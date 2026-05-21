@@ -400,12 +400,32 @@ var entryFrameLabel = []byte("entry-frame:")
 // Caller (the receiver) must drop the connection on any error —
 // a tag mismatch means either the session key is wrong or the
 // payload was tampered. Either way the session is poisoned.
+//
+// Prefer ValidateReplicationEntryTagWithMAC on the hot path — it
+// lets the receiver reuse a per-connection hmac.Hash and avoids
+// allocating a fresh HMAC context per entry.
 func ValidateReplicationEntryTag(sessionKey []byte, sequence uint64, payload []byte, receivedTag []byte) error {
 	if len(receivedTag) != ReplicationEntryTagLen {
 		return fmt.Errorf("replication entry tag: wrong length (got %d, want %d)", len(receivedTag), ReplicationEntryTagLen)
 	}
-	expected := ComputeReplicationEntryTag(sessionKey, sequence, payload)
-	if !hmac.Equal(expected, receivedTag) {
+	payloadHash := sha256.Sum256(payload)
+	mac := hmac.New(sha256.New, sessionKey)
+	return ValidateReplicationEntryTagWithMAC(mac, sequence, payloadHash, receivedTag)
+}
+
+// ValidateReplicationEntryTagWithMAC is the hot-path variant: caller
+// supplies a long-lived hmac.Hash (constructed once per connection
+// via NewReplicationEntryHMAC) and the pre-computed payload SHA-256.
+// At Arc's 200k+ entries/sec ingest rate this saves both the hmac.New
+// allocation per entry AND the sha256(payload) work the receiver
+// already does for cumulativeHash. Flagged by Gemini round 9 on PR #449.
+func ValidateReplicationEntryTagWithMAC(mac hash.Hash, sequence uint64, payloadHash [sha256.Size]byte, receivedTag []byte) error {
+	if len(receivedTag) != ReplicationEntryTagLen {
+		return fmt.Errorf("replication entry tag: wrong length (got %d, want %d)", len(receivedTag), ReplicationEntryTagLen)
+	}
+	var expected [ReplicationEntryTagLen]byte
+	ComputeReplicationEntryTagWithMAC(mac, sequence, payloadHash, expected[:])
+	if !hmac.Equal(expected[:], receivedTag) {
 		return fmt.Errorf("replication entry tag mismatch: session key wrong or payload tampered")
 	}
 	return nil

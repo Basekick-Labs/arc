@@ -386,6 +386,11 @@ func (r *Receiver) receiveLoop() {
 	}
 	llog := r.logger.With().Str("remote_addr", remoteAddr).Logger()
 	cumulativeHash := sha256.New()
+	// Reusable per-connection HMAC for entry-tag verification. Reset
+	// + reused on every entry, same pattern as the sender's
+	// reader.entryMAC (Gemini round 9). Saves the per-entry hmac.New
+	// allocation at Arc's 200k+ entries/sec ingest rate.
+	entryMAC := security.NewReplicationEntryHMAC(sessionKey)
 
 	for r.running.Load() {
 		select {
@@ -470,7 +475,14 @@ func (r *Receiver) receiveLoop() {
 					Msg("Replication entry tag malformed; dropping connection")
 				return
 			}
-			if err := security.ValidateReplicationEntryTag(sessionKey, entry.Sequence, entry.Payload, tagBytes[:]); err != nil {
+			// Compute the payload SHA-256 once, reuse for both tag
+			// verification (per-entry MAC binds the first 8 bytes
+			// of this hash) and the cumulative checkpoint hash
+			// (which absorbs every payload byte). Avoids the second
+			// SHA-256 pass that ValidateReplicationEntryTag would
+			// otherwise do internally. (Gemini round 9 / PR #449.)
+			payloadHash := sha256.Sum256(entry.Payload)
+			if err := security.ValidateReplicationEntryTagWithMAC(entryMAC, entry.Sequence, payloadHash, tagBytes[:]); err != nil {
 				r.totalErrors.Add(1)
 				llog.Error().
 					Err(err).

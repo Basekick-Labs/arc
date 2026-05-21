@@ -99,6 +99,38 @@ func BenchmarkComputeReplicationEntryTagWithMAC(b *testing.B) {
 	}
 }
 
+// BenchmarkValidateReplicationEntryTagWithMAC measures the production
+// hot-path variant used by receiveLoop: per-connection reusable mac +
+// pre-computed payload hash (the receiver already computes the hash
+// for cumulativeHash so this is free). Expected to be in the same
+// ballpark as ComputeReplicationEntryTagWithMAC.
+func BenchmarkValidateReplicationEntryTagWithMAC(b *testing.B) {
+	sessionKey, err := security.DeriveReplicationSessionKey(
+		"test-shared-secret", "test-handshake-nonce-aaaaaaaaaaaa",
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	mac := security.NewReplicationEntryHMAC(sessionKey)
+	payload := make([]byte, 256)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	payloadHash := sha256.Sum256(payload)
+	var tag [security.ReplicationEntryTagLen]byte
+	security.ComputeReplicationEntryTagWithMAC(mac, 0, payloadHash, tag[:])
+
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if err := security.ValidateReplicationEntryTagWithMAC(mac, 0, payloadHash, tag[:]); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkValidateReplicationEntryTag measures the per-entry receiver
 // verification cost. Expected to be ~2x ComputeReplicationEntryTag
 // (compute + constant-time compare).
