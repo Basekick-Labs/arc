@@ -461,11 +461,12 @@ func (r *Receiver) receiveLoop() {
 				return
 			}
 			// Stack-allocate the decoded tag — hex.DecodeString
-			// would heap-allocate twice per entry (source + dest)
-			// at 200k+ entries/sec; hex.Decode into a fixed-size
-			// array eliminates the destination allocation, and
-			// Go optimises the []byte(entry.Tag) source conversion
-			// here. Gemini round 5 / PR #449.
+			// would heap-allocate the destination at 200k+
+			// entries/sec; hex.Decode into a fixed-size array
+			// eliminates that. The []byte(entry.Tag) source
+			// conversion is elided by the compiler when the slice
+			// doesn't escape (verified by bench: zero allocs in
+			// the std hex.Decode path here). Gemini round 5 / PR #449.
 			var tagBytes [security.ReplicationEntryTagLen]byte
 			if _, err := hex.Decode(tagBytes[:], []byte(entry.Tag)); err != nil {
 				r.totalErrors.Add(1)
