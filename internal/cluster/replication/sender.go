@@ -76,14 +76,18 @@ type ReaderConnection struct {
 	cancelFunc context.CancelFunc
 	ctx        context.Context
 
-	// Stream authentication state (GHSA-wfgr-8x84-22q7). All three
+	// Stream authentication state (GHSA-wfgr-8x84-22q7). All four
 	// fields are protected by writeMu — every send path that touches
 	// them already holds it. sessionKey is the HKDF-derived per-
-	// connection key, cumulativeHash is the running SHA-256 over
-	// every payload streamed since the handshake (matches the
-	// receiver's running hash), and entriesSinceCheckpoint is the
-	// counter that triggers the next checkpoint emission.
+	// connection key, entryMAC is a long-lived hmac.Hash keyed by
+	// sessionKey that sendToReader reuses (via Reset) for every entry
+	// — at 200k+ entries/sec this saves the per-entry hmac.New
+	// allocation. cumulativeHash is the running SHA-256 over every
+	// payload streamed since the handshake (matches the receiver's
+	// running hash). entriesSinceCheckpoint is the counter that
+	// triggers the next checkpoint emission.
 	sessionKey             []byte
+	entryMAC               hash.Hash
 	cumulativeHash         hash.Hash
 	entriesSinceCheckpoint int
 
@@ -246,6 +250,7 @@ func (s *Sender) PrepareReader(conn net.Conn, readerID, handshakeNonce string, l
 		cancelFunc:     cancel,
 		ctx:            readerCtx,
 		sessionKey:     sessionKey,
+		entryMAC:       security.NewReplicationEntryHMAC(sessionKey),
 		cumulativeHash: sha256.New(),
 	}
 	reader.lastAck.Store(lastKnownSeq)
@@ -430,9 +435,17 @@ func (s *Sender) sendToReader(reader *ReaderConnection, entry *ReplicateEntry, p
 	//
 	// Gemini round 2 on PR #449 flagged the previous shared-pointer
 	// mutation as a latent race under parallelization.
+	//
+	// We reuse reader.entryMAC (allocated once at PrepareReader
+	// time) instead of building a fresh hmac.Hash per entry —
+	// hmac.New is one of the dominant allocations on the hot path
+	// at 200k+ entries/sec. The reuse is safe because writeMu
+	// serialises every sendToReader call for the same reader.
+	// (Gemini round 6 / PR #449.)
 	entryCopy := *entry
-	tag := security.ComputeReplicationEntryTagFromHash(reader.sessionKey, entryCopy.Sequence, payloadHash)
-	entryCopy.Tag = hex.EncodeToString(tag)
+	var tag [security.ReplicationEntryTagLen]byte
+	security.ComputeReplicationEntryTagWithMAC(reader.entryMAC, entryCopy.Sequence, payloadHash, tag[:])
+	entryCopy.Tag = hex.EncodeToString(tag[:])
 
 	// Feed the running cumulative hash that the checkpoint will sign.
 	// We hash the payload (not the tag) so both ends compute the same

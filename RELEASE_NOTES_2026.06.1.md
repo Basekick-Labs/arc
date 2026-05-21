@@ -161,7 +161,13 @@ Pre-26.06.1 the writer accepted `MsgReplicateSync` on its cluster-coordinator li
 
 The session key, cumulative hash, and per-entry counter all live for the lifetime of a single connection and are reset on reconnect — never reused across handshakes.
 
-**Performance.** Bench (`internal/cluster/replication/auth_bench_test.go`): per-entry tag compute is **386 ns / 552 B / 8 allocs** at a 256-byte payload (Apple M3 Max), trending up to ~3 µs at 8 KB payloads. For Arc's typical batch-of-records-per-entry shape (~100 records/entry → ~200k entries/sec at 19.9M records/sec), the per-entry overhead works out to ~0.08% of a single core. The full HMAC fires once every 1024 entries, so its cost amortises away. For multi-reader deployments the broadcast path computes SHA-256 once per entry and reuses it across every reader via `ComputeReplicationEntryTagFromHash` (**282 ns / op**, 27% faster than the hash-internal variant) — at N readers this drops the per-broadcast hash cost from N × sha256(payload) to 1 × sha256(payload).
+**Performance.** Bench (`internal/cluster/replication/auth_bench_test.go`), 256-byte payload on Apple M3 Max:
+
+- Naive single-call (`ComputeReplicationEntryTag`): 513 ns / 784 B / 11 allocs.
+- Broadcast-friendly with pre-computed payload hash (`ComputeReplicationEntryTagFromHash`): 376 ns / 784 B / 11 allocs — saves the per-reader SHA-256 over the payload.
+- **Production hot path** (`ComputeReplicationEntryTagWithMAC` with a per-reader reusable `hmac.Hash`): **120 ns / 72 B / 3 allocs** — 3.1× faster and ~11× lower allocations than the naive variant.
+
+For Arc's typical batch-of-records-per-entry shape (~100 records/entry → ~200k entries/sec at 19.9M records/sec) the per-entry overhead works out to **~0.024% of a single core** at the production hot-path cost. The full HMAC fires once every 1024 entries, so its cost amortises away. For multi-reader deployments the broadcast path computes SHA-256 once per entry and reuses it across every reader.
 
 **Operator-facing change.** `cluster.shared_secret` is now **required** for WAL replication. Pre-26.06.1 deployments that ran clustered replication with an empty shared secret will start logging `replication sender refuses connection: cluster.shared_secret not configured` on reader nodes and `Replication sync rejected: cluster.shared_secret not configured` on writer nodes until the secret is populated on every node. The same secret must match across all nodes — same value already used for the optional join/leave/forward-apply HMACs. Rolling upgrades are NOT supported for this change: pre-26.06.1 readers send no auth fields and 26.06.1 writers refuse them; the supported upgrade path is a full cluster restart with the secret pre-staged on every node.
 

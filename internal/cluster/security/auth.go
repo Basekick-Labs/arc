@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"time"
 
@@ -340,16 +341,53 @@ func ComputeReplicationEntryTag(sessionKey []byte, sequence uint64, payload []by
 // per-broadcast hash cost from N × sha256(payload) to 1 ×
 // sha256(payload). Flagged by Gemini round 1 on PR #449 as a hot-path
 // optimization for multi-reader deployments.
+//
+// Prefer ComputeReplicationEntryTagWithMAC on the hot path — it lets
+// the caller reuse a per-reader hmac.Hash and avoids allocating a
+// fresh HMAC context per entry.
 func ComputeReplicationEntryTagFromHash(sessionKey []byte, sequence uint64, payloadHash [sha256.Size]byte) []byte {
 	mac := hmac.New(sha256.New, sessionKey)
-	// Sequence as big-endian uint64, then first 8 bytes of payload hash.
+	tag := make([]byte, ReplicationEntryTagLen)
+	ComputeReplicationEntryTagWithMAC(mac, sequence, payloadHash, tag)
+	return tag
+}
+
+// NewReplicationEntryHMAC builds a fresh hmac.Hash keyed by the session
+// key, sized for SHA-256. Callers should construct one per reader
+// connection (the session key is stable for the connection's lifetime)
+// and reuse it via ComputeReplicationEntryTagWithMAC + mac.Reset()
+// across every entry to avoid the per-entry HMAC allocation.
+func NewReplicationEntryHMAC(sessionKey []byte) hash.Hash {
+	return hmac.New(sha256.New, sessionKey)
+}
+
+// ComputeReplicationEntryTagWithMAC writes the per-entry MAC tag into
+// dst (which MUST be at least ReplicationEntryTagLen bytes). The mac
+// argument must have been constructed with NewReplicationEntryHMAC
+// using the same session key both ends agreed on at handshake. This
+// function calls mac.Reset() before writing — callers can keep the
+// same mac across every entry without managing reset themselves.
+//
+// At Arc's 200k+ entries/sec ingest profile, reusing a per-reader
+// hmac.Hash drops the entry-tag allocations from ~8 per entry to ~3
+// (the persistent HMAC context replaces the per-call hmac.New
+// allocation). Flagged by Gemini round 6 on PR #449.
+func ComputeReplicationEntryTagWithMAC(mac hash.Hash, sequence uint64, payloadHash [sha256.Size]byte, dst []byte) {
+	mac.Reset()
 	var seqBuf [8]byte
 	binary.BigEndian.PutUint64(seqBuf[:], sequence)
 	mac.Write(entryFrameLabel)
 	mac.Write(seqBuf[:])
 	mac.Write(payloadHash[:8])
-	full := mac.Sum(nil)
-	return full[:ReplicationEntryTagLen]
+	// Sum into a stack buffer, then copy the truncated tag into dst.
+	// We don't pass dst directly to Sum because Sum APPENDS, not
+	// overwrites — passing dst[:0] would also overwrite the underlying
+	// array but only up to the appended length, which is the same
+	// thing as truncating after the copy. The two-line form is
+	// clearer.
+	var full [sha256.Size]byte
+	mac.Sum(full[:0])
+	copy(dst, full[:ReplicationEntryTagLen])
 }
 
 // entryFrameLabel is the domain-separation label baked into every

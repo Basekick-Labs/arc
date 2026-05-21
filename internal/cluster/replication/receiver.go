@@ -607,7 +607,16 @@ func (r *Receiver) receiveLoop() {
 			r.totalErrors.Add(1)
 
 		default:
-			llog.Warn().Uint8("msg_type", msgType).Msg("Unexpected message type")
+			// On an authenticated stream an unknown message type
+			// indicates a protocol desync or a corrupted/tampered
+			// frame. Continue would let the loop drift past
+			// further bytes that may also be desynced; safer to
+			// drop the connection and re-handshake so the stream
+			// state is reset (fresh session key, fresh cumulative
+			// hash). Gemini round 6 / PR #449.
+			r.totalErrors.Add(1)
+			llog.Warn().Uint8("msg_type", msgType).Msg("Unexpected message type; dropping connection")
+			return
 		}
 	}
 }

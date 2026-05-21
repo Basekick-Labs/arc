@@ -70,6 +70,35 @@ func BenchmarkComputeReplicationEntryTagFromHash(b *testing.B) {
 	}
 }
 
+// BenchmarkComputeReplicationEntryTagWithMAC measures the production
+// hot-path variant used by sendToReader: a single reusable hmac.Hash
+// per reader, Reset() between entries. Expected to be markedly faster
+// than ComputeReplicationEntryTagFromHash (no per-call hmac.New
+// allocation) and produces measurably fewer allocations per op.
+func BenchmarkComputeReplicationEntryTagWithMAC(b *testing.B) {
+	sessionKey, err := security.DeriveReplicationSessionKey(
+		"test-shared-secret", "test-handshake-nonce-aaaaaaaaaaaa",
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	mac := security.NewReplicationEntryHMAC(sessionKey)
+	payload := make([]byte, 256)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	payloadHash := sha256.Sum256(payload)
+	var tag [security.ReplicationEntryTagLen]byte
+
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		security.ComputeReplicationEntryTagWithMAC(mac, uint64(i), payloadHash, tag[:])
+	}
+}
+
 // BenchmarkValidateReplicationEntryTag measures the per-entry receiver
 // verification cost. Expected to be ~2x ComputeReplicationEntryTag
 // (compute + constant-time compare).
