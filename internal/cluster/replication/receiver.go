@@ -599,7 +599,18 @@ func (r *Receiver) receiveLoop() {
 				Msg("Replication checkpoint verified")
 
 		case MsgReplicateError:
-			errMsg, _ := ParseError(payload)
+			// ParseError can fail on malformed JSON. Don't deref a
+			// nil errMsg — log the parse error and drop the
+			// connection (same posture as the other "stream is
+			// poisoned" branches: a writer that sends a malformed
+			// error frame is either misbehaving or tampered).
+			// Gemini round 7 / PR #449.
+			errMsg, err := ParseError(payload)
+			if err != nil {
+				r.totalErrors.Add(1)
+				llog.Error().Err(err).Msg("Failed to parse error message from writer; dropping connection")
+				return
+			}
 			llog.Error().
 				Str("code", errMsg.Code).
 				Str("message", errMsg.Message).
