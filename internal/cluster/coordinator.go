@@ -2678,45 +2678,57 @@ func (c *Coordinator) AcceptReplicationConnection(conn net.Conn, syncReq *replic
 		return fmt.Errorf("replication connection rejected: not a writer")
 	}
 
-	if err := sender.AcceptReader(conn, syncReq.ReaderID, syncReq.HandshakeNonce, syncReq.LastKnownSequence); err != nil {
+	// Two-phase accept: prepare the reader (validates + derives session
+	// key + builds the connection struct, but does NOT publish it to
+	// the broadcast map), write the handshake ack on the raw conn
+	// while it's still invisible to broadcastEntry, then activate the
+	// reader so the broadcast path can start streaming entries.
+	//
+	// This ordering closes two races caught on PR #449:
+	//   - Write race: the old single-call AcceptReader published the
+	//     reader before returning, so the broadcast path could
+	//     interleave bytes with the coordinator's ack write on the
+	//     same conn.
+	//   - Delivery-order race (Gemini round 4): even with writeMu
+	//     serialisation, the broadcast could acquire the lock first
+	//     and write an entry frame BEFORE the ack — receiver reads
+	//     MsgReplicateEntry as its first message, fails the handshake.
+	//
+	// Failure handling: PrepareReader closes the conn on error, so we
+	// just propagate. If the ack write fails we close the conn manually
+	// and skip Activate — the reader is never published, so no leaked
+	// goroutines or map entries.
+	reader, err := sender.PrepareReader(conn, syncReq.ReaderID, syncReq.HandshakeNonce, syncReq.LastKnownSequence)
+	if err != nil {
 		return err
 	}
 
-	// Send success ack via the cluster-protocol wire format so the
-	// receiver's protocol.ReceiveMessage can decode it.
-	//
-	// IMPORTANT: hold the per-reader writeMu via DoWithReaderWriteLock
-	// for the ack write. AcceptReader publishes the reader to
-	// sender.readers BEFORE returning, so the moment we get here the
-	// distributionLoop is free to call sendToReader and start writing
-	// entry frames to the same conn. net.TCPConn per-Write is goroutine-
-	// safe, but a 3-write protocol frame ([4-byte len][1-byte type][JSON
-	// payload]) from each side would interleave at the byte level and
-	// corrupt the stream — the receiver would read garbage and tear the
-	// connection down. Holding writeMu for the ack write serialises it
-	// against any concurrent broadcast on the same reader.
-	//
-	// Final-review finding on PR #449 (post-Gemini round 3 sanity pass).
 	currentSeq, canResume := sender.CurrentSequenceAndCanResume(syncReq.LastKnownSequence)
 	ack := &protocol.ReplicateSyncAck{
 		CurrentSequence: currentSeq,
 		CanResume:       canResume,
 	}
-	ackErr := sender.DoWithReaderWriteLock(syncReq.ReaderID, func(c net.Conn) error {
-		return protocol.SendMessage(c, &protocol.Message{
-			Type:    protocol.MsgReplicateSyncAck,
-			Payload: ack,
-		}, 5*time.Second)
-	})
-	if ackErr != nil {
+	if err := protocol.SendMessage(conn, &protocol.Message{
+		Type:    protocol.MsgReplicateSyncAck,
+		Payload: ack,
+	}, 5*time.Second); err != nil {
 		c.logger.Warn().
-			Err(ackErr).
+			Err(err).
 			Str("reader_id", syncReq.ReaderID).
 			Msg("Replication: failed to send success sync ack to reader (connection will be torn down)")
-		sender.RemoveReader(syncReq.ReaderID)
-		return fmt.Errorf("write sync ack: %w", ackErr)
+		// Reader was prepared but never activated, so we own the
+		// cleanup. PrepareReader didn't take s.mu and didn't start
+		// a goroutine — Discard cancels the reader's context and
+		// closes the conn.
+		reader.Discard()
+		return fmt.Errorf("write sync ack: %w", err)
 	}
 
+	// Ack landed on the wire. Now publish the reader to the broadcast
+	// map; any entry that arrives after this point is guaranteed to
+	// be a SECOND message on the wire (after the ack), so the
+	// receiver reads them in protocol-required order.
+	sender.ActivateReader(reader)
 	return nil
 }
 

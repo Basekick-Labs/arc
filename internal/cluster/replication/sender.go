@@ -24,14 +24,8 @@ var (
 	errSharedSecretRequired = errors.New("replication sender refuses connection: cluster.shared_secret not configured")
 	// errHandshakeNonceRequired is returned when the handshake nonce is
 	// empty. Should never happen if the coordinator validated the
-	// MsgReplicateSync before calling AcceptReader; defensive.
+	// MsgReplicateSync before calling PrepareReader; defensive.
 	errHandshakeNonceRequired = errors.New("replication sender refuses connection: missing handshake nonce")
-	// errReaderUnknown is returned by DoWithReaderWriteLock when the
-	// readerID is no longer in s.readers (the reader was removed
-	// between AcceptReader and the ack write — e.g. concurrent
-	// RemoveReader from a broadcast failure). The caller should
-	// treat this as a tear-down signal, same as a write error.
-	errReaderUnknown = errors.New("replication sender: reader no longer registered")
 )
 
 // defaultCheckpointInterval is how many entries the sender streams
@@ -98,6 +92,21 @@ type ReaderConnection struct {
 	bytesSent    atomic.Int64
 	lastSendTime atomic.Int64 // Unix nano
 	errors       atomic.Int64
+}
+
+// Discard tears down a prepared-but-not-yet-activated reader. The
+// coordinator calls this when the handshake ack write fails — the
+// reader was built by PrepareReader but never published to the
+// broadcast map or had its receiveLoop started, so all we need to do
+// is cancel its context (in case anything stashed it) and close the
+// underlying conn. Safe to call exactly once on a reader that has
+// NOT been passed to ActivateReader; calling it on an active reader
+// would leak the entry from s.readers — use RemoveReader for that.
+func (r *ReaderConnection) Discard() {
+	r.cancelFunc()
+	if r.conn != nil {
+		r.conn.Close()
+	}
 }
 
 // Sender streams WAL entries to connected reader nodes.
@@ -184,24 +193,42 @@ func (s *Sender) Stop() error {
 	return nil
 }
 
-// AcceptReader registers a new reader connection for replication.
-// Called when a reader connects and sends a sync request. handshakeNonce
-// is the nonce the reader sent in MsgReplicateSync — both ends use it to
-// derive the same per-connection session key via HKDF
-// (GHSA-wfgr-8x84-22q7).
-func (s *Sender) AcceptReader(conn net.Conn, readerID, handshakeNonce string, lastKnownSeq uint64) error {
+// PrepareReader validates and builds a ReaderConnection but does NOT
+// add it to the sender's active map or start its receive loop. The
+// caller writes the handshake success ack on the returned conn, then
+// calls ActivateReader to publish it.
+//
+// Two-phase accept (Prepare → coordinator writes ack → Activate) is
+// the structural fix for two races on PR #449:
+//   - Write race: pre-fix, AcceptReader published the reader to
+//     s.readers before returning, so distributionLoop could start
+//     writing entry frames to the same conn concurrently with the
+//     coordinator's ack write — byte-level interleave on net.Conn.
+//   - Delivery-order race: even with writeMu serialisation, an entry
+//     frame could land BEFORE the ack frame (the broadcast path
+//     happened to acquire writeMu first), violating the protocol
+//     contract that the receiver reads MsgReplicateSyncAck as the
+//     first message. Receiver would log "unexpected message type"
+//     and tear down the handshake. Gemini round 4 finding.
+//
+// PrepareReader is safe to call without external locking; it does its
+// own validation and returns a fully-constructed ReaderConnection
+// that is invisible to broadcastEntry until ActivateReader runs.
+//
+// On error the conn is closed by this method, so the caller never
+// needs to clean it up.
+func (s *Sender) PrepareReader(conn net.Conn, readerID, handshakeNonce string, lastKnownSeq uint64) (*ReaderConnection, error) {
 	// Refuse-when-unconfigured: an unauthenticated sender is a footgun
-	// (anyone who reaches AcceptReader bypassed the coordinator's auth
-	// check, but defense in depth — we won't stream entries without a
-	// shared secret to MAC them with). Matches the coordinator-level
-	// refusal in handleReplicateSync.
+	// (anyone who reaches PrepareReader bypassed the coordinator's
+	// auth check, but defense in depth — we won't stream entries
+	// without a shared secret to MAC them with).
 	if s.cfg.SharedSecret == "" {
 		conn.Close()
-		return errSharedSecretRequired
+		return nil, errSharedSecretRequired
 	}
 	if handshakeNonce == "" {
 		conn.Close()
-		return errHandshakeNonceRequired
+		return nil, errHandshakeNonceRequired
 	}
 
 	// Derive the per-connection session key from the handshake nonce.
@@ -209,22 +236,10 @@ func (s *Sender) AcceptReader(conn net.Conn, readerID, handshakeNonce string, la
 	sessionKey, err := security.DeriveReplicationSessionKey(s.cfg.SharedSecret, handshakeNonce)
 	if err != nil {
 		conn.Close()
-		return err
+		return nil, err
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Check if this reader is already connected
-	if existing, ok := s.readers[readerID]; ok {
-		existing.cancelFunc()
-		existing.conn.Close()
-		s.logger.Warn().Str("reader_id", readerID).Msg("Reader reconnected, closing old connection")
-	}
-
-	// Create reader context
 	readerCtx, cancel := context.WithCancel(s.ctx)
-
 	reader := &ReaderConnection{
 		id:             readerID,
 		conn:           conn,
@@ -235,66 +250,63 @@ func (s *Sender) AcceptReader(conn net.Conn, readerID, handshakeNonce string, la
 	}
 	reader.lastAck.Store(lastKnownSeq)
 	reader.lastSendTime.Store(time.Now().UnixNano())
+	return reader, nil
+}
 
-	s.readers[readerID] = reader
+// ActivateReader publishes a prepared reader to the sender's active
+// map and starts its receive loop. Called by the coordinator AFTER
+// the handshake success ack has been written to reader.conn — so the
+// first message the receiver reads is always MsgReplicateSyncAck,
+// not a racing MsgReplicateEntry from the broadcast path. See
+// PrepareReader for the full ordering invariant.
+//
+// If a reader with the same ID is already active, its old connection
+// is closed and replaced with this one (matches the pre-two-phase
+// reconnect-replace behaviour).
+func (s *Sender) ActivateReader(reader *ReaderConnection) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	// Start reader's receive loop (for acks)
+	if existing, ok := s.readers[reader.id]; ok {
+		existing.cancelFunc()
+		existing.conn.Close()
+		s.logger.Warn().Str("reader_id", reader.id).Msg("Reader reconnected, closing old connection")
+	}
+	s.readers[reader.id] = reader
+
 	s.wg.Add(1)
 	go s.receiveLoop(reader)
 
-	// Note: the success-ack to the reader is sent by the caller
-	// (Coordinator.handleReplicateSync) via the cluster-protocol
-	// wire format, NOT here. AcceptReader used to write the ack
-	// via replication.WriteSyncAck (replication-package wire format,
-	// 0x13) but the receiver reads with protocol.ReceiveMessage
-	// (cluster-protocol wire format), so the two-byte-type mismatch
-	// silently broke handshake completion. The coordinator now
-	// owns the wire framing for both error AND success acks.
-
 	s.logger.Info().
-		Str("reader_id", readerID).
-		Uint64("last_known_seq", lastKnownSeq).
+		Str("reader_id", reader.id).
+		Uint64("last_known_seq", reader.lastAck.Load()).
 		Uint64("current_seq", s.sequence.Load()).
 		Msg("Reader connected for replication")
+}
 
+// AcceptReader is the legacy single-call shape: PrepareReader +
+// (caller writes ack) + ActivateReader. Kept for test code that
+// doesn't care about the handshake ack ordering. Production callers
+// (coordinator.AcceptReplicationConnection) MUST use the two-phase
+// API to avoid the delivery-order race documented on PrepareReader.
+func (s *Sender) AcceptReader(conn net.Conn, readerID, handshakeNonce string, lastKnownSeq uint64) error {
+	reader, err := s.PrepareReader(conn, readerID, handshakeNonce, lastKnownSeq)
+	if err != nil {
+		return err
+	}
+	s.ActivateReader(reader)
 	return nil
 }
 
 // CurrentSequenceAndCanResume returns the writer's current sequence
 // and whether the reader's lastKnownSeq is within the buffer window
-// for resume. The coordinator calls this after a successful
-// AcceptReader to build the protocol-level success ack. Exposed
-// because the framing now lives in the coordinator (see
-// AcceptReader comment).
+// for resume. The coordinator calls this after PrepareReader to build
+// the protocol-level success ack. Exposed because the framing lives
+// in the coordinator (see PrepareReader doc).
 func (s *Sender) CurrentSequenceAndCanResume(lastKnownSeq uint64) (uint64, bool) {
 	currentSeq := s.sequence.Load()
 	canResume := lastKnownSeq == 0 || lastKnownSeq >= currentSeq-uint64(s.cfg.BufferSize)
 	return currentSeq, canResume
-}
-
-// DoWithReaderWriteLock runs fn while holding the per-reader writeMu —
-// the same lock sendToReader takes for entry framing. The coordinator
-// uses this to write the post-AcceptReader success ack onto the same
-// conn that the distributionLoop's broadcast can ALSO start writing to
-// the instant AcceptReader returns (the reader is published to
-// s.readers under s.mu before AcceptReader returns, so the broadcast
-// path can race the unlocked ack write at the byte level — see the
-// final-review finding on PR #449). Holding writeMu for the ack write
-// serialises it against any concurrent sendToReader on the same conn.
-//
-// Returns the error fn returns, or sender.errReaderUnknown if the
-// readerID is no longer in the sender's map (concurrent RemoveReader
-// or a stale call after disconnect).
-func (s *Sender) DoWithReaderWriteLock(readerID string, fn func(net.Conn) error) error {
-	s.mu.RLock()
-	reader, ok := s.readers[readerID]
-	s.mu.RUnlock()
-	if !ok {
-		return errReaderUnknown
-	}
-	reader.writeMu.Lock()
-	defer reader.writeMu.Unlock()
-	return fn(reader.conn)
 }
 
 // RemoveReader disconnects a reader from replication.

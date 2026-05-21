@@ -519,14 +519,23 @@ func (r *Receiver) receiveLoop() {
 					Msg("Replication checkpoint cluster name mismatch; dropping connection")
 				return
 			}
-			// Sequence sanity: checkpoint can't claim coverage of an
-			// entry we haven't seen yet.
-			if cp.LastSequence > r.lastSeq.Load() {
+			// Sequence sanity: the checkpoint follows the Nth entry
+			// immediately on a single TCP connection, so its
+			// LastSequence must EXACTLY equal what the receiver has
+			// observed. Greater = checkpoint claims an unseen entry
+			// (impossible on an in-order TCP stream). Less = the
+			// receiver advanced past the checkpoint's coverage
+			// (protocol desync or out-of-order delivery, also
+			// impossible). Both are fatal. Hard-fail on inequality
+			// so a desync surfaces in the log with a clear message
+			// rather than via the downstream hash mismatch.
+			// (Gemini round 4 / PR #449.)
+			if cp.LastSequence != r.lastSeq.Load() {
 				r.totalErrors.Add(1)
 				llog.Error().
 					Uint64("checkpoint_seq", cp.LastSequence).
 					Uint64("our_last_seq", r.lastSeq.Load()).
-					Msg("Replication checkpoint claims unseen sequence; dropping connection")
+					Msg("Replication checkpoint sequence mismatch; dropping connection")
 				return
 			}
 			// Validate the hash matches what we've computed.
