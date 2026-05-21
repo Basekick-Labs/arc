@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/hashicorp/raft"
 	"github.com/rs/zerolog"
 )
@@ -147,17 +149,17 @@ type BatchFileOpsPayload struct {
 
 // FSMSnapshot represents a snapshot of the FSM state.
 type FSMSnapshot struct {
-	Nodes              map[string]*NodeInfo  `json:"nodes"`
-	PrimaryWriterID    string                `json:"primary_writer_id,omitempty"`
-	ActiveCompactorID  string                `json:"active_compactor_id,omitempty"`
-	Files              map[string]*FileEntry `json:"files,omitempty"` // File manifest (peer replication)
+	Nodes             map[string]*NodeInfo  `json:"nodes"`
+	PrimaryWriterID   string                `json:"primary_writer_id,omitempty"`
+	ActiveCompactorID string                `json:"active_compactor_id,omitempty"`
+	Files             map[string]*FileEntry `json:"files,omitempty"` // File manifest (peer replication)
 }
 
 // ClusterFSM implements the raft.FSM interface for cluster state management.
 // It maintains the authoritative state of nodes in the cluster.
 type ClusterFSM struct {
-	mu              sync.RWMutex
-	nodes           map[string]*NodeInfo
+	mu                sync.RWMutex
+	nodes             map[string]*NodeInfo
 	primaryWriterID   string                // ID of the current primary writer node
 	activeCompactorID string                // ID of the node currently holding the compactor lease
 	files             map[string]*FileEntry // File manifest (path → entry) for peer replication
@@ -167,14 +169,37 @@ type ClusterFSM struct {
 	filesByDB map[string]map[string]struct{}
 	logger    zerolog.Logger
 
+	// rejectedPaths counts manifest entries refused by path validation
+	// across every code path that mutates the manifest: applyRegisterFile,
+	// applyUpdateFile (steady-state runtime AND log replay), batch
+	// pre-validation, and Restore (snapshot boot). A non-zero value —
+	// or, more usefully, non-zero growth — is the load-bearing operator
+	// signal that somebody proposed a path this FSM refused.
+	//
+	// Surfaced three ways:
+	//   - RejectedPathsCount() Go-level getter (used by Node.Start's
+	//     end-of-boot summary log).
+	//   - The per-entry "manifest path validation failed" Error log lines.
+	//   - The process-wide metrics package counter
+	//     arc_cluster_manifest_rejected_paths_total, exported via
+	//     /metrics (Prometheus) and /api/v1/metrics (JSON). Every
+	//     rejectedPaths.Add(1) site also calls
+	//     metrics.Get().IncClusterManifestRejectedPaths() so the two
+	//     counters stay in sync.
+	//
+	// Atomic because /metrics scrapes read the (process-wide) sibling
+	// counter concurrently with FSM Apply on the runFSM goroutine. See
+	// GHSA-f85q-mvg8-qf37.
+	rejectedPaths atomic.Int64
+
 	// Callbacks for state changes
-	onNodeAdded      func(*NodeInfo)
-	onNodeRemoved    func(string)
-	onNodeUpdated    func(*NodeInfo)
-	onWriterPromoted   func(newPrimaryID, oldPrimaryID string)
+	onNodeAdded         func(*NodeInfo)
+	onNodeRemoved       func(string)
+	onNodeUpdated       func(*NodeInfo)
+	onWriterPromoted    func(newPrimaryID, oldPrimaryID string)
 	onCompactorAssigned func(newCompactorID, oldCompactorID string)
-	onFileRegistered   func(*FileEntry)
-	onFileDeleted      func(path string, reason string)
+	onFileRegistered    func(*FileEntry)
+	onFileDeleted       func(path string, reason string)
 }
 
 // NewClusterFSM creates a new cluster FSM.
@@ -185,6 +210,72 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 		filesByDB: make(map[string]map[string]struct{}),
 		logger:    logger.With().Str("component", "cluster-fsm").Logger(),
 	}
+}
+
+// rejectManifestPath centralizes the FSM-side response to a path that
+// failed ValidateManifestPath. Used by applyRegisterFile and
+// applyUpdateFile.
+//
+// In every case: log at Error, increment the rejectedPaths counter,
+// and return a wrapped validation error. The downstream behaviour
+// then depends on whether Apply is being called by a proposer or by
+// log replay — and crucially, the *security property* (entry does
+// NOT land in f.files) holds in both cases because we return BEFORE
+// any state mutation in the caller.
+//
+//   - Proposer path (Arc's Node.RegisterFile / .UpdateFile etc.):
+//     hashicorp/raft delivers the error via future.Response(), and
+//     Arc's node.go propagates it to the caller. The leader's
+//     Register/Update API call returns the validation error.
+//
+//   - Log replay (hashicorp/raft runFSM goroutine processing committed
+//     entries past the snapshot): the error is silently swallowed by
+//     runFSM (req.future == nil for replayed entries) — boot
+//     continues, the entry doesn't land, the counter is incremented,
+//     and operators see the Error log line.
+//
+// Note: hashicorp/raft commits a proposed entry to the leader's log
+// AND replicates it to followers BEFORE Apply runs. So a malicious
+// path is briefly in every node's Raft log; the security property is
+// that no node's FSM puts it in f.files. The Raft log is bounded by
+// the snapshot rotation interval — eventually the malicious entry is
+// garbage-collected when a snapshot is taken (Snapshot drains
+// f.files, which never contained the malicious entry).
+//
+// op is "register" or "update" for log disambiguation. errors.Is(err,
+// ErrPath*) gives the rejection reason. See GHSA-f85q-mvg8-qf37.
+func (f *ClusterFSM) rejectManifestPath(op, path string, logIndex uint64, err error) error {
+	f.incRejectedPaths()
+	f.logger.Error().
+		Err(err).
+		Str("op", op).
+		Str("path", path).
+		Uint64("log_index", logIndex).
+		Msg("manifest path validation failed — entry refused, not added to f.files")
+	return fmt.Errorf("%s file: %w", op, err)
+}
+
+// incRejectedPaths increments both the per-FSM rejectedPaths counter
+// (consumed by Node.Start's end-of-boot summary log + tests) and the
+// process-wide metrics-package counter (exposed via /metrics and
+// /api/v1/metrics as arc_cluster_manifest_rejected_paths_total).
+// Every site that refuses a manifest entry — runtime apply, batch
+// pre-pass, snapshot Restore — calls through here so the two
+// counters stay in sync. See GHSA-f85q-mvg8-qf37.
+func (f *ClusterFSM) incRejectedPaths() {
+	f.rejectedPaths.Add(1)
+	metrics.Get().IncClusterManifestRejectedPaths()
+}
+
+// RejectedPathsCount returns the count of manifest entries refused by
+// path validation across every FSM code path (snapshot Restore +
+// runtime Apply + log replay Apply). The counter is monotonic. A
+// non-zero growth rate is the load-bearing operator signal that
+// somebody — a peer, a stored snapshot, or a pre-validation Raft log
+// entry — proposed a path this FSM refused. Scrape and alert on it.
+// See GHSA-f85q-mvg8-qf37.
+func (f *ClusterFSM) RejectedPathsCount() int64 {
+	return f.rejectedPaths.Load()
 }
 
 // SetCallbacks sets the FSM callbacks for state changes.
@@ -263,7 +354,7 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 	case CommandBatchFileOps:
 		return f.applyBatchFileOps(cmd.Payload, log.Index)
 	case CommandUpdateFile:
-		return f.applyUpdateFile(cmd.Payload)
+		return f.applyUpdateFile(cmd.Payload, log.Index)
 	default:
 		return fmt.Errorf("unknown command type: %d", cmd.Type)
 	}
@@ -458,9 +549,23 @@ func (f *ClusterFSM) applyRegisterFile(payload []byte, logIndex uint64) interfac
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fmt.Errorf("failed to unmarshal register file payload: %w", err)
 	}
+	return f.applyRegisterFileStruct(p, logIndex)
+}
 
-	if p.File.Path == "" {
-		return fmt.Errorf("register file: path is required")
+// applyRegisterFileStruct is the struct-taking variant of applyRegisterFile.
+// applyBatchFileOps calls this directly after unmarshalling the payload
+// once in its pre-validation pass, avoiding a second unmarshal in the
+// apply loop. Non-batch callers go through applyRegisterFile, which
+// unmarshals + dispatches here.
+func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uint64) interface{} {
+	// Validate the path BEFORE any state mutation. See GHSA-f85q-mvg8-qf37:
+	// historically the only check was empty-string, which let an attacker
+	// register arbitrary paths (/etc/passwd, s3://attacker-bucket/..., etc.)
+	// into the authoritative manifest. ValidateManifestPath rejects every
+	// malicious shape from the audit (scheme, absolute, parent-traversal,
+	// NUL, oversize) plus the historical empty-string case.
+	if err := ValidateManifestPath(p.File.Path); err != nil {
+		return f.rejectManifestPath("register", p.File.Path, logIndex, err)
 	}
 	if p.File.CreatedAt.IsZero() {
 		// The creator is responsible for setting CreatedAt before appending
@@ -519,7 +624,13 @@ func (f *ClusterFSM) applyDeleteFile(payload []byte) interface{} {
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fmt.Errorf("failed to unmarshal delete file payload: %w", err)
 	}
+	return f.applyDeleteFileStruct(p)
+}
 
+// applyDeleteFileStruct is the struct-taking variant of applyDeleteFile.
+// applyBatchFileOps calls this directly after unmarshalling once during
+// pre-validation, avoiding a second unmarshal in the apply loop.
+func (f *ClusterFSM) applyDeleteFileStruct(p DeleteFilePayload) interface{} {
 	if p.Path == "" {
 		return fmt.Errorf("delete file: path is required")
 	}
@@ -556,14 +667,46 @@ func (f *ClusterFSM) applyDeleteFile(payload []byte) interface{} {
 	return nil
 }
 
-func (f *ClusterFSM) applyUpdateFile(payload []byte) interface{} {
+func (f *ClusterFSM) applyUpdateFile(payload []byte, logIndex uint64) interface{} {
 	var p UpdateFilePayload
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fmt.Errorf("failed to unmarshal update file payload: %w", err)
 	}
-	if p.File.Path == "" {
-		return fmt.Errorf("update file: path is required")
+	return f.applyUpdateFileStruct(p, logIndex)
+}
+
+// applyUpdateFileStruct is the struct-taking variant of applyUpdateFile.
+// applyBatchFileOps calls this directly after unmarshalling once during
+// pre-validation, avoiding a second unmarshal in the apply loop.
+func (f *ClusterFSM) applyUpdateFileStruct(p UpdateFilePayload, logIndex uint64) interface{} {
+	// Same validation as applyRegisterFile — an attacker who can submit
+	// Update commands could otherwise insert a new manifest entry at a
+	// malicious path (Update writes f.files[entry.Path] = &entry, so a
+	// payload with Path="/etc/passwd" would create a fresh entry at
+	// that path rather than mutating any pre-existing one). The end
+	// risk to operators is the same as in applyRegisterFile: a hostile
+	// path in f.files. See GHSA-f85q-mvg8-qf37.
+	if err := ValidateManifestPath(p.File.Path); err != nil {
+		return f.rejectManifestPath("update", p.File.Path, logIndex, err)
 	}
+	if p.File.CreatedAt.IsZero() {
+		// Same reasoning as applyRegisterFileStruct: the caller is
+		// responsible for setting CreatedAt before appending to Raft.
+		// Apply MUST NOT stamp it from time.Now() because that would
+		// be non-deterministic across nodes during log replay. An
+		// Update payload with a zero CreatedAt is a caller bug — it
+		// would clobber the original entry's creation timestamp with
+		// the JSON zero value.
+		return fmt.Errorf("update file: created_at is required")
+	}
+
+	// Stamp the LSN from the current Raft log index so consumers that
+	// watch f.files for "did this entry change" can detect the update.
+	// Without this, an Update that mutates an existing entry would
+	// leave the LSN at its registration-time value, and downstream
+	// consumers (e.g. compaction watchers) couldn't distinguish a
+	// fresh state from a stale one.
+	p.File.LSN = logIndex
 
 	f.mu.Lock()
 	entry := p.File
@@ -639,23 +782,119 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 		return fmt.Errorf("failed to unmarshal batch file ops payload: %w", err)
 	}
 
+	// Pre-validate every Register/Update path BEFORE any state
+	// mutation so the batch is atomic with respect to path validation:
+	// if any op carries a malicious path, the whole batch is refused
+	// and NO ops have side-effects. Without this pass, an attacker
+	// could place a legitimate op first and a malicious op second —
+	// the legitimate op would land before the loop hit the malicious
+	// one. See GHSA-f85q-mvg8-qf37 review notes.
+	//
+	// Delete ops are not validated here because applyDeleteFile only
+	// uses the path as a map key (delete of a non-existent key is a
+	// no-op); validating delete paths would change existing semantics
+	// for callers that legitimately race delete-then-register.
+	//
+	// We store each decoded Register/Update payload in parallel slots
+	// (decoded[i]) so the apply loop below can call the *Struct apply
+	// variants directly without re-unmarshalling. Each payload is
+	// decoded exactly once; Delete ops keep nil decoded slots.
+	decoded := make([]any, len(p.Ops))
+	for i, op := range p.Ops {
+		switch op.Type {
+		case CommandRegisterFile:
+			var rp RegisterFilePayload
+			if err := json.Unmarshal(op.Payload, &rp); err != nil {
+				return fmt.Errorf("batch file ops: op[%d] unmarshal: %w", i, err)
+			}
+			if err := ValidateManifestPath(rp.File.Path); err != nil {
+				f.incRejectedPaths()
+				f.logger.Error().
+					Err(err).
+					Str("op", "batch-prevalidate").
+					Str("path", rp.File.Path).
+					Uint64("log_index", logIndex).
+					Int("batch_index", i).
+					Msg("manifest path validation failed during batch pre-check — entire batch refused")
+				return fmt.Errorf("batch file ops: op[%d]: %w", i, err)
+			}
+			// Mirror applyRegisterFileStruct's CreatedAt requirement
+			// in the pre-pass so a batch that would fail mid-apply on
+			// this check is refused atomically up front.
+			if rp.File.CreatedAt.IsZero() {
+				return fmt.Errorf("batch file ops: op[%d]: register file: created_at is required", i)
+			}
+			decoded[i] = rp
+		case CommandUpdateFile:
+			var up UpdateFilePayload
+			if err := json.Unmarshal(op.Payload, &up); err != nil {
+				return fmt.Errorf("batch file ops: op[%d] unmarshal: %w", i, err)
+			}
+			if err := ValidateManifestPath(up.File.Path); err != nil {
+				f.incRejectedPaths()
+				f.logger.Error().
+					Err(err).
+					Str("op", "batch-prevalidate").
+					Str("path", up.File.Path).
+					Uint64("log_index", logIndex).
+					Int("batch_index", i).
+					Msg("manifest path validation failed during batch pre-check — entire batch refused")
+				return fmt.Errorf("batch file ops: op[%d]: %w", i, err)
+			}
+			// Mirror applyUpdateFileStruct's CreatedAt requirement.
+			if up.File.CreatedAt.IsZero() {
+				return fmt.Errorf("batch file ops: op[%d]: update file: created_at is required", i)
+			}
+			decoded[i] = up
+		case CommandDeleteFile:
+			// Delete paths intentionally bypass ValidateManifestPath
+			// (applyDeleteFile only uses the path as a map key — delete
+			// of a non-existent key is a no-op). BUT we still pre-check
+			// the structural invariants that applyDeleteFile enforces:
+			// unmarshal success and non-empty path. Without this, a
+			// malformed Delete payload would pass the pre-pass and fail
+			// mid-apply, violating the batch atomicity invariant. The
+			// decoded payload is stored in decoded[i] so the apply loop
+			// reuses it (one unmarshal per Delete op instead of two).
+			var dp DeleteFilePayload
+			if err := json.Unmarshal(op.Payload, &dp); err != nil {
+				return fmt.Errorf("batch file ops: op[%d] unmarshal: %w", i, err)
+			}
+			if dp.Path == "" {
+				return fmt.Errorf("batch file ops: op[%d]: delete file: path is required", i)
+			}
+			decoded[i] = dp
+		default:
+			return fmt.Errorf("batch file ops: op[%d] unsupported type: %d", i, op.Type)
+		}
+	}
+
+	// Apply loop. Each *Struct call re-validates path + CreatedAt that
+	// the pre-pass above already passed for the same payload — that's
+	// intentional defense-in-depth (two cheap checks vs. one JSON
+	// unmarshal), and it lets the *Struct functions stand on their
+	// own when called outside the batch path (single-op Register /
+	// Update from internal/cluster/raft/node.go).
 	for i, op := range p.Ops {
 		var result interface{}
 		switch op.Type {
 		case CommandRegisterFile:
-			result = f.applyRegisterFile(op.Payload, logIndex)
+			result = f.applyRegisterFileStruct(decoded[i].(RegisterFilePayload), logIndex)
 		case CommandDeleteFile:
-			result = f.applyDeleteFile(op.Payload)
+			result = f.applyDeleteFileStruct(decoded[i].(DeleteFilePayload))
 		case CommandUpdateFile:
-			result = f.applyUpdateFile(op.Payload)
+			result = f.applyUpdateFileStruct(decoded[i].(UpdateFilePayload), logIndex)
 		default:
+			// Unreachable: pre-pass at lines above rejects unsupported
+			// op types. Kept for type-completeness so the switch isn't
+			// missing the default arm.
 			return fmt.Errorf("batch file ops: op[%d] unsupported type: %d", i, op.Type)
 		}
-		// applyRegisterFile and applyDeleteFile return nil on success or an
-		// error on failure — they never return a non-nil non-error value.
-		// The type-assert is defensive: if either handler is ever refactored
-		// to return something unexpected, we propagate it as an error rather
-		// than silently ignoring it.
+		// apply*FileStruct return nil on success or an error on failure
+		// — they never return a non-nil non-error value. The type-assert
+		// is defensive: if any handler is ever refactored to return
+		// something unexpected, we propagate it as an error rather than
+		// silently ignoring it.
 		if result != nil {
 			if err, ok := result.(error); ok {
 				return fmt.Errorf("batch file ops: op[%d] (type=%d): %w", i, op.Type, err)
@@ -697,15 +936,51 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		return fmt.Errorf("failed to decode snapshot: %w", err)
 	}
 
+	// Validate every restored manifest path. Entries that fail
+	// validation are LOGGED AT ERROR + SKIPPED (NOT added to f.files)
+	// and counted into rejectedPaths so operators can alert on a
+	// non-zero growth rate. See GHSA-f85q-mvg8-qf37. We deliberately
+	// continue restoring the rest of the snapshot rather than failing
+	// hard — a cluster boot blocked by a single malicious entry in a
+	// historical snapshot would be unrecoverable.
+	//
+	// Rebuild f.files in a fresh map rather than mutating
+	// snapshot.Files in place; this keeps the snapshot struct
+	// untouched and makes the filter step impossible to skip on
+	// subsequent reads.
+	restoredFiles := make(map[string]*FileEntry, len(snapshot.Files))
+	for path, entry := range snapshot.Files {
+		// Defensive nil-check: f.files is map[string]*FileEntry, so a
+		// corrupted or attacker-crafted snapshot with `null` values
+		// would deserialize to nil pointers here. Without this skip,
+		// the secondary-index rebuild below (entry.Database) would
+		// panic — bricking the node's boot. Treat as a quarantine.
+		// See Gemini PR #446 r6.
+		if entry == nil {
+			f.incRejectedPaths()
+			f.logger.Error().
+				Str("path", path).
+				Str("source", "snapshot").
+				Msg("manifest entry is nil during snapshot restore — entry refused, not added to f.files")
+			continue
+		}
+		if err := ValidateManifestPath(path); err != nil {
+			f.incRejectedPaths()
+			f.logger.Error().
+				Err(err).
+				Str("path", path).
+				Str("source", "snapshot").
+				Msg("manifest path validation failed during snapshot restore — entry refused, not added to f.files")
+			continue
+		}
+		restoredFiles[path] = entry
+	}
+
 	f.mu.Lock()
 	f.nodes = snapshot.Nodes
 	f.primaryWriterID = snapshot.PrimaryWriterID
 	f.activeCompactorID = snapshot.ActiveCompactorID
-	if snapshot.Files != nil {
-		f.files = snapshot.Files
-	} else {
-		f.files = make(map[string]*FileEntry)
-	}
+	f.files = restoredFiles
 	// Rebuild the database → files secondary index from the restored files
 	f.filesByDB = make(map[string]map[string]struct{}, len(f.files))
 	for path, entry := range f.files {

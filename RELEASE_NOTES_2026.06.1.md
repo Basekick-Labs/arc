@@ -108,6 +108,45 @@ Operator-facing changes:
 
 Tests added: `TestCompute{,Fetch,Forward,CacheInvalidate}HMAC_Determinism` (pin reference MACs for every cluster HMAC endpoint so any future format drift fails CI), `TestValidate_RejectsMalformedHexMAC` (pins fail-closed on non-hex receivedMAC across all four validators), `TestValidateCacheInvalidateHMAC_{Valid, WrongSecret, StaleTimestamp, FutureTimestamp, FieldBinding}`, `TestCacheInvalidateHMAC_LabelBinding_NoCrossEndpointReplay` (cross-endpoint replay protection, covers Forward + Fetch + Join in both directions), `TestNewCacheInvalidateHandler_RejectsInvalidConfig` (constructor panics on each kind of misconfiguration), and 9 handler tests asserting both the response status AND the onInvalidate callback fired-exactly-once / never. The positive-path test asserts 204 + callback invoked; `TestCacheInvalidate_NonceNotBurnedByBadMAC` pins the ordering invariant (nonce cache `Track()` runs AFTER HMAC validation, so an off-path attacker without the secret cannot consume nonce-cache slots).
 
+### Cluster FSM rejects malicious paths in manifest-registration proposals (Enterprise)
+
+Reported by [Alex Manson](https://neurowinter.com/) ([@NeuroWinter](https://github.com/NeuroWinter)) — closes audit finding X2 / [GHSA-f85q-mvg8-qf37](https://github.com/Basekick-Labs/arc/security/advisories/GHSA-f85q-mvg8-qf37). **Enterprise-only critical** (clustering requires Arc Enterprise license — OSS deployments do not construct the cluster FSM and are unaffected).
+
+Pre-26.06.1 the Raft FSM (`internal/cluster/raft/fsm.go:applyRegisterFile` + `applyUpdateFile`) only checked that the proposed file path was non-empty. An attacker with one valid cluster credential — or one compromised cluster node — could issue Raft proposals registering arbitrary paths into the authoritative cluster manifest:
+
+- `/etc/passwd` as a "cluster data file" — other nodes that fetch the file to serve queries read host-level files outside Arc's storage root.
+- `s3://attacker-controlled-bucket/poisoned.parquet` — every cluster reader pulls attacker-controlled data into query results.
+- `../../etc/shadow` via parent-traversal — depending on how the storage backend resolves the path.
+
+Combined with [audit X1](https://github.com/Basekick-Labs/arc/security/advisories/GHSA-wfgr-8x84-22q7) (no HMAC on `MsgReplicateSync`, fix tracked separately), this was a **cluster-wide worm primitive**: a single-node compromise propagated through the entire data plane.
+
+26.06.1 introduces shape-based path validation in `internal/cluster/raft/path_validation.go`. Every manifest entry passes through `ValidateManifestPath` before landing in the FSM. The validator rejects:
+
+- **URL schemes** — `s3://`, `http://`, `file://`, etc. Legitimate Arc paths are relative to the storage backend root; the scheme is added by the backend at read time, never stored.
+- **Absolute paths** — leading `/` (POSIX) or `C:\` / `C:/` (Windows drive prefix). Legitimate paths are always backend-relative.
+- **Parent-traversal segments** — any segment exactly equal to `..`, treating both `/` and `\` as separators in a single pass so mixed-separator paths like `db/..\etc` are caught. Filenames containing `..` as a substring inside a longer token (e.g. `metric_20260520..parquet`) are NOT false-positives — the check is on segment equality, not substring containment.
+- **NUL bytes** — `\x00` smuggles through C-string callers (everything before NUL evaluates, everything after silently drops). Never legitimate.
+- **Empty paths** — already rejected pre-PR; preserved.
+- **Paths longer than 4096 bytes** — typical POSIX `PATH_MAX`. A malicious sender could otherwise propose a multi-megabyte path string to inflate the FSM's in-memory map.
+
+Validator returns sentinel errors (`ErrPath{Empty, TooLong, Traversal, Absolute, Scheme, NullByte}`) so callers can branch on the rejection reason via `errors.Is`. Every code path that mutates the manifest — `applyRegisterFile`, `applyUpdateFile`, `applyBatchFileOps` (atomic pre-validation pass), and snapshot `Restore` — logs at `Error` with the path + rejection reason as structured fields.
+
+**How rejection interacts with hashicorp/raft.** It is important to be precise about what "Apply rejects" actually does — the worm primitive is killed by the FSM, not by Raft's commit machinery:
+
+- A proposer (Arc's `Node.RegisterFile` / `.UpdateFile` etc.) calls `raftNode.Apply(cmd, timeout)`. Inside hashicorp/raft, the leader writes the command to its local log AND ships it to follower replicators BEFORE `fsm.Apply` runs. By the time `fsm.Apply` returns an error, the entry is already in every node's Raft log and is committed at the cluster level.
+- The security property is that **every node's FSM independently refuses to put the malicious path into `f.files`**: each `applyRegisterFile` validates the path, increments `rejectedPaths`, logs at `Error`, and returns the validation error. The proposer sees the error via `future.Response()` and propagates it; during log replay the error is silently swallowed (`req.future == nil`), but the entry still doesn't land and the counter still increments.
+- The malicious entry stays in the Raft log until the next snapshot rotation, at which point `Snapshot()` drains `f.files` (which never contained the malicious entry) and writes a clean snapshot; older log entries past the snapshot are subsequently truncated by hashicorp/raft.
+
+**Operator alerting.** `ClusterFSM.RejectedPathsCount()` returns a monotonic atomic counter of every refused entry across snapshot `Restore`, runtime Apply, and log-replay Apply. A non-zero growth rate is the load-bearing signal that somebody — a peer, a stored snapshot, or a Raft log entry from before validation was enforced — proposed a path this FSM refused. Operators should scrape this counter (or the per-entry `manifest path validation failed` Error log lines) and alert on growth. The Raft `Node.Start` also emits an `Error`-level summary at end-of-boot if any snapshot entries were refused during `Restore`.
+
+**Snapshot Restore vs. log replay.** hashicorp/raft splits boot into two phases: snapshot restore (synchronous inside `NewRaft`) and log replay past the snapshot (asynchronous on the `runFSM` goroutine, post-NewRaft). The FSM treats both identically: `ValidateManifestPath` runs, the rejected entry doesn't land, the counter increments. The cluster never refuses to boot because of a malicious entry — boot continues with the offending entry refused and the operator alert raised.
+
+**Atomicity of batched ops.** `applyBatchFileOps` (the common compaction path) runs a pre-validation pass over every Register/Update path in the batch before any state mutation. If ANY op carries a malicious path, the entire batch is refused and NO ops have side-effects. Without this pre-pass, a batch containing `[legit, malicious]` would have applied the legit op before the malicious one was caught — the test `TestApplyBatchFileOps_RejectsMaliciousPath_AtomicPrevalidation` pins this invariant.
+
+Approach note: shape-based validation, not backend-aware prefix matching. The legitimate path format produced by Arc's writer (`internal/cluster/file_registrar.go`) and compactor (`internal/cluster/compaction_bridge.go`) is `{database}/{measurement}/{year}/{month}/{day}/{hour}/{filename}.parquet` — always relative, always scheme-less, no `..`. The shape check catches every malicious shape from the audit without requiring `*config.StorageConfig` to be plumbed into the FSM (which would expand security surface unnecessarily). Backend-aware prefix matching can land later as a tightening if a path is found that the shape check accepts but the backend should reject.
+
+Tests added in `internal/cluster/raft/path_validation_test.go`: table-driven rejection matrix covering every shape from the audit + close-shape variants, sentinel-error verification via `errors.Is`, and a positive set covering production writer/compaction output. In `internal/cluster/raft/fsm_test.go`: `TestApplyRegisterFile_RejectsMaliciousPath` (table-driven across every malicious shape, asserts error + counter + non-membership in `f.files`), `TestApplyRegisterFile_MixedBatchIsolatesMaliciousEntries` (sequential Apply calls with legit/malicious interleaved — legit lands, malicious refused, counter reflects all), `TestApplyUpdateFile_RejectsMaliciousPath`, `TestApplyBatchFileOps_RejectsMaliciousPath_AtomicPrevalidation` (atomic batch: legit op preceding malicious op MUST NOT land), and `TestFSMRestore_QuarantinesMaliciousSnapshotEntries` (snapshot round-trip: 3 legit + 2 malicious entries → only 3 legit land, counter = 2).
+
 ## Bug fixes
 
 ### Parser no longer mis-resolves bare `time` column inside `EXTRACT(YEAR FROM time)`

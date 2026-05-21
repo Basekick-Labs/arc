@@ -858,3 +858,491 @@ func TestFSMBatchFileOpsEmpty(t *testing.T) {
 		t.Errorf("FileCount() = %d, want 0", count)
 	}
 }
+
+// TestApplyRegisterFile_RejectsMaliciousPath pins the security
+// property of GHSA-f85q-mvg8-qf37 across every malicious path shape:
+// Apply returns an error, the entry does NOT land in f.files, and
+// the rejectedPaths counter increments. The error is delivered to
+// the proposer via future.Response(); during log replay it's
+// silently swallowed by hashicorp/raft because req.future == nil,
+// but the security property (entry not in f.files) and visibility
+// (counter + Error log line) both hold.
+func TestApplyRegisterFile_RejectsMaliciousPath(t *testing.T) {
+	t.Parallel()
+	maliciousPaths := []string{
+		"/etc/passwd",
+		"s3://attacker-bucket/poisoned.parquet",
+		"../../etc/shadow",
+		"db\x00/etc/passwd",
+		"file:///etc/passwd",
+	}
+	for _, mp := range maliciousPaths {
+		t.Run(mp, func(t *testing.T) {
+			fsm := newTestFSM()
+			file := makeFileEntry(mp, "db", "cpu", 100)
+			data := makeCommand(t, CommandRegisterFile, RegisterFilePayload{File: file})
+
+			result := fsm.Apply(&raft.Log{Index: 1, Data: data})
+			if result == nil {
+				t.Fatalf("malicious path %q: Apply should have returned error", mp)
+			}
+			if _, ok := result.(error); !ok {
+				t.Fatalf("malicious path %q: expected error result, got %T", mp, result)
+			}
+			if fsm.FileCount() != 0 {
+				t.Errorf("malicious path %q: should not have landed in files (count=%d)", mp, fsm.FileCount())
+			}
+			if c := fsm.RejectedPathsCount(); c != 1 {
+				t.Errorf("malicious path %q: rejectedPaths should be 1, got %d", mp, c)
+			}
+		})
+	}
+}
+
+// TestApplyRegisterFile_MixedBatchIsolatesMaliciousEntries verifies
+// that when a stream of Apply calls contains both legitimate and
+// malicious entries, only the legitimate ones land in f.files and the
+// counter reflects all rejections. Simulates the "leader applies a
+// flush from a writer that has a malicious peer also proposing to
+// the same FSM" shape (which doesn't happen in practice but pins the
+// per-Apply isolation invariant).
+func TestApplyRegisterFile_MixedBatchIsolatesMaliciousEntries(t *testing.T) {
+	t.Parallel()
+	fsm := newTestFSM()
+
+	entries := []FileEntry{
+		makeFileEntry("/etc/passwd", "db", "cpu", 1),
+		makeFileEntry("db/cpu/2026/05/20/15/legit1.parquet", "db", "cpu", 100),
+		makeFileEntry("s3://attacker/poisoned.parquet", "db", "cpu", 1),
+		makeFileEntry("db/cpu/2026/05/20/15/legit2.parquet", "db", "cpu", 100),
+	}
+	for i, file := range entries {
+		data := makeCommand(t, CommandRegisterFile, RegisterFilePayload{File: file})
+		fsm.Apply(&raft.Log{Index: uint64(i + 1), Data: data})
+	}
+
+	if fsm.FileCount() != 2 {
+		t.Errorf("expected 2 legit entries to land, got count=%d", fsm.FileCount())
+	}
+	if c := fsm.RejectedPathsCount(); c != 2 {
+		t.Errorf("expected 2 rejected entries, got %d", c)
+	}
+	for _, malicious := range []string{"/etc/passwd", "s3://attacker/poisoned.parquet"} {
+		if _, exists := fsm.GetFile(malicious); exists {
+			t.Errorf("malicious entry %q must not be in f.files", malicious)
+		}
+	}
+	for _, legit := range []string{
+		"db/cpu/2026/05/20/15/legit1.parquet",
+		"db/cpu/2026/05/20/15/legit2.parquet",
+	} {
+		if _, exists := fsm.GetFile(legit); !exists {
+			t.Errorf("legit entry %q must be in f.files", legit)
+		}
+	}
+}
+
+// TestApplyUpdateFile_RejectsMaliciousPath pins that the same
+// validation guards apply to update commands. Without this, an
+// attacker who can submit Update could rewrite an existing entry's
+// path to a malicious value.
+func TestApplyUpdateFile_RejectsMaliciousPath(t *testing.T) {
+	t.Parallel()
+	fsm := newTestFSM()
+
+	// Register a legit entry first so there's something to update.
+	legit := makeFileEntry("db/cpu/2026/05/20/15/file.parquet", "db", "cpu", 100)
+	regData := makeCommand(t, CommandRegisterFile, RegisterFilePayload{File: legit})
+	if result := fsm.Apply(&raft.Log{Index: 1, Data: regData}); result != nil {
+		t.Fatalf("legit register failed: %v", result)
+	}
+
+	// Attempt to "update" with a malicious path.
+	bad := makeFileEntry("../../etc/shadow", "db", "cpu", 100)
+	updateData := makeCommand(t, CommandUpdateFile, UpdateFilePayload{File: bad})
+	result := fsm.Apply(&raft.Log{Index: 2, Data: updateData})
+	if result == nil {
+		t.Fatal("update with malicious path should error")
+	}
+	if _, ok := result.(error); !ok {
+		t.Fatalf("expected error result, got %T", result)
+	}
+
+	// Original entry still present + unchanged.
+	if _, exists := fsm.GetFile(legit.Path); !exists {
+		t.Error("legitimate entry should be untouched by rejected update")
+	}
+	if _, exists := fsm.GetFile(bad.Path); exists {
+		t.Error("malicious path should not appear in files")
+	}
+}
+
+// TestApplyUpdateFile_BumpsLSN pins that applyUpdateFile stamps the
+// current Raft log index into the entry's LSN, matching the contract
+// applyRegisterFile already satisfies. Without this, an Update that
+// mutates an existing entry would leave the LSN at its
+// registration-time value, and downstream consumers that watch LSN
+// for "did this entry change" (e.g. compaction watchers) couldn't
+// distinguish a fresh state from a stale one. Gemini #446-r1 #1.
+func TestApplyUpdateFile_BumpsLSN(t *testing.T) {
+	t.Parallel()
+	fsm := newTestFSM()
+
+	// Register at log index 10 → LSN should be 10.
+	legit := makeFileEntry("db/cpu/2026/05/20/15/file.parquet", "db", "cpu", 100)
+	regData := makeCommand(t, CommandRegisterFile, RegisterFilePayload{File: legit})
+	if result := fsm.Apply(&raft.Log{Index: 10, Data: regData}); result != nil {
+		t.Fatalf("legit register failed: %v", result)
+	}
+	got, exists := fsm.GetFile(legit.Path)
+	if !exists {
+		t.Fatal("entry should exist after register")
+	}
+	if got.LSN != 10 {
+		t.Fatalf("post-register LSN: got %d, want 10", got.LSN)
+	}
+
+	// Update at log index 42 with same path but different size.
+	updated := legit
+	updated.SizeBytes = 999
+	updateData := makeCommand(t, CommandUpdateFile, UpdateFilePayload{File: updated})
+	if result := fsm.Apply(&raft.Log{Index: 42, Data: updateData}); result != nil {
+		t.Fatalf("legit update failed: %v", result)
+	}
+
+	got, exists = fsm.GetFile(legit.Path)
+	if !exists {
+		t.Fatal("entry should still exist after update")
+	}
+	if got.LSN != 42 {
+		t.Errorf("post-update LSN: got %d, want 42 (Update must stamp LSN from log index, not preserve registration-time value)", got.LSN)
+	}
+	if got.SizeBytes != 999 {
+		t.Errorf("post-update SizeBytes: got %d, want 999 (update should land)", got.SizeBytes)
+	}
+}
+
+// TestFSMRestore_QuarantinesMaliciousSnapshotEntries pins the
+// snapshot-restore quarantine path. A snapshot containing 3 legit +
+// 2 malicious entries must round-trip with only the 3 legit entries
+// in f.files, and the quarantine counter must reflect both
+// rejections.
+func TestFSMRestore_QuarantinesMaliciousSnapshotEntries(t *testing.T) {
+	t.Parallel()
+	// Build a snapshot manually (not via Snapshot/Persist) so we can
+	// inject malicious entries that Snapshot() would never produce
+	// from our own state (Snapshot draws from f.files, which is
+	// validation-protected at write time after this PR).
+	snapshot := FSMSnapshot{
+		Nodes:           map[string]*NodeInfo{},
+		PrimaryWriterID: "",
+		Files: map[string]*FileEntry{
+			"db/cpu/2026/05/20/15/legit1.parquet":   {Path: "db/cpu/2026/05/20/15/legit1.parquet", Database: "db", Measurement: "cpu", CreatedAt: time.Now()},
+			"db/cpu/2026/05/20/15/legit2.parquet":   {Path: "db/cpu/2026/05/20/15/legit2.parquet", Database: "db", Measurement: "cpu", CreatedAt: time.Now()},
+			"db/cpu/2026/05/20/15/legit3.parquet":   {Path: "db/cpu/2026/05/20/15/legit3.parquet", Database: "db", Measurement: "cpu", CreatedAt: time.Now()},
+			"/etc/passwd":                           {Path: "/etc/passwd", Database: "db", Measurement: "cpu", CreatedAt: time.Now()},
+			"s3://attacker-bucket/poisoned.parquet": {Path: "s3://attacker-bucket/poisoned.parquet", Database: "db", Measurement: "cpu", CreatedAt: time.Now()},
+		},
+	}
+	snapshotBytes, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+
+	fsm := newTestFSM()
+	if err := fsm.Restore(io.NopCloser(bytes.NewReader(snapshotBytes))); err != nil {
+		t.Fatalf("Restore failed: %v", err)
+	}
+
+	if fsm.FileCount() != 3 {
+		t.Errorf("expected 3 legit entries restored, got %d", fsm.FileCount())
+	}
+	if c := fsm.RejectedPathsCount(); c != 2 {
+		t.Errorf("expected 2 rejected entries, got %d", c)
+	}
+	if _, exists := fsm.GetFile("/etc/passwd"); exists {
+		t.Error("/etc/passwd should not have been restored")
+	}
+	if _, exists := fsm.GetFile("s3://attacker-bucket/poisoned.parquet"); exists {
+		t.Error("s3:// scheme path should not have been restored")
+	}
+	for _, legit := range []string{
+		"db/cpu/2026/05/20/15/legit1.parquet",
+		"db/cpu/2026/05/20/15/legit2.parquet",
+		"db/cpu/2026/05/20/15/legit3.parquet",
+	} {
+		if _, exists := fsm.GetFile(legit); !exists {
+			t.Errorf("legit entry %q should be restored", legit)
+		}
+	}
+}
+
+// TestFSMRestore_HandlesNilFileEntry pins the defensive nil-check on
+// snapshot restore: a corrupted/crafted snapshot with `null` map
+// values must NOT panic the boot (would otherwise deref entry.Database
+// in the secondary-index rebuild). Nil entries are quarantined,
+// counter incremented, boot continues. Gemini #446-r6.
+func TestFSMRestore_HandlesNilFileEntry(t *testing.T) {
+	t.Parallel()
+	snapshot := FSMSnapshot{
+		Nodes: map[string]*NodeInfo{},
+		Files: map[string]*FileEntry{
+			"db/cpu/2026/05/20/15/legit.parquet":   {Path: "db/cpu/2026/05/20/15/legit.parquet", Database: "db", Measurement: "cpu", CreatedAt: time.Now()},
+			"db/cpu/2026/05/20/15/corrupt.parquet": nil, // explicit nil entry
+		},
+	}
+	snapshotBytes, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+
+	fsm := newTestFSM()
+	if err := fsm.Restore(io.NopCloser(bytes.NewReader(snapshotBytes))); err != nil {
+		t.Fatalf("Restore should not error on nil entry (got %v)", err)
+	}
+
+	if fsm.FileCount() != 1 {
+		t.Errorf("expected 1 legit entry restored, got %d", fsm.FileCount())
+	}
+	if c := fsm.RejectedPathsCount(); c != 1 {
+		t.Errorf("expected 1 quarantined entry (nil entry), got %d", c)
+	}
+	if _, exists := fsm.GetFile("db/cpu/2026/05/20/15/corrupt.parquet"); exists {
+		t.Error("nil entry should not have been restored")
+	}
+	if _, exists := fsm.GetFile("db/cpu/2026/05/20/15/legit.parquet"); !exists {
+		t.Error("legit entry should still be restored alongside nil entry")
+	}
+}
+
+// TestApplyBatchFileOps_RejectsMaliciousPath_AtomicPrevalidation pins
+// the atomicity invariant: when a batch contains a malicious entry —
+// even mid-batch — NO ops from the batch have side-effects. The
+// pre-validation pass walks every Register/Update path before any
+// applyXxx is called, so the legit op BEFORE the malicious one does
+// NOT land. This closes the High finding from internal review:
+// without pre-validation, the leader's f.files would diverge from
+// "the malicious entry never replicates" claim in the release notes.
+func TestApplyBatchFileOps_RejectsMaliciousPath_AtomicPrevalidation(t *testing.T) {
+	t.Parallel()
+	fsm := newTestFSM()
+
+	// Order matters: legit op FIRST so a non-atomic implementation
+	// would have applied it before reaching the malicious op.
+	legitFile := makeFileEntry("db/cpu/2026/05/20/15/legit.parquet", "db", "cpu", 100)
+	maliciousFile := makeFileEntry("../../etc/shadow", "db", "cpu", 100)
+
+	legitPayload, _ := json.Marshal(RegisterFilePayload{File: legitFile})
+	maliciousPayload, _ := json.Marshal(RegisterFilePayload{File: maliciousFile})
+
+	batchData := makeCommand(t, CommandBatchFileOps, BatchFileOpsPayload{
+		Ops: []BatchFileOp{
+			{Type: CommandRegisterFile, Payload: legitPayload},
+			{Type: CommandRegisterFile, Payload: maliciousPayload},
+		},
+	})
+	result := fsm.Apply(&raft.Log{Index: 1, Data: batchData})
+	if result == nil {
+		t.Fatal("batch with malicious entry should error")
+	}
+	if _, ok := result.(error); !ok {
+		t.Fatalf("expected error result, got %T", result)
+	}
+	// Atomic pre-validation: no ops land in f.files, including the
+	// legit op that came BEFORE the malicious one in the batch.
+	if fsm.FileCount() != 0 {
+		t.Errorf("batch should leave f.files unchanged on validation failure; got %d entries", fsm.FileCount())
+	}
+	if _, exists := fsm.GetFile(legitFile.Path); exists {
+		t.Error("legit op preceding malicious op MUST NOT land — batch must be atomic on validation failure")
+	}
+	// The rejected-paths counter increments once per pre-validation
+	// rejection (one per malicious op in the batch).
+	if c := fsm.RejectedPathsCount(); c != 1 {
+		t.Errorf("expected RejectedPathsCount=1 (one malicious op), got %d", c)
+	}
+}
+
+// TestApplyBatchFileOps_RejectsZeroCreatedAt_AtomicPrevalidation pins
+// that the batch pre-validation pass mirrors applyRegisterFileStruct's
+// CreatedAt requirement. Without this, a batch containing a legit op
+// followed by an op with zero CreatedAt would pass path-validation
+// pre-pass → the legit op would land in f.files → the second op
+// would fail mid-apply → batch atomicity violated. Gemini #446-r2.
+func TestApplyBatchFileOps_RejectsZeroCreatedAt_AtomicPrevalidation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("register with zero CreatedAt", func(t *testing.T) {
+		t.Parallel()
+		fsm := newTestFSM()
+
+		legitFile := makeFileEntry("db/cpu/2026/05/20/15/legit.parquet", "db", "cpu", 100)
+		// CreatedAt deliberately left zero.
+		badFile := FileEntry{
+			Path:         "db/cpu/2026/05/20/15/bad.parquet",
+			Database:     "db",
+			Measurement:  "cpu",
+			SizeBytes:    100,
+			OriginNodeID: "writer-1",
+			Tier:         "hot",
+		}
+
+		legitPayload, _ := json.Marshal(RegisterFilePayload{File: legitFile})
+		badPayload, _ := json.Marshal(RegisterFilePayload{File: badFile})
+
+		batchData := makeCommand(t, CommandBatchFileOps, BatchFileOpsPayload{
+			Ops: []BatchFileOp{
+				{Type: CommandRegisterFile, Payload: legitPayload},
+				{Type: CommandRegisterFile, Payload: badPayload},
+			},
+		})
+		result := fsm.Apply(&raft.Log{Index: 1, Data: batchData})
+		if result == nil {
+			t.Fatal("batch with zero-CreatedAt op should error")
+		}
+		if _, ok := result.(error); !ok {
+			t.Fatalf("expected error result, got %T", result)
+		}
+		// Atomic: legit op preceding bad op MUST NOT land.
+		if fsm.FileCount() != 0 {
+			t.Errorf("batch atomicity violated: f.files has %d entries (expected 0)", fsm.FileCount())
+		}
+	})
+
+	t.Run("update with zero CreatedAt", func(t *testing.T) {
+		t.Parallel()
+		fsm := newTestFSM()
+
+		// Pre-register an entry so the update has something to mutate.
+		preReg := makeFileEntry("db/cpu/2026/05/20/15/pre.parquet", "db", "cpu", 100)
+		fsm.Apply(&raft.Log{Index: 1, Data: makeCommand(t, CommandRegisterFile, RegisterFilePayload{File: preReg})})
+
+		legitUpd := preReg
+		legitUpd.SizeBytes = 999
+		badUpd := FileEntry{
+			Path:         "db/cpu/2026/05/20/15/other.parquet",
+			Database:     "db",
+			Measurement:  "cpu",
+			SizeBytes:    200,
+			OriginNodeID: "writer-1",
+			Tier:         "hot",
+			// CreatedAt zero.
+		}
+
+		legitPayload, _ := json.Marshal(UpdateFilePayload{File: legitUpd})
+		badPayload, _ := json.Marshal(UpdateFilePayload{File: badUpd})
+
+		batchData := makeCommand(t, CommandBatchFileOps, BatchFileOpsPayload{
+			Ops: []BatchFileOp{
+				{Type: CommandUpdateFile, Payload: legitPayload},
+				{Type: CommandUpdateFile, Payload: badPayload},
+			},
+		})
+		result := fsm.Apply(&raft.Log{Index: 2, Data: batchData})
+		if result == nil {
+			t.Fatal("batch with zero-CreatedAt update should error")
+		}
+		// Pre-existing entry must keep its original SizeBytes — the
+		// legit update preceding the bad one MUST NOT have landed.
+		got, _ := fsm.GetFile(preReg.Path)
+		if got.SizeBytes != 100 {
+			t.Errorf("batch atomicity violated: legit update landed (SizeBytes=%d, want pre-batch value 100)", got.SizeBytes)
+		}
+	})
+}
+
+// TestApplyBatchFileOps_RejectsEmptyDeletePath_AtomicPrevalidation pins
+// that the batch pre-pass also catches structural invariants for
+// Delete ops (unmarshal success + non-empty path). Without this, a
+// batch with [legit, delete-with-empty-path] would have applied the
+// legit op before applyDeleteFile rejected the second — violating
+// batch atomicity. Gemini #446-r4.
+func TestApplyBatchFileOps_RejectsEmptyDeletePath_AtomicPrevalidation(t *testing.T) {
+	t.Parallel()
+	fsm := newTestFSM()
+
+	legitFile := makeFileEntry("db/cpu/2026/05/20/15/legit.parquet", "db", "cpu", 100)
+	legitPayload, _ := json.Marshal(RegisterFilePayload{File: legitFile})
+	emptyDelPayload, _ := json.Marshal(DeleteFilePayload{Path: "", Reason: "test"})
+
+	batchData := makeCommand(t, CommandBatchFileOps, BatchFileOpsPayload{
+		Ops: []BatchFileOp{
+			{Type: CommandRegisterFile, Payload: legitPayload},
+			{Type: CommandDeleteFile, Payload: emptyDelPayload},
+		},
+	})
+	result := fsm.Apply(&raft.Log{Index: 1, Data: batchData})
+	if result == nil {
+		t.Fatal("batch with empty-path Delete should error")
+	}
+	if _, ok := result.(error); !ok {
+		t.Fatalf("expected error result, got %T", result)
+	}
+	// Atomic: legit Register MUST NOT land.
+	if fsm.FileCount() != 0 {
+		t.Errorf("batch atomicity violated: f.files has %d entries (expected 0)", fsm.FileCount())
+	}
+	if _, exists := fsm.GetFile(legitFile.Path); exists {
+		t.Error("legit op preceding empty-path Delete MUST NOT land")
+	}
+	// Delete path is not validated for shape (it's a map-key lookup),
+	// so the rejectedPaths counter is NOT incremented by this case —
+	// only by ValidateManifestPath rejections.
+	if c := fsm.RejectedPathsCount(); c != 0 {
+		t.Errorf("empty-Delete-path rejection should NOT touch rejectedPaths counter (got %d)", c)
+	}
+}
+
+// TestApplyBatchFileOps_RejectsMalformedDeletePayload_AtomicPrevalidation
+// pins the second half of the Delete pre-check: if op.Payload doesn't
+// even unmarshal as a DeleteFilePayload, refuse the whole batch.
+// Gemini #446-r4.
+func TestApplyBatchFileOps_RejectsMalformedDeletePayload_AtomicPrevalidation(t *testing.T) {
+	t.Parallel()
+	fsm := newTestFSM()
+
+	legitFile := makeFileEntry("db/cpu/2026/05/20/15/legit.parquet", "db", "cpu", 100)
+	legitPayload, _ := json.Marshal(RegisterFilePayload{File: legitFile})
+
+	batchData := makeCommand(t, CommandBatchFileOps, BatchFileOpsPayload{
+		Ops: []BatchFileOp{
+			{Type: CommandRegisterFile, Payload: legitPayload},
+			{Type: CommandDeleteFile, Payload: []byte("not-valid-json{")},
+		},
+	})
+	result := fsm.Apply(&raft.Log{Index: 1, Data: batchData})
+	if result == nil {
+		t.Fatal("batch with malformed Delete payload should error")
+	}
+	if fsm.FileCount() != 0 {
+		t.Errorf("batch atomicity violated: legit op landed despite malformed Delete (count=%d)", fsm.FileCount())
+	}
+}
+
+// TestApplyUpdateFile_RejectsZeroCreatedAt pins the standalone (non-batch)
+// path's CreatedAt requirement on Update. Gemini #446-r2.
+func TestApplyUpdateFile_RejectsZeroCreatedAt(t *testing.T) {
+	t.Parallel()
+	fsm := newTestFSM()
+
+	bad := FileEntry{
+		Path:         "db/cpu/2026/05/20/15/file.parquet",
+		Database:     "db",
+		Measurement:  "cpu",
+		SizeBytes:    100,
+		OriginNodeID: "writer-1",
+		Tier:         "hot",
+		// CreatedAt zero.
+	}
+	data := makeCommand(t, CommandUpdateFile, UpdateFilePayload{File: bad})
+	result := fsm.Apply(&raft.Log{Index: 1, Data: data})
+	if result == nil {
+		t.Fatal("update with zero CreatedAt should error")
+	}
+	if _, ok := result.(error); !ok {
+		t.Fatalf("expected error result, got %T", result)
+	}
+	if fsm.FileCount() != 0 {
+		t.Errorf("zero-CreatedAt update should not land in files (count=%d)", fsm.FileCount())
+	}
+}
