@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/hashicorp/raft"
 	"github.com/rs/zerolog"
 )
@@ -170,13 +171,25 @@ type ClusterFSM struct {
 
 	// rejectedPaths counts manifest entries refused by path validation
 	// across every code path that mutates the manifest: applyRegisterFile,
-	// applyUpdateFile (steady-state runtime AND log replay), and Restore
-	// (snapshot boot). A non-zero value — or, more usefully, non-zero
-	// growth — is the load-bearing operator signal that somebody
-	// proposed a path this FSM refused. Scrape and alert on it.
+	// applyUpdateFile (steady-state runtime AND log replay), batch
+	// pre-validation, and Restore (snapshot boot). A non-zero value —
+	// or, more usefully, non-zero growth — is the load-bearing operator
+	// signal that somebody proposed a path this FSM refused.
 	//
-	// Atomic because /metrics scrapes read it concurrently with FSM
-	// Apply on the runFSM goroutine. See GHSA-f85q-mvg8-qf37.
+	// Surfaced three ways:
+	//   - RejectedPathsCount() Go-level getter (used by Node.Start's
+	//     end-of-boot summary log).
+	//   - The per-entry "manifest path validation failed" Error log lines.
+	//   - The process-wide metrics package counter
+	//     arc_cluster_manifest_rejected_paths_total, exported via
+	//     /metrics (Prometheus) and /api/v1/metrics (JSON). Every
+	//     rejectedPaths.Add(1) site also calls
+	//     metrics.Get().IncClusterManifestRejectedPaths() so the two
+	//     counters stay in sync.
+	//
+	// Atomic because /metrics scrapes read the (process-wide) sibling
+	// counter concurrently with FSM Apply on the runFSM goroutine. See
+	// GHSA-f85q-mvg8-qf37.
 	rejectedPaths atomic.Int64
 
 	// Callbacks for state changes
@@ -233,6 +246,7 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 // ErrPath*) gives the rejection reason. See GHSA-f85q-mvg8-qf37.
 func (f *ClusterFSM) rejectManifestPath(op, path string, logIndex uint64, err error) error {
 	f.rejectedPaths.Add(1)
+	metrics.Get().IncClusterManifestRejectedPaths()
 	f.logger.Error().
 		Err(err).
 		Str("op", op).
@@ -778,6 +792,7 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 			}
 			if err := ValidateManifestPath(rp.File.Path); err != nil {
 				f.rejectedPaths.Add(1)
+				metrics.Get().IncClusterManifestRejectedPaths()
 				f.logger.Error().
 					Err(err).
 					Str("op", "batch-prevalidate").
@@ -801,6 +816,7 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 			}
 			if err := ValidateManifestPath(up.File.Path); err != nil {
 				f.rejectedPaths.Add(1)
+				metrics.Get().IncClusterManifestRejectedPaths()
 				f.logger.Error().
 					Err(err).
 					Str("op", "batch-prevalidate").
@@ -823,6 +839,12 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 		}
 	}
 
+	// Apply loop. Each *Struct call re-validates path + CreatedAt that
+	// the pre-pass above already passed for the same payload — that's
+	// intentional defense-in-depth (two cheap checks vs. one JSON
+	// unmarshal), and it lets the *Struct functions stand on their
+	// own when called outside the batch path (single-op Register /
+	// Update from internal/cluster/raft/node.go).
 	for i, op := range p.Ops {
 		var result interface{}
 		switch op.Type {
@@ -833,6 +855,9 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 		case CommandUpdateFile:
 			result = f.applyUpdateFileStruct(decoded[i].(UpdateFilePayload), logIndex)
 		default:
+			// Unreachable: pre-pass at lines above rejects unsupported
+			// op types. Kept for type-completeness so the switch isn't
+			// missing the default arm.
 			return fmt.Errorf("batch file ops: op[%d] unsupported type: %d", i, op.Type)
 		}
 		// apply*FileStruct and applyDeleteFile return nil on success or
@@ -897,6 +922,7 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	for path, entry := range snapshot.Files {
 		if err := ValidateManifestPath(path); err != nil {
 			f.rejectedPaths.Add(1)
+			metrics.Get().IncClusterManifestRejectedPaths()
 			f.logger.Error().
 				Err(err).
 				Str("path", path).
