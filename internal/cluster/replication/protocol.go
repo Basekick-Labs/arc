@@ -61,13 +61,11 @@ type ReplicateEntry struct {
 	// (MsgReplicateCheckpoint) is the full-strength backstop.
 	// See GHSA-wfgr-8x84-22q7 / CVE-2026-48106.
 	//
-	// Invariant: the sender mutates Tag once per reader inside
-	// sendToReader under reader.writeMu; broadcastEntry iterates
-	// readers sequentially, so the same *ReplicateEntry is never
-	// observed mid-tag-mutation. If broadcastEntry is ever
-	// parallelized, move Tag off the shared struct into a per-reader
-	// JSON encode (or rebuild the entry per reader) to avoid a data
-	// race on this field.
+	// Thread safety: the sender stamps Tag on a shallow copy of the
+	// shared *ReplicateEntry inside sendToReader (see sender.go),
+	// never on the broadcast-shared pointer — so a future parallel
+	// broadcastEntry can stamp distinct tags into distinct
+	// ReplicateEntry values without a race.
 	Tag string `json:"tag,omitempty"`
 }
 

@@ -376,13 +376,25 @@ func (s *Sender) sendToReader(reader *ReaderConnection, entry *ReplicateEntry, p
 
 	// Stamp the per-entry MAC tag under the session key, using the
 	// hash broadcastEntry already computed once for the whole fan-out.
-	tag := security.ComputeReplicationEntryTagFromHash(reader.sessionKey, entry.Sequence, payloadHash)
-	entry.Tag = hex.EncodeToString(tag)
+	//
+	// We mutate Tag on a SHALLOW COPY of *entry (not the shared
+	// pointer) so a future parallel broadcastEntry can race-free
+	// stamp distinct tags into distinct ReplicateEntry values on
+	// different goroutines. The shallow copy is cheap — three
+	// uint64-sized fields plus the Payload slice header (16 bytes);
+	// the payload bytes themselves are NOT copied (and don't need
+	// to be — sender never mutates them).
+	//
+	// Gemini round 2 on PR #449 flagged the previous shared-pointer
+	// mutation as a latent race under parallelization.
+	entryCopy := *entry
+	tag := security.ComputeReplicationEntryTagFromHash(reader.sessionKey, entryCopy.Sequence, payloadHash)
+	entryCopy.Tag = hex.EncodeToString(tag)
 
 	// Feed the running cumulative hash that the checkpoint will sign.
 	// We hash the payload (not the tag) so both ends compute the same
 	// hash without having to agree on tag encoding.
-	reader.cumulativeHash.Write(entry.Payload)
+	reader.cumulativeHash.Write(entryCopy.Payload)
 	reader.entriesSinceCheckpoint++
 
 	// Set write deadline
@@ -391,7 +403,7 @@ func (s *Sender) sendToReader(reader *ReaderConnection, entry *ReplicateEntry, p
 	}
 
 	// Write entry
-	if err := WriteEntry(reader.conn, entry); err != nil {
+	if err := WriteEntry(reader.conn, &entryCopy); err != nil {
 		return err
 	}
 

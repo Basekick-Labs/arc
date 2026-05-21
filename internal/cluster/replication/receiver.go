@@ -441,8 +441,22 @@ func (r *Receiver) receiveLoop() {
 					Msg("Replication entry missing MAC tag; dropping connection")
 				return
 			}
+			// Length-check the hex string before decoding so an
+			// attacker who sends an arbitrarily long Tag can't make
+			// us allocate a multi-MB byte slice in DecodeString just
+			// to throw it away. The expected hex length is
+			// 2*ReplicationEntryTagLen since each byte encodes to
+			// two hex chars.
+			if len(entry.Tag) != security.ReplicationEntryTagLen*2 {
+				r.totalErrors.Add(1)
+				llog.Error().
+					Int("got_len", len(entry.Tag)).
+					Uint64("sequence", entry.Sequence).
+					Msg("Replication entry tag length mismatch; dropping connection")
+				return
+			}
 			tagBytes, err := hex.DecodeString(entry.Tag)
-			if err != nil || len(tagBytes) != security.ReplicationEntryTagLen {
+			if err != nil {
 				r.totalErrors.Add(1)
 				llog.Error().
 					Err(err).
@@ -516,9 +530,18 @@ func (r *Receiver) receiveLoop() {
 				return
 			}
 			// Validate the hash matches what we've computed.
+			// Length-check the hex string before decoding (same
+			// rationale as the per-entry Tag check above).
+			if len(cp.CumulativePayloadHashHex) != sha256.Size*2 {
+				r.totalErrors.Add(1)
+				llog.Error().
+					Int("got_len", len(cp.CumulativePayloadHashHex)).
+					Msg("Replication checkpoint hash length mismatch; dropping connection")
+				return
+			}
 			ourHash := cumulativeHash.Sum(nil)
 			theirHash, err := hex.DecodeString(cp.CumulativePayloadHashHex)
-			if err != nil || len(theirHash) != sha256.Size {
+			if err != nil {
 				r.totalErrors.Add(1)
 				llog.Error().Err(err).Msg("Replication checkpoint hash malformed; dropping connection")
 				return
@@ -534,7 +557,8 @@ func (r *Receiver) receiveLoop() {
 			// Note: no nonce-cache replay check here. A replayed
 			// checkpoint carries a hash captured from a past window;
 			// our local running hash has since advanced, so the
-			// equality check above (line 499) rejects it first.
+			// subtle.ConstantTimeCompare(ourHash, theirHash) check
+			// just above rejects it first.
 			// A NonceCache pass would only matter if an attacker
 			// could MITM TLS (already cluster-CA protected) AND
 			// reorder the stream such that a replay arrives at the
