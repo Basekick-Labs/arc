@@ -986,8 +986,12 @@ func (p *PartitionPruner) StartCleanup(ctx context.Context, interval time.Durati
 
 // cleanupLoop is the body of the janitor goroutine. Runs until ctx is
 // cancelled. One sweep per tick; sweeps are cheap (single mu.Lock +
-// map iteration, no allocations) so we don't bother debouncing or
-// running them in a worker pool.
+// map iteration, no allocations) so we don't bother debouncing.
+//
+// The two cleanups run on independent goroutines per tick because they
+// take unrelated mutexes (globCache.mu vs partitionCache.mu). A future
+// hot-glob-cache that grows entries between sweeps shouldn't delay the
+// partition sweep behind it, or vice versa. (Gemini round 1 / PR #450.)
 func (p *PartitionPruner) cleanupLoop(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -997,8 +1001,17 @@ func (p *PartitionPruner) cleanupLoop(ctx context.Context, interval time.Duratio
 			p.logger.Info().Msg("Partition pruner cache janitor stopped")
 			return
 		case <-ticker.C:
-			p.CleanupGlobCache()
-			p.CleanupPartitionCache()
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				p.CleanupGlobCache()
+			}()
+			go func() {
+				defer wg.Done()
+				p.CleanupPartitionCache()
+			}()
+			wg.Wait()
 		}
 	}
 }

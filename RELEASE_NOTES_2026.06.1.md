@@ -250,6 +250,27 @@ Subdirectories are deliberately ignored — DuckDB 1.5.1 uses a flat layout. If 
 
 The previous draft also added a post-`db.Close()` sweep; review caught that it was effectively dead code (DuckDB had already unlinked, and the 60 s mtime guard would skip anything still in flight) and risked stalling shutdown past `systemd`'s `TimeoutStopSec`. It was dropped before merge.
 
+### Partition pruner caches no longer grow unboundedly over process lifetime
+
+`internal/pruning/partition_pruner.go` has two TTL caches — `globCache` (30 s TTL) and `partitionCache` (60 s TTL) — populated on every query. Their `get()` returns "expired" as a cache miss but does **not** evict the stale entry; neither cache has a max-size cap. The public `CleanupGlobCache()` and `CleanupPartitionCache()` methods existed since the 2024-12 and 2026-01 cache PRs respectively but had **zero production callers** anywhere in the binary. Under workloads with high-cardinality glob patterns or distinct `(path, sql)` keys (typical for satellite-telemetry dashboards), both maps accumulate Go-heap entries monotonically until either `InvalidateAllCaches()` runs post-compaction or the process exits — one component of a 24-hour RSS climb observed on a demo container that required daily restarts.
+
+26.06.1 wires a janitor goroutine that sweeps both caches at a 30-second interval (matching the shorter TTL → worst-case entry retention is bounded at ~2× TTL):
+
+- **`PartitionPruner.StartCleanup(ctx, interval)`** — public method that spawns the sweeper. Exits cleanly when `ctx` is cancelled. Idempotent via a `cleanupStarted` atomic flag, so a hot-reload path or test refactor can't silently multiply goroutines.
+- **`QueryHandler.StartBackgroundWorkers(ctx)`** — the seam from `main.go`. Today this just delegates to the pruner; the wrapper exists so future per-handler background workers land in one obvious place.
+- **`cmd/arc/main.go`** wires the lifecycle: ad-hoc `context.WithCancel`, hook registered at `shutdown.PriorityHTTPServer` (the earliest tier — the janitor owns nothing but a ticker and reads in-memory maps, so it's safe to stop first). Mirrors the WAL maintenance pattern already in `main.go`.
+- **Concurrent sweep**: glob and partition cache cleanups run on independent goroutines per tick. The two cache mutexes are unrelated, so parallelising them prevents a future hot-glob-cache from delaying the partition sweep behind it (or vice versa).
+
+Operator-visible: one new info line at startup —
+
+```
+Partition pruner cache janitor started interval=30000
+```
+
+and the symmetric "stopped" line on graceful shutdown. No new configuration knob; the 30 s interval is hard-coded today and operators do not need to tune it. The fix has no effect on the cache **hit rate** — entries are only swept after they're already expired by TTL, which the existing `get()` already treats as a miss.
+
+Out of scope for this release: a max-size LRU layer on top of both caches. The sweep-cost analysis showed this is unlikely to bite at realistic key cardinality between 30-second sweeps; will revisit when telemetry shows sweep latency above 10 ms.
+
 ### Startup banner now invites OSS operators to Arc Enterprise
 
 When Arc starts without a working Enterprise license — either because no `license.key` was configured, or because activation/verification failed and `licenseClient` was reset to nil — startup logs now include a single `Info` line:
