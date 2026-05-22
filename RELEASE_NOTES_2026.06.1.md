@@ -259,7 +259,6 @@ The previous draft also added a post-`db.Close()` sweep; review caught that it w
 - **`PartitionPruner.StartCleanup(ctx, interval)`** — public method that spawns the sweeper. Exits cleanly when `ctx` is cancelled. Idempotent via a `cleanupStarted` atomic flag, so a hot-reload path or test refactor can't silently multiply goroutines.
 - **`QueryHandler.StartBackgroundWorkers(ctx)`** — the seam from `main.go`. Today this just delegates to the pruner; the wrapper exists so future per-handler background workers land in one obvious place.
 - **`cmd/arc/main.go`** wires the lifecycle: ad-hoc `context.WithCancel`, hook registered at `shutdown.PriorityHTTPServer` (the earliest tier — the janitor owns nothing but a ticker and reads in-memory maps, so it's safe to stop first). Mirrors the WAL maintenance pattern already in `main.go`.
-- **Concurrent sweep**: glob and partition cache cleanups run on independent goroutines per tick. The two cache mutexes are unrelated, so parallelising them prevents a future hot-glob-cache from delaying the partition sweep behind it (or vice versa).
 
 Operator-visible: one new info line at startup —
 
