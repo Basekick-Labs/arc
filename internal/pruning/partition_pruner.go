@@ -948,6 +948,15 @@ func (p *PartitionPruner) CleanupPartitionCache() int {
 // before it's removed, bounding worst-case retention at ~2× TTL.
 const DefaultCleanupInterval = 30 * time.Second
 
+// minCleanupInterval is the smallest interval StartCleanup will honor.
+// Anything below this is clamped up to prevent a misconfigured caller
+// (or a fuzz input that passes a sub-millisecond duration) from
+// pinning a CPU core in a tight ticker loop. 1ms is a generous floor
+// — orders of magnitude below any plausible production interval and
+// any fast-iteration test (tests in this package use 5–10ms).
+// (Gemini round 3 / PR #450.)
+const minCleanupInterval = 1 * time.Millisecond
+
 // StartCleanup spawns a background goroutine that periodically removes
 // expired entries from both caches. The goroutine exits when ctx is
 // cancelled (or its Done channel closes). Caller controls lifetime via
@@ -977,6 +986,13 @@ func (p *PartitionPruner) StartCleanup(ctx context.Context, interval time.Durati
 	}
 	if interval <= 0 {
 		interval = DefaultCleanupInterval
+	}
+	if interval < minCleanupInterval {
+		p.logger.Warn().
+			Dur("requested", interval).
+			Dur("clamped", minCleanupInterval).
+			Msg("Cleanup interval below floor; clamping to prevent tight-loop sweep")
+		interval = minCleanupInterval
 	}
 	go p.cleanupLoop(ctx, interval)
 	p.logger.Info().

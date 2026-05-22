@@ -1389,6 +1389,43 @@ func TestStartCleanup_DefaultInterval(t *testing.T) {
 	}
 }
 
+// TestStartCleanup_ClampsTinyInterval verifies that intervals below
+// minCleanupInterval are clamped up to prevent a tight-loop sweep.
+// Gemini round 3 finding (PR #450).
+func TestStartCleanup_ClampsTinyInterval(t *testing.T) {
+	if minCleanupInterval <= 0 {
+		t.Fatalf("minCleanupInterval must be positive, got %v", minCleanupInterval)
+	}
+
+	pruner := NewPartitionPruner(zerolog.Nop())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 1 nanosecond would spin a CPU core if not clamped.
+	pruner.StartCleanup(ctx, 1*time.Nanosecond)
+	if !pruner.cleanupStarted.Load() {
+		t.Fatal("StartCleanup with sub-floor interval did not flip cleanupStarted")
+	}
+
+	// Give it a moment — if the clamp failed, we'd be in a tight
+	// loop. We can't easily observe the ticker interval from
+	// outside, but the lack of test timeout under -race is itself a
+	// signal. Seed an entry with a tiny TTL and confirm a sweep
+	// happens within a reasonable window (the clamp keeps sweeps
+	// at >= 1ms; over 50ms we should see at least a few sweeps).
+	pruner.globCache.ttl = 1 * time.Millisecond
+	pruner.globCache.set("/clamp/*.parquet", []string{"x.parquet"})
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, _, size := pruner.globCache.stats(); size == 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	_, _, size := pruner.globCache.stats()
+	t.Fatalf("janitor did not sweep within 200ms after clamp: glob size = %d", size)
+}
+
 // TestStartCleanup_Idempotent verifies the second StartCleanup call on
 // the same pruner is a no-op. Without this, a future hot-reload path
 // or test refactor could silently multiply janitor goroutines.
