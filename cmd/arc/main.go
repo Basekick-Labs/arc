@@ -1534,6 +1534,21 @@ func main() {
 		queryHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}
 	queryHandler.RegisterRoutes(server.GetApp())
+	// Start the handler's background workers (currently the partition
+	// pruner cache janitor — sweeps expired globCache / partitionCache
+	// entries so they don't accumulate over the process lifetime).
+	// Matches the WAL maintenance pattern at line 730: ad-hoc cancel
+	// context registered with the shutdown coordinator. Runs in the
+	// HTTPServer priority band (the earliest tier) because the janitor
+	// has nothing to flush — it just owns a ticker and an in-memory
+	// map. Stopping it early frees the goroutine without blocking any
+	// downstream shutdown hook.
+	queryWorkersCtx, queryWorkersCancel := context.WithCancel(context.Background())
+	shutdownCoordinator.RegisterHook("query-handler-workers", func(_ context.Context) error {
+		queryWorkersCancel()
+		return nil
+	}, shutdown.PriorityHTTPServer)
+	queryHandler.StartBackgroundWorkers(queryWorkersCtx)
 
 	// Wire up cluster router to handlers for request forwarding
 	// This enables reader nodes to forward writes to writers, and

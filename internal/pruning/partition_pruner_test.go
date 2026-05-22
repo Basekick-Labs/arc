@@ -1288,3 +1288,147 @@ func TestExtractStoragePrefix(t *testing.T) {
 		})
 	}
 }
+
+// TestStartCleanup_RemovesExpiredEntries verifies the janitor goroutine
+// sweeps expired entries from both caches at the configured interval.
+// Pre-PR the public Cleanup{Glob,Partition}Cache methods existed but
+// had no production caller; entries that expired by TTL stayed in the
+// map until invalidate() ran (post-compaction). This test pins that
+// the janitor actually evicts past-TTL entries on its own.
+func TestStartCleanup_RemovesExpiredEntries(t *testing.T) {
+	pruner := NewPartitionPruner(zerolog.Nop())
+
+	// Use tiny TTLs so the test runs in ~100ms instead of 30s.
+	pruner.globCache.ttl = 20 * time.Millisecond
+	pruner.partitionCache.ttl = 20 * time.Millisecond
+
+	// Seed both caches.
+	pruner.globCache.set("/seed/*.parquet", []string{"a.parquet", "b.parquet"})
+	pruner.partitionCache.set("seed-key", "/seed/optimized", true)
+
+	if _, _, size := pruner.globCache.stats(); size != 1 {
+		t.Fatalf("expected glob cache size 1 after seed, got %d", size)
+	}
+	if _, _, size := pruner.partitionCache.stats(); size != 1 {
+		t.Fatalf("expected partition cache size 1 after seed, got %d", size)
+	}
+
+	// Start the janitor with a sub-TTL sweep interval so an entry
+	// seeded at t=0 has time to expire (>20ms) AND be swept before
+	// the test deadline.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pruner.StartCleanup(ctx, 10*time.Millisecond)
+
+	// Both entries should be gone within ~3 sweep intervals.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		_, _, globSize := pruner.globCache.stats()
+		_, _, partSize := pruner.partitionCache.stats()
+		if globSize == 0 && partSize == 0 {
+			return // success
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_, _, globSize := pruner.globCache.stats()
+	_, _, partSize := pruner.partitionCache.stats()
+	t.Fatalf("janitor did not evict expired entries within 500ms: glob=%d, partition=%d", globSize, partSize)
+}
+
+// TestStartCleanup_StopsOnContextCancel verifies the janitor goroutine
+// exits when the parent context is cancelled. Without this, every
+// process-lifetime call to StartCleanup would leak a goroutine on
+// shutdown.
+func TestStartCleanup_StopsOnContextCancel(t *testing.T) {
+	pruner := NewPartitionPruner(zerolog.Nop())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	pruner.StartCleanup(ctx, 5*time.Millisecond)
+
+	// Let the loop tick at least once so we know it's running.
+	time.Sleep(20 * time.Millisecond)
+
+	// Cancel; the goroutine should observe ctx.Done() on its next
+	// tick (or sooner if the select picks Done() first).
+	cancel()
+
+	// Seed an entry that would expire, then verify the janitor is
+	// no longer sweeping: if it's running, the entry disappears
+	// within a sweep; if stopped, it stays.
+	pruner.globCache.ttl = 5 * time.Millisecond
+	pruner.globCache.set("/post-stop/*.parquet", []string{"x.parquet"})
+
+	// Wait well past TTL + several sweep intervals — if the janitor
+	// were still running, the entry would be gone by now.
+	time.Sleep(50 * time.Millisecond)
+
+	if _, _, size := pruner.globCache.stats(); size != 1 {
+		t.Fatalf("janitor still sweeping after ctx cancel: glob cache size = %d (want 1)", size)
+	}
+}
+
+// TestStartCleanup_DefaultInterval verifies that passing 0 falls back
+// to DefaultCleanupInterval — the intended "use the sensible default"
+// shape for production callers.
+func TestStartCleanup_DefaultInterval(t *testing.T) {
+	if DefaultCleanupInterval <= 0 {
+		t.Fatalf("DefaultCleanupInterval must be positive, got %v", DefaultCleanupInterval)
+	}
+
+	pruner := NewPartitionPruner(zerolog.Nop())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// We don't wait DefaultCleanupInterval (30s) — the goroutine
+	// behaviour at the default interval is exercised by production.
+	// Just confirm the zero/negative path doesn't panic and the
+	// first call succeeds.
+	pruner.StartCleanup(ctx, 0)
+	if !pruner.cleanupStarted.Load() {
+		t.Fatal("StartCleanup(ctx, 0) did not flip cleanupStarted")
+	}
+}
+
+// TestStartCleanup_Idempotent verifies the second StartCleanup call on
+// the same pruner is a no-op. Without this, a future hot-reload path
+// or test refactor could silently multiply janitor goroutines.
+func TestStartCleanup_Idempotent(t *testing.T) {
+	pruner := NewPartitionPruner(zerolog.Nop())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pruner.StartCleanup(ctx, 5*time.Millisecond)
+	if !pruner.cleanupStarted.Load() {
+		t.Fatal("first StartCleanup did not flip cleanupStarted")
+	}
+
+	// Second call must NOT spawn another goroutine. Easiest way to
+	// pin the invariant is to observe that cleanupStarted remains
+	// true (no panic, no state-change) and that no second log line
+	// for "started" fires. Since we can't easily capture logger
+	// calls here without a custom sink, we rely on the
+	// CompareAndSwap guard returning false on the second call —
+	// the test's value is "the second call doesn't panic AND
+	// cleanupStarted stays true."
+	pruner.StartCleanup(ctx, 5*time.Millisecond)
+	pruner.StartCleanup(ctx, -1*time.Second)
+	pruner.StartCleanup(ctx, 0)
+	if !pruner.cleanupStarted.Load() {
+		t.Fatal("cleanupStarted unexpectedly reset after repeat calls")
+	}
+
+	// Sanity: the underlying goroutine is still alive and still
+	// sweeping. Seed an entry with a TTL shorter than the sweep
+	// interval and verify it gets evicted.
+	pruner.globCache.ttl = 2 * time.Millisecond
+	pruner.globCache.set("/idempotent/*.parquet", []string{"x.parquet"})
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, _, size := pruner.globCache.stats(); size == 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	_, _, size := pruner.globCache.stats()
+	t.Fatalf("janitor goroutine appears dead after repeat StartCleanup calls: glob size = %d", size)
+}
