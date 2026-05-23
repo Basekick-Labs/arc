@@ -471,6 +471,14 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 
 		// Cluster FSM security (Enterprise)
 		"cluster_manifest_rejected_paths_total": m.clusterManifestRejectedPathsTotal.Load(),
+
+		// Cluster Auth (Enterprise, Phase A)
+		"cluster_auth_apply_create_total": m.clusterAuthApplyCreateTotal.Load(),
+		"cluster_auth_apply_update_total": m.clusterAuthApplyUpdateTotal.Load(),
+		"cluster_auth_apply_revoke_total": m.clusterAuthApplyRevokeTotal.Load(),
+		"cluster_auth_apply_delete_total": m.clusterAuthApplyDeleteTotal.Load(),
+		"cluster_auth_apply_rotate_total": m.clusterAuthApplyRotateTotal.Load(),
+		"cluster_auth_rejected_total":     m.clusterAuthRejectedTotal.Load(),
 	}
 }
 
@@ -769,6 +777,31 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_cluster_manifest_rejected_paths_total Total manifest path proposals refused by the cluster FSM. Non-zero growth indicates a peer/snapshot/log entry proposed a path validation refused (URL scheme, absolute, parent-traversal, NUL, oversize).\n"...)
 	b = append(b, "# TYPE arc_cluster_manifest_rejected_paths_total counter\n"...)
 	b = appendMetric(b, "arc_cluster_manifest_rejected_paths_total", float64(m.clusterManifestRejectedPathsTotal.Load()))
+
+	// Cluster Auth metrics (Enterprise, Phase A — Cluster Auth Convergence).
+	// apply_* counters increment per applied token command, per node — so
+	// every node in a healthy cluster sees the same monotonic count
+	// (they all apply the same Raft log). rejected_total counts applier-
+	// side validation refusals; non-zero growth is the security alerting
+	// signal that something is proposing invalid tokens.
+	b = append(b, "# HELP arc_cluster_auth_apply_create_total Total CommandCreateToken applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_auth_apply_create_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_auth_apply_create_total", float64(m.clusterAuthApplyCreateTotal.Load()))
+	b = append(b, "# HELP arc_cluster_auth_apply_update_total Total CommandUpdateToken applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_auth_apply_update_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_auth_apply_update_total", float64(m.clusterAuthApplyUpdateTotal.Load()))
+	b = append(b, "# HELP arc_cluster_auth_apply_revoke_total Total CommandRevokeToken applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_auth_apply_revoke_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_auth_apply_revoke_total", float64(m.clusterAuthApplyRevokeTotal.Load()))
+	b = append(b, "# HELP arc_cluster_auth_apply_delete_total Total CommandDeleteToken applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_auth_apply_delete_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_auth_apply_delete_total", float64(m.clusterAuthApplyDeleteTotal.Load()))
+	b = append(b, "# HELP arc_cluster_auth_apply_rotate_total Total CommandRotateToken applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_auth_apply_rotate_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_auth_apply_rotate_total", float64(m.clusterAuthApplyRotateTotal.Load()))
+	b = append(b, "# HELP arc_cluster_auth_rejected_total Total token command applies refused by FSM-side validation. Non-zero growth indicates a proposer is submitting malformed tokens; alert.\n"...)
+	b = append(b, "# TYPE arc_cluster_auth_rejected_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_auth_rejected_total", float64(m.clusterAuthRejectedTotal.Load()))
 
 	return string(b)
 }
