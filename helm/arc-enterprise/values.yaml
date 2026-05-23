@@ -36,13 +36,24 @@ license:
 # -----------------------------------------------------------------------------
 auth:
   # Pre-set the initial admin token at install time instead of scraping it
-  # from writer-0 logs on first boot. Must be 32+ chars. On re-install the
-  # value is a no-op (existing tokens are preserved).
+  # from pod logs on first boot. Must be 32+ chars. On re-install the value
+  # is a no-op (existing tokens are preserved).
+  #
+  # Since Arc Enterprise v26.06.1 token state replicates cluster-wide via
+  # Raft (Phase A — see docs/configuration/authentication.md). The bootstrap
+  # path is now deterministic across replicas: every pod calls
+  # EnsureInitialToken on boot but only the Raft leader's proposal lands —
+  # other pods silently no-op and converge on the leader's token via Raft.
+  # Setting this value pre-seeds the same admin token on every node, which
+  # means there is no banner-races-the-leader-election anxiety: kubectl
+  # secrets give you the value directly.
   #
   # If existingSecret is set, must contain key "bootstrap-token".
   bootstrapToken:
     existingSecret: ""
-    value: ""                      # leave empty to let Arc generate one (check writer-0 logs)
+    value: ""                      # leave empty to let Arc generate one
+                                   # (exactly one pod — the Raft leader — prints the banner;
+                                   #  see NOTES.txt for how to find it)
 
 # -----------------------------------------------------------------------------
 # Cluster identity and security

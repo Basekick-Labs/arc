@@ -18,6 +18,13 @@ x-arc-env: &arc-env
   ARC_CLUSTER_SEEDS: "arc-writer1:9100,arc-writer2:9100,arc-writer3:9100"
   ARC_CLUSTER_COORDINATOR_ADDR: ":9100"
   ARC_CLUSTER_RAFT_BIND_ADDR: ":9200"
+  # Shared secret authenticates HMAC for inter-node cluster traffic
+  # (peer-fetch, leader-forward apply, WAL replication handshake, and
+  # — since v26.06.1 — the Phase A token-replication forward-apply
+  # path). Required on every node; the value MUST be identical across
+  # the cluster. Sourced from the .env file alongside this compose
+  # file; generate via `openssl rand -hex 32`.
+  ARC_CLUSTER_SHARED_SECRET: "${ARC_CLUSTER_SHARED_SECRET}"
   # Storage — local filesystem + peer replication.
   # Arc defaults storage.local_path to ./data/arc (resolves to /app/data/arc
   # inside the container), which already lives under the mounted volume.
@@ -157,6 +164,12 @@ services:
       ARC_CLUSTER_NODE_ID: "arc-reader1"
       ARC_CLUSTER_ROLE: "reader"
       ARC_CLUSTER_ADVERTISE_ADDR: "arc-reader1:9100"
+      # Readers are non-bootstrapping Raft voters in Arc Enterprise —
+      # the Raft transport requires an advertisable address even on
+      # readers, otherwise the node fails to start with "local bind
+      # address is not advertisable" and falls back to OSS mode (no
+      # cluster state, no replicated auth, no peer file replication).
+      ARC_CLUSTER_RAFT_ADVERTISE_ADDR: "arc-reader1:9200"
     labels:
       <<: *traefik-reader-labels
     depends_on:

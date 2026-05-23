@@ -43,6 +43,17 @@ spec:
               value: "reader"
             - name: ARC_CLUSTER_ADVERTISE_ADDR
               value: "$(POD_NAME).{{ include "arc-enterprise.readerHeadlessName" . }}.{{ .Release.Namespace }}.svc.cluster.local:9100"
+            # Readers join the Raft cluster as voters (Arc Enterprise's
+            # cluster model — see internal/cluster/coordinator.go). The
+            # Raft transport requires an advertisable bind address even
+            # on readers; without this the node fails to start with
+            # "local bind address is not advertisable" and falls back to
+            # OSS mode (no cluster state, no replicated auth, no peer
+            # file replication). Phase A (v26.06.1+) made this gap
+            # symptomatic: token replication and the leader-only
+            # bootstrap banner require Raft on every node.
+            - name: ARC_CLUSTER_RAFT_ADVERTISE_ADDR
+              value: "$(POD_NAME).{{ include "arc-enterprise.readerHeadlessName" . }}.{{ .Release.Namespace }}.svc.cluster.local:9200"
             - name: ARC_CLUSTER_SEEDS
               value: {{ include "arc-enterprise.writerSeeds" . | quote }}
             {{- include "arc-enterprise.storageEnv" . | nindent 12 }}
