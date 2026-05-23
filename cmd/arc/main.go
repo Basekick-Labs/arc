@@ -859,6 +859,11 @@ func main() {
 
 	// Initialize AuthManager (if enabled)
 	var authManager *auth.AuthManager
+	// Phase A: assigned inside the auth-enabled branch below; invoked
+	// either immediately (OSS / non-clustered) or after the Raft proposer
+	// is wired (cluster mode). Function scope so the cluster wire-up branch
+	// can reach it.
+	var runInitialTokenBootstrap func()
 	if cfg.Auth.Enabled {
 		authManager, err = auth.NewAuthManager(
 			cfg.Auth.DBPath,
@@ -879,46 +884,69 @@ func main() {
 		// Create initial admin token on first run.
 		// ARC_AUTH_BOOTSTRAP_TOKEN: use a known token value instead of generating a random one.
 		// ARC_AUTH_FORCE_BOOTSTRAP: add a recovery admin token without removing existing tokens (recovery path).
-		var bootstrapToken string
-		var bootstrapErr error
-		if cfg.Auth.ForceBootstrap && cfg.Auth.BootstrapToken != "" {
-			bootstrapToken, bootstrapErr = authManager.ForceAddRecoveryToken(cfg.Auth.BootstrapToken)
-		} else if cfg.Auth.BootstrapToken != "" {
-			bootstrapToken, bootstrapErr = authManager.EnsureInitialTokenWithValue(cfg.Auth.BootstrapToken)
-		} else {
-			bootstrapToken, bootstrapErr = authManager.EnsureInitialToken()
+		//
+		// Phase A (Cluster Auth Convergence): when the node is going to enter
+		// cluster mode AND has a working Enterprise license that includes
+		// clustering, defer the bootstrap until AFTER SetRaftProposer has
+		// flipped the AuthManager onto the Raft path. Otherwise every node
+		// independently creates its own admin token in its own SQLite (the
+		// original OSS behaviour) and four banners print instead of one.
+		runInitialTokenBootstrap = func() {
+			var bootstrapToken string
+			var bootstrapErr error
+			if cfg.Auth.ForceBootstrap && cfg.Auth.BootstrapToken != "" {
+				bootstrapToken, bootstrapErr = authManager.ForceAddRecoveryToken(cfg.Auth.BootstrapToken)
+			} else if cfg.Auth.BootstrapToken != "" {
+				bootstrapToken, bootstrapErr = authManager.EnsureInitialTokenWithValue(cfg.Auth.BootstrapToken)
+			} else {
+				bootstrapToken, bootstrapErr = authManager.EnsureInitialToken()
+			}
+			if bootstrapErr != nil {
+				log.Error().Err(bootstrapErr).Msg("Failed to create initial admin token")
+			} else if bootstrapToken != "" {
+				// Print colorized banner to stderr (bypasses structured logging)
+				const (
+					cyan   = "\033[96m"
+					yellow = "\033[93m"
+					bold   = "\033[1m"
+					reset  = "\033[0m"
+				)
+				banner := cyan + "======================================================================" + reset
+				fmt.Fprintln(os.Stderr)
+				fmt.Fprintln(os.Stderr, banner)
+				if cfg.Auth.ForceBootstrap {
+					fmt.Fprintln(os.Stderr, cyan+bold+"  RECOVERY TOKEN ADDED - EXISTING TOKENS PRESERVED"+reset)
+				} else {
+					fmt.Fprintln(os.Stderr, cyan+bold+"  FIRST RUN - INITIAL ADMIN TOKEN GENERATED"+reset)
+				}
+				fmt.Fprintln(os.Stderr, banner)
+				fmt.Fprintln(os.Stderr, yellow+bold+"  Admin API token: "+bootstrapToken+reset)
+				fmt.Fprintln(os.Stderr, banner)
+				fmt.Fprintln(os.Stderr, cyan+"  SAVE THIS TOKEN! It will not be shown again."+reset)
+				fmt.Fprintln(os.Stderr, cyan+"  Use this token to login to the web UI or API."+reset)
+				if cfg.Auth.ForceBootstrap {
+					fmt.Fprintln(os.Stderr, cyan+"  Use the API to revoke any tokens you no longer need."+reset)
+					fmt.Fprintln(os.Stderr, cyan+"  Remove ARC_AUTH_FORCE_BOOTSTRAP after recovery."+reset)
+				} else {
+					fmt.Fprintln(os.Stderr, cyan+"  You can create additional tokens after logging in."+reset)
+				}
+				fmt.Fprintln(os.Stderr, banner)
+				fmt.Fprintln(os.Stderr)
+			}
 		}
-		if bootstrapErr != nil {
-			log.Error().Err(bootstrapErr).Msg("Failed to create initial admin token")
-		} else if bootstrapToken != "" {
-			// Print colorized banner to stderr (bypasses structured logging)
-			const (
-				cyan   = "\033[96m"
-				yellow = "\033[93m"
-				bold   = "\033[1m"
-				reset  = "\033[0m"
-			)
-			banner := cyan + "======================================================================" + reset
-			fmt.Fprintln(os.Stderr)
-			fmt.Fprintln(os.Stderr, banner)
-			if cfg.Auth.ForceBootstrap {
-				fmt.Fprintln(os.Stderr, cyan+bold+"  RECOVERY TOKEN ADDED - EXISTING TOKENS PRESERVED"+reset)
-			} else {
-				fmt.Fprintln(os.Stderr, cyan+bold+"  FIRST RUN - INITIAL ADMIN TOKEN GENERATED"+reset)
-			}
-			fmt.Fprintln(os.Stderr, banner)
-			fmt.Fprintln(os.Stderr, yellow+bold+"  Admin API token: "+bootstrapToken+reset)
-			fmt.Fprintln(os.Stderr, banner)
-			fmt.Fprintln(os.Stderr, cyan+"  SAVE THIS TOKEN! It will not be shown again."+reset)
-			fmt.Fprintln(os.Stderr, cyan+"  Use this token to login to the web UI or API."+reset)
-			if cfg.Auth.ForceBootstrap {
-				fmt.Fprintln(os.Stderr, cyan+"  Use the API to revoke any tokens you no longer need."+reset)
-				fmt.Fprintln(os.Stderr, cyan+"  Remove ARC_AUTH_FORCE_BOOTSTRAP after recovery."+reset)
-			} else {
-				fmt.Fprintln(os.Stderr, cyan+"  You can create additional tokens after logging in."+reset)
-			}
-			fmt.Fprintln(os.Stderr, banner)
-			fmt.Fprintln(os.Stderr)
+
+		// Decide whether bootstrap can run inline or must wait for the Raft
+		// proposer to be wired. We check the same preconditions the cluster
+		// init block at line 1157 checks, so a "yes" here is guaranteed to
+		// reach the proposer-wiring branch below.
+		willEnterClusterMode := cfg.Cluster.Enabled &&
+			licenseClient != nil &&
+			licenseClient.GetLicense() != nil &&
+			licenseClient.GetLicense().HasFeature(license.FeatureClustering)
+		if !willEnterClusterMode {
+			runInitialTokenBootstrap()
+		} else {
+			log.Info().Msg("Deferring initial token bootstrap until cluster Raft proposer is wired (Phase A)")
 		}
 
 		log.Info().
@@ -1282,6 +1310,31 @@ func main() {
 								if proposer != nil {
 									authManager.SetRaftProposer(proposer)
 									log.Info().Msg("Cluster auth state replication enabled — token writes now propagate via Raft")
+
+									// Phase A: NOW run the deferred bootstrap.
+									// The proposer is wired, the FSM has its
+									// auth callbacks, and a forwardApplyToLeader
+									// path exists for follower proposals.
+									// Every node calls EnsureInitialToken with
+									// its own randomly-generated value; only
+									// the Raft leader's proposal lands, the
+									// rest get "token name already exists" and
+									// silently return empty-string (no banner).
+									//
+									// First wait for a Raft leader to be
+									// observed. On followers this prevents
+									// forwardApplyToLeader from racing the
+									// election window and returning
+									// ErrNoLeaderKnown — that error would
+									// surface as a non-idempotent bootstrap
+									// failure even though the cluster will
+									// elect a leader within ~5s.
+									if err := clusterCoordinator.WaitForLeader(30 * time.Second); err != nil {
+										log.Warn().Err(err).Msg("Cluster auth bootstrap: leader not observed within 30s; proceeding (call will likely retry via Raft semantics)")
+									}
+									if runInitialTokenBootstrap != nil {
+										runInitialTokenBootstrap()
+									}
 								}
 							}
 						}
@@ -1429,6 +1482,20 @@ func main() {
 				}
 			}
 		}
+	}
+
+	// Phase A: fallback bootstrap. If we deferred the initial-token
+	// bootstrap above on the expectation that cluster mode would wire
+	// the Raft proposer, but the cluster startup actually failed (e.g.
+	// Raft transport refuse, peer-replication secret missing, FSM
+	// init error), runInitialTokenBootstrap was never invoked and the
+	// operator would have no admin token. Run it now in OSS-fallthrough
+	// mode so the system stays usable. The closure itself is idempotent
+	// via the underlying INSERT OR IGNORE path — if tokens already exist
+	// from a previous start, this is a no-op and prints no banner.
+	if authManager != nil && clusterCoordinator == nil && runInitialTokenBootstrap != nil {
+		log.Warn().Msg("Cluster coordinator did not start; running initial token bootstrap in standalone fallback mode")
+		runInitialTokenBootstrap()
 	}
 
 	// Determine node capabilities (for role-based component initialization)

@@ -2753,6 +2753,23 @@ func (c *Coordinator) IsLeader() bool {
 	return c.raftNode.IsLeader()
 }
 
+// WaitForLeader blocks until a Raft leader is observed (could be this node
+// or a peer) or the timeout elapses. Returns nil on success, or the
+// underlying hashicorp/raft error on timeout. Used during cluster
+// bootstrap to delay the first cluster-replicated CreateToken proposal
+// until the leader is reachable; on followers, this prevents
+// forwardApplyToLeader from returning ErrNoLeaderKnown during the
+// election window.
+//
+// Standalone mode (no Raft) returns nil immediately — every node is
+// effectively its own leader.
+func (c *Coordinator) WaitForLeader(timeout time.Duration) error {
+	if c.raftNode == nil {
+		return nil
+	}
+	return c.raftNode.WaitForLeader(timeout)
+}
+
 // LocalNodeID returns the local cluster node ID. Phase 4 uses this via
 // the CompactionBridge to set OriginNodeID on compacted-file Raft entries
 // so Phase 2/3's multi-peer resolver routes replica pulls back to the
