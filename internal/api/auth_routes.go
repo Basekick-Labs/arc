@@ -154,7 +154,7 @@ func (h *AuthHandler) createToken(c *fiber.Ctx) error {
 		expiresAt = &t
 	}
 
-	token, err := h.authManager.CreateToken(req.Name, req.Description, permissions, expiresAt)
+	token, err := h.authManager.CreateToken(c.UserContext(), req.Name, req.Description, permissions, expiresAt)
 	if err != nil {
 		h.logger.Error().Err(err).Str("name", req.Name).Msg("Failed to create token")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -297,7 +297,7 @@ func (h *AuthHandler) updateToken(c *fiber.Ctx) error {
 		expiresAt = &t
 	}
 
-	err = h.authManager.UpdateToken(id, req.Name, req.Description, permissions, expiresAt)
+	err = h.authManager.UpdateToken(c.UserContext(), id, req.Name, req.Description, permissions, expiresAt)
 	if err != nil {
 		if err.Error() == "token not found" {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
@@ -330,7 +330,7 @@ func (h *AuthHandler) deleteToken(c *fiber.Ctx) error {
 		})
 	}
 
-	err = h.authManager.DeleteToken(id)
+	err = h.authManager.DeleteToken(c.UserContext(), id)
 	if err != nil {
 		if err.Error() == "token not found" {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
@@ -363,7 +363,7 @@ func (h *AuthHandler) rotateToken(c *fiber.Ctx) error {
 		})
 	}
 
-	newToken, err := h.authManager.RotateToken(id)
+	newToken, err := h.authManager.RotateToken(c.UserContext(), id)
 	if err != nil {
 		if err.Error() == "token not found" {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
@@ -397,7 +397,7 @@ func (h *AuthHandler) revokeToken(c *fiber.Ctx) error {
 		})
 	}
 
-	err = h.authManager.RevokeToken(id)
+	err = h.authManager.RevokeToken(c.UserContext(), id)
 	if err != nil {
 		if err.Error() == "token not found" {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{

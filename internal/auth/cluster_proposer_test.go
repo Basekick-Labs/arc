@@ -187,7 +187,7 @@ func TestCreateToken_RoundTripsThroughProposer(t *testing.T) {
 	am, _, cleanup := setupClusteredAuthManager(t)
 	defer cleanup()
 
-	plaintext, err := am.CreateToken("smoke", "round-trip test", "read,write", nil)
+	plaintext, err := am.CreateToken(context.Background(), "smoke", "round-trip test", "read,write", nil)
 	if err != nil {
 		t.Fatalf("CreateToken: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestRevokeToken_InvalidatesCacheOnApply(t *testing.T) {
 	am, _, cleanup := setupClusteredAuthManager(t)
 	defer cleanup()
 
-	plaintext, err := am.CreateToken("svc", "test", "read,write", nil)
+	plaintext, err := am.CreateToken(context.Background(), "svc", "test", "read,write", nil)
 	if err != nil {
 		t.Fatalf("CreateToken: %v", err)
 	}
@@ -235,7 +235,7 @@ func TestRevokeToken_InvalidatesCacheOnApply(t *testing.T) {
 		t.Fatal("could not find newly created token")
 	}
 
-	if err := am.RevokeToken(id); err != nil {
+	if err := am.RevokeToken(context.Background(), id); err != nil {
 		t.Fatalf("RevokeToken: %v", err)
 	}
 
@@ -261,7 +261,7 @@ func TestProposerNil_FallsThroughToDirectSQLite(t *testing.T) {
 		t.Fatal("freshly-constructed AuthManager should have nil proposer")
 	}
 
-	plaintext, err := am.CreateToken("oss-mode", "fallback test", "read,write", nil)
+	plaintext, err := am.CreateToken(context.Background(), "oss-mode", "fallback test", "read,write", nil)
 	if err != nil {
 		t.Fatalf("CreateToken (OSS path): %v", err)
 	}
@@ -316,5 +316,31 @@ func TestClusterTokenEntryWire_JSONRoundTrip(t *testing.T) {
 	}
 	if restored != original {
 		t.Errorf("wire round-trip lost fields\nbefore: %+v\nafter:  %+v", original, restored)
+	}
+}
+
+// Pins the divergence-detection behaviour added in response to Gemini
+// #451 round-3: Apply{Update,Revoke,Rotate}Token must return an error
+// (and log at Error) when the local SQLite row is missing for an ID the
+// cluster FSM thinks exists. ApplyDeleteToken treats the same case as
+// a Warn-level no-op (the post-state matches, so it's not an error).
+func TestApplyXxxToken_DetectsLocalDivergence(t *testing.T) {
+	am, cleanup := setupTestAuthManager(t)
+	defer cleanup()
+
+	// Don't insert any row, but call Apply* with an ID — the local
+	// SQLite is empty, so RowsAffected will be 0.
+	if err := am.ApplyUpdateToken(ClusterTokenEntry{ID: 999, Name: "ghost", Permissions: "read"}); err == nil {
+		t.Error("ApplyUpdateToken should error on local divergence (id=999 missing)")
+	}
+	if err := am.ApplyRevokeToken(999); err == nil {
+		t.Error("ApplyRevokeToken should error on local divergence")
+	}
+	if err := am.ApplyRotateToken(999, "$2a$10$newhash................................", "newprefix01234"); err == nil {
+		t.Error("ApplyRotateToken should error on local divergence")
+	}
+	// Delete: idempotent post-state (no row), so no error — just a log.
+	if err := am.ApplyDeleteToken(999); err != nil {
+		t.Errorf("ApplyDeleteToken should NOT error on missing local row (post-state matches), got: %v", err)
 	}
 }

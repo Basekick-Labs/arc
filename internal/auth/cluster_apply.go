@@ -203,7 +203,7 @@ func (am *AuthManager) ApplyUpdateToken(entry ClusterTokenEntry) error {
 	if entry.ExpiresAtUnixNano != 0 {
 		expiresAt = time.Unix(0, entry.ExpiresAtUnixNano)
 	}
-	_, err := am.db.Exec(`
+	result, err := am.db.Exec(`
 		UPDATE api_tokens
 		SET name = ?, description = ?, permissions = ?, expires_at = ?
 		WHERE id = ?
@@ -211,37 +211,85 @@ func (am *AuthManager) ApplyUpdateToken(entry ClusterTokenEntry) error {
 	if err != nil {
 		return fmt.Errorf("ApplyUpdateToken: %w", err)
 	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		// Cluster FSM holds this token but our local SQLite doesn't. Most
+		// likely cause: the local row was manually deleted, or the FSM
+		// applied a CreateToken on this node that failed materialise and
+		// the upstream divergence wasn't repaired before this Update
+		// landed. Surface loudly so the operator can re-sync the local
+		// cache. The next CreateToken / restart re-applies the FSM
+		// snapshot and the row reappears. Gemini #451 round-3 review.
+		am.logger.Error().
+			Int64("token_id", entry.ID).
+			Str("name", entry.Name).
+			Msg("ApplyUpdateToken: local SQLite row missing — cluster FSM<->local cache divergence")
+		am.InvalidateCache()
+		return fmt.Errorf("ApplyUpdateToken: id %d not present in local SQLite cache (cluster<->local divergence)", entry.ID)
+	}
 	am.InvalidateCache()
 	return nil
 }
 
 // ApplyRevokeToken materialises a RevokeToken Raft apply.
+//
+// Checks RowsAffected() to detect local cache divergence: if the cluster
+// FSM holds this token enabled but our SQLite doesn't have the row at
+// all, the revoke would silently no-op and the token would keep
+// authenticating against the local stale cache (a security regression).
+// Gemini #451 round-3 review.
 func (am *AuthManager) ApplyRevokeToken(id int64) error {
 	if id == 0 {
 		return fmt.Errorf("ApplyRevokeToken: id required")
 	}
-	_, err := am.db.Exec("UPDATE api_tokens SET enabled = 0 WHERE id = ?", id)
+	result, err := am.db.Exec("UPDATE api_tokens SET enabled = 0 WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("ApplyRevokeToken: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		am.logger.Error().
+			Int64("token_id", id).
+			Msg("ApplyRevokeToken: local SQLite row missing — cluster<->local divergence; the token may still authenticate against this node's stale cache")
+		am.InvalidateCache()
+		return fmt.Errorf("ApplyRevokeToken: id %d not present in local SQLite cache (cluster<->local divergence)", id)
 	}
 	am.InvalidateCache()
 	return nil
 }
 
 // ApplyDeleteToken materialises a DeleteToken Raft apply.
+//
+// A zero RowsAffected() count is technically idempotent (deletion of a
+// non-existent row is a SQL no-op), but in this context it signals that
+// the local materialised cache was already missing an entry the cluster
+// FSM thought existed. Logged loudly so divergence is observable, but
+// NOT returned as an error — the desired post-state (no row) is the
+// same either way. Gemini #451 round-3 review.
 func (am *AuthManager) ApplyDeleteToken(id int64) error {
 	if id == 0 {
 		return fmt.Errorf("ApplyDeleteToken: id required")
 	}
-	_, err := am.db.Exec("DELETE FROM api_tokens WHERE id = ?", id)
+	result, err := am.db.Exec("DELETE FROM api_tokens WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("ApplyDeleteToken: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		am.logger.Warn().
+			Int64("token_id", id).
+			Msg("ApplyDeleteToken: local SQLite row already missing — cluster<->local divergence (post-state matches, no error)")
 	}
 	am.InvalidateCache()
 	return nil
 }
 
 // ApplyRotateToken materialises a RotateToken Raft apply.
+//
+// Particularly important to detect divergence here: a missing local row
+// means the rotate silently no-ops and the token KEEPS authenticating
+// against the OLD plaintext (via the OLD hash that's still in the local
+// cache) until the cache TTL expires. Gemini #451 round-3 review.
 func (am *AuthManager) ApplyRotateToken(id int64, newHash, newPrefix string) error {
 	if id == 0 {
 		return fmt.Errorf("ApplyRotateToken: id required")
@@ -249,9 +297,17 @@ func (am *AuthManager) ApplyRotateToken(id int64, newHash, newPrefix string) err
 	if newHash == "" || newPrefix == "" {
 		return fmt.Errorf("ApplyRotateToken: new_hash and new_prefix required")
 	}
-	_, err := am.db.Exec("UPDATE api_tokens SET token_hash = ?, token_prefix = ? WHERE id = ?", newHash, newPrefix, id)
+	result, err := am.db.Exec("UPDATE api_tokens SET token_hash = ?, token_prefix = ? WHERE id = ?", newHash, newPrefix, id)
 	if err != nil {
 		return fmt.Errorf("ApplyRotateToken: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		am.logger.Error().
+			Int64("token_id", id).
+			Msg("ApplyRotateToken: local SQLite row missing — cluster<->local divergence; the OLD token may keep authenticating against this node until its cache entry expires")
+		am.InvalidateCache()
+		return fmt.Errorf("ApplyRotateToken: id %d not present in local SQLite cache (cluster<->local divergence)", id)
 	}
 	am.InvalidateCache()
 	return nil

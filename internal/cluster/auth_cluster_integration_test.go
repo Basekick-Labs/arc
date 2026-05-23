@@ -116,7 +116,7 @@ func TestTwoNodeAuth_CreateOnAVerifyOnB(t *testing.T) {
 	amB.SetRaftProposer(replicator)
 
 	// THE DECISIVE TEST: create a token on node A; verify on node B.
-	plaintext, err := amA.CreateToken("cross-node", "smoke", "read,write", nil)
+	plaintext, err := amA.CreateToken(context.Background(), "cross-node", "smoke", "read,write", nil)
 	if err != nil {
 		t.Fatalf("CreateToken on A: %v", err)
 	}
@@ -172,7 +172,7 @@ func TestTwoNodeAuth_RevokeOnAInvalidatesB(t *testing.T) {
 	amA.SetRaftProposer(replicator)
 	amB.SetRaftProposer(replicator)
 
-	plaintext, err := amA.CreateToken("revokable", "smoke", "read,write", nil)
+	plaintext, err := amA.CreateToken(context.Background(), "revokable", "smoke", "read,write", nil)
 	if err != nil {
 		t.Fatalf("CreateToken: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestTwoNodeAuth_RevokeOnAInvalidatesB(t *testing.T) {
 	if id == 0 {
 		t.Fatal("could not find token to revoke")
 	}
-	if err := amA.RevokeToken(id); err != nil {
+	if err := amA.RevokeToken(context.Background(), id); err != nil {
 		t.Fatalf("RevokeToken on A: %v", err)
 	}
 

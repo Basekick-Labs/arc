@@ -908,7 +908,7 @@ func main() {
 			bootstrapCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			if cfg.Auth.ForceBootstrap && cfg.Auth.BootstrapToken != "" {
-				bootstrapToken, bootstrapErr = authManager.ForceAddRecoveryToken(cfg.Auth.BootstrapToken)
+				bootstrapToken, bootstrapErr = authManager.ForceAddRecoveryToken(bootstrapCtx, cfg.Auth.BootstrapToken)
 			} else if cfg.Auth.BootstrapToken != "" {
 				bootstrapToken, bootstrapErr = authManager.EnsureInitialTokenWithValue(bootstrapCtx, cfg.Auth.BootstrapToken)
 			} else {

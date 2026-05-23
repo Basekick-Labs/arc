@@ -420,8 +420,16 @@ func (am *AuthManager) insertToken(hash, prefix, name, description, permissions 
 	return nil
 }
 
-// CreateToken creates a new API token
-func (am *AuthManager) CreateToken(name, description, permissions string, expiresAt *time.Time) (string, error) {
+// CreateToken creates a new API token.
+//
+// In cluster mode, this proposes a CreateToken command through Raft and
+// waits up to proposeTimeout for the apply to land. The context bounds
+// that wait so a client disconnect or higher-level timeout cancels the
+// proposal cleanly. In OSS / standalone mode the context is currently
+// unused (the SQLite write is a single statement) but the signature is
+// kept consistent across both paths for callers (Gemini #451 round-3
+// review).
+func (am *AuthManager) CreateToken(ctx context.Context, name, description, permissions string, expiresAt *time.Time) (string, error) {
 	token, err := generateToken()
 	if err != nil {
 		return "", fmt.Errorf("failed to generate token: %w", err)
@@ -466,7 +474,7 @@ func (am *AuthManager) CreateToken(name, description, permissions string, expire
 				Enabled:           true,
 			},
 		}
-		if err := am.proposeCommand(context.Background(), ProposalCommandCreateToken, payload); err != nil {
+		if err := am.proposeCommand(ctx, ProposalCommandCreateToken, payload); err != nil {
 			return "", fmt.Errorf("create token: %w", err)
 		}
 		am.logger.Info().
@@ -477,7 +485,10 @@ func (am *AuthManager) CreateToken(name, description, permissions string, expire
 	}
 
 	// Standalone / OSS: direct SQLite write, unchanged from pre-Phase-A
-	// behaviour.
+	// behaviour. ctx is accepted for signature consistency but unused on
+	// this path — a single SQLite INSERT can't observe cancellation
+	// without re-plumbing the entire database/sql layer.
+	_ = ctx
 	if err := am.insertToken(hash, prefix, name, description, permissions, expiresAt); err != nil {
 		return "", err
 	}
@@ -725,8 +736,12 @@ func (am *AuthManager) GetTokenByID(id int64) (*TokenInfo, error) {
 	return info, nil
 }
 
-// UpdateToken updates token metadata
-func (am *AuthManager) UpdateToken(id int64, name, description, permissions *string, expiresAt *time.Time) error {
+// UpdateToken updates token metadata.
+//
+// The context bounds the cluster-mode Raft proposal wait. In OSS mode
+// it's currently unused (single SQLite UPDATE statement). Gemini #451
+// round-3 review.
+func (am *AuthManager) UpdateToken(ctx context.Context, id int64, name, description, permissions *string, expiresAt *time.Time) error {
 	// Cluster mode: propose via Raft with a ChangedFields list so the FSM
 	// applier knows which fields are "leave alone" vs "set to empty".
 	if am.getProposer() != nil {
@@ -759,11 +774,12 @@ func (am *AuthManager) UpdateToken(id int64, name, description, permissions *str
 			return nil
 		}
 		payload.ChangedFields = changed
-		if err := am.proposeCommand(context.Background(), ProposalCommandUpdateToken, payload); err != nil {
+		if err := am.proposeCommand(ctx, ProposalCommandUpdateToken, payload); err != nil {
 			return fmt.Errorf("update token: %w", err)
 		}
 		return nil
 	}
+	_ = ctx
 
 	// Standalone / OSS: direct SQLite.
 	var updates []string
@@ -807,18 +823,20 @@ func (am *AuthManager) UpdateToken(id int64, name, description, permissions *str
 	return nil
 }
 
-// DeleteToken deletes a token by ID
-func (am *AuthManager) DeleteToken(id int64) error {
+// DeleteToken deletes a token by ID. The context bounds the cluster-mode
+// Raft proposal wait. Gemini #451 round-3 review.
+func (am *AuthManager) DeleteToken(ctx context.Context, id int64) error {
 	if am.getProposer() != nil {
 		payload := struct {
 			ID int64 `json:"id"`
 		}{ID: id}
-		if err := am.proposeCommand(context.Background(), ProposalCommandDeleteToken, payload); err != nil {
+		if err := am.proposeCommand(ctx, ProposalCommandDeleteToken, payload); err != nil {
 			return fmt.Errorf("delete token: %w", err)
 		}
 		am.logger.Info().Int64("token_id", id).Msg("Deleted API token via Raft")
 		return nil
 	}
+	_ = ctx
 
 	result, err := am.db.Exec("DELETE FROM api_tokens WHERE id = ?", id)
 	if err != nil {
@@ -835,18 +853,20 @@ func (am *AuthManager) DeleteToken(id int64) error {
 	return nil
 }
 
-// RevokeToken disables a token
-func (am *AuthManager) RevokeToken(id int64) error {
+// RevokeToken disables a token. The context bounds the cluster-mode
+// Raft proposal wait. Gemini #451 round-3 review.
+func (am *AuthManager) RevokeToken(ctx context.Context, id int64) error {
 	if am.getProposer() != nil {
 		payload := struct {
 			ID int64 `json:"id"`
 		}{ID: id}
-		if err := am.proposeCommand(context.Background(), ProposalCommandRevokeToken, payload); err != nil {
+		if err := am.proposeCommand(ctx, ProposalCommandRevokeToken, payload); err != nil {
 			return fmt.Errorf("revoke token: %w", err)
 		}
 		am.logger.Info().Int64("token_id", id).Msg("Revoked API token via Raft")
 		return nil
 	}
+	_ = ctx
 
 	result, err := am.db.Exec("UPDATE api_tokens SET enabled = 0 WHERE id = ?", id)
 	if err != nil {
@@ -863,8 +883,10 @@ func (am *AuthManager) RevokeToken(id int64) error {
 	return nil
 }
 
-// RotateToken generates a new token value while keeping metadata
-func (am *AuthManager) RotateToken(id int64) (string, error) {
+// RotateToken generates a new token value while keeping metadata. The
+// context bounds the cluster-mode Raft proposal wait. Gemini #451
+// round-3 review.
+func (am *AuthManager) RotateToken(ctx context.Context, id int64) (string, error) {
 	token, err := generateToken()
 	if err != nil {
 		return "", fmt.Errorf("failed to generate token: %w", err)
@@ -886,12 +908,13 @@ func (am *AuthManager) RotateToken(id int64) (string, error) {
 			NewHash   string `json:"new_hash"`
 			NewPrefix string `json:"new_prefix"`
 		}{ID: id, NewHash: hash, NewPrefix: prefix}
-		if err := am.proposeCommand(context.Background(), ProposalCommandRotateToken, payload); err != nil {
+		if err := am.proposeCommand(ctx, ProposalCommandRotateToken, payload); err != nil {
 			return "", fmt.Errorf("rotate token: %w", err)
 		}
 		am.logger.Info().Int64("token_id", id).Msg("Rotated API token via Raft")
 		return token, nil
 	}
+	_ = ctx
 
 	result, err := am.db.Exec("UPDATE api_tokens SET token_hash = ?, token_prefix = ? WHERE id = ?", hash, prefix, id)
 	if err != nil {
@@ -1024,7 +1047,9 @@ func (am *AuthManager) EnsureInitialToken(ctx context.Context) (string, error) {
 
 // CreateTokenWithValue creates a new API token using a caller-provided token value instead of generating one.
 // The value must be at least 32 characters long to ensure adequate entropy.
-func (am *AuthManager) CreateTokenWithValue(tokenValue, name, description, permissions string, expiresAt *time.Time) (string, error) {
+// The context bounds the cluster-mode Raft proposal wait. Gemini #451
+// round-3 review.
+func (am *AuthManager) CreateTokenWithValue(ctx context.Context, tokenValue, name, description, permissions string, expiresAt *time.Time) (string, error) {
 	if len(tokenValue) < 32 {
 		return "", fmt.Errorf("bootstrap token must be at least 32 characters long")
 	}
@@ -1058,7 +1083,7 @@ func (am *AuthManager) CreateTokenWithValue(tokenValue, name, description, permi
 				Enabled:           true,
 			},
 		}
-		if err := am.proposeCommand(context.Background(), ProposalCommandCreateToken, payload); err != nil {
+		if err := am.proposeCommand(ctx, ProposalCommandCreateToken, payload); err != nil {
 			return "", fmt.Errorf("create token with value: %w", err)
 		}
 		am.logger.Info().
@@ -1067,6 +1092,7 @@ func (am *AuthManager) CreateTokenWithValue(tokenValue, name, description, permi
 			Msg("Created API token with provided value via Raft")
 		return tokenValue, nil
 	}
+	_ = ctx
 
 	if err := am.insertToken(hash, prefix, name, description, permissions, expiresAt); err != nil {
 		return "", err
@@ -1106,14 +1132,14 @@ func (am *AuthManager) EnsureInitialTokenWithValue(ctx context.Context, tokenVal
 // This is a recovery path for when the admin token has been lost. Requires ARC_AUTH_FORCE_BOOTSTRAP=true.
 // Existing tokens are preserved so that legitimate admins can still revoke the recovery token if it was
 // injected by a bad actor.
-func (am *AuthManager) ForceAddRecoveryToken(tokenValue string) (string, error) {
+func (am *AuthManager) ForceAddRecoveryToken(ctx context.Context, tokenValue string) (string, error) {
 	if len(tokenValue) < 32 {
 		return "", fmt.Errorf("bootstrap token must be at least 32 characters long")
 	}
 
 	am.logger.Warn().Msg("ARC_AUTH_FORCE_BOOTSTRAP=true: adding recovery admin token (existing tokens preserved)")
 
-	token, err := am.CreateTokenWithValue(tokenValue, "arc-recovery", "Recovery admin token added via ARC_AUTH_FORCE_BOOTSTRAP", "read,write,delete,admin", nil)
+	token, err := am.CreateTokenWithValue(ctx, tokenValue, "arc-recovery", "Recovery admin token added via ARC_AUTH_FORCE_BOOTSTRAP", "read,write,delete,admin", nil)
 	if err != nil {
 		if strings.Contains(err.Error(), "already exists") {
 			// Recovery token already exists from a previous restart — no-op, the caller

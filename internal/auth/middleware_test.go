@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"io"
 	"net/http/httptest"
 	"os"
@@ -68,7 +69,7 @@ func TestMiddleware_BearerToken(t *testing.T) {
 	defer cleanup()
 
 	// Create a valid token
-	token, _ := am.CreateToken("bearer-test", "Test", "read", nil)
+	token, _ := am.CreateToken(context.Background(), "bearer-test", "Test", "read", nil)
 
 	t.Run("valid bearer token", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/test", nil)
@@ -106,7 +107,7 @@ func TestMiddleware_PlainToken(t *testing.T) {
 	am, app, cleanup := setupMiddlewareTest(t, config)
 	defer cleanup()
 
-	token, _ := am.CreateToken("plain-test", "Test", "read", nil)
+	token, _ := am.CreateToken(context.Background(), "plain-test", "Test", "read", nil)
 
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.Header.Set("Authorization", token) // Plain token, no Bearer prefix
@@ -128,7 +129,7 @@ func TestMiddleware_ApiKeyHeader(t *testing.T) {
 	am, app, cleanup := setupMiddlewareTest(t, config)
 	defer cleanup()
 
-	token, _ := am.CreateToken("apikey-test", "Test", "read", nil)
+	token, _ := am.CreateToken(context.Background(), "apikey-test", "Test", "read", nil)
 
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.Header.Set("x-api-key", token)
@@ -319,8 +320,8 @@ func TestMiddleware_PublicPrefixes_AnchoredMatch(t *testing.T) {
 // shapes against the same set of request paths to pin that equivalence.
 func TestMiddleware_PublicPrefixes_TrailingSlashNormalisation(t *testing.T) {
 	configs := []struct {
-		name    string
-		prefix  string
+		name   string
+		prefix string
 	}{
 		{"prefix without trailing slash", "/metrics"},
 		{"prefix WITH trailing slash", "/metrics/"},
@@ -388,7 +389,7 @@ func TestMiddleware_ExpiredToken(t *testing.T) {
 
 	// Create expired token
 	expiresAt := time.Now().Add(-1 * time.Hour)
-	token, _ := am.CreateToken("expired-test", "Test", "read", &expiresAt)
+	token, _ := am.CreateToken(context.Background(), "expired-test", "Test", "read", &expiresAt)
 
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -409,7 +410,7 @@ func TestMiddleware_ContextToken(t *testing.T) {
 	am, app, cleanup := setupMiddlewareTest(t, config)
 	defer cleanup()
 
-	token, _ := am.CreateToken("context-test", "Test", "read,write", nil)
+	token, _ := am.CreateToken(context.Background(), "context-test", "Test", "read,write", nil)
 
 	req := httptest.NewRequest("GET", "/whoami", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -492,9 +493,9 @@ func TestRequirePermission(t *testing.T) {
 	defer am.Close()
 
 	// Create tokens with different permissions
-	readToken, _ := am.CreateToken("read-only", "Test", "read", nil)
-	writeToken, _ := am.CreateToken("read-write", "Test", "read,write", nil)
-	adminToken, _ := am.CreateToken("admin", "Test", "admin", nil)
+	readToken, _ := am.CreateToken(context.Background(), "read-only", "Test", "read", nil)
+	writeToken, _ := am.CreateToken(context.Background(), "read-write", "Test", "read,write", nil)
+	adminToken, _ := am.CreateToken(context.Background(), "admin", "Test", "admin", nil)
 
 	// Setup app with auth middleware and permission middleware
 	config := DefaultMiddlewareConfig()
@@ -577,7 +578,7 @@ func TestGetTokenInfo(t *testing.T) {
 	am, app, cleanup := setupMiddlewareTest(t, config)
 	defer cleanup()
 
-	token, _ := am.CreateToken("info-test", "Test", "read", nil)
+	token, _ := am.CreateToken(context.Background(), "info-test", "Test", "read", nil)
 
 	t.Run("with valid token", func(t *testing.T) {
 		var capturedInfo *TokenInfo
