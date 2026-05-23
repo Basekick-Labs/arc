@@ -938,6 +938,23 @@ func (h *QueryHandler) InvalidateCaches() {
 	h.logger.Info().Msg("Query caches invalidated after compaction")
 }
 
+// StartBackgroundWorkers spawns the long-lived goroutines the handler
+// needs: today this is the partition pruner cache janitor, which
+// sweeps expired entries from globCache + partitionCache so they don't
+// accumulate over the process lifetime. (Both caches are TTL-only with
+// no max-size cap and no read-side eviction — get() returns "expired"
+// as a miss but leaves the stale entry in the map.)
+//
+// The workers stop when ctx is cancelled. The handler itself remains
+// usable after that, and InvalidateCaches() (called post-compaction)
+// continues to reset both maps, but expired entries are no longer
+// swept on a schedule — they accumulate until the next compaction
+// flushes everything or the process exits. Production callers should
+// pass a context tied to process lifetime via the shutdown coordinator.
+func (h *QueryHandler) StartBackgroundWorkers(ctx context.Context) {
+	h.pruner.StartCleanup(ctx, 0) // 0 → DefaultCleanupInterval
+}
+
 // extractTableReferences extracts all database.measurement references from SQL
 // Returns a slice of TableReference structs for permission checking
 func extractTableReferences(sql string) []TableReference {

@@ -267,6 +267,13 @@ type PartitionPruner struct {
 	globCache      *globCache
 	partitionCache *partitionCache
 	storage        storage.Backend // Optional storage backend for S3/Azure path validation
+
+	// cleanupStarted ensures StartCleanup spawns at most one janitor
+	// goroutine per pruner. Idempotent on repeat calls — second and
+	// later invocations log a warn and return without spawning. Guards
+	// against a future hot-reload or test refactor accidentally
+	// multiplying goroutines silently.
+	cleanupStarted atomic.Bool
 }
 
 // PrunerStats tracks partition pruning statistics using atomic counters for thread-safety
@@ -932,6 +939,85 @@ func (p *PartitionPruner) CleanupPartitionCache() int {
 		p.logger.Debug().Int("removed", removed).Msg("Cleaned up expired partition cache entries")
 	}
 	return removed
+}
+
+// DefaultCleanupInterval is how often the background janitor sweeps
+// expired entries from both caches. 30 seconds matches the shorter of
+// the two TTLs (GlobCacheTTL = 30s, PartitionCacheTTL = 60s) — after
+// expiry an entry can sit in the map for at most one sweep interval
+// before it's removed, bounding worst-case retention at ~2× TTL.
+const DefaultCleanupInterval = 30 * time.Second
+
+// minCleanupInterval is the smallest interval StartCleanup will honor.
+// Anything below this is clamped up to prevent a misconfigured caller
+// (or a fuzz input that passes a sub-millisecond duration) from
+// pinning a CPU core in a tight ticker loop. 1ms is a generous floor
+// — orders of magnitude below any plausible production interval and
+// any fast-iteration test (tests in this package use 5–10ms).
+const minCleanupInterval = 1 * time.Millisecond
+
+// StartCleanup spawns a background goroutine that periodically removes
+// expired entries from both caches. The goroutine exits when ctx is
+// cancelled (or its Done channel closes). Caller controls lifetime via
+// the context.
+//
+// Idempotent: only the first call per *PartitionPruner spawns the
+// janitor. Subsequent calls log a warn and return without spawning,
+// so a hot-reload path or a test refactor can't silently multiply
+// goroutines.
+//
+// Why this exists: get() returns "expired" as a cache miss but does
+// NOT remove the stale entry — there's no eviction path on read.
+// Combined with no max-size cap on either cache, a workload with
+// high-cardinality glob patterns or distinct (path, sql) keys will
+// grow the maps monotonically over the lifetime of the process. The
+// public Cleanup{Glob,Partition}Cache methods exist but had no
+// production caller — this fills that gap.
+//
+// interval=0 uses DefaultCleanupInterval. Negative values are
+// rejected by clamping to the default.
+func (p *PartitionPruner) StartCleanup(ctx context.Context, interval time.Duration) {
+	if !p.cleanupStarted.CompareAndSwap(false, true) {
+		p.logger.Warn().Msg("Partition pruner cache janitor already started; ignoring duplicate StartCleanup call")
+		return
+	}
+	if interval <= 0 {
+		interval = DefaultCleanupInterval
+	}
+	if interval < minCleanupInterval {
+		p.logger.Warn().
+			Dur("requested", interval).
+			Dur("clamped", minCleanupInterval).
+			Msg("Cleanup interval below floor; clamping to prevent tight-loop sweep")
+		interval = minCleanupInterval
+	}
+	go p.cleanupLoop(ctx, interval)
+	p.logger.Info().
+		Dur("interval", interval).
+		Msg("Partition pruner cache janitor started")
+}
+
+// cleanupLoop is the body of the janitor goroutine. Runs until ctx is
+// cancelled. One sweep per tick; sweeps are cheap (single mu.Lock +
+// map iteration, no allocations) — at realistic key cardinality the
+// sweep cost is on the order of microseconds, well below the
+// goroutine-spawn + WaitGroup-sync overhead that parallelizing the
+// two sweeps would add. Run sequentially; if a future profile ever
+// shows the sweep itself blocking concurrent get() calls under a
+// hot-cache workload, that's the trigger to revisit.
+func (p *PartitionPruner) cleanupLoop(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			p.logger.Info().Msg("Partition pruner cache janitor stopped")
+			return
+		case <-ticker.C:
+			p.CleanupGlobCache()
+			p.CleanupPartitionCache()
+		}
+	}
 }
 
 // GetGlobCacheStats returns glob cache statistics
