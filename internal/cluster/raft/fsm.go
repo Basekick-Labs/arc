@@ -550,7 +550,7 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 	case CommandRevokeToken:
 		return f.applyRevokeToken(cmd.Payload, log.Index)
 	case CommandDeleteToken:
-		return f.applyDeleteToken(cmd.Payload)
+		return f.applyDeleteToken(cmd.Payload, log.Index)
 	case CommandRotateToken:
 		return f.applyRotateToken(cmd.Payload, log.Index)
 	default:
@@ -1379,13 +1379,13 @@ func (f *ClusterFSM) applyRevokeToken(payload []byte, logIndex uint64) interface
 	return nil
 }
 
-func (f *ClusterFSM) applyDeleteToken(payload []byte) interface{} {
+func (f *ClusterFSM) applyDeleteToken(payload []byte, logIndex uint64) interface{} {
 	var p DeleteTokenPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fmt.Errorf("failed to unmarshal delete token payload: %w", err)
 	}
 	if p.ID == 0 {
-		return fmt.Errorf("delete token: id is required")
+		return f.rejectToken("delete", 0, logIndex, fmt.Errorf("id is required"))
 	}
 
 	f.mu.Lock()

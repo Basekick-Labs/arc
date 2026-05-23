@@ -81,7 +81,12 @@ func (p *CoordinatorAuthProposer) Propose(ctx context.Context, cmdType uint8, pa
 	forwardCtx, cancel := context.WithTimeout(p.coord.ctxOrBackground(), timeout)
 	defer cancel()
 	// Caller's context wins if it cancels first; we merge via select.
-	mergedCtx := mergeContexts(ctx, forwardCtx)
+	// mergedCancel must be deferred so the watcher goroutine inside
+	// mergeContexts exits as soon as forwardApplyToLeader returns,
+	// rather than waiting up to forwardCtx's full timeout (Gemini
+	// #451 round-4).
+	mergedCtx, mergedCancel := mergeContexts(ctx, forwardCtx)
+	defer mergedCancel()
 	if err := p.coord.forwardApplyToLeader(mergedCtx, cmd); err != nil {
 		return wrapApplyError(err)
 	}
@@ -108,21 +113,22 @@ func wrapApplyError(err error) error {
 }
 
 // mergeContexts returns a context that cancels when EITHER input
-// cancels. The returned context inherits values from `a` (the
-// caller-supplied request context, which typically carries trace IDs,
-// loggers, and other request-scoped metadata that downstream code may
-// need), and additionally cancels when `b` (the deadline-bounded
-// forward-apply context) cancels.
+// cancels, plus a CancelFunc the caller MUST defer.
 //
-// Gemini #451 review feedback: an earlier version parented on
-// context.Background, which discarded values from both inputs and
-// would break observability the moment any caller added a logger or
-// trace ID via context.WithValue.
+// The returned context inherits values from `a` (the caller-supplied
+// request context, which carries trace IDs, loggers, and other
+// request-scoped metadata) and additionally cancels when `b` (the
+// deadline-bounded forward-apply context) cancels.
 //
-// The merged context's deadline is the earlier of `a`'s and `b`'s,
-// because cancelling on either input's Done is what makes the merge
-// useful.
-func mergeContexts(a, b context.Context) context.Context {
+// **Always defer the returned cancel.** Without it, the watcher
+// goroutine keeps running until `b`'s 5-second timeout, leaking one
+// goroutine per call even when forwardApplyToLeader returns
+// immediately. Gemini #451 round-4 review.
+//
+// Earlier versions: parented on context.Background (round 1 → dropped
+// values; fixed in round 1); leaked the watcher goroutine on early
+// return (round 4 → returns CancelFunc; fixed here).
+func mergeContexts(a, b context.Context) (context.Context, context.CancelFunc) {
 	merged, cancel := context.WithCancel(a)
 	go func() {
 		select {
@@ -131,7 +137,7 @@ func mergeContexts(a, b context.Context) context.Context {
 		case <-merged.Done():
 		}
 	}()
-	return merged
+	return merged, cancel
 }
 
 // ToAuthTokenEntry converts a cluster.raft.TokenEntry (the FSM-side
