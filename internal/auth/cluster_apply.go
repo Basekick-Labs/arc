@@ -211,7 +211,10 @@ func (am *AuthManager) ApplyUpdateToken(entry ClusterTokenEntry) error {
 	if err != nil {
 		return fmt.Errorf("ApplyUpdateToken: %w", err)
 	}
-	rows, _ := result.RowsAffected()
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("ApplyUpdateToken: rows affected: %w", err)
+	}
 	if rows == 0 {
 		// Cluster FSM holds this token but our local SQLite doesn't. Most
 		// likely cause: the local row was manually deleted, or the FSM
@@ -246,7 +249,10 @@ func (am *AuthManager) ApplyRevokeToken(id int64) error {
 	if err != nil {
 		return fmt.Errorf("ApplyRevokeToken: %w", err)
 	}
-	rows, _ := result.RowsAffected()
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("ApplyRevokeToken: rows affected: %w", err)
+	}
 	if rows == 0 {
 		am.logger.Error().
 			Int64("token_id", id).
@@ -274,7 +280,10 @@ func (am *AuthManager) ApplyDeleteToken(id int64) error {
 	if err != nil {
 		return fmt.Errorf("ApplyDeleteToken: %w", err)
 	}
-	rows, _ := result.RowsAffected()
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("ApplyDeleteToken: rows affected: %w", err)
+	}
 	if rows == 0 {
 		am.logger.Warn().
 			Int64("token_id", id).
@@ -301,7 +310,10 @@ func (am *AuthManager) ApplyRotateToken(id int64, newHash, newPrefix string) err
 	if err != nil {
 		return fmt.Errorf("ApplyRotateToken: %w", err)
 	}
-	rows, _ := result.RowsAffected()
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("ApplyRotateToken: rows affected: %w", err)
+	}
 	if rows == 0 {
 		am.logger.Error().
 			Int64("token_id", id).
