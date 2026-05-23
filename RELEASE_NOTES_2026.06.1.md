@@ -583,6 +583,42 @@ The cost model is linear in **file count**, not row count — so the speedup gro
 
 Tests added: `TestArcxStorageRootIsSetOnEveryConn` (opt-in integration test, requires `ARCX_TEST_PATH`; CI does not set it) confirms the setting is applied across **distinct pool connections** so a rolling failover to a fresh pool member doesn't break the function. Five validation tests cover the denylist behavior.
 
+### Cluster Auth Convergence — Phase A (token replication) (Enterprise)
+
+Before 26.06.1, every Arc Enterprise cluster node carried its **own** SQLite auth DB (`auth.db_path`, default `./data/arc.db`). A token created via `POST /api/v1/auth/tokens` on the writer was **not** valid on the reader — the reader's local SQLite never saw the row. Operators worked around this by setting `ARC_AUTH_BOOTSTRAP_TOKEN` to the same value on every node, but **API-created tokens and revocations did not propagate**. Combined: a security-incident-response revocation on the writer left the same token still valid on every reader for the lifetime of the affected reader process — a real customer-visible auth gap that nothing in the cluster protocol fixed automatically.
+
+26.06.1 closes this for the `api_tokens` surface. Auth **writes** are now routed through the existing Raft FSM (the same FSM that already holds node membership, the file manifest, and the compactor lease). Auth **reads** stay local-cache-fast — no Raft round trip on every API call. End-to-end behaviour: a token created on any node propagates to every node's local SQLite within one Raft commit (typically <50ms over loopback); a revocation invalidates the cached `*TokenInfo` on every node in the same window.
+
+**Architecture.** A new `RaftProposer` interface on `*AuthManager` (`internal/auth/raft_proposer.go`) supplies the seam. In OSS / standalone (no cluster) the proposer is nil and writes hit local SQLite directly — **OSS path is byte-identical to pre-26.06.1**. In cluster mode, writes are marshalled into one of five new Raft commands (`CommandCreateToken=12`, `CommandUpdateToken=13`, `CommandRevokeToken=14`, `CommandDeleteToken=15`, `CommandRotateToken=16`) and proposed via `cluster.CoordinatorAuthProposer` — leader applies directly, followers forward to the leader using the same `forwardApplyToLeader` plumbing as the file manifest. Every node's FSM materialises the result into its local SQLite via `AuthManager.ApplyCreateToken` / `ApplyUpdateToken` / `ApplyRevokeToken` / `ApplyDeleteToken` / `ApplyRotateToken`, then calls `InvalidateCache()` so the next `VerifyToken` reflects the new state.
+
+**Plaintext-secrecy invariant.** The plaintext token value is generated on the proposing node, bcrypt-hashed in-process, and returned to the API caller out-of-band. **Only the bcrypt hash + prefix go into the Raft payload** — the plaintext never crosses the wire, never lands in the Raft log, and never lands in any FSM snapshot. Pinned by `TestTwoNodeAuth_CreateOnAVerifyOnB`, which snapshots both FSMs after the round-trip and `strings.Contains`-greps the persisted blob for the plaintext substring.
+
+**Deterministic token IDs.** New tokens are stamped with `ID = raft.Log.Index` (mirror of the `FileEntry.LSN` pattern from the file manifest). Both nodes apply the same log entry at the same index and produce the same `INSERT OR IGNORE INTO api_tokens(id, ...)` row, so the SQLite primary key is identical on every node. Existing rows (from pre-26.06.1 deployments) keep their `AUTOINCREMENT` IDs; both shapes fit in `INTEGER`.
+
+**Applier-side validation.** Every token command runs `validateTokenEntry` on the applier — same precedent as the manifest path validation shipped in PR #446. Empty name, missing bcrypt hash, missing prefix, invalid permission string, or `created_at == 0` cause the entry to be rejected on every node (the malicious entry never lands in `f.tokens` and never propagates to local SQLite), the `arc_cluster_auth_rejected_total` counter increments, and an `Error` log line surfaces the rejection reason. The Raft entry itself still commits (hashicorp/raft's commit machinery is upstream of `fsm.Apply`); the security property is that **every node's FSM independently refuses to put the malicious token into its state**.
+
+**Bootstrap idempotency.** `EnsureInitialToken` now routes through Raft when in cluster mode. All nodes call it on boot with their own randomly-generated bootstrap token; only the Raft leader's proposal lands, the FSM's `applyCreateToken` rejects the others with `"token name already exists"` (matching the `api_tokens(name)` `UNIQUE` constraint), and the proposer treats that error as success-with-no-banner. Net effect: exactly one node prints the `Admin API token:` banner per cluster boot — the leader.
+
+**No migration of pre-existing tokens.** Tokens created on a pre-26.06.1 node by the local-only API path remain valid **only on that node** after upgrade. Operators are expected to re-issue API tokens through the new replicated path so they take effect cluster-wide. Bootstrap tokens set via `ARC_AUTH_BOOTSTRAP_TOKEN` are unaffected if the same value was used on every node (which the previous workaround required).
+
+**Operator-facing changes.**
+
+- **No new env vars.** `auth.db_path` and `ARC_AUTH_BOOTSTRAP_TOKEN` work as before.
+- **Bootstrap banner now prints on only one node** (the Raft leader). Other nodes log at `Info`: `"EnsureInitialToken: token already exists in cluster, no banner emitted on this node"`.
+- **New Prometheus counters**:
+  - `arc_cluster_auth_apply_create_total` / `arc_cluster_auth_apply_update_total` / `arc_cluster_auth_apply_revoke_total` / `arc_cluster_auth_apply_delete_total` / `arc_cluster_auth_apply_rotate_total` — count of applies on this node, per command. Healthy cluster: every node sees the same monotonic count (they all apply the same Raft log).
+  - `arc_cluster_auth_rejected_total` — applier-side validation refusals. Non-zero growth is the security alerting signal: somebody is proposing invalid tokens (malformed bcrypt hash, missing prefix, empty name, malformed permission string).
+- **Rolling upgrade is supported.** The new command types are additive (12-16 in the existing `CommandType` enum); a pre-26.06.1 follower receiving a 26.06.1 token command will reject it at the FSM with `unknown command type`, but the protocol allows mixed-version operation for a short window. The supported path is still a full cluster restart with all binaries upgraded together.
+
+**Out of scope for Phase A** (tracked as Phase A.1 / A.2 / B in [project_cluster_auth.md](memory/project_cluster_auth.md)):
+
+- **RBAC commands** (`organizations`, `teams`, `roles`, `measurement_permissions`, `token_memberships`) — same FSM shape as tokens, ~12 more applies, lands in 26.07.1.
+- **SSO / OIDC / LDAP** — Phase B, separate roadmap item.
+- **Audit log replication** — never; intentionally per-node (high-volume append-only, no consensus requirement).
+- **Read-after-write `Barrier`** — eventual consistency (Strategy A) is the contract today; sub-50ms typical convergence makes a per-query Raft barrier unnecessary for the customer surface, and SDKs already retry on transient 401. Phase A.2 only if a real customer report lands.
+
+Tests added: 16 FSM-level tests in `internal/cluster/raft/fsm_token_test.go` (apply success + every validation rejection shape + ID-stamping-from-log-index + prefix-index maintenance + snapshot round-trip + idempotent replay of unknown-ID revoke/delete); 5 AuthManager round-trip tests in `internal/auth/cluster_proposer_test.go` (proposer-nil OSS fallthrough, create→VerifyToken via proposer, revoke→cache-invalidation via proposer, `EnsureFirstToken` no-op-on-loser path, wire-format JSON round-trip pinning); 2 two-node integration tests in `internal/cluster/auth_cluster_integration_test.go` (create-on-A → verify-on-B success; revoke-on-A → invalidate-on-B; plaintext-non-leak via snapshot grep). All under `-race`.
+
 ## Bug Fixes
 
 ### S3-Backed Retention/Delete: RSS Recovery After Long Sweeps (PR #420)
