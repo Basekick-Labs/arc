@@ -1,9 +1,66 @@
 package auth
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 )
+
+// proposeTimeout caps how long a single AuthManager write will wait for
+// a Raft apply (whether direct on the leader or forwarded to it).
+// Matches the timeout used by internal/cluster/file_registrar.go for
+// CommandRegisterFile.
+const proposeTimeout = 5 * time.Second
+
+// SetRaftProposer wires the cluster's Raft FSM into AuthManager. Calling
+// this with a non-nil proposer flips every subsequent CreateToken /
+// UpdateToken / RevokeToken / DeleteToken / RotateToken from direct-
+// SQLite to a Raft-proposed apply. Calling it with nil flips back to
+// direct-SQLite (used by tests and by graceful shutdown). Safe to call
+// concurrently with active writes; the proposer is read under proposerMu.
+func (am *AuthManager) SetRaftProposer(p RaftProposer) {
+	am.proposerMu.Lock()
+	am.proposer = p
+	am.proposerMu.Unlock()
+}
+
+// getProposer returns the current proposer (or nil) under the read lock.
+// Hot-path writes call this once and operate on the snapshot — if a
+// concurrent SetRaftProposer flips it, the in-flight write completes
+// against whichever proposer was active when it started, which is the
+// behaviour we want (avoids torn writes).
+func (am *AuthManager) getProposer() RaftProposer {
+	am.proposerMu.RLock()
+	defer am.proposerMu.RUnlock()
+	return am.proposer
+}
+
+// proposeCommand marshals the payload, wraps it in the proposer's
+// expected envelope (commandType + bytes), and submits via the
+// proposer. Returns nil on a successful FSM apply on the leader (the
+// apply has already mutated the in-memory FSM map AND triggered the
+// onTokenXxx callback on the leader; follower applies happen
+// asynchronously within the usual <50ms Raft replication window).
+//
+// On the proposer node itself (whether leader or follower), the
+// callback has already fired by the time this returns — so the local
+// SQLite materialise is done. The caller can rely on a subsequent
+// VerifyToken on this node seeing the new state.
+func (am *AuthManager) proposeCommand(ctx context.Context, cmdType uint8, payload interface{}) error {
+	p := am.getProposer()
+	if p == nil {
+		return fmt.Errorf("auth: proposer not configured (cluster mode required)")
+	}
+	bytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("auth: marshal payload: %w", err)
+	}
+	if err := p.Propose(ctx, cmdType, bytes, proposeTimeout); err != nil {
+		return err
+	}
+	return nil
+}
 
 // ClusterTokenEntry is the FSM-side projection of an api_tokens row.
 // The cluster package's TokenEntry mirrors this shape; we duplicate the
@@ -24,6 +81,30 @@ type ClusterTokenEntry struct {
 	ExpiresAtUnixNano int64
 	Enabled           bool
 	LSN               uint64
+}
+
+// clusterTokenEntryWire is the JSON-tagged wire form of ClusterTokenEntry,
+// used when AuthManager marshals a CreateTokenPayload / UpdateTokenPayload
+// for the proposer. The JSON tags MUST match the cluster.raft.TokenEntry
+// field tags exactly — drift here means the FSM apply on the leader
+// sees zero-valued fields and the apply silently writes a broken row.
+//
+// Mirror is pinned by a test in Step 7 (internal/cluster/raft/
+// fsm_test.go's TestProposalWirePinning) that round-trips a
+// clusterTokenEntryWire through json.Marshal into a TokenEntry and
+// asserts every field survives. Any future field addition needs both
+// sides updated AND the pinning test extended.
+type clusterTokenEntryWire struct {
+	ID                int64  `json:"id"`
+	Name              string `json:"name"`
+	Description       string `json:"description,omitempty"`
+	Permissions       string `json:"permissions"`
+	TokenHash         string `json:"token_hash"`
+	TokenPrefix       string `json:"token_prefix"`
+	CreatedAtUnixNano int64  `json:"created_at_unix_nano"`
+	ExpiresAtUnixNano int64  `json:"expires_at_unix_nano,omitempty"`
+	Enabled           bool   `json:"enabled"`
+	LSN               uint64 `json:"lsn,omitempty"`
 }
 
 // ApplyCreateToken materialises a CreateToken Raft apply into local

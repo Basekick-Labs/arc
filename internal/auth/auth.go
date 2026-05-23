@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -55,6 +56,21 @@ type AuthManager struct {
 
 	cleanupDone chan struct{}
 	logger      zerolog.Logger
+
+	// proposer is the Raft seam for cluster-wide auth state replication.
+	// When non-nil (Enterprise cluster mode), every write method routes
+	// through here so the change applies on every node via the FSM. When
+	// nil (OSS / standalone), the write methods fall through to the
+	// existing direct-SQLite path — runtime behavior unchanged for OSS.
+	// Set via SetRaftProposer, typically once at startup from
+	// cmd/arc/main.go after both AuthManager and the cluster coordinator
+	// are constructed. Phase A: Cluster Auth Convergence.
+	//
+	// proposerMu guards reads of `proposer` against the rare reconfigure
+	// case (Stop() unsetting it during shutdown). All hot-path writes
+	// take it for read.
+	proposer   RaftProposer
+	proposerMu sync.RWMutex
 }
 
 // Logger returns the auth component logger.
@@ -415,8 +431,54 @@ func (am *AuthManager) CreateToken(name, description, permissions string, expire
 	if err != nil {
 		return "", fmt.Errorf("failed to hash token: %w", err)
 	}
+	prefix := tokenPrefix(token)
 
-	if err := am.insertToken(hash, tokenPrefix(token), name, description, permissions, expiresAt); err != nil {
+	// Normalise permissions to match SQLite-direct behaviour from
+	// insertToken (an empty string means "read,write"). Done here so both
+	// the cluster-propose path and the direct-SQLite path see the same
+	// stored value.
+	if permissions == "" {
+		permissions = "read,write"
+	}
+
+	// Cluster mode: propose via Raft, which runs ApplyCreateToken on every
+	// node (including this one) and writes to local SQLite via the apply
+	// callback. The plaintext token value never lands in the Raft log —
+	// only the bcrypt hash and prefix. Returned to the caller out of band.
+	if am.getProposer() != nil {
+		var expiresAtNano int64
+		if expiresAt != nil {
+			expiresAtNano = expiresAt.UnixNano()
+		}
+		// Use clusterTokenEntryWire mirroring fsm.go's TokenEntry. The
+		// proposer wraps this payload struct in a raft.Command envelope.
+		payload := struct {
+			Token clusterTokenEntryWire `json:"token"`
+		}{
+			Token: clusterTokenEntryWire{
+				Name:              name,
+				Description:       description,
+				Permissions:       permissions,
+				TokenHash:         hash,
+				TokenPrefix:       prefix,
+				CreatedAtUnixNano: time.Now().UnixNano(),
+				ExpiresAtUnixNano: expiresAtNano,
+				Enabled:           true,
+			},
+		}
+		if err := am.proposeCommand(context.Background(), ProposalCommandCreateToken, payload); err != nil {
+			return "", fmt.Errorf("create token: %w", err)
+		}
+		am.logger.Info().
+			Str("name", name).
+			Str("permissions", permissions).
+			Msg("Created API token via Raft")
+		return token, nil
+	}
+
+	// Standalone / OSS: direct SQLite write, unchanged from pre-Phase-A
+	// behaviour.
+	if err := am.insertToken(hash, prefix, name, description, permissions, expiresAt); err != nil {
 		return "", err
 	}
 
@@ -665,6 +727,45 @@ func (am *AuthManager) GetTokenByID(id int64) (*TokenInfo, error) {
 
 // UpdateToken updates token metadata
 func (am *AuthManager) UpdateToken(id int64, name, description, permissions *string, expiresAt *time.Time) error {
+	// Cluster mode: propose via Raft with a ChangedFields list so the FSM
+	// applier knows which fields are "leave alone" vs "set to empty".
+	if am.getProposer() != nil {
+		var changed []string
+		payload := struct {
+			ID                int64    `json:"id"`
+			Name              string   `json:"name,omitempty"`
+			Description       string   `json:"description,omitempty"`
+			Permissions       string   `json:"permissions,omitempty"`
+			ExpiresAtUnixNano int64    `json:"expires_at_unix_nano,omitempty"`
+			ChangedFields     []string `json:"changed_fields"`
+		}{ID: id}
+		if name != nil {
+			payload.Name = *name
+			changed = append(changed, "name")
+		}
+		if description != nil {
+			payload.Description = *description
+			changed = append(changed, "description")
+		}
+		if permissions != nil {
+			payload.Permissions = *permissions
+			changed = append(changed, "permissions")
+		}
+		if expiresAt != nil {
+			payload.ExpiresAtUnixNano = expiresAt.UnixNano()
+			changed = append(changed, "expires_at")
+		}
+		if len(changed) == 0 {
+			return nil
+		}
+		payload.ChangedFields = changed
+		if err := am.proposeCommand(context.Background(), ProposalCommandUpdateToken, payload); err != nil {
+			return fmt.Errorf("update token: %w", err)
+		}
+		return nil
+	}
+
+	// Standalone / OSS: direct SQLite.
 	var updates []string
 	var args []interface{}
 
@@ -708,6 +809,17 @@ func (am *AuthManager) UpdateToken(id int64, name, description, permissions *str
 
 // DeleteToken deletes a token by ID
 func (am *AuthManager) DeleteToken(id int64) error {
+	if am.getProposer() != nil {
+		payload := struct {
+			ID int64 `json:"id"`
+		}{ID: id}
+		if err := am.proposeCommand(context.Background(), ProposalCommandDeleteToken, payload); err != nil {
+			return fmt.Errorf("delete token: %w", err)
+		}
+		am.logger.Info().Int64("token_id", id).Msg("Deleted API token via Raft")
+		return nil
+	}
+
 	result, err := am.db.Exec("DELETE FROM api_tokens WHERE id = ?", id)
 	if err != nil {
 		return err
@@ -725,6 +837,17 @@ func (am *AuthManager) DeleteToken(id int64) error {
 
 // RevokeToken disables a token
 func (am *AuthManager) RevokeToken(id int64) error {
+	if am.getProposer() != nil {
+		payload := struct {
+			ID int64 `json:"id"`
+		}{ID: id}
+		if err := am.proposeCommand(context.Background(), ProposalCommandRevokeToken, payload); err != nil {
+			return fmt.Errorf("revoke token: %w", err)
+		}
+		am.logger.Info().Int64("token_id", id).Msg("Revoked API token via Raft")
+		return nil
+	}
+
 	result, err := am.db.Exec("UPDATE api_tokens SET enabled = 0 WHERE id = ?", id)
 	if err != nil {
 		return err
@@ -755,6 +878,21 @@ func (am *AuthManager) RotateToken(id int64) (string, error) {
 	// Generate new prefix for O(1) lookup optimization
 	prefix := tokenPrefix(token)
 
+	// Cluster mode: propose via Raft. The plaintext token is returned to
+	// the caller out of band — only hash + prefix go through the log.
+	if am.getProposer() != nil {
+		payload := struct {
+			ID        int64  `json:"id"`
+			NewHash   string `json:"new_hash"`
+			NewPrefix string `json:"new_prefix"`
+		}{ID: id, NewHash: hash, NewPrefix: prefix}
+		if err := am.proposeCommand(context.Background(), ProposalCommandRotateToken, payload); err != nil {
+			return "", fmt.Errorf("rotate token: %w", err)
+		}
+		am.logger.Info().Int64("token_id", id).Msg("Rotated API token via Raft")
+		return token, nil
+	}
+
 	result, err := am.db.Exec("UPDATE api_tokens SET token_hash = ?, token_prefix = ? WHERE id = ?", hash, prefix, id)
 	if err != nil {
 		return "", err
@@ -773,19 +911,60 @@ func (am *AuthManager) RotateToken(id int64) (string, error) {
 // ensureFirstToken is the shared implementation for EnsureInitialToken and EnsureInitialTokenWithValue.
 // It uses INSERT OR IGNORE to atomically create a token only when none exist, avoiding a TOCTOU race.
 // Returns the token value if a new token was created, or empty string if one already existed.
+//
+// In cluster mode this routes through Raft: every node calls ensureFirstToken
+// with its own (random) tokenValue on boot, but only one Raft proposal can
+// succeed cluster-wide. The FSM applier rejects subsequent CreateToken
+// commands whose Name = "admin" with a "token name already exists" error;
+// non-winning nodes get that back from proposeCommand and treat it as
+// "already initialised" (empty string return — same shape as the SQLite
+// path's "rows == 0" check). The plaintext is only known to the proposer
+// and only the winning leader prints the banner.
 func (am *AuthManager) ensureFirstToken(tokenValue, description string) (string, error) {
 	hash, err := am.hashToken(tokenValue)
 	if err != nil {
 		return "", fmt.Errorf("failed to hash token: %w", err)
 	}
+	prefix := tokenPrefix(tokenValue)
 
+	if am.getProposer() != nil {
+		payload := struct {
+			Token clusterTokenEntryWire `json:"token"`
+		}{
+			Token: clusterTokenEntryWire{
+				Name:              "admin",
+				Description:       description,
+				Permissions:       "read,write,delete,admin",
+				TokenHash:         hash,
+				TokenPrefix:       prefix,
+				CreatedAtUnixNano: time.Now().UnixNano(),
+				Enabled:           true,
+			},
+		}
+		err := am.proposeCommand(context.Background(), ProposalCommandCreateToken, payload)
+		if err != nil {
+			// "Already exists" is the expected non-winner path on every
+			// node except the Raft leader that won the bootstrap race.
+			// Surface it as "no new token" (empty string return), same
+			// shape as the SQLite "rows == 0" branch below. Any other
+			// error (forwarding failed, FSM apply timeout) is real and
+			// gets surfaced.
+			if strings.Contains(err.Error(), "already exists") {
+				return "", nil
+			}
+			return "", err
+		}
+		return tokenValue, nil
+	}
+
+	// Standalone / OSS: direct SQLite path.
 	// Use a single atomic statement: INSERT only if the table is empty.
 	// This eliminates the COUNT→INSERT race when multiple nodes start simultaneously.
 	result, err := am.db.Exec(`
 		INSERT OR IGNORE INTO api_tokens (name, token_hash, token_prefix, description, permissions)
 		SELECT 'admin', ?, ?, ?, 'read,write,delete,admin'
 		WHERE NOT EXISTS (SELECT 1 FROM api_tokens)
-	`, hash, tokenPrefix(tokenValue), description)
+	`, hash, prefix, description)
 	if err != nil {
 		return "", fmt.Errorf("failed to create initial token: %w", err)
 	}
@@ -826,8 +1005,42 @@ func (am *AuthManager) CreateTokenWithValue(tokenValue, name, description, permi
 	if err != nil {
 		return "", fmt.Errorf("failed to hash token: %w", err)
 	}
+	prefix := tokenPrefix(tokenValue)
+	if permissions == "" {
+		permissions = "read,write"
+	}
 
-	if err := am.insertToken(hash, tokenPrefix(tokenValue), name, description, permissions, expiresAt); err != nil {
+	// Cluster mode: propose via Raft — same shape as CreateToken.
+	if am.getProposer() != nil {
+		var expiresAtNano int64
+		if expiresAt != nil {
+			expiresAtNano = expiresAt.UnixNano()
+		}
+		payload := struct {
+			Token clusterTokenEntryWire `json:"token"`
+		}{
+			Token: clusterTokenEntryWire{
+				Name:              name,
+				Description:       description,
+				Permissions:       permissions,
+				TokenHash:         hash,
+				TokenPrefix:       prefix,
+				CreatedAtUnixNano: time.Now().UnixNano(),
+				ExpiresAtUnixNano: expiresAtNano,
+				Enabled:           true,
+			},
+		}
+		if err := am.proposeCommand(context.Background(), ProposalCommandCreateToken, payload); err != nil {
+			return "", fmt.Errorf("create token with value: %w", err)
+		}
+		am.logger.Info().
+			Str("name", name).
+			Str("permissions", permissions).
+			Msg("Created API token with provided value via Raft")
+		return tokenValue, nil
+	}
+
+	if err := am.insertToken(hash, prefix, name, description, permissions, expiresAt); err != nil {
 		return "", err
 	}
 
