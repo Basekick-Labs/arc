@@ -1270,8 +1270,8 @@ func (f *ClusterFSM) applyUpdateToken(payload []byte, logIndex uint64) interface
 	// Apply each changed field. Empty Name/Permissions in p are taken as
 	// "leave unchanged" UNLESS the field is listed in ChangedFields.
 	changed := make(map[string]bool, len(p.ChangedFields))
-	for _, f := range p.ChangedFields {
-		changed[f] = true
+	for _, field := range p.ChangedFields {
+		changed[field] = true
 	}
 	if changed["name"] {
 		// Enforce cluster-wide name uniqueness for the new name.

@@ -941,20 +941,28 @@ func (am *AuthManager) ensureFirstToken(tokenValue, description string) (string,
 				Enabled:           true,
 			},
 		}
-		err := am.proposeCommand(context.Background(), ProposalCommandCreateToken, payload)
-		if err != nil {
-			// "Already exists" is the expected non-winner path on every
-			// node except the Raft leader that won the bootstrap race.
-			// Surface it as "no new token" (empty string return), same
-			// shape as the SQLite "rows == 0" branch below. Any other
-			// error (forwarding failed, FSM apply timeout) is real and
-			// gets surfaced.
+		// Cluster bootstrap can race a Raft leader-flap window: WaitForLeader
+		// in main.go observed an election, but by the time we ship the
+		// proposal the leader may have stepped down. A short, bounded retry
+		// for ErrLeaderUnknown lets us ride out a single re-election (~1-2s)
+		// without surfacing a scary error to the operator. "Already exists"
+		// is still an immediate empty-return (the leader applied a peer's
+		// proposal before ours).
+		var err error
+		for attempt := 0; attempt < 3; attempt++ {
+			err = am.proposeCommand(context.Background(), ProposalCommandCreateToken, payload)
+			if err == nil {
+				return tokenValue, nil
+			}
 			if strings.Contains(err.Error(), "already exists") {
 				return "", nil
 			}
-			return "", err
+			if !errors.Is(err, ErrLeaderUnknown) {
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
 		}
-		return tokenValue, nil
+		return "", err
 	}
 
 	// Standalone / OSS: direct SQLite path.

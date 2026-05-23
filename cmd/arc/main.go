@@ -862,8 +862,12 @@ func main() {
 	// Phase A: assigned inside the auth-enabled branch below; invoked
 	// either immediately (OSS / non-clustered) or after the Raft proposer
 	// is wired (cluster mode). Function scope so the cluster wire-up branch
-	// can reach it.
+	// can reach it. `bootstrapRan` tracks whether the closure has been
+	// invoked, so the cluster-init-failure fallback later in main() can
+	// detect "deferred but never ran" without double-banners on the
+	// happy path.
 	var runInitialTokenBootstrap func()
+	var bootstrapRan bool
 	if cfg.Auth.Enabled {
 		authManager, err = auth.NewAuthManager(
 			cfg.Auth.DBPath,
@@ -892,6 +896,7 @@ func main() {
 		// independently creates its own admin token in its own SQLite (the
 		// original OSS behaviour) and four banners print instead of one.
 		runInitialTokenBootstrap = func() {
+			bootstrapRan = true
 			var bootstrapToken string
 			var bootstrapErr error
 			if cfg.Auth.ForceBootstrap && cfg.Auth.BootstrapToken != "" {
@@ -1486,15 +1491,16 @@ func main() {
 
 	// Phase A: fallback bootstrap. If we deferred the initial-token
 	// bootstrap above on the expectation that cluster mode would wire
-	// the Raft proposer, but the cluster startup actually failed (e.g.
-	// Raft transport refuse, peer-replication secret missing, FSM
-	// init error), runInitialTokenBootstrap was never invoked and the
-	// operator would have no admin token. Run it now in OSS-fallthrough
-	// mode so the system stays usable. The closure itself is idempotent
-	// via the underlying INSERT OR IGNORE path — if tokens already exist
-	// from a previous start, this is a no-op and prints no banner.
-	if authManager != nil && clusterCoordinator == nil && runInitialTokenBootstrap != nil {
-		log.Warn().Msg("Cluster coordinator did not start; running initial token bootstrap in standalone fallback mode")
+	// the Raft proposer, but the proposer never landed (cluster
+	// coordinator failed to start; coordinator started but raftFSM is
+	// nil because RaftDataDir was empty; SetRaftProposer branch was
+	// otherwise skipped), the operator would have no admin token.
+	// Run it now in OSS-fallthrough mode so the system stays usable.
+	// The closure itself sets bootstrapRan, and ensureFirstToken's
+	// underlying SQLite path is idempotent — re-running on subsequent
+	// boots is a no-op.
+	if authManager != nil && runInitialTokenBootstrap != nil && !bootstrapRan {
+		log.Warn().Msg("Cluster auth proposer was never wired (e.g. cluster init failed, or RaftDataDir empty); running initial token bootstrap in standalone fallback mode")
 		runInitialTokenBootstrap()
 	}
 

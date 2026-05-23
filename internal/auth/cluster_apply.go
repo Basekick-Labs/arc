@@ -2,7 +2,9 @@ package auth
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -113,9 +115,13 @@ type clusterTokenEntryWire struct {
 // truth for the SQLite write — see the plan's "FSM is source of truth"
 // decision).
 //
-// Idempotent: if a row with this ID already exists (log replay after a
-// crash), the INSERT OR IGNORE is a no-op. The FSM's own validation
-// already happened before this is called, so we don't re-validate here.
+// Idempotency vs. divergence detection: log replay can re-apply the
+// same CommandCreateToken (FSM snapshot older than last applied index),
+// so we must accept "row already exists with identical fields" as a
+// no-op. But a row at the same ID with a DIFFERENT hash means an
+// upgrade-in-place left a pre-26.06.1 AUTOINCREMENT row colliding
+// with the Raft-stamped log-index ID space — surface that loudly
+// rather than silently dropping the cluster-authoritative apply.
 //
 // Cache invalidate happens unconditionally so concurrent VerifyToken
 // calls on this node pick up the new row on next check.
@@ -132,17 +138,53 @@ func (am *AuthManager) ApplyCreateToken(entry ClusterTokenEntry) error {
 	if entry.Enabled {
 		enabled = 1
 	}
-	// INSERT OR IGNORE so log replay (which can re-apply the same
-	// CommandCreateToken when the FSM's snapshot is older than the
-	// last applied index) doesn't duplicate the row. The FSM is the
-	// authoritative state; SQLite is the materialised cache.
-	_, err := am.db.Exec(`
-		INSERT OR IGNORE INTO api_tokens
+
+	// Phase A: detect existing-row-with-different-content collisions
+	// (the upgrade-in-place divergence shape) before INSERTing. The
+	// FSM is the cluster-authoritative state; SQLite is the materialised
+	// cache. If a pre-26.06.1 AUTOINCREMENT row at this ID exists and
+	// carries DIFFERENT content than the Raft apply, silently
+	// overwriting would hide the divergence and silently no-oping
+	// would diverge the cache from the FSM. Surface it loudly so the
+	// operator can decide.
+	var existingHash, existingName string
+	queryErr := am.db.QueryRow(
+		`SELECT token_hash, name FROM api_tokens WHERE id = ?`,
+		entry.ID,
+	).Scan(&existingHash, &existingName)
+	switch {
+	case queryErr == nil:
+		// Row exists. Idempotent replay: identical hash + name → no-op.
+		// (Log replay re-applies the same CommandCreateToken when the
+		// FSM snapshot is older than the last applied index.)
+		if existingHash == entry.TokenHash && existingName == entry.Name {
+			am.InvalidateCache()
+			return nil
+		}
+		// Divergence: pre-existing local row at this ID has different
+		// content. Refusing to overwrite preserves the operator's
+		// ability to log in via the old token; surfacing the error
+		// makes the upgrade hazard visible. Operator action: drop
+		// the diverging local auth.db rows before re-joining the
+		// cluster, or accept the local-only behaviour (the cluster's
+		// authoritative state stays in the FSM in-memory map).
+		return fmt.Errorf("ApplyCreateToken: id %d already exists locally with different token (cluster<->local divergence; see upgrade notes for pre-26.06.1 tokens)", entry.ID)
+	case errors.Is(queryErr, sql.ErrNoRows):
+		// Expected fresh-row path; fall through to INSERT.
+	default:
+		return fmt.Errorf("ApplyCreateToken: pre-insert lookup: %w", queryErr)
+	}
+
+	if _, insertErr := am.db.Exec(`
+		INSERT INTO api_tokens
 			(id, name, token_hash, token_prefix, description, permissions, created_at, expires_at, enabled)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, entry.ID, entry.Name, entry.TokenHash, entry.TokenPrefix, entry.Description, entry.Permissions, createdAt, expiresAt, enabled)
-	if err != nil {
-		return fmt.Errorf("ApplyCreateToken: insert: %w", err)
+	`, entry.ID, entry.Name, entry.TokenHash, entry.TokenPrefix, entry.Description, entry.Permissions, createdAt, expiresAt, enabled); insertErr != nil {
+		// A name-collision (UNIQUE(name) constraint) here would mean
+		// the cluster applied a Raft-stamped row whose name conflicts
+		// with a pre-existing AUTOINCREMENT row — same upgrade hazard
+		// from the opposite direction. Surface it.
+		return fmt.Errorf("ApplyCreateToken: insert: %w", insertErr)
 	}
 	am.InvalidateCache()
 	return nil
