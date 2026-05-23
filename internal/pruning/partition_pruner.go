@@ -272,7 +272,7 @@ type PartitionPruner struct {
 	// goroutine per pruner. Idempotent on repeat calls — second and
 	// later invocations log a warn and return without spawning. Guards
 	// against a future hot-reload or test refactor accidentally
-	// multiplying goroutines silently. Internal-review M1 on PR #450.
+	// multiplying goroutines silently.
 	cleanupStarted atomic.Bool
 }
 
@@ -954,7 +954,6 @@ const DefaultCleanupInterval = 30 * time.Second
 // pinning a CPU core in a tight ticker loop. 1ms is a generous floor
 // — orders of magnitude below any plausible production interval and
 // any fast-iteration test (tests in this package use 5–10ms).
-// (Gemini round 3 / PR #450.)
 const minCleanupInterval = 1 * time.Millisecond
 
 // StartCleanup spawns a background goroutine that periodically removes
@@ -972,10 +971,8 @@ const minCleanupInterval = 1 * time.Millisecond
 // Combined with no max-size cap on either cache, a workload with
 // high-cardinality glob patterns or distinct (path, sql) keys will
 // grow the maps monotonically over the lifetime of the process. The
-// public Cleanup{Glob,Partition}Cache methods existed since the
-// 2024-12 and 2026-01 cache PRs but had no production caller — this
-// fills that gap. See https://github.com/Basekick-Labs/arc/pull/450
-// (Q2 finding from the 2026-05-22 memory-retention triage).
+// public Cleanup{Glob,Partition}Cache methods exist but had no
+// production caller — this fills that gap.
 //
 // interval=0 uses DefaultCleanupInterval. Negative values are
 // rejected by clamping to the default.
@@ -1004,12 +1001,10 @@ func (p *PartitionPruner) StartCleanup(ctx context.Context, interval time.Durati
 // cancelled. One sweep per tick; sweeps are cheap (single mu.Lock +
 // map iteration, no allocations) — at realistic key cardinality the
 // sweep cost is on the order of microseconds, well below the
-// goroutine-spawn + WaitGroup-sync overhead that parallelising the
+// goroutine-spawn + WaitGroup-sync overhead that parallelizing the
 // two sweeps would add. Run sequentially; if a future profile ever
 // shows the sweep itself blocking concurrent get() calls under a
-// hot-cache workload, that's the trigger to revisit. (Gemini round 2
-// / PR #450 reversed a round-1 suggestion to parallelise after
-// pointing out the overhead inversion.)
+// hot-cache workload, that's the trigger to revisit.
 func (p *PartitionPruner) cleanupLoop(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
