@@ -236,7 +236,10 @@ type testCapturingSink struct {
 	data []byte
 }
 
-func (s *testCapturingSink) Write(p []byte) (int, error) { s.data = append(s.data, p...); return len(p), nil }
-func (s *testCapturingSink) Close() error                { return nil }
-func (s *testCapturingSink) ID() string                  { return "test-sink" }
-func (s *testCapturingSink) Cancel() error               { return nil }
+func (s *testCapturingSink) Write(p []byte) (int, error) {
+	s.data = append(s.data, p...)
+	return len(p), nil
+}
+func (s *testCapturingSink) Close() error  { return nil }
+func (s *testCapturingSink) ID() string    { return "test-sink" }
+func (s *testCapturingSink) Cancel() error { return nil }
