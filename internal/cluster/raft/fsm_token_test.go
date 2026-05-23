@@ -206,6 +206,76 @@ func TestApplyCreateToken_MaintainsPrefixIndex(t *testing.T) {
 	}
 }
 
+// Pins the tokensByName secondary index (Gemini #451 review feedback —
+// O(1) uniqueness check on apply). The index must be populated on
+// create, updated on rename, and cleared on delete. If any of those
+// drift, applyCreateToken's "name already exists" check goes wrong:
+// either false-positives (rejecting legit creates because a stale name
+// entry exists) or false-negatives (accepting duplicate names).
+func TestApplyCreateToken_MaintainsNameIndex(t *testing.T) {
+	fsm := newTestFSMWithBootstrapNode(t)
+	cmd := makeTokenCommand(t, CommandCreateToken, CreateTokenPayload{Token: makeTokenEntry("svc-1")})
+	fsm.Apply(&raft.Log{Data: cmd, Index: 7})
+
+	fsm.mu.RLock()
+	id, ok := fsm.tokensByName["svc-1"]
+	fsm.mu.RUnlock()
+	if !ok || id != 7 {
+		t.Errorf("tokensByName should contain svc-1 → 7; got id=%d ok=%v", id, ok)
+	}
+}
+
+func TestApplyUpdateToken_RenamesUpdateTheNameIndex(t *testing.T) {
+	fsm := newTestFSMWithBootstrapNode(t)
+	createCmd := makeTokenCommand(t, CommandCreateToken, CreateTokenPayload{Token: makeTokenEntry("svc-old")})
+	fsm.Apply(&raft.Log{Data: createCmd, Index: 12})
+
+	updateCmd := makeTokenCommand(t, CommandUpdateToken, UpdateTokenPayload{
+		ID:            12,
+		Name:          "svc-new",
+		ChangedFields: []string{"name"},
+	})
+	if r := fsm.Apply(&raft.Log{Data: updateCmd, Index: 13}); r != nil {
+		t.Fatalf("update apply returned: %v", r)
+	}
+
+	fsm.mu.RLock()
+	_, oldStillIndexed := fsm.tokensByName["svc-old"]
+	newID, newIndexed := fsm.tokensByName["svc-new"]
+	fsm.mu.RUnlock()
+	if oldStillIndexed {
+		t.Error("old name should be removed from tokensByName after rename")
+	}
+	if !newIndexed || newID != 12 {
+		t.Errorf("new name should index to id=12; got id=%d indexed=%v", newID, newIndexed)
+	}
+}
+
+func TestApplyDeleteToken_RemovesFromNameIndex(t *testing.T) {
+	fsm := newTestFSMWithBootstrapNode(t)
+	createCmd := makeTokenCommand(t, CommandCreateToken, CreateTokenPayload{Token: makeTokenEntry("doomed")})
+	fsm.Apply(&raft.Log{Data: createCmd, Index: 20})
+
+	deleteCmd := makeTokenCommand(t, CommandDeleteToken, DeleteTokenPayload{ID: 20})
+	if r := fsm.Apply(&raft.Log{Data: deleteCmd, Index: 21}); r != nil {
+		t.Fatalf("delete apply returned: %v", r)
+	}
+
+	fsm.mu.RLock()
+	_, stillIndexed := fsm.tokensByName["doomed"]
+	fsm.mu.RUnlock()
+	if stillIndexed {
+		t.Error("deleted token should be removed from tokensByName")
+	}
+
+	// And a fresh create with the same name should now succeed (without
+	// the index cleanup, the name would still appear taken).
+	recreateCmd := makeTokenCommand(t, CommandCreateToken, CreateTokenPayload{Token: makeTokenEntry("doomed")})
+	if r := fsm.Apply(&raft.Log{Data: recreateCmd, Index: 22}); r != nil {
+		t.Fatalf("recreate after delete should succeed; got: %v", r)
+	}
+}
+
 func TestApplyUpdateToken_ChangesOnlyListedFields(t *testing.T) {
 	fsm := newTestFSMWithBootstrapNode(t)
 	createCmd := makeTokenCommand(t, CommandCreateToken, CreateTokenPayload{Token: makeTokenEntry("svc")})
@@ -399,11 +469,16 @@ func TestFSMSnapshot_RoundTripsTokens(t *testing.T) {
 	if fsm2.TokenCount() != 3 {
 		t.Errorf("restored FSM should have 3 tokens, got %d", fsm2.TokenCount())
 	}
-	// Prefix index must be rebuilt.
+	// Both secondary indices must be rebuilt from the restored tokens
+	// map. The name index is Gemini #451 review feedback.
 	fsm2.mu.RLock()
 	prefixCount := len(fsm2.tokensByPrefix)
+	nameCount := len(fsm2.tokensByName)
 	fsm2.mu.RUnlock()
 	if prefixCount != 3 {
 		t.Errorf("prefix index should have 3 entries, got %d", prefixCount)
+	}
+	if nameCount != 3 {
+		t.Errorf("name index should have 3 entries, got %d", nameCount)
 	}
 }

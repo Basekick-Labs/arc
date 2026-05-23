@@ -261,7 +261,16 @@ type ClusterFSM struct {
 	// prefix collision is astronomically unlikely but the slice form keeps
 	// the FSM robust against it. Maintained alongside `tokens`.
 	tokensByPrefix map[string][]int64
-	logger         zerolog.Logger
+	// tokensByName is the secondary index used to enforce the cluster-wide
+	// UNIQUE(name) constraint that mirrors the SQLite api_tokens schema.
+	// Without this index, applyCreateToken/applyUpdateToken would have to
+	// scan f.tokens linearly on every apply — a problem because the FSM
+	// apply path is single-threaded and blocks the Raft commit loop. Keyed
+	// by Name → ID; the inverse mapping back to *TokenEntry goes through
+	// f.tokens. Maintained alongside `tokens` and `tokensByPrefix`.
+	// Phase A: Cluster Auth Convergence.
+	tokensByName map[string]int64
+	logger       zerolog.Logger
 
 	// rejectedPaths counts manifest entries refused by path validation
 	// across every code path that mutates the manifest: applyRegisterFile,
@@ -321,6 +330,7 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 		filesByDB:      make(map[string]map[string]struct{}),
 		tokens:         make(map[int64]*TokenEntry),
 		tokensByPrefix: make(map[string][]int64),
+		tokensByName:   make(map[string]int64),
 		logger:         logger.With().Str("component", "cluster-fsm").Logger(),
 	}
 }
@@ -1211,15 +1221,17 @@ func (f *ClusterFSM) applyCreateToken(payload []byte, logIndex uint64) interface
 	// SQLite UNIQUE constraint on api_tokens.name; without this check, two
 	// concurrent proposers could each commit a CreateToken with the same
 	// name and the slower node's SQLite write would fail with UNIQUE
-	// violation while the FSM map happily holds both).
-	for _, existing := range f.tokens {
-		if existing.Name == entry.Name {
-			f.mu.Unlock()
-			return f.rejectToken("create", entry.ID, logIndex, fmt.Errorf("token name %q already exists", entry.Name))
-		}
+	// violation while the FSM map happily holds both). O(1) via the
+	// tokensByName secondary index — the apply path is single-threaded
+	// and blocks the Raft commit loop, so a linear scan over all tokens
+	// would bottleneck the cluster as the token count grows.
+	if _, exists := f.tokensByName[entry.Name]; exists {
+		f.mu.Unlock()
+		return f.rejectToken("create", entry.ID, logIndex, fmt.Errorf("token name %q already exists", entry.Name))
 	}
 	f.tokens[entry.ID] = &entry
 	f.tokensByPrefix[entry.TokenPrefix] = append(f.tokensByPrefix[entry.TokenPrefix], entry.ID)
+	f.tokensByName[entry.Name] = entry.ID
 	callback := f.onTokenCreated
 	f.mu.Unlock()
 
@@ -1274,16 +1286,17 @@ func (f *ClusterFSM) applyUpdateToken(payload []byte, logIndex uint64) interface
 		changed[field] = true
 	}
 	if changed["name"] {
-		// Enforce cluster-wide name uniqueness for the new name.
-		for id2, existing := range f.tokens {
-			if id2 == p.ID {
-				continue
-			}
-			if existing.Name == p.Name {
-				f.mu.Unlock()
-				return f.rejectToken("update", p.ID, logIndex, fmt.Errorf("token name %q already exists", p.Name))
-			}
+		// Enforce cluster-wide name uniqueness for the new name. O(1) via
+		// the tokensByName secondary index (Gemini #451 review feedback —
+		// the apply path is single-threaded and blocks the Raft commit
+		// loop, so a linear scan was a future scaling bottleneck).
+		if otherID, exists := f.tokensByName[p.Name]; exists && otherID != p.ID {
+			f.mu.Unlock()
+			return f.rejectToken("update", p.ID, logIndex, fmt.Errorf("token name %q already exists", p.Name))
 		}
+		// Maintain the name index: drop the old binding, add the new one.
+		delete(f.tokensByName, entry.Name)
+		f.tokensByName[p.Name] = entry.ID
 		entry.Name = p.Name
 	}
 	if changed["description"] {
@@ -1373,6 +1386,9 @@ func (f *ClusterFSM) applyDeleteToken(payload []byte) interface{} {
 			f.tokensByPrefix[entry.TokenPrefix] = out
 		}
 	}
+	// Remove from the name index so a future create with the same name
+	// is no longer rejected as a duplicate.
+	delete(f.tokensByName, entry.Name)
 	callback := f.onTokenDeleted
 	f.mu.Unlock()
 
@@ -1553,11 +1569,16 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		}
 		idx[path] = struct{}{}
 	}
-	// Rebuild tokens + the prefix secondary index.
+	// Rebuild tokens + both secondary indices. The prefix index supports
+	// AuthManager.VerifyToken lookups; the name index supports O(1)
+	// uniqueness checks in applyCreateToken/applyUpdateToken (Gemini #451
+	// review feedback).
 	f.tokens = restoredTokens
 	f.tokensByPrefix = make(map[string][]int64, len(f.tokens))
+	f.tokensByName = make(map[string]int64, len(f.tokens))
 	for id, entry := range f.tokens {
 		f.tokensByPrefix[entry.TokenPrefix] = append(f.tokensByPrefix[entry.TokenPrefix], id)
+		f.tokensByName[entry.Name] = id
 	}
 	f.mu.Unlock()
 

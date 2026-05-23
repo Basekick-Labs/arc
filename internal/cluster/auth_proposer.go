@@ -108,19 +108,28 @@ func wrapApplyError(err error) error {
 }
 
 // mergeContexts returns a context that cancels when EITHER input
-// cancels. Lightweight goroutine; the returned context's parent is
-// context.Background so it doesn't accidentally inherit deadlines
-// from either side.
+// cancels. The returned context inherits values from `a` (the
+// caller-supplied request context, which typically carries trace IDs,
+// loggers, and other request-scoped metadata that downstream code may
+// need), and additionally cancels when `b` (the deadline-bounded
+// forward-apply context) cancels.
+//
+// Gemini #451 review feedback: an earlier version parented on
+// context.Background, which discarded values from both inputs and
+// would break observability the moment any caller added a logger or
+// trace ID via context.WithValue.
+//
+// The merged context's deadline is the earlier of `a`'s and `b`'s,
+// because cancelling on either input's Done is what makes the merge
+// useful.
 func mergeContexts(a, b context.Context) context.Context {
-	merged, cancel := context.WithCancel(context.Background())
+	merged, cancel := context.WithCancel(a)
 	go func() {
 		select {
-		case <-a.Done():
 		case <-b.Done():
+			cancel()
 		case <-merged.Done():
-			return
 		}
-		cancel()
 	}()
 	return merged
 }
