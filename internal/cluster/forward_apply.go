@@ -409,7 +409,13 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 			Str("requesting_node", req.NodeID).
 			Int("cmd_type", int(cmd.Type)).
 			Msg("ForwardApply: Raft Apply failed")
-		c.sendForwardApplyError(conn, protocol.ForwardCodeApplyFailed, "raft apply failed")
+		// Preserve the FSM's actual error message in the ack so the
+		// follower-side caller can branch on it via strings.Contains
+		// (e.g. ensureFirstToken's "already exists" detection). Without
+		// this, every follower would see the same canned "raft apply
+		// failed" string and fail to recognise legitimate idempotency
+		// signals. PR #451 round-3 internal review.
+		c.sendForwardApplyError(conn, protocol.ForwardCodeApplyFailed, err.Error())
 		return
 	}
 

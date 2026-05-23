@@ -899,13 +899,16 @@ func main() {
 			bootstrapRan = true
 			var bootstrapToken string
 			var bootstrapErr error
-			// Bound the bootstrap retry loop. ~10s is plenty of headroom
-			// for the cluster's WaitForLeader (30s) + the 4-attempt
-			// retry with exponential backoff (250+500+1000ms ≈ 2s) to
-			// land. If the cluster genuinely never elects a leader the
-			// timeout cancels the loop cleanly and we surface the error
-			// rather than blocking startup indefinitely.
-			bootstrapCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			// Bound the bootstrap retry loop. 30s matches the upstream
+			// WaitForLeader ceiling and leaves headroom for the inner
+			// retry's worst case: 4 attempts × proposeTimeout (5s) +
+			// exp backoff (250+500+1000ms ≈ 1.75s) ≈ 22s. If the cluster
+			// genuinely never elects a leader the timeout cancels the
+			// loop cleanly and we surface the error rather than blocking
+			// startup indefinitely. Internal review #2 (post-Gemini round
+			// 3) flagged the previous 10s ceiling as too tight against
+			// proposeTimeout=5s.
+			bootstrapCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			if cfg.Auth.ForceBootstrap && cfg.Auth.BootstrapToken != "" {
 				bootstrapToken, bootstrapErr = authManager.ForceAddRecoveryToken(bootstrapCtx, cfg.Auth.BootstrapToken)
