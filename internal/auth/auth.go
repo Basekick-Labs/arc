@@ -920,7 +920,7 @@ func (am *AuthManager) RotateToken(id int64) (string, error) {
 // "already initialised" (empty string return — same shape as the SQLite
 // path's "rows == 0" check). The plaintext is only known to the proposer
 // and only the winning leader prints the banner.
-func (am *AuthManager) ensureFirstToken(tokenValue, description string) (string, error) {
+func (am *AuthManager) ensureFirstToken(ctx context.Context, tokenValue, description string) (string, error) {
 	hash, err := am.hashToken(tokenValue)
 	if err != nil {
 		return "", fmt.Errorf("failed to hash token: %w", err)
@@ -943,14 +943,20 @@ func (am *AuthManager) ensureFirstToken(tokenValue, description string) (string,
 		}
 		// Cluster bootstrap can race a Raft leader-flap window: WaitForLeader
 		// in main.go observed an election, but by the time we ship the
-		// proposal the leader may have stepped down. A short, bounded retry
-		// for ErrLeaderUnknown lets us ride out a single re-election (~1-2s)
-		// without surfacing a scary error to the operator. "Already exists"
-		// is still an immediate empty-return (the leader applied a peer's
-		// proposal before ours).
+		// proposal the leader may have stepped down. A bounded retry with
+		// exponential backoff for ErrLeaderUnknown lets us ride out a
+		// re-election without surfacing a scary error to the operator.
+		// "Already exists" is still an immediate empty-return (the leader
+		// applied a peer's proposal before ours).
+		//
+		// The backoff respects ctx so a shutdown signal during a
+		// pathological no-leader window doesn't block process exit (Gemini
+		// #451 round-2 review).
+		const maxAttempts = 4
+		backoff := 250 * time.Millisecond
 		var err error
-		for attempt := 0; attempt < 3; attempt++ {
-			err = am.proposeCommand(context.Background(), ProposalCommandCreateToken, payload)
+		for attempt := 0; attempt < maxAttempts; attempt++ {
+			err = am.proposeCommand(ctx, ProposalCommandCreateToken, payload)
 			if err == nil {
 				return tokenValue, nil
 			}
@@ -960,7 +966,15 @@ func (am *AuthManager) ensureFirstToken(tokenValue, description string) (string,
 			if !errors.Is(err, ErrLeaderUnknown) {
 				break
 			}
-			time.Sleep(500 * time.Millisecond)
+			if attempt == maxAttempts-1 {
+				break // don't sleep after the last attempt
+			}
+			select {
+			case <-time.After(backoff):
+				backoff *= 2 // exponential: 250ms, 500ms, 1s
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
 		}
 		return "", err
 	}
@@ -985,14 +999,20 @@ func (am *AuthManager) ensureFirstToken(tokenValue, description string) (string,
 	return tokenValue, nil
 }
 
-// EnsureInitialToken creates an admin token if no tokens exist
-func (am *AuthManager) EnsureInitialToken() (string, error) {
+// EnsureInitialToken creates an admin token if no tokens exist.
+//
+// The context bounds the cluster-mode retry loop (in OSS / no-proposer
+// mode it's ignored, since the underlying SQLite INSERT is a single
+// statement). Pass a shutdown-aware context if you want bootstrap to
+// abort cleanly when the process is being torn down — relevant when
+// the Raft cluster never achieves leader election (Gemini #451 review).
+func (am *AuthManager) EnsureInitialToken(ctx context.Context) (string, error) {
 	token, err := generateToken()
 	if err != nil {
 		return "", fmt.Errorf("failed to generate token: %w", err)
 	}
 
-	result, err := am.ensureFirstToken(token, "Initial admin token (auto-generated on first run)")
+	result, err := am.ensureFirstToken(ctx, token, "Initial admin token (auto-generated on first run)")
 	if err != nil {
 		return "", err
 	}
@@ -1062,12 +1082,15 @@ func (am *AuthManager) CreateTokenWithValue(tokenValue, name, description, permi
 
 // EnsureInitialTokenWithValue creates the initial admin token using a caller-provided value.
 // If tokens already exist, this is a no-op (returns empty string).
-func (am *AuthManager) EnsureInitialTokenWithValue(tokenValue string) (string, error) {
+//
+// The context bounds the cluster-mode retry loop. See EnsureInitialToken
+// for the contract.
+func (am *AuthManager) EnsureInitialTokenWithValue(ctx context.Context, tokenValue string) (string, error) {
 	if len(tokenValue) < 32 {
 		return "", fmt.Errorf("bootstrap token must be at least 32 characters long")
 	}
 
-	result, err := am.ensureFirstToken(tokenValue, "Initial admin token (set via ARC_AUTH_BOOTSTRAP_TOKEN)")
+	result, err := am.ensureFirstToken(ctx, tokenValue, "Initial admin token (set via ARC_AUTH_BOOTSTRAP_TOKEN)")
 	if err != nil {
 		return "", err
 	}

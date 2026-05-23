@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
@@ -481,7 +482,7 @@ func TestEnsureInitialToken(t *testing.T) {
 	defer cleanup()
 
 	// First call should create token
-	token, err := am.EnsureInitialToken()
+	token, err := am.EnsureInitialToken(context.Background())
 	if err != nil {
 		t.Fatalf("EnsureInitialToken failed: %v", err)
 	}
@@ -499,7 +500,7 @@ func TestEnsureInitialToken(t *testing.T) {
 	}
 
 	// Second call should return empty (tokens already exist)
-	token2, err := am.EnsureInitialToken()
+	token2, err := am.EnsureInitialToken(context.Background())
 	if err != nil {
 		t.Fatalf("Second EnsureInitialToken failed: %v", err)
 	}
@@ -682,7 +683,7 @@ func TestEnsureInitialTokenWithValue(t *testing.T) {
 		am, cleanup := setupTestAuthManager(t)
 		defer cleanup()
 
-		got, err := am.EnsureInitialTokenWithValue(validToken)
+		got, err := am.EnsureInitialTokenWithValue(context.Background(), validToken)
 		if err != nil {
 			t.Fatalf("EnsureInitialTokenWithValue failed: %v", err)
 		}
@@ -709,7 +710,7 @@ func TestEnsureInitialTokenWithValue(t *testing.T) {
 			t.Fatalf("pre-create failed: %v", err)
 		}
 
-		got, err := am.EnsureInitialTokenWithValue(validToken)
+		got, err := am.EnsureInitialTokenWithValue(context.Background(), validToken)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -731,7 +732,7 @@ func TestEnsureInitialTokenWithValue(t *testing.T) {
 		am, cleanup := setupTestAuthManager(t)
 		defer cleanup()
 
-		_, err := am.EnsureInitialTokenWithValue("short")
+		_, err := am.EnsureInitialTokenWithValue(context.Background(), "short")
 		if err == nil {
 			t.Error("expected error for token shorter than 32 chars")
 		}
@@ -745,7 +746,7 @@ func TestEnsureInitialTokenWithValue(t *testing.T) {
 		results := make(chan error, goroutines)
 		for i := 0; i < goroutines; i++ {
 			go func() {
-				_, err := am.EnsureInitialTokenWithValue(validToken)
+				_, err := am.EnsureInitialTokenWithValue(context.Background(), validToken)
 				results <- err
 			}()
 		}

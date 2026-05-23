@@ -899,12 +899,20 @@ func main() {
 			bootstrapRan = true
 			var bootstrapToken string
 			var bootstrapErr error
+			// Bound the bootstrap retry loop. ~10s is plenty of headroom
+			// for the cluster's WaitForLeader (30s) + the 4-attempt
+			// retry with exponential backoff (250+500+1000ms ≈ 2s) to
+			// land. If the cluster genuinely never elects a leader the
+			// timeout cancels the loop cleanly and we surface the error
+			// rather than blocking startup indefinitely.
+			bootstrapCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
 			if cfg.Auth.ForceBootstrap && cfg.Auth.BootstrapToken != "" {
 				bootstrapToken, bootstrapErr = authManager.ForceAddRecoveryToken(cfg.Auth.BootstrapToken)
 			} else if cfg.Auth.BootstrapToken != "" {
-				bootstrapToken, bootstrapErr = authManager.EnsureInitialTokenWithValue(cfg.Auth.BootstrapToken)
+				bootstrapToken, bootstrapErr = authManager.EnsureInitialTokenWithValue(bootstrapCtx, cfg.Auth.BootstrapToken)
 			} else {
-				bootstrapToken, bootstrapErr = authManager.EnsureInitialToken()
+				bootstrapToken, bootstrapErr = authManager.EnsureInitialToken(bootstrapCtx)
 			}
 			if bootstrapErr != nil {
 				log.Error().Err(bootstrapErr).Msg("Failed to create initial admin token")

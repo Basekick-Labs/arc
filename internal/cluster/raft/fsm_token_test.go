@@ -482,3 +482,33 @@ func TestFSMSnapshot_RoundTripsTokens(t *testing.T) {
 		t.Errorf("name index should have 3 entries, got %d", nameCount)
 	}
 }
+
+// Pins splitCSV's defensive whitespace trimming (Gemini #451 round-2
+// review). The proposer is expected to normalise, but the applier
+// trims anyway so a proposer typo surfaces as a clean validation
+// error instead of a confusing one. If anyone removes the trim,
+// validatePermissionString starts rejecting "read, write" with a
+// surprising " write"-not-allowed error.
+func TestValidatePermissionString_ToleratesWhitespace(t *testing.T) {
+	cases := []struct {
+		in      string
+		wantErr bool
+	}{
+		{"", false},
+		{"read", false},
+		{"read,write", false},
+		{"read, write", false},
+		{" read , write , delete ", false},
+		{"\tread\t,\twrite\t", false},
+		{"read,bogus", true},
+		{"read, bogus", true}, // not whitespace-tolerance laundering an unknown verb
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			err := validatePermissionString(tc.in)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("validatePermissionString(%q) err=%v, wantErr=%v", tc.in, err, tc.wantErr)
+			}
+		})
+	}
+}

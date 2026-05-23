@@ -275,13 +275,13 @@ func TestEnsureFirstToken_ReturnsEmptyOnDuplicateName(t *testing.T) {
 	defer cleanup()
 
 	// Pre-seed an admin token through the proposer.
-	if _, err := am.EnsureInitialToken(); err != nil {
+	if _, err := am.EnsureInitialToken(context.Background()); err != nil {
 		t.Fatalf("first EnsureInitialToken: %v", err)
 	}
 
 	// Second call from a "follower" node should detect "already exists"
 	// and return empty string + nil error (no banner on the non-winner).
-	got, err := am.EnsureInitialToken()
+	got, err := am.EnsureInitialToken(context.Background())
 	if err != nil {
 		t.Fatalf("second EnsureInitialToken: %v", err)
 	}

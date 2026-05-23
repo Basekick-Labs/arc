@@ -1156,8 +1156,10 @@ func validateTokenEntry(entry *TokenEntry) error {
 
 // validatePermissionString rejects anything outside the documented verb set.
 // The allowed verbs are "read", "write", "delete", "admin"; empty is allowed
-// (means "no permissions"). Comma-separated, no whitespace tolerance —
-// proposer is expected to normalise.
+// (means "no permissions"). Comma-separated. Tolerates ASCII whitespace
+// around each verb (defensive normalisation via splitCSV) so a typo in the
+// proposer's normalise step doesn't surface as a confusing " write"-is-not-
+// allowed error.
 func validatePermissionString(perms string) error {
 	if perms == "" {
 		return nil
@@ -1171,8 +1173,12 @@ func validatePermissionString(perms string) error {
 	return nil
 }
 
-// splitCSV is a no-allocs-friendly comma splitter that trims nothing. The
-// proposer is responsible for normalising "read , write" into "read,write".
+// splitCSV is a comma splitter that trims surrounding ASCII whitespace
+// from each token. The proposer is expected to normalise input but we
+// trim defensively here so a forgotten normalise step at the proposer
+// surfaces as a clean validation error (the verb itself was unknown)
+// rather than a confusing one (" write" vs "write"). Gemini #451
+// round-2 review.
 func splitCSV(s string) []string {
 	if s == "" {
 		return nil
@@ -1181,12 +1187,30 @@ func splitCSV(s string) []string {
 	start := 0
 	for i := 0; i < len(s); i++ {
 		if s[i] == ',' {
-			out = append(out, s[start:i])
+			out = append(out, trimASCIISpace(s[start:i]))
 			start = i + 1
 		}
 	}
-	out = append(out, s[start:])
+	out = append(out, trimASCIISpace(s[start:]))
 	return out
+}
+
+// trimASCIISpace strips leading/trailing spaces and tabs from s without
+// allocating when there's nothing to trim. Cheaper than strings.TrimSpace
+// (which handles full Unicode whitespace) for the permission-string use
+// case where only ASCII space/tab can appear in legitimate input.
+func trimASCIISpace(s string) string {
+	lo, hi := 0, len(s)
+	for lo < hi && (s[lo] == ' ' || s[lo] == '\t') {
+		lo++
+	}
+	for hi > lo && (s[hi-1] == ' ' || s[hi-1] == '\t') {
+		hi--
+	}
+	if lo == 0 && hi == len(s) {
+		return s
+	}
+	return s[lo:hi]
 }
 
 func (f *ClusterFSM) applyCreateToken(payload []byte, logIndex uint64) interface{} {
