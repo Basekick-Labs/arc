@@ -132,6 +132,18 @@ type Metrics struct {
 	// Alert on this.
 	clusterManifestRejectedPathsTotal atomic.Int64
 
+	// Cluster auth metrics (Enterprise only — mutated on every FSM apply
+	// of a token command). clusterAuthApplyTotal increments per applied
+	// command type so operators can see "create vs update vs revoke"
+	// distribution; clusterAuthRejectedTotal counts applier-side
+	// validation refusals. Phase A: Cluster Auth Convergence.
+	clusterAuthApplyCreateTotal atomic.Int64
+	clusterAuthApplyUpdateTotal atomic.Int64
+	clusterAuthApplyRevokeTotal atomic.Int64
+	clusterAuthApplyDeleteTotal atomic.Int64
+	clusterAuthApplyRotateTotal atomic.Int64
+	clusterAuthRejectedTotal    atomic.Int64
+
 	logger zerolog.Logger
 }
 
@@ -315,6 +327,17 @@ func (m *Metrics) IncReplicationSequenceGaps(n int64) { m.replicationSequenceGap
 // when ValidateManifestPath refuses a Register/Update/Restore path.
 // See GHSA-f85q-mvg8-qf37 for the security context.
 func (m *Metrics) IncClusterManifestRejectedPaths() { m.clusterManifestRejectedPathsTotal.Add(1) }
+
+// Cluster Auth metrics — incremented from the FSM apply path on every
+// Token command. apply_* counts successful applies per type;
+// IncClusterAuthRejected counts applier-side validation refusals.
+// Phase A: Cluster Auth Convergence.
+func (m *Metrics) IncClusterAuthApplyCreate() { m.clusterAuthApplyCreateTotal.Add(1) }
+func (m *Metrics) IncClusterAuthApplyUpdate() { m.clusterAuthApplyUpdateTotal.Add(1) }
+func (m *Metrics) IncClusterAuthApplyRevoke() { m.clusterAuthApplyRevokeTotal.Add(1) }
+func (m *Metrics) IncClusterAuthApplyDelete() { m.clusterAuthApplyDeleteTotal.Add(1) }
+func (m *Metrics) IncClusterAuthApplyRotate() { m.clusterAuthApplyRotateTotal.Add(1) }
+func (m *Metrics) IncClusterAuthRejected()    { m.clusterAuthRejectedTotal.Add(1) }
 
 // Snapshot returns all metrics as a map (for JSON endpoint)
 func (m *Metrics) Snapshot() map[string]interface{} {
