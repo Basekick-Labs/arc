@@ -23,6 +23,7 @@ import (
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/backup"
 	"github.com/basekick-labs/arc/internal/cluster"
+	clusterraft "github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/basekick-labs/arc/internal/compaction"
 	"github.com/basekick-labs/arc/internal/config"
@@ -1226,6 +1227,64 @@ func main() {
 							Bool("can_query", capabilities.CanQuery).
 							Bool("can_compact", capabilities.CanCompact).
 							Msg("Cluster coordinator started")
+
+						// Phase A: Cluster Auth Convergence — wire the AuthManager
+						// into the cluster's Raft FSM so that every CreateToken /
+						// RevokeToken / etc. propagates cluster-wide instead of
+						// staying in this node's local SQLite.
+						//
+						// Two halves:
+						//   1. SetRaftProposer flips AuthManager's write methods
+						//      from direct-SQLite to Raft-propose. From this point
+						//      forward every API-driven token mutation goes through
+						//      the FSM apply path on every node.
+						//   2. SetAuthCallbacks gives the FSM the per-node
+						//      materialise hooks so each node's local SQLite
+						//      mirrors the cluster-authoritative state. The
+						//      callbacks fire on the runFSM goroutine after the
+						//      in-memory tokens map has been mutated.
+						//
+						// Order matters: install callbacks BEFORE flipping the
+						// proposer, so the very first cluster-wide CreateToken
+						// (typically the bootstrap admin token on the next
+						// EnsureInitialToken call) has its callback wired and
+						// materialises into SQLite on this node.
+						if authManager != nil {
+							if fsm := clusterCoordinator.GetRaftFSM(); fsm != nil {
+								fsm.SetAuthCallbacks(
+									func(e *clusterraft.TokenEntry) {
+										if err := authManager.ApplyCreateToken(cluster.ToAuthTokenEntry(e)); err != nil {
+											log.Error().Err(err).Int64("token_id", e.ID).Msg("Failed to materialise CreateToken into local SQLite")
+										}
+									},
+									func(e *clusterraft.TokenEntry) {
+										if err := authManager.ApplyUpdateToken(cluster.ToAuthTokenEntry(e)); err != nil {
+											log.Error().Err(err).Int64("token_id", e.ID).Msg("Failed to materialise UpdateToken into local SQLite")
+										}
+									},
+									func(id int64) {
+										if err := authManager.ApplyRevokeToken(id); err != nil {
+											log.Error().Err(err).Int64("token_id", id).Msg("Failed to materialise RevokeToken into local SQLite")
+										}
+									},
+									func(id int64) {
+										if err := authManager.ApplyDeleteToken(id); err != nil {
+											log.Error().Err(err).Int64("token_id", id).Msg("Failed to materialise DeleteToken into local SQLite")
+										}
+									},
+									func(id int64, newHash, newPrefix string, lsn uint64) {
+										if err := authManager.ApplyRotateToken(id, newHash, newPrefix); err != nil {
+											log.Error().Err(err).Int64("token_id", id).Msg("Failed to materialise RotateToken into local SQLite")
+										}
+									},
+								)
+								proposer := cluster.NewCoordinatorAuthProposer(clusterCoordinator)
+								if proposer != nil {
+									authManager.SetRaftProposer(proposer)
+									log.Info().Msg("Cluster auth state replication enabled — token writes now propagate via Raft")
+								}
+							}
+						}
 
 						// Wire up WAL replication if enabled
 						if cfg.Cluster.ReplicationEnabled && walWriter != nil {
