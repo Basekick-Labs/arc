@@ -23,6 +23,7 @@ import (
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/backup"
 	"github.com/basekick-labs/arc/internal/cluster"
+	clusterraft "github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/basekick-labs/arc/internal/compaction"
 	"github.com/basekick-labs/arc/internal/config"
@@ -858,6 +859,15 @@ func main() {
 
 	// Initialize AuthManager (if enabled)
 	var authManager *auth.AuthManager
+	// Phase A: assigned inside the auth-enabled branch below; invoked
+	// either immediately (OSS / non-clustered) or after the Raft proposer
+	// is wired (cluster mode). Function scope so the cluster wire-up branch
+	// can reach it. `bootstrapRan` tracks whether the closure has been
+	// invoked, so the cluster-init-failure fallback later in main() can
+	// detect "deferred but never ran" without double-banners on the
+	// happy path.
+	var runInitialTokenBootstrap func()
+	var bootstrapRan bool
 	if cfg.Auth.Enabled {
 		authManager, err = auth.NewAuthManager(
 			cfg.Auth.DBPath,
@@ -878,46 +888,81 @@ func main() {
 		// Create initial admin token on first run.
 		// ARC_AUTH_BOOTSTRAP_TOKEN: use a known token value instead of generating a random one.
 		// ARC_AUTH_FORCE_BOOTSTRAP: add a recovery admin token without removing existing tokens (recovery path).
-		var bootstrapToken string
-		var bootstrapErr error
-		if cfg.Auth.ForceBootstrap && cfg.Auth.BootstrapToken != "" {
-			bootstrapToken, bootstrapErr = authManager.ForceAddRecoveryToken(cfg.Auth.BootstrapToken)
-		} else if cfg.Auth.BootstrapToken != "" {
-			bootstrapToken, bootstrapErr = authManager.EnsureInitialTokenWithValue(cfg.Auth.BootstrapToken)
-		} else {
-			bootstrapToken, bootstrapErr = authManager.EnsureInitialToken()
+		//
+		// Phase A (Cluster Auth Convergence): when the node is going to enter
+		// cluster mode AND has a working Enterprise license that includes
+		// clustering, defer the bootstrap until AFTER SetRaftProposer has
+		// flipped the AuthManager onto the Raft path. Otherwise every node
+		// independently creates its own admin token in its own SQLite (the
+		// original OSS behaviour) and four banners print instead of one.
+		runInitialTokenBootstrap = func() {
+			bootstrapRan = true
+			var bootstrapToken string
+			var bootstrapErr error
+			// Bound the bootstrap retry loop. 30s matches the upstream
+			// WaitForLeader ceiling and leaves headroom for the inner
+			// retry's worst case: 4 attempts × proposeTimeout (5s) +
+			// exp backoff (250+500+1000ms ≈ 1.75s) ≈ 22s. If the cluster
+			// genuinely never elects a leader the timeout cancels the
+			// loop cleanly and we surface the error rather than blocking
+			// startup indefinitely. Internal review #2 (post-Gemini round
+			// 3) flagged the previous 10s ceiling as too tight against
+			// proposeTimeout=5s.
+			bootstrapCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if cfg.Auth.ForceBootstrap && cfg.Auth.BootstrapToken != "" {
+				bootstrapToken, bootstrapErr = authManager.ForceAddRecoveryToken(bootstrapCtx, cfg.Auth.BootstrapToken)
+			} else if cfg.Auth.BootstrapToken != "" {
+				bootstrapToken, bootstrapErr = authManager.EnsureInitialTokenWithValue(bootstrapCtx, cfg.Auth.BootstrapToken)
+			} else {
+				bootstrapToken, bootstrapErr = authManager.EnsureInitialToken(bootstrapCtx)
+			}
+			if bootstrapErr != nil {
+				log.Error().Err(bootstrapErr).Msg("Failed to create initial admin token")
+			} else if bootstrapToken != "" {
+				// Print colorized banner to stderr (bypasses structured logging)
+				const (
+					cyan   = "\033[96m"
+					yellow = "\033[93m"
+					bold   = "\033[1m"
+					reset  = "\033[0m"
+				)
+				banner := cyan + "======================================================================" + reset
+				fmt.Fprintln(os.Stderr)
+				fmt.Fprintln(os.Stderr, banner)
+				if cfg.Auth.ForceBootstrap {
+					fmt.Fprintln(os.Stderr, cyan+bold+"  RECOVERY TOKEN ADDED - EXISTING TOKENS PRESERVED"+reset)
+				} else {
+					fmt.Fprintln(os.Stderr, cyan+bold+"  FIRST RUN - INITIAL ADMIN TOKEN GENERATED"+reset)
+				}
+				fmt.Fprintln(os.Stderr, banner)
+				fmt.Fprintln(os.Stderr, yellow+bold+"  Admin API token: "+bootstrapToken+reset)
+				fmt.Fprintln(os.Stderr, banner)
+				fmt.Fprintln(os.Stderr, cyan+"  SAVE THIS TOKEN! It will not be shown again."+reset)
+				fmt.Fprintln(os.Stderr, cyan+"  Use this token to login to the web UI or API."+reset)
+				if cfg.Auth.ForceBootstrap {
+					fmt.Fprintln(os.Stderr, cyan+"  Use the API to revoke any tokens you no longer need."+reset)
+					fmt.Fprintln(os.Stderr, cyan+"  Remove ARC_AUTH_FORCE_BOOTSTRAP after recovery."+reset)
+				} else {
+					fmt.Fprintln(os.Stderr, cyan+"  You can create additional tokens after logging in."+reset)
+				}
+				fmt.Fprintln(os.Stderr, banner)
+				fmt.Fprintln(os.Stderr)
+			}
 		}
-		if bootstrapErr != nil {
-			log.Error().Err(bootstrapErr).Msg("Failed to create initial admin token")
-		} else if bootstrapToken != "" {
-			// Print colorized banner to stderr (bypasses structured logging)
-			const (
-				cyan   = "\033[96m"
-				yellow = "\033[93m"
-				bold   = "\033[1m"
-				reset  = "\033[0m"
-			)
-			banner := cyan + "======================================================================" + reset
-			fmt.Fprintln(os.Stderr)
-			fmt.Fprintln(os.Stderr, banner)
-			if cfg.Auth.ForceBootstrap {
-				fmt.Fprintln(os.Stderr, cyan+bold+"  RECOVERY TOKEN ADDED - EXISTING TOKENS PRESERVED"+reset)
-			} else {
-				fmt.Fprintln(os.Stderr, cyan+bold+"  FIRST RUN - INITIAL ADMIN TOKEN GENERATED"+reset)
-			}
-			fmt.Fprintln(os.Stderr, banner)
-			fmt.Fprintln(os.Stderr, yellow+bold+"  Admin API token: "+bootstrapToken+reset)
-			fmt.Fprintln(os.Stderr, banner)
-			fmt.Fprintln(os.Stderr, cyan+"  SAVE THIS TOKEN! It will not be shown again."+reset)
-			fmt.Fprintln(os.Stderr, cyan+"  Use this token to login to the web UI or API."+reset)
-			if cfg.Auth.ForceBootstrap {
-				fmt.Fprintln(os.Stderr, cyan+"  Use the API to revoke any tokens you no longer need."+reset)
-				fmt.Fprintln(os.Stderr, cyan+"  Remove ARC_AUTH_FORCE_BOOTSTRAP after recovery."+reset)
-			} else {
-				fmt.Fprintln(os.Stderr, cyan+"  You can create additional tokens after logging in."+reset)
-			}
-			fmt.Fprintln(os.Stderr, banner)
-			fmt.Fprintln(os.Stderr)
+
+		// Decide whether bootstrap can run inline or must wait for the Raft
+		// proposer to be wired. We check the same preconditions the cluster
+		// init block at line 1157 checks, so a "yes" here is guaranteed to
+		// reach the proposer-wiring branch below.
+		willEnterClusterMode := cfg.Cluster.Enabled &&
+			licenseClient != nil &&
+			licenseClient.GetLicense() != nil &&
+			licenseClient.GetLicense().HasFeature(license.FeatureClustering)
+		if !willEnterClusterMode {
+			runInitialTokenBootstrap()
+		} else {
+			log.Info().Msg("Deferring initial token bootstrap until cluster Raft proposer is wired (Phase A)")
 		}
 
 		log.Info().
@@ -1227,6 +1272,89 @@ func main() {
 							Bool("can_compact", capabilities.CanCompact).
 							Msg("Cluster coordinator started")
 
+						// Phase A: Cluster Auth Convergence — wire the AuthManager
+						// into the cluster's Raft FSM so that every CreateToken /
+						// RevokeToken / etc. propagates cluster-wide instead of
+						// staying in this node's local SQLite.
+						//
+						// Two halves:
+						//   1. SetRaftProposer flips AuthManager's write methods
+						//      from direct-SQLite to Raft-propose. From this point
+						//      forward every API-driven token mutation goes through
+						//      the FSM apply path on every node.
+						//   2. SetAuthCallbacks gives the FSM the per-node
+						//      materialise hooks so each node's local SQLite
+						//      mirrors the cluster-authoritative state. The
+						//      callbacks fire on the runFSM goroutine after the
+						//      in-memory tokens map has been mutated.
+						//
+						// Order matters: install callbacks BEFORE flipping the
+						// proposer, so the very first cluster-wide CreateToken
+						// (typically the bootstrap admin token on the next
+						// EnsureInitialToken call) has its callback wired and
+						// materialises into SQLite on this node.
+						if authManager != nil {
+							if fsm := clusterCoordinator.GetRaftFSM(); fsm != nil {
+								fsm.SetAuthCallbacks(
+									func(e *clusterraft.TokenEntry) {
+										if err := authManager.ApplyCreateToken(cluster.ToAuthTokenEntry(e)); err != nil {
+											log.Error().Err(err).Int64("token_id", e.ID).Msg("Failed to materialise CreateToken into local SQLite")
+										}
+									},
+									func(e *clusterraft.TokenEntry) {
+										if err := authManager.ApplyUpdateToken(cluster.ToAuthTokenEntry(e)); err != nil {
+											log.Error().Err(err).Int64("token_id", e.ID).Msg("Failed to materialise UpdateToken into local SQLite")
+										}
+									},
+									func(id int64) {
+										if err := authManager.ApplyRevokeToken(id); err != nil {
+											log.Error().Err(err).Int64("token_id", id).Msg("Failed to materialise RevokeToken into local SQLite")
+										}
+									},
+									func(id int64) {
+										if err := authManager.ApplyDeleteToken(id); err != nil {
+											log.Error().Err(err).Int64("token_id", id).Msg("Failed to materialise DeleteToken into local SQLite")
+										}
+									},
+									func(id int64, newHash, newPrefix string, lsn uint64) {
+										if err := authManager.ApplyRotateToken(id, newHash, newPrefix); err != nil {
+											log.Error().Err(err).Int64("token_id", id).Msg("Failed to materialise RotateToken into local SQLite")
+										}
+									},
+								)
+								proposer := cluster.NewCoordinatorAuthProposer(clusterCoordinator)
+								if proposer != nil {
+									authManager.SetRaftProposer(proposer)
+									log.Info().Msg("Cluster auth state replication enabled — token writes now propagate via Raft")
+
+									// Phase A: NOW run the deferred bootstrap.
+									// The proposer is wired, the FSM has its
+									// auth callbacks, and a forwardApplyToLeader
+									// path exists for follower proposals.
+									// Every node calls EnsureInitialToken with
+									// its own randomly-generated value; only
+									// the Raft leader's proposal lands, the
+									// rest get "token name already exists" and
+									// silently return empty-string (no banner).
+									//
+									// First wait for a Raft leader to be
+									// observed. On followers this prevents
+									// forwardApplyToLeader from racing the
+									// election window and returning
+									// ErrNoLeaderKnown — that error would
+									// surface as a non-idempotent bootstrap
+									// failure even though the cluster will
+									// elect a leader within ~5s.
+									if err := clusterCoordinator.WaitForLeader(30 * time.Second); err != nil {
+										log.Warn().Err(err).Msg("Cluster auth bootstrap: leader not observed within 30s; proceeding (call will likely retry via Raft semantics)")
+									}
+									if runInitialTokenBootstrap != nil {
+										runInitialTokenBootstrap()
+									}
+								}
+							}
+						}
+
 						// Wire up WAL replication if enabled
 						if cfg.Cluster.ReplicationEnabled && walWriter != nil {
 							clusterCoordinator.SetWAL(walWriter)
@@ -1370,6 +1498,21 @@ func main() {
 				}
 			}
 		}
+	}
+
+	// Phase A: fallback bootstrap. If we deferred the initial-token
+	// bootstrap above on the expectation that cluster mode would wire
+	// the Raft proposer, but the proposer never landed (cluster
+	// coordinator failed to start; coordinator started but raftFSM is
+	// nil because RaftDataDir was empty; SetRaftProposer branch was
+	// otherwise skipped), the operator would have no admin token.
+	// Run it now in OSS-fallthrough mode so the system stays usable.
+	// The closure itself sets bootstrapRan, and ensureFirstToken's
+	// underlying SQLite path is idempotent — re-running on subsequent
+	// boots is a no-op.
+	if authManager != nil && runInitialTokenBootstrap != nil && !bootstrapRan {
+		log.Warn().Msg("Cluster auth proposer was never wired (e.g. cluster init failed, or RaftDataDir empty); running initial token bootstrap in standalone fallback mode")
+		runInitialTokenBootstrap()
 	}
 
 	// Determine node capabilities (for role-based component initialization)

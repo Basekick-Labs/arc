@@ -80,6 +80,36 @@ minio:
   enabled: false                           # don't deploy bundled MinIO
 ```
 
+### Authentication (admin token + cluster replication)
+
+```yaml
+# values-override.yaml
+auth:
+  bootstrapToken:
+    existingSecret: arc-admin-token          # must contain key "bootstrap-token", 32+ chars
+```
+
+Or let Arc generate the admin token at first boot and read it from logs:
+
+```bash
+# Exactly one pod (the Raft leader) prints the banner. Search all writers:
+kubectl -n arc logs -l app.kubernetes.io/component=writer --prefix=true --tail=-1 | \
+  grep -B1 -A2 'Admin API token:'
+```
+
+Since Arc Enterprise v26.06.1, tokens (creation, update, revocation, deletion,
+rotation) replicate cluster-wide automatically via Raft — a token created on
+any node is valid on every node, and revoking on any node invalidates it
+cluster-wide within ~50 ms. RBAC tables (organisations, teams, roles,
+measurement permissions, token memberships) follow the same pattern in
+v26.07.1. See the [Authentication docs](https://docs.basekick.net/docs/configuration/authentication#cluster-auth-replication-enterprise)
+for the full semantics, including:
+
+- The leader-only bootstrap banner behaviour (relevant for first install + log scraping).
+- Pre-26.06.1 tokens do **not** auto-migrate — re-issue them via the API after upgrade.
+- Divergence-detection error log and remediation if a pre-existing local
+  AUTOINCREMENT row collides with a new cluster-stamped ID.
+
 ### Cluster TLS
 
 ```yaml

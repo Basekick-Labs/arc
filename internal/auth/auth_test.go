@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
@@ -88,7 +89,7 @@ func TestCreateToken(t *testing.T) {
 	defer cleanup()
 
 	t.Run("basic token creation", func(t *testing.T) {
-		token, err := am.CreateToken("test-token", "Test description", "read,write", nil)
+		token, err := am.CreateToken(context.Background(), "test-token", "Test description", "read,write", nil)
 		if err != nil {
 			t.Fatalf("CreateToken failed: %v", err)
 		}
@@ -102,12 +103,12 @@ func TestCreateToken(t *testing.T) {
 	})
 
 	t.Run("duplicate name", func(t *testing.T) {
-		_, err := am.CreateToken("dup-token", "First", "read", nil)
+		_, err := am.CreateToken(context.Background(), "dup-token", "First", "read", nil)
 		if err != nil {
 			t.Fatalf("First CreateToken failed: %v", err)
 		}
 
-		_, err = am.CreateToken("dup-token", "Second", "read", nil)
+		_, err = am.CreateToken(context.Background(), "dup-token", "Second", "read", nil)
 		if err == nil {
 			t.Error("Expected error for duplicate token name")
 		}
@@ -115,7 +116,7 @@ func TestCreateToken(t *testing.T) {
 
 	t.Run("with expiration", func(t *testing.T) {
 		expiresAt := time.Now().Add(24 * time.Hour)
-		token, err := am.CreateToken("expiring-token", "Expires in 24h", "read", &expiresAt)
+		token, err := am.CreateToken(context.Background(), "expiring-token", "Expires in 24h", "read", &expiresAt)
 		if err != nil {
 			t.Fatalf("CreateToken with expiration failed: %v", err)
 		}
@@ -125,7 +126,7 @@ func TestCreateToken(t *testing.T) {
 	})
 
 	t.Run("default permissions", func(t *testing.T) {
-		token, err := am.CreateToken("default-perms", "Default permissions", "", nil)
+		token, err := am.CreateToken(context.Background(), "default-perms", "Default permissions", "", nil)
 		if err != nil {
 			t.Fatalf("CreateToken failed: %v", err)
 		}
@@ -158,7 +159,7 @@ func TestVerifyToken(t *testing.T) {
 	defer cleanup()
 
 	t.Run("valid token", func(t *testing.T) {
-		token, _ := am.CreateToken("verify-test", "Test", "read,write", nil)
+		token, _ := am.CreateToken(context.Background(), "verify-test", "Test", "read,write", nil)
 
 		info := am.VerifyToken(token)
 		if info == nil {
@@ -189,7 +190,7 @@ func TestVerifyToken(t *testing.T) {
 	t.Run("expired token", func(t *testing.T) {
 		// Create token that expires immediately
 		expiresAt := time.Now().Add(-1 * time.Second)
-		token, _ := am.CreateToken("expired-token", "Already expired", "read", &expiresAt)
+		token, _ := am.CreateToken(context.Background(), "expired-token", "Already expired", "read", &expiresAt)
 
 		info := am.VerifyToken(token)
 		if info != nil {
@@ -203,7 +204,7 @@ func TestVerifyToken_Cache(t *testing.T) {
 	am, cleanup := setupTestAuthManager(t)
 	defer cleanup()
 
-	token, _ := am.CreateToken("cache-test", "Test", "read", nil)
+	token, _ := am.CreateToken(context.Background(), "cache-test", "Test", "read", nil)
 
 	// First verification - cache miss
 	initialMisses := am.cacheMisses.Load()
@@ -232,7 +233,7 @@ func TestRotateToken(t *testing.T) {
 	defer cleanup()
 
 	// Create initial token
-	oldToken, _ := am.CreateToken("rotate-test", "Test", "read,write", nil)
+	oldToken, _ := am.CreateToken(context.Background(), "rotate-test", "Test", "read,write", nil)
 	info := am.VerifyToken(oldToken)
 	if info == nil {
 		t.Fatal("Initial token verification failed")
@@ -240,7 +241,7 @@ func TestRotateToken(t *testing.T) {
 	tokenID := info.ID
 
 	// Rotate token
-	newToken, err := am.RotateToken(tokenID)
+	newToken, err := am.RotateToken(context.Background(), tokenID)
 	if err != nil {
 		t.Fatalf("RotateToken failed: %v", err)
 	}
@@ -265,14 +266,14 @@ func TestRevokeToken(t *testing.T) {
 	am, cleanup := setupTestAuthManager(t)
 	defer cleanup()
 
-	token, _ := am.CreateToken("revoke-test", "Test", "read", nil)
+	token, _ := am.CreateToken(context.Background(), "revoke-test", "Test", "read", nil)
 	info := am.VerifyToken(token)
 	if info == nil {
 		t.Fatal("Initial verification failed")
 	}
 
 	// Revoke token
-	err := am.RevokeToken(info.ID)
+	err := am.RevokeToken(context.Background(), info.ID)
 	if err != nil {
 		t.Fatalf("RevokeToken failed: %v", err)
 	}
@@ -288,14 +289,14 @@ func TestDeleteToken(t *testing.T) {
 	am, cleanup := setupTestAuthManager(t)
 	defer cleanup()
 
-	token, _ := am.CreateToken("delete-test", "Test", "read", nil)
+	token, _ := am.CreateToken(context.Background(), "delete-test", "Test", "read", nil)
 	info := am.VerifyToken(token)
 	if info == nil {
 		t.Fatal("Initial verification failed")
 	}
 
 	// Delete token
-	err := am.DeleteToken(info.ID)
+	err := am.DeleteToken(context.Background(), info.ID)
 	if err != nil {
 		t.Fatalf("DeleteToken failed: %v", err)
 	}
@@ -321,9 +322,9 @@ func TestListTokens(t *testing.T) {
 	defer cleanup()
 
 	// Create multiple tokens
-	am.CreateToken("list-test-1", "First", "read", nil)
-	am.CreateToken("list-test-2", "Second", "write", nil)
-	am.CreateToken("list-test-3", "Third", "read,write,admin", nil)
+	am.CreateToken(context.Background(), "list-test-1", "First", "read", nil)
+	am.CreateToken(context.Background(), "list-test-2", "Second", "write", nil)
+	am.CreateToken(context.Background(), "list-test-3", "Third", "read,write,admin", nil)
 
 	tokens, err := am.ListTokens()
 	if err != nil {
@@ -378,7 +379,7 @@ func TestHasPermission(t *testing.T) {
 				return
 			}
 
-			token, _ := am.CreateToken("perm-test-"+tt.name, "Test", tt.permissions, nil)
+			token, _ := am.CreateToken(context.Background(), "perm-test-"+tt.name, "Test", tt.permissions, nil)
 			info := am.VerifyToken(token)
 			if info == nil {
 				t.Fatal("Token verification failed")
@@ -397,7 +398,7 @@ func TestUpdateToken(t *testing.T) {
 	am, cleanup := setupTestAuthManager(t)
 	defer cleanup()
 
-	token, _ := am.CreateToken("update-test", "Original", "read", nil)
+	token, _ := am.CreateToken(context.Background(), "update-test", "Original", "read", nil)
 	info := am.VerifyToken(token)
 	if info == nil {
 		t.Fatal("Initial verification failed")
@@ -405,7 +406,7 @@ func TestUpdateToken(t *testing.T) {
 
 	// Update description
 	newDesc := "Updated description"
-	err := am.UpdateToken(info.ID, nil, &newDesc, nil, nil)
+	err := am.UpdateToken(context.Background(), info.ID, nil, &newDesc, nil, nil)
 	if err != nil {
 		t.Fatalf("UpdateToken failed: %v", err)
 	}
@@ -426,7 +427,7 @@ func TestGetCacheStats(t *testing.T) {
 	defer cleanup()
 
 	// Create and verify a token to populate cache
-	token, _ := am.CreateToken("stats-test", "Test", "read", nil)
+	token, _ := am.CreateToken(context.Background(), "stats-test", "Test", "read", nil)
 	am.VerifyToken(token) // Cache miss
 	am.VerifyToken(token) // Cache hit
 
@@ -452,7 +453,7 @@ func TestInvalidateCache(t *testing.T) {
 	defer cleanup()
 
 	// Create and cache a token
-	token, _ := am.CreateToken("invalidate-test", "Test", "read", nil)
+	token, _ := am.CreateToken(context.Background(), "invalidate-test", "Test", "read", nil)
 	am.VerifyToken(token)
 
 	// Check cache has entry
@@ -481,7 +482,7 @@ func TestEnsureInitialToken(t *testing.T) {
 	defer cleanup()
 
 	// First call should create token
-	token, err := am.EnsureInitialToken()
+	token, err := am.EnsureInitialToken(context.Background())
 	if err != nil {
 		t.Fatalf("EnsureInitialToken failed: %v", err)
 	}
@@ -499,7 +500,7 @@ func TestEnsureInitialToken(t *testing.T) {
 	}
 
 	// Second call should return empty (tokens already exist)
-	token2, err := am.EnsureInitialToken()
+	token2, err := am.EnsureInitialToken(context.Background())
 	if err != nil {
 		t.Fatalf("Second EnsureInitialToken failed: %v", err)
 	}
@@ -526,7 +527,7 @@ func TestCacheEviction(t *testing.T) {
 	// Create and verify 4 tokens (should cause eviction)
 	var tokens []string
 	for i := 0; i < 4; i++ {
-		token, _ := am.CreateToken("eviction-test-"+string(rune('a'+i)), "Test", "read", nil)
+		token, _ := am.CreateToken(context.Background(), "eviction-test-"+string(rune('a'+i)), "Test", "read", nil)
 		tokens = append(tokens, token)
 		am.VerifyToken(token)
 	}
@@ -551,7 +552,7 @@ func TestTokenPrefix(t *testing.T) {
 	defer cleanup()
 
 	// Create token and verify prefix is stored
-	token, _ := am.CreateToken("prefix-test", "Test", "read", nil)
+	token, _ := am.CreateToken(context.Background(), "prefix-test", "Test", "read", nil)
 
 	// Query database directly to check prefix
 	var storedPrefix string
@@ -621,7 +622,7 @@ func TestCreateTokenWithValue(t *testing.T) {
 	validToken := "this-is-a-valid-token-value-with-enough-length"
 
 	t.Run("creates token with provided value", func(t *testing.T) {
-		got, err := am.CreateTokenWithValue(validToken, "bootstrap", "Bootstrap token", "read,write,admin", nil)
+		got, err := am.CreateTokenWithValue(context.Background(), validToken, "bootstrap", "Bootstrap token", "read,write,admin", nil)
 		if err != nil {
 			t.Fatalf("CreateTokenWithValue failed: %v", err)
 		}
@@ -640,21 +641,21 @@ func TestCreateTokenWithValue(t *testing.T) {
 	})
 
 	t.Run("rejects token shorter than 32 chars", func(t *testing.T) {
-		_, err := am.CreateTokenWithValue("tooshort", "short", "desc", "read", nil)
+		_, err := am.CreateTokenWithValue(context.Background(), "tooshort", "short", "desc", "read", nil)
 		if err == nil {
 			t.Error("expected error for token shorter than 32 chars")
 		}
 	})
 
 	t.Run("rejects duplicate name", func(t *testing.T) {
-		_, err := am.CreateTokenWithValue(validToken+"2", "bootstrap", "dup", "read", nil)
+		_, err := am.CreateTokenWithValue(context.Background(), validToken+"2", "bootstrap", "dup", "read", nil)
 		if err == nil {
 			t.Error("expected error for duplicate token name")
 		}
 	})
 
 	t.Run("default permissions are read,write when empty", func(t *testing.T) {
-		got, err := am.CreateTokenWithValue("another-valid-token-value-long-enough-here", "default-perms", "desc", "", nil)
+		got, err := am.CreateTokenWithValue(context.Background(), "another-valid-token-value-long-enough-here", "default-perms", "desc", "", nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -682,7 +683,7 @@ func TestEnsureInitialTokenWithValue(t *testing.T) {
 		am, cleanup := setupTestAuthManager(t)
 		defer cleanup()
 
-		got, err := am.EnsureInitialTokenWithValue(validToken)
+		got, err := am.EnsureInitialTokenWithValue(context.Background(), validToken)
 		if err != nil {
 			t.Fatalf("EnsureInitialTokenWithValue failed: %v", err)
 		}
@@ -704,12 +705,12 @@ func TestEnsureInitialTokenWithValue(t *testing.T) {
 		defer cleanup()
 
 		// Pre-create a token
-		_, err := am.CreateToken("existing", "pre-existing token", "admin", nil)
+		_, err := am.CreateToken(context.Background(), "existing", "pre-existing token", "admin", nil)
 		if err != nil {
 			t.Fatalf("pre-create failed: %v", err)
 		}
 
-		got, err := am.EnsureInitialTokenWithValue(validToken)
+		got, err := am.EnsureInitialTokenWithValue(context.Background(), validToken)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -731,7 +732,7 @@ func TestEnsureInitialTokenWithValue(t *testing.T) {
 		am, cleanup := setupTestAuthManager(t)
 		defer cleanup()
 
-		_, err := am.EnsureInitialTokenWithValue("short")
+		_, err := am.EnsureInitialTokenWithValue(context.Background(), "short")
 		if err == nil {
 			t.Error("expected error for token shorter than 32 chars")
 		}
@@ -745,7 +746,7 @@ func TestEnsureInitialTokenWithValue(t *testing.T) {
 		results := make(chan error, goroutines)
 		for i := 0; i < goroutines; i++ {
 			go func() {
-				_, err := am.EnsureInitialTokenWithValue(validToken)
+				_, err := am.EnsureInitialTokenWithValue(context.Background(), validToken)
 				results <- err
 			}()
 		}
@@ -776,12 +777,12 @@ func TestForceAddRecoveryToken(t *testing.T) {
 		defer cleanup()
 
 		// Create an existing admin token
-		existingToken, err := am.CreateToken("existing-admin", "pre-existing", "read,write,admin", nil)
+		existingToken, err := am.CreateToken(context.Background(), "existing-admin", "pre-existing", "read,write,admin", nil)
 		if err != nil {
 			t.Fatalf("pre-create failed: %v", err)
 		}
 
-		got, err := am.ForceAddRecoveryToken(recoveryToken)
+		got, err := am.ForceAddRecoveryToken(context.Background(), recoveryToken)
 		if err != nil {
 			t.Fatalf("ForceAddRecoveryToken failed: %v", err)
 		}
@@ -808,7 +809,7 @@ func TestForceAddRecoveryToken(t *testing.T) {
 		am, cleanup := setupTestAuthManager(t)
 		defer cleanup()
 
-		_, err := am.ForceAddRecoveryToken(recoveryToken)
+		_, err := am.ForceAddRecoveryToken(context.Background(), recoveryToken)
 		if err != nil {
 			t.Fatalf("ForceAddRecoveryToken failed: %v", err)
 		}
@@ -829,13 +830,13 @@ func TestForceAddRecoveryToken(t *testing.T) {
 		am, cleanup := setupTestAuthManager(t)
 		defer cleanup()
 
-		_, err := am.ForceAddRecoveryToken(recoveryToken)
+		_, err := am.ForceAddRecoveryToken(context.Background(), recoveryToken)
 		if err != nil {
 			t.Fatalf("first ForceAddRecoveryToken failed: %v", err)
 		}
 
 		// Second call with same token name should be a no-op, not an error
-		got, err := am.ForceAddRecoveryToken(recoveryToken)
+		got, err := am.ForceAddRecoveryToken(context.Background(), recoveryToken)
 		if err != nil {
 			t.Fatalf("second ForceAddRecoveryToken should not error: %v", err)
 		}
@@ -848,7 +849,7 @@ func TestForceAddRecoveryToken(t *testing.T) {
 		am, cleanup := setupTestAuthManager(t)
 		defer cleanup()
 
-		_, err := am.ForceAddRecoveryToken("short")
+		_, err := am.ForceAddRecoveryToken(context.Background(), "short")
 		if err == nil {
 			t.Error("expected error for token shorter than 32 chars")
 		}

@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -397,7 +398,7 @@ func TestTokenMembership(t *testing.T) {
 	team, _ := rm.CreateTeam(org.ID, &CreateTeamRequest{Name: "membership-test-team"})
 
 	// Create a token
-	token, _ := am.CreateToken("membership-test", "Test token", "read,write", nil)
+	token, _ := am.CreateToken(context.Background(), "membership-test", "Test token", "read,write", nil)
 	tokenInfo := am.VerifyToken(token)
 
 	t.Run("add token to team", func(t *testing.T) {
@@ -514,7 +515,7 @@ func TestCheckPermission(t *testing.T) {
 	defer cleanup()
 
 	// Create token with read,write permissions
-	token, _ := am.CreateToken("perm-test", "Test token", "read,write", nil)
+	token, _ := am.CreateToken(context.Background(), "perm-test", "Test token", "read,write", nil)
 	tokenInfo := am.VerifyToken(token)
 
 	// Without RBAC enabled (no license), should use OSS permissions
@@ -563,7 +564,7 @@ func TestCheckPermissionWithAdmin(t *testing.T) {
 	defer cleanup()
 
 	// Create admin token
-	token, _ := am.CreateToken("admin-test", "Admin token", "admin", nil)
+	token, _ := am.CreateToken(context.Background(), "admin-test", "Admin token", "admin", nil)
 	tokenInfo := am.VerifyToken(token)
 
 	// Admin should have all permissions
@@ -591,7 +592,7 @@ func TestGetEffectivePermissions(t *testing.T) {
 	defer cleanup()
 
 	// Create token
-	token, _ := am.CreateToken("eff-perm-test", "Test token", "read,write", nil)
+	token, _ := am.CreateToken(context.Background(), "eff-perm-test", "Test token", "read,write", nil)
 	tokenInfo := am.VerifyToken(token)
 
 	t.Run("OSS permissions only", func(t *testing.T) {

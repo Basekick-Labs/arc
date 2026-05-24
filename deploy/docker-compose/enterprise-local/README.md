@@ -123,9 +123,26 @@ Each node's `/app/data` volume contains:
 
 ## Usage
 
+Both `ARC_LICENSE_KEY` and `ARC_CLUSTER_SHARED_SECRET` must be set before
+bringing the cluster up. The compose file reads them via the `.env` file
+in this directory (gitignored). Create it once:
+
 ```bash
-# Start the cluster
-export ARC_LICENSE_KEY="your-enterprise-license-key"
+# .env (alongside docker-compose.yml)
+ARC_LICENSE_KEY=ARC-ENT-XXXX-XXXX-XXXX-XXXX
+ARC_CLUSTER_SHARED_SECRET=$(openssl rand -hex 32)
+```
+
+The shared secret authenticates HMAC for every cluster-internal RPC:
+peer file fetch, leader-forward apply (since v26.06.1 this includes the
+Phase A token-replication path), WAL replication handshake, and the
+post-compaction cache-invalidate fan-out. Without it, follower-to-leader
+forward-apply fails HMAC validation and **token writes that originate on
+a non-leader silently fail** — readers can ingest cluster state but
+can't issue admin API calls that mutate it.
+
+```bash
+# Start the cluster (reads .env automatically)
 docker compose up -d
 
 # Check cluster status
@@ -143,6 +160,22 @@ curl -X POST "http://localhost:8000/api/v1/query" \
 # Traefik dashboard (live routers and backends)
 open http://localhost:8080
 ```
+
+### Admin token on first boot
+
+On a fresh cluster start, **only one node** prints the `Admin API token:`
+banner — the Raft leader that wins the bootstrap election (Phase A,
+v26.06.1+). The other three nodes silently no-op the bootstrap and
+converge on the leader's token via Raft. To find the banner:
+
+```bash
+docker logs arc-writer1 arc-writer2 arc-writer3 arc-reader1 2>&1 | \
+  grep -A1 'Admin API token:'
+```
+
+Tokens you subsequently create / revoke / rotate via the API on any
+node propagate cluster-wide. See the [Authentication docs](https://docs.basekick.net/docs/configuration/authentication#cluster-auth-replication-enterprise)
+for the full semantics.
 
 ## Ports
 

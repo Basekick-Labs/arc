@@ -315,16 +315,16 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		c.sendForwardApplyError(conn, protocol.ForwardCodeAuth, "unknown node")
 		return
 	}
+	// Role gate is split between manifest commands and auth commands.
+	// Manifest commands (Register/Delete/BatchOps) are only legitimately
+	// proposed by ingest and compactor nodes — readers don't write files.
+	// Auth commands (Create/Update/Revoke/Delete/Rotate Token), in
+	// contrast, can originate on ANY node that serves the API (every
+	// role does), since the user-facing auth API is hosted on every
+	// node. We defer the role check to the per-command-type block
+	// below: if the command turns out to be auth, role doesn't gate;
+	// if manifest, the original CanIngest||CanCompact rule applies.
 	caps := peerNode.Role.GetCapabilities()
-	if !caps.CanIngest && !caps.CanCompact {
-		c.logger.Warn().
-			Str("peer", remoteAddr).
-			Str("requesting_node", req.NodeID).
-			Str("role", string(peerNode.Role)).
-			Msg("ForwardApply rejected: node role not authorized for manifest mutations")
-		c.sendForwardApplyError(conn, protocol.ForwardCodeAuth, "unauthorized role")
-		return
-	}
 
 	// Confirm we're STILL the leader. The caller forwarded to us because
 	// their LeaderID() check said we're leader, but leadership can flap
@@ -353,21 +353,50 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		return
 	}
 
-	// Security: allowlist the command types that may be forwarded. Only
-	// file-manifest operations (RegisterFile, DeleteFile, BatchFileOps) are
-	// expected via leader forwarding. Topology-mutating commands (AddNode,
-	// RemoveNode, PromoteWriter, etc.) must go through their dedicated
-	// join/leave handlers which have their own auth flow. Rejecting
-	// unexpected types prevents a compromised peer from escalating a
-	// shared-secret credential into topology mutations.
-	if cmd.Type != clusterraft.CommandRegisterFile &&
-		cmd.Type != clusterraft.CommandDeleteFile &&
-		cmd.Type != clusterraft.CommandBatchFileOps {
+	// Security: allowlist the command types that may be forwarded.
+	// Two distinct classes today:
+	//
+	//   - Manifest commands (RegisterFile, DeleteFile, BatchFileOps):
+	//     proposed by ingest + compactor nodes. Gated by
+	//     CanIngest||CanCompact since readers don't write files.
+	//
+	//   - Auth commands (CreateToken/Update/Revoke/Delete/RotateToken,
+	//     Phase A): proposed by ANY node that serves the user-facing
+	//     auth API (every role does). The user's request is already
+	//     authenticated and admin-checked at the API layer on the
+	//     proposing node — by the time we get here, the only
+	//     authorisation concern is "is this peer a known cluster
+	//     member", which knownPeer above already pinned. Role does
+	//     not gate auth commands.
+	//
+	// Topology-mutating commands (AddNode, RemoveNode, PromoteWriter,
+	// etc.) must go through their dedicated join/leave handlers which
+	// have their own auth flow. Rejecting unexpected types prevents a
+	// compromised peer from escalating a shared-secret credential into
+	// topology mutations.
+	isManifest := cmd.Type == clusterraft.CommandRegisterFile ||
+		cmd.Type == clusterraft.CommandDeleteFile ||
+		cmd.Type == clusterraft.CommandBatchFileOps
+	isAuth := cmd.Type == clusterraft.CommandCreateToken ||
+		cmd.Type == clusterraft.CommandUpdateToken ||
+		cmd.Type == clusterraft.CommandRevokeToken ||
+		cmd.Type == clusterraft.CommandDeleteToken ||
+		cmd.Type == clusterraft.CommandRotateToken
+	if !isManifest && !isAuth {
 		c.logger.Warn().
 			Str("requesting_node", req.NodeID).
 			Int("cmd_type", int(cmd.Type)).
 			Msg("ForwardApply rejected: command type not allowed via forwarding")
 		c.sendForwardApplyError(conn, protocol.ForwardCodeInvalidCommand, "command type not allowed via forwarding")
+		return
+	}
+	if isManifest && !caps.CanIngest && !caps.CanCompact {
+		c.logger.Warn().
+			Str("peer", remoteAddr).
+			Str("requesting_node", req.NodeID).
+			Str("role", string(peerNode.Role)).
+			Msg("ForwardApply rejected: node role not authorized for manifest mutations")
+		c.sendForwardApplyError(conn, protocol.ForwardCodeAuth, "unauthorized role")
 		return
 	}
 
@@ -380,7 +409,13 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 			Str("requesting_node", req.NodeID).
 			Int("cmd_type", int(cmd.Type)).
 			Msg("ForwardApply: Raft Apply failed")
-		c.sendForwardApplyError(conn, protocol.ForwardCodeApplyFailed, "raft apply failed")
+		// Preserve the FSM's actual error message in the ack so the
+		// follower-side caller can branch on it via strings.Contains
+		// (e.g. ensureFirstToken's "already exists" detection). Without
+		// this, every follower would see the same canned "raft apply
+		// failed" string and fail to recognise legitimate idempotency
+		// signals. PR #451 round-3 internal review.
+		c.sendForwardApplyError(conn, protocol.ForwardCodeApplyFailed, err.Error())
 		return
 	}
 

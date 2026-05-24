@@ -28,8 +28,11 @@ Cluster composition:
      kubectl -n {{ .Release.Namespace }} get secret {{ include "arc-enterprise.bootstrapTokenSecretName" . }} -o jsonpath='{.data.bootstrap-token}' | base64 -d
 {{- else }}
 
-     # Arc generated a random admin token on first boot — read it from writer-0 logs:
-     kubectl -n {{ .Release.Namespace }} logs {{ include "arc-enterprise.writerName" . }}-0 | grep -i "initial admin token"
+     # Arc generated a random admin token on first boot.
+     # In Arc Enterprise v26.06.1+, exactly ONE pod (the Raft leader that won
+     # the bootstrap election) prints the banner — other pods silently no-op
+     # and converge on the leader's token via Raft. Search all writer pods:
+     kubectl -n {{ .Release.Namespace }} logs -l app.kubernetes.io/component=writer --prefix=true --tail=-1 | grep -B1 -A2 'Admin API token:'
 {{- end }}
 
 3. Port-forward the writer (ingest) and reader (query) services:
