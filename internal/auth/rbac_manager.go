@@ -1847,6 +1847,15 @@ func readBackAfterPropose(ctx context.Context, scan func() error) error {
 	}
 	var lastErr error
 	for _, d := range delays {
+		// Honour ctx at the top of every iteration in addition to the
+		// select-during-wait arm below. Covers two cases the select
+		// alone misses: (a) first iteration has d==0 and skips the
+		// select, so a pre-cancelled ctx would still run one Scan; and
+		// (b) ctx cancelled while the previous iteration's Scan was
+		// in flight. Gemini PR #458 round 6.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if d > 0 {
 			select {
 			case <-ctx.Done():

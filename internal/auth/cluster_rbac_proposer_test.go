@@ -809,3 +809,57 @@ func TestReadBackAfterPropose_HonoursCtxCancel(t *testing.T) {
 		t.Errorf("readBackAfterPropose ignored ctx.Done: took %v (expected ≤300ms)", elapsed)
 	}
 }
+
+// TestReadBackAfterPropose_PreCancelledCtxNoScans pins Gemini PR #458
+// round 6 G22: a ctx that is ALREADY cancelled before
+// readBackAfterPropose is called must not run even one Scan attempt.
+// Pre-round-6 the first iteration had d==0 and skipped the select arm
+// entirely, so one wasted Scan would still run.
+//
+// We can't directly observe "Scan didn't run" through the helper's
+// public surface, but we can prove it via a side-channel: the
+// deferredApplyProposer schedules the apply 100ms in the future, so
+// if any Scan runs, it'll see sql.ErrNoRows AND the helper's
+// total runtime will include at least one Scan latency (~sub-ms).
+// More importantly, the helper must return immediately with
+// context.Canceled, not bail after the first failed Scan with
+// sql.ErrNoRows wrapped. Returning ctx.Err() proves the
+// top-of-loop check ran BEFORE the scan.
+func TestReadBackAfterPropose_PreCancelledCtxNoScans(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "rbac-precancel.db")
+	am, err := NewAuthManager(dbPath, 100*time.Millisecond, 100, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewAuthManager: %v", err)
+	}
+	defer am.Close()
+	rm := NewRBACManager(&RBACManagerConfig{DB: am.GetDB(), Logger: zerolog.Nop()})
+	defer rm.Close()
+
+	prop := &deferredApplyProposer{rm: rm, applyDelay: 100 * time.Millisecond}
+	rm.SetRaftProposer(prop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already-cancelled BEFORE the call
+
+	start := time.Now()
+	_, err = rm.CreateOrganization(ctx, &CreateOrganizationRequest{Name: "precancel-org"})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error on pre-cancelled ctx, got nil")
+	}
+	// The error chain must include context.Canceled — proves the
+	// top-of-loop ctx.Err() check fired before any Scan.
+	if !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "context canceled") {
+		t.Errorf("expected context.Canceled in error chain, got: %v", err)
+	}
+	// Pre-fix: would have done one Scan (~sub-ms) + returned
+	// sql.ErrNoRows wrapped. Post-fix: helper returns immediately
+	// without scanning. Either way the test runs very fast; the
+	// observable signal is the error type, not the elapsed time.
+	// But assert under 50ms anyway to catch any future regression
+	// that adds an unexpected wait.
+	if elapsed > 50*time.Millisecond {
+		t.Errorf("pre-cancelled ctx should bail immediately, took %v", elapsed)
+	}
+}
