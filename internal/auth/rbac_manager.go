@@ -310,9 +310,10 @@ func (rm *RBACManager) CreateOrganization(ctx context.Context, req *CreateOrgani
 		return &org, nil
 	}
 
-	_ = ctx
+	// OSS path: direct SQLite. ExecContext so cancellation is honoured
+	// even on the standalone deployment. Gemini PR #458 round 3.
 	now := time.Now()
-	result, err := rm.db.Exec(`
+	result, err := rm.db.ExecContext(ctx, `
 		INSERT INTO rbac_organizations (name, description, created_at, updated_at, enabled)
 		VALUES (?, ?, ?, ?, 1)
 	`, req.Name, req.Description, now, now)
@@ -410,7 +411,8 @@ func (rm *RBACManager) UpdateOrganization(ctx context.Context, id int64, req *Up
 		return nil
 	}
 
-	_ = ctx
+	// OSS path: direct SQLite. ExecContext honours ctx cancellation.
+	// Gemini PR #458 round 3.
 	var updates []string
 	var args []interface{}
 
@@ -440,7 +442,7 @@ func (rm *RBACManager) UpdateOrganization(ctx context.Context, id int64, req *Up
 	args = append(args, id)
 
 	query := fmt.Sprintf("UPDATE rbac_organizations SET %s WHERE id = ?", strings.Join(updates, ", "))
-	result, err := rm.db.Exec(query, args...)
+	result, err := rm.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
 			return errors.New("organization with that name already exists")
@@ -471,8 +473,8 @@ func (rm *RBACManager) DeleteOrganization(ctx context.Context, id int64) error {
 		return nil
 	}
 
-	_ = ctx
-	result, err := rm.db.Exec("DELETE FROM rbac_organizations WHERE id = ?", id)
+	// OSS path. Gemini PR #458 round 3: ExecContext honours ctx.
+	result, err := rm.db.ExecContext(ctx, "DELETE FROM rbac_organizations WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("failed to delete organization: %w", err)
 	}
@@ -534,7 +536,9 @@ func (rm *RBACManager) CreateTeam(ctx context.Context, orgID int64, req *CreateT
 		return &team, nil
 	}
 
-	_ = ctx
+	// OSS path. GetOrganization is a Get helper that does not currently
+	// thread ctx; the INSERT uses ExecContext so cancellation is at
+	// least honoured at the mutation site. Gemini PR #458 round 3.
 	// Verify organization exists
 	org, err := rm.GetOrganization(orgID)
 	if err != nil {
@@ -545,7 +549,7 @@ func (rm *RBACManager) CreateTeam(ctx context.Context, orgID int64, req *CreateT
 	}
 
 	now := time.Now()
-	result, err := rm.db.Exec(`
+	result, err := rm.db.ExecContext(ctx, `
 		INSERT INTO rbac_teams (organization_id, name, description, created_at, updated_at, enabled)
 		VALUES (?, ?, ?, ?, ?, 1)
 	`, orgID, req.Name, req.Description, now, now)
@@ -643,7 +647,7 @@ func (rm *RBACManager) UpdateTeam(ctx context.Context, id int64, req *UpdateTeam
 		return nil
 	}
 
-	_ = ctx
+	// OSS path. Gemini PR #458 round 3.
 	var updates []string
 	var args []interface{}
 
@@ -673,7 +677,7 @@ func (rm *RBACManager) UpdateTeam(ctx context.Context, id int64, req *UpdateTeam
 	args = append(args, id)
 
 	query := fmt.Sprintf("UPDATE rbac_teams SET %s WHERE id = ?", strings.Join(updates, ", "))
-	result, err := rm.db.Exec(query, args...)
+	result, err := rm.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
 			return errors.New("team with that name already exists in this organization")
@@ -705,8 +709,8 @@ func (rm *RBACManager) DeleteTeam(ctx context.Context, id int64) error {
 		return nil
 	}
 
-	_ = ctx
-	result, err := rm.db.Exec("DELETE FROM rbac_teams WHERE id = ?", id)
+	// OSS path. Gemini PR #458 round 3.
+	result, err := rm.db.ExecContext(ctx, "DELETE FROM rbac_teams WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("failed to delete team: %w", err)
 	}
@@ -787,7 +791,7 @@ func (rm *RBACManager) CreateRole(ctx context.Context, teamID int64, req *Create
 		return &role, nil
 	}
 
-	_ = ctx
+	// OSS path. Gemini PR #458 round 3.
 	team, err := rm.GetTeam(teamID)
 	if err != nil {
 		return nil, err
@@ -798,7 +802,7 @@ func (rm *RBACManager) CreateRole(ctx context.Context, teamID int64, req *Create
 
 	now := time.Now()
 	perms := strings.Join(req.Permissions, ",")
-	result, err := rm.db.Exec(`
+	result, err := rm.db.ExecContext(ctx, `
 		INSERT INTO rbac_roles (team_id, database_pattern, permissions, created_at)
 		VALUES (?, ?, ?, ?)
 	`, teamID, req.DatabasePattern, perms, now)
@@ -905,7 +909,7 @@ func (rm *RBACManager) UpdateRole(ctx context.Context, id int64, req *UpdateRole
 		return nil
 	}
 
-	_ = ctx
+	// OSS path. Gemini PR #458 round 3.
 	var updates []string
 	var args []interface{}
 
@@ -924,7 +928,7 @@ func (rm *RBACManager) UpdateRole(ctx context.Context, id int64, req *UpdateRole
 
 	args = append(args, id)
 	query := fmt.Sprintf("UPDATE rbac_roles SET %s WHERE id = ?", strings.Join(updates, ", "))
-	result, err := rm.db.Exec(query, args...)
+	result, err := rm.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("failed to update role: %w", err)
 	}
@@ -952,8 +956,8 @@ func (rm *RBACManager) DeleteRole(ctx context.Context, id int64) error {
 		return nil
 	}
 
-	_ = ctx
-	result, err := rm.db.Exec("DELETE FROM rbac_roles WHERE id = ?", id)
+	// OSS path. Gemini PR #458 round 3.
+	result, err := rm.db.ExecContext(ctx, "DELETE FROM rbac_roles WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("failed to delete role: %w", err)
 	}
@@ -1029,7 +1033,7 @@ func (rm *RBACManager) CreateMeasurementPermission(ctx context.Context, roleID i
 		return &mp, nil
 	}
 
-	_ = ctx
+	// OSS path. Gemini PR #458 round 3.
 	role, err := rm.GetRole(roleID)
 	if err != nil {
 		return nil, err
@@ -1040,7 +1044,7 @@ func (rm *RBACManager) CreateMeasurementPermission(ctx context.Context, roleID i
 
 	now := time.Now()
 	perms := strings.Join(req.Permissions, ",")
-	result, err := rm.db.Exec(`
+	result, err := rm.db.ExecContext(ctx, `
 		INSERT INTO rbac_measurement_permissions (role_id, measurement_pattern, permissions, created_at)
 		VALUES (?, ?, ?, ?)
 	`, roleID, req.MeasurementPattern, perms, now)
@@ -1101,8 +1105,8 @@ func (rm *RBACManager) DeleteMeasurementPermission(ctx context.Context, id int64
 		return nil
 	}
 
-	_ = ctx
-	result, err := rm.db.Exec("DELETE FROM rbac_measurement_permissions WHERE id = ?", id)
+	// OSS path. Gemini PR #458 round 3.
+	result, err := rm.db.ExecContext(ctx, "DELETE FROM rbac_measurement_permissions WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("failed to delete measurement permission: %w", err)
 	}
@@ -1159,7 +1163,7 @@ func (rm *RBACManager) AddTokenToTeam(ctx context.Context, tokenID, teamID int64
 		return &mem, nil
 	}
 
-	_ = ctx
+	// OSS path. Gemini PR #458 round 3.
 	team, err := rm.GetTeam(teamID)
 	if err != nil {
 		return nil, err
@@ -1169,7 +1173,7 @@ func (rm *RBACManager) AddTokenToTeam(ctx context.Context, tokenID, teamID int64
 	}
 
 	now := time.Now()
-	result, err := rm.db.Exec(`
+	result, err := rm.db.ExecContext(ctx, `
 		INSERT INTO rbac_token_memberships (token_id, team_id, created_at)
 		VALUES (?, ?, ?)
 	`, tokenID, teamID, now)
@@ -1204,8 +1208,8 @@ func (rm *RBACManager) RemoveTokenFromTeam(ctx context.Context, tokenID, teamID 
 		return nil
 	}
 
-	_ = ctx
-	result, err := rm.db.Exec(`
+	// OSS path. Gemini PR #458 round 3.
+	result, err := rm.db.ExecContext(ctx, `
 		DELETE FROM rbac_token_memberships WHERE token_id = ? AND team_id = ?
 	`, tokenID, teamID)
 	if err != nil {

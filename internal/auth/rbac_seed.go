@@ -72,7 +72,7 @@ func (rm *RBACManager) SeedRBACFromLocalSQLite(ctx context.Context) error {
 	// path (or "cluster that was already migrated"). Errors are logged
 	// at Warn and treated as "state may exist" so we still attempt the
 	// seed pass; better to do redundant work than to silently skip.
-	if has, err := rm.HasLocalRBACState(); err != nil {
+	if has, err := rm.HasLocalRBACState(ctx); err != nil {
 		rm.logger.Warn().Err(err).Msg("SeedRBACFromLocalSQLite: HasLocalRBACState failed; proceeding with full seed scan")
 	} else if !has {
 		rm.logger.Info().Msg("SeedRBACFromLocalSQLite: no local RBAC rows; nothing to seed")
@@ -100,7 +100,9 @@ func (rm *RBACManager) SeedRBACFromLocalSQLite(ctx context.Context) error {
 		// Inner scope so defer rows.Close() fires before the outer
 		// SeedRBACFromLocalSQLite continues to its COUNT(*) checks,
 		// keeping the rows handle short-lived. Gemini PR #458 round 2.
-		rows, qerr := rm.db.Query(`
+		// QueryContext so a cancelled ctx propagates to the driver and
+		// frees the connection immediately. Gemini PR #458 round 3.
+		rows, qerr := rm.db.QueryContext(ctx, `
 			SELECT id, name, description, created_at, updated_at, enabled
 			FROM rbac_organizations ORDER BY id
 		`)
@@ -129,6 +131,16 @@ func (rm *RBACManager) SeedRBACFromLocalSQLite(ctx context.Context) error {
 		return err
 	}
 	for _, r := range orgRows {
+		// Bail out early on ctx cancel/timeout to avoid a flood of
+		// proposeRBACCommand failures that would each log Error.
+		// Gemini PR #458 round 3.
+		if err := ctx.Err(); err != nil {
+			rm.logger.Warn().Err(err).Msg("seed: ctx cancelled mid-pass; remaining organizations not seeded")
+			if firstErr == nil {
+				firstErr = err
+			}
+			break
+		}
 		payload := createOrganizationPayloadWire{
 			Organization: clusterOrganizationEntryWire{
 				Name:              r.name,
@@ -167,17 +179,18 @@ func (rm *RBACManager) SeedRBACFromLocalSQLite(ctx context.Context) error {
 	var teamsPresent, rolesPresent, mpermsPresent, memPresent int
 	// COUNT(*) errors here are surfaced at Warn rather than silently
 	// swallowed — a future schema migration breaking one of these
-	// tables should not be invisible at startup.
-	if err := rm.db.QueryRow(`SELECT COUNT(*) FROM rbac_teams`).Scan(&teamsPresent); err != nil {
+	// tables should not be invisible at startup. QueryRowContext so a
+	// cancelled ctx releases the connection. Gemini PR #458 round 3.
+	if err := rm.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rbac_teams`).Scan(&teamsPresent); err != nil {
 		rm.logger.Warn().Err(err).Msg("SeedRBACFromLocalSQLite: COUNT rbac_teams failed (treating as 0)")
 	}
-	if err := rm.db.QueryRow(`SELECT COUNT(*) FROM rbac_roles`).Scan(&rolesPresent); err != nil {
+	if err := rm.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rbac_roles`).Scan(&rolesPresent); err != nil {
 		rm.logger.Warn().Err(err).Msg("SeedRBACFromLocalSQLite: COUNT rbac_roles failed (treating as 0)")
 	}
-	if err := rm.db.QueryRow(`SELECT COUNT(*) FROM rbac_measurement_permissions`).Scan(&mpermsPresent); err != nil {
+	if err := rm.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rbac_measurement_permissions`).Scan(&mpermsPresent); err != nil {
 		rm.logger.Warn().Err(err).Msg("SeedRBACFromLocalSQLite: COUNT rbac_measurement_permissions failed (treating as 0)")
 	}
-	if err := rm.db.QueryRow(`SELECT COUNT(*) FROM rbac_token_memberships`).Scan(&memPresent); err != nil {
+	if err := rm.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rbac_token_memberships`).Scan(&memPresent); err != nil {
 		rm.logger.Warn().Err(err).Msg("SeedRBACFromLocalSQLite: COUNT rbac_token_memberships failed (treating as 0)")
 	}
 	if teamsPresent+rolesPresent+mpermsPresent+memPresent > 0 {
@@ -216,9 +229,12 @@ func isDuplicateErr(err error) bool {
 // HasLocalRBACState reports whether the leader's local SQLite holds any
 // RBAC rows. Useful as a cheap "do we even need to seed" check before
 // firing 5 individual table scans.
-func (rm *RBACManager) HasLocalRBACState() (bool, error) {
+//
+// ctx is honoured via QueryRowContext so a cancelled seed run releases
+// the DB connection immediately. Gemini PR #458 round 3.
+func (rm *RBACManager) HasLocalRBACState(ctx context.Context) (bool, error) {
 	var count int
-	err := rm.db.QueryRow(`
+	err := rm.db.QueryRowContext(ctx, `
 		SELECT (
 			SELECT COUNT(*) FROM rbac_organizations
 		) + (
