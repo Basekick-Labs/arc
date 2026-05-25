@@ -544,6 +544,24 @@ func TestRBACSeed_PopulatesOrgsFromLocalSQLite(t *testing.T) {
 	defer rmA.Close()
 
 	ctx := context.Background()
+	// Pre-seed a few throwaway orgs and then delete them, advancing the
+	// AUTOINCREMENT counter past id=1 BEFORE creating the target org.
+	// This guarantees the pre-existing "preexisting" row lands at a
+	// non-1 AUTOINCREMENT id (e.g. 4) while the FSM proposer will stamp
+	// id=1 on its first apply — exercising the G1 upgrade-seed-accept
+	// path where the cluster id and local id genuinely differ. Without
+	// this nudge both ids coincide at 1 and the seed-accept branch
+	// never fires.
+	for _, throwaway := range []string{"throw-one", "throw-two", "throw-three"} {
+		if _, err := rmA.CreateOrganization(ctx, &auth.CreateOrganizationRequest{Name: throwaway}); err != nil {
+			t.Fatalf("pre-seed throwaway %s: %v", throwaway, err)
+		}
+	}
+	if _, err := amA.GetDB().Exec(`DELETE FROM rbac_organizations WHERE name LIKE 'throw-%'`); err != nil {
+		t.Fatalf("clear throwaway orgs: %v", err)
+	}
+	// Now the target org lands at a high AUTOINCREMENT id (e.g. 4),
+	// guaranteed to differ from the proposer's first log-index id (1).
 	if _, err := rmA.CreateOrganization(ctx, &auth.CreateOrganizationRequest{Name: "preexisting"}); err != nil {
 		t.Fatalf("pre-seed org: %v", err)
 	}
@@ -568,6 +586,19 @@ func TestRBACSeed_PopulatesOrgsFromLocalSQLite(t *testing.T) {
 	rmA.SetRaftProposer(replicator)
 	rmB.SetRaftProposer(replicator)
 
+	// Capture the pre-seed id on node A so we can assert the upgrade-seed
+	// re-alignment branch actually swapped the leader's local row to the
+	// FSM-stamped id. Gemini PR #458 flagged that without this, the
+	// leader's SQLite keeps the old AUTOINCREMENT id, every subsequent
+	// CreateTeam under the new cluster id fails the local FK check.
+	var preSeedID int64
+	if err := amA.GetDB().QueryRow(`SELECT id FROM rbac_organizations WHERE name = 'preexisting'`).Scan(&preSeedID); err != nil {
+		t.Fatalf("look up pre-seed AUTOINCREMENT id: %v", err)
+	}
+	if preSeedID <= 1 {
+		t.Fatalf("test setup: pre-seed id should be > 1 (we cleared throwaways to advance AUTOINCREMENT); got %d", preSeedID)
+	}
+
 	// Run the seed on leader (A — twoNodeReplicator reports IsLeader=true).
 	if err := rmA.SeedRBACFromLocalSQLite(ctx); err != nil {
 		t.Fatalf("Seed: %v", err)
@@ -582,13 +613,50 @@ func TestRBACSeed_PopulatesOrgsFromLocalSQLite(t *testing.T) {
 		t.Fatalf("ListOrganizations B: %v", err)
 	}
 	foundOrg := false
+	var orgB auth.Organization
 	for _, o := range orgsB {
 		if o.Name == "preexisting" {
 			foundOrg = true
+			orgB = o
 		}
 	}
 	if !foundOrg {
-		t.Errorf("seeded org should be on node B; got %v", orgsB)
+		t.Fatalf("seeded org should be on node B; got %v", orgsB)
+	}
+
+	// G1 pin: the leader's local SQLite id must now equal the
+	// FSM-stamped id (== node B's id). Without the upgrade-seed
+	// re-alignment branch in ApplyCreateOrganization, the leader keeps
+	// the old AUTOINCREMENT id and subsequent CreateTeam proposals fail
+	// the local FK check.
+	orgOnAByClusterID, err := rmA.GetOrganization(orgB.ID)
+	if err != nil {
+		t.Fatalf("GetOrganization on A by cluster id: %v", err)
+	}
+	if orgOnAByClusterID == nil {
+		t.Fatalf("G1 regression: leader's SQLite has no row at cluster id=%d after upgrade seed", orgB.ID)
+	}
+	if orgOnAByClusterID.Name != "preexisting" {
+		t.Errorf("G1 regression: leader's row at cluster id=%d has wrong name %q", orgB.ID, orgOnAByClusterID.Name)
+	}
+	// The pre-seed id must be GONE on the leader after re-alignment
+	// (unless it happens to coincide with the FSM-stamped id, which
+	// our test setup ensured against by advancing AUTOINCREMENT).
+	if preSeedID != orgB.ID {
+		if stale, _ := rmA.GetOrganization(preSeedID); stale != nil {
+			t.Errorf("G1 regression: pre-A.1 id=%d row still present on leader after upgrade re-align: %+v", preSeedID, stale)
+		}
+	}
+
+	// G1 follow-on: subsequent CreateTeam under the FSM-stamped org id
+	// must succeed on BOTH nodes' SQLite (FK to rbac_organizations must
+	// resolve). This is the customer-visible failure Gemini caught.
+	team, err := rmA.CreateTeam(ctx, orgB.ID, &auth.CreateTeamRequest{Name: "post-seed-team"})
+	if err != nil {
+		t.Fatalf("G1 regression: CreateTeam under seeded org id=%d failed (likely local FK violation): %v", orgB.ID, err)
+	}
+	if team.OrganizationID != orgB.ID {
+		t.Errorf("created team has wrong org id: got %d want %d", team.OrganizationID, orgB.ID)
 	}
 
 	// Re-running the seed should be idempotent (no errors, no duplicates).

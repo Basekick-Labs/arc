@@ -112,6 +112,13 @@ func (rm *RBACManager) SeedRBACFromLocalSQLite(ctx context.Context) error {
 		}
 		orgRows = append(orgRows, r)
 	}
+	// Surface iteration errors (connection loss, mid-stream corruption)
+	// loudly rather than silently proceeding with partial data. Gemini
+	// PR #458 review.
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("seed: organizations iteration error: %w", err)
+	}
 	rows.Close()
 	for _, r := range orgRows {
 		payload := createOrganizationPayloadWire{

@@ -317,12 +317,46 @@ func (rm *RBACManager) ApplyCreateOrganization(entry ClusterOrganizationEntry) e
 		if strings.Contains(insertErr.Error(), "UNIQUE constraint failed") {
 			// Upgrade-seed path: the local SQLite already holds a row
 			// with this name under a different (pre-A.1 AUTOINCREMENT)
-			// id. The cluster FSM is the source of truth; the local row
-			// is already correct content-wise — accept and move on.
+			// id. The cluster FSM is the source of truth, so the local
+			// row's id is the divergent one. If we left the local row
+			// in place, every subsequent CreateTeam under the new
+			// FSM-stamped org id would fail the local FK check
+			// (rbac_teams.organization_id REFERENCES rbac_organizations
+			// ON DELETE CASCADE doesn't help — the parent id doesn't
+			// exist locally yet). Realign by deleting the old row +
+			// inserting under the new id, in a single transaction. The
+			// DELETE cascades to any local pre-A.1 child rows
+			// (teams, roles, measurement_permissions, token_memberships)
+			// — operators have already been told via the seed Warn that
+			// child rows are not auto-replicated and must be re-issued
+			// post-upgrade, so cascading them out is the intended
+			// outcome. Gemini PR #458 review.
+			tx, txErr := rm.db.Begin()
+			if txErr != nil {
+				return fmt.Errorf("ApplyCreateOrganization: upgrade-seed tx begin: %w", txErr)
+			}
+			// Best-effort rollback on any error path; explicit Commit
+			// below succeeds the happy path.
+			defer func() { _ = tx.Rollback() }()
+
+			if _, delErr := tx.Exec(`DELETE FROM rbac_organizations WHERE name = ?`, entry.Name); delErr != nil {
+				return fmt.Errorf("ApplyCreateOrganization: upgrade-seed delete old row: %w", delErr)
+			}
+			if _, insErr := tx.Exec(`
+				INSERT INTO rbac_organizations
+					(id, name, description, created_at, updated_at, enabled)
+				VALUES (?, ?, ?, ?, ?, ?)
+			`, entry.ID, entry.Name, entry.Description, createdAt, updatedAt, enabled); insErr != nil {
+				return fmt.Errorf("ApplyCreateOrganization: upgrade-seed re-insert: %w", insErr)
+			}
+			if commitErr := tx.Commit(); commitErr != nil {
+				return fmt.Errorf("ApplyCreateOrganization: upgrade-seed commit: %w", commitErr)
+			}
+
 			rm.logger.Info().
 				Int64("cluster_id", entry.ID).
 				Str("name", entry.Name).
-				Msg("ApplyCreateOrganization: upgrade-seed accepted (row already present locally under pre-A.1 surrogate ID)")
+				Msg("ApplyCreateOrganization: upgrade-seed re-aligned local row to FSM-stamped id (any pre-A.1 child rows cascade-deleted; re-issue via API)")
 			rm.InvalidateAllCache()
 			return nil
 		}
