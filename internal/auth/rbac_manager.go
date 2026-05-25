@@ -299,8 +299,8 @@ func (rm *RBACManager) CreateOrganization(ctx context.Context, req *CreateOrgani
 		// sql.ErrNoRows. Gemini PR #458 round 2.
 		rm.logger.Info().Str("name", req.Name).Msg("Created organization via Raft")
 		var org Organization
-		if err := readBackAfterPropose(func() error {
-			return rm.db.QueryRow(`
+		if err := readBackAfterPropose(ctx, func() error {
+			return rm.db.QueryRowContext(ctx, `
 				SELECT id, name, description, created_at, updated_at, enabled
 				FROM rbac_organizations WHERE name = ?
 			`, req.Name).Scan(&org.ID, &org.Name, &org.Description, &org.CreatedAt, &org.UpdatedAt, &org.Enabled)
@@ -525,8 +525,8 @@ func (rm *RBACManager) CreateTeam(ctx context.Context, orgID int64, req *CreateT
 		}
 		rm.logger.Info().Int64("org_id", orgID).Str("name", req.Name).Msg("Created team via Raft")
 		var team Team
-		if err := readBackAfterPropose(func() error {
-			return rm.db.QueryRow(`
+		if err := readBackAfterPropose(ctx, func() error {
+			return rm.db.QueryRowContext(ctx, `
 				SELECT id, organization_id, name, description, created_at, updated_at, enabled
 				FROM rbac_teams WHERE organization_id = ? AND name = ?
 			`, orgID, req.Name).Scan(&team.ID, &team.OrganizationID, &team.Name, &team.Description, &team.CreatedAt, &team.UpdatedAt, &team.Enabled)
@@ -776,8 +776,8 @@ func (rm *RBACManager) CreateRole(ctx context.Context, teamID int64, req *Create
 		// read if the same handler call retries.
 		var role Role
 		var dbPerms string
-		if err := readBackAfterPropose(func() error {
-			return rm.db.QueryRow(`
+		if err := readBackAfterPropose(ctx, func() error {
+			return rm.db.QueryRowContext(ctx, `
 				SELECT id, team_id, database_pattern, permissions, created_at
 				FROM rbac_roles
 				WHERE team_id = ? AND database_pattern = ? AND permissions = ?
@@ -1018,8 +1018,8 @@ func (rm *RBACManager) CreateMeasurementPermission(ctx context.Context, roleID i
 			Msg("Created measurement permission via Raft")
 		var mp MeasurementPermission
 		var dbPerms string
-		if err := readBackAfterPropose(func() error {
-			return rm.db.QueryRow(`
+		if err := readBackAfterPropose(ctx, func() error {
+			return rm.db.QueryRowContext(ctx, `
 				SELECT id, role_id, measurement_pattern, permissions, created_at
 				FROM rbac_measurement_permissions
 				WHERE role_id = ? AND measurement_pattern = ? AND permissions = ?
@@ -1152,8 +1152,8 @@ func (rm *RBACManager) AddTokenToTeam(ctx context.Context, tokenID, teamID int64
 		}
 		rm.logger.Info().Int64("token_id", tokenID).Int64("team_id", teamID).Msg("Added token to team via Raft")
 		var mem TokenMembership
-		if err := readBackAfterPropose(func() error {
-			return rm.db.QueryRow(`
+		if err := readBackAfterPropose(ctx, func() error {
+			return rm.db.QueryRowContext(ctx, `
 				SELECT id, token_id, team_id, created_at
 				FROM rbac_token_memberships WHERE token_id = ? AND team_id = ?
 			`, tokenID, teamID).Scan(&mem.ID, &mem.TokenID, &mem.TeamID, &mem.CreatedAt)
@@ -1827,10 +1827,15 @@ func matchPattern(pattern, value string) bool {
 // SQLite yet. Without retry, the immediate read-back can return
 // sql.ErrNoRows and the API caller sees a 500.
 //
-// Retry shape: exponential backoff capped at ~1s total. The proposeTimeout
-// elsewhere is 5s so we stay well under that. Returns the last error
-// (typically sql.ErrNoRows) if all attempts fail. Gemini PR #458 round 2.
-func readBackAfterPropose(scan func() error) error {
+// Retry shape: exponential backoff capped at ~785ms total. The
+// proposeTimeout elsewhere is 5s so we stay well under that. Returns
+// the last error (typically sql.ErrNoRows) if all attempts fail.
+//
+// ctx is honoured between attempts via select on time.After + ctx.Done
+// so a cancelled / timed-out request doesn't keep the goroutine
+// blocked in time.Sleep. Gemini PR #458 round 2 (introduction) +
+// round 4 (ctx propagation).
+func readBackAfterPropose(ctx context.Context, scan func() error) error {
 	delays := []time.Duration{
 		0, // immediate
 		10 * time.Millisecond,
@@ -1843,7 +1848,11 @@ func readBackAfterPropose(scan func() error) error {
 	var lastErr error
 	for _, d := range delays {
 		if d > 0 {
-			time.Sleep(d)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(d):
+			}
 		}
 		err := scan()
 		if err == nil {
