@@ -196,7 +196,11 @@ func (m *Migrator) MigrateBatch(ctx context.Context, candidates []MigrationCandi
 
 // MigrateFile migrates a single file from one tier to another
 func (m *Migrator) MigrateFile(ctx context.Context, candidate MigrationCandidate) error {
-	startTime := time.Now()
+	// .UTC() so StartedAt persists in a stable timezone (matches the
+	// rest of internal/tiering/metadata.go). time.Since(startTime) is
+	// location-independent so the elapsed-duration math is unaffected.
+	// Issue #460.
+	startTime := time.Now().UTC()
 
 	// Get source and destination backends
 	srcBackend := m.manager.GetBackendForTier(candidate.CurrentTier)

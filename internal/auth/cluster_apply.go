@@ -129,10 +129,15 @@ func (am *AuthManager) ApplyCreateToken(entry ClusterTokenEntry) error {
 	if entry.ID == 0 {
 		return fmt.Errorf("ApplyCreateToken: id required")
 	}
-	createdAt := time.Unix(0, entry.CreatedAtUnixNano)
+	// .UTC() on both: SQLite text-encodes time.Time using the value's
+	// location, so a future `WHERE created_at = ?` or `WHERE expires_at = ?`
+	// readback can only round-trip cleanly if writes are in a stable
+	// timezone. Matches the RBAC apply path's UTC convention (#459).
+	// Issue #460.
+	createdAt := time.Unix(0, entry.CreatedAtUnixNano).UTC()
 	var expiresAt interface{}
 	if entry.ExpiresAtUnixNano != 0 {
-		expiresAt = time.Unix(0, entry.ExpiresAtUnixNano)
+		expiresAt = time.Unix(0, entry.ExpiresAtUnixNano).UTC()
 	}
 	enabled := 0
 	if entry.Enabled {
@@ -201,7 +206,9 @@ func (am *AuthManager) ApplyUpdateToken(entry ClusterTokenEntry) error {
 	}
 	var expiresAt interface{}
 	if entry.ExpiresAtUnixNano != 0 {
-		expiresAt = time.Unix(0, entry.ExpiresAtUnixNano)
+		// .UTC() per the cluster-apply UTC convention; see ApplyCreateToken
+		// for the rationale. Issue #460.
+		expiresAt = time.Unix(0, entry.ExpiresAtUnixNano).UTC()
 	}
 	result, err := am.db.Exec(`
 		UPDATE api_tokens
