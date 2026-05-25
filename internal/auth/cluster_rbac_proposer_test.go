@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -681,4 +682,130 @@ func seedTokenRow(t *testing.T, rm *RBACManager) int64 {
 	}
 	id, _ := result.LastInsertId()
 	return id
+}
+
+// -----------------------------------------------------------------------------
+// readBackAfterPropose regression tests (Gemini PR #458 rounds 2/4
+// introduced the helper + the ctx-cancel arm; internal review round 2
+// flagged that neither is pinned). Use a deferred-apply proposer so the
+// FSM apply completes AFTER Propose returns — simulating the
+// follower-apply lag readBackAfterPropose is supposed to absorb.
+// -----------------------------------------------------------------------------
+
+// deferredApplyProposer simulates the follower behaviour where Propose
+// returns when the leader has committed the entry but the local apply
+// has not yet fired. After `applyDelay`, it kicks the apply on a
+// goroutine. Only handles CreateOrganization — that's enough surface
+// to pin the retry helper.
+type deferredApplyProposer struct {
+	rm         *RBACManager
+	logIdx     atomic.Int64
+	applyDelay time.Duration
+}
+
+func (f *deferredApplyProposer) IsLeader() bool { return true }
+
+func (f *deferredApplyProposer) Propose(ctx context.Context, cmdType uint8, payload []byte, timeout time.Duration) error {
+	if cmdType != ProposalCommandCreateOrganization {
+		return fmt.Errorf("deferredApplyProposer: only supports CreateOrganization, got %d", cmdType)
+	}
+	var p createOrganizationPayloadWire
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return err
+	}
+	idx := f.logIdx.Add(1)
+	entry := ClusterOrganizationEntry{
+		ID:                idx,
+		Name:              p.Organization.Name,
+		Description:       p.Organization.Description,
+		CreatedAtUnixNano: p.Organization.CreatedAtUnixNano,
+		UpdatedAtUnixNano: p.Organization.UpdatedAtUnixNano,
+		Enabled:           true,
+		LSN:               uint64(idx),
+	}
+	// Schedule the apply to fire AFTER Propose returns. This is the
+	// production follower scenario: the leader committed, but our local
+	// runFSM goroutine hasn't picked it up yet.
+	go func() {
+		time.Sleep(f.applyDelay)
+		_ = f.rm.ApplyCreateOrganization(entry)
+	}()
+	return nil
+}
+
+// TestReadBackAfterPropose_RetriesOnFollowerApplyLag pins the round-2
+// G3-G7 read-back retry: Propose returns before the apply lands, the
+// first scan hits sql.ErrNoRows, the helper retries within its backoff
+// window, and the second scan succeeds.
+func TestReadBackAfterPropose_RetriesOnFollowerApplyLag(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "rbac-followerlag.db")
+	am, err := NewAuthManager(dbPath, 100*time.Millisecond, 100, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewAuthManager: %v", err)
+	}
+	defer am.Close()
+	rm := NewRBACManager(&RBACManagerConfig{DB: am.GetDB(), Logger: zerolog.Nop()})
+	defer rm.Close()
+
+	// Delay the apply by 40ms — past the first three retry intervals
+	// (0, 10, 25 = 35ms cumulative) and into the 50ms retry. The helper
+	// should hit ErrNoRows on attempts 1-3 then succeed on attempt 4.
+	prop := &deferredApplyProposer{rm: rm, applyDelay: 40 * time.Millisecond}
+	rm.SetRaftProposer(prop)
+
+	org, err := rm.CreateOrganization(context.Background(), &CreateOrganizationRequest{Name: "lag-org"})
+	if err != nil {
+		t.Fatalf("CreateOrganization with follower-lag: %v", err)
+	}
+	if org.Name != "lag-org" {
+		t.Errorf("expected name 'lag-org' after retry, got %q", org.Name)
+	}
+	if org.ID == 0 {
+		t.Errorf("expected non-zero ID after retry-succeeded read-back")
+	}
+}
+
+// TestReadBackAfterPropose_HonoursCtxCancel pins the round-4 G14
+// ctx-cancel arm: a ctx cancelled mid-retry causes the helper to bail
+// with ctx.Err() rather than waiting through the full backoff window.
+func TestReadBackAfterPropose_HonoursCtxCancel(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "rbac-ctxcancel.db")
+	am, err := NewAuthManager(dbPath, 100*time.Millisecond, 100, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewAuthManager: %v", err)
+	}
+	defer am.Close()
+	rm := NewRBACManager(&RBACManagerConfig{DB: am.GetDB(), Logger: zerolog.Nop()})
+	defer rm.Close()
+
+	// Use a long delay so the apply never lands during the test window;
+	// the helper should ride the backoff ladder and we cancel ctx
+	// before it finishes. Total readBackAfterPropose budget is ~785ms;
+	// we cancel at ~30ms which is during the 50ms wait.
+	prop := &deferredApplyProposer{rm: rm, applyDelay: 5 * time.Second}
+	rm.SetRaftProposer(prop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel from a goroutine so the cancel races the retry loop.
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	_, err = rm.CreateOrganization(ctx, &CreateOrganizationRequest{Name: "cancelled-org"})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatalf("expected ctx-cancel error, got nil (the apply never landed in 5s, retry should have given up earlier)")
+	}
+	// We expect the error to be the read-back error wrapping context.Canceled.
+	if !strings.Contains(err.Error(), "context canceled") && !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled in error chain, got %v", err)
+	}
+	// Sanity: should have returned well before the full 785ms budget.
+	// Allow a generous 300ms ceiling to absorb test-runner jitter and
+	// the time.Sleep(40) the cancel goroutine introduces.
+	if elapsed > 300*time.Millisecond {
+		t.Errorf("readBackAfterPropose ignored ctx.Done: took %v (expected ≤300ms)", elapsed)
+	}
 }

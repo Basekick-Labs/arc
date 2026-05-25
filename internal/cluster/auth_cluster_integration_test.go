@@ -599,6 +599,27 @@ func TestRBACSeed_PopulatesOrgsFromLocalSQLite(t *testing.T) {
 		t.Fatalf("test setup: pre-seed id should be > 1 (we cleared throwaways to advance AUTOINCREMENT); got %d", preSeedID)
 	}
 
+	// Seed a pre-A.1 child row directly into SQLite under the OLD parent
+	// id. The release notes claim these get cascade-deleted by SQLite ON
+	// DELETE CASCADE as a side effect of the upgrade-seed realign — pin
+	// that. Without this assertion, a future change to the realign
+	// transaction (e.g. removing the DELETE in favour of UPDATE id=...)
+	// would silently leave pre-A.1 child rows attached to a now-empty
+	// parent id and the operator would discover the stranded rows in
+	// production. Internal review round 2.
+	now := time.Now()
+	res, err := amA.GetDB().Exec(`
+		INSERT INTO rbac_teams (organization_id, name, description, created_at, updated_at, enabled)
+		VALUES (?, ?, ?, ?, ?, 1)
+	`, preSeedID, "pre-a1-team", "pre-A.1 child row", now, now)
+	if err != nil {
+		t.Fatalf("seed pre-A.1 team row: %v", err)
+	}
+	preSeedTeamID, _ := res.LastInsertId()
+	if preSeedTeamID == 0 {
+		t.Fatalf("expected non-zero LastInsertId for pre-A.1 team")
+	}
+
 	// Run the seed on leader (A — twoNodeReplicator reports IsLeader=true).
 	if err := rmA.SeedRBACFromLocalSQLite(ctx); err != nil {
 		t.Fatalf("Seed: %v", err)
@@ -645,6 +666,22 @@ func TestRBACSeed_PopulatesOrgsFromLocalSQLite(t *testing.T) {
 	if preSeedID != orgB.ID {
 		if stale, _ := rmA.GetOrganization(preSeedID); stale != nil {
 			t.Errorf("G1 regression: pre-A.1 id=%d row still present on leader after upgrade re-align: %+v", preSeedID, stale)
+		}
+	}
+
+	// H2 pin: the pre-A.1 child team we inserted directly into SQLite
+	// must be cascade-deleted by SQLite ON DELETE CASCADE as a side
+	// effect of the realign transaction. The release notes claim this
+	// behaviour — without this assertion a future change that swaps
+	// DELETE for UPDATE would silently leave the pre-A.1 child stranded
+	// against a parent id that no longer exists. Internal review round 2.
+	if preSeedID != orgB.ID {
+		var lingering int
+		if err := amA.GetDB().QueryRow(`SELECT COUNT(*) FROM rbac_teams WHERE id = ?`, preSeedTeamID).Scan(&lingering); err != nil {
+			t.Fatalf("count pre-A.1 team rows post-realign: %v", err)
+		}
+		if lingering != 0 {
+			t.Errorf("H2 regression: pre-A.1 team id=%d (org=%d) survived the realign — release notes claim ON DELETE CASCADE clears it but it did not. lingering=%d", preSeedTeamID, preSeedID, lingering)
 		}
 	}
 
