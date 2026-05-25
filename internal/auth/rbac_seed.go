@@ -176,6 +176,21 @@ func (rm *RBACManager) SeedRBACFromLocalSQLite(ctx context.Context) error {
 	// in SQLite is intact); they just won't replicate to followers
 	// until re-created. This trade-off is documented in the v26.06.1
 	// release notes.
+	// If ctx was cancelled mid-loop (G10 break), skip the 4 COUNT(*)
+	// queries — each would immediately fail with `context canceled`
+	// and flood the log with 4 useless Warns. Gemini PR #458 round 7
+	// G24.
+	if err := ctx.Err(); err != nil {
+		if firstErr == nil {
+			firstErr = err
+		}
+		rm.logger.Info().
+			Int("organizations_seeded", counts.orgs).
+			Int("organizations_skipped", counts.orgsSkip).
+			Msg("SeedRBACFromLocalSQLite: ctx cancelled before child-count step; skipping child-row diagnostics")
+		return firstErr
+	}
+
 	var teamsPresent, rolesPresent, mpermsPresent, memPresent int
 	// COUNT(*) errors here are surfaced at Warn rather than silently
 	// swallowed — a future schema migration breaking one of these

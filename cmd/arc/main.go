@@ -1694,15 +1694,29 @@ func main() {
 					// is wired and AFTER the leader is observed. Idempotent
 					// — followers skip via IsLeader(). Under a 30s ceiling
 					// to keep startup bounded.
-					if err := clusterCoordinator.WaitForLeader(30 * time.Second); err != nil {
-						log.Warn().Err(err).Msg("Cluster RBAC seed: leader not observed within 30s; skipping (will retry on next restart)")
-					} else {
+					//
+					// Run in a background goroutine so the HTTP server can
+					// start listening immediately instead of blocking up to
+					// 30s on the WaitForLeader call. On a cold start or
+					// rolling upgrade the leader may take seconds to elect;
+					// blocking startup would cause k8s liveness / readiness
+					// probes to time out and the container to restart-loop.
+					// The seed is leader-only and idempotent on re-run, so
+					// completing it asynchronously is safe — followers
+					// don't reach the seed body at all (IsLeader check),
+					// and a re-elected leader will pick it up on its own
+					// startup. Gemini PR #458 round 7 G23.
+					go func() {
+						if err := clusterCoordinator.WaitForLeader(30 * time.Second); err != nil {
+							log.Warn().Err(err).Msg("Cluster RBAC seed: leader not observed within 30s; skipping (will retry on next restart)")
+							return
+						}
 						seedCtx, seedCancel := context.WithTimeout(context.Background(), 30*time.Second)
+						defer seedCancel()
 						if seedErr := rbacManager.SeedRBACFromLocalSQLite(seedCtx); seedErr != nil {
 							log.Warn().Err(seedErr).Msg("Cluster RBAC seed: partial failure (cluster is still operable; missing rows can be re-issued by an operator)")
 						}
-						seedCancel()
-					}
+					}()
 				}
 			}
 		}

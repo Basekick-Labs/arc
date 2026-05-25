@@ -1924,6 +1924,14 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	// NOT affect the others. rejectedRBAC counts all skipped entries
 	// across all 5 maps.
 	restoredOrgs := make(map[int64]*OrganizationEntry, len(snapshot.Organizations))
+	// Track names seen so far to enforce UNIQUE(name) during restore.
+	// A corrupted snapshot with two orgs sharing a name would
+	// otherwise rebuild organizationsByName with the second write
+	// silently overwriting the first — the loser stays in the primary
+	// map but is unreachable via the name index, the FSM is
+	// permanently inconsistent. Quarantine duplicates instead.
+	// Gemini PR #458 round 7 G25.
+	restoredOrgNames := make(map[string]int64, len(snapshot.Organizations))
 	for id, entry := range snapshot.Organizations {
 		if entry == nil {
 			f.incRejectedRBAC()
@@ -1935,9 +1943,25 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 			f.logger.Error().Err(err).Int64("organization_id", id).Str("source", "snapshot").Msg("organization validation failed during snapshot restore — entry refused")
 			continue
 		}
+		if dupID, exists := restoredOrgNames[entry.Name]; exists {
+			f.incRejectedRBAC()
+			f.logger.Error().
+				Int64("organization_id", id).
+				Int64("duplicate_of_id", dupID).
+				Str("name", entry.Name).
+				Str("source", "snapshot").
+				Msg("duplicate organization name during snapshot restore — entry refused")
+			continue
+		}
 		restoredOrgs[id] = entry
+		restoredOrgNames[entry.Name] = id
 	}
 	restoredTeams := make(map[int64]*TeamEntry, len(snapshot.Teams))
+	// Track (orgID, name) seen so far to enforce UNIQUE(org_id, name)
+	// during restore. Same defence as the org-name check above —
+	// symmetric to applyCreateTeam's UNIQUE enforcement. Gemini PR #458
+	// round 7 G25 (extended to the composite-key case).
+	restoredTeamsByOrgAndName := make(map[int64]map[string]int64)
 	for id, entry := range snapshot.Teams {
 		if entry == nil {
 			f.incRejectedRBAC()
@@ -1957,6 +1981,24 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 			f.logger.Error().Int64("team_id", id).Int64("organization_id", entry.OrganizationID).Str("source", "snapshot").Msg("team references unknown organization during snapshot restore — entry refused")
 			continue
 		}
+		// Duplicate (org_id, name) check.
+		orgNames := restoredTeamsByOrgAndName[entry.OrganizationID]
+		if dupID, exists := orgNames[entry.Name]; exists {
+			f.incRejectedRBAC()
+			f.logger.Error().
+				Int64("team_id", id).
+				Int64("duplicate_of_id", dupID).
+				Int64("organization_id", entry.OrganizationID).
+				Str("name", entry.Name).
+				Str("source", "snapshot").
+				Msg("duplicate team name within organization during snapshot restore — entry refused")
+			continue
+		}
+		if orgNames == nil {
+			orgNames = make(map[string]int64)
+			restoredTeamsByOrgAndName[entry.OrganizationID] = orgNames
+		}
+		orgNames[entry.Name] = id
 		restoredTeams[id] = entry
 	}
 	restoredRoles := make(map[int64]*RoleEntry, len(snapshot.Roles))
@@ -1998,6 +2040,11 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		restoredMPerms[id] = entry
 	}
 	restoredMemberships := make(map[int64]*TokenMembershipEntry, len(snapshot.TokenMemberships))
+	// Track (token_id, team_id) seen so far to enforce UNIQUE(token_id,
+	// team_id) during restore. Symmetric to applyAddTokenToTeam's
+	// UNIQUE enforcement and the org/team duplicate-name checks
+	// above. Gemini PR #458 round 7 G25 (extended).
+	restoredMembershipPairs := make(map[int64]map[int64]int64)
 	for id, entry := range snapshot.TokenMemberships {
 		if entry == nil {
 			f.incRejectedRBAC()
@@ -2019,6 +2066,24 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 			f.logger.Error().Int64("membership_id", id).Int64("team_id", entry.TeamID).Str("source", "snapshot").Msg("token_membership references unknown team during snapshot restore — entry refused")
 			continue
 		}
+		// Duplicate (token_id, team_id) check.
+		tokenPairs := restoredMembershipPairs[entry.TokenID]
+		if dupID, exists := tokenPairs[entry.TeamID]; exists {
+			f.incRejectedRBAC()
+			f.logger.Error().
+				Int64("membership_id", id).
+				Int64("duplicate_of_id", dupID).
+				Int64("token_id", entry.TokenID).
+				Int64("team_id", entry.TeamID).
+				Str("source", "snapshot").
+				Msg("duplicate token-team membership during snapshot restore — entry refused")
+			continue
+		}
+		if tokenPairs == nil {
+			tokenPairs = make(map[int64]int64)
+			restoredMembershipPairs[entry.TokenID] = tokenPairs
+		}
+		tokenPairs[entry.TeamID] = id
 		restoredMemberships[id] = entry
 	}
 

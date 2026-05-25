@@ -964,3 +964,85 @@ func TestFSMSnapshot_RestoreSkipsOrphanedRBAC(t *testing.T) {
 		t.Errorf("expected 1 surviving team, got %d", len(fsm.teams))
 	}
 }
+
+// TestFSMSnapshot_RestoreQuarantinesDuplicateOrgName pins Gemini PR
+// #458 round 7 G25: a corrupted snapshot with two orgs sharing a
+// name must not silently overwrite organizationsByName during the
+// index rebuild. The second-encountered duplicate is refused +
+// counted into rejectedRBAC; the first survives.
+func TestFSMSnapshot_RestoreQuarantinesDuplicateOrgName(t *testing.T) {
+	malformed := FSMSnapshot{
+		Nodes: map[string]*NodeInfo{},
+		Organizations: map[int64]*OrganizationEntry{
+			1: {ID: 1, Name: "acme", CreatedAtUnixNano: 1, UpdatedAtUnixNano: 1, Enabled: true},
+			2: {ID: 2, Name: "acme", CreatedAtUnixNano: 2, UpdatedAtUnixNano: 2, Enabled: true}, // dup name
+			3: {ID: 3, Name: "globex", CreatedAtUnixNano: 3, UpdatedAtUnixNano: 3, Enabled: true},
+		},
+	}
+	data, err := json.Marshal(malformed)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	fsm := newTestFSM()
+	if err := fsm.Restore(io.NopCloser(bytes.NewReader(data))); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if fsm.RejectedRBACCount() != 1 {
+		t.Errorf("expected 1 rejected RBAC entry (the dup), got %d", fsm.RejectedRBACCount())
+	}
+	fsm.mu.RLock()
+	defer fsm.mu.RUnlock()
+	if len(fsm.organizations) != 2 {
+		t.Errorf("expected 2 surviving orgs (winner + unique), got %d", len(fsm.organizations))
+	}
+	// The "acme" name must point to exactly one of {1,2} in the index,
+	// and that org must still be in the primary map.
+	id, ok := fsm.organizationsByName["acme"]
+	if !ok {
+		t.Errorf("organizationsByName missing 'acme' after dup quarantine")
+	}
+	if _, ok := fsm.organizations[id]; !ok {
+		t.Errorf("organizationsByName points to id=%d but it's not in the primary map", id)
+	}
+	// Map iteration order in Go is random, but whichever id won, the
+	// loser must NOT be in the primary map.
+	loserID := int64(1)
+	if id == 1 {
+		loserID = 2
+	}
+	if _, ok := fsm.organizations[loserID]; ok {
+		t.Errorf("loser org id=%d should be quarantined, but is in primary map", loserID)
+	}
+}
+
+// TestFSMSnapshot_RestoreQuarantinesDuplicateTeamInOrg pins the
+// composite-key variant of G25 for teams: two teams with the same
+// (org_id, name) pair must not desync teamsByOrg.
+func TestFSMSnapshot_RestoreQuarantinesDuplicateTeamInOrg(t *testing.T) {
+	malformed := FSMSnapshot{
+		Nodes: map[string]*NodeInfo{},
+		Organizations: map[int64]*OrganizationEntry{
+			1: {ID: 1, Name: "acme", CreatedAtUnixNano: 1, UpdatedAtUnixNano: 1, Enabled: true},
+		},
+		Teams: map[int64]*TeamEntry{
+			2: {ID: 2, OrganizationID: 1, Name: "platform", CreatedAtUnixNano: 1, UpdatedAtUnixNano: 1, Enabled: true},
+			3: {ID: 3, OrganizationID: 1, Name: "platform", CreatedAtUnixNano: 2, UpdatedAtUnixNano: 2, Enabled: true}, // dup
+		},
+	}
+	data, err := json.Marshal(malformed)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	fsm := newTestFSM()
+	if err := fsm.Restore(io.NopCloser(bytes.NewReader(data))); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if fsm.RejectedRBACCount() != 1 {
+		t.Errorf("expected 1 rejected RBAC entry (the dup team), got %d", fsm.RejectedRBACCount())
+	}
+	fsm.mu.RLock()
+	defer fsm.mu.RUnlock()
+	if len(fsm.teams) != 1 {
+		t.Errorf("expected 1 surviving team, got %d", len(fsm.teams))
+	}
+}
