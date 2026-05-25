@@ -465,6 +465,23 @@ func (rm *RBACManager) UpdateOrganization(ctx context.Context, id int64, req *Up
 // path: unchanged.
 func (rm *RBACManager) DeleteOrganization(ctx context.Context, id int64) error {
 	if rm.getProposer() != nil {
+		// Local existence pre-check so cluster-mode Delete returns the
+		// same "not found" error as the OSS path (avoids the OSS-vs-
+		// cluster behavioural divergence where the FSM's
+		// applyDeleteOrganization treats not-found as an idempotent
+		// no-op and the proposer returns nil → API 200 OK for a
+		// missing org). On a follower with a stale local cache the
+		// pre-check might 404 for an org just-created elsewhere not
+		// yet replicated to us — that race window is sub-50ms and
+		// returning 404 honestly conveys "doesn't exist to me yet".
+		// Gemini PR #458 round 8 G27.
+		org, err := rm.GetOrganization(id)
+		if err != nil {
+			return fmt.Errorf("failed to look up organization: %w", err)
+		}
+		if org == nil {
+			return errors.New("organization not found")
+		}
 		payload := deleteOrganizationPayloadWire{ID: id}
 		if err := rm.proposeRBACCommand(ctx, ProposalCommandDeleteOrganization, payload); err != nil {
 			return fmt.Errorf("failed to delete organization: %w", err)
@@ -701,6 +718,15 @@ func (rm *RBACManager) UpdateTeam(ctx context.Context, id int64, req *UpdateTeam
 // DeleteTeam deletes a team (cascades to roles and memberships).
 func (rm *RBACManager) DeleteTeam(ctx context.Context, id int64) error {
 	if rm.getProposer() != nil {
+		// Pre-check for OSS-vs-cluster parity. See DeleteOrganization
+		// for rationale. Gemini PR #458 round 8 G27.
+		team, err := rm.GetTeam(id)
+		if err != nil {
+			return fmt.Errorf("failed to look up team: %w", err)
+		}
+		if team == nil {
+			return errors.New("team not found")
+		}
 		payload := deleteTeamPayloadWire{ID: id}
 		if err := rm.proposeRBACCommand(ctx, ProposalCommandDeleteTeam, payload); err != nil {
 			return fmt.Errorf("failed to delete team: %w", err)
@@ -948,6 +974,15 @@ func (rm *RBACManager) UpdateRole(ctx context.Context, id int64, req *UpdateRole
 // DeleteRole deletes a role (cascades to measurement permissions).
 func (rm *RBACManager) DeleteRole(ctx context.Context, id int64) error {
 	if rm.getProposer() != nil {
+		// Pre-check for OSS-vs-cluster parity. See DeleteOrganization
+		// for rationale. Gemini PR #458 round 8 G27.
+		role, err := rm.GetRole(id)
+		if err != nil {
+			return fmt.Errorf("failed to look up role: %w", err)
+		}
+		if role == nil {
+			return errors.New("role not found")
+		}
 		payload := deleteRolePayloadWire{ID: id}
 		if err := rm.proposeRBACCommand(ctx, ProposalCommandDeleteRole, payload); err != nil {
 			return fmt.Errorf("failed to delete role: %w", err)
@@ -1097,6 +1132,19 @@ func (rm *RBACManager) ListMeasurementPermissionsByRole(roleID int64) ([]Measure
 // DeleteMeasurementPermission deletes a measurement permission.
 func (rm *RBACManager) DeleteMeasurementPermission(ctx context.Context, id int64) error {
 	if rm.getProposer() != nil {
+		// Pre-check for OSS-vs-cluster parity. No GetMeasurementPermission
+		// helper today, so inline the existence query. See
+		// DeleteOrganization for rationale. Gemini PR #458 round 8 G27.
+		var exists int
+		err := rm.db.QueryRowContext(ctx,
+			`SELECT 1 FROM rbac_measurement_permissions WHERE id = ?`, id,
+		).Scan(&exists)
+		if err == sql.ErrNoRows {
+			return errors.New("measurement permission not found")
+		}
+		if err != nil {
+			return fmt.Errorf("failed to look up measurement permission: %w", err)
+		}
 		payload := deleteMeasurementPermissionPayloadWire{ID: id}
 		if err := rm.proposeRBACCommand(ctx, ProposalCommandDeleteMeasurementPermission, payload); err != nil {
 			return fmt.Errorf("failed to delete measurement permission: %w", err)
@@ -1200,6 +1248,19 @@ func (rm *RBACManager) AddTokenToTeam(ctx context.Context, tokenID, teamID int64
 // RemoveTokenFromTeam removes a token from a team.
 func (rm *RBACManager) RemoveTokenFromTeam(ctx context.Context, tokenID, teamID int64) error {
 	if rm.getProposer() != nil {
+		// Pre-check for OSS-vs-cluster parity. See DeleteOrganization
+		// for rationale. Gemini PR #458 round 8 G27.
+		var exists int
+		err := rm.db.QueryRowContext(ctx,
+			`SELECT 1 FROM rbac_token_memberships WHERE token_id = ? AND team_id = ?`,
+			tokenID, teamID,
+		).Scan(&exists)
+		if err == sql.ErrNoRows {
+			return errors.New("token membership not found")
+		}
+		if err != nil {
+			return fmt.Errorf("failed to look up token membership: %w", err)
+		}
 		payload := removeTokenFromTeamPayloadWire{TokenID: tokenID, TeamID: teamID}
 		if err := rm.proposeRBACCommand(ctx, ProposalCommandRemoveTokenFromTeam, payload); err != nil {
 			return fmt.Errorf("failed to remove token from team: %w", err)
@@ -1857,10 +1918,17 @@ func readBackAfterPropose(ctx context.Context, scan func() error) error {
 			return err
 		}
 		if d > 0 {
+			// time.NewTimer + Stop on the cancel arm avoids the
+			// time.After leak (the underlying Timer can't be GC'd
+			// until it fires, even after ctx cancels). Under hot
+			// churn — many cancelled creates — the leaked timers
+			// pile up briefly. Gemini PR #458 round 8.
+			timer := time.NewTimer(d)
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				return ctx.Err()
-			case <-time.After(d):
+			case <-timer.C:
 			}
 		}
 		err := scan()

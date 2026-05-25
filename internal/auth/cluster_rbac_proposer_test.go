@@ -506,6 +506,37 @@ func TestProposer_DeleteOrganization_CascadesInSQLite(t *testing.T) {
 	}
 }
 
+// TestProposer_DeleteNonExistent_ReturnsNotFound pins Gemini PR #458
+// round 8 G27: cluster-mode Delete of a non-existent entity must
+// return "not found" (not nil/200 OK) so the cluster path matches
+// the OSS path's behaviour. Covers all 5 Delete entry points
+// (org, team, role, mperm, membership).
+func TestProposer_DeleteNonExistent_ReturnsNotFound(t *testing.T) {
+	rm, _ := newRBACTestManager(t)
+	ctx := context.Background()
+
+	if err := rm.DeleteOrganization(ctx, 99999); err == nil ||
+		!strings.Contains(err.Error(), "organization not found") {
+		t.Errorf("DeleteOrganization(non-existent) should return 'organization not found', got: %v", err)
+	}
+	if err := rm.DeleteTeam(ctx, 99999); err == nil ||
+		!strings.Contains(err.Error(), "team not found") {
+		t.Errorf("DeleteTeam(non-existent) should return 'team not found', got: %v", err)
+	}
+	if err := rm.DeleteRole(ctx, 99999); err == nil ||
+		!strings.Contains(err.Error(), "role not found") {
+		t.Errorf("DeleteRole(non-existent) should return 'role not found', got: %v", err)
+	}
+	if err := rm.DeleteMeasurementPermission(ctx, 99999); err == nil ||
+		!strings.Contains(err.Error(), "measurement permission not found") {
+		t.Errorf("DeleteMeasurementPermission(non-existent) should return 'measurement permission not found', got: %v", err)
+	}
+	if err := rm.RemoveTokenFromTeam(ctx, 99999, 99999); err == nil ||
+		!strings.Contains(err.Error(), "token membership not found") {
+		t.Errorf("RemoveTokenFromTeam(non-existent) should return 'token membership not found', got: %v", err)
+	}
+}
+
 func TestProposer_CreateTeam_DuplicateInSameOrg(t *testing.T) {
 	rm, _ := newRBACTestManager(t)
 	ctx := context.Background()
