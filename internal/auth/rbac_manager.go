@@ -157,15 +157,20 @@ func NewRBACManager(cfg *RBACManagerConfig) *RBACManager {
 	}
 
 	rm := &RBACManager{
-		db:                    cfg.DB,
-		licenseClient:         cfg.LicenseClient,
-		logger:                cfg.Logger.With().Str("component", "rbac").Logger(),
-		tokenCache:            make(map[int64]*tokenRBACData),
-		tokenCacheTTL:         cacheTTL,
-		permCache:             make(map[permissionCacheKey]*permissionCacheEntry),
-		permCacheTTL:          cacheTTL,
-		maxCacheSize:          maxCacheSize,
-		maxCascadeDescendants: cfg.MaxCascadeDescendants,
+		db:            cfg.DB,
+		licenseClient: cfg.LicenseClient,
+		logger:        cfg.Logger.With().Str("component", "rbac").Logger(),
+		tokenCache:    make(map[int64]*tokenRBACData),
+		tokenCacheTTL: cacheTTL,
+		permCache:     make(map[permissionCacheKey]*permissionCacheEntry),
+		permCacheTTL:  cacheTTL,
+		maxCacheSize:  maxCacheSize,
+		// Negative values normalise to 0 (disabled). The cap check is
+		// already gated on `> 0`, but normalising here keeps the field
+		// canonical so a future metric export or comparison can't
+		// surprise on "-1 means disabled" vs "0 means disabled."
+		// Gemini PR #459 round 3.
+		maxCascadeDescendants: max(0, cfg.MaxCascadeDescendants),
 		done:                  make(chan struct{}),
 	}
 
