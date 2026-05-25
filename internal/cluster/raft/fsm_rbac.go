@@ -455,17 +455,26 @@ func (f *ClusterFSM) applyUpdateOrganization(payload []byte, logIndex uint64) in
 	// Make a copy to avoid mutating the existing pointer until we know all
 	// validation passes. Then atomically swap.
 	updated := *existing
+	// Stage index mutations and apply them only after the loop succeeds.
+	// A malformed payload with duplicate "name" entries in ChangedFields
+	// would otherwise leave the secondary index out of sync with the
+	// primary map: first iteration mutates organizationsByName, second
+	// iteration sees the new name as a duplicate and bails — but the
+	// primary f.organizations is never updated. Gemini PR #458 round 5.
+	nameChanged := false
 	for _, field := range p.ChangedFields {
 		switch field {
 		case "name":
-			if p.Name != existing.Name {
+			// Re-check against the new name on every "name" entry so a
+			// duplicate ChangedFields list with the same new name is a
+			// no-op rather than a bug. nameChanged tracks "we've already
+			// validated and staged this rename".
+			if p.Name != existing.Name && !nameChanged {
 				if _, exists := f.organizationsByName[p.Name]; exists {
 					f.mu.Unlock()
 					return f.rejectRBAC("update_organization", p.ID, logIndex, fmt.Errorf("organization name %q already exists", p.Name))
 				}
-				// Rewire the name index: remove old, add new.
-				delete(f.organizationsByName, existing.Name)
-				f.organizationsByName[p.Name] = p.ID
+				nameChanged = true
 				updated.Name = p.Name
 			}
 		case "description":
@@ -478,6 +487,12 @@ func (f *ClusterFSM) applyUpdateOrganization(payload []byte, logIndex uint64) in
 		updated.UpdatedAtUnixNano = p.UpdatedAtUnixNano
 	}
 	updated.LSN = logIndex
+	// All validation passed — commit primary map + secondary index
+	// together. Either both mutations land or neither does.
+	if nameChanged {
+		delete(f.organizationsByName, existing.Name)
+		f.organizationsByName[updated.Name] = p.ID
+	}
 	f.organizations[p.ID] = &updated
 	callback := f.onOrganizationUpdated
 	f.mu.Unlock()
@@ -731,17 +746,22 @@ func (f *ClusterFSM) applyUpdateTeam(payload []byte, logIndex uint64) interface{
 		return f.rejectRBAC("update_team", p.ID, logIndex, fmt.Errorf("team %d not found", p.ID))
 	}
 	updated := *existing
+	// Stage index mutations and apply them only after the loop succeeds.
+	// Same shape as applyUpdateOrganization: a malformed payload with
+	// duplicate "name" entries in ChangedFields would otherwise leave
+	// teamsByOrg out of sync with the primary f.teams map. Gemini PR
+	// #458 round 5.
+	nameChanged := false
 	for _, field := range p.ChangedFields {
 		switch field {
 		case "name":
-			if p.Name != existing.Name {
+			if p.Name != existing.Name && !nameChanged {
 				// Defensive: applyCreateTeam always initialises
 				// teamsByOrg[orgID] when it stores a team, so this
 				// should always be non-nil — but a corrupted snapshot
 				// restore or a buggy future code path could leave the
-				// nested map missing. Initialise on-demand so the write
-				// at the bottom of this block cannot panic on a nil
-				// map. Gemini PR #458 round 2.
+				// nested map missing. Init-on-demand so the write below
+				// cannot panic on a nil map. Gemini PR #458 round 2.
 				orgTeams, ok := f.teamsByOrg[existing.OrganizationID]
 				if !ok || orgTeams == nil {
 					orgTeams = make(map[string]int64)
@@ -751,8 +771,7 @@ func (f *ClusterFSM) applyUpdateTeam(payload []byte, logIndex uint64) interface{
 					f.mu.Unlock()
 					return f.rejectRBAC("update_team", p.ID, logIndex, fmt.Errorf("team name %q already exists in organization %d", p.Name, existing.OrganizationID))
 				}
-				delete(orgTeams, existing.Name)
-				orgTeams[p.Name] = p.ID
+				nameChanged = true
 				updated.Name = p.Name
 			}
 		case "description":
@@ -765,6 +784,13 @@ func (f *ClusterFSM) applyUpdateTeam(payload []byte, logIndex uint64) interface{
 		updated.UpdatedAtUnixNano = p.UpdatedAtUnixNano
 	}
 	updated.LSN = logIndex
+	// All validation passed — commit primary map + secondary index
+	// together. Either both mutations land or neither does.
+	if nameChanged {
+		orgTeams := f.teamsByOrg[existing.OrganizationID]
+		delete(orgTeams, existing.Name)
+		orgTeams[updated.Name] = p.ID
+	}
 	f.teams[p.ID] = &updated
 	callback := f.onTeamUpdated
 	f.mu.Unlock()

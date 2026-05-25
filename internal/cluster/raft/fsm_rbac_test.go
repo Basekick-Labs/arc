@@ -265,6 +265,49 @@ func TestApplyUpdateOrganization_NotFound(t *testing.T) {
 	}
 }
 
+// TestApplyUpdateOrganization_DuplicateNameInChangedFieldsKeepsIndexConsistent
+// pins Gemini PR #458 round 5 G20: a malformed payload that lists
+// "name" twice in ChangedFields must not corrupt organizationsByName.
+// Pre-round-5 behaviour: the first iteration of the loop mutated the
+// secondary index, the second iteration found the new name "already
+// exists", and the function rejected the entire update — leaving the
+// primary map untouched but the secondary index pointing the NEW name
+// at this ID. The fix stages the index mutation and applies it only
+// after the loop succeeds, so a duplicate "name" entry is now a no-op
+// rather than a corruption.
+func TestApplyUpdateOrganization_DuplicateNameInChangedFieldsKeepsIndexConsistent(t *testing.T) {
+	fsm := newTestFSM()
+	id := applyOrCreate(t, fsm, "acme", 17)
+
+	// Duplicate "name" in ChangedFields with a non-conflicting rename.
+	// Pre-fix: rejects with "name already exists" + leaves the index
+	// pointing the new name at id while primary still has the old name.
+	// Post-fix: rename applies cleanly; both index and primary agree.
+	updateP := UpdateOrganizationPayload{
+		ID:            id,
+		Name:          "acme-renamed",
+		ChangedFields: []string{"name", "name"}, // duplicate intentionally
+	}
+	cmd := makeCommand(t, CommandUpdateOrganization, updateP)
+	if res := fsm.Apply(&raft.Log{Data: cmd, Index: 18}); res != nil {
+		t.Fatalf("duplicate-name ChangedFields should be a no-op rename, got %v", res)
+	}
+
+	fsm.mu.RLock()
+	defer fsm.mu.RUnlock()
+	got := fsm.organizations[id]
+	if got.Name != "acme-renamed" {
+		t.Errorf("primary map not updated: got %q, want %q", got.Name, "acme-renamed")
+	}
+	// Index must agree with primary.
+	if fsm.organizationsByName["acme-renamed"] != id {
+		t.Errorf("secondary index missing new name; got %v", fsm.organizationsByName)
+	}
+	if _, stale := fsm.organizationsByName["acme"]; stale {
+		t.Errorf("secondary index still has old name 'acme'")
+	}
+}
+
 // -----------------------------------------------------------------------------
 // Team tests.
 // -----------------------------------------------------------------------------
@@ -323,6 +366,42 @@ func TestApplyCreateTeam_AllowsDuplicateNameAcrossOrgs(t *testing.T) {
 	defer fsm.mu.RUnlock()
 	if len(fsm.teams) != 2 {
 		t.Errorf("expected 2 teams (one per org), got %d", len(fsm.teams))
+	}
+}
+
+// TestApplyUpdateTeam_DuplicateNameInChangedFieldsKeepsIndexConsistent
+// pins Gemini PR #458 round 5 G21: same FSM-corruption shape as the
+// org-level G20 test above, but for applyUpdateTeam's teamsByOrg
+// nested index. A malformed payload listing "name" twice in
+// ChangedFields must not desync the index from f.teams.
+func TestApplyUpdateTeam_DuplicateNameInChangedFieldsKeepsIndexConsistent(t *testing.T) {
+	fsm := newTestFSM()
+	orgID := applyOrCreate(t, fsm, "acme", 17)
+	teamID := applyTeamCreate(t, fsm, orgID, "platform", 18)
+
+	updateP := UpdateTeamPayload{
+		ID:            teamID,
+		Name:          "platform-renamed",
+		ChangedFields: []string{"name", "name"}, // duplicate intentionally
+	}
+	cmd := makeCommand(t, CommandUpdateTeam, updateP)
+	if res := fsm.Apply(&raft.Log{Data: cmd, Index: 19}); res != nil {
+		t.Fatalf("duplicate-name ChangedFields should be a no-op rename, got %v", res)
+	}
+
+	fsm.mu.RLock()
+	defer fsm.mu.RUnlock()
+	got := fsm.teams[teamID]
+	if got.Name != "platform-renamed" {
+		t.Errorf("primary map not updated: got %q, want %q", got.Name, "platform-renamed")
+	}
+	// Index must agree with primary.
+	orgTeams := fsm.teamsByOrg[orgID]
+	if orgTeams["platform-renamed"] != teamID {
+		t.Errorf("secondary index missing new name; got %v", orgTeams)
+	}
+	if _, stale := orgTeams["platform"]; stale {
+		t.Errorf("secondary index still has old name 'platform'")
 	}
 }
 
