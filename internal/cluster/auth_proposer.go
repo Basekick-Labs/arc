@@ -47,6 +47,19 @@ func (c *Coordinator) GetRaftFSM() *raft.ClusterFSM {
 	return c.raftFSM
 }
 
+// IsLeader implements auth.RaftProposer. Returns false defensively when
+// the proposer or its underlying coordinator/raft node is nil — those
+// paths only happen in OSS / standalone mode where the proposer should
+// have been nil at construction (NewCoordinatorAuthProposer returns nil
+// for those cases), but the extra checks make the method safe to call
+// even from a stale reference. Phase A.1: Cluster Auth Convergence.
+func (p *CoordinatorAuthProposer) IsLeader() bool {
+	if p == nil || p.coord == nil || p.coord.raftNode == nil {
+		return false
+	}
+	return p.coord.raftNode.IsLeader()
+}
+
 // Propose implements auth.RaftProposer.
 //
 // The auth package owns the payload type definition (CreateTokenPayload,
@@ -161,6 +174,91 @@ func ToAuthTokenEntry(e *raft.TokenEntry) auth.ClusterTokenEntry {
 		CreatedAtUnixNano: e.CreatedAtUnixNano,
 		ExpiresAtUnixNano: e.ExpiresAtUnixNano,
 		Enabled:           e.Enabled,
+		LSN:               e.LSN,
+	}
+}
+
+// Phase A.1: ToAuth<X>Entry helpers — same pattern as ToAuthTokenEntry
+// but for the 5 RBAC entry types. Used by cmd/arc/main.go's
+// SetRBACCallbacks closures.
+
+// ToAuthOrganizationEntry converts cluster.raft.OrganizationEntry into
+// auth.ClusterOrganizationEntry.
+func ToAuthOrganizationEntry(e *raft.OrganizationEntry) auth.ClusterOrganizationEntry {
+	if e == nil {
+		return auth.ClusterOrganizationEntry{}
+	}
+	return auth.ClusterOrganizationEntry{
+		ID:                e.ID,
+		Name:              e.Name,
+		Description:       e.Description,
+		CreatedAtUnixNano: e.CreatedAtUnixNano,
+		UpdatedAtUnixNano: e.UpdatedAtUnixNano,
+		Enabled:           e.Enabled,
+		LSN:               e.LSN,
+	}
+}
+
+// ToAuthTeamEntry converts cluster.raft.TeamEntry into auth.ClusterTeamEntry.
+func ToAuthTeamEntry(e *raft.TeamEntry) auth.ClusterTeamEntry {
+	if e == nil {
+		return auth.ClusterTeamEntry{}
+	}
+	return auth.ClusterTeamEntry{
+		ID:                e.ID,
+		OrganizationID:    e.OrganizationID,
+		Name:              e.Name,
+		Description:       e.Description,
+		CreatedAtUnixNano: e.CreatedAtUnixNano,
+		UpdatedAtUnixNano: e.UpdatedAtUnixNano,
+		Enabled:           e.Enabled,
+		LSN:               e.LSN,
+	}
+}
+
+// ToAuthRoleEntry converts cluster.raft.RoleEntry into auth.ClusterRoleEntry.
+func ToAuthRoleEntry(e *raft.RoleEntry) auth.ClusterRoleEntry {
+	if e == nil {
+		return auth.ClusterRoleEntry{}
+	}
+	return auth.ClusterRoleEntry{
+		ID:                e.ID,
+		TeamID:            e.TeamID,
+		DatabasePattern:   e.DatabasePattern,
+		Permissions:       e.Permissions,
+		CreatedAtUnixNano: e.CreatedAtUnixNano,
+		LSN:               e.LSN,
+	}
+}
+
+// ToAuthMeasurementPermissionEntry converts
+// cluster.raft.MeasurementPermissionEntry into
+// auth.ClusterMeasurementPermissionEntry.
+func ToAuthMeasurementPermissionEntry(e *raft.MeasurementPermissionEntry) auth.ClusterMeasurementPermissionEntry {
+	if e == nil {
+		return auth.ClusterMeasurementPermissionEntry{}
+	}
+	return auth.ClusterMeasurementPermissionEntry{
+		ID:                 e.ID,
+		RoleID:             e.RoleID,
+		MeasurementPattern: e.MeasurementPattern,
+		Permissions:        e.Permissions,
+		CreatedAtUnixNano:  e.CreatedAtUnixNano,
+		LSN:                e.LSN,
+	}
+}
+
+// ToAuthTokenMembershipEntry converts cluster.raft.TokenMembershipEntry
+// into auth.ClusterTokenMembershipEntry.
+func ToAuthTokenMembershipEntry(e *raft.TokenMembershipEntry) auth.ClusterTokenMembershipEntry {
+	if e == nil {
+		return auth.ClusterTokenMembershipEntry{}
+	}
+	return auth.ClusterTokenMembershipEntry{
+		ID:                e.ID,
+		TokenID:           e.TokenID,
+		TeamID:            e.TeamID,
+		CreatedAtUnixNano: e.CreatedAtUnixNano,
 		LSN:               e.LSN,
 	}
 }

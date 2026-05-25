@@ -62,6 +62,61 @@ const (
 	// secrecy invariant as CommandCreateToken: only the hash + prefix go through
 	// Raft.
 	CommandRotateToken
+
+	// Phase A.1: Cluster Auth Convergence (RBAC)
+	//
+	// The RBAC command set extends Phase A's per-token replication to the five
+	// RBAC tables: organizations, teams, roles, measurement_permissions, and
+	// token_memberships. Each entity gets Create/Update/Delete applies (where
+	// applicable) under the same FSM seam used by tokens. Delete commands
+	// cascade in-apply across the in-memory maps under a single Raft log
+	// entry — mirroring SQLite ON DELETE CASCADE semantics at the FSM level,
+	// while the local SQLite materialise relies on its own FK cascade.
+
+	// CommandCreateOrganization inserts a new RBAC organization into the
+	// cluster-wide auth state. UNIQUE(name) is enforced applier-side via
+	// the organizationsByName index.
+	CommandCreateOrganization
+	// CommandUpdateOrganization updates mutable metadata (name, description,
+	// enabled) on an existing organization.
+	CommandUpdateOrganization
+	// CommandDeleteOrganization hard-deletes an organization. Cascades to
+	// all child teams, roles, measurement_permissions, and token_memberships
+	// under a single log entry. Irreversible.
+	CommandDeleteOrganization
+	// CommandCreateTeam inserts a new team scoped to an organization.
+	// UNIQUE(organization_id, name) is enforced applier-side via the
+	// teamsByOrg nested index.
+	CommandCreateTeam
+	// CommandUpdateTeam updates mutable metadata (name, description, enabled)
+	// on an existing team.
+	CommandUpdateTeam
+	// CommandDeleteTeam hard-deletes a team. Cascades to child roles,
+	// measurement_permissions, and token_memberships under a single log
+	// entry. Irreversible.
+	CommandDeleteTeam
+	// CommandCreateRole inserts a new role bound to a team. No UNIQUE
+	// constraint on (team_id, database_pattern) — same pattern in multiple
+	// roles is allowed by design.
+	CommandCreateRole
+	// CommandUpdateRole updates a role's database_pattern and/or permissions.
+	CommandUpdateRole
+	// CommandDeleteRole hard-deletes a role. Cascades to child
+	// measurement_permissions under a single log entry. Irreversible.
+	CommandDeleteRole
+	// CommandCreateMeasurementPermission inserts a measurement-level
+	// permission scoped to a role. No UNIQUE constraint; multiple patterns
+	// per role are allowed.
+	CommandCreateMeasurementPermission
+	// CommandDeleteMeasurementPermission hard-deletes a measurement
+	// permission. Leaf entity — no further cascade.
+	CommandDeleteMeasurementPermission
+	// CommandAddTokenToTeam grants a token membership in a team.
+	// UNIQUE(token_id, team_id) is enforced applier-side via the
+	// tokenMembershipsByPair nested index.
+	CommandAddTokenToTeam
+	// CommandRemoveTokenFromTeam revokes a token's membership in a team.
+	CommandRemoveTokenFromTeam
 )
 
 // Command represents a command to be applied to the FSM.
@@ -230,12 +285,28 @@ type RotateTokenPayload struct {
 }
 
 // FSMSnapshot represents a snapshot of the FSM state.
+//
+// Backwards-compatibility note: every map field carries `omitempty`. A
+// snapshot taken by an older binary that lacks one of the maps decodes into
+// a nil map on the newer binary, and the Restore loop simply iterates zero
+// entries — no version field required. The reverse (newer snapshot decoded
+// by older binary) silently drops the unknown fields per encoding/json.
 type FSMSnapshot struct {
 	Nodes             map[string]*NodeInfo  `json:"nodes"`
 	PrimaryWriterID   string                `json:"primary_writer_id,omitempty"`
 	ActiveCompactorID string                `json:"active_compactor_id,omitempty"`
 	Files             map[string]*FileEntry `json:"files,omitempty"`  // File manifest (peer replication)
 	Tokens            map[int64]*TokenEntry `json:"tokens,omitempty"` // Cluster-wide auth tokens (Phase A)
+	// Phase A.1: Cluster Auth Convergence (RBAC). Secondary indices
+	// (organizationsByName, teamsByOrg, etc.) are intentionally NOT
+	// persisted — Restore rebuilds them from the primary maps after the
+	// JSON decode. This keeps the snapshot format index-agnostic so future
+	// index additions don't break old-snapshot reads.
+	Organizations          map[int64]*OrganizationEntry          `json:"organizations,omitempty"`
+	Teams                  map[int64]*TeamEntry                  `json:"teams,omitempty"`
+	Roles                  map[int64]*RoleEntry                  `json:"roles,omitempty"`
+	MeasurementPermissions map[int64]*MeasurementPermissionEntry `json:"measurement_permissions,omitempty"`
+	TokenMemberships       map[int64]*TokenMembershipEntry       `json:"token_memberships,omitempty"`
 }
 
 // ClusterFSM implements the raft.FSM interface for cluster state management.
@@ -270,7 +341,77 @@ type ClusterFSM struct {
 	// f.tokens. Maintained alongside `tokens` and `tokensByPrefix`.
 	// Phase A: Cluster Auth Convergence.
 	tokensByName map[string]int64
-	logger       zerolog.Logger
+
+	// -------------------------------------------------------------------
+	// Phase A.1: Cluster Auth Convergence (RBAC).
+	//
+	// Five primary maps mirror the rbac_organizations, rbac_teams,
+	// rbac_roles, rbac_measurement_permissions, and rbac_token_memberships
+	// SQLite tables. Each map is the in-memory source of truth; the local
+	// SQLite tables are materialised caches rebuilt from FSM apply
+	// callbacks (same shape as Phase A tokens).
+	//
+	// Secondary indices serve two roles:
+	//   - UNIQUE-constraint enforcement on the single-threaded apply
+	//     path. Without them, applyCreateOrganization (and siblings)
+	//     would have to scan the primary map linearly on every apply,
+	//     blocking the Raft commit loop. Same reasoning as tokensByName.
+	//   - Cascade traversal for ON DELETE CASCADE semantics at the FSM
+	//     layer. applyDeleteOrganization walks teamsByOrg → rolesByTeam
+	//     → measurementPermsByRole → tokenMembershipsByTeam under a
+	//     single log entry. SQLite-side cascade fires naturally via FKs
+	//     in the local materialise.
+	// -------------------------------------------------------------------
+
+	// organizations holds all RBAC organizations, keyed by Raft-stamped ID.
+	organizations map[int64]*OrganizationEntry
+	// organizationsByName enforces UNIQUE(name) cluster-wide. Keyed by
+	// Name → ID; resolve back to *OrganizationEntry via organizations.
+	organizationsByName map[string]int64
+
+	// teams holds all RBAC teams, keyed by Raft-stamped ID.
+	teams map[int64]*TeamEntry
+	// teamsByOrg is the folded UNIQUE-and-traversal index: orgID → name →
+	// teamID. Serves both UNIQUE(organization_id, name) enforcement and
+	// the "all teams under this org" cascade query. Folded into one map
+	// (vs. two separate maps) because the natural traversal key IS the
+	// name — saves a map and prevents drift between two indices.
+	teamsByOrg map[int64]map[string]int64
+
+	// roles holds all RBAC roles, keyed by Raft-stamped ID.
+	roles map[int64]*RoleEntry
+	// rolesByTeam is the traversal-only index: teamID → set of roleIDs.
+	// Used by applyDeleteTeam / applyDeleteOrganization to cascade.
+	rolesByTeam map[int64]map[int64]struct{}
+
+	// measurementPermissions holds all RBAC measurement permissions,
+	// keyed by Raft-stamped ID.
+	measurementPermissions map[int64]*MeasurementPermissionEntry
+	// measurementPermsByRole is the traversal-only index: roleID → set
+	// of measurement-permission IDs. Used by applyDeleteRole /
+	// applyDeleteTeam / applyDeleteOrganization to cascade.
+	measurementPermsByRole map[int64]map[int64]struct{}
+
+	// tokenMemberships holds all RBAC token-team memberships, keyed by
+	// Raft-stamped surrogate ID. The (token_id, team_id) pair is the
+	// natural business key; the surrogate ID is retained for API parity.
+	tokenMemberships map[int64]*TokenMembershipEntry
+	// tokenMembershipsByPair enforces UNIQUE(token_id, team_id)
+	// cluster-wide. Nested map: tokenID → teamID → membershipID. The
+	// inner-map lookup is what every applyAddTokenToTeam does on the
+	// UNIQUE-check fast path.
+	tokenMembershipsByPair map[int64]map[int64]int64
+	// tokenMembershipsByToken is the traversal-only index used by
+	// applyDeleteToken to cascade memberships out of FSM state when a
+	// token row is hard-deleted (mirrors SQLite FK rbac_token_memberships.
+	// token_id REFERENCES api_tokens(id) ON DELETE CASCADE).
+	tokenMembershipsByToken map[int64]map[int64]struct{}
+	// tokenMembershipsByTeam is the traversal-only index used by
+	// applyDeleteTeam / applyDeleteOrganization to cascade memberships
+	// when a team is removed.
+	tokenMembershipsByTeam map[int64]map[int64]struct{}
+
+	logger zerolog.Logger
 
 	// rejectedPaths counts manifest entries refused by path validation
 	// across every code path that mutates the manifest: applyRegisterFile,
@@ -302,6 +443,14 @@ type ClusterFSM struct {
 	// Auth Convergence.
 	rejectedTokens atomic.Int64
 
+	// rejectedRBAC counts RBAC commands refused by applier-side validation
+	// across all 13 RBAC command types (validation failure, missing
+	// parent FK target, UNIQUE constraint violation, etc.). Single
+	// counter rather than per-command to keep the metric surface
+	// manageable; the per-entry Error log line carries the specific
+	// reason. Phase A.1: Cluster Auth Convergence (RBAC).
+	rejectedRBAC atomic.Int64
+
 	// Callbacks for state changes
 	onNodeAdded         func(*NodeInfo)
 	onNodeRemoved       func(string)
@@ -320,6 +469,31 @@ type ClusterFSM struct {
 	onTokenRevoked func(id int64)
 	onTokenDeleted func(id int64)
 	onTokenRotated func(id int64, newHash, newPrefix string, lsn uint64)
+
+	// RBAC-state callbacks: invoked from every node's apply path so the
+	// node's local RBACManager can materialise the change into its SQLite
+	// cache (and invalidate the relevant permission caches). All wired
+	// together via SetRBACCallbacks; nil callbacks are skipped, mirroring
+	// the auth-state pattern. Phase A.1: Cluster Auth Convergence.
+	//
+	// For Delete callbacks the cascade has already happened in-FSM under
+	// the same log entry; the callback is fired ONCE for the top-level
+	// deleted entity. Local SQLite cascade fires via FK ON DELETE CASCADE
+	// inside the materialise — neither layer needs to enumerate the
+	// affected children.
+	onOrganizationCreated          func(*OrganizationEntry)
+	onOrganizationUpdated          func(*OrganizationEntry)
+	onOrganizationDeleted          func(id int64)
+	onTeamCreated                  func(*TeamEntry)
+	onTeamUpdated                  func(*TeamEntry)
+	onTeamDeleted                  func(id int64)
+	onRoleCreated                  func(*RoleEntry)
+	onRoleUpdated                  func(*RoleEntry)
+	onRoleDeleted                  func(id int64)
+	onMeasurementPermissionCreated func(*MeasurementPermissionEntry)
+	onMeasurementPermissionDeleted func(id int64)
+	onTokenMembershipAdded         func(*TokenMembershipEntry)
+	onTokenMembershipRemoved       func(tokenID, teamID int64)
 }
 
 // NewClusterFSM creates a new cluster FSM.
@@ -331,7 +505,22 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 		tokens:         make(map[int64]*TokenEntry),
 		tokensByPrefix: make(map[string][]int64),
 		tokensByName:   make(map[string]int64),
-		logger:         logger.With().Str("component", "cluster-fsm").Logger(),
+
+		// Phase A.1: RBAC primary maps + secondary indices.
+		organizations:           make(map[int64]*OrganizationEntry),
+		organizationsByName:     make(map[string]int64),
+		teams:                   make(map[int64]*TeamEntry),
+		teamsByOrg:              make(map[int64]map[string]int64),
+		roles:                   make(map[int64]*RoleEntry),
+		rolesByTeam:             make(map[int64]map[int64]struct{}),
+		measurementPermissions:  make(map[int64]*MeasurementPermissionEntry),
+		measurementPermsByRole:  make(map[int64]map[int64]struct{}),
+		tokenMemberships:        make(map[int64]*TokenMembershipEntry),
+		tokenMembershipsByPair:  make(map[int64]map[int64]int64),
+		tokenMembershipsByToken: make(map[int64]map[int64]struct{}),
+		tokenMembershipsByTeam:  make(map[int64]map[int64]struct{}),
+
+		logger: logger.With().Str("component", "cluster-fsm").Logger(),
 	}
 }
 
@@ -481,6 +670,56 @@ func (f *ClusterFSM) incRejectedTokens() {
 	metrics.Get().IncClusterAuthRejected()
 }
 
+// SetRBACCallbacks wires the cluster FSM into the local RBACManager so that
+// every node's SQLite RBAC tables stay consistent with the Raft-replicated
+// RBAC state. Same shape as SetAuthCallbacks but with 13 callback slots
+// (matching the 13 RBAC command types). Each callback fires after the FSM's
+// in-memory map mutation, on the runFSM goroutine.
+//
+// For Delete callbacks the FSM-side cascade has already happened under the
+// same log entry; the callback is fired ONCE per top-level deleted entity
+// and the local SQLite cascade fires via ON DELETE CASCADE inside the
+// materialise. Phase A.1: Cluster Auth Convergence (RBAC).
+func (f *ClusterFSM) SetRBACCallbacks(
+	onOrgCreated func(*OrganizationEntry),
+	onOrgUpdated func(*OrganizationEntry),
+	onOrgDeleted func(id int64),
+	onTeamCreated func(*TeamEntry),
+	onTeamUpdated func(*TeamEntry),
+	onTeamDeleted func(id int64),
+	onRoleCreated func(*RoleEntry),
+	onRoleUpdated func(*RoleEntry),
+	onRoleDeleted func(id int64),
+	onMeasurementPermissionCreated func(*MeasurementPermissionEntry),
+	onMeasurementPermissionDeleted func(id int64),
+	onTokenMembershipAdded func(*TokenMembershipEntry),
+	onTokenMembershipRemoved func(tokenID, teamID int64),
+) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onOrganizationCreated = onOrgCreated
+	f.onOrganizationUpdated = onOrgUpdated
+	f.onOrganizationDeleted = onOrgDeleted
+	f.onTeamCreated = onTeamCreated
+	f.onTeamUpdated = onTeamUpdated
+	f.onTeamDeleted = onTeamDeleted
+	f.onRoleCreated = onRoleCreated
+	f.onRoleUpdated = onRoleUpdated
+	f.onRoleDeleted = onRoleDeleted
+	f.onMeasurementPermissionCreated = onMeasurementPermissionCreated
+	f.onMeasurementPermissionDeleted = onMeasurementPermissionDeleted
+	f.onTokenMembershipAdded = onTokenMembershipAdded
+	f.onTokenMembershipRemoved = onTokenMembershipRemoved
+}
+
+// RejectedRBACCount returns the count of RBAC commands refused by
+// applier-side validation across all 13 RBAC command types. Single
+// monotonic counter, atomic for /metrics scrape safety, mirrors
+// RejectedTokensCount. Phase A.1: Cluster Auth Convergence (RBAC).
+func (f *ClusterFSM) RejectedRBACCount() int64 {
+	return f.rejectedRBAC.Load()
+}
+
 // GetTokenByID returns a copy of the token entry with the given ID, or
 // nil if no such token exists in the FSM. Used by tests + by the
 // AuthManager when a local SQLite materialise needs to reconcile with
@@ -553,6 +792,37 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.applyDeleteToken(cmd.Payload, log.Index)
 	case CommandRotateToken:
 		return f.applyRotateToken(cmd.Payload, log.Index)
+
+	// Phase A.1: RBAC dispatch (13 cases). All apply functions live in
+	// fsm_rbac.go; the dispatch is here to keep the wire-format contract
+	// (CommandType ↔ apply function) in one place.
+	case CommandCreateOrganization:
+		return f.applyCreateOrganization(cmd.Payload, log.Index)
+	case CommandUpdateOrganization:
+		return f.applyUpdateOrganization(cmd.Payload, log.Index)
+	case CommandDeleteOrganization:
+		return f.applyDeleteOrganization(cmd.Payload, log.Index)
+	case CommandCreateTeam:
+		return f.applyCreateTeam(cmd.Payload, log.Index)
+	case CommandUpdateTeam:
+		return f.applyUpdateTeam(cmd.Payload, log.Index)
+	case CommandDeleteTeam:
+		return f.applyDeleteTeam(cmd.Payload, log.Index)
+	case CommandCreateRole:
+		return f.applyCreateRole(cmd.Payload, log.Index)
+	case CommandUpdateRole:
+		return f.applyUpdateRole(cmd.Payload, log.Index)
+	case CommandDeleteRole:
+		return f.applyDeleteRole(cmd.Payload, log.Index)
+	case CommandCreateMeasurementPermission:
+		return f.applyCreateMeasurementPermission(cmd.Payload, log.Index)
+	case CommandDeleteMeasurementPermission:
+		return f.applyDeleteMeasurementPermission(cmd.Payload, log.Index)
+	case CommandAddTokenToTeam:
+		return f.applyAddTokenToTeam(cmd.Payload, log.Index)
+	case CommandRemoveTokenFromTeam:
+		return f.applyRemoveTokenFromTeam(cmd.Payload, log.Index)
+
 	default:
 		return fmt.Errorf("unknown command type: %d", cmd.Type)
 	}
@@ -1413,11 +1683,49 @@ func (f *ClusterFSM) applyDeleteToken(payload []byte, logIndex uint64) interface
 	// Remove from the name index so a future create with the same name
 	// is no longer rejected as a duplicate.
 	delete(f.tokensByName, entry.Name)
+
+	// Phase A.1 extension: cascade out of FSM state for any RBAC
+	// memberships this token held. Mirrors the SQLite FK ON DELETE
+	// CASCADE on rbac_token_memberships.token_id REFERENCES
+	// api_tokens(id). Without this the FSM membership map would hold
+	// orphans pointing at a non-existent token row, diverging from
+	// the local SQLite materialise.
+	cascadedMemberships := 0
+	if tokenSet, ok := f.tokenMembershipsByToken[p.ID]; ok {
+		for membershipID := range tokenSet {
+			mem, ok := f.tokenMemberships[membershipID]
+			if !ok {
+				continue
+			}
+			// Remove from byPair.
+			if pairMap, ok := f.tokenMembershipsByPair[mem.TokenID]; ok {
+				delete(pairMap, mem.TeamID)
+				if len(pairMap) == 0 {
+					delete(f.tokenMembershipsByPair, mem.TokenID)
+				}
+			}
+			// Remove from byTeam.
+			if teamSet, ok := f.tokenMembershipsByTeam[mem.TeamID]; ok {
+				delete(teamSet, membershipID)
+				if len(teamSet) == 0 {
+					delete(f.tokenMembershipsByTeam, mem.TeamID)
+				}
+			}
+			delete(f.tokenMemberships, membershipID)
+			cascadedMemberships++
+		}
+		delete(f.tokenMembershipsByToken, p.ID)
+	}
+
 	callback := f.onTokenDeleted
 	f.mu.Unlock()
 
 	metrics.Get().IncClusterAuthApplyDelete()
-	f.logger.Info().Int64("token_id", p.ID).Msg("Token deleted from cluster auth state")
+	logEvt := f.logger.Info().Int64("token_id", p.ID)
+	if cascadedMemberships > 0 {
+		logEvt = logEvt.Int("cascaded_memberships", cascadedMemberships)
+	}
+	logEvt.Msg("Token deleted from cluster auth state")
 	if callback != nil {
 		callback(p.ID)
 	}
@@ -1500,12 +1808,45 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 		tokens[id] = &tokenCopy
 	}
 
+	// Phase A.1: Deep copy RBAC primary maps. Secondary indices are NOT
+	// persisted — Restore rebuilds them from these primaries.
+	organizations := make(map[int64]*OrganizationEntry, len(f.organizations))
+	for id, e := range f.organizations {
+		entryCopy := *e
+		organizations[id] = &entryCopy
+	}
+	teams := make(map[int64]*TeamEntry, len(f.teams))
+	for id, e := range f.teams {
+		entryCopy := *e
+		teams[id] = &entryCopy
+	}
+	roles := make(map[int64]*RoleEntry, len(f.roles))
+	for id, e := range f.roles {
+		entryCopy := *e
+		roles[id] = &entryCopy
+	}
+	measurementPermissions := make(map[int64]*MeasurementPermissionEntry, len(f.measurementPermissions))
+	for id, e := range f.measurementPermissions {
+		entryCopy := *e
+		measurementPermissions[id] = &entryCopy
+	}
+	tokenMemberships := make(map[int64]*TokenMembershipEntry, len(f.tokenMemberships))
+	for id, e := range f.tokenMemberships {
+		entryCopy := *e
+		tokenMemberships[id] = &entryCopy
+	}
+
 	return &fsmSnapshot{
-		nodes:             nodes,
-		primaryWriterID:   f.primaryWriterID,
-		activeCompactorID: f.activeCompactorID,
-		files:             files,
-		tokens:            tokens,
+		nodes:                  nodes,
+		primaryWriterID:        f.primaryWriterID,
+		activeCompactorID:      f.activeCompactorID,
+		files:                  files,
+		tokens:                 tokens,
+		organizations:          organizations,
+		teams:                  teams,
+		roles:                  roles,
+		measurementPermissions: measurementPermissions,
+		tokenMemberships:       tokenMemberships,
 	}, nil
 }
 
@@ -1578,6 +1919,174 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		restoredTokens[id] = entry
 	}
 
+	// Phase A.1: same quarantine policy for the 5 RBAC entry types.
+	// Each map is validated independently; a bad entry in one map does
+	// NOT affect the others. rejectedRBAC counts all skipped entries
+	// across all 5 maps.
+	restoredOrgs := make(map[int64]*OrganizationEntry, len(snapshot.Organizations))
+	// Track names seen so far to enforce UNIQUE(name) during restore.
+	// A corrupted snapshot with two orgs sharing a name would
+	// otherwise rebuild organizationsByName with the second write
+	// silently overwriting the first — the loser stays in the primary
+	// map but is unreachable via the name index, the FSM is
+	// permanently inconsistent. Quarantine duplicates instead.
+	// Gemini PR #458 round 7 G25.
+	restoredOrgNames := make(map[string]int64, len(snapshot.Organizations))
+	for id, entry := range snapshot.Organizations {
+		if entry == nil {
+			f.incRejectedRBAC()
+			f.logger.Error().Int64("organization_id", id).Str("source", "snapshot").Msg("organization entry is nil during snapshot restore — entry refused")
+			continue
+		}
+		if err := validateOrganizationEntry(entry); err != nil {
+			f.incRejectedRBAC()
+			f.logger.Error().Err(err).Int64("organization_id", id).Str("source", "snapshot").Msg("organization validation failed during snapshot restore — entry refused")
+			continue
+		}
+		if dupID, exists := restoredOrgNames[entry.Name]; exists {
+			f.incRejectedRBAC()
+			f.logger.Error().
+				Int64("organization_id", id).
+				Int64("duplicate_of_id", dupID).
+				Str("name", entry.Name).
+				Str("source", "snapshot").
+				Msg("duplicate organization name during snapshot restore — entry refused")
+			continue
+		}
+		restoredOrgs[id] = entry
+		restoredOrgNames[entry.Name] = id
+	}
+	restoredTeams := make(map[int64]*TeamEntry, len(snapshot.Teams))
+	// Track (orgID, name) seen so far to enforce UNIQUE(org_id, name)
+	// during restore. Same defence as the org-name check above —
+	// symmetric to applyCreateTeam's UNIQUE enforcement. Gemini PR #458
+	// round 7 G25 (extended to the composite-key case).
+	restoredTeamsByOrgAndName := make(map[int64]map[string]int64)
+	for id, entry := range snapshot.Teams {
+		if entry == nil {
+			f.incRejectedRBAC()
+			f.logger.Error().Int64("team_id", id).Str("source", "snapshot").Msg("team entry is nil during snapshot restore — entry refused")
+			continue
+		}
+		if err := validateTeamEntry(entry); err != nil {
+			f.incRejectedRBAC()
+			f.logger.Error().Err(err).Int64("team_id", id).Str("source", "snapshot").Msg("team validation failed during snapshot restore — entry refused")
+			continue
+		}
+		// Orphan check: team's parent org must have survived restore.
+		// Otherwise we'd have a stranded team in the FSM with no UNIQUE
+		// scope to enforce against. Skip + count.
+		if _, ok := restoredOrgs[entry.OrganizationID]; !ok {
+			f.incRejectedRBAC()
+			f.logger.Error().Int64("team_id", id).Int64("organization_id", entry.OrganizationID).Str("source", "snapshot").Msg("team references unknown organization during snapshot restore — entry refused")
+			continue
+		}
+		// Duplicate (org_id, name) check.
+		orgNames := restoredTeamsByOrgAndName[entry.OrganizationID]
+		if dupID, exists := orgNames[entry.Name]; exists {
+			f.incRejectedRBAC()
+			f.logger.Error().
+				Int64("team_id", id).
+				Int64("duplicate_of_id", dupID).
+				Int64("organization_id", entry.OrganizationID).
+				Str("name", entry.Name).
+				Str("source", "snapshot").
+				Msg("duplicate team name within organization during snapshot restore — entry refused")
+			continue
+		}
+		if orgNames == nil {
+			orgNames = make(map[string]int64)
+			restoredTeamsByOrgAndName[entry.OrganizationID] = orgNames
+		}
+		orgNames[entry.Name] = id
+		restoredTeams[id] = entry
+	}
+	restoredRoles := make(map[int64]*RoleEntry, len(snapshot.Roles))
+	for id, entry := range snapshot.Roles {
+		if entry == nil {
+			f.incRejectedRBAC()
+			f.logger.Error().Int64("role_id", id).Str("source", "snapshot").Msg("role entry is nil during snapshot restore — entry refused")
+			continue
+		}
+		if err := validateRoleEntry(entry); err != nil {
+			f.incRejectedRBAC()
+			f.logger.Error().Err(err).Int64("role_id", id).Str("source", "snapshot").Msg("role validation failed during snapshot restore — entry refused")
+			continue
+		}
+		if _, ok := restoredTeams[entry.TeamID]; !ok {
+			f.incRejectedRBAC()
+			f.logger.Error().Int64("role_id", id).Int64("team_id", entry.TeamID).Str("source", "snapshot").Msg("role references unknown team during snapshot restore — entry refused")
+			continue
+		}
+		restoredRoles[id] = entry
+	}
+	restoredMPerms := make(map[int64]*MeasurementPermissionEntry, len(snapshot.MeasurementPermissions))
+	for id, entry := range snapshot.MeasurementPermissions {
+		if entry == nil {
+			f.incRejectedRBAC()
+			f.logger.Error().Int64("measurement_permission_id", id).Str("source", "snapshot").Msg("measurement_permission entry is nil during snapshot restore — entry refused")
+			continue
+		}
+		if err := validateMeasurementPermissionEntry(entry); err != nil {
+			f.incRejectedRBAC()
+			f.logger.Error().Err(err).Int64("measurement_permission_id", id).Str("source", "snapshot").Msg("measurement_permission validation failed during snapshot restore — entry refused")
+			continue
+		}
+		if _, ok := restoredRoles[entry.RoleID]; !ok {
+			f.incRejectedRBAC()
+			f.logger.Error().Int64("measurement_permission_id", id).Int64("role_id", entry.RoleID).Str("source", "snapshot").Msg("measurement_permission references unknown role during snapshot restore — entry refused")
+			continue
+		}
+		restoredMPerms[id] = entry
+	}
+	restoredMemberships := make(map[int64]*TokenMembershipEntry, len(snapshot.TokenMemberships))
+	// Track (token_id, team_id) seen so far to enforce UNIQUE(token_id,
+	// team_id) during restore. Symmetric to applyAddTokenToTeam's
+	// UNIQUE enforcement and the org/team duplicate-name checks
+	// above. Gemini PR #458 round 7 G25 (extended).
+	restoredMembershipPairs := make(map[int64]map[int64]int64)
+	for id, entry := range snapshot.TokenMemberships {
+		if entry == nil {
+			f.incRejectedRBAC()
+			f.logger.Error().Int64("membership_id", id).Str("source", "snapshot").Msg("token_membership entry is nil during snapshot restore — entry refused")
+			continue
+		}
+		if err := validateTokenMembershipEntry(entry); err != nil {
+			f.incRejectedRBAC()
+			f.logger.Error().Err(err).Int64("membership_id", id).Str("source", "snapshot").Msg("token_membership validation failed during snapshot restore — entry refused")
+			continue
+		}
+		if _, ok := restoredTokens[entry.TokenID]; !ok {
+			f.incRejectedRBAC()
+			f.logger.Error().Int64("membership_id", id).Int64("token_id", entry.TokenID).Str("source", "snapshot").Msg("token_membership references unknown token during snapshot restore — entry refused")
+			continue
+		}
+		if _, ok := restoredTeams[entry.TeamID]; !ok {
+			f.incRejectedRBAC()
+			f.logger.Error().Int64("membership_id", id).Int64("team_id", entry.TeamID).Str("source", "snapshot").Msg("token_membership references unknown team during snapshot restore — entry refused")
+			continue
+		}
+		// Duplicate (token_id, team_id) check.
+		tokenPairs := restoredMembershipPairs[entry.TokenID]
+		if dupID, exists := tokenPairs[entry.TeamID]; exists {
+			f.incRejectedRBAC()
+			f.logger.Error().
+				Int64("membership_id", id).
+				Int64("duplicate_of_id", dupID).
+				Int64("token_id", entry.TokenID).
+				Int64("team_id", entry.TeamID).
+				Str("source", "snapshot").
+				Msg("duplicate token-team membership during snapshot restore — entry refused")
+			continue
+		}
+		if tokenPairs == nil {
+			tokenPairs = make(map[int64]int64)
+			restoredMembershipPairs[entry.TokenID] = tokenPairs
+		}
+		tokenPairs[entry.TeamID] = id
+		restoredMemberships[id] = entry
+	}
+
 	f.mu.Lock()
 	f.nodes = snapshot.Nodes
 	f.primaryWriterID = snapshot.PrimaryWriterID
@@ -1604,12 +2113,79 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		f.tokensByPrefix[entry.TokenPrefix] = append(f.tokensByPrefix[entry.TokenPrefix], id)
 		f.tokensByName[entry.Name] = id
 	}
+
+	// Phase A.1: install RBAC primary maps + rebuild all secondary
+	// indices from scratch (we never persist them — they're derived).
+	f.organizations = restoredOrgs
+	f.organizationsByName = make(map[string]int64, len(f.organizations))
+	for id, entry := range f.organizations {
+		f.organizationsByName[entry.Name] = id
+	}
+	f.teams = restoredTeams
+	f.teamsByOrg = make(map[int64]map[string]int64)
+	for id, entry := range f.teams {
+		orgTeams, ok := f.teamsByOrg[entry.OrganizationID]
+		if !ok {
+			orgTeams = make(map[string]int64)
+			f.teamsByOrg[entry.OrganizationID] = orgTeams
+		}
+		orgTeams[entry.Name] = id
+	}
+	f.roles = restoredRoles
+	f.rolesByTeam = make(map[int64]map[int64]struct{})
+	for id, entry := range f.roles {
+		teamRoles, ok := f.rolesByTeam[entry.TeamID]
+		if !ok {
+			teamRoles = make(map[int64]struct{})
+			f.rolesByTeam[entry.TeamID] = teamRoles
+		}
+		teamRoles[id] = struct{}{}
+	}
+	f.measurementPermissions = restoredMPerms
+	f.measurementPermsByRole = make(map[int64]map[int64]struct{})
+	for id, entry := range f.measurementPermissions {
+		roleMPerms, ok := f.measurementPermsByRole[entry.RoleID]
+		if !ok {
+			roleMPerms = make(map[int64]struct{})
+			f.measurementPermsByRole[entry.RoleID] = roleMPerms
+		}
+		roleMPerms[id] = struct{}{}
+	}
+	f.tokenMemberships = restoredMemberships
+	f.tokenMembershipsByPair = make(map[int64]map[int64]int64)
+	f.tokenMembershipsByToken = make(map[int64]map[int64]struct{})
+	f.tokenMembershipsByTeam = make(map[int64]map[int64]struct{})
+	for id, entry := range f.tokenMemberships {
+		pairMap, ok := f.tokenMembershipsByPair[entry.TokenID]
+		if !ok {
+			pairMap = make(map[int64]int64)
+			f.tokenMembershipsByPair[entry.TokenID] = pairMap
+		}
+		pairMap[entry.TeamID] = id
+		tokenSet, ok := f.tokenMembershipsByToken[entry.TokenID]
+		if !ok {
+			tokenSet = make(map[int64]struct{})
+			f.tokenMembershipsByToken[entry.TokenID] = tokenSet
+		}
+		tokenSet[id] = struct{}{}
+		teamSet, ok := f.tokenMembershipsByTeam[entry.TeamID]
+		if !ok {
+			teamSet = make(map[int64]struct{})
+			f.tokenMembershipsByTeam[entry.TeamID] = teamSet
+		}
+		teamSet[id] = struct{}{}
+	}
 	f.mu.Unlock()
 
 	f.logger.Info().
 		Int("node_count", len(snapshot.Nodes)).
 		Int("file_count", len(snapshot.Files)).
 		Int("token_count", len(snapshot.Tokens)).
+		Int("organization_count", len(restoredOrgs)).
+		Int("team_count", len(restoredTeams)).
+		Int("role_count", len(restoredRoles)).
+		Int("measurement_permission_count", len(restoredMPerms)).
+		Int("token_membership_count", len(restoredMemberships)).
 		Str("primary_writer", snapshot.PrimaryWriterID).
 		Str("active_compactor", snapshot.ActiveCompactorID).
 		Msg("FSM restored from snapshot")
@@ -1738,16 +2314,28 @@ type fsmSnapshot struct {
 	activeCompactorID string
 	files             map[string]*FileEntry
 	tokens            map[int64]*TokenEntry
+
+	// Phase A.1: RBAC primary maps (no secondary indices persisted).
+	organizations          map[int64]*OrganizationEntry
+	teams                  map[int64]*TeamEntry
+	roles                  map[int64]*RoleEntry
+	measurementPermissions map[int64]*MeasurementPermissionEntry
+	tokenMemberships       map[int64]*TokenMembershipEntry
 }
 
 // Persist writes the snapshot to the given sink.
 func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 	snapshot := FSMSnapshot{
-		Nodes:             s.nodes,
-		PrimaryWriterID:   s.primaryWriterID,
-		ActiveCompactorID: s.activeCompactorID,
-		Files:             s.files,
-		Tokens:            s.tokens,
+		Nodes:                  s.nodes,
+		PrimaryWriterID:        s.primaryWriterID,
+		ActiveCompactorID:      s.activeCompactorID,
+		Files:                  s.files,
+		Tokens:                 s.tokens,
+		Organizations:          s.organizations,
+		Teams:                  s.teams,
+		Roles:                  s.roles,
+		MeasurementPermissions: s.measurementPermissions,
+		TokenMemberships:       s.tokenMemberships,
 	}
 
 	data, err := json.Marshal(snapshot)
