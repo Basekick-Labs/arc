@@ -88,13 +88,6 @@ func (rm *RBACManager) SeedRBACFromLocalSQLite(ctx context.Context) error {
 	}
 
 	// 1. Organizations — top of the FK chain.
-	rows, err := rm.db.Query(`
-		SELECT id, name, description, created_at, updated_at, enabled
-		FROM rbac_organizations ORDER BY id
-	`)
-	if err != nil {
-		return fmt.Errorf("seed: query organizations: %w", err)
-	}
 	type orgRow struct {
 		id          int64
 		name        string
@@ -103,23 +96,38 @@ func (rm *RBACManager) SeedRBACFromLocalSQLite(ctx context.Context) error {
 		updatedAt   time.Time
 		enabled     bool
 	}
-	var orgRows []orgRow
-	for rows.Next() {
-		var r orgRow
-		if err := rows.Scan(&r.id, &r.name, &r.description, &r.createdAt, &r.updatedAt, &r.enabled); err != nil {
-			rows.Close()
-			return fmt.Errorf("seed: scan organization: %w", err)
+	orgRows, err := func() ([]orgRow, error) {
+		// Inner scope so defer rows.Close() fires before the outer
+		// SeedRBACFromLocalSQLite continues to its COUNT(*) checks,
+		// keeping the rows handle short-lived. Gemini PR #458 round 2.
+		rows, qerr := rm.db.Query(`
+			SELECT id, name, description, created_at, updated_at, enabled
+			FROM rbac_organizations ORDER BY id
+		`)
+		if qerr != nil {
+			return nil, fmt.Errorf("seed: query organizations: %w", qerr)
 		}
-		orgRows = append(orgRows, r)
+		defer rows.Close()
+
+		var out []orgRow
+		for rows.Next() {
+			var r orgRow
+			if scanErr := rows.Scan(&r.id, &r.name, &r.description, &r.createdAt, &r.updatedAt, &r.enabled); scanErr != nil {
+				return nil, fmt.Errorf("seed: scan organization: %w", scanErr)
+			}
+			out = append(out, r)
+		}
+		// Surface iteration errors (connection loss, mid-stream
+		// corruption) loudly rather than silently proceeding with
+		// partial data.
+		if iterErr := rows.Err(); iterErr != nil {
+			return nil, fmt.Errorf("seed: organizations iteration error: %w", iterErr)
+		}
+		return out, nil
+	}()
+	if err != nil {
+		return err
 	}
-	// Surface iteration errors (connection loss, mid-stream corruption)
-	// loudly rather than silently proceeding with partial data. Gemini
-	// PR #458 review.
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return fmt.Errorf("seed: organizations iteration error: %w", err)
-	}
-	rows.Close()
 	for _, r := range orgRows {
 		payload := createOrganizationPayloadWire{
 			Organization: clusterOrganizationEntryWire{

@@ -729,7 +729,18 @@ func (f *ClusterFSM) applyUpdateTeam(payload []byte, logIndex uint64) interface{
 		switch field {
 		case "name":
 			if p.Name != existing.Name {
-				orgTeams := f.teamsByOrg[existing.OrganizationID]
+				// Defensive: applyCreateTeam always initialises
+				// teamsByOrg[orgID] when it stores a team, so this
+				// should always be non-nil — but a corrupted snapshot
+				// restore or a buggy future code path could leave the
+				// nested map missing. Initialise on-demand so the write
+				// at the bottom of this block cannot panic on a nil
+				// map. Gemini PR #458 round 2.
+				orgTeams, ok := f.teamsByOrg[existing.OrganizationID]
+				if !ok || orgTeams == nil {
+					orgTeams = make(map[string]int64)
+					f.teamsByOrg[existing.OrganizationID] = orgTeams
+				}
 				if _, exists := orgTeams[p.Name]; exists {
 					f.mu.Unlock()
 					return f.rejectRBAC("update_team", p.ID, logIndex, fmt.Errorf("team name %q already exists in organization %d", p.Name, existing.OrganizationID))

@@ -292,15 +292,19 @@ func (rm *RBACManager) CreateOrganization(ctx context.Context, req *CreateOrgani
 			}
 			return nil, fmt.Errorf("failed to create organization: %w", err)
 		}
-		// Apply callback fired on this node before Propose returned — look
-		// up the materialised row to surface the Raft-stamped ID and the
-		// stored timestamps.
+		// On the leader, the apply callback has already fired by the time
+		// Propose returned — read-back is immediate. On a follower, the
+		// entry replicates asynchronously via the runFSM goroutine and
+		// may not have hit local SQLite yet, so we retry briefly on
+		// sql.ErrNoRows. Gemini PR #458 round 2.
 		rm.logger.Info().Str("name", req.Name).Msg("Created organization via Raft")
 		var org Organization
-		if err := rm.db.QueryRow(`
-			SELECT id, name, description, created_at, updated_at, enabled
-			FROM rbac_organizations WHERE name = ?
-		`, req.Name).Scan(&org.ID, &org.Name, &org.Description, &org.CreatedAt, &org.UpdatedAt, &org.Enabled); err != nil {
+		if err := readBackAfterPropose(func() error {
+			return rm.db.QueryRow(`
+				SELECT id, name, description, created_at, updated_at, enabled
+				FROM rbac_organizations WHERE name = ?
+			`, req.Name).Scan(&org.ID, &org.Name, &org.Description, &org.CreatedAt, &org.UpdatedAt, &org.Enabled)
+		}); err != nil {
 			return nil, fmt.Errorf("failed to read back organization after Raft apply: %w", err)
 		}
 		return &org, nil
@@ -519,10 +523,12 @@ func (rm *RBACManager) CreateTeam(ctx context.Context, orgID int64, req *CreateT
 		}
 		rm.logger.Info().Int64("org_id", orgID).Str("name", req.Name).Msg("Created team via Raft")
 		var team Team
-		if err := rm.db.QueryRow(`
-			SELECT id, organization_id, name, description, created_at, updated_at, enabled
-			FROM rbac_teams WHERE organization_id = ? AND name = ?
-		`, orgID, req.Name).Scan(&team.ID, &team.OrganizationID, &team.Name, &team.Description, &team.CreatedAt, &team.UpdatedAt, &team.Enabled); err != nil {
+		if err := readBackAfterPropose(func() error {
+			return rm.db.QueryRow(`
+				SELECT id, organization_id, name, description, created_at, updated_at, enabled
+				FROM rbac_teams WHERE organization_id = ? AND name = ?
+			`, orgID, req.Name).Scan(&team.ID, &team.OrganizationID, &team.Name, &team.Description, &team.CreatedAt, &team.UpdatedAt, &team.Enabled)
+		}); err != nil {
 			return nil, fmt.Errorf("failed to read back team after Raft apply: %w", err)
 		}
 		return &team, nil
@@ -766,13 +772,15 @@ func (rm *RBACManager) CreateRole(ctx context.Context, teamID int64, req *Create
 		// read if the same handler call retries.
 		var role Role
 		var dbPerms string
-		if err := rm.db.QueryRow(`
-			SELECT id, team_id, database_pattern, permissions, created_at
-			FROM rbac_roles
-			WHERE team_id = ? AND database_pattern = ? AND permissions = ?
-			ORDER BY created_at DESC, id DESC
-			LIMIT 1
-		`, teamID, req.DatabasePattern, perms).Scan(&role.ID, &role.TeamID, &role.DatabasePattern, &dbPerms, &role.CreatedAt); err != nil {
+		if err := readBackAfterPropose(func() error {
+			return rm.db.QueryRow(`
+				SELECT id, team_id, database_pattern, permissions, created_at
+				FROM rbac_roles
+				WHERE team_id = ? AND database_pattern = ? AND permissions = ?
+				ORDER BY created_at DESC, id DESC
+				LIMIT 1
+			`, teamID, req.DatabasePattern, perms).Scan(&role.ID, &role.TeamID, &role.DatabasePattern, &dbPerms, &role.CreatedAt)
+		}); err != nil {
 			return nil, fmt.Errorf("failed to read back role after Raft apply: %w", err)
 		}
 		role.Permissions = strings.Split(dbPerms, ",")
@@ -1006,13 +1014,15 @@ func (rm *RBACManager) CreateMeasurementPermission(ctx context.Context, roleID i
 			Msg("Created measurement permission via Raft")
 		var mp MeasurementPermission
 		var dbPerms string
-		if err := rm.db.QueryRow(`
-			SELECT id, role_id, measurement_pattern, permissions, created_at
-			FROM rbac_measurement_permissions
-			WHERE role_id = ? AND measurement_pattern = ? AND permissions = ?
-			ORDER BY created_at DESC, id DESC
-			LIMIT 1
-		`, roleID, req.MeasurementPattern, perms).Scan(&mp.ID, &mp.RoleID, &mp.MeasurementPattern, &dbPerms, &mp.CreatedAt); err != nil {
+		if err := readBackAfterPropose(func() error {
+			return rm.db.QueryRow(`
+				SELECT id, role_id, measurement_pattern, permissions, created_at
+				FROM rbac_measurement_permissions
+				WHERE role_id = ? AND measurement_pattern = ? AND permissions = ?
+				ORDER BY created_at DESC, id DESC
+				LIMIT 1
+			`, roleID, req.MeasurementPattern, perms).Scan(&mp.ID, &mp.RoleID, &mp.MeasurementPattern, &dbPerms, &mp.CreatedAt)
+		}); err != nil {
 			return nil, fmt.Errorf("failed to read back measurement permission after Raft apply: %w", err)
 		}
 		mp.Permissions = strings.Split(dbPerms, ",")
@@ -1138,10 +1148,12 @@ func (rm *RBACManager) AddTokenToTeam(ctx context.Context, tokenID, teamID int64
 		}
 		rm.logger.Info().Int64("token_id", tokenID).Int64("team_id", teamID).Msg("Added token to team via Raft")
 		var mem TokenMembership
-		if err := rm.db.QueryRow(`
-			SELECT id, token_id, team_id, created_at
-			FROM rbac_token_memberships WHERE token_id = ? AND team_id = ?
-		`, tokenID, teamID).Scan(&mem.ID, &mem.TokenID, &mem.TeamID, &mem.CreatedAt); err != nil {
+		if err := readBackAfterPropose(func() error {
+			return rm.db.QueryRow(`
+				SELECT id, token_id, team_id, created_at
+				FROM rbac_token_memberships WHERE token_id = ? AND team_id = ?
+			`, tokenID, teamID).Scan(&mem.ID, &mem.TokenID, &mem.TeamID, &mem.CreatedAt)
+		}); err != nil {
 			return nil, fmt.Errorf("failed to read back token membership after Raft apply: %w", err)
 		}
 		return &mem, nil
@@ -1800,4 +1812,44 @@ func matchPattern(pattern, value string) bool {
 
 	// Exact match
 	return pattern == value
+}
+
+// readBackAfterPropose retries a read-back Scan that may race the local
+// FSM apply on a follower. When a Create<X> RBAC method proposes via
+// Raft, Propose blocks until the leader commits the entry. On the
+// leader itself the local apply callback has already fired by the time
+// Propose returns — but on a follower the entry replicates
+// asynchronously via the runFSM goroutine and may not have hit local
+// SQLite yet. Without retry, the immediate read-back can return
+// sql.ErrNoRows and the API caller sees a 500.
+//
+// Retry shape: exponential backoff capped at ~1s total. The proposeTimeout
+// elsewhere is 5s so we stay well under that. Returns the last error
+// (typically sql.ErrNoRows) if all attempts fail. Gemini PR #458 round 2.
+func readBackAfterPropose(scan func() error) error {
+	delays := []time.Duration{
+		0, // immediate
+		10 * time.Millisecond,
+		25 * time.Millisecond,
+		50 * time.Millisecond,
+		100 * time.Millisecond,
+		200 * time.Millisecond,
+		400 * time.Millisecond,
+	}
+	var lastErr error
+	for _, d := range delays {
+		if d > 0 {
+			time.Sleep(d)
+		}
+		err := scan()
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			// Non-row-missing error: don't retry, return immediately.
+			return err
+		}
+		lastErr = err
+	}
+	return lastErr
 }
