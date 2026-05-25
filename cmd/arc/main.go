@@ -1706,14 +1706,38 @@ func main() {
 					// don't reach the seed body at all (IsLeader check),
 					// and a re-elected leader will pick it up on its own
 					// startup. Gemini PR #458 round 7 G23.
+					//
+					// Wire shutdown signal into the goroutine via a
+					// cancellable seedCtx that a shutdown hook fires. If
+					// the app receives SIGTERM during startup (operator
+					// kills a restart-looping container, k8s rolls a
+					// pod), we cancel mid-seed instead of fighting the
+					// database close. The cancel is also called in defer
+					// for the success path so the parent ctx never
+					// leaks. Gemini PR #458 round 9 G30.
+					seedCtx, seedCancel := context.WithCancel(context.Background())
+					// Fire before everything else (priority < PriorityHTTPServer=10)
+					// so the seed goroutine bails as soon as shutdown begins,
+					// freeing the RBACManager connections + the cluster
+					// coordinator's WaitForLeader before they get torn down
+					// in the higher-priority hooks.
+					shutdownCoordinator.RegisterHook("rbac-seed-cancel", func(ctx context.Context) error {
+						seedCancel()
+						return nil
+					}, 5)
 					go func() {
+						defer seedCancel()
 						if err := clusterCoordinator.WaitForLeader(30 * time.Second); err != nil {
 							log.Warn().Err(err).Msg("Cluster RBAC seed: leader not observed within 30s; skipping (will retry on next restart)")
 							return
 						}
-						seedCtx, seedCancel := context.WithTimeout(context.Background(), 30*time.Second)
-						defer seedCancel()
-						if seedErr := rbacManager.SeedRBACFromLocalSQLite(seedCtx); seedErr != nil {
+						// Bound the seed under a 30s timeout AND the
+						// app-shutdown cancellation; whichever fires first
+						// wins. context.WithTimeout chains off seedCtx so
+						// either source of cancellation propagates.
+						timedCtx, timedCancel := context.WithTimeout(seedCtx, 30*time.Second)
+						defer timedCancel()
+						if seedErr := rbacManager.SeedRBACFromLocalSQLite(timedCtx); seedErr != nil {
 							log.Warn().Err(seedErr).Msg("Cluster RBAC seed: partial failure (cluster is still operable; missing rows can be re-issued by an operator)")
 						}
 					}()

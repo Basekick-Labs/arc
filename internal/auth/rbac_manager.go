@@ -797,19 +797,24 @@ func (rm *RBACManager) CreateRole(ctx context.Context, teamID int64, req *Create
 			Str("database_pattern", req.DatabasePattern).
 			Strs("permissions", req.Permissions).
 			Msg("Created role via Raft")
-		// Read back. Roles aren't UNIQUE on (team_id, database_pattern) —
-		// pick the newest matching row by created_at to avoid a stale
-		// read if the same handler call retries.
+		// Read back. Roles aren't UNIQUE on (team_id, database_pattern,
+		// permissions) — two concurrent identical Create calls would
+		// produce two rows with the same business key. Match on
+		// created_at = this proposer's now (nanosecond Go monotonic
+		// clock + the proposer holding the value locally before
+		// propose makes the timestamp unique per call across the whole
+		// process). This unambiguously identifies THIS caller's row
+		// even when an identical row was created concurrently. The FSM
+		// stamps the proposer-supplied CreatedAtUnixNano verbatim into
+		// SQLite. Gemini PR #458 round 9 G28.
 		var role Role
 		var dbPerms string
 		if err := readBackAfterPropose(ctx, func() error {
 			return rm.db.QueryRowContext(ctx, `
 				SELECT id, team_id, database_pattern, permissions, created_at
 				FROM rbac_roles
-				WHERE team_id = ? AND database_pattern = ? AND permissions = ?
-				ORDER BY created_at DESC, id DESC
-				LIMIT 1
-			`, teamID, req.DatabasePattern, perms).Scan(&role.ID, &role.TeamID, &role.DatabasePattern, &dbPerms, &role.CreatedAt)
+				WHERE team_id = ? AND database_pattern = ? AND permissions = ? AND created_at = ?
+			`, teamID, req.DatabasePattern, perms, now).Scan(&role.ID, &role.TeamID, &role.DatabasePattern, &dbPerms, &role.CreatedAt)
 		}); err != nil {
 			return nil, fmt.Errorf("failed to read back role after Raft apply: %w", err)
 		}
@@ -1051,16 +1056,18 @@ func (rm *RBACManager) CreateMeasurementPermission(ctx context.Context, roleID i
 			Int64("role_id", roleID).
 			Str("measurement_pattern", req.MeasurementPattern).
 			Msg("Created measurement permission via Raft")
+		// Same race fix as CreateRole — match on created_at = this
+		// proposer's now to disambiguate concurrent identical creates
+		// (no UNIQUE(role_id, measurement_pattern, permissions) in the
+		// schema). Gemini PR #458 round 9 G29.
 		var mp MeasurementPermission
 		var dbPerms string
 		if err := readBackAfterPropose(ctx, func() error {
 			return rm.db.QueryRowContext(ctx, `
 				SELECT id, role_id, measurement_pattern, permissions, created_at
 				FROM rbac_measurement_permissions
-				WHERE role_id = ? AND measurement_pattern = ? AND permissions = ?
-				ORDER BY created_at DESC, id DESC
-				LIMIT 1
-			`, roleID, req.MeasurementPattern, perms).Scan(&mp.ID, &mp.RoleID, &mp.MeasurementPattern, &dbPerms, &mp.CreatedAt)
+				WHERE role_id = ? AND measurement_pattern = ? AND permissions = ? AND created_at = ?
+			`, roleID, req.MeasurementPattern, perms, now).Scan(&mp.ID, &mp.RoleID, &mp.MeasurementPattern, &dbPerms, &mp.CreatedAt)
 		}); err != nil {
 			return nil, fmt.Errorf("failed to read back measurement permission after Raft apply: %w", err)
 		}

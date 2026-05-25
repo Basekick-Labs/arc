@@ -599,6 +599,64 @@ func TestProposer_CreateRole_RejectsUnknownTeam(t *testing.T) {
 	}
 }
 
+// TestProposer_CreateRole_ConcurrentIdenticalDistinctIDs pins Gemini
+// PR #458 round 9 G28: two concurrent identical CreateRole calls
+// must return DIFFERENT IDs to each caller — neither can read back
+// the other's row. The fix matches on created_at = proposer's now
+// in the read-back query; the proposer's now is monotonic-nanosecond
+// unique per call.
+//
+// Pre-fix the read-back used ORDER BY created_at DESC LIMIT 1, so
+// the slower caller's read-back would return the faster caller's
+// row (the "newest"). Both callers ended up with the same ID
+// (the latter's), and one of them had a stale handle to a row
+// they thought they owned.
+func TestProposer_CreateRole_ConcurrentIdenticalDistinctIDs(t *testing.T) {
+	rm, _ := newRBACTestManager(t)
+	ctx := context.Background()
+	org, _ := rm.CreateOrganization(ctx, &CreateOrganizationRequest{Name: "acme"})
+	team, _ := rm.CreateTeam(ctx, org.ID, &CreateTeamRequest{Name: "platform"})
+
+	// Run N concurrent identical CreateRole calls; collect their IDs.
+	const n = 8
+	type result struct {
+		role *Role
+		err  error
+	}
+	results := make(chan result, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			role, err := rm.CreateRole(ctx, team.ID, &CreateRoleRequest{
+				DatabasePattern: "production",
+				Permissions:     []string{"read", "write"},
+			})
+			results <- result{role: role, err: err}
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	ids := map[int64]bool{}
+	for r := range results {
+		if r.err != nil {
+			t.Fatalf("concurrent CreateRole returned error: %v", r.err)
+		}
+		if r.role == nil || r.role.ID == 0 {
+			t.Fatalf("concurrent CreateRole returned nil/zero-id role: %+v", r.role)
+		}
+		if ids[r.role.ID] {
+			t.Errorf("concurrent CreateRole returned duplicate ID %d — each caller must get a distinct row", r.role.ID)
+		}
+		ids[r.role.ID] = true
+	}
+	if len(ids) != n {
+		t.Errorf("expected %d distinct role IDs across concurrent identical creates, got %d", n, len(ids))
+	}
+}
+
 func TestProposer_CreateMeasurementPermission_RoundTrip(t *testing.T) {
 	rm, _ := newRBACTestManager(t)
 	ctx := context.Background()
