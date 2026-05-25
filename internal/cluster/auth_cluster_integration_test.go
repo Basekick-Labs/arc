@@ -24,6 +24,8 @@ package cluster
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -703,5 +705,140 @@ func TestRBACSeed_PopulatesOrgsFromLocalSQLite(t *testing.T) {
 	orgsBAgain, _ := rmB.ListOrganizations()
 	if len(orgsBAgain) != len(orgsB) {
 		t.Errorf("seed re-run created duplicates: before=%d after=%d", len(orgsB), len(orgsBAgain))
+	}
+}
+
+// TestTwoNodeRBAC_DeleteOrgCapRejectsOnLeader pins Phase A.2 Item 2:
+// when the cluster-mode cascade-on-delete cap is exceeded, the
+// proposer rejects on the leader BEFORE any Raft proposal — meaning
+// the FSMs on both nodes stay untouched for the cap-rejected call and
+// the cluster does NOT spend a log entry on a cascade that would
+// pathologically block the runFSM goroutine.
+//
+// Setup: rig with cap=5, seed an org with 6 teams on writer (replicates
+// to reader through the standard wire path), then DeleteOrganization
+// on writer must return ErrCascadeCapExceeded and leave both nodes'
+// FSM + SQLite state intact for that org.
+func TestTwoNodeRBAC_DeleteOrgCapRejectsOnLeader(t *testing.T) {
+	rig := newRBACTestRigWithCap(t, 5)
+	ctx := context.Background()
+
+	org, err := rig.rmA.CreateOrganization(ctx, &auth.CreateOrganizationRequest{Name: "big-tenant"})
+	if err != nil {
+		t.Fatalf("CreateOrganization: %v", err)
+	}
+	// Inflate to 6 teams > cap=5. Each CreateTeam replicates A→B via
+	// the shared twoNodeReplicator.
+	for i := 0; i < 6; i++ {
+		if _, err := rig.rmA.CreateTeam(ctx, org.ID, &auth.CreateTeamRequest{
+			Name: fmt.Sprintf("team-%d", i),
+		}); err != nil {
+			t.Fatalf("CreateTeam %d: %v", i, err)
+		}
+	}
+
+	// Sanity: both nodes see the 6 teams.
+	teamsA, _ := rig.rmA.ListTeamsByOrganization(org.ID)
+	teamsB, _ := rig.rmB.ListTeamsByOrganization(org.ID)
+	if len(teamsA) != 6 || len(teamsB) != 6 {
+		t.Fatalf("setup: expected 6 teams on both nodes, got A=%d B=%d", len(teamsA), len(teamsB))
+	}
+
+	// Capture replicator log index BEFORE the cap-rejected delete so
+	// we can prove no Raft log entry was proposed for it.
+	idxBefore := rig.replicator.logIdx.Load()
+
+	err = rig.rmA.DeleteOrganization(ctx, org.ID)
+	if err == nil {
+		t.Fatal("DeleteOrganization should fail when cascade exceeds cap, got nil")
+	}
+	if !errors.Is(err, auth.ErrCascadeCapExceeded) {
+		t.Errorf("expected ErrCascadeCapExceeded in chain, got: %v", err)
+	}
+
+	// CRITICAL: no Raft log entry should have been spent on the rejected delete.
+	idxAfter := rig.replicator.logIdx.Load()
+	if idxAfter != idxBefore {
+		t.Errorf("replicator.logIdx changed from %d to %d — cap rejection should NOT propose to Raft", idxBefore, idxAfter)
+	}
+
+	// Org + teams must survive intact on BOTH nodes (rejection is a
+	// pure proposer-side refusal; nothing reached the FSM).
+	if got, _ := rig.rmA.GetOrganization(org.ID); got == nil {
+		t.Errorf("org should still exist on A after cap-rejected delete")
+	}
+	if got, _ := rig.rmB.GetOrganization(org.ID); got == nil {
+		t.Errorf("org should still exist on B after cap-rejected delete")
+	}
+	teamsA2, _ := rig.rmA.ListTeamsByOrganization(org.ID)
+	teamsB2, _ := rig.rmB.ListTeamsByOrganization(org.ID)
+	if len(teamsA2) != 6 || len(teamsB2) != 6 {
+		t.Errorf("teams should survive cap-rejected delete; got A=%d B=%d", len(teamsA2), len(teamsB2))
+	}
+
+	// Operator workaround: delete teams first to bring the cascade
+	// under the cap, then the org delete succeeds.
+	for _, tm := range teamsA2 {
+		if err := rig.rmA.DeleteTeam(ctx, tm.ID); err != nil {
+			t.Fatalf("DeleteTeam %d during workaround: %v", tm.ID, err)
+		}
+	}
+	if err := rig.rmA.DeleteOrganization(ctx, org.ID); err != nil {
+		t.Fatalf("DeleteOrganization after team-cleanup workaround: %v", err)
+	}
+	if got, _ := rig.rmB.GetOrganization(org.ID); got != nil {
+		t.Errorf("org should be deleted on B after workaround")
+	}
+}
+
+// newRBACTestRigWithCap mirrors newRBACTestRig but passes
+// MaxCascadeDescendants into both RBACManagers. maxDesc=0 → disabled.
+// Phase A.2 Item 2.
+func newRBACTestRigWithCap(t *testing.T, maxDesc int) *rbacTestRig {
+	t.Helper()
+	amA, err := auth.NewAuthManager(t.TempDir()+"/auth-a.db", 100*time.Millisecond, 100, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewAuthManager A: %v", err)
+	}
+	amB, err := auth.NewAuthManager(t.TempDir()+"/auth-b.db", 100*time.Millisecond, 100, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewAuthManager B: %v", err)
+	}
+	rmA := auth.NewRBACManager(&auth.RBACManagerConfig{
+		DB:                    amA.GetDB(),
+		Logger:                zerolog.Nop(),
+		MaxCascadeDescendants: maxDesc,
+	})
+	rmB := auth.NewRBACManager(&auth.RBACManagerConfig{
+		DB:                    amB.GetDB(),
+		Logger:                zerolog.Nop(),
+		MaxCascadeDescendants: maxDesc,
+	})
+
+	t.Cleanup(func() {
+		rmA.Close()
+		rmB.Close()
+		amA.Close()
+		amB.Close()
+	})
+
+	fsmA := raft.NewClusterFSM(zerolog.Nop())
+	fsmB := raft.NewClusterFSM(zerolog.Nop())
+	wireAuthCallbacks(t, fsmA, amA)
+	wireAuthCallbacks(t, fsmB, amB)
+	wireRBACCallbacks(t, fsmA, rmA)
+	wireRBACCallbacks(t, fsmB, rmB)
+
+	replicator := &twoNodeReplicator{fsmA: fsmA, fsmB: fsmB}
+	amA.SetRaftProposer(replicator)
+	amB.SetRaftProposer(replicator)
+	rmA.SetRaftProposer(replicator)
+	rmB.SetRaftProposer(replicator)
+
+	return &rbacTestRig{
+		rmA: rmA, rmB: rmB,
+		amA: amA, amB: amB,
+		fsmA: fsmA, fsmB: fsmB,
+		replicator: replicator,
 	}
 }

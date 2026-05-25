@@ -164,6 +164,14 @@ type Metrics struct {
 	clusterRBACApplyAddTokenToTeamTotal              atomic.Int64
 	clusterRBACApplyRemoveTokenFromTeamTotal         atomic.Int64
 	clusterRBACRejectedTotal                         atomic.Int64
+	// Phase A.2 Item 2: counts DeleteOrganization / DeleteTeam calls
+	// that the cluster-mode proposer refused because the local
+	// descendant count exceeded cluster.rbac.max_cascade_descendants.
+	// Non-zero growth means operators are issuing cascades large enough
+	// that the FSM apply would risk a leadership-loss-mid-apply; alert
+	// + ask the operator if they need a higher cap or a chunked-delete
+	// workflow.
+	clusterRBACCascadeRejectedTotal atomic.Int64
 
 	logger zerolog.Logger
 }
@@ -389,7 +397,8 @@ func (m *Metrics) IncClusterRBACApplyAddTokenToTeam() {
 func (m *Metrics) IncClusterRBACApplyRemoveTokenFromTeam() {
 	m.clusterRBACApplyRemoveTokenFromTeamTotal.Add(1)
 }
-func (m *Metrics) IncClusterRBACRejected() { m.clusterRBACRejectedTotal.Add(1) }
+func (m *Metrics) IncClusterRBACRejected()        { m.clusterRBACRejectedTotal.Add(1) }
+func (m *Metrics) IncClusterRBACCascadeRejected() { m.clusterRBACCascadeRejectedTotal.Add(1) }
 
 // Snapshot returns all metrics as a map (for JSON endpoint)
 func (m *Metrics) Snapshot() map[string]interface{} {
@@ -547,6 +556,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"cluster_rbac_apply_add_token_to_team_total":             m.clusterRBACApplyAddTokenToTeamTotal.Load(),
 		"cluster_rbac_apply_remove_token_from_team_total":        m.clusterRBACApplyRemoveTokenFromTeamTotal.Load(),
 		"cluster_rbac_rejected_total":                            m.clusterRBACRejectedTotal.Load(),
+		"cluster_rbac_cascade_rejected_total":                    m.clusterRBACCascadeRejectedTotal.Load(),
 	}
 }
 
@@ -919,6 +929,9 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_cluster_rbac_rejected_total Total RBAC command applies refused by FSM-side validation across all 13 RBAC command types. Non-zero growth indicates a proposer is submitting malformed RBAC commands; alert.\n"...)
 	b = append(b, "# TYPE arc_cluster_rbac_rejected_total counter\n"...)
 	b = appendMetric(b, "arc_cluster_rbac_rejected_total", float64(m.clusterRBACRejectedTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_cascade_rejected_total Total DeleteOrganization/DeleteTeam calls refused by the proposer-side cascade-depth cap. Phase A.2 Item 2: see cluster.rbac.max_cascade_descendants. Non-zero growth means operators are issuing cascades large enough to risk FSM apply blocking past the Raft heartbeat margin; consider raising the cap or chunking the delete.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_cascade_rejected_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_cascade_rejected_total", float64(m.clusterRBACCascadeRejectedTotal.Load()))
 
 	return string(b)
 }

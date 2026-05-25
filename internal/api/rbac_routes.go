@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"strconv"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -222,6 +223,19 @@ func (h *RBACHandler) deleteOrganization(c *fiber.Ctx) error {
 				"error":   "Organization not found",
 			})
 		}
+		// Phase A.2 Item 2: cascade-on-delete soft cap. The proposer
+		// refused because the descendant count exceeds
+		// cluster.rbac.max_cascade_descendants. 409 Conflict is the
+		// right HTTP code: the request conflicts with system state
+		// (too many descendants for an atomic Raft cascade); operator
+		// action required (delete sub-resources first, or raise the
+		// cap if their tenant size justifies it).
+		if errors.Is(err, auth.ErrCascadeCapExceeded) {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"success": false,
+				"error":   err.Error(),
+			})
+		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
 			"error":   err.Error(),
@@ -394,6 +408,13 @@ func (h *RBACHandler) deleteTeam(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Team not found",
+			})
+		}
+		// Phase A.2 Item 2: cascade-on-delete soft cap (see deleteOrganization).
+		if errors.Is(err, auth.ErrCascadeCapExceeded) {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"success": false,
+				"error":   err.Error(),
 			})
 		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{

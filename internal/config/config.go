@@ -94,15 +94,15 @@ type StorageConfig struct {
 }
 
 type IngestConfig struct {
-	MaxBufferSize       int      // Max records before flush
-	MaxBufferAgeMS      int      // Max age in milliseconds before flush
-	Compression         string   // Parquet compression: snappy, gzip, zstd
-	UseDictionary       bool     // Use dictionary encoding
-	WriteStatistics     bool     // Write Parquet statistics
-	DataPageVersion     string   // Parquet data page version: 1.0 or 2.0
-	FlushWorkers        int      // Number of workers for async flush (default: 2x CPU, min 8, max 64)
-	FlushQueueSize      int      // Capacity of flush task queue (default: 4x workers, min 100)
-	ShardCount          int      // Number of buffer shards for lock distribution (default: 32)
+	MaxBufferSize         int      // Max records before flush
+	MaxBufferAgeMS        int      // Max age in milliseconds before flush
+	Compression           string   // Parquet compression: snappy, gzip, zstd
+	UseDictionary         bool     // Use dictionary encoding
+	WriteStatistics       bool     // Write Parquet statistics
+	DataPageVersion       string   // Parquet data page version: 1.0 or 2.0
+	FlushWorkers          int      // Number of workers for async flush (default: 2x CPU, min 8, max 64)
+	FlushQueueSize        int      // Capacity of flush task queue (default: 4x workers, min 100)
+	ShardCount            int      // Number of buffer shards for lock distribution (default: 32)
 	SortKeys              []string // Per-measurement sort keys: "measurement:col1,col2,time"
 	DefaultSortKeys       string   // Default sort keys for measurements not in SortKeys
 	FlushTimeoutSeconds   int      // Timeout for storage writes during flush (default: 30s, 0 = no timeout)
@@ -227,20 +227,20 @@ type SchedulerConfig struct {
 // enabled, the reconciler runs on cron and auto-acts on drift older than the
 // grace window, with a per-run blast cap.
 type ReconciliationConfig struct {
-	Enabled                  bool   // Off by default — explicit operator opt-in
-	Schedule                 string // Cron schedule (default: "17 4 * * *" = 04:17 daily)
-	GraceWindowSeconds       int    // Orphan storage files younger than this are NEVER deleted (default: 86400 = 24h)
-	ClockSkewAllowanceSeconds int   // Added to grace window (default: 300 = 5m)
-	PerPrefixTimeoutSeconds  int    // Per-prefix List timeout (default: 300 = 5m)
-	MaxRunDurationSeconds    int    // Overall run timeout (default: 1800 = 30m)
-	MaxManifestSize          int    // Largest FSM manifest the reconciler will operate on (default: 200000)
-	MaxDeletesPerRun         int    // Per-run blast cap, manifest+storage combined (default: 10000)
-	BatchSize                int    // Chunk size for Raft batches and BatchDelete (default: 1000)
-	DeletePreManifestOrphans bool   // Allow deleting orphan files outside the 7-segment Arc layout. Default: false (secure-by-default for shared buckets). Set to true ONLY if you intentionally want pre-Phase-1 / migration-residual cleanup.
-	ManifestOnlyDryRun       bool   // Force every cron run to be dry-run. Default: true (safe first-run posture). Operators flip to false after reviewing dry-run audits.
-	SamplePathsCap           int    // Bound on sample paths in audit events / Run summaries (default: 10)
-	MaxRootWalkDatabases     int    // Cap on unknown databases the root-walk fallback descends into (default: 1000; 0 disables)
-	RecheckConcurrency       int    // Worker count for parallel storage.Exists re-check during manifest sweep (default: 8; 1 forces sequential)
+	Enabled                   bool   // Off by default — explicit operator opt-in
+	Schedule                  string // Cron schedule (default: "17 4 * * *" = 04:17 daily)
+	GraceWindowSeconds        int    // Orphan storage files younger than this are NEVER deleted (default: 86400 = 24h)
+	ClockSkewAllowanceSeconds int    // Added to grace window (default: 300 = 5m)
+	PerPrefixTimeoutSeconds   int    // Per-prefix List timeout (default: 300 = 5m)
+	MaxRunDurationSeconds     int    // Overall run timeout (default: 1800 = 30m)
+	MaxManifestSize           int    // Largest FSM manifest the reconciler will operate on (default: 200000)
+	MaxDeletesPerRun          int    // Per-run blast cap, manifest+storage combined (default: 10000)
+	BatchSize                 int    // Chunk size for Raft batches and BatchDelete (default: 1000)
+	DeletePreManifestOrphans  bool   // Allow deleting orphan files outside the 7-segment Arc layout. Default: false (secure-by-default for shared buckets). Set to true ONLY if you intentionally want pre-Phase-1 / migration-residual cleanup.
+	ManifestOnlyDryRun        bool   // Force every cron run to be dry-run. Default: true (safe first-run posture). Operators flip to false after reviewing dry-run audits.
+	SamplePathsCap            int    // Bound on sample paths in audit events / Run summaries (default: 10)
+	MaxRootWalkDatabases      int    // Cap on unknown databases the root-walk fallback descends into (default: 1000; 0 disables)
+	RecheckConcurrency        int    // Worker count for parallel storage.Exists re-check during manifest sweep (default: 8; 1 forces sequential)
 }
 
 // TieredStorageConfig holds configuration for tiered storage (Enterprise feature)
@@ -385,9 +385,9 @@ type ClusterConfig struct {
 	// Peer file replication catch-up (Phase 3). These control the startup
 	// reconciliation walker that brings a new or restarted node back into
 	// sync with the cluster manifest.
-	ReplicationCatchUpEnabled           bool    // Master switch for the catch-up walker. Emergency off-switch for pathologically large manifests. (default: true)
-	ReplicationCatchUpBarrierTimeoutMs  int     // Raft barrier timeout before walking the manifest — ensures the local FSM has applied every committed entry. (default: 10000)
-	ReplicationCatchUpQueueHighWater    float64 // Queue-depth fraction above which the walker pauses enqueueing. Keeps the walker from racing workers on large manifests. (default: 0.8)
+	ReplicationCatchUpEnabled          bool    // Master switch for the catch-up walker. Emergency off-switch for pathologically large manifests. (default: true)
+	ReplicationCatchUpBarrierTimeoutMs int     // Raft barrier timeout before walking the manifest — ensures the local FSM has applied every committed entry. (default: 10000)
+	ReplicationCatchUpQueueHighWater   float64 // Queue-depth fraction above which the walker pauses enqueueing. Keeps the walker from racing workers on large manifests. (default: 0.8)
 
 	// Hard query gating during catch-up (#392). When true, the query path
 	// rejects reads with 503 until Coordinator.ReplicationReady() is true
@@ -416,6 +416,23 @@ type ClusterConfig struct {
 	TLSCertFile  string // Path to TLS certificate file (PEM format)
 	TLSKeyFile   string // Path to TLS private key file (PEM format)
 	TLSCAFile    string // Optional: CA certificate for verifying peer certificates
+
+	// RBAC cascade-on-delete soft cap (Enterprise, Phase A.2 Item 2).
+	// DeleteOrganization / DeleteTeam in cluster mode pre-check the
+	// descendant count (teams + roles + measurement_permissions +
+	// token_memberships) before proposing the Raft command. If the count
+	// exceeds this cap, the API returns 409 Conflict with a clear
+	// operator-facing error telling them to delete sub-resources first.
+	// Default 50000 sized to fit a comfortable apply duration on Arc
+	// Enterprise's slowest target hardware; a pathological cascade past
+	// this threshold can block the single-threaded runFSM goroutine long
+	// enough to miss a Raft heartbeat (~5s default) and lose leadership
+	// mid-apply.
+	//
+	// Set to 0 to disable the cap entirely (escape hatch for operators
+	// who know their workload). DeleteRole's cascade is 1-level (only
+	// measurement_permissions) and is not capped.
+	RBACMaxCascadeDescendants int // (default: 50000; 0 = disabled)
 }
 
 // Load loads configuration from environment and config file
@@ -500,16 +517,16 @@ func Load() (*Config, error) {
 			AzureUseManagedIdentity: v.GetBool("storage.azure_use_managed_identity"),
 		},
 		Ingest: IngestConfig{
-			MaxBufferSize:       v.GetInt("ingest.max_buffer_size"),
-			MaxBufferAgeMS:      v.GetInt("ingest.max_buffer_age_ms"),
-			Compression:         v.GetString("ingest.compression"),
-			UseDictionary:       v.GetBool("ingest.use_dictionary"),
-			WriteStatistics:     v.GetBool("ingest.write_statistics"),
-			DataPageVersion:     v.GetString("ingest.data_page_version"),
-			FlushWorkers:        v.GetInt("ingest.flush_workers"),
-			FlushQueueSize:      v.GetInt("ingest.flush_queue_size"),
-			FlushTimeoutSeconds: v.GetInt("ingest.flush_timeout_seconds"),
-			ShardCount:          v.GetInt("ingest.shard_count"),
+			MaxBufferSize:         v.GetInt("ingest.max_buffer_size"),
+			MaxBufferAgeMS:        v.GetInt("ingest.max_buffer_age_ms"),
+			Compression:           v.GetString("ingest.compression"),
+			UseDictionary:         v.GetBool("ingest.use_dictionary"),
+			WriteStatistics:       v.GetBool("ingest.write_statistics"),
+			DataPageVersion:       v.GetString("ingest.data_page_version"),
+			FlushWorkers:          v.GetInt("ingest.flush_workers"),
+			FlushQueueSize:        v.GetInt("ingest.flush_queue_size"),
+			FlushTimeoutSeconds:   v.GetInt("ingest.flush_timeout_seconds"),
+			ShardCount:            v.GetInt("ingest.shard_count"),
 			SortKeys:              v.GetStringSlice("ingest.sort_keys"),
 			DefaultSortKeys:       v.GetString("ingest.default_sort_keys"),
 			DecimalColumns:        v.GetStringSlice("ingest.decimal_columns"),
@@ -671,6 +688,8 @@ func Load() (*Config, error) {
 			TLSCertFile:  v.GetString("cluster.tls_cert_file"),
 			TLSKeyFile:   v.GetString("cluster.tls_key_file"),
 			TLSCAFile:    v.GetString("cluster.tls_ca_file"),
+			// RBAC cascade-on-delete soft cap (Phase A.2 Item 2)
+			RBACMaxCascadeDescendants: v.GetInt("cluster.rbac.max_cascade_descendants"),
 		},
 		TieredStorage: TieredStorageConfig{
 			Enabled:                v.GetBool("tiered_storage.enabled"),
@@ -809,9 +828,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
 	// Phase 4: completion-manifest watcher tunables
-	v.SetDefault("compaction.completion_watcher_interval_ms", 1000)  // 1s poll rate
-	v.SetDefault("compaction.completion_dir", "")                    // "" = derive from temp_directory
-	v.SetDefault("compaction.completion_orphan_timeout_ms", 600000)  // 10min stuck-in-writing_output sweep
+	v.SetDefault("compaction.completion_watcher_interval_ms", 1000) // 1s poll rate
+	v.SetDefault("compaction.completion_dir", "")                   // "" = derive from temp_directory
+	v.SetDefault("compaction.completion_orphan_timeout_ms", 600000) // 10min stuck-in-writing_output sweep
 
 	// WAL defaults
 	v.SetDefault("wal.enabled", false)                 // Disabled by default for backwards compatibility
@@ -931,7 +950,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.replication_serve_timeout_ms", 120000) // 120s origin-side body-stream timeout
 	v.SetDefault("cluster.replication_retry_max_attempts", 3)    // 3 immediate retries
 	// Peer file replication catch-up (Enterprise Phase 3)
-	v.SetDefault("cluster.replication_catchup_enabled", true)            // Walk the manifest on startup to reconcile missing files
+	v.SetDefault("cluster.replication_catchup_enabled", true)             // Walk the manifest on startup to reconcile missing files
 	v.SetDefault("cluster.replication_catchup_barrier_timeout_ms", 10000) // 10s Raft barrier before walking
 	v.SetDefault("cluster.replication_catchup_queue_high_water", 0.8)     // Pause walker when queue is >80% full
 	v.SetDefault("cluster.query_gate_on_catchup", false)                  // Off by default; opt-in correctness gate (#392)
@@ -954,6 +973,12 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.tls_cert_file", "")
 	v.SetDefault("cluster.tls_key_file", "")
 	v.SetDefault("cluster.tls_ca_file", "")
+
+	// RBAC cascade-on-delete soft cap (Phase A.2 Item 2).
+	// Default 50000 covers typical mid-enterprise tenants while keeping
+	// the runFSM apply duration well clear of the Raft heartbeat
+	// margin. Set to 0 to disable.
+	v.SetDefault("cluster.rbac.max_cascade_descendants", 50000)
 
 	// Tiered storage defaults (Enterprise feature)
 	// Simple 2-tier system: Hot (local) -> Cold (S3/Azure archive)
