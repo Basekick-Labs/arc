@@ -144,6 +144,27 @@ type Metrics struct {
 	clusterAuthApplyRotateTotal atomic.Int64
 	clusterAuthRejectedTotal    atomic.Int64
 
+	// Cluster RBAC metrics (Enterprise only — mutated on every FSM apply
+	// of an RBAC command). Same shape as the auth metrics above: one
+	// counter per applied command type so operators can see the
+	// create vs update vs delete distribution; clusterRBACRejectedTotal
+	// counts applier-side validation refusals across all 13 RBAC command
+	// types. Phase A.1: Cluster Auth Convergence (RBAC).
+	clusterRBACApplyCreateOrganizationTotal          atomic.Int64
+	clusterRBACApplyUpdateOrganizationTotal          atomic.Int64
+	clusterRBACApplyDeleteOrganizationTotal          atomic.Int64
+	clusterRBACApplyCreateTeamTotal                  atomic.Int64
+	clusterRBACApplyUpdateTeamTotal                  atomic.Int64
+	clusterRBACApplyDeleteTeamTotal                  atomic.Int64
+	clusterRBACApplyCreateRoleTotal                  atomic.Int64
+	clusterRBACApplyUpdateRoleTotal                  atomic.Int64
+	clusterRBACApplyDeleteRoleTotal                  atomic.Int64
+	clusterRBACApplyCreateMeasurementPermissionTotal atomic.Int64
+	clusterRBACApplyDeleteMeasurementPermissionTotal atomic.Int64
+	clusterRBACApplyAddTokenToTeamTotal              atomic.Int64
+	clusterRBACApplyRemoveTokenFromTeamTotal         atomic.Int64
+	clusterRBACRejectedTotal                         atomic.Int64
+
 	logger zerolog.Logger
 }
 
@@ -339,6 +360,37 @@ func (m *Metrics) IncClusterAuthApplyDelete() { m.clusterAuthApplyDeleteTotal.Ad
 func (m *Metrics) IncClusterAuthApplyRotate() { m.clusterAuthApplyRotateTotal.Add(1) }
 func (m *Metrics) IncClusterAuthRejected()    { m.clusterAuthRejectedTotal.Add(1) }
 
+// Phase A.1 (RBAC): one Inc method per command type + a single rejected
+// counter. Same shape as the Phase A auth counters above.
+func (m *Metrics) IncClusterRBACApplyCreateOrganization() {
+	m.clusterRBACApplyCreateOrganizationTotal.Add(1)
+}
+func (m *Metrics) IncClusterRBACApplyUpdateOrganization() {
+	m.clusterRBACApplyUpdateOrganizationTotal.Add(1)
+}
+func (m *Metrics) IncClusterRBACApplyDeleteOrganization() {
+	m.clusterRBACApplyDeleteOrganizationTotal.Add(1)
+}
+func (m *Metrics) IncClusterRBACApplyCreateTeam() { m.clusterRBACApplyCreateTeamTotal.Add(1) }
+func (m *Metrics) IncClusterRBACApplyUpdateTeam() { m.clusterRBACApplyUpdateTeamTotal.Add(1) }
+func (m *Metrics) IncClusterRBACApplyDeleteTeam() { m.clusterRBACApplyDeleteTeamTotal.Add(1) }
+func (m *Metrics) IncClusterRBACApplyCreateRole() { m.clusterRBACApplyCreateRoleTotal.Add(1) }
+func (m *Metrics) IncClusterRBACApplyUpdateRole() { m.clusterRBACApplyUpdateRoleTotal.Add(1) }
+func (m *Metrics) IncClusterRBACApplyDeleteRole() { m.clusterRBACApplyDeleteRoleTotal.Add(1) }
+func (m *Metrics) IncClusterRBACApplyCreateMeasurementPermission() {
+	m.clusterRBACApplyCreateMeasurementPermissionTotal.Add(1)
+}
+func (m *Metrics) IncClusterRBACApplyDeleteMeasurementPermission() {
+	m.clusterRBACApplyDeleteMeasurementPermissionTotal.Add(1)
+}
+func (m *Metrics) IncClusterRBACApplyAddTokenToTeam() {
+	m.clusterRBACApplyAddTokenToTeamTotal.Add(1)
+}
+func (m *Metrics) IncClusterRBACApplyRemoveTokenFromTeam() {
+	m.clusterRBACApplyRemoveTokenFromTeamTotal.Add(1)
+}
+func (m *Metrics) IncClusterRBACRejected() { m.clusterRBACRejectedTotal.Add(1) }
+
 // Snapshot returns all metrics as a map (for JSON endpoint)
 func (m *Metrics) Snapshot() map[string]interface{} {
 	var memStats runtime.MemStats
@@ -479,6 +531,22 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"cluster_auth_apply_delete_total": m.clusterAuthApplyDeleteTotal.Load(),
 		"cluster_auth_apply_rotate_total": m.clusterAuthApplyRotateTotal.Load(),
 		"cluster_auth_rejected_total":     m.clusterAuthRejectedTotal.Load(),
+
+		// Cluster RBAC (Enterprise, Phase A.1)
+		"cluster_rbac_apply_create_organization_total":           m.clusterRBACApplyCreateOrganizationTotal.Load(),
+		"cluster_rbac_apply_update_organization_total":           m.clusterRBACApplyUpdateOrganizationTotal.Load(),
+		"cluster_rbac_apply_delete_organization_total":           m.clusterRBACApplyDeleteOrganizationTotal.Load(),
+		"cluster_rbac_apply_create_team_total":                   m.clusterRBACApplyCreateTeamTotal.Load(),
+		"cluster_rbac_apply_update_team_total":                   m.clusterRBACApplyUpdateTeamTotal.Load(),
+		"cluster_rbac_apply_delete_team_total":                   m.clusterRBACApplyDeleteTeamTotal.Load(),
+		"cluster_rbac_apply_create_role_total":                   m.clusterRBACApplyCreateRoleTotal.Load(),
+		"cluster_rbac_apply_update_role_total":                   m.clusterRBACApplyUpdateRoleTotal.Load(),
+		"cluster_rbac_apply_delete_role_total":                   m.clusterRBACApplyDeleteRoleTotal.Load(),
+		"cluster_rbac_apply_create_measurement_permission_total": m.clusterRBACApplyCreateMeasurementPermissionTotal.Load(),
+		"cluster_rbac_apply_delete_measurement_permission_total": m.clusterRBACApplyDeleteMeasurementPermissionTotal.Load(),
+		"cluster_rbac_apply_add_token_to_team_total":             m.clusterRBACApplyAddTokenToTeamTotal.Load(),
+		"cluster_rbac_apply_remove_token_from_team_total":        m.clusterRBACApplyRemoveTokenFromTeamTotal.Load(),
+		"cluster_rbac_rejected_total":                            m.clusterRBACRejectedTotal.Load(),
 	}
 }
 
@@ -802,6 +870,55 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_cluster_auth_rejected_total Total token command applies refused by FSM-side validation. Non-zero growth indicates a proposer is submitting malformed tokens; alert.\n"...)
 	b = append(b, "# TYPE arc_cluster_auth_rejected_total counter\n"...)
 	b = appendMetric(b, "arc_cluster_auth_rejected_total", float64(m.clusterAuthRejectedTotal.Load()))
+
+	// Cluster RBAC apply counters (Enterprise, Phase A.1). Same shape as
+	// the auth counters above — one per command type, monotonic per node,
+	// every node in a healthy cluster sees the same count (they all apply
+	// the same Raft log). rejected_total counts applier-side validation
+	// refusals across all 13 RBAC command types; non-zero growth is the
+	// security alerting signal.
+	b = append(b, "# HELP arc_cluster_rbac_apply_create_organization_total Total CommandCreateOrganization applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_create_organization_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_create_organization_total", float64(m.clusterRBACApplyCreateOrganizationTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_update_organization_total Total CommandUpdateOrganization applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_update_organization_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_update_organization_total", float64(m.clusterRBACApplyUpdateOrganizationTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_delete_organization_total Total CommandDeleteOrganization applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_delete_organization_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_delete_organization_total", float64(m.clusterRBACApplyDeleteOrganizationTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_create_team_total Total CommandCreateTeam applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_create_team_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_create_team_total", float64(m.clusterRBACApplyCreateTeamTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_update_team_total Total CommandUpdateTeam applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_update_team_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_update_team_total", float64(m.clusterRBACApplyUpdateTeamTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_delete_team_total Total CommandDeleteTeam applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_delete_team_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_delete_team_total", float64(m.clusterRBACApplyDeleteTeamTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_create_role_total Total CommandCreateRole applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_create_role_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_create_role_total", float64(m.clusterRBACApplyCreateRoleTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_update_role_total Total CommandUpdateRole applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_update_role_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_update_role_total", float64(m.clusterRBACApplyUpdateRoleTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_delete_role_total Total CommandDeleteRole applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_delete_role_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_delete_role_total", float64(m.clusterRBACApplyDeleteRoleTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_create_measurement_permission_total Total CommandCreateMeasurementPermission applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_create_measurement_permission_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_create_measurement_permission_total", float64(m.clusterRBACApplyCreateMeasurementPermissionTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_delete_measurement_permission_total Total CommandDeleteMeasurementPermission applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_delete_measurement_permission_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_delete_measurement_permission_total", float64(m.clusterRBACApplyDeleteMeasurementPermissionTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_add_token_to_team_total Total CommandAddTokenToTeam applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_add_token_to_team_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_add_token_to_team_total", float64(m.clusterRBACApplyAddTokenToTeamTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_remove_token_from_team_total Total CommandRemoveTokenFromTeam applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_remove_token_from_team_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_remove_token_from_team_total", float64(m.clusterRBACApplyRemoveTokenFromTeamTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_rejected_total Total RBAC command applies refused by FSM-side validation across all 13 RBAC command types. Non-zero growth indicates a proposer is submitting malformed RBAC commands; alert.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_rejected_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_rejected_total", float64(m.clusterRBACRejectedTotal.Load()))
 
 	return string(b)
 }

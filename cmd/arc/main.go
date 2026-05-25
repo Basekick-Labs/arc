@@ -1599,6 +1599,113 @@ func main() {
 		// Register RBAC routes (Enterprise feature)
 		rbacHandler := api.NewRBACHandler(authManager, rbacManager, logger.Get("rbac"))
 		rbacHandler.RegisterRoutes(server.GetApp())
+
+		// Phase A.1: Cluster Auth Convergence (RBAC). Wire the RBACManager
+		// into the cluster FSM so every node materialises Raft-replicated
+		// RBAC state into local SQLite. Mirrors the Phase A token wire-up
+		// at the cluster initialisation block above, but lives here
+		// because rbacManager is constructed after the cluster block.
+		//
+		// Order matters (mirrors Phase A):
+		//   1. SetRBACCallbacks gives the FSM the per-node materialise
+		//      hooks BEFORE flipping the proposer, so the first
+		//      cluster-wide CreateOrganization has its callback wired
+		//      and lands in SQLite on this node.
+		//   2. SetRaftProposer flips RBACManager's write methods from
+		//      direct-SQLite to Raft-propose.
+		//   3. SeedRBACFromLocalSQLite runs leader-only, proposing
+		//      Create<X> for every pre-existing RBAC row so post-upgrade
+		//      clusters have their state replicated to followers.
+		if clusterCoordinator != nil && rbacManager != nil {
+			if fsm := clusterCoordinator.GetRaftFSM(); fsm != nil {
+				fsm.SetRBACCallbacks(
+					func(e *clusterraft.OrganizationEntry) {
+						if err := rbacManager.ApplyCreateOrganization(cluster.ToAuthOrganizationEntry(e)); err != nil {
+							log.Error().Err(err).Int64("organization_id", e.ID).Msg("Failed to materialise CreateOrganization into local SQLite")
+						}
+					},
+					func(e *clusterraft.OrganizationEntry) {
+						if err := rbacManager.ApplyUpdateOrganization(cluster.ToAuthOrganizationEntry(e)); err != nil {
+							log.Error().Err(err).Int64("organization_id", e.ID).Msg("Failed to materialise UpdateOrganization into local SQLite")
+						}
+					},
+					func(id int64) {
+						if err := rbacManager.ApplyDeleteOrganization(id); err != nil {
+							log.Error().Err(err).Int64("organization_id", id).Msg("Failed to materialise DeleteOrganization into local SQLite")
+						}
+					},
+					func(e *clusterraft.TeamEntry) {
+						if err := rbacManager.ApplyCreateTeam(cluster.ToAuthTeamEntry(e)); err != nil {
+							log.Error().Err(err).Int64("team_id", e.ID).Msg("Failed to materialise CreateTeam into local SQLite")
+						}
+					},
+					func(e *clusterraft.TeamEntry) {
+						if err := rbacManager.ApplyUpdateTeam(cluster.ToAuthTeamEntry(e)); err != nil {
+							log.Error().Err(err).Int64("team_id", e.ID).Msg("Failed to materialise UpdateTeam into local SQLite")
+						}
+					},
+					func(id int64) {
+						if err := rbacManager.ApplyDeleteTeam(id); err != nil {
+							log.Error().Err(err).Int64("team_id", id).Msg("Failed to materialise DeleteTeam into local SQLite")
+						}
+					},
+					func(e *clusterraft.RoleEntry) {
+						if err := rbacManager.ApplyCreateRole(cluster.ToAuthRoleEntry(e)); err != nil {
+							log.Error().Err(err).Int64("role_id", e.ID).Msg("Failed to materialise CreateRole into local SQLite")
+						}
+					},
+					func(e *clusterraft.RoleEntry) {
+						if err := rbacManager.ApplyUpdateRole(cluster.ToAuthRoleEntry(e)); err != nil {
+							log.Error().Err(err).Int64("role_id", e.ID).Msg("Failed to materialise UpdateRole into local SQLite")
+						}
+					},
+					func(id int64) {
+						if err := rbacManager.ApplyDeleteRole(id); err != nil {
+							log.Error().Err(err).Int64("role_id", id).Msg("Failed to materialise DeleteRole into local SQLite")
+						}
+					},
+					func(e *clusterraft.MeasurementPermissionEntry) {
+						if err := rbacManager.ApplyCreateMeasurementPermission(cluster.ToAuthMeasurementPermissionEntry(e)); err != nil {
+							log.Error().Err(err).Int64("measurement_permission_id", e.ID).Msg("Failed to materialise CreateMeasurementPermission into local SQLite")
+						}
+					},
+					func(id int64) {
+						if err := rbacManager.ApplyDeleteMeasurementPermission(id); err != nil {
+							log.Error().Err(err).Int64("measurement_permission_id", id).Msg("Failed to materialise DeleteMeasurementPermission into local SQLite")
+						}
+					},
+					func(e *clusterraft.TokenMembershipEntry) {
+						if err := rbacManager.ApplyAddTokenToTeam(cluster.ToAuthTokenMembershipEntry(e)); err != nil {
+							log.Error().Err(err).Int64("membership_id", e.ID).Msg("Failed to materialise AddTokenToTeam into local SQLite")
+						}
+					},
+					func(tokenID, teamID int64) {
+						if err := rbacManager.ApplyRemoveTokenFromTeam(tokenID, teamID); err != nil {
+							log.Error().Err(err).Int64("token_id", tokenID).Int64("team_id", teamID).Msg("Failed to materialise RemoveTokenFromTeam into local SQLite")
+						}
+					},
+				)
+				rbacProposer := cluster.NewCoordinatorAuthProposer(clusterCoordinator)
+				if rbacProposer != nil {
+					rbacManager.SetRaftProposer(rbacProposer)
+					log.Info().Msg("Cluster RBAC replication enabled — RBAC writes now propagate via Raft")
+
+					// Phase A.1: run the upgrade-seed AFTER the proposer
+					// is wired and AFTER the leader is observed. Idempotent
+					// — followers skip via IsLeader(). Under a 30s ceiling
+					// to keep startup bounded.
+					if err := clusterCoordinator.WaitForLeader(30 * time.Second); err != nil {
+						log.Warn().Err(err).Msg("Cluster RBAC seed: leader not observed within 30s; skipping (will retry on next restart)")
+					} else {
+						seedCtx, seedCancel := context.WithTimeout(context.Background(), 30*time.Second)
+						if seedErr := rbacManager.SeedRBACFromLocalSQLite(seedCtx); seedErr != nil {
+							log.Warn().Err(seedErr).Msg("Cluster RBAC seed: partial failure (cluster is still operable; missing rows can be re-issued by an operator)")
+						}
+						seedCancel()
+					}
+				}
+			}
+		}
 	}
 
 	// Initialize Audit Logging (Enterprise feature - requires valid license)

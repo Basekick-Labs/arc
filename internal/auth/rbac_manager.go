@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -90,6 +91,14 @@ type RBACManager struct {
 	// Cache stats
 	cacheHits   atomic.Int64
 	cacheMisses atomic.Int64
+
+	// Phase A.1: Cluster Auth Convergence (RBAC). Same shape as
+	// AuthManager.proposer: nil in OSS / standalone (direct-SQLite
+	// path), non-nil in cluster mode (every write proposes via Raft).
+	// Guarded by proposerMu so SetRaftProposer can be called
+	// concurrently with in-flight writes.
+	proposer   RaftProposer
+	proposerMu sync.RWMutex
 
 	// Shutdown
 	done chan struct{}
@@ -251,17 +260,53 @@ func (rm *RBACManager) IsRBACEnabled() bool {
 // Organizations CRUD
 // =============================================================================
 
-// CreateOrganization creates a new organization
-func (rm *RBACManager) CreateOrganization(req *CreateOrganizationRequest) (*Organization, error) {
+// CreateOrganization creates a new organization. In cluster mode the
+// write is proposed via Raft and materialised on every node via
+// ApplyCreateOrganization; in OSS / standalone mode it writes directly
+// to local SQLite (unchanged from pre-Phase-A.1 behaviour).
+func (rm *RBACManager) CreateOrganization(ctx context.Context, req *CreateOrganizationRequest) (*Organization, error) {
 	if req.Name == "" {
 		return nil, errors.New("organization name is required")
 	}
-
-	// Validate name format to prevent malformed/malicious names
 	if err := validateName(req.Name); err != nil {
 		return nil, fmt.Errorf("invalid organization name: %w", err)
 	}
 
+	if rm.getProposer() != nil {
+		now := time.Now()
+		payload := createOrganizationPayloadWire{
+			Organization: clusterOrganizationEntryWire{
+				Name:              req.Name,
+				Description:       req.Description,
+				CreatedAtUnixNano: now.UnixNano(),
+				UpdatedAtUnixNano: now.UnixNano(),
+				Enabled:           true,
+			},
+		}
+		if err := rm.proposeRBACCommand(ctx, ProposalCommandCreateOrganization, payload); err != nil {
+			// Translate FSM-side rejection of duplicate-name into the same
+			// error string the OSS path returns, so handlers can keep their
+			// existing UX.
+			if strings.Contains(err.Error(), "already exists") {
+				return nil, fmt.Errorf("organization with name '%s' already exists", req.Name)
+			}
+			return nil, fmt.Errorf("failed to create organization: %w", err)
+		}
+		// Apply callback fired on this node before Propose returned — look
+		// up the materialised row to surface the Raft-stamped ID and the
+		// stored timestamps.
+		rm.logger.Info().Str("name", req.Name).Msg("Created organization via Raft")
+		var org Organization
+		if err := rm.db.QueryRow(`
+			SELECT id, name, description, created_at, updated_at, enabled
+			FROM rbac_organizations WHERE name = ?
+		`, req.Name).Scan(&org.ID, &org.Name, &org.Description, &org.CreatedAt, &org.UpdatedAt, &org.Enabled); err != nil {
+			return nil, fmt.Errorf("failed to read back organization after Raft apply: %w", err)
+		}
+		return &org, nil
+	}
+
+	_ = ctx
 	now := time.Now()
 	result, err := rm.db.Exec(`
 		INSERT INTO rbac_organizations (name, description, created_at, updated_at, enabled)
@@ -325,8 +370,43 @@ func (rm *RBACManager) ListOrganizations() ([]Organization, error) {
 	return orgs, nil
 }
 
-// UpdateOrganization updates an organization
-func (rm *RBACManager) UpdateOrganization(id int64, req *UpdateOrganizationRequest) error {
+// UpdateOrganization updates an organization. Same dual-path shape as
+// CreateOrganization.
+func (rm *RBACManager) UpdateOrganization(ctx context.Context, id int64, req *UpdateOrganizationRequest) error {
+	if rm.getProposer() != nil {
+		payload := updateOrganizationPayloadWire{
+			ID:                id,
+			UpdatedAtUnixNano: time.Now().UnixNano(),
+		}
+		if req.Name != nil {
+			payload.Name = *req.Name
+			payload.ChangedFields = append(payload.ChangedFields, "name")
+		}
+		if req.Description != nil {
+			payload.Description = *req.Description
+			payload.ChangedFields = append(payload.ChangedFields, "description")
+		}
+		if req.Enabled != nil {
+			payload.Enabled = *req.Enabled
+			payload.ChangedFields = append(payload.ChangedFields, "enabled")
+		}
+		if len(payload.ChangedFields) == 0 {
+			return nil
+		}
+		if err := rm.proposeRBACCommand(ctx, ProposalCommandUpdateOrganization, payload); err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				return errors.New("organization not found")
+			}
+			if strings.Contains(err.Error(), "already exists") {
+				return errors.New("organization with that name already exists")
+			}
+			return fmt.Errorf("failed to update organization: %w", err)
+		}
+		rm.logger.Info().Int64("id", id).Msg("Updated organization via Raft")
+		return nil
+	}
+
+	_ = ctx
 	var updates []string
 	var args []interface{}
 
@@ -373,8 +453,21 @@ func (rm *RBACManager) UpdateOrganization(id int64, req *UpdateOrganizationReque
 	return nil
 }
 
-// DeleteOrganization deletes an organization (cascades to teams, roles, etc.)
-func (rm *RBACManager) DeleteOrganization(id int64) error {
+// DeleteOrganization deletes an organization (cascades to teams, roles, etc.).
+// Cluster path: cascade-in-apply across all 4 descendant levels under one
+// Raft log entry; SQLite ON DELETE CASCADE handles the local mirror. OSS
+// path: unchanged.
+func (rm *RBACManager) DeleteOrganization(ctx context.Context, id int64) error {
+	if rm.getProposer() != nil {
+		payload := deleteOrganizationPayloadWire{ID: id}
+		if err := rm.proposeRBACCommand(ctx, ProposalCommandDeleteOrganization, payload); err != nil {
+			return fmt.Errorf("failed to delete organization: %w", err)
+		}
+		rm.logger.Info().Int64("id", id).Msg("Deleted organization via Raft")
+		return nil
+	}
+
+	_ = ctx
 	result, err := rm.db.Exec("DELETE FROM rbac_organizations WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("failed to delete organization: %w", err)
@@ -393,17 +486,49 @@ func (rm *RBACManager) DeleteOrganization(id int64) error {
 // Teams CRUD
 // =============================================================================
 
-// CreateTeam creates a new team in an organization
-func (rm *RBACManager) CreateTeam(orgID int64, req *CreateTeamRequest) (*Team, error) {
+// CreateTeam creates a new team in an organization. Same dual-path shape
+// as CreateOrganization.
+func (rm *RBACManager) CreateTeam(ctx context.Context, orgID int64, req *CreateTeamRequest) (*Team, error) {
 	if req.Name == "" {
 		return nil, errors.New("team name is required")
 	}
-
-	// Validate name format to prevent malformed/malicious names
 	if err := validateName(req.Name); err != nil {
 		return nil, fmt.Errorf("invalid team name: %w", err)
 	}
 
+	if rm.getProposer() != nil {
+		now := time.Now()
+		payload := createTeamPayloadWire{
+			Team: clusterTeamEntryWire{
+				OrganizationID:    orgID,
+				Name:              req.Name,
+				Description:       req.Description,
+				CreatedAtUnixNano: now.UnixNano(),
+				UpdatedAtUnixNano: now.UnixNano(),
+				Enabled:           true,
+			},
+		}
+		if err := rm.proposeRBACCommand(ctx, ProposalCommandCreateTeam, payload); err != nil {
+			if strings.Contains(err.Error(), "organization") && strings.Contains(err.Error(), "not found") {
+				return nil, errors.New("organization not found")
+			}
+			if strings.Contains(err.Error(), "already exists") {
+				return nil, fmt.Errorf("team with name '%s' already exists in this organization", req.Name)
+			}
+			return nil, fmt.Errorf("failed to create team: %w", err)
+		}
+		rm.logger.Info().Int64("org_id", orgID).Str("name", req.Name).Msg("Created team via Raft")
+		var team Team
+		if err := rm.db.QueryRow(`
+			SELECT id, organization_id, name, description, created_at, updated_at, enabled
+			FROM rbac_teams WHERE organization_id = ? AND name = ?
+		`, orgID, req.Name).Scan(&team.ID, &team.OrganizationID, &team.Name, &team.Description, &team.CreatedAt, &team.UpdatedAt, &team.Enabled); err != nil {
+			return nil, fmt.Errorf("failed to read back team after Raft apply: %w", err)
+		}
+		return &team, nil
+	}
+
+	_ = ctx
 	// Verify organization exists
 	org, err := rm.GetOrganization(orgID)
 	if err != nil {
@@ -477,8 +602,42 @@ func (rm *RBACManager) ListTeamsByOrganization(orgID int64) ([]Team, error) {
 	return teams, nil
 }
 
-// UpdateTeam updates a team
-func (rm *RBACManager) UpdateTeam(id int64, req *UpdateTeamRequest) error {
+// UpdateTeam updates a team.
+func (rm *RBACManager) UpdateTeam(ctx context.Context, id int64, req *UpdateTeamRequest) error {
+	if rm.getProposer() != nil {
+		payload := updateTeamPayloadWire{
+			ID:                id,
+			UpdatedAtUnixNano: time.Now().UnixNano(),
+		}
+		if req.Name != nil {
+			payload.Name = *req.Name
+			payload.ChangedFields = append(payload.ChangedFields, "name")
+		}
+		if req.Description != nil {
+			payload.Description = *req.Description
+			payload.ChangedFields = append(payload.ChangedFields, "description")
+		}
+		if req.Enabled != nil {
+			payload.Enabled = *req.Enabled
+			payload.ChangedFields = append(payload.ChangedFields, "enabled")
+		}
+		if len(payload.ChangedFields) == 0 {
+			return nil
+		}
+		if err := rm.proposeRBACCommand(ctx, ProposalCommandUpdateTeam, payload); err != nil {
+			if strings.Contains(err.Error(), "team") && strings.Contains(err.Error(), "not found") {
+				return errors.New("team not found")
+			}
+			if strings.Contains(err.Error(), "already exists") {
+				return errors.New("team with that name already exists in this organization")
+			}
+			return fmt.Errorf("failed to update team: %w", err)
+		}
+		rm.logger.Info().Int64("id", id).Msg("Updated team via Raft")
+		return nil
+	}
+
+	_ = ctx
 	var updates []string
 	var args []interface{}
 
@@ -529,8 +688,18 @@ func (rm *RBACManager) UpdateTeam(id int64, req *UpdateTeamRequest) error {
 	return nil
 }
 
-// DeleteTeam deletes a team (cascades to roles and memberships)
-func (rm *RBACManager) DeleteTeam(id int64) error {
+// DeleteTeam deletes a team (cascades to roles and memberships).
+func (rm *RBACManager) DeleteTeam(ctx context.Context, id int64) error {
+	if rm.getProposer() != nil {
+		payload := deleteTeamPayloadWire{ID: id}
+		if err := rm.proposeRBACCommand(ctx, ProposalCommandDeleteTeam, payload); err != nil {
+			return fmt.Errorf("failed to delete team: %w", err)
+		}
+		rm.logger.Info().Int64("id", id).Msg("Deleted team via Raft")
+		return nil
+	}
+
+	_ = ctx
 	result, err := rm.db.Exec("DELETE FROM rbac_teams WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("failed to delete team: %w", err)
@@ -553,28 +722,64 @@ func (rm *RBACManager) DeleteTeam(id int64) error {
 // Roles CRUD
 // =============================================================================
 
-// CreateRole creates a new role for a team
-func (rm *RBACManager) CreateRole(teamID int64, req *CreateRoleRequest) (*Role, error) {
+// CreateRole creates a new role for a team.
+func (rm *RBACManager) CreateRole(ctx context.Context, teamID int64, req *CreateRoleRequest) (*Role, error) {
 	if req.DatabasePattern == "" {
 		return nil, errors.New("database pattern is required")
 	}
 	if len(req.Permissions) == 0 {
 		return nil, errors.New("at least one permission is required")
 	}
-
-	// Validate database pattern to prevent malformed/malicious patterns
 	if err := validatePattern(req.DatabasePattern); err != nil {
 		return nil, fmt.Errorf("invalid database pattern: %w", err)
 	}
-
-	// Validate permissions
 	for _, p := range req.Permissions {
 		if !IsValidPermission(p) {
 			return nil, fmt.Errorf("invalid permission: %s", p)
 		}
 	}
 
-	// Verify team exists
+	if rm.getProposer() != nil {
+		now := time.Now()
+		perms := strings.Join(req.Permissions, ",")
+		payload := createRolePayloadWire{
+			Role: clusterRoleEntryWire{
+				TeamID:            teamID,
+				DatabasePattern:   req.DatabasePattern,
+				Permissions:       perms,
+				CreatedAtUnixNano: now.UnixNano(),
+			},
+		}
+		if err := rm.proposeRBACCommand(ctx, ProposalCommandCreateRole, payload); err != nil {
+			if strings.Contains(err.Error(), "team") && strings.Contains(err.Error(), "not found") {
+				return nil, errors.New("team not found")
+			}
+			return nil, fmt.Errorf("failed to create role: %w", err)
+		}
+		rm.logger.Info().
+			Int64("team_id", teamID).
+			Str("database_pattern", req.DatabasePattern).
+			Strs("permissions", req.Permissions).
+			Msg("Created role via Raft")
+		// Read back. Roles aren't UNIQUE on (team_id, database_pattern) —
+		// pick the newest matching row by created_at to avoid a stale
+		// read if the same handler call retries.
+		var role Role
+		var dbPerms string
+		if err := rm.db.QueryRow(`
+			SELECT id, team_id, database_pattern, permissions, created_at
+			FROM rbac_roles
+			WHERE team_id = ? AND database_pattern = ? AND permissions = ?
+			ORDER BY created_at DESC, id DESC
+			LIMIT 1
+		`, teamID, req.DatabasePattern, perms).Scan(&role.ID, &role.TeamID, &role.DatabasePattern, &dbPerms, &role.CreatedAt); err != nil {
+			return nil, fmt.Errorf("failed to read back role after Raft apply: %w", err)
+		}
+		role.Permissions = strings.Split(dbPerms, ",")
+		return &role, nil
+	}
+
+	_ = ctx
 	team, err := rm.GetTeam(teamID)
 	if err != nil {
 		return nil, err
@@ -601,7 +806,6 @@ func (rm *RBACManager) CreateRole(teamID int64, req *CreateRoleRequest) (*Role, 
 		Strs("permissions", req.Permissions).
 		Msg("Created role")
 
-	// Invalidate all caches - new role affects permissions
 	rm.InvalidateAllCache()
 
 	return &Role{
@@ -655,8 +859,45 @@ func (rm *RBACManager) ListRolesByTeam(teamID int64) ([]Role, error) {
 	return roles, nil
 }
 
-// UpdateRole updates a role
-func (rm *RBACManager) UpdateRole(id int64, req *UpdateRoleRequest) error {
+// UpdateRole updates a role.
+func (rm *RBACManager) UpdateRole(ctx context.Context, id int64, req *UpdateRoleRequest) error {
+	if len(req.Permissions) > 0 {
+		for _, p := range req.Permissions {
+			if !IsValidPermission(p) {
+				return fmt.Errorf("invalid permission: %s", p)
+			}
+		}
+	}
+	if req.DatabasePattern != nil {
+		if err := validatePattern(*req.DatabasePattern); err != nil {
+			return fmt.Errorf("invalid database pattern: %w", err)
+		}
+	}
+
+	if rm.getProposer() != nil {
+		payload := updateRolePayloadWire{ID: id}
+		if req.DatabasePattern != nil {
+			payload.DatabasePattern = *req.DatabasePattern
+			payload.ChangedFields = append(payload.ChangedFields, "database_pattern")
+		}
+		if len(req.Permissions) > 0 {
+			payload.Permissions = strings.Join(req.Permissions, ",")
+			payload.ChangedFields = append(payload.ChangedFields, "permissions")
+		}
+		if len(payload.ChangedFields) == 0 {
+			return nil
+		}
+		if err := rm.proposeRBACCommand(ctx, ProposalCommandUpdateRole, payload); err != nil {
+			if strings.Contains(err.Error(), "role") && strings.Contains(err.Error(), "not found") {
+				return errors.New("role not found")
+			}
+			return fmt.Errorf("failed to update role: %w", err)
+		}
+		rm.logger.Info().Int64("id", id).Msg("Updated role via Raft")
+		return nil
+	}
+
+	_ = ctx
 	var updates []string
 	var args []interface{}
 
@@ -665,11 +906,6 @@ func (rm *RBACManager) UpdateRole(id int64, req *UpdateRoleRequest) error {
 		args = append(args, *req.DatabasePattern)
 	}
 	if len(req.Permissions) > 0 {
-		for _, p := range req.Permissions {
-			if !IsValidPermission(p) {
-				return fmt.Errorf("invalid permission: %s", p)
-			}
-		}
 		updates = append(updates, "permissions = ?")
 		args = append(args, strings.Join(req.Permissions, ","))
 	}
@@ -692,14 +928,23 @@ func (rm *RBACManager) UpdateRole(id int64, req *UpdateRoleRequest) error {
 
 	rm.logger.Info().Int64("id", id).Msg("Updated role")
 
-	// Invalidate all caches - role changes affect permissions
 	rm.InvalidateAllCache()
 
 	return nil
 }
 
-// DeleteRole deletes a role (cascades to measurement permissions)
-func (rm *RBACManager) DeleteRole(id int64) error {
+// DeleteRole deletes a role (cascades to measurement permissions).
+func (rm *RBACManager) DeleteRole(ctx context.Context, id int64) error {
+	if rm.getProposer() != nil {
+		payload := deleteRolePayloadWire{ID: id}
+		if err := rm.proposeRBACCommand(ctx, ProposalCommandDeleteRole, payload); err != nil {
+			return fmt.Errorf("failed to delete role: %w", err)
+		}
+		rm.logger.Info().Int64("id", id).Msg("Deleted role via Raft")
+		return nil
+	}
+
+	_ = ctx
 	result, err := rm.db.Exec("DELETE FROM rbac_roles WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("failed to delete role: %w", err)
@@ -712,7 +957,6 @@ func (rm *RBACManager) DeleteRole(id int64) error {
 
 	rm.logger.Info().Int64("id", id).Msg("Deleted role")
 
-	// Invalidate all caches - role deletion affects permissions
 	rm.InvalidateAllCache()
 
 	return nil
@@ -722,27 +966,60 @@ func (rm *RBACManager) DeleteRole(id int64) error {
 // Measurement Permissions CRUD
 // =============================================================================
 
-// CreateMeasurementPermission creates measurement-level permissions for a role
-func (rm *RBACManager) CreateMeasurementPermission(roleID int64, req *CreateMeasurementPermissionRequest) (*MeasurementPermission, error) {
+// CreateMeasurementPermission creates measurement-level permissions for a role.
+func (rm *RBACManager) CreateMeasurementPermission(ctx context.Context, roleID int64, req *CreateMeasurementPermissionRequest) (*MeasurementPermission, error) {
 	if req.MeasurementPattern == "" {
 		return nil, errors.New("measurement pattern is required")
 	}
 	if len(req.Permissions) == 0 {
 		return nil, errors.New("at least one permission is required")
 	}
-
-	// Validate measurement pattern to prevent malformed/malicious patterns
 	if err := validatePattern(req.MeasurementPattern); err != nil {
 		return nil, fmt.Errorf("invalid measurement pattern: %w", err)
 	}
-
 	for _, p := range req.Permissions {
 		if !IsValidPermission(p) {
 			return nil, fmt.Errorf("invalid permission: %s", p)
 		}
 	}
 
-	// Verify role exists
+	if rm.getProposer() != nil {
+		now := time.Now()
+		perms := strings.Join(req.Permissions, ",")
+		payload := createMeasurementPermissionPayloadWire{
+			MeasurementPermission: clusterMeasurementPermissionEntryWire{
+				RoleID:             roleID,
+				MeasurementPattern: req.MeasurementPattern,
+				Permissions:        perms,
+				CreatedAtUnixNano:  now.UnixNano(),
+			},
+		}
+		if err := rm.proposeRBACCommand(ctx, ProposalCommandCreateMeasurementPermission, payload); err != nil {
+			if strings.Contains(err.Error(), "role") && strings.Contains(err.Error(), "not found") {
+				return nil, errors.New("role not found")
+			}
+			return nil, fmt.Errorf("failed to create measurement permission: %w", err)
+		}
+		rm.logger.Info().
+			Int64("role_id", roleID).
+			Str("measurement_pattern", req.MeasurementPattern).
+			Msg("Created measurement permission via Raft")
+		var mp MeasurementPermission
+		var dbPerms string
+		if err := rm.db.QueryRow(`
+			SELECT id, role_id, measurement_pattern, permissions, created_at
+			FROM rbac_measurement_permissions
+			WHERE role_id = ? AND measurement_pattern = ? AND permissions = ?
+			ORDER BY created_at DESC, id DESC
+			LIMIT 1
+		`, roleID, req.MeasurementPattern, perms).Scan(&mp.ID, &mp.RoleID, &mp.MeasurementPattern, &dbPerms, &mp.CreatedAt); err != nil {
+			return nil, fmt.Errorf("failed to read back measurement permission after Raft apply: %w", err)
+		}
+		mp.Permissions = strings.Split(dbPerms, ",")
+		return &mp, nil
+	}
+
+	_ = ctx
 	role, err := rm.GetRole(roleID)
 	if err != nil {
 		return nil, err
@@ -768,7 +1045,6 @@ func (rm *RBACManager) CreateMeasurementPermission(roleID int64, req *CreateMeas
 		Str("measurement_pattern", req.MeasurementPattern).
 		Msg("Created measurement permission")
 
-	// Invalidate all caches - new measurement permission affects permissions
 	rm.InvalidateAllCache()
 
 	return &MeasurementPermission{
@@ -804,8 +1080,18 @@ func (rm *RBACManager) ListMeasurementPermissionsByRole(roleID int64) ([]Measure
 	return perms, nil
 }
 
-// DeleteMeasurementPermission deletes a measurement permission
-func (rm *RBACManager) DeleteMeasurementPermission(id int64) error {
+// DeleteMeasurementPermission deletes a measurement permission.
+func (rm *RBACManager) DeleteMeasurementPermission(ctx context.Context, id int64) error {
+	if rm.getProposer() != nil {
+		payload := deleteMeasurementPermissionPayloadWire{ID: id}
+		if err := rm.proposeRBACCommand(ctx, ProposalCommandDeleteMeasurementPermission, payload); err != nil {
+			return fmt.Errorf("failed to delete measurement permission: %w", err)
+		}
+		rm.logger.Info().Int64("id", id).Msg("Deleted measurement permission via Raft")
+		return nil
+	}
+
+	_ = ctx
 	result, err := rm.db.Exec("DELETE FROM rbac_measurement_permissions WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("failed to delete measurement permission: %w", err)
@@ -818,7 +1104,6 @@ func (rm *RBACManager) DeleteMeasurementPermission(id int64) error {
 
 	rm.logger.Info().Int64("id", id).Msg("Deleted measurement permission")
 
-	// Invalidate all caches - measurement permission deletion affects permissions
 	rm.InvalidateAllCache()
 
 	return nil
@@ -828,9 +1113,41 @@ func (rm *RBACManager) DeleteMeasurementPermission(id int64) error {
 // Token Memberships
 // =============================================================================
 
-// AddTokenToTeam adds a token to a team
-func (rm *RBACManager) AddTokenToTeam(tokenID, teamID int64) (*TokenMembership, error) {
-	// Verify team exists
+// AddTokenToTeam adds a token to a team.
+func (rm *RBACManager) AddTokenToTeam(ctx context.Context, tokenID, teamID int64) (*TokenMembership, error) {
+	if rm.getProposer() != nil {
+		now := time.Now()
+		payload := addTokenToTeamPayloadWire{
+			Membership: clusterTokenMembershipEntryWire{
+				TokenID:           tokenID,
+				TeamID:            teamID,
+				CreatedAtUnixNano: now.UnixNano(),
+			},
+		}
+		if err := rm.proposeRBACCommand(ctx, ProposalCommandAddTokenToTeam, payload); err != nil {
+			if strings.Contains(err.Error(), "team") && strings.Contains(err.Error(), "not found") {
+				return nil, errors.New("team not found")
+			}
+			if strings.Contains(err.Error(), "token") && strings.Contains(err.Error(), "not found") {
+				return nil, errors.New("token not found")
+			}
+			if strings.Contains(err.Error(), "already") {
+				return nil, errors.New("token is already a member of this team")
+			}
+			return nil, fmt.Errorf("failed to add token to team: %w", err)
+		}
+		rm.logger.Info().Int64("token_id", tokenID).Int64("team_id", teamID).Msg("Added token to team via Raft")
+		var mem TokenMembership
+		if err := rm.db.QueryRow(`
+			SELECT id, token_id, team_id, created_at
+			FROM rbac_token_memberships WHERE token_id = ? AND team_id = ?
+		`, tokenID, teamID).Scan(&mem.ID, &mem.TokenID, &mem.TeamID, &mem.CreatedAt); err != nil {
+			return nil, fmt.Errorf("failed to read back token membership after Raft apply: %w", err)
+		}
+		return &mem, nil
+	}
+
+	_ = ctx
 	team, err := rm.GetTeam(teamID)
 	if err != nil {
 		return nil, err
@@ -854,7 +1171,6 @@ func (rm *RBACManager) AddTokenToTeam(tokenID, teamID int64) (*TokenMembership, 
 	id, _ := result.LastInsertId()
 	rm.logger.Info().Int64("token_id", tokenID).Int64("team_id", teamID).Msg("Added token to team")
 
-	// Invalidate cache for this token
 	rm.InvalidateTokenCache(tokenID)
 
 	return &TokenMembership{
@@ -865,8 +1181,18 @@ func (rm *RBACManager) AddTokenToTeam(tokenID, teamID int64) (*TokenMembership, 
 	}, nil
 }
 
-// RemoveTokenFromTeam removes a token from a team
-func (rm *RBACManager) RemoveTokenFromTeam(tokenID, teamID int64) error {
+// RemoveTokenFromTeam removes a token from a team.
+func (rm *RBACManager) RemoveTokenFromTeam(ctx context.Context, tokenID, teamID int64) error {
+	if rm.getProposer() != nil {
+		payload := removeTokenFromTeamPayloadWire{TokenID: tokenID, TeamID: teamID}
+		if err := rm.proposeRBACCommand(ctx, ProposalCommandRemoveTokenFromTeam, payload); err != nil {
+			return fmt.Errorf("failed to remove token from team: %w", err)
+		}
+		rm.logger.Info().Int64("token_id", tokenID).Int64("team_id", teamID).Msg("Removed token from team via Raft")
+		return nil
+	}
+
+	_ = ctx
 	result, err := rm.db.Exec(`
 		DELETE FROM rbac_token_memberships WHERE token_id = ? AND team_id = ?
 	`, tokenID, teamID)
@@ -881,7 +1207,6 @@ func (rm *RBACManager) RemoveTokenFromTeam(tokenID, teamID int64) error {
 
 	rm.logger.Info().Int64("token_id", tokenID).Int64("team_id", teamID).Msg("Removed token from team")
 
-	// Invalidate cache for this token
 	rm.InvalidateTokenCache(tokenID)
 
 	return nil

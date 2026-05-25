@@ -382,7 +382,24 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		cmd.Type == clusterraft.CommandRevokeToken ||
 		cmd.Type == clusterraft.CommandDeleteToken ||
 		cmd.Type == clusterraft.CommandRotateToken
-	if !isManifest && !isAuth {
+	// Phase A.1: extend the allowlist with the 13 RBAC commands. Same
+	// role-gating policy as the auth commands: any known authenticated
+	// peer can forward an RBAC write (admin-check happened on the
+	// proposing node's HTTP handler via RequireAdmin + license gate).
+	isRBAC := cmd.Type == clusterraft.CommandCreateOrganization ||
+		cmd.Type == clusterraft.CommandUpdateOrganization ||
+		cmd.Type == clusterraft.CommandDeleteOrganization ||
+		cmd.Type == clusterraft.CommandCreateTeam ||
+		cmd.Type == clusterraft.CommandUpdateTeam ||
+		cmd.Type == clusterraft.CommandDeleteTeam ||
+		cmd.Type == clusterraft.CommandCreateRole ||
+		cmd.Type == clusterraft.CommandUpdateRole ||
+		cmd.Type == clusterraft.CommandDeleteRole ||
+		cmd.Type == clusterraft.CommandCreateMeasurementPermission ||
+		cmd.Type == clusterraft.CommandDeleteMeasurementPermission ||
+		cmd.Type == clusterraft.CommandAddTokenToTeam ||
+		cmd.Type == clusterraft.CommandRemoveTokenFromTeam
+	if !isManifest && !isAuth && !isRBAC {
 		c.logger.Warn().
 			Str("requesting_node", req.NodeID).
 			Int("cmd_type", int(cmd.Type)).

@@ -47,6 +47,11 @@ func newFakeProposer() *fakeProposer { return &fakeProposer{} }
 
 func (f *fakeProposer) setAuthManager(am *AuthManager) { f.am = am }
 
+// IsLeader for the in-test proposer always reports leader; the tests
+// don't model the multi-node election and the apply path runs on the
+// single in-process FSM. Phase A.1 added IsLeader to RaftProposer.
+func (f *fakeProposer) IsLeader() bool { return true }
+
 func (f *fakeProposer) Propose(ctx context.Context, cmdType uint8, payload []byte, timeout time.Duration) error {
 	if f.am == nil {
 		return fmt.Errorf("fakeProposer: AuthManager not wired")

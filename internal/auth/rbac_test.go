@@ -52,7 +52,7 @@ func TestCreateOrganization(t *testing.T) {
 	defer cleanup()
 
 	t.Run("basic creation", func(t *testing.T) {
-		org, err := rm.CreateOrganization(&CreateOrganizationRequest{
+		org, err := rm.CreateOrganization(context.Background(), &CreateOrganizationRequest{
 			Name:        "acme-corp",
 			Description: "Test organization",
 		})
@@ -74,7 +74,7 @@ func TestCreateOrganization(t *testing.T) {
 	})
 
 	t.Run("empty name", func(t *testing.T) {
-		_, err := rm.CreateOrganization(&CreateOrganizationRequest{
+		_, err := rm.CreateOrganization(context.Background(), &CreateOrganizationRequest{
 			Name: "",
 		})
 		if err == nil {
@@ -84,7 +84,7 @@ func TestCreateOrganization(t *testing.T) {
 
 	t.Run("duplicate name", func(t *testing.T) {
 		// First creation should succeed
-		_, err := rm.CreateOrganization(&CreateOrganizationRequest{
+		_, err := rm.CreateOrganization(context.Background(), &CreateOrganizationRequest{
 			Name: "duplicate-org",
 		})
 		if err != nil {
@@ -92,7 +92,7 @@ func TestCreateOrganization(t *testing.T) {
 		}
 
 		// Second creation should fail
-		_, err = rm.CreateOrganization(&CreateOrganizationRequest{
+		_, err = rm.CreateOrganization(context.Background(), &CreateOrganizationRequest{
 			Name: "duplicate-org",
 		})
 		if err == nil {
@@ -106,7 +106,7 @@ func TestGetOrganization(t *testing.T) {
 	defer cleanup()
 
 	t.Run("existing organization", func(t *testing.T) {
-		created, err := rm.CreateOrganization(&CreateOrganizationRequest{
+		created, err := rm.CreateOrganization(context.Background(), &CreateOrganizationRequest{
 			Name:        "get-test-org",
 			Description: "Test description",
 		})
@@ -142,9 +142,9 @@ func TestListOrganizations(t *testing.T) {
 	defer cleanup()
 
 	// Create some organizations
-	rm.CreateOrganization(&CreateOrganizationRequest{Name: "org-a"})
-	rm.CreateOrganization(&CreateOrganizationRequest{Name: "org-b"})
-	rm.CreateOrganization(&CreateOrganizationRequest{Name: "org-c"})
+	rm.CreateOrganization(context.Background(), &CreateOrganizationRequest{Name: "org-a"})
+	rm.CreateOrganization(context.Background(), &CreateOrganizationRequest{Name: "org-b"})
+	rm.CreateOrganization(context.Background(), &CreateOrganizationRequest{Name: "org-c"})
 
 	orgs, err := rm.ListOrganizations()
 	if err != nil {
@@ -159,14 +159,14 @@ func TestUpdateOrganization(t *testing.T) {
 	rm, _, cleanup := setupTestRBACManager(t)
 	defer cleanup()
 
-	org, _ := rm.CreateOrganization(&CreateOrganizationRequest{
+	org, _ := rm.CreateOrganization(context.Background(), &CreateOrganizationRequest{
 		Name:        "update-test-org",
 		Description: "Original description",
 	})
 
 	t.Run("update name", func(t *testing.T) {
 		newName := "updated-org-name"
-		err := rm.UpdateOrganization(org.ID, &UpdateOrganizationRequest{
+		err := rm.UpdateOrganization(context.Background(), org.ID, &UpdateOrganizationRequest{
 			Name: &newName,
 		})
 		if err != nil {
@@ -181,7 +181,7 @@ func TestUpdateOrganization(t *testing.T) {
 
 	t.Run("disable organization", func(t *testing.T) {
 		enabled := false
-		err := rm.UpdateOrganization(org.ID, &UpdateOrganizationRequest{
+		err := rm.UpdateOrganization(context.Background(), org.ID, &UpdateOrganizationRequest{
 			Enabled: &enabled,
 		})
 		if err != nil {
@@ -196,7 +196,7 @@ func TestUpdateOrganization(t *testing.T) {
 
 	t.Run("non-existent organization", func(t *testing.T) {
 		newName := "new-name"
-		err := rm.UpdateOrganization(99999, &UpdateOrganizationRequest{
+		err := rm.UpdateOrganization(context.Background(), 99999, &UpdateOrganizationRequest{
 			Name: &newName,
 		})
 		if err == nil {
@@ -209,12 +209,12 @@ func TestDeleteOrganization(t *testing.T) {
 	rm, _, cleanup := setupTestRBACManager(t)
 	defer cleanup()
 
-	org, _ := rm.CreateOrganization(&CreateOrganizationRequest{
+	org, _ := rm.CreateOrganization(context.Background(), &CreateOrganizationRequest{
 		Name: "delete-test-org",
 	})
 
 	t.Run("delete existing", func(t *testing.T) {
-		err := rm.DeleteOrganization(org.ID)
+		err := rm.DeleteOrganization(context.Background(), org.ID)
 		if err != nil {
 			t.Fatalf("DeleteOrganization failed: %v", err)
 		}
@@ -226,7 +226,7 @@ func TestDeleteOrganization(t *testing.T) {
 	})
 
 	t.Run("delete non-existent", func(t *testing.T) {
-		err := rm.DeleteOrganization(99999)
+		err := rm.DeleteOrganization(context.Background(), 99999)
 		if err == nil {
 			t.Error("Expected error for non-existent organization")
 		}
@@ -241,10 +241,10 @@ func TestCreateTeam(t *testing.T) {
 	rm, _, cleanup := setupTestRBACManager(t)
 	defer cleanup()
 
-	org, _ := rm.CreateOrganization(&CreateOrganizationRequest{Name: "team-test-org"})
+	org, _ := rm.CreateOrganization(context.Background(), &CreateOrganizationRequest{Name: "team-test-org"})
 
 	t.Run("basic creation", func(t *testing.T) {
-		team, err := rm.CreateTeam(org.ID, &CreateTeamRequest{
+		team, err := rm.CreateTeam(context.Background(), org.ID, &CreateTeamRequest{
 			Name:        "Engineering",
 			Description: "Engineering team",
 		})
@@ -260,22 +260,22 @@ func TestCreateTeam(t *testing.T) {
 	})
 
 	t.Run("empty name", func(t *testing.T) {
-		_, err := rm.CreateTeam(org.ID, &CreateTeamRequest{Name: ""})
+		_, err := rm.CreateTeam(context.Background(), org.ID, &CreateTeamRequest{Name: ""})
 		if err == nil {
 			t.Error("Expected error for empty name")
 		}
 	})
 
 	t.Run("non-existent organization", func(t *testing.T) {
-		_, err := rm.CreateTeam(99999, &CreateTeamRequest{Name: "Test Team"})
+		_, err := rm.CreateTeam(context.Background(), 99999, &CreateTeamRequest{Name: "Test Team"})
 		if err == nil {
 			t.Error("Expected error for non-existent organization")
 		}
 	})
 
 	t.Run("duplicate name in organization", func(t *testing.T) {
-		rm.CreateTeam(org.ID, &CreateTeamRequest{Name: "Duplicate Team"})
-		_, err := rm.CreateTeam(org.ID, &CreateTeamRequest{Name: "Duplicate Team"})
+		rm.CreateTeam(context.Background(), org.ID, &CreateTeamRequest{Name: "Duplicate Team"})
+		_, err := rm.CreateTeam(context.Background(), org.ID, &CreateTeamRequest{Name: "Duplicate Team"})
 		if err == nil {
 			t.Error("Expected error for duplicate team name in same org")
 		}
@@ -286,17 +286,17 @@ func TestTeamCascadeDelete(t *testing.T) {
 	rm, _, cleanup := setupTestRBACManager(t)
 	defer cleanup()
 
-	org, _ := rm.CreateOrganization(&CreateOrganizationRequest{Name: "cascade-test-org"})
-	team, _ := rm.CreateTeam(org.ID, &CreateTeamRequest{Name: "cascade-test-team"})
+	org, _ := rm.CreateOrganization(context.Background(), &CreateOrganizationRequest{Name: "cascade-test-org"})
+	team, _ := rm.CreateTeam(context.Background(), org.ID, &CreateTeamRequest{Name: "cascade-test-team"})
 
 	// Create role and verify it exists
-	role, _ := rm.CreateRole(team.ID, &CreateRoleRequest{
+	role, _ := rm.CreateRole(context.Background(), team.ID, &CreateRoleRequest{
 		DatabasePattern: "production",
 		Permissions:     []string{"read", "write"},
 	})
 
 	// Delete organization should cascade delete team and role
-	err := rm.DeleteOrganization(org.ID)
+	err := rm.DeleteOrganization(context.Background(), org.ID)
 	if err != nil {
 		t.Fatalf("DeleteOrganization failed: %v", err)
 	}
@@ -322,11 +322,11 @@ func TestCreateRole(t *testing.T) {
 	rm, _, cleanup := setupTestRBACManager(t)
 	defer cleanup()
 
-	org, _ := rm.CreateOrganization(&CreateOrganizationRequest{Name: "role-test-org"})
-	team, _ := rm.CreateTeam(org.ID, &CreateTeamRequest{Name: "role-test-team"})
+	org, _ := rm.CreateOrganization(context.Background(), &CreateOrganizationRequest{Name: "role-test-org"})
+	team, _ := rm.CreateTeam(context.Background(), org.ID, &CreateTeamRequest{Name: "role-test-team"})
 
 	t.Run("basic creation", func(t *testing.T) {
-		role, err := rm.CreateRole(team.ID, &CreateRoleRequest{
+		role, err := rm.CreateRole(context.Background(), team.ID, &CreateRoleRequest{
 			DatabasePattern: "production",
 			Permissions:     []string{"read", "write"},
 		})
@@ -342,7 +342,7 @@ func TestCreateRole(t *testing.T) {
 	})
 
 	t.Run("wildcard pattern", func(t *testing.T) {
-		role, err := rm.CreateRole(team.ID, &CreateRoleRequest{
+		role, err := rm.CreateRole(context.Background(), team.ID, &CreateRoleRequest{
 			DatabasePattern: "*",
 			Permissions:     []string{"read"},
 		})
@@ -355,7 +355,7 @@ func TestCreateRole(t *testing.T) {
 	})
 
 	t.Run("empty database pattern", func(t *testing.T) {
-		_, err := rm.CreateRole(team.ID, &CreateRoleRequest{
+		_, err := rm.CreateRole(context.Background(), team.ID, &CreateRoleRequest{
 			DatabasePattern: "",
 			Permissions:     []string{"read"},
 		})
@@ -365,7 +365,7 @@ func TestCreateRole(t *testing.T) {
 	})
 
 	t.Run("empty permissions", func(t *testing.T) {
-		_, err := rm.CreateRole(team.ID, &CreateRoleRequest{
+		_, err := rm.CreateRole(context.Background(), team.ID, &CreateRoleRequest{
 			DatabasePattern: "test",
 			Permissions:     []string{},
 		})
@@ -375,7 +375,7 @@ func TestCreateRole(t *testing.T) {
 	})
 
 	t.Run("invalid permission", func(t *testing.T) {
-		_, err := rm.CreateRole(team.ID, &CreateRoleRequest{
+		_, err := rm.CreateRole(context.Background(), team.ID, &CreateRoleRequest{
 			DatabasePattern: "test",
 			Permissions:     []string{"read", "invalid_perm"},
 		})
@@ -394,15 +394,15 @@ func TestTokenMembership(t *testing.T) {
 	defer cleanup()
 
 	// Create organization and team
-	org, _ := rm.CreateOrganization(&CreateOrganizationRequest{Name: "membership-test-org"})
-	team, _ := rm.CreateTeam(org.ID, &CreateTeamRequest{Name: "membership-test-team"})
+	org, _ := rm.CreateOrganization(context.Background(), &CreateOrganizationRequest{Name: "membership-test-org"})
+	team, _ := rm.CreateTeam(context.Background(), org.ID, &CreateTeamRequest{Name: "membership-test-team"})
 
 	// Create a token
 	token, _ := am.CreateToken(context.Background(), "membership-test", "Test token", "read,write", nil)
 	tokenInfo := am.VerifyToken(token)
 
 	t.Run("add token to team", func(t *testing.T) {
-		membership, err := rm.AddTokenToTeam(tokenInfo.ID, team.ID)
+		membership, err := rm.AddTokenToTeam(context.Background(), tokenInfo.ID, team.ID)
 		if err != nil {
 			t.Fatalf("AddTokenToTeam failed: %v", err)
 		}
@@ -415,7 +415,7 @@ func TestTokenMembership(t *testing.T) {
 	})
 
 	t.Run("duplicate membership", func(t *testing.T) {
-		_, err := rm.AddTokenToTeam(tokenInfo.ID, team.ID)
+		_, err := rm.AddTokenToTeam(context.Background(), tokenInfo.ID, team.ID)
 		if err == nil {
 			t.Error("Expected error for duplicate membership")
 		}
@@ -435,7 +435,7 @@ func TestTokenMembership(t *testing.T) {
 	})
 
 	t.Run("remove token from team", func(t *testing.T) {
-		err := rm.RemoveTokenFromTeam(tokenInfo.ID, team.ID)
+		err := rm.RemoveTokenFromTeam(context.Background(), tokenInfo.ID, team.ID)
 		if err != nil {
 			t.Fatalf("RemoveTokenFromTeam failed: %v", err)
 		}
@@ -447,7 +447,7 @@ func TestTokenMembership(t *testing.T) {
 	})
 
 	t.Run("remove non-existent membership", func(t *testing.T) {
-		err := rm.RemoveTokenFromTeam(tokenInfo.ID, team.ID)
+		err := rm.RemoveTokenFromTeam(context.Background(), tokenInfo.ID, team.ID)
 		if err == nil {
 			t.Error("Expected error for non-existent membership")
 		}

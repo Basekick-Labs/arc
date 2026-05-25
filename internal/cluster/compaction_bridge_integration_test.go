@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -48,6 +49,11 @@ import (
 // "leader-flap" test exercises the latter and asserts the bridge maps
 // the error to compaction.ErrNotLeader so the watcher retries.
 type fsmCoordinator struct {
+	// forwardingFailureMu guards forwardingFailure. The watcher goroutine
+	// reads the field on every poll while tests mutate it from the main
+	// goroutine to flip "leader is reachable" on and off; without the
+	// mutex the race detector flags every write.
+	forwardingFailureMu sync.RWMutex
 	// forwardingFailure, when non-nil, is returned from
 	// RegisterFileInManifest / DeleteFileFromManifest INSTEAD of applying
 	// to the FSM. Tests use this to simulate "non-leader, forwarding to
@@ -58,11 +64,27 @@ type fsmCoordinator struct {
 	logIndex          uint64 // incremented per Apply to mimic Raft's monotonic index
 }
 
+// getForwardingFailure reads forwardingFailure under the read lock so
+// the watcher goroutine and the test goroutine don't race on the field.
+func (c *fsmCoordinator) getForwardingFailure() error {
+	c.forwardingFailureMu.RLock()
+	defer c.forwardingFailureMu.RUnlock()
+	return c.forwardingFailure
+}
+
+// setForwardingFailure writes forwardingFailure under the write lock.
+// Tests call this to flip the simulated forwarding state on and off.
+func (c *fsmCoordinator) setForwardingFailure(err error) {
+	c.forwardingFailureMu.Lock()
+	c.forwardingFailure = err
+	c.forwardingFailureMu.Unlock()
+}
+
 func (c *fsmCoordinator) LocalNodeID() string { return c.nodeID }
 
 func (c *fsmCoordinator) RegisterFileInManifest(file raft.FileEntry) error {
-	if c.forwardingFailure != nil {
-		return c.forwardingFailure
+	if ff := c.getForwardingFailure(); ff != nil {
+		return ff
 	}
 	payload, err := json.Marshal(raft.RegisterFilePayload{File: file})
 	if err != nil {
@@ -83,8 +105,8 @@ func (c *fsmCoordinator) RegisterFileInManifest(file raft.FileEntry) error {
 }
 
 func (c *fsmCoordinator) DeleteFileFromManifest(path, reason string) error {
-	if c.forwardingFailure != nil {
-		return c.forwardingFailure
+	if ff := c.getForwardingFailure(); ff != nil {
+		return ff
 	}
 	payload, err := json.Marshal(raft.DeleteFilePayload{Path: path, Reason: reason})
 	if err != nil {
@@ -105,8 +127,8 @@ func (c *fsmCoordinator) DeleteFileFromManifest(path, reason string) error {
 }
 
 func (c *fsmCoordinator) BatchFileOpsInManifest(ops []raft.BatchFileOp) error {
-	if c.forwardingFailure != nil {
-		return c.forwardingFailure
+	if ff := c.getForwardingFailure(); ff != nil {
+		return ff
 	}
 	payload, err := json.Marshal(raft.BatchFileOpsPayload{Ops: ops})
 	if err != nil {
@@ -344,7 +366,7 @@ func TestPhase4_ForwardingFailureKeepsManifestUntilRecovery(t *testing.T) {
 	// equivalent of "Raft elected a leader and the registry now has the
 	// leader's coordinator address". The next watcher tick should
 	// successfully apply via the FSM directly.
-	coord.forwardingFailure = nil
+	coord.setForwardingFailure(nil)
 	waitFSMHasFile(t, fsm, "db/cpu/2026/04/11/14/compacted_flap.parquet", 2*time.Second)
 
 	// Manifest should have been cleaned up after the successful apply.

@@ -549,7 +549,7 @@ func (h *AuthHandler) addTokenToTeam(c *fiber.Ctx) error {
 		})
 	}
 
-	membership, err := h.rbacManager.AddTokenToTeam(tokenID, req.TeamID)
+	membership, err := h.rbacManager.AddTokenToTeam(c.UserContext(), tokenID, req.TeamID)
 	if err != nil {
 		status := fiber.StatusInternalServerError
 		if err.Error() == "team not found" || err.Error() == "token is already a member of this team" {
@@ -599,7 +599,7 @@ func (h *AuthHandler) removeTokenFromTeam(c *fiber.Ctx) error {
 		})
 	}
 
-	err = h.rbacManager.RemoveTokenFromTeam(tokenID, teamID)
+	err = h.rbacManager.RemoveTokenFromTeam(c.UserContext(), tokenID, teamID)
 	if err != nil {
 		if err.Error() == "token membership not found" {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
