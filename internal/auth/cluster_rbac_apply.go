@@ -284,8 +284,8 @@ func (rm *RBACManager) ApplyCreateOrganization(entry ClusterOrganizationEntry) e
 	if entry.ID == 0 {
 		return fmt.Errorf("ApplyCreateOrganization: id required")
 	}
-	createdAt := time.Unix(0, entry.CreatedAtUnixNano)
-	updatedAt := time.Unix(0, entry.UpdatedAtUnixNano)
+	createdAt := time.Unix(0, entry.CreatedAtUnixNano).UTC()
+	updatedAt := time.Unix(0, entry.UpdatedAtUnixNano).UTC()
 	enabled := 0
 	if entry.Enabled {
 		enabled = 1
@@ -374,7 +374,7 @@ func (rm *RBACManager) ApplyUpdateOrganization(entry ClusterOrganizationEntry) e
 	if entry.ID == 0 {
 		return fmt.Errorf("ApplyUpdateOrganization: id required")
 	}
-	updatedAt := time.Unix(0, entry.UpdatedAtUnixNano)
+	updatedAt := time.Unix(0, entry.UpdatedAtUnixNano).UTC()
 	enabled := 0
 	if entry.Enabled {
 		enabled = 1
@@ -442,8 +442,8 @@ func (rm *RBACManager) ApplyCreateTeam(entry ClusterTeamEntry) error {
 	if entry.ID == 0 {
 		return fmt.Errorf("ApplyCreateTeam: id required")
 	}
-	createdAt := time.Unix(0, entry.CreatedAtUnixNano)
-	updatedAt := time.Unix(0, entry.UpdatedAtUnixNano)
+	createdAt := time.Unix(0, entry.CreatedAtUnixNano).UTC()
+	updatedAt := time.Unix(0, entry.UpdatedAtUnixNano).UTC()
 	enabled := 0
 	if entry.Enabled {
 		enabled = 1
@@ -483,7 +483,7 @@ func (rm *RBACManager) ApplyUpdateTeam(entry ClusterTeamEntry) error {
 	if entry.ID == 0 {
 		return fmt.Errorf("ApplyUpdateTeam: id required")
 	}
-	updatedAt := time.Unix(0, entry.UpdatedAtUnixNano)
+	updatedAt := time.Unix(0, entry.UpdatedAtUnixNano).UTC()
 	enabled := 0
 	if entry.Enabled {
 		enabled = 1
@@ -542,7 +542,7 @@ func (rm *RBACManager) ApplyCreateRole(entry ClusterRoleEntry) error {
 	if entry.ID == 0 {
 		return fmt.Errorf("ApplyCreateRole: id required")
 	}
-	createdAt := time.Unix(0, entry.CreatedAtUnixNano)
+	createdAt := time.Unix(0, entry.CreatedAtUnixNano).UTC()
 
 	var existingTeam int64
 	var existingPattern string
@@ -630,7 +630,7 @@ func (rm *RBACManager) ApplyCreateMeasurementPermission(entry ClusterMeasurement
 	if entry.ID == 0 {
 		return fmt.Errorf("ApplyCreateMeasurementPermission: id required")
 	}
-	createdAt := time.Unix(0, entry.CreatedAtUnixNano)
+	createdAt := time.Unix(0, entry.CreatedAtUnixNano).UTC()
 
 	var existingRole int64
 	var existingPattern string
@@ -691,7 +691,7 @@ func (rm *RBACManager) ApplyAddTokenToTeam(entry ClusterTokenMembershipEntry) er
 	if entry.ID == 0 {
 		return fmt.Errorf("ApplyAddTokenToTeam: id required")
 	}
-	createdAt := time.Unix(0, entry.CreatedAtUnixNano)
+	createdAt := time.Unix(0, entry.CreatedAtUnixNano).UTC()
 
 	var existingTokenID, existingTeamID int64
 	queryErr := rm.db.QueryRow(

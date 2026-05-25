@@ -1584,6 +1584,11 @@ func main() {
 			DB:            authManager.GetDB(),
 			LicenseClient: licenseClient,
 			Logger:        logger.Get("rbac"),
+			// Phase A.2 Item 2: cascade-on-delete soft cap.
+			// Default is 50000 (set by viper); operators can override
+			// via cluster.rbac.max_cascade_descendants in arc.toml or
+			// ARC_CLUSTER_RBAC_MAX_CASCADE_DESCENDANTS env var. 0 = disabled.
+			MaxCascadeDescendants: cfg.Cluster.RBACMaxCascadeDescendants,
 		})
 		shutdownCoordinator.Register("rbac", rbacManager, shutdown.PriorityAuth)
 		if rbacManager.IsRBACEnabled() {

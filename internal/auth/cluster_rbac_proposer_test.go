@@ -729,6 +729,166 @@ func TestProposer_RemoveTokenFromTeam_RoundTrip(t *testing.T) {
 	}
 }
 
+// -----------------------------------------------------------------------------
+// Phase A.2 Item 2 — cascade-on-delete soft cap tests.
+//
+// newRBACTestManagerWithCap mirrors newRBACTestManager but lets the
+// test pass an explicit MaxCascadeDescendants value. maxDesc=0 → disabled.
+// -----------------------------------------------------------------------------
+
+func newRBACTestManagerWithCap(t *testing.T, maxDesc int) (*RBACManager, *fakeRBACProposer) {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "rbac-test.db")
+	am, err := NewAuthManager(dbPath, 100*time.Millisecond, 100, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewAuthManager: %v", err)
+	}
+	t.Cleanup(func() { am.Close() })
+
+	rm := NewRBACManager(&RBACManagerConfig{
+		DB:                    am.GetDB(),
+		Logger:                zerolog.Nop(),
+		MaxCascadeDescendants: maxDesc,
+	})
+	t.Cleanup(func() { rm.Close() })
+
+	prop := newFakeRBACProposer()
+	prop.setRBACManager(rm)
+	rm.SetRaftProposer(prop)
+	return rm, prop
+}
+
+// seedOrgWithNTeams creates an org and N teams under it. Used by cap
+// tests to inflate the descendant count to a known value cheaply.
+// Returns the org id.
+func seedOrgWithNTeams(t *testing.T, rm *RBACManager, n int) int64 {
+	t.Helper()
+	ctx := context.Background()
+	org, err := rm.CreateOrganization(ctx, &CreateOrganizationRequest{Name: "acme"})
+	if err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		if _, err := rm.CreateTeam(ctx, org.ID, &CreateTeamRequest{Name: fmt.Sprintf("team-%d", i)}); err != nil {
+			t.Fatalf("create team %d: %v", i, err)
+		}
+	}
+	return org.ID
+}
+
+// TestProposer_DeleteOrganization_RefusesOversizedCascade pins the
+// cap-rejection path: an org with >cap descendants causes
+// DeleteOrganization to return ErrCascadeCapExceeded BEFORE proposing.
+// Phase A.2 Item 2.
+func TestProposer_DeleteOrganization_RefusesOversizedCascade(t *testing.T) {
+	const maxDesc = 5
+	rm, prop := newRBACTestManagerWithCap(t, maxDesc)
+	orgID := seedOrgWithNTeams(t, rm, maxDesc+1) // 6 teams > cap
+
+	// Snapshot the proposer's logIdx so we can prove no propose ran
+	// (a successful propose would have incremented it).
+	idxBefore := prop.logIdx.Load()
+
+	err := rm.DeleteOrganization(context.Background(), orgID)
+	if err == nil {
+		t.Fatal("expected ErrCascadeCapExceeded, got nil")
+	}
+	if !errors.Is(err, ErrCascadeCapExceeded) {
+		t.Errorf("expected ErrCascadeCapExceeded in chain, got %v", err)
+	}
+	// The error message must include the count and the workaround hint
+	// so operators get a useful diagnostic in API responses + logs.
+	if !strings.Contains(err.Error(), "6 descendants") {
+		t.Errorf("error should include descendant count; got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "max 5") {
+		t.Errorf("error should include the cap; got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "delete child entities") {
+		t.Errorf("error should include the workaround hint; got %q", err.Error())
+	}
+
+	// No propose must have happened.
+	idxAfter := prop.logIdx.Load()
+	if idxAfter != idxBefore {
+		t.Errorf("proposer.logIdx changed from %d to %d — cap rejection should NOT have proposed", idxBefore, idxAfter)
+	}
+
+	// Org must still exist locally — rejection must NOT touch state.
+	got, _ := rm.GetOrganization(orgID)
+	if got == nil {
+		t.Errorf("org should still exist after cap-rejected delete")
+	}
+}
+
+// TestProposer_DeleteOrganization_AllowsCascadeUnderCap pins the
+// happy path: an org with ≤cap descendants deletes normally.
+func TestProposer_DeleteOrganization_AllowsCascadeUnderCap(t *testing.T) {
+	const maxDesc = 10
+	rm, _ := newRBACTestManagerWithCap(t, maxDesc)
+	orgID := seedOrgWithNTeams(t, rm, maxDesc-1) // 9 teams ≤ cap
+
+	if err := rm.DeleteOrganization(context.Background(), orgID); err != nil {
+		t.Fatalf("DeleteOrganization under cap should succeed, got: %v", err)
+	}
+	// Org must be gone (cluster-mode delete cascades via the fake proposer
+	// → ApplyDeleteOrganization → SQLite ON DELETE CASCADE).
+	if got, _ := rm.GetOrganization(orgID); got != nil {
+		t.Errorf("org should be deleted after under-cap cascade")
+	}
+}
+
+// TestProposer_DeleteOrganization_DisabledCapAllowsAnyCascade pins
+// the operator escape hatch: cap=0 means no check at all, regardless
+// of descendant count.
+func TestProposer_DeleteOrganization_DisabledCapAllowsAnyCascade(t *testing.T) {
+	rm, _ := newRBACTestManagerWithCap(t, 0) // disabled
+	orgID := seedOrgWithNTeams(t, rm, 20)    // would exceed any sane test cap
+
+	if err := rm.DeleteOrganization(context.Background(), orgID); err != nil {
+		t.Fatalf("DeleteOrganization with cap=0 should succeed regardless of size, got: %v", err)
+	}
+}
+
+// TestProposer_DeleteTeam_RefusesOversizedCascade is the team-level
+// equivalent of the org-level cap test above. Inflates a team's
+// descendant count by creating roles (each role contributes 1) past
+// the cap.
+func TestProposer_DeleteTeam_RefusesOversizedCascade(t *testing.T) {
+	const maxDesc = 5
+	rm, prop := newRBACTestManagerWithCap(t, maxDesc)
+	ctx := context.Background()
+	org, _ := rm.CreateOrganization(ctx, &CreateOrganizationRequest{Name: "acme"})
+	team, _ := rm.CreateTeam(ctx, org.ID, &CreateTeamRequest{Name: "platform"})
+	for i := 0; i < maxDesc+1; i++ {
+		if _, err := rm.CreateRole(ctx, team.ID, &CreateRoleRequest{
+			DatabasePattern: fmt.Sprintf("db_%d", i),
+			Permissions:     []string{"read"},
+		}); err != nil {
+			t.Fatalf("create role %d: %v", i, err)
+		}
+	}
+
+	idxBefore := prop.logIdx.Load()
+	err := rm.DeleteTeam(ctx, team.ID)
+	if err == nil {
+		t.Fatal("expected ErrCascadeCapExceeded, got nil")
+	}
+	if !errors.Is(err, ErrCascadeCapExceeded) {
+		t.Errorf("expected ErrCascadeCapExceeded in chain, got %v", err)
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("under team %d", team.ID)) {
+		t.Errorf("error should identify the team; got %q", err.Error())
+	}
+	idxAfter := prop.logIdx.Load()
+	if idxAfter != idxBefore {
+		t.Errorf("proposer.logIdx changed from %d to %d — cap rejection should NOT have proposed", idxBefore, idxAfter)
+	}
+	if got, _ := rm.GetTeam(team.ID); got == nil {
+		t.Errorf("team should still exist after cap-rejected delete")
+	}
+}
+
 func TestProposer_NilProposer_FallsThroughToDirectSQLite(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "rbac-nil-proposer.db")
 	am, err := NewAuthManager(dbPath, 100*time.Millisecond, 100, zerolog.Nop())

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/license"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
 
@@ -100,6 +101,30 @@ type RBACManager struct {
 	proposer   RaftProposer
 	proposerMu sync.RWMutex
 
+	// Phase A.2 Item 2: cascade-on-delete soft cap. DeleteOrganization
+	// and DeleteTeam in cluster mode pre-check the descendant count
+	// against this cap before proposing. 0 = disabled (no cap, used in
+	// OSS and as an explicit operator escape hatch). Read-only after
+	// construction.
+	maxCascadeDescendants int
+
+	// proposerNowUnixNano holds the last UnixNano returned by
+	// nextProposerTimestamp(). It is updated via a CAS loop so two
+	// concurrent callers are guaranteed to receive strictly-increasing
+	// timestamps. Background: the round-9 G28 fix matches the
+	// CreateRole / CreateMeasurementPermission read-back by
+	// `created_at = proposer's now` to disambiguate concurrent identical
+	// creates. time.Now() alone can collide at the same nanosecond
+	// under heavy concurrency on fast machines, producing duplicate
+	// created_at values and the same race the fix was supposed to
+	// eliminate. The CAS loop returns max(prev+1, time.Now().UnixNano())
+	// so concurrent callers get distinct, monotonic stamps. The
+	// trade-off is a sub-microsecond drift from wall clock under heavy
+	// concurrency, which is fine — `created_at` is "when the proposer
+	// issued this command," not "exact wall clock." Phase A.2 follow-up
+	// to PR #458 round 9 G28.
+	proposerNowUnixNano atomic.Int64
+
 	// Shutdown
 	done chan struct{}
 }
@@ -111,6 +136,12 @@ type RBACManagerConfig struct {
 	Logger        zerolog.Logger
 	CacheTTL      time.Duration // TTL for permission cache (default: 30s)
 	MaxCacheSize  int           // Max entries per cache (default: 10000)
+	// MaxCascadeDescendants caps DeleteOrganization / DeleteTeam in
+	// cluster mode. 0 = disabled (no cap; recommended for OSS / tests
+	// that don't care about the cap). Production wiring in
+	// cmd/arc/main.go reads cluster.rbac.max_cascade_descendants
+	// (default 50000) and passes it here. Phase A.2 Item 2.
+	MaxCascadeDescendants int
 }
 
 // NewRBACManager creates a new RBAC manager
@@ -134,7 +165,13 @@ func NewRBACManager(cfg *RBACManagerConfig) *RBACManager {
 		permCache:     make(map[permissionCacheKey]*permissionCacheEntry),
 		permCacheTTL:  cacheTTL,
 		maxCacheSize:  maxCacheSize,
-		done:          make(chan struct{}),
+		// Negative values normalise to 0 (disabled). The cap check is
+		// already gated on `> 0`, but normalising here keeps the field
+		// canonical so a future metric export or comparison can't
+		// surprise on "-1 means disabled" vs "0 means disabled."
+		// Gemini PR #459 round 3.
+		maxCascadeDescendants: max(0, cfg.MaxCascadeDescendants),
+		done:                  make(chan struct{}),
 	}
 
 	// Start background cache cleanup
@@ -482,6 +519,27 @@ func (rm *RBACManager) DeleteOrganization(ctx context.Context, id int64) error {
 		if org == nil {
 			return errors.New("organization not found")
 		}
+		// Phase A.2 Item 2: cascade-on-delete soft cap. Count the
+		// descendants in local SQLite; if the sum exceeds the cap,
+		// refuse with a clear operator error instead of letting the
+		// FSM apply block past the Raft heartbeat margin. cap == 0
+		// disables the check.
+		if rm.maxCascadeDescendants > 0 {
+			n, countErr := rm.countOrgCascadeDescendants(ctx, id)
+			if countErr != nil {
+				return fmt.Errorf("failed to count organization descendants: %w", countErr)
+			}
+			if n > rm.maxCascadeDescendants {
+				metrics.Get().IncClusterRBACCascadeRejected()
+				rm.logger.Warn().
+					Int64("organization_id", id).
+					Int("descendants", n).
+					Int("max_cascade_descendants", rm.maxCascadeDescendants).
+					Msg("DeleteOrganization refused: cascade exceeds configured limit")
+				return fmt.Errorf("%w: %d descendants under organization %d (max %d); delete child entities (teams, roles, measurement_permissions, token_memberships) first",
+					ErrCascadeCapExceeded, n, id, rm.maxCascadeDescendants)
+			}
+		}
 		payload := deleteOrganizationPayloadWire{ID: id}
 		if err := rm.proposeRBACCommand(ctx, ProposalCommandDeleteOrganization, payload); err != nil {
 			return fmt.Errorf("failed to delete organization: %w", err)
@@ -727,6 +785,25 @@ func (rm *RBACManager) DeleteTeam(ctx context.Context, id int64) error {
 		if team == nil {
 			return errors.New("team not found")
 		}
+		// Phase A.2 Item 2: cascade-on-delete soft cap. Same shape as
+		// DeleteOrganization. Team cascade is 3-level (roles +
+		// measurement_permissions + memberships).
+		if rm.maxCascadeDescendants > 0 {
+			n, countErr := rm.countTeamCascadeDescendants(ctx, id)
+			if countErr != nil {
+				return fmt.Errorf("failed to count team descendants: %w", countErr)
+			}
+			if n > rm.maxCascadeDescendants {
+				metrics.Get().IncClusterRBACCascadeRejected()
+				rm.logger.Warn().
+					Int64("team_id", id).
+					Int("descendants", n).
+					Int("max_cascade_descendants", rm.maxCascadeDescendants).
+					Msg("DeleteTeam refused: cascade exceeds configured limit")
+				return fmt.Errorf("%w: %d descendants under team %d (max %d); delete child entities (roles, measurement_permissions, token_memberships) first",
+					ErrCascadeCapExceeded, n, id, rm.maxCascadeDescendants)
+			}
+		}
 		payload := deleteTeamPayloadWire{ID: id}
 		if err := rm.proposeRBACCommand(ctx, ProposalCommandDeleteTeam, payload); err != nil {
 			return fmt.Errorf("failed to delete team: %w", err)
@@ -776,7 +853,14 @@ func (rm *RBACManager) CreateRole(ctx context.Context, teamID int64, req *Create
 	}
 
 	if rm.getProposer() != nil {
-		now := time.Now()
+		// nextProposerTimestamp instead of time.Now(): the round-9
+		// G28 read-back disambiguator matches on `created_at = now`,
+		// and two concurrent callers can collide at the same
+		// nanosecond on fast machines (race-detector-confirmed under
+		// 8-goroutine load). nextProposerTimestamp adds a monotonic
+		// counter offset so even simultaneous calls get distinct
+		// timestamps. Phase A.2 follow-up.
+		now := rm.nextProposerTimestamp()
 		perms := strings.Join(req.Permissions, ",")
 		payload := createRolePayloadWire{
 			Role: clusterRoleEntryWire{
@@ -1036,7 +1120,10 @@ func (rm *RBACManager) CreateMeasurementPermission(ctx context.Context, roleID i
 	}
 
 	if rm.getProposer() != nil {
-		now := time.Now()
+		// nextProposerTimestamp instead of time.Now() — same race fix
+		// as CreateRole; see comment there. Phase A.2 follow-up to PR
+		// #458 round 9 G29.
+		now := rm.nextProposerTimestamp()
 		perms := strings.Join(req.Permissions, ",")
 		payload := createMeasurementPermissionPayloadWire{
 			MeasurementPermission: clusterMeasurementPermissionEntryWire{
@@ -1949,4 +2036,135 @@ func readBackAfterPropose(ctx context.Context, scan func() error) error {
 		lastErr = err
 	}
 	return lastErr
+}
+
+// countOrgCascadeDescendants returns the total number of descendants
+// (teams + roles + measurement_permissions + token_memberships) under
+// the given organization id. Used by DeleteOrganization in cluster mode
+// to pre-check against maxCascadeDescendants before proposing — turning
+// a "FSM apply blocks past the Raft heartbeat margin" failure into a
+// clean 409 Conflict at the API. Phase A.2 Item 2.
+//
+// All four COUNTs run against local SQLite under the same ctx. The
+// nested IN subqueries lean on the existing per-table indexes:
+//   - rbac_teams(organization_id)
+//   - rbac_roles(team_id)
+//   - rbac_measurement_permissions(role_id)
+//   - rbac_token_memberships(team_id)
+//
+// At realistic cap values (default 50000) the four COUNTs together
+// finish in a few ms on local SQLite — well under the proposeTimeout.
+func (rm *RBACManager) countOrgCascadeDescendants(ctx context.Context, orgID int64) (int, error) {
+	var teams, roles, mperms, memberships int
+	if err := rm.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM rbac_teams WHERE organization_id = ?`,
+		orgID,
+	).Scan(&teams); err != nil {
+		return 0, fmt.Errorf("count teams: %w", err)
+	}
+	// JOIN shape (Gemini round 1 PR #459) measurably outperforms
+	// nested-IN at every fixture size we benched: 1.38x at small
+	// (~250 descendants), 1.27x at medium (~3.5k), 1.23x at large
+	// (~24k). Absolute cost stays sub-ms either way; readability is
+	// the other win.
+	if err := rm.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM rbac_roles r
+		JOIN rbac_teams t ON r.team_id = t.id
+		WHERE t.organization_id = ?
+	`, orgID).Scan(&roles); err != nil {
+		return 0, fmt.Errorf("count roles: %w", err)
+	}
+	if err := rm.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM rbac_measurement_permissions mp
+		JOIN rbac_roles r ON mp.role_id = r.id
+		JOIN rbac_teams t ON r.team_id = t.id
+		WHERE t.organization_id = ?
+	`, orgID).Scan(&mperms); err != nil {
+		return 0, fmt.Errorf("count measurement_permissions: %w", err)
+	}
+	if err := rm.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM rbac_token_memberships tm
+		JOIN rbac_teams t ON tm.team_id = t.id
+		WHERE t.organization_id = ?
+	`, orgID).Scan(&memberships); err != nil {
+		return 0, fmt.Errorf("count token_memberships: %w", err)
+	}
+	return teams + roles + mperms + memberships, nil
+}
+
+// countTeamCascadeDescendants returns the total descendants under the
+// given team id (roles + measurement_permissions + memberships). The
+// DeleteTeam cascade is 3-level (no parent org rebase). Phase A.2 Item 2.
+func (rm *RBACManager) countTeamCascadeDescendants(ctx context.Context, teamID int64) (int, error) {
+	var roles, mperms, memberships int
+	if err := rm.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM rbac_roles WHERE team_id = ?`,
+		teamID,
+	).Scan(&roles); err != nil {
+		return 0, fmt.Errorf("count roles: %w", err)
+	}
+	if err := rm.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM rbac_measurement_permissions mp
+		JOIN rbac_roles r ON mp.role_id = r.id
+		WHERE r.team_id = ?
+	`, teamID).Scan(&mperms); err != nil {
+		return 0, fmt.Errorf("count measurement_permissions: %w", err)
+	}
+	if err := rm.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM rbac_token_memberships WHERE team_id = ?`,
+		teamID,
+	).Scan(&memberships); err != nil {
+		return 0, fmt.Errorf("count token_memberships: %w", err)
+	}
+	return roles + mperms + memberships, nil
+}
+
+// ErrCascadeCapExceeded is the sentinel returned by DeleteOrganization
+// and DeleteTeam (cluster mode) when the local descendant count exceeds
+// rm.maxCascadeDescendants. HTTP handlers detect this via errors.Is and
+// map it to 409 Conflict. Phase A.2 Item 2.
+var ErrCascadeCapExceeded = errors.New("cascade exceeds configured limit")
+
+// nextProposerTimestamp returns a time.Time that is guaranteed to be
+// strictly increasing across concurrent callers within a single
+// RBACManager process — even when time.Now() collides at the same
+// nanosecond under heavy concurrency. Used by Create<X> RBAC paths
+// that lack a schema-level UNIQUE constraint on (parent_id, key,
+// value) and rely on `created_at = proposer's now` to disambiguate
+// the read-back across concurrent identical creates.
+//
+// Mechanism: CAS loop on proposerNowUnixNano. Each call computes
+// max(prev+1, time.Now().UnixNano()) and tries to CAS it into the
+// shared counter; on contention it retries with the freshly-read
+// prev. This is strictly monotonic by construction: every successful
+// CAS writes a value greater than the previous load, and the loaded
+// value seen by any later caller is at least that. Under low
+// concurrency the returned value equals wall-clock time.Now(); under
+// heavy concurrency it can drift forward by 1ns per colliding caller,
+// which is fine — `created_at` is "when the proposer issued this
+// command," not "exact wall clock."
+//
+// The returned time is always in UTC. SQLite serialises time.Time
+// values via the driver's TimeZone-aware text encoder; a proposer
+// node and an applier-side read-back running with different local
+// timezones would produce different text representations of the same
+// instant, and the `created_at = ?` match would fall through. UTC
+// removes the variable so cross-node and cross-process matches are
+// byte-identical. (Gemini round 1 PR #459.)
+//
+// Phase A.2 follow-up to PR #458 round 9 G28: the original fix
+// (matching readback on `created_at = time.Now()`) raced under
+// concurrent identical CreateRole calls on fast machines.
+func (rm *RBACManager) nextProposerTimestamp() time.Time {
+	for {
+		prev := rm.proposerNowUnixNano.Load()
+		now := time.Now().UnixNano()
+		next := now
+		if prev >= next {
+			next = prev + 1
+		}
+		if rm.proposerNowUnixNano.CompareAndSwap(prev, next) {
+			return time.Unix(0, next).UTC()
+		}
+	}
 }
