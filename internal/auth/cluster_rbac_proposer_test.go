@@ -838,12 +838,18 @@ func TestOSS_RBACWrites_StampUTC(t *testing.T) {
 	if err := rm.UpdateTeam(ctx, team.ID, &UpdateTeamRequest{Description: &newDesc}); err != nil {
 		t.Fatalf("UpdateTeam: %v", err)
 	}
-	gotOrg, _ := rm.GetOrganization(org.ID)
-	if gotOrg != nil && gotOrg.UpdatedAt.Location() != time.UTC {
+	gotOrg, err := rm.GetOrganization(org.ID)
+	if err != nil {
+		t.Fatalf("GetOrganization: %v", err)
+	}
+	if gotOrg.UpdatedAt.Location() != time.UTC {
 		t.Errorf("UpdateOrganization.UpdatedAt: want UTC, got %s", gotOrg.UpdatedAt.Location())
 	}
-	gotTeam, _ := rm.GetTeam(team.ID)
-	if gotTeam != nil && gotTeam.UpdatedAt.Location() != time.UTC {
+	gotTeam, err := rm.GetTeam(team.ID)
+	if err != nil {
+		t.Fatalf("GetTeam: %v", err)
+	}
+	if gotTeam.UpdatedAt.Location() != time.UTC {
 		t.Errorf("UpdateTeam.UpdatedAt: want UTC, got %s", gotTeam.UpdatedAt.Location())
 	}
 }
