@@ -102,12 +102,24 @@ func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
 	// non-canonical keys leaking through. Canonicalising defensively
 	// also matches CopyResponse's behavior (Go's http.Header map keys
 	// are always canonical-cased).
+	// Direct map-write (rather than req.Header.Add) bypasses Add's
+	// internal CanonicalHeaderKey re-canonicalisation — k is already
+	// canonical from the line above, so re-canonicalising would be a
+	// wasted string scan + allocation per header.
+	//
+	// Host filter: net/http's Request.Write skips the Host header in the
+	// header map and writes Host from req.Host instead (req.go's
+	// reqWriteExcludeHeader), so leaving it in req.Header doesn't leak
+	// it onto the wire — but other code (middleware, logging, custom
+	// transports) that reads req.Header.Get("Host") would see the
+	// upstream client's Host instead of the target peer's. Filtering
+	// keeps the request struct's two notions of "host" consistent.
 	c.Request().Header.VisitAll(func(key, value []byte) {
 		k := http.CanonicalHeaderKey(string(key))
-		if isHopByHop(k) || k == "Content-Length" {
+		if isHopByHop(k) || k == "Content-Length" || k == "Host" {
 			return
 		}
-		req.Header.Add(k, string(value))
+		req.Header[k] = append(req.Header[k], string(value))
 	})
 
 	// Set remote address for X-Forwarded-For handling in router

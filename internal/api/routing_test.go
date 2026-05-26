@@ -166,6 +166,13 @@ func TestBuildHTTPRequest_FiltersHopByHopAndContentLength(t *testing.T) {
 	req.Header.Set("Te", "trailers")
 	req.Header.Set("Trailers", "X-End-Of-Stream")
 	req.Header.Set("Upgrade", "h2c")
+	// Host filter (round 5): the upstream client's Host header would
+	// shadow the target peer's req.Host for any middleware that reads
+	// req.Header.Get("Host") instead of req.Host. Note: httptest sets
+	// req.Host directly from the URL; we set the header via req.Header
+	// to simulate what fasthttp's VisitAll would emit for an incoming
+	// HTTP request with an explicit Host header.
+	req.Header.Set("Host", "original-client.example.com")
 
 	// End-to-end headers that MUST pass through.
 	req.Header.Set("Content-Type", "application/json")
@@ -184,6 +191,7 @@ func TestBuildHTTPRequest_FiltersHopByHopAndContentLength(t *testing.T) {
 	hopByHopFiltered := []string{
 		"Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
 		"Te", "Trailers", "Upgrade",
+		"Host", // round 5: filtered to keep req.Header consistent with req.Host
 	}
 	for _, h := range hopByHopFiltered {
 		assert.Empty(t, captured.Get(h),
