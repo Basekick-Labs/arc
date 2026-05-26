@@ -2559,13 +2559,24 @@ func main() {
 	// In-flight requests that arrived BEFORE MarkNotReady drain via Fiber's
 	// normal shutdown handling — they complete; only NEW requests get
 	// rejected by the LB once it observes the 503.
-	const readyDrainGrace = 10 * time.Second
+	// Drain grace: 10s in clustered mode gives the LB one poll cycle to
+	// observe /ready=503 and stop routing before the listener closes.
+	// In standalone mode there's no LB / no peer cluster — the grace
+	// just delays every shutdown for no benefit (local dev, integration
+	// tests). Skip it entirely. (Gemini PR #463 round 6.)
+	readyDrainGrace := 10 * time.Second
+	if !cfg.Cluster.Enabled {
+		readyDrainGrace = 0
+	}
 	shutdownCoordinator.RegisterHook("ready-flag-off", func(ctx context.Context) error {
 		server.MarkNotReady()
+		if readyDrainGrace == 0 {
+			return nil
+		}
 		// time.NewTimer + defer Stop instead of time.After: if ctx.Done
 		// wins the select, time.After would leak the underlying timer
-		// until the 10s deadline expires. Bounded leak in a shutdown
-		// hook, but using the standard idiom anyway.
+		// until the deadline expires. Bounded leak in a shutdown hook,
+		// but using the standard idiom anyway.
 		timer := time.NewTimer(readyDrainGrace)
 		defer timer.Stop()
 		select {

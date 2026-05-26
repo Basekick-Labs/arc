@@ -138,6 +138,11 @@ func TestIsPrimaryWriter_SharedStorageMode_RaftNotStarted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("raft.NewNode: %v", err)
 	}
+	// Defensive: Stop is a no-op when n.running is false (Start was
+	// never called and no BoltDB stores / listener exist yet), so this
+	// holds no resources today. Adding the defer future-proofs against
+	// a refactor that adds Start() to the test. (Gemini PR #463 round 6.)
+	defer func() { _ = raftNode.Stop() }()
 
 	c := &Coordinator{
 		cfg: &config.ClusterConfig{
@@ -222,6 +227,9 @@ func TestIsPrimaryWriter_SharedStorageMode_NonWriterLeaderRejected(t *testing.T)
 			if err != nil {
 				t.Fatalf("raft.NewNode: %v", err)
 			}
+			// Defensive: see TestIsPrimaryWriter_SharedStorageMode_RaftNotStarted.
+			// (Gemini PR #463 round 6.)
+			defer func() { _ = raftNode.Stop() }()
 
 			c := &Coordinator{
 				cfg: &config.ClusterConfig{
