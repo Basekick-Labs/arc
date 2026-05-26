@@ -183,13 +183,13 @@ func TestIsLoopbackBindAddr(t *testing.T) {
 		"127.0.0.5:6060",
 	}
 	nonLoopback := []string{
-		":6060",                // wildcard
-		"0.0.0.0:6060",         // v4 wildcard
-		"[::]:6060",            // v6 wildcard
-		"192.168.1.5:6060",     // LAN
-		"10.0.0.1:6060",        // RFC 1918
-		"example.com:6060",     // unresolved hostname — fail-closed
-		"not-a-valid-addr",     // SplitHostPort fails — fail-closed
+		":6060",            // wildcard
+		"0.0.0.0:6060",     // v4 wildcard
+		"[::]:6060",        // v6 wildcard
+		"192.168.1.5:6060", // LAN
+		"10.0.0.1:6060",    // RFC 1918
+		"example.com:6060", // unresolved hostname — fail-closed
+		"not-a-valid-addr", // SplitHostPort fails — fail-closed
 	}
 	for _, s := range loopback {
 		if !isLoopbackBindAddr(s) {
