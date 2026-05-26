@@ -2562,8 +2562,14 @@ func main() {
 	const readyDrainGrace = 10 * time.Second
 	shutdownCoordinator.RegisterHook("ready-flag-off", func(ctx context.Context) error {
 		server.MarkNotReady()
+		// time.NewTimer + defer Stop instead of time.After: if ctx.Done
+		// wins the select, time.After would leak the underlying timer
+		// until the 10s deadline expires. Bounded leak in a shutdown
+		// hook, but using the standard idiom anyway.
+		timer := time.NewTimer(readyDrainGrace)
+		defer timer.Stop()
 		select {
-		case <-time.After(readyDrainGrace):
+		case <-timer.C:
 		case <-ctx.Done():
 			// Coordinator timeout — yield immediately so http-server hook
 			// can still run within the remaining budget. Better an

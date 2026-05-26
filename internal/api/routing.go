@@ -61,8 +61,15 @@ func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
 	copy(bodyCopy, src)
 	body := bytes.NewReader(bodyCopy)
 
-	// Create HTTP request with context
-	req, err := http.NewRequestWithContext(c.Context(), c.Method(), url, body)
+	// Create HTTP request with context. UserContext (not Context) for the
+	// same fasthttp pool-lifecycle reason as the body copy above —
+	// c.Context() returns *fasthttp.RequestCtx, which is pooled and
+	// recycled when the handler returns. The HTTP client's transport may
+	// reference the context for cancellation, deadline propagation, or
+	// value lookup after the handler has returned (connection pooling,
+	// background reads, retries). c.UserContext() returns a plain
+	// context.Context that is safe to propagate to net/http.
+	req, err := http.NewRequestWithContext(c.UserContext(), c.Method(), url, body)
 	if err != nil {
 		return nil, err
 	}
@@ -70,8 +77,14 @@ func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
 	// Copy all headers from Fiber request. The string(key) / string(value)
 	// conversions copy the bytes (Go string-from-byte-slice is a copy), so
 	// the http.Header map retains independent allocations.
+	//
+	// Add (not Set) preserves multi-value headers: fasthttp emits a
+	// separate VisitAll call per value even for the same key, so Set
+	// would overwrite earlier values and only the last would forward.
+	// Affects multiple Cookie, Accept, Accept-Language, X-Forwarded-For,
+	// and similar multi-valued headers.
 	c.Request().Header.VisitAll(func(key, value []byte) {
-		req.Header.Set(string(key), string(value))
+		req.Header.Add(string(key), string(value))
 	})
 
 	// Set remote address for X-Forwarded-For handling in router
