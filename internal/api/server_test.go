@@ -136,6 +136,7 @@ func TestReadyHandler_StartsNotReady(t *testing.T) {
 	if err != nil {
 		t.Fatalf("/ready Test failed: %v", err)
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != 503 {
 		t.Errorf("freshly constructed Server /ready status = %d; want 503 (startup not complete)", resp.StatusCode)
 	}
@@ -159,6 +160,7 @@ func TestReadyHandler_MarkReadyFlipsTo200(t *testing.T) {
 	if err != nil {
 		t.Fatalf("/ready Test failed: %v", err)
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Errorf("after MarkReady() /ready status = %d; want 200", resp.StatusCode)
 	}
@@ -186,6 +188,7 @@ func TestReadyHandler_MarkNotReadyDrainsLB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("/ready Test failed: %v", err)
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != 503 {
 		t.Errorf("after MarkNotReady() /ready status = %d; want 503 (drain signal)", resp.StatusCode)
 	}
@@ -207,9 +210,11 @@ func TestHealthHandler_AlwaysOK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("/health Test (pre-ready) failed: %v", err)
 	}
+	// Explicit Close instead of defer: resp is reassigned below.
 	if resp.StatusCode != 200 {
 		t.Errorf("pre-MarkReady /health status = %d; want 200 (liveness != readiness)", resp.StatusCode)
 	}
+	resp.Body.Close()
 
 	// After MarkNotReady (graceful shutdown): /health is still 200.
 	s.MarkReady()
@@ -219,6 +224,7 @@ func TestHealthHandler_AlwaysOK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("/health Test (post-drain) failed: %v", err)
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Errorf("post-MarkNotReady /health status = %d; want 200 (liveness != readiness)", resp.StatusCode)
 	}

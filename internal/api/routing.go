@@ -34,13 +34,32 @@ func isHopByHop(header string) bool {
 
 // BuildHTTPRequest converts a Fiber context to a net/http Request for forwarding via the router.
 // It copies the method, URL, body, and headers from the Fiber request.
+//
+// The body is **defensively copied** before being wrapped in a bytes.Reader.
+// c.Body() returns a slice owned by fasthttp's request-context buffer pool;
+// that slice is recycled once the Fiber handler returns. http.Client.Do
+// usually reads the body synchronously inside its own call (so the handler
+// is still on the stack), but request retries, chunked transfer encoding,
+// or TCP backpressure can stretch the read into a window after the handler
+// returns — at which point the underlying bytes are reused for the next
+// request and the forwarded body silently corrupts. The other Arc
+// ingestion handlers (msgpack.go, lineprotocol.go, tle.go) all defensively
+// copy via decompressRequest for the same reason; routing.go is now
+// consistent with them. The cost is one allocation per forwarded request,
+// which is negligible compared to the cross-node HTTP round-trip already
+// in flight.
 func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
 	// Build full URL from Fiber context
 	// c.BaseURL() returns scheme://host, c.OriginalURL() returns path + query
 	url := c.BaseURL() + c.OriginalURL()
 
-	// Read body - use a bytes.Reader for the body to allow retries in the router
-	body := bytes.NewReader(c.Body())
+	// Defensive copy: c.Body() is a reference into fasthttp's pool-managed
+	// request buffer and is invalidated when the handler returns. The HTTP
+	// client may still be reading the body when that happens.
+	src := c.Body()
+	bodyCopy := make([]byte, len(src))
+	copy(bodyCopy, src)
+	body := bytes.NewReader(bodyCopy)
 
 	// Create HTTP request with context
 	req, err := http.NewRequestWithContext(c.Context(), c.Method(), url, body)
@@ -48,7 +67,9 @@ func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
 		return nil, err
 	}
 
-	// Copy all headers from Fiber request
+	// Copy all headers from Fiber request. The string(key) / string(value)
+	// conversions copy the bytes (Go string-from-byte-slice is a copy), so
+	// the http.Header map retains independent allocations.
 	c.Request().Header.VisitAll(func(key, value []byte) {
 		req.Header.Set(string(key), string(value))
 	})
