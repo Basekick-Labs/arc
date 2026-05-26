@@ -111,12 +111,16 @@ func TestBuildHTTPRequest_PreservesMultiValueHeaders(t *testing.T) {
 	defer resp.Body.Close()
 	require.Equal(t, fiber.StatusOK, resp.StatusCode)
 
-	assert.ElementsMatch(t,
+	// Equal (not ElementsMatch): order matters for X-Forwarded-For and
+	// Via — each represents the sequential path of proxy hops, with
+	// leftmost = original client. Reordering corrupts rate-limit /
+	// geo / audit trails downstream. (Gemini PR #463 round 7.)
+	assert.Equal(t,
 		[]string{"203.0.113.1", "198.51.100.7", "192.0.2.42"}, capturedXFF,
-		"X-Forwarded-For multi-value header was not preserved. Did Set replace Add?")
-	assert.ElementsMatch(t,
+		"X-Forwarded-For values not preserved in chain order")
+	assert.Equal(t,
 		[]string{"1.1 proxy1.example.com", "1.1 proxy2.example.com"}, capturedVia,
-		"Via multi-value header was not preserved. Did Set replace Add?")
+		"Via values not preserved in chain order")
 }
 
 // TestBuildHTTPRequest_FiltersHopByHopAndContentLength pins the
