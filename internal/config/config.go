@@ -433,6 +433,29 @@ type ClusterConfig struct {
 	// who know their workload). DeleteRole's cascade is 1-level (only
 	// measurement_permissions) and is not capped.
 	RBACMaxCascadeDescendants int // (default: 50000; 0 = disabled)
+
+	// SharedStorageMode enables Pattern 2 multi-writer deployments —
+	// multiple RoleWriter nodes sharing a single object-storage backend
+	// (S3, Azure Blob, MinIO) behind a load balancer. When true:
+	//   - Writer-failover health-check loop is suppressed (no
+	//     primary/standby distinction; LB does failover via retry).
+	//   - IsPrimaryWriter() returns "is Raft leader" instead of
+	//     singleton-writer semantics, so singleton background tasks
+	//     (retention, CQ, delete, reconciliation) run on whichever
+	//     node currently holds the cluster Raft leadership.
+	//   - WAL replays un-flushed entries on writer restart for crash
+	//     recovery (S3 PUTs are durable; only in-memory buffer is at
+	//     risk on a writer crash).
+	//   - Startup refuses if storage backend is local-filesystem;
+	//     refuses if licenseClient.CanUseSharedStorageMultiWriter()
+	//     is false. Requires FeatureSharedStorageMultiWriter license.
+	//
+	// Default false: today's single-writer-per-cluster behavior. Single
+	// writer pointed at S3 continues to work unchanged with this flag
+	// false (the flag only matters for N>1 writers).
+	//
+	// See docs/progress/2026-05-26-multi-writer-pattern2.md.
+	SharedStorageMode bool
 }
 
 // Load loads configuration from environment and config file
@@ -690,6 +713,9 @@ func Load() (*Config, error) {
 			TLSCAFile:    v.GetString("cluster.tls_ca_file"),
 			// RBAC cascade-on-delete soft cap (Phase A.2 Item 2)
 			RBACMaxCascadeDescendants: v.GetInt("cluster.rbac.max_cascade_descendants"),
+
+			// Pattern 2 multi-writer (Phase A PR 1)
+			SharedStorageMode: v.GetBool("cluster.shared_storage_mode"),
 		},
 		TieredStorage: TieredStorageConfig{
 			Enabled:                v.GetBool("tiered_storage.enabled"),
@@ -979,6 +1005,12 @@ func setDefaults(v *viper.Viper) {
 	// the runFSM apply duration well clear of the Raft heartbeat
 	// margin. Set to 0 to disable.
 	v.SetDefault("cluster.rbac.max_cascade_descendants", 50000)
+
+	// Pattern 2 multi-writer (Phase A PR 1). Default false: single-writer
+	// behavior. Flip to true to allow N RoleWriter nodes sharing one
+	// object-storage backend. See ClusterConfig.SharedStorageMode for
+	// the full semantic change.
+	v.SetDefault("cluster.shared_storage_mode", false)
 
 	// Tiered storage defaults (Enterprise feature)
 	// Simple 2-tier system: Hot (local) -> Cold (S3/Azure archive)

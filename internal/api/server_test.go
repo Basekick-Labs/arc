@@ -1,6 +1,9 @@
 package api
 
 import (
+	"io"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -112,5 +115,111 @@ func TestServerCapturesHostFromConfig(t *testing.T) {
 				t.Errorf("Server.host = %q; want %q (NewServer dropped Host on the floor)", s.host, tc.host)
 			}
 		})
+	}
+}
+
+// TestReadyHandler_StartsNotReady pins the readiness contract: a freshly
+// constructed Server returns /ready=503 until MarkReady() is called. This
+// is load-bearing for Pattern 2 shared-storage multi-writer mode — the
+// load balancer must NOT route writes to a writer that hasn't finished
+// WAL recovery (cmd/arc/main.go:701-724), and the same gate also protects
+// single-writer deployments behind Kubernetes readiness probes from
+// receiving traffic during startup.
+//
+// See internal/api/server.go::readyHandler for the contract.
+func TestReadyHandler_StartsNotReady(t *testing.T) {
+	s := NewServer(&ServerConfig{Port: 0, MaxPayloadSize: 1024}, zerolog.Nop())
+	s.RegisterRoutes()
+
+	req := httptest.NewRequest("GET", "/ready", nil)
+	resp, err := s.app.Test(req)
+	if err != nil {
+		t.Fatalf("/ready Test failed: %v", err)
+	}
+	if resp.StatusCode != 503 {
+		t.Errorf("freshly constructed Server /ready status = %d; want 503 (startup not complete)", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "not_ready") {
+		t.Errorf("/ready body before MarkReady() = %q; want substring \"not_ready\"", string(body))
+	}
+}
+
+// TestReadyHandler_MarkReadyFlipsTo200 pins the flip from 503 to 200 once
+// MarkReady() is called. main.go invokes this after WAL recovery completes
+// and all background work is initialised — the load balancer then sees
+// /ready=200 and starts routing traffic.
+func TestReadyHandler_MarkReadyFlipsTo200(t *testing.T) {
+	s := NewServer(&ServerConfig{Port: 0, MaxPayloadSize: 1024}, zerolog.Nop())
+	s.RegisterRoutes()
+	s.MarkReady()
+
+	req := httptest.NewRequest("GET", "/ready", nil)
+	resp, err := s.app.Test(req)
+	if err != nil {
+		t.Fatalf("/ready Test failed: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Errorf("after MarkReady() /ready status = %d; want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "\"status\":\"ready\"") {
+		t.Errorf("/ready body after MarkReady() = %q; want substring \"status\":\"ready\"", string(body))
+	}
+}
+
+// TestReadyHandler_MarkNotReadyDrainsLB pins the graceful-shutdown
+// contract: MarkNotReady() must flip /ready back to 503 so the load
+// balancer drains the node BEFORE the HTTP listener actually closes.
+// main.go registers this as priority 5 (lower than PriorityHTTPServer=10)
+// so it fires first in the shutdown sequence.
+func TestReadyHandler_MarkNotReadyDrainsLB(t *testing.T) {
+	s := NewServer(&ServerConfig{Port: 0, MaxPayloadSize: 1024}, zerolog.Nop())
+	s.RegisterRoutes()
+
+	// Simulate the normal startup → traffic → graceful-shutdown sequence.
+	s.MarkReady()
+	s.MarkNotReady()
+
+	req := httptest.NewRequest("GET", "/ready", nil)
+	resp, err := s.app.Test(req)
+	if err != nil {
+		t.Fatalf("/ready Test failed: %v", err)
+	}
+	if resp.StatusCode != 503 {
+		t.Errorf("after MarkNotReady() /ready status = %d; want 503 (drain signal)", resp.StatusCode)
+	}
+}
+
+// TestHealthHandler_AlwaysOK pins that /health (liveness) stays 200
+// regardless of the ready flag. Operators check /health for "is the
+// process alive" and /ready for "should requests go here." Conflating
+// the two would mean a graceful shutdown that flips /ready=503 would
+// also flip /health=503, causing Kubernetes liveness probes to kill
+// the pod mid-drain.
+func TestHealthHandler_AlwaysOK(t *testing.T) {
+	s := NewServer(&ServerConfig{Port: 0, MaxPayloadSize: 1024}, zerolog.Nop())
+	s.RegisterRoutes()
+
+	// Before MarkReady (mid-startup): /health is still 200.
+	req := httptest.NewRequest("GET", "/health", nil)
+	resp, err := s.app.Test(req)
+	if err != nil {
+		t.Fatalf("/health Test (pre-ready) failed: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Errorf("pre-MarkReady /health status = %d; want 200 (liveness != readiness)", resp.StatusCode)
+	}
+
+	// After MarkNotReady (graceful shutdown): /health is still 200.
+	s.MarkReady()
+	s.MarkNotReady()
+	req = httptest.NewRequest("GET", "/health", nil)
+	resp, err = s.app.Test(req)
+	if err != nil {
+		t.Fatalf("/health Test (post-drain) failed: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Errorf("post-MarkNotReady /health status = %d; want 200 (liveness != readiness)", resp.StatusCode)
 	}
 }
