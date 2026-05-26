@@ -119,6 +119,88 @@ func TestBuildHTTPRequest_PreservesMultiValueHeaders(t *testing.T) {
 		"Via multi-value header was not preserved. Did Set replace Add?")
 }
 
+// TestBuildHTTPRequest_FiltersHopByHopAndContentLength pins the
+// RFC 7230 §6.1 hop-by-hop filter on the request-forwarding path.
+// Connection-specific headers (Connection, Keep-Alive, Proxy-Auth*,
+// Te, Trailers, Transfer-Encoding, Upgrade) MUST NOT be forwarded
+// by intermediaries — they describe the upstream connection, not
+// end-to-end semantics. Forwarding them produces protocol violations
+// (e.g. a Transfer-Encoding: chunked header copied onto a request
+// the Go HTTP client is sending with a known Content-Length).
+//
+// Content-Length is filtered separately because net/http sets
+// req.ContentLength from the body (*bytes.Reader knows its length)
+// and writes the header from that field. Forwarding the upstream
+// Content-Length would either duplicate the header on the wire or
+// send a stale value if the body was somehow transformed.
+//
+// CopyResponse already filters these on the response path via the
+// same isHopByHop helper; this test pins that the request path now
+// does the same. Headers that should pass through (Authorization,
+// Content-Type, X-Custom-*, X-Arc-Database) are also asserted.
+func TestBuildHTTPRequest_FiltersHopByHopAndContentLength(t *testing.T) {
+	app := fiber.New()
+
+	var captured http.Header
+
+	app.Post("/test", func(c *fiber.Ctx) error {
+		req, err := BuildHTTPRequest(c)
+		require.NoError(t, err)
+		captured = req.Header
+		return c.SendStatus(fiber.StatusOK)
+	})
+
+	req := httptest.NewRequest("POST", "/test", nil)
+	// Hop-by-hop headers that MUST be filtered.
+	// Note: Transfer-Encoding and Content-Length are not set via
+	// req.Header.Set because Go's httptest validates protocol
+	// consistency on the test request — setting them on a nil body
+	// produces "unexpected EOF". The filter is exercised via the
+	// other hop-by-hop headers; Transfer-Encoding and Content-Length
+	// filtering is verified by code inspection (same isHopByHop map +
+	// explicit Content-Length string comparison in the filter).
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Keep-Alive", "timeout=5, max=1000")
+	req.Header.Set("Proxy-Authenticate", "Basic realm=\"proxy\"")
+	req.Header.Set("Proxy-Authorization", "Basic Zm9vOmJhcg==")
+	req.Header.Set("Te", "trailers")
+	req.Header.Set("Trailers", "X-End-Of-Stream")
+	req.Header.Set("Upgrade", "h2c")
+
+	// End-to-end headers that MUST pass through.
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer token123")
+	req.Header.Set("X-Arc-Database", "production")
+	req.Header.Set("X-Custom-Trace-Id", "abc-123")
+
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
+	// Hop-by-hop headers must NOT appear in the forwarded request.
+	// (Transfer-Encoding + Content-Length filtering verified by code
+	// inspection — see note above on httptest validation.)
+	hopByHopFiltered := []string{
+		"Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
+		"Te", "Trailers", "Upgrade",
+	}
+	for _, h := range hopByHopFiltered {
+		assert.Empty(t, captured.Get(h),
+			"%s should be filtered from forwarded request (hop-by-hop per RFC 7230 §6.1 / managed by net/http)", h)
+	}
+
+	// End-to-end headers must pass through.
+	assert.Equal(t, "application/json", captured.Get("Content-Type"),
+		"Content-Type (end-to-end) should pass through")
+	assert.Equal(t, "Bearer token123", captured.Get("Authorization"),
+		"Authorization (end-to-end) should pass through")
+	assert.Equal(t, "production", captured.Get("X-Arc-Database"),
+		"X-Arc-Database (Arc-internal routing header) should pass through")
+	assert.Equal(t, "abc-123", captured.Get("X-Custom-Trace-Id"),
+		"X-Custom-Trace-Id (custom end-to-end header) should pass through")
+}
+
 func TestCopyResponse(t *testing.T) {
 	app := fiber.New()
 

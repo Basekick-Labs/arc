@@ -74,17 +74,40 @@ func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
 		return nil, err
 	}
 
-	// Copy all headers from Fiber request. The string(key) / string(value)
-	// conversions copy the bytes (Go string-from-byte-slice is a copy), so
-	// the http.Header map retains independent allocations.
+	// Copy headers from Fiber request, filtering connection-specific
+	// (hop-by-hop) headers + Content-Length per RFC 7230 §6.1.
+	//
+	// Filtered headers:
+	//   - hop-by-hop set (Connection, Keep-Alive, Proxy-Authenticate,
+	//     Proxy-Authorization, Te, Trailers, Transfer-Encoding,
+	//     Upgrade): these are connection-specific and MUST NOT be
+	//     forwarded by intermediaries. CopyResponse already filters
+	//     them on the response path via the same isHopByHop helper;
+	//     the request path was missing this filter.
+	//   - Content-Length: net/http sets req.ContentLength from the
+	//     body (it knows the body is *bytes.Reader and gets its
+	//     length), then writes Content-Length on the wire from
+	//     ContentLength. Forwarding a Content-Length from the
+	//     upstream header would duplicate the header or send a stale
+	//     value mismatched with the actual body size.
 	//
 	// Add (not Set) preserves multi-value headers: fasthttp emits a
-	// separate VisitAll call per value even for the same key, so Set
-	// would overwrite earlier values and only the last would forward.
-	// Affects Via, X-Forwarded-For, Accept (multiple content types),
-	// Accept-Language, and similar multi-valued headers.
+	// separate VisitAll callback per value, so Set would overwrite
+	// earlier values and only the last would forward. Affects Via,
+	// X-Forwarded-For, Accept (multiple content types), and similar.
+	//
+	// http.CanonicalHeaderKey before isHopByHop lookup: fasthttp
+	// normalises header keys to canonical form by default, but a
+	// future config change or fasthttp behavior shift could leave
+	// non-canonical keys leaking through. Canonicalising defensively
+	// also matches CopyResponse's behavior (Go's http.Header map keys
+	// are always canonical-cased).
 	c.Request().Header.VisitAll(func(key, value []byte) {
-		req.Header.Add(string(key), string(value))
+		k := http.CanonicalHeaderKey(string(key))
+		if isHopByHop(k) || k == "Content-Length" {
+			return
+		}
+		req.Header.Add(k, string(value))
 	})
 
 	// Set remote address for X-Forwarded-For handling in router
