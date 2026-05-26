@@ -32,44 +32,44 @@ func isHopByHop(header string) bool {
 	return hopByHopHeaders[header]
 }
 
-// BuildHTTPRequest converts a Fiber context to a net/http Request for forwarding via the router.
-// It copies the method, URL, body, and headers from the Fiber request.
+// BuildHTTPRequest converts a Fiber context to a net/http Request for
+// forwarding via the router.
 //
-// The body is **defensively copied** before being wrapped in a bytes.Reader.
-// c.Body() returns a slice owned by fasthttp's request-context buffer pool;
-// that slice is recycled once the Fiber handler returns. http.Client.Do
-// usually reads the body synchronously inside its own call (so the handler
-// is still on the stack), but request retries, chunked transfer encoding,
-// or TCP backpressure can stretch the read into a window after the handler
-// returns — at which point the underlying bytes are reused for the next
-// request and the forwarded body silently corrupts. The other Arc
-// ingestion handlers (msgpack.go, lineprotocol.go, tle.go) all defensively
-// copy via decompressRequest for the same reason; routing.go is now
-// consistent with them. The cost is one allocation per forwarded request,
-// which is negligible compared to the cross-node HTTP round-trip already
-// in flight.
+// Lifecycle: every caller in this codebase (lineprotocol.go, msgpack.go,
+// tle.go, query.go, routing.go's RouteShardedWrite/Query) invokes the
+// returned *http.Request synchronously within the Fiber handler — they
+// pass it to router.RouteWrite/RouteQuery (which blocks on
+// http.Client.Do, and internally already buffers the body via io.ReadAll
+// for retry support, see internal/cluster/router.go forwardRequest) or
+// to shardRouter.RouteWrite/RouteQuery, then read+close the response
+// body inside CopyResponse, then return. fasthttp does not recycle the
+// RequestCtx until after the handler returns (fasthttp server.go
+// releaseCtx is post-handler), so wrapping c.Body() in bytes.NewReader
+// directly is safe and avoids a copy that can be large at max payload
+// (up to 1GB). Using c.Context() (returns *fasthttp.RequestCtx which
+// implements context.Context) is also correct here — it propagates
+// client-disconnect cancellation to the forwarded request, which
+// c.UserContext() (returns context.Background()) does NOT.
+//
+// If a future refactor moves any of this work to a background goroutine
+// or stream writer, those properties no longer hold and the caller
+// must take a defensive copy + use a non-pooled context. Today's
+// callers are all synchronous; revisit this if that changes.
 func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
 	// Build full URL from Fiber context
 	// c.BaseURL() returns scheme://host, c.OriginalURL() returns path + query
 	url := c.BaseURL() + c.OriginalURL()
 
-	// Defensive copy: c.Body() is a reference into fasthttp's pool-managed
-	// request buffer and is invalidated when the handler returns. The HTTP
-	// client may still be reading the body when that happens.
-	src := c.Body()
-	bodyCopy := make([]byte, len(src))
-	copy(bodyCopy, src)
-	body := bytes.NewReader(bodyCopy)
+	// Wrap fasthttp's body slice directly — synchronous-handler lifecycle
+	// argument above. Router.forwardRequest then io.ReadAll's it into its
+	// own buffer for retry support before issuing http.Client.Do.
+	body := bytes.NewReader(c.Body())
 
-	// Create HTTP request with context. UserContext (not Context) for the
-	// same fasthttp pool-lifecycle reason as the body copy above —
-	// c.Context() returns *fasthttp.RequestCtx, which is pooled and
-	// recycled when the handler returns. The HTTP client's transport may
-	// reference the context for cancellation, deadline propagation, or
-	// value lookup after the handler has returned (connection pooling,
-	// background reads, retries). c.UserContext() returns a plain
-	// context.Context that is safe to propagate to net/http.
-	req, err := http.NewRequestWithContext(c.UserContext(), c.Method(), url, body)
+	// c.Context() propagates client-disconnect cancellation to the
+	// forwarded request (so the backend stops processing if the original
+	// client gave up). c.UserContext() would default to context.Background
+	// and lose that signal.
+	req, err := http.NewRequestWithContext(c.Context(), c.Method(), url, body)
 	if err != nil {
 		return nil, err
 	}
@@ -81,8 +81,8 @@ func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
 	// Add (not Set) preserves multi-value headers: fasthttp emits a
 	// separate VisitAll call per value even for the same key, so Set
 	// would overwrite earlier values and only the last would forward.
-	// Affects multiple Cookie, Accept, Accept-Language, X-Forwarded-For,
-	// and similar multi-valued headers.
+	// Affects Via, X-Forwarded-For, Accept (multiple content types),
+	// Accept-Language, and similar multi-valued headers.
 	c.Request().Header.VisitAll(func(key, value []byte) {
 		req.Header.Add(string(key), string(value))
 	})

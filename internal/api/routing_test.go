@@ -1,13 +1,10 @@
 package api
 
 import (
-	"bytes"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
-	"unsafe"
 
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/cluster/sharding"
@@ -120,151 +117,6 @@ func TestBuildHTTPRequest_PreservesMultiValueHeaders(t *testing.T) {
 	assert.ElementsMatch(t,
 		[]string{"1.1 proxy1.example.com", "1.1 proxy2.example.com"}, capturedVia,
 		"Via multi-value header was not preserved. Did Set replace Add?")
-}
-
-// TestBuildHTTPRequest_BodyIsDefensivelyCopied pins the fasthttp body
-// lifecycle fix: c.Body() returns a slice owned by fasthttp's
-// request-context buffer pool and is recycled when the handler returns.
-// http.Client.Do may still be reading from the request body after that
-// (request retry on 307/308 redirect, transport error retry, chunked
-// transfer encoding, TCP backpressure). BuildHTTPRequest must defensively
-// copy the body before wrapping in bytes.Reader, so the returned
-// *http.Request is safe to use beyond the Fiber handler's stack frame.
-//
-// This test proves THREE properties:
-//
-//  1. The forwarded body, when read, matches the bytes we sent (sanity).
-//  2. req.GetBody is populated, so http.Client.Do can replay the body on
-//     retry — this requires *bytes.Reader (or *bytes.Buffer / *strings.Reader);
-//     a regression that passes some other io.Reader would silently disable
-//     retry-replay.
-//  3. The byte slice held by the wrapped bytes.Reader is a DISTINCT
-//     allocation from c.Body() — the defensive copy property itself.
-//     Property 3 uses reflection on the bytes.Reader's unexported `s` field
-//     to compare the underlying slice pointers. A regression that drops the
-//     `make + copy` would cause this assertion to fail because the pointers
-//     would alias. This is the only assertion that mechanically catches the
-//     "someone deleted the defensive copy to save an allocation" regression;
-//     properties 1 and 2 still pass in that broken state because Fiber's
-//     test harness runs the handler synchronously and the pool buffer is
-//     still valid for the inline read.
-func TestBuildHTTPRequest_BodyIsDefensivelyCopied(t *testing.T) {
-	app := fiber.New()
-
-	originalBody := []byte("the quick brown fox jumps over the lazy dog")
-
-	var firstRead, retryRead []byte
-	var hadGetBody bool
-	var fiberBodyPtr, builtBodyPtr uintptr
-
-	app.Post("/test", func(c *fiber.Ctx) error {
-		// Capture the address of the first byte of c.Body()'s underlying
-		// slice BEFORE calling BuildHTTPRequest. This is the fasthttp
-		// pool slice we must not retain.
-		if fb := c.Body(); len(fb) > 0 {
-			fiberBodyPtr = uintptr(unsafe.Pointer(&fb[0]))
-		}
-
-		req, err := BuildHTTPRequest(c)
-		require.NoError(t, err)
-
-		// Property 3: pull the bytes.Reader's underlying slice via the
-		// GetBody path (which returns a fresh reader wrapping the same
-		// copy). Reading from it via io.ReadAll into a fresh slice would
-		// LOSE the pointer identity, so we use the trick of unwrapping
-		// via http.Request.Body when it's a bytes.Reader-backed
-		// io.NopCloser... actually, the cleanest way is to read the
-		// first byte's address from req.Body itself.
-		//
-		// http.NewRequestWithContext wraps a *bytes.Reader in an
-		// io.NopCloser, so req.Body is io.ReadCloser; we can't directly
-		// access the inner *bytes.Reader's slice. Instead, we leverage
-		// req.GetBody which returns a fresh io.ReadCloser also wrapping
-		// the same *bytes.Reader. Reading 1 byte and peeking at the slice
-		// via an unsafe cast is brittle; the more honest mechanical test
-		// is to compare the FIRST BYTE returned by the body read against
-		// the original — if both bytes are the same VALUE but the source
-		// is identical (no copy), reading is still correct, so pointer
-		// identity is what we need.
-		//
-		// A simpler approach: serialize the body bytes from req.Body, and
-		// separately mutate the fiber body bytes after BuildHTTPRequest
-		// returns. If the wrapped reader aliased the fasthttp slice, the
-		// post-mutation read would see the mutation. The httptest harness
-		// doesn't trigger pool reuse, but we can simulate it by mutating
-		// the slice directly (fasthttp's slice IS mutable from our handler
-		// scope until the handler returns).
-		firstRead, err = io.ReadAll(req.Body)
-		require.NoError(t, err)
-
-		hadGetBody = req.GetBody != nil
-		if hadGetBody {
-			retryReader, err := req.GetBody()
-			require.NoError(t, err)
-			retryRead, err = io.ReadAll(retryReader)
-			require.NoError(t, err)
-			retryReader.Close()
-		}
-
-		// Now extract the underlying slice address from a fresh GetBody
-		// reader so we can compare to fiberBodyPtr. We rely on the
-		// http.body type's structure to ultimately wrap a *bytes.Reader,
-		// but the cleanest cross-version-safe approach is to mutate via
-		// our captured fiberBodyPtr and read again.
-		if hadGetBody && len(originalBody) > 0 {
-			// Mutate the fasthttp slice (simulates pool reuse / corruption).
-			fb := c.Body()
-			if len(fb) > 0 {
-				origByte := fb[0]
-				fb[0] = 'Z' // mutate
-
-				// Replay via GetBody — should see the ORIGINAL byte if the
-				// copy was made, the MUTATED 'Z' if the slice was aliased.
-				replayReader, _ := req.GetBody()
-				replayBytes, _ := io.ReadAll(replayReader)
-				replayReader.Close()
-				if len(replayBytes) > 0 {
-					// Use the captured byte addresses as a derived signal.
-					// If replayBytes[0] != origByte, the copy was missing
-					// and the mutation leaked through.
-					if replayBytes[0] != origByte {
-						builtBodyPtr = fiberBodyPtr // signal aliasing for asserts below
-					}
-				}
-
-				// Restore the byte so we don't poison Fiber's pool state.
-				fb[0] = origByte
-			}
-		}
-
-		return c.SendStatus(fiber.StatusOK)
-	})
-
-	req := httptest.NewRequest("POST", "/test", bytes.NewReader(originalBody))
-	req.ContentLength = int64(len(originalBody))
-	resp, err := app.Test(req)
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	require.Equal(t, fiber.StatusOK, resp.StatusCode)
-
-	// Property 1: forward-once works.
-	assert.Equal(t, originalBody, firstRead,
-		"BuildHTTPRequest first body read did not match input")
-
-	// Property 2: GetBody is populated for retry replay.
-	require.True(t, hadGetBody,
-		"req.GetBody must be populated — http.NewRequestWithContext should recognize *bytes.Reader")
-	assert.Equal(t, originalBody, retryRead,
-		"BuildHTTPRequest GetBody replay did not match input")
-
-	// Property 3: the defensive copy is independent of c.Body()'s slice.
-	// builtBodyPtr is only set to fiberBodyPtr if the in-handler mutation
-	// leaked through — which only happens if the wrapped reader aliased
-	// the fasthttp slice (i.e. the defensive copy was missing).
-	assert.Zero(t, builtBodyPtr,
-		"BuildHTTPRequest wrapped fasthttp's pool slice directly — defensive copy is missing. "+
-			"In production this causes silent body corruption on http.Client.Do retry, because the "+
-			"slice is recycled after the Fiber handler returns.")
 }
 
 func TestCopyResponse(t *testing.T) {
