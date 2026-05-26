@@ -349,7 +349,10 @@ func (rm *RBACManager) CreateOrganization(ctx context.Context, req *CreateOrgani
 
 	// OSS path: direct SQLite. ExecContext so cancellation is honoured
 	// even on the standalone deployment. Gemini PR #458 round 3.
-	now := time.Now()
+	// .UTC() for consistency with the cluster path (which goes through
+	// nextProposerTimestamp → UTC) and the rest of the auth surface.
+	// Issue #460.
+	now := time.Now().UTC()
 	result, err := rm.db.ExecContext(ctx, `
 		INSERT INTO rbac_organizations (name, description, created_at, updated_at, enabled)
 		VALUES (?, ?, ?, ?, 1)
@@ -475,7 +478,7 @@ func (rm *RBACManager) UpdateOrganization(ctx context.Context, id int64, req *Up
 	}
 
 	updates = append(updates, "updated_at = ?")
-	args = append(args, time.Now())
+	args = append(args, time.Now().UTC()) // OSS path; UTC per issue #460.
 	args = append(args, id)
 
 	query := fmt.Sprintf("UPDATE rbac_organizations SET %s WHERE id = ?", strings.Join(updates, ", "))
@@ -623,7 +626,9 @@ func (rm *RBACManager) CreateTeam(ctx context.Context, orgID int64, req *CreateT
 		return nil, errors.New("organization not found")
 	}
 
-	now := time.Now()
+	// OSS path; UTC per issue #460 (matches cluster path's
+	// nextProposerTimestamp → UTC convention).
+	now := time.Now().UTC()
 	result, err := rm.db.ExecContext(ctx, `
 		INSERT INTO rbac_teams (organization_id, name, description, created_at, updated_at, enabled)
 		VALUES (?, ?, ?, ?, ?, 1)
@@ -748,7 +753,7 @@ func (rm *RBACManager) UpdateTeam(ctx context.Context, id int64, req *UpdateTeam
 	}
 
 	updates = append(updates, "updated_at = ?")
-	args = append(args, time.Now())
+	args = append(args, time.Now().UTC()) // OSS path; UTC per issue #460.
 	args = append(args, id)
 
 	query := fmt.Sprintf("UPDATE rbac_teams SET %s WHERE id = ?", strings.Join(updates, ", "))
@@ -915,7 +920,10 @@ func (rm *RBACManager) CreateRole(ctx context.Context, teamID int64, req *Create
 		return nil, errors.New("team not found")
 	}
 
-	now := time.Now()
+	// OSS path; UTC per issue #460 (the cluster path uses
+	// nextProposerTimestamp → UTC and has a created_at = ? readback
+	// downstream, so OSS matches the convention for symmetry).
+	now := time.Now().UTC()
 	perms := strings.Join(req.Permissions, ",")
 	result, err := rm.db.ExecContext(ctx, `
 		INSERT INTO rbac_roles (team_id, database_pattern, permissions, created_at)
@@ -1171,7 +1179,8 @@ func (rm *RBACManager) CreateMeasurementPermission(ctx context.Context, roleID i
 		return nil, errors.New("role not found")
 	}
 
-	now := time.Now()
+	// OSS path; UTC per issue #460 (same reasoning as CreateRole above).
+	now := time.Now().UTC()
 	perms := strings.Join(req.Permissions, ",")
 	result, err := rm.db.ExecContext(ctx, `
 		INSERT INTO rbac_measurement_permissions (role_id, measurement_pattern, permissions, created_at)
@@ -1314,7 +1323,8 @@ func (rm *RBACManager) AddTokenToTeam(ctx context.Context, tokenID, teamID int64
 		return nil, errors.New("team not found")
 	}
 
-	now := time.Now()
+	// OSS path; UTC per issue #460.
+	now := time.Now().UTC()
 	result, err := rm.db.ExecContext(ctx, `
 		INSERT INTO rbac_token_memberships (token_id, team_id, created_at)
 		VALUES (?, ?, ?)

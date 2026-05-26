@@ -417,6 +417,29 @@ func newRBACTestManager(t *testing.T) (*RBACManager, *fakeRBACProposer) {
 	return rm, prop
 }
 
+// newRBACTestManagerOSS builds an RBACManager with NO proposer wired,
+// so every Create/Update/Delete takes the direct-SQLite OSS path
+// (the `if rm.getProposer() != nil` branches all evaluate to false
+// and fall through). Returns the AuthManager too because OSS-path
+// tests sometimes need to seed `api_tokens` directly for membership
+// tests.
+func newRBACTestManagerOSS(t *testing.T) (*RBACManager, *AuthManager) {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "rbac-test-oss.db")
+	am, err := NewAuthManager(dbPath, 100*time.Millisecond, 100, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewAuthManager: %v", err)
+	}
+	t.Cleanup(func() { am.Close() })
+
+	rm := NewRBACManager(&RBACManagerConfig{
+		DB:     am.GetDB(),
+		Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { rm.Close() })
+	return rm, am
+}
+
 // -----------------------------------------------------------------------------
 // Round-trip tests.
 // -----------------------------------------------------------------------------
@@ -654,6 +677,250 @@ func TestProposer_CreateRole_ConcurrentIdenticalDistinctIDs(t *testing.T) {
 	}
 	if len(ids) != n {
 		t.Errorf("expected %d distinct role IDs across concurrent identical creates, got %d", n, len(ids))
+	}
+}
+
+// TestProposer_CreateRole_NonUTCRoundTrip is a regression catcher for
+// issue #460. CI normally runs UTC, which masks a whole class of
+// timezone round-trip bugs: SQLite serialises time.Time using the
+// value's location, so a `WHERE created_at = ?` readback only matches
+// if both sides agree on timezone.
+//
+// PR #459 fixed the round-trip by making both sides UTC: the proposer
+// via nextProposerTimestamp() and the FSM applier via .UTC() on every
+// time.Unix(0, entry.X) site in cluster_rbac_apply.go. This test
+// fails fast (no row returned by the readback → nil panic on role.ID,
+// or row-not-found error from CreateRole) if anyone reintroduces a
+// non-UTC time.Time write on either side.
+//
+// Mechanism: force time.Local to a non-UTC zone for the duration of
+// the test. This affects what time.Now() returns on the OSS path, what
+// time.Unix(0, ...) returns by default, and how the SQLite driver
+// text-encodes any non-UTC time.Time that slips through. The
+// `nextProposerTimestamp()` UTC fix and the cluster_rbac_apply.go .UTC()
+// fixes both have to hold up under this — drop either, this test
+// breaks.
+func TestProposer_CreateRole_NonUTCRoundTrip(t *testing.T) {
+	loc, err := time.LoadLocation("America/Argentina/Buenos_Aires")
+	if err != nil {
+		t.Skipf("test requires tzdata for America/Argentina/Buenos_Aires; skipping (env may be Alpine without tzdata): %v", err)
+	}
+	// Register cleanup BEFORE the mutation so even a panic in between
+	// can't leak the local-tz override into the rest of the package's
+	// tests. time.Local is a package-global; internal/auth tests do not
+	// use t.Parallel() (verified) so this serial mutation is safe.
+	originalLocal := time.Local
+	t.Cleanup(func() { time.Local = originalLocal })
+	time.Local = loc
+
+	rm, _ := newRBACTestManager(t)
+	ctx := context.Background()
+	org, err := rm.CreateOrganization(ctx, &CreateOrganizationRequest{Name: "acme"})
+	if err != nil {
+		t.Fatalf("CreateOrganization: %v", err)
+	}
+	team, err := rm.CreateTeam(ctx, org.ID, &CreateTeamRequest{Name: "platform"})
+	if err != nil {
+		t.Fatalf("CreateTeam: %v", err)
+	}
+	role, err := rm.CreateRole(ctx, team.ID, &CreateRoleRequest{
+		DatabasePattern: "production",
+		Permissions:     []string{"read", "write"},
+	})
+	if err != nil {
+		t.Fatalf("CreateRole under non-UTC time.Local: %v — proposer/applier UTC parity is broken", err)
+	}
+	if role == nil || role.ID == 0 {
+		t.Fatalf("CreateRole returned nil/zero-id role under non-UTC time.Local: %+v", role)
+	}
+
+	// Also verify the readback round-trip for CreateMeasurementPermission,
+	// which has the same created_at = ? readback shape.
+	mp, err := rm.CreateMeasurementPermission(ctx, role.ID, &CreateMeasurementPermissionRequest{
+		MeasurementPattern: "cpu_usage",
+		Permissions:        []string{"read"},
+	})
+	if err != nil {
+		t.Fatalf("CreateMeasurementPermission under non-UTC time.Local: %v", err)
+	}
+	if mp == nil || mp.ID == 0 {
+		t.Fatalf("CreateMeasurementPermission returned nil/zero-id under non-UTC time.Local: %+v", mp)
+	}
+}
+
+// TestOSS_RBACWrites_StampUTC is the OSS-path companion to
+// TestProposer_CreateRole_NonUTCRoundTrip. The OSS direct-SQLite path
+// has no `WHERE created_at = ?` readback (it uses LastInsertId + the
+// in-memory `now` to populate the returned struct), so a regression
+// there wouldn't surface as a round-trip failure. Instead it would
+// silently return a `time.Time` in the wrong location, confusing any
+// API consumer that compares the value via `==` or expects UTC for
+// log correlation.
+//
+// This test forces time.Local to a non-UTC zone and asserts every
+// Create*'s returned `CreatedAt.Location()` is `time.UTC`. Drop the
+// `.UTC()` on any of the 7 OSS-path sites in rbac_manager.go and this
+// test fails. Issue #460.
+func TestOSS_RBACWrites_StampUTC(t *testing.T) {
+	loc, err := time.LoadLocation("America/Argentina/Buenos_Aires")
+	if err != nil {
+		t.Skipf("test requires tzdata; skipping: %v", err)
+	}
+	originalLocal := time.Local
+	t.Cleanup(func() { time.Local = originalLocal })
+	time.Local = loc
+
+	rm, am := newRBACTestManagerOSS(t)
+	ctx := context.Background()
+
+	org, err := rm.CreateOrganization(ctx, &CreateOrganizationRequest{Name: "acme"})
+	if err != nil {
+		t.Fatalf("CreateOrganization: %v", err)
+	}
+	if org.CreatedAt.Location() != time.UTC {
+		t.Errorf("CreateOrganization.CreatedAt: want UTC, got %s", org.CreatedAt.Location())
+	}
+
+	team, err := rm.CreateTeam(ctx, org.ID, &CreateTeamRequest{Name: "platform"})
+	if err != nil {
+		t.Fatalf("CreateTeam: %v", err)
+	}
+	if team.CreatedAt.Location() != time.UTC {
+		t.Errorf("CreateTeam.CreatedAt: want UTC, got %s", team.CreatedAt.Location())
+	}
+
+	role, err := rm.CreateRole(ctx, team.ID, &CreateRoleRequest{
+		DatabasePattern: "production",
+		Permissions:     []string{"read"},
+	})
+	if err != nil {
+		t.Fatalf("CreateRole: %v", err)
+	}
+	if role.CreatedAt.Location() != time.UTC {
+		t.Errorf("CreateRole.CreatedAt: want UTC, got %s", role.CreatedAt.Location())
+	}
+
+	mp, err := rm.CreateMeasurementPermission(ctx, role.ID, &CreateMeasurementPermissionRequest{
+		MeasurementPattern: "cpu_usage",
+		Permissions:        []string{"read"},
+	})
+	if err != nil {
+		t.Fatalf("CreateMeasurementPermission: %v", err)
+	}
+	if mp.CreatedAt.Location() != time.UTC {
+		t.Errorf("CreateMeasurementPermission.CreatedAt: want UTC, got %s", mp.CreatedAt.Location())
+	}
+
+	// AddTokenToTeam needs an existing token row. Seed via the auth API.
+	plaintext, err := am.CreateToken(ctx, "smoke-tok", "", "", nil)
+	if err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+	tokInfo := am.VerifyToken(plaintext)
+	if tokInfo == nil {
+		t.Fatal("VerifyToken returned nil for freshly-created token")
+	}
+	mb, err := rm.AddTokenToTeam(ctx, tokInfo.ID, team.ID)
+	if err != nil {
+		t.Fatalf("AddTokenToTeam: %v", err)
+	}
+	if mb.CreatedAt.Location() != time.UTC {
+		t.Errorf("AddTokenToTeam.CreatedAt: want UTC, got %s", mb.CreatedAt.Location())
+	}
+
+	// UpdateOrganization and UpdateTeam also hit OSS-path time.Now()
+	// sites. Verify by reading back the updated_at via GetOrganization /
+	// GetTeam (those return the struct that came from a fresh SELECT).
+	newDesc := "renamed"
+	if err := rm.UpdateOrganization(ctx, org.ID, &UpdateOrganizationRequest{Description: &newDesc}); err != nil {
+		t.Fatalf("UpdateOrganization: %v", err)
+	}
+	if err := rm.UpdateTeam(ctx, team.ID, &UpdateTeamRequest{Description: &newDesc}); err != nil {
+		t.Fatalf("UpdateTeam: %v", err)
+	}
+	gotOrg, err := rm.GetOrganization(org.ID)
+	if err != nil {
+		t.Fatalf("GetOrganization: %v", err)
+	}
+	if gotOrg.UpdatedAt.Location() != time.UTC {
+		t.Errorf("UpdateOrganization.UpdatedAt: want UTC, got %s", gotOrg.UpdatedAt.Location())
+	}
+	gotTeam, err := rm.GetTeam(team.ID)
+	if err != nil {
+		t.Fatalf("GetTeam: %v", err)
+	}
+	if gotTeam.UpdatedAt.Location() != time.UTC {
+		t.Errorf("UpdateTeam.UpdatedAt: want UTC, got %s", gotTeam.UpdatedAt.Location())
+	}
+}
+
+// TestApply_TokenCreate_NonUTC pins the Phase A token applier (FSM
+// cluster_apply.go) UTC convention. The applier has no `WHERE
+// created_at = ?` readback today, so a regression wouldn't surface
+// as a round-trip failure — but it would silently store local-tz
+// timestamps that diverge between nodes running with different TZs.
+// This test calls ApplyCreateToken directly with a known UnixNano
+// and asserts the resulting SQLite row's text-encoded created_at
+// matches the expected UTC RFC3339-ish form.
+//
+// Mechanism: write a token via the FSM apply path under non-UTC
+// time.Local, then read the raw `created_at` column via a SELECT
+// that bypasses Go time.Time deserialisation (CAST to TEXT) so we
+// see exactly what SQLite stored.
+//
+// Drop the `.UTC()` on cluster_apply.go's time.Unix sites and this
+// test catches it. Issue #460.
+func TestApply_TokenCreate_NonUTC(t *testing.T) {
+	loc, err := time.LoadLocation("America/Argentina/Buenos_Aires")
+	if err != nil {
+		t.Skipf("test requires tzdata; skipping: %v", err)
+	}
+	originalLocal := time.Local
+	t.Cleanup(func() { time.Local = originalLocal })
+	time.Local = loc
+
+	dbPath := filepath.Join(t.TempDir(), "tok-utc.db")
+	am, err := NewAuthManager(dbPath, 100*time.Millisecond, 100, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewAuthManager: %v", err)
+	}
+	t.Cleanup(func() { am.Close() })
+
+	// Pick a known instant and apply a CreateToken via the FSM path.
+	// The chosen instant is 2026-04-15T12:00:00Z; if cluster_apply.go
+	// drops .UTC(), the resulting row will be stored as
+	// "2026-04-15 09:00:00..." (Buenos Aires is UTC-3) instead.
+	wantInstant := time.Date(2026, 4, 15, 12, 0, 0, 0, time.UTC)
+	entry := ClusterTokenEntry{
+		ID:                1,
+		Name:              "utc-smoke",
+		TokenHash:         "deadbeef",
+		TokenPrefix:       "abc",
+		Description:       "test",
+		Permissions:       "read",
+		CreatedAtUnixNano: wantInstant.UnixNano(),
+		Enabled:           true,
+	}
+	if err := am.ApplyCreateToken(entry); err != nil {
+		t.Fatalf("ApplyCreateToken: %v", err)
+	}
+
+	// Read raw text storage. SQLite text-encodes time.Time using the
+	// value's location; if we wrote UTC we get "...+00:00" / "Z" form,
+	// if we wrote local we get the local-tz offset.
+	var rawCreatedAt string
+	if err := am.GetDB().QueryRow(
+		`SELECT CAST(created_at AS TEXT) FROM api_tokens WHERE id = ?`,
+		entry.ID,
+	).Scan(&rawCreatedAt); err != nil {
+		t.Fatalf("read back created_at: %v", err)
+	}
+
+	// The Go SQLite driver text-encodes time.Time as RFC3339Nano. The
+	// UTC form ends in "Z" or "+00:00"; a Buenos Aires-encoded value
+	// would end in "-03:00". Anything other than UTC fails the test.
+	if !strings.Contains(rawCreatedAt, "+00:00") && !strings.HasSuffix(rawCreatedAt, "Z") {
+		t.Errorf("ApplyCreateToken stored non-UTC created_at: %q (expected +00:00 or Z suffix)", rawCreatedAt)
 	}
 }
 
