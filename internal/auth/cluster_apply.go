@@ -109,6 +109,25 @@ type clusterTokenEntryWire struct {
 	LSN               uint64 `json:"lsn,omitempty"`
 }
 
+// invalidateAndReturn flushes the in-memory token cache and returns the
+// supplied result, encoding the contract that EVERY Apply* method
+// invalidates the cache — including on the divergence-detection error
+// paths.
+//
+// The error-path invalidation is intentional. When the FSM applies a
+// CommandUpdate/Revoke/Rotate but the local SQLite row is missing (the
+// cluster<->local divergence shape from #451), refusing the apply via
+// error doesn't undo the cluster-authoritative state — the FSM holds
+// the new value, this node's SQLite holds the old (or no) value, and
+// the in-memory cache might hold a stale entry derived from the old
+// row. Flushing the cache forces the next VerifyToken to fall through
+// to SQLite, which is the closest this node can get to converging
+// with cluster truth until the operator re-syncs. Tracked in #452.
+func (am *AuthManager) invalidateAndReturn(err error) error {
+	am.InvalidateCache()
+	return err
+}
+
 // ApplyCreateToken materialises a CreateToken Raft apply into local
 // SQLite. Called from every node's FSM apply callback (including the
 // proposer's own apply, because the apply path is the single source of
@@ -163,8 +182,7 @@ func (am *AuthManager) ApplyCreateToken(entry ClusterTokenEntry) error {
 		// (Log replay re-applies the same CommandCreateToken when the
 		// FSM snapshot is older than the last applied index.)
 		if existingHash == entry.TokenHash && existingName == entry.Name {
-			am.InvalidateCache()
-			return nil
+			return am.invalidateAndReturn(nil)
 		}
 		// Divergence: pre-existing local row at this ID has different
 		// content. Refusing to overwrite preserves the operator's
@@ -191,8 +209,7 @@ func (am *AuthManager) ApplyCreateToken(entry ClusterTokenEntry) error {
 		// from the opposite direction. Surface it.
 		return fmt.Errorf("ApplyCreateToken: insert: %w", insertErr)
 	}
-	am.InvalidateCache()
-	return nil
+	return am.invalidateAndReturn(nil)
 }
 
 // ApplyUpdateToken materialises an UpdateToken Raft apply into local
@@ -234,11 +251,9 @@ func (am *AuthManager) ApplyUpdateToken(entry ClusterTokenEntry) error {
 			Int64("token_id", entry.ID).
 			Str("name", entry.Name).
 			Msg("ApplyUpdateToken: local SQLite row missing — cluster FSM<->local cache divergence")
-		am.InvalidateCache()
-		return fmt.Errorf("ApplyUpdateToken: id %d not present in local SQLite cache (cluster<->local divergence)", entry.ID)
+		return am.invalidateAndReturn(fmt.Errorf("ApplyUpdateToken: id %d not present in local SQLite cache (cluster<->local divergence)", entry.ID))
 	}
-	am.InvalidateCache()
-	return nil
+	return am.invalidateAndReturn(nil)
 }
 
 // ApplyRevokeToken materialises a RevokeToken Raft apply.
@@ -264,11 +279,9 @@ func (am *AuthManager) ApplyRevokeToken(id int64) error {
 		am.logger.Error().
 			Int64("token_id", id).
 			Msg("ApplyRevokeToken: local SQLite row missing — cluster<->local divergence; the token may still authenticate against this node's stale cache")
-		am.InvalidateCache()
-		return fmt.Errorf("ApplyRevokeToken: id %d not present in local SQLite cache (cluster<->local divergence)", id)
+		return am.invalidateAndReturn(fmt.Errorf("ApplyRevokeToken: id %d not present in local SQLite cache (cluster<->local divergence)", id))
 	}
-	am.InvalidateCache()
-	return nil
+	return am.invalidateAndReturn(nil)
 }
 
 // ApplyDeleteToken materialises a DeleteToken Raft apply.
@@ -296,8 +309,7 @@ func (am *AuthManager) ApplyDeleteToken(id int64) error {
 			Int64("token_id", id).
 			Msg("ApplyDeleteToken: local SQLite row already missing — cluster<->local divergence (post-state matches, no error)")
 	}
-	am.InvalidateCache()
-	return nil
+	return am.invalidateAndReturn(nil)
 }
 
 // ApplyRotateToken materialises a RotateToken Raft apply.
@@ -325,9 +337,7 @@ func (am *AuthManager) ApplyRotateToken(id int64, newHash, newPrefix string) err
 		am.logger.Error().
 			Int64("token_id", id).
 			Msg("ApplyRotateToken: local SQLite row missing — cluster<->local divergence; the OLD token may keep authenticating against this node until its cache entry expires")
-		am.InvalidateCache()
-		return fmt.Errorf("ApplyRotateToken: id %d not present in local SQLite cache (cluster<->local divergence)", id)
+		return am.invalidateAndReturn(fmt.Errorf("ApplyRotateToken: id %d not present in local SQLite cache (cluster<->local divergence)", id))
 	}
-	am.InvalidateCache()
-	return nil
+	return am.invalidateAndReturn(nil)
 }

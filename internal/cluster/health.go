@@ -37,9 +37,9 @@ type HealthChecker struct {
 	// surfaces both warnings within the same minute instead of suppressing
 	// whichever one lost the CAS race. Each timer is independently
 	// throttled to compactorWarnInterval.
-	warnIfNoCompactor         bool
-	lastNoCompactorWarnAt     atomic.Int64 // unix nanos; throttles "no compactor elected"
-	lastMultiCompactorWarnAt  atomic.Int64 // unix nanos; throttles "multiple compactors elected"
+	warnIfNoCompactor        bool
+	lastNoCompactorWarnAt    atomic.Int64 // unix nanos; throttles "no compactor elected"
+	lastMultiCompactorWarnAt atomic.Int64 // unix nanos; throttles "multiple compactors elected"
 
 	// Phase 5: raftFSM is set when compactor failover is configured. When
 	// non-nil, checkCompactorElected also checks the FSM's activeCompactorID

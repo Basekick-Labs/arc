@@ -153,17 +153,17 @@ type Puller struct {
 	inflightCount atomic.Int64
 
 	// Metrics (atomic for lock-free observability)
-	totalEnqueued               atomic.Int64
-	totalSkippedSelf            atomic.Int64 // origin is self — no pull needed
-	totalSkippedLocal           atomic.Int64 // file fully present locally
-	totalSkippedDup             atomic.Int64 // already enqueued / in-flight
-	totalPulled                 atomic.Int64 // successful pulls
-	totalFailed                 atomic.Int64 // gave up after retries
-	totalDropped                atomic.Int64 // queue full
-	totalChecksumMismatch       atomic.Int64 // bytes didn't match manifest SHA256
-	totalPeerLookupFailure      atomic.Int64 // no candidate peers available
-	totalBadOffsetServer        atomic.Int64 // server rejected resume offset (AckCodeBadOffset)
-	totalBadOffsetBackend       atomic.Int64 // backend can't append (ErrResumeNotSupported)
+	totalEnqueued          atomic.Int64
+	totalSkippedSelf       atomic.Int64 // origin is self — no pull needed
+	totalSkippedLocal      atomic.Int64 // file fully present locally
+	totalSkippedDup        atomic.Int64 // already enqueued / in-flight
+	totalPulled            atomic.Int64 // successful pulls
+	totalFailed            atomic.Int64 // gave up after retries
+	totalDropped           atomic.Int64 // queue full
+	totalChecksumMismatch  atomic.Int64 // bytes didn't match manifest SHA256
+	totalPeerLookupFailure atomic.Int64 // no candidate peers available
+	totalBadOffsetServer   atomic.Int64 // server rejected resume offset (AckCodeBadOffset)
+	totalBadOffsetBackend  atomic.Int64 // backend can't append (ErrResumeNotSupported)
 
 	// Catch-up metrics (Phase 3). Populated by RunCatchUp and read via Stats.
 	catchupStartedAt     atomic.Int64 // unix seconds; 0 if never started
@@ -505,10 +505,10 @@ func (p *Puller) Stats() map[string]int64 {
 		"pulled":                 p.totalPulled.Load(),
 		"failed":                 p.totalFailed.Load(),
 		"dropped":                p.totalDropped.Load(),
-		"checksum_mismatch":        p.totalChecksumMismatch.Load(),
-		"peer_lookup_failure":      p.totalPeerLookupFailure.Load(),
-		"bad_offset_server":        p.totalBadOffsetServer.Load(),
-		"bad_offset_backend":       p.totalBadOffsetBackend.Load(),
+		"checksum_mismatch":      p.totalChecksumMismatch.Load(),
+		"peer_lookup_failure":    p.totalPeerLookupFailure.Load(),
+		"bad_offset_server":      p.totalBadOffsetServer.Load(),
+		"bad_offset_backend":     p.totalBadOffsetBackend.Load(),
 		"queue_depth":            int64(len(p.queue)),
 		"inflight_count":         p.inflightCount.Load(),
 		"catchup_started_at":     p.catchupStartedAt.Load(),
