@@ -315,8 +315,14 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		Scheme:    security.SchemeForServer(cfg.ServerTLSEnabled),
 	})
 
-	// Initialize writer failover manager (Phase 3) — requires license and Raft
-	if cfg.Config.FailoverEnabled && c.raftNode != nil {
+	// Initialize writer failover manager (Phase 3) — requires license and Raft.
+	//
+	// Suppressed in Pattern 2 shared-storage multi-writer mode: every
+	// RoleWriter node is equivalent (no primary/standby distinction), so
+	// CommandPromoteWriter has nothing meaningful to do. Load-balancer
+	// retry handles writer-crash failover instead. See
+	// docs/progress/2026-05-26-multi-writer-pattern2.md.
+	if cfg.Config.FailoverEnabled && c.raftNode != nil && !cfg.Config.SharedStorageMode {
 		if cfg.LicenseClient == nil || !cfg.LicenseClient.CanUseWriterFailover() {
 			c.logger.Warn().Msg("Writer failover enabled but license does not include writer_failover feature — failover disabled")
 		} else {
@@ -335,6 +341,8 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 
 			c.logger.Info().Msg("Writer failover manager initialized")
 		}
+	} else if cfg.Config.FailoverEnabled && cfg.Config.SharedStorageMode {
+		c.logger.Info().Msg("Writer failover suppressed: cluster.shared_storage_mode=true (Pattern 2 multi-writer; LB handles writer-crash failover)")
 	}
 
 	// Initialize compactor failover manager (Phase 5) — reuses the same
@@ -1676,11 +1684,62 @@ func (c *Coordinator) GetRole() NodeRole {
 }
 
 // IsPrimaryWriter implements api.RetentionCoordinator, api.DeleteCoordinator,
-// api.CQCoordinator, and scheduler.WriterGate: reports whether this node is
-// the primary writer and may execute writer-only mutations.
-// When failover is disabled there is no promoted primary — any writer node is
-// authoritative, so we fall back to a role check.
+// api.CQCoordinator, and scheduler.WriterGate: reports whether this node may
+// execute singleton-writer-only mutations (retention sweeps, continuous
+// queries, deletes, reconciliation).
+//
+// Three modes, in priority order:
+//
+//  1. Pattern 2 shared-storage multi-writer mode
+//     (cfg.Cluster.SharedStorageMode=true): N RoleWriter nodes accept writes
+//     concurrently and PUT to the same object-storage backend. There is no
+//     "primary writer" concept — every writer is equivalent for ingest.
+//     Singleton tasks must still run on exactly one node to avoid duplicate
+//     work, so we gate on the cluster Raft leader AND RoleWriter. The role
+//     check matters because every joining node becomes a Raft voter
+//     regardless of role; without it, a RoleReader or RoleCompactor that
+//     wins the election would run retention/CQ/delete.
+//
+//     Leader-change semantics: each scheduler (retention, CQ, delete,
+//     reconciliation) checks IsPrimaryWriter() ONCE at the start of each
+//     tick and runs all work for that tick if true. A leader change
+//     mid-tick will let the demoted node complete its current tick's
+//     work; the new leader's next tick picks up from there. This is
+//     correct for retention/CQ (idempotent post-states) but is a known
+//     ~tick-window of duplicate-singleton-work on leader change. Tighter
+//     gating would require pushing the check into each per-item loop,
+//     deferred until operators report it as a real problem.
+//
+//     See docs/progress/2026-05-26-multi-writer-pattern2.md.
+//
+//  2. Pattern 1 single-writer with no failover manager: WriterState stays at
+//     its zero value (no CommandPromoteWriter is ever issued), so any
+//     RoleWriter node is authoritative for singleton tasks. Same as today.
+//
+//  3. Pattern 1 single-writer with failover manager: the failover manager
+//     issues CommandPromoteWriter to elect one writer as primary; only that
+//     node returns true. Same as today.
 func (c *Coordinator) IsPrimaryWriter() bool {
+	// Pattern 2 multi-writer: singleton tasks gate on Raft leader AND
+	// RoleWriter. The role check is load-bearing — every joining node
+	// becomes a Raft voter regardless of role (coordinator.go AddVoter
+	// path), so a RoleReader or RoleCompactor can be elected leader.
+	// Without the role check, that node's scheduler would treat itself
+	// as the singleton runner and execute retention/CQ/delete against
+	// the shared bucket — exactly the duplicate-singleton hazard the
+	// gate is supposed to prevent (since the actual writer nodes also
+	// have schedulers and would also try to run the work). Defensive
+	// nil-checks: raftNode==nil means clustering isn't wired (returns
+	// false, fail-closed); localNode==nil shouldn't happen post-
+	// construction but we guard anyway.
+	if c.cfg.SharedStorageMode {
+		if c.raftNode == nil || !c.raftNode.IsLeader() {
+			return false
+		}
+		node := c.GetLocalNode()
+		return node != nil && node.Role == RoleWriter
+	}
+
 	node := c.GetLocalNode()
 	if node == nil {
 		return false

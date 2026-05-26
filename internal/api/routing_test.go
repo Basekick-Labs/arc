@@ -64,7 +64,153 @@ func TestBuildHTTPRequest(t *testing.T) {
 
 	resp, err := app.Test(req)
 	require.NoError(t, err)
+	defer resp.Body.Close()
 	assert.Equal(t, fiber.StatusOK, resp.StatusCode)
+}
+
+// TestBuildHTTPRequest_PreservesMultiValueHeaders pins the
+// req.Header.Add (not Set) behaviour: when a Fiber/fasthttp request
+// has multiple values for the same header key, fasthttp's VisitAll
+// calls the callback once per value. Using Set inside that callback
+// overwrites earlier values and only the last forwards. Add preserves
+// all of them.
+//
+// Cookie is special-cased in HTTP/1.1 (joined into one comma- or
+// semicolon-separated value per RFC 6265), so we use X-Forwarded-For
+// — a legitimately multi-valued header where each proxy hop appends
+// its own value, and dropping intermediate hops corrupts the chain
+// that downstream services depend on (rate limiting, geo, audit).
+// Also tests Via, another standard multi-value request header.
+//
+// Verified to fail when req.Header.Add is reverted to Set:
+// req.Header.Values(...) returns only the last value.
+func TestBuildHTTPRequest_PreservesMultiValueHeaders(t *testing.T) {
+	app := fiber.New()
+
+	var capturedXFF, capturedVia []string
+
+	app.Get("/test", func(c *fiber.Ctx) error {
+		req, err := BuildHTTPRequest(c)
+		require.NoError(t, err)
+		capturedXFF = req.Header.Values("X-Forwarded-For")
+		capturedVia = req.Header.Values("Via")
+		return c.SendStatus(fiber.StatusOK)
+	})
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	// X-Forwarded-For: three proxy hops, each adds its own value.
+	// Via: two proxies in the chain.
+	req.Header.Add("X-Forwarded-For", "203.0.113.1")
+	req.Header.Add("X-Forwarded-For", "198.51.100.7")
+	req.Header.Add("X-Forwarded-For", "192.0.2.42")
+	req.Header.Add("Via", "1.1 proxy1.example.com")
+	req.Header.Add("Via", "1.1 proxy2.example.com")
+
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
+	// Equal (not ElementsMatch): order matters for X-Forwarded-For and
+	// Via — each represents the sequential path of proxy hops, with
+	// leftmost = original client. Reordering corrupts rate-limit /
+	// geo / audit trails downstream. (Gemini PR #463 round 7.)
+	assert.Equal(t,
+		[]string{"203.0.113.1", "198.51.100.7", "192.0.2.42"}, capturedXFF,
+		"X-Forwarded-For values not preserved in chain order")
+	assert.Equal(t,
+		[]string{"1.1 proxy1.example.com", "1.1 proxy2.example.com"}, capturedVia,
+		"Via values not preserved in chain order")
+}
+
+// TestBuildHTTPRequest_FiltersHopByHopAndContentLength pins the
+// RFC 7230 §6.1 hop-by-hop filter on the request-forwarding path.
+// Connection-specific headers (Connection, Keep-Alive, Proxy-Auth*,
+// Te, Trailers, Transfer-Encoding, Upgrade) MUST NOT be forwarded
+// by intermediaries — they describe the upstream connection, not
+// end-to-end semantics. Forwarding them produces protocol violations
+// (e.g. a Transfer-Encoding: chunked header copied onto a request
+// the Go HTTP client is sending with a known Content-Length).
+//
+// Content-Length is filtered separately because net/http sets
+// req.ContentLength from the body (*bytes.Reader knows its length)
+// and writes the header from that field. Forwarding the upstream
+// Content-Length would either duplicate the header on the wire or
+// send a stale value if the body was somehow transformed.
+//
+// CopyResponse already filters these on the response path via the
+// same isHopByHop helper; this test pins that the request path now
+// does the same. Headers that should pass through (Authorization,
+// Content-Type, X-Custom-*, X-Arc-Database) are also asserted.
+func TestBuildHTTPRequest_FiltersHopByHopAndContentLength(t *testing.T) {
+	app := fiber.New()
+
+	var captured http.Header
+
+	app.Post("/test", func(c *fiber.Ctx) error {
+		req, err := BuildHTTPRequest(c)
+		require.NoError(t, err)
+		captured = req.Header
+		return c.SendStatus(fiber.StatusOK)
+	})
+
+	req := httptest.NewRequest("POST", "/test", nil)
+	// Hop-by-hop headers that MUST be filtered.
+	// Note: Transfer-Encoding and Content-Length are not set via
+	// req.Header.Set because Go's httptest validates protocol
+	// consistency on the test request — setting them on a nil body
+	// produces "unexpected EOF". The filter is exercised via the
+	// other hop-by-hop headers; Transfer-Encoding and Content-Length
+	// filtering is verified by code inspection (same isHopByHop map +
+	// explicit Content-Length string comparison in the filter).
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Keep-Alive", "timeout=5, max=1000")
+	req.Header.Set("Proxy-Authenticate", "Basic realm=\"proxy\"")
+	req.Header.Set("Proxy-Authorization", "Basic Zm9vOmJhcg==")
+	req.Header.Set("Te", "trailers")
+	req.Header.Set("Trailers", "X-End-Of-Stream")
+	req.Header.Set("Upgrade", "h2c")
+	// Host filter (round 5): the upstream client's Host header would
+	// shadow the target peer's req.Host for any middleware that reads
+	// req.Header.Get("Host") instead of req.Host. Note: httptest sets
+	// req.Host directly from the URL; we set the header via req.Header
+	// to simulate what fasthttp's VisitAll would emit for an incoming
+	// HTTP request with an explicit Host header.
+	req.Header.Set("Host", "original-client.example.com")
+
+	// End-to-end headers that MUST pass through.
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer token123")
+	req.Header.Set("X-Arc-Database", "production")
+	req.Header.Set("X-Custom-Trace-Id", "abc-123")
+
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
+	// Hop-by-hop headers must NOT appear in the forwarded request.
+	// (Transfer-Encoding + Content-Length filtering verified by code
+	// inspection — see note above on httptest validation.)
+	hopByHopFiltered := []string{
+		"Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
+		"Te", "Trailers", "Upgrade",
+		"Host", // round 5: filtered to keep req.Header consistent with req.Host
+	}
+	for _, h := range hopByHopFiltered {
+		assert.Empty(t, captured.Get(h),
+			"%s should be filtered from forwarded request (hop-by-hop per RFC 7230 §6.1 / managed by net/http)", h)
+	}
+
+	// End-to-end headers must pass through.
+	assert.Equal(t, "application/json", captured.Get("Content-Type"),
+		"Content-Type (end-to-end) should pass through")
+	assert.Equal(t, "Bearer token123", captured.Get("Authorization"),
+		"Authorization (end-to-end) should pass through")
+	assert.Equal(t, "production", captured.Get("X-Arc-Database"),
+		"X-Arc-Database (Arc-internal routing header) should pass through")
+	assert.Equal(t, "abc-123", captured.Get("X-Custom-Trace-Id"),
+		"X-Custom-Trace-Id (custom end-to-end header) should pass through")
 }
 
 func TestCopyResponse(t *testing.T) {

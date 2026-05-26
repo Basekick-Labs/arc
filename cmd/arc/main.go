@@ -638,6 +638,44 @@ func main() {
 		log.Fatal().Str("backend", cfg.Storage.Backend).Msg("Unsupported storage backend (use 'local', 's3', 'minio', 'azure', or 'azblob')")
 	}
 
+	// Pattern 2 shared-storage multi-writer mode startup validation.
+	// Refuses to start under three conditions that would silently break
+	// the multi-writer invariant:
+	//
+	//   (a) cluster.enabled=false — without the cluster coordinator,
+	//       schedulers have a nil ClusterGate (see scheduler wiring in
+	//       cmd/arc/main.go) and singleton tasks (retention, CQ, delete)
+	//       run unconditionally. Two such "standalone" nodes pointed at
+	//       the same bucket would each run retention against the shared
+	//       data — duplicate deletes, duplicate writes. SharedStorageMode
+	//       is meaningless without clustering.
+	//   (b) cfg.Storage.Backend == "local" — per-node filesystems can't
+	//       be shared across N writers. Writes would diverge silently.
+	//   (c) license lacks the shared_storage_multi_writer feature — this
+	//       is an Enterprise-tier capability that must be explicitly
+	//       licensed; running without the gate would be a license bypass.
+	//
+	// Order matters: cluster.enabled before backend before license, so
+	// the most upstream misconfig surfaces first.
+	if cfg.Cluster.SharedStorageMode {
+		if !cfg.Cluster.Enabled {
+			log.Fatal().
+				Msg("cluster.shared_storage_mode=true requires cluster.enabled=true; without the cluster coordinator there is no leader-election gate and singleton background tasks (retention, CQ, delete) would run on every node")
+		}
+		if cfg.Storage.Backend == "local" {
+			log.Fatal().
+				Str("backend", cfg.Storage.Backend).
+				Msg("cluster.shared_storage_mode=true requires an object-store backend (s3, minio, azure, or azblob); local-filesystem backend cannot be shared across writers")
+		}
+		if licenseClient == nil || !licenseClient.CanUseSharedStorageMultiWriter() {
+			log.Fatal().
+				Msg("cluster.shared_storage_mode=true requires an Enterprise license with the shared_storage_multi_writer feature; contact sales@basekick.net")
+		}
+		log.Info().
+			Str("backend", cfg.Storage.Backend).
+			Msg("Pattern 2 shared-storage multi-writer mode enabled (singleton tasks gate on Raft leader; writer failover suppressed)")
+	}
+
 	// Initialize WAL writer (if enabled) - recovery happens after ArrowBuffer is ready
 	var walWriter *wal.Writer
 	var walRecovery *wal.Recovery
@@ -2503,6 +2541,54 @@ func main() {
 		auditHandler.RegisterRoutes(server.GetApp())
 	}
 
+	// Mark /ready=503 BEFORE the HTTP listener drain begins so the load
+	// balancer (Pattern 2 multi-writer) stops routing new requests here
+	// before the listener actually closes. Priority 5 < PriorityHTTPServer=10
+	// so this hook fires first.
+	//
+	// The sleep is load-bearing: shutdown hooks run sequentially with no
+	// inter-hook wait, so without it the next hook (http-server, priority
+	// 10) would call app.Shutdown() within microseconds — before the LB
+	// has had time to poll /ready and observe the 503. The 10-second
+	// default matches the typical LB health-check cycle (HAProxy + nginx
+	// + Traefik default to ~5-10s polls). Operators with faster or
+	// slower polls should configure their LB termination grace
+	// accordingly; a future PR may expose this as an env var
+	// (ARC_SHUTDOWN_READY_DRAIN_SECONDS) if customers ask.
+	//
+	// In-flight requests that arrived BEFORE MarkNotReady drain via Fiber's
+	// normal shutdown handling — they complete; only NEW requests get
+	// rejected by the LB once it observes the 503.
+	// Drain grace: 10s in clustered mode gives the LB one poll cycle to
+	// observe /ready=503 and stop routing before the listener closes.
+	// In standalone mode there's no LB / no peer cluster — the grace
+	// just delays every shutdown for no benefit (local dev, integration
+	// tests). Skip it entirely. (Gemini PR #463 round 6.)
+	readyDrainGrace := 10 * time.Second
+	if !cfg.Cluster.Enabled {
+		readyDrainGrace = 0
+	}
+	shutdownCoordinator.RegisterHook("ready-flag-off", func(ctx context.Context) error {
+		server.MarkNotReady()
+		if readyDrainGrace == 0 {
+			return nil
+		}
+		// time.NewTimer + defer Stop instead of time.After: if ctx.Done
+		// wins the select, time.After would leak the underlying timer
+		// until the deadline expires. Bounded leak in a shutdown hook,
+		// but using the standard idiom anyway.
+		timer := time.NewTimer(readyDrainGrace)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			// Coordinator timeout — yield immediately so http-server hook
+			// can still run within the remaining budget. Better an
+			// undrained close than a deadlocked shutdown.
+		}
+		return nil
+	}, 5)
+
 	// Register HTTP server shutdown hook (first to stop accepting new
 	// requests). The 30-second arg is the HTTP server's INTERNAL drain
 	// timeout — independent of shutdownCoordinator's own 30-second
@@ -2515,6 +2601,14 @@ func main() {
 	shutdownCoordinator.RegisterHook("http-server", func(ctx context.Context) error {
 		return server.Shutdown(30 * time.Second)
 	}, shutdown.PriorityHTTPServer)
+
+	// Mark /ready=200 so the load balancer (Pattern 2 multi-writer) starts
+	// routing traffic here. By this point WAL recovery has completed
+	// (cmd/arc/main.go:701-724), the Arrow buffer is initialised, the
+	// cluster coordinator is up, and all background schedulers are running.
+	// In single-writer deployments this is also the signal to Kubernetes
+	// readiness probes / any LB doing httpchk that the node is healthy.
+	server.MarkReady()
 
 	// Start server
 	if err := server.Start(); err != nil {

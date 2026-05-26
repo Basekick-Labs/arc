@@ -32,25 +32,94 @@ func isHopByHop(header string) bool {
 	return hopByHopHeaders[header]
 }
 
-// BuildHTTPRequest converts a Fiber context to a net/http Request for forwarding via the router.
-// It copies the method, URL, body, and headers from the Fiber request.
+// BuildHTTPRequest converts a Fiber context to a net/http Request for
+// forwarding via the router.
+//
+// Lifecycle: every caller in this codebase (lineprotocol.go, msgpack.go,
+// tle.go, query.go, routing.go's RouteShardedWrite/Query) invokes the
+// returned *http.Request synchronously within the Fiber handler — they
+// pass it to router.RouteWrite/RouteQuery (which blocks on
+// http.Client.Do, and internally already buffers the body via io.ReadAll
+// for retry support, see internal/cluster/router.go forwardRequest) or
+// to shardRouter.RouteWrite/RouteQuery, then read+close the response
+// body inside CopyResponse, then return. fasthttp does not recycle the
+// RequestCtx until after the handler returns (fasthttp server.go
+// releaseCtx is post-handler), so wrapping c.Body() in bytes.NewReader
+// directly is safe and avoids a copy that can be large at max payload
+// (up to 1GB). Using c.Context() (returns *fasthttp.RequestCtx which
+// implements context.Context) is also correct here — it propagates
+// client-disconnect cancellation to the forwarded request, which
+// c.UserContext() (returns context.Background()) does NOT.
+//
+// If a future refactor moves any of this work to a background goroutine
+// or stream writer, those properties no longer hold and the caller
+// must take a defensive copy + use a non-pooled context. Today's
+// callers are all synchronous; revisit this if that changes.
 func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
 	// Build full URL from Fiber context
 	// c.BaseURL() returns scheme://host, c.OriginalURL() returns path + query
 	url := c.BaseURL() + c.OriginalURL()
 
-	// Read body - use a bytes.Reader for the body to allow retries in the router
+	// Wrap fasthttp's body slice directly — synchronous-handler lifecycle
+	// argument above. Router.forwardRequest then io.ReadAll's it into its
+	// own buffer for retry support before issuing http.Client.Do.
 	body := bytes.NewReader(c.Body())
 
-	// Create HTTP request with context
+	// c.Context() propagates client-disconnect cancellation to the
+	// forwarded request (so the backend stops processing if the original
+	// client gave up). c.UserContext() would default to context.Background
+	// and lose that signal.
 	req, err := http.NewRequestWithContext(c.Context(), c.Method(), url, body)
 	if err != nil {
 		return nil, err
 	}
 
-	// Copy all headers from Fiber request
+	// Copy headers from Fiber request, filtering connection-specific
+	// (hop-by-hop) headers + Content-Length per RFC 7230 §6.1.
+	//
+	// Filtered headers:
+	//   - hop-by-hop set (Connection, Keep-Alive, Proxy-Authenticate,
+	//     Proxy-Authorization, Te, Trailers, Transfer-Encoding,
+	//     Upgrade): these are connection-specific and MUST NOT be
+	//     forwarded by intermediaries. CopyResponse already filters
+	//     them on the response path via the same isHopByHop helper;
+	//     the request path was missing this filter.
+	//   - Content-Length: net/http sets req.ContentLength from the
+	//     body (it knows the body is *bytes.Reader and gets its
+	//     length), then writes Content-Length on the wire from
+	//     ContentLength. Forwarding a Content-Length from the
+	//     upstream header would duplicate the header or send a stale
+	//     value mismatched with the actual body size.
+	//
+	// Add (not Set) preserves multi-value headers: fasthttp emits a
+	// separate VisitAll callback per value, so Set would overwrite
+	// earlier values and only the last would forward. Affects Via,
+	// X-Forwarded-For, Accept (multiple content types), and similar.
+	//
+	// http.CanonicalHeaderKey before isHopByHop lookup: fasthttp
+	// normalises header keys to canonical form by default, but a
+	// future config change or fasthttp behavior shift could leave
+	// non-canonical keys leaking through. Canonicalising defensively
+	// also matches CopyResponse's behavior (Go's http.Header map keys
+	// are always canonical-cased).
+	// Direct map-write (rather than req.Header.Add) bypasses Add's
+	// internal CanonicalHeaderKey re-canonicalisation — k is already
+	// canonical from the line above, so re-canonicalising would be a
+	// wasted string scan + allocation per header.
+	//
+	// Host filter: net/http's Request.Write skips the Host header in the
+	// header map and writes Host from req.Host instead (req.go's
+	// reqWriteExcludeHeader), so leaving it in req.Header doesn't leak
+	// it onto the wire — but other code (middleware, logging, custom
+	// transports) that reads req.Header.Get("Host") would see the
+	// upstream client's Host instead of the target peer's. Filtering
+	// keeps the request struct's two notions of "host" consistent.
 	c.Request().Header.VisitAll(func(key, value []byte) {
-		req.Header.Set(string(key), string(value))
+		k := http.CanonicalHeaderKey(string(key))
+		if isHopByHop(k) || k == "Content-Length" || k == "Host" {
+			return
+		}
+		req.Header[k] = append(req.Header[k], string(value))
 	})
 
 	// Set remote address for X-Forwarded-For handling in router

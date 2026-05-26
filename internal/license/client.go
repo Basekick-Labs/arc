@@ -408,6 +408,17 @@ func (c *Client) CanUseArcx() bool {
 	return c.license != nil && c.license.CanUseArcx()
 }
 
+// CanUseSharedStorageMultiWriter returns true if Pattern 2 multi-writer
+// (N RoleWriter nodes sharing one object-storage backend) is allowed.
+// Read at process startup before opening the ingest gate; if false +
+// cluster.shared_storage_mode=true, Arc refuses to start with a clear
+// error pointing operators at the license documentation.
+func (c *Client) CanUseSharedStorageMultiWriter() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.license != nil && c.license.CanUseSharedStorageMultiWriter()
+}
+
 // GetFingerprint returns the machine fingerprint
 func (c *Client) GetFingerprint() string {
 	return c.fingerprint

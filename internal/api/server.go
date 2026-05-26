@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"runtime"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -29,6 +30,18 @@ type Server struct {
 	tlsEnabled     bool
 	tlsCert        string
 	tlsKey         string
+
+	// ready is the readiness flag surfaced by /ready (Kubernetes
+	// readiness probe; load-balancer health check). Zero = not ready
+	// (returns 503); non-zero = ready (returns 200). Starts at zero so
+	// startup work — most importantly WAL recovery in Pattern 2
+	// shared-storage multi-writer mode (cmd/arc/main.go:701-724) — can
+	// complete before the load balancer routes traffic to this writer.
+	// MarkReady() is called by main.go once all blocking startup work
+	// is done; MarkNotReady() is called by the graceful-shutdown hook
+	// so the LB drains this node before Stop() actually closes the
+	// listener. See docs/progress/2026-05-26-multi-writer-pattern2.md.
+	ready atomic.Bool
 }
 
 // ServerConfig holds server configuration
@@ -184,17 +197,58 @@ func (s *Server) healthHandler(c *fiber.Ctx) error {
 	})
 }
 
-// readyHandler returns server readiness status (for Kubernetes readiness probes)
+// readyHandler returns server readiness status for load-balancer health
+// checks and Kubernetes readiness probes.
+//
+// Returns 200 only when the server has finished startup work that must
+// complete before accepting traffic — most importantly WAL recovery in
+// Pattern 2 shared-storage multi-writer mode, where a writer that just
+// restarted must replay un-flushed WAL entries into its Arrow buffer
+// before re-opening the ingest gate (otherwise the LB would route
+// writes to it and risk duplicate/out-of-order entries on the
+// in-flight recovery boundary).
+//
+// Returns 503 in two cases:
+//
+//  1. Startup not complete: ready flag not yet flipped via MarkReady().
+//     main.go flips it after WAL recovery returns (cmd/arc/main.go:701).
+//  2. Graceful shutdown in progress: shutdown hook flips the flag back
+//     via MarkNotReady() so the LB drains this node before the listener
+//     closes. The /health endpoint stays 200 throughout — operators
+//     check /health for liveness ("is the process alive") and /ready
+//     for traffic-routing decisions ("should requests go here right
+//     now").
 func (s *Server) readyHandler(c *fiber.Ctx) error {
-	// Server is ready if it's responding to requests
-	// Additional checks can be added here (e.g., database connectivity)
-	uptime := time.Since(startTime).Seconds()
+	if !s.ready.Load() {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"status": "not_ready",
+			"time":   time.Now().UTC().Format(time.RFC3339),
+			"reason": "server is starting up or shutting down; load balancer should not route traffic here",
+		})
+	}
 
+	uptime := time.Since(startTime).Seconds()
 	return c.JSON(fiber.Map{
 		"status":     "ready",
 		"time":       time.Now().UTC().Format(time.RFC3339),
 		"uptime_sec": uptime,
 	})
+}
+
+// MarkReady flips the readiness flag to true. Called by main.go once
+// all blocking startup work (notably WAL recovery in Pattern 2
+// shared-storage multi-writer mode) has completed and the server is
+// safe for the load balancer to route traffic to.
+func (s *Server) MarkReady() {
+	s.ready.Store(true)
+}
+
+// MarkNotReady flips the readiness flag to false. Called by the
+// graceful-shutdown hook so the load balancer stops routing new
+// traffic to this node before the HTTP listener closes. In-flight
+// requests still drain via Fiber's normal shutdown handling.
+func (s *Server) MarkNotReady() {
+	s.ready.Store(false)
 }
 
 // metricsHandler returns metrics in Prometheus format or JSON

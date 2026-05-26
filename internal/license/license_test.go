@@ -429,3 +429,72 @@ func TestLicenseStruct(t *testing.T) {
 		t.Error("DaysRemaining mismatch")
 	}
 }
+
+// TestLicense_CanUseSharedStorageMultiWriter exercises the Pattern 2
+// multi-writer feature gate. Mirrors the shape used at the cmd/arc/main.go
+// startup-validation site: when cluster.shared_storage_mode=true, the
+// process refuses to start unless this returns true.
+func TestLicense_CanUseSharedStorageMultiWriter(t *testing.T) {
+	tests := []struct {
+		name    string
+		license *License
+		want    bool
+	}{
+		{
+			name:    "nil license",
+			license: nil,
+			want:    false,
+		},
+		{
+			name: "active license without feature",
+			license: &License{
+				Status:   "active",
+				Features: []string{FeatureClustering},
+			},
+			want: false,
+		},
+		{
+			name: "active license with feature",
+			license: &License{
+				Status:   "active",
+				Features: []string{FeatureClustering, FeatureSharedStorageMultiWriter},
+			},
+			want: true,
+		},
+		{
+			name: "expired license with feature",
+			license: &License{
+				Status:   "expired",
+				Features: []string{FeatureSharedStorageMultiWriter},
+			},
+			want: false,
+		},
+		{
+			name: "grace_period license with feature",
+			license: &License{
+				Status:   "grace_period",
+				Features: []string{FeatureSharedStorageMultiWriter},
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.license.CanUseSharedStorageMultiWriter(); got != tt.want {
+				t.Errorf("License.CanUseSharedStorageMultiWriter() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestFeatureSharedStorageMultiWriter_Constant pins the wire-format value
+// of the feature flag string. The license server emits this exact string
+// in the Features array; renaming it on the Arc side would silently break
+// activation for every existing customer until they re-issue.
+func TestFeatureSharedStorageMultiWriter_Constant(t *testing.T) {
+	if FeatureSharedStorageMultiWriter != "shared_storage_multi_writer" {
+		t.Errorf("FeatureSharedStorageMultiWriter = %q, want %q (wire-format change requires license server coordination)",
+			FeatureSharedStorageMultiWriter, "shared_storage_multi_writer")
+	}
+}
