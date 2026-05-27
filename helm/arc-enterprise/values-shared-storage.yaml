@@ -36,7 +36,18 @@ minio:
     size: 100Gi
 
 writer:
-  replicas: 1                                # bump to 3 for HA + failover
+  # In shared-storage mode the writer pods all accept writes concurrently
+  # (Pattern 2 multi-writer) — a Kubernetes Service load-balances incoming
+  # writes across all healthy writer pods, and each writer PUTs to the
+  # shared bucket independently. Singleton background tasks (retention,
+  # CQ, delete) run on whichever pod is the cluster Raft leader.
+  #   replicas: 1 — single writer (lowest cost; LB still routes through
+  #                 the Service so client URLs work identically to multi)
+  #   replicas: 3 — HA + horizontal scale (Raft quorum tolerates 1 failure;
+  #                 LB routes writes round-robin across all healthy pods)
+  #   replicas: 2 — REFUSED by _validation.tpl (no failure tolerance — a
+  #                 quorum of 2 stalls Raft writes on any single-pod loss)
+  replicas: 1
   persistence:
     size: 20Gi                               # WAL only; bucket holds Parquet
 

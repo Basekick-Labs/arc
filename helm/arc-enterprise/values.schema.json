@@ -147,7 +147,7 @@
         "replicas": {
           "type": "integer",
           "minimum": 1,
-          "description": "1 for dev, 3+ for HA. 2 is rejected (Raft split-brain hazard) via a cross-field check with a human-readable message."
+          "description": "1 for dev, 3+ for HA. 2 is rejected (no failure tolerance — Raft quorum=2 stalls on single-pod loss) via a cross-field check with a human-readable message."
         },
         "resources":   { "type": "object" },
         "persistence": {

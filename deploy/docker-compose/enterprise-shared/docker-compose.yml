@@ -13,7 +13,9 @@ x-arc-common: &arc-common
     - arc-cluster
   depends_on:
     minio:
-      condition: service_started
+      condition: service_healthy
+    minio-init:
+      condition: service_completed_successfully
 
 x-arc-env: &arc-env
   # Cluster
@@ -22,6 +24,14 @@ x-arc-env: &arc-env
   ARC_CLUSTER_SEEDS: "arc-writer1:9100,arc-writer2:9100,arc-writer3:9100"
   ARC_CLUSTER_COORDINATOR_ADDR: ":9100"
   ARC_CLUSTER_RAFT_BIND_ADDR: ":9200"
+  # Pattern 2 multi-writer: all RoleWriter nodes accept writes
+  # concurrently and PUT to the shared MinIO bucket. Writer failover
+  # is suppressed (LB does failover via retry). Singleton background
+  # tasks (retention, CQ, delete) run on whichever node is the cluster
+  # Raft leader. Requires Enterprise license with the
+  # shared_storage_multi_writer feature.
+  # See docs/progress/2026-05-26-multi-writer-pattern2.md.
+  ARC_CLUSTER_SHARED_STORAGE_MODE: "true"
   # Storage (MinIO)
   ARC_STORAGE_BACKEND: "s3"
   ARC_STORAGE_S3_BUCKET: "arc-data"
@@ -171,6 +181,13 @@ services:
       ARC_CLUSTER_NODE_ID: "arc-reader1"
       ARC_CLUSTER_ROLE: "reader"
       ARC_CLUSTER_ADVERTISE_ADDR: "arc-reader1:9100"
+      # Raft transport is mandatory in cluster mode even on read-only nodes:
+      # readers join the cluster Raft to receive replicated auth/RBAC state
+      # (Phase A cluster auth). Without these, Raft init fails with "local
+      # bind address is not advertisable", the cluster coordinator falls
+      # back to standalone, and the reader bootstraps its OWN admin token —
+      # so writer-issued tokens are rejected at /api/v1/query.
+      ARC_CLUSTER_RAFT_ADVERTISE_ADDR: "arc-reader1:9200"
       ARC_CLUSTER_REPLICATION_ENABLED: "true"
     labels:
       <<: *traefik-reader-labels
@@ -194,6 +211,37 @@ services:
       - minio-data:/data
     networks:
       - arc-cluster
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  # =============================================================================
+  # minio-init — one-shot bucket creation
+  #
+  # Runs after MinIO reports healthy, creates the `arc-data` bucket if
+  # it doesn't already exist, then exits. Arc writers fail their first
+  # S3 PUT silently if the bucket is missing (the HeadBucket warning is
+  # not fatal); without this init step the cluster boots cleanly but
+  # data writes never persist. Idempotent — re-running compose up does
+  # not affect an existing bucket.
+  # =============================================================================
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - arc-cluster
+    entrypoint: >-
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      (mc mb --ignore-existing local/arc-data) &&
+      echo 'minio-init: bucket arc-data ready'
+      "
+    restart: "no"
 
 volumes:
   arc-writer1-data:

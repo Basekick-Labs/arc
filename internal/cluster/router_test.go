@@ -187,6 +187,148 @@ func TestRouterRoundRobinSelection(t *testing.T) {
 	}
 }
 
+// TestRouterRoundRobinWriterSelection pins the Pattern 2 multi-writer
+// fix: when no primary writer is designated (the always-true case in
+// shared-storage mode + the transient failover case in legacy mode),
+// RouteWrite's fallback distributes across all healthy writers via
+// selectWriter's round-robin, instead of the pre-PR1b "always pick
+// writers[0]" behaviour that defeated the load balancer.
+//
+// Writer rotation uses a separate index from reader rotation so the
+// two don't interleave-skew each other; a separate sub-test interleaves
+// reader and writer selects and asserts both rotations remain stable.
+func TestRouterRoundRobinWriterSelection(t *testing.T) {
+	t.Run("evenly distributes across writers", func(t *testing.T) {
+		registry := newTestRegistry()
+		for i := 1; i <= 3; i++ {
+			writer := NewNode(fmt.Sprintf("writer-%d", i), "Writer", RoleWriter, "test-cluster")
+			writer.UpdateState(StateHealthy)
+			writer.APIAddress = fmt.Sprintf("10.0.0.%d:8000", i)
+			registry.Register(writer)
+		}
+
+		// Local node is a reader so RouteWrite doesn't short-circuit to
+		// ErrLocalNodeCanHandle. We're testing the writer-selection path
+		// from a reader's perspective.
+		localNode := NewNode("reader-1", "Reader", RoleReader, "test-cluster")
+		router := NewRouter(&RouterConfig{
+			Strategy:  LoadBalanceRoundRobin,
+			Registry:  registry,
+			LocalNode: localNode,
+			Logger:    zerolog.Nop(),
+		})
+
+		writers := registry.GetWriters()
+		selected := make(map[string]int)
+		for i := 0; i < 9; i++ {
+			node := router.selectWriter(writers)
+			selected[node.ID]++
+		}
+
+		// Each writer should be selected exactly 3 times.
+		if len(selected) != 3 {
+			t.Errorf("expected 3 distinct writers selected, got %d", len(selected))
+		}
+		for id, count := range selected {
+			if count != 3 {
+				t.Errorf("writer %s selected %d times, expected 3", id, count)
+			}
+		}
+	})
+
+	t.Run("RouteWrite uses selectWriter when no primary designated", func(t *testing.T) {
+		// End-to-end check that RouteWrite's no-primary fallback goes
+		// through selectWriter (round-robin), not the pre-PR1b
+		// writers[0] always-pick. We can't easily observe which
+		// writer RouteWrite chose without standing up real backends,
+		// but we CAN observe that the writerIndex counter advances
+		// on each call — which only happens via the selectWriter path.
+		registry := newTestRegistry()
+		for i := 1; i <= 3; i++ {
+			w := NewNode(fmt.Sprintf("writer-%d", i), "W", RoleWriter, "test")
+			w.UpdateState(StateHealthy)
+			w.APIAddress = "127.0.0.1:1" // dummy; we don't actually forward
+			registry.Register(w)
+		}
+		local := NewNode("reader-1", "R", RoleReader, "test")
+		router := NewRouter(&RouterConfig{
+			Strategy:  LoadBalanceRoundRobin,
+			Registry:  registry,
+			LocalNode: local,
+			Logger:    zerolog.Nop(),
+		})
+
+		// Sanity: registry's GetPrimaryWriter is nil (no WriterStatePrimary set).
+		if registry.GetPrimaryWriter() != nil {
+			t.Fatal("test precondition: GetPrimaryWriter must be nil for this case")
+		}
+
+		startIdx := router.writerIndex.Load()
+		// Multiple RouteWrite calls fail at the forward step (127.0.0.1:1
+		// is a dummy address) but selectWriter runs before the forward,
+		// so the index must advance regardless of forward success. We use
+		// a minimal valid *http.Request so doForward's URL handling
+		// doesn't panic.
+		dummyReq, _ := http.NewRequest("POST", "http://test/write", nil)
+		for i := 0; i < 5; i++ {
+			_, _ = router.RouteWrite(context.Background(), dummyReq)
+		}
+		endIdx := router.writerIndex.Load()
+
+		// Each call to RouteWrite -> selectWriter -> writerIndex.Add(1)
+		// (when len(writers) > 1). 5 calls -> +5.
+		if got := endIdx - startIdx; got != 5 {
+			t.Errorf("writerIndex advanced by %d after 5 RouteWrite calls; expected 5. "+
+				"selectWriter is NOT being invoked from RouteWrite's no-primary fallback — "+
+				"the writers[0] always-pick bug may have regressed.", got)
+		}
+	})
+
+	t.Run("writer index is independent of reader index", func(t *testing.T) {
+		// Interleave writer and reader selects. If both rotations
+		// share a counter, one would advance the other and the
+		// distribution would skew. With separate writerIndex /
+		// readerIndex, both rotations stay even.
+		registry := newTestRegistry()
+		for i := 1; i <= 3; i++ {
+			w := NewNode(fmt.Sprintf("writer-%d", i), "W", RoleWriter, "test")
+			w.UpdateState(StateHealthy)
+			w.APIAddress = fmt.Sprintf("10.0.0.%d:8000", i)
+			registry.Register(w)
+			r := NewNode(fmt.Sprintf("reader-%d", i), "R", RoleReader, "test")
+			r.UpdateState(StateHealthy)
+			r.APIAddress = fmt.Sprintf("10.0.1.%d:8000", i)
+			registry.Register(r)
+		}
+		local := NewNode("compactor-1", "C", RoleCompactor, "test")
+		router := NewRouter(&RouterConfig{
+			Strategy:  LoadBalanceRoundRobin,
+			Registry:  registry,
+			LocalNode: local,
+			Logger:    zerolog.Nop(),
+		})
+		writers := registry.GetWriters()
+		readers := registry.GetReaders()
+		wcount := make(map[string]int)
+		rcount := make(map[string]int)
+		// 9 each, interleaved.
+		for i := 0; i < 9; i++ {
+			wcount[router.selectWriter(writers).ID]++
+			rcount[router.selectNode(readers).ID]++
+		}
+		for id, c := range wcount {
+			if c != 3 {
+				t.Errorf("writer %s selected %d times (interleaved); expected 3 — rotation got skewed by reader selects", id, c)
+			}
+		}
+		for id, c := range rcount {
+			if c != 3 {
+				t.Errorf("reader %s selected %d times (interleaved); expected 3 — rotation got skewed by writer selects", id, c)
+			}
+		}
+	})
+}
+
 func TestRouterLeastConnectionsSelection(t *testing.T) {
 	registry := newTestRegistry()
 
