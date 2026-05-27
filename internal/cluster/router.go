@@ -450,6 +450,7 @@ func (r *Router) Stats() map[string]interface{} {
 		"timeout_ms":         r.cfg.Timeout.Milliseconds(),
 		"retries":            r.cfg.Retries,
 		"reader_index":       r.readerIndex.Load(),
+		"writer_index":       r.writerIndex.Load(),
 		"active_connections": connStats,
 	}
 }

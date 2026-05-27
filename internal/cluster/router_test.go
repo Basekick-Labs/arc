@@ -463,6 +463,17 @@ func TestRouterStats(t *testing.T) {
 	if connStats["node-2"] != 1 {
 		t.Errorf("node-2 connections = %d, want 1", connStats["node-2"])
 	}
+
+	// Both rotation counters surface in Stats — operators need parity
+	// between reader_index (since day 1) and writer_index (Pattern 2
+	// multi-writer, PR1b). The keys must be present even when the
+	// rotation hasn't been used yet (value 0).
+	if _, ok := stats["reader_index"]; !ok {
+		t.Error("reader_index missing from Stats()")
+	}
+	if _, ok := stats["writer_index"]; !ok {
+		t.Error("writer_index missing from Stats()")
+	}
 }
 
 func TestRouterFallbackToWriterForQuery(t *testing.T) {
