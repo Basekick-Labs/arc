@@ -283,15 +283,20 @@ curl -fsS -X POST "$TRAEFIK_URL/api/v1/databases" \
   -d "{\"name\":\"$DATABASE\"}" >/dev/null || fail "create database"
 
 # ---------- determine kill target (crash scenarios) ----------
+# Note: `VAR=$(fn)` under `set -e` exits immediately on a non-zero
+# return from fn, bypassing the `[[ -z "$VAR" ]] && fail "..."` check
+# and the helpful diagnostic message. Append `|| true` so the
+# assignment can't tear down the script — the explicit emptiness
+# check below produces the actual operator-readable failure.
 KILL_TARGET=""
 case "$SCENARIO" in
   leader-crash)
-    KILL_TARGET=$(find_leader)
+    KILL_TARGET=$(find_leader) || true
     [[ -z "$KILL_TARGET" ]] && fail "could not identify Raft leader"
     log "kill target (leader): $KILL_TARGET"
     ;;
   non-leader-crash)
-    KILL_TARGET=$(find_non_leader)
+    KILL_TARGET=$(find_non_leader) || true
     [[ -z "$KILL_TARGET" ]] && fail "could not identify non-leader writer"
     log "kill target (non-leader): $KILL_TARGET"
     ;;
@@ -313,9 +318,14 @@ START=$(date +%s)
 while [[ $WRITTEN_SENT -lt $RECORDS ]]; do
   remaining=$(( RECORDS - WRITTEN_SENT ))
   this_batch=$(( remaining < BATCH ? remaining : BATCH ))
+  # Capture base timestamp once per batch — forking `date` per record
+  # is ~70× slower (measured: 1000 records went 2.16s → 0.03s with
+  # this hoist). Uniqueness is preserved by the per-record offset
+  # (WRITTEN_SENT + i, microsecond resolution).
+  base_ts=$(date +%s)
   lines=""
   for ((i = 0; i < this_batch; i++)); do
-    ts_us=$(( ($(date +%s) * 1000000) + WRITTEN_SENT + i ))
+    ts_us=$(( (base_ts * 1000000) + WRITTEN_SENT + i ))
     lines+="$MEASUREMENT,host=server$((WRITTEN_SENT + i)) usage=$((RANDOM % 100)) $ts_us"$'\n'
   done
 
