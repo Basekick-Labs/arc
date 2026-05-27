@@ -155,9 +155,22 @@ func (p *LineProtocolParser) parseLineWithPrecision(line []byte, precision strin
 // growing slice for every part — measurable cost on the ingest hot
 // path (#354).
 func splitOnDelimiter(data []byte, delim byte) [][]byte {
+	// Empty-input fast path: avoid the make([]) allocation when there's
+	// nothing to split. Not reachable on the production hot path today
+	// (callers pre-check len(line) > 0) but defensive for hypothetical
+	// future callers.
+	if len(data) == 0 {
+		return nil
+	}
 	// Pre-size for the common case: telegraf lines split into 3-4 parts
 	// on space, tags/fields split into 4-8 on comma. Cap of 4 covers
 	// both without over-allocating on simple lines.
+	//
+	// Note: tried dynamic capacity (cap=8 on comma) per Gemini suggestion
+	// but the full-path ParseBatch bench regressed by +9% / +1.9 KB
+	// because most production comma-splits have ≤4 parts (1-tag
+	// measurements, single-field writes) — oversizing them costs more
+	// than the rare 5+-part case saves. Kept at 4 with bench evidence.
 	parts := make([][]byte, 0, 4)
 	start := 0
 	inQuotes := false
