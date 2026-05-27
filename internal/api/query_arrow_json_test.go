@@ -77,17 +77,23 @@ func buildArrowBatch(
 	for i, b := range builders {
 		cols[i] = b.NewArray()
 	}
-
-	rec := array.NewRecord(schema, cols, int64(len(rows)))
+	// Defer the cols Release so it fires even if array.NewRecord panics
+	// (length-mismatch + schema-mismatch are documented panic paths —
+	// verified empirically). Without defer, a NewRecord panic in a
+	// future schema-evolution test would leak every cols entry.
 	// array.NewRecord retains each column (increments refcount); the
 	// builder-returned arrays in `cols` are the test's own references and
 	// must be released so the final refcount on each buffer drops to
 	// (Record's count). When the record is released, refcount hits zero
 	// and CheckedAllocator sees a clean shutdown.
-	for _, c := range cols {
-		c.Release()
-	}
-	return rec
+	defer func() {
+		for _, c := range cols {
+			if c != nil {
+				c.Release()
+			}
+		}
+	}()
+	return array.NewRecord(schema, cols, int64(len(rows)))
 }
 
 // simpleRecordReader wraps a single record batch as an array.RecordReader.
