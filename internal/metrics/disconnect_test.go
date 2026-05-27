@@ -3,6 +3,7 @@ package metrics
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestIncQueryClientDisconnect covers the three valid paths plus the
@@ -10,17 +11,24 @@ import (
 // matter for #426: if a typo at a call site (e.g. "arrow-json" instead
 // of "arrow_json") were ever to land, we'd rather emit no count than
 // pollute the labelled time series with a malformed value.
+//
+// Note on string-literal usage: the VALID-label calls use the typed
+// constants (matching production call-site discipline); the INVALID
+// calls use raw literals on purpose — typed constants would defeat
+// the test (you can't typo a constant, so you can't test the silent-
+// drop guard with one).
 func TestIncQueryClientDisconnect(t *testing.T) {
-	m := &Metrics{}
+	m := &Metrics{startTime: time.Now().UTC()}
 
-	m.IncQueryClientDisconnect("arrow_ipc")
-	m.IncQueryClientDisconnect("arrow_ipc")
-	m.IncQueryClientDisconnect("arrow_json")
-	m.IncQueryClientDisconnect("sql_json")
-	m.IncQueryClientDisconnect("sql_json")
-	m.IncQueryClientDisconnect("sql_json")
+	m.IncQueryClientDisconnect(DisconnectPathArrowIPC)
+	m.IncQueryClientDisconnect(DisconnectPathArrowIPC)
+	m.IncQueryClientDisconnect(DisconnectPathArrowJSON)
+	m.IncQueryClientDisconnect(DisconnectPathSQLJSON)
+	m.IncQueryClientDisconnect(DisconnectPathSQLJSON)
+	m.IncQueryClientDisconnect(DisconnectPathSQLJSON)
 
-	// Invalid label: must NOT increment any counter.
+	// Invalid labels: must NOT increment any counter. Raw literals
+	// here on purpose — see comment above.
 	m.IncQueryClientDisconnect("arrow-json")
 	m.IncQueryClientDisconnect("")
 
@@ -41,11 +49,17 @@ func TestIncQueryClientDisconnect(t *testing.T) {
 // must be present so rate() over a fresh process doesn't produce
 // gaps). Also locks in the metric name + label shape against
 // accidental rename.
+//
+// startTime: time.Now().UTC() is required because PrometheusFormat
+// emits arc_uptime_seconds derived from time.Since(m.startTime). A
+// zero startTime yields ~9.2e9 seconds (~292 years) which is
+// observationally harmless but misleading if a test ever asserts on
+// uptime shape.
 func TestPrometheusFormat_DisconnectMetric(t *testing.T) {
-	m := &Metrics{}
-	m.IncQueryClientDisconnect("arrow_ipc")
-	m.IncQueryClientDisconnect("sql_json")
-	m.IncQueryClientDisconnect("sql_json")
+	m := &Metrics{startTime: time.Now().UTC()}
+	m.IncQueryClientDisconnect(DisconnectPathArrowIPC)
+	m.IncQueryClientDisconnect(DisconnectPathSQLJSON)
+	m.IncQueryClientDisconnect(DisconnectPathSQLJSON)
 
 	out := m.PrometheusFormat()
 

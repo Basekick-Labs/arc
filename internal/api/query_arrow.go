@@ -270,7 +270,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			// client-side events (disconnect / deadline / context-cancel)
 			// — server-side stream failures stay in IncQueryErrors only.
 			if isClientError(streamErr) {
-				m.IncQueryClientDisconnect("arrow_ipc")
+				m.IncQueryClientDisconnect(metrics.DisconnectPathArrowIPC)
 			}
 			// Warn for client-disconnect / timeout (expected ops noise);
 			// Error for everything else (real server-side problem worth

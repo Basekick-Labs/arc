@@ -159,7 +159,7 @@ func executeArrowJSONQuery(
 			// for the rationale; arrow_json is the duckdb_arrow build path
 			// that /api/v1/query takes by default.
 			if isClientError(streamErr) {
-				m.IncQueryClientDisconnect("arrow_json")
+				m.IncQueryClientDisconnect(metrics.DisconnectPathArrowJSON)
 			}
 			// Warn for client-disconnect / context expiry (expected ops noise
 			// — headers were already committed, the client got partial bytes).

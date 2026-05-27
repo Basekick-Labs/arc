@@ -281,17 +281,28 @@ func (m *Metrics) RecordQueryLatency(durationMicros int64) {
 	m.queryLatencyCount.Add(1)
 }
 
+// Label values for the arc_query_client_disconnects_total Prometheus
+// counter. Exported so callers in internal/api can reference them via
+// these constants instead of repeating the string literal at every
+// call site — typos become compile-time errors and the label set
+// stays single-source-of-truth here.
+const (
+	DisconnectPathArrowIPC  = "arrow_ipc"
+	DisconnectPathArrowJSON = "arrow_json"
+	DisconnectPathSQLJSON   = "sql_json"
+)
+
 // IncQueryClientDisconnect increments the per-handler client-disconnect
-// counter. `path` MUST be one of "arrow_ipc", "arrow_json", "sql_json";
+// counter. `path` MUST be one of the DisconnectPath* constants above;
 // any other value is silently dropped so a typo at the call site can't
 // emit a malformed labelled time series.
 func (m *Metrics) IncQueryClientDisconnect(path string) {
 	switch path {
-	case "arrow_ipc":
+	case DisconnectPathArrowIPC:
 		m.queryDisconnectsArrowIPC.Add(1)
-	case "arrow_json":
+	case DisconnectPathArrowJSON:
 		m.queryDisconnectsArrowJSON.Add(1)
-	case "sql_json":
+	case DisconnectPathSQLJSON:
 		m.queryDisconnectsSQLJSON.Add(1)
 	}
 }
@@ -717,9 +728,9 @@ func (m *Metrics) PrometheusFormat() string {
 	// behaviour (#426).
 	b = append(b, "# HELP arc_query_client_disconnects_total Streaming queries the client closed mid-response, by handler path\n"...)
 	b = append(b, "# TYPE arc_query_client_disconnects_total counter\n"...)
-	b = appendMetricWithLabel(b, "arc_query_client_disconnects_total", "path", "arrow_ipc", float64(m.queryDisconnectsArrowIPC.Load()))
-	b = appendMetricWithLabel(b, "arc_query_client_disconnects_total", "path", "arrow_json", float64(m.queryDisconnectsArrowJSON.Load()))
-	b = appendMetricWithLabel(b, "arc_query_client_disconnects_total", "path", "sql_json", float64(m.queryDisconnectsSQLJSON.Load()))
+	b = appendMetricWithLabel(b, "arc_query_client_disconnects_total", "path", DisconnectPathArrowIPC, float64(m.queryDisconnectsArrowIPC.Load()))
+	b = appendMetricWithLabel(b, "arc_query_client_disconnects_total", "path", DisconnectPathArrowJSON, float64(m.queryDisconnectsArrowJSON.Load()))
+	b = appendMetricWithLabel(b, "arc_query_client_disconnects_total", "path", DisconnectPathSQLJSON, float64(m.queryDisconnectsSQLJSON.Load()))
 
 	// Buffer metrics
 	b = append(b, "# HELP arc_buffer_records_buffered Records currently buffered\n"...)
