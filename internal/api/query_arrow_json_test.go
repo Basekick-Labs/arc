@@ -39,8 +39,15 @@ func buildArrowBatch(
 		builders[i] = array.NewBuilder(alloc, f.Type)
 	}
 	defer func() {
+		// nil-check: if array.NewBuilder panicked partway through the
+		// init loop above, `builders` is partially populated and the
+		// trailing entries are nil. Calling Release() on a nil
+		// array.Builder panics with a secondary nil-deref, which
+		// masks the original panic and makes test failures opaque.
 		for _, b := range builders {
-			b.Release()
+			if b != nil {
+				b.Release()
+			}
 		}
 	}()
 
