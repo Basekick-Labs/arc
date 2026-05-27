@@ -154,25 +154,22 @@ jobs:
 
       - name: Export digests
         run: |
-          # The digest is identical across both registries (same image
-          # content) but we write it to per-registry dirs so the merge
-          # job can build each manifest independently. They should match;
-          # we assert that so a divergence (e.g. a non-reproducible build)
-          # fails loudly rather than producing mismatched manifests.
+          # Each registry returns its OWN manifest digest for the same
+          # image content — push-by-digest serialises the manifest per
+          # registry, so the two digests legitimately differ. Keep them
+          # in separate per-registry dirs; the merge job references each
+          # registry's digest when building that registry's manifest.
           ghcr_digest="${{ steps.build_ghcr.outputs.digest }}"
           dockerhub_digest="${{ steps.build_dockerhub.outputs.digest }}"
-          if [[ "$ghcr_digest" != "$dockerhub_digest" ]]; then
-            echo "::error::digest mismatch between registries: ghcr=$ghcr_digest dockerhub=$dockerhub_digest"
-            exit 1
-          fi
-          mkdir -p /tmp/digests
-          touch "/tmp/digests/${ghcr_digest#sha256:}"
+          mkdir -p /tmp/digests/ghcr /tmp/digests/dockerhub
+          touch "/tmp/digests/ghcr/${ghcr_digest#sha256:}"
+          touch "/tmp/digests/dockerhub/${dockerhub_digest#sha256:}"
 
-      - name: Upload digest
+      - name: Upload digests
         uses: actions/upload-artifact@v4
         with:
           name: digests-${{ strategy.job-index }}
-          path: /tmp/digests/*
+          path: /tmp/digests/**
           if-no-files-found: error
           retention-days: 1
 
@@ -531,7 +528,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Create manifest list and push (GHCR)
-        working-directory: /tmp/digests
+        working-directory: /tmp/digests/ghcr
         env:
           IMAGE_REF: ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}
           VERSION: ${{ needs.prepare.outputs.version }}
@@ -540,8 +537,8 @@ jobs:
         run: |
           # Multi-arch manifest with version + short_version, plus latest
           # unless this is a test_mode run (which must not clobber latest).
-          # The digests were pushed by-digest to GHCR in docker-build, so
-          # imagetools can reference them by @sha256 here.
+          # /tmp/digests/ghcr/* are the per-platform GHCR manifest digests
+          # (each registry returns its own digest for the same content).
           TAGS=( -t "${IMAGE_REF}:${VERSION}" -t "${IMAGE_REF}:${SHORT_VERSION}" )
           if [ "${TEST_MODE}" != "true" ]; then
             TAGS+=( -t "${IMAGE_REF}:latest" )
@@ -553,15 +550,15 @@ jobs:
           echo "✅ GHCR multi-arch manifest pushed" >> $GITHUB_STEP_SUMMARY
 
       - name: Create manifest list and push (Docker Hub)
-        working-directory: /tmp/digests
+        working-directory: /tmp/digests/dockerhub
         env:
           IMAGE_REF: ${{ env.REGISTRY_DOCKERHUB }}/${{ env.IMAGE_NAME_DOCKERHUB }}
           VERSION: ${{ needs.prepare.outputs.version }}
           SHORT_VERSION: ${{ needs.prepare.outputs.short_version }}
           TEST_MODE: ${{ needs.prepare.outputs.test_mode }}
         run: |
-          # Same digests were also pushed by-digest to Docker Hub in
-          # docker-build, so the @sha256 references resolve there too.
+          # /tmp/digests/dockerhub/* are the per-platform Docker Hub
+          # manifest digests — distinct from the GHCR digests above.
           # latest is suppressed in test_mode, identical to the GHCR step.
           TAGS=( -t "${IMAGE_REF}:${VERSION}" -t "${IMAGE_REF}:${SHORT_VERSION}" )
           if [ "${TEST_MODE}" != "true" ]; then
