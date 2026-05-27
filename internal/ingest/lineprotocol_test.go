@@ -560,3 +560,26 @@ disk,host=server03 used=30.0 1609459200000000002`)
 		parser.ParseBatch(batch)
 	}
 }
+
+// BenchmarkSplitOnDelimiter exercises the underlying splitter directly
+// (closes #354 — verifies the sub-slice indexing fix vs the previous
+// per-byte append loop). The two inputs cover the two real call sites:
+// `splitLine` (spaces, ~4 parts per telegraf line) and `splitOnComma`
+// (tags/fields, often 5-8 parts).
+func BenchmarkSplitOnDelimiter(b *testing.B) {
+	line := []byte("cpu,host=server01,region=us-west,env=prod usage_idle=90.5,usage_system=2.1,usage_user=7.4 1609459200000000000")
+	tags := []byte("cpu,host=server01,region=us-west,env=prod,role=primary,zone=a")
+
+	b.Run("space_delimiter", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = splitOnDelimiter(line, ' ')
+		}
+	})
+	b.Run("comma_delimiter", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = splitOnDelimiter(tags, ',')
+		}
+	})
+}

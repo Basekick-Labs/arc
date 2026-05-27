@@ -146,31 +146,49 @@ func (p *LineProtocolParser) parseLineWithPrecision(line []byte, precision strin
 
 // splitOnDelimiter splits data on an unescaped delimiter, respecting escaped chars and quoted strings.
 // Used by splitLine (space) and splitOnComma (comma).
+//
+// The returned slices alias `data` — callers MUST NOT mutate either
+// the returned parts or the input buffer. (Current callers only read,
+// passing parts into parseMeasurementTags / parseFields / strconv.)
+// Sub-slice indexing avoids the per-byte append seen in the previous
+// implementation, which on a typical telegraf line allocates a fresh
+// growing slice for every part — measurable cost on the ingest hot
+// path (#354).
 func splitOnDelimiter(data []byte, delim byte) [][]byte {
-	var parts [][]byte
-	var current []byte
+	// Pre-size for the common case: telegraf lines split into 3-4 parts
+	// on space, tags/fields split into 4-8 on comma. Cap of 4 covers
+	// both without over-allocating on simple lines.
+	parts := make([][]byte, 0, 4)
+	start := 0
 	inQuotes := false
 
+	// Note on `continue` below: bytes consumed by the escape and quote
+	// branches are NOT dropped — they remain inside the current sub-slice
+	// because sub-slicing captures the whole [start:next-delim] range.
+	// `continue` here only skips the delimiter check; the byte itself is
+	// implicitly captured when the next delimiter or end-of-data fires.
 	for i := 0; i < len(data); i++ {
 		if data[i] == '\\' && i+1 < len(data) {
-			// Escaped character - include both backslash and next char
-			current = append(current, data[i], data[i+1])
+			// Escape consumes the next byte verbatim. Advance past it
+			// so the delimiter check below doesn't fire on, e.g., an
+			// escaped space ('\ ') or escaped comma ('\,').
 			i++
-		} else if data[i] == '"' {
+			continue
+		}
+		if data[i] == '"' {
 			inQuotes = !inQuotes
-			current = append(current, data[i])
-		} else if data[i] == delim && !inQuotes {
-			if len(current) > 0 {
-				parts = append(parts, current)
-				current = nil
+			continue
+		}
+		if data[i] == delim && !inQuotes {
+			if i > start {
+				parts = append(parts, data[start:i])
 			}
-		} else {
-			current = append(current, data[i])
+			start = i + 1
 		}
 	}
 
-	if len(current) > 0 {
-		parts = append(parts, current)
+	if len(data) > start {
+		parts = append(parts, data[start:])
 	}
 
 	return parts
