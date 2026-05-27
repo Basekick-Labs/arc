@@ -19,6 +19,15 @@ import (
 )
 
 // buildArrowBatch creates an Arrow record batch from Go slices for testing.
+//
+// Each builder is released after its array is extracted: b.NewArray()
+// transfers buffer ownership to the returned array, but the builder
+// retains its own reference to those buffers until Release() is called.
+// Without this, every call to buildArrowBatch leaks builder-side
+// allocations — invisible under memory.NewGoAllocator (Go GC eats it),
+// but fatal under memory.NewCheckedAllocator (AssertSize(t, 0) panics).
+// Releasing the builders here lets tests use CheckedAllocator and catch
+// real Arrow leaks in production code paths.
 func buildArrowBatch(
 	alloc memory.Allocator,
 	schema *arrow.Schema,
@@ -29,6 +38,11 @@ func buildArrowBatch(
 	for i, f := range schema.Fields() {
 		builders[i] = array.NewBuilder(alloc, f.Type)
 	}
+	defer func() {
+		for _, b := range builders {
+			b.Release()
+		}
+	}()
 
 	for _, row := range rows {
 		for col, val := range row {
@@ -57,7 +71,16 @@ func buildArrowBatch(
 		cols[i] = b.NewArray()
 	}
 
-	return array.NewRecord(schema, cols, int64(len(rows)))
+	rec := array.NewRecord(schema, cols, int64(len(rows)))
+	// array.NewRecord retains each column (increments refcount); the
+	// builder-returned arrays in `cols` are the test's own references and
+	// must be released so the final refcount on each buffer drops to
+	// (Record's count). When the record is released, refcount hits zero
+	// and CheckedAllocator sees a clean shutdown.
+	for _, c := range cols {
+		c.Release()
+	}
+	return rec
 }
 
 // simpleRecordReader wraps a single record batch as an array.RecordReader.
@@ -357,14 +380,14 @@ func (e *errAfterNBytes) Write(p []byte) (int, error) {
 // limitation: that channel only fires on server shutdown, so Flush errors are
 // our only signal that the client has gone away.
 func TestStreamArrowJSON_FlushErrorBreaksLoop(t *testing.T) {
-	// Note: this test uses NewGoAllocator (not CheckedAllocator) to match
-	// the rest of the test file. The buildArrowBatch helper creates Arrow
-	// builders that aren't explicitly Released — CheckedAllocator would
-	// flag those as leaks, but they're pre-existing and out of scope for
-	// the disconnect-handling fix this test verifies. The actual code path
-	// being tested (streamArrowJSON's break-on-Flush-error) does not itself
-	// retain any Arrow memory beyond what simpleRecordReader.Release frees.
-	alloc := memory.NewGoAllocator()
+	// CheckedAllocator + AssertSize(t, 0) at the end of the test verifies
+	// that streamArrowJSON's break-on-Flush-error path doesn't leak Arrow
+	// memory. The buildArrowBatch helper now releases its builders (#427)
+	// so the only allocations live in the records themselves, which
+	// simpleRecordReader.Release frees. If a future edit forgets to
+	// release a record after the break, AssertSize will catch it.
+	alloc := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	defer alloc.AssertSize(t, 0)
 
 	schema := arrow.NewSchema([]arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
