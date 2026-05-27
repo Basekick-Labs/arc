@@ -1556,6 +1556,10 @@ localProcessing:
 						h.queryRegistry.Fail(queryID, streamErr.Error())
 					}
 				}
+				// Per-handler client-disconnect counter (#426).
+				if isClientError(streamErr) {
+					m.IncQueryClientDisconnect(metrics.DisconnectPathSQLJSON)
+				}
 				// Warn for client-disconnect / context expiry (headers already
 				// committed, partial result was delivered). Error for genuine
 				// server-side failures (scanner, db iteration).
@@ -1777,6 +1781,10 @@ localProcessing:
 					} else {
 						h.queryRegistry.Fail(queryID, streamErr.Error())
 					}
+				}
+				// Per-handler client-disconnect counter (#426).
+				if isClientError(streamErr) {
+					m.IncQueryClientDisconnect(metrics.DisconnectPathSQLJSON)
 				}
 				// Warn for client-disconnect / context expiry (headers already
 				// committed, partial result was delivered). Error for genuine
@@ -3498,6 +3506,12 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 
 		if streamErr != nil {
 			m.IncQueryErrors()
+			// Per-handler client-disconnect counter (#426). queryMeasurement
+			// uses the pure database/sql streaming JSON path same as the
+			// other sites above, so it shares the sql_json label.
+			if isClientError(streamErr) {
+				m.IncQueryClientDisconnect(metrics.DisconnectPathSQLJSON)
+			}
 			// Warn for client-disconnect / context expiry (headers already
 			// committed, partial result was delivered). Error for genuine
 			// server-side failures.

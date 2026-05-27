@@ -265,6 +265,13 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 
 		if streamErr != nil {
 			m.IncQueryErrors()
+			// Per-handler client-disconnect counter (#426). Lets operators
+			// dashboard the rate without log-scraping. Only fires on
+			// client-side events (disconnect / deadline / context-cancel)
+			// — server-side stream failures stay in IncQueryErrors only.
+			if isClientError(streamErr) {
+				m.IncQueryClientDisconnect(metrics.DisconnectPathArrowIPC)
+			}
 			// Warn for client-disconnect / timeout (expected ops noise);
 			// Error for everything else (real server-side problem worth
 			// alerting on).

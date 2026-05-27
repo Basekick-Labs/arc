@@ -155,6 +155,12 @@ func executeArrowJSONQuery(
 			} else if onFail != nil {
 				onFail(streamErr.Error())
 			}
+			// Per-handler client-disconnect counter (#426). See query_arrow.go
+			// for the rationale; arrow_json is the duckdb_arrow build path
+			// that /api/v1/query takes by default.
+			if isClientError(streamErr) {
+				m.IncQueryClientDisconnect(metrics.DisconnectPathArrowJSON)
+			}
 			// Warn for client-disconnect / context expiry (expected ops noise
 			// — headers were already committed, the client got partial bytes).
 			// Error for everything else: scanner/reader failures are real
