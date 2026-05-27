@@ -212,7 +212,11 @@ services:
     networks:
       - arc-cluster
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      # Use MinIO's built-in HTTP health endpoint rather than `mc ready`.
+      # Both binaries ship in the current minio/minio image, but the HTTP
+      # path doesn't require an mc alias to be configured first and is
+      # more robust against future image trimming.
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
       interval: 2s
       timeout: 5s
       retries: 30
