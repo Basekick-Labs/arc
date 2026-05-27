@@ -50,6 +50,17 @@ type Metrics struct {
 	queryLatencySum    atomic.Int64 // microseconds
 	queryLatencyCount  atomic.Int64
 
+	// Client-disconnect mid-stream counters, broken out by streaming
+	// handler so operators can disambiguate "Grafana panels giving up"
+	// (arrow_json — the duckdb_arrow code path /api/v1/query takes) from
+	// "scripts piping into curl that get killed" (sql_json) from
+	// "downstream Arrow consumers like grafana-arrow-datasource that
+	// disconnect on tab close" (arrow_ipc). Incremented at every site
+	// that today only logs a Warn with rows_sent (see #426).
+	queryDisconnectsArrowIPC  atomic.Int64
+	queryDisconnectsArrowJSON atomic.Int64
+	queryDisconnectsSQLJSON   atomic.Int64
+
 	// Arrow buffer metrics
 	bufferRecordsBuffered atomic.Int64
 	bufferRecordsWritten  atomic.Int64
@@ -270,6 +281,21 @@ func (m *Metrics) RecordQueryLatency(durationMicros int64) {
 	m.queryLatencyCount.Add(1)
 }
 
+// IncQueryClientDisconnect increments the per-handler client-disconnect
+// counter. `path` MUST be one of "arrow_ipc", "arrow_json", "sql_json";
+// any other value is silently dropped so a typo at the call site can't
+// emit a malformed labelled time series.
+func (m *Metrics) IncQueryClientDisconnect(path string) {
+	switch path {
+	case "arrow_ipc":
+		m.queryDisconnectsArrowIPC.Add(1)
+	case "arrow_json":
+		m.queryDisconnectsArrowJSON.Add(1)
+	case "sql_json":
+		m.queryDisconnectsSQLJSON.Add(1)
+	}
+}
+
 // Buffer Metrics
 func (m *Metrics) SetBufferRecordsBuffered(count int64) { m.bufferRecordsBuffered.Store(count) }
 func (m *Metrics) SetBufferRecordsWritten(count int64)  { m.bufferRecordsWritten.Store(count) }
@@ -456,6 +482,10 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"query_rows_total":     m.queryRowsTotal.Load(),
 		"query_latency_sum_us": m.queryLatencySum.Load(),
 		"query_latency_count":  m.queryLatencyCount.Load(),
+
+		"query_client_disconnects_arrow_ipc_total":  m.queryDisconnectsArrowIPC.Load(),
+		"query_client_disconnects_arrow_json_total": m.queryDisconnectsArrowJSON.Load(),
+		"query_client_disconnects_sql_json_total":   m.queryDisconnectsSQLJSON.Load(),
 
 		// Buffer
 		"buffer_records_buffered":     m.bufferRecordsBuffered.Load(),
@@ -678,6 +708,18 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_query_rows_total Total rows returned by queries\n"...)
 	b = append(b, "# TYPE arc_query_rows_total counter\n"...)
 	b = appendMetric(b, "arc_query_rows_total", float64(m.queryRowsTotal.Load()))
+
+	// Per-handler client-disconnect counters. The `path` label
+	// distinguishes Arrow IPC (grafana-arrow-datasource style),
+	// Arrow-to-JSON (duckdb_arrow build serving /api/v1/query), and
+	// pure database/sql JSON (default build). Operators alert on a
+	// rising rate per path to correlate with RSS profiles + dashboard
+	// behaviour (#426).
+	b = append(b, "# HELP arc_query_client_disconnects_total Streaming queries the client closed mid-response, by handler path\n"...)
+	b = append(b, "# TYPE arc_query_client_disconnects_total counter\n"...)
+	b = appendMetricWithLabel(b, "arc_query_client_disconnects_total", "path", "arrow_ipc", float64(m.queryDisconnectsArrowIPC.Load()))
+	b = appendMetricWithLabel(b, "arc_query_client_disconnects_total", "path", "arrow_json", float64(m.queryDisconnectsArrowJSON.Load()))
+	b = appendMetricWithLabel(b, "arc_query_client_disconnects_total", "path", "sql_json", float64(m.queryDisconnectsSQLJSON.Load()))
 
 	// Buffer metrics
 	b = append(b, "# HELP arc_buffer_records_buffered Records currently buffered\n"...)
