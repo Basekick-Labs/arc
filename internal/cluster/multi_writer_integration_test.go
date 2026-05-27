@@ -310,13 +310,13 @@ func TestMultiWriter_SharedStorageMode_SingleNode_IsPrimary(t *testing.T) {
 		t.Error("single-node cluster: bootstrap writer with SharedStorageMode must report IsPrimaryWriter()=true")
 	}
 
-	// Stop the only Raft node — IsLeader() flips to false.
+	// Stop the only Raft node — IsLeader() flips to false. Node.Stop()
+	// calls raft.Shutdown() and blocks on future.Error() until the
+	// shutdown completes, so IsLeader() is guaranteed false on return;
+	// no sleep needed.
 	if err := r.Stop(); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
-
-	// Briefly wait for the in-process Raft state to settle.
-	time.Sleep(100 * time.Millisecond)
 
 	if c.IsPrimaryWriter() {
 		t.Error("stopped Raft: IsPrimaryWriter must report false")

@@ -211,7 +211,7 @@ log "extracting admin token from arc-writer1 logs"
 # logs and bails cleanly.
 ADMIN_TOKEN=$(docker logs arc-writer1 2>&1 | \
   sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' | \
-  grep -E '^[[:space:]]*Admin API token:' | head -1 | awk '{print $NF}' | tr -d '"' || true)
+  grep -E '^[[:space:]]*Admin API token:' | head -1 | awk '{print $NF}' | tr -d '"\r' || true)
 if [[ -z "${ADMIN_TOKEN:-}" ]]; then
   log "could not extract admin token — last 30 lines of arc-writer1:"
   docker logs arc-writer1 2>&1 | tail -30
