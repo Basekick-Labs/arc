@@ -35,21 +35,23 @@ func buildArrowBatch(
 ) arrow.Record {
 	numCols := len(schema.Fields())
 	builders := make([]array.Builder, numCols)
-	for i, f := range schema.Fields() {
-		builders[i] = array.NewBuilder(alloc, f.Type)
-	}
+	// Register the cleanup defer BEFORE the init loop so it covers a
+	// panic mid-loop. If we registered it AFTER the loop and
+	// array.NewBuilder panicked at iteration N, the defer would
+	// never register and builders[0..N-1] would leak. nil-check
+	// inside the loop guards against the trailing nil entries.
+	// Verified by counter-example: defer-after-loop never fires
+	// when the loop panics.
 	defer func() {
-		// nil-check: if array.NewBuilder panicked partway through the
-		// init loop above, `builders` is partially populated and the
-		// trailing entries are nil. Calling Release() on a nil
-		// array.Builder panics with a secondary nil-deref, which
-		// masks the original panic and makes test failures opaque.
 		for _, b := range builders {
 			if b != nil {
 				b.Release()
 			}
 		}
 	}()
+	for i, f := range schema.Fields() {
+		builders[i] = array.NewBuilder(alloc, f.Type)
+	}
 
 	for _, row := range rows {
 		for col, val := range row {
@@ -74,18 +76,15 @@ func buildArrowBatch(
 	}
 
 	cols := make([]arrow.Array, numCols)
-	for i, b := range builders {
-		cols[i] = b.NewArray()
-	}
-	// Defer the cols Release so it fires even if array.NewRecord panics
-	// (length-mismatch + schema-mismatch are documented panic paths —
-	// verified empirically). Without defer, a NewRecord panic in a
-	// future schema-evolution test would leak every cols entry.
-	// array.NewRecord retains each column (increments refcount); the
-	// builder-returned arrays in `cols` are the test's own references and
-	// must be released so the final refcount on each buffer drops to
-	// (Record's count). When the record is released, refcount hits zero
-	// and CheckedAllocator sees a clean shutdown.
+	// Register the cols Release defer BEFORE the NewArray loop AND
+	// before array.NewRecord — same lesson as the builders defer above.
+	// b.NewArray could panic on allocator failure, and NewRecord panics
+	// on length / schema mismatch (verified empirically). nil-check
+	// inside guards against partial population from a mid-loop panic.
+	// array.NewRecord retains each column (refcount++); this defer drops
+	// the test's own reference so the final refcount on each buffer is
+	// held only by the returned Record. CheckedAllocator sees a clean
+	// shutdown after Record.Release fires.
 	defer func() {
 		for _, c := range cols {
 			if c != nil {
@@ -93,6 +92,9 @@ func buildArrowBatch(
 			}
 		}
 	}()
+	for i, b := range builders {
+		cols[i] = b.NewArray()
+	}
 	return array.NewRecord(schema, cols, int64(len(rows)))
 }
 
