@@ -86,23 +86,23 @@ jobs:
           - linux/arm64
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY_GHCR }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY_DOCKERHUB }}
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -110,7 +110,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: |
             ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}
@@ -128,7 +128,7 @@ jobs:
       # it only re-pushes the already-built layers, no rebuild).
       - name: Build and push by digest (GHCR)
         id: build_ghcr
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -141,7 +141,7 @@ jobs:
 
       - name: Build and push by digest (Docker Hub)
         id: build_dockerhub
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -166,7 +166,7 @@ jobs:
           touch "/tmp/digests/dockerhub/${dockerhub_digest#sha256:}"
 
       - name: Upload digests
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: digests-${{ strategy.job-index }}
           path: /tmp/digests/**
@@ -187,10 +187,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: '1.26'
           cache: true
@@ -213,7 +213,7 @@ jobs:
           ls -lh arc-${{ matrix.suffix }}
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: arc-binary-${{ matrix.suffix }}
           path: arc-${{ matrix.suffix }}
@@ -233,10 +233,10 @@ jobs:
             binary_suffix: linux-arm64
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: arc-binary-${{ matrix.binary_suffix }}
 
@@ -345,7 +345,7 @@ jobs:
           sha256sum ${PKG_DIR}.deb > ${PKG_DIR}.deb.sha256
 
       - name: Upload Debian package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: arc-debian-${{ matrix.arch }}-${{ needs.prepare.outputs.version }}
           path: |
@@ -367,7 +367,7 @@ jobs:
             binary_suffix: linux-arm64
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install RPM tools
         run: |
@@ -375,7 +375,7 @@ jobs:
           sudo apt-get install -y rpm
 
       - name: Download binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: arc-binary-${{ matrix.binary_suffix }}
 
@@ -486,7 +486,7 @@ jobs:
           sha256sum arc-${VERSION}-1.*.rpm > arc-${VERSION}-1.${ARCH}.rpm.sha256
 
       - name: Upload RPM package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: arc-rpm-${{ matrix.arch }}-${{ needs.prepare.outputs.version }}
           path: |
@@ -504,24 +504,24 @@ jobs:
       packages: write
     steps:
       - name: Download digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: digests-*
           merge-multiple: true
           path: /tmp/digests
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY_GHCR }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY_DOCKERHUB }}
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -638,7 +638,7 @@ jobs:
     needs: [prepare, build-binaries]
     steps:
       - name: Download amd64 binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: arc-binary-linux-amd64
 
@@ -680,10 +680,10 @@ jobs:
     needs: prepare
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
           version: '3.13.0'
 
@@ -703,7 +703,7 @@ jobs:
           sha256sum arc-${VERSION}.tgz > arc-${VERSION}.tgz.sha256
 
       - name: Upload Helm chart
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: arc-helm-${{ needs.prepare.outputs.version }}
           path: |
@@ -718,19 +718,19 @@ jobs:
     needs: [prepare, helm-package]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download Helm chart
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: arc-helm-${{ needs.prepare.outputs.version }}
           path: dist/
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build Docker image for testing
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
@@ -740,10 +740,10 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Install kubectl
-        uses: azure/setup-kubectl@v4
+        uses: azure/setup-kubectl@v5
 
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
           version: '3.13.0'
 
@@ -803,12 +803,12 @@ jobs:
       contents: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Download all release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: arc-*
           merge-multiple: true
@@ -931,7 +931,7 @@ jobs:
           cat release-notes.md
 
       - name: Create draft release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           draft: true
           prerelease: false
