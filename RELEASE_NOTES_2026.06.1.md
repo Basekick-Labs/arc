@@ -787,6 +787,16 @@ Two follow-up micro-optimizations from Gemini review landed in the same PR: a pr
 
 `BenchmarkSplitOnDelimiter` added to `lineprotocol_test.go` covering both space + comma paths so future regressions on the ingest hot path don't go unnoticed.
 
+**End-to-end ingest impact (full HTTP path, 30-second run):**
+
+| | Pre-sprint | Post-sprint | Delta |
+|---|---|---|---|
+| Throughput | 4.1M rec/s | **4.63M rec/s** | **+12.9%** |
+| p50 latency | 2.41 ms | **2.14 ms** | -11% |
+| p99 latency | 8.85 ms | **8.46 ms** | -4% |
+
+Attribution sanity check: ParseLine -41% × ~30% pipeline share predicts +12% RPS, which matches the observed +12.9%. The wall-clock win is the parser; the latency win includes reduced GC pressure from -50% allocs/line.
+
 ---
 
 _Maintainer notes: keep this file at the repo root (per [memory/project_release_strategy.md](memory/project_release_strategy.md)); do not write to `docs/RELEASE_NOTES_*` (that path is stale)._
