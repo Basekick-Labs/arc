@@ -162,16 +162,20 @@ func splitOnDelimiter(data []byte, delim byte) [][]byte {
 	if len(data) == 0 {
 		return nil
 	}
-	// Pre-size for the common case: telegraf lines split into 3-4 parts
-	// on space, tags/fields split into 4-8 on comma. Cap of 4 covers
-	// both without over-allocating on simple lines.
+	// Lazy parts allocation: many real inputs have zero delimiters
+	// (measurement with no tags `cpu`, single-field writes `v=1`).
+	// Deferring the make() until we actually need it lets the
+	// no-delimiter case end with a 1-element literal slice instead
+	// of cap=4 — saves the cap-4 allocation on every such call. The
+	// with-delimiter case still allocates cap=4 once on first split
+	// (same as before, just lazily). Verified: this is a net win on
+	// full-path ParseBatch.
 	//
-	// Note: tried dynamic capacity (cap=8 on comma) per Gemini suggestion
-	// but the full-path ParseBatch bench regressed by +9% / +1.9 KB
-	// because most production comma-splits have ≤4 parts (1-tag
-	// measurements, single-field writes) — oversizing them costs more
-	// than the rare 5+-part case saves. Kept at 4 with bench evidence.
-	parts := make([][]byte, 0, 4)
+	// Note: tried dynamic capacity (cap=8 on comma) per Gemini R1 but
+	// the full-path ParseBatch bench regressed by +9% / +1.9 KB
+	// because most production comma-splits have ≤4 parts. Kept at 4
+	// with bench evidence.
+	var parts [][]byte
 	start := 0
 	inQuotes := false
 
@@ -194,6 +198,9 @@ func splitOnDelimiter(data []byte, delim byte) [][]byte {
 		}
 		if data[i] == delim && !inQuotes {
 			if i > start {
+				if parts == nil {
+					parts = make([][]byte, 0, 4)
+				}
 				parts = append(parts, data[start:i])
 			}
 			start = i + 1
@@ -201,6 +208,11 @@ func splitOnDelimiter(data []byte, delim byte) [][]byte {
 	}
 
 	if len(data) > start {
+		if parts == nil {
+			// No delimiters seen — single-element literal beats
+			// cap=4 make+append for this common case.
+			return [][]byte{data[start:]}
+		}
 		parts = append(parts, data[start:])
 	}
 
