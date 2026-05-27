@@ -92,6 +92,13 @@ type Router struct {
 	// Round-robin index for reader selection
 	readerIndex atomic.Uint64
 
+	// Round-robin index for writer selection (Pattern 2 multi-writer:
+	// when no primary writer is designated, distribute writes across
+	// all healthy writers). Separate from readerIndex so reader query
+	// rotation doesn't skew writer rotation when both happen
+	// interleaved.
+	writerIndex atomic.Uint64
+
 	// Active connection counts per node (for least_connections strategy)
 	activeConns   map[string]*atomic.Int64
 	activeConnsMu sync.RWMutex
@@ -136,25 +143,59 @@ func NewRouter(cfg *RouterConfig) *Router {
 
 // RouteWrite routes a write request to an appropriate writer node.
 // Returns ErrLocalNodeCanHandle if this node can process the write directly.
+//
+// Writer selection (in order of preference):
+//  1. GetPrimaryWriter() — the failover-promoted primary in legacy mode
+//     (Pattern 1 single-writer + failover). Returns nil in Pattern 2
+//     shared-storage multi-writer mode where no node holds WriterStatePrimary.
+//  2. Round-robin across all healthy writers via selectWriter (the
+//     Pattern 2 path; also a strict improvement in legacy mode during
+//     the failover window where GetPrimaryWriter() can return nil).
 func (r *Router) RouteWrite(ctx context.Context, req *http.Request) (*http.Response, error) {
 	// Check if local node can handle writes
 	if r.cfg.LocalNode != nil && r.cfg.LocalNode.Role.GetCapabilities().CanIngest {
 		return nil, ErrLocalNodeCanHandle
 	}
 
-	// Prefer the designated primary writer
+	// Prefer the designated primary writer (legacy single-writer + failover).
 	writer := r.cfg.Registry.GetPrimaryWriter()
 	if writer == nil {
-		// Fall back to any healthy writer (no failover configured or pre-promotion)
+		// Fall back to round-robin across healthy writers. In Pattern 2
+		// multi-writer mode this is the always-taken path (no primary
+		// designation); in legacy mode it covers the transient failover
+		// window. Either way, distributing across N writers is correct;
+		// the previous behaviour of always picking writers[0] defeated
+		// the load-distribution that the rest of the cluster expects.
 		writers := r.cfg.Registry.GetWriters()
 		if len(writers) == 0 {
 			r.logger.Warn().Msg("No healthy writer nodes available for routing")
 			return nil, ErrNoWriterAvailable
 		}
-		writer = writers[0]
+		writer = r.selectWriter(writers)
 	}
 
 	return r.forwardRequest(ctx, writer, req)
+}
+
+// selectWriter applies the configured load-balance strategy to a
+// list of writer nodes. Mirrors selectNode but uses writerIndex so
+// the rotation isn't perturbed by interleaved reader queries.
+func (r *Router) selectWriter(nodes []*Node) *Node {
+	if len(nodes) == 0 {
+		return nil
+	}
+	if len(nodes) == 1 {
+		return nodes[0]
+	}
+	switch r.cfg.Strategy {
+	case LoadBalanceLeastConnections:
+		return r.selectLeastConnections(nodes)
+	case LoadBalanceRoundRobin:
+		fallthrough
+	default:
+		idx := r.writerIndex.Add(1) - 1
+		return nodes[idx%uint64(len(nodes))]
+	}
 }
 
 // RouteQuery routes a query request to an appropriate reader node.
@@ -409,6 +450,7 @@ func (r *Router) Stats() map[string]interface{} {
 		"timeout_ms":         r.cfg.Timeout.Milliseconds(),
 		"retries":            r.cfg.Retries,
 		"reader_index":       r.readerIndex.Load(),
+		"writer_index":       r.writerIndex.Load(),
 		"active_connections": connStats,
 	}
 }

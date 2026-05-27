@@ -1,0 +1,58 @@
+# Override for the Pattern 2 multi-writer smoke harness.
+#
+# - Builds the Arc image FROM SOURCE in this checkout (Dockerfile at the
+#   repo root). The smoke needs to test the actual branch under review,
+#   not whatever is at basekick/arc:latest. Per
+#   memory/feedback_compose_build_from_source.md — pre-tagging a local
+#   image is brittle across docker contexts; `build:` is the path that
+#   reliably picks up the working tree.
+# - Disables telemetry on every container per
+#   memory/feedback_smoke_telemetry_disabled.md (default-on telemetry
+#   pollutes production analytics with dev signals).
+# - Pulls ARC_LICENSE_KEY + ARC_CLUSTER_SHARED_SECRET from host env.
+#   The smoke script in this directory sets these before running
+#   docker compose up.
+#
+# Usage:
+#   cd deploy/docker-compose/enterprise-shared
+#   export ARC_LICENSE_KEY=<dev key, NOT the customer key in .env>
+#   export ARC_CLUSTER_SHARED_SECRET=$(openssl rand -hex 32)
+#   docker compose -f docker-compose.yml -f docker-compose.override.smoke.yml up -d --build
+#
+# The dev license MUST have the `shared_storage_multi_writer` feature.
+# If the license-server activation cap is reached on the dev key, free
+# slots in the enterprise.basekick.net admin before re-running.
+
+x-arc-build: &arc-build
+  context: ../../..       # repo root
+  dockerfile: Dockerfile
+
+# Common smoke env across all containers. Requires the dev license key
+# referenced from memory/reference_smoke_test_license.md and that the
+# license has the `shared_storage_multi_writer` feature (added 2026-05-26
+# alongside Pattern 2 multi-writer PR1a/PR1b).
+x-smoke-env: &smoke-env
+  ARC_TELEMETRY_ENABLED: "false"
+  ARC_CLUSTER_SHARED_SECRET: ${ARC_CLUSTER_SHARED_SECRET}
+
+services:
+  arc-writer1:
+    build: *arc-build
+    image: arc-pr1b-smoke:writer1
+    environment:
+      <<: *smoke-env
+  arc-writer2:
+    build: *arc-build
+    image: arc-pr1b-smoke:writer2
+    environment:
+      <<: *smoke-env
+  arc-writer3:
+    build: *arc-build
+    image: arc-pr1b-smoke:writer3
+    environment:
+      <<: *smoke-env
+  arc-reader1:
+    build: *arc-build
+    image: arc-pr1b-smoke:reader1
+    environment:
+      <<: *smoke-env
