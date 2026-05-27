@@ -740,6 +740,22 @@ The fix is mechanical: capture the error from `bufio.Writer.Flush()` and break t
 
 This is **complementary to but distinct from** the #420 retention/delete leak: that fix targeted DuckDB native heap residue after S3 reads; this one targets in-flight Arrow record batches held on the goroutine stack when the client abandons a query mid-stream.
 
+### `arc_query_client_disconnects_total` Prometheus counter (PR #466, closes #426)
+
+Follow-up observability for the disconnect fix above. Operators investigating "why does RSS spike when this dashboard refreshes" used to grep logs for the streaming-truncation `Warn` line to count Grafana panel-close events. The new counter exposes the same signal as a Prometheus time series:
+
+```
+arc_query_client_disconnects_total{path="arrow_ipc|arrow_json|sql_json"}  counter
+```
+
+Three labels distinguish (a) the `/api/v1/query/arrow` IPC endpoint, (b) the `duckdb_arrow`-build path that `/api/v1/query` takes by default, and (c) the pure `database/sql` streaming JSON path. Wired at all 5 existing client-disconnect Warn-log sites in [internal/api/query_arrow.go](internal/api/query_arrow.go), [internal/api/query_arrow_json.go](internal/api/query_arrow_json.go), and [internal/api/query.go](internal/api/query.go). Guarded by the existing `isClientError()` predicate, so server-side stream failures stay in `IncQueryErrors` only — the new counter is strictly client-side noise. Typed `DisconnectPathArrowIPC` / `DisconnectPathArrowJSON` / `DisconnectPathSQLJSON` constants prevent typos at compile time; an unknown label is silently dropped by the increment switch.
+
+### Arrow streaming tests now leak-detect with `CheckedAllocator` (PR #465, closes #427)
+
+Test-hygiene follow-up to the disconnect fix. The `buildArrowBatch` helper in [internal/api/query_arrow_json_test.go](internal/api/query_arrow_json_test.go) was leaking Arrow allocator buffers — invisible under `memory.NewGoAllocator` (Go's GC absorbs the residue), but fatal under `memory.NewCheckedAllocator` because the builders and column arrays kept their own reference counts after `array.NewRecord` retained them.
+
+The helper now releases builders + cols inside two `defer` blocks (registered before their init loops, with nil-check guards for mid-loop panics). `TestStreamArrowJSON_FlushErrorBreaksLoop` switched from `NewGoAllocator` → `NewCheckedAllocator` + `defer alloc.AssertSize(t, 0)`, so future regressions where the disconnect-break path forgets to release a record will fail the test loudly instead of silently growing the heap.
+
 ### S3 Endpoint Scheme Normalization for DuckDB (PR #422)
 
 The AWS SDK Go v2 accepts `s3_endpoint` with or without an `http(s)://` prefix; DuckDB's `httpfs` extension expects a bare `host:port` and prepends scheme based on `s3_use_ssl`. With `s3_endpoint = "http://host:port"` in `arc.toml` (matching the AWS SDK convention), DuckDB built malformed URLs of the form `http://http://host:port/...` and every `read_parquet()` against S3 failed with `Could not resolve hostname`.
@@ -751,6 +767,25 @@ Added a small `stripURLScheme` helper in [internal/database/duckdb.go](internal/
 The DELETE API rewrites parquet files to remove rows matching a WHERE clause and uploads them back to S3. Against plain-HTTP S3 (MinIO, Garage), every rewrite failed with `compute input header checksum failed, unseekable stream is not supported without TLS and trailing checksum`. AWS SDK Go v2 (`aws-sdk-go-v2/service/s3 v1.99.0`, post-Feb 2025) requires either TLS or a seekable body for the mandatory request checksum, and the previous `io.TeeReader` single-pass SHA256+upload pattern lost the underlying `*os.File`'s seekability.
 
 Replaced the TeeReader with a two-step "hash, then seek-and-upload": `io.Copy` into the SHA256 hasher, `Seek(0, io.SeekStart)`, pass the seekable `*os.File` directly to `storage.WriteReader`. The second read hits OS page cache so disk I/O is unchanged. Validated against MinIO over plain HTTP: 199/199 files rewritten (pre-fix: 0/200).
+
+### Line Protocol parser: sub-slice indexing in `splitOnDelimiter` (PR #467, closes #354)
+
+The ingest hot path's tokenizer in [internal/ingest/lineprotocol.go](internal/ingest/lineprotocol.go) appended bytes one-at-a-time into a growing `[]byte` per part, allocating a fresh backing array (with several `append`-driven grows) for every space and every comma split in every line-protocol line. Replaced with sub-slice indexing: track a `start` index, emit `data[start:i]` sub-slices on delimiter hits, and let the returned `[][]byte` alias the input buffer.
+
+Behavior is unchanged at every edge — consecutive delimiters skip empty parts, leading/trailing delimiters handled identically, escape branch preserves the `\x` pair, quote tracking unchanged, returned-empty-on-empty-input preserved. Aliasing is safe because every downstream caller copies via `string(...)` or `unescape()` before storing anything beyond the parse call (`models.Record` holds `map[string]string` and `map[string]interface{}` only — no `[]byte` references escape).
+
+**Bench (Apple M3 Max, telegraf-style line + 10-line batch, 10s benchtime × count=3):**
+
+| | Before | After | Delta |
+|---|---|---|---|
+| `BenchmarkLineProtocolParser_ParseLine` | 1547 ns / 1728 B / 50 allocs | **915 ns / 1152 B / 24 allocs** | **-41% ns, -33% B, -52% allocs** |
+| `BenchmarkLineProtocolParser_ParseBatch` | 9215 ns / 12152 B / 282 allocs | **6326 ns / 10232 B / 142 allocs** | **-31% ns, -16% B, -50% allocs** |
+| `BenchmarkSplitOnDelimiter/space` (new) | — | 138 ns / 96 B / 1 alloc | — |
+| `BenchmarkSplitOnDelimiter/comma` (new) | — | 148 ns / 288 B / 2 allocs | — |
+
+Two follow-up micro-optimizations from Gemini review landed in the same PR: a pre-sized parts slice (`make([][]byte, 0, 4)`) so the first append is allocation-free on typical telegraf lines, and a lazy-allocation path that returns a 1-element literal slice for no-delimiter inputs (measurements with no tags, single-field writes) — additional -720 bytes per ParseBatch (-6.6%). A third Gemini suggestion (dynamic cap=8 on comma) was declined with bench evidence (caused a +9% regression on the full path because most real comma-splits have ≤4 parts; oversizing them costs more in aggregate than the rare 5+-part case saves).
+
+`BenchmarkSplitOnDelimiter` added to `lineprotocol_test.go` covering both space + comma paths so future regressions on the ingest hot path don't go unnoticed.
 
 ---
 
