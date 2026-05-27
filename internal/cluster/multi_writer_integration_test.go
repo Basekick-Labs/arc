@@ -49,19 +49,41 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// allocFreePort grabs a free TCP port on 127.0.0.1 and immediately
-// releases it, so raft.NetworkTransport can bind to it next. Standard
-// race-y idiom; the race window is small enough in practice that all
-// other in-process Raft tests in the ecosystem use it.
+// allocFreePort grabs a single free TCP port on 127.0.0.1. Convenience
+// wrapper around allocFreePorts for single-port callers.
 func allocFreePort(t *testing.T) string {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("alloc free port: %v", err)
+	return allocFreePorts(t, 1)[0]
+}
+
+// allocFreePorts grabs n distinct free TCP ports on 127.0.0.1. Holds
+// every listener open until all n have been allocated, then closes
+// them in a single sweep — this guarantees the kernel hands out a
+// distinct port for each call (a sequential alloc-and-close pattern
+// can occasionally reuse the just-released port on heavily-loaded
+// hosts and produce the same address twice). The races inherent to
+// bind+close-then-rebind remain; this only eliminates the
+// same-test-allocates-the-same-port-twice flake.
+func allocFreePorts(t *testing.T, n int) []string {
+	t.Helper()
+	listeners := make([]net.Listener, n)
+	addrs := make([]string, n)
+	for i := 0; i < n; i++ {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			// Close any listeners we already opened before failing.
+			for j := 0; j < i; j++ {
+				_ = listeners[j].Close()
+			}
+			t.Fatalf("alloc free port %d/%d: %v", i+1, n, err)
+		}
+		listeners[i] = l
+		addrs[i] = l.Addr().String()
 	}
-	addr := l.Addr().String()
-	_ = l.Close()
-	return addr
+	for _, l := range listeners {
+		_ = l.Close()
+	}
+	return addrs
 }
 
 // startRaftNode constructs and starts a raft.Node bound to the given
@@ -128,9 +150,8 @@ func TestMultiWriter_SharedStorageMode_LeaderElection_And_RoleGate(t *testing.T)
 	}
 
 	// Pre-allocate three ephemeral ports.
-	addrA := allocFreePort(t)
-	addrB := allocFreePort(t)
-	addrC := allocFreePort(t)
+	addrs := allocFreePorts(t, 3)
+	addrA, addrB, addrC := addrs[0], addrs[1], addrs[2]
 
 	// --- Boot writer-A as the bootstrap node ---
 	raftA := startRaftNode(t, "writer-A", addrA, true)

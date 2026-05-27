@@ -91,6 +91,11 @@ find_leader() {
     # local_node.is_raft_leader path was wrong and silently returned
     # false on every node, which made find_non_leader accidentally
     # pick whichever writer it happened to enumerate first.
+    # Trailing `|| echo "false"` protects against `set -o pipefail` +
+    # `set -e` killing the script if the docker/curl call fails
+    # transiently (e.g., a writer briefly unreachable during boot).
+    # Without it, the assignment subshell returns non-zero and the
+    # script dies before the diagnostic branch below can run.
     is_leader=$(docker exec "$c" curl -fsS \
       -H "Authorization: Bearer $ADMIN_TOKEN" \
       http://localhost:8000/api/v1/cluster 2>/dev/null \
@@ -101,7 +106,7 @@ try:
     print("true" if d.get("raft", {}).get("is_leader", False) else "false")
 except Exception:
     print("false")
-' 2>/dev/null)
+' 2>/dev/null || echo "false")
     if [[ "$is_leader" == "true" ]]; then
       echo "$c"
       return 0
@@ -198,9 +203,15 @@ log "extracting admin token from arc-writer1 logs"
 # pick the last whitespace-separated field on that line — which is the
 # token value. Previous broken approach used `grep -A1 ... | tail -1`,
 # which picked up the next log line and parsed garbage.
+# Trailing `|| true` protects against `set -o pipefail` + `set -e`
+# killing the script if `grep` finds zero matches (its exit-1 would
+# tear down the whole pipeline before the diagnostic branch below
+# can run). With `|| true`, the assignment succeeds with empty
+# ADMIN_TOKEN and the `[[ -z ... ]]` check below prints the helpful
+# logs and bails cleanly.
 ADMIN_TOKEN=$(docker logs arc-writer1 2>&1 | \
   sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' | \
-  grep -E '^[[:space:]]*Admin API token:' | head -1 | awk '{print $NF}' | tr -d '"')
+  grep -E '^[[:space:]]*Admin API token:' | head -1 | awk '{print $NF}' | tr -d '"' || true)
 if [[ -z "${ADMIN_TOKEN:-}" ]]; then
   log "could not extract admin token — last 30 lines of arc-writer1:"
   docker logs arc-writer1 2>&1 | tail -30
