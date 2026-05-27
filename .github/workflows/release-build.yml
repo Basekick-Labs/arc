@@ -101,31 +101,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY_DOCKERHUB }}
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v6
         with:
           images: |
             ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}
-            ${{ env.REGISTRY_DOCKERHUB }}/${{ env.IMAGE_NAME_DOCKERHUB }}
           tags: |
             type=raw,value=${{ needs.prepare.outputs.version }}
             type=raw,value=${{ needs.prepare.outputs.short_version }}
             type=raw,value=latest,enable=${{ needs.prepare.outputs.test_mode != 'true' }}
 
-      # Push the per-platform image by digest to BOTH registries. The
-      # digest-and-merge pattern needs one digest per registry per
-      # platform; build-push-action can only target a single image name
-      # per invocation when using push-by-digest, so we run it twice
-      # (the second is a cache hit — same context, same build args — so
-      # it only re-pushes the already-built layers, no rebuild).
+      # GHCR uses the digest-and-merge pattern: each platform pushes its
+      # image by digest, and docker-merge combines them into a multi-arch
+      # manifest. GHCR's package UI indexes these registry-API pushes
+      # correctly. (Docker Hub does NOT — its Tags page only indexes the
+      # standard buildx --push path — so Docker Hub is handled separately
+      # in the docker-build-dockerhub job below, not here.)
       - name: Build and push by digest (GHCR)
         id: build_ghcr
         uses: docker/build-push-action@v7
@@ -139,39 +131,79 @@ jobs:
           build-args: |
             VERSION=${{ needs.prepare.outputs.version }}
 
-      - name: Build and push by digest (Docker Hub)
-        id: build_dockerhub
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build_ghcr.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v6
+        with:
+          name: digests-${{ strategy.job-index }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Docker Hub gets a single multi-platform `buildx --push` (not the
+  # digest-and-merge pattern). imagetools/digest-merge pushes via the
+  # registry manifest API, which Docker Hub's Tags page does NOT index —
+  # the image is pullable but the Tags listing stays empty. A direct
+  # multi-platform build-push goes through the path Hub's UI indexes, so
+  # the published tags actually show up. Layers come from the same gha
+  # cache the GHCR build populated, so this is mostly cache-hit + push.
+  docker-build-dockerhub:
+    name: Build & Push Docker Hub
+    runs-on: ubuntu-latest
+    needs: prepare
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY_DOCKERHUB }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            ${{ env.REGISTRY_DOCKERHUB }}/${{ env.IMAGE_NAME_DOCKERHUB }}
+          tags: |
+            type=raw,value=${{ needs.prepare.outputs.version }}
+            type=raw,value=${{ needs.prepare.outputs.short_version }}
+            type=raw,value=latest,enable=${{ needs.prepare.outputs.test_mode != 'true' }}
+
+      - name: Build and push (multi-platform, direct)
         uses: docker/build-push-action@v7
         with:
           context: .
-          platforms: ${{ matrix.platform }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.REGISTRY_DOCKERHUB }}/${{ env.IMAGE_NAME_DOCKERHUB }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
             VERSION=${{ needs.prepare.outputs.version }}
 
-      - name: Export digests
+      - name: Summary
         run: |
-          # Each registry returns its OWN manifest digest for the same
-          # image content — push-by-digest serialises the manifest per
-          # registry, so the two digests legitimately differ. Keep them
-          # in separate per-registry dirs; the merge job references each
-          # registry's digest when building that registry's manifest.
-          ghcr_digest="${{ steps.build_ghcr.outputs.digest }}"
-          dockerhub_digest="${{ steps.build_dockerhub.outputs.digest }}"
-          mkdir -p /tmp/digests/ghcr /tmp/digests/dockerhub
-          touch "/tmp/digests/ghcr/${ghcr_digest#sha256:}"
-          touch "/tmp/digests/dockerhub/${dockerhub_digest#sha256:}"
-
-      - name: Upload digests
-        uses: actions/upload-artifact@v6
-        with:
-          name: digests-${{ strategy.job-index }}
-          path: /tmp/digests/**
-          if-no-files-found: error
-          retention-days: 1
+          echo "✅ Docker Hub multi-arch image pushed via direct buildx --push" >> $GITHUB_STEP_SUMMARY
+          echo "Tags:" >> $GITHUB_STEP_SUMMARY
+          echo '${{ steps.meta.outputs.tags }}' | sed 's/^/  - /' >> $GITHUB_STEP_SUMMARY
 
   # Build Go binaries using native runners (CGO required for SQLite)
   build-binaries:
@@ -520,15 +552,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY_DOCKERHUB }}
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Create manifest list and push (GHCR)
-        working-directory: /tmp/digests/ghcr
+        working-directory: /tmp/digests
         env:
           IMAGE_REF: ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}
           VERSION: ${{ needs.prepare.outputs.version }}
@@ -537,29 +562,8 @@ jobs:
         run: |
           # Multi-arch manifest with version + short_version, plus latest
           # unless this is a test_mode run (which must not clobber latest).
-          # /tmp/digests/ghcr/* are the per-platform GHCR manifest digests
-          # (each registry returns its own digest for the same content).
-          TAGS=( -t "${IMAGE_REF}:${VERSION}" -t "${IMAGE_REF}:${SHORT_VERSION}" )
-          if [ "${TEST_MODE}" != "true" ]; then
-            TAGS+=( -t "${IMAGE_REF}:latest" )
-          fi
-          docker buildx imagetools create \
-            "${TAGS[@]}" \
-            $(printf "${IMAGE_REF}@sha256:%s " *)
-
-          echo "✅ GHCR multi-arch manifest pushed" >> $GITHUB_STEP_SUMMARY
-
-      - name: Create manifest list and push (Docker Hub)
-        working-directory: /tmp/digests/dockerhub
-        env:
-          IMAGE_REF: ${{ env.REGISTRY_DOCKERHUB }}/${{ env.IMAGE_NAME_DOCKERHUB }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-          SHORT_VERSION: ${{ needs.prepare.outputs.short_version }}
-          TEST_MODE: ${{ needs.prepare.outputs.test_mode }}
-        run: |
-          # /tmp/digests/dockerhub/* are the per-platform Docker Hub
-          # manifest digests — distinct from the GHCR digests above.
-          # latest is suppressed in test_mode, identical to the GHCR step.
+          # Docker Hub is published separately (docker-build-dockerhub) via
+          # a direct buildx --push so its Tags UI indexes the release.
           TAGS=( -t "${IMAGE_REF}:${VERSION}" -t "${IMAGE_REF}:${SHORT_VERSION}" )
           if [ "${TEST_MODE}" != "true" ]; then
             TAGS+=( -t "${IMAGE_REF}:latest" )
@@ -570,9 +574,8 @@ jobs:
 
           LATEST_NOTE="latest"
           [ "${TEST_MODE}" = "true" ] && LATEST_NOTE="(latest suppressed — test_mode)"
-          echo "✅ Docker Hub multi-arch manifest pushed" >> $GITHUB_STEP_SUMMARY
+          echo "✅ GHCR multi-arch manifest pushed" >> $GITHUB_STEP_SUMMARY
           echo "Tags: ${VERSION}, ${SHORT_VERSION}, ${LATEST_NOTE}" >> $GITHUB_STEP_SUMMARY
-          echo "Registries: ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}, ${IMAGE_REF}" >> $GITHUB_STEP_SUMMARY
 
   # Test Docker image health
   test-docker:
@@ -798,7 +801,7 @@ jobs:
   create-draft-release:
     name: Create Draft Release
     runs-on: ubuntu-latest
-    needs: [prepare, docker-merge, test-docker, test-binary, helm-package, test-helm, debian-build, rpm-build]
+    needs: [prepare, docker-merge, docker-build-dockerhub, test-docker, test-binary, helm-package, test-helm, debian-build, rpm-build]
     permissions:
       contents: write
     steps:
