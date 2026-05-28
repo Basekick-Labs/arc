@@ -171,11 +171,20 @@ curl http://localhost:8000/health
 ### Docker
 
 ```bash
+# Docker Hub
+docker run -d \
+  -p 8000:8000 \
+  -v arc-data:/app/data \
+  basekicklabs/arc:latest
+
+# or GitHub Container Registry
 docker run -d \
   -p 8000:8000 \
   -v arc-data:/app/data \
   ghcr.io/basekick-labs/arc:latest
 ```
+
+Multi-arch images (`linux/amd64` + `linux/arm64`) are published to both registries on every release.
 
 ### Debian/Ubuntu
 

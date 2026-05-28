@@ -2,6 +2,24 @@
 
 > **Status:** In progress. Entries are added as PRs land.
 
+## Distribution
+
+### Now published to Docker Hub
+
+The release container image is now published to **Docker Hub** alongside GitHub Container Registry, so you can pull from whichever you prefer:
+
+```bash
+# Docker Hub (new)
+docker pull basekicklabs/arc:2026.06.1
+docker pull basekicklabs/arc:latest
+
+# GitHub Container Registry (existing)
+docker pull ghcr.io/basekick-labs/arc:2026.06.1
+docker pull ghcr.io/basekick-labs/arc:latest
+```
+
+Both registries get the same multi-arch image (`linux/amd64` + `linux/arm64`) on every release, tagged with the full version, the short `YY.MM` version, and `latest`. The release CI publishes Docker Hub via a direct multi-platform `buildx --push` (so the Docker Hub Tags page indexes correctly), while GHCR continues to use the per-platform digest-and-merge path. See PR #469.
+
 ## Security fixes
 
 ### DuckDB I/O sandbox closes arbitrary file-read by any authenticated caller
