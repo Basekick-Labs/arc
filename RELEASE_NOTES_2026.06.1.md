@@ -1,6 +1,6 @@
 # Arc v2026.06.1 Release Notes
 
-> **Status:** In progress. Entries are added as PRs land.
+> **Status:** Released 2026-05-31.
 
 ## Distribution
 
