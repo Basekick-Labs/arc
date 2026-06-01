@@ -8,9 +8,12 @@ import (
 	"io"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
@@ -797,4 +800,255 @@ func BenchmarkDatabasesHandler_ListMeasurements(b *testing.B) {
 
 	// Current: 2 calls (databaseExists + listMeasurements)
 	// Expected after fix: 1 call
+}
+
+// setupAuthedDatabasesHandler wires a DatabasesHandler with a real
+// AuthManager so the route-level auth.RequireAdmin guard is actually
+// exercised. Mirrors what cmd/arc/main.go does at startup: mount the
+// global auth.NewMiddleware on the fiber app, then register the
+// handler's routes (the per-route RequireAdmin wrappers stack on top
+// of the global middleware that populates c.Locals("token_info")).
+//
+// Returns (handler, app, authManager, tmpDir). Caller is responsible
+// for tmpDir cleanup.
+func setupAuthedDatabasesHandler(t *testing.T) (*DatabasesHandler, *fiber.App, *auth.AuthManager, string) {
+	t.Helper()
+
+	tmpDir, err := os.MkdirTemp("", "arc-databases-authtest-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+
+	logger := zerolog.New(os.Stderr).Level(zerolog.Disabled)
+
+	// Storage backend lives under tmpDir/data so the auth.db doesn't
+	// collide with arc-database marker files in the same dir.
+	storageDir := filepath.Join(tmpDir, "data")
+	if err := os.MkdirAll(storageDir, 0o700); err != nil {
+		os.RemoveAll(tmpDir)
+		t.Fatalf("failed to create storage dir: %v", err)
+	}
+	backend, err := storage.NewLocalBackend(storageDir, logger)
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		t.Fatalf("failed to create LocalBackend: %v", err)
+	}
+
+	// Real auth manager backed by a tmp SQLite file.
+	authDBPath := filepath.Join(tmpDir, "auth.db")
+	am, err := auth.NewAuthManager(authDBPath, 1*time.Second, 100, logger)
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		t.Fatalf("failed to create AuthManager: %v", err)
+	}
+
+	deleteConfig := &config.DeleteConfig{Enabled: true}
+	handler := NewDatabasesHandler(backend, deleteConfig, am, logger)
+
+	app := fiber.New()
+	// Mount the same global middleware cmd/arc/main.go does. Without
+	// this, RequireAdmin reads a nil token_info from c.Locals and
+	// rejects with 401 instead of 403 — the test would pass for the
+	// wrong reason.
+	app.Use(auth.NewMiddleware(auth.MiddlewareConfig{AuthManager: am}))
+	handler.RegisterRoutes(app)
+
+	return handler, app, am, tmpDir
+}
+
+// mustCreateToken provisions a token with the given permissions and
+// returns its raw value (suitable for Authorization: Bearer headers).
+// Tests fatal-out on any setup failure.
+func mustCreateToken(t *testing.T, am *auth.AuthManager, name, permissions string) string {
+	t.Helper()
+	tok, err := am.CreateToken(context.Background(), name, "test token", permissions, nil)
+	if err != nil {
+		t.Fatalf("CreateToken(%q, perms=%q): %v", name, permissions, err)
+	}
+	return tok
+}
+
+// TestDatabasesHandler_CreateRequiresAdmin is the regression test
+// for arc#471. Before the fix, POST /api/v1/databases passed through
+// the global any-valid-token middleware and accepted any token. A
+// read-scoped token could provision databases — a configuration-by-
+// privilege-escalation surface.
+//
+// After the fix:
+//   - admin token  → 201 Created (happy path unchanged)
+//   - read token   → 403 Forbidden (the case this test pins)
+//   - write token  → 403 Forbidden (write != admin)
+//   - no token     → 401 Unauthorized (global middleware rejects)
+//
+// The test sub-cases share one auth + storage backend per Run so the
+// admin-creates path persists state across the subsequent assertions,
+// mirroring how an operator would actually use the API.
+func TestDatabasesHandler_CreateRequiresAdmin(t *testing.T) {
+	_, app, am, tmpDir := setupAuthedDatabasesHandler(t)
+	defer os.RemoveAll(tmpDir)
+	defer am.Close()
+
+	adminToken := mustCreateToken(t, am, "admin-test", "read,write,delete,admin")
+	readToken := mustCreateToken(t, am, "read-test", "read")
+	writeToken := mustCreateToken(t, am, "write-test", "read,write")
+
+	doPost := func(t *testing.T, token, body string) (int, string) {
+		t.Helper()
+		req := httptest.NewRequest("POST", "/api/v1/databases", bytes.NewReader([]byte(body)))
+		req.Header.Set("Content-Type", "application/json")
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := app.Test(req)
+		if err != nil {
+			t.Fatalf("app.Test: %v", err)
+		}
+		defer resp.Body.Close()
+		respBody, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(respBody)
+	}
+
+	t.Run("admin token can create", func(t *testing.T) {
+		status, body := doPost(t, adminToken, `{"name":"db_admin_ok"}`)
+		if status != fiber.StatusCreated {
+			t.Errorf("admin POST: status = %d, want 201; body=%s", status, body)
+		}
+	})
+
+	t.Run("read-only token is forbidden", func(t *testing.T) {
+		status, body := doPost(t, readToken, `{"name":"db_read_should_fail"}`)
+		if status != fiber.StatusForbidden {
+			t.Errorf("read POST: status = %d, want 403 (regression for arc#471 — read tokens MUST NOT be able to provision databases); body=%s", status, body)
+		}
+	})
+
+	t.Run("write token without admin is forbidden", func(t *testing.T) {
+		// Write tokens can ingest into new namespaces via the ingest
+		// pipeline (that's intentional auto-create-on-write). They
+		// must NOT be able to call the management API to provision
+		// empty databases — that's an admin-tier operation.
+		status, body := doPost(t, writeToken, `{"name":"db_write_should_fail"}`)
+		if status != fiber.StatusForbidden {
+			t.Errorf("write POST: status = %d, want 403; body=%s", status, body)
+		}
+	})
+
+	t.Run("no token returns 401", func(t *testing.T) {
+		// The global auth middleware rejects unauthenticated requests
+		// before RequireAdmin runs. Pin the boundary so a future
+		// refactor doesn't accidentally make this 403.
+		status, _ := doPost(t, "", `{"name":"db_anon_should_fail"}`)
+		if status != fiber.StatusUnauthorized {
+			t.Errorf("anonymous POST: status = %d, want 401", status)
+		}
+	})
+}
+
+// TestDatabasesHandler_DeleteRequiresAdmin pins the same contract for
+// DELETE that already had RequireAdmin pre-fix — making sure the
+// route-wrapping refactor in this PR didn't accidentally regress the
+// existing admin gate on DELETE.
+func TestDatabasesHandler_DeleteRequiresAdmin(t *testing.T) {
+	_, app, am, tmpDir := setupAuthedDatabasesHandler(t)
+	defer os.RemoveAll(tmpDir)
+	defer am.Close()
+
+	adminToken := mustCreateToken(t, am, "admin-del", "read,write,delete,admin")
+	readToken := mustCreateToken(t, am, "read-del", "read")
+
+	// Seed: admin creates a db, then we try to delete it with various
+	// tokens.
+	createReq := httptest.NewRequest("POST", "/api/v1/databases", bytes.NewReader([]byte(`{"name":"db_to_delete"}`)))
+	createReq.Header.Set("Content-Type", "application/json")
+	createReq.Header.Set("Authorization", "Bearer "+adminToken)
+	createResp, err := app.Test(createReq)
+	if err != nil {
+		t.Fatalf("seed create: %v", err)
+	}
+	if createResp.StatusCode != fiber.StatusCreated {
+		body, _ := io.ReadAll(createResp.Body)
+		t.Fatalf("seed create: status %d, body %s", createResp.StatusCode, body)
+	}
+	createResp.Body.Close()
+
+	t.Run("read-only token cannot delete", func(t *testing.T) {
+		req := httptest.NewRequest("DELETE", "/api/v1/databases/db_to_delete?confirm=true", nil)
+		req.Header.Set("Authorization", "Bearer "+readToken)
+		resp, err := app.Test(req)
+		if err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		if resp.StatusCode != fiber.StatusForbidden {
+			body, _ := io.ReadAll(resp.Body)
+			t.Errorf("read DELETE: status = %d, want 403; body=%s", resp.StatusCode, body)
+		}
+		resp.Body.Close()
+	})
+
+	t.Run("admin token can delete", func(t *testing.T) {
+		req := httptest.NewRequest("DELETE", "/api/v1/databases/db_to_delete?confirm=true", nil)
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		resp, err := app.Test(req)
+		if err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		if resp.StatusCode != fiber.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Errorf("admin DELETE: status = %d, want 200; body=%s", resp.StatusCode, body)
+		}
+		resp.Body.Close()
+	})
+}
+
+// TestDatabasesHandler_ReadEndpointsAcceptAnyValidToken pins that the
+// fix didn't accidentally over-tighten the read paths. List, Get, and
+// ListMeasurements should still accept any valid token (admin OR
+// read-only) — they're read-only operations.
+func TestDatabasesHandler_ReadEndpointsAcceptAnyValidToken(t *testing.T) {
+	_, app, am, tmpDir := setupAuthedDatabasesHandler(t)
+	defer os.RemoveAll(tmpDir)
+	defer am.Close()
+
+	adminToken := mustCreateToken(t, am, "admin-read", "read,write,delete,admin")
+	readToken := mustCreateToken(t, am, "read-read", "read")
+
+	// Seed: admin creates a db with content so List/Get/ListMeasurements
+	// have something real to return.
+	createReq := httptest.NewRequest("POST", "/api/v1/databases", bytes.NewReader([]byte(`{"name":"readable_db"}`)))
+	createReq.Header.Set("Content-Type", "application/json")
+	createReq.Header.Set("Authorization", "Bearer "+adminToken)
+	createResp, _ := app.Test(createReq)
+	if createResp.StatusCode != fiber.StatusCreated {
+		body, _ := io.ReadAll(createResp.Body)
+		t.Fatalf("seed: %d %s", createResp.StatusCode, body)
+	}
+	createResp.Body.Close()
+
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"list databases", "/api/v1/databases"},
+		{"get database", "/api/v1/databases/readable_db"},
+		{"list measurements", "/api/v1/databases/readable_db/measurements"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", tc.path, nil)
+			req.Header.Set("Authorization", "Bearer "+readToken)
+			resp, err := app.Test(req)
+			if err != nil {
+				t.Fatalf("Test: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != fiber.StatusOK && resp.StatusCode != fiber.StatusNotFound {
+				// 200 is the happy case. 404 acceptable for
+				// list-measurements on a brand-new empty database
+				// (depends on storage backend; both are correct
+				// behavior — what matters is NOT 401/403).
+				body, _ := io.ReadAll(resp.Body)
+				t.Errorf("read token on %s: status = %d, want 200 (or 404 for empty list); body=%s", tc.path, resp.StatusCode, body)
+			}
+		})
+	}
 }
