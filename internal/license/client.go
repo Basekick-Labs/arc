@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"runtime"
@@ -14,6 +15,13 @@ import (
 
 	"github.com/rs/zerolog"
 )
+
+// maxLicenseResponseBytes caps the response-body size we'll read on
+// the activation/verify path. A signed RSA-2048 license_file is
+// ~800 bytes after base64; 1 MiB is generous headroom that still
+// shuts down a hostile proxy attempting to OOM us by streaming an
+// unbounded body.
+const maxLicenseResponseBytes = 1 << 20
 
 const (
 	// LicenseServerURL is the hardcoded enterprise license server URL
@@ -47,19 +55,28 @@ type VerifyRequest struct {
 	MachineFingerprint string `json:"machine_fingerprint"`
 }
 
-// VerifyResponse represents the response from the license server
+// VerifyResponse represents the response from the license server.
+//
+// LicenseFile + LicenseSignature form a JWS-style detached signature
+// pair. As of 26.06.2 this is the only material used for feature
+// gating; the other fields below are decoded for backward-compat /
+// debug logging only and MUST NOT be relied upon. Use
+// VerifyLicenseFile(LicenseFile, LicenseSignature) to derive a
+// verified License.
 type VerifyResponse struct {
-	Valid         bool      `json:"valid"`
-	Tier          string    `json:"tier,omitempty"`
-	ExpiresAt     time.Time `json:"expires_at,omitempty"`
-	DaysRemaining int       `json:"days_remaining,omitempty"`
-	Status        string    `json:"status,omitempty"` // active, grace_period, read_only, expired
-	Error         string    `json:"error,omitempty"`
-	MaxCores      int       `json:"max_cores,omitempty"`
-	MaxMachines   int       `json:"max_machines,omitempty"`
-	Features      []string  `json:"features,omitempty"`
-	CustomerID    string    `json:"customer_id,omitempty"`
-	CustomerName  string    `json:"customer_name,omitempty"`
+	Valid            bool      `json:"valid"`
+	LicenseFile      string    `json:"license_file,omitempty"`      // Base64 canonical License JSON (the SIGNED bytes)
+	LicenseSignature string    `json:"license_signature,omitempty"` // Base64 RSA-PKCS1v15 SHA-256 signature over LicenseFile's decoded bytes
+	Tier             string    `json:"tier,omitempty"`
+	ExpiresAt        time.Time `json:"expires_at,omitempty"`
+	DaysRemaining    int       `json:"days_remaining,omitempty"`
+	Status           string    `json:"status,omitempty"` // active, grace_period, read_only, expired
+	Error            string    `json:"error,omitempty"`
+	MaxCores         int       `json:"max_cores,omitempty"`
+	MaxMachines      int       `json:"max_machines,omitempty"`
+	Features         []string  `json:"features,omitempty"`
+	CustomerID       string    `json:"customer_id,omitempty"`
+	CustomerName     string    `json:"customer_name,omitempty"`
 }
 
 // NewClient creates a new license client
@@ -101,19 +118,25 @@ type ActivateRequest struct {
 	Cores              int    `json:"cores"`
 }
 
-// ActivateResponse represents the response from license activation
+// ActivateResponse represents the response from license activation.
+//
+// LicenseFile + LicenseSignature form a JWS-style detached signature
+// pair (matches VerifyResponse — see that struct for the rationale).
+// Decoded LicenseFile bytes ARE what was signed; LicenseSignature is
+// RSA-PKCS1v15 SHA-256 over those exact bytes.
 type ActivateResponse struct {
-	Success       bool      `json:"success"`
-	LicenseFile   string    `json:"license_file,omitempty"` // Base64 encoded signed license
-	ExpiresAt     time.Time `json:"expires_at,omitempty"`
-	Tier          string    `json:"tier,omitempty"`
-	MaxCores      int       `json:"max_cores,omitempty"`
-	Error         string    `json:"error,omitempty"`
-	CustomerID    string    `json:"customer_id,omitempty"`
-	CustomerName  string    `json:"customer_name,omitempty"`
-	Features      []string  `json:"features,omitempty"`
-	DaysRemaining int       `json:"days_remaining,omitempty"`
-	Status        string    `json:"status,omitempty"`
+	Success          bool      `json:"success"`
+	LicenseFile      string    `json:"license_file,omitempty"`      // Base64 canonical License JSON (the SIGNED bytes)
+	LicenseSignature string    `json:"license_signature,omitempty"` // Base64 RSA-PKCS1v15 SHA-256 signature over LicenseFile's decoded bytes
+	ExpiresAt        time.Time `json:"expires_at,omitempty"`
+	Tier             string    `json:"tier,omitempty"`
+	MaxCores         int       `json:"max_cores,omitempty"`
+	Error            string    `json:"error,omitempty"`
+	CustomerID       string    `json:"customer_id,omitempty"`
+	CustomerName     string    `json:"customer_name,omitempty"`
+	Features         []string  `json:"features,omitempty"`
+	DaysRemaining    int       `json:"days_remaining,omitempty"`
+	Status           string    `json:"status,omitempty"`
 }
 
 // Activate registers this machine with the license server
@@ -155,9 +178,12 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 	}
 	defer resp.Body.Close()
 
+	if err := checkHTTPStatus(resp); err != nil {
+		return nil, fmt.Errorf("license activation failed: %w", err)
+	}
 	var activateResp ActivateResponse
-	if err := json.NewDecoder(resp.Body).Decode(&activateResp); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+	if err := readBoundedJSON(resp, &activateResp); err != nil {
+		return nil, fmt.Errorf("failed to decode activation response: %w", err)
 	}
 
 	if !activateResp.Success {
@@ -169,17 +195,23 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 		return nil, fmt.Errorf("license activation failed: %s", errMsg)
 	}
 
-	license := &License{
-		LicenseKey:    c.licenseKey,
-		CustomerID:    activateResp.CustomerID,
-		CustomerName:  activateResp.CustomerName,
-		Tier:          TierFromString(activateResp.Tier),
-		MaxCores:      activateResp.MaxCores,
-		Features:      activateResp.Features,
-		ExpiresAt:     activateResp.ExpiresAt,
-		Status:        activateResp.Status,
-		DaysRemaining: activateResp.DaysRemaining,
+	// Verify the detached signature against the raw license_file
+	// bytes (NOT against a re-marshaled struct — that's the forward-
+	// compat trap). The unsigned envelope fields (Tier/Features/
+	// MaxCores/...) are discarded; the verified SignedLicense is the
+	// sole source of truth for every feature gate.
+	signed, err := VerifyLicenseFile(activateResp.LicenseFile, activateResp.LicenseSignature)
+	if err != nil {
+		c.logger.Warn().Err(err).Msg("License activation: signature verification failed")
+		return nil, fmt.Errorf("license activation failed: %w", err)
 	}
+	if err := c.bindFingerprint(signed); err != nil {
+		c.logger.Warn().Err(err).Msg("License activation: fingerprint binding mismatch")
+		return nil, fmt.Errorf("license activation failed: %w", err)
+	}
+	c.logger.Debug().Msg("signature verified")
+
+	license := signed.ToRuntimeLicense(time.Now().UTC())
 
 	// Store the license
 	c.mu.Lock()
@@ -222,9 +254,12 @@ func (c *Client) Verify(ctx context.Context) (*License, error) {
 	}
 	defer resp.Body.Close()
 
+	if err := checkHTTPStatus(resp); err != nil {
+		return nil, fmt.Errorf("license validation failed: %w", err)
+	}
 	var verifyResp VerifyResponse
-	if err := json.NewDecoder(resp.Body).Decode(&verifyResp); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+	if err := readBoundedJSON(resp, &verifyResp); err != nil {
+		return nil, fmt.Errorf("failed to decode verify response: %w", err)
 	}
 
 	if !verifyResp.Valid {
@@ -236,18 +271,19 @@ func (c *Client) Verify(ctx context.Context) (*License, error) {
 		return nil, fmt.Errorf("license validation failed: %s", errMsg)
 	}
 
-	license := &License{
-		LicenseKey:    c.licenseKey,
-		CustomerID:    verifyResp.CustomerID,
-		CustomerName:  verifyResp.CustomerName,
-		Tier:          TierFromString(verifyResp.Tier),
-		MaxCores:      verifyResp.MaxCores,
-		MaxMachines:   verifyResp.MaxMachines,
-		Features:      verifyResp.Features,
-		ExpiresAt:     verifyResp.ExpiresAt,
-		Status:        verifyResp.Status,
-		DaysRemaining: verifyResp.DaysRemaining,
+	// Same detached-signature verification path as Activate.
+	signed, err := VerifyLicenseFile(verifyResp.LicenseFile, verifyResp.LicenseSignature)
+	if err != nil {
+		c.logger.Warn().Err(err).Msg("License verification: signature verification failed")
+		return nil, fmt.Errorf("license validation failed: %w", err)
 	}
+	if err := c.bindFingerprint(signed); err != nil {
+		c.logger.Warn().Err(err).Msg("License verification: fingerprint binding mismatch")
+		return nil, fmt.Errorf("license validation failed: %w", err)
+	}
+	c.logger.Debug().Msg("signature verified")
+
+	license := signed.ToRuntimeLicense(time.Now().UTC())
 
 	// Store the license
 	c.mu.Lock()
@@ -430,4 +466,72 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// bindFingerprint enforces that, when the signed License is bound to
+// a specific machine, that machine is THIS machine. Closes the
+// "MitM captures customer A's signed blob and replays it to customer
+// B's machine" attack: the activation server already binds the
+// MachineFingerprint at sign time; arc now verifies the binding at
+// the receiver.
+//
+// An empty MachineFingerprint in the signed blob is permitted (some
+// signing flows omit it intentionally, e.g. offline licenses) and
+// returns nil. A non-empty fingerprint that doesn't match the
+// running machine is rejected.
+//
+// The constant-time check isn't strictly necessary (this is a public-
+// readable identifier, not a secret) but the fingerprints have fixed
+// "sha256:" prefix + 64 hex chars and bytewise equality is fine
+// either way.
+func (c *Client) bindFingerprint(signed *SignedLicense) error {
+	if signed == nil || signed.MachineFingerprint == "" {
+		return nil
+	}
+	if signed.MachineFingerprint != c.fingerprint {
+		return fmt.Errorf("license: signed fingerprint %q does not match this machine %q",
+			signed.MachineFingerprint[:min(16, len(signed.MachineFingerprint))]+"...",
+			c.fingerprint[:min(16, len(c.fingerprint))]+"...")
+	}
+	return nil
+}
+
+// checkHTTPStatus returns a descriptive error if the response is not
+// a 2xx. Lets callers surface "HTTP 502 from license server" to
+// operators instead of "failed to decode response: invalid character
+// 'H' looking for beginning of value" — much easier to triage.
+//
+// Doesn't close resp.Body — caller's defer handles that.
+func checkHTTPStatus(resp *http.Response) error {
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	// Drain a small bounded prefix of the body so the message can include
+	// the server's error text. Anything more than 4 KiB is almost
+	// certainly an HTML error page from an upstream proxy; truncate.
+	preview, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	previewStr := strings.TrimSpace(string(preview))
+	// Rune-safe truncation: a byte-slice cut can split a multi-byte
+	// UTF-8 sequence and leave the error string invalid (turns the
+	// log line into mojibake). Counting runes preserves character
+	// boundaries on localized error pages.
+	if runes := []rune(previewStr); len(runes) > 256 {
+		previewStr = string(runes[:256]) + "...[truncated]"
+	}
+	if previewStr == "" {
+		return fmt.Errorf("HTTP %d from license server", resp.StatusCode)
+	}
+	return fmt.Errorf("HTTP %d from license server: %s", resp.StatusCode, previewStr)
+}
+
+// readBoundedJSON decodes a JSON response body into `v`, refusing to
+// read more than maxLicenseResponseBytes. Defends against a hostile
+// proxy returning an unbounded stream — the threat model explicitly
+// contemplates a substituted activation server, and DoSing the arc
+// process via a huge body is the lowest-effort attack against it.
+//
+// Doesn't close resp.Body — caller's defer handles that.
+func readBoundedJSON(resp *http.Response, v any) error {
+	bounded := io.LimitReader(resp.Body, maxLicenseResponseBytes)
+	return json.NewDecoder(bounded).Decode(v)
 }
