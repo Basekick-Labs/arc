@@ -1017,7 +1017,10 @@ func TestDatabasesHandler_ReadEndpointsAcceptAnyValidToken(t *testing.T) {
 	createReq := httptest.NewRequest("POST", "/api/v1/databases", bytes.NewReader([]byte(`{"name":"readable_db"}`)))
 	createReq.Header.Set("Content-Type", "application/json")
 	createReq.Header.Set("Authorization", "Bearer "+adminToken)
-	createResp, _ := app.Test(createReq)
+	createResp, err := app.Test(createReq)
+	if err != nil {
+		t.Fatalf("seed create: %v", err)
+	}
 	if createResp.StatusCode != fiber.StatusCreated {
 		body, _ := io.ReadAll(createResp.Body)
 		t.Fatalf("seed: %d %s", createResp.StatusCode, body)
