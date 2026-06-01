@@ -40,8 +40,8 @@ func init() {
 }
 
 // withTestPublicKey temporarily replaces parsedEnterprisePublicKey for
-// the duration of a test. Returns a cleanup function via t.Cleanup so
-// no test can leak its pinned key into a subsequent test.
+// the duration of a test. t.Cleanup ensures no test leaks its pinned
+// key into subsequent tests.
 func withTestPublicKey(t *testing.T, pubKey *rsa.PublicKey) {
 	t.Helper()
 	original := parsedEnterprisePublicKey
@@ -51,28 +51,35 @@ func withTestPublicKey(t *testing.T, pubKey *rsa.PublicKey) {
 	})
 }
 
-// signLicense produces a license_file string the server would have
-// emitted: builds the SignedLicense, signs the canonical bytes, sets
-// the Signature field, marshals + base64-encodes.
-func signLicense(t *testing.T, priv *rsa.PrivateKey, lic *SignedLicense) string {
+// signDetached produces the (licenseFileB64, signatureB64) pair the
+// activation server would have emitted for a given SignedLicense.
+// Mirrors Signer.SignDetached on the server side.
+func signDetached(t *testing.T, priv *rsa.PrivateKey, lic *SignedLicense) (licenseFileB64, signatureB64 string) {
 	t.Helper()
-	// Capture the canonical bytes (signature-cleared) the server signs.
-	canonical, err := lic.ToJSONForSigning()
+	payload, err := json.Marshal(lic)
 	if err != nil {
-		t.Fatalf("ToJSONForSigning: %v", err)
+		t.Fatalf("marshal license: %v", err)
 	}
-	hash := sha256.Sum256(canonical)
+	hash := sha256.Sum256(payload)
 	signature, err := rsa.SignPKCS1v15(rand.Reader, priv, crypto.SHA256, hash[:])
 	if err != nil {
 		t.Fatalf("SignPKCS1v15: %v", err)
 	}
-	lic.Signature = base64.StdEncoding.EncodeToString(signature)
+	return base64.StdEncoding.EncodeToString(payload), base64.StdEncoding.EncodeToString(signature)
+}
 
-	signedJSON, err := json.Marshal(lic)
+// signDetachedRaw signs an arbitrary byte slice (NOT necessarily a
+// SignedLicense JSON). Used by the forward-compatibility test to
+// simulate a future server adding fields the current client doesn't
+// know about.
+func signDetachedRaw(t *testing.T, priv *rsa.PrivateKey, payload []byte) (licenseFileB64, signatureB64 string) {
+	t.Helper()
+	hash := sha256.Sum256(payload)
+	signature, err := rsa.SignPKCS1v15(rand.Reader, priv, crypto.SHA256, hash[:])
 	if err != nil {
-		t.Fatalf("marshal signed: %v", err)
+		t.Fatalf("SignPKCS1v15: %v", err)
 	}
-	return base64.StdEncoding.EncodeToString(signedJSON)
+	return base64.StdEncoding.EncodeToString(payload), base64.StdEncoding.EncodeToString(signature)
 }
 
 func sampleLicense() *SignedLicense {
@@ -97,9 +104,9 @@ func sampleLicense() *SignedLicense {
 func TestVerifyLicenseFile_GoldenPath(t *testing.T) {
 	withTestPublicKey(t, &rsaKey1.PublicKey)
 	lic := sampleLicense()
-	licenseFile := signLicense(t, rsaKey1, lic)
+	licenseFile, signature := signDetached(t, rsaKey1, lic)
 
-	got, err := VerifyLicenseFile(licenseFile)
+	got, err := VerifyLicenseFile(licenseFile, signature)
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -118,30 +125,21 @@ func TestVerifyLicenseFile_GoldenPath(t *testing.T) {
 }
 
 // TestVerifyLicenseFile_TamperedPayload pins detection of payload
-// modification: the signature was valid for the original blob, but a
-// byte of the blob has been flipped after signing, so verification
-// must fail. This is the "attacker upgrades their tier from starter
-// to enterprise without re-signing" attack.
+// modification: the signature was valid for the original payload
+// bytes, but a byte has been flipped after signing, so verification
+// must fail.
 func TestVerifyLicenseFile_TamperedPayload(t *testing.T) {
 	withTestPublicKey(t, &rsaKey1.PublicKey)
 	lic := sampleLicense()
-	licenseFile := signLicense(t, rsaKey1, lic)
+	licenseFile, signature := signDetached(t, rsaKey1, lic)
 
-	// Decode, mutate the License, re-encode WITHOUT re-signing.
-	rawJSON, err := base64.StdEncoding.DecodeString(licenseFile)
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	var s SignedLicense
-	if err := json.Unmarshal(rawJSON, &s); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	// Upgrade ourselves from enterprise to unlimited tier.
-	s.Tier = "unlimited"
-	tamperedJSON, _ := json.Marshal(s)
-	tamperedFile := base64.StdEncoding.EncodeToString(tamperedJSON)
+	// Mutate the encoded payload (flip a byte in the decoded bytes,
+	// then re-encode to base64).
+	payload, _ := base64.StdEncoding.DecodeString(licenseFile)
+	payload[len(payload)/2] ^= 0xFF
+	tamperedFile := base64.StdEncoding.EncodeToString(payload)
 
-	_, err = VerifyLicenseFile(tamperedFile)
+	_, err := VerifyLicenseFile(tamperedFile, signature)
 	if err == nil {
 		t.Fatal("expected verification failure, got nil")
 	}
@@ -156,19 +154,13 @@ func TestVerifyLicenseFile_TamperedPayload(t *testing.T) {
 func TestVerifyLicenseFile_TamperedSignature(t *testing.T) {
 	withTestPublicKey(t, &rsaKey1.PublicKey)
 	lic := sampleLicense()
-	licenseFile := signLicense(t, rsaKey1, lic)
+	licenseFile, signature := signDetached(t, rsaKey1, lic)
 
-	rawJSON, _ := base64.StdEncoding.DecodeString(licenseFile)
-	var s SignedLicense
-	_ = json.Unmarshal(rawJSON, &s)
-	// Flip a byte of the signature (decode → mutate → re-encode).
-	sigBytes, _ := base64.StdEncoding.DecodeString(s.Signature)
+	sigBytes, _ := base64.StdEncoding.DecodeString(signature)
 	sigBytes[0] ^= 0xFF
-	s.Signature = base64.StdEncoding.EncodeToString(sigBytes)
-	tamperedJSON, _ := json.Marshal(s)
-	tamperedFile := base64.StdEncoding.EncodeToString(tamperedJSON)
+	tamperedSig := base64.StdEncoding.EncodeToString(sigBytes)
 
-	_, err := VerifyLicenseFile(tamperedFile)
+	_, err := VerifyLicenseFile(licenseFile, tamperedSig)
 	if err == nil {
 		t.Fatal("expected verification failure, got nil")
 	}
@@ -179,14 +171,13 @@ func TestVerifyLicenseFile_TamperedSignature(t *testing.T) {
 
 // TestVerifyLicenseFile_WrongKey pins detection of signature-from-
 // another-key attempts: the blob is signed by rsaKey2 but the pinned
-// trust root is rsaKey1. The attacker has full signing capability
-// with their own key but can't forge against the pinned one.
+// trust root is rsaKey1.
 func TestVerifyLicenseFile_WrongKey(t *testing.T) {
 	withTestPublicKey(t, &rsaKey1.PublicKey)
 	lic := sampleLicense()
-	licenseFile := signLicense(t, rsaKey2, lic) // signed by rsaKey2!
+	licenseFile, signature := signDetached(t, rsaKey2, lic) // signed by rsaKey2!
 
-	_, err := VerifyLicenseFile(licenseFile)
+	_, err := VerifyLicenseFile(licenseFile, signature)
 	if err == nil {
 		t.Fatal("expected verification failure, got nil")
 	}
@@ -199,105 +190,60 @@ func TestVerifyLicenseFile_WrongKey(t *testing.T) {
 // empty-license-file case (older server, or stripped response).
 func TestVerifyLicenseFile_MissingLicenseFile(t *testing.T) {
 	withTestPublicKey(t, &rsaKey1.PublicKey)
-	_, err := VerifyLicenseFile("")
+	_, err := VerifyLicenseFile("", "some-sig")
 	if !errors.Is(err, ErrNoLicenseFile) {
 		t.Errorf("expected ErrNoLicenseFile, got %v", err)
 	}
 }
 
-// TestVerifyLicenseFile_MalformedBase64 pins fail-closed on garbage
-// in license_file. An attacker substituting `!!!notbase64!!!` should
-// not panic or trip a CPU loop — just fail cleanly.
-func TestVerifyLicenseFile_MalformedBase64(t *testing.T) {
+// TestVerifyLicenseFile_MissingSignature pins fail-closed when
+// license_file is present but license_signature is missing.
+func TestVerifyLicenseFile_MissingSignature(t *testing.T) {
 	withTestPublicKey(t, &rsaKey1.PublicKey)
-	_, err := VerifyLicenseFile("!!!notbase64!!!")
+	lic := sampleLicense()
+	licenseFile, _ := signDetached(t, rsaKey1, lic)
+	_, err := VerifyLicenseFile(licenseFile, "")
+	if !errors.Is(err, ErrNoLicenseSignature) {
+		t.Errorf("expected ErrNoLicenseSignature, got %v", err)
+	}
+}
+
+// TestVerifyLicenseFile_MalformedBase64File pins fail-closed on
+// garbage in license_file.
+func TestVerifyLicenseFile_MalformedBase64File(t *testing.T) {
+	withTestPublicKey(t, &rsaKey1.PublicKey)
+	_, err := VerifyLicenseFile("!!!notbase64!!!", "validplaceholderbase64==")
 	if !errors.Is(err, ErrMalformedLicenseFile) {
 		t.Errorf("expected ErrMalformedLicenseFile, got %v", err)
 	}
 }
 
-// TestVerifyLicenseFile_MalformedSignedLicense pins fail-closed on
-// valid-base64-but-not-a-SignedLicense JSON. Could happen if the
-// server's struct shape drifts and we decode an older arc against a
-// newer-shaped response.
-func TestVerifyLicenseFile_MalformedSignedLicense(t *testing.T) {
-	withTestPublicKey(t, &rsaKey1.PublicKey)
-	junk := base64.StdEncoding.EncodeToString([]byte("this is valid base64 but not json"))
-	_, err := VerifyLicenseFile(junk)
-	if !errors.Is(err, ErrMalformedSignedLicense) {
-		t.Errorf("expected ErrMalformedSignedLicense, got %v", err)
-	}
-}
-
-// TestVerifyLicenseFile_MissingSignature pins fail-closed when the
-// SignedLicense JSON is valid but has no signature field. The server
-// should never emit this, but if a bug or middleware strips it, we
-// fail closed rather than accepting an unsigned payload.
-func TestVerifyLicenseFile_MissingSignature(t *testing.T) {
+// TestVerifyLicenseFile_MalformedBase64Signature pins fail-closed on
+// garbage in license_signature.
+func TestVerifyLicenseFile_MalformedBase64Signature(t *testing.T) {
 	withTestPublicKey(t, &rsaKey1.PublicKey)
 	lic := sampleLicense()
-	// Build the blob WITHOUT signing — Signature stays empty.
-	signedJSON, _ := json.Marshal(lic)
-	noSigFile := base64.StdEncoding.EncodeToString(signedJSON)
-
-	_, err := VerifyLicenseFile(noSigFile)
-	if !errors.Is(err, ErrMissingSignature) {
-		t.Errorf("expected ErrMissingSignature, got %v", err)
+	licenseFile, _ := signDetached(t, rsaKey1, lic)
+	_, err := VerifyLicenseFile(licenseFile, "!!!notbase64!!!")
+	if !errors.Is(err, ErrMalformedSignature) {
+		t.Errorf("expected ErrMalformedSignature, got %v", err)
 	}
 }
 
-// TestBindFingerprint_AllowsEmptyFingerprintInSignedBlob pins the
-// "signed blob has no fingerprint" path: some sign flows omit it
-// (e.g. offline licenses). The client must not reject those — only
-// non-empty mismatches.
-func TestBindFingerprint_AllowsEmptyFingerprintInSignedBlob(t *testing.T) {
-	c := &Client{fingerprint: "sha256:abc"}
-	signed := &SignedLicense{MachineFingerprint: ""} // omitted
-	if err := c.bindFingerprint(signed); err != nil {
-		t.Errorf("expected nil error for empty fingerprint, got %v", err)
-	}
-}
+// TestVerifyLicenseFile_MalformedSignedLicense pins fail-closed when
+// the signature verifies but the payload isn't valid SignedLicense
+// JSON. This is the "server-side bug signed garbage" case — an
+// attacker who could produce a verifying signature could also
+// produce valid JSON, so this isn't a security boundary, just a
+// safety net.
+func TestVerifyLicenseFile_MalformedSignedLicense(t *testing.T) {
+	withTestPublicKey(t, &rsaKey1.PublicKey)
+	// Sign arbitrary bytes that aren't a JSON object.
+	licenseFile, signature := signDetachedRaw(t, rsaKey1, []byte("this is not json"))
 
-// TestBindFingerprint_AcceptsMatchingFingerprint covers the happy path.
-func TestBindFingerprint_AcceptsMatchingFingerprint(t *testing.T) {
-	c := &Client{fingerprint: "sha256:abc123"}
-	signed := &SignedLicense{MachineFingerprint: "sha256:abc123"}
-	if err := c.bindFingerprint(signed); err != nil {
-		t.Errorf("expected nil error for matching fingerprint, got %v", err)
-	}
-}
-
-// TestBindFingerprint_RejectsMismatch pins the replay-defense: a
-// signed blob bound to a different machine's fingerprint must be
-// rejected even though the RSA signature verifies. Closes the
-// "MitM intercepts customer-A's blob and replays it on customer-B's
-// machine" attack that the original matrix didn't cover.
-func TestBindFingerprint_RejectsMismatch(t *testing.T) {
-	c := &Client{fingerprint: "sha256:thismachine"}
-	signed := &SignedLicense{MachineFingerprint: "sha256:differentmachine"}
-	err := c.bindFingerprint(signed)
-	if err == nil {
-		t.Fatal("expected error for fingerprint mismatch, got nil")
-	}
-	if !strings.Contains(err.Error(), "does not match this machine") {
-		t.Errorf("error %q does not mention fingerprint mismatch", err)
-	}
-}
-
-// TestEnterprisePublicKey_PinnedAtBuildTime confirms the production
-// public key embedded in pubkey.go parses correctly at package init.
-// If this test fails the binary is misconfigured and every Enterprise
-// activation will fail with ErrNoPublicKey at runtime — this catches
-// that at build time instead.
-func TestEnterprisePublicKey_PinnedAtBuildTime(t *testing.T) {
-	if parsedEnterprisePublicKey == nil {
-		t.Fatal("parsedEnterprisePublicKey is nil — pubkey.go contains a placeholder or malformed PEM; production builds will reject every license")
-	}
-	// Sanity-check the key size — anything not RSA-2048 indicates
-	// the wrong key was pasted (e.g. a 1024-bit test key).
-	bits := parsedEnterprisePublicKey.N.BitLen()
-	if bits != 2048 {
-		t.Errorf("pinned key bit-size = %d, want 2048 (RSA-2048 is the contract with the activation server)", bits)
+	_, err := VerifyLicenseFile(licenseFile, signature)
+	if !errors.Is(err, ErrMalformedSignedLicense) {
+		t.Errorf("expected ErrMalformedSignedLicense, got %v", err)
 	}
 }
 
@@ -310,16 +256,118 @@ func TestVerifyLicenseFile_NoPublicKey(t *testing.T) {
 	t.Cleanup(func() { parsedEnterprisePublicKey = original })
 
 	lic := sampleLicense()
-	licenseFile := signLicense(t, rsaKey1, lic)
-	_, err := VerifyLicenseFile(licenseFile)
+	licenseFile, signature := signDetached(t, rsaKey1, lic)
+	_, err := VerifyLicenseFile(licenseFile, signature)
 	if !errors.Is(err, ErrNoPublicKey) {
 		t.Errorf("expected ErrNoPublicKey, got %v", err)
 	}
 }
 
+// TestVerifyLicenseFile_FutureServerAddsFields_StillVerifies is the
+// flagship test for the JWS-style detached-signature design. It
+// simulates the scenario Gemini flagged in PR #473 as a critical
+// flaw against the previous embedded-signature design:
+//
+//  1. A future activation server adds new fields to the License
+//     struct (here: "new_feature_x" and "max_widgets") that the
+//     current arc client doesn't know about.
+//  2. The future server signs the full payload INCLUDING the new
+//     fields.
+//  3. The current arc client receives the payload + signature.
+//  4. Verification MUST succeed: the signature is over the raw
+//     bytes the client received, and the verifier never tries to
+//     re-marshal a parsed struct.
+//  5. After verification, the client parses what it knows; the
+//     unknown fields are silently dropped by json.Unmarshal (Go's
+//     default behavior). The known fields come through correctly.
+//
+// This test passing is the entire reason for the detached-signature
+// refactor: it lets the server evolve the License struct without
+// breaking every deployed older arc binary.
+func TestVerifyLicenseFile_FutureServerAddsFields_StillVerifies(t *testing.T) {
+	withTestPublicKey(t, &rsaKey1.PublicKey)
+
+	// Future server's payload: includes fields the current client
+	// doesn't know about. Sign the EXACT bytes the future server
+	// would emit — that's the contract.
+	futureLicensePayload := []byte(`{
+		"version": 2,
+		"license_key": "ARC-ENT-FUTURE-0000",
+		"customer_id": "cust-future",
+		"customer_name": "Future Customer",
+		"tier": "enterprise",
+		"max_cores": 64,
+		"max_machines": 8,
+		"features": ["tiered_storage", "clustering"],
+		"new_feature_x": true,
+		"max_widgets": 99,
+		"issued_at": "2027-06-01T00:00:00Z",
+		"expires_at": "2028-06-01T00:00:00Z"
+	}`)
+	licenseFile, signature := signDetachedRaw(t, rsaKey1, futureLicensePayload)
+
+	got, err := VerifyLicenseFile(licenseFile, signature)
+	if err != nil {
+		t.Fatalf("verification should succeed against future-server payload, got %v", err)
+	}
+
+	// Known fields come through correctly.
+	if got.LicenseKey != "ARC-ENT-FUTURE-0000" {
+		t.Errorf("LicenseKey = %q, want ARC-ENT-FUTURE-0000", got.LicenseKey)
+	}
+	if got.Tier != "enterprise" {
+		t.Errorf("Tier = %q, want enterprise", got.Tier)
+	}
+	if got.MaxCores != 64 {
+		t.Errorf("MaxCores = %d, want 64", got.MaxCores)
+	}
+	if got.Version != 2 {
+		t.Errorf("Version = %d, want 2", got.Version)
+	}
+}
+
+// TestVerifyLicenseFile_PayloadWhitespaceMatters confirms that the
+// signature is over the EXACT bytes received, not over some
+// normalized form. If a proxy reformats the JSON (re-indents,
+// changes field order), the signature will not verify. This is the
+// correct behavior: the server signed specific bytes, and any
+// modification — even semantically-equivalent whitespace changes —
+// must invalidate the signature.
+func TestVerifyLicenseFile_PayloadWhitespaceMatters(t *testing.T) {
+	withTestPublicKey(t, &rsaKey1.PublicKey)
+	// Sign one specific byte sequence; the original encoded payload
+	// is intentionally discarded — this test verifies that a
+	// whitespace-different (semantically-identical) payload paired
+	// with the original signature fails verification.
+	original := []byte(`{"version":1,"license_key":"X"}`)
+	_, signature := signDetachedRaw(t, rsaKey1, original)
+
+	// Re-encode with different whitespace — semantically identical,
+	// byte-different.
+	reformatted := base64.StdEncoding.EncodeToString([]byte(`{ "version": 1, "license_key": "X" }`))
+
+	_, err := VerifyLicenseFile(reformatted, signature)
+	if !errors.Is(err, ErrSignatureVerificationFailed) {
+		t.Errorf("expected ErrSignatureVerificationFailed for whitespace-altered payload, got %v", err)
+	}
+}
+
+// TestEnterprisePublicKey_PinnedAtBuildTime confirms the production
+// public key embedded in pubkey.go parses correctly at package init.
+// If this test fails the binary is misconfigured and every Enterprise
+// activation will fail with ErrNoPublicKey at runtime.
+func TestEnterprisePublicKey_PinnedAtBuildTime(t *testing.T) {
+	if parsedEnterprisePublicKey == nil {
+		t.Fatal("parsedEnterprisePublicKey is nil — pubkey.go contains a placeholder or malformed PEM; production builds will reject every license")
+	}
+	bits := parsedEnterprisePublicKey.N.BitLen()
+	if bits != 2048 {
+		t.Errorf("pinned key bit-size = %d, want 2048", bits)
+	}
+}
+
 // TestParseRSAPublicKey_ValidPEM confirms the PEM parsing path works
-// against a freshly-generated key. Guards against future PEM-format
-// regressions if x509 conventions change.
+// against a freshly-generated key.
 func TestParseRSAPublicKey_ValidPEM(t *testing.T) {
 	pubKeyBytes, err := x509.MarshalPKIXPublicKey(&rsaKey1.PublicKey)
 	if err != nil {
@@ -362,7 +410,6 @@ func TestParseRSAPublicKey_MalformedPEM(t *testing.T) {
 // replaying a yesterday-signed blob alongside a "status: active"
 // envelope today must NOT result in an active runtime License.
 func TestSignedLicense_ToRuntimeLicense_DerivesStatusFromSignedExpiry(t *testing.T) {
-	// Signed yesterday; expired yesterday (per the signed blob).
 	lic := &SignedLicense{
 		ExpiresAt: time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
 		Tier:      "enterprise",
@@ -383,7 +430,7 @@ func TestSignedLicense_ToRuntimeLicense_ActiveWhenNotExpired(t *testing.T) {
 		ExpiresAt: time.Date(2027, 6, 1, 0, 0, 0, 0, time.UTC),
 		Tier:      "enterprise",
 	}
-	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC) // a year before expiry
+	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
 
 	runtime := lic.ToRuntimeLicense(now)
 	if runtime.Status != "active" {
@@ -394,46 +441,38 @@ func TestSignedLicense_ToRuntimeLicense_ActiveWhenNotExpired(t *testing.T) {
 	}
 }
 
-// TestVerifyLicenseFile_TolerantToUnknownFields documents (and pins)
-// that unknown JSON fields injected into the license_file are silently
-// ignored by Go's default json.Unmarshal — they don't reach the
-// SignedLicense struct, they're not part of the canonical bytes we
-// recompute, and the signature still verifies. This is the correct
-// behavior for forward compatibility:
-//
-//   - The server can add new fields in a future version without
-//     breaking existing arc clients (the future fields are dropped on
-//     unmarshal; canonical bytes match the older arc's struct shape).
-//   - An attacker injecting fields gains nothing: the verifier never
-//     reads those fields, so they're not a vector for tier-elevation
-//     or feature-flag tampering. Only modifications to fields the
-//     verifier actually decodes can affect runtime gating, and those
-//     break the signature.
-//
-// This test exists to document the trust boundary, not to test a
-// failure case. If a future change tightens this (DisallowUnknownFields,
-// say), this test will start failing and the contract should be
-// re-thought before relaxing it back.
-func TestVerifyLicenseFile_TolerantToUnknownFields(t *testing.T) {
-	withTestPublicKey(t, &rsaKey1.PublicKey)
-
-	lic := sampleLicense()
-	licenseFile := signLicense(t, rsaKey1, lic)
-
-	// Inject an unknown field into the JSON without re-signing.
-	rawJSON, _ := base64.StdEncoding.DecodeString(licenseFile)
-	withExtra := strings.Replace(string(rawJSON), `"signature":`, `"future_field":"new_value","signature":`, 1)
-	tamperedFile := base64.StdEncoding.EncodeToString([]byte(withExtra))
-
-	got, err := VerifyLicenseFile(tamperedFile)
-	if err != nil {
-		t.Errorf("expected verification to succeed (unknown fields are dropped, canonical bytes match), got %v", err)
+// TestBindFingerprint_AllowsEmptyFingerprintInSignedBlob pins the
+// "signed blob has no fingerprint" path: some sign flows omit it
+// (e.g. offline licenses). The client must not reject those — only
+// non-empty mismatches.
+func TestBindFingerprint_AllowsEmptyFingerprintInSignedBlob(t *testing.T) {
+	c := &Client{fingerprint: "sha256:abc"}
+	signed := &SignedLicense{MachineFingerprint: ""}
+	if err := c.bindFingerprint(signed); err != nil {
+		t.Errorf("expected nil error for empty fingerprint, got %v", err)
 	}
-	// Confirm the injected field had no effect on the decoded license.
-	if got.LicenseKey != lic.LicenseKey {
-		t.Errorf("LicenseKey changed: got %q, want %q", got.LicenseKey, lic.LicenseKey)
+}
+
+func TestBindFingerprint_AcceptsMatchingFingerprint(t *testing.T) {
+	c := &Client{fingerprint: "sha256:abc123"}
+	signed := &SignedLicense{MachineFingerprint: "sha256:abc123"}
+	if err := c.bindFingerprint(signed); err != nil {
+		t.Errorf("expected nil error for matching fingerprint, got %v", err)
 	}
-	if got.Tier != lic.Tier {
-		t.Errorf("Tier changed: got %q, want %q", got.Tier, lic.Tier)
+}
+
+// TestBindFingerprint_RejectsMismatch pins the replay-defense: a
+// signed blob bound to a different machine's fingerprint must be
+// rejected even though the RSA signature verifies. Closes the
+// "replay customer-A's blob on customer-B's machine" attack.
+func TestBindFingerprint_RejectsMismatch(t *testing.T) {
+	c := &Client{fingerprint: "sha256:thismachine"}
+	signed := &SignedLicense{MachineFingerprint: "sha256:differentmachine"}
+	err := c.bindFingerprint(signed)
+	if err == nil {
+		t.Fatal("expected error for fingerprint mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "does not match this machine") {
+		t.Errorf("error %q does not mention fingerprint mismatch", err)
 	}
 }

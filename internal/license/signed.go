@@ -1,35 +1,25 @@
 package license
 
 import (
-	"encoding/json"
-	"fmt"
 	"time"
 )
 
-// timeNow is the clock used for license-status derivation. Production
-// callers should pass timeNow() to ToRuntimeLicense; tests overwrite
-// this var to drive the expiry math deterministically (e.g. to verify
-// that a SignedLicense with ExpiresAt in the past produces Status =
-// "expired" regardless of what the unsigned envelope claimed).
-var timeNow = func() time.Time { return time.Now().UTC() }
-
-// SignedLicense is the wire-compatible mirror of the activation
-// server's License struct (defined in arc-enterprise-activation-server's
-// internal/license/license.go).
+// SignedLicense is the parsed form of the canonical JSON payload the
+// activation server signs and Arc verifies via a detached signature.
 //
-// The field order, JSON tags, omitempty markers, and types MUST match
-// the server's struct exactly, because the signature is computed over
-// the result of `json.Marshal(SignedLicense{Signature:""})` — any
-// deviation produces different canonical bytes and the signature
-// will not verify.
+// The field order, JSON tags, and types are kept aligned with the
+// activation server's License struct (in arc-enterprise-activation-
+// server's internal/license/license.go) — but unlike the previous
+// embedded-signature design, divergence between the two sides no
+// longer breaks signature verification. Signature verification is
+// done against the RAW received bytes; this struct is only used
+// AFTER verification, for parsing the known fields. Unknown fields
+// the server may have added in a future version are silently
+// ignored by json.Unmarshal.
 //
-// This struct is intentionally separate from the runtime-facing
-// License type in license.go: License represents what arc *uses*
-// internally (computed fields like DaysRemaining, simplified subset);
-// SignedLicense represents what the server *signs and sends* (exact
-// wire shape including IssuedAt, MachineFingerprint, etc.). The
-// verification path unwraps SignedLicense → License after checking
-// the signature.
+// The Signature field has been REMOVED in this version: the
+// signature now travels in a separate envelope field
+// (response.license_signature), not embedded in the payload.
 type SignedLicense struct {
 	Version            int       `json:"version"`
 	LicenseKey         string    `json:"license_key"`
@@ -43,24 +33,6 @@ type SignedLicense struct {
 	MachineFingerprint string    `json:"machine_fingerprint,omitempty"`
 	IssuedAt           time.Time `json:"issued_at"`
 	ExpiresAt          time.Time `json:"expires_at"`
-	Signature          string    `json:"signature,omitempty"`
-}
-
-// ToJSONForSigning returns the canonical JSON bytes of this
-// SignedLicense with the Signature field zeroed out. These are the
-// bytes the activation server signed and that we hash before
-// verifying.
-//
-// Must match `(*License).ToJSONForSigning()` in the activation server
-// byte-for-byte. The implementation deliberately mirrors the server:
-// shallow copy, clear Signature, json.Marshal.
-func (s *SignedLicense) ToJSONForSigning() ([]byte, error) {
-	if s == nil {
-		return nil, fmt.Errorf("signed license is nil")
-	}
-	copy := *s
-	copy.Signature = ""
-	return json.Marshal(copy)
 }
 
 // ToRuntimeLicense converts a verified SignedLicense into the runtime
@@ -93,20 +65,19 @@ func (s *SignedLicense) ToRuntimeLicense(now time.Time) *License {
 }
 
 // deriveStatus computes Status + DaysRemaining from the signed
-// ExpiresAt + the current time. Matches the server-side mapping:
-//   - expired_at in the past         → "expired"
-//   - expired_at in the past 30 days → "grace_period"  (deprecated; server now returns "expired" here too)
-//   - expired_at in the future       → "active"
+// ExpiresAt + the current time:
+//   - ExpiresAt in the past   → "expired"
+//   - ExpiresAt in the future → "active"
 //
 // We deliberately don't implement a grace period client-side: if the
 // signed ExpiresAt is in the past, the license is expired. The server
-// can still grant a different status in its unsigned envelope (e.g.
-// for billing-grace UX) but Arc's feature gates use the strict signed
-// expiry to avoid trust escalation through the unsigned envelope.
+// can grant a different status in its unsigned envelope (e.g. for
+// billing-grace UX) but Arc's feature gates use the strict signed
+// expiry to prevent trust escalation through the unsigned envelope.
 func (s *SignedLicense) deriveStatus(now time.Time) (string, int) {
-	remaining := int(s.ExpiresAt.Sub(now).Hours() / 24)
 	if !s.ExpiresAt.After(now) {
 		return "expired", 0
 	}
+	remaining := int(s.ExpiresAt.Sub(now).Hours() / 24)
 	return "active", remaining
 }

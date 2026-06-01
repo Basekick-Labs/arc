@@ -57,24 +57,26 @@ type VerifyRequest struct {
 
 // VerifyResponse represents the response from the license server.
 //
-// LicenseFile is the base64-encoded RSA-PKCS1v15 signed License JSON.
-// As of 26.06.2 this is the only field used for feature gating — the
-// other fields below are decoded for backward compatibility + debug
-// logging only. Never trust them for runtime gating decisions; use
-// VerifyLicenseFile to derive a verified License from LicenseFile.
+// LicenseFile + LicenseSignature form a JWS-style detached signature
+// pair. As of 26.06.2 this is the only material used for feature
+// gating; the other fields below are decoded for backward-compat /
+// debug logging only and MUST NOT be relied upon. Use
+// VerifyLicenseFile(LicenseFile, LicenseSignature) to derive a
+// verified License.
 type VerifyResponse struct {
-	Valid         bool      `json:"valid"`
-	LicenseFile   string    `json:"license_file,omitempty"` // Base64 encoded signed license (26.06.2+ verifies this)
-	Tier          string    `json:"tier,omitempty"`
-	ExpiresAt     time.Time `json:"expires_at,omitempty"`
-	DaysRemaining int       `json:"days_remaining,omitempty"`
-	Status        string    `json:"status,omitempty"` // active, grace_period, read_only, expired
-	Error         string    `json:"error,omitempty"`
-	MaxCores      int       `json:"max_cores,omitempty"`
-	MaxMachines   int       `json:"max_machines,omitempty"`
-	Features      []string  `json:"features,omitempty"`
-	CustomerID    string    `json:"customer_id,omitempty"`
-	CustomerName  string    `json:"customer_name,omitempty"`
+	Valid            bool      `json:"valid"`
+	LicenseFile      string    `json:"license_file,omitempty"`      // Base64 canonical License JSON (the SIGNED bytes)
+	LicenseSignature string    `json:"license_signature,omitempty"` // Base64 RSA-PKCS1v15 SHA-256 signature over LicenseFile's decoded bytes
+	Tier             string    `json:"tier,omitempty"`
+	ExpiresAt        time.Time `json:"expires_at,omitempty"`
+	DaysRemaining    int       `json:"days_remaining,omitempty"`
+	Status           string    `json:"status,omitempty"` // active, grace_period, read_only, expired
+	Error            string    `json:"error,omitempty"`
+	MaxCores         int       `json:"max_cores,omitempty"`
+	MaxMachines      int       `json:"max_machines,omitempty"`
+	Features         []string  `json:"features,omitempty"`
+	CustomerID       string    `json:"customer_id,omitempty"`
+	CustomerName     string    `json:"customer_name,omitempty"`
 }
 
 // NewClient creates a new license client
@@ -116,19 +118,25 @@ type ActivateRequest struct {
 	Cores              int    `json:"cores"`
 }
 
-// ActivateResponse represents the response from license activation
+// ActivateResponse represents the response from license activation.
+//
+// LicenseFile + LicenseSignature form a JWS-style detached signature
+// pair (matches VerifyResponse — see that struct for the rationale).
+// Decoded LicenseFile bytes ARE what was signed; LicenseSignature is
+// RSA-PKCS1v15 SHA-256 over those exact bytes.
 type ActivateResponse struct {
-	Success       bool      `json:"success"`
-	LicenseFile   string    `json:"license_file,omitempty"` // Base64 encoded signed license
-	ExpiresAt     time.Time `json:"expires_at,omitempty"`
-	Tier          string    `json:"tier,omitempty"`
-	MaxCores      int       `json:"max_cores,omitempty"`
-	Error         string    `json:"error,omitempty"`
-	CustomerID    string    `json:"customer_id,omitempty"`
-	CustomerName  string    `json:"customer_name,omitempty"`
-	Features      []string  `json:"features,omitempty"`
-	DaysRemaining int       `json:"days_remaining,omitempty"`
-	Status        string    `json:"status,omitempty"`
+	Success          bool      `json:"success"`
+	LicenseFile      string    `json:"license_file,omitempty"`      // Base64 canonical License JSON (the SIGNED bytes)
+	LicenseSignature string    `json:"license_signature,omitempty"` // Base64 RSA-PKCS1v15 SHA-256 signature over LicenseFile's decoded bytes
+	ExpiresAt        time.Time `json:"expires_at,omitempty"`
+	Tier             string    `json:"tier,omitempty"`
+	MaxCores         int       `json:"max_cores,omitempty"`
+	Error            string    `json:"error,omitempty"`
+	CustomerID       string    `json:"customer_id,omitempty"`
+	CustomerName     string    `json:"customer_name,omitempty"`
+	Features         []string  `json:"features,omitempty"`
+	DaysRemaining    int       `json:"days_remaining,omitempty"`
+	Status           string    `json:"status,omitempty"`
 }
 
 // Activate registers this machine with the license server
@@ -187,11 +195,12 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 		return nil, fmt.Errorf("license activation failed: %s", errMsg)
 	}
 
-	// Verify the signed license blob against the pinned public key.
-	// The unsigned envelope fields (Tier/Features/MaxCores/...) are
-	// discarded — the verified SignedLicense is the sole source of
-	// truth for every feature gate.
-	signed, err := VerifyLicenseFile(activateResp.LicenseFile)
+	// Verify the detached signature against the raw license_file
+	// bytes (NOT against a re-marshaled struct — that's the forward-
+	// compat trap). The unsigned envelope fields (Tier/Features/
+	// MaxCores/...) are discarded; the verified SignedLicense is the
+	// sole source of truth for every feature gate.
+	signed, err := VerifyLicenseFile(activateResp.LicenseFile, activateResp.LicenseSignature)
 	if err != nil {
 		c.logger.Warn().Err(err).Msg("License activation: signature verification failed")
 		return nil, fmt.Errorf("license activation failed: %w", err)
@@ -202,7 +211,7 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 	}
 	c.logger.Debug().Msg("signature verified")
 
-	license := signed.ToRuntimeLicense(timeNow())
+	license := signed.ToRuntimeLicense(time.Now().UTC())
 
 	// Store the license
 	c.mu.Lock()
@@ -262,9 +271,8 @@ func (c *Client) Verify(ctx context.Context) (*License, error) {
 		return nil, fmt.Errorf("license validation failed: %s", errMsg)
 	}
 
-	// Same verification path as Activate: the unsigned envelope is
-	// ignored; the verified SignedLicense is the sole source of truth.
-	signed, err := VerifyLicenseFile(verifyResp.LicenseFile)
+	// Same detached-signature verification path as Activate.
+	signed, err := VerifyLicenseFile(verifyResp.LicenseFile, verifyResp.LicenseSignature)
 	if err != nil {
 		c.logger.Warn().Err(err).Msg("License verification: signature verification failed")
 		return nil, fmt.Errorf("license validation failed: %w", err)
@@ -275,7 +283,7 @@ func (c *Client) Verify(ctx context.Context) (*License, error) {
 	}
 	c.logger.Debug().Msg("signature verified")
 
-	license := signed.ToRuntimeLicense(timeNow())
+	license := signed.ToRuntimeLicense(time.Now().UTC())
 
 	// Store the license
 	c.mu.Lock()
@@ -503,8 +511,12 @@ func checkHTTPStatus(resp *http.Response) error {
 	// certainly an HTML error page from an upstream proxy; truncate.
 	preview, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 	previewStr := strings.TrimSpace(string(preview))
-	if len(previewStr) > 256 {
-		previewStr = previewStr[:256] + "...[truncated]"
+	// Rune-safe truncation: a byte-slice cut can split a multi-byte
+	// UTF-8 sequence and leave the error string invalid (turns the
+	// log line into mojibake). Counting runes preserves character
+	// boundaries on localized error pages.
+	if runes := []rune(previewStr); len(runes) > 256 {
+		previewStr = string(runes[:256]) + "...[truncated]"
 	}
 	if previewStr == "" {
 		return fmt.Errorf("HTTP %d from license server", resp.StatusCode)
