@@ -77,17 +77,30 @@ func (h *DatabasesHandler) SetTieringManager(tm *tiering.Manager) {
 	h.tieringManager = tm
 }
 
-// RegisterRoutes registers the database management routes
+// RegisterRoutes registers the database management routes.
+//
+// Read-only routes (list, get, list measurements) pass through the
+// global any-valid-token middleware mounted in cmd/arc/main.go —
+// listing what exists is appropriate for any authenticated caller.
+//
+// Mutating routes (Create, Delete) require admin permission. The
+// global middleware would accept any-valid-token; the route-level
+// admin wrapper tightens that to admin only. Without it, a read-
+// scoped token could provision/destroy databases — a privilege
+// escalation by configuration.
+//
+// `withAdminAuth` returns auth.RequireAdmin(am) when am is non-nil
+// and a passthrough when am is nil (OSS / auth-disabled). This
+// matches the convention in import.go, lineprotocol.go, msgpack.go,
+// and tle.go — single source of truth for the nil-am branching.
 func (h *DatabasesHandler) RegisterRoutes(app *fiber.App) {
+	adminAuth := withAdminAuth(h.authManager)
+
 	app.Get("/api/v1/databases", h.handleList)
-	app.Post("/api/v1/databases", h.handleCreate)
 	app.Get("/api/v1/databases/:name", h.handleGet)
 	app.Get("/api/v1/databases/:name/measurements", h.handleListMeasurements)
-	if h.authManager != nil {
-		app.Delete("/api/v1/databases/:name", auth.RequireAdmin(h.authManager), h.handleDelete)
-	} else {
-		app.Delete("/api/v1/databases/:name", h.handleDelete)
-	}
+	app.Post("/api/v1/databases", adminAuth, h.handleCreate)
+	app.Delete("/api/v1/databases/:name", adminAuth, h.handleDelete)
 }
 
 // handleList handles GET /api/v1/databases
