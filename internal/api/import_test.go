@@ -1,135 +1,148 @@
 package api
 
 import (
+	"reflect"
 	"testing"
-	"time"
 
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/pkg/models"
 )
 
-func TestBuildReadExpression_CSV(t *testing.T) {
-	h := &ImportHandler{}
-
+func TestInferAndConvertColumn(t *testing.T) {
 	tests := []struct {
-		name     string
-		opts     importOptions
-		expected string
+		name string
+		raw  []string
+		want []interface{}
 	}{
-		{
-			name:     "default CSV",
-			opts:     importOptions{format: "csv", delimiter: ","},
-			expected: "read_csv('/tmp/test.csv', auto_detect=true, header=true)",
-		},
-		{
-			name:     "tab delimiter",
-			opts:     importOptions{format: "csv", delimiter: "\t"},
-			expected: "read_csv('/tmp/test.csv', auto_detect=true, header=true, delim='\t')",
-		},
-		{
-			name:     "skip rows",
-			opts:     importOptions{format: "csv", delimiter: ",", skipRows: 2},
-			expected: "read_csv('/tmp/test.csv', auto_detect=true, header=true, skip=2)",
-		},
-		{
-			name:     "semicolon with skip",
-			opts:     importOptions{format: "csv", delimiter: ";", skipRows: 1},
-			expected: "read_csv('/tmp/test.csv', auto_detect=true, header=true, delim=';', skip=1)",
-		},
+		{"all ints", []string{"1", "2", "3"}, []interface{}{int64(1), int64(2), int64(3)}},
+		{"all floats", []string{"1.5", "2.0", "3.25"}, []interface{}{1.5, 2.0, 3.25}},
+		{"int then float -> float", []string{"1", "2", "3.5"}, []interface{}{1.0, 2.0, 3.5}},
+		{"bools", []string{"true", "false", "TRUE"}, []interface{}{true, false, true}},
+		{"strings", []string{"a", "b", "c"}, []interface{}{"a", "b", "c"}},
+		{"mixed -> strings", []string{"1", "abc", "2"}, []interface{}{"1", "abc", "2"}},
+		{"empty int cell -> nil", []string{"1", "", "3"}, []interface{}{int64(1), nil, int64(3)}},
+		{"empty float cell -> nil", []string{"1.5", "", "3.5"}, []interface{}{1.5, nil, 3.5}},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := h.buildReadExpression("/tmp/test.csv", tt.opts)
-			if result != tt.expected {
-				t.Errorf("got %q, want %q", result, tt.expected)
+			got := inferAndConvertColumn(tt.raw)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("inferAndConvertColumn(%v) = %v, want %v", tt.raw, got, tt.want)
 			}
 		})
 	}
 }
 
-func TestBuildReadExpression_Parquet(t *testing.T) {
-	h := &ImportHandler{}
-
-	result := h.buildReadExpression("/tmp/test.parquet", importOptions{format: "parquet"})
-	expected := "read_parquet('/tmp/test.parquet')"
-	if result != expected {
-		t.Errorf("got %q, want %q", result, expected)
-	}
-}
-
-func TestBuildTimeCast(t *testing.T) {
-	h := &ImportHandler{}
-
+func TestOneTimeValueToMicros(t *testing.T) {
 	tests := []struct {
 		name       string
-		timeCol    string
+		value      string
 		timeFormat string
-		expected   string
+		want       int64
+		wantErr    bool
 	}{
-		{"auto detect", "time", "", `"time"::TIMESTAMP`},
-		{"epoch seconds", "ts", "epoch_s", `to_timestamp("ts"::BIGINT)`},
-		{"epoch milliseconds", "timestamp", "epoch_ms", `to_timestamp("timestamp"::BIGINT / 1000.0)`},
-		{"epoch microseconds", "time", "epoch_us", `to_timestamp("time"::BIGINT / 1000000.0)`},
-		{"epoch nanoseconds", "time", "epoch_ns", `to_timestamp("time"::BIGINT / 1000000000.0)`},
+		{"epoch_s", "1609459200", "epoch_s", 1609459200000000, false},
+		{"epoch_ms", "1609459200000", "epoch_ms", 1609459200000000, false},
+		{"epoch_us", "1609459200000000", "epoch_us", 1609459200000000, false},
+		{"epoch_ns", "1609459200000000000", "epoch_ns", 1609459200000000, false},
+		{"auto seconds", "1609459200", "", 1609459200000000, false},
+		{"auto millis", "1609459200000", "", 1609459200000000, false},
+		{"auto micros", "1609459200000000", "", 1609459200000000, false},
+		{"auto nanos", "1609459200000000000", "", 1609459200000000, false},
+		{"auto RFC3339", "2021-01-01T00:00:00Z", "", 1609459200000000, false},
+		{"auto date-only", "2021-01-01", "", 1609459200000000, false},
+		{"auto space-separated", "2021-01-01 00:00:00", "", 1609459200000000, false},
+		{"epoch with non-numeric -> err", "notanumber", "epoch_s", 0, true},
+		{"auto unparseable -> err", "not a date", "", 0, true},
+		{"bad format -> err", "1609459200", "epoch_weeks", 0, true},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := h.buildTimeCast(tt.timeCol, tt.timeFormat)
-			if result != tt.expected {
-				t.Errorf("got %q, want %q", result, tt.expected)
+			got, err := oneTimeValueToMicros(tt.value, tt.timeFormat)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error for %q (%s), got nil", tt.value, tt.timeFormat)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("oneTimeValueToMicros(%q, %q) = %d, want %d", tt.value, tt.timeFormat, got, tt.want)
 			}
 		})
 	}
 }
 
-func TestGenerateStoragePath(t *testing.T) {
-	partTime := time.Date(2025, 3, 15, 14, 0, 0, 0, time.UTC)
-	path := generateStoragePath("mydb", "cpu", partTime)
-
-	// Check prefix structure
-	prefix := "mydb/cpu/2025/03/15/14/cpu_"
-	if len(path) < len(prefix) || path[:len(prefix)] != prefix {
-		t.Errorf("path %q does not start with expected prefix %q", path, prefix)
-	}
-
-	// Check it ends with .parquet
-	if path[len(path)-8:] != ".parquet" {
-		t.Errorf("path %q does not end with .parquet", path)
+func TestStringsToTimeMicros_EmptyValueErrors(t *testing.T) {
+	if _, err := stringsToTimeMicros([]string{"1609459200", "", "1609459300"}, "epoch_s"); err == nil {
+		t.Error("expected error for empty time value, got nil")
 	}
 }
 
-func TestGenerateStoragePath_DifferentHours(t *testing.T) {
+func TestValidateImportHeader(t *testing.T) {
 	tests := []struct {
-		name           string
-		partTime       time.Time
-		expectedPrefix string
+		name       string
+		header     []string
+		timeColumn string
+		wantIdx    int
+		wantErr    bool
 	}{
-		{
-			"midnight",
-			time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
-			"db/metric/2025/01/01/00/metric_",
-		},
-		{
-			"noon",
-			time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC),
-			"db/metric/2025/06/15/12/metric_",
-		},
-		{
-			"end of day",
-			time.Date(2025, 12, 31, 23, 0, 0, 0, time.UTC),
-			"db/metric/2025/12/31/23/metric_",
-		},
+		{"time column present", []string{"time", "host", "v"}, "time", 0, false},
+		{"renamed time column", []string{"ts", "host", "v"}, "ts", 0, false},
+		{"missing time column", []string{"a", "b"}, "ts", -1, true},
+		{"duplicate column names", []string{"a", "a", "b"}, "a", -1, true},
+		{"rename collides with existing time", []string{"ts", "time", "v"}, "ts", -1, true},
+		{"time_column==time, no collision", []string{"time", "host"}, "time", 0, false},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			path := generateStoragePath("db", "metric", tt.partTime)
-			if path[:len(tt.expectedPrefix)] != tt.expectedPrefix {
-				t.Errorf("got prefix %q, want %q", path[:len(tt.expectedPrefix)], tt.expectedPrefix)
+			idx, err := validateImportHeader(tt.header, tt.timeColumn)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error for header %v (time=%q), got nil", tt.header, tt.timeColumn)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if idx != tt.wantIdx {
+				t.Errorf("timeIdx = %d, want %d", idx, tt.wantIdx)
 			}
 		})
+	}
+}
+
+func TestBuildImportResult(t *testing.T) {
+	// Two distinct hours -> partitions_created = 2. time column renamed to "time".
+	header := []string{"ts", "host", "value"}
+	timeMicros := []int64{
+		1609459200000000, // 2021-01-01T00:00:00Z (hour bucket A)
+		1609459260000000, // 2021-01-01T00:01:00Z (hour bucket A)
+		1609462800000000, // 2021-01-01T01:00:00Z (hour bucket B)
+	}
+	res := buildImportResult("mydb", "cpu", header, "ts", timeMicros)
+
+	if res.Database != "mydb" || res.Measurement != "cpu" {
+		t.Errorf("db/measurement mismatch: %+v", res)
+	}
+	if res.RowsImported != 3 {
+		t.Errorf("RowsImported = %d, want 3", res.RowsImported)
+	}
+	if res.PartitionsCreated != 2 {
+		t.Errorf("PartitionsCreated = %d, want 2 (distinct hour buckets)", res.PartitionsCreated)
+	}
+	wantCols := []string{"time", "host", "value"} // "ts" renamed to "time"
+	if !reflect.DeepEqual(res.Columns, wantCols) {
+		t.Errorf("Columns = %v, want %v", res.Columns, wantCols)
+	}
+	if res.TimeRangeMin != "2021-01-01T00:00:00Z" {
+		t.Errorf("TimeRangeMin = %q, want 2021-01-01T00:00:00Z", res.TimeRangeMin)
+	}
+	if res.TimeRangeMax != "2021-01-01T01:00:00Z" {
+		t.Errorf("TimeRangeMax = %q, want 2021-01-01T01:00:00Z", res.TimeRangeMax)
 	}
 }
 
@@ -245,25 +258,6 @@ func TestMeasurementFilter(t *testing.T) {
 	for _, r := range filtered {
 		if r.Measurement != "cpu" {
 			t.Errorf("expected measurement 'cpu', got %q", r.Measurement)
-		}
-	}
-}
-
-func TestEscapeSQLString(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected string
-	}{
-		{"normal", "normal"},
-		{"it's", "it''s"},
-		{"a'b'c", "a''b''c"},
-		{"", ""},
-	}
-
-	for _, tt := range tests {
-		result := escapeSQLString(tt.input)
-		if result != tt.expected {
-			t.Errorf("escapeSQLString(%q) = %q, want %q", tt.input, result, tt.expected)
 		}
 	}
 }

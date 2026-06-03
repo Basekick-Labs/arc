@@ -1850,9 +1850,12 @@ func main() {
 	tleHandler.RegisterRoutes(server.GetApp())
 
 	// Register Import handler (CSV, Parquet, Line Protocol, TLE bulk import).
-	// uploadDir is the same path that database.New added to the DuckDB
-	// sandbox's allowed_directories — staying in sync keeps imports working.
-	importHandler := api.NewImportHandler(db, storageBackend, dbConfig.UploadDir, logger.Get("import"))
+	// All formats parse in-process and ingest through the ArrowBuffer pipeline;
+	// no import path issues DuckDB queries against the uploaded file, so the
+	// handler no longer needs the sandbox-allowlisted upload directory.
+	// (dbConfig.UploadDir is still allowlisted for delete.go's S3 COPY ... TO
+	// staging — see NewDeleteHandler below.)
+	importHandler := api.NewImportHandler(logger.Get("import"))
 	importHandler.SetArrowBuffer(arrowBuffer)
 	if authManager != nil && rbacManager != nil {
 		importHandler.SetAuthAndRBAC(authManager, rbacManager)
