@@ -27,6 +27,8 @@ func TestInferAndConvertColumn(t *testing.T) {
 		{"empty int cell -> null", []string{"1", "", "3"}, []int64{1, 0, 3}, []bool{true, false, true}},
 		{"empty float cell -> null", []string{"1.5", "", "3.5"}, []float64{1.5, 0, 3.5}, []bool{true, false, true}},
 		{"all-empty column -> string", []string{"", "", ""}, []string{"", "", ""}, nil},
+		{"leading empty then int", []string{"", "5", "7"}, []int64{0, 5, 7}, []bool{false, true, true}},
+		{"leading empty then float demotion", []string{"", "1", "2.5"}, []float64{0, 1, 2.5}, []bool{false, true, true}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
