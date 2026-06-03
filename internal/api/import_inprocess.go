@@ -412,6 +412,9 @@ func (h *ImportHandler) importPreamble(c *fiber.Ctx) (string, string, error) {
 
 // validateImportHeader rejects header shapes that would cause silent data loss
 // when columns are keyed by name into a map[string][]interface{}:
+//   - empty column names (e.g. a trailing comma in a CSV header) — these would
+//     pass through to the Arrow schema builder, which indexes name[0] without a
+//     length check and panics on the empty string (a DoS vector),
 //   - duplicate column names (one would overwrite the other), and
 //   - a literal "time" column colliding with a renamed non-"time" time_column.
 //
@@ -420,6 +423,12 @@ func validateImportHeader(header []string, timeColumn string) (int, *importError
 	timeIdx := -1
 	seen := make(map[string]struct{}, len(header))
 	for i, name := range header {
+		if name == "" {
+			return -1, &importError{
+				StatusCode: fiber.StatusBadRequest,
+				Message:    "column name cannot be empty (check for trailing/empty delimiters in the header)",
+			}
+		}
 		if _, dup := seen[name]; dup {
 			return -1, &importError{
 				StatusCode: fiber.StatusBadRequest,
@@ -783,12 +792,22 @@ func arrowColumnToInterfaces(col *arrow.Column) ([]interface{}, error) {
 		case *array.Binary:
 			// BYTE_ARRAY without a UTF8 logical annotation reads as Binary, not
 			// String (common from Spark and some writers). Treat as string.
+			// Explicit branch (not appendOrNil) so string(a.Value(i)) isn't
+			// evaluated for null rows.
 			for i := 0; i < a.Len(); i++ {
-				out = appendOrNil(out, a.IsNull(i), string(a.Value(i)))
+				if a.IsNull(i) {
+					out = append(out, nil)
+				} else {
+					out = append(out, string(a.Value(i)))
+				}
 			}
 		case *array.FixedSizeBinary:
 			for i := 0; i < a.Len(); i++ {
-				out = appendOrNil(out, a.IsNull(i), string(a.Value(i)))
+				if a.IsNull(i) {
+					out = append(out, nil)
+				} else {
+					out = append(out, string(a.Value(i)))
+				}
 			}
 		case *array.Boolean:
 			for i := 0; i < a.Len(); i++ {
@@ -886,14 +905,22 @@ func parquetColumnToTimeMicros(col *arrow.Column, timeFormat string) ([]int64, e
 				if a.IsNull(i) {
 					return nil, fmt.Errorf("null value in time column at row %d", len(out)+1)
 				}
-				out = append(out, floatTimeToMicros(a.Value(i), timeFormat))
+				v := a.Value(i)
+				if math.IsNaN(v) || math.IsInf(v, 0) {
+					return nil, fmt.Errorf("invalid time value at row %d: NaN or Inf", len(out)+1)
+				}
+				out = append(out, floatTimeToMicros(v, timeFormat))
 			}
 		case *array.Float32:
 			for i := 0; i < a.Len(); i++ {
 				if a.IsNull(i) {
 					return nil, fmt.Errorf("null value in time column at row %d", len(out)+1)
 				}
-				out = append(out, floatTimeToMicros(float64(a.Value(i)), timeFormat))
+				v := float64(a.Value(i))
+				if math.IsNaN(v) || math.IsInf(v, 0) {
+					return nil, fmt.Errorf("invalid time value at row %d: NaN or Inf", len(out)+1)
+				}
+				out = append(out, floatTimeToMicros(v, timeFormat))
 			}
 		case *array.String:
 			for i := 0; i < a.Len(); i++ {

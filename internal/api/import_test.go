@@ -137,6 +137,7 @@ func TestValidateImportHeader(t *testing.T) {
 		{"renamed time column", []string{"ts", "host", "v"}, "ts", 0, false},
 		{"missing time column", []string{"a", "b"}, "ts", -1, true},
 		{"duplicate column names", []string{"a", "a", "b"}, "a", -1, true},
+		{"empty column name (DoS guard)", []string{"time", "v", ""}, "time", -1, true},
 		{"rename collides with existing time", []string{"ts", "time", "v"}, "ts", -1, true},
 		{"time_column==time, no collision", []string{"time", "host"}, "time", 0, false},
 	}
