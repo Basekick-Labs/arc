@@ -142,6 +142,10 @@ func (h *ImportHandler) importCSV(ctx fiberContext, database, measurement string
 	if len(header) == 0 {
 		return nil, &importError{StatusCode: fiber.StatusBadRequest, Message: "file is empty"}
 	}
+	// Strip a UTF-8 BOM from the first header field (Excel-on-Windows exports
+	// prepend one); otherwise the first column name carries the BOM and a
+	// time_column like "time" won't match.
+	header[0] = strings.TrimPrefix(header[0], "\xef\xbb\xbf")
 
 	timeIdx, herr := validateImportHeader(header, opts.timeColumn)
 	if herr != nil {
