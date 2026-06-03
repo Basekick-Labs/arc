@@ -19,7 +19,8 @@ Operators on 26.06.1 should plan to upgrade.
 User-visible behavior changes:
 
 - A 0-byte or header-only upload now returns `400 "file is empty"` / `"file contains no rows"` (previously a confusing parser error).
-- Imports validate up front and reject, with a clear `400`, a file whose `time_column` rename would collide with an existing `time` column, or a file with duplicate column names — cases that could previously have silently dropped a column.
+- Imports validate up front and reject, with a clear `400`: empty, blank, or duplicate column names; a `time_column` rename that would collide with an existing `time` column; or (for Parquet) a `NaN`/`Inf` value in a floating-point time column — cases that could previously have silently dropped a column, crashed the import, or written corrupt partition boundaries.
+- Time columns now accept **fractional (floating-point) epochs** (e.g. `1609459200.123`), preserving sub-second precision; the old DuckDB path tolerated these and the in-process rewrite restores parity. Integer epochs keep full precision (no float round-trip). For Parquet, the time column may be a `TIMESTAMP`, an integer or floating-point epoch, or a timestamp string.
 - CSV uploads are now subject to the same 500 MB size cap already enforced for the other import formats.
 - Parquet `DECIMAL` columns are imported as `DOUBLE` (Arc's ingest path does not carry per-column decimal precision for imports). Use Line Protocol with a configured decimal column if exact decimal precision is required.
 
@@ -31,7 +32,7 @@ Line Protocol and TLE imports are unchanged. CSV/Parquet imports no longer depen
 2. **Active licenses keep working.** Arc binaries running against `enterprise.basekick.net` continue to operate normally; no re-activation or license-key reissuance is required.
 3. **OSS-only deployments** (no `[license]` block in `arc.toml`) are unaffected by the license-verification change. The database-API authorization change applies only when authentication is enabled in `arc.toml`.
 4. **Token review for operators using non-admin tokens for database management**: if any automation provisions databases via `POST /api/v1/databases`, ensure the token it uses has the `admin` permission. Auto-create-on-write (databases that come into existence as a side-effect of line-protocol or msgpack writes) is unaffected — write tokens continue to work for ingestion.
-5. **CSV/Parquet import callers**: imports that relied on a Parquet `DECIMAL` column round-tripping as a decimal will now receive a `DOUBLE`. Imports of malformed files (empty, duplicate headers, or a `time_column` rename that collides with an existing `time` column) now fail fast with a `400` instead of partially succeeding — review any automation that ignored import error responses.
+5. **CSV/Parquet import callers**: imports that relied on a Parquet `DECIMAL` column round-tripping as a decimal will now receive a `DOUBLE`. Malformed files now fail fast with a `400` instead of partially succeeding (empty file, empty/blank/duplicate column names, a `time_column` rename that collides with an existing `time` column, or a `NaN`/`Inf` float time value) — review any automation that ignored import error responses.
 
 ## Dependencies
 
