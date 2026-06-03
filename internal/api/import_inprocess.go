@@ -536,6 +536,13 @@ func inferAndConvertColumn(raw []string) (interface{}, []bool) {
 				isBool = false
 			}
 		}
+		// Once every candidate type is ruled out the column is a string; stop
+		// scanning. (hasValue is already true here, and string columns ignore
+		// hasEmpty — empty cells are valid "" values, not nulls — so an early
+		// break can't change the result.)
+		if !isInt && !isFloat && !isBool {
+			break
+		}
 	}
 
 	// An all-empty column has no values to constrain the type; default to string
