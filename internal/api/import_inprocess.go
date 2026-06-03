@@ -110,6 +110,10 @@ func (h *ImportHandler) handleCSVImport(c *fiber.Ctx) error {
 func (h *ImportHandler) importCSV(ctx fiberContext, database, measurement string, r io.Reader, opts importOptions) (*ImportResult, *importError) {
 	reader := csv.NewReader(r)
 	reader.FieldsPerRecord = -1 // tolerate ragged rows; we validate against the header
+	reader.LazyQuotes = true    // tolerate unescaped quotes in user-uploaded CSVs
+	// NOTE: deliberately NOT setting ReuseRecord. We retain the `header` slice
+	// across all subsequent Read() calls (for validation, column naming, and the
+	// result), and ReuseRecord would overwrite its backing array with later rows.
 	if opts.delimiter != "" {
 		runes := []rune(opts.delimiter)
 		if len(runes) != 1 {
@@ -520,7 +524,9 @@ func inferAndConvertColumn(raw []string) (interface{}, []bool) {
 				isInt = false
 			}
 		}
-		if isFloat {
+		// Any valid base-10 integer is also a valid float, so only parse as
+		// float once a value has disqualified the integer type.
+		if isFloat && !isInt {
 			if _, err := strconv.ParseFloat(s, 64); err != nil {
 				isFloat = false
 			}
@@ -578,13 +584,10 @@ func inferAndConvertColumn(raw []string) (interface{}, []bool) {
 	}
 }
 
+// isBoolLiteral reports whether s is a recognized boolean literal. Uses
+// EqualFold / direct comparison to avoid the per-call allocation of ToLower.
 func isBoolLiteral(s string) bool {
-	switch strings.ToLower(s) {
-	case "true", "false", "1", "0":
-		return true
-	default:
-		return false
-	}
+	return s == "1" || s == "0" || strings.EqualFold(s, "true") || strings.EqualFold(s, "false")
 }
 
 // stringsToTimeMicros converts a string time column to []int64 microseconds.
