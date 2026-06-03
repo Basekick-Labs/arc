@@ -2185,6 +2185,7 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		}
 		teamSet[id] = struct{}{}
 	}
+	f.keysCache = nil // invalidate sorted-key cache after snapshot restore
 	f.mu.Unlock()
 
 	f.logger.Info().
@@ -2323,7 +2324,11 @@ func (f *ClusterFSM) GetFilesByDatabase(database string) []*FileEntry {
 //
 // Cursor stability: the cursor is the last path string of the previous
 // page. If the cursor path is deleted between pages, pagination resumes
-// from the next key in sort order — no entries are skipped.
+// from the next key in sort order — no existing entries are skipped.
+// Newly added entries that sort before the cursor may be missed (the
+// cache is rebuilt and cursor is relative to the new key order); this
+// is acceptable because catch-up also receives reactive FSM callbacks
+// for new entries.
 func (f *ClusterFSM) GetFilesPaginated(cursor string, limit int) ([]*FileEntry, string, error) {
 	if limit <= 0 {
 		limit = 1000

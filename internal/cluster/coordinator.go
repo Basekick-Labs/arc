@@ -2375,6 +2375,10 @@ func (c *Coordinator) runCatchUpOnce() {
 		if ctx == nil {
 			ctx = context.Background()
 		}
+		// fsm is captured in the closure below. The Raft FSM pointer is
+		// stable for the lifetime of the node — hashicorp/raft never
+		// replaces the FSM instance once set. The nil guard above ensures
+		// the capture is safe even if the puller outlives the coordinator.
 		c.puller.RunCatchUp(ctx, func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
 			return fsm.GetFilesPaginated(cursor, limit)
 		})

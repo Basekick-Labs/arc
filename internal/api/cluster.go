@@ -369,6 +369,7 @@ func (h *ClusterHandler) handleGetFiles(c *fiber.Ctx) error {
 // paginateSlice applies cursor-based pagination to an in-memory slice.
 // Used for database-filtered results where the FSM's paginated API doesn't
 // natively support database filtering yet.
+// nextCursor is the last path in this page; the next call will resume after it.
 func paginateSlice(files []*clusterraft.FileEntry, cursor string, limit int) ([]*clusterraft.FileEntry, string) {
 	start := 0
 	if cursor != "" {
