@@ -172,12 +172,10 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	}
 	defer file.Close()
 
-	// Size limit for bulk LP import (applies to both compressed and uncompressed)
-	const maxImportSize = 500 * 1024 * 1024 // 500MB
-
-	// Bound the read at the limit (+1 to detect overflow) so an oversized upload
-	// is rejected without buffering the whole body — the global BodyLimit (1GB)
-	// is a coarser backstop; this matches the CSV/Parquet handlers.
+	// Size limit (maxImportSize, package-level) applies to both compressed and
+	// uncompressed data. Bound the read at the limit (+1 to detect overflow) so an
+	// oversized upload is rejected without buffering the whole body — the global
+	// BodyLimit (1GB) is a coarser backstop; this matches the CSV/Parquet handlers.
 	data, err := io.ReadAll(io.LimitReader(file, maxImportSize+1))
 	if err != nil {
 		h.totalErrors.Add(1)
@@ -415,10 +413,8 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 	}
 	defer file.Close()
 
-	const maxImportSize = 500 * 1024 * 1024 // 500MB
-
-	// Bound the read at the limit (+1 to detect overflow) so an oversized upload
-	// is rejected without buffering the whole body — matches CSV/Parquet/LP.
+	// Bound the read at maxImportSize (+1 to detect overflow) so an oversized
+	// upload is rejected without buffering the whole body — matches CSV/Parquet/LP.
 	data, err := io.ReadAll(io.LimitReader(file, maxImportSize+1))
 	if err != nil {
 		h.totalErrors.Add(1)

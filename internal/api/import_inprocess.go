@@ -88,7 +88,9 @@ func (h *ImportHandler) handleCSVImport(c *fiber.Ctx) error {
 	// (e.g. chunked uploads). Use an erroring limit reader (NOT io.LimitReader,
 	// which returns EOF at the cap — the CSV parser would treat that as a clean
 	// end-of-file and silently import a truncated file with a 200 response).
-	result, ierr := h.importCSV(c.Context(), database, measurement, &limitedReader{r: f, limit: maxImportSize}, opts)
+	// Pass the upload size so importCSV can pre-size per-column buffers once it
+	// knows the column count (a size-only estimate over-allocates for wide files).
+	result, ierr := h.importCSV(c.Context(), database, measurement, &limitedReader{r: f, limit: maxImportSize}, opts, fileHeader.Size)
 	if ierr != nil {
 		h.totalErrors.Add(1)
 		h.logger.Error().Err(ierr).Str("database", database).Str("measurement", measurement).Msg("CSV import failed")
@@ -107,7 +109,7 @@ func (h *ImportHandler) handleCSVImport(c *fiber.Ctx) error {
 
 // importCSV reads the CSV stream, infers per-column types, normalizes the time
 // column to int64 microseconds, and ingests via WriteColumnarRecord.
-func (h *ImportHandler) importCSV(ctx fiberContext, database, measurement string, r io.Reader, opts importOptions) (*ImportResult, *importError) {
+func (h *ImportHandler) importCSV(ctx fiberContext, database, measurement string, r io.Reader, opts importOptions, fileSize int64) (*ImportResult, *importError) {
 	reader := csv.NewReader(r)
 	reader.FieldsPerRecord = -1 // tolerate ragged rows; we validate against the header
 	reader.LazyQuotes = true    // tolerate unescaped quotes in user-uploaded CSVs
@@ -152,10 +154,32 @@ func (h *ImportHandler) importCSV(ctx fiberContext, database, measurement string
 		return nil, herr
 	}
 
+	// Pre-size the per-column buffers from the upload size to avoid repeated slice
+	// doubling on large files. Estimate rows from total bytes divided by the row
+	// width (~8 bytes/cell × column count) — a size-only estimate would massively
+	// over-allocate for wide files (N columns × an inflated per-column capacity can
+	// run to many GB just for slice backing arrays). Floor at 1024, cap the
+	// estimate so a pathological column count can't blow up the allocation; the
+	// buffers still grow if the estimate is low.
+	// len(header) is guaranteed >= 1 here (the empty-header case returned above),
+	// so no division by zero. Multiply in int64 so a pathological column count
+	// can't overflow a 32-bit int before the divide.
+	const bytesPerCell = 8
+	estRows := 1024
+	if fileSize > 0 {
+		estRows = int(fileSize / (int64(bytesPerCell) * int64(len(header))))
+		switch {
+		case estRows < 1024:
+			estRows = 1024
+		case estRows > 1_000_000:
+			estRows = 1_000_000
+		}
+	}
+
 	// Read all rows as raw strings, one slice per column.
 	rawCols := make([][]string, len(header))
 	for i := range rawCols {
-		rawCols[i] = make([]string, 0, 1024)
+		rawCols[i] = make([]string, 0, estRows)
 	}
 	rowCount := 0
 	for {
@@ -514,31 +538,61 @@ func buildImportResult(database, measurement string, header []string, timeColumn
 // Returning typed slices directly (rather than a boxed []interface{}) lets the
 // caller use WriteTypedColumnarDirect, avoiding per-value boxing — same reason
 // the Parquet path uses arrowColumnToTyped.
+//
+// Numeric values are parsed once: the parsed result is accumulated into a typed
+// buffer during the inference scan, so a homogeneous int/float column needs no
+// second parse pass. On a type demotion (int→float, or →string) the buffer is
+// converted or abandoned. Bool columns are cheap (no parse) and rare, so they
+// use a small dedicated pass.
 func inferAndConvertColumn(raw []string) (interface{}, []bool) {
 	isInt, isFloat, isBool := true, true, true
 	hasValue, hasEmpty := false, false
-	for _, s := range raw {
+
+	// Typed accumulators filled during the scan while their type is still viable.
+	// Allocated lazily so a string column (ints ruled out on row 0) never pays
+	// for the int/float buffers.
+	var intBuf []int64
+	var floatBuf []float64
+
+	for i, s := range raw {
 		if s == "" {
 			hasEmpty = true
-			continue // empty cells don't constrain the type
+			continue // empty cells don't constrain the type; leave the zero value
 		}
 		hasValue = true
+
 		if isInt {
-			if _, err := strconv.ParseInt(s, 10, 64); err != nil {
-				isInt = false
+			if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+				if intBuf == nil {
+					intBuf = make([]int64, len(raw))
+				}
+				intBuf[i] = n
+			} else {
+				isInt = false // demote; floatBuf is built lazily below if float holds
 			}
 		}
 		// Any valid base-10 integer is also a valid float, so only parse as
 		// float once a value has disqualified the integer type.
-		if isFloat && !isInt {
-			if _, err := strconv.ParseFloat(s, 64); err != nil {
+		if !isInt && isFloat {
+			if f, err := strconv.ParseFloat(s, 64); err == nil {
+				if floatBuf == nil {
+					// First successful float parse: allocate and migrate the ints
+					// parsed before the demotion (intBuf may be nil if every prior
+					// cell was empty; those stay 0 and are marked null via validity).
+					floatBuf = make([]float64, len(raw))
+					if intBuf != nil {
+						for j := 0; j < i; j++ {
+							floatBuf[j] = float64(intBuf[j])
+						}
+					}
+				}
+				floatBuf[i] = f
+			} else {
 				isFloat = false
 			}
 		}
-		if isBool {
-			if !isBoolLiteral(s) {
-				isBool = false
-			}
+		if isBool && !isBoolLiteral(s) {
+			isBool = false
 		}
 		// Once every candidate type is ruled out the column is a string; stop
 		// scanning. (hasValue is already true here, and string columns ignore
@@ -567,24 +621,18 @@ func inferAndConvertColumn(raw []string) (interface{}, []bool) {
 		}
 	}
 
+	// Order matters: the flags are NOT mutually exclusive (a pure-int column has
+	// both isInt and isFloat true, and a 0/1 column has isInt and isBool true).
+	// Narrowest-type precedence is encoded by this case ordering — keep int first,
+	// then float, then bool. Do not reorder.
 	switch {
 	case isInt:
-		out := make([]int64, len(raw))
-		for i, s := range raw {
-			if s != "" {
-				out[i], _ = strconv.ParseInt(s, 10, 64)
-			}
-		}
-		return out, validity
+		// intBuf was filled during inference (no demotion happened) — return it.
+		return intBuf, validity
 	case isFloat:
-		out := make([]float64, len(raw))
-		for i, s := range raw {
-			if s != "" {
-				out[i], _ = strconv.ParseFloat(s, 64)
-			}
-		}
-		return out, validity
-	default: // isBool
+		// floatBuf was filled during inference (allocated at the int→float demotion).
+		return floatBuf, validity
+	default: // isBool — no numeric parsing needed
 		out := make([]bool, len(raw))
 		for i, s := range raw {
 			if s != "" {
