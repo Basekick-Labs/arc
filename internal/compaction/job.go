@@ -719,6 +719,10 @@ func (j *Job) uploadFile(ctx context.Context, localPath, key string) error {
 // This ensures we don't delete files that were skipped due to corruption or other issues.
 // Prefers batch delete (BatchDeleter interface) when the backend supports it
 // (S3 DeleteObjects, Azure BlobBatch) to reduce API call overhead.
+// Does NOT fall back to per-file delete on batch failure — a failing batch
+// (e.g. auth error, rate limit) means individual calls will also fail, and
+// the per-file loop would cause severe latency spikes. The next compaction
+// cycle will retry.
 func (j *Job) deleteOldFiles(ctx context.Context) error {
 	if len(j.compactedFiles) == 0 {
 		j.logger.Debug().Msg("No files to delete (none were compacted)")
@@ -728,16 +732,18 @@ func (j *Job) deleteOldFiles(ctx context.Context) error {
 	// Prefer batch delete when the backend supports it (S3, Azure).
 	if bd, ok := j.StorageBackend.(storage.BatchDeleter); ok {
 		if err := bd.DeleteBatch(ctx, j.compactedFiles); err != nil {
-			j.logger.Warn().Err(err).Msg("Batch delete failed, falling back to per-file delete")
-		} else {
-			j.logger.Info().
+			j.logger.Error().Err(err).
 				Int("total", len(j.compactedFiles)).
-				Msg("Completed batch deletion of old files")
-			return nil
+				Msg("Batch delete failed; files will retry on next compaction cycle")
+			return fmt.Errorf("batch delete failed: %w", err)
 		}
+		j.logger.Info().
+			Int("total", len(j.compactedFiles)).
+			Msg("Completed batch deletion of old files")
+		return nil
 	}
 
-	// Fallback: per-file delete
+	// Per-file delete (local storage, or any backend without BatchDeleter).
 	var lastErr error
 	var deleted, failed int
 	for _, fileKey := range j.compactedFiles {
