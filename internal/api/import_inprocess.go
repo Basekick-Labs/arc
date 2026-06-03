@@ -328,10 +328,8 @@ func (h *ImportHandler) importParquet(ctx fiberContext, database, measurement st
 	columns := make(map[string][]interface{}, len(header))
 	var timeMicros []int64
 	for i, name := range header {
-		vals, conv := arrowColumnToInterfaces(tbl.Column(i))
-		if conv != nil {
-			return nil, &importError{StatusCode: fiber.StatusUnprocessableEntity, Message: fmt.Sprintf("unsupported parquet column %q", name), Err: conv}
-		}
+		// Time column: normalize to micros via the dedicated path; don't run it
+		// through arrowColumnToInterfaces (its result would just be discarded).
 		if i == timeFieldIdx {
 			tm, terr := parquetColumnToTimeMicros(tbl.Column(i), opts.timeFormat)
 			if terr != nil {
@@ -339,6 +337,10 @@ func (h *ImportHandler) importParquet(ctx fiberContext, database, measurement st
 			}
 			timeMicros = tm
 			continue
+		}
+		vals, conv := arrowColumnToInterfaces(tbl.Column(i))
+		if conv != nil {
+			return nil, &importError{StatusCode: fiber.StatusUnprocessableEntity, Message: fmt.Sprintf("unsupported parquet column %q", name), Err: conv}
 		}
 		columns[name] = vals
 	}
@@ -629,6 +631,10 @@ func stringsToTimeMicros(raw []string, timeFormat string) ([]int64, error) {
 // or auto-detection. Used for the (rare) Parquet string time column; the CSV path
 // uses stringsToTimeMicros directly with layout caching.
 func oneTimeValueToMicros(s, timeFormat string) (int64, error) {
+	// Trim so Parquet string/binary time columns behave like the CSV path
+	// (stringsToTimeMicros trims before parsing); a value like " 1609459200 "
+	// should parse identically regardless of source.
+	s = strings.TrimSpace(s)
 	switch timeFormat {
 	case "epoch_s", "epoch_ms", "epoch_us", "epoch_ns":
 		// Integer epoch -> int64 math (no float precision loss for large ns).
