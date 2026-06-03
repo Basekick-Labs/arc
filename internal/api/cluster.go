@@ -1,6 +1,7 @@
 package api
 
 import (
+	"sort"
 	"strconv"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -368,16 +369,25 @@ func (h *ClusterHandler) handleGetFiles(c *fiber.Ctx) error {
 
 // paginateSlice applies cursor-based pagination to an in-memory slice.
 // Used for database-filtered results where the FSM's paginated API doesn't
-// natively support database filtering yet.
+// natively support database filtering yet. Files are sorted by path first
+// (source is an unordered map, so iteration order is non-deterministic).
 // nextCursor is the last path in this page; the next call will resume after it.
+//
+// NOTE: This still allocates the full filtered set (O(k) where k = files in
+// the database). The unfiltered path via GetFileManifestPaginated releases
+// the RLock between pages; this path does not. For large databases, prefer
+// the unfiltered paginated endpoint.
 func paginateSlice(files []*clusterraft.FileEntry, cursor string, limit int) ([]*clusterraft.FileEntry, string) {
+	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+
 	start := 0
 	if cursor != "" {
-		for i, f := range files {
-			if f.Path == cursor {
-				start = i + 1
-				break
-			}
+		// Binary search for cursor position
+		idx := sort.Search(len(files), func(i int) bool { return files[i].Path >= cursor })
+		if idx < len(files) && files[idx].Path == cursor {
+			start = idx + 1
+		} else {
+			start = idx
 		}
 	}
 	if start >= len(files) {

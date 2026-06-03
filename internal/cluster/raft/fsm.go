@@ -326,8 +326,7 @@ type ClusterFSM struct {
 	// GetFilesPaginated to avoid sorting the full key set on every page.
 	// Set to nil on any manifest mutation to trigger a rebuild on the
 	// next paginated call. Guarded by mu.
-	keysCache    []string
-	keysCacheGen int64 // incremented on each rebuild; used for sanity checks
+	keysCache []string
 	// tokens holds the cluster-wide API-token state (Phase A: Cluster Auth
 	// Convergence). The map is the source of truth in memory; each node's
 	// local SQLite `api_tokens` is a materialised cache rebuilt from
@@ -2342,7 +2341,6 @@ func (f *ClusterFSM) GetFilesPaginated(cursor string, limit int) ([]*FileEntry, 
 			f.keysCache = append(f.keysCache, k)
 		}
 		sort.Strings(f.keysCache)
-		f.keysCacheGen++
 	}
 	keys := f.keysCache
 	f.mu.Unlock()
