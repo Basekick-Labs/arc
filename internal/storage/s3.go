@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,12 +13,12 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/rs/zerolog"
 )
 
@@ -363,7 +364,6 @@ func (b *S3Backend) StatFile(ctx context.Context, path string) (int64, error) {
 	return *result.ContentLength, nil
 }
 
-
 // List lists objects with the given prefix
 func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 	var objects []string
@@ -410,7 +410,11 @@ func (b *S3Backend) Delete(ctx context.Context, path string) error {
 	return nil
 }
 
-// DeleteBatch deletes multiple objects from S3 efficiently
+// DeleteBatch deletes multiple objects from S3 using the DeleteObjects API.
+// S3 supports up to 1000 keys per request. Individual object deletion errors
+// (e.g. permission denied, key not found) are inspected: the not-found case
+// is treated as success; any other error is collected and returned so callers
+// can fall back to per-file Delete or retry.
 func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 	if len(paths) == 0 {
 		return nil
@@ -418,6 +422,7 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 
 	// S3 allows up to 1000 objects per delete request
 	const batchSize = 1000
+	var nonFatalErrs []error
 
 	for i := 0; i < len(paths); i += batchSize {
 		end := i + batchSize
@@ -433,7 +438,7 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 			}
 		}
 
-		_, err := b.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		output, err := b.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(b.bucket),
 			Delete: &types.Delete{
 				Objects: objects,
@@ -443,6 +448,37 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 		if err != nil {
 			return fmt.Errorf("failed to delete batch from S3: %w", err)
 		}
+
+		// Inspect per-object errors from the response. With Quiet=true only
+		// errors are returned. NotFound is normal (already deleted); other
+		// errors are collected and returned.
+		for _, e := range output.Errors {
+			if e.Code != nil && *e.Code == "NoSuchKey" {
+				continue // already deleted, not an error
+			}
+			key := "unknown"
+			if e.Key != nil {
+				key = *e.Key
+			}
+			code := ""
+			if e.Code != nil {
+				code = *e.Code
+			}
+			msg := ""
+			if e.Message != nil {
+				msg = *e.Message
+			}
+			b.logger.Warn().
+				Str("key", key).
+				Str("code", code).
+				Str("message", msg).
+				Msg("S3 batch: individual delete failed")
+			nonFatalErrs = append(nonFatalErrs, fmt.Errorf("%s: %s: %s", key, code, msg))
+		}
+	}
+
+	if len(nonFatalErrs) > 0 {
+		return fmt.Errorf("S3 batch delete: %d object(s) failed: %w", len(nonFatalErrs), errors.Join(nonFatalErrs...))
 	}
 
 	b.logger.Debug().Int("count", len(paths)).Msg("Batch deleted from S3")
