@@ -2366,10 +2366,7 @@ func (c *Coordinator) runCatchUpOnce() {
 			c.logger.Error().Msg("Catch-up: Raft FSM not available, skipping")
 			return
 		}
-		entries := fsm.GetAllFiles()
-		c.logger.Info().
-			Int("manifest_entries", len(entries)).
-			Msg("Catch-up: walking manifest")
+		c.logger.Info().Msg("Catch-up: starting paginated manifest walk")
 
 		// Derive a context from c.ctx (or Background if c.ctx is nil, which
 		// happens in tests that bypass Start). The walker honors cancellation
@@ -2378,7 +2375,9 @@ func (c *Coordinator) runCatchUpOnce() {
 		if ctx == nil {
 			ctx = context.Background()
 		}
-		c.puller.RunCatchUp(ctx, entries)
+		c.puller.RunCatchUp(ctx, func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
+			return fsm.GetFilesPaginated(cursor, limit)
+		})
 	})
 }
 
@@ -3095,6 +3094,20 @@ func (c *Coordinator) GetFileManifest() []*raft.FileEntry {
 		return nil
 	}
 	return fsm.GetAllFiles()
+}
+
+// GetFileManifestPaginated returns a page of files from the Raft FSM using
+// cursor-based pagination. cursor="" starts from the beginning. Returns the
+// page, the next cursor (empty when done), and an error.
+func (c *Coordinator) GetFileManifestPaginated(cursor string, limit int) ([]*raft.FileEntry, string, error) {
+	if c.raftNode == nil {
+		return nil, "", nil
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return nil, "", nil
+	}
+	return fsm.GetFilesPaginated(cursor, limit)
 }
 
 // GetFileManifestByDatabase returns files for a specific database.

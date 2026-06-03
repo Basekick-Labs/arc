@@ -46,7 +46,7 @@ func TestRunCatchUpEnqueuesAllWhenQueueLarge(t *testing.T) {
 		entries[i] = makeEntry(fmt.Sprintf("testdb/cpu/catchup-%02d.parquet", i), "writer-1", int64(len(body)))
 	}
 
-	p.RunCatchUp(context.Background(), entries)
+	p.RunCatchUp(context.Background(), sliceFetcher(entries))
 
 	// Wait for workers to drain.
 	stats := waitStats(t, p, func(s map[string]int64) bool {
@@ -112,7 +112,7 @@ func TestRunCatchUpThrottlesAtHighWater(t *testing.T) {
 	start := time.Now()
 	go func() {
 		defer close(done)
-		p.RunCatchUp(context.Background(), entries)
+		p.RunCatchUp(context.Background(), sliceFetcher(entries))
 	}()
 
 	// Let the walker try to enqueue for a bit. With Workers=1 blocked, the
@@ -176,7 +176,7 @@ func TestRunCatchUpHonorsContextCancel(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		p.RunCatchUp(ctx, entries)
+		p.RunCatchUp(ctx, sliceFetcher(entries))
 	}()
 
 	// Give the walker time to start throttling on the full queue, then cancel.
@@ -230,13 +230,13 @@ func TestRunCatchUpOnceOnly(t *testing.T) {
 		makeEntry("testdb/cpu/once-d.parquet", "writer-1", int64(len(body))),
 	}
 
-	p.RunCatchUp(context.Background(), entries1)
+	p.RunCatchUp(context.Background(), sliceFetcher(entries1))
 	firstWalked := p.Stats()["catchup_entries_walked"]
 	firstStartedAt := p.Stats()["catchup_started_at"]
 
 	// Second call should be a no-op — no new entries walked, started_at
 	// unchanged.
-	p.RunCatchUp(context.Background(), entries2)
+	p.RunCatchUp(context.Background(), sliceFetcher(entries2))
 	secondWalked := p.Stats()["catchup_entries_walked"]
 	secondStartedAt := p.Stats()["catchup_started_at"]
 
@@ -284,7 +284,7 @@ func TestRunCatchUpDedupsWithReactiveEnqueue(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		p.RunCatchUp(context.Background(), []*raft.FileEntry{entry})
+		p.RunCatchUp(context.Background(), sliceFetcher([]*raft.FileEntry{entry}))
 	}()
 	go func() {
 		defer wg.Done()
@@ -310,5 +310,34 @@ func TestRunCatchUpDedupsWithReactiveEnqueue(t *testing.T) {
 	}
 	if stats["skipped_dup"] == 0 {
 		t.Errorf("skipped_dup should be non-zero (parallel enqueues should dedup)")
+	}
+}
+
+// sliceFetcher converts a []*raft.FileEntry into a paginated fetch function
+// compatible with RunCatchUp's new signature. Used by tests that previously
+// passed slices directly.
+func sliceFetcher(entries []*raft.FileEntry) func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
+	return func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
+		start := 0
+		if cursor != "" {
+			for i, e := range entries {
+				if e.Path == cursor {
+					start = i + 1
+					break
+				}
+			}
+		}
+		if start >= len(entries) {
+			return nil, "", nil
+		}
+		end := start + limit
+		if end > len(entries) {
+			end = len(entries)
+		}
+		nextCursor := ""
+		if end < len(entries) {
+			nextCursor = entries[end-1].Path
+		}
+		return entries[start:end], nextCursor, nil
 	}
 }

@@ -34,6 +34,14 @@ Line Protocol and TLE imports are unchanged. CSV/Parquet imports no longer depen
 
 Additionally, the Azure `DeleteBatch` implementation was rewritten to use the actual Azure SDK `BlobBatch` API (`container.Client.NewBatchBuilder()` + `SubmitBatch`) instead of a per-file loop, bringing it into parity with the S3 implementation.
 
+**Paginated FSM manifest walks replace full-snapshot copies.** `ClusterFSM.GetAllFiles()` previously allocated a full O(N) copy of the file manifest — for 1M+ files this caused ~50ms apply-path spikes (RLock held while copying) and ~50MB transient memory. The replication catch-up walker and the `/api/v1/cluster/files` endpoint now use cursor-based pagination via `GetFilesPaginated(cursor, limit)`, which:
+
+- Maintains a lazily-built sorted-key cache (invalidated on manifest mutation)
+- Returns pages of entries, releasing the RLock between pages so Raft apply-path latency is unaffected by long-running walks
+- Supports `?cursor=<path>&limit=<n>` query parameters on the API endpoint (backward-compatible — omitting both params returns all files as before)
+
+The emergency kill-switch `replication_catchup_enabled=false` remains available.
+
 ## Upgrade notes
 
 1. **No configuration change required.** Drop in the new binary; existing `arc.toml` and license keys work as-is.
