@@ -25,6 +25,7 @@ func TestInferAndConvertColumn(t *testing.T) {
 		{"mixed -> strings", []string{"1", "abc", "2"}, []interface{}{"1", "abc", "2"}},
 		{"empty int cell -> nil", []string{"1", "", "3"}, []interface{}{int64(1), nil, int64(3)}},
 		{"empty float cell -> nil", []string{"1.5", "", "3.5"}, []interface{}{1.5, nil, 3.5}},
+		{"all-empty column -> string", []string{"", "", ""}, []interface{}{"", "", ""}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -57,6 +58,8 @@ func TestOneTimeValueToMicros(t *testing.T) {
 		{"auto millis", "1609459200000", "", 1609459200000000, false},
 		{"auto micros", "1609459200000000", "", 1609459200000000, false},
 		{"auto nanos", "1609459200000000000", "", 1609459200000000, false},
+		{"auto nanos precise (int64, not float)", "1609459200000001900", "", 1609459200000001, false},
+		{"epoch_ns precise (int64, not float)", "1609459200000001900", "epoch_ns", 1609459200000001, false},
 		{"auto negative seconds (pre-1970)", "-1000000000", "", -1000000000000000, false},
 		{"auto negative millis (pre-1970)", "-1000000000000", "", -1000000000000, false},
 		{"auto RFC3339", "2021-01-01T00:00:00Z", "", 1609459200000000, false},
