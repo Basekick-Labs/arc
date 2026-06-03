@@ -84,19 +84,13 @@ func (h *ImportHandler) handleCSVImport(c *fiber.Ctx) error {
 	}
 	defer f.Close()
 
-	// Estimate row count from the upload size (~80 bytes/row) to pre-size the
-	// per-column buffers and avoid repeated doubling on large files. Clamped to
-	// a sane floor; it's only a hint, the buffers still grow if it's low.
-	estRows := int(fileHeader.Size / 80)
-	if estRows < 1024 {
-		estRows = 1024
-	}
-
 	// Defense in depth: bound how much we read even if Size under-reports
 	// (e.g. chunked uploads). Use an erroring limit reader (NOT io.LimitReader,
 	// which returns EOF at the cap — the CSV parser would treat that as a clean
 	// end-of-file and silently import a truncated file with a 200 response).
-	result, ierr := h.importCSV(c.Context(), database, measurement, &limitedReader{r: f, limit: maxImportSize}, opts, estRows)
+	// Pass the upload size so importCSV can pre-size per-column buffers once it
+	// knows the column count (a size-only estimate over-allocates for wide files).
+	result, ierr := h.importCSV(c.Context(), database, measurement, &limitedReader{r: f, limit: maxImportSize}, opts, fileHeader.Size)
 	if ierr != nil {
 		h.totalErrors.Add(1)
 		h.logger.Error().Err(ierr).Str("database", database).Str("measurement", measurement).Msg("CSV import failed")
@@ -115,7 +109,7 @@ func (h *ImportHandler) handleCSVImport(c *fiber.Ctx) error {
 
 // importCSV reads the CSV stream, infers per-column types, normalizes the time
 // column to int64 microseconds, and ingests via WriteColumnarRecord.
-func (h *ImportHandler) importCSV(ctx fiberContext, database, measurement string, r io.Reader, opts importOptions, estRows int) (*ImportResult, *importError) {
+func (h *ImportHandler) importCSV(ctx fiberContext, database, measurement string, r io.Reader, opts importOptions, fileSize int64) (*ImportResult, *importError) {
 	reader := csv.NewReader(r)
 	reader.FieldsPerRecord = -1 // tolerate ragged rows; we validate against the header
 	reader.LazyQuotes = true    // tolerate unescaped quotes in user-uploaded CSVs
@@ -160,8 +154,26 @@ func (h *ImportHandler) importCSV(ctx fiberContext, database, measurement string
 		return nil, herr
 	}
 
-	// Read all rows as raw strings, one slice per column. Pre-size from the
-	// caller's row-count estimate to avoid repeated slice doubling on large files.
+	// Pre-size the per-column buffers from the upload size to avoid repeated slice
+	// doubling on large files. Estimate rows from total bytes divided by the row
+	// width (~8 bytes/cell × column count) — a size-only estimate would massively
+	// over-allocate for wide files (N columns × an inflated per-column capacity can
+	// run to many GB just for slice backing arrays). Floor at 1024, cap the
+	// estimate so a pathological column count can't blow up the allocation; the
+	// buffers still grow if the estimate is low.
+	const bytesPerCell = 8
+	estRows := 1024
+	if fileSize > 0 {
+		estRows = int(fileSize / int64(bytesPerCell*len(header)))
+		switch {
+		case estRows < 1024:
+			estRows = 1024
+		case estRows > 1_000_000:
+			estRows = 1_000_000
+		}
+	}
+
+	// Read all rows as raw strings, one slice per column.
 	rawCols := make([][]string, len(header))
 	for i := range rawCols {
 		rawCols[i] = make([]string, 0, estRows)
