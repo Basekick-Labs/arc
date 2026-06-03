@@ -13,25 +13,29 @@ import (
 
 func TestInferAndConvertColumn(t *testing.T) {
 	tests := []struct {
-		name string
-		raw  []string
-		want []interface{}
+		name         string
+		raw          []string
+		wantData     interface{}
+		wantValidity []bool
 	}{
-		{"all ints", []string{"1", "2", "3"}, []interface{}{int64(1), int64(2), int64(3)}},
-		{"all floats", []string{"1.5", "2.0", "3.25"}, []interface{}{1.5, 2.0, 3.25}},
-		{"int then float -> float", []string{"1", "2", "3.5"}, []interface{}{1.0, 2.0, 3.5}},
-		{"bools", []string{"true", "false", "TRUE"}, []interface{}{true, false, true}},
-		{"strings", []string{"a", "b", "c"}, []interface{}{"a", "b", "c"}},
-		{"mixed -> strings", []string{"1", "abc", "2"}, []interface{}{"1", "abc", "2"}},
-		{"empty int cell -> nil", []string{"1", "", "3"}, []interface{}{int64(1), nil, int64(3)}},
-		{"empty float cell -> nil", []string{"1.5", "", "3.5"}, []interface{}{1.5, nil, 3.5}},
-		{"all-empty column -> string", []string{"", "", ""}, []interface{}{"", "", ""}},
+		{"all ints", []string{"1", "2", "3"}, []int64{1, 2, 3}, nil},
+		{"all floats", []string{"1.5", "2.0", "3.25"}, []float64{1.5, 2.0, 3.25}, nil},
+		{"int then float -> float", []string{"1", "2", "3.5"}, []float64{1.0, 2.0, 3.5}, nil},
+		{"bools", []string{"true", "false", "TRUE"}, []bool{true, false, true}, nil},
+		{"strings", []string{"a", "b", "c"}, []string{"a", "b", "c"}, nil},
+		{"mixed -> strings", []string{"1", "abc", "2"}, []string{"1", "abc", "2"}, nil},
+		{"empty int cell -> null", []string{"1", "", "3"}, []int64{1, 0, 3}, []bool{true, false, true}},
+		{"empty float cell -> null", []string{"1.5", "", "3.5"}, []float64{1.5, 0, 3.5}, []bool{true, false, true}},
+		{"all-empty column -> string", []string{"", "", ""}, []string{"", "", ""}, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := inferAndConvertColumn(tt.raw)
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("inferAndConvertColumn(%v) = %v, want %v", tt.raw, got, tt.want)
+			gotData, gotValidity := inferAndConvertColumn(tt.raw)
+			if !reflect.DeepEqual(gotData, tt.wantData) {
+				t.Errorf("inferAndConvertColumn(%v) data = %v (%T), want %v (%T)", tt.raw, gotData, gotData, tt.wantData, tt.wantData)
+			}
+			if !reflect.DeepEqual(gotValidity, tt.wantValidity) {
+				t.Errorf("inferAndConvertColumn(%v) validity = %v, want %v", tt.raw, gotValidity, tt.wantValidity)
 			}
 		})
 	}
@@ -112,14 +116,17 @@ func TestStringsToTimeMicros_CachedLayoutMultiRow(t *testing.T) {
 
 func TestInferAndConvertColumn_MixedBoolReps(t *testing.T) {
 	// "true"/"1" mixed -> not all-int (true isn't int), all bool-literal -> bool.
-	got := inferAndConvertColumn([]string{"true", "1", "false", "0"})
-	want := []interface{}{true, true, false, false}
+	got, validity := inferAndConvertColumn([]string{"true", "1", "false", "0"})
+	want := []bool{true, true, false, false}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %v, want %v", got, want)
 	}
+	if validity != nil {
+		t.Errorf("expected nil validity (no empty cells), got %v", validity)
+	}
 	// Pure 0/1 stays integer (isInt wins over isBool in the switch).
-	gotInt := inferAndConvertColumn([]string{"0", "1", "1", "0"})
-	wantInt := []interface{}{int64(0), int64(1), int64(1), int64(0)}
+	gotInt, _ := inferAndConvertColumn([]string{"0", "1", "1", "0"})
+	wantInt := []int64{0, 1, 1, 0}
 	if !reflect.DeepEqual(gotInt, wantInt) {
 		t.Errorf("pure 0/1: got %v, want %v", gotInt, wantInt)
 	}

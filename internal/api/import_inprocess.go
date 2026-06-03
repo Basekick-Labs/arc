@@ -17,7 +17,6 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/basekick-labs/arc/internal/ingest"
-	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -184,26 +183,27 @@ func (h *ImportHandler) importCSV(ctx fiberContext, database, measurement string
 		return nil, &importError{StatusCode: fiber.StatusBadRequest, Message: fmt.Sprintf("failed to parse time column %q", opts.timeColumn), Err: terr}
 	}
 
-	// Build columnar data with native typed values; rename time column to "time".
-	columns := make(map[string][]interface{}, len(header))
+	// Build typed columnar data (rename time column to "time") and ingest via
+	// WriteTypedColumnarDirect, avoiding per-value []interface{} boxing.
+	cols := make(map[string]interface{}, len(header))
+	validity := make(map[string][]bool, len(header))
 	for i, name := range header {
 		if i == timeIdx {
 			continue // handled separately
 		}
-		columns[name] = inferAndConvertColumn(rawCols[i])
+		vals, valid := inferAndConvertColumn(rawCols[i])
+		cols[name] = vals
+		if valid != nil {
+			validity[name] = valid
+		}
 	}
-	timeCol := make([]interface{}, len(timeMicros))
-	for i, v := range timeMicros {
-		timeCol[i] = v
-	}
-	columns["time"] = timeCol
+	cols["time"] = timeMicros
 
-	record := &models.ColumnarRecord{
-		Measurement: measurement,
-		Columnar:    true,
-		Columns:     columns,
+	batch := &ingest.TypedColumnBatch{
+		Data:     cols,
+		Validity: validity,
 	}
-	if err := h.arrowBuffer.WriteColumnarRecord(ctx, database, record); err != nil {
+	if err := h.arrowBuffer.WriteTypedColumnarDirect(ctx, database, measurement, batch, rowCount); err != nil {
 		return nil, &importError{StatusCode: fiber.StatusInternalServerError, Message: "failed to ingest CSV data", Err: err}
 	}
 	if err := h.arrowBuffer.FlushAll(ctx); err != nil {
@@ -498,14 +498,20 @@ func buildImportResult(database, measurement string, header []string, timeColumn
 
 // inferAndConvertColumn scans all cells of a string column and converts to the
 // narrowest native type that fits the whole column: int64, then float64, then
-// bool, else string. Empty cells become nil (null) for numeric/bool columns.
-// This mirrors the auto-typing the old DuckDB read_csv path provided, so numeric
-// columns stay numeric instead of degrading to STRING in the ArrowBuffer.
-func inferAndConvertColumn(raw []string) []interface{} {
+// bool, else string. It returns a flat typed slice ([]int64/[]float64/[]bool/
+// []string) and a null-validity bitmap (nil when the column has no empty cells;
+// validity[i]=false marks an empty numeric/bool cell as null). String columns
+// keep empty cells as "" and have no nulls.
+//
+// Returning typed slices directly (rather than a boxed []interface{}) lets the
+// caller use WriteTypedColumnarDirect, avoiding per-value boxing — same reason
+// the Parquet path uses arrowColumnToTyped.
+func inferAndConvertColumn(raw []string) (interface{}, []bool) {
 	isInt, isFloat, isBool := true, true, true
-	hasValue := false
+	hasValue, hasEmpty := false, false
 	for _, s := range raw {
 		if s == "" {
+			hasEmpty = true
 			continue // empty cells don't constrain the type
 		}
 		hasValue = true
@@ -524,53 +530,52 @@ func inferAndConvertColumn(raw []string) []interface{} {
 				isBool = false
 			}
 		}
-		if !isInt && !isFloat && !isBool {
-			break
+	}
+
+	// An all-empty column has no values to constrain the type; default to string
+	// (keep the empty strings) rather than letting it fall through to int64.
+	// String columns carry no nulls (empty string is a valid value).
+	if !hasValue || (!isInt && !isFloat && !isBool) {
+		out := make([]string, len(raw))
+		copy(out, raw)
+		return out, nil
+	}
+
+	// Numeric/bool columns: build a validity bitmap only if empty cells exist.
+	var validity []bool
+	if hasEmpty {
+		validity = make([]bool, len(raw))
+		for i, s := range raw {
+			validity[i] = s != ""
 		}
 	}
 
-	out := make([]interface{}, len(raw))
-	// An all-empty column has no values to constrain the type; default to string
-	// (keep the empty strings) rather than letting it fall through to int64.
-	if !hasValue {
-		for i, s := range raw {
-			out[i] = s
-		}
-		return out
-	}
 	switch {
 	case isInt:
+		out := make([]int64, len(raw))
 		for i, s := range raw {
-			if s == "" {
-				out[i] = nil
-				continue
+			if s != "" {
+				out[i], _ = strconv.ParseInt(s, 10, 64)
 			}
-			v, _ := strconv.ParseInt(s, 10, 64)
-			out[i] = v
 		}
+		return out, validity
 	case isFloat:
+		out := make([]float64, len(raw))
 		for i, s := range raw {
-			if s == "" {
-				out[i] = nil
-				continue
+			if s != "" {
+				out[i], _ = strconv.ParseFloat(s, 64)
 			}
-			v, _ := strconv.ParseFloat(s, 64)
-			out[i] = v
 		}
-	case isBool:
+		return out, validity
+	default: // isBool
+		out := make([]bool, len(raw))
 		for i, s := range raw {
-			if s == "" {
-				out[i] = nil
-				continue
+			if s != "" {
+				out[i] = strings.EqualFold(s, "true") || s == "1"
 			}
-			out[i] = strings.EqualFold(s, "true") || s == "1"
 		}
-	default:
-		for i, s := range raw {
-			out[i] = s
-		}
+		return out, validity
 	}
-	return out
 }
 
 func isBoolLiteral(s string) bool {
