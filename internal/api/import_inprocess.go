@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -83,10 +85,10 @@ func (h *ImportHandler) handleCSVImport(c *fiber.Ctx) error {
 	defer f.Close()
 
 	// Defense in depth: bound how much we read even if Size under-reports
-	// (e.g. chunked uploads). The CSV reader streams from this limited reader so
-	// the whole file is never required to fit a single buffer, but we still cap
-	// total bytes to avoid unbounded heap growth from rawCols/columns.
-	result, ierr := h.importCSV(c.Context(), database, measurement, io.LimitReader(f, maxImportSize+1), opts)
+	// (e.g. chunked uploads). Use an erroring limit reader (NOT io.LimitReader,
+	// which returns EOF at the cap — the CSV parser would treat that as a clean
+	// end-of-file and silently import a truncated file with a 200 response).
+	result, ierr := h.importCSV(c.Context(), database, measurement, &limitedReader{r: f, limit: maxImportSize}, opts)
 	if ierr != nil {
 		h.totalErrors.Add(1)
 		h.logger.Error().Err(ierr).Str("database", database).Str("measurement", measurement).Msg("CSV import failed")
@@ -154,6 +156,11 @@ func (h *ImportHandler) importCSV(ctx fiberContext, database, measurement string
 			break
 		}
 		if err != nil {
+			// csv.Reader wraps the underlying reader's error; surface the size
+			// cap as 413 rather than a generic 422 parse error.
+			if errors.Is(err, errImportTooLarge) {
+				return nil, &importError{StatusCode: fiber.StatusRequestEntityTooLarge, Message: fmt.Sprintf("file exceeds maximum import size of %d bytes", maxImportSize)}
+			}
 			return nil, &importError{StatusCode: fiber.StatusUnprocessableEntity, Message: fmt.Sprintf("failed to parse CSV at row %d", rowCount+1), Err: err}
 		}
 		for i := range header {
@@ -646,7 +653,11 @@ func epochToMicros(n int64, format string) int64 {
 func autoEpochToMicros(n int64) int64 {
 	absN := n
 	if absN < 0 {
-		absN = -absN
+		if absN == math.MinInt64 {
+			absN = math.MaxInt64 // -MinInt64 overflows; clamp magnitude
+		} else {
+			absN = -absN
+		}
 	}
 	switch {
 	case absN < 1e10: // seconds
@@ -686,6 +697,9 @@ func parseTimestampString(s string) (int64, string, error) {
 // arrowColumnToInterfaces converts a (possibly chunked) Arrow column to a flat
 // []interface{} of native Go values, preserving nulls as nil.
 func arrowColumnToInterfaces(col *arrow.Column) ([]interface{}, error) {
+	if col == nil || col.Data() == nil {
+		return nil, fmt.Errorf("column or column data is nil")
+	}
 	out := make([]interface{}, 0, col.Len())
 	for _, chunk := range col.Data().Chunks() {
 		switch a := chunk.(type) {
@@ -774,6 +788,9 @@ func appendOrNil(out []interface{}, isNull bool, v interface{}) []interface{} {
 // parquetColumnToTimeMicros converts the time column to []int64 micros. Arrow
 // TIMESTAMP columns convert by unit; integer columns use the epoch/auto logic.
 func parquetColumnToTimeMicros(col *arrow.Column, timeFormat string) ([]int64, error) {
+	if col == nil || col.Data() == nil {
+		return nil, fmt.Errorf("column or column data is nil")
+	}
 	out := make([]int64, 0, col.Len())
 	for _, chunk := range col.Data().Chunks() {
 		switch a := chunk.(type) {
@@ -858,4 +875,27 @@ func arrowTimestampToMicros(v int64, unit arrow.TimeUnit) int64 {
 	default:
 		return v
 	}
+}
+
+// errImportTooLarge is returned by limitedReader when the byte cap is exceeded.
+// Distinct from a parse error so callers map it to 413 rather than 422.
+var errImportTooLarge = errors.New("file exceeds maximum import size")
+
+// limitedReader caps total bytes read and returns errImportTooLarge once the
+// limit is passed. Unlike io.LimitReader (which returns io.EOF at the cap and
+// would make csv.Reader silently truncate the file), this surfaces an explicit
+// error so an oversized upload fails instead of importing partial data.
+type limitedReader struct {
+	r     io.Reader
+	limit int64
+	read  int64
+}
+
+func (lr *limitedReader) Read(p []byte) (int, error) {
+	n, err := lr.r.Read(p)
+	lr.read += int64(n)
+	if lr.read > lr.limit {
+		return n, errImportTooLarge
+	}
+	return n, err
 }

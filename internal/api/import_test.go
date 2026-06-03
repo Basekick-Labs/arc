@@ -1,7 +1,10 @@
 package api
 
 import (
+	"errors"
+	"io"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/basekick-labs/arc/internal/ingest"
@@ -145,6 +148,26 @@ func TestValidateImportHeader(t *testing.T) {
 				t.Errorf("timeIdx = %d, want %d", idx, tt.wantIdx)
 			}
 		})
+	}
+}
+
+func TestLimitedReader(t *testing.T) {
+	// Reading within the limit succeeds and passes through EOF.
+	r := &limitedReader{r: strings.NewReader("hello"), limit: 10}
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("unexpected error under limit: %v", err)
+	}
+	if string(got) != "hello" {
+		t.Errorf("got %q, want hello", got)
+	}
+
+	// Exceeding the limit returns errImportTooLarge (NOT a silent EOF — that's
+	// the bug: io.LimitReader would let csv.Reader truncate quietly).
+	r2 := &limitedReader{r: strings.NewReader("0123456789ABCDEF"), limit: 8}
+	_, err = io.ReadAll(r2)
+	if !errors.Is(err, errImportTooLarge) {
+		t.Errorf("expected errImportTooLarge, got %v", err)
 	}
 }
 
