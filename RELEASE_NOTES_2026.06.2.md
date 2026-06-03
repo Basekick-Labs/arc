@@ -24,6 +24,8 @@ User-visible behavior changes:
 - CSV uploads are now subject to the same 500 MB size cap already enforced for the other import formats.
 - Parquet `DECIMAL` columns are imported as `DOUBLE` (Arc's ingest path does not carry per-column decimal precision for imports). Use Line Protocol with a configured decimal column if exact decimal precision is required.
 
+Performance: CSV imports now parse each numeric value once (the type-inference and conversion passes were merged), roughly halving CPU on numeric-heavy files; per-column buffers are pre-sized from the upload size to avoid repeated reallocation on large files. No behavior change.
+
 Line Protocol and TLE imports are unchanged. CSV/Parquet imports no longer depend on the DuckDB sandbox's allowed-directories list.
 
 ## Upgrade notes
