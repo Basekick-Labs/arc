@@ -166,7 +166,7 @@ func TestPhase3CatchUpHappyPath(t *testing.T) {
 	defer stop()
 
 	// Run catch-up with the full manifest — every entry is missing locally.
-	puller.RunCatchUp(context.Background(), entries)
+	puller.RunCatchUp(context.Background(), sliceFetcher(entries))
 
 	stats := waitForCatchUp(t, puller, 10)
 	if stats["pulled"] != 10 {
@@ -244,7 +244,7 @@ func TestPhase3CatchUpOriginAbsentFallbackSucceeds(t *testing.T) {
 	puller, readerBackend, stop := buildCatchUpPuller(t, readerID, []string{peer.addr()})
 	defer stop()
 
-	puller.RunCatchUp(context.Background(), entries)
+	puller.RunCatchUp(context.Background(), sliceFetcher(entries))
 
 	stats := waitForCatchUp(t, puller, 2)
 	if stats["pulled"] != 2 {
@@ -301,7 +301,7 @@ func TestPhase3CatchUpNoPeerHasFile(t *testing.T) {
 	puller, readerBackend, stop := buildCatchUpPuller(t, readerID, []string{peer1.addr(), peer2.addr()})
 	defer stop()
 
-	puller.RunCatchUp(context.Background(), entries)
+	puller.RunCatchUp(context.Background(), sliceFetcher(entries))
 
 	stats := waitForCatchUp(t, puller, 1)
 	if stats["failed"] != 1 {
@@ -319,3 +319,32 @@ func TestPhase3CatchUpNoPeerHasFile(t *testing.T) {
 // Ensure io.Discard is used elsewhere so this file's imports compile even
 // in the absence of other references. (Static unused-var protection.)
 var _ = io.Discard
+
+// sliceFetcher converts a []*raft.FileEntry into a paginated fetch function
+// compatible with RunCatchUp's signature. Used by tests that previously
+// passed slices directly.
+func sliceFetcher(entries []*raft.FileEntry) func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
+	return func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
+		start := 0
+		if cursor != "" {
+			for i, e := range entries {
+				if e.Path == cursor {
+					start = i + 1
+					break
+				}
+			}
+		}
+		if start >= len(entries) {
+			return nil, "", nil
+		}
+		end := start + limit
+		if end > len(entries) {
+			end = len(entries)
+		}
+		nextCursor := ""
+		if end < len(entries) {
+			nextCursor = entries[end-1].Path
+		}
+		return entries[start:end], nextCursor, nil
+	}
+}

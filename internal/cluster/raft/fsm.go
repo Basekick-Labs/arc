@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -321,6 +322,11 @@ type ClusterFSM struct {
 	// the primary `files` map on register/delete to avoid O(N) scans when
 	// filtering by database.
 	filesByDB map[string]map[string]struct{}
+	// keysCache is a sorted snapshot of f.files keys, used by
+	// GetFilesPaginated to avoid sorting the full key set on every page.
+	// Set to nil on any manifest mutation to trigger a rebuild on the
+	// next paginated call. Guarded by mu.
+	keysCache []string
 	// tokens holds the cluster-wide API-token state (Phase A: Cluster Auth
 	// Convergence). The map is the source of truth in memory; each node's
 	// local SQLite `api_tokens` is a materialised cache rebuilt from
@@ -1067,6 +1073,7 @@ func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uin
 		f.filesByDB[entry.Database] = idx
 	}
 	idx[entry.Path] = struct{}{}
+	f.keysCache = nil // invalidate sorted-key cache
 	callback := f.onFileRegistered
 	f.mu.Unlock()
 
@@ -1115,6 +1122,7 @@ func (f *ClusterFSM) applyDeleteFileStruct(p DeleteFilePayload) interface{} {
 			}
 		}
 	}
+	f.keysCache = nil // invalidate sorted-key cache
 	callback := f.onFileDeleted
 	f.mu.Unlock()
 
@@ -1196,6 +1204,7 @@ func (f *ClusterFSM) applyUpdateFileStruct(p UpdateFilePayload, logIndex uint64)
 		}
 		idx[entry.Path] = struct{}{}
 	}
+	f.keysCache = nil // invalidate sorted-key cache
 	callback := f.onFileRegistered
 	f.mu.Unlock()
 
@@ -2175,6 +2184,7 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		}
 		teamSet[id] = struct{}{}
 	}
+	f.keysCache = nil // invalidate sorted-key cache after snapshot restore
 	f.mu.Unlock()
 
 	f.logger.Info().
@@ -2298,6 +2308,81 @@ func (f *ClusterFSM) GetFilesByDatabase(database string) []*FileEntry {
 		}
 	}
 	return files
+}
+
+// GetFilesPaginated returns a page of file entries using cursor-based
+// pagination over a sorted snapshot of manifest keys. The caller passes
+// the cursor from the previous page (empty string for the first page)
+// and a limit; the method returns the page, the next cursor (empty when
+// there are no more pages), and an error.
+//
+// This avoids the O(N) allocation of GetAllFiles() for large manifests.
+// Between pages the RLock is released so Raft apply-path latency is not
+// affected by long-running manifest walks. The sorted-key cache is
+// rebuilt on first call after any manifest mutation.
+//
+// Cursor stability: the cursor is the last path string of the previous
+// page. If the cursor path is deleted between pages, pagination resumes
+// from the next key in sort order — no existing entries are skipped.
+// Newly added entries that sort before the cursor may be missed (the
+// cache is rebuilt and cursor is relative to the new key order); this
+// is acceptable because catch-up also receives reactive FSM callbacks
+// for new entries.
+func (f *ClusterFSM) GetFilesPaginated(cursor string, limit int) ([]*FileEntry, string, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+
+	f.mu.Lock()
+	// Rebuild the sorted-key cache if invalidated
+	if f.keysCache == nil {
+		f.keysCache = make([]string, 0, len(f.files))
+		for k := range f.files {
+			f.keysCache = append(f.keysCache, k)
+		}
+		sort.Strings(f.keysCache)
+	}
+	keys := f.keysCache
+	f.mu.Unlock()
+
+	// Find start position from cursor
+	start := 0
+	if cursor != "" {
+		// sort.SearchStrings returns the first index where keys[i] >= cursor.
+		// If cursor matches exactly, skip it (it was in the previous page).
+		idx := sort.SearchStrings(keys, cursor)
+		if idx < len(keys) && keys[idx] == cursor {
+			start = idx + 1
+		} else {
+			start = idx
+		}
+	}
+
+	if start >= len(keys) {
+		return nil, "", nil
+	}
+
+	end := start + limit
+	if end > len(keys) {
+		end = len(keys)
+	}
+
+	f.mu.RLock()
+	result := make([]*FileEntry, 0, end-start)
+	for i := start; i < end; i++ {
+		if entry, exists := f.files[keys[i]]; exists {
+			entryCopy := *entry
+			result = append(result, &entryCopy)
+		}
+	}
+	f.mu.RUnlock()
+
+	nextCursor := ""
+	if end < len(keys) {
+		nextCursor = keys[end-1]
+	}
+
+	return result, nextCursor, nil
 }
 
 // FileCount returns the number of files in the manifest.

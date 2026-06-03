@@ -1,6 +1,9 @@
 package api
 
 import (
+	"sort"
+	"strconv"
+
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
 	clusterraft "github.com/basekick-labs/arc/internal/cluster/raft"
@@ -304,6 +307,8 @@ func (h *ClusterHandler) handleRemoveNode(c *fiber.Ctx) error {
 
 // handleGetFiles returns the cluster-wide file manifest from the Raft FSM.
 // Supports optional `database` query parameter to filter by database.
+// Supports optional `cursor` and `limit` query parameters for pagination.
+// Without cursor/limit, returns all files (backward-compatible but O(N)).
 // This is the authoritative view of all files known to the cluster — used
 // by the peer replication system to determine what to pull from other nodes.
 func (h *ClusterHandler) handleGetFiles(c *fiber.Ctx) error {
@@ -312,7 +317,43 @@ func (h *ClusterHandler) handleGetFiles(c *fiber.Ctx) error {
 	}
 
 	database := c.Query("database")
+	cursor := c.Query("cursor")
+	limitStr := c.Query("limit")
 
+	// Paginated path
+	if cursor != "" || limitStr != "" {
+		limit := 1000
+		if limitStr != "" {
+			if parsed, err := strconv.Atoi(limitStr); err == nil && parsed > 0 && parsed <= 10000 {
+				limit = parsed
+			}
+		}
+
+		var files []*clusterraft.FileEntry
+		var nextCursor string
+		var err error
+
+		if database != "" {
+			// Database filtering + pagination: get all for DB, then slice
+			allFiles := h.coordinator.GetFileManifestByDatabase(database)
+			files, nextCursor = paginateSlice(allFiles, cursor, limit)
+		} else {
+			files, nextCursor, err = h.coordinator.GetFileManifestPaginated(cursor, limit)
+			if err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+					"error": err.Error(),
+				})
+			}
+		}
+
+		return c.JSON(fiber.Map{
+			"files":       files,
+			"total":       len(files),
+			"next_cursor": nextCursor,
+		})
+	}
+
+	// Backward-compatible: return all files (no pagination)
 	var files []*clusterraft.FileEntry
 	if database != "" {
 		files = h.coordinator.GetFileManifestByDatabase(database)
@@ -324,4 +365,41 @@ func (h *ClusterHandler) handleGetFiles(c *fiber.Ctx) error {
 		"files": files,
 		"total": len(files),
 	})
+}
+
+// paginateSlice applies cursor-based pagination to an in-memory slice.
+// Used for database-filtered results where the FSM's paginated API doesn't
+// natively support database filtering yet. Files are sorted by path first
+// (source is an unordered map, so iteration order is non-deterministic).
+// nextCursor is the last path in this page; the next call will resume after it.
+//
+// NOTE: This still allocates the full filtered set (O(k) where k = files in
+// the database). The unfiltered path via GetFileManifestPaginated releases
+// the RLock between pages; this path does not. For large databases, prefer
+// the unfiltered paginated endpoint.
+func paginateSlice(files []*clusterraft.FileEntry, cursor string, limit int) ([]*clusterraft.FileEntry, string) {
+	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+
+	start := 0
+	if cursor != "" {
+		// Binary search for cursor position
+		idx := sort.Search(len(files), func(i int) bool { return files[i].Path >= cursor })
+		if idx < len(files) && files[idx].Path == cursor {
+			start = idx + 1
+		} else {
+			start = idx
+		}
+	}
+	if start >= len(files) {
+		return nil, ""
+	}
+	end := start + limit
+	if end > len(files) {
+		end = len(files)
+	}
+	nextCursor := ""
+	if end < len(files) {
+		nextCursor = files[end-1].Path
+	}
+	return files[start:end], nextCursor
 }
