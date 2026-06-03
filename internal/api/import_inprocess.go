@@ -547,7 +547,7 @@ func inferAndConvertColumn(raw []string) []interface{} {
 
 func isBoolLiteral(s string) bool {
 	switch strings.ToLower(s) {
-	case "true", "false":
+	case "true", "false", "1", "0":
 		return true
 	default:
 		return false
@@ -556,23 +556,54 @@ func isBoolLiteral(s string) bool {
 
 // stringsToTimeMicros converts a string time column to []int64 microseconds.
 // Explicit epoch_* formats are deterministic; "" (auto) magnitude-detects numeric
-// values and falls back to parsing common timestamp string layouts.
+// values and falls back to parsing common timestamp string layouts. In the auto
+// string case the matched layout is cached and tried first on subsequent rows —
+// CSV time columns are homogeneous, so this avoids re-scanning all layouts per row.
 func stringsToTimeMicros(raw []string, timeFormat string) ([]int64, error) {
 	out := make([]int64, len(raw))
+	cachedLayout := ""
 	for i, s := range raw {
 		s = strings.TrimSpace(s)
 		if s == "" {
 			return nil, fmt.Errorf("empty value in time column at row %d", i+1)
 		}
-		micros, err := oneTimeValueToMicros(s, timeFormat)
+
+		// Explicit epoch format.
+		if timeFormat != "" {
+			micros, err := oneTimeValueToMicros(s, timeFormat)
+			if err != nil {
+				return nil, fmt.Errorf("row %d: %w", i+1, err)
+			}
+			out[i] = micros
+			continue
+		}
+
+		// Auto: numeric -> magnitude detection.
+		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+			out[i] = autoEpochToMicros(n)
+			continue
+		}
+
+		// Auto: timestamp string. Try the cached layout first.
+		if cachedLayout != "" {
+			if t, err := time.Parse(cachedLayout, s); err == nil {
+				out[i] = t.UTC().UnixMicro()
+				continue
+			}
+		}
+		micros, layout, err := parseTimestampString(s)
 		if err != nil {
 			return nil, fmt.Errorf("row %d: %w", i+1, err)
 		}
+		cachedLayout = layout
 		out[i] = micros
 	}
 	return out, nil
 }
 
+// oneTimeValueToMicros converts a single time value with an explicit time_format
+// or auto-detection. Used for the (rare) Parquet string time column; the CSV path
+// uses stringsToTimeMicros directly with layout caching.
 func oneTimeValueToMicros(s, timeFormat string) (int64, error) {
 	switch timeFormat {
 	case "epoch_s", "epoch_ms", "epoch_us", "epoch_ns":
@@ -586,7 +617,8 @@ func oneTimeValueToMicros(s, timeFormat string) (int64, error) {
 		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
 			return autoEpochToMicros(n), nil
 		}
-		return parseTimestampString(s)
+		micros, _, err := parseTimestampString(s)
+		return micros, err
 	default:
 		return 0, fmt.Errorf("unsupported time_format %q (want epoch_s|epoch_ms|epoch_us|epoch_ns or empty for auto)", timeFormat)
 	}
@@ -622,8 +654,9 @@ func autoEpochToMicros(n int64) int64 {
 	}
 }
 
-// parseTimestampString parses common timestamp string layouts (UTC if no zone).
-func parseTimestampString(s string) (int64, error) {
+// parseTimestampString parses common timestamp string layouts (UTC if no zone),
+// returning the micros and the layout that matched (so callers can cache it).
+func parseTimestampString(s string) (int64, string, error) {
 	layouts := []string{
 		time.RFC3339Nano,
 		time.RFC3339,
@@ -634,10 +667,10 @@ func parseTimestampString(s string) (int64, error) {
 	}
 	for _, layout := range layouts {
 		if t, err := time.Parse(layout, s); err == nil {
-			return t.UTC().UnixMicro(), nil
+			return t.UTC().UnixMicro(), layout, nil
 		}
 	}
-	return 0, fmt.Errorf("unrecognized timestamp %q (supported: RFC3339, 'YYYY-MM-DD[ T]HH:MM:SS[.fff]', 'YYYY-MM-DD', or set time_format)", s)
+	return 0, "", fmt.Errorf("unrecognized timestamp %q (supported: RFC3339, 'YYYY-MM-DD[ T]HH:MM:SS[.fff]', 'YYYY-MM-DD', or set time_format)", s)
 }
 
 // =============================================================================
@@ -655,6 +688,30 @@ func arrowColumnToInterfaces(col *arrow.Column) ([]interface{}, error) {
 				out = appendOrNil(out, a.IsNull(i), a.Value(i))
 			}
 		case *array.Int32:
+			for i := 0; i < a.Len(); i++ {
+				out = appendOrNil(out, a.IsNull(i), int64(a.Value(i)))
+			}
+		case *array.Int16:
+			for i := 0; i < a.Len(); i++ {
+				out = appendOrNil(out, a.IsNull(i), int64(a.Value(i)))
+			}
+		case *array.Int8:
+			for i := 0; i < a.Len(); i++ {
+				out = appendOrNil(out, a.IsNull(i), int64(a.Value(i)))
+			}
+		case *array.Uint64:
+			for i := 0; i < a.Len(); i++ {
+				out = appendOrNil(out, a.IsNull(i), int64(a.Value(i)))
+			}
+		case *array.Uint32:
+			for i := 0; i < a.Len(); i++ {
+				out = appendOrNil(out, a.IsNull(i), int64(a.Value(i)))
+			}
+		case *array.Uint16:
+			for i := 0; i < a.Len(); i++ {
+				out = appendOrNil(out, a.IsNull(i), int64(a.Value(i)))
+			}
+		case *array.Uint8:
 			for i := 0; i < a.Len(); i++ {
 				out = appendOrNil(out, a.IsNull(i), int64(a.Value(i)))
 			}
@@ -730,6 +787,27 @@ func parquetColumnToTimeMicros(col *arrow.Column, timeFormat string) ([]int64, e
 				out = append(out, intTimeToMicros(a.Value(i), timeFormat))
 			}
 		case *array.Int32:
+			for i := 0; i < a.Len(); i++ {
+				if a.IsNull(i) {
+					return nil, fmt.Errorf("null value in time column at row %d", len(out)+1)
+				}
+				out = append(out, intTimeToMicros(int64(a.Value(i)), timeFormat))
+			}
+		case *array.Int16:
+			for i := 0; i < a.Len(); i++ {
+				if a.IsNull(i) {
+					return nil, fmt.Errorf("null value in time column at row %d", len(out)+1)
+				}
+				out = append(out, intTimeToMicros(int64(a.Value(i)), timeFormat))
+			}
+		case *array.Uint64:
+			for i := 0; i < a.Len(); i++ {
+				if a.IsNull(i) {
+					return nil, fmt.Errorf("null value in time column at row %d", len(out)+1)
+				}
+				out = append(out, intTimeToMicros(int64(a.Value(i)), timeFormat))
+			}
+		case *array.Uint32:
 			for i := 0; i < a.Len(); i++ {
 				if a.IsNull(i) {
 					return nil, fmt.Errorf("null value in time column at row %d", len(out)+1)

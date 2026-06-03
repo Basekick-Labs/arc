@@ -81,6 +81,37 @@ func TestStringsToTimeMicros_EmptyValueErrors(t *testing.T) {
 	}
 }
 
+func TestStringsToTimeMicros_CachedLayoutMultiRow(t *testing.T) {
+	// Homogeneous RFC3339 column: layout cached after row 0, applied to all.
+	got, err := stringsToTimeMicros([]string{
+		"2021-01-01T00:00:00Z",
+		"2021-01-01T01:00:00Z",
+		"2021-01-01T02:00:00Z",
+	}, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []int64{1609459200000000, 1609462800000000, 1609466400000000}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestInferAndConvertColumn_MixedBoolReps(t *testing.T) {
+	// "true"/"1" mixed -> not all-int (true isn't int), all bool-literal -> bool.
+	got := inferAndConvertColumn([]string{"true", "1", "false", "0"})
+	want := []interface{}{true, true, false, false}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+	// Pure 0/1 stays integer (isInt wins over isBool in the switch).
+	gotInt := inferAndConvertColumn([]string{"0", "1", "1", "0"})
+	wantInt := []interface{}{int64(0), int64(1), int64(1), int64(0)}
+	if !reflect.DeepEqual(gotInt, wantInt) {
+		t.Errorf("pure 0/1: got %v, want %v", gotInt, wantInt)
+	}
+}
+
 func TestValidateImportHeader(t *testing.T) {
 	tests := []struct {
 		name       string
