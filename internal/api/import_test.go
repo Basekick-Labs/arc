@@ -49,6 +49,8 @@ func TestOneTimeValueToMicros(t *testing.T) {
 		{"auto millis", "1609459200000", "", 1609459200000000, false},
 		{"auto micros", "1609459200000000", "", 1609459200000000, false},
 		{"auto nanos", "1609459200000000000", "", 1609459200000000, false},
+		{"auto negative seconds (pre-1970)", "-1000000000", "", -1000000000000000, false},
+		{"auto negative millis (pre-1970)", "-1000000000000", "", -1000000000000, false},
 		{"auto RFC3339", "2021-01-01T00:00:00Z", "", 1609459200000000, false},
 		{"auto date-only", "2021-01-01", "", 1609459200000000, false},
 		{"auto space-separated", "2021-01-01 00:00:00", "", 1609459200000000, false},

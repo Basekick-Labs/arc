@@ -640,14 +640,20 @@ func epochToMicros(n int64, format string) int64 {
 }
 
 // autoEpochToMicros detects the unit by magnitude, matching the heuristic in
-// ingest.MessagePackDecoder.normalizeTimestamps.
+// ingest.MessagePackDecoder.normalizeTimestamps. Magnitude is taken on the
+// absolute value so negative epochs (historical data before 1970) classify by
+// the same thresholds rather than always falling into the "seconds" branch.
 func autoEpochToMicros(n int64) int64 {
+	absN := n
+	if absN < 0 {
+		absN = -absN
+	}
 	switch {
-	case n < 1e10: // seconds
+	case absN < 1e10: // seconds
 		return n * 1_000_000
-	case n < 1e13: // milliseconds
+	case absN < 1e13: // milliseconds
 		return n * 1_000
-	case n < 1e16: // microseconds
+	case absN < 1e16: // microseconds
 		return n
 	default: // nanoseconds
 		return n / 1_000
