@@ -172,16 +172,25 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	}
 	defer file.Close()
 
-	data, err := io.ReadAll(file)
+	// Size limit for bulk LP import (applies to both compressed and uncompressed)
+	const maxImportSize = 500 * 1024 * 1024 // 500MB
+
+	// Bound the read at the limit (+1 to detect overflow) so an oversized upload
+	// is rejected without buffering the whole body — the global BodyLimit (1GB)
+	// is a coarser backstop; this matches the CSV/Parquet handlers.
+	data, err := io.ReadAll(io.LimitReader(file, maxImportSize+1))
 	if err != nil {
 		h.totalErrors.Add(1)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "failed to read uploaded file: " + err.Error(),
 		})
 	}
-
-	// Size limit for bulk LP import (applies to both compressed and uncompressed)
-	const maxImportSize = 500 * 1024 * 1024 // 500MB
+	if int64(len(data)) > maxImportSize {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
+			"error": "file exceeds 500MB limit",
+		})
+	}
 
 	// Detect and decompress gzip (magic bytes: 0x1f 0x8b)
 	if len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b {
@@ -195,7 +204,7 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 		data = decompressed
 	}
 
-	// Enforce size limit on uncompressed data
+	// Enforce size limit on uncompressed data (decompressed gzip may exceed it)
 	if len(data) > maxImportSize {
 		h.totalErrors.Add(1)
 		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
@@ -406,15 +415,23 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 	}
 	defer file.Close()
 
-	data, err := io.ReadAll(file)
+	const maxImportSize = 500 * 1024 * 1024 // 500MB
+
+	// Bound the read at the limit (+1 to detect overflow) so an oversized upload
+	// is rejected without buffering the whole body — matches CSV/Parquet/LP.
+	data, err := io.ReadAll(io.LimitReader(file, maxImportSize+1))
 	if err != nil {
 		h.totalErrors.Add(1)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "failed to read uploaded file: " + err.Error(),
 		})
 	}
-
-	const maxImportSize = 500 * 1024 * 1024 // 500MB
+	if int64(len(data)) > maxImportSize {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
+			"error": "file exceeds 500MB limit",
+		})
+	}
 
 	// Detect and decompress gzip (magic bytes: 0x1f 0x8b)
 	if len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b {
@@ -428,6 +445,7 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 		data = decompressed
 	}
 
+	// Enforce size limit on uncompressed data (decompressed gzip may exceed it)
 	if len(data) > maxImportSize {
 		h.totalErrors.Add(1)
 		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
