@@ -161,10 +161,13 @@ func (h *ImportHandler) importCSV(ctx fiberContext, database, measurement string
 	// run to many GB just for slice backing arrays). Floor at 1024, cap the
 	// estimate so a pathological column count can't blow up the allocation; the
 	// buffers still grow if the estimate is low.
+	// len(header) is guaranteed >= 1 here (the empty-header case returned above),
+	// so no division by zero. Multiply in int64 so a pathological column count
+	// can't overflow a 32-bit int before the divide.
 	const bytesPerCell = 8
 	estRows := 1024
 	if fileSize > 0 {
-		estRows = int(fileSize / int64(bytesPerCell*len(header)))
+		estRows = int(fileSize / (int64(bytesPerCell) * int64(len(header))))
 		switch {
 		case estRows < 1024:
 			estRows = 1024
