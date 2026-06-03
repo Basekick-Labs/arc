@@ -585,9 +585,9 @@ func stringsToTimeMicros(raw []string, timeFormat string) ([]int64, error) {
 			continue
 		}
 
-		// Auto: numeric -> magnitude detection.
-		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
-			out[i] = autoEpochToMicros(n)
+		// Auto: numeric (incl. fractional epochs) -> magnitude detection.
+		if f, err := strconv.ParseFloat(s, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+			out[i] = autoEpochToMicros(f)
 			continue
 		}
 
@@ -614,15 +614,18 @@ func stringsToTimeMicros(raw []string, timeFormat string) ([]int64, error) {
 func oneTimeValueToMicros(s, timeFormat string) (int64, error) {
 	switch timeFormat {
 	case "epoch_s", "epoch_ms", "epoch_us", "epoch_ns":
-		n, err := strconv.ParseInt(s, 10, 64)
+		f, err := strconv.ParseFloat(s, 64)
 		if err != nil {
 			return 0, fmt.Errorf("invalid epoch value %q: %w", s, err)
 		}
-		return epochToMicros(n, timeFormat), nil
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return 0, fmt.Errorf("invalid epoch value %q: NaN or Inf", s)
+		}
+		return epochToMicros(f, timeFormat), nil
 	case "":
-		// Auto: numeric -> magnitude detection; else parse as timestamp string.
-		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
-			return autoEpochToMicros(n), nil
+		// Auto: numeric (incl. fractional epochs) -> magnitude detection; else parse as timestamp string.
+		if f, err := strconv.ParseFloat(s, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+			return autoEpochToMicros(f), nil
 		}
 		micros, _, err := parseTimestampString(s)
 		return micros, err
@@ -631,18 +634,20 @@ func oneTimeValueToMicros(s, timeFormat string) (int64, error) {
 	}
 }
 
-func epochToMicros(n int64, format string) int64 {
+// epochToMicros converts an epoch value (float, to allow fractional seconds like
+// 1609459200.123) in the given unit to int64 microseconds.
+func epochToMicros(f float64, format string) int64 {
 	switch format {
 	case "epoch_s":
-		return n * 1_000_000
+		return int64(f * 1_000_000)
 	case "epoch_ms":
-		return n * 1_000
+		return int64(f * 1_000)
 	case "epoch_us":
-		return n
+		return int64(f)
 	case "epoch_ns":
-		return n / 1_000
+		return int64(f / 1_000)
 	default:
-		return n
+		return int64(f)
 	}
 }
 
@@ -650,24 +655,18 @@ func epochToMicros(n int64, format string) int64 {
 // ingest.MessagePackDecoder.normalizeTimestamps. Magnitude is taken on the
 // absolute value so negative epochs (historical data before 1970) classify by
 // the same thresholds rather than always falling into the "seconds" branch.
-func autoEpochToMicros(n int64) int64 {
-	absN := n
-	if absN < 0 {
-		if absN == math.MinInt64 {
-			absN = math.MaxInt64 // -MinInt64 overflows; clamp magnitude
-		} else {
-			absN = -absN
-		}
-	}
+// Takes float64 to support fractional epochs (sub-second precision preserved).
+func autoEpochToMicros(f float64) int64 {
+	absF := math.Abs(f)
 	switch {
-	case absN < 1e10: // seconds
-		return n * 1_000_000
-	case absN < 1e13: // milliseconds
-		return n * 1_000
-	case absN < 1e16: // microseconds
-		return n
+	case absF < 1e10: // seconds
+		return int64(f * 1_000_000)
+	case absF < 1e13: // milliseconds
+		return int64(f * 1_000)
+	case absF < 1e16: // microseconds
+		return int64(f)
 	default: // nanoseconds
-		return n / 1_000
+		return int64(f / 1_000)
 	}
 }
 
@@ -857,9 +856,9 @@ func parquetColumnToTimeMicros(col *arrow.Column, timeFormat string) ([]int64, e
 
 func intTimeToMicros(n int64, timeFormat string) int64 {
 	if timeFormat == "" {
-		return autoEpochToMicros(n)
+		return autoEpochToMicros(float64(n))
 	}
-	return epochToMicros(n, timeFormat)
+	return epochToMicros(float64(n), timeFormat)
 }
 
 func arrowTimestampToMicros(v int64, unit arrow.TimeUnit) int64 {

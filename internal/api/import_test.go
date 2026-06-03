@@ -45,10 +45,15 @@ func TestOneTimeValueToMicros(t *testing.T) {
 		wantErr    bool
 	}{
 		{"epoch_s", "1609459200", "epoch_s", 1609459200000000, false},
+		{"epoch_s float", "1609459200.123", "epoch_s", 1609459200123000, false},
 		{"epoch_ms", "1609459200000", "epoch_ms", 1609459200000000, false},
+		{"epoch_ms float", "1609459200000.123", "epoch_ms", 1609459200000123, false},
 		{"epoch_us", "1609459200000000", "epoch_us", 1609459200000000, false},
 		{"epoch_ns", "1609459200000000000", "epoch_ns", 1609459200000000, false},
+		{"epoch NaN -> err", "NaN", "epoch_s", 0, true},
+		{"epoch Inf -> err", "Inf", "epoch_s", 0, true},
 		{"auto seconds", "1609459200", "", 1609459200000000, false},
+		{"auto seconds float", "1609459200.123", "", 1609459200123000, false},
 		{"auto millis", "1609459200000", "", 1609459200000000, false},
 		{"auto micros", "1609459200000000", "", 1609459200000000, false},
 		{"auto nanos", "1609459200000000000", "", 1609459200000000, false},
