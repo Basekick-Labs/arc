@@ -717,12 +717,27 @@ func (j *Job) uploadFile(ctx context.Context, localPath, key string) error {
 
 // deleteOldFiles removes only the files that were actually compacted from storage.
 // This ensures we don't delete files that were skipped due to corruption or other issues.
+// Prefers batch delete (BatchDeleter interface) when the backend supports it
+// (S3 DeleteObjects, Azure BlobBatch) to reduce API call overhead.
 func (j *Job) deleteOldFiles(ctx context.Context) error {
 	if len(j.compactedFiles) == 0 {
 		j.logger.Debug().Msg("No files to delete (none were compacted)")
 		return nil
 	}
 
+	// Prefer batch delete when the backend supports it (S3, Azure).
+	if bd, ok := j.StorageBackend.(storage.BatchDeleter); ok {
+		if err := bd.DeleteBatch(ctx, j.compactedFiles); err != nil {
+			j.logger.Warn().Err(err).Msg("Batch delete failed, falling back to per-file delete")
+		} else {
+			j.logger.Info().
+				Int("total", len(j.compactedFiles)).
+				Msg("Completed batch deletion of old files")
+			return nil
+		}
+	}
+
+	// Fallback: per-file delete
 	var lastErr error
 	var deleted, failed int
 	for _, fileKey := range j.compactedFiles {

@@ -308,30 +308,52 @@ func (b *AzureBlobBackend) Delete(ctx context.Context, path string) error {
 	return nil
 }
 
-// DeleteBatch deletes multiple blobs from Azure Blob Storage
-// Azure Blob Storage supports batch delete via the Batch API
+// DeleteBatch deletes multiple blobs from Azure Blob Storage using the Blob Batch API.
+// Azure supports up to 256 sub-requests per batch. Each batch is submitted as a
+// single HTTP request, dramatically reducing API call overhead vs per-file Delete.
 func (b *AzureBlobBackend) DeleteBatch(ctx context.Context, paths []string) error {
 	if len(paths) == 0 {
 		return nil
 	}
 
-	// Azure Blob batch operations can handle up to 256 operations per batch
 	const batchSize = 256
+	containerClient := b.client.ServiceClient().NewContainerClient(b.containerName)
 
 	for i := 0; i < len(paths); i += batchSize {
 		end := i + batchSize
 		if end > len(paths) {
 			end = len(paths)
 		}
-
 		batch := paths[i:end]
 
-		// Delete each blob individually (Azure SDK batch delete requires more setup)
-		// For simplicity, we use individual deletes in parallel concept
+		bb, err := containerClient.NewBatchBuilder()
+		if err != nil {
+			return fmt.Errorf("failed to create Azure batch builder: %w", err)
+		}
+
 		for _, path := range batch {
-			if err := b.Delete(ctx, path); err != nil {
-				b.logger.Warn().Err(err).Str("path", path).Msg("Failed to delete blob in batch")
-				// Continue with other deletions
+			if err := bb.Delete(path, nil); err != nil {
+				return fmt.Errorf("failed to add delete to Azure batch for %q: %w", path, err)
+			}
+		}
+
+		resp, err := containerClient.SubmitBatch(ctx, bb, nil)
+		if err != nil {
+			return fmt.Errorf("failed to submit Azure batch delete: %w", err)
+		}
+
+		// Log individual sub-request failures (the batch itself succeeded;
+		// individual blob deletes may still fail, e.g. blob not found).
+		for _, item := range resp.Responses {
+			if item.Error != nil {
+				blobName := "unknown"
+				if item.BlobName != nil {
+					blobName = *item.BlobName
+				}
+				b.logger.Warn().
+					Err(item.Error).
+					Str("blob", blobName).
+					Msg("Azure batch: individual delete failed")
 			}
 		}
 	}
