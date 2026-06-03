@@ -746,6 +746,16 @@ func arrowColumnToInterfaces(col *arrow.Column) ([]interface{}, error) {
 			for i := 0; i < a.Len(); i++ {
 				out = appendOrNil(out, a.IsNull(i), a.Value(i))
 			}
+		case *array.Binary:
+			// BYTE_ARRAY without a UTF8 logical annotation reads as Binary, not
+			// String (common from Spark and some writers). Treat as string.
+			for i := 0; i < a.Len(); i++ {
+				out = appendOrNil(out, a.IsNull(i), string(a.Value(i)))
+			}
+		case *array.FixedSizeBinary:
+			for i := 0; i < a.Len(); i++ {
+				out = appendOrNil(out, a.IsNull(i), string(a.Value(i)))
+			}
 		case *array.Boolean:
 			for i := 0; i < a.Len(); i++ {
 				out = appendOrNil(out, a.IsNull(i), a.Value(i))
@@ -842,6 +852,29 @@ func parquetColumnToTimeMicros(col *arrow.Column, timeFormat string) ([]int64, e
 					return nil, fmt.Errorf("null value in time column at row %d", len(out)+1)
 				}
 				micros, err := oneTimeValueToMicros(a.Value(i), timeFormat)
+				if err != nil {
+					return nil, fmt.Errorf("row %d: %w", len(out)+1, err)
+				}
+				out = append(out, micros)
+			}
+		case *array.Binary:
+			// BYTE_ARRAY without a UTF8 logical annotation reads as Binary.
+			for i := 0; i < a.Len(); i++ {
+				if a.IsNull(i) {
+					return nil, fmt.Errorf("null value in time column at row %d", len(out)+1)
+				}
+				micros, err := oneTimeValueToMicros(string(a.Value(i)), timeFormat)
+				if err != nil {
+					return nil, fmt.Errorf("row %d: %w", len(out)+1, err)
+				}
+				out = append(out, micros)
+			}
+		case *array.FixedSizeBinary:
+			for i := 0; i < a.Len(); i++ {
+				if a.IsNull(i) {
+					return nil, fmt.Errorf("null value in time column at row %d", len(out)+1)
+				}
+				micros, err := oneTimeValueToMicros(string(a.Value(i)), timeFormat)
 				if err != nil {
 					return nil, fmt.Errorf("row %d: %w", len(out)+1, err)
 				}
