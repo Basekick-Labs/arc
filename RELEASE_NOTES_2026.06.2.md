@@ -28,6 +28,12 @@ Performance: CSV imports now parse each numeric value once (the type-inference a
 
 Line Protocol and TLE imports are unchanged. CSV/Parquet imports no longer depend on the DuckDB sandbox's allowed-directories list.
 
+## Performance improvements
+
+**Compaction cleanup now uses batch-delete APIs on S3 and Azure.** `deleteOldFiles` previously called `StorageBackend.Delete` once per compacted source file — on large compaction cycles (hundreds of files), this produced hundreds of sequential S3/Azure API calls. Both cloud backends already implemented `DeleteBatch` (S3 `DeleteObjects`, Azure `BlobBatch`) but the compaction cleanup path never used it. The path now prefers `BatchDeleter.DeleteBatch`, falling back to per-file `Delete` if the backend does not support batching. This reduces S3 DELETE API calls by up to 1000× and Azure calls by up to 256× on large compactions, with a proportional drop in cleanup-phase latency. Local-storage deployments are unaffected (a per-file loop is the correct implementation for a local filesystem).
+
+Additionally, the Azure `DeleteBatch` implementation was rewritten to use the actual Azure SDK `BlobBatch` API (`container.Client.NewBatchBuilder()` + `SubmitBatch`) instead of a per-file loop, bringing it into parity with the S3 implementation.
+
 ## Upgrade notes
 
 1. **No configuration change required.** Drop in the new binary; existing `arc.toml` and license keys work as-is.
