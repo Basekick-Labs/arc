@@ -617,10 +617,11 @@ func (s *MetadataStore) CleanupOldMigrations(ctx context.Context, retentionDays 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays)
-
+	// Use SQLite's native datetime function to compute the cutoff in UTC,
+	// avoiding Go↔SQLite timezone/format discrepancies between Go's time.Time
+	// and the SQLite-stored started_at values.
 	result, err := s.db.ExecContext(ctx,
-		"DELETE FROM tier_migrations WHERE started_at < ?", cutoff)
+		"DELETE FROM tier_migrations WHERE started_at < datetime('now', '-' || ? || ' days')", retentionDays)
 	if err != nil {
 		return 0, fmt.Errorf("failed to cleanup old migrations: %w", err)
 	}
