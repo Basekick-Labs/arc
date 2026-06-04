@@ -613,9 +613,9 @@ func (s *MetadataStore) GetRecentMigrations(ctx context.Context, limit int) ([]M
 // so concurrent reads (e.g. GetTiersForMeasurement) are not blocked.
 //
 // Deletes are batched (1000 rows per transaction) to avoid holding the SQLite
-// write lock for extended periods, and PRAGMA incremental_vacuum is run after
-// each batch to reclaim freed pages (audit.go already sets auto_vacuum=INCREMENTAL
-// on this database).
+// write lock for extended periods. Vacuum is intentionally not run — freed
+// pages are immediately reused by subsequent INSERTs, and vacuum would cause
+// unnecessary write amplification.
 func (s *MetadataStore) CleanupOldMigrations(ctx context.Context, retentionDays int) (int64, error) {
 	if retentionDays <= 0 {
 		return 0, nil
