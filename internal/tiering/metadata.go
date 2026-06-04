@@ -81,6 +81,10 @@ func (s *MetadataStore) initSchema() error {
 
 	CREATE INDEX IF NOT EXISTS idx_tier_migrations_database ON tier_migrations(database);
 	CREATE INDEX IF NOT EXISTS idx_tier_migrations_started ON tier_migrations(started_at);
+	-- Expression index on the normalized timestamp so the one-time MAX(id)
+	-- cutoff lookup in CleanupOldMigrations is index-backed. The plain
+	-- started_at index cannot serve datetime(started_at) comparisons.
+	CREATE INDEX IF NOT EXISTS idx_tier_migrations_started_normalized ON tier_migrations(datetime(started_at));
 	`
 
 	_, err := s.db.Exec(schema)
@@ -618,10 +622,12 @@ func (s *MetadataStore) GetRecentMigrations(ctx context.Context, limit int) ([]M
 // Does not acquire the MetadataStore mutex — only uses the thread-safe s.db,
 // so concurrent reads (e.g. GetTiersForMeasurement) are not blocked.
 //
-// Deletes are batched (1000 rows per transaction) to avoid holding the SQLite
-// write lock for extended periods. Vacuum is intentionally not run — freed
-// pages are immediately reused by subsequent INSERTs, and vacuum would cause
-// unnecessary write amplification.
+// The cutoff is resolved to a single MAX(id) up front, then deletes are batched
+// (1000 rows per transaction) by primary key to avoid re-scanning on the
+// datetime(started_at) predicate every iteration and to keep the SQLite write
+// lock held only briefly. Vacuum is intentionally not run — freed pages are
+// immediately reused by subsequent INSERTs, and vacuum would cause unnecessary
+// write amplification.
 func (s *MetadataStore) CleanupOldMigrations(ctx context.Context, retentionDays int) (int64, error) {
 	if retentionDays <= 0 {
 		return 0, nil
@@ -634,6 +640,23 @@ func (s *MetadataStore) CleanupOldMigrations(ctx context.Context, retentionDays 
 	// the T > space ASCII comparison bug on mixed-format tables.
 	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays)
 
+	// Resolve the date predicate exactly once. RecordMigration sets started_at
+	// to time.Now().UTC() immediately before INSERT, so id (autoincrement) is
+	// monotonic with started_at — every row with id <= maxID has started_at
+	// <= the cutoff row's. That lets the batch loop below delete by primary
+	// key (id <= maxID) instead of re-evaluating datetime(started_at) on every
+	// iteration, which would force a full table scan per batch (the datetime()
+	// wrapper defeats the started_at index).
+	var maxID int64
+	if err := s.db.QueryRowContext(ctx,
+		"SELECT COALESCE(MAX(id), 0) FROM tier_migrations WHERE datetime(started_at) < datetime(?)",
+		cutoff).Scan(&maxID); err != nil {
+		return 0, fmt.Errorf("failed to find max migration id for cleanup: %w", err)
+	}
+	if maxID == 0 {
+		return 0, nil // No records older than the cutoff.
+	}
+
 	const batchSize = 1000
 	var totalDeleted int64
 
@@ -643,8 +666,8 @@ func (s *MetadataStore) CleanupOldMigrations(ctx context.Context, retentionDays 
 		}
 
 		result, err := s.db.ExecContext(ctx,
-			"DELETE FROM tier_migrations WHERE id IN (SELECT id FROM tier_migrations WHERE datetime(started_at) < datetime(?) ORDER BY id ASC LIMIT ?)",
-			cutoff, batchSize)
+			"DELETE FROM tier_migrations WHERE id IN (SELECT id FROM tier_migrations WHERE id <= ? ORDER BY id ASC LIMIT ?)",
+			maxID, batchSize)
 		if err != nil {
 			return totalDeleted, fmt.Errorf("failed to cleanup old migrations: %w", err)
 		}
@@ -657,16 +680,12 @@ func (s *MetadataStore) CleanupOldMigrations(ctx context.Context, retentionDays 
 			return totalDeleted, fmt.Errorf("failed to retrieve rows affected by migration cleanup: %w", err)
 		}
 
+		totalDeleted += deleted
+
 		if deleted < batchSize {
-			// Fewer rows than the limit means this is the last batch.
-			// No need for another round-trip.
-			if deleted > 0 {
-				totalDeleted += deleted
-			}
+			// Fewer rows than the limit means this was the last batch.
 			break
 		}
-
-		totalDeleted += deleted
 	}
 
 	// Note: we intentionally do not run PRAGMA incremental_vacuum here.

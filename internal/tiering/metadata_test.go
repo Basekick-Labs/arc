@@ -294,7 +294,11 @@ func TestMetadataStore_CleanupOldMigrations(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 
-	// Insert migration records with various ages
+	// Insert migration records with various ages. Order matters: in production
+	// RecordMigration stamps started_at = time.Now().UTC() immediately before
+	// INSERT, so id (autoincrement) is monotonic with started_at. The cleanup
+	// resolves the cutoff to MAX(id) once and deletes by id, which relies on
+	// that invariant — so the fixture inserts oldest-first to match.
 	migrations := []struct {
 		filePath  string
 		database  string
@@ -303,10 +307,10 @@ func TestMetadataStore_CleanupOldMigrations(t *testing.T) {
 		sizeBytes int64
 		startedAt time.Time
 	}{
-		{"recent.parquet", "db1", TierHot, TierCold, 100, now.Add(-1 * 24 * time.Hour)},
-		{"old.parquet", "db1", TierHot, TierCold, 200, now.Add(-31 * 24 * time.Hour)},
 		{"very_old.parquet", "db1", TierHot, TierCold, 300, now.Add(-100 * 24 * time.Hour)},
 		{"also_old.parquet", "db2", TierHot, TierCold, 400, now.Add(-60 * 24 * time.Hour)},
+		{"old.parquet", "db1", TierHot, TierCold, 200, now.Add(-31 * 24 * time.Hour)},
+		{"recent.parquet", "db1", TierHot, TierCold, 100, now.Add(-1 * 24 * time.Hour)},
 		{"just_now.parquet", "db2", TierHot, TierCold, 500, now},
 	}
 
