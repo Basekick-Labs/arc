@@ -150,6 +150,15 @@ func (t *BaseTier) GetBaseStats(tierName string) map[string]interface{} {
 	}
 }
 
+// RecordCompaction updates the tier's compaction metrics in a thread-safe manner.
+func (t *BaseTier) RecordCompaction(filesCompacted int, bytesSaved int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.totalCompactions++
+	t.totalFilesCompacted += filesCompacted
+	t.totalBytesSaved += bytesSaved
+}
+
 // ShouldCompactByFileSuffix determines if compaction is needed based on file classification.
 // This is a shared helper that implements the common compaction decision logic:
 //   - compactedSuffix: suffix for files already compacted at this tier (e.g., "_compacted.parquet")
