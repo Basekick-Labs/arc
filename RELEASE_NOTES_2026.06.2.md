@@ -28,6 +28,8 @@ Performance: CSV imports now parse each numeric value once (the type-inference a
 
 Line Protocol and TLE imports are unchanged. CSV/Parquet imports no longer depend on the DuckDB sandbox's allowed-directories list.
 
+**Compaction metric fields are no longer exported.** `Manager` (`TotalJobsCompleted`, `TotalJobsFailed`, `TotalFilesCompacted`, `TotalBytesSaved`, `TotalManifestsRecov`) and `BaseTier` (`TotalCompactions`, `TotalFilesCompacted`, `TotalBytesSaved`) previously had exported struct fields that could be read or written without going through the mutex-protected `Stats()` / `GetBaseStats()` accessors, creating a potential data race. The fields are now unexported; the `Stats()` and `GetBaseStats()` methods remain the sole access path and continue to hold the mutex.
+
 ## Performance improvements
 
 **Compaction cleanup now uses batch-delete APIs on S3 and Azure.** `deleteOldFiles` previously called `StorageBackend.Delete` once per compacted source file — on large compaction cycles (hundreds of files), this produced hundreds of sequential S3/Azure API calls. Both cloud backends already implemented `DeleteBatch` (S3 `DeleteObjects`, Azure `BlobBatch`) but the compaction cleanup path never used it. The path now prefers `BatchDeleter.DeleteBatch`, falling back to per-file `Delete` if the backend does not support batching. This reduces S3 DELETE API calls by up to 1000× and Azure calls by up to 256× on large compactions, with a proportional drop in cleanup-phase latency. Local-storage deployments are unaffected (a per-file loop is the correct implementation for a local filesystem).
