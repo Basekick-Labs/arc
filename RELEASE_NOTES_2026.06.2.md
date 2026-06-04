@@ -28,7 +28,7 @@ Performance: CSV imports now parse each numeric value once (the type-inference a
 
 Line Protocol and TLE imports are unchanged. CSV/Parquet imports no longer depend on the DuckDB sandbox's allowed-directories list.
 
-**Compaction metric fields are no longer exported.** `Manager` (`TotalJobsCompleted`, `TotalJobsFailed`, `TotalFilesCompacted`, `TotalBytesSaved`, `TotalManifestsRecov`) and `BaseTier` (`TotalCompactions`, `TotalFilesCompacted`, `TotalBytesSaved`) previously had exported struct fields that could be read or written without going through the mutex-protected `Stats()` / `GetBaseStats()` accessors, creating a potential data race. The fields are now unexported; the `Stats()` and `GetBaseStats()` methods remain the sole access path and continue to hold the mutex.
+**Compaction metric fields are no longer exported.** `Manager` (`TotalJobsCompleted`, `TotalJobsFailed`, `TotalFilesCompacted`, `TotalBytesSaved`, `TotalManifestsRecov`) and `BaseTier` (`TotalCompactions`, `TotalFilesCompacted`, `TotalBytesSaved`) previously had exported struct fields that could be read or written without going through the mutex-protected `Stats()` / `GetBaseStats()` accessors, creating a potential data race. The fields are now unexported; the `Stats()` and `GetBaseStats()` methods remain the sole access path and continue to hold the mutex. `BaseTier` also gains a thread-safe `RecordCompaction(filesCompacted int, bytesSaved int64)` helper for tier implementations to increment metrics under the lock.
 
 ## Performance improvements
 
