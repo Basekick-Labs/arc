@@ -609,13 +609,12 @@ func (s *MetadataStore) GetRecentMigrations(ctx context.Context, limit int) ([]M
 
 // CleanupOldMigrations deletes migration records older than retentionDays.
 // A retentionDays of 0 or less is a no-op (keep all records).
+// Does not acquire the MetadataStore mutex — only uses the thread-safe s.db,
+// so concurrent reads (e.g. GetTiersForMeasurement) are not blocked.
 func (s *MetadataStore) CleanupOldMigrations(ctx context.Context, retentionDays int) (int64, error) {
 	if retentionDays <= 0 {
 		return 0, nil
 	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	// Compute cutoff in Go as time.Time so both the stored started_at values
 	// and the cutoff go through the same go-sqlite3 driver serialization.
