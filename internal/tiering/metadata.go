@@ -627,11 +627,11 @@ func (s *MetadataStore) CleanupOldMigrations(ctx context.Context, retentionDays 
 		return 0, nil
 	}
 
-	// Compute cutoff in Go as time.Time so both the stored started_at values
-	// and the cutoff go through the same go-sqlite3 driver serialization.
-	// Using SQLite's datetime() would produce a space-separated format while
-	// go-sqlite3 stores time.Time as RFC3339 — the format mismatch would
-	// cause incorrect string comparisons (T > space in ASCII).
+	// Compute cutoff in Go as time.Time. Both sides use SQLite's datetime()
+	// wrapper to normalize format: Go time.Time is RFC3339 (T-separated),
+	// legacy records may use space-separated format from CURRENT_TIMESTAMP.
+	// datetime() accepts both and normalizes to space-separated, preventing
+	// the T > space ASCII comparison bug on mixed-format tables.
 	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays)
 
 	const batchSize = 1000
@@ -643,7 +643,7 @@ func (s *MetadataStore) CleanupOldMigrations(ctx context.Context, retentionDays 
 		}
 
 		result, err := s.db.ExecContext(ctx,
-			"DELETE FROM tier_migrations WHERE id IN (SELECT id FROM tier_migrations WHERE started_at < ? ORDER BY started_at ASC LIMIT ?)",
+			"DELETE FROM tier_migrations WHERE id IN (SELECT id FROM tier_migrations WHERE datetime(started_at) < datetime(?) ORDER BY started_at ASC LIMIT ?)",
 			cutoff, batchSize)
 		if err != nil {
 			return totalDeleted, fmt.Errorf("failed to cleanup old migrations: %w", err)
