@@ -10,7 +10,7 @@
 [![Discord](https://img.shields.io/badge/discord-join-7289da?logo=discord)](https://discord.gg/nxnWfUxsdm)
 [![GitHub](https://img.shields.io/github/stars/basekick-labs/arc?style=social)](https://github.com/basekick-labs/arc)
 
-High-performance columnar analytical database. 19M+ records/sec ingestion, 8M+ rows/sec queries. Built on DuckDB + Parquet + Arrow. Use for product analytics, observability, AI agents, IoT, logs, or data warehousing. Single binary. No vendor lock-in. AGPL-3.0
+High-performance columnar analytical database. 19M+ records/sec ingestion, 8M+ rows/sec queries. Ingestion, storage, compaction, SQL queries, retention policies, and continuous queries — in one binary. Open Parquet files on your storage. No vendor lock-in. AGPL-3.0.
 
 ---
 
@@ -21,6 +21,7 @@ Modern applications generate massive amounts of data that needs fast ingestion a
 * **Product Analytics**: Events, clickstreams, user behavior, A/B testing
 * **Observability**: Metrics, logs, traces from distributed systems
 * **AI Agent Memory**: Conversation history, context, RAG, embeddings
+* **Edge & Tactical**: Disconnected operations, tactical edge platforms, sensor telemetry, MQTT-native
 * **Industrial IoT**: Manufacturing telemetry, sensors, equipment monitoring
 * **Security & Compliance**: Audit logs, SIEM, security events
 * **Data Warehousing**: Analytics, BI, reporting on time-series or event data
@@ -33,6 +34,14 @@ Traditional solutions have problems:
 - **Overkill**: Need simple deployment, not Kubernetes orchestration
 
 **Arc solves this: 19M+ records/sec ingestion, 6M+ rows/sec queries, portable Parquet files you own, single binary deployment.**
+
+---
+
+## What Arc is (and isn't)
+
+Arc is a complete analytical database: ingestion pipeline, storage engine, compaction system, SQL query layer, retention policy manager, continuous query scheduler, and MQTT subscriber — in one binary. It uses DuckDB as its query engine the same way PostgreSQL uses its own, but Arc adds everything the query engine doesn't: high-throughput ingestion with automatic Parquet flushing, background compaction, scheduled compute, data lifecycle management, authentication, backup and restore, and enterprise clustering.
+
+Arc is **not a wrapper**. You don't bring your own ingestion, compaction, or retention policies. Arc provides the full stack.
 
 ```sql
 -- Product analytics: user events
@@ -74,7 +83,7 @@ ORDER BY created_at DESC
 LIMIT 100;
 ```
 
-**Standard DuckDB SQL. Window functions, CTEs, joins. No proprietary query language.**
+**Standard SQL. Window functions, CTEs, joins, aggregations. No proprietary query language.**
 
 ---
 
@@ -113,9 +122,9 @@ Benefits:
 
 ### Query (May 2026)
 
-Arc speaks three wire formats from the same query engine. **Arrow IPC** is the throughput leader for analytical clients (Grafana, pyarrow, polars) that can take an Arrow dependency — zero-copy from DuckDB's internal columnar buffers. **MessagePack** (experimental, columnar) is the choice for clients that don't speak Arrow but want smaller bytes and faster decode than JSON — same envelope shape as JSON, native binary types for timestamps and binary columns. **JSON** stays the default for ergonomic compatibility.
+Arc speaks three wire formats from the same query engine. **Arrow IPC** is the throughput leader for analytical clients (Grafana, pyarrow, polars) that can take an Arrow dependency — zero-copy from the engine's internal columnar buffers. **MessagePack** (experimental, columnar) is the choice for clients that don't speak Arrow but want smaller bytes and faster decode than JSON — same envelope shape as JSON, native binary types for timestamps and binary columns. **JSON** stays the default for ergonomic compatibility.
 
-Benchmark: 393.7M-row `cpu` measurement, 5 iterations per query, M3 Max, DuckDB 1.5.1. Latency is p50 in milliseconds. The five SELECT-LIMIT rows were measured back-to-back in the same session so the three columns are apples-to-apples; the DuckDB-bound rows (Time Bucket, Date Trunc, GROUP BY) are dominated by query execution and converge across wire formats.
+Benchmark: 393.7M-row `cpu` measurement, 5 iterations per query, M3 Max. Latency is p50 in milliseconds. The five SELECT-LIMIT rows were measured back-to-back in the same session so the three columns are apples-to-apples; the DuckDB-bound rows (Time Bucket, Date Trunc, GROUP BY) are dominated by query execution and converge across wire formats.
 
 | Query | JSON (ms) | MessagePack (ms) | Arrow IPC (ms) | msgpack vs JSON | Arrow vs JSON |
 |-------|----------:|-----------------:|---------------:|----------------:|--------------:|
@@ -142,12 +151,13 @@ The MessagePack endpoint is **experimental** (gated behind the `duckdb_arrow` bu
 
 ---
 
-## Why Go
+## Single binary. Zero dependencies.
 
-- **Stable memory**: Go's GC returns memory to OS. No leaks.
-- **Single binary**: Deploy one executable. No dependencies.
-- **Native concurrency**: Goroutines handle thousands of connections efficiently.
-- **Production GC**: Sub-millisecond pause times at scale.
+Arc deploys as one statically-linked executable. No JVM, no Python environment, no PostgreSQL cluster to manage, no ZooKeeper ensemble to babysit. Run it on a laptop, a factory edge box, a battlefield server, or a Kubernetes cluster. Same binary, same config surface.
+
+- **Air-gap ready**: No external services required at runtime. No license server, no cloud dependency.
+- **Edge to cloud**: Deploy at the tactical edge, in a sovereign cloud, or on-premises.
+- **Minimal footprint**: One process. Memory usage proportional to active workload, not fleet size.
 
 ---
 
@@ -243,18 +253,21 @@ go build -tags=duckdb_arrow ./cmd/arc
 ## Features
 
 ### Core Capabilities
-- **Columnar storage**: Parquet format with DuckDB query engine
-- **Multi-use-case**: Product analytics, observability, AI, IoT, logs, data warehousing
+- **Columnar storage**: Parquet format with full analytical SQL engine
+- **Multi-use-case**: Product analytics, observability, AI, IoT, edge and tactical, logs, data warehousing
 
-- **Ingestion**: MessagePack columnar (fastest), InfluxDB Line Protocol
-- **Query**: DuckDB SQL engine; JSON, columnar MessagePack (experimental), and Apache Arrow IPC responses
+- **Ingestion**: MessagePack columnar (fastest), InfluxDB Line Protocol, MQTT, TLE (satellite telemetry)
+- **Query**: Full analytical SQL; JSON, columnar MessagePack (experimental), and Apache Arrow IPC responses
+- **Compaction**: Tiered (hourly/daily) automatic Parquet file merging — 10x storage reduction
+- **Data Lifecycle**: Retention policies, continuous queries, tiered storage (hot/cold)
+- **Durability**: Optional write-ahead log (WAL), backup and restore
 - **Storage**: Local filesystem, S3, MinIO
 - **Auth**: Token-based authentication with in-memory caching
 - **Durability**: Optional write-ahead log (WAL)
-- **Compaction**: Tiered (hourly/daily) automatic file merging
-- **Data Management**: Retention policies, continuous queries, GDPR-compliant delete
+- **Data Management**: GDPR-compliant delete operations
 - **Observability**: Prometheus metrics, structured logging, graceful shutdown
 - **Reliability**: Circuit breakers, retry with exponential backoff
+- **Edge Sync** (coming 26.09.1): Spoke-to-hub data transport for disconnected operations
 
 ---
 
@@ -305,7 +318,7 @@ arc/
 │   ├── cluster/          # Raft consensus, node roles, WAL replication
 │   ├── compaction/       # Tiered hourly/daily Parquet file merging
 │   ├── config/           # TOML configuration with env var overrides
-│   ├── database/         # DuckDB connection pool
+│   ├── database/         # Query engine and connection management
 │   ├── governance/       # Per-token query quotas and rate limiting
 │   ├── ingest/           # MessagePack, Line Protocol, TLE, Arrow writer
 │   ├── license/          # License validation and feature gating
