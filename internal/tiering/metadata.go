@@ -643,7 +643,7 @@ func (s *MetadataStore) CleanupOldMigrations(ctx context.Context, retentionDays 
 		}
 
 		result, err := s.db.ExecContext(ctx,
-			"DELETE FROM tier_migrations WHERE id IN (SELECT id FROM tier_migrations WHERE datetime(started_at) < datetime(?) ORDER BY started_at ASC LIMIT ?)",
+			"DELETE FROM tier_migrations WHERE id IN (SELECT id FROM tier_migrations WHERE datetime(started_at) < datetime(?) ORDER BY id ASC LIMIT ?)",
 			cutoff, batchSize)
 		if err != nil {
 			return totalDeleted, fmt.Errorf("failed to cleanup old migrations: %w", err)
