@@ -258,6 +258,9 @@ type TieredStorageConfig struct {
 	// Single threshold: data older than this moves from hot to cold
 	DefaultHotMaxAgeDays int // Data older than this migrates to cold (default: 30)
 
+	// Migration history cleanup
+	MigrationHistoryRetentionDays int // How long to keep migration history (default: 90)
+
 	// Cold tier configuration (remote S3/Azure storage)
 	Cold ColdTierConfig
 }
@@ -718,11 +721,12 @@ func Load() (*Config, error) {
 			SharedStorageMode: v.GetBool("cluster.shared_storage_mode"),
 		},
 		TieredStorage: TieredStorageConfig{
-			Enabled:                v.GetBool("tiered_storage.enabled"),
-			MigrationSchedule:      v.GetString("tiered_storage.migration_schedule"),
-			MigrationMaxConcurrent: v.GetInt("tiered_storage.migration_max_concurrent"),
-			MigrationBatchSize:     v.GetInt("tiered_storage.migration_batch_size"),
-			DefaultHotMaxAgeDays:   v.GetInt("tiered_storage.default_hot_max_age_days"),
+			Enabled:                       v.GetBool("tiered_storage.enabled"),
+			MigrationSchedule:             v.GetString("tiered_storage.migration_schedule"),
+			MigrationMaxConcurrent:        v.GetInt("tiered_storage.migration_max_concurrent"),
+			MigrationBatchSize:            v.GetInt("tiered_storage.migration_batch_size"),
+			DefaultHotMaxAgeDays:          v.GetInt("tiered_storage.default_hot_max_age_days"),
+			MigrationHistoryRetentionDays: v.GetInt("tiered_storage.migration_history_retention_days"),
 			Cold: ColdTierConfig{
 				Enabled:                 v.GetBool("tiered_storage.cold.enabled"),
 				Backend:                 v.GetString("tiered_storage.cold.backend"),

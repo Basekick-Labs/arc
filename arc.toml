@@ -137,6 +137,7 @@ migration_schedule = "0 2 * * *"
 migration_max_concurrent = 4
 migration_batch_size = 100
 default_hot_max_age_days = 0
+migration_history_retention_days = 90
 
 [tiered_storage.cold]
 enabled = false

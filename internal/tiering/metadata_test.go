@@ -285,3 +285,129 @@ func TestMetadataStore_GetTierStats(t *testing.T) {
 		t.Errorf("Cold tier size = %d MB, want 5 MB", stats[TierCold].TotalSizeMB)
 	}
 }
+
+func TestMetadataStore_CleanupOldMigrations(t *testing.T) {
+	store, cleanup := setupTestMetadataStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Insert migration records with various ages
+	migrations := []struct {
+		filePath  string
+		database  string
+		fromTier  Tier
+		toTier    Tier
+		sizeBytes int64
+		startedAt time.Time
+	}{
+		{"recent.parquet", "db1", TierHot, TierCold, 100, now.Add(-1 * 24 * time.Hour)},
+		{"old.parquet", "db1", TierHot, TierCold, 200, now.Add(-31 * 24 * time.Hour)},
+		{"very_old.parquet", "db1", TierHot, TierCold, 300, now.Add(-100 * 24 * time.Hour)},
+		{"also_old.parquet", "db2", TierHot, TierCold, 400, now.Add(-60 * 24 * time.Hour)},
+		{"just_now.parquet", "db2", TierHot, TierCold, 500, now},
+	}
+
+	for _, m := range migrations {
+		record := &MigrationRecord{
+			FilePath:  m.filePath,
+			Database:  m.database,
+			FromTier:  m.fromTier,
+			ToTier:    m.toTier,
+			SizeBytes: m.sizeBytes,
+			StartedAt: m.startedAt,
+		}
+		_, err := store.RecordMigration(ctx, record)
+		if err != nil {
+			t.Fatalf("RecordMigration() error = %v", err)
+		}
+	}
+
+	// Cleanup migrations older than 30 days
+	deleted, err := store.CleanupOldMigrations(ctx, 30)
+	if err != nil {
+		t.Fatalf("CleanupOldMigrations() error = %v", err)
+	}
+
+	if deleted != 3 {
+		t.Errorf("CleanupOldMigrations(30d) deleted %d records, want 3 (old, very_old, also_old)", deleted)
+	}
+
+	// Verify remaining records (recent + just_now)
+	remaining, err := store.GetRecentMigrations(ctx, 100)
+	if err != nil {
+		t.Fatalf("GetRecentMigrations() error = %v", err)
+	}
+
+	if len(remaining) != 2 {
+		t.Errorf("After cleanup, %d records remain, want 2", len(remaining))
+	}
+
+	// Verify the remaining records are the expected ones
+	remainingPaths := make(map[string]bool)
+	for _, r := range remaining {
+		remainingPaths[r.FilePath] = true
+	}
+	if !remainingPaths["recent.parquet"] {
+		t.Error("recent.parquet should remain after cleanup")
+	}
+	if !remainingPaths["just_now.parquet"] {
+		t.Error("just_now.parquet should remain after cleanup")
+	}
+	if remainingPaths["old.parquet"] || remainingPaths["very_old.parquet"] || remainingPaths["also_old.parquet"] {
+		t.Error("old migration records should be cleaned up")
+	}
+}
+
+func TestMetadataStore_CleanupOldMigrations_NoRetention(t *testing.T) {
+	store, cleanup := setupTestMetadataStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Insert a migration record
+	record := &MigrationRecord{
+		FilePath:  "test.parquet",
+		Database:  "db1",
+		FromTier:  TierHot,
+		ToTier:    TierCold,
+		SizeBytes: 100,
+		StartedAt: now.Add(-200 * 24 * time.Hour),
+	}
+	_, err := store.RecordMigration(ctx, record)
+	if err != nil {
+		t.Fatalf("RecordMigration() error = %v", err)
+	}
+
+	// Zero retention days should be a no-op
+	deleted, err := store.CleanupOldMigrations(ctx, 0)
+	if err != nil {
+		t.Fatalf("CleanupOldMigrations(0) error = %v", err)
+	}
+
+	if deleted != 0 {
+		t.Errorf("CleanupOldMigrations(0) deleted %d records, want 0 (no-op)", deleted)
+	}
+
+	// Negative retention days should also be a no-op
+	deleted, err = store.CleanupOldMigrations(ctx, -1)
+	if err != nil {
+		t.Fatalf("CleanupOldMigrations(-1) error = %v", err)
+	}
+
+	if deleted != 0 {
+		t.Errorf("CleanupOldMigrations(-1) deleted %d records, want 0 (no-op)", deleted)
+	}
+
+	// Verify the record is still there
+	remaining, err := store.GetRecentMigrations(ctx, 10)
+	if err != nil {
+		t.Fatalf("GetRecentMigrations() error = %v", err)
+	}
+
+	if len(remaining) != 1 {
+		t.Errorf("After no-op cleanup, %d records remain, want 1", len(remaining))
+	}
+}

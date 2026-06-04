@@ -607,6 +607,35 @@ func (s *MetadataStore) GetRecentMigrations(ctx context.Context, limit int) ([]M
 	return records, nil
 }
 
+// CleanupOldMigrations deletes migration records older than retentionDays.
+// A retentionDays of 0 or less is a no-op (keep all records).
+func (s *MetadataStore) CleanupOldMigrations(ctx context.Context, retentionDays int) (int64, error) {
+	if retentionDays <= 0 {
+		return 0, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays)
+
+	result, err := s.db.ExecContext(ctx,
+		"DELETE FROM tier_migrations WHERE started_at < ?", cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("failed to cleanup old migrations: %w", err)
+	}
+
+	deleted, _ := result.RowsAffected()
+	if deleted > 0 {
+		s.logger.Info().
+			Int64("deleted", deleted).
+			Int("retention_days", retentionDays).
+			Msg("Cleaned up old migration records")
+	}
+
+	return deleted, nil
+}
+
 // helper functions
 
 func (s *MetadataStore) scanFile(row *sql.Row) (*FileMetadata, error) {
