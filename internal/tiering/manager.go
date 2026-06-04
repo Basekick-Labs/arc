@@ -227,12 +227,46 @@ func (m *Manager) RunMigrationCycle(ctx context.Context) error {
 			Msg("Orphaned hot file reconciliation completed")
 	}
 
+	// Cleanup old migration history records
+	if err := m.cleanupOldMigrations(ctx); err != nil {
+		m.logger.Warn().Err(err).Msg("Migration history cleanup failed")
+	}
+
 	duration := time.Since(startTime)
 	m.logger.Info().
 		Int("migrated", totalMigrated).
 		Int("errors", totalErrors).
 		Dur("duration", duration).
 		Msg("Migration cycle completed")
+
+	return nil
+}
+
+// cleanupOldMigrations deletes migration history records older than the configured retention.
+//
+// This layer owns retention *policy*: a value of 0 (unset) defaults to 90 days,
+// and a negative value explicitly disables cleanup. MetadataStore.CleanupOldMigrations
+// applies its own <= 0 guard as a defensive contract, but by the time we call it here
+// retentionDays is always > 0.
+func (m *Manager) cleanupOldMigrations(ctx context.Context) error {
+	retentionDays := m.config.MigrationHistoryRetentionDays
+	if retentionDays == 0 {
+		retentionDays = 90 // Default: keep 90 days of migration history
+	} else if retentionDays < 0 {
+		return nil // Negative value explicitly disables cleanup
+	}
+
+	deleted, err := m.metadata.CleanupOldMigrations(ctx, retentionDays)
+	if err != nil {
+		return err
+	}
+
+	if deleted > 0 {
+		m.logger.Debug().
+			Int64("deleted", deleted).
+			Int("retention_days", retentionDays).
+			Msg("Migration history cleanup completed")
+	}
 
 	return nil
 }
