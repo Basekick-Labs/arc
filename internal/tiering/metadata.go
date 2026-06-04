@@ -625,7 +625,10 @@ func (s *MetadataStore) CleanupOldMigrations(ctx context.Context, retentionDays 
 		return 0, fmt.Errorf("failed to cleanup old migrations: %w", err)
 	}
 
-	deleted, _ := result.RowsAffected()
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		s.logger.Warn().Err(err).Msg("Failed to retrieve rows affected by migration cleanup")
+	}
 	if deleted > 0 {
 		s.logger.Info().
 			Int64("deleted", deleted).
