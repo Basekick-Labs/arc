@@ -617,11 +617,15 @@ func (s *MetadataStore) CleanupOldMigrations(ctx context.Context, retentionDays 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Use SQLite's native datetime function to compute the cutoff in UTC,
-	// avoiding Go↔SQLite timezone/format discrepancies between Go's time.Time
-	// and the SQLite-stored started_at values.
+	// Compute cutoff in Go as time.Time so both the stored started_at values
+	// and the cutoff go through the same go-sqlite3 driver serialization.
+	// Using SQLite's datetime() would produce a space-separated format while
+	// go-sqlite3 stores time.Time as RFC3339 — the format mismatch would
+	// cause incorrect string comparisons (T > space in ASCII).
+	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays)
+
 	result, err := s.db.ExecContext(ctx,
-		"DELETE FROM tier_migrations WHERE started_at < datetime('now', '-' || ? || ' days')", retentionDays)
+		"DELETE FROM tier_migrations WHERE started_at < ?", cutoff)
 	if err != nil {
 		return 0, fmt.Errorf("failed to cleanup old migrations: %w", err)
 	}
