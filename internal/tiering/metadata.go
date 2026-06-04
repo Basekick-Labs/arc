@@ -654,8 +654,12 @@ func (s *MetadataStore) CleanupOldMigrations(ctx context.Context, retentionDays 
 		}
 
 		totalDeleted += deleted
+	}
 
-		// Reclaim disk space freed by this batch (audit module sets auto_vacuum=INCREMENTAL).
+	// Reclaim disk space freed by the cleanup (audit module sets auto_vacuum=INCREMENTAL).
+	// Run once after all batches, not inside the loop — incremental_vacuum reorganises
+	// the file and doing it per-batch causes unnecessary write amplification.
+	if totalDeleted > 0 {
 		if _, err := s.db.ExecContext(ctx, "PRAGMA incremental_vacuum"); err != nil {
 			s.logger.Warn().Err(err).Msg("Failed to run incremental vacuum after migration cleanup")
 		}
