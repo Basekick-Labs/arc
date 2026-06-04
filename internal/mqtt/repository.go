@@ -198,7 +198,7 @@ func (r *Repository) Create(ctx context.Context, sub *Subscription) error {
 
 	if err != nil {
 		if isUniqueConstraintError(err) {
-			return fmt.Errorf("subscription with name '%s' already exists", sub.Name)
+			return fmt.Errorf("%w: subscription with name '%s' already exists", ErrSubscriptionUniqueConstraint, sub.Name)
 		}
 		return fmt.Errorf("failed to create subscription: %w", err)
 	}
@@ -356,7 +356,7 @@ func (r *Repository) Update(ctx context.Context, sub *Subscription) error {
 
 	if err != nil {
 		if isUniqueConstraintError(err) {
-			return fmt.Errorf("subscription with name '%s' already exists", sub.Name)
+			return fmt.Errorf("%w: subscription with name '%s' already exists", ErrSubscriptionUniqueConstraint, sub.Name)
 		}
 		return fmt.Errorf("failed to update subscription: %w", err)
 	}
@@ -536,8 +536,16 @@ func nullableString(b []byte) sql.NullString {
 }
 
 func isUniqueConstraintError(err error) bool {
-	return err != nil && (errors.Is(err, sql.ErrNoRows) ||
-		// SQLite unique constraint error
-		(err.Error() != "" && (strings.Contains(err.Error(), "UNIQUE constraint failed") ||
-			strings.Contains(err.Error(), "unique constraint"))))
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrSubscriptionUniqueConstraint) {
+		return true
+	}
+	// SQLite driver returns unique constraint errors as strings.
+	if strings.Contains(err.Error(), "UNIQUE constraint failed") ||
+		strings.Contains(err.Error(), "unique constraint") {
+		return true
+	}
+	return false
 }

@@ -29,6 +29,15 @@ const (
 	StatusPaused  SubscriptionStatus = "paused"
 )
 
+// Sentinel errors for subscription lifecycle operations.
+// Callers should use errors.Is rather than comparing error strings.
+var (
+	ErrSubscriptionAlreadyRunning    = errors.New("subscription already running")
+	ErrSubscriptionNotRunning        = errors.New("subscription not running")
+	ErrSubscriptionRunningCantUpdate = errors.New("cannot update running subscription - stop it first")
+	ErrSubscriptionUniqueConstraint  = errors.New("subscription name already exists")
+)
+
 // Subscription represents an MQTT subscription configuration
 type Subscription struct {
 	ID                    string             `json:"id"`
