@@ -370,6 +370,10 @@ func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 	var continuationToken *string
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket:            aws.String(b.bucket),
 			Prefix:            aws.String(b.prefixedKey(prefix)),
@@ -672,6 +676,10 @@ func (b *S3Backend) ListDirectories(ctx context.Context, prefix string) ([]strin
 	var continuationToken *string
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket:            aws.String(b.bucket),
 			Prefix:            aws.String(fullPrefix),
@@ -711,6 +719,10 @@ func (b *S3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInf
 	var continuationToken *string
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket:            aws.String(b.bucket),
 			Prefix:            aws.String(b.prefixedKey(prefix)),
