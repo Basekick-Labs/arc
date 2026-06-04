@@ -53,11 +53,11 @@ type Manager struct {
 	cycleID      atomic.Int64
 
 	// Metrics
-	TotalJobsCompleted  int
-	TotalJobsFailed     int
-	TotalFilesCompacted int
-	TotalBytesSaved     int64
-	TotalManifestsRecov int // Number of manifests recovered
+	totalJobsCompleted  int
+	totalJobsFailed     int
+	totalFilesCompacted int
+	totalBytesSaved     int64
+	totalManifestsRecov int // Number of manifests recovered
 
 	// Callback invoked after a successful compaction job (in parent process).
 	// Used to invalidate DuckDB and query caches after files are deleted.
@@ -293,11 +293,11 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 
 	m.mu.Lock()
 	if shouldInvalidateCache {
-		m.TotalJobsCompleted++
-		m.TotalFilesCompacted += result.FilesCompacted
-		m.TotalBytesSaved += (result.BytesBefore - result.BytesAfter)
+		m.totalJobsCompleted++
+		m.totalFilesCompacted += result.FilesCompacted
+		m.totalBytesSaved += (result.BytesBefore - result.BytesAfter)
 	} else {
-		m.TotalJobsFailed++
+		m.totalJobsFailed++
 	}
 
 	// Build job stats for history
@@ -534,7 +534,7 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 		}
 		if recovered > 0 {
 			m.mu.Lock()
-			m.TotalManifestsRecov += recovered
+			m.totalManifestsRecov += recovered
 			m.mu.Unlock()
 			m.logger.Info().Int("recovered", recovered).Msg("Recovered orphaned compaction manifests")
 		}
@@ -897,12 +897,12 @@ func (m *Manager) Stats() map[string]interface{} {
 	defer m.mu.Unlock()
 
 	stats := map[string]interface{}{
-		"total_jobs_completed":    m.TotalJobsCompleted,
-		"total_jobs_failed":       m.TotalJobsFailed,
-		"total_files_compacted":   m.TotalFilesCompacted,
-		"total_bytes_saved":       m.TotalBytesSaved,
-		"total_bytes_saved_mb":    float64(m.TotalBytesSaved) / 1024 / 1024,
-		"total_manifests_recover": m.TotalManifestsRecov,
+		"total_jobs_completed":    m.totalJobsCompleted,
+		"total_jobs_failed":       m.totalJobsFailed,
+		"total_files_compacted":   m.totalFilesCompacted,
+		"total_bytes_saved":       m.totalBytesSaved,
+		"total_bytes_saved_mb":    float64(m.totalBytesSaved) / 1024 / 1024,
+		"total_manifests_recover": m.totalManifestsRecov,
 		"cycle_running":           m.cycleRunning.Load(),
 		"current_cycle_id":        m.cycleID.Load(),
 	}
