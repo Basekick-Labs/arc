@@ -219,7 +219,7 @@ func (m *SubscriptionManager) Update(ctx context.Context, id string, req *Update
 	m.mu.RUnlock()
 
 	if isRunning {
-		return nil, fmt.Errorf("cannot update running subscription - stop it first")
+		return nil, ErrSubscriptionRunningCantUpdate
 	}
 
 	// Apply updates
@@ -343,7 +343,7 @@ func (m *SubscriptionManager) StartSubscription(ctx context.Context, id string) 
 	m.mu.Lock()
 	if _, ok := m.subscribers[id]; ok {
 		m.mu.Unlock()
-		return fmt.Errorf("subscription already running")
+		return ErrSubscriptionAlreadyRunning
 	}
 	m.subscribers[id] = nil // placeholder — slot is reserved
 	m.mu.Unlock()
@@ -366,7 +366,7 @@ func (m *SubscriptionManager) StopSubscription(ctx context.Context, id string) e
 	subscriber, ok := m.subscribers[id]
 	if !ok || subscriber == nil {
 		m.mu.Unlock()
-		return fmt.Errorf("subscription not running")
+		return ErrSubscriptionNotRunning
 	}
 	delete(m.subscribers, id)
 	m.mu.Unlock()
@@ -387,7 +387,7 @@ func (m *SubscriptionManager) PauseSubscription(ctx context.Context, id string) 
 	subscriber, ok := m.subscribers[id]
 	if !ok || subscriber == nil {
 		m.mu.Unlock()
-		return fmt.Errorf("subscription not running")
+		return ErrSubscriptionNotRunning
 	}
 	delete(m.subscribers, id)
 	m.mu.Unlock()

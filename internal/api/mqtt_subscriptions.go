@@ -1,6 +1,8 @@
 package api
 
 import (
+	"errors"
+
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 
@@ -161,7 +163,7 @@ func (h *MQTTSubscriptionHandler) handleUpdate(c *fiber.Ctx) error {
 		h.logger.Error().Err(err).Str("id", id).Msg("Failed to update subscription")
 
 		// Check for specific errors
-		if err.Error() == "cannot update running subscription - stop it first" {
+		if errors.Is(err, mqtt.ErrSubscriptionRunningCantUpdate) {
 			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
 				"success": false,
 				"error":   err.Error(),
@@ -209,7 +211,7 @@ func (h *MQTTSubscriptionHandler) handleStart(c *fiber.Ctx) error {
 	if err := h.manager.StartSubscription(c.Context(), id); err != nil {
 		h.logger.Error().Err(err).Str("id", id).Msg("Failed to start subscription")
 
-		if err.Error() == "subscription already running" {
+		if errors.Is(err, mqtt.ErrSubscriptionAlreadyRunning) {
 			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
 				"success": false,
 				"error":   err.Error(),
@@ -237,7 +239,7 @@ func (h *MQTTSubscriptionHandler) handleStop(c *fiber.Ctx) error {
 	if err := h.manager.StopSubscription(c.Context(), id); err != nil {
 		h.logger.Error().Err(err).Str("id", id).Msg("Failed to stop subscription")
 
-		if err.Error() == "subscription not running" {
+		if errors.Is(err, mqtt.ErrSubscriptionNotRunning) {
 			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
 				"success": false,
 				"error":   err.Error(),
@@ -265,7 +267,7 @@ func (h *MQTTSubscriptionHandler) handlePause(c *fiber.Ctx) error {
 	if err := h.manager.PauseSubscription(c.Context(), id); err != nil {
 		h.logger.Error().Err(err).Str("id", id).Msg("Failed to pause subscription")
 
-		if err.Error() == "subscription not running" {
+		if errors.Is(err, mqtt.ErrSubscriptionNotRunning) {
 			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
 				"success": false,
 				"error":   err.Error(),
