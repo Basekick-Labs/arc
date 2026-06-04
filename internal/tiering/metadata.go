@@ -649,7 +649,12 @@ func (s *MetadataStore) CleanupOldMigrations(ctx context.Context, retentionDays 
 			break
 		}
 
-		if deleted == 0 {
+		if deleted < batchSize {
+			// Fewer rows than the limit means this is the last batch.
+			// No need for another round-trip.
+			if deleted > 0 {
+				totalDeleted += deleted
+			}
 			break
 		}
 
