@@ -429,13 +429,19 @@ func (s *MetadataStore) CompleteMigration(ctx context.Context, migrationID int64
 		errorMsg = &msg
 	}
 
+	// Use Go time.Time (not SQLite CURRENT_TIMESTAMP) so completed_at uses
+	// the same RFC3339 format as started_at (stored by RecordMigration).
+	// Mixing CURRENT_TIMESTAMP (space-separated) with Go time.Time (RFC3339)
+	// causes incorrect string comparisons (T > space in ASCII).
+	now := time.Now().UTC()
+
 	query := `
 		UPDATE tier_migrations
-		SET completed_at = CURRENT_TIMESTAMP, error = ?
+		SET completed_at = ?, error = ?
 		WHERE id = ?
 	`
 
-	_, execErr := s.db.ExecContext(ctx, query, errorMsg, migrationID)
+	_, execErr := s.db.ExecContext(ctx, query, now, errorMsg, migrationID)
 	if execErr != nil {
 		return fmt.Errorf("failed to complete migration: %w", execErr)
 	}
