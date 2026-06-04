@@ -1018,11 +1018,12 @@ func setDefaults(v *viper.Viper) {
 
 	// Tiered storage defaults (Enterprise feature)
 	// Simple 2-tier system: Hot (local) -> Cold (S3/Azure archive)
-	v.SetDefault("tiered_storage.enabled", false)                  // Disabled by default
-	v.SetDefault("tiered_storage.migration_schedule", "0 2 * * *") // 2am daily
-	v.SetDefault("tiered_storage.migration_max_concurrent", 4)     // 4 concurrent migrations
-	v.SetDefault("tiered_storage.migration_batch_size", 100)       // 100 files per batch
-	v.SetDefault("tiered_storage.default_hot_max_age_days", 30)    // 30 days in hot tier before archiving
+	v.SetDefault("tiered_storage.enabled", false)                       // Disabled by default
+	v.SetDefault("tiered_storage.migration_schedule", "0 2 * * *")      // 2am daily
+	v.SetDefault("tiered_storage.migration_max_concurrent", 4)          // 4 concurrent migrations
+	v.SetDefault("tiered_storage.migration_batch_size", 100)            // 100 files per batch
+	v.SetDefault("tiered_storage.default_hot_max_age_days", 30)         // 30 days in hot tier before archiving
+	v.SetDefault("tiered_storage.migration_history_retention_days", 90) // 90 days migration history
 
 	// Cold tier defaults (S3/Azure archive storage)
 	v.SetDefault("tiered_storage.cold.enabled", false)              // Disabled by default
