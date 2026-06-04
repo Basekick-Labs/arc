@@ -539,14 +539,10 @@ func isUniqueConstraintError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, sql.ErrNoRows) {
-		return true
-	}
 	if errors.Is(err, ErrSubscriptionUniqueConstraint) {
 		return true
 	}
 	// SQLite driver returns unique constraint errors as strings.
-	// Wrap them so callers can use errors.Is.
 	if strings.Contains(err.Error(), "UNIQUE constraint failed") ||
 		strings.Contains(err.Error(), "unique constraint") {
 		return true

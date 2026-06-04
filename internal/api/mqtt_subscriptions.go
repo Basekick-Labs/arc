@@ -95,6 +95,14 @@ func (h *MQTTSubscriptionHandler) handleCreate(c *fiber.Ctx) error {
 	sub, err := h.manager.Create(c.Context(), &req, body.Password)
 	if err != nil {
 		h.logger.Error().Err(err).Str("name", req.Name).Msg("Failed to create subscription")
+
+		if errors.Is(err, mqtt.ErrSubscriptionUniqueConstraint) {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"success": false,
+				"error":   err.Error(),
+			})
+		}
+
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
 			"error":   "Failed to create subscription",
