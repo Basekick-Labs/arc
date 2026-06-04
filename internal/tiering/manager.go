@@ -243,7 +243,11 @@ func (m *Manager) RunMigrationCycle(ctx context.Context) error {
 }
 
 // cleanupOldMigrations deletes migration history records older than the configured retention.
-// A value of 0 (unset) defaults to 90 days. A negative value explicitly disables cleanup.
+//
+// This layer owns retention *policy*: a value of 0 (unset) defaults to 90 days,
+// and a negative value explicitly disables cleanup. MetadataStore.CleanupOldMigrations
+// applies its own <= 0 guard as a defensive contract, but by the time we call it here
+// retentionDays is always > 0.
 func (m *Manager) cleanupOldMigrations(ctx context.Context) error {
 	retentionDays := m.config.MigrationHistoryRetentionDays
 	if retentionDays == 0 {

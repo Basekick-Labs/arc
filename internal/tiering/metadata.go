@@ -651,8 +651,10 @@ func (s *MetadataStore) CleanupOldMigrations(ctx context.Context, retentionDays 
 
 		deleted, err := result.RowsAffected()
 		if err != nil {
-			s.logger.Warn().Err(err).Msg("Failed to retrieve rows affected by migration cleanup")
-			break
+			// The rows for this batch were already deleted; we just can't read
+			// the count. Surface the error (the caller logs it) rather than
+			// silently breaking with an under-reported total.
+			return totalDeleted, fmt.Errorf("failed to retrieve rows affected by migration cleanup: %w", err)
 		}
 
 		if deleted < batchSize {
