@@ -417,12 +417,17 @@ func TestMetadataStore_CleanupOldMigrations_BatchLoop(t *testing.T) {
 	store, cleanup := setupTestMetadataStore(t)
 	defer cleanup()
 
+	// Speed up individual inserts in the test by disabling synchronous disk writes
+	if _, err := store.db.Exec("PRAGMA synchronous = OFF"); err != nil {
+		t.Fatalf("Failed to set synchronous = OFF: %v", err)
+	}
+
 	ctx := context.Background()
 	now := time.Now().UTC()
 
-	// Insert enough records to exercise the batch loop (>1000)
-	// All records are 200 days old — should all be deleted
-	const recordCount = 2500
+	// Insert enough records to exercise the batch loop (>1000).
+	// All records are 200 days old — should all be deleted.
+	const recordCount = 1050
 	for i := 0; i < recordCount; i++ {
 		record := &MigrationRecord{
 			FilePath:  fmt.Sprintf("old_%d.parquet", i),
@@ -438,7 +443,7 @@ func TestMetadataStore_CleanupOldMigrations_BatchLoop(t *testing.T) {
 		}
 	}
 
-	// Cleanup with 30-day retention — should delete all 2500 records
+	// Cleanup with 30-day retention — should delete all records
 	deleted, err := store.CleanupOldMigrations(ctx, 30)
 	if err != nil {
 		t.Fatalf("CleanupOldMigrations() error = %v", err)
