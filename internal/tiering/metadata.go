@@ -637,7 +637,7 @@ func (s *MetadataStore) CleanupOldMigrations(ctx context.Context, retentionDays 
 		}
 
 		result, err := s.db.ExecContext(ctx,
-			"DELETE FROM tier_migrations WHERE id IN (SELECT id FROM tier_migrations WHERE started_at < ? LIMIT ?)",
+			"DELETE FROM tier_migrations WHERE id IN (SELECT id FROM tier_migrations WHERE started_at < ? ORDER BY started_at ASC LIMIT ?)",
 			cutoff, batchSize)
 		if err != nil {
 			return totalDeleted, fmt.Errorf("failed to cleanup old migrations: %w", err)
@@ -656,14 +656,12 @@ func (s *MetadataStore) CleanupOldMigrations(ctx context.Context, retentionDays 
 		totalDeleted += deleted
 	}
 
-	// Reclaim disk space freed by the cleanup (audit module sets auto_vacuum=INCREMENTAL).
-	// Run once after all batches, not inside the loop — incremental_vacuum reorganises
-	// the file and doing it per-batch causes unnecessary write amplification.
-	if totalDeleted > 0 {
-		if _, err := s.db.ExecContext(ctx, "PRAGMA incremental_vacuum"); err != nil {
-			s.logger.Warn().Err(err).Msg("Failed to run incremental vacuum after migration cleanup")
-		}
-	}
+	// Note: we intentionally do not run PRAGMA incremental_vacuum here.
+	// tier_migrations is continuously written during normal operations;
+	// freed pages are immediately reused by subsequent INSERTs. Vacuuming
+	// would shrink the file only for it to re-grow on the next cycle,
+	// causing unnecessary write amplification. The key fix for #342 is
+	// the DELETE itself — that stops unbounded growth.
 
 	return totalDeleted, nil
 }
