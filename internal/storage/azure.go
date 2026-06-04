@@ -277,6 +277,10 @@ func (b *AzureBlobBackend) List(ctx context.Context, prefix string) ([]string, e
 	})
 
 	for pager.More() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		page, err := pager.NextPage(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to list Azure blobs: %w", err)
@@ -448,6 +452,10 @@ func (b *AzureBlobBackend) ListDirectories(ctx context.Context, prefix string) (
 	})
 
 	for pager.More() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		page, err := pager.NextPage(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to list Azure directories: %w", err)
@@ -481,6 +489,10 @@ func (b *AzureBlobBackend) ListObjects(ctx context.Context, prefix string) ([]Ob
 	})
 
 	for pager.More() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		page, err := pager.NextPage(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to list Azure blobs: %w", err)
