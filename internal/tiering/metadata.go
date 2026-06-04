@@ -611,6 +611,11 @@ func (s *MetadataStore) GetRecentMigrations(ctx context.Context, limit int) ([]M
 // A retentionDays of 0 or less is a no-op (keep all records).
 // Does not acquire the MetadataStore mutex — only uses the thread-safe s.db,
 // so concurrent reads (e.g. GetTiersForMeasurement) are not blocked.
+//
+// Deletes are batched (1000 rows per transaction) to avoid holding the SQLite
+// write lock for extended periods, and PRAGMA incremental_vacuum is run after
+// each batch to reclaim freed pages (audit.go already sets auto_vacuum=INCREMENTAL
+// on this database).
 func (s *MetadataStore) CleanupOldMigrations(ctx context.Context, retentionDays int) (int64, error) {
 	if retentionDays <= 0 {
 		return 0, nil
@@ -623,18 +628,40 @@ func (s *MetadataStore) CleanupOldMigrations(ctx context.Context, retentionDays 
 	// cause incorrect string comparisons (T > space in ASCII).
 	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays)
 
-	result, err := s.db.ExecContext(ctx,
-		"DELETE FROM tier_migrations WHERE started_at < ?", cutoff)
-	if err != nil {
-		return 0, fmt.Errorf("failed to cleanup old migrations: %w", err)
+	const batchSize = 1000
+	var totalDeleted int64
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return totalDeleted, err
+		}
+
+		result, err := s.db.ExecContext(ctx,
+			"DELETE FROM tier_migrations WHERE id IN (SELECT id FROM tier_migrations WHERE started_at < ? LIMIT ?)",
+			cutoff, batchSize)
+		if err != nil {
+			return totalDeleted, fmt.Errorf("failed to cleanup old migrations: %w", err)
+		}
+
+		deleted, err := result.RowsAffected()
+		if err != nil {
+			s.logger.Warn().Err(err).Msg("Failed to retrieve rows affected by migration cleanup")
+			break
+		}
+
+		if deleted == 0 {
+			break
+		}
+
+		totalDeleted += deleted
+
+		// Reclaim disk space freed by this batch (audit module sets auto_vacuum=INCREMENTAL).
+		if _, err := s.db.ExecContext(ctx, "PRAGMA incremental_vacuum"); err != nil {
+			s.logger.Warn().Err(err).Msg("Failed to run incremental vacuum after migration cleanup")
+		}
 	}
 
-	deleted, err := result.RowsAffected()
-	if err != nil {
-		s.logger.Warn().Err(err).Msg("Failed to retrieve rows affected by migration cleanup")
-	}
-
-	return deleted, nil
+	return totalDeleted, nil
 }
 
 // helper functions

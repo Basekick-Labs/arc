@@ -3,6 +3,7 @@ package tiering
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -409,5 +410,50 @@ func TestMetadataStore_CleanupOldMigrations_NoRetention(t *testing.T) {
 
 	if len(remaining) != 1 {
 		t.Errorf("After no-op cleanup, %d records remain, want 1", len(remaining))
+	}
+}
+
+func TestMetadataStore_CleanupOldMigrations_BatchLoop(t *testing.T) {
+	store, cleanup := setupTestMetadataStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Insert enough records to exercise the batch loop (>1000)
+	// All records are 200 days old — should all be deleted
+	const recordCount = 2500
+	for i := 0; i < recordCount; i++ {
+		record := &MigrationRecord{
+			FilePath:  fmt.Sprintf("old_%d.parquet", i),
+			Database:  "testdb",
+			FromTier:  TierHot,
+			ToTier:    TierCold,
+			SizeBytes: 100,
+			StartedAt: now.Add(-200 * 24 * time.Hour),
+		}
+		_, err := store.RecordMigration(ctx, record)
+		if err != nil {
+			t.Fatalf("RecordMigration(%d) error = %v", i, err)
+		}
+	}
+
+	// Cleanup with 30-day retention — should delete all 2500 records
+	deleted, err := store.CleanupOldMigrations(ctx, 30)
+	if err != nil {
+		t.Fatalf("CleanupOldMigrations() error = %v", err)
+	}
+
+	if deleted != recordCount {
+		t.Errorf("CleanupOldMigrations deleted %d records, want %d", deleted, recordCount)
+	}
+
+	// Verify nothing remains
+	remaining, err := store.GetRecentMigrations(ctx, 1)
+	if err != nil {
+		t.Fatalf("GetRecentMigrations() error = %v", err)
+	}
+	if len(remaining) != 0 {
+		t.Errorf("After full cleanup, %d records remain, want 0", len(remaining))
 	}
 }
