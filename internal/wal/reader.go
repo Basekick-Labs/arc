@@ -58,8 +58,11 @@ func (r *Reader) ReadAll() ([]Entry, error) {
 	// Read and verify header
 	header := make([]byte, WALFileHeaderSize)
 	if _, err := io.ReadFull(f, header); err != nil {
-		r.logger.Warn().Str("file", r.filePath).Msg("WAL file too short")
-		return entries, nil
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			r.logger.Warn().Str("file", r.filePath).Msg("WAL file too short")
+			return entries, nil
+		}
+		return nil, fmt.Errorf("failed to read WAL file header: %w", err)
 	}
 
 	// Verify magic bytes
@@ -107,7 +110,7 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 	// Read entry header
 	header := make([]byte, WALEntryHeaderSize)
 	if _, err := io.ReadFull(f, header); err != nil {
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
+		if err == io.EOF {
 			return nil, io.EOF
 		}
 		return nil, fmt.Errorf("failed to read entry header: %w", err)
