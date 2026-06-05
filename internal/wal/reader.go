@@ -110,7 +110,11 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 	// Read entry header
 	var header [WALEntryHeaderSize]byte
 	if _, err := io.ReadFull(f, header[:]); err != nil {
-		if err == io.EOF {
+		// io.EOF: 0 bytes read at clean end of WAL file.
+		// io.ErrUnexpectedEOF: 1-15 bytes read then EOF (crash during write,
+		// truncated entry header). Must stop here — the file offset is
+		// mid-header; continuing would cascade misaligned reads.
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			return nil, io.EOF
 		}
 		return nil, fmt.Errorf("failed to read entry header: %w", err)
