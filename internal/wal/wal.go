@@ -303,9 +303,35 @@ func (w *Writer) writeEntry(entry walEntry) {
 	}
 }
 
-// rotate creates a new WAL file
+// rotate creates a new WAL file.
+// The new file is opened and its header written BEFORE the old file is closed,
+// so a failure to create or initialize the new file leaves the old file intact
+// (no nil w.currentFile that would panic on the next write).
 func (w *Writer) rotate() error {
-	// Close current file (sync any pending data first)
+	// Generate new filename
+	timestamp := time.Now().UTC().Format("20060102_150405.000000000")
+	filename := fmt.Sprintf("arc-%s.wal", timestamp)
+	newPath := filepath.Join(w.config.WALDir, filename)
+
+	// Open new file first — if this fails, old file is still valid
+	newFile, err := os.OpenFile(newPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
+	if err != nil {
+		return fmt.Errorf("failed to create WAL file: %w", err)
+	}
+
+	// Write WAL header to new file
+	var header [WALFileHeaderSize]byte
+	copy(header[0:4], WALMagic)
+	binary.BigEndian.PutUint16(header[4:6], WALVersion)
+	header[6] = WALChecksumCRC32
+
+	n, err := newFile.Write(header[:])
+	if err != nil {
+		newFile.Close()
+		return fmt.Errorf("failed to write WAL header: %w", err)
+	}
+
+	// New file is ready — now close the old one (sync any pending data first)
 	if w.currentFile != nil {
 		if w.bytesSinceSync > 0 {
 			w.sync()
@@ -314,35 +340,14 @@ func (w *Writer) rotate() error {
 		w.currentFile.Close()
 	}
 
-	// Generate new filename
-	timestamp := time.Now().UTC().Format("20060102_150405.000000000")
-	filename := fmt.Sprintf("arc-%s.wal", timestamp)
-	w.currentPath = filepath.Join(w.config.WALDir, filename)
-
-	// Open new file with owner-only permissions (WAL contains sensitive data)
-	var err error
-	w.currentFile, err = os.OpenFile(w.currentPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
-	if err != nil {
-		return fmt.Errorf("failed to create WAL file: %w", err)
-	}
-
-	w.currentSize = 0
+	// Swap to new file
+	w.currentFile = newFile
+	w.currentPath = newPath
+	w.currentSize = int64(n)
 	w.startTime = time.Now()
 	w.lastSyncTime = time.Now()
 	w.bytesSinceSync = 0
 	atomic.AddInt64(&w.TotalRotations, 1)
-
-	// Write WAL header
-	header := make([]byte, WALFileHeaderSize)
-	copy(header[0:4], WALMagic)
-	binary.BigEndian.PutUint16(header[4:6], WALVersion)
-	header[6] = WALChecksumCRC32
-
-	n, err := w.currentFile.Write(header)
-	if err != nil {
-		return fmt.Errorf("failed to write WAL header: %w", err)
-	}
-	w.currentSize += int64(n)
 
 	w.logger.Info().Str("file", filename).Msg("WAL rotated")
 	return nil
