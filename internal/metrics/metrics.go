@@ -116,6 +116,7 @@ type Metrics struct {
 	walRecoveryTotal    atomic.Int64 // Successful WAL recovery operations
 	walRecoveryRecords  atomic.Int64 // Total records recovered from WAL
 	walDroppedEntries   atomic.Int64 // Entries dropped due to full WAL buffer
+	walFailedWrites     atomic.Int64 // Write failures to WAL file
 
 	// Decompression pool metrics
 	decompBufferDiscards atomic.Int64 // Oversized buffers not returned to pool
@@ -370,6 +371,7 @@ func (m *Metrics) IncWALRecordsPreserved(count int64) { m.walRecordsPreserved.Ad
 func (m *Metrics) IncWALRecoveryTotal()               { m.walRecoveryTotal.Add(1) }
 func (m *Metrics) IncWALRecoveryRecords(count int64)  { m.walRecoveryRecords.Add(count) }
 func (m *Metrics) IncWALDroppedEntries()              { m.walDroppedEntries.Add(1) }
+func (m *Metrics) IncWALFailedWrites()                { m.walFailedWrites.Add(1) }
 
 // Decompression Pool Metrics
 func (m *Metrics) IncDecompBufferDiscards() { m.decompBufferDiscards.Add(1) }
@@ -553,6 +555,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"wal_recovery_total":    m.walRecoveryTotal.Load(),
 		"wal_recovery_records":  m.walRecoveryRecords.Load(),
 		"wal_dropped_entries":   m.walDroppedEntries.Load(),
+		"wal_failed_writes":     m.walFailedWrites.Load(),
 
 		// Decompression Pool
 		"decomp_buffer_discards": m.decompBufferDiscards.Load(),
@@ -863,6 +866,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_dropped_entries_total WAL entries dropped due to full buffer\n"...)
 	b = append(b, "# TYPE arc_wal_dropped_entries_total counter\n"...)
 	b = appendMetric(b, "arc_wal_dropped_entries_total", float64(m.walDroppedEntries.Load()))
+
+	b = append(b, "# HELP arc_wal_failed_writes_total WAL write failures\n"...)
+	b = append(b, "# TYPE arc_wal_failed_writes_total counter\n"...)
+	b = appendMetric(b, "arc_wal_failed_writes_total", float64(m.walFailedWrites.Load()))
 
 	// Decompression pool metrics
 	b = append(b, "# HELP arc_decomp_buffer_discards_total Oversized decompression buffers not returned to pool\n"...)

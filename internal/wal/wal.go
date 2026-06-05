@@ -139,6 +139,7 @@ type Writer struct {
 	TotalSyncs     int64
 	TotalRotations int64
 	DroppedEntries int64 // Entries dropped due to full buffer
+	FailedWrites   int64 // Write failures to current WAL file
 
 	mu sync.Mutex
 }
@@ -256,8 +257,25 @@ func (w *Writer) writeEntry(entry walEntry) {
 	// Write entry
 	n, err := w.currentFile.Write(entry.data)
 	if err != nil {
-		w.logger.Error().Err(err).Msg("Failed to write WAL entry")
-		return
+		atomic.AddInt64(&w.FailedWrites, 1)
+		metrics.Get().IncWALFailedWrites()
+		w.logger.Error().Err(err).Msg("Failed to write WAL entry, attempting rotation")
+
+		// Attempt rotation — the current file handle may be bad (disk full,
+		// permission change, file deleted). A new file might succeed.
+		if rotErr := w.rotate(); rotErr != nil {
+			w.logger.Error().Err(rotErr).Msg("Rotation after write failure also failed, entry lost")
+			return
+		}
+
+		// Retry write on the new file
+		n, err = w.currentFile.Write(entry.data)
+		if err != nil {
+			atomic.AddInt64(&w.FailedWrites, 1)
+			metrics.Get().IncWALFailedWrites()
+			w.logger.Error().Err(err).Msg("Retry write after rotation also failed, entry lost")
+			return
+		}
 	}
 
 	bytesWritten := int64(n)
@@ -461,15 +479,21 @@ func (w *Writer) sync() {
 		return
 	}
 
+	var syncErr error
 	switch w.config.SyncMode {
 	case SyncModeFsync:
 		// Full sync: data + metadata
-		w.currentFile.Sync()
+		syncErr = w.currentFile.Sync()
 	case SyncModeFdatasync:
 		// Data sync only (use Sync on systems without fdatasync)
-		w.currentFile.Sync()
+		syncErr = w.currentFile.Sync()
 	case SyncModeAsync:
 		// No explicit sync, rely on OS buffer cache
+		return
+	}
+
+	if syncErr != nil {
+		w.logger.Error().Err(syncErr).Msg("WAL sync failed")
 	}
 }
 
@@ -588,6 +612,7 @@ func (w *Writer) Stats() map[string]interface{} {
 		"total_syncs":         atomic.LoadInt64(&w.TotalSyncs),
 		"total_rotations":     atomic.LoadInt64(&w.TotalRotations),
 		"dropped_entries":     atomic.LoadInt64(&w.DroppedEntries),
+		"failed_writes":       atomic.LoadInt64(&w.FailedWrites),
 		"buffer_size":         w.config.BufferSize,
 		"buffer_used":         len(w.entryChan),
 	}
