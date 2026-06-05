@@ -268,7 +268,12 @@ func (w *Writer) writeEntry(entry walEntry) {
 			return
 		}
 
-		// Retry write on the new file
+		// Retry write on the new file. If the original write failed partway
+		// (e.g. disk filled mid-write), a truncated entry is left at the tail
+		// of the old file. That is safe: the reader treats a partial trailing
+		// entry as clean EOF (truncated header) or a skipped corrupted entry
+		// (truncated payload / checksum mismatch), never a fatal error — see
+		// Reader.readEntry. The full entry is re-written here on the new file.
 		n, err = w.currentFile.Write(entry.data)
 		if err != nil {
 			atomic.AddInt64(&w.FailedWrites, 1)
