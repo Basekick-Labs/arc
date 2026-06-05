@@ -56,11 +56,13 @@ func (r *Reader) ReadAll() ([]Entry, error) {
 	defer f.Close()
 
 	// Read and verify header
-	header := make([]byte, WALFileHeaderSize)
-	n, err := f.Read(header)
-	if err != nil || n < WALFileHeaderSize {
-		r.logger.Warn().Str("file", r.filePath).Msg("WAL file too short")
-		return entries, nil
+	var header [WALFileHeaderSize]byte
+	if _, err := io.ReadFull(f, header[:]); err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			r.logger.Warn().Str("file", r.filePath).Msg("WAL file too short")
+			return entries, nil
+		}
+		return nil, fmt.Errorf("failed to read WAL file header: %w", err)
 	}
 
 	// Verify magic bytes
@@ -106,12 +108,15 @@ func (r *Reader) ReadAll() ([]Entry, error) {
 // readEntry reads a single entry from the file
 func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 	// Read entry header
-	header := make([]byte, WALEntryHeaderSize)
-	n, err := f.Read(header)
-	if err == io.EOF {
-		return nil, io.EOF
-	}
-	if err != nil || n < WALEntryHeaderSize {
+	var header [WALEntryHeaderSize]byte
+	if _, err := io.ReadFull(f, header[:]); err != nil {
+		// io.EOF: 0 bytes read at clean end of WAL file.
+		// io.ErrUnexpectedEOF: 1-15 bytes read then EOF (crash during write,
+		// truncated entry header). Must stop here — the file offset is
+		// mid-header; continuing would cascade misaligned reads.
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return nil, io.EOF
+		}
 		return nil, fmt.Errorf("failed to read entry header: %w", err)
 	}
 
@@ -126,7 +131,7 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 
 	// Read payload
 	payload := make([]byte, payloadLen)
-	n, err = io.ReadFull(f, payload)
+	n, err := io.ReadFull(f, payload)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read payload: %w", err)
 	}
