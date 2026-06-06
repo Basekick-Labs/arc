@@ -3211,6 +3211,57 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 		})
 	}
 
+	// RBAC-gate SHOW commands — mirror executeQuery's permission checks.
+	// SHOW DATABASES / SHOW TABLES extract zero table references, so
+	// checkQueryPermissions (which extracts FROM db.table refs) would pass them
+	// through without a permission check. Reject them here instead; the estimate
+	// endpoint has no legitimate use for metadata commands.
+	//
+	// Normalize the SQL before matching: strip comments and trim whitespace so
+	// that a comment (e.g. /* x */ SHOW DATABASES) cannot hide a SHOW command
+	// from the anchored regex. The same normalization is applied by
+	// checkQueryPermissions below; without it, the comment bypass would let
+	// SHOW reach DuckDB unchecked (the regex would not match the raw string,
+	// checkQueryPermissions would find zero table refs, and DuckDB would strip
+	// the comment and execute the SHOW).
+	features := scanSQLFeatures(req.SQL)
+	normalised := strings.TrimSpace(stripSQLComments(req.SQL, features.hasDashComment || features.hasBlockComment))
+
+	if showDatabasesPattern.MatchString(normalised) {
+		if err := h.checkMeasurementPermission(c, "*", "*", "read"); err != nil {
+			metrics.Get().IncQueryErrors()
+			return c.Status(fiber.StatusForbidden).JSON(EstimateResponse{
+				Success:      false,
+				Error:        "access denied: no read permission to list databases",
+				WarningLevel: "error",
+			})
+		}
+		return c.Status(fiber.StatusBadRequest).JSON(EstimateResponse{
+			Success:      false,
+			Error:        "SHOW DATABASES is not supported on the estimate endpoint; use /api/v1/query instead",
+			WarningLevel: "error",
+		})
+	}
+	if matches := showTablesPattern.FindStringSubmatch(normalised); matches != nil {
+		database := "default"
+		if len(matches) > 1 && matches[1] != "" {
+			database = matches[1]
+		}
+		if err := h.checkMeasurementPermission(c, database, "*", "read"); err != nil {
+			metrics.Get().IncQueryErrors()
+			return c.Status(fiber.StatusForbidden).JSON(EstimateResponse{
+				Success:      false,
+				Error:        fmt.Sprintf("access denied: no read permission for database '%s'", database),
+				WarningLevel: "error",
+			})
+		}
+		return c.Status(fiber.StatusBadRequest).JSON(EstimateResponse{
+			Success:      false,
+			Error:        "SHOW TABLES/MEASUREMENTS is not supported on the estimate endpoint; use /api/v1/query instead",
+			WarningLevel: "error",
+		})
+	}
+
 	// If header is set, reject cross-database syntax (db.table not allowed),
 	// matching the validation in executeQuery.
 	if headerDB != "" && hasCrossDatabaseSyntax(req.SQL) {
