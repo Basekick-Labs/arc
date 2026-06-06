@@ -151,10 +151,26 @@ func isIdentChar(c byte) bool {
 // This is faster than regex-based detection for simple pattern matching.
 // Used to reject queries that use db.table syntax when x-arc-database header is set.
 func hasCrossDatabaseSyntax(sql string) bool {
+	// Normalise before scanning, matching checkQueryPermissions /
+	// convertSQLToStoragePaths exactly:
+	//   - mask string literals so a db.table inside a literal isn't scanned;
+	//   - mask FROM inside function bodies so `EXTRACT(EPOCH FROM t.ts)` isn't
+	//     misread as a cross-database `t.ts` reference (false 400 on a legit
+	//     query whose `t` is just a table alias);
+	//   - strip comments so a db.table hidden in a comment can't bypass the scan
+	//     (e.g. `FROM /* x */ otherdb.cpu`).
+	features := scanSQLFeatures(sql)
+	sql, _ = sqlutil.MaskStringLiterals(sql, features.hasQuotes)
+	sql, _ = sqlutil.MaskFromKeywordsInFunctionBodies(sql)
+	sql = stripSQLComments(sql, features.hasDashComment || features.hasBlockComment)
+
 	sqlLower := strings.ToLower(sql)
 
-	// Check for "FROM identifier.identifier" or "JOIN identifier.identifier" patterns
-	for _, keyword := range []string{"from ", "join "} {
+	// Check for "FROM identifier.identifier" or "JOIN identifier.identifier" patterns.
+	// Search for the bare keyword and verify it's followed by whitespace (not part of
+	// a longer identifier like "fromage"), then scan past any whitespace before
+	// checking for the db.table dot pattern.
+	for _, keyword := range []string{"from", "join"} {
 		pos := 0
 		for {
 			idx := strings.Index(sqlLower[pos:], keyword)
@@ -164,27 +180,62 @@ func hasCrossDatabaseSyntax(sql string) bool {
 			idx += pos + len(keyword)
 			pos = idx
 
-			// Skip whitespace after keyword
-			for idx < len(sql) && (sql[idx] == ' ' || sql[idx] == '\t' || sql[idx] == '\n') {
+			// All indexing below uses sqlLower, since idx is derived from
+			// strings.Index(sqlLower, ...). Indexing the original sql with this
+			// offset would be incorrect (and could panic) when ToLower changes
+			// the byte length on non-ASCII input. The patterns we match (ASCII
+			// whitespace, identifier chars, '.') are unaffected by lowercasing.
+
+			// Verify keyword boundary on both sides: the preceding char must not
+			// be an identifier char (else this is a suffix like "select_from"),
+			// and the next char must be whitespace or end-of-string (else this is
+			// a prefix like "fromage"/"joiner").
+			startOfKeyword := idx - len(keyword)
+			if startOfKeyword > 0 && isIdentChar(sqlLower[startOfKeyword-1]) {
+				continue
+			}
+			if idx < len(sqlLower) && !isWhitespace(sqlLower[idx]) {
+				continue
+			}
+
+			// Skip whitespace after keyword (spaces, tabs, newlines)
+			for idx < len(sqlLower) && isWhitespace(sqlLower[idx]) {
 				idx++
 			}
 
 			// Find first identifier (database name)
 			start := idx
-			for idx < len(sql) && isIdentChar(sql[idx]) {
+			for idx < len(sqlLower) && isIdentChar(sqlLower[idx]) {
 				idx++
 			}
-			if idx == start || idx >= len(sql) {
+			if idx == start || idx >= len(sqlLower) {
 				continue
 			}
 
 			// Check for dot followed by another identifier (table name)
-			if sql[idx] == '.' && idx+1 < len(sql) && isIdentChar(sql[idx+1]) {
+			if sqlLower[idx] == '.' && idx+1 < len(sqlLower) && isIdentChar(sqlLower[idx+1]) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// isWhitespace returns true if b is a whitespace byte.
+func isWhitespace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+}
+
+// isFunctionCallAt reports whether the identifier ending at index `pos` is a
+// function call — i.e. the next non-whitespace byte is '('. SQL permits
+// whitespace between a function name and its opening paren (`generate_series
+// (1, 10)`), so a bare `sql[pos] == '('` check misses the spaced form and
+// would extract the function name as a spurious table reference.
+func isFunctionCallAt(sql string, pos int) bool {
+	for pos < len(sql) && isWhitespace(sql[pos]) {
+		pos++
+	}
+	return pos < len(sql) && sql[pos] == '('
 }
 
 // isSingleTableQuery returns true if query has exactly one FROM and no JOINs.
@@ -961,6 +1012,12 @@ func extractTableReferences(sql string) []TableReference {
 	var refs []TableReference
 	seen := make(map[string]bool)
 
+	// CTE names (WITH t AS (...)) are virtual, not real measurements. The query
+	// transform (convertSQLToStoragePaths) skips them, so the permission check
+	// must too — otherwise a query like `WITH t AS (...) SELECT * FROM t` would
+	// demand a spurious default.t:read grant (false denial).
+	cteNames := extractCTENames(sql)
+
 	// Extract database.table references (FROM database.table, JOIN database.table)
 	// These take priority - we track their positions to avoid double-counting
 	dbTableMatches := patternDBTable.FindAllStringSubmatch(sql, -1)
@@ -1005,10 +1062,25 @@ func extractTableReferences(sql string) []TableReference {
 				continue
 			}
 
+			// Skip CTE names — they are virtual, not real measurements.
+			if cteNames[table] {
+				continue
+			}
+
 			// Check if this table name is followed by a dot (meaning it's a database name, not a table)
 			endIdx := matchIdx[3]
 			if endIdx < len(sql) && sql[endIdx] == '.' {
 				// This is actually a database name in "database.table", skip it
+				continue
+			}
+
+			// Skip table-valued function calls (e.g. generate_series(...),
+			// read_csv(...)) — the name is followed by '(', not a real table.
+			// SQL allows whitespace before the paren (`generate_series  (…)`),
+			// and the query transform treats it as a function regardless, so the
+			// extractor must skip whitespace too to stay in parity (else a false
+			// default.<fn> ref → 403).
+			if isFunctionCallAt(sql, endIdx) {
 				continue
 			}
 
@@ -1034,9 +1106,20 @@ func extractTableReferences(sql string) []TableReference {
 				continue
 			}
 
+			// Skip CTE names — they are virtual, not real measurements.
+			if cteNames[table] {
+				continue
+			}
+
 			// Check if this table name is followed by a dot
 			endIdx := matchIdx[3]
 			if endIdx < len(sql) && sql[endIdx] == '.' {
+				continue
+			}
+
+			// Skip table-valued function calls (name followed by '(', possibly
+			// after whitespace) — see the simple-table loop above.
+			if isFunctionCallAt(sql, endIdx) {
 				continue
 			}
 
@@ -1070,11 +1153,41 @@ func (h *QueryHandler) checkQueryPermissions(c *fiber.Ctx, sql, permission strin
 		return nil
 	}
 
-	// Extract table references from SQL
-	tableRefs := extractTableReferences(sql)
+	// Normalise SQL before extracting table references. This MUST match the
+	// normalisation that convertSQLToStoragePaths applies downstream, or the
+	// permission check and the executed query disagree on which tables are
+	// referenced:
+	//   - mask string literals so keywords inside them don't false-positive;
+	//   - mask FROM inside function bodies (e.g. EXTRACT(YEAR FROM time)) so the
+	//     extractor doesn't treat the field as a default.<field> table ref —
+	//     that would cause a false-positive denial;
+	//   - strip comments so a comment interleaved between FROM/JOIN and the
+	//     table name can't hide a reference (SECURITY: RBAC bypass — the query
+	//     `SELECT * FROM /* x */ secret.cpu` would otherwise yield zero refs
+	//     here yet still execute against secret.cpu after the transform).
+	features := scanSQLFeatures(sql)
+	normalisedSQL, _ := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
+	normalisedSQL, _ = sqlutil.MaskFromKeywordsInFunctionBodies(normalisedSQL)
+	normalisedSQL = stripSQLComments(normalisedSQL, features.hasDashComment || features.hasBlockComment)
+
+	// Extract table references from the normalised SQL
+	tableRefs := extractTableReferences(normalisedSQL)
 	if len(tableRefs) == 0 {
 		// No tables referenced (e.g., SELECT 1+1)
 		return nil
+	}
+
+	// Override "default" database with the x-arc-database header value when
+	// present. Without this, a user with default.cpu:read can bypass RBAC
+	// and query sensitive_db.cpu by setting x-arc-database: sensitive_db —
+	// the permission check would use "default" while the query transform
+	// resolves paths against the header-specified database.
+	if headerDB := c.Get("x-arc-database"); headerDB != "" {
+		for i := range tableRefs {
+			if tableRefs[i].Database == "default" {
+				tableRefs[i].Database = headerDB
+			}
+		}
 	}
 
 	if h.debugEnabled {
@@ -3098,6 +3211,27 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 		})
 	}
 
+	// If header is set, reject cross-database syntax (db.table not allowed),
+	// matching the validation in executeQuery.
+	if headerDB != "" && hasCrossDatabaseSyntax(req.SQL) {
+		metrics.Get().IncQueryErrors()
+		return c.Status(fiber.StatusBadRequest).JSON(EstimateResponse{
+			Success:      false,
+			Error:        "Cross-database queries (db.table syntax) not allowed when x-arc-database header is set",
+			WarningLevel: "error",
+		})
+	}
+
+	// RBAC permission check for all tables referenced in the query
+	if err := h.checkQueryPermissions(c, req.SQL, "read"); err != nil {
+		metrics.Get().IncQueryErrors()
+		return c.Status(fiber.StatusForbidden).JSON(EstimateResponse{
+			Success:      false,
+			Error:        err.Error(),
+			WarningLevel: "error",
+		})
+	}
+
 	// Convert SQL to storage paths (with caching)
 	convertedSQL, _ := h.getTransformedSQL(req.SQL, headerDB)
 
@@ -3236,6 +3370,33 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 
 	// Optional database filter
 	dbFilter := c.Query("database", "")
+
+	// Validate the database filter parameter if provided
+	if dbFilter != "" {
+		if err := validateIdentifier(dbFilter); err != nil {
+			metrics.Get().IncQueryErrors()
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"success": false,
+				"error":   "invalid database parameter: " + err.Error(),
+			})
+		}
+	}
+
+	// RBAC permission check - user needs at least some read permission to list measurements.
+	// When a database filter is specified, check against that specific database instead of
+	// requiring wildcard access — users with single-database permissions should be able to
+	// list measurements scoped to that database.
+	rbacDB := "*"
+	if dbFilter != "" {
+		rbacDB = dbFilter
+	}
+	if err := h.checkMeasurementPermission(c, rbacDB, "*", "read"); err != nil {
+		metrics.Get().IncQueryErrors()
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"success": false,
+			"error":   err.Error(),
+		})
+	}
 
 	basePath := h.getStorageBasePath()
 	if basePath == "" {
