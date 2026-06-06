@@ -1040,6 +1040,16 @@ func TestValidateSQLRequest_BypassesAndFalsePositives(t *testing.T) {
 		{name: "user arc_partition_agg whitespace", sql: "SELECT * FROM arc_partition_agg  ('db2', 'mem', 'hour')", shouldFail: true},
 		{name: "user arc_partition_agg in CTE", sql: "WITH x AS (SELECT * FROM arc_partition_agg('db2', 'mem', 'hour')) SELECT * FROM x", shouldFail: true},
 		{name: "literal containing arc_partition_agg text", sql: "SELECT * FROM logs WHERE msg = 'arc_partition_agg failed'", shouldFail: false},
+
+		// Multi-statement smuggling — a second statement behind a semicolon
+		// bypasses the anchored SHOW regexes, so reject >1 statement outright.
+		{name: "SHOW smuggled behind semicolon", sql: "SHOW DATABASES; SELECT 1", shouldFail: true},
+		{name: "SHOW TABLES smuggled behind semicolon", sql: `SHOW TABLES FROM "db"; SELECT 1`, shouldFail: true},
+		{name: "two selects", sql: "SELECT 1; SELECT 2", shouldFail: true},
+		{name: "trailing semicolon allowed", sql: "SELECT * FROM cpu;", shouldFail: false},
+		{name: "trailing semicolon with spaces allowed", sql: "SELECT * FROM cpu;   ", shouldFail: false},
+		{name: "semicolon inside string literal allowed", sql: "SELECT * FROM logs WHERE msg = 'a;b'", shouldFail: false},
+		{name: "semicolon inside comment allowed", sql: "SELECT * FROM cpu -- a;b\n", shouldFail: false},
 	}
 
 	for _, tt := range tests {

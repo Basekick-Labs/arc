@@ -2000,6 +2000,22 @@ func ValidateSQLRequest(sql string) error {
 	normalised, _ := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
 	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
 
+	// SECURITY: reject multi-statement queries. A second statement smuggled
+	// behind a semicolon (`SHOW DATABASES; SELECT 1`) bypasses the anchored
+	// SHOW-command regexes (which require the SHOW to be the whole query),
+	// falls through checkQueryPermissions (a SHOW has no FROM/JOIN table refs,
+	// so zero are extracted → allowed), and DuckDB then executes the statement
+	// list. The dangerous-keyword denylist already blocks the destructive
+	// second statements, but rejecting multiple statements outright closes the
+	// SHOW-smuggling class for every endpoint that calls this (query, msgpack,
+	// arrow, estimate) in one place. A single trailing `;` is allowed; any
+	// semicolon before the final non-space character means >1 statement.
+	// Checked on the comment-stripped, literal-masked form so a `;` inside a
+	// string or comment doesn't false-positive.
+	if strings.Contains(strings.TrimRight(normalised, " \t\n\r;"), ";") {
+		return &SQLValidationError{Message: "Multiple SQL statements are not allowed"}
+	}
+
 	if dangerousSQLPattern.MatchString(normalised) {
 		return &SQLValidationError{Message: "Dangerous SQL operation not allowed"}
 	}
