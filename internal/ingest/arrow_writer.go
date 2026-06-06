@@ -1917,6 +1917,14 @@ func (b *ArrowBuffer) convertColumnsToTyped(measurement string, columns map[stri
 			}
 			arr := make([]int64, len(col))
 			for i, v := range col {
+				// Fast path: time is overwhelmingly int64 in production, so a
+				// direct assertion avoids toInt64's call + multi-case type
+				// switch on the hot path. Fall back to toInt64 for other
+				// numeric kinds (float64, uints from some msgpack decoders).
+				if ts, ok := v.(int64); ok {
+					arr[i] = ts
+					continue
+				}
 				// Reject null time: groupByHour reads the time slice directly
 				// (no validity check), so a nil would become 0 and silently
 				// route the record to the 1970-01-01 partition.
