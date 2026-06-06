@@ -1050,6 +1050,8 @@ func TestValidateSQLRequest_BypassesAndFalsePositives(t *testing.T) {
 		{name: "trailing semicolon with spaces allowed", sql: "SELECT * FROM cpu;   ", shouldFail: false},
 		{name: "semicolon inside string literal allowed", sql: "SELECT * FROM logs WHERE msg = 'a;b'", shouldFail: false},
 		{name: "semicolon inside comment allowed", sql: "SELECT * FROM cpu -- a;b\n", shouldFail: false},
+		{name: "semicolon inside backtick identifier allowed", sql: "SELECT * FROM `my;db`", shouldFail: false},
+		{name: "SHOW smuggled behind semicolon in backtick db", sql: "SHOW TABLES FROM `db`; SELECT 1", shouldFail: true},
 	}
 
 	for _, tt := range tests {
@@ -1151,6 +1153,7 @@ func TestNormalizeSQLForShow(t *testing.T) {
 	}{
 		{name: "dash-comment inside quoted db preserved", sql: `SHOW TABLES FROM "my--db"`, want: `SHOW TABLES FROM "my--db"`},
 		{name: "block-comment inside quoted db preserved", sql: `SHOW TABLES FROM "a/* */b"`, want: `SHOW TABLES FROM "a/* */b"`},
+		{name: "dash-comment inside backtick db preserved", sql: "SHOW TABLES FROM `my--db`", want: `SHOW TABLES FROM "my--db"`},
 		{name: "real leading block comment stripped", sql: `/* c */ SHOW DATABASES`, want: `SHOW DATABASES`},
 		{name: "real trailing dash comment stripped", sql: "SHOW TABLES FROM mydb -- trailing", want: "SHOW TABLES FROM mydb"},
 		{name: "no comments unchanged", sql: "SHOW TABLES FROM mydb", want: "SHOW TABLES FROM mydb"},

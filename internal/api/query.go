@@ -245,15 +245,31 @@ func isFunctionCallAt(sql string, pos int) bool {
 	return pos < len(sql) && sql[pos] == '('
 }
 
+// maskedQuoteForBacktick lets MaskStringLiterals (which only recognises ' and ")
+// also protect backtick-quoted identifiers: we map ` to " before masking so a
+// comment marker, semicolon, or keyword inside a backtick-quoted name does not
+// leak into comment-stripping / statement-splitting / denylist scanning. The
+// content inside is what matters for those scans; the exact quote character is
+// irrelevant downstream (the SHOW regex's capture excludes quotes either way).
+func backticksToDoubleQuotes(sql string) string {
+	if !strings.ContainsRune(sql, '`') {
+		return sql
+	}
+	return strings.ReplaceAll(sql, "`", "\"")
+}
+
 // normalizeSQLForShow prepares SQL for matching against the anchored SHOW
 // patterns. It masks string literals BEFORE stripping comments, then unmasks —
 // so a comment marker inside a quoted identifier (e.g. SHOW TABLES FROM
-// "my--db") is not mistaken for a real comment and truncated. Stripping
-// comments on raw SQL first would turn that query into `SHOW TABLES FROM "my`,
-// causing the gate to authorise database `my` while DuckDB executes against
-// `my--db` — an RBAC bypass. The literal content is restored so the SHOW regex
-// still captures the real (quoted) database name.
+// "my--db" or `my--db`) is not mistaken for a real comment and truncated.
+// Stripping comments on raw SQL first would turn that query into
+// `SHOW TABLES FROM "my`, causing the gate to authorise database `my` while
+// DuckDB executes against `my--db` — an RBAC bypass. Backticks are mapped to
+// double quotes first so backtick-quoted names are masked too (MaskStringLiterals
+// only knows ' and "). The captured database name excludes the surrounding
+// quotes, so the quote-character swap does not change the resolved db.
 func normalizeSQLForShow(sql string) string {
+	sql = backticksToDoubleQuotes(sql)
 	features := scanSQLFeatures(sql)
 	masked, masks := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
 	stripped := stripSQLComments(masked, features.hasDashComment || features.hasBlockComment)
@@ -2009,9 +2025,14 @@ func ValidateSQLRequest(sql string) error {
 	// Normalise before denylist check: mask string literals so keywords
 	// inside literals don't false-positive, then strip comments so
 	// keywords interleaved with comments don't slip past token
-	// boundaries (`DROP /* */ TABLE x`).
-	features := scanSQLFeatures(sql)
-	normalised, _ := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
+	// boundaries (`DROP /* */ TABLE x`). Map backticks to double quotes first
+	// so backtick-quoted identifiers are masked too — otherwise a semicolon
+	// inside `a;b` would false-trip the multi-statement check below, and a
+	// keyword inside `select` could be scanned. `normalised` is only ever read
+	// (never reconstructed into executable SQL), so the swap is safe here.
+	maskInput := backticksToDoubleQuotes(sql)
+	features := scanSQLFeatures(maskInput)
+	normalised, _ := sqlutil.MaskStringLiterals(maskInput, features.hasQuotes)
 	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
 
 	// SECURITY: reject multi-statement queries. A second statement smuggled
