@@ -364,20 +364,18 @@ func (p *LineProtocolParser) parseFieldValue(value []byte, validUTF8 bool) inter
 }
 
 // bytesEqualFold is a zero-allocation ASCII case-insensitive comparison
-// between a byte slice and a string. Only correct for ASCII alphabetic characters.
+// between a byte slice and a lowercase string. Callers must pass a
+// lowercase string constant (e.g. "true", "false").
 func bytesEqualFold(a []byte, b string) bool {
 	if len(a) != len(b) {
 		return false
 	}
 	for i := 0; i < len(a); i++ {
-		ca, cb := a[i], b[i]
+		ca := a[i]
 		if ca >= 'A' && ca <= 'Z' {
 			ca += 32
 		}
-		if cb >= 'A' && cb <= 'Z' {
-			cb += 32
-		}
-		if ca != cb {
+		if ca != b[i] {
 			return false
 		}
 	}
