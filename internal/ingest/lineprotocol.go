@@ -293,15 +293,19 @@ func (p *LineProtocolParser) parseFieldValue(value []byte, validUTF8 bool) inter
 		return nil
 	}
 
-	// Convert to string for easier comparison
-	strValue := string(value)
-	lowerValue := strings.ToLower(strValue)
-
-	// Boolean
-	if lowerValue == "t" || lowerValue == "true" {
+	// Boolean — zero-allocation byte comparison (avoids strings.ToLower allocation)
+	if len(value) == 1 {
+		switch value[0] {
+		case 't', 'T':
+			return true
+		case 'f', 'F':
+			return false
+		}
+	}
+	if len(value) == 4 && bytesEqualFold(value, []byte("true")) {
 		return true
 	}
-	if lowerValue == "f" || lowerValue == "false" {
+	if len(value) == 5 && bytesEqualFold(value, []byte("false")) {
 		return false
 	}
 
@@ -317,13 +321,16 @@ func (p *LineProtocolParser) parseFieldValue(value []byte, validUTF8 bool) inter
 			return sanitized
 		}
 		// Malformed quoted string - return as-is without leading quote, sanitized
-		trimmed := strings.Trim(strValue, "\"")
+		trimmed := strings.Trim(string(value), "\"")
 		if validUTF8 {
 			return trimmed
 		}
 		sanitized, _ := SanitizeUTF8(trimmed)
 		return sanitized
 	}
+
+	// For numeric types, convert to string
+	strValue := string(value)
 
 	// Integer (ends with 'i')
 	if value[len(value)-1] == 'i' {
@@ -355,6 +362,27 @@ func (p *LineProtocolParser) parseFieldValue(value []byte, validUTF8 bool) inter
 	}
 	sanitized, _ := SanitizeUTF8(strValue)
 	return sanitized
+}
+
+// bytesEqualFold is a zero-allocation ASCII case-insensitive comparison
+// for two byte slices. Only correct for ASCII alphabetic characters.
+func bytesEqualFold(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		ca, cb := a[i], b[i]
+		if ca >= 'A' && ca <= 'Z' {
+			ca += 32
+		}
+		if cb >= 'A' && cb <= 'Z' {
+			cb += 32
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
 }
 
 // unescape unescapes special characters in line protocol (\, \  \=)
