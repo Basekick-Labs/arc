@@ -1077,6 +1077,19 @@ func (h *QueryHandler) checkQueryPermissions(c *fiber.Ctx, sql, permission strin
 		return nil
 	}
 
+	// Override "default" database with the x-arc-database header value when
+	// present. Without this, a user with default.cpu:read can bypass RBAC
+	// and query sensitive_db.cpu by setting x-arc-database: sensitive_db —
+	// the permission check would use "default" while the query transform
+	// resolves paths against the header-specified database.
+	if headerDB := c.Get("x-arc-database"); headerDB != "" {
+		for i := range tableRefs {
+			if tableRefs[i].Database == "default" {
+				tableRefs[i].Database = headerDB
+			}
+		}
+	}
+
 	if h.debugEnabled {
 		h.logger.Debug().
 			Str("sql", sql).
@@ -3247,8 +3260,15 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 	// Optional database filter
 	dbFilter := c.Query("database", "")
 
-	// RBAC permission check - user needs at least some read permission to list measurements
-	if err := h.checkMeasurementPermission(c, "*", "*", "read"); err != nil {
+	// RBAC permission check - user needs at least some read permission to list measurements.
+	// When a database filter is specified, check against that specific database instead of
+	// requiring wildcard access — users with single-database permissions should be able to
+	// list measurements scoped to that database.
+	rbacDB := "*"
+	if dbFilter != "" {
+		rbacDB = dbFilter
+	}
+	if err := h.checkMeasurementPermission(c, rbacDB, "*", "read"); err != nil {
 		metrics.Get().IncQueryErrors()
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 			"success": false,

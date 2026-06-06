@@ -16,9 +16,16 @@ import (
 
 // mockRBACChecker implements RBACChecker for testing RBAC enforcement
 // in query endpoints.
+//
+// Three modes:
+//   - enabled=false: IsRBACEnabled returns false (OSS/no-RBAC mode)
+//   - enabled=true + allowAll=true: every permission check passes
+//   - enabled=true + allowAll=false + allowedDBs: only the listed databases pass;
+//     everything else is denied (default denyReason is used).
 type mockRBACChecker struct {
 	enabled      bool
 	allowAll     bool
+	allowedDBs   map[string]bool // databases for which read permission is granted
 	deniedReason string
 }
 
@@ -31,6 +38,19 @@ func (m *mockRBACChecker) CheckPermission(req *auth.PermissionCheckRequest) *aut
 		return &auth.PermissionCheckResult{Allowed: true, Source: "token"}
 	}
 	if m.allowAll {
+		return &auth.PermissionCheckResult{Allowed: true, Source: "rbac"}
+	}
+	// Only match "*" (wildcard) or databases explicitly in allowedDBs.
+	// Wildcard "*" matching means the user needs *.*:read — denied here
+	// unless allowAll is true.
+	if req.Database == "*" {
+		return &auth.PermissionCheckResult{
+			Allowed: false,
+			Source:  "rbac",
+			Reason:  m.deniedReason,
+		}
+	}
+	if m.allowedDBs != nil && m.allowedDBs[req.Database] {
 		return &auth.PermissionCheckResult{Allowed: true, Source: "rbac"}
 	}
 	return &auth.PermissionCheckResult{
@@ -277,6 +297,66 @@ func TestListMeasurements_RBAC_NoToken(t *testing.T) {
 	if resp.StatusCode == fiber.StatusForbidden {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected non-403 (no token = skip RBAC), got 403: %s", string(bodyBytes))
+	}
+}
+
+// TestListMeasurements_RBAC_DbFilterScoped verifies Gemini finding #2 fix:
+// a user with mydb.*:read should be able to list measurements scoped to
+// mydb via ?database=mydb, even though they lack *.*:read.
+func TestListMeasurements_RBAC_DbFilterScoped(t *testing.T) {
+	rbac := &mockRBACChecker{
+		enabled:      true,
+		allowAll:     false,
+		allowedDBs:   map[string]bool{"mydb": true},
+		deniedReason: "no read permission",
+	}
+	app := setupQueryRBACTest(t, rbac, tokenMiddleware(1, "scoped-token"))
+
+	// With ?database=mydb, the RBAC check should use "mydb" not "*",
+	// and since mydb is in allowedDBs, it passes.
+	req := httptest.NewRequest("GET", "/api/v1/measurements?database=mydb", nil)
+
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resp.StatusCode == fiber.StatusForbidden {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected non-403 (scoped db filter allowed), got 403: %s", string(bodyBytes))
+	}
+}
+
+// TestEstimateQuery_RBAC_HeaderBypassFixed verifies Gemini finding #1 fix:
+// when x-arc-database header is set, the RBAC check must resolve "default"
+// table references against the header database, not literal "default".
+func TestEstimateQuery_RBAC_HeaderBypassFixed(t *testing.T) {
+	// User has read on default.* but NOT on otherdb.*
+	rbac := &mockRBACChecker{
+		enabled:      true,
+		allowAll:     false,
+		allowedDBs:   map[string]bool{"default": true},
+		deniedReason: "no read permission",
+	}
+	app := setupQueryRBACTest(t, rbac, tokenMiddleware(1, "default-only"))
+
+	// SQL references bare table "cpu" (resolves to "default.cpu" by extractTableReferences).
+	// With x-arc-database: otherdb, the fixed checkQueryPermissions should remap
+	// default → otherdb, causing the RBAC check to fail (otherdb not in allowedDBs).
+	body := strings.NewReader(`{"sql": "SELECT * FROM cpu"}`)
+	req := httptest.NewRequest("POST", "/api/v1/query/estimate", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-arc-database", "otherdb")
+
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resp.StatusCode != fiber.StatusForbidden {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 403 (bypass prevented: header otherdb not allowed), got %d: %s",
+			resp.StatusCode, string(bodyBytes))
 	}
 }
 
