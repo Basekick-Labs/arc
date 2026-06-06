@@ -151,6 +151,14 @@ func isIdentChar(c byte) bool {
 // This is faster than regex-based detection for simple pattern matching.
 // Used to reject queries that use db.table syntax when x-arc-database header is set.
 func hasCrossDatabaseSyntax(sql string) bool {
+	// Normalise before scanning: mask string literals and strip comments so the
+	// scan can't be bypassed by hiding the db.table reference inside a comment
+	// (e.g. `FROM /* x */ otherdb.cpu`) or a string literal. Matches the
+	// normalisation applied by checkQueryPermissions / convertSQLToStoragePaths.
+	features := scanSQLFeatures(sql)
+	sql, _ = sqlutil.MaskStringLiterals(sql, features.hasQuotes)
+	sql = stripSQLComments(sql, features.hasDashComment || features.hasBlockComment)
+
 	sqlLower := strings.ToLower(sql)
 
 	// Check for "FROM identifier.identifier" or "JOIN identifier.identifier" patterns.
@@ -1090,15 +1098,21 @@ func (h *QueryHandler) checkQueryPermissions(c *fiber.Ctx, sql, permission strin
 		return nil
 	}
 
-	// Normalise SQL before extracting table references: mask string literals
-	// (so keywords inside literals don't false-positive) and strip comments
-	// (so a comment interleaved between FROM/JOIN and the table name can't hide
-	// the reference). This MUST match the normalisation that convertSQLToStoragePaths
-	// applies downstream — otherwise a query like `SELECT * FROM /* x */ secret.cpu`
-	// would yield zero table refs here (RBAC skipped) yet still execute against
-	// secret.cpu after the transform strips the comment. SECURITY: RBAC bypass.
+	// Normalise SQL before extracting table references. This MUST match the
+	// normalisation that convertSQLToStoragePaths applies downstream, or the
+	// permission check and the executed query disagree on which tables are
+	// referenced:
+	//   - mask string literals so keywords inside them don't false-positive;
+	//   - mask FROM inside function bodies (e.g. EXTRACT(YEAR FROM time)) so the
+	//     extractor doesn't treat the field as a default.<field> table ref —
+	//     that would cause a false-positive denial;
+	//   - strip comments so a comment interleaved between FROM/JOIN and the
+	//     table name can't hide a reference (SECURITY: RBAC bypass — the query
+	//     `SELECT * FROM /* x */ secret.cpu` would otherwise yield zero refs
+	//     here yet still execute against secret.cpu after the transform).
 	features := scanSQLFeatures(sql)
 	normalisedSQL, _ := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
+	normalisedSQL, _ = sqlutil.MaskFromKeywordsInFunctionBodies(normalisedSQL)
 	normalisedSQL = stripSQLComments(normalisedSQL, features.hasDashComment || features.hasBlockComment)
 
 	// Extract table references from the normalised SQL

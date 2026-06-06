@@ -394,6 +394,36 @@ func TestEstimateQuery_RBAC_CommentBypassFixed(t *testing.T) {
 	}
 }
 
+// TestEstimateQuery_RBAC_ExtractFromNotTreatedAsTable verifies that a FROM
+// keyword inside a function body (EXTRACT(YEAR FROM time)) is NOT extracted as
+// a table reference. Without masking it, the permission check would demand
+// default.time:read and falsely deny a query that only reads cpu. The token
+// here has read on default.cpu (the real table) but not default.time, so the
+// request must be allowed (non-403).
+func TestEstimateQuery_RBAC_ExtractFromNotTreatedAsTable(t *testing.T) {
+	rbac := &mockRBACChecker{
+		enabled:      true,
+		allowAll:     false,
+		allowedDBs:   map[string]bool{"default": true},
+		deniedReason: "no read permission",
+	}
+	app := setupQueryRBACTest(t, rbac, tokenMiddleware(1, "default-only"))
+
+	body := strings.NewReader(`{"sql": "SELECT EXTRACT(YEAR FROM time) FROM cpu"}`)
+	req := httptest.NewRequest("POST", "/api/v1/query/estimate", body)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resp.StatusCode == fiber.StatusForbidden {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected non-403 (EXTRACT FROM is not a table ref), got 403: %s", string(bodyBytes))
+	}
+}
+
 // TestEstimateQuery_CrossDBSyntaxRejected verifies Gemini finding #3 fix:
 // when x-arc-database header is set, cross-database syntax (db.table) must
 // be rejected with 400, matching executeQuery behavior.
@@ -484,6 +514,12 @@ func TestHasCrossDatabaseSyntax(t *testing.T) {
 		{name: "non-ascii in literal, no cross-db", sql: "SELECT * FROM cpu WHERE name = 'café'", expected: false},
 		{name: "non-ascii before cross-db ref", sql: "SELECT 'naïve' FROM otherdb.cpu", expected: true},
 		{name: "non-ascii multibyte İ then from", sql: "SELECT 'İstanbul' FROM otherdb.cpu", expected: true},
+
+		// Gemini R5: comment / literal must not hide a cross-db ref, and a
+		// db.table appearing only inside a literal must not be a false positive.
+		{name: "block comment before cross-db ref", sql: "SELECT * FROM /* sneaky */ otherdb.cpu", expected: true},
+		{name: "dash comment then newline cross-db ref", sql: "SELECT * FROM -- c\notherdb.cpu", expected: true},
+		{name: "cross-db only inside literal", sql: "SELECT * FROM cpu WHERE q = 'FROM otherdb.mem'", expected: false},
 	}
 
 	for _, tt := range tests {
