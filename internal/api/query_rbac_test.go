@@ -788,25 +788,27 @@ func TestExecuteQuery_ShowDatabases_CommentBypassDenied(t *testing.T) {
 	}
 	app := setupQueryRBACTest(t, rbac, tokenMiddleware(1, "no-wildcard"))
 
-	for _, sql := range []string{
-		"SHOW DATABASES",
-		"/* sneaky */ SHOW DATABASES",
-		"-- sneaky\nSHOW DATABASES",
-		"SHOW DATABASES -- trailing",
+	for _, tc := range []struct {
+		name string
+		json string // pre-escaped JSON request body
+	}{
+		{name: "plain SHOW DATABASES", json: `{"sql": "SHOW DATABASES"}`},
+		{name: "block comment before SHOW", json: `{"sql": "/* sneaky */ SHOW DATABASES"}`},
+		{name: "dash comment before SHOW", json: "{\"sql\": \"-- sneaky\\nSHOW DATABASES\"}"},
+		{name: "trailing dash comment", json: `{"sql": "SHOW DATABASES -- trailing"}`},
 	} {
-		body := strings.NewReader(`{"sql": ` + jsonQuote(sql) + `}`)
-		req := httptest.NewRequest("POST", "/api/v1/query", body)
+		req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(tc.json))
 		req.Header.Set("Content-Type", "application/json")
 
 		resp, err := app.Test(req, -1)
 		if err != nil {
-			t.Fatalf("%q: %v", sql, err)
+			t.Fatalf("%s: %v", tc.name, err)
 		}
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode != fiber.StatusForbidden {
-			t.Errorf("%q: expected 403 (SHOW gate must deny), got %d: %s",
-				sql, resp.StatusCode, string(bodyBytes))
+			t.Errorf("%s: expected 403 (SHOW gate must deny), got %d: %s",
+				tc.name, resp.StatusCode, string(bodyBytes))
 		}
 	}
 }
@@ -841,30 +843,4 @@ func TestExecuteQuery_ShowTables_HeaderDBScoped(t *testing.T) {
 		t.Fatalf("expected 403 (SHOW TABLES must check the header db, not default), got %d: %s",
 			resp.StatusCode, string(bodyBytes))
 	}
-}
-
-// jsonQuote returns a JSON-quoted string for embedding a SQL string (with
-// newlines/quotes) into a request body without pulling in encoding/json at the
-// call sites.
-func jsonQuote(s string) string {
-	var b strings.Builder
-	b.WriteByte('"')
-	for _, r := range s {
-		switch r {
-		case '"':
-			b.WriteString(`\"`)
-		case '\\':
-			b.WriteString(`\\`)
-		case '\n':
-			b.WriteString(`\n`)
-		case '\t':
-			b.WriteString(`\t`)
-		case '\r':
-			b.WriteString(`\r`)
-		default:
-			b.WriteRune(r)
-		}
-	}
-	b.WriteByte('"')
-	return b.String()
 }
