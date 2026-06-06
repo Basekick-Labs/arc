@@ -412,6 +412,78 @@ func TestListMeasurements_InvalidDbFilter(t *testing.T) {
 	}
 }
 
+// TestHasCrossDatabaseSyntax verifies Gemini finding #3 hardening:
+// the hasCrossDatabaseSyntax helper correctly handles arbitrary whitespace
+// (newlines, tabs, multiple spaces) between FROM/JOIN and the db.table ref.
+func TestHasCrossDatabaseSyntax(t *testing.T) {
+	tests := []struct {
+		name     string
+		sql      string
+		expected bool
+	}{
+		// Baseline: space-separated (original behaviour)
+		{name: "space after FROM", sql: "SELECT * FROM otherdb.cpu", expected: true},
+		{name: "space after JOIN", sql: "SELECT * FROM cpu JOIN otherdb.mem", expected: true},
+		{name: "no dot = single table", sql: "SELECT * FROM cpu", expected: false},
+		{name: "no FROM", sql: "SELECT 1", expected: false},
+
+		// Gemini R3: newline / tab / multiple spaces after keyword
+		{name: "newline after FROM", sql: "SELECT * FROM\notherdb.cpu", expected: true},
+		{name: "tab after FROM", sql: "SELECT * FROM\totherdb.cpu", expected: true},
+		{name: "multiple spaces after FROM", sql: "SELECT * FROM   otherdb.cpu", expected: true},
+		{name: "newline after JOIN", sql: "JOIN\notherdb.cpu", expected: true},
+		{name: "tab after JOIN", sql: "JOIN\totherdb.cpu", expected: true},
+
+		// Keyword boundary: should NOT match "fromage" or "joiner"
+		{name: "from embedded in identifier", sql: "SELECT fromage FROM cpu", expected: false},
+		{name: "join embedded in identifier", sql: "SELECT * FROM cpu JOINER x", expected: false},
+
+		// Mixed whitespace
+		{name: "mixed whitespace", sql: "SELECT * FROM \t \n otherdb.cpu", expected: true},
+
+		// Case insensitivity
+		{name: "uppercase FROM", sql: "SELECT * FROM otherdb.cpu", expected: true},
+		{name: "mixed case From", sql: "SELECT * From otherdb.cpu", expected: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hasCrossDatabaseSyntax(tt.sql)
+			if got != tt.expected {
+				t.Errorf("hasCrossDatabaseSyntax(%q) = %v, want %v", tt.sql, got, tt.expected)
+			}
+		})
+	}
+}
+
+// TestEstimateQuery_CrossDBSyntaxRejected_Newline verifies Gemini R3:
+// cross-database syntax with newline after FROM is still rejected in the
+// estimateQuery endpoint when x-arc-database header is set.
+func TestEstimateQuery_CrossDBSyntaxRejected_Newline(t *testing.T) {
+	rbac := &mockRBACChecker{
+		enabled:  true,
+		allowAll: true,
+	}
+	app := setupQueryRBACTest(t, rbac, tokenMiddleware(1, "test-token"))
+
+	// FROM\notherdb.cpu — newline between keyword and table ref
+	body := strings.NewReader("{\"sql\": \"SELECT * FROM\\notherdb.cpu\"}")
+	req := httptest.NewRequest("POST", "/api/v1/query/estimate", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-arc-database", "mydb")
+
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resp.StatusCode != fiber.StatusBadRequest {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400 (cross-database with newline rejected), got %d: %s",
+			resp.StatusCode, string(bodyBytes))
+	}
+}
+
 // =============================================================================
 // Benchmarks — measure RBAC check overhead on the hot query path
 // =============================================================================

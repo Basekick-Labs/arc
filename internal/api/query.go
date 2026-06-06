@@ -153,8 +153,11 @@ func isIdentChar(c byte) bool {
 func hasCrossDatabaseSyntax(sql string) bool {
 	sqlLower := strings.ToLower(sql)
 
-	// Check for "FROM identifier.identifier" or "JOIN identifier.identifier" patterns
-	for _, keyword := range []string{"from ", "join "} {
+	// Check for "FROM identifier.identifier" or "JOIN identifier.identifier" patterns.
+	// Search for the bare keyword and verify it's followed by whitespace (not part of
+	// a longer identifier like "fromage"), then scan past any whitespace before
+	// checking for the db.table dot pattern.
+	for _, keyword := range []string{"from", "join"} {
 		pos := 0
 		for {
 			idx := strings.Index(sqlLower[pos:], keyword)
@@ -164,8 +167,14 @@ func hasCrossDatabaseSyntax(sql string) bool {
 			idx += pos + len(keyword)
 			pos = idx
 
-			// Skip whitespace after keyword
-			for idx < len(sql) && (sql[idx] == ' ' || sql[idx] == '\t' || sql[idx] == '\n') {
+			// Verify keyword boundary: next char must be whitespace or end-of-string.
+			// This prevents matching "fromage", "joiner", etc.
+			if idx < len(sql) && !isWhitespace(sql[idx]) {
+				continue
+			}
+
+			// Skip whitespace after keyword (spaces, tabs, newlines)
+			for idx < len(sql) && isWhitespace(sql[idx]) {
 				idx++
 			}
 
@@ -185,6 +194,11 @@ func hasCrossDatabaseSyntax(sql string) bool {
 		}
 	}
 	return false
+}
+
+// isWhitespace returns true if b is a whitespace byte.
+func isWhitespace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
 }
 
 // isSingleTableQuery returns true if query has exactly one FROM and no JOINs.
