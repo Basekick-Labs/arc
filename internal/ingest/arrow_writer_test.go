@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/pkg/models"
@@ -567,6 +568,55 @@ func TestDecimal128_SchemaMetadata(t *testing.T) {
 	}
 }
 
+// TestInferSchema_TimeColumnTypeEnforcement verifies the time column is always
+// typed as Timestamp when sent as int64 microseconds, and that a non-int64 time
+// column (string or float) is REJECTED rather than silently written as
+// VARCHAR/DOUBLE. A mistyped time file in a partition makes compaction fail to
+// bind "time" (TIMESTAMP WITH TIME ZONE != VARCHAR) and wedges the partition,
+// so the write must fail loudly instead.
+func TestInferSchema_TimeColumnTypeEnforcement(t *testing.T) {
+	logger := zerolog.New(os.Stderr).Level(zerolog.Disabled)
+	cfg := &config.IngestConfig{Compression: "snappy"}
+	writer := NewArrowWriter(cfg, logger)
+
+	t.Run("int64 time becomes Timestamp", func(t *testing.T) {
+		schema, err := writer.getSchema("m_int", map[string]interface{}{
+			"time":  []int64{1609459200000000},
+			"value": []float64{1.5},
+		}, nil, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		idx := schema.FieldIndices("time")
+		if len(idx) == 0 {
+			t.Fatal("time field missing from schema")
+		}
+		if got := schema.Field(idx[0]).Type.ID(); got != arrow.TIMESTAMP {
+			t.Errorf("time type = %v, want TIMESTAMP", got)
+		}
+	})
+
+	t.Run("string time is rejected", func(t *testing.T) {
+		_, err := writer.getSchema("m_str", map[string]interface{}{
+			"time":  []string{"2021-01-01T00:00:00Z"},
+			"value": []float64{1.5},
+		}, nil, nil)
+		if err == nil {
+			t.Fatal("expected error for string time column, got nil (would write VARCHAR time)")
+		}
+	})
+
+	t.Run("float time is rejected", func(t *testing.T) {
+		_, err := writer.getSchema("m_float", map[string]interface{}{
+			"time":  []float64{1609459200.5},
+			"value": []float64{1.5},
+		}, nil, nil)
+		if err == nil {
+			t.Fatal("expected error for float64 time column, got nil (would write DOUBLE time)")
+		}
+	})
+}
+
 // BenchmarkGetColumnSignature benchmarks the column signature function
 func BenchmarkGetColumnSignature(b *testing.B) {
 	// Typical columnar payload columns
@@ -603,16 +653,16 @@ func TestGetColumnSignature(t *testing.T) {
 			columns: map[string]interface{}{
 				"value": []float64{1.0},
 			},
-			expected: "value:f64",
+			expected: "value",
 		},
 		{
-			name: "multiple columns sorted",
+			name: "multiple columns sorted (names only, no types)",
 			columns: map[string]interface{}{
 				"zebra": []string{"a"},
 				"apple": []int64{1},
 				"mango": []float64{1.0},
 			},
-			expected: "apple:i64,mango:f64,zebra:str",
+			expected: "apple,mango,zebra",
 		},
 		{
 			name: "skips internal columns",
@@ -621,7 +671,7 @@ func TestGetColumnSignature(t *testing.T) {
 				"time":    []int64{1},
 				"_hidden": []string{"x"},
 			},
-			expected: "time:i64,value:f64",
+			expected: "time,value",
 		},
 		{
 			name: "skips empty column names",
@@ -629,14 +679,7 @@ func TestGetColumnSignature(t *testing.T) {
 				"value": []float64{1.0},
 				"":      []int64{1},
 			},
-			expected: "value:f64",
-		},
-		{
-			name: "type change detected — same name different type",
-			columns: map[string]interface{}{
-				"cpu": []float64{1.0},
-			},
-			expected: "cpu:f64",
+			expected: "value",
 		},
 	}
 
@@ -649,12 +692,16 @@ func TestGetColumnSignature(t *testing.T) {
 		})
 	}
 
-	// Verify that a type change on the same column name produces a different signature
-	t.Run("type change produces different signature", func(t *testing.T) {
+	// REGRESSION GUARD (#411 revert): the signature is names-only, so a column
+	// arriving with different Go types across batches MUST produce the SAME
+	// signature. This keeps mixed-type batches in one buffer (collide loudly /
+	// coerce) instead of fanning them out into separate parquet files with
+	// conflicting column types, which permanently wedged compaction.
+	t.Run("type change produces SAME signature (no fan-out)", func(t *testing.T) {
 		sig1 := getColumnSignature(map[string]interface{}{"cpu": []int64{1}})
 		sig2 := getColumnSignature(map[string]interface{}{"cpu": []float64{1.0}})
-		if sig1 == sig2 {
-			t.Errorf("Expected different signatures for int64 vs float64, both got %q", sig1)
+		if sig1 != sig2 {
+			t.Errorf("Expected same signature for int64 vs float64 (names-only), got %q and %q", sig1, sig2)
 		}
 	})
 }
@@ -967,4 +1014,51 @@ func TestSliceTypedColumnBatchByIndices_NilValidityEntry(t *testing.T) {
 	if sliced.Signature != batch.Signature {
 		t.Errorf("signature = %q, want %q", sliced.Signature, batch.Signature)
 	}
+}
+
+// TestConvertColumnsToTyped_TimeForcedInt64 verifies the time column is forced
+// to int64 (→ Timestamp) regardless of incoming numeric type, and that a
+// string time is rejected — so a misbehaving writer can never produce a
+// VARCHAR time parquet file that would wedge compaction.
+func TestConvertColumnsToTyped_TimeForcedInt64(t *testing.T) {
+	buffer := createTestArrowBuffer(t)
+
+	t.Run("int64 time stays int64", func(t *testing.T) {
+		batch, n, err := buffer.convertColumnsToTyped("m", map[string][]interface{}{
+			"time":  {int64(1609459200000000), int64(1609459200000001)},
+			"value": {1.0, 2.0},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if n != 2 {
+			t.Fatalf("numRecords = %d, want 2", n)
+		}
+		if _, ok := batch.Data["time"].([]int64); !ok {
+			t.Errorf("time type = %T, want []int64", batch.Data["time"])
+		}
+	})
+
+	t.Run("float time coerced to int64", func(t *testing.T) {
+		batch, _, err := buffer.convertColumnsToTyped("m", map[string][]interface{}{
+			"time":  {float64(1609459200000000), float64(1609459200000001)},
+			"value": {1.0, 2.0},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if _, ok := batch.Data["time"].([]int64); !ok {
+			t.Errorf("time type = %T, want []int64 (coerced)", batch.Data["time"])
+		}
+	})
+
+	t.Run("string time rejected", func(t *testing.T) {
+		_, _, err := buffer.convertColumnsToTyped("m", map[string][]interface{}{
+			"time":  {"2021-01-01T00:00:00Z"},
+			"value": {1.0},
+		})
+		if err == nil {
+			t.Fatal("expected error for string time, got nil (would write VARCHAR time)")
+		}
+	})
 }

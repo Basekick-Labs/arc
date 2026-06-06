@@ -99,10 +99,13 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 	escapedOutput := escapeSQLPath(outputFile)
 
 	if len(tagColumns) == 0 {
-		// Standard compaction — no dedup overhead
+		// Standard compaction — no dedup overhead.
+		// Normalize "time" to TIMESTAMP so a partition that mixes file schemas
+		// (some time=TIMESTAMP, some time=VARCHAR from a misbehaving writer)
+		// still compacts instead of failing the column bind. See timeNormalizeReplace.
 		return fmt.Sprintf(`
 		COPY (
-			SELECT * FROM read_parquet(%s, union_by_name=true)
+			SELECT * REPLACE (%s) FROM read_parquet(%s, union_by_name=true)
 			%s
 		) TO '%s' (
 			FORMAT PARQUET,
@@ -110,7 +113,7 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 			COMPRESSION_LEVEL 3,
 			ROW_GROUP_SIZE 122880
 		)
-	`, fileListSQL, orderByClause, escapedOutput)
+	`, timeNormalizeReplace, fileListSQL, orderByClause, escapedOutput)
 	}
 
 	// Dedup compaction — use ROW_NUMBER to keep one row per unique key.
@@ -126,6 +129,8 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 	}
 	partitionBy := strings.Join(quotedTags, ", ")
 
+	// Normalize "time" to TIMESTAMP in the inner read so the PARTITION BY/ORDER BY
+	// on "time" and the output column are consistent across mixed-schema files.
 	return fmt.Sprintf(`
 		COPY (
 			SELECT * EXCLUDE (__dedup_rn) FROM (
@@ -133,7 +138,9 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 					PARTITION BY %s, "time"
 					ORDER BY "time" DESC
 				) AS __dedup_rn
-				FROM read_parquet(%s, union_by_name=true)
+				FROM (
+					SELECT * REPLACE (%s) FROM read_parquet(%s, union_by_name=true)
+				)
 			) WHERE __dedup_rn = 1
 			%s
 		) TO '%s' (
@@ -142,8 +149,22 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 			COMPRESSION_LEVEL 3,
 			ROW_GROUP_SIZE 122880
 		)
-	`, partitionBy, fileListSQL, orderByClause, escapedOutput)
+	`, partitionBy, timeNormalizeReplace, fileListSQL, orderByClause, escapedOutput)
 }
+
+// timeNormalizeReplace is the DuckDB `REPLACE (...)` expression that coerces a
+// possibly-mixed-type "time" column to a single TIMESTAMP type during compaction.
+// A partition can contain files where "time" is a proper TIMESTAMP and others
+// where a misbehaving writer wrote it as VARCHAR; read_parquet(union_by_name=true)
+// reconciles column NAMES but not conflicting TYPES, so without this the column
+// bind fails (TIMESTAMP != VARCHAR) and the partition can never compact.
+//
+// COALESCE order handles every case:
+//   - already TIMESTAMP, or an ISO/datetime string → TRY_CAST(... AS TIMESTAMP)
+//   - epoch-microseconds written as a string ("1717689600000000") →
+//     make_timestamp(BIGINT micros). Arc stores time as Timestamp_us, so the
+//     integer is microseconds, which is exactly make_timestamp's unit.
+const timeNormalizeReplace = `COALESCE(TRY_CAST("time" AS TIMESTAMP), make_timestamp(TRY_CAST("time" AS BIGINT))) AS "time"`
 
 // countParquetRows counts total rows across Parquet files using metadata (no data scan).
 // fileListSQL is a DuckDB array literal like "['file1.parquet', 'file2.parquet']".

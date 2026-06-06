@@ -59,6 +59,21 @@ type Config struct {
 	AsyncInsert bool
 	Token       string
 	TLS         bool
+	// BackdateHours shifts generated data timestamps this many hours into the
+	// past, spreading batches across the [now-BackdateHours, now-1h] window so
+	// multiple old hour-partitions each fill up and become immediately eligible
+	// for hourly compaction (which enforces a hard 1h min-age). 0 = disabled.
+	BackdateHours int
+	// MaxRecords stops the run early once this many records have been sent,
+	// regardless of Duration. Use to ingest an IDENTICAL volume across config
+	// variants (e.g. comparing sort keys) so file counts are comparable. 0 =
+	// disabled (duration-only).
+	MaxRecords int64
+	// BatchDelayMS throttles each worker by sleeping this long after every batch.
+	// Without it the bench blasts millions of records in <1s, so server-side
+	// flush cadence (not record count) governs how many files land — useful for
+	// throughput tests, useless for controlling on-disk file count. 0 = no throttle.
+	BatchDelayMS int
 }
 
 type Stats struct {
@@ -113,7 +128,7 @@ func roundTo(v float64, decimals int) float64 {
 	return math.Round(v*pow) / pow
 }
 
-func generateIOTBatches(count, batchSize int, compress string, zstdLevel int) [][]byte {
+func generateIOTBatches(count, batchSize int, compress string, zstdLevel int, backdateHours int) [][]byte {
 	measurements := []string{"cpu", "mem", "disk", "net"}
 	hosts := make([]string, 1000)
 	for i := range hosts {
@@ -132,6 +147,16 @@ func generateIOTBatches(count, batchSize int, compress string, zstdLevel int) []
 
 	for i := 0; i < count; i++ {
 		nowMicros := time.Now().UnixMicro()
+
+		// Backdate + spread across past hours so multiple old hour-partitions
+		// fill and clear the hard 1h compaction min-age. Batch i lands in hour
+		// offset [1 .. backdateHours] (cycled), plus minute jitter within the
+		// hour so files within a partition have distinct filename timestamps.
+		if backdateHours > 0 {
+			hourOffset := int64(1 + (i % backdateHours))
+			minuteJitter := int64(rand.Intn(60))
+			nowMicros -= (hourOffset*3600 + minuteJitter*60) * 1_000_000
+		}
 
 		times := make([]int64, batchSize)
 		hostVals := make([]string, batchSize)
@@ -184,7 +209,7 @@ func generateIOTBatches(count, batchSize int, compress string, zstdLevel int) []
 	return batches
 }
 
-func generateLineProtocolBatches(count, batchSize int, compress string, zstdLevel int, dataType string) [][]byte {
+func generateLineProtocolBatches(count, batchSize int, compress string, zstdLevel int, dataType string, backdateHours int) [][]byte {
 	batches := make([][]byte, count)
 	var zstdEncoder *zstd.Encoder
 	if compress == "zstd" {
@@ -214,6 +239,18 @@ func generateLineProtocolBatches(count, batchSize int, compress string, zstdLeve
 
 	for i := 0; i < count; i++ {
 		nowMicros := time.Now().UnixMicro()
+
+		// Backdate + spread across past hours so multiple old hour-partitions
+		// fill and clear the hard 1h compaction min-age. Batch i lands in hour
+		// offset [1 .. backdateHours] (cycled), plus minute jitter within the
+		// hour so files within a partition have distinct filename timestamps.
+		// Matches the IOT path in generateIOTBatches.
+		if backdateHours > 0 {
+			hourOffset := int64(1 + (i % backdateHours))
+			minuteJitter := int64(rand.Intn(60))
+			nowMicros -= (hourOffset*3600 + minuteJitter*60) * 1_000_000
+		}
+
 		var buf bytes.Buffer
 
 		for j := 0; j < batchSize; j++ {
@@ -1090,6 +1127,9 @@ func cratedbHTTPWorker(id int, cfg *Config, batches [][]byte, stats *Stats, clie
 	batchIdx := 0
 
 	for stats.running.Load() {
+		if cfg.BatchDelayMS > 0 {
+			time.Sleep(time.Duration(cfg.BatchDelayMS) * time.Millisecond)
+		}
 		batch := batches[batchIdx%len(batches)]
 		batchIdx++
 
@@ -1618,6 +1658,9 @@ func influxdb3Worker(id int, cfg *Config, batches [][]byte, stats *Stats, client
 	batchIdx := 0
 
 	for stats.running.Load() {
+		if cfg.BatchDelayMS > 0 {
+			time.Sleep(time.Duration(cfg.BatchDelayMS) * time.Millisecond)
+		}
 		batch := batches[batchIdx%len(batches)]
 		batchIdx++
 
@@ -1660,6 +1703,9 @@ func clickhouseHTTPWorker(id int, cfg *Config, batches [][]byte, stats *Stats, c
 	batchIdx := 0
 
 	for stats.running.Load() {
+		if cfg.BatchDelayMS > 0 {
+			time.Sleep(time.Duration(cfg.BatchDelayMS) * time.Millisecond)
+		}
 		batch := batches[batchIdx%len(batches)]
 		batchIdx++
 
@@ -1730,6 +1776,9 @@ func worker(id int, cfg *Config, batches [][]byte, stats *Stats, client *http.Cl
 	}
 
 	for stats.running.Load() {
+		if cfg.BatchDelayMS > 0 {
+			time.Sleep(time.Duration(cfg.BatchDelayMS) * time.Millisecond)
+		}
 		batch := batches[batchIdx%len(batches)]
 		batchIdx++
 
@@ -1791,6 +1840,9 @@ func main() {
 	flag.StringVar(&cfg.Database, "database", "default", "Database name (ClickHouse/TimescaleDB)")
 	flag.BoolVar(&cfg.AsyncInsert, "async-insert", false, "Enable ClickHouse async_insert (server-side batching)")
 	flag.BoolVar(&cfg.TLS, "tls", false, "Use HTTPS instead of HTTP")
+	flag.IntVar(&cfg.BackdateHours, "backdate-hours", 0, "Shift data timestamps into the past, spread across this many hours (offset 1..N + minute jitter) so old partitions are immediately compaction-eligible past the 1h min-age. Applies to both lineprotocol and msgpack iot. 0 = use current time")
+	flag.Int64Var(&cfg.MaxRecords, "max-records", 0, "Stop after sending this many records (for equal-volume A/B runs). 0 = duration-only")
+	flag.IntVar(&cfg.BatchDelayMS, "batch-delay-ms", 0, "Sleep this long after each batch per worker (throttle, to control flush/file cadence). 0 = no throttle")
 	flag.Parse()
 
 	// CrateDB optimal batch size is 10k–20k rows per request (bulk_args sweet spot).
@@ -2098,7 +2150,7 @@ func main() {
 		// Arc HTTP path
 		var batches [][]byte
 		if cfg.Protocol == "lineprotocol" {
-			batches = generateLineProtocolBatches(cfg.Pregenerate, cfg.BatchSize, cfg.Compress, cfg.ZstdLevel, cfg.DataType)
+			batches = generateLineProtocolBatches(cfg.Pregenerate, cfg.BatchSize, cfg.Compress, cfg.ZstdLevel, cfg.DataType, cfg.BackdateHours)
 		} else if cfg.DataType == "financial" {
 			batches = generateFinancialBatches(cfg.Pregenerate, cfg.BatchSize, cfg.Compress, cfg.ZstdLevel)
 		} else if cfg.DataType == "industrial" {
@@ -2110,7 +2162,7 @@ func main() {
 		} else if cfg.DataType == "racing" {
 			batches = generateRacingBatches(cfg.Pregenerate, cfg.BatchSize, cfg.Compress, cfg.ZstdLevel)
 		} else {
-			batches = generateIOTBatches(cfg.Pregenerate, cfg.BatchSize, cfg.Compress, cfg.ZstdLevel)
+			batches = generateIOTBatches(cfg.Pregenerate, cfg.BatchSize, cfg.Compress, cfg.ZstdLevel, cfg.BackdateHours)
 		}
 
 		genTime := time.Since(startGen)
@@ -2189,8 +2241,14 @@ func main() {
 		}
 	}()
 
-	// Wait for duration
-	time.Sleep(time.Duration(cfg.Duration) * time.Second)
+	// Wait for duration, or stop early once MaxRecords is reached (equal-volume A/B).
+	deadline := startTime.Add(time.Duration(cfg.Duration) * time.Second)
+	for time.Now().Before(deadline) {
+		if cfg.MaxRecords > 0 && stats.totalSent.Load() >= cfg.MaxRecords {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	stats.running.Store(false)
 	ticker.Stop()
 

@@ -458,14 +458,29 @@ func (w *ArrowWriter) inferSchema(columns map[string]interface{}, tagColumns []s
 
 		var arrowType arrow.DataType
 
+		// The time column MUST be int64 microseconds (→ Timestamp_us). This is
+		// checked BEFORE the type switch so it applies to every incoming Go
+		// type, not just []int64. The previous code only special-cased time
+		// inside `case []int64`, so a time column arriving as []string or
+		// []float64 fell through to String/Float64 — silently producing a
+		// VARCHAR (or DOUBLE) `time` parquet file. When such a file landed in a
+		// partition alongside a normally-written Timestamp file, compaction's
+		// read_parquet(union_by_name=true) could not reconcile the conflicting
+		// types and failed to bind "time" (TIMESTAMP WITH TIME ZONE != VARCHAR),
+		// permanently wedging the partition. Reject the write loudly instead —
+		// a clear error at ingest beats a corrupt-schema file discovered weeks
+		// later at compaction time, and it surfaces which writer sent bad time.
+		if name == "time" {
+			if _, ok := col.([]int64); !ok {
+				return nil, fmt.Errorf("time column must be int64 microseconds, got %T (writer must send an integer epoch, not a string or float)", col)
+			}
+			fields = append(fields, arrow.Field{Name: name, Type: arrow.FixedWidthTypes.Timestamp_us, Nullable: true})
+			continue
+		}
+
 		switch arr := col.(type) {
 		case []int64:
-			// Special case: time column uses timestamp type
-			if name == "time" {
-				arrowType = arrow.FixedWidthTypes.Timestamp_us
-			} else {
-				arrowType = arrow.PrimitiveTypes.Int64
-			}
+			arrowType = arrow.PrimitiveTypes.Int64
 		case []float64:
 			arrowType = arrow.PrimitiveTypes.Float64
 		case []string:
@@ -818,44 +833,39 @@ type ArrowBuffer struct {
 // int64→float64 on the same column) is detected as schema evolution and triggers a
 // flush before the new-schema data is appended.
 func getColumnSignature(columns map[string]interface{}) string {
-	type colEntry struct{ name, typ string }
-	entries := make([]colEntry, 0, len(columns))
-	size := -1 // will add 1 per comma; starts at -1 so the first entry adds 0 commas
-	for name, val := range columns {
+	// Signature is column NAMES only — NOT types. #411 made this type-aware
+	// ("name:type") to treat a column's type change as schema evolution. That
+	// had a damaging side effect: when a column (especially "time") arrived as
+	// int64 in some batches and string in others, the differing signatures
+	// routed those batches into SEPARATE parquet files in the same partition.
+	// Compaction then could not reconcile the conflicting column types
+	// (read_parquet union_by_name reconciles names, not types) and failed to
+	// bind "time" (TIMESTAMP != VARCHAR), permanently wedging the partition.
+	// Reverted to names-only: a within-buffer type change collides loudly at
+	// write time (or is coerced) instead of silently fanning out into
+	// un-compactable files. Type correctness for "time" is enforced separately
+	// at the typing chokepoint. Kept the strings.Builder so the allocation win
+	// from #411 is preserved.
+	names := make([]string, 0, len(columns))
+	size := -1 // first name adds 0 separators; each subsequent adds 1
+	for name := range columns {
 		if len(name) == 0 || name[0] == '_' {
 			continue // skip empty and internal columns
 		}
-		var typ string
-		switch val.(type) {
-		case []int64:
-			typ = "i64"
-		case []float64:
-			typ = "f64"
-		case []string:
-			typ = "str"
-		case []bool:
-			typ = "bool"
-		case []decimal128.Num:
-			typ = "dec"
-		default:
-			typ = "unk"
-		}
-		entries = append(entries, colEntry{name, typ})
-		size += 1 + len(name) + 1 + len(typ) // comma + name + colon + typ
+		names = append(names, name)
+		size += 1 + len(name)
 	}
-	if len(entries) == 0 {
+	if len(names) == 0 {
 		return ""
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
+	sort.Strings(names)
 	var sb strings.Builder
 	sb.Grow(size)
-	for i, e := range entries {
+	for i, name := range names {
 		if i > 0 {
 			sb.WriteByte(',')
 		}
-		sb.WriteString(e.name)
-		sb.WriteByte(':')
-		sb.WriteString(e.typ)
+		sb.WriteString(name)
 	}
 	return sb.String()
 }
@@ -1354,22 +1364,22 @@ func (b *ArrowBuffer) recordWALError(err error, fields func(*zerolog.Event)) {
 type flushSendOutcome int
 
 const (
-	flushQueued       flushSendOutcome = iota // task accepted on flushQueue
-	flushSkipClosing                          // buffer is closing — short-circuit
-	flushCtxCanceled                          // ctx fired during the select (defense-in-depth vs the closing flag)
-	flushQueueFull                            // queue at capacity, drop relying on WAL replay
+	flushQueued      flushSendOutcome = iota // task accepted on flushQueue
+	flushSkipClosing                         // buffer is closing — short-circuit
+	flushCtxCanceled                         // ctx fired during the select (defense-in-depth vs the closing flag)
+	flushQueueFull                           // queue at capacity, drop relying on WAL replay
 )
 
 // tryEnqueueFlush is the shared non-blocking send into b.flushQueue
 // used by both writeColumnarInternal and writeTypedColumnarInternal.
 // It encapsulates:
-//   1. The closing-flag short-circuit (Close() set the flag; data
-//      stays in WAL, no panic from a closed channel).
-//   2. The ctx.Done() defense-in-depth select arm (covers the narrow
-//      window between flag-load and select-eval where Close()'s
-//      cancel could fire).
-//   3. The queue-full default arm (queue at capacity; data stays in
-//      WAL for recovery).
+//  1. The closing-flag short-circuit (Close() set the flag; data
+//     stays in WAL, no panic from a closed channel).
+//  2. The ctx.Done() defense-in-depth select arm (covers the narrow
+//     window between flag-load and select-eval where Close()'s
+//     cancel could fire).
+//  3. The queue-full default arm (queue at capacity; data stays in
+//     WAL for recovery).
 //
 // The caller MUST already have built `task` and called flushCancel
 // to register the timeout context — tryEnqueueFlush does not own
@@ -1452,16 +1462,16 @@ var ErrSchemaChurnExceeded = errors.New("schema-evolution loop exceeded max iter
 // write paths to handle schema evolution under the shard lock.
 //
 // Caller MUST hold shard.mu. The loop terminates when either:
-//   1. The bufferSchemas entry is absent or matches newSignature (steady
-//      state — single iteration).
-//   2. ctx is cancelled — return ctx.Err() so the caller can abort the
-//      write entirely.
-//   3. schemaEvolutionMaxIters is reached — return ErrSchemaChurnExceeded
-//      so the caller can reject the write with a retryable status (HTTP
-//      503). The per-iteration flushes inside the loop already wrote
-//      older schemas' rows to durable Parquet, so there is no data loss —
-//      only the current request fails under sustained schema-rotation
-//      churn.
+//  1. The bufferSchemas entry is absent or matches newSignature (steady
+//     state — single iteration).
+//  2. ctx is cancelled — return ctx.Err() so the caller can abort the
+//     write entirely.
+//  3. schemaEvolutionMaxIters is reached — return ErrSchemaChurnExceeded
+//     so the caller can reject the write with a retryable status (HTTP
+//     503). The per-iteration flushes inside the loop already wrote
+//     older schemas' rows to durable Parquet, so there is no data loss —
+//     only the current request fails under sustained schema-rotation
+//     churn.
 //
 // flushBufferLocked is called inside the loop; it releases-and-
 // reacquires shard.mu around its I/O. On flush error the buffer
@@ -1872,6 +1882,41 @@ func (b *ArrowBuffer) convertColumnsToTyped(measurement string, columns map[stri
 		firstVal := firstNonNil(col)
 		if firstVal == nil {
 			continue // Skip all-nil columns
+		}
+
+		// The "time" column is always int64 microseconds → Arrow Timestamp.
+		// Force it here so a client that sends time as a string (or float) can
+		// never produce a VARCHAR/DOUBLE time parquet file, which would make a
+		// partition un-compactable (TIMESTAMP != VARCHAR bind failure). The
+		// msgpack columnar path already normalizes time via normalizeTimestamps,
+		// but this is the single chokepoint every typed write passes through, so
+		// enforce it here regardless of source. No extra pass: it replaces the
+		// generic type switch for this one column. Reject (not coerce) a
+		// non-numeric time so the bad writer is surfaced loudly at ingest.
+		if name == "time" {
+			if _, ok := firstVal.(string); ok {
+				return nil, 0, fmt.Errorf("time column must be numeric epoch, got string in measurement '%s' (writer must send an integer/float timestamp, not a string)", measurement)
+			}
+			arr := make([]int64, len(col))
+			valid := make([]bool, len(col))
+			hasNils := false
+			for i, v := range col {
+				if v == nil {
+					hasNils = true
+					continue
+				}
+				valid[i] = true
+				ts, ok := toInt64(v)
+				if !ok {
+					return nil, 0, fmt.Errorf("time column value %T not convertible to int64 in measurement '%s'", v, measurement)
+				}
+				arr[i] = ts
+			}
+			typed[name] = arr
+			if hasNils {
+				validity[name] = valid
+			}
+			continue
 		}
 
 		// FAST PATH: Try zero-copy bulk conversion first (fails fast on nils or mixed types).
@@ -3362,15 +3407,15 @@ func (b *ArrowBuffer) GetStats() map[string]interface{} {
 
 	// Read atomic values (lock-free!)
 	return map[string]interface{}{
-		"total_records_buffered": b.totalRecordsBuffered.Load(),
-		"total_records_written":  b.totalRecordsWritten.Load(),
-		"total_flushes":          b.totalFlushes.Load(),
-		"total_errors":           b.totalErrors.Load(),
-		"total_wal_errors":       b.totalWALErrors.Load(),
-		"total_wal_dropped":      b.totalWALDropped.Load(),
+		"total_records_buffered":      b.totalRecordsBuffered.Load(),
+		"total_records_written":       b.totalRecordsWritten.Load(),
+		"total_flushes":               b.totalFlushes.Load(),
+		"total_errors":                b.totalErrors.Load(),
+		"total_wal_errors":            b.totalWALErrors.Load(),
+		"total_wal_dropped":           b.totalWALDropped.Load(),
 		"total_schema_churn_exceeded": b.totalSchemaChurnExceeded.Load(),
-		"active_buffers":         activeBuffers,
-		"flush_queue_depth":      b.queueDepth.Load(),
-		"flush_workers":          b.flushWorkers,
+		"active_buffers":              activeBuffers,
+		"flush_queue_depth":           b.queueDepth.Load(),
+		"flush_workers":               b.flushWorkers,
 	}
 }
