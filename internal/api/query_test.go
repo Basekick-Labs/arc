@@ -1137,6 +1137,40 @@ func TestShowTablesPattern(t *testing.T) {
 	}
 }
 
+// TestNormalizeSQLForShow guards the SHOW-gate normalization: string literals
+// must be masked BEFORE comments are stripped, so a comment marker inside a
+// quoted database name (SHOW TABLES FROM "my--db") is not treated as a real
+// comment and truncated — which would make the gate authorise db "my" while
+// DuckDB executes against "my--db" (RBAC bypass). Real comments outside
+// literals must still be stripped.
+func TestNormalizeSQLForShow(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{name: "dash-comment inside quoted db preserved", sql: `SHOW TABLES FROM "my--db"`, want: `SHOW TABLES FROM "my--db"`},
+		{name: "block-comment inside quoted db preserved", sql: `SHOW TABLES FROM "a/* */b"`, want: `SHOW TABLES FROM "a/* */b"`},
+		{name: "real leading block comment stripped", sql: `/* c */ SHOW DATABASES`, want: `SHOW DATABASES`},
+		{name: "real trailing dash comment stripped", sql: "SHOW TABLES FROM mydb -- trailing", want: "SHOW TABLES FROM mydb"},
+		{name: "no comments unchanged", sql: "SHOW TABLES FROM mydb", want: "SHOW TABLES FROM mydb"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeSQLForShow(tt.sql); got != tt.want {
+				t.Errorf("normalizeSQLForShow(%q) = %q, want %q", tt.sql, got, tt.want)
+			}
+		})
+	}
+
+	// The quoted name with an embedded comment marker must round-trip through
+	// the regex with the FULL database name captured (not truncated at "--").
+	m := showTablesPattern.FindStringSubmatch(normalizeSQLForShow(`SHOW TABLES FROM "my--db"`))
+	if len(m) < 2 || m[1] != "my--db" {
+		t.Errorf("captured db = %v, want full name \"my--db\"", m)
+	}
+}
+
 func TestDBTablePattern(t *testing.T) {
 	tests := []struct {
 		name        string

@@ -84,10 +84,9 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// would pass them through unchecked. The Arrow IPC endpoint has no SHOW
 	// result handler (handleShowDatabases/handleShowTables emit JSON), so we
 	// gate on the same permission and return a 400 directing callers to
-	// /api/v1/query. Match against comment-stripped, trimmed SQL so a comment
-	// cannot hide the command from the anchored regex.
-	showFeatures := scanSQLFeatures(req.SQL)
-	showNormalised := strings.TrimSpace(stripSQLComments(req.SQL, showFeatures.hasDashComment || showFeatures.hasBlockComment))
+	// /api/v1/query. normalizeSQLForShow masks literals before stripping
+	// comments so a comment marker inside a quoted db name can't truncate it.
+	showNormalised := normalizeSQLForShow(req.SQL)
 	if showDatabasesPattern.MatchString(showNormalised) {
 		if err := h.checkMeasurementPermission(c, "*", "*", "read"); err != nil {
 			m.IncQueryErrors()

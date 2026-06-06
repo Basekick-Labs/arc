@@ -245,6 +245,21 @@ func isFunctionCallAt(sql string, pos int) bool {
 	return pos < len(sql) && sql[pos] == '('
 }
 
+// normalizeSQLForShow prepares SQL for matching against the anchored SHOW
+// patterns. It masks string literals BEFORE stripping comments, then unmasks —
+// so a comment marker inside a quoted identifier (e.g. SHOW TABLES FROM
+// "my--db") is not mistaken for a real comment and truncated. Stripping
+// comments on raw SQL first would turn that query into `SHOW TABLES FROM "my`,
+// causing the gate to authorise database `my` while DuckDB executes against
+// `my--db` — an RBAC bypass. The literal content is restored so the SHOW regex
+// still captures the real (quoted) database name.
+func normalizeSQLForShow(sql string) string {
+	features := scanSQLFeatures(sql)
+	masked, masks := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
+	stripped := stripSQLComments(masked, features.hasDashComment || features.hasBlockComment)
+	return strings.TrimSpace(sqlutil.UnmaskStringLiterals(stripped, masks))
+}
+
 // isSingleTableQuery returns true if query has exactly one FROM and no JOINs.
 // These queries can use a faster transformation path.
 func isSingleTableQuery(sqlLower string) bool {
@@ -1428,8 +1443,7 @@ localProcessing:
 	// checkQueryPermissions (zero table refs → allowed), and DuckDB strips the
 	// comment and executes it — returning the database/table list to a caller
 	// the SHOW RBAC gate would have denied. SECURITY: RBAC bypass.
-	showFeatures := scanSQLFeatures(req.SQL)
-	showNormalised := strings.TrimSpace(stripSQLComments(req.SQL, showFeatures.hasDashComment || showFeatures.hasBlockComment))
+	showNormalised := normalizeSQLForShow(req.SQL)
 
 	// Handle SHOW DATABASES command
 	if showDatabasesPattern.MatchString(showNormalised) {
@@ -3271,8 +3285,7 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	// SHOW reach DuckDB unchecked (the regex would not match the raw string,
 	// checkQueryPermissions would find zero table refs, and DuckDB would strip
 	// the comment and execute the SHOW).
-	features := scanSQLFeatures(req.SQL)
-	normalised := strings.TrimSpace(stripSQLComments(req.SQL, features.hasDashComment || features.hasBlockComment))
+	normalised := normalizeSQLForShow(req.SQL)
 
 	if showDatabasesPattern.MatchString(normalised) {
 		if err := h.checkMeasurementPermission(c, "*", "*", "read"); err != nil {
