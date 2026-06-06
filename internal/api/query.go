@@ -3374,6 +3374,7 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 	// Validate the database filter parameter if provided
 	if dbFilter != "" {
 		if err := validateIdentifier(dbFilter); err != nil {
+			metrics.Get().IncQueryErrors()
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 				"success": false,
 				"error":   "invalid database parameter: " + err.Error(),
