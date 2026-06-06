@@ -27,6 +27,12 @@ type mockRBACChecker struct {
 	allowAll     bool
 	allowedDBs   map[string]bool // databases for which read permission is granted
 	deniedReason string
+
+	// deniedMeasurements denies specific "db.measurement" refs even when the
+	// database is in allowedDBs. Used to prove the permission check extracts a
+	// precise table set — e.g. denying "default.time" so a test fails if an
+	// EXTRACT(... FROM time) spurious ref ever reaches the checker.
+	deniedMeasurements map[string]bool
 }
 
 func (m *mockRBACChecker) IsRBACEnabled() bool {
@@ -44,6 +50,14 @@ func (m *mockRBACChecker) CheckPermission(req *auth.PermissionCheckRequest) *aut
 	// Wildcard "*" matching means the user needs *.*:read — denied here
 	// unless allowAll is true.
 	if req.Database == "*" {
+		return &auth.PermissionCheckResult{
+			Allowed: false,
+			Source:  "rbac",
+			Reason:  m.deniedReason,
+		}
+	}
+	// Deny specific db.measurement refs even if the database is allowed.
+	if m.deniedMeasurements != nil && m.deniedMeasurements[req.Database+"."+req.Measurement] {
 		return &auth.PermissionCheckResult{
 			Allowed: false,
 			Source:  "rbac",
@@ -401,11 +415,16 @@ func TestEstimateQuery_RBAC_CommentBypassFixed(t *testing.T) {
 // here has read on default.cpu (the real table) but not default.time, so the
 // request must be allowed (non-403).
 func TestEstimateQuery_RBAC_ExtractFromNotTreatedAsTable(t *testing.T) {
+	// default.* is allowed, but default.time is explicitly denied. If the
+	// in-function FROM mask regresses, extractTableReferences emits a spurious
+	// default.time ref, the checker denies it, and this test fails with 403 —
+	// which is exactly the guard we want.
 	rbac := &mockRBACChecker{
-		enabled:      true,
-		allowAll:     false,
-		allowedDBs:   map[string]bool{"default": true},
-		deniedReason: "no read permission",
+		enabled:            true,
+		allowAll:           false,
+		allowedDBs:         map[string]bool{"default": true},
+		deniedMeasurements: map[string]bool{"default.time": true},
+		deniedReason:       "no read permission",
 	}
 	app := setupQueryRBACTest(t, rbac, tokenMiddleware(1, "default-only"))
 
@@ -421,6 +440,63 @@ func TestEstimateQuery_RBAC_ExtractFromNotTreatedAsTable(t *testing.T) {
 	if resp.StatusCode == fiber.StatusForbidden {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected non-403 (EXTRACT FROM is not a table ref), got 403: %s", string(bodyBytes))
+	}
+}
+
+// TestEstimateQuery_RBAC_CTENameNotTreatedAsTable verifies that a CTE name is
+// not treated as a real measurement: `WITH t AS (SELECT * FROM cpu) SELECT * FROM t`
+// references only default.cpu. The token allows default.* but denies default.t,
+// so if the CTE name leaked through as a table ref the request would 403.
+func TestEstimateQuery_RBAC_CTENameNotTreatedAsTable(t *testing.T) {
+	rbac := &mockRBACChecker{
+		enabled:            true,
+		allowAll:           false,
+		allowedDBs:         map[string]bool{"default": true},
+		deniedMeasurements: map[string]bool{"default.t": true},
+		deniedReason:       "no read permission",
+	}
+	app := setupQueryRBACTest(t, rbac, tokenMiddleware(1, "default-only"))
+
+	body := strings.NewReader(`{"sql": "WITH t AS (SELECT * FROM cpu) SELECT * FROM t"}`)
+	req := httptest.NewRequest("POST", "/api/v1/query/estimate", body)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resp.StatusCode == fiber.StatusForbidden {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected non-403 (CTE name is not a table ref), got 403: %s", string(bodyBytes))
+	}
+}
+
+// TestEstimateQuery_RBAC_TableFunctionNotTreatedAsTable verifies that a
+// table-valued function call (generate_series(...)) is not treated as a table.
+// The token allows default.* but denies default.generate_series.
+func TestEstimateQuery_RBAC_TableFunctionNotTreatedAsTable(t *testing.T) {
+	rbac := &mockRBACChecker{
+		enabled:            true,
+		allowAll:           false,
+		allowedDBs:         map[string]bool{"default": true},
+		deniedMeasurements: map[string]bool{"default.generate_series": true},
+		deniedReason:       "no read permission",
+	}
+	app := setupQueryRBACTest(t, rbac, tokenMiddleware(1, "default-only"))
+
+	body := strings.NewReader(`{"sql": "SELECT * FROM generate_series(1, 10)"}`)
+	req := httptest.NewRequest("POST", "/api/v1/query/estimate", body)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resp.StatusCode == fiber.StatusForbidden {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected non-403 (table function is not a table ref), got 403: %s", string(bodyBytes))
 	}
 }
 
@@ -498,9 +574,12 @@ func TestHasCrossDatabaseSyntax(t *testing.T) {
 		{name: "newline after JOIN", sql: "JOIN\notherdb.cpu", expected: true},
 		{name: "tab after JOIN", sql: "JOIN\totherdb.cpu", expected: true},
 
-		// Keyword boundary: should NOT match "fromage" or "joiner"
-		{name: "from embedded in identifier", sql: "SELECT fromage FROM cpu", expected: false},
-		{name: "join embedded in identifier", sql: "SELECT * FROM cpu JOINER x", expected: false},
+		// Keyword boundary: should NOT match prefix ("fromage"/"joiner") or
+		// suffix ("select_from"/"my_join") identifiers.
+		{name: "from embedded in identifier (prefix)", sql: "SELECT fromage FROM cpu", expected: false},
+		{name: "join embedded in identifier (prefix)", sql: "SELECT * FROM cpu JOINER x", expected: false},
+		{name: "from embedded in identifier (suffix)", sql: "SELECT select_from db.table", expected: false},
+		{name: "join embedded in identifier (suffix)", sql: "SELECT my_join db.table", expected: false},
 
 		// Mixed whitespace
 		{name: "mixed whitespace", sql: "SELECT * FROM \t \n otherdb.cpu", expected: true},
@@ -520,6 +599,11 @@ func TestHasCrossDatabaseSyntax(t *testing.T) {
 		{name: "block comment before cross-db ref", sql: "SELECT * FROM /* sneaky */ otherdb.cpu", expected: true},
 		{name: "dash comment then newline cross-db ref", sql: "SELECT * FROM -- c\notherdb.cpu", expected: true},
 		{name: "cross-db only inside literal", sql: "SELECT * FROM cpu WHERE q = 'FROM otherdb.mem'", expected: false},
+
+		// In-function FROM with a qualified column (alias.col) must NOT be read
+		// as a cross-database db.table reference. `t` is just a table alias.
+		{name: "extract from qualified column", sql: "SELECT EXTRACT(EPOCH FROM t.ts) FROM cpu t", expected: false},
+		{name: "extract from qualified column, no alias", sql: "SELECT EXTRACT(YEAR FROM cpu.time) FROM cpu", expected: false},
 	}
 
 	for _, tt := range tests {

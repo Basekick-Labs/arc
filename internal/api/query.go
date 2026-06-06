@@ -151,12 +151,17 @@ func isIdentChar(c byte) bool {
 // This is faster than regex-based detection for simple pattern matching.
 // Used to reject queries that use db.table syntax when x-arc-database header is set.
 func hasCrossDatabaseSyntax(sql string) bool {
-	// Normalise before scanning: mask string literals and strip comments so the
-	// scan can't be bypassed by hiding the db.table reference inside a comment
-	// (e.g. `FROM /* x */ otherdb.cpu`) or a string literal. Matches the
-	// normalisation applied by checkQueryPermissions / convertSQLToStoragePaths.
+	// Normalise before scanning, matching checkQueryPermissions /
+	// convertSQLToStoragePaths exactly:
+	//   - mask string literals so a db.table inside a literal isn't scanned;
+	//   - mask FROM inside function bodies so `EXTRACT(EPOCH FROM t.ts)` isn't
+	//     misread as a cross-database `t.ts` reference (false 400 on a legit
+	//     query whose `t` is just a table alias);
+	//   - strip comments so a db.table hidden in a comment can't bypass the scan
+	//     (e.g. `FROM /* x */ otherdb.cpu`).
 	features := scanSQLFeatures(sql)
 	sql, _ = sqlutil.MaskStringLiterals(sql, features.hasQuotes)
+	sql, _ = sqlutil.MaskFromKeywordsInFunctionBodies(sql)
 	sql = stripSQLComments(sql, features.hasDashComment || features.hasBlockComment)
 
 	sqlLower := strings.ToLower(sql)
@@ -181,8 +186,14 @@ func hasCrossDatabaseSyntax(sql string) bool {
 			// the byte length on non-ASCII input. The patterns we match (ASCII
 			// whitespace, identifier chars, '.') are unaffected by lowercasing.
 
-			// Verify keyword boundary: next char must be whitespace or end-of-string.
-			// This prevents matching "fromage", "joiner", etc.
+			// Verify keyword boundary on both sides: the preceding char must not
+			// be an identifier char (else this is a suffix like "select_from"),
+			// and the next char must be whitespace or end-of-string (else this is
+			// a prefix like "fromage"/"joiner").
+			startOfKeyword := idx - len(keyword)
+			if startOfKeyword > 0 && isIdentChar(sqlLower[startOfKeyword-1]) {
+				continue
+			}
 			if idx < len(sqlLower) && !isWhitespace(sqlLower[idx]) {
 				continue
 			}
@@ -989,6 +1000,12 @@ func extractTableReferences(sql string) []TableReference {
 	var refs []TableReference
 	seen := make(map[string]bool)
 
+	// CTE names (WITH t AS (...)) are virtual, not real measurements. The query
+	// transform (convertSQLToStoragePaths) skips them, so the permission check
+	// must too — otherwise a query like `WITH t AS (...) SELECT * FROM t` would
+	// demand a spurious default.t:read grant (false denial).
+	cteNames := extractCTENames(sql)
+
 	// Extract database.table references (FROM database.table, JOIN database.table)
 	// These take priority - we track their positions to avoid double-counting
 	dbTableMatches := patternDBTable.FindAllStringSubmatch(sql, -1)
@@ -1033,10 +1050,21 @@ func extractTableReferences(sql string) []TableReference {
 				continue
 			}
 
+			// Skip CTE names — they are virtual, not real measurements.
+			if cteNames[table] {
+				continue
+			}
+
 			// Check if this table name is followed by a dot (meaning it's a database name, not a table)
 			endIdx := matchIdx[3]
 			if endIdx < len(sql) && sql[endIdx] == '.' {
 				// This is actually a database name in "database.table", skip it
+				continue
+			}
+
+			// Skip table-valued function calls (e.g. generate_series(...),
+			// read_csv(...)) — the name is followed by '(', not a real table.
+			if endIdx < len(sql) && sql[endIdx] == '(' {
 				continue
 			}
 
@@ -1062,9 +1090,19 @@ func extractTableReferences(sql string) []TableReference {
 				continue
 			}
 
+			// Skip CTE names — they are virtual, not real measurements.
+			if cteNames[table] {
+				continue
+			}
+
 			// Check if this table name is followed by a dot
 			endIdx := matchIdx[3]
 			if endIdx < len(sql) && sql[endIdx] == '.' {
+				continue
+			}
+
+			// Skip table-valued function calls (name followed by '(').
+			if endIdx < len(sql) && sql[endIdx] == '(' {
 				continue
 			}
 
