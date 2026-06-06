@@ -53,7 +53,14 @@ type TableReference struct {
 // Regex patterns for SHOW commands
 var (
 	showDatabasesPattern = regexp.MustCompile(`(?i)^\s*SHOW\s+DATABASES\s*;?\s*$`)
-	showTablesPattern    = regexp.MustCompile(`(?i)^\s*SHOW\s+(?:TABLES|MEASUREMENTS)(?:\s+FROM\s+([\w-]+))?\s*;?\s*$`)
+	// The database name in `SHOW TABLES FROM <db>` may be quoted ("db", 'db', or
+	// `db`). The capture excludes the quotes so the RBAC check and the listing
+	// use the real database name. The surrounding quotes are matched
+	// independently (RE2 has no backreferences) — that is acceptable here: the
+	// goal is to RECOGNIZE the SHOW so it is RBAC-gated, and over-recognizing is
+	// safe; only a SHOW that fails to match would slip past the gate. Not a raw
+	// string literal because the pattern itself contains a backtick.
+	showTablesPattern = regexp.MustCompile("(?i)^\\s*SHOW\\s+(?:TABLES|MEASUREMENTS)(?:\\s+FROM\\s+[\"'`]?([\\w.-]+)[\"'`]?)?\\s*;?\\s*$")
 )
 
 // Pre-compiled regex patterns for SQL-to-storage-path conversion
@@ -236,6 +243,37 @@ func isFunctionCallAt(sql string, pos int) bool {
 		pos++
 	}
 	return pos < len(sql) && sql[pos] == '('
+}
+
+// maskedQuoteForBacktick lets MaskStringLiterals (which only recognises ' and ")
+// also protect backtick-quoted identifiers: we map ` to " before masking so a
+// comment marker, semicolon, or keyword inside a backtick-quoted name does not
+// leak into comment-stripping / statement-splitting / denylist scanning. The
+// content inside is what matters for those scans; the exact quote character is
+// irrelevant downstream (the SHOW regex's capture excludes quotes either way).
+func backticksToDoubleQuotes(sql string) string {
+	if !strings.ContainsRune(sql, '`') {
+		return sql
+	}
+	return strings.ReplaceAll(sql, "`", "\"")
+}
+
+// normalizeSQLForShow prepares SQL for matching against the anchored SHOW
+// patterns. It masks string literals BEFORE stripping comments, then unmasks —
+// so a comment marker inside a quoted identifier (e.g. SHOW TABLES FROM
+// "my--db" or `my--db`) is not mistaken for a real comment and truncated.
+// Stripping comments on raw SQL first would turn that query into
+// `SHOW TABLES FROM "my`, causing the gate to authorise database `my` while
+// DuckDB executes against `my--db` — an RBAC bypass. Backticks are mapped to
+// double quotes first so backtick-quoted names are masked too (MaskStringLiterals
+// only knows ' and "). The captured database name excludes the surrounding
+// quotes, so the quote-character swap does not change the resolved db.
+func normalizeSQLForShow(sql string) string {
+	sql = backticksToDoubleQuotes(sql)
+	features := scanSQLFeatures(sql)
+	masked, masks := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
+	stripped := stripSQLComments(masked, features.hasDashComment || features.hasBlockComment)
+	return strings.TrimSpace(sqlutil.UnmaskStringLiterals(stripped, masks))
 }
 
 // isSingleTableQuery returns true if query has exactly one FROM and no JOINs.
@@ -1415,8 +1453,16 @@ localProcessing:
 		return respondError(c, fiber.StatusBadRequest, "Cross-database queries (db.table syntax) not allowed when x-arc-database header is set", timestamp, start)
 	}
 
+	// Normalise before matching SHOW: strip comments and trim whitespace so a
+	// comment cannot hide a SHOW command from the anchored regex. Without this,
+	// `/* x */ SHOW DATABASES` fails the raw match, falls through to
+	// checkQueryPermissions (zero table refs → allowed), and DuckDB strips the
+	// comment and executes it — returning the database/table list to a caller
+	// the SHOW RBAC gate would have denied. SECURITY: RBAC bypass.
+	showNormalised := normalizeSQLForShow(req.SQL)
+
 	// Handle SHOW DATABASES command
-	if showDatabasesPattern.MatchString(req.SQL) {
+	if showDatabasesPattern.MatchString(showNormalised) {
 		// Check RBAC - user needs at least some read permission to see databases
 		if err := h.checkMeasurementPermission(c, "*", "*", "read"); err != nil {
 			m.IncQueryErrors()
@@ -1426,10 +1472,25 @@ localProcessing:
 	}
 
 	// Handle SHOW TABLES/MEASUREMENTS command
-	if matches := showTablesPattern.FindStringSubmatch(req.SQL); matches != nil {
+	if matches := showTablesPattern.FindStringSubmatch(showNormalised); matches != nil {
+		// Resolve the target database the same way the command does: explicit
+		// `FROM db` wins, else the x-arc-database header is the implicit target,
+		// else "default". Checking a different database than the listing targets
+		// would be an RBAC bypass (handleShowTables lists `database` below).
 		database := "default"
 		if len(matches) > 1 && matches[1] != "" {
 			database = matches[1]
+		} else if headerDB != "" {
+			database = headerDB
+		}
+		// Validate the resolved database name before it reaches storage. The
+		// SHOW regex permits a quoted/dotted token, so `SHOW TABLES FROM ..`
+		// would otherwise traverse out of the storage root when RBAC is
+		// disabled (handleShowTables lists `database + "/"`). validateIdentifier
+		// rejects anything but alphanumeric/underscore/hyphen.
+		if err := validateIdentifier(database); err != nil {
+			m.IncQueryErrors()
+			return respondError(c, fiber.StatusBadRequest, "invalid database name: "+err.Error(), timestamp, start)
 		}
 		// Check RBAC - user needs read permission on the specific database
 		if err := h.checkMeasurementPermission(c, database, "*", "read"); err != nil {
@@ -1964,10 +2025,31 @@ func ValidateSQLRequest(sql string) error {
 	// Normalise before denylist check: mask string literals so keywords
 	// inside literals don't false-positive, then strip comments so
 	// keywords interleaved with comments don't slip past token
-	// boundaries (`DROP /* */ TABLE x`).
-	features := scanSQLFeatures(sql)
-	normalised, _ := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
+	// boundaries (`DROP /* */ TABLE x`). Map backticks to double quotes first
+	// so backtick-quoted identifiers are masked too — otherwise a semicolon
+	// inside `a;b` would false-trip the multi-statement check below, and a
+	// keyword inside `select` could be scanned. `normalised` is only ever read
+	// (never reconstructed into executable SQL), so the swap is safe here.
+	maskInput := backticksToDoubleQuotes(sql)
+	features := scanSQLFeatures(maskInput)
+	normalised, _ := sqlutil.MaskStringLiterals(maskInput, features.hasQuotes)
 	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
+
+	// SECURITY: reject multi-statement queries. A second statement smuggled
+	// behind a semicolon (`SHOW DATABASES; SELECT 1`) bypasses the anchored
+	// SHOW-command regexes (which require the SHOW to be the whole query),
+	// falls through checkQueryPermissions (a SHOW has no FROM/JOIN table refs,
+	// so zero are extracted → allowed), and DuckDB then executes the statement
+	// list. The dangerous-keyword denylist already blocks the destructive
+	// second statements, but rejecting multiple statements outright closes the
+	// SHOW-smuggling class for every endpoint that calls this (query, msgpack,
+	// arrow, estimate) in one place. A single trailing `;` is allowed; any
+	// semicolon before the final non-space character means >1 statement.
+	// Checked on the comment-stripped, literal-masked form so a `;` inside a
+	// string or comment doesn't false-positive.
+	if strings.Contains(strings.TrimRight(normalised, " \t\n\r;"), ";") {
+		return &SQLValidationError{Message: "Multiple SQL statements are not allowed"}
+	}
 
 	if dangerousSQLPattern.MatchString(normalised) {
 		return &SQLValidationError{Message: "Dangerous SQL operation not allowed"}
@@ -3207,6 +3289,74 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(EstimateResponse{
 			Success:      false,
 			Error:        "invalid x-arc-database header: " + err.Error(),
+			WarningLevel: "error",
+		})
+	}
+
+	// RBAC-gate SHOW commands — mirror executeQuery's permission checks.
+	// SHOW DATABASES / SHOW TABLES extract zero table references, so
+	// checkQueryPermissions (which extracts FROM db.table refs) would pass them
+	// through without a permission check. Reject them here instead; the estimate
+	// endpoint has no legitimate use for metadata commands.
+	//
+	// Normalize the SQL before matching: strip comments and trim whitespace so
+	// that a comment (e.g. /* x */ SHOW DATABASES) cannot hide a SHOW command
+	// from the anchored regex. The same normalization is applied by
+	// checkQueryPermissions below; without it, the comment bypass would let
+	// SHOW reach DuckDB unchecked (the regex would not match the raw string,
+	// checkQueryPermissions would find zero table refs, and DuckDB would strip
+	// the comment and execute the SHOW).
+	normalised := normalizeSQLForShow(req.SQL)
+
+	if showDatabasesPattern.MatchString(normalised) {
+		if err := h.checkMeasurementPermission(c, "*", "*", "read"); err != nil {
+			metrics.Get().IncQueryErrors()
+			return c.Status(fiber.StatusForbidden).JSON(EstimateResponse{
+				Success:      false,
+				Error:        "access denied: no read permission to list databases",
+				WarningLevel: "error",
+			})
+		}
+		return c.Status(fiber.StatusBadRequest).JSON(EstimateResponse{
+			Success:      false,
+			Error:        "SHOW DATABASES is not supported on the estimate endpoint; use /api/v1/query instead",
+			WarningLevel: "error",
+		})
+	}
+	if matches := showTablesPattern.FindStringSubmatch(normalised); matches != nil {
+		// Resolve the target database the same way the command itself does:
+		// an explicit `SHOW TABLES FROM db` wins, otherwise the x-arc-database
+		// header is the implicit target, falling back to "default" only when
+		// neither is set. Checking a different database than the command targets
+		// would either deny a legitimate request or check the wrong scope.
+		database := "default"
+		if len(matches) > 1 && matches[1] != "" {
+			database = matches[1]
+		} else if headerDB != "" {
+			database = headerDB
+		}
+		// Validate the resolved database name (defense-in-depth, matching
+		// executeQuery): the SHOW regex permits a quoted/dotted token, so reject
+		// path-traversal like `SHOW TABLES FROM ..` before any storage access.
+		if err := validateIdentifier(database); err != nil {
+			metrics.Get().IncQueryErrors()
+			return c.Status(fiber.StatusBadRequest).JSON(EstimateResponse{
+				Success:      false,
+				Error:        "invalid database name: " + err.Error(),
+				WarningLevel: "error",
+			})
+		}
+		if err := h.checkMeasurementPermission(c, database, "*", "read"); err != nil {
+			metrics.Get().IncQueryErrors()
+			return c.Status(fiber.StatusForbidden).JSON(EstimateResponse{
+				Success:      false,
+				Error:        fmt.Sprintf("access denied: no read permission for database '%s'", database),
+				WarningLevel: "error",
+			})
+		}
+		return c.Status(fiber.StatusBadRequest).JSON(EstimateResponse{
+			Success:      false,
+			Error:        "SHOW TABLES/MEASUREMENTS is not supported on the estimate endpoint; use /api/v1/query instead",
 			WarningLevel: "error",
 		})
 	}

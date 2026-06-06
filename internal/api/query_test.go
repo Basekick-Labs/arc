@@ -479,7 +479,7 @@ func TestConvertSQLToStoragePaths_FromKeywordFunctions(t *testing.T) {
 			name:  "EXTRACT(YEAR FROM time) FROM table",
 			input: "SELECT EXTRACT(YEAR FROM time) FROM citibike_trips",
 			shouldContain: []string{
-				"EXTRACT(YEAR FROM time)",                              // expression preserved verbatim
+				"EXTRACT(YEAR FROM time)",                                   // expression preserved verbatim
 				"read_parquet('./data/default/citibike_trips/**/*.parquet'", // outer FROM rewritten
 			},
 			shouldNotContain: []string{
@@ -737,6 +737,8 @@ func TestValidateIdentifier(t *testing.T) {
 		{name: "contains quote", input: "db'name", wantErr: true},
 		{name: "contains double quote", input: `db"name`, wantErr: true},
 		{name: "contains dot", input: "db.name", wantErr: true},
+		{name: "path traversal dotdot", input: "..", wantErr: true},
+		{name: "path traversal relative", input: "../secret", wantErr: true},
 		{name: "contains slash", input: "db/name", wantErr: true},
 		{name: "contains backslash", input: `db\name`, wantErr: true},
 		{name: "sql injection attempt", input: "db; DROP TABLE users--", wantErr: true},
@@ -1038,6 +1040,18 @@ func TestValidateSQLRequest_BypassesAndFalsePositives(t *testing.T) {
 		{name: "user arc_partition_agg whitespace", sql: "SELECT * FROM arc_partition_agg  ('db2', 'mem', 'hour')", shouldFail: true},
 		{name: "user arc_partition_agg in CTE", sql: "WITH x AS (SELECT * FROM arc_partition_agg('db2', 'mem', 'hour')) SELECT * FROM x", shouldFail: true},
 		{name: "literal containing arc_partition_agg text", sql: "SELECT * FROM logs WHERE msg = 'arc_partition_agg failed'", shouldFail: false},
+
+		// Multi-statement smuggling — a second statement behind a semicolon
+		// bypasses the anchored SHOW regexes, so reject >1 statement outright.
+		{name: "SHOW smuggled behind semicolon", sql: "SHOW DATABASES; SELECT 1", shouldFail: true},
+		{name: "SHOW TABLES smuggled behind semicolon", sql: `SHOW TABLES FROM "db"; SELECT 1`, shouldFail: true},
+		{name: "two selects", sql: "SELECT 1; SELECT 2", shouldFail: true},
+		{name: "trailing semicolon allowed", sql: "SELECT * FROM cpu;", shouldFail: false},
+		{name: "trailing semicolon with spaces allowed", sql: "SELECT * FROM cpu;   ", shouldFail: false},
+		{name: "semicolon inside string literal allowed", sql: "SELECT * FROM logs WHERE msg = 'a;b'", shouldFail: false},
+		{name: "semicolon inside comment allowed", sql: "SELECT * FROM cpu -- a;b\n", shouldFail: false},
+		{name: "semicolon inside backtick identifier allowed", sql: "SELECT * FROM `my;db`", shouldFail: false},
+		{name: "SHOW smuggled behind semicolon in backtick db", sql: "SHOW TABLES FROM `db`; SELECT 1", shouldFail: true},
 	}
 
 	for _, tt := range tests {
@@ -1092,7 +1106,17 @@ func TestShowTablesPattern(t *testing.T) {
 		{name: "lowercase", sql: "show tables from mydb", shouldMatch: true, database: "mydb"},
 		{name: "with semicolon", sql: "SHOW TABLES;", shouldMatch: true, database: ""},
 
+		// Quoted database names must match and capture the UNquoted name —
+		// otherwise the SHOW RBAC gate is bypassed (the query falls through to
+		// checkQueryPermissions, which finds no table refs and allows it).
+		{name: "double-quoted db", sql: `SHOW TABLES FROM "mydb"`, shouldMatch: true, database: "mydb"},
+		{name: "double-quoted hyphen db", sql: `SHOW TABLES FROM "my-db"`, shouldMatch: true, database: "my-db"},
+		{name: "single-quoted db", sql: "SHOW TABLES FROM 'mydb'", shouldMatch: true, database: "mydb"},
+		{name: "backtick-quoted db", sql: "SHOW TABLES FROM `mydb`", shouldMatch: true, database: "mydb"},
+		{name: "quoted measurements", sql: `SHOW MEASUREMENTS FROM "secretdb"`, shouldMatch: true, database: "secretdb"},
+
 		{name: "select query", sql: "SELECT * FROM tables", shouldMatch: false, database: ""},
+		{name: "trailing junk", sql: "SHOW TABLES FROM mydb extra", shouldMatch: false, database: ""},
 	}
 
 	for _, tt := range tests {
@@ -1112,6 +1136,41 @@ func TestShowTablesPattern(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestNormalizeSQLForShow guards the SHOW-gate normalization: string literals
+// must be masked BEFORE comments are stripped, so a comment marker inside a
+// quoted database name (SHOW TABLES FROM "my--db") is not treated as a real
+// comment and truncated — which would make the gate authorise db "my" while
+// DuckDB executes against "my--db" (RBAC bypass). Real comments outside
+// literals must still be stripped.
+func TestNormalizeSQLForShow(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{name: "dash-comment inside quoted db preserved", sql: `SHOW TABLES FROM "my--db"`, want: `SHOW TABLES FROM "my--db"`},
+		{name: "block-comment inside quoted db preserved", sql: `SHOW TABLES FROM "a/* */b"`, want: `SHOW TABLES FROM "a/* */b"`},
+		{name: "dash-comment inside backtick db preserved", sql: "SHOW TABLES FROM `my--db`", want: `SHOW TABLES FROM "my--db"`},
+		{name: "real leading block comment stripped", sql: `/* c */ SHOW DATABASES`, want: `SHOW DATABASES`},
+		{name: "real trailing dash comment stripped", sql: "SHOW TABLES FROM mydb -- trailing", want: "SHOW TABLES FROM mydb"},
+		{name: "no comments unchanged", sql: "SHOW TABLES FROM mydb", want: "SHOW TABLES FROM mydb"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeSQLForShow(tt.sql); got != tt.want {
+				t.Errorf("normalizeSQLForShow(%q) = %q, want %q", tt.sql, got, tt.want)
+			}
+		})
+	}
+
+	// The quoted name with an embedded comment marker must round-trip through
+	// the regex with the FULL database name captured (not truncated at "--").
+	m := showTablesPattern.FindStringSubmatch(normalizeSQLForShow(`SHOW TABLES FROM "my--db"`))
+	if len(m) < 2 || m[1] != "my--db" {
+		t.Errorf("captured db = %v, want full name \"my--db\"", m)
 	}
 }
 

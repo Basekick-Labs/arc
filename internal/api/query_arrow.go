@@ -79,6 +79,54 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		})
 	}
 
+	// RBAC-gate SHOW commands, mirroring executeQuery / estimateQuery. SHOW
+	// commands carry no FROM/JOIN table references, so checkQueryPermissions
+	// would pass them through unchecked. The Arrow IPC endpoint has no SHOW
+	// result handler (handleShowDatabases/handleShowTables emit JSON), so we
+	// gate on the same permission and return a 400 directing callers to
+	// /api/v1/query. normalizeSQLForShow masks literals before stripping
+	// comments so a comment marker inside a quoted db name can't truncate it.
+	showNormalised := normalizeSQLForShow(req.SQL)
+	if showDatabasesPattern.MatchString(showNormalised) {
+		if err := h.checkMeasurementPermission(c, "*", "*", "read"); err != nil {
+			m.IncQueryErrors()
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+				"success": false,
+				"error":   "access denied: no read permission to list databases",
+			})
+		}
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   "SHOW DATABASES is not supported on the Arrow endpoint; use /api/v1/query instead",
+		})
+	}
+	if matches := showTablesPattern.FindStringSubmatch(showNormalised); matches != nil {
+		database := "default"
+		if len(matches) > 1 && matches[1] != "" {
+			database = matches[1]
+		} else if headerDB != "" {
+			database = headerDB
+		}
+		if err := validateIdentifier(database); err != nil {
+			m.IncQueryErrors()
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"success": false,
+				"error":   "invalid database name: " + err.Error(),
+			})
+		}
+		if err := h.checkMeasurementPermission(c, database, "*", "read"); err != nil {
+			m.IncQueryErrors()
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+				"success": false,
+				"error":   fmt.Sprintf("access denied: no read permission for database '%s'", database),
+			})
+		}
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   "SHOW TABLES/MEASUREMENTS is not supported on the Arrow endpoint; use /api/v1/query instead",
+		})
+	}
+
 	// Check RBAC permissions for all tables referenced in the query
 	if err := h.checkQueryPermissions(c, req.SQL, "read"); err != nil {
 		m.IncQueryErrors()
