@@ -3098,6 +3098,16 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 		})
 	}
 
+	// RBAC permission check for all tables referenced in the query
+	if err := h.checkQueryPermissions(c, req.SQL, "read"); err != nil {
+		metrics.Get().IncQueryErrors()
+		return c.Status(fiber.StatusForbidden).JSON(EstimateResponse{
+			Success:      false,
+			Error:        err.Error(),
+			WarningLevel: "error",
+		})
+	}
+
 	// Convert SQL to storage paths (with caching)
 	convertedSQL, _ := h.getTransformedSQL(req.SQL, headerDB)
 
@@ -3236,6 +3246,15 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 
 	// Optional database filter
 	dbFilter := c.Query("database", "")
+
+	// RBAC permission check - user needs at least some read permission to list measurements
+	if err := h.checkMeasurementPermission(c, "*", "*", "read"); err != nil {
+		metrics.Get().IncQueryErrors()
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"success": false,
+			"error":   err.Error(),
+		})
+	}
 
 	basePath := h.getStorageBasePath()
 	if basePath == "" {

@@ -10,6 +10,8 @@ This release strengthens internal verification routines on the Arc Enterprise ac
 
 `POST /api/v1/databases` and `DELETE /api/v1/databases/:name` now consistently require admin-permission tokens (matching the established convention on every other mutating endpoint in Arc). Read-only routes — listing databases, listing measurements, fetching database metadata — remain accessible to any authenticated token.
 
+**`POST /api/v1/query/estimate` and `GET /api/v1/measurements` now enforce RBAC read-permission checks.** These two endpoints were missing the table-level RBAC authorization that the main `POST /api/v1/query` endpoint already performs. `estimateQuery` now checks read permission for every table referenced in the submitted SQL. `listMeasurements` requires at least one read permission (wildcard `*.*:read`) — matching the existing SHOW DATABASES / SHOW MEASUREMENTS authorization pattern in the query endpoint. The RBAC check is skipped when RBAC is not configured (OSS deployments) or when the token has no RBAC memberships (token-level permissions apply). Overhead is negligible: 51 ns allowed / 186 ns denied for a single permission check, 6–30 µs for SQL table-reference extraction (same cost already paid by `executeQuery`).
+
 Operators on 26.06.1 should plan to upgrade.
 
 ## Bug fixes
