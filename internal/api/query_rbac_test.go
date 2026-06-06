@@ -802,8 +802,9 @@ func TestExecuteQuery_ShowDatabases_CommentBypassDenied(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%q: %v", sql, err)
 		}
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		if resp.StatusCode != fiber.StatusForbidden {
-			bodyBytes, _ := io.ReadAll(resp.Body)
 			t.Errorf("%q: expected 403 (SHOW gate must deny), got %d: %s",
 				sql, resp.StatusCode, string(bodyBytes))
 		}
@@ -834,6 +835,7 @@ func TestExecuteQuery_ShowTables_HeaderDBScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != fiber.StatusForbidden {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected 403 (SHOW TABLES must check the header db, not default), got %d: %s",
