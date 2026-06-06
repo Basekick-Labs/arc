@@ -737,6 +737,8 @@ func TestValidateIdentifier(t *testing.T) {
 		{name: "contains quote", input: "db'name", wantErr: true},
 		{name: "contains double quote", input: `db"name`, wantErr: true},
 		{name: "contains dot", input: "db.name", wantErr: true},
+		{name: "path traversal dotdot", input: "..", wantErr: true},
+		{name: "path traversal relative", input: "../secret", wantErr: true},
 		{name: "contains slash", input: "db/name", wantErr: true},
 		{name: "contains backslash", input: `db\name`, wantErr: true},
 		{name: "sql injection attempt", input: "db; DROP TABLE users--", wantErr: true},

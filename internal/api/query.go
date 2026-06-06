@@ -1453,6 +1453,15 @@ localProcessing:
 		} else if headerDB != "" {
 			database = headerDB
 		}
+		// Validate the resolved database name before it reaches storage. The
+		// SHOW regex permits a quoted/dotted token, so `SHOW TABLES FROM ..`
+		// would otherwise traverse out of the storage root when RBAC is
+		// disabled (handleShowTables lists `database + "/"`). validateIdentifier
+		// rejects anything but alphanumeric/underscore/hyphen.
+		if err := validateIdentifier(database); err != nil {
+			m.IncQueryErrors()
+			return respondError(c, fiber.StatusBadRequest, "invalid database name: "+err.Error(), timestamp, start)
+		}
 		// Check RBAC - user needs read permission on the specific database
 		if err := h.checkMeasurementPermission(c, database, "*", "read"); err != nil {
 			m.IncQueryErrors()
@@ -3275,6 +3284,17 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 			database = matches[1]
 		} else if headerDB != "" {
 			database = headerDB
+		}
+		// Validate the resolved database name (defense-in-depth, matching
+		// executeQuery): the SHOW regex permits a quoted/dotted token, so reject
+		// path-traversal like `SHOW TABLES FROM ..` before any storage access.
+		if err := validateIdentifier(database); err != nil {
+			metrics.Get().IncQueryErrors()
+			return c.Status(fiber.StatusBadRequest).JSON(EstimateResponse{
+				Success:      false,
+				Error:        "invalid database name: " + err.Error(),
+				WarningLevel: "error",
+			})
 		}
 		if err := h.checkMeasurementPermission(c, database, "*", "read"); err != nil {
 			metrics.Get().IncQueryErrors()
