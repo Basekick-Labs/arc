@@ -167,28 +167,34 @@ func hasCrossDatabaseSyntax(sql string) bool {
 			idx += pos + len(keyword)
 			pos = idx
 
+			// All indexing below uses sqlLower, since idx is derived from
+			// strings.Index(sqlLower, ...). Indexing the original sql with this
+			// offset would be incorrect (and could panic) when ToLower changes
+			// the byte length on non-ASCII input. The patterns we match (ASCII
+			// whitespace, identifier chars, '.') are unaffected by lowercasing.
+
 			// Verify keyword boundary: next char must be whitespace or end-of-string.
 			// This prevents matching "fromage", "joiner", etc.
-			if idx < len(sql) && !isWhitespace(sql[idx]) {
+			if idx < len(sqlLower) && !isWhitespace(sqlLower[idx]) {
 				continue
 			}
 
 			// Skip whitespace after keyword (spaces, tabs, newlines)
-			for idx < len(sql) && isWhitespace(sql[idx]) {
+			for idx < len(sqlLower) && isWhitespace(sqlLower[idx]) {
 				idx++
 			}
 
 			// Find first identifier (database name)
 			start := idx
-			for idx < len(sql) && isIdentChar(sql[idx]) {
+			for idx < len(sqlLower) && isIdentChar(sqlLower[idx]) {
 				idx++
 			}
-			if idx == start || idx >= len(sql) {
+			if idx == start || idx >= len(sqlLower) {
 				continue
 			}
 
 			// Check for dot followed by another identifier (table name)
-			if sql[idx] == '.' && idx+1 < len(sql) && isIdentChar(sql[idx+1]) {
+			if sqlLower[idx] == '.' && idx+1 < len(sqlLower) && isIdentChar(sqlLower[idx+1]) {
 				return true
 			}
 		}
@@ -1084,8 +1090,19 @@ func (h *QueryHandler) checkQueryPermissions(c *fiber.Ctx, sql, permission strin
 		return nil
 	}
 
-	// Extract table references from SQL
-	tableRefs := extractTableReferences(sql)
+	// Normalise SQL before extracting table references: mask string literals
+	// (so keywords inside literals don't false-positive) and strip comments
+	// (so a comment interleaved between FROM/JOIN and the table name can't hide
+	// the reference). This MUST match the normalisation that convertSQLToStoragePaths
+	// applies downstream — otherwise a query like `SELECT * FROM /* x */ secret.cpu`
+	// would yield zero table refs here (RBAC skipped) yet still execute against
+	// secret.cpu after the transform strips the comment. SECURITY: RBAC bypass.
+	features := scanSQLFeatures(sql)
+	normalisedSQL, _ := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
+	normalisedSQL = stripSQLComments(normalisedSQL, features.hasDashComment || features.hasBlockComment)
+
+	// Extract table references from the normalised SQL
+	tableRefs := extractTableReferences(normalisedSQL)
 	if len(tableRefs) == 0 {
 		// No tables referenced (e.g., SELECT 1+1)
 		return nil

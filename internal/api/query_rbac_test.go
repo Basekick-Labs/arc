@@ -360,6 +360,40 @@ func TestEstimateQuery_RBAC_HeaderBypassFixed(t *testing.T) {
 	}
 }
 
+// TestEstimateQuery_RBAC_CommentBypassFixed verifies the critical RBAC-bypass
+// fix: a comment interleaved between FROM and the table name must not hide the
+// table reference from the permission check. Before normalisation, the regex in
+// extractTableReferences failed to match `FROM /* x */ otherdb.cpu`, so zero
+// refs were found and RBAC was skipped — yet convertSQLToStoragePaths strips the
+// comment downstream and executes against otherdb.cpu. The user here only has
+// read on "default", so the request must be denied (403) once the comment is
+// stripped before extraction.
+func TestEstimateQuery_RBAC_CommentBypassFixed(t *testing.T) {
+	rbac := &mockRBACChecker{
+		enabled:      true,
+		allowAll:     false,
+		allowedDBs:   map[string]bool{"default": true},
+		deniedReason: "no read permission",
+	}
+	app := setupQueryRBACTest(t, rbac, tokenMiddleware(1, "default-only"))
+
+	// Block comment between FROM and the table reference.
+	body := strings.NewReader(`{"sql": "SELECT * FROM /* sneaky */ otherdb.cpu"}`)
+	req := httptest.NewRequest("POST", "/api/v1/query/estimate", body)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resp.StatusCode != fiber.StatusForbidden {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 403 (comment-hidden table ref must still be checked), got %d: %s",
+			resp.StatusCode, string(bodyBytes))
+	}
+}
+
 // TestEstimateQuery_CrossDBSyntaxRejected verifies Gemini finding #3 fix:
 // when x-arc-database header is set, cross-database syntax (db.table) must
 // be rejected with 400, matching executeQuery behavior.
@@ -444,6 +478,12 @@ func TestHasCrossDatabaseSyntax(t *testing.T) {
 		// Case insensitivity
 		{name: "uppercase FROM", sql: "SELECT * FROM otherdb.cpu", expected: true},
 		{name: "mixed case From", sql: "SELECT * From otherdb.cpu", expected: true},
+
+		// Non-ASCII: ToLower may change byte length, so indexing must stay on
+		// sqlLower. These must not panic (Gemini R4 medium).
+		{name: "non-ascii in literal, no cross-db", sql: "SELECT * FROM cpu WHERE name = 'café'", expected: false},
+		{name: "non-ascii before cross-db ref", sql: "SELECT 'naïve' FROM otherdb.cpu", expected: true},
+		{name: "non-ascii multibyte İ then from", sql: "SELECT 'İstanbul' FROM otherdb.cpu", expected: true},
 	}
 
 	for _, tt := range tests {
