@@ -653,16 +653,16 @@ func TestGetColumnSignature(t *testing.T) {
 			columns: map[string]interface{}{
 				"value": []float64{1.0},
 			},
-			expected: "value",
+			expected: "value:f64",
 		},
 		{
-			name: "multiple columns sorted (names only, no types)",
+			name: "multiple columns sorted (name:type)",
 			columns: map[string]interface{}{
 				"zebra": []string{"a"},
 				"apple": []int64{1},
 				"mango": []float64{1.0},
 			},
-			expected: "apple,mango,zebra",
+			expected: "apple:i64,mango:f64,zebra:str",
 		},
 		{
 			name: "skips internal columns",
@@ -671,7 +671,7 @@ func TestGetColumnSignature(t *testing.T) {
 				"time":    []int64{1},
 				"_hidden": []string{"x"},
 			},
-			expected: "time,value",
+			expected: "time:i64,value:f64",
 		},
 		{
 			name: "skips empty column names",
@@ -679,7 +679,7 @@ func TestGetColumnSignature(t *testing.T) {
 				"value": []float64{1.0},
 				"":      []int64{1},
 			},
-			expected: "value",
+			expected: "value:f64",
 		},
 	}
 
@@ -692,16 +692,16 @@ func TestGetColumnSignature(t *testing.T) {
 		})
 	}
 
-	// REGRESSION GUARD (#411 revert): the signature is names-only, so a column
-	// arriving with different Go types across batches MUST produce the SAME
-	// signature. This keeps mixed-type batches in one buffer (collide loudly /
-	// coerce) instead of fanning them out into separate parquet files with
-	// conflicting column types, which permanently wedged compaction.
-	t.Run("type change produces SAME signature (no fan-out)", func(t *testing.T) {
+	// Type-awareness is load-bearing: a column with different Go types across
+	// batches MUST get different signatures so they route to separate buffers,
+	// preventing the mergeBatches type-assertion panic. (The time column is
+	// separately forced to int64 at the typing chokepoint, so it never relies
+	// on this to avoid the compaction fan-out — see TestConvertColumnsToTyped_TimeForcedInt64.)
+	t.Run("type change produces different signature (panic-safe routing)", func(t *testing.T) {
 		sig1 := getColumnSignature(map[string]interface{}{"cpu": []int64{1}})
 		sig2 := getColumnSignature(map[string]interface{}{"cpu": []float64{1.0}})
-		if sig1 != sig2 {
-			t.Errorf("Expected same signature for int64 vs float64 (names-only), got %q and %q", sig1, sig2)
+		if sig1 == sig2 {
+			t.Errorf("Expected different signatures for int64 vs float64, both got %q", sig1)
 		}
 	})
 }
@@ -1059,6 +1059,18 @@ func TestConvertColumnsToTyped_TimeForcedInt64(t *testing.T) {
 		})
 		if err == nil {
 			t.Fatal("expected error for string time, got nil (would write VARCHAR time)")
+		}
+	})
+
+	t.Run("null time rejected", func(t *testing.T) {
+		// A nil time would otherwise become 0 → routed to the 1970-01-01
+		// partition silently (groupByHour reads the slice without validity).
+		_, _, err := buffer.convertColumnsToTyped("m", map[string][]interface{}{
+			"time":  {int64(1609459200000000), nil},
+			"value": {1.0, 2.0},
+		})
+		if err == nil {
+			t.Fatal("expected error for null time, got nil (would route to 1970 partition)")
 		}
 	})
 }

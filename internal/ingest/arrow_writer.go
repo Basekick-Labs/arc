@@ -833,39 +833,57 @@ type ArrowBuffer struct {
 // int64→float64 on the same column) is detected as schema evolution and triggers a
 // flush before the new-schema data is appended.
 func getColumnSignature(columns map[string]interface{}) string {
-	// Signature is column NAMES only — NOT types. #411 made this type-aware
-	// ("name:type") to treat a column's type change as schema evolution. That
-	// had a damaging side effect: when a column (especially "time") arrived as
-	// int64 in some batches and string in others, the differing signatures
-	// routed those batches into SEPARATE parquet files in the same partition.
-	// Compaction then could not reconcile the conflicting column types
-	// (read_parquet union_by_name reconciles names, not types) and failed to
-	// bind "time" (TIMESTAMP != VARCHAR), permanently wedging the partition.
-	// Reverted to names-only: a within-buffer type change collides loudly at
-	// write time (or is coerced) instead of silently fanning out into
-	// un-compactable files. Type correctness for "time" is enforced separately
-	// at the typing chokepoint. Kept the strings.Builder so the allocation win
-	// from #411 is preserved.
-	names := make([]string, 0, len(columns))
-	size := -1 // first name adds 0 separators; each subsequent adds 1
-	for name := range columns {
+	// Signature encodes column NAME:TYPE. The type component is load-bearing:
+	// if two batches for the same measurement differ in a column's Go type
+	// (e.g. a field "cpu" sent as int64 then float64), they MUST get different
+	// signatures so they land in separate buffers. Otherwise mergeBatches
+	// allocates the merged column by the first batch's type and then
+	// type-asserts the second batch against it (copy(merged[name].([]float64),
+	// v)) — which panics and crashes the server when the types disagree.
+	//
+	// This does NOT reintroduce the time-column fan-out that wedged compaction
+	// (#411 regression): the "time" column is forced to int64 at the typing
+	// chokepoint (see convertColumnsToTyped), so its signature component is
+	// always "time:i64" and time can never fan out into mixed-type files. The
+	// type-awareness only protects the OTHER columns from the merge panic.
+	type colEntry struct{ name, typ string }
+	entries := make([]colEntry, 0, len(columns))
+	size := -1 // first entry adds 0 commas; each subsequent adds 1
+	for name, val := range columns {
 		if len(name) == 0 || name[0] == '_' {
 			continue // skip empty and internal columns
 		}
-		names = append(names, name)
-		size += 1 + len(name)
+		var typ string
+		switch val.(type) {
+		case []int64:
+			typ = "i64"
+		case []float64:
+			typ = "f64"
+		case []string:
+			typ = "str"
+		case []bool:
+			typ = "bool"
+		case []decimal128.Num:
+			typ = "dec"
+		default:
+			typ = "unk"
+		}
+		entries = append(entries, colEntry{name, typ})
+		size += 1 + len(name) + 1 + len(typ) // comma + name + colon + typ
 	}
-	if len(names) == 0 {
+	if len(entries) == 0 {
 		return ""
 	}
-	sort.Strings(names)
+	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
 	var sb strings.Builder
 	sb.Grow(size)
-	for i, name := range names {
+	for i, e := range entries {
 		if i > 0 {
 			sb.WriteByte(',')
 		}
-		sb.WriteString(name)
+		sb.WriteString(e.name)
+		sb.WriteByte(':')
+		sb.WriteString(e.typ)
 	}
 	return sb.String()
 }
@@ -1898,14 +1916,13 @@ func (b *ArrowBuffer) convertColumnsToTyped(measurement string, columns map[stri
 				return nil, 0, fmt.Errorf("time column must be numeric epoch, got string in measurement '%s' (writer must send an integer/float timestamp, not a string)", measurement)
 			}
 			arr := make([]int64, len(col))
-			valid := make([]bool, len(col))
-			hasNils := false
 			for i, v := range col {
+				// Reject null time: groupByHour reads the time slice directly
+				// (no validity check), so a nil would become 0 and silently
+				// route the record to the 1970-01-01 partition.
 				if v == nil {
-					hasNils = true
-					continue
+					return nil, 0, fmt.Errorf("time column cannot contain null values in measurement '%s'", measurement)
 				}
-				valid[i] = true
 				ts, ok := toInt64(v)
 				if !ok {
 					return nil, 0, fmt.Errorf("time column value %T not convertible to int64 in measurement '%s'", v, measurement)
@@ -1913,9 +1930,6 @@ func (b *ArrowBuffer) convertColumnsToTyped(measurement string, columns map[stri
 				arr[i] = ts
 			}
 			typed[name] = arr
-			if hasNils {
-				validity[name] = valid
-			}
 			continue
 		}
 

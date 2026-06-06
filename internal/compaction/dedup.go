@@ -153,18 +153,27 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 }
 
 // timeNormalizeReplace is the DuckDB `REPLACE (...)` expression that coerces a
-// possibly-mixed-type "time" column to a single TIMESTAMP type during compaction.
-// A partition can contain files where "time" is a proper TIMESTAMP and others
+// possibly-mixed-type "time" column to a single canonical type during compaction.
+// A partition can contain files where "time" is a proper timestamp and others
 // where a misbehaving writer wrote it as VARCHAR; read_parquet(union_by_name=true)
 // reconciles column NAMES but not conflicting TYPES, so without this the column
-// bind fails (TIMESTAMP != VARCHAR) and the partition can never compact.
+// bind fails (TIMESTAMP WITH TIME ZONE != VARCHAR) and the partition can never
+// compact.
+//
+// The target type is TIMESTAMPTZ (TIMESTAMP WITH TIME ZONE), NOT naive TIMESTAMP:
+// Arc's Arrow writer types time as Timestamp_us{TimeZone:"UTC"}, which DuckDB
+// reads/writes as TIMESTAMP WITH TIME ZONE. Normalizing to naive TIMESTAMP would
+// strip the zone and make the compacted file's time type disagree with future
+// raw files (TIMESTAMPTZ) — recreating the very bind mismatch this fixes on the
+// NEXT compaction cycle. Casting to TIMESTAMPTZ keeps compacted output identical
+// to the normal ingest schema.
 //
 // COALESCE order handles every case:
-//   - already TIMESTAMP, or an ISO/datetime string → TRY_CAST(... AS TIMESTAMP)
+//   - already TIMESTAMPTZ, or an ISO/datetime string → TRY_CAST(... AS TIMESTAMPTZ)
 //   - epoch-microseconds written as a string ("1717689600000000") →
-//     make_timestamp(BIGINT micros). Arc stores time as Timestamp_us, so the
-//     integer is microseconds, which is exactly make_timestamp's unit.
-const timeNormalizeReplace = `COALESCE(TRY_CAST("time" AS TIMESTAMP), make_timestamp(TRY_CAST("time" AS BIGINT))) AS "time"`
+//     make_timestamptz(BIGINT micros). Arc stores time as microseconds, which is
+//     exactly make_timestamptz's unit; it yields a UTC-anchored TIMESTAMPTZ.
+const timeNormalizeReplace = `COALESCE(TRY_CAST("time" AS TIMESTAMPTZ), make_timestamptz(TRY_CAST("time" AS BIGINT))) AS "time"`
 
 // countParquetRows counts total rows across Parquet files using metadata (no data scan).
 // fileListSQL is a DuckDB array literal like "['file1.parquet', 'file2.parquet']".
