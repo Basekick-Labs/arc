@@ -360,6 +360,58 @@ func TestEstimateQuery_RBAC_HeaderBypassFixed(t *testing.T) {
 	}
 }
 
+// TestEstimateQuery_CrossDBSyntaxRejected verifies Gemini finding #3 fix:
+// when x-arc-database header is set, cross-database syntax (db.table) must
+// be rejected with 400, matching executeQuery behavior.
+func TestEstimateQuery_CrossDBSyntaxRejected(t *testing.T) {
+	rbac := &mockRBACChecker{
+		enabled:  true,
+		allowAll: true,
+	}
+	app := setupQueryRBACTest(t, rbac, tokenMiddleware(1, "test-token"))
+
+	body := strings.NewReader(`{"sql": "SELECT * FROM otherdb.cpu"}`)
+	req := httptest.NewRequest("POST", "/api/v1/query/estimate", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-arc-database", "mydb")
+
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resp.StatusCode != fiber.StatusBadRequest {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400 (cross-database syntax rejected), got %d: %s",
+			resp.StatusCode, string(bodyBytes))
+	}
+}
+
+// TestListMeasurements_InvalidDbFilter verifies Gemini finding #4 fix:
+// an invalid database query parameter should be rejected with 400 before
+// reaching the RBAC check.
+func TestListMeasurements_InvalidDbFilter(t *testing.T) {
+	rbac := &mockRBACChecker{
+		enabled:  true,
+		allowAll: true,
+	}
+	app := setupQueryRBACTest(t, rbac, tokenMiddleware(1, "test-token"))
+
+	// Database name with invalid characters
+	req := httptest.NewRequest("GET", "/api/v1/measurements?database=bad;name", nil)
+
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resp.StatusCode != fiber.StatusBadRequest {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400 (invalid db filter), got %d: %s",
+			resp.StatusCode, string(bodyBytes))
+	}
+}
+
 // =============================================================================
 // Benchmarks — measure RBAC check overhead on the hot query path
 // =============================================================================

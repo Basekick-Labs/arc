@@ -3111,6 +3111,17 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 		})
 	}
 
+	// If header is set, reject cross-database syntax (db.table not allowed),
+	// matching the validation in executeQuery.
+	if headerDB != "" && hasCrossDatabaseSyntax(req.SQL) {
+		metrics.Get().IncQueryErrors()
+		return c.Status(fiber.StatusBadRequest).JSON(EstimateResponse{
+			Success:      false,
+			Error:        "Cross-database queries (db.table syntax) not allowed when x-arc-database header is set",
+			WarningLevel: "error",
+		})
+	}
+
 	// RBAC permission check for all tables referenced in the query
 	if err := h.checkQueryPermissions(c, req.SQL, "read"); err != nil {
 		metrics.Get().IncQueryErrors()
@@ -3259,6 +3270,16 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 
 	// Optional database filter
 	dbFilter := c.Query("database", "")
+
+	// Validate the database filter parameter if provided
+	if dbFilter != "" {
+		if err := validateIdentifier(dbFilter); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"success": false,
+				"error":   "invalid database parameter: " + err.Error(),
+			})
+		}
+	}
 
 	// RBAC permission check - user needs at least some read permission to list measurements.
 	// When a database filter is specified, check against that specific database instead of
