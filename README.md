@@ -104,7 +104,7 @@ Test config: 12 concurrent workers, 1000-record batches, columnar data.
 | MessagePack Columnar | **19.9M rec/s** | 0.43ms | 2.95ms |
 | MessagePack + Zstd | 16.5M rec/s | 0.60ms | 2.70ms |
 | MessagePack + GZIP | 16.5M rec/s | 0.60ms | 2.71ms |
-| Line Protocol | 4.6M rec/s | 2.14ms | 8.46ms |
+| Line Protocol | 5.3M rec/s | 1.81ms | 7.69ms |
 
 ### Compaction
 
