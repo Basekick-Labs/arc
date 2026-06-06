@@ -16,7 +16,6 @@ import (
 	"bytes"
 	"math"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/basekick-labs/arc/pkg/models"
@@ -302,10 +301,10 @@ func (p *LineProtocolParser) parseFieldValue(value []byte, validUTF8 bool) inter
 			return false
 		}
 	}
-	if len(value) == 4 && bytesEqualFold(value, []byte("true")) {
+	if len(value) == 4 && bytesEqualFold(value, "true") {
 		return true
 	}
-	if len(value) == 5 && bytesEqualFold(value, []byte("false")) {
+	if len(value) == 5 && bytesEqualFold(value, "false") {
 		return false
 	}
 
@@ -321,7 +320,7 @@ func (p *LineProtocolParser) parseFieldValue(value []byte, validUTF8 bool) inter
 			return sanitized
 		}
 		// Malformed quoted string - return as-is without leading quote, sanitized
-		trimmed := strings.Trim(string(value), "\"")
+		trimmed := string(bytes.Trim(value, "\""))
 		if validUTF8 {
 			return trimmed
 		}
@@ -365,8 +364,8 @@ func (p *LineProtocolParser) parseFieldValue(value []byte, validUTF8 bool) inter
 }
 
 // bytesEqualFold is a zero-allocation ASCII case-insensitive comparison
-// for two byte slices. Only correct for ASCII alphabetic characters.
-func bytesEqualFold(a, b []byte) bool {
+// between a byte slice and a string. Only correct for ASCII alphabetic characters.
+func bytesEqualFold(a []byte, b string) bool {
 	if len(a) != len(b) {
 		return false
 	}
