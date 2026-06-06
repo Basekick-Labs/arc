@@ -226,6 +226,18 @@ func isWhitespace(b byte) bool {
 	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
 }
 
+// isFunctionCallAt reports whether the identifier ending at index `pos` is a
+// function call — i.e. the next non-whitespace byte is '('. SQL permits
+// whitespace between a function name and its opening paren (`generate_series
+// (1, 10)`), so a bare `sql[pos] == '('` check misses the spaced form and
+// would extract the function name as a spurious table reference.
+func isFunctionCallAt(sql string, pos int) bool {
+	for pos < len(sql) && isWhitespace(sql[pos]) {
+		pos++
+	}
+	return pos < len(sql) && sql[pos] == '('
+}
+
 // isSingleTableQuery returns true if query has exactly one FROM and no JOINs.
 // These queries can use a faster transformation path.
 func isSingleTableQuery(sqlLower string) bool {
@@ -1064,7 +1076,11 @@ func extractTableReferences(sql string) []TableReference {
 
 			// Skip table-valued function calls (e.g. generate_series(...),
 			// read_csv(...)) — the name is followed by '(', not a real table.
-			if endIdx < len(sql) && sql[endIdx] == '(' {
+			// SQL allows whitespace before the paren (`generate_series  (…)`),
+			// and the query transform treats it as a function regardless, so the
+			// extractor must skip whitespace too to stay in parity (else a false
+			// default.<fn> ref → 403).
+			if isFunctionCallAt(sql, endIdx) {
 				continue
 			}
 
@@ -1101,8 +1117,9 @@ func extractTableReferences(sql string) []TableReference {
 				continue
 			}
 
-			// Skip table-valued function calls (name followed by '(').
-			if endIdx < len(sql) && sql[endIdx] == '(' {
+			// Skip table-valued function calls (name followed by '(', possibly
+			// after whitespace) — see the simple-table loop above.
+			if isFunctionCallAt(sql, endIdx) {
 				continue
 			}
 

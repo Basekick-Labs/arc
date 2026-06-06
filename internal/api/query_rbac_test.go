@@ -485,7 +485,9 @@ func TestEstimateQuery_RBAC_TableFunctionNotTreatedAsTable(t *testing.T) {
 	}
 	app := setupQueryRBACTest(t, rbac, tokenMiddleware(1, "default-only"))
 
-	body := strings.NewReader(`{"sql": "SELECT * FROM generate_series(1, 10)"}`)
+	// Note the whitespace before '(' — SQL allows it, and the extractor must
+	// skip it too (Gemini R7) or generate_series is misread as default.generate_series.
+	body := strings.NewReader(`{"sql": "SELECT * FROM generate_series  (1, 10)"}`)
 	req := httptest.NewRequest("POST", "/api/v1/query/estimate", body)
 	req.Header.Set("Content-Type", "application/json")
 
