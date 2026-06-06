@@ -1415,8 +1415,17 @@ localProcessing:
 		return respondError(c, fiber.StatusBadRequest, "Cross-database queries (db.table syntax) not allowed when x-arc-database header is set", timestamp, start)
 	}
 
+	// Normalise before matching SHOW: strip comments and trim whitespace so a
+	// comment cannot hide a SHOW command from the anchored regex. Without this,
+	// `/* x */ SHOW DATABASES` fails the raw match, falls through to
+	// checkQueryPermissions (zero table refs → allowed), and DuckDB strips the
+	// comment and executes it — returning the database/table list to a caller
+	// the SHOW RBAC gate would have denied. SECURITY: RBAC bypass.
+	showFeatures := scanSQLFeatures(req.SQL)
+	showNormalised := strings.TrimSpace(stripSQLComments(req.SQL, showFeatures.hasDashComment || showFeatures.hasBlockComment))
+
 	// Handle SHOW DATABASES command
-	if showDatabasesPattern.MatchString(req.SQL) {
+	if showDatabasesPattern.MatchString(showNormalised) {
 		// Check RBAC - user needs at least some read permission to see databases
 		if err := h.checkMeasurementPermission(c, "*", "*", "read"); err != nil {
 			m.IncQueryErrors()
@@ -1426,10 +1435,16 @@ localProcessing:
 	}
 
 	// Handle SHOW TABLES/MEASUREMENTS command
-	if matches := showTablesPattern.FindStringSubmatch(req.SQL); matches != nil {
+	if matches := showTablesPattern.FindStringSubmatch(showNormalised); matches != nil {
+		// Resolve the target database the same way the command does: explicit
+		// `FROM db` wins, else the x-arc-database header is the implicit target,
+		// else "default". Checking a different database than the listing targets
+		// would be an RBAC bypass (handleShowTables lists `database` below).
 		database := "default"
 		if len(matches) > 1 && matches[1] != "" {
 			database = matches[1]
+		} else if headerDB != "" {
+			database = headerDB
 		}
 		// Check RBAC - user needs read permission on the specific database
 		if err := h.checkMeasurementPermission(c, database, "*", "read"); err != nil {
@@ -3243,9 +3258,16 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 		})
 	}
 	if matches := showTablesPattern.FindStringSubmatch(normalised); matches != nil {
+		// Resolve the target database the same way the command itself does:
+		// an explicit `SHOW TABLES FROM db` wins, otherwise the x-arc-database
+		// header is the implicit target, falling back to "default" only when
+		// neither is set. Checking a different database than the command targets
+		// would either deny a legitimate request or check the wrong scope.
 		database := "default"
 		if len(matches) > 1 && matches[1] != "" {
 			database = matches[1]
+		} else if headerDB != "" {
+			database = headerDB
 		}
 		if err := h.checkMeasurementPermission(c, database, "*", "read"); err != nil {
 			metrics.Get().IncQueryErrors()
