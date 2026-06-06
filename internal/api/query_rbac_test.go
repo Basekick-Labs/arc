@@ -765,3 +765,104 @@ GROUP BY a.host, b.region`
 		_ = extractTableReferences(sql)
 	}
 }
+
+// =============================================================================
+// SHOW-command RBAC gate — endpoint-level tests (POST /api/v1/query)
+//
+// These exercise the full handler path (not just the regex), confirming the
+// SHOW gate denies before any storage access. Each is revert-verified: with
+// its fix removed, the request escapes the gate and the test fails.
+// =============================================================================
+
+// TestExecuteQuery_ShowDatabases_CommentBypassDenied verifies a SHOW command
+// hidden behind a comment cannot bypass the RBAC gate. The gate matches against
+// comment-stripped SQL (normalizeSQLForShow); without that, the raw match fails,
+// checkQueryPermissions finds zero table refs and allows it, and DuckDB strips
+// the comment and executes the SHOW — leaking the database list. The token here
+// lacks *.*:read, so every form must be denied (403).
+func TestExecuteQuery_ShowDatabases_CommentBypassDenied(t *testing.T) {
+	rbac := &mockRBACChecker{
+		enabled:      true,
+		allowAll:     false, // *.* check is denied
+		deniedReason: "no read permission to list databases",
+	}
+	app := setupQueryRBACTest(t, rbac, tokenMiddleware(1, "no-wildcard"))
+
+	for _, sql := range []string{
+		"SHOW DATABASES",
+		"/* sneaky */ SHOW DATABASES",
+		"-- sneaky\nSHOW DATABASES",
+		"SHOW DATABASES -- trailing",
+	} {
+		body := strings.NewReader(`{"sql": ` + jsonQuote(sql) + `}`)
+		req := httptest.NewRequest("POST", "/api/v1/query", body)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := app.Test(req, -1)
+		if err != nil {
+			t.Fatalf("%q: %v", sql, err)
+		}
+		if resp.StatusCode != fiber.StatusForbidden {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			t.Errorf("%q: expected 403 (SHOW gate must deny), got %d: %s",
+				sql, resp.StatusCode, string(bodyBytes))
+		}
+	}
+}
+
+// TestExecuteQuery_ShowTables_HeaderDBScoped verifies that SHOW TABLES with no
+// explicit `FROM db` checks permission against the x-arc-database header (the
+// database the command actually targets via handleShowTables), not literal
+// "default". The token has read on "default" but not "secretdb"; with
+// x-arc-database: secretdb the request must be denied (403), proving the check
+// follows the header.
+func TestExecuteQuery_ShowTables_HeaderDBScoped(t *testing.T) {
+	rbac := &mockRBACChecker{
+		enabled:      true,
+		allowAll:     false,
+		allowedDBs:   map[string]bool{"default": true},
+		deniedReason: "no read permission",
+	}
+	app := setupQueryRBACTest(t, rbac, tokenMiddleware(1, "default-only"))
+
+	body := strings.NewReader(`{"sql": "SHOW TABLES"}`)
+	req := httptest.NewRequest("POST", "/api/v1/query", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-arc-database", "secretdb")
+
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != fiber.StatusForbidden {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 403 (SHOW TABLES must check the header db, not default), got %d: %s",
+			resp.StatusCode, string(bodyBytes))
+	}
+}
+
+// jsonQuote returns a JSON-quoted string for embedding a SQL string (with
+// newlines/quotes) into a request body without pulling in encoding/json at the
+// call sites.
+func jsonQuote(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\r':
+			b.WriteString(`\r`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
