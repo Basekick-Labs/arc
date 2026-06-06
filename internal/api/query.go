@@ -53,7 +53,14 @@ type TableReference struct {
 // Regex patterns for SHOW commands
 var (
 	showDatabasesPattern = regexp.MustCompile(`(?i)^\s*SHOW\s+DATABASES\s*;?\s*$`)
-	showTablesPattern    = regexp.MustCompile(`(?i)^\s*SHOW\s+(?:TABLES|MEASUREMENTS)(?:\s+FROM\s+([\w-]+))?\s*;?\s*$`)
+	// The database name in `SHOW TABLES FROM <db>` may be quoted ("db", 'db', or
+	// `db`). The capture excludes the quotes so the RBAC check and the listing
+	// use the real database name. The surrounding quotes are matched
+	// independently (RE2 has no backreferences) — that is acceptable here: the
+	// goal is to RECOGNIZE the SHOW so it is RBAC-gated, and over-recognizing is
+	// safe; only a SHOW that fails to match would slip past the gate. Not a raw
+	// string literal because the pattern itself contains a backtick.
+	showTablesPattern = regexp.MustCompile("(?i)^\\s*SHOW\\s+(?:TABLES|MEASUREMENTS)(?:\\s+FROM\\s+[\"'`]?([\\w.-]+)[\"'`]?)?\\s*;?\\s*$")
 )
 
 // Pre-compiled regex patterns for SQL-to-storage-path conversion

@@ -479,7 +479,7 @@ func TestConvertSQLToStoragePaths_FromKeywordFunctions(t *testing.T) {
 			name:  "EXTRACT(YEAR FROM time) FROM table",
 			input: "SELECT EXTRACT(YEAR FROM time) FROM citibike_trips",
 			shouldContain: []string{
-				"EXTRACT(YEAR FROM time)",                              // expression preserved verbatim
+				"EXTRACT(YEAR FROM time)",                                   // expression preserved verbatim
 				"read_parquet('./data/default/citibike_trips/**/*.parquet'", // outer FROM rewritten
 			},
 			shouldNotContain: []string{
@@ -1092,7 +1092,17 @@ func TestShowTablesPattern(t *testing.T) {
 		{name: "lowercase", sql: "show tables from mydb", shouldMatch: true, database: "mydb"},
 		{name: "with semicolon", sql: "SHOW TABLES;", shouldMatch: true, database: ""},
 
+		// Quoted database names must match and capture the UNquoted name —
+		// otherwise the SHOW RBAC gate is bypassed (the query falls through to
+		// checkQueryPermissions, which finds no table refs and allows it).
+		{name: "double-quoted db", sql: `SHOW TABLES FROM "mydb"`, shouldMatch: true, database: "mydb"},
+		{name: "double-quoted hyphen db", sql: `SHOW TABLES FROM "my-db"`, shouldMatch: true, database: "my-db"},
+		{name: "single-quoted db", sql: "SHOW TABLES FROM 'mydb'", shouldMatch: true, database: "mydb"},
+		{name: "backtick-quoted db", sql: "SHOW TABLES FROM `mydb`", shouldMatch: true, database: "mydb"},
+		{name: "quoted measurements", sql: `SHOW MEASUREMENTS FROM "secretdb"`, shouldMatch: true, database: "secretdb"},
+
 		{name: "select query", sql: "SELECT * FROM tables", shouldMatch: false, database: ""},
+		{name: "trailing junk", sql: "SHOW TABLES FROM mydb extra", shouldMatch: false, database: ""},
 	}
 
 	for _, tt := range tests {
