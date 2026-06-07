@@ -116,10 +116,31 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 	`, timeNormalizeReplace, fileListSQL, orderByClause, escapedOutput)
 	}
 
-	// Dedup compaction — use ROW_NUMBER to keep one row per unique key.
-	// PARTITION BY all tag columns + time: rows with identical (tags, time) are duplicates.
-	// Among duplicates, one row is kept (choice is arbitrary since all share the same time).
-	// The __dedup_rn column is excluded from the output via EXCLUDE.
+	// Dedup compaction — keep one row per unique (tags, time) key.
+	//
+	// The "time" normalization MUST be materialized in a CTE that the dedup
+	// window reads from. Two subtle DuckDB facts drive this structure:
+	//
+	//  1. A `SELECT *, ROW_NUMBER() OVER(...) ) WHERE rn=1` subquery re-expands
+	//     `*` over the raw `read_parquet(union_by_name=true)` schema and mis-binds
+	//     "time" as VARCHAR across many files (TIMESTAMP WITH TIME ZONE != VARCHAR
+	//     plan error) — even when every file's time is a valid TIMESTAMPTZ.
+	//  2. QUALIFY is evaluated BEFORE the SELECT projection, so a top-level
+	//     `SELECT * REPLACE(time...) ... QUALIFY ROW_NUMBER() OVER(PARTITION BY
+	//     ..., "time" ...)` runs the window over the *raw* time column, not the
+	//     REPLACE-normalized one. On a mixed-type partition the same (tags,time)
+	//     then renders as two different strings, lands in two window partitions,
+	//     and BOTH rows survive — silent under-dedup (duplicates written, sources
+	//     deleted). Worse than the loud bind error.
+	//
+	// The CTE form fixes both: the REPLACE is materialized first, so the window
+	// (and QUALIFY) bind against the already-normalized TIMESTAMPTZ "time".
+	// Verified empirically: a partition mixing a TIMESTAMPTZ-time file and a
+	// VARCHAR-time file dedups to 1 row with the CTE form, 2 rows without it.
+	//
+	// PARTITION BY all tag columns + time: rows with identical (tags, time) are
+	// duplicates; one is kept. This is the dedup key, not the output order — the
+	// output is sorted by the separate orderByClause (time).
 	var quotedTags []string
 	for _, tag := range tagColumns {
 		// Double-quote escaping: DuckDB treats "" inside a quoted identifier as a literal "
@@ -129,19 +150,16 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 	}
 	partitionBy := strings.Join(quotedTags, ", ")
 
-	// Normalize "time" to TIMESTAMP in the inner read so the PARTITION BY/ORDER BY
-	// on "time" and the output column are consistent across mixed-schema files.
 	return fmt.Sprintf(`
 		COPY (
-			SELECT * EXCLUDE (__dedup_rn) FROM (
-				SELECT *, ROW_NUMBER() OVER (
-					PARTITION BY %s, "time"
-					ORDER BY "time" DESC
-				) AS __dedup_rn
-				FROM (
-					SELECT * REPLACE (%s) FROM read_parquet(%s, union_by_name=true)
-				)
-			) WHERE __dedup_rn = 1
+			WITH normalized AS (
+				SELECT * REPLACE (%s) FROM read_parquet(%s, union_by_name=true)
+			)
+			SELECT * FROM normalized
+			QUALIFY ROW_NUMBER() OVER (
+				PARTITION BY %s, "time"
+				ORDER BY "time" DESC
+			) = 1
 			%s
 		) TO '%s' (
 			FORMAT PARQUET,
@@ -149,7 +167,7 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 			COMPRESSION_LEVEL 3,
 			ROW_GROUP_SIZE 122880
 		)
-	`, partitionBy, timeNormalizeReplace, fileListSQL, orderByClause, escapedOutput)
+	`, timeNormalizeReplace, fileListSQL, partitionBy, orderByClause, escapedOutput)
 }
 
 // timeNormalizeReplace is the DuckDB `REPLACE (...)` expression that coerces a

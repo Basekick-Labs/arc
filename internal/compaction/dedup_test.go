@@ -33,11 +33,18 @@ func TestBuildCompactionQuery_WithDedup(t *testing.T) {
 	if !strings.Contains(query, `PARTITION BY "host", "region", "time"`) {
 		t.Error("expected PARTITION BY with tag columns and time")
 	}
-	if !strings.Contains(query, "EXCLUDE (__dedup_rn)") {
-		t.Error("expected EXCLUDE __dedup_rn")
+	// Dedup uses QUALIFY (not a SELECT *, ROW_NUMBER ... ) WHERE rn=1 subquery):
+	// the subquery/star-expansion form mis-binds time under union_by_name. See
+	// buildCompactionQuery for the full explanation.
+	if !strings.Contains(query, "QUALIFY ROW_NUMBER") {
+		t.Errorf("expected QUALIFY ROW_NUMBER dedup form, got: %s", query)
 	}
-	if !strings.Contains(query, "__dedup_rn = 1") {
-		t.Error("expected WHERE __dedup_rn = 1")
+	if strings.Contains(query, "__dedup_rn") {
+		t.Error("expected no __dedup_rn subquery column (QUALIFY form has no helper column)")
+	}
+	// time must be normalized to TIMESTAMPTZ so mixed-type partitions reconcile.
+	if !strings.Contains(query, "make_timestamptz") {
+		t.Error("expected time normalized via make_timestamptz")
 	}
 	if !strings.Contains(query, `ORDER BY "time"`) {
 		t.Error("expected outer ORDER BY clause")
@@ -115,6 +122,20 @@ func TestReadTagColumnsValidation(t *testing.T) {
 	for _, tag := range []string{`host" OR 1=1--`, `"; DROP TABLE`, `host,region`} {
 		if isValidIdentifier(tag) {
 			t.Errorf("expected %q to be invalid", tag)
+		}
+	}
+}
+
+// TestBuildCompactionQuery_DedupNonDedupBothNormalizeTime asserts both branches
+// (with and without tag columns) normalize time to TIMESTAMPTZ so a VARCHAR-time
+// file never wedges compaction. String-only (no DuckDB), so it lives here in the
+// untagged test file rather than the duckdb_arrow-gated integration test.
+func TestBuildCompactionQuery_DedupNonDedupBothNormalizeTime(t *testing.T) {
+	withTags := buildCompactionQuery("['a.parquet']", "", "/tmp/o.parquet", []string{"host"})
+	noTags := buildCompactionQuery("['a.parquet']", "", "/tmp/o.parquet", nil)
+	for name, q := range map[string]string{"dedup": withTags, "non-dedup": noTags} {
+		if !strings.Contains(q, "make_timestamptz") || !strings.Contains(q, "TIMESTAMPTZ") {
+			t.Errorf("%s branch does not normalize time to TIMESTAMPTZ:\n%s", name, q)
 		}
 	}
 }
