@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -90,7 +89,6 @@ func TestBuildCompactionQuery_DedupMixedTimeType(t *testing.T) {
 	if epochUS != 1609459200000000 {
 		t.Errorf("stored instant = %d µs, want 1609459200000000 (UTC must be preserved)", epochUS)
 	}
-	_ = os.Remove
 }
 
 // TestBuildCompactionQuery_DedupNonDedupBothNormalizeTime asserts both branches
