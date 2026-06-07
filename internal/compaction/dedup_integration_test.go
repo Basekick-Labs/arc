@@ -36,8 +36,13 @@ func TestBuildCompactionQuery_DedupMixedTimeType(t *testing.T) {
 	defer db.Close()
 	ctx := context.Background()
 
-	// Worst case for tz handling: a non-UTC session timezone.
-	if _, err := db.ExecContext(ctx, "SET TimeZone='America/Argentina/Buenos_Aires'"); err != nil {
+	// Worst case for tz handling: a non-UTC session timezone. Use the fixed
+	// POSIX offset zone Etc/GMT+3 (= UTC-03) rather than a geographic name like
+	// America/Argentina/Buenos_Aires: the Etc/* offsets are built into DuckDB's
+	// ICU and don't depend on the host tzdata, so this won't be flaky on minimal
+	// CI runners (e.g. alpine) that lack the timezone database. (DuckDB rejects a
+	// bare numeric offset like '-03:00'.)
+	if _, err := db.ExecContext(ctx, "SET TimeZone='Etc/GMT+3'"); err != nil {
 		t.Fatalf("set tz: %v", err)
 	}
 
