@@ -40,9 +40,11 @@ func TestBuildCompactionQuery_DedupMixedTimeType(t *testing.T) {
 		t.Fatalf("set tz: %v", err)
 	}
 
-	fileTZ := filepath.Join(dir, "a_tz.parquet")
-	fileStr := filepath.Join(dir, "b_str.parquet")
-	out := filepath.Join(dir, "out.parquet")
+	// ToSlash: these paths are interpolated into DuckDB SQL (COPY TO / read_parquet);
+	// on Windows filepath.Join yields backslashes that would break the SQL.
+	fileTZ := filepath.ToSlash(filepath.Join(dir, "a_tz.parquet"))
+	fileStr := filepath.ToSlash(filepath.Join(dir, "b_str.parquet"))
+	out := filepath.ToSlash(filepath.Join(dir, "out.parquet"))
 
 	// 2021-01-01T00:00:00Z = 1609459200000000 microseconds. Same (host,time) in both.
 	if _, err := db.ExecContext(ctx, fmt.Sprintf(
