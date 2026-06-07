@@ -1,3 +1,5 @@
+//go:build duckdb_arrow
+
 package compaction
 
 import (
@@ -5,7 +7,6 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	_ "github.com/duckdb/duckdb-go/v2" // duckdb driver
@@ -90,18 +91,5 @@ func TestBuildCompactionQuery_DedupMixedTimeType(t *testing.T) {
 	}
 	if epochUS != 1609459200000000 {
 		t.Errorf("stored instant = %d µs, want 1609459200000000 (UTC must be preserved)", epochUS)
-	}
-}
-
-// TestBuildCompactionQuery_DedupNonDedupBothNormalizeTime asserts both branches
-// (with and without tag columns) normalize time to TIMESTAMPTZ so a VARCHAR-time
-// file never wedges compaction.
-func TestBuildCompactionQuery_DedupNonDedupBothNormalizeTime(t *testing.T) {
-	withTags := buildCompactionQuery("['a.parquet']", "", "/tmp/o.parquet", []string{"host"})
-	noTags := buildCompactionQuery("['a.parquet']", "", "/tmp/o.parquet", nil)
-	for name, q := range map[string]string{"dedup": withTags, "non-dedup": noTags} {
-		if !strings.Contains(q, "make_timestamptz") || !strings.Contains(q, "TIMESTAMPTZ") {
-			t.Errorf("%s branch does not normalize time to TIMESTAMPTZ:\n%s", name, q)
-		}
 	}
 }

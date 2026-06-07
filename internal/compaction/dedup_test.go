@@ -125,3 +125,17 @@ func TestReadTagColumnsValidation(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildCompactionQuery_DedupNonDedupBothNormalizeTime asserts both branches
+// (with and without tag columns) normalize time to TIMESTAMPTZ so a VARCHAR-time
+// file never wedges compaction. String-only (no DuckDB), so it lives here in the
+// untagged test file rather than the duckdb_arrow-gated integration test.
+func TestBuildCompactionQuery_DedupNonDedupBothNormalizeTime(t *testing.T) {
+	withTags := buildCompactionQuery("['a.parquet']", "", "/tmp/o.parquet", []string{"host"})
+	noTags := buildCompactionQuery("['a.parquet']", "", "/tmp/o.parquet", nil)
+	for name, q := range map[string]string{"dedup": withTags, "non-dedup": noTags} {
+		if !strings.Contains(q, "make_timestamptz") || !strings.Contains(q, "TIMESTAMPTZ") {
+			t.Errorf("%s branch does not normalize time to TIMESTAMPTZ:\n%s", name, q)
+		}
+	}
+}
