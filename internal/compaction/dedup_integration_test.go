@@ -49,15 +49,15 @@ func TestBuildCompactionQuery_DedupMixedTimeType(t *testing.T) {
 
 	// 2021-01-01T00:00:00Z = 1609459200000000 microseconds. Same (host,time) in both.
 	if _, err := db.ExecContext(ctx, fmt.Sprintf(
-		`COPY (SELECT 'h1' AS host, make_timestamptz(1609459200000000) AS "time", 1.0 AS v) TO '%s' (FORMAT PARQUET)`, fileTZ)); err != nil {
+		`COPY (SELECT 'h1' AS host, make_timestamptz(1609459200000000) AS "time", 1.0 AS v) TO '%s' (FORMAT PARQUET)`, escapeSQLPath(fileTZ))); err != nil {
 		t.Fatalf("write tz fixture: %v", err)
 	}
 	if _, err := db.ExecContext(ctx, fmt.Sprintf(
-		`COPY (SELECT 'h1' AS host, '1609459200000000' AS "time", 2.0 AS v) TO '%s' (FORMAT PARQUET)`, fileStr)); err != nil {
+		`COPY (SELECT 'h1' AS host, '1609459200000000' AS "time", 2.0 AS v) TO '%s' (FORMAT PARQUET)`, escapeSQLPath(fileStr))); err != nil {
 		t.Fatalf("write varchar fixture: %v", err)
 	}
 
-	fileList := fmt.Sprintf("['%s', '%s']", fileTZ, fileStr)
+	fileList := fmt.Sprintf("['%s', '%s']", escapeSQLPath(fileTZ), escapeSQLPath(fileStr))
 	query := buildCompactionQuery(fileList, `ORDER BY "time"`, out, []string{"host"})
 
 	if _, err := db.ExecContext(ctx, query); err != nil {
@@ -66,7 +66,7 @@ func TestBuildCompactionQuery_DedupMixedTimeType(t *testing.T) {
 
 	// Correct dedup → exactly one row.
 	var rows int
-	if err := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT count(*) FROM read_parquet('%s')`, out)).Scan(&rows); err != nil {
+	if err := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT count(*) FROM read_parquet('%s')`, escapeSQLPath(out))).Scan(&rows); err != nil {
 		t.Fatalf("count output: %v", err)
 	}
 	if rows != 1 {
@@ -76,7 +76,7 @@ func TestBuildCompactionQuery_DedupMixedTimeType(t *testing.T) {
 	// Output time must be TIMESTAMP WITH TIME ZONE (matches Arc's ingest schema; UTC-anchored).
 	var colType string
 	if err := db.QueryRowContext(ctx, fmt.Sprintf(
-		`SELECT column_type FROM (DESCRIBE SELECT * FROM read_parquet('%s')) WHERE column_name='time'`, out)).Scan(&colType); err != nil {
+		`SELECT column_type FROM (DESCRIBE SELECT * FROM read_parquet('%s')) WHERE column_name='time'`, escapeSQLPath(out))).Scan(&colType); err != nil {
 		t.Fatalf("describe output: %v", err)
 	}
 	if colType != "TIMESTAMP WITH TIME ZONE" {
@@ -86,7 +86,7 @@ func TestBuildCompactionQuery_DedupMixedTimeType(t *testing.T) {
 	// The instant must be exactly 1609459200000000 µs regardless of the non-UTC session tz.
 	var epochUS int64
 	if err := db.QueryRowContext(ctx, fmt.Sprintf(
-		`SELECT epoch_us("time") FROM read_parquet('%s')`, out)).Scan(&epochUS); err != nil {
+		`SELECT epoch_us("time") FROM read_parquet('%s')`, escapeSQLPath(out))).Scan(&epochUS); err != nil {
 		t.Fatalf("epoch_us: %v", err)
 	}
 	if epochUS != 1609459200000000 {
