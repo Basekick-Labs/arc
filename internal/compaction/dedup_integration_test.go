@@ -74,10 +74,14 @@ func TestBuildCompactionQuery_DedupMixedTimeType(t *testing.T) {
 	}
 
 	// Output time must be TIMESTAMP WITH TIME ZONE (matches Arc's ingest schema; UTC-anchored).
+	// Use typeof() rather than a DESCRIBE-subquery: the shipped DuckDB version
+	// rejects the DESCRIBE-as-subquery form in some contexts (see the 26.06.2
+	// CSV/Parquet-import fix), so avoid relying on it here. typeof() is simpler
+	// and equivalent for asserting the column's type.
 	var colType string
 	if err := db.QueryRowContext(ctx, fmt.Sprintf(
-		`SELECT column_type FROM (DESCRIBE SELECT * FROM read_parquet('%s')) WHERE column_name='time'`, escapeSQLPath(out))).Scan(&colType); err != nil {
-		t.Fatalf("describe output: %v", err)
+		`SELECT typeof("time") FROM read_parquet('%s') LIMIT 1`, escapeSQLPath(out))).Scan(&colType); err != nil {
+		t.Fatalf("get type of time: %v", err)
 	}
 	if colType != "TIMESTAMP WITH TIME ZONE" {
 		t.Errorf("output time type = %q, want TIMESTAMP WITH TIME ZONE", colType)
