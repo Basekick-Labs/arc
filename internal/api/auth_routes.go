@@ -104,11 +104,14 @@ func (h *AuthHandler) createToken(c *fiber.Ctx) error {
 	}
 
 	// Parse and validate permissions
-	// nil = use defaults (read,write), empty array = no permissions (RBAC-only token)
+	// nil = use defaults (read,write), empty array = no permissions (RBAC-only token).
+	// "" would be re-defaulted to read,write by the auth manager, so an explicit
+	// empty array maps to the auth.PermissionsNone sentinel to persist a true
+	// RBAC-only token (no OSS permissions).
 	permissions := "read,write"
 	if req.Permissions != nil {
 		if len(*req.Permissions) == 0 {
-			permissions = "" // RBAC-only token with no OSS permissions
+			permissions = auth.PermissionsNone // RBAC-only token with no OSS permissions
 		} else {
 			for _, p := range *req.Permissions {
 				if !auth.IsValidPermission(p) {

@@ -2055,41 +2055,115 @@ func ValidateSQLRequest(sql string) error {
 		return &SQLValidationError{Message: "Dangerous SQL operation not allowed"}
 	}
 
-	// SECURITY: reject user SQL that calls read_parquet() directly.
-	// Only Arc's transformation layer (convertSQLToStoragePaths and
-	// related) emits read_parquet — any occurrence in user input is a
-	// RBAC bypass vector: a user scoped to db1.m1 could read
-	// /data/db2/secrets/**/*.parquet by routing around the table-name
-	// → path mapping that RBAC depends on. See review/query-path-
-	// criticals C3.
-	if userSQLReadParquetPattern.MatchString(normalised) {
-		return &SQLValidationError{Message: "Direct read_parquet() calls are not allowed in user SQL"}
-	}
-
-	// SECURITY: reject user SQL that calls arcx's table functions
-	// directly. arc_partition_agg(db, m, unit) takes raw database and
-	// measurement strings and globs the filesystem; without this block,
-	// a user authenticated for db1 could call
-	// arc_partition_agg('db2', 'mem', 'hour') and learn row counts in
-	// db2. Same RBAC bypass shape as read_parquet — only Arc's query
-	// rewriter, which has the user's identity, may emit calls to it.
-	if userSQLArcPartitionAggPattern.MatchString(normalised) {
-		return &SQLValidationError{Message: "Direct arc_partition_agg() calls are not allowed in user SQL"}
+	// SECURITY: reject the DuckDB filesystem-I/O table-function family in
+	// user SQL.
+	//
+	// Background: an earlier fix (CVE-2026-47735) blocked only the literal
+	// spellings `read_parquet(` and `arc_partition_agg(`. That missed the
+	// documented alias `parquet_scan(` and the rest of the I/O family
+	// (`glob`, `read_blob`, `read_csv*`, `read_json*`, `read_text`,
+	// `parquet_metadata`, `parquet_schema`, `delta_scan`, `iceberg_scan`,
+	// …). The DuckDB sandbox allowlists the *entire* storage root and Arc's
+	// RBAC layer (extractTableReferences) skips anything that looks like a
+	// function call, so any of these in user SQL reads across the RBAC
+	// boundary — a user scoped to db1 could read /data/db2/secrets via
+	// `parquet_scan(...)` or enumerate every database via `glob(...)`.
+	// (GHSA-93cm-2v4m-c56c — incomplete fix of CVE-2026-47735.)
+	//
+	// The match is on the function NAME anywhere in the normalised
+	// (literal-masked, comment-stripped) SQL, NOT anchored to a FROM/JOIN
+	// position. Position-anchoring is unsafe: DuckDB supports comma
+	// cross-joins (`FROM cpu, parquet_scan(...)`) and these readers can sit
+	// in subqueries, IN-lists, and lateral joins — none of which the
+	// FROM/JOIN patterns reach. Whole-string name matching catches every
+	// position. Only Arc's own transformation layer (convertSQLToStoragePaths,
+	// which runs AFTER this validation and carries the caller's identity)
+	// may emit read_parquet; user input never legitimately contains any of
+	// these. A false positive on a string literally containing e.g.
+	// 'read_csv' is avoided because single-quoted string literals are masked
+	// before this runs (see ioDenylistNormalise).
+	//
+	// IMPORTANT: this uses a DIFFERENT normalisation than `normalised` above.
+	// The shared `normalised` masks double-quoted/backtick identifiers, but
+	// DuckDB executes `"parquet_scan"(...)` / `` `read_parquet`(...) ``
+	// identically to the unquoted call — so matching the denylist against
+	// `normalised` lets a quoted spelling slip past (the name is hidden inside
+	// a `__STR__` placeholder). Confirmed live: `SELECT * FROM
+	// "parquet_scan"('…/other-db/…')` executed and returned cross-tenant rows
+	// (GHSA-93cm-2v4m-c56c review round 2). ioDenylistNormalise strips
+	// identifier quoting so quoted function names are exposed to the regex,
+	// while still masking single-quoted string literals.
+	ioCheckNormalised := ioDenylistNormalise(sql)
+	if m := ioTableFunctionPattern.FindStringSubmatch(ioCheckNormalised); m != nil {
+		return &SQLValidationError{Message: "File I/O function not allowed in user SQL: " + m[1] + "()"}
 	}
 
 	return nil
 }
 
-// userSQLReadParquetPattern matches `read_parquet(` as a function call
-// (case-insensitive, allowing whitespace before the open paren). Only
-// runs against masked/comment-stripped SQL so a literal containing
-// "read_parquet" or a comment is fine.
-var userSQLReadParquetPattern = regexp.MustCompile(`(?i)\bread_parquet\s*\(`)
+// ioDenylistNormalise produces the form of the SQL the I/O-function denylist is
+// matched against. Unlike the general ValidateSQLRequest normalisation, it
+// strips identifier quoting (`"` and backtick) BEFORE masking so that a
+// quoted-identifier function call — `"parquet_scan"(...)`, “ `read_parquet`(...) “,
+// which DuckDB executes identically to the unquoted form — is exposed to the
+// regex rather than hidden inside a masked string. Single-quoted string literals
+// are still masked (so a literal value such as 'read_csv failed' is not matched)
+// and comments are stripped (so a name interleaved with a comment cannot hide).
+//
+// Stripping `"`/backtick can only ever expose an identifier (DuckDB uses `'`
+// for strings and `"`/backtick for identifiers), never the body of a string
+// literal, so this cannot unmask a genuine string. In the pathological case of
+// a `'` inside a `"..."` identifier the subsequent literal-masking may mis-pair
+// quotes, but that errs toward showing MORE text to the denylist (fail-closed),
+// never less.
+func ioDenylistNormalise(sql string) string {
+	stripped := strings.NewReplacer(`"`, "", "`", "").Replace(sql)
+	features := scanSQLFeatures(stripped)
+	masked, _ := sqlutil.MaskStringLiterals(stripped, features.hasQuotes)
+	masked = stripSQLComments(masked, features.hasDashComment || features.hasBlockComment)
+	return masked
+}
 
-// userSQLArcPartitionAggPattern matches `arc_partition_agg(` as a
-// function call. arcx exposes filesystem-anchored row counts; user SQL
-// must route through Arc's rewriter so RBAC stays load-bearing.
-var userSQLArcPartitionAggPattern = regexp.MustCompile(`(?i)\barc_partition_agg\s*\(`)
+// ioTableFunctionPattern matches a call to any DuckDB function that reads from
+// the filesystem (or an attached storage scanner), by name, in any position of
+// the masked/comment-stripped SQL. This is an intentionally comprehensive
+// denylist of the I/O family: each entry takes a path/glob and would let user
+// SQL read across the RBAC boundary inside the sandbox's allowlisted storage
+// root. The trailing `\s*\(` ensures we match the function-call form, not a
+// bare identifier. Anchored matching (`\b`) avoids matching these as a
+// substring of a longer identifier.
+//
+// Maintenance: when DuckDB adds a new path-taking table function (or Arc loads
+// an extension that exposes one), add it here. TestIOTableFunctionPattern_Family
+// documents the set we verified against the pinned DuckDB release.
+var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join([]string{
+	"read_parquet",
+	"parquet_scan",
+	"parquet_metadata",
+	"parquet_schema",
+	"parquet_file_metadata",
+	"parquet_kv_metadata",
+	"parquet_bloom_probe",
+	"read_csv",
+	"read_csv_auto",
+	"sniff_csv",
+	"read_json",
+	"read_json_auto",
+	"read_json_objects",
+	"read_json_objects_auto",
+	"read_ndjson",
+	"read_ndjson_auto",
+	"read_ndjson_objects",
+	"read_text",
+	"read_blob",
+	"read_xlsx",
+	"glob",
+	"delta_scan",
+	"iceberg_scan",
+	"iceberg_metadata",
+	"iceberg_snapshots",
+	"arc_partition_agg",
+}, "|") + `)\s*\(`)
 
 // getTransformedSQL returns the transformed SQL with caching.
 // If headerDB is non-empty, uses the optimized path with that database for all tables.

@@ -23,6 +23,38 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+// PermissionsNone is the explicit sentinel a caller passes to CreateToken /
+// CreateTokenWithValue to request a token with NO OSS-level permissions (an
+// RBAC-only token, whose access comes solely from team/role grants).
+//
+// It exists because the permissions parameter is overloaded: an empty string
+// ("") means "use the default read,write" — a contract relied on by bootstrap
+// and existing callers (see TestCreateTokenWithValue "default permissions are
+// read,write when empty"). Without a distinct sentinel there is no way to
+// express "deliberately empty", so requests for a least-privilege RBAC-only
+// token were silently upgraded to read,write — a privilege-escalation-shaped
+// bug (a token meant to be scoped to one database via RBAC instead got
+// wildcard read,write). The sentinel is normalised to a stored empty string
+// by storePermissions; the verify path already maps stored-empty to an empty
+// permission set (RBAC-only).
+const PermissionsNone = "\x00none"
+
+// storePermissions resolves the overloaded permissions argument into the exact
+// string persisted in api_tokens.permissions:
+//   - ""              => "read,write" (default contract, unchanged)
+//   - PermissionsNone => ""           (deliberate RBAC-only, no OSS perms)
+//   - anything else   => as-is
+func storePermissions(permissions string) string {
+	switch permissions {
+	case "":
+		return "read,write"
+	case PermissionsNone:
+		return ""
+	default:
+		return permissions
+	}
+}
+
 // TokenInfo represents token metadata returned by verify
 type TokenInfo struct {
 	ID          int64      `json:"id"`
@@ -395,10 +427,10 @@ func generateToken() (string, error) {
 
 // insertToken inserts a pre-hashed token into the database.
 // It is the shared implementation used by CreateToken and CreateTokenWithValue.
+// The permissions argument MUST already be resolved (via storePermissions) by
+// the caller — insertToken persists it verbatim and does not re-default, so the
+// sentinel is never double-resolved.
 func (am *AuthManager) insertToken(hash, prefix, name, description, permissions string, expiresAt *time.Time) error {
-	if permissions == "" {
-		permissions = "read,write"
-	}
 
 	var expiresAtVal interface{}
 	if expiresAt != nil {
@@ -441,13 +473,11 @@ func (am *AuthManager) CreateToken(ctx context.Context, name, description, permi
 	}
 	prefix := tokenPrefix(token)
 
-	// Normalise permissions to match SQLite-direct behaviour from
-	// insertToken (an empty string means "read,write"). Done here so both
-	// the cluster-propose path and the direct-SQLite path see the same
-	// stored value.
-	if permissions == "" {
-		permissions = "read,write"
-	}
+	// Resolve permissions to the exact stored value once, here, so both the
+	// cluster-propose path and the direct-SQLite insertToken path persist the
+	// same string (insertToken does NOT re-resolve). "" => read,write default;
+	// PermissionsNone => "" (deliberate RBAC-only).
+	permissions = storePermissions(permissions)
 
 	// Cluster mode: propose via Raft, which runs ApplyCreateToken on every
 	// node (including this one) and writes to local SQLite via the apply
@@ -1059,9 +1089,8 @@ func (am *AuthManager) CreateTokenWithValue(ctx context.Context, tokenValue, nam
 		return "", fmt.Errorf("failed to hash token: %w", err)
 	}
 	prefix := tokenPrefix(tokenValue)
-	if permissions == "" {
-		permissions = "read,write"
-	}
+	// Resolve once (see CreateToken): "" => read,write; PermissionsNone => "".
+	permissions = storePermissions(permissions)
 
 	// Cluster mode: propose via Raft — same shape as CreateToken.
 	if am.getProposer() != nil {

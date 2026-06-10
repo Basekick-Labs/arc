@@ -151,6 +151,37 @@ func TestCreateToken(t *testing.T) {
 			t.Errorf("Default permissions should be read,write, got %v", info.Permissions)
 		}
 	})
+
+	// Regression: a token created with the PermissionsNone sentinel must be
+	// stored with NO OSS permissions (RBAC-only). Previously the auth manager
+	// re-defaulted any empty permission string to read,write, so a request for
+	// a least-privilege RBAC-only token was silently upgraded to wildcard
+	// read,write — a privilege-escalation-shaped bug surfaced while validating
+	// GHSA-93cm-2v4m-c56c.
+	t.Run("PermissionsNone yields RBAC-only token (no OSS permissions)", func(t *testing.T) {
+		token, err := am.CreateToken(context.Background(), "rbac-only", "no OSS perms", PermissionsNone, nil)
+		if err != nil {
+			t.Fatalf("CreateToken failed: %v", err)
+		}
+		info := am.VerifyToken(token)
+		if info == nil {
+			t.Fatal("Token verification failed")
+		}
+		// Empty permission set: no read, no write, nothing. RBAC grants (if any)
+		// are layered on separately by the RBAC manager, not by this field.
+		nonEmpty := false
+		for _, p := range info.Permissions {
+			if p != "" {
+				nonEmpty = true
+			}
+		}
+		if nonEmpty {
+			t.Errorf("PermissionsNone token must have no OSS permissions, got %v", info.Permissions)
+		}
+		if am.HasPermission(info, "read") || am.HasPermission(info, "write") {
+			t.Errorf("PermissionsNone token must not satisfy read/write, perms=%v", info.Permissions)
+		}
+	})
 }
 
 // TestVerifyToken tests token verification
