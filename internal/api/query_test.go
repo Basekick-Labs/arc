@@ -1041,6 +1041,74 @@ func TestValidateSQLRequest_BypassesAndFalsePositives(t *testing.T) {
 		{name: "user arc_partition_agg in CTE", sql: "WITH x AS (SELECT * FROM arc_partition_agg('db2', 'mem', 'hour')) SELECT * FROM x", shouldFail: true},
 		{name: "literal containing arc_partition_agg text", sql: "SELECT * FROM logs WHERE msg = 'arc_partition_agg failed'", shouldFail: false},
 
+		// GHSA-93cm-2v4m-c56c (incomplete fix of CVE-2026-47735): the
+		// read_parquet denylist missed the parquet_scan alias and the rest
+		// of the DuckDB I/O table-function family. They read inside the
+		// sandbox's allowlisted storage root, crossing the RBAC boundary
+		// (e.g. a user scoped to db1 reads /data/arc/db2/secrets via
+		// parquet_scan). The strict table-function allowlist must reject
+		// every one of them in user SQL.
+		{name: "user parquet_scan alias", sql: "SELECT * FROM parquet_scan('/data/arc/db2/secrets/**/*.parquet')", shouldFail: true},
+		{name: "user PARQUET_SCAN uppercase", sql: "SELECT * FROM PARQUET_SCAN('/data/arc/db2/*.parquet')", shouldFail: true},
+		{name: "user parquet_scan whitespace", sql: "SELECT * FROM parquet_scan  ('/data/arc/db2/*.parquet')", shouldFail: true},
+		{name: "user parquet_scan in CTE", sql: "WITH x AS (SELECT * FROM parquet_scan('/data/arc/db2/*.parquet')) SELECT * FROM x", shouldFail: true},
+		{name: "user parquet_scan in JOIN", sql: "SELECT * FROM cpu JOIN parquet_scan('/data/arc/db2/*.parquet') p ON cpu.id = p.id", shouldFail: true},
+		{name: "user glob enumerate", sql: "SELECT * FROM glob('/data/arc/**/*')", shouldFail: true},
+		{name: "user read_blob raw bytes", sql: "SELECT * FROM read_blob('/data/arc/db2/secrets/f.parquet')", shouldFail: true},
+		{name: "user parquet_metadata stats", sql: "SELECT * FROM parquet_metadata('/data/arc/db2/*.parquet')", shouldFail: true},
+		{name: "user parquet_schema columns", sql: "SELECT * FROM parquet_schema('/data/arc/db2/*.parquet')", shouldFail: true},
+		{name: "user read_csv_auto", sql: "SELECT * FROM read_csv_auto('/etc/passwd')", shouldFail: true},
+		{name: "user read_csv", sql: "SELECT * FROM read_csv('/etc/passwd')", shouldFail: true},
+		{name: "user read_json_auto", sql: "SELECT * FROM read_json_auto('/data/arc/db2/x.json')", shouldFail: true},
+		{name: "user read_json", sql: "SELECT * FROM read_json('/data/arc/db2/x.json')", shouldFail: true},
+		{name: "user read_text", sql: "SELECT * FROM read_text('/data/arc/db2/x.txt')", shouldFail: true},
+		{name: "user delta_scan", sql: "SELECT * FROM delta_scan('/data/arc/db2/delta')", shouldFail: true},
+		{name: "user iceberg_scan", sql: "SELECT * FROM iceberg_scan('/data/arc/db2/ice')", shouldFail: true},
+		{name: "user sniff_csv", sql: "SELECT * FROM sniff_csv('/etc/passwd')", shouldFail: true},
+
+		// Position-independence regression (the gating is whole-string by
+		// function name, NOT anchored to FROM/JOIN): comma cross-joins,
+		// subqueries, IN-lists, and lateral joins all reach DuckDB's executor
+		// and must be blocked. A FROM/JOIN-anchored check missed all of these
+		// — comma-join in particular was a live bypass (GHSA-93cm-2v4m-c56c
+		// review finding).
+		{name: "parquet_scan via comma cross-join", sql: "SELECT * FROM cpu, parquet_scan('/data/arc/db2/secrets/x.parquet')", shouldFail: true},
+		{name: "read_parquet via comma cross-join", sql: "SELECT * FROM cpu, read_parquet('/data/arc/db2/x.parquet')", shouldFail: true},
+		{name: "glob via comma cross-join", sql: "SELECT * FROM cpu a, glob('/data/arc/**/*') g", shouldFail: true},
+		{name: "parquet_scan via nested subquery in FROM", sql: "SELECT * FROM (SELECT * FROM parquet_scan('/data/arc/db2/x.parquet'))", shouldFail: true},
+		{name: "glob via IN-list subquery", sql: "SELECT * FROM cpu WHERE host IN (SELECT file FROM glob('/data/arc/**/*'))", shouldFail: true},
+		{name: "read_blob via lateral join", sql: "SELECT * FROM cpu, LATERAL read_blob('/data/arc/db2/x.parquet')", shouldFail: true},
+		{name: "parquet_scan in scalar subquery", sql: "SELECT (SELECT count(*) FROM parquet_scan('/data/arc/db2/x.parquet')) AS n", shouldFail: true},
+		{name: "arc_partition_agg via comma join", sql: "SELECT * FROM cpu, arc_partition_agg('db2', 'mem', 'hour')", shouldFail: true},
+
+		// literal containing parquet_scan is a column value, not a call —
+		// literals are masked before the check, so no false positive.
+		{name: "literal containing parquet_scan text", sql: "SELECT * FROM logs WHERE msg = 'parquet_scan ran'", shouldFail: false},
+		{name: "literal containing glob path", sql: "SELECT * FROM logs WHERE msg = 'glob(/etc/*) failed'", shouldFail: false},
+
+		// Pure (non-I/O) table functions — must NOT be blocked. They take no
+		// path and cannot cross the RBAC boundary; the denylist must not
+		// over-reach into legitimate generators. Guards against false positives.
+		{name: "allowed generate_series", sql: "SELECT * FROM generate_series(1, 10)", shouldFail: false},
+		{name: "allowed generate_series whitespace", sql: "SELECT * FROM generate_series  (1, 10)", shouldFail: false},
+		{name: "allowed range", sql: "SELECT * FROM range(0, 100)", shouldFail: false},
+		{name: "allowed range in comma join", sql: "SELECT * FROM cpu, range(0, 10) r", shouldFail: false},
+		{name: "allowed unnest", sql: "SELECT * FROM unnest([1, 2, 3])", shouldFail: false},
+		{name: "allowed range in JOIN", sql: "SELECT * FROM cpu JOIN range(0, 10) r ON cpu.id = r.range", shouldFail: false},
+		// Scalar functions in SELECT/WHERE must NOT be blocked — the denylist
+		// only names I/O functions, so count/date_trunc/etc. pass through.
+		{name: "scalar funcs not blocked", sql: "SELECT count(*), date_trunc('hour', time) FROM cpu WHERE lower(host) = 'a'", shouldFail: false},
+		// Real table reference (not a function) — must NOT be blocked.
+		{name: "plain table ref", sql: "SELECT * FROM cpu", shouldFail: false},
+		{name: "db.table ref", sql: "SELECT * FROM mydb.cpu", shouldFail: false},
+		{name: "CTE ref not a function", sql: "WITH foo AS (SELECT * FROM cpu) SELECT * FROM foo", shouldFail: false},
+		// A table/column whose name merely contains an I/O function name as a
+		// substring must NOT trip the pattern — `glob(` requires the call
+		// form, and a longer identifier like `globthing` has no `(` after
+		// `glob`. `read_csv_table` likewise is not `read_csv(`.
+		{name: "table named globthing not blocked", sql: "SELECT * FROM globthing", shouldFail: false},
+		{name: "column named read_csv_count not blocked", sql: "SELECT read_csv_count FROM cpu", shouldFail: false},
+
 		// Multi-statement smuggling — a second statement behind a semicolon
 		// bypasses the anchored SHOW regexes, so reject >1 statement outright.
 		{name: "SHOW smuggled behind semicolon", sql: "SHOW DATABASES; SELECT 1", shouldFail: true},
@@ -1062,6 +1130,42 @@ func TestValidateSQLRequest_BypassesAndFalsePositives(t *testing.T) {
 				t.Errorf("ValidateSQLRequest for %q: matched=%v, shouldFail=%v (err=%v)", tt.sql, matched, tt.shouldFail, err)
 			}
 		})
+	}
+}
+
+// TestIOTableFunctionPattern_Family pins the set of DuckDB filesystem-I/O
+// functions the denylist must reject in every position. If DuckDB adds a new
+// path-taking function (or Arc loads an extension exposing one), add it both
+// here and to ioTableFunctionPattern. This test exists so the list is reviewed
+// deliberately rather than drifting silently — the original CVE-2026-47735 fix
+// was incomplete precisely because the list was not maintained against the
+// DuckDB function catalog.
+func TestIOTableFunctionPattern_Family(t *testing.T) {
+	mustBlock := []string{
+		"read_parquet", "parquet_scan", "parquet_metadata", "parquet_schema",
+		"parquet_file_metadata", "parquet_kv_metadata", "parquet_bloom_probe",
+		"read_csv", "read_csv_auto", "sniff_csv",
+		"read_json", "read_json_auto", "read_json_objects", "read_json_objects_auto",
+		"read_ndjson", "read_ndjson_auto", "read_ndjson_objects",
+		"read_text", "read_blob", "read_xlsx", "glob",
+		"delta_scan", "iceberg_scan", "iceberg_metadata", "iceberg_snapshots",
+		"arc_partition_agg",
+	}
+	for _, fn := range mustBlock {
+		// Each must be rejected as a call, anywhere, case-insensitively.
+		for _, sql := range []string{
+			"SELECT * FROM " + fn + "('/x')",
+			"SELECT * FROM cpu, " + fn + "('/x')",
+			"SELECT * FROM " + strings.ToUpper(fn) + "  ('/x')",
+		} {
+			if err := ValidateSQLRequest(sql); err == nil {
+				t.Errorf("ValidateSQLRequest(%q): expected rejection for I/O function %q, got nil", sql, fn)
+			}
+		}
+		// Bare identifier with the same prefix but no call form must NOT match.
+		if err := ValidateSQLRequest("SELECT * FROM " + fn + "_notacall_x"); err != nil {
+			t.Errorf("ValidateSQLRequest: false positive on identifier %q_notacall_x: %v", fn, err)
+		}
 	}
 }
 
