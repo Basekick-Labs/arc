@@ -1081,6 +1081,21 @@ func TestValidateSQLRequest_BypassesAndFalsePositives(t *testing.T) {
 		{name: "parquet_scan in scalar subquery", sql: "SELECT (SELECT count(*) FROM parquet_scan('/data/arc/db2/x.parquet')) AS n", shouldFail: true},
 		{name: "arc_partition_agg via comma join", sql: "SELECT * FROM cpu, arc_partition_agg('db2', 'mem', 'hour')", shouldFail: true},
 
+		// Quoted-identifier bypass (GHSA-93cm-2v4m-c56c review round 2): DuckDB
+		// executes `"parquet_scan"(...)` and `` `read_parquet`(...) `` exactly
+		// like the unquoted call. The general normalisation masks quoted
+		// identifiers as string literals, so the denylist must run on a
+		// quote-stripped form. Confirmed live that the double-quoted form
+		// executed and returned cross-tenant rows before this fix.
+		{name: "double-quoted parquet_scan", sql: `SELECT * FROM "parquet_scan"('/data/arc/db2/x.parquet')`, shouldFail: true},
+		{name: "double-quoted read_parquet", sql: `SELECT * FROM "read_parquet"('/data/arc/db2/x.parquet')`, shouldFail: true},
+		{name: "double-quoted glob", sql: `SELECT * FROM "glob"('/data/arc/**/*')`, shouldFail: true},
+		{name: "backtick parquet_scan", sql: "SELECT * FROM `parquet_scan`('/data/arc/db2/x.parquet')", shouldFail: true},
+		{name: "double-quoted read_parquet via comma join", sql: `SELECT * FROM cpu, "read_parquet"('/data/arc/db2/x.parquet')`, shouldFail: true},
+		// A single-quoted STRING that merely contains a function name must
+		// still NOT trip — only identifier-quotes are stripped, not strings.
+		{name: "single-quoted string with parquet_scan not blocked", sql: "SELECT * FROM cpu WHERE msg = 'call to parquet_scan() denied'", shouldFail: false},
+
 		// literal containing parquet_scan is a column value, not a call —
 		// literals are masked before the check, so no false positive.
 		{name: "literal containing parquet_scan text", sql: "SELECT * FROM logs WHERE msg = 'parquet_scan ran'", shouldFail: false},

@@ -2079,14 +2079,49 @@ func ValidateSQLRequest(sql string) error {
 	// position. Only Arc's own transformation layer (convertSQLToStoragePaths,
 	// which runs AFTER this validation and carries the caller's identity)
 	// may emit read_parquet; user input never legitimately contains any of
-	// these. False positives on a column/string literally named e.g.
-	// "read_csv" are avoided because literals and identifiers-in-quotes are
-	// masked before this runs.
-	if m := ioTableFunctionPattern.FindStringSubmatch(normalised); m != nil {
+	// these. A false positive on a string literally containing e.g.
+	// 'read_csv' is avoided because single-quoted string literals are masked
+	// before this runs (see ioDenylistNormalise).
+	//
+	// IMPORTANT: this uses a DIFFERENT normalisation than `normalised` above.
+	// The shared `normalised` masks double-quoted/backtick identifiers, but
+	// DuckDB executes `"parquet_scan"(...)` / `` `read_parquet`(...) ``
+	// identically to the unquoted call — so matching the denylist against
+	// `normalised` lets a quoted spelling slip past (the name is hidden inside
+	// a `__STR__` placeholder). Confirmed live: `SELECT * FROM
+	// "parquet_scan"('…/other-db/…')` executed and returned cross-tenant rows
+	// (GHSA-93cm-2v4m-c56c review round 2). ioDenylistNormalise strips
+	// identifier quoting so quoted function names are exposed to the regex,
+	// while still masking single-quoted string literals.
+	ioCheckNormalised := ioDenylistNormalise(sql)
+	if m := ioTableFunctionPattern.FindStringSubmatch(ioCheckNormalised); m != nil {
 		return &SQLValidationError{Message: "File I/O function not allowed in user SQL: " + m[1] + "()"}
 	}
 
 	return nil
+}
+
+// ioDenylistNormalise produces the form of the SQL the I/O-function denylist is
+// matched against. Unlike the general ValidateSQLRequest normalisation, it
+// strips identifier quoting (`"` and backtick) BEFORE masking so that a
+// quoted-identifier function call — `"parquet_scan"(...)`, “ `read_parquet`(...) “,
+// which DuckDB executes identically to the unquoted form — is exposed to the
+// regex rather than hidden inside a masked string. Single-quoted string literals
+// are still masked (so a literal value such as 'read_csv failed' is not matched)
+// and comments are stripped (so a name interleaved with a comment cannot hide).
+//
+// Stripping `"`/backtick can only ever expose an identifier (DuckDB uses `'`
+// for strings and `"`/backtick for identifiers), never the body of a string
+// literal, so this cannot unmask a genuine string. In the pathological case of
+// a `'` inside a `"..."` identifier the subsequent literal-masking may mis-pair
+// quotes, but that errs toward showing MORE text to the denylist (fail-closed),
+// never less.
+func ioDenylistNormalise(sql string) string {
+	stripped := strings.NewReplacer(`"`, "", "`", "").Replace(sql)
+	features := scanSQLFeatures(stripped)
+	masked, _ := sqlutil.MaskStringLiterals(stripped, features.hasQuotes)
+	masked = stripSQLComments(masked, features.hasDashComment || features.hasBlockComment)
+	return masked
 }
 
 // ioTableFunctionPattern matches a call to any DuckDB function that reads from
