@@ -223,6 +223,12 @@ func (b *LocalBackend) Read(ctx context.Context, path string) ([]byte, error) {
 	}
 
 	data, err := os.ReadFile(fullPath)
+	// os.ReadFile returns the data read so far alongside an error — count
+	// bytes read even on mid-read failure, for parity with the cloud
+	// backends' partial-transfer accounting.
+	if len(data) > 0 {
+		metrics.Get().IncStorageReadBytes(int64(len(data)))
+	}
 	if err != nil {
 		if os.IsNotExist(err) {
 			metrics.Get().IncStorageErrors()
@@ -234,7 +240,6 @@ func (b *LocalBackend) Read(ctx context.Context, path string) ([]byte, error) {
 
 	// Record metrics
 	metrics.Get().IncStorageReads()
-	metrics.Get().IncStorageReadBytes(int64(len(data)))
 
 	return data, nil
 }

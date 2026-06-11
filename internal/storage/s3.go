@@ -315,6 +315,12 @@ func (b *S3Backend) Read(ctx context.Context, path string) ([]byte, error) {
 	defer result.Body.Close()
 
 	data, err := io.ReadAll(result.Body)
+	// io.ReadAll returns the data read so far alongside an error — count
+	// bytes transferred even on mid-stream failure (real network egress),
+	// consistent with ReadTo/ReadToAt.
+	if len(data) > 0 {
+		metrics.Get().IncStorageReadBytes(int64(len(data)))
+	}
 	if err != nil {
 		recordStorageError(ctx, err)
 		return nil, fmt.Errorf("failed to read S3 object body: %w", err)
@@ -322,7 +328,6 @@ func (b *S3Backend) Read(ctx context.Context, path string) ([]byte, error) {
 
 	// Record metrics
 	metrics.Get().IncStorageReads()
-	metrics.Get().IncStorageReadBytes(int64(len(data)))
 
 	return data, nil
 }
