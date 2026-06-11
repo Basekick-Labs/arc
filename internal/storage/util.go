@@ -12,11 +12,14 @@ import (
 // operation failed because the caller cancelled or timed out its context —
 // caller-side lifecycle events (client disconnects, shutdown), not
 // storage-backend failures. Matches the treatment of context.Canceled in
-// the query and puller paths. Used by the cloud backends, whose SDK calls
-// honour ctx; local file ops don't fail on cancellation, so the local
-// backend increments the counter directly.
-func recordStorageError(err error) {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+// the query and puller paths.
+//
+// Both checks are needed: errors.Is catches SDK errors that wrap the
+// context error, while ctx.Err() catches failures that surface as plain
+// network errors (e.g. EPIPE / connection reset when a disconnecting
+// client's writer kills an io.Copy) without wrapping the context error.
+func recordStorageError(ctx context.Context, err error) {
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return
 	}
 	metrics.Get().IncStorageErrors()

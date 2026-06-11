@@ -172,7 +172,7 @@ func (b *AzureBlobBackend) WriteReader(ctx context.Context, path string, reader 
 		},
 	})
 	if err != nil {
-		recordStorageError(err)
+		recordStorageError(ctx, err)
 		b.logger.Error().
 			Err(err).
 			Str("path", path).
@@ -207,14 +207,14 @@ func (b *AzureBlobBackend) Read(ctx context.Context, path string) ([]byte, error
 
 	resp, err := blobClient.DownloadStream(ctx, nil)
 	if err != nil {
-		recordStorageError(err)
+		recordStorageError(ctx, err)
 		return nil, fmt.Errorf("failed to read from Azure Blob Storage: %w", err)
 	}
 	defer resp.Body.Close()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		recordStorageError(err)
+		recordStorageError(ctx, err)
 		return nil, fmt.Errorf("failed to read Azure blob body: %w", err)
 	}
 
@@ -231,7 +231,7 @@ func (b *AzureBlobBackend) ReadTo(ctx context.Context, path string, writer io.Wr
 
 	resp, err := blobClient.DownloadStream(ctx, nil)
 	if err != nil {
-		recordStorageError(err)
+		recordStorageError(ctx, err)
 		return fmt.Errorf("failed to read from Azure Blob Storage: %w", err)
 	}
 	defer resp.Body.Close()
@@ -243,7 +243,7 @@ func (b *AzureBlobBackend) ReadTo(ctx context.Context, path string, writer io.Wr
 		metrics.Get().IncStorageReadBytes(bytesRead)
 	}
 	if err != nil {
-		recordStorageError(err)
+		recordStorageError(ctx, err)
 		return fmt.Errorf("failed to copy Azure blob: %w", err)
 	}
 
@@ -267,7 +267,7 @@ func (b *AzureBlobBackend) ReadToAt(ctx context.Context, path string, writer io.
 	}
 	resp, err := blobClient.DownloadStream(ctx, opts)
 	if err != nil {
-		recordStorageError(err)
+		recordStorageError(ctx, err)
 		return fmt.Errorf("failed to read from Azure Blob Storage: %w", err)
 	}
 	defer resp.Body.Close()
@@ -279,7 +279,7 @@ func (b *AzureBlobBackend) ReadToAt(ctx context.Context, path string, writer io.
 		metrics.Get().IncStorageReadBytes(bytesRead)
 	}
 	if err != nil {
-		recordStorageError(err)
+		recordStorageError(ctx, err)
 		return fmt.Errorf("failed to copy Azure blob: %w", err)
 	}
 

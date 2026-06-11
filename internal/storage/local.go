@@ -265,7 +265,10 @@ func (b *LocalBackend) ReadTo(ctx context.Context, path string, writer io.Writer
 		metrics.Get().IncStorageReadBytes(bytesRead)
 	}
 	if err != nil {
-		metrics.Get().IncStorageErrors()
+		// The writer may be a network connection (HTTP response stream): a
+		// client disconnect fails the copy with EPIPE/connection-reset, which
+		// is not a storage failure — recordStorageError filters those.
+		recordStorageError(ctx, err)
 		return fmt.Errorf("failed to copy file data: %w", err)
 	}
 
@@ -317,7 +320,10 @@ func (b *LocalBackend) ReadToAt(ctx context.Context, path string, writer io.Writ
 		metrics.Get().IncStorageReadBytes(bytesRead)
 	}
 	if err != nil {
-		metrics.Get().IncStorageErrors()
+		// The writer may be a network connection (HTTP response stream): a
+		// client disconnect fails the copy with EPIPE/connection-reset, which
+		// is not a storage failure — recordStorageError filters those.
+		recordStorageError(ctx, err)
 		return fmt.Errorf("failed to copy file data: %w", err)
 	}
 
