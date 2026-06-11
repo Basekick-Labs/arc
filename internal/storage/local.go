@@ -258,6 +258,12 @@ func (b *LocalBackend) ReadTo(ctx context.Context, path string, writer io.Writer
 	defer file.Close()
 
 	bytesRead, err := io.Copy(writer, file)
+	// Count bytes delivered to the writer even when the copy fails mid-stream
+	// (parity with the S3/Azure backends, where partial transfers are real
+	// network egress).
+	if bytesRead > 0 {
+		metrics.Get().IncStorageReadBytes(bytesRead)
+	}
 	if err != nil {
 		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to copy file data: %w", err)
@@ -265,7 +271,6 @@ func (b *LocalBackend) ReadTo(ctx context.Context, path string, writer io.Writer
 
 	// Record metrics
 	metrics.Get().IncStorageReads()
-	metrics.Get().IncStorageReadBytes(bytesRead)
 
 	return nil
 }
@@ -305,13 +310,18 @@ func (b *LocalBackend) ReadToAt(ctx context.Context, path string, writer io.Writ
 	}
 
 	bytesRead, err := io.Copy(writer, file)
+	// Count bytes delivered to the writer even when the copy fails mid-stream
+	// (parity with the S3/Azure backends, where partial transfers are real
+	// network egress).
+	if bytesRead > 0 {
+		metrics.Get().IncStorageReadBytes(bytesRead)
+	}
 	if err != nil {
 		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to copy file data: %w", err)
 	}
 
 	metrics.Get().IncStorageReads()
-	metrics.Get().IncStorageReadBytes(bytesRead)
 	return nil
 }
 

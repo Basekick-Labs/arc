@@ -172,7 +172,7 @@ func (b *AzureBlobBackend) WriteReader(ctx context.Context, path string, reader 
 		},
 	})
 	if err != nil {
-		metrics.Get().IncStorageErrors()
+		recordStorageError(err)
 		b.logger.Error().
 			Err(err).
 			Str("path", path).
@@ -207,14 +207,14 @@ func (b *AzureBlobBackend) Read(ctx context.Context, path string) ([]byte, error
 
 	resp, err := blobClient.DownloadStream(ctx, nil)
 	if err != nil {
-		metrics.Get().IncStorageErrors()
+		recordStorageError(err)
 		return nil, fmt.Errorf("failed to read from Azure Blob Storage: %w", err)
 	}
 	defer resp.Body.Close()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		metrics.Get().IncStorageErrors()
+		recordStorageError(err)
 		return nil, fmt.Errorf("failed to read Azure blob body: %w", err)
 	}
 
@@ -231,20 +231,24 @@ func (b *AzureBlobBackend) ReadTo(ctx context.Context, path string, writer io.Wr
 
 	resp, err := blobClient.DownloadStream(ctx, nil)
 	if err != nil {
-		metrics.Get().IncStorageErrors()
+		recordStorageError(err)
 		return fmt.Errorf("failed to read from Azure Blob Storage: %w", err)
 	}
 	defer resp.Body.Close()
 
 	bytesRead, err := io.Copy(writer, resp.Body)
+	// Count bytes delivered to the writer even when the copy fails mid-stream —
+	// partial transfers are real network egress.
+	if bytesRead > 0 {
+		metrics.Get().IncStorageReadBytes(bytesRead)
+	}
 	if err != nil {
-		metrics.Get().IncStorageErrors()
+		recordStorageError(err)
 		return fmt.Errorf("failed to copy Azure blob: %w", err)
 	}
 
 	// Record metrics
 	metrics.Get().IncStorageReads()
-	metrics.Get().IncStorageReadBytes(bytesRead)
 
 	return nil
 }
@@ -263,20 +267,24 @@ func (b *AzureBlobBackend) ReadToAt(ctx context.Context, path string, writer io.
 	}
 	resp, err := blobClient.DownloadStream(ctx, opts)
 	if err != nil {
-		metrics.Get().IncStorageErrors()
+		recordStorageError(err)
 		return fmt.Errorf("failed to read from Azure Blob Storage: %w", err)
 	}
 	defer resp.Body.Close()
 
 	bytesRead, err := io.Copy(writer, resp.Body)
+	// Count bytes delivered to the writer even when the copy fails mid-stream —
+	// partial transfers are real network egress.
+	if bytesRead > 0 {
+		metrics.Get().IncStorageReadBytes(bytesRead)
+	}
 	if err != nil {
-		metrics.Get().IncStorageErrors()
+		recordStorageError(err)
 		return fmt.Errorf("failed to copy Azure blob: %w", err)
 	}
 
 	// Record metrics
 	metrics.Get().IncStorageReads()
-	metrics.Get().IncStorageReadBytes(bytesRead)
 
 	return nil
 }

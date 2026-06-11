@@ -238,7 +238,7 @@ func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Read
 		ContentType:   aws.String(contentType),
 	})
 	if err != nil {
-		metrics.Get().IncStorageErrors()
+		recordStorageError(err)
 		b.logger.Error().
 			Err(err).
 			Str("path", path).
@@ -271,7 +271,7 @@ func (b *S3Backend) writeMultipart(ctx context.Context, path string, reader io.R
 		ContentType: aws.String(contentType),
 	})
 	if err != nil {
-		metrics.Get().IncStorageErrors()
+		recordStorageError(err)
 		b.logger.Error().
 			Err(err).
 			Str("path", path).
@@ -309,14 +309,14 @@ func (b *S3Backend) Read(ctx context.Context, path string) ([]byte, error) {
 		Key:    aws.String(b.prefixedKey(path)),
 	})
 	if err != nil {
-		metrics.Get().IncStorageErrors()
+		recordStorageError(err)
 		return nil, fmt.Errorf("failed to read from S3: %w", err)
 	}
 	defer result.Body.Close()
 
 	data, err := io.ReadAll(result.Body)
 	if err != nil {
-		metrics.Get().IncStorageErrors()
+		recordStorageError(err)
 		return nil, fmt.Errorf("failed to read S3 object body: %w", err)
 	}
 
@@ -334,20 +334,24 @@ func (b *S3Backend) ReadTo(ctx context.Context, path string, writer io.Writer) e
 		Key:    aws.String(b.prefixedKey(path)),
 	})
 	if err != nil {
-		metrics.Get().IncStorageErrors()
+		recordStorageError(err)
 		return fmt.Errorf("failed to read from S3: %w", err)
 	}
 	defer result.Body.Close()
 
 	bytesRead, err := io.Copy(writer, result.Body)
+	// Count bytes delivered to the writer even when the copy fails mid-stream —
+	// partial transfers are real network egress.
+	if bytesRead > 0 {
+		metrics.Get().IncStorageReadBytes(bytesRead)
+	}
 	if err != nil {
-		metrics.Get().IncStorageErrors()
+		recordStorageError(err)
 		return fmt.Errorf("failed to copy S3 object: %w", err)
 	}
 
 	// Record metrics
 	metrics.Get().IncStorageReads()
-	metrics.Get().IncStorageReadBytes(bytesRead)
 
 	return nil
 }
@@ -365,20 +369,24 @@ func (b *S3Backend) ReadToAt(ctx context.Context, path string, writer io.Writer,
 	}
 	result, err := b.client.GetObject(ctx, input)
 	if err != nil {
-		metrics.Get().IncStorageErrors()
+		recordStorageError(err)
 		return fmt.Errorf("failed to read from S3: %w", err)
 	}
 	defer result.Body.Close()
 
 	bytesRead, err := io.Copy(writer, result.Body)
+	// Count bytes delivered to the writer even when the copy fails mid-stream —
+	// partial transfers are real network egress.
+	if bytesRead > 0 {
+		metrics.Get().IncStorageReadBytes(bytesRead)
+	}
 	if err != nil {
-		metrics.Get().IncStorageErrors()
+		recordStorageError(err)
 		return fmt.Errorf("failed to copy S3 object: %w", err)
 	}
 
 	// Record metrics
 	metrics.Get().IncStorageReads()
-	metrics.Get().IncStorageReadBytes(bytesRead)
 
 	return nil
 }
