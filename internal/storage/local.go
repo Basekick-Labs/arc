@@ -223,6 +223,12 @@ func (b *LocalBackend) Read(ctx context.Context, path string) ([]byte, error) {
 	}
 
 	data, err := os.ReadFile(fullPath)
+	// os.ReadFile returns the data read so far alongside an error — count
+	// bytes read even on mid-read failure, for parity with the cloud
+	// backends' partial-transfer accounting.
+	if len(data) > 0 {
+		metrics.Get().IncStorageReadBytes(int64(len(data)))
+	}
 	if err != nil {
 		if os.IsNotExist(err) {
 			metrics.Get().IncStorageErrors()
@@ -234,7 +240,6 @@ func (b *LocalBackend) Read(ctx context.Context, path string) ([]byte, error) {
 
 	// Record metrics
 	metrics.Get().IncStorageReads()
-	metrics.Get().IncStorageReadBytes(int64(len(data)))
 
 	return data, nil
 }
@@ -258,14 +263,22 @@ func (b *LocalBackend) ReadTo(ctx context.Context, path string, writer io.Writer
 	defer file.Close()
 
 	bytesRead, err := io.Copy(writer, file)
+	// Count bytes delivered to the writer even when the copy fails mid-stream
+	// (parity with the S3/Azure backends, where partial transfers are real
+	// network egress).
+	if bytesRead > 0 {
+		metrics.Get().IncStorageReadBytes(bytesRead)
+	}
 	if err != nil {
-		metrics.Get().IncStorageErrors()
+		// The writer may be a network connection (HTTP response stream): a
+		// client disconnect fails the copy with EPIPE/connection-reset, which
+		// is not a storage failure — recordStorageError filters those.
+		recordStorageError(ctx, err)
 		return fmt.Errorf("failed to copy file data: %w", err)
 	}
 
 	// Record metrics
 	metrics.Get().IncStorageReads()
-	metrics.Get().IncStorageReadBytes(bytesRead)
 
 	return nil
 }
@@ -305,13 +318,21 @@ func (b *LocalBackend) ReadToAt(ctx context.Context, path string, writer io.Writ
 	}
 
 	bytesRead, err := io.Copy(writer, file)
+	// Count bytes delivered to the writer even when the copy fails mid-stream
+	// (parity with the S3/Azure backends, where partial transfers are real
+	// network egress).
+	if bytesRead > 0 {
+		metrics.Get().IncStorageReadBytes(bytesRead)
+	}
 	if err != nil {
-		metrics.Get().IncStorageErrors()
+		// The writer may be a network connection (HTTP response stream): a
+		// client disconnect fails the copy with EPIPE/connection-reset, which
+		// is not a storage failure — recordStorageError filters those.
+		recordStorageError(ctx, err)
 		return fmt.Errorf("failed to copy file data: %w", err)
 	}
 
 	metrics.Get().IncStorageReads()
-	metrics.Get().IncStorageReadBytes(bytesRead)
 	return nil
 }
 

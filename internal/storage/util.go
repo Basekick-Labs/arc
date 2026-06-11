@@ -1,6 +1,29 @@
 package storage
 
-import "github.com/rs/zerolog"
+import (
+	"context"
+	"errors"
+
+	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/rs/zerolog"
+)
+
+// recordStorageError increments the storage-error counter unless the
+// operation failed because the caller cancelled or timed out its context —
+// caller-side lifecycle events (client disconnects, shutdown), not
+// storage-backend failures. Matches the treatment of context.Canceled in
+// the query and puller paths.
+//
+// Both checks are needed: errors.Is catches SDK errors that wrap the
+// context error, while ctx.Err() catches failures that surface as plain
+// network errors (e.g. EPIPE / connection reset when a disconnecting
+// client's writer kills an io.Copy) without wrapping the context error.
+func recordStorageError(ctx context.Context, err error) {
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	metrics.Get().IncStorageErrors()
+}
 
 // GetLocalBasePath returns the base filesystem path for local storage backends.
 // For cloud backends (S3, Azure), it logs a warning and returns empty string.

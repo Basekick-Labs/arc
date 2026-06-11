@@ -19,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
 
@@ -237,6 +238,7 @@ func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Read
 		ContentType:   aws.String(contentType),
 	})
 	if err != nil {
+		recordStorageError(ctx, err)
 		b.logger.Error().
 			Err(err).
 			Str("path", path).
@@ -244,6 +246,10 @@ func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Read
 			Msg("Failed to write to S3")
 		return fmt.Errorf("failed to write to S3: %w", err)
 	}
+
+	// Record metrics
+	metrics.Get().IncStorageWrites()
+	metrics.Get().IncStorageWriteBytes(size)
 
 	b.logger.Debug().
 		Str("path", path).
@@ -265,12 +271,24 @@ func (b *S3Backend) writeMultipart(ctx context.Context, path string, reader io.R
 		ContentType: aws.String(contentType),
 	})
 	if err != nil {
+		recordStorageError(ctx, err)
 		b.logger.Error().
 			Err(err).
 			Str("path", path).
 			Int64("size", size).
 			Msg("Failed multipart upload to S3")
 		return fmt.Errorf("failed multipart upload to S3: %w", err)
+	}
+
+	// Record metrics. Multipart is also the path for unknown-size streams
+	// (size <= 0), where the byte count is unavailable — count the write but
+	// skip the byte counter rather than subtracting from it. Note: size is
+	// the caller-declared length, not bytes observed on the wire — the
+	// uploader streams to EOF regardless of size, so a stale declared size
+	// drifts the byte counter (all current callers pass stat-derived sizes).
+	metrics.Get().IncStorageWrites()
+	if size > 0 {
+		metrics.Get().IncStorageWriteBytes(size)
 	}
 
 	b.logger.Info().
@@ -291,14 +309,25 @@ func (b *S3Backend) Read(ctx context.Context, path string) ([]byte, error) {
 		Key:    aws.String(b.prefixedKey(path)),
 	})
 	if err != nil {
+		recordStorageError(ctx, err)
 		return nil, fmt.Errorf("failed to read from S3: %w", err)
 	}
 	defer result.Body.Close()
 
 	data, err := io.ReadAll(result.Body)
+	// io.ReadAll returns the data read so far alongside an error — count
+	// bytes transferred even on mid-stream failure (real network egress),
+	// consistent with ReadTo/ReadToAt.
+	if len(data) > 0 {
+		metrics.Get().IncStorageReadBytes(int64(len(data)))
+	}
 	if err != nil {
+		recordStorageError(ctx, err)
 		return nil, fmt.Errorf("failed to read S3 object body: %w", err)
 	}
+
+	// Record metrics
+	metrics.Get().IncStorageReads()
 
 	return data, nil
 }
@@ -310,14 +339,24 @@ func (b *S3Backend) ReadTo(ctx context.Context, path string, writer io.Writer) e
 		Key:    aws.String(b.prefixedKey(path)),
 	})
 	if err != nil {
+		recordStorageError(ctx, err)
 		return fmt.Errorf("failed to read from S3: %w", err)
 	}
 	defer result.Body.Close()
 
-	_, err = io.Copy(writer, result.Body)
+	bytesRead, err := io.Copy(writer, result.Body)
+	// Count bytes delivered to the writer even when the copy fails mid-stream —
+	// partial transfers are real network egress.
+	if bytesRead > 0 {
+		metrics.Get().IncStorageReadBytes(bytesRead)
+	}
 	if err != nil {
+		recordStorageError(ctx, err)
 		return fmt.Errorf("failed to copy S3 object: %w", err)
 	}
+
+	// Record metrics
+	metrics.Get().IncStorageReads()
 
 	return nil
 }
@@ -335,14 +374,25 @@ func (b *S3Backend) ReadToAt(ctx context.Context, path string, writer io.Writer,
 	}
 	result, err := b.client.GetObject(ctx, input)
 	if err != nil {
+		recordStorageError(ctx, err)
 		return fmt.Errorf("failed to read from S3: %w", err)
 	}
 	defer result.Body.Close()
 
-	_, err = io.Copy(writer, result.Body)
+	bytesRead, err := io.Copy(writer, result.Body)
+	// Count bytes delivered to the writer even when the copy fails mid-stream —
+	// partial transfers are real network egress.
+	if bytesRead > 0 {
+		metrics.Get().IncStorageReadBytes(bytesRead)
+	}
 	if err != nil {
+		recordStorageError(ctx, err)
 		return fmt.Errorf("failed to copy S3 object: %w", err)
 	}
+
+	// Record metrics
+	metrics.Get().IncStorageReads()
+
 	return nil
 }
 
