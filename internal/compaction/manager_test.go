@@ -576,3 +576,53 @@ func TestManager_CleanupOrphanedTempDirs_NonExistentDir(t *testing.T) {
 		t.Errorf("CleanupOrphanedTempDirs should not error on non-existent dir, got: %v", err)
 	}
 }
+
+// TestSetOnCompactionCompleteConcurrent verifies the callback can be set
+// concurrently with job-completion reads without a data race (#351).
+// main.go wires the callback after the schedulers have already started, so
+// the setter must synchronize with the read in CompactPartition. Run with
+// -race to catch regressions.
+//
+// Limitation: the reader goroutines mirror CompactPartition's locked
+// copy-then-invoke rather than calling it (it spawns subprocesses), so this
+// test guards the setter side only — if the copy in CompactPartition is
+// moved outside m.mu, this test will NOT catch it.
+func TestSetOnCompactionCompleteConcurrent(t *testing.T) {
+	manager, _, cleanup := setupTestManager(t)
+	defer cleanup()
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	// Writers: re-register the callback, as main.go does after scheduler start.
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 1000; j++ {
+				manager.SetOnCompactionComplete(func() {})
+			}
+		}()
+	}
+
+	// Readers: mirror the locked copy-then-invoke in CompactPartition.
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 1000; j++ {
+				manager.mu.Lock()
+				onComplete := manager.onCompactionComplete
+				manager.mu.Unlock()
+				if onComplete != nil {
+					onComplete()
+				}
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+}

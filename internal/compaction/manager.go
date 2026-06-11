@@ -155,7 +155,12 @@ func NewManager(cfg *ManagerConfig) *Manager {
 // SetOnCompactionComplete sets the callback invoked after each successful compaction job.
 // This is used to invalidate DuckDB and query caches in the parent process after
 // the compaction subprocess deletes old parquet files.
+// Safe to call concurrently with running compaction jobs (the setter takes
+// m.mu): main.go wires this callback after the schedulers have already
+// started, so a job may complete concurrently (#351).
 func (m *Manager) SetOnCompactionComplete(fn func()) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.onCompactionComplete = fn
 }
 
@@ -331,14 +336,17 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 	if len(m.jobHistory) > 100 {
 		m.jobHistory = m.jobHistory[len(m.jobHistory)-100:]
 	}
+	// Copy the callback while still holding the lock — main.go wires it via
+	// SetOnCompactionComplete after the schedulers have started (#351).
+	onComplete := m.onCompactionComplete
 	m.mu.Unlock()
 
 	// Invalidate caches outside the lock — the callback performs IO (DuckDB Exec)
 	// and should not block stat reads or other concurrent compaction goroutines.
 	// The subprocess deleted old parquet files from storage, but DuckDB's
 	// cache_httpfs and parquet_metadata_cache still reference them.
-	if shouldInvalidateCache && m.onCompactionComplete != nil {
-		m.onCompactionComplete()
+	if shouldInvalidateCache && onComplete != nil {
+		onComplete()
 	}
 
 	// Return error if subprocess failed
