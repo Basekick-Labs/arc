@@ -15,6 +15,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
 
@@ -171,12 +172,23 @@ func (b *AzureBlobBackend) WriteReader(ctx context.Context, path string, reader 
 		},
 	})
 	if err != nil {
+		metrics.Get().IncStorageErrors()
 		b.logger.Error().
 			Err(err).
 			Str("path", path).
 			Int64("size", size).
 			Msg("Failed to write to Azure Blob Storage")
 		return fmt.Errorf("failed to write to Azure Blob Storage: %w", err)
+	}
+
+	// Record metrics. Callers may pass size <= 0 for unknown-size streams —
+	// count the write but skip the byte counter rather than subtracting from
+	// it. Note: size is the caller-declared length, not bytes observed on the
+	// wire — UploadStream ignores it and streams to EOF, so a stale declared
+	// size drifts the byte counter (all current callers pass stat-derived sizes).
+	metrics.Get().IncStorageWrites()
+	if size > 0 {
+		metrics.Get().IncStorageWriteBytes(size)
 	}
 
 	b.logger.Debug().
@@ -195,14 +207,20 @@ func (b *AzureBlobBackend) Read(ctx context.Context, path string) ([]byte, error
 
 	resp, err := blobClient.DownloadStream(ctx, nil)
 	if err != nil {
+		metrics.Get().IncStorageErrors()
 		return nil, fmt.Errorf("failed to read from Azure Blob Storage: %w", err)
 	}
 	defer resp.Body.Close()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
+		metrics.Get().IncStorageErrors()
 		return nil, fmt.Errorf("failed to read Azure blob body: %w", err)
 	}
+
+	// Record metrics
+	metrics.Get().IncStorageReads()
+	metrics.Get().IncStorageReadBytes(int64(len(data)))
 
 	return data, nil
 }
@@ -213,14 +231,20 @@ func (b *AzureBlobBackend) ReadTo(ctx context.Context, path string, writer io.Wr
 
 	resp, err := blobClient.DownloadStream(ctx, nil)
 	if err != nil {
+		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to read from Azure Blob Storage: %w", err)
 	}
 	defer resp.Body.Close()
 
-	_, err = io.Copy(writer, resp.Body)
+	bytesRead, err := io.Copy(writer, resp.Body)
 	if err != nil {
+		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to copy Azure blob: %w", err)
 	}
+
+	// Record metrics
+	metrics.Get().IncStorageReads()
+	metrics.Get().IncStorageReadBytes(bytesRead)
 
 	return nil
 }
@@ -239,14 +263,21 @@ func (b *AzureBlobBackend) ReadToAt(ctx context.Context, path string, writer io.
 	}
 	resp, err := blobClient.DownloadStream(ctx, opts)
 	if err != nil {
+		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to read from Azure Blob Storage: %w", err)
 	}
 	defer resp.Body.Close()
 
-	_, err = io.Copy(writer, resp.Body)
+	bytesRead, err := io.Copy(writer, resp.Body)
 	if err != nil {
+		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to copy Azure blob: %w", err)
 	}
+
+	// Record metrics
+	metrics.Get().IncStorageReads()
+	metrics.Get().IncStorageReadBytes(bytesRead)
+
 	return nil
 }
 

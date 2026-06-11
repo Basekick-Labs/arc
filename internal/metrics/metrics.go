@@ -765,6 +765,14 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_storage_write_bytes_total counter\n"...)
 	b = appendMetric(b, "arc_storage_write_bytes_total", float64(m.storageWriteBytesTotal.Load()))
 
+	b = append(b, "# HELP arc_storage_reads_total Total storage reads\n"...)
+	b = append(b, "# TYPE arc_storage_reads_total counter\n"...)
+	b = appendMetric(b, "arc_storage_reads_total", float64(m.storageReadsTotal.Load()))
+
+	b = append(b, "# HELP arc_storage_read_bytes_total Total bytes read from storage\n"...)
+	b = append(b, "# TYPE arc_storage_read_bytes_total counter\n"...)
+	b = appendMetric(b, "arc_storage_read_bytes_total", float64(m.storageReadBytesTotal.Load()))
+
 	b = append(b, "# HELP arc_storage_errors_total Total storage errors\n"...)
 	b = append(b, "# TYPE arc_storage_errors_total counter\n"...)
 	b = appendMetric(b, "arc_storage_errors_total", float64(m.storageErrorsTotal.Load()))

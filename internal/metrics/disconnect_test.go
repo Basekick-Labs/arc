@@ -74,3 +74,35 @@ func TestPrometheusFormat_DisconnectMetric(t *testing.T) {
 		}
 	}
 }
+
+// TestPrometheusFormat_StorageMetrics locks all five storage counters into
+// the Prometheus text exposition format. Regression test for #349:
+// arc_storage_reads_total and arc_storage_read_bytes_total were tracked
+// (and present in the JSON snapshot) but missing from PrometheusFormat.
+func TestPrometheusFormat_StorageMetrics(t *testing.T) {
+	m := &Metrics{startTime: time.Now().UTC()}
+	m.IncStorageWrites()
+	m.IncStorageWriteBytes(100)
+	m.IncStorageReads()
+	m.IncStorageReads()
+	m.IncStorageReadBytes(250)
+
+	out := m.PrometheusFormat()
+
+	for _, want := range []string{
+		`# TYPE arc_storage_writes_total counter`,
+		`arc_storage_writes_total 1`,
+		`# TYPE arc_storage_write_bytes_total counter`,
+		`arc_storage_write_bytes_total 100`,
+		`# TYPE arc_storage_reads_total counter`,
+		`arc_storage_reads_total 2`,
+		`# TYPE arc_storage_read_bytes_total counter`,
+		`arc_storage_read_bytes_total 250`,
+		`# TYPE arc_storage_errors_total counter`,
+		`arc_storage_errors_total 0`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("PrometheusFormat missing %q\n--- full output ---\n%s", want, out)
+		}
+	}
+}
