@@ -136,6 +136,9 @@ func (r *Router) BuildReadParquetExpr(paths []TieredPath) string {
 // caller wiring this up MUST pass only validated/escaped SQL there, or the
 // method should be reworked to take structured predicates instead of a string.
 func (r *Router) BuildMultiTierQuery(database, measurement string, whereClause string) string {
+	if r.manager == nil {
+		return ""
+	}
 	globPaths := r.GetGlobPathsForQuery(database, measurement)
 
 	var parts []string
@@ -210,6 +213,9 @@ func (r *Router) buildFullPath(backendType, path string) string {
 	// wrongly prefixed with the cold s3://|azure:// URI. (Pre-existing; the
 	// only caller, BuildMultiTierQuery, is unwired — see its doc comment.)
 	if backendType == "local" {
+		return path
+	}
+	if r.manager == nil {
 		return path
 	}
 	switch backend := r.manager.coldBackend.(type) {
