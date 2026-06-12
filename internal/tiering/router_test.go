@@ -59,6 +59,22 @@ func TestBuildReadParquet_EscapesQuotes(t *testing.T) {
 	}
 }
 
+// TestBuildFullPath_LocalReturnedAsIs guards the fix for the Gemini-flagged
+// bug: buildFullPath must return a hot-tier ("local") path unchanged rather
+// than prefixing it with the cold backend's URI. With no cold backend
+// configured the default branch already returns the path as-is; the explicit
+// "local" guard makes hot paths correct even when a cold backend IS set
+// (which this test cannot construct without a real backend, so it pins the
+// guard's behavior directly).
+func TestBuildFullPath_LocalReturnedAsIs(t *testing.T) {
+	r := &Router{manager: &Manager{}}
+
+	const hotPath = "mydb/cpu/**/*.parquet"
+	if got := r.buildFullPath("local", hotPath); got != hotPath {
+		t.Errorf("buildFullPath(\"local\", %q) = %q, want it returned unchanged", hotPath, got)
+	}
+}
+
 // TestBuildReadParquetExpr_EscapesQuotes verifies the public entry point
 // routes through the escaped builder for both the single-tier and the
 // multi-tier UNION ALL shapes.

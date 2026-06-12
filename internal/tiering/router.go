@@ -204,6 +204,14 @@ func (r *Router) buildReadParquet(paths []string) string {
 }
 
 func (r *Router) buildFullPath(backendType, path string) string {
+	// The cold-backend URI prefix only applies to cold-tier paths. A hot-tier
+	// path (backendType "local") is a bare local path and must be returned
+	// as-is — otherwise, with a cold backend configured, a hot path would be
+	// wrongly prefixed with the cold s3://|azure:// URI. (Pre-existing; the
+	// only caller, BuildMultiTierQuery, is unwired — see its doc comment.)
+	if backendType == "local" {
+		return path
+	}
 	switch backend := r.manager.coldBackend.(type) {
 	case *storage.S3Backend:
 		return fmt.Sprintf("s3://%s/%s%s", backend.GetBucket(), backend.GetPrefix(), path)
