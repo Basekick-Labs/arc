@@ -377,3 +377,85 @@ func TestPolicyStore_ListSkipsCachedNegatives(t *testing.T) {
 		t.Errorf("GetEffective() after cached negative = %+v, want global defaults", effective)
 	}
 }
+
+// TestPolicyStore_CacheIfFreshSkipsAfterDelete is the deterministic
+// regression test for #499. It replays the racing interleaving: a Get read
+// the policy row from SQLite, then Delete removed the row and the cache
+// entry before the Get committed its (now stale) result. The generation
+// check must refuse the cache write — key-absence alone cannot distinguish
+// "just deleted" from "never cached".
+func TestPolicyStore_CacheIfFreshSkipsAfterDelete(t *testing.T) {
+	store, cleanup := setupTestPolicyStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	hotDays := 3
+	policy := &DatabasePolicy{Database: "racer", HotMaxAgeDays: &hotDays}
+	if err := store.Set(ctx, policy); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+
+	// A concurrent Get snapshots gen, then reads the row from SQLite —
+	// at this point the policy still exists.
+	genAtRead := store.gen
+	staleRead := policy
+
+	// Delete wins the race: row and cache entry are gone, gen bumped.
+	if err := store.Delete(ctx, "racer"); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+
+	// The Get now tries to commit its stale read. The generation check
+	// must reject it (returning the stale value uncached is fine — the
+	// next Get re-queries).
+	store.cacheIfFresh("racer", staleRead, genAtRead)
+
+	got, err := store.Get(ctx, "racer")
+	if err != nil {
+		t.Fatalf("Get() after delete error = %v", err)
+	}
+	if got != nil {
+		t.Errorf("Get() after Delete = %+v, want nil (stale positive must not be re-cached, #499)", got)
+	}
+}
+
+// TestPolicyStore_ConcurrentGetSetDelete hammers the racing interleaving
+// end-to-end under -race: after each Set+Delete pair completes, a Get must
+// observe the deletion regardless of how an in-flight Get interleaved.
+func TestPolicyStore_ConcurrentGetSetDelete(t *testing.T) {
+	store, cleanup := setupTestPolicyStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	hotDays := 3
+
+	for i := 0; i < 200; i++ {
+		if err := store.Set(ctx, &DatabasePolicy{Database: "churn", HotMaxAgeDays: &hotDays}); err != nil {
+			t.Fatalf("Set() error = %v", err)
+		}
+		// Evict so the racing Get takes the DB-read path.
+		store.mu.Lock()
+		delete(store.cache, "churn")
+		store.mu.Unlock()
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_, _ = store.Get(ctx, "churn")
+		}()
+
+		if err := store.Delete(ctx, "churn"); err != nil {
+			t.Fatalf("Delete() error = %v", err)
+		}
+		<-done
+
+		got, err := store.Get(ctx, "churn")
+		if err != nil {
+			t.Fatalf("Get() error = %v", err)
+		}
+		if got != nil {
+			t.Fatalf("iteration %d: Get() after Delete = %+v, want nil (stale positive re-cached, #499)", i, got)
+		}
+	}
+}
