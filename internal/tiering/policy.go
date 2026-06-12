@@ -217,7 +217,17 @@ func (s *PolicyStore) List(ctx context.Context) ([]DatabasePolicy, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	policies := make([]DatabasePolicy, 0, len(s.cache))
+	// Size the slice from the non-nil count: the cache also holds nil
+	// not-found entries (#345), often the majority, and len(s.cache) would
+	// over-allocate. Both passes run under the same RLock.
+	var count int
+	for _, policy := range s.cache {
+		if policy != nil {
+			count++
+		}
+	}
+
+	policies := make([]DatabasePolicy, 0, count)
 	for _, policy := range s.cache {
 		// Skip cached negatives: nil marks "no custom policy" (#345) and
 		// must not be dereferenced or listed.
