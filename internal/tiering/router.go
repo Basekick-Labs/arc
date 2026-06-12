@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
@@ -87,7 +88,12 @@ func (r *Router) GetGlobPathsForQuery(database, measurement string) map[Tier]str
 }
 
 // BuildReadParquetExpr builds a DuckDB read_parquet expression for tiered paths
-// This generates a UNION ALL query to read from multiple tiers
+// This generates a UNION ALL query to read from multiple tiers.
+//
+// NOTE: not on the live query path. The query engine builds tiered
+// read_parquet() calls via internal/api/query.go's own quotePath helper;
+// this method (and BuildMultiTierQuery) is currently unwired. The path
+// escaping below is defense-in-depth for any future caller (#307).
 func (r *Router) BuildReadParquetExpr(paths []TieredPath) string {
 	if len(paths) == 0 {
 		return ""
@@ -123,7 +129,12 @@ func (r *Router) BuildReadParquetExpr(paths []TieredPath) string {
 	return fmt.Sprintf("(%s)", strings.Join(parts, " UNION ALL "))
 }
 
-// BuildMultiTierQuery builds a complete DuckDB query that reads from all tiers
+// BuildMultiTierQuery builds a complete DuckDB query that reads from all tiers.
+//
+// NOTE: not on the live query path (see BuildReadParquetExpr). The read_parquet
+// paths are escaped (#307), but whereClause is interpolated raw — a future
+// caller wiring this up MUST pass only validated/escaped SQL there, or the
+// method should be reworked to take structured predicates instead of a string.
 func (r *Router) BuildMultiTierQuery(database, measurement string, whereClause string) string {
 	globPaths := r.GetGlobPathsForQuery(database, measurement)
 
@@ -133,13 +144,15 @@ func (r *Router) BuildMultiTierQuery(database, measurement string, whereClause s
 	if hotPath, ok := globPaths[TierHot]; ok {
 		hotBackend := r.manager.hotBackend
 		fullPath := r.buildFullPath(hotBackend.Type(), hotPath)
-		parts = append(parts, fmt.Sprintf("SELECT * FROM read_parquet('%s')", fullPath))
+		// DuckDB read_parquet() cannot be parameterized — escape single
+		// quotes in the interpolated path (#307).
+		parts = append(parts, fmt.Sprintf("SELECT * FROM read_parquet('%s')", sqlutil.EscapeStringLiteral(fullPath)))
 	}
 
 	// Cold tier
 	if coldPath, ok := globPaths[TierCold]; ok && r.manager.coldBackend != nil {
 		fullPath := r.buildFullPath(r.manager.coldBackend.Type(), coldPath)
-		parts = append(parts, fmt.Sprintf("SELECT * FROM read_parquet('%s')", fullPath))
+		parts = append(parts, fmt.Sprintf("SELECT * FROM read_parquet('%s')", sqlutil.EscapeStringLiteral(fullPath)))
 	}
 
 	if len(parts) == 0 {
@@ -168,19 +181,24 @@ func (r *Router) getBackendName(tier Tier) string {
 	}
 }
 
+// buildReadParquet builds a DuckDB read_parquet() expression from file paths.
+// DuckDB cannot parameterize read_parquet() arguments, so paths are
+// interpolated as string literals — single quotes are escaped to keep a
+// quote-bearing path (e.g. from an unvalidated upstream name) inside the
+// literal instead of terminating it (#307).
 func (r *Router) buildReadParquet(paths []string) string {
 	if len(paths) == 0 {
 		return ""
 	}
 
 	if len(paths) == 1 {
-		return fmt.Sprintf("read_parquet('%s')", paths[0])
+		return fmt.Sprintf("read_parquet('%s')", sqlutil.EscapeStringLiteral(paths[0]))
 	}
 
 	// Multiple paths: use list
 	quotedPaths := make([]string, len(paths))
 	for i, p := range paths {
-		quotedPaths[i] = fmt.Sprintf("'%s'", p)
+		quotedPaths[i] = fmt.Sprintf("'%s'", sqlutil.EscapeStringLiteral(p))
 	}
 	return fmt.Sprintf("read_parquet([%s], union_by_name=true)", strings.Join(quotedPaths, ", "))
 }
