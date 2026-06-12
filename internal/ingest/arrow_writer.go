@@ -3167,7 +3167,9 @@ func hourIDToTime(hourID int64) time.Time {
 // is identical to t / microPerHour.
 func HourBucketID(microTime int64) int64 {
 	h := microTime / microPerHour
-	if microTime%microPerHour != 0 && microTime < 0 {
+	// Sign check first so the modulo is short-circuited away for the common
+	// non-negative case on the per-row ingest hot path.
+	if microTime < 0 && microTime%microPerHour != 0 {
 		h--
 	}
 	return h
