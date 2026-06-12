@@ -24,11 +24,6 @@ import (
 // Mirrors the limit already enforced by the LP/TLE import handlers.
 const maxImportSize = 500 * 1024 * 1024 // 500MB
 
-// microPerHour matches ingest.groupByHour's bucketing (t / 3_600_000_000).
-// Used to compute partitions_created in-process, identical to what the
-// ArrowBuffer will write for a single-flush import.
-const microPerHour = int64(3_600_000_000)
-
 // =============================================================================
 // CSV import — in-process parsing, no DuckDB on the temp file.
 // =============================================================================
@@ -493,7 +488,7 @@ func validateImportHeader(header []string, timeColumn string) (int, *importError
 
 // buildImportResult computes the ImportResult fields in-process from the parsed
 // time column, with no follow-up DuckDB query. partitions_created counts distinct
-// hour buckets exactly as ingest.groupByHour will (t / microPerHour).
+// hour buckets exactly as ingest.groupByHour will, via ingest.HourBucketID.
 func buildImportResult(database, measurement string, header []string, timeColumn string, timeMicros []int64) *ImportResult {
 	// Output columns: header with the time column renamed to "time".
 	cols := make([]string, len(header))
@@ -514,7 +509,9 @@ func buildImportResult(database, measurement string, header []string, timeColumn
 		if i == 0 || t > maxT {
 			maxT = t
 		}
-		hourBuckets[t/microPerHour] = struct{}{}
+		// Count distinct hour buckets exactly as ingest.groupByHour will
+		// (floor division so pre-epoch times match, #312).
+		hourBuckets[ingest.HourBucketID(t)] = struct{}{}
 	}
 
 	return &ImportResult{

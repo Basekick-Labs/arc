@@ -3158,10 +3158,25 @@ func hourIDToTime(hourID int64) time.Time {
 	return time.UnixMicro(hourID * microPerHour).UTC()
 }
 
+// HourBucketID returns the hour bucket for a microsecond timestamp, using
+// floor division so the bucket is the hour that actually contains the
+// timestamp. Plain integer division truncates toward zero, which puts
+// pre-epoch (negative) timestamps in the wrong hour — e.g. a timestamp 1µs
+// before the epoch would map to hour 0 (1970-01-01 00:00) instead of hour -1
+// (1969-12-31 23:00), misfiling the row's partition (#312). For t >= 0 this
+// is identical to t / microPerHour.
+func HourBucketID(microTime int64) int64 {
+	h := microTime / microPerHour
+	if microTime%microPerHour != 0 && microTime < 0 {
+		h--
+	}
+	return h
+}
+
 // groupByHour groups row indices by hour and tracks min/max times
 // Works correctly regardless of whether data is globally sorted by time
 // Returns: map of hourID -> bucket, global min time, global max time
-// Uses integer division for fast hour extraction (no time.Time allocations)
+// Uses HourBucketID for fast, allocation-free hour extraction (no time.Time)
 func groupByHour(times []int64) (map[int64]*hourBucket, int64, int64, error) {
 	if len(times) == 0 {
 		return nil, 0, 0, fmt.Errorf("empty time column")
@@ -3181,8 +3196,10 @@ func groupByHour(times []int64) (map[int64]*hourBucket, int64, int64, error) {
 			globalMax = t
 		}
 
-		// Fast hour extraction using integer division (no time.Time allocation)
-		hourID := t / microPerHour
+		// Fast hour extraction (no time.Time allocation). Floor division so
+		// pre-epoch (negative) timestamps bucket into the hour that contains
+		// them rather than truncating toward the epoch (#312).
+		hourID := HourBucketID(t)
 
 		// Get or create bucket
 		bucket, exists := buckets[hourID]
