@@ -695,3 +695,96 @@ func BenchmarkSortColumnsByKeys(b *testing.B) {
 		})
 	}
 }
+
+// TestHourBucketID verifies floor-division hour bucketing, including the
+// pre-epoch (negative) case that plain truncation gets wrong (#312). The
+// invariant proved for every case: the bucket's hour, mapped back to a time
+// via hourIDToTime, is the hour that actually CONTAINS the timestamp —
+// i.e. hourIDToTime(bucket) <= t < hourIDToTime(bucket)+1h.
+func TestHourBucketID(t *testing.T) {
+	tests := []struct {
+		name       string
+		micro      int64
+		wantBucket int64
+	}{
+		{"epoch", 0, 0},
+		{"mid hour 0", 30 * 60 * 1_000_000, 0},
+		{"exact hour 1 boundary", microPerHour, 1},
+		{"positive multi-hour", 5*microPerHour + 123, 5},
+		{"one micro before epoch", -1, -1},
+		{"exact hour -1 boundary", -microPerHour, -1},
+		{"sub-hour negative", -1_000_000, -1}, // 1s before epoch → hour -1
+		{"multi-hour negative", -3*microPerHour - 1, -4},
+		{"exact hour -3 boundary", -3 * microPerHour, -3},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := HourBucketID(tt.micro)
+			if got != tt.wantBucket {
+				t.Errorf("HourBucketID(%d) = %d, want %d", tt.micro, got, tt.wantBucket)
+			}
+
+			// The bucket must contain the timestamp: bucketStart <= t < bucketStart+1h.
+			bucketStart := hourIDToTime(got).UnixMicro()
+			if tt.micro < bucketStart || tt.micro >= bucketStart+microPerHour {
+				t.Errorf("HourBucketID(%d): bucket %d spans [%d, %d), does not contain %d",
+					tt.micro, got, bucketStart, bucketStart+microPerHour, tt.micro)
+			}
+		})
+	}
+
+	// For non-negative timestamps, floor division must equal plain truncation
+	// (no behavior change on the common path).
+	for _, micro := range []int64{0, 1, microPerHour - 1, microPerHour, 1_000 * microPerHour} {
+		if HourBucketID(micro) != micro/microPerHour {
+			t.Errorf("HourBucketID(%d) diverges from truncation for non-negative input", micro)
+		}
+	}
+}
+
+// TestGroupByHourPreEpoch verifies that groupByHour buckets pre-epoch
+// timestamps into the correct hour and that the bucket round-trips to the
+// correct pre-1970 partition path (#312).
+func TestGroupByHourPreEpoch(t *testing.T) {
+	// 1969-12-31 23:30:00 UTC and 1969-12-31 23:45:00 UTC — both in the hour
+	// 1969-12-31 23:00, which is bucket -1.
+	t1 := time.Date(1969, 12, 31, 23, 30, 0, 0, time.UTC).UnixMicro()
+	t2 := time.Date(1969, 12, 31, 23, 45, 0, 0, time.UTC).UnixMicro()
+	// 1970-01-01 00:15:00 UTC — the epoch hour, bucket 0.
+	t3 := time.Date(1970, 1, 1, 0, 15, 0, 0, time.UTC).UnixMicro()
+
+	buckets, gMin, gMax, err := groupByHour([]int64{t1, t2, t3})
+	if err != nil {
+		t.Fatalf("groupByHour() error = %v", err)
+	}
+	if len(buckets) != 2 {
+		t.Fatalf("groupByHour() got %d buckets, want 2 (pre-epoch hour + epoch hour)", len(buckets))
+	}
+	if gMin != t1 || gMax != t3 {
+		t.Errorf("global min/max = (%d, %d), want (%d, %d)", gMin, gMax, t1, t3)
+	}
+
+	preEpoch, ok := buckets[-1]
+	if !ok {
+		t.Fatalf("missing pre-epoch bucket -1; got buckets %v", bucketKeys(buckets))
+	}
+	if len(preEpoch.indices) != 2 {
+		t.Errorf("pre-epoch bucket has %d rows, want 2", len(preEpoch.indices))
+	}
+	// The pre-epoch bucket must map to 1969-12-31 23:00, not 1970-01-01 00:00.
+	if got := hourIDToTime(-1).UTC(); got.Year() != 1969 || got.Hour() != 23 {
+		t.Errorf("hourIDToTime(-1) = %s, want 1969-12-31 23:00", got.Format(time.RFC3339))
+	}
+	if _, ok := buckets[0]; !ok {
+		t.Errorf("missing epoch bucket 0; got buckets %v", bucketKeys(buckets))
+	}
+}
+
+func bucketKeys(m map[int64]*hourBucket) []int64 {
+	keys := make([]int64, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
