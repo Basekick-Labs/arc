@@ -118,12 +118,24 @@ func (s *PolicyStore) Get(ctx context.Context, database string) (*DatabasePolicy
 		return nil, err
 	}
 
-	// Cache the result (even if nil, we cache to avoid repeated DB lookups)
-	if policy != nil {
-		s.mu.Lock()
-		s.cache[database] = policy
-		s.mu.Unlock()
+	// Cache the result — including nil (not-found): most databases have no
+	// custom policy, and an uncached negative would otherwise hit SQLite on
+	// every lookup, twice per file per migration cycle (#345). A cached nil
+	// returns (nil, nil) on the next Get via the two-value map read above —
+	// the same not-found contract as an uncached miss. Set overwrites the
+	// entry and Delete removes it, so invalidation is unchanged.
+	//
+	// Double-check under the write lock: getFromDB ran outside the lock, so
+	// a concurrent Set may have inserted the policy and cached it after our
+	// DB read returned no row. Its fresher entry must not be overwritten —
+	// a stale cached nil would silently disable the policy until the next
+	// Set, with no self-healing re-query. Return the fresher entry too.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cached, raced := s.cache[database]; raced {
+		return cached, nil
 	}
+	s.cache[database] = policy
 
 	return policy, nil
 }
@@ -205,8 +217,23 @@ func (s *PolicyStore) List(ctx context.Context) ([]DatabasePolicy, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	policies := make([]DatabasePolicy, 0, len(s.cache))
+	// Size the slice from the non-nil count: the cache also holds nil
+	// not-found entries (#345), often the majority, and len(s.cache) would
+	// over-allocate. Both passes run under the same RLock.
+	var count int
 	for _, policy := range s.cache {
+		if policy != nil {
+			count++
+		}
+	}
+
+	policies := make([]DatabasePolicy, 0, count)
+	for _, policy := range s.cache {
+		// Skip cached negatives: nil marks "no custom policy" (#345) and
+		// must not be dereferenced or listed.
+		if policy == nil {
+			continue
+		}
 		policies = append(policies, *policy)
 	}
 	return policies, nil
