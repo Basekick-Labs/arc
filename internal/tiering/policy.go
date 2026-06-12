@@ -131,12 +131,11 @@ func (s *PolicyStore) Get(ctx context.Context, database string) (*DatabasePolicy
 	// a stale cached nil would silently disable the policy until the next
 	// Set, with no self-healing re-query. Return the fresher entry too.
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if cached, raced := s.cache[database]; raced {
-		s.mu.Unlock()
 		return cached, nil
 	}
 	s.cache[database] = policy
-	s.mu.Unlock()
 
 	return policy, nil
 }
