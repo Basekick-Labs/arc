@@ -940,7 +940,10 @@ func TestNewAuthManager_SymlinkedDBLocksRealWALPerms(t *testing.T) {
 		t.Fatalf("mkdir real: %v", err)
 	}
 	if err := os.Symlink(realDir, linkDir); err != nil {
-		t.Fatalf("symlink: %v", err)
+		// Symlink creation can be denied in restricted sandboxes/CI; the
+		// behavior under test is unobservable without one, so skip rather
+		// than fail.
+		t.Skipf("symlink creation not supported or permitted: %v", err)
 	}
 
 	// Open via the symlinked directory; the real files land under realDir.
