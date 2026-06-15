@@ -38,10 +38,85 @@ func TestComputeCacheInvalidateHMAC_Determinism(t *testing.T) {
 // before changing the constant.
 func TestComputeHMAC_Determinism(t *testing.T) {
 	t.Parallel()
-	got := ComputeHMAC("secret", "nonce-abc", "node-1", "cluster-A", 1700000000)
-	const want = "49f7533612fce7403bc6496e7de19132b6f9812e5e6731bafeb6c3f5f18df2e4"
+	got := ComputeHMAC("secret", MsgTypeJoin, "nonce-abc", "node-1", "cluster-A", 1700000000)
+	const want = "157f5091712b067897fb7f6e088229c05837799edd249daec924184cb57d9e6b"
 	if got != want {
 		t.Errorf("join MAC drift detected:\n  got  %s\n  want %s\nIf this test fails, the join-endpoint message format changed — coordinate with the deployed-version matrix before merging.", got, want)
+	}
+}
+
+// TestJoinFamilyHMAC_LabelBinding_NoCrossMessageTypeReplay is the
+// critical security property for #504: a MAC computed with one
+// message-type label (join/leave/heartbeat) must NOT validate against
+// the verifier for a different message type, even with identical
+// (nonce, nodeID, clusterName, timestamp) inputs.
+//
+// Without the per-message-type label, a heartbeat MAC could be replayed
+// as a node-evicting leave within the 5-minute freshness window.
+// This test ensures the labels make that impossible in all six
+// cross-type combinations.
+func TestJoinFamilyHMAC_LabelBinding_NoCrossMessageTypeReplay(t *testing.T) {
+	t.Parallel()
+	const (
+		secret      = "secret"
+		nonce       = "nonce-abc"
+		nodeID      = "node-1"
+		clusterName = "cluster-A"
+	)
+	ts := time.Now().Unix()
+
+	joinMAC := ComputeHMAC(secret, MsgTypeJoin, nonce, nodeID, clusterName, ts)
+	leaveMAC := ComputeHMAC(secret, MsgTypeLeave, nonce, nodeID, clusterName, ts)
+	heartbeatMAC := ComputeHMAC(secret, MsgTypeHeartbeat, nonce, nodeID, clusterName, ts)
+
+	// All three must produce distinct MACs for identical (nonce, nodeID,
+	// clusterName, timestamp). If any pair collides, cross-message-type
+	// replay is trivially possible.
+	if joinMAC == leaveMAC {
+		t.Error("join MAC collided with leave MAC — cross-message-type replay possible")
+	}
+	if joinMAC == heartbeatMAC {
+		t.Error("join MAC collided with heartbeat MAC — cross-message-type replay possible")
+	}
+	if leaveMAC == heartbeatMAC {
+		t.Error("leave MAC collided with heartbeat MAC — cross-message-type replay possible")
+	}
+
+	// Each validator must reject MACs computed with the other two labels.
+	// join validator rejects leave MAC.
+	if err := ValidateHMAC(secret, MsgTypeJoin, nonce, nodeID, clusterName, ts, leaveMAC, 5*time.Minute); err == nil {
+		t.Error("leave MAC accepted by join validator — label binding broken")
+	}
+	// join validator rejects heartbeat MAC.
+	if err := ValidateHMAC(secret, MsgTypeJoin, nonce, nodeID, clusterName, ts, heartbeatMAC, 5*time.Minute); err == nil {
+		t.Error("heartbeat MAC accepted by join validator — label binding broken")
+	}
+	// leave validator rejects join MAC.
+	if err := ValidateHMAC(secret, MsgTypeLeave, nonce, nodeID, clusterName, ts, joinMAC, 5*time.Minute); err == nil {
+		t.Error("join MAC accepted by leave validator — label binding broken")
+	}
+	// leave validator rejects heartbeat MAC.
+	if err := ValidateHMAC(secret, MsgTypeLeave, nonce, nodeID, clusterName, ts, heartbeatMAC, 5*time.Minute); err == nil {
+		t.Error("heartbeat MAC accepted by leave validator — label binding broken")
+	}
+	// heartbeat validator rejects join MAC.
+	if err := ValidateHMAC(secret, MsgTypeHeartbeat, nonce, nodeID, clusterName, ts, joinMAC, 5*time.Minute); err == nil {
+		t.Error("join MAC accepted by heartbeat validator — label binding broken")
+	}
+	// heartbeat validator rejects leave MAC.
+	if err := ValidateHMAC(secret, MsgTypeHeartbeat, nonce, nodeID, clusterName, ts, leaveMAC, 5*time.Minute); err == nil {
+		t.Error("leave MAC accepted by heartbeat validator — label binding broken")
+	}
+
+	// Sanity: each validator accepts its own MAC.
+	if err := ValidateHMAC(secret, MsgTypeJoin, nonce, nodeID, clusterName, ts, joinMAC, 5*time.Minute); err != nil {
+		t.Errorf("join validator rejected its own MAC: %v", err)
+	}
+	if err := ValidateHMAC(secret, MsgTypeLeave, nonce, nodeID, clusterName, ts, leaveMAC, 5*time.Minute); err != nil {
+		t.Errorf("leave validator rejected its own MAC: %v", err)
+	}
+	if err := ValidateHMAC(secret, MsgTypeHeartbeat, nonce, nodeID, clusterName, ts, heartbeatMAC, 5*time.Minute); err != nil {
+		t.Errorf("heartbeat validator rejected its own MAC: %v", err)
 	}
 }
 
@@ -81,7 +156,7 @@ func TestValidate_RejectsMalformedHexMAC(t *testing.T) {
 	ts := time.Now().Unix()
 	const malformed = "not-hex-at-all-zzzzzzzzzzzzzzzz"
 
-	if err := ValidateHMAC("s", "n", "id", "c", ts, malformed, 5*time.Minute); err == nil {
+	if err := ValidateHMAC("s", MsgTypeJoin, "n", "id", "c", ts, malformed, 5*time.Minute); err == nil {
 		t.Error("ValidateHMAC accepted a non-hex MAC")
 	}
 	if err := ValidateFetchHMAC("s", "n", "id", "c", "/p", ts, malformed, 5*time.Minute); err == nil {
@@ -177,7 +252,7 @@ func TestCacheInvalidateHMAC_LabelBinding_NoCrossEndpointReplay(t *testing.T) {
 	cacheMAC := ComputeCacheInvalidateHMAC(secret, nonce, nodeID, clusterName, ts)
 	forwardMAC := ComputeForwardHMAC(secret, nonce, nodeID, clusterName, []byte{}, ts)
 	fetchMAC := ComputeFetchHMAC(secret, nonce, nodeID, clusterName, fetchPath, ts)
-	joinMAC := ComputeHMAC(secret, nonce, nodeID, clusterName, ts)
+	joinMAC := ComputeHMAC(secret, MsgTypeJoin, nonce, nodeID, clusterName, ts)
 
 	if cacheMAC == forwardMAC {
 		t.Error("cache-invalidate MAC collided with forward MAC — cross-endpoint replay possible")
@@ -209,6 +284,10 @@ func TestCacheInvalidateHMAC_LabelBinding_NoCrossEndpointReplay(t *testing.T) {
 	}
 	if err := ValidateFetchHMAC(secret, nonce, nodeID, clusterName, fetchPath, ts, cacheMAC, 5*time.Minute); err == nil {
 		t.Error("cache-invalidate MAC accepted by fetch validator — endpoint labels not binding")
+	}
+	// Also the join-family validator must reject MACs from other endpoints.
+	if err := ValidateHMAC(secret, MsgTypeJoin, nonce, nodeID, clusterName, ts, cacheMAC, 5*time.Minute); err == nil {
+		t.Error("cache-invalidate MAC accepted by join validator — endpoint labels not binding")
 	}
 }
 
@@ -383,7 +462,7 @@ func TestReplicationHMAC_LabelBinding_NoCrossEndpointReplay(t *testing.T) {
 	cacheMAC := ComputeCacheInvalidateHMAC(secret, nonce, nodeID, clusterName, ts)
 	forwardMAC := ComputeForwardHMAC(secret, nonce, nodeID, clusterName, []byte{}, ts)
 	fetchMAC := ComputeFetchHMAC(secret, nonce, nodeID, clusterName, fetchPath, ts)
-	joinMAC := ComputeHMAC(secret, nonce, nodeID, clusterName, ts)
+	joinMAC := ComputeHMAC(secret, MsgTypeJoin, nonce, nodeID, clusterName, ts)
 
 	// All MAC families must produce distinct values for identical-ish inputs.
 	macs := map[string]string{
@@ -431,6 +510,13 @@ func TestReplicationHMAC_LabelBinding_NoCrossEndpointReplay(t *testing.T) {
 	}
 	if err := ValidateFetchHMAC(secret, nonce, nodeID, clusterName, fetchPath, ts, checkpointMAC, 5*time.Minute); err == nil {
 		t.Error("checkpoint MAC accepted by fetch validator")
+	}
+	// Join-family validator must reject sync/checkpoint MACs.
+	if err := ValidateHMAC(secret, MsgTypeJoin, nonce, nodeID, clusterName, ts, syncMAC, 5*time.Minute); err == nil {
+		t.Error("sync MAC accepted by join validator")
+	}
+	if err := ValidateHMAC(secret, MsgTypeJoin, nonce, nodeID, clusterName, ts, checkpointMAC, 5*time.Minute); err == nil {
+		t.Error("checkpoint MAC accepted by join validator")
 	}
 }
 
