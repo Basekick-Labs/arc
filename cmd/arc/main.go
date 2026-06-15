@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -38,6 +37,7 @@ import (
 	"github.com/basekick-labs/arc/internal/reconciliation"
 	"github.com/basekick-labs/arc/internal/scheduler"
 	"github.com/basekick-labs/arc/internal/shutdown"
+	"github.com/basekick-labs/arc/internal/sqlitex"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/telemetry"
 	"github.com/basekick-labs/arc/internal/tiering"
@@ -1832,9 +1832,16 @@ func main() {
 		} else if !licenseClient.CanUseAuditLogging() {
 			log.Warn().Msg("License does not include audit_logging feature - feature disabled")
 		} else {
-			auditDB, err := sql.Open("sqlite3", cfg.Auth.DBPath)
+			// sqlitex.Open locks the DB to 0600 (security finding M4). On the
+			// shared default path the auth manager already created/locked it;
+			// this is an idempotent re-tighten. HardenWALSHM after handles the
+			// -wal/-shm sidecars.
+			auditDB, err := sqlitex.Open(cfg.Auth.DBPath, "_busy_timeout=5000")
 			if err != nil {
 				log.Error().Err(err).Msg("Failed to open audit database - feature disabled")
+			} else if err := sqlitex.HardenWALSHM(cfg.Auth.DBPath, logger.Get("audit")); err != nil {
+				auditDB.Close()
+				log.Error().Err(err).Msg("Failed to harden audit database permissions - feature disabled")
 			} else {
 				auditLogger, err = audit.NewLogger(&audit.LoggerConfig{
 					DB:     auditDB,
@@ -1995,9 +2002,14 @@ func main() {
 			if governanceDBPath == "" {
 				governanceDBPath = "./data/arc.db"
 			}
-			governanceDB, err := sql.Open("sqlite3", governanceDBPath)
+			// sqlitex.Open locks the DB to 0600 (security finding M4); idempotent
+			// re-tighten on the shared default path. HardenWALSHM handles sidecars.
+			governanceDB, err := sqlitex.Open(governanceDBPath, "_busy_timeout=5000")
 			if err != nil {
 				log.Error().Err(err).Msg("Failed to open governance database - feature disabled")
+			} else if err := sqlitex.HardenWALSHM(governanceDBPath, logger.Get("governance")); err != nil {
+				governanceDB.Close()
+				log.Error().Err(err).Msg("Failed to harden governance database permissions - feature disabled")
 			} else {
 				governanceManager, err := governance.NewManager(&governance.ManagerConfig{
 					DB:     governanceDB,
@@ -2441,9 +2453,14 @@ func main() {
 		} else {
 			// Open SQLite database for tiering metadata (shared with other features)
 			tieringDBPath := cfg.Auth.DBPath // Use shared SQLite database
-			tieringDB, err := sql.Open("sqlite3", tieringDBPath)
+			// sqlitex.Open locks the DB to 0600 (security finding M4); idempotent
+			// re-tighten on the shared default path. HardenWALSHM handles sidecars.
+			tieringDB, err := sqlitex.Open(tieringDBPath, "_busy_timeout=5000")
 			if err != nil {
 				log.Error().Err(err).Msg("Failed to open tiering database - feature disabled")
+			} else if err := sqlitex.HardenWALSHM(tieringDBPath, logger.Get("tiering")); err != nil {
+				tieringDB.Close()
+				log.Error().Err(err).Msg("Failed to harden tiering database permissions - feature disabled")
 			} else {
 				// Create cold tier backend (S3 or Azure)
 				var coldBackend storage.Backend

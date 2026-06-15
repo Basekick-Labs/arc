@@ -2,7 +2,6 @@ package backup
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,8 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
-
+	"github.com/basekick-labs/arc/internal/sqlitex"
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
@@ -211,7 +209,10 @@ func (m *Manager) copyDataFiles(ctx context.Context, backupID string, files []st
 // It performs a WAL checkpoint first to ensure a consistent copy.
 func (m *Manager) backupSQLite(ctx context.Context, backupID string) error {
 	// Checkpoint WAL to ensure all data is flushed to the main DB file.
-	db, err := sql.Open("sqlite3", m.sqliteDBPath)
+	// sqlitex.Open locks the DB to 0600 (the file already exists here, so this is
+	// effectively a re-tighten) and is the single source of truth for SQLite
+	// hardening (security finding M4).
+	db, err := sqlitex.Open(m.sqliteDBPath, "")
 	if err != nil {
 		return fmt.Errorf("failed to open SQLite for checkpoint: %w", err)
 	}
@@ -220,6 +221,11 @@ func (m *Manager) backupSQLite(ctx context.Context, backupID string) error {
 		return fmt.Errorf("WAL checkpoint failed: %w", err)
 	}
 	db.Close()
+
+	// The checkpoint can rewrite the -wal/-shm sidecars; re-lock them to 0600.
+	if err := sqlitex.HardenWALSHM(m.sqliteDBPath, m.logger); err != nil {
+		return fmt.Errorf("failed to harden SQLite WAL/SHM permissions: %w", err)
+	}
 
 	data, err := os.ReadFile(m.sqliteDBPath)
 	if err != nil {

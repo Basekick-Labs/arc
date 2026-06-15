@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -15,6 +14,7 @@ import (
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/license"
+	"github.com/basekick-labs/arc/internal/sqlitex"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	_ "github.com/mattn/go-sqlite3"
@@ -104,14 +104,11 @@ type RetentionExecution struct {
 
 // NewRetentionHandler creates a new retention handler
 func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *config.RetentionConfig, licenseClient *license.Client, authManager *auth.AuthManager, logger zerolog.Logger) (*RetentionHandler, error) {
-	// Ensure directory exists
-	dir := filepath.Dir(cfg.DBPath)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return nil, fmt.Errorf("failed to create directory for retention DB: %w", err)
-	}
-
-	// Open SQLite database for policy metadata
-	db, err := sql.Open("sqlite3", cfg.DBPath)
+	// Open SQLite database for policy metadata with owner-only (0600)
+	// permissions. On a custom retention.db_path the file must not inherit the
+	// world-readable umask (security finding M4). sqlitex.Open also creates the
+	// parent directory (0700).
+	db, err := sqlitex.Open(cfg.DBPath, "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open retention database: %w", err)
 	}
@@ -130,6 +127,12 @@ func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *
 	if err := h.initTables(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to initialize retention tables: %w", err)
+	}
+
+	// Lock the -wal/-shm sidecars created during initTables.
+	if err := sqlitex.HardenWALSHM(cfg.DBPath, h.logger); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to harden retention DB WAL/SHM permissions: %w", err)
 	}
 
 	return h, nil
@@ -838,7 +841,7 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 		// into ops. The storage delete loop uses this subset so a marshal failure
 		// never causes a file to be deleted from storage without a manifest entry.
 		var ops []raft.BatchFileOp
-		subPaths := chunk          // default: all chunk paths (no coordinator)
+		subPaths := chunk // default: all chunk paths (no coordinator)
 		subRows := eligibleRows[i:end]
 		if h.coordinator != nil {
 			ops = make([]raft.BatchFileOp, 0, len(chunk))

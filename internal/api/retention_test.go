@@ -65,6 +65,26 @@ func setupTestRetentionHandler(t *testing.T) (*RetentionHandler, string) {
 	return handler, tmpDir
 }
 
+// TestNewRetentionHandler_LocksDBPerms is the M4 regression test (issue #509):
+// on a custom (non-shared) retention.db_path, the DB and its WAL/SHM siblings
+// must be locked to 0600, not left at the world-readable umask.
+func TestNewRetentionHandler_LocksDBPerms(t *testing.T) {
+	_, tmpDir := setupTestRetentionHandler(t)
+	dbPath := filepath.Join(tmpDir, "retention.db")
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		info, err := os.Lstat(p)
+		if os.IsNotExist(err) {
+			continue // -wal/-shm may not exist depending on journal state
+		}
+		if err != nil {
+			t.Fatalf("lstat %s: %v", p, err)
+		}
+		if perm := info.Mode().Perm(); perm != 0600 {
+			t.Errorf("%s perm = %o, want 0600", filepath.Base(p), perm)
+		}
+	}
+}
+
 func TestBuildParquetPath_LocalBackend(t *testing.T) {
 	handler, tmpDir := setupTestRetentionHandler(t)
 
