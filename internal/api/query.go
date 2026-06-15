@@ -1327,42 +1327,66 @@ func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 	// is a no-op unless cluster.query_gate_on_catchup is true AND the
 	// coordinator reports peer file replication is still drifting.
 	//
-	// The auth middleware is resolved lazily via sync.Once so it is
-	// independent of whether SetAuthAndRBAC runs before or after
-	// RegisterRoutes. On the fast path (every request after the first)
-	// this is a single atomic load — zero measurable overhead.
+	// The auth middleware is resolved lazily so it is independent of
+	// whether SetAuthAndRBAC runs before or after RegisterRoutes. Uses
+	// atomic.Value + double-checked locking (not sync.Once) because if
+	// h.authManager is nil at init time (early request before
+	// SetAuthAndRBAC), the middleware resolves as a passthrough for that
+	// single request but is NOT permanently cached — the next request
+	// retries and eventually caches the real middleware once the auth
+	// manager is configured. sync.Once would permanently cache the
+	// passthrough, creating a silent auth bypass.
+	//
+	// On the fast path (cached) this is a single atomic load — zero
+	// measurable overhead.
 	//
 	// QueryHandler holds the AuthManager interface for testability; at
 	// runtime it is always *auth.AuthManager. If the type assertion
 	// fails (non-nil but wrong concrete type), fail closed rather than
 	// silently disabling auth on all query routes.
 	var (
-		readAuthOnce   sync.Once
-		cachedReadAuth fiber.Handler
+		cachedReadAuth atomic.Value
+		initMu         sync.Mutex
 	)
 	readAuth := func(c *fiber.Ctx) error {
-		readAuthOnce.Do(func() {
-			if h.authManager == nil {
-				cachedReadAuth = passthroughMiddleware
-				return
+		if handler, ok := cachedReadAuth.Load().(fiber.Handler); ok {
+			return handler(c)
+		}
+
+		initMu.Lock()
+		defer initMu.Unlock()
+
+		// Double-check after acquiring lock.
+		if handler, ok := cachedReadAuth.Load().(fiber.Handler); ok {
+			return handler(c)
+		}
+
+		// authManager is nil before SetAuthAndRBAC is called (auth
+		// disabled, or early-startup request). Return passthrough for
+		// THIS request only — do NOT cache, so the next request retries.
+		if h.authManager == nil {
+			return c.Next()
+		}
+
+		var handler fiber.Handler
+		// Tests may pass a mock implementing an optional RequireRead()
+		// interface to provide their own middleware.
+		if provider, ok := h.authManager.(interface{ RequireRead() fiber.Handler }); ok {
+			handler = provider.RequireRead()
+		} else if concrete, ok := h.authManager.(*auth.AuthManager); ok {
+			handler = auth.RequireRead(concrete)
+		} else {
+			h.logger.Error().Msg("AuthManager type assertion failed — denying all query traffic (fail-closed)")
+			handler = func(c *fiber.Ctx) error {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+					"success": false,
+					"error":   "internal_auth_error",
+				})
 			}
-			// Tests may pass a mock implementing an optional RequireRead()
-			// interface to provide their own middleware.
-			if provider, ok := h.authManager.(interface{ RequireRead() fiber.Handler }); ok {
-				cachedReadAuth = provider.RequireRead()
-			} else if concrete, ok := h.authManager.(*auth.AuthManager); ok {
-				cachedReadAuth = auth.RequireRead(concrete)
-			} else {
-				h.logger.Error().Msg("AuthManager type assertion failed — denying all query traffic (fail-closed)")
-				cachedReadAuth = func(c *fiber.Ctx) error {
-					return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-						"success": false,
-						"error":   "internal_auth_error",
-					})
-				}
-			}
-		})
-		return cachedReadAuth(c)
+		}
+
+		cachedReadAuth.Store(handler)
+		return handler(c)
 	}
 	app.Post("/api/v1/query", readAuth, h.checkReplicationReady, h.executeQuery)
 	// Experimental: same execution pipeline as /api/v1/query, but the
