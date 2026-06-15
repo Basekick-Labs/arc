@@ -1255,14 +1255,24 @@ func main() {
 					_, apiAddr = api.ListenAddr(cfg.Server.Host, cfg.Server.Port)
 				}
 
-				// Peer replication (Enterprise Phase 2) requires shared-secret auth
-				// on the coordinator protocol. Fail loudly rather than silently
-				// running unauthenticated — operators should opt in explicitly.
-				if cfg.Cluster.ReplicationEnabled && cfg.Cluster.SharedSecret == "" {
-					log.Error().Msg("cluster.replication_enabled requires ARC_CLUSTER_SHARED_SECRET to be set (peer fetches must be authenticated)")
-					log.Error().Msg("Set ARC_CLUSTER_SHARED_SECRET or disable cluster.replication_enabled to continue")
+				// Clustering requires shared-secret auth on the coordinator
+				// protocol. Without it, the coordinator validates no HMAC on
+				// join/heartbeat/leave messages (the checks are gated on a
+				// non-empty secret), so any host that can reach the coordinator
+				// port could join as a trusted node. Fail closed rather than
+				// run an unauthenticated cluster (GHSA-p378-jp5r-gpgw). This
+				// guard is only reachable by a clustering-licensed instance
+				// (the standalone-fallback branches above handle the unlicensed
+				// case), so it never affects single-node deployments.
+				if cfg.Cluster.SharedSecret == "" {
+					log.Error().Msg("cluster.enabled requires ARC_CLUSTER_SHARED_SECRET to be set (cluster join and heartbeat messages must be authenticated)")
+					log.Error().Msg("Set ARC_CLUSTER_SHARED_SECRET to a value shared by all cluster nodes (generate with: openssl rand -hex 32), or disable cluster.enabled to continue")
 					os.Exit(1)
 				}
+				// Note: this guard subsumes the previous replication-only check
+				// (cluster.replication_enabled with an empty secret) — an empty
+				// secret now fails closed regardless of which cluster features
+				// are enabled.
 
 				var err error
 				clusterCoordinator, err = cluster.NewCoordinator(&cluster.CoordinatorConfig{

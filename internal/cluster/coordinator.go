@@ -770,6 +770,18 @@ func (c *Coordinator) sendHeartbeats() {
 		Timestamp: time.Now(),
 	}
 
+	// Sign the heartbeat if a shared secret is configured. Mirrors the
+	// join/leave signing path. The HMAC binds NodeID + ClusterName +
+	// timestamp, so it is the same for every peer this tick — compute once.
+	if c.cfg.SharedSecret != "" {
+		nonce, err := security.GenerateNonce()
+		if err == nil {
+			hb.AuthTimestamp = time.Now().Unix()
+			hb.AuthNonce = nonce
+			hb.AuthHMAC = security.ComputeHMAC(c.cfg.SharedSecret, nonce, hb.NodeID, c.cfg.ClusterName, hb.AuthTimestamp)
+		}
+	}
+
 	for _, node := range nodes {
 		if local != nil && node.ID == local.ID {
 			continue
@@ -1219,6 +1231,26 @@ func (c *Coordinator) sendJoinSuccess(conn net.Conn) {
 
 // handleHeartbeat processes a heartbeat from a peer.
 func (c *Coordinator) handleHeartbeat(conn net.Conn, hb *protocol.Heartbeat) {
+	// Validate shared secret if configured. A heartbeat mutates the sender's
+	// recorded liveness and self-reported state, so it is authenticated like
+	// join/leave — otherwise a network attacker could spoof any node's health
+	// (GHSA-p378-jp5r-gpgw). Mirrors handleLeaveNotify; freshness is bounded by
+	// the HMAC timestamp tolerance (consistent with join/leave, which likewise
+	// do not nonce-replay-check).
+	if c.cfg.SharedSecret != "" {
+		if hb.AuthHMAC == "" {
+			c.logger.Warn().Str("node_id", hb.NodeID).Msg("Heartbeat rejected: shared secret required but not provided")
+			return
+		}
+		if err := security.ValidateHMAC(
+			c.cfg.SharedSecret, hb.AuthNonce, hb.NodeID, c.cfg.ClusterName,
+			hb.AuthTimestamp, hb.AuthHMAC, security.HMACTimestampTolerance,
+		); err != nil {
+			c.logger.Warn().Err(err).Str("node_id", hb.NodeID).Msg("Heartbeat rejected: authentication failed")
+			return
+		}
+	}
+
 	// Update the real node's LastHeartbeat and self-reported state in the
 	// registry (not a clone).
 	c.registry.RecordHeartbeat(hb.NodeID, NodeStats{})
