@@ -128,6 +128,40 @@ func NewAuthManager(dbPath string, cacheTTL time.Duration, maxCacheSize int, log
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(time.Hour)
 
+	// In-memory databases (common in tests) have no filesystem footprint.
+	// Skip all file creation and permission operations for them.
+	isInMemory := dbPath == ":memory:" || strings.HasPrefix(dbPath, "file::memory:")
+
+	if !isInMemory {
+		// Pre-create the SQLite file with owner-only permissions (0600) so
+		// there is no window where the file exists with default umask
+		// (typically 0644, world-readable) before os.Chmod runs. If the file
+		// already exists, OpenFile is a no-op for permissions but still
+		// succeeds.
+		f, err := os.OpenFile(dbPath, os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to create auth DB file: %w", err)
+		}
+		f.Close()
+	}
+
+	// Force a connection so the SQLite file is initialized on disk
+	// (sql.Open validates the DSN but defers file creation to first use).
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to ping auth database: %w", err)
+	}
+
+	if !isInMemory {
+		// Ensure permissions are 0600 even if the file already existed with
+		// looser permissions from a previous deployment.
+		if err := os.Chmod(dbPath, 0600); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to set auth DB permissions: %w", err)
+		}
+	}
+
 	am := &AuthManager{
 		db:           db,
 		dbPath:       dbPath,
@@ -143,10 +177,31 @@ func NewAuthManager(dbPath string, cacheTTL time.Duration, maxCacheSize int, log
 		return nil, err
 	}
 
+	if !isInMemory {
+		// SQLite in WAL mode creates -wal and -shm files alongside the main
+		// database on first write (initDB above). Apply 0600 to these as well —
+		// they're created with the process umask (typically 0644) and can
+		// contain recently-committed token hashes. We run this after initDB
+		// so the files are guaranteed to exist on a fresh install; on
+		// pre-existing deployments this tightens permissions that were set
+		// by an earlier version.
+		//
+		// Chmod directly and ignore not-exist errors — avoids the TOCTOU
+		// race between Stat+Chmod. On a fresh install with no -wal yet
+		// (unlikely after initDB, but possible), the not-exist is harmless.
+		for _, ext := range []string{"-wal", "-shm"} {
+			p := dbPath + ext
+			if err := os.Chmod(p, 0600); err != nil && !os.IsNotExist(err) {
+				db.Close()
+				return nil, fmt.Errorf("failed to set auth DB %s permissions: %w", ext, err)
+			}
+		}
+	}
+
 	// Start background cleanup
 	go am.cleanupLoop()
 
-	am.logger.Info().
+	am.logger.Debug().
 		Str("db_path", dbPath).
 		Dur("cache_ttl", cacheTTL).
 		Int("max_cache_size", maxCacheSize).

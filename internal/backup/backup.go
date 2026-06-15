@@ -236,6 +236,12 @@ func (m *Manager) backupSQLite(ctx context.Context, backupID string) error {
 }
 
 // backupConfig copies the arc.toml config file into the backup.
+//
+// SECURITY: arc.toml typically contains plaintext credentials (S3 secret key,
+// Azure account key, cluster shared secret). The backup storage must be treated
+// as secret material with the same access controls as the live config.
+// Operators who cannot secure backup storage should set backup.include_config
+// to false in arc.toml.
 func (m *Manager) backupConfig(ctx context.Context, backupID string) error {
 	data, err := os.ReadFile(m.configPath)
 	if err != nil {

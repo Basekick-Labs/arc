@@ -1321,19 +1321,59 @@ func (h *QueryHandler) checkMeasurementPermission(c *fiber.Ctx, database, measur
 
 // RegisterRoutes registers query endpoints
 func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
-	// User-facing read endpoints get the catch-up gate (#392) as route-level
-	// middleware. The middleware is a no-op unless cluster.query_gate_on_catchup
-	// is true AND the coordinator reports peer file replication is still draining.
-	app.Post("/api/v1/query", h.checkReplicationReady, h.executeQuery)
+	// User-facing read endpoints get the read-auth + catch-up gate (#392) as
+	// route-level middleware. The read-auth middleware enforces that the token
+	// has read-level permission (not just any valid token). The catch-up gate
+	// is a no-op unless cluster.query_gate_on_catchup is true AND the
+	// coordinator reports peer file replication is still drifting.
+	//
+	// The auth middleware is resolved lazily via sync.Once so it is
+	// independent of whether SetAuthAndRBAC runs before or after
+	// RegisterRoutes. On the fast path (every request after the first)
+	// this is a single atomic load — zero measurable overhead.
+	//
+	// QueryHandler holds the AuthManager interface for testability; at
+	// runtime it is always *auth.AuthManager. If the type assertion
+	// fails (non-nil but wrong concrete type), fail closed rather than
+	// silently disabling auth on all query routes.
+	var (
+		readAuthOnce   sync.Once
+		cachedReadAuth fiber.Handler
+	)
+	readAuth := func(c *fiber.Ctx) error {
+		readAuthOnce.Do(func() {
+			if h.authManager == nil {
+				cachedReadAuth = passthroughMiddleware
+				return
+			}
+			// Tests may pass a mock implementing an optional RequireRead()
+			// interface to provide their own middleware.
+			if provider, ok := h.authManager.(interface{ RequireRead() fiber.Handler }); ok {
+				cachedReadAuth = provider.RequireRead()
+			} else if concrete, ok := h.authManager.(*auth.AuthManager); ok {
+				cachedReadAuth = auth.RequireRead(concrete)
+			} else {
+				h.logger.Error().Msg("AuthManager type assertion failed — denying all query traffic (fail-closed)")
+				cachedReadAuth = func(c *fiber.Ctx) error {
+					return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+						"success": false,
+						"error":   "internal_auth_error",
+					})
+				}
+			}
+		})
+		return cachedReadAuth(c)
+	}
+	app.Post("/api/v1/query", readAuth, h.checkReplicationReady, h.executeQuery)
 	// Experimental: same execution pipeline as /api/v1/query, but the
 	// response is streamed as MessagePack instead of JSON. Gated by the
 	// duckdb_arrow build tag (no database/sql fallback — see the
 	// wire-format dispatch in executeQuery).
-	app.Post("/api/v1/query/msgpack", h.checkReplicationReady, h.executeQueryMsgPack)
-	app.Post("/api/v1/query/estimate", h.checkReplicationReady, h.estimateQuery)
-	app.Get("/api/v1/measurements", h.checkReplicationReady, h.listMeasurements)
-	app.Get("/api/v1/query/:measurement", h.checkReplicationReady, h.queryMeasurement)
-	h.registerArrowRoutes(app)
+	app.Post("/api/v1/query/msgpack", readAuth, h.checkReplicationReady, h.executeQueryMsgPack)
+	app.Post("/api/v1/query/estimate", readAuth, h.checkReplicationReady, h.estimateQuery)
+	app.Get("/api/v1/measurements", readAuth, h.checkReplicationReady, h.listMeasurements)
+	app.Get("/api/v1/query/:measurement", readAuth, h.checkReplicationReady, h.queryMeasurement)
+	h.registerArrowRoutes(app, readAuth)
 
 	// The distributed cache-invalidate endpoint
 	// (POST CacheInvalidatePath) is wired separately in cmd/arc/main.go,
