@@ -40,9 +40,11 @@ func isInMemory(dbPath string) bool {
 //
 // dbPath is a bare filesystem path by contract: it must NOT be a "file:" URI or
 // already carry query parameters, because Open appends params to build the DSN.
-// params is the query string WITHOUT a leading "?", e.g.
-// "_journal_mode=WAL&_busy_timeout=5000"; pass "" for none. The in-memory forms
-// (":memory:", "file::memory:") are accepted and skip all file operations.
+// A non-in-memory "file:" URI is rejected with an error (rather than silently
+// hardening the wrong on-disk file). params is the query string WITHOUT a
+// leading "?", e.g. "_journal_mode=WAL&_busy_timeout=5000"; pass "" for none.
+// The in-memory forms (":memory:", "file::memory:") are accepted and skip all
+// file operations.
 //
 // Open is idempotent against an existing database: MkdirAll is a no-op when the
 // directory exists, O_CREATE leaves an existing file's permissions unchanged,
@@ -55,6 +57,16 @@ func isInMemory(dbPath string) bool {
 func Open(dbPath, params string) (*sql.DB, error) {
 	if dbPath == "" {
 		return nil, fmt.Errorf("sqlitex.Open: dbPath cannot be empty")
+	}
+	// Enforce the bare-path contract. A "file:" URI (other than the in-memory
+	// forms handled by isInMemory) would make the file ops below target the
+	// literal URI string while SQLite opens the resolved path, silently
+	// hardening the wrong file and leaving the real DB at the umask. Rather than
+	// add a URI parser (which also conflicts with the "?"+params DSN
+	// construction — see PR #508), reject it loudly so a misconfiguration fails
+	// at startup instead of silently shipping a world-readable database.
+	if !isInMemory(dbPath) && strings.HasPrefix(dbPath, "file:") {
+		return nil, fmt.Errorf("sqlitex.Open: dbPath must be a bare filesystem path, not a file: URI: %q", dbPath)
 	}
 	if !isInMemory(dbPath) {
 		// Ensure the parent directory exists with owner-only permissions.

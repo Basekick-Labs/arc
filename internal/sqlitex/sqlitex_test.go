@@ -3,6 +3,7 @@ package sqlitex
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -171,6 +172,29 @@ func TestOpen_InMemorySkipsFileOps(t *testing.T) {
 			t.Errorf("HardenWALSHM(%q): %v", p, err)
 		}
 	}
+}
+
+// TestOpen_RejectsFileURI verifies the bare-path contract is enforced: a "file:"
+// URI (which would make file ops target the literal URI string while SQLite
+// opens the resolved path) is rejected loudly rather than silently hardening the
+// wrong file. The in-memory "file::memory:" form is still accepted.
+func TestOpen_RejectsFileURI(t *testing.T) {
+	dbPath := "file:" + filepath.Join(t.TempDir(), "uri.db") + "?cache=shared"
+	db, err := Open(dbPath, "_busy_timeout=5000")
+	if err == nil {
+		db.Close()
+		t.Fatal("Open accepted a file: URI; want rejection")
+	}
+	if !strings.Contains(err.Error(), "file: URI") {
+		t.Errorf("error = %q, want it to mention the file: URI contract", err)
+	}
+
+	// The in-memory file: form must still be accepted.
+	mem, err := Open("file::memory:?cache=shared", "")
+	if err != nil {
+		t.Fatalf("Open rejected the in-memory file: form: %v", err)
+	}
+	mem.Close()
 }
 
 // TestOpen_ParamsJoinWithExistingQuery verifies that when dbPath already carries
