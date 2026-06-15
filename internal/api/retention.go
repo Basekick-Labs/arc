@@ -108,7 +108,7 @@ func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *
 	// permissions. On a custom retention.db_path the file must not inherit the
 	// world-readable umask (security finding M4). sqlitex.Open also creates the
 	// parent directory (0700).
-	db, err := sqlitex.Open(cfg.DBPath, "")
+	db, err := sqlitex.Open(cfg.DBPath, "_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open retention database: %w", err)
 	}

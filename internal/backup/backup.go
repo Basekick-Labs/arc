@@ -212,7 +212,7 @@ func (m *Manager) backupSQLite(ctx context.Context, backupID string) error {
 	// sqlitex.Open locks the DB to 0600 (the file already exists here, so this is
 	// effectively a re-tighten) and is the single source of truth for SQLite
 	// hardening (security finding M4).
-	db, err := sqlitex.Open(m.sqliteDBPath, "")
+	db, err := sqlitex.Open(m.sqliteDBPath, "_busy_timeout=5000")
 	if err != nil {
 		return fmt.Errorf("failed to open SQLite for checkpoint: %w", err)
 	}

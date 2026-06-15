@@ -141,7 +141,7 @@ func NewContinuousQueryHandler(db *database.DuckDB, storage storage.Backend, arr
 	// hold continuous-query definitions; on a custom continuous_query.db_path
 	// it must not inherit the world-readable umask (security finding M4).
 	// sqlitex.Open also creates the parent directory (0700).
-	sqliteDB, err := sqlitex.Open(cfg.DBPath, "")
+	sqliteDB, err := sqlitex.Open(cfg.DBPath, "_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open CQ database: %w", err)
 	}
