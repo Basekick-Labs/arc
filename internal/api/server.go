@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/logger"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/gofiber/fiber/v2"
@@ -179,11 +180,29 @@ func (s *Server) RegisterRoutes() {
 	s.app.Get("/api/v1/metrics/endpoints", s.endpointMetricsHandler)
 	s.app.Get("/api/v1/metrics/timeseries/:type", s.timeseriesMetricsHandler)
 
-	// Application logs endpoint
-	s.app.Get("/api/v1/logs", s.logsHandler)
+	// NOTE: /api/v1/logs is intentionally NOT registered here. It exposes
+	// buffered application logs and must be admin-authenticated. Registering
+	// it among these public base routes (before the global auth middleware is
+	// installed) left it reachable unauthenticated, because Fiber matches
+	// routes in registration order and returns before reaching a later
+	// app.Use middleware (GHSA-m3qr-fvp4-78xj). It is now registered via
+	// RegisterLogsRoute() AFTER the auth middleware, from cmd/arc/main.go.
 
 	// API v1 routes will be added here
 	// MessagePack endpoint will be registered separately
+}
+
+// RegisterLogsRoute registers the admin-authenticated application logs
+// endpoint. It must be called AFTER the global auth middleware is installed so
+// the route sits later in the Fiber stack than the middleware. When authManager
+// is nil (authentication disabled), the route is registered without the admin
+// guard, preserving no-auth deployment behaviour.
+func (s *Server) RegisterLogsRoute(authManager *auth.AuthManager) {
+	if authManager != nil {
+		s.app.Get("/api/v1/logs", auth.RequireAdmin(authManager), s.logsHandler)
+	} else {
+		s.app.Get("/api/v1/logs", s.logsHandler)
+	}
 }
 
 // healthHandler returns server health status
