@@ -32,11 +32,6 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// AuthManager interface for getting token info from context
-type AuthManager interface {
-	HasPermission(tokenInfo *auth.TokenInfo, permission string) bool
-}
-
 // RBACChecker interface for RBAC permission checking
 type RBACChecker interface {
 	IsRBACEnabled() bool
@@ -592,7 +587,7 @@ type QueryHandler struct {
 	pruner             *pruning.PartitionPruner
 	queryCache         *database.QueryCache
 	logger             zerolog.Logger
-	authManager        AuthManager
+	authManager        *auth.AuthManager
 	rbacManager        RBACChecker
 	debugEnabled       bool // Cached check for debug logging to avoid repeated level checks
 	parallelExecutor   *query.ParallelExecutor
@@ -851,7 +846,6 @@ func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolo
 		pruner:             pruner,
 		queryCache:         database.NewQueryCache(database.QueryCacheTTL, database.DefaultQueryCacheMaxSize),
 		logger:             handlerLogger,
-		authManager:        nil,
 		rbacManager:        nil,
 		debugEnabled:       handlerLogger.GetLevel() <= zerolog.DebugLevel,
 		parallelExecutor:   query.NewParallelExecutor(db.DB(), query.DefaultParallelConfig(), handlerLogger),
@@ -889,8 +883,11 @@ func getTokenName(c *fiber.Ctx) string {
 	return ""
 }
 
-// SetAuthAndRBAC sets the auth and RBAC managers for permission checking
-func (h *QueryHandler) SetAuthAndRBAC(am AuthManager, rm RBACChecker) {
+// SetAuthAndRBAC sets the auth and RBAC managers for permission checking.
+// Called once at startup before RegisterRoutes (see cmd/arc/main.go), so a
+// plain pointer assignment is sufficient — there is no concurrent reader.
+// Mirrors MsgPackHandler.SetAuthAndRBAC and the other ingest handlers.
+func (h *QueryHandler) SetAuthAndRBAC(am *auth.AuthManager, rm RBACChecker) {
 	h.authManager = am
 	h.rbacManager = rm
 }
@@ -1321,19 +1318,28 @@ func (h *QueryHandler) checkMeasurementPermission(c *fiber.Ctx, database, measur
 
 // RegisterRoutes registers query endpoints
 func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
-	// User-facing read endpoints get the catch-up gate (#392) as route-level
-	// middleware. The middleware is a no-op unless cluster.query_gate_on_catchup
-	// is true AND the coordinator reports peer file replication is still draining.
-	app.Post("/api/v1/query", h.checkReplicationReady, h.executeQuery)
+	// User-facing read endpoints get the read-auth + catch-up gate (#392) as
+	// route-level middleware. The read-auth middleware enforces that the token
+	// has read-level permission (not just any valid token). The catch-up gate
+	// is a no-op unless cluster.query_gate_on_catchup is true AND the
+	// coordinator reports peer file replication is still drifting.
+	//
+	// withReadAuth resolves to auth.RequireRead(h.authManager), or a no-op
+	// passthrough when auth is disabled (h.authManager == nil). SetAuthAndRBAC
+	// runs before RegisterRoutes (cmd/arc/main.go), so h.authManager is already
+	// set here — no lazy resolution needed. Same pattern as the ingest handlers'
+	// withWriteAuth (internal/api/auth_middleware.go).
+	readAuth := withReadAuth(h.authManager)
+	app.Post("/api/v1/query", readAuth, h.checkReplicationReady, h.executeQuery)
 	// Experimental: same execution pipeline as /api/v1/query, but the
 	// response is streamed as MessagePack instead of JSON. Gated by the
 	// duckdb_arrow build tag (no database/sql fallback — see the
 	// wire-format dispatch in executeQuery).
-	app.Post("/api/v1/query/msgpack", h.checkReplicationReady, h.executeQueryMsgPack)
-	app.Post("/api/v1/query/estimate", h.checkReplicationReady, h.estimateQuery)
-	app.Get("/api/v1/measurements", h.checkReplicationReady, h.listMeasurements)
-	app.Get("/api/v1/query/:measurement", h.checkReplicationReady, h.queryMeasurement)
-	h.registerArrowRoutes(app)
+	app.Post("/api/v1/query/msgpack", readAuth, h.checkReplicationReady, h.executeQueryMsgPack)
+	app.Post("/api/v1/query/estimate", readAuth, h.checkReplicationReady, h.estimateQuery)
+	app.Get("/api/v1/measurements", readAuth, h.checkReplicationReady, h.listMeasurements)
+	app.Get("/api/v1/query/:measurement", readAuth, h.checkReplicationReady, h.queryMeasurement)
+	h.registerArrowRoutes(app, readAuth)
 
 	// The distributed cache-invalidate endpoint
 	// (POST CacheInvalidatePath) is wired separately in cmd/arc/main.go,

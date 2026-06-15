@@ -631,11 +631,19 @@ func (b *S3Backend) GetRegion() string {
 }
 
 // GetAccessKey returns the access key (for subprocess credential passing)
+// GetAccessKey returns the S3 access key. It exists solely for subprocess
+// credential passing (compaction workers). The returned value is a plaintext
+// secret — callers MUST NOT log it, store it, or transmit it outside the
+// subprocess environment.
 func (b *S3Backend) GetAccessKey() string {
 	return b.accessKey
 }
 
 // GetSecretKey returns the secret key (for subprocess credential passing)
+// GetSecretKey returns the S3 secret key. It exists solely for subprocess
+// credential passing (compaction workers). The returned value is a plaintext
+// secret — callers MUST NOT log it, store it, or transmit it outside the
+// subprocess environment.
 func (b *S3Backend) GetSecretKey() string {
 	return b.secretKey
 }

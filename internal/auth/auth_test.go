@@ -54,8 +54,16 @@ func TestNewAuthManager(t *testing.T) {
 
 	t.Run("invalid path", func(t *testing.T) {
 		logger := zerolog.Nop()
-		// Use a path that should fail (root directory, no permission)
-		_, err := NewAuthManager("/nonexistent/deeply/nested/path/that/should/fail/auth.db", time.Minute, 100, logger)
+		// Use a path whose parent component is an existing regular file, so
+		// MkdirAll fails with ENOTDIR. This fails deterministically regardless
+		// of UID — a "/nonexistent/..." path would succeed under root (e.g. in
+		// containers running as UID 0), since the new pre-create logic runs
+		// MkdirAll before sql.Open.
+		notADir := filepath.Join(t.TempDir(), "regular-file")
+		if err := os.WriteFile(notADir, []byte("x"), 0600); err != nil {
+			t.Fatalf("setup: %v", err)
+		}
+		_, err := NewAuthManager(filepath.Join(notADir, "auth.db"), time.Minute, 100, logger)
 		if err == nil {
 			t.Error("Expected error for invalid path")
 		}
@@ -885,4 +893,77 @@ func TestForceAddRecoveryToken(t *testing.T) {
 			t.Error("expected error for token shorter than 32 chars")
 		}
 	})
+}
+
+// TestNewAuthManager_CreatesDirAndLocksPerms verifies the H2 hardening: given a
+// bare path into a not-yet-existing subdirectory (the production contract — see
+// the auth.db_path default), NewAuthManager creates the directory and locks the
+// DB plus its WAL/SHM siblings to 0600. Tokens are hashed in these files, so
+// world-readable (umask 0644) permissions would be a real exposure.
+func TestNewAuthManager_CreatesDirAndLocksPerms(t *testing.T) {
+	base := t.TempDir()
+	// Subdirectory that does NOT exist yet — NewAuthManager must create it.
+	dbPath := filepath.Join(base, "sub", "auth.db")
+
+	am, err := NewAuthManager(dbPath, 5*time.Minute, 100, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewAuthManager into non-existent dir failed: %v", err)
+	}
+	t.Cleanup(func() { am.Close() })
+
+	// The DB and any WAL/SHM siblings that exist must be 0600.
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		info, err := os.Stat(p)
+		if os.IsNotExist(err) {
+			continue // -wal/-shm may not exist depending on journal state
+		}
+		if err != nil {
+			t.Fatalf("stat %s: %v", p, err)
+		}
+		if perm := info.Mode().Perm(); perm != 0600 {
+			t.Errorf("%s perm = %o, want 0600", filepath.Base(p), perm)
+		}
+	}
+}
+
+// TestNewAuthManager_SymlinkedDBLocksRealWALPerms verifies that when the auth
+// DB path is a symlink, the -wal/-shm files SQLite creates beside the symlink's
+// real target are still locked to 0600. SQLite resolves symlinks before opening,
+// so a naive "symlinkPath+'-wal'" would point at a non-existent sibling of the
+// link and leave the real WAL untouched. NewAuthManager resolves the symlink
+// (filepath.EvalSymlinks) before chmod'ing the WAL/SHM siblings.
+func TestNewAuthManager_SymlinkedDBLocksRealWALPerms(t *testing.T) {
+	base := t.TempDir()
+	realDir := filepath.Join(base, "real")
+	linkDir := filepath.Join(base, "link")
+	if err := os.MkdirAll(realDir, 0o700); err != nil {
+		t.Fatalf("mkdir real: %v", err)
+	}
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		// Symlink creation can be denied in restricted sandboxes/CI; the
+		// behavior under test is unobservable without one, so skip rather
+		// than fail.
+		t.Skipf("symlink creation not supported or permitted: %v", err)
+	}
+
+	// Open via the symlinked directory; the real files land under realDir.
+	am, err := NewAuthManager(filepath.Join(linkDir, "auth.db"), 5*time.Minute, 100, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewAuthManager via symlink failed: %v", err)
+	}
+	t.Cleanup(func() { am.Close() })
+
+	realDB := filepath.Join(realDir, "auth.db")
+	for _, p := range []string{realDB, realDB + "-wal", realDB + "-shm"} {
+		info, err := os.Lstat(p)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			t.Fatalf("lstat %s: %v", p, err)
+		}
+		if perm := info.Mode().Perm(); perm != 0600 {
+			t.Errorf("%s perm = %o, want 0600 (symlink resolution failed?)", filepath.Base(p), perm)
+		}
+	}
 }

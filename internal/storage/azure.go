@@ -458,6 +458,10 @@ func (b *AzureBlobBackend) GetAccountName() string {
 }
 
 // GetAccountKey returns the account key (for subprocess credential passing)
+// GetAccountKey returns the Azure storage account key. It exists solely for
+// subprocess credential passing (compaction workers). The returned value is a
+// plaintext secret — callers MUST NOT log it, store it, or transmit it
+// outside the subprocess environment.
 func (b *AzureBlobBackend) GetAccountKey() string {
 	return b.accountKey
 }
