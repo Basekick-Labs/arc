@@ -202,6 +202,12 @@ func NewAuthManager(dbPath string, cacheTTL time.Duration, maxCacheSize int, log
 		walBase := dbPath
 		if resolved, err := filepath.EvalSymlinks(dbPath); err == nil {
 			walBase = resolved
+		} else {
+			// Fall back to dbPath, but surface it: if dbPath is in fact a
+			// symlink, the WAL/SHM chmod below targets the wrong (link-side)
+			// paths and silently no-ops, leaving the real files at the umask.
+			am.logger.Warn().Err(err).Str("db_path", dbPath).
+				Msg("Could not resolve auth DB symlinks; WAL/SHM permissions may not be hardened if the path is a symlink")
 		}
 		for _, ext := range []string{"-wal", "-shm"} {
 			p := walBase + ext
