@@ -1834,14 +1834,10 @@ func main() {
 		} else {
 			// sqlitex.Open locks the DB to 0600 (security finding M4). On the
 			// shared default path the auth manager already created/locked it;
-			// this is an idempotent re-tighten. HardenWALSHM after handles the
-			// -wal/-shm sidecars.
-			auditDB, err := sqlitex.Open(cfg.Auth.DBPath, "_busy_timeout=5000")
+			// this is an idempotent re-tighten.
+			auditDB, err := sqlitex.Open(cfg.Auth.DBPath, "_journal_mode=WAL&_busy_timeout=5000")
 			if err != nil {
 				log.Error().Err(err).Msg("Failed to open audit database - feature disabled")
-			} else if err := sqlitex.HardenWALSHM(cfg.Auth.DBPath, logger.Get("audit")); err != nil {
-				auditDB.Close()
-				log.Error().Err(err).Msg("Failed to harden audit database permissions - feature disabled")
 			} else {
 				auditLogger, err = audit.NewLogger(&audit.LoggerConfig{
 					DB:     auditDB,
@@ -1849,7 +1845,15 @@ func main() {
 					Logger: logger.Get("audit"),
 				})
 				if err != nil {
+					auditDB.Close()
 					log.Error().Err(err).Msg("Failed to create audit logger - feature disabled")
+				} else if err := sqlitex.HardenWALSHM(cfg.Auth.DBPath, logger.Get("audit")); err != nil {
+					// Harden the WAL/SHM/journal sidecars AFTER NewLogger's schema
+					// init, which is what creates them on a fresh database. The
+					// logger has not been Start()ed yet, so just close the DB.
+					auditDB.Close()
+					auditLogger = nil
+					log.Error().Err(err).Msg("Failed to harden audit database permissions - feature disabled")
 				} else {
 					auditLogger.Start()
 					shutdownCoordinator.RegisterHook("audit", func(ctx context.Context) error {
@@ -2003,13 +2007,10 @@ func main() {
 				governanceDBPath = "./data/arc.db"
 			}
 			// sqlitex.Open locks the DB to 0600 (security finding M4); idempotent
-			// re-tighten on the shared default path. HardenWALSHM handles sidecars.
-			governanceDB, err := sqlitex.Open(governanceDBPath, "_busy_timeout=5000")
+			// re-tighten on the shared default path.
+			governanceDB, err := sqlitex.Open(governanceDBPath, "_journal_mode=WAL&_busy_timeout=5000")
 			if err != nil {
 				log.Error().Err(err).Msg("Failed to open governance database - feature disabled")
-			} else if err := sqlitex.HardenWALSHM(governanceDBPath, logger.Get("governance")); err != nil {
-				governanceDB.Close()
-				log.Error().Err(err).Msg("Failed to harden governance database permissions - feature disabled")
 			} else {
 				governanceManager, err := governance.NewManager(&governance.ManagerConfig{
 					DB:     governanceDB,
@@ -2017,7 +2018,12 @@ func main() {
 					Logger: logger.Get("governance"),
 				})
 				if err != nil {
+					governanceDB.Close()
 					log.Error().Err(err).Msg("Failed to create governance manager - feature disabled")
+				} else if err := sqlitex.HardenWALSHM(governanceDBPath, logger.Get("governance")); err != nil {
+					// Harden sidecars AFTER NewManager's schema init creates them.
+					governanceDB.Close()
+					log.Error().Err(err).Msg("Failed to harden governance database permissions - feature disabled")
 				} else {
 					governanceManager.Start()
 					shutdownCoordinator.RegisterHook("governance", func(ctx context.Context) error {
@@ -2455,12 +2461,9 @@ func main() {
 			tieringDBPath := cfg.Auth.DBPath // Use shared SQLite database
 			// sqlitex.Open locks the DB to 0600 (security finding M4); idempotent
 			// re-tighten on the shared default path. HardenWALSHM handles sidecars.
-			tieringDB, err := sqlitex.Open(tieringDBPath, "_busy_timeout=5000")
+			tieringDB, err := sqlitex.Open(tieringDBPath, "_journal_mode=WAL&_busy_timeout=5000")
 			if err != nil {
 				log.Error().Err(err).Msg("Failed to open tiering database - feature disabled")
-			} else if err := sqlitex.HardenWALSHM(tieringDBPath, logger.Get("tiering")); err != nil {
-				tieringDB.Close()
-				log.Error().Err(err).Msg("Failed to harden tiering database permissions - feature disabled")
 			} else {
 				// Create cold tier backend (S3 or Azure)
 				var coldBackend storage.Backend
@@ -2511,7 +2514,13 @@ func main() {
 					Logger:        logger.Get("tiering"),
 				})
 				if err != nil {
+					tieringDB.Close()
 					log.Error().Err(err).Msg("Failed to create tiering manager - feature disabled")
+				} else if err := sqlitex.HardenWALSHM(tieringDBPath, logger.Get("tiering")); err != nil {
+					// Harden sidecars AFTER NewManager's schema init creates them.
+					tieringManager = nil
+					tieringDB.Close()
+					log.Error().Err(err).Msg("Failed to harden tiering database permissions - feature disabled")
 				} else {
 					// Start tiering manager
 					if err := tieringManager.Start(); err != nil {

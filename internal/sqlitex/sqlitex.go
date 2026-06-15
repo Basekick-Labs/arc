@@ -53,6 +53,9 @@ func isInMemory(dbPath string) bool {
 // first write. Call HardenWALSHM after the caller's schema initialization to
 // lock those.
 func Open(dbPath, params string) (*sql.DB, error) {
+	if dbPath == "" {
+		return nil, fmt.Errorf("sqlitex.Open: dbPath cannot be empty")
+	}
 	if !isInMemory(dbPath) {
 		// Ensure the parent directory exists with owner-only permissions.
 		if err := os.MkdirAll(filepath.Dir(dbPath), 0700); err != nil {
@@ -134,7 +137,9 @@ func Open(dbPath, params string) (*sql.DB, error) {
 // The logger receives a Warn only when symlink resolution fails on a path that
 // might be a symlink — see the inline comment for why that matters.
 func HardenWALSHM(dbPath string, logger zerolog.Logger) error {
-	if isInMemory(dbPath) {
+	// An empty path would make EvalSymlinks fail and leave walBase empty, so the
+	// chmod loop below would target bare "-wal"/"-shm"/"-journal" in the CWD.
+	if dbPath == "" || isInMemory(dbPath) {
 		return nil
 	}
 
