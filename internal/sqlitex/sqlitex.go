@@ -71,9 +71,17 @@ func Open(dbPath, params string) (*sql.DB, error) {
 		f.Close()
 	}
 
+	// Append params to the DSN. dbPath is a bare path by contract, but the
+	// in-memory test forms carry their own query string (e.g.
+	// "file::memory:?cache=shared"), so join with "&" when a "?" is already
+	// present to avoid producing a DSN with two "?" separators.
 	dsn := dbPath
 	if params != "" {
-		dsn = dbPath + "?" + params
+		if strings.Contains(dbPath, "?") {
+			dsn = dbPath + "&" + params
+		} else {
+			dsn = dbPath + "?" + params
+		}
 	}
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
@@ -83,7 +91,13 @@ func Open(dbPath, params string) (*sql.DB, error) {
 	// SQLite only supports a single writer.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	db.SetConnMaxLifetime(time.Hour)
+	// Do NOT cap connection lifetime for in-memory databases: database/sql
+	// closes a connection once it exceeds the lifetime, and closing the sole
+	// connection to an in-memory DB destroys the database and all its data.
+	// On-disk DBs reconnect transparently, so the lifetime cap is safe there.
+	if !isInMemory(dbPath) {
+		db.SetConnMaxLifetime(time.Hour)
+	}
 
 	// Force a connection so the SQLite file is initialized on disk (sql.Open
 	// validates the DSN but defers file creation to first use).
@@ -104,14 +118,18 @@ func Open(dbPath, params string) (*sql.DB, error) {
 	return db, nil
 }
 
-// HardenWALSHM locks the -wal and -shm sidecar files beside dbPath to 0600.
-// SQLite in WAL mode creates these on first write; they can hold
-// recently-committed secret material, so they must not inherit the umask.
+// HardenWALSHM locks SQLite's sidecar files beside dbPath to 0600: -wal and
+// -shm (WAL mode) and -journal (rollback mode). Which sidecars exist depends on
+// the journal mode of the handle that wrote the database — a handle opened
+// without _journal_mode=WAL uses rollback mode and creates a -journal file
+// during write transactions. All of them can hold recently-committed secret
+// material, so none may inherit the umask (typically 0644, world-readable).
 //
-// Call this AFTER schema initialization, when the sidecars are guaranteed to
-// exist on a fresh install. It is a harmless no-op when they don't exist yet
-// (not-exist errors are ignored) and when called repeatedly on a shared path.
-// In-memory databases have no sidecars and are skipped.
+// Call this AFTER schema initialization, when the relevant sidecar is
+// guaranteed to exist on a fresh install. It is a harmless no-op for sidecars
+// that don't exist yet (not-exist errors are ignored) and when called
+// repeatedly on a shared path. In-memory databases have no sidecars and are
+// skipped.
 //
 // The logger receives a Warn only when symlink resolution fails on a path that
 // might be a symlink — see the inline comment for why that matters.
@@ -134,10 +152,10 @@ func HardenWALSHM(dbPath string, logger zerolog.Logger) error {
 		// the WAL/SHM chmod below targets the wrong (link-side) paths and
 		// silently no-ops, leaving the real files at the umask.
 		logger.Warn().Err(err).Str("db_path", dbPath).
-			Msg("Could not resolve SQLite DB symlinks; WAL/SHM permissions may not be hardened if the path is a symlink")
+			Msg("Could not resolve SQLite DB symlinks; sidecar permissions may not be hardened if the path is a symlink")
 	}
 
-	for _, ext := range []string{"-wal", "-shm"} {
+	for _, ext := range []string{"-wal", "-shm", "-journal"} {
 		// Chmod directly and ignore not-exist errors — avoids the TOCTOU race
 		// between Stat+Chmod.
 		p := walBase + ext

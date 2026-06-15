@@ -91,6 +91,7 @@ func TestHardenWALSHM_LocksSidecars(t *testing.T) {
 	assertPerm(t, dbPath, false)
 	assertPerm(t, dbPath+"-wal", true)
 	assertPerm(t, dbPath+"-shm", true)
+	assertPerm(t, dbPath+"-journal", true)
 }
 
 // TestOpen_Idempotent verifies that opening the same path twice (as happens when
@@ -150,6 +151,7 @@ func TestHardenWALSHM_Symlink(t *testing.T) {
 	assertPerm(t, realDB, false)
 	assertPerm(t, realDB+"-wal", true)
 	assertPerm(t, realDB+"-shm", true)
+	assertPerm(t, realDB+"-journal", true)
 }
 
 // TestOpen_InMemorySkipsFileOps verifies the in-memory forms used by tests do no
@@ -168,5 +170,20 @@ func TestOpen_InMemorySkipsFileOps(t *testing.T) {
 		if err := HardenWALSHM(p, zerolog.Nop()); err != nil {
 			t.Errorf("HardenWALSHM(%q): %v", p, err)
 		}
+	}
+}
+
+// TestOpen_ParamsJoinWithExistingQuery verifies that when dbPath already carries
+// a query string (the in-memory test forms do), non-empty params are joined with
+// "&" so the resulting DSN is valid rather than carrying two "?" separators.
+func TestOpen_ParamsJoinWithExistingQuery(t *testing.T) {
+	db, err := Open("file::memory:?cache=shared", "_busy_timeout=5000")
+	if err != nil {
+		t.Fatalf("Open with ?-bearing in-memory path + params: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	// A malformed DSN (double "?") would surface on use.
+	if _, err := db.Exec(`CREATE TABLE t (id INTEGER)`); err != nil {
+		t.Fatalf("exec on joined-DSN in-memory DB: %v", err)
 	}
 }

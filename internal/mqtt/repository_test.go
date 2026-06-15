@@ -22,10 +22,10 @@ func TestNewRepository_LocksDBPerms(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = repo.Close() })
 
-	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm", dbPath + "-journal"} {
 		info, err := os.Lstat(p)
 		if os.IsNotExist(err) {
-			continue // -wal/-shm may not exist depending on journal state
+			continue // sidecars may not exist depending on journal mode/state
 		}
 		if err != nil {
 			t.Fatalf("lstat %s: %v", p, err)

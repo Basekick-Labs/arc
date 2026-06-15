@@ -71,10 +71,10 @@ func setupTestRetentionHandler(t *testing.T) (*RetentionHandler, string) {
 func TestNewRetentionHandler_LocksDBPerms(t *testing.T) {
 	_, tmpDir := setupTestRetentionHandler(t)
 	dbPath := filepath.Join(tmpDir, "retention.db")
-	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm", dbPath + "-journal"} {
 		info, err := os.Lstat(p)
 		if os.IsNotExist(err) {
-			continue // -wal/-shm may not exist depending on journal state
+			continue // sidecars may not exist depending on journal mode/state
 		}
 		if err != nil {
 			t.Fatalf("lstat %s: %v", p, err)
