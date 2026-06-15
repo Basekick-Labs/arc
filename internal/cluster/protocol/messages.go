@@ -177,6 +177,13 @@ type Heartbeat struct {
 	State     string    `json:"state"`
 	IsLeader  bool      `json:"is_leader"`
 	Timestamp time.Time `json:"timestamp"`
+	// Authentication (present when shared_secret configured). A heartbeat
+	// mutates the sender's recorded liveness/state in the registry, so it is
+	// authenticated like join/leave to prevent a network attacker from
+	// spoofing a node's health (GHSA-p378-jp5r-gpgw).
+	AuthNonce     string `json:"auth_nonce,omitempty"`
+	AuthTimestamp int64  `json:"auth_timestamp,omitempty"`
+	AuthHMAC      string `json:"auth_hmac,omitempty"`
 }
 
 // HeartbeatAck acknowledges a heartbeat.
