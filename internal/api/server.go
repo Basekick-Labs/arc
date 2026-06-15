@@ -194,15 +194,11 @@ func (s *Server) RegisterRoutes() {
 
 // RegisterLogsRoute registers the admin-authenticated application logs
 // endpoint. It must be called AFTER the global auth middleware is installed so
-// the route sits later in the Fiber stack than the middleware. When authManager
-// is nil (authentication disabled), the route is registered without the admin
-// guard, preserving no-auth deployment behaviour.
+// the route sits later in the Fiber stack than the middleware. withAdminAuth
+// returns the admin guard when authManager is non-nil, or a passthrough when it
+// is nil (authentication disabled), preserving no-auth deployment behaviour.
 func (s *Server) RegisterLogsRoute(authManager *auth.AuthManager) {
-	if authManager != nil {
-		s.app.Get("/api/v1/logs", auth.RequireAdmin(authManager), s.logsHandler)
-	} else {
-		s.app.Get("/api/v1/logs", s.logsHandler)
-	}
+	s.app.Get("/api/v1/logs", withAdminAuth(authManager), s.logsHandler)
 }
 
 // healthHandler returns server health status

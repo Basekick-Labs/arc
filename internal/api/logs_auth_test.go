@@ -67,6 +67,7 @@ func TestLogsEndpoint_RequiresAdmin(t *testing.T) {
 		if err != nil {
 			t.Fatalf("app.Test(%s): %v", path, err)
 		}
+		defer resp.Body.Close()
 		return resp.StatusCode
 	}
 
@@ -104,6 +105,7 @@ func TestLogsEndpoint_AuthDisabledStaysOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("app.Test: %v", err)
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != fiber.StatusOK {
 		t.Errorf("auth-disabled logs = %d, want 200", resp.StatusCode)
 	}
