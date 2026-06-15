@@ -32,11 +32,6 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// AuthManager interface for getting token info from context
-type AuthManager interface {
-	HasPermission(tokenInfo *auth.TokenInfo, permission string) bool
-}
-
 // RBACChecker interface for RBAC permission checking
 type RBACChecker interface {
 	IsRBACEnabled() bool
@@ -592,7 +587,7 @@ type QueryHandler struct {
 	pruner             *pruning.PartitionPruner
 	queryCache         *database.QueryCache
 	logger             zerolog.Logger
-	authManager        atomic.Value // stores AuthManager or nil; atomic for race-free read in readAuth vs write in SetAuthAndRBAC
+	authManager        *auth.AuthManager
 	rbacManager        RBACChecker
 	debugEnabled       bool // Cached check for debug logging to avoid repeated level checks
 	parallelExecutor   *query.ParallelExecutor
@@ -889,11 +884,11 @@ func getTokenName(c *fiber.Ctx) string {
 }
 
 // SetAuthAndRBAC sets the auth and RBAC managers for permission checking.
-// authManager is stored via atomic.Value so the readAuth middleware can read it
-// race-free without a dedicated mutex (SetAuthAndRBAC runs at startup, readAuth
-// runs per-request). Must be called at most once during initialization.
-func (h *QueryHandler) SetAuthAndRBAC(am AuthManager, rm RBACChecker) {
-	h.authManager.Store(am)
+// Called once at startup before RegisterRoutes (see cmd/arc/main.go), so a
+// plain pointer assignment is sufficient — there is no concurrent reader.
+// Mirrors MsgPackHandler.SetAuthAndRBAC and the other ingest handlers.
+func (h *QueryHandler) SetAuthAndRBAC(am *auth.AuthManager, rm RBACChecker) {
+	h.authManager = am
 	h.rbacManager = rm
 }
 
@@ -1329,76 +1324,12 @@ func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 	// is a no-op unless cluster.query_gate_on_catchup is true AND the
 	// coordinator reports peer file replication is still drifting.
 	//
-	// The auth middleware is resolved lazily so it is independent of
-	// whether SetAuthAndRBAC runs before or after RegisterRoutes. Uses
-	// atomic.Value + double-checked locking (not sync.Once) because if
-	// h.authManager is nil at init time (early request before
-	// SetAuthAndRBAC), the middleware resolves as a passthrough for that
-	// single request but is NOT permanently cached — the next request
-	// retries and eventually caches the real middleware once the auth
-	// manager is configured. sync.Once would permanently cache the
-	// passthrough, creating a silent auth bypass.
-	//
-	// On the fast path (cached) this is a single atomic load — zero
-	// measurable overhead.
-	//
-	// h.authManager is stored via atomic.Value (not a bare interface)
-	// to eliminate the data race between SetAuthAndRBAC (write at
-	// startup) and readAuth (read per-request). Go interface values are
-	// not word-atomic — concurrent reads and writes can produce partial
-	// writes (type pointer from one value, data pointer from another)
-	// leading to panics. atomic.Value guarantees safe concurrent access.
-	//
-	// QueryHandler holds the AuthManager interface for testability; at
-	// runtime it is always *auth.AuthManager. If the type assertion
-	// fails (non-nil but wrong concrete type), fail closed rather than
-	// silently disabling auth on all query routes.
-	var (
-		cachedReadAuth atomic.Value
-		initMu         sync.Mutex
-	)
-	readAuth := func(c *fiber.Ctx) error {
-		if handler, ok := cachedReadAuth.Load().(fiber.Handler); ok {
-			return handler(c)
-		}
-
-		initMu.Lock()
-		defer initMu.Unlock()
-
-		// Double-check after acquiring lock.
-		if handler, ok := cachedReadAuth.Load().(fiber.Handler); ok {
-			return handler(c)
-		}
-
-		// authManager is nil before SetAuthAndRBAC is called (auth
-		// disabled, or early-startup request). Return passthrough for
-		// THIS request only — do NOT cache, so the next request retries.
-		rawAuth := h.authManager.Load()
-		am, _ := rawAuth.(AuthManager)
-		if am == nil {
-			return c.Next()
-		}
-
-		var handler fiber.Handler
-		// Tests may pass a mock implementing an optional RequireRead()
-		// interface to provide their own middleware.
-		if provider, ok := am.(interface{ RequireRead() fiber.Handler }); ok {
-			handler = provider.RequireRead()
-		} else if concrete, ok := am.(*auth.AuthManager); ok {
-			handler = auth.RequireRead(concrete)
-		} else {
-			h.logger.Error().Msg("AuthManager type assertion failed — denying all query traffic (fail-closed)")
-			handler = func(c *fiber.Ctx) error {
-				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-					"success": false,
-					"error":   "internal_auth_error",
-				})
-			}
-		}
-
-		cachedReadAuth.Store(handler)
-		return handler(c)
-	}
+	// withReadAuth resolves to auth.RequireRead(h.authManager), or a no-op
+	// passthrough when auth is disabled (h.authManager == nil). SetAuthAndRBAC
+	// runs before RegisterRoutes (cmd/arc/main.go), so h.authManager is already
+	// set here — no lazy resolution needed. Same pattern as the ingest handlers'
+	// withWriteAuth (internal/api/auth_middleware.go).
+	readAuth := withReadAuth(h.authManager)
 	app.Post("/api/v1/query", readAuth, h.checkReplicationReady, h.executeQuery)
 	// Experimental: same execution pipeline as /api/v1/query, but the
 	// response is streamed as MessagePack instead of JSON. Gated by the

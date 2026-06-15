@@ -21,6 +21,16 @@ func withWriteAuth(am *auth.AuthManager) fiber.Handler {
 	return auth.RequireWrite(am)
 }
 
+// withReadAuth is the read-tier counterpart to withWriteAuth. Used for
+// query endpoints so a write-only token cannot execute SELECTs — the
+// token must carry read permission. nil-am is the OSS no-auth deployment.
+func withReadAuth(am *auth.AuthManager) fiber.Handler {
+	if am == nil {
+		return passthroughMiddleware
+	}
+	return auth.RequireRead(am)
+}
+
 // withAdminAuth is the admin-tier counterpart to withWriteAuth.
 // Used for endpoints that perform globally-disruptive operations
 // (force-flush, bulk imports that rewrite history).
