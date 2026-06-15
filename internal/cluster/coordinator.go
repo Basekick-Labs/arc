@@ -544,7 +544,7 @@ func (c *Coordinator) broadcastLeave() {
 		} else {
 			leave.AuthTimestamp = time.Now().Unix()
 			leave.AuthNonce = nonce
-			leave.AuthHMAC = security.ComputeHMAC(c.cfg.SharedSecret, nonce, leave.NodeID, c.cfg.ClusterName, leave.AuthTimestamp)
+			leave.AuthHMAC = security.ComputeHMAC(c.cfg.SharedSecret, security.MsgTypeLeave, nonce, leave.NodeID, c.cfg.ClusterName, leave.AuthTimestamp)
 		}
 	}
 
@@ -788,7 +788,7 @@ func (c *Coordinator) sendHeartbeats() {
 		} else {
 			hb.AuthTimestamp = time.Now().Unix()
 			hb.AuthNonce = nonce
-			hb.AuthHMAC = security.ComputeHMAC(c.cfg.SharedSecret, nonce, hb.NodeID, c.cfg.ClusterName, hb.AuthTimestamp)
+			hb.AuthHMAC = security.ComputeHMAC(c.cfg.SharedSecret, security.MsgTypeHeartbeat, nonce, hb.NodeID, c.cfg.ClusterName, hb.AuthTimestamp)
 		}
 	}
 
@@ -915,7 +915,7 @@ func (c *Coordinator) tryJoinViaSeed(seedAddr string) error {
 		}
 		req.AuthTimestamp = time.Now().Unix()
 		req.AuthNonce = nonce
-		req.AuthHMAC = security.ComputeHMAC(c.cfg.SharedSecret, nonce, req.NodeID, req.ClusterName, req.AuthTimestamp)
+		req.AuthHMAC = security.ComputeHMAC(c.cfg.SharedSecret, security.MsgTypeJoin, nonce, req.NodeID, req.ClusterName, req.AuthTimestamp)
 	}
 
 	// If RaftAdvertiseAddr is empty, use RaftBindAddr
@@ -1093,7 +1093,7 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 			return
 		}
 		if err := security.ValidateHMAC(
-			c.cfg.SharedSecret, req.AuthNonce, req.NodeID, req.ClusterName,
+			c.cfg.SharedSecret, security.MsgTypeJoin, req.AuthNonce, req.NodeID, req.ClusterName,
 			req.AuthTimestamp, req.AuthHMAC, security.HMACTimestampTolerance,
 		); err != nil {
 			c.logger.Warn().Err(err).Str("node_id", req.NodeID).Msg("Join rejected: authentication failed")
@@ -1253,7 +1253,7 @@ func (c *Coordinator) handleHeartbeat(conn net.Conn, hb *protocol.Heartbeat) {
 			return
 		}
 		if err := security.ValidateHMAC(
-			c.cfg.SharedSecret, hb.AuthNonce, hb.NodeID, c.cfg.ClusterName,
+			c.cfg.SharedSecret, security.MsgTypeHeartbeat, hb.AuthNonce, hb.NodeID, c.cfg.ClusterName,
 			hb.AuthTimestamp, hb.AuthHMAC, security.HMACTimestampTolerance,
 		); err != nil {
 			c.logger.Warn().Err(err).Str("node_id", hb.NodeID).Msg("Heartbeat rejected: authentication failed")
@@ -1283,7 +1283,7 @@ func (c *Coordinator) handleLeaveNotify(leave *protocol.LeaveNotify) {
 			return
 		}
 		if err := security.ValidateHMAC(
-			c.cfg.SharedSecret, leave.AuthNonce, leave.NodeID, c.cfg.ClusterName,
+			c.cfg.SharedSecret, security.MsgTypeLeave, leave.AuthNonce, leave.NodeID, c.cfg.ClusterName,
 			leave.AuthTimestamp, leave.AuthHMAC, security.HMACTimestampTolerance,
 		); err != nil {
 			c.logger.Warn().Err(err).Str("node_id", leave.NodeID).Msg("Leave rejected: authentication failed")

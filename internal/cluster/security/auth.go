@@ -14,19 +14,48 @@ import (
 	"golang.org/x/crypto/hkdf"
 )
 
-// ComputeHMAC computes HMAC-SHA256 over the join parameters.
-// Fields are delimited by NUL (\x00) so a field containing a colon
-// cannot be smuggled to collide with a different (nonce, nodeID,
-// clusterName, timestamp) arrangement. NUL is forbidden in HTTP header
-// values by net/http (httpguts), so the sender side cannot produce a
-// NUL-containing field even via malicious config.
-// Message format: nonce \x00 nodeID \x00 clusterName \x00 timestamp
-func ComputeHMAC(sharedSecret, nonce, nodeID, clusterName string, timestamp int64) string {
-	return hex.EncodeToString(computeJoinHMACRaw(sharedSecret, nonce, nodeID, clusterName, timestamp))
+// MsgType is a per-message-type label bound into the join-family HMAC for
+// domain separation (#504). Defining a dedicated type — rather than using
+// untyped string constants — prevents an arbitrary string from being passed
+// where a message-type label is expected, making sign/validate mismatches
+// a compile-time error.
+type MsgType string
+
+// Message-type labels bound into the join-family HMAC (ComputeHMAC /
+// ValidateHMAC) for domain separation (#504). Using shared typed constants —
+// rather than bare string literals at each call site — guarantees the sign and
+// validate sides agree. Using a bare string literal instead of these constants
+// at a single call site would reject every message of that message type
+// (sign and validate would compute different MACs), so this must not be
+// stringly-typed.
+const (
+	MsgTypeJoin      MsgType = "join"
+	MsgTypeLeave     MsgType = "leave"
+	MsgTypeHeartbeat MsgType = "heartbeat"
+)
+
+// ComputeHMAC computes HMAC-SHA256 over the parameters of a coordinator
+// handshake message (join, leave, or heartbeat). msgType is a per-message-type
+// label ("join"/"leave"/"heartbeat") bound as the FIRST field of the canonical
+// input, distinct per handler, so a MAC captured for one message type cannot be
+// replayed against another within the freshness window (#504) — the same
+// label-based domain-separation discipline ComputeCacheInvalidateHMAC uses
+// (ComputeFetchHMAC and ComputeForwardHMAC achieve domain separation via
+// payload-binding — different field layouts — rather than labels). A heartbeat
+// MAC replayed as a node-evicting leave is the concrete attack this closes.
+//
+// Fields are delimited by NUL (\x00) so a field containing a delimiter cannot
+// be smuggled to collide with a different (msgType, nonce, nodeID, clusterName,
+// timestamp) arrangement. NUL is forbidden in HTTP header values by net/http
+// (httpguts), so the sender side cannot produce a NUL-containing field even via
+// malicious config.
+// Message format: msgType \x00 nonce \x00 nodeID \x00 clusterName \x00 timestamp
+func ComputeHMAC(sharedSecret string, msgType MsgType, nonce, nodeID, clusterName string, timestamp int64) string {
+	return hex.EncodeToString(computeJoinFamilyHMACRaw(sharedSecret, msgType, nonce, nodeID, clusterName, timestamp))
 }
 
-func computeJoinHMACRaw(sharedSecret, nonce, nodeID, clusterName string, timestamp int64) []byte {
-	message := fmt.Sprintf("%s\x00%s\x00%s\x00%d", nonce, nodeID, clusterName, timestamp)
+func computeJoinFamilyHMACRaw(sharedSecret string, msgType MsgType, nonce, nodeID, clusterName string, timestamp int64) []byte {
+	message := fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%d", msgType, nonce, nodeID, clusterName, timestamp)
 	return computeRawHMAC(sharedSecret, message)
 }
 
@@ -66,8 +95,11 @@ func GenerateNonce() (string, error) {
 	return hex.EncodeToString(nonce), nil
 }
 
-// ValidateHMAC validates the HMAC and checks timestamp freshness to prevent replay attacks.
-func ValidateHMAC(sharedSecret, nonce, nodeID, clusterName string, timestamp int64, receivedMAC string, tolerance time.Duration) error {
+// ValidateHMAC validates the HMAC and checks timestamp freshness to prevent
+// replay attacks. msgType MUST match the label the sender used (see
+// ComputeHMAC) — a "leave" message validated as "join" fails, which is exactly
+// the cross-message-type replay this binding prevents (#504).
+func ValidateHMAC(sharedSecret string, msgType MsgType, nonce, nodeID, clusterName string, timestamp int64, receivedMAC string, tolerance time.Duration) error {
 	now := time.Now().Unix()
 	drift := now - timestamp
 	if drift < 0 {
@@ -77,7 +109,7 @@ func ValidateHMAC(sharedSecret, nonce, nodeID, clusterName string, timestamp int
 		return fmt.Errorf("auth timestamp expired (drift: %ds, tolerance: %ds)", drift, int64(tolerance.Seconds()))
 	}
 
-	expected := computeJoinHMACRaw(sharedSecret, nonce, nodeID, clusterName, timestamp)
+	expected := computeJoinFamilyHMACRaw(sharedSecret, msgType, nonce, nodeID, clusterName, timestamp)
 	if !constantTimeHexEqual(expected, receivedMAC) {
 		return fmt.Errorf("HMAC validation failed: shared secret mismatch or malformed MAC")
 	}

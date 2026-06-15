@@ -61,7 +61,7 @@ func signedHeartbeat(secret, nodeID, cluster string) *protocol.Heartbeat {
 		nonce, _ := security.GenerateNonce()
 		hb.AuthTimestamp = time.Now().Unix()
 		hb.AuthNonce = nonce
-		hb.AuthHMAC = security.ComputeHMAC(secret, nonce, nodeID, cluster, hb.AuthTimestamp)
+		hb.AuthHMAC = security.ComputeHMAC(secret, security.MsgTypeHeartbeat, nonce, nodeID, cluster, hb.AuthTimestamp)
 	}
 	return hb
 }
