@@ -1625,7 +1625,25 @@ func main() {
 		// here: pprof is no longer mounted on the public Fiber app
 		// (internal/api/server.go). The opt-in localhost pprof listener
 		// runs on a separate port; see startDebugPprofIfEnabled.
+		//
+		// The JSON metrics endpoints (/api/v1/metrics and its sub-paths) are
+		// deliberately public, equivalent to the existing Prometheus /metrics
+		// surface: aggregate operational counters plus Go runtime/GC stats and
+		// host-arch fingerprinting (go_version/os/arch). They expose no queries,
+		// database/measurement names, file paths, or credentials, and monitoring
+		// dashboards poll them without a token. Whitelist them explicitly so
+		// their public status is an auditable decision, not an accident of
+		// registration order (they were previously reachable only because
+		// RegisterRoutes runs before this middleware; see GHSA-m3qr-fvp4-78xj).
+		// /api/v1/logs, by contrast, is NOT public — it is registered with admin
+		// auth below.
+		middlewareConfig.PublicPrefixes = append(middlewareConfig.PublicPrefixes, "/api/v1/metrics")
 		server.GetApp().Use(auth.NewMiddleware(middlewareConfig))
+
+		// Register the admin-authenticated logs route AFTER the auth
+		// middleware so it sits later in the Fiber stack and is actually
+		// gated (GHSA-m3qr-fvp4-78xj).
+		server.RegisterLogsRoute(authManager)
 
 		// Initialize RBAC Manager (Enterprise feature)
 		rbacManager = auth.NewRBACManager(&auth.RBACManagerConfig{
@@ -1797,6 +1815,12 @@ func main() {
 				}
 			}
 		}
+	} else {
+		// Authentication disabled: register the logs route unguarded so the
+		// endpoint still works for no-auth deployments. (When auth is enabled
+		// it is registered with admin auth inside the block above, after the
+		// middleware — GHSA-m3qr-fvp4-78xj.)
+		server.RegisterLogsRoute(nil)
 	}
 
 	// Initialize Audit Logging (Enterprise feature - requires valid license)
