@@ -592,7 +592,7 @@ type QueryHandler struct {
 	pruner             *pruning.PartitionPruner
 	queryCache         *database.QueryCache
 	logger             zerolog.Logger
-	authManager        AuthManager
+	authManager        atomic.Value // stores AuthManager or nil; atomic for race-free read in readAuth vs write in SetAuthAndRBAC
 	rbacManager        RBACChecker
 	debugEnabled       bool // Cached check for debug logging to avoid repeated level checks
 	parallelExecutor   *query.ParallelExecutor
@@ -851,7 +851,6 @@ func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolo
 		pruner:             pruner,
 		queryCache:         database.NewQueryCache(database.QueryCacheTTL, database.DefaultQueryCacheMaxSize),
 		logger:             handlerLogger,
-		authManager:        nil,
 		rbacManager:        nil,
 		debugEnabled:       handlerLogger.GetLevel() <= zerolog.DebugLevel,
 		parallelExecutor:   query.NewParallelExecutor(db.DB(), query.DefaultParallelConfig(), handlerLogger),
@@ -889,9 +888,12 @@ func getTokenName(c *fiber.Ctx) string {
 	return ""
 }
 
-// SetAuthAndRBAC sets the auth and RBAC managers for permission checking
+// SetAuthAndRBAC sets the auth and RBAC managers for permission checking.
+// authManager is stored via atomic.Value so the readAuth middleware can read it
+// race-free without a dedicated mutex (SetAuthAndRBAC runs at startup, readAuth
+// runs per-request). Must be called at most once during initialization.
 func (h *QueryHandler) SetAuthAndRBAC(am AuthManager, rm RBACChecker) {
-	h.authManager = am
+	h.authManager.Store(am)
 	h.rbacManager = rm
 }
 
@@ -1340,6 +1342,13 @@ func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 	// On the fast path (cached) this is a single atomic load — zero
 	// measurable overhead.
 	//
+	// h.authManager is stored via atomic.Value (not a bare interface)
+	// to eliminate the data race between SetAuthAndRBAC (write at
+	// startup) and readAuth (read per-request). Go interface values are
+	// not word-atomic — concurrent reads and writes can produce partial
+	// writes (type pointer from one value, data pointer from another)
+	// leading to panics. atomic.Value guarantees safe concurrent access.
+	//
 	// QueryHandler holds the AuthManager interface for testability; at
 	// runtime it is always *auth.AuthManager. If the type assertion
 	// fails (non-nil but wrong concrete type), fail closed rather than
@@ -1364,16 +1373,18 @@ func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 		// authManager is nil before SetAuthAndRBAC is called (auth
 		// disabled, or early-startup request). Return passthrough for
 		// THIS request only — do NOT cache, so the next request retries.
-		if h.authManager == nil {
+		rawAuth := h.authManager.Load()
+		am, _ := rawAuth.(AuthManager)
+		if am == nil {
 			return c.Next()
 		}
 
 		var handler fiber.Handler
 		// Tests may pass a mock implementing an optional RequireRead()
 		// interface to provide their own middleware.
-		if provider, ok := h.authManager.(interface{ RequireRead() fiber.Handler }); ok {
+		if provider, ok := am.(interface{ RequireRead() fiber.Handler }); ok {
 			handler = provider.RequireRead()
-		} else if concrete, ok := h.authManager.(*auth.AuthManager); ok {
+		} else if concrete, ok := am.(*auth.AuthManager); ok {
 			handler = auth.RequireRead(concrete)
 		} else {
 			h.logger.Error().Msg("AuthManager type assertion failed — denying all query traffic (fail-closed)")

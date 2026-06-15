@@ -132,13 +132,31 @@ func NewAuthManager(dbPath string, cacheTTL time.Duration, maxCacheSize int, log
 	// Skip all file creation and permission operations for them.
 	isInMemory := dbPath == ":memory:" || strings.HasPrefix(dbPath, "file::memory:")
 
+	// Extract the clean filesystem path from the SQLite DSN. The caller may pass
+	// a bare path ("auth.db"), a file: URI ("file:auth.db"), or a DSN with query
+	// parameters ("file:auth.db?_journal_mode=WAL"). Direct os file operations
+	// on the raw dbPath would fail or create the wrong file when query parameters
+	// are present, and appending "-wal"/"-shm" to the raw DSN produces paths like
+	// "auth.db?_journal_mode=WAL-wal" instead of "auth.db-wal".
+	cleanPath := dbPath
+	if !isInMemory {
+		if strings.HasPrefix(cleanPath, "file:") {
+			cleanPath = strings.TrimPrefix(cleanPath, "file:")
+			// Trim double slash used in some URI formats (file:///path/to/db).
+			cleanPath = strings.TrimPrefix(cleanPath, "//")
+		}
+		if idx := strings.Index(cleanPath, "?"); idx != -1 {
+			cleanPath = cleanPath[:idx]
+		}
+	}
+
 	if !isInMemory {
 		// Pre-create the SQLite file with owner-only permissions (0600) so
 		// there is no window where the file exists with default umask
 		// (typically 0644, world-readable) before os.Chmod runs. If the file
 		// already exists, OpenFile is a no-op for permissions but still
 		// succeeds.
-		f, err := os.OpenFile(dbPath, os.O_CREATE|os.O_RDWR, 0600)
+		f, err := os.OpenFile(cleanPath, os.O_CREATE|os.O_RDWR, 0600)
 		if err != nil {
 			db.Close()
 			return nil, fmt.Errorf("failed to create auth DB file: %w", err)
@@ -156,7 +174,7 @@ func NewAuthManager(dbPath string, cacheTTL time.Duration, maxCacheSize int, log
 	if !isInMemory {
 		// Ensure permissions are 0600 even if the file already existed with
 		// looser permissions from a previous deployment.
-		if err := os.Chmod(dbPath, 0600); err != nil {
+		if err := os.Chmod(cleanPath, 0600); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("failed to set auth DB permissions: %w", err)
 		}
@@ -190,7 +208,7 @@ func NewAuthManager(dbPath string, cacheTTL time.Duration, maxCacheSize int, log
 		// race between Stat+Chmod. On a fresh install with no -wal yet
 		// (unlikely after initDB, but possible), the not-exist is harmless.
 		for _, ext := range []string{"-wal", "-shm"} {
-			p := dbPath + ext
+			p := cleanPath + ext
 			if err := os.Chmod(p, 0600); err != nil && !os.IsNotExist(err) {
 				db.Close()
 				return nil, fmt.Errorf("failed to set auth DB %s permissions: %w", ext, err)
