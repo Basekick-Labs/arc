@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -12,7 +14,6 @@ import (
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/ingest"
-	"github.com/basekick-labs/arc/internal/sqlitex"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -137,11 +138,14 @@ type CQExecution struct {
 
 // NewContinuousQueryHandler creates a new continuous query handler
 func NewContinuousQueryHandler(db *database.DuckDB, storage storage.Backend, arrowBuffer *ingest.ArrowBuffer, cfg *config.ContinuousQueryConfig, authManager *auth.AuthManager, logger zerolog.Logger) (*ContinuousQueryHandler, error) {
-	// Open SQLite database with owner-only (0600) permissions. The CQ DB can
-	// hold continuous-query definitions; on a custom continuous_query.db_path
-	// it must not inherit the world-readable umask (security finding M4).
-	// sqlitex.Open also creates the parent directory (0700).
-	sqliteDB, err := sqlitex.Open(cfg.DBPath, "_journal_mode=WAL&_busy_timeout=5000")
+	// Ensure directory exists
+	dir := filepath.Dir(cfg.DBPath)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, fmt.Errorf("failed to create directory for CQ DB: %w", err)
+	}
+
+	// Open SQLite database
+	sqliteDB, err := sql.Open("sqlite3", cfg.DBPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open CQ database: %w", err)
 	}
@@ -160,12 +164,6 @@ func NewContinuousQueryHandler(db *database.DuckDB, storage storage.Backend, arr
 	if err := h.initTables(); err != nil {
 		sqliteDB.Close()
 		return nil, fmt.Errorf("failed to initialize CQ tables: %w", err)
-	}
-
-	// Lock the -wal/-shm sidecars created during initTables.
-	if err := sqlitex.HardenWALSHM(cfg.DBPath, h.logger); err != nil {
-		sqliteDB.Close()
-		return nil, fmt.Errorf("failed to harden CQ DB WAL/SHM permissions: %w", err)
 	}
 
 	return h, nil

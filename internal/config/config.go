@@ -180,12 +180,12 @@ type DeleteConfig struct {
 
 type RetentionConfig struct {
 	Enabled bool   // Enable retention policy management (default: true for policy CRUD, execution is manual)
-	DBPath  string // SQLite database path for storing policies
+	DBPath  string // SQLite database path; always the shared auth.db_path (no independent override)
 }
 
 type ContinuousQueryConfig struct {
 	Enabled bool   // Enable continuous query management (default: true for CRUD, execution is manual)
-	DBPath  string // SQLite database path for storing queries
+	DBPath  string // SQLite database path; always the shared auth.db_path (no independent override)
 }
 
 type MetricsConfig struct {
@@ -614,11 +614,17 @@ func Load() (*Config, error) {
 		},
 		Retention: RetentionConfig{
 			Enabled: v.GetBool("retention.enabled"),
-			DBPath:  v.GetString("retention.db_path"),
+			// Arc uses a single shared SQLite database (auth.db_path). Retention
+			// metadata lives in it alongside auth, audit, CQ, and tiering. There
+			// is intentionally no separate retention.db_path: the auth manager
+			// creates and locks that one file to 0600 at startup, and a separate
+			// override would be created with the umask and never tightened.
+			DBPath: v.GetString("auth.db_path"),
 		},
 		ContinuousQuery: ContinuousQueryConfig{
 			Enabled: v.GetBool("continuous_query.enabled"),
-			DBPath:  v.GetString("continuous_query.db_path"),
+			// Single shared SQLite database — see the Retention note above.
+			DBPath: v.GetString("auth.db_path"),
 		},
 		Metrics: MetricsConfig{
 			TimeseriesRetentionMinutes: v.GetInt("metrics.timeseries_retention_minutes"),
@@ -882,13 +888,15 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("delete.confirmation_threshold", 10000) // Require confirm=true for > 10k rows
 	v.SetDefault("delete.max_rows_per_delete", 1000000)  // Max 1M rows per delete
 
-	// Retention policy defaults
-	v.SetDefault("retention.enabled", true)            // Enable policy management by default
-	v.SetDefault("retention.db_path", "./data/arc.db") // Shared SQLite DB with auth
+	// Retention policy defaults.
+	// No retention.db_path: retention metadata lives in the single shared
+	// SQLite database (auth.db_path). See the Retention block in Load().
+	v.SetDefault("retention.enabled", true) // Enable policy management by default
 
-	// Continuous query defaults
-	v.SetDefault("continuous_query.enabled", true)            // Enable CQ management by default
-	v.SetDefault("continuous_query.db_path", "./data/arc.db") // Shared SQLite DB with auth
+	// Continuous query defaults.
+	// No continuous_query.db_path: CQ metadata lives in the single shared
+	// SQLite database (auth.db_path). See the ContinuousQuery block in Load().
+	v.SetDefault("continuous_query.enabled", true) // Enable CQ management by default
 
 	// Metrics defaults
 	v.SetDefault("metrics.timeseries_retention_minutes", 30) // 30 minutes retention

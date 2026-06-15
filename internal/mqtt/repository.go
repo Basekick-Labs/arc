@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/basekick-labs/arc/internal/sqlitex"
 	"github.com/google/uuid"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
@@ -38,14 +37,14 @@ func NewSQLiteRepository(dbPath string, encryptionKey []byte, logger zerolog.Log
 
 // newRepository is the internal constructor
 func newRepository(dbPath string, encryptor PasswordEncryptor, logger zerolog.Logger) (*Repository, error) {
-	// Open with owner-only (0600) permissions. The MQTT DB holds encrypted
-	// broker credentials; on a custom path it must not inherit the
-	// world-readable umask (security finding M4). sqlitex.Open also creates the
-	// parent directory (0700) and configures the single-writer pool.
-	db, err := sqlitex.Open(dbPath, "_journal_mode=WAL&_busy_timeout=5000")
+	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
+
+	// Limit connections for SQLite
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 
 	repo := &Repository{
 		db:        db,
@@ -57,12 +56,6 @@ func newRepository(dbPath string, encryptor PasswordEncryptor, logger zerolog.Lo
 	if err := repo.initSchema(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to initialize schema: %w", err)
-	}
-
-	// Lock the -wal/-shm sidecars created during initSchema.
-	if err := sqlitex.HardenWALSHM(dbPath, repo.logger); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to harden MQTT DB WAL/SHM permissions: %w", err)
 	}
 
 	return repo, nil

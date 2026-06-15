@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -37,7 +38,6 @@ import (
 	"github.com/basekick-labs/arc/internal/reconciliation"
 	"github.com/basekick-labs/arc/internal/scheduler"
 	"github.com/basekick-labs/arc/internal/shutdown"
-	"github.com/basekick-labs/arc/internal/sqlitex"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/telemetry"
 	"github.com/basekick-labs/arc/internal/tiering"
@@ -1832,10 +1832,7 @@ func main() {
 		} else if !licenseClient.CanUseAuditLogging() {
 			log.Warn().Msg("License does not include audit_logging feature - feature disabled")
 		} else {
-			// sqlitex.Open locks the DB to 0600 (security finding M4). On the
-			// shared default path the auth manager already created/locked it;
-			// this is an idempotent re-tighten.
-			auditDB, err := sqlitex.Open(cfg.Auth.DBPath, "_journal_mode=WAL&_busy_timeout=5000")
+			auditDB, err := sql.Open("sqlite3", cfg.Auth.DBPath)
 			if err != nil {
 				log.Error().Err(err).Msg("Failed to open audit database - feature disabled")
 			} else {
@@ -1845,15 +1842,7 @@ func main() {
 					Logger: logger.Get("audit"),
 				})
 				if err != nil {
-					auditDB.Close()
 					log.Error().Err(err).Msg("Failed to create audit logger - feature disabled")
-				} else if err := sqlitex.HardenWALSHM(cfg.Auth.DBPath, logger.Get("audit")); err != nil {
-					// Harden the WAL/SHM/journal sidecars AFTER NewLogger's schema
-					// init, which is what creates them on a fresh database. The
-					// logger has not been Start()ed yet, so just close the DB.
-					auditDB.Close()
-					auditLogger = nil
-					log.Error().Err(err).Msg("Failed to harden audit database permissions - feature disabled")
 				} else {
 					auditLogger.Start()
 					shutdownCoordinator.RegisterHook("audit", func(ctx context.Context) error {
@@ -2006,9 +1995,7 @@ func main() {
 			if governanceDBPath == "" {
 				governanceDBPath = "./data/arc.db"
 			}
-			// sqlitex.Open locks the DB to 0600 (security finding M4); idempotent
-			// re-tighten on the shared default path.
-			governanceDB, err := sqlitex.Open(governanceDBPath, "_journal_mode=WAL&_busy_timeout=5000")
+			governanceDB, err := sql.Open("sqlite3", governanceDBPath)
 			if err != nil {
 				log.Error().Err(err).Msg("Failed to open governance database - feature disabled")
 			} else {
@@ -2018,12 +2005,7 @@ func main() {
 					Logger: logger.Get("governance"),
 				})
 				if err != nil {
-					governanceDB.Close()
 					log.Error().Err(err).Msg("Failed to create governance manager - feature disabled")
-				} else if err := sqlitex.HardenWALSHM(governanceDBPath, logger.Get("governance")); err != nil {
-					// Harden sidecars AFTER NewManager's schema init creates them.
-					governanceDB.Close()
-					log.Error().Err(err).Msg("Failed to harden governance database permissions - feature disabled")
 				} else {
 					governanceManager.Start()
 					shutdownCoordinator.RegisterHook("governance", func(ctx context.Context) error {
@@ -2459,9 +2441,7 @@ func main() {
 		} else {
 			// Open SQLite database for tiering metadata (shared with other features)
 			tieringDBPath := cfg.Auth.DBPath // Use shared SQLite database
-			// sqlitex.Open locks the DB to 0600 (security finding M4); idempotent
-			// re-tighten on the shared default path. HardenWALSHM handles sidecars.
-			tieringDB, err := sqlitex.Open(tieringDBPath, "_journal_mode=WAL&_busy_timeout=5000")
+			tieringDB, err := sql.Open("sqlite3", tieringDBPath)
 			if err != nil {
 				log.Error().Err(err).Msg("Failed to open tiering database - feature disabled")
 			} else {
@@ -2514,13 +2494,7 @@ func main() {
 					Logger:        logger.Get("tiering"),
 				})
 				if err != nil {
-					tieringDB.Close()
 					log.Error().Err(err).Msg("Failed to create tiering manager - feature disabled")
-				} else if err := sqlitex.HardenWALSHM(tieringDBPath, logger.Get("tiering")); err != nil {
-					// Harden sidecars AFTER NewManager's schema init creates them.
-					tieringManager = nil
-					tieringDB.Close()
-					log.Error().Err(err).Msg("Failed to harden tiering database permissions - feature disabled")
 				} else {
 					// Start tiering manager
 					if err := tieringManager.Start(); err != nil {

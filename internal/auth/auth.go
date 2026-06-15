@@ -9,13 +9,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/metrics"
-	"github.com/basekick-labs/arc/internal/sqlitex"
 	"github.com/rs/zerolog"
 	"golang.org/x/crypto/bcrypt"
 
@@ -111,15 +112,57 @@ func (am *AuthManager) Logger() zerolog.Logger {
 
 // NewAuthManager creates a new authentication manager
 func NewAuthManager(dbPath string, cacheTTL time.Duration, maxCacheSize int, logger zerolog.Logger) (*AuthManager, error) {
-	// Open with owner-only (0600) permissions. dbPath is a bare filesystem path
-	// by contract (e.g. "./data/arc.db" — see the auth.db_path default in
-	// internal/config); sqlitex.Open appends the query params below, so dbPath
-	// must NOT already be a file: URI or carry "?". The auth DB holds token
-	// hashes and must never be world-readable. See internal/sqlitex (the shared
-	// hardening helper extracted from this function per security finding M4).
-	db, err := sqlitex.Open(dbPath, "_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=ON")
+	// dbPath is a bare filesystem path by contract (e.g. "./data/arc.db" — see
+	// the auth.db_path default in internal/config). The sql.Open call below
+	// appends "?_journal_mode=WAL&..." unconditionally, so dbPath must NOT
+	// already be a file: URI or carry query parameters. ":memory:" (and the
+	// "file::memory:" shared-cache form) are the only non-filesystem inputs,
+	// used by tests; they have no on-disk footprint, so skip all file ops.
+	isInMemory := dbPath == ":memory:" || strings.HasPrefix(dbPath, "file::memory:")
+
+	if !isInMemory {
+		// Ensure the parent directory exists.
+		if err := os.MkdirAll(filepath.Dir(dbPath), 0700); err != nil {
+			return nil, fmt.Errorf("failed to create db directory: %w", err)
+		}
+
+		// Pre-create the SQLite file with owner-only permissions (0600) so
+		// there is no window where the file exists with the default umask
+		// (typically 0644, world-readable) before the Chmod below runs. The
+		// auth DB holds token hashes; it must never be world-readable. If the
+		// file already exists, OpenFile leaves its permissions unchanged, which
+		// the explicit Chmod after Ping then tightens.
+		f, err := os.OpenFile(dbPath, os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create auth DB file: %w", err)
+		}
+		f.Close()
+	}
+
+	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=ON")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open auth database: %w", err)
+	}
+
+	// Set connection pool settings
+	db.SetMaxOpenConns(1) // SQLite only supports one writer
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(time.Hour)
+
+	// Force a connection so the SQLite file is initialized on disk
+	// (sql.Open validates the DSN but defers file creation to first use).
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to ping auth database: %w", err)
+	}
+
+	if !isInMemory {
+		// Tighten to 0600 even if the file pre-existed with looser permissions
+		// from an earlier deployment.
+		if err := os.Chmod(dbPath, 0600); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to set auth DB permissions: %w", err)
+		}
 	}
 
 	am := &AuthManager{
@@ -137,12 +180,42 @@ func NewAuthManager(dbPath string, cacheTTL time.Duration, maxCacheSize int, log
 		return nil, err
 	}
 
-	// Lock the -wal/-shm sidecars, which SQLite creates on first write (initDB
-	// above). They can contain recently-committed token hashes, so they must
-	// not inherit the process umask.
-	if err := sqlitex.HardenWALSHM(dbPath, am.logger); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to harden auth DB WAL/SHM permissions: %w", err)
+	if !isInMemory {
+		// SQLite in WAL mode creates -wal and -shm files alongside the main
+		// database on first write (initDB above). Apply 0600 to these as well —
+		// they're created with the process umask (typically 0644) and can
+		// contain recently-committed token hashes. We run this after initDB
+		// so the files are guaranteed to exist on a fresh install; on
+		// pre-existing deployments this tightens permissions that were set
+		// by an earlier version.
+		//
+		// Chmod directly and ignore not-exist errors — avoids the TOCTOU
+		// race between Stat+Chmod. On a fresh install with no -wal yet
+		// (unlikely after initDB, but possible), the not-exist is harmless.
+		//
+		// Resolve symlinks first: SQLite creates -wal/-shm beside the DB's
+		// real path, so if dbPath is a symlink (e.g. /etc/arc/auth.db ->
+		// /var/lib/arc/auth.db), "dbPath+ext" points at a non-existent
+		// sibling of the link and the Chmod would silently no-op, leaving
+		// the real WAL/SHM at the process umask. EvalSymlinks gives the
+		// canonical path; fall back to dbPath if it can't be resolved.
+		walBase := dbPath
+		if resolved, err := filepath.EvalSymlinks(dbPath); err == nil {
+			walBase = resolved
+		} else {
+			// Fall back to dbPath, but surface it: if dbPath is in fact a
+			// symlink, the WAL/SHM chmod below targets the wrong (link-side)
+			// paths and silently no-ops, leaving the real files at the umask.
+			am.logger.Warn().Err(err).Str("db_path", dbPath).
+				Msg("Could not resolve auth DB symlinks; WAL/SHM permissions may not be hardened if the path is a symlink")
+		}
+		for _, ext := range []string{"-wal", "-shm"} {
+			p := walBase + ext
+			if err := os.Chmod(p, 0600); err != nil && !os.IsNotExist(err) {
+				db.Close()
+				return nil, fmt.Errorf("failed to set auth DB %s permissions: %w", ext, err)
+			}
+		}
 	}
 
 	// Start background cleanup
