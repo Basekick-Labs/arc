@@ -925,3 +925,42 @@ func TestNewAuthManager_CreatesDirAndLocksPerms(t *testing.T) {
 		}
 	}
 }
+
+// TestNewAuthManager_SymlinkedDBLocksRealWALPerms verifies that when the auth
+// DB path is a symlink, the -wal/-shm files SQLite creates beside the symlink's
+// real target are still locked to 0600. SQLite resolves symlinks before opening,
+// so a naive "symlinkPath+'-wal'" would point at a non-existent sibling of the
+// link and leave the real WAL untouched. NewAuthManager resolves the symlink
+// (filepath.EvalSymlinks) before chmod'ing the WAL/SHM siblings.
+func TestNewAuthManager_SymlinkedDBLocksRealWALPerms(t *testing.T) {
+	base := t.TempDir()
+	realDir := filepath.Join(base, "real")
+	linkDir := filepath.Join(base, "link")
+	if err := os.MkdirAll(realDir, 0o700); err != nil {
+		t.Fatalf("mkdir real: %v", err)
+	}
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	// Open via the symlinked directory; the real files land under realDir.
+	am, err := NewAuthManager(filepath.Join(linkDir, "auth.db"), 5*time.Minute, 100, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewAuthManager via symlink failed: %v", err)
+	}
+	t.Cleanup(func() { am.Close() })
+
+	realDB := filepath.Join(realDir, "auth.db")
+	for _, p := range []string{realDB, realDB + "-wal", realDB + "-shm"} {
+		info, err := os.Lstat(p)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			t.Fatalf("lstat %s: %v", p, err)
+		}
+		if perm := info.Mode().Perm(); perm != 0600 {
+			t.Errorf("%s perm = %o, want 0600 (symlink resolution failed?)", filepath.Base(p), perm)
+		}
+	}
+}

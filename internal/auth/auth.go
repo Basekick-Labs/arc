@@ -192,8 +192,19 @@ func NewAuthManager(dbPath string, cacheTTL time.Duration, maxCacheSize int, log
 		// Chmod directly and ignore not-exist errors — avoids the TOCTOU
 		// race between Stat+Chmod. On a fresh install with no -wal yet
 		// (unlikely after initDB, but possible), the not-exist is harmless.
+		//
+		// Resolve symlinks first: SQLite creates -wal/-shm beside the DB's
+		// real path, so if dbPath is a symlink (e.g. /etc/arc/auth.db ->
+		// /var/lib/arc/auth.db), "dbPath+ext" points at a non-existent
+		// sibling of the link and the Chmod would silently no-op, leaving
+		// the real WAL/SHM at the process umask. EvalSymlinks gives the
+		// canonical path; fall back to dbPath if it can't be resolved.
+		walBase := dbPath
+		if resolved, err := filepath.EvalSymlinks(dbPath); err == nil {
+			walBase = resolved
+		}
 		for _, ext := range []string{"-wal", "-shm"} {
-			p := dbPath + ext
+			p := walBase + ext
 			if err := os.Chmod(p, 0600); err != nil && !os.IsNotExist(err) {
 				db.Close()
 				return nil, fmt.Errorf("failed to set auth DB %s permissions: %w", ext, err)
