@@ -534,10 +534,14 @@ func (c *Coordinator) broadcastLeave() {
 		Reason: "graceful shutdown",
 	}
 
-	// Sign the leave message if shared secret is configured
+	// Sign the leave message if shared secret is configured. As with the
+	// heartbeat path, an unsigned leave (nonce failure) is rejected by the
+	// peer — log the error rather than swallow it silently.
 	if c.cfg.SharedSecret != "" {
 		nonce, err := security.GenerateNonce()
-		if err == nil {
+		if err != nil {
+			c.logger.Error().Err(err).Msg("Failed to generate nonce for leave signing; leave notification will be unsigned and rejected by peers")
+		} else {
 			leave.AuthTimestamp = time.Now().Unix()
 			leave.AuthNonce = nonce
 			leave.AuthHMAC = security.ComputeHMAC(c.cfg.SharedSecret, nonce, leave.NodeID, c.cfg.ClusterName, leave.AuthTimestamp)
@@ -773,9 +777,15 @@ func (c *Coordinator) sendHeartbeats() {
 	// Sign the heartbeat if a shared secret is configured. Mirrors the
 	// join/leave signing path. The HMAC binds NodeID + ClusterName +
 	// timestamp, so it is the same for every peer this tick — compute once.
+	// On a nonce-generation failure the heartbeat ships unsigned and peers
+	// reject it (fail-safe), so this node would trend unhealthy — log the
+	// error loudly so an operator can diagnose entropy/system failure rather
+	// than chase a silently-flapping node.
 	if c.cfg.SharedSecret != "" {
 		nonce, err := security.GenerateNonce()
-		if err == nil {
+		if err != nil {
+			c.logger.Error().Err(err).Msg("Failed to generate nonce for heartbeat signing; heartbeat will be unsigned and rejected by peers")
+		} else {
 			hb.AuthTimestamp = time.Now().Unix()
 			hb.AuthNonce = nonce
 			hb.AuthHMAC = security.ComputeHMAC(c.cfg.SharedSecret, nonce, hb.NodeID, c.cfg.ClusterName, hb.AuthTimestamp)
