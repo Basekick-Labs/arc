@@ -63,7 +63,7 @@ func TestLogsEndpoint_RequiresAdmin(t *testing.T) {
 		if token != "" {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
-		resp, err := app.Test(req, -1)
+		resp, err := app.Test(req)
 		if err != nil {
 			t.Fatalf("app.Test(%s): %v", path, err)
 		}
@@ -101,7 +101,7 @@ func TestLogsEndpoint_AuthDisabledStaysOpen(t *testing.T) {
 	srv.RegisterLogsRoute(nil) // auth disabled
 
 	req := httptest.NewRequest("GET", "/api/v1/logs?limit=3", nil)
-	resp, err := srv.app.Test(req, -1)
+	resp, err := srv.app.Test(req)
 	if err != nil {
 		t.Fatalf("app.Test: %v", err)
 	}
