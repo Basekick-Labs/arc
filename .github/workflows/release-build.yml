@@ -672,7 +672,9 @@ jobs:
       # by create-draft-release after provenance completes. Use artifact upload
       # instead so create-draft-release can attach the file to the release.
       upload-assets: false
-      provenance-name: arc-${{ needs.prepare.outputs.version }}.intoto.jsonl
+      # provenance-name cannot use needs context inside a reusable workflow
+      # with: block (GitHub limitation). The generator outputs multiple.intoto.jsonl
+      # by default; create-draft-release renames it to arc-VERSION.intoto.jsonl.
 
   # Scan container image for OS CVEs and Go module vulnerabilities.
   # exit-code: 0 — the deliverable is the signed scan report attached to the
@@ -1029,8 +1031,13 @@ jobs:
       - name: Download SLSA provenance attestation
         uses: actions/download-artifact@v7
         with:
-          name: arc-${{ needs.prepare.outputs.version }}.intoto.jsonl
+          name: multiple.intoto.jsonl
           path: ./release-artifacts
+
+      - name: Rename provenance attestation
+        run: |
+          mv ./release-artifacts/multiple.intoto.jsonl \
+             ./release-artifacts/arc-${{ needs.prepare.outputs.version }}.intoto.jsonl
 
       - name: Generate release notes
         id: release_notes
