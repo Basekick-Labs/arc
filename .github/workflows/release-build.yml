@@ -18,6 +18,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write   # required for OIDC keyless signing via Sigstore/cosign
 
 env:
   REGISTRY_GHCR: ghcr.io
@@ -227,6 +228,11 @@ jobs:
           go-version: '1.26'
           cache: true
 
+      - name: Run govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          govulncheck ./...
+
       - name: Build binary
         env:
           CGO_ENABLED: 1
@@ -244,12 +250,56 @@ jobs:
           file arc-${{ matrix.suffix }}
           ls -lh arc-${{ matrix.suffix }}
 
-      - name: Upload binary
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Sign the binary blob with keyless OIDC signing. The .bundle file
+      # contains the signature + Rekor transparency-log entry and is shipped
+      # as a release artifact so air-gapped/Zarf deployments can verify
+      # offline with: cosign verify-blob arc-linux-amd64 --bundle arc-linux-amd64.bundle
+      - name: Sign binary (keyless)
+        run: |
+          cosign sign-blob --yes \
+            arc-${{ matrix.suffix }} \
+            --bundle arc-${{ matrix.suffix }}.bundle
+          echo "✅ Binary signed: arc-${{ matrix.suffix }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload binary and signature bundle
         uses: actions/upload-artifact@v6
         with:
           name: arc-binary-${{ matrix.suffix }}
-          path: arc-${{ matrix.suffix }}
+          path: |
+            arc-${{ matrix.suffix }}
+            arc-${{ matrix.suffix }}.bundle
           retention-days: 7
+
+  # Aggregate binary hashes for SLSA provenance — must run after both
+  # matrix legs of build-binaries complete so we can combine both digests
+  # into a single base64-subjects string for the generator.
+  hash-binaries:
+    name: Hash Binaries for SLSA
+    runs-on: ubuntu-latest
+    needs: [prepare, build-binaries]
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - name: Download all binaries
+        uses: actions/download-artifact@v7
+        with:
+          pattern: arc-binary-*
+          merge-multiple: true
+          path: ./binaries
+
+      - name: Compute SHA-256 subjects
+        id: hash
+        run: |
+          cd binaries
+          # Compute sha256 for each binary (exclude .bundle sidecar files)
+          sha256sum arc-linux-amd64 arc-linux-arm64 > sha256sums.txt
+          cat sha256sums.txt
+          # SLSA generator expects base64-encoded "HASH  filename\n..." lines (sha256sum format)
+          HASHES=$(base64 -w0 sha256sums.txt)
+          echo "hashes=${HASHES}" >> $GITHUB_OUTPUT
 
   # Build Debian packages
   debian-build:
@@ -534,6 +584,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write   # required for cosign keyless signing of the manifest
     steps:
       - name: Download digests
         uses: actions/download-artifact@v7
@@ -553,6 +604,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create manifest list and push (GHCR)
+        id: manifest
         working-directory: /tmp/digests
         env:
           IMAGE_REF: ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}
@@ -576,6 +628,163 @@ jobs:
           [ "${TEST_MODE}" = "true" ] && LATEST_NOTE="(latest suppressed — test_mode)"
           echo "✅ GHCR multi-arch manifest pushed" >> $GITHUB_STEP_SUMMARY
           echo "Tags: ${VERSION}, ${SHORT_VERSION}, ${LATEST_NOTE}" >> $GITHUB_STEP_SUMMARY
+
+          # Capture the versioned manifest digest for cosign to sign below.
+          DIGEST=$(docker buildx imagetools inspect "${IMAGE_REF}:${VERSION}" --format '{{.Manifest.Digest}}')
+          echo "manifest_digest=${DIGEST}" >> $GITHUB_OUTPUT
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Sign the multi-arch manifest digest with keyless OIDC signing.
+      # The signature is anchored in the Rekor transparency log — verifiers
+      # can check: "this image was built by this Actions workflow from this
+      # commit." No key material is stored; the GitHub Actions OIDC token is
+      # the identity. Air-gap deployments can verify offline once the bundle
+      # is fetched from Rekor before the network is severed.
+      - name: Sign container image (keyless)
+        env:
+          IMAGE_REF: ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}
+          MANIFEST_DIGEST: ${{ steps.manifest.outputs.manifest_digest }}
+        run: |
+          cosign sign --yes "${IMAGE_REF}@${MANIFEST_DIGEST}"
+          echo "✅ Container image signed: ${IMAGE_REF}@${MANIFEST_DIGEST}" >> $GITHUB_STEP_SUMMARY
+
+  # Generate SLSA Level 3 provenance for the release binaries.
+  # Provenance proves: who built it, from what source commit, with what build
+  # inputs — the highest attestation level achievable on GitHub Actions without
+  # hardware HSMs. Verifiable with:
+  #   slsa-verifier verify-artifact arc-linux-amd64 \
+  #     --provenance-path arc-linux-amd64.intoto.jsonl \
+  #     --source-uri github.com/basekick-labs/arc
+  provenance:
+    needs: [prepare, hash-binaries]
+    permissions:
+      actions: read
+      id-token: write
+      contents: read
+    # Pinned by commit SHA (tag v2.1.0) — tags are mutable, SHAs are not.
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a
+    with:
+      base64-subjects: ${{ needs.hash-binaries.outputs.hashes }}
+      # upload-assets requires a tag ref with an existing GitHub release.
+      # This workflow triggers on a branch (release/*); the release is created
+      # by create-draft-release after provenance completes. Use artifact upload
+      # instead so create-draft-release can attach the file to the release.
+      upload-assets: false
+      provenance-name: arc-${{ needs.prepare.outputs.version }}.intoto.jsonl
+
+  # Scan container image for OS CVEs and Go module vulnerabilities.
+  # exit-code: 0 — the deliverable is the signed scan report attached to the
+  # GitHub release, not "zero findings." Primes need evidence, not a blocked
+  # pipeline over transitive Debian CVEs we don't control.
+  vuln-scan:
+    name: Vulnerability Scan
+    runs-on: ubuntu-latest
+    needs: [prepare, docker-merge]
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY_GHCR }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Trivy (SARIF — uploads to GitHub Security tab)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Run Trivy (JSON — release artifact)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }}
+          format: json
+          output: arc-${{ needs.prepare.outputs.version }}-trivy-report.json
+          severity: CRITICAL,HIGH,MEDIUM
+          exit-code: '0'
+
+      - name: Upload Trivy report
+        uses: actions/upload-artifact@v6
+        with:
+          name: arc-trivy-${{ needs.prepare.outputs.version }}
+          path: arc-${{ needs.prepare.outputs.version }}-trivy-report.json
+          retention-days: 7
+
+      - name: Summary
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+          echo "## Vulnerability Scan" >> $GITHUB_STEP_SUMMARY
+          echo "- Trivy report: \`arc-${VERSION}-trivy-report.json\`" >> $GITHUB_STEP_SUMMARY
+          echo "- SARIF uploaded to GitHub Security tab" >> $GITHUB_STEP_SUMMARY
+
+  # Generate SBOM artifacts for supply-chain compliance (EO 14028 / SLSA)
+  sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    needs: [prepare, docker-merge]
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY_GHCR }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Container SBOM: catches DuckDB native libs, libsqlite3, and all Debian
+      # packages in the runtime image — the layer primes' tools actually scan.
+      - name: Generate container SBOM (SPDX JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }}
+          artifact-name: arc-${{ needs.prepare.outputs.version }}-sbom-container.spdx.json
+          output-file: arc-${{ needs.prepare.outputs.version }}-sbom-container.spdx.json
+          format: spdx-json
+
+      # Source SBOM: Go module graph — complements the container scan by naming
+      # every Go dependency with its exact version and license expression.
+      - name: Generate source SBOM (CycloneDX JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          artifact-name: arc-${{ needs.prepare.outputs.version }}-sbom-source.cyclonedx.json
+          output-file: arc-${{ needs.prepare.outputs.version }}-sbom-source.cyclonedx.json
+          format: cyclonedx-json
+
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: arc-sbom-${{ needs.prepare.outputs.version }}
+          path: |
+            arc-${{ needs.prepare.outputs.version }}-sbom-container.spdx.json
+            arc-${{ needs.prepare.outputs.version }}-sbom-source.cyclonedx.json
+          retention-days: 7
+
+      - name: Summary
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+          echo "## SBOM Generated" >> $GITHUB_STEP_SUMMARY
+          echo "- \`arc-${VERSION}-sbom-container.spdx.json\` — container image (SPDX)" >> $GITHUB_STEP_SUMMARY
+          echo "- \`arc-${VERSION}-sbom-source.cyclonedx.json\` — Go module graph (CycloneDX)" >> $GITHUB_STEP_SUMMARY
 
   # Test Docker image health
   test-docker:
@@ -801,7 +1010,7 @@ jobs:
   create-draft-release:
     name: Create Draft Release
     runs-on: ubuntu-latest
-    needs: [prepare, docker-merge, docker-build-dockerhub, test-docker, test-binary, helm-package, test-helm, debian-build, rpm-build]
+    needs: [prepare, docker-merge, docker-build-dockerhub, test-docker, test-binary, helm-package, test-helm, debian-build, rpm-build, sbom, vuln-scan, provenance]
     permissions:
       contents: write
     steps:
@@ -815,6 +1024,12 @@ jobs:
         with:
           pattern: arc-*
           merge-multiple: true
+          path: ./release-artifacts
+
+      - name: Download SLSA provenance attestation
+        uses: actions/download-artifact@v7
+        with:
+          name: arc-${{ needs.prepare.outputs.version }}.intoto.jsonl
           path: ./release-artifacts
 
       - name: Generate release notes
@@ -948,6 +1163,13 @@ jobs:
             release-artifacts/**/*.deb.sha256
             release-artifacts/**/*.rpm
             release-artifacts/**/*.rpm.sha256
+            release-artifacts/**/*.spdx.json
+            release-artifacts/**/*.cyclonedx.json
+            release-artifacts/**/*-trivy-report.json
+            release-artifacts/**/*.bundle
+            release-artifacts/**/*.intoto.jsonl
+            release-artifacts/**/*-linux-amd64
+            release-artifacts/**/*-linux-arm64
           fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -969,6 +1191,11 @@ jobs:
           echo "| Debian arm64 | \`arc_${VERSION}_arm64.deb\` |" >> $GITHUB_STEP_SUMMARY
           echo "| RPM x86_64 | \`arc-${VERSION}-1.x86_64.rpm\` |" >> $GITHUB_STEP_SUMMARY
           echo "| RPM aarch64 | \`arc-${VERSION}-1.aarch64.rpm\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| SBOM (container, SPDX) | \`arc-${VERSION}-sbom-container.spdx.json\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| SBOM (source, CycloneDX) | \`arc-${VERSION}-sbom-source.cyclonedx.json\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Vulnerability scan | \`arc-${VERSION}-trivy-report.json\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cosign bundles | \`arc-linux-amd64.bundle\`, \`arc-linux-arm64.bundle\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| SLSA provenance | \`arc-${VERSION}.intoto.jsonl\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Tests Passed" >> $GITHUB_STEP_SUMMARY
           echo "- ✅ Docker image health check" >> $GITHUB_STEP_SUMMARY
