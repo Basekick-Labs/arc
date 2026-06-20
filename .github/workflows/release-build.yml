@@ -663,8 +663,15 @@ jobs:
       actions: read
       id-token: write
       contents: write
-    # Pinned by commit SHA (tag v2.1.0) — tags are mutable, SHAs are not.
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a
+    # MUST be pinned by version tag (refs/tags/vX.Y.Z), NOT a commit SHA.
+    # The generator's bootstrap (generate-builder.sh) maps its own ref to the
+    # matching prebuilt builder release asset and rejects any non-tag ref
+    # ("Invalid ref ... Expected ref of the form refs/tags/vX.Y.Z" -> exit 2 ->
+    # the final job reports SUCCESS=false -> exit 27). This is the documented
+    # carve-out to the pin-by-SHA rule: slsa-github-generator verifies its own
+    # builder integrity internally via slsa-verifier, so the tag pin is safe.
+    # (Pinning by SHA would require compile-generator: true to build from source.)
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
     with:
       base64-subjects: ${{ needs.hash-binaries.outputs.hashes }}
       # upload-assets requires a tag ref with an existing GitHub release.

@@ -130,6 +130,8 @@ The emergency kill-switch `replication_catchup_enabled=false` remains available.
 
 **Benchmark suite moved to a dedicated repository.** The `benchmarks/` directory — containing load generators for Arc, ClickHouse, PostgreSQL, Elasticsearch, and others — has been extracted to [github.com/Basekick-Labs/arc-benchmarks](https://github.com/Basekick-Labs/arc-benchmarks). As a result, `github.com/ClickHouse/clickhouse-go/v2`, `github.com/jackc/pgx/v5`, and their transitive deps (`jackc/pgpassfile`, `jackc/pgservicefile`) have been removed from the product module — they were never part of the Arc binary or container image, only benchmark tooling. The product module now has **25 direct dependencies**, all from tier-1 OSS organizations.
 
+**Go standard library and `golang.org/x/net` updated.** The release build now uses Go 1.26.4 (up from 1.26.0) and `golang.org/x/net` v0.55.0 (up from v0.50.0). Go 1.26.4 incorporates security fixes across `crypto/x509`, `crypto/tls`, `html/template`, `net/http`, `net/textproto`, `net/url`, and `os` (CVEs from Go patch series 1.26.1–1.26.4); `golang.org/x/net` v0.55.0 fixes GO-2026-5026 (Punycode label rejection in `idna`). These updates are required for `govulncheck` to pass cleanly — `govulncheck` now runs in CI on every release build and blocks on any known reachable vulnerability. The Arc API surface, wire format, and `arc.toml` configuration are unaffected.
+
 ---
 
 _Maintainer notes: keep this file at the repo root (per [memory/project_release_strategy.md](memory/project_release_strategy.md)); do not write to `docs/RELEASE_NOTES_*` (that path is stale)._
