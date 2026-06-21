@@ -98,22 +98,42 @@ const arcS3SecretName = "arc_s3"
 // matching the old SET GLOBAL behavior. PERSISTENT must NOT be used — it would
 // write the key unencrypted to ~/.duckdb/stored_secrets.
 //
+// Credentials are three-way:
+//   - both accessKey and secretKey set → static-key secret (KEY_ID/SECRET).
+//   - both empty → PROVIDER CREDENTIAL_CHAIN, so DuckDB falls back to the AWS
+//     credential chain (env vars, IAM instance profile / IRSA). Verified against
+//     the bundled DuckDB that CREDENTIAL_CHAIN composes with REGION/ENDPOINT/
+//     URL_STYLE/USE_SSL, so custom-endpoint (MinIO-with-env-creds) still works.
+//   - exactly one set → returns an error. Silently routing a half-supplied
+//     credential to the credential chain would discard the provided key and
+//     authenticate as a different identity (e.g. the host instance role) with no
+//     signal — a misconfiguration trap, not a convenience.
+//
 // accessKey/secretKey/region/endpoint are escaped (single quotes doubled);
 // pathStyle and useSSL are program-controlled and emitted as bare enum/bool
 // literals. region/endpoint are only included when non-empty. The endpoint is
 // scheme-stripped internally via stripURLScheme, so callers may pass a raw
-// "https://host:port" value. Callers must supply non-empty accessKey/secretKey:
-// empty values produce a non-functional empty-credentials secret (no fallback
-// to the AWS credential chain).
-func buildS3SecretSQL(accessKey, secretKey, region, endpoint string, pathStyle, useSSL bool) string {
+// "https://host:port" value.
+func buildS3SecretSQL(accessKey, secretKey, region, endpoint string, pathStyle, useSSL bool) (string, error) {
+	hasKey, hasSecret := accessKey != "", secretKey != ""
+	if hasKey != hasSecret {
+		return "", fmt.Errorf("S3 credentials misconfigured: exactly one of access key / secret key is set; provide both (static credentials) or neither (AWS credential chain)")
+	}
+
 	var b strings.Builder
 	b.WriteString("CREATE OR REPLACE SECRET ")
 	b.WriteString(arcS3SecretName)
-	b.WriteString(" (\n\tTYPE S3,\n\tKEY_ID '")
-	b.WriteString(escapeSQLString(accessKey))
-	b.WriteString("',\n\tSECRET '")
-	b.WriteString(escapeSQLString(secretKey))
-	b.WriteString("'")
+	b.WriteString(" (\n\tTYPE S3")
+	if hasKey {
+		b.WriteString(",\n\tKEY_ID '")
+		b.WriteString(escapeSQLString(accessKey))
+		b.WriteString("',\n\tSECRET '")
+		b.WriteString(escapeSQLString(secretKey))
+		b.WriteString("'")
+	} else {
+		// No static credentials: defer to the AWS credential chain.
+		b.WriteString(",\n\tPROVIDER CREDENTIAL_CHAIN")
+	}
 	if region != "" {
 		b.WriteString(",\n\tREGION '")
 		b.WriteString(escapeSQLString(region))
@@ -137,7 +157,7 @@ func buildS3SecretSQL(accessKey, secretKey, region, endpoint string, pathStyle, 
 		b.WriteString("false")
 	}
 	b.WriteString("\n)")
-	return b.String()
+	return b.String(), nil
 }
 
 // Config holds DuckDB configuration
@@ -481,7 +501,10 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	// after LOAD httpfs (which registers the S3 secret type). CREATE SECRET is a
 	// catalog op and is NOT gated by enable_external_access, so order relative to
 	// the sandbox lockdown is immaterial; we run it here for locality.
-	secretSQL := buildS3SecretSQL(cfg.S3AccessKey, cfg.S3SecretKey, cfg.S3Region, cfg.S3Endpoint, cfg.S3PathStyle, cfg.S3UseSSL)
+	secretSQL, err := buildS3SecretSQL(cfg.S3AccessKey, cfg.S3SecretKey, cfg.S3Region, cfg.S3Endpoint, cfg.S3PathStyle, cfg.S3UseSSL)
+	if err != nil {
+		return err
+	}
 	if _, err := db.Exec(secretSQL); err != nil {
 		return fmt.Errorf("failed to create S3 secret: %w", err)
 	}
@@ -577,7 +600,10 @@ type S3Config struct {
 // the sandbox lockdown (enable_external_access=false); CREATE SECRET is a catalog
 // operation and is not gated by that flag.
 func (d *DuckDB) ConfigureS3(s3cfg *S3Config) error {
-	secretSQL := buildS3SecretSQL(s3cfg.AccessKey, s3cfg.SecretKey, s3cfg.Region, s3cfg.Endpoint, s3cfg.PathStyle, s3cfg.UseSSL)
+	secretSQL, err := buildS3SecretSQL(s3cfg.AccessKey, s3cfg.SecretKey, s3cfg.Region, s3cfg.Endpoint, s3cfg.PathStyle, s3cfg.UseSSL)
+	if err != nil {
+		return err
+	}
 	if _, err := d.db.Exec(secretSQL); err != nil {
 		return fmt.Errorf("failed to create S3 secret: %w", err)
 	}

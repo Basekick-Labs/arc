@@ -2548,7 +2548,11 @@ func main() {
 		// Configure DuckDB with cold tier S3 credentials for direct S3 queries
 		// This is needed because DuckDB's httpfs extension needs credentials to query S3 directly
 		cold := cfg.TieredStorage.Cold
-		if cold.Enabled && cold.Backend == "s3" && cold.S3AccessKey != "" {
+		// Configure DuckDB for cold-tier S3 whenever cold tiering targets S3.
+		// Empty access/secret keys are valid: ConfigureS3 then provisions a
+		// CREDENTIAL_CHAIN secret so IAM roles / IRSA / env credentials work for
+		// tiered queries. A half-supplied key pair is rejected by ConfigureS3.
+		if cold.Enabled && cold.Backend == "s3" {
 			if err := db.ConfigureS3(&database.S3Config{
 				Region:    cold.S3Region,
 				Endpoint:  cold.S3Endpoint,

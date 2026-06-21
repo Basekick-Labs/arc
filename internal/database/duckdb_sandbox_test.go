@@ -405,7 +405,10 @@ func TestS3SecretNotReadable(t *testing.T) {
 	}
 
 	const secretVal = "SUPER-SECRET-KEY-do-not-leak"
-	secretSQL := buildS3SecretSQL("AKIATEST", secretVal, "us-east-1", "", false, true)
+	secretSQL, err := buildS3SecretSQL("AKIATEST", secretVal, "us-east-1", "", false, true)
+	if err != nil {
+		t.Fatalf("build S3 secret SQL: %v", err)
+	}
 	if _, err := db.ExecContext(ctx, secretSQL); err != nil {
 		t.Fatalf("create S3 secret: %v", err)
 	}
