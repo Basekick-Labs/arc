@@ -206,17 +206,119 @@ jobs:
           echo "Tags:" >> $GITHUB_STEP_SUMMARY
           echo '${{ steps.meta.outputs.tags }}' | sed 's/^/  - /' >> $GITHUB_STEP_SUMMARY
 
-  # Build Go binaries using native runners (CGO required for SQLite)
+  # FIPS container image. Same source/commit/version as the standard image,
+  # built with --build-arg FIPS=1 (GOFIPS140=v1.0.0, -tags=duckdb_arrow,fips).
+  # FIPS-ness lives in the TAG (:<version>-fips), never the version. Uses a
+  # single direct multi-platform buildx --push to BOTH registries (the path
+  # Docker Hub's Tags UI indexes; GHCR indexes it too), then cosign-signs the
+  # pushed manifest on each. Never tagged `latest` (the standard image owns
+  # latest). The FIPS binaries/bundles/SLSA provenance are produced separately
+  # by build-binaries; this job only adds the container option.
+  docker-build-fips:
+    name: Build & Push FIPS Image
+    runs-on: ubuntu-latest
+    needs: prepare
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # required for cosign keyless signing
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY_GHCR }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY_DOCKERHUB }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push FIPS image (multi-platform, direct)
+        id: build_fips
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }}-fips
+            ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.short_version }}-fips
+            ${{ env.REGISTRY_DOCKERHUB }}/${{ env.IMAGE_NAME_DOCKERHUB }}:${{ needs.prepare.outputs.version }}-fips
+            ${{ env.REGISTRY_DOCKERHUB }}/${{ env.IMAGE_NAME_DOCKERHUB }}:${{ needs.prepare.outputs.short_version }}-fips
+          cache-from: type=gha
+          # Separate cache scope so the FIPS layers don't evict/collide with the
+          # standard image's gha cache (different build-arg => different layers).
+          cache-to: type=gha,mode=max,scope=fips
+          build-args: |
+            VERSION=${{ needs.prepare.outputs.version }}
+            FIPS=1
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Sign the pushed FIPS manifests on both registries by digest. The digest
+      # is identical across registries (same content), so one digest signs both
+      # repositories' references.
+      - name: Sign FIPS images (keyless)
+        env:
+          DIGEST: ${{ steps.build_fips.outputs.digest }}
+        run: |
+          cosign sign --yes "${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}@${DIGEST}"
+          cosign sign --yes "${{ env.REGISTRY_DOCKERHUB }}/${{ env.IMAGE_NAME_DOCKERHUB }}@${DIGEST}"
+          echo "✅ FIPS images signed (digest ${DIGEST}) on GHCR + Docker Hub" >> $GITHUB_STEP_SUMMARY
+
+  # Build Go binaries using native runners (CGO required for SQLite).
+  #
+  # The matrix has two dimensions: architecture (amd64/arm64) x variant
+  # (standard/fips). The FIPS variant is the SAME source at the SAME version,
+  # compiled with -tags=fips against the CMVP-certified Go Cryptographic Module
+  # (GOFIPS140=v1.0.0). It is NOT a different version — the FIPS-ness lives in
+  # the artifact NAME (arc-fips-<suffix>), never in the version string. Both
+  # variants reuse the same govulncheck + cosign signing machinery.
   build-binaries:
     name: Build Binaries
     needs: prepare
     strategy:
+      fail-fast: false
       matrix:
         include:
           - runner: ubuntu-latest
             suffix: linux-amd64
+            variant: standard
+            artifact: arc-linux-amd64
+            build_tags: duckdb_arrow
+            gofips: ""
           - runner: ubuntu-24.04-arm
             suffix: linux-arm64
+            variant: standard
+            artifact: arc-linux-arm64
+            build_tags: duckdb_arrow
+            gofips: ""
+          - runner: ubuntu-latest
+            suffix: linux-amd64
+            variant: fips
+            artifact: arc-fips-linux-amd64
+            build_tags: duckdb_arrow,fips
+            gofips: "v1.0.0"
+          - runner: ubuntu-24.04-arm
+            suffix: linux-arm64
+            variant: fips
+            artifact: arc-fips-linux-arm64
+            build_tags: duckdb_arrow,fips
+            gofips: "v1.0.0"
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
@@ -233,22 +335,60 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
           govulncheck ./...
 
+      # FIPS variant only: prove the build links no non-FIPS crypto.
+      # Strip-independent (operates on the import graph, not symbols) so it
+      # works regardless of -ldflags="-s -w".
+      - name: Verify FIPS crypto boundary (import graph)
+        if: matrix.variant == 'fips'
+        run: |
+          if go list -tags=${{ matrix.build_tags }} -deps ./cmd/arc | grep -E 'golang.org/x/crypto/(bcrypt|hkdf)'; then
+            echo "::error::FIPS build pulls in non-approved x/crypto packages (listed above)"
+            exit 1
+          fi
+          echo "✅ FIPS import-graph clean: no x/crypto/bcrypt or x/crypto/hkdf"
+
       - name: Build binary
         env:
           CGO_ENABLED: 1
+          GOFIPS140: ${{ matrix.gofips }}
         run: |
           VERSION=${{ needs.prepare.outputs.version }}
 
-          go build -tags=duckdb_arrow \
+          go build -tags=${{ matrix.build_tags }} \
             -ldflags "-s -w -X main.Version=${VERSION}" \
-            -o arc-${{ matrix.suffix }} \
+            -o ${{ matrix.artifact }} \
             ./cmd/arc
 
-          chmod +x arc-${{ matrix.suffix }}
+          chmod +x ${{ matrix.artifact }}
 
           # Show binary info
-          file arc-${{ matrix.suffix }}
-          ls -lh arc-${{ matrix.suffix }}
+          file ${{ matrix.artifact }}
+          ls -lh ${{ matrix.artifact }}
+
+      # FIPS variant only: boot the freshly built binary and assert it is
+      # actually running with the Go Cryptographic Module in FIPS mode. The
+      # binary fails closed if fips140 is not active (see cmd/arc startup
+      # guard), so a successful boot that logs "fips_mode":true is the proof.
+      # amd64 boots natively; arm64 runs on a native arm runner, so no
+      # emulation is involved on either leg.
+      - name: Verify FIPS mode active at runtime
+        if: matrix.variant == 'fips'
+        env:
+          # Pin JSON logging so the grep for the structured field is robust
+          # regardless of any ARC_LOG_FORMAT in the runner environment.
+          ARC_LOG_FORMAT: json
+        run: |
+          ./${{ matrix.artifact }} > fips-boot.log 2>&1 &
+          APP_PID=$!
+          sleep 8
+          kill $APP_PID 2>/dev/null || true
+          echo "---- startup log ----"
+          head -5 fips-boot.log || true
+          if ! grep -q '"fips_mode":true' fips-boot.log; then
+            echo "::error::arc-fips binary did not report fips_mode=true at startup"
+            exit 1
+          fi
+          echo "✅ arc-fips booted with FIPS mode active"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
@@ -256,21 +396,21 @@ jobs:
       # Sign the binary blob with keyless OIDC signing. The .bundle file
       # contains the signature + Rekor transparency-log entry and is shipped
       # as a release artifact so air-gapped/Zarf deployments can verify
-      # offline with: cosign verify-blob arc-linux-amd64 --bundle arc-linux-amd64.bundle
+      # offline with: cosign verify-blob <artifact> --bundle <artifact>.bundle
       - name: Sign binary (keyless)
         run: |
           cosign sign-blob --yes \
-            arc-${{ matrix.suffix }} \
-            --bundle arc-${{ matrix.suffix }}.bundle
-          echo "✅ Binary signed: arc-${{ matrix.suffix }}" >> $GITHUB_STEP_SUMMARY
+            ${{ matrix.artifact }} \
+            --bundle ${{ matrix.artifact }}.bundle
+          echo "✅ Binary signed: ${{ matrix.artifact }}" >> $GITHUB_STEP_SUMMARY
 
       - name: Upload binary and signature bundle
         uses: actions/upload-artifact@v6
         with:
-          name: arc-binary-${{ matrix.suffix }}
+          name: arc-binary-${{ matrix.variant }}-${{ matrix.suffix }}
           path: |
-            arc-${{ matrix.suffix }}
-            arc-${{ matrix.suffix }}.bundle
+            ${{ matrix.artifact }}
+            ${{ matrix.artifact }}.bundle
           retention-days: 7
 
   # Aggregate binary hashes for SLSA provenance — must run after both
@@ -294,8 +434,13 @@ jobs:
         id: hash
         run: |
           cd binaries
-          # Compute sha256 for each binary (exclude .bundle sidecar files)
-          sha256sum arc-linux-amd64 arc-linux-arm64 > sha256sums.txt
+          # Compute sha256 for every released binary — standard AND fips — so the
+          # SLSA provenance attestation covers all four artifacts. (.bundle
+          # signature sidecars are excluded; they are not SLSA subjects.)
+          sha256sum \
+            arc-linux-amd64 arc-linux-arm64 \
+            arc-fips-linux-amd64 arc-fips-linux-arm64 \
+            > sha256sums.txt
           cat sha256sums.txt
           # SLSA generator expects base64-encoded "HASH  filename\n..." lines (sha256sum format)
           HASHES=$(base64 -w0 sha256sums.txt)
@@ -320,7 +465,7 @@ jobs:
       - name: Download binary
         uses: actions/download-artifact@v7
         with:
-          name: arc-binary-${{ matrix.binary_suffix }}
+          name: arc-binary-standard-${{ matrix.binary_suffix }}
 
       - name: Build Debian package
         run: |
@@ -459,7 +604,7 @@ jobs:
       - name: Download binary
         uses: actions/download-artifact@v7
         with:
-          name: arc-binary-${{ matrix.binary_suffix }}
+          name: arc-binary-standard-${{ matrix.binary_suffix }}
 
       - name: Build RPM package
         run: |
@@ -861,7 +1006,7 @@ jobs:
       - name: Download amd64 binary
         uses: actions/download-artifact@v7
         with:
-          name: arc-binary-linux-amd64
+          name: arc-binary-standard-linux-amd64
 
       - name: Test binary execution
         run: |

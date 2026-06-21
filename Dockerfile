@@ -15,12 +15,25 @@ RUN go mod download && go mod verify
 # Copy source code
 COPY . .
 
-# Build
+# Build. FIPS=1 selects the arc-fips variant: same source/commit/version,
+# compiled with the fips build tag against the CMVP-certified Go Cryptographic
+# Module (GOFIPS140=v1.0.0) and baking in GODEBUG=fips140=only. The binary is
+# always named "arc" inside the image; the FIPS-ness is conveyed by the image
+# TAG (e.g. :<version>-fips), per "FIPS is a build variant, not a version".
 ARG VERSION
-RUN go build -v \
-    -tags=duckdb_arrow \
-    -ldflags="-s -w -X main.Version=${VERSION}" \
-    -o arc ./cmd/arc
+ARG FIPS=0
+RUN if [ "$FIPS" = "1" ]; then \
+        echo "Building FIPS variant (GOFIPS140=v1.0.0, -tags=duckdb_arrow,fips)"; \
+        GOFIPS140=v1.0.0 CGO_ENABLED=1 go build -v \
+            -tags=duckdb_arrow,fips \
+            -ldflags="-s -w -X main.Version=${VERSION}" \
+            -o arc ./cmd/arc; \
+    else \
+        CGO_ENABLED=1 go build -v \
+            -tags=duckdb_arrow \
+            -ldflags="-s -w -X main.Version=${VERSION}" \
+            -o arc ./cmd/arc; \
+    fi
 
 # Production stage
 FROM debian:bookworm-slim

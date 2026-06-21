@@ -1,6 +1,7 @@
 package security
 
 import (
+	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -8,10 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"hash"
-	"io"
 	"time"
-
-	"golang.org/x/crypto/hkdf"
 )
 
 // MsgType is a per-message-type label bound into the join-family HMAC for
@@ -319,9 +317,17 @@ func DeriveReplicationSessionKey(sharedSecret string, handshakeNonce string) ([]
 	// HKDF-Extract uses the nonce as salt and the shared secret as IKM.
 	// HKDF-Expand pulls 32 bytes of output keyed with the namespace
 	// info string.
-	r := hkdf.New(sha256.New, []byte(sharedSecret), []byte(handshakeNonce), []byte("arc-replication-session:"))
-	key := make([]byte, 32)
-	if _, err := io.ReadFull(r, key); err != nil {
+	//
+	// Uses stdlib crypto/hkdf (Go 1.24+) rather than golang.org/x/crypto/hkdf
+	// so HKDF stays inside the FIPS 140-3 module boundary (the x/crypto
+	// version is outside it). The stdlib Key signature is
+	// (hash, secret, salt, info, keyLen) — secret=sharedSecret (IKM),
+	// salt=handshakeNonce. This ordering is byte-for-byte identical to the
+	// previous x/crypto New(hash, ikm, salt, info) call; a regression test
+	// pins the derived key (see auth_test.go) because a mismatch would
+	// silently split the cluster (both sides must derive the same key).
+	key, err := hkdf.Key(sha256.New, []byte(sharedSecret), []byte(handshakeNonce), "arc-replication-session:", 32)
+	if err != nil {
 		return nil, fmt.Errorf("derive replication session key: %w", err)
 	}
 	return key, nil

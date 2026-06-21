@@ -2,8 +2,10 @@ package auth
 
 import (
 	"context"
+	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -11,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,7 +21,6 @@ import (
 
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
-	"golang.org/x/crypto/bcrypt"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -451,26 +453,92 @@ func (am *AuthManager) cleanupExpiredCache() {
 	}
 }
 
-// hashToken generates a bcrypt hash of the token for storage
+// pbkdf2Prefix marks a token hash produced by hashToken (PBKDF2-HMAC-SHA256).
+// Format: $pbkdf2-sha256$<iter>$<saltB64>$<hashB64> (base64 std, no padding
+// concerns since we encode/decode with the same codec).
+const pbkdf2Prefix = "$pbkdf2-sha256$"
+
+// pbkdf2Iterations is the PBKDF2 work factor. API tokens are 256-bit random
+// values (see generateToken), so this is defense-in-depth rather than the sole
+// barrier against guessing; 600k matches current OWASP guidance for
+// PBKDF2-HMAC-SHA256 and keeps verify latency acceptable for the auth cache
+// miss path.
+const pbkdf2Iterations = 600_000
+
+// pbkdf2KeyLen is the derived-key length in bytes (256-bit).
+const pbkdf2KeyLen = 32
+
+// pbkdf2SaltLen is the per-token random salt length in bytes.
+const pbkdf2SaltLen = 16
+
+// hashToken generates a PBKDF2-HMAC-SHA256 hash of the token for storage.
+//
+// PBKDF2 is a FIPS 140-3-approved KDF (SP 800-132) implemented in the stdlib
+// crypto/pbkdf2 (Go 1.24+), which is inside the FIPS module boundary. Arc
+// previously used bcrypt (golang.org/x/crypto/bcrypt), which is NOT
+// FIPS-approved and sits OUTSIDE the module boundary — and crucially is NOT
+// rejected by GODEBUG=fips140=only because it is not stdlib crypto. New tokens
+// are therefore always PBKDF2 in BOTH build variants; verifyTokenHash handles
+// verifying any pre-existing bcrypt/sha256 hashes (see verifyLegacyTokenHash,
+// which fails closed in the fips build).
 func (am *AuthManager) hashToken(token string) (string, error) {
-	hash, err := bcrypt.GenerateFromPassword([]byte(token), bcrypt.DefaultCost)
-	if err != nil {
-		return "", err
+	salt := make([]byte, pbkdf2SaltLen)
+	if _, err := rand.Read(salt); err != nil {
+		return "", fmt.Errorf("generate token salt: %w", err)
 	}
-	return string(hash), nil
+	dk, err := pbkdf2.Key(sha256.New, token, salt, pbkdf2Iterations, pbkdf2KeyLen)
+	if err != nil {
+		return "", fmt.Errorf("derive token hash: %w", err)
+	}
+	return fmt.Sprintf("%s%d$%s$%s",
+		pbkdf2Prefix,
+		pbkdf2Iterations,
+		base64.RawStdEncoding.EncodeToString(salt),
+		base64.RawStdEncoding.EncodeToString(dk),
+	), nil
 }
 
-// verifyTokenHash checks if a token matches a stored hash
+// verifyTokenHash checks if a token matches a stored hash.
+//
+// PBKDF2 hashes (the format hashToken now emits) verify in both build
+// variants. Legacy bcrypt ($2…) and sha256 hashes are delegated to
+// verifyLegacyTokenHash, which is build-tag-specific: the default build
+// verifies them as before (backward compatibility); the fips build fails
+// closed and logs a "rotate this token" warning, because verifying a legacy
+// hash would call a non-FIPS-approved algorithm (bcrypt) or a bare unsalted
+// SHA-256.
 func (am *AuthManager) verifyTokenHash(token, hash string) bool {
-	// Bcrypt hash (secure, used for all new tokens since v26)
-	if strings.HasPrefix(hash, "$2") {
-		return bcrypt.CompareHashAndPassword([]byte(hash), []byte(token)) == nil
+	if strings.HasPrefix(hash, pbkdf2Prefix) {
+		return verifyPBKDF2TokenHash(token, hash)
 	}
-	// SHA256 hash (legacy compatibility for pre-v26 tokens)
-	// New tokens always use bcrypt. This path only verifies existing old tokens.
-	// #nosec G401 -- Legacy compatibility only, not used for new token storage
-	h := sha256.Sum256([]byte(token))
-	return hash == hex.EncodeToString(h[:])
+	return am.verifyLegacyTokenHash(token, hash)
+}
+
+// verifyPBKDF2TokenHash parses and verifies a $pbkdf2-sha256$ encoded hash in
+// constant time. A malformed encoding returns false (fail closed).
+func verifyPBKDF2TokenHash(token, hash string) bool {
+	rest := strings.TrimPrefix(hash, pbkdf2Prefix)
+	parts := strings.Split(rest, "$")
+	if len(parts) != 3 {
+		return false
+	}
+	iter, err := strconv.Atoi(parts[0])
+	if err != nil || iter <= 0 {
+		return false
+	}
+	salt, err := base64.RawStdEncoding.DecodeString(parts[1])
+	if err != nil {
+		return false
+	}
+	want, err := base64.RawStdEncoding.DecodeString(parts[2])
+	if err != nil {
+		return false
+	}
+	got, err := pbkdf2.Key(sha256.New, token, salt, iter, len(want))
+	if err != nil {
+		return false
+	}
+	return subtle.ConstantTimeCompare(got, want) == 1
 }
 
 // cacheKey generates a cache key for in-memory token lookup.

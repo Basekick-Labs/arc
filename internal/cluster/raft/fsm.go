@@ -227,16 +227,20 @@ type BatchFileOpsPayload struct {
 // This is the authoritative record of a token's existence, used by every node's
 // AuthManager to materialise its local SQLite cache via the FSM apply callbacks.
 //
-// Plaintext secrecy invariant: only TokenHash (bcrypt) and TokenPrefix (SHA256
-// prefix used for the indexed lookup) are stored. The plaintext token value
-// never lands in the Raft log — the proposer returns it directly to its caller
-// before the command is marshalled. Same posture as today's CreateToken.
+// Plaintext secrecy invariant: only TokenHash (PBKDF2-HMAC-SHA256; or a legacy
+// bcrypt/sha256 hash for tokens created before the FIPS migration) and
+// TokenPrefix (SHA256 prefix used for the indexed lookup) are stored. The
+// plaintext token value never lands in the Raft log — the proposer returns it
+// directly to its caller before the command is marshalled. Same posture as
+// today's CreateToken. The hash is an opaque string here (format not
+// validated), so PBKDF2 and legacy hashes replicate identically; a FIPS node
+// fails legacy-hash verification closed (see auth.verifyTokenHash).
 type TokenEntry struct {
 	ID                int64  `json:"id"`                             // Raft log index at create time (deterministic across nodes)
 	Name              string `json:"name"`                           // Human-readable name; UNIQUE in api_tokens
 	Description       string `json:"description,omitempty"`          // Optional free-text
 	Permissions       string `json:"permissions"`                    // Comma-separated: "read,write,delete,admin"
-	TokenHash         string `json:"token_hash"`                     // bcrypt hash of the plaintext token
+	TokenHash         string `json:"token_hash"`                     // PBKDF2 hash (or legacy bcrypt/sha256) of the plaintext token
 	TokenPrefix       string `json:"token_prefix"`                   // SHA256(token)[:16] for indexed lookup
 	CreatedAtUnixNano int64  `json:"created_at_unix_nano"`           // Proposer-set; deterministic across log replay
 	ExpiresAtUnixNano int64  `json:"expires_at_unix_nano,omitempty"` // 0 = no expiry
@@ -1407,8 +1411,9 @@ func (f *ClusterFSM) rejectToken(op string, id int64, logIndex uint64, err error
 //
 // Checks (cheapest first):
 //   - Name non-empty and length-bounded (avoid a DOS via 1GB names).
-//   - TokenHash non-empty (we never accept tokens without a bcrypt hash —
-//     the plaintext path is proposer-side only).
+//   - TokenHash non-empty (we never accept tokens without a hash —
+//     the plaintext path is proposer-side only). Format is not checked here;
+//     PBKDF2 and legacy bcrypt/sha256 hashes are all opaque to this validator.
 //   - TokenPrefix non-empty (required for the indexed lookup).
 //   - Permissions contains only the allowed verbs.
 func validateTokenEntry(entry *TokenEntry) error {

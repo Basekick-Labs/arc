@@ -28,6 +28,7 @@ import (
 	"github.com/basekick-labs/arc/internal/compaction"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
+	"github.com/basekick-labs/arc/internal/fips"
 	"github.com/basekick-labs/arc/internal/governance"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/license"
@@ -92,7 +93,16 @@ func main() {
 
 	// Setup logger
 	logger.Setup(cfg.Log.Level, cfg.Log.Format)
-	log.Info().Str("version", Version).Bool("duckdb_arrow", database.ArrowEnabled).Msg("Starting Arc...")
+	log.Info().Str("version", Version).Bool("duckdb_arrow", database.ArrowEnabled).Bool("fips_mode", fips.Enabled()).Msg("Starting Arc...")
+
+	// Fail closed: the arc-fips build (fips.BuildTagged) MUST run with the Go
+	// Cryptographic Module actually in FIPS mode. The binary bakes in
+	// GODEBUG=fips140=only (see cmd/arc/fips.go), but an operator could still
+	// override it; refuse to start rather than silently run a "FIPS" binary
+	// outside FIPS mode, which would defeat the posture and mislead an auditor.
+	if fips.BuildTagged && !fips.Enabled() {
+		log.Fatal().Msg("FIPS build started without the Go Cryptographic Module in FIPS mode (GODEBUG=fips140 disabled); refusing to start. Remove any GODEBUG=fips140=off override.")
+	}
 
 	// Validate Enterprise License early (before component initialization)
 	// This allows us to apply core limits to DuckDB and ingestion workers
@@ -2660,6 +2670,7 @@ func main() {
 		Int("port", cfg.Server.Port).
 		Str("protocol", protocol).
 		Str("version", Version).
+		Bool("fips_mode", fips.Enabled()).
 		Msg("Arc is ready!")
 
 	// Wait for shutdown signal

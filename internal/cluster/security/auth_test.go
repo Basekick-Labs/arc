@@ -545,3 +545,51 @@ func TestValidateReplicateSyncHMAC_StaleAndFuture(t *testing.T) {
 		t.Error("future timestamp accepted by replicate-sync validator")
 	}
 }
+
+// TestDeriveReplicationSessionKey_KnownAnswer pins the byte output of HKDF
+// session-key derivation. This guards the migration from golang.org/x/crypto/hkdf
+// to stdlib crypto/hkdf (done for FIPS 140-3 boundary compliance): the stdlib
+// Key signature is (hash, secret, salt, info, len) while x/crypto was
+// New(hash, ikm, salt, info) — secret/IKM and salt must stay in the SAME order
+// or every node derives a DIFFERENT session key and replication auth silently
+// splits the cluster. The expected value was captured from the pre-migration
+// x/crypto implementation; it MUST NOT change.
+func TestDeriveReplicationSessionKey_KnownAnswer(t *testing.T) {
+	const (
+		secret = "test-shared-secret-123"
+		nonce  = "test-handshake-nonce-abc"
+		// Captured from golang.org/x/crypto/hkdf before the stdlib swap.
+		want = "f7c40933499538025701d91ccf966fd1046630b6c182ea5407058f213f1b9800"
+	)
+	key, err := DeriveReplicationSessionKey(secret, nonce)
+	if err != nil {
+		t.Fatalf("DeriveReplicationSessionKey: %v", err)
+	}
+	if got := hex.EncodeToString(key); got != want {
+		t.Fatalf("HKDF session key changed across the stdlib migration:\n got=%s\nwant=%s\n(secret/salt order likely flipped — this splits the cluster)", got, want)
+	}
+}
+
+// TestDeriveReplicationSessionKey_BothSidesAgree confirms both peers derive the
+// same key from the same (secret, nonce) — the invariant cluster replication
+// auth depends on — and that a different nonce yields a different key.
+func TestDeriveReplicationSessionKey_BothSidesAgree(t *testing.T) {
+	a, err := DeriveReplicationSessionKey("s", "n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := DeriveReplicationSessionKey("s", "n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(a) != hex.EncodeToString(b) {
+		t.Fatal("same inputs derived different keys — peers would not agree")
+	}
+	c, err := DeriveReplicationSessionKey("s", "n2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(a) == hex.EncodeToString(c) {
+		t.Fatal("different nonce derived same key — nonce not contributing to derivation")
+	}
+}
