@@ -80,6 +80,66 @@ func stripURLScheme(endpoint string) string {
 	return strings.TrimRight(endpoint, "/")
 }
 
+// arcS3SecretName is the stable name of the DuckDB secret that holds Arc's S3
+// credentials. A single fixed name lets the runtime tiering reconfigure path
+// (DuckDB.ConfigureS3) overwrite the same secret via CREATE OR REPLACE rather
+// than accumulating conflicting secrets.
+const arcS3SecretName = "arc_s3"
+
+// buildS3SecretSQL builds a `CREATE OR REPLACE SECRET <name> (TYPE S3, ...)`
+// statement from the provided S3 parameters. Using DuckDB's secrets manager
+// (instead of `SET GLOBAL s3_secret_access_key`) keeps the secret out of
+// current_setting(): the value is unreadable via SQL and redacted in
+// duckdb_secrets(), closing the exfiltration path where any authenticated query
+// user could `SELECT current_setting('s3_secret_access_key')`.
+//
+// The secret is TEMPORARY by default (no PERSISTENT keyword): it lives in-memory
+// for the life of the DuckDB instance and is visible to every pooled connection,
+// matching the old SET GLOBAL behavior. PERSISTENT must NOT be used — it would
+// write the key unencrypted to ~/.duckdb/stored_secrets.
+//
+// accessKey/secretKey/region/endpoint are escaped (single quotes doubled);
+// pathStyle and useSSL are program-controlled and emitted as bare enum/bool
+// literals. region/endpoint are only included when non-empty. The endpoint is
+// scheme-stripped internally via stripURLScheme, so callers may pass a raw
+// "https://host:port" value. Callers must supply non-empty accessKey/secretKey:
+// empty values produce a non-functional empty-credentials secret (no fallback
+// to the AWS credential chain).
+func buildS3SecretSQL(accessKey, secretKey, region, endpoint string, pathStyle, useSSL bool) string {
+	var b strings.Builder
+	b.WriteString("CREATE OR REPLACE SECRET ")
+	b.WriteString(arcS3SecretName)
+	b.WriteString(" (\n\tTYPE S3,\n\tKEY_ID '")
+	b.WriteString(escapeSQLString(accessKey))
+	b.WriteString("',\n\tSECRET '")
+	b.WriteString(escapeSQLString(secretKey))
+	b.WriteString("'")
+	if region != "" {
+		b.WriteString(",\n\tREGION '")
+		b.WriteString(escapeSQLString(region))
+		b.WriteString("'")
+	}
+	if endpoint != "" {
+		b.WriteString(",\n\tENDPOINT '")
+		b.WriteString(escapeSQLString(stripURLScheme(endpoint)))
+		b.WriteString("'")
+	}
+	urlStyle := "vhost"
+	if pathStyle {
+		urlStyle = "path"
+	}
+	b.WriteString(",\n\tURL_STYLE '")
+	b.WriteString(urlStyle)
+	b.WriteString("',\n\tUSE_SSL ")
+	if useSSL {
+		b.WriteString("true")
+	} else {
+		b.WriteString("false")
+	}
+	b.WriteString("\n)")
+	return b.String()
+}
+
 // Config holds DuckDB configuration
 type Config struct {
 	MaxConnections int
@@ -403,8 +463,11 @@ func verifyArcxLoaded(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	return nil
 }
 
-// configureS3Access sets up the httpfs extension for S3 access
-// Note: We use SET GLOBAL to ensure settings persist across all connections in the pool
+// configureS3Access sets up the httpfs extension for S3 access.
+// S3 credentials are stored in DuckDB's secrets manager via CREATE SECRET (not
+// SET GLOBAL) so the secret key cannot be read back through the query API via
+// current_setting(); see buildS3SecretSQL. The secret is instance-scoped and
+// therefore visible to every connection in the pool, like the old SET GLOBAL.
 func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	// Install and load the httpfs extension
 	if _, err := db.Exec("INSTALL httpfs"); err != nil {
@@ -414,45 +477,13 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		return fmt.Errorf("failed to load httpfs: %w", err)
 	}
 
-	// Set S3 credentials using GLOBAL scope to persist across connections
-	// Note: credentials are escaped to prevent SQL injection
-	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_access_key_id='%s'", escapeSQLString(cfg.S3AccessKey))); err != nil {
-		return fmt.Errorf("failed to set s3_access_key_id: %w", err)
-	}
-	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_secret_access_key='%s'", escapeSQLString(cfg.S3SecretKey))); err != nil {
-		return fmt.Errorf("failed to set s3_secret_access_key: %w", err)
-	}
-
-	// Set S3 region
-	if cfg.S3Region != "" {
-		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_region='%s'", escapeSQLString(cfg.S3Region))); err != nil {
-			return fmt.Errorf("failed to set s3_region: %w", err)
-		}
-	}
-
-	// Set custom endpoint for MinIO or S3-compatible services
-	if cfg.S3Endpoint != "" {
-		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", escapeSQLString(stripURLScheme(cfg.S3Endpoint)))); err != nil {
-			return fmt.Errorf("failed to set s3_endpoint: %w", err)
-		}
-	}
-
-	// Set URL style (path-style for MinIO, virtual-hosted for AWS S3)
-	urlStyle := "vhost"
-	if cfg.S3PathStyle {
-		urlStyle = "path"
-	}
-	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_url_style='%s'", urlStyle)); err != nil {
-		return fmt.Errorf("failed to set s3_url_style: %w", err)
-	}
-
-	// Set SSL usage
-	useSSL := "true"
-	if !cfg.S3UseSSL {
-		useSSL = "false"
-	}
-	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_use_ssl=%s", useSSL)); err != nil {
-		return fmt.Errorf("failed to set s3_use_ssl: %w", err)
+	// Store S3 credentials + endpoint config in the secrets manager. Must run
+	// after LOAD httpfs (which registers the S3 secret type). CREATE SECRET is a
+	// catalog op and is NOT gated by enable_external_access, so order relative to
+	// the sandbox lockdown is immaterial; we run it here for locality.
+	secretSQL := buildS3SecretSQL(cfg.S3AccessKey, cfg.S3SecretKey, cfg.S3Region, cfg.S3Endpoint, cfg.S3PathStyle, cfg.S3UseSSL)
+	if _, err := db.Exec(secretSQL); err != nil {
+		return fmt.Errorf("failed to create S3 secret: %w", err)
 	}
 
 	if _, err := db.Exec("SET GLOBAL prefetch_all_parquet_files=true"); err != nil {
@@ -540,49 +571,15 @@ type S3Config struct {
 // ConfigureS3 reconfigures DuckDB's S3 settings at runtime.
 // This is useful when tiered storage uses different S3 credentials than the main storage.
 // The httpfs extension must already be loaded.
+//
+// Credentials go into the secrets manager via CREATE OR REPLACE SECRET (same
+// arc_s3 name as the startup path, so this overwrites in place). This runs after
+// the sandbox lockdown (enable_external_access=false); CREATE SECRET is a catalog
+// operation and is not gated by that flag.
 func (d *DuckDB) ConfigureS3(s3cfg *S3Config) error {
-	// Set S3 credentials (escaped to prevent SQL injection)
-	if s3cfg.AccessKey != "" {
-		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_access_key_id='%s'", escapeSQLString(s3cfg.AccessKey))); err != nil {
-			return fmt.Errorf("failed to set s3_access_key_id: %w", err)
-		}
-	}
-	if s3cfg.SecretKey != "" {
-		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_secret_access_key='%s'", escapeSQLString(s3cfg.SecretKey))); err != nil {
-			return fmt.Errorf("failed to set s3_secret_access_key: %w", err)
-		}
-	}
-
-	// Set S3 region
-	if s3cfg.Region != "" {
-		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_region='%s'", escapeSQLString(s3cfg.Region))); err != nil {
-			return fmt.Errorf("failed to set s3_region: %w", err)
-		}
-	}
-
-	// Set custom endpoint for MinIO or S3-compatible services
-	if s3cfg.Endpoint != "" {
-		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", escapeSQLString(stripURLScheme(s3cfg.Endpoint)))); err != nil {
-			return fmt.Errorf("failed to set s3_endpoint: %w", err)
-		}
-	}
-
-	// Set URL style (path-style for MinIO, virtual-hosted for AWS S3)
-	urlStyle := "vhost"
-	if s3cfg.PathStyle {
-		urlStyle = "path"
-	}
-	if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_url_style='%s'", urlStyle)); err != nil {
-		return fmt.Errorf("failed to set s3_url_style: %w", err)
-	}
-
-	// Set SSL usage
-	useSSL := "true"
-	if !s3cfg.UseSSL {
-		useSSL = "false"
-	}
-	if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_use_ssl=%s", useSSL)); err != nil {
-		return fmt.Errorf("failed to set s3_use_ssl: %w", err)
+	secretSQL := buildS3SecretSQL(s3cfg.AccessKey, s3cfg.SecretKey, s3cfg.Region, s3cfg.Endpoint, s3cfg.PathStyle, s3cfg.UseSSL)
+	if _, err := d.db.Exec(secretSQL); err != nil {
+		return fmt.Errorf("failed to create S3 secret: %w", err)
 	}
 
 	d.logger.Info().
@@ -655,7 +652,7 @@ func configureAzureAccess(db *sql.DB, cfg *Config, logger zerolog.Logger) error 
 			escapeSQLString(cfg.AzureAccountName),
 			escapeSQLString(cfg.AzureAccountKey))
 		secretSQL = fmt.Sprintf(`
-			CREATE SECRET azure_secret (
+			CREATE OR REPLACE SECRET azure_secret (
 				TYPE AZURE,
 				CONNECTION_STRING '%s'
 			)
@@ -663,7 +660,7 @@ func configureAzureAccess(db *sql.DB, cfg *Config, logger zerolog.Logger) error 
 	} else {
 		// Fall back to credential chain if no account key
 		secretSQL = fmt.Sprintf(`
-			CREATE SECRET azure_secret (
+			CREATE OR REPLACE SECRET azure_secret (
 				TYPE AZURE,
 				PROVIDER CREDENTIAL_CHAIN,
 				ACCOUNT_NAME '%s'

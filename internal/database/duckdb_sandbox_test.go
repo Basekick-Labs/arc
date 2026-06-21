@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -375,5 +376,60 @@ func TestSandboxEmptyAllowlistLogsButDoesNotPanic(t *testing.T) {
 	// File access against any path must fail.
 	if _, err := db.DB().Query("SELECT * FROM read_parquet('/etc/passwd') LIMIT 1"); err == nil {
 		t.Error("read_parquet on /etc/passwd succeeded — empty-allowlist sandbox did not lock down")
+	}
+}
+
+// TestS3SecretNotReadable is the H3 regression: an S3 secret created via
+// buildS3SecretSQL must NOT be readable through the query API. Before the fix,
+// credentials were `SET GLOBAL s3_secret_access_key=…`, which any authenticated
+// principal could read with `SELECT current_setting('s3_secret_access_key')`.
+// Requires httpfs (registers the S3 secret type); skips if it can't be loaded
+// (e.g. offline CI with no extension repo access).
+func TestS3SecretNotReadable(t *testing.T) {
+	ctx := context.Background()
+
+	// Open a raw DuckDB (NOT the sandbox fixture): we need to INSTALL/LOAD
+	// httpfs, which is blocked once enable_external_access=false. This mirrors
+	// startup ordering (extensions load before lockdown).
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.ExecContext(ctx, "INSTALL httpfs"); err != nil {
+		t.Skipf("httpfs unavailable (offline / cold extension cache): %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "LOAD httpfs"); err != nil {
+		t.Skipf("httpfs load failed: %v", err)
+	}
+
+	const secretVal = "SUPER-SECRET-KEY-do-not-leak"
+	secretSQL := buildS3SecretSQL("AKIATEST", secretVal, "us-east-1", "", false, true)
+	if _, err := db.ExecContext(ctx, secretSQL); err != nil {
+		t.Fatalf("create S3 secret: %v", err)
+	}
+
+	// 1) current_setting() must NOT return the secret key. With the secret in
+	//    the secrets manager (never SET GLOBAL), the setting is empty/NULL.
+	var got sql.NullString
+	if err := db.QueryRowContext(ctx,
+		"SELECT current_setting('s3_secret_access_key')").Scan(&got); err != nil {
+		t.Fatalf("current_setting query: %v", err)
+	}
+	if got.Valid && got.String == secretVal {
+		t.Fatalf("SECURITY: secret key leaked via current_setting('s3_secret_access_key'): %q", got.String)
+	}
+
+	// 2) duckdb_secrets() must redact the secret value (it may show KEY_ID; the
+	//    secret access key must not appear in the rendered secret_string).
+	var name, secretString string
+	if err := db.QueryRowContext(ctx,
+		"SELECT name, secret_string FROM duckdb_secrets() WHERE name = '"+arcS3SecretName+"'").
+		Scan(&name, &secretString); err != nil {
+		t.Fatalf("duckdb_secrets query: %v", err)
+	}
+	if strings.Contains(secretString, secretVal) {
+		t.Fatalf("SECURITY: secret key leaked via duckdb_secrets(): %q", secretString)
 	}
 }

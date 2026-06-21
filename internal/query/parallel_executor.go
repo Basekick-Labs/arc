@@ -193,8 +193,10 @@ LaunchLoop:
 
 // buildPartitionQuery builds a query for a single partition.
 func (e *ParallelExecutor) buildPartitionQuery(template, path, options string) string {
-	// Build read_parquet expression for this partition
-	readParquet := fmt.Sprintf("read_parquet('%s', %s)", path, options)
+	// Build read_parquet expression for this partition. Escape single quotes:
+	// DuckDB read_parquet() paths cannot be parameterized, so the path is
+	// interpolated into a SQL string literal. (options is program-built.)
+	readParquet := fmt.Sprintf("read_parquet('%s', %s)", strings.ReplaceAll(path, "'", "''"), options)
 
 	// Replace placeholder in template
 	return strings.Replace(template, "{PARTITION_PATH}", readParquet, 1)

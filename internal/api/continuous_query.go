@@ -14,6 +14,7 @@ import (
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/ingest"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -692,7 +693,9 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	// Skip if the source measurement name matches a CTE name (it's a virtual table reference)
 	wrappedQuery := query
 	if !cteNames[strings.ToLower(cq.SourceMeasurement)] {
-		readParquetExpr := fmt.Sprintf("read_parquet('%s', union_by_name=true)", measurementPath)
+		// Escape single quotes: DuckDB read_parquet() paths cannot be
+		// parameterized, so the path is interpolated into a SQL string literal.
+		readParquetExpr := fmt.Sprintf("read_parquet('%s', union_by_name=true)", sqlutil.EscapeStringLiteral(measurementPath))
 		// Match FROM database.measurement (e.g., FROM production.cpu)
 		dbMeasurementPattern := regexp.MustCompile(`(?i)\bFROM\s+` + regexp.QuoteMeta(cq.Database) + `\.` + regexp.QuoteMeta(cq.SourceMeasurement) + `\b`)
 		wrappedQuery = dbMeasurementPattern.ReplaceAllString(query, "FROM "+readParquetExpr)
