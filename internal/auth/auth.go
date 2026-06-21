@@ -465,11 +465,24 @@ const pbkdf2Prefix = "$pbkdf2-sha256$"
 // miss path.
 const pbkdf2Iterations = 600_000
 
+// pbkdf2MaxIterations bounds the iteration count accepted at verify time. A
+// value above this can only come from a corrupted or hostile hash (verifying
+// it would be a CPU-DoS vector — e.g. a rogue cluster node proposing a
+// TokenEntry with a huge iter). The ceiling is well above pbkdf2Iterations so
+// raising the minting cost later still verifies.
+const pbkdf2MaxIterations = 10_000_000
+
 // pbkdf2KeyLen is the derived-key length in bytes (256-bit).
 const pbkdf2KeyLen = 32
 
 // pbkdf2SaltLen is the per-token random salt length in bytes.
 const pbkdf2SaltLen = 16
+
+// pbkdf2MaxEncodedLen bounds the total length of a $pbkdf2-sha256$ encoded hash
+// accepted at verify time. A well-formed hash is ~80 bytes; 128 is generous
+// headroom. This is a cheap O(1) guard applied before any Atoi/base64 decode so
+// an oversized hostile hash cannot force large allocations or scans.
+const pbkdf2MaxEncodedLen = 128
 
 // hashToken generates a PBKDF2-HMAC-SHA256 hash of the token for storage.
 //
@@ -517,21 +530,40 @@ func (am *AuthManager) verifyTokenHash(token, hash string) bool {
 // verifyPBKDF2TokenHash parses and verifies a $pbkdf2-sha256$ encoded hash in
 // constant time. A malformed encoding returns false (fail closed).
 func verifyPBKDF2TokenHash(token, hash string) bool {
+	// Cheap length guard FIRST, before any Atoi/base64 decode. A well-formed
+	// hash is ~80 bytes (10-digit iter + 24-char b64 salt + 48-char b64 key +
+	// separators). Rejecting oversized input up front prevents an attacker-
+	// supplied hash (e.g. a rogue cluster-proposed TokenEntry persisted to
+	// SQLite) from forcing a multi-megabyte base64 decode or Atoi scan on every
+	// matching auth attempt — the allocation/CPU happens BEFORE the semantic
+	// length checks below would reject it.
+	if len(hash) > pbkdf2MaxEncodedLen {
+		return false
+	}
 	rest := strings.TrimPrefix(hash, pbkdf2Prefix)
 	parts := strings.Split(rest, "$")
 	if len(parts) != 3 {
 		return false
 	}
+	// Bound the iteration count. hashToken always writes pbkdf2Iterations, so a
+	// value far above that can only come from a corrupted or hostile hash
+	// (e.g. a rogue cluster node proposing a TokenEntry with a huge iter).
+	// Verifying it would burn CPU — cap it to bound the work. The ceiling is
+	// generous (well above pbkdf2Iterations) so a future increase to the
+	// minting cost still verifies.
 	iter, err := strconv.Atoi(parts[0])
-	if err != nil || iter <= 0 {
+	if err != nil || iter <= 0 || iter > pbkdf2MaxIterations {
 		return false
 	}
+	// Pin salt and key lengths to what hashToken emits. This rejects malformed
+	// hashes early and prevents a hostile hash from forcing oversized
+	// allocations / derivations.
 	salt, err := base64.RawStdEncoding.DecodeString(parts[1])
-	if err != nil {
+	if err != nil || len(salt) != pbkdf2SaltLen {
 		return false
 	}
 	want, err := base64.RawStdEncoding.DecodeString(parts[2])
-	if err != nil {
+	if err != nil || len(want) != pbkdf2KeyLen {
 		return false
 	}
 	got, err := pbkdf2.Key(sha256.New, token, salt, iter, len(want))

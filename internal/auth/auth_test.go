@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"strings"
@@ -638,10 +639,39 @@ func TestVerifyTokenHash(t *testing.T) {
 			pbkdf2Prefix + "notanint$c2FsdA$aGFzaA", // bad iter
 			pbkdf2Prefix + "600000$@@@$aGFzaA",      // bad salt b64
 			pbkdf2Prefix + "600000$c2FsdA$@@@",      // bad hash b64
+			pbkdf2Prefix + "0$c2FsdA$aGFzaA",        // zero iter
 		} {
 			if am.verifyTokenHash("any", bad) {
 				t.Errorf("malformed hash %q should not verify", bad)
 			}
+		}
+	})
+
+	// A hostile hash with an absurd iteration count or wrong salt/key lengths
+	// must fail closed BEFORE doing the expensive derivation (CPU-DoS guard,
+	// relevant to rogue cluster-proposed TokenEntry values).
+	t.Run("pbkdf2 abusive parameters fail closed", func(t *testing.T) {
+		token := "dos-token"
+		good, err := am.hashToken(token)
+		if err != nil {
+			t.Fatalf("hashToken: %v", err)
+		}
+		parts := strings.Split(strings.TrimPrefix(good, pbkdf2Prefix), "$")
+		// Tamper only the iteration count to far above the accepted ceiling.
+		abusiveIter := pbkdf2Prefix + "999999999$" + parts[1] + "$" + parts[2]
+		if am.verifyTokenHash(token, abusiveIter) {
+			t.Error("hash with iter above the ceiling must fail closed")
+		}
+		// Oversized salt (correct b64, wrong length).
+		bigSalt := pbkdf2Prefix + "600000$" + base64.RawStdEncoding.EncodeToString(make([]byte, 1024)) + "$" + parts[2]
+		if am.verifyTokenHash(token, bigSalt) {
+			t.Error("hash with wrong-length salt must fail closed")
+		}
+		// Multi-megabyte hash must be rejected by the upfront length guard
+		// WITHOUT decoding it (memory-amplification guard).
+		huge := pbkdf2Prefix + "600000$" + strings.Repeat("A", 8<<20) + "$" + parts[2]
+		if am.verifyTokenHash(token, huge) {
+			t.Error("oversized hash must fail closed via the length guard")
 		}
 	})
 

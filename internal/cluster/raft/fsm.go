@@ -1429,8 +1429,18 @@ func validateTokenEntry(entry *TokenEntry) error {
 	if entry.TokenHash == "" {
 		return fmt.Errorf("token hash is required")
 	}
+	// Cap the hash length so a rogue proposer cannot persist a multi-megabyte
+	// TokenHash into every node's FSM + SQLite, which would then force large
+	// allocations on each matching auth verify. Legitimate hashes are small:
+	// bcrypt 60, legacy sha256 64, PBKDF2 ~80. 512 is generous headroom.
+	if len(entry.TokenHash) > 512 {
+		return fmt.Errorf("token hash too long: %d > 512", len(entry.TokenHash))
+	}
 	if entry.TokenPrefix == "" {
 		return fmt.Errorf("token prefix is required")
+	}
+	if len(entry.TokenPrefix) > 256 {
+		return fmt.Errorf("token prefix too long: %d > 256", len(entry.TokenPrefix))
 	}
 	if err := validatePermissionString(entry.Permissions); err != nil {
 		return err

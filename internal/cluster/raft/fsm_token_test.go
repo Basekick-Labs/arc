@@ -3,6 +3,7 @@ package raft
 import (
 	"bytes"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/raft"
@@ -110,6 +111,24 @@ func TestApplyCreateToken_RejectsMissingHash(t *testing.T) {
 	result := fsm.Apply(&raft.Log{Data: cmd, Index: 1})
 	if result == nil {
 		t.Fatal("missing hash should be rejected")
+	}
+	if fsm.RejectedTokensCount() != 1 {
+		t.Errorf("rejection counter should bump: got %d", fsm.RejectedTokensCount())
+	}
+}
+
+func TestApplyCreateToken_RejectsOversizedHash(t *testing.T) {
+	// A rogue proposer must not be able to persist a multi-megabyte TokenHash
+	// into every node's FSM + SQLite (it would force large allocations on each
+	// matching auth verify). validateTokenEntry caps the hash at 512 bytes.
+	fsm := newTestFSMWithBootstrapNode(t)
+	tok := makeTokenEntry("admin")
+	tok.TokenHash = strings.Repeat("A", 8<<20) // 8 MB
+	cmd := makeTokenCommand(t, CommandCreateToken, CreateTokenPayload{Token: tok})
+
+	result := fsm.Apply(&raft.Log{Data: cmd, Index: 1})
+	if result == nil {
+		t.Fatal("oversized hash should be rejected")
 	}
 	if fsm.RejectedTokensCount() != 1 {
 		t.Errorf("rejection counter should bump: got %d", fsm.RejectedTokensCount())

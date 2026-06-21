@@ -36,7 +36,11 @@ build-fips: ## Build the FIPS 140-3 variant (arc-fips) against the certified Go 
 
 fips-check: ## Verify the fips build links no non-FIPS crypto (x/crypto/bcrypt, x/crypto/hkdf)
 	@echo "Checking fips build import graph for non-approved crypto..."
-	@if $(GO) list $(FIPS_GOFLAGS) -deps $(MAIN_PATH) 2>/dev/null | grep -E 'golang.org/x/crypto/(bcrypt|hkdf)'; then \
+	@out=$$($(GO) list $(FIPS_GOFLAGS) -deps $(MAIN_PATH) 2>&1); \
+	if [ $$? -ne 0 ]; then \
+		echo "ERROR: go list failed (fips build does not compile?):"; echo "$$out"; exit 1; \
+	fi; \
+	if echo "$$out" | grep -E 'golang.org/x/crypto/(bcrypt|hkdf)'; then \
 		echo "ERROR: fips build pulls in non-FIPS crypto above"; exit 1; \
 	else \
 		echo "OK: no x/crypto/bcrypt or x/crypto/hkdf in the fips build"; \

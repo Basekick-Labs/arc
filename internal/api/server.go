@@ -532,6 +532,14 @@ func (s *Server) Start() error {
 // whose tls.Config is restricted to FIPS-approved versions, cipher suites, and
 // curves (see fips.HardenTLSConfig). Used instead of Fiber's app.ListenTLS so
 // Arc — not Fiber — owns the public API's TLS policy.
+//
+// NextProtos advertises ONLY "http/1.1" over ALPN. Fiber's engine (fasthttp)
+// is HTTP/1.1-only — it does not implement HTTP/2 server-side, and Fiber's own
+// ListenTLS sets no h2 ALPN either — so advertising "h2" here would let a
+// client negotiate a protocol the server cannot speak. Setting "http/1.1"
+// explicitly matches what a default TLS server negotiates and avoids that
+// mismatch. (The h2 references elsewhere in Arc are the outbound net/http
+// clients for S3/cluster, not this server.)
 func (s *Server) hardenedTLSListener(addr string) (net.Listener, error) {
 	cert, err := tls.LoadX509KeyPair(s.tlsCert, s.tlsKey)
 	if err != nil {
@@ -539,6 +547,7 @@ func (s *Server) hardenedTLSListener(addr string) (net.Listener, error) {
 	}
 	tlsCfg := fips.HardenTLSConfig(&tls.Config{
 		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"http/1.1"},
 	})
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
