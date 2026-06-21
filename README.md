@@ -235,6 +235,30 @@ go build -tags=duckdb_arrow ./cmd/arc
 ./arc
 ```
 
+### FIPS 140-3 Build
+
+For US defense/federal and other regulated environments, Arc ships an optional
+**`arc-fips`** build: the same source at the same version, compiled against the
+CMVP-certified Go Cryptographic Module and run in FIPS-only mode. Pick the
+`-fips` artifact instead of the standard one.
+
+```bash
+# Binary — download arc-fips-linux-amd64 (or -arm64) from the release
+# Container — same repos, -fips tag suffix:
+docker run -d -p 8000:8000 -v arc-data:/app/data ghcr.io/basekick-labs/arc:VERSION-fips
+# or basekicklabs/arc:VERSION-fips
+
+# Build from source:
+make build-fips      # -> arc-fips (GOFIPS140=v1.0.0, -tags=duckdb_arrow,fips)
+```
+
+The FIPS build reports the same version as the standard build and logs
+`"fips_mode":true` at startup. **Cutover note:** existing bcrypt-hashed API
+tokens must be rotated when moving to the FIPS build (it stores new tokens with
+PBKDF2 and fails bcrypt verification closed). The Go Cryptographic Module is
+CMVP-certified; Arc itself is not a CMVP-listed module. See the
+[FIPS 140-3 mode guide](https://docs.basekick.net/docs/configuration/fips).
+
 ---
 
 ## Ecosystem & Integrations
@@ -267,6 +291,8 @@ go build -tags=duckdb_arrow ./cmd/arc
 - **Data Management**: GDPR-compliant delete operations
 - **Observability**: Prometheus metrics, structured logging, graceful shutdown
 - **Reliability**: Circuit breakers, retry with exponential backoff
+- **Supply chain**: SBOM (SPDX + CycloneDX), Trivy scans, cosign-signed releases, SLSA L3 provenance
+- **FIPS 140-3**: Optional `arc-fips` build against the CMVP-certified Go Cryptographic Module — see [Installation](#fips-140-3-build)
 - **Edge Sync** (coming 26.09.1): Spoke-to-hub data transport for disconnected operations
 
 ---

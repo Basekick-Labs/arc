@@ -2,10 +2,10 @@ package auth
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"encoding/base64"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -616,41 +616,67 @@ func TestVerifyTokenHash(t *testing.T) {
 	am, cleanup := setupTestAuthManager(t)
 	defer cleanup()
 
-	t.Run("bcrypt hash", func(t *testing.T) {
-		token := "test-token-bcrypt"
+	t.Run("pbkdf2 round-trip", func(t *testing.T) {
+		token := "test-token-pbkdf2"
 		hash, err := am.hashToken(token)
 		if err != nil {
 			t.Fatalf("hashToken failed: %v", err)
 		}
-
-		if !am.verifyTokenHash(token, hash) {
-			t.Error("verifyTokenHash should return true for valid bcrypt hash")
+		if !strings.HasPrefix(hash, pbkdf2Prefix) {
+			t.Errorf("hashToken should emit a %s hash, got %q", pbkdf2Prefix, hash)
 		}
-
+		if !am.verifyTokenHash(token, hash) {
+			t.Error("verifyTokenHash should return true for valid PBKDF2 hash")
+		}
 		if am.verifyTokenHash("wrong-token", hash) {
 			t.Error("verifyTokenHash should return false for wrong token")
 		}
 	})
 
-	t.Run("sha256 legacy hash", func(t *testing.T) {
-		token := "legacy-token"
-		// Compute SHA256 hash like legacy Python code
-		h := sha256Sum(token)
-
-		if !am.verifyTokenHash(token, h) {
-			t.Error("verifyTokenHash should return true for valid SHA256 hash")
-		}
-
-		if am.verifyTokenHash("wrong-token", h) {
-			t.Error("verifyTokenHash should return false for wrong token")
+	t.Run("malformed pbkdf2 fails closed", func(t *testing.T) {
+		for _, bad := range []string{
+			pbkdf2Prefix,                            // no fields
+			pbkdf2Prefix + "notanint$c2FsdA$aGFzaA", // bad iter
+			pbkdf2Prefix + "600000$@@@$aGFzaA",      // bad salt b64
+			pbkdf2Prefix + "600000$c2FsdA$@@@",      // bad hash b64
+			pbkdf2Prefix + "0$c2FsdA$aGFzaA",        // zero iter
+		} {
+			if am.verifyTokenHash("any", bad) {
+				t.Errorf("malformed hash %q should not verify", bad)
+			}
 		}
 	})
-}
 
-// sha256Sum computes SHA256 hex digest (like legacy Python code)
-func sha256Sum(s string) string {
-	h := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(h[:])
+	// A hostile hash with an absurd iteration count or wrong salt/key lengths
+	// must fail closed BEFORE doing the expensive derivation (CPU-DoS guard,
+	// relevant to rogue cluster-proposed TokenEntry values).
+	t.Run("pbkdf2 abusive parameters fail closed", func(t *testing.T) {
+		token := "dos-token"
+		good, err := am.hashToken(token)
+		if err != nil {
+			t.Fatalf("hashToken: %v", err)
+		}
+		parts := strings.Split(strings.TrimPrefix(good, pbkdf2Prefix), "$")
+		// Tamper only the iteration count to far above the accepted ceiling.
+		abusiveIter := pbkdf2Prefix + "999999999$" + parts[1] + "$" + parts[2]
+		if am.verifyTokenHash(token, abusiveIter) {
+			t.Error("hash with iter above the ceiling must fail closed")
+		}
+		// Oversized salt (correct b64, wrong length).
+		bigSalt := pbkdf2Prefix + "600000$" + base64.RawStdEncoding.EncodeToString(make([]byte, 1024)) + "$" + parts[2]
+		if am.verifyTokenHash(token, bigSalt) {
+			t.Error("hash with wrong-length salt must fail closed")
+		}
+		// Multi-megabyte hash must be rejected by the upfront length guard
+		// WITHOUT decoding it (memory-amplification guard).
+		huge := pbkdf2Prefix + "600000$" + strings.Repeat("A", 8<<20) + "$" + parts[2]
+		if am.verifyTokenHash(token, huge) {
+			t.Error("oversized hash must fail closed via the length guard")
+		}
+	})
+
+	// Legacy bcrypt/sha256 verification behavior is build-variant-specific and
+	// asserted in auth_hash_legacy_test.go (!fips) and auth_hash_fips_test.go (fips).
 }
 
 // TestCreateTokenWithValue tests creating a token with a user-supplied value

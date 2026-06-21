@@ -3,6 +3,7 @@ package raft
 import (
 	"bytes"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/raft"
@@ -110,6 +111,24 @@ func TestApplyCreateToken_RejectsMissingHash(t *testing.T) {
 	result := fsm.Apply(&raft.Log{Data: cmd, Index: 1})
 	if result == nil {
 		t.Fatal("missing hash should be rejected")
+	}
+	if fsm.RejectedTokensCount() != 1 {
+		t.Errorf("rejection counter should bump: got %d", fsm.RejectedTokensCount())
+	}
+}
+
+func TestApplyCreateToken_RejectsOversizedHash(t *testing.T) {
+	// A rogue proposer must not be able to persist a multi-megabyte TokenHash
+	// into every node's FSM + SQLite (it would force large allocations on each
+	// matching auth verify). validateTokenEntry caps the hash at 512 bytes.
+	fsm := newTestFSMWithBootstrapNode(t)
+	tok := makeTokenEntry("admin")
+	tok.TokenHash = strings.Repeat("A", 8<<20) // 8 MB
+	cmd := makeTokenCommand(t, CommandCreateToken, CreateTokenPayload{Token: tok})
+
+	result := fsm.Apply(&raft.Log{Data: cmd, Index: 1})
+	if result == nil {
+		t.Fatal("oversized hash should be rejected")
 	}
 	if fsm.RejectedTokensCount() != 1 {
 		t.Errorf("rejection counter should bump: got %d", fsm.RejectedTokensCount())
@@ -433,6 +452,27 @@ func TestApplyRotateToken_RejectsMissingFields(t *testing.T) {
 	})
 	if r := fsm.Apply(&raft.Log{Data: rotateCmd, Index: 2}); r == nil {
 		t.Fatal("rotate with empty new_hash should be rejected")
+	}
+}
+
+// A rogue rotate command must not be able to replace a small hash with a
+// multi-megabyte one (it would bloat every node's FSM + SQLite). The rotate
+// path enforces the same length caps as create (validateTokenHashAndPrefix).
+func TestApplyRotateToken_RejectsOversizedHash(t *testing.T) {
+	fsm := newTestFSMWithBootstrapNode(t)
+	fsm.Apply(&raft.Log{Data: makeTokenCommand(t, CommandCreateToken, CreateTokenPayload{Token: makeTokenEntry("svc")}), Index: 1})
+
+	rotateCmd := makeTokenCommand(t, CommandRotateToken, RotateTokenPayload{
+		ID:        1,
+		NewHash:   strings.Repeat("A", 8<<20), // 8 MB
+		NewPrefix: "new-prefix",
+	})
+	if r := fsm.Apply(&raft.Log{Data: rotateCmd, Index: 2}); r == nil {
+		t.Fatal("rotate with oversized new_hash should be rejected")
+	}
+	// The original (small) hash must be unchanged.
+	if got := fsm.GetTokenByID(1); got == nil || len(got.TokenHash) > maxTokenHashLen {
+		t.Errorf("oversized hash should not have been applied")
 	}
 }
 

@@ -1,10 +1,19 @@
-.PHONY: help build test run clean install deps fmt lint
+.PHONY: help build build-fips test test-fips run clean install deps fmt lint fips-check
 
 # Variables
 BINARY_NAME=arc
 GO=go
 GOFLAGS=-v -tags=duckdb_arrow
 MAIN_PATH=./cmd/arc
+
+# FIPS build variant. Same source/commit/version as the standard build — only
+# the build tag and the GOFIPS140 module selection differ. GOFIPS140=v1.0.0 is
+# the CMVP-certified Go Cryptographic Module snapshot (see
+# $(shell go env GOROOT)/lib/fips140/certified.txt). The fips tag enables
+# fail-closed legacy-token verification and bakes in GODEBUG=fips140=only.
+FIPS_BINARY_NAME=arc-fips
+FIPS_GOFLAGS=-v -tags=duckdb_arrow,fips
+GOFIPS140_VERSION=v1.0.0
 
 help: ## Show this help message
 	@echo 'Usage: make [target]'
@@ -22,11 +31,29 @@ install: ## Install dependencies (alias for deps)
 build: ## Build the binary
 	$(GO) build $(GOFLAGS) -o $(BINARY_NAME) $(MAIN_PATH)
 
+build-fips: ## Build the FIPS 140-3 variant (arc-fips) against the certified Go module
+	GOFIPS140=$(GOFIPS140_VERSION) CGO_ENABLED=1 $(GO) build $(FIPS_GOFLAGS) -o $(FIPS_BINARY_NAME) $(MAIN_PATH)
+
+fips-check: ## Verify the fips build links no non-FIPS crypto (x/crypto/bcrypt, x/crypto/hkdf)
+	@echo "Checking fips build import graph for non-approved crypto..."
+	@out=$$($(GO) list $(FIPS_GOFLAGS) -deps $(MAIN_PATH) 2>&1); \
+	if [ $$? -ne 0 ]; then \
+		echo "ERROR: go list failed (fips build does not compile?):"; echo "$$out"; exit 1; \
+	fi; \
+	if echo "$$out" | grep -E 'golang.org/x/crypto/(bcrypt|hkdf)'; then \
+		echo "ERROR: fips build pulls in non-FIPS crypto above"; exit 1; \
+	else \
+		echo "OK: no x/crypto/bcrypt or x/crypto/hkdf in the fips build"; \
+	fi
+
 run: ## Run Arc directly (without building)
 	$(GO) run $(GOFLAGS) $(MAIN_PATH)
 
 test: ## Run all tests
 	$(GO) test $(GOFLAGS) -race -coverprofile=coverage.out ./...
+
+test-fips: ## Run all tests with the fips build tag (exercises fail-closed paths)
+	$(GO) test $(FIPS_GOFLAGS) ./...
 
 test-coverage: test ## Run tests with coverage report
 	$(GO) tool cover -html=coverage.out
@@ -43,6 +70,7 @@ lint: ## Run linter (requires golangci-lint)
 
 clean: ## Clean build artifacts
 	rm -f $(BINARY_NAME)
+	rm -f $(FIPS_BINARY_NAME)
 	rm -f coverage.out
 	rm -rf ./data/arc/*
 

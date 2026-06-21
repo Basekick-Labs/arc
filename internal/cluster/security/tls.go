@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/config"
+	"github.com/basekick-labs/arc/internal/fips"
 )
 
 // ClusterTLSConfig creates a tls.Config from ClusterConfig.
@@ -39,10 +40,14 @@ func ClusterTLSConfig(cfg *config.ClusterConfig) (*tls.Config, error) {
 		}
 	}
 
-	tlsCfg := &tls.Config{
+	// HardenTLSConfig sets the TLS 1.2 floor in both build variants (the
+	// pre-existing behavior, formerly an explicit MinVersion literal here) and,
+	// in the fips build only, restricts cipher suites and curves to the
+	// FIPS-approved set. The default build keeps Go's default ciphers/curves.
+	// Certificates are passed in so they are preserved.
+	tlsCfg := fips.HardenTLSConfig(&tls.Config{
 		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
-	}
+	})
 
 	if cfg.TLSCAFile != "" {
 		caCert, err := os.ReadFile(cfg.TLSCAFile)

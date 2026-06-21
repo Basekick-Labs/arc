@@ -15,6 +15,7 @@ import (
 	pahomqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/rs/zerolog"
 
+	"github.com/basekick-labs/arc/internal/fips"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/pkg/models"
@@ -217,10 +218,21 @@ func (s *Subscriber) buildClientOptions() (*pahomqtt.ClientOptions, error) {
 
 // buildTLSConfig creates TLS configuration
 func (s *Subscriber) buildTLSConfig() (*tls.Config, error) {
-	tlsConfig := &tls.Config{
-		MinVersion:         tls.VersionTLS12,
-		InsecureSkipVerify: s.config.TLSInsecureSkipVerify,
+	// In the FIPS build, refuse to disable certificate verification: skipping
+	// verification defeats the trust chain and is not an acceptable posture for
+	// a FIPS/STIG deployment (it is a configuration risk, not an algorithm one,
+	// so GODEBUG=fips140=only would not catch it — we enforce it here).
+	if fips.BuildTagged && s.config.TLSInsecureSkipVerify {
+		return nil, fmt.Errorf("mqtt: tls_insecure_skip_verify is not permitted in the FIPS build; provide a valid CA via tls_ca_path")
 	}
+
+	// HardenTLSConfig sets the TLS 1.2 floor in both builds (pre-existing
+	// behavior) and, in the fips build only, pins FIPS-approved ciphers/curves.
+	// The fields below (InsecureSkipVerify, RootCAs, Certificates) are layered
+	// on after so they are preserved.
+	tlsConfig := fips.HardenTLSConfig(&tls.Config{
+		InsecureSkipVerify: s.config.TLSInsecureSkipVerify, //nolint:gosec // guarded above in FIPS build; operator opt-in otherwise
+	})
 
 	// Load CA certificate if provided
 	if s.config.TLSCAPath != "" {

@@ -227,16 +227,20 @@ type BatchFileOpsPayload struct {
 // This is the authoritative record of a token's existence, used by every node's
 // AuthManager to materialise its local SQLite cache via the FSM apply callbacks.
 //
-// Plaintext secrecy invariant: only TokenHash (bcrypt) and TokenPrefix (SHA256
-// prefix used for the indexed lookup) are stored. The plaintext token value
-// never lands in the Raft log — the proposer returns it directly to its caller
-// before the command is marshalled. Same posture as today's CreateToken.
+// Plaintext secrecy invariant: only TokenHash (PBKDF2-HMAC-SHA256; or a legacy
+// bcrypt/sha256 hash for tokens created before the FIPS migration) and
+// TokenPrefix (SHA256 prefix used for the indexed lookup) are stored. The
+// plaintext token value never lands in the Raft log — the proposer returns it
+// directly to its caller before the command is marshalled. Same posture as
+// today's CreateToken. The hash is an opaque string here (format not
+// validated), so PBKDF2 and legacy hashes replicate identically; a FIPS node
+// fails legacy-hash verification closed (see auth.verifyTokenHash).
 type TokenEntry struct {
 	ID                int64  `json:"id"`                             // Raft log index at create time (deterministic across nodes)
 	Name              string `json:"name"`                           // Human-readable name; UNIQUE in api_tokens
 	Description       string `json:"description,omitempty"`          // Optional free-text
 	Permissions       string `json:"permissions"`                    // Comma-separated: "read,write,delete,admin"
-	TokenHash         string `json:"token_hash"`                     // bcrypt hash of the plaintext token
+	TokenHash         string `json:"token_hash"`                     // PBKDF2 hash (or legacy bcrypt/sha256) of the plaintext token
 	TokenPrefix       string `json:"token_prefix"`                   // SHA256(token)[:16] for indexed lookup
 	CreatedAtUnixNano int64  `json:"created_at_unix_nano"`           // Proposer-set; deterministic across log replay
 	ExpiresAtUnixNano int64  `json:"expires_at_unix_nano,omitempty"` // 0 = no expiry
@@ -1407,10 +1411,43 @@ func (f *ClusterFSM) rejectToken(op string, id int64, logIndex uint64, err error
 //
 // Checks (cheapest first):
 //   - Name non-empty and length-bounded (avoid a DOS via 1GB names).
-//   - TokenHash non-empty (we never accept tokens without a bcrypt hash —
-//     the plaintext path is proposer-side only).
+//   - TokenHash non-empty (we never accept tokens without a hash —
+//     the plaintext path is proposer-side only). Format is not checked here;
+//     PBKDF2 and legacy bcrypt/sha256 hashes are all opaque to this validator.
 //   - TokenPrefix non-empty (required for the indexed lookup).
 //   - Permissions contains only the allowed verbs.
+//
+// Token field length caps. Legitimate hashes are small (bcrypt 60, legacy
+// sha256 64, PBKDF2 ~80); the caps are generous headroom whose purpose is to
+// stop a rogue Raft proposer from persisting a multi-megabyte hash/prefix into
+// every node's FSM + SQLite (which would force large allocations on each
+// matching auth verify and bloat snapshots). Enforced on BOTH the create and
+// rotate apply paths via validateTokenHashAndPrefix.
+const (
+	maxTokenHashLen   = 512
+	maxTokenPrefixLen = 256
+)
+
+// validateTokenHashAndPrefix enforces the non-empty + length-cap invariants for
+// a token's hash and prefix. Shared by validateTokenEntry (create/restore) and
+// applyRotateToken so the two paths cannot drift — a missing cap on rotate was
+// a real gap (a rotate could replace a small hash with a 10MB one).
+func validateTokenHashAndPrefix(hash, prefix string) error {
+	if hash == "" {
+		return fmt.Errorf("token hash is required")
+	}
+	if len(hash) > maxTokenHashLen {
+		return fmt.Errorf("token hash too long: %d > %d", len(hash), maxTokenHashLen)
+	}
+	if prefix == "" {
+		return fmt.Errorf("token prefix is required")
+	}
+	if len(prefix) > maxTokenPrefixLen {
+		return fmt.Errorf("token prefix too long: %d > %d", len(prefix), maxTokenPrefixLen)
+	}
+	return nil
+}
+
 func validateTokenEntry(entry *TokenEntry) error {
 	if entry == nil {
 		return fmt.Errorf("token entry is nil")
@@ -1421,11 +1458,8 @@ func validateTokenEntry(entry *TokenEntry) error {
 	if len(entry.Name) > 256 {
 		return fmt.Errorf("token name too long: %d > 256", len(entry.Name))
 	}
-	if entry.TokenHash == "" {
-		return fmt.Errorf("token hash is required")
-	}
-	if entry.TokenPrefix == "" {
-		return fmt.Errorf("token prefix is required")
+	if err := validateTokenHashAndPrefix(entry.TokenHash, entry.TokenPrefix); err != nil {
+		return err
 	}
 	if err := validatePermissionString(entry.Permissions); err != nil {
 		return err
@@ -1749,8 +1783,11 @@ func (f *ClusterFSM) applyRotateToken(payload []byte, logIndex uint64) interface
 	if p.ID == 0 {
 		return f.rejectToken("rotate", 0, logIndex, fmt.Errorf("token id is required"))
 	}
-	if p.NewHash == "" || p.NewPrefix == "" {
-		return f.rejectToken("rotate", p.ID, logIndex, fmt.Errorf("new_hash and new_prefix are required"))
+	// Same non-empty + length-cap validation the create/restore path enforces,
+	// so a rogue rotate command cannot replace a small hash/prefix with a
+	// multi-megabyte one that would bloat every node's FSM + SQLite.
+	if err := validateTokenHashAndPrefix(p.NewHash, p.NewPrefix); err != nil {
+		return f.rejectToken("rotate", p.ID, logIndex, err)
 	}
 
 	f.mu.Lock()

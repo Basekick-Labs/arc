@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/fips"
 	"github.com/basekick-labs/arc/internal/logger"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/gofiber/fiber/v2"
@@ -498,7 +500,22 @@ func (s *Server) Start() error {
 				Str("cert_file", s.tlsCert).
 				Str("key_file", s.tlsKey).
 				Msg("TLS enabled - starting HTTPS server")
-			err = s.app.ListenTLS(addr, s.tlsCert, s.tlsKey)
+			if fips.BuildTagged {
+				// FIPS build only: build our own TLS listener instead of
+				// Fiber's app.ListenTLS (which constructs an opaque tls.Config
+				// we cannot influence). fips.HardenTLSConfig pins FIPS-approved
+				// versions/cipher-suites/curves — the only way to control the
+				// public API's negotiated suites for an auditor-defensible FIPS
+				// posture. The default build keeps Fiber's ListenTLS unchanged
+				// so standard-build TLS behavior is untouched.
+				var ln net.Listener
+				ln, err = s.hardenedTLSListener(addr)
+				if err == nil {
+					err = s.app.Listener(ln)
+				}
+			} else {
+				err = s.app.ListenTLS(addr, s.tlsCert, s.tlsKey)
+			}
 		} else {
 			err = s.app.Listen(addr)
 		}
@@ -509,6 +526,34 @@ func (s *Server) Start() error {
 	}()
 
 	return nil
+}
+
+// hardenedTLSListener loads the server keypair and returns a TLS net.Listener
+// whose tls.Config is restricted to FIPS-approved versions, cipher suites, and
+// curves (see fips.HardenTLSConfig). Used instead of Fiber's app.ListenTLS so
+// Arc — not Fiber — owns the public API's TLS policy.
+//
+// NextProtos advertises ONLY "http/1.1" over ALPN. Fiber's engine (fasthttp)
+// is HTTP/1.1-only — it does not implement HTTP/2 server-side, and Fiber's own
+// ListenTLS sets no h2 ALPN either — so advertising "h2" here would let a
+// client negotiate a protocol the server cannot speak. Setting "http/1.1"
+// explicitly matches what a default TLS server negotiates and avoids that
+// mismatch. (The h2 references elsewhere in Arc are the outbound net/http
+// clients for S3/cluster, not this server.)
+func (s *Server) hardenedTLSListener(addr string) (net.Listener, error) {
+	cert, err := tls.LoadX509KeyPair(s.tlsCert, s.tlsKey)
+	if err != nil {
+		return nil, fmt.Errorf("load API TLS keypair: %w", err)
+	}
+	tlsCfg := fips.HardenTLSConfig(&tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"http/1.1"},
+	})
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("listen on %s: %w", addr, err)
+	}
+	return tls.NewListener(ln, tlsCfg), nil
 }
 
 // Shutdown gracefully shuts down the server
