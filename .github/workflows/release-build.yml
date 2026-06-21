@@ -280,6 +280,27 @@ jobs:
           cosign sign --yes "${{ env.REGISTRY_DOCKERHUB }}/${{ env.IMAGE_NAME_DOCKERHUB }}@${DIGEST}"
           echo "✅ FIPS images signed (digest ${DIGEST}) on GHCR + Docker Hub" >> $GITHUB_STEP_SUMMARY
 
+      # Smoke-test the FIPS IMAGE (not just the binary): boot the just-pushed
+      # GHCR image by digest (amd64 — the runner arch) and assert the running
+      # container reports FIPS mode active. Catches packaging defects (wrong
+      # binary baked, missing runtime libs) that the binary-level checks can't.
+      - name: Smoke test FIPS image (fips_mode active)
+        env:
+          IMAGE_REF: ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}@${{ steps.build_fips.outputs.digest }}
+        run: |
+          docker run -d --name arc-fips-smoke --platform linux/amd64 \
+            -e ARC_LOG_FORMAT=json "${IMAGE_REF}"
+          sleep 8
+          docker logs arc-fips-smoke > fips-image-boot.log 2>&1 || true
+          docker rm -f arc-fips-smoke >/dev/null 2>&1 || true
+          echo "---- FIPS image startup log ----"
+          head -5 fips-image-boot.log || true
+          if ! grep -q '"fips_mode":true' fips-image-boot.log; then
+            echo "::error::FIPS image did not report fips_mode=true at startup"
+            exit 1
+          fi
+          echo "✅ FIPS image booted with FIPS mode active" >> $GITHUB_STEP_SUMMARY
+
   # Build Go binaries using native runners (CGO required for SQLite).
   #
   # The matrix has two dimensions: architecture (amd64/arm64) x variant
@@ -446,7 +467,12 @@ jobs:
           HASHES=$(base64 -w0 sha256sums.txt)
           echo "hashes=${HASHES}" >> $GITHUB_OUTPUT
 
-  # Build Debian packages
+  # Build Debian packages (standard + FIPS variants).
+  #
+  # The FIPS package is named "arc-fips" and declares Conflicts: arc /
+  # Provides: arc / Replaces: arc — it installs the same /usr/bin/arc and
+  # arc.service, so an operator installs exactly one of the two. The binary
+  # inside is the arc-fips build (GOFIPS140, fips tag).
   debian-build:
     name: Build Debian Package
     runs-on: ubuntu-latest
@@ -456,8 +482,16 @@ jobs:
         include:
           - arch: amd64
             binary_suffix: linux-amd64
+            variant: standard
           - arch: arm64
             binary_suffix: linux-arm64
+            variant: standard
+          - arch: amd64
+            binary_suffix: linux-amd64
+            variant: fips
+          - arch: arm64
+            binary_suffix: linux-arm64
+            variant: fips
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -465,23 +499,34 @@ jobs:
       - name: Download binary
         uses: actions/download-artifact@v7
         with:
-          name: arc-binary-standard-${{ matrix.binary_suffix }}
+          name: arc-binary-${{ matrix.variant }}-${{ matrix.binary_suffix }}
 
       - name: Build Debian package
         run: |
           VERSION=${{ needs.prepare.outputs.version }}
           ARCH=${{ matrix.arch }}
+          VARIANT=${{ matrix.variant }}
+
+          # Package name + the on-disk binary name differ by variant. The FIPS
+          # binary artifact is arc-fips-<suffix>; the standard one is arc-<suffix>.
+          if [ "$VARIANT" = "fips" ]; then
+            PKG_NAME="arc-fips"
+            SRC_BIN="arc-fips-${{ matrix.binary_suffix }}"
+          else
+            PKG_NAME="arc"
+            SRC_BIN="arc-${{ matrix.binary_suffix }}"
+          fi
 
           # Create package directory structure
-          PKG_DIR="arc_${VERSION}_${ARCH}"
+          PKG_DIR="${PKG_NAME}_${VERSION}_${ARCH}"
           mkdir -p ${PKG_DIR}/DEBIAN
           mkdir -p ${PKG_DIR}/usr/bin
           mkdir -p ${PKG_DIR}/etc/arc
           mkdir -p ${PKG_DIR}/lib/systemd/system
           mkdir -p ${PKG_DIR}/var/lib/arc
 
-          # Copy binary
-          cp arc-${{ matrix.binary_suffix }} ${PKG_DIR}/usr/bin/arc
+          # Copy binary (always installed as /usr/bin/arc, same service)
+          cp "${SRC_BIN}" ${PKG_DIR}/usr/bin/arc
           chmod +x ${PKG_DIR}/usr/bin/arc
 
           # Copy config
@@ -510,16 +555,23 @@ jobs:
           WantedBy=multi-user.target
           SERVICE
 
-          # Create control file
+          # Create control file. The FIPS package conflicts with / provides /
+          # replaces the standard "arc" package (same binary path + service), so
+          # an operator installs exactly one of the two.
+          if [ "$VARIANT" = "fips" ]; then
+            DESC_SUFFIX=" (FIPS 140-3 build)"
+          else
+            DESC_SUFFIX=""
+          fi
           cat > ${PKG_DIR}/DEBIAN/control << EOF
-          Package: arc
+          Package: ${PKG_NAME}
           Version: ${VERSION}
           Section: database
           Priority: optional
           Architecture: ${ARCH}
           Depends: libc6
           Maintainer: Basekick Labs <contact@basekick.com>
-          Description: Arc - High-Performance Time-Series Database
+          Description: Arc - High-Performance Time-Series Database${DESC_SUFFIX}
            Arc is a high-performance time-series database built on DuckDB,
            optimized for IoT, observability, and analytics workloads.
            .
@@ -527,6 +579,13 @@ jobs:
            Parquet storage, S3/MinIO support.
           Homepage: https://github.com/basekick-labs/arc
           EOF
+
+          # For the FIPS variant, insert coexistence fields after Depends
+          # (single targeted insert — no blank-line surgery on the description,
+          # which uses the " ." paragraph separator).
+          if [ "$VARIANT" = "fips" ]; then
+            sed -i '/^Depends:/a Conflicts: arc\nProvides: arc\nReplaces: arc' ${PKG_DIR}/DEBIAN/control
+          fi
 
           # Create postinst script
           cat > ${PKG_DIR}/DEBIAN/postinst << 'POSTINST'
@@ -574,13 +633,16 @@ jobs:
       - name: Upload Debian package
         uses: actions/upload-artifact@v6
         with:
-          name: arc-debian-${{ matrix.arch }}-${{ needs.prepare.outputs.version }}
+          name: arc-debian-${{ matrix.variant }}-${{ matrix.arch }}-${{ needs.prepare.outputs.version }}
           path: |
             *.deb
             *.deb.sha256
           retention-days: 7
 
-  # Build RPM packages
+  # Build RPM packages (standard + FIPS variants).
+  #
+  # The FIPS package is named "arc-fips" and declares Conflicts/Obsoletes/
+  # Provides: arc — same /usr/bin/arc + arc.service, so exactly one installs.
   rpm-build:
     name: Build RPM Package
     runs-on: ubuntu-latest
@@ -590,8 +652,16 @@ jobs:
         include:
           - arch: x86_64
             binary_suffix: linux-amd64
+            variant: standard
           - arch: aarch64
             binary_suffix: linux-arm64
+            variant: standard
+          - arch: x86_64
+            binary_suffix: linux-amd64
+            variant: fips
+          - arch: aarch64
+            binary_suffix: linux-arm64
+            variant: fips
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -604,22 +674,31 @@ jobs:
       - name: Download binary
         uses: actions/download-artifact@v7
         with:
-          name: arc-binary-standard-${{ matrix.binary_suffix }}
+          name: arc-binary-${{ matrix.variant }}-${{ matrix.binary_suffix }}
 
       - name: Build RPM package
         run: |
           VERSION=${{ needs.prepare.outputs.version }}
           ARCH=${{ matrix.arch }}
+          VARIANT=${{ matrix.variant }}
+
+          if [ "$VARIANT" = "fips" ]; then
+            PKG_NAME="arc-fips"
+            SRC_BIN="arc-fips-${{ matrix.binary_suffix }}"
+          else
+            PKG_NAME="arc"
+            SRC_BIN="arc-${{ matrix.binary_suffix }}"
+          fi
 
           # Create RPM build structure
           mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
 
-          # Create source tarball
-          mkdir -p arc-${VERSION}
-          cp arc-${{ matrix.binary_suffix }} arc-${VERSION}/arc
-          chmod +x arc-${VERSION}/arc
-          cp arc.toml arc-${VERSION}/
-          tar -czf ~/rpmbuild/SOURCES/arc-${VERSION}.tar.gz arc-${VERSION}
+          # Create source tarball (dir is named after the package so %setup works)
+          mkdir -p ${PKG_NAME}-${VERSION}
+          cp "${SRC_BIN}" ${PKG_NAME}-${VERSION}/arc
+          chmod +x ${PKG_NAME}-${VERSION}/arc
+          cp arc.toml ${PKG_NAME}-${VERSION}/
+          tar -czf ~/rpmbuild/SOURCES/${PKG_NAME}-${VERSION}.tar.gz ${PKG_NAME}-${VERSION}
 
           # Create systemd service in SOURCES
           cat > ~/rpmbuild/SOURCES/arc.service << 'SERVICE'
@@ -642,15 +721,24 @@ jobs:
           WantedBy=multi-user.target
           SERVICE
 
+          # FIPS package coexistence directives (empty for standard). Kept on a
+          # single physical line each; emitted only for the FIPS variant so the
+          # standard spec has no extra/blank header lines.
+          if [ "$VARIANT" = "fips" ]; then
+            SUMMARY_SUFFIX=" (FIPS 140-3 build)"
+          else
+            SUMMARY_SUFFIX=""
+          fi
+
           # Create spec file
-          cat > ~/rpmbuild/SPECS/arc.spec << EOF
-          Name:           arc
+          cat > ~/rpmbuild/SPECS/${PKG_NAME}.spec << EOF
+          Name:           ${PKG_NAME}
           Version:        ${VERSION}
           Release:        1%{?dist}
-          Summary:        High-Performance Time-Series Database
+          Summary:        High-Performance Time-Series Database${SUMMARY_SUFFIX}
           License:        AGPL-3.0
           URL:            https://github.com/basekick-labs/arc
-          Source0:        arc-${VERSION}.tar.gz
+          Source0:        ${PKG_NAME}-${VERSION}.tar.gz
           Source1:        arc.service
 
           %description
@@ -703,19 +791,26 @@ jobs:
           - Release ${VERSION}
           EOF
 
+          # For the FIPS variant, insert coexistence tags right after Source1
+          # (a single targeted insert — avoids any blank-line surgery on the
+          # spec body, which has legitimate blank separators).
+          if [ "$VARIANT" = "fips" ]; then
+            sed -i '/^Source1:/a Conflicts:      arc\nObsoletes:      arc\nProvides:       arc' ~/rpmbuild/SPECS/${PKG_NAME}.spec
+          fi
+
           # Build RPM
-          rpmbuild -ba --target ${ARCH} ~/rpmbuild/SPECS/arc.spec
+          rpmbuild -ba --target ${ARCH} ~/rpmbuild/SPECS/${PKG_NAME}.spec
 
           # Copy to current directory
-          cp ~/rpmbuild/RPMS/${ARCH}/arc-${VERSION}-1.*.rpm .
+          cp ~/rpmbuild/RPMS/${ARCH}/${PKG_NAME}-${VERSION}-1.*.rpm .
 
           # Create checksum
-          sha256sum arc-${VERSION}-1.*.rpm > arc-${VERSION}-1.${ARCH}.rpm.sha256
+          sha256sum ${PKG_NAME}-${VERSION}-1.*.rpm > ${PKG_NAME}-${VERSION}-1.${ARCH}.rpm.sha256
 
       - name: Upload RPM package
         uses: actions/upload-artifact@v6
         with:
-          name: arc-rpm-${{ matrix.arch }}-${{ needs.prepare.outputs.version }}
+          name: arc-rpm-${{ matrix.variant }}-${{ matrix.arch }}-${{ needs.prepare.outputs.version }}
           path: |
             *.rpm
             *.rpm.sha256
@@ -835,7 +930,7 @@ jobs:
   vuln-scan:
     name: Vulnerability Scan
     runs-on: ubuntu-latest
-    needs: [prepare, docker-merge]
+    needs: [prepare, docker-merge, docker-build-fips]
     permissions:
       contents: read
       packages: read
@@ -878,18 +973,38 @@ jobs:
           path: arc-${{ needs.prepare.outputs.version }}-trivy-report.json
           retention-days: 7
 
+      # Scan the FIPS image too (M2). Same OS layers as the standard image, but
+      # the binary differs — attach a separate JSON report so the FIPS variant
+      # ships its own scan evidence for a prime/auditor.
+      - name: Run Trivy on FIPS image (JSON — release artifact)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }}-fips
+          format: json
+          output: arc-${{ needs.prepare.outputs.version }}-fips-trivy-report.json
+          severity: CRITICAL,HIGH,MEDIUM
+          exit-code: '0'
+
+      - name: Upload FIPS Trivy report
+        uses: actions/upload-artifact@v6
+        with:
+          name: arc-fips-trivy-${{ needs.prepare.outputs.version }}
+          path: arc-${{ needs.prepare.outputs.version }}-fips-trivy-report.json
+          retention-days: 7
+
       - name: Summary
         run: |
           VERSION=${{ needs.prepare.outputs.version }}
           echo "## Vulnerability Scan" >> $GITHUB_STEP_SUMMARY
           echo "- Trivy report: \`arc-${VERSION}-trivy-report.json\`" >> $GITHUB_STEP_SUMMARY
+          echo "- FIPS Trivy report: \`arc-${VERSION}-fips-trivy-report.json\`" >> $GITHUB_STEP_SUMMARY
           echo "- SARIF uploaded to GitHub Security tab" >> $GITHUB_STEP_SUMMARY
 
   # Generate SBOM artifacts for supply-chain compliance (EO 14028 / SLSA)
   sbom:
     name: Generate SBOM
     runs-on: ubuntu-latest
-    needs: [prepare, docker-merge]
+    needs: [prepare, docker-merge, docker-build-fips]
     permissions:
       contents: read
       packages: read
@@ -914,8 +1029,21 @@ jobs:
           output-file: arc-${{ needs.prepare.outputs.version }}-sbom-container.spdx.json
           format: spdx-json
 
+      # FIPS container SBOM (L1): same OS layers as the standard image, but the
+      # binary differs — ship a distinct SPDX so the FIPS image has its own
+      # bill of materials for a prime/auditor.
+      - name: Generate FIPS container SBOM (SPDX JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }}-fips
+          artifact-name: arc-${{ needs.prepare.outputs.version }}-fips-sbom-container.spdx.json
+          output-file: arc-${{ needs.prepare.outputs.version }}-fips-sbom-container.spdx.json
+          format: spdx-json
+
       # Source SBOM: Go module graph — complements the container scan by naming
-      # every Go dependency with its exact version and license expression.
+      # every Go dependency with its exact version and license expression. The
+      # module graph is identical for both variants (same go.mod), so one source
+      # SBOM covers standard and FIPS.
       - name: Generate source SBOM (CycloneDX JSON)
         uses: anchore/sbom-action@v0
         with:
@@ -930,6 +1058,7 @@ jobs:
           name: arc-sbom-${{ needs.prepare.outputs.version }}
           path: |
             arc-${{ needs.prepare.outputs.version }}-sbom-container.spdx.json
+            arc-${{ needs.prepare.outputs.version }}-fips-sbom-container.spdx.json
             arc-${{ needs.prepare.outputs.version }}-sbom-source.cyclonedx.json
           retention-days: 7
 
@@ -938,6 +1067,7 @@ jobs:
           VERSION=${{ needs.prepare.outputs.version }}
           echo "## SBOM Generated" >> $GITHUB_STEP_SUMMARY
           echo "- \`arc-${VERSION}-sbom-container.spdx.json\` — container image (SPDX)" >> $GITHUB_STEP_SUMMARY
+          echo "- \`arc-${VERSION}-fips-sbom-container.spdx.json\` — FIPS container image (SPDX)" >> $GITHUB_STEP_SUMMARY
           echo "- \`arc-${VERSION}-sbom-source.cyclonedx.json\` — Go module graph (CycloneDX)" >> $GITHUB_STEP_SUMMARY
 
   # Test Docker image health

@@ -1416,6 +1416,38 @@ func (f *ClusterFSM) rejectToken(op string, id int64, logIndex uint64, err error
 //     PBKDF2 and legacy bcrypt/sha256 hashes are all opaque to this validator.
 //   - TokenPrefix non-empty (required for the indexed lookup).
 //   - Permissions contains only the allowed verbs.
+//
+// Token field length caps. Legitimate hashes are small (bcrypt 60, legacy
+// sha256 64, PBKDF2 ~80); the caps are generous headroom whose purpose is to
+// stop a rogue Raft proposer from persisting a multi-megabyte hash/prefix into
+// every node's FSM + SQLite (which would force large allocations on each
+// matching auth verify and bloat snapshots). Enforced on BOTH the create and
+// rotate apply paths via validateTokenHashAndPrefix.
+const (
+	maxTokenHashLen   = 512
+	maxTokenPrefixLen = 256
+)
+
+// validateTokenHashAndPrefix enforces the non-empty + length-cap invariants for
+// a token's hash and prefix. Shared by validateTokenEntry (create/restore) and
+// applyRotateToken so the two paths cannot drift — a missing cap on rotate was
+// a real gap (a rotate could replace a small hash with a 10MB one).
+func validateTokenHashAndPrefix(hash, prefix string) error {
+	if hash == "" {
+		return fmt.Errorf("token hash is required")
+	}
+	if len(hash) > maxTokenHashLen {
+		return fmt.Errorf("token hash too long: %d > %d", len(hash), maxTokenHashLen)
+	}
+	if prefix == "" {
+		return fmt.Errorf("token prefix is required")
+	}
+	if len(prefix) > maxTokenPrefixLen {
+		return fmt.Errorf("token prefix too long: %d > %d", len(prefix), maxTokenPrefixLen)
+	}
+	return nil
+}
+
 func validateTokenEntry(entry *TokenEntry) error {
 	if entry == nil {
 		return fmt.Errorf("token entry is nil")
@@ -1426,21 +1458,8 @@ func validateTokenEntry(entry *TokenEntry) error {
 	if len(entry.Name) > 256 {
 		return fmt.Errorf("token name too long: %d > 256", len(entry.Name))
 	}
-	if entry.TokenHash == "" {
-		return fmt.Errorf("token hash is required")
-	}
-	// Cap the hash length so a rogue proposer cannot persist a multi-megabyte
-	// TokenHash into every node's FSM + SQLite, which would then force large
-	// allocations on each matching auth verify. Legitimate hashes are small:
-	// bcrypt 60, legacy sha256 64, PBKDF2 ~80. 512 is generous headroom.
-	if len(entry.TokenHash) > 512 {
-		return fmt.Errorf("token hash too long: %d > 512", len(entry.TokenHash))
-	}
-	if entry.TokenPrefix == "" {
-		return fmt.Errorf("token prefix is required")
-	}
-	if len(entry.TokenPrefix) > 256 {
-		return fmt.Errorf("token prefix too long: %d > 256", len(entry.TokenPrefix))
+	if err := validateTokenHashAndPrefix(entry.TokenHash, entry.TokenPrefix); err != nil {
+		return err
 	}
 	if err := validatePermissionString(entry.Permissions); err != nil {
 		return err
@@ -1764,8 +1783,11 @@ func (f *ClusterFSM) applyRotateToken(payload []byte, logIndex uint64) interface
 	if p.ID == 0 {
 		return f.rejectToken("rotate", 0, logIndex, fmt.Errorf("token id is required"))
 	}
-	if p.NewHash == "" || p.NewPrefix == "" {
-		return f.rejectToken("rotate", p.ID, logIndex, fmt.Errorf("new_hash and new_prefix are required"))
+	// Same non-empty + length-cap validation the create/restore path enforces,
+	// so a rogue rotate command cannot replace a small hash/prefix with a
+	// multi-megabyte one that would bloat every node's FSM + SQLite.
+	if err := validateTokenHashAndPrefix(p.NewHash, p.NewPrefix); err != nil {
+		return f.rejectToken("rotate", p.ID, logIndex, err)
 	}
 
 	f.mu.Lock()
