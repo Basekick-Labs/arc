@@ -410,10 +410,19 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		logger.Warn().Err(err).Msg("Failed to set preserve_insertion_order")
 	}
 
-	// Configure httpfs extension for S3 access if credentials are provided
+	// Configure httpfs extension + primary S3 secret if primary storage uses S3.
 	if cfg.S3AccessKey != "" && cfg.S3SecretKey != "" {
 		if err := configureS3Access(db, cfg, logger); err != nil {
 			return fmt.Errorf("failed to configure S3 access: %w", err)
+		}
+	} else if cfg.ColdS3Bucket != "" {
+		// Primary storage is not S3, but a cold tier targets S3. httpfs must be
+		// loaded at startup (before the sandbox lockdown blocks INSTALL/LOAD) so
+		// the runtime ConfigureS3 cold-tier secret can use the S3 secret type.
+		// No primary secret is created here — cold-tier credentials are applied
+		// later via ConfigureS3.
+		if err := ensureHTTPFSLoaded(db); err != nil {
+			return fmt.Errorf("failed to load httpfs for cold-tier S3: %w", err)
 		}
 	}
 
@@ -483,18 +492,31 @@ func verifyArcxLoaded(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	return nil
 }
 
-// configureS3Access sets up the httpfs extension for S3 access.
-// S3 credentials are stored in DuckDB's secrets manager via CREATE SECRET (not
-// SET GLOBAL) so the secret key cannot be read back through the query API via
-// current_setting(); see buildS3SecretSQL. The secret is instance-scoped and
-// therefore visible to every connection in the pool, like the old SET GLOBAL.
-func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
-	// Install and load the httpfs extension
+// ensureHTTPFSLoaded installs and loads the httpfs extension. httpfs registers
+// the S3 secret type, so it MUST be loaded before any CREATE SECRET (TYPE S3) —
+// including the runtime cold-tier secret created by ConfigureS3 — and before the
+// sandbox lockdown (enable_external_access=false blocks INSTALL/LOAD). Loading
+// httpfs is idempotent, so calling this for both primary and cold-tier S3 is
+// safe.
+func ensureHTTPFSLoaded(db *sql.DB) error {
 	if _, err := db.Exec("INSTALL httpfs"); err != nil {
 		return fmt.Errorf("failed to install httpfs: %w", err)
 	}
 	if _, err := db.Exec("LOAD httpfs"); err != nil {
 		return fmt.Errorf("failed to load httpfs: %w", err)
+	}
+	return nil
+}
+
+// configureS3Access sets up the httpfs extension and the primary-storage S3
+// secret. S3 credentials are stored in DuckDB's secrets manager via CREATE
+// SECRET (not SET GLOBAL) so the secret key cannot be read back through the
+// query API via current_setting(); see buildS3SecretSQL. The secret is
+// instance-scoped and therefore visible to every connection in the pool, like
+// the old SET GLOBAL.
+func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
+	if err := ensureHTTPFSLoaded(db); err != nil {
+		return err
 	}
 
 	// Store S3 credentials + endpoint config in the secrets manager. Must run
@@ -593,7 +615,11 @@ type S3Config struct {
 
 // ConfigureS3 reconfigures DuckDB's S3 settings at runtime.
 // This is useful when tiered storage uses different S3 credentials than the main storage.
-// The httpfs extension must already be loaded.
+//
+// httpfs must already be loaded: configureDatabase loads it at startup whenever
+// primary OR cold storage uses S3 (see the ColdS3Bucket branch), which is before
+// the sandbox lockdown blocks INSTALL/LOAD. This is the only thing that makes the
+// CREATE SECRET (TYPE S3) below work on a local-primary + S3-cold deployment.
 //
 // Credentials go into the secrets manager via CREATE OR REPLACE SECRET (same
 // arc_s3 name as the startup path, so this overwrites in place). This runs after

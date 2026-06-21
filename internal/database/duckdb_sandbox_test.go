@@ -436,3 +436,48 @@ func TestS3SecretNotReadable(t *testing.T) {
 		t.Fatalf("SECURITY: secret key leaked via duckdb_secrets(): %q", secretString)
 	}
 }
+
+// TestColdTierS3SecretWithLocalPrimary reproduces the local-primary + S3-cold
+// critical bug: configureS3Access only ran when PRIMARY S3 keys were set, so on a
+// local-primary deployment httpfs was never loaded, and the runtime cold-tier
+// ConfigureS3 → CREATE SECRET (TYPE S3) failed ("Secret type 'S3' not found")
+// — made worse because the sandbox lockdown blocks loading httpfs at runtime.
+// The fix loads httpfs at startup whenever ColdS3Bucket is set. This test runs
+// the real New() startup path (which locks down the sandbox) with no primary S3
+// but a cold bucket, then exercises ConfigureS3.
+func TestColdTierS3SecretWithLocalPrimary(t *testing.T) {
+	tmp := t.TempDir()
+	storageRoot := filepath.Join(tmp, "data")
+	if err := os.MkdirAll(storageRoot, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	cfg := &Config{
+		MaxConnections:   2,
+		MemoryLimit:      "256MB",
+		LocalStorageRoot: storageRoot,
+		TempDirectory:    tmp,
+		// No primary S3 credentials; cold tier targets S3.
+		ColdS3Bucket: "cold-bucket",
+	}
+	db, err := New(cfg, zerolog.Nop())
+	if err != nil {
+		// New runs INSTALL/LOAD httpfs; skip if the extension cache is cold
+		// (offline CI). A non-httpfs error is a real failure.
+		if strings.Contains(err.Error(), "httpfs") {
+			t.Skipf("httpfs unavailable (offline?): %v", err)
+		}
+		t.Fatalf("New: %v", err)
+	}
+	defer db.Close()
+
+	// Runtime cold-tier configuration must succeed — httpfs was pre-loaded at
+	// startup, so the S3 secret type is registered even though primary is local
+	// and the sandbox is locked down.
+	if err := db.ConfigureS3(&S3Config{
+		Region:    "us-east-1",
+		AccessKey: "AKIACOLD",
+		SecretKey: "coldsecret",
+	}); err != nil {
+		t.Fatalf("ConfigureS3 on local-primary + S3-cold failed (httpfs not pre-loaded?): %v", err)
+	}
+}
