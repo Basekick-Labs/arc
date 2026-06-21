@@ -228,6 +228,17 @@ func TestBuildS3SecretSQL(t *testing.T) {
 		}
 	})
 
+	t.Run("malformed endpoint strips to empty -> omitted", func(t *testing.T) {
+		// "http://" strips to "" and must not emit an empty ENDPOINT '' clause.
+		got, err := buildS3SecretSQL("k", "s", "us-east-1", "http://", false, true)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if strings.Contains(got, "ENDPOINT") {
+			t.Errorf("endpoint that strips to empty should be omitted, got:\n%s", got)
+		}
+	})
+
 	t.Run("single quotes are escaped", func(t *testing.T) {
 		// A secret key or region containing a quote must not break out of the
 		// SQL string literal.

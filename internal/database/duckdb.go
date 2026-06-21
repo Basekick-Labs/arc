@@ -139,9 +139,12 @@ func buildS3SecretSQL(accessKey, secretKey, region, endpoint string, pathStyle, 
 		b.WriteString(escapeSQLString(region))
 		b.WriteString("'")
 	}
-	if endpoint != "" {
+	// Check the stripped value, not the raw endpoint: a malformed config like
+	// "http://" or whitespace strips to "" and must be treated as "no endpoint"
+	// rather than emitting an empty ENDPOINT '' clause.
+	if stripped := stripURLScheme(endpoint); stripped != "" {
 		b.WriteString(",\n\tENDPOINT '")
-		b.WriteString(escapeSQLString(stripURLScheme(endpoint)))
+		b.WriteString(escapeSQLString(stripped))
 		b.WriteString("'")
 	}
 	urlStyle := "vhost"
