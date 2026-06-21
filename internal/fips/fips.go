@@ -4,7 +4,8 @@
 //
 // Arc ships two build variants. The default build is unchanged. The "fips"
 // build (built with -tags=fips and GOFIPS140=v1.0.0) bakes in
-// GODEBUG=fips140=only via a //go:debug directive (see fips_enabled.go), runs
+// GODEBUG=fips140=only via a //go:debug directive (see cmd/arc/fips.go, which
+// is in package main where //go:debug takes effect), runs
 // against the CMVP-certified Go Cryptographic Module, and fails closed on
 // non-approved code paths (legacy token hashes, InsecureSkipVerify, etc.).
 //
