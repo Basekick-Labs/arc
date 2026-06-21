@@ -264,7 +264,7 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 	}
 
 	s3Enabled := cfg.S3AccessKey != "" && cfg.S3SecretKey != ""
-	azureEnabled := cfg.AzureAccountName != "" && cfg.AzureAccountKey != ""
+	azureEnabled := cfg.AzureAccountName != ""
 	logger.Info().
 		Int("max_connections", cfg.MaxConnections).
 		Str("memory_limit", cfg.MemoryLimit).
@@ -426,8 +426,11 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		}
 	}
 
-	// Configure azure extension for Azure Blob Storage access if credentials are provided
-	if cfg.AzureAccountName != "" && cfg.AzureAccountKey != "" {
+	// Configure azure extension for Azure Blob Storage access. Only the account
+	// name is required: when AzureAccountKey is empty, configureAzureAccess
+	// provisions a PROVIDER CREDENTIAL_CHAIN secret so managed identity / az-login
+	// / env credentials work (mirrors the S3 credential-chain behavior).
+	if cfg.AzureAccountName != "" {
 		if err := configureAzureAccess(db, cfg, logger); err != nil {
 			return fmt.Errorf("failed to configure Azure access: %w", err)
 		}
@@ -673,8 +676,11 @@ func (d *DuckDB) ClearHTTPCache() {
 	}
 }
 
-// configureAzureAccess sets up the azure extension for Azure Blob Storage access
-// Note: We use SET GLOBAL to ensure settings persist across all connections in the pool
+// configureAzureAccess sets up the azure extension and the Azure Blob Storage
+// secret. With an account key it builds a connection-string secret; with only an
+// account name (no key) it builds a PROVIDER CREDENTIAL_CHAIN secret so managed
+// identity / az-login / env credentials work. The secret is instance-scoped and
+// shared across the connection pool.
 func configureAzureAccess(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	// Install and load the azure extension
 	if _, err := db.Exec("INSTALL azure"); err != nil {

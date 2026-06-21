@@ -481,3 +481,33 @@ func TestColdTierS3SecretWithLocalPrimary(t *testing.T) {
 		t.Fatalf("ConfigureS3 on local-primary + S3-cold failed (httpfs not pre-loaded?): %v", err)
 	}
 }
+
+// TestAzureCredentialChainStartup covers the previously-unreachable Azure
+// managed-identity path: configureAzureAccess used to be gated on BOTH account
+// name and key, so the PROVIDER CREDENTIAL_CHAIN branch (account name only) was
+// dead code. The gate is now AzureAccountName != "". This asserts startup
+// succeeds (i.e. the credential-chain CREATE SECRET is valid SQL) when only the
+// account name is configured.
+func TestAzureCredentialChainStartup(t *testing.T) {
+	tmp := t.TempDir()
+	storageRoot := filepath.Join(tmp, "data")
+	if err := os.MkdirAll(storageRoot, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	cfg := &Config{
+		MaxConnections:   2,
+		MemoryLimit:      "256MB",
+		LocalStorageRoot: storageRoot,
+		TempDirectory:    tmp,
+		// Account name only, no key: must use PROVIDER CREDENTIAL_CHAIN.
+		AzureAccountName: "myaccount",
+	}
+	db, err := New(cfg, zerolog.Nop())
+	if err != nil {
+		if strings.Contains(err.Error(), "azure") {
+			t.Skipf("azure extension unavailable (offline?): %v", err)
+		}
+		t.Fatalf("New with Azure credential chain: %v", err)
+	}
+	defer db.Close()
+}
