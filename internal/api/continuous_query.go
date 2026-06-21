@@ -696,9 +696,12 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 		// Escape single quotes: DuckDB read_parquet() paths cannot be
 		// parameterized, so the path is interpolated into a SQL string literal.
 		readParquetExpr := fmt.Sprintf("read_parquet('%s', union_by_name=true)", sqlutil.EscapeStringLiteral(measurementPath))
-		// Match FROM database.measurement (e.g., FROM production.cpu)
+		// Match FROM database.measurement (e.g., FROM production.cpu).
+		// Use ReplaceAllLiteralString (not ReplaceAllString) so '$' characters
+		// in the storage path are inserted verbatim rather than interpreted as
+		// regexp submatch references ($1, $name).
 		dbMeasurementPattern := regexp.MustCompile(`(?i)\bFROM\s+` + regexp.QuoteMeta(cq.Database) + `\.` + regexp.QuoteMeta(cq.SourceMeasurement) + `\b`)
-		wrappedQuery = dbMeasurementPattern.ReplaceAllString(query, "FROM "+readParquetExpr)
+		wrappedQuery = dbMeasurementPattern.ReplaceAllLiteralString(query, "FROM "+readParquetExpr)
 	}
 
 	h.logger.Debug().Str("query", wrappedQuery).Msg("Executing wrapped query")
