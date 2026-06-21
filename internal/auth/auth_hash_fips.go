@@ -21,7 +21,13 @@ func (am *AuthManager) verifyLegacyTokenHash(token, hash string) bool {
 	if strings.HasPrefix(hash, "$2") {
 		kind = "bcrypt"
 	}
-	am.logger.Warn().
+	// Logged at Debug, not Warn: this fires on every auth attempt that matches a
+	// legacy-hashed token's prefix. At Warn it would (a) spam logs under repeated
+	// auth and (b) act as a token-existence oracle for anyone watching logs —
+	// "token not found" is silent while "found but legacy, rejected" would log.
+	// Debug keeps it available for an operator actively diagnosing a failed auth
+	// without leaking the distinction into normal log output.
+	am.logger.Debug().
 		Str("hash_kind", kind).
 		Bool("fips_mode", true).
 		Msg("rejecting legacy non-FIPS token hash; rotate this token (recreate it) to store a FIPS-approved PBKDF2 hash")
