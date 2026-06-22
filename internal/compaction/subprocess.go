@@ -245,14 +245,14 @@ func RunJobInSubprocess(ctx context.Context, config *SubprocessJobConfig, logger
 	// Run subprocess
 	err = cmd.Run()
 
-	// Log stderr (contains subprocess logs) - forward at INFO level for visibility
+	// Log stderr (contains subprocess logs). The subprocess emits structured
+	// zerolog JSON, so re-emit each line at its original level instead of
+	// flattening everything to INFO (which made subprocess errors appear as INF).
 	if stderr.Len() > 0 {
 		// Log each line separately for better formatting
 		for _, line := range strings.Split(strings.TrimSpace(stderr.String()), "\n") {
 			if line != "" {
-				logger.Info().
-					Str("subprocess", "compaction").
-					Msg(line)
+				forwardSubprocessLine(logger, line)
 			}
 		}
 	}
@@ -277,6 +277,27 @@ func RunJobInSubprocess(ctx context.Context, config *SubprocessJobConfig, logger
 		Msg("Subprocess completed")
 
 	return &result, nil
+}
+
+// forwardSubprocessLine re-emits a single line of subprocess stderr at its
+// original zerolog level. The subprocess logs structured JSON, so we parse the
+// "level" field and map it onto the parent logger; lines that aren't JSON (or
+// have no recognizable level) fall back to INFO. The original line is preserved
+// verbatim as the message so the full subprocess payload (including its own
+// stack traces) is never lost.
+func forwardSubprocessLine(logger zerolog.Logger, line string) {
+	level := zerolog.InfoLevel
+	var parsed struct {
+		Level string `json:"level"`
+	}
+	if err := json.Unmarshal([]byte(line), &parsed); err == nil && parsed.Level != "" {
+		if lvl, err := zerolog.ParseLevel(parsed.Level); err == nil {
+			level = lvl
+		}
+	}
+	logger.WithLevel(level).
+		Str("subprocess", "compaction").
+		Msg(line)
 }
 
 // createStorageBackendFromConfig creates a storage backend from subprocess config
