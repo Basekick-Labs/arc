@@ -684,6 +684,9 @@ type S3Config struct {
 // per read_parquet() path. This runs after the sandbox lockdown
 // (enable_external_access=false); CREATE SECRET is a catalog op, not gated by it.
 func (d *DuckDB) ConfigureS3(s3cfg *S3Config) error {
+	if s3cfg == nil {
+		return fmt.Errorf("ConfigureS3: s3cfg must not be nil")
+	}
 	secretSQL, err := buildS3SecretSQL(s3SecretParams{
 		name:      arcS3ColdSecretName,
 		scope:     s3SecretScope(s3cfg.Bucket, s3cfg.Prefix),
