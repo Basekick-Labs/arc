@@ -287,6 +287,71 @@ func TestS3SecretScope(t *testing.T) {
 	}
 }
 
+func TestBuildAzureSecretSQL(t *testing.T) {
+	t.Run("account key -> connection string, named + scoped", func(t *testing.T) {
+		got, err := buildAzureSecretSQL(azureSecretParams{
+			name: arcAzurePrimarySecretName, scope: "azure://primary/",
+			accountName: "acct", accountKey: "key==",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		mustContain(t, got, "CREATE OR REPLACE SECRET azure_secret_primary")
+		mustContain(t, got, "TYPE AZURE")
+		mustContain(t, got, "CONNECTION_STRING 'AccountName=acct;AccountKey=key=='")
+		mustContain(t, got, "SCOPE 'azure://primary/'")
+		if strings.Contains(got, "CREDENTIAL_CHAIN") {
+			t.Errorf("account key must not use credential chain, got:\n%s", got)
+		}
+	})
+
+	t.Run("no key -> credential chain", func(t *testing.T) {
+		got, err := buildAzureSecretSQL(azureSecretParams{
+			name: arcAzureColdSecretName, scope: "azure://cold/", accountName: "acct",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		mustContain(t, got, "CREATE OR REPLACE SECRET azure_secret_cold")
+		mustContain(t, got, "PROVIDER CREDENTIAL_CHAIN")
+		mustContain(t, got, "ACCOUNT_NAME 'acct'")
+		mustContain(t, got, "SCOPE 'azure://cold/'")
+		if strings.Contains(got, "CONNECTION_STRING") {
+			t.Errorf("credential chain must not emit CONNECTION_STRING, got:\n%s", got)
+		}
+	})
+
+	t.Run("missing account name -> error", func(t *testing.T) {
+		if _, err := buildAzureSecretSQL(azureSecretParams{name: "x", accountKey: "k"}); err == nil {
+			t.Error("missing account name should error")
+		}
+	})
+
+	t.Run("single quotes escaped", func(t *testing.T) {
+		got, err := buildAzureSecretSQL(azureSecretParams{
+			name: "x", scope: "azure://c'/", accountName: "ac't", accountKey: "k'y",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// connection string embeds both escaped values inside one literal
+		mustContain(t, got, "CONNECTION_STRING 'AccountName=ac''t;AccountKey=k''y'")
+		mustContain(t, got, "SCOPE 'azure://c''/'")
+	})
+}
+
+func TestAzureScope(t *testing.T) {
+	tests := []struct{ container, want string }{
+		{"", ""},
+		{"c1", "azure://c1/"},
+	}
+	for _, tt := range tests {
+		if got := azureScope(tt.container); got != tt.want {
+			t.Errorf("azureScope(%q) = %q, want %q", tt.container, got, tt.want)
+		}
+	}
+}
+
 func mustContain(t *testing.T, haystack, needle string) {
 	t.Helper()
 	if !strings.Contains(haystack, needle) {

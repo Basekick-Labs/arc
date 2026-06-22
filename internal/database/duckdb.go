@@ -90,6 +90,14 @@ const (
 	arcS3ColdSecretName    = "arc_s3_cold"
 )
 
+// Azure secret names. Same rationale as the S3 names above: primary and cold
+// Azure storage get separate, SCOPE-bound secrets so distinct containers/accounts
+// per tier don't clobber each other.
+const (
+	arcAzurePrimarySecretName = "azure_secret_primary"
+	arcAzureColdSecretName    = "azure_secret_cold"
+)
+
 // s3SecretParams describes one DuckDB S3 secret to create.
 type s3SecretParams struct {
 	name      string // secret name (must be unique per credential set)
@@ -468,6 +476,15 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		if err := configureAzureAccess(db, cfg, logger); err != nil {
 			return fmt.Errorf("failed to configure Azure access: %w", err)
 		}
+	} else if cfg.ColdAzureContainer != "" {
+		// Primary storage is not Azure, but a cold tier targets Azure. Load the
+		// azure extension at startup (before the sandbox lockdown blocks
+		// INSTALL/LOAD) so the runtime ConfigureAzure cold-tier secret works. No
+		// primary secret is created here — cold credentials are applied later via
+		// ConfigureAzure. Mirrors the cold-tier S3 branch above.
+		if err := ensureAzureLoaded(db, logger); err != nil {
+			return fmt.Errorf("failed to load azure extension for cold-tier Azure: %w", err)
+		}
 	}
 
 	// Load the proprietary arcx extension once for the whole pool. Extension
@@ -743,60 +760,131 @@ func (d *DuckDB) ClearHTTPCache() {
 	}
 }
 
-// configureAzureAccess sets up the azure extension and the Azure Blob Storage
-// secret. With an account key it builds a connection-string secret; with only an
-// account name (no key) it builds a PROVIDER CREDENTIAL_CHAIN secret so managed
-// identity / az-login / env credentials work. The secret is instance-scoped and
-// shared across the connection pool.
-func configureAzureAccess(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
-	// Install and load the azure extension
+// azureSecretParams describes one DuckDB Azure secret to create.
+type azureSecretParams struct {
+	name        string // secret name (unique per credential set)
+	scope       string // azure://container/ this secret applies to; "" = unscoped
+	accountName string
+	accountKey  string // empty → PROVIDER CREDENTIAL_CHAIN (managed identity / env)
+}
+
+// buildAzureSecretSQL builds a `CREATE OR REPLACE SECRET <name> (TYPE AZURE, ...)`
+// statement. With an account key it builds a connection-string secret; with only
+// an account name (no key) it builds a PROVIDER CREDENTIAL_CHAIN secret so managed
+// identity / az-login / env credentials work. SCOPE, when non-empty, binds the
+// secret to one container so primary and cold-tier Azure secrets coexist and
+// DuckDB resolves the right credentials per path. Values are escaped (single
+// quotes doubled). Mirrors buildS3SecretSQL.
+func buildAzureSecretSQL(p azureSecretParams) (string, error) {
+	if p.accountName == "" {
+		return "", fmt.Errorf("azure secret %q: account name is required", p.name)
+	}
+	var b strings.Builder
+	b.WriteString("CREATE OR REPLACE SECRET ")
+	b.WriteString(p.name)
+	b.WriteString(" (\n\tTYPE AZURE")
+	if p.accountKey != "" {
+		// Connection string with account key.
+		connStr := "AccountName=" + p.accountName + ";AccountKey=" + p.accountKey
+		b.WriteString(",\n\tCONNECTION_STRING '")
+		b.WriteString(escapeSQLString(connStr))
+		b.WriteString("'")
+	} else {
+		// No key: defer to the Azure credential chain (managed identity / env).
+		b.WriteString(",\n\tPROVIDER CREDENTIAL_CHAIN,\n\tACCOUNT_NAME '")
+		b.WriteString(escapeSQLString(p.accountName))
+		b.WriteString("'")
+	}
+	if p.scope != "" {
+		b.WriteString(",\n\tSCOPE '")
+		b.WriteString(escapeSQLString(p.scope))
+		b.WriteString("'")
+	}
+	b.WriteString("\n)")
+	return b.String(), nil
+}
+
+// azureScope builds the SCOPE prefix for an Azure secret from a container name,
+// or "" (unscoped) when no container is configured.
+func azureScope(container string) string {
+	if container == "" {
+		return ""
+	}
+	return "azure://" + container + "/"
+}
+
+// ensureAzureLoaded installs and loads the azure extension and sets the Linux
+// curl transport. Like httpfs for S3, this MUST run before any
+// CREATE SECRET (TYPE AZURE) — including the runtime cold-tier secret created by
+// ConfigureAzure — and before the sandbox lockdown. Idempotent.
+func ensureAzureLoaded(db *sql.DB, logger zerolog.Logger) error {
 	if _, err := db.Exec("INSTALL azure"); err != nil {
 		return fmt.Errorf("failed to install azure: %w", err)
 	}
 	if _, err := db.Exec("LOAD azure"); err != nil {
 		return fmt.Errorf("failed to load azure: %w", err)
 	}
-
-	// Set transport option to curl on Linux to resolve potential SSL certificate issues
+	// Set transport option to curl on Linux to resolve potential SSL cert issues.
 	if runtime.GOOS == "linux" {
 		if _, err := db.Exec("SET GLOBAL azure_transport_option_type = 'curl'"); err != nil {
 			return fmt.Errorf("failed to set azure_transport_option_type: %w", err)
 		}
-
-		logger.Info().
-			Str("azure_transport_option", "curl").
-			Msg("Azure transport option set to curl for Linux")
+		logger.Info().Str("azure_transport_option", "curl").Msg("Azure transport option set to curl for Linux")
 	}
+	return nil
+}
 
-	// Create a secret for Azure Blob Storage authentication
-	// Note: values are escaped to prevent SQL injection
-	var secretSQL string
-	if cfg.AzureAccountKey != "" {
-		// Use connection string with account key
-		connStr := fmt.Sprintf("AccountName=%s;AccountKey=%s",
-			escapeSQLString(cfg.AzureAccountName),
-			escapeSQLString(cfg.AzureAccountKey))
-		secretSQL = fmt.Sprintf(`
-			CREATE OR REPLACE SECRET azure_secret (
-				TYPE AZURE,
-				CONNECTION_STRING '%s'
-			)
-		`, connStr)
-	} else {
-		// Fall back to credential chain if no account key
-		secretSQL = fmt.Sprintf(`
-			CREATE OR REPLACE SECRET azure_secret (
-				TYPE AZURE,
-				PROVIDER CREDENTIAL_CHAIN,
-				ACCOUNT_NAME '%s'
-			)
-		`, escapeSQLString(cfg.AzureAccountName))
+// configureAzureAccess sets up the azure extension and the PRIMARY Azure secret,
+// scoped to the primary container so it coexists with a separately-scoped
+// cold-tier secret (see DuckDB.ConfigureAzure) instead of clobbering it.
+func configureAzureAccess(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
+	if err := ensureAzureLoaded(db, logger); err != nil {
+		return err
 	}
-
+	secretSQL, err := buildAzureSecretSQL(azureSecretParams{
+		name:        arcAzurePrimarySecretName,
+		scope:       azureScope(cfg.AzureContainer),
+		accountName: cfg.AzureAccountName,
+		accountKey:  cfg.AzureAccountKey,
+	})
+	if err != nil {
+		return err
+	}
 	if _, err := db.Exec(secretSQL); err != nil {
 		return fmt.Errorf("failed to create azure secret: %w", err)
 	}
+	return nil
+}
 
+// AzureConfig holds Azure configuration for a runtime (cold-tier) secret.
+type AzureConfig struct {
+	AccountName string
+	AccountKey  string
+	Container   string // scopes the secret to this container; empty = unscoped
+}
+
+// ConfigureAzure provisions the cold-tier Azure secret at runtime, under a
+// DEDICATED name (azure_secret_cold) scoped to the cold container, so it does not
+// clobber the primary Azure secret. Mirrors ConfigureS3. The azure extension must
+// already be loaded (configureDatabase loads it at startup whenever primary OR
+// cold storage uses Azure, before the sandbox lockdown).
+func (d *DuckDB) ConfigureAzure(azcfg *AzureConfig) error {
+	if azcfg == nil {
+		return fmt.Errorf("ConfigureAzure: azcfg must not be nil")
+	}
+	secretSQL, err := buildAzureSecretSQL(azureSecretParams{
+		name:        arcAzureColdSecretName,
+		scope:       azureScope(azcfg.Container),
+		accountName: azcfg.AccountName,
+		accountKey:  azcfg.AccountKey,
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := d.db.Exec(secretSQL); err != nil {
+		return fmt.Errorf("failed to create cold-tier azure secret: %w", err)
+	}
+	d.logger.Info().Str("account", azcfg.AccountName).Str("container", azcfg.Container).Msg("DuckDB cold-tier Azure secret configured")
 	return nil
 }
 

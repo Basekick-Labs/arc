@@ -2568,6 +2568,21 @@ func main() {
 				log.Info().Msg("DuckDB configured with cold tier S3 credentials for multi-tier queries")
 			}
 		}
+
+		// Configure DuckDB for cold-tier Azure (scoped secret, separate from the
+		// primary Azure secret). Empty account key → credential chain (managed
+		// identity / env). Mirrors the cold-tier S3 path above.
+		if cold.Enabled && cold.Backend == "azure" {
+			if err := db.ConfigureAzure(&database.AzureConfig{
+				AccountName: cold.AzureAccountName,
+				AccountKey:  cold.AzureAccountKey,
+				Container:   cold.AzureContainer,
+			}); err != nil {
+				log.Warn().Err(err).Msg("Failed to configure DuckDB with cold tier Azure credentials")
+			} else {
+				log.Info().Msg("DuckDB configured with cold tier Azure credentials for multi-tier queries")
+			}
+		}
 	}
 
 	// Initialize Backup/Restore (OSS feature — no license required)

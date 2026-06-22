@@ -510,6 +510,71 @@ func TestScopedSecretsCoexist(t *testing.T) {
 	}
 }
 
+// TestAzureScopedSecretsCoexist mirrors TestScopedSecretsCoexist for Azure: a
+// primary and a cold-tier Azure secret with different containers must coexist
+// (separate names + scopes), so configuring the cold tier does not clobber the
+// primary credentials.
+func TestAzureScopedSecretsCoexist(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, "INSTALL azure"); err != nil {
+		t.Skipf("azure extension unavailable (offline?): %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "LOAD azure"); err != nil {
+		t.Skipf("azure load failed: %v", err)
+	}
+
+	primarySQL, err := buildAzureSecretSQL(azureSecretParams{
+		name: arcAzurePrimarySecretName, scope: "azure://primary-container/",
+		accountName: "acct1", accountKey: "key1==",
+	})
+	if err != nil {
+		t.Fatalf("build primary: %v", err)
+	}
+	coldSQL, err := buildAzureSecretSQL(azureSecretParams{
+		name: arcAzureColdSecretName, scope: "azure://cold-container/",
+		accountName: "acct2", // credential chain
+	})
+	if err != nil {
+		t.Fatalf("build cold: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, primarySQL); err != nil {
+		t.Fatalf("create primary azure secret: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, coldSQL); err != nil {
+		t.Fatalf("create cold azure secret: %v", err)
+	}
+
+	var n int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM duckdb_secrets() WHERE name IN ('"+arcAzurePrimarySecretName+"','"+arcAzureColdSecretName+"')").
+		Scan(&n); err != nil {
+		t.Fatalf("count secrets: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("expected both scoped azure secrets to coexist, found %d", n)
+	}
+
+	resolve := func(path string) string {
+		var name string
+		if err := db.QueryRowContext(ctx,
+			"SELECT name FROM which_secret('"+path+"', 'azure')").Scan(&name); err != nil {
+			t.Fatalf("which_secret(%s): %v", path, err)
+		}
+		return name
+	}
+	if got := resolve("azure://primary-container/db/m/x.parquet"); got != arcAzurePrimarySecretName {
+		t.Errorf("primary path resolved to %q, want %q", got, arcAzurePrimarySecretName)
+	}
+	if got := resolve("azure://cold-container/db/m/y.parquet"); got != arcAzureColdSecretName {
+		t.Errorf("cold path resolved to %q, want %q", got, arcAzureColdSecretName)
+	}
+}
+
 // TestColdTierS3SecretWithLocalPrimary reproduces the local-primary + S3-cold
 // critical bug: configureS3Access only ran when PRIMARY S3 keys were set, so on a
 // local-primary deployment httpfs was never loaded, and the runtime cold-tier
