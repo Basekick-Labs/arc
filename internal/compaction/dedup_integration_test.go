@@ -12,6 +12,29 @@ import (
 	_ "github.com/duckdb/duckdb-go/v2" // duckdb driver
 )
 
+// execCompaction runs the statement(s) buildCompactionQuery returns, in order,
+// on a single pinned connection — mirroring the production caller in job.go. The
+// pin is required, not cosmetic: the dedup path's TEMP table is connection-local
+// and database/sql does not guarantee two ExecContext calls share a connection.
+func execCompaction(ctx context.Context, db *sql.DB, fileListSQL, orderByClause, outputFile string, tagColumns []string) error {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if len(tagColumns) > 0 {
+			_, _ = conn.ExecContext(ctx, "DROP TABLE IF EXISTS "+dedupStagingTable)
+		}
+		conn.Close()
+	}()
+	for _, stmt := range buildCompactionQuery(fileListSQL, orderByClause, outputFile, tagColumns) {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // TestBuildCompactionQuery_DedupMixedTimeType is a DuckDB-backed regression test
 // for the dedup compaction query. String assertions cannot catch the binder
 // behavior this code depends on, so this exercises the real generated SQL
@@ -63,10 +86,8 @@ func TestBuildCompactionQuery_DedupMixedTimeType(t *testing.T) {
 	}
 
 	fileList := fmt.Sprintf("['%s', '%s']", escapeSQLPath(fileTZ), escapeSQLPath(fileStr))
-	query := buildCompactionQuery(fileList, `ORDER BY "time"`, out, []string{"host"})
-
-	if _, err := db.ExecContext(ctx, query); err != nil {
-		t.Fatalf("compaction query failed (bind error regression?): %v\nquery:\n%s", err, query)
+	if err := execCompaction(ctx, db, fileList, `ORDER BY "time"`, out, []string{"host"}); err != nil {
+		t.Fatalf("compaction query failed (bind error regression?): %v", err)
 	}
 
 	// Correct dedup → exactly one row.
@@ -138,11 +159,9 @@ func TestBuildCompactionQuery_StandardMixedTimeType(t *testing.T) {
 	}
 
 	fileList := fmt.Sprintf("['%s', '%s']", escapeSQLPath(fileTZ), escapeSQLPath(fileStr))
-	// nil tagColumns → standard branch (the wedged path).
-	query := buildCompactionQuery(fileList, `ORDER BY "time"`, out, nil)
-
-	if _, err := db.ExecContext(ctx, query); err != nil {
-		t.Fatalf("standard compaction query failed (bind error regression?): %v\nquery:\n%s", err, query)
+	// nil tagColumns → standard branch.
+	if err := execCompaction(ctx, db, fileList, `ORDER BY "time"`, out, nil); err != nil {
+		t.Fatalf("standard compaction query failed (bind error regression?): %v", err)
 	}
 
 	var rows int
