@@ -80,6 +80,123 @@ func stripURLScheme(endpoint string) string {
 	return strings.TrimRight(endpoint, "/")
 }
 
+// S3 secret names. Primary storage and the cold tier get SEPARATE, SCOPE-bound
+// secrets so a query against the primary bucket and a query against the cold
+// bucket each resolve their own credentials. A single shared secret would let
+// the runtime cold-tier ConfigureS3 overwrite the primary's credentials (the two
+// tiers can use different buckets/accounts), so they must not share a name.
+const (
+	arcS3PrimarySecretName = "arc_s3_primary"
+	arcS3ColdSecretName    = "arc_s3_cold"
+)
+
+// Azure secret names. Same rationale as the S3 names above: primary and cold
+// Azure storage get separate, SCOPE-bound secrets so distinct containers/accounts
+// per tier don't clobber each other.
+const (
+	arcAzurePrimarySecretName = "azure_secret_primary"
+	arcAzureColdSecretName    = "azure_secret_cold"
+)
+
+// s3SecretParams describes one DuckDB S3 secret to create.
+type s3SecretParams struct {
+	name      string // secret name (must be unique per credential set)
+	scope     string // s3://bucket/prefix/ this secret applies to; "" = unscoped
+	accessKey string
+	secretKey string
+	region    string
+	endpoint  string
+	pathStyle bool
+	useSSL    bool
+}
+
+// buildS3SecretSQL builds a `CREATE OR REPLACE SECRET <name> (TYPE S3, ...)`
+// statement. Using DuckDB's secrets manager (instead of
+// `SET GLOBAL s3_secret_access_key`) keeps the secret out of current_setting():
+// the value is unreadable via SQL and redacted in duckdb_secrets(), closing the
+// exfiltration path where any authenticated query user could
+// `SELECT current_setting('s3_secret_access_key')`.
+//
+// The secret is TEMPORARY by default (no PERSISTENT keyword): it lives in-memory
+// for the life of the DuckDB instance and is visible to every pooled connection,
+// matching the old SET GLOBAL behavior. PERSISTENT must NOT be used — it would
+// write the key unencrypted to ~/.duckdb/stored_secrets.
+//
+// SCOPE: when non-empty, the secret applies only to paths under that prefix, so
+// primary and cold-tier secrets coexist and DuckDB picks the right credentials
+// per read_parquet() path (longest-prefix match). An empty scope is unscoped
+// (applies to all s3:// paths) — the single-tier default.
+//
+// Credentials are three-way:
+//   - both accessKey and secretKey set → static-key secret (KEY_ID/SECRET).
+//   - both empty → PROVIDER CREDENTIAL_CHAIN, so DuckDB falls back to the AWS
+//     credential chain (env vars, IAM instance profile / IRSA). Verified against
+//     the bundled DuckDB that CREDENTIAL_CHAIN composes with REGION/ENDPOINT/
+//     URL_STYLE/USE_SSL, so custom-endpoint (MinIO-with-env-creds) still works.
+//   - exactly one set → returns an error. Silently routing a half-supplied
+//     credential to the credential chain would discard the provided key and
+//     authenticate as a different identity (e.g. the host instance role) with no
+//     signal — a misconfiguration trap, not a convenience.
+//
+// accessKey/secretKey/region/endpoint/scope are escaped (single quotes doubled);
+// pathStyle and useSSL are program-controlled and emitted as bare enum/bool
+// literals. region/endpoint/scope are only included when non-empty. The endpoint
+// is scheme-stripped internally via stripURLScheme, so callers may pass a raw
+// "https://host:port" value.
+func buildS3SecretSQL(p s3SecretParams) (string, error) {
+	hasKey, hasSecret := p.accessKey != "", p.secretKey != ""
+	if hasKey != hasSecret {
+		return "", fmt.Errorf("S3 credentials misconfigured for secret %q: exactly one of access key / secret key is set; provide both (static credentials) or neither (AWS credential chain)", p.name)
+	}
+
+	var b strings.Builder
+	b.WriteString("CREATE OR REPLACE SECRET ")
+	b.WriteString(p.name)
+	b.WriteString(" (\n\tTYPE S3")
+	if hasKey {
+		b.WriteString(",\n\tKEY_ID '")
+		b.WriteString(escapeSQLString(p.accessKey))
+		b.WriteString("',\n\tSECRET '")
+		b.WriteString(escapeSQLString(p.secretKey))
+		b.WriteString("'")
+	} else {
+		// No static credentials: defer to the AWS credential chain.
+		b.WriteString(",\n\tPROVIDER CREDENTIAL_CHAIN")
+	}
+	if p.region != "" {
+		b.WriteString(",\n\tREGION '")
+		b.WriteString(escapeSQLString(p.region))
+		b.WriteString("'")
+	}
+	// Check the stripped value, not the raw endpoint: a malformed config like
+	// "http://" or whitespace strips to "" and must be treated as "no endpoint"
+	// rather than emitting an empty ENDPOINT '' clause.
+	if stripped := stripURLScheme(p.endpoint); stripped != "" {
+		b.WriteString(",\n\tENDPOINT '")
+		b.WriteString(escapeSQLString(stripped))
+		b.WriteString("'")
+	}
+	urlStyle := "vhost"
+	if p.pathStyle {
+		urlStyle = "path"
+	}
+	b.WriteString(",\n\tURL_STYLE '")
+	b.WriteString(urlStyle)
+	b.WriteString("',\n\tUSE_SSL ")
+	if p.useSSL {
+		b.WriteString("true")
+	} else {
+		b.WriteString("false")
+	}
+	if p.scope != "" {
+		b.WriteString(",\n\tSCOPE '")
+		b.WriteString(escapeSQLString(p.scope))
+		b.WriteString("'")
+	}
+	b.WriteString("\n)")
+	return b.String(), nil
+}
+
 // Config holds DuckDB configuration
 type Config struct {
 	MaxConnections int
@@ -184,7 +301,7 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 	}
 
 	s3Enabled := cfg.S3AccessKey != "" && cfg.S3SecretKey != ""
-	azureEnabled := cfg.AzureAccountName != "" && cfg.AzureAccountKey != ""
+	azureEnabled := cfg.AzureAccountName != ""
 	logger.Info().
 		Int("max_connections", cfg.MaxConnections).
 		Str("memory_limit", cfg.MemoryLimit).
@@ -330,17 +447,43 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		logger.Warn().Err(err).Msg("Failed to set preserve_insertion_order")
 	}
 
-	// Configure httpfs extension for S3 access if credentials are provided
-	if cfg.S3AccessKey != "" && cfg.S3SecretKey != "" {
+	// Configure httpfs extension + primary S3 secret if primary storage uses S3.
+	// Use || so a half-configured pair (exactly one key set) reaches
+	// configureS3Access and is rejected by buildS3SecretSQL at startup, instead
+	// of being silently skipped. Both-empty falls through to the cold-tier branch
+	// (primary storage is not S3); primary credential-chain is intentionally not
+	// supported here (would require both empty AND an explicit S3 primary signal).
+	if cfg.S3AccessKey != "" || cfg.S3SecretKey != "" {
 		if err := configureS3Access(db, cfg, logger); err != nil {
 			return fmt.Errorf("failed to configure S3 access: %w", err)
 		}
+	} else if cfg.ColdS3Bucket != "" {
+		// Primary storage is not S3, but a cold tier targets S3. httpfs must be
+		// loaded at startup (before the sandbox lockdown blocks INSTALL/LOAD) so
+		// the runtime ConfigureS3 cold-tier secret can use the S3 secret type.
+		// No primary secret is created here — cold-tier credentials are applied
+		// later via ConfigureS3.
+		if err := ensureHTTPFSLoaded(db); err != nil {
+			return fmt.Errorf("failed to load httpfs for cold-tier S3: %w", err)
+		}
 	}
 
-	// Configure azure extension for Azure Blob Storage access if credentials are provided
-	if cfg.AzureAccountName != "" && cfg.AzureAccountKey != "" {
+	// Configure azure extension for Azure Blob Storage access. Only the account
+	// name is required: when AzureAccountKey is empty, configureAzureAccess
+	// provisions a PROVIDER CREDENTIAL_CHAIN secret so managed identity / az-login
+	// / env credentials work (mirrors the S3 credential-chain behavior).
+	if cfg.AzureAccountName != "" {
 		if err := configureAzureAccess(db, cfg, logger); err != nil {
 			return fmt.Errorf("failed to configure Azure access: %w", err)
+		}
+	} else if cfg.ColdAzureContainer != "" {
+		// Primary storage is not Azure, but a cold tier targets Azure. Load the
+		// azure extension at startup (before the sandbox lockdown blocks
+		// INSTALL/LOAD) so the runtime ConfigureAzure cold-tier secret works. No
+		// primary secret is created here — cold credentials are applied later via
+		// ConfigureAzure. Mirrors the cold-tier S3 branch above.
+		if err := ensureAzureLoaded(db, logger); err != nil {
+			return fmt.Errorf("failed to load azure extension for cold-tier Azure: %w", err)
 		}
 	}
 
@@ -403,56 +546,57 @@ func verifyArcxLoaded(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	return nil
 }
 
-// configureS3Access sets up the httpfs extension for S3 access
-// Note: We use SET GLOBAL to ensure settings persist across all connections in the pool
-func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
-	// Install and load the httpfs extension
+// ensureHTTPFSLoaded installs and loads the httpfs extension. httpfs registers
+// the S3 secret type, so it MUST be loaded before any CREATE SECRET (TYPE S3) —
+// including the runtime cold-tier secret created by ConfigureS3 — and before the
+// sandbox lockdown (enable_external_access=false blocks INSTALL/LOAD). Loading
+// httpfs is idempotent, so calling this for both primary and cold-tier S3 is
+// safe.
+func ensureHTTPFSLoaded(db *sql.DB) error {
 	if _, err := db.Exec("INSTALL httpfs"); err != nil {
 		return fmt.Errorf("failed to install httpfs: %w", err)
 	}
 	if _, err := db.Exec("LOAD httpfs"); err != nil {
 		return fmt.Errorf("failed to load httpfs: %w", err)
 	}
+	return nil
+}
 
-	// Set S3 credentials using GLOBAL scope to persist across connections
-	// Note: credentials are escaped to prevent SQL injection
-	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_access_key_id='%s'", escapeSQLString(cfg.S3AccessKey))); err != nil {
-		return fmt.Errorf("failed to set s3_access_key_id: %w", err)
-	}
-	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_secret_access_key='%s'", escapeSQLString(cfg.S3SecretKey))); err != nil {
-		return fmt.Errorf("failed to set s3_secret_access_key: %w", err)
-	}
-
-	// Set S3 region
-	if cfg.S3Region != "" {
-		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_region='%s'", escapeSQLString(cfg.S3Region))); err != nil {
-			return fmt.Errorf("failed to set s3_region: %w", err)
-		}
+// configureS3Access sets up the httpfs extension and the primary-storage S3
+// secret. S3 credentials are stored in DuckDB's secrets manager via CREATE
+// SECRET (not SET GLOBAL) so the secret key cannot be read back through the
+// query API via current_setting(); see buildS3SecretSQL. The secret is
+// instance-scoped and therefore visible to every connection in the pool, like
+// the old SET GLOBAL.
+func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
+	if err := ensureHTTPFSLoaded(db); err != nil {
+		return err
 	}
 
-	// Set custom endpoint for MinIO or S3-compatible services
-	if cfg.S3Endpoint != "" {
-		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", escapeSQLString(stripURLScheme(cfg.S3Endpoint)))); err != nil {
-			return fmt.Errorf("failed to set s3_endpoint: %w", err)
-		}
+	// Store S3 credentials + endpoint config in the secrets manager. Must run
+	// after LOAD httpfs (which registers the S3 secret type). CREATE SECRET is a
+	// catalog op and is NOT gated by enable_external_access, so order relative to
+	// the sandbox lockdown is immaterial; we run it here for locality.
+	//
+	// Scope the primary secret to the primary bucket/prefix when known, so it
+	// coexists with a separately-scoped cold-tier secret (see DuckDB.ConfigureS3)
+	// instead of one clobbering the other. When no bucket is configured the scope
+	// is empty (unscoped), preserving single-tier behavior.
+	secretSQL, err := buildS3SecretSQL(s3SecretParams{
+		name:      arcS3PrimarySecretName,
+		scope:     s3SecretScope(cfg.S3Bucket, cfg.S3Prefix),
+		accessKey: cfg.S3AccessKey,
+		secretKey: cfg.S3SecretKey,
+		region:    cfg.S3Region,
+		endpoint:  cfg.S3Endpoint,
+		pathStyle: cfg.S3PathStyle,
+		useSSL:    cfg.S3UseSSL,
+	})
+	if err != nil {
+		return err
 	}
-
-	// Set URL style (path-style for MinIO, virtual-hosted for AWS S3)
-	urlStyle := "vhost"
-	if cfg.S3PathStyle {
-		urlStyle = "path"
-	}
-	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_url_style='%s'", urlStyle)); err != nil {
-		return fmt.Errorf("failed to set s3_url_style: %w", err)
-	}
-
-	// Set SSL usage
-	useSSL := "true"
-	if !cfg.S3UseSSL {
-		useSSL = "false"
-	}
-	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_use_ssl=%s", useSSL)); err != nil {
-		return fmt.Errorf("failed to set s3_use_ssl: %w", err)
+	if _, err := db.Exec(secretSQL); err != nil {
+		return fmt.Errorf("failed to create S3 secret: %w", err)
 	}
 
 	if _, err := db.Exec("SET GLOBAL prefetch_all_parquet_files=true"); err != nil {
@@ -535,54 +679,46 @@ type S3Config struct {
 	SecretKey string
 	UseSSL    bool
 	PathStyle bool
+	// Bucket/Prefix scope the cold-tier secret to its own bucket/prefix so it
+	// does not clobber the primary S3 secret. Empty Bucket → unscoped secret.
+	Bucket string
+	Prefix string
 }
 
 // ConfigureS3 reconfigures DuckDB's S3 settings at runtime.
 // This is useful when tiered storage uses different S3 credentials than the main storage.
-// The httpfs extension must already be loaded.
+//
+// httpfs must already be loaded: configureDatabase loads it at startup whenever
+// primary OR cold storage uses S3 (see the ColdS3Bucket branch), which is before
+// the sandbox lockdown blocks INSTALL/LOAD. This is the only thing that makes the
+// CREATE SECRET (TYPE S3) below work on a local-primary + S3-cold deployment.
+//
+// Credentials go into the secrets manager via CREATE OR REPLACE SECRET under a
+// DEDICATED cold-tier name (arc_s3_cold), scoped to the cold bucket/prefix. This
+// must NOT reuse the primary secret name — primary and cold can use different
+// buckets/accounts, and a shared secret would let cold credentials clobber the
+// primary's. With distinct scoped secrets, DuckDB resolves the right credentials
+// per read_parquet() path. This runs after the sandbox lockdown
+// (enable_external_access=false); CREATE SECRET is a catalog op, not gated by it.
 func (d *DuckDB) ConfigureS3(s3cfg *S3Config) error {
-	// Set S3 credentials (escaped to prevent SQL injection)
-	if s3cfg.AccessKey != "" {
-		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_access_key_id='%s'", escapeSQLString(s3cfg.AccessKey))); err != nil {
-			return fmt.Errorf("failed to set s3_access_key_id: %w", err)
-		}
+	if s3cfg == nil {
+		return fmt.Errorf("ConfigureS3: s3cfg must not be nil")
 	}
-	if s3cfg.SecretKey != "" {
-		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_secret_access_key='%s'", escapeSQLString(s3cfg.SecretKey))); err != nil {
-			return fmt.Errorf("failed to set s3_secret_access_key: %w", err)
-		}
+	secretSQL, err := buildS3SecretSQL(s3SecretParams{
+		name:      arcS3ColdSecretName,
+		scope:     s3SecretScope(s3cfg.Bucket, s3cfg.Prefix),
+		accessKey: s3cfg.AccessKey,
+		secretKey: s3cfg.SecretKey,
+		region:    s3cfg.Region,
+		endpoint:  s3cfg.Endpoint,
+		pathStyle: s3cfg.PathStyle,
+		useSSL:    s3cfg.UseSSL,
+	})
+	if err != nil {
+		return err
 	}
-
-	// Set S3 region
-	if s3cfg.Region != "" {
-		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_region='%s'", escapeSQLString(s3cfg.Region))); err != nil {
-			return fmt.Errorf("failed to set s3_region: %w", err)
-		}
-	}
-
-	// Set custom endpoint for MinIO or S3-compatible services
-	if s3cfg.Endpoint != "" {
-		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", escapeSQLString(stripURLScheme(s3cfg.Endpoint)))); err != nil {
-			return fmt.Errorf("failed to set s3_endpoint: %w", err)
-		}
-	}
-
-	// Set URL style (path-style for MinIO, virtual-hosted for AWS S3)
-	urlStyle := "vhost"
-	if s3cfg.PathStyle {
-		urlStyle = "path"
-	}
-	if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_url_style='%s'", urlStyle)); err != nil {
-		return fmt.Errorf("failed to set s3_url_style: %w", err)
-	}
-
-	// Set SSL usage
-	useSSL := "true"
-	if !s3cfg.UseSSL {
-		useSSL = "false"
-	}
-	if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_use_ssl=%s", useSSL)); err != nil {
-		return fmt.Errorf("failed to set s3_use_ssl: %w", err)
+	if _, err := d.db.Exec(secretSQL); err != nil {
+		return fmt.Errorf("failed to create S3 secret: %w", err)
 	}
 
 	d.logger.Info().
@@ -624,57 +760,131 @@ func (d *DuckDB) ClearHTTPCache() {
 	}
 }
 
-// configureAzureAccess sets up the azure extension for Azure Blob Storage access
-// Note: We use SET GLOBAL to ensure settings persist across all connections in the pool
-func configureAzureAccess(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
-	// Install and load the azure extension
+// azureSecretParams describes one DuckDB Azure secret to create.
+type azureSecretParams struct {
+	name        string // secret name (unique per credential set)
+	scope       string // azure://container/ this secret applies to; "" = unscoped
+	accountName string
+	accountKey  string // empty → PROVIDER CREDENTIAL_CHAIN (managed identity / env)
+}
+
+// buildAzureSecretSQL builds a `CREATE OR REPLACE SECRET <name> (TYPE AZURE, ...)`
+// statement. With an account key it builds a connection-string secret; with only
+// an account name (no key) it builds a PROVIDER CREDENTIAL_CHAIN secret so managed
+// identity / az-login / env credentials work. SCOPE, when non-empty, binds the
+// secret to one container so primary and cold-tier Azure secrets coexist and
+// DuckDB resolves the right credentials per path. Values are escaped (single
+// quotes doubled). Mirrors buildS3SecretSQL.
+func buildAzureSecretSQL(p azureSecretParams) (string, error) {
+	if p.accountName == "" {
+		return "", fmt.Errorf("azure secret %q: account name is required", p.name)
+	}
+	var b strings.Builder
+	b.WriteString("CREATE OR REPLACE SECRET ")
+	b.WriteString(p.name)
+	b.WriteString(" (\n\tTYPE AZURE")
+	if p.accountKey != "" {
+		// Connection string with account key.
+		connStr := "AccountName=" + p.accountName + ";AccountKey=" + p.accountKey
+		b.WriteString(",\n\tCONNECTION_STRING '")
+		b.WriteString(escapeSQLString(connStr))
+		b.WriteString("'")
+	} else {
+		// No key: defer to the Azure credential chain (managed identity / env).
+		b.WriteString(",\n\tPROVIDER CREDENTIAL_CHAIN,\n\tACCOUNT_NAME '")
+		b.WriteString(escapeSQLString(p.accountName))
+		b.WriteString("'")
+	}
+	if p.scope != "" {
+		b.WriteString(",\n\tSCOPE '")
+		b.WriteString(escapeSQLString(p.scope))
+		b.WriteString("'")
+	}
+	b.WriteString("\n)")
+	return b.String(), nil
+}
+
+// azureScope builds the SCOPE prefix for an Azure secret from a container name,
+// or "" (unscoped) when no container is configured.
+func azureScope(container string) string {
+	if container == "" {
+		return ""
+	}
+	return "azure://" + container + "/"
+}
+
+// ensureAzureLoaded installs and loads the azure extension and sets the Linux
+// curl transport. Like httpfs for S3, this MUST run before any
+// CREATE SECRET (TYPE AZURE) — including the runtime cold-tier secret created by
+// ConfigureAzure — and before the sandbox lockdown. Idempotent.
+func ensureAzureLoaded(db *sql.DB, logger zerolog.Logger) error {
 	if _, err := db.Exec("INSTALL azure"); err != nil {
 		return fmt.Errorf("failed to install azure: %w", err)
 	}
 	if _, err := db.Exec("LOAD azure"); err != nil {
 		return fmt.Errorf("failed to load azure: %w", err)
 	}
-
-	// Set transport option to curl on Linux to resolve potential SSL certificate issues
+	// Set transport option to curl on Linux to resolve potential SSL cert issues.
 	if runtime.GOOS == "linux" {
 		if _, err := db.Exec("SET GLOBAL azure_transport_option_type = 'curl'"); err != nil {
 			return fmt.Errorf("failed to set azure_transport_option_type: %w", err)
 		}
-
-		logger.Info().
-			Str("azure_transport_option", "curl").
-			Msg("Azure transport option set to curl for Linux")
+		logger.Info().Str("azure_transport_option", "curl").Msg("Azure transport option set to curl for Linux")
 	}
+	return nil
+}
 
-	// Create a secret for Azure Blob Storage authentication
-	// Note: values are escaped to prevent SQL injection
-	var secretSQL string
-	if cfg.AzureAccountKey != "" {
-		// Use connection string with account key
-		connStr := fmt.Sprintf("AccountName=%s;AccountKey=%s",
-			escapeSQLString(cfg.AzureAccountName),
-			escapeSQLString(cfg.AzureAccountKey))
-		secretSQL = fmt.Sprintf(`
-			CREATE SECRET azure_secret (
-				TYPE AZURE,
-				CONNECTION_STRING '%s'
-			)
-		`, connStr)
-	} else {
-		// Fall back to credential chain if no account key
-		secretSQL = fmt.Sprintf(`
-			CREATE SECRET azure_secret (
-				TYPE AZURE,
-				PROVIDER CREDENTIAL_CHAIN,
-				ACCOUNT_NAME '%s'
-			)
-		`, escapeSQLString(cfg.AzureAccountName))
+// configureAzureAccess sets up the azure extension and the PRIMARY Azure secret,
+// scoped to the primary container so it coexists with a separately-scoped
+// cold-tier secret (see DuckDB.ConfigureAzure) instead of clobbering it.
+func configureAzureAccess(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
+	if err := ensureAzureLoaded(db, logger); err != nil {
+		return err
 	}
-
+	secretSQL, err := buildAzureSecretSQL(azureSecretParams{
+		name:        arcAzurePrimarySecretName,
+		scope:       azureScope(cfg.AzureContainer),
+		accountName: cfg.AzureAccountName,
+		accountKey:  cfg.AzureAccountKey,
+	})
+	if err != nil {
+		return err
+	}
 	if _, err := db.Exec(secretSQL); err != nil {
 		return fmt.Errorf("failed to create azure secret: %w", err)
 	}
+	return nil
+}
 
+// AzureConfig holds Azure configuration for a runtime (cold-tier) secret.
+type AzureConfig struct {
+	AccountName string
+	AccountKey  string
+	Container   string // scopes the secret to this container; empty = unscoped
+}
+
+// ConfigureAzure provisions the cold-tier Azure secret at runtime, under a
+// DEDICATED name (azure_secret_cold) scoped to the cold container, so it does not
+// clobber the primary Azure secret. Mirrors ConfigureS3. The azure extension must
+// already be loaded (configureDatabase loads it at startup whenever primary OR
+// cold storage uses Azure, before the sandbox lockdown).
+func (d *DuckDB) ConfigureAzure(azcfg *AzureConfig) error {
+	if azcfg == nil {
+		return fmt.Errorf("ConfigureAzure: azcfg must not be nil")
+	}
+	secretSQL, err := buildAzureSecretSQL(azureSecretParams{
+		name:        arcAzureColdSecretName,
+		scope:       azureScope(azcfg.Container),
+		accountName: azcfg.AccountName,
+		accountKey:  azcfg.AccountKey,
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := d.db.Exec(secretSQL); err != nil {
+		return fmt.Errorf("failed to create cold-tier azure secret: %w", err)
+	}
+	d.logger.Info().Str("account", azcfg.AccountName).Str("container", azcfg.Container).Msg("DuckDB cold-tier Azure secret configured")
 	return nil
 }
 

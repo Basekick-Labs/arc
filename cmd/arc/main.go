@@ -2548,7 +2548,11 @@ func main() {
 		// Configure DuckDB with cold tier S3 credentials for direct S3 queries
 		// This is needed because DuckDB's httpfs extension needs credentials to query S3 directly
 		cold := cfg.TieredStorage.Cold
-		if cold.Enabled && cold.Backend == "s3" && cold.S3AccessKey != "" {
+		// Configure DuckDB for cold-tier S3 whenever cold tiering targets S3.
+		// Empty access/secret keys are valid: ConfigureS3 then provisions a
+		// CREDENTIAL_CHAIN secret so IAM roles / IRSA / env credentials work for
+		// tiered queries. A half-supplied key pair is rejected by ConfigureS3.
+		if cold.Enabled && cold.Backend == "s3" {
 			if err := db.ConfigureS3(&database.S3Config{
 				Region:    cold.S3Region,
 				Endpoint:  cold.S3Endpoint,
@@ -2556,10 +2560,27 @@ func main() {
 				SecretKey: cold.S3SecretKey,
 				UseSSL:    cold.S3UseSSL,
 				PathStyle: cold.S3PathStyle,
+				Bucket:    cold.S3Bucket,
+				Prefix:    cold.S3Prefix,
 			}); err != nil {
 				log.Warn().Err(err).Msg("Failed to configure DuckDB with cold tier S3 credentials")
 			} else {
 				log.Info().Msg("DuckDB configured with cold tier S3 credentials for multi-tier queries")
+			}
+		}
+
+		// Configure DuckDB for cold-tier Azure (scoped secret, separate from the
+		// primary Azure secret). Empty account key → credential chain (managed
+		// identity / env). Mirrors the cold-tier S3 path above.
+		if cold.Enabled && cold.Backend == "azure" {
+			if err := db.ConfigureAzure(&database.AzureConfig{
+				AccountName: cold.AzureAccountName,
+				AccountKey:  cold.AzureAccountKey,
+				Container:   cold.AzureContainer,
+			}); err != nil {
+				log.Warn().Err(err).Msg("Failed to configure DuckDB with cold tier Azure credentials")
+			} else {
+				log.Info().Msg("DuckDB configured with cold tier Azure credentials for multi-tier queries")
 			}
 		}
 	}

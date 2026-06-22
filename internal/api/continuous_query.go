@@ -14,6 +14,7 @@ import (
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/ingest"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -678,6 +679,28 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 	})
 }
 
+// wrapSourceMeasurement rewrites `FROM <database>.<measurement>` in a
+// continuous-query body into the given read_parquet(...) expression.
+//
+// Scope is deliberately narrow — only the `FROM db.measurement` form is matched
+// (not JOIN, comma-joins, or quoted identifiers). A regex cannot safely
+// distinguish a genuine table position from a same-named column qualifier
+// (`db.m.field`), a projection/GROUP BY column (`SELECT a, db.m`), or text inside
+// a string literal without a real SQL tokenizer; widening the pattern to those
+// forms silently corrupts valid queries (rewriting a table-valued function into
+// a scalar position). Anything not matched here is left unchanged and fails
+// loudly at query time rather than being mis-rewritten. Broader, parser-based
+// source matching is tracked as a follow-up. See
+// [[feedback_regex_sql_gating_is_leaky]].
+//
+// ReplaceAllLiteralString (not ReplaceAllString) is used so '$' characters in
+// the storage path are inserted verbatim rather than interpreted as regexp
+// submatch references ($1, $name).
+func wrapSourceMeasurement(query, database, measurement, readParquetExpr string) string {
+	pattern := regexp.MustCompile(`(?i)\bFROM\s+` + regexp.QuoteMeta(database) + `\.` + regexp.QuoteMeta(measurement) + `\b`)
+	return pattern.ReplaceAllLiteralString(query, "FROM "+readParquetExpr)
+}
+
 // executeAggregation runs the aggregation query and writes results
 func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *ContinuousQuery, query string, _, _ time.Time) (int64, error) {
 	// Build storage path for source measurement (supports local, S3, Azure)
@@ -692,10 +715,10 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	// Skip if the source measurement name matches a CTE name (it's a virtual table reference)
 	wrappedQuery := query
 	if !cteNames[strings.ToLower(cq.SourceMeasurement)] {
-		readParquetExpr := fmt.Sprintf("read_parquet('%s', union_by_name=true)", measurementPath)
-		// Match FROM database.measurement (e.g., FROM production.cpu)
-		dbMeasurementPattern := regexp.MustCompile(`(?i)\bFROM\s+` + regexp.QuoteMeta(cq.Database) + `\.` + regexp.QuoteMeta(cq.SourceMeasurement) + `\b`)
-		wrappedQuery = dbMeasurementPattern.ReplaceAllString(query, "FROM "+readParquetExpr)
+		// Escape single quotes: DuckDB read_parquet() paths cannot be
+		// parameterized, so the path is interpolated into a SQL string literal.
+		readParquetExpr := fmt.Sprintf("read_parquet('%s', union_by_name=true)", sqlutil.EscapeStringLiteral(measurementPath))
+		wrappedQuery = wrapSourceMeasurement(query, cq.Database, cq.SourceMeasurement, readParquetExpr)
 	}
 
 	h.logger.Debug().Str("query", wrappedQuery).Msg("Executing wrapped query")

@@ -1,6 +1,9 @@
 package database
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestEscapeSQLString(t *testing.T) {
 	tests := []struct {
@@ -160,5 +163,198 @@ func TestStripURLScheme(t *testing.T) {
 				t.Errorf("stripURLScheme(%q) = %q, want %q", tt.input, result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestBuildS3SecretSQL(t *testing.T) {
+	t.Run("AWS minimal (region only), named + scoped", func(t *testing.T) {
+		got, err := buildS3SecretSQL(s3SecretParams{
+			name: arcS3PrimarySecretName, scope: "s3://primary-bucket/",
+			accessKey: "AKIA", secretKey: "secretval", region: "us-east-1", useSSL: true,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		mustContain(t, got, "CREATE OR REPLACE SECRET arc_s3_primary")
+		mustContain(t, got, "TYPE S3")
+		mustContain(t, got, "KEY_ID 'AKIA'")
+		mustContain(t, got, "SECRET 'secretval'")
+		mustContain(t, got, "REGION 'us-east-1'")
+		mustContain(t, got, "URL_STYLE 'vhost'")
+		mustContain(t, got, "USE_SSL true")
+		mustContain(t, got, "SCOPE 's3://primary-bucket/'")
+		if strings.Contains(got, "ENDPOINT") {
+			t.Errorf("empty endpoint should be omitted, got:\n%s", got)
+		}
+		if strings.Contains(got, "CREDENTIAL_CHAIN") {
+			t.Errorf("static keys must not use the credential chain, got:\n%s", got)
+		}
+	})
+
+	t.Run("MinIO (endpoint, path-style, no SSL)", func(t *testing.T) {
+		got, err := buildS3SecretSQL(s3SecretParams{
+			name:      arcS3PrimarySecretName,
+			accessKey: "key", secretKey: "sec", endpoint: "http://minio.local:9000", pathStyle: true,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// endpoint must be scheme-stripped
+		mustContain(t, got, "ENDPOINT 'minio.local:9000'")
+		mustContain(t, got, "URL_STYLE 'path'")
+		mustContain(t, got, "USE_SSL false")
+		if strings.Contains(got, "REGION") {
+			t.Errorf("empty region should be omitted, got:\n%s", got)
+		}
+		if strings.Contains(got, "SCOPE") {
+			t.Errorf("empty scope should be omitted, got:\n%s", got)
+		}
+	})
+
+	t.Run("no keys -> credential chain", func(t *testing.T) {
+		// Both keys empty: defer to the AWS credential chain (IAM role / IRSA /
+		// env). Verified separately against live DuckDB that CREDENTIAL_CHAIN
+		// composes with the endpoint params.
+		got, err := buildS3SecretSQL(s3SecretParams{
+			name: arcS3ColdSecretName, region: "us-east-1", endpoint: "minio.local:9000", pathStyle: true,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		mustContain(t, got, "CREATE OR REPLACE SECRET arc_s3_cold")
+		mustContain(t, got, "PROVIDER CREDENTIAL_CHAIN")
+		mustContain(t, got, "REGION 'us-east-1'")
+		mustContain(t, got, "ENDPOINT 'minio.local:9000'")
+		if strings.Contains(got, "KEY_ID") || strings.Contains(got, "SECRET '") {
+			t.Errorf("credential chain must not emit KEY_ID/SECRET, got:\n%s", got)
+		}
+	})
+
+	t.Run("exactly one key set -> error", func(t *testing.T) {
+		// Asymmetric config is a misconfiguration trap: silently routing to the
+		// credential chain would discard the provided key.
+		if _, err := buildS3SecretSQL(s3SecretParams{name: "x", accessKey: "AKIA", region: "us-east-1"}); err == nil {
+			t.Error("access key without secret key should error")
+		}
+		if _, err := buildS3SecretSQL(s3SecretParams{name: "x", secretKey: "secretval", region: "us-east-1"}); err == nil {
+			t.Error("secret key without access key should error")
+		}
+	})
+
+	t.Run("malformed endpoint strips to empty -> omitted", func(t *testing.T) {
+		// "http://" strips to "" and must not emit an empty ENDPOINT '' clause.
+		got, err := buildS3SecretSQL(s3SecretParams{name: "x", accessKey: "k", secretKey: "s", region: "us-east-1", endpoint: "http://"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if strings.Contains(got, "ENDPOINT") {
+			t.Errorf("endpoint that strips to empty should be omitted, got:\n%s", got)
+		}
+	})
+
+	t.Run("single quotes escaped (incl. scope)", func(t *testing.T) {
+		// A secret key/region/scope containing a quote must not break out of the
+		// SQL string literal.
+		got, err := buildS3SecretSQL(s3SecretParams{
+			name: "x", scope: "s3://b'k/",
+			accessKey: "ak'); DROP", secretKey: "se'cret", region: "re'gion", endpoint: "ep'host",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		mustContain(t, got, "KEY_ID 'ak''); DROP'")
+		mustContain(t, got, "SECRET 'se''cret'")
+		mustContain(t, got, "REGION 're''gion'")
+		mustContain(t, got, "ENDPOINT 'ep''host'")
+		mustContain(t, got, "SCOPE 's3://b''k/'")
+	})
+}
+
+func TestS3SecretScope(t *testing.T) {
+	tests := []struct {
+		bucket, prefix, want string
+	}{
+		{"", "", ""},                        // no bucket -> unscoped
+		{"", "p", ""},                       // prefix without bucket -> unscoped
+		{"bkt", "", "s3://bkt/"},            // bucket only
+		{"bkt", "data", "s3://bkt/data/"},   // bucket + prefix
+		{"bkt", "/data/", "s3://bkt/data/"}, // leading/trailing slashes normalized
+	}
+	for _, tt := range tests {
+		if got := s3SecretScope(tt.bucket, tt.prefix); got != tt.want {
+			t.Errorf("s3SecretScope(%q, %q) = %q, want %q", tt.bucket, tt.prefix, got, tt.want)
+		}
+	}
+}
+
+func TestBuildAzureSecretSQL(t *testing.T) {
+	t.Run("account key -> connection string, named + scoped", func(t *testing.T) {
+		got, err := buildAzureSecretSQL(azureSecretParams{
+			name: arcAzurePrimarySecretName, scope: "azure://primary/",
+			accountName: "acct", accountKey: "key==",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		mustContain(t, got, "CREATE OR REPLACE SECRET azure_secret_primary")
+		mustContain(t, got, "TYPE AZURE")
+		mustContain(t, got, "CONNECTION_STRING 'AccountName=acct;AccountKey=key=='")
+		mustContain(t, got, "SCOPE 'azure://primary/'")
+		if strings.Contains(got, "CREDENTIAL_CHAIN") {
+			t.Errorf("account key must not use credential chain, got:\n%s", got)
+		}
+	})
+
+	t.Run("no key -> credential chain", func(t *testing.T) {
+		got, err := buildAzureSecretSQL(azureSecretParams{
+			name: arcAzureColdSecretName, scope: "azure://cold/", accountName: "acct",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		mustContain(t, got, "CREATE OR REPLACE SECRET azure_secret_cold")
+		mustContain(t, got, "PROVIDER CREDENTIAL_CHAIN")
+		mustContain(t, got, "ACCOUNT_NAME 'acct'")
+		mustContain(t, got, "SCOPE 'azure://cold/'")
+		if strings.Contains(got, "CONNECTION_STRING") {
+			t.Errorf("credential chain must not emit CONNECTION_STRING, got:\n%s", got)
+		}
+	})
+
+	t.Run("missing account name -> error", func(t *testing.T) {
+		if _, err := buildAzureSecretSQL(azureSecretParams{name: "x", accountKey: "k"}); err == nil {
+			t.Error("missing account name should error")
+		}
+	})
+
+	t.Run("single quotes escaped", func(t *testing.T) {
+		got, err := buildAzureSecretSQL(azureSecretParams{
+			name: "x", scope: "azure://c'/", accountName: "ac't", accountKey: "k'y",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// connection string embeds both escaped values inside one literal
+		mustContain(t, got, "CONNECTION_STRING 'AccountName=ac''t;AccountKey=k''y'")
+		mustContain(t, got, "SCOPE 'azure://c''/'")
+	})
+}
+
+func TestAzureScope(t *testing.T) {
+	tests := []struct{ container, want string }{
+		{"", ""},
+		{"c1", "azure://c1/"},
+	}
+	for _, tt := range tests {
+		if got := azureScope(tt.container); got != tt.want {
+			t.Errorf("azureScope(%q) = %q, want %q", tt.container, got, tt.want)
+		}
+	}
+}
+
+func mustContain(t *testing.T, haystack, needle string) {
+	t.Helper()
+	if !strings.Contains(haystack, needle) {
+		t.Errorf("expected SQL to contain %q, got:\n%s", needle, haystack)
 	}
 }
