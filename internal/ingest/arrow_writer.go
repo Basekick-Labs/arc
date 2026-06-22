@@ -2409,11 +2409,12 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	// case (all rows in the current hour) never does. Deferring it past the single-hour
 	// check saved ~15GB of bucket-index allocation per the 2026-06-22 profile.
 	globalMin, globalMax := times[0], times[0]
-	for _, t := range times {
+	for _, t := range times[1:] {
+		// else if is safe: globalMax >= globalMin always holds, so a value strictly
+		// below the running min cannot also be strictly above the running max.
 		if t < globalMin {
 			globalMin = t
-		}
-		if t > globalMax {
+		} else if t > globalMax {
 			globalMax = t
 		}
 	}
