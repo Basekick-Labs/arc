@@ -1,0 +1,67 @@
+name: CI
+
+# Run the Go test suite with the SHIPPING build tags on every PR and push to
+# main, so what we test is what we ship. The duckdb_arrow tag is mandatory —
+# the DuckDB driver gates its Arrow CGO API behind it (see issue #490), so a
+# bare `go test` does not compile the Arrow path. Both shipped variants are
+# covered: standard (-tags=duckdb_arrow) and FIPS (-tags=duckdb_arrow,fips,
+# GOFIPS140), mirroring the build-binaries matrix in release-build.yml.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: standard
+            build_tags: duckdb_arrow
+            gofips: ""
+          - variant: fips
+            build_tags: duckdb_arrow,fips
+            gofips: "v1.0.0"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.4'
+          cache: true
+
+      # vet only on the standard variant (vet findings are tag-independent;
+      # running once avoids duplicate annotations). No gofmt gate: Go 1.26's
+      # gofmt rewrites doc-comment content (e.g. mangles the `'it''s'` SQL-escape
+      # example in internal/sql/mask.go), so enforcing it in CI would propagate
+      # comment corruption. Format is left to local tooling / review.
+      - name: go vet
+        if: matrix.variant == 'standard'
+        env:
+          CGO_ENABLED: 1
+        run: go vet -tags=duckdb_arrow ./...
+
+      # No -race: bcrypt-based auth tests hard-code 1000ms request timeouts that
+      # the race detector's CPU overhead blows past (not real races — the suite
+      # is race-clean). The #490 goal is tag-correct coverage (test == ship),
+      # which -race is orthogonal to. Race coverage can be added later behind a
+      # carve-out for the timeout-sensitive auth/api packages.
+      - name: go test
+        env:
+          CGO_ENABLED: 1
+          GOFIPS140: ${{ matrix.gofips }}
+        run: go test -tags=${{ matrix.build_tags }} ./...
