@@ -662,22 +662,52 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 		}
 	}
 
-	// Build and execute compaction query (with dedup if tag metadata found)
-	query := buildCompactionQuery(fileListSQL, orderByClause, outputFile, tagColumns)
+	// Build and execute compaction statement(s) (with dedup if tag metadata found).
+	// The dedup path returns two statements (CREATE OR REPLACE TEMP TABLE + COPY).
+	// A DuckDB TEMP table is connection-local, and database/sql does NOT guarantee
+	// two sequential ExecContext calls share a pooled connection — so the COPY
+	// could land on a different connection and fail to see the staged table. We
+	// pin both statements to a single dedicated connection via db.Conn. Closing it
+	// also deterministically drops the temp table (no leak on partial failure).
+	dedupBranch := len(tagColumns) > 0
+	stmts := buildCompactionQuery(fileListSQL, orderByClause, outputFile, tagColumns)
 
 	// When dedup is active, count rows before compaction using parquet metadata (no data scan)
 	var rowsBefore int64
-	if len(tagColumns) > 0 {
+	if dedupBranch {
 		rowsBefore, _ = countParquetRows(ctx, db, fileListSQL)
 	}
 
-	_, err := db.ExecContext(ctx, query)
+	conn, err := db.Conn(ctx)
 	if err != nil {
-		return "", fmt.Errorf("failed to execute compaction query: %w", err)
+		return "", fmt.Errorf("failed to acquire compaction connection: %w", err)
+	}
+	// conn.Close() returns the connection to the pool, NOT destroyed — and the
+	// DuckDB driver implements no session reset, so a TEMP table created here
+	// would persist on the pooled connection (retained memory on any reused *sql.DB).
+	// Drop it explicitly so the connection returns clean. DROP runs on the same
+	// pinned conn; ignore its error (best-effort cleanup, the real error is the
+	// statement error). defer Close guards against an early return leaking the conn.
+	defer func() {
+		if dedupBranch {
+			// Use a detached context: if the job's ctx was cancelled/timed out,
+			// running the DROP on ctx would skip it and leave the temp table on
+			// the pooled connection (the driver does no session reset). A short
+			// independent timeout guarantees the cleanup runs.
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, _ = conn.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS "+dedupStagingTable)
+		}
+		conn.Close()
+	}()
+	for _, stmt := range stmts {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			return "", fmt.Errorf("failed to execute compaction query: %w", err)
+		}
 	}
 
 	// Log dedup metrics when rows were removed
-	if len(tagColumns) > 0 && rowsBefore > 0 {
+	if dedupBranch && rowsBefore > 0 {
 		escapedOutput := escapeSQLPath(outputFile)
 		rowsAfter, _ := countParquetRows(ctx, db, fmt.Sprintf("['%s']", escapedOutput))
 		if rowsAfter > 0 && rowsAfter < rowsBefore {
