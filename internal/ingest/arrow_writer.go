@@ -2403,11 +2403,19 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		return fmt.Errorf("no time data in batch")
 	}
 
-	// OPTIMIZATION: Group by hour in a single O(n) pass
-	// This gives us: hour buckets, global min/max, per-hour min/max
-	hourBuckets, globalMin, globalMax, err := groupByHour(times)
-	if err != nil {
-		return fmt.Errorf("failed to group by hour: %w", err)
+	// Cheap O(n) min/max scan to decide single- vs multi-hour. The full per-hour
+	// bucketing (groupByHour) allocates an index slice covering every row and is only
+	// needed when the flush actually spans multiple hours — which the common live-ingest
+	// case (all rows in the current hour) never does. Deferring it past the single-hour
+	// check saved ~15GB of bucket-index allocation per the 2026-06-22 profile.
+	globalMin, globalMax := times[0], times[0]
+	for _, t := range times {
+		if t < globalMin {
+			globalMin = t
+		}
+		if t > globalMax {
+			globalMax = t
+		}
 	}
 
 	minTime := time.UnixMicro(globalMin).UTC()
@@ -2474,7 +2482,15 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		return nil
 	}
 
-	// Multiple hours - process each hour bucket independently
+	// Multiple hours - now (and only now) build the per-hour index buckets. This is the
+	// allocation-heavy path, but a multi-hour flush is the uncommon backfill/clock-skew
+	// case, so paying for the full bucketing here keeps the common single-hour path cheap.
+	hourBuckets, _, _, err := groupByHour(times)
+	if err != nil {
+		return fmt.Errorf("failed to group by hour: %w", err)
+	}
+
+	// Process each hour bucket independently
 	b.logger.Info().
 		Str("buffer_key", bufferKey).
 		Int("num_hours", len(hourBuckets)).
@@ -2950,29 +2966,12 @@ func sortColumnsByTimeOnlyWithPermutation(columns map[string]interface{}) (map[s
 		return columns, nil, nil
 	}
 
-	// FAST PATH: Check if already sorted (common case for time-series producers)
-	// This is O(n) but much cheaper than sorting + permutation when data is in order
-	alreadySorted := true
-	for i := 1; i < n; i++ {
-		if times[i] < times[i-1] {
-			alreadySorted = false
-			break
-		}
+	// Compute the time-ordering permutation. permuteByTime returns nil when the
+	// data is already sorted (identity), letting callers skip rematerialization.
+	indices := permuteByTime(times)
+	if indices == nil {
+		return columns, nil, nil // already sorted — nil indices signals identity permutation
 	}
-	if alreadySorted {
-		return columns, nil, nil // nil indices signals identity permutation
-	}
-
-	// Create permutation indices
-	indices := make([]int, n)
-	for i := range indices {
-		indices[i] = i
-	}
-
-	// Sort by time directly (no function call overhead per comparison)
-	sort.Slice(indices, func(i, j int) bool {
-		return times[indices[i]] < times[indices[j]]
-	})
 
 	// Apply permutation to all columns
 	result := make(map[string]interface{}, len(columns))
@@ -2981,6 +2980,116 @@ func sortColumnsByTimeOnlyWithPermutation(columns map[string]interface{}) (map[s
 	}
 
 	return result, indices, nil
+}
+
+// radixSkipThreshold: below this row count the comparison sort wins (radix's fixed
+// per-pass overhead isn't amortized), so permuteByTime uses sort.Slice for small buffers.
+const radixSkipThreshold = 4096
+
+// permuteByTime returns the permutation that sorts times ascending, or nil when the
+// data is already sorted (identity permutation — callers skip rematerialization).
+//
+// The merged 5M-row flush buffer is, under concurrent producers, effectively unordered:
+// rows from many in-flight batches interleave at the row level as they append to the
+// shared buffer (the 2026-06-22 profile measured ~2.5M sorted runs in a 5M-row buffer,
+// i.e. no exploitable run structure). The previous closure-based sort.Slice cost ~6.9%
+// of total CPU on this path. The keys are int64 microsecond timestamps, so an LSD radix
+// sort wins decisively (no comparisons; the near-constant high bytes are skipped per
+// pass): measured ~5x faster than sort.Slice (796ms -> 157ms on 5M rows). Negative
+// (pre-epoch) timestamps are handled via radixSortBias.
+//
+// The already-sorted check is kept first: in-order single-producer ingest stays an O(n)
+// scan with zero permutation work.
+func permuteByTime(times []int64) []int {
+	n := len(times)
+	if n == 0 {
+		return nil
+	}
+
+	// FAST PATH: already sorted (single in-order producer) — identity permutation.
+	alreadySorted := true
+	for i := 1; i < n; i++ {
+		if times[i] < times[i-1] {
+			alreadySorted = false
+			break
+		}
+	}
+	if alreadySorted {
+		return nil
+	}
+
+	// Small buffers: comparison sort beats radix's fixed per-pass cost.
+	if n < radixSkipThreshold {
+		return permuteByTimeSort(times)
+	}
+
+	return radixPermuteByTime(times)
+}
+
+// permuteByTimeSort is the comparison-sort path for small buffers.
+func permuteByTimeSort(times []int64) []int {
+	n := len(times)
+	indices := make([]int, n)
+	for i := range indices {
+		indices[i] = i
+	}
+	sort.Slice(indices, func(i, j int) bool {
+		return times[indices[i]] < times[indices[j]]
+	})
+	return indices
+}
+
+// radixSortBias maps a signed int64 to its order-preserving unsigned key by flipping the
+// sign bit: int64 min -> 0, int64 max -> max. This lets an unsigned LSD radix sort produce
+// correct ascending order even when timestamps are negative (pre-1970, which Line Protocol
+// and MessagePack both accept — see #312). Without it, negatives' set sign bit would sort
+// them after positives.
+func radixSortBias(t int64) uint64 {
+	return uint64(t) ^ (1 << 63)
+}
+
+// radixPermuteByTime returns the ascending-time permutation via an LSD radix sort over
+// the int64 timestamps (8 passes of 8 bits), using radixSortBias so negative (pre-epoch)
+// timestamps order correctly. Passes where every key shares one byte value are skipped,
+// which makes the near-constant high-order bytes (all timestamps near "now") almost free.
+// Stable, which keeps equal-timestamp rows in arrival order.
+func radixPermuteByTime(times []int64) []int {
+	n := len(times)
+	if n == 0 {
+		// Defensive: permuteByTime already short-circuits empty input, but guard here
+		// too so a direct caller can't trip the times[src[0]] index below.
+		return nil
+	}
+	src := make([]int, n)
+	for i := range src {
+		src[i] = i
+	}
+	dst := make([]int, n)
+
+	var count [256]int
+	for shift := uint(0); shift < 64; shift += 8 {
+		count = [256]int{}
+		for _, ix := range src {
+			count[(radixSortBias(times[ix])>>shift)&0xff]++
+		}
+		// Skip this pass if all keys fall in a single bucket (e.g. constant high bytes).
+		if count[(radixSortBias(times[src[0]])>>shift)&0xff] == n {
+			continue
+		}
+		sum := 0
+		for i := 0; i < 256; i++ {
+			c := count[i]
+			count[i] = sum
+			sum += c
+		}
+		for _, ix := range src {
+			b := (radixSortBias(times[ix]) >> shift) & 0xff
+			dst[count[b]] = ix
+			count[b]++
+		}
+		src, dst = dst, src
+	}
+	return src
 }
 
 // compareMultiKeyCached compares two rows by multiple sort keys using cached column pointers

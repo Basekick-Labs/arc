@@ -97,14 +97,18 @@ See Arc in action: [https://basekick.net/demos](https://basekick.net/demos)
 Benchmarked on Apple MacBook Pro M3 Max (14 cores, 36GB RAM, 1TB NVMe).
 Test config: 12 concurrent workers, 1000-record batches, columnar data.
 
-### Ingestion
+### Ingestion (June 2026)
 
 | Protocol | Throughput | p50 Latency | p99 Latency |
 |----------|------------|-------------|-------------|
-| MessagePack Columnar | **19.9M rec/s** | 0.43ms | 2.95ms |
-| MessagePack + Zstd | 16.5M rec/s | 0.60ms | 2.70ms |
-| MessagePack + GZIP | 16.5M rec/s | 0.60ms | 2.71ms |
-| Line Protocol | 5.5M rec/s | 1.77ms | 7.13ms |
+| MessagePack Columnar | **20.9M rec/s** | 0.43ms | 2.67ms |
+| MessagePack + Zstd | 17.2M rec/s | 0.58ms | 2.49ms |
+| MessagePack + GZIP | 16.9M rec/s | 0.59ms | 2.55ms |
+| Line Protocol | 5.4M rec/s | 1.83ms | 7.24ms |
+
+All rows measured over a 60-second sustained run. The radix flush-sort and single-hour
+allocation fixes in 26.06.2 lifted MessagePack Columnar from 19.9M to 20.9M and flattened
+its decay curve; the Zstd/GZIP rows benefit from the same flush-path work.
 
 ### Compaction
 
