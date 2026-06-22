@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2" // duckdb driver
 )
@@ -23,7 +24,9 @@ func execCompaction(ctx context.Context, db *sql.DB, fileListSQL, orderByClause,
 	}
 	defer func() {
 		if len(tagColumns) > 0 {
-			_, _ = conn.ExecContext(ctx, "DROP TABLE IF EXISTS "+dedupStagingTable)
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, _ = conn.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS "+dedupStagingTable)
 		}
 		conn.Close()
 	}()

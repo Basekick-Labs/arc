@@ -690,7 +690,13 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// statement error). defer Close guards against an early return leaking the conn.
 	defer func() {
 		if dedupBranch {
-			_, _ = conn.ExecContext(ctx, "DROP TABLE IF EXISTS "+dedupStagingTable)
+			// Use a detached context: if the job's ctx was cancelled/timed out,
+			// running the DROP on ctx would skip it and leave the temp table on
+			// the pooled connection (the driver does no session reset). A short
+			// independent timeout guarantees the cleanup runs.
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, _ = conn.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS "+dedupStagingTable)
 		}
 		conn.Close()
 	}()
