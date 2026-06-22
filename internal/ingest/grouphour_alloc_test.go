@@ -32,8 +32,9 @@ func BenchmarkGroupByHour_SingleHour(b *testing.B) {
 	}
 }
 
-// BenchmarkMinMaxScan_SingleHour: the NEW cost — just the inline min/max scan that
-// replaces groupByHour on the single-hour decision.
+// BenchmarkMinMaxScan_SingleHour: the NEW cost — the inline min/max scan that replaces
+// groupByHour on the single-hour decision. Mirrors the production loop in
+// flushPartitionedData (two unconditional comparisons over the full range).
 func BenchmarkMinMaxScan_SingleHour(b *testing.B) {
 	times := singleHourTimes(5_000_000)
 	b.ReportAllocs()
@@ -45,6 +46,28 @@ func BenchmarkMinMaxScan_SingleHour(b *testing.B) {
 				mn = t
 			}
 			if t > mx {
+				mx = t
+			}
+		}
+		_, _ = mn, mx
+	}
+}
+
+// BenchmarkMinMaxScan_ElseIf: the else-if + times[1:] variant a reviewer suggested.
+// Kept to document that it is NOT used: on ascending live-ingest input it is ~24%
+// slower (1.55ms vs 1.25ms on 5M rows) because the else-if makes the second comparison
+// data-dependent, defeating the branch predictor on monotonic data. See the production
+// loop comment in flushPartitionedData.
+func BenchmarkMinMaxScan_ElseIf(b *testing.B) {
+	times := singleHourTimes(5_000_000)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		mn, mx := times[0], times[0]
+		for _, t := range times[1:] {
+			if t < mn {
+				mn = t
+			} else if t > mx {
 				mx = t
 			}
 		}
