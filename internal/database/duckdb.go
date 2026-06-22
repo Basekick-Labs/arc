@@ -414,7 +414,12 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	}
 
 	// Configure httpfs extension + primary S3 secret if primary storage uses S3.
-	if cfg.S3AccessKey != "" && cfg.S3SecretKey != "" {
+	// Use || so a half-configured pair (exactly one key set) reaches
+	// configureS3Access and is rejected by buildS3SecretSQL at startup, instead
+	// of being silently skipped. Both-empty falls through to the cold-tier branch
+	// (primary storage is not S3); primary credential-chain is intentionally not
+	// supported here (would require both empty AND an explicit S3 primary signal).
+	if cfg.S3AccessKey != "" || cfg.S3SecretKey != "" {
 		if err := configureS3Access(db, cfg, logger); err != nil {
 			return fmt.Errorf("failed to configure S3 access: %w", err)
 		}

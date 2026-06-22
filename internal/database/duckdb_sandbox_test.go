@@ -482,6 +482,37 @@ func TestColdTierS3SecretWithLocalPrimary(t *testing.T) {
 	}
 }
 
+// TestHalfConfiguredPrimaryS3Fails verifies the startup gate routes a
+// half-configured primary credential pair (exactly one of access/secret key set)
+// into configureS3Access so buildS3SecretSQL rejects it, rather than silently
+// skipping S3 configuration. Guards the `||` gate in configureDatabase.
+func TestHalfConfiguredPrimaryS3Fails(t *testing.T) {
+	tmp := t.TempDir()
+	storageRoot := filepath.Join(tmp, "data")
+	if err := os.MkdirAll(storageRoot, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	cfg := &Config{
+		MaxConnections:   2,
+		MemoryLimit:      "256MB",
+		LocalStorageRoot: storageRoot,
+		TempDirectory:    tmp,
+		S3AccessKey:      "AKIAONLY", // secret key intentionally empty
+	}
+	db, err := New(cfg, zerolog.Nop())
+	if err == nil {
+		db.Close()
+		t.Fatal("New succeeded with a half-configured primary S3 credential; expected startup failure")
+	}
+	// Skip if the failure is an offline httpfs issue rather than the validation.
+	if strings.Contains(err.Error(), "install httpfs") || strings.Contains(err.Error(), "load httpfs") {
+		t.Skipf("httpfs unavailable (offline?): %v", err)
+	}
+	if !strings.Contains(err.Error(), "misconfigured") {
+		t.Fatalf("expected credential-misconfiguration error, got: %v", err)
+	}
+}
+
 // TestAzureCredentialChainStartup covers the previously-unreachable Azure
 // managed-identity path: configureAzureAccess used to be gated on BOTH account
 // name and key, so the PROVIDER CREDENTIAL_CHAIN branch (account name only) was
