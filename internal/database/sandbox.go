@@ -214,3 +214,15 @@ func s3PrefixURI(bucket, prefix string) string {
 	}
 	return "s3://" + bucket + "/" + prefix + "/"
 }
+
+// s3SecretScope builds the SCOPE prefix for a DuckDB S3 secret. It reuses
+// s3PrefixURI so the secret's scope matches the sandbox allowlist entry exactly
+// (same bucket/prefix normalization), but returns "" when no bucket is
+// configured so the caller emits an UNSCOPED secret rather than a bogus
+// "s3:///" scope.
+func s3SecretScope(bucket, prefix string) string {
+	if bucket == "" {
+		return ""
+	}
+	return s3PrefixURI(bucket, prefix)
+}

@@ -167,18 +167,22 @@ func TestStripURLScheme(t *testing.T) {
 }
 
 func TestBuildS3SecretSQL(t *testing.T) {
-	t.Run("AWS minimal (region only)", func(t *testing.T) {
-		got, err := buildS3SecretSQL("AKIA", "secretval", "us-east-1", "", false, true)
+	t.Run("AWS minimal (region only), named + scoped", func(t *testing.T) {
+		got, err := buildS3SecretSQL(s3SecretParams{
+			name: arcS3PrimarySecretName, scope: "s3://primary-bucket/",
+			accessKey: "AKIA", secretKey: "secretval", region: "us-east-1", useSSL: true,
+		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		mustContain(t, got, "CREATE OR REPLACE SECRET arc_s3")
+		mustContain(t, got, "CREATE OR REPLACE SECRET arc_s3_primary")
 		mustContain(t, got, "TYPE S3")
 		mustContain(t, got, "KEY_ID 'AKIA'")
 		mustContain(t, got, "SECRET 'secretval'")
 		mustContain(t, got, "REGION 'us-east-1'")
 		mustContain(t, got, "URL_STYLE 'vhost'")
 		mustContain(t, got, "USE_SSL true")
+		mustContain(t, got, "SCOPE 's3://primary-bucket/'")
 		if strings.Contains(got, "ENDPOINT") {
 			t.Errorf("empty endpoint should be omitted, got:\n%s", got)
 		}
@@ -188,7 +192,10 @@ func TestBuildS3SecretSQL(t *testing.T) {
 	})
 
 	t.Run("MinIO (endpoint, path-style, no SSL)", func(t *testing.T) {
-		got, err := buildS3SecretSQL("key", "sec", "", "http://minio.local:9000", true, false)
+		got, err := buildS3SecretSQL(s3SecretParams{
+			name:      arcS3PrimarySecretName,
+			accessKey: "key", secretKey: "sec", endpoint: "http://minio.local:9000", pathStyle: true,
+		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -199,16 +206,22 @@ func TestBuildS3SecretSQL(t *testing.T) {
 		if strings.Contains(got, "REGION") {
 			t.Errorf("empty region should be omitted, got:\n%s", got)
 		}
+		if strings.Contains(got, "SCOPE") {
+			t.Errorf("empty scope should be omitted, got:\n%s", got)
+		}
 	})
 
 	t.Run("no keys -> credential chain", func(t *testing.T) {
 		// Both keys empty: defer to the AWS credential chain (IAM role / IRSA /
 		// env). Verified separately against live DuckDB that CREDENTIAL_CHAIN
 		// composes with the endpoint params.
-		got, err := buildS3SecretSQL("", "", "us-east-1", "minio.local:9000", true, false)
+		got, err := buildS3SecretSQL(s3SecretParams{
+			name: arcS3ColdSecretName, region: "us-east-1", endpoint: "minio.local:9000", pathStyle: true,
+		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
+		mustContain(t, got, "CREATE OR REPLACE SECRET arc_s3_cold")
 		mustContain(t, got, "PROVIDER CREDENTIAL_CHAIN")
 		mustContain(t, got, "REGION 'us-east-1'")
 		mustContain(t, got, "ENDPOINT 'minio.local:9000'")
@@ -220,17 +233,17 @@ func TestBuildS3SecretSQL(t *testing.T) {
 	t.Run("exactly one key set -> error", func(t *testing.T) {
 		// Asymmetric config is a misconfiguration trap: silently routing to the
 		// credential chain would discard the provided key.
-		if _, err := buildS3SecretSQL("AKIA", "", "us-east-1", "", false, true); err == nil {
+		if _, err := buildS3SecretSQL(s3SecretParams{name: "x", accessKey: "AKIA", region: "us-east-1"}); err == nil {
 			t.Error("access key without secret key should error")
 		}
-		if _, err := buildS3SecretSQL("", "secretval", "us-east-1", "", false, true); err == nil {
+		if _, err := buildS3SecretSQL(s3SecretParams{name: "x", secretKey: "secretval", region: "us-east-1"}); err == nil {
 			t.Error("secret key without access key should error")
 		}
 	})
 
 	t.Run("malformed endpoint strips to empty -> omitted", func(t *testing.T) {
 		// "http://" strips to "" and must not emit an empty ENDPOINT '' clause.
-		got, err := buildS3SecretSQL("k", "s", "us-east-1", "http://", false, true)
+		got, err := buildS3SecretSQL(s3SecretParams{name: "x", accessKey: "k", secretKey: "s", region: "us-east-1", endpoint: "http://"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -239,10 +252,13 @@ func TestBuildS3SecretSQL(t *testing.T) {
 		}
 	})
 
-	t.Run("single quotes are escaped", func(t *testing.T) {
-		// A secret key or region containing a quote must not break out of the
+	t.Run("single quotes escaped (incl. scope)", func(t *testing.T) {
+		// A secret key/region/scope containing a quote must not break out of the
 		// SQL string literal.
-		got, err := buildS3SecretSQL("ak'); DROP", "se'cret", "re'gion", "ep'host", false, true)
+		got, err := buildS3SecretSQL(s3SecretParams{
+			name: "x", scope: "s3://b'k/",
+			accessKey: "ak'); DROP", secretKey: "se'cret", region: "re'gion", endpoint: "ep'host",
+		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -250,7 +266,25 @@ func TestBuildS3SecretSQL(t *testing.T) {
 		mustContain(t, got, "SECRET 'se''cret'")
 		mustContain(t, got, "REGION 're''gion'")
 		mustContain(t, got, "ENDPOINT 'ep''host'")
+		mustContain(t, got, "SCOPE 's3://b''k/'")
 	})
+}
+
+func TestS3SecretScope(t *testing.T) {
+	tests := []struct {
+		bucket, prefix, want string
+	}{
+		{"", "", ""},                        // no bucket -> unscoped
+		{"", "p", ""},                       // prefix without bucket -> unscoped
+		{"bkt", "", "s3://bkt/"},            // bucket only
+		{"bkt", "data", "s3://bkt/data/"},   // bucket + prefix
+		{"bkt", "/data/", "s3://bkt/data/"}, // leading/trailing slashes normalized
+	}
+	for _, tt := range tests {
+		if got := s3SecretScope(tt.bucket, tt.prefix); got != tt.want {
+			t.Errorf("s3SecretScope(%q, %q) = %q, want %q", tt.bucket, tt.prefix, got, tt.want)
+		}
+	}
 }
 
 func mustContain(t *testing.T, haystack, needle string) {

@@ -80,23 +80,44 @@ func stripURLScheme(endpoint string) string {
 	return strings.TrimRight(endpoint, "/")
 }
 
-// arcS3SecretName is the stable name of the DuckDB secret that holds Arc's S3
-// credentials. A single fixed name lets the runtime tiering reconfigure path
-// (DuckDB.ConfigureS3) overwrite the same secret via CREATE OR REPLACE rather
-// than accumulating conflicting secrets.
-const arcS3SecretName = "arc_s3"
+// S3 secret names. Primary storage and the cold tier get SEPARATE, SCOPE-bound
+// secrets so a query against the primary bucket and a query against the cold
+// bucket each resolve their own credentials. A single shared secret would let
+// the runtime cold-tier ConfigureS3 overwrite the primary's credentials (the two
+// tiers can use different buckets/accounts), so they must not share a name.
+const (
+	arcS3PrimarySecretName = "arc_s3_primary"
+	arcS3ColdSecretName    = "arc_s3_cold"
+)
+
+// s3SecretParams describes one DuckDB S3 secret to create.
+type s3SecretParams struct {
+	name      string // secret name (must be unique per credential set)
+	scope     string // s3://bucket/prefix/ this secret applies to; "" = unscoped
+	accessKey string
+	secretKey string
+	region    string
+	endpoint  string
+	pathStyle bool
+	useSSL    bool
+}
 
 // buildS3SecretSQL builds a `CREATE OR REPLACE SECRET <name> (TYPE S3, ...)`
-// statement from the provided S3 parameters. Using DuckDB's secrets manager
-// (instead of `SET GLOBAL s3_secret_access_key`) keeps the secret out of
-// current_setting(): the value is unreadable via SQL and redacted in
-// duckdb_secrets(), closing the exfiltration path where any authenticated query
-// user could `SELECT current_setting('s3_secret_access_key')`.
+// statement. Using DuckDB's secrets manager (instead of
+// `SET GLOBAL s3_secret_access_key`) keeps the secret out of current_setting():
+// the value is unreadable via SQL and redacted in duckdb_secrets(), closing the
+// exfiltration path where any authenticated query user could
+// `SELECT current_setting('s3_secret_access_key')`.
 //
 // The secret is TEMPORARY by default (no PERSISTENT keyword): it lives in-memory
 // for the life of the DuckDB instance and is visible to every pooled connection,
 // matching the old SET GLOBAL behavior. PERSISTENT must NOT be used — it would
 // write the key unencrypted to ~/.duckdb/stored_secrets.
+//
+// SCOPE: when non-empty, the secret applies only to paths under that prefix, so
+// primary and cold-tier secrets coexist and DuckDB picks the right credentials
+// per read_parquet() path (longest-prefix match). An empty scope is unscoped
+// (applies to all s3:// paths) — the single-tier default.
 //
 // Credentials are three-way:
 //   - both accessKey and secretKey set → static-key secret (KEY_ID/SECRET).
@@ -109,55 +130,60 @@ const arcS3SecretName = "arc_s3"
 //     authenticate as a different identity (e.g. the host instance role) with no
 //     signal — a misconfiguration trap, not a convenience.
 //
-// accessKey/secretKey/region/endpoint are escaped (single quotes doubled);
+// accessKey/secretKey/region/endpoint/scope are escaped (single quotes doubled);
 // pathStyle and useSSL are program-controlled and emitted as bare enum/bool
-// literals. region/endpoint are only included when non-empty. The endpoint is
-// scheme-stripped internally via stripURLScheme, so callers may pass a raw
+// literals. region/endpoint/scope are only included when non-empty. The endpoint
+// is scheme-stripped internally via stripURLScheme, so callers may pass a raw
 // "https://host:port" value.
-func buildS3SecretSQL(accessKey, secretKey, region, endpoint string, pathStyle, useSSL bool) (string, error) {
-	hasKey, hasSecret := accessKey != "", secretKey != ""
+func buildS3SecretSQL(p s3SecretParams) (string, error) {
+	hasKey, hasSecret := p.accessKey != "", p.secretKey != ""
 	if hasKey != hasSecret {
-		return "", fmt.Errorf("S3 credentials misconfigured: exactly one of access key / secret key is set; provide both (static credentials) or neither (AWS credential chain)")
+		return "", fmt.Errorf("S3 credentials misconfigured for secret %q: exactly one of access key / secret key is set; provide both (static credentials) or neither (AWS credential chain)", p.name)
 	}
 
 	var b strings.Builder
 	b.WriteString("CREATE OR REPLACE SECRET ")
-	b.WriteString(arcS3SecretName)
+	b.WriteString(p.name)
 	b.WriteString(" (\n\tTYPE S3")
 	if hasKey {
 		b.WriteString(",\n\tKEY_ID '")
-		b.WriteString(escapeSQLString(accessKey))
+		b.WriteString(escapeSQLString(p.accessKey))
 		b.WriteString("',\n\tSECRET '")
-		b.WriteString(escapeSQLString(secretKey))
+		b.WriteString(escapeSQLString(p.secretKey))
 		b.WriteString("'")
 	} else {
 		// No static credentials: defer to the AWS credential chain.
 		b.WriteString(",\n\tPROVIDER CREDENTIAL_CHAIN")
 	}
-	if region != "" {
+	if p.region != "" {
 		b.WriteString(",\n\tREGION '")
-		b.WriteString(escapeSQLString(region))
+		b.WriteString(escapeSQLString(p.region))
 		b.WriteString("'")
 	}
 	// Check the stripped value, not the raw endpoint: a malformed config like
 	// "http://" or whitespace strips to "" and must be treated as "no endpoint"
 	// rather than emitting an empty ENDPOINT '' clause.
-	if stripped := stripURLScheme(endpoint); stripped != "" {
+	if stripped := stripURLScheme(p.endpoint); stripped != "" {
 		b.WriteString(",\n\tENDPOINT '")
 		b.WriteString(escapeSQLString(stripped))
 		b.WriteString("'")
 	}
 	urlStyle := "vhost"
-	if pathStyle {
+	if p.pathStyle {
 		urlStyle = "path"
 	}
 	b.WriteString(",\n\tURL_STYLE '")
 	b.WriteString(urlStyle)
 	b.WriteString("',\n\tUSE_SSL ")
-	if useSSL {
+	if p.useSSL {
 		b.WriteString("true")
 	} else {
 		b.WriteString("false")
+	}
+	if p.scope != "" {
+		b.WriteString(",\n\tSCOPE '")
+		b.WriteString(escapeSQLString(p.scope))
+		b.WriteString("'")
 	}
 	b.WriteString("\n)")
 	return b.String(), nil
@@ -534,7 +560,21 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	// after LOAD httpfs (which registers the S3 secret type). CREATE SECRET is a
 	// catalog op and is NOT gated by enable_external_access, so order relative to
 	// the sandbox lockdown is immaterial; we run it here for locality.
-	secretSQL, err := buildS3SecretSQL(cfg.S3AccessKey, cfg.S3SecretKey, cfg.S3Region, cfg.S3Endpoint, cfg.S3PathStyle, cfg.S3UseSSL)
+	//
+	// Scope the primary secret to the primary bucket/prefix when known, so it
+	// coexists with a separately-scoped cold-tier secret (see DuckDB.ConfigureS3)
+	// instead of one clobbering the other. When no bucket is configured the scope
+	// is empty (unscoped), preserving single-tier behavior.
+	secretSQL, err := buildS3SecretSQL(s3SecretParams{
+		name:      arcS3PrimarySecretName,
+		scope:     s3SecretScope(cfg.S3Bucket, cfg.S3Prefix),
+		accessKey: cfg.S3AccessKey,
+		secretKey: cfg.S3SecretKey,
+		region:    cfg.S3Region,
+		endpoint:  cfg.S3Endpoint,
+		pathStyle: cfg.S3PathStyle,
+		useSSL:    cfg.S3UseSSL,
+	})
 	if err != nil {
 		return err
 	}
@@ -622,6 +662,10 @@ type S3Config struct {
 	SecretKey string
 	UseSSL    bool
 	PathStyle bool
+	// Bucket/Prefix scope the cold-tier secret to its own bucket/prefix so it
+	// does not clobber the primary S3 secret. Empty Bucket → unscoped secret.
+	Bucket string
+	Prefix string
 }
 
 // ConfigureS3 reconfigures DuckDB's S3 settings at runtime.
@@ -632,12 +676,24 @@ type S3Config struct {
 // the sandbox lockdown blocks INSTALL/LOAD. This is the only thing that makes the
 // CREATE SECRET (TYPE S3) below work on a local-primary + S3-cold deployment.
 //
-// Credentials go into the secrets manager via CREATE OR REPLACE SECRET (same
-// arc_s3 name as the startup path, so this overwrites in place). This runs after
-// the sandbox lockdown (enable_external_access=false); CREATE SECRET is a catalog
-// operation and is not gated by that flag.
+// Credentials go into the secrets manager via CREATE OR REPLACE SECRET under a
+// DEDICATED cold-tier name (arc_s3_cold), scoped to the cold bucket/prefix. This
+// must NOT reuse the primary secret name — primary and cold can use different
+// buckets/accounts, and a shared secret would let cold credentials clobber the
+// primary's. With distinct scoped secrets, DuckDB resolves the right credentials
+// per read_parquet() path. This runs after the sandbox lockdown
+// (enable_external_access=false); CREATE SECRET is a catalog op, not gated by it.
 func (d *DuckDB) ConfigureS3(s3cfg *S3Config) error {
-	secretSQL, err := buildS3SecretSQL(s3cfg.AccessKey, s3cfg.SecretKey, s3cfg.Region, s3cfg.Endpoint, s3cfg.PathStyle, s3cfg.UseSSL)
+	secretSQL, err := buildS3SecretSQL(s3SecretParams{
+		name:      arcS3ColdSecretName,
+		scope:     s3SecretScope(s3cfg.Bucket, s3cfg.Prefix),
+		accessKey: s3cfg.AccessKey,
+		secretKey: s3cfg.SecretKey,
+		region:    s3cfg.Region,
+		endpoint:  s3cfg.Endpoint,
+		pathStyle: s3cfg.PathStyle,
+		useSSL:    s3cfg.UseSSL,
+	})
 	if err != nil {
 		return err
 	}

@@ -405,7 +405,13 @@ func TestS3SecretNotReadable(t *testing.T) {
 	}
 
 	const secretVal = "SUPER-SECRET-KEY-do-not-leak"
-	secretSQL, err := buildS3SecretSQL("AKIATEST", secretVal, "us-east-1", "", false, true)
+	secretSQL, err := buildS3SecretSQL(s3SecretParams{
+		name:      arcS3PrimarySecretName,
+		accessKey: "AKIATEST",
+		secretKey: secretVal,
+		region:    "us-east-1",
+		useSSL:    true,
+	})
 	if err != nil {
 		t.Fatalf("build S3 secret SQL: %v", err)
 	}
@@ -428,12 +434,79 @@ func TestS3SecretNotReadable(t *testing.T) {
 	//    secret access key must not appear in the rendered secret_string).
 	var name, secretString string
 	if err := db.QueryRowContext(ctx,
-		"SELECT name, secret_string FROM duckdb_secrets() WHERE name = '"+arcS3SecretName+"'").
+		"SELECT name, secret_string FROM duckdb_secrets() WHERE name = '"+arcS3PrimarySecretName+"'").
 		Scan(&name, &secretString); err != nil {
 		t.Fatalf("duckdb_secrets query: %v", err)
 	}
 	if strings.Contains(secretString, secretVal) {
 		t.Fatalf("SECURITY: secret key leaked via duckdb_secrets(): %q", secretString)
+	}
+}
+
+// TestScopedSecretsCoexist is the H-1 regression: a primary and a cold-tier S3
+// secret with DIFFERENT credentials and scopes must coexist, and DuckDB must
+// resolve each path to its own secret. Before the fix both tiers shared one
+// secret name, so configuring the cold tier clobbered the primary credentials.
+func TestScopedSecretsCoexist(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, "INSTALL httpfs"); err != nil {
+		t.Skipf("httpfs unavailable (offline?): %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "LOAD httpfs"); err != nil {
+		t.Skipf("httpfs load failed: %v", err)
+	}
+
+	primarySQL, err := buildS3SecretSQL(s3SecretParams{
+		name: arcS3PrimarySecretName, scope: "s3://primary-bucket/",
+		accessKey: "AKIAPRIMARY", secretKey: "psecret", region: "us-east-1", useSSL: true,
+	})
+	if err != nil {
+		t.Fatalf("build primary: %v", err)
+	}
+	coldSQL, err := buildS3SecretSQL(s3SecretParams{
+		name: arcS3ColdSecretName, scope: "s3://cold-bucket/",
+		region: "us-east-1", useSSL: true, // credential chain
+	})
+	if err != nil {
+		t.Fatalf("build cold: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, primarySQL); err != nil {
+		t.Fatalf("create primary secret: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, coldSQL); err != nil {
+		t.Fatalf("create cold secret: %v", err)
+	}
+
+	// Both secrets must exist (cold did not overwrite primary).
+	var n int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM duckdb_secrets() WHERE name IN ('"+arcS3PrimarySecretName+"','"+arcS3ColdSecretName+"')").
+		Scan(&n); err != nil {
+		t.Fatalf("count secrets: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("expected both scoped secrets to coexist, found %d", n)
+	}
+
+	// which_secret resolves each path to its own scoped secret.
+	resolve := func(path string) string {
+		var name string
+		if err := db.QueryRowContext(ctx,
+			"SELECT name FROM which_secret('"+path+"', 's3')").Scan(&name); err != nil {
+			t.Fatalf("which_secret(%s): %v", path, err)
+		}
+		return name
+	}
+	if got := resolve("s3://primary-bucket/db/m/x.parquet"); got != arcS3PrimarySecretName {
+		t.Errorf("primary path resolved to %q, want %q", got, arcS3PrimarySecretName)
+	}
+	if got := resolve("s3://cold-bucket/db/m/y.parquet"); got != arcS3ColdSecretName {
+		t.Errorf("cold path resolved to %q, want %q", got, arcS3ColdSecretName)
 	}
 }
 

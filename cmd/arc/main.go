@@ -2560,6 +2560,8 @@ func main() {
 				SecretKey: cold.S3SecretKey,
 				UseSSL:    cold.S3UseSSL,
 				PathStyle: cold.S3PathStyle,
+				Bucket:    cold.S3Bucket,
+				Prefix:    cold.S3Prefix,
 			}); err != nil {
 				log.Warn().Err(err).Msg("Failed to configure DuckDB with cold tier S3 credentials")
 			} else {
