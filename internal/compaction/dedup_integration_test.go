@@ -102,3 +102,63 @@ func TestBuildCompactionQuery_DedupMixedTimeType(t *testing.T) {
 		t.Errorf("stored instant = %d µs, want 1609459200000000 (UTC must be preserved)", epochUS)
 	}
 }
+
+// TestBuildCompactionQuery_StandardMixedTimeType is the tagless-branch counterpart
+// of the dedup test above. A measurement whose Parquet files carry NO "arc:tags"
+// metadata (pre-dedup files, msgpack-columnar) takes the standard branch in
+// buildCompactionQuery, which the dedup-branch comment claims mis-binds "time"
+// as VARCHAR under union_by_name even with a top-level SELECT * REPLACE. This
+// test reproduces a mixed-type tagless partition (the live wedge on
+// production/cpu/2026/06/18/03) against Arc's real linked DuckDB.
+func TestBuildCompactionQuery_StandardMixedTimeType(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	if _, err := db.ExecContext(ctx, "SET TimeZone='Etc/GMT+3'"); err != nil {
+		t.Fatalf("set tz: %v", err)
+	}
+
+	fileTZ := filepath.ToSlash(filepath.Join(dir, "a_tz.parquet"))
+	fileStr := filepath.ToSlash(filepath.Join(dir, "b_str.parquet"))
+	out := filepath.ToSlash(filepath.Join(dir, "out.parquet"))
+
+	// Distinct (host, time) rows — no dedup expected, just a type-mixed partition.
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(
+		`COPY (SELECT 'h1' AS host, make_timestamptz(1609459200000000) AS "time", 1.0 AS v) TO '%s' (FORMAT PARQUET)`, escapeSQLPath(fileTZ))); err != nil {
+		t.Fatalf("write tz fixture: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(
+		`COPY (SELECT 'h2' AS host, '1609462800000000' AS "time", 2.0 AS v) TO '%s' (FORMAT PARQUET)`, escapeSQLPath(fileStr))); err != nil {
+		t.Fatalf("write varchar fixture: %v", err)
+	}
+
+	fileList := fmt.Sprintf("['%s', '%s']", escapeSQLPath(fileTZ), escapeSQLPath(fileStr))
+	// nil tagColumns → standard branch (the wedged path).
+	query := buildCompactionQuery(fileList, `ORDER BY "time"`, out, nil)
+
+	if _, err := db.ExecContext(ctx, query); err != nil {
+		t.Fatalf("standard compaction query failed (bind error regression?): %v\nquery:\n%s", err, query)
+	}
+
+	var rows int
+	if err := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT count(*) FROM read_parquet('%s')`, escapeSQLPath(out))).Scan(&rows); err != nil {
+		t.Fatalf("count output: %v", err)
+	}
+	if rows != 2 {
+		t.Errorf("standard compaction produced %d rows, want 2 (no dedup on distinct keys)", rows)
+	}
+
+	var colType string
+	if err := db.QueryRowContext(ctx, fmt.Sprintf(
+		`SELECT typeof("time") FROM read_parquet('%s') LIMIT 1`, escapeSQLPath(out))).Scan(&colType); err != nil {
+		t.Fatalf("get type of time: %v", err)
+	}
+	if colType != "TIMESTAMP WITH TIME ZONE" {
+		t.Errorf("output time type = %q, want TIMESTAMP WITH TIME ZONE", colType)
+	}
+}
