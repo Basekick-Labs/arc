@@ -254,10 +254,11 @@ func main() {
 		// credentials authenticate DuckDB query reads against s3://.
 		S3IsPrimaryBackend: cfg.Storage.Backend == "s3" || cfg.Storage.Backend == "minio",
 		// Azure Blob Storage configuration for azure extension
-		AzureAccountName: cfg.Storage.AzureAccountName,
-		AzureAccountKey:  cfg.Storage.AzureAccountKey,
-		AzureEndpoint:    cfg.Storage.AzureEndpoint,
-		AzureContainer:   cfg.Storage.AzureContainer,
+		AzureAccountName:      cfg.Storage.AzureAccountName,
+		AzureAccountKey:       cfg.Storage.AzureAccountKey,
+		AzureConnectionString: cfg.Storage.AzureConnectionString,
+		AzureEndpoint:         cfg.Storage.AzureEndpoint,
+		AzureContainer:        cfg.Storage.AzureContainer,
 		// Cold-tier sandbox allowlist entries. The cold tier may use a
 		// different bucket/container from the primary backend (commonly
 		// hot=local + cold=S3 on Enterprise); the sandbox must allow both.

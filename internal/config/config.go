@@ -787,12 +787,25 @@ func Load() (*Config, error) {
 	if (cfg.Storage.Backend == "s3" || cfg.Storage.Backend == "minio") && strings.TrimSpace(cfg.Storage.S3Bucket) == "" {
 		return nil, fmt.Errorf("storage.backend is %q but storage.s3_bucket is empty; set storage.s3_bucket", cfg.Storage.Backend)
 	}
-	// Same guard for an Azure primary backend with no container: an empty
-	// container yields an empty sandbox allowlist entry and opaque query-time
-	// permission errors. (Account name is separately required by the Azure
-	// secret builder.)
-	if (cfg.Storage.Backend == "azure" || cfg.Storage.Backend == "azblob") && strings.TrimSpace(cfg.Storage.AzureContainer) == "" {
-		return nil, fmt.Errorf("storage.backend is %q but storage.azure_container is empty; set storage.azure_container", cfg.Storage.Backend)
+	// Same class of guard for an Azure primary backend. An empty container
+	// yields an empty sandbox allowlist entry and opaque query-time permission
+	// errors. An empty account name is worse: configureAzureAccess gates on
+	// AzureAccountName != "", so an empty name silently creates NO primary
+	// secret at all (and buildAzureSecretSQL would reject it anyway) — queries
+	// then fail to authenticate. Reject both here, before any subsystem
+	// initializes, rather than failing at first query.
+	if cfg.Storage.Backend == "azure" || cfg.Storage.Backend == "azblob" {
+		// Account name is required UNLESS a connection string is supplied — the
+		// connection string embeds the account identity, and the Go backend's
+		// first auth case (internal/storage/azure_blob.go) authenticates from it
+		// with AzureAccountName empty. Requiring the name unconditionally would
+		// falsely reject a valid connection-string deployment.
+		if strings.TrimSpace(cfg.Storage.AzureConnectionString) == "" && strings.TrimSpace(cfg.Storage.AzureAccountName) == "" {
+			return nil, fmt.Errorf("storage.backend is %q but neither storage.azure_account_name nor storage.azure_connection_string is set; provide one", cfg.Storage.Backend)
+		}
+		if strings.TrimSpace(cfg.Storage.AzureContainer) == "" {
+			return nil, fmt.Errorf("storage.backend is %q but storage.azure_container is empty; set storage.azure_container", cfg.Storage.Backend)
+		}
 	}
 
 	return cfg, nil

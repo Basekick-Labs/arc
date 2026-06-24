@@ -226,8 +226,12 @@ type Config struct {
 	// Azure Blob Storage configuration for azure extension
 	AzureAccountName string
 	AzureAccountKey  string
-	AzureEndpoint    string // Custom endpoint (optional)
-	AzureContainer   string // Container name; used to build the allowed_directories prefix for the sandbox
+	// AzureConnectionString embeds the account identity (and key) itself. When
+	// set, it is the primary auth method and AzureAccountName may be empty —
+	// mirrors the Go backend's first auth case (internal/storage/azure_blob.go).
+	AzureConnectionString string
+	AzureEndpoint         string // Custom endpoint (optional)
+	AzureContainer        string // Container name; used to build the allowed_directories prefix for the sandbox
 	// Cold-tier sandbox allowlist entries. Independent from S3Bucket /
 	// AzureContainer (which describe Arc's primary/hot storage) because
 	// Enterprise tiered storage routinely combines hot=local with cold=S3 —
@@ -310,7 +314,7 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 	// with empty keys) or static keys are configured. Keying only off key
 	// presence would log s3_enabled=false for a working IRSA deployment.
 	s3Enabled := cfg.S3IsPrimaryBackend || (cfg.S3AccessKey != "" && cfg.S3SecretKey != "")
-	azureEnabled := cfg.AzureAccountName != ""
+	azureEnabled := cfg.AzureAccountName != "" || cfg.AzureConnectionString != ""
 	logger.Info().
 		Int("max_connections", cfg.MaxConnections).
 		Str("memory_limit", cfg.MemoryLimit).
@@ -486,7 +490,7 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	// name is required: when AzureAccountKey is empty, configureAzureAccess
 	// provisions a PROVIDER CREDENTIAL_CHAIN secret so managed identity / az-login
 	// / env credentials work (mirrors the S3 credential-chain behavior).
-	if cfg.AzureAccountName != "" {
+	if cfg.AzureAccountName != "" || cfg.AzureConnectionString != "" {
 		if err := configureAzureAccess(db, cfg, logger); err != nil {
 			return fmt.Errorf("failed to configure Azure access: %w", err)
 		}
@@ -776,34 +780,47 @@ func (d *DuckDB) ClearHTTPCache() {
 
 // azureSecretParams describes one DuckDB Azure secret to create.
 type azureSecretParams struct {
-	name        string // secret name (unique per credential set)
-	scope       string // azure://container/ this secret applies to; "" = unscoped
-	accountName string
-	accountKey  string // empty → PROVIDER CREDENTIAL_CHAIN (managed identity / env)
+	name  string // secret name (unique per credential set)
+	scope string // azure://container/ this secret applies to; "" = unscoped
+	// connectionString, when set, is the auth method (it embeds the account
+	// name + key); accountName/accountKey are then ignored. Mirrors the Go
+	// backend's connection-string-first precedence.
+	connectionString string
+	accountName      string
+	accountKey       string // empty → PROVIDER CREDENTIAL_CHAIN (managed identity / env)
 }
 
 // buildAzureSecretSQL builds a `CREATE OR REPLACE SECRET <name> (TYPE AZURE, ...)`
-// statement. With an account key it builds a connection-string secret; with only
-// an account name (no key) it builds a PROVIDER CREDENTIAL_CHAIN secret so managed
-// identity / az-login / env credentials work. SCOPE, when non-empty, binds the
-// secret to one container so primary and cold-tier Azure secrets coexist and
-// DuckDB resolves the right credentials per path. Values are escaped (single
-// quotes doubled). Mirrors buildS3SecretSQL.
+// statement. Auth precedence mirrors the Go backend (internal/storage/azure_blob.go):
+//   - an explicit connection string → CONNECTION_STRING (account name not required;
+//     the connection string embeds it);
+//   - account name + key → a synthesized AccountName=…;AccountKey=… connection string;
+//   - account name, no key → PROVIDER CREDENTIAL_CHAIN (managed identity / az-login / env).
+//
+// SCOPE, when non-empty, binds the secret to one container so primary and cold-tier
+// Azure secrets coexist and DuckDB resolves the right credentials per path. Values are
+// escaped (single quotes doubled). Mirrors buildS3SecretSQL.
 func buildAzureSecretSQL(p azureSecretParams) (string, error) {
-	if p.accountName == "" {
-		return "", fmt.Errorf("azure secret %q: account name is required", p.name)
+	if p.connectionString == "" && p.accountName == "" {
+		return "", fmt.Errorf("azure secret %q: account name or connection string is required", p.name)
 	}
 	var b strings.Builder
 	b.WriteString("CREATE OR REPLACE SECRET ")
 	b.WriteString(p.name)
 	b.WriteString(" (\n\tTYPE AZURE")
-	if p.accountKey != "" {
-		// Connection string with account key.
+	switch {
+	case p.connectionString != "":
+		// Operator-supplied connection string (embeds account name + key/SAS).
+		b.WriteString(",\n\tCONNECTION_STRING '")
+		b.WriteString(escapeSQLString(p.connectionString))
+		b.WriteString("'")
+	case p.accountKey != "":
+		// Synthesize a connection string from account name + key.
 		connStr := "AccountName=" + p.accountName + ";AccountKey=" + p.accountKey
 		b.WriteString(",\n\tCONNECTION_STRING '")
 		b.WriteString(escapeSQLString(connStr))
 		b.WriteString("'")
-	} else {
+	default:
 		// No key: defer to the Azure credential chain (managed identity / env).
 		b.WriteString(",\n\tPROVIDER CREDENTIAL_CHAIN,\n\tACCOUNT_NAME '")
 		b.WriteString(escapeSQLString(p.accountName))
@@ -856,10 +873,11 @@ func configureAzureAccess(db *sql.DB, cfg *Config, logger zerolog.Logger) error 
 		return err
 	}
 	secretSQL, err := buildAzureSecretSQL(azureSecretParams{
-		name:        arcAzurePrimarySecretName,
-		scope:       azureScope(cfg.AzureContainer),
-		accountName: cfg.AzureAccountName,
-		accountKey:  cfg.AzureAccountKey,
+		name:             arcAzurePrimarySecretName,
+		scope:            azureScope(cfg.AzureContainer),
+		connectionString: cfg.AzureConnectionString,
+		accountName:      cfg.AzureAccountName,
+		accountKey:       cfg.AzureAccountKey,
 	})
 	if err != nil {
 		return err

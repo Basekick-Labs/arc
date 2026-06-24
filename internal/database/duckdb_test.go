@@ -343,9 +343,38 @@ func TestBuildAzureSecretSQL(t *testing.T) {
 		}
 	})
 
-	t.Run("missing account name -> error", func(t *testing.T) {
+	t.Run("connection string -> CONNECTION_STRING, no account name needed", func(t *testing.T) {
+		// A connection string embeds the account identity, so account name may be
+		// empty (mirrors the Go backend's first auth case).
+		got, err := buildAzureSecretSQL(azureSecretParams{
+			name: arcAzurePrimarySecretName, scope: "azure://primary/",
+			connectionString: "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=key==;EndpointSuffix=core.windows.net",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		mustContain(t, got, "CONNECTION_STRING 'DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=key==;EndpointSuffix=core.windows.net'")
+		if strings.Contains(got, "CREDENTIAL_CHAIN") || strings.Contains(got, "ACCOUNT_NAME") {
+			t.Errorf("connection string must not emit CREDENTIAL_CHAIN/ACCOUNT_NAME, got:\n%s", got)
+		}
+	})
+
+	t.Run("connection string takes precedence over account name/key", func(t *testing.T) {
+		got, err := buildAzureSecretSQL(azureSecretParams{
+			name: "x", connectionString: "ConnStr", accountName: "acct", accountKey: "key==",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		mustContain(t, got, "CONNECTION_STRING 'ConnStr'")
+		if strings.Contains(got, "AccountName=acct") {
+			t.Errorf("connection string must take precedence over synthesized conn string, got:\n%s", got)
+		}
+	})
+
+	t.Run("no account name and no connection string -> error", func(t *testing.T) {
 		if _, err := buildAzureSecretSQL(azureSecretParams{name: "x", accountKey: "k"}); err == nil {
-			t.Error("missing account name should error")
+			t.Error("missing both account name and connection string should error")
 		}
 	})
 
