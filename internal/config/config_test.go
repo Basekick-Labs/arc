@@ -792,6 +792,16 @@ func TestLoad_StorageBackendValidation(t *testing.T) {
 		wantError bool
 	}{
 		{
+			name:      "invalid primary backend -> error",
+			env:       map[string]string{"ARC_STORAGE_BACKEND": "gcs"},
+			wantError: true,
+		},
+		{
+			name:      "local primary backend -> ok",
+			env:       map[string]string{"ARC_STORAGE_BACKEND": "local"},
+			wantError: false,
+		},
+		{
 			name:      "s3 primary without bucket -> error",
 			env:       map[string]string{"ARC_STORAGE_BACKEND": "s3"},
 			wantError: true,

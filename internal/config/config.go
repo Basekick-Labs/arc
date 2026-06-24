@@ -791,22 +791,26 @@ func Load() (*Config, error) {
 	cfg.Storage.AzureAccountName = strings.TrimSpace(cfg.Storage.AzureAccountName)
 	cfg.Storage.AzureContainer = strings.TrimSpace(cfg.Storage.AzureContainer)
 
-	// An S3-compatible primary backend with no bucket would build an unscoped
-	// DuckDB credential-chain secret AND an empty sandbox s3:// allowlist (so
-	// every query read fails with an opaque DuckDB permission error). Reject it
-	// here — before any subsystem initializes — rather than failing at first
-	// query. Checked against the normalized Backend value.
-	if (cfg.Storage.Backend == "s3" || cfg.Storage.Backend == "minio") && cfg.Storage.S3Bucket == "" {
-		return nil, fmt.Errorf("storage.backend is %q but storage.s3_bucket is empty; set storage.s3_bucket", cfg.Storage.Backend)
-	}
-	// Same class of guard for an Azure primary backend. An empty container
-	// yields an empty sandbox allowlist entry and opaque query-time permission
-	// errors. An empty account name is worse: configureAzureAccess gates on
-	// AzureAccountName != "", so an empty name silently creates NO primary
-	// secret at all (and buildAzureSecretSQL would reject it anyway) — queries
-	// then fail to authenticate. Reject both here, before any subsystem
-	// initializes, rather than failing at first query.
-	if cfg.Storage.Backend == "azure" || cfg.Storage.Backend == "azblob" {
+	// Validate the primary storage backend against the supported set and check
+	// its required fields — fail fast at load rather than late in main.go's
+	// backend switch. The supported set must match that switch
+	// (cmd/arc/main.go): local / s3 / minio / azure / azblob.
+	switch cfg.Storage.Backend {
+	case "local":
+		// No object-storage fields to validate.
+	case "s3", "minio":
+		// An S3-compatible primary backend with no bucket would build an
+		// unscoped DuckDB credential-chain secret AND an empty sandbox s3://
+		// allowlist, so every query read fails with an opaque DuckDB permission
+		// error.
+		if cfg.Storage.S3Bucket == "" {
+			return nil, fmt.Errorf("storage.backend is %q but storage.s3_bucket is empty; set storage.s3_bucket", cfg.Storage.Backend)
+		}
+	case "azure", "azblob":
+		// An empty container yields an empty sandbox allowlist entry and opaque
+		// query-time errors. An empty account name is worse: configureAzureAccess
+		// gates on AzureAccountName != "", so an empty name silently creates NO
+		// primary secret (and buildAzureSecretSQL would reject it anyway).
 		// Account name is required UNLESS a connection string is supplied — the
 		// connection string embeds the account identity, and the Go backend's
 		// first auth case (internal/storage/azure_blob.go) authenticates from it
@@ -818,6 +822,8 @@ func Load() (*Config, error) {
 		if cfg.Storage.AzureContainer == "" {
 			return nil, fmt.Errorf("storage.backend is %q but storage.azure_container is empty; set storage.azure_container", cfg.Storage.Backend)
 		}
+	default:
+		return nil, fmt.Errorf("storage.backend %q is invalid; must be \"local\", \"s3\", \"minio\", \"azure\", or \"azblob\"", cfg.Storage.Backend)
 	}
 
 	// Cold tier (Enterprise tiered storage). When enabled, validate its backend
