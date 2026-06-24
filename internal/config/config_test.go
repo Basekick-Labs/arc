@@ -873,3 +873,48 @@ func TestLoad_StorageBackendValidation(t *testing.T) {
 		})
 	}
 }
+
+// TestLoad_StorageValuesTrimmed verifies storage identifiers are trimmed
+// in-place at load, so stray copy-paste whitespace can't reach the DuckDB
+// secret SCOPE / sandbox allowlist / cloud clients.
+func TestLoad_StorageValuesTrimmed(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-trim")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	env := map[string]string{
+		"ARC_STORAGE_BACKEND":               "s3",
+		"ARC_STORAGE_S3_BUCKET":             "  my-bucket  ",
+		"ARC_STORAGE_S3_PREFIX":             "  hot/  ",
+		"ARC_TIERED_STORAGE_COLD_ENABLED":   "true",
+		"ARC_TIERED_STORAGE_COLD_BACKEND":   "s3",
+		"ARC_TIERED_STORAGE_COLD_S3_BUCKET": "  cold-bucket  ",
+	}
+	for k, v := range env {
+		os.Setenv(k, v)
+	}
+	defer func() {
+		for k := range env {
+			os.Unsetenv(k)
+		}
+	}()
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Storage.S3Bucket != "my-bucket" {
+		t.Errorf("S3Bucket = %q, want trimmed %q", cfg.Storage.S3Bucket, "my-bucket")
+	}
+	if cfg.Storage.S3Prefix != "hot/" {
+		t.Errorf("S3Prefix = %q, want trimmed %q", cfg.Storage.S3Prefix, "hot/")
+	}
+	if cfg.TieredStorage.Cold.S3Bucket != "cold-bucket" {
+		t.Errorf("Cold.S3Bucket = %q, want trimmed %q (pointer mutation must persist)", cfg.TieredStorage.Cold.S3Bucket, "cold-bucket")
+	}
+}

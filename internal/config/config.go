@@ -779,12 +779,24 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("invalid database.memory_limit value: %q", cfg.Database.MemoryLimit)
 	}
 
+	// Trim storage identifiers in-place before validating. These build DuckDB
+	// secret SCOPEs and sandbox allowlist URIs (s3://bucket/prefix/,
+	// azure://container/) and feed cloud-client config; stray copy-paste
+	// whitespace would pass an emptiness check but then produce opaque
+	// connection/auth failures downstream. (The S3 endpoint is trimmed
+	// separately via stripURLScheme.)
+	cfg.Storage.S3Bucket = strings.TrimSpace(cfg.Storage.S3Bucket)
+	cfg.Storage.S3Prefix = strings.TrimSpace(cfg.Storage.S3Prefix)
+	cfg.Storage.AzureConnectionString = strings.TrimSpace(cfg.Storage.AzureConnectionString)
+	cfg.Storage.AzureAccountName = strings.TrimSpace(cfg.Storage.AzureAccountName)
+	cfg.Storage.AzureContainer = strings.TrimSpace(cfg.Storage.AzureContainer)
+
 	// An S3-compatible primary backend with no bucket would build an unscoped
 	// DuckDB credential-chain secret AND an empty sandbox s3:// allowlist (so
 	// every query read fails with an opaque DuckDB permission error). Reject it
 	// here — before any subsystem initializes — rather than failing at first
 	// query. Checked against the normalized Backend value.
-	if (cfg.Storage.Backend == "s3" || cfg.Storage.Backend == "minio") && strings.TrimSpace(cfg.Storage.S3Bucket) == "" {
+	if (cfg.Storage.Backend == "s3" || cfg.Storage.Backend == "minio") && cfg.Storage.S3Bucket == "" {
 		return nil, fmt.Errorf("storage.backend is %q but storage.s3_bucket is empty; set storage.s3_bucket", cfg.Storage.Backend)
 	}
 	// Same class of guard for an Azure primary backend. An empty container
@@ -800,10 +812,10 @@ func Load() (*Config, error) {
 		// first auth case (internal/storage/azure_blob.go) authenticates from it
 		// with AzureAccountName empty. Requiring the name unconditionally would
 		// falsely reject a valid connection-string deployment.
-		if strings.TrimSpace(cfg.Storage.AzureConnectionString) == "" && strings.TrimSpace(cfg.Storage.AzureAccountName) == "" {
+		if cfg.Storage.AzureConnectionString == "" && cfg.Storage.AzureAccountName == "" {
 			return nil, fmt.Errorf("storage.backend is %q but neither storage.azure_account_name nor storage.azure_connection_string is set; provide one", cfg.Storage.Backend)
 		}
-		if strings.TrimSpace(cfg.Storage.AzureContainer) == "" {
+		if cfg.Storage.AzureContainer == "" {
 			return nil, fmt.Errorf("storage.backend is %q but storage.azure_container is empty; set storage.azure_container", cfg.Storage.Backend)
 		}
 	}
@@ -813,19 +825,25 @@ func Load() (*Config, error) {
 	// above: a missing bucket/container surfaces only as an opaque tiering /
 	// query-time error otherwise. The cold runtime switch (cmd/arc/main.go)
 	// handles exactly "s3" and "azure"; reject anything else loudly. Backend is
-	// normalized at load.
+	// normalized at load. cold is a POINTER so the in-place trims persist to the
+	// real config struct, not a copy.
 	if cfg.TieredStorage.Cold.Enabled {
-		cold := cfg.TieredStorage.Cold
+		cold := &cfg.TieredStorage.Cold
+		cold.S3Bucket = strings.TrimSpace(cold.S3Bucket)
+		cold.S3Prefix = strings.TrimSpace(cold.S3Prefix)
+		cold.AzureConnectionString = strings.TrimSpace(cold.AzureConnectionString)
+		cold.AzureAccountName = strings.TrimSpace(cold.AzureAccountName)
+		cold.AzureContainer = strings.TrimSpace(cold.AzureContainer)
 		switch cold.Backend {
 		case "s3":
-			if strings.TrimSpace(cold.S3Bucket) == "" {
+			if cold.S3Bucket == "" {
 				return nil, fmt.Errorf("tiered_storage.cold.enabled is true and backend is \"s3\" but tiered_storage.cold.s3_bucket is empty; set tiered_storage.cold.s3_bucket")
 			}
 		case "azure":
-			if strings.TrimSpace(cold.AzureConnectionString) == "" && strings.TrimSpace(cold.AzureAccountName) == "" {
+			if cold.AzureConnectionString == "" && cold.AzureAccountName == "" {
 				return nil, fmt.Errorf("tiered_storage.cold.enabled is true and backend is \"azure\" but neither tiered_storage.cold.azure_account_name nor tiered_storage.cold.azure_connection_string is set; provide one")
 			}
-			if strings.TrimSpace(cold.AzureContainer) == "" {
+			if cold.AzureContainer == "" {
 				return nil, fmt.Errorf("tiered_storage.cold.enabled is true and backend is \"azure\" but tiered_storage.cold.azure_container is empty; set tiered_storage.cold.azure_container")
 			}
 		default:
