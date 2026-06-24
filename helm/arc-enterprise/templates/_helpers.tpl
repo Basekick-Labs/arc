@@ -325,6 +325,7 @@ Storage env vars — depends on storage.mode.
 */}}
 {{- define "arc-enterprise.storageEnv" -}}
 {{- if eq .Values.storage.mode "shared" }}
+{{- $creds := (.Values.storage.shared | default dict).credentials | default dict -}}
 - name: ARC_STORAGE_BACKEND
   value: "s3"
 - name: ARC_STORAGE_S3_BUCKET
@@ -341,7 +342,7 @@ Storage env vars — depends on storage.mode.
 - name: ARC_STORAGE_S3_PREFIX
   value: {{ .Values.storage.shared.prefix | quote }}
 {{- end }}
-{{- if not .Values.storage.shared.credentials.useIRSA }}
+{{- if not $creds.useIRSA }}
 - name: ARC_STORAGE_S3_ACCESS_KEY
   valueFrom:
     secretKeyRef:

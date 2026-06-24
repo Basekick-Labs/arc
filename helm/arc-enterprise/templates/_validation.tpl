@@ -90,16 +90,25 @@ Only enforced when shared storage is explicitly external.
 */}}
 {{- define "arc-enterprise.validate.externalStorageCredentials" -}}
 {{/*
+  Default the nested maps to empty dicts: in local mode an operator's values
+  file may omit storage.shared entirely, and Go templates evaluate every `and`
+  argument (no short-circuit), so a bare .Values.storage.shared.credentials.X
+  would nil-panic. Wrap all credential checks in the mode=="shared" gate.
+*/}}
+{{- $shared := .Values.storage.shared | default dict -}}
+{{- $creds := $shared.credentials | default dict -}}
+{{- if eq .Values.storage.mode "shared" -}}
+{{/*
   IRSA makes sense only for external S3. With bundled MinIO (external=false) the
   chart would omit the S3 cred env vars and Arc would fall back to the AWS
   credential chain, which can't authenticate to the local MinIO — a broken
   deployment. Fail fast.
 */}}
-{{- if and (eq .Values.storage.mode "shared") .Values.storage.shared.credentials.useIRSA (not .Values.storage.shared.external) -}}
+{{- if and $creds.useIRSA (not $shared.external) -}}
 {{- fail "storage.shared.credentials.useIRSA=true requires storage.shared.external=true (IRSA is for external S3; bundled MinIO needs static credentials)" -}}
 {{- end -}}
-{{- if and (eq .Values.storage.mode "shared") .Values.storage.shared.external -}}
-{{- if .Values.storage.shared.credentials.useIRSA -}}
+{{- if $shared.external -}}
+{{- if $creds.useIRSA -}}
 {{/*
   IRSA needs no static creds. Only enforce the role-arn annotation when the
   chart CREATES the ServiceAccount — that's the only case where the annotation
@@ -116,10 +125,11 @@ Only enforced when shared storage is explicitly external.
 {{- end -}}
 {{- end -}}
 {{- else -}}
-{{- if and (not .Values.storage.shared.credentials.existingSecret) (or (not .Values.storage.shared.credentials.accessKey) (not .Values.storage.shared.credentials.secretKey)) -}}
+{{- if and (not $creds.existingSecret) (or (not $creds.accessKey) (not $creds.secretKey)) -}}
 {{- $existing := lookup "v1" "Secret" .Release.Namespace (include "arc-enterprise.objectStorageSecretName" .) -}}
 {{- if not $existing -}}
 {{- fail "storage.shared.credentials.accessKey/secretKey are required when storage.shared.external=true (or set storage.shared.credentials.existingSecret, or storage.shared.credentials.useIRSA=true)" -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
