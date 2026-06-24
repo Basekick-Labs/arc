@@ -80,6 +80,19 @@ Names for derived resources.
 {{- printf "%s-compactor" (include "arc-enterprise.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end }}
 
+{{/*
+ServiceAccount name. When serviceAccount.create=true, use the explicit name or
+derive one from the release; when create=false, use the explicit name or fall
+back to "default" (the namespace default SA). Mirrors the common Helm pattern.
+*/}}
+{{- define "arc-enterprise.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create -}}
+{{- default (include "arc-enterprise.fullname" .) .Values.serviceAccount.name -}}
+{{- else -}}
+{{- default "default" .Values.serviceAccount.name -}}
+{{- end -}}
+{{- end }}
+
 {{- define "arc-enterprise.writerHeadlessName" -}}
 {{- printf "%s-headless" (include "arc-enterprise.writerName" .) | trunc 63 | trimSuffix "-" -}}
 {{- end }}
@@ -327,6 +340,7 @@ Storage env vars — depends on storage.mode.
 - name: ARC_STORAGE_S3_PREFIX
   value: {{ .Values.storage.shared.prefix | quote }}
 {{- end }}
+{{- if not .Values.storage.shared.credentials.useIRSA }}
 - name: ARC_STORAGE_S3_ACCESS_KEY
   valueFrom:
     secretKeyRef:
@@ -337,6 +351,7 @@ Storage env vars — depends on storage.mode.
     secretKeyRef:
       name: {{ include "arc-enterprise.objectStorageSecretName" . }}
       key: {{ if eq (include "arc-enterprise.useMinioCredKeys" .) "true" }}root-password{{ else }}secret-key{{ end }}
+{{- end }}
 - name: ARC_CLUSTER_REPLICATION_ENABLED
   value: "false"
 {{- else }}

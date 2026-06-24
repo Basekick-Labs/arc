@@ -80,6 +80,41 @@ minio:
   enabled: false                           # don't deploy bundled MinIO
 ```
 
+### External S3 with IRSA (EKS — no static keys)
+
+On EKS, authenticate to S3 through the pod's IAM role (IRSA) instead of static
+keys. Set `credentials.useIRSA=true` (the chart omits the S3 key env vars so
+Arc falls back to the AWS credential chain) and attach the role via a
+ServiceAccount annotation. Arc resolves the role for both writes and queries.
+
+```yaml
+# values-override.yaml
+storage:
+  mode: shared
+  shared:
+    external: true
+    bucket: my-arc-bucket
+    region: us-east-1
+    endpoint: https://s3.us-east-1.amazonaws.com
+    useSSL: true
+    usePathStyle: false
+    credentials:
+      useIRSA: true                        # no static keys; use the pod IAM role
+
+serviceAccount:
+  create: true
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/arc-s3
+
+minio:
+  enabled: false
+```
+
+The IAM role's trust policy must permit the cluster's OIDC provider + this
+ServiceAccount, and the role must grant `s3:GetObject`/`PutObject`/`ListBucket`
+on the bucket. The chart fails the install if `useIRSA=true` without the
+`eks.amazonaws.com/role-arn` annotation.
+
 ### Authentication (admin token + cluster replication)
 
 ```yaml

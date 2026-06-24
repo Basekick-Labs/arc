@@ -90,10 +90,18 @@ Only enforced when shared storage is explicitly external.
 */}}
 {{- define "arc-enterprise.validate.externalStorageCredentials" -}}
 {{- if and (eq .Values.storage.mode "shared") .Values.storage.shared.external -}}
+{{- if .Values.storage.shared.credentials.useIRSA -}}
+{{/* IRSA: no static creds needed, but the pod's SA must carry a role-arn. */}}
+{{- $ann := .Values.serviceAccount.annotations | default dict -}}
+{{- if not (index $ann "eks.amazonaws.com/role-arn") -}}
+{{- fail "storage.shared.credentials.useIRSA=true requires serviceAccount.annotations.\"eks.amazonaws.com/role-arn\" to be set (the IAM role Arc assumes for S3)" -}}
+{{- end -}}
+{{- else -}}
 {{- if and (not .Values.storage.shared.credentials.existingSecret) (or (not .Values.storage.shared.credentials.accessKey) (not .Values.storage.shared.credentials.secretKey)) -}}
 {{- $existing := lookup "v1" "Secret" .Release.Namespace (include "arc-enterprise.objectStorageSecretName" .) -}}
 {{- if not $existing -}}
-{{- fail "storage.shared.credentials.accessKey/secretKey are required when storage.shared.external=true (or set storage.shared.credentials.existingSecret)" -}}
+{{- fail "storage.shared.credentials.accessKey/secretKey are required when storage.shared.external=true (or set storage.shared.credentials.existingSecret, or storage.shared.credentials.useIRSA=true)" -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
