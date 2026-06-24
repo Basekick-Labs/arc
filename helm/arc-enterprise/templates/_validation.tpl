@@ -89,6 +89,15 @@ External S3 / Azure requires the operator to provide credentials.
 Only enforced when shared storage is explicitly external.
 */}}
 {{- define "arc-enterprise.validate.externalStorageCredentials" -}}
+{{/*
+  IRSA makes sense only for external S3. With bundled MinIO (external=false) the
+  chart would omit the S3 cred env vars and Arc would fall back to the AWS
+  credential chain, which can't authenticate to the local MinIO — a broken
+  deployment. Fail fast.
+*/}}
+{{- if and (eq .Values.storage.mode "shared") .Values.storage.shared.credentials.useIRSA (not .Values.storage.shared.external) -}}
+{{- fail "storage.shared.credentials.useIRSA=true requires storage.shared.external=true (IRSA is for external S3; bundled MinIO needs static credentials)" -}}
+{{- end -}}
 {{- if and (eq .Values.storage.mode "shared") .Values.storage.shared.external -}}
 {{- if .Values.storage.shared.credentials.useIRSA -}}
 {{/*
