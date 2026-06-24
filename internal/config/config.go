@@ -523,7 +523,11 @@ func Load() (*Config, error) {
 			ArcxExtensionPath: v.GetString("database.arcx_extension_path"),
 		},
 		Storage: StorageConfig{
-			Backend:     v.GetString("storage.backend"),
+			// Normalize once at load so the backend switch, the DuckDB
+			// primary-S3 signal, and the tiering cold.Backend checks all key off
+			// one canonical value ("s3"/"minio"/"local"); an operator writing
+			// "S3" or " s3 " must not silently behave differently across sites.
+			Backend:     strings.ToLower(strings.TrimSpace(v.GetString("storage.backend"))),
 			LocalPath:   v.GetString("storage.local_path"),
 			S3Bucket:    v.GetString("storage.s3_bucket"),
 			S3Region:    v.GetString("storage.s3_region"),
@@ -728,8 +732,10 @@ func Load() (*Config, error) {
 			DefaultHotMaxAgeDays:          v.GetInt("tiered_storage.default_hot_max_age_days"),
 			MigrationHistoryRetentionDays: v.GetInt("tiered_storage.migration_history_retention_days"),
 			Cold: ColdTierConfig{
-				Enabled:                 v.GetBool("tiered_storage.cold.enabled"),
-				Backend:                 v.GetString("tiered_storage.cold.backend"),
+				Enabled: v.GetBool("tiered_storage.cold.enabled"),
+				// Normalized like storage.backend so cold.Backend == "s3"/"azure"
+				// checks key off one canonical value.
+				Backend:                 strings.ToLower(strings.TrimSpace(v.GetString("tiered_storage.cold.backend"))),
 				S3Bucket:                v.GetString("tiered_storage.cold.s3_bucket"),
 				S3Region:                v.GetString("tiered_storage.cold.s3_region"),
 				S3Endpoint:              v.GetString("tiered_storage.cold.s3_endpoint"),
@@ -771,6 +777,22 @@ func Load() (*Config, error) {
 
 	if cfg.Database.MemoryLimit != "" && !memoryLimitRe.MatchString(cfg.Database.MemoryLimit) {
 		return nil, fmt.Errorf("invalid database.memory_limit value: %q", cfg.Database.MemoryLimit)
+	}
+
+	// An S3-compatible primary backend with no bucket would build an unscoped
+	// DuckDB credential-chain secret AND an empty sandbox s3:// allowlist (so
+	// every query read fails with an opaque DuckDB permission error). Reject it
+	// here — before any subsystem initializes — rather than failing at first
+	// query. Checked against the normalized Backend value.
+	if (cfg.Storage.Backend == "s3" || cfg.Storage.Backend == "minio") && strings.TrimSpace(cfg.Storage.S3Bucket) == "" {
+		return nil, fmt.Errorf("storage.backend is %q but storage.s3_bucket is empty; set storage.s3_bucket", cfg.Storage.Backend)
+	}
+	// Same guard for an Azure primary backend with no container: an empty
+	// container yields an empty sandbox allowlist entry and opaque query-time
+	// permission errors. (Account name is separately required by the Azure
+	// secret builder.)
+	if (cfg.Storage.Backend == "azure" || cfg.Storage.Backend == "azblob") && strings.TrimSpace(cfg.Storage.AzureContainer) == "" {
+		return nil, fmt.Errorf("storage.backend is %q but storage.azure_container is empty; set storage.azure_container", cfg.Storage.Backend)
 	}
 
 	return cfg, nil

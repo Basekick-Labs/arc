@@ -230,6 +230,28 @@ func TestBuildS3SecretSQL(t *testing.T) {
 		}
 	})
 
+	t.Run("primary IRSA (no keys) -> scoped credential chain", func(t *testing.T) {
+		// storage.backend=="s3" with empty keys (IRSA / IAM role): the widened
+		// gate in configureDatabase now calls configureS3Access, which builds the
+		// PRIMARY secret with no keys -> PROVIDER CREDENTIAL_CHAIN, scoped to the
+		// primary bucket/prefix so it coexists with a cold-tier secret without
+		// clobbering it. This is the bug fix: previously no primary secret was
+		// created and s3:// query reads went unauthenticated.
+		got, err := buildS3SecretSQL(s3SecretParams{
+			name:  arcS3PrimarySecretName,
+			scope: s3SecretScope("primary-bucket", "hot/"),
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		mustContain(t, got, "CREATE OR REPLACE SECRET "+arcS3PrimarySecretName)
+		mustContain(t, got, "PROVIDER CREDENTIAL_CHAIN")
+		mustContain(t, got, "SCOPE 's3://primary-bucket/hot/'")
+		if strings.Contains(got, "KEY_ID") || strings.Contains(got, "SECRET '") {
+			t.Errorf("IRSA primary secret must not emit KEY_ID/SECRET, got:\n%s", got)
+		}
+	})
+
 	t.Run("exactly one key set -> error", func(t *testing.T) {
 		// Asymmetric config is a misconfiguration trap: silently routing to the
 		// credential chain would discard the provided key.

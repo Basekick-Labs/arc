@@ -247,6 +247,12 @@ func main() {
 		S3PathStyle: cfg.Storage.S3PathStyle,
 		S3Bucket:    cfg.Storage.S3Bucket,
 		S3Prefix:    cfg.Storage.S3Prefix,
+		// Primary-backend signal: when the primary store is S3-compatible
+		// (storage.backend is "s3" or "minio" — the same set switched on at the
+		// storage-backend selection below), create a primary S3 secret even with
+		// empty keys (PROVIDER CREDENTIAL_CHAIN) so IRSA / IAM role / env
+		// credentials authenticate DuckDB query reads against s3://.
+		S3IsPrimaryBackend: cfg.Storage.Backend == "s3" || cfg.Storage.Backend == "minio",
 		// Azure Blob Storage configuration for azure extension
 		AzureAccountName: cfg.Storage.AzureAccountName,
 		AzureAccountKey:  cfg.Storage.AzureAccountKey,
@@ -600,6 +606,9 @@ func main() {
 			Msg("Storage backend initialized")
 
 	case "s3", "minio":
+		// Note: an empty s3_bucket for an S3 primary backend is rejected earlier
+		// in config.Load (before database.New builds the DuckDB secret), so by
+		// here the bucket is guaranteed non-empty.
 		s3Config := &storage.S3Config{
 			Bucket:    cfg.Storage.S3Bucket,
 			Region:    cfg.Storage.S3Region,

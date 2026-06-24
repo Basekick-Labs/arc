@@ -217,6 +217,12 @@ type Config struct {
 	S3PathStyle bool   // Use path-style addressing (required for MinIO)
 	S3Bucket    string // Bucket name; used to build the allowed_directories prefix for the sandbox
 	S3Prefix    string // Key prefix under the bucket; used with S3Bucket to scope sandbox access
+	// S3IsPrimaryBackend is true when the primary/hot store is S3-compatible
+	// (storage.backend in {"s3","minio"}). Decouples "a primary S3 secret must
+	// exist" from "static keys are set", so IRSA / credential-chain deployments
+	// (empty keys) still get a primary secret with PROVIDER CREDENTIAL_CHAIN.
+	// See the gate in configureDatabase.
+	S3IsPrimaryBackend bool
 	// Azure Blob Storage configuration for azure extension
 	AzureAccountName string
 	AzureAccountKey  string
@@ -300,7 +306,10 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 		return nil, fmt.Errorf("failed to configure duckdb: %w", err)
 	}
 
-	s3Enabled := cfg.S3AccessKey != "" && cfg.S3SecretKey != ""
+	// S3 is active when the primary backend is S3 (incl. IRSA / credential-chain
+	// with empty keys) or static keys are configured. Keying only off key
+	// presence would log s3_enabled=false for a working IRSA deployment.
+	s3Enabled := cfg.S3IsPrimaryBackend || (cfg.S3AccessKey != "" && cfg.S3SecretKey != "")
 	azureEnabled := cfg.AzureAccountName != ""
 	logger.Info().
 		Int("max_connections", cfg.MaxConnections).
@@ -448,12 +457,17 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	}
 
 	// Configure httpfs extension + primary S3 secret if primary storage uses S3.
-	// Use || so a half-configured pair (exactly one key set) reaches
-	// configureS3Access and is rejected by buildS3SecretSQL at startup, instead
-	// of being silently skipped. Both-empty falls through to the cold-tier branch
-	// (primary storage is not S3); primary credential-chain is intentionally not
-	// supported here (would require both empty AND an explicit S3 primary signal).
-	if cfg.S3AccessKey != "" || cfg.S3SecretKey != "" {
+	//   - S3IsPrimaryBackend (storage.backend=="s3"): always create a primary
+	//     secret. With static keys → KEY_ID/SECRET; with both keys empty →
+	//     PROVIDER CREDENTIAL_CHAIN, so IRSA / IAM instance role / env creds
+	//     authenticate s3:// query reads (buildS3SecretSQL handles both).
+	//   - Keys set without the backend signal (legacy/explicit): still handled,
+	//     and a half-configured pair (exactly one key set) reaches
+	//     configureS3Access and is rejected by buildS3SecretSQL at startup rather
+	//     than being silently skipped.
+	// Both-empty AND backend!="s3" falls through to the cold-tier branch (primary
+	// storage is not S3).
+	if cfg.S3IsPrimaryBackend || cfg.S3AccessKey != "" || cfg.S3SecretKey != "" {
 		if err := configureS3Access(db, cfg, logger); err != nil {
 			return fmt.Errorf("failed to configure S3 access: %w", err)
 		}
