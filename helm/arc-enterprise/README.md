@@ -112,8 +112,11 @@ minio:
 
 The IAM role's trust policy must permit the cluster's OIDC provider + this
 ServiceAccount, and the role must grant `s3:GetObject`/`PutObject`/`ListBucket`
-on the bucket. The chart fails the install if `useIRSA=true` without the
-`eks.amazonaws.com/role-arn` annotation.
+on the bucket. When the chart creates the ServiceAccount (`serviceAccount.create=true`),
+the install fails if the `eks.amazonaws.com/role-arn` annotation is missing. If
+you manage the ServiceAccount externally (`serviceAccount.create=false`, set
+`serviceAccount.name`) — or authenticate via an EC2 instance profile — the chart
+does not require the annotation in values; attach the role to the SA out-of-band.
 
 ### Authentication (admin token + cluster replication)
 

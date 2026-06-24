@@ -86,10 +86,11 @@ derive one from the release; when create=false, use the explicit name or fall
 back to "default" (the namespace default SA). Mirrors the common Helm pattern.
 */}}
 {{- define "arc-enterprise.serviceAccountName" -}}
-{{- if .Values.serviceAccount.create -}}
-{{- default (include "arc-enterprise.fullname" .) .Values.serviceAccount.name -}}
+{{- $sa := .Values.serviceAccount | default dict -}}
+{{- if $sa.create -}}
+{{- default (include "arc-enterprise.fullname" .) $sa.name -}}
 {{- else -}}
-{{- default "default" .Values.serviceAccount.name -}}
+{{- default "default" $sa.name -}}
 {{- end -}}
 {{- end }}
 

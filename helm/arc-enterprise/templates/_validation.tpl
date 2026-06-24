@@ -91,10 +91,20 @@ Only enforced when shared storage is explicitly external.
 {{- define "arc-enterprise.validate.externalStorageCredentials" -}}
 {{- if and (eq .Values.storage.mode "shared") .Values.storage.shared.external -}}
 {{- if .Values.storage.shared.credentials.useIRSA -}}
-{{/* IRSA: no static creds needed, but the pod's SA must carry a role-arn. */}}
-{{- $ann := .Values.serviceAccount.annotations | default dict -}}
+{{/*
+  IRSA needs no static creds. Only enforce the role-arn annotation when the
+  chart CREATES the ServiceAccount — that's the only case where the annotation
+  in values is how the role gets attached. With serviceAccount.create=false the
+  SA is managed externally (Terraform/eksctl) and already annotated, and
+  useIRSA also covers EC2 instance profiles / env credentials which need no
+  annotation at all — so don't block those valid patterns.
+*/}}
+{{- $sa := .Values.serviceAccount | default dict -}}
+{{- if $sa.create -}}
+{{- $ann := $sa.annotations | default dict -}}
 {{- if not (index $ann "eks.amazonaws.com/role-arn") -}}
-{{- fail "storage.shared.credentials.useIRSA=true requires serviceAccount.annotations.\"eks.amazonaws.com/role-arn\" to be set (the IAM role Arc assumes for S3)" -}}
+{{- fail "storage.shared.credentials.useIRSA=true with serviceAccount.create=true requires serviceAccount.annotations.\"eks.amazonaws.com/role-arn\" (the IAM role Arc assumes for S3)" -}}
+{{- end -}}
 {{- end -}}
 {{- else -}}
 {{- if and (not .Values.storage.shared.credentials.existingSecret) (or (not .Values.storage.shared.credentials.accessKey) (not .Values.storage.shared.credentials.secretKey)) -}}
