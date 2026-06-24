@@ -890,9 +890,12 @@ func configureAzureAccess(db *sql.DB, cfg *Config, logger zerolog.Logger) error 
 
 // AzureConfig holds Azure configuration for a runtime (cold-tier) secret.
 type AzureConfig struct {
-	AccountName string
-	AccountKey  string
-	Container   string // scopes the secret to this container; empty = unscoped
+	// ConnectionString, when set, is the auth method (embeds account name+key);
+	// AccountName/AccountKey are then ignored. Mirrors the primary path.
+	ConnectionString string
+	AccountName      string
+	AccountKey       string
+	Container        string // scopes the secret to this container; empty = unscoped
 }
 
 // ConfigureAzure provisions the cold-tier Azure secret at runtime, under a
@@ -905,10 +908,11 @@ func (d *DuckDB) ConfigureAzure(azcfg *AzureConfig) error {
 		return fmt.Errorf("ConfigureAzure: azcfg must not be nil")
 	}
 	secretSQL, err := buildAzureSecretSQL(azureSecretParams{
-		name:        arcAzureColdSecretName,
-		scope:       azureScope(azcfg.Container),
-		accountName: azcfg.AccountName,
-		accountKey:  azcfg.AccountKey,
+		name:             arcAzureColdSecretName,
+		scope:            azureScope(azcfg.Container),
+		connectionString: azcfg.ConnectionString,
+		accountName:      azcfg.AccountName,
+		accountKey:       azcfg.AccountKey,
 	})
 	if err != nil {
 		return err

@@ -2584,9 +2584,10 @@ func main() {
 		// identity / env). Mirrors the cold-tier S3 path above.
 		if cold.Enabled && cold.Backend == "azure" {
 			if err := db.ConfigureAzure(&database.AzureConfig{
-				AccountName: cold.AzureAccountName,
-				AccountKey:  cold.AzureAccountKey,
-				Container:   cold.AzureContainer,
+				ConnectionString: cold.AzureConnectionString,
+				AccountName:      cold.AzureAccountName,
+				AccountKey:       cold.AzureAccountKey,
+				Container:        cold.AzureContainer,
 			}); err != nil {
 				log.Warn().Err(err).Msg("Failed to configure DuckDB with cold tier Azure credentials")
 			} else {
