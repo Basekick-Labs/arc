@@ -808,6 +808,31 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// Cold tier (Enterprise tiered storage). When enabled, validate its backend
+	// and required fields at startup — same rationale as the primary guards
+	// above: a missing bucket/container surfaces only as an opaque tiering /
+	// query-time error otherwise. The cold runtime switch (cmd/arc/main.go)
+	// handles exactly "s3" and "azure"; reject anything else loudly. Backend is
+	// normalized at load.
+	if cfg.TieredStorage.Cold.Enabled {
+		cold := cfg.TieredStorage.Cold
+		switch cold.Backend {
+		case "s3":
+			if strings.TrimSpace(cold.S3Bucket) == "" {
+				return nil, fmt.Errorf("tiered_storage.cold.enabled is true and backend is \"s3\" but tiered_storage.cold.s3_bucket is empty; set tiered_storage.cold.s3_bucket")
+			}
+		case "azure":
+			if strings.TrimSpace(cold.AzureConnectionString) == "" && strings.TrimSpace(cold.AzureAccountName) == "" {
+				return nil, fmt.Errorf("tiered_storage.cold.enabled is true and backend is \"azure\" but neither tiered_storage.cold.azure_account_name nor tiered_storage.cold.azure_connection_string is set; provide one")
+			}
+			if strings.TrimSpace(cold.AzureContainer) == "" {
+				return nil, fmt.Errorf("tiered_storage.cold.enabled is true and backend is \"azure\" but tiered_storage.cold.azure_container is empty; set tiered_storage.cold.azure_container")
+			}
+		default:
+			return nil, fmt.Errorf("tiered_storage.cold.enabled is true but tiered_storage.cold.backend %q is invalid; must be \"s3\" or \"azure\"", cold.Backend)
+		}
+	}
+
 	return cfg, nil
 }
 
