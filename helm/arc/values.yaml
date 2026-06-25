@@ -16,7 +16,7 @@ updateStrategy:
   #   maxUnavailable: 0
 
 image:
-  repository: ghcr.io/basekick-labs/arc-go
+  repository: ghcr.io/basekick-labs/arc
   pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion
   tag: ""

@@ -2,8 +2,8 @@ apiVersion: v2
 name: arc
 description: High-performance time-series database built on DuckDB (Go implementation)
 type: application
-version: 0.0.1
-appVersion: "0.0.1"
+version: 0.1.0
+appVersion: "26.06.1"
 keywords:
   - database
   - timeseries
@@ -11,9 +11,9 @@ keywords:
   - duckdb
   - analytics
   - go
-home: https://github.com/basekick-labs/arc-go
+home: https://github.com/basekick-labs/arc
 sources:
-  - https://github.com/basekick-labs/arc-go
+  - https://github.com/basekick-labs/arc
 maintainers:
   - name: Basekick Labs
     email: contact@basekick.com
