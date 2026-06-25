@@ -937,3 +937,41 @@ func TestLoad_StorageValuesTrimmed(t *testing.T) {
 		t.Errorf("Cold.S3Bucket = %q, want trimmed %q (pointer mutation must persist)", cfg.TieredStorage.Cold.S3Bucket, "cold-bucket")
 	}
 }
+
+// TestLoad_LicenseFilePathTrimmed: a whitespace-padded license.file_path is
+// trimmed at load so it doesn't take the offline branch and silently shadow a
+// valid license.key. Empty after trim => online path (FilePath == "").
+func TestLoad_LicenseFilePathTrimmed(t *testing.T) {
+	cases := []struct {
+		name string
+		env  string
+		want string
+	}{
+		{"real path preserved", "/etc/arc/license.json", "/etc/arc/license.json"},
+		{"surrounding whitespace trimmed", "  /etc/arc/license.json  ", "/etc/arc/license.json"},
+		{"whitespace-only becomes empty", "   ", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir, err := os.MkdirTemp("", "arc-lic-cfg")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(tmpDir)
+			oldWd, _ := os.Getwd()
+			os.Chdir(tmpDir)
+			defer os.Chdir(oldWd)
+
+			os.Setenv("ARC_LICENSE_FILE_PATH", tc.env)
+			defer os.Unsetenv("ARC_LICENSE_FILE_PATH")
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.License.FilePath != tc.want {
+				t.Errorf("License.FilePath = %q, want %q", cfg.License.FilePath, tc.want)
+			}
+		})
+	}
+}

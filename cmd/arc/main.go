@@ -105,9 +105,68 @@ func main() {
 	}
 
 	// Validate Enterprise License early (before component initialization)
-	// This allows us to apply core limits to DuckDB and ingestion workers
+	// This allows us to apply core limits to DuckDB and ingestion workers.
 	var licenseClient *license.Client
-	if cfg.License.Key != "" {
+
+	// applyLicense logs the verified license and enforces its core limit on the
+	// Go runtime / DuckDB / ingest workers. Shared by the online and offline
+	// paths so both enforce identically.
+	applyLicense := func(lic *license.License) {
+		log.Info().
+			Str("tier", string(lic.Tier)).
+			Str("status", lic.Status).
+			Int("days_remaining", lic.DaysRemaining).
+			Int("max_cores", lic.MaxCores).
+			Time("expires_at", lic.ExpiresAt).
+			Strs("features", lic.Features).
+			Msg("Enterprise license verified successfully")
+
+		if lic.MaxCores > 0 {
+			machineCores := runtime.NumCPU()
+			if machineCores > lic.MaxCores {
+				previousGOMAXPROCS := runtime.GOMAXPROCS(lic.MaxCores)
+				log.Info().
+					Int("machine_cores", machineCores).
+					Int("licensed_cores", lic.MaxCores).
+					Int("gomaxprocs_before", previousGOMAXPROCS).
+					Int("gomaxprocs_after", lic.MaxCores).
+					Msg("License core limit applied via GOMAXPROCS")
+
+				cfg.Database.ThreadCount = lic.MaxCores
+				log.Info().Int("duckdb_threads", lic.MaxCores).Msg("License core limit applied to DuckDB threads")
+
+				if cfg.Ingest.FlushWorkers > lic.MaxCores {
+					cfg.Ingest.FlushWorkers = lic.MaxCores
+					log.Info().Int("flush_workers", lic.MaxCores).Msg("License core limit applied to ingestion flush workers")
+				}
+			}
+		}
+	}
+
+	switch {
+	case cfg.License.FilePath != "":
+		// Offline (air-gapped / GovCloud) activation: verify a signed license
+		// file on disk with NO network. Takes precedence over license.key —
+		// the file path is the explicit air-gapped intent.
+		if cfg.License.Key != "" {
+			log.Warn().Msg("Both license.file_path and license.key are set; using the offline file and ignoring the key")
+		}
+		log.Info().
+			Str("file_path", cfg.License.FilePath).
+			Msg("Validating enterprise license from offline file")
+
+		lc, err := license.LoadOfflineLicense(cfg.License.FilePath, logger.Get("license"))
+		if err != nil {
+			// Fail closed: any verification/read error disables enterprise
+			// features (same posture as a failed online activation), non-fatal.
+			log.Warn().Err(err).Msg("Offline license validation failed - enterprise features disabled")
+		} else {
+			licenseClient = lc
+			lic, _ := licenseClient.ActivateOrVerify(context.Background()) // offline: returns the loaded license, no network
+			applyLicense(lic)
+		}
+
+	case cfg.License.Key != "":
 		log.Info().
 			Str("license_key", cfg.License.Key[:min(12, len(cfg.License.Key))]+"...").
 			Str("server_url", license.LicenseServerURL).
@@ -120,8 +179,8 @@ func main() {
 		})
 		if err != nil {
 			log.Warn().Err(err).Msg("Failed to initialize license client - enterprise features disabled")
+			licenseClient = nil
 		} else {
-			// Activate or verify license at startup
 			lic, err := licenseClient.ActivateOrVerify(context.Background())
 			if err != nil {
 				log.Warn().
@@ -130,48 +189,11 @@ func main() {
 					Msg("License activation/verification failed - enterprise features disabled")
 				licenseClient = nil
 			} else {
-				log.Info().
-					Str("tier", string(lic.Tier)).
-					Str("status", lic.Status).
-					Int("days_remaining", lic.DaysRemaining).
-					Int("max_cores", lic.MaxCores).
-					Time("expires_at", lic.ExpiresAt).
-					Strs("features", lic.Features).
-					Msg("Enterprise license verified successfully")
-
-				// Apply core limits from license to config
-				// This ensures DuckDB and ingestion workers respect the license
-				if lic.MaxCores > 0 {
-					machineCores := runtime.NumCPU()
-
-					if machineCores > lic.MaxCores {
-						// Limit Go runtime to licensed cores - this is the real enforcement
-						previousGOMAXPROCS := runtime.GOMAXPROCS(lic.MaxCores)
-						log.Info().
-							Int("machine_cores", machineCores).
-							Int("licensed_cores", lic.MaxCores).
-							Int("gomaxprocs_before", previousGOMAXPROCS).
-							Int("gomaxprocs_after", lic.MaxCores).
-							Msg("License core limit applied via GOMAXPROCS")
-
-						// Also set DuckDB thread count to match
-						cfg.Database.ThreadCount = lic.MaxCores
-						log.Info().
-							Int("duckdb_threads", lic.MaxCores).
-							Msg("License core limit applied to DuckDB threads")
-
-						// Limit ingestion flush workers to licensed cores
-						if cfg.Ingest.FlushWorkers > lic.MaxCores {
-							cfg.Ingest.FlushWorkers = lic.MaxCores
-							log.Info().
-								Int("flush_workers", lic.MaxCores).
-								Msg("License core limit applied to ingestion flush workers")
-						}
-					}
-				}
+				applyLicense(lic)
 			}
 		}
-	} else {
+
+	default:
 		log.Warn().Msg("Enterprise license not configured - enterprise features disabled")
 	}
 

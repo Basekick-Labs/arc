@@ -212,7 +212,12 @@ type QueryConfig struct {
 // LicenseConfig holds configuration for enterprise license validation
 type LicenseConfig struct {
 	Enabled bool   // Enable license validation (default: false)
-	Key     string // License key (ARC-ENT-XXXX-XXXX-XXXX-XXXX)
+	Key     string // License key (ARC-ENT-XXXX-XXXX-XXXX-XXXX) — online activation
+	// FilePath points at a signed offline license file ({license_file,
+	// license_signature} JSON) for air-gapped / GovCloud deployments that
+	// cannot reach the license server. When set, Arc verifies it locally with
+	// no network and it takes precedence over Key.
+	FilePath string
 }
 
 // SchedulerConfig holds configuration for automatic schedulers (Enterprise features)
@@ -641,6 +646,10 @@ func Load() (*Config, error) {
 		License: LicenseConfig{
 			Enabled: v.GetBool("license.enabled"),
 			Key:     v.GetString("license.key"),
+			// Trimmed so a stray-whitespace path does not take the offline
+			// branch and silently shadow a valid license.key (it would fail to
+			// open and disable enterprise features). Empty/blank => online path.
+			FilePath: strings.TrimSpace(v.GetString("license.file_path")),
 		},
 		Scheduler: SchedulerConfig{
 			RetentionSchedule: v.GetString("scheduler.retention_schedule"),
@@ -1006,6 +1015,7 @@ func setDefaults(v *viper.Viper) {
 	// Note: Server URL and validation interval are hardcoded in internal/license/client.go
 	v.SetDefault("license.enabled", false) // Disabled by default
 	v.SetDefault("license.key", "")        // Must be provided
+	v.SetDefault("license.file_path", "")  // Offline (air-gapped) signed license file; takes precedence over key
 
 	// Scheduler defaults (Enterprise features)
 	// Note: CQ and retention schedulers are auto-enabled when their features are enabled AND license allows

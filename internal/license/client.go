@@ -47,6 +47,11 @@ type Client struct {
 	mu          sync.RWMutex
 	stopCh      chan struct{}
 	logger      zerolog.Logger
+	// offline is true for a client built from an on-disk signed license
+	// file (air-gapped activation). Offline clients perform NO network
+	// calls — Activate/Verify/StartPeriodicValidation are no-ops — and the
+	// license is the verified contents of the file, valid until its expiry.
+	offline bool
 }
 
 // VerifyRequest represents a license verification request
@@ -141,6 +146,9 @@ type ActivateResponse struct {
 
 // Activate registers this machine with the license server
 func (c *Client) Activate(ctx context.Context) (*License, error) {
+	if c.offline {
+		return nil, fmt.Errorf("offline license client cannot activate over the network")
+	}
 	url := fmt.Sprintf("%s/api/v1/activate", c.serverURL)
 
 	hostname, _ := os.Hostname()
@@ -231,6 +239,9 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 
 // Verify validates the license with the enterprise server
 func (c *Client) Verify(ctx context.Context) (*License, error) {
+	if c.offline {
+		return nil, fmt.Errorf("offline license client cannot verify over the network")
+	}
 	url := fmt.Sprintf("%s/api/v1/verify", c.serverURL)
 
 	c.logger.Debug().
@@ -303,6 +314,19 @@ func (c *Client) Verify(ctx context.Context) (*License, error) {
 
 // ActivateOrVerify tries to verify first, and if the machine is not activated, activates it
 func (c *Client) ActivateOrVerify(ctx context.Context) (*License, error) {
+	// Offline (air-gapped) clients are already activated from the on-disk
+	// signed file and must never touch the network. Return the verified
+	// license directly.
+	if c.offline {
+		c.mu.RLock()
+		lic := c.license
+		c.mu.RUnlock()
+		if lic == nil {
+			return nil, fmt.Errorf("offline license client has no loaded license")
+		}
+		return lic, nil
+	}
+
 	// Try to verify first
 	license, err := c.Verify(ctx)
 	if err == nil {
@@ -321,6 +345,15 @@ func (c *Client) ActivateOrVerify(ctx context.Context) (*License, error) {
 
 // StartPeriodicValidation starts background license validation
 func (c *Client) StartPeriodicValidation(interval time.Duration) {
+	// Offline licenses have nothing to re-validate against (no server). Their
+	// validity is the file's expiry, enforced locally via the license status.
+	// Skip the background loop entirely so an air-gapped node makes no network
+	// calls.
+	if c.offline {
+		c.logger.Debug().Msg("Offline license: periodic validation disabled (no network)")
+		return
+	}
+
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
