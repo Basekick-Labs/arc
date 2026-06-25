@@ -781,3 +781,159 @@ func TestWALConfig_EnvOverride(t *testing.T) {
 		t.Errorf("WAL.RecoveryBatchSize = %d, want 5000", cfg.WAL.RecoveryBatchSize)
 	}
 }
+
+// TestLoad_StorageBackendValidation covers the startup guards added for
+// S3/Azure primary backends and the cold tier: a misconfigured backend must
+// fail fast at config load rather than at first query.
+func TestLoad_StorageBackendValidation(t *testing.T) {
+	cases := []struct {
+		name      string
+		env       map[string]string
+		wantError bool
+	}{
+		{
+			name:      "invalid primary backend -> error",
+			env:       map[string]string{"ARC_STORAGE_BACKEND": "gcs"},
+			wantError: true,
+		},
+		{
+			name:      "local primary backend -> ok",
+			env:       map[string]string{"ARC_STORAGE_BACKEND": "local"},
+			wantError: false,
+		},
+		{
+			name:      "s3 primary without bucket -> error",
+			env:       map[string]string{"ARC_STORAGE_BACKEND": "s3"},
+			wantError: true,
+		},
+		{
+			name:      "minio primary without bucket -> error",
+			env:       map[string]string{"ARC_STORAGE_BACKEND": "minio"},
+			wantError: true,
+		},
+		{
+			name:      "s3 primary with bucket -> ok",
+			env:       map[string]string{"ARC_STORAGE_BACKEND": "s3", "ARC_STORAGE_S3_BUCKET": "b"},
+			wantError: false,
+		},
+		{
+			name:      "backend case/space normalized -> bucket guard still applies",
+			env:       map[string]string{"ARC_STORAGE_BACKEND": "  S3  "},
+			wantError: true,
+		},
+		{
+			name:      "azure primary without account name or conn string -> error",
+			env:       map[string]string{"ARC_STORAGE_BACKEND": "azure", "ARC_STORAGE_AZURE_CONTAINER": "c"},
+			wantError: true,
+		},
+		{
+			name:      "azure primary with connection string, no account name -> ok",
+			env:       map[string]string{"ARC_STORAGE_BACKEND": "azure", "ARC_STORAGE_AZURE_CONTAINER": "c", "ARC_STORAGE_AZURE_CONNECTION_STRING": "DefaultEndpointsProtocol=https;AccountName=a;AccountKey=k"},
+			wantError: false,
+		},
+		{
+			name:      "azure primary without container -> error",
+			env:       map[string]string{"ARC_STORAGE_BACKEND": "azure", "ARC_STORAGE_AZURE_ACCOUNT_NAME": "a"},
+			wantError: true,
+		},
+		{
+			name:      "cold tier enabled s3 without bucket -> error",
+			env:       map[string]string{"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "s3"},
+			wantError: true,
+		},
+		{
+			name:      "cold tier enabled s3 with bucket -> ok",
+			env:       map[string]string{"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "s3", "ARC_TIERED_STORAGE_COLD_S3_BUCKET": "b"},
+			wantError: false,
+		},
+		{
+			name:      "cold tier enabled invalid backend -> error",
+			env:       map[string]string{"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "gcs"},
+			wantError: true,
+		},
+		{
+			// Regression for the gate-vs-runtime divergence: with the PARENT tier
+			// disabled, the runtime ignores the cold tier entirely, so an invalid
+			// cold config must NOT block startup (previously it did).
+			name:      "parent tiering disabled + bad cold config -> ok (runtime ignores it)",
+			env:       map[string]string{"ARC_TIERED_STORAGE_ENABLED": "false", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "gcs"},
+			wantError: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir, err := os.MkdirTemp("", "arc-config-validate")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(tmpDir)
+			oldWd, _ := os.Getwd()
+			os.Chdir(tmpDir)
+			defer os.Chdir(oldWd)
+
+			for k, v := range tc.env {
+				os.Setenv(k, v)
+			}
+			defer func() {
+				for k := range tc.env {
+					os.Unsetenv(k)
+				}
+			}()
+
+			_, err = Load()
+			if tc.wantError && err == nil {
+				t.Errorf("Load() expected an error, got nil")
+			}
+			if !tc.wantError && err != nil {
+				t.Errorf("Load() unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// TestLoad_StorageValuesTrimmed verifies storage identifiers are trimmed
+// in-place at load, so stray copy-paste whitespace can't reach the DuckDB
+// secret SCOPE / sandbox allowlist / cloud clients.
+func TestLoad_StorageValuesTrimmed(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-trim")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	env := map[string]string{
+		"ARC_STORAGE_BACKEND":               "s3",
+		"ARC_STORAGE_S3_BUCKET":             "  my-bucket  ",
+		"ARC_STORAGE_S3_PREFIX":             "  hot/  ",
+		"ARC_TIERED_STORAGE_ENABLED":        "true",
+		"ARC_TIERED_STORAGE_COLD_ENABLED":   "true",
+		"ARC_TIERED_STORAGE_COLD_BACKEND":   "s3",
+		"ARC_TIERED_STORAGE_COLD_S3_BUCKET": "  cold-bucket  ",
+	}
+	for k, v := range env {
+		os.Setenv(k, v)
+	}
+	defer func() {
+		for k := range env {
+			os.Unsetenv(k)
+		}
+	}()
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Storage.S3Bucket != "my-bucket" {
+		t.Errorf("S3Bucket = %q, want trimmed %q", cfg.Storage.S3Bucket, "my-bucket")
+	}
+	if cfg.Storage.S3Prefix != "hot/" {
+		t.Errorf("S3Prefix = %q, want trimmed %q", cfg.Storage.S3Prefix, "hot/")
+	}
+	if cfg.TieredStorage.Cold.S3Bucket != "cold-bucket" {
+		t.Errorf("Cold.S3Bucket = %q, want trimmed %q (pointer mutation must persist)", cfg.TieredStorage.Cold.S3Bucket, "cold-bucket")
+	}
+}

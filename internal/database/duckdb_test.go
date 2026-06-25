@@ -230,6 +230,28 @@ func TestBuildS3SecretSQL(t *testing.T) {
 		}
 	})
 
+	t.Run("primary IRSA (no keys) -> scoped credential chain", func(t *testing.T) {
+		// storage.backend=="s3" with empty keys (IRSA / IAM role): the widened
+		// gate in configureDatabase now calls configureS3Access, which builds the
+		// PRIMARY secret with no keys -> PROVIDER CREDENTIAL_CHAIN, scoped to the
+		// primary bucket/prefix so it coexists with a cold-tier secret without
+		// clobbering it. This is the bug fix: previously no primary secret was
+		// created and s3:// query reads went unauthenticated.
+		got, err := buildS3SecretSQL(s3SecretParams{
+			name:  arcS3PrimarySecretName,
+			scope: s3SecretScope("primary-bucket", "hot/"),
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		mustContain(t, got, "CREATE OR REPLACE SECRET "+arcS3PrimarySecretName)
+		mustContain(t, got, "PROVIDER CREDENTIAL_CHAIN")
+		mustContain(t, got, "SCOPE 's3://primary-bucket/hot/'")
+		if strings.Contains(got, "KEY_ID") || strings.Contains(got, "SECRET '") {
+			t.Errorf("IRSA primary secret must not emit KEY_ID/SECRET, got:\n%s", got)
+		}
+	})
+
 	t.Run("exactly one key set -> error", func(t *testing.T) {
 		// Asymmetric config is a misconfiguration trap: silently routing to the
 		// credential chain would discard the provided key.
@@ -321,10 +343,51 @@ func TestBuildAzureSecretSQL(t *testing.T) {
 		}
 	})
 
-	t.Run("missing account name -> error", func(t *testing.T) {
-		if _, err := buildAzureSecretSQL(azureSecretParams{name: "x", accountKey: "k"}); err == nil {
-			t.Error("missing account name should error")
+	t.Run("connection string -> CONNECTION_STRING, no account name needed", func(t *testing.T) {
+		// A connection string embeds the account identity, so account name may be
+		// empty (mirrors the Go backend's first auth case).
+		got, err := buildAzureSecretSQL(azureSecretParams{
+			name: arcAzurePrimarySecretName, scope: "azure://primary/",
+			connectionString: "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=key==;EndpointSuffix=core.windows.net",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
 		}
+		mustContain(t, got, "CONNECTION_STRING 'DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=key==;EndpointSuffix=core.windows.net'")
+		if strings.Contains(got, "CREDENTIAL_CHAIN") || strings.Contains(got, "ACCOUNT_NAME") {
+			t.Errorf("connection string must not emit CREDENTIAL_CHAIN/ACCOUNT_NAME, got:\n%s", got)
+		}
+	})
+
+	t.Run("connection string takes precedence over account name/key", func(t *testing.T) {
+		got, err := buildAzureSecretSQL(azureSecretParams{
+			name: "x", connectionString: "ConnStr", accountName: "acct", accountKey: "key==",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		mustContain(t, got, "CONNECTION_STRING 'ConnStr'")
+		if strings.Contains(got, "AccountName=acct") {
+			t.Errorf("connection string must take precedence over synthesized conn string, got:\n%s", got)
+		}
+	})
+
+	t.Run("no account name and no connection string -> error", func(t *testing.T) {
+		if _, err := buildAzureSecretSQL(azureSecretParams{name: "x", accountKey: "k"}); err == nil {
+			t.Error("missing both account name and connection string should error")
+		}
+	})
+
+	t.Run("connection string single quotes escaped", func(t *testing.T) {
+		// The operator-supplied connection string is interpolated into the
+		// CREATE SECRET literal; an embedded quote must be doubled, not break out.
+		got, err := buildAzureSecretSQL(azureSecretParams{
+			name: "x", connectionString: "AccountName=a;SharedAccessSignature=sig'inject",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		mustContain(t, got, "CONNECTION_STRING 'AccountName=a;SharedAccessSignature=sig''inject'")
 	})
 
 	t.Run("single quotes escaped", func(t *testing.T) {

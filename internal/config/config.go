@@ -523,7 +523,11 @@ func Load() (*Config, error) {
 			ArcxExtensionPath: v.GetString("database.arcx_extension_path"),
 		},
 		Storage: StorageConfig{
-			Backend:     v.GetString("storage.backend"),
+			// Normalize once at load so the backend switch, the DuckDB
+			// primary-S3 signal, and the tiering cold.Backend checks all key off
+			// one canonical value ("s3"/"minio"/"local"); an operator writing
+			// "S3" or " s3 " must not silently behave differently across sites.
+			Backend:     strings.ToLower(strings.TrimSpace(v.GetString("storage.backend"))),
 			LocalPath:   v.GetString("storage.local_path"),
 			S3Bucket:    v.GetString("storage.s3_bucket"),
 			S3Region:    v.GetString("storage.s3_region"),
@@ -728,8 +732,10 @@ func Load() (*Config, error) {
 			DefaultHotMaxAgeDays:          v.GetInt("tiered_storage.default_hot_max_age_days"),
 			MigrationHistoryRetentionDays: v.GetInt("tiered_storage.migration_history_retention_days"),
 			Cold: ColdTierConfig{
-				Enabled:                 v.GetBool("tiered_storage.cold.enabled"),
-				Backend:                 v.GetString("tiered_storage.cold.backend"),
+				Enabled: v.GetBool("tiered_storage.cold.enabled"),
+				// Normalized like storage.backend so cold.Backend == "s3"/"azure"
+				// checks key off one canonical value.
+				Backend:                 strings.ToLower(strings.TrimSpace(v.GetString("tiered_storage.cold.backend"))),
 				S3Bucket:                v.GetString("tiered_storage.cold.s3_bucket"),
 				S3Region:                v.GetString("tiered_storage.cold.s3_region"),
 				S3Endpoint:              v.GetString("tiered_storage.cold.s3_endpoint"),
@@ -771,6 +777,98 @@ func Load() (*Config, error) {
 
 	if cfg.Database.MemoryLimit != "" && !memoryLimitRe.MatchString(cfg.Database.MemoryLimit) {
 		return nil, fmt.Errorf("invalid database.memory_limit value: %q", cfg.Database.MemoryLimit)
+	}
+
+	// Trim storage identifiers in-place before validating. These build DuckDB
+	// secret SCOPEs and sandbox allowlist URIs (s3://bucket/prefix/,
+	// azure://container/) and feed cloud-client config; stray copy-paste
+	// whitespace would pass an emptiness check but then produce opaque
+	// connection/auth failures downstream. Endpoint/region are trimmed too: the
+	// S3 endpoint is additionally scheme-stripped inside buildS3SecretSQL, but
+	// the value handed to the Go storage client is otherwise raw, so trim here.
+	cfg.Storage.S3Bucket = strings.TrimSpace(cfg.Storage.S3Bucket)
+	cfg.Storage.S3Prefix = strings.TrimSpace(cfg.Storage.S3Prefix)
+	cfg.Storage.S3Region = strings.TrimSpace(cfg.Storage.S3Region)
+	cfg.Storage.S3Endpoint = strings.TrimSpace(cfg.Storage.S3Endpoint)
+	cfg.Storage.AzureConnectionString = strings.TrimSpace(cfg.Storage.AzureConnectionString)
+	cfg.Storage.AzureAccountName = strings.TrimSpace(cfg.Storage.AzureAccountName)
+	cfg.Storage.AzureContainer = strings.TrimSpace(cfg.Storage.AzureContainer)
+	cfg.Storage.AzureEndpoint = strings.TrimSpace(cfg.Storage.AzureEndpoint)
+
+	// Validate the primary storage backend against the supported set and check
+	// its required fields — fail fast at load rather than late in main.go's
+	// backend switch. The supported set must match that switch
+	// (cmd/arc/main.go): local / s3 / minio / azure / azblob.
+	switch cfg.Storage.Backend {
+	case "local":
+		// No object-storage fields to validate.
+	case "s3", "minio":
+		// An S3-compatible primary backend with no bucket would build an
+		// unscoped DuckDB credential-chain secret AND an empty sandbox s3://
+		// allowlist, so every query read fails with an opaque DuckDB permission
+		// error.
+		if cfg.Storage.S3Bucket == "" {
+			return nil, fmt.Errorf("storage.backend is %q but storage.s3_bucket is empty; set storage.s3_bucket", cfg.Storage.Backend)
+		}
+	case "azure", "azblob":
+		// An empty container yields an empty sandbox allowlist entry and opaque
+		// query-time errors. An empty account name is worse: configureAzureAccess
+		// gates on AzureAccountName != "", so an empty name silently creates NO
+		// primary secret (and buildAzureSecretSQL would reject it anyway).
+		// Account name is required UNLESS a connection string is supplied — the
+		// connection string embeds the account identity, and the Go backend's
+		// first auth case (internal/storage/azure_blob.go) authenticates from it
+		// with AzureAccountName empty. Requiring the name unconditionally would
+		// falsely reject a valid connection-string deployment.
+		if cfg.Storage.AzureConnectionString == "" && cfg.Storage.AzureAccountName == "" {
+			return nil, fmt.Errorf("storage.backend is %q but neither storage.azure_account_name nor storage.azure_connection_string is set; provide one", cfg.Storage.Backend)
+		}
+		if cfg.Storage.AzureContainer == "" {
+			return nil, fmt.Errorf("storage.backend is %q but storage.azure_container is empty; set storage.azure_container", cfg.Storage.Backend)
+		}
+	default:
+		return nil, fmt.Errorf("storage.backend %q is invalid; must be \"local\", \"s3\", \"minio\", \"azure\", or \"azblob\"", cfg.Storage.Backend)
+	}
+
+	// Cold tier (Enterprise tiered storage). Validate its backend and required
+	// fields at startup — same rationale as the primary guards above: a missing
+	// bucket/container surfaces only as an opaque tiering / query-time error
+	// otherwise. The cold runtime switch (cmd/arc/main.go) handles exactly "s3"
+	// and "azure"; reject anything else loudly. Backend is normalized at load.
+	// cold is a POINTER so the in-place trims persist to the real config struct,
+	// not a copy.
+	//
+	// Gate on TieredStorage.Enabled AND Cold.Enabled to match the runtime: the
+	// cold-tier path at cmd/arc/main.go is entered only under
+	// `if cfg.TieredStorage.Enabled` (then a license check, then cold.Enabled).
+	// Validating cold config when the parent tier is disabled would reject a
+	// config the runtime ignores entirely — including OSS/unlicensed deploys with
+	// a leftover cold.enabled=true — a false-positive boot failure.
+	if cfg.TieredStorage.Enabled && cfg.TieredStorage.Cold.Enabled {
+		cold := &cfg.TieredStorage.Cold
+		cold.S3Bucket = strings.TrimSpace(cold.S3Bucket)
+		cold.S3Prefix = strings.TrimSpace(cold.S3Prefix)
+		cold.S3Region = strings.TrimSpace(cold.S3Region)
+		cold.S3Endpoint = strings.TrimSpace(cold.S3Endpoint)
+		cold.AzureConnectionString = strings.TrimSpace(cold.AzureConnectionString)
+		cold.AzureAccountName = strings.TrimSpace(cold.AzureAccountName)
+		cold.AzureContainer = strings.TrimSpace(cold.AzureContainer)
+		cold.AzureEndpoint = strings.TrimSpace(cold.AzureEndpoint)
+		switch cold.Backend {
+		case "s3":
+			if cold.S3Bucket == "" {
+				return nil, fmt.Errorf("tiered_storage.cold.enabled is true and backend is \"s3\" but tiered_storage.cold.s3_bucket is empty; set tiered_storage.cold.s3_bucket")
+			}
+		case "azure":
+			if cold.AzureConnectionString == "" && cold.AzureAccountName == "" {
+				return nil, fmt.Errorf("tiered_storage.cold.enabled is true and backend is \"azure\" but neither tiered_storage.cold.azure_account_name nor tiered_storage.cold.azure_connection_string is set; provide one")
+			}
+			if cold.AzureContainer == "" {
+				return nil, fmt.Errorf("tiered_storage.cold.enabled is true and backend is \"azure\" but tiered_storage.cold.azure_container is empty; set tiered_storage.cold.azure_container")
+			}
+		default:
+			return nil, fmt.Errorf("tiered_storage.cold.enabled is true but tiered_storage.cold.backend %q is invalid; must be \"s3\" or \"azure\"", cold.Backend)
+		}
 	}
 
 	return cfg, nil
