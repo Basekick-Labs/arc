@@ -143,9 +143,11 @@ back to "default" (the namespace default SA). Mirrors the common Helm pattern.
 {{- end }}
 
 {{- define "arc-enterprise.objectStorageSecretName" -}}
-{{- if .Values.storage.shared.credentials.existingSecret -}}
-{{ .Values.storage.shared.credentials.existingSecret }}
-{{- else if and (eq .Values.storage.mode "shared") (not .Values.storage.shared.external) -}}
+{{- $shared := .Values.storage.shared | default dict -}}
+{{- $creds := $shared.credentials | default dict -}}
+{{- if $creds.existingSecret -}}
+{{ $creds.existingSecret }}
+{{- else if and (eq .Values.storage.mode "shared") (not $shared.external) -}}
 {{- include "arc-enterprise.minioSecretName" . -}}
 {{- else -}}
 {{ printf "%s-object-storage" (include "arc-enterprise.fullname" .) | trunc 63 | trimSuffix "-" }}
@@ -167,7 +169,7 @@ Secret (root-user / root-password keys), false when they come from an
 operator-supplied external-S3 secret (access-key / secret-key keys).
 */}}
 {{- define "arc-enterprise.useMinioCredKeys" -}}
-{{- if .Values.storage.shared.credentials.existingSecret -}}
+{{- if (($.Values.storage.shared | default dict).credentials | default dict).existingSecret -}}
 false
 {{- else if eq (include "arc-enterprise.minioBundled" .) "true" -}}
 true

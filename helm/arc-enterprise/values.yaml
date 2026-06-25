@@ -106,15 +106,16 @@ cluster:
 storage:
   mode: shared                     # "shared" or "local"
 
-  # Settings for shared mode (S3-compatible object storage).
+  # Settings for shared mode (S3-compatible object storage). The chart emits S3
+  # config only (ARC_STORAGE_BACKEND=s3); use an S3-compatible endpoint.
   shared:
-    external: false                # true = use existing S3/Azure; false = bundled MinIO
+    external: false                # true = use existing S3/MinIO; false = bundled MinIO
     bucket: arc-data
     region: us-east-1
-    endpoint: ""                   # auto-populated when bundled MinIO; set for external S3/Azure
+    endpoint: ""                   # auto-populated when bundled MinIO; set for external S3
     prefix: ""                     # optional key prefix (multi-tenant bucket sharing)
     usePathStyle: true             # true for MinIO and some S3-compatible services
-    useSSL: false                  # true for production S3 / Azure
+    useSSL: false                  # true for production S3
     credentials:
       # useIRSA: authenticate to S3 via the pod's IAM role (IRSA / instance
       # profile / env) instead of static keys. When true, the chart omits the
