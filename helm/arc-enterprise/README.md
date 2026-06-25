@@ -87,17 +87,12 @@ keys. Set `credentials.useIRSA=true` (the chart omits the S3 key env vars so
 Arc falls back to the AWS credential chain) and attach the role via a
 ServiceAccount annotation.
 
-> **Image version:** primary-S3 **query** reads via the credential chain require
-> the Arc **26.06.2** binary. The chart's default `appVersion` (26.06.1)
-> authenticates IRSA for **writes** but not for query reads — set
-> `image.tag: 26.06.2` (once released) for full IRSA support. The chart default
-> will move to 26.06.2 when it ships.
+> **Requires Arc 26.06.2+** for primary-S3 query reads via the credential chain.
+> The chart's default `appVersion` is 26.06.2, so no `image.tag` override is
+> needed unless you pin an older image.
 
 ```yaml
 # values-override.yaml
-image:
-  tag: "26.06.2"                            # required for IRSA query reads (see note above)
-
 storage:
   mode: shared
   shared:

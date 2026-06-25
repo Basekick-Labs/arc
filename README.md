@@ -203,23 +203,23 @@ Multi-arch images (`linux/amd64` + `linux/arm64`) are published to both registri
 ### Debian/Ubuntu
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v26.06.1/arc_26.06.1_amd64.deb
-sudo dpkg -i arc_26.06.1_amd64.deb
+wget https://github.com/basekick-labs/arc/releases/download/v26.06.2/arc_26.06.2_amd64.deb
+sudo dpkg -i arc_26.06.2_amd64.deb
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
 ### RHEL/Fedora
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v26.06.1/arc-26.06.1-1.x86_64.rpm
-sudo rpm -i arc-26.06.1-1.x86_64.rpm
+wget https://github.com/basekick-labs/arc/releases/download/v26.06.2/arc-26.06.2-1.x86_64.rpm
+sudo rpm -i arc-26.06.2-1.x86_64.rpm
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
 ### Kubernetes (Helm)
 
 ```bash
-helm install arc https://github.com/basekick-labs/arc/releases/download/v26.06.1/arc-26.06.1.tgz
+helm install arc https://github.com/basekick-labs/arc/releases/download/v26.06.2/arc-26.06.2.tgz
 ```
 
 ### Build from Source

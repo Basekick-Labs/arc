@@ -1,6 +1,6 @@
 # Arc v2026.06.2 Release Notes
 
-> **Status:** In progress (planned release: July 2026).
+> **Status:** Released 2026-06-26.
 
 > **This is a patch release.** Bug fixes and hardening only — no new features, no breaking API changes, no schema migrations. Drop-in upgrade from v2026.06.1.
 

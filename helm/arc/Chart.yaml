@@ -2,8 +2,8 @@ apiVersion: v2
 name: arc
 description: High-performance time-series database built on DuckDB (Go implementation)
 type: application
-version: 0.1.0
-appVersion: "26.06.1"
+version: 0.2.0
+appVersion: "26.06.2"
 keywords:
   - database
   - timeseries
