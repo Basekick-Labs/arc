@@ -259,6 +259,9 @@ func main() {
 		AzureConnectionString: cfg.Storage.AzureConnectionString,
 		AzureEndpoint:         cfg.Storage.AzureEndpoint,
 		AzureContainer:        cfg.Storage.AzureContainer,
+		// Primary-backend signal for Azure (mirrors S3IsPrimaryBackend): only an
+		// azure/azblob primary backend provisions a primary Azure secret.
+		AzureIsPrimaryBackend: cfg.Storage.Backend == "azure" || cfg.Storage.Backend == "azblob",
 		// Cold-tier sandbox allowlist entries. The cold tier may use a
 		// different bucket/container from the primary backend (commonly
 		// hot=local + cold=S3 on Enterprise); the sandbox must allow both.

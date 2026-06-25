@@ -783,13 +783,17 @@ func Load() (*Config, error) {
 	// secret SCOPEs and sandbox allowlist URIs (s3://bucket/prefix/,
 	// azure://container/) and feed cloud-client config; stray copy-paste
 	// whitespace would pass an emptiness check but then produce opaque
-	// connection/auth failures downstream. (The S3 endpoint is trimmed
-	// separately via stripURLScheme.)
+	// connection/auth failures downstream. Endpoint/region are trimmed too: the
+	// S3 endpoint is additionally scheme-stripped inside buildS3SecretSQL, but
+	// the value handed to the Go storage client is otherwise raw, so trim here.
 	cfg.Storage.S3Bucket = strings.TrimSpace(cfg.Storage.S3Bucket)
 	cfg.Storage.S3Prefix = strings.TrimSpace(cfg.Storage.S3Prefix)
+	cfg.Storage.S3Region = strings.TrimSpace(cfg.Storage.S3Region)
+	cfg.Storage.S3Endpoint = strings.TrimSpace(cfg.Storage.S3Endpoint)
 	cfg.Storage.AzureConnectionString = strings.TrimSpace(cfg.Storage.AzureConnectionString)
 	cfg.Storage.AzureAccountName = strings.TrimSpace(cfg.Storage.AzureAccountName)
 	cfg.Storage.AzureContainer = strings.TrimSpace(cfg.Storage.AzureContainer)
+	cfg.Storage.AzureEndpoint = strings.TrimSpace(cfg.Storage.AzureEndpoint)
 
 	// Validate the primary storage backend against the supported set and check
 	// its required fields — fail fast at load rather than late in main.go's
@@ -826,20 +830,30 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("storage.backend %q is invalid; must be \"local\", \"s3\", \"minio\", \"azure\", or \"azblob\"", cfg.Storage.Backend)
 	}
 
-	// Cold tier (Enterprise tiered storage). When enabled, validate its backend
-	// and required fields at startup — same rationale as the primary guards
-	// above: a missing bucket/container surfaces only as an opaque tiering /
-	// query-time error otherwise. The cold runtime switch (cmd/arc/main.go)
-	// handles exactly "s3" and "azure"; reject anything else loudly. Backend is
-	// normalized at load. cold is a POINTER so the in-place trims persist to the
-	// real config struct, not a copy.
-	if cfg.TieredStorage.Cold.Enabled {
+	// Cold tier (Enterprise tiered storage). Validate its backend and required
+	// fields at startup — same rationale as the primary guards above: a missing
+	// bucket/container surfaces only as an opaque tiering / query-time error
+	// otherwise. The cold runtime switch (cmd/arc/main.go) handles exactly "s3"
+	// and "azure"; reject anything else loudly. Backend is normalized at load.
+	// cold is a POINTER so the in-place trims persist to the real config struct,
+	// not a copy.
+	//
+	// Gate on TieredStorage.Enabled AND Cold.Enabled to match the runtime: the
+	// cold-tier path at cmd/arc/main.go is entered only under
+	// `if cfg.TieredStorage.Enabled` (then a license check, then cold.Enabled).
+	// Validating cold config when the parent tier is disabled would reject a
+	// config the runtime ignores entirely — including OSS/unlicensed deploys with
+	// a leftover cold.enabled=true — a false-positive boot failure.
+	if cfg.TieredStorage.Enabled && cfg.TieredStorage.Cold.Enabled {
 		cold := &cfg.TieredStorage.Cold
 		cold.S3Bucket = strings.TrimSpace(cold.S3Bucket)
 		cold.S3Prefix = strings.TrimSpace(cold.S3Prefix)
+		cold.S3Region = strings.TrimSpace(cold.S3Region)
+		cold.S3Endpoint = strings.TrimSpace(cold.S3Endpoint)
 		cold.AzureConnectionString = strings.TrimSpace(cold.AzureConnectionString)
 		cold.AzureAccountName = strings.TrimSpace(cold.AzureAccountName)
 		cold.AzureContainer = strings.TrimSpace(cold.AzureContainer)
+		cold.AzureEndpoint = strings.TrimSpace(cold.AzureEndpoint)
 		switch cold.Backend {
 		case "s3":
 			if cold.S3Bucket == "" {

@@ -232,6 +232,11 @@ type Config struct {
 	AzureConnectionString string
 	AzureEndpoint         string // Custom endpoint (optional)
 	AzureContainer        string // Container name; used to build the allowed_directories prefix for the sandbox
+	// AzureIsPrimaryBackend is true when storage.backend is "azure"/"azblob".
+	// Gates primary Azure secret creation on the backend actually being Azure,
+	// so a stray storage.azure_* value on a non-Azure-primary deployment does
+	// not provision a spurious primary secret (mirrors S3IsPrimaryBackend).
+	AzureIsPrimaryBackend bool
 	// Cold-tier sandbox allowlist entries. Independent from S3Bucket /
 	// AzureContainer (which describe Arc's primary/hot storage) because
 	// Enterprise tiered storage routinely combines hot=local with cold=S3 —
@@ -314,7 +319,7 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 	// with empty keys) or static keys are configured. Keying only off key
 	// presence would log s3_enabled=false for a working IRSA deployment.
 	s3Enabled := cfg.S3IsPrimaryBackend || (cfg.S3AccessKey != "" && cfg.S3SecretKey != "")
-	azureEnabled := cfg.AzureAccountName != "" || cfg.AzureConnectionString != ""
+	azureEnabled := cfg.AzureIsPrimaryBackend
 	logger.Info().
 		Int("max_connections", cfg.MaxConnections).
 		Str("memory_limit", cfg.MemoryLimit).
@@ -486,11 +491,14 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		}
 	}
 
-	// Configure azure extension for Azure Blob Storage access. Only the account
-	// name is required: when AzureAccountKey is empty, configureAzureAccess
-	// provisions a PROVIDER CREDENTIAL_CHAIN secret so managed identity / az-login
-	// / env credentials work (mirrors the S3 credential-chain behavior).
-	if cfg.AzureAccountName != "" || cfg.AzureConnectionString != "" {
+	// Configure azure extension + primary Azure secret when the primary backend
+	// is Azure. Keyed on AzureIsPrimaryBackend (not field presence) so a stray
+	// storage.azure_* value on a non-Azure-primary deployment does not provision
+	// a spurious primary secret or fail startup on a malformed connection string.
+	// configureAzureAccess builds the secret from the connection string, the
+	// account name+key, or (no key) PROVIDER CREDENTIAL_CHAIN for managed
+	// identity / az-login / env. Mirrors the S3IsPrimaryBackend gate above.
+	if cfg.AzureIsPrimaryBackend {
 		if err := configureAzureAccess(db, cfg, logger); err != nil {
 			return fmt.Errorf("failed to configure Azure access: %w", err)
 		}

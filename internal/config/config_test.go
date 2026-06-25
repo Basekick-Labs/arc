@@ -838,18 +838,26 @@ func TestLoad_StorageBackendValidation(t *testing.T) {
 		},
 		{
 			name:      "cold tier enabled s3 without bucket -> error",
-			env:       map[string]string{"ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "s3"},
+			env:       map[string]string{"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "s3"},
 			wantError: true,
 		},
 		{
 			name:      "cold tier enabled s3 with bucket -> ok",
-			env:       map[string]string{"ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "s3", "ARC_TIERED_STORAGE_COLD_S3_BUCKET": "b"},
+			env:       map[string]string{"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "s3", "ARC_TIERED_STORAGE_COLD_S3_BUCKET": "b"},
 			wantError: false,
 		},
 		{
 			name:      "cold tier enabled invalid backend -> error",
-			env:       map[string]string{"ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "gcs"},
+			env:       map[string]string{"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "gcs"},
 			wantError: true,
+		},
+		{
+			// Regression for the gate-vs-runtime divergence: with the PARENT tier
+			// disabled, the runtime ignores the cold tier entirely, so an invalid
+			// cold config must NOT block startup (previously it did).
+			name:      "parent tiering disabled + bad cold config -> ok (runtime ignores it)",
+			env:       map[string]string{"ARC_TIERED_STORAGE_ENABLED": "false", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "gcs"},
+			wantError: false,
 		},
 	}
 
@@ -901,6 +909,7 @@ func TestLoad_StorageValuesTrimmed(t *testing.T) {
 		"ARC_STORAGE_BACKEND":               "s3",
 		"ARC_STORAGE_S3_BUCKET":             "  my-bucket  ",
 		"ARC_STORAGE_S3_PREFIX":             "  hot/  ",
+		"ARC_TIERED_STORAGE_ENABLED":        "true",
 		"ARC_TIERED_STORAGE_COLD_ENABLED":   "true",
 		"ARC_TIERED_STORAGE_COLD_BACKEND":   "s3",
 		"ARC_TIERED_STORAGE_COLD_S3_BUCKET": "  cold-bucket  ",

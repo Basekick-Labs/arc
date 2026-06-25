@@ -378,6 +378,18 @@ func TestBuildAzureSecretSQL(t *testing.T) {
 		}
 	})
 
+	t.Run("connection string single quotes escaped", func(t *testing.T) {
+		// The operator-supplied connection string is interpolated into the
+		// CREATE SECRET literal; an embedded quote must be doubled, not break out.
+		got, err := buildAzureSecretSQL(azureSecretParams{
+			name: "x", connectionString: "AccountName=a;SharedAccessSignature=sig'inject",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		mustContain(t, got, "CONNECTION_STRING 'AccountName=a;SharedAccessSignature=sig''inject'")
+	})
+
 	t.Run("single quotes escaped", func(t *testing.T) {
 		got, err := buildAzureSecretSQL(azureSecretParams{
 			name: "x", scope: "azure://c'/", accountName: "ac't", accountKey: "k'y",
