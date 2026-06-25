@@ -80,6 +80,53 @@ minio:
   enabled: false                           # don't deploy bundled MinIO
 ```
 
+### External S3 with IRSA (EKS — no static keys)
+
+On EKS, authenticate to S3 through the pod's IAM role (IRSA) instead of static
+keys. Set `credentials.useIRSA=true` (the chart omits the S3 key env vars so
+Arc falls back to the AWS credential chain) and attach the role via a
+ServiceAccount annotation.
+
+> **Image version:** primary-S3 **query** reads via the credential chain require
+> the Arc **26.06.2** binary. The chart's default `appVersion` (26.06.1)
+> authenticates IRSA for **writes** but not for query reads — set
+> `image.tag: 26.06.2` (once released) for full IRSA support. The chart default
+> will move to 26.06.2 when it ships.
+
+```yaml
+# values-override.yaml
+image:
+  tag: "26.06.2"                            # required for IRSA query reads (see note above)
+
+storage:
+  mode: shared
+  shared:
+    external: true
+    bucket: my-arc-bucket
+    region: us-east-1
+    endpoint: https://s3.us-east-1.amazonaws.com
+    useSSL: true
+    usePathStyle: false
+    credentials:
+      useIRSA: true                        # no static keys; use the pod IAM role
+
+serviceAccount:
+  create: true
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/arc-s3
+
+minio:
+  enabled: false
+```
+
+The IAM role's trust policy must permit the cluster's OIDC provider + this
+ServiceAccount, and the role must grant `s3:GetObject`/`PutObject`/`ListBucket`
+on the bucket. When the chart creates the ServiceAccount (`serviceAccount.create=true`),
+the install fails if the `eks.amazonaws.com/role-arn` annotation is missing. If
+you manage the ServiceAccount externally (`serviceAccount.create=false`, set
+`serviceAccount.name`) — or authenticate via an EC2 instance profile — the chart
+does not require the annotation in values; attach the role to the SA out-of-band.
+
 ### Authentication (admin token + cluster replication)
 
 ```yaml

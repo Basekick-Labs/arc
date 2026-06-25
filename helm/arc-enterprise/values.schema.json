@@ -14,6 +14,15 @@
     },
     "imagePullSecrets": { "type": "array", "items": { "type": "object" } },
 
+    "serviceAccount": {
+      "type": "object",
+      "properties": {
+        "create":      { "type": "boolean" },
+        "name":        { "type": "string" },
+        "annotations": { "type": "object" }
+      }
+    },
+
     "license": {
       "type": "object",
       "properties": {
@@ -99,6 +108,7 @@
             "credentials": {
               "type": "object",
               "properties": {
+                "useIRSA":        { "type": "boolean" },
                 "existingSecret": { "type": "string" },
                 "accessKey":      { "type": "string" },
                 "secretKey":      { "type": "string" }

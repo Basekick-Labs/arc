@@ -23,6 +23,18 @@ image:
 imagePullSecrets: []
 
 # -----------------------------------------------------------------------------
+# ServiceAccount
+# -----------------------------------------------------------------------------
+# Used by all Arc pods (writer/reader/compactor). Set annotations to attach an
+# AWS IAM role via IRSA (IAM Roles for Service Accounts) on EKS, so Arc reaches
+# S3 through the pod's role instead of static keys — pair with
+# storage.shared.credentials.useIRSA=true.
+serviceAccount:
+  create: false                    # true = chart creates the ServiceAccount
+  name: ""                         # SA to use; "" + create=true derives a name; "" + create=false = "default"
+  annotations: {}                  # e.g. eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/arc-s3
+
+# -----------------------------------------------------------------------------
 # License — required for Enterprise features
 # -----------------------------------------------------------------------------
 license:
@@ -94,17 +106,25 @@ cluster:
 storage:
   mode: shared                     # "shared" or "local"
 
-  # Settings for shared mode (S3-compatible object storage).
+  # Settings for shared mode (S3-compatible object storage). The chart emits S3
+  # config only (ARC_STORAGE_BACKEND=s3); use an S3-compatible endpoint.
   shared:
-    external: false                # true = use existing S3/Azure; false = bundled MinIO
+    external: false                # true = use existing S3/MinIO; false = bundled MinIO
     bucket: arc-data
     region: us-east-1
-    endpoint: ""                   # auto-populated when bundled MinIO; set for external S3/Azure
+    endpoint: ""                   # auto-populated when bundled MinIO; set for external S3
     prefix: ""                     # optional key prefix (multi-tenant bucket sharing)
     usePathStyle: true             # true for MinIO and some S3-compatible services
-    useSSL: false                  # true for production S3 / Azure
+    useSSL: false                  # true for production S3
     credentials:
+      # useIRSA: authenticate to S3 via the pod's IAM role (IRSA / instance
+      # profile / env) instead of static keys. When true, the chart omits the
+      # ARC_STORAGE_S3_ACCESS_KEY/SECRET_KEY env vars entirely and Arc falls
+      # back to the AWS credential chain. Pair with serviceAccount.annotations
+      # carrying eks.amazonaws.com/role-arn. Only valid for external S3.
+      useIRSA: false
       # If existingSecret is set, must contain keys "access-key" and "secret-key".
+      # Ignored when useIRSA=true.
       existingSecret: ""
       accessKey: ""
       secretKey: ""

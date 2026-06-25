@@ -80,6 +80,20 @@ Names for derived resources.
 {{- printf "%s-compactor" (include "arc-enterprise.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end }}
 
+{{/*
+ServiceAccount name. When serviceAccount.create=true, use the explicit name or
+derive one from the release; when create=false, use the explicit name or fall
+back to "default" (the namespace default SA). Mirrors the common Helm pattern.
+*/}}
+{{- define "arc-enterprise.serviceAccountName" -}}
+{{- $sa := .Values.serviceAccount | default dict -}}
+{{- if $sa.create -}}
+{{- default (include "arc-enterprise.fullname" .) $sa.name -}}
+{{- else -}}
+{{- default "default" $sa.name -}}
+{{- end -}}
+{{- end }}
+
 {{- define "arc-enterprise.writerHeadlessName" -}}
 {{- printf "%s-headless" (include "arc-enterprise.writerName" .) | trunc 63 | trimSuffix "-" -}}
 {{- end }}
@@ -129,9 +143,11 @@ Names for derived resources.
 {{- end }}
 
 {{- define "arc-enterprise.objectStorageSecretName" -}}
-{{- if .Values.storage.shared.credentials.existingSecret -}}
-{{ .Values.storage.shared.credentials.existingSecret }}
-{{- else if and (eq .Values.storage.mode "shared") (not .Values.storage.shared.external) -}}
+{{- $shared := .Values.storage.shared | default dict -}}
+{{- $creds := $shared.credentials | default dict -}}
+{{- if $creds.existingSecret -}}
+{{ $creds.existingSecret }}
+{{- else if and (eq .Values.storage.mode "shared") (not $shared.external) -}}
 {{- include "arc-enterprise.minioSecretName" . -}}
 {{- else -}}
 {{ printf "%s-object-storage" (include "arc-enterprise.fullname" .) | trunc 63 | trimSuffix "-" }}
@@ -153,7 +169,7 @@ Secret (root-user / root-password keys), false when they come from an
 operator-supplied external-S3 secret (access-key / secret-key keys).
 */}}
 {{- define "arc-enterprise.useMinioCredKeys" -}}
-{{- if .Values.storage.shared.credentials.existingSecret -}}
+{{- if (($.Values.storage.shared | default dict).credentials | default dict).existingSecret -}}
 false
 {{- else if eq (include "arc-enterprise.minioBundled" .) "true" -}}
 true
@@ -311,6 +327,7 @@ Storage env vars — depends on storage.mode.
 */}}
 {{- define "arc-enterprise.storageEnv" -}}
 {{- if eq .Values.storage.mode "shared" }}
+{{- $creds := (.Values.storage.shared | default dict).credentials | default dict -}}
 - name: ARC_STORAGE_BACKEND
   value: "s3"
 - name: ARC_STORAGE_S3_BUCKET
@@ -327,6 +344,7 @@ Storage env vars — depends on storage.mode.
 - name: ARC_STORAGE_S3_PREFIX
   value: {{ .Values.storage.shared.prefix | quote }}
 {{- end }}
+{{- if not $creds.useIRSA }}
 - name: ARC_STORAGE_S3_ACCESS_KEY
   valueFrom:
     secretKeyRef:
@@ -337,6 +355,7 @@ Storage env vars — depends on storage.mode.
     secretKeyRef:
       name: {{ include "arc-enterprise.objectStorageSecretName" . }}
       key: {{ if eq (include "arc-enterprise.useMinioCredKeys" .) "true" }}root-password{{ else }}secret-key{{ end }}
+{{- end }}
 - name: ARC_CLUSTER_REPLICATION_ENABLED
   value: "false"
 {{- else }}
