@@ -269,6 +269,7 @@ CMVP-certified; Arc itself is not a CMVP-listed module. See the
 
 | Tool | Description | Link |
 |------|-------------|------|
+| **Arc Launchpad** | Self-hosted web UI: SQL console, schema explorer, logs, tokens, retention, alerts, and team management | [GitHub](https://github.com/Basekick-Labs/launchpad) |
 | **VS Code Extension** | Browse databases, run queries, visualize results | [Marketplace](https://marketplace.visualstudio.com/items?itemName=basekick-labs.arc-db-manager) |
 | **Grafana Data Source** | Native Grafana plugin for dashboards and alerting | [GitHub](https://github.com/Basekick-Labs/grafana-arc-datasource) |
 | **Telegraf Output Plugin** | Ship data from 300+ Telegraf inputs directly to Arc | [Docs](https://docs.influxdata.com/telegraf/v1/output-plugins/arc/) |
