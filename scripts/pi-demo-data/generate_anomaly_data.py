@@ -95,7 +95,7 @@ def main():
 
     # Order by time so Arc's hour-partitioning lands cleanly.
     source_sql = """
-        SELECT epoch_ms(time)::BIGINT AS time, machine, value
+        SELECT (epoch(time) * 1000)::BIGINT AS time, machine, value
         FROM vibration ORDER BY time
     """
 

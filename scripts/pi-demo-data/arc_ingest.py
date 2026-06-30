@@ -12,6 +12,7 @@ column must be epoch milliseconds (int64); Arc stores it as Timestamp(us).
 """
 
 import time
+import urllib.error
 import urllib.request
 
 import msgpack
@@ -54,31 +55,36 @@ def ingest_table(
     print(f"  ingesting {total:,} rows into {database}.{measurement} "
           f"in chunks of {chunk_rows:,} ...")
 
-    sent, offset, t0 = 0, 0, time.time()
-    while offset < total:
-        rows = con.execute(
-            f"SELECT {', '.join(columns)} FROM ({source_sql}) "
-            f"LIMIT {chunk_rows} OFFSET {offset}"
-        ).fetchall()
+    # Execute the SELECT once and stream it with fetchmany(). Looping with
+    # LIMIT/OFFSET would re-scan all preceding rows on every chunk (O(N^2));
+    # streaming a single cursor is O(N).
+    sent, t0 = 0, time.time()
+    result = con.execute(f"SELECT {', '.join(columns)} FROM ({source_sql})")
+    while True:
+        rows = result.fetchmany(chunk_rows)
         if not rows:
             break
 
         # Transpose row tuples into per-column arrays (columnar payload).
-        cols = {name: [] for name in columns}
-        for r in rows:
-            for i, name in enumerate(columns):
-                cols[name].append(r[i])
+        cols = {name: list(values) for name, values in zip(columns, zip(*rows))}
 
         payload = msgpack.packb(
             [{"m": measurement, "columns": cols}], use_bin_type=True
         )
         req = urllib.request.Request(write_url, data=payload, headers=headers)
-        resp = urllib.request.urlopen(req, timeout=120)
-        if resp.status not in (200, 204):
-            raise RuntimeError(f"write failed: HTTP {resp.status} {resp.read()[:200]!r}")
+        try:
+            # `with` closes the response socket promptly after each request.
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                if resp.status not in (200, 204):
+                    raise RuntimeError(
+                        f"write failed: HTTP {resp.status} {resp.read()[:200]!r}"
+                    )
+        except urllib.error.HTTPError as e:
+            # urlopen raises on non-2xx; surface Arc's error body, which is
+            # otherwise lost.
+            raise RuntimeError(f"write failed: HTTP {e.code} {e.read()[:200]!r}") from e
 
         sent += len(rows)
-        offset += chunk_rows
 
     elapsed = time.time() - t0
     rate = sent / elapsed / 1e6 if elapsed else 0

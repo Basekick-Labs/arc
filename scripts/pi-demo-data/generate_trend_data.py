@@ -75,7 +75,7 @@ def main():
     build(con)
 
     source_sql = """
-        SELECT epoch_ms(time)::BIGINT AS time, tag, value, status
+        SELECT (epoch(time) * 1000)::BIGINT AS time, tag, value, status
         FROM sensors ORDER BY time
     """
 
