@@ -152,4 +152,4 @@ Full write-up: https://basekick.net/blog/anomaly-detection-with-arc
 - The synthetic data is dated 2025 (the demo's reference year); adjust the
   `TIMESTAMP` literals in the generators if you want a different epoch.
 - `time` is sent as epoch milliseconds; Arc stores it as `Timestamp(us)`.
-- Questions: ignacio@basekick.net
+- Questions: support[at]basekick[dot]net
