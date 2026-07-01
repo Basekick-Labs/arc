@@ -340,6 +340,24 @@ jobs:
             artifact: arc-fips-linux-arm64
             build_tags: duckdb_arrow,fips
             gofips: "v1.0.0"
+          # macOS (darwin) binaries for the Homebrew tap (basekick-labs/homebrew-tap).
+          # Standard variant only: the FIPS story is Linux/CMVP-focused, and brew
+          # users want the standard build. DuckDB links statically via CGO, so the
+          # resulting Mach-O depends only on macOS system libs (verified with
+          # otool -L) — no runtime deps for the formula. macos-14 = arm64 (Apple
+          # Silicon), macos-13 = amd64 (Intel).
+          - runner: macos-14
+            suffix: darwin-arm64
+            variant: standard
+            artifact: arc-darwin-arm64
+            build_tags: duckdb_arrow
+            gofips: ""
+          - runner: macos-13
+            suffix: darwin-amd64
+            variant: standard
+            artifact: arc-darwin-amd64
+            build_tags: duckdb_arrow
+            gofips: ""
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
@@ -461,6 +479,7 @@ jobs:
           sha256sum \
             arc-linux-amd64 arc-linux-arm64 \
             arc-fips-linux-amd64 arc-fips-linux-arm64 \
+            arc-darwin-amd64 arc-darwin-arm64 \
             > sha256sums.txt
           cat sha256sums.txt
           # SLSA generator expects base64-encoded "HASH  filename\n..." lines (sha256sum format)
@@ -1459,6 +1478,8 @@ jobs:
             release-artifacts/**/*.intoto.jsonl
             release-artifacts/**/*-linux-amd64
             release-artifacts/**/*-linux-arm64
+            release-artifacts/**/*-darwin-amd64
+            release-artifacts/**/*-darwin-arm64
           fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
