@@ -404,10 +404,17 @@ type fiberContext = context.Context
 // importPreamble validates the database/measurement and RBAC, returning a ready
 // error response if validation fails. Shared by CSV and Parquet handlers.
 func (h *ImportHandler) importPreamble(c *fiber.Ctx) (string, string, error) {
+	// c.Get / c.Query are zero-copy aliases into the fasthttp request buffer.
+	// The database and measurement returned here are retained past the handler by
+	// the async Arrow buffer (WriteTypedColumnarDirect) as storage-path segments,
+	// so both are strings.Clone'd before they can escape — otherwise a concurrent
+	// CSV/Parquet import reusing the buffer could redirect this write. See the
+	// full explanation in msgpack.go.
 	database := c.Get("x-arc-database")
 	if database == "" {
 		database = c.Query("db")
 	}
+	database = strings.Clone(database)
 	if database == "" {
 		h.totalErrors.Add(1)
 		return "", "", c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "database is required (set x-arc-database header or db query param)"})
@@ -417,7 +424,7 @@ func (h *ImportHandler) importPreamble(c *fiber.Ctx) (string, string, error) {
 		return "", "", c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)"})
 	}
 
-	measurement := c.Query("measurement")
+	measurement := strings.Clone(c.Query("measurement"))
 	if measurement == "" {
 		h.totalErrors.Add(1)
 		return "", "", c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "measurement query parameter is required"})

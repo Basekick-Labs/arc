@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -156,6 +157,15 @@ func (h *LineProtocolHandler) WriteSimple(c *fiber.Ctx) error {
 // handleWrite processes Line Protocol data and writes to the Arrow buffer.
 // precision controls timestamp interpretation: "ns" (default), "us", "ms", "s".
 func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string, precision string) error {
+	// Copy the database name before it can escape the handler. Every caller
+	// sources `database` from Fiber's zero-copy c.Get / c.Query (aliases into the
+	// fasthttp request buffer, valid only for this handler). The Arrow-buffer
+	// flush retains it on a background goroutine as the storage-path DB
+	// directory, so without a copy a concurrent request reusing the buffer can
+	// redirect this write to a different database. See the matching fix and
+	// full explanation in msgpack.go.
+	database = strings.Clone(database)
+
 	// Validate database name to prevent path traversal
 	if !isValidDatabaseName(database) {
 		h.totalErrors.Add(1)

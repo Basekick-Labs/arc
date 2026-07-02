@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"io"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -111,10 +112,16 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
 	start := time.Now()
 
+	// c.Get / c.Query are zero-copy aliases into the fasthttp request buffer.
+	// This database name is retained past the handler by the async Arrow buffer
+	// as the storage-path DB directory, so clone it before it can escape (a
+	// concurrent request reusing the buffer would otherwise redirect the write).
+	// See the full explanation in msgpack.go.
 	database := c.Get("x-arc-database")
 	if database == "" {
 		database = c.Query("db")
 	}
+	database = strings.Clone(database)
 	if database == "" {
 		h.totalErrors.Add(1)
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -369,10 +376,13 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
 	start := time.Now()
 
+	// strings.Clone: c.Get/c.Query alias the fasthttp buffer and this database is
+	// retained past the handler by the async Arrow buffer (see msgpack.go).
 	database := c.Get("x-arc-database")
 	if database == "" {
 		database = c.Query("db")
 	}
+	database = strings.Clone(database)
 	if database == "" {
 		h.totalErrors.Add(1)
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -456,8 +466,9 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 		})
 	}
 
-	// Measurement name from header (default: satellite_tle)
-	measurement := c.Get("x-arc-measurement", "satellite_tle")
+	// Measurement name from header (default: satellite_tle). strings.Clone for
+	// the same aliasing reason as database above (retained past the handler).
+	measurement := strings.Clone(c.Get("x-arc-measurement", "satellite_tle"))
 	if !isValidMeasurementName(measurement) {
 		h.totalErrors.Add(1)
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{

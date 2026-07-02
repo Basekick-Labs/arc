@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -283,8 +284,20 @@ localProcessing:
 		})
 	}
 
-	// Get database from header (optional)
-	database := c.Get("x-arc-database")
+	// Get database from header (optional).
+	//
+	// strings.Clone is REQUIRED, not cosmetic: Fiber's c.Get is zero-copy — it
+	// returns a string aliasing the fasthttp request-header buffer, valid only
+	// for this handler's lifetime (Fiber runs with Immutable=false). This string
+	// is retained past the handler by the async Arrow-buffer flush (it is stored
+	// in the flushTask as task.database and consumed later on a background
+	// goroutine, where it becomes the top-level storage-path directory). Without
+	// a copy, a concurrent request reusing the fasthttp buffer overwrites the
+	// bytes, so a write tagged database=X silently lands under a different DB —
+	// observed as ~60% of an energy_grid backfill scattering into other demos'
+	// databases (names truncated to len("energy_grid")=11), a burst-triggered
+	// data-corruption race. Copy at the boundary before it can escape.
+	database := strings.Clone(c.Get("x-arc-database"))
 
 	// Get record count based on type
 	var recordCount int

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync/atomic"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -76,7 +77,12 @@ func (h *TLEHandler) RegisterRoutes(app *fiber.App) {
 func (h *TLEHandler) handleWrite(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
 
-	database := c.Get("x-arc-database", "default")
+	// strings.Clone: c.Get is zero-copy (aliases the fasthttp header buffer);
+	// this database name is retained past the handler by the async Arrow buffer
+	// (WriteTypedColumnarDirect) as the storage-path DB directory, so a
+	// concurrent request reusing the buffer could redirect the write. Copy at the
+	// boundary. See the full explanation in msgpack.go.
+	database := strings.Clone(c.Get("x-arc-database", "default"))
 
 	if !isValidDatabaseName(database) {
 		h.totalErrors.Add(1)
@@ -141,8 +147,10 @@ localProcessing:
 		})
 	}
 
-	// Measurement name from header (default: satellite_tle)
-	measurement := c.Get("x-arc-measurement", "satellite_tle")
+	// Measurement name from header (default: satellite_tle). strings.Clone for
+	// the same reason as database above: c.Get aliases the request buffer and
+	// this value is retained past the handler as the storage-path measurement.
+	measurement := strings.Clone(c.Get("x-arc-measurement", "satellite_tle"))
 	if !isValidMeasurementName(measurement) {
 		h.totalErrors.Add(1)
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
