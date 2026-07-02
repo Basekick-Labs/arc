@@ -26,8 +26,10 @@ or, equivalently:
 
 ```bash
 brew tap basekick-labs/tap
-brew install arc
+brew install --formula arc
 ```
+
+(The `--formula` flag is needed because `arc` is also the name of a Homebrew *cask* — the Arc browser — so a bare `brew install arc` after tapping would be ambiguous. The fully-qualified `brew install basekick-labs/tap/arc` above has no such ambiguity.)
 
 Then start the server:
 
