@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync/atomic"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -76,7 +77,19 @@ func (h *TLEHandler) RegisterRoutes(app *fiber.App) {
 func (h *TLEHandler) handleWrite(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
 
-	database := c.Get("x-arc-database", "default")
+	// strings.Clone: c.Get is zero-copy (aliases the fasthttp header buffer);
+	// this database name is retained past the handler by the async Arrow buffer
+	// (WriteTypedColumnarDirect) as the storage-path DB directory, so a
+	// concurrent request reusing the buffer could redirect the write. Copy at the
+	// boundary. See the full explanation in msgpack.go. Only the request-provided
+	// value aliases the buffer; the static "default" fallback does not, so we
+	// clone only when the header was actually present.
+	database := c.Get("x-arc-database")
+	if database == "" {
+		database = "default"
+	} else {
+		database = strings.Clone(database)
+	}
 
 	if !isValidDatabaseName(database) {
 		h.totalErrors.Add(1)
@@ -141,8 +154,15 @@ localProcessing:
 		})
 	}
 
-	// Measurement name from header (default: satellite_tle)
-	measurement := c.Get("x-arc-measurement", "satellite_tle")
+	// Measurement name from header (default: satellite_tle). Clone for the same
+	// reason as database above; clone only the request-provided value, not the
+	// static default (which does not alias the request buffer).
+	measurement := c.Get("x-arc-measurement")
+	if measurement == "" {
+		measurement = "satellite_tle"
+	} else {
+		measurement = strings.Clone(measurement)
+	}
 	if !isValidMeasurementName(measurement) {
 		h.totalErrors.Add(1)
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
