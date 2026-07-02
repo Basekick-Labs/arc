@@ -466,9 +466,15 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 		})
 	}
 
-	// Measurement name from header (default: satellite_tle). strings.Clone for
-	// the same aliasing reason as database above (retained past the handler).
-	measurement := strings.Clone(c.Get("x-arc-measurement", "satellite_tle"))
+	// Measurement name from header (default: satellite_tle). Clone for the same
+	// aliasing reason as database above; clone only the request-provided value,
+	// not the static default (which does not alias the request buffer).
+	measurement := c.Get("x-arc-measurement")
+	if measurement == "" {
+		measurement = "satellite_tle"
+	} else {
+		measurement = strings.Clone(measurement)
+	}
 	if !isValidMeasurementName(measurement) {
 		h.totalErrors.Add(1)
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
