@@ -1,6 +1,6 @@
 # Arc v2026.06.3 Release Notes
 
-> **Status:** In progress.
+> **Status:** Released 2026-07-02.
 
 > **This is a patch release.** A reliability fix plus macOS/Homebrew packaging — no breaking API changes and no schema migrations. Drop-in upgrade from v2026.06.2.
 
