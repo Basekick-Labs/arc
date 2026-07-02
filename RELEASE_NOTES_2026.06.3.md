@@ -38,7 +38,7 @@ arc            # listens on http://localhost:8000
 arc --help
 ```
 
-The release now builds native **macOS binaries** for both Apple Silicon (`arc-darwin-arm64`) and Intel (`arc-darwin-amd64`), alongside the existing Linux binaries, `.deb`/`.rpm` packages, container images, and Helm chart. Like every other release binary, the macOS binaries are built on GitHub-hosted runners and **cosign-signed** with keyless OIDC (a `.bundle` signature sidecar is attached to the release for offline verification). DuckDB is statically linked into the binary, so the Homebrew install has **no runtime dependencies** — it drops a single self-contained `arc` executable into your Homebrew prefix.
+The release now builds a native **macOS binary** for Apple Silicon (`arc-darwin-arm64`), alongside the existing Linux binaries, `.deb`/`.rpm` packages, container images, and Helm chart. Like every other release binary, it is built on GitHub-hosted runners and **cosign-signed** with keyless OIDC (a `.bundle` signature sidecar is attached to the release for offline verification). DuckDB is statically linked into the binary, so the Homebrew install has **no runtime dependencies** — it drops a single self-contained `arc` executable into your Homebrew prefix. The macOS build is Apple Silicon only.
 
 The formula installs the standard (non-FIPS) build, which is the right choice for local development and evaluation on macOS. The FIPS variant remains a Linux/CMVP-focused build distributed as a container image and Linux packages; see the [FIPS 140-3 mode guide](https://docs.basekick.net/docs/configuration/fips). Linux users should continue to use the `.deb`/`.rpm`, container, or Helm artifacts from the [release page](https://github.com/basekick-labs/arc/releases).
 

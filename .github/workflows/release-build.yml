@@ -345,17 +345,14 @@ jobs:
           # users want the standard build. DuckDB links statically via CGO, so the
           # resulting Mach-O depends only on macOS system libs (verified with
           # otool -L) — no runtime deps for the formula. macos-14 = arm64 (Apple
-          # Silicon), macos-13 = amd64 (Intel).
+          # Silicon). Intel (darwin-amd64 / macos-13) is intentionally NOT built:
+          # Apple stopped shipping Intel Macs years ago, and GitHub's macos-13
+          # runners are a scarce, sunsetting tier that stalled the release waiting
+          # on capacity. Homebrew on macOS is Apple-Silicon-only.
           - runner: macos-14
             suffix: darwin-arm64
             variant: standard
             artifact: arc-darwin-arm64
-            build_tags: duckdb_arrow
-            gofips: ""
-          - runner: macos-13
-            suffix: darwin-amd64
-            variant: standard
-            artifact: arc-darwin-amd64
             build_tags: duckdb_arrow
             gofips: ""
     runs-on: ${{ matrix.runner }}
@@ -479,7 +476,7 @@ jobs:
           sha256sum \
             arc-linux-amd64 arc-linux-arm64 \
             arc-fips-linux-amd64 arc-fips-linux-arm64 \
-            arc-darwin-amd64 arc-darwin-arm64 \
+            arc-darwin-arm64 \
             > sha256sums.txt
           cat sha256sums.txt
           # SLSA generator expects base64-encoded "HASH  filename\n..." lines (sha256sum format)
@@ -1478,7 +1475,6 @@ jobs:
             release-artifacts/**/*.intoto.jsonl
             release-artifacts/**/*-linux-amd64
             release-artifacts/**/*-linux-arm64
-            release-artifacts/**/*-darwin-amd64
             release-artifacts/**/*-darwin-arm64
           fail_on_unmatched_files: false
         env:
