@@ -99,7 +99,14 @@ func (h *TLEHandler) handleWrite(c *fiber.Ctx) error {
 	}
 
 	// Check if this request should be forwarded to a writer node
-	if h.router != nil && ShouldForwardWrite(h.router, c) {
+	switch WriteForwardDecision(h.router, c) {
+	case ForwardAlreadyForwarded:
+		// Already-forwarded marker on a node that cannot ingest locally:
+		// a routing loop or a spoofed X-Arc-Forwarded-By header. Return a
+		// deterministic error instead of a doomed local write attempt.
+		h.totalErrors.Add(1)
+		return RespondAlreadyForwarded(c)
+	case ForwardToPeer:
 		h.logger.Debug().Msg("Forwarding TLE write request to writer node")
 
 		httpReq, err := BuildHTTPRequest(c)

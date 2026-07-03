@@ -98,8 +98,13 @@ func TestBuildHTTPRequest_PreservesMultiValueHeaders(t *testing.T) {
 	})
 
 	req := httptest.NewRequest("GET", "/test", nil)
-	// X-Forwarded-For: three proxy hops, each adds its own value.
-	// Via: two proxies in the chain.
+	// X-Forwarded-For: three proxy hops. As a client-controlled
+	// forwarding header it is now STRIPPED at the forward boundary
+	// (CVE-2026-45045 class hardening) — the forwarding node re-sets a
+	// single trusted value from the socket peer in router.go. See
+	// clientForwardingHeaders.
+	// Via: two proxies in the chain — NOT a forwarding/identity header,
+	// so it must still be preserved multi-value and in order.
 	req.Header.Add("X-Forwarded-For", "203.0.113.1")
 	req.Header.Add("X-Forwarded-For", "198.51.100.7")
 	req.Header.Add("X-Forwarded-For", "192.0.2.42")
@@ -111,13 +116,15 @@ func TestBuildHTTPRequest_PreservesMultiValueHeaders(t *testing.T) {
 	defer resp.Body.Close()
 	require.Equal(t, fiber.StatusOK, resp.StatusCode)
 
-	// Equal (not ElementsMatch): order matters for X-Forwarded-For and
-	// Via — each represents the sequential path of proxy hops, with
-	// leftmost = original client. Reordering corrupts rate-limit /
-	// geo / audit trails downstream. (Gemini PR #463 round 7.)
-	assert.Equal(t,
-		[]string{"203.0.113.1", "198.51.100.7", "192.0.2.42"}, capturedXFF,
-		"X-Forwarded-For values not preserved in chain order")
+	// Client-supplied X-Forwarded-For must not survive onto the
+	// inter-node forward — the forwarding node establishes the trusted
+	// value itself.
+	assert.Empty(t, capturedXFF,
+		"client X-Forwarded-For must be stripped at the forward boundary")
+
+	// Equal (not ElementsMatch): order matters for Via — it represents
+	// the sequential path of proxy hops. Multi-value preservation for
+	// non-forwarding headers is unchanged (Gemini PR #463 round 7).
 	assert.Equal(t,
 		[]string{"1.1 proxy1.example.com", "1.1 proxy2.example.com"}, capturedVia,
 		"Via values not preserved in chain order")
@@ -332,6 +339,119 @@ func TestShouldForwardQuery(t *testing.T) {
 			assert.Equal(t, tt.expectedResult, result)
 		})
 	}
+}
+
+// routerForRole builds a minimal Router whose local node has the given
+// role, so CanRouteLocally reflects that role's capabilities. No registry
+// or transport is needed because these tests only exercise the pre-forward
+// decision, never an actual forward.
+func routerForRole(role cluster.NodeRole) *cluster.Router {
+	return cluster.NewRouter(&cluster.RouterConfig{
+		LocalNode: cluster.NewNode("local", "Local", role, "test-cluster"),
+		Logger:    zerolog.Nop(),
+	})
+}
+
+// TestForwardDecision_ClientCannotForceLocal pins the CVE-2026-45045-class
+// hardening on the loop guard: a client-supplied X-Arc-Forwarded-By must
+// NOT let a caller force a node that cannot serve the request locally onto
+// a doomed local path. On a non-capable node a present marker yields
+// ForwardAlreadyForwarded (deterministic error), and on a capable node the
+// marker is ignored entirely.
+func TestForwardDecision_ClientCannotForceLocal(t *testing.T) {
+	tests := []struct {
+		name        string
+		role        cluster.NodeRole
+		isWrite     bool
+		forwardedBy string
+		want        ForwardDecision
+	}{
+		// Reader cannot ingest.
+		{"reader write, no marker -> forward", cluster.RoleReader, true, "", ForwardToPeer},
+		{"reader write, spoofed marker -> already-forwarded", cluster.RoleReader, true, "spoofed", ForwardAlreadyForwarded},
+		// Writer can ingest: marker is irrelevant, always local.
+		{"writer write, no marker -> local", cluster.RoleWriter, true, "", ForwardLocal},
+		{"writer write, spoofed marker -> local (marker ignored)", cluster.RoleWriter, true, "spoofed", ForwardLocal},
+		// Compactor cannot query.
+		{"compactor query, no marker -> forward", cluster.RoleCompactor, false, "", ForwardToPeer},
+		{"compactor query, spoofed marker -> already-forwarded", cluster.RoleCompactor, false, "spoofed", ForwardAlreadyForwarded},
+		// Reader can query: marker irrelevant.
+		{"reader query, spoofed marker -> local (marker ignored)", cluster.RoleReader, false, "spoofed", ForwardLocal},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := fiber.New()
+			router := routerForRole(tt.role)
+			var got ForwardDecision
+			method := "GET"
+			if tt.isWrite {
+				method = "POST"
+			}
+			app.Add(method, "/decide", func(c *fiber.Ctx) error {
+				got = decideForward(router, c, tt.isWrite)
+				return c.SendStatus(fiber.StatusOK)
+			})
+
+			req := httptest.NewRequest(method, "/decide", nil)
+			if tt.forwardedBy != "" {
+				req.Header.Set(ForwardedByHeader, tt.forwardedBy)
+			}
+			_, err := app.Test(req)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestBuildHTTPRequest_StripsClientForwardingHeaders pins that every
+// client-controlled forwarding/identity header is removed at the forward
+// boundary (CVE-2026-45045 class). The forwarding node re-establishes the
+// trusted values itself in internal/cluster/router.go.
+func TestBuildHTTPRequest_StripsClientForwardingHeaders(t *testing.T) {
+	app := fiber.New()
+
+	stripped := []string{
+		"X-Real-IP",
+		"X-Forwarded-For",
+		"X-Forwarded-Host",
+		"X-Forwarded-Proto",
+		"X-Forwarded-Port",
+		"Forwarded",
+		"X-Arc-Forwarded-By",
+		"X-Arc-Original-Host",
+		"X-Arc-Shard-Routed",
+		"True-Client-IP",
+		"CF-Connecting-IP",
+		"X-Client-IP",
+	}
+
+	var built *http.Request
+	app.Get("/test", func(c *fiber.Ctx) error {
+		var err error
+		built, err = BuildHTTPRequest(c)
+		require.NoError(t, err)
+		return c.SendStatus(fiber.StatusOK)
+	})
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	for _, h := range stripped {
+		req.Header.Set(h, "attacker-value")
+	}
+	// A legitimate end-to-end header must still pass through.
+	req.Header.Set("X-Arc-Database", "mydb")
+
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
+	for _, h := range stripped {
+		assert.Empty(t, built.Header.Values(h),
+			"client-supplied %s must be stripped at the forward boundary", h)
+	}
+	assert.Equal(t, "mydb", built.Header.Get("X-Arc-Database"),
+		"legitimate application header must survive forwarding")
 }
 
 func TestHandleRoutingError(t *testing.T) {

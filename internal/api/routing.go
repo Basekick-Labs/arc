@@ -32,6 +32,48 @@ func isHopByHop(header string) bool {
 	return hopByHopHeaders[header]
 }
 
+// clientForwardingHeaders are client-controlled forwarding / identity
+// headers that MUST NOT be propagated verbatim from an inbound client
+// request onto an inter-node forward. The forwarding node re-establishes
+// the trustworthy values itself (internal/cluster/router.go Sets
+// X-Forwarded-For, X-Arc-Forwarded-By, X-Arc-Original-Host from the socket
+// peer and local node identity), so passing the client's copies through
+// would let a caller inject spoofed values a peer might log or, in future
+// code, trust — the same failure class as CVE-2026-45045 (X-Real-IP
+// spoofing). Arc trusts none of these on the receive side today (identity
+// is derived only from the socket via fiber c.IP()); stripping them here
+// is defense-in-depth that keeps that property true regardless of what a
+// downstream node later chooses to read.
+//
+// Keys are in http.CanonicalHeaderKey form (the VisitAll callback
+// canonicalises before lookup).
+// If future receive-side code ever derives client identity from a header
+// (a custom Fiber ProxyHeader, or a CDN client-IP header), that header MUST
+// be added here so a client cannot pre-seed it across a forward hop.
+var clientForwardingHeaders = map[string]bool{
+	"X-Real-Ip":           true, // canonical form of X-Real-IP
+	"X-Forwarded-For":     true,
+	"X-Forwarded-Host":    true,
+	"X-Forwarded-Proto":   true,
+	"X-Forwarded-Port":    true,
+	"Forwarded":           true, // RFC 7239
+	"X-Arc-Forwarded-By":  true, // internal loop marker; only the peer may set it
+	"X-Arc-Original-Host": true,
+	"X-Arc-Shard-Routed":  true, // internal shard-loop marker
+	// CDN / proxy client-IP headers. Not read by Arc today (identity is
+	// socket-only), stripped defensively so they cannot be trusted later.
+	"True-Client-Ip":   true, // canonical form of True-Client-IP (Akamai/Cloudflare)
+	"Cf-Connecting-Ip": true, // canonical form of CF-Connecting-IP (Cloudflare)
+	"X-Client-Ip":      true, // canonical form of X-Client-IP
+}
+
+// isClientForwardingHeader reports whether a canonicalised header key is a
+// client-controlled forwarding/identity header stripped at the forward
+// boundary. See clientForwardingHeaders.
+func isClientForwardingHeader(canonicalKey string) bool {
+	return clientForwardingHeaders[canonicalKey]
+}
+
 // BuildHTTPRequest converts a Fiber context to a net/http Request for
 // forwarding via the router.
 //
@@ -94,7 +136,9 @@ func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
 	// Add (not Set) preserves multi-value headers: fasthttp emits a
 	// separate VisitAll callback per value, so Set would overwrite
 	// earlier values and only the last would forward. Affects Via,
-	// X-Forwarded-For, Accept (multiple content types), and similar.
+	// Accept (multiple content types), and similar. (Client forwarding
+	// headers like X-Forwarded-For are stripped below, so they are not
+	// among the multi-value headers preserved here.)
 	//
 	// http.CanonicalHeaderKey before isHopByHop lookup: fasthttp
 	// normalises header keys to canonical form by default, but a
@@ -117,6 +161,14 @@ func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
 	c.Request().Header.VisitAll(func(key, value []byte) {
 		k := http.CanonicalHeaderKey(string(key))
 		if isHopByHop(k) || k == "Content-Length" || k == "Host" {
+			return
+		}
+		// Strip client-controlled forwarding/identity headers. The
+		// forwarding node re-establishes the trustworthy values itself
+		// (router.go), so a client cannot inject spoofed X-Real-IP /
+		// X-Forwarded-* / X-Arc-* onto the inter-node hop. Same class as
+		// CVE-2026-45045. See clientForwardingHeaders.
+		if isClientForwardingHeader(k) {
 			return
 		}
 		req.Header[k] = append(req.Header[k], string(value))
@@ -154,46 +206,96 @@ func CopyResponse(c *fiber.Ctx, resp *http.Response) error {
 	return c.Send(body)
 }
 
-// ShouldForwardWrite checks if a write request should be forwarded to another node.
-// Returns true if the request should be forwarded (local node cannot handle writes).
-// Returns false if:
-//   - Router is nil (no clustering)
-//   - Request is already forwarded (loop prevention)
-//   - Local node can handle writes
-func ShouldForwardWrite(router *cluster.Router, c *fiber.Ctx) bool {
-	// No router means no clustering - process locally
+// ForwardDecision is the outcome of the pre-handler routing check. It
+// separates the two reasons a request is not forwarded — "handle it here"
+// versus "it was already forwarded and this node still cannot serve it" —
+// so the second case produces a deterministic error instead of silently
+// falling through to a local path that is structurally guaranteed to fail.
+//
+// Splitting these two cases is also what makes the X-Arc-Forwarded-By loop
+// guard non-abusable. The header is client-settable (it survives at the
+// HTTP boundary and is only overwritten on the *outbound* forward in
+// internal/cluster/router.go), so an authenticated caller can set it on a
+// direct request. Previously that collapsed into "do not forward" and the
+// node then attempted local processing it could not complete — a
+// client-triggered routing bypass / self-inflicted failure. Now a present
+// header on a node that cannot route locally yields ForwardAlreadyForwarded,
+// which the handler answers with a clear 508-style error. A genuine
+// peer->peer loop terminates the same way. On a node that *can* serve
+// locally the header is irrelevant and ignored entirely (the common case).
+type ForwardDecision int
+
+const (
+	// ForwardLocal: handle the request on this node.
+	ForwardLocal ForwardDecision = iota
+	// ForwardToPeer: forward the request to another node.
+	ForwardToPeer
+	// ForwardAlreadyForwarded: the request carries the forwarded-by marker
+	// but this node cannot serve it locally — a loop or a spoofed header.
+	// The handler must return an error, never fall through to local.
+	ForwardAlreadyForwarded
+)
+
+// decideForward centralizes the routing decision for both writes and
+// queries. isWrite selects the capability checked on the local node.
+func decideForward(router *cluster.Router, c *fiber.Ctx, isWrite bool) ForwardDecision {
+	// No router means no clustering - process locally.
 	if router == nil {
-		return false
+		return ForwardLocal
 	}
 
-	// Check for forwarding loop - if X-Arc-Forwarded-By is set, this request was already forwarded
+	// A node that can serve this request type locally always does so.
+	// The X-Arc-Forwarded-By header is irrelevant here and is NOT
+	// consulted — this keeps a client-supplied value from having any
+	// effect on the common (capable-node) path.
+	if router.CanRouteLocally(isWrite) {
+		return ForwardLocal
+	}
+
+	// This node cannot serve locally. If the request is already marked as
+	// forwarded, forwarding it again would loop; and because the marker is
+	// client-settable, honoring it as "handle locally" would let a caller
+	// force a doomed local path. Surface a deterministic error instead.
 	if c.Get(ForwardedByHeader) != "" {
-		return false
+		return ForwardAlreadyForwarded
 	}
 
-	// Check if local node can handle writes
-	return !router.CanRouteLocally(true) // isWrite=true
+	return ForwardToPeer
 }
 
-// ShouldForwardQuery checks if a query request should be forwarded to another node.
-// Returns true if the request should be forwarded (local node cannot handle queries).
-// Returns false if:
-//   - Router is nil (no clustering)
-//   - Request is already forwarded (loop prevention)
-//   - Local node can handle queries
+// ShouldForwardWrite reports whether a write request should be forwarded to
+// another node. It returns true only for ForwardToPeer; ForwardLocal and
+// ForwardAlreadyForwarded both return false. Callers that need to
+// distinguish the already-forwarded case (to emit an error rather than fall
+// through to local processing) should use WriteForwardDecision instead.
+func ShouldForwardWrite(router *cluster.Router, c *fiber.Ctx) bool {
+	return decideForward(router, c, true) == ForwardToPeer
+}
+
+// ShouldForwardQuery reports whether a query request should be forwarded to
+// another node. See ShouldForwardWrite for the return-value semantics.
 func ShouldForwardQuery(router *cluster.Router, c *fiber.Ctx) bool {
-	// No router means no clustering - process locally
-	if router == nil {
-		return false
-	}
+	return decideForward(router, c, false) == ForwardToPeer
+}
 
-	// Check for forwarding loop - if X-Arc-Forwarded-By is set, this request was already forwarded
-	if c.Get(ForwardedByHeader) != "" {
-		return false
-	}
+// WriteForwardDecision returns the full routing decision for a write.
+func WriteForwardDecision(router *cluster.Router, c *fiber.Ctx) ForwardDecision {
+	return decideForward(router, c, true)
+}
 
-	// Check if local node can handle queries
-	return !router.CanRouteLocally(false) // isWrite=false
+// QueryForwardDecision returns the full routing decision for a query.
+func QueryForwardDecision(router *cluster.Router, c *fiber.Ctx) ForwardDecision {
+	return decideForward(router, c, false)
+}
+
+// RespondAlreadyForwarded writes the error returned when a node receives a
+// request marked as already-forwarded that it cannot serve locally (a
+// routing loop or a spoofed X-Arc-Forwarded-By header). Uses 508 Loop
+// Detected so the condition is distinguishable from a transient 503.
+func RespondAlreadyForwarded(c *fiber.Ctx) error {
+	return c.Status(fiber.StatusLoopDetected).JSON(fiber.Map{
+		"error": "request already forwarded and cannot be served by this node",
+	})
 }
 
 // HandleRoutingError returns an appropriate error response for routing failures.
