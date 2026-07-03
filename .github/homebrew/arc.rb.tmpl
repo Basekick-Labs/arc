@@ -30,8 +30,10 @@ class Arc < Formula
   end
 
   def install
-    # The release asset is the bare binary named per-arch; install it as `arc`.
-    bin.install Dir["arc-darwin-*"].first => "arc"
+    # The release asset is the bare arm64 binary; install it as `arc`. Explicit
+    # name (not a glob) so a missing/renamed asset fails loud naming the file,
+    # rather than Dir[...].first => nil raising a cryptic TypeError.
+    bin.install "arc-darwin-arm64" => "arc"
   end
 
   def caveats
