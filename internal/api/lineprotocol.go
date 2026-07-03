@@ -187,7 +187,14 @@ func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string, precisi
 
 	// Check if this request should be forwarded to a writer node
 	// Reader nodes cannot process writes locally, so they forward to writers
-	if h.router != nil && ShouldForwardWrite(h.router, c) {
+	switch WriteForwardDecision(h.router, c) {
+	case ForwardAlreadyForwarded:
+		// Already-forwarded marker on a node that cannot ingest locally:
+		// a routing loop or a spoofed X-Arc-Forwarded-By header. Return a
+		// deterministic error instead of a doomed local write attempt.
+		h.totalErrors.Add(1)
+		return RespondAlreadyForwarded(c)
+	case ForwardToPeer:
 		h.logger.Debug().Msg("Forwarding Line Protocol write request to writer node")
 
 		httpReq, err := BuildHTTPRequest(c)

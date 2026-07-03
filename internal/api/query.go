@@ -1374,7 +1374,14 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 
 	// Check if this request should be forwarded to a reader/writer node
 	// Compactor nodes cannot process queries locally, so they forward to readers/writers
-	if ShouldForwardQuery(h.router, c) {
+	switch QueryForwardDecision(h.router, c) {
+	case ForwardAlreadyForwarded:
+		// Already-forwarded marker on a node that cannot serve queries
+		// locally: a routing loop or a spoofed X-Arc-Forwarded-By header.
+		// Return a deterministic error instead of a doomed local attempt.
+		m.IncQueryErrors()
+		return RespondAlreadyForwarded(c)
+	case ForwardToPeer:
 		h.logger.Debug().Msg("Forwarding query request to reader/writer node")
 
 		httpReq, err := BuildHTTPRequest(c)
