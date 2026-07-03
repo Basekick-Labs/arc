@@ -1,0 +1,54 @@
+# typed: false
+# frozen_string_literal: true
+
+# Homebrew formula for Arc — high-performance columnar analytical database.
+#
+# GENERATED FILE — do not edit by hand. The release workflow
+# (.github/workflows/release-build.yml, job `homebrew-formula`) renders this
+# template with the real version and arc-darwin-arm64 sha256, then pushes it to
+# basekick-labs/homebrew-tap. Edit this template, not the tap copy.
+#
+# Binary formula: downloads the prebuilt, cosign-signed macOS binary from the
+# GitHub release (built on macOS runners; DuckDB is statically linked, so the
+# binary depends only on macOS system libraries — no `depends_on`).
+#
+# Apple Silicon only: Homebrew on macOS is Apple-Silicon-only and the release
+# workflow does not build an Intel (darwin-amd64) asset.
+#
+# Install:  brew install basekick-labs/tap/arc
+class Arc < Formula
+  desc "High-performance columnar analytical database (DuckDB/Parquet/Arrow)"
+  homepage "https://github.com/basekick-labs/arc"
+  version "__VERSION__"
+  license "AGPL-3.0-or-later"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/basekick-labs/arc/releases/download/v#{version}/arc-darwin-arm64"
+      sha256 "__DARWIN_ARM64_SHA256__"
+    end
+  end
+
+  def install
+    # The release asset is the bare binary named per-arch; install it as `arc`.
+    bin.install Dir["arc-darwin-*"].first => "arc"
+  end
+
+  def caveats
+    <<~EOS
+      Arc stores data locally by default under ./data/arc (relative to CWD).
+      Start the server:  arc
+      Then it listens on http://localhost:8000 (see `arc --help`).
+
+      Docs: https://docs.basekick.net/arc
+    EOS
+  end
+
+  test do
+    # `arc` boots a server rather than offering a --version-only flag, so the
+    # smoke test asserts the binary is present and Mach-O executable. A fuller
+    # test (boot + /health) would require backgrounding the server.
+    assert_predicate bin/"arc", :executable?
+    assert_match "Mach-O", shell_output("file #{bin}/arc")
+  end
+end
