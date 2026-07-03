@@ -10,24 +10,26 @@
 #
 # Binary formula: downloads the prebuilt, cosign-signed macOS binary from the
 # GitHub release (built on macOS runners; DuckDB is statically linked, so the
-# binary depends only on macOS system libraries — no `depends_on`).
+# Mach-O depends only on macOS system libraries).
 #
-# Apple Silicon only: Homebrew on macOS is Apple-Silicon-only and the release
-# workflow does not build an Intel (darwin-amd64) asset.
+# Apple Silicon macOS only. The platform is declared with top-level
+# `depends_on :macos` / `depends_on arch: :arm64` (not nested on_macos/on_arm
+# blocks) so `brew install`/`brew info` on Linux or Intel macOS fails with a
+# clean "requires arm64 / macOS" message instead of the cryptic
+# `Error: arc: url is missing` you get when the only url is inside a skipped
+# platform block. The release workflow builds no Intel (darwin-amd64) asset.
 #
 # Install:  brew install basekick-labs/tap/arc
 class Arc < Formula
   desc "High-performance columnar analytical database (DuckDB/Parquet/Arrow)"
   homepage "https://github.com/basekick-labs/arc"
+  url "https://github.com/basekick-labs/arc/releases/download/v__VERSION__/arc-darwin-arm64"
   version "__VERSION__"
+  sha256 "__DARWIN_ARM64_SHA256__"
   license "AGPL-3.0-or-later"
 
-  on_macos do
-    on_arm do
-      url "https://github.com/basekick-labs/arc/releases/download/v#{version}/arc-darwin-arm64"
-      sha256 "__DARWIN_ARM64_SHA256__"
-    end
-  end
+  depends_on arch: :arm64
+  depends_on :macos
 
   def install
     # The release asset is the bare arm64 binary; install it as `arc`. Explicit
