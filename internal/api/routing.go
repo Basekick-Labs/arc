@@ -2,12 +2,10 @@ package api
 
 import (
 	"bytes"
-	"errors"
 	"io"
 	"net/http"
 
 	"github.com/basekick-labs/arc/internal/cluster"
-	"github.com/basekick-labs/arc/internal/cluster/sharding"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -59,7 +57,6 @@ var clientForwardingHeaders = map[string]bool{
 	"Forwarded":           true, // RFC 7239
 	"X-Arc-Forwarded-By":  true, // internal loop marker; only the peer may set it
 	"X-Arc-Original-Host": true,
-	"X-Arc-Shard-Routed":  true, // internal shard-loop marker
 	// CDN / proxy client-IP headers. Not read by Arc today (identity is
 	// socket-only), stripped defensively so they cannot be trusted later.
 	"True-Client-Ip":   true, // canonical form of True-Client-IP (Akamai/Cloudflare)
@@ -78,12 +75,11 @@ func isClientForwardingHeader(canonicalKey string) bool {
 // forwarding via the router.
 //
 // Lifecycle: every caller in this codebase (lineprotocol.go, msgpack.go,
-// tle.go, query.go, routing.go's RouteShardedWrite/Query) invokes the
-// returned *http.Request synchronously within the Fiber handler — they
-// pass it to router.RouteWrite/RouteQuery (which blocks on
-// http.Client.Do, and internally already buffers the body via io.ReadAll
-// for retry support, see internal/cluster/router.go forwardRequest) or
-// to shardRouter.RouteWrite/RouteQuery, then read+close the response
+// tle.go, query.go) invokes the returned *http.Request synchronously
+// within the Fiber handler — they pass it to router.RouteWrite/RouteQuery
+// (which blocks on http.Client.Do, and internally already buffers the body
+// via io.ReadAll for retry support, see internal/cluster/router.go
+// forwardRequest), then read+close the response
 // body inside CopyResponse, then return. fasthttp does not recycle the
 // RequestCtx until after the handler returns (fasthttp server.go
 // releaseCtx is post-handler), so wrapping c.Body() in bytes.NewReader
@@ -316,97 +312,6 @@ func HandleRoutingError(c *fiber.Ctx, err error) error {
 	default:
 		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
 			"error": "Routing error: " + err.Error(),
-		})
-	}
-}
-
-// ShardRoutedHeader indicates a request has been routed by the shard router.
-const ShardRoutedHeader = "X-Arc-Shard-Routed"
-
-// RouteShardedWrite routes a write request using the shard router.
-// Returns:
-//   - (nil, nil) if request should be handled locally
-//   - (*http.Response, nil) if request was forwarded successfully
-//   - (nil, error) if routing failed
-func RouteShardedWrite(shardRouter *sharding.ShardRouter, c *fiber.Ctx) (*http.Response, error) {
-	if shardRouter == nil {
-		return nil, nil // No shard router - handle locally
-	}
-
-	// Check if already shard-routed (prevent loops)
-	if c.Get(ShardRoutedHeader) != "" {
-		return nil, nil // Already routed - handle locally
-	}
-
-	// Build HTTP request for forwarding
-	req, err := BuildHTTPRequest(c)
-	if err != nil {
-		return nil, err
-	}
-
-	// Route via shard router
-	resp, err := shardRouter.RouteWrite(c.Context(), req)
-	if err != nil {
-		if errors.Is(err, sharding.ErrLocalNodeCanHandle) {
-			return nil, nil // Handle locally
-		}
-		return nil, err
-	}
-
-	return resp, nil
-}
-
-// RouteShardedQuery routes a query request using the shard router.
-// Returns:
-//   - (nil, nil) if request should be handled locally
-//   - (*http.Response, nil) if request was forwarded successfully
-//   - (nil, error) if routing failed
-func RouteShardedQuery(shardRouter *sharding.ShardRouter, database string, c *fiber.Ctx) (*http.Response, error) {
-	if shardRouter == nil {
-		return nil, nil // No shard router - handle locally
-	}
-
-	// Check if already shard-routed (prevent loops)
-	if c.Get(ShardRoutedHeader) != "" {
-		return nil, nil // Already routed - handle locally
-	}
-
-	// Build HTTP request for forwarding
-	req, err := BuildHTTPRequest(c)
-	if err != nil {
-		return nil, err
-	}
-
-	// Route via shard router
-	resp, err := shardRouter.RouteQuery(c.Context(), database, req)
-	if err != nil {
-		if errors.Is(err, sharding.ErrLocalNodeCanHandle) {
-			return nil, nil // Handle locally
-		}
-		return nil, err
-	}
-
-	return resp, nil
-}
-
-// HandleShardRoutingError returns an appropriate error response for shard routing failures.
-func HandleShardRoutingError(c *fiber.Ctx, err error) error {
-	switch {
-	case errors.Is(err, sharding.ErrNoDatabaseHeader):
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Missing X-Arc-Database header required for sharded routing",
-		})
-	case errors.Is(err, sharding.ErrNoShardPrimary):
-		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-			"error": "No primary node available for this shard",
-		})
-	case errors.Is(err, sharding.ErrShardingDisabled):
-		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-			"error": "Sharding is not enabled on this cluster",
-		})
-	default:
-		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
-			"error": "Shard routing error: " + err.Error(),
 		})
 	}
 }
