@@ -1,0 +1,58 @@
+# typed: false
+# frozen_string_literal: true
+
+# Homebrew formula for Arc — high-performance columnar analytical database.
+#
+# GENERATED FILE — do not edit by hand. The release workflow
+# (.github/workflows/release-build.yml, job `homebrew-formula`) renders this
+# template with the real version and arc-darwin-arm64 sha256, then pushes it to
+# basekick-labs/homebrew-tap. Edit this template, not the tap copy.
+#
+# Binary formula: downloads the prebuilt, cosign-signed macOS binary from the
+# GitHub release (built on macOS runners; DuckDB is statically linked, so the
+# Mach-O depends only on macOS system libraries).
+#
+# Apple Silicon macOS only. The platform is declared with top-level
+# `depends_on :macos` / `depends_on arch: :arm64` (not nested on_macos/on_arm
+# blocks) so `brew install`/`brew info` on Linux or Intel macOS fails with a
+# clean "requires arm64 / macOS" message instead of the cryptic
+# `Error: arc: url is missing` you get when the only url is inside a skipped
+# platform block. The release workflow builds no Intel (darwin-amd64) asset.
+#
+# Install:  brew install basekick-labs/tap/arc
+class Arc < Formula
+  desc "High-performance columnar analytical database (DuckDB/Parquet/Arrow)"
+  homepage "https://github.com/basekick-labs/arc"
+  url "https://github.com/basekick-labs/arc/releases/download/v__VERSION__/arc-darwin-arm64"
+  version "__VERSION__"
+  sha256 "__DARWIN_ARM64_SHA256__"
+  license "AGPL-3.0-or-later"
+
+  depends_on arch: :arm64
+  depends_on :macos
+
+  def install
+    # The release asset is the bare arm64 binary; install it as `arc`. Explicit
+    # name (not a glob) so a missing/renamed asset fails loud naming the file,
+    # rather than Dir[...].first => nil raising a cryptic TypeError.
+    bin.install "arc-darwin-arm64" => "arc"
+  end
+
+  def caveats
+    <<~EOS
+      Arc stores data locally by default under ./data/arc (relative to CWD).
+      Start the server:  arc
+      Then it listens on http://localhost:8000 (see `arc --help`).
+
+      Docs: https://docs.basekick.net/arc
+    EOS
+  end
+
+  test do
+    # `arc` boots a server rather than offering a --version-only flag, so the
+    # smoke test asserts the binary is present and Mach-O executable. A fuller
+    # test (boot + /health) would require backgrounding the server.
+    assert_predicate bin/"arc", :executable?
+    assert_match "Mach-O", shell_output("file #{bin}/arc")
+  end
+end

@@ -1511,3 +1511,109 @@ jobs:
           echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
           echo "1. Review release notes" >> $GITHUB_STEP_SUMMARY
           echo "2. Publish when ready" >> $GITHUB_STEP_SUMMARY
+
+  # Render the Homebrew formula from .github/homebrew/arc.rb.tmpl with the real
+  # version + arc-darwin-arm64 sha256, then push it to basekick-labs/homebrew-tap.
+  #
+  # WHY THIS EXISTS: 26.06.3 shipped a formula with a REPLACE_WITH_DARWIN_ARM64_SHA256
+  # placeholder (the tap was hand-edited, nothing filled the checksum), so
+  # `brew install arc` failed with a checksum mismatch (#528). Templating the
+  # formula from the built artifact's real hash makes that class of bug impossible.
+  #
+  # The darwin arm64 binary's sha256 is fixed at build time and does not change
+  # when the draft release is later published, so computing it here (before manual
+  # publish) is correct — the asset URL the formula points at resolves once the
+  # release is published.
+  #
+  # REQUIRES the repo secret HOMEBREW_TAP_TOKEN: a fine-grained PAT (or GitHub App
+  # token) with contents:write on basekick-labs/homebrew-tap. GITHUB_TOKEN is
+  # scoped to this repo only and cannot push to the tap. The job no-ops (does not
+  # fail the release) if the secret is absent, so forks and misconfigured runs
+  # don't break the pipeline.
+  homebrew-formula:
+    name: Update Homebrew Tap Formula
+    runs-on: ubuntu-latest
+    needs: [prepare, build-binaries, create-draft-release]
+    # Never push to the production tap from a workflow_dispatch test_mode run:
+    # the formula's url points at v{version}, which for a test run is a draft
+    # (unpublished) asset — brew would 404. Mirrors the `latest` Docker-tag guard.
+    if: needs.prepare.outputs.test_mode != 'true'
+    steps:
+      - name: Check for tap token
+        id: gate
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "${HOMEBREW_TAP_TOKEN}" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN not set — skipping Homebrew formula update. Add a fine-grained PAT with contents:write on basekick-labs/homebrew-tap to enable."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout arc (for template)
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@v5
+
+      - name: Download darwin arm64 binary
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/download-artifact@v7
+        with:
+          name: arc-binary-standard-darwin-arm64
+          path: ./darwin
+
+      - name: Render formula
+        if: steps.gate.outputs.enabled == 'true'
+        id: render
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+          SHA=$(sha256sum ./darwin/arc-darwin-arm64 | awk '{print $1}')
+          echo "Computed arc-darwin-arm64 sha256: ${SHA}"
+          if [ -z "${SHA}" ] || [ ${#SHA} -ne 64 ]; then
+            echo "::error::Failed to compute a valid sha256 for arc-darwin-arm64"
+            exit 1
+          fi
+          mkdir -p out
+          sed -e "s/__VERSION__/${VERSION}/g" \
+              -e "s/__DARWIN_ARM64_SHA256__/${SHA}/g" \
+              .github/homebrew/arc.rb.tmpl > out/arc.rb
+          # Fail loudly if any placeholder survived templating.
+          if grep -qE '__VERSION__|__DARWIN_ARM64_SHA256__|REPLACE_WITH' out/arc.rb; then
+            echo "::error::Rendered formula still contains a placeholder"
+            cat out/arc.rb
+            exit 1
+          fi
+          echo "----- rendered formula -----"
+          cat out/arc.rb
+
+      - name: Checkout tap
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: basekick-labs/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Commit and push formula
+        if: steps.gate.outputs.enabled == 'true'
+        working-directory: tap
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+          mkdir -p Formula
+          cp ../out/arc.rb Formula/arc.rb
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Stage first, then gate on the staged diff: `git diff --quiet` ignores
+          # untracked files, so a brand-new Formula/arc.rb (fresh tap, renamed
+          # path) would be seen as "no change" and silently skipped. --cached
+          # detects both new and modified files.
+          git add Formula/arc.rb
+          if git diff --cached --quiet -- Formula/arc.rb; then
+            echo "Formula already up to date for ${VERSION}; nothing to commit."
+            exit 0
+          fi
+          git commit \
+            -m "chore(arc): update formula to ${VERSION}" \
+            -m "Rendered by the arc release workflow from the built arc-darwin-arm64 artifact's sha256. Do not edit by hand — edit .github/homebrew/arc.rb.tmpl in Basekick-Labs/arc instead."
+          git push
+          echo "✅ Pushed Homebrew formula for ${VERSION} to basekick-labs/homebrew-tap" >> "$GITHUB_STEP_SUMMARY"
