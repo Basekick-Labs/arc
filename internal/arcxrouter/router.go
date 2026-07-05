@@ -25,6 +25,7 @@ import (
 	"context"
 	"database/sql"
 	"strings"
+	"time"
 
 	"github.com/basekick-labs/arc/internal/arcxengine"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -187,7 +188,9 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 // It never serves — the caller's DuckDB dispatch does. Synchronous for the first
 // cut (immediate, deterministic correctness signal).
 func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
+	arcxStart := time.Now()
 	rec, err := arcxengine.Query(engineSQL, d.Ctx)
+	arcxMicros := time.Since(arcxStart).Microseconds()
 	if err != nil {
 		if _, unsupported := err.(arcxengine.ErrUnsupported); unsupported {
 			// Expected engine decline (e.g. hour-over-daily, F2). Not an alarm —
@@ -204,13 +207,17 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 		return
 	}
 	defer rec.Release()
+	h.Metrics.ArcxLatency("arcx", d.Shape, arcxMicros)
 
+	oracleStart := time.Now()
 	oracle, err := h.fetchOracle(ctx)
+	oracleMicros := time.Since(oracleStart).Microseconds()
 	if err != nil {
 		// The oracle itself failed — can't compare. Log, don't alarm arcx for it.
 		h.Logger.Warn().Err(err).Str("shape", d.Shape).Msg("arcx shadow: oracle query failed; skipping compare")
 		return
 	}
+	h.Metrics.ArcxLatency("duckdb", d.Shape, oracleMicros)
 
 	if diff := compareResults(rec, oracle); diff != "" {
 		h.Logger.Error().
