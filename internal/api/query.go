@@ -1785,6 +1785,20 @@ localProcessing:
 			// because SetBodyStreamWriter runs asynchronously after this function returns.
 		}
 
+		// arcx router hook. Decides eligibility on the RAW req.SQL (date_trunc
+		// still intact, before rewriteDateTrunc's epoch rewrite) and, in serve
+		// mode, may serve the response from the arcx engine. In shadow mode (the
+		// default when built with -tags=arcx_engine) it compares arcx vs DuckDB
+		// off to the side and returns false, so the DuckDB dispatch below serves
+		// untouched. Without the tag this is a no-op stub — stock Arc is
+		// unaffected. See internal/arcxrouter + docs 2026-07-05-router-phase1.
+		if h.tryArcxRouter(c, req.SQL, headerDB, convertedSQL) {
+			if cancel != nil {
+				cancel()
+			}
+			return nil
+		}
+
 		// Arrow-native path: bypasses database/sql row scanning entirely — reads typed
 		// values directly from DuckDB's internal Arrow columnar chunks.
 		//
