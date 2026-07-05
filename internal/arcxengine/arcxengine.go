@@ -20,6 +20,12 @@
 package arcxengine
 
 /*
+// Default paths assume arcx is a sibling checkout (../arcx). These are only a
+// fallback — build via `make build-arcx` / `make test-arcx`, which (a) rebuild
+// libarcx.a from ARCX_DIR first (so it is never a STALE artifact silently linked)
+// and (b) can point elsewhere by exporting CGO_CFLAGS / CGO_LDFLAGS with the
+// desired -I/-L. Never rely on this relative fallback for a release build; the
+// Makefile's arcx-lib prerequisite is the source of truth for which lib is linked.
 #cgo CFLAGS: -I${SRCDIR}/../../../arcx/include
 #cgo LDFLAGS: -L${SRCDIR}/../../../arcx/target/release -larcx -lm -ldl
 #include <stdlib.h>
