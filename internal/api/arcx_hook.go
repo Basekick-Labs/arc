@@ -13,12 +13,14 @@ package api
 
 import (
 	"bufio"
+	"context"
 	"os"
 	"sync"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/basekick-labs/arc/internal/arcxrouter"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
@@ -63,6 +65,56 @@ func (h *QueryHandler) tryArcxRouter(c *fiber.Ctx, rawSQL, headerDB, convertedSQ
 		return false
 	}
 	return arcxrouter.Run(c, d, deps, mode)
+}
+
+// tryArcxRouterArrow is the hook for the raw Arrow-IPC endpoint
+// (/api/v1/query/arrow), which has its own handler outside handleQuery. In serve
+// mode on a green shape it streams arcx's record as Arrow IPC — arcx's most
+// natural output (zero transcode). Returns handled=true only when it served; in
+// shadow mode it runs the compare and returns false; declines/errors return false
+// so the caller's DuckDB IPC path serves. execCtx must be the caller's
+// background-derived context (NOT the pooled Fiber ctx — used inside the async
+// stream writer).
+func (h *QueryHandler) tryArcxRouterArrow(c *fiber.Ctx, execCtx context.Context, rawSQL, headerDB, convertedSQL string) (handled bool) {
+	mode := arcxMode()
+	if mode == arcxrouter.ModeOff {
+		return false
+	}
+	deps := arcxrouter.Deps{
+		Storage:      h.storage,
+		DB:           h.db,
+		Logger:       h.logger,
+		Metrics:      arcxMetrics{logger: h.logger},
+		Mode:         mode,
+		ConvertedSQL: convertedSQL,
+	}
+	d := arcxrouter.Decide(rawSQL, headerDB, deps)
+	if !d.Eligible {
+		return false
+	}
+	rec, served := arcxrouter.RunArrow(execCtx, d, deps, mode)
+	if !served {
+		return false
+	}
+	// arcx served a record — stream it as Arrow IPC. We own rec and must Release
+	// it after the async stream writer finishes.
+	schema := rec.Schema()
+	c.Set("Content-Type", "application/vnd.apache.arrow.stream")
+	// Capture the fasthttp RequestCtx before the async callback; the pooled Fiber
+	// *Ctx is recycled after this handler returns (the UAF trap).
+	fctx := c.Context()
+	fctx.SetBodyStreamWriter(func(w *bufio.Writer) {
+		defer rec.Release()
+		ipcWriter := ipc.NewWriter(w, ipc.WithSchema(schema))
+		if err := ipcWriter.Write(rec); err != nil {
+			h.logger.Warn().Err(err).Msg("arcx serve (arrow): IPC write failed after headers committed")
+		}
+		if err := ipcWriter.Close(); err != nil {
+			h.logger.Warn().Err(err).Msg("arcx serve (arrow): IPC close failed")
+		}
+		w.Flush()
+	})
+	return true
 }
 
 // serveArcxResult streams a single arcx arrow.Record to the response in the

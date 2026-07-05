@@ -157,6 +157,18 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		ctx, cancel = context.WithTimeout(ctx, h.queryTimeout)
 	}
 
+	// arcx router hook (Arrow-IPC variant). In serve mode a green shape is
+	// streamed as Arrow IPC by arcx (its most natural output); shadow mode
+	// compares off to the side and returns false. No-op stub without the
+	// arcx_engine tag — stock Arc unaffected. Uses ctx (background-derived, safe
+	// in the async writer), not c.UserContext().
+	if h.tryArcxRouterArrow(c, ctx, req.SQL, headerDB, convertedSQL) {
+		if cancel != nil {
+			cancel()
+		}
+		return nil
+	}
+
 	// Execute query using DuckDB's native Arrow API — returns record batches
 	// directly from DuckDB's internal columnar chunks, no row-by-row scanning.
 	reader, conn, err := h.db.ArrowQueryContext(ctx, convertedSQL)

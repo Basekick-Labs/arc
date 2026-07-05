@@ -7,8 +7,16 @@
 
 package api
 
-import "github.com/gofiber/fiber/v2"
+import (
+	"context"
+
+	"github.com/gofiber/fiber/v2"
+)
 
 func (h *QueryHandler) tryArcxRouter(c *fiber.Ctx, rawSQL, headerDB, convertedSQL string) (handled bool) {
+	return false
+}
+
+func (h *QueryHandler) tryArcxRouterArrow(c *fiber.Ctx, execCtx context.Context, rawSQL, headerDB, convertedSQL string) (handled bool) {
 	return false
 }

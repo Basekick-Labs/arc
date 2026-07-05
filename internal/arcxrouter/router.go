@@ -137,6 +137,41 @@ func Run(c *fiber.Ctx, d Decision, h Handler, mode Mode) (handled bool) {
 	}
 }
 
+// RunArrow is the router entry for the raw Arrow-IPC endpoint, which streams
+// arcx's record itself (IPC writing lives in the api package) rather than going
+// through ServeStream. It returns the arcx record ONLY in serve mode on a green
+// shape; the caller owns it and MUST Release it after streaming. In shadow mode it
+// runs the compare and returns (nil,false); on decline/error/off it returns
+// (nil,false) so the caller falls back to DuckDB. `ctx` is the caller's (already
+// context.Background-derived, not the pooled Fiber ctx) execution context.
+func RunArrow(ctx context.Context, d Decision, h Handler, mode Mode) (rec arrow.Record, served bool) {
+	if !d.Eligible || mode == ModeOff {
+		return nil, false
+	}
+	engineSQL, ok := h.buildEngineSQL(ctx, d)
+	if !ok {
+		return nil, false
+	}
+	switch mode {
+	case ModeShadow:
+		h.runShadow(ctx, d, engineSQL)
+		return nil, false // DuckDB serves in shadow
+	case ModeServe:
+		r, err := arcxengine.Query(engineSQL, d.Ctx)
+		if err != nil {
+			if _, unsupported := err.(arcxengine.ErrUnsupported); !unsupported {
+				h.Logger.Error().Err(err).Str("shape", d.Shape).Str("sql", engineSQL).
+					Msg("arcx serve (arrow): engine ERROR; falling back to DuckDB")
+				h.Metrics.ArcxShadowError(d.Shape)
+			}
+			return nil, false
+		}
+		return r, true // caller owns r, must Release after streaming
+	default:
+		return nil, false
+	}
+}
+
 // buildEngineSQL expands the measurement to a concrete .parquet path array (F5 —
 // the engine declines globs) and constructs canonical arcx SQL from the parsed
 // parts. Returns ok=false if the backend isn't local (the engine has no
