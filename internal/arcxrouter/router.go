@@ -27,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/basekick-labs/arc/internal/arcxengine"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
@@ -44,6 +45,12 @@ type Deps struct {
 	// ConvertedSQL is the DuckDB-correct rewrite the caller already computed for
 	// this query (the oracle SQL for shadow compare). date_trunc intact per DuckDB.
 	ConvertedSQL string
+	// ServeStream writes an arcx result to the response in the request's wire
+	// format (JSON or msgpack), reusing Arc's existing Arrow→wire streamers. It
+	// lives on the api side because those streamers are package-private there;
+	// the router just hands back the record. Returns true if it served the
+	// response. nil in shadow-only wiring (serve mode then falls back to DuckDB).
+	ServeStream func(c *fiber.Ctx, rec arrow.Record) bool
 }
 
 // Handler is the concrete dependency bundle in the tagged build.
@@ -247,7 +254,17 @@ func (h Deps) runServe(c *fiber.Ctx, ctx context.Context, d Decision, engineSQL 
 		return false
 	}
 	defer rec.Release()
-	return streamArcxResult(c, rec)
+	if h.ServeStream == nil {
+		// No streamer wired (shadow-only build/config) — fall back to DuckDB.
+		return false
+	}
+	// ServeStream streams the record to the response. It MUST Retain the record
+	// if it defers work past return (the async body-stream writer does), because
+	// this defer releases our reference as soon as Run returns. Owning the
+	// buffer lifetime across the async boundary is the memory-safety cliff the
+	// design doc warns about — the streamer, not the router, holds it while the
+	// response is in flight.
+	return h.ServeStream(c, rec)
 }
 
 // fetchOracle runs the DuckDB-correct converted SQL and drains it into a

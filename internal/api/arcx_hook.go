@@ -12,15 +12,19 @@
 package api
 
 import (
+	"bufio"
 	"os"
 	"sync"
+	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/basekick-labs/arc/internal/arcxrouter"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
 
-// arcxMode is parsed once from ARCX_ROUTER. Default (empty/unknown) is shadow when
+// arcxMode is parsed once from ARC_ROUTER. Default (empty/unknown) is shadow when
 // the engine is built in — observe, never serve, until a human sets serve.
 var (
 	arcxModeOnce sync.Once
@@ -29,7 +33,8 @@ var (
 
 func arcxMode() arcxrouter.Mode {
 	arcxModeOnce.Do(func() {
-		arcxModeVal = arcxrouter.ParseMode(os.Getenv("ARCX_ROUTER"))
+		raw := os.Getenv("ARC_ROUTER")
+		arcxModeVal = arcxrouter.ParseMode(raw)
 	})
 	return arcxModeVal
 }
@@ -51,12 +56,79 @@ func (h *QueryHandler) tryArcxRouter(c *fiber.Ctx, rawSQL, headerDB, convertedSQ
 		Metrics:      arcxMetrics{logger: h.logger},
 		Mode:         mode,
 		ConvertedSQL: convertedSQL,
+		ServeStream:  h.serveArcxResult,
 	}
 	d := arcxrouter.Decide(rawSQL, headerDB, deps)
 	if !d.Eligible {
 		return false
 	}
 	return arcxrouter.Run(c, d, deps, mode)
+}
+
+// serveArcxResult streams a single arcx arrow.Record to the response in the
+// request's wire format, reusing Arc's existing Arrow→wire streamers
+// (streamArrowJSON / streamMsgPackFromBatches) — no re-implementation of encoding.
+// arcx's native output is Arrow, so this is a thin adapter: wrap the one record as
+// an array.RecordReader and hand it to the same code the DuckDB Arrow path uses.
+//
+// MEMORY SAFETY: the record is arcx-owned and the router releases its reference as
+// soon as Run returns, but SetBodyStreamWriter runs the encode ASYNCHRONOUSLY
+// after return. So we Retain the record here and Release it inside the async
+// callback — owning the buffer lifetime across the async boundary. Without the
+// Retain, the arcx buffers would be freed while the encoder still reads them (the
+// use-after-free the design doc flags as the FFI cliff).
+func (h *QueryHandler) serveArcxResult(c *fiber.Ctx, rec arrow.Record) (handled bool) {
+	schema := rec.Schema()
+	start := time.Now()
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+
+	// Capture the context BEFORE SetBodyStreamWriter. The Fiber *Ctx is recycled
+	// once the handler returns; touching c.UserContext() inside the async stream
+	// callback is a use-after-free (the "Fiber context not safe in callbacks"
+	// trap the DuckDB path avoids the same way). The captured context.Context is
+	// safe to close over.
+	streamCtx := c.UserContext()
+
+	// Retain for the async writer; the router's defer releases its own reference.
+	// Released inside each stream callback below.
+	rec.Retain()
+
+	if isMsgPackWire(c) {
+		batches := []arrow.Record{rec}
+		rowCount := int(rec.NumRows())
+		c.Set(fiber.HeaderContentType, msgpackContentType)
+		c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+			defer rec.Release()
+			bw := bufio.NewWriterSize(w, 256*1024)
+			if _, serr := streamMsgPackFromBatches(streamCtx, bw, schema, batches, rowCount, nil, start, timestamp); serr != nil {
+				h.logger.Warn().Err(serr).Msg("arcx serve: msgpack stream error after headers committed")
+			}
+			bw.Flush()
+			w.Flush()
+		})
+		return true
+	}
+
+	// JSON: the streamer consumes an array.RecordReader. NewRecordReader retains
+	// the record, so we release our extra Retain immediately and let the reader
+	// own the record; releasing the reader in the callback frees it.
+	reader, err := array.NewRecordReader(schema, []arrow.Record{rec})
+	if err != nil {
+		rec.Release()
+		h.logger.Error().Err(err).Msg("arcx serve: failed to wrap record as reader; falling back")
+		return false
+	}
+	rec.Release() // reader holds its own ref now
+
+	c.Set("Content-Type", "application/json")
+	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+		defer reader.Release()
+		if _, serr := streamArrowJSON(streamCtx, w, reader, 0, nil, start, timestamp); serr != nil {
+			h.logger.Warn().Err(serr).Msg("arcx serve: json stream error after headers committed")
+		}
+		w.Flush()
+	})
+	return true
 }
 
 // arcxMetrics is a logger-backed implementation of the router's Metrics interface.
