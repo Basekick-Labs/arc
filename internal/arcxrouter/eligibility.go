@@ -32,7 +32,20 @@ const (
 	ShapeMinCol   = "min_col"
 	ShapeMaxCol   = "max_col"
 	ShapeCountCol = "count_col"
+	// Phase 2a general single-table scan: SELECT <cols> FROM m [WHERE <preds>].
+	ShapeScan = "scan"
 )
+
+// scanPred is one WHERE predicate `<col> <op> <literal>` from a scan. Exactly one
+// of (num, str) is meaningful per isStr. The engine re-type-checks (col,op,lit);
+// the router just carries the parsed parts.
+type scanPred struct {
+	col   string
+	op    string // = != < <= > >=
+	num   string // integer literal text (isStr == false)
+	str   string // string literal content (isStr == true)
+	isStr bool
+}
 
 // timeColumn is Arc's hardcoded time-column convention (F1): every measurement
 // ingests an int64-µs column literally named "time". There is no per-measurement
@@ -61,9 +74,11 @@ var tzInjectionTokens = []string{"time zone", "timezone", "at time zone"}
 // (min/max/count(col)). measurement is the bare FROM token as written.
 type matchResult struct {
 	shape       string
-	unit        string // date_trunc agg only
-	col         string // min/max/count(col) only
+	unit        string     // date_trunc agg only
+	col         string     // min/max/count(col) only
 	measurement string
+	cols        []string   // scan only: projected columns (as written)
+	preds       []scanPred // scan only: AND-conjoined WHERE predicates
 }
 
 // eligibleShape recognizes the arcx shapes on the raw user SQL. ok=false means
@@ -94,6 +109,11 @@ func eligibleShape(sql string) (matchResult, bool) {
 	if fn, col, meas, ok := matchScalarAgg(toks); ok {
 		shape := map[string]string{"min": ShapeMinCol, "max": ShapeMaxCol, "count": ShapeCountCol}[fn]
 		return matchResult{shape: shape, col: col, measurement: meas}, true
+	}
+	// Scan is tried LAST: it's the broadest shape (a bare column list matches many
+	// SELECTs), so the specific aggregate shapes get first refusal.
+	if cols, preds, meas, ok := matchScan(toks); ok {
+		return matchResult{shape: ShapeScan, cols: cols, preds: preds, measurement: meas}, true
 	}
 	return matchResult{}, false
 }

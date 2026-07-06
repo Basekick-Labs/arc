@@ -84,8 +84,10 @@ type Decision struct {
 	Eligible bool
 	Ctx      arcxengine.Context
 	Shape    string
-	Unit     string // date_trunc agg only
-	Col      string // min/max/count(col) only — the bare column, user's spelling
+	Unit     string     // date_trunc agg only
+	Col      string     // min/max/count(col) only — the bare column, user's spelling
+	Cols     []string   // scan only: projected columns (as written)
+	Preds    []scanPred // scan only: AND-conjoined WHERE predicates
 }
 
 // Decide is the cheap per-query pre-filter. It never calls the engine; it only
@@ -121,6 +123,8 @@ func Decide(sql, headerDB string, h Handler) Decision {
 		Shape: m.shape,
 		Unit:  m.unit,
 		Col:   m.col,
+		Cols:  m.cols,
+		Preds: m.preds,
 	}
 }
 
@@ -242,9 +246,98 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 		}
 		fn := map[string]string{ShapeMinCol: "min", ShapeMaxCol: "max", ShapeCountCol: "count"}[d.Shape]
 		return "SELECT " + fn + "(" + d.Col + ") FROM read_parquet(" + arr.String() + ")", true
+	case ShapeScan:
+		return buildScanSQL(d, arr.String())
 	default:
 		return "", false
 	}
+}
+
+// buildScanSQL constructs the engine SQL for a general single-table scan:
+//
+//	SELECT <cols> FROM read_parquet([<paths>]) [WHERE <col> <op> <lit> AND ...]
+//
+// Every column (projection AND predicate) must be a bare identifier — they came
+// from the tokenizer as identifiers, so injection-safe by construction, but we
+// guard defensively. String literals are single-quote escaped; numeric literals
+// are validated as integers. Declines (ok=false) on any non-bare column or
+// malformed literal rather than emit unsafe SQL.
+func buildScanSQL(d Decision, pathArray string) (string, bool) {
+	if len(d.Cols) == 0 {
+		return "", false
+	}
+	var b strings.Builder
+	b.WriteString("SELECT ")
+	for i, col := range d.Cols {
+		if !isBareIdent(col) {
+			return "", false
+		}
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(col)
+	}
+	b.WriteString(" FROM read_parquet(")
+	b.WriteString(pathArray)
+	b.WriteByte(')')
+
+	if len(d.Preds) > 0 {
+		b.WriteString(" WHERE ")
+		for i, p := range d.Preds {
+			if !isBareIdent(p.col) || !isCmpOp(p.op) {
+				return "", false
+			}
+			if i > 0 {
+				b.WriteString(" AND ")
+			}
+			b.WriteString(p.col)
+			b.WriteByte(' ')
+			b.WriteString(p.op)
+			b.WriteByte(' ')
+			if p.isStr {
+				b.WriteByte('\'')
+				b.WriteString(escapeStringLiteral(p.str))
+				b.WriteByte('\'')
+			} else {
+				if !isIntLiteral(p.num) {
+					return "", false
+				}
+				b.WriteString(p.num)
+			}
+		}
+	}
+	return b.String(), true
+}
+
+// isCmpOp guards the operator string emitted into SQL (defense-in-depth; the
+// tokenizer only ever produces these).
+func isCmpOp(op string) bool {
+	switch op {
+	case "=", "!=", "<", "<=", ">", ">=":
+		return true
+	}
+	return false
+}
+
+// isIntLiteral reports whether s is a base-10 integer (optional leading '-'),
+// matching what the tokenizer's tokNum produces for a WHERE literal.
+func isIntLiteral(s string) bool {
+	if s == "" {
+		return false
+	}
+	i := 0
+	if s[0] == '-' {
+		if len(s) == 1 {
+			return false
+		}
+		i = 1
+	}
+	for ; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // runShadow runs arcx and a cheap DuckDB oracle, compares, and records metrics.
@@ -306,6 +399,13 @@ func (h Deps) compareToOracle(ctx context.Context, d Decision, rec arrow.Record)
 	}
 	defer rows.Close()
 
+	if d.Shape == ShapeScan {
+		oracle, err := scanRowsFromRows(rows)
+		if err != nil {
+			return "", err
+		}
+		return compareScan(rec, oracle), nil
+	}
 	if isScalarShape(d.Shape) {
 		oracle, err := scalarFromRows(rows)
 		if err != nil {

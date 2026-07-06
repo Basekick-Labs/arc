@@ -18,9 +18,10 @@ type tokKind int
 
 const (
 	tokIdent tokKind = iota // keyword or identifier, incl. dotted db.measurement
-	tokStr                  // single-quoted string literal (date_trunc unit)
-	tokNum                  // run of digits (the 1 in GROUP BY 1)
+	tokStr                  // single-quoted string literal (date_trunc unit, WHERE string literal)
+	tokNum                  // integer literal (GROUP BY 1, WHERE numeric literal, optional leading -)
 	tokPunct                // one of ( ) * ,
+	tokOp                   // comparison operator: = != <> < <= > >= (scan WHERE)
 )
 
 type token struct {
@@ -31,6 +32,7 @@ type token struct {
 	orig  string
 	str   string // unescaped content for tokStr
 	punct byte   // the char for tokPunct
+	op    string // normalized comparison operator for tokOp: = != < <= > >=
 }
 
 // tokenize lexes sql into the narrow vocabulary. Returns ok=false on any
@@ -56,6 +58,45 @@ func tokenize(sql string) ([]token, bool) {
 		case c == '(' || c == ')' || c == '*' || c == ',':
 			toks = append(toks, token{kind: tokPunct, punct: c})
 			i++
+		case c == '=':
+			toks = append(toks, token{kind: tokOp, op: "="})
+			i++
+		case c == '<':
+			// <=, <>, or <. Greedy so `< =` (spaced) never forms an operator.
+			if i+1 < n && b[i+1] == '=' {
+				toks = append(toks, token{kind: tokOp, op: "<="})
+				i += 2
+			} else if i+1 < n && b[i+1] == '>' {
+				toks = append(toks, token{kind: tokOp, op: "!="}) // <> normalizes to !=
+				i += 2
+			} else {
+				toks = append(toks, token{kind: tokOp, op: "<"})
+				i++
+			}
+		case c == '>':
+			if i+1 < n && b[i+1] == '=' {
+				toks = append(toks, token{kind: tokOp, op: ">="})
+				i += 2
+			} else {
+				toks = append(toks, token{kind: tokOp, op: ">"})
+				i++
+			}
+		case c == '!':
+			if i+1 < n && b[i+1] == '=' {
+				toks = append(toks, token{kind: tokOp, op: "!="})
+				i += 2
+			} else {
+				return nil, false // bare `!` is not in the vocabulary
+			}
+		case c == '-' && i+1 < n && isDigit(b[i+1]):
+			// Negative integer literal (e.g. a pre-1970 epoch in a WHERE). The sign
+			// is part of the token. A bare `-` (arithmetic) falls to default → decline.
+			start := i
+			i++ // consume '-'
+			for i < n && isDigit(b[i]) {
+				i++
+			}
+			toks = append(toks, token{kind: tokNum, orig: sql[start:i]})
 		case isAlpha(c) || c == '_':
 			// Identifier: letter/underscore start, then alnum/underscore/dot.
 			// A dot is allowed INSIDE an identifier so `mydb.cpu` is one token —
@@ -274,4 +315,129 @@ func matchDateTruncCount(toks []token) (string, string, bool) {
 		return "", "", false
 	}
 	return unit, meas, true
+}
+
+// op reads a comparison operator token.
+func (c *cursor) op() (string, bool) {
+	t, ok := c.next()
+	if !ok || t.kind != tokOp {
+		return "", false
+	}
+	return t.op, true
+}
+
+// peekIdentLower returns the lowercased next-token ident text without consuming,
+// or "" if the next token isn't an ident.
+func (c *cursor) peekIdentLower() string {
+	if c.i >= len(c.toks) {
+		return ""
+	}
+	t := c.toks[c.i]
+	if t.kind != tokIdent {
+		return ""
+	}
+	return t.lower
+}
+
+// matchScan matches the Phase 2a general single-table scan (user-facing form):
+//
+//	select <col> (, <col>)* from <measurement>
+//	    [ where <col> <op> <lit> ( and <col> <op> <lit> )* ]
+//
+// Deliberately narrow, mirroring the engine's 2a grammar and its decline-harder
+// posture — the router recognizes only what the engine answers green:
+//   - projection is an explicit, non-empty BARE-COLUMN list. `*` is NOT routed
+//     (the engine declines SELECT * under schema drift, which the router can't
+//     detect ahead of the files — so star scans stay on DuckDB).
+//   - WHERE is AND-conjoined `<col> <op> <literal>` only; OR/IN/LIKE/BETWEEN/
+//     functions/arithmetic all fall outside the vocabulary → decline.
+//   - no ORDER BY / LIMIT (the engine declines them in 2a). Anything trailing
+//     the (optional) WHERE declines.
+//
+// The engine re-validates types, union_by_name, and the sandbox; the router's job
+// is only to recognize the shape and hand over the parts. Returns the projected
+// columns (as written), the predicates, the measurement, and ok.
+func matchScan(toks []token) (cols []string, preds []scanPred, meas string, ok bool) {
+	c := &cursor{toks: toks}
+	if !c.ident("select") {
+		return nil, nil, "", false
+	}
+	// Projection: one or more bare columns, comma-separated. A `*`, a function
+	// call `col(`, or an alias all fall outside → decline.
+	for {
+		t, ok := c.next()
+		if !ok || t.kind != tokIdent || isScanKeyword(t.lower) {
+			return nil, nil, "", false
+		}
+		// A `(` immediately after would be a function call (expression) — 2b.
+		if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '(' {
+			return nil, nil, "", false
+		}
+		cols = append(cols, t.orig)
+		// Comma → another column; otherwise projection ends.
+		if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == ',' {
+			c.i++
+			continue
+		}
+		break
+	}
+	if !c.ident("from") {
+		return nil, nil, "", false
+	}
+	mt, ok := c.next()
+	if !ok || mt.kind != tokIdent {
+		return nil, nil, "", false
+	}
+	meas = mt.orig
+
+	// Optional WHERE.
+	if !c.atEnd() {
+		if !c.ident("where") {
+			return nil, nil, "", false
+		}
+		for {
+			colT, ok := c.next()
+			if !ok || colT.kind != tokIdent || isScanKeyword(colT.lower) {
+				return nil, nil, "", false
+			}
+			opStr, ok := c.op()
+			if !ok {
+				return nil, nil, "", false
+			}
+			litT, ok := c.next()
+			if !ok {
+				return nil, nil, "", false
+			}
+			var p scanPred
+			switch litT.kind {
+			case tokNum:
+				p = scanPred{col: colT.orig, op: opStr, num: litT.orig, isStr: false}
+			case tokStr:
+				p = scanPred{col: colT.orig, op: opStr, str: litT.str, isStr: true}
+			default:
+				return nil, nil, "", false
+			}
+			preds = append(preds, p)
+			// AND chains another predicate; anything else must be end-of-input.
+			if c.peekIdentLower() == "and" {
+				c.i++
+				continue
+			}
+			break
+		}
+	}
+	if !c.atEnd() {
+		return nil, nil, "", false
+	}
+	return cols, preds, meas, true
+}
+
+// isScanKeyword reports whether a lowercased ident is a clause keyword that must
+// not be treated as a column in the scan grammar (guards `SELECT from FROM ...`).
+func isScanKeyword(lower string) bool {
+	switch lower {
+	case "from", "where", "and", "or", "order", "by", "group", "limit", "having", "as":
+		return true
+	}
+	return false
 }
