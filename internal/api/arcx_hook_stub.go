@@ -9,11 +9,12 @@ package api
 
 import (
 	"context"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 )
 
-func (h *QueryHandler) tryArcxRouter(c *fiber.Ctx, rawSQL, headerDB, convertedSQL string) (handled bool) {
+func (h *QueryHandler) tryArcxRouter(c *fiber.Ctx, start time.Time, rawSQL, headerDB, convertedSQL string) (handled bool) {
 	return false
 }
 

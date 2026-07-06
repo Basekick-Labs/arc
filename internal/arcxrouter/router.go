@@ -49,9 +49,11 @@ type Deps struct {
 	// ServeStream writes an arcx result to the response in the request's wire
 	// format (JSON or msgpack), reusing Arc's existing Arrow→wire streamers. It
 	// lives on the api side because those streamers are package-private there;
-	// the router just hands back the record. Returns true if it served the
+	// the router just hands back the record. `start` is when the query began
+	// (captured BEFORE the engine ran) so the response's execution_time_ms covers
+	// the engine work, not just serialization. Returns true if it served the
 	// response. nil in shadow-only wiring (serve mode then falls back to DuckDB).
-	ServeStream func(c *fiber.Ctx, rec arrow.Record) bool
+	ServeStream func(c *fiber.Ctx, rec arrow.Record, start time.Time) bool
 	// AllowedDirs is DuckDB's sandbox allowlist, passed straight through to the
 	// arcx engine's per-query Context. arcx does NOT inherit DuckDB's
 	// allowed_directories, so this is the ONLY thing stopping arcx from being a
@@ -135,7 +137,7 @@ func Decide(sql, headerDB string, h Handler) Decision {
 
 // Run executes the decision. In shadow it returns false (caller serves DuckDB);
 // in serve it returns true when it streamed an arcx result.
-func Run(c *fiber.Ctx, d Decision, h Handler, mode Mode) (handled bool) {
+func Run(c *fiber.Ctx, d Decision, h Handler, mode Mode, start time.Time) (handled bool) {
 	if !d.Eligible || mode == ModeOff {
 		return false
 	}
@@ -152,7 +154,7 @@ func Run(c *fiber.Ctx, d Decision, h Handler, mode Mode) (handled bool) {
 		h.runShadow(ctx, d, engineSQL)
 		return false // DuckDB always serves in shadow
 	case ModeServe:
-		return h.runServe(c, ctx, d, engineSQL)
+		return h.runServe(c, ctx, d, engineSQL, start)
 	default:
 		return false
 	}
@@ -463,7 +465,7 @@ func (h Deps) compareToOracle(ctx context.Context, d Decision, rec arrow.Record)
 // runServe streams arcx's result for a green shape. Falls back (handled=false) on
 // decline; on a real error it alarms and falls back too (Phase 1 keeps DuckDB the
 // safety net rather than surfacing arcx errors to users).
-func (h Deps) runServe(c *fiber.Ctx, ctx context.Context, d Decision, engineSQL string) bool {
+func (h Deps) runServe(c *fiber.Ctx, ctx context.Context, d Decision, engineSQL string, start time.Time) bool {
 	rec, err := arcxengine.Query(engineSQL, d.Ctx)
 	if err != nil {
 		if _, unsupported := err.(arcxengine.ErrUnsupported); unsupported {
@@ -485,5 +487,5 @@ func (h Deps) runServe(c *fiber.Ctx, ctx context.Context, d Decision, engineSQL 
 	// buffer lifetime across the async boundary is the memory-safety cliff the
 	// design doc warns about — the streamer, not the router, holds it while the
 	// response is in flight.
-	return h.ServeStream(c, rec)
+	return h.ServeStream(c, rec, start)
 }

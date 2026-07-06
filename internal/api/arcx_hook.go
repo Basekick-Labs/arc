@@ -46,7 +46,7 @@ func arcxMode() arcxrouter.Mode {
 // when eligible, runs the router. Returns handled=true only when the router
 // served the response itself (serve mode, green shape); shadow mode and all
 // declines return false so the caller's existing DuckDB dispatch runs untouched.
-func (h *QueryHandler) tryArcxRouter(c *fiber.Ctx, rawSQL, headerDB, convertedSQL string) (handled bool) {
+func (h *QueryHandler) tryArcxRouter(c *fiber.Ctx, start time.Time, rawSQL, headerDB, convertedSQL string) (handled bool) {
 	mode := arcxMode()
 	if mode == arcxrouter.ModeOff {
 		return false
@@ -65,7 +65,7 @@ func (h *QueryHandler) tryArcxRouter(c *fiber.Ctx, rawSQL, headerDB, convertedSQ
 	if !d.Eligible {
 		return false
 	}
-	return arcxrouter.Run(c, d, deps, mode)
+	return arcxrouter.Run(c, d, deps, mode, start)
 }
 
 // tryArcxRouterArrow is the hook for the raw Arrow-IPC endpoint
@@ -131,9 +131,12 @@ func (h *QueryHandler) tryArcxRouterArrow(c *fiber.Ctx, execCtx context.Context,
 // callback — owning the buffer lifetime across the async boundary. Without the
 // Retain, the arcx buffers would be freed while the encoder still reads them (the
 // use-after-free the design doc flags as the FFI cliff).
-func (h *QueryHandler) serveArcxResult(c *fiber.Ctx, rec arrow.Record) (handled bool) {
+func (h *QueryHandler) serveArcxResult(c *fiber.Ctx, rec arrow.Record, start time.Time) (handled bool) {
 	schema := rec.Schema()
-	start := time.Now()
+	// `start` is the query's true start (captured in the handler BEFORE the arcx
+	// engine ran), threaded through so execution_time_ms covers the engine work,
+	// not just this serialization step. Capturing it here reported ~0ms for scans
+	// that took 100+ms in the engine (the 2026-07-06 benchmark's mis-measurement).
 	timestamp := time.Now().UTC().Format(time.RFC3339)
 
 	// Capture the context BEFORE SetBodyStreamWriter. The Fiber *Ctx is recycled

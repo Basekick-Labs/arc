@@ -1792,7 +1792,7 @@ localProcessing:
 		// off to the side and returns false, so the DuckDB dispatch below serves
 		// untouched. Without the tag this is a no-op stub — stock Arc is
 		// unaffected. See internal/arcxrouter + docs 2026-07-05-router-phase1.
-		if h.tryArcxRouter(c, req.SQL, headerDB, convertedSQL) {
+		if h.tryArcxRouter(c, start, req.SQL, headerDB, convertedSQL) {
 			if cancel != nil {
 				cancel()
 			}
