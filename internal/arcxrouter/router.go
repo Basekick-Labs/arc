@@ -51,6 +51,12 @@ type Deps struct {
 	// the router just hands back the record. Returns true if it served the
 	// response. nil in shadow-only wiring (serve mode then falls back to DuckDB).
 	ServeStream func(c *fiber.Ctx, rec arrow.Record) bool
+	// AllowedDirs is DuckDB's sandbox allowlist, passed straight through to the
+	// arcx engine's per-query Context. arcx does NOT inherit DuckDB's
+	// allowed_directories, so this is the ONLY thing stopping arcx from being a
+	// filesystem-sandbox bypass around Arc's CVE fix. Populated by the hook from
+	// (*database.DuckDB).AllowedDirectories(); empty ⇒ engine denies every path.
+	AllowedDirs []string
 }
 
 // Handler is the concrete dependency bundle in the tagged build.
@@ -107,6 +113,10 @@ func Decide(sql, headerDB string, h Handler) Decision {
 			Database:    database,
 			Measurement: measurement,
 			TimeColumn:  timeColumn,
+			// Thread DuckDB's sandbox allowlist into the engine — without it every
+			// arcx path-open is denied (fail-closed), and WITH the wrong list arcx
+			// would be a bypass around Arc's CVE fix.
+			AllowedDirs: h.AllowedDirs,
 		},
 		Shape: m.shape,
 		Unit:  m.unit,

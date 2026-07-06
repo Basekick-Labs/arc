@@ -59,6 +59,7 @@ func (h *QueryHandler) tryArcxRouter(c *fiber.Ctx, rawSQL, headerDB, convertedSQ
 		Mode:         mode,
 		ConvertedSQL: convertedSQL,
 		ServeStream:  h.serveArcxResult,
+		AllowedDirs:  h.db.AllowedDirectories(),
 	}
 	d := arcxrouter.Decide(rawSQL, headerDB, deps)
 	if !d.Eligible {
@@ -87,6 +88,7 @@ func (h *QueryHandler) tryArcxRouterArrow(c *fiber.Ctx, execCtx context.Context,
 		Metrics:      arcxMetrics{logger: h.logger},
 		Mode:         mode,
 		ConvertedSQL: convertedSQL,
+		AllowedDirs:  h.db.AllowedDirectories(),
 	}
 	d := arcxrouter.Decide(rawSQL, headerDB, deps)
 	if !d.Eligible {

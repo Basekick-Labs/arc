@@ -52,6 +52,13 @@ type Context struct {
 	Database    string
 	Measurement string
 	TimeColumn  string
+	// AllowedDirs is the filesystem sandbox — DuckDB's allowed_directories (the CVE
+	// fix) passed into arcx per query. arcx does NOT inherit DuckDB's sandbox, so
+	// every path it opens must resolve under one of these or the engine errors.
+	// EMPTY = deny-all (the engine fails every file-touching query, fail-closed) —
+	// so the router MUST populate this for a real query, or arcx becomes a bypass
+	// around the sandbox. See internal/database.(*DuckDB).AllowedDirectories.
+	AllowedDirs []string
 }
 
 // ErrUnsupported signals the engine declined the query shape — the caller should
@@ -113,6 +120,25 @@ func buildCCtx(ctx Context) (*C.ArcxCtx, func()) {
 	cctx.database = set(ctx.Database)
 	cctx.measurement = set(ctx.Measurement)
 	cctx.time_column = set(ctx.TimeColumn)
+
+	// Marshal the sandbox allowlist into a C array of NUL-terminated strings. A
+	// nil/empty slice leaves allowed_dirs NULL + len 0, which the engine reads as a
+	// deny-all sandbox (fail-closed) — never open-everything.
+	if n := len(ctx.AllowedDirs); n > 0 {
+		// Allocate the array of char* in C memory so it outlives this Go frame for
+		// the duration of the call (the engine copies what it keeps).
+		arr := C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(uintptr(0))))
+		toFree = append(toFree, arr)
+		slice := unsafe.Slice((**C.char)(arr), n)
+		for i, d := range ctx.AllowedDirs {
+			p := C.CString(d)
+			toFree = append(toFree, unsafe.Pointer(p))
+			slice[i] = p
+		}
+		cctx.allowed_dirs = (**C.char)(arr)
+		cctx.allowed_dirs_len = C.size_t(n)
+	}
+
 	return &cctx, func() {
 		for _, p := range toFree {
 			C.free(p)

@@ -39,6 +39,19 @@ type DuckDB struct {
 	config *Config
 }
 
+// AllowedDirectories returns the filesystem/object-store prefixes this DuckDB was
+// locked down to (its sandbox allowlist — the CVE fix). Exposed so the arcx router
+// can pass the SAME allowlist into the arcx engine: arcx is a from-scratch reader
+// that does NOT inherit DuckDB's allowed_directories, so without this it would be a
+// bypass path around the sandbox. Returns the same list configureDatabase used to
+// lock DuckDB down (see buildAllowedDirectories).
+func (d *DuckDB) AllowedDirectories() []string {
+	if d.config == nil {
+		return nil
+	}
+	return buildAllowedDirectories(d.config)
+}
+
 // escapeSQLString escapes single quotes for safe use in DuckDB SQL strings.
 // This prevents SQL injection when interpolating configuration values.
 func escapeSQLString(s string) string {

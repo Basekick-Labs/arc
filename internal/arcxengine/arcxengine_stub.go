@@ -16,6 +16,7 @@ type Context struct {
 	Database    string
 	Measurement string
 	TimeColumn  string
+	AllowedDirs []string
 }
 
 // ErrUnsupported mirrors the real build's type.

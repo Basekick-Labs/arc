@@ -46,7 +46,7 @@ func TestE2E_CountStar_ExecutesOnEngine(t *testing.T) {
 	d := Decision{
 		Eligible: true,
 		Shape:    ShapeCountStar,
-		Ctx:      arcxengine.Context{Database: "agent_memory", Measurement: "agent_events", TimeColumn: "time"},
+		Ctx:      arcxengine.Context{Database: "agent_memory", Measurement: "agent_events", TimeColumn: "time", AllowedDirs: []string{dataRoot + "/arc/"}},
 	}
 	sql, ok := deps.buildEngineSQL(context.Background(), d)
 	if !ok {
@@ -76,7 +76,7 @@ func TestE2E_DayAgg_ExecutesOnEngine(t *testing.T) {
 		Eligible: true,
 		Shape:    ShapeDateTruncCent,
 		Unit:     "day",
-		Ctx:      arcxengine.Context{Database: "agent_memory", Measurement: "agent_events", TimeColumn: "time"},
+		Ctx:      arcxengine.Context{Database: "agent_memory", Measurement: "agent_events", TimeColumn: "time", AllowedDirs: []string{dataRoot + "/arc/"}},
 	}
 	sql, ok := deps.buildEngineSQL(context.Background(), d)
 	if !ok {
@@ -110,7 +110,7 @@ func TestE2E_HourOverDaily_EngineDeclines(t *testing.T) {
 		Eligible: true,
 		Shape:    ShapeDateTruncCent,
 		Unit:     "hour",
-		Ctx:      arcxengine.Context{Database: "agent_memory", Measurement: "agent_events", TimeColumn: "time"},
+		Ctx:      arcxengine.Context{Database: "agent_memory", Measurement: "agent_events", TimeColumn: "time", AllowedDirs: []string{dataRoot + "/arc/"}},
 	}
 	sql, ok := deps.buildEngineSQL(context.Background(), d)
 	if !ok {
