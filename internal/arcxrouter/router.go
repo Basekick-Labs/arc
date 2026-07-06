@@ -24,6 +24,7 @@ package arcxrouter
 import (
 	"context"
 	"database/sql"
+	"strconv"
 	"strings"
 	"time"
 
@@ -86,8 +87,10 @@ type Decision struct {
 	Shape    string
 	Unit     string     // date_trunc agg only
 	Col      string     // min/max/count(col) only — the bare column, user's spelling
-	Cols     []string   // scan only: projected columns (as written)
-	Preds    []scanPred // scan only: AND-conjoined WHERE predicates
+	Cols     []string       // scan only: projected columns (as written)
+	Preds    []scanPred     // scan only: AND-conjoined WHERE predicates
+	OrderBy  []scanOrderKey // scan only: ORDER BY keys
+	Limit    int            // scan only: LIMIT n (0 = none)
 }
 
 // Decide is the cheap per-query pre-filter. It never calls the engine; it only
@@ -120,11 +123,13 @@ func Decide(sql, headerDB string, h Handler) Decision {
 			// would be a bypass around Arc's CVE fix.
 			AllowedDirs: h.AllowedDirs,
 		},
-		Shape: m.shape,
-		Unit:  m.unit,
-		Col:   m.col,
-		Cols:  m.cols,
-		Preds: m.preds,
+		Shape:   m.shape,
+		Unit:    m.unit,
+		Col:     m.col,
+		Cols:    m.cols,
+		Preds:   m.preds,
+		OrderBy: m.orderBy,
+		Limit:   m.limit,
 	}
 }
 
@@ -306,6 +311,30 @@ func buildScanSQL(d Decision, pathArray string) (string, bool) {
 			}
 		}
 	}
+
+	if len(d.OrderBy) > 0 {
+		b.WriteString(" ORDER BY ")
+		for i, k := range d.OrderBy {
+			if !isBareIdent(k.col) {
+				return "", false
+			}
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(k.col)
+			if k.desc {
+				b.WriteString(" DESC")
+			} else {
+				b.WriteString(" ASC")
+			}
+		}
+	}
+
+	if d.Limit > 0 {
+		b.WriteString(" LIMIT ")
+		b.WriteString(strconv.Itoa(d.Limit))
+	}
+
 	return b.String(), true
 }
 

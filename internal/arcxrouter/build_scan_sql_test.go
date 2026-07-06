@@ -75,3 +75,38 @@ func TestBuildScanSQL_DeclinesUnsafe(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildScanSQL_OrderByLimit(t *testing.T) {
+	cases := []struct {
+		name string
+		d    Decision
+		want string
+	}{
+		{
+			"order desc limit",
+			Decision{Shape: ShapeScan, Cols: []string{"code"}, OrderBy: []scanOrderKey{{"code", true}}, Limit: 100},
+			"SELECT code FROM read_parquet(['/a.parquet']) ORDER BY code DESC LIMIT 100",
+		},
+		{
+			"multi key asc",
+			Decision{Shape: ShapeScan, Cols: []string{"code"}, OrderBy: []scanOrderKey{{"host", false}, {"code", true}}},
+			"SELECT code FROM read_parquet(['/a.parquet']) ORDER BY host ASC, code DESC",
+		},
+		{
+			"where order limit",
+			Decision{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "code", op: ">=", num: "5"}}, OrderBy: []scanOrderKey{{"code", true}}, Limit: 10},
+			"SELECT code FROM read_parquet(['/a.parquet']) WHERE code >= 5 ORDER BY code DESC LIMIT 10",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := buildScanSQL(tc.d, "['/a.parquet']")
+			if !ok {
+				t.Fatalf("declined unexpectedly")
+			}
+			if got != tc.want {
+				t.Fatalf("got  %q\nwant %q", got, tc.want)
+			}
+		})
+	}
+}

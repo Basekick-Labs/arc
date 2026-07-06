@@ -12,7 +12,10 @@
 
 package arcxrouter
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+)
 
 type tokKind int
 
@@ -357,24 +360,27 @@ func (c *cursor) peekIdentLower() string {
 // The engine re-validates types, union_by_name, and the sandbox; the router's job
 // is only to recognize the shape and hand over the parts. Returns the projected
 // columns (as written), the predicates, the measurement, and ok.
-func matchScan(toks []token) (cols []string, preds []scanPred, meas string, ok bool) {
+func matchScan(toks []token) (cols []string, preds []scanPred, orderBy []scanOrderKey, limit int, meas string, ok bool) {
 	c := &cursor{toks: toks}
 	if !c.ident("select") {
-		return nil, nil, "", false
+		return nil, nil, nil, 0, "", false
 	}
+	fail := func() ([]string, []scanPred, []scanOrderKey, int, string, bool) {
+		return nil, nil, nil, 0, "", false
+	}
+
 	// Projection: one or more bare columns, comma-separated. A `*`, a function
 	// call `col(`, or an alias all fall outside → decline.
 	for {
 		t, ok := c.next()
 		if !ok || t.kind != tokIdent || isScanKeyword(t.lower) {
-			return nil, nil, "", false
+			return fail()
 		}
 		// A `(` immediately after would be a function call (expression) — 2b.
 		if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '(' {
-			return nil, nil, "", false
+			return fail()
 		}
 		cols = append(cols, t.orig)
-		// Comma → another column; otherwise projection ends.
 		if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == ',' {
 			c.i++
 			continue
@@ -382,31 +388,29 @@ func matchScan(toks []token) (cols []string, preds []scanPred, meas string, ok b
 		break
 	}
 	if !c.ident("from") {
-		return nil, nil, "", false
+		return fail()
 	}
 	mt, ok := c.next()
 	if !ok || mt.kind != tokIdent {
-		return nil, nil, "", false
+		return fail()
 	}
 	meas = mt.orig
 
-	// Optional WHERE.
-	if !c.atEnd() {
-		if !c.ident("where") {
-			return nil, nil, "", false
-		}
+	// Optional WHERE (AND-conjoined <col> <op> <literal>).
+	if c.peekIdentLower() == "where" {
+		c.next()
 		for {
 			colT, ok := c.next()
 			if !ok || colT.kind != tokIdent || isScanKeyword(colT.lower) {
-				return nil, nil, "", false
+				return fail()
 			}
 			opStr, ok := c.op()
 			if !ok {
-				return nil, nil, "", false
+				return fail()
 			}
 			litT, ok := c.next()
 			if !ok {
-				return nil, nil, "", false
+				return fail()
 			}
 			var p scanPred
 			switch litT.kind {
@@ -415,10 +419,9 @@ func matchScan(toks []token) (cols []string, preds []scanPred, meas string, ok b
 			case tokStr:
 				p = scanPred{col: colT.orig, op: opStr, str: litT.str, isStr: true}
 			default:
-				return nil, nil, "", false
+				return fail()
 			}
 			preds = append(preds, p)
-			// AND chains another predicate; anything else must be end-of-input.
 			if c.peekIdentLower() == "and" {
 				c.i++
 				continue
@@ -426,10 +429,66 @@ func matchScan(toks []token) (cols []string, preds []scanPred, meas string, ok b
 			break
 		}
 	}
-	if !c.atEnd() {
-		return nil, nil, "", false
+
+	// Optional ORDER BY <col> [ASC|DESC] (, <col> [ASC|DESC])*. The engine serves
+	// ORDER BY on int/µs columns only and declines strings/floats — but the router
+	// recognizes the shape and lets the engine be the type authority (decline →
+	// DuckDB). Positional ORDER BY (`ORDER BY 1`) is NOT this shape (numeric key);
+	// it belongs to the agg matcher, so a Num here declines.
+	if c.peekIdentLower() == "order" {
+		c.next()
+		if !c.ident("by") {
+			return fail()
+		}
+		for {
+			colT, ok := c.next()
+			if !ok || colT.kind != tokIdent || isScanKeyword(colT.lower) {
+				return fail()
+			}
+			desc := false
+			switch c.peekIdentLower() {
+			case "asc":
+				c.next()
+			case "desc":
+				c.next()
+				desc = true
+			}
+			orderBy = append(orderBy, scanOrderKey{col: colT.orig, desc: desc})
+			if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == ',' {
+				c.i++
+				continue
+			}
+			break
+		}
 	}
-	return cols, preds, meas, true
+
+	// Optional LIMIT <n>. LIMIT without ORDER BY is nondeterministic — the engine
+	// declines it, so the router does too (don't route a shape the engine won't run).
+	if c.peekIdentLower() == "limit" {
+		c.next()
+		if len(orderBy) == 0 {
+			return fail() // LIMIT without ORDER BY
+		}
+		nt, ok := c.next()
+		if !ok || nt.kind != tokNum {
+			return fail()
+		}
+		n, err := strconv.Atoi(nt.orig)
+		if err != nil || n < 0 {
+			return fail()
+		}
+		limit = n
+		if limit == 0 {
+			// `LIMIT 0` is a valid but degenerate shape; use a sentinel-free encoding
+			// where 0 means "no limit". Route LIMIT 0 to DuckDB rather than conflate.
+			return fail()
+		}
+	}
+
+	if !c.atEnd() {
+		return fail()
+	}
+	return cols, preds, orderBy, limit, meas, true
 }
 
 // isScanKeyword reports whether a lowercased ident is a clause keyword that must

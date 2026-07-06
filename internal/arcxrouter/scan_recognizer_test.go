@@ -53,6 +53,41 @@ func TestMatchScan_Accepts(t *testing.T) {
 	}
 }
 
+func TestMatchScan_OrderByLimit(t *testing.T) {
+	cases := []struct {
+		name      string
+		sql       string
+		wantOrder []scanOrderKey
+		wantLimit int
+	}{
+		{"order asc default", "SELECT code FROM cpu ORDER BY code", []scanOrderKey{{"code", false}}, 0},
+		{"order desc", "SELECT code FROM cpu ORDER BY code DESC", []scanOrderKey{{"code", true}}, 0},
+		{"order asc explicit", "SELECT code FROM cpu ORDER BY code ASC", []scanOrderKey{{"code", false}}, 0},
+		{"order desc limit", "SELECT code FROM cpu ORDER BY code DESC LIMIT 100", []scanOrderKey{{"code", true}}, 100},
+		{"multi key", "SELECT code FROM cpu ORDER BY host ASC, code DESC", []scanOrderKey{{"host", false}, {"code", true}}, 0},
+		{"where order limit", "SELECT code FROM cpu WHERE code >= 5 ORDER BY code DESC LIMIT 10", []scanOrderKey{{"code", true}}, 10},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, ok := eligibleShape(tc.sql)
+			if !ok || m.shape != ShapeScan {
+				t.Fatalf("expected scan-eligible for %q", tc.sql)
+			}
+			if len(m.orderBy) != len(tc.wantOrder) {
+				t.Fatalf("orderBy = %v, want %v", m.orderBy, tc.wantOrder)
+			}
+			for i := range tc.wantOrder {
+				if m.orderBy[i] != tc.wantOrder[i] {
+					t.Fatalf("orderBy[%d] = %v, want %v", i, m.orderBy[i], tc.wantOrder[i])
+				}
+			}
+			if m.limit != tc.wantLimit {
+				t.Fatalf("limit = %d, want %d", m.limit, tc.wantLimit)
+			}
+		})
+	}
+}
+
 func TestMatchScan_Declines(t *testing.T) {
 	// Each must NOT be recognized as a scan (either declines entirely or matches a
 	// different, more-specific shape). The engine's 2a scan doesn't answer these.
@@ -63,8 +98,9 @@ func TestMatchScan_Declines(t *testing.T) {
 		"SELECT host FROM cpu WHERE a IN (1,2)",              // IN (2b) — `in` is an ident, IN(...) not our grammar
 		"SELECT host FROM cpu WHERE a LIKE 'x'",              // LIKE (2b)
 		"SELECT lower(host) FROM cpu",                        // function in projection (2b)
-		"SELECT host FROM cpu ORDER BY host",                 // ORDER BY (engine declines)
-		"SELECT host FROM cpu LIMIT 10",                      // LIMIT (engine declines)
+		"SELECT host FROM cpu LIMIT 10",                      // LIMIT without ORDER BY (nondeterministic)
+		"SELECT host FROM cpu ORDER BY host LIMIT 0",         // LIMIT 0 routed to DuckDB
+		"SELECT host FROM cpu ORDER BY 1",                    // positional ORDER BY (agg shape, not scan)
 		"SELECT host AS h FROM cpu",                          // alias
 		"SELECT host FROM cpu GROUP BY host",                 // GROUP BY (Phase 3)
 		"SELECT host FROM cpu WHERE code >",                  // predicate missing literal

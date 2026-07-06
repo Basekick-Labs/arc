@@ -47,6 +47,12 @@ type scanPred struct {
 	isStr bool
 }
 
+// scanOrderKey is one ORDER BY key `<col> [ASC|DESC]` from a scan.
+type scanOrderKey struct {
+	col  string
+	desc bool
+}
+
 // timeColumn is Arc's hardcoded time-column convention (F1): every measurement
 // ingests an int64-µs column literally named "time". There is no per-measurement
 // registry, so the agg shape's bucket column must be exactly this or we decline.
@@ -77,8 +83,10 @@ type matchResult struct {
 	unit        string     // date_trunc agg only
 	col         string     // min/max/count(col) only
 	measurement string
-	cols        []string   // scan only: projected columns (as written)
-	preds       []scanPred // scan only: AND-conjoined WHERE predicates
+	cols        []string       // scan only: projected columns (as written)
+	preds       []scanPred     // scan only: AND-conjoined WHERE predicates
+	orderBy     []scanOrderKey // scan only: ORDER BY keys
+	limit       int            // scan only: LIMIT n (0 = none)
 }
 
 // eligibleShape recognizes the arcx shapes on the raw user SQL. ok=false means
@@ -112,8 +120,15 @@ func eligibleShape(sql string) (matchResult, bool) {
 	}
 	// Scan is tried LAST: it's the broadest shape (a bare column list matches many
 	// SELECTs), so the specific aggregate shapes get first refusal.
-	if cols, preds, meas, ok := matchScan(toks); ok {
-		return matchResult{shape: ShapeScan, cols: cols, preds: preds, measurement: meas}, true
+	if cols, preds, orderBy, limit, meas, ok := matchScan(toks); ok {
+		return matchResult{
+			shape:       ShapeScan,
+			cols:        cols,
+			preds:       preds,
+			orderBy:     orderBy,
+			limit:       limit,
+			measurement: meas,
+		}, true
 	}
 	return matchResult{}, false
 }
