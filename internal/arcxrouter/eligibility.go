@@ -41,10 +41,14 @@ const (
 // the router just carries the parsed parts.
 type scanPred struct {
 	col   string
-	op    string // = != < <= > >=
+	op    string // = != < <= > >=  (comparison predicates)
 	num   string // integer literal text (isStr == false)
 	str   string // string literal content (isStr == true)
 	isStr bool
+	// Null-check predicates (col IS [NOT] NULL). When isNull is true, op/num/str are
+	// unused; negated distinguishes IS NOT NULL (true) from IS NULL (false).
+	isNull  bool
+	negated bool
 }
 
 // scanOrderKey is one ORDER BY key `<col> [ASC|DESC]` from a scan.

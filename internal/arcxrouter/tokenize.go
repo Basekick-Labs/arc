@@ -404,24 +404,37 @@ func matchScan(toks []token) (cols []string, preds []scanPred, orderBy []scanOrd
 			if !ok || colT.kind != tokIdent || isScanKeyword(colT.lower) {
 				return fail()
 			}
-			opStr, ok := c.op()
-			if !ok {
-				return fail()
+			// Branch: `IS [NOT] NULL` vs `<op> <literal>`.
+			if c.peekIdentLower() == "is" {
+				c.next() // consume `is`
+				negated := false
+				if c.peekIdentLower() == "not" {
+					c.next()
+					negated = true
+				}
+				if c.peekIdentLower() != "null" {
+					return fail()
+				}
+				c.next() // consume `null`
+				preds = append(preds, scanPred{col: colT.orig, isNull: true, negated: negated})
+			} else {
+				opStr, ok := c.op()
+				if !ok {
+					return fail()
+				}
+				litT, ok := c.next()
+				if !ok {
+					return fail()
+				}
+				switch litT.kind {
+				case tokNum:
+					preds = append(preds, scanPred{col: colT.orig, op: opStr, num: litT.orig, isStr: false})
+				case tokStr:
+					preds = append(preds, scanPred{col: colT.orig, op: opStr, str: litT.str, isStr: true})
+				default:
+					return fail()
+				}
 			}
-			litT, ok := c.next()
-			if !ok {
-				return fail()
-			}
-			var p scanPred
-			switch litT.kind {
-			case tokNum:
-				p = scanPred{col: colT.orig, op: opStr, num: litT.orig, isStr: false}
-			case tokStr:
-				p = scanPred{col: colT.orig, op: opStr, str: litT.str, isStr: true}
-			default:
-				return fail()
-			}
-			preds = append(preds, p)
 			if c.peekIdentLower() == "and" {
 				c.i++
 				continue

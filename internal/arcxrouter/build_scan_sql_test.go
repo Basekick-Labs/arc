@@ -110,3 +110,41 @@ func TestBuildScanSQL_OrderByLimit(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildScanSQL_IsNull(t *testing.T) {
+	cases := []struct {
+		name string
+		d    Decision
+		want string
+	}{
+		{
+			"is null",
+			Decision{Shape: ShapeScan, Cols: []string{"a"}, Preds: []scanPred{{col: "b", isNull: true}}},
+			"SELECT a FROM read_parquet(['/a.parquet']) WHERE b IS NULL",
+		},
+		{
+			"is not null",
+			Decision{Shape: ShapeScan, Cols: []string{"a"}, Preds: []scanPred{{col: "b", isNull: true, negated: true}}},
+			"SELECT a FROM read_parquet(['/a.parquet']) WHERE b IS NOT NULL",
+		},
+		{
+			"cmp and is null",
+			Decision{Shape: ShapeScan, Cols: []string{"a"}, Preds: []scanPred{
+				{col: "code", op: ">=", num: "5"},
+				{col: "host", isNull: true, negated: true},
+			}},
+			"SELECT a FROM read_parquet(['/a.parquet']) WHERE code >= 5 AND host IS NOT NULL",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := buildScanSQL(tc.d, "['/a.parquet']")
+			if !ok {
+				t.Fatalf("declined unexpectedly")
+			}
+			if got != tc.want {
+				t.Fatalf("got  %q\nwant %q", got, tc.want)
+			}
+		})
+	}
+}

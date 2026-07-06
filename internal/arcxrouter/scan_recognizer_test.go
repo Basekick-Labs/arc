@@ -117,3 +117,54 @@ func TestMatchScan_Declines(t *testing.T) {
 		})
 	}
 }
+
+func TestMatchScan_IsNull(t *testing.T) {
+	cases := []struct {
+		name       string
+		sql        string
+		wantNPreds int
+		checkPred  func(*testing.T, scanPred) // on the last pred
+	}{
+		{"is null", "SELECT a FROM cpu WHERE b IS NULL", 1, func(t *testing.T, p scanPred) {
+			if !p.isNull || p.negated || p.col != "b" {
+				t.Fatalf("bad IS NULL pred: %+v", p)
+			}
+		}},
+		{"is not null", "SELECT a FROM cpu WHERE b IS NOT NULL", 1, func(t *testing.T, p scanPred) {
+			if !p.isNull || !p.negated || p.col != "b" {
+				t.Fatalf("bad IS NOT NULL pred: %+v", p)
+			}
+		}},
+		{"mixed with cmp", "SELECT a FROM cpu WHERE code >= 5 AND host IS NULL", 2, func(t *testing.T, p scanPred) {
+			if !p.isNull || p.negated {
+				t.Fatalf("bad trailing IS NULL pred: %+v", p)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, ok := eligibleShape(tc.sql)
+			if !ok || m.shape != ShapeScan {
+				t.Fatalf("expected scan-eligible for %q", tc.sql)
+			}
+			if len(m.preds) != tc.wantNPreds {
+				t.Fatalf("preds = %d, want %d", len(m.preds), tc.wantNPreds)
+			}
+			tc.checkPred(t, m.preds[len(m.preds)-1])
+		})
+	}
+}
+
+func TestMatchScan_MalformedIsDeclines(t *testing.T) {
+	for _, sql := range []string{
+		"SELECT a FROM cpu WHERE b IS 5",
+		"SELECT a FROM cpu WHERE b IS NOT 5",
+		"SELECT a FROM cpu WHERE b IS",
+	} {
+		t.Run(sql, func(t *testing.T) {
+			if m, ok := eligibleShape(sql); ok && m.shape == ShapeScan {
+				t.Fatalf("expected NOT scan-eligible: %q", sql)
+			}
+		})
+	}
+}

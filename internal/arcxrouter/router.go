@@ -289,13 +289,24 @@ func buildScanSQL(d Decision, pathArray string) (string, bool) {
 	if len(d.Preds) > 0 {
 		b.WriteString(" WHERE ")
 		for i, p := range d.Preds {
-			if !isBareIdent(p.col) || !isCmpOp(p.op) {
+			if !isBareIdent(p.col) {
 				return "", false
 			}
 			if i > 0 {
 				b.WriteString(" AND ")
 			}
 			b.WriteString(p.col)
+			if p.isNull {
+				if p.negated {
+					b.WriteString(" IS NOT NULL")
+				} else {
+					b.WriteString(" IS NULL")
+				}
+				continue
+			}
+			if !isCmpOp(p.op) {
+				return "", false
+			}
 			b.WriteByte(' ')
 			b.WriteString(p.op)
 			b.WriteByte(' ')
