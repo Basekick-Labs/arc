@@ -176,6 +176,54 @@ func matchCountStar(toks []token) (string, bool) {
 	return meas, true
 }
 
+// matchScalarAgg matches a single-scalar footer aggregate over a bare column:
+//
+//	select {min|max|count} ( <col> ) from <measurement>
+//
+// with nothing after. `count(*)` is NOT matched here — that's matchCountStar; the
+// arg must be a bare identifier, not `*`. Returns (func, col-as-written,
+// measurement, ok). `func` is one of "min", "max", "count".
+func matchScalarAgg(toks []token) (fn, col, meas string, ok bool) {
+	c := &cursor{toks: toks}
+	if !c.ident("select") {
+		return "", "", "", false
+	}
+	f, ok := c.next()
+	if !ok || f.kind != tokIdent {
+		return "", "", "", false
+	}
+	switch f.lower {
+	case "min", "max", "count":
+		fn = f.lower
+	default:
+		return "", "", "", false
+	}
+	if !c.punct('(') {
+		return "", "", "", false
+	}
+	// The argument must be a bare column identifier — NOT `*` (count(*) is the
+	// existing CountStar shape) and NOT an expression.
+	arg, ok := c.next()
+	if !ok || arg.kind != tokIdent {
+		return "", "", "", false
+	}
+	col = arg.orig
+	if !c.punct(')') || !c.ident("from") {
+		return "", "", "", false
+	}
+	m, ok := c.next()
+	if !ok || m.kind != tokIdent {
+		return "", "", "", false
+	}
+	meas = m.orig
+	// Nothing may follow — a WHERE/GROUP BY/alias means the footer scalar path
+	// would silently ignore it. Decline.
+	if !c.atEnd() {
+		return "", "", "", false
+	}
+	return fn, col, meas, true
+}
+
 // matchDateTruncCount matches:
 //
 //	select date_trunc ( '<unit>' , time ) , count ( * ) from <measurement>

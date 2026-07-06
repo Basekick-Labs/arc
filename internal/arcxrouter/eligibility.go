@@ -28,6 +28,10 @@ import "strings"
 const (
 	ShapeCountStar     = "count_star"
 	ShapeDateTruncCent = "date_trunc_count"
+	// Phase 1b scalar footer aggregates over a bare column.
+	ShapeMinCol   = "min_col"
+	ShapeMaxCol   = "max_col"
+	ShapeCountCol = "count_col"
 )
 
 // timeColumn is Arc's hardcoded time-column convention (F1): every measurement
@@ -52,31 +56,44 @@ var supportedUnits = map[string]bool{
 // against a query that smuggles a session-TZ change in the SQL body.
 var tzInjectionTokens = []string{"time zone", "timezone", "at time zone"}
 
-// eligibleShape recognizes the two arcx shapes on the raw user SQL and returns
-// (shape, unit, measurementToken, ok). measurementToken is the bare table
-// reference as written (e.g. "cpu" or "mydb.cpu"); the caller resolves it to a
-// (database, measurement) pair via Arc's extractTableReferences + headerDB fold.
-// unit is "" for the count(*) shape. ok=false means "not one of our shapes" —
-// decline silently, this is the overwhelmingly common path and must be cheap.
-func eligibleShape(sql string) (shape, unit, measurement string, ok bool) {
+// matchResult is what eligibleShape resolves a recognized query into. `unit` is
+// set only for the date_trunc agg; `col` only for the scalar column aggregates
+// (min/max/count(col)). measurement is the bare FROM token as written.
+type matchResult struct {
+	shape       string
+	unit        string // date_trunc agg only
+	col         string // min/max/count(col) only
+	measurement string
+}
+
+// eligibleShape recognizes the arcx shapes on the raw user SQL. ok=false means
+// "not one of our shapes" — decline silently, the overwhelmingly common path, so
+// it must be cheap (a lowercased Contains guard + one tokenize pass).
+func eligibleShape(sql string) (matchResult, bool) {
 	// Cheap TZ-injection guard first — a lowercased Contains, before tokenizing.
 	// Correctness gate (M3): never let a non-UTC session reach the UTC fast path.
+	// This matters for min/max(time) too — a non-UTC session renders timestamps
+	// differently, so the scalar timestamp shapes inherit the exclusion.
 	low := strings.ToLower(sql)
 	for _, t := range tzInjectionTokens {
 		if strings.Contains(low, t) {
-			return "", "", "", false
+			return matchResult{}, false
 		}
 	}
 
 	toks, ok := tokenize(sql)
 	if !ok {
-		return "", "", "", false
+		return matchResult{}, false
 	}
 	if u, meas, ok := matchDateTruncCount(toks); ok {
-		return ShapeDateTruncCent, u, meas, true
+		return matchResult{shape: ShapeDateTruncCent, unit: u, measurement: meas}, true
 	}
 	if meas, ok := matchCountStar(toks); ok {
-		return ShapeCountStar, "", meas, true
+		return matchResult{shape: ShapeCountStar, measurement: meas}, true
 	}
-	return "", "", "", false
+	if fn, col, meas, ok := matchScalarAgg(toks); ok {
+		shape := map[string]string{"min": ShapeMinCol, "max": ShapeMaxCol, "count": ShapeCountCol}[fn]
+		return matchResult{shape: shape, col: col, measurement: meas}, true
+	}
+	return matchResult{}, false
 }

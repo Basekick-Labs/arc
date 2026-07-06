@@ -78,7 +78,8 @@ type Decision struct {
 	Eligible bool
 	Ctx      arcxengine.Context
 	Shape    string
-	Unit     string // "" for count_star
+	Unit     string // date_trunc agg only
+	Col      string // min/max/count(col) only — the bare column, user's spelling
 }
 
 // Decide is the cheap per-query pre-filter. It never calls the engine; it only
@@ -88,7 +89,7 @@ func Decide(sql, headerDB string, h Handler) Decision {
 	if h.Mode == ModeOff {
 		return Decision{}
 	}
-	shape, unit, measToken, ok := eligibleShape(sql)
+	m, ok := eligibleShape(sql)
 	if !ok {
 		return Decision{}
 	}
@@ -96,7 +97,7 @@ func Decide(sql, headerDB string, h Handler) Decision {
 	// (database, measurement) and fold headerDB for the bare form — mirroring
 	// checkQueryPermissions' resolution (query.go:1220), self-contained so we
 	// don't need Arc's unexported extractTableReferences.
-	database, measurement, ok := resolveMeasurementToken(measToken, headerDB)
+	database, measurement, ok := resolveMeasurementToken(m.measurement, headerDB)
 	if !ok {
 		return Decision{}
 	}
@@ -107,8 +108,9 @@ func Decide(sql, headerDB string, h Handler) Decision {
 			Measurement: measurement,
 			TimeColumn:  timeColumn,
 		},
-		Shape: shape,
-		Unit:  unit,
+		Shape: m.shape,
+		Unit:  m.unit,
+		Col:   m.col,
 	}
 }
 
@@ -221,6 +223,15 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 		// derived column name. Column is the "time" convention (F1).
 		return "SELECT date_trunc('" + escapeStringLiteral(d.Unit) + "', time), count(*) FROM read_parquet(" +
 			arr.String() + ") GROUP BY 1", true
+	case ShapeMinCol, ShapeMaxCol, ShapeCountCol:
+		// The engine's parser expects the column as a BARE identifier. d.Col came
+		// from the tokenizer as an identifier ([A-Za-z_][A-Za-z0-9_.]*), so it's
+		// injection-safe by construction; guard defensively anyway.
+		if !isBareIdent(d.Col) {
+			return "", false
+		}
+		fn := map[string]string{ShapeMinCol: "min", ShapeMaxCol: "max", ShapeCountCol: "count"}[d.Shape]
+		return "SELECT " + fn + "(" + d.Col + ") FROM read_parquet(" + arr.String() + ")", true
 	default:
 		return "", false
 	}
@@ -252,7 +263,7 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 	h.Metrics.ArcxLatency("arcx", d.Shape, arcxMicros)
 
 	oracleStart := time.Now()
-	oracle, err := h.fetchOracle(ctx)
+	diff, err := h.compareToOracle(ctx, d, rec)
 	oracleMicros := time.Since(oracleStart).Microseconds()
 	if err != nil {
 		// The oracle itself failed — can't compare. Log, don't alarm arcx for it.
@@ -261,7 +272,7 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 	}
 	h.Metrics.ArcxLatency("duckdb", d.Shape, oracleMicros)
 
-	if diff := compareResults(rec, oracle); diff != "" {
+	if diff != "" {
 		h.Logger.Error().
 			Str("shape", d.Shape).
 			Str("engine_sql", engineSQL).
@@ -272,6 +283,31 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 		return
 	}
 	h.Metrics.ArcxShadowMatch(d.Shape)
+}
+
+// compareToOracle runs the DuckDB oracle for this query and compares its result to
+// arcx's `rec`, returning the diff string ("" == match) or an oracle error. Scalar
+// shapes (min/max/count(col)) use the single-cell comparison; count(*)/agg use the
+// (bucket, count) canonical form.
+func (h Deps) compareToOracle(ctx context.Context, d Decision, rec arrow.Record) (string, error) {
+	rows, err := h.DB.QueryContext(ctx, h.ConvertedSQL)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	if isScalarShape(d.Shape) {
+		oracle, err := scalarFromRows(rows)
+		if err != nil {
+			return "", err
+		}
+		return compareScalar(rec, oracle), nil
+	}
+	oracle, err := canonicalFromRows(rows)
+	if err != nil {
+		return "", err
+	}
+	return compareResults(rec, oracle), nil
 }
 
 // runServe streams arcx's result for a green shape. Falls back (handled=false) on
@@ -300,15 +336,4 @@ func (h Deps) runServe(c *fiber.Ctx, ctx context.Context, d Decision, engineSQL 
 	// design doc warns about — the streamer, not the router, holds it while the
 	// response is in flight.
 	return h.ServeStream(c, rec)
-}
-
-// fetchOracle runs the DuckDB-correct converted SQL and drains it into a
-// canonical result for comparison. Tiny shapes → cheap full scan.
-func (h Deps) fetchOracle(ctx context.Context) (canonicalResult, error) {
-	rows, err := h.DB.QueryContext(ctx, h.ConvertedSQL)
-	if err != nil {
-		return canonicalResult{}, err
-	}
-	defer rows.Close()
-	return canonicalFromRows(rows)
 }

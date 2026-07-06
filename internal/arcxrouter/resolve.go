@@ -43,6 +43,18 @@ func resolveMeasurementToken(token, headerDB string) (database, measurement stri
 	return database, measurement, true
 }
 
+// bareIdent matches a plain SQL column identifier (optionally dotted). The scalar
+// aggregate column is interpolated into engine SQL UNQUOTED (the engine parser
+// wants a bare identifier), so it must be exactly this — no quotes, spaces, or
+// operators that could break out. The tokenizer already guarantees this shape;
+// isBareIdent is the defensive re-check at the SQL-construction boundary.
+var bareIdent = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_.]*$`)
+
+// isBareIdent reports whether col is safe to interpolate unquoted into engine SQL.
+func isBareIdent(col string) bool {
+	return bareIdent.MatchString(col)
+}
+
 // quotePath returns a single-quoted DuckDB path literal, escaping embedded quotes
 // via Arc's canonical escaper — the single source of truth for the read_parquet
 // interpolation SQL-injection boundary (internal/sql.EscapeStringLiteral).

@@ -29,15 +29,71 @@ func TestEligibleShape_Accepts(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			shape, unit, meas, ok := eligibleShape(tc.sql)
+			m, ok := eligibleShape(tc.sql)
 			if !ok {
 				t.Fatalf("expected eligible, got decline for %q", tc.sql)
 			}
-			if shape != tc.wantShape || unit != tc.wantUnit || meas != tc.wantMeas {
+			if m.shape != tc.wantShape || m.unit != tc.wantUnit || m.measurement != tc.wantMeas {
 				t.Fatalf("got (shape=%q unit=%q meas=%q), want (%q %q %q)",
-					shape, unit, meas, tc.wantShape, tc.wantUnit, tc.wantMeas)
+					m.shape, m.unit, m.measurement, tc.wantShape, tc.wantUnit, tc.wantMeas)
 			}
 		})
+	}
+}
+
+func TestEligibleShape_ScalarAggregates(t *testing.T) {
+	cases := []struct {
+		name      string
+		sql       string
+		wantShape string
+		wantCol   string
+		wantMeas  string
+	}{
+		{"min time", "SELECT min(time) FROM cpu", ShapeMinCol, "time", "cpu"},
+		{"max time", "SELECT max(time) FROM cpu", ShapeMaxCol, "time", "cpu"},
+		{"count col", "SELECT count(host) FROM cpu", ShapeCountCol, "host", "cpu"},
+		{"min dotted", "SELECT min(usage) FROM mydb.cpu", ShapeMinCol, "usage", "mydb.cpu"},
+		{"count col preserves case", "SELECT count(MyCol) FROM cpu", ShapeCountCol, "MyCol", "cpu"},
+		{"lowercase kw", "select max(value) from cpu", ShapeMaxCol, "value", "cpu"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, ok := eligibleShape(tc.sql)
+			if !ok {
+				t.Fatalf("expected eligible, got decline for %q", tc.sql)
+			}
+			if m.shape != tc.wantShape || m.col != tc.wantCol || m.measurement != tc.wantMeas {
+				t.Fatalf("got (shape=%q col=%q meas=%q), want (%q %q %q)",
+					m.shape, m.col, m.measurement, tc.wantShape, tc.wantCol, tc.wantMeas)
+			}
+			// count(*) must NOT be misread as count(col).
+			if m.shape == ShapeCountCol && m.col == "*" {
+				t.Fatal("count(*) leaked into count(col)")
+			}
+		})
+	}
+}
+
+func TestEligibleShape_ScalarDeclines(t *testing.T) {
+	for _, sql := range []string{
+		"SELECT min(time) FROM cpu WHERE x > 1",
+		"SELECT max(time) FROM cpu GROUP BY 1",
+		"SELECT min(time) AS m FROM cpu",
+		"SELECT min(time + 1) FROM cpu",
+		"SELECT min(*) FROM cpu",
+		"SELECT sum(value) FROM cpu",        // sum not supported (footers lack sums)
+		"SELECT avg(value) FROM cpu",        // avg not supported
+		"SELECT min(a), max(b) FROM cpu",    // two aggregates
+		"SELECT min(time) FROM cpu, mem",    // two tables
+		"SELECT min(time) FROM cpu LIMIT 1", // trailing clause
+	} {
+		if _, ok := eligibleShape(sql); ok {
+			t.Fatalf("expected decline, got ELIGIBLE for %q", sql)
+		}
+	}
+	// count(*) must still be ShapeCountStar, not a scalar col shape.
+	if m, ok := eligibleShape("SELECT count(*) FROM cpu"); !ok || m.shape != ShapeCountStar {
+		t.Fatalf("count(*) should be ShapeCountStar, got shape=%q ok=%v", m.shape, ok)
 	}
 }
 
@@ -63,7 +119,8 @@ func TestEligibleShape_Declines(t *testing.T) {
 		{"count with groupby", "SELECT count(*) FROM cpu GROUP BY host"},
 		{"count with limit", "SELECT count(*) FROM cpu LIMIT 10"},
 		{"count with join", "SELECT count(*) FROM cpu JOIN mem ON cpu.time = mem.time"},
-		{"count column not star", "SELECT count(x) FROM cpu"},
+		// NOTE: `count(x)` is now ELIGIBLE (ShapeCountCol, Phase 1b) — no longer a
+		// decline. Its acceptance is covered by TestEligibleShape_ScalarAggregates.
 		{"count alias", "SELECT count(*) AS n FROM cpu"},
 		{"count two tables", "SELECT count(*) FROM cpu, mem"},
 		{"not count", "SELECT sum(x) FROM cpu"},
@@ -96,7 +153,7 @@ func TestEligibleShape_Declines(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, _, _, ok := eligibleShape(tc.sql); ok {
+			if _, ok := eligibleShape(tc.sql); ok {
 				t.Fatalf("expected decline, got ELIGIBLE for %q — a mis-accept is a silent-wrong-answer risk", tc.sql)
 			}
 		})

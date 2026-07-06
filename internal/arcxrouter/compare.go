@@ -192,3 +192,115 @@ func toMicros(v int64, unit arrow.TimeUnit) int64 {
 		return v
 	}
 }
+
+// --- Phase 1b scalar comparison (min/max/count(col)) ---------------------------
+//
+// These shapes are a SINGLE row, SINGLE column. Unlike count(*)/agg they can be a
+// Timestamp scalar (min/max(time)) or NULL (all-null min/max), so they get their
+// own comparison rather than the (bucket, count) canonical form. The value is
+// reduced to a nullable int64 (count and int-min/max are already int64;
+// timestamps become µs epoch; NULL is represented explicitly).
+
+// scalarValue is one comparable cell: an int64 (or µs epoch for a timestamp), or
+// NULL. Everything the scalar shapes produce reduces to this.
+type scalarValue struct {
+	isNull bool
+	v      int64
+}
+
+func (s scalarValue) String() string {
+	if s.isNull {
+		return "NULL"
+	}
+	return fmt.Sprintf("%d", s.v)
+}
+
+// scalarFromArcx extracts the single cell from arcx's 1x1 result. Accepts Int64
+// (count(col), int min/max) or Timestamp (min/max(time)); NULL is honored.
+func scalarFromArcx(rec arrow.Record) (scalarValue, error) {
+	if rec.NumCols() != 1 {
+		return scalarValue{}, fmt.Errorf("arcx scalar expected 1 col, got %d", rec.NumCols())
+	}
+	if rec.NumRows() != 1 {
+		return scalarValue{}, fmt.Errorf("arcx scalar expected 1 row, got %d", rec.NumRows())
+	}
+	switch col := rec.Column(0).(type) {
+	case *array.Int64:
+		if col.IsNull(0) {
+			return scalarValue{isNull: true}, nil
+		}
+		return scalarValue{v: col.Value(0)}, nil
+	case *array.Timestamp:
+		if col.IsNull(0) {
+			return scalarValue{isNull: true}, nil
+		}
+		unit := col.DataType().(*arrow.TimestampType).Unit
+		return scalarValue{v: toMicros(int64(col.Value(0)), unit)}, nil
+	default:
+		return scalarValue{}, fmt.Errorf("arcx scalar unexpected col type %T", rec.Column(0))
+	}
+}
+
+// scalarFromRows extracts the single cell from DuckDB's 1x1 result. DuckDB scans a
+// count/int as int64 and a timestamp as time.Time; NULL scans as a nil pointer.
+// We scan into *int64 and *time.Time via a sql.Null-style two-attempt: the column
+// type tells us which. Simplest robust path: scan into an interface{} and type-switch.
+func scalarFromRows(rows *sql.Rows) (scalarValue, error) {
+	cols, err := rows.Columns()
+	if err != nil {
+		return scalarValue{}, err
+	}
+	if len(cols) != 1 {
+		return scalarValue{}, fmt.Errorf("duckdb scalar expected 1 col, got %d", len(cols))
+	}
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return scalarValue{}, err
+		}
+		return scalarValue{}, fmt.Errorf("duckdb scalar returned no rows")
+	}
+	var raw interface{}
+	if err := rows.Scan(&raw); err != nil {
+		return scalarValue{}, err
+	}
+	// Guard against >1 row (a real scalar aggregate never returns more).
+	if rows.Next() {
+		return scalarValue{}, fmt.Errorf("duckdb scalar returned more than one row")
+	}
+	if err := rows.Err(); err != nil {
+		return scalarValue{}, err
+	}
+	switch x := raw.(type) {
+	case nil:
+		return scalarValue{isNull: true}, nil
+	case int64:
+		return scalarValue{v: x}, nil
+	case time.Time:
+		return scalarValue{v: x.UnixMicro()}, nil
+	default:
+		return scalarValue{}, fmt.Errorf("duckdb scalar unexpected type %T", raw)
+	}
+}
+
+// compareScalar returns "" if arcx's scalar matches DuckDB's, else a short diff.
+func compareScalar(rec arrow.Record, oracle scalarValue) string {
+	got, err := scalarFromArcx(rec)
+	if err != nil {
+		return "arcx scalar decode error: " + err.Error()
+	}
+	if got.isNull != oracle.isNull || (!got.isNull && got.v != oracle.v) {
+		return fmt.Sprintf("scalar differs: arcx=%s duckdb=%s", got, oracle)
+	}
+	return ""
+}
+
+// isScalarShape reports whether a shape produces a single-cell result compared via
+// compareScalar rather than the (bucket, count) canonical form.
+func isScalarShape(shape string) bool {
+	switch shape {
+	case ShapeMinCol, ShapeMaxCol, ShapeCountCol:
+		return true
+	default:
+		return false
+	}
+}
