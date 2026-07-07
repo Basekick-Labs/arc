@@ -207,3 +207,24 @@ func TestReserializeWhere_RoundTripFidelity(t *testing.T) {
 		}
 	}
 }
+
+func TestReserializeWhere_InRoundTrip(t *testing.T) {
+	// IN / NOT IN re-serialize idempotently, and a nasty string element survives as one
+	// escaped literal (no injection). Same round-trip discipline as the 2b-2 test.
+	inputs := []string{
+		"SELECT a FROM cpu WHERE x IN (1, 2, 3)",
+		"SELECT a FROM cpu WHERE host IN ('a'') OR 1=1 --', 'ok')",
+		"SELECT a FROM cpu WHERE x IN (1,2) AND y NOT IN (3,4)",
+	}
+	for _, sql := range inputs {
+		m1, ok := eligibleShape(sql)
+		if !ok || m1.shape != ShapeScan || m1.whereText == "" {
+			t.Fatalf("expected IN scan-eligible with whereText for %q", sql)
+		}
+		reconstructed := "SELECT a FROM cpu WHERE " + m1.whereText
+		m2, ok := eligibleShape(reconstructed)
+		if !ok || m2.whereText != m1.whereText {
+			t.Fatalf("IN round-trip not idempotent:\n in:  %q\n out: %q", m1.whereText, m2.whereText)
+		}
+	}
+}

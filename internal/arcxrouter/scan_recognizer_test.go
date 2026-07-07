@@ -114,7 +114,6 @@ func TestMatchScan_BooleanTreeDeclines(t *testing.T) {
 	// vocabulary declines AT THE ROUTER (never route-then-engine-decline / shadow mismatch).
 	decline := []string{
 		"SELECT a FROM cpu WHERE a = 1 OR NOT b = 2",      // NOT prefix
-		"SELECT a FROM cpu WHERE a = 1 OR b IN (1,2)",     // IN
 		"SELECT a FROM cpu WHERE a = 1 OR b LIKE 'x'",     // LIKE
 		"SELECT a FROM cpu WHERE a = 1 OR lower(b) = 'x'", // function call
 		"SELECT a FROM cpu WHERE a = 1 OR b = 1 + 1",      // arithmetic RHS
@@ -128,6 +127,78 @@ func TestMatchScan_BooleanTreeDeclines(t *testing.T) {
 		if m, ok := eligibleShape(sql); ok && m.shape == ShapeScan {
 			t.Fatalf("expected NOT scan-eligible: %q (whereText=%q)", sql, m.whereText)
 		}
+	}
+}
+
+func TestMatchScan_InList(t *testing.T) {
+	// IN / NOT IN (2b-3) route through the boolean-tree re-serializer (whereText); the
+	// engine re-lexes and desugars to Or-of-equals / And-of-not-equals.
+	cases := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{"in ints", "SELECT a FROM cpu WHERE x IN (1, 2, 3)", "x IN (1, 2, 3)"},
+		{"in strings", "SELECT a FROM cpu WHERE host IN ('a', 'b')", "host IN ('a', 'b')"},
+		{"not in", "SELECT a FROM cpu WHERE x NOT IN (1, 2)", "x NOT IN (1, 2)"},
+		{"in single", "SELECT a FROM cpu WHERE x IN (5)", "x IN (5)"},
+		{"in composed", "SELECT a FROM cpu WHERE x IN (1,2) AND y NOT IN (3,4)", "x IN (1, 2) AND y NOT IN (3, 4)"},
+		{"in string reescaped", "SELECT a FROM cpu WHERE h IN ('we''b', 'x')", "h IN ('we''b', 'x')"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, ok := eligibleShape(tc.sql)
+			if !ok || m.shape != ShapeScan {
+				t.Fatalf("expected scan-eligible: %q", tc.sql)
+			}
+			if m.whereText != tc.want {
+				t.Fatalf("whereText = %q, want %q", m.whereText, tc.want)
+			}
+		})
+	}
+}
+
+func TestMatchScan_InDeclines(t *testing.T) {
+	decline := []string{
+		"SELECT a FROM cpu WHERE x IN ()",                // empty
+		"SELECT a FROM cpu WHERE x NOT IN ()",            // empty NOT IN
+		"SELECT a FROM cpu WHERE x IN (1,2",              // unbalanced
+		"SELECT a FROM cpu WHERE x IN (1 2)",             // missing comma
+		"SELECT a FROM cpu WHERE x IN (,1)",              // leading comma
+		"SELECT a FROM cpu WHERE x IN 1",                 // no paren
+		"SELECT a FROM cpu WHERE x IN (SELECT a FROM t)", // subquery
+		"SELECT a FROM cpu WHERE NOT x IN (1,2)",         // NOT before col (NOT-node)
+		"SELECT a FROM cpu WHERE x NOT BETWEEN 1 AND 2",  // NOT BETWEEN
+	}
+	for _, sql := range decline {
+		if m, ok := eligibleShape(sql); ok && m.shape == ShapeScan {
+			t.Fatalf("expected NOT scan-eligible: %q (whereText=%q)", sql, m.whereText)
+		}
+	}
+}
+
+func TestWhereHasOrOrParen_RoutesIN(t *testing.T) {
+	// LOAD-BEARING: a bare `x IN (1,2)` (no boolean OR/paren) must still route to the
+	// tree re-serializer (whereText), because the []scanPred flat path can't represent
+	// IN. It routes because the IN list's `(` is a tokPunct. Pin it so nobody narrows
+	// whereHasOrOrParen to boolean-parens-only and silently stops routing IN.
+	toks, ok := tokenize("SELECT a FROM cpu WHERE x IN (1, 2)")
+	if !ok {
+		t.Fatal("tokenize failed")
+	}
+	// advance a cursor to just after WHERE
+	c := &cursor{toks: toks}
+	for c.i < len(c.toks) && c.toks[c.i].lower != "where" {
+		c.i++
+	}
+	c.i++ // past `where`
+	if !whereHasOrOrParen(c) {
+		t.Fatal("whereHasOrOrParen must return true for `x IN (1,2)` so it routes to whereText")
+	}
+	// And end-to-end: it recognizes as a scan with whereText set (not flat preds).
+	m, ok := eligibleShape("SELECT a FROM cpu WHERE x IN (1, 2)")
+	if !ok || m.shape != ShapeScan || m.whereText == "" || len(m.preds) != 0 {
+		t.Fatalf("bare IN should route to whereText: ok=%v whereText=%q preds=%+v", ok, m.whereText, m.preds)
 	}
 }
 
@@ -211,7 +282,6 @@ func TestMatchScan_Declines(t *testing.T) {
 	decline := []string{
 		"SELECT * FROM cpu",                          // star not routed (drift-unprovable)
 		"SELECT *, host FROM cpu",                    // star mixed
-		"SELECT host FROM cpu WHERE a IN (1,2)",      // IN (2b-3) — `in` is an ident, IN(...) not our grammar
 		"SELECT host FROM cpu WHERE a LIKE 'x'",      // LIKE (2b)
 		"SELECT host FROM cpu WHERE NOT a = 1",       // NOT (2b-2b)
 		"SELECT host FROM cpu WHERE (a = 1",          // unbalanced paren

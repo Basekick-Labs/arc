@@ -785,6 +785,21 @@ func reserializeAtom(c *cursor, b *strings.Builder, atoms *int) bool {
 		}
 		b.WriteString(" AND ")
 		return writeLiteralTok(b, hi)
+	case c.peekIdentLower() == "in":
+		// `col IN (lit, …)` — the engine desugars to Or-of-equals (2b-3). Re-emit the
+		// list; the atom counter bumps per element (a huge IN declines like a wide OR).
+		c.next() // consume `in`
+		return reserializeInList(c, b, false, atoms)
+	case c.peekIdentLower() == "not":
+		// The ONLY valid `<col> not …` here is `NOT IN` — consume `not`; if the next isn't
+		// `in`, decline (matches the engine's disambiguation; `IS NOT NULL` puts `not`
+		// after `is`, `NOT BETWEEN` isn't reachable).
+		c.next() // consume `not`
+		if c.peekIdentLower() != "in" {
+			return false
+		}
+		c.next() // consume `in`
+		return reserializeInList(c, b, true, atoms)
 	default:
 		opStr, ok := c.op()
 		if !ok || !isCmpOp(opStr) {
@@ -799,6 +814,60 @@ func reserializeAtom(c *cursor, b *strings.Builder, atoms *int) bool {
 		b.WriteByte(' ')
 		return writeLiteralTok(b, litT)
 	}
+}
+
+// reserializeInList re-emits `IN ( lit, … )` / `NOT IN ( … )` (2b-3). The engine desugars
+// to Or-of-equals / And-of-not-equals; the router just re-serializes the list verbatim
+// (each literal re-escaped/re-validated via writeLiteralTok) into whereText. `col` and the
+// `IN`/`NOT IN` keyword are already written by the caller EXCEPT the keyword — write it here.
+// Empty list, a NULL/non-literal element, a subquery all decline AT THE ROUTER (strict
+// allowlist). Per-element atom bump with the cap check inside the loop (a huge IN declines).
+func reserializeInList(c *cursor, b *strings.Builder, negated bool, atoms *int) bool {
+	if negated {
+		b.WriteString(" NOT IN (")
+	} else {
+		b.WriteString(" IN (")
+	}
+	// Require `(`.
+	if lp, ok := c.next(); !ok || lp.kind != tokPunct || lp.punct != '(' {
+		return false
+	}
+	// Empty `()` declines (DuckDB parser-errors; the engine declines too).
+	if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == ')' {
+		return false
+	}
+	first := true
+	for {
+		*atoms++
+		if *atoms > maxWhereAtoms {
+			return false
+		}
+		lit, ok := c.next()
+		if !ok || !isAtomLiteralTok(lit) {
+			return false // EOF, a subquery `select`, a bare NULL ident — all decline
+		}
+		if !first {
+			b.WriteString(", ")
+		}
+		first = false
+		if !writeLiteralTok(b, lit) {
+			return false
+		}
+		// Terminator: `,` continues, `)` ends, anything else declines.
+		sep, ok := c.next()
+		if !ok || sep.kind != tokPunct {
+			return false
+		}
+		if sep.punct == ',' {
+			continue
+		}
+		if sep.punct == ')' {
+			break
+		}
+		return false
+	}
+	b.WriteByte(')')
+	return true
 }
 
 // isAtomLiteralTok reports whether a token is an accepted predicate RHS literal.
@@ -836,7 +905,7 @@ func writeLiteralTok(b *strings.Builder, t token) bool {
 // not be treated as a column in the scan grammar (guards `SELECT from FROM ...`).
 func isScanKeyword(lower string) bool {
 	switch lower {
-	case "from", "where", "and", "or", "order", "by", "group", "limit", "having", "as":
+	case "from", "where", "and", "or", "in", "order", "by", "group", "limit", "having", "as":
 		return true
 	}
 	return false
