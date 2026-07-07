@@ -66,3 +66,35 @@ func quotePath(path string) string {
 func escapeStringLiteral(s string) string {
 	return arcsql.EscapeStringLiteral(s)
 }
+
+// isCmpOp guards the operator string emitted into SQL (defense-in-depth; the
+// tokenizer only ever produces these). Cgo-free so the untagged recognizer/re-serializer
+// and the tagged buildScanSQL both call it.
+func isCmpOp(op string) bool {
+	switch op {
+	case "=", "!=", "<", "<=", ">", ">=":
+		return true
+	}
+	return false
+}
+
+// isIntLiteral reports whether s is a base-10 integer (optional leading '-'),
+// matching what the tokenizer's tokNum produces for a WHERE literal.
+func isIntLiteral(s string) bool {
+	if s == "" {
+		return false
+	}
+	i := 0
+	if s[0] == '-' {
+		if len(s) == 1 {
+			return false
+		}
+		i = 1
+	}
+	for ; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}

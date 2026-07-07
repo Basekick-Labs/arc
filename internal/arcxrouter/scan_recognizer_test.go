@@ -77,6 +77,60 @@ func TestMatchScan_Between(t *testing.T) {
 	}
 }
 
+func TestMatchScan_BooleanTreeWhere(t *testing.T) {
+	// A WHERE with OR / parens is recognized as a scan and RE-SERIALIZED into whereText
+	// (not the flat preds path). The engine re-lexes whereText and owns the tree.
+	cases := []struct {
+		name string
+		sql  string
+		want string // expected whereText
+	}{
+		{"simple or", "SELECT a FROM cpu WHERE a = 1 OR b = 2", "a = 1 OR b = 2"},
+		{"precedence", "SELECT a FROM cpu WHERE a = 1 OR b = 2 AND c = 3", "a = 1 OR b = 2 AND c = 3"},
+		{"parens", "SELECT a FROM cpu WHERE (a = 1 OR b = 2) AND c = 3", "(a = 1 OR b = 2) AND c = 3"},
+		{"string reescaped", "SELECT a FROM cpu WHERE host = 'we''b' OR host = 'x'", "host = 'we''b' OR host = 'x'"},
+		{"is null in or", "SELECT a FROM cpu WHERE a IS NULL OR b = 2", "a IS NULL OR b = 2"},
+		{"between in or", "SELECT a FROM cpu WHERE x BETWEEN 1 AND 5 OR y = 9", "x BETWEEN 1 AND 5 OR y = 9"},
+		{"wide or", "SELECT a FROM cpu WHERE h = 'a' OR h = 'b' OR h = 'c'", "h = 'a' OR h = 'b' OR h = 'c'"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, ok := eligibleShape(tc.sql)
+			if !ok || m.shape != ShapeScan {
+				t.Fatalf("expected scan-eligible: %q", tc.sql)
+			}
+			if len(m.preds) != 0 {
+				t.Fatalf("boolean-tree WHERE should set whereText, not preds: %+v", m.preds)
+			}
+			if m.whereText != tc.want {
+				t.Fatalf("whereText = %q, want %q", m.whereText, tc.want)
+			}
+		})
+	}
+}
+
+func TestMatchScan_BooleanTreeDeclines(t *testing.T) {
+	// The re-serializer is a strict allowlist: anything outside the boolean-atom
+	// vocabulary declines AT THE ROUTER (never route-then-engine-decline / shadow mismatch).
+	decline := []string{
+		"SELECT a FROM cpu WHERE a = 1 OR NOT b = 2",      // NOT prefix
+		"SELECT a FROM cpu WHERE a = 1 OR b IN (1,2)",     // IN
+		"SELECT a FROM cpu WHERE a = 1 OR b LIKE 'x'",     // LIKE
+		"SELECT a FROM cpu WHERE a = 1 OR lower(b) = 'x'", // function call
+		"SELECT a FROM cpu WHERE a = 1 OR b = 1 + 1",      // arithmetic RHS
+		"SELECT a FROM cpu WHERE (a = 1 OR b = 2",         // unbalanced (
+		"SELECT a FROM cpu WHERE a = 1 OR b = 2)",         // stray )
+		"SELECT a FROM cpu WHERE ()",                      // empty parens
+		"SELECT a FROM cpu WHERE a = 1 OR",                // trailing OR
+		"SELECT a FROM cpu WHERE OR a = 1",                // leading OR
+	}
+	for _, sql := range decline {
+		if m, ok := eligibleShape(sql); ok && m.shape == ShapeScan {
+			t.Fatalf("expected NOT scan-eligible: %q (whereText=%q)", sql, m.whereText)
+		}
+	}
+}
+
 func TestMatchScan_DoubleEquality(t *testing.T) {
 	// DOUBLE eq (2b-1b): `= f` / `!= f` with a `digit.digit` float literal is accepted
 	// as a scan pred (isFloat), mirroring the engine binder. The router recognizes the
@@ -157,9 +211,11 @@ func TestMatchScan_Declines(t *testing.T) {
 	decline := []string{
 		"SELECT * FROM cpu",                          // star not routed (drift-unprovable)
 		"SELECT *, host FROM cpu",                    // star mixed
-		"SELECT host FROM cpu WHERE a = 1 OR b = 2",  // OR (2b)
-		"SELECT host FROM cpu WHERE a IN (1,2)",      // IN (2b) — `in` is an ident, IN(...) not our grammar
+		"SELECT host FROM cpu WHERE a IN (1,2)",      // IN (2b-3) — `in` is an ident, IN(...) not our grammar
 		"SELECT host FROM cpu WHERE a LIKE 'x'",      // LIKE (2b)
+		"SELECT host FROM cpu WHERE NOT a = 1",       // NOT (2b-2b)
+		"SELECT host FROM cpu WHERE (a = 1",          // unbalanced paren
+		"SELECT host FROM cpu WHERE a = 1 OR",        // trailing OR
 		"SELECT lower(host) FROM cpu",                // function in projection (2b)
 		"SELECT host FROM cpu LIMIT 10",              // LIMIT without ORDER BY (nondeterministic)
 		"SELECT host FROM cpu ORDER BY host LIMIT 0", // LIMIT 0 routed to DuckDB

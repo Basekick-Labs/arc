@@ -90,10 +90,14 @@ type matchResult struct {
 	unit        string // date_trunc agg only
 	col         string // min/max/count(col) only
 	measurement string
-	cols        []string       // scan only: projected columns (as written)
-	preds       []scanPred     // scan only: AND-conjoined WHERE predicates
-	orderBy     []scanOrderKey // scan only: ORDER BY keys
-	limit       int            // scan only: LIMIT n (0 = none)
+	cols        []string   // scan only: projected columns (as written)
+	preds       []scanPred // scan only: AND-conjoined WHERE predicates (flat case)
+	whereText   string     // scan only: re-serialized WHERE for the boolean-TREE case
+	// (OR / parens). Mutually exclusive with preds — set only when the flat AND-list
+	// can't represent the WHERE (2b-2). buildScanSQL emits it verbatim; the engine is
+	// the tree authority.
+	orderBy []scanOrderKey // scan only: ORDER BY keys
+	limit   int            // scan only: LIMIT n (0 = none)
 }
 
 // eligibleShape recognizes the arcx shapes on the raw user SQL. ok=false means
@@ -127,11 +131,12 @@ func eligibleShape(sql string) (matchResult, bool) {
 	}
 	// Scan is tried LAST: it's the broadest shape (a bare column list matches many
 	// SELECTs), so the specific aggregate shapes get first refusal.
-	if cols, preds, orderBy, limit, meas, ok := matchScan(toks); ok {
+	if cols, preds, whereText, orderBy, limit, meas, ok := matchScan(toks); ok {
 		return matchResult{
 			shape:       ShapeScan,
 			cols:        cols,
 			preds:       preds,
+			whereText:   whereText,
 			orderBy:     orderBy,
 			limit:       limit,
 			measurement: meas,

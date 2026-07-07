@@ -84,15 +84,16 @@ type Metrics interface {
 // Decision is the router's verdict for a query. Carries structured components,
 // not SQL — Run builds the arcx engine SQL from Unit + the expanded path array.
 type Decision struct {
-	Eligible bool
-	Ctx      arcxengine.Context
-	Shape    string
-	Unit     string         // date_trunc agg only
-	Col      string         // min/max/count(col) only — the bare column, user's spelling
-	Cols     []string       // scan only: projected columns (as written)
-	Preds    []scanPred     // scan only: AND-conjoined WHERE predicates
-	OrderBy  []scanOrderKey // scan only: ORDER BY keys
-	Limit    int            // scan only: LIMIT n (0 = none)
+	Eligible  bool
+	Ctx       arcxengine.Context
+	Shape     string
+	Unit      string         // date_trunc agg only
+	Col       string         // min/max/count(col) only — the bare column, user's spelling
+	Cols      []string       // scan only: projected columns (as written)
+	Preds     []scanPred     // scan only: AND-conjoined WHERE predicates (flat case)
+	WhereText string         // scan only: re-serialized boolean WHERE (OR/parens, 2b-2)
+	OrderBy   []scanOrderKey // scan only: ORDER BY keys
+	Limit     int            // scan only: LIMIT n (0 = none)
 }
 
 // Decide is the cheap per-query pre-filter. It never calls the engine; it only
@@ -125,13 +126,14 @@ func Decide(sql, headerDB string, h Handler) Decision {
 			// would be a bypass around Arc's CVE fix.
 			AllowedDirs: h.AllowedDirs,
 		},
-		Shape:   m.shape,
-		Unit:    m.unit,
-		Col:     m.col,
-		Cols:    m.cols,
-		Preds:   m.preds,
-		OrderBy: m.orderBy,
-		Limit:   m.limit,
+		Shape:     m.shape,
+		Unit:      m.unit,
+		Col:       m.col,
+		Cols:      m.cols,
+		Preds:     m.preds,
+		WhereText: m.whereText,
+		OrderBy:   m.orderBy,
+		Limit:     m.limit,
 	}
 }
 
@@ -288,7 +290,13 @@ func buildScanSQL(d Decision, pathArray string) (string, bool) {
 	b.WriteString(pathArray)
 	b.WriteByte(')')
 
-	if len(d.Preds) > 0 {
+	// A boolean-tree WHERE (2b-2) is emitted from its pre-validated, re-serialized text
+	// (built by reserializeWhere, which already re-escaped strings + re-validated every
+	// token). Mutually exclusive with the flat Preds path.
+	if d.WhereText != "" {
+		b.WriteString(" WHERE ")
+		b.WriteString(d.WhereText)
+	} else if len(d.Preds) > 0 {
 		b.WriteString(" WHERE ")
 		for i, p := range d.Preds {
 			if !isBareIdent(p.col) {
@@ -360,37 +368,6 @@ func buildScanSQL(d Decision, pathArray string) (string, bool) {
 	}
 
 	return b.String(), true
-}
-
-// isCmpOp guards the operator string emitted into SQL (defense-in-depth; the
-// tokenizer only ever produces these).
-func isCmpOp(op string) bool {
-	switch op {
-	case "=", "!=", "<", "<=", ">", ">=":
-		return true
-	}
-	return false
-}
-
-// isIntLiteral reports whether s is a base-10 integer (optional leading '-'),
-// matching what the tokenizer's tokNum produces for a WHERE literal.
-func isIntLiteral(s string) bool {
-	if s == "" {
-		return false
-	}
-	i := 0
-	if s[0] == '-' {
-		if len(s) == 1 {
-			return false
-		}
-		i = 1
-	}
-	for ; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
-			return false
-		}
-	}
-	return true
 }
 
 // runShadow runs arcx and a cheap DuckDB oracle, compares, and records metrics.

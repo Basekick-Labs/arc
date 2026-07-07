@@ -163,3 +163,47 @@ func TestBuildScanSQL_IsNull(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildScanSQL_WhereTextTree(t *testing.T) {
+	// A boolean-tree Decision emits `WHERE <WhereText>` verbatim (the text was already
+	// re-serialized + re-escaped by reserializeWhere).
+	d := Decision{
+		Shape:     ShapeScan,
+		Cols:      []string{"a"},
+		WhereText: "a = 1 OR (b = 2 AND host = 'we''b')",
+	}
+	got, ok := buildScanSQL(d, "['/a.parquet']")
+	if !ok {
+		t.Fatal("declined unexpectedly")
+	}
+	want := "SELECT a FROM read_parquet(['/a.parquet']) WHERE a = 1 OR (b = 2 AND host = 'we''b')"
+	if got != want {
+		t.Fatalf("got  %q\nwant %q", got, want)
+	}
+}
+
+func TestReserializeWhere_RoundTripFidelity(t *testing.T) {
+	// The router's re-serialized WHERE must lex+recognize back to the SAME whereText when
+	// fed through the recognizer again (idempotent), and a nasty string literal (quotes,
+	// parens, AND, --) must survive as a single escaped literal — no injection across the
+	// round-trip. This is the cross-serializer divergence guard (router emits → re-parse).
+	inputs := []string{
+		"SELECT a FROM cpu WHERE a = 1 OR (b = 2 AND c = 3)",
+		"SELECT a FROM cpu WHERE host = 'a'') OR 1=1 --' OR host = 'ok'",
+		"SELECT a FROM cpu WHERE (a = 1 OR b = 2) AND (c = 3 OR d = 4)",
+	}
+	for _, sql := range inputs {
+		m1, ok := eligibleShape(sql)
+		if !ok || m1.shape != ShapeScan || m1.whereText == "" {
+			t.Fatalf("expected boolean-tree scan for %q", sql)
+		}
+		// Reconstruct a user-form query from the re-serialized whereText and recognize it
+		// again: the re-serializer must be IDEMPOTENT (its output re-lexes to the same
+		// text), which is exactly what the engine relies on when it re-parses whereText.
+		reconstructed := "SELECT a FROM cpu WHERE " + m1.whereText
+		m2, ok := eligibleShape(reconstructed)
+		if !ok || m2.whereText != m1.whereText {
+			t.Fatalf("round-trip not idempotent:\n in:  %q\n out: %q", m1.whereText, m2.whereText)
+		}
+	}
+}

@@ -429,13 +429,13 @@ func (c *cursor) peekIdentLower() string {
 // The engine re-validates types, union_by_name, and the sandbox; the router's job
 // is only to recognize the shape and hand over the parts. Returns the projected
 // columns (as written), the predicates, the measurement, and ok.
-func matchScan(toks []token) (cols []string, preds []scanPred, orderBy []scanOrderKey, limit int, meas string, ok bool) {
+func matchScan(toks []token) (cols []string, preds []scanPred, whereText string, orderBy []scanOrderKey, limit int, meas string, ok bool) {
 	c := &cursor{toks: toks}
 	if !c.ident("select") {
-		return nil, nil, nil, 0, "", false
+		return nil, nil, "", nil, 0, "", false
 	}
-	fail := func() ([]string, []scanPred, []scanOrderKey, int, string, bool) {
-		return nil, nil, nil, 0, "", false
+	fail := func() ([]string, []scanPred, string, []scanOrderKey, int, string, bool) {
+		return nil, nil, "", nil, 0, "", false
 	}
 
 	// Projection: one or more bare columns, comma-separated. A `*`, a function
@@ -465,9 +465,21 @@ func matchScan(toks []token) (cols []string, preds []scanPred, orderBy []scanOrd
 	}
 	meas = mt.orig
 
-	// Optional WHERE (AND-conjoined <col> <op> <literal>).
+	// Optional WHERE. A flat AND-list is captured as []scanPred (2a/2b-1); a WHERE that
+	// contains OR or parens is a boolean TREE that []scanPred can't represent, so it's
+	// re-serialized to whereText and the engine owns the tree (2b-2).
 	if c.peekIdentLower() == "where" {
 		c.next()
+		if whereHasOrOrParen(c) {
+			wt, ok := reserializeWhere(c)
+			if !ok {
+				return fail()
+			}
+			whereText = wt
+			// After the WHERE tree, fall through to ORDER BY / LIMIT below.
+			preds = nil
+			goto afterWhere
+		}
 		for {
 			colT, ok := c.next()
 			if !ok || colT.kind != tokIdent || isScanKeyword(colT.lower) {
@@ -555,6 +567,7 @@ func matchScan(toks []token) (cols []string, preds []scanPred, orderBy []scanOrd
 			break
 		}
 	}
+afterWhere:
 
 	// Optional ORDER BY <col> [ASC|DESC] (, <col> [ASC|DESC])*. The engine serves
 	// ORDER BY on int/µs columns only and declines strings/floats — but the router
@@ -614,7 +627,209 @@ func matchScan(toks []token) (cols []string, preds []scanPred, orderBy []scanOrd
 	if !c.atEnd() {
 		return fail()
 	}
-	return cols, preds, orderBy, limit, meas, true
+	return cols, preds, whereText, orderBy, limit, meas, true
+}
+
+// whereHasOrOrParen peeks (without advancing) whether the WHERE clause ahead contains
+// an `or` keyword or a `(` — i.e. it's a boolean TREE the flat []scanPred can't hold, so
+// it must go through reserializeWhere. Scans from the cursor to the first ORDER/LIMIT/end.
+func whereHasOrOrParen(c *cursor) bool {
+	for i := c.i; i < len(c.toks); i++ {
+		t := c.toks[i]
+		if t.kind == tokIdent && (t.lower == "order" || t.lower == "limit") {
+			break
+		}
+		if t.kind == tokIdent && t.lower == "or" {
+			return true
+		}
+		if t.kind == tokPunct && (t.punct == '(' || t.punct == ')') {
+			return true
+		}
+	}
+	return false
+}
+
+// reserializeWhere recognizes the WHERE as a boolean expression over the STRICT allowed
+// vocabulary and RE-SERIALIZES it token-by-token into a normalized string (2b-2). It is
+// NOT a source-substring slice (tokens carry no offsets): every token is re-emitted —
+// bare-column idents via isBareIdent, comparison ops via isCmpOp, string literals
+// RE-ESCAPED via escapeStringLiteral, numbers/floats re-validated, and only the structural
+// tokens `(` `)` AND OR BETWEEN IS [NOT] NULL. Anything else (NOT-prefix, IN, LIKE, a
+// function-call `ident(`, arithmetic) → decline, so the router never routes a shape the
+// engine declines (a served-then-declined shadow mismatch). The engine re-lexes this text
+// and is the sole tree authority; the round-trip fidelity is covered by a test.
+//
+// Grammar (SQL precedence): or := and (OR and)* ; and := unary (AND unary)* ;
+// unary := '(' or ')' | atom . It leaves the cursor at the first ORDER/LIMIT/end token.
+func reserializeWhere(c *cursor) (string, bool) {
+	var b strings.Builder
+	depth := 0
+	atoms := 0
+	if !reserializeOr(c, &b, &depth, &atoms) {
+		return "", false
+	}
+	if depth != 0 {
+		return "", false // unbalanced parens
+	}
+	if atoms == 0 {
+		return "", false // empty WHERE / `()`
+	}
+	return b.String(), true
+}
+
+// maxWhereDepth / maxWhereAtoms mirror the engine's parse-time caps (a too-deep or
+// too-wide WHERE declines at the router too, matching the engine's decline).
+const (
+	maxWhereDepth = 32
+	maxWhereAtoms = 1024
+)
+
+func reserializeOr(c *cursor, b *strings.Builder, depth, atoms *int) bool {
+	if !reserializeAnd(c, b, depth, atoms) {
+		return false
+	}
+	for c.peekIdentLower() == "or" {
+		c.next()
+		b.WriteString(" OR ")
+		if !reserializeAnd(c, b, depth, atoms) {
+			return false
+		}
+	}
+	return true
+}
+
+func reserializeAnd(c *cursor, b *strings.Builder, depth, atoms *int) bool {
+	if !reserializeUnary(c, b, depth, atoms) {
+		return false
+	}
+	for c.peekIdentLower() == "and" {
+		c.next()
+		b.WriteString(" AND ")
+		if !reserializeUnary(c, b, depth, atoms) {
+			return false
+		}
+	}
+	return true
+}
+
+func reserializeUnary(c *cursor, b *strings.Builder, depth, atoms *int) bool {
+	if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '(' {
+		*depth++
+		if *depth > maxWhereDepth {
+			return false
+		}
+		c.next()
+		b.WriteByte('(')
+		if !reserializeOr(c, b, depth, atoms) {
+			return false
+		}
+		if c.i >= len(c.toks) || c.toks[c.i].kind != tokPunct || c.toks[c.i].punct != ')' {
+			return false
+		}
+		c.next()
+		b.WriteByte(')')
+		*depth--
+		return true
+	}
+	return reserializeAtom(c, b, atoms)
+}
+
+// reserializeAtom emits ONE predicate atom, re-escaping/re-validating every token. Mirrors
+// the flat []scanPred atom recognition, but writes normalized SQL instead of a struct.
+func reserializeAtom(c *cursor, b *strings.Builder, atoms *int) bool {
+	*atoms++
+	if *atoms > maxWhereAtoms {
+		return false
+	}
+	colT, ok := c.next()
+	if !ok || colT.kind != tokIdent || isScanKeyword(colT.lower) || !isBareIdent(colT.orig) {
+		return false
+	}
+	// A `(` right after the ident is a function call — decline (no expression atoms).
+	if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '(' {
+		return false
+	}
+	b.WriteString(colT.orig)
+
+	switch {
+	case c.peekIdentLower() == "is":
+		c.next()
+		b.WriteString(" IS")
+		if c.peekIdentLower() == "not" {
+			c.next()
+			b.WriteString(" NOT")
+		}
+		if c.peekIdentLower() != "null" {
+			return false
+		}
+		c.next()
+		b.WriteString(" NULL")
+		return true
+	case c.peekIdentLower() == "between":
+		c.next()
+		lo, ok := c.next()
+		if !ok || !isAtomLiteralTok(lo) {
+			return false
+		}
+		if c.peekIdentLower() != "and" {
+			return false
+		}
+		c.next()
+		hi, ok := c.next()
+		if !ok || !isAtomLiteralTok(hi) {
+			return false
+		}
+		b.WriteString(" BETWEEN ")
+		if !writeLiteralTok(b, lo) {
+			return false
+		}
+		b.WriteString(" AND ")
+		return writeLiteralTok(b, hi)
+	default:
+		opStr, ok := c.op()
+		if !ok || !isCmpOp(opStr) {
+			return false
+		}
+		litT, ok := c.next()
+		if !ok || !isAtomLiteralTok(litT) {
+			return false
+		}
+		b.WriteByte(' ')
+		b.WriteString(opStr)
+		b.WriteByte(' ')
+		return writeLiteralTok(b, litT)
+	}
+}
+
+// isAtomLiteralTok reports whether a token is an accepted predicate RHS literal.
+func isAtomLiteralTok(t token) bool {
+	return t.kind == tokNum || t.kind == tokFloat || t.kind == tokStr
+}
+
+// writeLiteralTok re-emits a literal token with re-escaping/re-validation — the same
+// discipline buildScanSQL uses, so a crafted string can't break out of the quote.
+func writeLiteralTok(b *strings.Builder, t token) bool {
+	switch t.kind {
+	case tokStr:
+		b.WriteByte('\'')
+		b.WriteString(escapeStringLiteral(t.str))
+		b.WriteByte('\'')
+		return true
+	case tokFloat:
+		if !isFloatLiteral(t.orig) {
+			return false
+		}
+		b.WriteString(t.orig)
+		return true
+	case tokNum:
+		if !isIntLiteral(t.orig) {
+			return false
+		}
+		b.WriteString(t.orig)
+		return true
+	default:
+		return false
+	}
 }
 
 // isScanKeyword reports whether a lowercased ident is a clause keyword that must
