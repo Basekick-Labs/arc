@@ -42,9 +42,12 @@ const (
 type scanPred struct {
 	col   string
 	op    string // = != < <= > >=  (comparison predicates)
-	num   string // integer literal text (isStr == false)
+	num   string // integer OR float literal text (isStr == false; float when isFloat)
 	str   string // string literal content (isStr == true)
 	isStr bool
+	// isFloat marks a DOUBLE-eq literal (2b-1b): num holds `digit.digit` text, op is
+	// `=`/`!=`, and it's never `±0.0` (declined at match time). Emitted verbatim.
+	isFloat bool
 	// Null-check predicates (col IS [NOT] NULL). When isNull is true, op/num/str are
 	// unused; negated distinguishes IS NOT NULL (true) from IS NULL (false).
 	isNull  bool
@@ -84,8 +87,8 @@ var tzInjectionTokens = []string{"time zone", "timezone", "at time zone"}
 // (min/max/count(col)). measurement is the bare FROM token as written.
 type matchResult struct {
 	shape       string
-	unit        string     // date_trunc agg only
-	col         string     // min/max/count(col) only
+	unit        string // date_trunc agg only
+	col         string // min/max/count(col) only
 	measurement string
 	cols        []string       // scan only: projected columns (as written)
 	preds       []scanPred     // scan only: AND-conjoined WHERE predicates

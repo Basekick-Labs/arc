@@ -87,8 +87,8 @@ type Decision struct {
 	Eligible bool
 	Ctx      arcxengine.Context
 	Shape    string
-	Unit     string     // date_trunc agg only
-	Col      string     // min/max/count(col) only — the bare column, user's spelling
+	Unit     string         // date_trunc agg only
+	Col      string         // min/max/count(col) only — the bare column, user's spelling
 	Cols     []string       // scan only: projected columns (as written)
 	Preds    []scanPred     // scan only: AND-conjoined WHERE predicates
 	OrderBy  []scanOrderKey // scan only: ORDER BY keys
@@ -316,6 +316,17 @@ func buildScanSQL(d Decision, pathArray string) (string, bool) {
 				b.WriteByte('\'')
 				b.WriteString(escapeStringLiteral(p.str))
 				b.WriteByte('\'')
+			} else if p.isFloat {
+				// DOUBLE-eq literal — validate the `digit.digit` shape and reject
+				// `±0.0` again at emit time (defense in depth vs a hand-built
+				// Decision); the op was constrained to `=`/`!=` at match time.
+				if !isFloatLiteral(p.num) || isZeroFloatLiteral(p.num) {
+					return "", false
+				}
+				if p.op != "=" && p.op != "!=" {
+					return "", false
+				}
+				b.WriteString(p.num)
 			} else {
 				if !isIntLiteral(p.num) {
 					return "", false

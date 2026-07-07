@@ -23,6 +23,7 @@ const (
 	tokIdent tokKind = iota // keyword or identifier, incl. dotted db.measurement
 	tokStr                  // single-quoted string literal (date_trunc unit, WHERE string literal)
 	tokNum                  // integer literal (GROUP BY 1, WHERE numeric literal, optional leading -)
+	tokFloat                // decimal float literal `digit.digit` (WHERE DOUBLE eq, optional leading -)
 	tokPunct                // one of ( ) * ,
 	tokOp                   // comparison operator: = != <> < <= > >= (scan WHERE)
 )
@@ -92,14 +93,14 @@ func tokenize(sql string) ([]token, bool) {
 				return nil, false // bare `!` is not in the vocabulary
 			}
 		case c == '-' && i+1 < n && isDigit(b[i+1]):
-			// Negative integer literal (e.g. a pre-1970 epoch in a WHERE). The sign
-			// is part of the token. A bare `-` (arithmetic) falls to default → decline.
+			// Negative integer or `digit.digit` float (e.g. a pre-1970 epoch, or a
+			// DOUBLE-eq literal). The sign is part of the token. A bare `-`
+			// (arithmetic) falls to default → decline.
 			start := i
 			i++ // consume '-'
-			for i < n && isDigit(b[i]) {
-				i++
-			}
-			toks = append(toks, token{kind: tokNum, orig: sql[start:i]})
+			var tok token
+			tok, i = lexNumber(sql, b, start, i, n)
+			toks = append(toks, tok)
 		case isAlpha(c) || c == '_':
 			// Identifier: letter/underscore start, then alnum/underscore/dot.
 			// A dot is allowed INSIDE an identifier so `mydb.cpu` is one token —
@@ -116,11 +117,9 @@ func tokenize(sql string) ([]token, bool) {
 			toks = append(toks, token{kind: tokIdent, lower: strings.ToLower(orig), orig: orig})
 		case isDigit(c):
 			start := i
-			i++
-			for i < n && isDigit(b[i]) {
-				i++
-			}
-			toks = append(toks, token{kind: tokNum, orig: sql[start:i]})
+			var tok token
+			tok, i = lexNumber(sql, b, start, i, n)
+			toks = append(toks, tok)
 		case c == '\'':
 			lit, next, ok := lexString(sql, i)
 			if !ok {
@@ -135,6 +134,26 @@ func tokenize(sql string) ([]token, bool) {
 		}
 	}
 	return toks, true
+}
+
+// lexNumber consumes the integer digit run beginning at i (start points at the
+// literal's first byte, possibly a leading '-'), then — only if a '.' is
+// IMMEDIATELY followed by a digit — the fractional part, producing a tokFloat.
+// Otherwise it's a tokNum (integer). This mirrors the arcx engine's lexer: only
+// `digit.digit` is a float; `5.` and `.5` are not (the '.' is left for the next
+// step, which then fails to match → decline). No exponent / inf / nan spelling.
+func lexNumber(sql string, b []byte, start, i, n int) (token, int) {
+	for i < n && isDigit(b[i]) {
+		i++
+	}
+	if i+1 < n && b[i] == '.' && isDigit(b[i+1]) {
+		i++ // consume '.'
+		for i < n && isDigit(b[i]) {
+			i++
+		}
+		return token{kind: tokFloat, orig: sql[start:i]}, i
+	}
+	return token{kind: tokNum, orig: sql[start:i]}, i
 }
 
 // lexString reads a single-quoted literal starting at start (a '). ” is an
@@ -164,6 +183,55 @@ func lexString(sql string, start int) (string, int, bool) {
 func isAlpha(c byte) bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
 func isDigit(c byte) bool { return c >= '0' && c <= '9' }
 func isAlnum(c byte) bool { return isAlpha(c) || isDigit(c) }
+
+// isFloatLiteral reports whether s is exactly `digit.digit` (optional leading '-'),
+// matching what the tokenizer's tokFloat produces — one '.' with at least one digit
+// on each side, no exponent / inf / nan. This is the SQL the engine's lexer accepts.
+// Lives here (untagged) so both the recognizer and buildScanSQL can call it.
+func isFloatLiteral(s string) bool {
+	if s == "" {
+		return false
+	}
+	i := 0
+	if s[0] == '-' {
+		i = 1
+	}
+	dot := -1
+	digitsBefore, digitsAfter := 0, 0
+	for ; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '.':
+			if dot != -1 {
+				return false // more than one '.'
+			}
+			dot = i
+		case c >= '0' && c <= '9':
+			if dot == -1 {
+				digitsBefore++
+			} else {
+				digitsAfter++
+			}
+		default:
+			return false
+		}
+	}
+	return dot != -1 && digitsBefore > 0 && digitsAfter > 0
+}
+
+// isZeroFloatLiteral reports whether a `digit.digit` float literal is `±0.0` in
+// value (any spelling: 0.0, -0.0, 00.000, …). The engine declines these because
+// arrow total_cmp separates +0.0/-0.0 while DuckDB treats them equal, so the router
+// must not route them. Assumes s already passed isFloatLiteral.
+func isZeroFloatLiteral(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= '1' && c <= '9' {
+			return false
+		}
+	}
+	return true
+}
 
 // --- matchers -------------------------------------------------------------
 
@@ -462,6 +530,18 @@ func matchScan(toks []token) (cols []string, preds []scanPred, orderBy []scanOrd
 				switch litT.kind {
 				case tokNum:
 					preds = append(preds, scanPred{col: colT.orig, op: opStr, num: litT.orig, isStr: false})
+				case tokFloat:
+					// DOUBLE eq (2b-1b). Mirror the engine's binder guards so the
+					// router never routes a float shape the engine declines: Eq/Ne
+					// only, and a `±0.0` literal declines (arrow total_cmp vs DuckDB
+					// signed-zero). Any other case → decline (fall to DuckDB).
+					if opStr != "=" && opStr != "!=" {
+						return fail()
+					}
+					if isZeroFloatLiteral(litT.orig) {
+						return fail()
+					}
+					preds = append(preds, scanPred{col: colT.orig, op: opStr, num: litT.orig, isFloat: true})
 				case tokStr:
 					preds = append(preds, scanPred{col: colT.orig, op: opStr, str: litT.str, isStr: true})
 				default:

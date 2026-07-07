@@ -44,6 +44,18 @@ func TestBuildScanSQL(t *testing.T) {
 			"['/a.parquet']",
 			"SELECT code FROM read_parquet(['/a.parquet']) WHERE code >= 5 AND host = 'web'",
 		},
+		{
+			"float equality (2b-1b)",
+			Decision{Shape: ShapeScan, Cols: []string{"value"}, Preds: []scanPred{{col: "value", op: "=", num: "99.5", isFloat: true}}},
+			"['/a.parquet']",
+			"SELECT value FROM read_parquet(['/a.parquet']) WHERE value = 99.5",
+		},
+		{
+			"float inequality-of-equals (!=) with negative literal",
+			Decision{Shape: ShapeScan, Cols: []string{"value"}, Preds: []scanPred{{col: "value", op: "!=", num: "-2.25", isFloat: true}}},
+			"['/a.parquet']",
+			"SELECT value FROM read_parquet(['/a.parquet']) WHERE value != -2.25",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -63,11 +75,14 @@ func TestBuildScanSQL_DeclinesUnsafe(t *testing.T) {
 	// than emit unsafe SQL (the tokenizer wouldn't produce these, but the guard is
 	// the last line before SQL-string interpolation).
 	bad := []Decision{
-		{Shape: ShapeScan, Cols: nil},                                                            // empty projection
-		{Shape: ShapeScan, Cols: []string{"a b"}},                                                // space in col
-		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a;drop", op: "=", num: "1"}}}, // injection-y col
-		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "LIKE", num: "1"}}},   // bad op
-		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "=", num: "1x"}}},     // bad int literal
+		{Shape: ShapeScan, Cols: nil},             // empty projection
+		{Shape: ShapeScan, Cols: []string{"a b"}}, // space in col
+		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a;drop", op: "=", num: "1"}}},              // injection-y col
+		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "LIKE", num: "1"}}},                // bad op
+		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "=", num: "1x"}}},                  // bad int literal
+		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "=", num: "1.2x", isFloat: true}}}, // bad float literal
+		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "=", num: "0.0", isFloat: true}}},  // ±0.0 float (declines defense-in-depth)
+		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "<", num: "1.5", isFloat: true}}},  // float inequality op
 	}
 	for i, d := range bad {
 		if _, ok := buildScanSQL(d, "['/a.parquet']"); ok {

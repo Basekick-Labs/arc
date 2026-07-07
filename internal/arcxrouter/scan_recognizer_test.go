@@ -77,6 +77,45 @@ func TestMatchScan_Between(t *testing.T) {
 	}
 }
 
+func TestMatchScan_DoubleEquality(t *testing.T) {
+	// DOUBLE eq (2b-1b): `= f` / `!= f` with a `digit.digit` float literal is accepted
+	// as a scan pred (isFloat), mirroring the engine binder. The router recognizes the
+	// SHAPE; the engine is the type authority (a float literal on a non-DOUBLE column
+	// declines at bind time → DuckDB).
+	m, ok := eligibleShape("SELECT host FROM cpu WHERE value = 99.5")
+	if !ok || m.shape != ShapeScan || len(m.preds) != 1 {
+		t.Fatalf("float eq should be scan-eligible with 1 pred: ok=%v %+v", ok, m.preds)
+	}
+	p := m.preds[0]
+	if p.op != "=" || p.num != "99.5" || !p.isFloat || p.isStr {
+		t.Fatalf("float eq pred wrong: %+v", p)
+	}
+	// `!=`, negative literal, and mixed with another AND pred.
+	if m2, ok := eligibleShape("SELECT a FROM cpu WHERE value != -2.25 AND host = 'web'"); !ok ||
+		len(m2.preds) != 2 || !m2.preds[0].isFloat || m2.preds[0].num != "-2.25" {
+		t.Fatalf("float ne + and wrong: ok=%v %+v", ok, m2.preds)
+	}
+
+	// Declines the router must make (mirror the engine so it never routes a decline):
+	decline := []string{
+		"SELECT a FROM cpu WHERE value < 1.5",               // DOUBLE inequality (NaN-ordering, 2b-4)
+		"SELECT a FROM cpu WHERE value > 1.5",               // "
+		"SELECT a FROM cpu WHERE value <= 1.5",              // "
+		"SELECT a FROM cpu WHERE value = 0.0",               // ±0.0 (signed-zero divergence)
+		"SELECT a FROM cpu WHERE value = -0.0",              // "
+		"SELECT a FROM cpu WHERE value != 0.0",              // "
+		"SELECT a FROM cpu WHERE value = 00.000",            // ±0.0 alt spelling
+		"SELECT a FROM cpu WHERE value BETWEEN 1.0 AND 2.0", // float BETWEEN (Ge/Le → decline)
+		"SELECT a FROM cpu WHERE value = 5.",                // `digit.` not a float token → junk
+		"SELECT a FROM cpu WHERE value = .5",                // `.digit` not a float token → junk
+	}
+	for _, sql := range decline {
+		if m, ok := eligibleShape(sql); ok && m.shape == ShapeScan {
+			t.Fatalf("expected NOT scan-eligible: %q (preds=%+v)", sql, m.preds)
+		}
+	}
+}
+
 func TestMatchScan_OrderByLimit(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -116,21 +155,21 @@ func TestMatchScan_Declines(t *testing.T) {
 	// Each must NOT be recognized as a scan (either declines entirely or matches a
 	// different, more-specific shape). The engine's 2a scan doesn't answer these.
 	decline := []string{
-		"SELECT * FROM cpu",                                  // star not routed (drift-unprovable)
-		"SELECT *, host FROM cpu",                            // star mixed
-		"SELECT host FROM cpu WHERE a = 1 OR b = 2",          // OR (2b)
-		"SELECT host FROM cpu WHERE a IN (1,2)",              // IN (2b) — `in` is an ident, IN(...) not our grammar
-		"SELECT host FROM cpu WHERE a LIKE 'x'",              // LIKE (2b)
-		"SELECT lower(host) FROM cpu",                        // function in projection (2b)
-		"SELECT host FROM cpu LIMIT 10",                      // LIMIT without ORDER BY (nondeterministic)
-		"SELECT host FROM cpu ORDER BY host LIMIT 0",         // LIMIT 0 routed to DuckDB
-		"SELECT host FROM cpu ORDER BY 1",                    // positional ORDER BY (agg shape, not scan)
-		"SELECT host AS h FROM cpu",                          // alias
-		"SELECT host FROM cpu GROUP BY host",                 // GROUP BY (Phase 3)
-		"SELECT host FROM cpu WHERE code >",                  // predicate missing literal
-		"SELECT host FROM cpu WHERE code > 1 EXTRA",          // trailing junk
-		"SELECT FROM cpu",                                    // empty projection
-		"SELECT from FROM cpu",                               // keyword-as-column
+		"SELECT * FROM cpu",                          // star not routed (drift-unprovable)
+		"SELECT *, host FROM cpu",                    // star mixed
+		"SELECT host FROM cpu WHERE a = 1 OR b = 2",  // OR (2b)
+		"SELECT host FROM cpu WHERE a IN (1,2)",      // IN (2b) — `in` is an ident, IN(...) not our grammar
+		"SELECT host FROM cpu WHERE a LIKE 'x'",      // LIKE (2b)
+		"SELECT lower(host) FROM cpu",                // function in projection (2b)
+		"SELECT host FROM cpu LIMIT 10",              // LIMIT without ORDER BY (nondeterministic)
+		"SELECT host FROM cpu ORDER BY host LIMIT 0", // LIMIT 0 routed to DuckDB
+		"SELECT host FROM cpu ORDER BY 1",            // positional ORDER BY (agg shape, not scan)
+		"SELECT host AS h FROM cpu",                  // alias
+		"SELECT host FROM cpu GROUP BY host",         // GROUP BY (Phase 3)
+		"SELECT host FROM cpu WHERE code >",          // predicate missing literal
+		"SELECT host FROM cpu WHERE code > 1 EXTRA",  // trailing junk
+		"SELECT FROM cpu",                            // empty projection
+		"SELECT from FROM cpu",                       // keyword-as-column
 	}
 	for _, sql := range decline {
 		t.Run(sql, func(t *testing.T) {
