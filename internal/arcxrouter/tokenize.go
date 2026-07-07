@@ -352,8 +352,9 @@ func (c *cursor) peekIdentLower() string {
 //   - projection is an explicit, non-empty BARE-COLUMN list. `*` is NOT routed
 //     (the engine declines SELECT * under schema drift, which the router can't
 //     detect ahead of the files — so star scans stay on DuckDB).
-//   - WHERE is AND-conjoined `<col> <op> <literal>` only; OR/IN/LIKE/BETWEEN/
-//     functions/arithmetic all fall outside the vocabulary → decline.
+//   - WHERE is AND-conjoined `<col> <op> <literal>` / `<col> IS [NOT] NULL` /
+//     `<col> BETWEEN lo AND hi` (desugared to two `>=`/`<=` preds). OR/IN/LIKE/
+//     functions/arithmetic fall outside the vocabulary → decline.
 //   - no ORDER BY / LIMIT (the engine declines them in 2a). Anything trailing
 //     the (optional) WHERE declines.
 //
@@ -404,7 +405,7 @@ func matchScan(toks []token) (cols []string, preds []scanPred, orderBy []scanOrd
 			if !ok || colT.kind != tokIdent || isScanKeyword(colT.lower) {
 				return fail()
 			}
-			// Branch: `IS [NOT] NULL` vs `<op> <literal>`.
+			// Branch: `IS [NOT] NULL` / `BETWEEN lo AND hi` / `<op> <literal>`.
 			if c.peekIdentLower() == "is" {
 				c.next() // consume `is`
 				negated := false
@@ -417,6 +418,38 @@ func matchScan(toks []token) (cols []string, preds []scanPred, orderBy []scanOrd
 				}
 				c.next() // consume `null`
 				preds = append(preds, scanPred{col: colT.orig, isNull: true, negated: negated})
+			} else if c.peekIdentLower() == "between" {
+				// `col BETWEEN lo AND hi` → desugar to two preds (col >= lo, col <= hi),
+				// matching arcx's binder exactly so buildScanSQL and the engine agree. The
+				// INNER `and` is consumed EAGERLY here so the outer AND-chain loop never
+				// mistakes it for a conjunction. NOT BETWEEN isn't reachable (a leading
+				// `not` isn't a valid bare-column token) — it declines upstream.
+				c.next() // consume `between`
+				loT, ok := c.next()
+				if !ok || (loT.kind != tokNum && loT.kind != tokStr) {
+					return fail()
+				}
+				if c.peekIdentLower() != "and" {
+					return fail()
+				}
+				c.next() // consume the INNER `and`
+				hiT, ok := c.next()
+				if !ok || (hiT.kind != tokNum && hiT.kind != tokStr) {
+					return fail()
+				}
+				lo := scanPred{col: colT.orig, op: ">="}
+				hi := scanPred{col: colT.orig, op: "<="}
+				if loT.kind == tokStr {
+					lo.str, lo.isStr = loT.str, true
+				} else {
+					lo.num = loT.orig
+				}
+				if hiT.kind == tokStr {
+					hi.str, hi.isStr = hiT.str, true
+				} else {
+					hi.num = hiT.orig
+				}
+				preds = append(preds, lo, hi)
 			} else {
 				opStr, ok := c.op()
 				if !ok {

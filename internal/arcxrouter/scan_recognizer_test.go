@@ -53,6 +53,30 @@ func TestMatchScan_Accepts(t *testing.T) {
 	}
 }
 
+func TestMatchScan_Between(t *testing.T) {
+	// BETWEEN desugars to two preds (col >= lo, col <= hi), matching arcx's binder.
+	m, ok := eligibleShape("SELECT host FROM cpu WHERE code BETWEEN 5 AND 20")
+	if !ok || m.shape != ShapeScan {
+		t.Fatalf("BETWEEN should be scan-eligible")
+	}
+	if len(m.preds) != 2 {
+		t.Fatalf("BETWEEN -> %d preds, want 2: %+v", len(m.preds), m.preds)
+	}
+	if m.preds[0].op != ">=" || m.preds[0].num != "5" || m.preds[1].op != "<=" || m.preds[1].num != "20" {
+		t.Fatalf("BETWEEN desugar wrong: %+v", m.preds)
+	}
+	// Inner AND is not confused with the conjunction AND: `BETWEEN 1 AND 2 AND host='x'`
+	// -> 3 preds (>=1, <=2, host='x').
+	m2, ok := eligibleShape("SELECT a FROM cpu WHERE code BETWEEN 1 AND 2 AND host = 'web'")
+	if !ok || len(m2.preds) != 3 {
+		t.Fatalf("chained BETWEEN+AND -> want 3 preds, got %+v", m2.preds)
+	}
+	// NOT BETWEEN declines (a leading NOT isn't a bare column → not scan-eligible).
+	if m3, ok := eligibleShape("SELECT a FROM cpu WHERE code NOT BETWEEN 1 AND 2"); ok && m3.shape == ShapeScan {
+		t.Fatalf("NOT BETWEEN should decline")
+	}
+}
+
 func TestMatchScan_OrderByLimit(t *testing.T) {
 	cases := []struct {
 		name      string
