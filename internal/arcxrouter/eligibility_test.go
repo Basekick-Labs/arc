@@ -143,6 +143,10 @@ func TestEligibleShape_Declines(t *testing.T) {
 		{"set timezone", "SET TimeZone='America/New_York'; SELECT count(*) FROM cpu"},
 		{"at time zone", "SELECT count(*) FROM cpu WHERE time AT TIME ZONE 'UTC' > now()"},
 
+		// --- collation declines (2b-4): byte-wise == DuckDB only under default BINARY ---
+		{"collate clause", "SELECT host FROM cpu WHERE host < 'm' COLLATE NOCASE"},
+		{"set default_collation", "SET default_collation='nocase'; SELECT host FROM cpu WHERE host < 'm'"},
+
 		// --- structural / vocabulary declines ---
 		{"multiple statements", "SELECT count(*) FROM cpu; SELECT count(*) FROM mem"},
 		{"empty", ""},

@@ -56,6 +56,21 @@ func TestBuildScanSQL(t *testing.T) {
 			"['/a.parquet']",
 			"SELECT value FROM read_parquet(['/a.parquet']) WHERE value != -2.25",
 		},
+		{
+			"float inequality < (2b-4)",
+			Decision{Shape: ShapeScan, Cols: []string{"value"}, Preds: []scanPred{{col: "value", op: "<", num: "1.5", isFloat: true}}},
+			"['/a.parquet']",
+			"SELECT value FROM read_parquet(['/a.parquet']) WHERE value < 1.5",
+		},
+		{
+			"float BETWEEN desugared to two float preds (2b-4)",
+			Decision{Shape: ShapeScan, Cols: []string{"value"}, Preds: []scanPred{
+				{col: "value", op: ">=", num: "1.5", isFloat: true},
+				{col: "value", op: "<=", num: "3.5", isFloat: true},
+			}},
+			"['/a.parquet']",
+			"SELECT value FROM read_parquet(['/a.parquet']) WHERE value >= 1.5 AND value <= 3.5",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -81,8 +96,8 @@ func TestBuildScanSQL_DeclinesUnsafe(t *testing.T) {
 		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "LIKE", num: "1"}}},                // bad op
 		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "=", num: "1x"}}},                  // bad int literal
 		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "=", num: "1.2x", isFloat: true}}}, // bad float literal
-		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "=", num: "0.0", isFloat: true}}},  // ±0.0 float (declines defense-in-depth)
-		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "<", num: "1.5", isFloat: true}}},  // float inequality op
+		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "=", num: "0.0", isFloat: true}}}, // ±0.0 float (declines defense-in-depth)
+		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "<", num: "0.0", isFloat: true}}}, // ±0.0 inequality still declines (2b-4)
 	}
 	for i, d := range bad {
 		if _, ok := buildScanSQL(d, "['/a.parquet']"); ok {

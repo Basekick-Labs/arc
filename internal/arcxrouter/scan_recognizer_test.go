@@ -221,23 +221,73 @@ func TestMatchScan_DoubleEquality(t *testing.T) {
 		t.Fatalf("float ne + and wrong: ok=%v %+v", ok, m2.preds)
 	}
 
-	// Declines the router must make (mirror the engine so it never routes a decline):
+	// 2b-4: DOUBLE inequality now ROUTES on a finite (non-±0.0) float literal — arrow
+	// total_cmp == DuckDB ordering. All four ops + float BETWEEN (desugared Ge/Le).
+	accept := []struct {
+		sql string
+		op  string
+	}{
+		{"SELECT a FROM cpu WHERE value < 1.5", "<"},
+		{"SELECT a FROM cpu WHERE value > 1.5", ">"},
+		{"SELECT a FROM cpu WHERE value <= 1.5", "<="},
+		{"SELECT a FROM cpu WHERE value >= 1.5", ">="},
+	}
+	for _, tc := range accept {
+		m, ok := eligibleShape(tc.sql)
+		if !ok || m.shape != ShapeScan || len(m.preds) != 1 || !m.preds[0].isFloat || m.preds[0].op != tc.op {
+			t.Fatalf("float inequality should route (op=%s): ok=%v %+v", tc.op, ok, m.preds)
+		}
+	}
+	// Float BETWEEN desugars in the flat path to two isFloat preds (`>= lo`, `<= hi`).
+	if m, ok := eligibleShape("SELECT a FROM cpu WHERE value BETWEEN 1.0 AND 2.0"); !ok ||
+		m.shape != ShapeScan || len(m.preds) != 2 ||
+		!m.preds[0].isFloat || m.preds[0].op != ">=" || m.preds[0].num != "1.0" ||
+		!m.preds[1].isFloat || m.preds[1].op != "<=" || m.preds[1].num != "2.0" {
+		t.Fatalf("float BETWEEN should desugar to 2 float preds (2b-4): ok=%v %+v", ok, m.preds)
+	}
+	// A ±0.0 float BETWEEN bound declines (the desugared `>= 0.0` fires the guard).
+	if m, ok := eligibleShape("SELECT a FROM cpu WHERE value BETWEEN 0.0 AND 2.0"); ok && m.shape == ShapeScan {
+		t.Fatalf("±0.0 float BETWEEN bound should decline: %+v", m.preds)
+	}
+
+	// Declines the router must STILL make (mirror the engine so it never routes a decline):
 	decline := []string{
-		"SELECT a FROM cpu WHERE value < 1.5",               // DOUBLE inequality (NaN-ordering, 2b-4)
-		"SELECT a FROM cpu WHERE value > 1.5",               // "
-		"SELECT a FROM cpu WHERE value <= 1.5",              // "
-		"SELECT a FROM cpu WHERE value = 0.0",               // ±0.0 (signed-zero divergence)
-		"SELECT a FROM cpu WHERE value = -0.0",              // "
-		"SELECT a FROM cpu WHERE value != 0.0",              // "
-		"SELECT a FROM cpu WHERE value = 00.000",            // ±0.0 alt spelling
-		"SELECT a FROM cpu WHERE value BETWEEN 1.0 AND 2.0", // float BETWEEN (Ge/Le → decline)
-		"SELECT a FROM cpu WHERE value = 5.",                // `digit.` not a float token → junk
-		"SELECT a FROM cpu WHERE value = .5",                // `.digit` not a float token → junk
+		"SELECT a FROM cpu WHERE value = 0.0",    // ±0.0 (signed-zero divergence) — all ops
+		"SELECT a FROM cpu WHERE value = -0.0",   // "
+		"SELECT a FROM cpu WHERE value != 0.0",   // "
+		"SELECT a FROM cpu WHERE value < 0.0",    // ±0.0 inequality (2b-4 widened the guard)
+		"SELECT a FROM cpu WHERE value >= -0.0",  // "
+		"SELECT a FROM cpu WHERE value = 00.000", // ±0.0 alt spelling
+		"SELECT a FROM cpu WHERE value = 5.",     // `digit.` not a float token → junk
+		"SELECT a FROM cpu WHERE value = .5",     // `.digit` not a float token → junk
 	}
 	for _, sql := range decline {
 		if m, ok := eligibleShape(sql); ok && m.shape == ShapeScan {
 			t.Fatalf("expected NOT scan-eligible: %q (preds=%+v)", sql, m.preds)
 		}
+	}
+}
+
+func TestMatchScan_StringInequality(t *testing.T) {
+	// 2b-4: string `<`/`>`/`<=`/`>=` route (the flat `tokStr` arm has no op restriction;
+	// arcx compares byte-wise == DuckDB default BINARY collation). The collation guard in
+	// eligibleShape defends the in-query COLLATE case (see TestEligibleShape_Declines).
+	for _, op := range []string{"<", ">", "<=", ">="} {
+		sql := "SELECT code FROM cpu WHERE host " + op + " 'm'"
+		m, ok := eligibleShape(sql)
+		if !ok || m.shape != ShapeScan || len(m.preds) != 1 {
+			t.Fatalf("string inequality should route (op=%s): ok=%v %+v", op, ok, m.preds)
+		}
+		p := m.preds[0]
+		if p.op != op || !p.isStr || p.str != "m" {
+			t.Fatalf("string inequality pred wrong (op=%s): %+v", op, p)
+		}
+	}
+	// String BETWEEN desugars in the flat path to two isStr preds (`>= lo`, `<= hi`).
+	if m, ok := eligibleShape("SELECT code FROM cpu WHERE host BETWEEN 'a' AND 'm'"); !ok ||
+		m.shape != ShapeScan || len(m.preds) != 2 ||
+		!m.preds[0].isStr || m.preds[0].op != ">=" || m.preds[1].op != "<=" {
+		t.Fatalf("string BETWEEN should desugar to 2 str preds (2b-4): ok=%v %+v", ok, m.preds)
 	}
 }
 

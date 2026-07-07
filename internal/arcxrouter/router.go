@@ -325,13 +325,11 @@ func buildScanSQL(d Decision, pathArray string) (string, bool) {
 				b.WriteString(escapeStringLiteral(p.str))
 				b.WriteByte('\'')
 			} else if p.isFloat {
-				// DOUBLE-eq literal — validate the `digit.digit` shape and reject
-				// `±0.0` again at emit time (defense in depth vs a hand-built
-				// Decision); the op was constrained to `=`/`!=` at match time.
+				// DOUBLE comparison literal — validate the `digit.digit` shape and reject
+				// `±0.0` again at emit time (defense in depth vs a hand-built Decision).
+				// As of 2b-4 all six ops are allowed (arrow total_cmp == DuckDB); only the
+				// ±0.0 literal stays rejected (signed-zero divergence, all ops).
 				if !isFloatLiteral(p.num) || isZeroFloatLiteral(p.num) {
-					return "", false
-				}
-				if p.op != "=" && p.op != "!=" {
 					return "", false
 				}
 				b.WriteString(p.num)

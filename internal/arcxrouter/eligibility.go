@@ -82,6 +82,16 @@ var supportedUnits = map[string]bool{
 // against a query that smuggles a session-TZ change in the SQL body.
 var tzInjectionTokens = []string{"time zone", "timezone", "at time zone"}
 
+// collationTokens force a decline for the same class of reason as tzInjectionTokens,
+// but for string ordering (2b-4). arcx compares strings byte-wise, which equals DuckDB
+// ONLY under the default BINARY collation. A `COLLATE` clause or an in-query
+// `default_collation` change makes DuckDB order differently (e.g. NOCASE/ICU), so any
+// string inequality/BETWEEN answer would silently diverge. Decline whenever the SQL body
+// mentions collation. NOTE: this guards only the in-query case — an out-of-band
+// `SET default_collation` on the pooled DuckDB connection is invisible here and must be
+// upheld by Arc keeping its pooled session at default BINARY collation (2b-4 review H1).
+var collationTokens = []string{"collate", "default_collation"}
+
 // matchResult is what eligibleShape resolves a recognized query into. `unit` is
 // set only for the date_trunc agg; `col` only for the scalar column aggregates
 // (min/max/count(col)). measurement is the bare FROM token as written.
@@ -110,6 +120,14 @@ func eligibleShape(sql string) (matchResult, bool) {
 	// differently, so the scalar timestamp shapes inherit the exclusion.
 	low := strings.ToLower(sql)
 	for _, t := range tzInjectionTokens {
+		if strings.Contains(low, t) {
+			return matchResult{}, false
+		}
+	}
+	// Collation guard (2b-4): arcx's byte-wise string comparison equals DuckDB only under
+	// the default BINARY collation. Any in-query collation mention makes string ordering
+	// potentially non-BINARY and thus ineligible.
+	for _, t := range collationTokens {
 		if strings.Contains(low, t) {
 			return matchResult{}, false
 		}
