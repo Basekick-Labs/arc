@@ -21,6 +21,22 @@ func NewPathResolver(backend storage.Backend) *PathResolver {
 	return &PathResolver{backend: backend}
 }
 
+// DefaultWarehouse returns the Iceberg warehouse root for a backend when none is configured:
+// the storage root, so table metadata lands alongside the data (file:// local, s3://bucket/
+// prefix for object storage). Iceberg writes {warehouse}/{namespace}.db/{table}/metadata/...
+func DefaultWarehouse(backend storage.Backend) string {
+	switch b := backend.(type) {
+	case *storage.S3Backend:
+		return strings.TrimSuffix("s3://"+b.GetBucket()+"/"+b.GetPrefix(), "/")
+	case *storage.AzureBlobBackend:
+		return "azure://" + b.GetContainer()
+	case *storage.LocalBackend:
+		return "file://" + b.GetBasePath()
+	default:
+		return "file://./data"
+	}
+}
+
 // Resolve returns the iceberg-readable URI for a storage-relative key.
 func (r *PathResolver) Resolve(relativeKey string) string {
 	key := strings.TrimPrefix(relativeKey, "/")

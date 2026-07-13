@@ -58,6 +58,38 @@ func SchemaFromParquet(localPath string) (ArcSchema, error) {
 	return ArcSchema{Fields: fields}, nil
 }
 
+// UnionSchema derives the union of column schemas across multiple local Parquet files.
+// Arc's ingest is schema-flexible: files for the same measurement can have different column
+// sets over time (a metric added later). The Iceberg table must carry the SUPERSET so both
+// narrow and wide files pass AddFiles (a column absent from a file reads as NULL, since all
+// fields are optional). Column order follows first-seen; a name seen again must have a
+// matching type (a genuine type conflict is returned as an error rather than silently picked).
+func UnionSchema(localPaths []string) (ArcSchema, error) {
+	seen := make(map[string]iceberg.Type)
+	var order []string
+	for _, p := range localPaths {
+		sc, err := SchemaFromParquet(p)
+		if err != nil {
+			return ArcSchema{}, err
+		}
+		for _, f := range sc.Fields {
+			if prev, ok := seen[f.Name]; ok {
+				if prev.String() != f.Type.String() {
+					return ArcSchema{}, fmt.Errorf("column %q has conflicting types across files: %s vs %s", f.Name, prev, f.Type)
+				}
+				continue
+			}
+			seen[f.Name] = f.Type
+			order = append(order, f.Name)
+		}
+	}
+	fields := make([]ArcField, len(order))
+	for i, name := range order {
+		fields[i] = ArcField{Name: name, Type: seen[name]}
+	}
+	return ArcSchema{Fields: fields}, nil
+}
+
 // arrowToIceberg maps one Arrow type to its Iceberg type per the table above.
 func arrowToIceberg(t arrow.DataType) (iceberg.Type, error) {
 	switch dt := t.(type) {

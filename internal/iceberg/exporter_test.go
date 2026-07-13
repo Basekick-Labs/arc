@@ -39,6 +39,9 @@ func writeArcStyleParquet(t *testing.T, path string, baseTS int64, n int) {
 	rec := b.NewRecord()
 	defer rec.Release()
 
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	f, err := os.Create(path)
 	if err != nil {
 		t.Fatal(err)
@@ -138,6 +141,87 @@ func TestReconcile_AddIdempotentSupersede(t *testing.T) {
 	}
 	if len(files) != 1 {
 		t.Fatalf("after supersede: want exactly 1 file, got %v", files)
+	}
+}
+
+// writeArcStyleParquet4Col writes a file with an extra column (cpu_idle) to exercise schema
+// evolution — matches what Arc's schema-flexible ingest produces when a metric is added.
+func writeArcStyleParquet4Col(t *testing.T, path string, baseTS int64, n int) {
+	t.Helper()
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "time", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "host", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "value", Type: arrow.PrimitiveTypes.Float64, Nullable: true},
+		{Name: "cpu_idle", Type: arrow.PrimitiveTypes.Float64, Nullable: true},
+	}, nil)
+	b := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer b.Release()
+	b.Field(0).(*array.TimestampBuilder).Append(arrow.Timestamp(baseTS))
+	b.Field(1).(*array.StringBuilder).Append("h")
+	b.Field(2).(*array.Float64Builder).Append(1)
+	b.Field(3).(*array.Float64Builder).Append(2)
+	rec := b.NewRecord()
+	defer rec.Release()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := os.Create(path)
+	defer f.Close()
+	w, _ := pqarrow.NewFileWriter(schema, f, parquet.NewWriterProperties(parquet.WithCompression(0)),
+		pqarrow.NewArrowWriterProperties(pqarrow.WithStoreSchema()))
+	if err := w.Write(rec); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+}
+
+// TestReconcile_SchemaEvolution reproduces the bug the running binary caught: a narrow file
+// (3 cols) creates the table, then a wider file (4 cols, +cpu_idle) is reconciled. Without
+// schema evolution, AddFiles fails "field missing from name mapping: cpu_idle". With union
+// schema + evolveSchema, the table widens and both files register.
+func TestReconcile_SchemaEvolution(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	narrow := filepath.Join(dir, "cpu_narrow.parquet")
+	wide := filepath.Join(dir, "cpu_wide.parquet")
+	base := int64(1_700_000_000_000_000)
+	writeArcStyleParquet(t, narrow, base, 10)        // time, host, value
+	writeArcStyleParquet4Col(t, wide, base+1000, 10) // + cpu_idle
+
+	db, err := sql.Open("sqlite3", filepath.Join(dir, "c.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	exp, err := NewExporter(db, "file://"+dir+"/wh", "arc", zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Create the table from the NARROW schema (first file only).
+	narrowSc, _ := SchemaFromParquet(narrow)
+	if err := exp.ReconcileMeasurement(ctx, "mydb", "cpu", narrowSc, []FileRef{{PhysicalPath: fileURI(narrow)}}); err != nil {
+		t.Fatalf("reconcile narrow: %v", err)
+	}
+
+	// 2. Now reconcile with the UNION schema + BOTH files (the wide one has cpu_idle).
+	unionSc, err := UnionSchema([]string{narrow, wide})
+	if err != nil {
+		t.Fatalf("UnionSchema: %v", err)
+	}
+	if err := exp.ReconcileMeasurement(ctx, "mydb", "cpu", unionSc,
+		[]FileRef{{PhysicalPath: fileURI(narrow)}, {PhysicalPath: fileURI(wide)}}); err != nil {
+		t.Fatalf("reconcile wide (schema evolution): %v", err)
+	}
+
+	// Both files must be in the table, and the schema must now include cpu_idle.
+	lt, _ := exp.EnsureTable(ctx, "mydb", "cpu", unionSc)
+	files, _ := exp.tableDataFiles(ctx, lt)
+	if len(files) != 2 {
+		t.Fatalf("want 2 files after evolution, got %d: %v", len(files), files)
+	}
+	if _, ok := lt.Schema().FindFieldByName("cpu_idle"); !ok {
+		t.Fatalf("table schema missing cpu_idle after evolution: %v", lt.Schema())
 	}
 }
 

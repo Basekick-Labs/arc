@@ -30,6 +30,7 @@ import (
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/fips"
 	"github.com/basekick-labs/arc/internal/governance"
+	"github.com/basekick-labs/arc/internal/iceberg"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/logger"
@@ -2263,6 +2264,50 @@ func main() {
 		log.Info().Msg("Retention policies DISABLED")
 	}
 
+	// Iceberg export (opt-in). Publishes Arc's existing Parquet as Iceberg tables via a
+	// periodic reconciler that walks storage — works in OSS and cluster, no tiering/Raft
+	// dependency. Wired OUTSIDE the cluster block so it runs in standalone mode.
+	if cfg.Iceberg.Enabled {
+		icebergDBPath := cfg.Iceberg.CatalogDBPath
+		if icebergDBPath == "" {
+			icebergDBPath = cfg.Auth.DBPath // shared SQLite DB
+		}
+		icebergDB, err := sql.Open("sqlite3", icebergDBPath)
+		if err != nil {
+			log.Fatal().Err(err).Str("path", icebergDBPath).Msg("Failed to open Iceberg catalog DB")
+		}
+		// Default the warehouse to the storage root when unset, so table metadata lands
+		// alongside the data (file:// for local; s3://bucket/prefix for object storage).
+		warehouse := cfg.Iceberg.Warehouse
+		if warehouse == "" {
+			warehouse = iceberg.DefaultWarehouse(storageBackend)
+		}
+		exporter, err := iceberg.NewExporter(icebergDB, warehouse, cfg.Iceberg.NamespacePrefix, logger.Get("iceberg"))
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to initialize Iceberg exporter")
+		}
+		icebergSource := iceberg.NewStorageWalkSource(storageBackend)
+		// Writer gate: in cluster mode reuse the compaction gate (single active writer);
+		// nil in OSS (single node, always runs).
+		var icebergGate iceberg.WriterGate
+		if compactionGate != nil {
+			icebergGate = icebergWriterGate{compactionGate}
+		}
+		icebergScheduler := iceberg.NewScheduler(iceberg.SchedulerConfig{
+			Exporter: exporter,
+			Source:   icebergSource,
+			Interval: time.Duration(cfg.Iceberg.ReconcileInterval) * time.Second,
+			Gate:     icebergGate,
+			Logger:   logger.Get("iceberg"),
+		})
+		icebergScheduler.Start()
+		shutdownCoordinator.RegisterHook("iceberg", func(ctx context.Context) error {
+			icebergScheduler.Stop()
+			return icebergDB.Close()
+		}, shutdown.PriorityDatabase)
+		log.Info().Str("warehouse", warehouse).Int("interval_s", cfg.Iceberg.ReconcileInterval).Msg("Iceberg export enabled")
+	}
+
 	// Register Continuous Query handler
 	var cqHandler *api.ContinuousQueryHandler
 	if cfg.ContinuousQuery.Enabled {
@@ -2909,6 +2954,14 @@ func (g *compactionClusterGate) CanCompact() bool {
 func (g *compactionClusterGate) Role() string {
 	return string(g.role)
 }
+
+// icebergWriterGate adapts the compaction cluster gate to iceberg.WriterGate: the Iceberg
+// reconciler is a singleton writer-only operation, so it runs where compaction runs (the
+// active compactor). In OSS the compaction gate is nil, so the adapter is not constructed and
+// the reconciler runs unconditionally (single node).
+type icebergWriterGate struct{ inner compaction.ClusterGate }
+
+func (g icebergWriterGate) CanRun() bool { return g.inner.CanCompact() }
 
 // reconciliationClusterGate implements reconciliation.Gate. The two halves
 // of a reconcile run (storage scan, manifest sweep) have different gating

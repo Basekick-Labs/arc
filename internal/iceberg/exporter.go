@@ -15,6 +15,7 @@ package iceberg
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -99,7 +100,10 @@ func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string
 	}
 
 	if tbl, err := e.catalog.LoadTable(ctx, ident); err == nil {
-		return tbl, nil // already exists
+		// Table exists — evolve its schema to cover any new columns in `sc` (Arc's
+		// per-measurement schema can grow over time). Missing columns are added as optional,
+		// so older narrow files stay compatible. No-op when already a superset.
+		return e.evolveSchema(ctx, tbl, sc)
 	}
 
 	// Build the Iceberg schema with stable field IDs (1..N).
@@ -134,6 +138,56 @@ func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string
 	}
 	e.logger.Info().Str("database", database).Str("measurement", measurement).Msg("Created Iceberg table")
 	return tbl, nil
+}
+
+// evolveSchema adds any columns present in `sc` but missing from the table's current schema,
+// as optional columns (so older files that lack them stay compatible). Returns the reloaded
+// table. No-op (and no snapshot) when the table already covers every column.
+func (e *Exporter) evolveSchema(ctx context.Context, tbl *icetable.Table, sc ArcSchema) (*icetable.Table, error) {
+	current := tbl.Schema()
+	var missing []ArcField
+	for _, f := range sc.Fields {
+		if _, ok := current.FindFieldByName(f.Name); !ok {
+			missing = append(missing, f)
+		}
+	}
+	if len(missing) == 0 {
+		return tbl, nil
+	}
+	txn := tbl.NewTransaction()
+	upd := txn.UpdateSchema(false /* caseSensitive */, false /* allowIncompatibleChanges */)
+	for _, f := range missing {
+		upd = upd.AddColumn([]string{f.Name}, f.Type, "", false /* required=false => optional */, nil)
+	}
+	if err := upd.Commit(); err != nil {
+		return nil, fmt.Errorf("evolve schema (adding %d columns): %w", len(missing), err)
+	}
+	evolved, err := txn.Commit(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("commit schema evolution: %w", err)
+	}
+
+	// CRITICAL: refresh schema.name-mapping.default to cover the new columns. iceberg-go
+	// auto-sets the name-mapping on the first AddFiles, but UpdateSchema.AddColumn does NOT
+	// extend it — so an evolution-added column has no field-id AND no mapping entry, and
+	// external readers fail with "does not have a field-id, and no field-mapping exists"
+	// (Arc's Parquet carries no field IDs). Derive the mapping from the table's ACTUAL
+	// post-evolution schema (authoritative field IDs, which UpdateSchema assigns) and set it
+	// in a follow-up transaction, matching iceberg-go's own post-AddFiles behavior.
+	nmJSON, err := json.Marshal(evolved.Schema().NameMapping())
+	if err != nil {
+		return nil, fmt.Errorf("marshal name mapping: %w", err)
+	}
+	txn2 := evolved.NewTransaction()
+	if err := txn2.SetProperties(iceberg.Properties{icetable.DefaultNameMappingKey: string(nmJSON)}); err != nil {
+		return nil, fmt.Errorf("set name mapping after evolution: %w", err)
+	}
+	evolved, err = txn2.Commit(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("commit name mapping after evolution: %w", err)
+	}
+	e.logger.Info().Int("added_columns", len(missing)).Msg("Evolved Iceberg table schema")
+	return evolved, nil
 }
 
 // ReconcileMeasurement makes the Iceberg table's data-file set equal `current`: it AddFiles

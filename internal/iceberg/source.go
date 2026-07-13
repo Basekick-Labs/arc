@@ -1,0 +1,126 @@
+package iceberg
+
+import (
+	"context"
+	"fmt"
+	"path"
+	"strings"
+
+	"github.com/basekick-labs/arc/internal/storage"
+)
+
+// Measurement identifies one Arc table to export.
+type Measurement struct {
+	Database    string
+	Measurement string
+}
+
+// FileSetSource enumerates the Arc data files the Iceberg tables should mirror. It is the
+// reconciler's view of Arc's durable state. The default implementation walks the storage
+// backend directly (works in OSS and cluster, with or without tiering), which is why the
+// exporter has no dependency on the tiering metadata store or the Raft manifest being enabled.
+type FileSetSource interface {
+	// Measurements returns every (database, measurement) that currently has data files.
+	Measurements(ctx context.Context) ([]Measurement, error)
+	// Files returns the current data files for one measurement, as iceberg-readable URIs.
+	Files(ctx context.Context, m Measurement) ([]FileRef, error)
+}
+
+// StorageWalkSource lists files straight from the storage backend. Arc's layout is
+// {database}/{measurement}/{year}/{month}/{day}/{hour}/{file}.parquet, so databases are the
+// top-level directories and measurements are the second level.
+type StorageWalkSource struct {
+	backend  storage.Backend
+	resolver *PathResolver
+}
+
+// NewStorageWalkSource builds a storage-walking file-set source.
+func NewStorageWalkSource(backend storage.Backend) *StorageWalkSource {
+	return &StorageWalkSource{backend: backend, resolver: NewPathResolver(backend)}
+}
+
+// dirLister is the subset of storage backends that can enumerate immediate subdirectories.
+type dirLister interface {
+	ListDirectories(ctx context.Context, prefix string) ([]string, error)
+}
+
+// Measurements enumerates (database, measurement) pairs from the top two directory levels.
+func (s *StorageWalkSource) Measurements(ctx context.Context) ([]Measurement, error) {
+	dl, ok := s.backend.(dirLister)
+	if !ok {
+		return nil, fmt.Errorf("storage backend does not support directory listing")
+	}
+	dbs, err := dl.ListDirectories(ctx, "")
+	if err != nil {
+		return nil, fmt.Errorf("list databases: %w", err)
+	}
+	// ListDirectories returns base names (not prefixed paths) and already skips hidden dirs.
+	var out []Measurement
+	for _, db := range dbs {
+		db = strings.Trim(db, "/")
+		if db == "" {
+			continue
+		}
+		measurements, err := dl.ListDirectories(ctx, db+"/")
+		if err != nil {
+			return nil, fmt.Errorf("list measurements for %q: %w", db, err)
+		}
+		for _, m := range measurements {
+			m = strings.Trim(m, "/")
+			if m == "" {
+				continue
+			}
+			out = append(out, Measurement{Database: db, Measurement: m})
+		}
+	}
+	return out, nil
+}
+
+// Files lists the current .parquet files for a measurement and resolves them to URIs.
+func (s *StorageWalkSource) Files(ctx context.Context, m Measurement) ([]FileRef, error) {
+	prefix := m.Database + "/" + m.Measurement + "/"
+	paths, err := s.backend.List(ctx, prefix)
+	if err != nil {
+		return nil, fmt.Errorf("list files for %s/%s: %w", m.Database, m.Measurement, err)
+	}
+	var out []FileRef
+	for _, p := range paths {
+		if !isDataFile(p) {
+			continue
+		}
+		out = append(out, FileRef{PhysicalPath: s.resolver.Resolve(p)})
+	}
+	return out, nil
+}
+
+// LocalFiles returns on-disk paths to ALL of the measurement's Parquet files for schema
+// derivation (the reconciler unions their schemas — Arc's per-measurement schema can evolve,
+// so one sample file is not enough; see UnionSchema). Returns empty if the backend is not
+// local or the measurement has no local files. Cold-only measurements yield no local files
+// and are skipped for schema derivation in v1 (documented limitation).
+func (s *StorageWalkSource) LocalFiles(ctx context.Context, m Measurement) ([]string, error) {
+	prefix := m.Database + "/" + m.Measurement + "/"
+	paths, err := s.backend.List(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, p := range paths {
+		if isDataFile(p) {
+			if lp := s.resolver.LocalPath(p); lp != "" {
+				out = append(out, lp)
+			}
+		}
+	}
+	return out, nil
+}
+
+// isDataFile reports whether a storage key is an Arc data file to export. Only .parquet is
+// exported; vortex is a separate (shelved) format and Iceberg's data files are Parquet.
+func isDataFile(p string) bool {
+	base := path.Base(p)
+	if strings.HasPrefix(base, ".") || strings.HasPrefix(base, ".tmp.") {
+		return false
+	}
+	return strings.HasSuffix(base, ".parquet")
+}

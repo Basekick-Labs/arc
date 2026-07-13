@@ -17,6 +17,7 @@ type Config struct {
 	Server          ServerConfig
 	Database        DatabaseConfig
 	Storage         StorageConfig
+	Iceberg         IcebergConfig
 	Ingest          IngestConfig
 	Cache           CacheConfig
 	Log             LogConfig
@@ -181,6 +182,18 @@ type DeleteConfig struct {
 type RetentionConfig struct {
 	Enabled bool   // Enable retention policy management (default: true for policy CRUD, execution is manual)
 	DBPath  string // SQLite database path for storing policies
+}
+
+// IcebergConfig controls the optional Iceberg export layer, which publishes Arc's existing
+// Parquet files as Apache Iceberg tables (metadata only — no data rewrite) so external engines
+// (Spark, Trino, DuckDB) can read Arc's data. Disabled by default. The reconciler discovers
+// files by walking the storage backend, so it works in OSS and cluster alike.
+type IcebergConfig struct {
+	Enabled           bool   // Enable the Iceberg export reconciler
+	Warehouse         string // Root URI for Iceberg table metadata (file://… or s3://bucket/prefix); defaults to the storage root
+	NamespacePrefix   string // Iceberg namespace prefix; tables land in "<prefix>_<database>" (default "arc")
+	ReconcileInterval int    // Seconds between reconcile passes (default 300)
+	CatalogDBPath     string // SQLite catalog path; defaults to the shared auth DB
 }
 
 type ContinuousQueryConfig struct {
@@ -620,6 +633,13 @@ func Load() (*Config, error) {
 			Enabled: v.GetBool("retention.enabled"),
 			DBPath:  v.GetString("retention.db_path"),
 		},
+		Iceberg: IcebergConfig{
+			Enabled:           v.GetBool("iceberg.enabled"),
+			Warehouse:         v.GetString("iceberg.warehouse"),
+			NamespacePrefix:   v.GetString("iceberg.namespace_prefix"),
+			ReconcileInterval: v.GetInt("iceberg.reconcile_interval"),
+			CatalogDBPath:     v.GetString("iceberg.catalog_db_path"),
+		},
 		ContinuousQuery: ContinuousQueryConfig{
 			Enabled: v.GetBool("continuous_query.enabled"),
 			DBPath:  v.GetString("continuous_query.db_path"),
@@ -983,6 +1003,13 @@ func setDefaults(v *viper.Viper) {
 	// Retention policy defaults
 	v.SetDefault("retention.enabled", true)            // Enable policy management by default
 	v.SetDefault("retention.db_path", "./data/arc.db") // Shared SQLite DB with auth
+
+	// Iceberg export defaults (opt-in; disabled by default)
+	v.SetDefault("iceberg.enabled", false)
+	v.SetDefault("iceberg.namespace_prefix", "arc")
+	v.SetDefault("iceberg.reconcile_interval", 300)          // seconds
+	v.SetDefault("iceberg.catalog_db_path", "./data/arc.db") // shared SQLite DB with auth
+	// iceberg.warehouse defaults at wire time to the storage root (needs the backend)
 
 	// Continuous query defaults
 	v.SetDefault("continuous_query.enabled", true)            // Enable CQ management by default
