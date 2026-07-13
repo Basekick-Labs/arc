@@ -12,6 +12,8 @@
 
 High-performance columnar analytical database. 19M+ records/sec ingestion, 8M+ rows/sec queries. Ingestion, storage, compaction, SQL queries, retention policies, and continuous queries — in one binary. Open Parquet files on your storage. No vendor lock-in. AGPL-3.0.
 
+> **Prefer a UI?** [**Arc Launchpad**](https://github.com/Basekick-Labs/launchpad) is a self-hosted web console for the Arc instances you run — SQL console, schema explorer, logs, monitoring, and management for tokens, retention, alerts, continuous queries, and MQTT ingestion. Deploy it alongside Arc with Docker Compose. [Docs](https://docs.basekick.net/launchpad).
+
 ---
 
 ## The Problem
@@ -277,7 +279,7 @@ CMVP-certified; Arc itself is not a CMVP-listed module. See the
 
 | Tool | Description | Link |
 |------|-------------|------|
-| **Arc Launchpad** | Self-hosted web UI: SQL console, schema explorer, logs, tokens, retention, alerts, and team management | [GitHub](https://github.com/Basekick-Labs/launchpad) |
+| **Arc Launchpad** | Self-hosted web UI: SQL console, schema explorer, logs, monitoring, and management for tokens, retention, alerts, continuous queries, MQTT ingestion, and teams | [GitHub](https://github.com/Basekick-Labs/launchpad) · [Docs](https://docs.basekick.net/launchpad) |
 | **VS Code Extension** | Browse databases, run queries, visualize results | [Marketplace](https://marketplace.visualstudio.com/items?itemName=basekick-labs.arc-db-manager) |
 | **Grafana Data Source** | Native Grafana plugin for dashboards and alerting | [GitHub](https://github.com/Basekick-Labs/grafana-arc-datasource) |
 | **Telegraf Output Plugin** | Ship data from 300+ Telegraf inputs directly to Arc | [Docs](https://docs.influxdata.com/telegraf/v1/output-plugins/arc/) |
