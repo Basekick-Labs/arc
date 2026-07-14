@@ -541,17 +541,43 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) {
 	}
 }
 
-// warehouseRelKey converts a full metadata URI to a STORAGE-RELATIVE key (backend Read/Write
-// operate on relative keys). Returns ok=false if the URI isn't under the warehouse root.
+// warehouseRelKey converts a full metadata URI to a STORAGE-RELATIVE key, since backend
+// Read/Write operate on keys relative to the STORAGE ROOT — not to the warehouse. Returns
+// ok=false if the URI isn't under the configured warehouse.
 //
-//	metaLoc="file:///wh/arc_db.db/cpu/metadata/00004-<uuid>.metadata.json", warehouse="file:///wh"
-//	-> "arc_db.db/cpu/metadata/00004-<uuid>.metadata.json"
+// The two bases coincide only when iceberg.warehouse is the storage root (the default), so
+// trimming the warehouse silently produced a key missing the warehouse's own path segment
+// whenever an operator pointed iceberg.warehouse at a SUBDIRECTORY — the version-hint and
+// v<N>.metadata.json copies then landed outside the warehouse, where directory-based readers
+// (DuckDB, Spark) could not resolve the current snapshot. Gate on the warehouse, trim the root.
+//
+//	storage root "file:///data", warehouse "file:///data/wh",
+//	metaLoc "file:///data/wh/arc_db.db/cpu/metadata/00004-<uuid>.metadata.json"
+//	-> "wh/arc_db.db/cpu/metadata/00004-<uuid>.metadata.json"
 func (e *Exporter) warehouseRelKey(metaLoc string) (string, bool) {
-	rel := strings.TrimPrefix(metaLoc, e.warehouse)
-	if rel == metaLoc {
+	if !isUnderDir(metaLoc, e.warehouse) {
 		return "", false
 	}
-	return strings.TrimPrefix(rel, "/"), true
+	// No backend (tests/no-op mode): warehouse is the only base we have.
+	if e.backend == nil {
+		return strings.TrimPrefix(strings.TrimPrefix(metaLoc, e.warehouse), "/"), true
+	}
+	root := DefaultWarehouse(e.backend)
+	if !isUnderDir(metaLoc, root) {
+		// Warehouse is outside the storage root entirely — the backend cannot address it.
+		return "", false
+	}
+	return strings.TrimPrefix(strings.TrimPrefix(metaLoc, root), "/"), true
+}
+
+// isUnderDir reports whether p is dir itself or lies beneath it, matching only at a path
+// boundary. A bare strings.HasPrefix would accept a sibling whose name merely starts with dir's
+// ("file:///data/wh" would match "file:///data/wh-other/…"), which for warehouseRelKey means
+// accepting another warehouse's metadata as our own — and pruneOldVersionFiles DELETES files
+// under the key it derives, so the gate has to match on real path segments.
+func isUnderDir(p, dir string) bool {
+	dir = strings.TrimSuffix(dir, "/")
+	return p == dir || strings.HasPrefix(p, dir+"/")
 }
 
 // parseVersionAndMetaDir derives, from a full metadata-file URI, the version integer (e.g.

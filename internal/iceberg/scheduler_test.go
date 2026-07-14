@@ -499,3 +499,86 @@ func TestMergeSchemas(t *testing.T) {
 		t.Error("expected an error for a conflicting type on column 'host', got nil")
 	}
 }
+
+// TestCustomWarehouseSubdir covers iceberg.warehouse pointed at a SUBDIRECTORY of the storage
+// root (a supported config: the key defaults to the storage root but operators can override it).
+// backend Read/Write take keys relative to the STORAGE ROOT, not the warehouse — trimming the
+// warehouse instead dropped its own path segment, so version-hint.text and the v<N> copies
+// landed outside the warehouse and directory-based readers (DuckDB/Spark) could not resolve the
+// current snapshot.
+func TestCustomWarehouseSubdir(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeArcStyleParquet(t, filepath.Join(root, "mydb/cpu/2023/11/14/22/a.parquet"), 1_700_000_000_000_000, 20)
+
+	db, err := sql.Open("sqlite3", filepath.Join(root, "arc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Warehouse is <root>/warehouse, NOT <root>. Built via localFileURI so it matches what
+	// DefaultWarehouse produces (absolute + forward slashes) on every platform.
+	exp, err := NewExporter(db, backend, localFileURI(filepath.Join(root, "warehouse")), "arc", 3, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc"), Logger: zerolog.Nop()})
+	sched.runPass(ctx)
+
+	// version-hint.text must live INSIDE the configured warehouse.
+	hint := filepath.Join(root, "warehouse", "arc_mydb.db", "cpu", "metadata", "version-hint.text")
+	if _, err := os.Stat(hint); err != nil {
+		t.Fatalf("version-hint.text not inside the configured warehouse: %v", err)
+	}
+	// ...and must NOT have leaked to the storage root (the pre-fix behaviour).
+	if _, err := os.Stat(filepath.Join(root, "arc_mydb.db", "cpu", "metadata", "version-hint.text")); err == nil {
+		t.Error("version-hint.text leaked to the storage root, outside the configured warehouse")
+	}
+
+	// The table must still be readable/registered (the file made it into the table).
+	lt, err := exp.EnsureTable(ctx, "mydb", "cpu", ArcSchema{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f, _ := exp.tableDataFiles(ctx, lt); len(f) != 1 {
+		t.Errorf("want 1 file registered with a custom warehouse, got %d", len(f))
+	}
+}
+
+// TestIsUnderDir pins the path-boundary matching that warehouseRelKey's gate depends on. A bare
+// strings.HasPrefix accepts a sibling directory whose name merely starts with the warehouse's
+// ("file:///data/wh" vs "file:///data/wh-other"), which would let another warehouse's metadata
+// be treated as ours — and pruneOldVersionFiles deletes files under the derived key.
+func TestIsUnderDir(t *testing.T) {
+	const dir = "file:///data/wh"
+	tests := []struct {
+		p    string
+		want bool
+	}{
+		{"file:///data/wh", true}, // the dir itself
+		{"file:///data/wh/arc_db.db/cpu/metadata/v1.metadata.json", true}, // beneath it
+		{"file:///data/wh/", true},                                        // trailing slash
+		// Siblings that share a name prefix must NOT match.
+		{"file:///data/wh-other/arc_db.db/cpu/metadata/v1.metadata.json", false},
+		{"file:///data/wharf/x.json", false},
+		{"file:///data/whx", false},
+		// Unrelated / parent paths.
+		{"file:///data/other/x.json", false},
+		{"file:///data", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		if got := isUnderDir(tt.p, dir); got != tt.want {
+			t.Errorf("isUnderDir(%q, %q) = %v, want %v", tt.p, dir, got, tt.want)
+		}
+	}
+	// A dir configured WITH a trailing slash must behave identically.
+	if !isUnderDir("file:///data/wh/a.json", "file:///data/wh/") {
+		t.Error("isUnderDir should normalize a trailing slash on dir")
+	}
+}
