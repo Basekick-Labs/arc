@@ -228,21 +228,48 @@ func (e *Exporter) evolveSchema(ctx context.Context, tbl *icetable.Table, sc Arc
 	// (Arc's Parquet carries no field IDs). Derive the mapping from the table's ACTUAL
 	// post-evolution schema (authoritative field IDs, which UpdateSchema assigns) and set it
 	// in a follow-up transaction, matching iceberg-go's own post-AddFiles behavior.
-	nmJSON, err := json.Marshal(evolved.Schema().NameMapping())
+	//
+	// Routed through the same helper as the self-heal path so the "never write a null mapping"
+	// guard lives in exactly one place — these two sites did the same marshal+SetProperties and
+	// drifted apart once already.
+	evolved, err = e.setNameMappingFromSchema(ctx, evolved)
 	if err != nil {
-		return nil, fmt.Errorf("marshal name mapping: %w", err)
-	}
-	txn2 := evolved.NewTransaction()
-	if err := txn2.SetProperties(iceberg.Properties{icetable.DefaultNameMappingKey: string(nmJSON)}); err != nil {
-		return nil, fmt.Errorf("set name mapping after evolution: %w", err)
-	}
-	evolved, err = txn2.Commit(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("commit name mapping after evolution: %w", err)
+		return nil, err
 	}
 	e.writeVersionHint(ctx, evolved)
 	e.logger.Info().Int("added_columns", len(missing)).Msg("Evolved Iceberg table schema")
 	return evolved, nil
+}
+
+// setNameMappingFromSchema writes schema.name-mapping.default derived from the table's current
+// schema, and is the ONLY place that property is set. Returns the table unchanged (no commit)
+// when the mapping already matches or would be invalid.
+//
+// The "null" guard is the reason this is shared: NameMapping is a []MappedField, so a nil
+// mapping marshals to the literal "null". Writing schema.name-mapping.default="null" is not a
+// valid mapping and would break the external readers the property exists to serve — strictly
+// worse than leaving it unset.
+func (e *Exporter) setNameMappingFromSchema(ctx context.Context, tbl *icetable.Table) (*icetable.Table, error) {
+	nmJSON, err := json.Marshal(tbl.Schema().NameMapping())
+	if err != nil {
+		return nil, fmt.Errorf("marshal name mapping: %w", err)
+	}
+	if string(nmJSON) == "null" {
+		e.logger.Warn().Msg("Iceberg name-mapping: schema produced an empty mapping, leaving property unset")
+		return tbl, nil
+	}
+	if tbl.Properties()[icetable.DefaultNameMappingKey] == string(nmJSON) {
+		return tbl, nil // already consistent — no commit
+	}
+	txn := tbl.NewTransaction()
+	if err := txn.SetProperties(iceberg.Properties{icetable.DefaultNameMappingKey: string(nmJSON)}); err != nil {
+		return nil, fmt.Errorf("set name mapping: %w", err)
+	}
+	updated, err := txn.Commit(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("commit name mapping: %w", err)
+	}
+	return updated, nil
 }
 
 // healNameMapping ensures the stored schema.name-mapping.default matches the table's current
@@ -252,33 +279,18 @@ func (e *Exporter) evolveSchema(ctx context.Context, tbl *icetable.Table, sc Arc
 // early-return would otherwise never repair the mapping, permanently breaking external readers
 // for the evolution-added column. Best-effort: on any failure it logs and returns tbl unchanged.
 func (e *Exporter) healNameMapping(ctx context.Context, tbl *icetable.Table) (*icetable.Table, error) {
-	nmJSON, err := json.Marshal(tbl.Schema().NameMapping())
+	before := tbl.Properties()[icetable.DefaultNameMappingKey]
+	healed, err := e.setNameMappingFromSchema(ctx, tbl)
 	if err != nil {
-		e.logger.Warn().Err(err).Msg("Iceberg name-mapping heal: marshal failed (non-fatal)")
+		// Best-effort: this runs on the steady-state path, so a transient catalog failure must
+		// not fail the reconcile. The next pass retries.
+		e.logger.Warn().Err(err).Msg("Iceberg name-mapping heal failed (non-fatal) — will retry next pass")
 		return tbl, nil
 	}
-	// NameMapping is a []MappedField, so a nil mapping marshals to the literal "null". Writing
-	// schema.name-mapping.default="null" is not a valid mapping and would break the external
-	// readers this property exists to serve — worse than leaving it unset. Never heal to that.
-	if string(nmJSON) == "null" {
-		e.logger.Warn().Msg("Iceberg name-mapping heal: table schema produced an empty mapping (non-fatal, skipping)")
-		return tbl, nil
+	if healed.Properties()[icetable.DefaultNameMappingKey] != before {
+		e.writeVersionHint(ctx, healed)
+		e.logger.Info().Msg("Iceberg name-mapping healed to match current schema")
 	}
-	if tbl.Properties()[icetable.DefaultNameMappingKey] == string(nmJSON) {
-		return tbl, nil // already consistent — no commit
-	}
-	txn := tbl.NewTransaction()
-	if err := txn.SetProperties(iceberg.Properties{icetable.DefaultNameMappingKey: string(nmJSON)}); err != nil {
-		e.logger.Warn().Err(err).Msg("Iceberg name-mapping heal: set property failed (non-fatal)")
-		return tbl, nil
-	}
-	healed, err := txn.Commit(ctx)
-	if err != nil {
-		e.logger.Warn().Err(err).Msg("Iceberg name-mapping heal: commit failed (non-fatal) — will retry next pass")
-		return tbl, nil
-	}
-	e.writeVersionHint(ctx, healed)
-	e.logger.Info().Msg("Iceberg name-mapping healed to match current schema")
 	return healed, nil
 }
 
