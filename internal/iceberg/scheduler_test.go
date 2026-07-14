@@ -499,3 +499,52 @@ func TestMergeSchemas(t *testing.T) {
 		t.Error("expected an error for a conflicting type on column 'host', got nil")
 	}
 }
+
+// TestCustomWarehouseSubdir covers iceberg.warehouse pointed at a SUBDIRECTORY of the storage
+// root (a supported config: the key defaults to the storage root but operators can override it).
+// backend Read/Write take keys relative to the STORAGE ROOT, not the warehouse — trimming the
+// warehouse instead dropped its own path segment, so version-hint.text and the v<N> copies
+// landed outside the warehouse and directory-based readers (DuckDB/Spark) could not resolve the
+// current snapshot.
+func TestCustomWarehouseSubdir(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeArcStyleParquet(t, filepath.Join(root, "mydb/cpu/2023/11/14/22/a.parquet"), 1_700_000_000_000_000, 20)
+
+	db, err := sql.Open("sqlite3", filepath.Join(root, "arc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Warehouse is <root>/warehouse, NOT <root>.
+	exp, err := NewExporter(db, backend, "file://"+filepath.Join(root, "warehouse"), "arc", 3, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc"), Logger: zerolog.Nop()})
+	sched.runPass(ctx)
+
+	// version-hint.text must live INSIDE the configured warehouse.
+	hint := filepath.Join(root, "warehouse", "arc_mydb.db", "cpu", "metadata", "version-hint.text")
+	if _, err := os.Stat(hint); err != nil {
+		t.Fatalf("version-hint.text not inside the configured warehouse: %v", err)
+	}
+	// ...and must NOT have leaked to the storage root (the pre-fix behaviour).
+	if _, err := os.Stat(filepath.Join(root, "arc_mydb.db", "cpu", "metadata", "version-hint.text")); err == nil {
+		t.Error("version-hint.text leaked to the storage root, outside the configured warehouse")
+	}
+
+	// The table must still be readable/registered (the file made it into the table).
+	lt, err := exp.EnsureTable(ctx, "mydb", "cpu", ArcSchema{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f, _ := exp.tableDataFiles(ctx, lt); len(f) != 1 {
+		t.Errorf("want 1 file registered with a custom warehouse, got %d", len(f))
+	}
+}
