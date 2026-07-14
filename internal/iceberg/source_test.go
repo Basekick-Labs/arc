@@ -88,3 +88,29 @@ func TestFiles_RecursesNestedPartitions(t *testing.T) {
 		}
 	}
 }
+
+// TestIsDataFile covers the export predicate. The dotfile skip is load-bearing: Arc writes
+// in-flight files as ".tmp.*", and registering a partially-written Parquet into an Iceberg
+// table would hand external readers a corrupt file.
+func TestIsDataFile(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{"mydb/cpu/2026/07/14/15/cpu_123.parquet", true},
+		{"mydb/cpu/2026/07/14/15/cpu_123_compacted.parquet", true},
+		// In-flight write — must never be registered.
+		{"mydb/cpu/2026/07/14/15/.tmp.cpu_123.parquet", false},
+		// Any other dotfile is skipped too (e.g. editor/OS cruft).
+		{"mydb/cpu/2026/07/14/15/.hidden.parquet", false},
+		{"mydb/cpu/2026/07/14/15/.DS_Store", false},
+		// Non-parquet is not a data file.
+		{"mydb/cpu/2026/07/14/15/notes.txt", false},
+		{"arc_mydb.db/cpu/metadata/v1.metadata.json", false},
+	}
+	for _, tt := range tests {
+		if got := isDataFile(tt.path); got != tt.want {
+			t.Errorf("isDataFile(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+}

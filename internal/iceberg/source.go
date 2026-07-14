@@ -139,7 +139,9 @@ func isDataFile(p string) bool {
 	// export is local-only. filepath.Base handles both separators; path.Base would treat a
 	// backslash key as one component.
 	base := filepath.Base(p)
-	if strings.HasPrefix(base, ".") || strings.HasPrefix(base, ".tmp.") {
+	// Skip dotfiles. This covers Arc's in-flight ".tmp.*" writes (a separate ".tmp." check would
+	// be redundant — it already starts with "."), so a partially-written file is never registered.
+	if strings.HasPrefix(base, ".") {
 		return false
 	}
 	return strings.HasSuffix(base, ".parquet")
