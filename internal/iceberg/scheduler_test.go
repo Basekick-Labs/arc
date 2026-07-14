@@ -122,3 +122,56 @@ func mustAtoi(t *testing.T, s string) int {
 	}
 	return n
 }
+
+// TestScheduler_IncrementalSkip verifies the deferred optimization: a second pass over an
+// UNCHANGED file set does no work — no new Iceberg snapshot — because the fingerprint matches.
+func TestScheduler_IncrementalSkip(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeArcStyleParquet(t, filepath.Join(root, "mydb/cpu/2023/11/14/22/a.parquet"), 1_700_000_000_000_000, 50)
+
+	db, err := sql.Open("sqlite3", filepath.Join(root, "arc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	exp, err := NewExporter(db, backend, "file://"+root, "arc", 0, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc"), Logger: zerolog.Nop()})
+
+	snapOf := func() int64 {
+		lt, err := exp.EnsureTable(ctx, "mydb", "cpu", ArcSchema{})
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if snap := lt.CurrentSnapshot(); snap != nil {
+			return snap.SnapshotID
+		}
+		return 0
+	}
+
+	sched.runPass(ctx) // first pass: creates + reconciles
+	s1 := snapOf()
+	if s1 == 0 {
+		t.Fatal("expected a snapshot after first pass")
+	}
+
+	// Second pass, nothing changed on disk → fingerprint hit → NO new snapshot.
+	sched.runPass(ctx)
+	if s2 := snapOf(); s2 != s1 {
+		t.Errorf("unchanged pass created a new snapshot (%d -> %d) — incremental skip failed", s1, s2)
+	}
+
+	// Add a file → fingerprint changes → a reconcile happens (new snapshot).
+	writeArcStyleParquet(t, filepath.Join(root, "mydb/cpu/2023/11/14/23/b.parquet"), 1_700_000_003_600_000, 50)
+	sched.runPass(ctx)
+	if s3 := snapOf(); s3 == s1 {
+		t.Errorf("adding a file did not produce a new snapshot (still %d) — change not detected", s1)
+	}
+}

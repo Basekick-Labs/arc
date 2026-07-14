@@ -2,10 +2,21 @@ package iceberg
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
 )
+
+// measurementState caches per-measurement work between passes so an unchanged measurement is
+// skipped without re-reading every Parquet footer.
+type measurementState struct {
+	fingerprint string    // hash of the sorted file set + local-file set at last successful reconcile
+	schema      ArcSchema // schema derived at that reconcile (reused while the file set is unchanged)
+}
 
 // WriterGate gates the reconciler to a single node in cluster mode. nil means "no gate,
 // allow" (OSS/standalone — single node, always runs). Mirrors compaction's ClusterGate:
@@ -26,9 +37,17 @@ type Scheduler struct {
 	gate     WriterGate
 	logger   zerolog.Logger
 
+	// state caches per-measurement fingerprint+schema so unchanged measurements are skipped
+	// without re-reading footers. Accessed only from the single loop() goroutine — no lock.
+	state map[string]measurementState
+
 	cancel context.CancelFunc
 	done   chan struct{}
 }
+
+// measurementTimeout bounds a single measurement's reconcile so one slow/wedged measurement
+// (e.g. a huge footer scan) can't block the whole pass or graceful shutdown indefinitely.
+const measurementTimeout = 2 * time.Minute
 
 // FileSetSourceWithSchema is a FileSetSource that can also list the local files of a
 // measurement for schema derivation. StorageWalkSource satisfies it.
@@ -57,6 +76,7 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		interval: cfg.Interval,
 		gate:     cfg.Gate,
 		logger:   cfg.Logger.With().Str("component", "iceberg-scheduler").Logger(),
+		state:    make(map[string]measurementState),
 	}
 }
 
@@ -105,41 +125,90 @@ func (s *Scheduler) runPass(ctx context.Context) {
 		s.logger.Error().Err(err).Msg("Iceberg reconcile: failed to enumerate measurements")
 		return
 	}
-	var ok, failed int
+	var ok, failed, skipped int
+	seen := make(map[string]struct{}, len(measurements))
 	for _, m := range measurements {
-		if err := s.reconcileOne(ctx, m); err != nil {
+		if ctx.Err() != nil { // shutdown mid-pass
+			return
+		}
+		key := m.Database + "\x00" + m.Measurement
+		seen[key] = struct{}{}
+		mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
+		changed, err := s.reconcileOne(mctx, m, key)
+		cancel()
+		switch {
+		case err != nil:
 			// Log and continue — one bad measurement must not block the rest; next pass retries.
 			s.logger.Error().Err(err).
 				Str("database", m.Database).Str("measurement", m.Measurement).
 				Msg("Iceberg reconcile: measurement failed")
 			failed++
-			continue
+		case changed:
+			ok++
+		default:
+			skipped++ // fingerprint unchanged — nothing to do (the cheap common case)
 		}
-		ok++
 	}
-	s.logger.Info().Int("ok", ok).Int("failed", failed).Msg("Iceberg reconcile pass complete")
+	// Drop cache entries for measurements that no longer exist (bounded memory).
+	for k := range s.state {
+		if _, ok := seen[k]; !ok {
+			delete(s.state, k)
+		}
+	}
+	s.logger.Info().Int("reconciled", ok).Int("unchanged", skipped).Int("failed", failed).
+		Msg("Iceberg reconcile pass complete")
 }
 
-func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement) error {
+// reconcileOne reconciles one measurement, returning whether it did work (changed=true) or was
+// skipped because its file set is unchanged since the last successful pass. The fingerprint of
+// the (data-file set + local-file set) lets us skip the expensive per-file footer reads and the
+// no-op diff entirely when nothing changed — the common steady-state case.
+func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string) (changed bool, err error) {
+	files, err := s.source.Files(ctx, m)
+	if err != nil {
+		return false, err
+	}
 	localFiles, err := s.source.LocalFiles(ctx, m)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if len(localFiles) == 0 {
 		// No local files to derive schema from (cold-only measurement). Skip in v1 — documented.
 		s.logger.Debug().Str("database", m.Database).Str("measurement", m.Measurement).
 			Msg("Iceberg reconcile: no local file for schema derivation, skipping")
-		return nil
+		return false, nil
 	}
-	// Union the schemas across all files — Arc's per-measurement schema can evolve (a metric
-	// added later), so the Iceberg table must carry the superset or a wider file fails AddFiles.
+
+	// Fingerprint the file set. Unchanged fingerprint + a cached schema => guaranteed no-op
+	// (same files in the table already), so skip the footer reads and the diff.
+	fp := fingerprint(files, localFiles)
+	prev, cached := s.state[key]
+	if cached && prev.fingerprint == fp {
+		return false, nil
+	}
+
+	// The set changed (or first sight): (re)derive the union schema from the local files. This
+	// is the only place footers are read, and only when something actually changed.
 	sc, err := UnionSchema(localFiles)
 	if err != nil {
-		return err
+		return false, err
 	}
-	files, err := s.source.Files(ctx, m)
-	if err != nil {
-		return err
+	if err := s.exporter.ReconcileMeasurement(ctx, m.Database, m.Measurement, sc, files); err != nil {
+		return false, err
 	}
-	return s.exporter.ReconcileMeasurement(ctx, m.Database, m.Measurement, sc, files)
+	s.state[key] = measurementState{fingerprint: fp, schema: sc}
+	return true, nil
+}
+
+// fingerprint hashes the sorted union of the data-file paths and local-file paths. Any add,
+// remove, or compaction changes the set and thus the hash; an unchanged set hashes identically.
+func fingerprint(files []FileRef, localFiles []string) string {
+	parts := make([]string, 0, len(files)+len(localFiles))
+	for _, f := range files {
+		parts = append(parts, f.PhysicalPath)
+	}
+	parts = append(parts, localFiles...)
+	sort.Strings(parts)
+	h := sha256.Sum256([]byte(strings.Join(parts, "\n")))
+	return hex.EncodeToString(h[:])
 }
