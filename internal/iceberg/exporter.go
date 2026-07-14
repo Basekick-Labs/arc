@@ -46,6 +46,7 @@ type Exporter struct {
 	backend   storage.Backend // for writing version-hint.text alongside table metadata
 	warehouse string          // warehouse root URI (file://… or s3://bucket/prefix)
 	nsPrefix  string          // namespace for Iceberg tables (e.g. "arc")
+	retain    int             // snapshots + metadata versions to keep per table (0 = keep all)
 	logger    zerolog.Logger
 }
 
@@ -56,7 +57,7 @@ type Exporter struct {
 // (file://… or s3://bucket/prefix). backend is used to write version-hint.text next to the
 // table metadata (local or S3), enabling directory-based readers to discover the current
 // metadata without an exact filename.
-func NewExporter(db *sql.DB, backend storage.Backend, warehouse, nsPrefix string, logger zerolog.Logger) (*Exporter, error) {
+func NewExporter(db *sql.DB, backend storage.Backend, warehouse, nsPrefix string, retain int, logger zerolog.Logger) (*Exporter, error) {
 	if nsPrefix == "" {
 		nsPrefix = "arc"
 	}
@@ -71,6 +72,7 @@ func NewExporter(db *sql.DB, backend storage.Backend, warehouse, nsPrefix string
 		backend:   backend,
 		warehouse: strings.TrimSuffix(warehouse, "/"),
 		nsPrefix:  nsPrefix,
+		retain:    retain,
 		logger:    logger.With().Str("component", "iceberg-exporter").Logger(),
 	}, nil
 }
@@ -140,6 +142,15 @@ func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string
 			Transform: iceberg.DayTransform{},
 		})
 		createOpts = append(createOpts, icecatalog.WithPartitionSpec(&spec))
+	}
+	// Bound iceberg-go's own metadata-file history so NNNNN-*.metadata.json don't accumulate
+	// forever: enable delete-after-commit and cap previous versions at `retain`. (Our own
+	// v<N>.metadata.json copies are pruned separately in pruneOldVersionFiles.)
+	if e.retain > 0 {
+		createOpts = append(createOpts, icecatalog.WithProperties(iceberg.Properties{
+			icetable.MetadataDeleteAfterCommitEnabledKey: "true",
+			icetable.MetadataPreviousVersionsMaxKey:      strconv.Itoa(e.retain),
+		}))
 	}
 
 	tbl, err := e.catalog.CreateTable(ctx, ident, schema, createOpts...)
@@ -253,12 +264,99 @@ func (e *Exporter) ReconcileMeasurement(ctx context.Context, database, measureme
 	if err != nil {
 		return fmt.Errorf("iceberg commit (add=%d remove=%d): %w", len(toAdd), len(toRemove), err)
 	}
+	// Expire old snapshots (+ orphaned manifests/data) so snapshot history and metadata don't
+	// grow unbounded. Best-effort — a failure here doesn't undo the successful reconcile; the
+	// next pass retries. Returns the possibly-newer table so version-hint points at it.
+	committed = e.expireSnapshots(ctx, committed, database, measurement)
 	e.writeVersionHint(ctx, committed)
+	e.pruneOldVersionFiles(ctx, committed)
 	e.logger.Info().
 		Str("database", database).Str("measurement", measurement).
 		Int("added", len(toAdd)).Int("removed", len(toRemove)).
 		Msg("Reconciled Iceberg table")
 	return nil
+}
+
+// expireSnapshots keeps the last `retain` snapshots for the table (0 = keep all → no-op),
+// deleting older snapshots and their orphaned manifests/data files. Best-effort: on any
+// failure it logs and returns the input table unchanged.
+func (e *Exporter) expireSnapshots(ctx context.Context, tbl *icetable.Table, database, measurement string) *icetable.Table {
+	if e.retain <= 0 {
+		return tbl
+	}
+	// Only expire when there's more history than we intend to keep, to avoid pointless commits.
+	if snaps := tbl.Metadata().Snapshots(); len(snaps) <= e.retain {
+		return tbl
+	}
+	txn := tbl.NewTransaction()
+	// WithRetainLast is a FLOOR, not a cap: iceberg-go only expires a snapshot when it is BOTH
+	// older than maxSnapshotAgeMs AND beyond the retain-last count. With the default age
+	// (~5 days) nothing expires regardless of count. Pass WithOlderThan(0) so the age gate is
+	// always satisfied and retain-last becomes the effective cap ("keep the last N, expire the
+	// rest"). Cluster-mode note: this is fine because the reconciler is writer-gated (single
+	// writer), so no concurrent reader-vs-expire race beyond Iceberg's own snapshot isolation.
+	if err := txn.ExpireSnapshots(icetable.WithRetainLast(e.retain), icetable.WithOlderThan(0)); err != nil {
+		e.logger.Warn().Err(err).Str("database", database).Str("measurement", measurement).
+			Msg("ExpireSnapshots failed (non-fatal)")
+		return tbl
+	}
+	expired, err := txn.Commit(ctx)
+	if err != nil {
+		e.logger.Warn().Err(err).Str("database", database).Str("measurement", measurement).
+			Msg("ExpireSnapshots commit failed (non-fatal)")
+		return tbl
+	}
+	return expired
+}
+
+// pruneOldVersionFiles keeps only the newest `retain` v<M>.metadata.json copies and deletes
+// the rest. iceberg-go prunes its own NNNNN-*.metadata.json (via delete-after-commit) but does
+// not know about the v<N> copies we write for directory-based readers, so we prune them here.
+// Scan-based (not arithmetic) so it's robust to non-contiguous version numbers — each reconcile
+// commits twice (ReplaceDataFiles + ExpireSnapshots), so versions advance by more than one.
+// Best-effort; never deletes the current version.
+func (e *Exporter) pruneOldVersionFiles(ctx context.Context, tbl *icetable.Table) {
+	if e.backend == nil || e.retain <= 0 {
+		return
+	}
+	cur, dirKey, ok := e.parseVersionAndMetaDir(tbl.MetadataLocation())
+	if !ok {
+		return
+	}
+	keys, err := e.backend.List(ctx, dirKey+"/")
+	if err != nil {
+		return
+	}
+	// Collect version numbers of existing v<M>.metadata.json copies.
+	type vfile struct {
+		n   int
+		key string
+	}
+	var vs []vfile
+	for _, k := range keys {
+		base := path.Base(k)
+		if !strings.HasPrefix(base, "v") || !strings.HasSuffix(base, ".metadata.json") {
+			continue
+		}
+		numStr := strings.TrimSuffix(strings.TrimPrefix(base, "v"), ".metadata.json")
+		if n, err := strconv.Atoi(numStr); err == nil {
+			vs = append(vs, vfile{n: n, key: path.Join(dirKey, base)})
+		}
+	}
+	if len(vs) <= e.retain {
+		return
+	}
+	// Keep the newest `retain`; delete the rest. Never delete the current version.
+	sort.Slice(vs, func(i, j int) bool { return vs[i].n > vs[j].n }) // descending
+	curN, _ := strconv.Atoi(cur)
+	for _, v := range vs[e.retain:] {
+		if v.n == curN {
+			continue
+		}
+		if err := e.backend.Delete(ctx, v.key); err != nil {
+			e.logger.Debug().Err(err).Str("key", v.key).Msg("prune old v<N> (non-fatal)")
+		}
+	}
 }
 
 // writeVersionHint publishes the Hadoop-catalog discovery files next to the table's current

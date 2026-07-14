@@ -42,7 +42,7 @@ func TestStorageWalkSourceAndReconcile(t *testing.T) {
 	}
 	defer db.Close()
 
-	exp, err := NewExporter(db, backend, "file://"+root, "arc", zerolog.Nop())
+	exp, err := NewExporter(db, backend, "file://"+root, "arc", 2, zerolog.Nop())
 	if err != nil {
 		t.Fatal(err)
 	}

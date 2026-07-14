@@ -194,6 +194,7 @@ type IcebergConfig struct {
 	NamespacePrefix   string // Iceberg namespace prefix; tables land in "<prefix>_<database>" (default "arc")
 	ReconcileInterval int    // Seconds between reconcile passes (default 300)
 	CatalogDBPath     string // SQLite catalog path; defaults to the shared auth DB
+	RetainSnapshots   int    // Snapshots (and metadata versions) to keep per table; older are expired (default 10)
 }
 
 type ContinuousQueryConfig struct {
@@ -639,6 +640,7 @@ func Load() (*Config, error) {
 			NamespacePrefix:   v.GetString("iceberg.namespace_prefix"),
 			ReconcileInterval: v.GetInt("iceberg.reconcile_interval"),
 			CatalogDBPath:     v.GetString("iceberg.catalog_db_path"),
+			RetainSnapshots:   v.GetInt("iceberg.retain_snapshots"),
 		},
 		ContinuousQuery: ContinuousQueryConfig{
 			Enabled: v.GetBool("continuous_query.enabled"),
@@ -1009,6 +1011,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("iceberg.namespace_prefix", "arc")
 	v.SetDefault("iceberg.reconcile_interval", 300)          // seconds
 	v.SetDefault("iceberg.catalog_db_path", "./data/arc.db") // shared SQLite DB with auth
+	v.SetDefault("iceberg.retain_snapshots", 10)
 	// iceberg.warehouse defaults at wire time to the storage root (needs the backend)
 
 	// Continuous query defaults

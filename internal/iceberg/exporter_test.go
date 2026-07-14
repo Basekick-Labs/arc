@@ -2,8 +2,11 @@ package iceberg
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -14,7 +17,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
 
-	"database/sql"
+	"github.com/basekick-labs/arc/internal/storage"
 )
 
 // writeArcStyleParquet writes a Parquet file matching Arc's ingest output: time as
@@ -84,7 +87,7 @@ func TestReconcile_AddIdempotentSupersede(t *testing.T) {
 	}
 	defer db.Close()
 
-	exp, err := NewExporter(db, nil, "file://"+dir+"/warehouse", "arc", zerolog.Nop())
+	exp, err := NewExporter(db, nil, "file://"+dir+"/warehouse", "arc", 0, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("NewExporter: %v", err)
 	}
@@ -193,7 +196,7 @@ func TestReconcile_SchemaEvolution(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	exp, err := NewExporter(db, nil, "file://"+dir+"/wh", "arc", zerolog.Nop())
+	exp, err := NewExporter(db, nil, "file://"+dir+"/wh", "arc", 0, zerolog.Nop())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,6 +225,72 @@ func TestReconcile_SchemaEvolution(t *testing.T) {
 	}
 	if _, ok := lt.Schema().FindFieldByName("cpu_idle"); !ok {
 		t.Fatalf("table schema missing cpu_idle after evolution: %v", lt.Schema())
+	}
+}
+
+// TestExpireSnapshotsAndPruneVersions verifies that with retain=N, snapshot history is capped
+// and our v<M>.metadata.json copies below the retained window are pruned.
+func TestExpireSnapshotsAndPruneVersions(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(root, "arc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const retain = 3
+	exp, err := NewExporter(db, backend, "file://"+root, "arc", retain, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	base := int64(1_700_000_000_000_000)
+
+	// Create 8 distinct single-file snapshots. Derive the schema the SAME way the reconciler
+	// does (from a Parquet file) so no spurious schema-evolution commit occurs on load.
+	var sc ArcSchema
+	for i := 0; i < 8; i++ {
+		f := filepath.Join(root, "db", "cpu", "2023", "11", "14", "22", fmt.Sprintf("f%d.parquet", i))
+		writeArcStyleParquet(t, f, base+int64(i)*1000, 5)
+		if i == 0 {
+			sc, _ = SchemaFromParquet(f)
+		}
+		if err := exp.ReconcileMeasurement(ctx, "db", "cpu", sc, []FileRef{{PhysicalPath: fileURI(f)}}); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+
+	// Snapshot count must be capped at retain, not 8+.
+	lt, _ := exp.EnsureTable(ctx, "db", "cpu", sc)
+	if n := len(lt.Metadata().Snapshots()); n > retain+1 {
+		t.Errorf("snapshot count = %d, want <= %d (retain=%d)", n, retain+1, retain)
+	}
+
+	// Old v<M>.metadata.json copies must be pruned to the newest `retain`.
+	metaDir := filepath.Join(root, "arc_db.db", "cpu", "metadata")
+	entries, _ := os.ReadDir(metaDir)
+	var vFiles []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "v") && strings.HasSuffix(e.Name(), ".metadata.json") {
+			vFiles = append(vFiles, e.Name())
+		}
+	}
+	if len(vFiles) > retain {
+		t.Errorf("v<N>.metadata.json count = %d (%v), want <= %d after pruning", len(vFiles), vFiles, retain)
+	}
+	// version-hint.text must point at an existing v<N>.metadata.json (readers rely on it).
+	hint, err := os.ReadFile(filepath.Join(metaDir, "version-hint.text"))
+	if err != nil {
+		t.Fatalf("version-hint.text missing: %v", err)
+	}
+	hv := strings.TrimSpace(string(hint))
+	if _, err := os.Stat(filepath.Join(metaDir, "v"+hv+".metadata.json")); err != nil {
+		t.Errorf("version-hint points at v%s but v%s.metadata.json missing: %v (have %v)", hv, hv, err, vFiles)
 	}
 }
 
