@@ -12,10 +12,12 @@ import (
 )
 
 // measurementState caches per-measurement work between passes so an unchanged measurement is
-// skipped without re-reading every Parquet footer.
+// skipped without re-reading every Parquet footer, and a grown measurement re-reads only the
+// footers of its newly-added local files (incremental schema derivation).
 type measurementState struct {
-	fingerprint string    // hash of the sorted file set + local-file set at last successful reconcile
-	schema      ArcSchema // schema derived at that reconcile (reused while the file set is unchanged)
+	fingerprint string              // hash of the sorted file set + local-file set at last successful reconcile
+	schema      ArcSchema           // schema derived at that reconcile (reused/extended while files persist)
+	localFiles  map[string]struct{} // local-file set at that reconcile — to diff for newly-added files
 }
 
 // WriterGate gates the reconciler to a single node in cluster mode. nil means "no gate,
@@ -50,10 +52,15 @@ type Scheduler struct {
 const measurementTimeout = 2 * time.Minute
 
 // FileSetSourceWithSchema is a FileSetSource that can also list the local files of a
-// measurement for schema derivation. StorageWalkSource satisfies it.
+// measurement for schema derivation, and (via FilesAndLocal) return both views from a single
+// storage listing so a reconcile pass doesn't double-list every measurement. StorageWalkSource
+// satisfies it.
 type FileSetSourceWithSchema interface {
 	FileSetSource
 	LocalFiles(ctx context.Context, m Measurement) ([]string, error)
+	// FilesAndLocal returns the measurement's data-file URIs and on-disk local paths from ONE
+	// backend listing (Files + LocalFiles would list twice).
+	FilesAndLocal(ctx context.Context, m Measurement) ([]FileRef, []string, error)
 }
 
 // SchedulerConfig configures the reconcile scheduler.
@@ -99,16 +106,22 @@ func (s *Scheduler) Stop() {
 
 func (s *Scheduler) loop(ctx context.Context) {
 	defer close(s.done)
-	ticker := time.NewTicker(s.interval)
-	defer ticker.Stop()
-	// Run one pass shortly after start so a fresh deployment publishes promptly, then on tick.
+	// Run one pass shortly after start so a fresh deployment publishes promptly.
 	s.runPass(ctx)
+	// A Timer reset AFTER each pass (rather than a Ticker) guarantees a full interval of idle
+	// between passes. With a Ticker, a pass that runs longer than the interval (slow disk, many
+	// files) would queue ticks and cause back-to-back passes with no breathing room — starving
+	// I/O and, in cluster mode, competing with the write path. The reconciler is idempotent, so
+	// a slightly-later next pass is always safe.
+	timer := time.NewTimer(s.interval)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			s.runPass(ctx)
+			timer.Reset(s.interval)
 		}
 	}
 }
@@ -164,11 +177,9 @@ func (s *Scheduler) runPass(ctx context.Context) {
 // the (data-file set + local-file set) lets us skip the expensive per-file footer reads and the
 // no-op diff entirely when nothing changed — the common steady-state case.
 func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string) (changed bool, err error) {
-	files, err := s.source.Files(ctx, m)
-	if err != nil {
-		return false, err
-	}
-	localFiles, err := s.source.LocalFiles(ctx, m)
+	// One backend listing yields both the data-file URIs and the local paths (Files + LocalFiles
+	// would list the same prefix twice).
+	files, localFiles, err := s.source.FilesAndLocal(ctx, m)
 	if err != nil {
 		return false, err
 	}
@@ -187,16 +198,48 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		return false, nil
 	}
 
-	// The set changed (or first sight): (re)derive the union schema from the local files. This
-	// is the only place footers are read, and only when something actually changed.
-	sc, err := UnionSchema(localFiles)
-	if err != nil {
-		return false, err
+	// The set changed (or first sight): derive the union schema. When we have a cached schema,
+	// only read footers of the LOCAL files that are new since last reconcile and merge them into
+	// the cached schema — avoiding an O(N) re-read of every footer every time the set grows.
+	// (Removed files can't remove columns: the table schema is a superset and all fields are
+	// optional, so dropping a file never narrows the schema.) First sight, or a cache with no
+	// remembered local set, falls back to a full UnionSchema.
+	var sc ArcSchema
+	if cached && prev.localFiles != nil {
+		var newLocal []string
+		for _, lp := range localFiles {
+			if _, ok := prev.localFiles[lp]; !ok {
+				newLocal = append(newLocal, lp)
+			}
+		}
+		if len(newLocal) == 0 {
+			sc = prev.schema // only removals — schema unchanged
+		} else {
+			addSc, err := UnionSchema(newLocal)
+			if err != nil {
+				return false, err
+			}
+			sc, err = MergeSchemas(prev.schema, addSc)
+			if err != nil {
+				return false, err
+			}
+		}
+	} else {
+		sc, err = UnionSchema(localFiles)
+		if err != nil {
+			return false, err
+		}
 	}
+
 	if err := s.exporter.ReconcileMeasurement(ctx, m.Database, m.Measurement, sc, files); err != nil {
 		return false, err
 	}
-	s.state[key] = measurementState{fingerprint: fp, schema: sc}
+
+	localSet := make(map[string]struct{}, len(localFiles))
+	for _, lp := range localFiles {
+		localSet[lp] = struct{}{}
+	}
+	s.state[key] = measurementState{fingerprint: fp, schema: sc, localFiles: localSet}
 	return true, nil
 }
 

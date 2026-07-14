@@ -21,6 +21,24 @@ func NewPathResolver(backend storage.Backend) *PathResolver {
 	return &PathResolver{backend: backend}
 }
 
+// localFileURI builds a valid file:// URI from an on-disk path. It resolves to an absolute path
+// (a relative path like ./data would be misread as the URI host/authority by Spark/Trino/DuckDB)
+// and normalizes separators to forward slashes (backslashes on Windows produce malformed URIs).
+// Result is file:///abs/path — the empty authority (three slashes) is the correct local form.
+func localFileURI(p string) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		abs = p
+	}
+	slashed := filepath.ToSlash(abs)
+	if !strings.HasPrefix(slashed, "/") {
+		// Windows absolute paths (C:/…) need a leading slash after file:// so the drive letter
+		// is the path, not the authority: file:///C:/…
+		slashed = "/" + slashed
+	}
+	return "file://" + slashed
+}
+
 // DefaultWarehouse returns the Iceberg warehouse root for a backend when none is configured:
 // the storage root, so table metadata lands alongside the data (file:// local, s3://bucket/
 // prefix for object storage). Iceberg writes {warehouse}/{namespace}.db/{table}/metadata/...
@@ -31,9 +49,9 @@ func DefaultWarehouse(backend storage.Backend) string {
 	case *storage.AzureBlobBackend:
 		return "azure://" + b.GetContainer()
 	case *storage.LocalBackend:
-		return "file://" + b.GetBasePath()
+		return localFileURI(b.GetBasePath())
 	default:
-		return "file://./data"
+		return localFileURI("./data")
 	}
 }
 
@@ -46,9 +64,9 @@ func (r *PathResolver) Resolve(relativeKey string) string {
 	case *storage.AzureBlobBackend:
 		return "azure://" + b.GetContainer() + "/" + key
 	case *storage.LocalBackend:
-		return "file://" + filepath.Join(b.GetBasePath(), key)
+		return localFileURI(filepath.Join(b.GetBasePath(), key))
 	default:
-		return "file://" + filepath.Join("./data", key)
+		return localFileURI(filepath.Join("./data", key))
 	}
 }
 

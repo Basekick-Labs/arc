@@ -174,7 +174,12 @@ func (e *Exporter) evolveSchema(ctx context.Context, tbl *icetable.Table, sc Arc
 		}
 	}
 	if len(missing) == 0 {
-		return tbl, nil
+		// Self-heal: a prior evolution may have committed the schema but then failed to commit the
+		// follow-up name-mapping update (txn2 below). In that state the schema already covers every
+		// column, so we return here without ever re-setting the mapping — leaving an evolution-added
+		// column with no field-mapping, which breaks external readers permanently. Reconcile the
+		// stored name-mapping against the table's actual schema whenever they diverge.
+		return e.healNameMapping(ctx, tbl)
 	}
 	txn := tbl.NewTransaction()
 	upd := txn.UpdateSchema(false /* caseSensitive */, false /* allowIncompatibleChanges */)
@@ -211,6 +216,36 @@ func (e *Exporter) evolveSchema(ctx context.Context, tbl *icetable.Table, sc Arc
 	e.writeVersionHint(ctx, evolved)
 	e.logger.Info().Int("added_columns", len(missing)).Msg("Evolved Iceberg table schema")
 	return evolved, nil
+}
+
+// healNameMapping ensures the stored schema.name-mapping.default matches the table's current
+// schema. It only commits when they actually differ, so it is a cheap no-op on the common path.
+// This closes the gap where a schema evolution committed but its follow-up mapping update did
+// not (see evolveSchema): once the columns are in the schema, evolveSchema's len(missing)==0
+// early-return would otherwise never repair the mapping, permanently breaking external readers
+// for the evolution-added column. Best-effort: on any failure it logs and returns tbl unchanged.
+func (e *Exporter) healNameMapping(ctx context.Context, tbl *icetable.Table) (*icetable.Table, error) {
+	nmJSON, err := json.Marshal(tbl.Schema().NameMapping())
+	if err != nil {
+		e.logger.Warn().Err(err).Msg("Iceberg name-mapping heal: marshal failed (non-fatal)")
+		return tbl, nil
+	}
+	if tbl.Properties()[icetable.DefaultNameMappingKey] == string(nmJSON) {
+		return tbl, nil // already consistent — no commit
+	}
+	txn := tbl.NewTransaction()
+	if err := txn.SetProperties(iceberg.Properties{icetable.DefaultNameMappingKey: string(nmJSON)}); err != nil {
+		e.logger.Warn().Err(err).Msg("Iceberg name-mapping heal: set property failed (non-fatal)")
+		return tbl, nil
+	}
+	healed, err := txn.Commit(ctx)
+	if err != nil {
+		e.logger.Warn().Err(err).Msg("Iceberg name-mapping heal: commit failed (non-fatal) — will retry next pass")
+		return tbl, nil
+	}
+	e.writeVersionHint(ctx, healed)
+	e.logger.Info().Msg("Iceberg name-mapping healed to match current schema")
+	return healed, nil
 }
 
 // ReconcileMeasurement makes the Iceberg table's data-file set equal `current`: it AddFiles

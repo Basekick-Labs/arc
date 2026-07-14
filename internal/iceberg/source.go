@@ -92,19 +92,8 @@ func (s *StorageWalkSource) Measurements(ctx context.Context) ([]Measurement, er
 
 // Files lists the current .parquet files for a measurement and resolves them to URIs.
 func (s *StorageWalkSource) Files(ctx context.Context, m Measurement) ([]FileRef, error) {
-	prefix := m.Database + "/" + m.Measurement + "/"
-	paths, err := s.backend.List(ctx, prefix)
-	if err != nil {
-		return nil, fmt.Errorf("list files for %s/%s: %w", m.Database, m.Measurement, err)
-	}
-	var out []FileRef
-	for _, p := range paths {
-		if !isDataFile(p) {
-			continue
-		}
-		out = append(out, FileRef{PhysicalPath: s.resolver.Resolve(p)})
-	}
-	return out, nil
+	files, _, err := s.FilesAndLocal(ctx, m)
+	return files, err
 }
 
 // LocalFiles returns on-disk paths to ALL of the measurement's Parquet files for schema
@@ -113,20 +102,33 @@ func (s *StorageWalkSource) Files(ctx context.Context, m Measurement) ([]FileRef
 // local or the measurement has no local files. Cold-only measurements yield no local files
 // and are skipped for schema derivation in v1 (documented limitation).
 func (s *StorageWalkSource) LocalFiles(ctx context.Context, m Measurement) ([]string, error) {
+	_, local, err := s.FilesAndLocal(ctx, m)
+	return local, err
+}
+
+// FilesAndLocal lists the measurement's Parquet files ONCE and returns both the iceberg-readable
+// URIs and the on-disk local paths, so the reconciler doesn't pay for two identical backend
+// List() calls per measurement per pass. The two slices are aligned only in the sense that every
+// local path corresponds to a data file also present in `files`; local is empty when the backend
+// is non-local. Files() and LocalFiles() delegate here for callers that need just one view.
+func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([]FileRef, []string, error) {
 	prefix := m.Database + "/" + m.Measurement + "/"
 	paths, err := s.backend.List(ctx, prefix)
 	if err != nil {
-		return nil, err
+		return nil, nil, fmt.Errorf("list files for %s/%s: %w", m.Database, m.Measurement, err)
 	}
-	var out []string
+	var files []FileRef
+	var local []string
 	for _, p := range paths {
-		if isDataFile(p) {
-			if lp := s.resolver.LocalPath(p); lp != "" {
-				out = append(out, lp)
-			}
+		if !isDataFile(p) {
+			continue
+		}
+		files = append(files, FileRef{PhysicalPath: s.resolver.Resolve(p)})
+		if lp := s.resolver.LocalPath(p); lp != "" {
+			local = append(local, lp)
 		}
 	}
-	return out, nil
+	return files, local, nil
 }
 
 // isDataFile reports whether a storage key is an Arc data file to export. Only .parquet is

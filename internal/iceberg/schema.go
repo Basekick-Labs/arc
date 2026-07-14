@@ -90,6 +90,35 @@ func UnionSchema(localPaths []string) (ArcSchema, error) {
 	return ArcSchema{Fields: fields}, nil
 }
 
+// MergeSchemas unions two already-derived ArcSchemas, preserving `base`'s column order and
+// appending any names that appear only in `add`. A name present in both must carry the same
+// type — a genuine conflict is an error (matching UnionSchema's semantics). This lets the
+// reconciler extend a cached schema with only the newly-added files' schemas, avoiding an O(N)
+// re-read of every footer when a measurement's file set grows.
+func MergeSchemas(base, add ArcSchema) (ArcSchema, error) {
+	seen := make(map[string]iceberg.Type, len(base.Fields)+len(add.Fields))
+	order := make([]string, 0, len(base.Fields)+len(add.Fields))
+	for _, f := range base.Fields {
+		seen[f.Name] = f.Type
+		order = append(order, f.Name)
+	}
+	for _, f := range add.Fields {
+		if prev, ok := seen[f.Name]; ok {
+			if prev.String() != f.Type.String() {
+				return ArcSchema{}, fmt.Errorf("column %q has conflicting types across files: %s vs %s", f.Name, prev, f.Type)
+			}
+			continue
+		}
+		seen[f.Name] = f.Type
+		order = append(order, f.Name)
+	}
+	fields := make([]ArcField, len(order))
+	for i, name := range order {
+		fields[i] = ArcField{Name: name, Type: seen[name]}
+	}
+	return ArcSchema{Fields: fields}, nil
+}
+
 // arrowToIceberg maps one Arrow type to its Iceberg type per the table above.
 func arrowToIceberg(t arrow.DataType) (iceberg.Type, error) {
 	switch dt := t.(type) {

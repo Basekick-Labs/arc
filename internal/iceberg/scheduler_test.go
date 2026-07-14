@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	iceberg "github.com/apache/iceberg-go"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
 
@@ -173,5 +174,80 @@ func TestScheduler_IncrementalSkip(t *testing.T) {
 	sched.runPass(ctx)
 	if s3 := snapOf(); s3 == s1 {
 		t.Errorf("adding a file did not produce a new snapshot (still %d) — change not detected", s1)
+	}
+}
+
+// TestScheduler_IncrementalSchemaEvolution proves the incremental schema-derivation path picks
+// up a column that appears only in a newly-added file. The first pass caches the narrow (3-col)
+// schema; the second pass adds a wide (4-col) file, so reconcileOne reads ONLY the new file's
+// footer and merges it — the table schema must gain the new column without a full re-derivation.
+func TestScheduler_IncrementalSchemaEvolution(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := int64(1_700_000_000_000_000)
+	// Narrow file first: time, host, value.
+	writeArcStyleParquet(t, filepath.Join(root, "mydb/cpu/2023/11/14/22/a.parquet"), base, 20)
+
+	db, err := sql.Open("sqlite3", filepath.Join(root, "arc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	exp, err := NewExporter(db, backend, "file://"+root, "arc", 0, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc"), Logger: zerolog.Nop()})
+
+	sched.runPass(ctx) // caches narrow schema
+	lt, _ := exp.EnsureTable(ctx, "mydb", "cpu", ArcSchema{})
+	if _, ok := lt.Schema().FindFieldByName("cpu_idle"); ok {
+		t.Fatal("cpu_idle present before the wide file was added")
+	}
+
+	// Add a WIDE file (has the extra cpu_idle column). Incremental path reads only this footer.
+	writeArcStyleParquet4Col(t, filepath.Join(root, "mydb/cpu/2023/11/14/23/b.parquet"), base+3_600_000_000, 20)
+	sched.runPass(ctx)
+
+	lt, _ = exp.EnsureTable(ctx, "mydb", "cpu", ArcSchema{})
+	if _, ok := lt.Schema().FindFieldByName("cpu_idle"); !ok {
+		t.Fatalf("incremental schema derivation missed the new column cpu_idle: %v", lt.Schema())
+	}
+	files, _ := exp.tableDataFiles(ctx, lt)
+	if len(files) != 2 {
+		t.Fatalf("want 2 files after evolution, got %d", len(files))
+	}
+}
+
+func TestMergeSchemas(t *testing.T) {
+	long := iceberg.PrimitiveTypes.Int64
+	dbl := iceberg.PrimitiveTypes.Float64
+	str := iceberg.PrimitiveTypes.String
+
+	base := ArcSchema{Fields: []ArcField{{Name: "time", Type: long}, {Name: "host", Type: str}}}
+	add := ArcSchema{Fields: []ArcField{{Name: "host", Type: str}, {Name: "value", Type: dbl}}}
+
+	merged, err := MergeSchemas(base, add)
+	if err != nil {
+		t.Fatalf("MergeSchemas: %v", err)
+	}
+	// Order: base first-seen, then new names from add.
+	gotNames := make([]string, len(merged.Fields))
+	for i, f := range merged.Fields {
+		gotNames[i] = f.Name
+	}
+	want := []string{"time", "host", "value"}
+	if strings.Join(gotNames, ",") != strings.Join(want, ",") {
+		t.Errorf("merged order = %v, want %v", gotNames, want)
+	}
+
+	// Conflicting type for the same name must error, not silently pick one.
+	conflict := ArcSchema{Fields: []ArcField{{Name: "host", Type: long}}}
+	if _, err := MergeSchemas(base, conflict); err == nil {
+		t.Error("expected an error for a conflicting type on column 'host', got nil")
 	}
 }
