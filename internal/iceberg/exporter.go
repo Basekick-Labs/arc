@@ -17,7 +17,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"path"
 	"sort"
+	"strconv"
 	"strings"
 
 	iceberg "github.com/apache/iceberg-go"
@@ -25,6 +27,8 @@ import (
 	sqlcat "github.com/apache/iceberg-go/catalog/sql"
 	icetable "github.com/apache/iceberg-go/table"
 	"github.com/rs/zerolog"
+
+	"github.com/basekick-labs/arc/internal/storage"
 )
 
 // FileRef is one Arc data file as the reconciler sees it, decoupled from the durable source
@@ -38,17 +42,21 @@ type FileRef struct {
 // Exporter maintains Iceberg tables that mirror Arc's Parquet file set. One Exporter per
 // process; ReconcileMeasurement is the unit of work (one measurement's table).
 type Exporter struct {
-	catalog  *sqlcat.Catalog
-	nsPrefix string // namespace for Iceberg tables (e.g. "arc")
-	logger   zerolog.Logger
+	catalog   *sqlcat.Catalog
+	backend   storage.Backend // for writing version-hint.text alongside table metadata
+	warehouse string          // warehouse root URI (file://… or s3://bucket/prefix)
+	nsPrefix  string          // namespace for Iceberg tables (e.g. "arc")
+	logger    zerolog.Logger
 }
 
 // NewExporter builds an Exporter backed by a SQL (SQLite) Iceberg catalog on the given
 // *sql.DB. Pass Arc's existing shared SQLite handle (mattn sqlite3) so the catalog rides the
 // same DB as auth/tiering/retention — no second SQLite implementation, no extra service.
 // warehouse is the object-store/local root under which table metadata is written
-// (file://… or s3://bucket/prefix).
-func NewExporter(db *sql.DB, warehouse, nsPrefix string, logger zerolog.Logger) (*Exporter, error) {
+// (file://… or s3://bucket/prefix). backend is used to write version-hint.text next to the
+// table metadata (local or S3), enabling directory-based readers to discover the current
+// metadata without an exact filename.
+func NewExporter(db *sql.DB, backend storage.Backend, warehouse, nsPrefix string, logger zerolog.Logger) (*Exporter, error) {
 	if nsPrefix == "" {
 		nsPrefix = "arc"
 	}
@@ -59,9 +67,11 @@ func NewExporter(db *sql.DB, warehouse, nsPrefix string, logger zerolog.Logger) 
 		return nil, fmt.Errorf("create iceberg sql catalog: %w", err)
 	}
 	return &Exporter{
-		catalog:  cat,
-		nsPrefix: nsPrefix,
-		logger:   logger.With().Str("component", "iceberg-exporter").Logger(),
+		catalog:   cat,
+		backend:   backend,
+		warehouse: strings.TrimSuffix(warehouse, "/"),
+		nsPrefix:  nsPrefix,
+		logger:    logger.With().Str("component", "iceberg-exporter").Logger(),
 	}, nil
 }
 
@@ -136,6 +146,7 @@ func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string
 	if err != nil {
 		return nil, fmt.Errorf("create iceberg table %v: %w", ident, err)
 	}
+	e.writeVersionHint(ctx, tbl)
 	e.logger.Info().Str("database", database).Str("measurement", measurement).Msg("Created Iceberg table")
 	return tbl, nil
 }
@@ -186,6 +197,7 @@ func (e *Exporter) evolveSchema(ctx context.Context, tbl *icetable.Table, sc Arc
 	if err != nil {
 		return nil, fmt.Errorf("commit name mapping after evolution: %w", err)
 	}
+	e.writeVersionHint(ctx, evolved)
 	e.logger.Info().Int("added_columns", len(missing)).Msg("Evolved Iceberg table schema")
 	return evolved, nil
 }
@@ -237,14 +249,96 @@ func (e *Exporter) ReconcileMeasurement(ctx context.Context, database, measureme
 	if err := txn.ReplaceDataFiles(ctx, toRemove, toAdd, nil); err != nil {
 		return fmt.Errorf("iceberg ReplaceDataFiles (add=%d remove=%d): %w", len(toAdd), len(toRemove), err)
 	}
-	if _, err := txn.Commit(ctx); err != nil {
+	committed, err := txn.Commit(ctx)
+	if err != nil {
 		return fmt.Errorf("iceberg commit (add=%d remove=%d): %w", len(toAdd), len(toRemove), err)
 	}
+	e.writeVersionHint(ctx, committed)
 	e.logger.Info().
 		Str("database", database).Str("measurement", measurement).
 		Int("added", len(toAdd)).Int("removed", len(toRemove)).
 		Msg("Reconciled Iceberg table")
 	return nil
+}
+
+// writeVersionHint publishes the Hadoop-catalog discovery files next to the table's current
+// metadata so DIRECTORY-based readers (Spark's hadoop-format load, DuckDB's dir-level
+// iceberg_scan) can find the current metadata without being handed the exact filename:
+//
+//   - metadata/version-hint.text — the version integer (e.g. "4").
+//   - metadata/v<N>.metadata.json — a copy of the current metadata under the Hadoop-convention
+//     filename. REQUIRED in addition to the hint: iceberg-go/the SQL catalog write
+//     "NNNNN-<uuid>.metadata.json", but Spark and DuckDB resolve the hint strictly to
+//     "v<N>.metadata.json" (verified empirically — both fail "metadata file for version N
+//     missing" with only the hint). Catalog-aware readers (PyIceberg, iceberg-go) are
+//     unaffected; they use the catalog's pointer and ignore these files.
+//
+// Best-effort: failures are logged, not fatal — the SQL catalog remains the source of truth
+// and the next reconcile rewrites these. Works for local and S3 warehouses via the backend.
+func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) {
+	if e.backend == nil {
+		return
+	}
+	metaLoc := tbl.MetadataLocation() // e.g. file:///…/metadata/00004-<uuid>.metadata.json
+	version, dirKey, ok := e.parseVersionAndMetaDir(metaLoc)
+	if !ok {
+		e.logger.Debug().Str("metadata", metaLoc).Msg("Could not derive version-hint location; skipping")
+		return
+	}
+	// Copy the current metadata to v<N>.metadata.json (Hadoop-convention name).
+	metaKey, kOK := e.warehouseRelKey(metaLoc)
+	if kOK {
+		if body, err := e.backend.Read(ctx, metaKey); err != nil {
+			e.logger.Warn().Err(err).Str("key", metaKey).Msg("Failed to read current metadata for v<N> copy (non-fatal)")
+		} else {
+			vKey := path.Join(dirKey, "v"+version+".metadata.json")
+			if err := e.backend.Write(ctx, vKey, body); err != nil {
+				e.logger.Warn().Err(err).Str("key", vKey).Msg("Failed to write v<N>.metadata.json (non-fatal)")
+			}
+		}
+	}
+	// Write the version-hint pointer — just the integer, NO trailing newline (DuckDB reads the
+	// file verbatim and would look for "v<N>\n.metadata.json" otherwise; verified empirically).
+	hintKey := path.Join(dirKey, "version-hint.text")
+	if err := e.backend.Write(ctx, hintKey, []byte(version)); err != nil {
+		e.logger.Warn().Err(err).Str("key", hintKey).Msg("Failed to write version-hint.text (non-fatal)")
+	}
+}
+
+// warehouseRelKey converts a full metadata URI to a STORAGE-RELATIVE key (backend Read/Write
+// operate on relative keys). Returns ok=false if the URI isn't under the warehouse root.
+//
+//	metaLoc="file:///wh/arc_db.db/cpu/metadata/00004-<uuid>.metadata.json", warehouse="file:///wh"
+//	-> "arc_db.db/cpu/metadata/00004-<uuid>.metadata.json"
+func (e *Exporter) warehouseRelKey(metaLoc string) (string, bool) {
+	rel := strings.TrimPrefix(metaLoc, e.warehouse)
+	if rel == metaLoc {
+		return "", false
+	}
+	return strings.TrimPrefix(rel, "/"), true
+}
+
+// parseVersionAndMetaDir derives, from a full metadata-file URI, the version integer (e.g.
+// "4" from 00004-<uuid>.metadata.json) and the STORAGE-RELATIVE key of the metadata/ directory
+// it lives in. Returns ok=false if not under the warehouse or the filename doesn't match.
+func (e *Exporter) parseVersionAndMetaDir(metaLoc string) (version, dirKey string, ok bool) {
+	rel, ok := e.warehouseRelKey(metaLoc)
+	if !ok {
+		return "", "", false
+	}
+	base := path.Base(rel) // 00004-<uuid>.metadata.json
+	if !strings.HasSuffix(base, ".metadata.json") {
+		return "", "", false
+	}
+	prefix, _, found := strings.Cut(base, "-") // "00004"
+	if !found {
+		return "", "", false
+	}
+	n, err := strconv.Atoi(prefix)
+	if err != nil {
+		return "", "", false
+	}
+	return strconv.Itoa(n), path.Dir(rel), true
 }
 
 // tableDataFiles returns the set of LIVE physical data-file paths in the table's current

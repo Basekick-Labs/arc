@@ -3,8 +3,11 @@ package iceberg
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -39,7 +42,7 @@ func TestStorageWalkSourceAndReconcile(t *testing.T) {
 	}
 	defer db.Close()
 
-	exp, err := NewExporter(db, "file://"+root+"/warehouse", "arc", zerolog.Nop())
+	exp, err := NewExporter(db, backend, "file://"+root, "arc", zerolog.Nop())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,4 +94,31 @@ func TestStorageWalkSourceAndReconcile(t *testing.T) {
 	}
 	sched.runPass(ctx)
 	assertTableFiles(relH15, relH16)
+
+	// version-hint.text must exist in the table's metadata dir with the current version int,
+	// so directory-based readers (Spark hadoop-format load) can discover current metadata.
+	hint := filepath.Join(root, "arc_mydb.db", "cpu", "metadata", "version-hint.text")
+	data, err := os.ReadFile(hint)
+	if err != nil {
+		t.Fatalf("version-hint.text not written: %v", err)
+	}
+	v := strings.TrimSpace(string(data))
+	if n, err := strconv.Atoi(v); err != nil || n < 1 {
+		t.Fatalf("version-hint.text content = %q, want a positive integer", v)
+	}
+	// It must match the current metadata file's version prefix.
+	lt, _ := exp.EnsureTable(ctx, "mydb", "cpu", ArcSchema{})
+	wantPrefix := fmt.Sprintf("%05d-", mustAtoi(t, v))
+	if base := filepath.Base(strings.TrimPrefix(lt.MetadataLocation(), "file://")); !strings.HasPrefix(base, wantPrefix) {
+		t.Errorf("version-hint %q does not match current metadata %q", v, base)
+	}
+}
+
+func mustAtoi(t *testing.T, s string) int {
+	t.Helper()
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
 }

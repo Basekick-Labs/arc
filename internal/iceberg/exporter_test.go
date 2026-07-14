@@ -84,7 +84,7 @@ func TestReconcile_AddIdempotentSupersede(t *testing.T) {
 	}
 	defer db.Close()
 
-	exp, err := NewExporter(db, "file://"+dir+"/warehouse", "arc", zerolog.Nop())
+	exp, err := NewExporter(db, nil, "file://"+dir+"/warehouse", "arc", zerolog.Nop())
 	if err != nil {
 		t.Fatalf("NewExporter: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestReconcile_SchemaEvolution(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	exp, err := NewExporter(db, "file://"+dir+"/wh", "arc", zerolog.Nop())
+	exp, err := NewExporter(db, nil, "file://"+dir+"/wh", "arc", zerolog.Nop())
 	if err != nil {
 		t.Fatal(err)
 	}
