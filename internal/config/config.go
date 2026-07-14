@@ -646,6 +646,10 @@ func Load() (*Config, error) {
 			Enabled: v.GetBool("continuous_query.enabled"),
 			DBPath:  v.GetString("continuous_query.db_path"),
 		},
+		Backup: BackupConfig{
+			Enabled:   v.GetBool("backup.enabled"),
+			LocalPath: v.GetString("backup.local_path"),
+		},
 		Metrics: MetricsConfig{
 			TimeseriesRetentionMinutes: v.GetInt("metrics.timeseries_retention_minutes"),
 			TimeseriesIntervalSeconds:  v.GetInt("metrics.timeseries_interval_seconds"),
