@@ -133,6 +133,32 @@ func TestParseDBMeasurement(t *testing.T) {
 	}
 }
 
+func TestIsIcebergMetadata(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		// Iceberg warehouse metadata — must be backed up.
+		{"arc_mydb.db/cpu/metadata/00001-abc.metadata.json", true},
+		{"arc_mydb.db/cpu/metadata/v3.metadata.json", true},
+		{"arc_mydb.db/cpu/metadata/1234-uuid-m1.avro", true},
+		{"arc_mydb.db/cpu/metadata/snap-999-uuid.avro", true},
+		{"arc_mydb.db/cpu/metadata/version-hint.text", true},
+		// Regular data files — handled by the .parquet filter, not this.
+		{"mydb/cpu/2026/07/14/15/cpu_123.parquet", false},
+		// A measurement literally named "metadata" holding parquet must NOT match
+		// (it's .parquet, and the base is not a metadata-file form).
+		{"mydb/metadata/2026/07/14/15/x.parquet", false},
+		// Stray non-metadata files under a metadata/ dir don't match.
+		{"arc_mydb.db/cpu/metadata/notes.txt", false},
+	}
+	for _, tt := range tests {
+		if got := isIcebergMetadata(tt.path); got != tt.want {
+			t.Errorf("isIcebergMetadata(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+}
+
 func TestUnmarshalManifest_Invalid(t *testing.T) {
 	_, err := UnmarshalManifest([]byte("not json"))
 	if err == nil {
