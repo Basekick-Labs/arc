@@ -66,11 +66,20 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		return nil, fmt.Errorf("failed to list data files: %w", err)
 	}
 
-	// Filter to .parquet files only
+	// Filter to .parquet data files (the manifest inventory), and separately collect Iceberg
+	// warehouse metadata (metadata.json / .avro / version-hint.text under an Iceberg table's
+	// metadata/ dir). The Iceberg metadata is NOT parquet, so the old .parquet-only filter
+	// silently dropped it — a restore then lost the Iceberg tables (the referenced parquet
+	// survived, but the table metadata pointing at it did not). It is copied via the same
+	// mechanism but kept out of the db/measurement inventory below.
 	var parquetFiles []storage.ObjectInfo
+	var icebergMetaFiles []storage.ObjectInfo
 	for _, obj := range objects {
-		if strings.HasSuffix(obj.Path, ".parquet") {
+		switch {
+		case strings.HasSuffix(obj.Path, ".parquet"):
 			parquetFiles = append(parquetFiles, obj)
+		case isIcebergMetadata(obj.Path):
+			icebergMetaFiles = append(icebergMetaFiles, obj)
 		}
 	}
 
@@ -118,7 +127,9 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		manifest.Databases = append(manifest.Databases, *di)
 	}
 
-	progress.TotalFiles = manifest.TotalFiles
+	// Progress total includes Iceberg metadata files (copied in step 2b) so ProcessedFiles
+	// never exceeds TotalFiles. The manifest inventory (TotalFiles) counts only data files.
+	progress.TotalFiles = manifest.TotalFiles + int64(len(icebergMetaFiles))
 	progress.TotalBytes = manifest.TotalSizeBytes
 
 	// ── 2. Copy parquet files ───────────────────────────────────────────
@@ -126,6 +137,19 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		progress.Status = "failed"
 		progress.Error = err.Error()
 		return nil, err
+	}
+
+	// ── 2b. Copy Iceberg warehouse metadata (if any) ────────────────────
+	// Same copy mechanism + path preservation as data files, so restore round-trips them to
+	// their original locations and the SQLite catalog's metadata pointers still resolve. The
+	// referenced parquet data is already copied above; only the Iceberg metadata is added here.
+	if len(icebergMetaFiles) > 0 {
+		if err := m.copyDataFiles(ctx, backupID, icebergMetaFiles, progress); err != nil {
+			progress.Status = "failed"
+			progress.Error = err.Error()
+			return nil, err
+		}
+		m.logger.Info().Int("files", len(icebergMetaFiles)).Msg("Backed up Iceberg warehouse metadata")
 	}
 
 	// ── 3. Copy SQLite metadata ─────────────────────────────────────────
@@ -255,6 +279,28 @@ func (m *Manager) backupConfig(ctx context.Context, backupID string) error {
 
 	m.logger.Info().Str("backup_id", backupID).Msg("Config file backed up")
 	return nil
+}
+
+// isIcebergMetadata reports whether a storage path is an Iceberg warehouse metadata file that
+// must be backed up alongside data. Iceberg tables written by Arc's exporter live at
+// {nsPrefix}_{db}.db/{measurement}/metadata/*, containing table metadata (*.metadata.json,
+// incl. our v<N>.metadata.json reader copies), manifest lists + manifests (*.avro), and
+// version-hint.text (current-version pointer for directory-based readers).
+//
+// Deliberately a catch-all — ANY non-parquet file under a "/metadata/" segment — rather than an
+// allowlist of today's extensions. Iceberg keeps adding metadata file types (e.g. Puffin
+// .puffin statistics/index files); an allowlist silently drops them from the backup and loses
+// them on restore. Over-copying a stray file is cheap; losing table metadata is not.
+//
+// Safe against a user measurement literally named "metadata": its files are .parquet, and the
+// caller's switch tests the .parquet branch FIRST, so data files never reach this predicate.
+// The referenced parquet DATA files are backed up normally.
+func isIcebergMetadata(p string) bool {
+	p = filepath.ToSlash(p)
+	if !strings.Contains(p, "/metadata/") {
+		return false
+	}
+	return !strings.HasSuffix(p, ".parquet")
 }
 
 // parseDBMeasurement extracts the database and measurement from a storage path.

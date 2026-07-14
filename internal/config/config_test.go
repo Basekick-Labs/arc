@@ -149,6 +149,103 @@ func TestLoad_DefaultsFromSystem(t *testing.T) {
 	}
 }
 
+func TestLoad_BackupConfigPopulated(t *testing.T) {
+	// Regression: cfg.Backup was never populated in Load(), so the backup API never enabled
+	// regardless of the [backup] section. Assert defaults land and env overrides apply.
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	// Defaults: enabled=true, local_path set.
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if !cfg.Backup.Enabled {
+		t.Error("Backup.Enabled = false, want true (default)")
+	}
+	if cfg.Backup.LocalPath == "" {
+		t.Error("Backup.LocalPath is empty, want the default path")
+	}
+
+	// Env override.
+	os.Setenv("ARC_BACKUP_ENABLED", "false")
+	os.Setenv("ARC_BACKUP_LOCAL_PATH", "/custom/backups")
+	defer func() {
+		os.Unsetenv("ARC_BACKUP_ENABLED")
+		os.Unsetenv("ARC_BACKUP_LOCAL_PATH")
+	}()
+	cfg2, err := Load()
+	if err != nil {
+		t.Fatalf("Load() with env: %v", err)
+	}
+	if cfg2.Backup.Enabled {
+		t.Error("Backup.Enabled = true, want false (from env)")
+	}
+	if cfg2.Backup.LocalPath != "/custom/backups" {
+		t.Errorf("Backup.LocalPath = %q, want /custom/backups (from env)", cfg2.Backup.LocalPath)
+	}
+}
+
+func TestLoad_IcebergRejectsColdTiering(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	// iceberg + cold-tier tiering must be rejected (cold files would be deleted from the table).
+	os.Setenv("ARC_ICEBERG_ENABLED", "true")
+	os.Setenv("ARC_TIERED_STORAGE_ENABLED", "true")
+	os.Setenv("ARC_TIERED_STORAGE_COLD_ENABLED", "true")
+	os.Setenv("ARC_TIERED_STORAGE_COLD_BACKEND", "s3")
+	os.Setenv("ARC_TIERED_STORAGE_COLD_S3_BUCKET", "b")
+	defer func() {
+		os.Unsetenv("ARC_ICEBERG_ENABLED")
+		os.Unsetenv("ARC_TIERED_STORAGE_ENABLED")
+		os.Unsetenv("ARC_TIERED_STORAGE_COLD_ENABLED")
+		os.Unsetenv("ARC_TIERED_STORAGE_COLD_BACKEND")
+		os.Unsetenv("ARC_TIERED_STORAGE_COLD_S3_BUCKET")
+	}()
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for iceberg.enabled + cold-tier tiering, got nil")
+	}
+}
+
+func TestLoad_IcebergRequiresLocalBackend(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	// iceberg + non-local primary backend must be rejected (local-only in v1).
+	os.Setenv("ARC_ICEBERG_ENABLED", "true")
+	os.Setenv("ARC_STORAGE_BACKEND", "s3")
+	os.Setenv("ARC_STORAGE_S3_BUCKET", "b")
+	defer func() {
+		os.Unsetenv("ARC_ICEBERG_ENABLED")
+		os.Unsetenv("ARC_STORAGE_BACKEND")
+		os.Unsetenv("ARC_STORAGE_S3_BUCKET")
+	}()
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for iceberg.enabled + non-local backend, got nil")
+	}
+}
+
 func TestLoad_EnvOverride(t *testing.T) {
 	// Create a temp dir without config file
 	tmpDir, err := os.MkdirTemp("", "arc-config-test")

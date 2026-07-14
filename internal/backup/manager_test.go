@@ -133,6 +133,35 @@ func TestParseDBMeasurement(t *testing.T) {
 	}
 }
 
+func TestIsIcebergMetadata(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		// Iceberg warehouse metadata — must be backed up.
+		{"arc_mydb.db/cpu/metadata/00001-abc.metadata.json", true},
+		{"arc_mydb.db/cpu/metadata/v3.metadata.json", true},
+		{"arc_mydb.db/cpu/metadata/1234-uuid-m1.avro", true},
+		{"arc_mydb.db/cpu/metadata/snap-999-uuid.avro", true},
+		{"arc_mydb.db/cpu/metadata/version-hint.text", true},
+		// Future Iceberg metadata types (e.g. Puffin stats/index files) must be caught too —
+		// the predicate is a catch-all for non-parquet under /metadata/, not an extension
+		// allowlist, so a new file type can't silently drop out of the backup.
+		{"arc_mydb.db/cpu/metadata/stats-abc.puffin", true},
+		{"arc_mydb.db/cpu/metadata/notes.txt", true},
+		// Regular data files — handled by the .parquet filter, not this.
+		{"mydb/cpu/2026/07/14/15/cpu_123.parquet", false},
+		// A measurement literally named "metadata" holding parquet must NOT match: it's
+		// .parquet, and CreateBackup's switch tests the .parquet branch before this predicate.
+		{"mydb/metadata/2026/07/14/15/x.parquet", false},
+	}
+	for _, tt := range tests {
+		if got := isIcebergMetadata(tt.path); got != tt.want {
+			t.Errorf("isIcebergMetadata(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+}
+
 func TestUnmarshalManifest_Invalid(t *testing.T) {
 	_, err := UnmarshalManifest([]byte("not json"))
 	if err == nil {
