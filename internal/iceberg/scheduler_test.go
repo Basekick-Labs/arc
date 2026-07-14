@@ -223,6 +223,110 @@ func TestScheduler_IncrementalSchemaEvolution(t *testing.T) {
 	}
 }
 
+// TestScheduler_AllFilesDeletedEmptiesTable is the regression test for the orphaned-reference
+// bug: when retention/compaction deletes EVERY file of a measurement, Arc's Delete only removes
+// the file (os.Remove) — the {db}/{measurement}/… directory tree survives, so Measurements()
+// keeps yielding the measurement and reconcileOne sees files=[] and localFiles=[]. Returning
+// early there left the Iceberg table pointing at deleted files forever, and external engines
+// fail on the missing paths. The table must be reconciled to EMPTY instead.
+func TestScheduler_AllFilesDeletedEmptiesTable(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel := "mydb/cpu/2023/11/14/22/a.parquet"
+	writeArcStyleParquet(t, filepath.Join(root, rel), 1_700_000_000_000_000, 20)
+
+	db, err := sql.Open("sqlite3", filepath.Join(root, "arc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	exp, err := NewExporter(db, backend, "file://"+root, "arc", 0, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc"), Logger: zerolog.Nop()})
+
+	sched.runPass(ctx)
+	lt, _ := exp.EnsureTable(ctx, "mydb", "cpu", ArcSchema{})
+	if f, _ := exp.tableDataFiles(ctx, lt); len(f) != 1 {
+		t.Fatalf("setup: want 1 file in table, got %d", len(f))
+	}
+
+	// Delete ALL data files, leaving the directory tree (what retention actually does).
+	if err := os.Remove(filepath.Join(root, rel)); err != nil {
+		t.Fatal(err)
+	}
+	// Precondition for the bug: the measurement is still enumerated.
+	if ms, _ := NewStorageWalkSource(backend, "arc").Measurements(ctx); len(ms) != 1 {
+		t.Fatalf("precondition: measurement should still be enumerated, got %v", ms)
+	}
+
+	sched.runPass(ctx)
+	lt2, _ := exp.EnsureTable(ctx, "mydb", "cpu", ArcSchema{})
+	files, err := exp.tableDataFiles(ctx, lt2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 0 {
+		t.Errorf("table still references %d deleted file(s) — orphaned refs; want 0: %v", len(files), files)
+	}
+
+	// The empty state must be fingerprint-cached: a further pass over the still-empty
+	// measurement does no work (no repeated catalog commit / log every tick).
+	emptied := lt2.CurrentSnapshot().SnapshotID
+	sched.runPass(ctx)
+	lt3, _ := exp.EnsureTable(ctx, "mydb", "cpu", ArcSchema{})
+	if got := lt3.CurrentSnapshot().SnapshotID; got != emptied {
+		t.Errorf("a second pass over an already-empty measurement committed again (%d -> %d)", emptied, got)
+	}
+
+	// Re-ingest must recover: the cached empty state has no schema, so this falls through to a
+	// full re-derivation and the file lands back in the table.
+	writeArcStyleParquet(t, filepath.Join(root, "mydb/cpu/2023/11/14/23/b.parquet"), 1_700_000_003_600_000, 20)
+	sched.runPass(ctx)
+	lt4, _ := exp.EnsureTable(ctx, "mydb", "cpu", ArcSchema{})
+	if f, _ := exp.tableDataFiles(ctx, lt4); len(f) != 1 {
+		t.Errorf("re-ingest after empty-out: want 1 file back in the table, got %d", len(f))
+	}
+}
+
+// TestScheduler_EmptyDirNeverCreatesTable guards the other half of the empty-out fix: a stray
+// empty measurement directory that never held data must NOT mint a zero-column Iceberg table
+// (EnsureTable with an empty schema would create one with no fields and no partition spec).
+func TestScheduler_EmptyDirNeverCreatesTable(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A measurement directory with no data files at all.
+	if err := os.MkdirAll(filepath.Join(root, "mydb/ghost/2023/11/14/22"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite3", filepath.Join(root, "arc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	exp, err := NewExporter(db, backend, "file://"+root, "arc", 0, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc"), Logger: zerolog.Nop()})
+
+	sched.runPass(ctx)
+
+	if exp.TableExists(ctx, "mydb", "ghost") {
+		t.Error("an empty measurement directory created an Iceberg table; want none")
+	}
+}
+
 // TestUnionSchema_ParallelDeterministic proves the parallelized UnionSchema still folds columns
 // in first-seen order regardless of which footer read finishes first, and surfaces a per-file
 // error. Uses a mix of narrow (3-col) and wide (4-col) files so cpu_idle must land last.

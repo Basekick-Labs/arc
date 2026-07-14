@@ -183,8 +183,39 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 	if err != nil {
 		return false, err
 	}
+	if len(files) == 0 {
+		// Every data file is gone (retention/compaction/manual delete). We still reach this code
+		// because Arc's Delete only os.Remove()s the file — the {db}/{measurement}/… directory
+		// tree survives, so Measurements() keeps yielding this measurement. Returning early here
+		// would leave the Iceberg table pointing at deleted files forever, and external engines
+		// fail on the missing paths. Reconcile the table to EMPTY instead.
+		//
+		// Fingerprint-gate it like any other state so a permanently-empty measurement (an emptied
+		// directory Arc never prunes) is emptied ONCE and skipped every pass after — otherwise
+		// every tick re-runs the catalog load + commit and re-logs forever.
+		fp := fingerprint(files, localFiles)
+		if prev, cached := s.state[key]; cached && prev.fingerprint == fp {
+			return false, nil
+		}
+		// Only for a table that already exists: an empty directory that never held data must not
+		// mint a zero-column table (EnsureTable would create one with no fields and no partition
+		// spec). Schema is irrelevant when emptying — the existing table's schema is preserved.
+		if !s.exporter.TableExists(ctx, m.Database, m.Measurement) {
+			return false, nil
+		}
+		if err := s.exporter.ReconcileMeasurement(ctx, m.Database, m.Measurement, ArcSchema{}, nil); err != nil {
+			return false, err
+		}
+		s.logger.Info().Str("database", m.Database).Str("measurement", m.Measurement).
+			Msg("Iceberg reconcile: all data files gone — table reconciled to empty")
+		// Cache the empty state (nil schema/localFiles): a later re-ingest changes the
+		// fingerprint and falls through to a full re-derivation below.
+		s.state[key] = measurementState{fingerprint: fp}
+		return true, nil
+	}
 	if len(localFiles) == 0 {
-		// No local files to derive schema from (cold-only measurement). Skip in v1 — documented.
+		// Files exist but none are local, so we cannot derive a schema (cold-only measurement).
+		// Skip in v1 — documented limitation.
 		s.logger.Debug().Str("database", m.Database).Str("measurement", m.Measurement).
 			Msg("Iceberg reconcile: no local file for schema derivation, skipping")
 		return false, nil

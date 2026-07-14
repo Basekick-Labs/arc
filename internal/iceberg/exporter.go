@@ -96,6 +96,16 @@ type ArcField struct {
 	Type iceberg.Type
 }
 
+// TableExists reports whether the Iceberg table for (database, measurement) is already in the
+// catalog. Used by the reconciler to distinguish "this measurement's files were all deleted, so
+// empty its existing table" from "this is a stray empty directory that never held data" — the
+// latter must NOT mint a zero-column table via EnsureTable. A catalog error reads as false: the
+// caller's only action on true is an empty-out, so failing closed just defers to the next pass.
+func (e *Exporter) TableExists(ctx context.Context, database, measurement string) bool {
+	_, err := e.catalog.LoadTable(ctx, e.tableIdent(database, measurement))
+	return err == nil
+}
+
 // EnsureTable creates the Iceberg table for (database, measurement) if absent, using the
 // given schema and a day(time) partition spec. Idempotent: returns the existing table if the
 // namespace/table already exist. name-mapping is auto-set by iceberg-go on first AddFiles.
