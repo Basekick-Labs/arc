@@ -521,8 +521,9 @@ func TestCustomWarehouseSubdir(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Warehouse is <root>/warehouse, NOT <root>.
-	exp, err := NewExporter(db, backend, "file://"+filepath.Join(root, "warehouse"), "arc", 3, zerolog.Nop())
+	// Warehouse is <root>/warehouse, NOT <root>. Built via localFileURI so it matches what
+	// DefaultWarehouse produces (absolute + forward slashes) on every platform.
+	exp, err := NewExporter(db, backend, localFileURI(filepath.Join(root, "warehouse")), "arc", 3, zerolog.Nop())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -546,5 +547,38 @@ func TestCustomWarehouseSubdir(t *testing.T) {
 	}
 	if f, _ := exp.tableDataFiles(ctx, lt); len(f) != 1 {
 		t.Errorf("want 1 file registered with a custom warehouse, got %d", len(f))
+	}
+}
+
+// TestIsUnderDir pins the path-boundary matching that warehouseRelKey's gate depends on. A bare
+// strings.HasPrefix accepts a sibling directory whose name merely starts with the warehouse's
+// ("file:///data/wh" vs "file:///data/wh-other"), which would let another warehouse's metadata
+// be treated as ours — and pruneOldVersionFiles deletes files under the derived key.
+func TestIsUnderDir(t *testing.T) {
+	const dir = "file:///data/wh"
+	tests := []struct {
+		p    string
+		want bool
+	}{
+		{"file:///data/wh", true}, // the dir itself
+		{"file:///data/wh/arc_db.db/cpu/metadata/v1.metadata.json", true}, // beneath it
+		{"file:///data/wh/", true},                                        // trailing slash
+		// Siblings that share a name prefix must NOT match.
+		{"file:///data/wh-other/arc_db.db/cpu/metadata/v1.metadata.json", false},
+		{"file:///data/wharf/x.json", false},
+		{"file:///data/whx", false},
+		// Unrelated / parent paths.
+		{"file:///data/other/x.json", false},
+		{"file:///data", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		if got := isUnderDir(tt.p, dir); got != tt.want {
+			t.Errorf("isUnderDir(%q, %q) = %v, want %v", tt.p, dir, got, tt.want)
+		}
+	}
+	// A dir configured WITH a trailing slash must behave identically.
+	if !isUnderDir("file:///data/wh/a.json", "file:///data/wh/") {
+		t.Error("isUnderDir should normalize a trailing slash on dir")
 	}
 }

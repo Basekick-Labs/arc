@@ -555,7 +555,7 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) {
 //	metaLoc "file:///data/wh/arc_db.db/cpu/metadata/00004-<uuid>.metadata.json"
 //	-> "wh/arc_db.db/cpu/metadata/00004-<uuid>.metadata.json"
 func (e *Exporter) warehouseRelKey(metaLoc string) (string, bool) {
-	if !strings.HasPrefix(metaLoc, e.warehouse) {
+	if !isUnderDir(metaLoc, e.warehouse) {
 		return "", false
 	}
 	// No backend (tests/no-op mode): warehouse is the only base we have.
@@ -563,12 +563,21 @@ func (e *Exporter) warehouseRelKey(metaLoc string) (string, bool) {
 		return strings.TrimPrefix(strings.TrimPrefix(metaLoc, e.warehouse), "/"), true
 	}
 	root := DefaultWarehouse(e.backend)
-	rel := strings.TrimPrefix(metaLoc, root)
-	if rel == metaLoc {
+	if !isUnderDir(metaLoc, root) {
 		// Warehouse is outside the storage root entirely — the backend cannot address it.
 		return "", false
 	}
-	return strings.TrimPrefix(rel, "/"), true
+	return strings.TrimPrefix(strings.TrimPrefix(metaLoc, root), "/"), true
+}
+
+// isUnderDir reports whether p is dir itself or lies beneath it, matching only at a path
+// boundary. A bare strings.HasPrefix would accept a sibling whose name merely starts with dir's
+// ("file:///data/wh" would match "file:///data/wh-other/…"), which for warehouseRelKey means
+// accepting another warehouse's metadata as our own — and pruneOldVersionFiles DELETES files
+// under the key it derives, so the gate has to match on real path segments.
+func isUnderDir(p, dir string) bool {
+	dir = strings.TrimSuffix(dir, "/")
+	return p == dir || strings.HasPrefix(p, dir+"/")
 }
 
 // parseVersionAndMetaDir derives, from a full metadata-file URI, the version integer (e.g.
