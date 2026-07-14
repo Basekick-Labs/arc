@@ -147,6 +147,77 @@ func TestReconcile_AddIdempotentSupersede(t *testing.T) {
 	}
 }
 
+// writeStraddlingParquet writes a file whose time values span MORE than one UTC day (first
+// row at baseTS, last row +2 days), so iceberg-go's day() partition inference cannot map it to
+// a single partition value. Exercises the B2 resilient path.
+func writeStraddlingParquet(t *testing.T, path string, baseTS int64) {
+	t.Helper()
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "time", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "host", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "value", Type: arrow.PrimitiveTypes.Float64, Nullable: true},
+	}, nil)
+	b := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer b.Release()
+	const twoDaysUs = int64(2 * 24 * 60 * 60 * 1_000_000)
+	b.Field(0).(*array.TimestampBuilder).AppendValues(
+		[]arrow.Timestamp{arrow.Timestamp(baseTS), arrow.Timestamp(baseTS + twoDaysUs)}, nil)
+	b.Field(1).(*array.StringBuilder).AppendValues([]string{"h", "h"}, nil)
+	b.Field(2).(*array.Float64Builder).AppendValues([]float64{1, 2}, nil)
+	rec := b.NewRecord()
+	defer rec.Release()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := os.Create(path)
+	defer f.Close()
+	w, _ := pqarrow.NewFileWriter(schema, f, parquet.NewWriterProperties(parquet.WithCompression(0)),
+		pqarrow.NewArrowWriterProperties(pqarrow.WithStoreSchema()))
+	if err := w.Write(rec); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+}
+
+// TestReconcile_DayStraddlingFileSkipped verifies B2: a file whose time range spans >1 day
+// cannot be day()-partitioned and would otherwise wedge the measurement forever. The resilient
+// path must skip ONLY the straddling file and still export the good one.
+func TestReconcile_DayStraddlingFileSkipped(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good.parquet")
+	bad := filepath.Join(dir, "straddle.parquet")
+	base := int64(1_700_000_000_000_000)
+	writeArcStyleParquet(t, good, base, 10) // single-day
+	writeStraddlingParquet(t, bad, base)    // spans 2 days
+
+	db, err := sql.Open("sqlite3", filepath.Join(dir, "c.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	exp, err := NewExporter(db, nil, "file://"+dir+"/wh", "arc", 0, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc, _ := SchemaFromParquet(good)
+
+	// Reconcile both files. The straddling one must be skipped, the good one exported —
+	// and crucially this must NOT return an error (the measurement is not wedged).
+	if err := exp.ReconcileMeasurement(ctx, "db", "cpu", sc,
+		[]FileRef{{PhysicalPath: fileURI(good)}, {PhysicalPath: fileURI(bad)}}); err != nil {
+		t.Fatalf("reconcile with straddling file returned error (should skip, not fail): %v", err)
+	}
+	lt, _ := exp.EnsureTable(ctx, "db", "cpu", sc)
+	files, _ := exp.tableDataFiles(ctx, lt)
+	if _, ok := files[fileURI(good)]; !ok {
+		t.Errorf("good file not exported: %v", files)
+	}
+	if _, ok := files[fileURI(bad)]; ok {
+		t.Errorf("straddling file should have been skipped but is in the table: %v", files)
+	}
+}
+
 // writeArcStyleParquet4Col writes a file with an extra column (cpu_idle) to exercise schema
 // evolution — matches what Arc's schema-flexible ingest produces when a metric is added.
 func writeArcStyleParquet4Col(t *testing.T, path string, baseTS int64, n int) {

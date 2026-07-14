@@ -46,7 +46,7 @@ func TestStorageWalkSourceAndReconcile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	src := NewStorageWalkSource(backend)
+	src := NewStorageWalkSource(backend, "arc")
 	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: src, Logger: zerolog.Nop()})
 
 	// Enumerate: should find exactly mydb/cpu.

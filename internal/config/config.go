@@ -893,6 +893,16 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// Iceberg export is local-only in v1: the reconciler walks the single configured storage
+	// backend, so a file migrated to a cold tier (S3/Azure) disappears from the walk and would
+	// be DELETED from the Iceberg table on the next reconcile — silently amputating cold data.
+	// Refuse the combination rather than corrupt the export.
+	if cfg.Iceberg.Enabled && cfg.TieredStorage.Enabled && cfg.TieredStorage.Cold.Enabled {
+		return nil, fmt.Errorf("iceberg.enabled=true is not supported with cold-tier tiering " +
+			"(tiered_storage.cold.enabled): files migrated to the cold tier would be removed from the " +
+			"Iceberg table. Disable one of them")
+	}
+
 	return cfg, nil
 }
 

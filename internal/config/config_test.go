@@ -149,6 +149,35 @@ func TestLoad_DefaultsFromSystem(t *testing.T) {
 	}
 }
 
+func TestLoad_IcebergRejectsColdTiering(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	// iceberg + cold-tier tiering must be rejected (cold files would be deleted from the table).
+	os.Setenv("ARC_ICEBERG_ENABLED", "true")
+	os.Setenv("ARC_TIERED_STORAGE_ENABLED", "true")
+	os.Setenv("ARC_TIERED_STORAGE_COLD_ENABLED", "true")
+	os.Setenv("ARC_TIERED_STORAGE_COLD_BACKEND", "s3")
+	os.Setenv("ARC_TIERED_STORAGE_COLD_S3_BUCKET", "b")
+	defer func() {
+		os.Unsetenv("ARC_ICEBERG_ENABLED")
+		os.Unsetenv("ARC_TIERED_STORAGE_ENABLED")
+		os.Unsetenv("ARC_TIERED_STORAGE_COLD_ENABLED")
+		os.Unsetenv("ARC_TIERED_STORAGE_COLD_BACKEND")
+		os.Unsetenv("ARC_TIERED_STORAGE_COLD_S3_BUCKET")
+	}()
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for iceberg.enabled + cold-tier tiering, got nil")
+	}
+}
+
 func TestLoad_EnvOverride(t *testing.T) {
 	// Create a temp dir without config file
 	tmpDir, err := os.MkdirTemp("", "arc-config-test")

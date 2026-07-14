@@ -32,11 +32,25 @@ type FileSetSource interface {
 type StorageWalkSource struct {
 	backend  storage.Backend
 	resolver *PathResolver
+	nsPrefix string // Iceberg namespace prefix; warehouse dirs "<nsPrefix>_*.db" are excluded
 }
 
-// NewStorageWalkSource builds a storage-walking file-set source.
-func NewStorageWalkSource(backend storage.Backend) *StorageWalkSource {
-	return &StorageWalkSource{backend: backend, resolver: NewPathResolver(backend)}
+// NewStorageWalkSource builds a storage-walking file-set source. nsPrefix is the exporter's
+// namespace prefix (e.g. "arc"); it must match so the walk skips the Iceberg warehouse
+// directories the exporter writes under the same storage root ("<nsPrefix>_<db>.db/…") — those
+// are Arc's own table metadata, NOT user databases, and must never be enumerated as tables.
+func NewStorageWalkSource(backend storage.Backend, nsPrefix string) *StorageWalkSource {
+	if nsPrefix == "" {
+		nsPrefix = "arc"
+	}
+	return &StorageWalkSource{backend: backend, resolver: NewPathResolver(backend), nsPrefix: nsPrefix}
+}
+
+// isWarehouseDir reports whether a top-level directory is an Iceberg warehouse namespace
+// directory ("<nsPrefix>_<db>.db") written by the exporter, which must be excluded from the
+// data-file walk. Iceberg's SQL catalog names namespace dirs "<namespace>.db".
+func (s *StorageWalkSource) isWarehouseDir(name string) bool {
+	return strings.HasPrefix(name, s.nsPrefix+"_") && strings.HasSuffix(name, ".db")
 }
 
 // dirLister is the subset of storage backends that can enumerate immediate subdirectories.
@@ -58,8 +72,8 @@ func (s *StorageWalkSource) Measurements(ctx context.Context) ([]Measurement, er
 	var out []Measurement
 	for _, db := range dbs {
 		db = strings.Trim(db, "/")
-		if db == "" {
-			continue
+		if db == "" || s.isWarehouseDir(db) {
+			continue // skip empty + the exporter's own warehouse namespace dirs
 		}
 		measurements, err := dl.ListDirectories(ctx, db+"/")
 		if err != nil {

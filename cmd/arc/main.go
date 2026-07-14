@@ -2272,10 +2272,16 @@ func main() {
 		if icebergDBPath == "" {
 			icebergDBPath = cfg.Auth.DBPath // shared SQLite DB
 		}
-		icebergDB, err := sql.Open("sqlite3", icebergDBPath)
+		// Open the catalog DB with the same DSN + single-writer discipline as auth
+		// (internal/auth/auth.go) — this is the shared SQLite file, so WAL + a 5s busy_timeout
+		// let the catalog wait for the lock instead of getting an immediate SQLITE_BUSY when
+		// auth/audit/tiering/retention/MQTT hold it, and SetMaxOpenConns(1) keeps the reconciler's
+		// multiple per-measurement transactions from self-contending across pooled connections.
+		icebergDB, err := sql.Open("sqlite3", icebergDBPath+"?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=ON")
 		if err != nil {
 			log.Fatal().Err(err).Str("path", icebergDBPath).Msg("Failed to open Iceberg catalog DB")
 		}
+		icebergDB.SetMaxOpenConns(1)
 		// Default the warehouse to the storage root when unset, so table metadata lands
 		// alongside the data (file:// for local; s3://bucket/prefix for object storage).
 		warehouse := cfg.Iceberg.Warehouse
@@ -2286,9 +2292,14 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize Iceberg exporter")
 		}
-		icebergSource := iceberg.NewStorageWalkSource(storageBackend)
-		// Writer gate: in cluster mode reuse the compaction gate (single active writer);
-		// nil in OSS (single node, always runs).
+		icebergSource := iceberg.NewStorageWalkSource(storageBackend, cfg.Iceberg.NamespacePrefix)
+		// Writer gate: in cluster mode reuse the compaction gate; nil in OSS (single node, always
+		// runs). SINGLE-WRITER REQUIREMENT: the reconciler writes version-hint.text / v<N>.json
+		// to the shared warehouse non-transactionally, so exactly one node must run it. The
+		// compaction failover lease (Phase 5) guarantees that. In a Phase-4 static-role cluster
+		// with MULTIPLE compaction-capable nodes and no lease, CanCompact() is true on each of
+		// them — configure only ONE compaction-capable node when iceberg export is enabled, or
+		// two nodes will race on the warehouse files.
 		var icebergGate iceberg.WriterGate
 		if compactionGate != nil {
 			icebergGate = icebergWriterGate{compactionGate}

@@ -1,10 +1,10 @@
 // Package iceberg publishes Arc's existing Parquet files as Apache Iceberg tables so
 // external engines (Spark, Trino, Snowflake, DuckDB) can read Arc's data directly, without
 // changing Arc's ingest write path. It is a periodic *reconciler*: it diffs Arc's durable
-// file set (tiering metadata / cluster manifest) against the current Iceberg table state and
-// commits the delta via iceberg-go's AddFiles (register-existing-Parquet, no rewrite) and
-// Delete. Because it is driven by Arc's durable source of truth — not a transient event
-// stream — a failed or missed commit self-heals on the next reconcile tick.
+// file set (the storage backend walk) against the current Iceberg table state and commits the
+// delta via iceberg-go's ReplaceDataFiles (register/deregister existing Parquet by path — no
+// data rewrite). Because it is driven by Arc's durable storage — not a transient event stream —
+// a failed or missed commit self-heals on the next reconcile tick.
 //
 // Verified in Phase 0/0b: iceberg-go v0.6.0 + the mattn sqlite3 catalog registers Arc's
 // field-ID-less Parquet (AddFiles auto-emits schema.name-mapping.default) and a non-DuckDB
@@ -252,17 +252,21 @@ func (e *Exporter) ReconcileMeasurement(ctx context.Context, database, measureme
 		return nil // already converged — no snapshot
 	}
 
-	txn := tbl.NewTransaction()
 	// ReplaceDataFiles is the metadata-only primitive that both drops files by path and adds
 	// files by path in one snapshot — exactly the reconcile diff. (Transaction.Delete is a
 	// ROW-level predicate that rewrites partially-matching files — wrong here; we drop whole
 	// files that Arc already removed from storage.) When only adding, filesToDelete is empty.
-	if err := txn.ReplaceDataFiles(ctx, toRemove, toAdd, nil); err != nil {
-		return fmt.Errorf("iceberg ReplaceDataFiles (add=%d remove=%d): %w", len(toAdd), len(toRemove), err)
-	}
-	committed, err := txn.Commit(ctx)
+	committed, skipped, err := e.replaceDataFilesResilient(ctx, tbl, toRemove, toAdd, database, measurement)
 	if err != nil {
-		return fmt.Errorf("iceberg commit (add=%d remove=%d): %w", len(toAdd), len(toRemove), err)
+		return err
+	}
+	if len(skipped) > 0 {
+		// Some files could not be partitioned (day-straddling data — see day() spec). They are
+		// omitted from the table but logged loudly; the rest of the measurement still exports.
+		e.logger.Error().
+			Str("database", database).Str("measurement", measurement).
+			Int("skipped", len(skipped)).Strs("files", skipped).
+			Msg("Iceberg: skipped files that could not be partition-mapped (day-straddling time range)")
 	}
 	// Expire old snapshots (+ orphaned manifests/data) so snapshot history and metadata don't
 	// grow unbounded. Best-effort — a failure here doesn't undo the successful reconcile; the
@@ -275,6 +279,59 @@ func (e *Exporter) ReconcileMeasurement(ctx context.Context, database, measureme
 		Int("added", len(toAdd)).Int("removed", len(toRemove)).
 		Msg("Reconciled Iceberg table")
 	return nil
+}
+
+// replaceDataFilesResilient applies the add/remove diff, tolerating files that iceberg-go
+// cannot partition-map. iceberg-go infers each file's day() partition value from its Parquet
+// time min/max and ERRORS ("more than one value for partition field") when a single file's
+// data straddles a UTC-day boundary (rare: backfill or a flush crossing midnight). Left
+// unhandled, one such file fails ReplaceDataFiles and wedges the whole measurement's export
+// on every pass forever. So: try the batch first (the common case, one commit); if it fails,
+// fall back to adding files one at a time, skipping (and returning) any single file that can't
+// be partitioned. Removes are always applied. Returns the committed table + skipped file paths.
+func (e *Exporter) replaceDataFilesResilient(ctx context.Context, tbl *icetable.Table, toRemove, toAdd []string, database, measurement string) (*icetable.Table, []string, error) {
+	// Fast path: try the whole batch in one commit.
+	txn := tbl.NewTransaction()
+	if err := txn.ReplaceDataFiles(ctx, toRemove, toAdd, nil); err == nil {
+		committed, cerr := txn.Commit(ctx)
+		if cerr != nil {
+			return nil, nil, fmt.Errorf("iceberg commit (add=%d remove=%d): %w", len(toAdd), len(toRemove), cerr)
+		}
+		return committed, nil, nil
+	} else if !isPartitionInferenceError(err) {
+		// A non-partition error is a real failure — surface it (don't silently skip).
+		return nil, nil, fmt.Errorf("iceberg ReplaceDataFiles (add=%d remove=%d): %w", len(toAdd), len(toRemove), err)
+	}
+
+	// Slow path: at least one file can't be partition-mapped. Apply removes + add files one at
+	// a time so good files still export and only the straddling file(s) are skipped.
+	txn = tbl.NewTransaction()
+	if len(toRemove) > 0 {
+		if err := txn.ReplaceDataFiles(ctx, toRemove, nil, nil); err != nil {
+			return nil, nil, fmt.Errorf("iceberg remove-only (remove=%d): %w", len(toRemove), err)
+		}
+	}
+	var skipped []string
+	for _, f := range toAdd {
+		if err := txn.AddFiles(ctx, []string{f}, nil, false); err != nil {
+			if isPartitionInferenceError(err) {
+				skipped = append(skipped, f)
+				continue
+			}
+			return nil, nil, fmt.Errorf("iceberg AddFiles(%s): %w", f, err)
+		}
+	}
+	committed, err := txn.Commit(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("iceberg commit (resilient, skipped=%d): %w", len(skipped), err)
+	}
+	return committed, skipped, nil
+}
+
+// isPartitionInferenceError reports whether an error is iceberg-go's day()-partition
+// inference failure for a file whose time range spans more than one partition value.
+func isPartitionInferenceError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "more than one value for partition field")
 }
 
 // expireSnapshots keeps the last `retain` snapshots for the table (0 = keep all → no-op),
@@ -296,14 +353,14 @@ func (e *Exporter) expireSnapshots(ctx context.Context, tbl *icetable.Table, dat
 	// rest"). Cluster-mode note: this is fine because the reconciler is writer-gated (single
 	// writer), so no concurrent reader-vs-expire race beyond Iceberg's own snapshot isolation.
 	if err := txn.ExpireSnapshots(icetable.WithRetainLast(e.retain), icetable.WithOlderThan(0)); err != nil {
-		e.logger.Warn().Err(err).Str("database", database).Str("measurement", measurement).
-			Msg("ExpireSnapshots failed (non-fatal)")
+		e.logger.Error().Err(err).Str("database", database).Str("measurement", measurement).
+			Msg("Iceberg ExpireSnapshots failed (non-fatal) — snapshot history grows until it recovers")
 		return tbl
 	}
 	expired, err := txn.Commit(ctx)
 	if err != nil {
-		e.logger.Warn().Err(err).Str("database", database).Str("measurement", measurement).
-			Msg("ExpireSnapshots commit failed (non-fatal)")
+		e.logger.Error().Err(err).Str("database", database).Str("measurement", measurement).
+			Msg("Iceberg ExpireSnapshots commit failed (non-fatal) — snapshot history grows until it recovers")
 		return tbl
 	}
 	return expired
