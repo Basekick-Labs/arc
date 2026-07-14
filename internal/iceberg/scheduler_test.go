@@ -3,6 +3,7 @@ package iceberg
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -346,7 +347,7 @@ func TestUnionSchema_ParallelDeterministic(t *testing.T) {
 		paths = append(paths, p)
 	}
 
-	sc, err := UnionSchema(paths)
+	sc, err := UnionSchema(context.Background(), paths)
 	if err != nil {
 		t.Fatalf("UnionSchema: %v", err)
 	}
@@ -361,8 +362,75 @@ func TestUnionSchema_ParallelDeterministic(t *testing.T) {
 	}
 
 	// A missing/unreadable file must produce an error, not a silent partial schema.
-	if _, err := UnionSchema(append(paths, filepath.Join(dir, "does-not-exist.parquet"))); err == nil {
+	if _, err := UnionSchema(context.Background(), append(paths, filepath.Join(dir, "does-not-exist.parquet"))); err == nil {
 		t.Error("expected an error for an unreadable file, got nil")
+	}
+}
+
+// TestUnionSchema_ContextCancelled verifies the parallel footer reads honour cancellation
+// rather than grinding through every remaining file after the caller has given up (the
+// reconciler bounds each measurement with measurementTimeout).
+func TestUnionSchema_ContextCancelled(t *testing.T) {
+	dir := t.TempDir()
+	base := int64(1_700_000_000_000_000)
+	var paths []string
+	for i := 0; i < 8; i++ {
+		p := filepath.Join(dir, fmt.Sprintf("c%02d.parquet", i))
+		writeArcStyleParquet(t, p, base+int64(i)*1000, 5)
+		paths = append(paths, p)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled before the call
+	if _, err := UnionSchema(ctx, paths); !errors.Is(err, context.Canceled) {
+		t.Errorf("UnionSchema with a cancelled context: got err=%v, want context.Canceled", err)
+	}
+}
+
+// TestEvolveSchema_TypeMismatchRejected guards against silent table corruption: a column whose
+// type CHANGES for an existing table must fail the measurement, not register incompatible files.
+// Neither schema-derivation path catches this — UnionSchema only compares the current pass's
+// files against each other, and MergeSchemas compares against the in-memory cache (empty after a
+// restart or an empty-out) — so evolveSchema, which sees the durable table schema, is the guard.
+func TestEvolveSchema_TypeMismatchRejected(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	db, err := sql.Open("sqlite3", filepath.Join(dir, "c.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	exp, err := NewExporter(db, nil, "file://"+dir+"/wh", "arc", 0, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create the table with `value` as a long.
+	longSc := ArcSchema{Fields: []ArcField{
+		{Name: "time", Type: iceberg.PrimitiveTypes.TimestampTz},
+		{Name: "value", Type: iceberg.PrimitiveTypes.Int64},
+	}}
+	if _, err := exp.EnsureTable(ctx, "mydb", "cpu", longSc); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Same column now arrives as a double (what a restart + re-ingest with changed types looks
+	// like). Must be rejected rather than silently skipped.
+	doubleSc := ArcSchema{Fields: []ArcField{
+		{Name: "time", Type: iceberg.PrimitiveTypes.TimestampTz},
+		{Name: "value", Type: iceberg.PrimitiveTypes.Float64},
+	}}
+	_, err = exp.EnsureTable(ctx, "mydb", "cpu", doubleSc)
+	if err == nil {
+		t.Fatal("expected a type-mismatch error when a column's type changes, got nil")
+	}
+	if !strings.Contains(err.Error(), "type mismatch") {
+		t.Errorf("error should name the type mismatch, got: %v", err)
+	}
+
+	// An unchanged schema must still be a clean no-op (no false positives).
+	if _, err := exp.EnsureTable(ctx, "mydb", "cpu", longSc); err != nil {
+		t.Errorf("unchanged schema should be a no-op, got: %v", err)
 	}
 }
 

@@ -1,6 +1,7 @@
 package iceberg
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -73,10 +74,12 @@ const unionSchemaConcurrency = 8
 //
 // Footers are read in parallel (bounded) because on first-sight/full-derivation this reads EVERY
 // local footer, which is sequential I/O that can exceed the reconciler's measurementTimeout on a
-// measurement with thousands of files. The merge stays deterministic: results are collected by
-// index and folded in localPaths order, so column ordering and conflict detection are unaffected
-// by scheduling. (The incremental path in the scheduler only passes newly-added files here.)
-func UnionSchema(localPaths []string) (ArcSchema, error) {
+// measurement with thousands of files. ctx aborts the remaining reads early on the first failure
+// or on reconciler shutdown/timeout, instead of grinding through every file. The merge stays
+// deterministic: results are collected by index and folded in localPaths order, so column
+// ordering and conflict detection are unaffected by scheduling. (The incremental path in the
+// scheduler only passes newly-added files here.)
+func UnionSchema(ctx context.Context, localPaths []string) (ArcSchema, error) {
 	if len(localPaths) == 0 {
 		return ArcSchema{}, nil
 	}
@@ -85,24 +88,29 @@ func UnionSchema(localPaths []string) (ArcSchema, error) {
 	}
 
 	schemas := make([]ArcSchema, len(localPaths))
-	errs := make([]error, len(localPaths))
-	g := new(errgroup.Group)
+	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(unionSchemaConcurrency)
 	for i, p := range localPaths {
 		i, p := i, p
 		g.Go(func() error {
-			schemas[i], errs[i] = SchemaFromParquet(p)
-			return nil // collect all errors; fold below in deterministic order
+			if err := gctx.Err(); err != nil {
+				return err // cancelled by an earlier failure or by the caller's timeout
+			}
+			sc, err := SchemaFromParquet(p)
+			if err != nil {
+				return fmt.Errorf("file %q: %w", p, err)
+			}
+			schemas[i] = sc
+			return nil
 		})
 	}
-	_ = g.Wait()
+	if err := g.Wait(); err != nil {
+		return ArcSchema{}, err
+	}
 
 	seen := make(map[string]iceberg.Type)
 	var order []string
-	for i, p := range localPaths {
-		if errs[i] != nil {
-			return ArcSchema{}, fmt.Errorf("file %q: %w", p, errs[i])
-		}
+	for i := range localPaths {
 		for _, f := range schemas[i].Fields {
 			if prev, ok := seen[f.Name]; ok {
 				if !prev.Equals(f.Type) {

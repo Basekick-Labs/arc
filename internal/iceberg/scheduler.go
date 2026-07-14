@@ -246,7 +246,7 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		if len(newLocal) == 0 {
 			sc = prev.schema // only removals — schema unchanged
 		} else {
-			addSc, err := UnionSchema(newLocal)
+			addSc, err := UnionSchema(ctx, newLocal)
 			if err != nil {
 				return false, err
 			}
@@ -256,7 +256,7 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 			}
 		}
 	} else {
-		sc, err = UnionSchema(localFiles)
+		sc, err = UnionSchema(ctx, localFiles)
 		if err != nil {
 			return false, err
 		}

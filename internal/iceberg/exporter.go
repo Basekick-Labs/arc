@@ -16,6 +16,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path"
 	"path/filepath"
@@ -180,8 +181,23 @@ func (e *Exporter) evolveSchema(ctx context.Context, tbl *icetable.Table, sc Arc
 	current := tbl.Schema()
 	var missing []ArcField
 	for _, f := range sc.Fields {
-		if _, ok := current.FindFieldByName(f.Name); !ok {
+		existing, ok := current.FindFieldByName(f.Name)
+		if !ok {
 			missing = append(missing, f)
+			continue
+		}
+		// A column already in the table must keep its type. Neither of the schema-derivation
+		// paths can catch this: UnionSchema only compares the CURRENT pass's files against each
+		// other, and MergeSchemas compares against the in-memory cache, which is empty after a
+		// restart or an empty-out. So a measurement whose column changes type across those
+		// boundaries (e.g. `value` was long, all old files age out, Arc restarts, new files
+		// arrive with value as double) would derive a self-consistent schema, find the column
+		// "present", skip it, and register type-incompatible files into the table. Fail the
+		// measurement instead — the table stays readable and the next pass retries.
+		if !existing.Type.Equals(f.Type) {
+			return nil, fmt.Errorf("column %q type mismatch: Iceberg table has %s, new Parquet files have %s "+
+				"(the measurement's column type changed; Iceberg cannot represent both in one column)",
+				f.Name, existing.Type, f.Type)
 		}
 	}
 	if len(missing) == 0 {
@@ -239,6 +255,13 @@ func (e *Exporter) healNameMapping(ctx context.Context, tbl *icetable.Table) (*i
 	nmJSON, err := json.Marshal(tbl.Schema().NameMapping())
 	if err != nil {
 		e.logger.Warn().Err(err).Msg("Iceberg name-mapping heal: marshal failed (non-fatal)")
+		return tbl, nil
+	}
+	// NameMapping is a []MappedField, so a nil mapping marshals to the literal "null". Writing
+	// schema.name-mapping.default="null" is not a valid mapping and would break the external
+	// readers this property exists to serve — worse than leaving it unset. Never heal to that.
+	if string(nmJSON) == "null" {
+		e.logger.Warn().Msg("Iceberg name-mapping heal: table schema produced an empty mapping (non-fatal, skipping)")
 		return tbl, nil
 	}
 	if tbl.Properties()[icetable.DefaultNameMappingKey] == string(nmJSON) {
@@ -561,6 +584,12 @@ func (e *Exporter) tableDataFiles(ctx context.Context, tbl *icetable.Table) (map
 	return out, nil
 }
 
+// isAlreadyExists reports whether a catalog error means "the thing is already there", which the
+// idempotent create paths treat as success. Matches on iceberg-go's typed sentinels (the SQL
+// catalog wraps them with %w, so errors.Is unwraps correctly) rather than substring-matching the
+// message: the old strings.Contains(msg, "exist") also matched "does not exist", so a genuine
+// not-found/backend error could be swallowed as success.
 func isAlreadyExists(err error) bool {
-	return err != nil && strings.Contains(strings.ToLower(err.Error()), "exist")
+	return errors.Is(err, icecatalog.ErrNamespaceAlreadyExists) ||
+		errors.Is(err, icecatalog.ErrTableAlreadyExists)
 }

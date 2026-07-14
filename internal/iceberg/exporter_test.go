@@ -279,7 +279,7 @@ func TestReconcile_SchemaEvolution(t *testing.T) {
 	}
 
 	// 2. Now reconcile with the UNION schema + BOTH files (the wide one has cpu_idle).
-	unionSc, err := UnionSchema([]string{narrow, wide})
+	unionSc, err := UnionSchema(ctx, []string{narrow, wide})
 	if err != nil {
 		t.Fatalf("UnionSchema: %v", err)
 	}
