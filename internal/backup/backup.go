@@ -283,23 +283,24 @@ func (m *Manager) backupConfig(ctx context.Context, backupID string) error {
 
 // isIcebergMetadata reports whether a storage path is an Iceberg warehouse metadata file that
 // must be backed up alongside data. Iceberg tables written by Arc's exporter live at
-// {nsPrefix}_{db}.db/{measurement}/metadata/*, containing:
-//   - *.metadata.json         (table metadata, incl. our v<N>.metadata.json reader copies)
-//   - *.avro                  (manifest lists + manifests)
-//   - version-hint.text       (current-version pointer for directory-based readers)
+// {nsPrefix}_{db}.db/{measurement}/metadata/*, containing table metadata (*.metadata.json,
+// incl. our v<N>.metadata.json reader copies), manifest lists + manifests (*.avro), and
+// version-hint.text (current-version pointer for directory-based readers).
 //
-// Matched by the "/metadata/" path segment plus one of those forms, so it won't accidentally
-// catch a user measurement literally named "metadata" holding parquet (those are .parquet and
-// handled by the data-file filter). The referenced parquet DATA files are backed up normally.
+// Deliberately a catch-all — ANY non-parquet file under a "/metadata/" segment — rather than an
+// allowlist of today's extensions. Iceberg keeps adding metadata file types (e.g. Puffin
+// .puffin statistics/index files); an allowlist silently drops them from the backup and loses
+// them on restore. Over-copying a stray file is cheap; losing table metadata is not.
+//
+// Safe against a user measurement literally named "metadata": its files are .parquet, and the
+// caller's switch tests the .parquet branch FIRST, so data files never reach this predicate.
+// The referenced parquet DATA files are backed up normally.
 func isIcebergMetadata(p string) bool {
 	p = filepath.ToSlash(p)
 	if !strings.Contains(p, "/metadata/") {
 		return false
 	}
-	base := filepath.Base(p)
-	return strings.HasSuffix(base, ".metadata.json") ||
-		strings.HasSuffix(base, ".avro") ||
-		base == "version-hint.text"
+	return !strings.HasSuffix(p, ".parquet")
 }
 
 // parseDBMeasurement extracts the database and measurement from a storage path.

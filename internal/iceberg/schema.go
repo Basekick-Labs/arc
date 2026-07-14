@@ -105,7 +105,7 @@ func UnionSchema(localPaths []string) (ArcSchema, error) {
 		}
 		for _, f := range schemas[i].Fields {
 			if prev, ok := seen[f.Name]; ok {
-				if prev.String() != f.Type.String() {
+				if !prev.Equals(f.Type) {
 					return ArcSchema{}, fmt.Errorf("column %q has conflicting types across files: %s vs %s", f.Name, prev, f.Type)
 				}
 				continue
@@ -135,7 +135,7 @@ func MergeSchemas(base, add ArcSchema) (ArcSchema, error) {
 	}
 	for _, f := range add.Fields {
 		if prev, ok := seen[f.Name]; ok {
-			if prev.String() != f.Type.String() {
+			if !prev.Equals(f.Type) {
 				return ArcSchema{}, fmt.Errorf("column %q has conflicting types across files: %s vs %s", f.Name, prev, f.Type)
 			}
 			continue
@@ -155,8 +155,16 @@ func arrowToIceberg(t arrow.DataType) (iceberg.Type, error) {
 	switch dt := t.(type) {
 	case *arrow.Int64Type:
 		return iceberg.Int64Type{}, nil
+	case *arrow.Int32Type:
+		// Arc's own ingest only emits Int64/Float64/String/Boolean/Timestamp_us, but Parquet
+		// files can also arrive via the bulk import path (internal/api/import.go) carrying
+		// externally-produced int32/float32 columns. Without these, such a measurement fails
+		// the whole export with "unsupported Arrow type". Iceberg has native 32-bit int/float.
+		return iceberg.Int32Type{}, nil
 	case *arrow.Float64Type:
 		return iceberg.Float64Type{}, nil
+	case *arrow.Float32Type:
+		return iceberg.Float32Type{}, nil
 	case *arrow.StringType:
 		return iceberg.StringType{}, nil
 	case *arrow.BooleanType:

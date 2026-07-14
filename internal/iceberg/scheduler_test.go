@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	iceberg "github.com/apache/iceberg-go"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
@@ -362,6 +363,43 @@ func TestUnionSchema_ParallelDeterministic(t *testing.T) {
 	// A missing/unreadable file must produce an error, not a silent partial schema.
 	if _, err := UnionSchema(append(paths, filepath.Join(dir, "does-not-exist.parquet"))); err == nil {
 		t.Error("expected an error for an unreadable file, got nil")
+	}
+}
+
+// TestArrowToIceberg covers the Arrow→Iceberg type mapping. Arc's own ingest only emits
+// Int64/Float64/String/Boolean/Timestamp_us, but Parquet can also arrive via the bulk import
+// path carrying externally-produced types (int32/float32/decimal), so those must map too
+// rather than failing the measurement's whole export.
+func TestArrowToIceberg(t *testing.T) {
+	tests := []struct {
+		name string
+		in   arrow.DataType
+		want iceberg.Type
+	}{
+		{"int64", arrow.PrimitiveTypes.Int64, iceberg.PrimitiveTypes.Int64},
+		{"int32", arrow.PrimitiveTypes.Int32, iceberg.PrimitiveTypes.Int32},
+		{"float64", arrow.PrimitiveTypes.Float64, iceberg.PrimitiveTypes.Float64},
+		{"float32", arrow.PrimitiveTypes.Float32, iceberg.PrimitiveTypes.Float32},
+		{"string", arrow.BinaryTypes.String, iceberg.PrimitiveTypes.String},
+		{"bool", arrow.FixedWidthTypes.Boolean, iceberg.PrimitiveTypes.Bool},
+		// Arc's `time`: UTC-adjusted timestamp MUST become timestamptz, not timestamp.
+		{"timestamp_utc", arrow.FixedWidthTypes.Timestamp_us, iceberg.PrimitiveTypes.TimestampTz},
+		{"timestamp_naive", &arrow.TimestampType{Unit: arrow.Microsecond}, iceberg.PrimitiveTypes.Timestamp},
+	}
+	for _, tt := range tests {
+		got, err := arrowToIceberg(tt.in)
+		if err != nil {
+			t.Errorf("%s: unexpected error: %v", tt.name, err)
+			continue
+		}
+		if !got.Equals(tt.want) {
+			t.Errorf("%s: got %s, want %s", tt.name, got, tt.want)
+		}
+	}
+
+	// An genuinely unsupported type must error, not map to something wrong.
+	if _, err := arrowToIceberg(arrow.ListOf(arrow.PrimitiveTypes.Int64)); err == nil {
+		t.Error("expected an error for an unsupported Arrow type (list), got nil")
 	}
 }
 
