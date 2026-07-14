@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -426,7 +427,7 @@ func (e *Exporter) pruneOldVersionFiles(ctx context.Context, tbl *icetable.Table
 	}
 	var vs []vfile
 	for _, k := range keys {
-		base := path.Base(k)
+		base := filepath.Base(k) // filepath.Base: local-backend keys may be backslash-separated on Windows
 		if !strings.HasPrefix(base, "v") || !strings.HasSuffix(base, ".metadata.json") {
 			continue
 		}
@@ -516,7 +517,7 @@ func (e *Exporter) parseVersionAndMetaDir(metaLoc string) (version, dirKey strin
 	if !ok {
 		return "", "", false
 	}
-	base := path.Base(rel) // 00004-<uuid>.metadata.json
+	base := filepath.Base(rel) // 00004-<uuid>.metadata.json; filepath.Base for Windows backslash keys
 	if !strings.HasSuffix(base, ".metadata.json") {
 		return "", "", false
 	}

@@ -223,6 +223,44 @@ func TestScheduler_IncrementalSchemaEvolution(t *testing.T) {
 	}
 }
 
+// TestUnionSchema_ParallelDeterministic proves the parallelized UnionSchema still folds columns
+// in first-seen order regardless of which footer read finishes first, and surfaces a per-file
+// error. Uses a mix of narrow (3-col) and wide (4-col) files so cpu_idle must land last.
+func TestUnionSchema_ParallelDeterministic(t *testing.T) {
+	dir := t.TempDir()
+	base := int64(1_700_000_000_000_000)
+	var paths []string
+	// Interleave narrow/wide so the extra column comes from files at varying positions.
+	for i := 0; i < 12; i++ {
+		p := filepath.Join(dir, fmt.Sprintf("f%02d.parquet", i))
+		if i%3 == 0 {
+			writeArcStyleParquet4Col(t, p, base+int64(i)*1000, 5) // time, host, value, cpu_idle
+		} else {
+			writeArcStyleParquet(t, p, base+int64(i)*1000, 5) // time, host, value
+		}
+		paths = append(paths, p)
+	}
+
+	sc, err := UnionSchema(paths)
+	if err != nil {
+		t.Fatalf("UnionSchema: %v", err)
+	}
+	got := make([]string, len(sc.Fields))
+	for i, f := range sc.Fields {
+		got[i] = f.Name
+	}
+	// First-seen order: the first file (i=0) is wide (time, host, value, cpu_idle).
+	want := []string{"time", "host", "value", "cpu_idle"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("union column order = %v, want %v", got, want)
+	}
+
+	// A missing/unreadable file must produce an error, not a silent partial schema.
+	if _, err := UnionSchema(append(paths, filepath.Join(dir, "does-not-exist.parquet"))); err == nil {
+		t.Error("expected an error for an unreadable file, got nil")
+	}
+}
+
 func TestMergeSchemas(t *testing.T) {
 	long := iceberg.PrimitiveTypes.Int64
 	dbl := iceberg.PrimitiveTypes.Float64

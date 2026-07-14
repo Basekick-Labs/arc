@@ -3,7 +3,7 @@ package iceberg
 import (
 	"context"
 	"fmt"
-	"path"
+	"path/filepath"
 	"strings"
 
 	"github.com/basekick-labs/arc/internal/storage"
@@ -134,7 +134,11 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 // isDataFile reports whether a storage key is an Arc data file to export. Only .parquet is
 // exported; vortex is a separate (shelved) format and Iceberg's data files are Parquet.
 func isDataFile(p string) bool {
-	base := path.Base(p)
+	// filepath.Base (not path.Base): storage keys from a local backend on Windows are
+	// backslash-separated (LocalBackend.List uses filepath.Rel without ToSlash), and Iceberg
+	// export is local-only. filepath.Base handles both separators; path.Base would treat a
+	// backslash key as one component.
+	base := filepath.Base(p)
 	if strings.HasPrefix(base, ".") || strings.HasPrefix(base, ".tmp.") {
 		return false
 	}

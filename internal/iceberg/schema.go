@@ -9,6 +9,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	iceberg "github.com/apache/iceberg-go"
+	"golang.org/x/sync/errgroup"
 )
 
 // SchemaFromParquet derives an ArcSchema (typed Iceberg columns) by reading a Parquet file's
@@ -58,21 +59,51 @@ func SchemaFromParquet(localPath string) (ArcSchema, error) {
 	return ArcSchema{Fields: fields}, nil
 }
 
+// unionSchemaConcurrency bounds parallel footer reads in UnionSchema. Small enough to avoid
+// file-descriptor exhaustion on a measurement with many files, large enough to hide per-file
+// open+footer latency.
+const unionSchemaConcurrency = 8
+
 // UnionSchema derives the union of column schemas across multiple local Parquet files.
 // Arc's ingest is schema-flexible: files for the same measurement can have different column
 // sets over time (a metric added later). The Iceberg table must carry the SUPERSET so both
 // narrow and wide files pass AddFiles (a column absent from a file reads as NULL, since all
 // fields are optional). Column order follows first-seen; a name seen again must have a
 // matching type (a genuine type conflict is returned as an error rather than silently picked).
+//
+// Footers are read in parallel (bounded) because on first-sight/full-derivation this reads EVERY
+// local footer, which is sequential I/O that can exceed the reconciler's measurementTimeout on a
+// measurement with thousands of files. The merge stays deterministic: results are collected by
+// index and folded in localPaths order, so column ordering and conflict detection are unaffected
+// by scheduling. (The incremental path in the scheduler only passes newly-added files here.)
 func UnionSchema(localPaths []string) (ArcSchema, error) {
+	if len(localPaths) == 0 {
+		return ArcSchema{}, nil
+	}
+	if len(localPaths) == 1 {
+		return SchemaFromParquet(localPaths[0])
+	}
+
+	schemas := make([]ArcSchema, len(localPaths))
+	errs := make([]error, len(localPaths))
+	g := new(errgroup.Group)
+	g.SetLimit(unionSchemaConcurrency)
+	for i, p := range localPaths {
+		i, p := i, p
+		g.Go(func() error {
+			schemas[i], errs[i] = SchemaFromParquet(p)
+			return nil // collect all errors; fold below in deterministic order
+		})
+	}
+	_ = g.Wait()
+
 	seen := make(map[string]iceberg.Type)
 	var order []string
-	for _, p := range localPaths {
-		sc, err := SchemaFromParquet(p)
-		if err != nil {
-			return ArcSchema{}, err
+	for i, p := range localPaths {
+		if errs[i] != nil {
+			return ArcSchema{}, fmt.Errorf("file %q: %w", p, errs[i])
 		}
-		for _, f := range sc.Fields {
+		for _, f := range schemas[i].Fields {
 			if prev, ok := seen[f.Name]; ok {
 				if prev.String() != f.Type.String() {
 					return ArcSchema{}, fmt.Errorf("column %q has conflicting types across files: %s vs %s", f.Name, prev, f.Type)
