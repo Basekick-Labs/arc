@@ -17,6 +17,7 @@ type Config struct {
 	Server          ServerConfig
 	Database        DatabaseConfig
 	Storage         StorageConfig
+	Iceberg         IcebergConfig
 	Ingest          IngestConfig
 	Cache           CacheConfig
 	Log             LogConfig
@@ -181,6 +182,19 @@ type DeleteConfig struct {
 type RetentionConfig struct {
 	Enabled bool   // Enable retention policy management (default: true for policy CRUD, execution is manual)
 	DBPath  string // SQLite database path for storing policies
+}
+
+// IcebergConfig controls the optional Iceberg export layer, which publishes Arc's existing
+// Parquet files as Apache Iceberg tables (metadata only — no data rewrite) so external engines
+// (Spark, Trino, DuckDB) can read Arc's data. Disabled by default. The reconciler discovers
+// files by walking the storage backend, so it works in OSS and cluster alike.
+type IcebergConfig struct {
+	Enabled           bool   // Enable the Iceberg export reconciler
+	Warehouse         string // Root URI for Iceberg table metadata (file://… or s3://bucket/prefix); defaults to the storage root
+	NamespacePrefix   string // Iceberg namespace prefix; tables land in "<prefix>_<database>" (default "arc")
+	ReconcileInterval int    // Seconds between reconcile passes (default 300)
+	CatalogDBPath     string // SQLite catalog path; defaults to the shared auth DB
+	RetainSnapshots   int    // Snapshots (and metadata versions) to keep per table; older are expired (default 10)
 }
 
 type ContinuousQueryConfig struct {
@@ -620,9 +634,21 @@ func Load() (*Config, error) {
 			Enabled: v.GetBool("retention.enabled"),
 			DBPath:  v.GetString("retention.db_path"),
 		},
+		Iceberg: IcebergConfig{
+			Enabled:           v.GetBool("iceberg.enabled"),
+			Warehouse:         v.GetString("iceberg.warehouse"),
+			NamespacePrefix:   v.GetString("iceberg.namespace_prefix"),
+			ReconcileInterval: v.GetInt("iceberg.reconcile_interval"),
+			CatalogDBPath:     v.GetString("iceberg.catalog_db_path"),
+			RetainSnapshots:   v.GetInt("iceberg.retain_snapshots"),
+		},
 		ContinuousQuery: ContinuousQueryConfig{
 			Enabled: v.GetBool("continuous_query.enabled"),
 			DBPath:  v.GetString("continuous_query.db_path"),
+		},
+		Backup: BackupConfig{
+			Enabled:   v.GetBool("backup.enabled"),
+			LocalPath: v.GetString("backup.local_path"),
 		},
 		Metrics: MetricsConfig{
 			TimeseriesRetentionMinutes: v.GetInt("metrics.timeseries_retention_minutes"),
@@ -871,6 +897,23 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// Iceberg export is LOCAL-ONLY in v1. The reconciler walks the single configured storage
+	// backend and derives schemas by reading Parquet footers from the local filesystem, and the
+	// export was verified only against a local backend. Refuse non-local primary backends and
+	// cold-tier tiering (a file migrated to object storage would leave the Iceberg table) at
+	// load time rather than run an unsupported/corrupting configuration.
+	if cfg.Iceberg.Enabled {
+		if cfg.Storage.Backend != "local" {
+			return nil, fmt.Errorf("iceberg.enabled=true requires storage.backend=\"local\" (got %q); "+
+				"Iceberg export is local-only in this release", cfg.Storage.Backend)
+		}
+		if cfg.TieredStorage.Enabled && cfg.TieredStorage.Cold.Enabled {
+			return nil, fmt.Errorf("iceberg.enabled=true is not supported with cold-tier tiering " +
+				"(tiered_storage.cold.enabled): files migrated to the cold tier would be removed from the " +
+				"Iceberg table. Disable one of them")
+		}
+	}
+
 	return cfg, nil
 }
 
@@ -983,6 +1026,14 @@ func setDefaults(v *viper.Viper) {
 	// Retention policy defaults
 	v.SetDefault("retention.enabled", true)            // Enable policy management by default
 	v.SetDefault("retention.db_path", "./data/arc.db") // Shared SQLite DB with auth
+
+	// Iceberg export defaults (opt-in; disabled by default)
+	v.SetDefault("iceberg.enabled", false)
+	v.SetDefault("iceberg.namespace_prefix", "arc")
+	v.SetDefault("iceberg.reconcile_interval", 300)          // seconds
+	v.SetDefault("iceberg.catalog_db_path", "./data/arc.db") // shared SQLite DB with auth
+	v.SetDefault("iceberg.retain_snapshots", 10)
+	// iceberg.warehouse defaults at wire time to the storage root (needs the backend)
 
 	// Continuous query defaults
 	v.SetDefault("continuous_query.enabled", true)            // Enable CQ management by default
