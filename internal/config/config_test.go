@@ -221,6 +221,31 @@ func TestLoad_IcebergRejectsColdTiering(t *testing.T) {
 	}
 }
 
+func TestLoad_IcebergRequiresLocalBackend(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	// iceberg + non-local primary backend must be rejected (local-only in v1).
+	os.Setenv("ARC_ICEBERG_ENABLED", "true")
+	os.Setenv("ARC_STORAGE_BACKEND", "s3")
+	os.Setenv("ARC_STORAGE_S3_BUCKET", "b")
+	defer func() {
+		os.Unsetenv("ARC_ICEBERG_ENABLED")
+		os.Unsetenv("ARC_STORAGE_BACKEND")
+		os.Unsetenv("ARC_STORAGE_S3_BUCKET")
+	}()
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for iceberg.enabled + non-local backend, got nil")
+	}
+}
+
 func TestLoad_EnvOverride(t *testing.T) {
 	// Create a temp dir without config file
 	tmpDir, err := os.MkdirTemp("", "arc-config-test")
