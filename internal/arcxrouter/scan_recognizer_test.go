@@ -38,6 +38,12 @@ func TestMatchScan_Accepts(t *testing.T) {
 		{"substr 2-arg", "SELECT substr(host, 3) FROM cpu", []string{"substr(host, 3)"}, "cpu", 0},
 		{"substr negative", "SELECT substr(host, -2, 2) FROM cpu", []string{"substr(host, -2, 2)"}, "cpu", 0},
 		{"substr + passthrough", "SELECT substr(host, 1, 2), code FROM cpu", []string{"substr(host, 1, 2)", "code"}, "cpu", 0},
+		// 2f-2 string predicates: `<fn>(col, '<str>')`, needle re-escaped.
+		{"starts_with", "SELECT starts_with(host, 'web') FROM cpu", []string{"starts_with(host, 'web')"}, "cpu", 0},
+		{"ends_with", "SELECT ends_with(host, 'lo') FROM cpu", []string{"ends_with(host, 'lo')"}, "cpu", 0},
+		{"contains", "SELECT contains(host, 'ell') FROM cpu", []string{"contains(host, 'ell')"}, "cpu", 0},
+		{"contains reescaped quote", "SELECT contains(host, 'a''b') FROM cpu", []string{"contains(host, 'a''b')"}, "cpu", 0},
+		{"starts_with + passthrough", "SELECT starts_with(host, 'w'), code FROM cpu", []string{"starts_with(host, 'w')", "code"}, "cpu", 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -374,6 +380,13 @@ func TestMatchScan_Declines(t *testing.T) {
 		"SELECT substr(host, +1, 3) FROM cpu",        // substr unary-plus (not tokNum)
 		"SELECT substr(host, 1, code) FROM cpu",      // substr column len
 		"SELECT substr(upper(host), 1, 2) FROM cpu",  // substr nested function
+		"SELECT upper(host) FROM cpu",                // non-PROJ_FUNCS (ICU) — decline
+		"SELECT starts_with(host, 1) FROM cpu",       // non-string needle
+		"SELECT starts_with(host, code) FROM cpu",    // column needle
+		"SELECT starts_with(host) FROM cpu",          // wrong arity
+		"SELECT starts_with(host, 'a', 'b') FROM cpu", // wrong arity
+		"SELECT contains(host, [1,2,3]) FROM cpu",    // LIST contains overload
+		"SELECT starts_with(upper(host), 'a') FROM cpu", // nested function
 		"SELECT host FROM cpu LIMIT 10",              // LIMIT without ORDER BY (nondeterministic)
 		"SELECT host FROM cpu ORDER BY host LIMIT 0", // LIMIT 0 routed to DuckDB
 		"SELECT host FROM cpu ORDER BY 1",            // positional ORDER BY (agg shape, not scan)

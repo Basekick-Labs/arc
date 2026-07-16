@@ -514,11 +514,20 @@ func (c *cursor) peekIdentLower() string {
 // columns (as written), the predicates, the measurement, and ok.
 // projFuncs is the computed-projection functions the router recognizes (2f-0: only
 // `length`). Matches ProjFn / PROJ_FUNCS in arcx/src/{bind,parse}.rs.
-// projFuncs maps a recognized projection function to its argument signature:
-// length(<col>) (2f-0) and substr(<col>, <int>[, <int>]) (2f-1). Matches PROJ_FUNCS /
-// bind_proj_func in arcx/src/{parse,bind}.rs. The engine re-validates everything
-// (offset range, string-col type); the router mirrors the parse-level decline boundary.
-var projFuncs = map[string]bool{"length": true, "substr": true}
+// projFuncs maps a recognized projection function to true. length(<col>) (2f-0),
+// substr(<col>, <int>[, <int>]) (2f-1), and starts_with/ends_with/contains(<col>, '<str>')
+// (2f-2). Matches PROJ_FUNCS / bind_proj_func in arcx/src/{parse,bind}.rs. The engine
+// re-validates everything; the router mirrors the parse-level decline boundary.
+var projFuncs = map[string]bool{
+	"length":      true,
+	"substr":      true,
+	"starts_with": true,
+	"ends_with":   true,
+	"contains":    true,
+}
+
+// strPredFuncs are the 2f-2 funcs taking `(col, '<string-literal>')` → BOOLEAN.
+var strPredFuncs = map[string]bool{"starts_with": true, "ends_with": true, "contains": true}
 
 // matchProjFunc parses a recognized projection function `<fn>(<args>)`, cursor at the
 // `(`. Returns the re-serialized item (`length(host)`, `substr(host, 1, 3)`) or ok=false.
@@ -578,6 +587,22 @@ func matchProjFunc(c *cursor, fnLower string) (string, bool) {
 		b.WriteByte(')')
 		return b.String(), true
 	default:
+		// 2f-2 string predicates: `<fn>(col, '<string-literal>')` → re-serialize with the
+		// needle re-escaped. The engine re-validates the string-col type + owns the kernel.
+		if strPredFuncs[fnLower] {
+			if !c.punct(',') {
+				return "", false
+			}
+			lit, ok := c.next()
+			if !ok || lit.kind != tokStr {
+				return "", false // non-string needle (int/column/`[`) → decline
+			}
+			if !c.punct(')') {
+				return "", false // wrong arity → decline
+			}
+			// lit.str is the UNESCAPED content; re-escape (double `'`) for the emitted SQL.
+			return fnLower + "(" + arg.orig + ", '" + escapeStringLiteral(lit.str) + "')", true
+		}
 		return "", false
 	}
 }

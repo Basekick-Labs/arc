@@ -56,13 +56,16 @@ func isBareIdent(col string) bool {
 }
 
 // projFuncItem matches a re-serialized computed-projection item — the ONLY non-bare-
-// column forms buildScanSQL emits: `length(host)` (2f-0) and `substr(host, 1, 3)` /
-// `substr(host, -2, 2)` (2f-1). The function name and column arg are bare identifiers;
-// substr's remaining args are (optionally `-`-signed) integers with `, ` separators. So
-// it's injection-safe: no quotes or operators beyond a leading `-`. `isProjFuncItem` is
-// the SQL-boundary defensive re-check that the item came from matchProjFunc.
+// column forms buildScanSQL emits: `length(host)` (2f-0), `substr(host, 1, 3)` (2f-1),
+// and `starts_with(host, 'web')` / `ends_with`/`contains` (2f-2). The function name and
+// column arg are bare identifiers; the remaining args are EITHER (optionally `-`-signed)
+// integers (substr) OR a single properly-escaped single-quoted string literal (the 2f-2
+// needle, `'([^']|'')*'` — every embedded `'` is DOUBLED, so no unescaped quote can break
+// out). Injection-safe. `isProjFuncItem` is the SQL-boundary defensive re-check that the
+// item came from matchProjFunc.
 var projFuncItem = regexp.MustCompile(
-	`^[a-zA-Z_][a-zA-Z0-9_]*\([a-zA-Z_][a-zA-Z0-9_.]*(, -?[0-9]+){0,2}\)$`,
+	`^[a-zA-Z_][a-zA-Z0-9_]*\([a-zA-Z_][a-zA-Z0-9_.]*` +
+		`(?:(?:, -?[0-9]+){1,2}|, '(?:[^']|'')*')?\)$`,
 )
 
 func isProjFuncItem(col string) bool {
