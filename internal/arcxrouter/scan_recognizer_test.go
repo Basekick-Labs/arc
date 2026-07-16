@@ -25,6 +25,13 @@ func TestMatchScan_Accepts(t *testing.T) {
 		{"ne op", "SELECT code FROM cpu WHERE code != 2", []string{"code"}, "cpu", 1},
 		{"lowercase", "select host from cpu", []string{"host"}, "cpu", 0},
 		{"case preserved cols", "SELECT Host, UsageIdle FROM cpu", []string{"Host", "UsageIdle"}, "cpu", 0},
+		// 2f-0 computed projection: length(<col>) re-serialized as an item string, arg
+		// spelling preserved (DuckDB echoes it as the output column name).
+		{"length sole", "SELECT length(host) FROM cpu", []string{"length(host)"}, "cpu", 0},
+		{"length caps arg", "SELECT length(Host) FROM cpu", []string{"length(Host)"}, "cpu", 0},
+		{"length with passthrough", "SELECT length(host), code FROM cpu", []string{"length(host)", "code"}, "cpu", 0},
+		{"two length", "SELECT length(host), length(region) FROM cpu", []string{"length(host)", "length(region)"}, "cpu", 0},
+		{"length under filter", "SELECT length(host) FROM cpu WHERE code > 5", []string{"length(host)"}, "cpu", 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -348,7 +355,13 @@ func TestMatchScan_Declines(t *testing.T) {
 		"SELECT host FROM cpu WHERE NOT a = 1",       // NOT (2b-2b)
 		"SELECT host FROM cpu WHERE (a = 1",          // unbalanced paren
 		"SELECT host FROM cpu WHERE a = 1 OR",        // trailing OR
-		"SELECT lower(host) FROM cpu",                // function in projection (2b)
+		"SELECT lower(host) FROM cpu",                // non-length function (later sub-phase)
+		"SELECT upper(host) FROM cpu",                // non-length function
+		"SELECT length(host, 2) FROM cpu",            // length wrong arity
+		"SELECT length() FROM cpu",                   // length no args
+		"SELECT length('lit') FROM cpu",              // length literal arg (2f-1)
+		"SELECT length(upper(host)) FROM cpu",        // length nested function
+		"SELECT length(*) FROM cpu",                  // length on star
 		"SELECT host FROM cpu LIMIT 10",              // LIMIT without ORDER BY (nondeterministic)
 		"SELECT host FROM cpu ORDER BY host LIMIT 0", // LIMIT 0 routed to DuckDB
 		"SELECT host FROM cpu ORDER BY 1",            // positional ORDER BY (agg shape, not scan)

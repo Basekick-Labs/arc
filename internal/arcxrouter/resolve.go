@@ -55,6 +55,17 @@ func isBareIdent(col string) bool {
 	return bareIdent.MatchString(col)
 }
 
+// projFuncItem matches a re-serialized computed-projection item `<fn>(<bare-col>)`
+// (2f-0: `length(host)`) — the ONLY non-bare-column form buildScanSQL emits. Both the
+// function name and the arg are bare identifiers, so it's injection-safe: no quotes,
+// spaces, or operators. `isProjFuncItem` is the SQL-boundary defensive re-check that
+// the item came from matchProjFunc, not a hand-built Decision.
+var projFuncItem = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*\([a-zA-Z_][a-zA-Z0-9_.]*\)$`)
+
+func isProjFuncItem(col string) bool {
+	return projFuncItem.MatchString(col)
+}
+
 // quotePath returns a single-quoted DuckDB path literal, escaping embedded quotes
 // via Arc's canonical escaper — the single source of truth for the read_parquet
 // interpolation SQL-injection boundary (internal/sql.EscapeStringLiteral).

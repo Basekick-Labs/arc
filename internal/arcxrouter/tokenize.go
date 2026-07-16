@@ -512,6 +512,39 @@ func (c *cursor) peekIdentLower() string {
 // The engine re-validates types, union_by_name, and the sandbox; the router's job
 // is only to recognize the shape and hand over the parts. Returns the projected
 // columns (as written), the predicates, the measurement, and ok.
+// projFuncs is the computed-projection functions the router recognizes (2f-0: only
+// `length`). Matches ProjFn / PROJ_FUNCS in arcx/src/{bind,parse}.rs.
+var projFuncs = map[string]bool{"length": true}
+
+// matchProjFunc parses `<fn>( <bare-col> )` for a recognized projection function,
+// with the cursor positioned at the `(`. Returns the re-serialized item `fn(col)`
+// (original arg spelling — DuckDB echoes it as the output column name) or ok=false.
+// Mirrors the engine's 2f-0 decline boundary: only `length`, exactly one bare-column
+// arg — a literal arg, a nested function, >1 arg, or an unknown function declines.
+func matchProjFunc(c *cursor, fnLower string) (string, bool) {
+	if !projFuncs[fnLower] {
+		return "", false
+	}
+	if !c.punct('(') {
+		return "", false
+	}
+	arg, ok := c.next()
+	if !ok || arg.kind != tokIdent || isScanKeyword(arg.lower) {
+		return "", false // a literal / `*` / keyword arg → decline
+	}
+	// A `(` after the arg is a nested function (`length(upper(host))`) → decline.
+	if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '(' {
+		return "", false
+	}
+	if !c.punct(')') {
+		return "", false // >1 arg or missing `)` → decline
+	}
+	if !isBareIdent(arg.orig) {
+		return "", false
+	}
+	return fnLower + "(" + arg.orig + ")", true
+}
+
 func matchScan(toks []token) (cols []string, preds []scanPred, whereText string, orderBy []scanOrderKey, limit int, meas string, ok bool) {
 	c := &cursor{toks: toks}
 	if !c.ident("select") {
@@ -522,17 +555,26 @@ func matchScan(toks []token) (cols []string, preds []scanPred, whereText string,
 	}
 
 	// Projection: one or more bare columns, comma-separated. A `*`, a function
-	// call `col(`, or an alias all fall outside → decline.
+	// call, or an alias all fall outside — EXCEPT a recognized computed-projection
+	// function `length(<col>)` (2f-0), which is re-serialized as an item string.
 	for {
 		t, ok := c.next()
 		if !ok || t.kind != tokIdent || isScanKeyword(t.lower) {
 			return fail()
 		}
-		// A `(` immediately after would be a function call (expression) — 2b.
+		// A `(` immediately after is a function call. Only `length(<bare-col>)` (2f-0)
+		// is recognized; any other function / arg-shape declines (mirrors the engine's
+		// parse_like_pattern-style decline boundary). The engine re-lexes the emitted SQL
+		// and is the authority; the router just re-serializes what it proved.
 		if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '(' {
-			return fail()
+			item, ok := matchProjFunc(c, t.lower)
+			if !ok {
+				return fail()
+			}
+			cols = append(cols, item)
+		} else {
+			cols = append(cols, t.orig)
 		}
-		cols = append(cols, t.orig)
 		if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == ',' {
 			c.i++
 			continue

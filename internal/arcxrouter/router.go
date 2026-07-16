@@ -290,7 +290,11 @@ func buildScanSQL(d Decision, pathArray string) (string, bool) {
 	var b strings.Builder
 	b.WriteString("SELECT ")
 	for i, col := range d.Cols {
-		if !isBareIdent(col) {
+		// A projection item is either a bare column or a recognized computed function
+		// re-serialized by matchProjFunc (`length(col)`, 2f-0). Re-validate both here
+		// (defense in depth vs a hand-built Decision) — a bare ident, or a proj-func
+		// item whose form re-parses cleanly.
+		if !isBareIdent(col) && !isProjFuncItem(col) {
 			return "", false
 		}
 		if i > 0 {
