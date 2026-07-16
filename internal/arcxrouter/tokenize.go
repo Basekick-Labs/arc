@@ -514,13 +514,17 @@ func (c *cursor) peekIdentLower() string {
 // columns (as written), the predicates, the measurement, and ok.
 // projFuncs is the computed-projection functions the router recognizes (2f-0: only
 // `length`). Matches ProjFn / PROJ_FUNCS in arcx/src/{bind,parse}.rs.
-var projFuncs = map[string]bool{"length": true}
+// projFuncs maps a recognized projection function to its argument signature:
+// length(<col>) (2f-0) and substr(<col>, <int>[, <int>]) (2f-1). Matches PROJ_FUNCS /
+// bind_proj_func in arcx/src/{parse,bind}.rs. The engine re-validates everything
+// (offset range, string-col type); the router mirrors the parse-level decline boundary.
+var projFuncs = map[string]bool{"length": true, "substr": true}
 
-// matchProjFunc parses `<fn>( <bare-col> )` for a recognized projection function,
-// with the cursor positioned at the `(`. Returns the re-serialized item `fn(col)`
-// (original arg spelling — DuckDB echoes it as the output column name) or ok=false.
-// Mirrors the engine's 2f-0 decline boundary: only `length`, exactly one bare-column
-// arg — a literal arg, a nested function, >1 arg, or an unknown function declines.
+// matchProjFunc parses a recognized projection function `<fn>(<args>)`, cursor at the
+// `(`. Returns the re-serialized item (`length(host)`, `substr(host, 1, 3)`) or ok=false.
+// The first arg is always a bare column; substr then takes 1-2 int literals. Mirrors the
+// engine's decline boundary: a nested function, `*`, a non-int/`+`-signed substr arg,
+// wrong arity, or an unknown function declines (the engine re-checks + owns offset range).
 func matchProjFunc(c *cursor, fnLower string) (string, bool) {
 	if !projFuncs[fnLower] {
 		return "", false
@@ -528,21 +532,54 @@ func matchProjFunc(c *cursor, fnLower string) (string, bool) {
 	if !c.punct('(') {
 		return "", false
 	}
+	// First arg: a bare column (never a nested function / literal / keyword).
 	arg, ok := c.next()
-	if !ok || arg.kind != tokIdent || isScanKeyword(arg.lower) {
-		return "", false // a literal / `*` / keyword arg → decline
+	if !ok || arg.kind != tokIdent || isScanKeyword(arg.lower) || !isBareIdent(arg.orig) {
+		return "", false
 	}
-	// A `(` after the arg is a nested function (`length(upper(host))`) → decline.
 	if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '(' {
+		return "", false // nested function (`substr(upper(host), ...)`) → decline
+	}
+	switch fnLower {
+	case "length":
+		if !c.punct(')') {
+			return "", false // >1 arg → decline
+		}
+		return "length(" + arg.orig + ")", true
+	case "substr":
+		// `substr(col, <int> [, <int>])` — 1 or 2 int-literal args after the column.
+		var b strings.Builder
+		b.WriteString("substr(")
+		b.WriteString(arg.orig)
+		nargs := 0
+		for {
+			if !c.punct(',') {
+				return "", false // substr needs at least a start arg
+			}
+			lit, ok := c.next()
+			// An int literal only (tokNum; a `+`-signed or float/string arg isn't tokNum
+			// → decline, mirroring the engine which declines a Column/non-int start/len).
+			if !ok || lit.kind != tokNum || !isIntLiteral(lit.orig) {
+				return "", false
+			}
+			b.WriteString(", ")
+			b.WriteString(lit.orig)
+			nargs++
+			if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == ')' {
+				break
+			}
+			if nargs >= 2 {
+				return "", false // >2 int args (arity >3) → decline
+			}
+		}
+		if !c.punct(')') {
+			return "", false
+		}
+		b.WriteByte(')')
+		return b.String(), true
+	default:
 		return "", false
 	}
-	if !c.punct(')') {
-		return "", false // >1 arg or missing `)` → decline
-	}
-	if !isBareIdent(arg.orig) {
-		return "", false
-	}
-	return fnLower + "(" + arg.orig + ")", true
 }
 
 func matchScan(toks []token) (cols []string, preds []scanPred, whereText string, orderBy []scanOrderKey, limit int, meas string, ok bool) {

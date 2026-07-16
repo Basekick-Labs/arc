@@ -55,12 +55,15 @@ func isBareIdent(col string) bool {
 	return bareIdent.MatchString(col)
 }
 
-// projFuncItem matches a re-serialized computed-projection item `<fn>(<bare-col>)`
-// (2f-0: `length(host)`) — the ONLY non-bare-column form buildScanSQL emits. Both the
-// function name and the arg are bare identifiers, so it's injection-safe: no quotes,
-// spaces, or operators. `isProjFuncItem` is the SQL-boundary defensive re-check that
-// the item came from matchProjFunc, not a hand-built Decision.
-var projFuncItem = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*\([a-zA-Z_][a-zA-Z0-9_.]*\)$`)
+// projFuncItem matches a re-serialized computed-projection item — the ONLY non-bare-
+// column forms buildScanSQL emits: `length(host)` (2f-0) and `substr(host, 1, 3)` /
+// `substr(host, -2, 2)` (2f-1). The function name and column arg are bare identifiers;
+// substr's remaining args are (optionally `-`-signed) integers with `, ` separators. So
+// it's injection-safe: no quotes or operators beyond a leading `-`. `isProjFuncItem` is
+// the SQL-boundary defensive re-check that the item came from matchProjFunc.
+var projFuncItem = regexp.MustCompile(
+	`^[a-zA-Z_][a-zA-Z0-9_]*\([a-zA-Z_][a-zA-Z0-9_.]*(, -?[0-9]+){0,2}\)$`,
+)
 
 func isProjFuncItem(col string) bool {
 	return projFuncItem.MatchString(col)

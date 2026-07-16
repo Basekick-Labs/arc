@@ -32,6 +32,12 @@ func TestMatchScan_Accepts(t *testing.T) {
 		{"length with passthrough", "SELECT length(host), code FROM cpu", []string{"length(host)", "code"}, "cpu", 0},
 		{"two length", "SELECT length(host), length(region) FROM cpu", []string{"length(host)", "length(region)"}, "cpu", 0},
 		{"length under filter", "SELECT length(host) FROM cpu WHERE code > 5", []string{"length(host)"}, "cpu", 1},
+		// 2f-1 substr: re-serialized `substr(col, N[, M])` with `, ` separators, arg spelling
+		// and int-literal text preserved (both engines normalize identically).
+		{"substr 3-arg", "SELECT substr(host, 1, 3) FROM cpu", []string{"substr(host, 1, 3)"}, "cpu", 0},
+		{"substr 2-arg", "SELECT substr(host, 3) FROM cpu", []string{"substr(host, 3)"}, "cpu", 0},
+		{"substr negative", "SELECT substr(host, -2, 2) FROM cpu", []string{"substr(host, -2, 2)"}, "cpu", 0},
+		{"substr + passthrough", "SELECT substr(host, 1, 2), code FROM cpu", []string{"substr(host, 1, 2)", "code"}, "cpu", 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -362,6 +368,12 @@ func TestMatchScan_Declines(t *testing.T) {
 		"SELECT length('lit') FROM cpu",              // length literal arg (2f-1)
 		"SELECT length(upper(host)) FROM cpu",        // length nested function
 		"SELECT length(*) FROM cpu",                  // length on star
+		"SELECT substr(host) FROM cpu",               // substr missing start arg
+		"SELECT substr(host, 1, 2, 3) FROM cpu",      // substr arity 4
+		"SELECT substr(host, 'x', 2) FROM cpu",       // substr non-int start
+		"SELECT substr(host, +1, 3) FROM cpu",        // substr unary-plus (not tokNum)
+		"SELECT substr(host, 1, code) FROM cpu",      // substr column len
+		"SELECT substr(upper(host), 1, 2) FROM cpu",  // substr nested function
 		"SELECT host FROM cpu LIMIT 10",              // LIMIT without ORDER BY (nondeterministic)
 		"SELECT host FROM cpu ORDER BY host LIMIT 0", // LIMIT 0 routed to DuckDB
 		"SELECT host FROM cpu ORDER BY 1",            // positional ORDER BY (agg shape, not scan)
