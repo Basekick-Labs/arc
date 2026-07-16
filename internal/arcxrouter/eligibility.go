@@ -92,6 +92,18 @@ var tzInjectionTokens = []string{"time zone", "timezone", "at time zone"}
 // upheld by Arc keeping its pooled session at default BINARY collation (2b-4 review H1).
 var collationTokens = []string{"collate", "default_collation"}
 
+// nullOrderTokens force a decline for the footer-agg NULL bucket: arcx hard-codes the
+// NULL bucket LAST under ORDER BY 1 (DuckDB's default `NULLS_LAST`). An in-query
+// `SET default_null_order = 'nulls_first'` would make DuckDB order the NULL bucket
+// FIRST, so arcx's fixed ordering would silently diverge (values identical, ROW ORDER
+// differs). Decline whenever the SQL body mentions null-order. Same out-of-band caveat
+// as collation: a `SET default_null_order` on the pooled DuckDB connection is invisible
+// here and must be upheld by Arc keeping the pooled session at NULLS_LAST. Note the
+// filtered footer-agg shape never emits a NULL bucket (a time filter drops NULL rows),
+// so this only bites the unfiltered date_trunc agg — but the guard is cheap and
+// covers both.
+var nullOrderTokens = []string{"default_null_order", "null_order"}
+
 // matchResult is what eligibleShape resolves a recognized query into. `unit` is
 // set only for the date_trunc agg; `col` only for the scalar column aggregates
 // (min/max/count(col)). measurement is the bare FROM token as written.
@@ -102,7 +114,7 @@ type matchResult struct {
 	measurement string
 	cols        []string   // scan only: projected columns (as written)
 	preds       []scanPred // scan only: AND-conjoined WHERE predicates (flat case)
-	whereText   string     // scan only: re-serialized WHERE for the boolean-TREE case
+	whereText   string     // re-serialized WHERE: boolean tree (scan, 2b-2) OR time-range (date_trunc agg, PR-A)
 	// (OR / parens). Mutually exclusive with preds — set only when the flat AND-list
 	// can't represent the WHERE (2b-2). buildScanSQL emits it verbatim; the engine is
 	// the tree authority.
@@ -132,13 +144,20 @@ func eligibleShape(sql string) (matchResult, bool) {
 			return matchResult{}, false
 		}
 	}
+	// Null-order guard: arcx's fixed NULLS_LAST footer-agg output diverges from DuckDB
+	// under an in-query `SET default_null_order = 'nulls_first'`.
+	for _, t := range nullOrderTokens {
+		if strings.Contains(low, t) {
+			return matchResult{}, false
+		}
+	}
 
 	toks, ok := tokenize(sql)
 	if !ok {
 		return matchResult{}, false
 	}
-	if u, meas, ok := matchDateTruncCount(toks); ok {
-		return matchResult{shape: ShapeDateTruncCent, unit: u, measurement: meas}, true
+	if u, meas, whereText, ok := matchDateTruncCount(toks); ok {
+		return matchResult{shape: ShapeDateTruncCent, unit: u, measurement: meas, whereText: whereText}, true
 	}
 	if meas, ok := matchCountStar(toks); ok {
 		return matchResult{shape: ShapeCountStar, measurement: meas}, true

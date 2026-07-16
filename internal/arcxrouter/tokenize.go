@@ -343,49 +343,123 @@ func matchScalarAgg(toks []token) (fn, col, meas string, ok bool) {
 //
 // The bucket column must be exactly "time" (Arc's convention, F1) and the unit
 // one of the supported set. Returns (unit-literal-as-written, measurement, ok).
-func matchDateTruncCount(toks []token) (string, string, bool) {
+func matchDateTruncCount(toks []token) (unit, meas, whereText string, ok bool) {
 	c := &cursor{toks: toks}
 	if !c.ident("select") || !c.ident("date_trunc") || !c.punct('(') {
-		return "", "", false
+		return "", "", "", false
 	}
 	// Unit literal.
 	ut, ok := c.next()
 	if !ok || ut.kind != tokStr {
-		return "", "", false
+		return "", "", "", false
 	}
-	unit := ut.str
+	unit = ut.str
 	if !supportedUnits[strings.ToLower(unit)] {
-		return "", "", false
+		return "", "", "", false
 	}
 	if !c.punct(',') {
-		return "", "", false
+		return "", "", "", false
 	}
 	// Bucket column — must be the bare identifier "time".
 	col, ok := c.next()
 	if !ok || col.kind != tokIdent || col.lower != timeColumn {
-		return "", "", false
+		return "", "", "", false
 	}
 	if !c.punct(')') || !c.punct(',') || !c.ident("count") || !c.punct('(') || !c.punct('*') || !c.punct(')') || !c.ident("from") {
-		return "", "", false
+		return "", "", "", false
 	}
 	mt, ok := c.next()
 	if !ok || mt.kind != tokIdent {
-		return "", "", false
+		return "", "", "", false
 	}
-	meas := mt.orig
+	meas = mt.orig
+
+	// Optional WHERE — only a time-range filter on the `time` column (PR-A). The
+	// engine serves `time <range-op> '<ts>'` AND-conjoined; anything else declines.
+	if c.peekIdentLower() == "where" {
+		c.next()
+		wt, ok := reserializeTimeWhere(c)
+		if !ok {
+			return "", "", "", false
+		}
+		whereText = wt
+	}
+
 	if !c.ident("group") || !c.ident("by") || !c.numOne() {
-		return "", "", false
+		return "", "", "", false
 	}
 	// Optional ORDER BY 1.
 	if !c.atEnd() {
 		if !c.ident("order") || !c.ident("by") || !c.numOne() {
-			return "", "", false
+			return "", "", "", false
 		}
 	}
 	if !c.atEnd() {
-		return "", "", false
+		return "", "", "", false
 	}
-	return unit, meas, true
+	return unit, meas, whereText, true
+}
+
+// reserializeTimeWhere recognizes the footer-agg WHERE — a time-range filter on the
+// `time` column, AND-conjoined — and RE-SERIALIZES it token-by-token into a normalized
+// string, mirroring reserializeWhere's safety property (no source-substring slice; every
+// token re-emitted from the validated vocabulary, string literals re-escaped). It is
+// deliberately NARROWER than reserializeWhere: only `time <op> '<str>'` atoms with `op`
+// in {>, >=, <, <=}, joined by AND. `=`/`!=`, OR, parens, a non-time column, IN, BETWEEN,
+// a non-string RHS → decline, matching the engine's match_footer_where exactly so the
+// router never routes a shape the engine declines. The engine re-lexes this text, checks
+// the RFC3339-UTC literal, and is the sole authority; a naive/offset literal declines
+// engine-side (the router passes the string through, so it can't over-accept the value).
+// Leaves the cursor at the first GROUP token. Caps atoms like the scan path.
+func reserializeTimeWhere(c *cursor) (string, bool) {
+	var b strings.Builder
+	atoms := 0
+	for {
+		atoms++
+		if atoms > maxWhereAtoms {
+			return "", false
+		}
+		// LHS: the bare `time` column (same convention as the bucket column).
+		colT, ok := c.next()
+		if !ok || colT.kind != tokIdent || colT.lower != timeColumn {
+			return "", false
+		}
+		// Operator: only range ops. `=`/`!=` decline (not a range).
+		opT, ok := c.next()
+		if !ok || opT.kind != tokOp {
+			return "", false
+		}
+		switch opT.op {
+		case ">", ">=", "<", "<=":
+		default:
+			return "", false
+		}
+		// RHS: a string literal (the RFC3339-UTC timestamp; the engine validates it).
+		rhsT, ok := c.next()
+		if !ok || rhsT.kind != tokStr {
+			return "", false
+		}
+		if atoms > 1 {
+			b.WriteString(" AND ")
+		}
+		// Re-emit from validated pieces: constant column name, switch-checked op,
+		// re-escaped literal. No input byte reaches the output un-validated.
+		b.WriteString(timeColumn)
+		b.WriteByte(' ')
+		b.WriteString(opT.op)
+		b.WriteByte(' ')
+		b.WriteByte('\'')
+		b.WriteString(escapeStringLiteral(rhsT.str))
+		b.WriteByte('\'')
+
+		// Continue only on AND; anything else ends the WHERE (GROUP must follow).
+		if c.peekIdentLower() == "and" {
+			c.next()
+			continue
+		}
+		break
+	}
+	return b.String(), true
 }
 
 // op reads a comparison operator token.

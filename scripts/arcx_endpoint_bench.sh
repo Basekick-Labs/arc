@@ -90,7 +90,21 @@ row_count() {
 }
 
 # did arcx actually serve? (its cost line only appears in serve mode)
-arcx_served() { grep -q "arcx scan cost" /tmp/arcx_bench_serve.log && echo yes || echo no; }
+# Detect whether arcx served vs fell back to DuckDB. arcx logs a cost line for the
+# SCAN path ("arcx scan cost") and the FILTERED footer-agg path ("arcx filtered
+# footer-agg: ... served=true"), but the UNFILTERED footer-agg / min-max / count paths
+# log nothing, so a "no" here can be a false negative for those shapes — cross-check
+# the latency (an arcx footer answer is ~ms; a DuckDB fallback scans rows). A definitive
+# marker for every footer shape is a TODO on the engine side (issue: emit a served-shape
+# log line uniformly). Until then this covers scan + filtered-agg definitively.
+arcx_served() {
+  if grep -q "arcx scan cost" /tmp/arcx_bench_serve.log ||
+     grep -q "arcx filtered footer-agg:.*served=true" /tmp/arcx_bench_serve.log; then
+    echo yes
+  else
+    echo "no (or an unlogged footer shape — check latency)"
+  fi
+}
 
 echo "Query: $QUERY"
 echo "Port: $PORT   Iters: $ITERS   Data: $DATA_ROOT"

@@ -91,7 +91,7 @@ type Decision struct {
 	Col       string         // min/max/count(col) only — the bare column, user's spelling
 	Cols      []string       // scan only: projected columns (as written)
 	Preds     []scanPred     // scan only: AND-conjoined WHERE predicates (flat case)
-	WhereText string         // scan only: re-serialized boolean WHERE (OR/parens, 2b-2)
+	WhereText string         // re-serialized WHERE: boolean tree for scan (2b-2), or a time-range filter for date_trunc agg (PR-A)
 	OrderBy   []scanOrderKey // scan only: ORDER BY keys
 	Limit     int            // scan only: LIMIT n (0 = none)
 }
@@ -243,9 +243,21 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 		return "SELECT count(*) FROM read_parquet(" + arr.String() + ")", true
 	case ShapeDateTruncCent:
 		// Unit spelling preserved verbatim so the engine reproduces DuckDB's
-		// derived column name. Column is the "time" convention (F1).
-		return "SELECT date_trunc('" + escapeStringLiteral(d.Unit) + "', time), count(*) FROM read_parquet(" +
-			arr.String() + ") GROUP BY 1", true
+		// derived column name. Column is the "time" convention (F1). An optional
+		// WHERE carries a re-serialized time-range filter (PR-A); the engine
+		// re-lexes it, validates the RFC3339-UTC literal, and classifies path-first.
+		var b strings.Builder
+		b.WriteString("SELECT date_trunc('")
+		b.WriteString(escapeStringLiteral(d.Unit))
+		b.WriteString("', time), count(*) FROM read_parquet(")
+		b.WriteString(arr.String())
+		b.WriteByte(')')
+		if d.WhereText != "" {
+			b.WriteString(" WHERE ")
+			b.WriteString(d.WhereText)
+		}
+		b.WriteString(" GROUP BY 1")
+		return b.String(), true
 	case ShapeMinCol, ShapeMaxCol, ShapeCountCol:
 		// The engine's parser expects the column as a BARE identifier. d.Col came
 		// from the tokenizer as an identifier ([A-Za-z_][A-Za-z0-9_.]*), so it's

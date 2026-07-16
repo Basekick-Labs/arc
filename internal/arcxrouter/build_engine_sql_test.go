@@ -119,3 +119,32 @@ func TestBuildEngineSQL_EmptyMeasurementDeclines(t *testing.T) {
 		t.Fatal("expected decline for measurement with no parquet files")
 	}
 }
+
+// TestBuildEngineSQL_Agg_Filtered asserts the PR-A time-range WHERE is emitted
+// between read_parquet(...) and GROUP BY 1, with the whereText verbatim.
+func TestBuildEngineSQL_Agg_Filtered(t *testing.T) {
+	base := t.TempDir()
+	touchParquet(t, base, "prod/cpu/2026/02/03/04/a.parquet") // hourly
+	deps := newLocalDeps(t, base)
+	where := "time >= '2026-02-03T00:00:00Z' AND time < '2026-02-04T00:00:00Z'"
+	d := Decision{
+		Eligible:  true,
+		Shape:     ShapeDateTruncCent,
+		Unit:      "hour",
+		WhereText: where,
+		Ctx:       arcxengine.Context{Database: "prod", Measurement: "cpu", TimeColumn: "time"},
+	}
+	sql, ok := deps.buildEngineSQL(context.Background(), d)
+	if !ok {
+		t.Fatal("expected ok, got decline")
+	}
+	if !strings.HasPrefix(sql, "SELECT date_trunc('hour', time), count(*) FROM read_parquet([") {
+		t.Fatalf("unexpected prefix: %s", sql)
+	}
+	if !strings.Contains(sql, ") WHERE "+where+" GROUP BY 1") {
+		t.Fatalf("WHERE not emitted between read_parquet and GROUP BY 1: %s", sql)
+	}
+	if !strings.HasSuffix(sql, " GROUP BY 1") {
+		t.Fatalf("unexpected suffix: %s", sql)
+	}
+}

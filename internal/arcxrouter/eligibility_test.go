@@ -163,3 +163,60 @@ func TestEligibleShape_Declines(t *testing.T) {
 		})
 	}
 }
+
+// TestEligibleShape_FilteredDateTrunc covers PR-A: a time-range WHERE on the
+// date_trunc agg. The WHERE is re-serialized into whereText (the engine re-lexes it
+// and is the RFC3339-UTC authority); only `time <range-op> '<str>'` AND-conjoined is
+// accepted, everything else declines to DuckDB.
+func TestEligibleShape_FilteredDateTrunc(t *testing.T) {
+	eligible := []struct {
+		name, sql, wantWhere string
+	}{
+		{"time range (the Grafana shape)",
+			"SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time >= '2024-01-01T00:00:00Z' AND time < '2024-01-02T00:00:00Z' GROUP BY 1 ORDER BY 1",
+			"time >= '2024-01-01T00:00:00Z' AND time < '2024-01-02T00:00:00Z'"},
+		{"half-bounded lower",
+			"SELECT date_trunc('day', time), count(*) FROM cpu WHERE time >= '2024-01-01T00:00:00Z' GROUP BY 1",
+			"time >= '2024-01-01T00:00:00Z'"},
+		{"half-bounded upper",
+			"SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time < '2024-01-02T00:00:00Z' GROUP BY 1",
+			"time < '2024-01-02T00:00:00Z'"},
+		{"strict ops preserved",
+			"SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time > '2024-01-01T00:00:00Z' AND time <= '2024-01-02T00:00:00Z' GROUP BY 1",
+			"time > '2024-01-01T00:00:00Z' AND time <= '2024-01-02T00:00:00Z'"},
+		{"unfiltered still eligible (empty whereText)",
+			"SELECT date_trunc('hour', time), count(*) FROM cpu GROUP BY 1", ""},
+	}
+	for _, tc := range eligible {
+		t.Run(tc.name, func(t *testing.T) {
+			m, ok := eligibleShape(tc.sql)
+			if !ok {
+				t.Fatalf("expected eligible, got decline for %q", tc.sql)
+			}
+			if m.shape != ShapeDateTruncCent {
+				t.Fatalf("shape=%q want %q", m.shape, ShapeDateTruncCent)
+			}
+			if m.whereText != tc.wantWhere {
+				t.Fatalf("whereText=%q want %q", m.whereText, tc.wantWhere)
+			}
+		})
+	}
+
+	declines := []struct{ name, sql string }{
+		{"= on time (not a range)", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time = '2024-01-01T00:00:00Z' GROUP BY 1"},
+		{"!= on time", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time != '2024-01-01T00:00:00Z' GROUP BY 1"},
+		{"OR", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time >= '2024-01-01T00:00:00Z' OR time < '2024-01-02T00:00:00Z' GROUP BY 1"},
+		{"non-time column", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE host = 'web1' GROUP BY 1"},
+		{"BETWEEN", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time BETWEEN '2024-01-01T00:00:00Z' AND '2024-01-02T00:00:00Z' GROUP BY 1"},
+		{"numeric RHS", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time >= 5 GROUP BY 1"},
+		{"IS NULL", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time IS NULL GROUP BY 1"},
+		{"in-query default_null_order", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time >= '2024-01-01T00:00:00Z' GROUP BY 1 /* default_null_order */"},
+	}
+	for _, tc := range declines {
+		t.Run("decline/"+tc.name, func(t *testing.T) {
+			if _, ok := eligibleShape(tc.sql); ok {
+				t.Fatalf("expected decline, got eligible for %q", tc.sql)
+			}
+		})
+	}
+}
