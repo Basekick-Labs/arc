@@ -723,16 +723,19 @@ afterWhere:
 	return cols, preds, whereText, orderBy, limit, meas, true
 }
 
-// whereHasOrOrParen peeks (without advancing) whether the WHERE clause ahead contains
-// an `or` keyword or a `(` — i.e. it's a boolean TREE the flat []scanPred can't hold, so
-// it must go through reserializeWhere. Scans from the cursor to the first ORDER/LIMIT/end.
+// whereHasOrOrParen peeks (without advancing) whether the WHERE clause ahead must go
+// through the boolean-TREE re-serializer rather than the flat []scanPred path: an `or`
+// keyword or a `(` (a tree the flat list can't hold), OR a `like` token. LIKE is handled
+// ONLY in the tree re-serializer (reserializeAtom → writeLikePattern), so any LIKE-bearing
+// WHERE — even a single `col LIKE 'x'` with no OR/paren — is routed there; the flat path
+// never sees LIKE. Scans from the cursor to the first ORDER/LIMIT/end.
 func whereHasOrOrParen(c *cursor) bool {
 	for i := c.i; i < len(c.toks); i++ {
 		t := c.toks[i]
 		if t.kind == tokIdent && (t.lower == "order" || t.lower == "limit") {
 			break
 		}
-		if t.kind == tokIdent && t.lower == "or" {
+		if t.kind == tokIdent && (t.lower == "or" || t.lower == "like") {
 			return true
 		}
 		if t.kind == tokPunct && (t.punct == '(' || t.punct == ')') {
@@ -747,8 +750,8 @@ func whereHasOrOrParen(c *cursor) bool {
 // NOT a source-substring slice (tokens carry no offsets): every token is re-emitted —
 // bare-column idents via isBareIdent, comparison ops via isCmpOp, string literals
 // RE-ESCAPED via escapeStringLiteral, numbers/floats re-validated, and only the structural
-// tokens `(` `)` AND OR BETWEEN IS [NOT] NULL. Anything else (NOT-prefix, IN, LIKE, a
-// function-call `ident(`, arithmetic) → decline, so the router never routes a shape the
+// tokens `(` `)` AND OR BETWEEN IS [NOT] NULL IN [NOT] LIKE. Anything else (a bare NOT-prefix,
+// a function-call `ident(`, arithmetic) → decline, so the router never routes a shape the
 // engine declines (a served-then-declined shadow mismatch). The engine re-lexes this text
 // and is the sole tree authority; the round-trip fidelity is covered by a test.
 //
@@ -883,16 +886,26 @@ func reserializeAtom(c *cursor, b *strings.Builder, atoms *int) bool {
 		// list; the atom counter bumps per element (a huge IN declines like a wide OR).
 		c.next() // consume `in`
 		return reserializeInList(c, b, false, atoms)
+	case c.peekIdentLower() == "like":
+		// `col LIKE '<pattern>'` (2d). Engine reuses arrow's like kernel, which matches
+		// DuckDB on every backslash-free pattern; a `\`-pattern or an ESCAPE clause declines
+		// (see writeLikePattern). Re-escape the pattern; never slice source text.
+		c.next() // consume `like`
+		return writeLikePattern(c, b, false)
 	case c.peekIdentLower() == "not":
-		// The ONLY valid `<col> not …` here is `NOT IN` — consume `not`; if the next isn't
-		// `in`, decline (matches the engine's disambiguation; `IS NOT NULL` puts `not`
-		// after `is`, `NOT BETWEEN` isn't reachable).
+		// `<col> not …` is valid here for `NOT IN` or `NOT LIKE`. Consume `not`; if the next
+		// is neither, decline (matches the engine; `IS NOT NULL` puts `not` after `is`,
+		// `NOT BETWEEN` isn't reachable).
 		c.next() // consume `not`
-		if c.peekIdentLower() != "in" {
-			return false
+		if c.peekIdentLower() == "in" {
+			c.next() // consume `in`
+			return reserializeInList(c, b, true, atoms)
 		}
-		c.next() // consume `in`
-		return reserializeInList(c, b, true, atoms)
+		if c.peekIdentLower() == "like" {
+			c.next() // consume `like`
+			return writeLikePattern(c, b, true)
+		}
+		return false
 	default:
 		opStr, ok := c.op()
 		if !ok || !isCmpOp(opStr) {
@@ -907,6 +920,33 @@ func reserializeAtom(c *cursor, b *strings.Builder, atoms *int) bool {
 		b.WriteByte(' ')
 		return writeLiteralTok(b, litT)
 	}
+}
+
+// writeLikePattern re-emits `[NOT] LIKE '<pattern>'` (2d), mirroring the ENGINE's decline
+// boundary exactly (arcx/src/parse.rs parse_like_pattern): the pattern must be a bare string
+// literal, must NOT contain a backslash (arrow's kernel escapes `\`, DuckDB treats it literal
+// — the one divergence), and must NOT be followed by an ESCAPE clause (arrow's kernel has no
+// ESCAPE param). The pattern is re-escaped via escapeStringLiteral (doubled `''`), never
+// sliced from source. The `col` and the caller-consumed `[NOT] LIKE` keyword precede this.
+func writeLikePattern(c *cursor, b *strings.Builder, negated bool) bool {
+	patT, ok := c.next()
+	if !ok || patT.kind != tokStr {
+		return false // non-literal pattern (ident/number/NULL) declines
+	}
+	if strings.Contains(patT.str, "\\") {
+		return false // backslash pattern → engine declines; mirror it here
+	}
+	if c.peekIdentLower() == "escape" {
+		return false // ESCAPE clause unsupported
+	}
+	if negated {
+		b.WriteString(" NOT LIKE '")
+	} else {
+		b.WriteString(" LIKE '")
+	}
+	b.WriteString(escapeStringLiteral(patT.str))
+	b.WriteByte('\'')
+	return true
 }
 
 // reserializeInList re-emits `IN ( lit, … )` / `NOT IN ( … )` (2b-3). The engine desugars

@@ -92,6 +92,16 @@ func TestMatchScan_BooleanTreeWhere(t *testing.T) {
 		{"is null in or", "SELECT a FROM cpu WHERE a IS NULL OR b = 2", "a IS NULL OR b = 2"},
 		{"between in or", "SELECT a FROM cpu WHERE x BETWEEN 1 AND 5 OR y = 9", "x BETWEEN 1 AND 5 OR y = 9"},
 		{"wide or", "SELECT a FROM cpu WHERE h = 'a' OR h = 'b' OR h = 'c'", "h = 'a' OR h = 'b' OR h = 'c'"},
+		// LIKE (2d): a LIKE token forces the tree path even without OR/paren. The pattern is
+		// re-escaped (doubled `''`) and multibyte survives — the re-serialization round-trip
+		// fidelity that matters (a mangled served pattern would be an engine-invisible wrong
+		// answer). Backslash / ESCAPE / non-literal LIKE decline (TestMatchScan_*Declines).
+		{"bare like", "SELECT a FROM cpu WHERE host LIKE 'web%'", "host LIKE 'web%'"},
+		{"not like", "SELECT a FROM cpu WHERE host NOT LIKE 'web%'", "host NOT LIKE 'web%'"},
+		{"like in and", "SELECT a FROM cpu WHERE host LIKE 'web%' AND code = 5", "host LIKE 'web%' AND code = 5"},
+		{"like in or", "SELECT a FROM cpu WHERE host LIKE 'a%' OR host LIKE 'b%'", "host LIKE 'a%' OR host LIKE 'b%'"},
+		{"like reescaped quote", "SELECT a FROM cpu WHERE host LIKE 'a''b%'", "host LIKE 'a''b%'"},
+		{"like multibyte", "SELECT a FROM cpu WHERE host LIKE 'café%'", "host LIKE 'café%'"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -113,9 +123,11 @@ func TestMatchScan_BooleanTreeDeclines(t *testing.T) {
 	// The re-serializer is a strict allowlist: anything outside the boolean-atom
 	// vocabulary declines AT THE ROUTER (never route-then-engine-decline / shadow mismatch).
 	decline := []string{
-		"SELECT a FROM cpu WHERE a = 1 OR NOT b = 2",      // NOT prefix
-		"SELECT a FROM cpu WHERE a = 1 OR b LIKE 'x'",     // LIKE
-		"SELECT a FROM cpu WHERE a = 1 OR lower(b) = 'x'", // function call
+		"SELECT a FROM cpu WHERE a = 1 OR NOT b = 2",         // NOT prefix
+		"SELECT a FROM cpu WHERE a = 1 OR b LIKE 'x\\%'",     // LIKE w/ backslash (2d decline)
+		"SELECT a FROM cpu WHERE a = 1 OR b LIKE 'x' ESCAPE '!'", // LIKE ESCAPE (2d decline)
+		"SELECT a FROM cpu WHERE a = 1 OR b LIKE c",          // LIKE non-literal pattern
+		"SELECT a FROM cpu WHERE a = 1 OR lower(b) = 'x'",    // function call
 		"SELECT a FROM cpu WHERE a = 1 OR b = 1 + 1",      // arithmetic RHS
 		"SELECT a FROM cpu WHERE (a = 1 OR b = 2",         // unbalanced (
 		"SELECT a FROM cpu WHERE a = 1 OR b = 2)",         // stray )
@@ -332,7 +344,7 @@ func TestMatchScan_Declines(t *testing.T) {
 	decline := []string{
 		"SELECT * FROM cpu",                          // star not routed (drift-unprovable)
 		"SELECT *, host FROM cpu",                    // star mixed
-		"SELECT host FROM cpu WHERE a LIKE 'x'",      // LIKE (2b)
+		"SELECT host FROM cpu WHERE a LIKE 'x\\%'",   // LIKE backslash pattern (2d decline)
 		"SELECT host FROM cpu WHERE NOT a = 1",       // NOT (2b-2b)
 		"SELECT host FROM cpu WHERE (a = 1",          // unbalanced paren
 		"SELECT host FROM cpu WHERE a = 1 OR",        // trailing OR
