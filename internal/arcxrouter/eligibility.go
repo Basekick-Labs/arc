@@ -65,13 +65,34 @@ type scanOrderKey struct {
 // registry, so the agg shape's bucket column must be exactly this or we decline.
 const timeColumn = "time"
 
-// supportedUnits is the date_trunc units the engine buckets from the partition
-// path. Matches Unit::from_str in arcx/src/partition.rs.
+// supportedUnits is the date_trunc units the engine buckets. Matches
+// Unit::from_str in arcx/src/partition.rs. year/month/day/hour derive the bucket
+// from the partition PATH; minute/second are sub-hour (the path granularity is at
+// most the hour) so the engine decodes and buckets per-row — and requires a
+// time-range WHERE (see isSubHour / the decline in matchDateTruncCount).
 var supportedUnits = map[string]bool{
-	"year":  true,
-	"month": true,
-	"day":   true,
-	"hour":  true,
+	"year":   true,
+	"month":  true,
+	"day":    true,
+	"hour":   true,
+	"minute": true,
+	"second": true,
+}
+
+// isSubHour reports whether a date_trunc unit buckets below the partition path's
+// finest granularity (the hour). Sub-hour units require a time-range WHERE: the
+// engine's per-row decode counts only non-null in-range rows, so an UNFILTERED
+// sub-hour query would miss DuckDB's date_trunc(NULL)=NULL bucket (silent wrong
+// answer). A WHERE drops NULL-time rows by 3-valued logic, closing that gap. The
+// engine enforces this too (defense in depth); declining here keeps a wrong shape
+// off the arcx path entirely.
+func isSubHour(unit string) bool {
+	switch strings.ToLower(unit) {
+	case "minute", "second":
+		return true
+	default:
+		return false
+	}
 }
 
 // tzInjectionTokens are lowercased substrings whose presence forces a decline:

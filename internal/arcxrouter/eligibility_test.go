@@ -130,7 +130,11 @@ func TestEligibleShape_Declines(t *testing.T) {
 		{"agg wrong column", "SELECT date_trunc('day', ts), count(*) FROM cpu GROUP BY 1"},
 		{"agg column expr", "SELECT date_trunc('day', time + 1), count(*) FROM cpu GROUP BY 1"},
 		{"agg unsupported unit", "SELECT date_trunc('week', time), count(*) FROM cpu GROUP BY 1"},
-		{"agg unsupported minute", "SELECT date_trunc('minute', time), count(*) FROM cpu GROUP BY 1"},
+		// minute/second ARE supported, but ONLY with a time-range WHERE — unfiltered
+		// sub-hour declines (would miss DuckDB's NULL bucket). Covered in detail by
+		// TestEligibleShape_FilteredDateTrunc.
+		{"agg minute no where declines", "SELECT date_trunc('minute', time), count(*) FROM cpu GROUP BY 1"},
+		{"agg second no where declines", "SELECT date_trunc('second', time), count(*) FROM cpu GROUP BY 1"},
 		{"agg group by expr", "SELECT date_trunc('day', time), count(*) FROM cpu GROUP BY date_trunc('day', time)"},
 		{"agg group by 2", "SELECT date_trunc('day', time), count(*) FROM cpu GROUP BY 2"},
 		{"agg no group by", "SELECT date_trunc('day', time), count(*) FROM cpu"},
@@ -184,8 +188,14 @@ func TestEligibleShape_FilteredDateTrunc(t *testing.T) {
 		{"strict ops preserved",
 			"SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time > '2024-01-01T00:00:00Z' AND time <= '2024-01-02T00:00:00Z' GROUP BY 1",
 			"time > '2024-01-01T00:00:00Z' AND time <= '2024-01-02T00:00:00Z'"},
-		{"unfiltered still eligible (empty whereText)",
+		{"unfiltered hour still eligible (empty whereText)",
 			"SELECT date_trunc('hour', time), count(*) FROM cpu GROUP BY 1", ""},
+		{"minute WITH a time range (the sub-hour Grafana shape)",
+			"SELECT date_trunc('minute', time), count(*) FROM cpu WHERE time >= '2024-01-01T03:00:00Z' AND time < '2024-01-01T04:00:00Z' GROUP BY 1 ORDER BY 1",
+			"time >= '2024-01-01T03:00:00Z' AND time < '2024-01-01T04:00:00Z'"},
+		{"second WITH a half-bounded range",
+			"SELECT date_trunc('second', time), count(*) FROM cpu WHERE time >= '2024-01-01T03:00:00Z' GROUP BY 1",
+			"time >= '2024-01-01T03:00:00Z'"},
 	}
 	for _, tc := range eligible {
 		t.Run(tc.name, func(t *testing.T) {
@@ -211,6 +221,13 @@ func TestEligibleShape_FilteredDateTrunc(t *testing.T) {
 		{"numeric RHS", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time >= 5 GROUP BY 1"},
 		{"IS NULL", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time IS NULL GROUP BY 1"},
 		{"in-query default_null_order", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time >= '2024-01-01T00:00:00Z' GROUP BY 1 /* default_null_order */"},
+		// Sub-hour units REQUIRE a time range: unfiltered would miss DuckDB's NULL
+		// bucket (the engine's per-row decode counts only non-null in-range rows).
+		{"minute no where", "SELECT date_trunc('minute', time), count(*) FROM cpu GROUP BY 1"},
+		{"second no where", "SELECT date_trunc('second', time), count(*) FROM cpu GROUP BY 1"},
+		// A sub-hour WHERE that isn't a pure time range still declines (same as hour).
+		{"minute IS NULL OR range (grammar guardrail)", "SELECT date_trunc('minute', time), count(*) FROM cpu WHERE time IS NULL OR time >= '2024-01-01T00:00:00Z' GROUP BY 1"},
+		{"minute non-time predicate", "SELECT date_trunc('minute', time), count(*) FROM cpu WHERE host = 'web1' GROUP BY 1"},
 	}
 	for _, tc := range declines {
 		t.Run("decline/"+tc.name, func(t *testing.T) {

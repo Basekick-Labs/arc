@@ -397,6 +397,15 @@ func matchDateTruncCount(toks []token) (unit, meas, whereText string, ok bool) {
 	if !c.atEnd() {
 		return "", "", "", false
 	}
+	// Sub-hour units (minute/second) require a time-range WHERE. The WHERE above is
+	// optional, so a no-WHERE sub-hour query reaches here with whereText=="". The
+	// engine's per-row decode counts only non-null in-range rows, so an unfiltered
+	// sub-hour query would miss DuckDB's date_trunc(NULL)=NULL bucket — decline it
+	// here (and the engine declines it too). Above-hour units answer unfiltered from
+	// footers (NULL bucket included), so they are unaffected.
+	if isSubHour(unit) && whereText == "" {
+		return "", "", "", false
+	}
 	return unit, meas, whereText, true
 }
 
