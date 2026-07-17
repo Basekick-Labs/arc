@@ -133,6 +133,20 @@ func TestMatchScan_BooleanTreeWhere(t *testing.T) {
 		{"div by zero", "SELECT a FROM cpu WHERE value / 0.0 > 2.5", "value / 0.0 > 2.5"},
 		{"div neg zero divisor", "SELECT a FROM cpu WHERE value / -0.0 > 0.0", "value / -0.0 > 0.0"},
 		{"div in and", "SELECT a FROM cpu WHERE value / 2.0 > 2.0 AND host = 'x'", "value / 2.0 > 2.0 AND host = 'x'"},
+		// 2e-multiterm: full-precedence arith expr — re-emitted VERBATIM (parens preserved).
+		{"mt sum", "SELECT a FROM cpu WHERE value * 2 + cpu_idle * 3 > 100", "value * 2 + cpu_idle * 3 > 100"},
+		{"mt precedence", "SELECT a FROM cpu WHERE value + cpu_idle * 2 > 7.5", "value + cpu_idle * 2 > 7.5"},
+		{"mt parens", "SELECT a FROM cpu WHERE (value + cpu_idle) * 2 > 5.0", "(value + cpu_idle) * 2 > 5.0"},
+		{"mt nested parens", "SELECT a FROM cpu WHERE (value + (cpu_idle - value)) / 2 > 2.0", "(value + (cpu_idle - value)) / 2 > 2.0"},
+		{"mt unary", "SELECT a FROM cpu WHERE -(value + cpu_idle) < 0.0", "-(value + cpu_idle) < 0.0"},
+		{"mt left assoc", "SELECT a FROM cpu WHERE value + 2 + 3 > 6.0", "value + 2 + 3 > 6.0"},
+		{"mt in and", "SELECT a FROM cpu WHERE value / 2.0 > 2.0 AND host = 'x'", "value / 2.0 > 2.0 AND host = 'x'"},
+		{"mt in or", "SELECT a FROM cpu WHERE value * 2 + cpu_idle > 5.0 OR host = 'x'", "value * 2 + cpu_idle > 5.0 OR host = 'x'"},
+		// Multi-column arith is OPTIMISTICALLY routed — the router can't type-check columns from
+		// SQL text. A non-DOUBLE operand (`host`) is caught by the ENGINE's Float64 gate → a clean
+		// ErrUnsupported → silent DuckDB fallback (router.go: "eligibility over-claimed", NOT an
+		// alarm). So `value * host` routes here; the engine declines it downstream.
+		{"mt col operand (engine type-gates)", "SELECT a FROM cpu WHERE value * host > 5.0", "value * host > 5.0"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -154,26 +168,29 @@ func TestMatchScan_BooleanTreeDeclines(t *testing.T) {
 	// The re-serializer is a strict allowlist: anything outside the boolean-atom
 	// vocabulary declines AT THE ROUTER (never route-then-engine-decline / shadow mismatch).
 	decline := []string{
-		"SELECT a FROM cpu WHERE a = 1 OR NOT b = 2",         // NOT prefix
-		"SELECT a FROM cpu WHERE a = 1 OR b LIKE 'x\\%'",     // LIKE w/ backslash (2d decline)
+		"SELECT a FROM cpu WHERE a = 1 OR NOT b = 2",             // NOT prefix
+		"SELECT a FROM cpu WHERE a = 1 OR b LIKE 'x\\%'",         // LIKE w/ backslash (2d decline)
 		"SELECT a FROM cpu WHERE a = 1 OR b LIKE 'x' ESCAPE '!'", // LIKE ESCAPE (2d decline)
-		"SELECT a FROM cpu WHERE a = 1 OR b LIKE c",          // LIKE non-literal pattern
-		"SELECT a FROM cpu WHERE a = 1 OR lower(b) = 'x'",    // function call
-		"SELECT a FROM cpu WHERE a = 1 OR b = 1 + 1",      // arith on the RHS (not col-arith)
+		"SELECT a FROM cpu WHERE a = 1 OR b LIKE c",              // LIKE non-literal pattern
+		"SELECT a FROM cpu WHERE a = 1 OR lower(b) = 'x'",        // function call
+		"SELECT a FROM cpu WHERE a = 1 OR b = 1 + 1",             // arith on the RHS (not col-arith)
 		// 2e arith declines (mirror the engine):
-		"SELECT a FROM cpu WHERE value // 2.0 > 3.0",      // floor-div (2nd `/` fails isNumericTok)
-		"SELECT a FROM cpu WHERE value / 2.0 / 3.0 > 1.0", // second div op
-		"SELECT a FROM cpu WHERE value / 2 * 3 > 5.0",     // div then mul (second arith op)
-		"SELECT a FROM cpu WHERE value--5.0 > 0.0",        // `--` line comment (CRITICAL)
-		"SELECT a FROM cpu WHERE value * 2.0 + 1.0 > 5.0", // multi-term
-		"SELECT a FROM cpu WHERE value * host > 5.0",      // column in arith
-		"SELECT a FROM cpu WHERE value * 2.0 > host",      // column cmp RHS
-		"SELECT a FROM cpu WHERE 2.0 * value > 10.0",      // literal-left orientation
-		"SELECT a FROM cpu WHERE (a = 1 OR b = 2",         // unbalanced (
-		"SELECT a FROM cpu WHERE a = 1 OR b = 2)",         // stray )
-		"SELECT a FROM cpu WHERE ()",                      // empty parens
-		"SELECT a FROM cpu WHERE a = 1 OR",                // trailing OR
-		"SELECT a FROM cpu WHERE OR a = 1",                // leading OR
+		"SELECT a FROM cpu WHERE value // 2.0 > 3.0", // floor-div (2nd `/` fails a primary)
+		"SELECT a FROM cpu WHERE value--5.0 > 0.0",   // `--` line comment (CRITICAL)
+		"SELECT a FROM cpu WHERE value * 2.0 > host", // column cmp RHS (RHS not a literal)
+		"SELECT a FROM cpu WHERE 2.0 * value > 10.0", // lit-left SINGLE-op (engine ArithCompare declines)
+		// 2e-multiterm constant-subexpr declines (DuckDB folds INT/DECIMAL — engine declines):
+		"SELECT a FROM cpu WHERE value + 2 * 3 > 10.0",                  // const-only subexpr (2*3)
+		"SELECT a FROM cpu WHERE value * (2 + 3) > 10.0",                // const-only paren subexpr
+		"SELECT a FROM cpu WHERE value + 4000000000 * 4000000000 > 1.0", // i64-overflow const
+		"SELECT a FROM cpu WHERE 2 + 3 > 1.0",                           // column-free arith
+		"SELECT a FROM cpu WHERE value + 1 > cpu_idle",                  // RHS is a column
+		"SELECT a FROM cpu WHERE value + 1 > cpu_idle + 1",              // RHS is an expr
+		"SELECT a FROM cpu WHERE (a = 1 OR b = 2",                       // unbalanced (
+		"SELECT a FROM cpu WHERE a = 1 OR b = 2)",                       // stray )
+		"SELECT a FROM cpu WHERE ()",                                    // empty parens
+		"SELECT a FROM cpu WHERE a = 1 OR",                              // trailing OR
+		"SELECT a FROM cpu WHERE OR a = 1",                              // leading OR
 	}
 	for _, sql := range decline {
 		if m, ok := eligibleShape(sql); ok && m.shape == ShapeScan {
@@ -382,41 +399,41 @@ func TestMatchScan_Declines(t *testing.T) {
 	// Each must NOT be recognized as a scan (either declines entirely or matches a
 	// different, more-specific shape). The engine's 2a scan doesn't answer these.
 	decline := []string{
-		"SELECT * FROM cpu",                          // star not routed (drift-unprovable)
-		"SELECT *, host FROM cpu",                    // star mixed
-		"SELECT host FROM cpu WHERE a LIKE 'x\\%'",   // LIKE backslash pattern (2d decline)
-		"SELECT host FROM cpu WHERE NOT a = 1",       // NOT (2b-2b)
-		"SELECT host FROM cpu WHERE (a = 1",          // unbalanced paren
-		"SELECT host FROM cpu WHERE a = 1 OR",        // trailing OR
-		"SELECT lower(host) FROM cpu",                // non-length function (later sub-phase)
-		"SELECT upper(host) FROM cpu",                // non-length function
-		"SELECT length(host, 2) FROM cpu",            // length wrong arity
-		"SELECT length() FROM cpu",                   // length no args
-		"SELECT length('lit') FROM cpu",              // length literal arg (2f-1)
-		"SELECT length(upper(host)) FROM cpu",        // length nested function
-		"SELECT length(*) FROM cpu",                  // length on star
-		"SELECT substr(host) FROM cpu",               // substr missing start arg
-		"SELECT substr(host, 1, 2, 3) FROM cpu",      // substr arity 4
-		"SELECT substr(host, 'x', 2) FROM cpu",       // substr non-int start
-		"SELECT substr(host, +1, 3) FROM cpu",        // substr unary-plus (not tokNum)
-		"SELECT substr(host, 1, code) FROM cpu",      // substr column len
-		"SELECT substr(upper(host), 1, 2) FROM cpu",  // substr nested function
-		"SELECT upper(host) FROM cpu",                // non-PROJ_FUNCS (ICU) — decline
-		"SELECT starts_with(host, 1) FROM cpu",       // non-string needle
-		"SELECT starts_with(host, code) FROM cpu",    // column needle
-		"SELECT starts_with(host) FROM cpu",          // wrong arity
-		"SELECT starts_with(host, 'a', 'b') FROM cpu", // wrong arity
-		"SELECT contains(host, [1,2,3]) FROM cpu",    // LIST contains overload
+		"SELECT * FROM cpu",                             // star not routed (drift-unprovable)
+		"SELECT *, host FROM cpu",                       // star mixed
+		"SELECT host FROM cpu WHERE a LIKE 'x\\%'",      // LIKE backslash pattern (2d decline)
+		"SELECT host FROM cpu WHERE NOT a = 1",          // NOT (2b-2b)
+		"SELECT host FROM cpu WHERE (a = 1",             // unbalanced paren
+		"SELECT host FROM cpu WHERE a = 1 OR",           // trailing OR
+		"SELECT lower(host) FROM cpu",                   // non-length function (later sub-phase)
+		"SELECT upper(host) FROM cpu",                   // non-length function
+		"SELECT length(host, 2) FROM cpu",               // length wrong arity
+		"SELECT length() FROM cpu",                      // length no args
+		"SELECT length('lit') FROM cpu",                 // length literal arg (2f-1)
+		"SELECT length(upper(host)) FROM cpu",           // length nested function
+		"SELECT length(*) FROM cpu",                     // length on star
+		"SELECT substr(host) FROM cpu",                  // substr missing start arg
+		"SELECT substr(host, 1, 2, 3) FROM cpu",         // substr arity 4
+		"SELECT substr(host, 'x', 2) FROM cpu",          // substr non-int start
+		"SELECT substr(host, +1, 3) FROM cpu",           // substr unary-plus (not tokNum)
+		"SELECT substr(host, 1, code) FROM cpu",         // substr column len
+		"SELECT substr(upper(host), 1, 2) FROM cpu",     // substr nested function
+		"SELECT upper(host) FROM cpu",                   // non-PROJ_FUNCS (ICU) — decline
+		"SELECT starts_with(host, 1) FROM cpu",          // non-string needle
+		"SELECT starts_with(host, code) FROM cpu",       // column needle
+		"SELECT starts_with(host) FROM cpu",             // wrong arity
+		"SELECT starts_with(host, 'a', 'b') FROM cpu",   // wrong arity
+		"SELECT contains(host, [1,2,3]) FROM cpu",       // LIST contains overload
 		"SELECT starts_with(upper(host), 'a') FROM cpu", // nested function
-		"SELECT host FROM cpu LIMIT 10",              // LIMIT without ORDER BY (nondeterministic)
-		"SELECT host FROM cpu ORDER BY host LIMIT 0", // LIMIT 0 routed to DuckDB
-		"SELECT host FROM cpu ORDER BY 1",            // positional ORDER BY (agg shape, not scan)
-		"SELECT host AS h FROM cpu",                  // alias
-		"SELECT host FROM cpu GROUP BY host",         // GROUP BY (Phase 3)
-		"SELECT host FROM cpu WHERE code >",          // predicate missing literal
-		"SELECT host FROM cpu WHERE code > 1 EXTRA",  // trailing junk
-		"SELECT FROM cpu",                            // empty projection
-		"SELECT from FROM cpu",                       // keyword-as-column
+		"SELECT host FROM cpu LIMIT 10",                 // LIMIT without ORDER BY (nondeterministic)
+		"SELECT host FROM cpu ORDER BY host LIMIT 0",    // LIMIT 0 routed to DuckDB
+		"SELECT host FROM cpu ORDER BY 1",               // positional ORDER BY (agg shape, not scan)
+		"SELECT host AS h FROM cpu",                     // alias
+		"SELECT host FROM cpu GROUP BY host",            // GROUP BY (Phase 3)
+		"SELECT host FROM cpu WHERE code >",             // predicate missing literal
+		"SELECT host FROM cpu WHERE code > 1 EXTRA",     // trailing junk
+		"SELECT FROM cpu",                               // empty projection
+		"SELECT from FROM cpu",                          // keyword-as-column
 	}
 	for _, sql := range decline {
 		t.Run(sql, func(t *testing.T) {

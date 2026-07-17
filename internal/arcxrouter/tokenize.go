@@ -930,7 +930,212 @@ func reserializeAnd(c *cursor, b *strings.Builder, depth, atoms *int) bool {
 	return true
 }
 
+// maxArithNodes mirrors the engine's MAX_ARITH_NODES: cap the arith tree size so a wide/deep
+// expr declines at the router too (matching the engine's decline, no served-then-declined shadow).
+const maxArithNodes = 64
+
+// arithParse carries the running state of an arith-expr re-serialization: the output builder,
+// whether any column leaf was seen (a column-free LHS declines — DuckDB folds it in INT/DECIMAL),
+// whether the CURRENT node's subtree is constant-only (for the constant-subexpr decline), whether
+// any binary op was seen (a bare column/single-op defers to the existing dispatch), and the node
+// count (cap). Mirrors the engine's ArithNode analysis (is_constant / has_constant_binop).
+type arithParse struct {
+	b        strings.Builder
+	hasCol   bool
+	hasOp    bool
+	sawConst bool // a constant-only sub-expression was found → decline
+	nodes    int
+	// opCount / colCount / litCount over the whole expr, used to DEFER the single-op
+	// single-column shape (`col op lit`) to the engine's proven ArithCompare path — the
+	// engine's try_parse_arith_expr_atom does the same via is_single_op_single_col, so the
+	// router must too or it routes a shape the engine declines (lit-left `2.0 * value`).
+	opCount  int
+	colCount int
+	litCount int
+}
+
+// tryReserializeArithExpr attempts `<arith-expr> <cmp> <lit>` from c, re-emitting verbatim.
+// Returns true (and commits) only for a COMPOUND, column-bearing, constant-fold-free expr
+// followed by a comparison to a numeric literal — else restores the cursor and returns false
+// (defer). Mirrors the engine so the router never routes a shape the engine declines.
+func tryReserializeArithExpr(c *cursor, b *strings.Builder, atoms *int) bool {
+	start := c.i
+	ap := &arithParse{}
+	constOnly, ok := arithAddSub(c, ap)
+	if !ok || ap.sawConst || !ap.hasCol || !ap.hasOp || constOnly {
+		c.i = start
+		return false
+	}
+	// Defer the single-op single-column shape (`col op lit` — exactly 1 op, 1 col, 1 lit,
+	// no parens/unary) to the engine's proven ArithCompare path. The engine's
+	// is_single_op_single_col does the same; if the router served this, it would route the
+	// lit-left form (`2.0 * value`) that the engine declines — a served-then-declined shadow.
+	// The existing col-left single-op re-serializer (reserializeAtom) handles the served case.
+	if ap.opCount == 1 && ap.colCount == 1 && ap.litCount == 1 && ap.nodes == 3 {
+		c.i = start
+		return false
+	}
+	// Must be `<cmp-op> <numeric-literal>` to be an atom.
+	opStr, ok := c.op()
+	if !ok || !isCmpOp(opStr) {
+		c.i = start
+		return false
+	}
+	cmpLit, ok := c.next()
+	if !ok || !isNumericTok(cmpLit) {
+		c.i = start
+		return false
+	}
+	*atoms++
+	if *atoms > maxWhereAtoms {
+		c.i = start
+		return false
+	}
+	b.WriteString(ap.b.String())
+	b.WriteByte(' ')
+	b.WriteString(opStr)
+	b.WriteByte(' ')
+	return writeLiteralTok(b, cmpLit)
+}
+
+// arithAddSub := arithMulDiv ( (+|-) arithMulDiv )* — lowest precedence. Returns
+// (subtreeIsConstantOnly, ok). Emits verbatim with single spaces around binary ops.
+func arithAddSub(c *cursor, ap *arithParse) (bool, bool) {
+	// `lconst` tracks whether the CURRENT left subtree (folded left-assoc) is constant-only.
+	lconst, ok := arithMulDiv(c, ap)
+	if !ok {
+		return false, false
+	}
+	for c.i < len(c.toks) && c.toks[c.i].kind == tokPunct &&
+		(c.toks[c.i].punct == '+' || c.toks[c.i].punct == '-') {
+		op := c.toks[c.i].punct
+		c.next()
+		if !ap.bumpNodes() {
+			return false, false
+		}
+		ap.hasOp = true
+		ap.opCount++
+		ap.b.WriteByte(' ')
+		ap.b.WriteByte(op)
+		ap.b.WriteByte(' ')
+		rconst, ok := arithMulDiv(c, ap)
+		if !ok {
+			return false, false
+		}
+		// This node = (left OP right). Both operands constant-only → constant-fold decline.
+		if lconst && rconst {
+			ap.sawConst = true
+		}
+		lconst = lconst && rconst // the new left subtree's constant-ness
+	}
+	return lconst, true
+}
+
+// arithMulDiv := arithFactor ( (*|/) arithFactor )* — tighter than +/-. `//` declines: the
+// second `/` fails arithPrimary (not a primary), mirroring the engine.
+func arithMulDiv(c *cursor, ap *arithParse) (bool, bool) {
+	lconst, ok := arithFactor(c, ap)
+	if !ok {
+		return false, false
+	}
+	for c.i < len(c.toks) && c.toks[c.i].kind == tokPunct &&
+		(c.toks[c.i].punct == '*' || c.toks[c.i].punct == '/') {
+		op := c.toks[c.i].punct
+		c.next()
+		if !ap.bumpNodes() {
+			return false, false
+		}
+		ap.hasOp = true
+		ap.opCount++
+		ap.b.WriteByte(' ')
+		ap.b.WriteByte(op)
+		ap.b.WriteByte(' ')
+		rconst, ok := arithFactor(c, ap)
+		if !ok {
+			return false, false
+		}
+		if lconst && rconst {
+			ap.sawConst = true
+		}
+		lconst = lconst && rconst
+	}
+	return lconst, true
+}
+
+// arithFactor := `-` arithFactor | arithPrimary — unary minus. Only reaches as Punct('-')
+// before an ident/`(` (the tokenizer folds `-<digit>` into a signed literal).
+func arithFactor(c *cursor, ap *arithParse) (bool, bool) {
+	if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '-' {
+		c.next()
+		if !ap.bumpNodes() {
+			return false, false
+		}
+		ap.b.WriteByte('-')
+		return arithFactor(c, ap)
+	}
+	return arithPrimary(c, ap)
+}
+
+// arithPrimary := column | number | `(` arithAddSub `)`.
+func arithPrimary(c *cursor, ap *arithParse) (bool, bool) {
+	if !ap.bumpNodes() {
+		return false, false
+	}
+	if c.i >= len(c.toks) {
+		return false, false
+	}
+	t := c.toks[c.i]
+	switch {
+	case t.kind == tokPunct && t.punct == '(':
+		c.next()
+		ap.b.WriteByte('(')
+		constInner, ok := arithAddSub(c, ap)
+		if !ok {
+			return false, false
+		}
+		if c.i >= len(c.toks) || c.toks[c.i].kind != tokPunct || c.toks[c.i].punct != ')' {
+			return false, false
+		}
+		c.next()
+		ap.b.WriteByte(')')
+		return constInner, true
+	case isNumericTok(t):
+		c.next()
+		if !writeLiteralTok(&ap.b, t) {
+			return false, false
+		}
+		ap.litCount++
+		return true, true // a literal leaf is constant
+	case t.kind == tokIdent && !isScanKeyword(t.lower) && isBareIdent(t.orig):
+		// A `(` right after the ident is a function call — no functions in arith.
+		if c.i+1 < len(c.toks) && c.toks[c.i+1].kind == tokPunct && c.toks[c.i+1].punct == '(' {
+			return false, false
+		}
+		c.next()
+		ap.b.WriteString(t.orig)
+		ap.hasCol = true
+		ap.colCount++
+		return false, true // a column leaf is NOT constant
+	default:
+		return false, false
+	}
+}
+
+func (ap *arithParse) bumpNodes() bool {
+	ap.nodes++
+	return ap.nodes <= maxArithNodes
+}
+
 func reserializeUnary(c *cursor, b *strings.Builder, depth, atoms *int) bool {
+	// 2e-multiterm: try a full-precedence arith-expr atom FIRST (`<arith-expr> <cmp> <lit>`),
+	// re-emitting tokens VERBATIM (parens preserved — a dropped paren is a silent wrong answer).
+	// Mirrors the engine's try_parse_arith_expr_atom: on a non-arith atom (boolean `(` group,
+	// IN/LIKE/BETWEEN/IS NULL, plain/single-op compare) it restores the cursor and defers. The
+	// engine re-parses this text and is the sole tree authority; this is the eligibility gate.
+	if tryReserializeArithExpr(c, b, atoms) {
+		return true
+	}
+
 	if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '(' {
 		*depth++
 		if *depth > maxWhereDepth {
@@ -1081,7 +1286,7 @@ func reserializeAtom(c *cursor, b *strings.Builder, atoms *int) bool {
 // boundary exactly (arcx/src/parse.rs parse_like_pattern): the pattern must be a bare string
 // literal, must NOT contain a backslash (arrow's kernel escapes `\`, DuckDB treats it literal
 // — the one divergence), and must NOT be followed by an ESCAPE clause (arrow's kernel has no
-// ESCAPE param). The pattern is re-escaped via escapeStringLiteral (doubled `''`), never
+// ESCAPE param). The pattern is re-escaped via escapeStringLiteral (doubled `”`), never
 // sliced from source. The `col` and the caller-consumed `[NOT] LIKE` keyword precede this.
 func writeLikePattern(c *cursor, b *strings.Builder, negated bool) bool {
 	patT, ok := c.next()
