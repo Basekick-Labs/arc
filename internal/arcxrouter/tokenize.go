@@ -59,7 +59,9 @@ func tokenize(sql string) ([]token, bool) {
 				return nil, false
 			}
 			i = n
-		case c == '(' || c == ')' || c == '*' || c == ',':
+		case c == '(' || c == ')' || c == '*' || c == ',' || c == '+' || c == '/':
+			// `+`/`/` for 2e DOUBLE arith in WHERE (`*` was already here for SELECT *
+			// / count(*) AND doubles as arith-multiply by position, same as the engine).
 			toks = append(toks, token{kind: tokPunct, punct: c})
 			i++
 		case c == '=':
@@ -92,15 +94,25 @@ func tokenize(sql string) ([]token, bool) {
 			} else {
 				return nil, false // bare `!` is not in the vocabulary
 			}
+		case c == '-' && i+1 < n && b[i+1] == '-':
+			// `--` is a SQL LINE COMMENT — arcx has no comment handling and the engine
+			// declines it (must NOT read as subtract-of-negative, a wrong answer). Match
+			// the engine: decline the whole query.
+			return nil, false
 		case c == '-' && i+1 < n && isDigit(b[i+1]):
 			// Negative integer or `digit.digit` float (e.g. a pre-1970 epoch, or a
-			// DOUBLE-eq literal). The sign is part of the token. A bare `-`
-			// (arithmetic) falls to default → decline.
+			// DOUBLE-eq literal). The sign is part of the token → `value -5` stays a
+			// signed literal (declines), NOT a subtract (the engine's mis-parse guard).
 			start := i
 			i++ // consume '-'
 			var tok token
 			tok, i = lexNumber(sql, b, start, i, n)
 			toks = append(toks, tok)
+		case c == '-':
+			// A bare `-` (not `--`, not before a digit) is a 2e BINARY subtract in a WHERE
+			// atom. The re-serializer interprets it by position.
+			toks = append(toks, token{kind: tokPunct, punct: '-'})
+			i++
 		case isAlpha(c) || c == '_':
 			// Identifier: letter/underscore start, then alnum/underscore/dot.
 			// A dot is allowed INSIDE an identifier so `mydb.cpu` is one token —
@@ -842,6 +854,12 @@ func whereHasOrOrParen(c *cursor) bool {
 		if t.kind == tokIdent && (t.lower == "or" || t.lower == "like") {
 			return true
 		}
+		// An arith punct (`+`/`-`/`/`, or `*` between a col and a literal) routes to the
+		// TREE re-serializer, which handles the 2e `col arith num op num` atom. (`*` also
+		// appears in `count(*)`/`SELECT *`, but those aren't in a scan WHERE.)
+		if t.kind == tokPunct && (t.punct == '+' || t.punct == '-' || t.punct == '/' || t.punct == '*') {
+			return true
+		}
 		if t.kind == tokPunct && (t.punct == '(' || t.punct == ')') {
 			return true
 		}
@@ -950,6 +968,37 @@ func reserializeAtom(c *cursor, b *strings.Builder, atoms *int) bool {
 		return false
 	}
 	b.WriteString(colT.orig)
+
+	// 2e: `<col> (+|-|*) <num> <op> <num>` — an arith punct right after the column. Re-emit
+	// verbatim (both engines parse identically); the engine owns the Float64 type-gate + the
+	// signed-zero normalization. `/` is NOT accepted (division declines — the engine does too).
+	if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct {
+		if ap := c.toks[c.i].punct; ap == '+' || ap == '-' || ap == '*' {
+			c.next() // consume the arith punct
+			arithLit, ok := c.next()
+			if !ok || !isNumericTok(arithLit) {
+				return false // non-numeric / column operand → decline
+			}
+			opStr, ok := c.op()
+			if !ok || !isCmpOp(opStr) {
+				return false // second arith op / missing cmp → decline
+			}
+			cmpLit, ok := c.next()
+			if !ok || !isNumericTok(cmpLit) {
+				return false
+			}
+			b.WriteByte(' ')
+			b.WriteByte(ap)
+			b.WriteByte(' ')
+			if !writeLiteralTok(b, arithLit) {
+				return false
+			}
+			b.WriteByte(' ')
+			b.WriteString(opStr)
+			b.WriteByte(' ')
+			return writeLiteralTok(b, cmpLit)
+		}
+	}
 
 	switch {
 	case c.peekIdentLower() == "is":
@@ -1110,6 +1159,12 @@ func reserializeInList(c *cursor, b *strings.Builder, negated bool, atoms *int) 
 // isAtomLiteralTok reports whether a token is an accepted predicate RHS literal.
 func isAtomLiteralTok(t token) bool {
 	return t.kind == tokNum || t.kind == tokFloat || t.kind == tokStr
+}
+
+// isNumericTok reports whether the token is an int or decimal-float literal (a 2e
+// arithmetic operand — NOT a string).
+func isNumericTok(t token) bool {
+	return t.kind == tokNum || t.kind == tokFloat
 }
 
 // writeLiteralTok re-emits a literal token with re-escaping/re-validation — the same

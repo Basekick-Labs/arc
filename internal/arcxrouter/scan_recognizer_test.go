@@ -121,6 +121,12 @@ func TestMatchScan_BooleanTreeWhere(t *testing.T) {
 		{"like in or", "SELECT a FROM cpu WHERE host LIKE 'a%' OR host LIKE 'b%'", "host LIKE 'a%' OR host LIKE 'b%'"},
 		{"like reescaped quote", "SELECT a FROM cpu WHERE host LIKE 'a''b%'", "host LIKE 'a''b%'"},
 		{"like multibyte", "SELECT a FROM cpu WHERE host LIKE 'café%'", "host LIKE 'café%'"},
+		// 2e DOUBLE arith in WHERE — re-serialized verbatim (engine owns type-gate + normalize).
+		{"arith mul", "SELECT a FROM cpu WHERE value * 100 > 120", "value * 100 > 120"},
+		{"arith add float", "SELECT a FROM cpu WHERE value + 0.5 > 1.5", "value + 0.5 > 1.5"},
+		{"arith sub spaced", "SELECT a FROM cpu WHERE value - 5.0 > 0.0", "value - 5.0 > 0.0"},
+		{"arith in and", "SELECT a FROM cpu WHERE value * 2.0 > 4.0 AND host = 'x'", "value * 2.0 > 4.0 AND host = 'x'"},
+		{"arith neg cmp lit", "SELECT a FROM cpu WHERE value * -1.0 >= -0.0", "value * -1.0 >= -0.0"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -147,7 +153,14 @@ func TestMatchScan_BooleanTreeDeclines(t *testing.T) {
 		"SELECT a FROM cpu WHERE a = 1 OR b LIKE 'x' ESCAPE '!'", // LIKE ESCAPE (2d decline)
 		"SELECT a FROM cpu WHERE a = 1 OR b LIKE c",          // LIKE non-literal pattern
 		"SELECT a FROM cpu WHERE a = 1 OR lower(b) = 'x'",    // function call
-		"SELECT a FROM cpu WHERE a = 1 OR b = 1 + 1",      // arithmetic RHS
+		"SELECT a FROM cpu WHERE a = 1 OR b = 1 + 1",      // arith on the RHS (not col-arith)
+		// 2e arith declines (mirror the engine):
+		"SELECT a FROM cpu WHERE value / 2.0 > 3.0",       // division
+		"SELECT a FROM cpu WHERE value--5.0 > 0.0",        // `--` line comment (CRITICAL)
+		"SELECT a FROM cpu WHERE value * 2.0 + 1.0 > 5.0", // multi-term
+		"SELECT a FROM cpu WHERE value * host > 5.0",      // column in arith
+		"SELECT a FROM cpu WHERE value * 2.0 > host",      // column cmp RHS
+		"SELECT a FROM cpu WHERE 2.0 * value > 10.0",      // literal-left orientation
 		"SELECT a FROM cpu WHERE (a = 1 OR b = 2",         // unbalanced (
 		"SELECT a FROM cpu WHERE a = 1 OR b = 2)",         // stray )
 		"SELECT a FROM cpu WHERE ()",                      // empty parens
