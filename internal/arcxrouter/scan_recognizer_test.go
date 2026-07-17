@@ -127,6 +127,12 @@ func TestMatchScan_BooleanTreeWhere(t *testing.T) {
 		{"arith sub spaced", "SELECT a FROM cpu WHERE value - 5.0 > 0.0", "value - 5.0 > 0.0"},
 		{"arith in and", "SELECT a FROM cpu WHERE value * 2.0 > 4.0 AND host = 'x'", "value * 2.0 > 4.0 AND host = 'x'"},
 		{"arith neg cmp lit", "SELECT a FROM cpu WHERE value * -1.0 >= -0.0", "value * -1.0 >= -0.0"},
+		// 2e-division: `/` now serves (any divisor incl. zero / -0.0; engine folds -0.0→+0.0).
+		{"div float", "SELECT a FROM cpu WHERE value / 2.0 > 3.0", "value / 2.0 > 3.0"},
+		{"div int lit", "SELECT a FROM cpu WHERE value / 2 = 2", "value / 2 = 2"},
+		{"div by zero", "SELECT a FROM cpu WHERE value / 0.0 > 2.5", "value / 0.0 > 2.5"},
+		{"div neg zero divisor", "SELECT a FROM cpu WHERE value / -0.0 > 0.0", "value / -0.0 > 0.0"},
+		{"div in and", "SELECT a FROM cpu WHERE value / 2.0 > 2.0 AND host = 'x'", "value / 2.0 > 2.0 AND host = 'x'"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -155,7 +161,9 @@ func TestMatchScan_BooleanTreeDeclines(t *testing.T) {
 		"SELECT a FROM cpu WHERE a = 1 OR lower(b) = 'x'",    // function call
 		"SELECT a FROM cpu WHERE a = 1 OR b = 1 + 1",      // arith on the RHS (not col-arith)
 		// 2e arith declines (mirror the engine):
-		"SELECT a FROM cpu WHERE value / 2.0 > 3.0",       // division
+		"SELECT a FROM cpu WHERE value // 2.0 > 3.0",      // floor-div (2nd `/` fails isNumericTok)
+		"SELECT a FROM cpu WHERE value / 2.0 / 3.0 > 1.0", // second div op
+		"SELECT a FROM cpu WHERE value / 2 * 3 > 5.0",     // div then mul (second arith op)
 		"SELECT a FROM cpu WHERE value--5.0 > 0.0",        // `--` line comment (CRITICAL)
 		"SELECT a FROM cpu WHERE value * 2.0 + 1.0 > 5.0", // multi-term
 		"SELECT a FROM cpu WHERE value * host > 5.0",      // column in arith

@@ -969,11 +969,13 @@ func reserializeAtom(c *cursor, b *strings.Builder, atoms *int) bool {
 	}
 	b.WriteString(colT.orig)
 
-	// 2e: `<col> (+|-|*) <num> <op> <num>` — an arith punct right after the column. Re-emit
-	// verbatim (both engines parse identically); the engine owns the Float64 type-gate + the
-	// signed-zero normalization. `/` is NOT accepted (division declines — the engine does too).
+	// 2e: `<col> (+|-|*|/) <num> <op> <num>` — an arith punct right after the column. Re-emit
+	// verbatim (both engines parse identically); the engine owns the Float64 type-gate, the
+	// signed-zero normalization, AND the `-0.0`-divisor fold. `/` is true division (any divisor
+	// incl. zero); `//` (floor-div) declines because its lexed second `/` fails isNumericTok —
+	// exactly mirroring the engine's match_arith_literal decline.
 	if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct {
-		if ap := c.toks[c.i].punct; ap == '+' || ap == '-' || ap == '*' {
+		if ap := c.toks[c.i].punct; ap == '+' || ap == '-' || ap == '*' || ap == '/' {
 			c.next() // consume the arith punct
 			arithLit, ok := c.next()
 			if !ok || !isNumericTok(arithLit) {
