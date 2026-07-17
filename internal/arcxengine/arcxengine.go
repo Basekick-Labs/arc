@@ -97,6 +97,63 @@ func Query(sql string, ctx Context) (arrow.Record, error) {
 	}
 }
 
+// QueryStream runs sql through arcx and returns the result as a streaming
+// array.RecordReader (un-concatenated batches) — the caller drains it and MUST keep
+// it strongly reachable (runtime.KeepAlive) until AFTER the last batch is read. The
+// reader's Release()/Retain() are NO-OPS in arrow-go v18: the underlying
+// FFI_ArrowArrayStream (holding arcx-owned batch buffers) frees on a GC FINALIZER, so a
+// reader that goes unreachable mid-drain can free buffers Go is still reading — a
+// process-fatal use-after-free across the in-process FFI boundary. The single-batch Query
+// concats to one array (a serial tail on big results); this streams to skip that.
+//
+// Status handling mirrors Query EXACTLY: Unsupported → ErrUnsupported (fall back to
+// DuckDB); Error → plain error (alarm). The stream is imported ONLY on ARCX_OK — the
+// engine leaves out_stream untouched on decline/error (arcx.h), so we never import or set
+// up a finalizer on those paths.
+func QueryStream(sql string, ctx Context) (array.RecordReader, error) {
+	cSQL := C.CString(sql)
+	defer C.free(unsafe.Pointer(cSQL))
+
+	cctx, freeCtx := buildCCtx(ctx)
+	// The C ctx + SQL are freed as soon as this returns: borrow_ctx copies every field
+	// to owned Rust Strings, and export_stream wraps the ALREADY-materialized batch Vec
+	// (eager execute()) — the streamed batches hold no pointer into the C ctx or CString.
+	defer freeCtx()
+
+	var cStream C.struct_ArrowArrayStream
+	var cErr *C.char
+
+	status := C.arcx_query_stream(cSQL, cctx, &cStream, &cErr)
+
+	switch status {
+	case C.ARCX_OK:
+		// The two ArrowArrayStream C types (arcx.h and cdata's) are layout-identical
+		// standard C Data Interface structs — reinterpret the address, the canonical
+		// interop pattern (same as importRecord). ImportCRecordReader MOVES the stream.
+		reader, err := cdata.ImportCRecordReader(
+			(*cdata.CArrowArrayStream)(unsafe.Pointer(&cStream)),
+			nil, // let the reader read the schema from the stream
+		)
+		if err != nil {
+			return nil, fmt.Errorf("arcx: importing arrow stream: %w", err)
+		}
+		// ImportCRecordReader returns arrio.Reader; the transcoders need the richer
+		// array.RecordReader. The concrete type satisfies it (v18), but assert CHECKED —
+		// an unchecked assertion that fails on a future arrow-go would panic inside the
+		// async body writer (process-fatal). A miss → clean error → DuckDB fallback.
+		rr, ok := reader.(array.RecordReader)
+		if !ok {
+			return nil, fmt.Errorf(
+				"arcx: imported stream reader is %T, not array.RecordReader", reader)
+		}
+		return rr, nil
+	case C.ARCX_UNSUPPORTED:
+		return nil, ErrUnsupported{msg: takeErr(cErr)}
+	default: // C.ARCX_ERROR
+		return nil, fmt.Errorf("arcx: %s", takeErr(cErr))
+	}
+}
+
 // Version returns the engine's proof-of-life version string.
 func Version() string {
 	p := C.arcx_version()

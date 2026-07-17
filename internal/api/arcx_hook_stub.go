@@ -14,7 +14,16 @@ import (
 	"github.com/gofiber/fiber/v2"
 )
 
-func (h *QueryHandler) tryArcxRouter(c *fiber.Ctx, start time.Time, rawSQL, headerDB, convertedSQL string) (handled bool) {
+func (h *QueryHandler) tryArcxRouter(
+	c *fiber.Ctx,
+	ctx context.Context,
+	cancel context.CancelFunc,
+	start time.Time,
+	rawSQL, headerDB, convertedSQL string,
+	governanceMaxRows int,
+	onComplete func(int),
+	onFail func(string),
+) (handled bool) {
 	return false
 }
 

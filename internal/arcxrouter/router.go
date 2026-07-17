@@ -24,11 +24,14 @@ package arcxrouter
 import (
 	"context"
 	"database/sql"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/basekick-labs/arc/internal/arcxengine"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
@@ -49,11 +52,14 @@ type Deps struct {
 	// ServeStream writes an arcx result to the response in the request's wire
 	// format (JSON or msgpack), reusing Arc's existing Arrow→wire streamers. It
 	// lives on the api side because those streamers are package-private there;
-	// the router just hands back the record. `start` is when the query began
-	// (captured BEFORE the engine ran) so the response's execution_time_ms covers
-	// the engine work, not just serialization. Returns true if it served the
-	// response. nil in shadow-only wiring (serve mode then falls back to DuckDB).
-	ServeStream func(c *fiber.Ctx, rec arrow.Record, start time.Time) bool
+	// the router hands back the streaming RECORD READER (un-concatenated batches —
+	// the single-batch concat is the serial tail this slice removes). The api side
+	// owns the governance cap/timeout, the metrics/onComplete callbacks, and the
+	// runtime.KeepAlive that holds the FFI-backed reader alive across the async wire
+	// writer (its Release is a no-op; the arcx buffers free on a GC finalizer). `start`
+	// is when the query began (BEFORE the engine ran) so execution_time_ms covers the
+	// engine work. Returns true if it served. nil in shadow-only wiring.
+	ServeStream func(c *fiber.Ctx, reader array.RecordReader, start time.Time) bool
 	// AllowedDirs is DuckDB's sandbox allowlist, passed straight through to the
 	// arcx engine's per-query Context. arcx does NOT inherit DuckDB's
 	// allowed_directories, so this is the ONLY thing stopping arcx from being a
@@ -169,7 +175,7 @@ func Run(c *fiber.Ctx, d Decision, h Handler, mode Mode, start time.Time) (handl
 // runs the compare and returns (nil,false); on decline/error/off it returns
 // (nil,false) so the caller falls back to DuckDB. `ctx` is the caller's (already
 // context.Background-derived, not the pooled Fiber ctx) execution context.
-func RunArrow(ctx context.Context, d Decision, h Handler, mode Mode) (rec arrow.Record, served bool) {
+func RunArrow(ctx context.Context, d Decision, h Handler, mode Mode) (reader array.RecordReader, served bool) {
 	if !d.Eligible || mode == ModeOff {
 		return nil, false
 	}
@@ -182,7 +188,7 @@ func RunArrow(ctx context.Context, d Decision, h Handler, mode Mode) (rec arrow.
 		h.runShadow(ctx, d, engineSQL)
 		return nil, false // DuckDB serves in shadow
 	case ModeServe:
-		r, err := arcxengine.Query(engineSQL, d.Ctx)
+		r, err := arcxengine.QueryStream(engineSQL, d.Ctx)
 		if err != nil {
 			if _, unsupported := err.(arcxengine.ErrUnsupported); !unsupported {
 				h.Logger.Error().Err(err).Str("shape", d.Shape).Str("sql", engineSQL).
@@ -191,7 +197,10 @@ func RunArrow(ctx context.Context, d Decision, h Handler, mode Mode) (rec arrow.
 			}
 			return nil, false
 		}
-		return r, true // caller owns r, must Release after streaming
+		// caller owns r: it drains the reader to the IPC wire and MUST
+		// runtime.KeepAlive(r) past the last batch (the FFI-backed batches free on a
+		// GC finalizer; Release is a no-op) — the FFI use-after-free cliff.
+		return r, true
 	default:
 		return nil, false
 	}
@@ -384,13 +393,82 @@ func buildScanSQL(d Decision, pathArray string) (string, bool) {
 	return b.String(), true
 }
 
+// drainReaderToRecord pulls every batch from a streaming reader and concatenates them into
+// ONE arrow.Record (the shadow comparators take a single Record). Each batch is Retained on
+// extraction because the reader auto-releases the previous batch on the next Next() (the
+// arrow-go C-stream reader contract). The caller MUST runtime.KeepAlive(reader) until after
+// this returns — the batches are FFI-backed and free on the reader's GC finalizer. Returns
+// an empty-but-schema'd record for a zero-batch result.
+func drainReaderToRecord(reader array.RecordReader) (arrow.Record, error) {
+	schema := reader.Schema()
+	var batches []arrow.Record
+	for reader.Next() {
+		b := reader.Record()
+		if b == nil {
+			break
+		}
+		b.Retain()
+		batches = append(batches, b)
+	}
+	if err := reader.Err(); err != nil {
+		for _, b := range batches {
+			b.Release()
+		}
+		return nil, err
+	}
+	if len(batches) == 0 {
+		return emptyRecord(schema), nil
+	}
+	if len(batches) == 1 {
+		return batches[0], nil // caller releases
+	}
+	// Concatenate via a Table → single record. NewTableFromRecords retains the batches;
+	// release our refs after.
+	tbl := array.NewTableFromRecords(schema, batches)
+	defer tbl.Release()
+	for _, b := range batches {
+		b.Release()
+	}
+	tr := array.NewTableReader(tbl, tbl.NumRows())
+	defer tr.Release()
+	if !tr.Next() {
+		return emptyRecord(schema), nil
+	}
+	rec := tr.Record()
+	rec.Retain() // outlive the table reader
+	return rec, nil
+}
+
+// emptyRecord builds a zero-row record carrying `schema` (for a fully-filtered result).
+// Each column is built via NewBuilder(f.Type) — its empty array's type is EXACTLY the
+// schema field's type, so NewRecord's internal validate() cannot panic on a type mismatch
+// (the invariant that keeps this off the "no panics in the query path" list). arcx's scan
+// result schema is plain columns (dict encoding is reconciled to Utf8 before export), so
+// there is no dictionary/extension type here for which an empty builder could disagree.
+func emptyRecord(schema *arrow.Schema) arrow.Record {
+	cols := make([]arrow.Array, schema.NumFields())
+	for i, f := range schema.Fields() {
+		b := array.NewBuilder(memory.DefaultAllocator, f.Type)
+		cols[i] = b.NewArray()
+		b.Release()
+	}
+	rec := array.NewRecord(schema, cols, 0)
+	for _, col := range cols {
+		col.Release()
+	}
+	return rec
+}
+
 // runShadow runs arcx and a cheap DuckDB oracle, compares, and records metrics.
 // It never serves — the caller's DuckDB dispatch does. Synchronous for the first
 // cut (immediate, deterministic correctness signal).
 func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 	arcxStart := time.Now()
-	rec, err := arcxengine.Query(engineSQL, d.Ctx)
-	arcxMicros := time.Since(arcxStart).Microseconds()
+	// Drive the STREAMING path in shadow (the default mode) so the FFI-import + reader
+	// machinery is exercised on every shadow query — otherwise the streaming serve path
+	// would first run in prod only at the serve-flip (its riskiest moment). Drain the
+	// reader into ONE record for the existing comparators (which take a single Record).
+	reader, err := arcxengine.QueryStream(engineSQL, d.Ctx)
 	if err != nil {
 		if _, unsupported := err.(arcxengine.ErrUnsupported); unsupported {
 			// Expected engine decline (e.g. hour-over-daily, F2). Not an alarm —
@@ -406,6 +484,18 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 		h.Metrics.ArcxShadowError(d.Shape)
 		return
 	}
+	rec, err := drainReaderToRecord(reader)
+	// KeepAlive: the reader (holding FFI-backed arcx buffers) must stay reachable until
+	// AFTER the drain reads the last batch — Release is a no-op; the stream frees on a GC
+	// finalizer, so an early finalize is a use-after-free.
+	runtime.KeepAlive(reader)
+	if err != nil {
+		h.Logger.Error().Err(err).Str("shape", d.Shape).Str("sql", engineSQL).
+			Msg("arcx shadow: stream drain ERROR")
+		h.Metrics.ArcxShadowError(d.Shape)
+		return
+	}
+	arcxMicros := time.Since(arcxStart).Microseconds()
 	defer rec.Release()
 	h.Metrics.ArcxLatency("arcx", d.Shape, arcxMicros)
 
@@ -468,7 +558,7 @@ func (h Deps) compareToOracle(ctx context.Context, d Decision, rec arrow.Record)
 // decline; on a real error it alarms and falls back too (Phase 1 keeps DuckDB the
 // safety net rather than surfacing arcx errors to users).
 func (h Deps) runServe(c *fiber.Ctx, ctx context.Context, d Decision, engineSQL string, start time.Time) bool {
-	rec, err := arcxengine.Query(engineSQL, d.Ctx)
+	reader, err := arcxengine.QueryStream(engineSQL, d.Ctx)
 	if err != nil {
 		if _, unsupported := err.(arcxengine.ErrUnsupported); unsupported {
 			return false // silent fallback — normal router contract
@@ -478,16 +568,17 @@ func (h Deps) runServe(c *fiber.Ctx, ctx context.Context, d Decision, engineSQL 
 		h.Metrics.ArcxShadowError(d.Shape)
 		return false
 	}
-	defer rec.Release()
 	if h.ServeStream == nil {
-		// No streamer wired (shadow-only build/config) — fall back to DuckDB.
+		// No streamer wired (shadow-only build/config) — release the reader (its
+		// Release is a no-op; the stream frees on GC finalizer) and fall back.
+		reader.Release()
 		return false
 	}
-	// ServeStream streams the record to the response. It MUST Retain the record
-	// if it defers work past return (the async body-stream writer does), because
-	// this defer releases our reference as soon as Run returns. Owning the
-	// buffer lifetime across the async boundary is the memory-safety cliff the
-	// design doc warns about — the streamer, not the router, holds it while the
-	// response is in flight.
-	return h.ServeStream(c, rec, start)
+	// ServeStream owns the reader across the async wire writer: it must
+	// runtime.KeepAlive(reader) until AFTER the last batch is encoded, because the
+	// imported reader's Release is a no-op and the FFI-backed batches free on a GC
+	// finalizer — a reader that goes unreachable mid-encode is the design doc's FFI
+	// use-after-free cliff. The router does NOT defer-release here; the reader's
+	// lifetime is the streamer's, held for the in-flight response.
+	return h.ServeStream(c, reader, start)
 }
