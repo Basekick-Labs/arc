@@ -91,7 +91,7 @@ func (h *QueryHandler) tryArcxRouter(
 // so the caller's DuckDB IPC path serves. execCtx must be the caller's
 // background-derived context (NOT the pooled Fiber ctx — used inside the async
 // stream writer).
-func (h *QueryHandler) tryArcxRouterArrow(c *fiber.Ctx, execCtx context.Context, rawSQL, headerDB, convertedSQL string) (handled bool) {
+func (h *QueryHandler) tryArcxRouterArrow(c *fiber.Ctx, execCtx context.Context, cancel context.CancelFunc, rawSQL, headerDB, convertedSQL string) (handled bool) {
 	mode := arcxMode()
 	if mode == arcxrouter.ModeOff {
 		return false
@@ -124,7 +124,15 @@ func (h *QueryHandler) tryArcxRouterArrow(c *fiber.Ctx, execCtx context.Context,
 	// *Ctx is recycled after this handler returns (the UAF trap).
 	fctx := c.Context()
 	fctx.SetBodyStreamWriter(func(w *bufio.Writer) {
-		defer runtime.KeepAlive(reader)
+		// The async writer OWNS cancel — it runs AFTER the handler returns, so the caller must
+		// NOT cancel eagerly (that would cancel execCtx while we're still streaming → the
+		// select below breaks immediately → schema-only + spurious "cancel mid-stream").
+		defer func() {
+			if cancel != nil {
+				cancel()
+			}
+			runtime.KeepAlive(reader) // LAST: hold the FFI buffers past the final read.
+		}()
 		ipcWriter := ipc.NewWriter(w, ipc.WithSchema(schema))
 	batchLoop:
 		for reader.Next() {

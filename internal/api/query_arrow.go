@@ -162,10 +162,10 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// compares off to the side and returns false. No-op stub without the
 	// arcx_engine tag — stock Arc unaffected. Uses ctx (background-derived, safe
 	// in the async writer), not c.UserContext().
-	if h.tryArcxRouterArrow(c, ctx, req.SQL, headerDB, convertedSQL) {
-		if cancel != nil {
-			cancel()
-		}
+	// Pass `cancel` INTO the hook — the arcx serve path streams asynchronously in
+	// SetBodyStreamWriter (after this returns), so it owns calling cancel when the stream
+	// finishes. Calling cancel() here would cancel execCtx mid-stream → truncate to schema-only.
+	if h.tryArcxRouterArrow(c, ctx, cancel, req.SQL, headerDB, convertedSQL) {
 		return nil
 	}
 
