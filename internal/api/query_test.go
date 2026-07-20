@@ -1655,6 +1655,19 @@ func TestRewriteTimeBucket(t *testing.T) {
 			input:    "SELECT time_bucket('1 days', time) AS bucket FROM cpu",
 			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 86400) * 86400) AS bucket FROM cpu",
 		},
+		// #535: parenthesized column args must be left verbatim for DuckDB (the
+		// capture already fails to match most of these, but the guard makes the
+		// safety explicit and consistent with date_trunc).
+		{
+			name:     "coalesce column arg left unrewritten (#535)",
+			input:    "SELECT time_bucket('1 hour', coalesce(time, a)) AS bucket FROM cpu",
+			expected: "SELECT time_bucket('1 hour', coalesce(time, a)) AS bucket FROM cpu",
+		},
+		{
+			name:     "parenthesized column left unrewritten (#535)",
+			input:    "SELECT time_bucket('1 hour', (time)) AS bucket FROM cpu",
+			expected: "SELECT time_bucket('1 hour', (time)) AS bucket FROM cpu",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1835,6 +1848,34 @@ func TestRewriteDateTrunc(t *testing.T) {
 			name:     "date_trunc in WHERE clause",
 			input:    "SELECT * FROM cpu WHERE date_trunc('day', time) = '2024-01-01'",
 			expected: "SELECT * FROM cpu WHERE to_timestamp((epoch(time)::BIGINT // 86400) * 86400) = '2024-01-01'",
+		},
+		// #535: parenthesized column args must NOT be rewritten (paren-blind
+		// capture would corrupt them). Left verbatim for DuckDB to handle
+		// natively — correct, just not epoch-optimized.
+		{
+			name:     "coalesce column arg left unrewritten (#535 case 1)",
+			input:    "SELECT date_trunc('hour', coalesce(time, a)) FROM cpu",
+			expected: "SELECT date_trunc('hour', coalesce(time, a)) FROM cpu",
+		},
+		{
+			name:     "parenthesized column left unrewritten (#535 case 2)",
+			input:    "SELECT date_trunc('hour', (time)) FROM cpu",
+			expected: "SELECT date_trunc('hour', (time)) FROM cpu",
+		},
+		{
+			name:     "nested function arg left unrewritten (#535 case 3)",
+			input:    "SELECT date_trunc('hour', f(g(time))) FROM cpu",
+			expected: "SELECT date_trunc('hour', f(g(time))) FROM cpu",
+		},
+		{
+			name:     "CAST column arg left unrewritten (#535)",
+			input:    "SELECT date_trunc('day', CAST(ts AS TIMESTAMP)) FROM cpu",
+			expected: "SELECT date_trunc('day', CAST(ts AS TIMESTAMP)) FROM cpu",
+		},
+		{
+			name:     "bare column still optimized alongside a parenthesized one (#535)",
+			input:    "SELECT date_trunc('hour', time) AS h, date_trunc('day', coalesce(time, a)) AS d FROM cpu",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 3600) * 3600) AS h, date_trunc('day', coalesce(time, a)) AS d FROM cpu",
 		},
 	}
 

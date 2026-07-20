@@ -384,6 +384,15 @@ func rewriteTimeBucket(sql string) string {
 		column := strings.TrimSpace(parts[3])
 		origin := parts[4] // e.g., "2024-01-01 00:30:00"
 
+		// Paren-blind guard (#535): if the column arg contains parentheses the
+		// regex capture may be truncated at the wrong ')'. Leave the call
+		// unrewritten so DuckDB handles it natively. (For time_bucket the
+		// capture already fails to match most nested args, so this is belt-and-
+		// suspenders — but it keeps every rewrite path consistently safe.)
+		if strings.Contains(column, "(") {
+			return match
+		}
+
 		// Parse origin timestamp
 		originTime, err := parseTimeBucketOrigin(origin)
 		if err != nil {
@@ -415,6 +424,12 @@ func rewriteTimeBucket(sql string) string {
 		unit := strings.ToLower(strings.TrimSuffix(parts[2], "s"))
 		column := strings.TrimSpace(parts[3])
 
+		// Paren-blind guard (#535): see the 3-arg form above. If the column arg
+		// contains parentheses the capture may be truncated; leave it for DuckDB.
+		if strings.Contains(column, "(") {
+			return match
+		}
+
 		// Use epoch-based arithmetic for all intervals (2.5x faster than date_trunc)
 		seconds := intervalToSeconds(amount, unit)
 		if seconds == 0 {
@@ -444,6 +459,19 @@ func rewriteDateTrunc(sql string) string {
 
 		unit := strings.ToLower(parts[1])
 		column := strings.TrimSpace(parts[2])
+
+		// Paren-blind guard (#535): the column capture uses [^)]+, which stops
+		// at the FIRST ')' rather than the matching one. When the column arg
+		// itself contains parentheses — coalesce(time, a), (time), CAST(...),
+		// nested calls — the capture is truncated and splicing ::BIGINT onto it
+		// would corrupt the query (e.g. epoch(coalesce(time, a)::BIGINT // 3600)
+		// swallows the arithmetic inside epoch's arg list, producing a binder
+		// error on SQL DuckDB would have run fine). Detect a '(' in the captured
+		// column and leave the call unrewritten — DuckDB runs date_trunc()
+		// natively (correct, just without the epoch optimization).
+		if strings.Contains(column, "(") {
+			return match
+		}
 
 		// Get interval in seconds
 		seconds := intervalToSeconds("1", unit)
