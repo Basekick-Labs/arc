@@ -75,6 +75,17 @@ Note: this makes output **eventually** idempotent (duplicates collapse at compac
 
 No action is required to upgrade; add `tag_columns` to your grouped CQs when you want the duplicate-collapsing behavior.
 
+## Performance
+
+### Faster local-storage directory listing ([#347](https://github.com/Basekick-Labs/arc/issues/347))
+
+The local storage backend's `List` and `ListObjects` now use `filepath.WalkDir` instead of `filepath.Walk`. `WalkDir` reads directory entries without an `lstat(2)` per entry:
+
+- **`List`** needs only the entry name and is-dir bit (both free on `fs.DirEntry`), so it now does **no** per-entry stat at all — down from one stat on every file, directory, and hidden file. Benchmarked at ~19% fewer allocations and ~38% less allocated memory on a 2,000-file partition tree.
+- **`ListObjects`** needs each returned file's size and mod-time, so it still stats those — but skips the stat on directories and hidden files (matched by name first). The saving grows with the fraction of the tree that is directories/dotfiles.
+
+The win is largest on cold caches and network filesystems, where the `lstat` syscall dominates. Local backend only; the returned results are unchanged.
+
 ## Impact by deployment mode
 
 The forwarding-header and loop-guard changes are cluster-only; the partition-pruner DoS fix (#536) applies to **every** deployment mode, since the pruner runs on every query.
