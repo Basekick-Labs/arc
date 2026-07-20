@@ -68,6 +68,13 @@ Two fixes, which together make CQ output **idempotent via compaction**:
 
 Note: this makes output **eventually** idempotent (duplicates collapse at compaction), not atomically exactly-once — the write and the watermark advance remain separate steps. True exactly-once is tracked in #522.
 
+**Upgrade impact — this is not a breaking change.** Existing continuous queries keep working: the CQ database is migrated automatically (a new nullable `tag_columns` column is added on startup), old definitions read and execute exactly as before, and `tag_columns` is optional. Two behavior changes to be aware of:
+
+- **Timestamps for CQs that don't select a `time` column.** These previously stamped output with `time.Now()` (ingestion wall-clock) and now stamp the window start. This corrects a real bug, but it means such a destination has a timestamp discontinuity at the upgrade point (old rows keep their `time.Now()` values, new rows get window-start values). CQs that *do* select a time column (the common case, e.g. `date_trunc('hour', time) AS time`) are completely unchanged.
+- **Dedup is opt-in for grouped CQs.** An existing `GROUP BY <dimension>` CQ gets no idempotency benefit until you add `tag_columns` (via an update); until then it behaves exactly as before (append-only). This is deliberate — a grouped CQ is **never** auto-deduped without declared tags, because deduping multi-series output on time alone would delete series. A genuinely ungrouped CQ (one row per window) is deduped automatically after the upgrade.
+
+No action is required to upgrade; add `tag_columns` to your grouped CQs when you want the duplicate-collapsing behavior.
+
 ## Impact by deployment mode
 
 The forwarding-header and loop-guard changes are cluster-only; the partition-pruner DoS fix (#536) applies to **every** deployment mode, since the pruner runs on every query.
