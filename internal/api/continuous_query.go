@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"github.com/basekick-labs/arc/internal/ingest"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	_ "github.com/mattn/go-sqlite3"
@@ -73,29 +75,35 @@ type ContinuousQuery struct {
 	DestinationMeasurement string  `json:"destination_measurement"`
 	Query                  string  `json:"query"`
 	Interval               string  `json:"interval"`
-	RetentionDays          *int    `json:"retention_days"`
-	DeleteSourceAfterDays  *int    `json:"delete_source_after_days"`
-	IsActive               bool    `json:"is_active"`
-	LastExecutionTime      *string `json:"last_execution_time"`
-	LastExecutionStatus    *string `json:"last_execution_status"`
-	LastProcessedTime      *string `json:"last_processed_time"`
-	LastRecordsWritten     *int64  `json:"last_records_written"`
-	CreatedAt              string  `json:"created_at"`
-	UpdatedAt              string  `json:"updated_at"`
+	// TagColumns are the output columns that are grouping dimensions (not
+	// aggregates). They are written as Parquet `arc:tags` metadata so that
+	// compaction can dedup CQ output on (tags, time), making re-emitted windows
+	// idempotent (#521). Empty means no dedup key — duplicate windows accumulate.
+	TagColumns            []string `json:"tag_columns"`
+	RetentionDays         *int     `json:"retention_days"`
+	DeleteSourceAfterDays *int     `json:"delete_source_after_days"`
+	IsActive              bool     `json:"is_active"`
+	LastExecutionTime     *string  `json:"last_execution_time"`
+	LastExecutionStatus   *string  `json:"last_execution_status"`
+	LastProcessedTime     *string  `json:"last_processed_time"`
+	LastRecordsWritten    *int64   `json:"last_records_written"`
+	CreatedAt             string   `json:"created_at"`
+	UpdatedAt             string   `json:"updated_at"`
 }
 
 // ContinuousQueryRequest represents a request to create/update a CQ
 type ContinuousQueryRequest struct {
-	Name                   string  `json:"name"`
-	Description            *string `json:"description"`
-	Database               string  `json:"database"`
-	SourceMeasurement      string  `json:"source_measurement"`
-	DestinationMeasurement string  `json:"destination_measurement"`
-	Query                  string  `json:"query"`
-	Interval               string  `json:"interval"`
-	RetentionDays          *int    `json:"retention_days"`
-	DeleteSourceAfterDays  *int    `json:"delete_source_after_days"`
-	IsActive               bool    `json:"is_active"`
+	Name                   string   `json:"name"`
+	Description            *string  `json:"description"`
+	Database               string   `json:"database"`
+	SourceMeasurement      string   `json:"source_measurement"`
+	DestinationMeasurement string   `json:"destination_measurement"`
+	Query                  string   `json:"query"`
+	Interval               string   `json:"interval"`
+	TagColumns             []string `json:"tag_columns"`
+	RetentionDays          *int     `json:"retention_days"`
+	DeleteSourceAfterDays  *int     `json:"delete_source_after_days"`
+	IsActive               bool     `json:"is_active"`
 }
 
 // ExecuteCQRequest represents a request to execute a CQ
@@ -183,6 +191,7 @@ func (h *ContinuousQueryHandler) initTables() error {
 			destination_measurement TEXT NOT NULL,
 			query TEXT NOT NULL,
 			interval TEXT NOT NULL,
+			tag_columns TEXT,
 			retention_days INTEGER,
 			delete_source_after_days INTEGER,
 			is_active BOOLEAN DEFAULT TRUE,
@@ -193,6 +202,15 @@ func (h *ContinuousQueryHandler) initTables() error {
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to create continuous_queries table: %w", err)
+	}
+
+	// Migration: add tag_columns to pre-existing databases (#521). The column
+	// holds a JSON-encoded []string of grouping-dimension output columns, used
+	// as the Parquet arc:tags dedup key. A duplicate-column error means an
+	// already-migrated DB — ignore it; any other error is fatal.
+	if _, err = h.sqliteDB.Exec(`ALTER TABLE continuous_queries ADD COLUMN tag_columns TEXT`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column name") {
+		return fmt.Errorf("failed to add tag_columns column: %w", err)
 	}
 
 	// Execution history table
@@ -287,12 +305,23 @@ func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
 		})
 	}
 
+	// Validate tag columns before storing — they end up in Parquet arc:tags
+	// metadata and compaction's PARTITION BY, so unsafe names must be rejected
+	// at the boundary (#521).
+	if err := validateTagColumns(req.TagColumns); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	tagColumnsJSON, err := encodeTagColumns(req.TagColumns)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to encode tag_columns"})
+	}
+
 	// Insert query
 	result, err := h.sqliteDB.Exec(`
 		INSERT INTO continuous_queries
-		(name, description, database, source_measurement, destination_measurement, query, interval, retention_days, delete_source_after_days, is_active)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, req.Name, req.Description, req.Database, req.SourceMeasurement, req.DestinationMeasurement, req.Query, req.Interval, req.RetentionDays, req.DeleteSourceAfterDays, req.IsActive)
+		(name, description, database, source_measurement, destination_measurement, query, interval, tag_columns, retention_days, delete_source_after_days, is_active)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, req.Name, req.Description, req.Database, req.SourceMeasurement, req.DestinationMeasurement, req.Query, req.Interval, tagColumnsJSON, req.RetentionDays, req.DeleteSourceAfterDays, req.IsActive)
 
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
@@ -381,13 +410,21 @@ func (h *ContinuousQueryHandler) handleUpdate(c *fiber.Ctx) error {
 		})
 	}
 
+	if err := validateTagColumns(req.TagColumns); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	tagColumnsJSON, err := encodeTagColumns(req.TagColumns)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to encode tag_columns"})
+	}
+
 	result, err := h.sqliteDB.Exec(`
 		UPDATE continuous_queries SET
 			name = ?, description = ?, database = ?, source_measurement = ?,
-			destination_measurement = ?, query = ?, interval = ?, retention_days = ?,
+			destination_measurement = ?, query = ?, interval = ?, tag_columns = ?, retention_days = ?,
 			delete_source_after_days = ?, is_active = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE id = ?
-	`, req.Name, req.Description, req.Database, req.SourceMeasurement, req.DestinationMeasurement, req.Query, req.Interval, req.RetentionDays, req.DeleteSourceAfterDays, req.IsActive, queryID)
+	`, req.Name, req.Description, req.Database, req.SourceMeasurement, req.DestinationMeasurement, req.Query, req.Interval, tagColumnsJSON, req.RetentionDays, req.DeleteSourceAfterDays, req.IsActive, queryID)
 
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to update continuous query")
@@ -635,8 +672,12 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 		})
 	}
 
-	// Execute the aggregation query using DuckDB
-	ctx := context.Background()
+	// Execute the aggregation query using DuckDB. Derive from the request context
+	// (so a client disconnect cancels downstream context-aware work) and cap the
+	// runtime with the same 10-minute deadline the scheduler path uses, so a
+	// manual execute over a very wide range can't run unbounded.
+	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Minute)
+	defer cancel()
 	recordsWritten, err := h.executeAggregation(ctx, cq, executedQuery, startTime, endTime)
 	if err != nil {
 		executionDuration := time.Since(start).Seconds()
@@ -701,8 +742,13 @@ func wrapSourceMeasurement(query, database, measurement, readParquetExpr string)
 	return pattern.ReplaceAllLiteralString(query, "FROM "+readParquetExpr)
 }
 
-// executeAggregation runs the aggregation query and writes results
-func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *ContinuousQuery, query string, _, _ time.Time) (int64, error) {
+// executeAggregation runs the aggregation query and writes results.
+// startTime is the window's inclusive left boundary — it stamps output rows
+// when the aggregation query does not select a time column, so re-runs of the
+// same window produce identical (tags, time) rows that dedup at compaction (#521).
+// The window's end time is intentionally unused here: output rows are labelled by
+// the window START (bucket-start convention), so only startTime is needed.
+func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *ContinuousQuery, query string, startTime, _ time.Time) (int64, error) {
 	// Build storage path for source measurement (supports local, S3, Azure)
 	measurementPath := storage.GetStoragePath(h.storage, cq.Database, cq.SourceMeasurement)
 
@@ -817,18 +863,76 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 		}
 	}
 
-	// Ensure time column exists (as int64 microseconds)
+	// Ensure time column exists (as int64 microseconds).
+	// When the aggregation query does not select a time column, stamp every row
+	// with the WINDOW START time — not time.Now() (#521). time.Now() gave rows a
+	// wall-clock ingestion timestamp (wrong for a time-series) and made a re-run
+	// of the same window produce rows with a DIFFERENT timestamp, so they could
+	// never be deduped. The window start is stable across re-runs, so duplicate
+	// emissions land at the identical (tags, time) and collapse at compaction.
 	if _, hasTime := columnarData["time"]; !hasTime {
-		nowMicro := time.Now().UTC().UnixMicro()
+		windowMicro := startTime.UTC().UnixMicro()
 		times := make([]interface{}, len(records))
 		for i := range times {
-			times[i] = nowMicro
+			times[i] = windowMicro
 		}
 		columnarData["time"] = times
 	}
 
-	// Write using WriteColumnarDirect
-	if err := h.arrowBuffer.WriteColumnarDirect(ctx, cq.Database, cq.DestinationMeasurement, columnarData); err != nil {
+	// Determine which declared tag columns are actually present in the output.
+	// A tag name that isn't an output column must NOT reach the Parquet arc:tags
+	// metadata: compaction's dedup builds `PARTITION BY "<tag>", "time"` from that
+	// metadata, and a name with no matching column fails to bind and wedges the
+	// whole partition (it can never compact). Intersecting here makes a stale or
+	// mistaken tag_columns entry harmless rather than a compaction wedge (#521).
+	var tagColumns []string
+	for _, name := range cq.TagColumns {
+		if _, ok := columnarData[name]; ok {
+			tagColumns = append(tagColumns, name)
+		} else {
+			h.logger.Warn().
+				Str("query_name", cq.Name).
+				Str("tag_column", name).
+				Msg("Declared tag_column is not an output column of the CQ; skipping (would otherwise wedge compaction)")
+		}
+	}
+
+	// Decide whether to mark this output for time-only dedup (#521). This ONLY
+	// matters when there are no tag columns — with tags, arc:tags already drives
+	// dedup on (tags, time). The marker makes compaction dedup on time ALONE, so
+	// it is safe ONLY if time is a unique key in the output (one row per window).
+	//
+	// CRITICAL: we must NOT assume "no tag columns" means "one row per window". A
+	// grouped CQ (e.g. GROUP BY host) whose operator forgot to declare
+	// tag_columns produces MULTIPLE rows per timestamp with no tags — marking it
+	// for time-only dedup would make compaction keep one row per timestamp and
+	// silently DELETE every series but one. So we verify uniqueness against the
+	// actual output and, if time repeats without tags, skip the marker and warn
+	// the operator to declare tag_columns.
+	dedupTime := false
+	if len(tagColumns) == 0 {
+		if timeColumnIsUnique(columnarData["time"]) {
+			dedupTime = true
+		} else {
+			h.logger.Warn().
+				Str("query_name", cq.Name).
+				Msg("CQ output has multiple rows per timestamp but no tag_columns declared; " +
+					"skipping time-only dedup to avoid data loss. Declare tag_columns for the " +
+					"grouping dimensions to make this CQ idempotent (#521).")
+		}
+	}
+
+	// Write using WriteColumnarRecord so TagColumns (and the dedup-time marker)
+	// are preserved as Parquet metadata, enabling compaction to dedup CQ output.
+	// This goes through the identical buffer/flush/WAL path as WriteColumnarDirect.
+	record := &models.ColumnarRecord{
+		Measurement: cq.DestinationMeasurement,
+		Columnar:    true,
+		Columns:     columnarData,
+		TagColumns:  tagColumns,
+		DedupTime:   dedupTime,
+	}
+	if err := h.arrowBuffer.WriteColumnarRecord(ctx, cq.Database, record); err != nil {
 		return 0, fmt.Errorf("failed to write records: %w", err)
 	}
 
@@ -878,7 +982,7 @@ func (h *ContinuousQueryHandler) getQuery(queryID int64) (*ContinuousQuery, erro
 	row := h.sqliteDB.QueryRow(`
 		SELECT
 			cq.id, cq.name, cq.description, cq.database, cq.source_measurement, cq.destination_measurement,
-			cq.query, cq.interval, cq.retention_days, cq.delete_source_after_days, cq.is_active,
+			cq.query, cq.interval, cq.tag_columns, cq.retention_days, cq.delete_source_after_days, cq.is_active,
 			cq.last_processed_time, cq.created_at, cq.updated_at,
 			cqe.execution_time, cqe.status, cqe.records_written
 		FROM continuous_queries cq
@@ -891,15 +995,22 @@ func (h *ContinuousQueryHandler) getQuery(queryID int64) (*ContinuousQuery, erro
 	`, queryID)
 
 	var q ContinuousQuery
+	var tagColumnsRaw *string
 	err := row.Scan(
 		&q.ID, &q.Name, &q.Description, &q.Database, &q.SourceMeasurement, &q.DestinationMeasurement,
-		&q.Query, &q.Interval, &q.RetentionDays, &q.DeleteSourceAfterDays, &q.IsActive,
+		&q.Query, &q.Interval, &tagColumnsRaw, &q.RetentionDays, &q.DeleteSourceAfterDays, &q.IsActive,
 		&q.LastProcessedTime, &q.CreatedAt, &q.UpdatedAt,
 		&q.LastExecutionTime, &q.LastExecutionStatus, &q.LastRecordsWritten,
 	)
 	if err != nil {
 		return nil, err
 	}
+	tags, decErr := decodeTagColumns(tagColumnsRaw)
+	if decErr != nil {
+		h.logger.Warn().Err(decErr).Str("query_name", q.Name).
+			Msg("Ignoring corrupt tag_columns; CQ will not dedup until it is re-saved (#521)")
+	}
+	q.TagColumns = tags
 
 	return &q, nil
 }
@@ -909,7 +1020,7 @@ func (h *ContinuousQueryHandler) getQueries(database, isActiveStr string) ([]Con
 	query := `
 		SELECT
 			cq.id, cq.name, cq.description, cq.database, cq.source_measurement, cq.destination_measurement,
-			cq.query, cq.interval, cq.retention_days, cq.delete_source_after_days, cq.is_active,
+			cq.query, cq.interval, cq.tag_columns, cq.retention_days, cq.delete_source_after_days, cq.is_active,
 			cq.last_processed_time, cq.created_at, cq.updated_at,
 			cqe.execution_time, cqe.status, cqe.records_written
 		FROM continuous_queries cq
@@ -949,14 +1060,21 @@ func (h *ContinuousQueryHandler) getQueries(database, isActiveStr string) ([]Con
 	var queries []ContinuousQuery
 	for rows.Next() {
 		var q ContinuousQuery
+		var tagColumnsRaw *string
 		if err := rows.Scan(
 			&q.ID, &q.Name, &q.Description, &q.Database, &q.SourceMeasurement, &q.DestinationMeasurement,
-			&q.Query, &q.Interval, &q.RetentionDays, &q.DeleteSourceAfterDays, &q.IsActive,
+			&q.Query, &q.Interval, &tagColumnsRaw, &q.RetentionDays, &q.DeleteSourceAfterDays, &q.IsActive,
 			&q.LastProcessedTime, &q.CreatedAt, &q.UpdatedAt,
 			&q.LastExecutionTime, &q.LastExecutionStatus, &q.LastRecordsWritten,
 		); err != nil {
 			continue
 		}
+		tags, decErr := decodeTagColumns(tagColumnsRaw)
+		if decErr != nil {
+			h.logger.Warn().Err(decErr).Str("query_name", q.Name).
+				Msg("Ignoring corrupt tag_columns; CQ will not dedup until it is re-saved (#521)")
+		}
+		q.TagColumns = tags
 		queries = append(queries, q)
 	}
 
@@ -1008,6 +1126,100 @@ func (h *ContinuousQueryHandler) recordExecution(queryID int64, executionID, sta
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to record execution")
 	}
+}
+
+// encodeTagColumns serializes the tag column list for storage as a SQLite TEXT
+// column. An empty/nil list encodes to NULL (stored as a nil *string) so the
+// column round-trips cleanly and pre-migration rows read back as no tags.
+func encodeTagColumns(tags []string) (*string, error) {
+	if len(tags) == 0 {
+		return nil, nil
+	}
+	b, err := json.Marshal(tags)
+	if err != nil {
+		return nil, err
+	}
+	s := string(b)
+	return &s, nil
+}
+
+// decodeTagColumns parses the JSON tag column list read from SQLite. A NULL or
+// empty value (pre-migration rows, or CQs created without tags) decodes to nil
+// with no error. A non-empty value that fails to parse (corruption, a bad manual
+// edit) returns an error so the caller can warn — silently returning nil would
+// revert a CQ to no-dedup behavior with no signal, letting duplicates accumulate.
+func decodeTagColumns(raw *string) ([]string, error) {
+	if raw == nil || *raw == "" {
+		return nil, nil
+	}
+	var tags []string
+	if err := json.Unmarshal([]byte(*raw), &tags); err != nil {
+		return nil, fmt.Errorf("corrupt tag_columns value %q: %w", *raw, err)
+	}
+	return tags, nil
+}
+
+// maxUniquenessCheckRows caps how many rows timeColumnIsUnique will scan before
+// giving up and reporting "not unique" (i.e. not dedup-safe). A tagless CQ that
+// legitimately produces one row per window is tiny (one row per interval), so a
+// large output almost certainly means a grouping CQ that forgot to declare
+// tag_columns — exactly the case where time-only dedup would be unsafe. Bounding
+// the scan avoids building a huge map for that misconfiguration, and failing
+// closed (treat as not-unique → skip the marker) is the safe direction.
+const maxUniquenessCheckRows = 100_000
+
+// timeColumnIsUnique reports whether the time column has no duplicate values —
+// i.e. time alone is a unique key for the output. Used to decide whether a
+// tagless CQ is safe to mark for time-only dedup (#521): if two rows share a
+// timestamp with no tag to distinguish them, time-only dedup would lose one, so
+// the marker must be withheld. An empty/absent column is trivially unique.
+//
+// Fails closed: an output larger than maxUniquenessCheckRows returns false
+// (not dedup-safe) rather than building an unbounded map — a tagless CQ that big
+// is almost certainly a mis-declared grouping CQ, which must NOT be marked.
+func timeColumnIsUnique(times []interface{}) bool {
+	if len(times) <= 1 {
+		return true
+	}
+	if len(times) > maxUniquenessCheckRows {
+		return false
+	}
+	seen := make(map[interface{}]struct{}, len(times))
+	for _, t := range times {
+		// Comparable key: the time column is normalized to int64 micros before
+		// this runs, but be defensive about the underlying type. interface{}
+		// values are comparable as map keys when the dynamic type is comparable
+		// (all our time representations — int64, string, time.Time — are).
+		if _, dup := seen[t]; dup {
+			return false
+		}
+		seen[t] = struct{}{}
+	}
+	return true
+}
+
+// validateTagColumns rejects tag column names that aren't safe SQL identifiers.
+// The names are emitted verbatim into the Parquet arc:tags metadata and later
+// interpolated into compaction's `PARTITION BY "<name>"` dedup query, so an
+// unsafe name must never reach storage — validate at the API boundary. Rules
+// match internal/compaction/dedup.go#isValidIdentifier (alphanumeric, '_', '-').
+func validateTagColumns(tags []string) error {
+	for _, name := range tags {
+		if name == "" {
+			return fmt.Errorf("tag column name must not be empty")
+		}
+		// "time" is never a valid tag: compaction always appends "time" to the
+		// dedup key, so declaring it would produce PARTITION BY "time", "time".
+		if strings.EqualFold(name, "time") {
+			return fmt.Errorf("tag column %q is reserved: time is always part of the dedup key and must not be listed", name)
+		}
+		for _, c := range name {
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+				return fmt.Errorf("invalid tag column %q: only alphanumeric, underscore, and hyphen are allowed", name)
+			}
+		}
+	}
+	return nil
 }
 
 // updateLastProcessedTime updates the last processed time for a query

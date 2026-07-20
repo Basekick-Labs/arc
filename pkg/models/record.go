@@ -18,9 +18,15 @@ type ColumnarRecord struct {
 	Measurement string                   `json:"measurement"`
 	Columnar    bool                     `json:"_columnar"` // Marker for columnar format
 	Columns     map[string][]interface{} `json:"columns"`   // Column name -> array of values
-	TagColumns  []string                 `json:"-"`          // Tag column names (for Parquet metadata, enables auto-dedup)
-	TimeUnit    string                   `json:"_time_unit,omitempty"`
-	RawPayload  []byte                   `json:"-"` // Original msgpack bytes for zero-copy WAL
+	TagColumns  []string                 `json:"-"`         // Tag column names (for Parquet metadata, enables auto-dedup)
+	// DedupTime, when true, makes compaction dedup this data on the time column
+	// even when TagColumns is empty (keeping one row per timestamp). Set ONLY by
+	// producers whose data model guarantees one row per (tags, time) — continuous
+	// queries (#521). MUST stay false for raw ingest, where many distinct rows
+	// legitimately share a timestamp and time-only dedup would destroy data.
+	DedupTime  bool   `json:"-"`
+	TimeUnit   string `json:"_time_unit,omitempty"`
+	RawPayload []byte `json:"-"` // Original msgpack bytes for zero-copy WAL
 }
 
 // MsgPackPayload represents the top-level MessagePack payload structure

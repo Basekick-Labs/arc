@@ -55,6 +55,26 @@ This was an **availability** bug, not a wrong-answer bug: every corrupted form f
 
 The fix leaves any `date_trunc`/`time_bucket` call whose column argument contains a parenthesis **unrewritten**, so DuckDB evaluates it natively — correct results, just without the epoch optimization for that one call. The common `date_trunc('hour', time)` bare-column form is unaffected and still gets the optimization; a query mixing both forms optimizes the bare one and passes the parenthesized one through. Introduced in `161be30` (2026-01-07); present on `main`.
 
+### Continuous queries no longer produce duplicate aggregate rows ([#521](https://github.com/Basekick-Labs/arc/issues/521))
+
+Continuous-query output was append-only with no idempotency: a window could be aggregated and written more than once — after a crash between the destination write and the watermark advance, or a re-run over an overlapping range — leaving **duplicate rows** in the destination measurement. Separately, when the aggregation query selected no `time` column, every output row was stamped with `time.Now()` (the ingestion wall-clock) instead of the window time, so the rollup's timestamps were wrong and the duplicates weren't even dedupe-able.
+
+Two fixes, which together make CQ output **idempotent via compaction**:
+
+- **Window-time stamping.** A CQ that doesn't select a time column now stamps each output row with the window's start time (the `[start, end)` bucket boundary), not `time.Now()`. Timestamps are correct, and re-running the same window produces byte-identical `(dimensions, time)` keys.
+- **Dedup metadata on CQ output.** CQ output now carries the Parquet metadata compaction needs to collapse duplicate windows to one row. Declare the grouping dimensions in a new optional **`tag_columns`** field on the CQ definition (e.g. `"tag_columns": ["host"]` for `GROUP BY host`) — these are written as `arc:tags`, and compaction dedups on `(tags, time)`. A CQ with **no** grouping (one row per window, e.g. `SELECT avg(x) …`) is detected automatically and deduped on time alone. Duplicate emissions are collapsed the next time the destination partition compacts.
+
+**Safety:** a CQ that groups by a dimension but does **not** declare it in `tag_columns` is detected (its output has multiple rows per timestamp) and is **not** marked for time-only dedup — this avoids silently dropping series. Such a CQ logs a warning asking the operator to declare `tag_columns`. Existing CQ definitions are migrated automatically (a new nullable column); a CQ without `tag_columns` behaves exactly as before except for the corrected timestamp. This is the foundation for late-data reprocessing ([#522](https://github.com/Basekick-Labs/arc/issues/522)).
+
+Note: this makes output **eventually** idempotent (duplicates collapse at compaction), not atomically exactly-once — the write and the watermark advance remain separate steps. True exactly-once is tracked in #522.
+
+**Upgrade impact — this is not a breaking change.** Existing continuous queries keep working: the CQ database is migrated automatically (a new nullable `tag_columns` column is added on startup), old definitions read and execute exactly as before, and `tag_columns` is optional. Two behavior changes to be aware of:
+
+- **Timestamps for CQs that don't select a `time` column.** These previously stamped output with `time.Now()` (ingestion wall-clock) and now stamp the window start. This corrects a real bug, but it means such a destination has a timestamp discontinuity at the upgrade point (old rows keep their `time.Now()` values, new rows get window-start values). CQs that *do* select a time column (the common case, e.g. `date_trunc('hour', time) AS time`) are completely unchanged.
+- **Dedup is opt-in for grouped CQs.** An existing `GROUP BY <dimension>` CQ gets no idempotency benefit until you add `tag_columns` (via an update); until then it behaves exactly as before (append-only). This is deliberate — a grouped CQ is **never** auto-deduped without declared tags, because deduping multi-series output on time alone would delete series. A genuinely ungrouped CQ (one row per window) is deduped automatically after the upgrade.
+
+No action is required to upgrade; add `tag_columns` to your grouped CQs when you want the duplicate-collapsing behavior.
+
 ## Impact by deployment mode
 
 The forwarding-header and loop-guard changes are cluster-only; the partition-pruner DoS fix (#536) applies to **every** deployment mode, since the pruner runs on every query.

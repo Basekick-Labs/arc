@@ -88,7 +88,7 @@ func TestBuildCompactionQuery_DedupMixedTimeAtScale(t *testing.T) {
 				out := filepath.ToSlash(filepath.Join(dir, "out.parquet"))
 
 				// Dedup branch (host tag) — the one that wedged.
-				if err := execCompaction(ctx, db, fileList, `ORDER BY "time"`, out, []string{"host"}); err != nil {
+				if err := execCompaction(ctx, db, fileList, `ORDER BY "time"`, out, []string{"host"}, false); err != nil {
 					t.Fatalf("dedup compaction wedged (temp-table materialization missing?): %v", err)
 				}
 

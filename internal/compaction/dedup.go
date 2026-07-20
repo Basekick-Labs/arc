@@ -44,6 +44,33 @@ func readTagColumnsFromParquetFiles(ctx context.Context, db *sql.DB, filePaths [
 	return result, nil
 }
 
+// readDedupTimeFromParquetFiles reports whether ANY of the given Parquet files
+// carries the "arc:dedup_time" marker. That marker is written only by producers
+// whose data model is one-row-per-(tags,time) — continuous queries (#521) — and
+// tells compaction it is safe to dedup on time even when there are no tag
+// columns. A missing marker (all raw-ingest files) returns false, so ingest
+// dedup behavior is unchanged.
+func readDedupTimeFromParquetFiles(ctx context.Context, db *sql.DB, filePaths []string) (bool, error) {
+	for _, filePath := range filePaths {
+		query := fmt.Sprintf(
+			`SELECT value FROM parquet_kv_metadata('%s') WHERE key = 'arc:dedup_time'`,
+			escapeSQLPath(filePath),
+		)
+		var val string
+		err := db.QueryRowContext(ctx, query).Scan(&val)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("failed to read parquet dedup_time metadata: %w", err)
+		}
+		if val == "true" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // readTagColumnsFromParquet reads the "arc:tags" metadata from a single Parquet file.
 // Returns nil if no tag metadata is found (file written before dedup feature).
 func readTagColumnsFromParquet(ctx context.Context, db *sql.DB, filePath string) ([]string, error) {
@@ -105,15 +132,20 @@ const dedupStagingTable = "arc_compaction_staged"
 // buildCompactionQuery builds the DuckDB statement(s) for compaction. It returns
 // a slice of statements to execute in order on the same connection.
 //
-// When tagColumns is nil/empty, returns a single standard COPY (zero overhead).
-// When tagColumns is non-empty, returns two statements (CREATE OR REPLACE TEMP
-// TABLE ... AS <normalized read> ; COPY <dedup window over the table>) — see the
-// long comment on the dedup branch for why a temp table is required rather than
-// a CTE or subquery.
-func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColumns []string) []string {
+// Dedup runs when tagColumns is non-empty OR dedupTime is set. Without either,
+// returns a single standard COPY (zero overhead). When deduping, returns two
+// statements (CREATE OR REPLACE TEMP TABLE ... AS <normalized read> ; COPY
+// <dedup window over the table>) — see the long comment on the dedup branch for
+// why a temp table is required rather than a CTE or subquery.
+//
+// The dedup key is (tagColumns..., "time"). With no tag columns but dedupTime
+// set (a no-group-by continuous query, #521), the key is "time" alone — one row
+// per timestamp. This is safe ONLY because dedupTime is written exclusively by
+// producers whose data is one-row-per-time; raw ingest never sets it.
+func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColumns []string, dedupTime bool) []string {
 	escapedOutput := escapeSQLPath(outputFile)
 
-	if len(tagColumns) == 0 {
+	if len(tagColumns) == 0 && !dedupTime {
 		// Standard compaction — no dedup overhead.
 		// Normalize "time" to TIMESTAMP so a partition that mixes file schemas
 		// (some time=TIMESTAMP, some time=VARCHAR from a misbehaving writer)
@@ -167,14 +199,18 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 	// PARTITION BY all tag columns + time: rows with identical (tags, time) are
 	// duplicates; one is kept. This is the dedup key, not the output order — the
 	// output is sorted by the separate orderByClause (time).
-	var quotedTags []string
+	// Build the PARTITION BY key: all tag columns plus "time". When there are no
+	// tag columns (a no-group-by CQ reaching here via dedupTime), the key is
+	// "time" alone — build the list without a dangling leading comma.
+	quotedKeys := make([]string, 0, len(tagColumns)+1)
 	for _, tag := range tagColumns {
 		// Double-quote escaping: DuckDB treats "" inside a quoted identifier as a literal "
 		// (same as PostgreSQL). This prevents identifier breakout even if validation is bypassed.
 		escaped := strings.ReplaceAll(tag, `"`, `""`)
-		quotedTags = append(quotedTags, fmt.Sprintf(`"%s"`, escaped))
+		quotedKeys = append(quotedKeys, fmt.Sprintf(`"%s"`, escaped))
 	}
-	partitionBy := strings.Join(quotedTags, ", ")
+	quotedKeys = append(quotedKeys, `"time"`)
+	partitionBy := strings.Join(quotedKeys, ", ")
 
 	stage := fmt.Sprintf(
 		`CREATE OR REPLACE TEMP TABLE %s AS SELECT * REPLACE (%s) FROM read_parquet(%s, union_by_name=true)`,
@@ -184,7 +220,7 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 		COPY (
 			SELECT * FROM %s
 			QUALIFY ROW_NUMBER() OVER (
-				PARTITION BY %s, "time"
+				PARTITION BY %s
 				ORDER BY "time" DESC
 			) = 1
 			%s
