@@ -138,7 +138,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 
 	// Convert SQL to storage paths (with caching)
 	// If headerDB is set, uses optimized path that skips db.table regex patterns
-	convertedSQL, _ := h.getTransformedSQL(req.SQL, headerDB)
+	convertedSQL, _ := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
 
 	h.logger.Debug().
 		Str("original_sql", req.SQL).

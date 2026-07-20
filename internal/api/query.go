@@ -1520,7 +1520,7 @@ localProcessing:
 	}
 
 	// Convert SQL to storage paths and check for parallel execution opportunity
-	convertedSQL, parallelInfo, cached := h.getTransformedSQLForParallel(req.SQL, headerDB)
+	convertedSQL, parallelInfo, cached := h.getTransformedSQLForParallel(c.Context(), req.SQL, headerDB)
 
 	if h.debugEnabled {
 		h.logger.Debug().
@@ -2181,7 +2181,7 @@ var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join([]strin
 // getTransformedSQL returns the transformed SQL with caching.
 // If headerDB is non-empty, uses the optimized path with that database for all tables.
 // Returns the transformed SQL and whether it was a cache hit.
-func (h *QueryHandler) getTransformedSQL(sql string, headerDB string) (string, bool) {
+func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, headerDB string) (string, bool) {
 	// Fast path: queries already using read_parquet don't need transformation
 	sqlLower := strings.ToLower(sql)
 	if strings.Contains(sqlLower, "read_parquet") {
@@ -2208,9 +2208,9 @@ func (h *QueryHandler) getTransformedSQL(sql string, headerDB string) (string, b
 	// Transform using appropriate method
 	var transformed string
 	if headerDB != "" {
-		transformed = h.convertSQLToStoragePathsWithHeaderDB(sql, headerDB)
+		transformed = h.convertSQLToStoragePathsWithHeaderDB(ctx, sql, headerDB)
 	} else {
-		transformed = h.convertSQLToStoragePaths(sql)
+		transformed = h.convertSQLToStoragePaths(ctx, sql)
 	}
 
 	h.queryCache.Set(cacheKey, transformed)
@@ -2221,7 +2221,7 @@ func (h *QueryHandler) getTransformedSQL(sql string, headerDB string) (string, b
 // This variant checks if the query can benefit from parallel partition scanning.
 // Only simple single-table queries with header DB can use parallel execution.
 // Returns (sql, parallel_info, cache_hit).
-func (h *QueryHandler) getTransformedSQLForParallel(sql string, headerDB string) (string, *ParallelQueryInfo, bool) {
+func (h *QueryHandler) getTransformedSQLForParallel(ctx context.Context, sql string, headerDB string) (string, *ParallelQueryInfo, bool) {
 	sqlLower := strings.ToLower(sql)
 
 	// Fast paths that don't support parallel execution
@@ -2235,7 +2235,7 @@ func (h *QueryHandler) getTransformedSQLForParallel(sql string, headerDB string)
 	// Parallel execution only supported for simple single-table queries with header DB
 	// Complex queries (JOINs, subqueries, CTEs) fall back to standard execution
 	if headerDB == "" || !isSingleTableQuery(sqlLower) || strings.Contains(sqlLower, "with ") {
-		transformed, cached := h.getTransformedSQL(sql, headerDB)
+		transformed, cached := h.getTransformedSQL(ctx, sql, headerDB)
 		return transformed, nil, cached
 	}
 
@@ -2243,7 +2243,7 @@ func (h *QueryHandler) getTransformedSQLForParallel(sql string, headerDB string)
 	// SUBSTRING/TRIM/OVERLAY need the slow path's FROM-keyword mask.
 	features := scanSQLFeatures(sql)
 	if features.hasQuotes || features.hasDashComment || features.hasBlockComment || sqlutil.ContainsFromKeywordFunction(sql) {
-		transformed, cached := h.getTransformedSQL(sql, headerDB)
+		transformed, cached := h.getTransformedSQL(ctx, sql, headerDB)
 		return transformed, nil, cached
 	}
 
@@ -2255,7 +2255,7 @@ func (h *QueryHandler) getTransformedSQLForParallel(sql string, headerDB string)
 	}
 
 	// Use parallel-aware conversion
-	convertedSQL, parallelInfo := h.convertSingleTableQueryForParallel(sql, sqlLower, headerDB)
+	convertedSQL, parallelInfo := h.convertSingleTableQueryForParallel(ctx, sql, sqlLower, headerDB)
 	return convertedSQL, parallelInfo, false
 }
 
@@ -2266,7 +2266,7 @@ func (h *QueryHandler) getTransformedSQLForParallel(sql string, headerDB string)
 // Converts: JOIN measurement -> JOIN read_parquet('path/**/*.parquet')
 // CTE names are extracted and excluded from conversion to avoid replacing virtual table references.
 // String literals and comments are protected from regex matching.
-func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
+func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string) string {
 	originalSQL := sql
 
 	// Phase 0a: Rewrite regex functions to faster string functions BEFORE masking
@@ -2314,7 +2314,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 			return match
 		}
 		path := h.getStoragePath(parts[1], parts[2])
-		return h.buildReadParquetExpr(path, originalSQL, "FROM")
+		return h.buildReadParquetExpr(ctx, path, originalSQL, "FROM")
 	})
 
 	// Handle JOIN database.table references (includes LATERAL JOIN)
@@ -2324,7 +2324,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 			return match
 		}
 		path := h.getStoragePath(parts[1], parts[2])
-		return h.buildReadParquetExpr(path, originalSQL, "JOIN")
+		return h.buildReadParquetExpr(ctx, path, originalSQL, "JOIN")
 	})
 
 	// Handle FROM simple_table references
@@ -2357,7 +2357,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 		}
 
 		path := h.getStoragePath("default", parts[1])
-		return h.buildReadParquetExpr(path, originalSQL, "FROM")
+		return h.buildReadParquetExpr(ctx, path, originalSQL, "FROM")
 	})
 
 	// Handle JOIN simple_table references (includes LATERAL JOIN)
@@ -2390,7 +2390,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 		}
 
 		path := h.getStoragePath("default", parts[1])
-		return h.buildReadParquetExpr(path, originalSQL, "JOIN")
+		return h.buildReadParquetExpr(ctx, path, originalSQL, "JOIN")
 	})
 
 	// Restore masked FROM keywords and string literals. Both use content-
@@ -2440,7 +2440,7 @@ type ParallelQueryInfo struct {
 // buildReadParquetExpr builds a read_parquet expression with optional partition pruning.
 // keyword is "FROM" or "JOIN" to prepend to the result.
 // If tiering is enabled and cold tier has data, builds a UNION ALL query across tiers.
-func (h *QueryHandler) buildReadParquetExpr(path, originalSQL, keyword string) string {
+func (h *QueryHandler) buildReadParquetExpr(ctx context.Context, path, originalSQL, keyword string) string {
 	// Check if tiering is enabled and cold tier is configured
 	if h.tieringManager != nil {
 		router := h.tieringManager.GetRouter()
@@ -2467,7 +2467,7 @@ func (h *QueryHandler) buildReadParquetExpr(path, originalSQL, keyword string) s
 	options := buildReadParquetOptions()
 
 	// Apply partition pruning
-	optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(path, originalSQL)
+	optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(ctx, path, originalSQL)
 
 	if wasOptimized {
 		// Check if it's a list of paths or a single path
@@ -2496,7 +2496,7 @@ func (h *QueryHandler) buildReadParquetExpr(path, originalSQL, keyword string) s
 // buildReadParquetExprForMeasurement builds a read_parquet expression for a database/measurement pair.
 // This is the tiering-aware version used by the fast path that takes database and measurement
 // separately instead of a pre-constructed path, allowing proper tiering metadata lookup.
-func (h *QueryHandler) buildReadParquetExprForMeasurement(database, measurement, originalSQL, keyword string) string {
+func (h *QueryHandler) buildReadParquetExprForMeasurement(ctx context.Context, database, measurement, originalSQL, keyword string) string {
 	// Check if tiering is enabled and cold tier is configured
 	if h.tieringManager != nil {
 		router := h.tieringManager.GetRouter()
@@ -2517,17 +2517,17 @@ func (h *QueryHandler) buildReadParquetExprForMeasurement(database, measurement,
 
 	// Fall back to single-tier behavior (hot tier only)
 	path := h.getStoragePath(database, measurement)
-	return h.buildReadParquetExpr(path, originalSQL, keyword)
+	return h.buildReadParquetExpr(ctx, path, originalSQL, keyword)
 }
 
 // buildReadParquetExprForParallel builds a read_parquet expression and returns
 // parallel execution info if the query can benefit from parallel partition scanning.
 // Returns (sql_expression, parallel_info) where parallel_info is non-nil if parallel is recommended.
-func (h *QueryHandler) buildReadParquetExprForParallel(path, originalSQL, keyword string) (string, *ParallelQueryInfo) {
+func (h *QueryHandler) buildReadParquetExprForParallel(ctx context.Context, path, originalSQL, keyword string) (string, *ParallelQueryInfo) {
 	options := buildReadParquetOptions()
 
 	// Apply partition pruning
-	optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(path, originalSQL)
+	optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(ctx, path, originalSQL)
 
 	if wasOptimized {
 		if pathList, ok := optimizedPath.([]string); ok {
@@ -2729,7 +2729,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(database, measurement string, t
 
 // convertSingleTableQuery is a fast path for simple single-table queries.
 // It avoids regex entirely by using simple string manipulation.
-func (h *QueryHandler) convertSingleTableQuery(sql, sqlLower, database string) string {
+func (h *QueryHandler) convertSingleTableQuery(ctx context.Context, sql, sqlLower, database string) string {
 	// Find "FROM table" position
 	idx := strings.Index(sqlLower, "from ")
 	if idx < 0 {
@@ -2761,14 +2761,14 @@ func (h *QueryHandler) convertSingleTableQuery(sql, sqlLower, database string) s
 	}
 
 	// Build replacement - use tiering-aware method that checks both hot and cold tiers
-	replacement := h.buildReadParquetExprForMeasurement(database, tableName, sql, "FROM")
+	replacement := h.buildReadParquetExprForMeasurement(ctx, database, tableName, sql, "FROM")
 
 	return sql[:idx] + replacement + sql[end:]
 }
 
 // convertSingleTableQueryForParallel is a variant that returns parallel execution info.
 // Returns (converted_sql, parallel_info) where parallel_info is non-nil if parallel execution is recommended.
-func (h *QueryHandler) convertSingleTableQueryForParallel(sql, sqlLower, database string) (string, *ParallelQueryInfo) {
+func (h *QueryHandler) convertSingleTableQueryForParallel(ctx context.Context, sql, sqlLower, database string) (string, *ParallelQueryInfo) {
 	// Find "FROM table" position
 	idx := strings.Index(sqlLower, "from ")
 	if idx < 0 {
@@ -2814,7 +2814,7 @@ func (h *QueryHandler) convertSingleTableQueryForParallel(sql, sqlLower, databas
 
 	// Build replacement with parallel info (hot tier only)
 	path := h.getStoragePath(database, tableName)
-	replacement, parallelInfo := h.buildReadParquetExprForParallel(path, sql, "FROM")
+	replacement, parallelInfo := h.buildReadParquetExprForParallel(ctx, path, sql, "FROM")
 
 	convertedSQL := sql[:idx] + replacement + sql[end:]
 
@@ -2830,7 +2830,7 @@ func (h *QueryHandler) convertSingleTableQueryForParallel(sql, sqlLower, databas
 // the database specified in the x-arc-database header. This is an optimized path that
 // skips the database.table regex patterns since all tables use the header-specified database.
 // This provides ~50% reduction in regex operations compared to convertSQLToStoragePaths.
-func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database string) string {
+func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context, sql string, database string) string {
 	originalSQL := sql
 	sqlLower := strings.ToLower(sql)
 
@@ -2853,7 +2853,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database
 				sql = rewriteDateTrunc(sql)
 				sqlLower = strings.ToLower(sql)
 			}
-			return h.convertSingleTableQuery(sql, sqlLower, database)
+			return h.convertSingleTableQuery(ctx, sql, sqlLower, database)
 		}
 	}
 
@@ -2919,7 +2919,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database
 
 		// Use header database instead of "default"
 		path := h.getStoragePath(database, parts[1])
-		return h.buildReadParquetExpr(path, originalSQL, "FROM")
+		return h.buildReadParquetExpr(ctx, path, originalSQL, "FROM")
 	})
 
 	// Handle JOIN simple_table references - apply header database
@@ -2953,7 +2953,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database
 
 		// Use header database instead of "default"
 		path := h.getStoragePath(database, parts[1])
-		return h.buildReadParquetExpr(path, originalSQL, "JOIN")
+		return h.buildReadParquetExpr(ctx, path, originalSQL, "JOIN")
 	})
 
 	// Restore masked FROM keywords and original string literals.
@@ -3470,7 +3470,7 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	}
 
 	// Convert SQL to storage paths (with caching)
-	convertedSQL, _ := h.getTransformedSQL(req.SQL, headerDB)
+	convertedSQL, _ := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
 
 	// Create a COUNT(*) version of the query
 	countSQL := "SELECT COUNT(*) FROM (" + convertedSQL + ") AS t"
@@ -3830,7 +3830,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 
 	// Convert SQL to storage paths (with caching)
 	// Note: This endpoint builds its own db.measurement SQL, so no header optimization
-	convertedSQL, _ := h.getTransformedSQL(sql, "")
+	convertedSQL, _ := h.getTransformedSQL(c.Context(), sql, "")
 
 	h.logger.Debug().
 		Str("measurement", measurement).
