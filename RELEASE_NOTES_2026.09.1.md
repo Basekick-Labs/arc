@@ -45,6 +45,16 @@ Separately, the pruner's two internal TTL caches (glob results and partition pat
 
 Reachable in every deployment mode (the pruner runs on every `FROM`/`JOIN` query); pre-existing on `main`, unrelated to any other work in this release.
 
+## Bug fixes
+
+### `date_trunc`/`time_bucket` epoch rewrite no longer corrupts parenthesized column arguments ([#535](https://github.com/Basekick-Labs/arc/issues/535))
+
+Arc rewrites `date_trunc('hour', col)` (and `time_bucket(...)`) into faster epoch arithmetic. The rewriter extracted the column argument with a paren-blind regex that stopped at the **first** `)` rather than the matching one. When the column argument itself contained parentheses — `coalesce(time, a)`, `(time)`, `CAST(ts AS TIMESTAMP)`, or any nested call — the capture was truncated and the `::BIGINT` cast was spliced into the wrong place, producing SQL that failed at the DuckDB binder (`No function matches ... 'epoch(BIGINT)'`) on a query DuckDB would otherwise have run correctly.
+
+This was an **availability** bug, not a wrong-answer bug: every corrupted form failed loudly at the binder rather than returning a wrong number.
+
+The fix leaves any `date_trunc`/`time_bucket` call whose column argument contains a parenthesis **unrewritten**, so DuckDB evaluates it natively — correct results, just without the epoch optimization for that one call. The common `date_trunc('hour', time)` bare-column form is unaffected and still gets the optimization; a query mixing both forms optimizes the bare one and passes the parenthesized one through. Introduced in `161be30` (2026-01-07); present on `main`.
+
 ## Impact by deployment mode
 
 The forwarding-header and loop-guard changes are cluster-only; the partition-pruner DoS fix (#536) applies to **every** deployment mode, since the pruner runs on every query.
