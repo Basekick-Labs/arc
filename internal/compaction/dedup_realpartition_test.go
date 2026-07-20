@@ -72,7 +72,7 @@ func TestDedupCompaction_RealPartition(t *testing.T) {
 
 	// Step 1: real files only (all TIMESTAMPTZ) — must bind.
 	out1 := filepath.ToSlash(filepath.Join(t.TempDir(), "real.parquet"))
-	if err := execCompaction(ctx, db, quote(files), `ORDER BY "time"`, out1, []string{"host"}); err != nil {
+	if err := execCompaction(ctx, db, quote(files), `ORDER BY "time"`, out1, []string{"host"}, false); err != nil {
 		t.Fatalf("dedup compaction wedged on real all-TIMESTAMPTZ files: %v", err)
 	}
 	var baseRows int
@@ -98,7 +98,7 @@ func TestDedupCompaction_RealPartition(t *testing.T) {
 		t.Fatalf("write varchar dup: %v", err)
 	}
 	out2 := filepath.ToSlash(filepath.Join(tmp, "withdup.parquet"))
-	if err := execCompaction(ctx, db, quote(append(files, vc)), `ORDER BY "time"`, out2, []string{"host"}); err != nil {
+	if err := execCompaction(ctx, db, quote(append(files, vc)), `ORDER BY "time"`, out2, []string{"host"}, false); err != nil {
 		t.Fatalf("dedup compaction wedged with injected VARCHAR-time file: %v", err)
 	}
 	var dupRows int

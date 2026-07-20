@@ -17,20 +17,20 @@ import (
 // on a single pinned connection — mirroring the production caller in job.go. The
 // pin is required, not cosmetic: the dedup path's TEMP table is connection-local
 // and database/sql does not guarantee two ExecContext calls share a connection.
-func execCompaction(ctx context.Context, db *sql.DB, fileListSQL, orderByClause, outputFile string, tagColumns []string) error {
+func execCompaction(ctx context.Context, db *sql.DB, fileListSQL, orderByClause, outputFile string, tagColumns []string, dedupTime bool) error {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		if len(tagColumns) > 0 {
+		if len(tagColumns) > 0 || dedupTime {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_, _ = conn.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS "+dedupStagingTable)
 		}
 		conn.Close()
 	}()
-	for _, stmt := range buildCompactionQuery(fileListSQL, orderByClause, outputFile, tagColumns) {
+	for _, stmt := range buildCompactionQuery(fileListSQL, orderByClause, outputFile, tagColumns, dedupTime) {
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			return err
 		}
@@ -89,7 +89,7 @@ func TestBuildCompactionQuery_DedupMixedTimeType(t *testing.T) {
 	}
 
 	fileList := fmt.Sprintf("['%s', '%s']", escapeSQLPath(fileTZ), escapeSQLPath(fileStr))
-	if err := execCompaction(ctx, db, fileList, `ORDER BY "time"`, out, []string{"host"}); err != nil {
+	if err := execCompaction(ctx, db, fileList, `ORDER BY "time"`, out, []string{"host"}, false); err != nil {
 		t.Fatalf("compaction query failed (bind error regression?): %v", err)
 	}
 
@@ -163,7 +163,7 @@ func TestBuildCompactionQuery_StandardMixedTimeType(t *testing.T) {
 
 	fileList := fmt.Sprintf("['%s', '%s']", escapeSQLPath(fileTZ), escapeSQLPath(fileStr))
 	// nil tagColumns → standard branch.
-	if err := execCompaction(ctx, db, fileList, `ORDER BY "time"`, out, nil); err != nil {
+	if err := execCompaction(ctx, db, fileList, `ORDER BY "time"`, out, nil, false); err != nil {
 		t.Fatalf("standard compaction query failed (bind error regression?): %v", err)
 	}
 
@@ -182,5 +182,55 @@ func TestBuildCompactionQuery_StandardMixedTimeType(t *testing.T) {
 	}
 	if colType != "TIMESTAMP WITH TIME ZONE" {
 		t.Errorf("output time type = %q, want TIMESTAMP WITH TIME ZONE", colType)
+	}
+}
+
+// TestBuildCompactionQuery_DedupTimeOnly is the #521 no-group-by CQ path against
+// real DuckDB: NO tag columns, dedupTime=true. Two files carry the SAME "time"
+// (a window re-emitted twice by a crash-retry); dedup on time alone must collapse
+// them to exactly one row. Without the dedupTime flag these would both survive
+// (the standard branch keeps distinct rows), so this proves the marker is what
+// makes a tagless CQ idempotent.
+func TestBuildCompactionQuery_DedupTimeOnlyDuckDB(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	if _, err := db.ExecContext(ctx, "SET TimeZone='Etc/GMT+3'"); err != nil {
+		t.Fatalf("set tz: %v", err)
+	}
+
+	fileA := filepath.ToSlash(filepath.Join(dir, "a.parquet"))
+	fileB := filepath.ToSlash(filepath.Join(dir, "b.parquet"))
+	out := filepath.ToSlash(filepath.Join(dir, "out.parquet"))
+
+	// Same window (same "time"), no tag column — two emissions of a no-group-by
+	// aggregate. avg differs (2.0 vs 2.5) but they are the same window; dedup
+	// keeps the newest by "time" DESC (a tie here, so exactly one survives).
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(
+		`COPY (SELECT make_timestamptz(1609459200000000) AS "time", 2.0 AS avg_v) TO '%s' (FORMAT PARQUET)`, escapeSQLPath(fileA))); err != nil {
+		t.Fatalf("write fixture a: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(
+		`COPY (SELECT make_timestamptz(1609459200000000) AS "time", 2.5 AS avg_v) TO '%s' (FORMAT PARQUET)`, escapeSQLPath(fileB))); err != nil {
+		t.Fatalf("write fixture b: %v", err)
+	}
+
+	fileList := fmt.Sprintf("['%s', '%s']", escapeSQLPath(fileA), escapeSQLPath(fileB))
+	// nil tagColumns, dedupTime=true → PARTITION BY "time" alone.
+	if err := execCompaction(ctx, db, fileList, `ORDER BY "time"`, out, nil, true); err != nil {
+		t.Fatalf("dedup-time compaction failed: %v", err)
+	}
+
+	var rows int
+	if err := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT count(*) FROM read_parquet('%s')`, escapeSQLPath(out))).Scan(&rows); err != nil {
+		t.Fatalf("count output: %v", err)
+	}
+	if rows != 1 {
+		t.Errorf("dedup-time produced %d rows, want 1 (same-time rows must collapse)", rows)
 	}
 }
