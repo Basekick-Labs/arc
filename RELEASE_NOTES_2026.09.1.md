@@ -100,6 +100,10 @@ The per-request SQL-transform cache (which memoizes rewriting `FROM db.measureme
 
 Per-op benchmarks on the cache: `Get` **257 ns → 71 ns**, `Set` **269 ns → 86 ns**, and each drops from **192 B / 4 allocations to zero allocations**. This is a per-request improvement (it removes allocation pressure from the query path); it does not affect the time DuckDB spends executing a query, so end-to-end latency on large scans is unchanged. This change only swaps the hash and key — the cache's existing sharding, sizing, and eviction are untouched.
 
+### Centralized memory-release throttle ([#421](https://github.com/Basekick-Labs/arc/issues/421))
+
+The three copies of the 30-second memory-release debounce (the post-delete/retention `debug.FreeOSMemory` throttle, the `/api/v1/debug/free-os-memory` endpoint, and the Linux `malloc_trim` throttle) are now a single `internal/throttle.Debouncer`. Behavior is unchanged — same monotonic-clock window and the same first-call sentinel that fires the very first request rather than throttling it. One minor improvement: when two callers race the `/api/v1/debug/free-os-memory` endpoint at the same instant and one loses, the loser's `429` response now includes a `retry_after_seconds` hint (previously it was omitted only in that narrow race).
+
 ## Impact by deployment mode
 
 The forwarding-header and loop-guard changes are cluster-only; the partition-pruner DoS fix (#536) applies to **every** deployment mode, since the pruner runs on every query.
