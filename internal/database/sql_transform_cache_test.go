@@ -198,12 +198,68 @@ func BenchmarkQueryCache_Set(b *testing.B) {
 	}
 }
 
-// BenchmarkQueryCache_Hash benchmarks the hash function overhead
+// BenchmarkQueryCache_Hash benchmarks the per-call key-hashing overhead — the
+// FNV-1a shard selection that replaced the old SHA256+hex key derivation (#331).
 func BenchmarkQueryCache_Hash(b *testing.B) {
+	cache := NewQueryCache(time.Minute, 100)
 	testSQL := "SELECT * FROM mydb.cpu WHERE time > 1609459200000000 AND host = 'server01' GROUP BY time ORDER BY time DESC LIMIT 100"
 
+	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		queryHash(testSQL)
+		cache.shardFor(testSQL)
+	}
+}
+
+// TestQueryCache_DistinctKeysNoCollision verifies that different SQL strings are
+// stored as distinct entries even when they hash to the same shard — the map key
+// is the full SQL string, so there is no cross-query collision (#331). Uses many
+// distinct queries so some necessarily share a shard (pigeonhole: >16 keys).
+func TestQueryCache_DistinctKeysNoCollision(t *testing.T) {
+	cache := NewQueryCache(time.Minute, 100000)
+
+	const n = 500
+	for i := 0; i < n; i++ {
+		sql := fmt.Sprintf("SELECT * FROM db.m WHERE id = %d", i)
+		cache.Set(sql, fmt.Sprintf("transformed_%d", i))
+	}
+
+	// Every query must return its OWN transformed value, never another's.
+	for i := 0; i < n; i++ {
+		sql := fmt.Sprintf("SELECT * FROM db.m WHERE id = %d", i)
+		got, ok := cache.Get(sql)
+		if !ok {
+			t.Fatalf("query %d missing from cache", i)
+		}
+		want := fmt.Sprintf("transformed_%d", i)
+		if got != want {
+			t.Fatalf("query %d returned wrong value: got %q, want %q (cross-key collision)", i, got, want)
+		}
+	}
+}
+
+// TestQueryCache_ShardDistribution verifies FNV-1a spreads distinct keys across
+// all shards rather than piling them into a few (the old scheme keyed the shard
+// off the first hex character of a SHA256 digest). We don't require perfect
+// balance — just that every shard receives at least one of a large key set, so
+// no shard is starved and none is a hotspot for the whole workload.
+func TestQueryCache_ShardDistribution(t *testing.T) {
+	cache := NewQueryCache(time.Minute, 1000000)
+
+	used := make(map[*cacheShard]int)
+	for i := 0; i < 10000; i++ {
+		sql := fmt.Sprintf("SELECT col_%d FROM measurement_%d WHERE ts > %d", i%97, i%53, i)
+		used[cache.shardFor(sql)]++
+	}
+
+	if len(used) != cacheShardCount {
+		t.Errorf("expected all %d shards to receive keys, got %d distinct shards", cacheShardCount, len(used))
+	}
+	// Sanity: no shard should hold a wildly disproportionate share. With 10k keys
+	// over 16 shards the mean is 625; flag if any shard exceeds 3x the mean.
+	for shard, count := range used {
+		if count > 3*(10000/cacheShardCount) {
+			t.Errorf("shard %p over-loaded: %d keys (mean ~%d) — poor distribution", shard, count, 10000/cacheShardCount)
+		}
 	}
 }

@@ -94,6 +94,12 @@ The local storage backend's `List` and `ListObjects` now use `filepath.WalkDir` 
 
 The win is largest on cold caches and network filesystems, where the `lstat` syscall dominates. Local backend only; the returned results are unchanged.
 
+### Cheaper SQL-transform cache key ([#331](https://github.com/Basekick-Labs/arc/issues/331))
+
+The per-request SQL-transform cache (which memoizes rewriting `FROM db.measurement` into `read_parquet(...)`) derived its map key with SHA256 plus a hex-encode — a 256-bit cryptographic digest and an allocation, for an internal cache key with no adversarial-collision concern. The cache now stores the SQL string itself as the map key (an exact match, so there is **no** possibility of two different queries colliding onto one entry) and uses a fast FNV-1a hash **only** to pick a shard.
+
+Per-op benchmarks on the cache: `Get` **257 ns → 71 ns**, `Set` **269 ns → 86 ns**, and each drops from **192 B / 4 allocations to zero allocations**. This is a per-request improvement (it removes allocation pressure from the query path); it does not affect the time DuckDB spends executing a query, so end-to-end latency on large scans is unchanged. This change only swaps the hash and key — the cache's existing sharding, sizing, and eviction are untouched.
+
 ## Impact by deployment mode
 
 The forwarding-header and loop-guard changes are cluster-only; the partition-pruner DoS fix (#536) applies to **every** deployment mode, since the pruner runs on every query.

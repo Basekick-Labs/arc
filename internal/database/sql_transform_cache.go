@@ -1,8 +1,7 @@
 package database
 
 import (
-	"crypto/sha256"
-	"fmt"
+	"hash/fnv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -84,25 +83,30 @@ func NewQueryCache(ttl time.Duration, maxSize int) *SQLTransformCache {
 // QueryCache is an alias for SQLTransformCache (backwards compatibility)
 type QueryCache = SQLTransformCache
 
-// queryHash generates a cache key from SQL using SHA256
-func queryHash(sql string) string {
-	return fmt.Sprintf("%x", sha256.Sum256([]byte(sql)))
-}
-
-// getShard returns the shard for a given hash using the first byte
-func (c *SQLTransformCache) getShard(hash string) *cacheShard {
-	// Use first byte of hash for shard selection (0-255 mod 16 = 0-15)
-	idx := uint8(hash[0]) % cacheShardCount
+// shardFor selects a shard for a cache key using FNV-1a.
+//
+// The full key string is stored as the map key (see Get/Set), so lookups are an
+// exact string match — there is NO risk of two different queries colliding onto
+// one entry, unlike a scheme that hashes the SQL into the key. This hash is used
+// ONLY to pick a shard: a hash collision here merely lands two distinct keys in
+// the same shard, which is harmless (they remain separate map entries). That
+// lets us use a fast non-cryptographic hash — SHA256 was needlessly expensive
+// (a 256-bit crypto digest plus a hex-encoding allocation) for an internal cache
+// key with no adversarial-collision concern (#331).
+func (c *SQLTransformCache) shardFor(key string) *cacheShard {
+	h := fnv.New32a()
+	// fnv Write never returns an error; ignore it.
+	_, _ = h.Write([]byte(key))
+	idx := h.Sum32() % cacheShardCount
 	return c.shards[idx]
 }
 
 // Get retrieves a cached transformed SQL if it exists and hasn't expired
 func (c *SQLTransformCache) Get(sql string) (string, bool) {
-	hash := queryHash(sql)
-	shard := c.getShard(hash)
+	shard := c.shardFor(sql)
 
 	shard.mu.RLock()
-	entry, ok := shard.entries[hash]
+	entry, ok := shard.entries[sql]
 	shard.mu.RUnlock()
 
 	if !ok {
@@ -121,8 +125,7 @@ func (c *SQLTransformCache) Get(sql string) (string, bool) {
 
 // Set stores a transformed SQL in the cache
 func (c *SQLTransformCache) Set(sql, transformed string) {
-	hash := queryHash(sql)
-	shard := c.getShard(hash)
+	shard := c.shardFor(sql)
 
 	shard.mu.Lock()
 
@@ -156,7 +159,7 @@ func (c *SQLTransformCache) Set(sql, transformed string) {
 		}
 	}
 
-	shard.entries[hash] = sqlTransformCacheEntry{
+	shard.entries[sql] = sqlTransformCacheEntry{
 		transformed: transformed,
 		expiresAt:   time.Now().Add(c.ttl),
 	}
