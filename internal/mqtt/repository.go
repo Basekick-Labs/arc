@@ -178,11 +178,14 @@ func (r *Repository) Create(ctx context.Context, sub *Subscription) error {
 		username, password_encrypted, tls_enabled, tls_cert_path,
 		tls_key_path, tls_ca_path, tls_insecure_skip_verify, auto_start,
 		status, error_message, topic_mapping, keep_alive_seconds,
-		connect_timeout_seconds, reconnect_min_seconds, reconnect_max_seconds,
+		connect_timeout_seconds, reconnect_max_seconds,
 		clean_session, created_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
+	// Note: reconnect_min_seconds is intentionally omitted — the column remains
+	// (nullable, DEFAULT 1) to avoid a destructive migration, but ReconnectMin is
+	// dead config that paho ignores, so it is no longer written or read (#327).
 	_, err = r.db.ExecContext(ctx, query,
 		sub.ID, sub.Name, sub.Broker, sub.ClientID, string(topicsJSON),
 		sub.QoS, sub.Database, sub.Username, sub.PasswordEncrypted,
@@ -190,7 +193,7 @@ func (r *Repository) Create(ctx context.Context, sub *Subscription) error {
 		sub.TLSCAPath, boolToInt(sub.TLSInsecureSkipVerify),
 		boolToInt(sub.AutoStart), string(sub.Status), sub.ErrorMessage,
 		nullableString(topicMappingJSON), sub.KeepAliveSeconds,
-		sub.ConnectTimeoutSeconds, sub.ReconnectMinSeconds,
+		sub.ConnectTimeoutSeconds,
 		sub.ReconnectMaxSeconds, boolToInt(sub.CleanSession),
 		sub.CreatedAt.Format(time.RFC3339),
 		sub.UpdatedAt.Format(time.RFC3339),
@@ -213,7 +216,7 @@ func (r *Repository) Get(ctx context.Context, id string) (*Subscription, error) 
 		username, password_encrypted, tls_enabled, tls_cert_path,
 		tls_key_path, tls_ca_path, tls_insecure_skip_verify, auto_start,
 		status, error_message, topic_mapping, keep_alive_seconds,
-		connect_timeout_seconds, reconnect_min_seconds, reconnect_max_seconds,
+		connect_timeout_seconds, reconnect_max_seconds,
 		clean_session, created_at, updated_at
 	FROM mqtt_subscriptions
 	WHERE id = ?
@@ -229,7 +232,7 @@ func (r *Repository) GetByName(ctx context.Context, name string) (*Subscription,
 		username, password_encrypted, tls_enabled, tls_cert_path,
 		tls_key_path, tls_ca_path, tls_insecure_skip_verify, auto_start,
 		status, error_message, topic_mapping, keep_alive_seconds,
-		connect_timeout_seconds, reconnect_min_seconds, reconnect_max_seconds,
+		connect_timeout_seconds, reconnect_max_seconds,
 		clean_session, created_at, updated_at
 	FROM mqtt_subscriptions
 	WHERE name = ?
@@ -245,7 +248,7 @@ func (r *Repository) List(ctx context.Context) ([]*Subscription, error) {
 		username, password_encrypted, tls_enabled, tls_cert_path,
 		tls_key_path, tls_ca_path, tls_insecure_skip_verify, auto_start,
 		status, error_message, topic_mapping, keep_alive_seconds,
-		connect_timeout_seconds, reconnect_min_seconds, reconnect_max_seconds,
+		connect_timeout_seconds, reconnect_max_seconds,
 		clean_session, created_at, updated_at
 	FROM mqtt_subscriptions
 	ORDER BY name
@@ -280,7 +283,7 @@ func (r *Repository) ListAutoStart(ctx context.Context) ([]*Subscription, error)
 		username, password_encrypted, tls_enabled, tls_cert_path,
 		tls_key_path, tls_ca_path, tls_insecure_skip_verify, auto_start,
 		status, error_message, topic_mapping, keep_alive_seconds,
-		connect_timeout_seconds, reconnect_min_seconds, reconnect_max_seconds,
+		connect_timeout_seconds, reconnect_max_seconds,
 		clean_session, created_at, updated_at
 	FROM mqtt_subscriptions
 	WHERE auto_start = 1
@@ -336,11 +339,13 @@ func (r *Repository) Update(ctx context.Context, sub *Subscription) error {
 		tls_ca_path = ?, tls_insecure_skip_verify = ?, auto_start = ?,
 		status = ?, error_message = ?, topic_mapping = ?,
 		keep_alive_seconds = ?, connect_timeout_seconds = ?,
-		reconnect_min_seconds = ?, reconnect_max_seconds = ?,
+		reconnect_max_seconds = ?,
 		clean_session = ?, updated_at = ?
 	WHERE id = ?
 	`
 
+	// reconnect_min_seconds is left untouched (dead config, see Create) — the
+	// column keeps its existing/default value and is never read back (#327).
 	result, err := r.db.ExecContext(ctx, query,
 		sub.Name, sub.Broker, sub.ClientID, string(topicsJSON),
 		sub.QoS, sub.Database, sub.Username, sub.PasswordEncrypted,
@@ -348,7 +353,7 @@ func (r *Repository) Update(ctx context.Context, sub *Subscription) error {
 		sub.TLSCAPath, boolToInt(sub.TLSInsecureSkipVerify),
 		boolToInt(sub.AutoStart), string(sub.Status), sub.ErrorMessage,
 		nullableString(topicMappingJSON), sub.KeepAliveSeconds,
-		sub.ConnectTimeoutSeconds, sub.ReconnectMinSeconds,
+		sub.ConnectTimeoutSeconds,
 		sub.ReconnectMaxSeconds, boolToInt(sub.CleanSession),
 		sub.UpdatedAt.Format(time.RFC3339),
 		sub.ID,
@@ -431,7 +436,7 @@ func (r *Repository) scanSubscription(row *sql.Row) (*Subscription, error) {
 		&tlsEnabled, &sub.TLSCertPath, &sub.TLSKeyPath, &sub.TLSCAPath,
 		&tlsInsecureSkipVerify, &autoStart, &status, &sub.ErrorMessage,
 		&topicMappingJSON, &sub.KeepAliveSeconds, &sub.ConnectTimeoutSeconds,
-		&sub.ReconnectMinSeconds, &sub.ReconnectMaxSeconds,
+		&sub.ReconnectMaxSeconds,
 		&cleanSession, &createdAt, &updatedAt,
 	)
 
@@ -484,7 +489,7 @@ func (r *Repository) scanSubscriptionRow(rows *sql.Rows) (*Subscription, error) 
 		&tlsEnabled, &sub.TLSCertPath, &sub.TLSKeyPath, &sub.TLSCAPath,
 		&tlsInsecureSkipVerify, &autoStart, &status, &sub.ErrorMessage,
 		&topicMappingJSON, &sub.KeepAliveSeconds, &sub.ConnectTimeoutSeconds,
-		&sub.ReconnectMinSeconds, &sub.ReconnectMaxSeconds,
+		&sub.ReconnectMaxSeconds,
 		&cleanSession, &createdAt, &updatedAt,
 	)
 
