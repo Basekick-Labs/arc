@@ -105,7 +105,7 @@ func (s *Subscriber) Start() error {
 
 	s.mu.Lock()
 	s.running = true
-	s.connectedSince = time.Now()
+	s.connectedSince = time.Now().UTC()
 	s.mu.Unlock()
 
 	s.logger.Info().Msg("Connected to MQTT broker")
@@ -156,18 +156,24 @@ func (s *Subscriber) GetStats() *SubscriptionStats {
 	if s.running {
 		status = "running"
 	}
-	connectedSince := s.connectedSince
+	// connectedSince is nil until the subscriber has connected; a pointer so the
+	// stats response omits it (rather than "0001-01-01T00:00:00Z") when unset.
+	var connectedSince *time.Time
+	if !s.connectedSince.IsZero() {
+		cs := s.connectedSince // already UTC (set with time.Now().UTC())
+		connectedSince = &cs
+	}
 	s.mu.RUnlock()
 
 	// lastMessageAt lives in an atomic (off the message hot path). 0 nanos means
-	// no message has been received yet — map it to the zero time.Time so the
-	// response renders exactly as before (0001-01-01T00:00:00Z; note encoding/json
-	// does not actually omit a zero time.Time despite the omitempty tag). The 0
-	// sentinel collides with the Unix epoch instant, but time.Now() never returns
-	// it in practice, so a real message can't be misread as "never received".
-	var lastMessageAt time.Time
+	// no message received yet → leave the pointer nil so omitempty omits the
+	// field (#546). The 0 sentinel collides with the Unix epoch instant, but
+	// time.Now() never returns it in practice. Reconstruct in UTC to match the
+	// rest of Arc's timestamps.
+	var lastMessageAt *time.Time
 	if nanos := s.lastMessageAtNanos.Load(); nanos != 0 {
-		lastMessageAt = time.Unix(0, nanos)
+		t := time.Unix(0, nanos).UTC()
+		lastMessageAt = &t
 	}
 
 	return &SubscriptionStats{
@@ -291,7 +297,7 @@ func (s *Subscriber) onConnect(client pahomqtt.Client) {
 	}
 
 	s.mu.Lock()
-	s.connectedSince = time.Now()
+	s.connectedSince = time.Now().UTC()
 	s.mu.Unlock()
 
 	// Update metrics

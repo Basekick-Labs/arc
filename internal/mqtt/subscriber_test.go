@@ -18,15 +18,15 @@ func newStatsSubscriber() *Subscriber {
 	}
 }
 
-// TestGetStats_LastMessageAt verifies the atomic lastMessageAt (#328): it is the
-// zero time.Time before any message (so omitempty omits it), and reflects the
-// stored nanos after a message.
+// TestGetStats_LastMessageAt verifies lastMessageAt (#328/#546): the pointer is
+// nil before any message (so omitempty omits the field), and after a message it
+// points to the stored instant, reconstructed in UTC.
 func TestGetStats_LastMessageAt(t *testing.T) {
 	s := newStatsSubscriber()
 
-	// Before any message: zero value, so the JSON omitempty tag drops it.
-	if got := s.GetStats().LastMessageAt; !got.IsZero() {
-		t.Errorf("LastMessageAt before any message = %v, want zero", got)
+	// Before any message: nil pointer, so the JSON omitempty tag drops the field.
+	if got := s.GetStats().LastMessageAt; got != nil {
+		t.Errorf("LastMessageAt before any message = %v, want nil", got)
 	}
 
 	// Simulate a message arriving: store the current time as nanos (this is what
@@ -35,12 +35,16 @@ func TestGetStats_LastMessageAt(t *testing.T) {
 	s.lastMessageAtNanos.Store(now.UnixNano())
 
 	got := s.GetStats().LastMessageAt
-	if got.IsZero() {
-		t.Fatal("LastMessageAt after a message should be non-zero")
+	if got == nil {
+		t.Fatal("LastMessageAt after a message should be non-nil")
 	}
-	// Reconstructed time must equal the stored instant to nanosecond precision.
+	// Reconstructed time must equal the stored instant to nanosecond precision...
 	if !got.Equal(now) {
 		t.Errorf("LastMessageAt = %v, want %v (nanos round-trip)", got, now)
+	}
+	// ...and be rendered in UTC (Arc's timestamp convention, #546).
+	if got.Location() != time.UTC {
+		t.Errorf("LastMessageAt location = %v, want UTC", got.Location())
 	}
 }
 
@@ -96,7 +100,7 @@ func TestGetStats_ConcurrentMessageUpdates(t *testing.T) {
 	if s.GetStats().MessagesReceived == 0 {
 		t.Error("expected some messages counted")
 	}
-	if s.GetStats().LastMessageAt.IsZero() {
+	if s.GetStats().LastMessageAt == nil {
 		t.Error("expected LastMessageAt to be set after concurrent updates")
 	}
 }

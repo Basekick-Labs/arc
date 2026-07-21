@@ -64,19 +64,22 @@ type VerifyRequest struct {
 // VerifyLicenseFile(LicenseFile, LicenseSignature) to derive a
 // verified License.
 type VerifyResponse struct {
-	Valid            bool      `json:"valid"`
-	LicenseFile      string    `json:"license_file,omitempty"`      // Base64 canonical License JSON (the SIGNED bytes)
-	LicenseSignature string    `json:"license_signature,omitempty"` // Base64 RSA-PKCS1v15 SHA-256 signature over LicenseFile's decoded bytes
-	Tier             string    `json:"tier,omitempty"`
-	ExpiresAt        time.Time `json:"expires_at,omitempty"`
-	DaysRemaining    int       `json:"days_remaining,omitempty"`
-	Status           string    `json:"status,omitempty"` // active, grace_period, read_only, expired
-	Error            string    `json:"error,omitempty"`
-	MaxCores         int       `json:"max_cores,omitempty"`
-	MaxMachines      int       `json:"max_machines,omitempty"`
-	Features         []string  `json:"features,omitempty"`
-	CustomerID       string    `json:"customer_id,omitempty"`
-	CustomerName     string    `json:"customer_name,omitempty"`
+	Valid            bool   `json:"valid"`
+	LicenseFile      string `json:"license_file,omitempty"`      // Base64 canonical License JSON (the SIGNED bytes)
+	LicenseSignature string `json:"license_signature,omitempty"` // Base64 RSA-PKCS1v15 SHA-256 signature over LicenseFile's decoded bytes
+	Tier             string `json:"tier,omitempty"`
+	// No omitempty: a value time.Time is never omitted by encoding/json, so the
+	// tag was a no-op; drop it to keep the contract honest (#546). This field is
+	// decode-side/debug-only — the authoritative expiry is the signed License.
+	ExpiresAt     time.Time `json:"expires_at"`
+	DaysRemaining int       `json:"days_remaining,omitempty"`
+	Status        string    `json:"status,omitempty"` // active, grace_period, read_only, expired
+	Error         string    `json:"error,omitempty"`
+	MaxCores      int       `json:"max_cores,omitempty"`
+	MaxMachines   int       `json:"max_machines,omitempty"`
+	Features      []string  `json:"features,omitempty"`
+	CustomerID    string    `json:"customer_id,omitempty"`
+	CustomerName  string    `json:"customer_name,omitempty"`
 }
 
 // NewClient creates a new license client
@@ -125,18 +128,19 @@ type ActivateRequest struct {
 // Decoded LicenseFile bytes ARE what was signed; LicenseSignature is
 // RSA-PKCS1v15 SHA-256 over those exact bytes.
 type ActivateResponse struct {
-	Success          bool      `json:"success"`
-	LicenseFile      string    `json:"license_file,omitempty"`      // Base64 canonical License JSON (the SIGNED bytes)
-	LicenseSignature string    `json:"license_signature,omitempty"` // Base64 RSA-PKCS1v15 SHA-256 signature over LicenseFile's decoded bytes
-	ExpiresAt        time.Time `json:"expires_at,omitempty"`
-	Tier             string    `json:"tier,omitempty"`
-	MaxCores         int       `json:"max_cores,omitempty"`
-	Error            string    `json:"error,omitempty"`
-	CustomerID       string    `json:"customer_id,omitempty"`
-	CustomerName     string    `json:"customer_name,omitempty"`
-	Features         []string  `json:"features,omitempty"`
-	DaysRemaining    int       `json:"days_remaining,omitempty"`
-	Status           string    `json:"status,omitempty"`
+	Success          bool   `json:"success"`
+	LicenseFile      string `json:"license_file,omitempty"`      // Base64 canonical License JSON (the SIGNED bytes)
+	LicenseSignature string `json:"license_signature,omitempty"` // Base64 RSA-PKCS1v15 SHA-256 signature over LicenseFile's decoded bytes
+	// No omitempty: a value time.Time is never omitted (#546); tag was a no-op.
+	ExpiresAt     time.Time `json:"expires_at"`
+	Tier          string    `json:"tier,omitempty"`
+	MaxCores      int       `json:"max_cores,omitempty"`
+	Error         string    `json:"error,omitempty"`
+	CustomerID    string    `json:"customer_id,omitempty"`
+	CustomerName  string    `json:"customer_name,omitempty"`
+	Features      []string  `json:"features,omitempty"`
+	DaysRemaining int       `json:"days_remaining,omitempty"`
+	Status        string    `json:"status,omitempty"`
 }
 
 // Activate registers this machine with the license server

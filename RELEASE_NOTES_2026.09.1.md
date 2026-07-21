@@ -89,6 +89,17 @@ MQTT subscriptions accepted a `reconnect_min_seconds` field that was validated, 
 
 This is not a breaking change: an omitted or extra `reconnect_min_seconds` in a request body is simply ignored, and existing MQTT subscription databases are untouched (the underlying column is left in place, unused, so no migration runs). The reconnect behavior itself is unchanged — the minimum was already a fixed 1 second in practice.
 
+### Optional timestamp fields are now omitted when unset, and rendered in UTC ([#546](https://github.com/Basekick-Labs/arc/issues/546))
+
+Several API response fields typed as a Go `time.Time` carried an `omitempty` tag that does nothing — `encoding/json` never omits a `time.Time`, so an unset value rendered as the confusing placeholder `"0001-01-01T00:00:00Z"` rather than being absent. Fields where "unset" is a meaningful state are now proper optional fields (omitted when there is no value):
+
+- MQTT subscription stats: `last_message_at` (no message received yet) and `connected_since` (not connected).
+- API token info: `last_used_at` (a token that has never been used).
+
+The MQTT stats timestamps are also now rendered in **UTC** (matching every other timestamp in the API) instead of the server's local timezone. Two internal/debug-only fields (the license-server response's `expires_at`, the compaction subprocess's `partition_time`) had the misleading `omitempty` dropped for honesty; their values are unchanged.
+
+Minor response-shape change: clients that previously read `"0001-01-01T00:00:00Z"` from these fields will now find them absent. That placeholder carried no information, so this is safe.
+
 ## Performance
 
 ### Faster local-storage directory listing ([#347](https://github.com/Basekick-Labs/arc/issues/347))

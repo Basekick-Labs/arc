@@ -59,14 +59,17 @@ func storePermissions(permissions string) string {
 
 // TokenInfo represents token metadata returned by verify
 type TokenInfo struct {
-	ID          int64      `json:"id"`
-	Name        string     `json:"name"`
-	Description string     `json:"description,omitempty"`
-	Permissions []string   `json:"permissions"`
-	CreatedAt   time.Time  `json:"created_at"`
-	LastUsedAt  time.Time  `json:"last_used_at,omitempty"`
-	Enabled     bool       `json:"enabled"`
-	ExpiresAt   *time.Time `json:"expires_at"`
+	ID          int64     `json:"id"`
+	Name        string    `json:"name"`
+	Description string    `json:"description,omitempty"`
+	Permissions []string  `json:"permissions"`
+	CreatedAt   time.Time `json:"created_at"`
+	// LastUsedAt is a pointer so omitempty omits it for a never-used token — a
+	// value time.Time is never omitted and would render "0001-01-01T00:00:00Z"
+	// (#546). Matches the sibling ExpiresAt pointer.
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+	Enabled    bool       `json:"enabled"`
+	ExpiresAt  *time.Time `json:"expires_at"`
 }
 
 // cacheEntry represents a cached token
@@ -795,7 +798,7 @@ func (am *AuthManager) VerifyToken(token string) *TokenInfo {
 			info.Permissions = strings.Split(permissions.String, ",")
 		}
 		if lastUsedAt.Valid {
-			info.LastUsedAt = lastUsedAt.Time
+			info.LastUsedAt = &lastUsedAt.Time
 		}
 		if expiresAt.Valid {
 			info.ExpiresAt = &expiresAt.Time
@@ -884,7 +887,7 @@ func (am *AuthManager) ListTokens() ([]TokenInfo, error) {
 			info.Permissions = strings.Split(permissions.String, ",")
 		}
 		if lastUsedAt.Valid {
-			info.LastUsedAt = lastUsedAt.Time
+			info.LastUsedAt = &lastUsedAt.Time
 		}
 		if expiresAt.Valid {
 			info.ExpiresAt = &expiresAt.Time
@@ -932,7 +935,7 @@ func (am *AuthManager) GetTokenByID(id int64) (*TokenInfo, error) {
 		info.Permissions = strings.Split(permissions.String, ",")
 	}
 	if lastUsedAt.Valid {
-		info.LastUsedAt = lastUsedAt.Time
+		info.LastUsedAt = &lastUsedAt.Time
 	}
 	if expiresAt.Valid {
 		info.ExpiresAt = &expiresAt.Time

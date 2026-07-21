@@ -126,15 +126,18 @@ type UpdateSubscriptionRequest struct {
 
 // SubscriptionStats contains runtime statistics for a subscription
 type SubscriptionStats struct {
-	ID               string    `json:"id"`
-	Name             string    `json:"name"`
-	Status           string    `json:"status"`
-	MessagesReceived int64     `json:"messages_received"`
-	MessagesFailed   int64     `json:"messages_failed"`
-	BytesReceived    int64     `json:"bytes_received"`
-	LastMessageAt    time.Time `json:"last_message_at,omitempty"`
-	ConnectedSince   time.Time `json:"connected_since,omitempty"`
-	Reconnects       int64     `json:"reconnects"`
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	Status           string `json:"status"`
+	MessagesReceived int64  `json:"messages_received"`
+	MessagesFailed   int64  `json:"messages_failed"`
+	BytesReceived    int64  `json:"bytes_received"`
+	// Pointers so omitempty actually omits them when unset — a value time.Time
+	// is never omitted by encoding/json and would render "0001-01-01T00:00:00Z"
+	// (#546). Set only when real, and always UTC.
+	LastMessageAt  *time.Time `json:"last_message_at,omitempty"`
+	ConnectedSince *time.Time `json:"connected_since,omitempty"`
+	Reconnects     int64      `json:"reconnects"`
 }
 
 // Validate validates the subscription configuration
