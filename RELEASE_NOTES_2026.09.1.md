@@ -83,6 +83,12 @@ The create request now models `qos` as optional: an omitted field still defaults
 
 Related fix in the same handler: an out-of-range or otherwise invalid subscription request now returns **`400 Bad Request`** with the validation message instead of `500 Internal Server Error`.
 
+### Removed the non-functional MQTT `reconnect_min_seconds` setting ([#327](https://github.com/Basekick-Labs/arc/issues/327))
+
+MQTT subscriptions accepted a `reconnect_min_seconds` field that was validated, defaulted, and persisted but **never applied** — the MQTT client library hardcodes the initial reconnect backoff at 1 second and exposes no setter for it, so the value had no effect. It has been removed from the API: create/update request bodies no longer accept it, and it no longer appears in `GET`/`LIST` subscription responses. `reconnect_max_seconds` is unaffected — it still caps the exponential backoff.
+
+This is not a breaking change: an omitted or extra `reconnect_min_seconds` in a request body is simply ignored, and existing MQTT subscription databases are untouched (the underlying column is left in place, unused, so no migration runs). The reconnect behavior itself is unchanged — the minimum was already a fixed 1 second in practice.
+
 ## Performance
 
 ### Faster local-storage directory listing ([#347](https://github.com/Basekick-Labs/arc/issues/347))

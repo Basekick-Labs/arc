@@ -65,11 +65,13 @@ type Subscription struct {
 	TopicMapping          map[string]string  `json:"topic_mapping,omitempty"`
 	KeepAliveSeconds      int                `json:"keep_alive_seconds"`
 	ConnectTimeoutSeconds int                `json:"connect_timeout_seconds"`
-	ReconnectMinSeconds   int                `json:"reconnect_min_seconds"`
-	ReconnectMaxSeconds   int                `json:"reconnect_max_seconds"`
-	CleanSession          bool               `json:"clean_session"`
-	CreatedAt             time.Time          `json:"created_at"`
-	UpdatedAt             time.Time          `json:"updated_at"`
+	// ReconnectMaxSeconds caps paho's exponential reconnect backoff. There is no
+	// ReconnectMinSeconds: paho hardcodes the initial backoff at 1s with no
+	// setter, so a configurable minimum was dead config and was removed (#327).
+	ReconnectMaxSeconds int       `json:"reconnect_max_seconds"`
+	CleanSession        bool      `json:"clean_session"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
 }
 
 // CreateSubscriptionRequest is the request body for creating a subscription
@@ -95,7 +97,6 @@ type CreateSubscriptionRequest struct {
 	TopicMapping          map[string]string `json:"topic_mapping,omitempty"`
 	KeepAliveSeconds      int               `json:"keep_alive_seconds"`
 	ConnectTimeoutSeconds int               `json:"connect_timeout_seconds"`
-	ReconnectMinSeconds   int               `json:"reconnect_min_seconds"`
 	ReconnectMaxSeconds   int               `json:"reconnect_max_seconds"`
 	CleanSession          bool              `json:"clean_session"`
 }
@@ -119,7 +120,6 @@ type UpdateSubscriptionRequest struct {
 	TopicMapping          *map[string]string `json:"topic_mapping,omitempty"`
 	KeepAliveSeconds      *int               `json:"keep_alive_seconds,omitempty"`
 	ConnectTimeoutSeconds *int               `json:"connect_timeout_seconds,omitempty"`
-	ReconnectMinSeconds   *int               `json:"reconnect_min_seconds,omitempty"`
 	ReconnectMaxSeconds   *int               `json:"reconnect_max_seconds,omitempty"`
 	CleanSession          *bool              `json:"clean_session,omitempty"`
 }
@@ -203,14 +203,8 @@ func (s *Subscription) Validate() error {
 	if s.ConnectTimeoutSeconds < 0 {
 		return errors.New("connect_timeout_seconds cannot be negative")
 	}
-	if s.ReconnectMinSeconds < 0 {
-		return errors.New("reconnect_min_seconds cannot be negative")
-	}
 	if s.ReconnectMaxSeconds < 0 {
 		return errors.New("reconnect_max_seconds cannot be negative")
-	}
-	if s.ReconnectMinSeconds > s.ReconnectMaxSeconds && s.ReconnectMaxSeconds > 0 {
-		return errors.New("reconnect_min_seconds cannot exceed reconnect_max_seconds")
 	}
 
 	return nil
@@ -249,9 +243,6 @@ func (s *Subscription) SetDefaults() {
 	}
 	if s.ConnectTimeoutSeconds == 0 {
 		s.ConnectTimeoutSeconds = 30
-	}
-	if s.ReconnectMinSeconds == 0 {
-		s.ReconnectMinSeconds = 1
 	}
 	if s.ReconnectMaxSeconds == 0 {
 		s.ReconnectMaxSeconds = 60
@@ -312,7 +303,6 @@ func ValidateCreateRequest(req *CreateSubscriptionRequest) error {
 		TLSCAPath:             req.TLSCAPath,
 		KeepAliveSeconds:      req.KeepAliveSeconds,
 		ConnectTimeoutSeconds: req.ConnectTimeoutSeconds,
-		ReconnectMinSeconds:   req.ReconnectMinSeconds,
 		ReconnectMaxSeconds:   req.ReconnectMaxSeconds,
 		CleanSession:          req.CleanSession,
 	}

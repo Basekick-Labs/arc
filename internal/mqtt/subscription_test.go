@@ -134,8 +134,8 @@ func TestSubscription_Validate(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "reconnect_min_exceeds_max",
-			modify:  func(s *Subscription) { s.ReconnectMinSeconds = 60; s.ReconnectMaxSeconds = 30 },
+			name:    "negative_reconnect_max",
+			modify:  func(s *Subscription) { s.ReconnectMaxSeconds = -1 },
 			wantErr: true,
 		},
 	}
@@ -169,9 +169,6 @@ func TestSubscription_SetDefaults(t *testing.T) {
 	}
 	if sub.ConnectTimeoutSeconds != 30 {
 		t.Errorf("Default ConnectTimeoutSeconds = %d, want 30", sub.ConnectTimeoutSeconds)
-	}
-	if sub.ReconnectMinSeconds != 1 {
-		t.Errorf("Default ReconnectMinSeconds = %d, want 1", sub.ReconnectMinSeconds)
 	}
 	if sub.ReconnectMaxSeconds != 60 {
 		t.Errorf("Default ReconnectMaxSeconds = %d, want 60", sub.ReconnectMaxSeconds)

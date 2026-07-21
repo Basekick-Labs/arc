@@ -163,7 +163,6 @@ func (m *SubscriptionManager) Create(ctx context.Context, req *CreateSubscriptio
 		TopicMapping:          req.TopicMapping,
 		KeepAliveSeconds:      req.KeepAliveSeconds,
 		ConnectTimeoutSeconds: req.ConnectTimeoutSeconds,
-		ReconnectMinSeconds:   req.ReconnectMinSeconds,
 		ReconnectMaxSeconds:   req.ReconnectMaxSeconds,
 		CleanSession:          req.CleanSession,
 		Status:                StatusStopped,
@@ -283,9 +282,6 @@ func (m *SubscriptionManager) Update(ctx context.Context, id string, req *Update
 	}
 	if req.ConnectTimeoutSeconds != nil {
 		sub.ConnectTimeoutSeconds = *req.ConnectTimeoutSeconds
-	}
-	if req.ReconnectMinSeconds != nil {
-		sub.ReconnectMinSeconds = *req.ReconnectMinSeconds
 	}
 	if req.ReconnectMaxSeconds != nil {
 		sub.ReconnectMaxSeconds = *req.ReconnectMaxSeconds
