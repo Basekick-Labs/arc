@@ -36,6 +36,10 @@ var (
 	ErrSubscriptionNotRunning        = errors.New("subscription not running")
 	ErrSubscriptionRunningCantUpdate = errors.New("cannot update running subscription - stop it first")
 	ErrSubscriptionUniqueConstraint  = errors.New("subscription name already exists")
+	// ErrValidation wraps a request that failed validation (bad QoS, broker URL,
+	// missing field, …). Handlers map it to 400 Bad Request rather than 500 —
+	// it's a client error, not a server fault.
+	ErrValidation = errors.New("validation error")
 )
 
 // Subscription represents an MQTT subscription configuration
@@ -70,11 +74,15 @@ type Subscription struct {
 
 // CreateSubscriptionRequest is the request body for creating a subscription
 type CreateSubscriptionRequest struct {
-	Name                  string            `json:"name"`
-	Broker                string            `json:"broker"`
-	ClientID              string            `json:"client_id"`
-	Topics                []string          `json:"topics"`
-	QoS                   int               `json:"qos"`
+	Name     string   `json:"name"`
+	Broker   string   `json:"broker"`
+	ClientID string   `json:"client_id"`
+	Topics   []string `json:"topics"`
+	// QoS is a pointer so an explicit "qos": 0 (at-most-once) is distinguishable
+	// from an omitted field. A plain int would make both indistinguishable, and
+	// the default logic would silently rewrite an explicit 0 to 1 (#326). nil
+	// means "use the default" (see defaultQoS / resolveQoS).
+	QoS                   *int              `json:"qos,omitempty"`
 	Database              string            `json:"database"`
 	Username              string            `json:"username,omitempty"`
 	Password              string            `json:"password,omitempty"`
@@ -208,13 +216,33 @@ func (s *Subscription) Validate() error {
 	return nil
 }
 
-// SetDefaults sets default values for optional fields
+// defaultQoS is the QoS applied when a create request omits the field.
+// At-least-once (1) is the safe default for ingestion — at-most-once (0) can
+// silently drop messages.
+const defaultQoS = 1
+
+// resolveQoS turns an optional QoS from a request into a concrete value: nil
+// (field omitted) becomes the default; an explicit value — including 0 — is
+// used as-is. This is the fix for #326: an explicit "qos": 0 must not be
+// rewritten to 1.
+func resolveQoS(qos *int) int {
+	if qos == nil {
+		return defaultQoS
+	}
+	return *qos
+}
+
+// SetDefaults sets default values for optional fields.
+//
+// Note: QoS is intentionally NOT defaulted here. By the time a Subscription
+// exists its QoS is already resolved from the create request via resolveQoS
+// (nil → defaultQoS, explicit value — including 0 — kept). Re-applying an
+// "if QoS == 0 { QoS = 1 }" rule here would reintroduce #326, silently turning
+// a persisted, explicitly-chosen QoS 0 back into 1 on any code path that
+// rebuilds-and-defaults a subscription.
 func (s *Subscription) SetDefaults() {
 	if s.ClientID == "" {
 		s.ClientID = generateClientID()
-	}
-	if s.QoS == 0 {
-		s.QoS = 1 // Default to at-least-once
 	}
 	if s.KeepAliveSeconds == 0 {
 		s.KeepAliveSeconds = 60
@@ -277,7 +305,7 @@ func ValidateCreateRequest(req *CreateSubscriptionRequest) error {
 		Broker:                req.Broker,
 		ClientID:              req.ClientID,
 		Topics:                req.Topics,
-		QoS:                   req.QoS,
+		QoS:                   resolveQoS(req.QoS),
 		Database:              req.Database,
 		TLSCertPath:           req.TLSCertPath,
 		TLSKeyPath:            req.TLSKeyPath,

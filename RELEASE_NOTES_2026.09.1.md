@@ -75,6 +75,14 @@ Note: this makes output **eventually** idempotent (duplicates collapse at compac
 
 No action is required to upgrade; add `tag_columns` to your grouped CQs when you want the duplicate-collapsing behavior.
 
+### MQTT subscriptions honor an explicit QoS 0 ([#326](https://github.com/Basekick-Labs/arc/issues/326))
+
+Creating an MQTT subscription with `"qos": 0` (at-most-once / fire-and-forget) silently persisted it as QoS 1. The create request modeled `qos` as a plain integer, so an explicit `0` was indistinguishable from an omitted field, and the "default unset QoS to 1" step rewrote it. A subscription requested as fire-and-forget was quietly upgraded to at-least-once.
+
+The create request now models `qos` as optional: an omitted field still defaults to 1 (at-least-once, the safe ingestion default), but an explicit `0`, `1`, or `2` is preserved as written. QoS defaulting was moved out of the shared `SetDefaults` step so a persisted, explicitly-chosen QoS 0 can never be rewritten. (The update endpoint already handled this correctly.)
+
+Related fix in the same handler: an out-of-range or otherwise invalid subscription request now returns **`400 Bad Request`** with the validation message instead of `500 Internal Server Error`.
+
 ## Performance
 
 ### Faster local-storage directory listing ([#347](https://github.com/Basekick-Labs/arc/issues/347))

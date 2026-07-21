@@ -130,7 +130,7 @@ func (m *SubscriptionManager) Shutdown(ctx context.Context) error {
 func (m *SubscriptionManager) Create(ctx context.Context, req *CreateSubscriptionRequest, password string) (*Subscription, error) {
 	// Validate request
 	if err := ValidateCreateRequest(req); err != nil {
-		return nil, fmt.Errorf("validation error: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrValidation, err)
 	}
 
 	// Encrypt password if provided
@@ -149,7 +149,7 @@ func (m *SubscriptionManager) Create(ctx context.Context, req *CreateSubscriptio
 		Broker:                req.Broker,
 		ClientID:              req.ClientID,
 		Topics:                req.Topics,
-		QoS:                   req.QoS,
+		QoS:                   resolveQoS(req.QoS),
 		Database:              req.Database,
 		Username:              req.Username,
 		PasswordEncrypted:     encryptedPassword,
@@ -296,7 +296,7 @@ func (m *SubscriptionManager) Update(ctx context.Context, id string, req *Update
 
 	// Validate updated subscription
 	if err := sub.Validate(); err != nil {
-		return nil, fmt.Errorf("validation error: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrValidation, err)
 	}
 
 	if err := m.repo.Update(ctx, sub); err != nil {
