@@ -7,26 +7,18 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/database"
+	"github.com/basekick-labs/arc/internal/throttle"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
 
-// freeOSMemoryDebounce debounces /debug/free-os-memory so polled callers
+// debugFreeOSMemoryDebounce debounces /debug/free-os-memory so polled callers
 // can't pin the runtime in stop-the-world GC.
-const freeOSMemoryDebounce = 30 * time.Second
-
-// debugProcessStart anchors the debounce to the monotonic clock so wall-clock
-// adjustments (NTP steps, manual `date` changes) cannot misbehave.
-var debugProcessStart = time.Now()
-
-// debugFreeOSMemoryLastNanos stores nanoseconds since debugProcessStart
-// (monotonic) of the last /debug/free-os-memory call that wasn't throttled.
-var debugFreeOSMemoryLastNanos atomic.Int64
+var debugFreeOSMemoryDebounce = throttle.New(30 * time.Second)
 
 // DebugHandler exposes process- and DuckDB-level memory diagnostics. Used to
 // attribute RSS to Go heap, DuckDB native heap, or glibc arenas during
@@ -165,18 +157,23 @@ func (h *DebugHandler) handleDuckDBMemory(c *fiber.Ctx) error {
 
 // handleFreeOSMemory triggers debug.FreeOSMemory and returns the delta in
 // HeapReleased so callers can see how many bytes the runtime returned to the
-// OS. Throttled to one call per freeOSMemoryDebounce; debug.FreeOSMemory is
+// OS. Throttled to one call per debugFreeOSMemoryDebounce; debug.FreeOSMemory is
 // stop-the-world and a tight polling loop would tank ingest throughput.
 func (h *DebugHandler) handleFreeOSMemory(c *fiber.Ctx) error {
-	now := time.Since(debugProcessStart).Nanoseconds()
-	last := debugFreeOSMemoryLastNanos.Load()
-	// last==0 means "never fired" — first call always proceeds.
-	if last != 0 && now-last < int64(freeOSMemoryDebounce) {
+	if !debugFreeOSMemoryDebounce.TryAcquire() {
 		// Round the remaining wait UP to the next whole second so a client
 		// retrying after retry_after_seconds is past the throttle window.
 		// Truncating could return 0 when 500ms remains and cause immediate
-		// retry storms.
-		remaining := freeOSMemoryDebounce - time.Duration(now-last)
+		// retry storms. Remaining() can be 0 here if the window elapsed in the
+		// brief gap between TryAcquire() and this Remaining() call (the acquire
+		// still lost the race for this interval, but the next one is already
+		// eligible); in that case omit retry_after_seconds rather than emit 0.
+		remaining := debugFreeOSMemoryDebounce.Remaining()
+		if remaining <= 0 {
+			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
+				"error": "throttled",
+			})
+		}
 		retryAfter := int64(remaining / time.Second)
 		if remaining%time.Second != 0 {
 			retryAfter++
@@ -184,11 +181,6 @@ func (h *DebugHandler) handleFreeOSMemory(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
 			"error":               "throttled",
 			"retry_after_seconds": retryAfter,
-		})
-	}
-	if !debugFreeOSMemoryLastNanos.CompareAndSwap(last, now) {
-		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
-			"error": "throttled",
 		})
 	}
 
