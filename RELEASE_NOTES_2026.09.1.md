@@ -110,6 +110,10 @@ Per-op benchmarks on the cache: `Get` **257 ns → 71 ns**, `Set` **269 ns → 8
 
 The three copies of the 30-second memory-release debounce (the post-delete/retention `debug.FreeOSMemory` throttle, the `/api/v1/debug/free-os-memory` endpoint, and the Linux `malloc_trim` throttle) are now a single `internal/throttle.Debouncer`. Behavior is unchanged — same monotonic-clock window and the same first-call sentinel that fires the very first request rather than throttling it. One minor improvement: when two callers race the `/api/v1/debug/free-os-memory` endpoint at the same instant and one loses, the loser's `429` response now includes a `retry_after_seconds` hint (previously it was omitted only in that narrow race).
 
+### MQTT message hot path no longer takes a mutex per message ([#328](https://github.com/Basekick-Labs/arc/issues/328))
+
+Every received MQTT message took a full write-lock on the subscriber's state mutex just to update the `last_message_at` timestamp. That serialized the message hot path against itself and against the stats endpoint. The timestamp is now an `atomic.Int64` (Unix nanoseconds), so the per-message stat update is lock-free — matching the other per-message counters, which were already atomic. The stats-reporting output is unchanged. Under contention the per-message stat update is ~19% faster in a microbenchmark; the real benefit is removing the serialization point from a high-throughput ingest path.
+
 ## Impact by deployment mode
 
 The forwarding-header and loop-guard changes are cluster-only; the partition-pruner DoS fix (#536) applies to **every** deployment mode, since the pruner runs on every query.

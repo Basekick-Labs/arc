@@ -31,17 +31,21 @@ type Subscriber struct {
 	encryptor      PasswordEncryptor
 	onStatusChange func(id string, status SubscriptionStatus, errMsg string)
 
-	// Runtime state
+	// Runtime state. mu guards the lifecycle fields (running, connectedSince),
+	// which change only on connect/start/stop — not on the message hot path.
 	mu             sync.RWMutex
 	running        bool
 	connectedSince time.Time
-	lastMessageAt  time.Time
 
-	// Statistics
-	messagesReceived atomic.Int64
-	messagesFailed   atomic.Int64
-	bytesReceived    atomic.Int64
-	reconnects       atomic.Int64
+	// Statistics. All updated on the message hot path without the mutex.
+	// lastMessageAtNanos holds the last-message time as Unix nanoseconds (0 =
+	// no message received yet); it was a mutex-guarded time.Time, which took a
+	// full lock on every received message (#328).
+	messagesReceived   atomic.Int64
+	messagesFailed     atomic.Int64
+	bytesReceived      atomic.Int64
+	reconnects         atomic.Int64
+	lastMessageAtNanos atomic.Int64
 
 	// Shutdown
 	ctx    context.Context
@@ -148,11 +152,22 @@ func (s *Subscriber) IsRunning() bool {
 // GetStats returns current statistics
 func (s *Subscriber) GetStats() *SubscriptionStats {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	status := "stopped"
 	if s.running {
 		status = "running"
+	}
+	connectedSince := s.connectedSince
+	s.mu.RUnlock()
+
+	// lastMessageAt lives in an atomic (off the message hot path). 0 nanos means
+	// no message has been received yet — map it to the zero time.Time so the
+	// response renders exactly as before (0001-01-01T00:00:00Z; note encoding/json
+	// does not actually omit a zero time.Time despite the omitempty tag). The 0
+	// sentinel collides with the Unix epoch instant, but time.Now() never returns
+	// it in practice, so a real message can't be misread as "never received".
+	var lastMessageAt time.Time
+	if nanos := s.lastMessageAtNanos.Load(); nanos != 0 {
+		lastMessageAt = time.Unix(0, nanos)
 	}
 
 	return &SubscriptionStats{
@@ -162,8 +177,8 @@ func (s *Subscriber) GetStats() *SubscriptionStats {
 		MessagesReceived: s.messagesReceived.Load(),
 		MessagesFailed:   s.messagesFailed.Load(),
 		BytesReceived:    s.bytesReceived.Load(),
-		LastMessageAt:    s.lastMessageAt,
-		ConnectedSince:   s.connectedSince,
+		LastMessageAt:    lastMessageAt,
+		ConnectedSince:   connectedSince,
 		Reconnects:       s.reconnects.Load(),
 	}
 }
@@ -300,10 +315,8 @@ func (s *Subscriber) onReconnecting(client pahomqtt.Client, opts *pahomqtt.Clien
 func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 	s.messagesReceived.Add(1)
 	s.bytesReceived.Add(int64(len(msg.Payload())))
-
-	s.mu.Lock()
-	s.lastMessageAt = time.Now()
-	s.mu.Unlock()
+	// Atomic store — no mutex on the message hot path (#328).
+	s.lastMessageAtNanos.Store(time.Now().UnixNano())
 
 	// Update metrics
 	metrics.Get().IncMQTTMessagesReceived()
