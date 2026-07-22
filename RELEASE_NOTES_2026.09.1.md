@@ -97,6 +97,18 @@ Both update methods now call `validateName` on the supplied name before any writ
 
 The API handlers now return **`400 Bad Request`** when name validation fails, so client-supplied invalid values get the correct status code. On the create path this replaces a `500 Internal Server Error` that was returned for every rule except the empty-name check (so `name` values containing spaces, or starting with a digit, previously surfaced as a server error). On the update path there was no status code to replace — the invalid name was accepted with `200 OK` and written to the database, which is the bug described above.
 
+### RBAC endpoints no longer return `500` for client errors ([#549](https://github.com/Basekick-Labs/arc/issues/549))
+
+Two remaining cases in the RBAC API reported client-supplied bad input as `500 Internal Server Error`. A 5xx tells the caller the server broke — it drives client retries, pages on-call, and burns error budgets — when the correct response is "fix your request".
+
+- **Duplicate organization/team names now return `409 Conflict`** (previously `500`) on all four create and update endpoints. Renaming an organization to a name already in use, or creating a team whose name is taken within its organization, is a conflict with existing state, not a server fault.
+- **`PATCH /api/v1/rbac/roles/:id` now returns `400 Bad Request`** (previously `500`) for an invalid `database_pattern` or an unrecognized entry in `permissions`. These were already validated — the errors simply were not mapped to a status code. The matching create endpoint already returned `400`, so create and update now agree.
+- **`POST /api/v1/rbac/roles/:role_id/measurements` now returns `400 Bad Request`** (previously `500`) for an invalid `measurement_pattern`, matching the sibling `permissions` check on the same endpoint, which already returned `400`.
+
+Error *messages* are unchanged — only the status codes differ. Clients that branch on the response body are unaffected; clients that branch on the status code get a correct one. A regression test pins the exact message text so this stays true.
+
+Internally, these paths now classify errors with typed sentinels (`errors.Is`) instead of matching on message text, so rewording one of them cannot change a status code. This covers the name-collision, name-validation, and role-input paths; a few other conditions in the RBAC handlers are still matched by error string and are left for follow-up work.
+
 ### Optional timestamp fields are now omitted when unset, and rendered in UTC ([#546](https://github.com/Basekick-Labs/arc/issues/546))
 
 Several API response fields typed as a Go `time.Time` carried an `omitempty` tag that does nothing — `encoding/json` never omits a `time.Time`, so an unset value rendered as the confusing placeholder `"0001-01-01T00:00:00Z"` rather than being absent. Fields where "unset" is a meaningful state are now proper optional fields (omitted when there is no value):

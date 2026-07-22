@@ -3,7 +3,6 @@ package api
 import (
 	"errors"
 	"strconv"
-	"strings"
 
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/gofiber/fiber/v2"
@@ -24,6 +23,39 @@ func NewRBACHandler(authManager *auth.AuthManager, rbacManager *auth.RBACManager
 		rbacManager: rbacManager,
 		logger:      logger.With().Str("component", "rbac-handler").Logger(),
 	}
+}
+
+// rbacErrorStatus maps an RBACManager error to an HTTP status code.
+//
+// Client-supplied bad input must not surface as 5xx: a 500 is what drives
+// client retries, alerting, and error budgets, and it gives the caller no
+// way to tell "the server broke" from "pick a different name". Detection
+// uses errors.Is against the exported sentinels, so rewording any error
+// these sentinels tag cannot change a status code (issue #549).
+//
+// Scope: this covers the name-collision, name-validation, and role-input
+// paths. Several other 400/404 conditions in this file are still matched
+// by exact error string at their call sites ("team not found", "database
+// pattern is required", and similar) and remain message-text dependent.
+// Converting those is deliberate future work, not something this helper
+// already delivers.
+//
+// Returns 0 when the error is not a recognised client error, leaving the
+// caller to apply its own default (500, or a handler-specific 404).
+func rbacErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, auth.ErrInvalidName), errors.Is(err, auth.ErrInvalidRoleInput):
+		return fiber.StatusBadRequest
+	case errors.Is(err, auth.ErrNameConflict):
+		return fiber.StatusConflict
+	case errors.Is(err, auth.ErrCascadeCapExceeded):
+		// Not reachable from the current callers — the cascade cap is
+		// only produced by the delete handlers, which match it directly.
+		// Kept so the mapping stays in one place if a delete path is
+		// ever routed through this helper.
+		return fiber.StatusConflict
+	}
+	return 0
 }
 
 // requireRBACLicense is a middleware that checks if RBAC feature is licensed
@@ -113,8 +145,8 @@ func (h *RBACHandler) createOrganization(c *fiber.Ctx) error {
 	org, err := h.rbacManager.CreateOrganization(c.UserContext(), &req)
 	if err != nil {
 		status := fiber.StatusInternalServerError
-		if err.Error() == "organization name is required" || strings.Contains(err.Error(), "invalid organization name") {
-			status = fiber.StatusBadRequest
+		if s := rbacErrorStatus(err); s != 0 {
+			status = s
 		}
 		return c.Status(status).JSON(fiber.Map{
 			"success": false,
@@ -194,8 +226,8 @@ func (h *RBACHandler) updateOrganization(c *fiber.Ctx) error {
 				"error":   "Organization not found",
 			})
 		}
-		if strings.Contains(err.Error(), "invalid organization name") {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+		if s := rbacErrorStatus(err); s != 0 {
+			return c.Status(s).JSON(fiber.Map{
 				"success": false,
 				"error":   err.Error(),
 			})
@@ -306,8 +338,15 @@ func (h *RBACHandler) createTeam(c *fiber.Ctx) error {
 	team, err := h.rbacManager.CreateTeam(c.UserContext(), orgID, &req)
 	if err != nil {
 		status := fiber.StatusInternalServerError
-		if err.Error() == "team name is required" || err.Error() == "organization not found" || strings.Contains(err.Error(), "invalid team name") {
+		if err.Error() == "organization not found" {
+			// Kept at 400 to preserve the pre-#549 contract. The org ID
+			// comes from the URL path, so 404 is arguably more correct,
+			// but changing it would break existing clients — out of
+			// scope here.
 			status = fiber.StatusBadRequest
+		}
+		if s := rbacErrorStatus(err); s != 0 {
+			status = s
 		}
 		return c.Status(status).JSON(fiber.Map{
 			"success": false,
@@ -387,8 +426,8 @@ func (h *RBACHandler) updateTeam(c *fiber.Ctx) error {
 				"error":   "Team not found",
 			})
 		}
-		if strings.Contains(err.Error(), "invalid team name") {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+		if s := rbacErrorStatus(err); s != 0 {
+			return c.Status(s).JSON(fiber.Map{
 				"success": false,
 				"error":   err.Error(),
 			})
@@ -496,9 +535,11 @@ func (h *RBACHandler) createRole(c *fiber.Ctx) error {
 		errMsg := err.Error()
 		if errMsg == "database pattern is required" ||
 			errMsg == "at least one permission is required" ||
-			errMsg == "team not found" ||
-			len(errMsg) > 20 && errMsg[:20] == "invalid permission: " {
+			errMsg == "team not found" {
 			status = fiber.StatusBadRequest
+		}
+		if s := rbacErrorStatus(err); s != 0 {
+			status = s
 		}
 		return c.Status(status).JSON(fiber.Map{
 			"success": false,
@@ -576,6 +617,12 @@ func (h *RBACHandler) updateRole(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Role not found",
+			})
+		}
+		if s := rbacErrorStatus(err); s != 0 {
+			return c.Status(s).JSON(fiber.Map{
+				"success": false,
+				"error":   err.Error(),
 			})
 		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -674,9 +721,11 @@ func (h *RBACHandler) createMeasurementPermission(c *fiber.Ctx) error {
 		errMsg := err.Error()
 		if errMsg == "measurement pattern is required" ||
 			errMsg == "at least one permission is required" ||
-			errMsg == "role not found" ||
-			len(errMsg) > 20 && errMsg[:20] == "invalid permission: " {
+			errMsg == "role not found" {
 			status = fiber.StatusBadRequest
+		}
+		if s := rbacErrorStatus(err); s != 0 {
+			status = s
 		}
 		return c.Status(status).JSON(fiber.Map{
 			"success": false,
