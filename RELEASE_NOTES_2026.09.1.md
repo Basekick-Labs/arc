@@ -89,6 +89,12 @@ MQTT subscriptions accepted a `reconnect_min_seconds` field that was validated, 
 
 This is not a breaking change: an omitted or extra `reconnect_min_seconds` in a request body is simply ignored, and existing MQTT subscription databases are untouched (the underlying column is left in place, unused, so no migration runs). The reconnect behavior itself is unchanged — the minimum was already a fixed 1 second in practice.
 
+### `UpdateOrganization`/`UpdateTeam` now validate the name on update ([#324](https://github.com/Basekick-Labs/arc/issues/324))
+
+`UpdateOrganization` and `UpdateTeam` accepted any string as a new name — including empty strings and names starting with a digit — because the `validateName` check that `CreateOrganization` and `CreateTeam` apply was missing from the update path. An invalid name could be written to the database and later cause confusing errors or inconsistent behavior downstream.
+
+Both update methods now call `validateName` on the supplied name before any write (OSS direct-SQLite path and cluster Raft path). The validation rules are the same as create: must start with a letter, alphanumeric plus underscore/hyphen, at most 64 characters. An invalid name returns an error and the update is rejected.
+
 ### Optional timestamp fields are now omitted when unset, and rendered in UTC ([#546](https://github.com/Basekick-Labs/arc/issues/546))
 
 Several API response fields typed as a Go `time.Time` carried an `omitempty` tag that does nothing — `encoding/json` never omits a `time.Time`, so an unset value rendered as the confusing placeholder `"0001-01-01T00:00:00Z"` rather than being absent. Fields where "unset" is a meaningful state are now proper optional fields (omitted when there is no value):
