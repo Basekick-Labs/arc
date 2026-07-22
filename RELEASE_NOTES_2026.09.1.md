@@ -93,7 +93,9 @@ This is not a breaking change: an omitted or extra `reconnect_min_seconds` in a 
 
 `UpdateOrganization` and `UpdateTeam` accepted any string as a new name — including empty strings and names starting with a digit — because the `validateName` check that `CreateOrganization` and `CreateTeam` apply was missing from the update path. An invalid name could be written to the database and later cause confusing errors or inconsistent behavior downstream.
 
-Both update methods now call `validateName` on the supplied name before any write (OSS direct-SQLite path and cluster Raft path). The validation rules are the same as create: must start with a letter, alphanumeric plus underscore/hyphen, at most 64 characters. An invalid name returns an error and the update is rejected. The API handlers for both create and update now return **`400 Bad Request`** (instead of `500 Internal Server Error`) when name validation fails, so client-supplied invalid values get the correct status code.
+Both update methods now call `validateName` on the supplied name before any write (OSS direct-SQLite path and cluster Raft path). The validation rules are the same as create: must start with a letter, alphanumeric plus underscore/hyphen, at most 64 characters. An invalid name returns an error and the update is rejected.
+
+The API handlers now return **`400 Bad Request`** when name validation fails, so client-supplied invalid values get the correct status code. On the create path this replaces a `500 Internal Server Error` that was returned for every rule except the empty-name check (so `name` values containing spaces, or starting with a digit, previously surfaced as a server error). On the update path there was no status code to replace — the invalid name was accepted with `200 OK` and written to the database, which is the bug described above.
 
 ### Optional timestamp fields are now omitted when unset, and rendered in UTC ([#546](https://github.com/Basekick-Labs/arc/issues/546))
 

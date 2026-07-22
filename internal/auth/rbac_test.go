@@ -235,6 +235,18 @@ func TestUpdateOrganization(t *testing.T) {
 		}
 	})
 
+	// Boundary: 64 is the inclusive maximum. Pins the `{0,63}` quantifier
+	// in nameValidationRegex against an off-by-one.
+	t.Run("name at 64 char limit accepted", func(t *testing.T) {
+		maxName := "a" + strings.Repeat("b", 63) // exactly 64 chars
+		err := rm.UpdateOrganization(context.Background(), org.ID, &UpdateOrganizationRequest{
+			Name: &maxName,
+		})
+		if err != nil {
+			t.Fatalf("UpdateOrganization with a 64-character name should succeed: %v", err)
+		}
+	})
+
 	t.Run("name with spaces rejected", func(t *testing.T) {
 		spaceName := "valid start but invalid"
 		err := rm.UpdateOrganization(context.Background(), org.ID, &UpdateOrganizationRequest{
