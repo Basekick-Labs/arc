@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"strconv"
+	"strings"
 
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/gofiber/fiber/v2"
@@ -112,7 +113,7 @@ func (h *RBACHandler) createOrganization(c *fiber.Ctx) error {
 	org, err := h.rbacManager.CreateOrganization(c.UserContext(), &req)
 	if err != nil {
 		status := fiber.StatusInternalServerError
-		if err.Error() == "organization name is required" {
+		if err.Error() == "organization name is required" || strings.Contains(err.Error(), "invalid organization name") {
 			status = fiber.StatusBadRequest
 		}
 		return c.Status(status).JSON(fiber.Map{
@@ -191,6 +192,12 @@ func (h *RBACHandler) updateOrganization(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Organization not found",
+			})
+		}
+		if strings.Contains(err.Error(), "invalid organization name") {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"success": false,
+				"error":   err.Error(),
 			})
 		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -299,7 +306,7 @@ func (h *RBACHandler) createTeam(c *fiber.Ctx) error {
 	team, err := h.rbacManager.CreateTeam(c.UserContext(), orgID, &req)
 	if err != nil {
 		status := fiber.StatusInternalServerError
-		if err.Error() == "team name is required" || err.Error() == "organization not found" {
+		if err.Error() == "team name is required" || err.Error() == "organization not found" || strings.Contains(err.Error(), "invalid team name") {
 			status = fiber.StatusBadRequest
 		}
 		return c.Status(status).JSON(fiber.Map{
@@ -378,6 +385,12 @@ func (h *RBACHandler) updateTeam(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Team not found",
+			})
+		}
+		if strings.Contains(err.Error(), "invalid team name") {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"success": false,
+				"error":   err.Error(),
 			})
 		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
