@@ -418,6 +418,11 @@ func (rm *RBACManager) ListOrganizations() ([]Organization, error) {
 // UpdateOrganization updates an organization. Same dual-path shape as
 // CreateOrganization.
 func (rm *RBACManager) UpdateOrganization(ctx context.Context, id int64, req *UpdateOrganizationRequest) error {
+	if req.Name != nil {
+		if err := validateName(*req.Name); err != nil {
+			return fmt.Errorf("invalid organization name: %w", err)
+		}
+	}
 	if rm.getProposer() != nil {
 		payload := updateOrganizationPayloadWire{
 			ID:                id,
@@ -694,6 +699,11 @@ func (rm *RBACManager) ListTeamsByOrganization(orgID int64) ([]Team, error) {
 
 // UpdateTeam updates a team.
 func (rm *RBACManager) UpdateTeam(ctx context.Context, id int64, req *UpdateTeamRequest) error {
+	if req.Name != nil {
+		if err := validateName(*req.Name); err != nil {
+			return fmt.Errorf("invalid team name: %w", err)
+		}
+	}
 	if rm.getProposer() != nil {
 		payload := updateTeamPayloadWire{
 			ID:                id,

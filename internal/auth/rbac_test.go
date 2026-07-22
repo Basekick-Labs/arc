@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -203,6 +204,68 @@ func TestUpdateOrganization(t *testing.T) {
 			t.Error("Expected error for non-existent organization")
 		}
 	})
+
+	t.Run("invalid name rejected", func(t *testing.T) {
+		badName := "123-invalid"
+		err := rm.UpdateOrganization(context.Background(), org.ID, &UpdateOrganizationRequest{
+			Name: &badName,
+		})
+		if err == nil {
+			t.Error("Expected error for invalid organization name")
+		}
+	})
+
+	t.Run("empty name rejected", func(t *testing.T) {
+		empty := ""
+		err := rm.UpdateOrganization(context.Background(), org.ID, &UpdateOrganizationRequest{
+			Name: &empty,
+		})
+		if err == nil {
+			t.Error("Expected error for empty organization name")
+		}
+	})
+
+	t.Run("name too long rejected", func(t *testing.T) {
+		longName := "a" + strings.Repeat("b", 64) // 65 chars
+		err := rm.UpdateOrganization(context.Background(), org.ID, &UpdateOrganizationRequest{
+			Name: &longName,
+		})
+		if err == nil {
+			t.Error("Expected error for name exceeding 64 characters")
+		}
+	})
+
+	// Boundary: 64 is the inclusive maximum. Pins the `{0,63}` quantifier
+	// in nameValidationRegex against an off-by-one.
+	t.Run("name at 64 char limit accepted", func(t *testing.T) {
+		maxName := "a" + strings.Repeat("b", 63) // exactly 64 chars
+		err := rm.UpdateOrganization(context.Background(), org.ID, &UpdateOrganizationRequest{
+			Name: &maxName,
+		})
+		if err != nil {
+			t.Fatalf("UpdateOrganization with a 64-character name should succeed: %v", err)
+		}
+	})
+
+	t.Run("name with spaces rejected", func(t *testing.T) {
+		spaceName := "valid start but invalid"
+		err := rm.UpdateOrganization(context.Background(), org.ID, &UpdateOrganizationRequest{
+			Name: &spaceName,
+		})
+		if err == nil {
+			t.Error("Expected error for name with spaces")
+		}
+	})
+
+	t.Run("update description only skips name validation", func(t *testing.T) {
+		desc := "new description"
+		err := rm.UpdateOrganization(context.Background(), org.ID, &UpdateOrganizationRequest{
+			Description: &desc,
+		})
+		if err != nil {
+			t.Fatalf("UpdateOrganization with description only should succeed: %v", err)
+		}
+	})
 }
 
 func TestDeleteOrganization(t *testing.T) {
@@ -278,6 +341,91 @@ func TestCreateTeam(t *testing.T) {
 		_, err := rm.CreateTeam(context.Background(), org.ID, &CreateTeamRequest{Name: "Duplicate Team"})
 		if err == nil {
 			t.Error("Expected error for duplicate team name in same org")
+		}
+	})
+}
+
+func TestUpdateTeam(t *testing.T) {
+	rm, _, cleanup := setupTestRBACManager(t)
+	defer cleanup()
+
+	org, _ := rm.CreateOrganization(context.Background(), &CreateOrganizationRequest{Name: "update-team-org"})
+	team, _ := rm.CreateTeam(context.Background(), org.ID, &CreateTeamRequest{
+		Name:        "original-team",
+		Description: "Original description",
+	})
+
+	t.Run("update name", func(t *testing.T) {
+		newName := "renamed-team"
+		err := rm.UpdateTeam(context.Background(), team.ID, &UpdateTeamRequest{
+			Name: &newName,
+		})
+		if err != nil {
+			t.Fatalf("UpdateTeam failed: %v", err)
+		}
+		updated, _ := rm.GetTeam(team.ID)
+		if updated.Name != "renamed-team" {
+			t.Errorf("Name = %s, want %s", updated.Name, "renamed-team")
+		}
+	})
+
+	t.Run("invalid name rejected", func(t *testing.T) {
+		badName := "123-invalid"
+		err := rm.UpdateTeam(context.Background(), team.ID, &UpdateTeamRequest{
+			Name: &badName,
+		})
+		if err == nil {
+			t.Error("Expected error for invalid team name")
+		}
+	})
+
+	t.Run("empty name rejected", func(t *testing.T) {
+		empty := ""
+		err := rm.UpdateTeam(context.Background(), team.ID, &UpdateTeamRequest{
+			Name: &empty,
+		})
+		if err == nil {
+			t.Error("Expected error for empty team name")
+		}
+	})
+
+	t.Run("non-existent team", func(t *testing.T) {
+		newName := "new-name"
+		err := rm.UpdateTeam(context.Background(), 99999, &UpdateTeamRequest{
+			Name: &newName,
+		})
+		if err == nil {
+			t.Error("Expected error for non-existent team")
+		}
+	})
+
+	t.Run("name too long rejected", func(t *testing.T) {
+		longName := "a" + strings.Repeat("b", 64) // 65 chars
+		err := rm.UpdateTeam(context.Background(), team.ID, &UpdateTeamRequest{
+			Name: &longName,
+		})
+		if err == nil {
+			t.Error("Expected error for name exceeding 64 characters")
+		}
+	})
+
+	t.Run("name with spaces rejected", func(t *testing.T) {
+		spaceName := "valid start but invalid"
+		err := rm.UpdateTeam(context.Background(), team.ID, &UpdateTeamRequest{
+			Name: &spaceName,
+		})
+		if err == nil {
+			t.Error("Expected error for name with spaces")
+		}
+	})
+
+	t.Run("update description only skips name validation", func(t *testing.T) {
+		desc := "new description"
+		err := rm.UpdateTeam(context.Background(), team.ID, &UpdateTeamRequest{
+			Description: &desc,
+		})
+		if err != nil {
+			t.Fatalf("UpdateTeam with description only should succeed: %v", err)
 		}
 	})
 }
