@@ -303,10 +303,10 @@ func (rm *RBACManager) IsRBACEnabled() bool {
 // to local SQLite (unchanged from pre-Phase-A.1 behaviour).
 func (rm *RBACManager) CreateOrganization(ctx context.Context, req *CreateOrganizationRequest) (*Organization, error) {
 	if req.Name == "" {
-		return nil, errors.New("organization name is required")
+		return nil, tagError(ErrInvalidName, errors.New("organization name is required"))
 	}
 	if err := validateName(req.Name); err != nil {
-		return nil, fmt.Errorf("invalid organization name: %w", err)
+		return nil, tagError(ErrInvalidName, fmt.Errorf("invalid organization name: %w", err))
 	}
 
 	if rm.getProposer() != nil {
@@ -325,7 +325,7 @@ func (rm *RBACManager) CreateOrganization(ctx context.Context, req *CreateOrgani
 			// error string the OSS path returns, so handlers can keep their
 			// existing UX.
 			if strings.Contains(err.Error(), "already exists") {
-				return nil, fmt.Errorf("organization with name '%s' already exists", req.Name)
+				return nil, tagError(ErrNameConflict, fmt.Errorf("organization with name '%s' already exists", req.Name))
 			}
 			return nil, fmt.Errorf("failed to create organization: %w", err)
 		}
@@ -359,7 +359,7 @@ func (rm *RBACManager) CreateOrganization(ctx context.Context, req *CreateOrgani
 	`, req.Name, req.Description, now, now)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
-			return nil, fmt.Errorf("organization with name '%s' already exists", req.Name)
+			return nil, tagError(ErrNameConflict, fmt.Errorf("organization with name '%s' already exists", req.Name))
 		}
 		return nil, fmt.Errorf("failed to create organization: %w", err)
 	}
@@ -420,7 +420,7 @@ func (rm *RBACManager) ListOrganizations() ([]Organization, error) {
 func (rm *RBACManager) UpdateOrganization(ctx context.Context, id int64, req *UpdateOrganizationRequest) error {
 	if req.Name != nil {
 		if err := validateName(*req.Name); err != nil {
-			return fmt.Errorf("invalid organization name: %w", err)
+			return tagError(ErrInvalidName, fmt.Errorf("invalid organization name: %w", err))
 		}
 	}
 	if rm.getProposer() != nil {
@@ -448,7 +448,7 @@ func (rm *RBACManager) UpdateOrganization(ctx context.Context, id int64, req *Up
 				return errors.New("organization not found")
 			}
 			if strings.Contains(err.Error(), "already exists") {
-				return errors.New("organization with that name already exists")
+				return tagError(ErrNameConflict, errors.New("organization with that name already exists"))
 			}
 			return fmt.Errorf("failed to update organization: %w", err)
 		}
@@ -490,7 +490,7 @@ func (rm *RBACManager) UpdateOrganization(ctx context.Context, id int64, req *Up
 	result, err := rm.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
-			return errors.New("organization with that name already exists")
+			return tagError(ErrNameConflict, errors.New("organization with that name already exists"))
 		}
 		return fmt.Errorf("failed to update organization: %w", err)
 	}
@@ -579,10 +579,10 @@ func (rm *RBACManager) DeleteOrganization(ctx context.Context, id int64) error {
 // as CreateOrganization.
 func (rm *RBACManager) CreateTeam(ctx context.Context, orgID int64, req *CreateTeamRequest) (*Team, error) {
 	if req.Name == "" {
-		return nil, errors.New("team name is required")
+		return nil, tagError(ErrInvalidName, errors.New("team name is required"))
 	}
 	if err := validateName(req.Name); err != nil {
-		return nil, fmt.Errorf("invalid team name: %w", err)
+		return nil, tagError(ErrInvalidName, fmt.Errorf("invalid team name: %w", err))
 	}
 
 	if rm.getProposer() != nil {
@@ -602,7 +602,7 @@ func (rm *RBACManager) CreateTeam(ctx context.Context, orgID int64, req *CreateT
 				return nil, errors.New("organization not found")
 			}
 			if strings.Contains(err.Error(), "already exists") {
-				return nil, fmt.Errorf("team with name '%s' already exists in this organization", req.Name)
+				return nil, tagError(ErrNameConflict, fmt.Errorf("team with name '%s' already exists in this organization", req.Name))
 			}
 			return nil, fmt.Errorf("failed to create team: %w", err)
 		}
@@ -640,7 +640,7 @@ func (rm *RBACManager) CreateTeam(ctx context.Context, orgID int64, req *CreateT
 	`, orgID, req.Name, req.Description, now, now)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
-			return nil, fmt.Errorf("team with name '%s' already exists in this organization", req.Name)
+			return nil, tagError(ErrNameConflict, fmt.Errorf("team with name '%s' already exists in this organization", req.Name))
 		}
 		return nil, fmt.Errorf("failed to create team: %w", err)
 	}
@@ -701,7 +701,7 @@ func (rm *RBACManager) ListTeamsByOrganization(orgID int64) ([]Team, error) {
 func (rm *RBACManager) UpdateTeam(ctx context.Context, id int64, req *UpdateTeamRequest) error {
 	if req.Name != nil {
 		if err := validateName(*req.Name); err != nil {
-			return fmt.Errorf("invalid team name: %w", err)
+			return tagError(ErrInvalidName, fmt.Errorf("invalid team name: %w", err))
 		}
 	}
 	if rm.getProposer() != nil {
@@ -729,7 +729,7 @@ func (rm *RBACManager) UpdateTeam(ctx context.Context, id int64, req *UpdateTeam
 				return errors.New("team not found")
 			}
 			if strings.Contains(err.Error(), "already exists") {
-				return errors.New("team with that name already exists in this organization")
+				return tagError(ErrNameConflict, errors.New("team with that name already exists in this organization"))
 			}
 			return fmt.Errorf("failed to update team: %w", err)
 		}
@@ -770,7 +770,7 @@ func (rm *RBACManager) UpdateTeam(ctx context.Context, id int64, req *UpdateTeam
 	result, err := rm.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
-			return errors.New("team with that name already exists in this organization")
+			return tagError(ErrNameConflict, errors.New("team with that name already exists in this organization"))
 		}
 		return fmt.Errorf("failed to update team: %w", err)
 	}
@@ -859,11 +859,11 @@ func (rm *RBACManager) CreateRole(ctx context.Context, teamID int64, req *Create
 		return nil, errors.New("at least one permission is required")
 	}
 	if err := validatePattern(req.DatabasePattern); err != nil {
-		return nil, fmt.Errorf("invalid database pattern: %w", err)
+		return nil, tagError(ErrInvalidRoleInput, fmt.Errorf("invalid database pattern: %w", err))
 	}
 	for _, p := range req.Permissions {
 		if !IsValidPermission(p) {
-			return nil, fmt.Errorf("invalid permission: %s", p)
+			return nil, tagError(ErrInvalidRoleInput, fmt.Errorf("invalid permission: %s", p))
 		}
 	}
 
@@ -1009,13 +1009,13 @@ func (rm *RBACManager) UpdateRole(ctx context.Context, id int64, req *UpdateRole
 	if len(req.Permissions) > 0 {
 		for _, p := range req.Permissions {
 			if !IsValidPermission(p) {
-				return fmt.Errorf("invalid permission: %s", p)
+				return tagError(ErrInvalidRoleInput, fmt.Errorf("invalid permission: %s", p))
 			}
 		}
 	}
 	if req.DatabasePattern != nil {
 		if err := validatePattern(*req.DatabasePattern); err != nil {
-			return fmt.Errorf("invalid database pattern: %w", err)
+			return tagError(ErrInvalidRoleInput, fmt.Errorf("invalid database pattern: %w", err))
 		}
 	}
 
@@ -1129,11 +1129,11 @@ func (rm *RBACManager) CreateMeasurementPermission(ctx context.Context, roleID i
 		return nil, errors.New("at least one permission is required")
 	}
 	if err := validatePattern(req.MeasurementPattern); err != nil {
-		return nil, fmt.Errorf("invalid measurement pattern: %w", err)
+		return nil, tagError(ErrInvalidRoleInput, fmt.Errorf("invalid measurement pattern: %w", err))
 	}
 	for _, p := range req.Permissions {
 		if !IsValidPermission(p) {
-			return nil, fmt.Errorf("invalid permission: %s", p)
+			return nil, tagError(ErrInvalidRoleInput, fmt.Errorf("invalid permission: %s", p))
 		}
 	}
 
@@ -2144,6 +2144,57 @@ func (rm *RBACManager) countTeamCascadeDescendants(ctx context.Context, teamID i
 // rm.maxCascadeDescendants. HTTP handlers detect this via errors.Is and
 // map it to 409 Conflict. Phase A.2 Item 2.
 var ErrCascadeCapExceeded = errors.New("cascade exceeds configured limit")
+
+// ErrNameConflict is the sentinel tagging every organization/team
+// name-collision error, on both the OSS direct-SQLite path (UNIQUE
+// constraint violation) and the cluster Raft path ("already exists"
+// from the FSM apply). HTTP handlers detect it via errors.Is and map it
+// to 409 Conflict — a duplicate name is a client error, not a server
+// fault. Issue #549.
+var ErrNameConflict = errors.New("name already exists")
+
+// ErrInvalidName is the sentinel tagging validateName failures on the
+// organization and team create/update paths. HTTP handlers detect it via
+// errors.Is and map it to 400 Bad Request. Replaces the substring match
+// on "invalid organization name"/"invalid team name" added in #324.
+// Issue #549.
+var ErrInvalidName = errors.New("invalid name")
+
+// ErrInvalidRoleInput is the sentinel tagging CreateRole/UpdateRole and
+// CreateMeasurementPermission input-validation failures (database or
+// measurement pattern, permission list). HTTP handlers detect it via
+// errors.Is and map it to 400 Bad Request. Issue #549.
+var ErrInvalidRoleInput = errors.New("invalid role input")
+
+// taggedError attaches a classification sentinel to an error without
+// altering its message.
+//
+// fmt.Errorf("%w: ...", sentinel, ...) would prepend the sentinel's text
+// to every message — turning "organization with name 'x' already exists"
+// into "name already exists: organization with name 'x' already exists".
+// That is a client-visible API change: the JSON `error` field is what
+// callers read, and some match on it. Status-code classification is an
+// internal concern and must not leak into the message.
+//
+// Error() returns the underlying message verbatim; Unwrap() exposes both
+// the sentinel (for errors.Is classification) and the cause (so wrapped
+// detail stays reachable). Issue #549.
+type taggedError struct {
+	sentinel error
+	cause    error
+}
+
+func (e *taggedError) Error() string   { return e.cause.Error() }
+func (e *taggedError) Unwrap() []error { return []error{e.sentinel, e.cause} }
+
+// tagError classifies err with sentinel, leaving err's message untouched.
+// Returns nil if err is nil, so it is safe to apply unconditionally.
+func tagError(sentinel, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &taggedError{sentinel: sentinel, cause: err}
+}
 
 // nextProposerTimestamp returns a time.Time that is guaranteed to be
 // strictly increasing across concurrent callers within a single
