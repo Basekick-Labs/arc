@@ -54,6 +54,10 @@ func setupRBACStatusTest(t *testing.T) (*fiber.App, *auth.RBACManager) {
 	app.Post("/teams/:team_id/roles", h.createRole)
 	app.Patch("/roles/:id", h.updateRole)
 	app.Post("/roles/:role_id/measurements", h.createMeasurementPermission)
+	app.Delete("/orgs/:id", h.deleteOrganization)
+	app.Delete("/teams/:id", h.deleteTeam)
+	app.Delete("/roles/:id", h.deleteRole)
+	app.Delete("/measurement-permissions/:id", h.deleteMeasurementPermission)
 
 	return app, rm
 }

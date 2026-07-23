@@ -107,7 +107,17 @@ Two remaining cases in the RBAC API reported client-supplied bad input as `500 I
 
 Error *messages* are unchanged — only the status codes differ. Clients that branch on the response body are unaffected; clients that branch on the status code get a correct one. A regression test pins the exact message text so this stays true.
 
-Internally, these paths now classify errors with typed sentinels (`errors.Is`) instead of matching on message text, so rewording one of them cannot change a status code. This covers the name-collision, name-validation, and role-input paths; a few other conditions in the RBAC handlers are still matched by error string and are left for follow-up work.
+Internally, these paths now classify errors with typed sentinels (`errors.Is`) instead of matching on message text, so rewording one of them cannot change a status code. The remaining not-found and required-field conditions were converted in the same release (see below).
+
+### RBAC status codes no longer depend on error-message text
+
+Follow-up to the sentinel work above. The RBAC handlers previously decided several status codes by comparing `err.Error()` against exact strings such as `"team not found"` and `"database pattern is required"` — 16 comparisons across the RBAC routes and the token-membership endpoints. Rewording any of those messages would have silently changed an endpoint's status code, with nothing to catch it.
+
+All of them now use typed sentinels (`ErrNotFound`, `ErrMissingField`, `ErrConflict`) matched with `errors.Is`. Error messages and every status code are unchanged — this is an internal robustness change with no API-visible effect.
+
+Scope: this covers every status decision in the RBAC handlers (`rbac_routes.go`) and the two RBAC-gated token-membership endpoints. The plain token endpoints (`PATCH`/`DELETE /api/v1/auth/tokens/:id`) still match `"token not found"` by string; those are served by `AuthManager`, not the RBAC manager, and converting them is separate work.
+
+One asymmetry is deliberately preserved: a missing entity returns **`404`** when it is the target of the request (`PATCH /organizations/:id`) but **`400`** when it is the parent of a create (`POST /organizations/:org_id/teams`). Both surface the same underlying error, so the distinction lives in the handlers; a regression test now pins it, since a central not-found mapping would otherwise have flipped three create endpoints from `400` to `404`.
 
 ### Optional timestamp fields are now omitted when unset, and rendered in UTC ([#546](https://github.com/Basekick-Labs/arc/issues/546))
 

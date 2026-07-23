@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"strconv"
 	"time"
 
@@ -555,7 +556,10 @@ func (h *AuthHandler) addTokenToTeam(c *fiber.Ctx) error {
 	membership, err := h.rbacManager.AddTokenToTeam(c.UserContext(), tokenID, req.TeamID)
 	if err != nil {
 		status := fiber.StatusInternalServerError
-		if err.Error() == "team not found" || err.Error() == "token is already a member of this team" {
+		// Both stay 400 (not 404/409) to preserve the existing contract:
+		// the team ID comes from the request body, and "already a member"
+		// has always been reported as a bad request here.
+		if errors.Is(err, auth.ErrNotFound) || errors.Is(err, auth.ErrConflict) {
 			status = fiber.StatusBadRequest
 		}
 		return c.Status(status).JSON(fiber.Map{
@@ -604,7 +608,7 @@ func (h *AuthHandler) removeTokenFromTeam(c *fiber.Ctx) error {
 
 	err = h.rbacManager.RemoveTokenFromTeam(c.UserContext(), tokenID, teamID)
 	if err != nil {
-		if err.Error() == "token membership not found" {
+		if errors.Is(err, auth.ErrNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Token is not a member of this team",
