@@ -33,12 +33,17 @@ func NewRBACHandler(authManager *auth.AuthManager, rbacManager *auth.RBACManager
 // uses errors.Is against the exported sentinels, so rewording any error
 // these sentinels tag cannot change a status code (issue #549).
 //
-// Scope: this covers the name-collision, name-validation, and role-input
-// paths. Several other 400/404 conditions in this file are still matched
-// by exact error string at their call sites ("team not found", "database
-// pattern is required", and similar) and remain message-text dependent.
-// Converting those is deliberate future work, not something this helper
-// already delivers.
+// Scope: this helper covers the conditions whose status code is the same
+// at every call site — name collisions, name validation, and role input.
+//
+// ErrNotFound and ErrMissingField are deliberately NOT handled here.
+// ErrMissingField only arises on create paths, and ErrNotFound is
+// genuinely ambiguous: the same error means 404 when the missing entity
+// is the request's target (PATCH /orgs/:id) but 400 when it is the parent
+// of a create (POST /orgs/:org_id/teams). Centralising it would have to
+// pick one and silently break the other, so each handler matches those
+// two sentinels itself. See TestRBACNotFoundStatusContract, which pins
+// the asymmetry.
 //
 // Returns 0 when the error is not a recognised client error, leaving the
 // caller to apply its own default (500, or a handler-specific 404).
@@ -220,7 +225,7 @@ func (h *RBACHandler) updateOrganization(c *fiber.Ctx) error {
 
 	err = h.rbacManager.UpdateOrganization(c.UserContext(), id, &req)
 	if err != nil {
-		if err.Error() == "organization not found" {
+		if errors.Is(err, auth.ErrNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Organization not found",
@@ -256,7 +261,7 @@ func (h *RBACHandler) deleteOrganization(c *fiber.Ctx) error {
 
 	err = h.rbacManager.DeleteOrganization(c.UserContext(), id)
 	if err != nil {
-		if err.Error() == "organization not found" {
+		if errors.Is(err, auth.ErrNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Organization not found",
@@ -338,11 +343,12 @@ func (h *RBACHandler) createTeam(c *fiber.Ctx) error {
 	team, err := h.rbacManager.CreateTeam(c.UserContext(), orgID, &req)
 	if err != nil {
 		status := fiber.StatusInternalServerError
-		if err.Error() == "organization not found" {
-			// Kept at 400 to preserve the pre-#549 contract. The org ID
-			// comes from the URL path, so 404 is arguably more correct,
-			// but changing it would break existing clients — out of
-			// scope here.
+		if errors.Is(err, auth.ErrNotFound) {
+			// The missing entity is this create's PARENT, not its
+			// target, and Arc has always reported that as 400. 404 is
+			// arguably more correct, but changing it would break
+			// existing clients — out of scope here. This is why
+			// ErrNotFound is not mapped centrally in rbacErrorStatus.
 			status = fiber.StatusBadRequest
 		}
 		if s := rbacErrorStatus(err); s != 0 {
@@ -420,7 +426,7 @@ func (h *RBACHandler) updateTeam(c *fiber.Ctx) error {
 
 	err = h.rbacManager.UpdateTeam(c.UserContext(), id, &req)
 	if err != nil {
-		if err.Error() == "team not found" {
+		if errors.Is(err, auth.ErrNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Team not found",
@@ -456,7 +462,7 @@ func (h *RBACHandler) deleteTeam(c *fiber.Ctx) error {
 
 	err = h.rbacManager.DeleteTeam(c.UserContext(), id)
 	if err != nil {
-		if err.Error() == "team not found" {
+		if errors.Is(err, auth.ErrNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Team not found",
@@ -532,10 +538,9 @@ func (h *RBACHandler) createRole(c *fiber.Ctx) error {
 	role, err := h.rbacManager.CreateRole(c.UserContext(), teamID, &req)
 	if err != nil {
 		status := fiber.StatusInternalServerError
-		errMsg := err.Error()
-		if errMsg == "database pattern is required" ||
-			errMsg == "at least one permission is required" ||
-			errMsg == "team not found" {
+		// ErrNotFound here is the parent team from the URL path, so this
+		// is 400 rather than 404 — see createTeam for the same shape.
+		if errors.Is(err, auth.ErrMissingField) || errors.Is(err, auth.ErrNotFound) {
 			status = fiber.StatusBadRequest
 		}
 		if s := rbacErrorStatus(err); s != 0 {
@@ -543,7 +548,7 @@ func (h *RBACHandler) createRole(c *fiber.Ctx) error {
 		}
 		return c.Status(status).JSON(fiber.Map{
 			"success": false,
-			"error":   errMsg,
+			"error":   err.Error(),
 		})
 	}
 
@@ -613,7 +618,7 @@ func (h *RBACHandler) updateRole(c *fiber.Ctx) error {
 
 	err = h.rbacManager.UpdateRole(c.UserContext(), id, &req)
 	if err != nil {
-		if err.Error() == "role not found" {
+		if errors.Is(err, auth.ErrNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Role not found",
@@ -649,7 +654,7 @@ func (h *RBACHandler) deleteRole(c *fiber.Ctx) error {
 
 	err = h.rbacManager.DeleteRole(c.UserContext(), id)
 	if err != nil {
-		if err.Error() == "role not found" {
+		if errors.Is(err, auth.ErrNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Role not found",
@@ -718,10 +723,9 @@ func (h *RBACHandler) createMeasurementPermission(c *fiber.Ctx) error {
 	perm, err := h.rbacManager.CreateMeasurementPermission(c.UserContext(), roleID, &req)
 	if err != nil {
 		status := fiber.StatusInternalServerError
-		errMsg := err.Error()
-		if errMsg == "measurement pattern is required" ||
-			errMsg == "at least one permission is required" ||
-			errMsg == "role not found" {
+		// ErrNotFound here is the parent role from the URL path, so this
+		// is 400 rather than 404 — see createTeam for the same shape.
+		if errors.Is(err, auth.ErrMissingField) || errors.Is(err, auth.ErrNotFound) {
 			status = fiber.StatusBadRequest
 		}
 		if s := rbacErrorStatus(err); s != 0 {
@@ -729,7 +733,7 @@ func (h *RBACHandler) createMeasurementPermission(c *fiber.Ctx) error {
 		}
 		return c.Status(status).JSON(fiber.Map{
 			"success": false,
-			"error":   errMsg,
+			"error":   err.Error(),
 		})
 	}
 
@@ -751,7 +755,7 @@ func (h *RBACHandler) deleteMeasurementPermission(c *fiber.Ctx) error {
 
 	err = h.rbacManager.DeleteMeasurementPermission(c.UserContext(), id)
 	if err != nil {
-		if err.Error() == "measurement permission not found" {
+		if errors.Is(err, auth.ErrNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Measurement permission not found",
