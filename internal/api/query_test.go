@@ -1124,6 +1124,47 @@ func TestValidateSQLRequest_BypassesAndFalsePositives(t *testing.T) {
 		{name: "table named globthing not blocked", sql: "SELECT * FROM globthing", shouldFail: false},
 		{name: "column named read_csv_count not blocked", sql: "SELECT read_csv_count FROM cpu", shouldFail: false},
 
+		// GHSA-w8x2-cccw-25f7 (incomplete-fix residual of GHSA-93cm): a bare
+		// single-quoted string in table position is a DuckDB replacement scan —
+		// it reads the file with NO function name, so it slips past the
+		// I/O-function denylist above, and extractTableReferences masks the
+		// quoted path to a placeholder so RBAC never sees it. Must be rejected.
+		{name: "bare-string replacement scan single file", sql: "SELECT * FROM '/data/arc/db2/secrets/data.parquet'", shouldFail: true},
+		{name: "bare-string replacement scan glob", sql: "SELECT * FROM '/data/arc/*/**/*.parquet'", shouldFail: true},
+		{name: "bare-string replacement scan comma cross-join", sql: "SELECT b.s FROM cpu, '/data/arc/db2/secrets/data.parquet' b", shouldFail: true},
+		{name: "bare-string replacement scan in JOIN", sql: "SELECT * FROM cpu JOIN '/data/arc/db2/x.parquet' b ON cpu.id = b.id", shouldFail: true},
+		{name: "bare-string replacement scan in subquery FROM", sql: "SELECT * FROM (SELECT * FROM '/data/arc/db2/x.parquet')", shouldFail: true},
+		{name: "bare-string replacement scan uppercase FROM", sql: "SELECT * FROM '/data/arc/db2/x.parquet'", shouldFail: true},
+		{name: "bare-string replacement scan comma after subquery", sql: "SELECT * FROM (SELECT 1) a, '/data/arc/db2/x.parquet' b", shouldFail: true},
+		// GHSA-w8x2 review blocker 1: a subquery WITH an inner FROM must not
+		// clear the OUTER FROM clause — the trailing comma cross-join is still
+		// table position. (The no-inner-FROM case above never clobbered state.)
+		{name: "bare-string comma after subquery WITH inner FROM", sql: "SELECT * FROM (SELECT * FROM cpu) a, '/data/arc/db2/secrets/data.parquet' b", shouldFail: true},
+		{name: "bare-string comma after subquery no alias inner FROM", sql: "SELECT * FROM (SELECT * FROM cpu), '/data/arc/db2/x.parquet'", shouldFail: true},
+		{name: "bare-string comma after subquery inner WHERE", sql: "SELECT b.s FROM (SELECT id FROM cpu WHERE id=1) a, '/data/arc/db2/x.parquet' b", shouldFail: true},
+		// GHSA-w8x2 review blocker 2: no whitespace between FROM/JOIN and the
+		// quote — masking glues keyword+placeholder; must still tokenise apart.
+		{name: "bare-string no space after FROM", sql: "SELECT * FROM'/data/arc/db2/x.parquet'", shouldFail: true},
+		{name: "bare-string no space glued SELECT and FROM", sql: "SELECT*FROM'/data/arc/db2/x.parquet'", shouldFail: true},
+		{name: "bare-string no space after JOIN", sql: "SELECT * FROM cpu JOIN'/data/arc/db2/x.parquet' b ON cpu.id=b.id", shouldFail: true},
+		// Three-way comma cross-join, string last.
+		{name: "bare-string third in comma chain", sql: "SELECT * FROM cpu, mem, '/data/arc/db2/x.parquet'", shouldFail: true},
+		// Comma cross-join still armed after a JOIN ... ON predicate.
+		{name: "bare-string comma after JOIN ON predicate", sql: "SELECT * FROM a JOIN b ON a.id=b.id, '/data/arc/db2/x.parquet'", shouldFail: true},
+		// False-positive guards: a quoted string used as a VALUE (WHERE/SELECT
+		// literal, or a function argument) is NOT table position and must pass.
+		{name: "string value in WHERE not table position", sql: "SELECT * FROM cpu WHERE path = '/data/arc/db2/secrets/data.parquet'", shouldFail: false},
+		{name: "string arg to date_trunc not table position", sql: "SELECT date_trunc('hour', time) FROM cpu", shouldFail: false},
+		{name: "string arg after comma in function not table position", sql: "SELECT coalesce(host, '/default/path') FROM cpu", shouldFail: false},
+		{name: "string literal in SELECT projection not table position", sql: "SELECT '/data/x.parquet' AS note FROM cpu", shouldFail: false},
+		{name: "string in GROUP BY-adjacent comma not table position", sql: "SELECT host, count(*) FROM cpu GROUP BY host ORDER BY count(*), '/x'", shouldFail: false},
+		{name: "string arg to strftime after comma-join table not flagged", sql: "SELECT strftime(time, '%Y') FROM cpu, mem", shouldFail: false},
+		{name: "string in JOIN ON predicate not table position", sql: "SELECT * FROM cpu JOIN mem ON mem.tag = 'x'", shouldFail: false},
+		{name: "VALUES clause with string not table position", sql: "SELECT * FROM (VALUES ('a'), ('b')) t(x)", shouldFail: false},
+		{name: "string in second UNION arm WHERE not table position", sql: "SELECT host FROM cpu UNION SELECT host FROM mem WHERE host = '/data/x'", shouldFail: false},
+		{name: "string in IN-list not table position", sql: "SELECT * FROM cpu WHERE host IN ('a', 'b', '/data/x.parquet')", shouldFail: false},
+		{name: "string comma-arg in coalesce after comma-join not flagged", sql: "SELECT coalesce(a, '/x'), b FROM cpu, mem", shouldFail: false},
+
 		// Multi-statement smuggling — a second statement behind a semicolon
 		// bypasses the anchored SHOW regexes, so reject >1 statement outright.
 		{name: "SHOW smuggled behind semicolon", sql: "SHOW DATABASES; SELECT 1", shouldFail: true},
