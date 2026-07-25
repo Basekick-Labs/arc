@@ -45,6 +45,16 @@ Separately, the pruner's two internal TTL caches (glob results and partition pat
 
 Reachable in every deployment mode (the pruner runs on every `FROM`/`JOIN` query); pre-existing on `main`, unrelated to any other work in this release.
 
+### Replacement-scan RBAC bypass: reject single-quoted strings in table position ([GHSA-w8x2-cccw-25f7](https://github.com/Basekick-Labs/arc/security/advisories/GHSA-w8x2-cccw-25f7))
+
+An authenticated tenant on an RBAC-enabled multi-tenant instance could read any Parquet file inside the allow-listed storage root — including other tenants' databases — by writing a **bare single-quoted string in table position**: `SELECT * FROM '/data/arc/db2/secrets/*.parquet'`. DuckDB resolves such a string as a *replacement scan* that reads the file directly, with **no function name**. Arc's two query-authorization controls both key on function names — the I/O-function denylist (`read_parquet`, `parquet_scan`, `glob`, …) and the RBAC table extractor — so the bare string slipped past the denylist, and the extractor masked the quoted path to a placeholder before matching, so RBAC never saw the foreign path. The comma form (`SELECT b.s FROM cpu, '/data/arc/db2/secrets/*.parquet' b`) needed only a single legitimate grant.
+
+This is an incomplete-fix residual of [GHSA-93cm-2v4m-c56c](https://github.com/Basekick-Labs/arc/security/advisories/GHSA-93cm-2v4m-c56c): the same root cause (authorization keyed on function names), via the one table-position syntax that carries no function name. It is a within-allow-list cross-database read — it does **not** escape the DuckDB sandbox to arbitrary OS files (`enable_external_access=false` holds).
+
+The fix rejects, in `ValidateSQLRequest` (before any transform or RBAC check runs), any single-quoted string standing where a table reference belongs — after `FROM`/`JOIN`, or continuing a `FROM` clause's table list via a cross-join comma — while leaving single-quoted strings used as values (`WHERE`, `IN`, function arguments) and legitimately quoted *identifiers* (`FROM "my table"`) untouched. Arc's own transform layer, which emits `read_parquet('…')` under the caller's identity, runs after validation and is unaffected. The denylist test matrix now covers the replacement-scan forms — single-file, glob, comma cross-join, `JOIN`, subquery, and the no-whitespace (`FROM'…'`) variant.
+
+Reachable only when RBAC is enabled (the multi-tenant authorization boundary); no CVE is being filed, as it is a residual of GHSA-93cm scoped to within the allow-list, tracked under the advisory above. Reported by [@arpitjain099](https://github.com/arpitjain099).
+
 ## Bug fixes
 
 ### `date_trunc`/`time_bucket` epoch rewrite no longer corrupts parenthesized column arguments ([#535](https://github.com/Basekick-Labs/arc/issues/535))
@@ -157,13 +167,13 @@ Every received MQTT message took a full write-lock on the subscriber's state mut
 
 ## Impact by deployment mode
 
-The forwarding-header and loop-guard changes are cluster-only; the partition-pruner DoS fix (#536) applies to **every** deployment mode, since the pruner runs on every query.
+The forwarding-header and loop-guard changes are cluster-only; the partition-pruner DoS fix (#536) applies to **every** deployment mode, since the pruner runs on every query. The replacement-scan RBAC fix (GHSA-w8x2) applies wherever RBAC is enabled — it is the multi-tenant authorization boundary.
 
-| Deployment | Forwarding-header / loop-guard changes | Partition-pruner DoS fix (#536) |
-|---|---|---|
-| Single-node / OSS standalone (no cluster router) | **No.** The forwarding path never executes; behavior is byte-for-byte identical to 26.06.3. | **Yes.** Applies to every query. |
-| Clustered, homogeneous nodes (every node can serve every request) | Header-stripping applies to forwarded requests; loop-guard reorder is a no-op because nodes serve locally. | **Yes.** Applies to every query. |
-| Clustered with role separation (reader / writer / compactor) | Header-stripping applies; a spoofed or looped `X-Arc-Forwarded-By` on a non-capable node now returns `508` instead of a failed local attempt. | **Yes.** Applies to every query. |
+| Deployment | Forwarding-header / loop-guard changes | Partition-pruner DoS fix (#536) | Replacement-scan RBAC fix (GHSA-w8x2) |
+|---|---|---|---|
+| Single-node / OSS standalone (no cluster router) | **No.** The forwarding path never executes; behavior is byte-for-byte identical to 26.06.3. | **Yes.** Applies to every query. | **Only if RBAC is enabled.** The table-position check runs on every query, but the cross-tenant read it prevents requires RBAC. |
+| Clustered, homogeneous nodes (every node can serve every request) | Header-stripping applies to forwarded requests; loop-guard reorder is a no-op because nodes serve locally. | **Yes.** Applies to every query. | **Only if RBAC is enabled.** |
+| Clustered with role separation (reader / writer / compactor) | Header-stripping applies; a spoofed or looped `X-Arc-Forwarded-By` on a non-capable node now returns `508` instead of a failed local attempt. | **Yes.** Applies to every query. | **Only if RBAC is enabled.** |
 
 ## Upgrade notes
 
