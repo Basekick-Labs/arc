@@ -65,6 +65,18 @@ No current code path mutates a batch's `Files` in place, so this was latent rath
 
 Both sites now copy into independent backing arrays, including the single-batch (`len(Files) <= MaxFilesPerBatch`) path that previously returned the caller's slice unchanged. Batch isolation no longer depends on file count: mutating any returned batch cannot affect another batch or the original candidate.
 
+### Backup no longer loads entire files into memory ([#322](https://github.com/Basekick-Labs/arc/issues/322))
+
+`CreateBackup` read each Parquet file entirely into memory (`dataStorage.Read` → `backupStorage.Write`) before writing it to backup storage. With large Parquet files (the default 1M buffer size produces ~10–14MB files each; partitions can have hundreds), a backup of a moderately-sized database could spike process memory to gigabytes, triggering OOM kills or swapping.
+
+Backup now streams each file through a temp file: `dataStorage.ReadTo` writes the source into a temp file on disk, then `backupStorage.WriteReader` streams the temp file to backup storage. Peak memory per file is bounded by the I/O buffer size (typically 32KB) instead of the file size. The SQLite metadata backup uses the same streaming pattern (`os.Open` → `WriteReader`) instead of `os.ReadFile`. The pattern matches the existing restore path (`streamRestoreFile`), which already streamed in both directions.
+
+Failure handling is deliberately narrow about what it tolerates. Only a failure to **read the source file** is skippable — that file may legitimately have been removed by compaction or retention between the listing and the copy, and aborting a whole backup over that benign race would be wrong. Every other failure (temp file creation, seek, backup-storage write) is fatal and aborts the backup: those indicate a broken environment, not a race, and a backup that silently omits files while reporting success is worse than one that fails loudly.
+
+Skipped files are now counted in the backup manifest (`skipped_files`) and in the progress API, so an incomplete backup is visible without reading logs — the manifest's `total_files` describes what was inventoried, not necessarily what was stored. If **every** file proves unreadable, the backup now fails rather than producing an empty backup that reports success.
+
+**Operational note:** streaming trades memory pressure for temp disk usage. Each file being backed up requires temp disk space equal to its size. In container environments with a small `/tmp` (tmpfs), set `TMPDIR` to a volume with sufficient space, or ensure the default temp directory has room for the largest Parquet file. If the temp directory is unusable the backup fails with a clear error rather than silently skipping files.
+
 ### `date_trunc`/`time_bucket` epoch rewrite no longer corrupts parenthesized column arguments ([#535](https://github.com/Basekick-Labs/arc/issues/535))
 
 Arc rewrites `date_trunc('hour', col)` (and `time_bucket(...)`) into faster epoch arithmetic. The rewriter extracted the column argument with a paren-blind regex that stopped at the **first** `)` rather than the matching one. When the column argument itself contained parentheses — `coalesce(time, a)`, `(time)`, `CAST(ts AS TIMESTAMP)`, or any nested call — the capture was truncated and the `::BIGINT` cast was spliced into the wrong place, producing SQL that failed at the DuckDB binder (`No function matches ... 'epoch(BIGINT)'`) on a query DuckDB would otherwise have run correctly.
