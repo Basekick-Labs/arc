@@ -454,10 +454,12 @@ func (m *Manager) compactFilesAdaptively(ctx context.Context, candidate Candidat
 		return err
 	}
 
-	// Split batch in half and try each half
+	// Split batch in half and try each half (copy to independent backing arrays)
 	mid := len(files) / 2
-	firstHalf := files[:mid]
-	secondHalf := files[mid:]
+	firstHalf := make([]string, mid)
+	copy(firstHalf, files[:mid])
+	secondHalf := make([]string, len(files)-mid)
+	copy(secondHalf, files[mid:])
 
 	m.logger.Warn().
 		Int("depth", depth).

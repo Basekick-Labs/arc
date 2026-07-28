@@ -57,6 +57,14 @@ Reachable only when RBAC is enabled (the multi-tenant authorization boundary); n
 
 ## Bug fixes
 
+### Compaction batch splitting no longer produces aliased file slices ([#292](https://github.com/Basekick-Labs/arc/issues/292))
+
+`SplitCandidateIntoBatches` partitioned a candidate's file list into batches using `c.Files[start:end]` sub-slices, which share the original's backing array — so every batch pointed into the same underlying memory. The same pattern existed in `compactFilesAdaptively`, which split a failed batch in half with `files[:mid]` / `files[mid:]`.
+
+No current code path mutates a batch's `Files` in place, so this was latent rather than an active source of corruption — compaction jobs never produced wrong file lists because of it. But it left every future caller one in-place sort or append away from silently rewriting sibling batches, with no error or log signal.
+
+Both sites now copy into independent backing arrays, including the single-batch (`len(Files) <= MaxFilesPerBatch`) path that previously returned the caller's slice unchanged. Batch isolation no longer depends on file count: mutating any returned batch cannot affect another batch or the original candidate.
+
 ### `date_trunc`/`time_bucket` epoch rewrite no longer corrupts parenthesized column arguments ([#535](https://github.com/Basekick-Labs/arc/issues/535))
 
 Arc rewrites `date_trunc('hour', col)` (and `time_bucket(...)`) into faster epoch arithmetic. The rewriter extracted the column argument with a paren-blind regex that stopped at the **first** `)` rather than the matching one. When the column argument itself contained parentheses — `coalesce(time, a)`, `(time)`, `CAST(ts AS TIMESTAMP)`, or any nested call — the capture was truncated and the `::BIGINT` cast was spliced into the wrong place, producing SQL that failed at the DuckDB binder (`No function matches ... 'epoch(BIGINT)'`) on a query DuckDB would otherwise have run correctly.

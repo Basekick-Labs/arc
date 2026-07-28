@@ -31,9 +31,15 @@ type Candidate struct {
 // SplitCandidateIntoBatches splits a candidate with many files into multiple candidates,
 // each with at most MaxFilesPerBatch files. This prevents DuckDB segfaults when processing
 // thousands of files in a single read_parquet() call.
+//
+// Every returned batch owns an independent Files backing array, including the
+// single-batch case. Callers may mutate a batch's Files without affecting the
+// input candidate or any sibling batch.
 func SplitCandidateIntoBatches(c Candidate) []Candidate {
 	if len(c.Files) <= MaxFilesPerBatch {
-		return []Candidate{c}
+		single := c
+		single.Files = append([]string(nil), c.Files...)
+		return []Candidate{single}
 	}
 
 	// Calculate number of batches needed
@@ -47,11 +53,14 @@ func SplitCandidateIntoBatches(c Candidate) []Candidate {
 			end = len(c.Files)
 		}
 
+		filesCopy := make([]string, end-start)
+		copy(filesCopy, c.Files[start:end])
+
 		batch := Candidate{
 			Database:      c.Database,
 			Measurement:   c.Measurement,
 			PartitionPath: c.PartitionPath,
-			Files:         c.Files[start:end],
+			Files:         filesCopy,
 			FileCount:     end - start,
 			Tier:          c.Tier,
 			PartitionTime: c.PartitionTime,
