@@ -31,6 +31,20 @@ import (
 // mode added here later is fatal by default until someone marks it skippable.
 var errBackupRead = errors.New("backup source read failed")
 
+// maxSkipRatio is the fraction of data files that may be skipped before the
+// backup is treated as failed rather than merely incomplete.
+//
+// Skipping exists to tolerate one narrow race: a file removed by compaction or
+// retention between the listing and the copy. That affects a small number of
+// files at the tail of a run, so a low ceiling is enough to absorb it. Anything
+// above this is a different event — throttling, credential expiry, a storage
+// outage — where returning a fraction of the data as a "successful" backup
+// hides the gap until a restore needs it.
+//
+// Deliberately a constant, not a config key: no operator has needed to tune it,
+// and a knob nobody sets is a knob nobody tests.
+const maxSkipRatio = 0.10
+
 func isSourceReadError(err error) bool {
 	return errors.Is(err, errBackupRead)
 }
@@ -202,8 +216,9 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 // copyDataFiles copies parquet files from data storage to backup storage.
 //
 // Files whose source cannot be read are skipped (see errBackupRead) and counted
-// in progress.SkippedFiles. Every other failure aborts the backup. If every file
-// was skipped, the backup fails rather than reporting success over an empty set.
+// in progress.SkippedFiles. Every other failure aborts the backup immediately.
+// If more than maxSkipRatio of the files were skipped, the backup fails rather
+// than reporting success over a fraction of the data.
 func (m *Manager) copyDataFiles(ctx context.Context, backupID string, files []storage.ObjectInfo, progress *Progress) error {
 	var skipped int64
 
@@ -242,19 +257,27 @@ func (m *Manager) copyDataFiles(ctx context.Context, backupID string, files []st
 
 	atomic.StoreInt64(&progress.SkippedFiles, skipped)
 
-	// Every single file failed to read. That is an unreadable source storage,
-	// not the benign delete-during-backup race that skipping exists to tolerate.
-	// Reporting success here would produce an empty backup that looks valid.
-	if skipped > 0 && atomic.LoadInt64(&progress.ProcessedFiles) == 0 {
-		return fmt.Errorf("backup failed: all %d data files were unreadable", skipped)
+	if skipped == 0 {
+		return nil
 	}
 
-	if skipped > 0 {
-		m.logger.Warn().
-			Int64("skipped", skipped).
-			Int64("copied", atomic.LoadInt64(&progress.ProcessedFiles)).
-			Msg("Backup completed with skipped files — backup is incomplete")
+	copied := atomic.LoadInt64(&progress.ProcessedFiles)
+
+	// Skipping tolerates one specific thing: a file removed by compaction or
+	// retention between the listing and the copy. That race touches a handful of
+	// files at the tail of a run. A large fraction of the backup failing to read
+	// is a different event — throttling, credential expiry, a storage outage —
+	// and silently returning a fraction of the data as a successful backup is how
+	// an operator discovers the gap at restore time instead of at backup time.
+	if float64(skipped) > maxSkipRatio*float64(len(files)) {
+		return fmt.Errorf("backup failed: %d of %d data files were unreadable (>%.0f%%), source storage may be degraded",
+			skipped, len(files), maxSkipRatio*100)
 	}
+
+	m.logger.Warn().
+		Int64("skipped", skipped).
+		Int64("copied", copied).
+		Msg("Backup completed with skipped files — backup is incomplete")
 
 	return nil
 }
@@ -297,10 +320,37 @@ func (m *Manager) streamBackupFile(ctx context.Context, srcPath, destPath string
 
 	// Stream from temp file to backup storage
 	if err := m.backupStorage.WriteReader(ctx, destPath, tmpFile, size); err != nil {
+		m.cleanupPartialWrite(ctx, destPath)
 		return 0, fmt.Errorf("failed to write to backup storage: %w", err)
 	}
 
 	return size, nil
+}
+
+// partSuffix mirrors the staging suffix LocalBackend.WriteReader uses for
+// in-progress writes. Kept in sync with internal/storage/local.go#partPath.
+const partSuffix = ".part"
+
+// cleanupPartialWrite removes the staging file a failed WriteReader leaves behind.
+//
+// LocalBackend.WriteReader deliberately preserves "<path>.part" on failure so the
+// file-replication puller can resume from the last committed byte. Backup has no
+// resume path — a retried backup starts over under a fresh backup ID — so that
+// staging file is unreferenced garbage: never read, never listed as a backup
+// (it has no manifest.json), and holding disk equal to the bytes transferred
+// before the failure.
+//
+// Best-effort by design: the write already failed, so the cleanup very likely
+// fails too (unwritable volume, storage unreachable). A cleanup failure must not
+// mask the real error, so it is logged at debug and discarded.
+func (m *Manager) cleanupPartialWrite(ctx context.Context, destPath string) {
+	stagingPath := destPath + partSuffix
+	if err := m.backupStorage.Delete(ctx, stagingPath); err != nil {
+		m.logger.Debug().
+			Str("path", stagingPath).
+			Err(err).
+			Msg("Could not remove partial backup staging file")
+	}
 }
 
 // backupSQLite copies the SQLite database file into the backup.

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/basekick-labs/arc/internal/storage"
@@ -177,30 +179,87 @@ func TestCopyDataFiles_SkipsFailedFiles(t *testing.T) {
 		logger:        logger,
 	}
 
-	// Write only one file; the other will fail to read
-	goodFile := storage.ObjectInfo{Path: "db/cpu/2026/07/28/00/good.parquet", Size: 100}
-	if err := dataStorage.Write(ctx, goodFile.Path, bytes.Repeat([]byte("y"), 100)); err != nil {
-		t.Fatalf("failed to write test file: %v", err)
+	// 20 readable files plus one missing: a single skip stays under maxSkipRatio,
+	// so the backup tolerates it. (See TestCopyDataFiles_SkipRatioExceeded for the
+	// case where too many files are skipped.)
+	var files []storage.ObjectInfo
+	files = append(files, storage.ObjectInfo{Path: "db/cpu/2026/07/28/00/missing.parquet", Size: 100})
+	for i := 0; i < 20; i++ {
+		f := storage.ObjectInfo{Path: fmt.Sprintf("db/cpu/2026/07/28/00/good_%d.parquet", i), Size: 100}
+		if err := dataStorage.Write(ctx, f.Path, bytes.Repeat([]byte("y"), 100)); err != nil {
+			t.Fatalf("failed to write test file: %v", err)
+		}
+		files = append(files, f)
 	}
-
-	badFile := storage.ObjectInfo{Path: "db/cpu/2026/07/28/00/missing.parquet", Size: 100}
 
 	backupID := "backup-test-skip"
 	progress := &Progress{
 		Operation:  "backup",
 		BackupID:   backupID,
 		Status:     "running",
-		TotalFiles: 2,
+		TotalFiles: int64(len(files)),
 	}
 
-	// Should not return error — failed files are skipped
-	if err := m.copyDataFiles(ctx, backupID, []storage.ObjectInfo{badFile, goodFile}, progress); err != nil {
+	// Should not return error — an isolated unreadable file is skipped
+	if err := m.copyDataFiles(ctx, backupID, files, progress); err != nil {
 		t.Fatalf("copyDataFiles should not fail on individual file errors: %v", err)
 	}
 
-	// Only the good file should have been processed
-	if progress.ProcessedFiles != 1 {
-		t.Errorf("expected 1 processed file (skipped bad file), got %d", progress.ProcessedFiles)
+	if progress.ProcessedFiles != 20 {
+		t.Errorf("expected 20 processed files (skipped bad file), got %d", progress.ProcessedFiles)
+	}
+	if progress.SkippedFiles != 1 {
+		t.Errorf("expected 1 skipped file, got %d", progress.SkippedFiles)
+	}
+}
+
+// Skipping tolerates the compaction/retention race, not a storage outage. Once
+// more than maxSkipRatio of the files fail to read, the backup must fail rather
+// than return a fraction of the data as a success.
+func TestCopyDataFiles_SkipRatioExceeded(t *testing.T) {
+	ctx := context.Background()
+	logger := zerolog.Nop()
+
+	dataDir := t.TempDir()
+	dataStorage, err := storage.NewLocalBackend(dataDir, logger)
+	if err != nil {
+		t.Fatalf("failed to create data storage: %v", err)
+	}
+
+	backupDir := t.TempDir()
+	m := &Manager{
+		dataStorage:   dataStorage,
+		backupStorage: mustLocalBackend(t, backupDir, logger),
+		logger:        logger,
+	}
+
+	// 10 files, 5 of them unreadable — 50%, well over the ratio.
+	var files []storage.ObjectInfo
+	for i := 0; i < 5; i++ {
+		f := storage.ObjectInfo{Path: fmt.Sprintf("db/cpu/2026/07/28/00/ok_%d.parquet", i), Size: 100}
+		if err := dataStorage.Write(ctx, f.Path, bytes.Repeat([]byte("y"), 100)); err != nil {
+			t.Fatalf("failed to write test file: %v", err)
+		}
+		files = append(files, f)
+	}
+	for i := 0; i < 5; i++ {
+		files = append(files, storage.ObjectInfo{
+			Path: fmt.Sprintf("db/cpu/2026/07/28/00/gone_%d.parquet", i),
+			Size: 100,
+		})
+	}
+
+	progress := &Progress{Operation: "backup", TotalFiles: int64(len(files))}
+	err = m.copyDataFiles(ctx, "bkid", files, progress)
+	if err == nil {
+		t.Fatal("expected failure when the skip ratio is exceeded, got nil (partial backup would report success)")
+	}
+	if !strings.Contains(err.Error(), "source storage may be degraded") {
+		t.Errorf("unexpected error: %v", err)
+	}
+	// The count must still be recorded even though the backup failed.
+	if progress.SkippedFiles != 5 {
+		t.Errorf("expected 5 skipped files recorded, got %d", progress.SkippedFiles)
 	}
 }
 
@@ -270,7 +329,8 @@ func TestCopyDataFiles_TempFileFailureIsFatal(t *testing.T) {
 }
 
 // A backup whose every file is unreadable must fail rather than silently
-// producing an empty backup that reports success.
+// producing an empty backup that reports success. (100% skipped also exceeds
+// maxSkipRatio, but this pins the total-loss case explicitly.)
 func TestCopyDataFiles_AllFilesSkippedIsFatal(t *testing.T) {
 	ctx := context.Background()
 	logger := zerolog.Nop()
@@ -319,19 +379,23 @@ func TestCopyDataFiles_PartialSkipRecordsCount(t *testing.T) {
 		logger:        logger,
 	}
 
-	good := storage.ObjectInfo{Path: "db/cpu/2026/07/28/00/good.parquet", Size: 100}
-	if err := dataStorage.Write(ctx, good.Path, bytes.Repeat([]byte("y"), 100)); err != nil {
-		t.Fatalf("failed to write test file: %v", err)
+	// One skip out of 21 files stays under maxSkipRatio.
+	files := []storage.ObjectInfo{{Path: "db/cpu/2026/07/28/00/missing.parquet", Size: 100}}
+	for i := 0; i < 20; i++ {
+		f := storage.ObjectInfo{Path: fmt.Sprintf("db/cpu/2026/07/28/00/good_%d.parquet", i), Size: 100}
+		if err := dataStorage.Write(ctx, f.Path, bytes.Repeat([]byte("y"), 100)); err != nil {
+			t.Fatalf("failed to write test file: %v", err)
+		}
+		files = append(files, f)
 	}
-	missing := storage.ObjectInfo{Path: "db/cpu/2026/07/28/00/missing.parquet", Size: 100}
 
-	progress := &Progress{Operation: "backup", TotalFiles: 2}
-	if err := m.copyDataFiles(ctx, "bkid", []storage.ObjectInfo{missing, good}, progress); err != nil {
+	progress := &Progress{Operation: "backup", TotalFiles: int64(len(files))}
+	if err := m.copyDataFiles(ctx, "bkid", files, progress); err != nil {
 		t.Fatalf("partial skip should not fail the backup: %v", err)
 	}
 
-	if progress.ProcessedFiles != 1 {
-		t.Errorf("ProcessedFiles = %d, want 1", progress.ProcessedFiles)
+	if progress.ProcessedFiles != 20 {
+		t.Errorf("ProcessedFiles = %d, want 20", progress.ProcessedFiles)
 	}
 	if progress.SkippedFiles != 1 {
 		t.Errorf("SkippedFiles = %d, want 1", progress.SkippedFiles)
@@ -372,6 +436,133 @@ func TestCopyDataFiles_ProgressUsesActualBytes(t *testing.T) {
 	if progress.ProcessedBytes != 50 {
 		t.Errorf("ProcessedBytes = %d, want 50 (actual bytes, not the stale listing size)", progress.ProcessedBytes)
 	}
+}
+
+// partialWriteBackend wraps a real backend and makes WriteReader fail partway
+// through, reproducing what LocalBackend does on a transport error: it consumes
+// some of the reader, leaves a "<path>.part" staging file behind, and returns an
+// error. Delete is delegated so cleanup can be observed.
+type partialWriteBackend struct {
+	storage.Backend
+	dir           string
+	deleteCalls   []string
+	failWriteWith error
+}
+
+func (b *partialWriteBackend) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) error {
+	if b.failWriteWith == nil {
+		return b.Backend.WriteReader(ctx, path, reader, size)
+	}
+	// Mimic LocalBackend: stage partial bytes to "<path>.part", then fail and
+	// deliberately leave the staging file in place.
+	stagingPath := filepath.Join(b.dir, path+".part")
+	if err := os.MkdirAll(filepath.Dir(stagingPath), 0o700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(stagingPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	_, _ = io.CopyN(f, reader, 4) // partial transfer
+	f.Close()
+	return b.failWriteWith
+}
+
+func (b *partialWriteBackend) Delete(ctx context.Context, path string) error {
+	b.deleteCalls = append(b.deleteCalls, path)
+	return b.Backend.Delete(ctx, path)
+}
+
+// A failed backup write must not leave an orphaned ".part" staging file in
+// backup storage. LocalBackend keeps it for the replication puller to resume
+// from; backup has no resume path, so it is unreferenced garbage.
+func TestStreamBackupFile_CleansUpPartFileOnWriteFailure(t *testing.T) {
+	ctx := context.Background()
+	logger := zerolog.Nop()
+
+	dataDir := t.TempDir()
+	dataStorage, err := storage.NewLocalBackend(dataDir, logger)
+	if err != nil {
+		t.Fatalf("failed to create data storage: %v", err)
+	}
+
+	backupDir := t.TempDir()
+	backupBackend := &partialWriteBackend{
+		Backend:       mustLocalBackend(t, backupDir, logger),
+		dir:           backupDir,
+		failWriteWith: fmt.Errorf("simulated transport failure"),
+	}
+	m := &Manager{dataStorage: dataStorage, backupStorage: backupBackend, logger: logger}
+
+	srcPath := "db/cpu/2026/07/28/00/a.parquet"
+	if err := dataStorage.Write(ctx, srcPath, bytes.Repeat([]byte("d"), 64)); err != nil {
+		t.Fatalf("failed to write source: %v", err)
+	}
+
+	destPath := "bkid/data/" + srcPath
+	if _, err := m.streamBackupFile(ctx, srcPath, destPath); err == nil {
+		t.Fatal("expected write failure")
+	}
+
+	// The staging file must not survive the failure.
+	staging := filepath.Join(backupDir, destPath+".part")
+	if _, statErr := os.Stat(staging); !os.IsNotExist(statErr) {
+		t.Errorf("orphaned .part file left in backup storage: %s (stat err: %v)", staging, statErr)
+	}
+
+	// And cleanup must have targeted exactly the staging path.
+	if len(backupBackend.deleteCalls) != 1 || backupBackend.deleteCalls[0] != destPath+".part" {
+		t.Errorf("expected cleanup of %q, got delete calls %v", destPath+".part", backupBackend.deleteCalls)
+	}
+}
+
+// A cleanup failure must not mask or replace the original write error.
+func TestStreamBackupFile_CleanupFailureDoesNotMaskWriteError(t *testing.T) {
+	ctx := context.Background()
+	logger := zerolog.Nop()
+
+	dataDir := t.TempDir()
+	dataStorage, err := storage.NewLocalBackend(dataDir, logger)
+	if err != nil {
+		t.Fatalf("failed to create data storage: %v", err)
+	}
+
+	backupDir := t.TempDir()
+	backupBackend := &deleteFailingBackend{
+		Backend:       mustLocalBackend(t, backupDir, logger),
+		failWriteWith: fmt.Errorf("simulated transport failure"),
+	}
+	m := &Manager{dataStorage: dataStorage, backupStorage: backupBackend, logger: logger}
+
+	srcPath := "db/cpu/2026/07/28/00/a.parquet"
+	if err := dataStorage.Write(ctx, srcPath, bytes.Repeat([]byte("d"), 64)); err != nil {
+		t.Fatalf("failed to write source: %v", err)
+	}
+
+	_, err = m.streamBackupFile(ctx, srcPath, "bkid/data/"+srcPath)
+	if err == nil {
+		t.Fatal("expected write failure")
+	}
+	if !strings.Contains(err.Error(), "simulated transport failure") {
+		t.Errorf("original write error was masked by cleanup failure: %v", err)
+	}
+	// Must still be fatal, not reclassified as a skippable read error.
+	if isSourceReadError(err) {
+		t.Errorf("write failure must not be skippable: %v", err)
+	}
+}
+
+type deleteFailingBackend struct {
+	storage.Backend
+	failWriteWith error
+}
+
+func (b *deleteFailingBackend) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) error {
+	return b.failWriteWith
+}
+
+func (b *deleteFailingBackend) Delete(ctx context.Context, path string) error {
+	return fmt.Errorf("simulated cleanup failure")
 }
 
 func mustLocalBackend(t *testing.T, dir string, logger zerolog.Logger) storage.Backend {
