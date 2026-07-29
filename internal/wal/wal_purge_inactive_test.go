@@ -12,6 +12,37 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// waitForEntries blocks until the writer has durably recorded at least want
+// entries, or fails the test after a generous timeout.
+//
+// Append is asynchronous: it enqueues onto entryChan and returns, while a
+// background writer goroutine performs the file write and only then increments
+// TotalEntries. Reading that counter straight after Append therefore races the
+// writer, and a fixed sleep only sets how often the race is lost — on a loaded
+// or heavily-scheduled machine (CI, a container) the writer may not have run at
+// all. Polling makes the test wait for the condition it actually depends on.
+func waitForEntries(t *testing.T, w *Writer, want int64) {
+	t.Helper()
+
+	const (
+		timeout = 5 * time.Second
+		step    = 2 * time.Millisecond
+	)
+
+	deadline := time.Now().Add(timeout)
+	for {
+		got := atomic.LoadInt64(&w.TotalEntries)
+		if got >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %v waiting for %d entries; TotalEntries=%d dropped=%d",
+				timeout, want, got, atomic.LoadInt64(&w.DroppedEntries))
+		}
+		time.Sleep(step)
+	}
+}
+
 // ==========================================================================
 // Duplication proof: old periodic recovery replays already-flushed data
 // ==========================================================================
@@ -408,7 +439,7 @@ func TestPurgeInactive_PreservesActiveFileDuringWrites(t *testing.T) {
 	defer writer.Close()
 
 	writer.Append([]map[string]interface{}{{"measurement": "cpu", "value": 42.0}})
-	time.Sleep(50 * time.Millisecond)
+	waitForEntries(t, writer, 1)
 
 	os.WriteFile(filepath.Join(tmpDir, "arc-20240101_000000.wal"), []byte("old"), 0600)
 
@@ -428,11 +459,7 @@ func TestPurgeInactive_PreservesActiveFileDuringWrites(t *testing.T) {
 	if err != nil {
 		t.Errorf("should be able to write after PurgeInactive: %v", err)
 	}
-	time.Sleep(50 * time.Millisecond)
-
-	if atomic.LoadInt64(&writer.TotalEntries) < 2 {
-		t.Errorf("expected at least 2 entries, got %d", atomic.LoadInt64(&writer.TotalEntries))
-	}
+	waitForEntries(t, writer, 2)
 }
 
 // TestPurgeInactive_DoesNotDeleteNonWALFiles verifies only .wal files are deleted.
@@ -511,10 +538,10 @@ func TestPurgeInactive_ConcurrentWithWrite(t *testing.T) {
 		t.Errorf("expected 5 deleted, got %d", deleted)
 	}
 
+	// <-done only means the 100 Appends were enqueued; the background writer
+	// may not have written any of them yet. Wait for the writes themselves.
 	<-done
-	if atomic.LoadInt64(&writer.TotalEntries) == 0 {
-		t.Error("expected some entries to be written")
-	}
+	waitForEntries(t, writer, 1)
 }
 
 // TestPurgeAll_VsPurgeInactive verifies the behavioral difference between
