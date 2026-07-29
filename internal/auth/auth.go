@@ -108,7 +108,17 @@ type AuthManager struct {
 	cacheMisses    atomic.Int64
 	cacheEvictions atomic.Int64
 
-	cleanupDone chan struct{}
+	// shutdown is closed by Close to stop every background goroutine this
+	// manager owns: the cache janitor (cleanupLoop) and the last_used_at
+	// writer (lastUsedLoop).
+	//
+	// Named for what it governs rather than for one of its consumers. It was
+	// previously "cleanupDone", which read as though it covered only the cache
+	// janitor — a janitor that never touches the database. That reading is
+	// part of why the last_used_at writer was originally left untracked
+	// entirely (#325): the manager appeared to already have a shutdown signal,
+	// so it was not obvious that nothing was waiting on the DB writer.
+	shutdown chan struct{}
 
 	// lastUsedCh carries token IDs whose last_used_at needs updating. A single
 	// writer goroutine (lastUsedLoop) drains it, so the number of concurrent
@@ -207,7 +217,7 @@ func NewAuthManager(dbPath string, cacheTTL time.Duration, maxCacheSize int, log
 		cacheTTL:     cacheTTL,
 		maxCacheSize: maxCacheSize,
 		cache:        make(map[string]cacheEntry),
-		cleanupDone:  make(chan struct{}),
+		shutdown:     make(chan struct{}),
 		lastUsedCh:   make(chan lastUsedUpdate, lastUsedBufferSize),
 		logger:       logger.With().Str("component", "auth").Logger(),
 	}
@@ -467,7 +477,7 @@ func (am *AuthManager) cleanupLoop() {
 		select {
 		case <-ticker.C:
 			am.cleanupExpiredCache()
-		case <-am.cleanupDone:
+		case <-am.shutdown:
 			return
 		}
 	}
@@ -508,7 +518,7 @@ func (am *AuthManager) lastUsedLoop() {
 		select {
 		case u := <-am.lastUsedCh:
 			am.applyLastUsed(u)
-		case <-am.cleanupDone:
+		case <-am.shutdown:
 			// Drain what is already queued, then stop. Only updates already in
 			// the buffer are applied — VerifyToken may still be sending
 			// concurrently, and those are dropped rather than waited on, since
@@ -1504,7 +1514,7 @@ func (am *AuthManager) GetCacheStats() map[string]interface{} {
 // "sql: database is closed", logging a spurious error on every shutdown that
 // happened to catch a cache miss in flight (#325).
 func (am *AuthManager) Close() error {
-	close(am.cleanupDone)
+	close(am.shutdown)
 	am.lastUsedWG.Wait()
 	return am.db.Close()
 }
