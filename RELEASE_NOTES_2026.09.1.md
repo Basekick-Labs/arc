@@ -57,6 +57,14 @@ Reachable only when RBAC is enabled (the multi-tenant authorization boundary); n
 
 ## Bug fixes
 
+### Auth `last_used_at` updates no longer outlive shutdown ([#325](https://github.com/Basekick-Labs/arc/issues/325))
+
+Every token verification that missed the auth cache spawned a fire-and-forget goroutine to run `UPDATE api_tokens SET last_used_at = ?`. Nothing tracked those goroutines, so `AuthManager.Close()` could close the database out from under one still in flight; it then failed with `sql: database is closed` and logged at **Error** level, making an otherwise clean shutdown look like a failure. The update itself was also lost.
+
+The same pattern had a second cost independent of shutdown. The auth database runs with `SetMaxOpenConns(1)` — SQLite has a single writer — so a burst of verifications against distinct tokens could pile an unbounded number of goroutines onto that one connection, competing with the live authentication queries sharing it.
+
+Both are now handled by a single writer goroutine fed by a bounded queue. Verification hands off the update and returns immediately, so the authentication hot path never blocks; at most one `UPDATE` is ever in flight; and `Close()` drains the queue before closing the database, so pending updates are persisted rather than lost. If the queue is full the update is dropped (logged at debug) rather than blocking a request — `last_used_at` is a coarse "when was this token last seen" statistic, and under a burst large enough to fill the queue the dropped updates carry essentially the same timestamp as the queued ones.
+
 ### Compaction batch splitting no longer produces aliased file slices ([#292](https://github.com/Basekick-Labs/arc/issues/292))
 
 `SplitCandidateIntoBatches` partitioned a candidate's file list into batches using `c.Files[start:end]` sub-slices, which share the original's backing array — so every batch pointed into the same underlying memory. The same pattern existed in `compactFilesAdaptively`, which split a failed batch in half with `files[:mid]` / `files[mid:]`.

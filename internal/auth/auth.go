@@ -78,6 +78,23 @@ type cacheEntry struct {
 	expiresAt time.Time
 }
 
+// lastUsedUpdate is a pending "this token was used at this time" record,
+// applied asynchronously by lastUsedLoop.
+type lastUsedUpdate struct {
+	tokenID int64
+	at      time.Time
+}
+
+// lastUsedBufferSize bounds the number of pending last_used_at updates.
+//
+// Updates are only produced on a cache miss (a cache hit returns before the
+// send), so in steady state this queue is nearly empty. The buffer absorbs a
+// burst of distinct tokens; past that, sends are dropped rather than blocking
+// the authentication hot path. Dropping is safe: last_used_at is a coarse
+// observability stat, and under a burst the surviving updates carry
+// approximately the same information.
+const lastUsedBufferSize = 256
+
 // AuthManager handles API token authentication with SQLite storage
 type AuthManager struct {
 	db           *sql.DB
@@ -92,7 +109,21 @@ type AuthManager struct {
 	cacheEvictions atomic.Int64
 
 	cleanupDone chan struct{}
-	logger      zerolog.Logger
+
+	// lastUsedCh carries token IDs whose last_used_at needs updating. A single
+	// writer goroutine (lastUsedLoop) drains it, so the number of concurrent
+	// UPDATEs is bounded at one regardless of request volume — important
+	// because the auth DB is limited to a single connection (SetMaxOpenConns(1),
+	// SQLite has one writer). Sends never block: a full channel drops the
+	// update, which is acceptable for a best-effort "when was this token last
+	// seen" statistic.
+	lastUsedCh chan lastUsedUpdate
+	// lastUsedWG tracks lastUsedLoop so Close can wait for the final drain
+	// before closing the database, rather than letting an in-flight UPDATE
+	// race db.Close() and log a spurious "sql: database is closed" error.
+	lastUsedWG sync.WaitGroup
+
+	logger zerolog.Logger
 
 	// proposer is the Raft seam for cluster-wide auth state replication.
 	// When non-nil (Enterprise cluster mode), every write method routes
@@ -177,6 +208,7 @@ func NewAuthManager(dbPath string, cacheTTL time.Duration, maxCacheSize int, log
 		maxCacheSize: maxCacheSize,
 		cache:        make(map[string]cacheEntry),
 		cleanupDone:  make(chan struct{}),
+		lastUsedCh:   make(chan lastUsedUpdate, lastUsedBufferSize),
 		logger:       logger.With().Str("component", "auth").Logger(),
 	}
 
@@ -225,6 +257,10 @@ func NewAuthManager(dbPath string, cacheTTL time.Duration, maxCacheSize int, log
 
 	// Start background cleanup
 	go am.cleanupLoop()
+
+	// Start the single last_used_at writer
+	am.lastUsedWG.Add(1)
+	go am.lastUsedLoop()
 
 	am.logger.Debug().
 		Str("db_path", dbPath).
@@ -434,6 +470,70 @@ func (am *AuthManager) cleanupLoop() {
 		case <-am.cleanupDone:
 			return
 		}
+	}
+}
+
+// recordLastUsed queues a last_used_at update for the given token.
+//
+// This runs on the authentication hot path, so it must never block: if the
+// buffer is full the update is dropped. last_used_at is a best-effort stat,
+// and a burst large enough to fill the buffer is one where the dropped
+// updates would have carried nearly the same timestamp as the queued ones.
+func (am *AuthManager) recordLastUsed(tokenID int64, at time.Time) {
+	select {
+	case am.lastUsedCh <- lastUsedUpdate{tokenID: tokenID, at: at}:
+	default:
+		// Queue full — drop. Debug rather than Warn: under sustained load this
+		// would otherwise emit one line per authentication.
+		am.logger.Debug().
+			Int64("token_id", tokenID).
+			Msg("last_used_at update queue full, dropping update")
+	}
+}
+
+// lastUsedLoop is the single writer applying last_used_at updates.
+//
+// Serializing through one goroutine bounds concurrent UPDATEs at one, which
+// matters because the auth DB runs with SetMaxOpenConns(1) — the previous
+// fire-and-forget goroutine-per-verification could pile an unbounded number of
+// writers onto that single connection, competing with live authentication
+// queries.
+//
+// On shutdown it drains whatever is already queued before returning, so Close
+// can wait for it and no UPDATE races db.Close().
+func (am *AuthManager) lastUsedLoop() {
+	defer am.lastUsedWG.Done()
+
+	for {
+		select {
+		case u := <-am.lastUsedCh:
+			am.applyLastUsed(u)
+		case <-am.cleanupDone:
+			// Drain what is already queued, then stop. Only updates already in
+			// the buffer are applied — VerifyToken may still be sending
+			// concurrently, and those are dropped rather than waited on, since
+			// the database is about to close.
+			for {
+				select {
+				case u := <-am.lastUsedCh:
+					am.applyLastUsed(u)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+// applyLastUsed performs the UPDATE for a single queued record.
+func (am *AuthManager) applyLastUsed(u lastUsedUpdate) {
+	if _, err := am.db.Exec(
+		"UPDATE api_tokens SET last_used_at = ? WHERE id = ?", u.at, u.tokenID,
+	); err != nil {
+		am.logger.Error().
+			Err(err).
+			Int64("token_id", u.tokenID).
+			Msg("Failed to update last_used_at")
 	}
 }
 
@@ -777,13 +877,10 @@ func (am *AuthManager) VerifyToken(token string) *TokenInfo {
 			return nil
 		}
 
-		// Update last used timestamp (fire and forget)
-		go func(tokenID int64) {
-			_, err := am.db.Exec("UPDATE api_tokens SET last_used_at = ? WHERE id = ?", now, tokenID)
-			if err != nil {
-				am.logger.Error().Err(err).Int64("token_id", tokenID).Msg("Failed to update last_used_at")
-			}
-		}(id)
+		// Hand the last_used_at update to the single writer goroutine. Never
+		// blocks the authentication path: if the queue is full the update is
+		// dropped (see lastUsedBufferSize).
+		am.recordLastUsed(id, now)
 
 		// Build token info
 		info := &TokenInfo{
@@ -1400,9 +1497,15 @@ func (am *AuthManager) GetCacheStats() map[string]interface{} {
 	}
 }
 
-// Close shuts down the auth manager
+// Close shuts down the auth manager.
+//
+// It waits for the last_used_at writer to drain before closing the database.
+// Without that wait an in-flight UPDATE races db.Close() and fails with
+// "sql: database is closed", logging a spurious error on every shutdown that
+// happened to catch a cache miss in flight (#325).
 func (am *AuthManager) Close() error {
 	close(am.cleanupDone)
+	am.lastUsedWG.Wait()
 	return am.db.Close()
 }
 
