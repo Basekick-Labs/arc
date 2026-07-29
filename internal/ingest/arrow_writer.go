@@ -1926,7 +1926,34 @@ func (b *ArrowBuffer) convertColumnsToTyped(measurement string, columns map[stri
 		// Infer type from first non-nil value
 		firstVal := firstNonNil(col)
 		if firstVal == nil {
-			continue // Skip all-nil columns
+			// Every value is nil, so there is nothing to infer a type from.
+			// Dropping the column would make it vanish from this batch's
+			// parquet file; a column that is all-nil in every batch would then
+			// never exist at all, and querying it fails to bind instead of
+			// returning NULLs (#337).
+			//
+			// Emit it as an all-null string column instead. The value is
+			// correct either way — every entry is NULL — and string is the
+			// safe placeholder: a later batch carrying real values writes its
+			// own inferred type, and readers union across files by name
+			// (read_parquet union_by_name=true), so the type only has to be
+			// consistent within a file, not across them.
+			//
+			// Time is exempt: a partition whose time column is VARCHAR cannot be
+			// compacted (TIMESTAMP != VARCHAR bind failure), so an all-nil time
+			// is rejected here rather than written as a string. The msgpack path
+			// already rejects it upstream in normalizeTimestamps, but this
+			// function is the chokepoint every typed write passes through, so
+			// the guard belongs here too.
+			if name == "time" {
+				return nil, 0, fmt.Errorf("time column contains only null values in measurement '%s' (writer must send an integer/float timestamp)", measurement)
+			}
+
+			arr := make([]string, len(col))
+			valid := make([]bool, len(col)) // all false — every entry is NULL
+			typed[name] = arr
+			validity[name] = valid
+			continue
 		}
 
 		// The "time" column is always int64 microseconds → Arrow Timestamp.

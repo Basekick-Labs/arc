@@ -142,12 +142,25 @@ func (m *ManifestManager) ReadManifest(ctx context.Context, manifestPath string)
 	return &manifest, nil
 }
 
-// ListManifests lists all manifest files in storage
+// ListManifests lists all manifest files in storage.
+//
+// Errors are returned rather than reported as an empty list. "No manifests
+// exist" and "storage is unreachable" mean opposite things to the caller:
+// filterCandidateFiles treats an empty manifest set as "nothing is being
+// compacted, proceed" but has an explicit guard that skips the partition when
+// the lookup fails. Collapsing the error into an empty slice made that guard
+// unreachable, so a transient List failure (S3 throttling, expired
+// credentials, a network blip) let Arc re-compact files another job already
+// had in flight.
+//
+// A missing manifest directory is not an error at this layer: LocalBackend.List
+// skips directories that do not exist, and the object-store backends return an
+// empty result for a prefix with no objects. So any error arriving here is a
+// real failure.
 func (m *ManifestManager) ListManifests(ctx context.Context) ([]string, error) {
 	objects, err := m.backend.List(ctx, ManifestBasePath+"/")
 	if err != nil {
-		// If the directory doesn't exist, return empty list
-		return []string{}, nil
+		return nil, fmt.Errorf("failed to list manifests: %w", err)
 	}
 
 	var manifests []string
@@ -165,7 +178,8 @@ func (m *ManifestManager) ListManifests(ctx context.Context) ([]string, error) {
 func (m *ManifestManager) RecoverOrphanedManifests(ctx context.Context) (int, error) {
 	manifests, err := m.ListManifests(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("failed to list manifests: %w", err)
+		// ListManifests already describes the failure.
+		return 0, err
 	}
 
 	if len(manifests) == 0 {
