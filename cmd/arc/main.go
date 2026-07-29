@@ -2046,11 +2046,16 @@ func main() {
 		} else if !licenseClient.CanUseQueryGovernance() {
 			log.Warn().Msg("License does not include query_governance feature - feature disabled")
 		} else {
+			// Share the auth manager's SQLite handle when there is one.
+			// Governance and auth are enabled independently (this block is
+			// gated on the license, not on cfg.Auth.Enabled), so authManager
+			// may be nil — sharedSQLiteHandle falls back to a dedicated handle
+			// we own.
 			governanceDBPath := cfg.Auth.DBPath
 			if governanceDBPath == "" {
 				governanceDBPath = "./data/arc.db"
 			}
-			governanceDB, err := sql.Open("sqlite3", governanceDBPath)
+			governanceDB, governanceOwnsDB, err := sharedSQLiteHandle(authManager, governanceDBPath)
 			if err != nil {
 				log.Error().Err(err).Msg("Failed to open governance database - feature disabled")
 			} else {
@@ -2061,10 +2066,21 @@ func main() {
 				})
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to create governance manager - feature disabled")
+					if governanceOwnsDB {
+						governanceDB.Close()
+					}
 				} else {
 					governanceManager.Start()
 					shutdownCoordinator.RegisterHook("governance", func(ctx context.Context) error {
-						return governanceManager.Stop()
+						stopErr := governanceManager.Stop()
+						// governance.Manager never closes its DB — it may be
+						// borrowed. Close it here only when this block opened it.
+						if governanceOwnsDB {
+							if closeErr := governanceDB.Close(); closeErr != nil && stopErr == nil {
+								stopErr = closeErr
+							}
+						}
+						return stopErr
 					}, shutdown.PriorityCompaction)
 
 					// Wire governance to query handler

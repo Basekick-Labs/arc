@@ -1523,3 +1523,43 @@ func (am *AuthManager) Close() error {
 func (am *AuthManager) GetDB() *sql.DB {
 	return am.db
 }
+
+// SharesDBPath reports whether dbPath refers to the same file this manager has
+// open, so a caller can borrow GetDB instead of opening a second connection.
+//
+// Features such as retention and continuous queries have their own *_db_path
+// config keys that merely default to the auth database. An operator who points
+// one at a different file expects a genuinely separate database, so borrowing
+// must be conditional on the paths actually matching rather than assumed.
+//
+// Comparison is on the cleaned absolute path, with symlinks resolved when the
+// file exists: "./data/arc.db" and an absolute path to the same file are the
+// same database, and answering otherwise would silently open a redundant
+// connection. Returns false for a nil receiver or an in-memory database, where
+// there is nothing meaningful to share.
+func (am *AuthManager) SharesDBPath(dbPath string) bool {
+	if am == nil || dbPath == "" {
+		return false
+	}
+	// In-memory databases are private to the connection that opened them, so
+	// two handles naming ":memory:" are not the same database.
+	if strings.HasPrefix(am.dbPath, ":memory:") || strings.HasPrefix(dbPath, ":memory:") ||
+		strings.HasPrefix(am.dbPath, "file::memory:") || strings.HasPrefix(dbPath, "file::memory:") {
+		return false
+	}
+
+	resolve := func(p string) string {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			return filepath.Clean(p)
+		}
+		// EvalSymlinks fails when the file does not exist yet; the cleaned
+		// absolute path is the best available answer in that case.
+		if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+			return resolved
+		}
+		return abs
+	}
+
+	return resolve(am.dbPath) == resolve(dbPath)
+}
