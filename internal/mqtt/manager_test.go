@@ -17,9 +17,9 @@ func TestSubscriptionManager_GetAllStats_NilSubscriber(t *testing.T) {
 	tmp := t.TempDir()
 	dbPath := filepath.Join(tmp, "mqtt.db")
 
-	repo, err := NewRepository(dbPath, nil, zerolog.Nop())
+	repo, err := NewSQLiteRepository(dbPath, nil, zerolog.Nop())
 	if err != nil {
-		t.Fatalf("NewRepository: %v", err)
+		t.Fatalf("NewSQLiteRepository: %v", err)
 	}
 	t.Cleanup(func() { _ = repo.Close() })
 
@@ -72,9 +72,9 @@ func TestSubscriptionManager_GetAllStats_NilSubscriber(t *testing.T) {
 func newTestManager(t *testing.T) *SubscriptionManager {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "mqtt.db")
-	repo, err := NewRepository(dbPath, nil, zerolog.Nop())
+	repo, err := NewSQLiteRepository(dbPath, nil, zerolog.Nop())
 	if err != nil {
-		t.Fatalf("NewRepository: %v", err)
+		t.Fatalf("NewSQLiteRepository: %v", err)
 	}
 	t.Cleanup(func() { _ = repo.Close() })
 	encryptor, err := NewPasswordEncryptor(nil)
