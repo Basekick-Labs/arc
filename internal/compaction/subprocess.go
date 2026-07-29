@@ -317,8 +317,14 @@ func createStorageBackendFromConfig(config *SubprocessJobConfig, logger zerolog.
 		return storage.NewLocalBackend(localConfig.BasePath, logger)
 
 	case "s3":
+		// Every field S3Backend.ConfigJSON emits must be parsed and forwarded
+		// here. Prefix in particular: it is applied to every key the backend
+		// touches (prefixedKey), so dropping it silently reroots the subprocess
+		// at the bucket root and compaction reads and writes the wrong location.
+		// It defaults to empty, which is why the omission went unnoticed.
 		var s3Config struct {
 			Bucket    string `json:"bucket"`
+			Prefix    string `json:"prefix"`
 			Region    string `json:"region"`
 			Endpoint  string `json:"endpoint"`
 			PathStyle bool   `json:"path_style"`
@@ -329,6 +335,7 @@ func createStorageBackendFromConfig(config *SubprocessJobConfig, logger zerolog.
 		}
 		return storage.NewS3Backend(&storage.S3Config{
 			Bucket:    s3Config.Bucket,
+			Prefix:    s3Config.Prefix,
 			Region:    s3Config.Region,
 			Endpoint:  s3Config.Endpoint,
 			PathStyle: s3Config.PathStyle,
