@@ -47,6 +47,10 @@ type ContinuousQueryHandler struct {
 	arrowBuffer *ingest.ArrowBuffer
 	config      *config.ContinuousQueryConfig
 	sqliteDB    *sql.DB
+	// ownsDB records whether this handler opened sqliteDB itself. When CQ
+	// shares the auth database (the default), the handle is borrowed and Close
+	// must leave it to its owner.
+	ownsDB      bool
 	authManager *auth.AuthManager
 	scheduler   CQSchedulerReloader
 	coordinator CQCoordinator
@@ -147,16 +151,31 @@ type CQExecution struct {
 
 // NewContinuousQueryHandler creates a new continuous query handler
 func NewContinuousQueryHandler(db *database.DuckDB, storage storage.Backend, arrowBuffer *ingest.ArrowBuffer, cfg *config.ContinuousQueryConfig, authManager *auth.AuthManager, logger zerolog.Logger) (*ContinuousQueryHandler, error) {
-	// Ensure directory exists
-	dir := filepath.Dir(cfg.DBPath)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return nil, fmt.Errorf("failed to create directory for CQ DB: %w", err)
-	}
+	// continuous_query.db_path defaults to the auth database. When it resolves
+	// to the same file, borrow the auth manager's handle rather than opening a
+	// second connection pool against it — SQLite has a single writer, so
+	// independent pools on one file only contend for the same lock. An operator
+	// who points continuous_query.db_path elsewhere still gets a genuinely
+	// separate database.
+	var (
+		sqliteDB *sql.DB
+		ownsDB   bool
+	)
+	if authManager.SharesDBPath(cfg.DBPath) {
+		sqliteDB = authManager.GetDB()
+	} else {
+		// Ensure directory exists
+		dir := filepath.Dir(cfg.DBPath)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return nil, fmt.Errorf("failed to create directory for CQ DB: %w", err)
+		}
 
-	// Open SQLite database
-	sqliteDB, err := sql.Open("sqlite3", cfg.DBPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open CQ database: %w", err)
+		// Open SQLite database
+		opened, err := sql.Open("sqlite3", cfg.DBPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open CQ database: %w", err)
+		}
+		sqliteDB, ownsDB = opened, true
 	}
 
 	h := &ContinuousQueryHandler{
@@ -165,13 +184,16 @@ func NewContinuousQueryHandler(db *database.DuckDB, storage storage.Backend, arr
 		arrowBuffer: arrowBuffer,
 		config:      cfg,
 		sqliteDB:    sqliteDB,
+		ownsDB:      ownsDB,
 		authManager: authManager,
 		logger:      logger.With().Str("component", "cq-handler").Logger(),
 	}
 
 	// Initialize tables
 	if err := h.initTables(); err != nil {
-		sqliteDB.Close()
+		if ownsDB {
+			sqliteDB.Close()
+		}
 		return nil, fmt.Errorf("failed to initialize CQ tables: %w", err)
 	}
 
@@ -240,6 +262,9 @@ func (h *ContinuousQueryHandler) initTables() error {
 
 // Close closes the database connection
 func (h *ContinuousQueryHandler) Close() error {
+	if !h.ownsDB {
+		return nil
+	}
 	return h.sqliteDB.Close()
 }
 

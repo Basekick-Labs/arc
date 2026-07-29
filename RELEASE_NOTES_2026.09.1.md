@@ -57,15 +57,25 @@ Reachable only when RBAC is enabled (the multi-tenant authorization boundary); n
 
 ## Bug fixes
 
-### MQTT, audit and tiering share the auth manager's SQLite handle ([#329](https://github.com/Basekick-Labs/arc/issues/329))
+### Features share the auth manager's SQLite handle instead of opening their own ([#329](https://github.com/Basekick-Labs/arc/issues/329), [#562](https://github.com/Basekick-Labs/arc/issues/562))
 
-Arc keeps auth, audit, tiering and MQTT metadata in a single SQLite file (`auth.db_path`, default `./data/arc.db`). Each of those features opened its **own** connection to that file, so a default deployment ran several independent connection pools — each capped at one connection, since SQLite has a single writer — competing for the same write lock. MQTT, audit and tiering now borrow the auth manager's existing handle instead.
+Arc keeps auth, audit, tiering, governance, retention, continuous-query and MQTT metadata in a single SQLite file (`auth.db_path`, default `./data/arc.db`). Each of those features opened its **own** connection to that file, so a default deployment ran six independent connection pools — each capped at one connection, since SQLite has a single writer — competing for the same write lock. They now borrow the auth manager's existing handle instead.
 
-Two of those handles were also **leaked**: nothing closed the audit or tiering connections on shutdown. When these features now open their own handle (see below) it is closed on every path, including the failure paths that previously returned early.
+Three of those handles were also **leaked**: nothing closed the audit, tiering or governance connections on shutdown. When these features now open their own handle (see below) it is closed on every path, including the failure paths that previously returned early.
+
+**Retention and continuous queries keep their own config keys.** `retention.db_path` and `continuous_query.db_path` merely *default* to the auth database; an operator may point either at a different file and expects a genuinely separate database. Those features borrow the auth handle only when the configured path resolves to the same file — compared as a cleaned absolute path with symlinks resolved, so `./data/arc.db` and an absolute path to that file are correctly recognized as one database. Point them elsewhere and they open and own a separate handle exactly as before.
+
+One behavior change worth noting: the auth connection enables SQLite foreign-key enforcement, which retention's and CQ's own connections did not. Their schemas declare foreign keys (`retention_executions` → `retention_policies`, `continuous_query_executions` → `continuous_queries`) and both delete child rows before parents, so enforcement is satisfied — it now also rejects the orphan-creating order, which the code never used.
 
 MQTT initialization moved after auth initialization in startup so the handle exists to be borrowed. MQTT's repository tracks whether it owns its handle and closes it only if so — MQTT shuts down at ingest priority, well before the auth manager closes the shared handle, so closing a borrowed connection there would have taken the database out from under every component still shutting down.
 
-**Auth-disabled deployments are unaffected in behavior:** MQTT, audit and tiering are each enabled independently of auth, so when auth is off they open and own a handle exactly as before. That path is now hardened to match what the auth manager does: the parent directory is created, and the database file is pre-created with owner-only (0600) permissions rather than being left at the process umask (typically 0644, world-readable). The file holds audit logs, tiering metadata and encrypted MQTT broker credentials. Previously, an MQTT-enabled deployment with auth disabled and no existing data directory **failed to start**.
+**Auth-disabled deployments are unaffected in behavior:** these features are each enabled independently of auth, so when auth is off they open and own a handle exactly as before. That path is now hardened to match what the auth manager does: the parent directory is created, and the database file is pre-created with owner-only (0600) permissions rather than being left at the process umask (typically 0644, world-readable). The file holds audit logs, tiering metadata and encrypted MQTT broker credentials. Previously, an MQTT-enabled deployment with auth disabled and no existing data directory **failed to start**.
+
+### Audit log disk reclamation no longer runs a no-op vacuum
+
+Audit set `PRAGMA auto_vacuum = INCREMENTAL` during schema init, then ran `PRAGMA incremental_vacuum` after each retention cleanup. Because audit shares the auth database, whose tables already exist by then, the pragma was rejected — `auto_vacuum` can only be changed on an empty database — and SQLite reports no error for the rejection, so the setting silently stayed at NONE and every subsequent vacuum was a no-op.
+
+Both statements are removed rather than repaired. `audit_logs` is written on every request, and vacuuming a continuously-written table causes write amplification: the vacuum shrinks the file and the next insert re-grows it. Pages freed by the retention `DELETE` are reused by later inserts, which is what actually bounds file growth. No operational change — the vacuum was already doing nothing.
 
 ### Compaction subprocesses no longer drop the S3 prefix ([#560](https://github.com/Basekick-Labs/arc/issues/560))
 
