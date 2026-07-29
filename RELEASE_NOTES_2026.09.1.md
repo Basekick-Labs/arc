@@ -57,6 +57,28 @@ Reachable only when RBAC is enabled (the multi-tenant authorization boundary); n
 
 ## Bug fixes
 
+### Compaction no longer treats a storage failure as "no manifests exist" ([#314](https://github.com/Basekick-Labs/arc/issues/314))
+
+`ListManifests` discarded every error from the storage backend and returned an empty list, with no log line. "No manifests exist" and "we could not find out" are opposite instructions to the caller: an empty manifest set means nothing is being compacted and the candidate may proceed, while a failed lookup means the files in flight cannot be identified.
+
+The candidate filter already had the correct guard — it skips the partition when the manifest lookup fails, explicitly *"to avoid re-compaction"* — but swallowing the error inside `ListManifests` made that guard unreachable. A transient failure (S3 throttling, an expired credential, a network blip) therefore let Arc treat files already claimed by an in-flight compaction as untracked, and compact them a second time.
+
+Errors now propagate. A missing manifest directory remains a non-error: the local backend skips directories that do not exist, and the object-store backends return an empty listing for a prefix with no objects, so any error reaching this layer is a real failure.
+
+### Ingest no longer drops columns that are entirely null in a batch ([#337](https://github.com/Basekick-Labs/arc/issues/337))
+
+A column whose every value was null in a batch was dropped, because no type can be inferred from it. In most cases readers absorbed this — queries and compaction union schemas by name — but a column that is null in **every** batch never appeared in any file, so querying it failed with `Binder Error: Referenced column "depth" not found` instead of returning NULLs. Realistic triggers: an optional field absent for a whole batch, or a sensor reporting null through an outage.
+
+Such columns are now written as an all-null placeholder that keeps the column present and every value NULL. A later batch carrying real values still infers its own type, so nothing is pinned to the placeholder. The `time` column is exempt and an all-null time is now rejected outright: a VARCHAR time column makes a partition un-compactable.
+
+### `fdatasync` WAL sync mode is now actually fdatasync on Linux ([#305](https://github.com/Basekick-Labs/arc/issues/305))
+
+`wal.sync_mode` accepted `fdatasync`, and it is the default when the WAL is enabled, but both `fsync` and `fdatasync` called the same full `Sync()`. Operators who selected the balanced mode silently got the strictest one.
+
+Linux now uses a real `fdatasync(2)`, which skips the metadata-journal flush (retried on `EINTR` so an interrupted call cannot report durability it did not achieve). Go does not expose `fdatasync` on macOS or Windows, so those platforms honestly fall back to a full `Sync()` and now **log that fact once at startup** rather than reporting a mode they are not performing. The startup log also carries `fdatasync_supported` so the effective behavior is visible.
+
+Expect no measurable throughput change: WAL syncs are driven by a 100 ms ticker rather than per-write, so there are at most ~10 per second regardless of ingest rate. This is a correctness and honesty fix, not a performance one.
+
 ### Features share the auth manager's SQLite handle instead of opening their own ([#329](https://github.com/Basekick-Labs/arc/issues/329), [#562](https://github.com/Basekick-Labs/arc/issues/562))
 
 Arc keeps auth, audit, tiering, governance, retention, continuous-query and MQTT metadata in a single SQLite file (`auth.db_path`, default `./data/arc.db`). Each of those features opened its **own** connection to that file, so a default deployment ran six independent connection pools — each capped at one connection, since SQLite has a single writer — competing for the same write lock. They now borrow the auth manager's existing handle instead.
