@@ -57,6 +57,16 @@ Reachable only when RBAC is enabled (the multi-tenant authorization boundary); n
 
 ## Bug fixes
 
+### MQTT, audit and tiering share the auth manager's SQLite handle ([#329](https://github.com/Basekick-Labs/arc/issues/329))
+
+Arc keeps auth, audit, tiering and MQTT metadata in a single SQLite file (`auth.db_path`, default `./data/arc.db`). Each of those features opened its **own** connection to that file, so a default deployment ran several independent connection pools — each capped at one connection, since SQLite has a single writer — competing for the same write lock. MQTT, audit and tiering now borrow the auth manager's existing handle instead.
+
+Two of those handles were also **leaked**: nothing closed the audit or tiering connections on shutdown. When these features now open their own handle (see below) it is closed on every path, including the failure paths that previously returned early.
+
+MQTT initialization moved after auth initialization in startup so the handle exists to be borrowed. MQTT's repository tracks whether it owns its handle and closes it only if so — MQTT shuts down at ingest priority, well before the auth manager closes the shared handle, so closing a borrowed connection there would have taken the database out from under every component still shutting down.
+
+**Auth-disabled deployments are unaffected in behavior:** MQTT, audit and tiering are each enabled independently of auth, so when auth is off they open and own a handle exactly as before. That path is now hardened to match what the auth manager does: the parent directory is created, and the database file is pre-created with owner-only (0600) permissions rather than being left at the process umask (typically 0644, world-readable). The file holds audit logs, tiering metadata and encrypted MQTT broker credentials. Previously, an MQTT-enabled deployment with auth disabled and no existing data directory **failed to start**.
+
 ### Compaction subprocesses no longer drop the S3 prefix ([#560](https://github.com/Basekick-Labs/arc/issues/560))
 
 Compaction runs in a forked subprocess for DuckDB memory isolation, and the child rebuilds its storage backend from the parent's `Type()` and `ConfigJSON()`. `S3Backend.ConfigJSON()` emitted `prefix`, but the subprocess's parse struct had no matching field, so `json.Unmarshal` silently discarded it and the rebuilt backend was left with an empty prefix.
