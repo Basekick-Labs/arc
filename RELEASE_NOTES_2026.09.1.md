@@ -57,6 +57,20 @@ Reachable only when RBAC is enabled (the multi-tenant authorization boundary); n
 
 ## Bug fixes
 
+### Compaction subprocesses no longer drop the S3 prefix ([#560](https://github.com/Basekick-Labs/arc/issues/560))
+
+Compaction runs in a forked subprocess for DuckDB memory isolation, and the child rebuilds its storage backend from the parent's `Type()` and `ConfigJSON()`. `S3Backend.ConfigJSON()` emitted `prefix`, but the subprocess's parse struct had no matching field, so `json.Unmarshal` silently discarded it and the rebuilt backend was left with an empty prefix.
+
+Because the prefix is applied to every key the S3 backend touches — read, write, delete, and list — a compaction subprocess on a deployment with `storage.s3_prefix` set operated against the **bucket root** instead of the configured prefix, with no error raised. Only deployments that set a non-empty prefix were affected; it defaults to empty, which is why "prefixed" and "unprefixed" were the same string everywhere the code was exercised.
+
+The prefix is now parsed and forwarded. A round-trip test drives the real reconstruction path and compares the rebuilt backend's configuration against the parent's, so any field added to `ConfigJSON()` in future without a matching parse field fails immediately rather than silently.
+
+### Removed the unused `ResilientBackend` storage wrapper ([#320](https://github.com/Basekick-Labs/arc/issues/320))
+
+`internal/storage/resilient.go` provided a retry + circuit-breaker wrapper around a storage backend, but nothing ever constructed one: no call sites in `cmd/` or `internal/`, no tests, no type assertions. It dates to the original Go migration and was never wired in. Having drifted behind the `Backend` interface — missing `ReadToAt`, `StatFile`, `Type`, and `ConfigJSON` — it no longer satisfied the interface it was written against, which is what surfaced it.
+
+The file is removed rather than completed. Retry and circuit-breaking around cloud storage remain worth having, but an unused, untested wrapper would simply drift again with the next interface change; a future implementation should be written against the interface as it stands then, and actually wired in. No behavior change — the code was unreachable.
+
 ### Auth `last_used_at` updates no longer outlive shutdown ([#325](https://github.com/Basekick-Labs/arc/issues/325))
 
 Every token verification that missed the auth cache spawned a fire-and-forget goroutine to run `UPDATE api_tokens SET last_used_at = ?`. Nothing tracked those goroutines, so `AuthManager.Close()` could close the database out from under one still in flight; it then failed with `sql: database is closed` and logged at **Error** level, making an otherwise clean shutdown look like a failure. The update itself was also lost.
