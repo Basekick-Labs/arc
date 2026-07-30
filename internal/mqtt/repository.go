@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -19,42 +21,107 @@ type Repository struct {
 	db        *sql.DB
 	encryptor PasswordEncryptor
 	logger    zerolog.Logger
+
+	// ownsDB records whether this Repository opened db itself and is therefore
+	// responsible for closing it. When the handle is borrowed (the normal case
+	// — Arc shares one SQLite file across auth, audit, tiering and MQTT), Close
+	// must leave it alone: MQTT shuts down at PriorityIngest(20) but auth owns
+	// the handle until PriorityAuth(70), so closing a borrowed DB here would
+	// pull it out from under every other component still shutting down.
+	ownsDB bool
 }
 
-// NewRepository creates a new MQTT subscription repository
-func NewRepository(dbPath string, encryptor PasswordEncryptor, logger zerolog.Logger) (*Repository, error) {
-	return NewSQLiteRepository(dbPath, nil, logger)
-}
-
-// NewSQLiteRepository creates a new MQTT subscription repository with optional encryption key
-func NewSQLiteRepository(dbPath string, encryptionKey []byte, logger zerolog.Logger) (*Repository, error) {
+// NewRepository creates a subscription repository over an existing database
+// handle. The caller retains ownership of db: Close will not close it.
+//
+// db must be non-nil. Use OpenDB when there is no shared handle to borrow.
+func NewRepository(db *sql.DB, encryptionKey []byte, logger zerolog.Logger) (*Repository, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database handle is required")
+	}
 	encryptor, err := NewPasswordEncryptor(encryptionKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create encryptor: %w", err)
 	}
-	return newRepository(dbPath, encryptor, logger)
+	return newRepository(db, encryptor, false, logger)
 }
 
-// newRepository is the internal constructor
-func newRepository(dbPath string, encryptor PasswordEncryptor, logger zerolog.Logger) (*Repository, error) {
+// OpenDB opens a SQLite handle suitable for a Repository.
+//
+// It exists for deployments that run MQTT without auth, where there is no
+// shared handle to borrow.
+//
+// The DSN sets WAL and a busy timeout but, unlike the auth manager's, omits
+// _foreign_keys=ON. No MQTT table declares a foreign key and none references
+// mqtt_subscriptions, so the two handles behave identically today — but a
+// borrowed handle does run MQTT statements with foreign keys enabled. Any
+// future FK on an MQTT table must be checked against both settings.
+func OpenDB(dbPath string) (*sql.DB, error) {
+	// Create the parent directory. sql.Open is lazy — it validates the DSN but
+	// never touches the filesystem — so on a fresh install a missing directory
+	// would otherwise surface as a schema-init failure at startup.
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0700); err != nil {
+		return nil, fmt.Errorf("failed to create database directory: %w", err)
+	}
+
+	// Pre-create the file 0600. SQLite would otherwise create it with the
+	// process umask (typically 0644, world-readable), and this file holds
+	// broker credentials in the encrypted-password column.
+	f, err := os.OpenFile(dbPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create database file: %w", err)
+	}
+	f.Close()
+
 	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	// Limit connections for SQLite
+	// SQLite has a single writer; keep the pool at one connection.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
+	return db, nil
+}
+
+// NewSQLiteRepository opens dbPath and returns a Repository that owns the
+// resulting handle — Close will close it.
+//
+// Prefer NewRepository with a shared handle. This exists for the standalone
+// case (MQTT enabled, auth disabled) and for tests.
+func NewSQLiteRepository(dbPath string, encryptionKey []byte, logger zerolog.Logger) (*Repository, error) {
+	encryptor, err := NewPasswordEncryptor(encryptionKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create encryptor: %w", err)
+	}
+
+	db, err := OpenDB(dbPath)
+	if err != nil {
+		return nil, err
+	}
+
+	repo, err := newRepository(db, encryptor, true, logger)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	return repo, nil
+}
+
+// newRepository is the internal constructor. ownsDB records whether the caller
+// handed over ownership of db.
+func newRepository(db *sql.DB, encryptor PasswordEncryptor, ownsDB bool, logger zerolog.Logger) (*Repository, error) {
 	repo := &Repository{
 		db:        db,
 		encryptor: encryptor,
 		logger:    logger.With().Str("component", "mqtt-repository").Logger(),
+		ownsDB:    ownsDB,
 	}
 
-	// Initialize schema
+	// Initialize schema. Safe on a borrowed handle: every statement is
+	// CREATE ... IF NOT EXISTS, and mqtt_subscriptions is created nowhere else.
 	if err := repo.initSchema(); err != nil {
-		db.Close()
 		return nil, fmt.Errorf("failed to initialize schema: %w", err)
 	}
 
@@ -140,8 +207,16 @@ func (r *Repository) runMigrations() error {
 	return nil
 }
 
-// Close closes the database connection
+// Close releases the database handle if this Repository owns it.
+//
+// When the handle was borrowed (NewRepository), Close is a no-op: the owner
+// closes it at its own point in the shutdown sequence. Closing it here would
+// be actively harmful — MQTT shuts down at PriorityIngest(20), well before the
+// auth manager that owns the shared handle closes it at PriorityAuth(70).
 func (r *Repository) Close() error {
+	if !r.ownsDB {
+		return nil
+	}
 	return r.db.Close()
 }
 
@@ -178,11 +253,14 @@ func (r *Repository) Create(ctx context.Context, sub *Subscription) error {
 		username, password_encrypted, tls_enabled, tls_cert_path,
 		tls_key_path, tls_ca_path, tls_insecure_skip_verify, auto_start,
 		status, error_message, topic_mapping, keep_alive_seconds,
-		connect_timeout_seconds, reconnect_min_seconds, reconnect_max_seconds,
+		connect_timeout_seconds, reconnect_max_seconds,
 		clean_session, created_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
+	// Note: reconnect_min_seconds is intentionally omitted — the column remains
+	// (nullable, DEFAULT 1) to avoid a destructive migration, but ReconnectMin is
+	// dead config that paho ignores, so it is no longer written or read (#327).
 	_, err = r.db.ExecContext(ctx, query,
 		sub.ID, sub.Name, sub.Broker, sub.ClientID, string(topicsJSON),
 		sub.QoS, sub.Database, sub.Username, sub.PasswordEncrypted,
@@ -190,7 +268,7 @@ func (r *Repository) Create(ctx context.Context, sub *Subscription) error {
 		sub.TLSCAPath, boolToInt(sub.TLSInsecureSkipVerify),
 		boolToInt(sub.AutoStart), string(sub.Status), sub.ErrorMessage,
 		nullableString(topicMappingJSON), sub.KeepAliveSeconds,
-		sub.ConnectTimeoutSeconds, sub.ReconnectMinSeconds,
+		sub.ConnectTimeoutSeconds,
 		sub.ReconnectMaxSeconds, boolToInt(sub.CleanSession),
 		sub.CreatedAt.Format(time.RFC3339),
 		sub.UpdatedAt.Format(time.RFC3339),
@@ -213,7 +291,7 @@ func (r *Repository) Get(ctx context.Context, id string) (*Subscription, error) 
 		username, password_encrypted, tls_enabled, tls_cert_path,
 		tls_key_path, tls_ca_path, tls_insecure_skip_verify, auto_start,
 		status, error_message, topic_mapping, keep_alive_seconds,
-		connect_timeout_seconds, reconnect_min_seconds, reconnect_max_seconds,
+		connect_timeout_seconds, reconnect_max_seconds,
 		clean_session, created_at, updated_at
 	FROM mqtt_subscriptions
 	WHERE id = ?
@@ -229,7 +307,7 @@ func (r *Repository) GetByName(ctx context.Context, name string) (*Subscription,
 		username, password_encrypted, tls_enabled, tls_cert_path,
 		tls_key_path, tls_ca_path, tls_insecure_skip_verify, auto_start,
 		status, error_message, topic_mapping, keep_alive_seconds,
-		connect_timeout_seconds, reconnect_min_seconds, reconnect_max_seconds,
+		connect_timeout_seconds, reconnect_max_seconds,
 		clean_session, created_at, updated_at
 	FROM mqtt_subscriptions
 	WHERE name = ?
@@ -245,7 +323,7 @@ func (r *Repository) List(ctx context.Context) ([]*Subscription, error) {
 		username, password_encrypted, tls_enabled, tls_cert_path,
 		tls_key_path, tls_ca_path, tls_insecure_skip_verify, auto_start,
 		status, error_message, topic_mapping, keep_alive_seconds,
-		connect_timeout_seconds, reconnect_min_seconds, reconnect_max_seconds,
+		connect_timeout_seconds, reconnect_max_seconds,
 		clean_session, created_at, updated_at
 	FROM mqtt_subscriptions
 	ORDER BY name
@@ -280,7 +358,7 @@ func (r *Repository) ListAutoStart(ctx context.Context) ([]*Subscription, error)
 		username, password_encrypted, tls_enabled, tls_cert_path,
 		tls_key_path, tls_ca_path, tls_insecure_skip_verify, auto_start,
 		status, error_message, topic_mapping, keep_alive_seconds,
-		connect_timeout_seconds, reconnect_min_seconds, reconnect_max_seconds,
+		connect_timeout_seconds, reconnect_max_seconds,
 		clean_session, created_at, updated_at
 	FROM mqtt_subscriptions
 	WHERE auto_start = 1
@@ -336,11 +414,13 @@ func (r *Repository) Update(ctx context.Context, sub *Subscription) error {
 		tls_ca_path = ?, tls_insecure_skip_verify = ?, auto_start = ?,
 		status = ?, error_message = ?, topic_mapping = ?,
 		keep_alive_seconds = ?, connect_timeout_seconds = ?,
-		reconnect_min_seconds = ?, reconnect_max_seconds = ?,
+		reconnect_max_seconds = ?,
 		clean_session = ?, updated_at = ?
 	WHERE id = ?
 	`
 
+	// reconnect_min_seconds is left untouched (dead config, see Create) — the
+	// column keeps its existing/default value and is never read back (#327).
 	result, err := r.db.ExecContext(ctx, query,
 		sub.Name, sub.Broker, sub.ClientID, string(topicsJSON),
 		sub.QoS, sub.Database, sub.Username, sub.PasswordEncrypted,
@@ -348,7 +428,7 @@ func (r *Repository) Update(ctx context.Context, sub *Subscription) error {
 		sub.TLSCAPath, boolToInt(sub.TLSInsecureSkipVerify),
 		boolToInt(sub.AutoStart), string(sub.Status), sub.ErrorMessage,
 		nullableString(topicMappingJSON), sub.KeepAliveSeconds,
-		sub.ConnectTimeoutSeconds, sub.ReconnectMinSeconds,
+		sub.ConnectTimeoutSeconds,
 		sub.ReconnectMaxSeconds, boolToInt(sub.CleanSession),
 		sub.UpdatedAt.Format(time.RFC3339),
 		sub.ID,
@@ -431,7 +511,7 @@ func (r *Repository) scanSubscription(row *sql.Row) (*Subscription, error) {
 		&tlsEnabled, &sub.TLSCertPath, &sub.TLSKeyPath, &sub.TLSCAPath,
 		&tlsInsecureSkipVerify, &autoStart, &status, &sub.ErrorMessage,
 		&topicMappingJSON, &sub.KeepAliveSeconds, &sub.ConnectTimeoutSeconds,
-		&sub.ReconnectMinSeconds, &sub.ReconnectMaxSeconds,
+		&sub.ReconnectMaxSeconds,
 		&cleanSession, &createdAt, &updatedAt,
 	)
 
@@ -484,7 +564,7 @@ func (r *Repository) scanSubscriptionRow(rows *sql.Rows) (*Subscription, error) 
 		&tlsEnabled, &sub.TLSCertPath, &sub.TLSKeyPath, &sub.TLSCAPath,
 		&tlsInsecureSkipVerify, &autoStart, &status, &sub.ErrorMessage,
 		&topicMappingJSON, &sub.KeepAliveSeconds, &sub.ConnectTimeoutSeconds,
-		&sub.ReconnectMinSeconds, &sub.ReconnectMaxSeconds,
+		&sub.ReconnectMaxSeconds,
 		&cleanSession, &createdAt, &updatedAt,
 	)
 

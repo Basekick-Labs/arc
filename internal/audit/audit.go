@@ -100,11 +100,19 @@ func NewLogger(cfg *LoggerConfig) (*Logger, error) {
 }
 
 func (l *Logger) initSchema() error {
-	// Enable incremental auto-vacuum to reclaim disk space after retention cleanup.
-	// Must be set before creating tables (only takes effect on new databases).
-	if _, err := l.db.Exec("PRAGMA auto_vacuum = INCREMENTAL"); err != nil {
-		l.logger.Warn().Err(err).Msg("Failed to set auto_vacuum pragma")
-	}
+	// No auto_vacuum pragma here, deliberately.
+	//
+	// auto_vacuum can only be changed on an empty database (or via a full
+	// VACUUM), and audit shares the auth database, whose tables already exist
+	// by the time this runs. SQLite reports no error for the rejected pragma,
+	// so the setting silently stayed at NONE and the incremental_vacuum that
+	// followed each retention cleanup was a no-op.
+	//
+	// Restoring it would be the wrong fix: audit_logs is written on every
+	// request, and vacuuming a continuously-written table causes write
+	// amplification — the vacuum shrinks the file, the next insert re-grows it.
+	// Pages freed by the retention DELETE are reused by subsequent inserts,
+	// which is what actually bounds file growth.
 
 	schema := `
 	CREATE TABLE IF NOT EXISTS audit_logs (
@@ -304,11 +312,8 @@ func (l *Logger) cleanupOldEntries() {
 
 	if rows, _ := result.RowsAffected(); rows > 0 {
 		l.logger.Info().Int64("deleted", rows).Int("retention_days", l.config.RetentionDays).Msg("Cleaned up old audit entries")
-
-		// Reclaim disk space freed by deleted rows
-		if _, err := l.db.Exec("PRAGMA incremental_vacuum"); err != nil {
-			l.logger.Warn().Err(err).Msg("Failed to run incremental vacuum")
-		}
+		// No incremental_vacuum: see initSchema. Pages freed here are reused by
+		// subsequent inserts, so the DELETE alone bounds file growth.
 	}
 }
 

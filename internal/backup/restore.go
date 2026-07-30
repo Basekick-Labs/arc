@@ -177,16 +177,50 @@ func (m *Manager) streamRestoreFile(ctx context.Context, srcPath, destPath strin
 // restoreSQLite restores the SQLite database from the backup.
 // It creates a .before-restore backup of the current database first.
 func (m *Manager) restoreSQLite(ctx context.Context, backupID string) error {
-	srcPath := fmt.Sprintf("%s/metadata/arc.db", backupID)
+	if err := m.restoreSQLiteFile(ctx, backupID, "arc.db", m.sqliteDBPath); err != nil {
+		return err
+	}
+
+	// Restore the Iceberg SQL catalog when it was backed up as a separate
+	// database. Skipped silently when the backup predates this, or when the
+	// catalog lived in the shared database (already restored above).
+	if m.icebergCatalogDBPath != "" {
+		err := m.restoreSQLiteFile(ctx, backupID, icebergCatalogDBName, m.icebergCatalogDBPath)
+		switch {
+		case err == nil:
+			m.logger.Info().Str("backup_id", backupID).Msg("Iceberg catalog database restored")
+		case isNotFoundErr(err):
+			// Backup taken before the catalog was split out, or with the
+			// catalog in the shared database. Not an error.
+			m.logger.Info().Str("backup_id", backupID).
+				Msg("Backup contains no separate Iceberg catalog; skipping")
+		default:
+			return fmt.Errorf("failed to restore Iceberg catalog: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// isNotFoundErr reports whether a storage read failed because the object is
+// absent, as opposed to a real backend failure.
+func isNotFoundErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "file not found")
+}
+
+// restoreSQLiteFile restores one SQLite database from metadata/<srcName> in the
+// backup to destPath, preserving the previous file as .before-restore.
+func (m *Manager) restoreSQLiteFile(ctx context.Context, backupID, srcName, destPath string) error {
+	srcPath := fmt.Sprintf("%s/metadata/%s", backupID, srcName)
 	data, err := m.backupStorage.Read(ctx, srcPath)
 	if err != nil {
 		return fmt.Errorf("failed to read SQLite backup: %w", err)
 	}
 
 	// Safety: backup the current database before overwriting
-	if _, statErr := os.Stat(m.sqliteDBPath); statErr == nil {
-		preRestorePath := m.sqliteDBPath + ".before-restore"
-		currentData, err := os.ReadFile(m.sqliteDBPath)
+	if _, statErr := os.Stat(destPath); statErr == nil {
+		preRestorePath := destPath + ".before-restore"
+		currentData, err := os.ReadFile(destPath)
 		if err == nil {
 			if err := os.WriteFile(preRestorePath, currentData, 0600); err != nil {
 				m.logger.Warn().Err(err).Msg("Failed to create pre-restore backup of SQLite database")
@@ -196,11 +230,11 @@ func (m *Manager) restoreSQLite(ctx context.Context, backupID string) error {
 		}
 	}
 
-	if err := os.WriteFile(m.sqliteDBPath, data, 0600); err != nil {
+	if err := os.WriteFile(destPath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write SQLite database: %w", err)
 	}
 
-	m.logger.Info().Str("backup_id", backupID).Msg("SQLite database restored")
+	m.logger.Info().Str("backup_id", backupID).Str("database", srcName).Msg("SQLite database restored")
 	return nil
 }
 

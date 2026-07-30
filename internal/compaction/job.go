@@ -649,6 +649,7 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// If tags are present, dedup on (tags, time) keeping one row per unique key.
 	// Files without tag metadata (pre-dedup or msgpack columnar) are compacted normally.
 	var tagColumns []string
+	var dedupTime bool
 	if len(validLocalPaths) > 0 {
 		tags, err := readTagColumnsFromParquetFiles(ctx, db, validLocalPaths)
 		if err != nil {
@@ -660,6 +661,21 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 				Int("files", len(validLocalPaths)).
 				Msg("Auto-dedup enabled: found tag metadata in parquet files")
 		}
+
+		// arc:dedup_time marker (continuous-query output, #521) enables dedup on
+		// time even when there are no tag columns — a no-group-by CQ produces one
+		// row per window, so duplicate emissions collapse on time alone.
+		dt, err := readDedupTimeFromParquetFiles(ctx, db, validLocalPaths)
+		if err != nil {
+			j.logger.Warn().Err(err).Msg("Failed to read dedup_time metadata from parquet, skipping time-only dedup")
+		} else if dt {
+			dedupTime = true
+			if len(tagColumns) == 0 {
+				j.logger.Info().
+					Int("files", len(validLocalPaths)).
+					Msg("Auto-dedup enabled: arc:dedup_time marker present, deduping on time")
+			}
+		}
 	}
 
 	// Build and execute compaction statement(s) (with dedup if tag metadata found).
@@ -669,8 +685,8 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// could land on a different connection and fail to see the staged table. We
 	// pin both statements to a single dedicated connection via db.Conn. Closing it
 	// also deterministically drops the temp table (no leak on partial failure).
-	dedupBranch := len(tagColumns) > 0
-	stmts := buildCompactionQuery(fileListSQL, orderByClause, outputFile, tagColumns)
+	dedupBranch := len(tagColumns) > 0 || dedupTime
+	stmts := buildCompactionQuery(fileListSQL, orderByClause, outputFile, tagColumns, dedupTime)
 
 	// When dedup is active, count rows before compaction using parquet metadata (no data scan)
 	var rowsBefore int64

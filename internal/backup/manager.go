@@ -3,6 +3,7 @@ package backup
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,11 @@ type Manager struct {
 	backupStorage storage.Backend // default local backup destination
 	sqliteDBPath  string          // path to shared SQLite database
 	configPath    string          // path to arc.toml
+	// icebergCatalogDBPath is the Iceberg SQL catalog, backed up separately only
+	// when iceberg.catalog_db_path points somewhere other than the shared DB.
+	// The catalog holds every Iceberg table's schema and snapshot pointers, so a
+	// backup without it restores data whose tables no longer resolve.
+	icebergCatalogDBPath string
 
 	logger zerolog.Logger
 	mu     sync.Mutex // serializes backup/restore operations
@@ -30,8 +36,12 @@ type ManagerConfig struct {
 	DataStorage  storage.Backend
 	BackupPath   string // local directory for backups
 	SQLiteDBPath string
-	ConfigPath   string
-	Logger       zerolog.Logger
+	// IcebergCatalogDBPath is the Iceberg SQL catalog path. Leave empty, or set
+	// equal to SQLiteDBPath, when the catalog lives in the shared database —
+	// it is then already covered by the shared-database backup.
+	IcebergCatalogDBPath string
+	ConfigPath           string
+	Logger               zerolog.Logger
 }
 
 // NewManager creates a new backup manager.
@@ -48,13 +58,41 @@ func NewManager(cfg *ManagerConfig) (*Manager, error) {
 		return nil, fmt.Errorf("failed to create backup storage: %w", err)
 	}
 
+	// Only treat the Iceberg catalog as a separate database when it really is a
+	// different file. Both paths default to the same value, and a relative vs
+	// absolute spelling of one file must not produce a redundant second copy.
+	icebergCatalog := cfg.IcebergCatalogDBPath
+	if icebergCatalog != "" && sameFilePath(icebergCatalog, cfg.SQLiteDBPath) {
+		icebergCatalog = ""
+	}
+
 	return &Manager{
-		dataStorage:   cfg.DataStorage,
-		backupStorage: backupBackend,
-		sqliteDBPath:  cfg.SQLiteDBPath,
-		configPath:    cfg.ConfigPath,
-		logger:        cfg.Logger.With().Str("component", "backup-manager").Logger(),
+		dataStorage:          cfg.DataStorage,
+		backupStorage:        backupBackend,
+		sqliteDBPath:         cfg.SQLiteDBPath,
+		icebergCatalogDBPath: icebergCatalog,
+		configPath:           cfg.ConfigPath,
+		logger:               cfg.Logger.With().Str("component", "backup-manager").Logger(),
 	}, nil
+}
+
+// sameFilePath reports whether two configured paths refer to the same file,
+// comparing cleaned absolute paths with symlinks resolved when they exist.
+func sameFilePath(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	resolve := func(p string) string {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			return filepath.Clean(p)
+		}
+		if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+			return resolved
+		}
+		return abs
+	}
+	return resolve(a) == resolve(b)
 }
 
 // generateBackupID creates a unique backup identifier.

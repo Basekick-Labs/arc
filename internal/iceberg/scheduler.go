@@ -203,13 +203,19 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		if !s.exporter.TableExists(ctx, m.Database, m.Measurement) {
 			return false, nil
 		}
-		if err := s.exporter.ReconcileMeasurement(ctx, m.Database, m.Measurement, ArcSchema{}, nil); err != nil {
+		hintOK, err := s.exporter.ReconcileMeasurementWithHint(ctx, m.Database, m.Measurement, ArcSchema{}, nil)
+		if err != nil {
 			return false, err
 		}
 		s.logger.Info().Str("database", m.Database).Str("measurement", m.Measurement).
 			Msg("Iceberg reconcile: all data files gone — table reconciled to empty")
-		// Cache the empty state (nil schema/localFiles): a later re-ingest changes the
-		// fingerprint and falls through to a full re-derivation below.
+		// Cache the empty state (nil schema/localFiles) so a permanently-empty
+		// measurement is emptied once, but only once the discovery files are
+		// published — see the equivalent guard on the main path below.
+		if !hintOK {
+			delete(s.state, key)
+			return true, nil
+		}
 		s.state[key] = measurementState{fingerprint: fp}
 		return true, nil
 	}
@@ -262,8 +268,22 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		}
 	}
 
-	if err := s.exporter.ReconcileMeasurement(ctx, m.Database, m.Measurement, sc, files); err != nil {
+	hintOK, err := s.exporter.ReconcileMeasurementWithHint(ctx, m.Database, m.Measurement, sc, files)
+	if err != nil {
 		return false, err
+	}
+
+	// Cache only when the reader discovery files are current. The snapshot is
+	// committed either way, but caching an unpublished hint would gate this
+	// measurement out of every later pass — and if its file set then goes quiet
+	// (the steady state) the hint would stay stale indefinitely. Leaving the
+	// entry uncached costs one repeated reconcile per tick until it succeeds.
+	if !hintOK {
+		delete(s.state, key)
+		s.logger.Warn().
+			Str("database", m.Database).Str("measurement", m.Measurement).
+			Msg("Iceberg reconcile: reader discovery files not published; will retry next pass")
+		return true, nil
 	}
 
 	localSet := make(map[string]struct{}, len(localFiles))

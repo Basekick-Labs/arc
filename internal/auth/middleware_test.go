@@ -75,7 +75,7 @@ func TestMiddleware_BearerToken(t *testing.T) {
 		req := httptest.NewRequest("GET", "/test", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
 
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, testTimeoutMS)
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
@@ -90,7 +90,7 @@ func TestMiddleware_BearerToken(t *testing.T) {
 		req := httptest.NewRequest("GET", "/test", nil)
 		req.Header.Set("Authorization", "Bearer invalid-token")
 
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, testTimeoutMS)
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
@@ -112,7 +112,7 @@ func TestMiddleware_PlainToken(t *testing.T) {
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.Header.Set("Authorization", token) // Plain token, no Bearer prefix
 
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testTimeoutMS)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestMiddleware_ApiKeyHeader(t *testing.T) {
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.Header.Set("x-api-key", token)
 
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testTimeoutMS)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -173,7 +173,7 @@ func TestMiddleware_PublicRoutes(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {
 			req := httptest.NewRequest("GET", tt.path, nil)
-			resp, err := app.Test(req)
+			resp, err := app.Test(req, testTimeoutMS)
 			if err != nil {
 				t.Fatalf("Request failed: %v", err)
 			}
@@ -216,7 +216,7 @@ func TestMiddleware_PublicPrefixes(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {
 			req := httptest.NewRequest("GET", tt.path, nil)
-			resp, err := app.Test(req)
+			resp, err := app.Test(req, testTimeoutMS)
 			if err != nil {
 				t.Fatalf("Request failed: %v", err)
 			}
@@ -298,7 +298,7 @@ func TestMiddleware_PublicPrefixes_AnchoredMatch(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest("GET", tt.path, nil)
-			resp, err := app.Test(req)
+			resp, err := app.Test(req, testTimeoutMS)
 			if err != nil {
 				t.Fatalf("Request failed: %v", err)
 			}
@@ -350,7 +350,7 @@ func TestMiddleware_PublicPrefixes_TrailingSlashNormalisation(t *testing.T) {
 			for _, tt := range tests {
 				t.Run(tt.name, func(t *testing.T) {
 					req := httptest.NewRequest("GET", tt.path, nil)
-					resp, err := app.Test(req)
+					resp, err := app.Test(req, testTimeoutMS)
 					if err != nil {
 						t.Fatalf("Request failed: %v", err)
 					}
@@ -371,7 +371,7 @@ func TestMiddleware_NoToken(t *testing.T) {
 	defer cleanup()
 
 	req := httptest.NewRequest("GET", "/test", nil)
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testTimeoutMS)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -394,7 +394,7 @@ func TestMiddleware_ExpiredToken(t *testing.T) {
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testTimeoutMS)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -415,7 +415,7 @@ func TestMiddleware_ContextToken(t *testing.T) {
 	req := httptest.NewRequest("GET", "/whoami", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testTimeoutMS)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -445,7 +445,7 @@ func TestMiddleware_Skip(t *testing.T) {
 
 	// Request without any token should succeed when Skip is true
 	req := httptest.NewRequest("GET", "/test", nil)
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testTimeoutMS)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -468,7 +468,7 @@ func TestMiddleware_NoAuthManager(t *testing.T) {
 
 	// Request should succeed when no AuthManager is configured
 	req := httptest.NewRequest("GET", "/test", nil)
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testTimeoutMS)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -534,7 +534,7 @@ func TestRequirePermission(t *testing.T) {
 			req := httptest.NewRequest(tt.method, tt.path, nil)
 			req.Header.Set("Authorization", "Bearer "+tt.token)
 
-			resp, err := app.Test(req)
+			resp, err := app.Test(req, testTimeoutMS)
 			if err != nil {
 				t.Fatalf("Request failed: %v", err)
 			}
@@ -565,7 +565,7 @@ func TestRequirePermission_NoToken(t *testing.T) {
 	})
 
 	req := httptest.NewRequest("POST", "/data", nil)
-	resp, _ := app.Test(req)
+	resp, _ := app.Test(req, testTimeoutMS)
 
 	if resp.StatusCode != fiber.StatusUnauthorized {
 		t.Errorf("Expected 401 when no token in context, got %d", resp.StatusCode)
@@ -589,7 +589,7 @@ func TestGetTokenInfo(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/capture", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
-		app.Test(req)
+		app.Test(req, testTimeoutMS)
 
 		if capturedInfo == nil {
 			t.Error("GetTokenInfo should return token info")

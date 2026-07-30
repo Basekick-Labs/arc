@@ -342,7 +342,10 @@ func TestExpireSnapshotsAndPruneVersions(t *testing.T) {
 		t.Errorf("snapshot count = %d, want <= %d (retain=%d)", n, retain+1, retain)
 	}
 
-	// Old v<M>.metadata.json copies must be pruned to the newest `retain`.
+	// Old v<M>.metadata.json copies must be pruned. The bound is retain+1, not
+	// retain: one extra version is kept so a directory reader that resolved
+	// version-hint.text just before a commit can still open the version it read
+	// (see pruneOldVersionFiles).
 	metaDir := filepath.Join(root, "arc_db.db", "cpu", "metadata")
 	entries, _ := os.ReadDir(metaDir)
 	var vFiles []string
@@ -351,8 +354,12 @@ func TestExpireSnapshotsAndPruneVersions(t *testing.T) {
 			vFiles = append(vFiles, e.Name())
 		}
 	}
-	if len(vFiles) > retain {
-		t.Errorf("v<N>.metadata.json count = %d (%v), want <= %d after pruning", len(vFiles), vFiles, retain)
+	if len(vFiles) > retain+1 {
+		t.Errorf("v<N>.metadata.json count = %d (%v), want <= %d after pruning", len(vFiles), vFiles, retain+1)
+	}
+	// The bound must still be a bound — 8 writes must not leave 8 copies.
+	if len(vFiles) >= 8 {
+		t.Errorf("v<N>.metadata.json count = %d (%v): pruning is not bounding growth", len(vFiles), vFiles)
 	}
 	// version-hint.text must point at an existing v<N>.metadata.json (readers rely on it).
 	hint, err := os.ReadFile(filepath.Join(metaDir, "version-hint.text"))

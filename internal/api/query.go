@@ -384,6 +384,15 @@ func rewriteTimeBucket(sql string) string {
 		column := strings.TrimSpace(parts[3])
 		origin := parts[4] // e.g., "2024-01-01 00:30:00"
 
+		// Paren-blind guard (#535): if the column arg contains parentheses the
+		// regex capture may be truncated at the wrong ')'. Leave the call
+		// unrewritten so DuckDB handles it natively. (For time_bucket the
+		// capture already fails to match most nested args, so this is belt-and-
+		// suspenders — but it keeps every rewrite path consistently safe.)
+		if strings.Contains(column, "(") {
+			return match
+		}
+
 		// Parse origin timestamp
 		originTime, err := parseTimeBucketOrigin(origin)
 		if err != nil {
@@ -415,6 +424,12 @@ func rewriteTimeBucket(sql string) string {
 		unit := strings.ToLower(strings.TrimSuffix(parts[2], "s"))
 		column := strings.TrimSpace(parts[3])
 
+		// Paren-blind guard (#535): see the 3-arg form above. If the column arg
+		// contains parentheses the capture may be truncated; leave it for DuckDB.
+		if strings.Contains(column, "(") {
+			return match
+		}
+
 		// Use epoch-based arithmetic for all intervals (2.5x faster than date_trunc)
 		seconds := intervalToSeconds(amount, unit)
 		if seconds == 0 {
@@ -444,6 +459,19 @@ func rewriteDateTrunc(sql string) string {
 
 		unit := strings.ToLower(parts[1])
 		column := strings.TrimSpace(parts[2])
+
+		// Paren-blind guard (#535): the column capture uses [^)]+, which stops
+		// at the FIRST ')' rather than the matching one. When the column arg
+		// itself contains parentheses — coalesce(time, a), (time), CAST(...),
+		// nested calls — the capture is truncated and splicing ::BIGINT onto it
+		// would corrupt the query (e.g. epoch(coalesce(time, a)::BIGINT // 3600)
+		// swallows the arithmetic inside epoch's arg list, producing a binder
+		// error on SQL DuckDB would have run fine). Detect a '(' in the captured
+		// column and leave the call unrewritten — DuckDB runs date_trunc()
+		// natively (correct, just without the epoch optimization).
+		if strings.Contains(column, "(") {
+			return match
+		}
 
 		// Get interval in seconds
 		seconds := intervalToSeconds("1", unit)
@@ -1520,7 +1548,7 @@ localProcessing:
 	}
 
 	// Convert SQL to storage paths and check for parallel execution opportunity
-	convertedSQL, parallelInfo, cached := h.getTransformedSQLForParallel(req.SQL, headerDB)
+	convertedSQL, parallelInfo, cached := h.getTransformedSQLForParallel(c.Context(), req.SQL, headerDB)
 
 	if h.debugEnabled {
 		h.logger.Debug().
@@ -2111,7 +2139,167 @@ func ValidateSQLRequest(sql string) error {
 		return &SQLValidationError{Message: "File I/O function not allowed in user SQL: " + m[1] + "()"}
 	}
 
+	// SECURITY: reject a bare single-quoted string in table position — a
+	// DuckDB replacement scan (GHSA-w8x2-cccw-25f7, incomplete-fix residual of
+	// GHSA-93cm-2v4m-c56c).
+	//
+	// DuckDB resolves `FROM '/path/*.parquet'` (a quoted string where a table
+	// name is expected) as a replacement scan that reads that file directly —
+	// with NO function name. So it slips past the I/O-function denylist above
+	// (which keys on `name(`), and downstream extractTableReferences masks the
+	// quoted path to a `__STR__` placeholder before RBAC matching, so RBAC
+	// never sees the foreign path. Net: a tenant with any one legitimate grant
+	// reads any Parquet inside the sandbox's allowlisted storage root — every
+	// other tenant's data — via `SELECT b.s FROM cpu, '/data/arc/db2/secrets/*.parquet' b`
+	// (comma form) or `SELECT * FROM '<root>/*/**/*.parquet'` (glob form).
+	//
+	// Only Arc's own transform layer (convertSQLToStoragePaths, which runs
+	// AFTER this validation and carries the caller's identity) may put a quoted
+	// path in table position via read_parquet('…'); user SQL never legitimately
+	// does. A single-quoted string used as a VALUE — `WHERE msg = '…'`,
+	// `date_trunc('hour', t)`, an IN-list — is NOT flagged; only a placeholder
+	// standing where a table reference belongs (after FROM/JOIN, or continuing a
+	// FROM clause's table list via a cross-join comma) trips it.
+	//
+	// The check must distinguish a single-quoted STRING from a quoted
+	// IDENTIFIER: DuckDB uses `'` for strings and `"`/backtick for identifiers,
+	// and a quoted identifier in table position (`FROM "my table"`,
+	// `` FROM `my;db` ``) is legitimate — not a replacement scan. So it runs on
+	// the identifier-quote-stripped, single-quote-masked form, NOT the shared
+	// `normalised` above (which masks all quote kinds indiscriminately and would
+	// false-positive on a quoted identifier).
+	//
+	// ioCheckNormalised (computed above) is exactly the form we need here: it
+	// strips `"`/backtick identifier quoting (exposing identifiers as barewords)
+	// and masks the remaining single-quoted strings to `__STR__` placeholders,
+	// with comments stripped. Reuse it rather than normalising twice.
+	if stringLiteralInTablePosition(ioCheckNormalised) {
+		return &SQLValidationError{Message: "String literal not allowed in table position (replacement scans are disabled); reference a table by name"}
+	}
+
 	return nil
+}
+
+// tablePosPlaceholder matches a MaskStringLiterals placeholder (`__STR_<n>__`).
+// Used to isolate placeholders with surrounding spaces before tokenising, so a
+// placeholder that abuts a keyword with no whitespace (`FROM'…'` masks to the
+// glued `FROM__STR_0__`) is not swallowed into one identifier token — a real
+// replacement-scan bypass otherwise (GHSA-w8x2 review, blocker 2).
+var tablePosPlaceholder = regexp.MustCompile(`__STR_\d+__`)
+
+// tablePosTokenPattern tokenises the (space-isolated) masked/normalised SQL into
+// the atoms the table-position scanner cares about: a masked string placeholder
+// (`__STR_<n>__`), a parenthesis, a comma, or any other run of identifier bytes
+// (keywords, table names, aliases). Everything else (whitespace, operators) is
+// skipped. The placeholder alternative is matched BEFORE the generic identifier
+// run so it wins even though `_`/digits are also identifier bytes.
+var tablePosTokenPattern = regexp.MustCompile(`__STR_\d+__|[A-Za-z_][A-Za-z0-9_]*|[(),]`)
+
+// stringLiteralInTablePosition reports whether `normalised` — SQL whose SINGLE-
+// quoted string literals have already been masked to `__STR_<n>__` placeholders,
+// whose identifier quoting has been stripped, and whose comments have been
+// removed (i.e. the output of ioDenylistNormalise) — puts a masked string where
+// a table reference belongs. That is DuckDB's replacement-scan syntax
+// (`FROM '…'`), which reads a file with no function name and so bypasses both the
+// I/O-function denylist and the RBAC table extractor (GHSA-w8x2-cccw-25f7).
+//
+// A placeholder is in table position when it directly follows the FROM or JOIN
+// keyword, or a comma that continues an in-progress FROM clause's table list (a
+// comma cross-join: `FROM cpu, '…'`, including after a subquery: `FROM (…) a, '…'`).
+// A placeholder that is a VALUE — a WHERE/SELECT literal, or a function argument
+// such as `date_trunc('hour', t)` (deeper in a paren group than its enclosing
+// FROM clause) — is never in table position, so those do not trip.
+//
+// FROM-clause state is a STACK keyed by parenthesis depth, not a single scalar:
+// a subquery inside a FROM clause (`FROM (SELECT … FROM inner) a, '…'`) opens its
+// OWN nested FROM clause whose end (on the closing paren) must NOT clear the
+// outer FROM clause — otherwise the trailing comma cross-join is wrongly
+// disarmed and the replacement scan slips through (GHSA-w8x2 review, blocker 1).
+func stringLiteralInTablePosition(normalised string) bool {
+	// fromArmed[d] is true when, at paren depth d, we are inside a FROM clause
+	// whose table list is still open — so a comma at depth d continues that
+	// list (a cross-join table position). Indexed by depth; grows as needed.
+	fromArmed := make([]bool, 1, 8)
+
+	// afterFromJoin is true when the immediately preceding token was FROM or
+	// JOIN, so the very next table-atom is in table position.
+	afterFromJoin := false
+
+	depth := 0
+	// Isolate placeholders with surrounding spaces so a keyword directly
+	// abutting one (`FROM__STR_0__` from `FROM'…'`) tokenises as two atoms.
+	isolated := tablePosPlaceholder.ReplaceAllString(normalised, " $0 ")
+	toks := tablePosTokenPattern.FindAllString(isolated, -1)
+	for _, tok := range toks {
+		switch tok {
+		case "(":
+			depth++
+			if depth >= len(fromArmed) {
+				fromArmed = append(fromArmed, false)
+			} else {
+				fromArmed[depth] = false
+			}
+			afterFromJoin = false
+			continue
+		case ")":
+			if depth > 0 {
+				fromArmed[depth] = false
+				depth--
+			}
+			// Leaving the paren group does NOT touch fromArmed[depth-1]: the
+			// OUTER FROM clause (if any) is still open. This is the blocker-1 fix.
+			afterFromJoin = false
+			continue
+		case ",":
+			// A comma continues the table list only if THIS depth's FROM clause
+			// is still armed (excludes function-argument and projection commas,
+			// which are either at a deeper depth or after a clause terminator).
+			afterFromJoin = fromArmed[depth]
+			continue
+		}
+
+		// tok is a placeholder or an identifier/keyword run.
+		if strings.HasPrefix(tok, "__STR_") {
+			// A masked single-quoted string standing in table position.
+			if afterFromJoin {
+				return true
+			}
+			// A string that is NOT in table position (a value, a function arg)
+			// closes the "immediately after FROM/JOIN" window but leaves the
+			// FROM clause's armed state (for a following cross-join comma) alone.
+			afterFromJoin = false
+			continue
+		}
+
+		switch strings.ToLower(tok) {
+		case "from", "join":
+			fromArmed[depth] = true
+			afterFromJoin = true
+		default:
+			// A real table name, alias, ON, USING, etc. ends the "immediately
+			// after FROM/JOIN" window but keeps the FROM clause armed so a
+			// following `, '…'` cross-join is still caught.
+			afterFromJoin = false
+			// Keywords that close the FROM clause's table list at this depth:
+			// after WHERE/GROUP/…, a top-level comma is a projection/ordering
+			// separator, not another cross-join table.
+			if fromClauseTerminator(strings.ToLower(tok)) {
+				fromArmed[depth] = false
+			}
+		}
+	}
+	return false
+}
+
+// fromClauseTerminator reports whether a lower-cased keyword ends the table
+// list of a FROM clause, so that a later same-depth comma is a projection or
+// ordering separator rather than another comma cross-join table.
+func fromClauseTerminator(word string) bool {
+	switch word {
+	case "where", "group", "having", "order", "limit", "offset", "window", "qualify", "union", "except", "intersect", "fetch", "for":
+		return true
+	}
+	return false
 }
 
 // ioDenylistNormalise produces the form of the SQL the I/O-function denylist is
@@ -2127,8 +2315,13 @@ func ValidateSQLRequest(sql string) error {
 // for strings and `"`/backtick for identifiers), never the body of a string
 // literal, so this cannot unmask a genuine string. In the pathological case of
 // a `'` inside a `"..."` identifier the subsequent literal-masking may mis-pair
-// quotes, but that errs toward showing MORE text to the denylist (fail-closed),
-// never less.
+// quotes. For the I/O-function DENYLIST consumer that errs toward showing MORE
+// text (fail-closed), never less. NOTE: this output is ALSO consumed by
+// stringLiteralInTablePosition (the replacement-scan check), for which the same
+// mis-pairing can instead hide a placeholder from table-position detection
+// (fail-OPEN for that consumer). That is not exploitable: a `'` inside a
+// `"..."` identifier means the attacker's own SQL is mis-quoted, so DuckDB does
+// not parse the intended replacement scan either — no foreign read results.
 func ioDenylistNormalise(sql string) string {
 	stripped := strings.NewReplacer(`"`, "", "`", "").Replace(sql)
 	features := scanSQLFeatures(stripped)
@@ -2181,7 +2374,7 @@ var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join([]strin
 // getTransformedSQL returns the transformed SQL with caching.
 // If headerDB is non-empty, uses the optimized path with that database for all tables.
 // Returns the transformed SQL and whether it was a cache hit.
-func (h *QueryHandler) getTransformedSQL(sql string, headerDB string) (string, bool) {
+func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, headerDB string) (string, bool) {
 	// Fast path: queries already using read_parquet don't need transformation
 	sqlLower := strings.ToLower(sql)
 	if strings.Contains(sqlLower, "read_parquet") {
@@ -2208,9 +2401,9 @@ func (h *QueryHandler) getTransformedSQL(sql string, headerDB string) (string, b
 	// Transform using appropriate method
 	var transformed string
 	if headerDB != "" {
-		transformed = h.convertSQLToStoragePathsWithHeaderDB(sql, headerDB)
+		transformed = h.convertSQLToStoragePathsWithHeaderDB(ctx, sql, headerDB)
 	} else {
-		transformed = h.convertSQLToStoragePaths(sql)
+		transformed = h.convertSQLToStoragePaths(ctx, sql)
 	}
 
 	h.queryCache.Set(cacheKey, transformed)
@@ -2221,7 +2414,7 @@ func (h *QueryHandler) getTransformedSQL(sql string, headerDB string) (string, b
 // This variant checks if the query can benefit from parallel partition scanning.
 // Only simple single-table queries with header DB can use parallel execution.
 // Returns (sql, parallel_info, cache_hit).
-func (h *QueryHandler) getTransformedSQLForParallel(sql string, headerDB string) (string, *ParallelQueryInfo, bool) {
+func (h *QueryHandler) getTransformedSQLForParallel(ctx context.Context, sql string, headerDB string) (string, *ParallelQueryInfo, bool) {
 	sqlLower := strings.ToLower(sql)
 
 	// Fast paths that don't support parallel execution
@@ -2235,7 +2428,7 @@ func (h *QueryHandler) getTransformedSQLForParallel(sql string, headerDB string)
 	// Parallel execution only supported for simple single-table queries with header DB
 	// Complex queries (JOINs, subqueries, CTEs) fall back to standard execution
 	if headerDB == "" || !isSingleTableQuery(sqlLower) || strings.Contains(sqlLower, "with ") {
-		transformed, cached := h.getTransformedSQL(sql, headerDB)
+		transformed, cached := h.getTransformedSQL(ctx, sql, headerDB)
 		return transformed, nil, cached
 	}
 
@@ -2243,7 +2436,7 @@ func (h *QueryHandler) getTransformedSQLForParallel(sql string, headerDB string)
 	// SUBSTRING/TRIM/OVERLAY need the slow path's FROM-keyword mask.
 	features := scanSQLFeatures(sql)
 	if features.hasQuotes || features.hasDashComment || features.hasBlockComment || sqlutil.ContainsFromKeywordFunction(sql) {
-		transformed, cached := h.getTransformedSQL(sql, headerDB)
+		transformed, cached := h.getTransformedSQL(ctx, sql, headerDB)
 		return transformed, nil, cached
 	}
 
@@ -2255,7 +2448,7 @@ func (h *QueryHandler) getTransformedSQLForParallel(sql string, headerDB string)
 	}
 
 	// Use parallel-aware conversion
-	convertedSQL, parallelInfo := h.convertSingleTableQueryForParallel(sql, sqlLower, headerDB)
+	convertedSQL, parallelInfo := h.convertSingleTableQueryForParallel(ctx, sql, sqlLower, headerDB)
 	return convertedSQL, parallelInfo, false
 }
 
@@ -2266,7 +2459,7 @@ func (h *QueryHandler) getTransformedSQLForParallel(sql string, headerDB string)
 // Converts: JOIN measurement -> JOIN read_parquet('path/**/*.parquet')
 // CTE names are extracted and excluded from conversion to avoid replacing virtual table references.
 // String literals and comments are protected from regex matching.
-func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
+func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string) string {
 	originalSQL := sql
 
 	// Phase 0a: Rewrite regex functions to faster string functions BEFORE masking
@@ -2314,7 +2507,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 			return match
 		}
 		path := h.getStoragePath(parts[1], parts[2])
-		return h.buildReadParquetExpr(path, originalSQL, "FROM")
+		return h.buildReadParquetExpr(ctx, path, originalSQL, "FROM")
 	})
 
 	// Handle JOIN database.table references (includes LATERAL JOIN)
@@ -2324,7 +2517,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 			return match
 		}
 		path := h.getStoragePath(parts[1], parts[2])
-		return h.buildReadParquetExpr(path, originalSQL, "JOIN")
+		return h.buildReadParquetExpr(ctx, path, originalSQL, "JOIN")
 	})
 
 	// Handle FROM simple_table references
@@ -2357,7 +2550,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 		}
 
 		path := h.getStoragePath("default", parts[1])
-		return h.buildReadParquetExpr(path, originalSQL, "FROM")
+		return h.buildReadParquetExpr(ctx, path, originalSQL, "FROM")
 	})
 
 	// Handle JOIN simple_table references (includes LATERAL JOIN)
@@ -2390,7 +2583,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
 		}
 
 		path := h.getStoragePath("default", parts[1])
-		return h.buildReadParquetExpr(path, originalSQL, "JOIN")
+		return h.buildReadParquetExpr(ctx, path, originalSQL, "JOIN")
 	})
 
 	// Restore masked FROM keywords and string literals. Both use content-
@@ -2440,7 +2633,7 @@ type ParallelQueryInfo struct {
 // buildReadParquetExpr builds a read_parquet expression with optional partition pruning.
 // keyword is "FROM" or "JOIN" to prepend to the result.
 // If tiering is enabled and cold tier has data, builds a UNION ALL query across tiers.
-func (h *QueryHandler) buildReadParquetExpr(path, originalSQL, keyword string) string {
+func (h *QueryHandler) buildReadParquetExpr(ctx context.Context, path, originalSQL, keyword string) string {
 	// Check if tiering is enabled and cold tier is configured
 	if h.tieringManager != nil {
 		router := h.tieringManager.GetRouter()
@@ -2467,7 +2660,7 @@ func (h *QueryHandler) buildReadParquetExpr(path, originalSQL, keyword string) s
 	options := buildReadParquetOptions()
 
 	// Apply partition pruning
-	optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(path, originalSQL)
+	optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(ctx, path, originalSQL)
 
 	if wasOptimized {
 		// Check if it's a list of paths or a single path
@@ -2496,7 +2689,7 @@ func (h *QueryHandler) buildReadParquetExpr(path, originalSQL, keyword string) s
 // buildReadParquetExprForMeasurement builds a read_parquet expression for a database/measurement pair.
 // This is the tiering-aware version used by the fast path that takes database and measurement
 // separately instead of a pre-constructed path, allowing proper tiering metadata lookup.
-func (h *QueryHandler) buildReadParquetExprForMeasurement(database, measurement, originalSQL, keyword string) string {
+func (h *QueryHandler) buildReadParquetExprForMeasurement(ctx context.Context, database, measurement, originalSQL, keyword string) string {
 	// Check if tiering is enabled and cold tier is configured
 	if h.tieringManager != nil {
 		router := h.tieringManager.GetRouter()
@@ -2517,17 +2710,17 @@ func (h *QueryHandler) buildReadParquetExprForMeasurement(database, measurement,
 
 	// Fall back to single-tier behavior (hot tier only)
 	path := h.getStoragePath(database, measurement)
-	return h.buildReadParquetExpr(path, originalSQL, keyword)
+	return h.buildReadParquetExpr(ctx, path, originalSQL, keyword)
 }
 
 // buildReadParquetExprForParallel builds a read_parquet expression and returns
 // parallel execution info if the query can benefit from parallel partition scanning.
 // Returns (sql_expression, parallel_info) where parallel_info is non-nil if parallel is recommended.
-func (h *QueryHandler) buildReadParquetExprForParallel(path, originalSQL, keyword string) (string, *ParallelQueryInfo) {
+func (h *QueryHandler) buildReadParquetExprForParallel(ctx context.Context, path, originalSQL, keyword string) (string, *ParallelQueryInfo) {
 	options := buildReadParquetOptions()
 
 	// Apply partition pruning
-	optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(path, originalSQL)
+	optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(ctx, path, originalSQL)
 
 	if wasOptimized {
 		if pathList, ok := optimizedPath.([]string); ok {
@@ -2729,7 +2922,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(database, measurement string, t
 
 // convertSingleTableQuery is a fast path for simple single-table queries.
 // It avoids regex entirely by using simple string manipulation.
-func (h *QueryHandler) convertSingleTableQuery(sql, sqlLower, database string) string {
+func (h *QueryHandler) convertSingleTableQuery(ctx context.Context, sql, sqlLower, database string) string {
 	// Find "FROM table" position
 	idx := strings.Index(sqlLower, "from ")
 	if idx < 0 {
@@ -2761,14 +2954,14 @@ func (h *QueryHandler) convertSingleTableQuery(sql, sqlLower, database string) s
 	}
 
 	// Build replacement - use tiering-aware method that checks both hot and cold tiers
-	replacement := h.buildReadParquetExprForMeasurement(database, tableName, sql, "FROM")
+	replacement := h.buildReadParquetExprForMeasurement(ctx, database, tableName, sql, "FROM")
 
 	return sql[:idx] + replacement + sql[end:]
 }
 
 // convertSingleTableQueryForParallel is a variant that returns parallel execution info.
 // Returns (converted_sql, parallel_info) where parallel_info is non-nil if parallel execution is recommended.
-func (h *QueryHandler) convertSingleTableQueryForParallel(sql, sqlLower, database string) (string, *ParallelQueryInfo) {
+func (h *QueryHandler) convertSingleTableQueryForParallel(ctx context.Context, sql, sqlLower, database string) (string, *ParallelQueryInfo) {
 	// Find "FROM table" position
 	idx := strings.Index(sqlLower, "from ")
 	if idx < 0 {
@@ -2814,7 +3007,7 @@ func (h *QueryHandler) convertSingleTableQueryForParallel(sql, sqlLower, databas
 
 	// Build replacement with parallel info (hot tier only)
 	path := h.getStoragePath(database, tableName)
-	replacement, parallelInfo := h.buildReadParquetExprForParallel(path, sql, "FROM")
+	replacement, parallelInfo := h.buildReadParquetExprForParallel(ctx, path, sql, "FROM")
 
 	convertedSQL := sql[:idx] + replacement + sql[end:]
 
@@ -2830,7 +3023,7 @@ func (h *QueryHandler) convertSingleTableQueryForParallel(sql, sqlLower, databas
 // the database specified in the x-arc-database header. This is an optimized path that
 // skips the database.table regex patterns since all tables use the header-specified database.
 // This provides ~50% reduction in regex operations compared to convertSQLToStoragePaths.
-func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database string) string {
+func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context, sql string, database string) string {
 	originalSQL := sql
 	sqlLower := strings.ToLower(sql)
 
@@ -2853,7 +3046,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database
 				sql = rewriteDateTrunc(sql)
 				sqlLower = strings.ToLower(sql)
 			}
-			return h.convertSingleTableQuery(sql, sqlLower, database)
+			return h.convertSingleTableQuery(ctx, sql, sqlLower, database)
 		}
 	}
 
@@ -2919,7 +3112,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database
 
 		// Use header database instead of "default"
 		path := h.getStoragePath(database, parts[1])
-		return h.buildReadParquetExpr(path, originalSQL, "FROM")
+		return h.buildReadParquetExpr(ctx, path, originalSQL, "FROM")
 	})
 
 	// Handle JOIN simple_table references - apply header database
@@ -2953,7 +3146,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database
 
 		// Use header database instead of "default"
 		path := h.getStoragePath(database, parts[1])
-		return h.buildReadParquetExpr(path, originalSQL, "JOIN")
+		return h.buildReadParquetExpr(ctx, path, originalSQL, "JOIN")
 	})
 
 	// Restore masked FROM keywords and original string literals.
@@ -3470,7 +3663,7 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	}
 
 	// Convert SQL to storage paths (with caching)
-	convertedSQL, _ := h.getTransformedSQL(req.SQL, headerDB)
+	convertedSQL, _ := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
 
 	// Create a COUNT(*) version of the query
 	countSQL := "SELECT COUNT(*) FROM (" + convertedSQL + ") AS t"
@@ -3830,7 +4023,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 
 	// Convert SQL to storage paths (with caching)
 	// Note: This endpoint builds its own db.measurement SQL, so no header optimization
-	convertedSQL, _ := h.getTransformedSQL(sql, "")
+	convertedSQL, _ := h.getTransformedSQL(c.Context(), sql, "")
 
 	h.logger.Debug().
 		Str("measurement", measurement).

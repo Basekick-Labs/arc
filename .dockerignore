@@ -1,0 +1,29 @@
+# Build artifacts and packaging output — large, and never needed inside the
+# image. Without these exclusions the build context carries hundreds of MB of
+# release tarballs and packaging trees on a developer machine that has them.
+zarf-package-*.tar.zst
+uds/
+*.tar.zst
+
+# Local runtime data — gitignored, and on a developer machine this can be tens
+# of GB of parquet. Copying it into the build context exhausts the builder's
+# disk long before the binary is compiled.
+data/
+*.parquet
+*.duckdb
+
+# Version control and local tooling
+.git/
+.github/
+.claude/
+
+# Test/scratch output
+scripts/memtest/
+*.test
+coverage.out
+
+# Docs and deployment manifests — not needed to compile or run the binary
+docs/
+deploy/
+helm/
+*.md

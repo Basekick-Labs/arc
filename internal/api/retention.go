@@ -36,9 +36,13 @@ type RetentionCoordinator interface {
 
 // RetentionHandler handles retention policy operations
 type RetentionHandler struct {
-	storage       storage.Backend
-	config        *config.RetentionConfig
-	db            *sql.DB              // SQLite for policy metadata
+	storage storage.Backend
+	config  *config.RetentionConfig
+	db      *sql.DB // SQLite for policy metadata
+	// ownsDB records whether this handler opened db itself. When retention
+	// shares the auth database (the default), the handle is borrowed and Close
+	// must leave it to its owner.
+	ownsDB        bool
 	duckdb        *database.DuckDB     // Shared DuckDB for parquet queries
 	coordinator   RetentionCoordinator // nil in standalone mode
 	licenseClient *license.Client      // nil when auth/licensing is disabled
@@ -104,22 +108,37 @@ type RetentionExecution struct {
 
 // NewRetentionHandler creates a new retention handler
 func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *config.RetentionConfig, licenseClient *license.Client, authManager *auth.AuthManager, logger zerolog.Logger) (*RetentionHandler, error) {
-	// Ensure directory exists
-	dir := filepath.Dir(cfg.DBPath)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return nil, fmt.Errorf("failed to create directory for retention DB: %w", err)
-	}
+	// retention.db_path defaults to the auth database. When it resolves to the
+	// same file, borrow the auth manager's handle rather than opening a second
+	// connection pool against it — SQLite has a single writer, so independent
+	// pools on one file only contend for the same lock. An operator who points
+	// retention.db_path elsewhere still gets a genuinely separate database.
+	var (
+		db     *sql.DB
+		ownsDB bool
+	)
+	if authManager.SharesDBPath(cfg.DBPath) {
+		db = authManager.GetDB()
+	} else {
+		// Ensure directory exists
+		dir := filepath.Dir(cfg.DBPath)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return nil, fmt.Errorf("failed to create directory for retention DB: %w", err)
+		}
 
-	// Open SQLite database for policy metadata
-	db, err := sql.Open("sqlite3", cfg.DBPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open retention database: %w", err)
+		// Open SQLite database for policy metadata
+		opened, err := sql.Open("sqlite3", cfg.DBPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open retention database: %w", err)
+		}
+		db, ownsDB = opened, true
 	}
 
 	h := &RetentionHandler{
 		storage:       storage,
 		config:        cfg,
 		db:            db,
+		ownsDB:        ownsDB,
 		duckdb:        duckdb,
 		licenseClient: licenseClient,
 		authManager:   authManager,
@@ -128,7 +147,9 @@ func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *
 
 	// Initialize tables
 	if err := h.initTables(); err != nil {
-		db.Close()
+		if ownsDB {
+			db.Close()
+		}
 		return nil, fmt.Errorf("failed to initialize retention tables: %w", err)
 	}
 
@@ -183,8 +204,14 @@ func (h *RetentionHandler) initTables() error {
 	return nil
 }
 
-// Close closes the database connection
+// Close releases the database handle if this handler owns it.
+//
+// When retention shares the auth database (the default), the handle is
+// borrowed and its owner closes it later in the shutdown sequence.
 func (h *RetentionHandler) Close() error {
+	if !h.ownsDB {
+		return nil
+	}
 	return h.db.Close()
 }
 
@@ -838,7 +865,7 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 		// into ops. The storage delete loop uses this subset so a marshal failure
 		// never causes a file to be deleted from storage without a manifest entry.
 		var ops []raft.BatchFileOp
-		subPaths := chunk          // default: all chunk paths (no coordinator)
+		subPaths := chunk // default: all chunk paths (no coordinator)
 		subRows := eligibleRows[i:end]
 		if h.coordinator != nil {
 			ops = make([]raft.BatchFileOp, 0, len(chunk))
