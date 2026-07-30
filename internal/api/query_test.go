@@ -438,7 +438,7 @@ func TestConvertSQLWithCTE(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := h.convertSQLToStoragePaths(tt.inputSQL)
+			result := h.convertSQLToStoragePaths(context.Background(), tt.inputSQL)
 
 			for _, substr := range tt.shouldContain {
 				if !strings.Contains(result, substr) {
@@ -566,7 +566,7 @@ func TestConvertSQLToStoragePaths_FromKeywordFunctions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := h.convertSQLToStoragePaths(tt.input)
+			result := h.convertSQLToStoragePaths(context.Background(), tt.input)
 			for _, substr := range tt.shouldContain {
 				if !strings.Contains(result, substr) {
 					t.Errorf("Result should contain %q.\nInput:  %s\nResult: %s", substr, tt.input, result)
@@ -637,7 +637,7 @@ func TestConvertSQLToStoragePaths_ExtractAfterFrom(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := h.convertSQLToStoragePaths(tt.input)
+			result := h.convertSQLToStoragePaths(context.Background(), tt.input)
 			for _, substr := range tt.shouldContain {
 				if !strings.Contains(result, substr) {
 					t.Errorf("Result should contain %q.\nInput:  %s\nResult: %s", substr, tt.input, result)
@@ -662,7 +662,7 @@ func TestConvertSQLToStoragePathsWithHeaderDB_FromKeywordFunctions(t *testing.T)
 	}
 
 	input := "SELECT EXTRACT(YEAR FROM time) FROM citibike_trips"
-	result := h.convertSQLToStoragePathsWithHeaderDB(input, "mydb")
+	result := h.convertSQLToStoragePathsWithHeaderDB(context.Background(), input, "mydb")
 
 	if !strings.Contains(result, "EXTRACT(YEAR FROM time)") {
 		t.Errorf("inner EXTRACT expression was mutated.\nGot: %s", result)
@@ -1124,6 +1124,47 @@ func TestValidateSQLRequest_BypassesAndFalsePositives(t *testing.T) {
 		{name: "table named globthing not blocked", sql: "SELECT * FROM globthing", shouldFail: false},
 		{name: "column named read_csv_count not blocked", sql: "SELECT read_csv_count FROM cpu", shouldFail: false},
 
+		// GHSA-w8x2-cccw-25f7 (incomplete-fix residual of GHSA-93cm): a bare
+		// single-quoted string in table position is a DuckDB replacement scan —
+		// it reads the file with NO function name, so it slips past the
+		// I/O-function denylist above, and extractTableReferences masks the
+		// quoted path to a placeholder so RBAC never sees it. Must be rejected.
+		{name: "bare-string replacement scan single file", sql: "SELECT * FROM '/data/arc/db2/secrets/data.parquet'", shouldFail: true},
+		{name: "bare-string replacement scan glob", sql: "SELECT * FROM '/data/arc/*/**/*.parquet'", shouldFail: true},
+		{name: "bare-string replacement scan comma cross-join", sql: "SELECT b.s FROM cpu, '/data/arc/db2/secrets/data.parquet' b", shouldFail: true},
+		{name: "bare-string replacement scan in JOIN", sql: "SELECT * FROM cpu JOIN '/data/arc/db2/x.parquet' b ON cpu.id = b.id", shouldFail: true},
+		{name: "bare-string replacement scan in subquery FROM", sql: "SELECT * FROM (SELECT * FROM '/data/arc/db2/x.parquet')", shouldFail: true},
+		{name: "bare-string replacement scan uppercase FROM", sql: "SELECT * FROM '/data/arc/db2/x.parquet'", shouldFail: true},
+		{name: "bare-string replacement scan comma after subquery", sql: "SELECT * FROM (SELECT 1) a, '/data/arc/db2/x.parquet' b", shouldFail: true},
+		// GHSA-w8x2 review blocker 1: a subquery WITH an inner FROM must not
+		// clear the OUTER FROM clause — the trailing comma cross-join is still
+		// table position. (The no-inner-FROM case above never clobbered state.)
+		{name: "bare-string comma after subquery WITH inner FROM", sql: "SELECT * FROM (SELECT * FROM cpu) a, '/data/arc/db2/secrets/data.parquet' b", shouldFail: true},
+		{name: "bare-string comma after subquery no alias inner FROM", sql: "SELECT * FROM (SELECT * FROM cpu), '/data/arc/db2/x.parquet'", shouldFail: true},
+		{name: "bare-string comma after subquery inner WHERE", sql: "SELECT b.s FROM (SELECT id FROM cpu WHERE id=1) a, '/data/arc/db2/x.parquet' b", shouldFail: true},
+		// GHSA-w8x2 review blocker 2: no whitespace between FROM/JOIN and the
+		// quote — masking glues keyword+placeholder; must still tokenise apart.
+		{name: "bare-string no space after FROM", sql: "SELECT * FROM'/data/arc/db2/x.parquet'", shouldFail: true},
+		{name: "bare-string no space glued SELECT and FROM", sql: "SELECT*FROM'/data/arc/db2/x.parquet'", shouldFail: true},
+		{name: "bare-string no space after JOIN", sql: "SELECT * FROM cpu JOIN'/data/arc/db2/x.parquet' b ON cpu.id=b.id", shouldFail: true},
+		// Three-way comma cross-join, string last.
+		{name: "bare-string third in comma chain", sql: "SELECT * FROM cpu, mem, '/data/arc/db2/x.parquet'", shouldFail: true},
+		// Comma cross-join still armed after a JOIN ... ON predicate.
+		{name: "bare-string comma after JOIN ON predicate", sql: "SELECT * FROM a JOIN b ON a.id=b.id, '/data/arc/db2/x.parquet'", shouldFail: true},
+		// False-positive guards: a quoted string used as a VALUE (WHERE/SELECT
+		// literal, or a function argument) is NOT table position and must pass.
+		{name: "string value in WHERE not table position", sql: "SELECT * FROM cpu WHERE path = '/data/arc/db2/secrets/data.parquet'", shouldFail: false},
+		{name: "string arg to date_trunc not table position", sql: "SELECT date_trunc('hour', time) FROM cpu", shouldFail: false},
+		{name: "string arg after comma in function not table position", sql: "SELECT coalesce(host, '/default/path') FROM cpu", shouldFail: false},
+		{name: "string literal in SELECT projection not table position", sql: "SELECT '/data/x.parquet' AS note FROM cpu", shouldFail: false},
+		{name: "string in GROUP BY-adjacent comma not table position", sql: "SELECT host, count(*) FROM cpu GROUP BY host ORDER BY count(*), '/x'", shouldFail: false},
+		{name: "string arg to strftime after comma-join table not flagged", sql: "SELECT strftime(time, '%Y') FROM cpu, mem", shouldFail: false},
+		{name: "string in JOIN ON predicate not table position", sql: "SELECT * FROM cpu JOIN mem ON mem.tag = 'x'", shouldFail: false},
+		{name: "VALUES clause with string not table position", sql: "SELECT * FROM (VALUES ('a'), ('b')) t(x)", shouldFail: false},
+		{name: "string in second UNION arm WHERE not table position", sql: "SELECT host FROM cpu UNION SELECT host FROM mem WHERE host = '/data/x'", shouldFail: false},
+		{name: "string in IN-list not table position", sql: "SELECT * FROM cpu WHERE host IN ('a', 'b', '/data/x.parquet')", shouldFail: false},
+		{name: "string comma-arg in coalesce after comma-join not flagged", sql: "SELECT coalesce(a, '/x'), b FROM cpu, mem", shouldFail: false},
+
 		// Multi-statement smuggling — a second statement behind a semicolon
 		// bypasses the anchored SHOW regexes, so reject >1 statement outright.
 		{name: "SHOW smuggled behind semicolon", sql: "SHOW DATABASES; SELECT 1", shouldFail: true},
@@ -1463,7 +1504,7 @@ func BenchmarkConvertSQLToStoragePaths(b *testing.B) {
 		b.Run(tc.name, func(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				h.convertSQLToStoragePaths(tc.sql)
+				h.convertSQLToStoragePaths(context.Background(), tc.sql)
 			}
 		})
 	}
@@ -1503,16 +1544,16 @@ func BenchmarkGetTransformedSQL(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				h.queryCache.Invalidate() // Force cache miss
-				h.getTransformedSQL(tc.sql, "")
+				h.getTransformedSQL(context.Background(), tc.sql, "")
 			}
 		})
 
 		// Benchmark cache hit (pre-populated)
 		b.Run(tc.name+"_cache_hit", func(b *testing.B) {
-			h.getTransformedSQL(tc.sql, "") // Pre-populate cache
+			h.getTransformedSQL(context.Background(), tc.sql, "") // Pre-populate cache
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				h.getTransformedSQL(tc.sql, "")
+				h.getTransformedSQL(context.Background(), tc.sql, "")
 			}
 		})
 	}
@@ -1654,6 +1695,19 @@ func TestRewriteTimeBucket(t *testing.T) {
 			name:     "singular day",
 			input:    "SELECT time_bucket('1 days', time) AS bucket FROM cpu",
 			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 86400) * 86400) AS bucket FROM cpu",
+		},
+		// #535: parenthesized column args must be left verbatim for DuckDB (the
+		// capture already fails to match most of these, but the guard makes the
+		// safety explicit and consistent with date_trunc).
+		{
+			name:     "coalesce column arg left unrewritten (#535)",
+			input:    "SELECT time_bucket('1 hour', coalesce(time, a)) AS bucket FROM cpu",
+			expected: "SELECT time_bucket('1 hour', coalesce(time, a)) AS bucket FROM cpu",
+		},
+		{
+			name:     "parenthesized column left unrewritten (#535)",
+			input:    "SELECT time_bucket('1 hour', (time)) AS bucket FROM cpu",
+			expected: "SELECT time_bucket('1 hour', (time)) AS bucket FROM cpu",
 		},
 	}
 
@@ -1835,6 +1889,34 @@ func TestRewriteDateTrunc(t *testing.T) {
 			name:     "date_trunc in WHERE clause",
 			input:    "SELECT * FROM cpu WHERE date_trunc('day', time) = '2024-01-01'",
 			expected: "SELECT * FROM cpu WHERE to_timestamp((epoch(time)::BIGINT // 86400) * 86400) = '2024-01-01'",
+		},
+		// #535: parenthesized column args must NOT be rewritten (paren-blind
+		// capture would corrupt them). Left verbatim for DuckDB to handle
+		// natively — correct, just not epoch-optimized.
+		{
+			name:     "coalesce column arg left unrewritten (#535 case 1)",
+			input:    "SELECT date_trunc('hour', coalesce(time, a)) FROM cpu",
+			expected: "SELECT date_trunc('hour', coalesce(time, a)) FROM cpu",
+		},
+		{
+			name:     "parenthesized column left unrewritten (#535 case 2)",
+			input:    "SELECT date_trunc('hour', (time)) FROM cpu",
+			expected: "SELECT date_trunc('hour', (time)) FROM cpu",
+		},
+		{
+			name:     "nested function arg left unrewritten (#535 case 3)",
+			input:    "SELECT date_trunc('hour', f(g(time))) FROM cpu",
+			expected: "SELECT date_trunc('hour', f(g(time))) FROM cpu",
+		},
+		{
+			name:     "CAST column arg left unrewritten (#535)",
+			input:    "SELECT date_trunc('day', CAST(ts AS TIMESTAMP)) FROM cpu",
+			expected: "SELECT date_trunc('day', CAST(ts AS TIMESTAMP)) FROM cpu",
+		},
+		{
+			name:     "bare column still optimized alongside a parenthesized one (#535)",
+			input:    "SELECT date_trunc('hour', time) AS h, date_trunc('day', coalesce(time, a)) AS d FROM cpu",
+			expected: "SELECT to_timestamp((epoch(time)::BIGINT // 3600) * 3600) AS h, date_trunc('day', coalesce(time, a)) AS d FROM cpu",
 		},
 	}
 

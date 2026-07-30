@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	iceberg "github.com/apache/iceberg-go"
 	icecatalog "github.com/apache/iceberg-go/catalog"
@@ -50,6 +51,42 @@ type Exporter struct {
 	nsPrefix  string          // namespace for Iceberg tables (e.g. "arc")
 	retain    int             // snapshots + metadata versions to keep per table (0 = keep all)
 	logger    zerolog.Logger
+
+	// hintWarned records metadata directories already warned about for
+	// unaddressable version-hint publishing, so a permanent configuration
+	// property is reported once per table rather than every reconcile pass.
+	hintWarnMu sync.Mutex
+	hintWarned map[string]struct{}
+
+	// hintFailure records that a discovery-file write failed anywhere during the
+	// current ReconcileMeasurementWithHint call, including inside EnsureTable
+	// (which publishes on table creation and schema evolution). The reconciler
+	// is single-writer and reconciles one measurement at a time, so a plain flag
+	// reset at the start of each call is sufficient; the mutex only guards
+	// against a future concurrent caller.
+	hintFailMu  sync.Mutex
+	hintFailure bool
+}
+
+// resetHintFailure clears the per-reconcile discovery-file failure flag.
+func (e *Exporter) resetHintFailure() {
+	e.hintFailMu.Lock()
+	e.hintFailure = false
+	e.hintFailMu.Unlock()
+}
+
+// noteHintFailure records that a discovery-file write failed.
+func (e *Exporter) noteHintFailure() {
+	e.hintFailMu.Lock()
+	e.hintFailure = true
+	e.hintFailMu.Unlock()
+}
+
+// hintFailed reports whether any discovery-file write failed since the last reset.
+func (e *Exporter) hintFailed() bool {
+	e.hintFailMu.Lock()
+	defer e.hintFailMu.Unlock()
+	return e.hintFailure
 }
 
 // NewExporter builds an Exporter backed by a SQL (SQLite) Iceberg catalog on the given
@@ -299,10 +336,31 @@ func (e *Exporter) healNameMapping(ctx context.Context, tbl *icetable.Table) (*i
 // table but absent from Arc. One transaction. Idempotent — if the sets already match, it is a
 // no-op (no new snapshot). This is the core of the reconciler design.
 func (e *Exporter) ReconcileMeasurement(ctx context.Context, database, measurement string, sc ArcSchema, current []FileRef) error {
+	_, err := e.ReconcileMeasurementWithHint(ctx, database, measurement, sc, current)
+	return err
+}
+
+// ReconcileMeasurementWithHint is ReconcileMeasurement plus whether the reader
+// discovery files (version-hint.text, v<N>.metadata.json) were published.
+//
+// The scheduler needs this separately from the error: those writes are
+// best-effort with respect to the committed snapshot, but if they fail the
+// caller must NOT cache the measurement's fingerprint, or a file set that then
+// goes quiet is never revisited and the hint stays stale forever.
+//
+// hintOK is true when the discovery files are current, including the case where
+// there was nothing to publish.
+func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, measurement string, sc ArcSchema, current []FileRef) (hintOK bool, err error) {
+	// EnsureTable publishes the discovery files itself when it creates or evolves
+	// the table, so start from whether those writes succeeded. Otherwise a
+	// creation-time failure would be invisible here and the fingerprint would be
+	// cached over an unpublished hint.
+	e.resetHintFailure()
 	tbl, err := e.EnsureTable(ctx, database, measurement, sc)
 	if err != nil {
-		return err
+		return false, err
 	}
+	hintOK = !e.hintFailed()
 
 	want := make(map[string]struct{}, len(current))
 	for _, f := range current {
@@ -310,7 +368,7 @@ func (e *Exporter) ReconcileMeasurement(ctx context.Context, database, measureme
 	}
 	have, err := e.tableDataFiles(ctx, tbl)
 	if err != nil {
-		return fmt.Errorf("read current iceberg data files: %w", err)
+		return false, fmt.Errorf("read current iceberg data files: %w", err)
 	}
 
 	var toAdd []string
@@ -330,7 +388,10 @@ func (e *Exporter) ReconcileMeasurement(ctx context.Context, database, measureme
 	sort.Strings(toRemove)
 
 	if len(toAdd) == 0 && len(toRemove) == 0 {
-		return nil // already converged — no snapshot
+		// Already converged — no new snapshot. Still republish the discovery
+		// files: a previous pass may have committed the snapshot but failed to
+		// write them, and this is the path that pass's retry lands on.
+		return e.writeVersionHint(ctx, tbl) && hintOK, nil
 	}
 
 	// ReplaceDataFiles is the metadata-only primitive that both drops files by path and adds
@@ -339,7 +400,7 @@ func (e *Exporter) ReconcileMeasurement(ctx context.Context, database, measureme
 	// files that Arc already removed from storage.) When only adding, filesToDelete is empty.
 	committed, skipped, err := e.replaceDataFilesResilient(ctx, tbl, toRemove, toAdd, database, measurement)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if len(skipped) > 0 {
 		// Some files could not be partitioned (day-straddling data — see day() spec). They are
@@ -353,13 +414,14 @@ func (e *Exporter) ReconcileMeasurement(ctx context.Context, database, measureme
 	// grow unbounded. Best-effort — a failure here doesn't undo the successful reconcile; the
 	// next pass retries. Returns the possibly-newer table so version-hint points at it.
 	committed = e.expireSnapshots(ctx, committed, database, measurement)
-	e.writeVersionHint(ctx, committed)
+	hintOK = e.writeVersionHint(ctx, committed) && !e.hintFailed()
 	e.pruneOldVersionFiles(ctx, committed)
 	e.logger.Info().
 		Str("database", database).Str("measurement", measurement).
 		Int("added", len(toAdd)).Int("removed", len(toRemove)).
+		Bool("hint_published", hintOK).
 		Msg("Reconciled Iceberg table")
-	return nil
+	return hintOK, nil
 }
 
 // replaceDataFilesResilient applies the add/remove diff, tolerating files that iceberg-go
@@ -481,13 +543,20 @@ func (e *Exporter) pruneOldVersionFiles(ctx context.Context, tbl *icetable.Table
 			vs = append(vs, vfile{n: n, key: path.Join(dirKey, base)})
 		}
 	}
-	if len(vs) <= e.retain {
+	// Keep one more than `retain` to cover the read-vs-prune race: a directory
+	// reader fetches version-hint.text and only then opens v<N>.metadata.json.
+	// If a commit lands in that window, keeping exactly `retain` can delete the
+	// version the reader just resolved — sharpest at retain=1, where every
+	// commit would invalidate the immediately-preceding version. The extra file
+	// is a few KB and bounds the window to one full reconcile interval.
+	keep := e.retain + 1
+	if len(vs) <= keep {
 		return
 	}
-	// Keep the newest `retain`; delete the rest. Never delete the current version.
+	// Keep the newest `keep`; delete the rest. Never delete the current version.
 	sort.Slice(vs, func(i, j int) bool { return vs[i].n > vs[j].n }) // descending
 	curN, _ := strconv.Atoi(cur)
-	for _, v := range vs[e.retain:] {
+	for _, v := range vs[keep:] {
 		if v.n == curN {
 			continue
 		}
@@ -509,27 +578,47 @@ func (e *Exporter) pruneOldVersionFiles(ctx context.Context, tbl *icetable.Table
 //     missing" with only the hint). Catalog-aware readers (PyIceberg, iceberg-go) are
 //     unaffected; they use the catalog's pointer and ignore these files.
 //
-// Best-effort: failures are logged, not fatal — the SQL catalog remains the source of truth
-// and the next reconcile rewrites these. Works for local and S3 warehouses via the backend.
-func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) {
+// Best-effort with respect to the reconcile: a failure here never undoes the committed
+// snapshot, and the SQL catalog remains the source of truth. It DOES return false so the
+// caller can decline to cache the measurement's fingerprint, which is what makes the retry
+// real — without that, a measurement whose file set then goes quiet is never revisited and
+// the hint stays stale indefinitely. Works for local and S3 warehouses via the backend.
+//
+// Returns true when there was nothing to do (no backend) or everything was written.
+func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bool {
 	if e.backend == nil {
-		return
+		return true
 	}
 	metaLoc := tbl.MetadataLocation() // e.g. file:///…/metadata/00004-<uuid>.metadata.json
 	version, dirKey, ok := e.parseVersionAndMetaDir(metaLoc)
 	if !ok {
-		e.logger.Debug().Str("metadata", metaLoc).Msg("Could not derive version-hint location; skipping")
-		return
+		// Reachable when iceberg.warehouse points outside the storage root: the
+		// backend cannot address the metadata directory, so directory-based
+		// readers (DuckDB iceberg_scan on a bare path, Spark hadoop-format) can
+		// never discover this table. Catalog-based readers are unaffected. This
+		// is a permanent property of the configuration, not a transient failure,
+		// so warn once per table rather than returning false and retrying a
+		// write that can never succeed.
+		e.warnHintUnaddressableOnce(metaLoc)
+		return true
 	}
+	okAll := true
+	defer func() {
+		if !okAll {
+			e.noteHintFailure()
+		}
+	}()
 	// Copy the current metadata to v<N>.metadata.json (Hadoop-convention name).
 	metaKey, kOK := e.warehouseRelKey(metaLoc)
 	if kOK {
 		if body, err := e.backend.Read(ctx, metaKey); err != nil {
-			e.logger.Warn().Err(err).Str("key", metaKey).Msg("Failed to read current metadata for v<N> copy (non-fatal)")
+			e.logger.Warn().Err(err).Str("key", metaKey).Msg("Failed to read current metadata for v<N> copy (will retry next pass)")
+			okAll = false
 		} else {
 			vKey := path.Join(dirKey, "v"+version+".metadata.json")
 			if err := e.backend.Write(ctx, vKey, body); err != nil {
-				e.logger.Warn().Err(err).Str("key", vKey).Msg("Failed to write v<N>.metadata.json (non-fatal)")
+				e.logger.Warn().Err(err).Str("key", vKey).Msg("Failed to write v<N>.metadata.json (will retry next pass)")
+				okAll = false
 			}
 		}
 	}
@@ -537,8 +626,35 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) {
 	// file verbatim and would look for "v<N>\n.metadata.json" otherwise; verified empirically).
 	hintKey := path.Join(dirKey, "version-hint.text")
 	if err := e.backend.Write(ctx, hintKey, []byte(version)); err != nil {
-		e.logger.Warn().Err(err).Str("key", hintKey).Msg("Failed to write version-hint.text (non-fatal)")
+		e.logger.Warn().Err(err).Str("key", hintKey).Msg("Failed to write version-hint.text (will retry next pass)")
+		okAll = false
 	}
+	return okAll
+}
+
+// warnHintUnaddressableOnce warns that version-hint publishing is disabled for a
+// metadata directory, at most once per directory, so a permanent configuration
+// property does not produce a line on every reconcile pass.
+func (e *Exporter) warnHintUnaddressableOnce(metaLoc string) {
+	dir := path.Dir(metaLoc)
+	e.hintWarnMu.Lock()
+	_, warned := e.hintWarned[dir]
+	if !warned {
+		if e.hintWarned == nil {
+			e.hintWarned = make(map[string]struct{})
+		}
+		e.hintWarned[dir] = struct{}{}
+	}
+	e.hintWarnMu.Unlock()
+	if warned {
+		return
+	}
+	e.logger.Warn().
+		Str("metadata", metaLoc).
+		Str("warehouse", e.warehouse).
+		Msg("Iceberg warehouse is not under the storage root: version-hint.text and v<N>.metadata.json " +
+			"cannot be written, so directory-based readers (DuckDB iceberg_scan, Spark hadoop-format) " +
+			"cannot discover this table. Catalog-based readers (PyIceberg, the SQLite catalog) work normally")
 }
 
 // warehouseRelKey converts a full metadata URI to a STORAGE-RELATIVE key, since backend

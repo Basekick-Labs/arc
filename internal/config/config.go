@@ -912,6 +912,15 @@ func Load() (*Config, error) {
 				"(tiered_storage.cold.enabled): files migrated to the cold tier would be removed from the " +
 				"Iceberg table. Disable one of them")
 		}
+		// Reject rather than silently treat as "keep every snapshot forever": an
+		// operator setting 0 almost certainly means "keep no history", and the
+		// unbounded reading grows table metadata without limit. 1 is the real
+		// minimum ("keep only the current snapshot").
+		if cfg.Iceberg.RetainSnapshots < 1 {
+			return nil, fmt.Errorf("iceberg.retain_snapshots must be >= 1 (got %d): "+
+				"it is the number of snapshots kept per table, and values below 1 would leave "+
+				"snapshot and metadata growth unbounded", cfg.Iceberg.RetainSnapshots)
+		}
 	}
 
 	return cfg, nil

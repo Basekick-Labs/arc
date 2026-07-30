@@ -192,9 +192,18 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 	w.wg.Add(1)
 	go w.writerLoop()
 
+	// Say so when the selected mode cannot be honored, rather than reporting
+	// "fdatasync" while performing a full fsync.
+	if cfg.SyncMode == SyncModeFdatasync && !dataSyncSupported {
+		w.logger.Info().
+			Str("sync_mode", string(cfg.SyncMode)).
+			Msg("fdatasync is unavailable on this platform; using full fsync instead")
+	}
+
 	w.logger.Info().
 		Str("dir", cfg.WALDir).
 		Str("sync_mode", string(cfg.SyncMode)).
+		Bool("fdatasync_supported", dataSyncSupported).
 		Int64("max_size_mb", cfg.MaxSizeBytes/1024/1024).
 		Dur("max_age", cfg.MaxAge).
 		Dur("sync_interval", cfg.SyncInterval).
@@ -495,8 +504,9 @@ func (w *Writer) sync() {
 		// Full sync: data + metadata
 		syncErr = w.currentFile.Sync()
 	case SyncModeFdatasync:
-		// Data sync only (use Sync on systems without fdatasync)
-		syncErr = w.currentFile.Sync()
+		// Data sync only. Real fdatasync(2) on Linux; a full Sync elsewhere,
+		// where Go does not expose it (see datasync_other.go).
+		syncErr = dataSync(w.currentFile)
 	case SyncModeAsync:
 		// No explicit sync, rely on OS buffer cache
 		return

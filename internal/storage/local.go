@@ -416,8 +416,11 @@ func (b *LocalBackend) List(ctx context.Context, prefix string) ([]string, error
 	}
 	var results []string
 
-	// Use filepath.Walk to recursively list files
-	err = filepath.Walk(searchPath, func(path string, info os.FileInfo, err error) error {
+	// Use filepath.WalkDir to recursively list files. WalkDir passes an
+	// fs.DirEntry (from the directory read) instead of an os.FileInfo, so it
+	// avoids an lstat(2) per entry — this path only needs the name and
+	// is-dir bit, both available on DirEntry, so no per-entry Info() call.
+	err = filepath.WalkDir(searchPath, func(path string, d os.DirEntry, err error) error {
 		// Respect context cancellation (important for large directory trees)
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -432,12 +435,12 @@ func (b *LocalBackend) List(ctx context.Context, prefix string) ([]string, error
 		}
 
 		// Skip directories
-		if info.IsDir() {
+		if d.IsDir() {
 			return nil
 		}
 
 		// Skip hidden files (e.g., .DS_Store on macOS)
-		if strings.HasPrefix(info.Name(), ".") {
+		if strings.HasPrefix(d.Name(), ".") {
 			return nil
 		}
 
@@ -620,7 +623,12 @@ func (b *LocalBackend) ListObjects(ctx context.Context, prefix string) ([]Object
 
 	var results []ObjectInfo
 
-	err = filepath.Walk(searchPath, func(path string, info os.FileInfo, err error) error {
+	// Use filepath.WalkDir: it avoids an lstat(2) per entry by passing an
+	// fs.DirEntry. This path needs per-file size/mod-time, but only for files
+	// we keep — so we skip dirs and hidden files first (name + is-dir come from
+	// the DirEntry with no stat) and call d.Info() only on the surviving files.
+	// Net: no stat on directories or hidden files, one stat per kept file.
+	err = filepath.WalkDir(searchPath, func(path string, d os.DirEntry, err error) error {
 		// Respect context cancellation (important for large directory trees)
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -634,18 +642,29 @@ func (b *LocalBackend) ListObjects(ctx context.Context, prefix string) ([]Object
 		}
 
 		// Skip directories
-		if info.IsDir() {
+		if d.IsDir() {
 			return nil
 		}
 
 		// Skip hidden files
-		if strings.HasPrefix(info.Name(), ".") {
+		if strings.HasPrefix(d.Name(), ".") {
 			return nil
 		}
 
 		// Get relative path from base
 		relPath, err := filepath.Rel(b.basePath, path)
 		if err != nil {
+			return err
+		}
+
+		// Metadata (size, mod-time) is not on DirEntry — stat the kept file.
+		info, err := d.Info()
+		if err != nil {
+			// Race: the file was removed between the dir read and Info().
+			// Skip it rather than failing the whole listing.
+			if os.IsNotExist(err) {
+				return nil
+			}
 			return err
 		}
 

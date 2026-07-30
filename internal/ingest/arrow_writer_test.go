@@ -471,7 +471,7 @@ func TestDecimal128_WriteParquetRoundTrip(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	data, err := writer.WriteParquetColumnar(ctx, "trades", columns, nil, nil, decimalCols)
+	data, err := writer.WriteParquetColumnar(ctx, "trades", columns, nil, nil, false, decimalCols)
 	if err != nil {
 		t.Fatalf("WriteParquetColumnar failed: %v", err)
 	}
@@ -551,7 +551,7 @@ func TestDecimal128_SchemaMetadata(t *testing.T) {
 		"price": {Precision: 18, Scale: 8},
 	}
 
-	schema, err := writer.getSchema("trades", columns, nil, decimalCols)
+	schema, err := writer.getSchema("trades", columns, nil, false, decimalCols)
 	if err != nil {
 		t.Fatalf("getSchema failed: %v", err)
 	}
@@ -583,7 +583,7 @@ func TestInferSchema_TimeColumnTypeEnforcement(t *testing.T) {
 		schema, err := writer.getSchema("m_int", map[string]interface{}{
 			"time":  []int64{1609459200000000},
 			"value": []float64{1.5},
-		}, nil, nil)
+		}, nil, false, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -600,7 +600,7 @@ func TestInferSchema_TimeColumnTypeEnforcement(t *testing.T) {
 		_, err := writer.getSchema("m_str", map[string]interface{}{
 			"time":  []string{"2021-01-01T00:00:00Z"},
 			"value": []float64{1.5},
-		}, nil, nil)
+		}, nil, false, nil)
 		if err == nil {
 			t.Fatal("expected error for string time column, got nil (would write VARCHAR time)")
 		}
@@ -610,7 +610,7 @@ func TestInferSchema_TimeColumnTypeEnforcement(t *testing.T) {
 		_, err := writer.getSchema("m_float", map[string]interface{}{
 			"time":  []float64{1609459200.5},
 			"value": []float64{1.5},
-		}, nil, nil)
+		}, nil, false, nil)
 		if err == nil {
 			t.Fatal("expected error for float64 time column, got nil (would write DOUBLE time)")
 		}

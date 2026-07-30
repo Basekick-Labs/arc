@@ -2,10 +2,14 @@ package backup
 
 import (
 	"context"
+	"database/sql"
+	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/rs/zerolog"
+
+	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/basekick-labs/arc/internal/storage"
 )
@@ -97,5 +101,229 @@ func TestBackupRestore_IcebergMetadata(t *testing.T) {
 	// And the parquet data file too (sanity).
 	if _, err := data.Read(ctx, parquetKey); err != nil {
 		t.Errorf("parquet data not restored: %v", err)
+	}
+}
+
+// The Iceberg SQL catalog holds every table's schema and snapshot pointers. When
+// an operator moves it out of the shared database via iceberg.catalog_db_path, a
+// backup that only copies the shared database restores Parquet and warehouse
+// metadata whose tables no longer resolve.
+func TestBackup_SeparateIcebergCatalogIsIncluded(t *testing.T) {
+	ctx := context.Background()
+	logger := zerolog.Nop()
+
+	dataDir := t.TempDir()
+	dataStorage, err := storage.NewLocalBackend(dataDir, logger)
+	if err != nil {
+		t.Fatalf("NewLocalBackend: %v", err)
+	}
+
+	sharedDB := filepath.Join(t.TempDir(), "arc.db")
+	catalogDB := filepath.Join(t.TempDir(), "iceberg-catalog.db")
+	for _, p := range []string{sharedDB, catalogDB} {
+		db, err := sql.Open("sqlite3", p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY)"); err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+	}
+
+	backupDir := t.TempDir()
+	m, err := NewManager(&ManagerConfig{
+		DataStorage:          dataStorage,
+		BackupPath:           backupDir,
+		SQLiteDBPath:         sharedDB,
+		IcebergCatalogDBPath: catalogDB,
+		Logger:               logger,
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	res, err := m.CreateBackup(ctx, BackupOptions{IncludeMetadata: true})
+	if err != nil {
+		t.Fatalf("CreateBackup: %v", err)
+	}
+	if !res.Manifest.HasIcebergCatalog {
+		t.Error("manifest does not record the separate Iceberg catalog")
+	}
+
+	stored := filepath.Join(backupDir, res.Manifest.BackupID, "metadata", icebergCatalogDBName)
+	if _, err := os.Stat(stored); err != nil {
+		t.Fatalf("Iceberg catalog was not backed up: %v", err)
+	}
+}
+
+// When the catalog lives in the shared database (the default), it must not be
+// copied a second time under its own name.
+func TestBackup_SharedIcebergCatalogIsNotDuplicated(t *testing.T) {
+	ctx := context.Background()
+	logger := zerolog.Nop()
+
+	dataDir := t.TempDir()
+	dataStorage, err := storage.NewLocalBackend(dataDir, logger)
+	if err != nil {
+		t.Fatalf("NewLocalBackend: %v", err)
+	}
+
+	sharedDB := filepath.Join(t.TempDir(), "arc.db")
+	db, err := sql.Open("sqlite3", sharedDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	backupDir := t.TempDir()
+	m, err := NewManager(&ManagerConfig{
+		DataStorage:  dataStorage,
+		BackupPath:   backupDir,
+		SQLiteDBPath: sharedDB,
+		// Same file, spelled the same way — the common default.
+		IcebergCatalogDBPath: sharedDB,
+		Logger:               logger,
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	res, err := m.CreateBackup(ctx, BackupOptions{IncludeMetadata: true})
+	if err != nil {
+		t.Fatalf("CreateBackup: %v", err)
+	}
+	if res.Manifest.HasIcebergCatalog {
+		t.Error("a catalog inside the shared database must not be recorded as separate")
+	}
+	stored := filepath.Join(backupDir, res.Manifest.BackupID, "metadata", icebergCatalogDBName)
+	if _, err := os.Stat(stored); err == nil {
+		t.Error("catalog was copied a second time despite living in the shared database")
+	}
+}
+
+// Restoring a backup that predates the separate-catalog support must skip the
+// missing catalog rather than fail. Presence is tested via Exists, so this holds
+// regardless of how a backend words its not-found error.
+func TestRestore_MissingIcebergCatalogIsSkipped(t *testing.T) {
+	ctx := context.Background()
+	logger := zerolog.Nop()
+
+	dataDir := t.TempDir()
+	dataStorage, err := storage.NewLocalBackend(dataDir, logger)
+	if err != nil {
+		t.Fatalf("NewLocalBackend: %v", err)
+	}
+
+	sharedDB := filepath.Join(t.TempDir(), "arc.db")
+	db, err := sql.Open("sqlite3", sharedDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	backupDir := t.TempDir()
+
+	// Take a backup with NO Iceberg catalog configured — an "old" backup.
+	writer, err := NewManager(&ManagerConfig{
+		DataStorage:  dataStorage,
+		BackupPath:   backupDir,
+		SQLiteDBPath: sharedDB,
+		Logger:       logger,
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	res, err := writer.CreateBackup(ctx, BackupOptions{IncludeMetadata: true})
+	if err != nil {
+		t.Fatalf("CreateBackup: %v", err)
+	}
+	if res.Manifest.HasIcebergCatalog {
+		t.Fatal("setup: this backup should not contain a catalog")
+	}
+
+	// Restore it on a deployment that DOES configure a separate catalog.
+	catalogDB := filepath.Join(t.TempDir(), "iceberg-catalog.db")
+	reader, err := NewManager(&ManagerConfig{
+		DataStorage:          dataStorage,
+		BackupPath:           backupDir,
+		SQLiteDBPath:         sharedDB,
+		IcebergCatalogDBPath: catalogDB,
+		Logger:               logger,
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	if err := reader.restoreSQLite(ctx, res.Manifest.BackupID); err != nil {
+		t.Fatalf("restoring a backup without a catalog must not fail: %v", err)
+	}
+	if _, err := os.Stat(catalogDB); err == nil {
+		t.Error("no catalog was in the backup, so none should have been written")
+	}
+}
+
+// A catalog present in the backup must actually be restored to the configured path.
+func TestRestore_SeparateIcebergCatalogIsRestored(t *testing.T) {
+	ctx := context.Background()
+	logger := zerolog.Nop()
+
+	dataDir := t.TempDir()
+	dataStorage, err := storage.NewLocalBackend(dataDir, logger)
+	if err != nil {
+		t.Fatalf("NewLocalBackend: %v", err)
+	}
+
+	sharedDB := filepath.Join(t.TempDir(), "arc.db")
+	catalogDB := filepath.Join(t.TempDir(), "iceberg-catalog.db")
+	for _, p := range []string{sharedDB, catalogDB} {
+		db, err := sql.Open("sqlite3", p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec("CREATE TABLE marker (id INTEGER PRIMARY KEY)"); err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+	}
+
+	backupDir := t.TempDir()
+	m, err := NewManager(&ManagerConfig{
+		DataStorage:          dataStorage,
+		BackupPath:           backupDir,
+		SQLiteDBPath:         sharedDB,
+		IcebergCatalogDBPath: catalogDB,
+		Logger:               logger,
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	res, err := m.CreateBackup(ctx, BackupOptions{IncludeMetadata: true})
+	if err != nil {
+		t.Fatalf("CreateBackup: %v", err)
+	}
+
+	// Destroy the live catalog, then restore it from the backup.
+	if err := os.Remove(catalogDB); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.restoreSQLite(ctx, res.Manifest.BackupID); err != nil {
+		t.Fatalf("restoreSQLite: %v", err)
+	}
+
+	db, err := sql.Open("sqlite3", catalogDB)
+	if err != nil {
+		t.Fatalf("restored catalog is not openable: %v", err)
+	}
+	defer db.Close()
+	var name string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='marker'`).Scan(&name); err != nil {
+		t.Fatalf("restored catalog is missing its contents: %v", err)
 	}
 }

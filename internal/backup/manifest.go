@@ -15,8 +15,18 @@ type Manifest struct {
 	Databases      []DatabaseInfo `json:"databases"`
 	TotalFiles     int64          `json:"total_files"`
 	TotalSizeBytes int64          `json:"total_size_bytes"`
-	HasMetadata    bool           `json:"has_metadata"`
-	HasConfig      bool           `json:"has_config"`
+	// SkippedFiles counts files that were listed and inventoried above but could
+	// not be read from source storage at copy time. When non-zero the backup is
+	// incomplete: TotalFiles/TotalSizeBytes describe what was inventoried, not
+	// what was actually stored.
+	SkippedFiles int64 `json:"skipped_files,omitempty"`
+	HasMetadata  bool  `json:"has_metadata"`
+	// HasIcebergCatalog records that the Iceberg SQL catalog was stored as a
+	// separate database (metadata/iceberg-catalog.db) because the operator
+	// configured iceberg.catalog_db_path away from the shared database. When
+	// false the catalog either lives in the shared database or does not exist.
+	HasIcebergCatalog bool `json:"has_iceberg_catalog,omitempty"`
+	HasConfig         bool `json:"has_config"`
 }
 
 // DatabaseInfo describes a single database within a backup.
@@ -51,6 +61,7 @@ type Progress struct {
 	Status         string     `json:"status"` // "running", "completed", "failed"
 	TotalFiles     int64      `json:"total_files"`
 	ProcessedFiles int64      `json:"processed_files"`
+	SkippedFiles   int64      `json:"skipped_files"`
 	TotalBytes     int64      `json:"total_bytes"`
 	ProcessedBytes int64      `json:"processed_bytes"`
 	StartedAt      time.Time  `json:"started_at"`

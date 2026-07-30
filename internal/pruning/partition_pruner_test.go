@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -290,7 +291,7 @@ func TestGeneratePartitionPaths(t *testing.T) {
 		end, _ := parseDateTime("2024-03-15 11:00:00")
 		tr := &TimeRange{Start: start, End: end}
 
-		paths := p.GeneratePartitionPaths("/data", "mydb", "cpu", tr)
+		paths := p.GeneratePartitionPaths(context.Background(), "/data", "mydb", "cpu", tr)
 
 		// Should have hourly path + daily path
 		if len(paths) < 1 {
@@ -315,7 +316,7 @@ func TestGeneratePartitionPaths(t *testing.T) {
 		end, _ := parseDateTime("2024-03-15 14:00:00")
 		tr := &TimeRange{Start: start, End: end}
 
-		paths := p.GeneratePartitionPaths("/data", "mydb", "cpu", tr)
+		paths := p.GeneratePartitionPaths(context.Background(), "/data", "mydb", "cpu", tr)
 
 		// Should have 4 hourly paths + 1 daily path = 5
 		if len(paths) != 5 {
@@ -328,7 +329,7 @@ func TestGeneratePartitionPaths(t *testing.T) {
 		end, _ := parseDateTime("2024-03-17 00:00:00")
 		tr := &TimeRange{Start: start, End: end}
 
-		paths := p.GeneratePartitionPaths("/data", "mydb", "cpu", tr)
+		paths := p.GeneratePartitionPaths(context.Background(), "/data", "mydb", "cpu", tr)
 
 		// 48 hourly paths + 2 daily paths
 		expectedHourly := 48
@@ -339,7 +340,7 @@ func TestGeneratePartitionPaths(t *testing.T) {
 	})
 
 	t.Run("nil time range", func(t *testing.T) {
-		paths := p.GeneratePartitionPaths("/data", "mydb", "cpu", nil)
+		paths := p.GeneratePartitionPaths(context.Background(), "/data", "mydb", "cpu", nil)
 
 		if paths != nil {
 			t.Errorf("Expected nil for nil time range, got %v", paths)
@@ -356,7 +357,7 @@ func TestOptimizeTablePath(t *testing.T) {
 		path := "/data/mydb/cpu/**/*.parquet"
 		sql := "SELECT * FROM cpu WHERE host = 'server1'"
 
-		result, optimized := p.OptimizeTablePath(path, sql)
+		result, optimized := p.OptimizeTablePath(context.Background(), path, sql)
 
 		if optimized {
 			t.Error("Should not be optimized without time range")
@@ -371,7 +372,7 @@ func TestOptimizeTablePath(t *testing.T) {
 		path := "s3://bucket/mydb/cpu/**/*.parquet"
 		sql := "SELECT * FROM cpu WHERE time >= '2024-03-15' AND time < '2024-03-16'"
 
-		result, optimized := p.OptimizeTablePath(path, sql)
+		result, optimized := p.OptimizeTablePath(context.Background(), path, sql)
 
 		if !optimized {
 			t.Error("Should be optimized with time range for non-local path")
@@ -407,7 +408,7 @@ func TestOptimizeTablePath(t *testing.T) {
 		path := "/invalid/path"
 		sql := "SELECT * FROM cpu WHERE time >= '2024-03-15' AND time < '2024-03-16'"
 
-		result, optimized := p.OptimizeTablePath(path, sql)
+		result, optimized := p.OptimizeTablePath(context.Background(), path, sql)
 
 		if optimized {
 			t.Error("Invalid path should not be optimized")
@@ -422,7 +423,7 @@ func TestOptimizeTablePath(t *testing.T) {
 		path := "/data/mydb/cpu/**/*.parquet"
 		sql := "SELECT * FROM cpu WHERE time >= '2024-03-15' AND time < '2024-03-16'"
 
-		result, optimized := p.OptimizeTablePath(path, sql)
+		result, optimized := p.OptimizeTablePath(context.Background(), path, sql)
 
 		if optimized {
 			t.Error("Disabled pruner should not optimize")
@@ -604,7 +605,7 @@ func TestPrunerStats(t *testing.T) {
 	// Generate some partition paths (this increments QueriesOptimized)
 	start, _ := parseDateTime("2024-03-15")
 	end, _ := parseDateTime("2024-03-16")
-	p.GeneratePartitionPaths("/data", "db", "cpu", &TimeRange{Start: start, End: end})
+	p.GeneratePartitionPaths(context.Background(), "/data", "db", "cpu", &TimeRange{Start: start, End: end})
 
 	stats = p.GetStats()
 	if stats.QueriesOptimized != 1 {
@@ -1210,7 +1211,7 @@ func TestOptimizeTablePath_S3WithMissingPartitions(t *testing.T) {
 	originalPath := "s3://mybucket/default/cpu/**/*.parquet"
 	sql := "SELECT * FROM cpu WHERE time >= '2026-01-15 10:00:00' AND time < '2026-01-15 14:00:00'"
 
-	result, optimized := p.OptimizeTablePath(originalPath, sql)
+	result, optimized := p.OptimizeTablePath(context.Background(), originalPath, sql)
 
 	// The result depends on whether filtering works correctly
 	// If optimization applied, we should have filtered paths
@@ -1468,4 +1469,206 @@ func TestStartCleanup_Idempotent(t *testing.T) {
 	}
 	_, _, size := pruner.globCache.stats()
 	t.Fatalf("janitor goroutine appears dead after repeat StartCleanup calls: glob size = %d", size)
+}
+
+// TestGeneratePartitionPathsClampsStartToEpoch verifies that a start before the
+// epoch floor is clamped UP to 1970-01-01 (not rejected), so a degenerate old
+// start doesn't drive a huge pre-data range but a two-sided query with an old
+// start still prunes to [1970, end) instead of dropping legitimate rows (#536,
+// reviewer finding H1).
+func TestGeneratePartitionPathsClampsStartToEpoch(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+
+	// Start well before the epoch, end just after it: without clamping this
+	// would either be rejected (dropping data) or walk millions of empty hours.
+	// With clamping the loop starts at 1970-01-01 and generates a small range.
+	start := time.Date(0001, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(1970, 1, 1, 3, 0, 0, 0, time.UTC) // 3 hours past epoch
+	paths := p.GeneratePartitionPaths(context.Background(), "/data", "mydb", "cpu", &TimeRange{Start: start, End: end})
+
+	if len(paths) == 0 {
+		t.Fatal("expected clamped range to still produce paths, got none")
+	}
+	// 3 hourly + 1 daily = 4 paths; must NOT be an enormous count.
+	if len(paths) > 10 {
+		t.Fatalf("start was not clamped to epoch: got %d paths for a 3-hour post-epoch window", len(paths))
+	}
+	// Every path must be at 1970 or later — no pre-epoch partitions.
+	for _, path := range paths {
+		if strings.Contains(path, "/0001/") || strings.Contains(path, "/1969/") {
+			t.Errorf("generated a pre-epoch partition path: %s", path)
+		}
+		if !strings.Contains(path, "/1970/") {
+			t.Errorf("expected path within the 1970 window, got: %s", path)
+		}
+	}
+}
+
+// TestGeneratePartitionPathsClampIsLossless verifies clamping doesn't reduce
+// coverage for real (post-epoch) data: a two-sided query whose start is old but
+// whose end is modern still prunes from 1970 through the end (no rows dropped).
+func TestGeneratePartitionPathsClampIsLossless(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+
+	// Old start, modern end, but a span narrow enough (measured from the 1970
+	// clamp) to stay under the cap: 1970-01-01 .. 1970-06-01 is ~3,624 hours.
+	start := time.Date(1960, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(1970, 6, 1, 0, 0, 0, 0, time.UTC)
+	paths := p.GeneratePartitionPaths(context.Background(), "/data", "mydb", "cpu", &TimeRange{Start: start, End: end})
+
+	if len(paths) == 0 {
+		t.Fatal("expected paths from the clamped start through end, got none")
+	}
+	// First hour partition must be exactly 1970/01/01/00 — coverage starts at
+	// the floor, so any post-epoch data in [1970, end) is included.
+	foundEpochHour := false
+	for _, path := range paths {
+		if strings.Contains(path, "/1970/01/01/00/") {
+			foundEpochHour = true
+			break
+		}
+	}
+	if !foundEpochHour {
+		t.Error("expected coverage to start at the 1970-01-01 00:00 partition")
+	}
+}
+
+// TestGeneratePartitionPathsCap verifies the path-count cap defuses the
+// amplification DoS: an over-wide range returns nil (caller falls back to the
+// unpruned glob) instead of materializing millions of path strings (#536).
+func TestGeneratePartitionPathsCap(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+
+	t.Run("under cap generates paths", func(t *testing.T) {
+		// ~1 year is well under the 50k cap (~9,150 hourly paths).
+		start := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		end := start.AddDate(1, 0, 0)
+		paths := p.GeneratePartitionPaths(context.Background(), "/data", "mydb", "cpu", &TimeRange{Start: start, End: end})
+		if len(paths) == 0 {
+			t.Fatal("expected paths for a 1-year range under the cap, got none")
+		}
+		if len(paths) > maxPartitionPaths {
+			t.Fatalf("under-cap range should not exceed cap: got %d > %d", len(paths), maxPartitionPaths)
+		}
+	})
+
+	t.Run("over cap returns nil", func(t *testing.T) {
+		// 200 years -> ~1.75M hourly paths, far over the 50k cap.
+		start := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+		end := start.AddDate(200, 0, 0)
+		paths := p.GeneratePartitionPaths(context.Background(), "/data", "mydb", "cpu", &TimeRange{Start: start, End: end})
+		if paths != nil {
+			t.Fatalf("expected nil for over-cap range (fallback to unpruned glob), got %d paths", len(paths))
+		}
+	})
+
+	t.Run("just under cap generates paths, actual count never exceeds cap", func(t *testing.T) {
+		// Pick an hourly count H such that H + (H/24 + 1) <= maxPartitionPaths.
+		// With H = 47000: daily = 47000/24 + 1 = 1959, total est = 48959 < 50000.
+		start := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		end := start.Add(47000 * time.Hour)
+		paths := p.GeneratePartitionPaths(context.Background(), "/data", "mydb", "cpu", &TimeRange{Start: start, End: end})
+		if paths == nil {
+			t.Fatal("expected paths for a range just under the cap, got nil")
+		}
+		// The estimate must be a true upper bound: the materialized count must
+		// never exceed the cap (reviewer finding M1 — estimate must not
+		// under-count vs the loop's ceil + daily paths).
+		if len(paths) > maxPartitionPaths {
+			t.Fatalf("materialized %d paths, exceeds cap %d (estimate under-counted)", len(paths), maxPartitionPaths)
+		}
+	})
+}
+
+// TestGeneratePartitionPathsContextCancel verifies a cancelled context aborts
+// path generation so a client disconnect / deadline stops the work (#536).
+func TestGeneratePartitionPathsContextCancel(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled
+
+	// A range large enough to reach the loop but under the cap so the cap
+	// branch doesn't short-circuit first.
+	start := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := start.AddDate(1, 0, 0)
+	paths := p.GeneratePartitionPaths(ctx, "/data", "mydb", "cpu", &TimeRange{Start: start, End: end})
+	if paths != nil {
+		t.Fatalf("expected nil when context is cancelled, got %d paths", len(paths))
+	}
+}
+
+// TestGlobCacheEvictOnRead verifies expired glob entries are removed on read,
+// not merely reported as a miss, so distinct keys can't accumulate (#536).
+func TestGlobCacheEvictOnRead(t *testing.T) {
+	c := newGlobCache(10 * time.Millisecond)
+	c.set("pattern-a", []string{"file1"})
+
+	if _, _, size := c.stats(); size != 1 {
+		t.Fatalf("expected 1 entry after set, got %d", size)
+	}
+
+	time.Sleep(15 * time.Millisecond)
+
+	if _, ok := c.get("pattern-a"); ok {
+		t.Fatal("expected expired entry to be a miss")
+	}
+	if _, _, size := c.stats(); size != 0 {
+		t.Fatalf("expected expired entry to be evicted on read, got size %d", size)
+	}
+}
+
+// TestPartitionCacheEvictOnRead is the partitionCache analogue.
+func TestPartitionCacheEvictOnRead(t *testing.T) {
+	c := newPartitionCache(10 * time.Millisecond)
+	c.set("key-a", "some-path", true)
+
+	if _, _, size := c.stats(); size != 1 {
+		t.Fatalf("expected 1 entry after set, got %d", size)
+	}
+
+	time.Sleep(15 * time.Millisecond)
+
+	if _, _, ok := c.get("key-a"); ok {
+		t.Fatal("expected expired entry to be a miss")
+	}
+	if _, _, size := c.stats(); size != 0 {
+		t.Fatalf("expected expired entry to be evicted on read, got size %d", size)
+	}
+}
+
+// TestGlobCacheMaxEntries verifies the glob cache refuses new keys past its cap
+// (after evicting expired entries) so attacker-varied keys can't grow it
+// unbounded (#536). Uses a long TTL so nothing expires during the test.
+func TestGlobCacheMaxEntries(t *testing.T) {
+	c := newGlobCache(1 * time.Hour)
+	c.maxEntries = 3
+
+	for i := 0; i < 10; i++ {
+		c.set("pattern-"+strconv.Itoa(i), []string{"f"})
+	}
+
+	if _, _, size := c.stats(); size > 3 {
+		t.Fatalf("cache exceeded maxEntries: got %d, want <= 3", size)
+	}
+
+	// Refreshing an existing key must still be allowed even at capacity.
+	c.set("pattern-0", []string{"f", "g"})
+	if _, _, size := c.stats(); size > 3 {
+		t.Fatalf("refreshing existing key grew cache past cap: got %d", size)
+	}
+}
+
+// TestPartitionCacheMaxEntries is the partitionCache analogue.
+func TestPartitionCacheMaxEntries(t *testing.T) {
+	c := newPartitionCache(1 * time.Hour)
+	c.maxEntries = 3
+
+	for i := 0; i < 10; i++ {
+		c.set("key-"+strconv.Itoa(i), "path", true)
+	}
+
+	if _, _, size := c.stats(); size > 3 {
+		t.Fatalf("cache exceeded maxEntries: got %d, want <= 3", size)
+	}
 }

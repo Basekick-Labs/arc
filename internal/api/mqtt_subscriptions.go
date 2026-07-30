@@ -103,6 +103,14 @@ func (h *MQTTSubscriptionHandler) handleCreate(c *fiber.Ctx) error {
 			})
 		}
 
+		// Validation failures are client errors (bad QoS, broker URL, …) → 400.
+		if errors.Is(err, mqtt.ErrValidation) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"success": false,
+				"error":   err.Error(),
+			})
+		}
+
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
 			"error":   "Failed to create subscription",
@@ -173,6 +181,22 @@ func (h *MQTTSubscriptionHandler) handleUpdate(c *fiber.Ctx) error {
 		// Check for specific errors
 		if errors.Is(err, mqtt.ErrSubscriptionRunningCantUpdate) {
 			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"success": false,
+				"error":   err.Error(),
+			})
+		}
+
+		// Duplicate name on rename is a conflict (409), matching handleCreate.
+		if errors.Is(err, mqtt.ErrSubscriptionUniqueConstraint) {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"success": false,
+				"error":   err.Error(),
+			})
+		}
+
+		// Validation failures are client errors → 400.
+		if errors.Is(err, mqtt.ErrValidation) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 				"success": false,
 				"error":   err.Error(),
 			})
