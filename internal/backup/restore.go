@@ -182,30 +182,34 @@ func (m *Manager) restoreSQLite(ctx context.Context, backupID string) error {
 	}
 
 	// Restore the Iceberg SQL catalog when it was backed up as a separate
-	// database. Skipped silently when the backup predates this, or when the
-	// catalog lived in the shared database (already restored above).
+	// database. Absent for a backup taken before the catalog was split out, or
+	// one where the catalog lived in the shared database (already restored
+	// above) — neither is an error.
+	//
+	// Presence is tested with Exists rather than by classifying the read error:
+	// every backend implements Exists with an explicit (bool, error), whereas
+	// not-found error text differs per backend ("file not found" locally,
+	// wrapped SDK errors for S3/Azure). Matching on text would silently invert
+	// — reporting "no catalog in this backup" for a real read failure — if the
+	// backup destination ever stops being local.
 	if m.icebergCatalogDBPath != "" {
-		err := m.restoreSQLiteFile(ctx, backupID, icebergCatalogDBName, m.icebergCatalogDBPath)
-		switch {
-		case err == nil:
-			m.logger.Info().Str("backup_id", backupID).Msg("Iceberg catalog database restored")
-		case isNotFoundErr(err):
-			// Backup taken before the catalog was split out, or with the
-			// catalog in the shared database. Not an error.
+		srcPath := fmt.Sprintf("%s/metadata/%s", backupID, icebergCatalogDBName)
+		exists, err := m.backupStorage.Exists(ctx, srcPath)
+		if err != nil {
+			return fmt.Errorf("failed to check for Iceberg catalog in backup: %w", err)
+		}
+		if !exists {
 			m.logger.Info().Str("backup_id", backupID).
 				Msg("Backup contains no separate Iceberg catalog; skipping")
-		default:
+			return nil
+		}
+		if err := m.restoreSQLiteFile(ctx, backupID, icebergCatalogDBName, m.icebergCatalogDBPath); err != nil {
 			return fmt.Errorf("failed to restore Iceberg catalog: %w", err)
 		}
+		m.logger.Info().Str("backup_id", backupID).Msg("Iceberg catalog database restored")
 	}
 
 	return nil
-}
-
-// isNotFoundErr reports whether a storage read failed because the object is
-// absent, as opposed to a real backend failure.
-func isNotFoundErr(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "file not found")
 }
 
 // restoreSQLiteFile restores one SQLite database from metadata/<srcName> in the
