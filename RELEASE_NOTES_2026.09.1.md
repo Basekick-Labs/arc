@@ -2,6 +2,51 @@
 
 > **Status:** In development.
 
+## New: Apache Iceberg export (opt-in)
+
+Arc can now publish its data as **Apache Iceberg tables** so any Iceberg-aware engine — Spark, Trino, DuckDB, Snowflake, PyIceberg — can query Arc's data directly, without going through Arc's API. This is the strongest form of the "your data, no lock-in" promise: Arc already writes open Parquet files you own; now those same files are also a standard Iceberg lakehouse table.
+
+**How it works (and what it doesn't do):** Iceberg is a *table format* — a metadata layer over Parquet — not a new file format. Arc's ingest path is **completely unchanged**; nothing in the 20M+ rec/s write path is touched. A background reconciler periodically registers Arc's **existing** Parquet files into an Iceberg table by reference (Iceberg's `add_files` — **no data is copied or rewritten**) and keeps the table's file set in sync as compaction and retention change the underlying files. Because it registers files in place rather than re-exporting them, there is effectively no storage overhead beyond the small Iceberg metadata.
+
+Enable it with one setting:
+
+```toml
+[iceberg]
+enabled = true          # default false
+```
+
+Then point any engine at the table. Example with DuckDB:
+
+```sql
+INSTALL iceberg; LOAD iceberg;
+SELECT * FROM iceberg_scan('/path/to/data/arc/arc_<database>.db/<measurement>');
+```
+
+**Highlights:**
+- **Zero-copy** — registers your existing Parquet, no rewrite (unlike export plugins that duplicate data).
+- **Automatic maintenance** — Arc's compaction and retention are reflected into the Iceberg table; snapshots are expired on a retention policy so metadata stays bounded.
+- **Schema evolution** — measurements that gain columns over time evolve the Iceberg table automatically; older files stay readable.
+- **Cross-engine verified** — read-tested against DuckDB, PyIceberg, and Apache Spark (host and containerized).
+- **Backup-aware** — the Iceberg metadata is included in Arc's backup/restore.
+- **Efficient** — the reconciler skips measurements whose file set hasn't changed since the last pass (no wasted work at steady state).
+
+**Configuration:**
+
+| Key | Default | Meaning |
+|---|---|---|
+| `iceberg.enabled` | `false` | Enable the export reconciler. |
+| `iceberg.reconcile_interval` | `300` | Seconds between reconcile passes. |
+| `iceberg.retain_snapshots` | `10` | Iceberg snapshots (and metadata versions) kept per table; older are expired. |
+| `iceberg.namespace_prefix` | `"arc"` | Iceberg namespace prefix; tables land in `<prefix>_<database>`. |
+| `iceberg.warehouse` | *storage root* | Where table metadata is written (defaults alongside the data). |
+| `iceberg.catalog_db_path` | *shared auth DB* | SQLite catalog location. |
+
+Env vars follow the usual pattern, e.g. `ARC_ICEBERG_ENABLED=true`.
+
+**v1 scope / limits:** Iceberg export requires a **local storage backend** and is **not compatible with cold-tier tiering** (a file migrated to S3 would leave the Iceberg table) — Arc refuses to start with both enabled. `iceberg.retain_snapshots` must be at least 1; 0 is rejected rather than silently meaning "keep every snapshot forever". Directory-based readers are supported via an emitted `version-hint.text`; catalog-based discovery works today with PyIceberg / the SQLite catalog. If `iceberg.warehouse` points outside the storage root the discovery files cannot be addressed and are not written — Arc warns once per table, and catalog-based readers are unaffected. See the full guide in the docs (**Integrations → Apache Iceberg**) for engine-by-engine instructions, the trade-offs, and the cluster single-writer note.
+
+**Backups cover the catalog wherever it lives.** Backup copies the Iceberg warehouse metadata alongside the Parquet data, and now also the Iceberg SQL catalog itself when `iceberg.catalog_db_path` points somewhere other than the shared database. The catalog holds every table's schema and snapshot pointers, so a backup without it restores data whose tables no longer resolve. Restores of older backups that predate this are unaffected — a missing catalog copy is skipped, not an error.
+
 ## Security hardening
 
 ### Strip client-controlled forwarding headers at the inter-node boundary (CVE-2026-45045 class)

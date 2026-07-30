@@ -177,16 +177,54 @@ func (m *Manager) streamRestoreFile(ctx context.Context, srcPath, destPath strin
 // restoreSQLite restores the SQLite database from the backup.
 // It creates a .before-restore backup of the current database first.
 func (m *Manager) restoreSQLite(ctx context.Context, backupID string) error {
-	srcPath := fmt.Sprintf("%s/metadata/arc.db", backupID)
+	if err := m.restoreSQLiteFile(ctx, backupID, "arc.db", m.sqliteDBPath); err != nil {
+		return err
+	}
+
+	// Restore the Iceberg SQL catalog when it was backed up as a separate
+	// database. Absent for a backup taken before the catalog was split out, or
+	// one where the catalog lived in the shared database (already restored
+	// above) — neither is an error.
+	//
+	// Presence is tested with Exists rather than by classifying the read error:
+	// every backend implements Exists with an explicit (bool, error), whereas
+	// not-found error text differs per backend ("file not found" locally,
+	// wrapped SDK errors for S3/Azure). Matching on text would silently invert
+	// — reporting "no catalog in this backup" for a real read failure — if the
+	// backup destination ever stops being local.
+	if m.icebergCatalogDBPath != "" {
+		srcPath := fmt.Sprintf("%s/metadata/%s", backupID, icebergCatalogDBName)
+		exists, err := m.backupStorage.Exists(ctx, srcPath)
+		if err != nil {
+			return fmt.Errorf("failed to check for Iceberg catalog in backup: %w", err)
+		}
+		if !exists {
+			m.logger.Info().Str("backup_id", backupID).
+				Msg("Backup contains no separate Iceberg catalog; skipping")
+			return nil
+		}
+		if err := m.restoreSQLiteFile(ctx, backupID, icebergCatalogDBName, m.icebergCatalogDBPath); err != nil {
+			return fmt.Errorf("failed to restore Iceberg catalog: %w", err)
+		}
+		m.logger.Info().Str("backup_id", backupID).Msg("Iceberg catalog database restored")
+	}
+
+	return nil
+}
+
+// restoreSQLiteFile restores one SQLite database from metadata/<srcName> in the
+// backup to destPath, preserving the previous file as .before-restore.
+func (m *Manager) restoreSQLiteFile(ctx context.Context, backupID, srcName, destPath string) error {
+	srcPath := fmt.Sprintf("%s/metadata/%s", backupID, srcName)
 	data, err := m.backupStorage.Read(ctx, srcPath)
 	if err != nil {
 		return fmt.Errorf("failed to read SQLite backup: %w", err)
 	}
 
 	// Safety: backup the current database before overwriting
-	if _, statErr := os.Stat(m.sqliteDBPath); statErr == nil {
-		preRestorePath := m.sqliteDBPath + ".before-restore"
-		currentData, err := os.ReadFile(m.sqliteDBPath)
+	if _, statErr := os.Stat(destPath); statErr == nil {
+		preRestorePath := destPath + ".before-restore"
+		currentData, err := os.ReadFile(destPath)
 		if err == nil {
 			if err := os.WriteFile(preRestorePath, currentData, 0600); err != nil {
 				m.logger.Warn().Err(err).Msg("Failed to create pre-restore backup of SQLite database")
@@ -196,11 +234,11 @@ func (m *Manager) restoreSQLite(ctx context.Context, backupID string) error {
 		}
 	}
 
-	if err := os.WriteFile(m.sqliteDBPath, data, 0600); err != nil {
+	if err := os.WriteFile(destPath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write SQLite database: %w", err)
 	}
 
-	m.logger.Info().Str("backup_id", backupID).Msg("SQLite database restored")
+	m.logger.Info().Str("backup_id", backupID).Str("database", srcName).Msg("SQLite database restored")
 	return nil
 }
 

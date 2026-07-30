@@ -250,7 +250,11 @@ func TestCopyDataFiles_SkipRatioExceeded(t *testing.T) {
 	}
 
 	progress := &Progress{Operation: "backup", TotalFiles: int64(len(files))}
-	err = m.copyDataFiles(ctx, "bkid", files, progress)
+	if err := m.copyDataFiles(ctx, "bkid", files, progress); err != nil {
+		t.Fatalf("copyDataFiles should record skips, not fail: %v", err)
+	}
+	// The ratio is evaluated once over the whole backup, not per copy group.
+	err = m.checkSkipRatio(progress, len(files))
 	if err == nil {
 		t.Fatal("expected failure when the skip ratio is exceeded, got nil (partial backup would report success)")
 	}
@@ -355,8 +359,69 @@ func TestCopyDataFiles_AllFilesSkippedIsFatal(t *testing.T) {
 	}
 
 	progress := &Progress{Operation: "backup", TotalFiles: int64(len(files))}
-	if err := m.copyDataFiles(ctx, "bkid", files, progress); err == nil {
+	if err := m.copyDataFiles(ctx, "bkid", files, progress); err != nil {
+		t.Fatalf("copyDataFiles should record skips, not fail: %v", err)
+	}
+	if err := m.checkSkipRatio(progress, len(files)); err == nil {
 		t.Fatal("expected error when every file is skipped, got nil (empty backup would report success)")
+	}
+}
+
+// The ratio must span every copy group. A small Iceberg metadata set with one
+// stale entry is a large fraction of that set but a negligible fraction of the
+// backup, and must not abort a run whose data files all copied.
+func TestCheckSkipRatio_SpansAllFileGroups(t *testing.T) {
+	ctx := context.Background()
+	logger := zerolog.Nop()
+
+	dataDir := t.TempDir()
+	dataStorage, err := storage.NewLocalBackend(dataDir, logger)
+	if err != nil {
+		t.Fatalf("failed to create data storage: %v", err)
+	}
+	m := &Manager{
+		dataStorage:   dataStorage,
+		backupStorage: mustLocalBackend(t, t.TempDir(), logger),
+		logger:        logger,
+	}
+
+	// 30 healthy data files.
+	var dataFiles []storage.ObjectInfo
+	for i := 0; i < 30; i++ {
+		p := fmt.Sprintf("db/cpu/2026/07/28/00/f%d.parquet", i)
+		if err := dataStorage.Write(ctx, p, bytes.Repeat([]byte("d"), 10)); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		dataFiles = append(dataFiles, storage.ObjectInfo{Path: p, Size: 10})
+	}
+	// A 3-file Iceberg metadata set where one entry is already gone — 33% of
+	// that group, but only ~3% of the backup.
+	if err := dataStorage.Write(ctx, "db/cpu/metadata/a.metadata.json", []byte("x")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := dataStorage.Write(ctx, "db/cpu/metadata/b.metadata.json", []byte("x")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	metaFiles := []storage.ObjectInfo{
+		{Path: "db/cpu/metadata/a.metadata.json", Size: 1},
+		{Path: "db/cpu/metadata/b.metadata.json", Size: 1},
+		{Path: "db/cpu/metadata/vanished.metadata.json", Size: 1},
+	}
+
+	progress := &Progress{Operation: "backup", TotalFiles: int64(len(dataFiles) + len(metaFiles))}
+	if err := m.copyDataFiles(ctx, "bkid", dataFiles, progress); err != nil {
+		t.Fatalf("data files: %v", err)
+	}
+	if err := m.copyDataFiles(ctx, "bkid", metaFiles, progress); err != nil {
+		t.Fatalf("iceberg metadata: %v", err)
+	}
+
+	// Skips must accumulate across groups, not be overwritten by the last one.
+	if progress.SkippedFiles != 1 {
+		t.Errorf("SkippedFiles = %d, want 1 (a later group must not erase earlier skips)", progress.SkippedFiles)
+	}
+	if err := m.checkSkipRatio(progress, len(dataFiles)+len(metaFiles)); err != nil {
+		t.Errorf("1 stale entry out of 33 files must not fail the backup: %v", err)
 	}
 }
 

@@ -30,6 +30,7 @@ import (
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/fips"
 	"github.com/basekick-labs/arc/internal/governance"
+	"github.com/basekick-labs/arc/internal/iceberg"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/logger"
@@ -2311,6 +2312,74 @@ func main() {
 		log.Info().Msg("Retention policies DISABLED")
 	}
 
+	// Iceberg export (opt-in). Publishes Arc's existing Parquet as Iceberg tables via a
+	// periodic reconciler that walks storage — works in OSS and cluster, no tiering/Raft
+	// dependency. Wired OUTSIDE the cluster block so it runs in standalone mode.
+	if cfg.Iceberg.Enabled {
+		icebergDBPath := cfg.Iceberg.CatalogDBPath
+		if icebergDBPath == "" {
+			icebergDBPath = cfg.Auth.DBPath // shared SQLite DB
+		}
+		// Borrow the auth manager's handle when the catalog lives in the shared
+		// database (the default), rather than opening yet another connection pool
+		// against one file — SQLite has a single writer, so independent pools only
+		// contend for the same lock (#329/#562). An operator who points
+		// iceberg.catalog_db_path at its own file still gets a dedicated handle.
+		var (
+			icebergDB     *sql.DB
+			icebergOwnsDB bool
+		)
+		if authManager.SharesDBPath(icebergDBPath) {
+			icebergDB = authManager.GetDB()
+		} else {
+			var err error
+			icebergDB, icebergOwnsDB, err = sharedSQLiteHandle(nil, icebergDBPath)
+			if err != nil {
+				log.Fatal().Err(err).Str("path", icebergDBPath).Msg("Failed to open Iceberg catalog DB")
+			}
+		}
+		// Default the warehouse to the storage root when unset, so table metadata lands
+		// alongside the data (file:// for local; s3://bucket/prefix for object storage).
+		warehouse := cfg.Iceberg.Warehouse
+		if warehouse == "" {
+			warehouse = iceberg.DefaultWarehouse(storageBackend)
+		}
+		exporter, err := iceberg.NewExporter(icebergDB, storageBackend, warehouse, cfg.Iceberg.NamespacePrefix, cfg.Iceberg.RetainSnapshots, logger.Get("iceberg"))
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to initialize Iceberg exporter")
+		}
+		icebergSource := iceberg.NewStorageWalkSource(storageBackend, cfg.Iceberg.NamespacePrefix)
+		// Writer gate: in cluster mode reuse the compaction gate; nil in OSS (single node, always
+		// runs). SINGLE-WRITER REQUIREMENT: the reconciler writes version-hint.text / v<N>.json
+		// to the shared warehouse non-transactionally, so exactly one node must run it. The
+		// compaction failover lease (Phase 5) guarantees that. In a Phase-4 static-role cluster
+		// with MULTIPLE compaction-capable nodes and no lease, CanCompact() is true on each of
+		// them — configure only ONE compaction-capable node when iceberg export is enabled, or
+		// two nodes will race on the warehouse files.
+		var icebergGate iceberg.WriterGate
+		if compactionGate != nil {
+			icebergGate = icebergWriterGate{compactionGate}
+		}
+		icebergScheduler := iceberg.NewScheduler(iceberg.SchedulerConfig{
+			Exporter: exporter,
+			Source:   icebergSource,
+			Interval: time.Duration(cfg.Iceberg.ReconcileInterval) * time.Second,
+			Gate:     icebergGate,
+			Logger:   logger.Get("iceberg"),
+		})
+		icebergScheduler.Start()
+		shutdownCoordinator.RegisterHook("iceberg", func(ctx context.Context) error {
+			icebergScheduler.Stop()
+			// Close only a handle this block opened. A borrowed one belongs to
+			// the auth manager, which closes it at PriorityAuth.
+			if icebergOwnsDB {
+				return icebergDB.Close()
+			}
+			return nil
+		}, shutdown.PriorityDatabase)
+		log.Info().Str("warehouse", warehouse).Int("interval_s", cfg.Iceberg.ReconcileInterval).Msg("Iceberg export enabled")
+	}
+
 	// Register Continuous Query handler
 	var cqHandler *api.ContinuousQueryHandler
 	if cfg.ContinuousQuery.Enabled {
@@ -2668,12 +2737,24 @@ func main() {
 
 	// Initialize Backup/Restore (OSS feature — no license required)
 	if cfg.Backup.Enabled {
+		// Pass the Iceberg catalog path so a catalog the operator moved out of the
+		// shared database is still backed up. NewManager ignores it when it
+		// resolves to the same file. Only when Iceberg is enabled: otherwise the
+		// catalog does not exist and there is nothing to copy.
+		icebergCatalogDBPath := ""
+		if cfg.Iceberg.Enabled {
+			icebergCatalogDBPath = cfg.Iceberg.CatalogDBPath
+			if icebergCatalogDBPath == "" {
+				icebergCatalogDBPath = cfg.Auth.DBPath
+			}
+		}
 		backupManager, err := backup.NewManager(&backup.ManagerConfig{
-			DataStorage:  storageBackend,
-			BackupPath:   cfg.Backup.LocalPath,
-			SQLiteDBPath: cfg.Auth.DBPath,
-			ConfigPath:   "arc.toml",
-			Logger:       logger.Get("backup"),
+			DataStorage:          storageBackend,
+			BackupPath:           cfg.Backup.LocalPath,
+			SQLiteDBPath:         cfg.Auth.DBPath,
+			IcebergCatalogDBPath: icebergCatalogDBPath,
+			ConfigPath:           "arc.toml",
+			Logger:               logger.Get("backup"),
 		})
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to initialize backup manager")
@@ -3033,6 +3114,14 @@ func (g *compactionClusterGate) CanCompact() bool {
 func (g *compactionClusterGate) Role() string {
 	return string(g.role)
 }
+
+// icebergWriterGate adapts the compaction cluster gate to iceberg.WriterGate: the Iceberg
+// reconciler is a singleton writer-only operation, so it runs where compaction runs (the
+// active compactor). In OSS the compaction gate is nil, so the adapter is not constructed and
+// the reconciler runs unconditionally (single node).
+type icebergWriterGate struct{ inner compaction.ClusterGate }
+
+func (g icebergWriterGate) CanRun() bool { return g.inner.CanCompact() }
 
 // reconciliationClusterGate implements reconciliation.Gate. The two halves
 // of a reconcile run (storage scan, manifest sweep) have different gating

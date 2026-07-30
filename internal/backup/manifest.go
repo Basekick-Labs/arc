@@ -21,7 +21,12 @@ type Manifest struct {
 	// what was actually stored.
 	SkippedFiles int64 `json:"skipped_files,omitempty"`
 	HasMetadata  bool  `json:"has_metadata"`
-	HasConfig    bool  `json:"has_config"`
+	// HasIcebergCatalog records that the Iceberg SQL catalog was stored as a
+	// separate database (metadata/iceberg-catalog.db) because the operator
+	// configured iceberg.catalog_db_path away from the shared database. When
+	// false the catalog either lives in the shared database or does not exist.
+	HasIcebergCatalog bool `json:"has_iceberg_catalog,omitempty"`
+	HasConfig         bool `json:"has_config"`
 }
 
 // DatabaseInfo describes a single database within a backup.
