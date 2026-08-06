@@ -145,6 +145,23 @@ type CompactionConfig struct {
 	MaxConcurrent             int    // Max concurrent compaction jobs (default: 2)
 	TempDirectory             string // Temporary directory for compaction files (default: ./data/compaction)
 
+	// MaxFilesPerBatch bounds how many files a single compaction job feeds to
+	// one DuckDB read_parquet() call; larger partitions are split into that
+	// many batches, each producing its own output file. DuckDB can segfault
+	// when a single call spans too many files, which is why this bound exists.
+	//
+	// This is a file-count bound, not a byte bound — compacted output size
+	// tracks input file size, which follows the ingest buffer settings.
+	// Deployments syncing compacted files over constrained or intermittent
+	// links may lower it to get smaller, independently-transferable outputs,
+	// at the cost of more compaction jobs (and, in cluster mode,
+	// proportionally more Raft manifest entries) per partition.
+	//
+	// Valid range is [2, 500]; out-of-range values fall back to the default
+	// with a startup warning. 1 is explicitly not usable — the adaptive retry
+	// in compaction rejects batches below 2 files. (default: 30)
+	MaxFilesPerBatch int
+
 	// Phase 4: completion-manifest watcher tunables. The watcher polls
 	// {temp_directory}/.completion/pending on a 1s default interval
 	// looking for compaction jobs that finished and need their outputs
@@ -605,6 +622,7 @@ func Load() (*Config, error) {
 			DailyMinFiles:               v.GetInt("compaction.daily_min_files"),
 			DailySkipFileAgeCheckDays:   v.GetInt("compaction.daily_skip_file_age_check_days"),
 			MaxConcurrent:               v.GetInt("compaction.max_concurrent"),
+			MaxFilesPerBatch:            v.GetInt("compaction.max_files_per_batch"),
 			TempDirectory:               v.GetString("compaction.temp_directory"),
 			CompletionWatcherIntervalMS: v.GetInt("compaction.completion_watcher_interval_ms"),
 			CompletionDir:               v.GetString("compaction.completion_dir"),
@@ -1006,6 +1024,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.daily_min_files", 12)                 // 12 files minimum
 	v.SetDefault("compaction.daily_skip_file_age_check_days", 7)   // Skip file age check for partitions older than 7 days
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
+	v.SetDefault("compaction.max_files_per_batch", 30)             // 30 files per DuckDB read_parquet() call; valid range [2, 500]
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
 	// Phase 4: completion-manifest watcher tunables
 	v.SetDefault("compaction.completion_watcher_interval_ms", 1000) // 1s poll rate

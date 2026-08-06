@@ -24,7 +24,6 @@ type DailyTierConfig struct {
 	MinAgeHours          int  // Don't compact days younger than this (default: 24)
 	MinFiles             int  // Only compact days with at least this many files (default: 12)
 	SkipFileAgeCheckDays int  // Skip file creation time check for partitions older than this (default: 7)
-	TargetSizeMB         int  // Target size for compacted files (default: 2048)
 	Enabled              bool // Enable daily compaction (default: true)
 	Logger               zerolog.Logger
 }
@@ -46,18 +45,11 @@ func NewDailyTier(cfg *DailyTierConfig) *DailyTier {
 		// backfill is assumed complete.
 		cfg.SkipFileAgeCheckDays = 7
 	}
-	if cfg.TargetSizeMB == 0 {
-		// 2048 MB (2 GB): daily files should be large for efficient cold-tier reads.
-		// Larger than hourly (512 MB) because daily data is read less frequently.
-		cfg.TargetSizeMB = 2048
-	}
-
 	tier := &DailyTier{
 		BaseTier: NewBaseTier(&BaseTierConfig{
 			StorageBackend: cfg.StorageBackend,
 			MinAgeHours:    cfg.MinAgeHours,
 			MinFiles:       cfg.MinFiles,
-			TargetSizeMB:   cfg.TargetSizeMB,
 			Enabled:        cfg.Enabled,
 			Logger:         cfg.Logger.With().Str("tier", "daily").Logger(),
 		}),
@@ -68,7 +60,6 @@ func NewDailyTier(cfg *DailyTierConfig) *DailyTier {
 		Int("min_age_hours", cfg.MinAgeHours).
 		Int("min_files", cfg.MinFiles).
 		Int("skip_file_age_check_days", cfg.SkipFileAgeCheckDays).
-		Int("target_size_mb", cfg.TargetSizeMB).
 		Bool("enabled", cfg.Enabled).
 		Msg("Daily compaction tier initialized")
 

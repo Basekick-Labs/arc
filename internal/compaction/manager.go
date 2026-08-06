@@ -25,12 +25,15 @@ type Manager struct {
 	ManifestManager *ManifestManager
 
 	// Configuration
-	MinAgeHours   int
-	MinFiles      int
-	TargetSizeMB  int
-	MaxConcurrent int
-	TempDirectory string // Temp directory for compaction files
-	MemoryLimit   string // DuckDB memory limit for subprocess (e.g., "8GB")
+	MinAgeHours int
+	MinFiles    int
+	// MaxFilesPerBatch bounds how many files one compaction job feeds to a
+	// single DuckDB read_parquet() call. Already clamped to the supported
+	// range by NewManager.
+	MaxFilesPerBatch int
+	MaxConcurrent    int
+	TempDirectory    string // Temp directory for compaction files
+	MemoryLimit      string // DuckDB memory limit for subprocess (e.g., "8GB")
 	// Phase 4: local-disk directory where compaction subprocesses write
 	// completion manifests for the parent-side CompletionWatcher to pick
 	// up. Empty means "OSS mode, no completion-manifest handoff". Set by
@@ -69,19 +72,22 @@ type Manager struct {
 
 // ManagerConfig holds configuration for creating a compaction manager
 type ManagerConfig struct {
-	StorageBackend  storage.Backend
-	LockManager     *LockManager
-	MinAgeHours     int
-	MinFiles        int
-	TargetSizeMB    int
-	MaxConcurrent   int
-	TempDirectory   string              // Temp directory for compaction files
-	MemoryLimit     string              // DuckDB memory limit for subprocess (e.g., "8GB")
-	CompletionDir   string              // Phase 4: local-disk completion-manifest dir (empty = OSS mode)
-	SortKeysConfig  map[string][]string // Per-measurement sort keys from ingest config
-	DefaultSortKeys []string            // Default sort keys from ingest config
-	Tiers           []Tier
-	Logger          zerolog.Logger
+	StorageBackend storage.Backend
+	LockManager    *LockManager
+	MinAgeHours    int
+	MinFiles       int
+	// MaxFilesPerBatch bounds files per compaction job. Out-of-range values
+	// (including 0 from an unset field) are clamped by NewManager — see
+	// clampFilesPerBatch.
+	MaxFilesPerBatch int
+	MaxConcurrent    int
+	TempDirectory    string              // Temp directory for compaction files
+	MemoryLimit      string              // DuckDB memory limit for subprocess (e.g., "8GB")
+	CompletionDir    string              // Phase 4: local-disk completion-manifest dir (empty = OSS mode)
+	SortKeysConfig   map[string][]string // Per-measurement sort keys from ingest config
+	DefaultSortKeys  []string            // Default sort keys from ingest config
+	Tiers            []Tier
+	Logger           zerolog.Logger
 }
 
 // NewManager creates a new compaction manager
@@ -93,12 +99,13 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	if cfg.MinFiles == 0 {
 		cfg.MinFiles = 10
 	}
-	if cfg.TargetSizeMB == 0 {
-		cfg.TargetSizeMB = 512
-	}
 	if cfg.MaxConcurrent == 0 {
 		cfg.MaxConcurrent = 2
 	}
+	// Clamp the batch size once here rather than per-partition, so an
+	// out-of-range configured value produces exactly one warning at startup.
+	// SplitCandidateIntoBatches clamps again defensively.
+	maxFilesPerBatch, batchSizeAdjusted := clampFilesPerBatch(cfg.MaxFilesPerBatch)
 	if cfg.TempDirectory == "" {
 		cfg.TempDirectory = "./data/compaction"
 	}
@@ -117,21 +124,30 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	logger := cfg.Logger.With().Str("component", "compaction-manager").Logger()
 
 	m := &Manager{
-		StorageBackend:  cfg.StorageBackend,
-		LockManager:     cfg.LockManager,
-		ManifestManager: NewManifestManager(cfg.StorageBackend, logger),
-		MinAgeHours:     cfg.MinAgeHours,
-		MinFiles:        cfg.MinFiles,
-		TargetSizeMB:    cfg.TargetSizeMB,
-		MaxConcurrent:   cfg.MaxConcurrent,
-		TempDirectory:   cfg.TempDirectory,
-		MemoryLimit:     cfg.MemoryLimit,
-		CompletionDir:   cfg.CompletionDir,
-		SortKeysConfig:  sortKeysConfig,
-		DefaultSortKeys: defaultSortKeys,
-		Tiers:           cfg.Tiers,
-		jobHistory:      make([]map[string]interface{}, 0),
-		logger:          logger,
+		StorageBackend:   cfg.StorageBackend,
+		LockManager:      cfg.LockManager,
+		ManifestManager:  NewManifestManager(cfg.StorageBackend, logger),
+		MinAgeHours:      cfg.MinAgeHours,
+		MinFiles:         cfg.MinFiles,
+		MaxFilesPerBatch: maxFilesPerBatch,
+		MaxConcurrent:    cfg.MaxConcurrent,
+		TempDirectory:    cfg.TempDirectory,
+		MemoryLimit:      cfg.MemoryLimit,
+		CompletionDir:    cfg.CompletionDir,
+		SortKeysConfig:   sortKeysConfig,
+		DefaultSortKeys:  defaultSortKeys,
+		Tiers:            cfg.Tiers,
+		jobHistory:       make([]map[string]interface{}, 0),
+		logger:           logger,
+	}
+
+	if batchSizeAdjusted {
+		m.logger.Warn().
+			Int("configured", cfg.MaxFilesPerBatch).
+			Int("effective", maxFilesPerBatch).
+			Int("min", MinFilesPerBatch).
+			Int("max", MaxAllowedFilesPerBatch).
+			Msg("compaction.max_files_per_batch out of range; using adjusted value")
 	}
 
 	// Log tier information
@@ -229,11 +245,30 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 	// Build subprocess config. JobID is generated here (not inside NewJob)
 	// so the parent and subprocess agree on the completion-manifest filename.
 	// The format matches NewJob's default to stay consistent with the
-	// existing temp-dir naming scheme used by CleanupOrphanedTempDirs.
-	jobID := fmt.Sprintf("%s_%s_%d",
+	// existing temp-dir naming scheme used by CleanupOrphanedTempDirs (which
+	// removes non-reserved subdirectories wholesale and does not parse this).
+	//
+	// BatchNumber is included because sibling batches of one partition differ
+	// in nothing else: same database, same partition path, and a wall-clock
+	// nanosecond that is not guaranteed distinct (macOS returns a coarse
+	// clock). A JobID collision would make two batches share a
+	// completion-manifest filename (completion.go writes {JobID}.json), so one
+	// batch's manifest would overwrite the other's and its output would never
+	// be registered in the Raft manifest. Batches run sequentially today, which
+	// makes this remote — BatchNumber makes it impossible.
+	//
+	// This assumes the candidate came from SplitCandidateIntoBatches, which
+	// always sets a 1-based BatchNumber (1 of 1 for an unsplit partition).
+	// Today that holds: the only caller is compactFilesAdaptively, which is
+	// only ever reached from runCycleInternal via the split. A candidate
+	// constructed directly would carry BatchNumber 0 and yield a "_b0" suffix
+	// — still unique against real batches, but a signal the invariant was
+	// bypassed.
+	jobID := fmt.Sprintf("%s_%s_%d_b%d",
 		candidate.Database,
 		strings.ReplaceAll(candidate.PartitionPath, "/", "_"),
 		time.Now().UnixNano(),
+		candidate.BatchNumber,
 	)
 	config := &SubprocessJobConfig{
 		Database:      candidate.Database,
@@ -241,7 +276,7 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 		PartitionPath: candidate.PartitionPath,
 		Files:         candidate.Files,
 		Tier:          candidate.Tier,
-		TargetSizeMB:  m.TargetSizeMB,
+		BatchNumber:   candidate.BatchNumber,
 		TempDirectory: m.TempDirectory,
 		MemoryLimit:   m.MemoryLimit,
 		SortKeys:      m.GetSortKeys(candidate.Measurement),
@@ -378,8 +413,16 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 //     - Recursively compact each half
 //  3. If batch size <= minBatchSize and still failing, give up
 func (m *Manager) compactFilesAdaptively(ctx context.Context, candidate Candidate, files []string, depth int, stderr string) error {
-	const maxDepth = 4     // Maximum split depth: 30 → 15 → 7 → 3 → minimum
-	const minBatchSize = 2 // Don't split below 2 files
+	// Maximum split depth. Each level halves the batch, so the ladder starts at
+	// whatever compaction.max_files_per_batch produced and bottoms out at
+	// MinFilesPerBatch — e.g. at the default 30: 30 → 15 → 7 → 3 → stop.
+	// A larger configured batch size does not get proportionally more retries,
+	// which is part of why MaxAllowedFilesPerBatch caps it.
+	const maxDepth = 4
+	// Don't split below MinFilesPerBatch files. This is the same floor
+	// SplitCandidateIntoBatches clamps to, so a configured batch size can never
+	// land below it and fail here on the first attempt.
+	const minBatchSize = MinFilesPerBatch
 
 	// Check context cancellation
 	if ctx.Err() != nil {
@@ -657,7 +700,7 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 
 					// Split large candidates into batches to prevent DuckDB segfaults
 					// when processing too many files in a single read_parquet() call
-					batches := SplitCandidateIntoBatches(filteredCandidate)
+					batches := SplitCandidateIntoBatches(filteredCandidate, m.MaxFilesPerBatch)
 					if len(batches) > 1 {
 						m.logger.Info().
 							Str("partition", filteredCandidate.PartitionPath).

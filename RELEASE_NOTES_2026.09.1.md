@@ -47,6 +47,21 @@ Env vars follow the usual pattern, e.g. `ARC_ICEBERG_ENABLED=true`.
 
 **Backups cover the catalog wherever it lives.** Backup copies the Iceberg warehouse metadata alongside the Parquet data, and now also the Iceberg SQL catalog itself when `iceberg.catalog_db_path` points somewhere other than the shared database. The catalog holds every table's schema and snapshot pointers, so a backup without it restores data whose tables no longer resolve. Restores of older backups that predate this are unaffected — a missing catalog copy is skipped, not an error.
 
+## New: tunable compaction batch size
+
+Compaction splits a large partition into batches, each becoming an independent job with its own output file. That batch size was a hardcoded constant (30 files); it is now configurable:
+
+```toml
+[compaction]
+max_files_per_batch = 30   # default; valid range [2, 500]
+```
+
+Env var: `ARC_COMPACTION_MAX_FILES_PER_BATCH`.
+
+This is a **file-count** bound, not a byte bound — compacted output size tracks input file size, which follows the ingest buffer settings. Lowering it yields smaller, independently-transferable compacted files, which matters when those files are shipped over a constrained or intermittent link (edge and field deployments). The cost is more compaction jobs per partition, and in cluster mode proportionally more Raft manifest entries — at `5`, a 600-file partition produces 120 manifest entries instead of 20.
+
+Out-of-range values fall back to the default with a startup warning rather than failing. **`1` is not usable** and is treated as out of range: compaction's adaptive retry rejects any batch below two files, so a batch size of one would fail every batch of every partition.
+
 ## Security hardening
 
 ### Strip client-controlled forwarding headers at the inter-node boundary (CVE-2026-45045 class)
@@ -174,7 +189,19 @@ Follow-up cleanup, no runtime behavior change: the channel governing the auth ma
 
 No current code path mutates a batch's `Files` in place, so this was latent rather than an active source of corruption — compaction jobs never produced wrong file lists because of it. But it left every future caller one in-place sort or append away from silently rewriting sibling batches, with no error or log signal.
 
-Both sites now copy into independent backing arrays, including the single-batch (`len(Files) <= MaxFilesPerBatch`) path that previously returned the caller's slice unchanged. Batch isolation no longer depends on file count: mutating any returned batch cannot affect another batch or the original candidate.
+Both sites now copy into independent backing arrays, including the single-batch (`len(Files) <= DefaultMaxFilesPerBatch`) path that previously returned the caller's slice unchanged. Batch isolation no longer depends on file count: mutating any returned batch cannot affect another batch or the original candidate.
+
+### Compaction batch splitting no longer strands a sub-minimum remainder
+
+Splitting a partition into batches could leave a trailing batch of one file — 31 files at the default batch size of 30 produced batches of 30 and 1. `compactFilesAdaptively` rejects any batch below two files on its first attempt (`compaction failed: batch size 1 below minimum 2`), so that remainder failed every cycle and its file never compacted. The partition's tail stayed permanently uncompacted, with the only symptom a per-batch failure log.
+
+A trailing remainder smaller than the two-file floor is now folded into the final batch, which overshoots the configured size by at most one file. Every emitted batch is now large enough to actually compact.
+
+### `compaction.target_size_mb` removed (it never did anything)
+
+The compaction tiers carried a `TargetSizeMB` field, defaulted to 512 (hourly) and 2048 (daily), plumbed through five structs and the parent↔subprocess IPC, and reported as `target_size_mb` on `GET /api/v1/compaction/stats`. Nothing ever read it: the file-selection path has no size information (`Candidate` carries no file sizes), and the compaction `COPY` never emitted a `FILE_SIZE_BYTES` clause. Compacted file size was, and is, governed by the batch file count.
+
+There was no config key for it, so no deployment could have set it — the removal cannot change anyone's behavior. **The `target_size_mb` field is gone from the `tiers[]` entries of `GET /api/v1/compaction/stats`**; the tier-initialization log lines no longer include it either.
 
 ### Backup no longer loads entire files into memory ([#322](https://github.com/Basekick-Labs/arc/issues/322))
 

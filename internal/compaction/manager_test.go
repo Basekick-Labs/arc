@@ -30,14 +30,14 @@ func setupTestManager(t *testing.T) (*Manager, storage.Backend, func()) {
 	lockManager := NewLockManager()
 
 	cfg := &ManagerConfig{
-		StorageBackend: backend,
-		LockManager:    lockManager,
-		MinAgeHours:    1,
-		MinFiles:       5,
-		TargetSizeMB:   256,
-		MaxConcurrent:  2,
-		TempDirectory:  tmpDir + "/temp",
-		Logger:         logger,
+		StorageBackend:   backend,
+		LockManager:      lockManager,
+		MinAgeHours:      1,
+		MinFiles:         5,
+		MaxFilesPerBatch: 10,
+		MaxConcurrent:    2,
+		TempDirectory:    tmpDir + "/temp",
+		Logger:           logger,
 	}
 
 	manager := NewManager(cfg)
@@ -75,8 +75,11 @@ func TestNewManager(t *testing.T) {
 		if manager.MinFiles != 10 {
 			t.Errorf("MinFiles = %d, want 10", manager.MinFiles)
 		}
-		if manager.TargetSizeMB != 512 {
-			t.Errorf("TargetSizeMB = %d, want 512", manager.TargetSizeMB)
+		// An unset MaxFilesPerBatch (0) is out of range and must clamp to the
+		// default rather than reaching SplitCandidateIntoBatches as a zero
+		// divisor.
+		if manager.MaxFilesPerBatch != DefaultMaxFilesPerBatch {
+			t.Errorf("MaxFilesPerBatch = %d, want %d", manager.MaxFilesPerBatch, DefaultMaxFilesPerBatch)
 		}
 		if manager.MaxConcurrent != 2 {
 			t.Errorf("MaxConcurrent = %d, want 2", manager.MaxConcurrent)
@@ -92,14 +95,14 @@ func TestNewManager(t *testing.T) {
 		defer backend.Close()
 
 		cfg := &ManagerConfig{
-			StorageBackend: backend,
-			LockManager:    NewLockManager(),
-			MinAgeHours:    24,
-			MinFiles:       20,
-			TargetSizeMB:   1024,
-			MaxConcurrent:  4,
-			TempDirectory:  "/custom/temp",
-			Logger:         logger,
+			StorageBackend:   backend,
+			LockManager:      NewLockManager(),
+			MinAgeHours:      24,
+			MinFiles:         20,
+			MaxFilesPerBatch: 12,
+			MaxConcurrent:    4,
+			TempDirectory:    "/custom/temp",
+			Logger:           logger,
 		}
 
 		manager := NewManager(cfg)
@@ -110,8 +113,9 @@ func TestNewManager(t *testing.T) {
 		if manager.MinFiles != 20 {
 			t.Errorf("MinFiles = %d, want 20", manager.MinFiles)
 		}
-		if manager.TargetSizeMB != 1024 {
-			t.Errorf("TargetSizeMB = %d, want 1024", manager.TargetSizeMB)
+		// An in-range value is honored verbatim.
+		if manager.MaxFilesPerBatch != 12 {
+			t.Errorf("MaxFilesPerBatch = %d, want 12", manager.MaxFilesPerBatch)
 		}
 		if manager.MaxConcurrent != 4 {
 			t.Errorf("MaxConcurrent = %d, want 4", manager.MaxConcurrent)

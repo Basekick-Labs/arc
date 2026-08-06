@@ -1034,3 +1034,52 @@ func TestLoad_StorageValuesTrimmed(t *testing.T) {
 		t.Errorf("Cold.S3Bucket = %q, want trimmed %q (pointer mutation must persist)", cfg.TieredStorage.Cold.S3Bucket, "cold-bucket")
 	}
 }
+
+func TestLoad_CompactionMaxFilesPerBatch(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		tmpDir, err := os.MkdirTemp("", "arc-config-test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.RemoveAll(tmpDir)
+
+		oldWd, _ := os.Getwd()
+		os.Chdir(tmpDir)
+		defer os.Chdir(oldWd)
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+
+		if cfg.Compaction.MaxFilesPerBatch != 30 {
+			t.Errorf("Compaction.MaxFilesPerBatch = %d, want 30 (default)", cfg.Compaction.MaxFilesPerBatch)
+		}
+	})
+
+	t.Run("env override", func(t *testing.T) {
+		tmpDir, err := os.MkdirTemp("", "arc-config-test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.RemoveAll(tmpDir)
+
+		oldWd, _ := os.Getwd()
+		os.Chdir(tmpDir)
+		defer os.Chdir(oldWd)
+
+		// The edge/constrained-link case: smaller batches produce smaller,
+		// independently-transferable compacted outputs.
+		os.Setenv("ARC_COMPACTION_MAX_FILES_PER_BATCH", "5")
+		defer os.Unsetenv("ARC_COMPACTION_MAX_FILES_PER_BATCH")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+
+		if cfg.Compaction.MaxFilesPerBatch != 5 {
+			t.Errorf("Compaction.MaxFilesPerBatch = %d, want 5 (from env)", cfg.Compaction.MaxFilesPerBatch)
+		}
+	})
+}
