@@ -22,7 +22,6 @@ type HourlyTierConfig struct {
 	StorageBackend storage.Backend
 	MinAgeHours    int  // Don't compact partitions younger than this (default: 1)
 	MinFiles       int  // Only compact partitions with at least this many files (default: 10)
-	TargetSizeMB   int  // Target size for compacted files (default: 512)
 	Enabled        bool // Enable hourly compaction (default: true)
 	Logger         zerolog.Logger
 }
@@ -41,18 +40,11 @@ func NewHourlyTier(cfg *HourlyTierConfig) *HourlyTier {
 		// Below this threshold compaction overhead outweighs the read-time savings.
 		cfg.MinFiles = 10
 	}
-	if cfg.TargetSizeMB == 0 {
-		// 512 MB: balances DuckDB read performance (prefers fewer, larger files)
-		// with memory usage during compaction.
-		cfg.TargetSizeMB = 512
-	}
-
 	tier := &HourlyTier{
 		BaseTier: NewBaseTier(&BaseTierConfig{
 			StorageBackend: cfg.StorageBackend,
 			MinAgeHours:    cfg.MinAgeHours,
 			MinFiles:       cfg.MinFiles,
-			TargetSizeMB:   cfg.TargetSizeMB,
 			Enabled:        cfg.Enabled,
 			Logger:         cfg.Logger.With().Str("tier", "hourly").Logger(),
 		}),
@@ -67,7 +59,6 @@ func NewHourlyTier(cfg *HourlyTierConfig) *HourlyTier {
 	tier.Logger.Info().
 		Int("min_age_hours", cfg.MinAgeHours).
 		Int("min_files", cfg.MinFiles).
-		Int("target_size_mb", cfg.TargetSizeMB).
 		Bool("enabled", cfg.Enabled).
 		Msg("Hourly compaction tier initialized")
 

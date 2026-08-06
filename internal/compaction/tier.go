@@ -9,11 +9,51 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// MaxFilesPerBatch is the maximum number of files to process in a single compaction job.
-// DuckDB can segfault/abort when processing too many files in a single read_parquet() call.
-// This limit prevents OOM and crashes on partitions with many large files.
-// With 1M buffer size, files are ~10-14MB each, so 30 files ≈ 300-420MB per batch.
-const MaxFilesPerBatch = 30
+// Batch-size bounds for a single compaction job.
+//
+// DuckDB can segfault/abort when a single read_parquet() call spans too many
+// files, so compaction splits large partitions into batches. Each batch becomes
+// an independent job with its own output file, upload, and manifest entry.
+//
+// Output size scales with INPUT file size, which in turn tracks the ingest
+// buffer settings — this is a file-count bound, not a byte bound, so the size
+// of a compacted file is not directly controlled here. Deployments on
+// constrained or intermittent links (edge/field) may lower
+// compaction.max_files_per_batch to get smaller, independently-transferable
+// outputs, at the cost of more compaction jobs per partition.
+const (
+	// DefaultMaxFilesPerBatch is the default and the fallback used when the
+	// configured value is out of range.
+	DefaultMaxFilesPerBatch = 30
+
+	// MinFilesPerBatch is the smallest usable batch size. It matches the
+	// minBatchSize floor in compactFilesAdaptively: a batch below this size is
+	// rejected there outright, so allowing it here would fail every batch of
+	// every partition rather than merely producing small outputs.
+	MinFilesPerBatch = 2
+
+	// MaxAllowedFilesPerBatch caps the configured value. The whole point of
+	// batching is to keep read_parquet() below DuckDB's crash threshold, and
+	// the adaptive retry in compactFilesAdaptively only halves four times —
+	// not enough to rescue an arbitrarily large value.
+	MaxAllowedFilesPerBatch = 500
+)
+
+// clampFilesPerBatch coerces a configured batch size into the supported range.
+// Out-of-range low values (including 0 and the fatal 1) fall back to the
+// default; excessive values are capped. Returns the effective size and whether
+// the input was adjusted, so callers can log the correction once at startup
+// rather than on every partition.
+func clampFilesPerBatch(n int) (int, bool) {
+	switch {
+	case n < MinFilesPerBatch:
+		return DefaultMaxFilesPerBatch, true
+	case n > MaxAllowedFilesPerBatch:
+		return MaxAllowedFilesPerBatch, true
+	default:
+		return n, false
+	}
+}
 
 // Candidate represents a partition candidate for compaction
 type Candidate struct {
@@ -24,32 +64,68 @@ type Candidate struct {
 	FileCount     int
 	Tier          string
 	PartitionTime time.Time
-	BatchNumber   int // Batch number when candidate is split (0 = not batched or first batch)
-	TotalBatches  int // Total number of batches for this partition (0 = not batched)
+	// BatchNumber and TotalBatches are 1-based and always set by
+	// SplitCandidateIntoBatches, including for a partition that fits in a
+	// single batch (1 of 1). Job and output-file identifiers incorporate
+	// BatchNumber to keep sibling batches of one partition distinct, so a zero
+	// value here would collide with batch 1. A Candidate constructed directly
+	// (not via SplitCandidateIntoBatches) leaves these at 0.
+	BatchNumber  int // 1-based batch index within the partition
+	TotalBatches int // Total number of batches for this partition
 }
 
 // SplitCandidateIntoBatches splits a candidate with many files into multiple candidates,
-// each with at most MaxFilesPerBatch files. This prevents DuckDB segfaults when processing
+// each with at most maxFilesPerBatch files. This prevents DuckDB segfaults when processing
 // thousands of files in a single read_parquet() call.
+//
+// maxFilesPerBatch is clamped to [MinFilesPerBatch, MaxAllowedFilesPerBatch];
+// out-of-range values fall back to DefaultMaxFilesPerBatch (see
+// clampFilesPerBatch). Clamping happens here as well as at startup so a caller
+// that bypasses the configured manager value cannot produce a zero divisor or a
+// batch size that compactFilesAdaptively would reject outright.
 //
 // Every returned batch owns an independent Files backing array, including the
 // single-batch case. Callers may mutate a batch's Files without affecting the
 // input candidate or any sibling batch.
-func SplitCandidateIntoBatches(c Candidate) []Candidate {
-	if len(c.Files) <= MaxFilesPerBatch {
+func SplitCandidateIntoBatches(c Candidate, maxFilesPerBatch int) []Candidate {
+	maxFilesPerBatch, _ = clampFilesPerBatch(maxFilesPerBatch)
+
+	if len(c.Files) <= maxFilesPerBatch {
 		single := c
 		single.Files = append([]string(nil), c.Files...)
+		// A partition that fits in one batch is still batch 1 of 1 — callers
+		// derive job and output identifiers from these fields, so leaving them
+		// zero here would make the single-batch case indistinguishable from an
+		// unbatched candidate.
+		single.BatchNumber = 1
+		single.TotalBatches = 1
 		return []Candidate{single}
 	}
 
 	// Calculate number of batches needed
-	numBatches := (len(c.Files) + MaxFilesPerBatch - 1) / MaxFilesPerBatch
+	numBatches := (len(c.Files) + maxFilesPerBatch - 1) / maxFilesPerBatch
+
+	// A trailing remainder smaller than MinFilesPerBatch cannot be compacted:
+	// compactFilesAdaptively rejects any batch below that floor on its first
+	// attempt, so the remainder would fail every cycle and its files would
+	// never compact. Drop the last batch and let the loop's end-clamp fold
+	// those files into the (now final) batch instead, which overshoots
+	// maxFilesPerBatch by at most MinFilesPerBatch-1 files — far safer than
+	// leaving a partition permanently un-compacted at the tail.
+	if rem := len(c.Files) % maxFilesPerBatch; rem != 0 && rem < MinFilesPerBatch && numBatches > 1 {
+		numBatches--
+	}
 
 	batches := make([]Candidate, 0, numBatches)
 	for i := 0; i < numBatches; i++ {
-		start := i * MaxFilesPerBatch
-		end := start + MaxFilesPerBatch
-		if end > len(c.Files) {
+		start := i * maxFilesPerBatch
+		end := start + maxFilesPerBatch
+		// The final batch absorbs every remaining file, so it spans its nominal
+		// maxFilesPerBatch plus any remainder left by the adjustment above. A
+		// non-final batch always ends within bounds — numBatches is derived
+		// from len(Files), so only the last iteration can reach past it — which
+		// is why this clamp keys off the index rather than comparing to length.
+		if i == numBatches-1 {
 			end = len(c.Files)
 		}
 
@@ -102,7 +178,6 @@ type BaseTier struct {
 	StorageBackend storage.Backend
 	MinAgeHours    int
 	MinFiles       int
-	TargetSizeMB   int
 	Enabled        bool
 
 	// Metrics
@@ -119,7 +194,6 @@ type BaseTierConfig struct {
 	StorageBackend storage.Backend
 	MinAgeHours    int
 	MinFiles       int
-	TargetSizeMB   int
 	Enabled        bool
 	Logger         zerolog.Logger
 }
@@ -130,7 +204,6 @@ func NewBaseTier(cfg *BaseTierConfig) *BaseTier {
 		StorageBackend: cfg.StorageBackend,
 		MinAgeHours:    cfg.MinAgeHours,
 		MinFiles:       cfg.MinFiles,
-		TargetSizeMB:   cfg.TargetSizeMB,
 		Enabled:        cfg.Enabled,
 		Logger:         cfg.Logger,
 	}
@@ -151,7 +224,6 @@ func (t *BaseTier) GetBaseStats(tierName string) map[string]interface{} {
 		"enabled":               t.Enabled,
 		"min_age_hours":         t.MinAgeHours,
 		"min_files":             t.MinFiles,
-		"target_size_mb":        t.TargetSizeMB,
 		"total_compactions":     t.totalCompactions,
 		"total_files_compacted": t.totalFilesCompacted,
 		"total_bytes_saved":     t.totalBytesSaved,

@@ -30,10 +30,14 @@ type SubprocessJobConfig struct {
 	PartitionPath string   `json:"partition_path"`
 	Files         []string `json:"files"`
 	Tier          string   `json:"tier"`
-	TargetSizeMB  int      `json:"target_size_mb"`
 	TempDirectory string   `json:"temp_directory"`
-	SortKeys      []string `json:"sort_keys"`    // Sort keys for ORDER BY in compaction
-	MemoryLimit   string   `json:"memory_limit"` // DuckDB memory limit (e.g., "8GB")
+	// BatchNumber is the 1-based index of this batch within its partition.
+	// Carried through so the subprocess can disambiguate the output filename
+	// between sibling batches (see Job.compactFiles). Zero means the job was
+	// not produced by SplitCandidateIntoBatches.
+	BatchNumber int      `json:"batch_number,omitempty"`
+	SortKeys    []string `json:"sort_keys"`    // Sort keys for ORDER BY in compaction
+	MemoryLimit string   `json:"memory_limit"` // DuckDB memory limit (e.g., "8GB")
 
 	// Storage configuration
 	StorageType   string `json:"storage_type"`   // "local" or "s3"
@@ -124,8 +128,8 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 		PartitionPath:   config.PartitionPath,
 		Files:           config.Files,
 		StorageBackend:  backend,
-		TargetSizeMB:    config.TargetSizeMB,
 		Tier:            config.Tier,
+		BatchNumber:     config.BatchNumber,
 		TempDirectory:   config.TempDirectory,
 		SortKeys:        config.SortKeys,
 		Logger:          logger,

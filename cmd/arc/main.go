@@ -1136,11 +1136,12 @@ func main() {
 		// Create compaction manager (discovers all databases dynamically)
 		// Compaction jobs run in subprocesses for memory isolation
 		compactionManager = compaction.NewManager(&compaction.ManagerConfig{
-			StorageBackend: storageBackend,
-			LockManager:    lockManager,
-			MaxConcurrent:  cfg.Compaction.MaxConcurrent,
-			MemoryLimit:    cfg.Database.MemoryLimit, // Use same limit as main DuckDB
-			CompletionDir:  completionDir,            // Phase 4: empty in OSS, set in cluster mode
+			StorageBackend:   storageBackend,
+			LockManager:      lockManager,
+			MaxConcurrent:    cfg.Compaction.MaxConcurrent,
+			MaxFilesPerBatch: cfg.Compaction.MaxFilesPerBatch,
+			MemoryLimit:      cfg.Database.MemoryLimit, // Use same limit as main DuckDB
+			CompletionDir:    completionDir,            // Phase 4: empty in OSS, set in cluster mode
 			// Pass the SAME absolute-resolved value the DB-layer sandbox
 			// allowlist references — dbConfig.CompactionTempDirectory has
 			// already been through resolveAbsPath. Using the raw
