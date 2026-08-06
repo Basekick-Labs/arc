@@ -62,6 +62,16 @@ This is a **file-count** bound, not a byte bound — compacted output size track
 
 Out-of-range values fall back to the default with a startup warning rather than failing. **`1` is not usable** and is treated as out of range: compaction's adaptive retry rejects any batch below two files, so a batch size of one would fail every batch of every partition.
 
+## Groundwork: edge-to-cloud sync (not yet usable)
+
+Arc runs at the edge today — a standalone binary with local storage in a vehicle, a factory cell, or a forward deployment — with no first-class way to ship that data to a central Arc. Backup is a full DR snapshot rather than incremental sync, and Parquet import re-ingests rows through the write path, which breaks the end-to-end checksum and double-counts on retry.
+
+**Edge sync** ([#569](https://github.com/Basekick-Labs/arc/issues/569)) addresses this by shipping immutable Parquet *files* from a spoke (edge) to a hub (central Arc): the spoke initiates, the hub verifies each file's SHA256 before committing it, and re-delivery of an already-received file is a no-op. Connectivity is treated as the exception rather than the norm — discovery is a single batched round-trip regardless of backlog size, and transfers resume from a byte offset when a link drops mid-file.
+
+**Nothing is user-visible in this release, on disk or otherwise.** The work is landing as a sequence of reviewed changes, and this release contains only the first: the spoke-side ledger that tracks which files have reached which hub. No configuration key enables it, no endpoint exposes it, and no startup path constructs it — so its SQLite schema is not even created yet. It is recorded here so the release history matches the work, not because there is anything to use or configure.
+
+Manual export/import will be OSS when it ships; the automatic scheduled agent will be an Enterprise feature.
+
 ## Security hardening
 
 ### Strip client-controlled forwarding headers at the inter-node boundary (CVE-2026-45045 class)
@@ -343,6 +353,7 @@ The forwarding-header and loop-guard changes are cluster-only; the partition-pru
 2. **No API or on-disk format changes.** Reads, queries, and storage layout are untouched. Queries with a start date earlier than `1970-01-01` are pruned from the epoch forward; since Arc stores no pre-epoch data, results are unchanged.
 3. **Clustered operators:** if any external tooling deliberately sets `X-Arc-Forwarded-By`, `X-Real-IP`, or `X-Forwarded-*` headers on requests to Arc and expects them to survive an inter-node forward, note that these are now stripped on the forwarding hop and re-established by Arc. Client IP has never been derived from these headers, so log/audit attribution is unchanged.
 4. **Active licenses keep working.** No re-activation required.
+5. **Nothing changes on disk or in the database.** The edge-sync groundwork above defines two SQLite tables (`sync_ledger`, `sync_history`), but no startup path constructs the ledger, so the schema is never created and the tables do not appear in `auth.db_path`. They will be created by the release that first wires edge sync into the server.
 
 ## Dependencies
 
