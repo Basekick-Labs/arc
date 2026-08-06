@@ -1,4 +1,4 @@
-// Package sync implements edge-to-cloud replication: a spoke (an Arc instance
+// Package edgesync implements edge-to-cloud replication: a spoke (an Arc instance
 // at the edge) ships its immutable Parquet files to a hub (a central Arc).
 //
 // The unit of sync is the FILE, not the row. Arc already produces immutable
@@ -11,7 +11,7 @@
 // state, and knows nothing about transports, HTTP, or hubs beyond their ID.
 //
 // See docs/progress/2026-06-04-edge-sync-architecture-converged.md.
-package sync
+package edgesync
 
 import (
 	"context"
@@ -63,7 +63,7 @@ const (
 const DefaultHubID = "default"
 
 // ErrNotFound is returned when a ledger lookup matches no row.
-var ErrNotFound = errors.New("sync: ledger entry not found")
+var ErrNotFound = errors.New("edgesync: ledger entry not found")
 
 // ErrInvalidTransition is returned when a state change is attempted from a
 // state that does not permit it — e.g. marking a terminally failed entry
@@ -72,7 +72,7 @@ var ErrNotFound = errors.New("sync: ledger entry not found")
 // The ledger enforces these rather than trusting callers because §6.2's
 // exactly-once-effect property depends on `synced` being reached only via a
 // hub acknowledgment and never being silently walked back.
-var ErrInvalidTransition = errors.New("sync: invalid state transition")
+var ErrInvalidTransition = errors.New("edgesync: invalid state transition")
 
 // LedgerEntry is one file's sync state with respect to one hub.
 type LedgerEntry struct {
@@ -115,7 +115,7 @@ type Ledger struct {
 // NewLedger creates the ledger and initializes its schema.
 func NewLedger(db *sql.DB, logger zerolog.Logger) (*Ledger, error) {
 	if db == nil {
-		return nil, errors.New("sync: ledger requires a non-nil database")
+		return nil, errors.New("edgesync: ledger requires a non-nil database")
 	}
 
 	l := &Ledger{
@@ -124,7 +124,7 @@ func NewLedger(db *sql.DB, logger zerolog.Logger) (*Ledger, error) {
 	}
 
 	if err := l.initSchema(); err != nil {
-		return nil, fmt.Errorf("sync: initialize ledger schema: %w", err)
+		return nil, fmt.Errorf("edgesync: initialize ledger schema: %w", err)
 	}
 
 	return l, nil
@@ -243,7 +243,7 @@ func (l *Ledger) Track(ctx context.Context, e *LedgerEntry) error {
 		hubID, e.Path, e.SHA256, e.SizeBytes, e.Database, e.Measurement,
 		e.PartitionTime.UTC(), discoveredAt, string(StatePending))
 	if err != nil {
-		return fmt.Errorf("sync: track %q: %w", e.Path, err)
+		return fmt.Errorf("edgesync: track %q: %w", e.Path, err)
 	}
 	return nil
 }
@@ -260,7 +260,7 @@ func (l *Ledger) TrackBatch(ctx context.Context, entries []*LedgerEntry) (int, e
 
 	tx, err := l.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("sync: begin track batch: %w", err)
+		return 0, fmt.Errorf("edgesync: begin track batch: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }() // no-op after a successful Commit
 
@@ -271,7 +271,7 @@ func (l *Ledger) TrackBatch(ctx context.Context, entries []*LedgerEntry) (int, e
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(hub_id, path) DO NOTHING`)
 	if err != nil {
-		return 0, fmt.Errorf("sync: prepare track batch: %w", err)
+		return 0, fmt.Errorf("edgesync: prepare track batch: %w", err)
 	}
 	defer stmt.Close()
 
@@ -299,7 +299,7 @@ func (l *Ledger) TrackBatch(ctx context.Context, entries []*LedgerEntry) (int, e
 			hubID, e.Path, e.SHA256, e.SizeBytes, e.Database, e.Measurement,
 			e.PartitionTime.UTC(), discoveredAt, string(StatePending))
 		if err != nil {
-			return 0, fmt.Errorf("sync: track %q in batch: %w", e.Path, err)
+			return 0, fmt.Errorf("edgesync: track %q in batch: %w", e.Path, err)
 		}
 		// RowsAffected is 0 for a conflict that hit DO NOTHING, so this counts
 		// genuinely new entries rather than rows considered.
@@ -309,7 +309,7 @@ func (l *Ledger) TrackBatch(ctx context.Context, entries []*LedgerEntry) (int, e
 	}
 
 	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("sync: commit track batch: %w", err)
+		return 0, fmt.Errorf("edgesync: commit track batch: %w", err)
 	}
 	return inserted, nil
 }
@@ -342,7 +342,7 @@ func (l *Ledger) Pending(ctx context.Context, hubID string, limit int) ([]*Ledge
 
 	rows, err := l.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("sync: query pending: %w", err)
+		return nil, fmt.Errorf("edgesync: query pending: %w", err)
 	}
 	defer rows.Close()
 
@@ -355,7 +355,7 @@ func (l *Ledger) Pending(ctx context.Context, hubID string, limit int) ([]*Ledge
 		out = append(out, e)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("sync: iterate pending: %w", err)
+		return nil, fmt.Errorf("edgesync: iterate pending: %w", err)
 	}
 	return out, nil
 }
@@ -376,7 +376,7 @@ func (l *Ledger) MarkInFlight(ctx context.Context, hubID, path string) error {
 		WHERE hub_id = ? AND path = ? AND state = ?`,
 		string(StateInFlight), time.Now().UTC(), hubID, path, string(StatePending))
 	if err != nil {
-		return fmt.Errorf("sync: mark in-flight %q: %w", path, err)
+		return fmt.Errorf("edgesync: mark in-flight %q: %w", path, err)
 	}
 	return l.checkTransition(ctx, res, hubID, path, StatePending)
 }
@@ -390,7 +390,7 @@ func (l *Ledger) RecordProgress(ctx context.Context, hubID, path string, bytesSe
 		hubID = DefaultHubID
 	}
 	if bytesSent < 0 {
-		return fmt.Errorf("sync: negative progress %d for %q", bytesSent, path)
+		return fmt.Errorf("edgesync: negative progress %d for %q", bytesSent, path)
 	}
 
 	// Clamped to size_bytes in SQL. An offset larger than the file would make
@@ -403,7 +403,7 @@ func (l *Ledger) RecordProgress(ctx context.Context, hubID, path string, bytesSe
 		WHERE hub_id = ? AND path = ? AND state = ?`,
 		bytesSent, hubID, path, string(StateInFlight))
 	if err != nil {
-		return fmt.Errorf("sync: record progress %q: %w", path, err)
+		return fmt.Errorf("edgesync: record progress %q: %w", path, err)
 	}
 	return l.checkTransition(ctx, res, hubID, path, StateInFlight)
 }
@@ -434,7 +434,7 @@ func (l *Ledger) MarkSynced(ctx context.Context, hubID, path string) error {
 		string(StateSynced), time.Now().UTC(), hubID, path,
 		string(StatePending), string(StateInFlight))
 	if err != nil {
-		return fmt.Errorf("sync: mark synced %q: %w", path, err)
+		return fmt.Errorf("edgesync: mark synced %q: %w", path, err)
 	}
 	return l.checkTransition(ctx, res, hubID, path, StatePending, StateInFlight)
 }
@@ -451,7 +451,7 @@ func (l *Ledger) MarkFailed(ctx context.Context, hubID, path, errMsg string, max
 		hubID = DefaultHubID
 	}
 	if maxAttempts <= 0 {
-		return fmt.Errorf("sync: mark failed %q: maxAttempts must be >= 1, got %d", path, maxAttempts)
+		return fmt.Errorf("edgesync: mark failed %q: maxAttempts must be >= 1, got %d", path, maxAttempts)
 	}
 
 	// The cap decision is made INSIDE the UPDATE rather than by reading
@@ -469,7 +469,7 @@ func (l *Ledger) MarkFailed(ctx context.Context, hubID, path, errMsg string, max
 		maxAttempts, string(StateFailed), string(StatePending),
 		errMsg, hubID, path, string(StateInFlight))
 	if err != nil {
-		return fmt.Errorf("sync: mark failed %q: %w", path, err)
+		return fmt.Errorf("edgesync: mark failed %q: %w", path, err)
 	}
 	return l.checkTransition(ctx, res, hubID, path, StateInFlight)
 }
@@ -485,12 +485,12 @@ func (l *Ledger) RecoverInFlight(ctx context.Context) (int64, error) {
 		`UPDATE sync_ledger SET state = ? WHERE state = ?`,
 		string(StatePending), string(StateInFlight))
 	if err != nil {
-		return 0, fmt.Errorf("sync: recover in-flight entries: %w", err)
+		return 0, fmt.Errorf("edgesync: recover in-flight entries: %w", err)
 	}
 
 	n, err := res.RowsAffected()
 	if err != nil {
-		return 0, fmt.Errorf("sync: count recovered entries: %w", err)
+		return 0, fmt.Errorf("edgesync: count recovered entries: %w", err)
 	}
 	if n > 0 {
 		l.logger.Info().
@@ -530,7 +530,7 @@ func (l *Ledger) Stats(ctx context.Context, hubID string) (*Stats, error) {
 		FROM sync_ledger WHERE hub_id = ?`, hubID).
 		Scan(&s.Pending, &s.InFlight, &s.Synced, &s.Failed, &s.PendingBytes)
 	if err != nil {
-		return nil, fmt.Errorf("sync: ledger stats: %w", err)
+		return nil, fmt.Errorf("edgesync: ledger stats: %w", err)
 	}
 
 	// The newest synced_at is fetched by ORDER BY ... LIMIT 1 rather than
@@ -550,7 +550,7 @@ func (l *Ledger) Stats(ctx context.Context, hubID string) (*Stats, error) {
 		WHERE state = ? AND synced_at IS NOT NULL AND hub_id = ?
 		ORDER BY synced_at DESC LIMIT 1`, string(StateSynced), hubID).Scan(&lastSynced)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("sync: ledger last-synced: %w", err)
+		return nil, fmt.Errorf("edgesync: ledger last-synced: %w", err)
 	}
 	if lastSynced.Valid {
 		t := lastSynced.Time.UTC()
@@ -615,7 +615,7 @@ func (l *Ledger) PruneSynced(ctx context.Context, retentionDays int) (int64, err
 		WHERE state = ? AND synced_at IS NOT NULL AND synced_at < ?`,
 		string(StateSynced), cutoff).Scan(&maxID)
 	if err != nil {
-		return 0, fmt.Errorf("sync: find prune cutoff: %w", err)
+		return 0, fmt.Errorf("edgesync: find prune cutoff: %w", err)
 	}
 	if maxID == 0 {
 		return 0, nil
@@ -643,12 +643,12 @@ func (l *Ledger) PruneSynced(ctx context.Context, retentionDays int) (int64, err
 				ORDER BY id ASC LIMIT ?
 			)`, maxID, string(StateSynced), cutoff, batchSize)
 		if err != nil {
-			return total, fmt.Errorf("sync: prune synced entries: %w", err)
+			return total, fmt.Errorf("edgesync: prune synced entries: %w", err)
 		}
 
 		deleted, err := res.RowsAffected()
 		if err != nil {
-			return total, fmt.Errorf("sync: count pruned entries: %w", err)
+			return total, fmt.Errorf("edgesync: count pruned entries: %w", err)
 		}
 		total += deleted
 
@@ -681,7 +681,7 @@ func scanEntry(s rowScanner) (*LedgerEntry, error) {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, err // caller maps to ErrNotFound
 		}
-		return nil, fmt.Errorf("sync: scan ledger entry: %w", err)
+		return nil, fmt.Errorf("edgesync: scan ledger entry: %w", err)
 	}
 
 	e.State = SyncState(state)
@@ -704,10 +704,10 @@ func scanEntry(s rowScanner) (*LedgerEntry, error) {
 func checkAffected(res sql.Result, path string) error {
 	n, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("sync: rows affected for %q: %w", path, err)
+		return fmt.Errorf("edgesync: rows affected for %q: %w", path, err)
 	}
 	if n == 0 {
-		return fmt.Errorf("sync: %q: %w", path, ErrNotFound)
+		return fmt.Errorf("edgesync: %q: %w", path, ErrNotFound)
 	}
 	return nil
 }
@@ -720,7 +720,7 @@ func checkAffected(res sql.Result, path string) error {
 func (l *Ledger) checkTransition(ctx context.Context, res sql.Result, hubID, path string, from ...SyncState) error {
 	n, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("sync: rows affected for %q: %w", path, err)
+		return fmt.Errorf("edgesync: rows affected for %q: %w", path, err)
 	}
 	if n > 0 {
 		return nil
@@ -730,11 +730,11 @@ func (l *Ledger) checkTransition(ctx context.Context, res sql.Result, hubID, pat
 	err = l.db.QueryRowContext(ctx,
 		`SELECT state FROM sync_ledger WHERE hub_id = ? AND path = ?`, hubID, path).Scan(&current)
 	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("sync: %q: %w", path, ErrNotFound)
+		return fmt.Errorf("edgesync: %q: %w", path, ErrNotFound)
 	}
 	if err != nil {
-		return fmt.Errorf("sync: read state for %q: %w", path, err)
+		return fmt.Errorf("edgesync: read state for %q: %w", path, err)
 	}
-	return fmt.Errorf("sync: %q: %w: state is %q, expected one of %v",
+	return fmt.Errorf("edgesync: %q: %w: state is %q, expected one of %v",
 		path, ErrInvalidTransition, current, from)
 }

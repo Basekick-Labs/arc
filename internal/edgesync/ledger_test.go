@@ -1,15 +1,14 @@
-package sync
+package edgesync
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
-	stdsync "sync"
+	"sync"
 	"testing"
 	"time"
-
-	"database/sql"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
@@ -664,7 +663,7 @@ func TestLedger_MarkFailedCapHoldsUnderConcurrency(t *testing.T) {
 			t.Fatalf("round %d in-flight: %v", round, err)
 		}
 
-		var wg stdsync.WaitGroup
+		var wg sync.WaitGroup
 		for i := 0; i < 4; i++ {
 			wg.Add(1)
 			go func() {
