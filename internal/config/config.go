@@ -204,6 +204,15 @@ type EdgeSyncConfig struct {
 	// Default 512MiB, comfortably above a compacted Parquet file
 	// (compaction.max_files_per_batch keeps those well below it).
 	MaxFileBytes int64
+
+	// MaxReconcileEntries caps one batch-discovery request.
+	//
+	// The design wants a spoke's whole pending set in one round-trip, but the
+	// request body is buffered before authentication (see MaxFileBytes), so an
+	// unbounded batch is a pre-auth memory claim. Capping and letting the
+	// spoke page keeps what matters — discovery costs O(batches), not
+	// O(files) — while bounding the exposure. Default 10,000 entries (~2MB).
+	MaxReconcileEntries int
 }
 
 type WALConfig struct {
@@ -644,9 +653,10 @@ func Load() (*Config, error) {
 			ForceBootstrap: v.GetBool("auth.force_bootstrap"),
 		},
 		EdgeSync: EdgeSyncConfig{
-			Enabled:      v.GetBool("edge_sync.enabled"),
-			HubID:        v.GetString("edge_sync.hub_id"),
-			MaxFileBytes: int64(v.GetInt64("edge_sync.max_file_bytes")),
+			Enabled:             v.GetBool("edge_sync.enabled"),
+			HubID:               v.GetString("edge_sync.hub_id"),
+			MaxFileBytes:        int64(v.GetInt64("edge_sync.max_file_bytes")),
+			MaxReconcileEntries: v.GetInt("edge_sync.max_reconcile_entries"),
 		},
 		Compaction: CompactionConfig{
 			Enabled:                     v.GetBool("compaction.enabled"),
@@ -1003,6 +1013,19 @@ func Load() (*Config, error) {
 		if len(cfg.EdgeSync.HubID) > 128 {
 			return nil, fmt.Errorf("edge_sync.hub_id is %d bytes; the maximum is 128", len(cfg.EdgeSync.HubID))
 		}
+		if cfg.EdgeSync.MaxReconcileEntries <= 0 {
+			return nil, fmt.Errorf("edge_sync.max_reconcile_entries must be > 0 (got %d)", cfg.EdgeSync.MaxReconcileEntries)
+		}
+		// An upper bound matters as much as the lower one: this cap is what
+		// bounds a pre-authentication memory claim, so a value large enough to
+		// make it meaningless defeats its only purpose. 1,000,000 entries is
+		// already ~190MB of body at a realistic entry size.
+		const maxReconcileEntriesCeiling = 1_000_000
+		if cfg.EdgeSync.MaxReconcileEntries > maxReconcileEntriesCeiling {
+			return nil, fmt.Errorf("edge_sync.max_reconcile_entries is %d; the maximum is %d "+
+				"(the cap exists to bound a pre-auth memory claim, so an unbounded value defeats it)",
+				cfg.EdgeSync.MaxReconcileEntries, maxReconcileEntriesCeiling)
+		}
 		if cfg.EdgeSync.MaxFileBytes <= 0 {
 			return nil, fmt.Errorf("edge_sync.max_file_bytes must be > 0 (got %d)", cfg.EdgeSync.MaxFileBytes)
 		}
@@ -1095,6 +1118,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("edge_sync.enabled", false)
 	v.SetDefault("edge_sync.hub_id", "")
 	v.SetDefault("edge_sync.max_file_bytes", 512*1024*1024) // 512MiB per upload
+	v.SetDefault("edge_sync.max_reconcile_entries", 10000)  // ~2MB per discovery batch
 
 	v.SetDefault("compaction.enabled", true)
 	v.SetDefault("compaction.hourly_schedule", "5 * * * *")        // Every hour at :05

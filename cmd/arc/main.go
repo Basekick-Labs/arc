@@ -1968,13 +1968,49 @@ func main() {
 			}
 		}
 
+		// The hub index lives in the shared SQLite DB alongside auth and audit
+		// data. It is what lets reconcile answer without reading parquet
+		// bytes — the Raft manifest only exists in cluster mode, so a
+		// standalone hub would otherwise have to hash every candidate file.
+		//
+		// sharedSQLiteHandle borrows the auth manager's handle when auth is
+		// enabled and opens a dedicated one otherwise, so a hub works with
+		// auth disabled (an OSS deployment behind its own perimeter) without
+		// a second handle on the same file.
+		syncDB, syncOwnsDB, err := sharedSQLiteHandle(authManager, cfg.Auth.DBPath)
+		if err != nil {
+			log.Fatal().Err(err).Str("path", cfg.Auth.DBPath).Msg("Failed to open the edge sync database; refusing to start")
+		}
+		if syncOwnsDB {
+			// Close only a handle this block opened. A borrowed one belongs to
+			// the auth manager, which closes it at PriorityAuth.
+			shutdownCoordinator.RegisterHook("edgesync-db", func(context.Context) error {
+				return syncDB.Close()
+			}, shutdown.PriorityDatabase)
+		}
+
+		hubIndex, err := edgesync.NewHubIndex(syncDB, logger.Get("edgesync"))
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to create edge sync hub index; refusing to start")
+		}
+
 		receiver, err := edgesync.NewReceiver(edgesync.ReceiverConfig{
 			Backend:      storageBackend,
+			Index:        hubIndex,
 			Logger:       logger.Get("edgesync"),
 			RegisterFile: registerFile,
 		})
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to create edge sync receiver; refusing to start")
+		}
+
+		reconciler, err := edgesync.NewReconciler(edgesync.ReconcilerConfig{
+			Index:      hubIndex,
+			Backend:    storageBackend,
+			MaxEntries: cfg.EdgeSync.MaxReconcileEntries,
+		})
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to create edge sync reconciler; refusing to start")
 		}
 
 		// TODO(#569 PR 7): spoke secrets come from the SQLite registry. Until
@@ -1983,6 +2019,7 @@ func main() {
 		// rather than silently accepting unauthenticated writes.
 		syncHandler, err := api.NewEdgeSyncHandler(api.EdgeSyncHandlerConfig{
 			Receiver:     receiver,
+			Reconciler:   reconciler,
 			SpokeSecrets: api.StaticSpokeSecrets(nil),
 			Replay:       security.NewNonceCache(security.HMACTimestampTolerance),
 			HubID:        cfg.EdgeSync.HubID,

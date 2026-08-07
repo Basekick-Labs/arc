@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"strconv"
 	"time"
@@ -32,6 +33,11 @@ const (
 // Parquet file over a constrained link is the expected case, not an anomaly.
 const receiveTimeout = 30 * time.Minute
 
+// reconcileTimeout bounds a discovery request. Much shorter than a transfer:
+// reconcile is a bounded SQLite lookup, so anything slow is a symptom rather
+// than a large file.
+const reconcileTimeout = 2 * time.Minute
+
 // SpokeSecretLookup returns the shared secret registered for a spoke.
 //
 // Per-spoke secrets are the point: revoking one edge must not re-key the
@@ -42,6 +48,7 @@ type SpokeSecretLookup func(ctx context.Context, spokeID string) (secret string,
 // EdgeSyncHandler serves the hub side of edge-to-cloud sync.
 type EdgeSyncHandler struct {
 	receiver     *edgesync.Receiver
+	reconciler   *edgesync.Reconciler
 	lookup       SpokeSecretLookup
 	replay       security.ReplayGuard
 	authManager  *auth.AuthManager
@@ -53,6 +60,10 @@ type EdgeSyncHandler struct {
 // EdgeSyncHandlerConfig configures the handler.
 type EdgeSyncHandlerConfig struct {
 	Receiver *edgesync.Receiver
+
+	// Reconciler answers batch discovery. Required — without it a spoke
+	// returning from a long outage would have to probe file by file.
+	Reconciler *edgesync.Reconciler
 
 	// SpokeSecrets resolves a spoke's shared secret. Required — without it
 	// every request would be unauthenticated.
@@ -83,6 +94,9 @@ func NewEdgeSyncHandler(cfg EdgeSyncHandlerConfig) (*EdgeSyncHandler, error) {
 	if cfg.Receiver == nil {
 		return nil, errors.New("edgesync handler: receiver is required")
 	}
+	if cfg.Reconciler == nil {
+		return nil, errors.New("edgesync handler: reconciler is required")
+	}
 	if cfg.SpokeSecrets == nil {
 		return nil, errors.New("edgesync handler: spoke secret lookup is required")
 	}
@@ -97,6 +111,7 @@ func NewEdgeSyncHandler(cfg EdgeSyncHandlerConfig) (*EdgeSyncHandler, error) {
 	}
 	return &EdgeSyncHandler{
 		receiver:     cfg.Receiver,
+		reconciler:   cfg.Reconciler,
 		lookup:       cfg.SpokeSecrets,
 		replay:       cfg.Replay,
 		authManager:  cfg.AuthManager,
@@ -122,11 +137,30 @@ func NewEdgeSyncHandler(cfg EdgeSyncHandlerConfig) (*EdgeSyncHandler, error) {
 func (h *EdgeSyncHandler) RegisterRoutes(app fiber.Router) {
 	group := app.Group("/api/v1/sync")
 
+	// A route-level body limit, ahead of everything else. The Content-Length
+	// pre-checks below cannot bound a chunked request (there is no declared
+	// length to check), and the body is buffered before routing — so without
+	// this an unauthenticated caller could stream past both caps. Sized to the
+	// larger of the two per-route limits, since one group serves both.
+	bodyLimit := h.maxFileBytes
+	if rb := h.maxReconcileBytes(); rb > bodyLimit {
+		bodyLimit = rb
+	}
+	group.Use(func(c *fiber.Ctx) error {
+		if int64(len(c.Body())) > bodyLimit {
+			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
+				"error": "request body exceeds the edge sync limit",
+			})
+		}
+		return c.Next()
+	})
+
 	if h.authManager != nil {
 		group.Use(auth.RequireAdmin(h.authManager))
 	}
 
 	group.Post("/file", h.receiveFile)
+	group.Post("/reconcile", h.reconcile)
 
 	h.logger.Info().
 		Str("hub_id", h.hubID).
@@ -284,6 +318,142 @@ func (h *EdgeSyncHandler) receiveFile(c *fiber.Ctx) error {
 	}
 
 	return h.writeOutcome(c, res)
+}
+
+// reconcile handles POST /api/v1/sync/reconcile.
+//
+// One round-trip tells a spoke which of its pending files the hub already
+// holds, which is what makes a long disconnection survivable: 5,000 pending
+// files cost one request rather than 5,000.
+func (h *EdgeSyncHandler) reconcile(c *fiber.Ctx) error {
+	// Size check first, before anything reads the body. The body is buffered
+	// before routing (StreamRequestBody=false), so this is the only bound on
+	// what an unauthenticated caller can make the hub hold.
+	if cl := c.Request().Header.ContentLength(); cl > 0 && int64(cl) > h.maxReconcileBytes() {
+		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
+			"error":       "reconcile batch too large",
+			"max_entries": h.reconciler.MaxEntries(),
+		})
+	}
+
+	spokeID := string(append([]byte(nil), c.Request().Header.Peek(headerSpokeID)...))
+	hubID := string(append([]byte(nil), c.Request().Header.Peek(headerHubID)...))
+	nonce := string(append([]byte(nil), c.Request().Header.Peek(headerNonce)...))
+	mac := string(append([]byte(nil), c.Request().Header.Peek(headerMAC)...))
+
+	if spokeID == "" || nonce == "" || mac == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "missing required sync headers",
+		})
+	}
+	if hubID != h.hubID {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "hub ID mismatch"})
+	}
+
+	ts, err := strconv.ParseInt(c.Get(headerTS), 10, 64)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid or missing " + headerTS,
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(c.Context(), reconcileTimeout)
+	defer cancel()
+
+	secret, ok := h.lookup(ctx, spokeID)
+	if !ok {
+		h.logger.Warn().Str("spoke_id", spokeID).Msg("Reconcile rejected: unknown or disabled spoke")
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "authentication failed"})
+	}
+
+	// The MAC binds a digest of the body, so a replayed request cannot
+	// substitute a different path list and use the hub as an oracle for what
+	// data exists. Validated against the RAW bytes, before parsing — hashing a
+	// re-serialized form would compare a different byte sequence.
+	body := c.Body()
+	if err := security.ValidateSyncReconcileHMACWithReplay(
+		h.replay, secret, nonce, spokeID, hubID, body, ts, mac,
+		security.HMACTimestampTolerance,
+	); err != nil {
+		return h.authFailure(c, spokeID, err)
+	}
+
+	var req reconcileRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "malformed reconcile body",
+		})
+	}
+
+	res, err := h.reconciler.Reconcile(ctx, spokeID, req.Entries)
+	if err != nil {
+		if errors.Is(err, edgesync.ErrReconcileTooLarge) {
+			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
+				"error":       err.Error(),
+				"max_entries": h.reconciler.MaxEntries(),
+			})
+		}
+		if errors.Is(err, edgesync.ErrReceiveInternal) {
+			h.logger.Error().Err(err).Str("spoke_id", spokeID).Msg("Reconcile failed for a hub-side reason")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"error":  "hub temporarily unable to reconcile",
+				"reason": "hub_unavailable",
+			})
+		}
+		h.logger.Warn().Err(err).Str("spoke_id", spokeID).Msg("Reconcile rejected an invalid request")
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	// Empty slices rather than null: a spoke iterating the response should not
+	// have to special-case a missing field.
+	return c.Status(fiber.StatusOK).JSON(reconcileResponse{
+		Missing:   orEmpty(res.Missing),
+		Present:   orEmpty(res.Present),
+		Conflicts: orEmptyConflicts(res.Conflicts),
+	})
+}
+
+// maxReconcileBytes bounds the request body from the entry cap.
+//
+// Derived rather than configured separately so the two cannot drift. The
+// figure is measured, not guessed: a minimal legal entry JSON-encodes to 96
+// bytes (a one-character path plus a 64-character digest) and a realistic Arc
+// entry — a full compacted path with a size — to 189. An earlier version used
+// 512, which sounded "generous" but let the byte check admit roughly five
+// times the entry cap, so the only bound applied BEFORE authentication was
+// five times looser than intended.
+//
+// 256 covers a realistic entry with room to spare while keeping the pre-auth
+// bound close to the entry cap. A batch of legitimately long paths that
+// overshoots is still answered correctly — it is refused with a 413 naming the
+// entry limit, which is what a spoke needs to page under.
+func (h *EdgeSyncHandler) maxReconcileBytes() int64 {
+	const bytesPerEntry = 256
+	return int64(h.reconciler.MaxEntries()) * bytesPerEntry
+}
+
+type reconcileRequest struct {
+	Entries []edgesync.ReconcileEntry `json:"entries"`
+}
+
+type reconcileResponse struct {
+	Missing   []string            `json:"missing"`
+	Present   []string            `json:"present"`
+	Conflicts []edgesync.Conflict `json:"conflicts"`
+}
+
+func orEmpty(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
+}
+
+func orEmptyConflicts(c []edgesync.Conflict) []edgesync.Conflict {
+	if c == nil {
+		return []edgesync.Conflict{}
+	}
+	return c
 }
 
 // authFailure reports an authentication problem without leaking which check

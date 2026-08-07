@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -21,6 +22,7 @@ import (
 	"github.com/basekick-labs/arc/internal/edgesync"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
 )
 
@@ -58,13 +60,19 @@ func newSyncTestRig(t *testing.T) *syncTestRig {
 	}
 	t.Cleanup(func() { backend.Close() })
 
-	recv, err := edgesync.NewReceiver(edgesync.ReceiverConfig{Backend: backend, Logger: zerolog.Nop()})
+	idx := newTestAPIHubIndex(t)
+	recv, err := edgesync.NewReceiver(edgesync.ReceiverConfig{Backend: backend, Index: idx, Logger: zerolog.Nop()})
 	if err != nil {
 		t.Fatalf("receiver: %v", err)
+	}
+	rec, err := edgesync.NewReconciler(edgesync.ReconcilerConfig{Index: idx, Backend: backend, MaxEntries: 100})
+	if err != nil {
+		t.Fatalf("reconciler: %v", err)
 	}
 
 	h, err := NewEdgeSyncHandler(EdgeSyncHandlerConfig{
 		Receiver:     recv,
+		Reconciler:   rec,
 		SpokeSecrets: StaticSpokeSecrets(map[string]string{testSpokeID: testSecret}),
 		Replay:       security.NewNonceCache(security.HMACTimestampTolerance),
 		HubID:        testHubID,
@@ -453,6 +461,7 @@ func TestNewEdgeSyncHandler_RequiresSecurityDependencies(t *testing.T) {
 
 	base := EdgeSyncHandlerConfig{
 		Receiver:     recv,
+		Reconciler:   mustReconciler(t),
 		SpokeSecrets: StaticSpokeSecrets(map[string]string{testSpokeID: testSecret}),
 		Replay:       security.NewNonceCache(security.HMACTimestampTolerance),
 		HubID:        testHubID,
@@ -467,6 +476,7 @@ func TestNewEdgeSyncHandler_RequiresSecurityDependencies(t *testing.T) {
 		mutate func(*EdgeSyncHandlerConfig)
 	}{
 		{"no receiver", func(c *EdgeSyncHandlerConfig) { c.Receiver = nil }},
+		{"no reconciler", func(c *EdgeSyncHandlerConfig) { c.Reconciler = nil }},
 		{"no spoke secrets", func(c *EdgeSyncHandlerConfig) { c.SpokeSecrets = nil }},
 		{"no replay guard", func(c *EdgeSyncHandlerConfig) { c.Replay = nil }},
 		{"no hub ID", func(c *EdgeSyncHandlerConfig) { c.HubID = "" }},
@@ -657,8 +667,13 @@ func TestEdgeSyncHandler_HubSideFailureIs503NotBadRequest(t *testing.T) {
 		t.Fatalf("receiver: %v", err)
 	}
 
+	rec2, err := edgesync.NewReconciler(edgesync.ReconcilerConfig{Index: newTestAPIHubIndex(t), Backend: backend, MaxEntries: 100})
+	if err != nil {
+		t.Fatalf("reconciler: %v", err)
+	}
 	h, err := NewEdgeSyncHandler(EdgeSyncHandlerConfig{
 		Receiver:     recv,
+		Reconciler:   rec2,
 		SpokeSecrets: StaticSpokeSecrets(map[string]string{testSpokeID: testSecret}),
 		Replay:       security.NewNonceCache(security.HMACTimestampTolerance),
 		HubID:        testHubID,
@@ -687,5 +702,272 @@ func TestEdgeSyncHandler_HubSideFailureIs503NotBadRequest(t *testing.T) {
 	// The message must not leak hub internals to a spoke.
 	if msg, _ := got["error"].(string); strings.Contains(msg, "raft") {
 		t.Errorf("error message leaks hub internals: %q", msg)
+	}
+}
+
+// newTestAPIHubIndex builds a hub index on a temp SQLite file.
+func newTestAPIHubIndex(t *testing.T) *edgesync.HubIndex {
+	t.Helper()
+	f, err := os.CreateTemp("", "api-hub-index-*.db")
+	if err != nil {
+		t.Fatalf("temp file: %v", err)
+	}
+	f.Close()
+	db, err := sql.Open("sqlite3", f.Name())
+	if err != nil {
+		os.Remove(f.Name())
+		t.Fatalf("open sqlite: %v", err)
+	}
+	idx, err := edgesync.NewHubIndex(db, zerolog.Nop())
+	if err != nil {
+		db.Close()
+		os.Remove(f.Name())
+		t.Fatalf("hub index: %v", err)
+	}
+	t.Cleanup(func() { db.Close(); os.Remove(f.Name()) })
+	return idx
+}
+
+func mustReconciler(t *testing.T) *edgesync.Reconciler {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "api-recon-*")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	b, err := storage.NewLocalBackend(dir, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+	t.Cleanup(func() { b.Close() })
+	r, err := edgesync.NewReconciler(edgesync.ReconcilerConfig{Index: newTestAPIHubIndex(t), Backend: b, MaxEntries: 100})
+	if err != nil {
+		t.Fatalf("reconciler: %v", err)
+	}
+	return r
+}
+
+// reconcileReq builds a signed reconcile request.
+type reconcileReqSpec struct {
+	spokeID, hubID string
+	nonce          string
+	ts             int64
+	body           []byte
+	macOverride    string
+	secret         string
+}
+
+func defaultReconcileReq(entries []edgesync.ReconcileEntry) reconcileReqSpec {
+	nonce, _ := security.GenerateNonce()
+	body, _ := json.Marshal(map[string]any{"entries": entries})
+	return reconcileReqSpec{
+		spokeID: testSpokeID,
+		hubID:   testHubID,
+		nonce:   nonce,
+		ts:      time.Now().Unix(),
+		body:    body,
+		secret:  testSecret,
+	}
+}
+
+func (r reconcileReqSpec) do(t *testing.T, rig *syncTestRig) *http.Response {
+	t.Helper()
+	mac := r.macOverride
+	if mac == "" {
+		var err error
+		mac, err = security.ComputeSyncReconcileHMAC(r.secret, r.nonce, r.spokeID, r.hubID, r.body, r.ts)
+		if err != nil {
+			t.Fatalf("compute MAC: %v", err)
+		}
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sync/reconcile", bytes.NewReader(r.body))
+	req.Header.Set(headerSpokeID, r.spokeID)
+	req.Header.Set(headerHubID, r.hubID)
+	req.Header.Set(headerNonce, r.nonce)
+	req.Header.Set(headerTS, strconv.FormatInt(r.ts, 10))
+	req.Header.Set(headerMAC, mac)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := rig.app.Test(req, 10_000)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	return resp
+}
+
+func TestEdgeSyncHandler_ReconcileRoundTrip(t *testing.T) {
+	rig := newSyncTestRig(t)
+
+	// Upload one file so the hub has something to report as present.
+	body := []byte("parquet payload")
+	if resp := defaultReq(body).do(t, rig); resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("seed upload: status %d", resp.StatusCode)
+	}
+
+	entries := []edgesync.ReconcileEntry{
+		{Path: testSyncPth, SHA256: testDigest(body)},
+		{Path: "metrics/cpu/2026/08/07/14/never_sent.parquet", SHA256: testDigest([]byte("other"))},
+	}
+	resp := defaultReconcileReq(entries).do(t, rig)
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%v", resp.StatusCode, decodeBody(t, resp))
+	}
+
+	got := decodeBody(t, resp)
+	present, _ := got["present"].([]any)
+	missing, _ := got["missing"].([]any)
+	if len(present) != 1 || present[0] != testSyncPth {
+		t.Errorf("present = %v, want the uploaded file", present)
+	}
+	if len(missing) != 1 {
+		t.Errorf("missing = %v, want the file never sent", missing)
+	}
+	// Empty slices rather than null, so a spoke need not special-case the field.
+	if _, ok := got["conflicts"].([]any); !ok {
+		t.Errorf("conflicts = %v, want an empty array not null", got["conflicts"])
+	}
+}
+
+func TestEdgeSyncHandler_ReconcileRejectsUnauthenticated(t *testing.T) {
+	rig := newSyncTestRig(t)
+	entries := []edgesync.ReconcileEntry{{Path: testSyncPth, SHA256: testDigest([]byte("x"))}}
+
+	tests := []struct {
+		name   string
+		mutate func(*reconcileReqSpec)
+	}{
+		{"wrong secret", func(r *reconcileReqSpec) { r.secret = "not-the-secret" }},
+		{"unknown spoke", func(r *reconcileReqSpec) { r.spokeID = "rocket-99"; r.secret = "its-own-secret" }},
+		{"expired timestamp", func(r *reconcileReqSpec) {
+			r.ts = time.Now().Add(-2 * security.HMACTimestampTolerance).Unix()
+		}},
+		{"body swapped after signing", func(r *reconcileReqSpec) {
+			// The MAC binds a digest of the body precisely so a replayed
+			// request cannot substitute a different path list and use the hub
+			// as an oracle for what data exists.
+			mac, _ := security.ComputeSyncReconcileHMAC(r.secret, r.nonce, r.spokeID, r.hubID, r.body, r.ts)
+			r.macOverride = mac
+			r.body, _ = json.Marshal(map[string]any{"entries": []edgesync.ReconcileEntry{
+				{Path: "metrics/secret/2026/08/07/14/probe.parquet", SHA256: testDigest([]byte("probe"))},
+			}})
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := defaultReconcileReq(entries)
+			tt.mutate(&r)
+			if resp := r.do(t, rig); resp.StatusCode != fiber.StatusUnauthorized {
+				t.Errorf("status = %d, want 401", resp.StatusCode)
+			}
+		})
+	}
+}
+
+func TestEdgeSyncHandler_ReconcileRejectsReplay(t *testing.T) {
+	rig := newSyncTestRig(t)
+	r := defaultReconcileReq([]edgesync.ReconcileEntry{{Path: testSyncPth, SHA256: testDigest([]byte("x"))}})
+
+	if resp := r.do(t, rig); resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("first: status %d", resp.StatusCode)
+	}
+	resp := r.do(t, rig)
+	if resp.StatusCode != fiber.StatusUnauthorized {
+		t.Fatalf("replay: status = %d, want 401", resp.StatusCode)
+	}
+	if got := decodeBody(t, resp); got["reason"] != "replay" {
+		t.Errorf("reason = %v, want replay", got["reason"])
+	}
+}
+
+func TestEdgeSyncHandler_ReconcileRejectsOversizedBatch(t *testing.T) {
+	rig := newSyncTestRig(t)
+
+	// The rig caps at 100 entries. An unbounded batch is a pre-auth memory
+	// claim, since the body is buffered before routing.
+	entries := make([]edgesync.ReconcileEntry, 101)
+	for i := range entries {
+		entries[i] = edgesync.ReconcileEntry{
+			Path:   fmt.Sprintf("metrics/cpu/2026/08/07/14/f_%d.parquet", i),
+			SHA256: testDigest([]byte(fmt.Sprint(i))),
+		}
+	}
+
+	resp := defaultReconcileReq(entries).do(t, rig)
+	if resp.StatusCode != fiber.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", resp.StatusCode)
+	}
+	if got := decodeBody(t, resp); got["max_entries"] == nil {
+		t.Error("the 413 response does not tell the spoke the limit it must page under")
+	}
+}
+
+func TestEdgeSyncHandler_ReconcileRejectsMalformedBody(t *testing.T) {
+	rig := newSyncTestRig(t)
+
+	r := defaultReconcileReq(nil)
+	r.body = []byte("{not json")
+	// The MAC must still be computed over the malformed bytes, so this
+	// exercises body parsing rather than authentication.
+	mac, err := security.ComputeSyncReconcileHMAC(r.secret, r.nonce, r.spokeID, r.hubID, r.body, r.ts)
+	if err != nil {
+		t.Fatalf("mac: %v", err)
+	}
+	r.macOverride = mac
+
+	if resp := r.do(t, rig); resp.StatusCode != fiber.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestEdgeSyncHandler_ReconcileRejectsMaliciousPaths(t *testing.T) {
+	rig := newSyncTestRig(t)
+
+	// Signed by a legitimate spoke, so this models a COMPROMISED edge trying
+	// to probe outside its namespace. The MAC proves who is asking, not that
+	// what they ask about is theirs.
+	for _, p := range []string{
+		"../../../etc/passwd.parquet",
+		"/absolute/path.parquet",
+		".sync-staging/rocket-02/steal.parquet",
+	} {
+		t.Run(p, func(t *testing.T) {
+			entries := []edgesync.ReconcileEntry{{Path: p, SHA256: testDigest([]byte("x"))}}
+			if resp := defaultReconcileReq(entries).do(t, rig); resp.StatusCode == fiber.StatusOK {
+				t.Errorf("path %q was accepted", p)
+			}
+		})
+	}
+}
+
+func TestEdgeSyncHandler_ReconcileRejectsOversizedBodyBeforeAuth(t *testing.T) {
+	rig := newSyncTestRig(t)
+
+	// The Content-Length guard is the ONLY bound applied before
+	// authentication, so it must be exercised by a body that actually exceeds
+	// it. An earlier version of this suite could not: with a 100-entry cap the
+	// byte threshold was 25,600 while a 101-entry body was only ~12KB, so the
+	// guard was unreachable and deleting it left every test green.
+	//
+	// Padding the paths pushes the body past the byte threshold while keeping
+	// the entry count under the cap, isolating the pre-auth guard.
+	pad := strings.Repeat("p", 400)
+	entries := make([]edgesync.ReconcileEntry, 90)
+	for i := range entries {
+		entries[i] = edgesync.ReconcileEntry{
+			Path:   fmt.Sprintf("metrics/cpu/2026/08/07/14/%s_%d.parquet", pad, i),
+			SHA256: testDigest([]byte(fmt.Sprint(i))),
+		}
+	}
+
+	r := defaultReconcileReq(entries)
+	if len(r.body) <= 90*256 {
+		t.Fatalf("test body is %d bytes, not above the %d-byte guard — the guard would not be exercised",
+			len(r.body), 90*256)
+	}
+
+	resp := r.do(t, rig)
+	if resp.StatusCode != fiber.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413 — an oversized body was accepted before auth", resp.StatusCode)
 	}
 }
