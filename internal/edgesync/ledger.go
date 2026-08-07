@@ -6,9 +6,14 @@
 // gives end-to-end integrity for free, costs the hub no re-ingestion, and makes
 // idempotency trivial: (path, sha256) IS the file's identity.
 //
-// This file implements the spoke-side ledger — the durable record of what has
-// been sent to which hub, and how far. It is deliberately dumb: it tracks
-// state, and knows nothing about transports, HTTP, or hubs beyond their ID.
+// The package is layered so each piece can be tested on its own:
+//
+//   - ledger.go — the durable record of what has been sent to which hub, and
+//     how far. Deliberately dumb: it tracks state and knows nothing about
+//     transports, HTTP, or hubs beyond their ID.
+//   - transport.go — the SyncTransport interface the agent talks to, so the
+//     wire format (HTTPS, S3 relay, sneakernet bundle) stays swappable.
+//   - transport_memory.go — an in-process transport for tests.
 //
 // See docs/progress/2026-06-04-edge-sync-architecture-converged.md.
 package edgesync
