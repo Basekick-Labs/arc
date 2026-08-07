@@ -2107,6 +2107,70 @@ func main() {
 		}
 	}
 
+	// Register the edge-sync SPOKE side (#569) — this instance pushing its
+	// files to a hub. Independent of the hub block above: an Arc can be a hub,
+	// a spoke, both, or neither.
+	//
+	// The secret comes from ARC_EDGE_SYNC_SPOKE_SECRET only; config load
+	// already refused a config-file secret and verified every required field,
+	// so by here the configuration is known good.
+	if cfg.EdgeSync.Spoke.Enabled {
+		spokeLogger := logger.Get("edgesync-spoke")
+
+		// The ledger shares the auth database, like the hub index. Reuse the
+		// handle opened for the hub block when both roles are enabled on one
+		// instance, rather than opening a second one on the same file.
+		spokeDB, spokeOwnsDB, err := sharedSQLiteHandle(authManager, cfg.Auth.DBPath)
+		if err != nil {
+			log.Fatal().Err(err).Str("path", cfg.Auth.DBPath).Msg("Failed to open the edge sync spoke database; refusing to start")
+		}
+		if spokeOwnsDB {
+			shutdownCoordinator.RegisterHook("edgesync-spoke-db", func(context.Context) error {
+				return spokeDB.Close()
+			}, shutdown.PriorityDatabase)
+		}
+
+		spokeLedger, err := edgesync.NewLedger(spokeDB, spokeLogger)
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to create the edge sync ledger; refusing to start")
+		}
+
+		spokeTransport, err := edgesync.NewHTTPTransport(edgesync.HTTPTransportConfig{
+			BaseURL: cfg.EdgeSync.Spoke.HubURL,
+			SpokeID: cfg.EdgeSync.Spoke.SpokeID,
+			Secret:  cfg.EdgeSync.Spoke.Secret,
+		})
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to create the edge sync transport; refusing to start")
+		}
+
+		syncAgent, err := edgesync.NewAgent(edgesync.AgentConfig{
+			Ledger:        spokeLedger,
+			Transport:     spokeTransport,
+			Backend:       storageBackend,
+			HubID:         cfg.EdgeSync.Spoke.HubID,
+			SpokeID:       cfg.EdgeSync.Spoke.SpokeID,
+			MaxAttempts:   cfg.EdgeSync.Spoke.MaxAttempts,
+			MaxConcurrent: cfg.EdgeSync.Spoke.MaxConcurrent,
+			BatchSize:     cfg.EdgeSync.Spoke.BatchSize,
+			Logger:        spokeLogger,
+		})
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to create the edge sync agent; refusing to start")
+		}
+
+		spokeHandler, err := api.NewEdgeSyncSpokeHandler(syncAgent, authManager, spokeLogger)
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to create the edge sync spoke handler; refusing to start")
+		}
+		spokeHandler.RegisterRoutes(server.GetApp())
+
+		spokeLogger.Info().
+			Str("hub_url", cfg.EdgeSync.Spoke.HubURL).
+			Str("spoke_id", cfg.EdgeSync.Spoke.SpokeID).
+			Msg("Edge sync spoke enabled; trigger a pass with POST /api/v1/spoke-sync/run")
+	}
+
 	// Register TLE handler (streaming TLE ingestion)
 	tleHandler := api.NewTLEHandler(arrowBuffer, logger.Get("tle"))
 	if authManager != nil && rbacManager != nil {

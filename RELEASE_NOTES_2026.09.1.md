@@ -62,7 +62,7 @@ This is a **file-count** bound, not a byte bound — compacted output size track
 
 Out-of-range values fall back to the default with a startup warning rather than failing. **`1` is not usable** and is treated as out of range: compaction's adaptive retry rejects any batch below two files, so a batch size of one would fail every batch of every partition.
 
-## Groundwork: edge-to-cloud sync (not yet usable)
+## New: edge-to-cloud sync (manual)
 
 Arc runs at the edge today — a standalone binary with local storage in a vehicle, a factory cell, or a forward deployment — with no first-class way to ship that data to a central Arc. Backup is a full DR snapshot rather than incremental sync, and Parquet import re-ingests rows through the write path, which breaks the end-to-end checksum and double-counts on retry.
 
@@ -88,9 +88,36 @@ Reconcile is answered from a hub-side index of received files rather than by rea
 
 Resume is supported on local storage. On S3 and Azure a dropped transfer restarts from zero, because block objects cannot be appended to; this is a throughput cost on intermittent links, not a correctness problem.
 
-The rest of the work is still internal: the spoke-side ledger, the `SyncTransport` interface, and the HMAC scheme. Manual export/import will be OSS when it ships; the automatic scheduled agent will be an Enterprise feature.
+### The spoke side
 
-Manual export/import will be OSS when it ships; the automatic scheduled agent will be an Enterprise feature.
+An edge Arc now syncs to a hub on demand. Enable it on the spoke:
+
+```toml
+[edge_sync.spoke]
+enabled = true                        # default false
+hub_url = "https://hub.example.com"   # required when enabled
+spoke_id = "rocket-01"                # this spoke's ID, as registered on the hub
+hub_id = "ground-station"             # the REMOTE hub's edge_sync.hub_id
+max_attempts = 5                      # attempts before a file is marked failed
+max_concurrent = 2                    # simultaneous transfers
+batch_size = 0                        # files per reconcile round-trip; 0 = hub default
+```
+
+The secret is **environment-only**: `ARC_EDGE_SYNC_SPOKE_SECRET`, the value the hub returned once at registration. A secret in the config file is **refused at startup** rather than ignored — one that is ignored still leaks, and leaving it in place makes the committed copy look load-bearing. `hub_id` is validated at load for the same reason it is easy to get wrong: it is bound into every request MAC, so a mismatch fails *every* request with a `400` that looks like a hub problem.
+
+Three admin endpoints drive it:
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/v1/spoke-sync/run` | Run one sync pass and return what it did. |
+| `GET /api/v1/spoke-sync/status` | Pending/synced/failed counts and sync lag. |
+| `GET /api/v1/spoke-sync/ledger` | Per-file state, attempts, and last error. |
+
+A pass recovers transfers interrupted by a crash, discovers new files, reconciles the backlog, and streams what the hub lacks — **newest first**, so a contact window that closes mid-backlog has already delivered the freshest telemetry. It **pages until the backlog drains**, so one pass on a spoke returning from a long outage moves everything, not just the first batch. Conflicts are reported in full rather than counted and are not retried: the same path holding different content means a spoke-ID collision or corruption, and re-sending would either be refused or destroy evidence.
+
+Files are hashed once at discovery, and the ledger survives restarts, so a spoke re-run after a crash neither re-hashes nor re-sends what already landed. Nothing is deleted from the spoke — sync is a copy, and local retention stays in the operator's hands.
+
+This is the **manual** form, and it is OSS. The automatic scheduled agent will be an Enterprise feature.
 
 ## Security hardening
 
@@ -373,7 +400,7 @@ The forwarding-header and loop-guard changes are cluster-only; the partition-pru
 2. **No API or on-disk format changes.** Reads, queries, and storage layout are untouched. Queries with a start date earlier than `1970-01-01` are pruned from the epoch forward; since Arc stores no pre-epoch data, results are unchanged.
 3. **Clustered operators:** if any external tooling deliberately sets `X-Arc-Forwarded-By`, `X-Real-IP`, or `X-Forwarded-*` headers on requests to Arc and expects them to survive an inter-node forward, note that these are now stripped on the forwarding hop and re-established by Arc. Client IP has never been derived from these headers, so log/audit attribution is unchanged.
 4. **Active licenses keep working.** No re-activation required.
-5. **Edge sync is off by default and nothing changes unless you enable it.** With `edge_sync.enabled=false` (the default) no routes are mounted and `/api/v1/sync/file` returns 404. The `sync_ledger` and `sync_history` tables are still not created — the spoke side is not yet wired into startup.
+5. **Edge sync is off by default and nothing changes unless you enable it.** With `edge_sync.enabled=false` (the default) the hub mounts no routes and `/api/v1/sync/file` returns 404. With `edge_sync.spoke.enabled=false` (the default) no spoke routes are mounted, no `sync_ledger` or `sync_history` tables are created, and nothing is read from local storage. Both sides are independent: a hub need not be a spoke, and a spoke need not be a hub.
 
 ## Dependencies
 
