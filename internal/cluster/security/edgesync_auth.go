@@ -53,6 +53,14 @@ const (
 	// arrangement of another family's field contents — that is what makes the
 	// three families non-interchangeable. Never add a label of length 9 or 14.
 	syncLabelBundle = "sync-bundle"
+
+	// syncLabelAck marks a hub's acknowledgment of an imported bundle (PR 9d).
+	//
+	// Length 8, distinct from sync-file (9), sync-bundle (11), and
+	// sync-reconcile (14). Signed by the HUB rather than a spoke — the secret
+	// is symmetric, so the same key that lets a spoke prove authorship lets the
+	// hub prove receipt.
+	syncLabelAck = "sync-ack"
 )
 
 // ErrSyncAuthMalformedField is returned when a field carries a NUL byte.
@@ -298,6 +306,79 @@ func BundleEntriesDigest(paths, sha256s []string, sizes []int64) (string, error)
 			return "", fmt.Errorf("security: bundle digest: duplicate path %q", paths[i])
 		}
 		b.WriteString(canonicalSyncInput(paths[i], sha256s[i], strconv.FormatInt(sizes[i], 10)))
+	}
+
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// ComputeSyncAckHMAC signs a hub's acknowledgment of an imported bundle.
+//
+// Binds the bundle it acknowledges, both identities, when the hub imported it,
+// and a digest of the acknowledged paths. A spoke that verifies this knows the
+// named hub actually holds those exact files — the evidence that lets it
+// advance them from `exported` to `synced` and eventually prune them.
+//
+// Without an ack an air-gapped spoke has no terminal state at all: `synced` is
+// unreachable, so its ledger grows forever on the box least able to receive a
+// site visit.
+//
+// NO NONCE and NO FRESHNESS CHECK, matching the bundle family it answers: an
+// ack rides the same physical drive back and is subject to the same weeks-long
+// latency. Replaying an ack is harmless — it can only re-advance files that are
+// already synced, which MarkSynced treats as a no-op.
+//
+// Format: "sync-ack" \x00 bundleID \x00 spokeID \x00 hubID \x00 importedAt \x00 pathsDigest
+func ComputeSyncAckHMAC(sharedSecret, bundleID, spokeID, hubID string, importedAt int64, pathsDigest string) (string, error) {
+	if err := rejectSyncNUL(bundleID, spokeID, hubID, pathsDigest); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(
+		computeSyncAckHMACRaw(sharedSecret, bundleID, spokeID, hubID, importedAt, pathsDigest)), nil
+}
+
+func computeSyncAckHMACRaw(sharedSecret, bundleID, spokeID, hubID string, importedAt int64, pathsDigest string) []byte {
+	return computeRawHMAC(sharedSecret, canonicalSyncInput(
+		syncLabelAck, bundleID, spokeID, hubID,
+		strconv.FormatInt(importedAt, 10), pathsDigest))
+}
+
+// ValidateSyncAckHMAC checks an acknowledgment's MAC.
+//
+// No freshness check, for the same reason ValidateSyncBundleHMAC has none.
+func ValidateSyncAckHMAC(sharedSecret, bundleID, spokeID, hubID string, importedAt int64, pathsDigest, receivedMAC string) error {
+	if err := rejectSyncNUL(bundleID, spokeID, hubID, pathsDigest); err != nil {
+		return err
+	}
+	expected := computeSyncAckHMACRaw(sharedSecret, bundleID, spokeID, hubID, importedAt, pathsDigest)
+	if !constantTimeHexEqual(expected, receivedMAC) {
+		return ErrSyncAuthInvalid
+	}
+	return nil
+}
+
+// AckPathsDigest hashes the acknowledged path list into the value the MAC binds.
+//
+// Same canonicalization discipline as BundleEntriesDigest, and for the same
+// reason: sorted byte-lexicographically, duplicates rejected, each path
+// contributed through the shared length-prefixed helper rather than a second
+// encoding. A spoke that computes a different digest than the hub cannot tell
+// a tampered ack from an encoding disagreement, so there must be exactly one
+// way to compute it.
+func AckPathsDigest(paths []string) (string, error) {
+	if err := rejectSyncNUL(paths...); err != nil {
+		return "", err
+	}
+
+	sorted := append([]string(nil), paths...)
+	sort.Strings(sorted)
+
+	var b strings.Builder
+	for i, p := range sorted {
+		if i > 0 && sorted[i-1] == p {
+			return "", fmt.Errorf("security: ack digest: duplicate path %q", p)
+		}
+		b.WriteString(canonicalSyncInput(p))
 	}
 
 	sum := sha256.Sum256([]byte(b.String()))

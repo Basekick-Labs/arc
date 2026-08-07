@@ -80,6 +80,7 @@ func (h *EdgeSyncSpokeHandler) RegisterRoutes(app fiber.Router) {
 	group.Get("/ledger", h.ledger)
 	group.Post("/export", h.export)
 	group.Post("/export/:bundle_id/revert", h.revertExport)
+	group.Post("/ack", h.applyAck)
 
 	h.logger.Info().Msg("Edge sync spoke routes registered")
 }
@@ -380,4 +381,89 @@ func (h *EdgeSyncSpokeHandler) revertExport(c *fiber.Ctx) error {
 
 	h.logger.Info().Str("bundle_id", bundleID).Int64("files", n).Msg("Bundle reverted")
 	return c.JSON(fiber.Map{"bundle_id": bundleID, "reverted": n})
+}
+
+// applyAck handles POST /api/v1/spoke-sync/ack.
+//
+// The return leg of the air-gap transport: an operator plugs a drive back in
+// after it has been to the hub, and this advances the files the hub confirmed
+// from `exported` to `synced`.
+//
+// This is what makes those entries prunable. Without it `synced` is
+// unreachable on an air-gapped spoke, so the ledger grows without bound on the
+// box least able to receive a site visit.
+func (h *EdgeSyncSpokeHandler) applyAck(c *fiber.Ctx) error {
+	if h.exporter == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "air-gap bundle export is not enabled (edge_sync.spoke.bundle.enabled)",
+		})
+	}
+
+	var req struct {
+		Path string `json:"path"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
+	if req.Path == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "path is required: the returned bundle directory",
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Minute)
+	defer cancel()
+
+	res, err := h.exporter.ApplyAck(ctx, req.Path)
+	switch {
+	case errors.Is(err, edgesync.ErrNoAck):
+		// Not an error: a drive that has not yet been to the hub is the normal
+		// state on the outbound leg, and an operator checking early should not
+		// see a failure.
+		return c.JSON(fiber.Map{
+			"applied": false,
+			"reason":  "this bundle carries no acknowledgment yet",
+		})
+
+	case errors.Is(err, edgesync.ErrAckInvalid), errors.Is(err, edgesync.ErrDestinationRefused):
+		// The operator's own input — a tampered ack, one from another hub, or
+		// a path outside the allow-list. Retrying unchanged fails identically.
+		h.logger.Warn().Err(err).Msg("Acknowledgment refused")
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+
+	case err != nil:
+		h.logger.Error().Err(err).Msg("Failed to apply an acknowledgment")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "failed to apply the acknowledgment",
+		})
+	}
+
+	out := fiber.Map{
+		"applied":     true,
+		"bundle_id":   res.BundleID,
+		"hub_id":      res.HubID,
+		"imported_at": res.ImportedAt,
+		"synced":      res.Synced,
+	}
+	if res.Unknown > 0 {
+		// Not a failure — a spoke restored from a backup, or whose entries
+		// were already synced by another route, legitimately produces these —
+		// but an operator comparing counts deserves to know.
+		out["unknown"] = res.Unknown
+	}
+
+	conflicts := make([]fiber.Map, 0, len(res.Conflicts))
+	for _, cf := range res.Conflicts {
+		conflicts = append(conflicts, fiber.Map{
+			"path":         cf.Path,
+			"their_sha256": cf.TheirSHA256,
+		})
+	}
+	out["conflicts"] = conflicts
+	if len(conflicts) > 0 {
+		out["warning"] = "The hub holds different content at these paths. They were NOT acknowledged " +
+			"and remain exported; investigate before re-sending."
+	}
+
+	return c.JSON(out)
 }
