@@ -132,7 +132,7 @@ func TestReadyHandler_StartsNotReady(t *testing.T) {
 	s.RegisterRoutes()
 
 	req := httptest.NewRequest("GET", "/ready", nil)
-	resp, err := s.app.Test(req)
+	resp, err := s.app.Test(req, testRequestTimeoutMS)
 	if err != nil {
 		t.Fatalf("/ready Test failed: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestReadyHandler_MarkReadyFlipsTo200(t *testing.T) {
 	s.MarkReady()
 
 	req := httptest.NewRequest("GET", "/ready", nil)
-	resp, err := s.app.Test(req)
+	resp, err := s.app.Test(req, testRequestTimeoutMS)
 	if err != nil {
 		t.Fatalf("/ready Test failed: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestReadyHandler_MarkNotReadyDrainsLB(t *testing.T) {
 	s.MarkNotReady()
 
 	req := httptest.NewRequest("GET", "/ready", nil)
-	resp, err := s.app.Test(req)
+	resp, err := s.app.Test(req, testRequestTimeoutMS)
 	if err != nil {
 		t.Fatalf("/ready Test failed: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestHealthHandler_AlwaysOK(t *testing.T) {
 
 	// Before MarkReady (mid-startup): /health is still 200.
 	req := httptest.NewRequest("GET", "/health", nil)
-	resp, err := s.app.Test(req)
+	resp, err := s.app.Test(req, testRequestTimeoutMS)
 	if err != nil {
 		t.Fatalf("/health Test (pre-ready) failed: %v", err)
 	}
@@ -220,7 +220,7 @@ func TestHealthHandler_AlwaysOK(t *testing.T) {
 	s.MarkReady()
 	s.MarkNotReady()
 	req = httptest.NewRequest("GET", "/health", nil)
-	resp, err = s.app.Test(req)
+	resp, err = s.app.Test(req, testRequestTimeoutMS)
 	if err != nil {
 		t.Fatalf("/health Test (post-drain) failed: %v", err)
 	}

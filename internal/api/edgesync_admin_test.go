@@ -106,7 +106,7 @@ func (r *adminRig) do(t *testing.T, method, path string, body any) (*http.Respon
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := r.app.Test(req, 10_000)
+	resp, err := r.app.Test(req, testRequestTimeoutMS)
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}

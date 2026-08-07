@@ -100,7 +100,7 @@ func TestDatabasesHandler_List(t *testing.T) {
 
 	t.Run("List databases", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/api/v1/databases", nil)
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, testRequestTimeoutMS)
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
@@ -140,7 +140,7 @@ func TestDatabasesHandler_ListEmpty(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	req := httptest.NewRequest("GET", "/api/v1/databases", nil)
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testRequestTimeoutMS)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestDatabasesHandler_Create(t *testing.T) {
 		req := httptest.NewRequest("POST", "/api/v1/databases", bytes.NewBufferString(body))
 		req.Header.Set("Content-Type", "application/json")
 
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, testRequestTimeoutMS)
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
@@ -223,7 +223,7 @@ func TestDatabasesHandler_CreateInvalidName(t *testing.T) {
 			req := httptest.NewRequest("POST", "/api/v1/databases", bytes.NewBufferString(body))
 			req.Header.Set("Content-Type", "application/json")
 
-			resp, err := app.Test(req)
+			resp, err := app.Test(req, testRequestTimeoutMS)
 			if err != nil {
 				t.Fatalf("Request failed: %v", err)
 			}
@@ -251,7 +251,7 @@ func TestDatabasesHandler_CreateAlreadyExists(t *testing.T) {
 	body := `{"name": "existingdb"}`
 	req := httptest.NewRequest("POST", "/api/v1/databases", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
-	resp, _ := app.Test(req)
+	resp, _ := app.Test(req, testRequestTimeoutMS)
 	if resp.StatusCode != fiber.StatusCreated {
 		t.Fatalf("Failed to create initial database")
 	}
@@ -259,7 +259,7 @@ func TestDatabasesHandler_CreateAlreadyExists(t *testing.T) {
 	// Try to create again
 	req = httptest.NewRequest("POST", "/api/v1/databases", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
-	resp, _ = app.Test(req)
+	resp, _ = app.Test(req, testRequestTimeoutMS)
 
 	if resp.StatusCode != fiber.StatusConflict {
 		t.Errorf("Expected status 409 Conflict, got %d", resp.StatusCode)
@@ -286,7 +286,7 @@ func TestDatabasesHandler_Get(t *testing.T) {
 
 	t.Run("Get existing database", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/api/v1/databases/testdb", nil)
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, testRequestTimeoutMS)
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
@@ -316,7 +316,7 @@ func TestDatabasesHandler_GetNotFound(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	req := httptest.NewRequest("GET", "/api/v1/databases/nonexistent", nil)
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testRequestTimeoutMS)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -341,7 +341,7 @@ func TestDatabasesHandler_ListMeasurements(t *testing.T) {
 
 	t.Run("List measurements", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/api/v1/databases/testdb/measurements", nil)
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, testRequestTimeoutMS)
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
@@ -377,7 +377,7 @@ func TestDatabasesHandler_ListMeasurementsEmpty(t *testing.T) {
 	backend.Write(ctx, "emptydb/.arc-database", []byte(`{"created_at":"2025-01-01T00:00:00Z"}`))
 
 	req := httptest.NewRequest("GET", "/api/v1/databases/emptydb/measurements", nil)
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testRequestTimeoutMS)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -412,7 +412,7 @@ func TestDatabasesHandler_Delete(t *testing.T) {
 
 	t.Run("Delete database with confirmation", func(t *testing.T) {
 		req := httptest.NewRequest("DELETE", "/api/v1/databases/deletedb?confirm=true", nil)
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, testRequestTimeoutMS)
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
@@ -452,7 +452,7 @@ func TestDatabasesHandler_DeleteDisabled(t *testing.T) {
 	backend.Write(ctx, "testdb/measurement1/data.parquet", []byte("data"))
 
 	req := httptest.NewRequest("DELETE", "/api/v1/databases/testdb?confirm=true", nil)
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testRequestTimeoutMS)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -481,7 +481,7 @@ func TestDatabasesHandler_DeleteRequiresConfirm(t *testing.T) {
 
 	t.Run("Without confirm param", func(t *testing.T) {
 		req := httptest.NewRequest("DELETE", "/api/v1/databases/testdb", nil)
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, testRequestTimeoutMS)
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
@@ -493,7 +493,7 @@ func TestDatabasesHandler_DeleteRequiresConfirm(t *testing.T) {
 
 	t.Run("With confirm=false", func(t *testing.T) {
 		req := httptest.NewRequest("DELETE", "/api/v1/databases/testdb?confirm=false", nil)
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, testRequestTimeoutMS)
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
@@ -510,7 +510,7 @@ func TestDatabasesHandler_DeleteNotFound(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	req := httptest.NewRequest("DELETE", "/api/v1/databases/nonexistent?confirm=true", nil)
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testRequestTimeoutMS)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -533,7 +533,7 @@ func TestDatabasesHandler_DeleteEmptyDatabase(t *testing.T) {
 
 	// Verify database appears in list before deletion
 	listReq := httptest.NewRequest("GET", "/api/v1/databases", nil)
-	listResp, _ := app.Test(listReq)
+	listResp, _ := app.Test(listReq, testRequestTimeoutMS)
 	var listResult DatabaseListResponse
 	json.NewDecoder(listResp.Body).Decode(&listResult)
 	found := false
@@ -549,7 +549,7 @@ func TestDatabasesHandler_DeleteEmptyDatabase(t *testing.T) {
 
 	// Delete the database
 	req := httptest.NewRequest("DELETE", "/api/v1/databases/emptydb?confirm=true", nil)
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testRequestTimeoutMS)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -570,7 +570,7 @@ func TestDatabasesHandler_DeleteEmptyDatabase(t *testing.T) {
 
 	// Verify database no longer appears in list
 	listReq2 := httptest.NewRequest("GET", "/api/v1/databases", nil)
-	listResp2, _ := app.Test(listReq2)
+	listResp2, _ := app.Test(listReq2, testRequestTimeoutMS)
 	var listResult2 DatabaseListResponse
 	json.NewDecoder(listResp2.Body).Decode(&listResult2)
 	for _, db := range listResult2.Databases {
@@ -696,7 +696,7 @@ func BenchmarkDatabasesHandler_List(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				req := httptest.NewRequest("GET", "/api/v1/databases", nil)
-				resp, err := app.Test(req)
+				resp, err := app.Test(req, testRequestTimeoutMS)
 				if err != nil {
 					b.Fatalf("Request failed: %v", err)
 				}
@@ -750,7 +750,7 @@ func BenchmarkDatabasesHandler_Exists(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				req := httptest.NewRequest("GET", "/api/v1/databases/"+targetDB, nil)
-				resp, err := app.Test(req)
+				resp, err := app.Test(req, testRequestTimeoutMS)
 				if err != nil {
 					b.Fatalf("Request failed: %v", err)
 				}
@@ -782,7 +782,7 @@ func BenchmarkDatabasesHandler_ListMeasurements(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		req := httptest.NewRequest("GET", "/api/v1/databases/database5/measurements", nil)
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, testRequestTimeoutMS)
 		if err != nil {
 			b.Fatalf("Request failed: %v", err)
 		}
@@ -899,7 +899,7 @@ func TestDatabasesHandler_CreateRequiresAdmin(t *testing.T) {
 		if token != "" {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, testRequestTimeoutMS)
 		if err != nil {
 			t.Fatalf("app.Test: %v", err)
 		}
@@ -961,7 +961,7 @@ func TestDatabasesHandler_DeleteRequiresAdmin(t *testing.T) {
 	createReq := httptest.NewRequest("POST", "/api/v1/databases", bytes.NewReader([]byte(`{"name":"db_to_delete"}`)))
 	createReq.Header.Set("Content-Type", "application/json")
 	createReq.Header.Set("Authorization", "Bearer "+adminToken)
-	createResp, err := app.Test(createReq)
+	createResp, err := app.Test(createReq, testRequestTimeoutMS)
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
 	}
@@ -974,7 +974,7 @@ func TestDatabasesHandler_DeleteRequiresAdmin(t *testing.T) {
 	t.Run("read-only token cannot delete", func(t *testing.T) {
 		req := httptest.NewRequest("DELETE", "/api/v1/databases/db_to_delete?confirm=true", nil)
 		req.Header.Set("Authorization", "Bearer "+readToken)
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, testRequestTimeoutMS)
 		if err != nil {
 			t.Fatalf("delete: %v", err)
 		}
@@ -988,7 +988,7 @@ func TestDatabasesHandler_DeleteRequiresAdmin(t *testing.T) {
 	t.Run("admin token can delete", func(t *testing.T) {
 		req := httptest.NewRequest("DELETE", "/api/v1/databases/db_to_delete?confirm=true", nil)
 		req.Header.Set("Authorization", "Bearer "+adminToken)
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, testRequestTimeoutMS)
 		if err != nil {
 			t.Fatalf("delete: %v", err)
 		}
@@ -1017,7 +1017,7 @@ func TestDatabasesHandler_ReadEndpointsAcceptAnyValidToken(t *testing.T) {
 	createReq := httptest.NewRequest("POST", "/api/v1/databases", bytes.NewReader([]byte(`{"name":"readable_db"}`)))
 	createReq.Header.Set("Content-Type", "application/json")
 	createReq.Header.Set("Authorization", "Bearer "+adminToken)
-	createResp, err := app.Test(createReq)
+	createResp, err := app.Test(createReq, testRequestTimeoutMS)
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
 	}
@@ -1039,7 +1039,7 @@ func TestDatabasesHandler_ReadEndpointsAcceptAnyValidToken(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest("GET", tc.path, nil)
 			req.Header.Set("Authorization", "Bearer "+readToken)
-			resp, err := app.Test(req)
+			resp, err := app.Test(req, testRequestTimeoutMS)
 			if err != nil {
 				t.Fatalf("Test: %v", err)
 			}

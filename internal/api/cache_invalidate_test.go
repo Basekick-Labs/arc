@@ -63,7 +63,7 @@ func sendInvalidate(t *testing.T, app *fiber.App, headers map[string]string) int
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testRequestTimeoutMS)
 	if err != nil {
 		t.Fatalf("app.Test: %v", err)
 	}

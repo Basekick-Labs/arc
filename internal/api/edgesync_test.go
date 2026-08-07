@@ -144,7 +144,7 @@ func (r syncReq) do(t *testing.T, rig *syncTestRig) *http.Response {
 		httpReq.Header.Set(headerOffset, strconv.FormatInt(r.offset, 10))
 	}
 
-	resp, err := rig.app.Test(httpReq, 10_000)
+	resp, err := rig.app.Test(httpReq, testRequestTimeoutMS)
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
@@ -417,7 +417,7 @@ func TestEdgeSyncHandler_RejectsMalformedRequests(t *testing.T) {
 			httpReq.Header.Set(headerMAC, mac)
 			tt.mutate(httpReq)
 
-			resp, err := rig.app.Test(httpReq, 10_000)
+			resp, err := rig.app.Test(httpReq, testRequestTimeoutMS)
 			if err != nil {
 				t.Fatalf("request: %v", err)
 			}
@@ -547,7 +547,7 @@ func TestEdgeSyncHandler_ConcurrentUploadsAreIsolated(t *testing.T) {
 			httpReq.Header.Set(headerTS, strconv.FormatInt(r.ts, 10))
 			httpReq.Header.Set(headerMAC, mac)
 
-			resp, err := rig.app.Test(httpReq, 10_000)
+			resp, err := rig.app.Test(httpReq, testRequestTimeoutMS)
 			if err != nil {
 				errs <- err
 				return
@@ -788,7 +788,7 @@ func (r reconcileReqSpec) do(t *testing.T, rig *syncTestRig) *http.Response {
 	req.Header.Set(headerMAC, mac)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := rig.app.Test(req, 10_000)
+	resp, err := rig.app.Test(req, testRequestTimeoutMS)
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}

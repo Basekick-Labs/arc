@@ -47,7 +47,7 @@ func TestServer_PprofNotRegisteredOnPublicApp(t *testing.T) {
 	for _, p := range pprofPaths {
 		t.Run(p, func(t *testing.T) {
 			req := httptest.NewRequest("GET", p, nil)
-			resp, err := app.Test(req)
+			resp, err := app.Test(req, testRequestTimeoutMS)
 			if err != nil {
 				t.Fatalf("Request failed: %v", err)
 			}
