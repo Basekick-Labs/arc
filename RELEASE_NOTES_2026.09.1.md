@@ -68,7 +68,7 @@ Arc runs at the edge today — a standalone binary with local storage in a vehic
 
 **Edge sync** ([#569](https://github.com/Basekick-Labs/arc/issues/569)) addresses this by shipping immutable Parquet *files* from a spoke (edge) to a hub (central Arc): the spoke initiates, the hub verifies each file's SHA256 before committing it, and re-delivery of an already-received file is a no-op. Connectivity is treated as the exception rather than the norm — discovery is a single batched round-trip regardless of backlog size, and transfers resume from a byte offset when a link drops mid-file.
 
-**Nothing is user-visible in this release, on disk or otherwise.** The work is landing as a sequence of reviewed changes, and this release contains only the first: the spoke-side ledger that tracks which files have reached which hub. No configuration key enables it, no endpoint exposes it, and no startup path constructs it — so its SQLite schema is not even created yet. It is recorded here so the release history matches the work, not because there is anything to use or configure.
+**Nothing is user-visible in this release, on disk or otherwise.** The work is landing as a sequence of reviewed changes; so far that is the spoke-side ledger (which files have reached which hub, and how far a partial transfer got) and the `SyncTransport` interface the agent will talk to, with an in-process implementation for tests. No configuration key enables it, no endpoint exposes it, and no startup path constructs it — so its SQLite schema is not even created yet. It is recorded here so the release history matches the work, not because there is anything to use or configure.
 
 Manual export/import will be OSS when it ships; the automatic scheduled agent will be an Enterprise feature.
 
