@@ -231,6 +231,22 @@ func (r *BundleReader) rejectUndeclared(declared map[string]struct{}) error {
 			return nil
 		}
 
+		// The hub's acknowledgment, written into the bundle on import so the
+		// drive carries its own receipt. Allowed here but NOT covered by the
+		// manifest's digest — it cannot be, since it is created after the
+		// manifest is signed. That is safe because it is independently signed
+		// with the same per-spoke secret and verified by ReadAck before it can
+		// advance anything; an attacker who replaces it gets a MAC failure,
+		// and one who deletes it merely costs the spoke this receipt.
+		//
+		// Excluded from the "unsigned payload" rule rather than ignored: a
+		// returned drive must still re-verify, or an operator auditing what
+		// crossed the air gap would be told a legitimately-acknowledged bundle
+		// was tampered with.
+		if rel == ackName {
+			return nil
+		}
+
 		if !strings.HasPrefix(rel, dataPrefix) {
 			return fmt.Errorf("%w: %q is in the bundle but is not %s, %s, or under %s/ — unsigned payload",
 				ErrBundleInvalid, truncateForError(rel), manifestName, entriesName, dataDir)

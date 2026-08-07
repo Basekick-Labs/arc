@@ -48,9 +48,15 @@ type Exporter struct {
 	policy     *DestinationPolicy
 	discoverer *Discoverer
 	hubID      string
-	maxFiles   int
-	maxBytes   int64
-	logger     zerolog.Logger
+
+	// spokeID and secret are needed to VERIFY a returning acknowledgment. The
+	// writer holds its own copies for signing; these are read-side only.
+	spokeID string
+	secret  string
+
+	maxFiles int
+	maxBytes int64
+	logger   zerolog.Logger
 }
 
 // NewExporter validates configuration and returns a ready exporter.
@@ -89,6 +95,8 @@ func NewExporter(cfg ExporterConfig) (*Exporter, error) {
 		policy:     cfg.Policy,
 		discoverer: cfg.Discoverer,
 		hubID:      hubID,
+		spokeID:    cfg.Writer.spokeID,
+		secret:     cfg.Writer.secret,
 		maxFiles:   maxFiles,
 		maxBytes:   maxBytes,
 		logger:     cfg.Logger.With().Str("component", "edgesync-export").Logger(),
@@ -224,4 +232,45 @@ func (e *Exporter) Status(ctx context.Context) (*Stats, error) {
 // first. Mirrors Agent.UnfinishedEntries.
 func (e *Exporter) UnfinishedEntries(ctx context.Context, limit int) ([]*LedgerEntry, error) {
 	return e.ledger.Unfinished(ctx, e.hubID, limit)
+}
+
+// ApplyAck reads an acknowledgment from a returned bundle directory and
+// advances the ledger.
+//
+// The return leg. An operator plugs the drive back into the spoke after it has
+// been to the hub, and this is what finally moves those files from `exported`
+// to `synced` — making them prunable, which is the only thing that stops an
+// air-gap ledger growing without bound.
+//
+// The destination policy applies here too: the path is operator-supplied and
+// reaches the filesystem directly, exactly as on the export side.
+func (e *Exporter) ApplyAck(ctx context.Context, dir string) (*AckResult, error) {
+	resolved, err := e.policy.Resolve(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	// ReadAck verifies before returning, so what reaches ApplyAck is already
+	// proven to come from the configured hub and to name only paths this spoke
+	// could have sent.
+	ack, err := ReadAck(resolved, e.secret, e.spokeID, e.hubID)
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := ApplyAck(ctx, e.ledger, ack, e.logger)
+	if err != nil {
+		return nil, err
+	}
+
+	e.logger.Info().
+		Str("bundle_id", res.BundleID).
+		Int("synced", res.Synced).
+		Int("already_synced", res.AlreadySynced).
+		Int("untracked", res.Untracked).
+		Int("discrepancies", res.Discrepancies).
+		Int("conflicts", len(res.Conflicts)).
+		Msg("Acknowledgment applied")
+
+	return res, nil
 }

@@ -191,7 +191,38 @@ In cluster mode, manifest registrations are **batched at 1000 ops per Raft propo
 
 `GET /api/v1/bundle-import/history/{spoke_id}` answers "did last month's drive ever arrive?" — which, on a link with no telemetry, nothing else can.
 
-The acknowledgment that advances `exported` to `synced` lands next.
+### The acknowledgment
+
+The return leg, and the piece that makes air-gap sync converge. On a successful import the hub writes a signed `ack.json` **into the bundle directory** — so the drive that goes back carries the receipt, and it cannot be separated from the bundle it answers.
+
+An operator plugs the drive back into the spoke:
+
+```bash
+curl -X POST https://edge.local:8000/api/v1/spoke-sync/ack \
+  -H "Authorization: Bearer $ARC_TOKEN" \
+  -d '{"path": "/mnt/usb/bundle-submarine-01-06FXWFA2NYJHJJFAJAXBDV4PKC"}'
+```
+
+```json
+{
+  "applied": true,
+  "bundle_id": "06FXWFA2NYJHJJFAJAXBDV4PKC",
+  "hub_id": "shore-station",
+  "imported_at": "2026-08-07T21:59:56Z",
+  "synced": 4,
+  "conflicts": []
+}
+```
+
+Those files move from `exported` to `synced`, which is what finally makes them **prunable**. Before this, `synced` was unreachable on an air-gapped spoke: `PruneSynced` never pruned and the ledger grew without bound on the box least able to receive a site visit.
+
+The ack is signed with a fourth HMAC family (`sync-ack`, length 8 — distinct from the other three, so the length-prefixed canonical input keeps them non-interchangeable). The hub signs with the **same per-spoke secret** the spoke signs with: it is symmetric, so the key that lets a spoke prove authorship lets the hub prove receipt. No new key material.
+
+The spoke recomputes the path digest rather than trusting the one in the file — the MAC binds the digest, so a tampered path list with a stale digest would otherwise validate and license marking files synced the hub never received.
+
+**Conflicted paths are deliberately not acknowledged.** A conflict means the hub holds *different* content there, so the spoke's copy was never delivered; those entries stay `exported` and are reported for a human. Re-applying an ack is harmless — already-synced entries are a no-op — so a drive plugged in twice changes nothing.
+
+Like the bundle it answers, the ack carries **no freshness window**: it rides the same drive back and is subject to the same weeks-long latency.
 
 ## Security hardening
 

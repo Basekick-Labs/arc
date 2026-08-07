@@ -132,6 +132,17 @@ type ImportResult struct {
 	AlreadyPresent int
 	BytesWritten   int64
 
+	// AckPaths are the paths the hub now holds, for the acknowledgment.
+	// Committed and already-present both qualify: from the spoke's side they
+	// are the same fact. Conflicted paths are excluded — the hub holds
+	// DIFFERENT content there, so the spoke's copy was never delivered.
+	AckPaths []string
+
+	// AckWritten reports whether the acknowledgment reached the drive. False
+	// means the import succeeded but the spoke cannot learn of it from this
+	// drive, so its files stay `exported` and ride the next bundle.
+	AckWritten bool
+
 	// Conflicts are reported in full, not counted: each needs a human to
 	// decide which copy is right, and a count alone would not say which.
 	Conflicts []Conflict
@@ -249,6 +260,19 @@ func (i *Importer) Import(ctx context.Context, dir string) (*ImportResult, error
 		}
 	}
 
+	// Written after the dedup row, so an ack only ever describes an import
+	// this hub considers complete. Failure is logged and surfaced, not fatal:
+	// the files are committed either way, and the spoke simply re-sends them
+	// in a later bundle where the hub answers already_present.
+	if err := i.writeAck(ctx, dir, m, res); err != nil {
+		i.logger.Error().Err(err).
+			Str("bundle_id", m.BundleID).
+			Msg("Bundle imported but the acknowledgment could not be written; " +
+				"the spoke will not learn of this import from this drive")
+	} else {
+		res.AckWritten = true
+	}
+
 	res.Duration = time.Since(start)
 	i.logger.Info().
 		Str("bundle_id", m.BundleID).
@@ -301,9 +325,11 @@ func (i *Importer) commitAll(ctx context.Context, r *BundleReader, spokeID strin
 			res.Conflicts = append(res.Conflicts, *conflict)
 		case size < 0:
 			res.AlreadyPresent++
+			res.AckPaths = append(res.AckPaths, e.Path)
 		default:
 			res.Committed++
 			res.BytesWritten += size
+			res.AckPaths = append(res.AckPaths, e.Path)
 		}
 
 		// Checked after EVERY entry, not only after a commit. An
@@ -404,3 +430,25 @@ func (c *CollectingRegistrar) Drain() []*ReceivedFile {
 // Reset discards anything buffered, so a new import does not inherit files
 // left over from one that failed partway.
 func (c *CollectingRegistrar) Reset() { c.files = c.files[:0] }
+
+// writeAck signs and writes the acknowledgment into the bundle directory.
+//
+// The hub signs with the SAME per-spoke secret the spoke signs with — it is
+// symmetric, so the key that lets a spoke prove authorship lets the hub prove
+// receipt. No new key material, and a spoke that can make a bundle can check
+// the answer.
+func (i *Importer) writeAck(ctx context.Context, dir string, m *Manifest, res *ImportResult) error {
+	secret, err := i.registry.Secret(ctx, m.SpokeID)
+	if err != nil {
+		return fmt.Errorf("read spoke secret: %w", err)
+	}
+
+	return WriteAck(dir, secret, &Ack{
+		BundleID:   m.BundleID,
+		SpokeID:    m.SpokeID,
+		HubID:      i.hubID,
+		ImportedAt: time.Now().UTC().Unix(),
+		Paths:      res.AckPaths,
+		Conflicts:  res.Conflicts,
+	})
+}
