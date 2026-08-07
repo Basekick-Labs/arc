@@ -1945,7 +1945,10 @@ func main() {
 	// construct), but clusterCoordinator may be nil: OSS standalone runs a hub
 	// with no Raft manifest, where the backend's own listing is the manifest.
 	// RegisterFile is therefore nil in that mode rather than assumed present.
-	if cfg.EdgeSync.Enabled {
+	// Either role independently: a hub can take network pushes, drives off an
+	// air gap, or both. They share the registry, index, and receiver, which is
+	// why they live in one block.
+	if cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Enabled {
 		var registerFile func(context.Context, *edgesync.ReceivedFile) error
 		if clusterCoordinator != nil {
 			coord := clusterCoordinator
@@ -2053,20 +2056,130 @@ func main() {
 		}
 		syncAdminHandler.RegisterRoutes(server.GetApp())
 
-		syncHandler, err := api.NewEdgeSyncHandler(api.EdgeSyncHandlerConfig{
-			Receiver:     receiver,
-			Reconciler:   reconciler,
-			SpokeSecrets: api.RegistrySpokeSecrets(spokeRegistry, logger.Get("edgesync")),
-			Replay:       security.NewNonceCache(security.HMACTimestampTolerance),
-			HubID:        cfg.EdgeSync.HubID,
-			MaxFileBytes: cfg.EdgeSync.MaxFileBytes,
-			AuthManager:  authManager,
-			Logger:       logger.Get("edgesync"),
-		})
-		if err != nil {
-			log.Fatal().Err(err).Msg("Failed to create edge sync handler; refusing to start")
+		// The spoke-facing receive endpoints mount ONLY for a network hub. An
+		// import-only hub takes drives and must not expose a remotely-writable
+		// surface just because it can read a bundle off a mount point.
+		if cfg.EdgeSync.Enabled {
+			syncHandler, err := api.NewEdgeSyncHandler(api.EdgeSyncHandlerConfig{
+				Receiver:     receiver,
+				Reconciler:   reconciler,
+				SpokeSecrets: api.RegistrySpokeSecrets(spokeRegistry, logger.Get("edgesync")),
+				Replay:       security.NewNonceCache(security.HMACTimestampTolerance),
+				HubID:        cfg.EdgeSync.HubID,
+				MaxFileBytes: cfg.EdgeSync.MaxFileBytes,
+				AuthManager:  authManager,
+				Logger:       logger.Get("edgesync"),
+			})
+			if err != nil {
+				log.Fatal().Err(err).Msg("Failed to create edge sync handler; refusing to start")
+			}
+			syncHandler.RegisterRoutes(server.GetApp())
 		}
-		syncHandler.RegisterRoutes(server.GetApp())
+
+		// Air-gap import, independent of the network receive endpoints.
+		if cfg.EdgeSync.Import.Enabled {
+			importLogger := logger.Get("edgesync-import")
+
+			localRoot := ""
+			if cfg.Storage.Backend == "local" {
+				localRoot = cfg.Storage.LocalPath
+			}
+			importPolicy, err := edgesync.NewDestinationPolicy(cfg.EdgeSync.Import.AllowedDirs, localRoot)
+			if err != nil {
+				log.Fatal().Err(err).Msg("Failed to resolve the bundle import policy; refusing to start")
+			}
+
+			bundleIndex, err := edgesync.NewBundleIndex(syncDB, importLogger)
+			if err != nil {
+				log.Fatal().Err(err).Msg("Failed to create the bundle index; refusing to start")
+			}
+
+			// A SEPARATE receiver whose RegisterFile collects rather than
+			// proposes. The online receiver above proposes to the Raft
+			// manifest once per file, which is right at one file per HTTP
+			// request but would emit one proposal per file in an import's
+			// tight loop — 10,000 for a 10,000-file bundle, against the
+			// Cluster Operations Checklist's batch-at-1000 rule.
+			collector := edgesync.NewCollectingRegistrar()
+			importReceiver, err := edgesync.NewReceiver(edgesync.ReceiverConfig{
+				Backend:      storageBackend,
+				Index:        hubIndex,
+				Logger:       importLogger,
+				RegisterFile: collector.Register,
+				RecordActivity: func(ctx context.Context, spokeID string, files, bytes int64) {
+					if err := spokeRegistry.RecordActivity(ctx, spokeID, files, bytes); err != nil {
+						importLogger.Warn().Err(err).Str("spoke_id", spokeID).
+							Msg("Failed to record spoke activity")
+					}
+				},
+			})
+			if err != nil {
+				log.Fatal().Err(err).Msg("Failed to create the bundle import receiver; refusing to start")
+			}
+
+			// Nil in standalone mode: there is no manifest to update, and the
+			// hub index the receiver already wrote is the whole record.
+			var flushManifest func(context.Context, []*edgesync.ReceivedFile) error
+			if clusterCoordinator != nil {
+				coord := clusterCoordinator
+				flushManifest = func(_ context.Context, files []*edgesync.ReceivedFile) error {
+					ops := make([]clusterraft.BatchFileOp, 0, len(files))
+					for _, f := range files {
+						payload, err := json.Marshal(clusterraft.RegisterFilePayload{
+							File: clusterraft.FileEntry{
+								Path:        f.Path,
+								SHA256:      f.SHA256,
+								SizeBytes:   f.SizeBytes,
+								Database:    f.Database(),
+								Measurement: f.Measurement(),
+								// Same reasoning as the online path: a zero
+								// PartitionTime would make the file look
+								// infinitely old to the tiering migrator and
+								// drop it from time-ranged queries.
+								PartitionTime: f.PartitionTime(),
+								OriginNodeID:  f.SpokeID,
+								Tier:          "hot",
+								CreatedAt:     time.Now().UTC(),
+							},
+						})
+						if err != nil {
+							return fmt.Errorf("marshal manifest entry for %q: %w", f.Path, err)
+						}
+						ops = append(ops, clusterraft.BatchFileOp{
+							Type:    clusterraft.CommandRegisterFile,
+							Payload: payload,
+						})
+					}
+					return coord.BatchFileOpsInManifest(ops)
+				}
+			}
+
+			importer, err := edgesync.NewImporter(edgesync.ImporterConfig{
+				Receiver:      importReceiver,
+				Collector:     collector,
+				Index:         bundleIndex,
+				Registry:      spokeRegistry,
+				HubID:         cfg.EdgeSync.HubID,
+				MaxFiles:      cfg.EdgeSync.Import.MaxFiles,
+				FlushManifest: flushManifest,
+				Logger:        importLogger,
+			})
+			if err != nil {
+				log.Fatal().Err(err).Msg("Failed to create the bundle importer; refusing to start")
+			}
+
+			importHandler, err := api.NewEdgeSyncImportHandler(
+				importer, importPolicy, bundleIndex, authManager, importLogger)
+			if err != nil {
+				log.Fatal().Err(err).Msg("Failed to create the bundle import handler; refusing to start")
+			}
+			importHandler.RegisterRoutes(server.GetApp())
+
+			importLogger.Info().
+				Str("hub_id", cfg.EdgeSync.HubID).
+				Bool("clustered", clusterCoordinator != nil).
+				Msg("Edge sync bundle import enabled; import a drive with POST /api/v1/bundle-import")
+		}
 
 		// A hub with no registered spokes rejects everything, which is correct
 		// but easy to mistake for a broken deployment. Say so once at startup

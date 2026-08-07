@@ -222,6 +222,31 @@ type EdgeSyncConfig struct {
 	// spoke page keeps what matters — discovery costs O(batches), not
 	// O(files) — while bounding the exposure. Default 10,000 entries (~2MB).
 	MaxReconcileEntries int
+
+	// Import is the hub's air-gap side: taking a bundle off removable media.
+	Import EdgeSyncImportConfig
+}
+
+// EdgeSyncImportConfig configures air-gap bundle import on a hub.
+type EdgeSyncImportConfig struct {
+	// Enabled mounts the import endpoint. Independent of the receive
+	// endpoints: a hub that only ever takes drives has no reason to expose a
+	// network-writable surface, and one that only takes network pushes has no
+	// reason to read the filesystem.
+	Enabled bool
+
+	// AllowedDirs are the filesystem roots a bundle may be READ from.
+	//
+	// Required — an empty list refuses every import. Same reasoning as the
+	// spoke's export list: a mount point is outside the storage root by
+	// definition, so nothing else bounds where an operator-supplied path can
+	// point. Separate from the spoke's list because a hub is a different
+	// machine with different mounts.
+	AllowedDirs []string
+
+	// MaxFiles refuses a manifest declaring more than this, independently of
+	// whatever the exporting spoke was configured with. Zero means 10,000.
+	MaxFiles int64
 }
 
 // EdgeSyncSpokeConfig configures the push side of edge sync (#569).
@@ -741,6 +766,11 @@ func Load() (*Config, error) {
 			HubID:               v.GetString("edge_sync.hub_id"),
 			MaxFileBytes:        int64(v.GetInt64("edge_sync.max_file_bytes")),
 			MaxReconcileEntries: v.GetInt("edge_sync.max_reconcile_entries"),
+			Import: EdgeSyncImportConfig{
+				Enabled:     v.GetBool("edge_sync.import.enabled"),
+				AllowedDirs: v.GetStringSlice("edge_sync.import.allowed_dirs"),
+				MaxFiles:    v.GetInt64("edge_sync.import.max_files"),
+			},
 			Spoke: EdgeSyncSpokeConfig{
 				Enabled:       v.GetBool("edge_sync.spoke.enabled"),
 				HubURL:        v.GetString("edge_sync.spoke.hub_url"),
@@ -1159,6 +1189,24 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// Checked independently of EdgeSync.Enabled: a hub that only takes drives
+	// has no reason to expose the network receive endpoints.
+	if cfg.EdgeSync.Import.Enabled {
+		if len(cfg.EdgeSync.Import.AllowedDirs) == 0 {
+			return nil, fmt.Errorf("edge_sync.import.enabled=true requires " +
+				"edge_sync.import.allowed_dirs: a bundle is read from a raw filesystem path " +
+				"outside the storage root, so the permitted roots must be stated explicitly")
+		}
+		if cfg.EdgeSync.HubID == "" {
+			return nil, fmt.Errorf("edge_sync.import.enabled=true requires edge_sync.hub_id: " +
+				"a bundle names the hub it is destined for, and one addressed elsewhere is refused")
+		}
+		if cfg.EdgeSync.Import.MaxFiles < 0 {
+			return nil, fmt.Errorf("edge_sync.import.max_files must be >= 0 (got %d); 0 means \"use the default\"",
+				cfg.EdgeSync.Import.MaxFiles)
+		}
+	}
+
 	// Checked independently of Spoke.Enabled: a fully air-gapped spoke exports
 	// bundles and never runs the network path, so it has no hub URL and no
 	// reason to enable the sync agent at all.
@@ -1342,6 +1390,12 @@ func setDefaults(v *viper.Viper) {
 	// Air-gap bundle export. allowed_dirs has no default on purpose: an empty
 	// list refuses every export, so an operator must state where bundles may
 	// be written rather than inherit a guess.
+	// Hub-side air-gap import. allowed_dirs has no default for the same reason
+	// the spoke's does not: an operator must state where drives are mounted.
+	v.SetDefault("edge_sync.import.enabled", false)
+	v.SetDefault("edge_sync.import.allowed_dirs", []string{})
+	v.SetDefault("edge_sync.import.max_files", 10000)
+
 	v.SetDefault("edge_sync.spoke.bundle.enabled", false)
 	v.SetDefault("edge_sync.spoke.bundle.allowed_dirs", []string{})
 	v.SetDefault("edge_sync.spoke.bundle.max_files", 10000)

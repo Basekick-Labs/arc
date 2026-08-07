@@ -156,7 +156,42 @@ Signing uses a third HMAC family (`sync-bundle`) alongside the two online ones. 
 
 Exported files move to a new ledger state, `exported`, rather than staying pending. Without it a capped export would re-take the newest files every time and the oldest would never leave the box. They are reported separately from `pending` in `/status` but still counted in `pending_bytes`, because a file on a drive in transit has not arrived. If a drive is lost, `POST /api/v1/spoke-sync/export/{bundle_id}/revert` returns just that bundle's files to pending.
 
-The hub-side import, and the acknowledgment that advances `exported` to `synced`, land next.
+### Importing a drive on the hub
+
+The other half. A hub takes a bundle off removable media:
+
+```toml
+[edge_sync.import]
+enabled = true                        # default false
+allowed_dirs = ["/mnt/usb"]           # REQUIRED; an empty list refuses every import
+max_files = 10000                     # refuses a manifest declaring more
+```
+
+Independent of `edge_sync.enabled`: a hub that only ever takes drives exposes **no** network-writable surface — `/api/v1/sync/file` returns 404.
+
+```bash
+curl -X POST https://hub.example.com/api/v1/bundle-import \
+  -H "Authorization: Bearer $ARC_TOKEN" \
+  -d '{"path": "/mnt/usb/bundle-submarine-01-06FXW4H1BHR3XHWK2J826G28JG"}'
+```
+
+**Nothing is committed until the whole bundle verifies.** The MAC, `entries.jsonl`'s own hash, the canonical entries digest, every file's size and digest, and the absence of any undeclared file are all checked first. A tampered drive is refused with `422` naming the offending file, and not one byte reaches storage.
+
+Three refusals an operator will actually meet:
+
+| Situation | Response |
+|---|---|
+| Already imported | `409`, with when it arrived and how many files |
+| Tampered, truncated, wrong hub, unknown or disabled spoke | `422`, naming what failed |
+| Path outside `allowed_dirs` | `400` |
+
+**Replay protection is a dedup ledger, not a clock.** The hub records every imported bundle keyed `(spoke_id, bundle_id)` — namespaced, so a compromised spoke cannot burn IDs in another's space. A re-imported drive is refused rather than re-applied. A *refused* bundle is never recorded, so a corrected drive still imports.
+
+In cluster mode, manifest registrations are **batched at 1000 ops per Raft proposal**. The online path is naturally rate-limited to one proposal per HTTP request; an import is a tight loop, so a 2,500-file bundle costs 3 proposals rather than 2,500.
+
+`GET /api/v1/bundle-import/history/{spoke_id}` answers "did last month's drive ever arrive?" — which, on a link with no telemetry, nothing else can.
+
+The acknowledgment that advances `exported` to `synced` lands next.
 
 ## Security hardening
 
