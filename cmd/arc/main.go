@@ -28,6 +28,7 @@ import (
 	"github.com/basekick-labs/arc/internal/compaction"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
+	"github.com/basekick-labs/arc/internal/edgesync"
 	"github.com/basekick-labs/arc/internal/fips"
 	"github.com/basekick-labs/arc/internal/governance"
 	"github.com/basekick-labs/arc/internal/iceberg"
@@ -1932,6 +1933,73 @@ func main() {
 		lineProtocolHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}
 	lineProtocolHandler.RegisterRoutes(server.GetApp())
+
+	// Register the edge-sync hub receive endpoint (#569).
+	//
+	// Opt-in: an Arc that is not a hub must not expose a remotely-writable
+	// surface. When enabled, two independent auth layers apply — Arc's API
+	// token middleware on the route group, and a per-spoke HMAC inside the
+	// handler that binds spoke, hub, path, and content digest.
+	//
+	// storageBackend is always non-nil here (main exits earlier if it fails to
+	// construct), but clusterCoordinator may be nil: OSS standalone runs a hub
+	// with no Raft manifest, where the backend's own listing is the manifest.
+	// RegisterFile is therefore nil in that mode rather than assumed present.
+	if cfg.EdgeSync.Enabled {
+		var registerFile func(context.Context, *edgesync.ReceivedFile) error
+		if clusterCoordinator != nil {
+			coord := clusterCoordinator
+			registerFile = func(_ context.Context, f *edgesync.ReceivedFile) error {
+				return coord.RegisterFileInManifest(clusterraft.FileEntry{
+					Path:        f.Path,
+					SHA256:      f.SHA256,
+					SizeBytes:   f.SizeBytes,
+					Database:    f.Database(),
+					Measurement: f.Measurement(),
+					// PartitionTime drives hot/cold routing and tiering age
+					// checks; leaving it zero would make a synced file look
+					// infinitely old to the migrator and exclude it from
+					// time-ranged queries.
+					PartitionTime: f.PartitionTime(),
+					OriginNodeID:  f.SpokeID,
+					Tier:          "hot",
+					CreatedAt:     time.Now().UTC(),
+				})
+			}
+		}
+
+		receiver, err := edgesync.NewReceiver(edgesync.ReceiverConfig{
+			Backend:      storageBackend,
+			Logger:       logger.Get("edgesync"),
+			RegisterFile: registerFile,
+		})
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to create edge sync receiver; refusing to start")
+		}
+
+		// TODO(#569 PR 7): spoke secrets come from the SQLite registry. Until
+		// that lands there is no way to register a spoke, so the hub starts
+		// with an empty set and rejects every request — visible and safe,
+		// rather than silently accepting unauthenticated writes.
+		syncHandler, err := api.NewEdgeSyncHandler(api.EdgeSyncHandlerConfig{
+			Receiver:     receiver,
+			SpokeSecrets: api.StaticSpokeSecrets(nil),
+			Replay:       security.NewNonceCache(security.HMACTimestampTolerance),
+			HubID:        cfg.EdgeSync.HubID,
+			MaxFileBytes: cfg.EdgeSync.MaxFileBytes,
+			AuthManager:  authManager,
+			Logger:       logger.Get("edgesync"),
+		})
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to create edge sync handler; refusing to start")
+		}
+		syncHandler.RegisterRoutes(server.GetApp())
+
+		syncLogger := logger.Get("edgesync")
+		syncLogger.Warn().
+			Str("hub_id", cfg.EdgeSync.HubID).
+			Msg("Edge sync hub enabled with no registered spokes; every request will be rejected until the spoke registry lands (#569 PR 7)")
+	}
 
 	// Register TLE handler (streaming TLE ingestion)
 	tleHandler := api.NewTLEHandler(arrowBuffer, logger.Get("tle"))

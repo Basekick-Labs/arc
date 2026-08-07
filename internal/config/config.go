@@ -23,6 +23,7 @@ type Config struct {
 	Log             LogConfig
 	Auth            AuthConfig
 	Compaction      CompactionConfig
+	EdgeSync        EdgeSyncConfig
 	WAL             WALConfig
 	Telemetry       TelemetryConfig
 	Delete          DeleteConfig
@@ -171,6 +172,38 @@ type CompactionConfig struct {
 	CompletionWatcherIntervalMS int    // Watcher poll interval in milliseconds (default: 1000)
 	CompletionDir               string // Override the watcher directory (default: "" = {temp_directory}/.completion/pending)
 	CompletionOrphanTimeoutMS   int    // Sweep "writing_output" manifests older than this on startup (default: 600000 = 10min)
+}
+
+// EdgeSyncConfig configures the hub side of edge-to-cloud sync (#569).
+//
+// A "hub" is a central Arc that receives immutable Parquet files pushed by
+// "spokes" — edge Arc instances in vehicles, factories, or forward
+// deployments. Only the receive side is configured here; a spoke needs no
+// server-side configuration at all.
+type EdgeSyncConfig struct {
+	// Enabled mounts the hub receive endpoints. Off by default: an Arc that
+	// is not acting as a hub must not expose a remotely-writable surface.
+	Enabled bool
+
+	// HubID names this hub. It is bound into every request's HMAC, so a
+	// request minted for a different hub — even by a spoke that legitimately
+	// syncs to both — is rejected here. Required when Enabled.
+	HubID string
+
+	// MaxFileBytes caps a single upload.
+	//
+	// This is a DoS control, not a tuning knob. The Fiber app runs with
+	// StreamRequestBody=false (see api/server.go), so fasthttp buffers the
+	// WHOLE body in memory before routing — which means before any
+	// authentication runs. Under the global server.max_payload_size default
+	// of 1GB, anyone who can merely reach the port could pin 1GB of hub
+	// memory per connection without holding a token or a spoke secret.
+	//
+	// The handler rejects on Content-Length before the body is consumed, so
+	// this bound is enforced ahead of that buffering rather than after it.
+	// Default 512MiB, comfortably above a compacted Parquet file
+	// (compaction.max_files_per_batch keeps those well below it).
+	MaxFileBytes int64
 }
 
 type WALConfig struct {
@@ -610,6 +643,11 @@ func Load() (*Config, error) {
 			BootstrapToken: v.GetString("auth.bootstrap_token"),
 			ForceBootstrap: v.GetBool("auth.force_bootstrap"),
 		},
+		EdgeSync: EdgeSyncConfig{
+			Enabled:      v.GetBool("edge_sync.enabled"),
+			HubID:        v.GetString("edge_sync.hub_id"),
+			MaxFileBytes: int64(v.GetInt64("edge_sync.max_file_bytes")),
+		},
 		Compaction: CompactionConfig{
 			Enabled:                     v.GetBool("compaction.enabled"),
 			HourlySchedule:              v.GetString("compaction.hourly_schedule"),
@@ -941,6 +979,43 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// A hub without an ID cannot authenticate anything: hub_id is bound into
+	// every request MAC, so an empty value would mean every spoke signs for
+	// the same anonymous hub and a request captured at one could be replayed
+	// at another. Refuse at load rather than start an unsafe listener.
+	if cfg.EdgeSync.Enabled {
+		if cfg.EdgeSync.HubID == "" {
+			return nil, fmt.Errorf("edge_sync.enabled=true requires edge_sync.hub_id to be set: " +
+				"it is bound into every spoke request's HMAC, so an empty value would let a request " +
+				"captured at one hub be replayed at another")
+		}
+		if strings.ContainsAny(cfg.EdgeSync.HubID, "\x00/\\") {
+			return nil, fmt.Errorf("edge_sync.hub_id %q may not contain a path separator or NUL byte", cfg.EdgeSync.HubID)
+		}
+		// Control characters would land in logs and error messages verbatim.
+		// No forgery consequence (hub_id is length-prefixed into the MAC and
+		// never used as a path) — this is log-injection hygiene.
+		for _, r := range cfg.EdgeSync.HubID {
+			if r < 0x20 || r == 0x7f {
+				return nil, fmt.Errorf("edge_sync.hub_id may not contain control characters")
+			}
+		}
+		if len(cfg.EdgeSync.HubID) > 128 {
+			return nil, fmt.Errorf("edge_sync.hub_id is %d bytes; the maximum is 128", len(cfg.EdgeSync.HubID))
+		}
+		if cfg.EdgeSync.MaxFileBytes <= 0 {
+			return nil, fmt.Errorf("edge_sync.max_file_bytes must be > 0 (got %d)", cfg.EdgeSync.MaxFileBytes)
+		}
+		// The global body limit is enforced by fasthttp BEFORE the handler
+		// runs, so a per-upload cap above it could never take effect and the
+		// operator would silently get the smaller bound.
+		if cfg.EdgeSync.MaxFileBytes > cfg.Server.MaxPayloadSize {
+			return nil, fmt.Errorf("edge_sync.max_file_bytes (%d) exceeds server.max_payload_size (%d); "+
+				"the server limit is enforced first, so the larger value would never apply",
+				cfg.EdgeSync.MaxFileBytes, cfg.Server.MaxPayloadSize)
+		}
+	}
+
 	return cfg, nil
 }
 
@@ -1013,6 +1088,14 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("auth.max_cache_size", 1000)     // Max cached tokens
 
 	// Compaction defaults
+	// Edge sync: the hub receive side is OFF by default. Enabling it exposes
+	// an endpoint that accepts file writes from registered spokes, so it must
+	// be a deliberate operator decision rather than something that appears on
+	// upgrade.
+	v.SetDefault("edge_sync.enabled", false)
+	v.SetDefault("edge_sync.hub_id", "")
+	v.SetDefault("edge_sync.max_file_bytes", 512*1024*1024) // 512MiB per upload
+
 	v.SetDefault("compaction.enabled", true)
 	v.SetDefault("compaction.hourly_schedule", "5 * * * *")        // Every hour at :05
 	v.SetDefault("compaction.daily_schedule", "0 3 * * *")         // 3 AM daily
