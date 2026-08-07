@@ -266,7 +266,9 @@ func (e *Exporter) ApplyAck(ctx context.Context, dir string) (*AckResult, error)
 	e.logger.Info().
 		Str("bundle_id", res.BundleID).
 		Int("synced", res.Synced).
-		Int("unknown", res.Unknown).
+		Int("already_synced", res.AlreadySynced).
+		Int("untracked", res.Untracked).
+		Int("discrepancies", res.Discrepancies).
 		Int("conflicts", len(res.Conflicts)).
 		Msg("Acknowledgment applied")
 

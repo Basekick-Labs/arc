@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/rs/zerolog"
 )
@@ -285,10 +284,16 @@ func TestAck_ApplyingTwiceIsHarmless(t *testing.T) {
 	if first.Synced != 2 {
 		t.Errorf("first apply synced %d, want 2", first.Synced)
 	}
-	// The second finds them already synced — reported as unknown, not synced
-	// again, and above all not an error.
+	// The second finds them already synced — counted apart from a real
+	// discrepancy, not synced again, and above all not an error.
 	if second.Synced != 0 {
 		t.Errorf("second apply synced %d, want 0", second.Synced)
+	}
+	if second.AlreadySynced != 2 {
+		t.Errorf("already_synced = %d, want 2", second.AlreadySynced)
+	}
+	if second.Discrepancies != 0 {
+		t.Errorf("a benign replay reported %d discrepancies", second.Discrepancies)
 	}
 
 	st, _ := l.Stats(ctx, testHubID)
@@ -320,7 +325,6 @@ func TestAck_MACIsADistinctFamily(t *testing.T) {
 	if ack.MAC == m.MAC {
 		t.Error("the ack and the manifest share a MAC")
 	}
-	_ = ctx
 }
 
 // An ack whose file is absurdly large must be refused before it is parsed.
@@ -341,8 +345,6 @@ func TestAck_OversizedAckIsRefused(t *testing.T) {
 		t.Errorf("error = %v, want a size-bound refusal", err)
 	}
 }
-
-var _ = time.Now
 
 // The hub writes ack.json INTO the bundle, but the manifest was signed before
 // it existed and cannot cover it. A returned drive must still re-verify, or an
@@ -402,5 +404,64 @@ func TestAck_TamperedAckIsStillRefusedOnRead(t *testing.T) {
 	// ...but ReadAck must refuse it, so nothing is ever advanced.
 	if _, err := ReadAck(dir, rig.secret, testSpokeID, testHubID); err == nil {
 		t.Error("a replaced acknowledgment was accepted")
+	}
+}
+
+// The three non-advanced cases mean different things. Collapsing them hides
+// the only one that says something is wrong: the hub holding a file this spoke
+// gave up on.
+func TestAck_NonAdvancedPathsAreClassified(t *testing.T) {
+	ctx := context.Background()
+	l := setupTestLedger(t)
+
+	const (
+		synced    = "m/cpu/2026/08/06/10/synced.parquet"
+		failed    = "m/cpu/2026/08/06/11/failed.parquet"
+		untracked = "m/cpu/2026/08/06/12/untracked.parquet"
+	)
+
+	for _, p := range []string{synced, failed} {
+		e := testEntry(p)
+		e.HubID = testHubID
+		if err := l.Track(ctx, e); err != nil {
+			t.Fatalf("track: %v", err)
+		}
+	}
+	if err := l.MarkSynced(ctx, testHubID, synced); err != nil {
+		t.Fatalf("mark synced: %v", err)
+	}
+	if err := l.MarkInFlight(ctx, testHubID, failed); err != nil {
+		t.Fatalf("mark in flight: %v", err)
+	}
+	if err := l.MarkFailed(ctx, testHubID, failed, "gave up", 1); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+
+	res, err := ApplyAck(ctx, l, &Ack{
+		HubID: testHubID,
+		Paths: []string{synced, failed, untracked},
+	}, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	if res.AlreadySynced != 1 {
+		t.Errorf("already_synced = %d, want 1", res.AlreadySynced)
+	}
+	if res.Untracked != 1 {
+		t.Errorf("untracked = %d, want 1", res.Untracked)
+	}
+	// The one that matters: the hub holds a file this spoke gave up on.
+	if res.Discrepancies != 1 {
+		t.Errorf("discrepancies = %d, want 1", res.Discrepancies)
+	}
+
+	// And a terminally failed entry is NOT resurrected by an ack.
+	entry, err := l.Get(ctx, testHubID, failed)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if entry.State != StateFailed {
+		t.Errorf("the failed entry became %q; an ack must not resurrect it", entry.State)
 	}
 }

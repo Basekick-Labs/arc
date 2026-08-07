@@ -188,11 +188,20 @@ type AckResult struct {
 	// Synced is how many entries advanced from exported to synced.
 	Synced int
 
-	// Unknown is how many acknowledged paths this ledger does not track, or
-	// tracks in a state the ack cannot advance. Not an error: a spoke restored
-	// from a backup, or one whose entries were already synced by another
-	// route, legitimately produces these.
-	Unknown int
+	// AlreadySynced is how many acknowledged paths were already synced. The
+	// benign replay case: a drive plugged in twice.
+	AlreadySynced int
+
+	// Untracked is how many acknowledged paths this ledger does not know. A
+	// spoke restored from a backup legitimately produces these.
+	Untracked int
+
+	// Discrepancies is how many acknowledged paths this ledger holds in a
+	// state the ack cannot advance — in practice, terminally failed. The hub
+	// says it HOLDS a file this spoke gave up on, which an operator should
+	// see. Counted apart from the two benign cases because collapsing all
+	// three hides the only one that means something is wrong.
+	Discrepancies int
 
 	Conflicts []Conflict
 }
@@ -202,6 +211,14 @@ type AckResult struct {
 // The caller must have obtained the Ack from ReadAck, which verifies it. This
 // function trusts what it is given, so handing it an unverified ack would let a
 // tampered path list mark files synced that no hub ever received.
+//
+// An acknowledged entry that is still `pending` — one the spoke never put on
+// the drive, queued for the network path instead — IS advanced, deliberately.
+// ReadAck has proven the hub holds that exact path, so `synced` is factually
+// true however it got there, and re-sending it over a contact window would
+// spend link budget on a file already delivered. The effect is that a drive can
+// satisfy work queued for the network, which is the right outcome when both
+// transports are enabled.
 func ApplyAck(ctx context.Context, l *Ledger, a *Ack, logger zerolog.Logger) (*AckResult, error) {
 	if l == nil {
 		return nil, errors.New("edgesync: apply ack: nil ledger")
@@ -222,13 +239,31 @@ func ApplyAck(ctx context.Context, l *Ledger, a *Ack, logger zerolog.Logger) (*A
 			return nil, err
 		}
 		if err := l.MarkSynced(ctx, a.HubID, p); err != nil {
-			// Not fatal. An entry the ack names but this ledger cannot advance
-			// — already synced, never tracked, or terminally failed — is a
-			// discrepancy to report, not a reason to abandon the rest of a
+			// Not fatal: an entry the ack names but this ledger cannot advance
+			// is something to report, not a reason to abandon the rest of a
 			// valid acknowledgment.
-			res.Unknown++
-			logger.Debug().Err(err).Str("path", p).
-				Msg("Acknowledged path could not be advanced")
+			//
+			// Classified rather than lumped together. The ledger already
+			// distinguishes "no such row" from "wrong state", and the two mean
+			// opposite things to an operator.
+			switch {
+			case errors.Is(err, ErrNotFound):
+				res.Untracked++
+				logger.Debug().Str("path", p).Msg("Acknowledged path is not tracked by this ledger")
+			default:
+				// Wrong state. Already-synced is the benign replay case;
+				// anything else — in practice a terminally failed entry — is a
+				// real discrepancy, because the hub says it holds a file this
+				// spoke gave up on.
+				entry, getErr := l.Get(ctx, a.HubID, p)
+				if getErr == nil && entry.State == StateSynced {
+					res.AlreadySynced++
+					continue
+				}
+				res.Discrepancies++
+				logger.Warn().Err(err).Str("path", p).
+					Msg("The hub acknowledges a file this spoke cannot advance; investigate")
+			}
 			continue
 		}
 		res.Synced++

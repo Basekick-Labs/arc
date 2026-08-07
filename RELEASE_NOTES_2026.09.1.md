@@ -204,7 +204,14 @@ curl -X POST https://edge.local:8000/api/v1/spoke-sync/ack \
 ```
 
 ```json
-{"applied": true, "bundle_id": "06FXWFA2NYJ…", "hub_id": "shore-station", "synced": 4}
+{
+  "applied": true,
+  "bundle_id": "06FXWFA2NYJHJJFAJAXBDV4PKC",
+  "hub_id": "shore-station",
+  "imported_at": "2026-08-07T21:59:56Z",
+  "synced": 4,
+  "conflicts": []
+}
 ```
 
 Those files move from `exported` to `synced`, which is what finally makes them **prunable**. Before this, `synced` was unreachable on an air-gapped spoke: `PruneSynced` never pruned and the ledger grew without bound on the box least able to receive a site visit.

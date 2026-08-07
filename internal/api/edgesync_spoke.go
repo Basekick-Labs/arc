@@ -445,11 +445,22 @@ func (h *EdgeSyncSpokeHandler) applyAck(c *fiber.Ctx) error {
 		"imported_at": res.ImportedAt,
 		"synced":      res.Synced,
 	}
-	if res.Unknown > 0 {
-		// Not a failure — a spoke restored from a backup, or whose entries
-		// were already synced by another route, legitimately produces these —
-		// but an operator comparing counts deserves to know.
-		out["unknown"] = res.Unknown
+	var warnings []string
+	// The three non-advanced cases mean different things, so they are reported
+	// apart. Already-synced is the benign replay; untracked is a restored
+	// spoke; a discrepancy means the hub holds a file this spoke gave up on,
+	// which is the only one that says something is wrong.
+	if res.AlreadySynced > 0 {
+		out["already_synced"] = res.AlreadySynced
+	}
+	if res.Untracked > 0 {
+		out["untracked"] = res.Untracked
+	}
+	if res.Discrepancies > 0 {
+		out["discrepancies"] = res.Discrepancies
+		warnings = append(warnings,
+			"The hub acknowledges files this spoke had given up on. They remain failed locally; "+
+				"the data IS on the hub, but the local ledger disagrees and is worth investigating.")
 	}
 
 	conflicts := make([]fiber.Map, 0, len(res.Conflicts))
@@ -461,8 +472,12 @@ func (h *EdgeSyncSpokeHandler) applyAck(c *fiber.Ctx) error {
 	}
 	out["conflicts"] = conflicts
 	if len(conflicts) > 0 {
-		out["warning"] = "The hub holds different content at these paths. They were NOT acknowledged " +
-			"and remain exported; investigate before re-sending."
+		warnings = append(warnings,
+			"The hub holds different content at these paths. They were NOT acknowledged "+
+				"and remain exported; investigate before re-sending.")
+	}
+	if len(warnings) > 0 {
+		out["warnings"] = warnings
 	}
 
 	return c.JSON(out)
