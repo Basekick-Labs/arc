@@ -26,7 +26,7 @@ func TestMQTTHandler_DisabledManager(t *testing.T) {
 
 	t.Run("stats_returns_503", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/api/v1/mqtt/stats", nil)
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, testRequestTimeoutMS)
 		if err != nil {
 			t.Fatalf("app.Test: %v", err)
 		}
@@ -53,7 +53,7 @@ func TestMQTTHandler_DisabledManager(t *testing.T) {
 
 	t.Run("health_returns_200_disabled", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/api/v1/mqtt/health", nil)
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, testRequestTimeoutMS)
 		if err != nil {
 			t.Fatalf("app.Test: %v", err)
 		}

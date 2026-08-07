@@ -58,7 +58,7 @@ func TestMQTTSubscriptionHandler_DisabledManager(t *testing.T) {
 			if tc.body != "" {
 				req.Header.Set("Content-Type", "application/json")
 			}
-			resp, err := app.Test(req)
+			resp, err := app.Test(req, testRequestTimeoutMS)
 			if err != nil {
 				t.Fatalf("app.Test: %v", err)
 			}

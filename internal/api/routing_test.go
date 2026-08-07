@@ -60,7 +60,7 @@ func TestBuildHTTPRequest(t *testing.T) {
 	req.Header.Set("Content-Type", "application/msgpack")
 	req.Header.Set("X-Arc-Database", "test-database")
 
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testRequestTimeoutMS)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.Equal(t, fiber.StatusOK, resp.StatusCode)
@@ -109,7 +109,7 @@ func TestBuildHTTPRequest_PreservesMultiValueHeaders(t *testing.T) {
 	req.Header.Add("Via", "1.1 proxy1.example.com")
 	req.Header.Add("Via", "1.1 proxy2.example.com")
 
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testRequestTimeoutMS)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, fiber.StatusOK, resp.StatusCode)
@@ -189,7 +189,7 @@ func TestBuildHTTPRequest_FiltersHopByHopAndContentLength(t *testing.T) {
 	req.Header.Set("X-Arc-Database", "production")
 	req.Header.Set("X-Custom-Trace-Id", "abc-123")
 
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testRequestTimeoutMS)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, fiber.StatusOK, resp.StatusCode)
@@ -240,7 +240,7 @@ func TestCopyResponse(t *testing.T) {
 	})
 
 	req := httptest.NewRequest("GET", "/test", nil)
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testRequestTimeoutMS)
 	require.NoError(t, err)
 
 	// Verify status code is copied
@@ -290,7 +290,7 @@ func TestShouldForwardWrite(t *testing.T) {
 				req.Header.Set(ForwardedByHeader, tt.forwardedBy)
 			}
 
-			_, err := app.Test(req)
+			_, err := app.Test(req, testRequestTimeoutMS)
 			require.NoError(t, err)
 			assert.Equal(t, tt.expectedResult, result)
 		})
@@ -332,7 +332,7 @@ func TestShouldForwardQuery(t *testing.T) {
 				req.Header.Set(ForwardedByHeader, tt.forwardedBy)
 			}
 
-			_, err := app.Test(req)
+			_, err := app.Test(req, testRequestTimeoutMS)
 			require.NoError(t, err)
 			assert.Equal(t, tt.expectedResult, result)
 		})
@@ -395,7 +395,7 @@ func TestForwardDecision_ClientCannotForceLocal(t *testing.T) {
 			if tt.forwardedBy != "" {
 				req.Header.Set(ForwardedByHeader, tt.forwardedBy)
 			}
-			_, err := app.Test(req)
+			_, err := app.Test(req, testRequestTimeoutMS)
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, got)
 		})
@@ -438,7 +438,7 @@ func TestBuildHTTPRequest_StripsClientForwardingHeaders(t *testing.T) {
 	// A legitimate end-to-end header must still pass through.
 	req.Header.Set("X-Arc-Database", "mydb")
 
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testRequestTimeoutMS)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, fiber.StatusOK, resp.StatusCode)
@@ -460,7 +460,7 @@ func TestHandleRoutingError(t *testing.T) {
 	})
 
 	req := httptest.NewRequest("GET", "/test-routing-error", nil)
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testRequestTimeoutMS)
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusBadGateway, resp.StatusCode)
 }

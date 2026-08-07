@@ -68,7 +68,7 @@ func doRBACRequest(t *testing.T, app *fiber.App, method, path, body string) (int
 
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := app.Test(req, 5000)
+	resp, err := app.Test(req, testRequestTimeoutMS)
 	if err != nil {
 		t.Fatalf("%s %s: %v", method, path, err)
 	}
