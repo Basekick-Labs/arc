@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"regexp"
 	"runtime"
@@ -205,6 +206,14 @@ type EdgeSyncConfig struct {
 	// (compaction.max_files_per_batch keeps those well below it).
 	MaxFileBytes int64
 
+	// Spoke is the push side: this Arc instance sending its files to a hub.
+	//
+	// Separate from the hub keys above because an Arc can be a hub, a spoke,
+	// both, or neither, and the two roles share no settings. A flat block
+	// would leave an operator unable to tell which keys apply to their
+	// deployment.
+	Spoke EdgeSyncSpokeConfig
+
 	// MaxReconcileEntries caps one batch-discovery request.
 	//
 	// The design wants a spoke's whole pending set in one round-trip, but the
@@ -213,6 +222,54 @@ type EdgeSyncConfig struct {
 	// spoke page keeps what matters — discovery costs O(batches), not
 	// O(files) — while bounding the exposure. Default 10,000 entries (~2MB).
 	MaxReconcileEntries int
+}
+
+// EdgeSyncSpokeConfig configures the push side of edge sync (#569).
+type EdgeSyncSpokeConfig struct {
+	// Enabled mounts the manual sync controls. Off by default: pushing data
+	// off a box is a deliberate decision.
+	Enabled bool
+
+	// HubURL is the hub's root, e.g. https://ground-station.example.com.
+	HubURL string
+
+	// SpokeID is this instance's identity, as registered on the hub with
+	// POST /api/v1/sync-spokes. Becomes the first path segment of everything
+	// this spoke writes there.
+	SpokeID string
+
+	// HubID is the REMOTE hub's identity, and must match that hub's
+	// edge_sync.hub_id exactly.
+	//
+	// It is bound into every request MAC, so the hub rejects anything signed
+	// for a different one — which is what stops a request captured en route to
+	// one hub from being replayed at another that shares this spoke's secret.
+	// A mismatch fails every request with a 400, so it is validated at load
+	// rather than discovered on the first contact window.
+	HubID string
+
+	// Secret is the hub-issued shared secret, read ONLY from
+	// ARC_EDGE_SYNC_SPOKE_SECRET.
+	//
+	// Deliberately not a config key. Viper binds every key to an env var, so
+	// declaring one would also make it settable from arc.toml — and a live
+	// write credential in a config file is a credential in every copy, backup,
+	// and commit of that file. ARC_ENCRYPTION_KEY sets the same precedent.
+	// Arc refuses to start if a secret appears in the config file rather than
+	// quietly preferring the environment, because a silent preference leaves
+	// the committed copy looking load-bearing while still being leaked.
+	Secret string
+
+	// MaxAttempts before a file is given up on. Zero uses the package default.
+	MaxAttempts int
+
+	// MaxConcurrent bounds simultaneous transfers. Zero means 2 — edge boxes
+	// are small.
+	MaxConcurrent int
+
+	// BatchSize caps how many files one reconcile asks about. Zero lets the
+	// hub's own limit decide, and a larger backlog pages.
+	BatchSize int
 }
 
 type WALConfig struct {
@@ -657,6 +714,16 @@ func Load() (*Config, error) {
 			HubID:               v.GetString("edge_sync.hub_id"),
 			MaxFileBytes:        int64(v.GetInt64("edge_sync.max_file_bytes")),
 			MaxReconcileEntries: v.GetInt("edge_sync.max_reconcile_entries"),
+			Spoke: EdgeSyncSpokeConfig{
+				Enabled:       v.GetBool("edge_sync.spoke.enabled"),
+				HubURL:        v.GetString("edge_sync.spoke.hub_url"),
+				SpokeID:       v.GetString("edge_sync.spoke.spoke_id"),
+				HubID:         v.GetString("edge_sync.spoke.hub_id"),
+				Secret:        os.Getenv("ARC_EDGE_SYNC_SPOKE_SECRET"),
+				MaxAttempts:   v.GetInt("edge_sync.spoke.max_attempts"),
+				MaxConcurrent: v.GetInt("edge_sync.spoke.max_concurrent"),
+				BatchSize:     v.GetInt("edge_sync.spoke.batch_size"),
+			},
 		},
 		Compaction: CompactionConfig{
 			Enabled:                     v.GetBool("compaction.enabled"),
@@ -989,6 +1056,76 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// The spoke secret must come from the environment. Refuse rather than
+	// silently prefer it: a config-file secret that is ignored still leaks,
+	// and leaving it in place makes the committed copy look load-bearing.
+	//
+	// InConfig, not IsSet: with AutomaticEnv in play IsSet also consults the
+	// environment, so it fires on ARC_EDGE_SYNC_SPOKE_SECRET — the one way an
+	// operator is supposed to supply the secret — and refuses to start in the
+	// configuration this check exists to require. InConfig reads only the
+	// parsed file, which is the thing being prohibited.
+	if v.InConfig("edge_sync.spoke.secret") || v.InConfig("edge_sync.spoke.shared_secret") {
+		return nil, fmt.Errorf("edge_sync.spoke.secret must not be set in the configuration file; " +
+			"supply it via the ARC_EDGE_SYNC_SPOKE_SECRET environment variable so a write credential " +
+			"is not stored in a file that gets copied, backed up, and committed")
+	}
+
+	if cfg.EdgeSync.Spoke.Enabled {
+		if cfg.EdgeSync.Spoke.HubURL == "" {
+			return nil, fmt.Errorf("edge_sync.spoke.enabled=true requires edge_sync.spoke.hub_url")
+		}
+		// Parsed, not prefix-matched. The transport builds request URLs by
+		// concatenating endpoint paths onto this value, so a fragment or query
+		// string swallows the path — "https://hub#f" + "/api/v1/sync/file"
+		// requests "/" with the endpoint buried in the fragment, and the hub
+		// answers with something that looks nothing like a config error.
+		hubURL, err := url.Parse(cfg.EdgeSync.Spoke.HubURL)
+		if err != nil {
+			return nil, fmt.Errorf("edge_sync.spoke.hub_url %q is not a valid URL: %w", cfg.EdgeSync.Spoke.HubURL, err)
+		}
+		if hubURL.Scheme != "http" && hubURL.Scheme != "https" {
+			return nil, fmt.Errorf("edge_sync.spoke.hub_url %q must start with http:// or https://", cfg.EdgeSync.Spoke.HubURL)
+		}
+		if hubURL.Host == "" {
+			return nil, fmt.Errorf("edge_sync.spoke.hub_url %q has no host", cfg.EdgeSync.Spoke.HubURL)
+		}
+		if hubURL.RawQuery != "" || hubURL.Fragment != "" {
+			return nil, fmt.Errorf("edge_sync.spoke.hub_url %q must not carry a query string or fragment: "+
+				"endpoint paths are appended to it, and either one would swallow them", cfg.EdgeSync.Spoke.HubURL)
+		}
+		if cfg.EdgeSync.Spoke.SpokeID == "" {
+			return nil, fmt.Errorf("edge_sync.spoke.enabled=true requires edge_sync.spoke.spoke_id (the ID registered on the hub)")
+		}
+
+		// Negative tuning values are rejected rather than clamped silently.
+		// batch_size in particular reaches a make() capacity on the sync path,
+		// so a negative one crashes the spoke on the pass it was configured
+		// for; the agent clamps defensively, but an operator who typed it
+		// should be told at startup rather than have it quietly ignored.
+		if cfg.EdgeSync.Spoke.BatchSize < 0 {
+			return nil, fmt.Errorf("edge_sync.spoke.batch_size must be >= 0 (got %d); 0 means \"use the hub's cap\"",
+				cfg.EdgeSync.Spoke.BatchSize)
+		}
+		if cfg.EdgeSync.Spoke.MaxAttempts < 0 {
+			return nil, fmt.Errorf("edge_sync.spoke.max_attempts must be >= 0 (got %d); 0 means \"use the default\"",
+				cfg.EdgeSync.Spoke.MaxAttempts)
+		}
+		if cfg.EdgeSync.Spoke.MaxConcurrent < 0 {
+			return nil, fmt.Errorf("edge_sync.spoke.max_concurrent must be >= 0 (got %d); 0 means \"use the default\"",
+				cfg.EdgeSync.Spoke.MaxConcurrent)
+		}
+		if cfg.EdgeSync.Spoke.HubID == "" {
+			return nil, fmt.Errorf("edge_sync.spoke.enabled=true requires edge_sync.spoke.hub_id: " +
+				"it is bound into every request's HMAC and must match the remote hub's edge_sync.hub_id, " +
+				"so a wrong or missing value fails every request")
+		}
+		if cfg.EdgeSync.Spoke.Secret == "" {
+			return nil, fmt.Errorf("edge_sync.spoke.enabled=true requires the ARC_EDGE_SYNC_SPOKE_SECRET environment variable; " +
+				"it is the secret the hub issued when this spoke was registered")
+		}
+	}
+
 	// A hub without an ID cannot authenticate anything: hub_id is bound into
 	// every request MAC, so an empty value would mean every spoke signs for
 	// the same anonymous hub and a request captured at one could be replayed
@@ -1119,6 +1256,17 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("edge_sync.hub_id", "")
 	v.SetDefault("edge_sync.max_file_bytes", 512*1024*1024) // 512MiB per upload
 	v.SetDefault("edge_sync.max_reconcile_entries", 10000)  // ~2MB per discovery batch
+
+	// Spoke side. Declared here rather than relying only on the agent's
+	// zero-value fallbacks so the defaults are visible to an operator reading
+	// the config, and so the documented value and the code cannot drift apart.
+	v.SetDefault("edge_sync.spoke.enabled", false)
+	v.SetDefault("edge_sync.spoke.hub_url", "")
+	v.SetDefault("edge_sync.spoke.spoke_id", "")
+	v.SetDefault("edge_sync.spoke.hub_id", "")
+	v.SetDefault("edge_sync.spoke.max_attempts", 5)   // before a file is marked failed
+	v.SetDefault("edge_sync.spoke.max_concurrent", 2) // edge boxes are small
+	v.SetDefault("edge_sync.spoke.batch_size", 0)     // 0 defers to the hub's cap
 
 	v.SetDefault("compaction.enabled", true)
 	v.SetDefault("compaction.hourly_schedule", "5 * * * *")        // Every hour at :05

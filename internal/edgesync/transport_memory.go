@@ -44,7 +44,18 @@ type MemoryTransport struct {
 	// failing link.
 	failures map[string][]*PutResult
 
+	// putOrder records the paths PutFile was called with, in call order, so a
+	// test can assert the agent's newest-first ordering.
+	putOrder []string
+
 	closed bool
+}
+
+// PutOrder returns the paths PutFile was called with, in order.
+func (m *MemoryTransport) PutOrder() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.putOrder...)
 }
 
 type memFile struct {
@@ -211,6 +222,8 @@ func (m *MemoryTransport) PutFile(ctx context.Context, hubID string, entry *Ledg
 	// Phase 1 — decide under the lock whether this transfer should read a body
 	// at all, and grab the staged prefix if resuming.
 	m.mu.Lock()
+	m.putOrder = append(m.putOrder, entry.Path)
+
 	if m.closed {
 		m.mu.Unlock()
 		return nil, ErrTransportClosed

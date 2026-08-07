@@ -326,6 +326,58 @@ func (l *Ledger) TrackBatch(ctx context.Context, entries []*LedgerEntry) (int, e
 // hub and backfill catches up on a later pass.
 //
 // A limit <= 0 returns all pending entries.
+// Unfinished returns entries that have not reached the hub, in either state
+// an operator cares about: still queued, or given up on.
+//
+// Separate from Pending rather than a widening of it, because the sync pass
+// depends on Pending returning ONLY 'pending' rows — a failed entry re-offered
+// to the hub would restart a transfer the retry cap deliberately stopped.
+// This is the troubleshooting view: a file that exhausted its attempts is the
+// one an operator most needs to see, and it is exactly the one Pending hides.
+//
+// Failed entries sort first: they need a decision, whereas pending ones are
+// simply waiting for the next pass.
+//
+// A limit <= 0 returns everything unfinished.
+func (l *Ledger) Unfinished(ctx context.Context, hubID string, limit int) ([]*LedgerEntry, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+
+	query := `
+		SELECT id, hub_id, path, sha256, size_bytes, database, measurement,
+		       partition_time, discovered_at, state, attempts, last_attempt,
+		       synced_at, bytes_sent, COALESCE(last_error, '')
+		FROM sync_ledger
+		WHERE hub_id = ? AND state IN (?, ?, ?)
+		ORDER BY CASE state WHEN ? THEN 0 ELSE 1 END, partition_time DESC, id ASC`
+	args := []any{hubID, string(StateFailed), string(StatePending), string(StateInFlight), string(StateFailed)}
+
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+
+	rows, err := l.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("edgesync: query unfinished: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*LedgerEntry
+	for rows.Next() {
+		e, err := scanEntry(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("edgesync: iterate unfinished: %w", err)
+	}
+	return out, nil
+}
+
 func (l *Ledger) Pending(ctx context.Context, hubID string, limit int) ([]*LedgerEntry, error) {
 	if hubID == "" {
 		hubID = DefaultHubID
@@ -451,6 +503,35 @@ func (l *Ledger) MarkSynced(ctx context.Context, hubID, path string) error {
 // usually a dropped link, and the bytes the hub already accepted are still
 // valid. Discarding the checkpoint would restart a large file from zero on
 // exactly the link least able to afford it.
+// MarkConflicted terminally fails an entry the hub reports as conflicting.
+//
+// Separate from MarkFailed because that transition is pending→in_flight→failed
+// and requires the row to be in_flight: a conflict found during RECONCILE is
+// still 'pending' — no transfer was ever started for it — so MarkFailed would
+// match no rows and silently leave it pending, to be re-offered in every
+// future reconcile payload forever.
+//
+// Terminal immediately, with no attempt counting: retrying cannot resolve a
+// content disagreement, and the same path holding different bytes on both
+// sides needs a human to decide which copy is right.
+func (l *Ledger) MarkConflicted(ctx context.Context, hubID, path, errMsg string) error {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+
+	// Only from pending: an in_flight row is owned by a running transfer,
+	// which resolves it through sendOne's own conflict path.
+	res, err := l.db.ExecContext(ctx, `
+		UPDATE sync_ledger
+		SET state = ?, last_error = ?
+		WHERE hub_id = ? AND path = ? AND state = ?`,
+		string(StateFailed), errMsg, hubID, path, string(StatePending))
+	if err != nil {
+		return fmt.Errorf("edgesync: mark conflicted %q: %w", path, err)
+	}
+	return l.checkTransition(ctx, res, hubID, path, StatePending)
+}
+
 func (l *Ledger) MarkFailed(ctx context.Context, hubID, path, errMsg string, maxAttempts int) error {
 	if hubID == "" {
 		hubID = DefaultHubID
