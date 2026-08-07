@@ -35,18 +35,28 @@ const syncRunTimeout = 2 * time.Hour
 // that is not a string-prefix of another group's is the only way to keep the
 // two genuinely uncoupled.
 type EdgeSyncSpokeHandler struct {
-	agent       *edgesync.Agent
+	agent *edgesync.Agent
+
+	// exporter is nil unless air-gap bundle export is enabled. It is
+	// independent of the agent: a fully air-gapped spoke exports bundles and
+	// never runs the network path at all.
+	exporter *edgesync.Exporter
+
 	authManager *auth.AuthManager
 	logger      zerolog.Logger
 }
 
 // NewEdgeSyncSpokeHandler validates configuration and returns a ready handler.
-func NewEdgeSyncSpokeHandler(agent *edgesync.Agent, authManager *auth.AuthManager, logger zerolog.Logger) (*EdgeSyncSpokeHandler, error) {
-	if agent == nil {
-		return nil, errors.New("edgesync spoke: agent is required")
+func NewEdgeSyncSpokeHandler(agent *edgesync.Agent, exporter *edgesync.Exporter, authManager *auth.AuthManager, logger zerolog.Logger) (*EdgeSyncSpokeHandler, error) {
+	if agent == nil && exporter == nil {
+		// One or the other must exist, or the routes would all 503. Both is
+		// the normal case for a spoke that has intermittent connectivity AND
+		// ships drives.
+		return nil, errors.New("edgesync spoke: an agent or an exporter is required")
 	}
 	return &EdgeSyncSpokeHandler{
 		agent:       agent,
+		exporter:    exporter,
 		authManager: authManager,
 		logger:      logger.With().Str("component", "edgesync-spoke").Logger(),
 	}, nil
@@ -68,6 +78,8 @@ func (h *EdgeSyncSpokeHandler) RegisterRoutes(app fiber.Router) {
 	group.Post("/run", h.run)
 	group.Get("/status", h.status)
 	group.Get("/ledger", h.ledger)
+	group.Post("/export", h.export)
+	group.Post("/export/:bundle_id/revert", h.revertExport)
 
 	h.logger.Info().Msg("Edge sync spoke routes registered")
 }
@@ -79,6 +91,12 @@ func (h *EdgeSyncSpokeHandler) RegisterRoutes(app fiber.Router) {
 // would mean inventing job tracking for a feature whose automatic form (phase
 // 2) will not need it.
 func (h *EdgeSyncSpokeHandler) run(c *fiber.Ctx) error {
+	if h.agent == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "the network sync agent is not enabled (edge_sync.spoke.enabled)",
+		})
+	}
+
 	ctx, cancel := context.WithTimeout(c.Context(), syncRunTimeout)
 	defer cancel()
 
@@ -137,7 +155,24 @@ func (h *EdgeSyncSpokeHandler) status(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
 	defer cancel()
 
-	st, err := h.agent.Status(ctx)
+	// Served by whichever side exists: both are pure ledger reads, and an
+	// air-gap-only spoke has no agent. Gating this on the agent would hide the
+	// exported count from the only operator who needs it — the one whose files
+	// are on a drive somewhere.
+	var (
+		st  *edgesync.Stats
+		err error
+	)
+	switch {
+	case h.agent != nil:
+		st, err = h.agent.Status(ctx)
+	case h.exporter != nil:
+		st, err = h.exporter.Status(ctx)
+	default:
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "no edge sync transport is enabled",
+		})
+	}
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to read sync status")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -194,7 +229,21 @@ func (h *EdgeSyncSpokeHandler) ledger(c *fiber.Ctx) error {
 		limit = n
 	}
 
-	entries, err := h.agent.UnfinishedEntries(ctx, limit)
+	// Same reasoning as status: a pure ledger read, served by either side.
+	var (
+		entries []*edgesync.LedgerEntry
+		err     error
+	)
+	switch {
+	case h.agent != nil:
+		entries, err = h.agent.UnfinishedEntries(ctx, limit)
+	case h.exporter != nil:
+		entries, err = h.exporter.UnfinishedEntries(ctx, limit)
+	default:
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "no edge sync transport is enabled",
+		})
+	}
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to read the sync ledger")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -228,4 +277,107 @@ func (h *EdgeSyncSpokeHandler) ledger(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{"entries": out, "limit": limit})
+}
+
+// bundleExportTimeout bounds one export.
+//
+// Generous for the same reason a sync pass is: a bundle can carry thousands of
+// files to removable media, and cutting that short leaves a partial tree the
+// writer must then clean up. An operator who wants a shorter bound cancels.
+const bundleExportTimeout = 2 * time.Hour
+
+// export handles POST /api/v1/spoke-sync/export.
+//
+// Writes pending files to an air-gap bundle under an operator-supplied path.
+// The path is checked against the configured allow-list before anything is
+// written — it reaches the filesystem directly, unlike every other Arc write.
+func (h *EdgeSyncSpokeHandler) export(c *fiber.Ctx) error {
+	if h.exporter == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "air-gap bundle export is not enabled (edge_sync.spoke.bundle.enabled)",
+		})
+	}
+
+	var req struct {
+		Path  string `json:"path"`
+		Limit int    `json:"limit"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
+	if req.Path == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "path is required: the directory to write the bundle into",
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(c.Context(), bundleExportTimeout)
+	defer cancel()
+
+	res, err := h.exporter.Export(ctx, req.Path, req.Limit)
+	switch {
+	case errors.Is(err, edgesync.ErrNothingToExport):
+		// Not a failure: a drained backlog is the steady state, and a
+		// scheduled export should not look broken when it finds nothing.
+		return c.JSON(fiber.Map{"exported": false, "reason": "nothing to export"})
+
+	case errors.Is(err, edgesync.ErrDestinationRefused):
+		// The operator's own input, so 400 rather than 503 — retrying without
+		// changing the path would fail identically.
+		h.logger.Warn().Err(err).Msg("Bundle export destination refused")
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+
+	case err != nil:
+		// A fixed string, with the detail in the log — matching this file's
+		// other handlers. The raw error carries absolute filesystem paths, and
+		// while the endpoint is admin-only there is no reason to return them.
+		h.logger.Error().Err(err).Msg("Bundle export failed")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "bundle export failed"})
+	}
+
+	h.logger.Info().
+		Str("bundle_id", res.BundleID).
+		Str("dir", res.Dir).
+		Int("files", res.FileCount).
+		Int64("bytes", res.Bytes).
+		Msg("Bundle exported")
+
+	return c.JSON(fiber.Map{
+		"exported":    true,
+		"bundle_id":   res.BundleID,
+		"dir":         res.Dir,
+		"files":       res.FileCount,
+		"bytes":       res.Bytes,
+		"duration_ms": res.Duration.Milliseconds(),
+		// The bundle is on media but no hub has confirmed it. Saying so here
+		// stops an operator reading "exported" as "delivered".
+		"note": "Files are marked exported, not synced. They advance to synced when the hub acknowledges the bundle.",
+	})
+}
+
+// revertExport handles POST /api/v1/spoke-sync/export/:bundle_id/revert.
+//
+// For a drive that was lost, damaged, or never delivered: returns that
+// bundle's files to pending so a later bundle or contact window carries them.
+// Scoped to one bundle so recovering one drive does not disturb others in
+// transit.
+func (h *EdgeSyncSpokeHandler) revertExport(c *fiber.Ctx) error {
+	if h.exporter == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "air-gap bundle export is not enabled (edge_sync.spoke.bundle.enabled)",
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
+	defer cancel()
+
+	bundleID := c.Params("bundle_id")
+	n, err := h.exporter.Revert(ctx, bundleID)
+	if err != nil {
+		h.logger.Warn().Err(err).Str("bundle_id", bundleID).Msg("Bundle revert failed")
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	h.logger.Info().Str("bundle_id", bundleID).Int64("files", n).Msg("Bundle reverted")
+	return c.JSON(fiber.Map{"bundle_id": bundleID, "reverted": n})
 }

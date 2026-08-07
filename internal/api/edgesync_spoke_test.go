@@ -60,7 +60,7 @@ func newSpokeRig(t *testing.T) *spokeRig {
 		t.Fatalf("agent: %v", err)
 	}
 
-	h, err := NewEdgeSyncSpokeHandler(agent, nil, zerolog.Nop())
+	h, err := NewEdgeSyncSpokeHandler(agent, nil, nil, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("handler: %v", err)
 	}
@@ -261,8 +261,9 @@ func TestEdgeSyncSpoke_RunFailureIs503(t *testing.T) {
 }
 
 func TestNewEdgeSyncSpokeHandler_RequiresAnAgent(t *testing.T) {
-	if _, err := NewEdgeSyncSpokeHandler(nil, nil, zerolog.Nop()); err == nil {
-		t.Error("a spoke handler was created without an agent")
+	// Neither an agent nor an exporter means every route would 503.
+	if _, err := NewEdgeSyncSpokeHandler(nil, nil, nil, zerolog.Nop()); err == nil {
+		t.Error("a spoke handler was created with neither an agent nor an exporter")
 	}
 }
 
@@ -285,7 +286,7 @@ func TestEdgeSyncSpoke_PrefixDoesNotCollideWithHubGroups(t *testing.T) {
 	admin.Get("/", func(c *fiber.Ctx) error { return c.SendString("admin") })
 
 	rig := newSpokeRig(t)
-	h, err := NewEdgeSyncSpokeHandler(rig.agent, nil, zerolog.Nop())
+	h, err := NewEdgeSyncSpokeHandler(rig.agent, nil, nil, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("handler: %v", err)
 	}
