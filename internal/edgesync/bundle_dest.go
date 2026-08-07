@@ -116,11 +116,22 @@ func resolveDir(path string) (string, error) {
 		// up to the nearest existing ancestor, resolve THAT, and re-attach the
 		// remainder. Resolving only the existing part is the point: a symlink
 		// can only exist on a path that exists.
+		// Bounded. The walk terminates at the filesystem root either way, but
+		// a destination whose parent chain is dozens of missing levels deep is
+		// a typo or a hostile input, not a drive mount — and each level costs a
+		// stat. Refusing early gives a clearer error than resolving a 2KB path.
+		const maxMissingLevels = 32
+
 		existing, remainder := abs, ""
-		for {
+		for depth := 0; ; depth++ {
+			if depth > maxMissingLevels {
+				return "", fmt.Errorf("resolve %q: more than %d missing directory levels; "+
+					"a bundle destination should be at or just below an existing mount point",
+					truncateForError(path), maxMissingLevels)
+			}
 			parent := filepath.Dir(existing)
 			if parent == existing {
-				return "", fmt.Errorf("resolve %q: no existing ancestor", path)
+				return "", fmt.Errorf("resolve %q: no existing ancestor", truncateForError(path))
 			}
 			remainder = filepath.Join(filepath.Base(existing), remainder)
 			existing = parent

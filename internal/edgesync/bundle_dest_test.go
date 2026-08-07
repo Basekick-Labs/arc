@@ -168,3 +168,27 @@ func TestDestinationPolicy_AllowsANotYetCreatedSubdirectory(t *testing.T) {
 		t.Errorf("a not-yet-created subdirectory was refused: %v", err)
 	}
 }
+
+// A destination dozens of missing levels below an existing directory is a typo
+// or a hostile input, not a drive mount. Each level costs a stat, and refusing
+// early gives a clearer error than resolving a multi-kilobyte path.
+func TestDestinationPolicy_RefusesAnAbsurdlyDeepPath(t *testing.T) {
+	allowed := t.TempDir()
+	p, err := NewDestinationPolicy([]string{allowed}, "")
+	if err != nil {
+		t.Fatalf("policy: %v", err)
+	}
+
+	deep := allowed
+	for i := 0; i < 40; i++ {
+		deep = filepath.Join(deep, "nope")
+	}
+	if _, err := p.Resolve(deep); err == nil {
+		t.Error("a path 40 missing levels deep was accepted")
+	}
+
+	// A normal not-yet-created destination must still work.
+	if _, err := p.Resolve(filepath.Join(allowed, "bundles")); err != nil {
+		t.Errorf("a one-level destination was refused: %v", err)
+	}
+}

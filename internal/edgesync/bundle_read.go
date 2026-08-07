@@ -317,6 +317,18 @@ func (r *BundleReader) DataPath(entryPath string) string {
 }
 
 // Open returns a reader over one entry's file, for an importer to stream.
+//
+// The CALLER MUST CLOSE the returned reader. An importer streams thousands of
+// files through this, so a missed Close exhausts descriptors on the hub.
+//
+// The path is validated even though Verify has already checked every declared
+// entry: this is exported, the importer is a separate component, and a
+// traversal primitive that happens to be unreachable today is one refactor
+// away from being reachable. os.Open on data/../../etc/passwd would otherwise
+// succeed.
 func (r *BundleReader) Open(entryPath string) (io.ReadCloser, error) {
+	if err := validateSyncPath(entryPath); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrBundleInvalid, err)
+	}
 	return os.Open(r.DataPath(entryPath))
 }

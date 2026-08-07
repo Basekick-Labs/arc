@@ -634,3 +634,41 @@ func TestBundleWriter_RefusesAnExistingBundleDirectory(t *testing.T) {
 		t.Fatalf("the first bundle is gone: %v", err)
 	}
 }
+
+// Open is exported and the importer is a separate component, so it validates
+// rather than trusting that Verify already did. A traversal primitive that is
+// unreachable today is one refactor away from being reachable.
+func TestBundleReader_OpenCannotEscapeTheDataDirectory(t *testing.T) {
+	ctx := context.Background()
+	rig := newBundleRig(t)
+	res := rig.exportTwo(t)
+
+	// A file inside the bundle but outside data/.
+	if err := os.WriteFile(filepath.Join(res.Dir, "secret.txt"), []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := OpenBundle(res.Dir, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("open bundle: %v", err)
+	}
+
+	for _, bad := range []string{"../secret.txt", "../../etc/passwd", "/etc/passwd", "a/../../secret.txt"} {
+		f, err := r.Open(bad)
+		if err == nil {
+			f.Close()
+			t.Errorf("Open(%q) escaped data/", bad)
+		}
+	}
+
+	// A legitimate entry still opens.
+	entries, err := r.Entries(ctx)
+	if err != nil {
+		t.Fatalf("entries: %v", err)
+	}
+	f, err := r.Open(entries[0].Path)
+	if err != nil {
+		t.Fatalf("a declared entry could not be opened: %v", err)
+	}
+	f.Close()
+}
