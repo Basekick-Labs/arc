@@ -68,7 +68,22 @@ Arc runs at the edge today — a standalone binary with local storage in a vehic
 
 **Edge sync** ([#569](https://github.com/Basekick-Labs/arc/issues/569)) addresses this by shipping immutable Parquet *files* from a spoke (edge) to a hub (central Arc): the spoke initiates, the hub verifies each file's SHA256 before committing it, and re-delivery of an already-received file is a no-op. Connectivity is treated as the exception rather than the norm — discovery is a single batched round-trip regardless of backlog size, and transfers resume from a byte offset when a link drops mid-file.
 
-**Nothing is user-visible in this release, on disk or otherwise.** The work is landing as a sequence of reviewed changes; so far that is the spoke-side ledger (which files have reached which hub, and how far a partial transfer got), the `SyncTransport` interface the agent will talk to with an in-process implementation for tests, and the HMAC scheme that authenticates a spoke to a hub. No configuration key enables it, no endpoint exposes it, and no startup path constructs it — so its SQLite schema is not even created yet. It is recorded here so the release history matches the work, not because there is anything to use or configure.
+The hub receive endpoint is the first piece an operator can turn on:
+
+```toml
+[edge_sync]
+enabled = true                     # default false
+hub_id = "ground-station"          # required when enabled; bound into every request's HMAC
+max_file_bytes = 536870912         # 512MiB default; must not exceed server.max_payload_size
+```
+
+With it enabled, `POST /api/v1/sync/file` accepts an authenticated file push from a registered spoke. Every upload is streamed to a staging area, hashed on the way in, and **verified before it is promoted** to its final location — a checksum mismatch is discarded and never appears where a reader would find it. Redelivering a file the hub already holds is a no-op; the same path arriving with *different* content is refused with `409` rather than overwritten, because one of the two copies is wrong and silently replacing either destroys the evidence.
+
+Two independent authentication layers apply: Arc's API token middleware, and a per-spoke HMAC binding the spoke, the hub, the path, and the content digest. **There is no way to register a spoke yet** (that lands with the spoke registry), so an enabled hub currently rejects every request and logs a warning saying so — visible and safe, rather than silently accepting unauthenticated writes.
+
+Resume is supported on local storage. On S3 and Azure a dropped transfer restarts from zero, because block objects cannot be appended to; this is a throughput cost on intermittent links, not a correctness problem.
+
+The rest of the work is still internal: the spoke-side ledger, the `SyncTransport` interface, and the HMAC scheme. Manual export/import will be OSS when it ships; the automatic scheduled agent will be an Enterprise feature.
 
 Manual export/import will be OSS when it ships; the automatic scheduled agent will be an Enterprise feature.
 
@@ -353,7 +368,7 @@ The forwarding-header and loop-guard changes are cluster-only; the partition-pru
 2. **No API or on-disk format changes.** Reads, queries, and storage layout are untouched. Queries with a start date earlier than `1970-01-01` are pruned from the epoch forward; since Arc stores no pre-epoch data, results are unchanged.
 3. **Clustered operators:** if any external tooling deliberately sets `X-Arc-Forwarded-By`, `X-Real-IP`, or `X-Forwarded-*` headers on requests to Arc and expects them to survive an inter-node forward, note that these are now stripped on the forwarding hop and re-established by Arc. Client IP has never been derived from these headers, so log/audit attribution is unchanged.
 4. **Active licenses keep working.** No re-activation required.
-5. **Nothing changes on disk or in the database.** The edge-sync groundwork above defines two SQLite tables (`sync_ledger`, `sync_history`), but no startup path constructs the ledger, so the schema is never created and the tables do not appear in `auth.db_path`. They will be created by the release that first wires edge sync into the server.
+5. **Edge sync is off by default and nothing changes unless you enable it.** With `edge_sync.enabled=false` (the default) no routes are mounted and `/api/v1/sync/file` returns 404. The `sync_ledger` and `sync_history` tables are still not created — the spoke side is not yet wired into startup.
 
 ## Dependencies
 
