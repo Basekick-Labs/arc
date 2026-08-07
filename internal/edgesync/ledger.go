@@ -23,6 +23,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -46,6 +47,19 @@ const (
 	// design's ack-then-advance rule means a lost ack costs one extra entry in
 	// the next reconcile, but never a silent gap.
 	StateSynced SyncState = "synced"
+
+	// StateExported — written to an air-gap bundle, awaiting acknowledgment.
+	//
+	// A file on a physical drive in transit is neither pending (re-exporting or
+	// re-sending it wastes the scarce resource: media, or a contact window) nor
+	// synced (no hub has confirmed anything). Without this state, exported rows
+	// stay pending, and because Pending orders partition_time DESC a capped
+	// export takes the newest N every time — the oldest files are never
+	// exported at all. That is a treadmill, not eventual consistency.
+	//
+	// NOT terminal. It advances to synced when an ack bundle returns, and an
+	// operator can revert it to pending if the drive is lost.
+	StateExported SyncState = "exported"
 
 	// StateFailed — exhausted retries. Terminal until an operator intervenes.
 	StateFailed SyncState = "failed"
@@ -103,6 +117,13 @@ type LedgerEntry struct {
 	BytesSent int64
 
 	LastError string
+
+	// ExportedAt / ExportedBundleID identify the air-gap bundle a file left on,
+	// for the operator whose drive did not arrive. Nil and empty unless the
+	// entry is (or once was) exported. RevertExported filters on the bundle ID
+	// in SQL, but an operator needs to READ it to know which ID to revert.
+	ExportedAt       *time.Time
+	ExportedBundleID string
 }
 
 // Ledger is the spoke-side record of sync progress, backed by the shared
@@ -157,6 +178,8 @@ func (l *Ledger) initSchema() error {
 		synced_at      TIMESTAMP,
 		bytes_sent     INTEGER NOT NULL DEFAULT 0,
 		last_error     TEXT,
+		exported_at    TIMESTAMP,
+		exported_bundle_id TEXT,
 		UNIQUE(hub_id, path)
 	);
 
@@ -203,6 +226,23 @@ func (l *Ledger) initSchema() error {
 
 	if _, err := l.db.Exec(schema); err != nil {
 		return fmt.Errorf("create sync tables: %w", err)
+	}
+
+	// CREATE TABLE IF NOT EXISTS leaves an existing table untouched, so a
+	// ledger created before the air-gap columns existed keeps its old shape.
+	// 26.09.1 is unreleased, so this only affects development databases — but
+	// silently running against a table missing exported_at would fail every
+	// export with a confusing SQL error rather than a clear one.
+	//
+	// SQLite has no ADD COLUMN IF NOT EXISTS; a duplicate-column error is the
+	// expected outcome on an up-to-date database and is not a failure.
+	for _, col := range []string{
+		"ALTER TABLE sync_ledger ADD COLUMN exported_at TIMESTAMP",
+		"ALTER TABLE sync_ledger ADD COLUMN exported_bundle_id TEXT",
+	} {
+		if _, err := l.db.Exec(col); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("add air-gap columns: %w", err)
+		}
 	}
 
 	l.logger.Info().Msg("Sync ledger schema initialized")
@@ -347,11 +387,13 @@ func (l *Ledger) Unfinished(ctx context.Context, hubID string, limit int) ([]*Le
 	query := `
 		SELECT id, hub_id, path, sha256, size_bytes, database, measurement,
 		       partition_time, discovered_at, state, attempts, last_attempt,
-		       synced_at, bytes_sent, COALESCE(last_error, '')
+		       synced_at, bytes_sent, COALESCE(last_error, ''),
+		       exported_at, COALESCE(exported_bundle_id, '')
 		FROM sync_ledger
-		WHERE hub_id = ? AND state IN (?, ?, ?)
+		WHERE hub_id = ? AND state IN (?, ?, ?, ?)
 		ORDER BY CASE state WHEN ? THEN 0 ELSE 1 END, partition_time DESC, id ASC`
-	args := []any{hubID, string(StateFailed), string(StatePending), string(StateInFlight), string(StateFailed)}
+	args := []any{hubID, string(StateFailed), string(StatePending), string(StateInFlight),
+		string(StateExported), string(StateFailed)}
 
 	if limit > 0 {
 		query += " LIMIT ?"
@@ -386,7 +428,8 @@ func (l *Ledger) Pending(ctx context.Context, hubID string, limit int) ([]*Ledge
 	query := `
 		SELECT id, hub_id, path, sha256, size_bytes, database, measurement,
 		       partition_time, discovered_at, state, attempts, last_attempt,
-		       synced_at, bytes_sent, COALESCE(last_error, '')
+		       synced_at, bytes_sent, COALESCE(last_error, ''),
+		       exported_at, COALESCE(exported_bundle_id, '')
 		FROM sync_ledger
 		WHERE hub_id = ? AND state = ?
 		ORDER BY partition_time DESC, id ASC`
@@ -484,16 +527,132 @@ func (l *Ledger) MarkSynced(ctx context.Context, hubID, path string) error {
 	//     entry, hiding the failure from operators.
 	// Pending is permitted because §5.1's reconcile advances entries the hub
 	// reports as `present` — the lost-ack recovery path — without a transfer.
+	// Exported is permitted because that is exactly what an ack bundle
+	// acknowledges: the file left on physical media and a hub has now
+	// confirmed it. Without this, an air-gap spoke could never reach synced.
 	res, err := l.db.ExecContext(ctx, `
 		UPDATE sync_ledger
 		SET state = ?, synced_at = ?, bytes_sent = size_bytes, last_error = NULL
-		WHERE hub_id = ? AND path = ? AND state IN (?, ?)`,
+		WHERE hub_id = ? AND path = ? AND state IN (?, ?, ?)`,
 		string(StateSynced), time.Now().UTC(), hubID, path,
-		string(StatePending), string(StateInFlight))
+		string(StatePending), string(StateInFlight), string(StateExported))
 	if err != nil {
 		return fmt.Errorf("edgesync: mark synced %q: %w", path, err)
 	}
-	return l.checkTransition(ctx, res, hubID, path, StatePending, StateInFlight)
+	return l.checkTransition(ctx, res, hubID, path, StatePending, StateInFlight, StateExported)
+}
+
+// MarkExported records that a file was written to an air-gap bundle.
+//
+// Only from pending: an in_flight row belongs to a running network transfer,
+// and exporting it concurrently would put the same file on two paths with no
+// way to reconcile which acknowledgment arrived.
+//
+// This is what stops a capped export from starving old files. Pending orders
+// partition_time DESC, so without a state change every export would re-take the
+// newest N and the oldest files would never leave the box.
+func (l *Ledger) MarkExported(ctx context.Context, hubID, path, bundleID string) error {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	if bundleID == "" {
+		// The bundle ID is how an ack finds these rows again. Without it an
+		// exported row is unattributable and could only be recovered by hand.
+		return fmt.Errorf("edgesync: mark exported %q: a bundle ID is required", path)
+	}
+
+	res, err := l.db.ExecContext(ctx, `
+		UPDATE sync_ledger
+		SET state = ?, exported_at = ?, exported_bundle_id = ?, last_error = NULL
+		WHERE hub_id = ? AND path = ? AND state = ?`,
+		string(StateExported), time.Now().UTC(), bundleID, hubID, path,
+		string(StatePending))
+	if err != nil {
+		return fmt.Errorf("edgesync: mark exported %q: %w", path, err)
+	}
+	return l.checkTransition(ctx, res, hubID, path, StatePending)
+}
+
+// RevertExported returns a bundle's files to pending, for a drive that was lost,
+// damaged, or never delivered.
+//
+// Without this an exported row is a dead end until an ack that will never come:
+// the files are neither retryable nor visible as a problem. Scoped to one
+// bundle ID so recovering one lost drive does not disturb others in transit.
+//
+// Returns the number of rows reverted.
+func (l *Ledger) RevertExported(ctx context.Context, hubID, bundleID string) (int64, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	if bundleID == "" {
+		return 0, fmt.Errorf("edgesync: revert exported: a bundle ID is required")
+	}
+
+	// Only exported rows. A file already acknowledged by some other route must
+	// not be dragged back into the queue by an operator recovering a drive.
+	res, err := l.db.ExecContext(ctx, `
+		UPDATE sync_ledger
+		SET state = ?, exported_at = NULL, exported_bundle_id = NULL
+		WHERE hub_id = ? AND exported_bundle_id = ? AND state = ?`,
+		string(StatePending), hubID, bundleID, string(StateExported))
+	if err != nil {
+		return 0, fmt.Errorf("edgesync: revert exported bundle %q: %w", bundleID, err)
+	}
+
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("edgesync: revert exported bundle %q: %w", bundleID, err)
+	}
+	return n, nil
+}
+
+// Unexported returns files eligible for an air-gap bundle, newest first.
+//
+// Distinct from Pending only in intent today — both select pending rows — but
+// they diverge the moment anything else can enqueue work, and the export path
+// should not silently inherit a change made for the network path. Ordering
+// matches Pending so a bundle carries the freshest telemetry first.
+//
+// A limit <= 0 returns everything eligible.
+func (l *Ledger) Unexported(ctx context.Context, hubID string, limit int) ([]*LedgerEntry, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+
+	query := `
+		SELECT id, hub_id, path, sha256, size_bytes, database, measurement,
+		       partition_time, discovered_at, state, attempts, last_attempt,
+		       synced_at, bytes_sent, COALESCE(last_error, ''),
+		       exported_at, COALESCE(exported_bundle_id, '')
+		FROM sync_ledger
+		WHERE hub_id = ? AND state = ?
+		ORDER BY partition_time DESC, id ASC`
+	args := []any{hubID, string(StatePending)}
+
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+
+	rows, err := l.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("edgesync: query unexported: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*LedgerEntry
+	for rows.Next() {
+		e, err := scanEntry(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("edgesync: iterate unexported: %w", err)
+	}
+	return out, nil
 }
 
 // MarkFailed records a transfer failure. If the entry has reached maxAttempts
@@ -588,12 +747,24 @@ func (l *Ledger) RecoverInFlight(ctx context.Context) (int64, error) {
 
 // Stats summarizes ledger state for one hub.
 type Stats struct {
-	HubID        string
-	Pending      int64
-	InFlight     int64
-	Synced       int64
-	Failed       int64
+	HubID    string
+	Pending  int64
+	InFlight int64
+
+	// Exported — on physical media, awaiting an ack. Counted separately
+	// because it is neither "still queued" nor "delivered", and folding it
+	// into either would misreport how far behind an air-gap spoke is.
+	Exported int64
+
+	Synced int64
+	Failed int64
+
+	// PendingBytes is what has not reached a hub, INCLUDING exported bytes:
+	// a file on a drive in transit has not arrived. Excluding it would make an
+	// air-gap spoke's backlog appear to shrink the moment a bundle is written,
+	// which is precisely when nothing has been delivered yet.
 	PendingBytes int64
+
 	LastSyncedAt *time.Time
 }
 
@@ -609,12 +780,13 @@ func (l *Ledger) Stats(ctx context.Context, hubID string) (*Stats, error) {
 		SELECT
 			COALESCE(SUM(state = 'pending'), 0),
 			COALESCE(SUM(state = 'in_flight'), 0),
+			COALESCE(SUM(state = 'exported'), 0),
 			COALESCE(SUM(state = 'synced'), 0),
 			COALESCE(SUM(state = 'failed'), 0),
-			COALESCE(SUM(CASE WHEN state IN ('pending','in_flight')
+			COALESCE(SUM(CASE WHEN state IN ('pending','in_flight','exported')
 			                  THEN size_bytes - bytes_sent ELSE 0 END), 0)
 		FROM sync_ledger WHERE hub_id = ?`, hubID).
-		Scan(&s.Pending, &s.InFlight, &s.Synced, &s.Failed, &s.PendingBytes)
+		Scan(&s.Pending, &s.InFlight, &s.Exported, &s.Synced, &s.Failed, &s.PendingBytes)
 	if err != nil {
 		return nil, fmt.Errorf("edgesync: ledger stats: %w", err)
 	}
@@ -653,7 +825,8 @@ func (l *Ledger) Get(ctx context.Context, hubID, path string) (*LedgerEntry, err
 	row := l.db.QueryRowContext(ctx, `
 		SELECT id, hub_id, path, sha256, size_bytes, database, measurement,
 		       partition_time, discovered_at, state, attempts, last_attempt,
-		       synced_at, bytes_sent, COALESCE(last_error, '')
+		       synced_at, bytes_sent, COALESCE(last_error, ''),
+		       exported_at, COALESCE(exported_bundle_id, '')
 		FROM sync_ledger WHERE hub_id = ? AND path = ?`, hubID, path)
 
 	e, err := scanEntry(row)
@@ -755,6 +928,7 @@ func scanEntry(s rowScanner) (*LedgerEntry, error) {
 		e           LedgerEntry
 		lastAttempt sql.NullTime
 		syncedAt    sql.NullTime
+		exportedAt  sql.NullTime
 		state       string
 	)
 
@@ -762,6 +936,7 @@ func scanEntry(s rowScanner) (*LedgerEntry, error) {
 		&e.ID, &e.HubID, &e.Path, &e.SHA256, &e.SizeBytes, &e.Database,
 		&e.Measurement, &e.PartitionTime, &e.DiscoveredAt, &state,
 		&e.Attempts, &lastAttempt, &syncedAt, &e.BytesSent, &e.LastError,
+		&exportedAt, &e.ExportedBundleID,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -780,6 +955,10 @@ func scanEntry(s rowScanner) (*LedgerEntry, error) {
 	if syncedAt.Valid {
 		t := syncedAt.Time.UTC()
 		e.SyncedAt = &t
+	}
+	if exportedAt.Valid {
+		t := exportedAt.Time.UTC()
+		e.ExportedAt = &t
 	}
 	return &e, nil
 }

@@ -146,9 +146,12 @@ func (h *EdgeSyncSpokeHandler) status(c *fiber.Ctx) error {
 	}
 
 	out := fiber.Map{
-		"hub_id":        st.HubID,
-		"pending":       st.Pending,
-		"in_flight":     st.InFlight,
+		"hub_id":    st.HubID,
+		"pending":   st.Pending,
+		"in_flight": st.InFlight,
+		// Files on physical media awaiting an ack. Reported separately so an
+		// operator can tell "queued here" from "in transit on a drive".
+		"exported":      st.Exported,
 		"synced":        st.Synced,
 		"failed":        st.Failed,
 		"pending_bytes": st.PendingBytes,
@@ -212,6 +215,14 @@ func (h *EdgeSyncSpokeHandler) ledger(c *fiber.Ctx) error {
 		}
 		if e.LastError != "" {
 			row["last_error"] = e.LastError
+		}
+		// Which bundle a file left on. The answer an operator needs when a
+		// drive does not arrive and they have to decide what to revert.
+		if e.ExportedBundleID != "" {
+			row["exported_bundle_id"] = e.ExportedBundleID
+		}
+		if e.ExportedAt != nil {
+			row["exported_at"] = *e.ExportedAt
 		}
 		out = append(out, row)
 	}

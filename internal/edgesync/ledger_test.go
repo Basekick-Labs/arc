@@ -841,3 +841,281 @@ func TestLedger_PendingToSyncedIsReconcilePath(t *testing.T) {
 		t.Errorf("bytes_sent = %d, want %d (a synced row reads as fully sent)", got.BytesSent, e.SizeBytes)
 	}
 }
+
+// testEntryAt builds an entry whose partition time sets its export priority.
+func testEntryAt(path string, hour int) *LedgerEntry {
+	e := testEntry(path)
+	e.PartitionTime = time.Date(2026, 8, 6, hour, 0, 0, 0, time.UTC)
+	return e
+}
+
+// The reason StateExported exists. Pending orders partition_time DESC, so a
+// capped export that leaves rows pending re-takes the newest N every time and
+// the oldest files never leave the box — a treadmill, not eventual
+// consistency. Marking them exported is what lets the backlog drain.
+func TestLedger_CappedExportDrainsTheBacklogInsteadOfStarvingOldFiles(t *testing.T) {
+	ctx := context.Background()
+	l := setupTestLedger(t)
+
+	const total, batch = 9, 3
+	for i := 0; i < total; i++ {
+		if err := l.Track(ctx, testEntryAt(fmt.Sprintf("m/cpu/2026/08/06/%02d/f.parquet", i), i)); err != nil {
+			t.Fatalf("track: %v", err)
+		}
+	}
+
+	// Three capped export rounds should cover every file exactly once.
+	seen := map[string]int{}
+	for round := 0; round < total/batch; round++ {
+		entries, err := l.Unexported(ctx, DefaultHubID, batch)
+		if err != nil {
+			t.Fatalf("unexported: %v", err)
+		}
+		if len(entries) != batch {
+			t.Fatalf("round %d returned %d entries, want %d", round, len(entries), batch)
+		}
+		bundleID := fmt.Sprintf("bundle-%d", round)
+		for _, e := range entries {
+			seen[e.Path]++
+			if err := l.MarkExported(ctx, DefaultHubID, e.Path, bundleID); err != nil {
+				t.Fatalf("mark exported: %v", err)
+			}
+		}
+	}
+
+	if len(seen) != total {
+		t.Errorf("exported %d distinct files across all rounds, want %d: old files were starved", len(seen), total)
+	}
+	for p, n := range seen {
+		if n != 1 {
+			t.Errorf("%s was exported %d times, want exactly once", p, n)
+		}
+	}
+
+	// The oldest file (hour 00) is the one a treadmill would never reach.
+	if _, ok := seen["m/cpu/2026/08/06/00/f.parquet"]; !ok {
+		t.Error("the oldest file was never exported")
+	}
+
+	left, err := l.Unexported(ctx, DefaultHubID, 0)
+	if err != nil {
+		t.Fatalf("unexported: %v", err)
+	}
+	if len(left) != 0 {
+		t.Errorf("%d files still eligible after exporting everything", len(left))
+	}
+}
+
+// An exported file must not be re-offered to the network path: it is already on
+// media, and re-sending it spends the contact window the bundle existed to save.
+func TestLedger_ExportedFilesAreNotPending(t *testing.T) {
+	ctx := context.Background()
+	l := setupTestLedger(t)
+
+	const p = "m/cpu/2026/08/06/14/f.parquet"
+	if err := l.Track(ctx, testEntry(p)); err != nil {
+		t.Fatalf("track: %v", err)
+	}
+	if err := l.MarkExported(ctx, DefaultHubID, p, "bundle-1"); err != nil {
+		t.Fatalf("mark exported: %v", err)
+	}
+
+	pending, err := l.Pending(ctx, DefaultHubID, 0)
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Errorf("an exported file is still pending; the network path would re-send it")
+	}
+
+	// But it must remain visible to an operator asking what has not landed.
+	unfinished, err := l.Unfinished(ctx, DefaultHubID, 0)
+	if err != nil {
+		t.Fatalf("unfinished: %v", err)
+	}
+	if len(unfinished) != 1 {
+		t.Errorf("unfinished = %d entries, want the exported file to be visible", len(unfinished))
+	}
+}
+
+// A drive that is lost or never delivered must be recoverable, scoped to that
+// bundle so other drives in transit are undisturbed.
+func TestLedger_RevertExportedRecoversOneBundleOnly(t *testing.T) {
+	ctx := context.Background()
+	l := setupTestLedger(t)
+
+	lost := []string{"m/cpu/2026/08/06/10/a.parquet", "m/cpu/2026/08/06/11/b.parquet"}
+	kept := "m/cpu/2026/08/06/12/c.parquet"
+	for _, p := range append(append([]string{}, lost...), kept) {
+		if err := l.Track(ctx, testEntry(p)); err != nil {
+			t.Fatalf("track: %v", err)
+		}
+	}
+	for _, p := range lost {
+		if err := l.MarkExported(ctx, DefaultHubID, p, "lost-drive"); err != nil {
+			t.Fatalf("mark exported: %v", err)
+		}
+	}
+	if err := l.MarkExported(ctx, DefaultHubID, kept, "in-transit"); err != nil {
+		t.Fatalf("mark exported: %v", err)
+	}
+
+	n, err := l.RevertExported(ctx, DefaultHubID, "lost-drive")
+	if err != nil {
+		t.Fatalf("revert: %v", err)
+	}
+	if n != int64(len(lost)) {
+		t.Errorf("reverted %d rows, want %d", n, len(lost))
+	}
+
+	pending, err := l.Pending(ctx, DefaultHubID, 0)
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	if len(pending) != len(lost) {
+		t.Errorf("pending = %d, want the %d files from the lost drive", len(pending), len(lost))
+	}
+
+	// The other drive is still in transit and must not have been disturbed.
+	entry, err := l.Get(ctx, DefaultHubID, kept)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if entry.State != StateExported {
+		t.Errorf("the in-transit bundle's file is %q, want it left exported", entry.State)
+	}
+}
+
+// An ack bundle acknowledges exported files. Without this transition an
+// air-gap spoke could never reach synced, so PruneSynced would never prune and
+// the ledger would grow forever on the box least able to receive a site visit.
+func TestLedger_ExportedAdvancesToSyncedOnAck(t *testing.T) {
+	ctx := context.Background()
+	l := setupTestLedger(t)
+
+	const p = "m/cpu/2026/08/06/14/f.parquet"
+	if err := l.Track(ctx, testEntry(p)); err != nil {
+		t.Fatalf("track: %v", err)
+	}
+	if err := l.MarkExported(ctx, DefaultHubID, p, "bundle-1"); err != nil {
+		t.Fatalf("mark exported: %v", err)
+	}
+	if err := l.MarkSynced(ctx, DefaultHubID, p); err != nil {
+		t.Fatalf("an ack for an exported file was rejected: %v", err)
+	}
+
+	entry, err := l.Get(ctx, DefaultHubID, p)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if entry.State != StateSynced {
+		t.Errorf("state = %q, want %q", entry.State, StateSynced)
+	}
+}
+
+// Exporting a file already in flight would put it on two paths at once with no
+// way to reconcile which acknowledgment arrived.
+func TestLedger_MarkExportedRejectsNonPendingStates(t *testing.T) {
+	ctx := context.Background()
+	l := setupTestLedger(t)
+
+	const p = "m/cpu/2026/08/06/14/f.parquet"
+	if err := l.Track(ctx, testEntry(p)); err != nil {
+		t.Fatalf("track: %v", err)
+	}
+	if err := l.MarkInFlight(ctx, DefaultHubID, p); err != nil {
+		t.Fatalf("mark in flight: %v", err)
+	}
+
+	if err := l.MarkExported(ctx, DefaultHubID, p, "bundle-1"); err == nil {
+		t.Error("an in-flight file was exported; it is now on two paths at once")
+	}
+
+	// And a bundle ID is required, since it is how an ack finds these rows.
+	if err := l.Track(ctx, testEntry("m/cpu/2026/08/06/15/g.parquet")); err != nil {
+		t.Fatalf("track: %v", err)
+	}
+	if err := l.MarkExported(ctx, DefaultHubID, "m/cpu/2026/08/06/15/g.parquet", ""); err == nil {
+		t.Error("a file was exported with no bundle ID; an ack could never attribute it")
+	}
+}
+
+// Exported bytes have NOT arrived, so they must stay in the backlog figure.
+// Excluding them would make an air-gap spoke's backlog appear to shrink at
+// exactly the moment nothing has been delivered.
+func TestLedger_StatsCountExportedSeparatelyButStillAsBacklog(t *testing.T) {
+	ctx := context.Background()
+	l := setupTestLedger(t)
+
+	for _, p := range []string{"m/cpu/2026/08/06/10/a.parquet", "m/cpu/2026/08/06/11/b.parquet"} {
+		if err := l.Track(ctx, testEntry(p)); err != nil {
+			t.Fatalf("track: %v", err)
+		}
+	}
+	if err := l.MarkExported(ctx, DefaultHubID, "m/cpu/2026/08/06/10/a.parquet", "bundle-1"); err != nil {
+		t.Fatalf("mark exported: %v", err)
+	}
+
+	st, err := l.Stats(ctx, DefaultHubID)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if st.Exported != 1 {
+		t.Errorf("Exported = %d, want 1", st.Exported)
+	}
+	if st.Pending != 1 {
+		t.Errorf("Pending = %d, want 1 (the exported file must not be counted twice)", st.Pending)
+	}
+	// 2 files x 1024 bytes: the exported one has not arrived either.
+	if st.PendingBytes != 2048 {
+		t.Errorf("PendingBytes = %d, want 2048: exported bytes are still in transit", st.PendingBytes)
+	}
+}
+
+// The bundle ID must be readable, not just filterable. When a drive does not
+// arrive, an operator has to know which bundle a file left on to decide what to
+// revert — otherwise the only way to find out is to open the SQLite file.
+func TestLedger_ExportedBundleIDIsReadable(t *testing.T) {
+	ctx := context.Background()
+	l := setupTestLedger(t)
+
+	const p = "m/cpu/2026/08/06/14/f.parquet"
+	if err := l.Track(ctx, testEntry(p)); err != nil {
+		t.Fatalf("track: %v", err)
+	}
+	if err := l.MarkExported(ctx, DefaultHubID, p, "bundle-abc"); err != nil {
+		t.Fatalf("mark exported: %v", err)
+	}
+
+	entry, err := l.Get(ctx, DefaultHubID, p)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if entry.ExportedBundleID != "bundle-abc" {
+		t.Errorf("ExportedBundleID = %q, want %q", entry.ExportedBundleID, "bundle-abc")
+	}
+	if entry.ExportedAt == nil {
+		t.Error("ExportedAt is nil on an exported entry")
+	}
+
+	// And it must survive the list queries an operator actually calls.
+	unfinished, err := l.Unfinished(ctx, DefaultHubID, 0)
+	if err != nil {
+		t.Fatalf("unfinished: %v", err)
+	}
+	if len(unfinished) != 1 || unfinished[0].ExportedBundleID != "bundle-abc" {
+		t.Errorf("the bundle ID did not survive Unfinished: %+v", unfinished)
+	}
+
+	// A never-exported entry carries no bundle, rather than a stale one.
+	if err := l.Track(ctx, testEntry("m/cpu/2026/08/06/15/g.parquet")); err != nil {
+		t.Fatalf("track: %v", err)
+	}
+	fresh, err := l.Get(ctx, DefaultHubID, "m/cpu/2026/08/06/15/g.parquet")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if fresh.ExportedBundleID != "" || fresh.ExportedAt != nil {
+		t.Errorf("a never-exported entry reports bundle %q at %v", fresh.ExportedBundleID, fresh.ExportedAt)
+	}
+}
