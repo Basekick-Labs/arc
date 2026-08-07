@@ -2114,7 +2114,10 @@ func main() {
 	// The secret comes from ARC_EDGE_SYNC_SPOKE_SECRET only; config load
 	// already refused a config-file secret and verified every required field,
 	// so by here the configuration is known good.
-	if cfg.EdgeSync.Spoke.Enabled {
+	// Either role independently: a spoke with intermittent connectivity runs
+	// the agent, a fully air-gapped one only exports bundles, and a spoke that
+	// does both runs both. The shared ledger is why they live in one block.
+	if cfg.EdgeSync.Spoke.Enabled || cfg.EdgeSync.Spoke.Bundle.Enabled {
 		spokeLogger := logger.Get("edgesync-spoke")
 
 		// The ledger shares the auth database, like the hub index. Reuse the
@@ -2135,40 +2138,111 @@ func main() {
 			log.Fatal().Err(err).Msg("Failed to create the edge sync ledger; refusing to start")
 		}
 
-		spokeTransport, err := edgesync.NewHTTPTransport(edgesync.HTTPTransportConfig{
-			BaseURL: cfg.EdgeSync.Spoke.HubURL,
-			SpokeID: cfg.EdgeSync.Spoke.SpokeID,
-			Secret:  cfg.EdgeSync.Spoke.Secret,
-		})
-		if err != nil {
-			log.Fatal().Err(err).Msg("Failed to create the edge sync transport; refusing to start")
+		// The network agent. Skipped entirely on a fully air-gapped spoke,
+		// which has no hub URL to build a transport from.
+		var syncAgent *edgesync.Agent
+		if cfg.EdgeSync.Spoke.Enabled {
+			spokeTransport, err := edgesync.NewHTTPTransport(edgesync.HTTPTransportConfig{
+				BaseURL: cfg.EdgeSync.Spoke.HubURL,
+				SpokeID: cfg.EdgeSync.Spoke.SpokeID,
+				Secret:  cfg.EdgeSync.Spoke.Secret,
+			})
+			if err != nil {
+				log.Fatal().Err(err).Msg("Failed to create the edge sync transport; refusing to start")
+			}
+
+			syncAgent, err = edgesync.NewAgent(edgesync.AgentConfig{
+				Ledger:        spokeLedger,
+				Transport:     spokeTransport,
+				Backend:       storageBackend,
+				HubID:         cfg.EdgeSync.Spoke.HubID,
+				SpokeID:       cfg.EdgeSync.Spoke.SpokeID,
+				MaxAttempts:   cfg.EdgeSync.Spoke.MaxAttempts,
+				MaxConcurrent: cfg.EdgeSync.Spoke.MaxConcurrent,
+				BatchSize:     cfg.EdgeSync.Spoke.BatchSize,
+				Logger:        spokeLogger,
+			})
+			if err != nil {
+				log.Fatal().Err(err).Msg("Failed to create the edge sync agent; refusing to start")
+			}
 		}
 
-		syncAgent, err := edgesync.NewAgent(edgesync.AgentConfig{
-			Ledger:        spokeLedger,
-			Transport:     spokeTransport,
-			Backend:       storageBackend,
-			HubID:         cfg.EdgeSync.Spoke.HubID,
-			SpokeID:       cfg.EdgeSync.Spoke.SpokeID,
-			MaxAttempts:   cfg.EdgeSync.Spoke.MaxAttempts,
-			MaxConcurrent: cfg.EdgeSync.Spoke.MaxConcurrent,
-			BatchSize:     cfg.EdgeSync.Spoke.BatchSize,
-			Logger:        spokeLogger,
-		})
-		if err != nil {
-			log.Fatal().Err(err).Msg("Failed to create the edge sync agent; refusing to start")
+		// Air-gap export, independent of the network agent above.
+		var bundleExporter *edgesync.Exporter
+		if cfg.EdgeSync.Spoke.Bundle.Enabled {
+			// The storage root is passed so the policy can refuse it outright:
+			// exporting into it would make the next discovery pass find the
+			// exported copies and queue them for sync.
+			// Only meaningful for a local backend; for S3/Azure there is no
+			// local root to protect and the policy simply skips that check.
+			localRoot := ""
+			if cfg.Storage.Backend == "local" {
+				localRoot = cfg.Storage.LocalPath
+			}
+			policy, err := edgesync.NewDestinationPolicy(
+				cfg.EdgeSync.Spoke.Bundle.AllowedDirs, localRoot)
+			if err != nil {
+				log.Fatal().Err(err).Msg("Failed to resolve the bundle destination policy; refusing to start")
+			}
+
+			bundleWriter, err := edgesync.NewBundleWriter(edgesync.BundleWriterConfig{
+				Backend: storageBackend,
+				SpokeID: cfg.EdgeSync.Spoke.SpokeID,
+				HubID:   cfg.EdgeSync.Spoke.HubID,
+				Secret:  cfg.EdgeSync.Spoke.Secret,
+				Logger:  spokeLogger,
+			})
+			if err != nil {
+				log.Fatal().Err(err).Msg("Failed to create the bundle writer; refusing to start")
+			}
+
+			// Its own discoverer: an air-gapped spoke runs no agent, so this
+			// is the only thing that ever populates its ledger.
+			bundleDiscoverer, err := edgesync.NewDiscoverer(
+				spokeLedger, storageBackend, cfg.EdgeSync.Spoke.HubID, spokeLogger)
+			if err != nil {
+				log.Fatal().Err(err).Msg("Failed to create the bundle discoverer; refusing to start")
+			}
+
+			bundleExporter, err = edgesync.NewExporter(edgesync.ExporterConfig{
+				Ledger:     spokeLedger,
+				Writer:     bundleWriter,
+				Policy:     policy,
+				Discoverer: bundleDiscoverer,
+				HubID:      cfg.EdgeSync.Spoke.HubID,
+				MaxFiles:   cfg.EdgeSync.Spoke.Bundle.MaxFiles,
+				MaxBytes:   cfg.EdgeSync.Spoke.Bundle.MaxBytes,
+				Logger:     spokeLogger,
+			})
+			if err != nil {
+				log.Fatal().Err(err).Msg("Failed to create the bundle exporter; refusing to start")
+			}
 		}
 
-		spokeHandler, err := api.NewEdgeSyncSpokeHandler(syncAgent, authManager, spokeLogger)
+		spokeHandler, err := api.NewEdgeSyncSpokeHandler(syncAgent, bundleExporter, authManager, spokeLogger)
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to create the edge sync spoke handler; refusing to start")
 		}
 		spokeHandler.RegisterRoutes(server.GetApp())
 
-		spokeLogger.Info().
-			Str("hub_url", cfg.EdgeSync.Spoke.HubURL).
+		// Reports what is actually enabled: an air-gap-only spoke has no hub
+		// URL and no /run endpoint, so claiming both would send an operator
+		// looking for a route that returns 503.
+		evt := spokeLogger.Info().
 			Str("spoke_id", cfg.EdgeSync.Spoke.SpokeID).
-			Msg("Edge sync spoke enabled; trigger a pass with POST /api/v1/spoke-sync/run")
+			Bool("network_sync", syncAgent != nil).
+			Bool("bundle_export", bundleExporter != nil)
+		if syncAgent != nil {
+			evt = evt.Str("hub_url", cfg.EdgeSync.Spoke.HubURL)
+		}
+		switch {
+		case syncAgent != nil && bundleExporter != nil:
+			evt.Msg("Edge sync spoke enabled; POST /api/v1/spoke-sync/run to sync, /export for an air-gap bundle")
+		case syncAgent != nil:
+			evt.Msg("Edge sync spoke enabled; trigger a pass with POST /api/v1/spoke-sync/run")
+		default:
+			evt.Msg("Edge sync air-gap export enabled; write a bundle with POST /api/v1/spoke-sync/export")
+		}
 	}
 
 	// Register TLE handler (streaming TLE ingestion)

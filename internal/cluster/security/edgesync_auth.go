@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -43,6 +44,15 @@ const (
 	// same content hash, so a MAC valid for one is legitimately valid for the
 	// other.
 	syncLabelFile = "sync-file"
+
+	// syncLabelBundle marks an air-gap bundle manifest (§10, PR 9b).
+	//
+	// Length 11, deliberately distinct from "sync-file" (9) and
+	// "sync-reconcile" (14). canonicalSyncInput prefixes each field with its
+	// length, so a label of a DIFFERENT length cannot be reached by any
+	// arrangement of another family's field contents — that is what makes the
+	// three families non-interchangeable. Never add a label of length 9 or 14.
+	syncLabelBundle = "sync-bundle"
 )
 
 // ErrSyncAuthMalformedField is returned when a field carries a NUL byte.
@@ -192,6 +202,106 @@ func ValidateSyncReconcileHMAC(sharedSecret, nonce, spokeID, hubID string, body 
 		return ErrSyncAuthInvalid
 	}
 	return nil
+}
+
+// ComputeSyncBundleHMAC signs an air-gap bundle manifest.
+//
+// Binds bundleID, spokeID, hubID, createdAt, and a digest of the bundle's
+// entry list. A bundle whose entries are altered, whose spoke or hub is
+// changed, or whose ID is swapped fails to validate.
+//
+// NO NONCE, unlike the other two families, and deliberately: a nonce plus
+// NonceCache is in-memory replay protection sized for requests in flight. A
+// bundle is an artifact that may sit on a drive for weeks, so replay
+// protection is the hub's durable (spoke_id, bundle_id) dedup ledger instead —
+// which survives a restart, as a nonce cache does not.
+//
+// Format: "sync-bundle" \x00 bundleID \x00 spokeID \x00 hubID \x00 createdAt \x00 entriesDigest
+func ComputeSyncBundleHMAC(sharedSecret, bundleID, spokeID, hubID string, createdAt int64, entriesDigest string) (string, error) {
+	if err := rejectSyncNUL(bundleID, spokeID, hubID, entriesDigest); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(
+		computeSyncBundleHMACRaw(sharedSecret, bundleID, spokeID, hubID, createdAt, entriesDigest)), nil
+}
+
+func computeSyncBundleHMACRaw(sharedSecret, bundleID, spokeID, hubID string, createdAt int64, entriesDigest string) []byte {
+	return computeRawHMAC(sharedSecret, canonicalSyncInput(
+		syncLabelBundle, bundleID, spokeID, hubID,
+		strconv.FormatInt(createdAt, 10), entriesDigest))
+}
+
+// ValidateSyncBundleHMAC checks a bundle manifest's MAC.
+//
+// NO FRESHNESS CHECK, unlike the other two families. A bundle legitimately
+// crosses an air gap over days or weeks, so a timestamp window would reject
+// exactly the artifacts this transport exists to carry. Replay protection is
+// the hub's dedup ledger; createdAt is bound into the MAC so it cannot be
+// altered, and is surfaced to operators rather than enforced.
+func ValidateSyncBundleHMAC(sharedSecret, bundleID, spokeID, hubID string, createdAt int64, entriesDigest, receivedMAC string) error {
+	if err := rejectSyncNUL(bundleID, spokeID, hubID, entriesDigest); err != nil {
+		return err
+	}
+	expected := computeSyncBundleHMACRaw(sharedSecret, bundleID, spokeID, hubID, createdAt, entriesDigest)
+	if !constantTimeHexEqual(expected, receivedMAC) {
+		return ErrSyncAuthInvalid
+	}
+	return nil
+}
+
+// BundleEntriesDigest hashes a bundle's entry list into the value the MAC binds.
+//
+// Canonicalization is normative, because two implementations that disagree
+// produce MACs that fail with no diagnosis — and the auditability argument for
+// a directory bundle invites a second implementation (a verifier on the secure
+// side of an air gap):
+//
+//   - entries sorted byte-lexicographically by path
+//   - duplicate paths REJECTED, not deduplicated: a duplicate is how a
+//     conflict smuggles past "conflicts are reported, never overwritten"
+//   - each entry contributes canonicalSyncInput(path, sha256, size) — the SAME
+//     length-prefixed helper the MACs use, not a second encoding, because a
+//     second encoding in the same package is how the two drift
+//   - the concatenation is SHA-256'd
+//
+// Paths are treated as bytes; no Unicode normalization is applied or assumed.
+func BundleEntriesDigest(paths, sha256s []string, sizes []int64) (string, error) {
+	if len(paths) != len(sha256s) || len(paths) != len(sizes) {
+		return "", fmt.Errorf("security: bundle digest: %d paths, %d digests, %d sizes",
+			len(paths), len(sha256s), len(sizes))
+	}
+	if err := rejectSyncNUL(paths...); err != nil {
+		return "", err
+	}
+	if err := rejectSyncNUL(sha256s...); err != nil {
+		return "", err
+	}
+
+	// Rejected here as well as at verification: 9c computes digests on paths
+	// that may not run the per-file checks first, and a negative size must
+	// never be signed into a manifest.
+	for i, n := range sizes {
+		if n < 0 {
+			return "", fmt.Errorf("security: bundle digest: negative size %d for %q", n, paths[i])
+		}
+	}
+
+	idx := make([]int, len(paths))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.Slice(idx, func(a, b int) bool { return paths[idx[a]] < paths[idx[b]] })
+
+	var b strings.Builder
+	for n, i := range idx {
+		if n > 0 && paths[idx[n-1]] == paths[i] {
+			return "", fmt.Errorf("security: bundle digest: duplicate path %q", paths[i])
+		}
+		b.WriteString(canonicalSyncInput(paths[i], sha256s[i], strconv.FormatInt(sizes[i], 10)))
+	}
+
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // canonicalSyncInput serializes fields so that no two distinct field tuples

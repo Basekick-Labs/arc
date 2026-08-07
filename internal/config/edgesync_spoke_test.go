@@ -126,3 +126,121 @@ func TestSpokeConfig_DefaultsAreDeclared(t *testing.T) {
 		t.Errorf("batch_size = %d, want 0", got)
 	}
 }
+
+// A fully air-gapped spoke exports bundles and never runs the network path, so
+// bundle validation must not be nested inside the spoke's own enabled check.
+func TestBundleConfig_ValidatesIndependentlyOfTheSpokeAgent(t *testing.T) {
+	// The secret signs the manifest, so bundle export requires it too.
+	t.Setenv("ARC_EDGE_SYNC_SPOKE_SECRET", strings.Repeat("a", 64))
+
+	body := `
+[edge_sync.spoke]
+spoke_id = "rocket-01"
+hub_id = "ground-station"
+
+[edge_sync.spoke.bundle]
+enabled = true
+allowed_dirs = ["/mnt/usb"]
+`
+	cfg, err := loadWith(t, body)
+	if err != nil {
+		t.Fatalf("an air-gap-only spoke failed to load: %v", err)
+	}
+	if cfg.EdgeSync.Spoke.Enabled {
+		t.Error("the sync agent was enabled without being asked for")
+	}
+	if !cfg.EdgeSync.Spoke.Bundle.Enabled {
+		t.Error("bundle export did not survive load")
+	}
+	// Defaults must apply even though the agent is off.
+	if cfg.EdgeSync.Spoke.Bundle.MaxFiles != 10000 {
+		t.Errorf("max_files = %d, want 10000", cfg.EdgeSync.Spoke.Bundle.MaxFiles)
+	}
+	if cfg.EdgeSync.Spoke.Bundle.MaxBytes != int64(64)<<30 {
+		t.Errorf("max_bytes = %d, want 64GiB", cfg.EdgeSync.Spoke.Bundle.MaxBytes)
+	}
+}
+
+// Every other Arc write path is confined to the storage root by its backend. A
+// bundle is not, so the permitted roots must be stated rather than guessed.
+func TestBundleConfig_RequiresAllowedDirsAndIdentities(t *testing.T) {
+	// Present so each case fails for the reason it is testing, not for a
+	// missing secret.
+	t.Setenv("ARC_EDGE_SYNC_SPOKE_SECRET", strings.Repeat("a", 64))
+
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			"no allowed_dirs",
+			"[edge_sync.spoke]\nspoke_id = \"r1\"\nhub_id = \"g\"\n[edge_sync.spoke.bundle]\nenabled = true\n",
+			"allowed_dirs",
+		},
+		{
+			"no spoke_id",
+			"[edge_sync.spoke]\nhub_id = \"g\"\n[edge_sync.spoke.bundle]\nenabled = true\nallowed_dirs = [\"/mnt/usb\"]\n",
+			"spoke_id",
+		},
+		{
+			"no hub_id",
+			"[edge_sync.spoke]\nspoke_id = \"r1\"\n[edge_sync.spoke.bundle]\nenabled = true\nallowed_dirs = [\"/mnt/usb\"]\n",
+			"hub_id",
+		},
+		{
+			"negative max_files",
+			"[edge_sync.spoke]\nspoke_id = \"r1\"\nhub_id = \"g\"\n[edge_sync.spoke.bundle]\nenabled = true\nallowed_dirs = [\"/mnt/usb\"]\nmax_files = -1\n",
+			"max_files",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := loadWith(t, tc.body); err == nil {
+				t.Fatalf("config loaded despite %s", tc.name)
+			} else if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %v, want it to mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// Disabled bundle export is the default for every Arc deployment.
+func TestBundleConfig_DisabledSkipsValidation(t *testing.T) {
+	cfg, err := loadWith(t, "[edge_sync.spoke.bundle]\nenabled = false\n")
+	if err != nil {
+		t.Fatalf("a disabled bundle blocked startup: %v", err)
+	}
+	if cfg.EdgeSync.Spoke.Bundle.Enabled {
+		t.Error("bundle export reported enabled")
+	}
+}
+
+// An air-gap-only spoke never enters the Spoke.Enabled block, so without its
+// own check the missing secret surfaced as a late fatal from an internal
+// constructor after a full startup — naming a Go type rather than the
+// environment variable, to the operator least able to iterate.
+func TestBundleConfig_RequiresTheSecretOnTheAirGapPath(t *testing.T) {
+	body := `
+[edge_sync.spoke]
+spoke_id = "rocket-01"
+hub_id = "ground-station"
+
+[edge_sync.spoke.bundle]
+enabled = true
+allowed_dirs = ["/mnt/usb"]
+`
+	_, err := loadWith(t, body)
+	if err == nil {
+		t.Fatal("an air-gap spoke loaded with no signing secret")
+	}
+	if !strings.Contains(err.Error(), "ARC_EDGE_SYNC_SPOKE_SECRET") {
+		t.Errorf("the error does not name the environment variable: %v", err)
+	}
+
+	// With the secret present it must load.
+	t.Setenv("ARC_EDGE_SYNC_SPOKE_SECRET", strings.Repeat("a", 64))
+	if _, err := loadWith(t, body); err != nil {
+		t.Errorf("an air-gap spoke with a secret failed to load: %v", err)
+	}
+}

@@ -770,3 +770,154 @@ func TestSyncHMAC_SubSecondToleranceIsRejected(t *testing.T) {
 		t.Errorf("a one-second tolerance was rejected: %v", err)
 	}
 }
+
+// A bundle MAC must not validate on either online family, or vice versa.
+// canonicalSyncInput is length-prefixed, so the label's own length is bound
+// before its bytes — no arrangement of later field CONTENTS can re-partition
+// the string to reach a different label.
+func TestSyncBundleHMAC_CannotCrossFamilies(t *testing.T) {
+	const (
+		secret   = "s3cr3t"
+		bundleID = "01J9ZQK8000000000000000000"
+		spokeID  = "rocket-01"
+		hubID    = "ground-station"
+		digest   = "aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44"
+	)
+	const createdAt = int64(1786000000)
+
+	bundleMAC, err := ComputeSyncBundleHMAC(secret, bundleID, spokeID, hubID, createdAt, digest)
+	if err != nil {
+		t.Fatalf("compute bundle MAC: %v", err)
+	}
+
+	// The bundle MAC must not pass as a file MAC, however the fields are lined up.
+	if err := ValidateSyncFileHMAC(secret, bundleID, spokeID, hubID, digest,
+		digest, createdAt, bundleMAC, time.Hour); err == nil {
+		t.Error("a bundle MAC validated as a file MAC")
+	}
+	if err := ValidateSyncReconcileHMAC(secret, bundleID, spokeID, hubID,
+		[]byte(digest), createdAt, bundleMAC, time.Hour); err == nil {
+		t.Error("a bundle MAC validated as a reconcile MAC")
+	}
+
+	// And the reverse: a file MAC must not pass as a bundle MAC.
+	fileMAC, err := ComputeSyncFileHMAC(secret, bundleID, spokeID, hubID, digest, digest, createdAt)
+	if err != nil {
+		t.Fatalf("compute file MAC: %v", err)
+	}
+	if err := ValidateSyncBundleHMAC(secret, bundleID, spokeID, hubID, createdAt, digest, fileMAC); err == nil {
+		t.Error("a file MAC validated as a bundle MAC")
+	}
+}
+
+// Every field the MAC binds must actually change it, or that field can be
+// altered on a drive without detection.
+func TestSyncBundleHMAC_BindsEveryField(t *testing.T) {
+	const (
+		secret   = "s3cr3t"
+		bundleID = "01J9ZQK8000000000000000000"
+		spokeID  = "rocket-01"
+		hubID    = "ground-station"
+		digest   = "aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44"
+	)
+	const createdAt = int64(1786000000)
+
+	base, err := ComputeSyncBundleHMAC(secret, bundleID, spokeID, hubID, createdAt, digest)
+	if err != nil {
+		t.Fatalf("compute: %v", err)
+	}
+
+	tests := []struct {
+		name                    string
+		bundle, spoke, hub, dig string
+		created                 int64
+	}{
+		{"bundle ID", "01J9ZQK8000000000000000001", spokeID, hubID, digest, createdAt},
+		{"spoke ID", bundleID, "rocket-02", hubID, digest, createdAt},
+		{"hub ID", bundleID, spokeID, "other-hub", digest, createdAt},
+		{"entries digest", bundleID, spokeID, hubID, "bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55", createdAt},
+		{"created at", bundleID, spokeID, hubID, digest, createdAt + 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := ValidateSyncBundleHMAC(secret, tc.bundle, tc.spoke, tc.hub,
+				tc.created, tc.dig, base); err == nil {
+				t.Errorf("changing the %s did not invalidate the MAC", tc.name)
+			}
+		})
+	}
+
+	// A different secret must fail too — the whole point of per-spoke secrets.
+	if err := ValidateSyncBundleHMAC("other-secret", bundleID, spokeID, hubID, createdAt, digest, base); err == nil {
+		t.Error("a MAC validated under the wrong secret")
+	}
+}
+
+// A bundle crosses an air gap over days or weeks. A freshness window would
+// reject exactly the artifacts this transport exists to carry.
+func TestSyncBundleHMAC_HasNoFreshnessWindow(t *testing.T) {
+	const (
+		secret   = "s3cr3t"
+		bundleID = "01J9ZQK8000000000000000000"
+		spokeID  = "rocket-01"
+		hubID    = "ground-station"
+		digest   = "aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44"
+	)
+	// A year old.
+	createdAt := time.Now().Add(-365 * 24 * time.Hour).Unix()
+
+	mac, err := ComputeSyncBundleHMAC(secret, bundleID, spokeID, hubID, createdAt, digest)
+	if err != nil {
+		t.Fatalf("compute: %v", err)
+	}
+	if err := ValidateSyncBundleHMAC(secret, bundleID, spokeID, hubID, createdAt, digest, mac); err != nil {
+		t.Errorf("a year-old bundle was rejected: %v", err)
+	}
+}
+
+// The digest is canonical: entry ORDER must not change it, or an export and a
+// verifier that iterate differently would disagree with no diagnosis.
+func TestBundleEntriesDigest_IsOrderIndependentAndRejectsDuplicates(t *testing.T) {
+	paths := []string{"b/2.parquet", "a/1.parquet", "c/3.parquet"}
+	shas := []string{"bb", "aa", "cc"}
+	sizes := []int64{2, 1, 3}
+
+	d1, err := BundleEntriesDigest(paths, shas, sizes)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+
+	// Same entries, different order.
+	d2, err := BundleEntriesDigest(
+		[]string{"a/1.parquet", "b/2.parquet", "c/3.parquet"},
+		[]string{"aa", "bb", "cc"},
+		[]int64{1, 2, 3})
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	if d1 != d2 {
+		t.Errorf("digest depends on input order: %s vs %s", d1, d2)
+	}
+
+	// A changed size must change the digest — it is bound per entry.
+	d3, err := BundleEntriesDigest(paths, shas, []int64{2, 99, 3})
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	if d1 == d3 {
+		t.Error("changing an entry's size did not change the digest")
+	}
+
+	// A duplicate path is how a conflict smuggles past "never overwritten".
+	if _, err := BundleEntriesDigest(
+		[]string{"a/1.parquet", "a/1.parquet"},
+		[]string{"aa", "bb"},
+		[]int64{1, 2}); err == nil {
+		t.Error("a duplicate path was accepted")
+	}
+
+	// Mismatched slice lengths are a programming error, not a silent truncation.
+	if _, err := BundleEntriesDigest([]string{"a"}, []string{"aa", "bb"}, []int64{1}); err == nil {
+		t.Error("mismatched slice lengths were accepted")
+	}
+}

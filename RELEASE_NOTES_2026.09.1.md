@@ -119,6 +119,45 @@ Files are hashed once at discovery, and the ledger survives restarts, so a spoke
 
 This is the **manual** form, and it is OSS. The automatic scheduled agent will be an Enterprise feature.
 
+### Air-gap bundles
+
+Some spokes have no network path at all — a submarine, a classified facility, a vehicle whose data comes off on a physical drive. For those, a spoke writes a **signed bundle** to removable media:
+
+```toml
+[edge_sync.spoke.bundle]
+enabled = true                        # default false
+allowed_dirs = ["/mnt/usb"]           # REQUIRED; an empty list refuses every export
+max_files = 10000                     # per bundle
+max_bytes = 68719476736               # 64 GiB per bundle
+```
+
+`edge_sync.spoke.bundle.enabled` is **independent of `edge_sync.spoke.enabled`**: a fully air-gapped spoke exports bundles and never runs the network path, so it needs no `hub_url` at all. A spoke that has both intermittent connectivity and a drive courier can run both.
+
+```bash
+curl -X POST https://edge.local:8000/api/v1/spoke-sync/export \
+  -H "Authorization: Bearer $ARC_TOKEN" \
+  -d '{"path": "/mnt/usb"}'
+```
+
+A bundle is a **directory**, not an archive:
+
+```
+bundle-submarine-01-06FXVSQXJ2C0EBDFDQ9D24S1E8/
+  manifest.json     signed header: bundle ID, spoke, hub, entry digest, MAC
+  entries.jsonl     one JSON object per file
+  data/             the Parquet files, under their original paths
+```
+
+Chosen over a tar for two reasons. **Resume is free** — an interrupted copy leaves whole files, and the manifest's per-file SHA identifies exactly which landed, so resuming re-copies the mismatches rather than restarting. And it is **auditable**: someone has to inspect what crosses an air gap, and `ls` plus `sha256sum entries.jsonl` answers that without opening anything.
+
+Signing uses a third HMAC family (`sync-bundle`) alongside the two online ones. The canonical input is length-prefixed, so a bundle MAC cannot validate on `/sync/file` or `/sync/reconcile`, nor the reverse. Unlike those families the bundle MAC carries **no timestamp window** — a bundle legitimately crosses an air gap over weeks, and a freshness check would reject exactly the artifacts this transport exists to carry. Replay protection is the hub's dedup ledger, which arrives with the import side.
+
+**Where a bundle may be written is explicit.** Every other Arc write path is confined to the storage root by its backend; a USB mount is outside that root by definition, so `allowed_dirs` is required and an empty list refuses every export. Paths are resolved through symlinks before the check, compared at a path-segment boundary, and Arc **refuses to export into its own storage root** — the next discovery pass would otherwise find the exported copies and queue them for sync.
+
+Exported files move to a new ledger state, `exported`, rather than staying pending. Without it a capped export would re-take the newest files every time and the oldest would never leave the box. They are reported separately from `pending` in `/status` but still counted in `pending_bytes`, because a file on a drive in transit has not arrived. If a drive is lost, `POST /api/v1/spoke-sync/export/{bundle_id}/revert` returns just that bundle's files to pending.
+
+The hub-side import, and the acknowledgment that advances `exported` to `synced`, land next.
+
 ## Security hardening
 
 ### Strip client-controlled forwarding headers at the inter-node boundary (CVE-2026-45045 class)

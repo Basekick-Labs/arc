@@ -322,65 +322,11 @@ func (a *Agent) runBatch(ctx context.Context, pending []*LedgerEntry, res *RunRe
 // works identically everywhere, and compaction output and backfilled files just
 // appear as new rows on the next pass.
 func (a *Agent) Discover(ctx context.Context) (int, error) {
-	lister, ok := a.backend.(storage.ObjectLister)
-	if !ok {
-		return 0, errors.New("edgesync: backend cannot list object metadata, so discovery is not possible")
-	}
-
-	objects, err := lister.ListObjects(ctx, "")
+	d, err := NewDiscoverer(a.ledger, a.backend, a.hubID, a.logger)
 	if err != nil {
-		return 0, fmt.Errorf("edgesync: list local files: %w", err)
+		return 0, err
 	}
-
-	entries := make([]*LedgerEntry, 0, len(objects))
-	for _, obj := range objects {
-		if err := ctx.Err(); err != nil {
-			return 0, err
-		}
-		if !isSyncableFile(obj.Path) {
-			continue
-		}
-
-		// Skip anything already tracked BEFORE hashing it. Discovery runs
-		// every pass, and re-hashing the whole corpus each time would make the
-		// cheap step the expensive one.
-		if _, err := a.ledger.Get(ctx, a.hubID, obj.Path); err == nil {
-			continue
-		} else if !errors.Is(err, ErrNotFound) {
-			return 0, fmt.Errorf("edgesync: check ledger for %q: %w", obj.Path, err)
-		}
-
-		// ListObjects carries no digest, so compute one. This is the only full
-		// read a file gets from discovery, ever — and the spoke has to read
-		// those bytes to send them anyway. The digest is then reused for the
-		// request HMAC and for the hub's verify-before-commit.
-		sum, err := a.hashFile(ctx, obj.Path)
-		if err != nil {
-			// One unreadable file must not stop discovery: the rest of the
-			// backlog is still syncable, and this one is retried next pass.
-			a.logger.Warn().Err(err).Str("path", obj.Path).Msg("Skipping a file that could not be hashed")
-			continue
-		}
-
-		e := &LedgerEntry{
-			HubID:     a.hubID,
-			Path:      obj.Path,
-			SHA256:    sum,
-			SizeBytes: obj.Size,
-		}
-		e.Database, e.Measurement, e.PartitionTime = parseArcPath(obj.Path)
-		entries = append(entries, e)
-	}
-
-	if len(entries) == 0 {
-		return 0, nil
-	}
-
-	inserted, err := a.ledger.TrackBatch(ctx, entries)
-	if err != nil {
-		return 0, fmt.Errorf("edgesync: track discovered files: %w", err)
-	}
-	return inserted, nil
+	return d.Discover(ctx)
 }
 
 // sendAll streams the missing files, bounded by MaxConcurrent.

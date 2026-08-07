@@ -270,6 +270,33 @@ type EdgeSyncSpokeConfig struct {
 	// BatchSize caps how many files one reconcile asks about. Zero lets the
 	// hub's own limit decide, and a larger backlog pages.
 	BatchSize int
+
+	// Bundle configures air-gap export.
+	Bundle EdgeSyncBundleConfig
+}
+
+// EdgeSyncBundleConfig configures air-gap bundle export on a spoke.
+type EdgeSyncBundleConfig struct {
+	// Enabled mounts the export endpoint. Independent of Spoke.Enabled: a
+	// fully air-gapped spoke has no hub URL to reach and no reason to run the
+	// network path at all.
+	Enabled bool
+
+	// AllowedDirs are the filesystem roots a bundle may be written to.
+	//
+	// Required — an empty list refuses every export. Every other Arc write
+	// path is confined to the storage root by its backend, but a USB mount is
+	// outside that root by definition, so this is the only thing bounding
+	// where an operator-supplied path can land. Symlinks are resolved and the
+	// storage root is refused outright.
+	AllowedDirs []string
+
+	// MaxFiles caps one bundle. Zero means 10,000.
+	MaxFiles int
+
+	// MaxBytes caps one bundle's data. Zero means 64 GiB — roughly a large
+	// removable drive, and a bound on how much a single export can write.
+	MaxBytes int64
 }
 
 type WALConfig struct {
@@ -723,6 +750,12 @@ func Load() (*Config, error) {
 				MaxAttempts:   v.GetInt("edge_sync.spoke.max_attempts"),
 				MaxConcurrent: v.GetInt("edge_sync.spoke.max_concurrent"),
 				BatchSize:     v.GetInt("edge_sync.spoke.batch_size"),
+				Bundle: EdgeSyncBundleConfig{
+					Enabled:     v.GetBool("edge_sync.spoke.bundle.enabled"),
+					AllowedDirs: v.GetStringSlice("edge_sync.spoke.bundle.allowed_dirs"),
+					MaxFiles:    v.GetInt("edge_sync.spoke.bundle.max_files"),
+					MaxBytes:    v.GetInt64("edge_sync.spoke.bundle.max_bytes"),
+				},
 			},
 		},
 		Compaction: CompactionConfig{
@@ -1126,6 +1159,44 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// Checked independently of Spoke.Enabled: a fully air-gapped spoke exports
+	// bundles and never runs the network path, so it has no hub URL and no
+	// reason to enable the sync agent at all.
+	if cfg.EdgeSync.Spoke.Bundle.Enabled {
+		if len(cfg.EdgeSync.Spoke.Bundle.AllowedDirs) == 0 {
+			return nil, fmt.Errorf("edge_sync.spoke.bundle.enabled=true requires " +
+				"edge_sync.spoke.bundle.allowed_dirs: a bundle is written to a raw filesystem " +
+				"path outside the storage root, so the permitted roots must be stated explicitly")
+		}
+		// Identity is bound into the bundle MAC, so the hub cannot accept a
+		// bundle that does not name both sides.
+		if cfg.EdgeSync.Spoke.SpokeID == "" {
+			return nil, fmt.Errorf("edge_sync.spoke.bundle.enabled=true requires edge_sync.spoke.spoke_id")
+		}
+		if cfg.EdgeSync.Spoke.HubID == "" {
+			return nil, fmt.Errorf("edge_sync.spoke.bundle.enabled=true requires edge_sync.spoke.hub_id " +
+				"(the hub the bundle is destined for)")
+		}
+		// Checked here too, not only under Spoke.Enabled: an air-gap-only spoke
+		// never enters that block, and without this the missing secret surfaced
+		// as a late fatal from an internal constructor AFTER a full startup —
+		// naming a Go type rather than the environment variable to set, to the
+		// operator least able to iterate on it.
+		if cfg.EdgeSync.Spoke.Secret == "" {
+			return nil, fmt.Errorf("edge_sync.spoke.bundle.enabled=true requires the " +
+				"ARC_EDGE_SYNC_SPOKE_SECRET environment variable: it signs the bundle manifest, " +
+				"and the hub rejects an unsigned bundle")
+		}
+		if cfg.EdgeSync.Spoke.Bundle.MaxFiles < 0 {
+			return nil, fmt.Errorf("edge_sync.spoke.bundle.max_files must be >= 0 (got %d); 0 means \"use the default\"",
+				cfg.EdgeSync.Spoke.Bundle.MaxFiles)
+		}
+		if cfg.EdgeSync.Spoke.Bundle.MaxBytes < 0 {
+			return nil, fmt.Errorf("edge_sync.spoke.bundle.max_bytes must be >= 0 (got %d); 0 means \"use the default\"",
+				cfg.EdgeSync.Spoke.Bundle.MaxBytes)
+		}
+	}
+
 	// A hub without an ID cannot authenticate anything: hub_id is bound into
 	// every request MAC, so an empty value would mean every spoke signs for
 	// the same anonymous hub and a request captured at one could be replayed
@@ -1267,6 +1338,14 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("edge_sync.spoke.max_attempts", 5)   // before a file is marked failed
 	v.SetDefault("edge_sync.spoke.max_concurrent", 2) // edge boxes are small
 	v.SetDefault("edge_sync.spoke.batch_size", 0)     // 0 defers to the hub's cap
+
+	// Air-gap bundle export. allowed_dirs has no default on purpose: an empty
+	// list refuses every export, so an operator must state where bundles may
+	// be written rather than inherit a guess.
+	v.SetDefault("edge_sync.spoke.bundle.enabled", false)
+	v.SetDefault("edge_sync.spoke.bundle.allowed_dirs", []string{})
+	v.SetDefault("edge_sync.spoke.bundle.max_files", 10000)
+	v.SetDefault("edge_sync.spoke.bundle.max_bytes", int64(64)<<30) // 64 GiB
 
 	v.SetDefault("compaction.enabled", true)
 	v.SetDefault("compaction.hourly_schedule", "5 * * * *")        // Every hour at :05
