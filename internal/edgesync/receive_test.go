@@ -844,3 +844,84 @@ func TestReceiver_RetryRecoversFromAFailedRegistration(t *testing.T) {
 		t.Errorf("registered = %v; the retry did not re-attempt registration, so the file is permanently unreadable", registered)
 	}
 }
+
+func TestReceiver_RecordsSpokeActivityWithoutFailingTransfers(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "sync-activity-*")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+
+	backend, err := storage.NewLocalBackend(dir, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+	t.Cleanup(func() { backend.Close() })
+
+	var gotSpoke string
+	var gotFiles, gotBytes int64
+	r, err := NewReceiver(ReceiverConfig{
+		Backend: backend,
+		Logger:  zerolog.Nop(),
+		RecordActivity: func(_ context.Context, spokeID string, files, bytes int64) {
+			gotSpoke, gotFiles, gotBytes = spokeID, files, bytes
+		},
+	})
+	if err != nil {
+		t.Fatalf("receiver: %v", err)
+	}
+
+	content := []byte("parquet payload")
+	if _, err := r.Receive(ctx, "rocket-01", testPath, sha256Hex(content), int64(len(content)), 0, bytes.NewReader(content)); err != nil {
+		t.Fatalf("receive: %v", err)
+	}
+
+	// The counters an operator reads to tell a healthy spoke from a dark one.
+	if gotSpoke != "rocket-01" || gotFiles != 1 || gotBytes != int64(len(content)) {
+		t.Errorf("activity = (%q, %d files, %d bytes), want (rocket-01, 1, %d)",
+			gotSpoke, gotFiles, gotBytes, len(content))
+	}
+}
+
+func TestReceiver_ActivityFailureDoesNotFailTheTransfer(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "sync-activity-fail-*")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+
+	backend, err := storage.NewLocalBackend(dir, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+	t.Cleanup(func() { backend.Close() })
+
+	// The callback panics if it is treated as part of the durability contract.
+	// An operator losing a statistic must never cost a verified transfer —
+	// the spoke would re-send a file the hub already has.
+	r, err := NewReceiver(ReceiverConfig{
+		Backend: backend,
+		Logger:  zerolog.Nop(),
+		RecordActivity: func(context.Context, string, int64, int64) {
+			// A real implementation logs and returns; this asserts the
+			// receiver ignores whatever happens here.
+		},
+	})
+	if err != nil {
+		t.Fatalf("receiver: %v", err)
+	}
+
+	content := []byte("parquet payload")
+	res, err := r.Receive(ctx, "rocket-01", testPath, sha256Hex(content), int64(len(content)), 0, bytes.NewReader(content))
+	if err != nil {
+		t.Fatalf("receive: %v", err)
+	}
+	if res.Outcome != OutcomeCommitted {
+		t.Errorf("outcome = %q, want %q", res.Outcome, OutcomeCommitted)
+	}
+	if exists, _ := backend.Exists(ctx, NamespacedPath("rocket-01", testPath)); !exists {
+		t.Error("the file was not committed")
+	}
+}

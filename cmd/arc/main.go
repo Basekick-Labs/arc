@@ -1994,11 +1994,45 @@ func main() {
 			log.Fatal().Err(err).Msg("Failed to create edge sync hub index; refusing to start")
 		}
 
+		// Spoke secrets are encrypted at rest with the same key MQTT uses for
+		// broker passwords. Encrypted rather than hashed because HMAC
+		// verification recomputes the MAC from the secret, so the hub needs
+		// the plaintext at request time — a one-way hash cannot serve that.
+		//
+		// No plaintext fallback: without a key the hub refuses to start,
+		// because a silent downgrade would leave every spoke's write
+		// credential readable in a database that also holds audit logs.
+		syncEncryptionKey, keyErr := mqtt.GetEncryptionKey()
+		if keyErr != nil {
+			log.Fatal().Err(keyErr).Msg("Failed to read ARC_ENCRYPTION_KEY for edge sync; refusing to start")
+		}
+		if syncEncryptionKey == nil {
+			log.Fatal().Msg("edge_sync.enabled=true requires ARC_ENCRYPTION_KEY: spoke secrets are encrypted at rest and Arc will not store them in plaintext")
+		}
+		syncEncryptor, err := mqtt.NewPasswordEncryptor(syncEncryptionKey)
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to create the edge sync secret encryptor; refusing to start")
+		}
+
+		spokeRegistry, err := edgesync.NewRegistry(syncDB, syncEncryptor, logger.Get("edgesync"))
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to create the edge sync spoke registry; refusing to start")
+		}
+
 		receiver, err := edgesync.NewReceiver(edgesync.ReceiverConfig{
 			Backend:      storageBackend,
 			Index:        hubIndex,
 			Logger:       logger.Get("edgesync"),
 			RegisterFile: registerFile,
+			RecordActivity: func(ctx context.Context, spokeID string, files, bytes int64) {
+				// Best-effort: a failed counter update must not fail a
+				// verified transfer, so this logs and returns.
+				if err := spokeRegistry.RecordActivity(ctx, spokeID, files, bytes); err != nil {
+					activityLogger := logger.Get("edgesync")
+					activityLogger.Warn().Err(err).Str("spoke_id", spokeID).
+						Msg("Failed to record spoke activity")
+				}
+			},
 		})
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to create edge sync receiver; refusing to start")
@@ -2013,14 +2047,16 @@ func main() {
 			log.Fatal().Err(err).Msg("Failed to create edge sync reconciler; refusing to start")
 		}
 
-		// TODO(#569 PR 7): spoke secrets come from the SQLite registry. Until
-		// that lands there is no way to register a spoke, so the hub starts
-		// with an empty set and rejects every request — visible and safe,
-		// rather than silently accepting unauthenticated writes.
+		syncAdminHandler, err := api.NewEdgeSyncAdminHandler(spokeRegistry, authManager, logger.Get("edgesync"))
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to create the edge sync admin handler; refusing to start")
+		}
+		syncAdminHandler.RegisterRoutes(server.GetApp())
+
 		syncHandler, err := api.NewEdgeSyncHandler(api.EdgeSyncHandlerConfig{
 			Receiver:     receiver,
 			Reconciler:   reconciler,
-			SpokeSecrets: api.StaticSpokeSecrets(nil),
+			SpokeSecrets: api.RegistrySpokeSecrets(spokeRegistry, logger.Get("edgesync")),
 			Replay:       security.NewNonceCache(security.HMACTimestampTolerance),
 			HubID:        cfg.EdgeSync.HubID,
 			MaxFileBytes: cfg.EdgeSync.MaxFileBytes,
@@ -2032,10 +2068,43 @@ func main() {
 		}
 		syncHandler.RegisterRoutes(server.GetApp())
 
+		// A hub with no registered spokes rejects everything, which is correct
+		// but easy to mistake for a broken deployment. Say so once at startup
+		// rather than leaving an operator to infer it from 401s.
 		syncLogger := logger.Get("edgesync")
-		syncLogger.Warn().
-			Str("hub_id", cfg.EdgeSync.HubID).
-			Msg("Edge sync hub enabled with no registered spokes; every request will be rejected until the spoke registry lands (#569 PR 7)")
+
+		// Spoke registration is admin-token protected, but with auth disabled
+		// there are no tokens — so anyone who can reach the port can register
+		// a spoke and mint themselves working write credentials. That matches
+		// every other Arc admin endpoint in this mode, but the consequence is
+		// sharper here, so say it out loud rather than leaving it implicit.
+		if !cfg.Auth.Enabled {
+			syncLogger.Warn().
+				Str("hub_id", cfg.EdgeSync.HubID).
+				Msg("auth.enabled=false: edge sync spoke registration is UNAUTHENTICATED — anyone who can reach this port can register a spoke and obtain write credentials. Enable auth or restrict network access to this hub.")
+		}
+
+		// Also proves the configured key still decrypts what is stored. A
+		// changed ARC_ENCRYPTION_KEY is systemic and otherwise invisible — the
+		// admin endpoints keep answering 200 while every spoke fails auth — so
+		// refuse to start rather than wait for a missed contact window to
+		// reveal it.
+		countCtx, cancelCount := context.WithTimeout(context.Background(), 10*time.Second)
+		spokeCount, countErr := spokeRegistry.VerifyStoredSecrets(countCtx)
+		cancelCount()
+		if countErr != nil {
+			log.Fatal().Err(countErr).Msg("Edge sync spoke registry is unusable; refusing to start")
+		}
+		if spokeCount == 0 {
+			syncLogger.Warn().
+				Str("hub_id", cfg.EdgeSync.HubID).
+				Msg("Edge sync hub enabled with no registered spokes; every sync request will be rejected until one is registered via POST /api/v1/sync-spokes")
+		} else {
+			syncLogger.Info().
+				Str("hub_id", cfg.EdgeSync.HubID).
+				Int64("registered_spokes", spokeCount).
+				Msg("Edge sync hub enabled")
+		}
 	}
 
 	// Register TLE handler (streaming TLE ingestion)

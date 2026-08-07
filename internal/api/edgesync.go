@@ -527,11 +527,42 @@ func (h *EdgeSyncHandler) writeOutcome(c *fiber.Ctx, res *edgesync.PutResult) er
 	}
 }
 
+// RegistrySpokeSecrets adapts a spoke registry to the lookup the handler needs.
+//
+// Every failure — unregistered, disabled, or an undecryptable secret — is
+// collapsed into a single `false`. The handler turns that into the same 401 a
+// bad MAC produces, so an attacker cannot use the response to learn which
+// spoke IDs exist. The reason is logged hub-side, where an operator can see it.
+func RegistrySpokeSecrets(reg *edgesync.Registry, logger zerolog.Logger) SpokeSecretLookup {
+	return func(ctx context.Context, spokeID string) (string, bool) {
+		secret, err := reg.Secret(ctx, spokeID)
+		if err != nil {
+			// An unknown or disabled spoke is the expected shape of a scan, so
+			// it logs at Debug — logging every probe at Warn hands an attacker
+			// a way to fill an operator's log.
+			//
+			// A decrypt failure is categorically different: it means the hub
+			// itself is misconfigured (almost always a changed
+			// ARC_ENCRYPTION_KEY) and EVERY spoke is failing, while the admin
+			// endpoints keep returning 200 with a full spoke list because
+			// metadata is not encrypted. Without this branch the hub looks
+			// healthy while nothing can authenticate.
+			if errors.Is(err, edgesync.ErrSpokeNotFound) || errors.Is(err, edgesync.ErrSpokeDisabled) {
+				logger.Debug().Err(err).Str("spoke_id", spokeID).Msg("Spoke secret lookup failed")
+			} else {
+				logger.Warn().Err(err).Str("spoke_id", spokeID).
+					Msg("Spoke secret could not be decrypted; the hub cannot authenticate any spoke")
+			}
+			return "", false
+		}
+		return secret, true
+	}
+}
+
 // StaticSpokeSecrets builds a lookup over an in-memory map.
 //
-// A stand-in until the spoke registry lands (#569 PR 7), which will store
-// per-spoke secrets in SQLite. Exported so the hub can be wired and exercised
-// end to end before that PR.
+// Retained for tests and for a hub exercised without a registry. Production
+// wiring uses RegistrySpokeSecrets.
 func StaticSpokeSecrets(secrets map[string]string) SpokeSecretLookup {
 	// Copy so a later mutation of the caller's map cannot silently change
 	// which spokes authenticate.

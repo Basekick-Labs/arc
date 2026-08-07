@@ -50,6 +50,12 @@ type Receiver struct {
 	// AlreadyPresent) but wasteful, so the hub always wires one.
 	index *HubIndex
 
+	// recordActivity bumps a spoke's last-seen time and transfer counters.
+	// Best-effort observability, so a failure here must never fail a verified,
+	// committed transfer — an operator losing a statistic beats a spoke
+	// re-sending a file the hub already has.
+	recordActivity func(ctx context.Context, spokeID string, files, bytes int64)
+
 	// registerFile publishes a committed file so readers can see it. In
 	// cluster mode this proposes to the Raft manifest; standalone it is nil,
 	// because a local backend's directory listing IS the manifest.
@@ -139,6 +145,9 @@ type ReceiverConfig struct {
 	Backend storage.Backend
 	Logger  zerolog.Logger
 
+	// RecordActivity is called after each committed file. Optional.
+	RecordActivity func(ctx context.Context, spokeID string, files, bytes int64)
+
 	// Index records received files for reconcile. Optional but strongly
 	// recommended; without it reconcile cannot report anything as present.
 	Index *HubIndex
@@ -154,8 +163,9 @@ func NewReceiver(cfg ReceiverConfig) (*Receiver, error) {
 		return nil, errors.New("edgesync: receiver requires a storage backend")
 	}
 	return &Receiver{
-		backend: cfg.Backend,
-		index:   cfg.Index,
+		backend:        cfg.Backend,
+		index:          cfg.Index,
+		recordActivity: cfg.RecordActivity,
 		// No .Str("component", ...) here: logger.Get already sets it, and a
 		// second one emits a duplicate JSON key that strict parsers and log
 		// aggregators mishandle.
@@ -322,6 +332,13 @@ func (r *Receiver) Receive(ctx context.Context, spokeID, sourcePath, declaredSHA
 	// synced and stop re-sending.
 	if err := r.recordReceived(ctx, spokeID, sourcePath, finalPath, declaredSHA256, declaredSize); err != nil {
 		return nil, err
+	}
+
+	// Last, and deliberately unable to fail the request: this is the counter
+	// an operator reads to tell a healthy spoke from a dark one, not part of
+	// the durability contract.
+	if r.recordActivity != nil {
+		r.recordActivity(ctx, spokeID, 1, declaredSize)
 	}
 
 	return &PutResult{Outcome: OutcomeCommitted, BytesAccepted: declaredSize}, nil
