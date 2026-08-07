@@ -44,6 +44,12 @@ type Receiver struct {
 	backend storage.Backend
 	logger  zerolog.Logger
 
+	// index records what the hub holds so reconcile can answer without
+	// reading parquet bytes. Nil disables recording — reconcile then reports
+	// every file as missing, which is safe (the spoke re-sends and gets
+	// AlreadyPresent) but wasteful, so the hub always wires one.
+	index *HubIndex
+
 	// registerFile publishes a committed file so readers can see it. In
 	// cluster mode this proposes to the Raft manifest; standalone it is nil,
 	// because a local backend's directory listing IS the manifest.
@@ -133,6 +139,10 @@ type ReceiverConfig struct {
 	Backend storage.Backend
 	Logger  zerolog.Logger
 
+	// Index records received files for reconcile. Optional but strongly
+	// recommended; without it reconcile cannot report anything as present.
+	Index *HubIndex
+
 	// RegisterFile is called after a file is verified and promoted. Leave nil
 	// in standalone mode.
 	RegisterFile func(ctx context.Context, f *ReceivedFile) error
@@ -145,6 +155,7 @@ func NewReceiver(cfg ReceiverConfig) (*Receiver, error) {
 	}
 	return &Receiver{
 		backend: cfg.Backend,
+		index:   cfg.Index,
 		// No .Str("component", ...) here: logger.Get already sets it, and a
 		// second one emits a duplicate JSON key that strict parsers and log
 		// aggregators mishandle.
@@ -305,7 +316,33 @@ func (r *Receiver) Receive(ctx context.Context, spokeID, sourcePath, declaredSHA
 		}
 	}
 
+	// Recorded AFTER registration so the index never claims a file that
+	// readers cannot see. The reverse order would make reconcile report a file
+	// as present while it is still invisible, and the spoke would mark it
+	// synced and stop re-sending.
+	if err := r.recordReceived(ctx, spokeID, sourcePath, finalPath, declaredSHA256, declaredSize); err != nil {
+		return nil, err
+	}
+
 	return &PutResult{Outcome: OutcomeCommitted, BytesAccepted: declaredSize}, nil
+}
+
+// recordReceived notes a committed file in the hub index.
+func (r *Receiver) recordReceived(ctx context.Context, spokeID, sourcePath, finalPath, sha string, size int64) error {
+	if r.index == nil {
+		return nil
+	}
+	err := r.index.Record(ctx, &ReceivedRecord{
+		SpokeID:    spokeID,
+		SourcePath: sourcePath,
+		HubPath:    finalPath,
+		SHA256:     sha,
+		SizeBytes:  size,
+	})
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrReceiveInternal, err)
+	}
+	return nil
 }
 
 // register publishes a committed file to the manifest.
@@ -347,6 +384,13 @@ func (r *Receiver) resolveExisting(ctx context.Context, spokeID, sourcePath, fin
 			if err := r.register(ctx, spokeID, sourcePath, finalPath, declaredSHA256, size); err != nil {
 				return nil, err
 			}
+		}
+		// Re-record for the same reason registration is re-attempted: if a
+		// previous attempt committed the bytes but failed to index them, the
+		// hub would keep reporting this file as missing and the spoke would
+		// keep re-sending it forever.
+		if err := r.recordReceived(ctx, spokeID, sourcePath, finalPath, declaredSHA256, size); err != nil {
+			return nil, err
 		}
 		return &PutResult{Outcome: OutcomeAlreadyPresent, BytesAccepted: size}, nil
 	}

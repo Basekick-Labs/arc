@@ -75,11 +75,14 @@ The hub receive endpoint is the first piece an operator can turn on:
 enabled = true                     # default false
 hub_id = "ground-station"          # required when enabled; bound into every request's HMAC
 max_file_bytes = 536870912         # 512MiB default; must not exceed server.max_payload_size
+max_reconcile_entries = 10000      # ~2MB per discovery batch
 ```
 
-With it enabled, `POST /api/v1/sync/file` accepts an authenticated file push from a registered spoke. Every upload is streamed to a staging area, hashed on the way in, and **verified before it is promoted** to its final location — a checksum mismatch is discarded and never appears where a reader would find it. Redelivering a file the hub already holds is a no-op; the same path arriving with *different* content is refused with `409` rather than overwritten, because one of the two copies is wrong and silently replacing either destroys the evidence.
+With it enabled, `POST /api/v1/sync/file` accepts an authenticated file push from a registered spoke, and `POST /api/v1/sync/reconcile` answers — in **one round-trip** — which of a spoke's pending files the hub already holds. That second endpoint is what makes a long disconnection survivable: a spoke returning with 5,000 pending files asks once rather than 5,000 times, and any file whose acknowledgment was lost is discovered in bulk rather than re-uploaded. Every upload is streamed to a staging area, hashed on the way in, and **verified before it is promoted** to its final location — a checksum mismatch is discarded and never appears where a reader would find it. Redelivering a file the hub already holds is a no-op; the same path arriving with *different* content is refused with `409` rather than overwritten, because one of the two copies is wrong and silently replacing either destroys the evidence.
 
 Two independent authentication layers apply: Arc's API token middleware, and a per-spoke HMAC binding the spoke, the hub, the path, and the content digest. **There is no way to register a spoke yet** (that lands with the spoke registry), so an enabled hub currently rejects every request and logs a warning saying so — visible and safe, rather than silently accepting unauthenticated writes.
+
+Reconcile is answered from a hub-side index of received files rather than by reading Parquet, so it stays cheap regardless of backlog size and works identically on a standalone hub and a clustered one. A batch larger than `max_reconcile_entries` is refused with `413` and the limit, so a spoke pages rather than sending an unbounded body — the request body is buffered before authentication, so an uncapped batch would be a memory claim by an unauthenticated caller.
 
 Resume is supported on local storage. On S3 and Azure a dropped transfer restarts from zero, because block objects cannot be appended to; this is a throughput cost on intermittent links, not a correctness problem.
 
