@@ -66,9 +66,16 @@ Out-of-range values fall back to the default with a startup warning rather than 
 
 Arc runs at the edge today — a standalone binary with local storage in a vehicle, a factory cell, or a forward deployment — with no first-class way to ship that data to a central Arc. Backup is a full DR snapshot rather than incremental sync, and Parquet import re-ingests rows through the write path, which breaks the end-to-end checksum and double-counts on retry.
 
-**Edge sync** ([#569](https://github.com/Basekick-Labs/arc/issues/569)) addresses this by shipping immutable Parquet *files* from a spoke (edge) to a hub (central Arc): the spoke initiates, the hub verifies each file's SHA256 before committing it, and re-delivery of an already-received file is a no-op. Connectivity is treated as the exception rather than the norm — discovery is a single batched round-trip regardless of backlog size, and transfers resume from a byte offset when a link drops mid-file.
+**Edge sync** ([#569](https://github.com/Basekick-Labs/arc/issues/569)) addresses this by shipping immutable Parquet *files* from a spoke (edge) to a hub (central Arc). The hub verifies each file's SHA256 before committing it, and re-delivery of an already-received file is a no-op.
 
-The hub receive endpoint is the first piece an operator can turn on:
+It ships over **two transports**, because "the edge" is not one thing:
+
+- **Network** — the spoke initiates, so an edge behind NAT with no inbound reachability still works. Connectivity is the exception rather than the norm: discovery is a single batched round-trip regardless of backlog size, and transfers resume from a byte offset when a link drops mid-file.
+- **Air gap** — for a spoke with no network path at all (a submarine, a classified facility, a vehicle whose data comes off on a drive), the spoke writes a signed bundle to removable media, the hub imports it, and a signed receipt travels back on the same drive.
+
+Both are **manual** in this release: an operator triggers each step. Everything below is OSS; the scheduled agent that automates it is Enterprise and lands later.
+
+Start with the hub receive endpoint:
 
 ```toml
 [edge_sync]
@@ -116,8 +123,6 @@ Three admin endpoints drive it:
 A pass recovers transfers interrupted by a crash, discovers new files, reconciles the backlog, and streams what the hub lacks — **newest first**, so a contact window that closes mid-backlog has already delivered the freshest telemetry. It **pages until the backlog drains**, so one pass on a spoke returning from a long outage moves everything, not just the first batch. Conflicts are reported in full rather than counted and are not retried: the same path holding different content means a spoke-ID collision or corruption, and re-sending would either be refused or destroy evidence.
 
 Files are hashed once at discovery, and the ledger survives restarts, so a spoke re-run after a crash neither re-hashes nor re-sends what already landed. Nothing is deleted from the spoke — sync is a copy, and local retention stays in the operator's hands.
-
-This is the **manual** form, and it is OSS. The automatic scheduled agent will be an Enterprise feature.
 
 ### Air-gap bundles
 
