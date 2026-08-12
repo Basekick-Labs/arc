@@ -477,6 +477,22 @@ func TestJoinClausePatterns(t *testing.T) {
 	}
 }
 
+func TestConvertSQLToStoragePaths_BareJoinPreservesAliasSeparator(t *testing.T) {
+	h := &QueryHandler{
+		storage: &mockLocalBackend{basePath: "./data"},
+		pruner:  pruning.NewPartitionPruner(zerolog.Nop()),
+		logger:  zerolog.Nop(),
+	}
+
+	result := h.convertSQLToStoragePaths("SELECT * FROM a JOIN mydb.cpu ON 1=1")
+	if strings.Contains(result, "parquet'JOIN") {
+		t.Errorf("bare JOIN consumed the separator after the preceding table. Got: %s", result)
+	}
+	if !strings.Contains(result, " JOIN read_parquet('./data/mydb/cpu/**/*.parquet'") {
+		t.Errorf("bare JOIN was not rewritten correctly. Got: %s", result)
+	}
+}
+
 func TestValidateIdentifier(t *testing.T) {
 	tests := []struct {
 		name    string

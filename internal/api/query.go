@@ -65,10 +65,10 @@ var (
 	patternSimpleTable = regexp.MustCompile(`(?i)\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]*)\b`)
 	// Pattern for database.table in JOIN clauses (e.g., JOIN mydb.mytable)
 	// Includes LATERAL JOIN support: "LATERAL JOIN", "JOIN LATERAL", "CROSS JOIN LATERAL"
-	patternJoinDBTable = regexp.MustCompile(`(?i)\b(?:(?:LEFT|RIGHT|INNER|OUTER|CROSS|NATURAL)?\s*)?(?:LATERAL\s+)?JOIN\s+(?:LATERAL\s+)?([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\b`)
+	patternJoinDBTable = regexp.MustCompile(`(?i)\b(?:(?:LEFT|RIGHT|INNER|OUTER|CROSS|NATURAL)\s+)?(?:LATERAL\s+)?JOIN\s+(?:LATERAL\s+)?([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\b`)
 	// Pattern for simple table in JOIN clauses (JOIN table_name)
 	// Includes LATERAL JOIN support: "LATERAL JOIN", "JOIN LATERAL", "CROSS JOIN LATERAL"
-	patternJoinSimpleTable = regexp.MustCompile(`(?i)\b(?:(?:LEFT|RIGHT|INNER|OUTER|CROSS|NATURAL)?\s*)?(?:LATERAL\s+)?JOIN\s+(?:LATERAL\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b`)
+	patternJoinSimpleTable = regexp.MustCompile(`(?i)\b(?:(?:LEFT|RIGHT|INNER|OUTER|CROSS|NATURAL)\s+)?(?:LATERAL\s+)?JOIN\s+(?:LATERAL\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b`)
 	// Pattern to extract CTE names from WITH clauses
 	// Matches: WITH name AS, WITH RECURSIVE name AS, and comma-separated CTEs
 	patternCTENames = regexp.MustCompile(`(?i)\bWITH\s+(?:RECURSIVE\s+)?(\w+)\s+AS\s*\(|,\s*(\w+)\s+AS\s*\(`)
