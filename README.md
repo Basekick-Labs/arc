@@ -1,6 +1,6 @@
 # Arc
 
-[![Ingestion](https://img.shields.io/badge/ingestion-20M%2B%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
+[![Ingestion](https://img.shields.io/badge/ingestion-26M%2B%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
 [![Query](https://img.shields.io/badge/query-8.42M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
 [![Go](https://img.shields.io/badge/go-1.26+-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
@@ -10,7 +10,7 @@
 [![Discord](https://img.shields.io/badge/discord-join-7289da?logo=discord)](https://discord.gg/nxnWfUxsdm)
 [![GitHub](https://img.shields.io/github/stars/basekick-labs/arc?style=social)](https://github.com/basekick-labs/arc)
 
-Open, SQL-native time-series database for telemetry you need to keep. Arc ingests 20M+ records/sec, stores data as standard Parquet on infrastructure you own, and lets you query recent and historical data together. InfluxDB Line Protocol and Telegraf compatible. Single binary. AGPL-3.0.
+Open, SQL-native time-series database for telemetry you need to keep. Arc ingests 26M+ records/sec, stores data as standard Parquet on infrastructure you own, and lets you query recent and historical data together. InfluxDB Line Protocol and Telegraf compatible. Single binary. AGPL-3.0.
 
 > **Prefer a UI?** [**Arc Launchpad**](https://github.com/Basekick-Labs/launchpad) is a self-hosted web console for the Arc instances you run — SQL console, schema explorer, logs, monitoring, and management for tokens, retention, alerts, continuous queries, and MQTT ingestion. Deploy it alongside Arc with Docker Compose. [Docs](https://docs.basekick.net/launchpad).
 
@@ -104,18 +104,20 @@ See Arc in action: [https://basekick.net/demos](https://basekick.net/demos)
 Benchmarked on Apple MacBook Pro M3 Max (14 cores, 36GB RAM, 1TB NVMe).
 Test config: 12 concurrent workers, 1000-record batches, columnar data.
 
-### Ingestion (June 2026)
+### Ingestion (August 2026)
 
 | Protocol | Throughput | p50 Latency | p99 Latency |
 |----------|------------|-------------|-------------|
-| MessagePack Columnar | **20.9M rec/s** | 0.43ms | 2.67ms |
-| MessagePack + Zstd | 17.2M rec/s | 0.58ms | 2.49ms |
-| MessagePack + GZIP | 16.9M rec/s | 0.59ms | 2.55ms |
-| Line Protocol | 5.4M rec/s | 1.83ms | 7.24ms |
+| MessagePack Columnar | **26.1M rec/s** | 0.37ms | 1.78ms |
+| MessagePack + Zstd | 20.2M rec/s | 0.49ms | 1.94ms |
+| MessagePack + GZIP | 19.7M rec/s | 0.51ms | 1.98ms |
+| Line Protocol | 4.6M rec/s | 2.29ms | 6.92ms |
 
-All rows measured over a 60-second sustained run. The radix flush-sort and single-hour
-allocation fixes in 26.06.2 lifted MessagePack Columnar from 19.9M to 20.9M and flattened
-its decay curve; the Zstd/GZIP rows benefit from the same flush-path work.
+All rows measured over a 60-second sustained run — the MessagePack Columnar row moved
+**1,563,468,000 records in 60 seconds**. Measured on a development build; these
+improvements ship in **26.09.1**, which stops dictionary-encoding Parquet at ingest
+time (compaction re-encodes files anyway, so ingest now spends that CPU on
+throughput — see the 26.09.1 release notes).
 
 ### Compaction
 

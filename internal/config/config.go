@@ -108,7 +108,8 @@ type IngestConfig struct {
 	MaxBufferSize         int      // Max records before flush
 	MaxBufferAgeMS        int      // Max age in milliseconds before flush
 	Compression           string   // Parquet compression: snappy, gzip, zstd
-	UseDictionary         bool     // Use dictionary encoding
+	UseDictionary         bool     // Dictionary-encode string/binary columns at ingest (default false: compaction re-encodes anyway; see setDefaults)
+	NumericDictionary     bool     // With UseDictionary, also dictionary-encode numeric/timestamp columns (pre-26.09.1 behavior; costs hashing+boxing per value)
 	WriteStatistics       bool     // Write Parquet statistics
 	DataPageVersion       string   // Parquet data page version: 1.0 or 2.0
 	FlushWorkers          int      // Number of workers for async flush (default: 2x CPU, min 8, max 64)
@@ -742,6 +743,7 @@ func Load() (*Config, error) {
 			MaxBufferAgeMS:        v.GetInt("ingest.max_buffer_age_ms"),
 			Compression:           v.GetString("ingest.compression"),
 			UseDictionary:         v.GetBool("ingest.use_dictionary"),
+			NumericDictionary:     v.GetBool("ingest.numeric_dictionary"),
 			WriteStatistics:       v.GetBool("ingest.write_statistics"),
 			DataPageVersion:       v.GetString("ingest.data_page_version"),
 			FlushWorkers:          v.GetInt("ingest.flush_workers"),
@@ -1354,7 +1356,15 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.max_buffer_size", 50000)
 	v.SetDefault("ingest.max_buffer_age_ms", 5000)
 	v.SetDefault("ingest.compression", "snappy")
-	v.SetDefault("ingest.use_dictionary", true)
+	// Dictionary encoding OFF at ingest by default: ingest files are
+	// transient — hourly/daily compaction rewrites them via DuckDB COPY,
+	// which re-encodes with its own adaptive dictionary/compression choices
+	// regardless of source encoding. Ingest-time dictionaries cost a hash
+	// insert + interface boxing per value (~measured 20.6→26.0M rec/s when
+	// disabled) to compress files that are about to be rewritten anyway.
+	// The tradeoff is a temporarily larger uncompacted hot partition.
+	v.SetDefault("ingest.use_dictionary", false)
+	v.SetDefault("ingest.numeric_dictionary", false) // only relevant with use_dictionary=true; see IngestConfig
 	v.SetDefault("ingest.write_statistics", true)
 	v.SetDefault("ingest.data_page_version", "2.0")
 	v.SetDefault("ingest.flush_workers", getDefaultFlushWorkers())

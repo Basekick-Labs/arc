@@ -62,6 +62,24 @@ This is a **file-count** bound, not a byte bound — compacted output size track
 
 Out-of-range values fall back to the default with a startup warning rather than failing. **`1` is not usable** and is treated as out of range: compaction's adaptive retry rejects any batch below two files, so a batch size of one would fail every batch of every partition.
 
+## Faster ingest: Parquet dictionary encoding at write time is now off by default
+
+Sustained msgpack ingest throughput improves **~26%** (20.65M → 26.1M records/sec — 1.56 billion records in a 60-second run — on the IOT sustained-load benchmark, Apple M3 Max, 12 workers) by no longer dictionary-encoding Parquet columns at ingest time:
+
+```toml
+[ingest]
+use_dictionary = false        # default; was true
+numeric_dictionary = false    # default (only relevant with use_dictionary = true)
+```
+
+Env vars: `ARC_INGEST_USE_DICTIONARY`, `ARC_INGEST_NUMERIC_DICTIONARY`.
+
+**Why this is safe:** ingest files are transient staging — hourly and daily compaction rewrite them through DuckDB, which re-encodes every column with its own adaptive dictionary/compression choices regardless of how the source files were encoded. Dictionary-encoding at ingest paid a hash-table insert plus an interface allocation for every value (~8–10% of write CPU in profiles) to compress files that were about to be rewritten anyway. Long-term storage efficiency is unchanged; the tradeoff is a temporarily larger uncompacted hot partition (up to ~2× for highly repetitive data) until the next compaction pass.
+
+The write path also profiles GC-bound at sustained 20M+ records/sec (interface boxing across the decode → buffer → flush pipeline); operators chasing peak sustained throughput on memory-rich hosts can additionally set `GOGC=200-300` (measured +7% and flat RPS over time, at roughly double the resident memory). A typed-column ingest pipeline that removes the boxing entirely is planned follow-up work.
+
+**Restoring the old behavior:** `use_dictionary = true` re-enables dictionaries for string columns only (a middle ground measured at +12% over the old default with tag columns still dictionary-compressed); adding `numeric_dictionary = true` restores the exact pre-26.09.1 all-columns encoding.
+
 ## Insertion-order preservation is now configurable, and off by default
 
 Arc previously forced DuckDB's `preserve_insertion_order=true`, which makes queries **without** an `ORDER BY` return rows in file/insertion order — at the cost of order-preserving buffering in the engine. That setting is now configurable and defaults to **false**:
