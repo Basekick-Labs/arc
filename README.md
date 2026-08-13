@@ -113,11 +113,14 @@ Test config: 12 concurrent workers, 1000-record batches, columnar data.
 | MessagePack + GZIP | 19.7M rec/s | 0.51ms | 1.98ms |
 | Line Protocol | 4.6M rec/s | 2.29ms | 6.92ms |
 
-All rows measured over a 60-second sustained run — the MessagePack Columnar row moved
-**1,563,468,000 records in 60 seconds**. Measured on a development build; these
-improvements ship in **26.09.1**, which stops dictionary-encoding Parquet at ingest
-time (compaction re-encodes files anyway, so ingest now spends that CPU on
-throughput — see the 26.09.1 release notes).
+All rows measured over a 60-second sustained run. The MessagePack Columnar row is
+**1,563,468,000 records ingested in 60 seconds** — and that's not rows streamed into
+a memory buffer: every record was received over HTTP, decoded, time-sorted, and
+durably written to disk as queryable Parquet, at 0.37ms median latency, on a laptop.
+
+Measured on a development build; these improvements ship in **26.09.1**, which stops
+dictionary-encoding Parquet at ingest time (compaction re-encodes files anyway, so
+ingest now spends that CPU on throughput — see the 26.09.1 release notes).
 
 ### Compaction
 
