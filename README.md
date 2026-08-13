@@ -1,6 +1,6 @@
 # Arc
 
-[![Ingestion](https://img.shields.io/badge/ingestion-19M%2B%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
+[![Ingestion](https://img.shields.io/badge/ingestion-20M%2B%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
 [![Query](https://img.shields.io/badge/query-8.42M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
 [![Go](https://img.shields.io/badge/go-1.26+-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
@@ -10,82 +10,87 @@
 [![Discord](https://img.shields.io/badge/discord-join-7289da?logo=discord)](https://discord.gg/nxnWfUxsdm)
 [![GitHub](https://img.shields.io/github/stars/basekick-labs/arc?style=social)](https://github.com/basekick-labs/arc)
 
-High-performance columnar analytical database. 19M+ records/sec ingestion, 8M+ rows/sec queries. Ingestion, storage, compaction, SQL queries, retention policies, and continuous queries — in one binary. Open Parquet files on your storage. No vendor lock-in. AGPL-3.0.
+Open, SQL-native time-series database for telemetry you need to keep. Arc ingests 20M+ records/sec, stores data as standard Parquet on infrastructure you own, and lets you query recent and historical data together. InfluxDB Line Protocol and Telegraf compatible. Single binary. AGPL-3.0.
 
 > **Prefer a UI?** [**Arc Launchpad**](https://github.com/Basekick-Labs/launchpad) is a self-hosted web console for the Arc instances you run — SQL console, schema explorer, logs, monitoring, and management for tokens, retention, alerts, continuous queries, and MQTT ingestion. Deploy it alongside Arc with Docker Compose. [Docs](https://docs.basekick.net/launchpad).
 
 ---
 
-## The Problem
+## Telemetry is easy to collect and expensive to keep
 
-Modern applications generate massive amounts of data that needs fast ingestion and analytical queries:
+Machines, services, vehicles, and devices produce data continuously. The operational problem is not only ingesting the latest readings — it is keeping the full-resolution history available for debugging, analysis, compliance, and the next question nobody has asked yet.
 
-* **Product Analytics**: Events, clickstreams, user behavior, A/B testing
-* **Observability**: Metrics, logs, traces from distributed systems
-* **AI Agent Memory**: Conversation history, context, RAG, embeddings
-* **Edge & Tactical**: Disconnected operations, tactical edge platforms, sensor telemetry, MQTT-native
-* **Industrial IoT**: Manufacturing telemetry, sensors, equipment monitoring
-* **Security & Compliance**: Audit logs, SIEM, security events
-* **Data Warehousing**: Analytics, BI, reporting on time-series or event data
+Teams evaluating a time-series database usually run into the same trade-offs:
 
-Traditional solutions have problems:
-- **Expensive**: Cloud data warehouses cost thousands per month at scale
-- **Complex**: ClickHouse/Druid require cluster management expertise
-- **Vendor lock-in**: Proprietary formats trap your data
-- **Slow ingestion**: Most analytical DBs struggle with high-throughput writes
-- **Overkill**: Need simple deployment, not Kubernetes orchestration
+- **Retention cliffs**: Older data is downsampled, exported, or deleted because storage costs grow too quickly.
+- **Split hot and cold paths**: Recent data is queryable in one system while historical data waits in a warehouse or object store.
+- **Operational overhead**: A simple workload turns into a PostgreSQL extension stack or a multi-service cluster.
+- **Migration friction**: Existing agents, dashboards, and Line Protocol writers make changing databases risky.
+- **Vendor lock-in**: Proprietary storage makes it difficult to use your data elsewhere or leave later.
 
-**Arc solves this: 19M+ records/sec ingestion, 6M+ rows/sec queries, portable Parquet files you own, single binary deployment.**
+Arc is built for teams that want to keep the data, query the whole history, and start with a small deployment. It combines high-throughput ingestion, automatic Parquet storage and compaction, analytical SQL, retention policies, and continuous queries in one binary.
+
+**Built for aerospace telemetry. Useful anywhere machines never stop producing data.**
 
 ---
 
 ## What Arc is (and isn't)
 
-Arc is a complete analytical database: ingestion pipeline, storage engine, compaction system, SQL query layer, retention policy manager, continuous query scheduler, and MQTT subscriber — in one binary. It uses DuckDB as its query engine the same way PostgreSQL uses its own, but Arc adds everything the query engine doesn't: high-throughput ingestion with automatic Parquet flushing, background compaction, scheduled compute, data lifecycle management, authentication, backup and restore, and enterprise clustering.
+Arc is a complete time-series analytical database: ingestion pipeline, Parquet storage engine, compaction system, SQL query layer, retention policy manager, continuous query scheduler, and telemetry integrations — in one binary. It uses DuckDB as its query engine, while Arc adds the pieces needed to run a durable ingestion and analytics service: high-throughput writes with automatic Parquet flushing, background compaction, scheduled compute, data lifecycle management, authentication, backup and restore, and enterprise clustering.
 
 Arc is **not a wrapper**. You don't bring your own ingestion, compaction, or retention policies. Arc provides the full stack.
 
+### Why teams evaluate Arc
+
+- **Keep full-resolution history** instead of choosing between retention and cost.
+- **Use standard SQL** with window functions, CTEs, joins, and analytical aggregations.
+- **Own the files**: Arc stores data as open Apache Parquet on local disk, S3, Azure, or MinIO.
+- **Start small**: run one binary on a laptop, edge box, or server before adding enterprise clustering.
+- **Migrate gradually**: use InfluxDB Line Protocol and Telegraf-compatible ingestion to dual-write and validate before cutover.
+
+### When Arc may not be the right choice
+
+- If your workload is primarily transactional relational data and already fits comfortably in PostgreSQL, start by evaluating TimescaleDB.
+- If you need a mature metrics-only replacement for Prometheus and depend on PromQL, evaluate VictoriaMetrics.
+- If your organization cannot approve AGPL-3.0 software, use Arc Enterprise's commercial license or choose an Apache-licensed alternative.
+- If you need the largest established community and the lowest adoption risk, Arc is newer than TimescaleDB, VictoriaMetrics, and QuestDB.
+
 ```sql
--- Product analytics: user events
+-- Telemetry: hourly sensor summary across a full history
 SELECT
-  user_id,
-  event_type,
-  COUNT(*) as event_count,
-  COUNT(DISTINCT session_id) as sessions
-FROM analytics.events
-WHERE timestamp > NOW() - INTERVAL '7 days'
-  AND event_type IN ('page_view', 'click', 'purchase')
-GROUP BY user_id, event_type
-HAVING COUNT(*) > 100;
+  device_id,
+  DATE_TRUNC('hour', timestamp) AS hour,
+  AVG(value) AS average_value,
+  MIN(value) AS minimum_value,
+  MAX(value) AS maximum_value
+FROM telemetry.sensor_readings
+WHERE timestamp > NOW() - INTERVAL '30 days'
+GROUP BY device_id, hour
+ORDER BY hour DESC;
 
--- Observability: error rate by service
+-- Telemetry: correlate readings with device metadata
 SELECT
-  service_name,
-  DATE_TRUNC('hour', timestamp) as hour,
-  COUNT(*) as total_requests,
-  SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END) as errors,
-  (SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END)::FLOAT / COUNT(*)) * 100 as error_rate
-FROM logs.http_requests
-WHERE timestamp > NOW() - INTERVAL '24 hours'
-GROUP BY service_name, hour
-HAVING error_rate > 1.0;
-
--- AI agent memory: conversation search
-SELECT
-  agent_id,
-  conversation_id,
-  user_message,
-  assistant_response,
-  created_at
-FROM ai.conversations
-WHERE agent_id = 'support-bot-v2'
-  AND created_at > NOW() - INTERVAL '30 days'
-  AND user_message ILIKE '%refund%'
-ORDER BY created_at DESC
-LIMIT 100;
+  d.site,
+  r.device_id,
+  AVG(r.value) AS average_value
+FROM telemetry.sensor_readings AS r
+JOIN telemetry.devices AS d ON d.device_id = r.device_id
+WHERE r.timestamp > NOW() - INTERVAL '24 hours'
+GROUP BY d.site, r.device_id;
 ```
 
 **Standard SQL. Window functions, CTEs, joins, aggregations. No proprietary query language.**
+
+## Start with the workload you already have
+
+Arc accepts **InfluxDB Line Protocol** directly, so existing Telegraf inputs can write to Arc without changing the collection layer. A low-risk migration usually looks like this:
+
+1. Point a small slice of ingestion at Arc, or dual-write to both systems.
+2. Compare the data and query results over an overlapping time window.
+3. Move one dashboard or workload at a time.
+4. Decommission the old database only after a full retention cycle has passed.
+
+See the [InfluxDB migration guide](https://basekick.net/migrate/influxdb), or compare Arc with [TimescaleDB](https://basekick.net/compare/timescaledb), [InfluxDB](https://basekick.net/compare/influxdb), [ClickHouse](https://basekick.net/compare/clickhouse), and [Elasticsearch](https://basekick.net/compare/elasticsearch).
 
 ---
 
@@ -159,7 +164,7 @@ The MessagePack endpoint is **experimental** (gated behind the `duckdb_arrow` bu
 
 ## Single binary. Zero dependencies.
 
-Arc deploys as one statically-linked executable. No JVM, no Python environment, no PostgreSQL cluster to manage, no ZooKeeper ensemble to babysit. Run it on a laptop, a factory edge box, a battlefield server, or a Kubernetes cluster. Same binary, same config surface.
+Arc deploys as one statically-linked executable. No JVM, no Python environment, no PostgreSQL cluster to manage, no ZooKeeper ensemble to babysit. Run it on a laptop, a factory edge box, an on-premises server, or a Kubernetes cluster. Same binary, same config surface.
 
 - **Air-gap ready**: No external services required at runtime. No license server, no cloud dependency.
 - **Edge to cloud**: Deploy at the tactical edge, in a sovereign cloud, or on-premises.
@@ -293,7 +298,7 @@ CMVP-certified; Arc itself is not a CMVP-listed module. See the
 
 ### Core Capabilities
 - **Columnar storage**: Parquet format with full analytical SQL engine
-- **Multi-use-case**: Product analytics, observability, AI, IoT, edge and tactical, logs, data warehousing
+- **Workloads**: Industrial IoT, manufacturing, energy, fleet telemetry, aerospace, observability, and event analytics
 
 - **Ingestion**: MessagePack columnar (fastest), InfluxDB Line Protocol, MQTT, TLE (satellite telemetry)
 - **Query**: Full analytical SQL; JSON, columnar MessagePack (experimental), and Apache Arrow IPC responses

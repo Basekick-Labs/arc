@@ -693,21 +693,21 @@ func TestJoinClausePatterns(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Using patternJoinDBTable which captures: database, table
+			// Using patternJoinDBTable which captures: join prefix, database, table
 			matches := patternJoinDBTable.FindStringSubmatch(tt.sql)
 			matched := matches != nil
 			if matched != tt.shouldMatch {
 				t.Errorf("patternJoinDBTable for %q: matched=%v, want %v", tt.sql, matched, tt.shouldMatch)
 			}
 			if matched && tt.shouldMatch {
-				if len(matches) < 3 {
-					t.Errorf("expected at least 3 groups, got %d", len(matches))
+				if len(matches) < 4 {
+					t.Errorf("expected at least 4 groups, got %d", len(matches))
 				} else {
-					if matches[1] != tt.database {
-						t.Errorf("database = %q, want %q", matches[1], tt.database)
+					if matches[2] != tt.database {
+						t.Errorf("database = %q, want %q", matches[2], tt.database)
 					}
-					if matches[2] != tt.table {
-						t.Errorf("table = %q, want %q", matches[2], tt.table)
+					if matches[3] != tt.table {
+						t.Errorf("table = %q, want %q", matches[3], tt.table)
 					}
 				}
 			}
@@ -1926,6 +1926,310 @@ func TestRewriteDateTrunc(t *testing.T) {
 			if result != tt.expected {
 				t.Errorf("rewriteDateTrunc(%q)\n  got:      %q\n  expected: %q",
 					tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestJoinModifierPreserved verifies the SQL rewriter keeps the join operator
+// intact when rewriting a table reference to read_parquet(). Emitting a bare
+// "JOIN" silently demoted outer joins to inner joins (dropping unmatched rows)
+// and stripped NATURAL's implicit join condition, turning it into a cross
+// product — wrong results, no error. See #586.
+func TestJoinModifierPreserved(t *testing.T) {
+	h := &QueryHandler{
+		storage: &mockLocalBackend{basePath: "./data"},
+		pruner:  pruning.NewPartitionPruner(zerolog.Nop()),
+		logger:  zerolog.Nop(),
+	}
+
+	tests := []struct {
+		name string
+		sql  string
+		want string // join operator expected immediately before the rewritten table
+	}{
+		// database.table form (patternJoinDBTable)
+		{name: "bare JOIN db.table", sql: "SELECT * FROM a JOIN mydb.cpu ON 1=1", want: "JOIN"},
+		{name: "LEFT JOIN db.table", sql: "SELECT * FROM a LEFT JOIN mydb.cpu ON 1=1", want: "LEFT JOIN"},
+		{name: "RIGHT JOIN db.table", sql: "SELECT * FROM a RIGHT JOIN mydb.cpu ON 1=1", want: "RIGHT JOIN"},
+		{name: "INNER JOIN db.table", sql: "SELECT * FROM a INNER JOIN mydb.cpu ON 1=1", want: "INNER JOIN"},
+		{name: "LEFT OUTER JOIN db.table", sql: "SELECT * FROM a LEFT OUTER JOIN mydb.cpu ON 1=1", want: "LEFT OUTER JOIN"},
+		{name: "FULL OUTER JOIN db.table", sql: "SELECT * FROM a FULL OUTER JOIN mydb.cpu ON 1=1", want: "FULL OUTER JOIN"},
+		{name: "NATURAL JOIN db.table", sql: "SELECT * FROM a NATURAL JOIN mydb.cpu", want: "NATURAL JOIN"},
+		{name: "CROSS JOIN db.table", sql: "SELECT * FROM a CROSS JOIN mydb.cpu", want: "CROSS JOIN"},
+		{name: "ASOF JOIN db.table", sql: "SELECT * FROM a ASOF JOIN mydb.cpu ON 1=1", want: "ASOF JOIN"},
+		{name: "SEMI JOIN db.table", sql: "SELECT * FROM a SEMI JOIN mydb.cpu ON 1=1", want: "SEMI JOIN"},
+		{name: "ANTI JOIN db.table", sql: "SELECT * FROM a ANTI JOIN mydb.cpu ON 1=1", want: "ANTI JOIN"},
+		{name: "POSITIONAL JOIN db.table", sql: "SELECT * FROM a POSITIONAL JOIN mydb.cpu", want: "POSITIONAL JOIN"},
+		{name: "RIGHT ANTI JOIN db.table", sql: "SELECT * FROM a RIGHT ANTI JOIN mydb.cpu ON 1=1", want: "RIGHT ANTI JOIN"},
+		{name: "CROSS JOIN LATERAL db.table", sql: "SELECT * FROM a CROSS JOIN LATERAL mydb.cpu", want: "CROSS JOIN LATERAL"},
+		{name: "LATERAL JOIN db.table", sql: "SELECT * FROM a LATERAL JOIN mydb.cpu", want: "LATERAL JOIN"},
+
+		// simple table form (patternJoinSimpleTable)
+		{name: "bare JOIN table", sql: "SELECT * FROM a JOIN cpu ON 1=1", want: "JOIN"},
+		{name: "LEFT JOIN table", sql: "SELECT * FROM a LEFT JOIN cpu ON 1=1", want: "LEFT JOIN"},
+		{name: "FULL OUTER JOIN table", sql: "SELECT * FROM a FULL OUTER JOIN cpu ON 1=1", want: "FULL OUTER JOIN"},
+		{name: "NATURAL JOIN table", sql: "SELECT * FROM a NATURAL JOIN cpu", want: "NATURAL JOIN"},
+		{name: "ASOF JOIN table", sql: "SELECT * FROM a ASOF JOIN cpu ON 1=1", want: "ASOF JOIN"},
+
+		// irregular whitespace must not corrupt the emitted operator
+		{name: "newline before LEFT JOIN", sql: "SELECT * FROM a\nLEFT JOIN mydb.cpu ON 1=1", want: "LEFT JOIN"},
+		{name: "newline inside LEFT OUTER JOIN", sql: "SELECT * FROM a LEFT\n  OUTER JOIN mydb.cpu ON 1=1", want: "LEFT OUTER JOIN"},
+		{name: "double space in LEFT JOIN", sql: "SELECT * FROM a LEFT  JOIN mydb.cpu ON 1=1", want: "LEFT JOIN"},
+		{name: "tab before bare JOIN", sql: "SELECT * FROM a\tJOIN mydb.cpu ON 1=1", want: "JOIN"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := h.convertSQLToStoragePaths(context.Background(), tt.sql)
+
+			want := tt.want + " read_parquet("
+			if !strings.Contains(got, want) {
+				t.Errorf("join operator not preserved.\n  sql:  %q\n  want: %q\n  got:  %s", tt.sql, want, got)
+			}
+
+			// The alias preceding the join must stay separated from the operator.
+			// A swallowed separator fused them into a fabricated measurement
+			// (`FROM a JOIN x` -> `.../aJOIN/...`). See #585.
+			if strings.Contains(got, "aJOIN") || strings.Contains(got, "parquet')JOIN") {
+				t.Errorf("separator before join operator was consumed.\n  sql: %q\n  got: %s", tt.sql, got)
+			}
+		})
+	}
+}
+
+// TestJoinModifierPreservedWithHeaderDB covers the x-arc-database fast path,
+// which shares patternJoinSimpleTable with the standard rewriter.
+func TestJoinModifierPreservedWithHeaderDB(t *testing.T) {
+	h := &QueryHandler{
+		storage: &mockLocalBackend{basePath: "./data"},
+		pruner:  pruning.NewPartitionPruner(zerolog.Nop()),
+		logger:  zerolog.Nop(),
+	}
+
+	tests := []struct {
+		sql  string
+		want string
+	}{
+		{sql: "SELECT * FROM a JOIN cpu ON 1=1", want: "JOIN"},
+		{sql: "SELECT * FROM a LEFT JOIN cpu ON 1=1", want: "LEFT JOIN"},
+		{sql: "SELECT * FROM a FULL OUTER JOIN cpu ON 1=1", want: "FULL OUTER JOIN"},
+		{sql: "SELECT * FROM a NATURAL JOIN cpu", want: "NATURAL JOIN"},
+		{sql: "SELECT * FROM a ASOF JOIN cpu ON 1=1", want: "ASOF JOIN"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			got := h.convertSQLToStoragePathsWithHeaderDB(context.Background(), tt.sql, "mydb")
+
+			want := tt.want + " read_parquet("
+			if !strings.Contains(got, want) {
+				t.Errorf("join operator not preserved.\n  sql:  %q\n  want: %q\n  got:  %s", tt.sql, want, got)
+			}
+			if !strings.Contains(got, "./data/mydb/cpu/") {
+				t.Errorf("header database not applied.\n  sql: %q\n  got: %s", tt.sql, got)
+			}
+		})
+	}
+}
+
+// TestJoinKeyword covers the prefix normaliser directly, including the
+// whitespace-collapsing and empty-input edge cases.
+func TestJoinKeyword(t *testing.T) {
+	tests := []struct {
+		prefix string
+		want   string
+	}{
+		{prefix: "JOIN ", want: "JOIN"},
+		{prefix: "LEFT JOIN ", want: "LEFT JOIN"},
+		{prefix: "LEFT  JOIN\t", want: "LEFT JOIN"},
+		{prefix: "LEFT\n  OUTER\nJOIN ", want: "LEFT OUTER JOIN"},
+		{prefix: "CROSS JOIN LATERAL ", want: "CROSS JOIN LATERAL"},
+		{prefix: "left join ", want: "left join"}, // case preserved as authored
+		{prefix: "   ", want: "JOIN"},             // degenerate: never emit empty
+		{prefix: "", want: "JOIN"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			if got := joinKeyword(tt.prefix); got != tt.want {
+				t.Errorf("joinKeyword(%q) = %q, want %q", tt.prefix, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestJoinModifierRBACExtraction verifies the capture-group renumbering did not
+// disturb RBAC table extraction. Extracting the wrong identifier here would
+// check permissions against the wrong table — a security-relevant regression.
+func TestJoinModifierRBACExtraction(t *testing.T) {
+	tests := []struct {
+		sql  string
+		want []TableReference
+	}{
+		{
+			sql: "SELECT * FROM a LEFT JOIN mydb.cpu ON 1=1",
+			want: []TableReference{
+				{Database: "default", Measurement: "a"},
+				{Database: "mydb", Measurement: "cpu"},
+			},
+		},
+		{
+			sql: "SELECT * FROM a ASOF JOIN mydb.cpu ON 1=1",
+			want: []TableReference{
+				{Database: "default", Measurement: "a"},
+				{Database: "mydb", Measurement: "cpu"},
+			},
+		},
+		{
+			sql: "SELECT * FROM a NATURAL JOIN cpu",
+			want: []TableReference{
+				{Database: "default", Measurement: "a"},
+				{Database: "default", Measurement: "cpu"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.sql, func(t *testing.T) {
+			got := extractTableReferences(tt.sql)
+
+			for _, want := range tt.want {
+				found := false
+				for _, ref := range got {
+					if ref.Database == want.Database && ref.Measurement == want.Measurement {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("missing table reference %s.%s\n  sql: %q\n  got: %+v",
+						want.Database, want.Measurement, tt.sql, got)
+				}
+			}
+
+			// A stale group index would surface as a join keyword captured as a
+			// measurement name (e.g. default.JOIN or default.LEFT).
+			for _, ref := range got {
+				switch strings.ToUpper(ref.Measurement) {
+				case "JOIN", "LEFT", "RIGHT", "FULL", "OUTER", "INNER", "NATURAL", "ASOF", "CROSS", "LATERAL":
+					t.Errorf("join keyword %q extracted as a measurement\n  sql: %q\n  got: %+v",
+						ref.Measurement, tt.sql, got)
+				}
+			}
+		})
+	}
+}
+
+// TestTableRefLookaheadUsesCurrentOffset covers a latent defect in the
+// rewriter's "is this identifier followed by '.' or '('?" lookahead.
+//
+// The lookahead used to recover the match offset with
+// strings.Index(sqlLower, match). sqlLower was computed once, before the
+// earlier FROM/JOIN passes rewrote sql, so the recovered index pointed into
+// the PRE-rewrite string while the slice was taken from the POST-rewrite one.
+// The stale offset landed inside an already-emitted read_parquet('…') and the
+// '(' there tripped the function-call guard, silently leaving a legitimate
+// table un-rewritten. Whether a given query hit it depended on the table
+// name's length: `JOIN cross` broke while `JOIN crossx` happened to work.
+func TestTableRefLookaheadUsesCurrentOffset(t *testing.T) {
+	h := &QueryHandler{
+		storage: &mockLocalBackend{basePath: "./data"},
+		pruner:  pruning.NewPartitionPruner(zerolog.Nop()),
+		logger:  zerolog.Nop(),
+	}
+
+	tests := []struct {
+		name string
+		sql  string
+		want []string
+	}{
+		{
+			name: "short table name after a rewritten FROM",
+			sql:  "SELECT * FROM a JOIN cross ON 1=1",
+			want: []string{
+				"read_parquet('./data/default/a/**/*.parquet'",
+				"JOIN read_parquet('./data/default/cross/**/*.parquet'",
+			},
+		},
+		{
+			name: "longer table name after a rewritten FROM",
+			sql:  "SELECT * FROM a JOIN crossx ON 1=1",
+			want: []string{"JOIN read_parquet('./data/default/crossx/**/*.parquet'"},
+		},
+		{
+			name: "chained joins all rewrite",
+			sql:  "SELECT * FROM a LEFT JOIN b ON 1=1 RIGHT JOIN c ON 1=1",
+			want: []string{
+				"read_parquet('./data/default/a/**/*.parquet'",
+				"LEFT JOIN read_parquet('./data/default/b/**/*.parquet'",
+				"RIGHT JOIN read_parquet('./data/default/c/**/*.parquet'",
+			},
+		},
+		{
+			name: "join inside a CTE body",
+			sql:  "WITH t AS (SELECT * FROM cpu) SELECT * FROM t LEFT JOIN mem ON 1=1",
+			want: []string{
+				"read_parquet('./data/default/cpu/**/*.parquet'",
+				"LEFT JOIN read_parquet('./data/default/mem/**/*.parquet'",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := h.convertSQLToStoragePaths(context.Background(), tt.sql)
+			for _, want := range tt.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("missing %q\n  sql: %q\n  got: %s", want, tt.sql, got)
+				}
+			}
+		})
+	}
+}
+
+// TestTableRefLookaheadStillSkipsFunctionsAndQualifiers verifies the rewritten
+// lookahead did not lose the behaviour it exists for: table-valued function
+// calls and database-qualified names must still be left alone.
+func TestTableRefLookaheadStillSkipsFunctionsAndQualifiers(t *testing.T) {
+	h := &QueryHandler{
+		storage: &mockLocalBackend{basePath: "./data"},
+		pruner:  pruning.NewPartitionPruner(zerolog.Nop()),
+		logger:  zerolog.Nop(),
+	}
+
+	tests := []struct {
+		name    string
+		sql     string
+		notWant string
+	}{
+		{
+			name:    "table-valued function is not a measurement",
+			sql:     "SELECT * FROM generate_series(1, 10)",
+			notWant: "read_parquet('./data/default/generate_series",
+		},
+		{
+			name:    "function call after a join is not a measurement",
+			sql:     "SELECT * FROM a JOIN generate_series(1, 10) ON 1=1",
+			notWant: "read_parquet('./data/default/generate_series",
+		},
+		{
+			name:    "whitespace before the paren still reads as a call",
+			sql:     "SELECT * FROM a JOIN generate_series (1, 10) ON 1=1",
+			notWant: "read_parquet('./data/default/generate_series",
+		},
+		{
+			name:    "database qualifier is not rewritten as a bare table",
+			sql:     "SELECT * FROM a JOIN mydb.cpu ON 1=1",
+			notWant: "read_parquet('./data/default/mydb/",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := h.convertSQLToStoragePaths(context.Background(), tt.sql)
+			if strings.Contains(got, tt.notWant) {
+				t.Errorf("should not contain %q\n  sql: %q\n  got: %s", tt.notWant, tt.sql, got)
 			}
 		})
 	}

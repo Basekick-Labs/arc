@@ -284,6 +284,29 @@ Reachable only when RBAC is enabled (the multi-tenant authorization boundary); n
 
 ## Bug fixes
 
+### `LEFT`/`RIGHT`/`FULL OUTER`/`NATURAL` joins are no longer rewritten to inner joins ([#586](https://github.com/Basekick-Labs/arc/issues/586))
+
+Arc rewrites table references into `read_parquet(...)` calls before handing the query to DuckDB. The join rewriter matched the join operator but replaced it with a hardcoded bare `JOIN`, discarding whatever modifier the query actually used. `LEFT JOIN metrics` became `JOIN read_parquet(…)`.
+
+This was a **wrong-answer** bug, and the most severe kind: the query succeeded, returned `success: true`, and produced a plausible result set that was **silently missing rows**. A `LEFT JOIN` against a table with unmatched rows returned only the matched ones — the exact rows an outer join exists to preserve. Every modifier was affected: `LEFT`, `RIGHT`, and `FULL OUTER` were demoted to inner joins, and `ASOF`/`SEMI`/`ANTI`/`POSITIONAL` lost their semantics. `NATURAL JOIN` failed loudly instead — stripping `NATURAL` left no join condition, so DuckDB rejected the statement with a parser error.
+
+The rewriter now captures the join operator and emits it verbatim, so `LEFT OUTER JOIN mydb.cpu` rewrites to `LEFT OUTER JOIN read_parquet(…)`. Irregular whitespace (newlines, repeated spaces, tabs between `LEFT` and `JOIN`) is normalized to single spaces rather than corrupting the emitted operator.
+
+The same change fixes a related defect on bare joins ([#585](https://github.com/Basekick-Labs/arc/pull/585), reported by [@schotime](https://github.com/schotime)): the pattern could consume the whitespace *before* an unmodified `JOIN`, fusing the preceding alias into the rewritten path — `FROM a JOIN mydb.cpu` produced a reference to a fabricated measurement `aJOIN` and dropped the join operator entirely. `INNER JOIN` was unaffected by both defects, which is why this survived: the existing tests only covered modifier forms that happened to round-trip.
+
+RBAC table extraction shares these patterns but was **not** affected — it reads the table identifier, which was never part of the corrupted text, so permission checks always evaluated the correct table.
+
+### Table rewriting no longer depends on the length of the table name
+
+Fixing the joins above surfaced a second, unrelated defect in the same rewriter. Before rewriting an identifier, Arc checks whether it is followed by `.` or `(` — a database qualifier or a table-valued function call, neither of which is a measurement. That check recovered the identifier's position by searching a lowercased copy of the SQL that was computed **once, before** the earlier rewrite passes ran. The recovered offset therefore pointed into the original string while the text was read from the already-rewritten one.
+
+The consequences depended on where the stale offset happened to land, which in practice meant **the length of the table name**:
+
+- `SELECT * FROM a JOIN cross ON 1=1` left `cross` un-rewritten (the offset landed on the `(` of a previously emitted `read_parquet(`), so DuckDB failed to resolve the table — while the one-character-longer `SELECT * FROM a JOIN crossx ON 1=1` worked.
+- In the other direction, `JOIN generate_series(1, 10)` was rewritten **as if it were a measurement**, because the offset missed the `(` that marks it a function call.
+
+The lookahead now uses the match offset the regex already provides, so it always reads the string actually being rewritten. Table-valued functions and database-qualified names are still skipped, including when whitespace separates the name from the paren.
+
 ### Compaction no longer treats a storage failure as "no manifests exist" ([#314](https://github.com/Basekick-Labs/arc/issues/314))
 
 `ListManifests` discarded every error from the storage backend and returned an empty list, with no log line. "No manifests exist" and "we could not find out" are opposite instructions to the caller: an empty manifest set means nothing is being compacted and the candidate may proceed, while a failed lookup means the files in flight cannot be identified.
