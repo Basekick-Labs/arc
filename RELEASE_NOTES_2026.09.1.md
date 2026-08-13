@@ -62,6 +62,23 @@ This is a **file-count** bound, not a byte bound — compacted output size track
 
 Out-of-range values fall back to the default with a startup warning rather than failing. **`1` is not usable** and is treated as out of range: compaction's adaptive retry rejects any batch below two files, so a batch size of one would fail every batch of every partition.
 
+## Insertion-order preservation is now configurable, and off by default
+
+Arc previously forced DuckDB's `preserve_insertion_order=true`, which makes queries **without** an `ORDER BY` return rows in file/insertion order — at the cost of order-preserving buffering in the engine. That setting is now configurable and defaults to **false**:
+
+```toml
+[database]
+preserve_insertion_order = false   # default; set true for pre-26.09.1 behavior
+```
+
+Env var: `ARC_DATABASE_PRESERVE_INSERTION_ORDER`.
+
+The default follows SQL semantics (row order without `ORDER BY` is unspecified) and DuckDB's guidance that disabling order preservation can reduce memory usage and unlock additional parallelism on large result materializations. On ClickBench-style aggregation suites — where nearly every query carries an explicit `ORDER BY` — measured throughput is unchanged; the setting matters for large un-ordered scans and exports.
+
+**Behavior change:** queries without an explicit `ORDER BY` may now return rows in any order, as SQL semantics allow. Queries with an `ORDER BY` are completely unaffected. If a dashboard or integration relies on implicit insertion order (e.g. `SELECT * FROM cpu LIMIT 10` expecting oldest-first), either add an explicit `ORDER BY time` (recommended) or set `preserve_insertion_order = true`.
+
+Internal write paths that rebuild parquet files keep the same ordering behavior as before this change: compaction with configured `sort_keys` sorts explicitly, while sort-keys-less compaction and DELETE file rewrites force order preservation on their own database session (session-scoped, so concurrent queries are unaffected).
+
 ## New: edge-to-cloud sync (manual)
 
 Arc runs at the edge today — a standalone binary with local storage in a vehicle, a factory cell, or a forward deployment — with no first-class way to ship that data to a central Arc. Backup is a full DR snapshot rather than incremental sync, and Parquet import re-ingests rows through the write path, which breaks the end-to-end checksum and double-counts on retry.

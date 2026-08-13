@@ -235,11 +235,12 @@ func main() {
 		Int("machine_cpus", runtime.NumCPU()).
 		Msg("Initializing DuckDB with database config")
 	dbConfig := &database.Config{
-		MaxConnections: cfg.Database.MaxConnections,
-		MemoryLimit:    cfg.Database.MemoryLimit,
-		ThreadCount:    cfg.Database.ThreadCount,
-		EnableWAL:      cfg.Database.EnableWAL,
-		TempDirectory:  cfg.Database.TempDirectory,
+		MaxConnections:         cfg.Database.MaxConnections,
+		MemoryLimit:            cfg.Database.MemoryLimit,
+		ThreadCount:            cfg.Database.ThreadCount,
+		EnableWAL:              cfg.Database.EnableWAL,
+		TempDirectory:          cfg.Database.TempDirectory,
+		PreserveInsertionOrder: cfg.Database.PreserveInsertionOrder,
 		// S3 configuration for httpfs extension (enables DuckDB to query S3 directly)
 		S3Region:    cfg.Storage.S3Region,
 		S3AccessKey: cfg.Storage.S3AccessKey,

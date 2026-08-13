@@ -72,6 +72,14 @@ type DatabaseConfig struct {
 	// binary. Empty disables the loader. Arc Enterprise only — gated by
 	// licenseClient.CanUseArcx() before this value reaches the DB layer.
 	ArcxExtensionPath string
+	// PreserveInsertionOrder controls DuckDB's preserve_insertion_order
+	// setting. false (the default) lets DuckDB reorder results of queries
+	// without an ORDER BY, which can reduce memory usage and unlock
+	// parallelism on large un-ordered materializations. Queries with an
+	// explicit ORDER BY are unaffected either way. Set true to restore
+	// pre-26.09.1 behavior where un-ordered SELECTs return rows in
+	// file/insertion order.
+	PreserveInsertionOrder bool
 }
 
 type StorageConfig struct {
@@ -697,12 +705,13 @@ func Load() (*Config, error) {
 			TLSKeyFile:      v.GetString("server.tls_key_file"),
 		},
 		Database: DatabaseConfig{
-			MaxConnections:    v.GetInt("database.max_connections"),
-			MemoryLimit:       v.GetString("database.memory_limit"),
-			ThreadCount:       v.GetInt("database.thread_count"),
-			EnableWAL:         v.GetBool("database.enable_wal"),
-			TempDirectory:     v.GetString("database.temp_directory"),
-			ArcxExtensionPath: v.GetString("database.arcx_extension_path"),
+			MaxConnections:         v.GetInt("database.max_connections"),
+			MemoryLimit:            v.GetString("database.memory_limit"),
+			ThreadCount:            v.GetInt("database.thread_count"),
+			EnableWAL:              v.GetBool("database.enable_wal"),
+			TempDirectory:          v.GetString("database.temp_directory"),
+			ArcxExtensionPath:      v.GetString("database.arcx_extension_path"),
+			PreserveInsertionOrder: v.GetBool("database.preserve_insertion_order"),
 		},
 		Storage: StorageConfig{
 			// Normalize once at load so the backend switch, the DuckDB
@@ -1325,8 +1334,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("database.memory_limit", getDefaultMemoryLimit())
 	v.SetDefault("database.thread_count", getDefaultThreadCount())
 	v.SetDefault("database.enable_wal", true)
-	v.SetDefault("database.temp_directory", "./.tmp") // DuckDB query spill files (overflow, sort, join). Orphans swept at startup.
-	v.SetDefault("database.arcx_extension_path", "")  // Enterprise-only; gated by licenseClient.CanUseArcx()
+	v.SetDefault("database.temp_directory", "./.tmp")        // DuckDB query spill files (overflow, sort, join). Orphans swept at startup.
+	v.SetDefault("database.arcx_extension_path", "")         // Enterprise-only; gated by licenseClient.CanUseArcx()
+	v.SetDefault("database.preserve_insertion_order", false) // false = SQL-standard unordered results; ORDER BY queries unaffected
 
 	// Storage defaults
 	v.SetDefault("storage.backend", "local")
