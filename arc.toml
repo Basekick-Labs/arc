@@ -31,6 +31,12 @@ format = "console"  # json or console
 # thread_count = 14       # Default: CPU cores
 enable_wal = true
 
+# Allow DuckDB to reorder results of queries WITHOUT an ORDER BY (queries
+# with ORDER BY are unaffected); can reduce memory usage on large un-ordered
+# scans and exports. Set true to restore pre-26.09.1 behavior where
+# un-ordered SELECTs return rows in file/insertion order.
+# preserve_insertion_order = false
+
 # -----------------------------------------------------------------------------
 # Storage
 # -----------------------------------------------------------------------------

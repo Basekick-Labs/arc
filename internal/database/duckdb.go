@@ -203,6 +203,11 @@ type Config struct {
 	MemoryLimit    string
 	ThreadCount    int
 	EnableWAL      bool
+	// PreserveInsertionOrder maps to DuckDB's preserve_insertion_order.
+	// false allows DuckDB to reorder results of queries without an ORDER BY,
+	// enabling faster parallel scans/aggregations. Explicit ORDER BY clauses
+	// (including compaction's ORDER BY "time") are respected either way.
+	PreserveInsertionOrder bool
 	// TempDirectory is where DuckDB writes query spill files (HASH_GROUP_BY
 	// overflow, large sorts, joins). Empty leaves DuckDB's default
 	// (CWD-relative). Orphans from a crashed previous run are swept by
@@ -421,6 +426,70 @@ func loadArcxExtension(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	return nil
 }
 
+// ForcePreserveInsertionOrder forces preserve_insertion_order=true for the
+// session of the pinned connection, so statements that rebuild parquet files
+// (DELETE rewrites, sort-keys-less compaction) keep the source's row order
+// even when the database-wide setting is false.
+//
+// Scope subtleties, verified against the pinned duckdb-go driver:
+//   - It MUST be `SET SESSION`: for this option a plain `SET` is
+//     GLOBAL-scoped and would flip the whole instance (slowing every
+//     concurrent query and racing two concurrent rewrites into unordered
+//     output).
+//   - The restore MUST be `RESET SESSION`, which clears the session override
+//     so the connection tracks the configured global again. A bare `RESET`
+//     would restore DuckDB's built-in default (true), stomping Arc's
+//     configured global; a `SET SESSION ...=false` would pin a session value
+//     that shadows any later change to the global.
+//   - The driver performs no session reset when a connection returns to the
+//     pool, so the caller MUST invoke the returned restore function (defer
+//     it) before releasing the connection. The restore uses
+//     context.WithoutCancel so a caller timeout that kills the statement
+//     cannot also skip the restore and leak the override into the pool.
+//
+// When the session value read here is already true the returned restore is a
+// no-op.
+func ForcePreserveInsertionOrder(ctx context.Context, conn *sql.Conn) (restore func(), err error) {
+	var prev bool
+	if err := conn.QueryRowContext(ctx, "SELECT current_setting('preserve_insertion_order')").Scan(&prev); err != nil {
+		return nil, fmt.Errorf("read preserve_insertion_order: %w", err)
+	}
+	if prev {
+		return func() {}, nil
+	}
+	if _, err := conn.ExecContext(ctx, "SET SESSION preserve_insertion_order=true"); err != nil {
+		return nil, fmt.Errorf("set preserve_insertion_order: %w", err)
+	}
+	return func() {
+		_, _ = conn.ExecContext(context.WithoutCancel(ctx), "RESET SESSION preserve_insertion_order")
+	}, nil
+}
+
+// ExecPreservingInsertionOrder runs a statement (typically a COPY that
+// rewrites a parquet file in place) on a dedicated connection with
+// preserve_insertion_order forced on for that session. See
+// ForcePreserveInsertionOrder for the ordering rationale. Callers are
+// infrequent maintenance paths (DELETE file rewrites), so the extra
+// roundtrips are irrelevant.
+func ExecPreservingInsertionOrder(ctx context.Context, db *sql.DB, query string) error {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire connection: %w", err)
+	}
+	defer conn.Close()
+
+	restore, err := ForcePreserveInsertionOrder(ctx, conn)
+	if err != nil {
+		return err
+	}
+	defer restore()
+
+	if _, err := conn.ExecContext(ctx, query); err != nil {
+		return err
+	}
+	return nil
+}
+
 // configureDatabase sets DuckDB configuration after connection
 func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	// Set memory limit to prevent unbounded memory growth
@@ -460,8 +529,13 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		logger.Warn().Err(err).Msg("Failed to enable parquet metadata cache (continuing without it)")
 	}
 
-	// Preserve insertion order for deterministic results (important for LIMIT queries)
-	if _, err := db.Exec("SET GLOBAL preserve_insertion_order=true"); err != nil {
+	// preserve_insertion_order=false (the default) lets DuckDB reorder
+	// results of queries without an ORDER BY, which per DuckDB guidance can
+	// reduce memory usage and unlock parallelism on large un-ordered
+	// materializations. Explicit ORDER BY is respected either way. Operators
+	// can set database.preserve_insertion_order=true to restore
+	// insertion-ordered results for un-ordered SELECTs.
+	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL preserve_insertion_order=%t", cfg.PreserveInsertionOrder)); err != nil {
 		logger.Warn().Err(err).Msg("Failed to set preserve_insertion_order")
 	}
 

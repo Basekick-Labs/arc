@@ -743,7 +743,10 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, _, where
 
 	tempFile := filepath.Join(tempDir, filepath.Base(filePath)+".new")
 
-	// Write filtered data to temp file using DuckDB COPY
+	// Write filtered data to temp file using DuckDB COPY. Run with
+	// preserve_insertion_order forced on so the rewritten file keeps the
+	// source's row order (typically time-sorted) even when the
+	// database-wide setting is false.
 	copyQuery := fmt.Sprintf(`
 		COPY (
 			SELECT * FROM read_parquet('%s') WHERE NOT (%s)
@@ -754,7 +757,7 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, _, where
 			ROW_GROUP_SIZE %d
 		)`, escapeDuckDBPath(filePath), whereClause, escapeDuckDBPath(tempFile), parquetRowGroupSize)
 
-	if _, err := db.ExecContext(ctx, copyQuery); err != nil {
+	if err := database.ExecPreservingInsertionOrder(ctx, db, copyQuery); err != nil {
 		os.Remove(tempFile)
 		return 0, fmt.Errorf("failed to write filtered data: %w", err)
 	}
@@ -816,7 +819,10 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 	tempFile.Close()
 	defer os.Remove(tempPath)
 
-	// DuckDB reads from S3 and writes to local temp file
+	// DuckDB reads from S3 and writes to local temp file. Run with
+	// preserve_insertion_order forced on so the rewritten file keeps the
+	// source's row order (typically time-sorted) even when the
+	// database-wide setting is false.
 	copyQuery := fmt.Sprintf(`
 		COPY (
 			SELECT * FROM read_parquet('%s') WHERE NOT (%s)
@@ -827,7 +833,7 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 			ROW_GROUP_SIZE %d
 		)`, escapeDuckDBPath(s3Path), whereClause, escapeDuckDBPath(tempPath), parquetRowGroupSize)
 
-	if _, err := db.ExecContext(ctx, copyQuery); err != nil {
+	if err := database.ExecPreservingInsertionOrder(ctx, db, copyQuery); err != nil {
 		return 0, nil, fmt.Errorf("failed to write filtered data: %w", err)
 	}
 

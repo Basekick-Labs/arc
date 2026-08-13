@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
@@ -729,6 +730,26 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 		}
 		conn.Close()
 	}()
+	// Without configured sort keys the compaction SQL has no ORDER BY, so the
+	// merged output's row order comes from the scan itself. Force
+	// preserve_insertion_order on this pinned session so the output keeps
+	// per-source-file row order (typically time-sorted) even when the
+	// database-wide setting is false. Registered after the Close defer above,
+	// so the restore runs before the connection returns to the pool.
+	//
+	// In the shipping configuration this is a no-op: compaction runs in a
+	// subprocess whose raw DuckDB never goes through configureDatabase, so
+	// its preserve_insertion_order sits at DuckDB's default (true). The
+	// force is what keeps ordering correct if compaction is ever moved
+	// in-process onto the configured database (a refactor duckdb.go
+	// explicitly anticipates).
+	if orderByClause == "" {
+		restore, err := database.ForcePreserveInsertionOrder(ctx, conn)
+		if err != nil {
+			return "", fmt.Errorf("failed to force preserve_insertion_order for compaction: %w", err)
+		}
+		defer restore()
+	}
 	for _, stmt := range stmts {
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			return "", fmt.Errorf("failed to execute compaction query: %w", err)
