@@ -292,7 +292,9 @@ This was a **wrong-answer** bug, and the most severe kind: the query succeeded, 
 
 The rewriter now captures the join operator and emits it verbatim, so `LEFT OUTER JOIN mydb.cpu` rewrites to `LEFT OUTER JOIN read_parquet(…)`. Irregular whitespace (newlines, repeated spaces, tabs between `LEFT` and `JOIN`) is normalized to single spaces rather than corrupting the emitted operator.
 
-The same change fixes a related defect on bare joins ([#585](https://github.com/Basekick-Labs/arc/pull/585), reported by [@schotime](https://github.com/schotime)): the pattern could consume the whitespace *before* an unmodified `JOIN`, fusing the preceding alias into the rewritten path — `FROM a JOIN mydb.cpu` produced a reference to a fabricated measurement `aJOIN` and dropped the join operator entirely. `INNER JOIN` was unaffected by both defects, which is why this survived: the existing tests only covered modifier forms that happened to round-trip.
+The same change fixes a related defect on bare joins, **found and fixed by [@schotime](https://github.com/schotime)** in [#585](https://github.com/Basekick-Labs/arc/pull/585): because the join modifier was optional *and* its trailing whitespace was optional, the pattern collapsed to "optionally consume whitespace" for an unmodified `JOIN` — so the match began at the space *before* it, and replacing the match deleted the separator. `FROM a JOIN mydb.cpu` fused the preceding alias into a reference to a fabricated measurement `aJOIN` and dropped the join operator entirely. That fix — requiring whitespace after a modifier rather than allowing it to float — is the basis of the corrected patterns shipped here, extended to also capture the operator for the modifier fix above.
+
+`INNER JOIN` was unaffected by both defects, which is why they survived: the existing tests only covered modifier forms that happened to round-trip.
 
 RBAC table extraction shares these patterns but was **not** affected — it reads the table identifier, which was never part of the corrupted text, so permission checks always evaluated the correct table.
 
