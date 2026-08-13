@@ -69,10 +69,22 @@ var (
 	patternSimpleTable = regexp.MustCompile(`(?i)\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]*)\b`)
 	// Pattern for database.table in JOIN clauses (e.g., JOIN mydb.mytable)
 	// Includes LATERAL JOIN support: "LATERAL JOIN", "JOIN LATERAL", "CROSS JOIN LATERAL"
-	patternJoinDBTable = regexp.MustCompile(`(?i)\b(?:(?:LEFT|RIGHT|INNER|OUTER|CROSS|NATURAL)?\s*)?(?:LATERAL\s+)?JOIN\s+(?:LATERAL\s+)?([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\b`)
+	//
+	// The join modifier (LEFT/RIGHT/ASOF/...) is REQUIRED to be followed by
+	// whitespace rather than optional-with-optional-whitespace. Writing it as
+	// `(?:MODIFIER)?\s*` makes the whole prefix collapse to "optionally eat
+	// whitespace" for a bare JOIN, so the match would start at the space
+	// *before* JOIN and replacing the match would delete the separator
+	// (`FROM a JOIN x` -> `read_parquet('.../aJOIN/...')`). See #585.
+	//
+	// The modifier is captured (group 1) so the rewriter can preserve it —
+	// emitting a bare "JOIN" would silently demote LEFT/RIGHT/FULL OUTER to an
+	// inner join and strip NATURAL/ASOF semantics. See #586.
+	patternJoinDBTable = regexp.MustCompile(`(?i)\b((?:(?:LEFT|RIGHT|FULL|INNER|OUTER|CROSS|NATURAL|SEMI|ANTI|ASOF|POSITIONAL)\s+)*(?:LATERAL\s+)?JOIN\s+(?:LATERAL\s+)?)([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\b`)
 	// Pattern for simple table in JOIN clauses (JOIN table_name)
 	// Includes LATERAL JOIN support: "LATERAL JOIN", "JOIN LATERAL", "CROSS JOIN LATERAL"
-	patternJoinSimpleTable = regexp.MustCompile(`(?i)\b(?:(?:LEFT|RIGHT|INNER|OUTER|CROSS|NATURAL)?\s*)?(?:LATERAL\s+)?JOIN\s+(?:LATERAL\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b`)
+	// Group 1 is the join prefix, group 2 the table. See patternJoinDBTable above.
+	patternJoinSimpleTable = regexp.MustCompile(`(?i)\b((?:(?:LEFT|RIGHT|FULL|INNER|OUTER|CROSS|NATURAL|SEMI|ANTI|ASOF|POSITIONAL)\s+)*(?:LATERAL\s+)?JOIN\s+(?:LATERAL\s+)?)([a-zA-Z_][a-zA-Z0-9_]*)\b`)
 	// Pattern to extract CTE names from WITH clauses
 	// Matches: WITH name AS, WITH RECURSIVE name AS, and comma-separated CTEs
 	// CTE name extraction. DuckDB allows `WITH foo AS (...)` and
@@ -1100,13 +1112,15 @@ func extractTableReferences(sql string) []TableReference {
 	// Also check JOIN patterns for database.table
 	joinDBMatches := patternJoinDBTable.FindAllStringSubmatch(sql, -1)
 	for _, match := range joinDBMatches {
-		if len(match) >= 3 {
-			key := match[1] + "." + match[2]
+		// Group 1 is the join prefix (LEFT JOIN, ASOF JOIN, ...); the
+		// database/measurement identifiers are groups 2 and 3.
+		if len(match) >= 4 {
+			key := match[2] + "." + match[3]
 			if !seen[key] {
 				seen[key] = true
 				refs = append(refs, TableReference{
-					Database:    match[1],
-					Measurement: match[2],
+					Database:    match[2],
+					Measurement: match[3],
 				})
 			}
 		}
@@ -1161,8 +1175,10 @@ func extractTableReferences(sql string) []TableReference {
 	// Also check JOIN simple patterns
 	joinSimpleMatches := patternJoinSimpleTable.FindAllStringSubmatchIndex(sql, -1)
 	for _, matchIdx := range joinSimpleMatches {
-		if len(matchIdx) >= 4 {
-			tableName := sql[matchIdx[2]:matchIdx[3]]
+		// Group 1 is the join prefix (indices 2:4); the table identifier is
+		// group 2, at indices 4:6.
+		if len(matchIdx) >= 6 {
+			tableName := sql[matchIdx[4]:matchIdx[5]]
 			table := strings.ToLower(tableName)
 
 			if shouldSkipTableConversion(table) {
@@ -1175,7 +1191,7 @@ func extractTableReferences(sql string) []TableReference {
 			}
 
 			// Check if this table name is followed by a dot
-			endIdx := matchIdx[3]
+			endIdx := matchIdx[5]
 			if endIdx < len(sql) && sql[endIdx] == '.' {
 				continue
 			}
@@ -2494,9 +2510,6 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 	// e.g., "-- FROM mydb.cpu" should not be converted
 	sql = stripSQLComments(sql, features.hasDashComment || features.hasBlockComment)
 
-	// Compute sqlLower once after all pre-processing mutations
-	sqlLower := strings.ToLower(sql)
-
 	// Extract CTE names to avoid converting them to storage paths
 	cteNames := extractCTENames(sql)
 
@@ -2513,40 +2526,33 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 	// Handle JOIN database.table references (includes LATERAL JOIN)
 	sql = patternJoinDBTable.ReplaceAllStringFunc(sql, func(match string) string {
 		parts := patternJoinDBTable.FindStringSubmatch(match)
-		if len(parts) < 3 {
+		if len(parts) < 4 {
 			return match
 		}
-		path := h.getStoragePath(parts[1], parts[2])
-		return h.buildReadParquetExpr(ctx, path, originalSQL, "JOIN")
+		path := h.getStoragePath(parts[2], parts[3])
+		return h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1]))
 	})
 
 	// Handle FROM simple_table references
-	sql = patternSimpleTable.ReplaceAllStringFunc(sql, func(match string) string {
-		parts := patternSimpleTable.FindStringSubmatch(match)
+	sql = replaceTableRefs(sql, patternSimpleTable, func(parts []string, end int) string {
 		if len(parts) < 2 {
-			return match
+			return parts[0]
 		}
 		table := strings.ToLower(parts[1])
 
 		// Skip if this is a CTE name - CTEs are virtual tables, not physical storage
 		if cteNames[table] {
-			return match
+			return parts[0]
 		}
 
 		// Skip already converted read_parquet, system tables, etc.
 		if shouldSkipTableConversion(table) {
-			return match
+			return parts[0]
 		}
 
 		// Check if followed by a dot (database.table already handled) or parenthesis (function call)
-		matchLower := strings.ToLower(match)
-		idx := strings.Index(sqlLower, matchLower)
-		if idx >= 0 {
-			afterMatch := sql[idx+len(match):]
-			afterMatch = strings.TrimLeft(afterMatch, " \t")
-			if len(afterMatch) > 0 && (afterMatch[0] == '.' || afterMatch[0] == '(') {
-				return match
-			}
+		if isDotOrCallAt(sql, end) {
+			return parts[0]
 		}
 
 		path := h.getStoragePath("default", parts[1])
@@ -2554,36 +2560,29 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 	})
 
 	// Handle JOIN simple_table references (includes LATERAL JOIN)
-	sql = patternJoinSimpleTable.ReplaceAllStringFunc(sql, func(match string) string {
-		parts := patternJoinSimpleTable.FindStringSubmatch(match)
-		if len(parts) < 2 {
-			return match
+	sql = replaceTableRefs(sql, patternJoinSimpleTable, func(parts []string, end int) string {
+		if len(parts) < 3 {
+			return parts[0]
 		}
-		table := strings.ToLower(parts[1])
+		table := strings.ToLower(parts[2])
 
 		// Skip if this is a CTE name - CTEs are virtual tables, not physical storage
 		if cteNames[table] {
-			return match
+			return parts[0]
 		}
 
 		// Skip already converted read_parquet, system tables, etc.
 		if shouldSkipTableConversion(table) {
-			return match
+			return parts[0]
 		}
 
 		// Check if followed by a dot or parenthesis
-		matchLower := strings.ToLower(match)
-		idx := strings.Index(sqlLower, matchLower)
-		if idx >= 0 {
-			afterMatch := sql[idx+len(match):]
-			afterMatch = strings.TrimLeft(afterMatch, " \t")
-			if len(afterMatch) > 0 && (afterMatch[0] == '.' || afterMatch[0] == '(') {
-				return match
-			}
+		if isDotOrCallAt(sql, end) {
+			return parts[0]
 		}
 
-		path := h.getStoragePath("default", parts[1])
-		return h.buildReadParquetExpr(ctx, path, originalSQL, "JOIN")
+		path := h.getStoragePath("default", parts[2])
+		return h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1]))
 	})
 
 	// Restore masked FROM keywords and string literals. Both use content-
@@ -2630,8 +2629,83 @@ type ParallelQueryInfo struct {
 	ReadParquetOptions string
 }
 
+// replaceTableRefs rewrites every match of re in sql using fn.
+//
+// It exists because the rewriter's "is this identifier followed by '.' or '('?"
+// lookahead needs the offset of the match within the CURRENT string. The
+// obvious implementation — regexp.ReplaceAllStringFunc plus
+// strings.Index(sqlLower, match) to recover the offset — is wrong: sqlLower is
+// computed once, before the earlier FROM/JOIN passes rewrite sql, so the
+// recovered index refers to the pre-rewrite string. Slicing the post-rewrite
+// string at that stale offset lands inside an already-emitted
+// read_parquet('…') and the '(' there trips the function-call guard, silently
+// leaving a legitimate table un-rewritten (`FROM a JOIN cross` left `cross`
+// alone, while the longer `crossx` happened to land on a different character
+// and worked).
+//
+// fn receives the submatch strings and the byte offset just past the match in
+// the string being scanned, and returns the replacement text. parts[0] is
+// always the full match, so callers can `return parts[0]` to leave a match
+// untouched; parts for groups that did not participate are empty strings.
+func replaceTableRefs(sql string, re *regexp.Regexp, fn func(parts []string, end int) string) string {
+	matches := re.FindAllStringSubmatchIndex(sql, -1)
+	if len(matches) == 0 {
+		return sql
+	}
+
+	var b strings.Builder
+	b.Grow(len(sql))
+	last := 0
+	for _, m := range matches {
+		parts := make([]string, len(m)/2)
+		for i := range parts {
+			if m[2*i] >= 0 {
+				parts[i] = sql[m[2*i]:m[2*i+1]]
+			}
+		}
+		b.WriteString(sql[last:m[0]])
+		b.WriteString(fn(parts, m[1]))
+		last = m[1]
+	}
+	b.WriteString(sql[last:])
+	return b.String()
+}
+
+// isDotOrCallAt reports whether the first non-blank byte at or after end is a
+// '.' (so the identifier was a database qualifier, already handled by the
+// database.table pass) or a '(' (so it was a table-valued function call, not a
+// measurement). Either way the identifier must not be rewritten.
+func isDotOrCallAt(sql string, end int) bool {
+	rest := strings.TrimLeft(sql[end:], " \t")
+	return len(rest) > 0 && (rest[0] == '.' || rest[0] == '(')
+}
+
+// joinKeyword normalises a captured join prefix (group 1 of patternJoinDBTable /
+// patternJoinSimpleTable) into the keyword prepended to the rewritten table
+// expression.
+//
+// The captured prefix carries the operator's full semantics — "LEFT JOIN ",
+// "FULL OUTER JOIN ", "ASOF JOIN ", "CROSS JOIN LATERAL " — plus whatever
+// whitespace the author used, which may include newlines. Emitting a bare
+// "JOIN" instead would silently demote outer joins to inner joins and drop
+// NATURAL's implicit join condition, turning it into a cross product (#586).
+//
+// Interior whitespace runs are collapsed to a single space so the rewritten SQL
+// stays on one line, and the trailing separator is trimmed because callers
+// append their own " read_parquet(...)". Returns "JOIN" if the prefix somehow
+// normalises to nothing, so the output is always valid SQL.
+func joinKeyword(prefix string) string {
+	keyword := strings.Join(strings.Fields(prefix), " ")
+	if keyword == "" {
+		return "JOIN"
+	}
+	return keyword
+}
+
 // buildReadParquetExpr builds a read_parquet expression with optional partition pruning.
-// keyword is "FROM" or "JOIN" to prepend to the result.
+// keyword is the clause prefix to prepend to the result — "FROM" for FROM
+// clauses, or the preserved join operator ("JOIN", "LEFT JOIN", "ASOF JOIN", …)
+// for join clauses.
 // If tiering is enabled and cold tier has data, builds a UNION ALL query across tiers.
 func (h *QueryHandler) buildReadParquetExpr(ctx context.Context, path, originalSQL, keyword string) string {
 	// Check if tiering is enabled and cold tier is configured
@@ -3082,32 +3156,25 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 	// since we know all tables use the header-specified database
 
 	// Handle FROM simple_table references - apply header database
-	sql = patternSimpleTable.ReplaceAllStringFunc(sql, func(match string) string {
-		parts := patternSimpleTable.FindStringSubmatch(match)
+	sql = replaceTableRefs(sql, patternSimpleTable, func(parts []string, end int) string {
 		if len(parts) < 2 {
-			return match
+			return parts[0]
 		}
 		table := strings.ToLower(parts[1])
 
 		// Skip if this is a CTE name
 		if cteNames[table] {
-			return match
+			return parts[0]
 		}
 
 		// Skip already converted read_parquet, system tables, etc.
 		if shouldSkipTableConversion(table) {
-			return match
+			return parts[0]
 		}
 
 		// Check if followed by a dot (function call like db.func()) or parenthesis
-		matchLower := strings.ToLower(match)
-		idx := strings.Index(sqlLower, matchLower)
-		if idx >= 0 {
-			afterMatch := sql[idx+len(match):]
-			afterMatch = strings.TrimLeft(afterMatch, " \t")
-			if len(afterMatch) > 0 && (afterMatch[0] == '.' || afterMatch[0] == '(') {
-				return match
-			}
+		if isDotOrCallAt(sql, end) {
+			return parts[0]
 		}
 
 		// Use header database instead of "default"
@@ -3116,37 +3183,30 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 	})
 
 	// Handle JOIN simple_table references - apply header database
-	sql = patternJoinSimpleTable.ReplaceAllStringFunc(sql, func(match string) string {
-		parts := patternJoinSimpleTable.FindStringSubmatch(match)
-		if len(parts) < 2 {
-			return match
+	sql = replaceTableRefs(sql, patternJoinSimpleTable, func(parts []string, end int) string {
+		if len(parts) < 3 {
+			return parts[0]
 		}
-		table := strings.ToLower(parts[1])
+		table := strings.ToLower(parts[2])
 
 		// Skip if this is a CTE name
 		if cteNames[table] {
-			return match
+			return parts[0]
 		}
 
 		// Skip already converted read_parquet, system tables, etc.
 		if shouldSkipTableConversion(table) {
-			return match
+			return parts[0]
 		}
 
 		// Check if followed by a dot or parenthesis
-		matchLower := strings.ToLower(match)
-		idx := strings.Index(sqlLower, matchLower)
-		if idx >= 0 {
-			afterMatch := sql[idx+len(match):]
-			afterMatch = strings.TrimLeft(afterMatch, " \t")
-			if len(afterMatch) > 0 && (afterMatch[0] == '.' || afterMatch[0] == '(') {
-				return match
-			}
+		if isDotOrCallAt(sql, end) {
+			return parts[0]
 		}
 
 		// Use header database instead of "default"
-		path := h.getStoragePath(database, parts[1])
-		return h.buildReadParquetExpr(ctx, path, originalSQL, "JOIN")
+		path := h.getStoragePath(database, parts[2])
+		return h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1]))
 	})
 
 	// Restore masked FROM keywords and original string literals.
