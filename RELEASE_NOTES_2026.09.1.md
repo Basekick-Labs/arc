@@ -100,6 +100,28 @@ The write path also profiles GC-bound at sustained 20M+ records/sec (interface b
 
 **Restoring the old behavior:** `use_dictionary = true` re-enables dictionaries for string columns only (a middle ground measured at +12% over the old default with tag columns still dictionary-compressed); adding `numeric_dictionary = true` restores the exact pre-26.09.1 all-columns encoding.
 
+## JSON and msgpack query responses honor Accept-Encoding (zstd/gzip)
+
+`/api/v1/query` and `/api/v1/query/msgpack` now compress responses when the
+client asks via the standard `Accept-Encoding` header (zstd preferred over
+gzip — send `Accept-Encoding: zstd, gzip` for the best of both). No client
+code changes: curl, browsers, `requests`, and Grafana negotiate this
+automatically; clients that don't send the header get byte-identical
+responses to before (verified: zero overhead on the identity path).
+
+Measured on a 5M-row result (M3 Max): JSON **405.6MB → 128.1MB (−68%)** with
+zstd at +8% server CPU; msgpack 184.0MB → 113.9MB (−38%). Encoders are
+pooled (zstd fastest level, single-threaded) — steady-state allocation cost
+is near zero.
+
+**When it helps:** network-constrained clients — at 1Gbps the JSON transfer
+above drops from 3.2s to 1.0s. On loopback or very fast links, compression
+adds latency; simply don't send the header. Two secondary effects on
+compressed streams: progressive delivery is chunkier (the encoder buffers
+~128KB blocks), and mid-stream client-disconnect detection is correspondingly
+slower for slow-trickling queries. This does not change query execution time
+— only transfer.
+
 ## Arrow IPC egress: opt-in dictionary encoding and buffer compression
 
 The Arrow IPC query endpoint (`/api/v1/query/arrow`) can now halve its wire

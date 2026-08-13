@@ -189,6 +189,15 @@ func executeArrowMsgPackQuery(
 	// in memory, encode is the only remaining work and can only fail
 	// via client disconnect (no DuckDB or context-deadline path).
 	c.Set(fiber.HeaderContentType, msgpackContentType)
+	// Accept-Encoding negotiation before headers commit at first body byte.
+	respEncoding := negotiateResponseCompression(c)
+	// Vary is sent whenever negotiation happens (shared caches must key on
+	// Accept-Encoding even for identity responses); c.Vary appends with
+	// dedup rather than clobbering values set by other middleware.
+	c.Vary(fiber.HeaderAcceptEncoding)
+	if respEncoding != "" {
+		c.Set(fiber.HeaderContentEncoding, respEncoding)
+	}
 	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
 		// Release retained batches when the stream finishes (or fails).
 		defer func() {
@@ -202,10 +211,15 @@ func executeArrowMsgPackQuery(
 		// time (~9 bytes per int64), so on a 1M-row response the
 		// default bufio fills and flushes ~15k times — each flush is a
 		// channel-send to fasthttp's chunked-transfer goroutine. The
-		// larger buffer cuts that to ~250 sends.
-		bw := bufio.NewWriterSize(w, 256*1024)
+		// larger buffer cuts that to ~250 sends. With compression
+		// negotiated, the pooled encoder sits between that buffer and w.
+		sink, finishCompression := compressedSink(w, respEncoding)
+		bw := bufio.NewWriterSize(sink, 256*1024)
 		rc, streamErr := streamMsgPackFromBatches(ctx, bw, schema, batches, rowCount, profile, start, timestamp)
 		bw.Flush()
+		if err := finishCompression(); err != nil && streamErr == nil {
+			streamErr = err
+		}
 		w.Flush()
 
 		if cancel != nil {
