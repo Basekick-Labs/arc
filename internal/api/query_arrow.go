@@ -60,6 +60,28 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		})
 	}
 
+	// Opt-in stream encodings. Both change the bytes the client must be able
+	// to parse, so they are strictly request-driven — no config default:
+	//   x-arc-arrow-dictionary: true  → dictionary-encode low-cardinality
+	//     string columns (schema becomes dictionary<int32, utf8> for them)
+	//   x-arc-arrow-compression: zstd|lz4 → Arrow IPC buffer compression
+	dictEnabled := isTruthyHeader(c.Get("x-arc-arrow-dictionary"))
+	// strings.Clone is REQUIRED: c.Get aliases the fasthttp header buffer,
+	// and ToLower/TrimSpace return the ORIGINAL string when unchanged (e.g.
+	// "zstd"). ipcCompression is captured by the SetBodyStreamWriter closure
+	// and read after the handler returns — same aliasing class as the
+	// x-arc-database wrong-DB corruption bug.
+	ipcCompression := strings.Clone(strings.ToLower(strings.TrimSpace(c.Get("x-arc-arrow-compression"))))
+	switch ipcCompression {
+	case "", "zstd", "lz4":
+	default:
+		m.IncQueryErrors()
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   "invalid x-arc-arrow-compression: must be zstd or lz4",
+		})
+	}
+
 	// Extract x-arc-database header for optimized query path
 	headerDB := c.Get("x-arc-database")
 	if err := validateHeaderDatabase(headerDB); err != nil {
@@ -217,7 +239,38 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 
 	streamCtx := ctx
 	fctx.SetBodyStreamWriter(func(w *bufio.Writer) {
-		ipcWriter := ipc.NewWriter(w, ipc.WithSchema(schema))
+		// This closure runs on a bare fasthttp goroutine: an unrecovered
+		// panic here kills the whole process (fiber's recover middleware
+		// only wraps the handler, which has already returned). Convert
+		// panics to a logged error; the connection dies mid-stream, which
+		// the client sees as a truncated Arrow stream.
+		defer func() {
+			if r := recover(); r != nil {
+				m.IncQueryErrors()
+				h.logger.Error().Interface("panic", r).
+					Msg("Arrow IPC stream writer panicked; stream truncated")
+			}
+		}()
+		// The IPC writer is created lazily on the first batch: when
+		// dictionary encoding is requested, the output schema depends on a
+		// cardinality analysis of that batch (see newArrowDictTransformer).
+		var ipcWriter *ipc.Writer
+		var dictXform *arrowDictTransformer
+		// Dictionary columns use REPLACEMENT dictionaries (arrow-go's
+		// default): the writer skips re-sending an unchanged dictionary and
+		// re-sends the full dictionary when it grows. Deliberately NOT
+		// WithDictionaryDeltas — polars cannot read delta batches (verified
+		// against polars 1.43; pyarrow reads both).
+		newIPCWriter := func(outSchema *arrow.Schema) *ipc.Writer {
+			opts := []ipc.Option{ipc.WithSchema(outSchema)}
+			switch ipcCompression {
+			case "zstd":
+				opts = append(opts, ipc.WithZstd())
+			case "lz4":
+				opts = append(opts, ipc.WithLZ4())
+			}
+			return ipc.NewWriter(w, opts...)
+		}
 
 		var totalRows int64
 		var streamErr error
@@ -261,7 +314,40 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 				batch = castedBatch
 			}
 
-			err := ipcWriter.Write(batch)
+			// First batch: decide dictionary columns (if requested) and
+			// create the writer with the final output schema.
+			if ipcWriter == nil {
+				outSchema := schema
+				if dictEnabled {
+					// Analysis runs on the (possibly decimal-casted) batch so
+					// the transformer's schema matches what it will receive.
+					dictXform = newArrowDictTransformer(batch, &h.logger)
+					if dictXform != nil {
+						outSchema = dictXform.schema
+					}
+				}
+				ipcWriter = newIPCWriter(outSchema)
+			}
+
+			writeBatch := batch
+			var encodedBatch arrow.Record
+			if dictXform != nil {
+				var encErr error
+				encodedBatch, encErr = dictXform.transform(batch)
+				if encErr != nil {
+					if castedBatch != nil {
+						castedBatch.Release()
+					}
+					streamErr = fmt.Errorf("failed to dictionary-encode batch at row %d: %w", totalRows, encErr)
+					break streamLoop
+				}
+				writeBatch = encodedBatch
+			}
+
+			err := ipcWriter.Write(writeBatch)
+			if encodedBatch != nil {
+				encodedBatch.Release()
+			}
 			if castedBatch != nil {
 				castedBatch.Release()
 			}
@@ -284,6 +370,16 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			if err := reader.Err(); err != nil {
 				streamErr = fmt.Errorf("arrow reader error after %d rows: %w", totalRows, err)
 			}
+		}
+
+		// Zero-batch result: no writer was created in the loop. Emit an
+		// empty stream with the base schema so clients still get a valid
+		// Arrow IPC response.
+		if ipcWriter == nil {
+			ipcWriter = newIPCWriter(schema)
+		}
+		if dictXform != nil {
+			defer dictXform.release()
 		}
 
 		if err := ipcWriter.Close(); err != nil {

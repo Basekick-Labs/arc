@@ -100,6 +100,37 @@ The write path also profiles GC-bound at sustained 20M+ records/sec (interface b
 
 **Restoring the old behavior:** `use_dictionary = true` re-enables dictionaries for string columns only (a middle ground measured at +12% over the old default with tag columns still dictionary-compressed); adding `numeric_dictionary = true` restores the exact pre-26.09.1 all-columns encoding.
 
+## Arrow IPC egress: opt-in dictionary encoding and buffer compression
+
+The Arrow IPC query endpoint (`/api/v1/query/arrow`) can now halve its wire
+size, opted in per request:
+
+- `x-arc-arrow-dictionary: true` — low-cardinality string columns (symbols,
+  hostnames, sides) are dictionary-encoded in the stream: the dictionary is
+  re-sent only when it grows and each row carries a 4-byte index instead of
+  the repeated string. Column selection is adaptive (first-batch cardinality
+  analysis); high-cardinality strings (URLs, IDs) stay plain. The affected
+  columns arrive as standard Arrow dictionary arrays — verified readable by
+  pyarrow, polars, and pandas. One caveat: column selection is decided on
+  the first batch, so a query ordered BY a medium-cardinality string column
+  can qualify a column whose dictionary then grows large over the stream —
+  Arc logs a warning when that happens; omit the header for such shapes.
+- `x-arc-arrow-compression: zstd` (or `lz4`) — standard Arrow IPC buffer
+  compression, decompressed natively by Arrow clients.
+
+Measured on a 500M-row trades table (5 columns, 8 parallel readers, M3 Max):
+**39.0 → 19.4 bytes/row (−50%) with both enabled** — 19.5GB → 9.7GB on the
+wire for the same result set.
+
+**When to use it:** these encodings trade server/client CPU for wire bytes.
+On loopback or very fast links, leave them off (the extra encode/decode work
+lowers rows/sec). On network-constrained links they win decisively — at
+1Gbps, transmitting the 500M-row result takes 156s plain vs 78s with
+dictionary+zstd, roughly 2× faster end-to-end. Rule of thumb: enable both
+for remote analytical clients pulling large result sets; leave off for
+same-host consumers. Existing clients are completely unaffected — without
+the headers, the stream is byte-identical to before.
+
 ## Insertion-order preservation is now configurable, and off by default
 
 Arc previously forced DuckDB's `preserve_insertion_order=true`, which makes queries **without** an `ORDER BY` return rows in file/insertion order — at the cost of order-preserving buffering in the engine. That setting is now configurable and defaults to **false**:
