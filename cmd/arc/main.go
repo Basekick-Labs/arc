@@ -768,7 +768,26 @@ func main() {
 		recoveryCallback := createWALRecoveryCallback(arrowBuffer, logger.Get("wal-recovery"))
 		columnarCallback := createColumnarRecoveryCallback(arrowBuffer, logger.Get("wal-recovery"))
 
+		// SkipActiveFile is REQUIRED (#594): the WAL writer was created
+		// above and has already rotated in its active (header-only) file.
+		// Without the skip, recovery treats that file as an empty leftover
+		// and DELETES it — the writer then appends to an unlinked inode for
+		// the whole session and the WAL provides no crash durability. The
+		// periodic flush-failure recovery below always passed this; the
+		// startup call was the one that forgot.
+		startupActiveFile := ""
+		if walWriter != nil {
+			startupActiveFile = walWriter.CurrentFile()
+		}
+		// NOTE: no MinFileAge here — startup recovery runs exactly once,
+		// before any ingest, so there is no rotation race (the active file
+		// is fully identified by SkipActiveFile), and a just-crashed
+		// server's WAL file may legitimately be seconds old. Skipping it
+		// would strand its data until the next restart. The age guard is
+		// for the PERIODIC flush-failure recovery below, where ingest (and
+		// therefore rotation) is live during the scan.
 		recoveryStats, err := walRecovery.RecoverWithOptions(context.Background(), recoveryCallback, &wal.RecoveryOptions{
+			SkipActiveFile:   startupActiveFile,
 			BatchSize:        cfg.WAL.RecoveryBatchSize,
 			ColumnarCallback: columnarCallback,
 		})
@@ -840,6 +859,7 @@ func main() {
 						}
 						stats, err := recovery.RecoverWithOptions(context.Background(), recoveryCallback, &wal.RecoveryOptions{
 							SkipActiveFile:   activeFile,
+							MinFileAge:       5 * time.Second,
 							BatchSize:        cfg.WAL.RecoveryBatchSize,
 							ColumnarCallback: columnarCallback,
 						})

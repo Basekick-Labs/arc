@@ -461,6 +461,15 @@ func (d *MessagePackDecoder) extractCompactFields(f interface{}) map[string]inte
 // Modifies values in-place to avoid allocating a new []interface{} slice
 // This reduces GC pressure significantly under high load (6M+ RPS)
 func (d *MessagePackDecoder) normalizeTimestamps(columns map[string][]interface{}) error {
+	return normalizeTimestampColumns(columns)
+}
+
+// normalizeTimestampColumns is the package-level implementation, shared with
+// the WAL-replay/replication path (WriteColumnarDirectNoWAL, #590): raw WAL
+// payloads are original client bytes that never went through the live decode
+// path, so replay must apply identical normalization. Idempotent for values
+// already in microseconds (multiplier 1).
+func normalizeTimestampColumns(columns map[string][]interface{}) error {
 	timeCol, exists := columns["time"]
 	if !exists || len(timeCol) == 0 {
 		return nil
@@ -569,6 +578,12 @@ func toInt64Timestamp(v interface{}) (int64, bool) {
 // This prevents DuckDB query failures caused by non-UTF-8 data in Parquet files.
 // Returns count of sanitized fields for logging.
 func (d *MessagePackDecoder) sanitizeStringColumns(columns map[string][]interface{}) int {
+	return sanitizeColumnarStrings(columns)
+}
+
+// sanitizeColumnarStrings is the package-level implementation, shared with
+// the WAL-replay/replication path (#590).
+func sanitizeColumnarStrings(columns map[string][]interface{}) int {
 	sanitizedCount := 0
 	for _, colData := range columns {
 		for i, val := range colData {
