@@ -1021,6 +1021,24 @@ func (b *ArrowBuffer) getDecimalColumns(measurement string) map[string]config.De
 	return b.defaultDecimalConfig
 }
 
+// HasDecimalColumns reports whether ANY measurement has decimal columns
+// configured. The typed msgpack decode path is disabled entirely on such
+// deployments: decimal conversion is config-driven and happens inside
+// convertColumnsToTyped, and diverting per-measurement at decode time would
+// need the measurement name before the columns are decoded (msgpack map key
+// order is not guaranteed). Decimal deployments keep the generic path's
+// exact semantics; everyone else gets the fast path.
+//
+// INVARIANT: decimalConfig and defaultDecimalConfig are parsed once in
+// NewArrowBuffer and never mutated afterwards. The msgpack handler snapshots
+// this value at construction (SetTypedDecodeEnabled); if decimal config ever
+// becomes runtime-mutable, that snapshot must be revisited or decimal
+// columns would silently take the typed path (signature without "dec" →
+// wrong buffer keying).
+func (b *ArrowBuffer) HasDecimalColumns() bool {
+	return len(b.decimalConfig) > 0 || len(b.defaultDecimalConfig) > 0
+}
+
 // NewArrowBuffer creates a new Arrow buffer with automatic flushing
 func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger zerolog.Logger) *ArrowBuffer {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1340,6 +1358,14 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 				b.totalErrors.Add(1)
 				return err
 			}
+		case *TypedColumnarRecord:
+			// Typed msgpack decode fast path: already converted, carries the
+			// raw client bytes for the zero-copy WAL branch.
+			if err := b.writeTypedColumnarRaw(ctx, database, r.Measurement, r.Batch, r.NumRecords, r.RawPayload, false); err != nil {
+				b.logger.Error().Err(err).Str("measurement", r.Measurement).Msg("Failed to write typed columnar record")
+				b.totalErrors.Add(1)
+				return err
+			}
 		case *models.Record:
 			// Lazy init: only allocate map when we actually have row records
 			if rowRecordsByMeasurement == nil {
@@ -1348,7 +1374,13 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 			// Group row records by measurement for batch conversion
 			rowRecordsByMeasurement[r.Measurement] = append(rowRecordsByMeasurement[r.Measurement], r)
 		default:
-			b.logger.Warn().Interface("type", fmt.Sprintf("%T", record)).Msg("Unknown record type")
+			// FAIL LOUDLY: an unwired record type here means a decoder
+			// produced a type this dispatch doesn't know — silently dropping
+			// it would return 204 to the client while writing nothing, and
+			// would also mean api/msgpack.go extractMeasurements skipped
+			// measurement validation and RBAC for it. Refuse the write.
+			b.totalErrors.Add(1)
+			return fmt.Errorf("unknown record type %T in write dispatch (unwired decoder output)", record)
 		}
 	}
 
@@ -1782,18 +1814,40 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 // is already typed ([]int64, []float64, []string). Used by format-specific parsers
 // that know column types at compile time.
 func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, measurement string, typedColumns *TypedColumnBatch, numRecords int, skipWAL bool) error {
+	return b.writeTypedColumnarRaw(ctx, database, measurement, typedColumns, numRecords, nil, skipWAL)
+}
+
+// writeTypedColumnarRaw is writeTypedColumnarInternal with an optional raw
+// msgpack payload for the zero-copy WAL path. When rawPayload is non-empty
+// the WAL stores the original client bytes (AppendRawWithMeta, same as
+// writeColumnarInternal's fast path); otherwise the typed batch is
+// transposed to row records — the pre-existing typed fallback, which is
+// lossy for NULLs (typedBatchToWALRecords ignores Validity; see plan doc).
+// The typed msgpack decode path always supplies rawPayload, so it never
+// takes the lossy fallback.
+func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measurement string, typedColumns *TypedColumnBatch, numRecords int, rawPayload []byte, skipWAL bool) error {
 	bufferKey := database + "/" + measurement
 
-	// WAL: Convert typed batch to row format for WAL storage
+	// WAL: raw client bytes when available (zero-copy), row transpose otherwise
 	if b.wal != nil && !skipWAL {
-		walRecords := typedBatchToWALRecords(database, measurement, typedColumns, numRecords, b.getDecimalColumns(measurement))
-		if len(walRecords) > 0 {
-			if err := b.wal.Append(walRecords); err != nil {
+		if len(rawPayload) > 0 {
+			if err := b.wal.AppendRawWithMeta(database, rawPayload); err != nil {
 				b.recordWALError(err, func(ev *zerolog.Event) {
 					ev.Str("database", database).
 						Str("measurement", measurement).
-						Int("records", len(walRecords))
+						Int("payload_size", len(rawPayload))
 				})
+			}
+		} else {
+			walRecords := typedBatchToWALRecords(database, measurement, typedColumns, numRecords, b.getDecimalColumns(measurement))
+			if len(walRecords) > 0 {
+				if err := b.wal.Append(walRecords); err != nil {
+					b.recordWALError(err, func(ev *zerolog.Event) {
+						ev.Str("database", database).
+							Str("measurement", measurement).
+							Int("records", len(walRecords))
+					})
+				}
 			}
 		}
 	}
