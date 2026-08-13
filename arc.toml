@@ -64,6 +64,16 @@ max_buffer_age_ms = 100   # Max buffer age before flush
 sort_keys = []
 default_sort_keys = ""
 
+# Parquet dictionary encoding at ingest. Off by default: ingest files are
+# transient (hourly/daily compaction rewrites them via DuckDB, which applies
+# its own adaptive encoding), and ingest-time dictionaries cost significant
+# write CPU. Set use_dictionary = true to dictionary-encode string columns
+# (smaller uncompacted hot partition, ~12% write throughput cost); add
+# numeric_dictionary = true to also cover numeric/timestamp columns
+# (pre-26.09.1 behavior).
+# use_dictionary = false
+# numeric_dictionary = false
+
 # -----------------------------------------------------------------------------
 # Compaction
 # -----------------------------------------------------------------------------

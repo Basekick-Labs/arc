@@ -192,14 +192,23 @@ func (c *schemaLRUCache) evictLRU() {
 
 // ArrowWriter handles Arrow schema inference and Parquet writing
 type ArrowWriter struct {
-	compression     compress.Compression
-	useDictionary   bool
-	writeStatistics bool
-	dataPageVersion string
+	compression       compress.Compression
+	useDictionary     bool
+	numericDictionary bool
+	writeStatistics   bool
+	dataPageVersion   string
 
-	// Pre-built Parquet writer properties (immutable after construction)
+	// Pre-built Parquet writer properties (immutable after construction).
+	// Used directly for the all-columns-alike configurations (the
+	// use_dictionary=false default, and use_dictionary+numeric_dictionary
+	// both true) and for all-string schemas; the strings-only tier
+	// (use_dictionary=true alone) builds per-schema properties in
+	// writerPropsFor instead.
 	writerProps *parquet.WriterProperties
-	arrowProps  pqarrow.ArrowWriterProperties
+	// baseWriterOpts are the schema-independent options writerPropsFor
+	// extends with per-column dictionary overrides.
+	baseWriterOpts []parquet.WriterProperty
+	arrowProps     pqarrow.ArrowWriterProperties
 
 	// LRU Schema cache (measurement -> schema) with bounded size
 	schemaCache *schemaLRUCache
@@ -238,15 +247,56 @@ func NewArrowWriter(cfg *config.IngestConfig, logger zerolog.Logger) *ArrowWrite
 	}
 
 	return &ArrowWriter{
-		compression:     comp,
-		useDictionary:   cfg.UseDictionary,
-		writeStatistics: cfg.WriteStatistics,
-		dataPageVersion: cfg.DataPageVersion,
-		writerProps:     parquet.NewWriterProperties(writerOpts...),
-		arrowProps:      pqarrow.NewArrowWriterProperties(pqarrow.WithStoreSchema()),
-		schemaCache:     newSchemaLRUCache(schemaCacheCapacity),
-		logger:          logger.With().Str("component", "arrow-writer").Logger(),
+		compression:       comp,
+		useDictionary:     cfg.UseDictionary,
+		numericDictionary: cfg.NumericDictionary,
+		writeStatistics:   cfg.WriteStatistics,
+		dataPageVersion:   cfg.DataPageVersion,
+		writerProps:       parquet.NewWriterProperties(writerOpts...),
+		baseWriterOpts:    writerOpts,
+		arrowProps:        pqarrow.NewArrowWriterProperties(pqarrow.WithStoreSchema()),
+		schemaCache:       newSchemaLRUCache(schemaCacheCapacity),
+		logger:            logger.With().Str("component", "arrow-writer").Logger(),
 	}
+}
+
+// writerPropsFor returns Parquet writer properties for one schema. String and
+// binary columns keep the configured dictionary setting — dictionaries
+// compress repeated tag values extremely well. All other columns (numeric,
+// boolean, timestamp, decimal) get dictionary encoding disabled unless
+// ingest.numeric_dictionary is set: metric values are mostly
+// high-cardinality, so the dictionary path pays a hash-table insert plus an
+// interface boxing per value (~8-10% of write CPU on the sustained-ingest
+// benchmark) and then typically falls back to plain encoding anyway.
+// (Booleans are listed for completeness; the parquet writer never
+// dictionary-encodes the Boolean physical type, so their override is a
+// no-op either way.)
+//
+// Building properties per flush is deliberate: flushes happen tens of times
+// per second at most, and the alternative — caching per schema — would need
+// eviction tied to the schema LRU for no measurable gain.
+func (w *ArrowWriter) writerPropsFor(schema *arrow.Schema) *parquet.WriterProperties {
+	if !w.useDictionary || w.numericDictionary {
+		return w.writerProps
+	}
+	var opts []parquet.WriterProperty
+	for _, f := range schema.Fields() {
+		switch f.Type.ID() {
+		case arrow.STRING, arrow.LARGE_STRING, arrow.BINARY, arrow.LARGE_BINARY:
+			// keep the dictionary default
+		default:
+			if opts == nil {
+				opts = make([]parquet.WriterProperty, 0, len(w.baseWriterOpts)+len(schema.Fields()))
+				opts = append(opts, w.baseWriterOpts...)
+			}
+			opts = append(opts, parquet.WithDictionaryFor(f.Name, false))
+		}
+	}
+	if opts == nil {
+		// No non-string columns — the prebuilt props are already correct.
+		return w.writerProps
+	}
+	return parquet.NewWriterProperties(opts...)
 }
 
 // =============================================================================
@@ -671,11 +721,12 @@ func (w *ArrowWriter) writeRecordToParquet(schema *arrow.Schema, arrays []arrow.
 	// Write to Parquet
 	var buf bytes.Buffer
 
-	// Use pre-built writer properties (constructed once at startup, immutable)
+	// Schema-aware writer properties (see writerPropsFor for the
+	// per-configuration dictionary tiers).
 	writer, err := pqarrow.NewFileWriter(
 		schema,
 		&buf,
-		w.writerProps,
+		w.writerPropsFor(schema),
 		w.arrowProps,
 	)
 	if err != nil {

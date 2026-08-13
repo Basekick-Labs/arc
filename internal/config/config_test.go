@@ -133,6 +133,22 @@ func TestLoad_DefaultsFromSystem(t *testing.T) {
 		t.Errorf("Database.MemoryLimit = %s, want %s", cfg.Database.MemoryLimit, expectedMem)
 	}
 
+	// Ingest dictionary defaults (26.09.1): no dictionary encoding at ingest —
+	// compaction re-encodes via DuckDB anyway. A silent revert of either
+	// SetDefault would ship unnoticed otherwise: every ingest test constructs
+	// IngestConfig by hand and the bool zero values coincide with these.
+	if cfg.Ingest.UseDictionary {
+		t.Error("Ingest.UseDictionary default = true, want false (26.09.1 default flip)")
+	}
+	if cfg.Ingest.NumericDictionary {
+		t.Error("Ingest.NumericDictionary default = true, want false")
+	}
+
+	// preserve_insertion_order (26.09.1): SQL-standard unordered results.
+	if cfg.Database.PreserveInsertionOrder {
+		t.Error("Database.PreserveInsertionOrder default = true, want false (26.09.1 default flip)")
+	}
+
 	// Verify ingest defaults are applied
 	expectedFlushWorkers := getDefaultFlushWorkers()
 	if cfg.Ingest.FlushWorkers != expectedFlushWorkers {
