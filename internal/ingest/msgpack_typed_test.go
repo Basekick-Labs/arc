@@ -3,6 +3,7 @@ package ingest
 import (
 	"math"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/Basekick-Labs/msgpack/v6"
@@ -330,8 +331,17 @@ func TestTypedDecodeRejectEquivalence(t *testing.T) {
 			if typedErr == nil {
 				t.Fatalf("typed-enabled decode accepted %s that generic path rejects", tc.name)
 			}
-			if typedErr.Error() != boxedErr.Error() {
-				t.Errorf("error text diverged:\n typed: %v\n boxed: %v", typedErr, boxedErr)
+			// Exact-text equality is wrong for errors that embed a column
+			// name chosen by map-iteration order (length_mismatch reports
+			// whichever column the validation loop visited first — two
+			// independent Decode calls can legitimately name different
+			// columns). Compare the deterministic prefix instead.
+			te, be := typedErr.Error(), boxedErr.Error()
+			if te != be {
+				common := "columnar format: array length mismatch"
+				if !(strings.Contains(te, common) && strings.Contains(be, common)) {
+					t.Errorf("error text diverged:\n typed: %v\n boxed: %v", typedErr, boxedErr)
+				}
 			}
 		})
 	}

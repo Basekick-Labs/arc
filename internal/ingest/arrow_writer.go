@@ -1427,6 +1427,52 @@ func (b *ArrowBuffer) WriteColumnarRecord(ctx context.Context, database string, 
 // loss. This matches the pre-existing arc:tags WAL behavior; propagating the
 // markers through the WAL is a separate, larger change (WAL schema).
 func (b *ArrowBuffer) WriteColumnarDirectNoWAL(ctx context.Context, database, measurement string, columns map[string][]interface{}) error {
+	// #590: both callers (WAL crash replay, cluster WAL replication) feed
+	// RAW client payloads that never went through the live decode path's
+	// post-processing. Apply it here so replayed data behaves exactly like
+	// live-ingested data:
+	//   - missing/empty time column → generate now-µs (the live path did
+	//     this at original ingest; the WAL stores the client's original
+	//     bytes WITHOUT the generated column, and without it the flush
+	//     wrote nothing — silent data loss)
+	//   - normalize timestamp units to µs (a seconds-precision client's
+	//     entries otherwise land in 1970-era partitions via groupByHour)
+	//   - sanitize strings to valid UTF-8 (invalid UTF-8 breaks DuckDB)
+	// All three are idempotent for already-processed data.
+	//
+	// Structural validation mirrors decodeColumnar: today's inputs are
+	// leader-validated (the WAL stores only payloads that passed the live
+	// decode; replication is HMAC-authenticated), but a checksum-passing
+	// corrupt entry with mismatched column lengths must not flow into the
+	// typed conversion unchecked.
+	numRecords := -1
+	for colName, col := range columns {
+		if numRecords == -1 {
+			numRecords = len(col)
+		} else if len(col) != numRecords {
+			return fmt.Errorf("replayed columnar entry for %s: column length mismatch (expected %d, got %d for '%s')", measurement, numRecords, len(col), colName)
+		}
+	}
+	if numRecords <= 0 {
+		return fmt.Errorf("replayed columnar entry for %s: empty columns", measurement)
+	}
+	if _, ok := columns["time"]; !ok {
+		b.logger.Warn().
+			Str("measurement", measurement).
+			Int("row_count", numRecords).
+			Msg("Replayed data missing 'time' column - generating UTC timestamps")
+		nowMicros := time.Now().UTC().UnixMicro()
+		generated := make([]interface{}, numRecords)
+		for i := range generated {
+			generated[i] = nowMicros
+		}
+		columns["time"] = generated
+	}
+	if err := normalizeTimestampColumns(columns); err != nil {
+		return fmt.Errorf("normalize replayed timestamps for %s: %w", measurement, err)
+	}
+	sanitizeColumnarStrings(columns)
+
 	record := &models.ColumnarRecord{
 		Measurement: measurement,
 		Columns:     columns,

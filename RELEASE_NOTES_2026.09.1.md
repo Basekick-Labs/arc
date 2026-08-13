@@ -100,6 +100,37 @@ The write path also profiles GC-bound at sustained 20M+ records/sec (interface b
 
 **Restoring the old behavior:** `use_dictionary = true` re-enables dictionaries for string columns only (a middle ground measured at +12% over the old default with tag columns still dictionary-compressed); adding `numeric_dictionary = true` restores the exact pre-26.09.1 all-columns encoding.
 
+## WAL reliability improvements ([#594](https://github.com/Basekick-Labs/arc/issues/594), [#590](https://github.com/Basekick-Labs/arc/issues/590))
+
+This release includes a set of fixes that make WAL-based crash recovery
+significantly more robust. If you run with `wal.enabled = true` (off by
+default), we recommend picking up 26.09.1.
+
+**#594 — startup recovery could interfere with the active WAL file.** WAL
+recovery at startup scanned the WAL directory after the writer had already
+created its current file and could clean that file up as an empty leftover,
+which prevented WAL entries written during the session from being available
+for crash recovery later. Startup recovery now excludes the active file
+(the periodic recovery path already did), and the periodic path gained a
+minimum-file-age guard against the same interaction during file rotation.
+
+**#590 — replayed data now behaves exactly like live-ingested data.** WAL
+crash replay and cluster WAL replication feed the original client bytes back
+through ingestion, and previously skipped some of the live decode path's
+post-processing. Now aligned:
+
+- Timestamp units are normalized on replay, so clients sending second- or
+  millisecond-precision timestamps recover into the correct time partitions.
+- Clients that omit the `time` column have timestamps regenerated on replay
+  (stamped at replay time rather than original ingest time — an inherent
+  semantic for omitted timestamps).
+- Strings are UTF-8-sanitized on replay, matching live ingest.
+
+Additionally, a single problematic WAL entry no longer stops replay of the
+remaining entries in its file (the failure is counted in recovery stats).
+These improvements also apply to Enterprise cluster WAL replication, which
+shares the same ingestion path on replica nodes.
+
 ## JSON and msgpack query responses honor Accept-Encoding (zstd/gzip)
 
 `/api/v1/query` and `/api/v1/query/msgpack` now compress responses when the
