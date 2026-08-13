@@ -424,7 +424,7 @@ For commercial licensing, contact: **enterprise@basekick.net**
 
 Thanks to everyone who has contributed code to Arc:
 
-- [@schotime](https://github.com/schotime) (Adam Schroder) — Data-time partitioning, compaction API triggers, UTC fixes
+- [@schotime](https://github.com/schotime) (Adam Schroder) — Data-time partitioning, compaction API triggers, UTC fixes, bare-JOIN SQL rewriting fix
 - [@khalid244](https://github.com/khalid244) — S3 partition pruning improvements, multi-line SQL query support
 - [@SAY-5](https://github.com/SAY-5) (Sai Asish Y) — MQTT nil-guard hardening (handlers + manager) with regression coverage
 
