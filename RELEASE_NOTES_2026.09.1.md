@@ -62,6 +62,26 @@ This is a **file-count** bound, not a byte bound — compacted output size track
 
 Out-of-range values fall back to the default with a startup warning rather than failing. **`1` is not usable** and is treated as out of range: compaction's adaptive retry rejects any batch below two files, so a batch size of one would fail every batch of every partition.
 
+## Faster ingest, part 2: typed msgpack decode (+30% on top of the dictionary change)
+
+The msgpack columnar write path now decodes payloads directly into typed column
+arrays, eliminating the per-value interface boxing that previously dominated
+decode CPU and fed GC pressure. Combined with the dictionary change below, sustained
+ingest on the IOT benchmark moved from 20.6M records/sec (26.06.3) to **34.0M
+records/sec — 2,043,451,000 records in a 60-second run** (p50 0.29ms, p99 1.40ms;
+paired A/B runs attribute +30% to this change alone, peaking at 35.5M). The
+compressed variants ride the same path after decompression: gzip 19.7M → 24.6M,
+zstd 20.2M → 24.9M (+23-24%).
+
+There is no configuration and no wire-format change. The typed decoder handles the
+standard single-map columnar payload (`{m: "...", columns: {...}}`) and
+transparently falls back to the previous decoder for batch/array/row formats,
+deployments with configured decimal columns, and any payload shape it does not
+recognize — the previous decoder remains the authority on what is accepted or
+rejected, so client-visible semantics are unchanged. Decoder statistics
+(`/api/v1/write/msgpack/stats`) expose `typed_decode_hits`/`typed_decode_misses`
+so operators can confirm the fast path is engaged.
+
 ## Faster ingest: Parquet dictionary encoding at write time is now off by default
 
 Sustained msgpack ingest throughput improves **~26%** (20.65M → 26.1M records/sec — 1.56 billion records in a 60-second run — on the IOT sustained-load benchmark, Apple M3 Max, 12 workers) by no longer dictionary-encoding Parquet columns at ingest time:
