@@ -2,10 +2,12 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/viper"
@@ -155,6 +157,26 @@ type CompactionConfig struct {
 	DailySkipFileAgeCheckDays int    // Skip file creation time check for partitions older than N days (default: 7)
 	MaxConcurrent             int    // Max concurrent compaction jobs (default: 2)
 	TempDirectory             string // Temporary directory for compaction files (default: ./data/compaction)
+
+	// MemoryLimit is the DuckDB memory limit applied to EACH compaction
+	// subprocess. Empty (the default) means auto-derive: database.memory_limit
+	// divided by max_concurrent, so worst-case compaction memory stays at
+	// roughly one database.memory_limit regardless of concurrency. Before this
+	// key existed, each subprocess inherited the FULL database.memory_limit —
+	// with the default max_concurrent of 2, compaction alone could reach 2x
+	// the configured limit on top of the main process's DuckDB, which is
+	// exactly the RSS spike operators saw during backfill catch-up cycles.
+	// Accepts absolute sizes ("8GB", "512MB"). Percent forms are rejected:
+	// DuckDB's SET memory_limit does not support them, and the subprocess
+	// only warns on a failed SET, which would leave it silently unbounded.
+	MemoryLimit string
+
+	// Threads is the DuckDB thread count for EACH compaction subprocess.
+	// 0 (the default) means auto: half the CPU cores, minimum 1. Before this
+	// key existed, each subprocess used DuckDB's default of ALL cores, so two
+	// concurrent jobs could saturate the machine and starve ingest. Sort and
+	// scan buffers scale with threads, so this also bounds memory.
+	Threads int
 
 	// MaxFilesPerBatch bounds how many files a single compaction job feeds to
 	// one DuckDB read_parquet() call; larger partitions are split into that
@@ -813,6 +835,8 @@ func Load() (*Config, error) {
 			MaxConcurrent:               v.GetInt("compaction.max_concurrent"),
 			MaxFilesPerBatch:            v.GetInt("compaction.max_files_per_batch"),
 			TempDirectory:               v.GetString("compaction.temp_directory"),
+			MemoryLimit:                 v.GetString("compaction.memory_limit"),
+			Threads:                     v.GetInt("compaction.threads"),
 			CompletionWatcherIntervalMS: v.GetInt("compaction.completion_watcher_interval_ms"),
 			CompletionDir:               v.GetString("compaction.completion_dir"),
 			CompletionOrphanTimeoutMS:   v.GetInt("compaction.completion_orphan_timeout_ms"),
@@ -1010,6 +1034,29 @@ func Load() (*Config, error) {
 
 	if cfg.Database.MemoryLimit != "" && !memoryLimitRe.MatchString(cfg.Database.MemoryLimit) {
 		return nil, fmt.Errorf("invalid database.memory_limit value: %q", cfg.Database.MemoryLimit)
+	}
+	if err := validateCompactionMemoryLimit(cfg.Compaction.MemoryLimit); err != nil {
+		return nil, err
+	}
+	if cfg.Compaction.Threads < 0 {
+		return nil, fmt.Errorf("invalid compaction.threads value: %d (must be >= 0; 0 = auto)", cfg.Compaction.Threads)
+	}
+	// A negative max_concurrent would reach make(chan struct{}, m.MaxConcurrent)
+	// in the compaction manager's cycle loop and panic the process at the first
+	// scheduled cycle — NewManager only defaults the ZERO value. Fail fast here
+	// instead; 0 remains "use the default of 2".
+	if cfg.Compaction.MaxConcurrent < 0 {
+		return nil, fmt.Errorf("invalid compaction.max_concurrent value: %d (must be >= 0; 0 = default)", cfg.Compaction.MaxConcurrent)
+	}
+
+	// Resolve the "auto" sentinels AFTER validation so everything downstream
+	// (main.go wiring, the compaction manager, the subprocess) sees concrete
+	// effective values and the startup config log shows what will actually run.
+	if cfg.Compaction.MemoryLimit == "" {
+		cfg.Compaction.MemoryLimit = deriveCompactionMemoryLimit(cfg.Database.MemoryLimit, cfg.Compaction.MaxConcurrent)
+	}
+	if cfg.Compaction.Threads == 0 {
+		cfg.Compaction.Threads = getDefaultCompactionThreads()
 	}
 
 	// Trim storage identifiers in-place before validating. These build DuckDB
@@ -1434,6 +1481,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
 	v.SetDefault("compaction.max_files_per_batch", 30)             // 30 files per DuckDB read_parquet() call; valid range [2, 500]
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
+	v.SetDefault("compaction.memory_limit", "")                    // "" = auto: database.memory_limit / max_concurrent (see CompactionConfig.MemoryLimit)
+	v.SetDefault("compaction.threads", 0)                          // 0 = auto: half the CPU cores, min 1 (see CompactionConfig.Threads)
 	// Phase 4: completion-manifest watcher tunables
 	v.SetDefault("compaction.completion_watcher_interval_ms", 1000) // 1s poll rate
 	v.SetDefault("compaction.completion_dir", "")                   // "" = derive from temp_directory
@@ -1688,6 +1737,99 @@ func getDefaultMaxConnections() int {
 		return 64 // Cap at 64 to avoid excessive resource usage
 	}
 	return maxConns
+}
+
+// memoryLimitValueRe splits a validated memory-limit string into its numeric
+// value and unit. Same shape as memoryLimitRe, with capture groups.
+var memoryLimitValueRe = regexp.MustCompile(`^(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB|%)?$`)
+
+// validateCompactionMemoryLimit rejects compaction.memory_limit values that
+// DuckDB's SET memory_limit would refuse: percent forms and unit-less numbers
+// (both of which memoryLimitRe allows, because database.memory_limit shares
+// that regex). The distinction matters here and not for database.memory_limit
+// because the main database's failed SET aborts startup loudly, while the
+// compaction subprocess only WARNS on a failed SET — an un-SETtable value
+// would silently leave every subprocess unbounded, defeating the limit
+// entirely. Empty is valid ("auto"). Verified against DuckDB: absolute sizes
+// with a B/KB/MB/GB/TB unit work (decimals and internal whitespace included);
+// "%" and bare numbers are parser errors.
+func validateCompactionMemoryLimit(limit string) error {
+	if limit == "" {
+		return nil
+	}
+	if !memoryLimitRe.MatchString(limit) {
+		return fmt.Errorf("invalid compaction.memory_limit value: %q", limit)
+	}
+	m := memoryLimitValueRe.FindStringSubmatch(strings.TrimSpace(limit))
+	if m == nil || m[2] == "" || m[2] == "%" {
+		return fmt.Errorf("invalid compaction.memory_limit value: %q (DuckDB requires an absolute size with a unit, e.g. \"2GB\" or \"512MB\"; percent and unit-less forms are not supported)", limit)
+	}
+	return nil
+}
+
+// deriveCompactionMemoryLimit computes the auto value for
+// compaction.memory_limit: database.memory_limit divided by the effective
+// max_concurrent, so all concurrent compaction subprocesses together stay
+// within roughly one database.memory_limit. The unit is preserved; the value
+// is floored to 2 decimals so the division never rounds the total up. Falls
+// back to dbLimit unchanged when it cannot parse (dbLimit is already
+// regex-validated, so this is defensive) or when division would produce a
+// nonsensical near-zero limit.
+//
+// An empty dbLimit (operator explicitly disabled the database limit, letting
+// DuckDB default to 80% of RAM) returns "" — there is nothing to derive from,
+// and the subprocess skips the SET entirely, matching pre-existing behavior.
+// A percent or unit-less dbLimit also returns "": DuckDB's SET memory_limit
+// rejects both forms, so such a config aborts startup at the main database's
+// loud SET before compaction ever runs — deriving from it would only smuggle
+// an un-SETtable value past validateCompactionMemoryLimit (which checks the
+// operator-set value BEFORE this derivation fills it in).
+//
+// The remaining fallbacks (unparseable input, near-zero result) return
+// dbLimit verbatim — i.e. the pre-derivation behavior of one full database
+// limit per subprocess. Both are unreachable through Load, which has already
+// regex-validated dbLimit; they exist only so a future caller can't get an
+// empty limit out of a non-empty input by accident.
+func deriveCompactionMemoryLimit(dbLimit string, maxConcurrent int) string {
+	if dbLimit == "" {
+		return ""
+	}
+	m := memoryLimitValueRe.FindStringSubmatch(strings.TrimSpace(dbLimit))
+	if m == nil {
+		return dbLimit
+	}
+	if m[2] == "" || m[2] == "%" {
+		return ""
+	}
+	// Load has already rejected negative max_concurrent; 0 means the default
+	// of 2, matching compaction.NewManager.
+	if maxConcurrent <= 0 {
+		maxConcurrent = 2
+	}
+	if maxConcurrent == 1 {
+		return dbLimit
+	}
+	value, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return dbLimit
+	}
+	derived := math.Floor(value/float64(maxConcurrent)*100) / 100
+	if derived <= 0 {
+		return dbLimit
+	}
+	return strconv.FormatFloat(derived, 'f', -1, 64) + m[2]
+}
+
+// getDefaultCompactionThreads is the auto value for compaction.threads: half
+// the CPU cores, minimum 1. With the default max_concurrent of 2, the two
+// subprocesses together use about as many threads as the machine has cores,
+// leaving headroom for the main process's ingest and query work.
+func getDefaultCompactionThreads() int {
+	threads := runtime.NumCPU() / 2
+	if threads < 1 {
+		threads = 1
+	}
+	return threads
 }
 
 func getDefaultMemoryLimit() string {

@@ -47,6 +47,24 @@ Env vars follow the usual pattern, e.g. `ARC_ICEBERG_ENABLED=true`.
 
 **Backups cover the catalog wherever it lives.** Backup copies the Iceberg warehouse metadata alongside the Parquet data, and now also the Iceberg SQL catalog itself when `iceberg.catalog_db_path` points somewhere other than the shared database. The catalog holds every table's schema and snapshot pointers, so a backup without it restores data whose tables no longer resolve. Restores of older backups that predate this are unaffected — a missing catalog copy is skipped, not an error.
 
+## New: compaction subprocess resource bounds (`compaction.memory_limit`, `compaction.threads`)
+
+Compaction runs each job in an isolated subprocess so DuckDB's memory is fully returned on exit — but the *peak* was under-constrained. Each subprocess inherited the full `database.memory_limit`, and with the default `max_concurrent = 2`, compaction alone could reach **2× the configured limit on top of the main process's own DuckDB** — the RSS spike operators saw during backfill catch-up, when months of partitions become candidates in a single cycle. Each subprocess also used DuckDB's default of *all* CPU cores, competing with ingest and query work (and sort/scan buffers scale with threads, so this compounded the memory peak).
+
+Two new keys bound this:
+
+```toml
+[compaction]
+memory_limit = ""   # per-subprocess DuckDB memory limit; "" (default) = auto
+threads = 0         # per-subprocess DuckDB threads; 0 (default) = auto
+```
+
+Env vars: `ARC_COMPACTION_MEMORY_LIMIT`, `ARC_COMPACTION_THREADS`.
+
+**Auto defaults:** `memory_limit` derives as `database.memory_limit / max_concurrent`, so all concurrent compaction jobs together stay within roughly one `database.memory_limit` regardless of concurrency (an operator running `database.memory_limit = "8GB"` with default concurrency now gets 4GB per subprocess instead of 8GB each). `threads` defaults to half the CPU cores, minimum 1 — the two default subprocesses together use about one machine's worth of cores. Accepts absolute sizes with a unit (`"8GB"`, `"512MB"`, `"0.5GB"`); percent and unit-less forms are rejected at startup because DuckDB's `SET memory_limit` does not support them, as are other invalid values. The effective values are logged at startup (`subprocess_memory_limit`, `subprocess_threads`) and by each subprocess as it applies them.
+
+Compaction subprocesses also now spill to a managed location: a `duckdb-spill/` directory inside the job's own temp directory (under `compaction.temp_directory`), instead of DuckDB's default `.tmp` relative to the server's working directory. Spill files are covered by the existing job cleanup and crash sweeps, so they can never outlive the job — and they land on the volume you sized for compaction, not wherever Arc was started from.
+
 ## New: tunable compaction batch size
 
 Compaction splits a large partition into batches, each becoming an independent job with its own output file. That batch size was a hardcoded constant (30 files); it is now configurable:

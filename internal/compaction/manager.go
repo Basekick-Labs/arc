@@ -33,7 +33,8 @@ type Manager struct {
 	MaxFilesPerBatch int
 	MaxConcurrent    int
 	TempDirectory    string // Temp directory for compaction files
-	MemoryLimit      string // DuckDB memory limit for subprocess (e.g., "8GB")
+	MemoryLimit      string // DuckDB memory limit for EACH subprocess (e.g., "8GB")
+	Threads          int    // DuckDB thread count for EACH subprocess (0 = DuckDB default: all cores)
 	// Phase 4: local-disk directory where compaction subprocesses write
 	// completion manifests for the parent-side CompletionWatcher to pick
 	// up. Empty means "OSS mode, no completion-manifest handoff". Set by
@@ -82,7 +83,8 @@ type ManagerConfig struct {
 	MaxFilesPerBatch int
 	MaxConcurrent    int
 	TempDirectory    string              // Temp directory for compaction files
-	MemoryLimit      string              // DuckDB memory limit for subprocess (e.g., "8GB")
+	MemoryLimit      string              // DuckDB memory limit for EACH subprocess (e.g., "8GB")
+	Threads          int                 // DuckDB thread count for EACH subprocess (0 = DuckDB default: all cores)
 	CompletionDir    string              // Phase 4: local-disk completion-manifest dir (empty = OSS mode)
 	SortKeysConfig   map[string][]string // Per-measurement sort keys from ingest config
 	DefaultSortKeys  []string            // Default sort keys from ingest config
@@ -133,6 +135,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		MaxConcurrent:    cfg.MaxConcurrent,
 		TempDirectory:    cfg.TempDirectory,
 		MemoryLimit:      cfg.MemoryLimit,
+		Threads:          cfg.Threads,
 		CompletionDir:    cfg.CompletionDir,
 		SortKeysConfig:   sortKeysConfig,
 		DefaultSortKeys:  defaultSortKeys,
@@ -160,9 +163,16 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		}
 		m.logger.Info().
 			Strs("tiers", enabledTiers).
+			Str("subprocess_memory_limit", m.MemoryLimit).
+			Int("subprocess_threads", m.Threads).
+			Int("max_concurrent", m.MaxConcurrent).
 			Msg("Compaction manager initialized with tiers")
 	} else {
-		m.logger.Info().Msg("Compaction manager initialized (no tiers)")
+		m.logger.Info().
+			Str("subprocess_memory_limit", m.MemoryLimit).
+			Int("subprocess_threads", m.Threads).
+			Int("max_concurrent", m.MaxConcurrent).
+			Msg("Compaction manager initialized (no tiers)")
 	}
 
 	return m
@@ -279,6 +289,7 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 		BatchNumber:   candidate.BatchNumber,
 		TempDirectory: m.TempDirectory,
 		MemoryLimit:   m.MemoryLimit,
+		Threads:       m.Threads,
 		SortKeys:      m.GetSortKeys(candidate.Measurement),
 		StorageType:   m.StorageBackend.Type(),
 		StorageConfig: m.StorageBackend.ConfigJSON(),
