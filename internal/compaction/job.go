@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,6 +19,12 @@ import (
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
+
+// errNoTimeColumn is returned by compactFiles when no input file has a "time"
+// column. Job.Run treats it as a clean skip (complete with zero files, sources
+// left in place), not a failure — the partition is outside Arc's data model and
+// retrying can never succeed.
+var errNoTimeColumn = errors.New("no 'time' column in any input file")
 
 // escapeSQLString escapes single quotes for safe use in DuckDB SQL string literals.
 // This prevents SQL injection when interpolating configuration values.
@@ -296,6 +303,7 @@ func (j *Job) Run(ctx context.Context) error {
 
 	if len(downloadedFiles) == 0 {
 		j.logger.Info().Msg("All files already compacted, skipping")
+		j.discardCompletionManifest()
 		return j.complete()
 	}
 
@@ -311,6 +319,24 @@ func (j *Job) Run(ctx context.Context) error {
 	// This allows GC to reclaim memory from the file metadata before upload/delete phases.
 	downloadedFiles = nil
 
+	if errors.Is(err, errNoTimeColumn) {
+		// Not compactable, ever: no input file has a "time" column, so neither
+		// the REPLACE("time") normalization nor the default ORDER BY "time" can
+		// bind. Complete as a zero-file skip (compactedFiles is empty, so
+		// nothing is uploaded or deleted) rather than failing — a failure here
+		// would repeat every cycle and, pre-classification-fix, walked the
+		// whole adaptive retry ladder on a deterministic error.
+		j.logger.Warn().
+			Str("database", j.Database).
+			Str("partition", j.PartitionPath).
+			Msg("Skipping compaction: no 'time' column in any input file (data was not written by Arc ingest); leaving source files in place")
+		// Zero the download-phase byte count: nothing was compacted, and a
+		// non-zero BytesBefore with BytesAfter 0 would log as a 100%
+		// compression ratio and count toward the manager's total_bytes_saved.
+		j.BytesBefore = 0
+		j.discardCompletionManifest()
+		return j.complete()
+	}
 	if err != nil {
 		return j.fail(fmt.Errorf("failed to compact files: %w", err))
 	}
@@ -655,6 +681,20 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 		fileListSQL += "]"
 	}
 
+	// A partition whose files have no "time" column at all can never compact:
+	// the REPLACE("time") normalization in buildCompactionQuery and the default
+	// ORDER BY "time" both fail to bind, deterministically, at any batch size.
+	// Probe the unified schema up front (footer-only read) and skip cleanly
+	// instead of surfacing a Binder Error every cycle. A probe FAILURE is not a
+	// skip — proceed and let the compaction query produce the authoritative
+	// error, so a transient read problem doesn't silently strand a partition.
+	hasTime, err := parquetFilesHaveTimeColumn(ctx, db, fileListSQL)
+	if err != nil {
+		j.logger.Warn().Err(err).Msg("Failed to probe parquet schema for time column; attempting compaction anyway")
+	} else if !hasTime {
+		return "", errNoTimeColumn
+	}
+
 	// Build ORDER BY clause from sort keys
 	// This ensures compacted files maintain the same sort order as ingested files
 	orderByClause := buildOrderByClause(j.SortKeys)
@@ -957,6 +997,23 @@ func (j *Job) writeSourcesDeletedManifest() error {
 		Int("deleted_sources", len(prev.DeletedSources)).
 		Msg("Phase 4 completion manifest: sources_deleted")
 	return nil
+}
+
+// discardCompletionManifest removes the Phase 4 writing_output completion
+// manifest for a job that completes WITHOUT producing output (a no-time-column
+// skip, or all files already compacted). Run() writes that manifest before the
+// outcome is known; a zero-work completion never advances it to
+// output_written, so the watcher will never consume it — and a partition that
+// skips every cycle would otherwise accumulate one orphaned manifest file per
+// cycle, only swept at restart. Idempotent and a no-op in OSS mode.
+func (j *Job) discardCompletionManifest() {
+	if !j.clusterMode() {
+		return
+	}
+	path := filepath.Join(j.CompletionDir, j.JobID+".json")
+	if err := deleteCompletionManifest(path); err != nil {
+		j.logger.Warn().Err(err).Str("path", path).Msg("Failed to remove completion manifest for zero-work job; orphan sweep will collect it")
+	}
 }
 
 // cleanupTemp removes the temporary directory

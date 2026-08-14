@@ -328,11 +328,16 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 		}
 	}
 
-	// Update metrics
-	shouldInvalidateCache := err == nil && result.Success
+	// Update metrics. Cache invalidation is gated on FilesCompacted > 0, not
+	// just success: a zero-file completion (all files already compacted, or a
+	// no-time-column skip) changed nothing on storage, and dropping the parquet
+	// metadata + query caches for it would cost every in-flight query a cold
+	// re-read — every cycle, for a partition that skips every cycle.
+	jobSucceeded := err == nil && result.Success
+	shouldInvalidateCache := jobSucceeded && result.FilesCompacted > 0
 
 	m.mu.Lock()
-	if shouldInvalidateCache {
+	if jobSucceeded {
 		m.totalJobsCompleted++
 		m.totalFilesCompacted += result.FilesCompacted
 		m.totalBytesSaved += (result.BytesBefore - result.BytesAfter)

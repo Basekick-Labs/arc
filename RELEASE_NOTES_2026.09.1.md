@@ -448,6 +448,19 @@ The consequences depended on where the stale offset happened to land, which in p
 
 The lookahead now uses the match offset the regex already provides, so it always reads the string actually being rewritten. Table-valued functions and database-qualified names are still skipped, including when whitespace separates the name from the paren.
 
+### Compaction skips partitions without a `time` column instead of failing every cycle
+
+Every compaction query normalizes the `time` column via a `SELECT * REPLACE (...)` expression (and sorts by `time` by default). A partition whose Parquet files have no `time` column at all — data loaded by external tools rather than Arc's ingest path, which always writes one — could never satisfy either, so every cycle failed with `Binder Error: Column "time" in REPLACE list not found in FROM clause`, forever.
+
+Worse, the adaptive batch splitter treated that deterministic error as potentially memory-related and walked its full retry ladder (30 → 15 → 7 → 3 files), re-downloading the batch at every rung — turning one impossible partition into up to eight failed jobs with gigabytes of wasted I/O, every cycle.
+
+Two fixes ship together:
+
+- Compaction now probes the unified schema up front (a footer-only `DESCRIBE`, no data scan) and, when **no** input file has a `time` column, completes as a zero-work skip: a single warning (`Skipping compaction: no 'time' column in any input file`), sources left in place, counted as completed rather than failed. Partitions where only *some* files have `time` compact normally — the missing values are backfilled as `NULL`.
+- Deterministic DuckDB SQL failures (`Binder Error`, `Catalog Error`, `Parser Error`) are now classified as non-recoverable, so the batch splitter no longer retries errors that fail identically at any batch size. DuckDB's own out-of-memory errors remain recoverable — retrying with a smaller batch is exactly the right response, and they are now recognized on the subprocess result path too, not just in stderr.
+
+Zero-work completions (skips, and the existing "all files already compacted" path) also no longer invalidate the parquet-metadata and query caches — nothing changed on storage, and dropping those caches forced a cold re-read on every in-flight query. In cluster mode they now clean up their pending completion manifest instead of leaving one orphaned file per cycle for the startup sweep.
+
 ### Compaction no longer treats a storage failure as "no manifests exist" ([#314](https://github.com/Basekick-Labs/arc/issues/314))
 
 `ListManifests` discarded every error from the storage backend and returned an empty list, with no log line. "No manifests exist" and "we could not find out" are opposite instructions to the caller: an empty manifest set means nothing is being compacted and the candidate may proceed, while a failed lookup means the files in flight cannot be identified.
