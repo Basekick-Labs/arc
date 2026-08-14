@@ -1162,8 +1162,14 @@ func main() {
 			LockManager:      lockManager,
 			MaxConcurrent:    cfg.Compaction.MaxConcurrent,
 			MaxFilesPerBatch: cfg.Compaction.MaxFilesPerBatch,
-			MemoryLimit:      cfg.Database.MemoryLimit, // Use same limit as main DuckDB
-			CompletionDir:    completionDir,            // Phase 4: empty in OSS, set in cluster mode
+			// Per-subprocess DuckDB bounds. Config resolves the "auto"
+			// sentinels at load time: memory_limit defaults to
+			// database.memory_limit / max_concurrent (so compaction's
+			// worst case stays ~one database.memory_limit total, not
+			// max_concurrent times it), threads to half the cores.
+			MemoryLimit:   cfg.Compaction.MemoryLimit,
+			Threads:       cfg.Compaction.Threads,
+			CompletionDir: completionDir, // Phase 4: empty in OSS, set in cluster mode
 			// Pass the SAME absolute-resolved value the DB-layer sandbox
 			// allowlist references — dbConfig.CompactionTempDirectory has
 			// already been through resolveAbsPath. Using the raw

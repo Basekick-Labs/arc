@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"runtime/pprof"
 	"strings"
@@ -38,6 +39,11 @@ type SubprocessJobConfig struct {
 	BatchNumber int      `json:"batch_number,omitempty"`
 	SortKeys    []string `json:"sort_keys"`    // Sort keys for ORDER BY in compaction
 	MemoryLimit string   `json:"memory_limit"` // DuckDB memory limit (e.g., "8GB")
+	// Threads is the DuckDB thread count for this subprocess. 0 means leave
+	// DuckDB at its default (all cores) — the parent normally sends the
+	// resolved compaction.threads value, so 0 only occurs for callers that
+	// predate the field.
+	Threads int `json:"threads,omitempty"`
 
 	// Storage configuration
 	StorageType   string `json:"storage_type"`   // "local" or "s3"
@@ -108,13 +114,44 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 	}
 	defer db.Close()
 
-	// Set DuckDB memory limit from config.
-	// This prevents OOM on servers without swap by forcing DuckDB to spill to disk.
+	// Set DuckDB memory limit from config. Exceeding it makes DuckDB spill to
+	// its temp_directory (configured below) instead of OOMing the process.
 	if config.MemoryLimit != "" {
 		if _, err := db.Exec(fmt.Sprintf("SET memory_limit='%s'", escapeSQLString(config.MemoryLimit))); err != nil {
 			logger.Warn().Err(err).Str("limit", config.MemoryLimit).Msg("Failed to set DuckDB memory limit")
 		} else {
 			logger.Info().Str("limit", config.MemoryLimit).Msg("DuckDB memory limit configured")
+		}
+	}
+
+	// Cap DuckDB threads. Without this every subprocess uses all cores, so
+	// concurrent compaction jobs compete with the parent's ingest/query work —
+	// and sort/scan buffers scale with threads, so this also bounds memory.
+	if config.Threads > 0 {
+		if _, err := db.Exec(fmt.Sprintf("SET threads=%d", config.Threads)); err != nil {
+			logger.Warn().Err(err).Int("threads", config.Threads).Msg("Failed to set DuckDB thread count")
+		} else {
+			logger.Info().Int("threads", config.Threads).Msg("DuckDB thread count configured")
+		}
+	}
+
+	// Point DuckDB's spill directory inside this job's own temp dir. An
+	// in-memory DuckDB defaults temp_directory to ".tmp" relative to the
+	// PARENT's cwd — unmanaged by compaction's cleanup and wrong if the
+	// operator moved compaction.temp_directory to a bigger volume. The job dir
+	// ({TempDirectory}/{JobID}) is already covered by both the subprocess's
+	// deferred cleanup and the parent's crash sweep (CompactPartition's
+	// partition-prefix walk), so spill files can never outlive the job.
+	// JobID is always set by the parent (CompactPartition); skip on the
+	// defensive empty case and keep DuckDB's default.
+	if config.JobID != "" {
+		spillDir := filepath.Join(config.TempDirectory, config.JobID, "duckdb-spill")
+		if err := os.MkdirAll(spillDir, 0700); err != nil {
+			logger.Warn().Err(err).Str("dir", spillDir).Msg("Failed to create DuckDB spill directory; keeping DuckDB default")
+		} else if _, err := db.Exec(fmt.Sprintf("SET temp_directory='%s'", escapeSQLString(spillDir))); err != nil {
+			logger.Warn().Err(err).Str("dir", spillDir).Msg("Failed to set DuckDB spill directory")
+		} else {
+			logger.Info().Str("dir", spillDir).Msg("DuckDB spill directory configured")
 		}
 	}
 
