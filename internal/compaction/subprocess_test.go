@@ -92,6 +92,62 @@ func TestClassifySubprocessError(t *testing.T) {
 			wantReason:      "unknown",
 		},
 		{
+			// Regression: the trades partition (#no-time-column) failed with a
+			// Binder Error via the subprocess JSON result (exit 0, success=false),
+			// so the error text is in err, not stderr. Pre-fix this classified as
+			// "unknown → recoverable" and the adaptive splitter walked the whole
+			// 30→15→7→3 ladder re-downloading files on a deterministic failure.
+			name:            "duckdb binder error in err - not recoverable",
+			err:             errors.New(`failed to compact files: failed to execute compaction query: Binder Error: Column "time" in REPLACE list not found in FROM clause`),
+			stderr:          "",
+			wantRecoverable: false,
+			wantReason:      "sql_error",
+		},
+		{
+			name:            "duckdb catalog error in err - not recoverable",
+			err:             errors.New("failed to execute compaction query: Catalog Error: Table with name x does not exist"),
+			stderr:          "",
+			wantRecoverable: false,
+			wantReason:      "sql_error",
+		},
+		{
+			name:            "duckdb parser error in err - not recoverable",
+			err:             errors.New("failed to execute compaction query: Parser Error: syntax error at or near \"FROM\""),
+			stderr:          "",
+			wantRecoverable: false,
+			wantReason:      "sql_error",
+		},
+		{
+			name:            "duckdb binder error in stderr - not recoverable",
+			err:             errors.New("subprocess failed: exit status 1"),
+			stderr:          `{"level":"error","error":"Binder Error: Column \"time\" in REPLACE list not found in FROM clause"}`,
+			wantRecoverable: false,
+			wantReason:      "sql_error",
+		},
+		{
+			// DuckDB's own OOM surfaces through the same JSON-result path as the
+			// binder error. It must STAY recoverable (retrying a smaller batch is
+			// exactly the right response) and must not be caught by the sql_error
+			// class.
+			name:            "duckdb out of memory in err - recoverable",
+			err:             errors.New("failed to execute compaction query: Out of Memory Error: could not allocate block"),
+			stderr:          "",
+			wantRecoverable: true,
+			wantReason:      "memory_error",
+		},
+		{
+			// A crashed subprocess embeds its whole stderr in the error string,
+			// and that stderr may quote SQL error text in warn lines logged
+			// before the crash. Process-level evidence (signal, OOM exit code)
+			// must win: the crash is memory-dependent and retryable even though
+			// an sql_error marker is present.
+			name:            "crash evidence wins over sql marker in embedded stderr",
+			err:             errors.New(`subprocess failed: signal: killed (stderr: {"level":"warn","message":"probe failed: Binder Error: something"})`),
+			stderr:          `{"level":"warn","message":"probe failed: Binder Error: something"}`,
+			wantRecoverable: true,
+			wantReason:      "killed",
+		},
+		{
 			name:            "case insensitive stderr matching",
 			err:             errors.New("failed"),
 			stderr:          "PERMISSION DENIED",

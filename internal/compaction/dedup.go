@@ -258,6 +258,28 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 //     exactly make_timestamptz's unit; it yields a UTC-anchored TIMESTAMPTZ.
 const timeNormalizeReplace = `COALESCE(TRY_CAST("time" AS TIMESTAMPTZ), make_timestamptz(TRY_CAST("time" AS BIGINT))) AS "time"`
 
+// parquetFilesHaveTimeColumn reports whether the unified schema of the given
+// Parquet files contains a "time" column. DESCRIBE over read_parquet reads
+// footers only (no data scan), and union_by_name gives exactly the schema the
+// compaction COPY will see — so "true" here guarantees the REPLACE("time")
+// normalization and the default ORDER BY "time" can bind. When only SOME files
+// have the column, union_by_name backfills the others with NULLs and the query
+// still binds; the probe is false only when NO file has it (e.g. a dataset
+// loaded outside Arc's ingest path, which always writes "time").
+// fileListSQL is a DuckDB array literal or single quoted path, as built by
+// Job.compactFiles.
+func parquetFilesHaveTimeColumn(ctx context.Context, db *sql.DB, fileListSQL string) (bool, error) {
+	query := fmt.Sprintf(
+		`SELECT COUNT(*) FROM (DESCRIBE SELECT * FROM read_parquet(%s, union_by_name=true)) WHERE column_name = 'time'`,
+		fileListSQL,
+	)
+	var n int64
+	if err := db.QueryRowContext(ctx, query).Scan(&n); err != nil {
+		return false, fmt.Errorf("failed to probe parquet schema for time column: %w", err)
+	}
+	return n > 0, nil
+}
+
 // countParquetRows counts total rows across Parquet files using metadata (no data scan).
 // fileListSQL is a DuckDB array literal like "['file1.parquet', 'file2.parquet']".
 func countParquetRows(ctx context.Context, db *sql.DB, fileListSQL string) (int64, error) {

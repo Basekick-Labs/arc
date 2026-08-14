@@ -371,15 +371,27 @@ func createStorageBackendFromConfig(config *SubprocessJobConfig, logger zerolog.
 	}
 }
 
+// sqlErrorMarkers are deterministic DuckDB SQL failure classes: a query that
+// fails to bind, resolve, or parse fails identically at any batch size, so the
+// adaptive splitter must not walk its retry ladder on them.
+var sqlErrorMarkers = []string{"binder error", "catalog error", "parser error"}
+
+// memoryErrorMarkers indicate memory pressure; retrying with a smaller batch
+// is exactly the right response.
+var memoryErrorMarkers = []string{"out of memory", "cannot allocate", "memory allocation failed"}
+
 // ClassifySubprocessError determines if a subprocess error is recoverable via retry.
 // Returns (recoverable, reason) where reason describes the error type.
 //
 // Recoverable errors (should retry with smaller batch):
 //   - Segmentation faults (memory corruption, often from memory pressure)
 //   - SIGKILL (exit code 137, usually OOM killer)
-//   - Explicit memory errors in stderr
+//   - Explicit memory errors in the error string or stderr (including DuckDB's
+//     own "Out of Memory Error", which arrives via the subprocess JSON result)
 //
 // Non-recoverable errors (should not retry):
+//   - Deterministic DuckDB SQL errors (Binder/Catalog/Parser Error) — these
+//     fail identically at any batch size
 //   - Permission denied
 //   - File not found
 //   - Access denied
@@ -389,7 +401,15 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 	}
 
 	errStr := err.Error()
+	errLower := strings.ToLower(errStr)
 	stderrLower := strings.ToLower(stderr)
+
+	// Process-level evidence first: a real, actionable SQL error always arrives
+	// via the subprocess JSON result (exit 0, success=false), so it can never
+	// co-occur with a signal or OOM exit code. A crashed subprocess, however,
+	// embeds its whole stderr in the error string — including warn lines that
+	// may quote SQL error text — so a signal/exit-code match must win over the
+	// string markers below or a crash-after-warn would misclassify as permanent.
 
 	// Check for signals (segfault, killed)
 	if strings.Contains(errStr, "signal:") {
@@ -413,11 +433,21 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 		}
 	}
 
-	// Check stderr for memory-related errors
-	if strings.Contains(stderrLower, "out of memory") ||
-		strings.Contains(stderrLower, "cannot allocate") ||
-		strings.Contains(stderrLower, "memory allocation failed") {
-		return true, "memory_error"
+	// Deterministic DuckDB SQL errors — permanent at any batch size, so the
+	// splitter's retry ladder (each rung re-downloads the whole batch) is pure
+	// waste. These arrive via the JSON result path, so they appear in err
+	// rather than stderr; check both.
+	for _, marker := range sqlErrorMarkers {
+		if strings.Contains(errLower, marker) || strings.Contains(stderrLower, marker) {
+			return false, "sql_error"
+		}
+	}
+
+	// Check for memory-related errors in either stream.
+	for _, marker := range memoryErrorMarkers {
+		if strings.Contains(errLower, marker) || strings.Contains(stderrLower, marker) {
+			return true, "memory_error"
+		}
 	}
 
 	// Non-recoverable errors - don't waste time retrying
