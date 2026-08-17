@@ -441,6 +441,23 @@ Reachable only when RBAC is enabled (the multi-tenant authorization boundary); n
 
 ## Bug fixes
 
+### Arc refuses to start when built without `-tags=duckdb_arrow`
+
+Arc's query fast path uses DuckDB's Arrow interface, which `duckdb-go/v2` places behind the `duckdb_arrow` build tag — the tag is upstream's, not Arc's, and `NewArrowFromConn` does not exist in the package without it. Arc mirrored that with tagged files and a `database/sql` fallback, so a binary built without the tag still compiled and still started.
+
+That binary was not a lighter variant, it was a strictly worse one. On a 2M-row query, `/api/v1/query` served the fallback at **1425ms against 637ms** for the same query on a tagged build — byte-identical responses, 2.2× the latency. `/api/v1/query/arrow` was worse than unavailable: the route is never registered, so the request fell through to the `GET /api/v1/query/:measurement` pattern and returned `405 Method Not Allowed`, which a client cannot distinguish from using the wrong verb. `/api/v1/query/msgpack` returned `501`.
+
+Every artifact Arc ships already sets the tag — `make build`, the Dockerfile, and all release targets including FIPS — so no released binary was ever affected. The untagged build was reachable only by someone running a bare `go build ./cmd/arc`, who would then be silently served half-speed queries and a misleading `405`.
+
+Arc now checks the tag at startup and refuses to run without it, alongside the existing FIPS fail-closed check:
+
+```
+Arc was built without -tags=duckdb_arrow; refusing to start.
+The Arrow query path is required: rebuild with `make build`.
+```
+
+The untagged tree still compiles, so `go build ./...` and editor tooling are unaffected — the failure moved from silent runtime degradation to an explicit startup error. The `compact` subcommand is unaffected; it does not use the query path.
+
 ### `LEFT`/`RIGHT`/`FULL OUTER`/`NATURAL` joins are no longer rewritten to inner joins ([#586](https://github.com/Basekick-Labs/arc/issues/586))
 
 Arc rewrites table references into `read_parquet(...)` calls before handing the query to DuckDB. The join rewriter matched the join operator but replaced it with a hardcoded bare `JOIN`, discarding whatever modifier the query actually used. `LEFT JOIN metrics` became `JOIN read_parquet(…)`.

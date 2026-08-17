@@ -106,6 +106,19 @@ func main() {
 		log.Fatal().Msg("FIPS build started without the Go Cryptographic Module in FIPS mode (GODEBUG=fips140 disabled); refusing to start. Remove any GODEBUG=fips140=off override.")
 	}
 
+	// Fail closed: every artifact Arc ships (Makefile, Dockerfile, and all
+	// release-build.yml targets) is compiled with -tags=duckdb_arrow. The tag
+	// is a pass-through requirement of duckdb-go/v2, which puts its Arrow
+	// interface — NewArrowFromConn, the whole query fast path — behind the
+	// same tag. A binary built without it is not a lighter variant, it is a
+	// strictly worse one: /api/v1/query serves the database/sql fallback at
+	// roughly half the throughput, /api/v1/query/arrow is unrouted (405), and
+	// /api/v1/query/msgpack returns 501. Refuse to start rather than serve a
+	// silently degraded configuration nobody intends to run.
+	if !database.ArrowEnabled {
+		log.Fatal().Msg("Arc was built without -tags=duckdb_arrow; refusing to start. The Arrow query path is required: rebuild with `make build` (or `go build -tags=duckdb_arrow ./cmd/arc`).")
+	}
+
 	// Validate Enterprise License early (before component initialization)
 	// This allows us to apply core limits to DuckDB and ingestion workers
 	var licenseClient *license.Client
