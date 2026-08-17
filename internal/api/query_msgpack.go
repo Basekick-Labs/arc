@@ -147,7 +147,24 @@ func executeArrowMsgPackQuery(
 	// row stream can produce partial JSON-valid output, so the
 	// failure mode is less harmful there.
 	schema := reader.Schema()
-	batches, rowCount, drainErr := drainArrowBatches(ctx, reader, governanceMaxRows)
+
+	// Normalize decimal columns exactly as the Arrow IPC path does
+	// (see normalizeDecimalSchema): DuckDB returns SUM(integer) as
+	// decimal(38,0) and AVG as decimal(x,y). Without this the msgpack
+	// encoder has no *array.Decimal128 case, so decimal columns fall
+	// through to encodeFallbackColumn and go out as msgpack *strings*
+	// while the "types" array advertises decimal(38, 0) — the wire
+	// contract disagreeing with the bytes on the wire. Casting here
+	// keeps types and values consistent and makes msgpack agree with
+	// /api/v1/query/arrow for the same SQL.
+	// castInfo is nil when there are no decimal columns (zero overhead
+	// on the common path).
+	castInfo := normalizeDecimalSchema(schema)
+	if castInfo != nil {
+		schema = castInfo.schema
+	}
+
+	batches, rowCount, drainErr := drainArrowBatches(ctx, reader, governanceMaxRows, castInfo)
 	// reader and conn are no longer needed after the drain — release
 	// them before either the error or the streaming branch.
 	reader.Release()
@@ -265,10 +282,25 @@ func executeArrowMsgPackQuery(
 
 // drainArrowBatches reads all batches from the Arrow reader into a
 // retained slice. governanceMaxRows (when > 0) trims the trailing batch
-// to fit. Returns the batches, total row count, and an error if ctx
-// fires or the reader surfaces a deferred error. Callers MUST Release()
-// the returned batches when done.
-func drainArrowBatches(ctx context.Context, reader array.RecordReader, governanceMaxRows int) ([]arrow.Record, int, error) {
+// to fit. castInfo (when non-nil) rewrites decimal columns to int64 /
+// float64 as each batch is retained, so the buffered batches match the
+// normalized schema the encoder advertises. Returns the batches, total
+// row count, and an error if ctx fires, the reader surfaces a deferred
+// error, or a decimal cast fails. Callers MUST Release() the returned
+// batches when done.
+func drainArrowBatches(ctx context.Context, reader array.RecordReader, governanceMaxRows int, castInfo *decimalCastInfo) ([]arrow.Record, int, error) {
+	// retain prepares one batch for buffering: cast decimals when
+	// castInfo is set (castDecimalBatch returns an already-owned record,
+	// so no extra Retain), otherwise take a reference on the reader's
+	// batch, which is only valid until the next Next() call.
+	retain := func(batch arrow.Record) (arrow.Record, error) {
+		if castInfo == nil {
+			batch.Retain()
+			return batch, nil
+		}
+		return castDecimalBatch(batch, castInfo)
+	}
+
 	rowCap := 0
 	if governanceMaxRows > 0 {
 		rowCap = governanceMaxRows
@@ -295,13 +327,25 @@ func drainArrowBatches(ctx context.Context, reader array.RecordReader, governanc
 			if rowCount+n > rowCap {
 				keep := rowCap - rowCount
 				trimmed := batch.NewSlice(0, int64(keep))
-				batches = append(batches, trimmed)
+				// NewSlice returns an owned record; retain() either
+				// takes a second reference (castInfo == nil) or builds
+				// a new casted record. Either way the slice itself must
+				// be released once we no longer need it directly.
+				kept, err := retain(trimmed)
+				trimmed.Release()
+				if err != nil {
+					return batches, rowCount, fmt.Errorf("decimal cast failed at row %d: %w", rowCount, err)
+				}
+				batches = append(batches, kept)
 				rowCount = rowCap
 				break
 			}
 		}
-		batch.Retain()
-		batches = append(batches, batch)
+		kept, err := retain(batch)
+		if err != nil {
+			return batches, rowCount, fmt.Errorf("decimal cast failed at row %d: %w", rowCount, err)
+		}
+		batches = append(batches, kept)
 		rowCount += n
 	}
 	if err := reader.Err(); err != nil {
@@ -316,7 +360,7 @@ func drainArrowBatches(ctx context.Context, reader array.RecordReader, governanc
 //	map(7 or 8) {
 //	  "success":           bool
 //	  "columns":           [string...]            // column names
-//	  "types":             [string...]            // arrow type names, parallel to columns
+//	  "types":             [string...]            // Arc wire type names, parallel to columns
 //	  "data":              [[v...], [v...], ...]  // numCols arrays, each with N values
 //	  "row_count":         uint
 //	  "execution_time_ms": uint                   (milliseconds)
@@ -402,10 +446,11 @@ func streamMsgPackFromBatches(
 		}
 	}
 
-	// "types": [arrow-type-name...] — clients use this to interpret
+	// "types": [arc-wire-type-name...] — clients use this to interpret
 	// each column's elements (int64 vs uint64 vs string vs timestamp
-	// ext type vs binary). Names come from arrow.DataType.String()
-	// which is stable across the arrow-go library.
+	// ext type vs binary). Names come from arrowTypeName, which is Arc's
+	// own contract keyed on Arrow type IDs; see query_msgpack_types.go
+	// for why arrow.DataType.String() must not be used here.
 	if err := enc.EncodeString("types"); err != nil {
 		return 0, err
 	}
@@ -413,7 +458,7 @@ func streamMsgPackFromBatches(
 		return 0, err
 	}
 	for _, f := range fields {
-		if err := enc.EncodeString(f.Type.String()); err != nil {
+		if err := enc.EncodeString(arrowTypeName(f.Type)); err != nil {
 			return 0, err
 		}
 	}

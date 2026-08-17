@@ -441,6 +441,24 @@ Reachable only when RBAC is enabled (the multi-tenant authorization boundary); n
 
 ## Bug fixes
 
+### msgpack query responses: decimal columns are now numbers, and the `types` array is a frozen contract
+
+Two related fixes to `/api/v1/query/msgpack`, ahead of that endpoint graduating out of experimental.
+
+**Decimal columns disagreed with their declared type.** DuckDB returns `SUM(integer)` as `decimal(38,0)` and `AVG` as `decimal(x,y)`. The Arrow IPC path normalizes those to `int64`/`float64`; the msgpack path did not, and its encoder has no decimal case — so decimal columns fell through to the string fallback. The response advertised `decimal(38, 0)` in `types` while transmitting the msgpack **string** `"3"`, and the same query returned a number on `/api/v1/query/arrow` but a string on `/api/v1/query/msgpack`. Decimals are now normalized on the msgpack path too: `SUM(int)` yields `int64`, scaled decimals yield `float64`, values are numeric, and the two binary formats agree for the same SQL.
+
+**The `types` array is now Arc's own contract rather than arrow-go debug output.** Type names previously came from `arrow.DataType.String()`, which upstream treats as debug output and reformats in patch releases — `list<item: int32>` gained `, nullable` in 2021, its hardcoded `item` became the element name a week later, and struct gained an (un-comma'd) ` nullable` in the arrow-go release Arc currently pins. A client binding to those strings would break on a routine dependency bump.
+
+Names are now derived from stable Arrow type IDs:
+
+- **Scalars are unchanged** — `int64`, `utf8`, `float64`, `bool`, `binary`, `date32` and friends keep their exact spelling, so existing clients see no difference.
+- **Parameterized types keep their information** in an Arc-owned format: `timestamp[us]` (the unit is load-bearing) and `decimal(p, s)`.
+- **Nested types collapse to a bare `list` / `struct` / `map`.** The encoder has no list or struct case, so those values already go out as strings; a bare token says "opaque" instead of promising element typing that is not delivered.
+- **Types the encoder renders as text report `string_encoded`** — `DATE64`, `TIME`, `INTERVAL`, `DURATION`, `FLOAT16`, and fixed-size binary have no typed encoder case, so their values are transmitted as msgpack strings. They previously reported precise names like `duration[ns]`, which is the same "numeric-looking name over a string payload" defect as the decimal bug above; the name now matches the wire.
+- **Unrecognized types emit an `unknown:` sentinel** and log once, so a client cannot accidentally bind to a spelling Arc does not control. DuckDB `ENUM` columns land here, since DuckDB exports them as Arrow dictionaries.
+
+The SHOW handlers, which emit the same `types` field from a second code path, now share one set of constants with the streaming path, so the two cannot drift. A golden test pins every string the contract can produce.
+
 ### Arc refuses to start when built without `-tags=duckdb_arrow`
 
 Arc's query fast path uses DuckDB's Arrow interface, which `duckdb-go/v2` places behind the `duckdb_arrow` build tag — the tag is upstream's, not Arc's, and `NewArrowFromConn` does not exist in the package without it. Arc mirrored that with tagged files and a `database/sql` fallback, so a binary built without the tag still compiled and still started.

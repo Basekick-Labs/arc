@@ -451,7 +451,12 @@ type decimalCastInfo struct {
 func normalizeDecimalSchema(schema *arrow.Schema) *decimalCastInfo {
 	hasDecimal := false
 	for i := 0; i < schema.NumFields(); i++ {
-		if _, ok := schema.Field(i).Type.(*arrow.Decimal128Type); ok {
+		// Match the arrow.DecimalType interface, not *arrow.Decimal128Type:
+		// arrow-go also has Decimal32/64/256, and a decimal that slips
+		// through here is neither normalized nor encodable (the msgpack
+		// encoder has no decimal case), so it would go out as a string
+		// under a numeric-looking type name.
+		if _, ok := schema.Field(i).Type.(arrow.DecimalType); ok {
 			hasDecimal = true
 			break
 		}
@@ -464,8 +469,8 @@ func normalizeDecimalSchema(schema *arrow.Schema) *decimalCastInfo {
 	fields := make([]arrow.Field, schema.NumFields())
 	for i := 0; i < schema.NumFields(); i++ {
 		f := schema.Field(i)
-		if dt, ok := f.Type.(*arrow.Decimal128Type); ok {
-			if dt.Scale == 0 {
+		if dt, ok := f.Type.(arrow.DecimalType); ok {
+			if dt.GetScale() == 0 {
 				targets[i] = arrow.PrimitiveTypes.Int64
 			} else {
 				targets[i] = arrow.PrimitiveTypes.Float64

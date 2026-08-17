@@ -3299,10 +3299,10 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 	hasTiering := h.tieringManager != nil
 	if hasTiering {
 		columns = []string{"database", "tier"}
-		types = []string{"utf8", "utf8"}
+		types = []string{wireTypeUTF8, wireTypeUTF8}
 	} else {
 		columns = []string{"database"}
-		types = []string{"utf8"}
+		types = []string{wireTypeUTF8}
 	}
 	data := make([][]interface{}, 0)
 
@@ -3402,7 +3402,7 @@ func (h *QueryHandler) handleShowTables(c *fiber.Ctx, start time.Time, database 
 	// types parallel to columns: SHOW TABLES emits two text columns,
 	// a text path, an int file count, and a float size. Declared
 	// explicitly rather than inferred from row content.
-	types := []string{"utf8", "utf8", "utf8", "int64", "float64"}
+	types := []string{wireTypeUTF8, wireTypeUTF8, wireTypeUTF8, wireTypeInt64, wireTypeFloat64}
 	data := make([][]interface{}, 0)
 
 	ctx := context.Background()
