@@ -121,60 +121,46 @@ type s3SecretParams struct {
 	sessionToken string
 }
 
-// The AWS_* constants below are the environment variables the AWS SDKs use to locate a
-// projected web-identity token. On EKS the IRSA admission webhook injects both
-// into every pod that uses an annotated service account; outside IRSA they are
-// normally absent. Their presence is Arc's signal that the deployment
-// authenticates via AssumeRoleWithWebIdentity.
-const (
-	envAWSRoleARN              = "AWS_ROLE_ARN"
-	envAWSWebIdentityTokenFile = "AWS_WEB_IDENTITY_TOKEN_FILE"
-	// Static credentials can also be supplied through the environment;
-	// internal/storage/s3.go honours these when the config keys are empty.
-	envAWSAccessKeyID     = "AWS_ACCESS_KEY_ID"
-	envAWSSecretAccessKey = "AWS_SECRET_ACCESS_KEY"
-)
-
-// useWebIdentityChain reports whether the deployment authenticates to S3 via
-// IRSA (web identity), in which case the secret is managed by Arc's credential
-// refresher (s3refresh.go) instead of DuckDB's own resolution.
+// Credential routing for the primary/cold S3 secrets (#600, #601).
 //
-// Why this is needed (issue #600): with a bare `PROVIDER CREDENTIAL_CHAIN`,
-// DuckDB resolves temporary STS credentials ONCE at CREATE SECRET time and never
-// refreshes them, because no refresh metadata is stored on the secret. On EKS
-// with IRSA the AssumeRoleWithWebIdentity session defaults to one hour, so every
-// S3-backed query fails with `ExpiredToken` roughly an hour after process start
-// and only a restart recovers. Ingest is unaffected — it uses the Go AWS SDK,
-// which refreshes correctly.
-//
-// DuckDB's own remedies were verified NOT to work here (live AWS STS,
-// 2026-08-18): 1.5.5's `CHAIN 'web_identity'` + `REFRESH auto` never refreshes
+// Why Arc manages S3 credentials itself: with a bare `PROVIDER
+// CREDENTIAL_CHAIN`, DuckDB resolves temporary credentials ONCE at CREATE
+// SECRET time and never refreshes them — verified live against AWS STS
+// (2026-08-18): 1.5.5's `CHAIN 'web_identity'` + `REFRESH auto` never fires
 // for globbed reads (Arc's only read shape), and the reactive re-auth arms on
-// HTTP 401/403 while expired STS creds surface as HTTP 400. Hence the
-// Arc-side refresher.
+// HTTP 401/403 while expired STS creds surface as HTTP 400. So every S3-backed
+// query died ~1h after process start on EKS/IRSA, ~6h on EC2 instance roles.
+// Ingest never suffered — it uses the Go AWS SDK, which refreshes correctly.
 //
-// The gate is deliberately narrow: static keys always win, and both env vars must
-// be present. Any deployment that is not IRSA (static keys, MinIO, EC2 instance
-// role, env credentials, local storage) emits exactly the SQL it did before.
-// EC2 instance-role creds (~6h IMDS sessions) likely suffer the same DuckDB
-// expiry bug and are NOT yet covered — a CanExpire-based gate is the follow-up.
-// Credential modes for the primary/cold S3 secrets, logged at startup and used
-// to route between direct secret emission and the credential refresher.
+// The gate is resolve-and-decide (#601): when no static keys are configured,
+// startRefresher builds the same SDK credential chain ingest uses and performs
+// one bounded resolve. Expiring credentials (IRSA, EC2 instance role, EKS Pod
+// Identity, SSO, process creds) get the Arc-managed refresher; non-expiring
+// ones (env/profile static keys) are emitted once; an unresolvable chain
+// falls back to today's plain CREDENTIAL_CHAIN secret (anonymous MinIO keeps
+// working) while a background retry keeps probing. Query identity therefore
+// equals ingest identity BY CONSTRUCTION — both come from
+// config.LoadDefaultConfig.
+//
+// Cost note: for a deployment with no resolvable credentials at all, the
+// probe pays a measured 4–5s at startup (IMDS dial+retries; bounded by
+// s3FirstResolveTimeout), twice if a keyless cold tier is configured. Setting
+// AWS_EC2_METADATA_DISABLED=true fast-fails it in <1ms.
 const (
-	s3ModeStaticKeys      = "static_keys"      // configured keys, emitted directly
-	s3ModeWebIdentity     = "web_identity"     // IRSA: Arc-managed refresher (s3refresh.go)
-	s3ModeCredentialChain = "credential_chain" // DuckDB-side chain (instance role / env)
+	s3ModeStaticKeys      = "static_keys"      // configured keys, emitted directly pre-lockdown
+	s3ModeSDKManaged      = "sdk_managed"      // Arc-managed refresher; source logged per emit
+	s3ModeCredentialChain = "credential_chain" // DuckDB-side chain (refresher fallback only)
 )
 
-// s3CredentialMode names the credential source a secret will use.
+// s3CredentialMode names the ROUTE a secret takes. The concrete credential
+// source for sdk_managed (EC2RoleProvider, WebIdentityCredentials,
+// CredentialsEndpointProvider, ...) is only known after the first resolve and
+// is logged by the refresher per emission.
 func s3CredentialMode(accessKey, secretKey string) string {
 	if accessKey != "" || secretKey != "" {
 		return s3ModeStaticKeys
 	}
-	if useWebIdentityChain(accessKey, secretKey) {
-		return s3ModeWebIdentity
-	}
-	return s3ModeCredentialChain
+	return s3ModeSDKManaged
 }
 
 // primaryS3SecretParams builds the secret template for the primary tier; shared
@@ -191,24 +177,6 @@ func primaryS3SecretParams(cfg *Config) s3SecretParams {
 		pathStyle: cfg.S3PathStyle,
 		useSSL:    cfg.S3UseSSL,
 	}
-}
-
-func useWebIdentityChain(accessKey, secretKey string) bool {
-	if accessKey != "" || secretKey != "" {
-		return false
-	}
-	// Static credentials may also arrive via the environment. internal/storage/s3.go
-	// falls back to AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY when the config keys
-	// are empty, so ingest would authenticate with those env keys. If we ignored
-	// them here, the query path would pin itself to web_identity — which is a
-	// SINGLE chain and does not fall back to env credentials — and the two halves
-	// of the same process would authenticate as DIFFERENT identities against the
-	// same bucket. Defer to the plain credential chain instead, which honours the
-	// env keys exactly as before.
-	if os.Getenv(envAWSAccessKeyID) != "" || os.Getenv(envAWSSecretAccessKey) != "" {
-		return false
-	}
-	return os.Getenv(envAWSRoleARN) != "" && os.Getenv(envAWSWebIdentityTokenFile) != ""
 }
 
 // buildS3SecretSQL builds a `CREATE OR REPLACE SECRET <name> (TYPE S3, ...)`
@@ -271,9 +239,19 @@ func buildS3SecretSQL(p s3SecretParams) (string, error) {
 	} else {
 		// No static credentials: defer to the AWS credential chain.
 		// NOTE: temporary credentials resolved through this chain are resolved
-		// ONCE and never refreshed by DuckDB (#600); deployments the refresher
-		// covers (IRSA) never reach this branch.
-		b.WriteString(",\n\tPROVIDER CREDENTIAL_CHAIN")
+		// ONCE and never refreshed by DuckDB (#600). Since #601 this branch is
+		// only reachable as the refresher's FALLBACK — emitted when the SDK
+		// chain cannot resolve credentials at all, or a transient failure the
+		// background retry later upgrades from.
+		//
+		// VALIDATION 'none' is required, not cosmetic: DuckDB validates a
+		// chain secret at CREATE time and FAILS when the chain resolves
+		// nothing ("Secret Validation Failure: Credential Chain: 'config'") —
+		// which is exactly the situation the fallback exists for. Without it a
+		// credential-less deployment cannot create the fallback at all (and on
+		// pre-#601 main was startup-FATAL, masked on dev machines by
+		// ~/.aws/credentials).
+		b.WriteString(",\n\tPROVIDER CREDENTIAL_CHAIN,\n\tVALIDATION 'none'")
 	}
 	if p.region != "" {
 		b.WriteString(",\n\tREGION '")
@@ -461,41 +439,86 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 	// DuckDB struct owns its lifecycle (Close stops it). The first resolve+emit
 	// happens synchronously inside startRefresher, before New returns — i.e.
 	// before the server starts accepting queries.
-	if cfg.S3IsPrimaryBackend && s3CredentialMode(cfg.S3AccessKey, cfg.S3SecretKey) == s3ModeWebIdentity {
-		d.startRefresher(primaryS3SecretParams(cfg))
+	if cfg.S3IsPrimaryBackend && s3CredentialMode(cfg.S3AccessKey, cfg.S3SecretKey) == s3ModeSDKManaged {
+		if err := d.startRefresher(primaryS3SecretParams(cfg)); err != nil {
+			// Template errors are deterministic misconfigurations — startup-fatal
+			// like every other pre-#601 chain-mode emission failure. Only
+			// credential RESOLUTION degrades to the background loop.
+			db.Close()
+			return nil, fmt.Errorf("failed to configure S3 credential refresher: %w", err)
+		}
 	}
 
 	return d, nil
 }
 
-// startRefresher builds the AWS credential provider and starts (or replaces) the
-// refresher for params.name. The provider-construction fallback path does NOT
-// stop an existing refresher — it assumes at most one configuration call per
-// secret name (true today: New once for primary, ConfigureS3 once for cold). Never fails: if the provider cannot be constructed
-// (malformed AWS config file), it falls back to emitting a plain
-// CREDENTIAL_CHAIN secret so behavior degrades to pre-#600 rather than to no
-// secret at all.
-func (d *DuckDB) startRefresher(params s3SecretParams) {
-	provider, err := newAWSCredProvider(context.Background(), params.region)
-	if err != nil {
-		d.logger.Error().Err(err).Str("secret", params.name).
-			Msg("failed to build AWS credential provider; falling back to DuckDB credential chain (credentials will NOT refresh)")
-		fallback := params
-		fallback.accessKey, fallback.secretKey, fallback.sessionToken = "", "", ""
-		if sqlText, berr := buildS3SecretSQL(fallback); berr == nil {
-			if _, xerr := d.db.Exec(sqlText); xerr != nil {
-				d.logger.Error().Err(xerr).Str("secret", params.name).Msg("fallback secret creation failed")
-			}
-		}
-		return
+// startRefresher validates the secret template, builds the SDK credential
+// provider (the same chain ingest uses), and starts — or stop-and-replaces —
+// the refresher for params.name.
+//
+// Error contract (#601): only a TEMPLATE error (deterministic
+// misconfiguration) is returned, and callers treat it as startup-fatal —
+// matching the pre-#601 behavior where chain-mode emission failures aborted
+// startup. Everything runtime-ish degrades instead of failing: if the provider
+// cannot be constructed or the bounded first resolve does not produce a secret,
+// a plain CREDENTIAL_CHAIN fallback secret is emitted so the deployment keeps
+// its pre-#600 behavior (anonymous MinIO keeps working; a not-yet-projected
+// IRSA token resolves shortly), and the background loop keeps retrying — a
+// later success stop-and-replaces the fallback with the managed secret and
+// logs the credential source at Info.
+func (d *DuckDB) startRefresher(params s3SecretParams) error {
+	// Template validation with placeholder credentials: catches deterministic
+	// param-shape errors up front so they stay startup-fatal. (Today the
+	// builder only rejects key-shape violations, so this is near-vacuous — it
+	// exists to pin the fatality contract for future template constraints.)
+	probe := params
+	probe.accessKey, probe.secretKey, probe.sessionToken = "VALIDATE", "VALIDATE", ""
+	if _, err := buildS3SecretSQL(probe); err != nil {
+		return fmt.Errorf("invalid S3 secret template for %q: %w", params.name, err)
 	}
 
+	emitFallback := func(reason error) {
+		fallback := params
+		fallback.accessKey, fallback.secretKey, fallback.sessionToken = "", "", ""
+		sqlText, berr := buildS3SecretSQL(fallback)
+		if berr != nil {
+			// Unreachable given the template validation above; belt only.
+			d.logger.Error().Err(berr).Str("secret", params.name).Msg("fallback secret build failed")
+			return
+		}
+		if _, xerr := d.db.Exec(sqlText); xerr != nil {
+			d.logger.Error().Err(xerr).Str("secret", params.name).
+				Str("resolve_error", reason.Error()).
+				Msg("fallback secret creation failed")
+			return
+		}
+		d.logger.Warn().Err(reason).
+			Str("secret", params.name).
+			Str("credential_mode", s3ModeCredentialChain).
+			Msg("AWS credentials not resolvable yet; emitted DuckDB credential-chain fallback secret (will not auto-refresh). If this deployment has no AWS credentials at all, set AWS_EC2_METADATA_DISABLED=true to skip the ~5s startup probe")
+	}
+
+	provider, err := newAWSCredProvider(context.Background(), params.region)
+	if err != nil {
+		emitFallback(err)
+		return nil
+	}
+
+	// Stop any previous refresher for this name BEFORE starting the new one:
+	// started-then-stop ordering would let the old loop emit after (and clobber)
+	// the new refresher's sync first emit (#601 review M2). At most one
+	// configuration call per name happens today (New once for primary,
+	// ConfigureS3 once for cold); this handles repeats safely anyway.
 	d.refresherMu.Lock()
 	defer d.refresherMu.Unlock()
 	if old := d.s3Refreshers[params.name]; old != nil {
 		old.stop()
 	}
-	d.s3Refreshers[params.name] = startS3CredentialRefresher(d.db, params, provider, d.logger)
+	// emitFallback runs via the pre-loop hook, so the fallback secret lands
+	// before the retry loop's first managed emit — structural ordering, not a
+	// race against the initial backoff.
+	d.s3Refreshers[params.name] = startS3CredentialRefresher(d.db, params, provider, d.logger, emitFallback)
+	return nil
 }
 
 // buildDSN constructs the DuckDB connection string
@@ -876,42 +899,46 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	// instead of one clobbering the other. When no bucket is configured the scope
 	// is empty (unscoped), preserving single-tier behavior.
 	mode := s3CredentialMode(cfg.S3AccessKey, cfg.S3SecretKey)
-	if mode == s3ModeWebIdentity {
-		// IRSA: the secret is created and maintained by the credential refresher,
-		// which New starts right after configureDatabase returns (it needs the
-		// DuckDB struct for ownership). DuckDB-side resolution is NOT used —
-		// see s3refresh.go for why (#600).
+	if mode == s3ModeSDKManaged {
+		// No static keys: the secret is created and maintained by the credential
+		// refresher, which New starts right after configureDatabase returns (it
+		// needs the DuckDB struct for ownership). DuckDB-side resolution is only
+		// the refresher's fallback — see s3refresh.go and the routing comment
+		// above s3CredentialMode for why (#600/#601).
+		//
+		// Only the SECRET is deferred. Everything below (prefetch, cache_httpfs)
+		// still runs for this mode: it is independent of credentials and must
+		// happen pre-lockdown (INSTALL cache_httpfs FROM community is blocked
+		// after enable_external_access=false). A previous shape of this branch
+		// early-returned here, silently costing every keyless deployment the
+		// prefetch setting and the whole s3_cache configuration (#601 review H1).
+		//
+		// This branch MUST also stay after ensureHTTPFSLoaded above: httpfs
+		// registers the S3 secret type and pre-loads the aws extension, and the
+		// refresher's fallback CREDENTIAL_CHAIN secret is created after the
+		// sandbox lockdown, where extension autoload is blocked.
 		logger.Info().
 			Str("component", "database").
 			Str("secret", arcS3PrimarySecretName).
 			Str("credential_mode", mode).
 			Msg("DuckDB S3 secret deferred to credential refresher")
-		return nil
-	}
+	} else {
+		secretSQL, err := buildS3SecretSQL(primaryS3SecretParams(cfg))
+		if err != nil {
+			return err
+		}
+		if _, err := db.Exec(secretSQL); err != nil {
+			return fmt.Errorf("failed to create S3 secret: %w", err)
+		}
 
-	secretSQL, err := buildS3SecretSQL(primaryS3SecretParams(cfg))
-	if err != nil {
-		return err
-	}
-	if _, err := db.Exec(secretSQL); err != nil {
-		return fmt.Errorf("failed to create S3 secret: %w", err)
-	}
-
-	// This line is the one place an operator can confirm, at startup, which
-	// identity the QUERY path will use — and lets them spot a query/ingest
-	// credential-source mismatch without reproducing a failing query.
-	logger.Info().
-		Str("component", "database").
-		Str("secret", arcS3PrimarySecretName).
-		Str("credential_mode", mode).
-		Msg("DuckDB S3 secret created")
-	if mode == s3ModeCredentialChain {
-		// Instance-role / env-credential deployments: DuckDB resolves these once
-		// and never refreshes (#600 covers only IRSA so far). IMDS sessions last
-		// ~6h; warn so the eventual expiry is diagnosable from startup logs.
-		logger.Warn().
+		// This line is the one place an operator can confirm, at startup, which
+		// identity the QUERY path will use — and lets them spot a query/ingest
+		// credential-source mismatch without reproducing a failing query.
+		logger.Info().
 			Str("component", "database").
-			Msg("S3 credentials resolved via DuckDB's credential chain; temporary credentials (e.g. EC2 instance role) will NOT auto-refresh and expire with their session")
+			Str("secret", arcS3PrimarySecretName).
+			Str("credential_mode", mode).
+			Msg("DuckDB S3 secret created")
 	}
 
 	if _, err := db.Exec("SET GLOBAL prefetch_all_parquet_files=true"); err != nil {
@@ -1037,10 +1064,13 @@ func (d *DuckDB) ConfigureS3(s3cfg *S3Config) error {
 		pathStyle: s3cfg.PathStyle,
 		useSSL:    s3cfg.UseSSL,
 	}
-	if s3CredentialMode(s3cfg.AccessKey, s3cfg.SecretKey) == s3ModeWebIdentity {
-		// IRSA: the cold-tier secret is Arc-managed too (#600). startRefresher
-		// stop-and-replaces any previous refresher for this secret name.
-		d.startRefresher(params)
+	if s3CredentialMode(s3cfg.AccessKey, s3cfg.SecretKey) == s3ModeSDKManaged {
+		// No static keys: the cold-tier secret is Arc-managed too (#600/#601).
+		// startRefresher stop-and-replaces any previous refresher for this name;
+		// template errors are deterministic misconfigurations and propagate.
+		if err := d.startRefresher(params); err != nil {
+			return err
+		}
 	} else {
 		secretSQL, err := buildS3SecretSQL(params)
 		if err != nil {
