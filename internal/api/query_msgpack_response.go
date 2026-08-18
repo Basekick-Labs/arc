@@ -277,7 +277,7 @@ func writeMsgPackError(c *fiber.Ctx, errMsg string, start time.Time, timestamp s
 	_ = enc.EncodeString(timestamp)
 }
 
-// msgpackContentType is the response Content-Type for the experimental
-// MessagePack query endpoint. Matches the content type advertised by
-// the ingest msgpack spec at msgpack.go.
+// msgpackContentType is the response Content-Type for the MessagePack
+// query endpoint. Matches the content type advertised by the ingest
+// msgpack spec at msgpack.go.
 const msgpackContentType = "application/msgpack"

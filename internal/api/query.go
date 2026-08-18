@@ -1375,8 +1375,9 @@ func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 	// withWriteAuth (internal/api/auth_middleware.go).
 	readAuth := withReadAuth(h.authManager)
 	app.Post("/api/v1/query", readAuth, h.checkReplicationReady, h.executeQuery)
-	// Experimental: same execution pipeline as /api/v1/query, but the
-	// response is streamed as MessagePack instead of JSON. Gated by the
+	// Same execution pipeline as /api/v1/query, but the response is
+	// streamed as MessagePack instead of JSON — columnar, typed, and
+	// roughly 2-3x faster end-to-end on large result sets. Gated by the
 	// duckdb_arrow build tag (no database/sql fallback — see the
 	// wire-format dispatch in executeQuery).
 	app.Post("/api/v1/query/msgpack", readAuth, h.checkReplicationReady, h.executeQueryMsgPack)
@@ -1400,9 +1401,22 @@ func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 // the Arrow dispatch site to route the response stream through the
 // msgpack encoder instead of JSON.
 //
-// Experimental. The endpoint may move or be removed based on benchmark
-// results; clients should not hard-code against it for production
-// traffic yet.
+// Stable as of 26.09.1 (previously experimental). The response shape and
+// the "types" vocabulary are a published contract — see wiretypes.go and
+// arrowTypeName in query_msgpack_types.go, whose golden test pins every
+// string the contract can emit. Changing either is a breaking wire change.
+//
+// The response is a single msgpack map:
+//
+//	success, columns, types, data, row_count, execution_time_ms,
+//	timestamp, and profile when x-arc-profile is set.
+//
+// Note "data" is COLUMNAR (an array of numCols arrays), unlike the JSON
+// envelope's row-major shape, and unlike JSON it carries "types".
+//
+// Requires the duckdb_arrow build tag, which every shipped artifact sets
+// and without which Arc refuses to start (#598); the 501 below is
+// therefore unreachable in any supported deployment.
 func (h *QueryHandler) executeQueryMsgPack(c *fiber.Ctx) error {
 	c.Locals(wireFormatLocalsKey, wireFormatMsgPack)
 	return h.executeQuery(c)
@@ -1832,7 +1846,7 @@ localProcessing:
 		// Arrow-native path: bypasses database/sql row scanning entirely — reads typed
 		// values directly from DuckDB's internal Arrow columnar chunks.
 		//
-		// Wire-format selector: the experimental msgpack endpoint
+		// Wire-format selector: the msgpack endpoint
 		// (POST /api/v1/query/msgpack) sets c.Locals("wire_format", "msgpack")
 		// in its wrapper handler so this dispatch can route to the msgpack
 		// streamer instead of JSON. Unknown / missing values default to JSON.

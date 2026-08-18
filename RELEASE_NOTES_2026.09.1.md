@@ -441,6 +441,16 @@ Reachable only when RBAC is enabled (the multi-tenant authorization boundary); n
 
 ## Bug fixes
 
+## `/api/v1/query/msgpack` is now stable
+
+The MessagePack query endpoint graduates out of experimental. Its response shape and type vocabulary are a published contract — clients can bind to them.
+
+MessagePack is now the best general-purpose format for a client that isn't using Arrow directly. It is columnar, carries a per-column `types` array, accepts `SHOW` statements (which the Arrow endpoint rejects), and honors `Accept-Encoding` — zstd cuts a 7.4MB response to 4.5MB, about 39%. End-to-end it runs roughly 2–3× faster than JSON on large result sets; Arrow remains faster for raw throughput but has neither `SHOW` support nor response compression.
+
+What changed to get here, all in this release: decimal columns now transmit as numbers rather than strings, the `types` vocabulary is frozen and pinned by a golden test, and a client disconnect no longer logs as a server error. The endpoint requires the `duckdb_arrow` build tag, which every shipped artifact sets.
+
+See the API reference for the response shape and the full type vocabulary.
+
 ### A client disconnecting mid-response no longer logs as a server error on the msgpack path
 
 When a client hangs up partway through a large `/api/v1/query/msgpack` response, Arc logged the truncation at **Error**, while `/api/v1/query` logged the identical condition at **Warn**. A browser tab closing on a big dashboard query is routine operational noise, not a server fault, so this produced spurious Error-level entries for operators alerting on them.
