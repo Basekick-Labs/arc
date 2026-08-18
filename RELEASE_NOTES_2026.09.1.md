@@ -441,6 +441,12 @@ Reachable only when RBAC is enabled (the multi-tenant authorization boundary); n
 
 ## Bug fixes
 
+### A client disconnecting mid-response no longer logs as a server error on the msgpack path
+
+When a client hangs up partway through a large `/api/v1/query/msgpack` response, Arc logged the truncation at **Error**, while `/api/v1/query` logged the identical condition at **Warn**. A browser tab closing on a big dashboard query is routine operational noise, not a server fault, so this produced spurious Error-level entries for operators alerting on them.
+
+The severity decision is shared between both paths and keys off a client-disconnect sentinel, but the msgpack emit loop returned the encoder's bare socket error without that marker — so the shared helper classified a client hangup as a server-side failure. The JSON path already wrapped its equivalent flush failure. Genuine timeouts and cancellations are passed through unchanged, so a real deadline is still distinguishable from a disconnect.
+
 ### msgpack query responses: decimal columns are now numbers, and the `types` array is a frozen contract
 
 Two related fixes to `/api/v1/query/msgpack`, ahead of that endpoint graduating out of experimental.

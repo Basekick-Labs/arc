@@ -354,6 +354,35 @@ func drainArrowBatches(ctx context.Context, reader array.RecordReader, governanc
 	return batches, rowCount, nil
 }
 
+// wrapMsgPackWriteErr tags an encoder error as a client disconnect when it
+// is one.
+//
+// The msgpack encoder writes through the bufio.Writer that fasthttp's stream
+// writer handed us, so once the client hangs up every subsequent Encode*
+// call fails with the underlying socket error — but the encoder returns it
+// bare, with no indication that the cause was the peer rather than the
+// server. isClientError (query.go:143) keys off errClientDisconnected and
+// the context sentinels, so an unwrapped socket error is classified as a
+// server fault and logged at Error.
+//
+// That is how a routine client disconnect ended up logged at Error on the
+// msgpack path while the JSON path — which wraps at its own flush site
+// (query_json_writer.go:180) — correctly logged Warn for the identical
+// condition.
+//
+// Applying this at the two call sites in the emit loop is sound because the
+// only errors reachable there are ctx cancellation (already a client error,
+// passed through untouched below so a genuine timeout is not obscured) and
+// enc.Encode* write failures — the typed column encoders do no I/O of their
+// own and no validation that can fail. Encoding of the header fields above
+// happens before any large write and is left unwrapped.
+func wrapMsgPackWriteErr(err error) error {
+	if err == nil || isClientError(err) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", errClientDisconnected, err)
+}
+
 // streamMsgPackFromBatches writes the query response as a single
 // msgpack map over a pre-drained slice of Arrow record batches. Shape:
 //
@@ -470,7 +499,7 @@ func streamMsgPackFromBatches(
 
 	// Outer data array: one entry per column.
 	if err := enc.EncodeArrayLen(numCols); err != nil {
-		return rowCount, err
+		return rowCount, wrapMsgPackWriteErr(err)
 	}
 
 	// Per-column emit: one type-switch on the first batch's column,
@@ -488,10 +517,10 @@ func streamMsgPackFromBatches(
 		default:
 		}
 		if err := enc.EncodeArrayLen(rowCount); err != nil {
-			return rowCount, fmt.Errorf("encode column %d header: %w", colIdx, err)
+			return rowCount, fmt.Errorf("encode column %d header: %w", colIdx, wrapMsgPackWriteErr(err))
 		}
 		if err := encodeColumn(ctx, enc, batches, colIdx); err != nil {
-			return rowCount, err
+			return rowCount, wrapMsgPackWriteErr(err)
 		}
 		// No explicit Flush per column. bufio.Writer flushes its 4KiB
 		// internal buffer automatically when full; for a multi-MB
