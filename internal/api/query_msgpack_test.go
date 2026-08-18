@@ -40,7 +40,13 @@ func msgpackStreamToBytes(
 	start := time.Now()
 	ctx := context.Background()
 	schema := reader.Schema()
-	batches, rowCount, drainErr := drainArrowBatches(ctx, reader, governanceMaxRows)
+	// Mirror production: normalize decimals before the drain so the
+	// buffered batches match the schema the encoder advertises.
+	castInfo := normalizeDecimalSchema(schema)
+	if castInfo != nil {
+		schema = castInfo.schema
+	}
+	batches, rowCount, drainErr := drainArrowBatches(ctx, reader, governanceMaxRows, castInfo)
 	defer func() {
 		for _, b := range batches {
 			b.Release()
@@ -125,7 +131,9 @@ func TestStreamArrowMsgPack_BasicTypes(t *testing.T) {
 	if len(typeNames) != 5 {
 		t.Fatalf("expected 5 type names, got %d", len(typeNames))
 	}
-	// Spot-check a few type names — the streamer emits arrow.DataType.String().
+	// Spot-check a few type names — the streamer emits arrowTypeName's
+	// Arc-owned wire names (see query_msgpack_types.go), not Arrow's
+	// String() output.
 	if typeNames[0].(string) != "int64" {
 		t.Errorf("expected types[0]='int64', got %v", typeNames[0])
 	}

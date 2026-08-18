@@ -65,9 +65,11 @@ func respondError(c *fiber.Ctx, status int, errMsg, timestamp string, start time
 // passes through unchanged.
 //
 // types is parallel to columns and carries the wire-level type name
-// per column (matching the streaming hot path's arrow.DataType.String()
-// output for the comparable Arrow type). Passed explicitly by the
-// caller rather than inferred from cell content, because:
+// per column. Callers pass the shared wireType* constants (wiretypes.go),
+// which are the same values arrowTypeName produces on the streaming hot
+// path — one source, so the two emitters of this field cannot drift.
+// Passed explicitly by the caller rather than inferred from cell content,
+// because:
 //
 //  1. SHOW handlers know the schema by construction — the row-major
 //     []interface{} representation is for JSON convenience, not type
