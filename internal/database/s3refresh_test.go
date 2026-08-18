@@ -81,11 +81,11 @@ func TestResolveAndEmitInvalidatesOnProactiveRefresh(t *testing.T) {
 		AccessKeyID: "K2", SecretAccessKey: "S2", SessionToken: "T2",
 		CanExpire: true, Expires: time.Now().Add(2 * time.Hour),
 	}
-	r := &s3CredentialRefresher{
-		db: db, provider: fake, logger: zerolog.Nop(),
-		params: s3SecretParams{name: "inv_test", region: "us-east-1", useSSL: true},
+	r := &credentialRefresher{
+		resolver: &s3Resolver{db: db, provider: fake, params: s3SecretParams{name: "inv_test", region: "us-east-1", useSSL: true}},
+		logger:   zerolog.Nop(),
 	}
-	if _, err := r.resolveAndEmit(context.Background(), false); err != nil {
+	if _, err := r.refreshOnce(context.Background(), false); err != nil {
 		t.Fatalf("initial fill: %v", err)
 	}
 	if fake.invalidations.Load() != 0 {
@@ -93,13 +93,13 @@ func TestResolveAndEmitInvalidatesOnProactiveRefresh(t *testing.T) {
 	}
 	// Without invalidation the provider keeps serving the current session, so a
 	// proactive resolve would be non-advancing; WITH it, the new session lands.
-	creds, err := r.resolveAndEmit(context.Background(), true)
+	m, err := r.refreshOnce(context.Background(), true)
 	if err != nil {
 		t.Fatalf("proactive refresh: %v", err)
 	}
-	if fake.invalidations.Load() != 1 || creds.SessionToken != "T2" {
+	if got := m.payload.(aws.Credentials).SessionToken; fake.invalidations.Load() != 1 || got != "T2" {
 		t.Fatalf("proactive refresh must invalidate then get the new session; invalidations=%d token=%q",
-			fake.invalidations.Load(), creds.SessionToken)
+			fake.invalidations.Load(), got)
 	}
 }
 
@@ -132,18 +132,18 @@ func TestResolveAndEmitFlagsNonAdvancingExpiry(t *testing.T) {
 		AccessKeyID: "K1", SecretAccessKey: "S", SessionToken: "T",
 		CanExpire: true, Expires: exp,
 	}}
-	r := &s3CredentialRefresher{
-		db: db, provider: fake, logger: zerolog.Nop(),
-		params: s3SecretParams{name: "adv_test", region: "us-east-1", useSSL: true},
+	r := &credentialRefresher{
+		resolver: &s3Resolver{db: db, provider: fake, params: s3SecretParams{name: "adv_test", region: "us-east-1", useSSL: true}},
+		logger:   zerolog.Nop(),
 	}
-	if _, err := r.resolveAndEmit(context.Background(), false); err != nil {
+	if _, err := r.refreshOnce(context.Background(), false); err != nil {
 		t.Fatalf("first emit: %v", err)
 	}
-	if _, err := r.resolveAndEmit(context.Background(), false); !errors.Is(err, errNonAdvancingExpiry) {
+	if _, err := r.refreshOnce(context.Background(), false); !errors.Is(err, errNonAdvancingExpiry) {
 		t.Fatalf("second emit with identical expiry must return errNonAdvancingExpiry, got: %v", err)
 	}
 	fake.creds.Expires = exp.Add(time.Hour)
-	if _, err := r.resolveAndEmit(context.Background(), false); err != nil {
+	if _, err := r.refreshOnce(context.Background(), false); err != nil {
 		t.Fatalf("emit with advanced expiry: %v", err)
 	}
 }
@@ -220,12 +220,12 @@ func TestSecretRotationReachesRequests(t *testing.T) {
 		AccessKeyID: "AKIAOLDKEY", SecretAccessKey: "s1", SessionToken: "t1",
 		CanExpire: true, Expires: time.Now().Add(time.Hour),
 	}}
-	r := &s3CredentialRefresher{
-		db: db, provider: fake, logger: zerolog.Nop(),
-		params: s3SecretParams{
+	r := &credentialRefresher{
+		resolver: &s3Resolver{db: db, provider: fake, params: s3SecretParams{
 			name: "rot_test", region: "us-east-1",
 			endpoint: endpoint, pathStyle: true, useSSL: false,
-		},
+		}},
+		logger: zerolog.Nop(),
 	}
 	// F8 sub-case: the FALLBACK-to-managed upgrade path replaces a
 	// CREDENTIAL_CHAIN secret with a static one. Emit the chain shape first
@@ -244,7 +244,7 @@ func TestSecretRotationReachesRequests(t *testing.T) {
 		t.Fatalf("chain fallback emit: %v", err)
 	}
 
-	if _, err := r.resolveAndEmit(context.Background(), false); err != nil {
+	if _, err := r.refreshOnce(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -259,7 +259,7 @@ func TestSecretRotationReachesRequests(t *testing.T) {
 		AccessKeyID: "AKIANEWKEY", SecretAccessKey: "s2", SessionToken: "t2",
 		CanExpire: true, Expires: time.Now().Add(2 * time.Hour),
 	}
-	if _, err := r.resolveAndEmit(context.Background(), false); err != nil {
+	if _, err := r.refreshOnce(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	query()
@@ -362,11 +362,11 @@ func TestResolveAndEmitRejectsControlBytes(t *testing.T) {
 		AccessKeyID: "AKIA", SecretAccessKey: "s", SessionToken: "SUPERSECRET\x00trunc",
 		CanExpire: true, Expires: time.Now().Add(time.Hour),
 	}}
-	r := &s3CredentialRefresher{
-		db: db, provider: fake, logger: zerolog.Nop(),
-		params: s3SecretParams{name: "nul_test", region: "us-east-1", useSSL: true},
+	r := &credentialRefresher{
+		resolver: &s3Resolver{db: db, provider: fake, params: s3SecretParams{name: "nul_test", region: "us-east-1", useSSL: true}},
+		logger:   zerolog.Nop(),
 	}
-	_, err := r.resolveAndEmit(context.Background(), false)
+	_, err := r.refreshOnce(context.Background(), false)
 	if err == nil {
 		t.Fatal("control-byte credential must be rejected")
 	}
@@ -463,7 +463,7 @@ func TestNewAWSCredProviderPodIdentityStub(t *testing.T) {
 // TestPlanOutcomes pins the scheduling/severity state machine (#601 F2/F6)
 // without real waits.
 func TestPlanOutcomes(t *testing.T) {
-	r := &s3CredentialRefresher{logger: zerolog.Nop()}
+	r := &credentialRefresher{logger: zerolog.Nop()}
 
 	t.Run("non-advancing polls flat at MinDelay", func(t *testing.T) {
 		r.lastExpiry = time.Now().Add(30 * time.Minute)
@@ -473,7 +473,7 @@ func TestPlanOutcomes(t *testing.T) {
 	})
 
 	t.Run("never-succeeded errors demote after threshold with longer cap", func(t *testing.T) {
-		rr := &s3CredentialRefresher{logger: zerolog.Nop()} // everSucceeded=false
+		rr := &credentialRefresher{logger: zerolog.Nop()} // everSucceeded=false
 		var last time.Duration
 		for i := 0; i < 10; i++ {
 			last = rr.planError(fmt.Errorf("no creds"))
@@ -484,7 +484,7 @@ func TestPlanOutcomes(t *testing.T) {
 	})
 
 	t.Run("previously-succeeded errors keep the tight cap", func(t *testing.T) {
-		rr := &s3CredentialRefresher{logger: zerolog.Nop(), everSucceeded: true}
+		rr := &credentialRefresher{logger: zerolog.Nop(), everSucceeded: true}
 		var last time.Duration
 		for i := 0; i < 10; i++ {
 			last = rr.planError(fmt.Errorf("sts down"))
@@ -495,10 +495,10 @@ func TestPlanOutcomes(t *testing.T) {
 	})
 
 	t.Run("success resets the error streak", func(t *testing.T) {
-		rr := &s3CredentialRefresher{logger: zerolog.Nop()}
+		rr := &credentialRefresher{logger: zerolog.Nop()}
 		rr.planError(fmt.Errorf("x"))
 		rr.planError(fmt.Errorf("x"))
-		rr.planSuccess(aws.Credentials{CanExpire: true, Expires: time.Now().Add(time.Hour)})
+		rr.planSuccess(credMaterial{canExpire: true, expires: time.Now().Add(time.Hour)})
 		if rr.consecutiveErrors != 0 || !rr.everSucceeded {
 			t.Errorf("success must reset streak and mark proven: errors=%d proven=%v", rr.consecutiveErrors, rr.everSucceeded)
 		}
@@ -573,7 +573,7 @@ func TestPlanLogLevels(t *testing.T) {
 
 	t.Run("never-succeeded demotion: N errors, one warn, then debug", func(t *testing.T) {
 		var buf strings.Builder
-		r := &s3CredentialRefresher{logger: zerolog.New(&buf)}
+		r := &credentialRefresher{logger: zerolog.New(&buf), demotionHint: s3DemotionHint}
 		for i := 0; i < s3RefreshErrorsBeforeDemotion+3; i++ {
 			r.planError(fmt.Errorf("no creds"))
 		}
@@ -592,7 +592,7 @@ func TestPlanLogLevels(t *testing.T) {
 
 	t.Run("previously-succeeded failures stay at error", func(t *testing.T) {
 		var buf strings.Builder
-		r := &s3CredentialRefresher{logger: zerolog.New(&buf), everSucceeded: true}
+		r := &credentialRefresher{logger: zerolog.New(&buf), everSucceeded: true}
 		for i := 0; i < 6; i++ {
 			r.planError(fmt.Errorf("sts down"))
 		}
@@ -605,7 +605,7 @@ func TestPlanLogLevels(t *testing.T) {
 
 	t.Run("non-advancing: debug with runway, warn in final window", func(t *testing.T) {
 		var buf strings.Builder
-		r := &s3CredentialRefresher{logger: zerolog.New(&buf)}
+		r := &credentialRefresher{logger: zerolog.New(&buf)}
 		r.lastExpiry = time.Now().Add(30 * time.Minute)
 		r.planNonAdvancing()
 		r.lastExpiry = time.Now().Add(s3RefreshFinalWarnWindow - time.Minute)
@@ -688,7 +688,7 @@ func TestStatusPublishSites(t *testing.T) {
 	})
 
 	t.Run("planError publishes degraded; planSuccess recovers", func(t *testing.T) {
-		r := &s3CredentialRefresher{logger: zerolog.Nop()}
+		r := &credentialRefresher{logger: zerolog.Nop()}
 		r.everSucceeded = true
 		r.lastExpiry = now.Add(time.Hour)
 		r.publishStatus(true)
@@ -696,14 +696,14 @@ func TestStatusPublishSites(t *testing.T) {
 		if st := r.status(now); st.State != CredStateDegraded || st.ConsecutiveErrors != 1 {
 			t.Fatalf("post-error status = %+v", st)
 		}
-		r.planSuccess(aws.Credentials{CanExpire: true, Expires: now.Add(2 * time.Hour)})
+		r.planSuccess(credMaterial{canExpire: true, expires: now.Add(2 * time.Hour)})
 		if st := r.status(now); st.State != CredStateOK || st.ConsecutiveErrors != 0 {
 			t.Fatalf("post-recovery status = %+v", st)
 		}
 	})
 
 	t.Run("expired derives at READ time with no new outcome", func(t *testing.T) {
-		r := &s3CredentialRefresher{logger: zerolog.Nop()}
+		r := &credentialRefresher{logger: zerolog.Nop()}
 		r.everSucceeded = true
 		r.lastExpiry = now.Add(30 * time.Millisecond)
 		r.publishStatus(true)
@@ -721,18 +721,24 @@ func TestStatusPublishSites(t *testing.T) {
 // report static/ok.
 func TestAzureCredentialsLabel(t *testing.T) {
 	cases := []struct {
-		conn, key, wantCreds, wantState string
+		conn, key, sas, wantCreds, wantState string
 	}{
-		{"DefaultEndpointsProtocol=https;AccountName=a;AccountKey=abc==", "", credModeStaticKeys, CredStateOK},
-		{"BlobEndpoint=https://a.blob.core.windows.net;SharedAccessSignature=sv=2024&sig=xyz", "", credModeSAS, CredStateUnknown},
-		{"BlobEndpoint=https://a.blob.core.windows.net;sig=xyz", "", credModeSAS, CredStateUnknown},
-		{"", "accountkey==", credModeStaticKeys, CredStateOK},
-		{"", "", credModeUnmanagedChain, CredStateUnknown},
+		{"DefaultEndpointsProtocol=https;AccountName=a;AccountKey=abc==", "", "", credModeStaticKeys, CredStateOK},
+		{"BlobEndpoint=https://a.blob.core.windows.net;SharedAccessSignature=sv=2024&sig=xyz", "", "", credModeSAS, CredStateUnknown},
+		{"BlobEndpoint=https://a.blob.core.windows.net;sig=xyz", "", "", credModeSAS, CredStateUnknown},
+		{"BlobEndpoint=https://a.blob.core.windows.net?sv=2024&sig=xyz", "", "", credModeSAS, CredStateUnknown},
+		{"", "accountkey==", "", credModeStaticKeys, CredStateOK},
+		// A configured SAS token (#605 M6) must never route to the managed
+		// refresher — that would acquire a broader identity than the
+		// operator's deliberately-scoped SAS.
+		{"", "", "sv=2024&sig=xyz", credModeSAS, CredStateUnknown},
+		// Managed identity / SP env: Arc-managed refresher as of #605.
+		{"", "", "", s3ModeSDKManaged, CredStateOK},
 	}
 	for _, tc := range cases {
-		creds, state := azureCredentialsLabel(tc.conn, tc.key)
+		creds, state := azureCredentialsLabel(tc.conn, tc.key, tc.sas)
 		if creds != tc.wantCreds || state != tc.wantState {
-			t.Errorf("azureCredentialsLabel(%q,%q) = %s/%s, want %s/%s", tc.conn, tc.key, creds, state, tc.wantCreds, tc.wantState)
+			t.Errorf("azureCredentialsLabel(%q,%q,%q) = %s/%s, want %s/%s", tc.conn, tc.key, tc.sas, creds, state, tc.wantCreds, tc.wantState)
 		}
 	}
 }

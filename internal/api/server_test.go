@@ -270,7 +270,7 @@ func TestHealthStorageField(t *testing.T) {
 		s.SetStorageStatus(func() map[string]database.StorageTierStatus {
 			return map[string]database.StorageTierStatus{
 				"hot":  {Backend: "s3", Credentials: "sdk_managed", State: "ok", ExpiresAt: &exp, Source: "WebIdentityCredentials"},
-				"cold": {Backend: "azure", Credentials: "unmanaged_chain", State: "unknown"},
+				"cold": {Backend: "azure", Credentials: "sas", State: "unknown"},
 			}
 		}, false)
 		_, body := mkReq(s, "/health")
