@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -117,9 +118,13 @@ func (f *invalidatingFakeProvider) Invalidate() {
 	f.current = f.next
 }
 
-// TestResolveAndEmitRejectsNonAdvancingExpiry: a provider handing back the same
-// session (mis-cached) must be treated as a refresh FAILURE, not re-emitted.
-func TestResolveAndEmitRejectsNonAdvancingExpiry(t *testing.T) {
+// TestResolveAndEmitFlagsNonAdvancingExpiry: a provider handing back the same
+// session must surface the errNonAdvancingExpiry SENTINEL — the loop routes on
+// errors.Is to the flat-poll path (normal for server-rotated sources); a
+// wrapped or generic error here would silently reclassify normal IMDS-tail
+// polling as Error + exponential backoff, whose steps can straddle the
+// rotation (#601 M3).
+func TestResolveAndEmitFlagsNonAdvancingExpiry(t *testing.T) {
 	db := openTestDuckDBWithHTTPFS(t)
 	exp := time.Now().Add(30 * time.Minute)
 	fake := &fakeCredProvider{creds: aws.Credentials{
@@ -133,8 +138,8 @@ func TestResolveAndEmitRejectsNonAdvancingExpiry(t *testing.T) {
 	if _, err := r.resolveAndEmit(context.Background(), false); err != nil {
 		t.Fatalf("first emit: %v", err)
 	}
-	if _, err := r.resolveAndEmit(context.Background(), false); err == nil {
-		t.Fatal("second emit with identical expiry must fail (non-advancing)")
+	if _, err := r.resolveAndEmit(context.Background(), false); !errors.Is(err, errNonAdvancingExpiry) {
+		t.Fatalf("second emit with identical expiry must return errNonAdvancingExpiry, got: %v", err)
 	}
 	fake.creds.Expires = exp.Add(time.Hour)
 	if _, err := r.resolveAndEmit(context.Background(), false); err != nil {
@@ -156,12 +161,20 @@ func TestRefreshDelay(t *testing.T) {
 }
 
 // TestRefresherStartFailureAndStop: an erroring provider must not block start
-// (Warn + background retry), and stop() must return promptly.
+// (the caller's onFirstFailure hook runs, then background retry), and stop()
+// must return promptly. The hook must fire synchronously during start — that
+// is the structural guarantee that a caller-emitted fallback secret lands
+// before the retry loop can emit over it (#601 M1).
 func TestRefresherStartFailureAndStop(t *testing.T) {
 	db := openTestDuckDBWithHTTPFS(t)
 	fake := &fakeCredProvider{err: fmt.Errorf("token file not yet projected")}
 	start := time.Now()
-	r := startS3CredentialRefresher(db, s3SecretParams{name: "fail_test", region: "us-east-1", useSSL: true}, fake, zerolog.Nop())
+	hookFired := false
+	r := startS3CredentialRefresher(db, s3SecretParams{name: "fail_test", region: "us-east-1", useSSL: true}, fake, zerolog.Nop(),
+		func(err error) { hookFired = true })
+	if !hookFired {
+		t.Fatal("onFirstFailure hook must fire synchronously during start")
+	}
 	if elapsed := time.Since(start); elapsed > s3FirstResolveTimeout+2*time.Second {
 		t.Fatalf("start blocked %v; must degrade fast", elapsed)
 	}
@@ -213,6 +226,23 @@ func TestSecretRotationReachesRequests(t *testing.T) {
 			endpoint: endpoint, pathStyle: true, useSSL: false,
 		},
 	}
+	// F8 sub-case: the FALLBACK-to-managed upgrade path replaces a
+	// CREDENTIAL_CHAIN secret with a static one. Emit the chain shape first
+	// (resolving to nothing under the hermetic env); the initial managed emit
+	// below then replaces it, and the first query must sign with the managed
+	// key — proving chain→static replacement takes effect like static→static.
+	hermeticAWSEnv(t)
+	chainSQL, err := buildS3SecretSQL(s3SecretParams{
+		name: "rot_test", region: "us-east-1",
+		endpoint: endpoint, pathStyle: true, useSSL: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(chainSQL); err != nil {
+		t.Fatalf("chain fallback emit: %v", err)
+	}
+
 	if _, err := r.resolveAndEmit(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
@@ -221,6 +251,7 @@ func TestSecretRotationReachesRequests(t *testing.T) {
 		// The 404 error is expected; the signed request is what we're after.
 		_, _ = db.Exec("SELECT * FROM read_parquet('s3://rotbucket/x.parquet')")
 	}
+
 	query()
 
 	fake.creds = aws.Credentials{
@@ -277,10 +308,7 @@ func openTestDuckDBWithHTTPFS(t *testing.T) *sql.DB {
 // and pass the suite while leaving IRSA primaries with NO secret at all —
 // configureS3Access intentionally defers emission for this mode.
 func TestNewStartsPrimaryRefresherUnderIRSA(t *testing.T) {
-	t.Setenv(envAWSRoleARN, "arn:aws:iam::123456789012:role/arc-irsa")
-	t.Setenv(envAWSWebIdentityTokenFile, "/var/run/secrets/eks.amazonaws.com/serviceaccount/token")
-	t.Setenv(envAWSAccessKeyID, "")
-	t.Setenv(envAWSSecretAccessKey, "")
+	hermeticAWSEnv(t)
 
 	orig := newAWSCredProvider
 	fake := &fakeCredProvider{creds: aws.Credentials{
@@ -344,4 +372,247 @@ func TestResolveAndEmitRejectsControlBytes(t *testing.T) {
 	if strings.Contains(err.Error(), "SUPERSECRET") {
 		t.Fatalf("error leaks credential material: %v", err)
 	}
+}
+
+// TestNewAWSCredProviderIMDSStub drives the REAL provider chain against a local
+// IMDSv2 stub (AWS_EC2_METADATA_SERVICE_ENDPOINT) and pins the SDK behavior the
+// EC2 cell depends on: ec2rolecreds caps reported Expires at now+1h even for a
+// ~6h IMDS session, so on EC2 the refresher fires HOURLY re-emitting the same
+// material under an advancing cap — expected behavior, not a bug (#601 F4).
+func TestNewAWSCredProviderIMDSStub(t *testing.T) {
+	hermeticAWSEnv(t)
+	sixHours := time.Now().Add(6 * time.Hour).UTC().Format("2006-01-02T15:04:05Z")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "PUT" && r.URL.Path == "/latest/api/token":
+			w.Write([]byte("stub-token"))
+		case r.URL.Path == "/latest/meta-data/iam/security-credentials/":
+			w.Write([]byte("stub-role"))
+		case r.URL.Path == "/latest/meta-data/iam/security-credentials/stub-role":
+			fmt.Fprintf(w, `{"Code":"Success","AccessKeyId":"ASIAIMDSSTUB","SecretAccessKey":"s","Token":"t","Expiration":"%s"}`, sixHours)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "false")
+	t.Setenv("AWS_EC2_METADATA_SERVICE_ENDPOINT", srv.URL)
+
+	provider, err := newAWSCredProvider(context.Background(), "us-east-1")
+	if err != nil {
+		t.Fatalf("provider: %v", err)
+	}
+	creds, err := provider.Retrieve(context.Background())
+	if err != nil {
+		t.Fatalf("retrieve: %v", err)
+	}
+	if credSourceLabel(creds.Source) != "EC2RoleProvider" {
+		t.Errorf("source = %q, want EC2RoleProvider", creds.Source)
+	}
+	if !creds.CanExpire {
+		t.Fatal("IMDS creds must be expiring")
+	}
+	// The 1h cap: reported expiry must be ~1h out, NOT ~6h.
+	until := time.Until(creds.Expires)
+	if until > 65*time.Minute {
+		t.Errorf("expiry %v out — ec2rolecreds 1h cap not in effect; hourly scheduling assumption broken", until.Round(time.Minute))
+	}
+	// Consequently the refresher schedules ~hourly.
+	if d := refreshDelay(creds.Expires); d > 55*time.Minute {
+		t.Errorf("refreshDelay = %v, want <=55m under the 1h cap", d.Round(time.Minute))
+	}
+}
+
+// TestNewAWSCredProviderPodIdentityStub drives the real chain against a local
+// container-credentials stub (the provider EKS Pod Identity uses) and pins the
+// config package's baked-in ExpiryWindow=5min: reported expiry is real-5min,
+// so non-advancing responses are possible in this cell too (#601 F4).
+func TestNewAWSCredProviderPodIdentityStub(t *testing.T) {
+	hermeticAWSEnv(t)
+	oneHour := time.Now().Add(time.Hour).UTC().Format("2006-01-02T15:04:05Z")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "stub-auth" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		fmt.Fprintf(w, `{"AccessKeyId":"ASIAPODSTUB","SecretAccessKey":"s","Token":"t","Expiration":"%s"}`, oneHour)
+	}))
+	defer srv.Close()
+	t.Setenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", srv.URL)
+	t.Setenv("AWS_CONTAINER_AUTHORIZATION_TOKEN", "stub-auth")
+
+	provider, err := newAWSCredProvider(context.Background(), "us-east-1")
+	if err != nil {
+		t.Fatalf("provider: %v", err)
+	}
+	creds, err := provider.Retrieve(context.Background())
+	if err != nil {
+		t.Fatalf("retrieve: %v", err)
+	}
+	if credSourceLabel(creds.Source) != "CredentialsEndpointProvider" {
+		t.Errorf("source = %q, want CredentialsEndpointProvider", creds.Source)
+	}
+	until := time.Until(creds.Expires)
+	// real-5min window: expect ~55min, definitely under the served 60.
+	if until > 57*time.Minute || until < 50*time.Minute {
+		t.Errorf("reported expiry %v out, want ~55m (endpointcreds baked-in 5min ExpiryWindow)", until.Round(time.Minute))
+	}
+}
+
+// TestPlanOutcomes pins the scheduling/severity state machine (#601 F2/F6)
+// without real waits.
+func TestPlanOutcomes(t *testing.T) {
+	r := &s3CredentialRefresher{logger: zerolog.Nop()}
+
+	t.Run("non-advancing polls flat at MinDelay", func(t *testing.T) {
+		r.lastExpiry = time.Now().Add(30 * time.Minute)
+		if d := r.planNonAdvancing(); d != s3RefreshMinDelay {
+			t.Errorf("delay = %v, want flat %v (backoff could straddle the rotation)", d, s3RefreshMinDelay)
+		}
+	})
+
+	t.Run("never-succeeded errors demote after threshold with longer cap", func(t *testing.T) {
+		rr := &s3CredentialRefresher{logger: zerolog.Nop()} // everSucceeded=false
+		var last time.Duration
+		for i := 0; i < 10; i++ {
+			last = rr.planError(fmt.Errorf("no creds"))
+		}
+		if last != s3RefreshBackoffMaxUnproven {
+			t.Errorf("unproven cap = %v, want %v", last, s3RefreshBackoffMaxUnproven)
+		}
+	})
+
+	t.Run("previously-succeeded errors keep the tight cap", func(t *testing.T) {
+		rr := &s3CredentialRefresher{logger: zerolog.Nop(), everSucceeded: true}
+		var last time.Duration
+		for i := 0; i < 10; i++ {
+			last = rr.planError(fmt.Errorf("sts down"))
+		}
+		if last != s3RefreshBackoffMax {
+			t.Errorf("proven cap = %v, want %v (credentials WILL die at expiry)", last, s3RefreshBackoffMax)
+		}
+	})
+
+	t.Run("success resets the error streak", func(t *testing.T) {
+		rr := &s3CredentialRefresher{logger: zerolog.Nop()}
+		rr.planError(fmt.Errorf("x"))
+		rr.planError(fmt.Errorf("x"))
+		rr.planSuccess(aws.Credentials{CanExpire: true, Expires: time.Now().Add(time.Hour)})
+		if rr.consecutiveErrors != 0 || !rr.everSucceeded {
+			t.Errorf("success must reset streak and mark proven: errors=%d proven=%v", rr.consecutiveErrors, rr.everSucceeded)
+		}
+		if d := rr.planError(fmt.Errorf("x")); d != s3RefreshBackoffMin {
+			t.Errorf("post-success first error delay = %v, want %v", d, s3RefreshBackoffMin)
+		}
+	})
+}
+
+// TestUnresolvableFallsBackToChainSecret pins the resolve-fails cell (#601):
+// New with an S3 primary and NOTHING resolvable must still produce a secret —
+// the plain CREDENTIAL_CHAIN fallback — post-lockdown, and register a refresher
+// that keeps retrying. This is also the post-lockdown CHAIN-secret variant the
+// plan review asked for (F9): the fallback is created after
+// enable_external_access=false, which only works because ensureHTTPFSLoaded
+// pre-loaded the aws extension and buildDSN disabled persistent secrets.
+func TestUnresolvableFallsBackToChainSecret(t *testing.T) {
+	hermeticAWSEnv(t)
+	// Real provider chain, nothing resolvable, IMDS disabled -> fails in <1ms.
+	tmp := t.TempDir()
+	db, err := New(&Config{
+		MaxConnections:     2,
+		MemoryLimit:        "256MB",
+		TempDirectory:      tmp,
+		S3IsPrimaryBackend: true,
+		S3Bucket:           "fallback-bucket",
+		S3Region:           "us-east-1",
+		S3UseSSL:           true,
+	}, zerolog.Nop())
+	if err != nil {
+		if strings.Contains(err.Error(), "httpfs") {
+			t.Skipf("httpfs unavailable (offline?): %v", err)
+		}
+		t.Fatalf("New must not fail on unresolvable credentials: %v", err)
+	}
+	defer db.Close()
+
+	var secretString string
+	if err := db.DB().QueryRow(
+		"SELECT secret_string FROM duckdb_secrets() WHERE name = ?", arcS3PrimarySecretName,
+	).Scan(&secretString); err != nil {
+		t.Fatalf("fallback secret not registered: %v", err)
+	}
+	if !strings.Contains(secretString, "credential_chain") {
+		t.Errorf("fallback must be a CREDENTIAL_CHAIN secret, got: %s", secretString)
+	}
+	if db.s3Refreshers[arcS3PrimarySecretName] == nil {
+		t.Fatal("refresher must stay registered (background retry picks up late-arriving credentials)")
+	}
+}
+
+// TestPlanLogLevels pins the severity choreography (#601 M4) — the headline
+// operational claims: a never-succeeded refresher logs Error for the first
+// failures, exactly ONE demotion Warn (naming the escape hatch), then Debug;
+// and non-advancing polls log Debug with runway, Warn inside the final window.
+func TestPlanLogLevels(t *testing.T) {
+	levelsOf := func(buf *strings.Builder) []string {
+		var out []string
+		for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+			if line == "" {
+				continue
+			}
+			for _, lvl := range []string{"error", "warn", "debug", "info"} {
+				if strings.Contains(line, `"level":"`+lvl+`"`) {
+					out = append(out, lvl)
+					break
+				}
+			}
+		}
+		return out
+	}
+
+	t.Run("never-succeeded demotion: N errors, one warn, then debug", func(t *testing.T) {
+		var buf strings.Builder
+		r := &s3CredentialRefresher{logger: zerolog.New(&buf)}
+		for i := 0; i < s3RefreshErrorsBeforeDemotion+3; i++ {
+			r.planError(fmt.Errorf("no creds"))
+		}
+		got := levelsOf(&buf)
+		want := []string{"error", "error", "error", "warn", "debug", "debug"}
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("levels = %v, want %v", got, want)
+		}
+		if !strings.Contains(buf.String(), "AWS_EC2_METADATA_DISABLED") {
+			t.Error("demotion warn must name the escape hatch")
+		}
+		if n := strings.Count(buf.String(), `"level":"warn"`); n != 1 {
+			t.Errorf("demotion warn must fire exactly once, got %d", n)
+		}
+	})
+
+	t.Run("previously-succeeded failures stay at error", func(t *testing.T) {
+		var buf strings.Builder
+		r := &s3CredentialRefresher{logger: zerolog.New(&buf), everSucceeded: true}
+		for i := 0; i < 6; i++ {
+			r.planError(fmt.Errorf("sts down"))
+		}
+		for _, lvl := range levelsOf(&buf) {
+			if lvl != "error" {
+				t.Fatalf("proven refresher must keep Error on every failure, saw %v", levelsOf(&buf))
+			}
+		}
+	})
+
+	t.Run("non-advancing: debug with runway, warn in final window", func(t *testing.T) {
+		var buf strings.Builder
+		r := &s3CredentialRefresher{logger: zerolog.New(&buf)}
+		r.lastExpiry = time.Now().Add(30 * time.Minute)
+		r.planNonAdvancing()
+		r.lastExpiry = time.Now().Add(s3RefreshFinalWarnWindow - time.Minute)
+		r.planNonAdvancing()
+		got := levelsOf(&buf)
+		want := []string{"debug", "warn"}
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("levels = %v, want %v", got, want)
+		}
+	})
 }

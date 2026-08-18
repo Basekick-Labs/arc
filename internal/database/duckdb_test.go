@@ -432,52 +432,50 @@ func mustContain(t *testing.T, haystack, needle string) {
 	}
 }
 
-// TestUseWebIdentityChain covers the IRSA detection gate (#600). The rule is
-// deliberately narrow: static keys always win, and BOTH web-identity env vars
-// must be present. Everything else keeps the pre-existing behavior.
-func TestUseWebIdentityChain(t *testing.T) {
-	tests := []struct {
-		name                       string
-		accessKey, secret          string
-		roleARN, tokenFile         string
-		envAccessKey, envSecretKey string
-		want                       bool
-	}{
-		{"IRSA: no keys + both env vars", "", "", "arn:aws:iam::1:role/r", "/var/run/secrets/token", "", "", true},
-		{"static keys win even under IRSA", "AKIA", "sk", "arn:aws:iam::1:role/r", "/var/run/secrets/token", "", "", false},
-		{"no keys, only role ARN", "", "", "arn:aws:iam::1:role/r", "", "", "", false},
-		{"no keys, only token file", "", "", "", "/var/run/secrets/token", "", "", false},
-		{"no keys, no env (EC2 instance role / env creds)", "", "", "", "", "", "", false},
-		{"half-configured key + env vars", "AKIA", "", "arn:aws:iam::1:role/r", "/var/run/secrets/token", "", "", false},
-		{"half-configured secret + env vars", "", "sk", "arn:aws:iam::1:role/r", "/var/run/secrets/token", "", "", false},
-		// Credential-source asymmetry guard: internal/storage/s3.go falls back to
-		// AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY when the config keys are empty,
-		// so ingest would use those env keys. web_identity is a SINGLE chain and
-		// would NOT, leaving ingest and queries authenticating as different
-		// identities against the same bucket. Defer to the plain chain instead.
-		{"env static keys present (both) beat IRSA env", "", "", "arn:aws:iam::1:role/r", "/var/run/secrets/token", "AKIAENV", "envsecret", false},
-		{"env access key alone still defers", "", "", "arn:aws:iam::1:role/r", "/var/run/secrets/token", "AKIAENV", "", false},
-		{"env secret key alone still defers", "", "", "arn:aws:iam::1:role/r", "/var/run/secrets/token", "", "envsecret", false},
+// hermeticAWSEnv makes a test's SDK credential resolution deterministic:
+// scrubs ambient AWS_* credentials, points the shared config files at
+// /dev/null, and disables the IMDS probe. Without this, any test that reaches
+// newAWSCredProvider would resolve the developer's ~/.aws credentials (or, on
+// an EC2/EKS CI runner, REAL instance credentials) and pay a measured 4-5s
+// IMDS probe on machines without one (#601 review F10).
+func hermeticAWSEnv(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{
+		"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+		"AWS_ROLE_ARN", "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_PROFILE",
+		"AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+		"AWS_CONTAINER_AUTHORIZATION_TOKEN", "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+	} {
+		t.Setenv(k, "")
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv(envAWSRoleARN, tt.roleARN)
-			t.Setenv(envAWSWebIdentityTokenFile, tt.tokenFile)
-			t.Setenv(envAWSAccessKeyID, tt.envAccessKey)
-			t.Setenv(envAWSSecretAccessKey, tt.envSecretKey)
-			if got := useWebIdentityChain(tt.accessKey, tt.secret); got != tt.want {
-				t.Errorf("useWebIdentityChain(%q,%q) with role=%q file=%q = %v, want %v",
-					tt.accessKey, tt.secret, tt.roleARN, tt.tokenFile, got, tt.want)
-			}
-		})
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", "/dev/null")
+	t.Setenv("AWS_CONFIG_FILE", "/dev/null")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+}
+
+// TestS3CredentialMode pins the two-way routing (#601): configured keys emit
+// directly; anything else is SDK-managed (the refresher decides the rest at
+// resolve time).
+func TestS3CredentialMode(t *testing.T) {
+	if got := s3CredentialMode("AKIA", "sk"); got != s3ModeStaticKeys {
+		t.Errorf("static keys => %q, want %q", got, s3ModeStaticKeys)
+	}
+	if got := s3CredentialMode("", ""); got != s3ModeSDKManaged {
+		t.Errorf("no keys => %q, want %q", got, s3ModeSDKManaged)
+	}
+	// Half-configured pairs still route to direct emission, where
+	// buildS3SecretSQL rejects them with a clear error (unchanged from #600).
+	if got := s3CredentialMode("AKIA", ""); got != s3ModeStaticKeys {
+		t.Errorf("half pair => %q, want %q", got, s3ModeStaticKeys)
 	}
 }
 
 // TestBuildS3SecretSQL_SessionToken pins the static-credentials emission the
-// refresher (s3refresh.go) depends on, and — as important — that NON-refresher
-// shapes are unchanged: no CHAIN/REFRESH/VALIDATION anywhere (the DuckDB-side
-// web_identity mechanism was removed after live testing proved it never
-// refreshes for Arc's globbed reads, #600).
+// refresher (s3refresh.go) depends on, and that no shape emits CHAIN/REFRESH
+// (the DuckDB-side web_identity mechanism was removed after live testing proved
+// it never refreshes for Arc's globbed reads, #600). VALIDATION 'none' is
+// required on the chain fallback and forbidden on static shapes — see the
+// sub-test.
 func TestBuildS3SecretSQL_SessionToken(t *testing.T) {
 	t.Run("keys + session token emit SESSION_TOKEN", func(t *testing.T) {
 		got, err := buildS3SecretSQL(s3SecretParams{
@@ -502,19 +500,32 @@ func TestBuildS3SecretSQL_SessionToken(t *testing.T) {
 	})
 
 	t.Run("no shape ever emits DuckDB-side refresh clauses", func(t *testing.T) {
+		// CHAIN pinning and REFRESH were the #600 dead end — verified live to
+		// never refresh for Arc's globbed reads. Nothing may emit them.
 		for _, p := range []s3SecretParams{
 			{name: "a", accessKey: "k", secretKey: "s", sessionToken: "t", region: "r", useSSL: true},
-			{name: "b", region: "r", useSSL: true}, // plain chain
+			{name: "b", region: "r", useSSL: true}, // chain fallback
 		} {
 			got, err := buildS3SecretSQL(p)
 			if err != nil {
 				t.Fatalf("buildS3SecretSQL(%q): %v", p.name, err)
 			}
-			for _, forbidden := range []string{"CHAIN '", "REFRESH", "VALIDATION"} {
+			for _, forbidden := range []string{"CHAIN '", "REFRESH"} {
 				if strings.Contains(got, forbidden) {
 					t.Errorf("secret %q must not contain %q, got:\n%s", p.name, forbidden, got)
 				}
 			}
+		}
+		// Static secrets must not carry VALIDATION; the chain fallback MUST —
+		// DuckDB fails a chain-secret CREATE when nothing resolves, and the
+		// fallback exists precisely for that situation.
+		staticSQL, _ := buildS3SecretSQL(s3SecretParams{name: "a", accessKey: "k", secretKey: "s", region: "r", useSSL: true})
+		if strings.Contains(staticSQL, "VALIDATION") {
+			t.Errorf("static secret must not carry VALIDATION:\n%s", staticSQL)
+		}
+		chainSQL, _ := buildS3SecretSQL(s3SecretParams{name: "b", region: "r", useSSL: true})
+		if !strings.Contains(chainSQL, "VALIDATION 'none'") {
+			t.Errorf("chain fallback must carry VALIDATION 'none':\n%s", chainSQL)
 		}
 	})
 }
@@ -561,35 +572,6 @@ func TestSessionTokenSecretExecutesAndRedacts(t *testing.T) {
 	mustContain(t, secretString, "session_token=redacted")
 }
 
-// TestS3CredentialMode pins the log label to the same branch structure
-// buildS3SecretSQL uses, so the two cannot drift.
-func TestS3CredentialMode(t *testing.T) {
-	tests := []struct {
-		name                       string
-		accessKey, secretKey       string
-		roleARN, tokenFile         string
-		envAccessKey, envSecretKey string
-		want                       string
-	}{
-		{"static keys", "AKIA", "sk", "", "", "", "", "static_keys"},
-		{"static keys under IRSA env", "AKIA", "sk", "arn:aws:iam::1:role/r", "/tok", "", "", "static_keys"},
-		{"IRSA", "", "", "arn:aws:iam::1:role/r", "/tok", "", "", "web_identity"},
-		{"plain chain (instance role)", "", "", "", "", "", "", "credential_chain"},
-		{"env keys beat IRSA env", "", "", "arn:aws:iam::1:role/r", "/tok", "AKIAENV", "envsec", "credential_chain"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv(envAWSRoleARN, tt.roleARN)
-			t.Setenv(envAWSWebIdentityTokenFile, tt.tokenFile)
-			t.Setenv(envAWSAccessKeyID, tt.envAccessKey)
-			t.Setenv(envAWSSecretAccessKey, tt.envSecretKey)
-			if got := s3CredentialMode(tt.accessKey, tt.secretKey); got != tt.want {
-				t.Errorf("s3CredentialMode(%q,%q) = %q, want %q", tt.accessKey, tt.secretKey, got, tt.want)
-			}
-		})
-	}
-}
-
 // TestConfigureS3ColdTierStartsRefresher pins the cold-tier wiring for #600:
 // under IRSA (no static keys + web-identity env), ConfigureS3 must route to the
 // credential refresher, whose synchronous first resolve emits a static-key
@@ -597,10 +579,7 @@ func TestS3CredentialMode(t *testing.T) {
 // deleting the refresher branch from ConfigureS3 compiles and passes the suite,
 // silently leaving tiered-storage IRSA deployments on the expiring path.
 func TestConfigureS3ColdTierStartsRefresher(t *testing.T) {
-	t.Setenv(envAWSRoleARN, "arn:aws:iam::123456789012:role/arc-irsa")
-	t.Setenv(envAWSWebIdentityTokenFile, "/var/run/secrets/eks.amazonaws.com/serviceaccount/token")
-	t.Setenv(envAWSAccessKeyID, "")
-	t.Setenv(envAWSSecretAccessKey, "")
+	hermeticAWSEnv(t)
 
 	// Inject a deterministic provider; restore the SDK one afterwards.
 	orig := newAWSCredProvider
