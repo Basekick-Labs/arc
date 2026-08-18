@@ -1691,6 +1691,14 @@ func main() {
 
 	server := api.NewServer(serverConfig, logger.Get("server"))
 
+	// #603: surface per-tier storage credential state in /health (and /ready
+	// when the knob is set). In-memory reads from the credential refresher —
+	// never a live S3/Azure probe from the probe path.
+	server.SetStorageStatus(db.StorageCredentialStatus, cfg.Server.StorageCredentialsFailReady)
+	if cfg.Server.StorageCredentialsFailReady && cfg.Cluster.Enabled && cfg.Cluster.Role == string(cluster.RoleWriter) {
+		log.Warn().Msg("server.storage_credentials_fail_ready is set on a writer: expired S3 credentials will drain this node from the LB even though ingest is unaffected by credential expiry; intended for reader pools")
+	}
+
 	// Register base routes
 	server.RegisterRoutes()
 

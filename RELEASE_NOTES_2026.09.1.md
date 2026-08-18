@@ -441,6 +441,29 @@ Reachable only when RBAC is enabled (the multi-tenant authorization boundary); n
 
 ## Bug fixes
 
+### `/health` now reports storage credential state — a dead read path can no longer hide behind green probes ([#603](https://github.com/Basekick-Labs/arc/issues/603))
+
+The incident that motivated this: a reader ran ~21 hours READY 1/1 with `/health` green while every S3-backed query failed on expired credentials — the only failure signal lived in query responses, invisible to probes, monitoring, and orchestration.
+
+`/health` now carries a `storage` field describing every configured tier — hot always; cold once its configuration succeeded (a cold tier whose secret creation failed is absent from the payload rather than falsely green):
+
+```json
+"storage": {
+  "hot":  {"backend": "s3", "credentials": "sdk_managed", "state": "ok",
+           "expires_at": "2026-08-18T20:24:18Z", "source": "CredentialsEndpointProvider",
+           "last_refresh": "2026-08-18T20:12:26Z"},
+  "cold": {"backend": "azure", "credentials": "unmanaged_chain", "state": "unknown"}
+}
+```
+
+States: `ok`, `degraded` (refreshes failing, credentials still valid), `expired` (the incident case — red within a minute of expiry), `fallback` (no resolvable credentials; running on DuckDB's chain), `unknown` (Arc has no visibility — see below). The state is computed from the credential refresher's in-memory records at read time: **`/health` never probes S3 or Azure**, so there is nothing to flap and no per-probe storage traffic. Pre-expiry alerting belongs on `expires_at`, not on a state change — a healthy IMDS or Pod Identity session routinely waits for server-side rotation near its end and stays `ok` while doing so.
+
+Honesty notes: an Azure connection string embedding a **SAS token** reports `credentials: sas, state: unknown` — SAS tokens expire and Arc cannot see when, and calling that "ok" would recreate exactly the incident above. Azure **managed identity** likewise reports `unmanaged_chain / unknown`: those credentials are resolved once by DuckDB and never refreshed — the same class #600 fixed for S3, tracked as a probable live bug in [#605](https://github.com/Basekick-Labs/arc/issues/605). Local storage reports `local / none / ok`.
+
+**Opt-in readiness gating**: `server.storage_credentials_fail_ready = true` (default **false**) makes `/ready` return 503 while any tier's credential state is `expired`, so Kubernetes recycles the pod — a restart re-resolves credentials. Only `expired` drains a node; `fallback`/`unknown`/`degraded` never do (those deployments may be healthy or credential-less by design). Intended for reader pools: Arc logs a startup warning when it is enabled on a cluster writer, whose ingest keeps working through credential expiry. Startup and shutdown readiness gating are unaffected — the knob can only remove readiness, never grant it.
+
+The field is served unauthenticated like the rest of `/health` and `/metrics`: it contains no bucket or container names, endpoints, prefixes, paths, or key material.
+
 ### S3 queries no longer fail with `ExpiredToken` an hour after startup on EKS/IRSA ([#600](https://github.com/Basekick-Labs/arc/issues/600))
 
 On EKS with IRSA — where pods authenticate to S3 through a projected service-account token instead of static keys — Arc's query path stopped being able to read S3 roughly **one hour after each process start**. Every S3-backed query failed with `ExpiredToken`, while ingest and `/health` kept working normally, so Kubernetes probes never noticed and only a pod restart recovered it.

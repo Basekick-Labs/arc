@@ -44,6 +44,137 @@ type DuckDB struct {
 	// Close stops and waits for each. See s3refresh.go and #600.
 	refresherMu  sync.Mutex
 	s3Refreshers map[string]*s3CredentialRefresher
+
+	// coldTier records the cold tier's backend + credential mode for the
+	// /health storage payload (#603). Set by ConfigureS3/ConfigureAzure at
+	// startup (the hot tier is derived live from d.config and needs no
+	// record). Guarded by refresherMu.
+	coldTier *storageTierConfig
+}
+
+// storageTierConfig is what StorageCredentialStatus needs to describe a tier
+// whose secret was emitted directly (no refresher registry entry).
+type storageTierConfig struct {
+	backend     string // s3 | azure
+	credentials string // static_keys | sas | sdk_managed | unmanaged_chain
+	secretName  string // registry key when credentials == sdk_managed
+}
+
+// StorageTierStatus is one tier's entry in the /health "storage" payload
+// (#603). ExpiresAt/Source/LastRefresh are populated only for
+// refresher-managed credentials.
+type StorageTierStatus struct {
+	Backend           string     `json:"backend"`
+	Credentials       string     `json:"credentials"`
+	State             string     `json:"state"`
+	ExpiresAt         *time.Time `json:"expires_at,omitempty"`
+	Source            string     `json:"source,omitempty"`
+	LastRefresh       *time.Time `json:"last_refresh,omitempty"`
+	ConsecutiveErrors int        `json:"consecutive_errors,omitempty"`
+}
+
+// Credential-mode labels for tiers without a refresher.
+const (
+	credModeNone           = "none"
+	credModeStaticKeys     = "static_keys"
+	credModeSAS            = "sas"
+	credModeUnmanagedChain = "unmanaged_chain"
+)
+
+// azureCredentialsLabel classifies an Azure tier's credential source. A
+// connection string embedding a SharedAccessSignature EXPIRES (typically
+// hours/days) — reporting it "static_keys/ok" would recreate the exact
+// green-dashboard-dead-reads incident #603 fixes, so SAS maps to
+// state "unknown" (#603 review F3). Arc has no visibility into SAS expiry.
+func azureCredentialsLabel(connectionString, accountKey string) (creds, state string) {
+	if connectionString != "" {
+		lower := strings.ToLower(connectionString)
+		// ';sig=' cannot false-positive inside an AccountKey: base64 excludes
+		// ';'. The '?sig='/'&sig=' forms catch a SAS carried in BlobEndpoint
+		// query parameters.
+		if strings.Contains(lower, "sharedaccesssignature=") || strings.Contains(lower, ";sig=") ||
+			strings.Contains(lower, "?sig=") || strings.Contains(lower, "&sig=") {
+			return credModeSAS, CredStateUnknown
+		}
+		return credModeStaticKeys, CredStateOK
+	}
+	if accountKey != "" {
+		return credModeStaticKeys, CredStateOK
+	}
+	// Managed identity / az-login via DuckDB's chain: resolved once, never
+	// refreshed, no Arc visibility (#605 tracks the refresher gap).
+	return credModeUnmanagedChain, CredStateUnknown
+}
+
+// StorageCredentialStatus builds the /health "storage" payload: one entry per
+// configured tier (hot always; cold once its configuration succeeded), built
+// LIVE per call. Refresher pointers are copied under refresherMu and the mutex
+// is released before status() calls, keeping the critical section tiny. Note
+// what actually protects /health from blocking behind Close (which holds
+// refresherMu across stop(), bounded by s3ResolveTimeout): graceful-shutdown
+// ORDERING — HTTP drains (priority 10) before the database closes (priority
+// 90), so no probe can be in flight by then. A future non-HTTP caller running
+// through shutdown would still contend on the Lock below.
+func (d *DuckDB) StorageCredentialStatus() map[string]StorageTierStatus {
+	now := time.Now()
+
+	d.refresherMu.Lock()
+	refreshers := make(map[string]*s3CredentialRefresher, len(d.s3Refreshers))
+	for k, v := range d.s3Refreshers {
+		refreshers[k] = v
+	}
+	cold := d.coldTier
+	d.refresherMu.Unlock()
+
+	out := make(map[string]StorageTierStatus, 2)
+
+	// Hot tier: derived live from retained config. Note the legacy edge where
+	// S3 keys are set with backend=local: a primary S3 secret exists but reads
+	// serve from local storage, so hot honestly reports local/none.
+	switch {
+	case d.config.S3IsPrimaryBackend:
+		out["hot"] = d.s3TierStatus(primaryS3SecretParams(d.config), refreshers, now)
+	case d.config.AzureIsPrimaryBackend:
+		creds, state := azureCredentialsLabel(d.config.AzureConnectionString, d.config.AzureAccountKey)
+		out["hot"] = StorageTierStatus{Backend: "azure", Credentials: creds, State: state}
+	default:
+		out["hot"] = StorageTierStatus{Backend: "local", Credentials: credModeNone, State: CredStateOK}
+	}
+
+	if cold != nil {
+		st := StorageTierStatus{Backend: cold.backend, Credentials: cold.credentials, State: CredStateOK}
+		switch cold.credentials {
+		case credModeSAS, credModeUnmanagedChain:
+			st.State = CredStateUnknown
+		case s3ModeSDKManaged:
+			if r := refreshers[cold.secretName]; r != nil {
+				st = r.status(now)
+				st.Backend, st.Credentials = cold.backend, s3ModeSDKManaged
+			} else {
+				// Provider construction failed at configure time: running on
+				// the CREDENTIAL_CHAIN fallback with no refresher.
+				st.Credentials, st.State = s3ModeCredentialChain, CredStateFallback
+			}
+		}
+		out["cold"] = st
+	}
+	return out
+}
+
+// s3TierStatus describes an S3 tier from its secret params + the refresher
+// registry.
+func (d *DuckDB) s3TierStatus(params s3SecretParams, refreshers map[string]*s3CredentialRefresher, now time.Time) StorageTierStatus {
+	if s3CredentialMode(params.accessKey, params.secretKey) == s3ModeStaticKeys {
+		return StorageTierStatus{Backend: "s3", Credentials: credModeStaticKeys, State: CredStateOK}
+	}
+	if r := refreshers[params.name]; r != nil {
+		st := r.status(now)
+		st.Backend, st.Credentials = "s3", s3ModeSDKManaged
+		return st
+	}
+	// sdk_managed route but no registry entry: provider construction failed and
+	// the CREDENTIAL_CHAIN fallback secret is serving (see startRefresher).
+	return StorageTierStatus{Backend: "s3", Credentials: s3ModeCredentialChain, State: CredStateFallback}
 }
 
 // escapeSQLString escapes single quotes for safe use in DuckDB SQL strings.
@@ -1064,7 +1195,12 @@ func (d *DuckDB) ConfigureS3(s3cfg *S3Config) error {
 		pathStyle: s3cfg.PathStyle,
 		useSSL:    s3cfg.UseSSL,
 	}
+	coldCreds := credModeStaticKeys
 	if s3CredentialMode(s3cfg.AccessKey, s3cfg.SecretKey) == s3ModeSDKManaged {
+		coldCreds = s3ModeSDKManaged
+	}
+
+	if coldCreds == s3ModeSDKManaged {
 		// No static keys: the cold-tier secret is Arc-managed too (#600/#601).
 		// startRefresher stop-and-replaces any previous refresher for this name;
 		// template errors are deterministic misconfigurations and propagate.
@@ -1080,6 +1216,15 @@ func (d *DuckDB) ConfigureS3(s3cfg *S3Config) error {
 			return fmt.Errorf("failed to create S3 secret: %w", err)
 		}
 	}
+
+	// Record the tier only AFTER the secret/refresher is in place: recording
+	// first would make /health affirmatively report a working cold tier whose
+	// secret was never created — the exact green-but-dead shape #603 exists to
+	// kill (#603 review H1). On failure the tier is ABSENT from the payload,
+	// matching ConfigureAzure; the caller logs the error.
+	d.refresherMu.Lock()
+	d.coldTier = &storageTierConfig{backend: "s3", credentials: coldCreds, secretName: arcS3ColdSecretName}
+	d.refresherMu.Unlock()
 
 	// credential_mode matters most here: on a local-primary + S3-cold deployment
 	// configureS3Access never runs, so this is the ONLY place an operator can see
@@ -1271,6 +1416,12 @@ func (d *DuckDB) ConfigureAzure(azcfg *AzureConfig) error {
 	if _, err := d.db.Exec(secretSQL); err != nil {
 		return fmt.Errorf("failed to create cold-tier azure secret: %w", err)
 	}
+
+	creds, _ := azureCredentialsLabel(azcfg.ConnectionString, azcfg.AccountKey)
+	d.refresherMu.Lock()
+	d.coldTier = &storageTierConfig{backend: "azure", credentials: creds, secretName: arcAzureColdSecretName}
+	d.refresherMu.Unlock()
+
 	d.logger.Info().Str("account", azcfg.AccountName).Str("container", azcfg.Container).Msg("DuckDB cold-tier Azure secret configured")
 	return nil
 }

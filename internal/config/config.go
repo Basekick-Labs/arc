@@ -51,9 +51,13 @@ type ServerConfig struct {
 	Port            int
 	ReadTimeout     int
 	WriteTimeout    int
-	IdleTimeout     int   // Connection idle timeout in seconds
-	ShutdownTimeout int   // Graceful shutdown timeout in seconds
-	MaxPayloadSize  int64 // Maximum request payload size in bytes (applies to both compressed and decompressed)
+	IdleTimeout     int // Connection idle timeout in seconds
+	ShutdownTimeout int // Graceful shutdown timeout in seconds
+	// StorageCredentialsFailReady: /ready returns 503 while any storage tier's
+	// credential state is "expired" (#603). Default false — recycling on
+	// credential expiry is an operator policy; recommended for reader pools.
+	StorageCredentialsFailReady bool
+	MaxPayloadSize              int64 // Maximum request payload size in bytes (applies to both compressed and decompressed)
 	// TLS Configuration
 	TLSEnabled  bool   // Enable HTTPS/TLS
 	TLSCertFile string // Path to TLS certificate file (PEM format)
@@ -716,16 +720,17 @@ func Load() (*Config, error) {
 	// Build config from Viper (which includes defaults + env vars)
 	cfg := &Config{
 		Server: ServerConfig{
-			Host:            v.GetString("server.host"),
-			Port:            v.GetInt("server.port"),
-			ReadTimeout:     v.GetInt("server.read_timeout"),
-			WriteTimeout:    v.GetInt("server.write_timeout"),
-			IdleTimeout:     v.GetInt("server.idle_timeout"),
-			ShutdownTimeout: v.GetInt("server.shutdown_timeout"),
-			MaxPayloadSize:  maxPayloadSize,
-			TLSEnabled:      v.GetBool("server.tls_enabled"),
-			TLSCertFile:     v.GetString("server.tls_cert_file"),
-			TLSKeyFile:      v.GetString("server.tls_key_file"),
+			Host:                        v.GetString("server.host"),
+			Port:                        v.GetInt("server.port"),
+			ReadTimeout:                 v.GetInt("server.read_timeout"),
+			WriteTimeout:                v.GetInt("server.write_timeout"),
+			IdleTimeout:                 v.GetInt("server.idle_timeout"),
+			ShutdownTimeout:             v.GetInt("server.shutdown_timeout"),
+			StorageCredentialsFailReady: v.GetBool("server.storage_credentials_fail_ready"),
+			MaxPayloadSize:              maxPayloadSize,
+			TLSEnabled:                  v.GetBool("server.tls_enabled"),
+			TLSCertFile:                 v.GetString("server.tls_cert_file"),
+			TLSKeyFile:                  v.GetString("server.tls_key_file"),
 		},
 		Database: DatabaseConfig{
 			MaxConnections:         v.GetInt("database.max_connections"),
@@ -1368,6 +1373,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("server.host", "")
 	v.SetDefault("server.port", 8000)
 	v.SetDefault("server.read_timeout", 30)
+	v.SetDefault("server.storage_credentials_fail_ready", false)
 	v.SetDefault("server.write_timeout", 30)
 	v.SetDefault("server.idle_timeout", 120)
 	v.SetDefault("server.shutdown_timeout", 30)

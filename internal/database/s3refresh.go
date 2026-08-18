@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -127,6 +128,105 @@ type s3CredentialRefresher struct {
 	// first resolve before the goroutine starts).
 	everSucceeded     bool
 	consecutiveErrors int
+
+	// lastRefresh / source describe the last successful emission; loop-owned
+	// like the fields above.
+	lastRefresh time.Time
+	source      string
+
+	// snap is the read side for /health (#603): an immutable snapshot swapped
+	// atomically by publishStatus at every outcome. status() reads ONLY this —
+	// never the loop-owned raw fields above. Publication of the refresher in
+	// the DuckDB registry (under refresherMu) is what orders the constructor's
+	// writes before any reader; the done channel plays no part in that.
+	snap atomic.Pointer[storageCredSnapshot]
+}
+
+// storageCredSnapshot is the raw material for state derivation. It stores
+// facts, not a state string: state is derived at READ time by deriveState so
+// an expiry crossing between refresher outcomes (up to ~refreshDelay apart)
+// becomes visible within one probe interval, not one refresh interval.
+type storageCredSnapshot struct {
+	everSucceeded     bool
+	canExpire         bool
+	consecutiveErrors int
+	lastExpiry        time.Time
+	lastRefresh       time.Time
+	source            string
+}
+
+// publishStatus snapshots the loop-owned fields. Called at every outcome —
+// the three constructor branches, the three plan* outcomes, and the loop's
+// non-expiring exit. Missing a site is not cosmetic: skipping the
+// constructor-success site would report "fallback" for ~refreshDelay on a
+// perfectly healthy refresher (#603 review F1).
+func (r *s3CredentialRefresher) publishStatus(canExpire bool) {
+	r.snap.Store(&storageCredSnapshot{
+		everSucceeded:     r.everSucceeded,
+		canExpire:         canExpire,
+		consecutiveErrors: r.consecutiveErrors,
+		lastExpiry:        r.lastExpiry,
+		lastRefresh:       r.lastRefresh,
+		source:            r.source,
+	})
+}
+
+// Credential states surfaced via /health (#603). Exported: they are a
+// published API contract (release notes) and internal/api compares against
+// CredStateExpired for the readiness knob — a raw string there would let a
+// respelling here silently disable the knob (#603 review M3).
+const (
+	CredStateOK       = "ok"
+	CredStateDegraded = "degraded"
+	CredStateExpired  = "expired"
+	CredStateFallback = "fallback"
+	CredStateUnknown  = "unknown"
+)
+
+// deriveState maps a snapshot to a state at time `now`. Pure so the full grid
+// — including "expired", impossible to force against real STS in a test — is
+// unit-testable.
+//
+// Precedence (#603 review F4): fallback (never succeeded — cannot be expired,
+// lastExpiry is only ever set by a successful emit) > non-expiring ok >
+// expired (EVEN with a concurrent error streak: in the field incident both
+// held at once and expired is the actionable truth) > degraded > ok.
+// Non-advancing rotation-waits stay "ok" deliberately: they occur in the tail
+// of every healthy IMDS/Pod-Identity session; pre-expiry alerting belongs to
+// the payload's expires_at, not a state flap.
+func deriveState(snap *storageCredSnapshot, now time.Time) string {
+	switch {
+	case snap == nil || !snap.everSucceeded:
+		return CredStateFallback
+	case !snap.canExpire:
+		return CredStateOK
+	case !now.Before(snap.lastExpiry):
+		return CredStateExpired
+	case snap.consecutiveErrors > 0:
+		return CredStateDegraded
+	default:
+		return CredStateOK
+	}
+}
+
+// status returns this refresher's contribution to the /health payload.
+func (r *s3CredentialRefresher) status(now time.Time) StorageTierStatus {
+	snap := r.snap.Load()
+	st := StorageTierStatus{State: deriveState(snap, now)}
+	if snap == nil {
+		return st
+	}
+	st.Source = snap.source
+	st.ConsecutiveErrors = snap.consecutiveErrors
+	if snap.canExpire && !snap.lastExpiry.IsZero() {
+		t := snap.lastExpiry.UTC()
+		st.ExpiresAt = &t
+	}
+	if !snap.lastRefresh.IsZero() {
+		t := snap.lastRefresh.UTC()
+		st.LastRefresh = &t
+	}
+	return st
 }
 
 // startS3CredentialRefresher performs one synchronous resolve+emit (bounded by
@@ -158,6 +258,7 @@ func startS3CredentialRefresher(db *sql.DB, params s3SecretParams, provider awsC
 
 	switch {
 	case err != nil:
+		r.publishStatus(true)
 		if onFirstFailure != nil {
 			onFirstFailure(err)
 		}
@@ -165,10 +266,12 @@ func startS3CredentialRefresher(db *sql.DB, params s3SecretParams, provider awsC
 	case !creds.CanExpire:
 		// Static credentials resolved through the chain — nothing to refresh.
 		r.everSucceeded = true
+		r.publishStatus(false)
 		r.logger.Info().Msg("resolved non-expiring S3 credentials; refresh loop not needed")
 		close(r.done)
 	default:
 		r.everSucceeded = true
+		r.publishStatus(true)
 		go r.loop(ctx, refreshDelay(creds.Expires))
 	}
 	return r
@@ -205,6 +308,11 @@ func (r *s3CredentialRefresher) loop(ctx context.Context, initialDelay time.Dura
 		var delay time.Duration
 		switch {
 		case err == nil && !creds.CanExpire:
+			// Publish before exiting or the stale ExpiresAt would eventually
+			// derive "expired" forever while queries work (#603 review F1).
+			r.everSucceeded = true
+			r.consecutiveErrors = 0
+			r.publishStatus(false)
 			r.logger.Info().Msg("credentials became non-expiring; refresh loop exiting")
 			return
 		case err == nil:
@@ -225,6 +333,7 @@ func (r *s3CredentialRefresher) loop(ctx context.Context, initialDelay time.Dura
 func (r *s3CredentialRefresher) planSuccess(creds aws.Credentials) time.Duration {
 	r.everSucceeded = true
 	r.consecutiveErrors = 0
+	r.publishStatus(true)
 	return refreshDelay(creds.Expires)
 }
 
@@ -235,6 +344,7 @@ func (r *s3CredentialRefresher) planSuccess(creds aws.Credentials) time.Duration
 // error, and do not add backoff (a backoff step could straddle the rotation).
 func (r *s3CredentialRefresher) planNonAdvancing() time.Duration {
 	r.consecutiveErrors = 0
+	r.publishStatus(true)
 	remaining := time.Until(r.lastExpiry)
 	// Deliberate: if the source NEVER rotates and the held credentials expire,
 	// this keeps warning once a minute indefinitely. Queries are failing in
@@ -260,6 +370,7 @@ func (r *s3CredentialRefresher) planNonAdvancing() time.Duration {
 // later retry.
 func (r *s3CredentialRefresher) planError(err error) time.Duration {
 	r.consecutiveErrors++
+	r.publishStatus(true)
 	n := r.consecutiveErrors
 	backoffCap := s3RefreshBackoffMax
 	ev := r.logger.Error()
@@ -331,6 +442,8 @@ func (r *s3CredentialRefresher) resolveAndEmit(ctx context.Context, invalidate b
 	if _, err := r.db.ExecContext(ctx, secretSQL); err != nil {
 		return aws.Credentials{}, fmt.Errorf("emit S3 secret: %w", err)
 	}
+	r.source = credSourceLabel(creds.Source)
+	r.lastRefresh = time.Now().Truncate(time.Second)
 	if creds.CanExpire {
 		r.lastExpiry = creds.Expires
 		// Wording note: on EC2 the SDK caps reported Expires at now+1h even for
