@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -615,4 +616,214 @@ func TestPlanLogLevels(t *testing.T) {
 			t.Fatalf("levels = %v, want %v", got, want)
 		}
 	})
+}
+
+// TestDeriveState covers the full state grid — the pure function is the only
+// practical coverage for "expired" (unforceable against real STS) and pins the
+// precedence: fallback > non-expiring ok > expired-even-with-errors > degraded.
+func TestDeriveState(t *testing.T) {
+	now := time.Now()
+	past, future := now.Add(-time.Minute), now.Add(time.Hour)
+	cases := []struct {
+		name string
+		snap *storageCredSnapshot
+		want string
+	}{
+		{"nil snapshot", nil, CredStateFallback},
+		{"never succeeded", &storageCredSnapshot{everSucceeded: false, consecutiveErrors: 9}, CredStateFallback},
+		{"non-expiring", &storageCredSnapshot{everSucceeded: true, canExpire: false}, CredStateOK},
+		{"healthy", &storageCredSnapshot{everSucceeded: true, canExpire: true, lastExpiry: future}, CredStateOK},
+		{"failing but valid", &storageCredSnapshot{everSucceeded: true, canExpire: true, lastExpiry: future, consecutiveErrors: 2}, CredStateDegraded},
+		{"expired", &storageCredSnapshot{everSucceeded: true, canExpire: true, lastExpiry: past}, CredStateExpired},
+		// The field incident: refreshes failing AND creds dead — expired wins.
+		{"expired with error streak", &storageCredSnapshot{everSucceeded: true, canExpire: true, lastExpiry: past, consecutiveErrors: 7}, CredStateExpired},
+	}
+	for _, tc := range cases {
+		if got := deriveState(tc.snap, now); got != tc.want {
+			t.Errorf("%s: deriveState = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestStatusPublishSites pins that every refresher outcome publishes a
+// snapshot status() can see — most importantly the constructor-success site,
+// whose omission would report "fallback" for ~refreshDelay on a healthy
+// refresher (#603 review F1).
+func TestStatusPublishSites(t *testing.T) {
+	db := openTestDuckDBWithHTTPFS(t)
+	now := time.Now()
+
+	t.Run("constructor success publishes ok with expiry+source", func(t *testing.T) {
+		fake := &fakeCredProvider{creds: aws.Credentials{
+			AccessKeyID: "K", SecretAccessKey: "S", SessionToken: "T", Source: "WebIdentityCredentials",
+			CanExpire: true, Expires: now.Add(time.Hour),
+		}}
+		r := startS3CredentialRefresher(db, s3SecretParams{name: "st_ok", region: "r", useSSL: true}, fake, zerolog.Nop(), nil)
+		defer r.stop()
+		st := r.status(now)
+		if st.State != CredStateOK || st.ExpiresAt == nil || st.Source != "WebIdentityCredentials" {
+			t.Fatalf("constructor success status = %+v", st)
+		}
+	})
+
+	t.Run("constructor failure publishes fallback", func(t *testing.T) {
+		fake := &fakeCredProvider{err: fmt.Errorf("nope")}
+		r := startS3CredentialRefresher(db, s3SecretParams{name: "st_fb", region: "r", useSSL: true}, fake, zerolog.Nop(), nil)
+		defer r.stop()
+		if st := r.status(now); st.State != CredStateFallback {
+			t.Fatalf("constructor failure status = %+v", st)
+		}
+	})
+
+	t.Run("emit-once publishes non-expiring ok", func(t *testing.T) {
+		fake := &fakeCredProvider{creds: aws.Credentials{
+			AccessKeyID: "K", SecretAccessKey: "S", Source: "EnvConfigCredentials", CanExpire: false,
+		}}
+		r := startS3CredentialRefresher(db, s3SecretParams{name: "st_once", region: "r", useSSL: true}, fake, zerolog.Nop(), nil)
+		r.stop()
+		st := r.status(now)
+		if st.State != CredStateOK || st.ExpiresAt != nil {
+			t.Fatalf("emit-once status = %+v", st)
+		}
+	})
+
+	t.Run("planError publishes degraded; planSuccess recovers", func(t *testing.T) {
+		r := &s3CredentialRefresher{logger: zerolog.Nop()}
+		r.everSucceeded = true
+		r.lastExpiry = now.Add(time.Hour)
+		r.publishStatus(true)
+		r.planError(fmt.Errorf("sts down"))
+		if st := r.status(now); st.State != CredStateDegraded || st.ConsecutiveErrors != 1 {
+			t.Fatalf("post-error status = %+v", st)
+		}
+		r.planSuccess(aws.Credentials{CanExpire: true, Expires: now.Add(2 * time.Hour)})
+		if st := r.status(now); st.State != CredStateOK || st.ConsecutiveErrors != 0 {
+			t.Fatalf("post-recovery status = %+v", st)
+		}
+	})
+
+	t.Run("expired derives at READ time with no new outcome", func(t *testing.T) {
+		r := &s3CredentialRefresher{logger: zerolog.Nop()}
+		r.everSucceeded = true
+		r.lastExpiry = now.Add(30 * time.Millisecond)
+		r.publishStatus(true)
+		if st := r.status(now); st.State != CredStateOK {
+			t.Fatalf("pre-expiry: %+v", st)
+		}
+		if st := r.status(now.Add(time.Minute)); st.State != CredStateExpired {
+			t.Fatalf("post-expiry (same snapshot!): %+v", st)
+		}
+	})
+}
+
+// TestAzureCredentialsLabel pins the SAS honesty rule (#603 review F3): a
+// connection string embedding a SharedAccessSignature EXPIRES and must not
+// report static/ok.
+func TestAzureCredentialsLabel(t *testing.T) {
+	cases := []struct {
+		conn, key, wantCreds, wantState string
+	}{
+		{"DefaultEndpointsProtocol=https;AccountName=a;AccountKey=abc==", "", credModeStaticKeys, CredStateOK},
+		{"BlobEndpoint=https://a.blob.core.windows.net;SharedAccessSignature=sv=2024&sig=xyz", "", credModeSAS, CredStateUnknown},
+		{"BlobEndpoint=https://a.blob.core.windows.net;sig=xyz", "", credModeSAS, CredStateUnknown},
+		{"", "accountkey==", credModeStaticKeys, CredStateOK},
+		{"", "", credModeUnmanagedChain, CredStateUnknown},
+	}
+	for _, tc := range cases {
+		creds, state := azureCredentialsLabel(tc.conn, tc.key)
+		if creds != tc.wantCreds || state != tc.wantState {
+			t.Errorf("azureCredentialsLabel(%q,%q) = %s/%s, want %s/%s", tc.conn, tc.key, creds, state, tc.wantCreds, tc.wantState)
+		}
+	}
+}
+
+// TestStorageCredentialStatusTiers pins the per-tier aggregation across the
+// matrix cells.
+func TestStorageCredentialStatusTiers(t *testing.T) {
+	hermeticAWSEnv(t)
+
+	t.Run("local hot only", func(t *testing.T) {
+		tmp := t.TempDir()
+		db, err := New(&Config{MaxConnections: 2, MemoryLimit: "256MB", TempDirectory: tmp, LocalStorageRoot: filepath.Join(tmp, "d")}, zerolog.Nop())
+		if err != nil {
+			t.Skipf("New: %v", err)
+		}
+		defer db.Close()
+		st := db.StorageCredentialStatus()
+		if len(st) != 1 || st["hot"].Backend != "local" || st["hot"].State != CredStateOK {
+			t.Fatalf("local-only status = %+v", st)
+		}
+	})
+
+	t.Run("s3 hot managed + s3 cold managed", func(t *testing.T) {
+		orig := newAWSCredProvider
+		newAWSCredProvider = func(ctx context.Context, region string) (awsCredentialsProvider, error) {
+			return &fakeCredProvider{creds: aws.Credentials{
+				AccessKeyID: "K", SecretAccessKey: "S", SessionToken: "T", Source: "CredentialsEndpointProvider",
+				CanExpire: true, Expires: time.Now().Add(time.Hour),
+			}}, nil
+		}
+		t.Cleanup(func() { newAWSCredProvider = orig })
+
+		tmp := t.TempDir()
+		db, err := New(&Config{
+			MaxConnections: 2, MemoryLimit: "256MB", TempDirectory: tmp,
+			S3IsPrimaryBackend: true, S3Bucket: "hotb", S3Region: "us-east-1", S3UseSSL: true,
+		}, zerolog.Nop())
+		if err != nil {
+			t.Skipf("New: %v", err)
+		}
+		defer db.Close()
+		if err := db.ConfigureS3(&S3Config{Region: "us-east-1", Bucket: "coldb"}); err != nil {
+			t.Fatalf("ConfigureS3: %v", err)
+		}
+		st := db.StorageCredentialStatus()
+		hot, cold := st["hot"], st["cold"]
+		if hot.Backend != "s3" || hot.Credentials != s3ModeSDKManaged || hot.State != CredStateOK || hot.ExpiresAt == nil {
+			t.Fatalf("hot = %+v", hot)
+		}
+		if cold.Backend != "s3" || cold.Credentials != s3ModeSDKManaged || cold.State != CredStateOK {
+			t.Fatalf("cold = %+v", cold)
+		}
+	})
+
+	t.Run("s3 static hot", func(t *testing.T) {
+		tmp := t.TempDir()
+		db, err := New(&Config{
+			MaxConnections: 2, MemoryLimit: "256MB", TempDirectory: tmp,
+			S3IsPrimaryBackend: true, S3Bucket: "b", S3Region: "us-east-1", S3UseSSL: true,
+			S3AccessKey: "AKIA", S3SecretKey: "sk",
+		}, zerolog.Nop())
+		if err != nil {
+			t.Skipf("New: %v", err)
+		}
+		defer db.Close()
+		hot := db.StorageCredentialStatus()["hot"]
+		if hot.Credentials != credModeStaticKeys || hot.State != CredStateOK || hot.ExpiresAt != nil {
+			t.Fatalf("static hot = %+v", hot)
+		}
+	})
+}
+
+// TestColdTierAbsentWhenConfigurationFails (#603 review H1): a cold tier whose
+// secret creation failed must be ABSENT from /health — recording it before
+// emission would affirmatively report a working tier with no secret, the exact
+// green-but-dead shape this feature exists to kill.
+func TestColdTierAbsentWhenConfigurationFails(t *testing.T) {
+	hermeticAWSEnv(t)
+	tmp := t.TempDir()
+	db, err := New(&Config{MaxConnections: 2, MemoryLimit: "256MB", TempDirectory: tmp, LocalStorageRoot: filepath.Join(tmp, "d")}, zerolog.Nop())
+	if err != nil {
+		t.Skipf("New: %v", err)
+	}
+	defer db.Close()
+
+	// Half-configured key pair: buildS3SecretSQL rejects it, ConfigureS3 errors.
+	if err := db.ConfigureS3(&S3Config{Region: "us-east-1", Bucket: "coldb", AccessKey: "AKIA"}); err == nil {
+		t.Fatal("half-configured cold tier must error")
+	}
+	st := db.StorageCredentialStatus()
+	if _, ok := st["cold"]; ok {
+		t.Fatalf("failed cold tier must be absent from /health, got %+v", st["cold"])
+	}
 }

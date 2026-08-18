@@ -1,10 +1,15 @@
 package api
 
 import (
+	"encoding/json"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/basekick-labs/arc/internal/database"
 
 	"github.com/rs/zerolog"
 )
@@ -228,4 +233,122 @@ func TestHealthHandler_AlwaysOK(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Errorf("post-MarkNotReady /health status = %d; want 200 (liveness != readiness)", resp.StatusCode)
 	}
+}
+
+// TestHealthStorageField (#603): /health carries the per-tier storage
+// credential state when wired, and omits the field entirely when not (or when
+// empty) — static-key and pre-wiring deployments see the exact pre-#603
+// payload.
+func TestHealthStorageField(t *testing.T) {
+	now := time.Now().UTC()
+	mkReq := func(s *Server, path string) (*http.Response, map[string]any) {
+		t.Helper()
+		s.RegisterRoutes()
+		req := httptest.NewRequest("GET", path, nil)
+		resp, err := s.app.Test(req, 2000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		return resp, body
+	}
+
+	t.Run("absent when not wired", func(t *testing.T) {
+		s := NewServer(DefaultServerConfig(), zerolog.Nop())
+		_, body := mkReq(s, "/health")
+		if _, ok := body["storage"]; ok {
+			t.Fatal("storage field must be absent when no status source is wired")
+		}
+	})
+
+	t.Run("present with tiers when wired", func(t *testing.T) {
+		s := NewServer(DefaultServerConfig(), zerolog.Nop())
+		exp := now.Add(30 * time.Minute)
+		s.SetStorageStatus(func() map[string]database.StorageTierStatus {
+			return map[string]database.StorageTierStatus{
+				"hot":  {Backend: "s3", Credentials: "sdk_managed", State: "ok", ExpiresAt: &exp, Source: "WebIdentityCredentials"},
+				"cold": {Backend: "azure", Credentials: "unmanaged_chain", State: "unknown"},
+			}
+		}, false)
+		_, body := mkReq(s, "/health")
+		storage, ok := body["storage"].(map[string]any)
+		if !ok {
+			t.Fatalf("storage field missing: %v", body)
+		}
+		hot := storage["hot"].(map[string]any)
+		if hot["state"] != "ok" || hot["backend"] != "s3" || hot["expires_at"] == nil {
+			t.Fatalf("hot = %v", hot)
+		}
+		if cold := storage["cold"].(map[string]any); cold["state"] != "unknown" {
+			t.Fatalf("cold = %v", cold)
+		}
+		// Liveness stays ok regardless of credential state.
+		if body["status"] != "ok" {
+			t.Fatalf("/health status must stay ok, got %v", body["status"])
+		}
+	})
+}
+
+// TestReadyStorageCredentialsKnob (#603): the opt-in knob fails /ready ONLY on
+// state "expired" — fallback/unknown/degraded/local must not drain a node
+// (they may be healthy or permanently credential-less by design), and the knob
+// never overrides the not-ready startup/shutdown flag.
+func TestReadyStorageCredentialsKnob(t *testing.T) {
+	statusFn := func(state string) func() map[string]database.StorageTierStatus {
+		return func() map[string]database.StorageTierStatus {
+			return map[string]database.StorageTierStatus{
+				"hot": {Backend: "s3", Credentials: "sdk_managed", State: state},
+			}
+		}
+	}
+	get := func(s *Server) int {
+		t.Helper()
+		s.RegisterRoutes()
+		resp, err := s.app.Test(httptest.NewRequest("GET", "/ready", nil), 2000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.StatusCode
+	}
+
+	t.Run("knob on + expired -> 503", func(t *testing.T) {
+		s := NewServer(DefaultServerConfig(), zerolog.Nop())
+		s.MarkReady()
+		s.SetStorageStatus(statusFn("expired"), true)
+		if code := get(s); code != 503 {
+			t.Fatalf("code = %d, want 503", code)
+		}
+	})
+
+	t.Run("knob off + expired -> 200", func(t *testing.T) {
+		s := NewServer(DefaultServerConfig(), zerolog.Nop())
+		s.MarkReady()
+		s.SetStorageStatus(statusFn("expired"), false)
+		if code := get(s); code != 200 {
+			t.Fatalf("code = %d, want 200 (default-off knob)", code)
+		}
+	})
+
+	// The row that catches an accidental "any non-ok fails ready" bug.
+	for _, state := range []string{"ok", "degraded", "fallback", "unknown"} {
+		t.Run("knob on + "+state+" -> 200", func(t *testing.T) {
+			s := NewServer(DefaultServerConfig(), zerolog.Nop())
+			s.MarkReady()
+			s.SetStorageStatus(statusFn(state), true)
+			if code := get(s); code != 200 {
+				t.Fatalf("state %q: code = %d, want 200 (only expired fails ready)", state, code)
+			}
+		})
+	}
+
+	t.Run("knob cannot grant readiness before MarkReady", func(t *testing.T) {
+		s := NewServer(DefaultServerConfig(), zerolog.Nop())
+		s.SetStorageStatus(statusFn("ok"), true)
+		if code := get(s); code != 503 {
+			t.Fatalf("code = %d, want 503 (startup gating untouched)", code)
+		}
+	})
 }
