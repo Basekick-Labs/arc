@@ -273,6 +273,7 @@ func main() {
 		AzureAccountName:      cfg.Storage.AzureAccountName,
 		AzureAccountKey:       cfg.Storage.AzureAccountKey,
 		AzureConnectionString: cfg.Storage.AzureConnectionString,
+		AzureSASToken:         cfg.Storage.AzureSASToken,
 		AzureEndpoint:         cfg.Storage.AzureEndpoint,
 		AzureContainer:        cfg.Storage.AzureContainer,
 		// Primary-backend signal for Azure (mirrors S3IsPrimaryBackend): only an
@@ -3200,7 +3201,9 @@ func main() {
 				ConnectionString: cold.AzureConnectionString,
 				AccountName:      cold.AzureAccountName,
 				AccountKey:       cold.AzureAccountKey,
+				SASToken:         cold.AzureSASToken,
 				Container:        cold.AzureContainer,
+				Endpoint:         cold.AzureEndpoint,
 			}); err != nil {
 				log.Warn().Err(err).Msg("Failed to configure DuckDB with cold tier Azure credentials")
 			} else {

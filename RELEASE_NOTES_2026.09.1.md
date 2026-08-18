@@ -441,6 +441,18 @@ Reachable only when RBAC is enabled (the multi-tenant authorization boundary); n
 
 ## Bug fixes
 
+### Azure managed-identity credentials on the query path now refresh — and no longer die an hour in ([#605](https://github.com/Basekick-Labs/arc/issues/605))
+
+The same class as the S3/IRSA bug above, on the other cloud: DuckDB's azure `CREDENTIAL_CHAIN` secret materializes an AAD token **once** at secret creation and never refreshes it, while AAD access tokens live about an hour — so on `storage.backend = azure` with managed identity or a service-principal environment, query reads died roughly an hour after each process start, with ingest unaffected.
+
+Arc now resolves AAD tokens itself through `azidentity`'s `DefaultAzureCredential` — the same chain ingest uses, so query identity equals ingest identity — and hands DuckDB `PROVIDER ACCESS_TOKEN` secrets, re-issued before each expiry by the same refresher machinery that manages the AWS sources. Near the end of a token's life MSAL serves its cache for up to ~5 minutes; the refresher's rotation-wait handles that, exactly as it does for IMDS and Pod Identity. Verified end-to-end against live Azure Blob Storage with real hour-long AAD tokens, through a full rotation.
+
+Also in this change:
+
+- **`storage.azure_endpoint` now reaches the query path.** It was silently ignored there — every azure secret targeted `blob.core.windows.net`, so sovereign-cloud endpoints only worked for writes. Full-URL values are normalized to DuckDB's host-suffix form; path-style endpoints (Azurite) don't fit that model and are logged and skipped. The sovereign token *audience* remains a known, ingest-shared limitation.
+- **SAS deployments never start a refresher.** `storage.azure_sas_token` is now visible to the credential routing: a deliberately-scoped SAS reports `sas / unknown` in `/health` and keeps its existing behavior — a managed refresher would have acquired a broader identity than the operator intended. (The query path has never consumed the SAS itself; its DuckDB secret is chain-shaped. That pre-existing asymmetry is unchanged and now at least visible.)
+- Deployments with no resolvable Azure credentials degrade to the previous chain secret with a demoted background retry, like S3.
+
 ### `/health` now reports storage credential state — a dead read path can no longer hide behind green probes ([#603](https://github.com/Basekick-Labs/arc/issues/603))
 
 The incident that motivated this: a reader ran ~21 hours READY 1/1 with `/health` green while every S3-backed query failed on expired credentials — the only failure signal lived in query responses, invisible to probes, monitoring, and orchestration.
@@ -452,13 +464,13 @@ The incident that motivated this: a reader ran ~21 hours READY 1/1 with `/health
   "hot":  {"backend": "s3", "credentials": "sdk_managed", "state": "ok",
            "expires_at": "2026-08-18T20:24:18Z", "source": "CredentialsEndpointProvider",
            "last_refresh": "2026-08-18T20:12:26Z"},
-  "cold": {"backend": "azure", "credentials": "unmanaged_chain", "state": "unknown"}
+  "cold": {"backend": "azure", "credentials": "sas", "state": "unknown"}
 }
 ```
 
 States: `ok`, `degraded` (refreshes failing, credentials still valid), `expired` (the incident case — red within a minute of expiry), `fallback` (no resolvable credentials; running on DuckDB's chain), `unknown` (Arc has no visibility — see below). The state is computed from the credential refresher's in-memory records at read time: **`/health` never probes S3 or Azure**, so there is nothing to flap and no per-probe storage traffic. Pre-expiry alerting belongs on `expires_at`, not on a state change — a healthy IMDS or Pod Identity session routinely waits for server-side rotation near its end and stays `ok` while doing so.
 
-Honesty notes: an Azure connection string embedding a **SAS token** reports `credentials: sas, state: unknown` — SAS tokens expire and Arc cannot see when, and calling that "ok" would recreate exactly the incident above. Azure **managed identity** likewise reports `unmanaged_chain / unknown`: those credentials are resolved once by DuckDB and never refreshed — the same class #600 fixed for S3, tracked as a probable live bug in [#605](https://github.com/Basekick-Labs/arc/issues/605). Local storage reports `local / none / ok`.
+Honesty notes: an Azure **SAS token** (configured directly or embedded in a connection string) reports `credentials: sas, state: unknown` — SAS tokens expire and Arc cannot see when, and calling that "ok" would recreate exactly the incident above. Azure **managed identity** reports full refresher state (`sdk_managed`), since [#605](https://github.com/Basekick-Labs/arc/issues/605) above brought it under Arc's credential management. Local storage reports `local / none / ok`.
 
 **Opt-in readiness gating**: `server.storage_credentials_fail_ready = true` (default **false**) makes `/ready` return 503 while any tier's credential state is `expired`, so Kubernetes recycles the pod — a restart re-resolves credentials. Only `expired` drains a node; `fallback`/`unknown`/`degraded` never do (those deployments may be healthy or credential-less by design). Intended for reader pools: Arc logs a startup warning when it is enabled on a cluster writer, whose ingest keeps working through credential expiry. Startup and shutdown readiness gating are unaffected — the knob can only remove readiness, never grant it.
 

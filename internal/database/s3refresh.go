@@ -3,18 +3,18 @@ package database
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"strings"
-	"sync/atomic"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/rs/zerolog"
 )
 
-// This file owns Arc-side S3 credential management for DuckDB (#600).
+// This file owns the S3 side of Arc's credential management for DuckDB
+// (#600/#601); the shared refresher core lives in credrefresh.go.
+//
+// Incident history, kept here on purpose:
 //
 // DuckDB's own credential resolution is a dead end for temporary credentials:
 // PROVIDER CREDENTIAL_CHAIN resolves once at CREATE SECRET time, and the 1.5.5
@@ -30,68 +30,33 @@ import (
 // across the whole pool (verified against the bundled engine: request signing
 // looks the secret up per request; a live process dead with ExpiredToken
 // recovers on the next query after re-emission, no restart).
+//
+// The first merge-gate run also taught the ExpiryWindow lesson now encoded in
+// newAWSCredProvider and the core's non-advancing machinery: a proactive
+// Retrieve before the cache considers credentials expired returns the SAME
+// session; only Invalidate() makes an early refresh real.
 
-const (
-	// s3RefreshMargin is how long before credential expiry the refresher
-	// re-resolves. It must comfortably exceed the default query timeout (300s)
-	// so credentials stay valid for the lifetime of queries started just before
-	// a rotation. Queries longer than the margin may still see one retryable
-	// ExpiredToken at rotation.
-	s3RefreshMargin = 10 * time.Minute
-	// s3RefreshMinDelay floors the delay between refreshes so pathologically
-	// short sessions cannot spin the loop.
-	s3RefreshMinDelay = time.Minute
-	// s3FirstResolveTimeout bounds the synchronous resolve during startup /
-	// ConfigureS3. STS unreachable (GovCloud endpoints, proxy misconfig) must
-	// degrade to the background retry loop, not stall startup — database.New
-	// failures are fatal in main.go.
-	s3FirstResolveTimeout = 10 * time.Second
-	// s3ResolveTimeout bounds each background resolve+emit.
-	s3ResolveTimeout = 30 * time.Second
+// s3DemotionHint is what a never-succeeded S3 refresher's demotion Warn tells
+// the operator (see credentialRefresher.planError).
+const s3DemotionHint = "no resolvable AWS credentials; running on DuckDB's credential chain — configure keys, or set AWS_EC2_METADATA_DISABLED=true to fast-fail the probe"
 
-	s3RefreshBackoffMin = 30 * time.Second
-	s3RefreshBackoffMax = 5 * time.Minute
-	// s3RefreshBackoffMaxUnproven caps retries for a refresher that has NEVER
-	// succeeded and is running behind the fallback CREDENTIAL_CHAIN secret
-	// (e.g. anonymous MinIO with no resolvable AWS credentials). Such a
-	// deployment is healthy; polling it every 5 minutes forever at Error level
-	// would produce ~288 spurious error lines/day. See planNext.
-	s3RefreshBackoffMaxUnproven = 15 * time.Minute
-	// s3RefreshErrorsBeforeDemotion: a never-succeeded refresher logs its first
-	// failures at Error (a genuinely broken IMDS/STS at boot must be visible),
-	// then demotes to Debug with one Warn marking the transition.
-	s3RefreshErrorsBeforeDemotion = 3
-	// s3RefreshFinalWarnWindow: a non-advancing resolve (the upstream source
-	// has not rotated yet — normal for IMDS and Pod Identity, which rotate
-	// server-side on their own schedule) logs Debug while there is plenty of
-	// runway, escalating to Warn inside this window before the held
-	// credentials' expiry so an operator has reaction time.
-	s3RefreshFinalWarnWindow = 5 * time.Minute
-)
-
-// errNonAdvancingExpiry marks a resolve that succeeded but returned the same
-// session we already hold — the upstream source has not rotated yet. Not a
-// failure: the held credentials remain valid; the loop polls at a flat
-// s3RefreshMinDelay until the source rotates.
-var errNonAdvancingExpiry = errors.New("credential provider returned a non-advancing expiry (upstream not rotated yet)")
-
-// awsCredentialsProvider is the seam between the refresher and the AWS SDK,
+// awsCredentialsProvider is the seam between the S3 resolver and the AWS SDK,
 // so tests can inject deterministic providers.
 type awsCredentialsProvider interface {
 	Retrieve(ctx context.Context) (aws.Credentials, error)
 }
 
 // newAWSCredProvider builds the SDK default credential chain (web identity /
-// IRSA, env, shared config, IMDS) for the refresher. Package-level so tests can
-// substitute a fake.
+// IRSA, env, shared config, IMDS, container credentials / Pod Identity) for
+// the refresher. Package-level so tests can substitute a fake.
 //
-// The returned provider is an aws.CredentialsCache. A PROACTIVE refresh (before
-// expiry) must call Invalidate() first: the cache serves cached credentials
-// until it considers them expired, so a plain Retrieve at Expires−margin
-// returns the SAME session and the refresh accomplishes nothing. (An
-// ExpiryWindow does NOT fix this — the SDK applies the window once at store
-// time, shifting the reported/stored Expires earlier, and still serves the
-// cache until that shifted instant. Verified live 2026-08-18: with
+// The returned provider is an aws.CredentialsCache. A PROACTIVE refresh
+// (before expiry) must call Invalidate() first: the cache serves cached
+// credentials until it considers them expired, so a plain Retrieve at
+// Expires−margin returns the SAME session and the refresh accomplishes
+// nothing. (An ExpiryWindow does NOT fix this — the SDK applies the window
+// once at store time, shifting the reported/stored Expires earlier, and still
+// serves the cache until that shifted instant. Verified live 2026-08-18: with
 // ExpiryWindow=11m a 1h session was reported as expires=+49m and the +39m
 // proactive Retrieve returned it unchanged, tripping the non-advancing guard
 // until the cache itself relented at +49m.)
@@ -109,355 +74,53 @@ var newAWSCredProvider = func(ctx context.Context, region string) (awsCredential
 	return cfg.Credentials, nil
 }
 
-// s3CredentialRefresher keeps one DuckDB S3 secret stocked with fresh session
-// credentials. One instance per managed secret (primary, cold); owned by the
-// DuckDB struct, which stops it on Close.
-type s3CredentialRefresher struct {
+// s3Resolver implements credentialResolver for S3 secrets: Resolve pulls from
+// the SDK chain (Invalidating its cache on proactive refreshes), Emit writes
+// the static KEY_ID/SECRET/SESSION_TOKEN secret.
+type s3Resolver struct {
 	db       *sql.DB
-	params   s3SecretParams // template; key/secret/session token filled per emission
+	params   s3SecretParams // template; credentials filled per emission
 	provider awsCredentialsProvider
-	logger   zerolog.Logger
-	cancel   context.CancelFunc
-	done     chan struct{}
-
-	// lastExpiry drives the non-advancing check: every successful refresh must
-	// advance the expiry, else the upstream source has not rotated yet.
-	lastExpiry time.Time
-
-	// Scheduling/severity state, owned by the loop goroutine (and the sync
-	// first resolve before the goroutine starts).
-	everSucceeded     bool
-	consecutiveErrors int
-
-	// lastRefresh / source describe the last successful emission; loop-owned
-	// like the fields above.
-	lastRefresh time.Time
-	source      string
-
-	// snap is the read side for /health (#603): an immutable snapshot swapped
-	// atomically by publishStatus at every outcome. status() reads ONLY this —
-	// never the loop-owned raw fields above. Publication of the refresher in
-	// the DuckDB registry (under refresherMu) is what orders the constructor's
-	// writes before any reader; the done channel plays no part in that.
-	snap atomic.Pointer[storageCredSnapshot]
 }
 
-// storageCredSnapshot is the raw material for state derivation. It stores
-// facts, not a state string: state is derived at READ time by deriveState so
-// an expiry crossing between refresher outcomes (up to ~refreshDelay apart)
-// becomes visible within one probe interval, not one refresh interval.
-type storageCredSnapshot struct {
-	everSucceeded     bool
-	canExpire         bool
-	consecutiveErrors int
-	lastExpiry        time.Time
-	lastRefresh       time.Time
-	source            string
-}
-
-// publishStatus snapshots the loop-owned fields. Called at every outcome —
-// the three constructor branches, the three plan* outcomes, and the loop's
-// non-expiring exit. Missing a site is not cosmetic: skipping the
-// constructor-success site would report "fallback" for ~refreshDelay on a
-// perfectly healthy refresher (#603 review F1).
-func (r *s3CredentialRefresher) publishStatus(canExpire bool) {
-	r.snap.Store(&storageCredSnapshot{
-		everSucceeded:     r.everSucceeded,
-		canExpire:         canExpire,
-		consecutiveErrors: r.consecutiveErrors,
-		lastExpiry:        r.lastExpiry,
-		lastRefresh:       r.lastRefresh,
-		source:            r.source,
-	})
-}
-
-// Credential states surfaced via /health (#603). Exported: they are a
-// published API contract (release notes) and internal/api compares against
-// CredStateExpired for the readiness knob — a raw string there would let a
-// respelling here silently disable the knob (#603 review M3).
-const (
-	CredStateOK       = "ok"
-	CredStateDegraded = "degraded"
-	CredStateExpired  = "expired"
-	CredStateFallback = "fallback"
-	CredStateUnknown  = "unknown"
-)
-
-// deriveState maps a snapshot to a state at time `now`. Pure so the full grid
-// — including "expired", impossible to force against real STS in a test — is
-// unit-testable.
-//
-// Precedence (#603 review F4): fallback (never succeeded — cannot be expired,
-// lastExpiry is only ever set by a successful emit) > non-expiring ok >
-// expired (EVEN with a concurrent error streak: in the field incident both
-// held at once and expired is the actionable truth) > degraded > ok.
-// Non-advancing rotation-waits stay "ok" deliberately: they occur in the tail
-// of every healthy IMDS/Pod-Identity session; pre-expiry alerting belongs to
-// the payload's expires_at, not a state flap.
-func deriveState(snap *storageCredSnapshot, now time.Time) string {
-	switch {
-	case snap == nil || !snap.everSucceeded:
-		return CredStateFallback
-	case !snap.canExpire:
-		return CredStateOK
-	case !now.Before(snap.lastExpiry):
-		return CredStateExpired
-	case snap.consecutiveErrors > 0:
-		return CredStateDegraded
-	default:
-		return CredStateOK
-	}
-}
-
-// status returns this refresher's contribution to the /health payload.
-func (r *s3CredentialRefresher) status(now time.Time) StorageTierStatus {
-	snap := r.snap.Load()
-	st := StorageTierStatus{State: deriveState(snap, now)}
-	if snap == nil {
-		return st
-	}
-	st.Source = snap.source
-	st.ConsecutiveErrors = snap.consecutiveErrors
-	if snap.canExpire && !snap.lastExpiry.IsZero() {
-		t := snap.lastExpiry.UTC()
-		st.ExpiresAt = &t
-	}
-	if !snap.lastRefresh.IsZero() {
-		t := snap.lastRefresh.UTC()
-		st.LastRefresh = &t
-	}
-	return st
-}
-
-// startS3CredentialRefresher performs one synchronous resolve+emit (bounded by
-// s3FirstResolveTimeout) and then maintains the secret in the background. It
-// never fails: an unreachable STS or an unprojected token degrades to a Warn
-// and background retries, matching the principle that a transient credential
-// race must not turn into a startup failure.
-// onFirstFailure, when non-nil, runs synchronously after a failed first
-// resolve and BEFORE the retry loop starts — so a caller-emitted fallback
-// secret is structurally guaranteed to land before the loop's first managed
-// emit can replace it (#601 review M1; without the hook that ordering rested
-// on the 30s initial backoff being longer than the fallback Exec).
-func startS3CredentialRefresher(db *sql.DB, params s3SecretParams, provider awsCredentialsProvider, logger zerolog.Logger, onFirstFailure func(error)) *s3CredentialRefresher {
-	ctx, cancel := context.WithCancel(context.Background())
-	r := &s3CredentialRefresher{
-		db:       db,
-		params:   params,
-		provider: provider,
-		logger: logger.With().
-			Str("component", "s3-cred-refresher").
-			Str("secret", params.name).Logger(),
-		cancel: cancel,
-		done:   make(chan struct{}),
-	}
-
-	fctx, fcancel := context.WithTimeout(ctx, s3FirstResolveTimeout)
-	creds, err := r.resolveAndEmit(fctx, false)
-	fcancel()
-
-	switch {
-	case err != nil:
-		r.publishStatus(true)
-		if onFirstFailure != nil {
-			onFirstFailure(err)
-		}
-		go r.loop(ctx, s3RefreshBackoffMin)
-	case !creds.CanExpire:
-		// Static credentials resolved through the chain — nothing to refresh.
-		r.everSucceeded = true
-		r.publishStatus(false)
-		r.logger.Info().Msg("resolved non-expiring S3 credentials; refresh loop not needed")
-		close(r.done)
-	default:
-		r.everSucceeded = true
-		r.publishStatus(true)
-		go r.loop(ctx, refreshDelay(creds.Expires))
-	}
-	return r
-}
-
-// stop cancels the refresher and waits for the background goroutine to finish,
-// so no Exec can race the pool's Close.
-func (r *s3CredentialRefresher) stop() {
-	r.cancel()
-	<-r.done
-}
-
-func (r *s3CredentialRefresher) loop(ctx context.Context, initialDelay time.Duration) {
-	defer close(r.done)
-	timer := time.NewTimer(initialDelay)
-	defer timer.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-timer.C:
-		}
-
-		rctx, rcancel := context.WithTimeout(ctx, s3ResolveTimeout)
-		creds, err := r.resolveAndEmit(rctx, true)
-		rcancel()
-
-		if ctx.Err() != nil {
-			// Shutdown, not a failure.
-			r.logger.Debug().Msg("credential refresh stopped")
-			return
-		}
-
-		var delay time.Duration
-		switch {
-		case err == nil && !creds.CanExpire:
-			// Publish before exiting or the stale ExpiresAt would eventually
-			// derive "expired" forever while queries work (#603 review F1).
-			r.everSucceeded = true
-			r.consecutiveErrors = 0
-			r.publishStatus(false)
-			r.logger.Info().Msg("credentials became non-expiring; refresh loop exiting")
-			return
-		case err == nil:
-			delay = r.planSuccess(creds)
-		case errors.Is(err, errNonAdvancingExpiry):
-			delay = r.planNonAdvancing()
-		default:
-			delay = r.planError(err)
-		}
-		timer.Reset(delay)
-	}
-}
-
-// planSuccess, planNonAdvancing and planError decide the wait before the next
-// attempt and do the outcome's logging. They are separated from loop so the
-// scheduling/severity policy is unit-testable without real waits.
-
-func (r *s3CredentialRefresher) planSuccess(creds aws.Credentials) time.Duration {
-	r.everSucceeded = true
-	r.consecutiveErrors = 0
-	r.publishStatus(true)
-	return refreshDelay(creds.Expires)
-}
-
-// planNonAdvancing: the upstream source has not rotated yet. The held secret
-// stays valid; poll at the flat minimum until it rotates. Debug while there is
-// runway, Warn inside the final window. NOTE: this outcome is expected in the
-// tail of every IMDS / Pod Identity session — do not "fix" it back into an
-// error, and do not add backoff (a backoff step could straddle the rotation).
-func (r *s3CredentialRefresher) planNonAdvancing() time.Duration {
-	r.consecutiveErrors = 0
-	r.publishStatus(true)
-	remaining := time.Until(r.lastExpiry)
-	// Deliberate: if the source NEVER rotates and the held credentials expire,
-	// this keeps warning once a minute indefinitely. Queries are failing in
-	// that state; unlike the never-succeeded error loop (demoted — the
-	// deployment there is healthy on the fallback), this noise is proportionate.
-	ev := r.logger.Debug()
-	if remaining < s3RefreshFinalWarnWindow {
-		ev = r.logger.Warn()
-	}
-	ev.Dur("held_credentials_expire_in", remaining.Round(time.Second)).
-		Msg("credential source has not rotated yet; polling")
-	return s3RefreshMinDelay
-}
-
-// planError: a real resolve/emit failure. A refresher that has succeeded
-// before keeps loud Error + 30s→5m backoff — its credentials WILL die at
-// expiry. A refresher that has NEVER succeeded is running behind the fallback
-// CREDENTIAL_CHAIN secret (see startRefresher): the deployment may simply have
-// no resolvable AWS credentials (anonymous MinIO), so after
-// s3RefreshErrorsBeforeDemotion failures it demotes to Debug with a longer cap
-// — one Warn marks the demotion so the state is diagnosable from logs. It
-// never gives up: an EC2 host whose IMDS was down at boot is picked up by a
-// later retry.
-func (r *s3CredentialRefresher) planError(err error) time.Duration {
-	r.consecutiveErrors++
-	r.publishStatus(true)
-	n := r.consecutiveErrors
-	backoffCap := s3RefreshBackoffMax
-	ev := r.logger.Error()
-	if !r.everSucceeded {
-		backoffCap = s3RefreshBackoffMaxUnproven
-		switch {
-		case n == s3RefreshErrorsBeforeDemotion+1:
-			ev = r.logger.Warn()
-			ev = ev.Str("hint", "no resolvable AWS credentials; running on DuckDB's credential chain — configure keys, or set AWS_EC2_METADATA_DISABLED=true to fast-fail the probe")
-		case n > s3RefreshErrorsBeforeDemotion+1:
-			ev = r.logger.Debug()
-		}
-	}
-	delay := s3RefreshBackoffMin << (n - 1)
-	if delay > backoffCap || delay <= 0 {
-		delay = backoffCap
-	}
-	ev.Err(err).Dur("retry_in", delay).
-		Msg("S3 credential refresh failed; existing secret remains in place")
-	return delay
-}
-
-// resolveAndEmit retrieves credentials from the chain and re-emits the DuckDB
-// secret with them. Credential values are never logged.
-//
-// invalidate must be true for every PROACTIVE resolve (the scheduled refresh
-// and its retries): it drops the provider's cached session so Retrieve performs
-// a real STS exchange instead of returning the credentials we already hold.
-// The initial fill passes false — there is nothing cached yet, and on a
-// provider without Invalidate (tests) the assertion is simply skipped.
-func (r *s3CredentialRefresher) resolveAndEmit(ctx context.Context, invalidate bool) (aws.Credentials, error) {
+// Resolve retrieves credentials from the chain. invalidate must be true for
+// every PROACTIVE resolve (the scheduled refresh and its retries): it drops
+// the provider's cached session so Retrieve performs a real STS exchange
+// instead of returning the credentials we already hold. The initial fill
+// passes false — there is nothing cached yet, and on a provider without
+// Invalidate (tests) the assertion is simply skipped.
+func (s *s3Resolver) Resolve(ctx context.Context, invalidate bool) (credMaterial, error) {
 	if invalidate {
-		if inv, ok := r.provider.(interface{ Invalidate() }); ok {
+		if inv, ok := s.provider.(interface{ Invalidate() }); ok {
 			inv.Invalidate()
 		}
 	}
-	creds, err := r.provider.Retrieve(ctx)
+	creds, err := s.provider.Retrieve(ctx)
 	if err != nil {
-		return aws.Credentials{}, fmt.Errorf("resolve AWS credentials: %w", err)
+		return credMaterial{}, fmt.Errorf("resolve AWS credentials: %w", err)
 	}
-	// Refuse credential material containing control bytes BEFORE it reaches SQL
-	// construction. escapeSQLString handles quotes, but a NUL truncates the C
-	// string inside DuckDB's parser, whose "unterminated quoted string" error
-	// echoes the credential prefix — which resolveAndEmit's callers log. Real
-	// AWS credentials are ASCII and never trip this; the check exists so the
-	// no-credentials-in-logs guarantee doesn't rest on that assumption. The
-	// error is a fixed string on purpose: never include the values.
-	for _, v := range []string{creds.AccessKeyID, creds.SecretAccessKey, creds.SessionToken} {
-		if strings.ContainsFunc(v, func(c rune) bool { return c < 0x20 || c == 0x7f }) {
-			return aws.Credentials{}, fmt.Errorf("resolved credential material contains control bytes; refusing to emit secret")
-		}
-	}
-	if creds.CanExpire && !r.lastExpiry.IsZero() && !creds.Expires.After(r.lastExpiry) {
-		// Same session as we already hold. For server-rotated sources (IMDS,
-		// Pod Identity) this is NORMAL near the end of a session — rotation
-		// happens on the server's schedule, not ours. The held secret stays
-		// valid; the caller polls until the source rotates.
-		return aws.Credentials{}, errNonAdvancingExpiry
-	}
+	return credMaterial{
+		canExpire:    creds.CanExpire,
+		expires:      creds.Expires,
+		source:       credSourceLabel(creds.Source),
+		secretValues: []string{creds.AccessKeyID, creds.SecretAccessKey, creds.SessionToken},
+		payload:      creds,
+	}, nil
+}
 
-	p := r.params
+// Emit writes the S3 secret with the resolved credentials.
+func (s *s3Resolver) Emit(ctx context.Context, m credMaterial) error {
+	creds := m.payload.(aws.Credentials)
+	p := s.params
 	p.accessKey = creds.AccessKeyID
 	p.secretKey = creds.SecretAccessKey
 	p.sessionToken = creds.SessionToken
 	secretSQL, err := buildS3SecretSQL(p)
 	if err != nil {
-		return aws.Credentials{}, err
+		return err
 	}
-	if _, err := r.db.ExecContext(ctx, secretSQL); err != nil {
-		return aws.Credentials{}, fmt.Errorf("emit S3 secret: %w", err)
-	}
-	r.source = credSourceLabel(creds.Source)
-	r.lastRefresh = time.Now().Truncate(time.Second)
-	if creds.CanExpire {
-		r.lastExpiry = creds.Expires
-		// Wording note: on EC2 the SDK caps reported Expires at now+1h even for
-		// ~6h IMDS sessions (ec2rolecreds), so hourly re-emits of the SAME
-		// material under an advancing cap are expected — hence "refreshed", not
-		// "new session".
-		r.logger.Info().Time("expires", creds.Expires.UTC()).
-			Str("source", credSourceLabel(creds.Source)).
-			Msg("DuckDB S3 secret refreshed")
-	} else {
-		r.logger.Info().Str("source", credSourceLabel(creds.Source)).
-			Msg("DuckDB S3 secret emitted (non-expiring credentials)")
-	}
-	return creds, nil
+	_, err = s.db.ExecContext(ctx, secretSQL)
+	return err
 }
 
 // credSourceLabel sanitizes aws.Credentials.Source for logging: the
@@ -475,15 +138,9 @@ func credSourceLabel(source string) string {
 	return source
 }
 
-// refreshDelay schedules the next refresh s3RefreshMargin before `expires`,
-// floored at s3RefreshMinDelay. With no ExpiryWindow configured (see
-// newAWSCredProvider) `expires` is the real STS session expiry, so the margin
-// is the true headroom; the proactive resolve Invalidates the cache first,
-// which is what makes firing before expiry actually produce a new session.
-func refreshDelay(expires time.Time) time.Duration {
-	d := time.Until(expires) - s3RefreshMargin
-	if d < s3RefreshMinDelay {
-		d = s3RefreshMinDelay
-	}
-	return d
+// startS3CredentialRefresher wires an S3 resolver into the shared core.
+func startS3CredentialRefresher(db *sql.DB, params s3SecretParams, provider awsCredentialsProvider, logger zerolog.Logger, onFirstFailure func(error)) *credentialRefresher {
+	return startCredentialRefresher(
+		&s3Resolver{db: db, params: params, provider: provider},
+		params.name, logger, s3DemotionHint, onFirstFailure)
 }
