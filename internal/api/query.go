@@ -751,6 +751,15 @@ var dangerousSQLPattern = regexp.MustCompile(`(?i)(?:` +
 	// bypassable via `CALL(proc)` (no whitespace before paren) — gemini
 	// round 1.
 	`|\bCALL\b` +
+	// Secrets manager: CREATE/DROP SECRET lets any authenticated user replace
+	// or delete Arc's S3 credentials (redirecting reads to attacker-controlled
+	// creds, or knocking out S3 access entirely) and probe the secret manager.
+	// Arc's own secret management (internal/database, incl. the #600 credential
+	// refresher) runs on the server side, never through user SQL. Matches the
+	// keyword pair with anything between (CREATE OR REPLACE [TEMPORARY|
+	// PERSISTENT] SECRET, DROP SECRET IF EXISTS, ...): normalised input has
+	// comments stripped, so only whitespace/keywords can sit between them.
+	`|\b(?:CREATE|DROP)\b[^;]*?\bSECRET\b` +
 	`)`)
 
 // Patterns for SQL injection prevention in queryMeasurement endpoint

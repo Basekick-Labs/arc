@@ -680,3 +680,90 @@ func TestAzureCredentialChainStartup(t *testing.T) {
 	}
 	defer db.Close()
 }
+
+// TestPostLockdownSecretCreationSucceeds is a regression test for the DuckDB
+// secrets-manager behavior change found while bumping 1.5.1 -> 1.5.5.
+//
+// In 1.5.5 (verified; 1.5.1 did not) the secrets manager stats
+// `secret_directory` on EVERY CREATE SECRET — including the TEMPORARY secrets
+// Arc exclusively creates, which are never written to disk. The default
+// directory (~/.duckdb/stored_secrets) is outside every entry
+// buildAllowedDirectories produces, so after the sandbox lockdown the runtime
+// cold-tier ConfigureS3 failed with:
+//
+//	Permission Error: Cannot access directory "…/.duckdb/stored_secrets" -
+//	file system operations are disabled by configuration
+//
+// This invalidated the (previously true) assumption that CREATE SECRET is a pure
+// catalog op unaffected by enable_external_access.
+//
+// The fix is allow_persistent_secrets=false in buildDSN: with on-disk secret
+// storage off, DuckDB skips the directory stat entirely. Removing that DSN
+// option makes this test fail.
+func TestPostLockdownSecretCreationSucceeds(t *testing.T) {
+	tmp := t.TempDir()
+	storageRoot := filepath.Join(tmp, "data")
+	if err := os.MkdirAll(storageRoot, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	db, err := New(&Config{
+		MaxConnections:   2,
+		MemoryLimit:      "256MB",
+		LocalStorageRoot: storageRoot,
+		TempDirectory:    tmp,
+		ColdS3Bucket:     "cold-bucket",
+	}, zerolog.Nop())
+	if err != nil {
+		if strings.Contains(err.Error(), "httpfs") {
+			t.Skipf("httpfs unavailable (offline?): %v", err)
+		}
+		t.Fatalf("New: %v", err)
+	}
+	defer db.Close()
+
+	// The cold tier configures its credentials at runtime, i.e. AFTER
+	// lockdownExternalAccess has already run. This is the call that regressed.
+	if err := db.ConfigureS3(&S3Config{
+		Region: "us-east-1", AccessKey: "AKIACOLD", SecretKey: "coldsecret",
+	}); err != nil {
+		t.Fatalf("post-lockdown CREATE SECRET failed: %v", err)
+	}
+
+	// With persistent secrets disabled, DuckDB must not create or touch any
+	// on-disk secret store. Nothing should appear under TempDirectory.
+	entries, err := os.ReadDir(tmp)
+	if err != nil {
+		t.Fatalf("read temp dir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), "secret") {
+			t.Errorf("no secret storage may be created on disk, found %q", e.Name())
+		}
+	}
+}
+
+// TestBuildDSNDisablesPersistentSecrets pins the connection-time option that
+// makes the above work. It must be set via the DSN rather than a later SET:
+// DuckDB rejects secrets-manager setting changes once the manager has been used
+// ("Changing Secret Manager settings after the secret manager is used is not
+// allowed!"), so a runtime SET would be silently order-dependent.
+func TestBuildDSNDisablesPersistentSecrets(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  *Config
+	}{
+		{"without arcx", &Config{}},
+		{"with arcx", &Config{ArcxExtensionPath: "/opt/arcx.duckdb_extension"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dsn := buildDSN(tc.cfg)
+			if !strings.Contains(dsn, "allow_persistent_secrets=false") {
+				t.Errorf("buildDSN(%+v) = %q, must disable persistent secrets", tc.cfg, dsn)
+			}
+		})
+	}
+	// The arcx flag must survive alongside it.
+	if dsn := buildDSN(&Config{ArcxExtensionPath: "/opt/arcx.duckdb_extension"}); !strings.Contains(dsn, "allow_unsigned_extensions=true") {
+		t.Errorf("buildDSN with arcx = %q, lost allow_unsigned_extensions", dsn)
+	}
+}

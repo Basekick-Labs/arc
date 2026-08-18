@@ -6,16 +6,20 @@ import (
 	"os"
 	"testing"
 
+	"strings"
+
 	"github.com/rs/zerolog"
 )
 
-// TestBuildDSN_ArcxDisabled confirms that when no arcx path is configured
-// the DSN stays empty and DuckDB opens with default (signed-only) settings.
+// TestBuildDSN_ArcxDisabled confirms that when no arcx path is configured the
+// DSN does NOT enable unsigned extensions (DuckDB stays signed-only). The DSN is
+// no longer empty in this case: allow_persistent_secrets=false is set
+// unconditionally — see buildDSN.
 func TestBuildDSN_ArcxDisabled(t *testing.T) {
 	t.Parallel()
 	cfg := &Config{}
-	if dsn := buildDSN(cfg); dsn != "" {
-		t.Errorf("buildDSN with no arcx path = %q, want empty", dsn)
+	if dsn := buildDSN(cfg); strings.Contains(dsn, "allow_unsigned_extensions") {
+		t.Errorf("buildDSN with no arcx path = %q, must not allow unsigned extensions", dsn)
 	}
 }
 
@@ -25,9 +29,11 @@ func TestBuildDSN_ArcxDisabled(t *testing.T) {
 func TestBuildDSN_ArcxEnabled(t *testing.T) {
 	t.Parallel()
 	cfg := &Config{ArcxExtensionPath: "/opt/arcx/arcx.duckdb_extension"}
-	want := "?allow_unsigned_extensions=true"
-	if dsn := buildDSN(cfg); dsn != want {
-		t.Errorf("buildDSN with arcx path = %q, want %q", dsn, want)
+	// Assert on the flag rather than the whole DSN: buildDSN also sets
+	// allow_persistent_secrets=false unconditionally, and the option order is an
+	// implementation detail.
+	if dsn := buildDSN(cfg); !strings.Contains(dsn, "allow_unsigned_extensions=true") {
+		t.Errorf("buildDSN with arcx path = %q, want allow_unsigned_extensions=true", dsn)
 	}
 }
 

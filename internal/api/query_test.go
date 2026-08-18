@@ -2234,3 +2234,34 @@ func TestTableRefLookaheadStillSkipsFunctionsAndQualifiers(t *testing.T) {
 		})
 	}
 }
+
+// TestValidateSQLRequest_BlocksSecretStatements: CREATE/DROP SECRET in user SQL
+// would let any authenticated user replace or delete Arc's S3 credentials
+// (found live while testing #600: CREATE OR REPLACE SECRET was accepted through
+// /api/v1/query and silently swapped the S3 identity for every query).
+func TestValidateSQLRequest_BlocksSecretStatements(t *testing.T) {
+	blocked := []string{
+		"CREATE SECRET s (TYPE S3, KEY_ID 'k', SECRET 's')",
+		"CREATE OR REPLACE SECRET arc_s3_primary (TYPE S3, KEY_ID 'k', SECRET 's')",
+		"create or replace temporary secret s (type s3)",
+		"CREATE /* sneaky */ SECRET s (TYPE S3)",
+		"DROP SECRET arc_s3_primary",
+		"drop secret if exists arc_s3_cold",
+	}
+	for _, q := range blocked {
+		if err := ValidateSQLRequest(q); err == nil {
+			t.Errorf("must block: %s", q)
+		}
+	}
+	// The word "secret" in ordinary query positions must not false-positive.
+	allowed := []string{
+		"SELECT secret FROM cpu",
+		"SELECT * FROM cpu WHERE name = 'CREATE SECRET'",
+		"SELECT count(*) FROM secrets_audit",
+	}
+	for _, q := range allowed {
+		if err := ValidateSQLRequest(q); err != nil {
+			t.Errorf("must allow %q, got: %v", q, err)
+		}
+	}
+}
