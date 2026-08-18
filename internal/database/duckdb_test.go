@@ -1,8 +1,18 @@
 package database
 
 import (
+	"context"
+	"database/sql"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	_ "github.com/duckdb/duckdb-go/v2"
+	"github.com/rs/zerolog"
 )
 
 func TestEscapeSQLString(t *testing.T) {
@@ -420,4 +430,243 @@ func mustContain(t *testing.T, haystack, needle string) {
 	if !strings.Contains(haystack, needle) {
 		t.Errorf("expected SQL to contain %q, got:\n%s", needle, haystack)
 	}
+}
+
+// TestUseWebIdentityChain covers the IRSA detection gate (#600). The rule is
+// deliberately narrow: static keys always win, and BOTH web-identity env vars
+// must be present. Everything else keeps the pre-existing behavior.
+func TestUseWebIdentityChain(t *testing.T) {
+	tests := []struct {
+		name                       string
+		accessKey, secret          string
+		roleARN, tokenFile         string
+		envAccessKey, envSecretKey string
+		want                       bool
+	}{
+		{"IRSA: no keys + both env vars", "", "", "arn:aws:iam::1:role/r", "/var/run/secrets/token", "", "", true},
+		{"static keys win even under IRSA", "AKIA", "sk", "arn:aws:iam::1:role/r", "/var/run/secrets/token", "", "", false},
+		{"no keys, only role ARN", "", "", "arn:aws:iam::1:role/r", "", "", "", false},
+		{"no keys, only token file", "", "", "", "/var/run/secrets/token", "", "", false},
+		{"no keys, no env (EC2 instance role / env creds)", "", "", "", "", "", "", false},
+		{"half-configured key + env vars", "AKIA", "", "arn:aws:iam::1:role/r", "/var/run/secrets/token", "", "", false},
+		{"half-configured secret + env vars", "", "sk", "arn:aws:iam::1:role/r", "/var/run/secrets/token", "", "", false},
+		// Credential-source asymmetry guard: internal/storage/s3.go falls back to
+		// AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY when the config keys are empty,
+		// so ingest would use those env keys. web_identity is a SINGLE chain and
+		// would NOT, leaving ingest and queries authenticating as different
+		// identities against the same bucket. Defer to the plain chain instead.
+		{"env static keys present (both) beat IRSA env", "", "", "arn:aws:iam::1:role/r", "/var/run/secrets/token", "AKIAENV", "envsecret", false},
+		{"env access key alone still defers", "", "", "arn:aws:iam::1:role/r", "/var/run/secrets/token", "AKIAENV", "", false},
+		{"env secret key alone still defers", "", "", "arn:aws:iam::1:role/r", "/var/run/secrets/token", "", "envsecret", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(envAWSRoleARN, tt.roleARN)
+			t.Setenv(envAWSWebIdentityTokenFile, tt.tokenFile)
+			t.Setenv(envAWSAccessKeyID, tt.envAccessKey)
+			t.Setenv(envAWSSecretAccessKey, tt.envSecretKey)
+			if got := useWebIdentityChain(tt.accessKey, tt.secret); got != tt.want {
+				t.Errorf("useWebIdentityChain(%q,%q) with role=%q file=%q = %v, want %v",
+					tt.accessKey, tt.secret, tt.roleARN, tt.tokenFile, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBuildS3SecretSQL_SessionToken pins the static-credentials emission the
+// refresher (s3refresh.go) depends on, and — as important — that NON-refresher
+// shapes are unchanged: no CHAIN/REFRESH/VALIDATION anywhere (the DuckDB-side
+// web_identity mechanism was removed after live testing proved it never
+// refreshes for Arc's globbed reads, #600).
+func TestBuildS3SecretSQL_SessionToken(t *testing.T) {
+	t.Run("keys + session token emit SESSION_TOKEN", func(t *testing.T) {
+		got, err := buildS3SecretSQL(s3SecretParams{
+			name: arcS3PrimarySecretName, accessKey: "ASIAKEY", secretKey: "sk",
+			sessionToken: "tok'en//with=quirks", region: "us-gov-west-1",
+			scope: "s3://bucket/", useSSL: true,
+		})
+		if err != nil {
+			t.Fatalf("buildS3SecretSQL: %v", err)
+		}
+		mustContain(t, got, "KEY_ID 'ASIAKEY'")
+		// single quote doubled by escapeSQLString
+		mustContain(t, got, "SESSION_TOKEN 'tok''en//with=quirks'")
+	})
+
+	t.Run("session token without keys is rejected", func(t *testing.T) {
+		if _, err := buildS3SecretSQL(s3SecretParams{
+			name: "x", sessionToken: "tok", region: "us-east-1",
+		}); err == nil {
+			t.Fatal("want error for session token without static keys")
+		}
+	})
+
+	t.Run("no shape ever emits DuckDB-side refresh clauses", func(t *testing.T) {
+		for _, p := range []s3SecretParams{
+			{name: "a", accessKey: "k", secretKey: "s", sessionToken: "t", region: "r", useSSL: true},
+			{name: "b", region: "r", useSSL: true}, // plain chain
+		} {
+			got, err := buildS3SecretSQL(p)
+			if err != nil {
+				t.Fatalf("buildS3SecretSQL(%q): %v", p.name, err)
+			}
+			for _, forbidden := range []string{"CHAIN '", "REFRESH", "VALIDATION"} {
+				if strings.Contains(got, forbidden) {
+					t.Errorf("secret %q must not contain %q, got:\n%s", p.name, forbidden, got)
+				}
+			}
+		}
+	})
+}
+
+// TestSessionTokenSecretExecutesAndRedacts runs the refresher-shaped secret
+// against real DuckDB: the statement must be accepted (incl. quirky token
+// bytes), and SESSION_TOKEN must be redacted in duckdb_secrets() — the secret
+// manager is readable by any authenticated query user, so a visible token
+// would hand out live AWS credentials.
+func TestSessionTokenSecretExecutesAndRedacts(t *testing.T) {
+	db, err := sql.Open("duckdb", "?allow_persistent_secrets=false")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("INSTALL httpfs"); err != nil {
+		t.Skipf("httpfs unavailable (offline?): %v", err)
+	}
+	if _, err := db.Exec("LOAD httpfs"); err != nil {
+		t.Skipf("httpfs unavailable (offline?): %v", err)
+	}
+
+	const token = "FwoGZXIvYXdzEBa//////////wEaDD'quote+slash=="
+	stmt, err := buildS3SecretSQL(s3SecretParams{
+		name: arcS3PrimarySecretName, accessKey: "ASIATEST", secretKey: "secretval",
+		sessionToken: token, region: "us-east-1", scope: "s3://b/", useSSL: true,
+	})
+	if err != nil {
+		t.Fatalf("buildS3SecretSQL: %v", err)
+	}
+	if _, err := db.Exec(stmt); err != nil {
+		t.Fatalf("DuckDB rejected refresher-shaped secret: %v\nSQL:\n%s", err, stmt)
+	}
+
+	var secretString string
+	if err := db.QueryRow(
+		"SELECT secret_string FROM duckdb_secrets() WHERE name = ?", arcS3PrimarySecretName,
+	).Scan(&secretString); err != nil {
+		t.Fatalf("secret not registered: %v", err)
+	}
+	if strings.Contains(secretString, "quote+slash") || strings.Contains(secretString, "secretval") {
+		t.Fatalf("credential material visible in duckdb_secrets(): %s", secretString)
+	}
+	mustContain(t, secretString, "session_token=redacted")
+}
+
+// TestS3CredentialMode pins the log label to the same branch structure
+// buildS3SecretSQL uses, so the two cannot drift.
+func TestS3CredentialMode(t *testing.T) {
+	tests := []struct {
+		name                       string
+		accessKey, secretKey       string
+		roleARN, tokenFile         string
+		envAccessKey, envSecretKey string
+		want                       string
+	}{
+		{"static keys", "AKIA", "sk", "", "", "", "", "static_keys"},
+		{"static keys under IRSA env", "AKIA", "sk", "arn:aws:iam::1:role/r", "/tok", "", "", "static_keys"},
+		{"IRSA", "", "", "arn:aws:iam::1:role/r", "/tok", "", "", "web_identity"},
+		{"plain chain (instance role)", "", "", "", "", "", "", "credential_chain"},
+		{"env keys beat IRSA env", "", "", "arn:aws:iam::1:role/r", "/tok", "AKIAENV", "envsec", "credential_chain"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(envAWSRoleARN, tt.roleARN)
+			t.Setenv(envAWSWebIdentityTokenFile, tt.tokenFile)
+			t.Setenv(envAWSAccessKeyID, tt.envAccessKey)
+			t.Setenv(envAWSSecretAccessKey, tt.envSecretKey)
+			if got := s3CredentialMode(tt.accessKey, tt.secretKey); got != tt.want {
+				t.Errorf("s3CredentialMode(%q,%q) = %q, want %q", tt.accessKey, tt.secretKey, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestConfigureS3ColdTierStartsRefresher pins the cold-tier wiring for #600:
+// under IRSA (no static keys + web-identity env), ConfigureS3 must route to the
+// credential refresher, whose synchronous first resolve emits a static-key
+// secret with a session token BEFORE ConfigureS3 returns. Without this test,
+// deleting the refresher branch from ConfigureS3 compiles and passes the suite,
+// silently leaving tiered-storage IRSA deployments on the expiring path.
+func TestConfigureS3ColdTierStartsRefresher(t *testing.T) {
+	t.Setenv(envAWSRoleARN, "arn:aws:iam::123456789012:role/arc-irsa")
+	t.Setenv(envAWSWebIdentityTokenFile, "/var/run/secrets/eks.amazonaws.com/serviceaccount/token")
+	t.Setenv(envAWSAccessKeyID, "")
+	t.Setenv(envAWSSecretAccessKey, "")
+
+	// Inject a deterministic provider; restore the SDK one afterwards.
+	orig := newAWSCredProvider
+	fake := &fakeCredProvider{creds: aws.Credentials{
+		AccessKeyID: "ASIAFAKECOLD", SecretAccessKey: "fakesecret",
+		SessionToken: "faketoken", CanExpire: true,
+		Expires: time.Now().Add(time.Hour),
+	}}
+	newAWSCredProvider = func(ctx context.Context, region string) (awsCredentialsProvider, error) {
+		return fake, nil
+	}
+	t.Cleanup(func() { newAWSCredProvider = orig })
+
+	tmp := t.TempDir()
+	storageRoot := filepath.Join(tmp, "data")
+	if err := os.MkdirAll(storageRoot, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	db, err := New(&Config{
+		MaxConnections:   2,
+		MemoryLimit:      "256MB",
+		LocalStorageRoot: storageRoot,
+		TempDirectory:    tmp,
+		ColdS3Bucket:     "cold-bucket",
+	}, zerolog.Nop())
+	if err != nil {
+		if strings.Contains(err.Error(), "httpfs") {
+			t.Skipf("httpfs unavailable (offline?): %v", err)
+		}
+		t.Fatalf("New: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.ConfigureS3(&S3Config{Region: "us-gov-west-1", Bucket: "cold-bucket"}); err != nil {
+		t.Fatalf("ConfigureS3: %v", err)
+	}
+
+	// The refresher's synchronous first resolve must have emitted the secret
+	// already — no waiting, no goroutine race.
+	var secretString string
+	if err := db.DB().QueryRow(
+		"SELECT secret_string FROM duckdb_secrets() WHERE name = ?", arcS3ColdSecretName,
+	).Scan(&secretString); err != nil {
+		t.Fatalf("cold secret not registered after ConfigureS3: %v", err)
+	}
+	mustContain(t, secretString, "key_id=ASIAFAKECOLD")
+	mustContain(t, secretString, "session_token=redacted")
+	if fake.calls.Load() == 0 {
+		t.Fatal("injected provider never called — refresher not wired")
+	}
+	if db.s3Refreshers[arcS3ColdSecretName] == nil {
+		t.Fatal("refresher not registered on the DuckDB struct — Close cannot stop it")
+	}
+}
+
+// fakeCredProvider is a deterministic awsCredentialsProvider for wiring tests.
+type fakeCredProvider struct {
+	creds aws.Credentials
+	calls atomic.Int64
+	err   error
+}
+
+func (f *fakeCredProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
+	f.calls.Add(1)
+	if f.err != nil {
+		return aws.Credentials{}, f.err
+	}
+	return f.creds, nil
 }

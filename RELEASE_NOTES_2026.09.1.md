@@ -441,6 +441,35 @@ Reachable only when RBAC is enabled (the multi-tenant authorization boundary); n
 
 ## Bug fixes
 
+### S3 queries no longer fail with `ExpiredToken` an hour after startup on EKS/IRSA ([#600](https://github.com/Basekick-Labs/arc/issues/600))
+
+On EKS with IRSA — where pods authenticate to S3 through a projected service-account token instead of static keys — Arc's query path stopped being able to read S3 roughly **one hour after each process start**. Every S3-backed query failed with `ExpiredToken`, while ingest and `/health` kept working normally, so Kubernetes probes never noticed and only a pod restart recovered it.
+
+The root cause is that DuckDB resolves temporary STS credentials **once**, when the S3 secret is created, and has no working refresh path for Arc's workload. We verified this against live AWS STS: even DuckDB 1.5.5's `web_identity` auto-refresh never fires for globbed reads (Arc's only read shape), and its reactive re-authentication arms on HTTP 401/403 while an expired STS token surfaces as HTTP 400.
+
+**The fix: Arc now manages these credentials itself.** When IRSA is detected, a background refresher resolves credentials through the AWS SDK — the same code path ingest uses, which is why writes never suffered from this bug — and hands DuckDB session credentials, re-issued about ten minutes before each expiry. Verified end-to-end against real AWS STS with hour-long sessions.
+
+Detection is deliberately narrow: the refresher engages only when **no static S3 keys are configured** — in `arc.toml` *or* via `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` — *and* both `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE` are present (the pair the EKS IRSA webhook injects). Static-key, MinIO, and local-storage deployments behave exactly as before. Both the hot and cold S3 tiers are covered, and a pod that starts before its service-account token is projected degrades to a logged retry loop instead of failing startup.
+
+Arc logs which credential mode the query path selected at startup (`credential_mode=web_identity` / `credential_chain` / `static_keys`), and each refresh logs the new expiry.
+
+**Not covered yet, stated plainly:**
+
+- **EC2 instance-role credentials** (~6h IMDS sessions) still go through DuckDB's own chain and will expire the same way; Arc now logs a startup warning in that configuration. Extending the refresher to any expiring credential source is tracked in [#601](https://github.com/Basekick-Labs/arc/issues/601).
+- **EKS Pod Identity** (the newer alternative to IRSA, which injects `AWS_CONTAINER_CREDENTIALS_FULL_URI` instead) is not detected. Use IRSA for S3-backed query workloads.
+
+**Related hardening:** `CREATE SECRET` / `DROP SECRET` statements are now rejected in user SQL. While testing this fix we found the query API accepted them, which would let any authenticated user replace or delete Arc's S3 credentials.
+
+### DuckDB upgraded to 1.5.5
+
+Arc's bundled DuckDB moves from 1.5.1 to 1.5.5, picking up four upstream releases of fixes. The most relevant to Arc: hardening across many Parquet decompression and deserialization paths, a fix for an out-of-bounds read in dictionary-string decompression, and a deadlock fix in DuckDB's `TemporaryMemoryManager` (reachable by queries that spill). Since Arc's entire storage layer is Parquet and it serves queries over it, the Parquet hardening matters even for deployments that never see the deadlock.
+
+The upgrade also required a fix on Arc's side. As of 1.5.5 DuckDB's secrets manager stats its `secret_directory` on **every** `CREATE SECRET`, including the temporary, in-memory secrets Arc exclusively creates. That directory defaults to `~/.duckdb/stored_secrets`, which sits outside Arc's DuckDB sandbox allowlist — so on 1.5.5 any secret created *after* the sandbox locked down would have failed with `Permission Error: Cannot access directory`. In practice that is the **tiered-storage cold-tier path** (S3 and Azure alike), which configures its credentials at runtime by design.
+
+Arc now opens DuckDB with `allow_persistent_secrets=false`. Arc has never used DuckDB's on-disk secret storage — credentials live in memory for the life of the process — so nothing is lost, DuckDB skips the directory check, and the guarantee that Arc never writes an unencrypted credential to disk is now enforced by DuckDB itself rather than by convention.
+
+No configuration change is required.
+
 ## `/api/v1/query/msgpack` is now stable
 
 The MessagePack query endpoint graduates out of experimental. Its response shape and type vocabulary are a published contract — clients can bind to them.

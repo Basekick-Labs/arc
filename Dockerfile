@@ -35,6 +35,18 @@ RUN if [ "$FIPS" = "1" ]; then \
             -o arc ./cmd/arc; \
     fi
 
+# Pre-seed the DuckDB extensions Arc loads at startup (httpfs for S3/HTTP reads,
+# aws for the credential-chain providers, incl. CHAIN 'web_identity' for IRSA).
+# Without this the first run performs an INSTALL that fetches from
+# extensions.duckdb.org: an air-gapped or egress-restricted deployment fails at
+# startup, and everyone else pays a network round-trip on first boot. Seeding
+# here makes Arc's startup INSTALL/LOAD resolve against the local cache.
+#
+# Built from the same go.mod as the server so the cached extensions stay in step
+# with the bundled DuckDB version — extension binaries are version- and
+# platform-specific.
+RUN go run -tags=duckdb_arrow ./scripts/duckdbseed
+
 # Production stage
 FROM debian:bookworm-slim
 
@@ -58,6 +70,11 @@ COPY --from=builder --chown=arc:arc /build/arc .
 
 # Copy default config
 COPY --chown=arc:arc arc.toml .
+
+# Copy the pre-seeded DuckDB extension cache from the builder. Arc's startup
+# INSTALL/LOAD then resolves locally instead of fetching from
+# extensions.duckdb.org, so S3-backed and IRSA deployments start with no egress.
+COPY --from=builder --chown=arc:arc /root/.duckdb /home/arc/.duckdb
 
 # Create VERSION file
 RUN echo "${VERSION}" > VERSION && chown arc:arc VERSION

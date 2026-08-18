@@ -45,12 +45,20 @@ backend = "local"           # "local" or "s3"
 local_path = "./data/arc"
 
 # S3/MinIO (when backend = "s3")
+#
+# NOTE: the values below are the MinIO/local-dev defaults. For real AWS S3 you
+# MUST set s3_use_ssl = true and s3_path_style = false, or every read fails with
+# "403 Forbidden / AccessDenied" (plaintext HTTP + path-style addressing against
+# s3.amazonaws.com). Arc's built-in defaults are already the AWS-correct ones —
+# it is this sample file that opts into MinIO.
 s3_bucket = "arc-test"
 s3_region = "us-east-2"
 s3_endpoint = ""            # Empty for AWS, set for MinIO
-s3_use_ssl = false          # Set true for production
-s3_path_style = true        # True for MinIO, false for AWS
+s3_use_ssl = false          # MinIO/dev. AWS S3: true
+s3_path_style = true        # MinIO/dev. AWS S3: false
 # Credentials via env: ARC_STORAGE_S3_ACCESS_KEY, ARC_STORAGE_S3_SECRET_KEY
+# On EKS with IRSA, leave both unset: Arc detects AWS_ROLE_ARN +
+# AWS_WEB_IDENTITY_TOKEN_FILE and authenticates via the pod's IAM role.
 
 # -----------------------------------------------------------------------------
 # Ingestion
@@ -159,14 +167,18 @@ migration_history_retention_days = 90
 enabled = false
 backend = "s3"              # "s3" or "azure"
 
-# S3/MinIO
+# S3/MinIO — as with the primary [storage] block above, these are MinIO/local-dev
+# values. For real AWS S3: clear s3_endpoint, set s3_use_ssl = true and
+# s3_path_style = false, and REMOVE the static keys below — leaving them set
+# suppresses IRSA/instance-role detection for the cold tier, since configured
+# keys always take precedence over the AWS credential chain.
 s3_bucket = "arc-archive"
 s3_region = "us-east-1"
-s3_endpoint = "localhost:9000"
-s3_access_key = "minioadmin"
-s3_secret_key = "minioadmin"
-s3_use_ssl = false
-s3_path_style = true
+s3_endpoint = "localhost:9000"   # MinIO/dev. AWS S3: leave empty
+s3_access_key = "minioadmin"     # MinIO/dev. AWS S3 with IRSA: remove
+s3_secret_key = "minioadmin"     # MinIO/dev. AWS S3 with IRSA: remove
+s3_use_ssl = false               # MinIO/dev. AWS S3: true
+s3_path_style = true             # MinIO/dev. AWS S3: false
 s3_storage_class = "GLACIER"
 
 # Azure (when backend = "azure")
