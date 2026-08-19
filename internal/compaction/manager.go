@@ -67,6 +67,20 @@ type Manager struct {
 	// Used to invalidate DuckDB and query caches after files are deleted.
 	onCompactionComplete func()
 
+	// syncEligibility, when set, restricts compaction inputs to files the
+	// edge sync ledger reports delivered (issue #610): compacting an
+	// undelivered raw would destroy the only copy of rows the hub never
+	// received. nil means unrestricted (edge sync absent or the operator
+	// opted out via edge_sync.spoke.defer_compaction_until_synced=false).
+	// Guarded by mu, like onCompactionComplete.
+	syncEligibility func(ctx context.Context, paths []string) (map[string]bool, error)
+
+	// onCompactedOutput, when set, receives the storage key of every
+	// compacted output the parent learns about — from a subprocess result
+	// AND from manifest crash-recovery — so the edge sync ledger can mark
+	// it as already-delivered content that must never sync (issue #610).
+	onCompactedOutput func(storageKey string)
+
 	logger zerolog.Logger
 	mu     sync.Mutex
 }
@@ -188,6 +202,83 @@ func (m *Manager) SetOnCompactionComplete(fn func()) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.onCompactionComplete = fn
+}
+
+// SetSyncEligibility installs the edge sync delivery gate (issue #610).
+// A fail-closed placeholder may be installed at construction time and
+// swapped for the ledger-backed hook once the spoke ledger exists — a
+// scheduler tick during slow startup must never run unfiltered.
+func (m *Manager) SetSyncEligibility(fn func(ctx context.Context, paths []string) (map[string]bool, error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.syncEligibility = fn
+}
+
+// SetOnCompactedOutput installs the compacted-output observer (issue #610),
+// covering both delivery paths: subprocess results (CompactPartition) and
+// manifest crash-recovery (notifyCompactedOutput is handed to
+// RecoverOrphanedManifests per call, copied under mu there).
+func (m *Manager) SetOnCompactedOutput(fn func(storageKey string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onCompactedOutput = fn
+}
+
+// filterSyncEligibility drops candidate files the edge sync ledger has not
+// confirmed delivered, re-applying the TIER's MinFiles threshold to what
+// remains. Returns false when the partition should be deferred this cycle.
+// A hook error defers the whole candidate: the fail-safe direction is to
+// compact nothing rather than risk consuming undelivered rows.
+func (m *Manager) filterSyncEligibility(ctx context.Context, candidate Candidate, tier Tier) (Candidate, bool) {
+	m.mu.Lock()
+	fn := m.syncEligibility
+	m.mu.Unlock()
+	if fn == nil {
+		return candidate, true
+	}
+
+	eligible, err := fn(ctx, candidate.Files)
+	if err != nil {
+		m.logger.Warn().Err(err).
+			Str("partition", candidate.PartitionPath).
+			Msg("Sync eligibility lookup failed; deferring this partition (fail-safe)")
+		return candidate, false
+	}
+
+	kept := make([]string, 0, len(candidate.Files))
+	for _, f := range candidate.Files {
+		if eligible[f] {
+			kept = append(kept, f)
+		}
+	}
+	deferred := len(candidate.Files) - len(kept)
+	if deferred > 0 {
+		m.logger.Info().
+			Str("partition", candidate.PartitionPath).
+			Str("tier", candidate.Tier).
+			Int("deferred", deferred).
+			Int("eligible", len(kept)).
+			Msg("Edge sync deferral: files await delivery before compaction")
+	}
+	if len(kept) < tier.GetMinFiles() {
+		return candidate, false
+	}
+	candidate.Files = kept
+	candidate.FileCount = len(kept)
+	return candidate, true
+}
+
+// notifyCompactedOutput invokes the compacted-output observer, if any.
+func (m *Manager) notifyCompactedOutput(storageKey string) {
+	if storageKey == "" {
+		return
+	}
+	m.mu.Lock()
+	fn := m.onCompactedOutput
+	m.mu.Unlock()
+	if fn != nil {
+		fn(storageKey)
+	}
 }
 
 // FindCandidates finds partitions that are candidates for compaction across all databases
@@ -396,6 +487,12 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 	// and should not block stat reads or other concurrent compaction goroutines.
 	// The subprocess deleted old parquet files from storage, but DuckDB's
 	// cache_httpfs and parquet_metadata_cache still reference them.
+	// Edge sync compacted-output observer (issue #610): record the output
+	// in the sync ledger before anything can discover it as a new file.
+	if jobSucceeded && result != nil {
+		m.notifyCompactedOutput(result.OutputFile)
+	}
+
 	if shouldInvalidateCache && onComplete != nil {
 		onComplete()
 	}
@@ -597,7 +694,7 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 	// Run manifest recovery before starting new compactions
 	// This ensures interrupted compactions from previous cycles are completed
 	if m.ManifestManager != nil {
-		recovered, err := m.ManifestManager.RecoverOrphanedManifests(ctx)
+		recovered, err := m.ManifestManager.RecoverOrphanedManifests(ctx, m.notifyCompactedOutput)
 		if err != nil {
 			m.logger.Warn().Err(err).Msg("Manifest recovery encountered errors")
 		}
@@ -711,6 +808,16 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 						m.logger.Debug().
 							Str("partition", candidate.PartitionPath).
 							Msg("Skipping candidate: all files are tracked by manifests")
+						continue
+					}
+
+					// Edge sync delivery gate (issue #610): drop files the
+					// sync ledger has not confirmed delivered and re-check
+					// the tier's MinFiles on what remains. Deferring here is
+					// the design, not a failure — the partition compacts
+					// once its files have synced.
+					filteredCandidate, shouldProcess = m.filterSyncEligibility(ctx, filteredCandidate, tier)
+					if !shouldProcess {
 						continue
 					}
 

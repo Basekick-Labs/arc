@@ -1242,6 +1242,39 @@ func main() {
 			Logger:          logger.Get("compaction"),
 		})
 
+		// Issue #610, the disabled-sync leg: compaction is enabled but edge
+		// sync is entirely off, so the spoke block that manages the defer
+		// epoch never runs — yet compaction is about to run UNGATED. A stored
+		// epoch from an earlier gated period must be invalidated here, or
+		// re-enabling sync later would classify this period's compacted
+		// outputs as delivered when their inputs may never have synced.
+		if !cfg.EdgeSync.Spoke.Enabled && !cfg.EdgeSync.Spoke.Bundle.Enabled {
+			if metaDB, ownsMetaDB, err := sharedSQLiteHandle(authManager, cfg.Auth.DBPath); err == nil {
+				if _, err := metaDB.Exec(`DELETE FROM sync_meta WHERE key = 'compaction_defer_epoch'`); err != nil &&
+					!strings.Contains(err.Error(), "no such table") {
+					log.Warn().Err(err).Msg("Could not clear the compaction-defer epoch (edge sync disabled); " +
+						"re-enabling edge sync later may mis-classify this period's compacted outputs")
+				}
+				if ownsMetaDB {
+					metaDB.Close()
+				}
+			}
+		}
+
+		// Issue #610: when this spoke defers compaction until delivery, a
+		// fail-closed placeholder gate goes in BEFORE the schedulers start.
+		// The real ledger-backed gate is wired in the edge sync spoke block,
+		// which runs after the schedulers — a cron tick landing in that
+		// window (slow startup: WAL recovery can take minutes) must defer
+		// everything rather than run one unfiltered cycle that consumes
+		// undelivered raws.
+		if (cfg.EdgeSync.Spoke.Enabled || cfg.EdgeSync.Spoke.Bundle.Enabled) &&
+			cfg.EdgeSync.Spoke.DeferCompactionUntilSynced {
+			compactionManager.SetSyncEligibility(func(ctx context.Context, paths []string) (map[string]bool, error) {
+				return nil, fmt.Errorf("edge sync ledger not ready yet; deferring compaction (startup)")
+			})
+		}
+
 		// Cleanup orphaned temp directories from previous runs (e.g., pod crashes).
 		// CleanupOrphanedTempDirs skips the Phase 4 reserved ".completion"
 		// subdirectory so a crash that left pending completion manifests on
@@ -2394,6 +2427,51 @@ func main() {
 			log.Fatal().Err(err).Msg("Failed to create the edge sync ledger; refusing to start")
 		}
 
+		// Issue #610: swap the fail-closed startup placeholder for the real
+		// ledger-backed gate, and install the compacted-output observer.
+		// compactionManager may be nil (independently enabled — CLAUDE.md
+		// nil rule); the placeholder was only installed when it wasn't.
+		var compactionDeferEpoch time.Time
+		if compactionManager != nil && !cfg.EdgeSync.Spoke.DeferCompactionUntilSynced {
+			// The epoch means "the gate has been continuously active since
+			// this instant". Compaction is about to run UNGATED, so a stored
+			// epoch is now a lie — outputs produced from here on may consume
+			// undelivered raws, and re-activating the gate later must treat
+			// them as legacy (sync once), not as delivered. Clearing it makes
+			// the next activation stamp a fresh epoch.
+			clearCtx, clearCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := spokeLedger.ClearMeta(clearCtx, edgesync.MetaCompactionDeferEpoch); err != nil {
+				log.Warn().Err(err).Msg("Could not clear the compaction-defer epoch; " +
+					"re-enabling defer_compaction_until_synced later may mis-classify this period's compacted outputs")
+			}
+			clearCancel()
+		}
+		if compactionManager != nil && cfg.EdgeSync.Spoke.DeferCompactionUntilSynced {
+			epochCtx, epochCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			epochStr, err := spokeLedger.EnsureMetaOnce(epochCtx,
+				edgesync.MetaCompactionDeferEpoch, time.Now().UTC().Format(time.RFC3339Nano))
+			epochCancel()
+			if err != nil {
+				// The fail-closed placeholder stays in place: compaction
+				// defers everything rather than risking undelivered rows.
+				log.Error().Err(err).Msg("Could not establish the compaction-defer epoch; " +
+					"compaction will defer ALL files until restart")
+			} else {
+				compactionDeferEpoch, err = time.Parse(time.RFC3339Nano, epochStr)
+				if err != nil {
+					log.Error().Err(err).Str("stored", epochStr).
+						Msg("Stored compaction-defer epoch is unreadable; compaction will defer ALL files until restart")
+				} else {
+					compactionManager.SetSyncEligibility(edgesync.NewCompactionEligibility(
+						spokeLedger, cfg.EdgeSync.Spoke.HubID, compactionDeferEpoch, spokeLogger))
+					compactionManager.SetOnCompactedOutput(edgesync.NewCompactedOutputObserver(
+						spokeLedger, cfg.EdgeSync.Spoke.HubID, compactionDeferEpoch, spokeLogger))
+					log.Info().Time("epoch", compactionDeferEpoch).
+						Msg("Compaction defers until edge sync delivery; compacted outputs will not sync (edge_sync.spoke.defer_compaction_until_synced)")
+				}
+			}
+		}
+
 		// The network agent. Skipped entirely on a fully air-gapped spoke,
 		// which has no hub URL to build a transport from.
 		var syncAgent *edgesync.Agent
@@ -2427,6 +2505,7 @@ func main() {
 			if err != nil {
 				log.Fatal().Err(err).Msg("Failed to create the edge sync agent; refusing to start")
 			}
+			syncAgent.SetCompactionDeferEpoch(compactionDeferEpoch)
 		}
 
 		// Air-gap export, independent of the network agent above.
@@ -2465,6 +2544,7 @@ func main() {
 			if err != nil {
 				log.Fatal().Err(err).Msg("Failed to create the bundle discoverer; refusing to start")
 			}
+			bundleDiscoverer.SetCompactionDeferEpoch(compactionDeferEpoch)
 
 			bundleExporter, err = edgesync.NewExporter(edgesync.ExporterConfig{
 				Ledger:     spokeLedger,
@@ -2506,13 +2586,21 @@ func main() {
 			evt.Msg("Edge sync air-gap export enabled; write a bundle with POST /api/v1/spoke-sync/export")
 		}
 
-		// Periodic ledger prune of terminal rows (synced, skipped). Every
-		// sync action is operator-triggered, but hygiene must not be: an
-		// air-gapped spoke may go months between operator visits, and the
-		// terminal rows those visits produce would otherwise accumulate
-		// forever on the box least able to receive one. Twice daily, plus
-		// once shortly after startup so a long-stopped spoke catches up.
-		if retentionDays := cfg.EdgeSync.Spoke.LedgerRetentionDays; retentionDays > 0 {
+		// Periodic ledger maintenance: prune of terminal rows (synced,
+		// skipped) when retention is enabled, plus the compacted-output row
+		// sweep (issue #610) whenever the compaction gate is active — the
+		// sweep must run even at ledger_retention_days=0, because those rows
+		// are exempt from the prune and this is their only reclamation path.
+		// Twice daily, plus once shortly after startup so a long-stopped
+		// spoke catches up.
+		retentionDays := cfg.EdgeSync.Spoke.LedgerRetentionDays
+		// The sweep runs whenever the spoke does, not only while the gate is
+		// active: compacted-output rows can persist from a PREVIOUSLY active
+		// gate (compaction or defer since turned off), are exempt from the
+		// prune, and this is their only reclamation path. With zero rows it
+		// is a no-op SELECT twice a day.
+		const sweepOutputs = true
+		if retentionDays > 0 || sweepOutputs {
 			pruneCtx, pruneCancel := context.WithCancel(context.Background())
 			shutdownCoordinator.RegisterHook("edgesync-ledger-prune", func(ctx context.Context) error {
 				pruneCancel()
@@ -2521,19 +2609,31 @@ func main() {
 			go func() {
 				pruneLogger := logger.Get("edgesync")
 				runPrune := func() {
-					synced, err := spokeLedger.PruneSynced(pruneCtx, retentionDays)
-					if err != nil {
-						pruneLogger.Warn().Err(err).Msg("Edge sync ledger prune (synced) failed")
+					if retentionDays > 0 {
+						synced, err := spokeLedger.PruneSynced(pruneCtx, retentionDays)
+						if err != nil {
+							pruneLogger.Warn().Err(err).Msg("Edge sync ledger prune (synced) failed")
+						}
+						skipped, err := spokeLedger.PruneSkipped(pruneCtx, retentionDays)
+						if err != nil {
+							pruneLogger.Warn().Err(err).Msg("Edge sync ledger prune (skipped) failed")
+						}
+						if synced+skipped > 0 {
+							pruneLogger.Info().
+								Int64("synced_rows", synced).
+								Int64("skipped_rows", skipped).
+								Msg("Pruned terminal edge sync ledger rows")
+						}
 					}
-					skipped, err := spokeLedger.PruneSkipped(pruneCtx, retentionDays)
-					if err != nil {
-						pruneLogger.Warn().Err(err).Msg("Edge sync ledger prune (skipped) failed")
-					}
-					if synced+skipped > 0 {
-						pruneLogger.Info().
-							Int64("synced_rows", synced).
-							Int64("skipped_rows", skipped).
-							Msg("Pruned terminal edge sync ledger rows")
+					if sweepOutputs {
+						swept, err := spokeLedger.SweepCompactedOutputRows(pruneCtx,
+							cfg.EdgeSync.Spoke.HubID, storageBackend.Exists)
+						if err != nil {
+							pruneLogger.Warn().Err(err).Msg("Edge sync compacted-output row sweep failed")
+						} else if swept > 0 {
+							pruneLogger.Info().Int64("rows", swept).
+								Msg("Swept compacted-output ledger rows whose file is gone")
+						}
 					}
 				}
 				// Deferred first run: not at startup itself, where a large

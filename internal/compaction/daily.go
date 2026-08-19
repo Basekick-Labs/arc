@@ -72,6 +72,10 @@ func (t *DailyTier) GetTierName() string {
 }
 
 // GetPartitionLevel returns the partition level
+func (t *DailyTier) GetMinFiles() int {
+	return t.MinFiles
+}
+
 func (t *DailyTier) GetPartitionLevel() string {
 	return "day"
 }

@@ -348,6 +348,16 @@ type EdgeSyncSpokeConfig struct {
 	// value can leave a backlog undrainable.
 	BatchSize int
 
+	// DeferCompactionUntilSynced makes local compaction wait for edge sync:
+	// only files the ledger reports delivered (synced — on the air-gap path,
+	// acked) are eligible compaction inputs, and compacted outputs are
+	// recorded as never-to-sync. Together those make hub-side row
+	// duplication AND compaction-caused data loss structurally impossible
+	// (issue #610). Default true. Setting false restores pre-26.09.1
+	// behavior: compaction runs freely and the hub double-counts any
+	// partition whose raws synced before compaction consumed them.
+	DeferCompactionUntilSynced bool
+
 	// LedgerRetentionDays is how long terminal ledger rows (synced, skipped)
 	// are kept before the periodic prune deletes them. The rows are
 	// bookkeeping about files that finished their journey; without pruning
@@ -841,16 +851,17 @@ func Load() (*Config, error) {
 				MaxFiles:    v.GetInt64("edge_sync.import.max_files"),
 			},
 			Spoke: EdgeSyncSpokeConfig{
-				Enabled:             v.GetBool("edge_sync.spoke.enabled"),
-				HubURL:              v.GetString("edge_sync.spoke.hub_url"),
-				SpokeID:             v.GetString("edge_sync.spoke.spoke_id"),
-				HubID:               v.GetString("edge_sync.spoke.hub_id"),
-				Secret:              os.Getenv("ARC_EDGE_SYNC_SPOKE_SECRET"),
-				HubToken:            os.Getenv("ARC_EDGE_SYNC_HUB_TOKEN"),
-				MaxAttempts:         v.GetInt("edge_sync.spoke.max_attempts"),
-				MaxConcurrent:       v.GetInt("edge_sync.spoke.max_concurrent"),
-				BatchSize:           v.GetInt("edge_sync.spoke.batch_size"),
-				LedgerRetentionDays: v.GetInt("edge_sync.spoke.ledger_retention_days"),
+				Enabled:                    v.GetBool("edge_sync.spoke.enabled"),
+				HubURL:                     v.GetString("edge_sync.spoke.hub_url"),
+				SpokeID:                    v.GetString("edge_sync.spoke.spoke_id"),
+				HubID:                      v.GetString("edge_sync.spoke.hub_id"),
+				Secret:                     os.Getenv("ARC_EDGE_SYNC_SPOKE_SECRET"),
+				HubToken:                   os.Getenv("ARC_EDGE_SYNC_HUB_TOKEN"),
+				MaxAttempts:                v.GetInt("edge_sync.spoke.max_attempts"),
+				MaxConcurrent:              v.GetInt("edge_sync.spoke.max_concurrent"),
+				BatchSize:                  v.GetInt("edge_sync.spoke.batch_size"),
+				LedgerRetentionDays:        v.GetInt("edge_sync.spoke.ledger_retention_days"),
+				DeferCompactionUntilSynced: v.GetBool("edge_sync.spoke.defer_compaction_until_synced"),
 				Bundle: EdgeSyncBundleConfig{
 					Enabled:     v.GetBool("edge_sync.spoke.bundle.enabled"),
 					AllowedDirs: v.GetStringSlice("edge_sync.spoke.bundle.allowed_dirs"),
@@ -1508,6 +1519,10 @@ func setDefaults(v *viper.Viper) {
 	// retries on a 413 either way, so no value can strand a backlog.
 	v.SetDefault("edge_sync.spoke.batch_size", 1000)
 	v.SetDefault("edge_sync.spoke.ledger_retention_days", 90) // terminal (synced/skipped) rows; 0 = never prune
+	// true: compaction waits for delivery, outputs never sync (issue #610).
+	// A spoke with sync configured but never triggered will DEFER compaction
+	// until a pass runs — visible via the per-scan deferral log line.
+	v.SetDefault("edge_sync.spoke.defer_compaction_until_synced", true)
 
 	// Air-gap bundle export. allowed_dirs has no default on purpose: an empty
 	// list refuses every export, so an operator must state where bundles may

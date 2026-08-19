@@ -48,6 +48,16 @@ type Agent struct {
 	maxAttempts   int
 	maxConcurrent int
 	batchSize     int
+
+	// compactionDeferEpoch is forwarded to the per-pass Discoverer so it can
+	// tell crash-orphaned compacted outputs from legacy ones (issue #610).
+	compactionDeferEpoch time.Time
+}
+
+// SetCompactionDeferEpoch forwards the issue-#610 enablement epoch to this
+// agent's discovery passes. Zero deactivates the discrimination.
+func (a *Agent) SetCompactionDeferEpoch(epoch time.Time) {
+	a.compactionDeferEpoch = epoch
 }
 
 // AgentConfig configures a sync Agent.
@@ -380,6 +390,7 @@ func (a *Agent) Discover(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	d.SetCompactionDeferEpoch(a.compactionDeferEpoch)
 	return d.Discover(ctx)
 }
 

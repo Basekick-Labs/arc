@@ -169,6 +169,12 @@ type Tier interface {
 	// IsEnabled returns whether this tier is enabled
 	IsEnabled() bool
 
+	// GetMinFiles returns the tier's minimum-file threshold. The sync
+	// eligibility filter re-applies it after removing undelivered files
+	// from a candidate — a single manager-wide value would be wrong
+	// (hourly defaults to 10, daily to 12).
+	GetMinFiles() int
+
 	// GetStats returns tier statistics
 	GetStats() map[string]interface{}
 }

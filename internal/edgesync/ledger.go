@@ -74,6 +74,20 @@ const (
 	StateSkipped SyncState = "skipped"
 )
 
+// NoteCompactedOutput marks a skipped ledger row as a compacted output whose
+// contents were already delivered (issue #610): every input to the job was in
+// state synced, so the output must never sync — it would duplicate rows on
+// the hub. Rows carrying this note are EXEMPT from PruneSkipped while their
+// file exists (a pruned row would let discovery rediscover and sync the
+// output) and are instead reclaimed by SweepCompactedOutputRows once the
+// file is gone. They are also ELIGIBLE compaction inputs (daily consumes
+// hourly outputs).
+const NoteCompactedOutput = "compaction output; contents already delivered"
+
+// MetaCompactionDeferEpoch is the sync_meta key recording when
+// defer-compaction-until-synced first became active on this spoke.
+const MetaCompactionDeferEpoch = "compaction_defer_epoch"
+
 // DefaultHubID is the hub identifier used when multi-hub is not configured.
 //
 // The ledger is keyed (hub_id, path) from day one even though phase 1 syncs to
@@ -223,6 +237,16 @@ func (l *Ledger) initSchema() error {
 
 	CREATE INDEX IF NOT EXISTS idx_sync_history_started
 		ON sync_history(hub_id, started_at);
+
+	-- Spoke-local key/value facts that must survive restarts. First user:
+	-- the compaction-defer enablement epoch (issue #610), which lets
+	-- discovery and the eligibility gate tell a post-enablement crash
+	-- orphan (delivered content by construction) from a pre-enablement
+	-- legacy compacted file (must sync once for completeness).
+	CREATE TABLE IF NOT EXISTS sync_meta (
+		key   TEXT PRIMARY KEY,
+		value TEXT NOT NULL
+	);
 	`
 
 	if _, err := l.db.Exec(schema); err != nil {
@@ -720,6 +744,175 @@ func (l *Ledger) MarkFailed(ctx context.Context, hubID, path, errMsg string, max
 	return l.checkTransition(ctx, res, hubID, path, StateInFlight)
 }
 
+// EnsureMetaOnce stores value under key unless the key already exists, and
+// returns the stored (possibly pre-existing) value. Used for the compaction
+// defer epoch: set on first activation, stable forever after.
+func (l *Ledger) EnsureMetaOnce(ctx context.Context, key, value string) (string, error) {
+	if _, err := l.db.ExecContext(ctx,
+		`INSERT INTO sync_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING`,
+		key, value); err != nil {
+		return "", fmt.Errorf("edgesync: store meta %q: %w", key, err)
+	}
+	var out string
+	if err := l.db.QueryRowContext(ctx,
+		`SELECT value FROM sync_meta WHERE key = ?`, key).Scan(&out); err != nil {
+		return "", fmt.Errorf("edgesync: read meta %q: %w", key, err)
+	}
+	return out, nil
+}
+
+// ClearMeta removes a sync_meta key. Used when the compaction defer gate is
+// INACTIVE while compaction may run (issue #610): the epoch's meaning is
+// "the gate has been continuously active since this instant", so any ungated
+// run must invalidate it — the next activation re-stamps a fresh epoch and
+// outputs from the ungated period classify as legacy (sync once; a bounded
+// duplicate, never a loss).
+func (l *Ledger) ClearMeta(ctx context.Context, key string) error {
+	if _, err := l.db.ExecContext(ctx, `DELETE FROM sync_meta WHERE key = ?`, key); err != nil {
+		return fmt.Errorf("edgesync: clear meta %q: %w", key, err)
+	}
+	return nil
+}
+
+// TrackCompactedOutput records a compacted output as already-delivered
+// content that must never sync (state skipped, NoteCompactedOutput).
+//
+// INSERT OR IGNORE: the observer can fire more than once for one output —
+// manifest recovery retries until input deletion fully succeeds — and a
+// legacy compacted file may already be tracked as a synced row, which must
+// be left alone (it DID sync).
+func (l *Ledger) TrackCompactedOutput(ctx context.Context, hubID, path string) error {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	db, meas, ok := splitFirstTwo(path)
+	if !ok {
+		// A compacted output always lives at {db}/{meas}/... depth; anything
+		// shallower is not a path this spoke's storage produced.
+		return fmt.Errorf("edgesync: track compacted output %q: path too shallow", path)
+	}
+	_, err := l.db.ExecContext(ctx, `
+		INSERT OR IGNORE INTO sync_ledger
+			(hub_id, path, sha256, size_bytes, database, measurement,
+			 partition_time, discovered_at, state, last_error, last_attempt)
+		VALUES (?, ?, '', 0, ?, ?, ?, ?, ?, ?, ?)`,
+		hubID, path, db, meas,
+		time.Now().UTC(), time.Now().UTC(),
+		string(StateSkipped), NoteCompactedOutput, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("edgesync: track compacted output %q: %w", path, err)
+	}
+	return nil
+}
+
+// DeliveryState is a ledger row's state plus the note the eligibility gate
+// needs to recognize compacted outputs.
+type DeliveryState struct {
+	State SyncState
+	Note  string
+}
+
+// DeliveryStates returns state+note for each of paths that has a ledger row.
+// Paths without a row are absent from the result. IN-chunked at 500 binds.
+func (l *Ledger) DeliveryStates(ctx context.Context, hubID string, paths []string) (map[string]DeliveryState, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	out := make(map[string]DeliveryState, len(paths))
+	const chunk = 500
+	for start := 0; start < len(paths); start += chunk {
+		end := start + chunk
+		if end > len(paths) {
+			end = len(paths)
+		}
+		part := paths[start:end]
+		placeholders := strings.Repeat("?,", len(part))
+		placeholders = placeholders[:len(placeholders)-1]
+		args := make([]any, 0, len(part)+1)
+		args = append(args, hubID)
+		for _, p := range part {
+			args = append(args, p)
+		}
+		rows, err := l.db.QueryContext(ctx, `
+			SELECT path, state, COALESCE(last_error, '')
+			FROM sync_ledger WHERE hub_id = ? AND path IN (`+placeholders+`)`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("edgesync: delivery states: %w", err)
+		}
+		for rows.Next() {
+			var p, st, note string
+			if err := rows.Scan(&p, &st, &note); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("edgesync: scan delivery state: %w", err)
+			}
+			out[p] = DeliveryState{State: SyncState(st), Note: note}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("edgesync: delivery states rows: %w", err)
+		}
+		rows.Close()
+	}
+	return out, nil
+}
+
+// SweepCompactedOutputRows deletes compacted-output rows whose file no
+// longer exists (consumed by a later compaction tier, or removed by
+// retention). These rows are exempt from PruneSkipped — pruning one whose
+// file still exists would let discovery re-sync the output — so this sweep
+// is their only reclamation path and must run regardless of the retention
+// setting. exists is consulted per row; an exists ERROR keeps the row
+// (fail-safe: never delete bookkeeping on an uncertain answer).
+func (l *Ledger) SweepCompactedOutputRows(ctx context.Context, hubID string, exists func(context.Context, string) (bool, error)) (int64, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	rows, err := l.db.QueryContext(ctx, `
+		SELECT id, path FROM sync_ledger
+		WHERE hub_id = ? AND state = ? AND last_error = ?
+		ORDER BY id ASC`,
+		hubID, string(StateSkipped), NoteCompactedOutput)
+	if err != nil {
+		return 0, fmt.Errorf("edgesync: list compacted-output rows: %w", err)
+	}
+	type rec struct {
+		id   int64
+		path string
+	}
+	var candidates []rec
+	for rows.Next() {
+		var r rec
+		if err := rows.Scan(&r.id, &r.path); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("edgesync: scan compacted-output row: %w", err)
+		}
+		candidates = append(candidates, r)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, fmt.Errorf("edgesync: compacted-output rows: %w", err)
+	}
+	rows.Close()
+
+	var deleted int64
+	for _, r := range candidates {
+		if err := ctx.Err(); err != nil {
+			return deleted, err
+		}
+		present, err := exists(ctx, r.path)
+		if err != nil || present {
+			continue
+		}
+		if _, err := l.db.ExecContext(ctx,
+			`DELETE FROM sync_ledger WHERE id = ? AND state = ? AND last_error = ?`,
+			r.id, string(StateSkipped), NoteCompactedOutput); err != nil {
+			return deleted, fmt.Errorf("edgesync: sweep compacted-output row %q: %w", r.path, err)
+		}
+		deleted++
+	}
+	return deleted, nil
+}
+
 // MarkSkipped records that an entry's source file vanished from storage
 // before delivery — compaction or retention got to it first.
 //
@@ -963,11 +1156,16 @@ func (l *Ledger) PruneSkipped(ctx context.Context, retentionDays int) (int64, er
 
 	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays)
 
+	// Compacted-output rows are excluded (NULL-safe: last_error is nullable):
+	// pruning one whose file still exists lets discovery rediscover and SYNC
+	// the output — duplicates returning after retention days. They are
+	// reclaimed by SweepCompactedOutputRows once the file is gone instead.
 	var maxID int64
 	err := l.db.QueryRowContext(ctx, `
 		SELECT COALESCE(MAX(id), 0) FROM sync_ledger
-		WHERE state = ? AND last_attempt IS NOT NULL AND last_attempt < ?`,
-		string(StateSkipped), cutoff).Scan(&maxID)
+		WHERE state = ? AND last_attempt IS NOT NULL AND last_attempt < ?
+		  AND (last_error IS NULL OR last_error <> ?)`,
+		string(StateSkipped), cutoff, NoteCompactedOutput).Scan(&maxID)
 	if err != nil {
 		return 0, fmt.Errorf("edgesync: find skipped prune cutoff: %w", err)
 	}
@@ -987,8 +1185,9 @@ func (l *Ledger) PruneSkipped(ctx context.Context, retentionDays int) (int64, er
 			DELETE FROM sync_ledger WHERE id IN (
 				SELECT id FROM sync_ledger
 				WHERE id <= ? AND state = ? AND last_attempt IS NOT NULL AND last_attempt < ?
+				  AND (last_error IS NULL OR last_error <> ?)
 				ORDER BY id ASC LIMIT ?
-			)`, maxID, string(StateSkipped), cutoff, batchSize)
+			)`, maxID, string(StateSkipped), cutoff, NoteCompactedOutput, batchSize)
 		if err != nil {
 			return total, fmt.Errorf("edgesync: prune skipped entries: %w", err)
 		}
