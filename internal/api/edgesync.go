@@ -156,7 +156,12 @@ func (h *EdgeSyncHandler) RegisterRoutes(app fiber.Router) {
 	})
 
 	if h.authManager != nil {
-		group.Use(auth.RequireAdmin(h.authManager))
+		// Write-level, not admin: these endpoints are ingest-shaped (a spoke
+		// pushes data files), and the ingest endpoints gate on RequireWrite.
+		// Requiring admin here would force every spoke to hold a credential
+		// that can also rotate tokens and delete data on the hub. The spoke
+		// presents the token from ARC_EDGE_SYNC_HUB_TOKEN.
+		group.Use(auth.RequireWrite(h.authManager))
 	}
 
 	group.Post("/file", h.receiveFile)

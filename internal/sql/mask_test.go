@@ -12,8 +12,8 @@ func TestMaskFromKeywordsInFunctionBodies(t *testing.T) {
 		wantMasks int
 		// After mask runs, the table-rewriter regex should NOT see "FROM x"
 		// where x is the inner column, but SHOULD still see the outer FROM.
-		mustContainOuterFROM     []string
-		mustNotContainInnerFROM  []string
+		mustContainOuterFROM    []string
+		mustNotContainInnerFROM []string
 	}{
 		{
 			name:                    "EXTRACT(YEAR FROM time) FROM table",

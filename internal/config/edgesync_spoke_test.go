@@ -67,6 +67,29 @@ func TestSpokeConfig_SecretInFileIsRefused(t *testing.T) {
 	}
 }
 
+// The hub API token follows the secret's rules exactly: environment only,
+// refused in the file, and reachable from the config when supplied via env.
+func TestSpokeConfig_HubTokenEnvOnlyAndRefusedInFile(t *testing.T) {
+	t.Setenv("ARC_EDGE_SYNC_SPOKE_SECRET", strings.Repeat("a", 64))
+	t.Setenv("ARC_EDGE_SYNC_HUB_TOKEN", "hub-write-token")
+
+	cfg, err := loadWith(t, validSpokeConfig)
+	if err != nil {
+		t.Fatalf("a spoke supplying its hub token via the environment failed to load: %v", err)
+	}
+	if cfg.EdgeSync.Spoke.HubToken != "hub-write-token" {
+		t.Errorf("hub token from the environment did not reach the config: %q", cfg.EdgeSync.Spoke.HubToken)
+	}
+
+	_, err = loadWith(t, validSpokeConfig+`hub_token = "hunter2"`+"\n")
+	if err == nil {
+		t.Fatal("a config file carrying hub_token loaded without complaint")
+	}
+	if !strings.Contains(err.Error(), "ARC_EDGE_SYNC_HUB_TOKEN") {
+		t.Errorf("the error does not say where the token belongs: %v", err)
+	}
+}
+
 // A mismatched or missing hub_id fails every request with a 400. Catching it
 // at load turns a silent total failure into a startup message.
 func TestSpokeConfig_RequiresIdentitiesAndURL(t *testing.T) {
@@ -120,10 +143,12 @@ func TestSpokeConfig_DefaultsAreDeclared(t *testing.T) {
 	if got := cfg.EdgeSync.Spoke.MaxConcurrent; got != 2 {
 		t.Errorf("max_concurrent = %d, want 2", got)
 	}
-	// 0 means "defer to the hub's cap", which is a real value here, not an
-	// unset field.
-	if got := cfg.EdgeSync.Spoke.BatchSize; got != 0 {
-		t.Errorf("batch_size = %d, want 0", got)
+	// 1000 pages under the hub's default max_reconcile_entries (10000) and
+	// bounds per-page spoke memory. 0 ("whole backlog in one reconcile") is
+	// an explicit opt-in, not the default — a default-config spoke with a
+	// large backlog must not depend on 413 splitting to make progress.
+	if got := cfg.EdgeSync.Spoke.BatchSize; got != 1000 {
+		t.Errorf("batch_size = %d, want 1000", got)
 	}
 }
 

@@ -244,13 +244,15 @@ max_reconcile_entries = 10000      # ~2MB per discovery batch
 
 With it enabled, `POST /api/v1/sync/file` accepts an authenticated file push from a registered spoke, and `POST /api/v1/sync/reconcile` answers — in **one round-trip** — which of a spoke's pending files the hub already holds. That second endpoint is what makes a long disconnection survivable: a spoke returning with 5,000 pending files asks once rather than 5,000 times, and any file whose acknowledgment was lost is discovered in bulk rather than re-uploaded. Every upload is streamed to a staging area, hashed on the way in, and **verified before it is promoted** to its final location — a checksum mismatch is discarded and never appears where a reader would find it. Redelivering a file the hub already holds is a no-op; the same path arriving with *different* content is refused with `409` rather than overwritten, because one of the two copies is wrong and silently replacing either destroys the evidence.
 
-Two independent authentication layers apply: Arc's API token middleware, and a per-spoke HMAC binding the spoke, the hub, the path, and the content digest.
+Two independent authentication layers apply: Arc's API token middleware (write level — the endpoints are ingest-shaped, and a spoke should not hold admin credentials), and a per-spoke HMAC binding the spoke, the hub, the path, and the content digest. The spoke presents both: the HMAC is derived from its secret, and the API token comes from a second environment-only credential, `ARC_EDGE_SYNC_HUB_TOKEN` — any hub token with write permission. A spoke without it gets a `401` whose error text names the variable, and warns at startup. Only a hub running with auth disabled needs none.
 
 **Spokes are registered through the API.** `POST /api/v1/sync-spokes` generates a cryptographically random secret and returns it **once** — it is never readable again, so an operator who loses it rotates rather than retrieves. Secrets are encrypted at rest with `ARC_ENCRYPTION_KEY`, the same key MQTT uses for broker passwords; a hub enabled without that key **refuses to start** rather than storing write credentials in a database that also holds audit logs. Spokes can be listed, rotated, disabled (reversible, keeping history and counters), and deleted — deleting a registration deliberately leaves the files that spoke already sent.
 
 Reconcile is answered from a hub-side index of received files rather than by reading Parquet, so it stays cheap regardless of backlog size and works identically on a standalone hub and a clustered one. A batch larger than `max_reconcile_entries` is refused with `413` and the limit, so a spoke pages rather than sending an unbounded body — the request body is buffered before authentication, so an uncapped batch would be a memory claim by an unauthenticated caller.
 
 Resume is supported on local storage. On S3 and Azure a dropped transfer restarts from zero, because block objects cannot be appended to; this is a throughput cost on intermittent links, not a correctness problem.
+
+Abandoned partial uploads are swept from the staging area hourly once they are older than `edge_sync.staging_sweep_max_age_hours` (default 72 — deliberately longer than a plausible contact gap, because a staged partial is also the spoke's resume checkpoint; 0 disables the sweep).
 
 ### The spoke side
 
@@ -264,10 +266,13 @@ spoke_id = "rocket-01"                # this spoke's ID, as registered on the hu
 hub_id = "ground-station"             # the REMOTE hub's edge_sync.hub_id
 max_attempts = 5                      # attempts before a file is marked failed
 max_concurrent = 2                    # simultaneous transfers
-batch_size = 0                        # files per reconcile round-trip; 0 = hub default
+batch_size = 1000                     # files per reconcile round-trip; 0 = whole backlog at once
+ledger_retention_days = 90            # prune synced/skipped ledger rows; 0 = never
 ```
 
-The secret is **environment-only**: `ARC_EDGE_SYNC_SPOKE_SECRET`, the value the hub returned once at registration. A secret in the config file is **refused at startup** rather than ignored — one that is ignored still leaks, and leaving it in place makes the committed copy look load-bearing. `hub_id` is validated at load for the same reason it is easy to get wrong: it is bound into every request MAC, so a mismatch fails *every* request with a `400` that looks like a hub problem.
+A reconcile page the hub refuses as too large (over its `max_reconcile_entries`, or its byte limit) is **split and retried within the same pass** — the 413 carries the hub's cap, and the agent adapts to it. No `batch_size` value can leave a backlog undrainable.
+
+The secret is **environment-only**: `ARC_EDGE_SYNC_SPOKE_SECRET`, the value the hub returned once at registration; the hub API token is `ARC_EDGE_SYNC_HUB_TOKEN`, handled the same way. A secret in the config file is **refused at startup** rather than ignored — one that is ignored still leaks, and leaving it in place makes the committed copy look load-bearing. `hub_id` is validated at load for the same reason it is easy to get wrong: it is bound into every request MAC, so a mismatch fails *every* request with a `400` that looks like a hub problem.
 
 Three admin endpoints drive it:
 
@@ -280,6 +285,10 @@ Three admin endpoints drive it:
 A pass recovers transfers interrupted by a crash, discovers new files, reconciles the backlog, and streams what the hub lacks — **newest first**, so a contact window that closes mid-backlog has already delivered the freshest telemetry. It **pages until the backlog drains**, so one pass on a spoke returning from a long outage moves everything, not just the first batch. Conflicts are reported in full rather than counted and are not retried: the same path holding different content means a spoke-ID collision or corruption, and re-sending would either be refused or destroy evidence.
 
 Files are hashed once at discovery, and the ledger survives restarts, so a spoke re-run after a crash neither re-hashes nor re-sends what already landed. Nothing is deleted from the spoke — sync is a copy, and local retention stays in the operator's hands.
+
+**A tracked file that vanishes before delivery is marked `skipped`, not retried.** Compaction (on by default) rewrites raw Parquet and deletes the sources; retention deletes whole partitions. A file caught by either after discovery but before delivery has nothing left to send — the ledger records it as `skipped` (reported in `/status` and each pass/export result) instead of burning the retry budget or, on the air-gap path, failing the export outright. The check is deliberately one-directional: only a storage backend positively reporting the file gone skips it; a transient storage error never does. Terminal rows (`synced`, `skipped`) are pruned automatically after `ledger_retention_days`.
+
+**Compaction on a syncing spoke duplicates rows on the hub.** Raw files synced before compaction stay on the hub; the compacted file carrying the same rows then syncs as a new path, and hub queries over that partition double-count. Until hub-side supersede logic ships, either disable compaction on databases a spoke syncs, or account for duplicates in hub queries.
 
 ### Air-gap bundles
 
@@ -440,6 +449,26 @@ The fix rejects, in `ValidateSQLRequest` (before any transform or RBAC check run
 Reachable only when RBAC is enabled (the multi-tenant authorization boundary); no CVE is being filed, as it is a residual of GHSA-93cm scoped to within the allow-list, tracked under the advisory above. Reported by [@arpitjain099](https://github.com/arpitjain099).
 
 ## Bug fixes
+
+### Quoted identifiers in SQL now resolve to storage paths
+
+`SELECT * FROM "my-db".cpu` used to return zero rows, silently. The query
+layer masked double-quoted tokens as if they were string literals, so the
+quotes were spliced back **inside** the generated `read_parquet` glob —
+`…/"my-db"/cpu/**` — a literal directory that never exists. Since a hyphenated
+name *must* be quoted (unquoted it is a SQL parser error), any database or
+measurement with a hyphen was unqueryable by any syntax. Edge sync made this
+mainline: the hub stores each spoke's data under the spoke ID, and every
+spoke-ID example in the docs is hyphenated.
+
+Double-quoted tokens are now masked as a distinct identifier class, resolved
+to their unquoted names (and validated — a quoted identifier carrying path
+characters is refused rather than globbed) before storage paths are built.
+The RBAC permission extractor resolves the same way, so quoted references are
+permission-checked under their real names, and the cross-database rejection
+for `x-arc-database` requests now sees quoted `db.table` syntax too. Quoted
+CTE names, quoted column names, and string literals that merely *contain*
+table-like text all behave as before.
 
 ### License-server outages no longer crash-loop Enterprise clusters ([field report])
 
@@ -846,7 +875,7 @@ The forwarding-header and loop-guard changes are cluster-only; the partition-pru
 2. **No API or on-disk format changes.** Reads, queries, and storage layout are untouched. Queries with a start date earlier than `1970-01-01` are pruned from the epoch forward; since Arc stores no pre-epoch data, results are unchanged.
 3. **Clustered operators:** if any external tooling deliberately sets `X-Arc-Forwarded-By`, `X-Real-IP`, or `X-Forwarded-*` headers on requests to Arc and expects them to survive an inter-node forward, note that these are now stripped on the forwarding hop and re-established by Arc. Client IP has never been derived from these headers, so log/audit attribution is unchanged.
 4. **Active licenses keep working.** No re-activation required.
-5. **Edge sync is off by default and nothing changes unless you enable it.** With `edge_sync.enabled=false` (the default) the hub mounts no routes and `/api/v1/sync/file` returns 404. With `edge_sync.spoke.enabled=false` (the default) no spoke routes are mounted, no `sync_ledger` or `sync_history` tables are created, and nothing is read from local storage. Both sides are independent: a hub need not be a spoke, and a spoke need not be a hub.
+5. **Edge sync is off by default and nothing changes unless you enable it.** With `edge_sync.enabled=false` (the default) the hub mounts no routes and `/api/v1/sync/file` returns 404. With `edge_sync.spoke.enabled=false` (the default) no spoke routes are mounted, no `sync_ledger` or `sync_history` tables are created, and nothing is read from local storage. Both sides are independent: a hub need not be a spoke, and a spoke need not be a hub. (One related change applies everywhere: the quoted-identifier query fix under Bug fixes — quoted names now resolve instead of returning zero rows.)
 
 ## Dependencies
 

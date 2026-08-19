@@ -1091,10 +1091,26 @@ func (h *QueryHandler) StartBackgroundWorkers(ctx context.Context) {
 }
 
 // extractTableReferences extracts all database.measurement references from SQL
-// Returns a slice of TableReference structs for permission checking
-func extractTableReferences(sql string) []TableReference {
+// Returns a slice of TableReference structs for permission checking.
+//
+// identNames maps __IDENT_n__ placeholders (masked double-quoted identifiers)
+// back to their unquoted names; pass the result of sqlutil.IdentifierNames on
+// the same masks the sql was masked with, or nil when the sql contains no
+// quoted identifiers. Resolution here MUST mirror the query transform's
+// (resolveIdent in convertSQLToStoragePaths): if extraction saw placeholder
+// text while execution resolved real names, a quoted reference would be
+// permission-checked as `__IDENT_0__` — a grant that can never exist — while
+// the query still executed against the real measurement.
+func extractTableReferences(sql string, identNames map[string]string) []TableReference {
 	var refs []TableReference
 	seen := make(map[string]bool)
+
+	resolve := func(name string) string {
+		if orig, ok := identNames[name]; ok {
+			return orig
+		}
+		return name
+	}
 
 	// CTE names (WITH t AS (...)) are virtual, not real measurements. The query
 	// transform (convertSQLToStoragePaths) skips them, so the permission check
@@ -1107,12 +1123,13 @@ func extractTableReferences(sql string) []TableReference {
 	dbTableMatches := patternDBTable.FindAllStringSubmatch(sql, -1)
 	for _, match := range dbTableMatches {
 		if len(match) >= 3 {
-			key := match[1] + "." + match[2]
+			db, table := resolve(match[1]), resolve(match[2])
+			key := db + "." + table
 			if !seen[key] {
 				seen[key] = true
 				refs = append(refs, TableReference{
-					Database:    match[1],
-					Measurement: match[2],
+					Database:    db,
+					Measurement: table,
 				})
 			}
 		}
@@ -1124,12 +1141,13 @@ func extractTableReferences(sql string) []TableReference {
 		// Group 1 is the join prefix (LEFT JOIN, ASOF JOIN, ...); the
 		// database/measurement identifiers are groups 2 and 3.
 		if len(match) >= 4 {
-			key := match[2] + "." + match[3]
+			db, table := resolve(match[2]), resolve(match[3])
+			key := db + "." + table
 			if !seen[key] {
 				seen[key] = true
 				refs = append(refs, TableReference{
-					Database:    match[2],
-					Measurement: match[3],
+					Database:    db,
+					Measurement: table,
 				})
 			}
 		}
@@ -1140,7 +1158,7 @@ func extractTableReferences(sql string) []TableReference {
 	simpleMatches := patternSimpleTable.FindAllStringSubmatchIndex(sql, -1)
 	for _, matchIdx := range simpleMatches {
 		if len(matchIdx) >= 4 {
-			tableName := sql[matchIdx[2]:matchIdx[3]]
+			tableName := resolve(sql[matchIdx[2]:matchIdx[3]])
 			table := strings.ToLower(tableName)
 
 			// Skip system tables and already-converted paths
@@ -1149,7 +1167,9 @@ func extractTableReferences(sql string) []TableReference {
 			}
 
 			// Skip CTE names — they are virtual, not real measurements.
-			if cteNames[table] {
+			// Checked on the RESOLVED name too: a quoted reference to an
+			// unquoted CTE names the same virtual table.
+			if cteNames[table] || cteNames[strings.ToLower(sql[matchIdx[2]:matchIdx[3]])] {
 				continue
 			}
 
@@ -1187,7 +1207,7 @@ func extractTableReferences(sql string) []TableReference {
 		// Group 1 is the join prefix (indices 2:4); the table identifier is
 		// group 2, at indices 4:6.
 		if len(matchIdx) >= 6 {
-			tableName := sql[matchIdx[4]:matchIdx[5]]
+			tableName := resolve(sql[matchIdx[4]:matchIdx[5]])
 			table := strings.ToLower(tableName)
 
 			if shouldSkipTableConversion(table) {
@@ -1195,7 +1215,8 @@ func extractTableReferences(sql string) []TableReference {
 			}
 
 			// Skip CTE names — they are virtual, not real measurements.
-			if cteNames[table] {
+			// Checked on the RESOLVED name too, as above.
+			if cteNames[table] || cteNames[strings.ToLower(sql[matchIdx[4]:matchIdx[5]])] {
 				continue
 			}
 
@@ -1254,12 +1275,14 @@ func (h *QueryHandler) checkQueryPermissions(c *fiber.Ctx, sql, permission strin
 	//     `SELECT * FROM /* x */ secret.cpu` would otherwise yield zero refs
 	//     here yet still execute against secret.cpu after the transform).
 	features := scanSQLFeatures(sql)
-	normalisedSQL, _ := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
+	normalisedSQL, permMasks := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
 	normalisedSQL, _ = sqlutil.MaskFromKeywordsInFunctionBodies(normalisedSQL)
 	normalisedSQL = stripSQLComments(normalisedSQL, features.hasDashComment || features.hasBlockComment)
 
-	// Extract table references from the normalised SQL
-	tableRefs := extractTableReferences(normalisedSQL)
+	// Extract table references from the normalised SQL. The identifier-mask
+	// table rides along so quoted references are checked under their real
+	// names — the same resolution the query transform applies.
+	tableRefs := extractTableReferences(normalisedSQL, sqlutil.IdentifierNames(permMasks))
 	if len(tableRefs) == 0 {
 		// No tables referenced (e.g., SELECT 1+1)
 		return nil
@@ -2112,7 +2135,7 @@ func ValidateSQLRequest(sql string) error {
 	// (never reconstructed into executable SQL), so the swap is safe here.
 	maskInput := backticksToDoubleQuotes(sql)
 	features := scanSQLFeatures(maskInput)
-	normalised, _ := sqlutil.MaskStringLiterals(maskInput, features.hasQuotes)
+	normalised, vMasks := sqlutil.MaskStringLiterals(maskInput, features.hasQuotes)
 	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
 
 	// SECURITY: reject multi-statement queries. A second statement smuggled
@@ -2216,15 +2239,30 @@ func ValidateSQLRequest(sql string) error {
 		return &SQLValidationError{Message: "String literal not allowed in table position (replacement scans are disabled); reference a table by name"}
 	}
 
+	// SECURITY: reject a double-quoted token in table position whose unquoted
+	// name is not a valid identifier — `FROM "db2/**/*.parquet"` is the
+	// double-quoted spelling of the replacement scan above, invisible to the
+	// I/O denylist (no function name) and, in a comma cross-join, to RBAC
+	// extraction as well. No legitimate Arc database or measurement can carry
+	// the rejected characters, so a valid quoted name (`FROM "my-db"`) and an
+	// invalid one anywhere OUTSIDE table position (`SELECT "my col"`) both
+	// pass. Runs on the shared normalisation, where quoted identifiers are
+	// distinct __IDENT__ placeholders. (2026-08 edge-sync audit follow-up to
+	// GHSA-w8x2.)
+	if name := invalidQuotedIdentifierInTablePosition(normalised, sqlutil.IdentifierNames(vMasks)); name != "" {
+		return &SQLValidationError{Message: "Quoted identifier in table position is not a valid database or measurement name (replacement scans are disabled): " + name}
+	}
+
 	return nil
 }
 
-// tablePosPlaceholder matches a MaskStringLiterals placeholder (`__STR_<n>__`).
+// tablePosPlaceholder matches a MaskStringLiterals placeholder — either the
+// string class (`__STR_<n>__`) or the identifier class (`__IDENT_<n>__`).
 // Used to isolate placeholders with surrounding spaces before tokenising, so a
 // placeholder that abuts a keyword with no whitespace (`FROM'…'` masks to the
 // glued `FROM__STR_0__`) is not swallowed into one identifier token — a real
 // replacement-scan bypass otherwise (GHSA-w8x2 review, blocker 2).
-var tablePosPlaceholder = regexp.MustCompile(`__STR_\d+__`)
+var tablePosPlaceholder = regexp.MustCompile(`__(?:STR|IDENT)_\d+__`)
 
 // tablePosTokenPattern tokenises the (space-isolated) masked/normalised SQL into
 // the atoms the table-position scanner cares about: a masked string placeholder
@@ -2232,7 +2270,7 @@ var tablePosPlaceholder = regexp.MustCompile(`__STR_\d+__`)
 // (keywords, table names, aliases). Everything else (whitespace, operators) is
 // skipped. The placeholder alternative is matched BEFORE the generic identifier
 // run so it wins even though `_`/digits are also identifier bytes.
-var tablePosTokenPattern = regexp.MustCompile(`__STR_\d+__|[A-Za-z_][A-Za-z0-9_]*|[(),]`)
+var tablePosTokenPattern = regexp.MustCompile(`__(?:STR|IDENT)_\d+__|[A-Za-z_][A-Za-z0-9_]*|[(),]`)
 
 // stringLiteralInTablePosition reports whether `normalised` — SQL whose SINGLE-
 // quoted string literals have already been masked to `__STR_<n>__` placeholders,
@@ -2255,6 +2293,60 @@ var tablePosTokenPattern = regexp.MustCompile(`__STR_\d+__|[A-Za-z_][A-Za-z0-9_]
 // outer FROM clause — otherwise the trailing comma cross-join is wrongly
 // disarmed and the replacement scan slips through (GHSA-w8x2 review, blocker 1).
 func stringLiteralInTablePosition(normalised string) bool {
+	return maskedTokenInTablePosition(normalised, func(tok string) bool {
+		return strings.HasPrefix(tok, "__STR_")
+	}) != ""
+}
+
+// invalidQuotedIdentifierInTablePosition reports the first double-quoted
+// identifier standing in table position whose UNQUOTED name fails
+// validateIdentifier — returning the offending name, or "".
+//
+// Rationale: DuckDB resolves a quoted token in table position that looks like
+// a path (`FROM "db2/**/*.parquet"`) as a REPLACEMENT SCAN, reading the file
+// directly with no function name — the double-quoted sibling of the
+// single-quoted GHSA-w8x2 case above, and invisible to both the I/O-function
+// denylist (no name to match) and RBAC extraction in positions the table
+// patterns do not reach (a comma cross-join). The characters
+// validateIdentifier rejects (`/`, `*`, `.`) are exactly the ones that make a
+// token replacement-scan-capable, and no legitimate Arc database or
+// measurement can carry them, so rejecting here loses nothing. A VALID quoted
+// identifier (`FROM "my-db"`) passes untouched, as does an invalid one in any
+// non-table position (`SELECT "my col" …`).
+//
+// normalised must be the shared ValidateSQLRequest normalisation (identifier
+// placeholders intact); identNames maps those placeholders to unquoted names.
+func invalidQuotedIdentifierInTablePosition(normalised string, identNames map[string]string) string {
+	if identNames == nil {
+		return ""
+	}
+	var offending string
+	maskedTokenInTablePosition(normalised, func(tok string) bool {
+		if !strings.HasPrefix(tok, "__IDENT_") {
+			return false
+		}
+		name, known := identNames[tok]
+		if !known {
+			// A placeholder-shaped token this mask table did not produce.
+			// Fail closed: it is in table position and unaccounted for.
+			offending = tok
+			return true
+		}
+		if validateIdentifier(name) != nil {
+			offending = name
+			return true
+		}
+		return false
+	})
+	return offending
+}
+
+// maskedTokenInTablePosition is the shared table-position scanner: it walks
+// the masked/normalised SQL and returns the first placeholder token for which
+// flag returns true while the token stands in table position (directly after
+// FROM or JOIN, or after a comma continuing an armed FROM clause's table
+// list). Returns "" when no flagged placeholder is in table position.
+func maskedTokenInTablePosition(normalised string, flag func(tok string) bool) string {
 	// fromArmed[d] is true when, at paren depth d, we are inside a FROM clause
 	// whose table list is still open — so a comma at depth d continues that
 	// list (a cross-join table position). Indexed by depth; grows as needed.
@@ -2298,14 +2390,16 @@ func stringLiteralInTablePosition(normalised string) bool {
 		}
 
 		// tok is a placeholder or an identifier/keyword run.
-		if strings.HasPrefix(tok, "__STR_") {
-			// A masked single-quoted string standing in table position.
-			if afterFromJoin {
-				return true
+		if strings.HasPrefix(tok, "__STR_") || strings.HasPrefix(tok, "__IDENT_") {
+			// A masked token standing in table position: the caller's flag
+			// decides whether this class of placeholder is a violation.
+			if afterFromJoin && flag(tok) {
+				return tok
 			}
-			// A string that is NOT in table position (a value, a function arg)
-			// closes the "immediately after FROM/JOIN" window but leaves the
-			// FROM clause's armed state (for a following cross-join comma) alone.
+			// A placeholder that is NOT flagged (or not in table position — a
+			// value, a function arg, a legitimate quoted table) closes the
+			// "immediately after FROM/JOIN" window but leaves the FROM
+			// clause's armed state (for a following cross-join comma) alone.
 			afterFromJoin = false
 			continue
 		}
@@ -2327,7 +2421,7 @@ func stringLiteralInTablePosition(normalised string) bool {
 			}
 		}
 	}
-	return false
+	return ""
 }
 
 // fromClauseTerminator reports whether a lower-cased keyword ends the table
@@ -2536,13 +2630,29 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 	// Extract CTE names to avoid converting them to storage paths
 	cteNames := extractCTENames(sql)
 
+	// Quoted identifiers (`"rocket-01"`) were masked to __IDENT_n__
+	// placeholders above, and a placeholder is word-shaped, so the table
+	// patterns match it like any bare name. Resolve back to the unquoted
+	// identifier before building a storage path — and validate it, because a
+	// quoted token can carry characters (`..`, `/`, `*`) that a bare match
+	// never could. A name that fails validation resolves to an inert sentinel
+	// path segment instead: leaving the raw quoted token in the output SQL is
+	// NOT safe, because DuckDB executes a path-shaped quoted token in table
+	// position as a replacement scan (deep-review finding on the quoted-
+	// identifier fix; ValidateSQLRequest rejects these queries up front, and
+	// this keeps the transform safe for any caller that skips validation).
+	identNames := sqlutil.IdentifierNames(masks)
+	resolveIdent := makeIdentResolver(identNames)
+
 	// Handle FROM database.table references
 	sql = patternDBTable.ReplaceAllStringFunc(sql, func(match string) string {
 		parts := patternDBTable.FindStringSubmatch(match)
 		if len(parts) < 3 {
 			return match
 		}
-		path := h.getStoragePath(parts[1], parts[2])
+		db, _ := resolveIdent(parts[1])
+		table, _ := resolveIdent(parts[2])
+		path := h.getStoragePath(db, table)
 		return h.buildReadParquetExpr(ctx, path, originalSQL, "FROM")
 	})
 
@@ -2552,7 +2662,9 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 		if len(parts) < 4 {
 			return match
 		}
-		path := h.getStoragePath(parts[2], parts[3])
+		db, _ := resolveIdent(parts[2])
+		table, _ := resolveIdent(parts[3])
+		path := h.getStoragePath(db, table)
 		return h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1]))
 	})
 
@@ -2568,8 +2680,17 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 			return parts[0]
 		}
 
+		// A quoted name resolves before the skip/CTE checks below run against
+		// it — a placeholder token would never match either. The CTE check
+		// runs on BOTH forms: `WITH x AS (…) SELECT * FROM "x"` names the
+		// same virtual table in DuckDB whether or not the reference is quoted.
+		resolved, _ := resolveIdent(parts[1])
+		if cteNames[strings.ToLower(resolved)] {
+			return parts[0]
+		}
+
 		// Skip already converted read_parquet, system tables, etc.
-		if shouldSkipTableConversion(table) {
+		if shouldSkipTableConversion(strings.ToLower(resolved)) {
 			return parts[0]
 		}
 
@@ -2578,7 +2699,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 			return parts[0]
 		}
 
-		path := h.getStoragePath("default", parts[1])
+		path := h.getStoragePath("default", resolved)
 		return h.buildReadParquetExpr(ctx, path, originalSQL, "FROM")
 	})
 
@@ -2594,8 +2715,14 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 			return parts[0]
 		}
 
+		// Same resolve-then-check ordering as the FROM handler above.
+		resolved, _ := resolveIdent(parts[2])
+		if cteNames[strings.ToLower(resolved)] {
+			return parts[0]
+		}
+
 		// Skip already converted read_parquet, system tables, etc.
-		if shouldSkipTableConversion(table) {
+		if shouldSkipTableConversion(strings.ToLower(resolved)) {
 			return parts[0]
 		}
 
@@ -2604,17 +2731,49 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 			return parts[0]
 		}
 
-		path := h.getStoragePath("default", parts[2])
+		path := h.getStoragePath("default", resolved)
 		return h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1]))
 	})
 
 	// Restore masked FROM keywords and string literals. Both use content-
 	// addressed placeholders, so the intermediate length-changing regex
-	// rewrites above are safe.
+	// rewrites above are safe. Identifier placeholders consumed by the table
+	// rewrites above are gone from the SQL (their names went into storage
+	// paths); the unmask restores only the ones that remain — quoted column
+	// names, aliases, and any reference left unrewritten.
 	sql = sqlutil.UnmaskFromKeywordsInFunctionBodies(sql, fromMasks)
 	sql = sqlutil.UnmaskStringLiterals(sql, masks)
 
 	return sql
+}
+
+// arcInvalidIdentifierSentinel is the path segment an invalid quoted
+// identifier resolves to. No real database or measurement can collide with it
+// (validateIdentifier forbids a leading dot), so the resulting read_parquet
+// glob matches nothing and the query returns empty instead of the raw quoted
+// token surviving into executable SQL — where a path-shaped token in table
+// position would run as a DuckDB replacement scan. ValidateSQLRequest rejects
+// such queries with an explicit error before the transform normally runs;
+// this sentinel is the transform's own backstop.
+const arcInvalidIdentifierSentinel = ".arc-invalid-quoted-identifier"
+
+// makeIdentResolver returns the resolver the table rewriters use to map a
+// captured token to a clean storage-path segment. Bare tokens pass through;
+// identifier placeholders resolve to their unquoted names when valid, and to
+// arcInvalidIdentifierSentinel when not. The second return is false only for
+// the sentinel case, letting callers log or count if they care — every caller
+// still receives a safe segment to build a path from.
+func makeIdentResolver(identNames map[string]string) func(string) (string, bool) {
+	return func(name string) (string, bool) {
+		orig, isPlaceholder := identNames[name]
+		if !isPlaceholder {
+			return name, true
+		}
+		if err := validateIdentifier(orig); err != nil {
+			return arcInvalidIdentifierSentinel, false
+		}
+		return orig, true
+	}
 }
 
 // getStoragePath returns the storage path for a database.table
@@ -3178,6 +3337,12 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 	// OPTIMIZATION: Skip patternDBTable and patternJoinDBTable entirely
 	// since we know all tables use the header-specified database
 
+	// Quoted measurement names arrive as __IDENT_n__ placeholders; resolve
+	// and validate exactly as convertSQLToStoragePaths does, so the header-db
+	// path and the dotted path agree on what a quoted name means.
+	identNames := sqlutil.IdentifierNames(masks)
+	resolveIdent := makeIdentResolver(identNames)
+
 	// Handle FROM simple_table references - apply header database
 	sql = replaceTableRefs(sql, patternSimpleTable, func(parts []string, end int) string {
 		if len(parts) < 2 {
@@ -3190,8 +3355,15 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 			return parts[0]
 		}
 
+		// Resolve-then-check, matching convertSQLToStoragePaths: the CTE and
+		// skip checks must see the clean name, never a placeholder token.
+		resolved, _ := resolveIdent(parts[1])
+		if cteNames[strings.ToLower(resolved)] {
+			return parts[0]
+		}
+
 		// Skip already converted read_parquet, system tables, etc.
-		if shouldSkipTableConversion(table) {
+		if shouldSkipTableConversion(strings.ToLower(resolved)) {
 			return parts[0]
 		}
 
@@ -3201,7 +3373,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 		}
 
 		// Use header database instead of "default"
-		path := h.getStoragePath(database, parts[1])
+		path := h.getStoragePath(database, resolved)
 		return h.buildReadParquetExpr(ctx, path, originalSQL, "FROM")
 	})
 
@@ -3217,8 +3389,14 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 			return parts[0]
 		}
 
+		// Same resolve-then-check ordering as the FROM handler above.
+		resolved, _ := resolveIdent(parts[2])
+		if cteNames[strings.ToLower(resolved)] {
+			return parts[0]
+		}
+
 		// Skip already converted read_parquet, system tables, etc.
-		if shouldSkipTableConversion(table) {
+		if shouldSkipTableConversion(strings.ToLower(resolved)) {
 			return parts[0]
 		}
 
@@ -3228,7 +3406,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 		}
 
 		// Use header database instead of "default"
-		path := h.getStoragePath(database, parts[2])
+		path := h.getStoragePath(database, resolved)
 		return h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1]))
 	})
 

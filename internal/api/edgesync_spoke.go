@@ -118,6 +118,7 @@ func (h *EdgeSyncSpokeHandler) run(c *fiber.Ctx) error {
 		Int("already_present", res.AlreadyPresent).
 		Int("partial", res.Partial).
 		Int("failed", res.Failed).
+		Int("skipped", res.Skipped).
 		Int("conflicts", len(res.Conflicts)).
 		Dur("duration", res.Duration).
 		Msg("Manual sync pass complete")
@@ -130,6 +131,7 @@ func (h *EdgeSyncSpokeHandler) run(c *fiber.Ctx) error {
 		"bytes_sent":      res.BytesSent,
 		"partial":         res.Partial,
 		"failed":          res.Failed,
+		"skipped":         res.Skipped,
 		"duration_ms":     res.Duration.Milliseconds(),
 	}
 
@@ -187,9 +189,12 @@ func (h *EdgeSyncSpokeHandler) status(c *fiber.Ctx) error {
 		"in_flight": st.InFlight,
 		// Files on physical media awaiting an ack. Reported separately so an
 		// operator can tell "queued here" from "in transit on a drive".
-		"exported":      st.Exported,
-		"synced":        st.Synced,
-		"failed":        st.Failed,
+		"exported": st.Exported,
+		"synced":   st.Synced,
+		"failed":   st.Failed,
+		// Source files that vanished (compaction/retention) before delivery.
+		// Terminal bookkeeping, excluded from pending_bytes.
+		"skipped":       st.Skipped,
 		"pending_bytes": st.PendingBytes,
 	}
 	if st.LastSyncedAt != nil {
@@ -344,11 +349,14 @@ func (h *EdgeSyncSpokeHandler) export(c *fiber.Ctx) error {
 		Msg("Bundle exported")
 
 	return c.JSON(fiber.Map{
-		"exported":    true,
-		"bundle_id":   res.BundleID,
-		"dir":         res.Dir,
-		"files":       res.FileCount,
-		"bytes":       res.Bytes,
+		"exported":  true,
+		"bundle_id": res.BundleID,
+		"dir":       res.Dir,
+		"files":     res.FileCount,
+		"bytes":     res.Bytes,
+		// Eligible entries whose source file vanished before export
+		// (compaction or retention); recorded as skipped in the ledger.
+		"skipped":     res.Skipped,
 		"duration_ms": res.Duration.Milliseconds(),
 		// The bundle is on media but no hub has confirmed it. Saying so here
 		// stops an operator reading "exported" as "delivered".

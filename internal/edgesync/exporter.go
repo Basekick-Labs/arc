@@ -138,6 +138,44 @@ func (e *Exporter) Export(ctx context.Context, dest string, limit int) (*ExportR
 		return nil, ErrNothingToExport
 	}
 
+	// Drop entries whose source file vanished (compaction or retention beat
+	// the export to it) BEFORE the writer runs. Without this the write fails
+	// wholesale on the missing file, the entry stays pending, and the next
+	// export re-selects it — the bundle path is wedged until someone edits
+	// SQLite by hand, on exactly the air-gapped box no one can reach.
+	//
+	// The check direction is deliberate: Exists must POSITIVELY report the
+	// file gone. On an Exists error the entry is kept — the copy then fails
+	// and aborts the export as before, because a transient storage error must
+	// never terminally skip a file that still exists. A file deleted between
+	// this check and the copy still aborts this export, but the next one
+	// skips it here: the window self-heals instead of wedging.
+	alive := entries[:0]
+	skipped := 0
+	for _, entry := range entries {
+		present, existsErr := e.writer.backend.Exists(ctx, entry.Path)
+		if existsErr != nil || present {
+			alive = append(alive, entry)
+			continue
+		}
+		if markErr := e.ledger.MarkSkipped(ctx, e.hubID, entry.Path,
+			"source file removed before export (compaction or retention)"); markErr != nil {
+			e.logger.Warn().Err(markErr).Str("path", entry.Path).
+				Msg("Could not mark a vanished file skipped; keeping it in the export")
+			alive = append(alive, entry)
+			continue
+		}
+		skipped++
+		e.logger.Info().Str("path", entry.Path).
+			Msg("Source file vanished before export; marked skipped (compaction or retention removed it)")
+	}
+	entries = alive
+	if len(entries) == 0 {
+		// Everything eligible had vanished. The ledger now reflects that, so
+		// this converges to a clean "nothing to export" instead of recurring.
+		return nil, ErrNothingToExport
+	}
+
 	// Byte cap applied by truncating the selection, not by failing: a backlog
 	// larger than one drive is the expected case, and the operator's next
 	// bundle continues from where this one stopped. Entries are newest-first,
@@ -168,6 +206,7 @@ func (e *Exporter) Export(ctx context.Context, dest string, limit int) (*ExportR
 	if err != nil {
 		return nil, err
 	}
+	res.Skipped = skipped
 
 	// A file that cannot be marked is NOT fatal: it is already in a signed,
 	// verified bundle on disk. Leaving it pending means a later bundle carries
