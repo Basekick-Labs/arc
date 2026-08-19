@@ -2,8 +2,6 @@ package edgesync
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -52,6 +50,16 @@ type Agent struct {
 	// compactionDeferEpoch is forwarded to the per-pass Discoverer so it can
 	// tell crash-orphaned compacted outputs from legacy ones (issue #610).
 	compactionDeferEpoch time.Time
+
+	// namespaceExcluder is forwarded to the per-pass Discoverer on dual-role
+	// nodes (see Discoverer.SetNamespaceExcluder).
+	namespaceExcluder func(ctx context.Context) (map[string]struct{}, error)
+}
+
+// SetNamespaceExcluder forwards the dual-role received-namespace exclusion
+// to this agent's discovery passes. nil deactivates it.
+func (a *Agent) SetNamespaceExcluder(fn func(ctx context.Context) (map[string]struct{}, error)) {
+	a.namespaceExcluder = fn
 }
 
 // SetCompactionDeferEpoch forwards the issue-#610 enablement epoch to this
@@ -391,6 +399,7 @@ func (a *Agent) Discover(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	d.SetCompactionDeferEpoch(a.compactionDeferEpoch)
+	d.SetNamespaceExcluder(a.namespaceExcluder)
 	return d.Discover(ctx)
 }
 
@@ -608,15 +617,6 @@ func (a *Agent) openAt(ctx context.Context, path string, offset int64) (io.ReadC
 	}()
 
 	return pr, nil
-}
-
-// hashFile computes a file's SHA-256 without holding it in memory.
-func (a *Agent) hashFile(ctx context.Context, path string) (string, error) {
-	h := sha256.New()
-	if err := a.backend.ReadTo(ctx, path, hasherWriter{h}); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // UnfinishedEntries returns files that have not reached the hub — those still

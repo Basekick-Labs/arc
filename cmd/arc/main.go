@@ -2087,6 +2087,9 @@ func main() {
 	// Either role independently: a hub can take network pushes, drives off an
 	// air gap, or both. They share the registry, index, and receiver, which is
 	// why they live in one block.
+	// Hoisted: on a dual-role (hub+spoke) node the spoke block below needs
+	// the registry to exclude received namespaces from its own discovery.
+	var spokeRegistry *edgesync.Registry
 	if cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Enabled {
 		var registerFile func(context.Context, *edgesync.ReceivedFile) error
 		if clusterCoordinator != nil {
@@ -2156,7 +2159,7 @@ func main() {
 			log.Fatal().Err(err).Msg("Failed to create the edge sync secret encryptor; refusing to start")
 		}
 
-		spokeRegistry, err := edgesync.NewRegistry(syncDB, syncEncryptor, logger.Get("edgesync"))
+		spokeRegistry, err = edgesync.NewRegistry(syncDB, syncEncryptor, logger.Get("edgesync"))
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to create the edge sync spoke registry; refusing to start")
 		}
@@ -2506,6 +2509,9 @@ func main() {
 				log.Fatal().Err(err).Msg("Failed to create the edge sync agent; refusing to start")
 			}
 			syncAgent.SetCompactionDeferEpoch(compactionDeferEpoch)
+			if spokeRegistry != nil {
+				syncAgent.SetNamespaceExcluder(receivedNamespaces(spokeRegistry))
+			}
 		}
 
 		// Air-gap export, independent of the network agent above.
@@ -2545,6 +2551,9 @@ func main() {
 				log.Fatal().Err(err).Msg("Failed to create the bundle discoverer; refusing to start")
 			}
 			bundleDiscoverer.SetCompactionDeferEpoch(compactionDeferEpoch)
+			if spokeRegistry != nil {
+				bundleDiscoverer.SetNamespaceExcluder(receivedNamespaces(spokeRegistry))
+			}
 
 			bundleExporter, err = edgesync.NewExporter(edgesync.ExporterConfig{
 				Ledger:     spokeLedger,
@@ -3653,6 +3662,28 @@ func sharedSQLiteHandle(authManager *auth.AuthManager, dbPath string) (db *sql.D
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(time.Hour)
 	return db, true, nil
+}
+
+// receivedNamespaces returns a Discoverer namespace excluder backed by the
+// hub's spoke registry: on a dual-role (hub+spoke) node, top-level segments
+// matching registered spoke IDs are OTHER edges' data held here as a hub,
+// and this node's own sync must not forward them upstream (an undocumented,
+// unbounded relay otherwise — 2026-08-19 audit M2). A namespace left behind
+// by a DELETED registration is not excluded; deleting a registration keeps
+// the files deliberately, so document that dual-role operators should keep
+// registrations for as long as the data sits in storage.
+func receivedNamespaces(registry *edgesync.Registry) func(ctx context.Context) (map[string]struct{}, error) {
+	return func(ctx context.Context) (map[string]struct{}, error) {
+		spokes, err := registry.List(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make(map[string]struct{}, len(spokes))
+		for _, sp := range spokes {
+			out[sp.SpokeID] = struct{}{}
+		}
+		return out, nil
+	}
 }
 
 // createWALRecoveryCallback creates a reusable WAL recovery callback function.

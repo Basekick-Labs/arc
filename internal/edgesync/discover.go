@@ -26,6 +26,17 @@ type Discoverer struct {
 	hubID   string
 	logger  zerolog.Logger
 
+	// namespaceExcluder, when set, returns the top-level path segments this
+	// node holds ON BEHALF OF OTHERS — the spoke namespaces a dual-role
+	// (hub+spoke) node received from other edges. Discovery skips them:
+	// without this, a hub that is also a spoke re-discovers other spokes'
+	// received files and forwards them, double-namespaced, to ITS upstream
+	// hub — an undocumented, unbounded relay (2026-08-19 audit M2). Relaying
+	// may become a real feature; today it is opt-nothing and surprising, so
+	// it is off. An excluder ERROR aborts discovery (fail-safe: a transient
+	// registry error must not silently start relaying).
+	namespaceExcluder func(ctx context.Context) (map[string]struct{}, error)
+
 	// compactionDeferEpoch, when non-zero, activates issue-#610 handling of
 	// tier-suffixed compacted files that are NOT in the ledger: one whose
 	// embedded timestamp is AFTER the epoch is a crash orphan — produced
@@ -42,6 +53,12 @@ type Discoverer struct {
 // discrimination (issue #610). Zero deactivates it.
 func (d *Discoverer) SetCompactionDeferEpoch(epoch time.Time) {
 	d.compactionDeferEpoch = epoch
+}
+
+// SetNamespaceExcluder installs the received-namespace exclusion for
+// dual-role nodes. nil deactivates it.
+func (d *Discoverer) SetNamespaceExcluder(fn func(ctx context.Context) (map[string]struct{}, error)) {
+	d.namespaceExcluder = fn
 }
 
 // NewDiscoverer validates configuration and returns a ready discoverer.
@@ -79,6 +96,16 @@ func (d *Discoverer) Discover(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("edgesync: list local files: %w", err)
 	}
 
+	var excluded map[string]struct{}
+	if d.namespaceExcluder != nil {
+		excluded, err = d.namespaceExcluder(ctx)
+		if err != nil {
+			// Fail-safe: proceeding without the exclusion set would relay
+			// other spokes' received data upstream on a registry blip.
+			return 0, fmt.Errorf("edgesync: list received namespaces for discovery exclusion: %w", err)
+		}
+	}
+
 	entries := make([]*LedgerEntry, 0, len(objects))
 	for _, obj := range objects {
 		if err := ctx.Err(); err != nil {
@@ -86,6 +113,20 @@ func (d *Discoverer) Discover(ctx context.Context) (int, error) {
 		}
 		if !isSyncableFile(obj.Path) {
 			continue
+		}
+		if len(excluded) > 0 {
+			// First segment alone, NOT splitFirstTwo: that helper requires
+			// three segments, but a spoke can legally sync a root-level file
+			// the hub stores as {spokeID}/x.parquet — two segments, which
+			// would escape the exclusion and relay upstream (deep-review
+			// High on this change).
+			if i := strings.IndexByte(obj.Path, '/'); i > 0 {
+				if _, isReceived := excluded[obj.Path[:i]]; isReceived {
+					// Another spoke's data, held here as a hub. Not this
+					// node's telemetry; never forwarded upstream.
+					continue
+				}
+			}
 		}
 
 		// Skip anything already tracked BEFORE hashing it. Discovery runs

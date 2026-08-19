@@ -252,6 +252,8 @@ Reconcile is answered from a hub-side index of received files rather than by rea
 
 Resume is supported on local storage. On S3 and Azure a dropped transfer restarts from zero, because block objects cannot be appended to; this is a throughput cost on intermittent links, not a correctness problem.
 
+**A hub that is also a spoke no longer relays other spokes' data upstream.** On a dual-role node, discovery used to walk the whole storage backend — including the namespaces this node holds *as a hub* — and forward other edges' received files, double-namespaced, to its own upstream hub: an undocumented, unbounded relay. Received spoke namespaces (the registered spoke IDs) are now excluded from the node's own sync discovery; explicit relay topologies may become a real feature later. One operational note: deleting a spoke's registration deliberately keeps its files, but a dual-role node stops excluding an unregistered namespace — keep registrations for as long as the data sits in storage, and don't name a local database the same as a registered spoke ID. Two smaller cleanups ride along: the hub-ID mismatch answer on `/sync/file` and `/sync/reconcile` now comes *after* HMAC verification (an unauthenticated caller could previously confirm the hub's ID by iterating candidates), and the never-written `sync_history` table is dropped from spoke ledgers.
+
 Abandoned partial uploads are swept from the staging area hourly once they are older than `edge_sync.staging_sweep_max_age_hours` (default 72 — deliberately longer than a plausible contact gap, because a staged partial is also the spoke's resume checkpoint; 0 disables the sweep).
 
 ### The spoke side
