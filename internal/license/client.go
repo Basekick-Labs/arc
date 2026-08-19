@@ -48,11 +48,18 @@ type Client struct {
 	licenseKey  string
 	fingerprint string
 	cacheDir    string
-	httpClient  *http.Client
-	license     *License
-	mu          sync.RWMutex
-	stopCh      chan struct{}
-	logger      zerolog.Logger
+	// offline marks a file-mode client (NewOfflineClient): network-free, no
+	// periodic validation, no cache.
+	offline bool
+	// source says where the CURRENT license came from ("server", "cache",
+	// "file") for /health; guarded by mu. A cache-boot flips to "server" on
+	// the first successful background verify.
+	source     LicenseSource
+	httpClient *http.Client
+	license    *License
+	mu         sync.RWMutex
+	stopCh     chan struct{}
+	logger     zerolog.Logger
 }
 
 // VerifyRequest represents a license verification request
@@ -152,6 +159,9 @@ type ActivateResponse struct {
 
 // Activate registers this machine with the license server
 func (c *Client) Activate(ctx context.Context) (*License, error) {
+	if c.offline {
+		return nil, fmt.Errorf("license client is in offline file mode; network operations are disabled")
+	}
 	url := fmt.Sprintf("%s/api/v1/activate", c.serverURL)
 
 	hostname, _ := os.Hostname()
@@ -231,6 +241,7 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 	// Store the license
 	c.mu.Lock()
 	c.license = license
+	c.source = SourceServer
 	c.mu.Unlock()
 
 	// Persist the verified pair for boot resilience (see cache.go).
@@ -249,6 +260,9 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 
 // Verify validates the license with the enterprise server
 func (c *Client) Verify(ctx context.Context) (*License, error) {
+	if c.offline {
+		return nil, fmt.Errorf("license client is in offline file mode; network operations are disabled")
+	}
 	url := fmt.Sprintf("%s/api/v1/verify", c.serverURL)
 
 	c.logger.Debug().
@@ -316,6 +330,7 @@ func (c *Client) Verify(ctx context.Context) (*License, error) {
 	// Store the license
 	c.mu.Lock()
 	c.license = license
+	c.source = SourceServer
 	c.mu.Unlock()
 
 	// Persist the verified pair for boot resilience (see cache.go).
@@ -361,6 +376,10 @@ func (c *Client) ActivateOrVerify(ctx context.Context) (*License, error) {
 
 // StartPeriodicValidation starts background license validation
 func (c *Client) StartPeriodicValidation(interval time.Duration) {
+	if c.offline {
+		c.logger.Debug().Msg("offline license mode: periodic validation disabled")
+		return
+	}
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()

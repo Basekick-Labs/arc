@@ -16,6 +16,7 @@ import (
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/fips"
+	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/logger"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/gofiber/fiber/v2"
@@ -62,6 +63,16 @@ type Server struct {
 	// deployments may be healthy or permanently credential-less by design and
 	// must not flap the LB.
 	storageCredsFailReady bool
+
+	// licenseStatus supplies the /health "license" field: tier/status/source/
+	// expiry only — no key material, no customer identity, no feature list
+	// (unauthenticated endpoint, same posture as the "storage" field). Wired
+	// by main.go whenever a license is CONFIGURED — including the
+	// configured-but-failed case, which reports tier "oss"/status
+	// "unlicensed" so monitoring catches a pod that silently fell back
+	// (the invisible state behind the 27-restart field incident). Absent for
+	// deployments with no license configured at all.
+	licenseStatus func() license.LicenseHealth
 }
 
 // ServerConfig holds server configuration
@@ -220,6 +231,11 @@ func (s *Server) RegisterLogsRoute(authManager *auth.AuthManager) {
 	s.app.Get("/api/v1/logs", withAdminAuth(authManager), s.logsHandler)
 }
 
+// SetLicenseStatus wires the /health "license" field source.
+func (s *Server) SetLicenseStatus(fn func() license.LicenseHealth) {
+	s.licenseStatus = fn
+}
+
 // SetStorageStatus wires the per-tier storage credential status source
 // (database.DuckDB.StorageCredentialStatus) into /health and, when
 // server.storage_credentials_fail_ready is set, /ready. failReady gates the
@@ -256,6 +272,9 @@ func (s *Server) healthHandler(c *fiber.Ctx) error {
 		if st := s.storageStatus(); len(st) > 0 {
 			payload["storage"] = st
 		}
+	}
+	if s.licenseStatus != nil {
+		payload["license"] = s.licenseStatus()
 	}
 	return c.JSON(payload)
 }
