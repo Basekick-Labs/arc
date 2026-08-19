@@ -60,6 +60,19 @@ spec:
               mountPath: /etc/arc/tls
               readOnly: true
             {{- end }}
+          startupProbe:
+            # Boot can legitimately take minutes: the license phase retries a
+            # transient license-server outage (bounded 45s) and multi-writer
+            # WAL recovery replays before the listener binds — during which
+            # /health is connection-refused. Without this gate the liveness
+            # probe (kill at ~60s) would murder booting pods, converting a
+            # slow boot into a crash-loop. 30 * 10s = 5 minutes of grace;
+            # liveness takes over only after the first success.
+            httpGet:
+              path: /health
+              port: 8000
+            failureThreshold: {{ .Values.compactor.startupProbeFailureThreshold | default 30 }}
+            periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /health

@@ -131,13 +131,21 @@ func main() {
 		var err error
 		licenseClient, err = license.NewClient(&license.ClientConfig{
 			LicenseKey: cfg.License.Key,
-			Logger:     logger.Get("license"),
+			// Cache lives next to the auth DB (per-pod volume): boot survives a
+			// transient license-server outage on the last verified license,
+			// honored until ITS OWN expiry. Deliberately inside the Key != ""
+			// branch — removing the key must also stop cache consultation.
+			CacheDir: filepath.Dir(cfg.Auth.DBPath),
+			Logger:   logger.Get("license"),
 		})
 		if err != nil {
 			log.Warn().Err(err).Msg("Failed to initialize license client - enterprise features disabled")
 		} else {
-			// Activate or verify license at startup
-			lic, err := licenseClient.ActivateOrVerify(context.Background())
+			// Activate or verify at startup: bounded retries, then — for
+			// transient failures only — the signature-verified cache. A
+			// definitive server rejection still lands in OSS mode; a
+			// deploy-window ingress 404 no longer crash-loops the cluster.
+			lic, src, err := licenseClient.ActivateOrVerifyResilient(context.Background())
 			if err != nil {
 				log.Warn().
 					Err(err).
@@ -145,14 +153,21 @@ func main() {
 					Msg("License activation/verification failed - enterprise features disabled")
 				licenseClient = nil
 			} else {
-				log.Info().
-					Str("tier", string(lic.Tier)).
-					Str("status", lic.Status).
-					Int("days_remaining", lic.DaysRemaining).
-					Int("max_cores", lic.MaxCores).
-					Time("expires_at", lic.ExpiresAt).
-					Strs("features", lic.Features).
-					Msg("Enterprise license verified successfully")
+				if src == license.SourceCache {
+					log.Warn().
+						Str("tier", string(lic.Tier)).
+						Time("expires_at", lic.ExpiresAt).
+						Msg("license server unreachable; running on the cached verified license until it expires or the server recovers (background re-verification continues)")
+				} else {
+					log.Info().
+						Str("tier", string(lic.Tier)).
+						Str("status", lic.Status).
+						Int("days_remaining", lic.DaysRemaining).
+						Int("max_cores", lic.MaxCores).
+						Time("expires_at", lic.ExpiresAt).
+						Strs("features", lic.Features).
+						Msg("Enterprise license verified successfully")
+				}
 
 				// Apply core limits from license to config
 				// This ensures DuckDB and ingestion workers respect the license

@@ -441,6 +441,23 @@ Reachable only when RBAC is enabled (the multi-tenant authorization boundary); n
 
 ## Bug fixes
 
+### License-server outages no longer crash-loop Enterprise clusters ([field report])
+
+Every pod boot used to make one blocking license check against `enterprise.basekick.net` with no retry and no memory: any transient failure — a deploy-window ingress 404, DNS, an egress blip — dropped the pod to OSS mode, and for enterprise-required configurations (shared-storage multi-writer) that is a **fatal exit**. One customer watched a writer accumulate 27 restarts during a brief license-server deploy. License-server availability was, in effect, a hard runtime dependency of every pod restart.
+
+Boot now works like this:
+
+1. **Bounded retry** — up to three attempts with jittered backoff, the whole phase capped at 45 seconds, so a black-holed endpoint can't stretch startup past probe budgets.
+2. **Failure classification** — a *definitive* answer (the server spoke the license protocol and said no: revoked, suspended, expired, unknown key) still lands in OSS mode immediately, no retries. Only *non-definitive* failures — unreachable, 5xx, rate-limited, or a 4xx **without** the protocol's JSON body (an ingress error page, exactly the field incident) — proceed to:
+3. **The cached license** — after every successful activation or verification, Arc persists the server's signed response (`license_cache.json`, `0600`, next to the auth DB). When the server can't answer, the cache is re-verified from scratch — RSA signature against the pinned key, license key must match the configured key, machine binding must match **this** machine, and expiry is enforced — and if it holds, the pod boots **fully licensed until the license's own expiry**, with a prominent warning and background re-verification continuing. A cache file copied to another machine fails the binding check (the fingerprint is hostname/hardware-derived — this stops casual copying, the same bar as online activation, not a determined cloner); removing or changing `license.key` stops the cache being consulted at all; **no new grace period exists** — the cache is honored to `expires_at`, never past it. One accepted property, stated plainly: a license revoked *during* an outage keeps working from cache until the server is reachable again or the license expires — revocation was only ever enforceable online, and a definitive server answer always wins the moment one arrives.
+
+Two more fixes in the same change:
+
+- **A latent crash-loop nobody had reported yet**: the license server reaps activations that haven't been heard from in 72 hours, but the "heard from" signal was only ever sent by a heartbeat call Arc never made — so any machine with a stable fingerprint was silently revoked 72 hours after activating, and its next restart crash-looped. Arc now re-activates on that condition (a deliberately revoked *license* still refuses definitively), and the license server counts successful verifications as liveness.
+- The Helm chart's Arc pods gain a **startupProbe** (5 minutes of grace): the liveness probe used to be able to kill a legitimately slow boot — license retries plus multi-writer WAL recovery — at about 60 seconds, before the HTTP listener even bound.
+
+Air-gapped, fully offline license files (no server dependency at all) are the follow-up currently in flight.
+
 ### Azure managed-identity credentials on the query path now refresh — and no longer die an hour in ([#605](https://github.com/Basekick-Labs/arc/issues/605))
 
 The same class as the S3/IRSA bug above, on the other cloud: DuckDB's azure `CREDENTIAL_CHAIN` secret materializes an AAD token **once** at secret creation and never refreshes it, while AAD access tokens live about an hour — so on `storage.backend = azure` with managed identity or a service-principal environment, query reads died roughly an hour after each process start, with ingest unaffected.

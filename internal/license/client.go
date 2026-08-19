@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -34,7 +35,11 @@ const (
 // ClientConfig holds configuration for the license client
 type ClientConfig struct {
 	LicenseKey string
-	Logger     zerolog.Logger
+	// CacheDir, when non-empty, enables the on-disk license cache
+	// (license_cache.json) used for boot resilience when the license server
+	// is unreachable. See cache.go.
+	CacheDir string
+	Logger   zerolog.Logger
 }
 
 // Client handles license validation with the enterprise server
@@ -42,6 +47,7 @@ type Client struct {
 	serverURL   string
 	licenseKey  string
 	fingerprint string
+	cacheDir    string
 	httpClient  *http.Client
 	license     *License
 	mu          sync.RWMutex
@@ -97,6 +103,7 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 	c := &Client{
 		serverURL:   LicenseServerURL,
 		licenseKey:  cfg.LicenseKey,
+		cacheDir:    cfg.CacheDir,
 		fingerprint: fingerprint,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
@@ -178,7 +185,7 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		c.logger.Error().Err(err).Msg("License activation request failed")
-		return nil, fmt.Errorf("license activation request failed: %w", err)
+		return nil, transientErr("license activation request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -187,7 +194,8 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 	}
 	var activateResp ActivateResponse
 	if err := readBoundedJSON(resp, &activateResp); err != nil {
-		return nil, fmt.Errorf("failed to decode activation response: %w", err)
+		// Malformed 200 = proxy default backend, not a protocol answer.
+		return nil, transientErr("failed to decode activation response: %w", err)
 	}
 
 	if !activateResp.Success {
@@ -196,7 +204,8 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 			errMsg = "license activation failed"
 		}
 		c.logger.Warn().Str("error", errMsg).Msg("License activation failed")
-		return nil, fmt.Errorf("license activation failed: %s", errMsg)
+		// 200 envelope rejection: the server spoke the protocol and said no.
+		return nil, definitiveErr("license activation failed: %s", errMsg)
 	}
 
 	// Verify the detached signature against the raw license_file
@@ -207,11 +216,13 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 	signed, err := VerifyLicenseFile(activateResp.LicenseFile, activateResp.LicenseSignature)
 	if err != nil {
 		c.logger.Warn().Err(err).Msg("License activation: signature verification failed")
-		return nil, fmt.Errorf("license activation failed: %w", err)
+		// Protocol violation (or MITM): transient — the cache re-verifies
+		// independently, so preferring it cannot be worse than this response.
+		return nil, transientErr("license activation failed: %w", err)
 	}
 	if err := c.bindFingerprint(signed); err != nil {
 		c.logger.Warn().Err(err).Msg("License activation: fingerprint binding mismatch")
-		return nil, fmt.Errorf("license activation failed: %w", err)
+		return nil, transientErr("license activation failed: %w", err)
 	}
 	c.logger.Debug().Msg("signature verified")
 
@@ -221,6 +232,9 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 	c.mu.Lock()
 	c.license = license
 	c.mu.Unlock()
+
+	// Persist the verified pair for boot resilience (see cache.go).
+	c.saveCache(activateResp.LicenseFile, activateResp.LicenseSignature)
 
 	c.logger.Info().
 		Str("tier", string(license.Tier)).
@@ -254,7 +268,7 @@ func (c *Client) Verify(ctx context.Context) (*License, error) {
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		c.logger.Error().Err(err).Msg("License verification request failed")
-		return nil, fmt.Errorf("license verification request failed: %w", err)
+		return nil, transientErr("license verification request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -263,7 +277,7 @@ func (c *Client) Verify(ctx context.Context) (*License, error) {
 	}
 	var verifyResp VerifyResponse
 	if err := readBoundedJSON(resp, &verifyResp); err != nil {
-		return nil, fmt.Errorf("failed to decode verify response: %w", err)
+		return nil, transientErr("failed to decode verify response: %w", err)
 	}
 
 	if !verifyResp.Valid {
@@ -272,18 +286,28 @@ func (c *Client) Verify(ctx context.Context) (*License, error) {
 			errMsg = "license validation failed"
 		}
 		c.logger.Warn().Str("error", errMsg).Msg("License validation failed")
-		return nil, fmt.Errorf("license validation failed: %s", errMsg)
+		// Two envelope rejections are NOT terminal (activation is the intended
+		// recovery); matched EXACTLY against the server's strings here — where
+		// the raw envelope is in hand — rather than substring-scanned on a
+		// wrapped message that also embeds HTTP body previews. The server side
+		// carries a frozen-contract comment on these strings.
+		if errMsg == "machine not activated for this license" || errMsg == "activation has been revoked" {
+			return nil, fmt.Errorf("license validation failed: %w: %s", errActivationMissing, errMsg)
+		}
+		// Everything else = definitive (unknown strings included: the server
+		// spoke the protocol and said no).
+		return nil, definitiveErr("license validation failed: %s", errMsg)
 	}
 
 	// Same detached-signature verification path as Activate.
 	signed, err := VerifyLicenseFile(verifyResp.LicenseFile, verifyResp.LicenseSignature)
 	if err != nil {
 		c.logger.Warn().Err(err).Msg("License verification: signature verification failed")
-		return nil, fmt.Errorf("license validation failed: %w", err)
+		return nil, transientErr("license validation failed: %w", err)
 	}
 	if err := c.bindFingerprint(signed); err != nil {
 		c.logger.Warn().Err(err).Msg("License verification: fingerprint binding mismatch")
-		return nil, fmt.Errorf("license validation failed: %w", err)
+		return nil, transientErr("license validation failed: %w", err)
 	}
 	c.logger.Debug().Msg("signature verified")
 
@@ -293,6 +317,9 @@ func (c *Client) Verify(ctx context.Context) (*License, error) {
 	c.mu.Lock()
 	c.license = license
 	c.mu.Unlock()
+
+	// Persist the verified pair for boot resilience (see cache.go).
+	c.saveCache(verifyResp.LicenseFile, verifyResp.LicenseSignature)
 
 	c.logger.Info().
 		Str("tier", string(license.Tier)).
@@ -313,13 +340,22 @@ func (c *Client) ActivateOrVerify(ctx context.Context) (*License, error) {
 		return license, nil
 	}
 
-	// If verification failed with "machine not activated", try to activate
-	if strings.Contains(err.Error(), "machine not activated") {
-		c.logger.Info().Msg("Machine not activated, attempting activation")
+	// errActivationMissing covers the two NOT-terminal verify rejections —
+	// activation is the server's intended recovery path for both:
+	//   - "machine not activated": first boot on this fingerprint.
+	//   - "activation has been revoked": the server's stale-activation reaper
+	//     revokes activations without a heartbeat for 72h, and Arc has never
+	//     sent heartbeats — so this is a ROUTINE condition for any
+	//     stable-fingerprint machine, not an operator decision. Re-activating
+	//     re-creates the activation record (the server supports it); a
+	//     deliberately revoked LICENSE still rejects the re-activation
+	//     definitively ("license is not active").
+	if errors.Is(err, errActivationMissing) {
+		c.logger.Info().Msg("No live activation for this machine, attempting activation")
 		return c.Activate(ctx)
 	}
 
-	// Other error, return it
+	// Other error, return it (carrying its failure class).
 	return nil, err
 }
 
@@ -333,7 +369,11 @@ func (c *Client) StartPeriodicValidation(interval time.Duration) {
 			select {
 			case <-ticker.C:
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				_, err := c.Verify(ctx)
+				// ActivateOrVerify, not bare Verify: an activation reaped
+				// during a long outage (>72h without a liveness signal)
+				// self-heals on the next tick instead of warning every 4h
+				// until restart — and each success refreshes the cache.
+				_, err := c.ActivateOrVerify(ctx)
 				if err != nil {
 					c.logger.Warn().Err(err).Msg("Periodic license validation failed")
 				}
@@ -506,6 +546,11 @@ func (c *Client) bindFingerprint(signed *SignedLicense) error {
 // 'H' looking for beginning of value" — much easier to triage.
 //
 // Doesn't close resp.Body — caller's defer handles that.
+// checkHTTPStatus returns nil for 2xx and a CLASSIFIED error otherwise: 5xx
+// and 429 are transient; a 4xx is definitive only when its body is the
+// protocol's own JSON error shape — a bare/HTML 4xx is an ingress artifact
+// (the field incident: deploy-window 404s crash-looped a cluster). The message
+// embeds a bounded, rune-safe preview of the body for diagnosis.
 func checkHTTPStatus(resp *http.Response) error {
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil
@@ -522,10 +567,16 @@ func checkHTTPStatus(resp *http.Response) error {
 	if runes := []rune(previewStr); len(runes) > 256 {
 		previewStr = string(runes[:256]) + "...[truncated]"
 	}
-	if previewStr == "" {
-		return fmt.Errorf("HTTP %d from license server", resp.StatusCode)
+	definitive := resp.StatusCode >= 400 && resp.StatusCode < 500 &&
+		resp.StatusCode != 429 && isProtocolJSONBody(previewStr)
+	mk := transientErr
+	if definitive {
+		mk = definitiveErr
 	}
-	return fmt.Errorf("HTTP %d from license server: %s", resp.StatusCode, previewStr)
+	if previewStr == "" {
+		return mk("HTTP %d from license server", resp.StatusCode)
+	}
+	return mk("HTTP %d from license server: %s", resp.StatusCode, previewStr)
 }
 
 // readBoundedJSON decodes a JSON response body into `v`, refusing to
