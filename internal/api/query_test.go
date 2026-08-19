@@ -116,9 +116,13 @@ func TestMaskStringLiterals(t *testing.T) {
 			expectedMasks:  1,
 		},
 		{
-			name:           "double quoted string",
+			// A double-quoted token is a DuckDB IDENTIFIER, not a string, so
+			// it masks into the distinct __IDENT__ class the table rewriter
+			// resolves through (quoted/hyphenated database names — the fix
+			// that made edge-sync spoke data queryable on a hub).
+			name:           "double quoted identifier",
 			input:          `SELECT * FROM t WHERE x = "hello"`,
-			expectedMasked: "SELECT * FROM t WHERE x = __STR_0__",
+			expectedMasked: "SELECT * FROM t WHERE x = __IDENT_0__",
 			expectedMasks:  1,
 		},
 		{
@@ -1174,7 +1178,15 @@ func TestValidateSQLRequest_BypassesAndFalsePositives(t *testing.T) {
 		{name: "trailing semicolon with spaces allowed", sql: "SELECT * FROM cpu;   ", shouldFail: false},
 		{name: "semicolon inside string literal allowed", sql: "SELECT * FROM logs WHERE msg = 'a;b'", shouldFail: false},
 		{name: "semicolon inside comment allowed", sql: "SELECT * FROM cpu -- a;b\n", shouldFail: false},
-		{name: "semicolon inside backtick identifier allowed", sql: "SELECT * FROM `my;db`", shouldFail: false},
+		// Since the quoted-identifier table-position check (26.09.1), an
+		// identifier that can never name a real Arc table is rejected
+		// explicitly IN TABLE POSITION — with the identifier error, not the
+		// multi-statement one this case originally pinned against. The
+		// original property (a `;` inside a quoted identifier is not a
+		// statement separator) is preserved by the column-position case
+		// below, which must stay allowed.
+		{name: "semicolon inside backtick identifier in table position rejected as invalid name", sql: "SELECT * FROM `my;db`", shouldFail: true},
+		{name: "semicolon inside backtick identifier in column position allowed", sql: "SELECT `my;col` FROM cpu", shouldFail: false},
 		{name: "SHOW smuggled behind semicolon in backtick db", sql: "SHOW TABLES FROM `db`; SELECT 1", shouldFail: true},
 	}
 
@@ -2092,7 +2104,7 @@ func TestJoinModifierRBACExtraction(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.sql, func(t *testing.T) {
-			got := extractTableReferences(tt.sql)
+			got := extractTableReferences(tt.sql, nil)
 
 			for _, want := range tt.want {
 				found := false

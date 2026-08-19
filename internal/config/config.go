@@ -258,6 +258,13 @@ type EdgeSyncConfig struct {
 	// O(files) — while bounding the exposure. Default 10,000 entries (~2MB).
 	MaxReconcileEntries int
 
+	// StagingSweepMaxAgeHours is how old an abandoned staged partial upload
+	// must be before the hourly sweep reclaims it. A staged prefix is also a
+	// spoke's RESUME CHECKPOINT, so this must be comfortably longer than a
+	// plausible contact gap — sweeping too aggressively forces full re-sends
+	// on exactly the intermittent links resume exists for. Default 72h.
+	StagingSweepMaxAgeHours int
+
 	// Import is the hub's air-gap side: taking a bundle off removable media.
 	Import EdgeSyncImportConfig
 }
@@ -320,6 +327,14 @@ type EdgeSyncSpokeConfig struct {
 	// the committed copy looking load-bearing while still being leaked.
 	Secret string
 
+	// HubToken is an Arc API token for the hub, read ONLY from
+	// ARC_EDGE_SYNC_HUB_TOKEN. The hub's /api/v1/sync endpoints sit behind
+	// Arc's token middleware (write level) in addition to the per-spoke HMAC;
+	// this is the credential that satisfies the token layer. Optional: a hub
+	// running with auth disabled needs none, so an empty value is a startup
+	// warning rather than an error. Env-only for the same reason Secret is.
+	HubToken string
+
 	// MaxAttempts before a file is given up on. Zero uses the package default.
 	MaxAttempts int
 
@@ -327,9 +342,18 @@ type EdgeSyncSpokeConfig struct {
 	// are small.
 	MaxConcurrent int
 
-	// BatchSize caps how many files one reconcile asks about. Zero lets the
-	// hub's own limit decide, and a larger backlog pages.
+	// BatchSize caps how many files one reconcile asks about; a larger
+	// backlog pages. Zero offers the whole backlog in one reconcile. Either
+	// way, a page the hub refuses as too large is split and retried, so no
+	// value can leave a backlog undrainable.
 	BatchSize int
+
+	// LedgerRetentionDays is how long terminal ledger rows (synced, skipped)
+	// are kept before the periodic prune deletes them. The rows are
+	// bookkeeping about files that finished their journey; without pruning
+	// the ledger grows without bound on the box least able to receive a site
+	// visit. 0 disables pruning. Default 90.
+	LedgerRetentionDays int
 
 	// Bundle configures air-gap export.
 	Bundle EdgeSyncBundleConfig
@@ -806,24 +830,27 @@ func Load() (*Config, error) {
 			ForceBootstrap: v.GetBool("auth.force_bootstrap"),
 		},
 		EdgeSync: EdgeSyncConfig{
-			Enabled:             v.GetBool("edge_sync.enabled"),
-			HubID:               v.GetString("edge_sync.hub_id"),
-			MaxFileBytes:        int64(v.GetInt64("edge_sync.max_file_bytes")),
-			MaxReconcileEntries: v.GetInt("edge_sync.max_reconcile_entries"),
+			Enabled:                 v.GetBool("edge_sync.enabled"),
+			HubID:                   v.GetString("edge_sync.hub_id"),
+			MaxFileBytes:            int64(v.GetInt64("edge_sync.max_file_bytes")),
+			MaxReconcileEntries:     v.GetInt("edge_sync.max_reconcile_entries"),
+			StagingSweepMaxAgeHours: v.GetInt("edge_sync.staging_sweep_max_age_hours"),
 			Import: EdgeSyncImportConfig{
 				Enabled:     v.GetBool("edge_sync.import.enabled"),
 				AllowedDirs: v.GetStringSlice("edge_sync.import.allowed_dirs"),
 				MaxFiles:    v.GetInt64("edge_sync.import.max_files"),
 			},
 			Spoke: EdgeSyncSpokeConfig{
-				Enabled:       v.GetBool("edge_sync.spoke.enabled"),
-				HubURL:        v.GetString("edge_sync.spoke.hub_url"),
-				SpokeID:       v.GetString("edge_sync.spoke.spoke_id"),
-				HubID:         v.GetString("edge_sync.spoke.hub_id"),
-				Secret:        os.Getenv("ARC_EDGE_SYNC_SPOKE_SECRET"),
-				MaxAttempts:   v.GetInt("edge_sync.spoke.max_attempts"),
-				MaxConcurrent: v.GetInt("edge_sync.spoke.max_concurrent"),
-				BatchSize:     v.GetInt("edge_sync.spoke.batch_size"),
+				Enabled:             v.GetBool("edge_sync.spoke.enabled"),
+				HubURL:              v.GetString("edge_sync.spoke.hub_url"),
+				SpokeID:             v.GetString("edge_sync.spoke.spoke_id"),
+				HubID:               v.GetString("edge_sync.spoke.hub_id"),
+				Secret:              os.Getenv("ARC_EDGE_SYNC_SPOKE_SECRET"),
+				HubToken:            os.Getenv("ARC_EDGE_SYNC_HUB_TOKEN"),
+				MaxAttempts:         v.GetInt("edge_sync.spoke.max_attempts"),
+				MaxConcurrent:       v.GetInt("edge_sync.spoke.max_concurrent"),
+				BatchSize:           v.GetInt("edge_sync.spoke.batch_size"),
+				LedgerRetentionDays: v.GetInt("edge_sync.spoke.ledger_retention_days"),
 				Bundle: EdgeSyncBundleConfig{
 					Enabled:     v.GetBool("edge_sync.spoke.bundle.enabled"),
 					AllowedDirs: v.GetStringSlice("edge_sync.spoke.bundle.allowed_dirs"),
@@ -1203,6 +1230,11 @@ func Load() (*Config, error) {
 			"supply it via the ARC_EDGE_SYNC_SPOKE_SECRET environment variable so a write credential " +
 			"is not stored in a file that gets copied, backed up, and committed")
 	}
+	if v.InConfig("edge_sync.spoke.hub_token") {
+		return nil, fmt.Errorf("edge_sync.spoke.hub_token must not be set in the configuration file; " +
+			"supply it via the ARC_EDGE_SYNC_HUB_TOKEN environment variable so a write credential " +
+			"is not stored in a file that gets copied, backed up, and committed")
+	}
 
 	if cfg.EdgeSync.Spoke.Enabled {
 		if cfg.EdgeSync.Spoke.HubURL == "" {
@@ -1237,7 +1269,7 @@ func Load() (*Config, error) {
 		// for; the agent clamps defensively, but an operator who typed it
 		// should be told at startup rather than have it quietly ignored.
 		if cfg.EdgeSync.Spoke.BatchSize < 0 {
-			return nil, fmt.Errorf("edge_sync.spoke.batch_size must be >= 0 (got %d); 0 means \"use the hub's cap\"",
+			return nil, fmt.Errorf("edge_sync.spoke.batch_size must be >= 0 (got %d); 0 means \"offer the whole backlog in one reconcile\"",
 				cfg.EdgeSync.Spoke.BatchSize)
 		}
 		if cfg.EdgeSync.Spoke.MaxAttempts < 0 {
@@ -1455,6 +1487,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("edge_sync.hub_id", "")
 	v.SetDefault("edge_sync.max_file_bytes", 512*1024*1024) // 512MiB per upload
 	v.SetDefault("edge_sync.max_reconcile_entries", 10000)  // ~2MB per discovery batch
+	// 72h, not shorter: a staged partial is also a spoke's resume checkpoint,
+	// and sweeping inside a plausible contact gap forces full re-sends on
+	// exactly the intermittent links resume exists for.
+	v.SetDefault("edge_sync.staging_sweep_max_age_hours", 72)
 
 	// Spoke side. Declared here rather than relying only on the agent's
 	// zero-value fallbacks so the defaults are visible to an operator reading
@@ -1465,7 +1501,13 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("edge_sync.spoke.hub_id", "")
 	v.SetDefault("edge_sync.spoke.max_attempts", 5)   // before a file is marked failed
 	v.SetDefault("edge_sync.spoke.max_concurrent", 2) // edge boxes are small
-	v.SetDefault("edge_sync.spoke.batch_size", 0)     // 0 defers to the hub's cap
+	// 1000, not 0: a page must fit under the hub's max_reconcile_entries
+	// (default 10000) AND its derived byte limit, and it bounds how much of
+	// the backlog the spoke loads into memory per page. 0 ("send the whole
+	// backlog in one reconcile") is an explicit opt-in; the agent splits and
+	// retries on a 413 either way, so no value can strand a backlog.
+	v.SetDefault("edge_sync.spoke.batch_size", 1000)
+	v.SetDefault("edge_sync.spoke.ledger_retention_days", 90) // terminal (synced/skipped) rows; 0 = never prune
 
 	// Air-gap bundle export. allowed_dirs has no default on purpose: an empty
 	// list refuses every export, so an operator must state where bundles may

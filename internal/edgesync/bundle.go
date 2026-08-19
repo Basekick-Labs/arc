@@ -195,6 +195,11 @@ type ExportResult struct {
 	FileCount int
 	Bytes     int64
 	Duration  time.Duration
+
+	// Skipped is how many eligible entries were dropped because their source
+	// file vanished before export (compaction or retention). Set by the
+	// Exporter's pre-check, not the writer.
+	Skipped int
 }
 
 // Export writes entries to a new bundle directory under parent.

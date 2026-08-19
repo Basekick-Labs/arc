@@ -64,12 +64,13 @@ const (
 	// StateFailed — exhausted retries. Terminal until an operator intervenes.
 	StateFailed SyncState = "failed"
 
-	// StateSkipped — deliberately excluded (e.g. a future filtering policy).
-	//
-	// TODO(#569): reserved, nothing sets it in phase 1. Stats deliberately
-	// does not count it, so a skipped row would be invisible to operators —
-	// whoever introduces the first writer must add it to Stats at the same
-	// time, or drop this constant.
+	// StateSkipped — the source file vanished from local storage (compaction
+	// or retention deleted it) before it could be delivered. Terminal: the
+	// content no longer exists to send. Without this state a vanished pending
+	// file wedged air-gap export forever (the export failed wholesale and
+	// re-selected the same entry every time) and burned the network path's
+	// full retry budget per pass. Counted in Stats and reported in /status;
+	// reclaimed by PruneSkipped.
 	StateSkipped SyncState = "skipped"
 )
 
@@ -719,6 +720,30 @@ func (l *Ledger) MarkFailed(ctx context.Context, hubID, path, errMsg string, max
 	return l.checkTransition(ctx, res, hubID, path, StateInFlight)
 }
 
+// MarkSkipped records that an entry's source file vanished from storage
+// before delivery — compaction or retention got to it first.
+//
+// Legal from pending (the export pre-check finds the file gone) AND from
+// in_flight (the network path only learns mid-transfer: openAt streams
+// through an io.Pipe, so a missing file surfaces as a PutFile error after
+// MarkInFlight has already run). last_attempt is stamped because it is the
+// column PruneSkipped keys on — synced_at stays NULL on this path.
+func (l *Ledger) MarkSkipped(ctx context.Context, hubID, path, note string) error {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	res, err := l.db.ExecContext(ctx, `
+		UPDATE sync_ledger
+		SET state = ?, last_error = ?, last_attempt = ?
+		WHERE hub_id = ? AND path = ? AND state IN (?, ?)`,
+		string(StateSkipped), note, time.Now().UTC(),
+		hubID, path, string(StatePending), string(StateInFlight))
+	if err != nil {
+		return fmt.Errorf("edgesync: mark skipped %q: %w", path, err)
+	}
+	return l.checkTransition(ctx, res, hubID, path, StatePending, StateInFlight)
+}
+
 // RecoverInFlight reverts in_flight entries to pending. Call once at startup.
 //
 // An in_flight row can only have been written by a transfer that is no longer
@@ -759,6 +784,11 @@ type Stats struct {
 	Synced int64
 	Failed int64
 
+	// Skipped — the source file vanished (compaction/retention) before
+	// delivery. Terminal bookkeeping, not backlog: excluded from
+	// PendingBytes because there is nothing left to send.
+	Skipped int64
+
 	// PendingBytes is what has not reached a hub, INCLUDING exported bytes:
 	// a file on a drive in transit has not arrived. Excluding it would make an
 	// air-gap spoke's backlog appear to shrink the moment a bundle is written,
@@ -783,10 +813,11 @@ func (l *Ledger) Stats(ctx context.Context, hubID string) (*Stats, error) {
 			COALESCE(SUM(state = 'exported'), 0),
 			COALESCE(SUM(state = 'synced'), 0),
 			COALESCE(SUM(state = 'failed'), 0),
+			COALESCE(SUM(state = 'skipped'), 0),
 			COALESCE(SUM(CASE WHEN state IN ('pending','in_flight','exported')
 			                  THEN size_bytes - bytes_sent ELSE 0 END), 0)
 		FROM sync_ledger WHERE hub_id = ?`, hubID).
-		Scan(&s.Pending, &s.InFlight, &s.Exported, &s.Synced, &s.Failed, &s.PendingBytes)
+		Scan(&s.Pending, &s.InFlight, &s.Exported, &s.Synced, &s.Failed, &s.Skipped, &s.PendingBytes)
 	if err != nil {
 		return nil, fmt.Errorf("edgesync: ledger stats: %w", err)
 	}
@@ -908,6 +939,63 @@ func (l *Ledger) PruneSynced(ctx context.Context, retentionDays int) (int64, err
 		deleted, err := res.RowsAffected()
 		if err != nil {
 			return total, fmt.Errorf("edgesync: count pruned entries: %w", err)
+		}
+		total += deleted
+
+		if deleted < batchSize {
+			break
+		}
+	}
+	return total, nil
+}
+
+// PruneSkipped deletes skipped rows older than retentionDays.
+//
+// Same shape and discipline as PruneSynced (resolved id bound, 1000-row
+// batches, ctx checked between batches, Go-time-vs-Go-time comparison — see
+// the domain note there). Keys on last_attempt, which MarkSkipped stamps:
+// synced_at is NULL for a file that never arrived anywhere, so PruneSynced's
+// predicate can never reclaim these rows.
+func (l *Ledger) PruneSkipped(ctx context.Context, retentionDays int) (int64, error) {
+	if retentionDays <= 0 {
+		return 0, nil
+	}
+
+	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays)
+
+	var maxID int64
+	err := l.db.QueryRowContext(ctx, `
+		SELECT COALESCE(MAX(id), 0) FROM sync_ledger
+		WHERE state = ? AND last_attempt IS NOT NULL AND last_attempt < ?`,
+		string(StateSkipped), cutoff).Scan(&maxID)
+	if err != nil {
+		return 0, fmt.Errorf("edgesync: find skipped prune cutoff: %w", err)
+	}
+	if maxID == 0 {
+		return 0, nil
+	}
+
+	const batchSize = 1000
+	var total int64
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+
+		res, err := l.db.ExecContext(ctx, `
+			DELETE FROM sync_ledger WHERE id IN (
+				SELECT id FROM sync_ledger
+				WHERE id <= ? AND state = ? AND last_attempt IS NOT NULL AND last_attempt < ?
+				ORDER BY id ASC LIMIT ?
+			)`, maxID, string(StateSkipped), cutoff, batchSize)
+		if err != nil {
+			return total, fmt.Errorf("edgesync: prune skipped entries: %w", err)
+		}
+
+		deleted, err := res.RowsAffected()
+		if err != nil {
+			return total, fmt.Errorf("edgesync: count pruned skipped entries: %w", err)
 		}
 		total += deleted
 

@@ -27,6 +27,11 @@ import (
 type MemoryTransport struct {
 	mu sync.Mutex
 
+	// MaxReconcileEntries, when > 0, refuses larger reconcile batches with
+	// ReconcileTooLargeError — mirroring the real hub's cap so agent paging
+	// and 413 splitting are testable. Set before use; not synchronized.
+	MaxReconcileEntries int
+
 	// files is the hub's contents, keyed by hub ID then path.
 	files map[string]map[string]*memFile
 
@@ -157,6 +162,9 @@ func (m *MemoryTransport) stagingLocked(hubID string) map[string]*memFile {
 func (m *MemoryTransport) Reconcile(ctx context.Context, hubID string, pending []*LedgerEntry) (*ReconcileResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if m.MaxReconcileEntries > 0 && len(pending) > m.MaxReconcileEntries {
+		return nil, &ReconcileTooLargeError{MaxEntries: m.MaxReconcileEntries}
 	}
 
 	m.mu.Lock()

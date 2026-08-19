@@ -11,6 +11,17 @@ import (
 type StringMask struct {
 	Placeholder string
 	Original    string
+
+	// Identifier marks a double-quoted token. In DuckDB SQL `"…"` is an
+	// IDENTIFIER, never a string — masking it identically to '…' literals is
+	// what made quoted database/measurement names resolve to quote-polluted
+	// storage paths (the quotes were spliced back inside the read_parquet
+	// glob at unmask time). Identifier masks get a distinct placeholder class
+	// so the table-reference rewriter can resolve them to their unquoted
+	// names, while every other masking consumer (comment stripping,
+	// validateSQL, the FROM-in-function-body scanner, the partition pruner)
+	// still sees an inert placeholder.
+	Identifier bool
 }
 
 // MaskStringLiterals replaces string literals with placeholders to prevent regex from matching inside them.
@@ -31,6 +42,14 @@ func MaskStringLiterals(sql string, hasQuotes bool) (string, []StringMask) {
 
 	i := 0
 	maskIndex := 0
+	// Identical quoted identifiers share ONE placeholder. The CTE-name
+	// registry and the table rewriter compare captured names textually, so
+	// `WITH "x-y" AS (…) SELECT * FROM "x-y"` must present the same token at
+	// both sites — per-occurrence placeholders would make the FROM site miss
+	// the CTE and rewrite it to a nonexistent storage path.
+	// Allocated lazily: the common single-quote-only query on this hot path
+	// never carries a double-quoted identifier.
+	var identPlaceholders map[string]string
 
 	for i < len(sql) {
 		ch := sql[i]
@@ -64,12 +83,28 @@ func MaskStringLiterals(sql string, hasQuotes bool) (string, []StringMask) {
 				i++
 			}
 
-			// Extract the full string literal and create a placeholder
+			// Extract the full quoted token and create a placeholder.
 			original := sql[start:i]
-			placeholder := fmt.Sprintf("__STR_%d__", maskIndex)
-			masks = append(masks, StringMask{Placeholder: placeholder, Original: original})
-			result.WriteString(placeholder)
-			maskIndex++
+			if quote == '"' {
+				// Identifier class: deduplicated, distinct prefix (see the
+				// StringMask.Identifier comment).
+				placeholder, seen := identPlaceholders[original]
+				if !seen {
+					if identPlaceholders == nil {
+						identPlaceholders = make(map[string]string)
+					}
+					placeholder = fmt.Sprintf("__IDENT_%d__", maskIndex)
+					identPlaceholders[original] = placeholder
+					masks = append(masks, StringMask{Placeholder: placeholder, Original: original, Identifier: true})
+					maskIndex++
+				}
+				result.WriteString(placeholder)
+			} else {
+				placeholder := fmt.Sprintf("__STR_%d__", maskIndex)
+				masks = append(masks, StringMask{Placeholder: placeholder, Original: original})
+				result.WriteString(placeholder)
+				maskIndex++
+			}
 		} else {
 			result.WriteByte(ch)
 			i++
@@ -83,9 +118,38 @@ func MaskStringLiterals(sql string, hasQuotes bool) (string, []StringMask) {
 func UnmaskStringLiterals(sql string, masks []StringMask) string {
 	result := sql
 	for _, mask := range masks {
+		if mask.Identifier {
+			// Identifier placeholders are deduplicated at mask time, so one
+			// mask entry may stand for several occurrences.
+			result = strings.ReplaceAll(result, mask.Placeholder, mask.Original)
+			continue
+		}
 		result = strings.Replace(result, mask.Placeholder, mask.Original, 1)
 	}
 	return result
+}
+
+// IdentifierNames maps each identifier placeholder to its UNQUOTED name:
+// surrounding double quotes stripped and the `""` escape collapsed. This is
+// what the table-reference rewriter and the RBAC extractor resolve captured
+// placeholders through, so both see the same clean name — the
+// extraction-must-match-execution invariant.
+func IdentifierNames(masks []StringMask) map[string]string {
+	var out map[string]string
+	for _, mask := range masks {
+		if !mask.Identifier {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]string)
+		}
+		name := mask.Original
+		if len(name) >= 2 && name[0] == '"' && name[len(name)-1] == '"' {
+			name = name[1 : len(name)-1]
+		}
+		out[mask.Placeholder] = strings.ReplaceAll(name, `""`, `"`)
+	}
+	return out
 }
 
 // HasQuotes returns true if the SQL string contains any quote characters.
@@ -315,7 +379,7 @@ func UnmaskFromKeywordsInFunctionBodies(sql string, masks []FromMask) string {
 // masker runs before stripSQLComments, so `EXTRACT /* c */ (YEAR FROM x)`
 // must still be recognised.
 //
-// Rejects quoted identifiers — `"EXTRACT"(...)` or `` `EXTRACT`(...) `` is
+// Rejects quoted identifiers — `"EXTRACT"(...)` or “ `EXTRACT`(...) “ is
 // a user column, not the builtin. DuckDB does not accept backticks for
 // identifiers in its default parser, but the check costs nothing and
 // matches gemini-code-assist's defensive guidance.
@@ -459,7 +523,7 @@ func equalFoldASCII(a, b string) bool {
 }
 
 // EscapeStringLiteral escapes single quotes for safe use as a DuckDB
-// single-quoted string literal: 'foo' → 'foo', 'it's' → 'it''s'.
+// single-quoted string literal: 'foo' → 'foo', 'it's' → 'it”s'.
 // Use this for every interpolation into a DuckDB SQL fragment that
 // cannot be parameterised — most importantly `read_parquet('PATH')`,
 // where the path comes from user-controlled inputs (database header,

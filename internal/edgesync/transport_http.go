@@ -21,10 +21,11 @@ import (
 // outcome taxonomy, resume — lives above this in the interface, so an S3-relay
 // or sneakernet transport reuses it unchanged and only the wire format differs.
 type HTTPTransport struct {
-	baseURL string
-	spokeID string
-	secret  string
-	client  *http.Client
+	baseURL  string
+	spokeID  string
+	secret   string
+	apiToken string
+	client   *http.Client
 }
 
 // HTTPTransportConfig configures an HTTPTransport.
@@ -38,6 +39,12 @@ type HTTPTransportConfig struct {
 	// Secret is the hub-issued shared secret. Never logged, never persisted
 	// by this package — it arrives from the environment and stays in memory.
 	Secret string
+
+	// APIToken is an Arc API token for the hub's token middleware, which
+	// gates /api/v1/sync at write level ahead of the per-spoke HMAC. Optional:
+	// empty means no Authorization header, which only works against a hub
+	// running with auth disabled. Same handling discipline as Secret.
+	APIToken string
 
 	// Timeout bounds a single request. Zero means 30 minutes, matching the
 	// hub's receive timeout: a large Parquet file over a constrained link is
@@ -73,11 +80,28 @@ func NewHTTPTransport(cfg HTTPTransportConfig) (*HTTPTransport, error) {
 	}
 
 	return &HTTPTransport{
-		baseURL: strings.TrimRight(cfg.BaseURL, "/"),
-		spokeID: cfg.SpokeID,
-		secret:  cfg.Secret,
-		client:  client,
+		baseURL:  strings.TrimRight(cfg.BaseURL, "/"),
+		spokeID:  cfg.SpokeID,
+		secret:   cfg.Secret,
+		apiToken: cfg.APIToken,
+		client:   client,
 	}, nil
+}
+
+// ReconcileTooLargeError reports that the hub refused a reconcile batch with
+// 413. MaxEntries is the hub's advertised entry cap, or 0 when the refusal
+// came from a byte limit that advertises none (the route-level body cap).
+// The agent reacts by splitting the page and retrying, so this error never
+// fails a pass on its own.
+type ReconcileTooLargeError struct {
+	MaxEntries int
+}
+
+func (e *ReconcileTooLargeError) Error() string {
+	if e.MaxEntries > 0 {
+		return fmt.Sprintf("edgesync: hub refused reconcile batch as too large (max_entries=%d)", e.MaxEntries)
+	}
+	return "edgesync: hub refused reconcile batch as too large"
 }
 
 // Reconcile asks the hub which of the pending files it already holds.
@@ -122,6 +146,17 @@ func (t *HTTPTransport) Reconcile(ctx context.Context, hubID string, pending []*
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusRequestEntityTooLarge {
+		// Two producers on the hub: the reconciler's entry cap (body carries
+		// max_entries) and the route-level byte limit (no max_entries). Both
+		// are typed so the agent splits the page instead of failing the pass.
+		var refusal struct {
+			MaxEntries int `json:"max_entries"`
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		_ = json.Unmarshal(body, &refusal)
+		return nil, &ReconcileTooLargeError{MaxEntries: refusal.MaxEntries}
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, t.statusError(resp, "reconcile")
 	}
@@ -242,6 +277,12 @@ func (t *HTTPTransport) decodePutResponse(resp *http.Response, entry *LedgerEntr
 
 // setAuthHeaders applies the headers every sync request carries.
 func (t *HTTPTransport) setAuthHeaders(req *http.Request, hubID, nonce string, ts int64, mac string) {
+	// Two layers, matching the hub's mount order: the Arc API token satisfies
+	// the token middleware ahead of the routes, then the HMAC headers bind
+	// this request to a spoke identity and its content.
+	if t.apiToken != "" {
+		req.Header.Set("Authorization", "Bearer "+t.apiToken)
+	}
 	req.Header.Set(headerSyncSpokeID, t.spokeID)
 	req.Header.Set(headerSyncHubID, hubID)
 	req.Header.Set(headerSyncNonce, nonce)
@@ -260,6 +301,18 @@ func (t *HTTPTransport) statusError(resp *http.Response, op string) error {
 	msg := strings.TrimSpace(string(body))
 	if msg == "" {
 		msg = resp.Status
+	}
+	// The two failures whose remedy is on THIS box, not the hub: the hub's
+	// token middleware rejected the request before the sync handler ran.
+	switch resp.StatusCode {
+	case http.StatusUnauthorized:
+		if t.apiToken == "" {
+			msg += " (hub requires an Arc API token; set ARC_EDGE_SYNC_HUB_TOKEN on this spoke)"
+		} else {
+			msg += " (the ARC_EDGE_SYNC_HUB_TOKEN on this spoke was rejected by the hub, or the request MAC failed; check the token, then the spoke secret and hub_id)"
+		}
+	case http.StatusForbidden:
+		msg += " (the ARC_EDGE_SYNC_HUB_TOKEN on this spoke lacks write permission on the hub)"
 	}
 	return fmt.Errorf("edgesync: %s failed with %d: %s", op, resp.StatusCode, msg)
 }

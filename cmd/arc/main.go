@@ -2180,6 +2180,42 @@ func main() {
 				log.Fatal().Err(err).Msg("Failed to create edge sync handler; refusing to start")
 			}
 			syncHandler.RegisterRoutes(server.GetApp())
+
+			// Hourly staging sweep. A spoke that declares a large upload, sends
+			// a few bytes, and never returns leaves a partial in .sync-staging;
+			// without this nothing ever reclaims that space and the staging
+			// area grows without bound (the receiver's own doc-comment calls
+			// out the DoS). Network hub only: staged partials exist only where
+			// uploads arrive, and the import path never stages.
+			sweepAge := time.Duration(cfg.EdgeSync.StagingSweepMaxAgeHours) * time.Hour
+			if sweepAge > 0 {
+				sweepCtx, sweepCancel := context.WithCancel(context.Background())
+				shutdownCoordinator.RegisterHook("edgesync-staging-sweep", func(ctx context.Context) error {
+					sweepCancel()
+					return nil
+				}, shutdown.PriorityBuffer)
+				go func() {
+					sweepLogger := logger.Get("edgesync")
+					ticker := time.NewTicker(time.Hour)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-sweepCtx.Done():
+							return
+						case <-ticker.C:
+							swept, err := receiver.SweepStaging(sweepCtx, sweepAge, time.Now())
+							if err != nil {
+								sweepLogger.Warn().Err(err).Msg("Edge sync staging sweep failed")
+								continue
+							}
+							if swept > 0 {
+								sweepLogger.Info().Int("swept", swept).
+									Msg("Reclaimed abandoned staged uploads")
+							}
+						}
+					}
+				}()
+			}
 		}
 
 		// Air-gap import, independent of the network receive endpoints.
@@ -2339,9 +2375,10 @@ func main() {
 	if cfg.EdgeSync.Spoke.Enabled || cfg.EdgeSync.Spoke.Bundle.Enabled {
 		spokeLogger := logger.Get("edgesync-spoke")
 
-		// The ledger shares the auth database, like the hub index. Reuse the
-		// handle opened for the hub block when both roles are enabled on one
-		// instance, rather than opening a second one on the same file.
+		// The ledger shares the auth database file, like the hub index. With
+		// auth enabled both roles borrow the auth manager's handle; with auth
+		// disabled each role opens its own handle on the same file — safe
+		// under WAL + busy_timeout, just not shared.
 		spokeDB, spokeOwnsDB, err := sharedSQLiteHandle(authManager, cfg.Auth.DBPath)
 		if err != nil {
 			log.Fatal().Err(err).Str("path", cfg.Auth.DBPath).Msg("Failed to open the edge sync spoke database; refusing to start")
@@ -2361,10 +2398,16 @@ func main() {
 		// which has no hub URL to build a transport from.
 		var syncAgent *edgesync.Agent
 		if cfg.EdgeSync.Spoke.Enabled {
+			if cfg.EdgeSync.Spoke.HubToken == "" {
+				log.Warn().Msg("ARC_EDGE_SYNC_HUB_TOKEN is not set; a hub running with auth enabled " +
+					"(the default) will reject every sync request with 401. Set it to an Arc API " +
+					"token with write permission on the hub, or disable auth on the hub.")
+			}
 			spokeTransport, err := edgesync.NewHTTPTransport(edgesync.HTTPTransportConfig{
-				BaseURL: cfg.EdgeSync.Spoke.HubURL,
-				SpokeID: cfg.EdgeSync.Spoke.SpokeID,
-				Secret:  cfg.EdgeSync.Spoke.Secret,
+				BaseURL:  cfg.EdgeSync.Spoke.HubURL,
+				SpokeID:  cfg.EdgeSync.Spoke.SpokeID,
+				Secret:   cfg.EdgeSync.Spoke.Secret,
+				APIToken: cfg.EdgeSync.Spoke.HubToken,
 			})
 			if err != nil {
 				log.Fatal().Err(err).Msg("Failed to create the edge sync transport; refusing to start")
@@ -2461,6 +2504,58 @@ func main() {
 			evt.Msg("Edge sync spoke enabled; trigger a pass with POST /api/v1/spoke-sync/run")
 		default:
 			evt.Msg("Edge sync air-gap export enabled; write a bundle with POST /api/v1/spoke-sync/export")
+		}
+
+		// Periodic ledger prune of terminal rows (synced, skipped). Every
+		// sync action is operator-triggered, but hygiene must not be: an
+		// air-gapped spoke may go months between operator visits, and the
+		// terminal rows those visits produce would otherwise accumulate
+		// forever on the box least able to receive one. Twice daily, plus
+		// once shortly after startup so a long-stopped spoke catches up.
+		if retentionDays := cfg.EdgeSync.Spoke.LedgerRetentionDays; retentionDays > 0 {
+			pruneCtx, pruneCancel := context.WithCancel(context.Background())
+			shutdownCoordinator.RegisterHook("edgesync-ledger-prune", func(ctx context.Context) error {
+				pruneCancel()
+				return nil
+			}, shutdown.PriorityBuffer)
+			go func() {
+				pruneLogger := logger.Get("edgesync")
+				runPrune := func() {
+					synced, err := spokeLedger.PruneSynced(pruneCtx, retentionDays)
+					if err != nil {
+						pruneLogger.Warn().Err(err).Msg("Edge sync ledger prune (synced) failed")
+					}
+					skipped, err := spokeLedger.PruneSkipped(pruneCtx, retentionDays)
+					if err != nil {
+						pruneLogger.Warn().Err(err).Msg("Edge sync ledger prune (skipped) failed")
+					}
+					if synced+skipped > 0 {
+						pruneLogger.Info().
+							Int64("synced_rows", synced).
+							Int64("skipped_rows", skipped).
+							Msg("Pruned terminal edge sync ledger rows")
+					}
+				}
+				// Deferred first run: not at startup itself, where a large
+				// backlogged DELETE would compete with WAL recovery and
+				// ingest warm-up for the shared SQLite handle.
+				select {
+				case <-pruneCtx.Done():
+					return
+				case <-time.After(5 * time.Minute):
+					runPrune()
+				}
+				ticker := time.NewTicker(12 * time.Hour)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-pruneCtx.Done():
+						return
+					case <-ticker.C:
+						runPrune()
+					}
+				}
+			}()
 		}
 	}
 

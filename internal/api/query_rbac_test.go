@@ -762,7 +762,7 @@ GROUP BY a.host, b.region`
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = extractTableReferences(sql)
+		_ = extractTableReferences(sql, nil)
 	}
 }
 

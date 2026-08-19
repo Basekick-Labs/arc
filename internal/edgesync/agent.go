@@ -71,8 +71,9 @@ type AgentConfig struct {
 	// are small, and §8.2 caps this low deliberately.
 	MaxConcurrent int
 
-	// BatchSize caps how many files one reconcile asks about. Zero means the
-	// hub's own default. A spoke with a larger backlog pages.
+	// BatchSize caps how many files one reconcile asks about; a larger
+	// backlog pages. Zero offers the whole backlog in one reconcile — a page
+	// the hub refuses as too large is split and retried either way.
 	BatchSize int
 
 	Logger zerolog.Logger
@@ -107,6 +108,10 @@ type RunResult struct {
 
 	// Failed is how many transfers errored.
 	Failed int
+
+	// Skipped is how many entries were dropped because their source file
+	// vanished (compaction or retention) before delivery.
+	Skipped int
 
 	// Conflicts are same-path-different-content disagreements. These need an
 	// operator, not a retry, so they are surfaced rather than counted away.
@@ -245,11 +250,60 @@ func (a *Agent) Run(ctx context.Context) (*RunResult, error) {
 }
 
 // runBatch reconciles one page of pending files and sends what the hub lacks.
+//
+// A page the hub refuses as too large (413) is split and retried rather than
+// failing the pass: the spoke has no reliable way to learn the hub's caps up
+// front (batch_size is operator-set, and the byte limit depends on path
+// lengths), so the refusal itself is the negotiation. Every split strictly
+// shrinks the page, and a single-entry page that still gets refused is a real
+// error — so this terminates.
 func (a *Agent) runBatch(ctx context.Context, pending []*LedgerEntry, res *RunResult) error {
+	queue := [][]*LedgerEntry{pending}
+	for len(queue) > 0 {
+		page := queue[0]
+		queue = queue[1:]
+
+		err := a.reconcileAndSend(ctx, page, res)
+		if err == nil {
+			continue
+		}
+		var tooLarge *ReconcileTooLargeError
+		if !errors.As(err, &tooLarge) || len(page) <= 1 {
+			return err
+		}
+		size := tooLarge.MaxEntries
+		if size <= 0 || size >= len(page) {
+			// Byte-limit refusal (no advertised cap), or an entry cap the
+			// page already satisfies: halving is the only signal available.
+			size = len(page) / 2
+		}
+		a.logger.Warn().
+			Int("page_entries", len(page)).
+			Int("retrying_at", size).
+			Msg("Hub refused reconcile page as too large; splitting and retrying")
+		for start := 0; start < len(page); start += size {
+			end := start + size
+			if end > len(page) {
+				end = len(page)
+			}
+			queue = append(queue, page[start:end])
+		}
+	}
+	return nil
+}
+
+// reconcileAndSend performs one reconcile round-trip and the transfers it
+// prescribes.
+func (a *Agent) reconcileAndSend(ctx context.Context, pending []*LedgerEntry, res *RunResult) error {
 	// One round-trip for the whole backlog. This is the property that makes a
 	// long disconnection survivable: 5,000 pending files cost one request.
 	reconciled, err := a.transport.Reconcile(ctx, a.hubID, pending)
 	if err != nil {
+		var tooLarge *ReconcileTooLargeError
+		if errors.As(err, &tooLarge) {
+			// Preserved un-wrapped for runBatch's split-and-retry.
+			return err
+		}
 		return fmt.Errorf("edgesync: reconcile: %w", err)
 	}
 	if err := reconciled.Validate(); err != nil {
@@ -334,6 +388,7 @@ func (a *Agent) sendAll(ctx context.Context, missing []*LedgerEntry, res *RunRes
 	type outcome struct {
 		sent      bool
 		partial   bool
+		skipped   bool
 		failed    bool
 		bytesSent int64
 	}
@@ -361,8 +416,8 @@ func (a *Agent) sendAll(ctx context.Context, missing []*LedgerEntry, res *RunRes
 
 		go func(entry *LedgerEntry) {
 			defer func() { <-sem }()
-			sent, partial, n, err := a.sendOne(ctx, entry)
-			results <- outcome{sent: sent, partial: partial, failed: err != nil, bytesSent: n}
+			sent, partial, skipped, n, err := a.sendOne(ctx, entry)
+			results <- outcome{sent: sent, partial: partial, skipped: skipped, failed: err != nil, bytesSent: n}
 		}(e)
 	}
 
@@ -373,6 +428,8 @@ func (a *Agent) sendAll(ctx context.Context, missing []*LedgerEntry, res *RunRes
 			res.Sent++
 		case o.partial:
 			res.Partial++
+		case o.skipped:
+			res.Skipped++
 		case o.failed:
 			res.Failed++
 		}
@@ -381,24 +438,34 @@ func (a *Agent) sendAll(ctx context.Context, missing []*LedgerEntry, res *RunRes
 }
 
 // sendOne transfers a single file, resuming from its checkpoint if it has one.
-func (a *Agent) sendOne(ctx context.Context, e *LedgerEntry) (sent, partial bool, bytesSent int64, err error) {
+func (a *Agent) sendOne(ctx context.Context, e *LedgerEntry) (sent, partial, skipped bool, bytesSent int64, err error) {
 	if err := a.ledger.MarkInFlight(ctx, a.hubID, e.Path); err != nil {
 		// Usually a concurrent pass already claimed it. Not an error worth
 		// failing the run over.
 		a.logger.Debug().Err(err).Str("path", e.Path).Msg("Could not claim a file for transfer")
-		return false, false, 0, err
+		return false, false, false, 0, err
 	}
 
 	offset := e.BytesSent
 	body, err := a.openAt(ctx, e.Path, offset)
 	if err != nil {
+		if a.skipIfVanished(ctx, e) {
+			return false, false, true, 0, nil
+		}
 		a.fail(ctx, e, fmt.Sprintf("open: %v", err))
-		return false, false, 0, err
+		return false, false, false, 0, err
 	}
 	defer body.Close()
 
 	res, err := a.transport.PutFile(ctx, a.hubID, e, body, offset)
 	if err != nil {
+		// openAt streams through an io.Pipe, so a source file deleted by
+		// compaction or retention surfaces HERE, as a transfer error, not at
+		// open. Without this check the row burns its whole retry budget on a
+		// file that no longer exists and then sits terminally failed.
+		if a.skipIfVanished(ctx, e) {
+			return false, false, true, 0, nil
+		}
 		// A resume the hub cannot honour: it no longer holds the prefix our
 		// checkpoint refers to. That happens when a hub restarts, sweeps its
 		// staging area, or runs on a backend that cannot append at all. The
@@ -415,25 +482,25 @@ func (a *Agent) sendOne(ctx context.Context, e *LedgerEntry) (sent, partial bool
 			}
 		}
 		a.fail(ctx, e, err.Error())
-		return false, false, 0, err
+		return false, false, false, 0, err
 	}
 	// A hub is remote code as far as the spoke is concerned; an inconsistent
 	// answer must not become ledger state.
 	if err := res.Validate(e); err != nil {
 		a.fail(ctx, e, fmt.Sprintf("invalid hub response: %v", err))
-		return false, false, 0, err
+		return false, false, false, 0, err
 	}
 
 	switch {
 	case res.Outcome.Done():
 		if err := a.ledger.MarkSynced(ctx, a.hubID, e.Path); err != nil {
-			return false, false, 0, err
+			return false, false, false, 0, err
 		}
 		// A file the hub already had cost no bytes; only count a real transfer.
 		if res.Outcome == OutcomeCommitted {
-			return true, false, res.BytesAccepted - offset, nil
+			return true, false, false, res.BytesAccepted - offset, nil
 		}
-		return true, false, 0, nil
+		return true, false, false, 0, nil
 
 	case res.Outcome == OutcomePartial:
 		// Record the hub's offset, not our own guess: the two can disagree,
@@ -442,7 +509,7 @@ func (a *Agent) sendOne(ctx context.Context, e *LedgerEntry) (sent, partial bool
 			a.logger.Warn().Err(err).Str("path", e.Path).Msg("Could not record a resume checkpoint")
 		}
 		a.fail(ctx, e, "transfer ended early; will resume")
-		return false, true, res.BytesAccepted - offset, nil
+		return false, true, false, res.BytesAccepted - offset, nil
 
 	case res.Outcome == OutcomeConflict:
 		// Terminal by design. Retrying cannot resolve a content disagreement,
@@ -455,13 +522,13 @@ func (a *Agent) sendOne(ctx context.Context, e *LedgerEntry) (sent, partial bool
 		if err := a.ledger.MarkFailed(ctx, a.hubID, e.Path, "conflict: hub holds different content", 1); err != nil {
 			a.logger.Warn().Err(err).Str("path", e.Path).Msg("Could not mark a conflicted file failed")
 		}
-		return false, false, 0, nil
+		return false, false, false, 0, nil
 
 	default:
 		// Checksum mismatch or backpressure: retryable, so let the attempt
 		// counter decide when to give up.
 		a.fail(ctx, e, string(res.Outcome))
-		return false, false, 0, nil
+		return false, false, false, 0, nil
 	}
 }
 
@@ -486,6 +553,30 @@ func (a *Agent) fail(ctx context.Context, e *LedgerEntry, msg string) {
 	if err := a.ledger.MarkFailed(ctx, a.hubID, e.Path, msg, a.maxAttempts); err != nil {
 		a.logger.Warn().Err(err).Str("path", e.Path).Msg("Could not record a transfer failure")
 	}
+}
+
+// skipIfVanished checks whether a transfer failed because the source file no
+// longer exists (compaction or retention deleted it after discovery), and if
+// so marks the entry skipped. Returns true when the entry was skipped.
+//
+// The direction of the check is deliberate: Exists must POSITIVELY report the
+// file gone. On an Exists error nothing is skipped — a transient storage
+// error must never terminally skip a file that still exists, so uncertainty
+// falls through to the normal retry path.
+func (a *Agent) skipIfVanished(ctx context.Context, e *LedgerEntry) bool {
+	present, err := a.backend.Exists(ctx, e.Path)
+	if err != nil || present {
+		return false
+	}
+	if err := a.ledger.MarkSkipped(ctx, a.hubID, e.Path,
+		"source file removed before delivery (compaction or retention)"); err != nil {
+		a.logger.Warn().Err(err).Str("path", e.Path).Msg("Could not mark a vanished file skipped")
+		return false
+	}
+	a.logger.Info().
+		Str("path", e.Path).
+		Msg("Source file vanished before delivery; marked skipped (compaction or retention removed it)")
+	return true
 }
 
 // openAt returns a reader positioned at offset.
