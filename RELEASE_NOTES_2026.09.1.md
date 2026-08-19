@@ -456,7 +456,16 @@ Two more fixes in the same change:
 - **A latent crash-loop nobody had reported yet**: the license server reaps activations that haven't been heard from in 72 hours, but the "heard from" signal was only ever sent by a heartbeat call Arc never made — so any machine with a stable fingerprint was silently revoked 72 hours after activating, and its next restart crash-looped. Arc now re-activates on that condition (a deliberately revoked *license* still refuses definitively), and the license server counts successful verifications as liveness.
 - The Helm chart's Arc pods gain a **startupProbe** (5 minutes of grace): the liveness probe used to be able to kill a legitimately slow boot — license retries plus multi-writer WAL recovery — at about 60 seconds, before the HTTP listener even bound.
 
-Air-gapped, fully offline license files (no server dependency at all) are the follow-up currently in flight.
+**Offline (air-gapped) license files.** For environments that cannot reach `enterprise.basekick.net` at all, an administrator can now download an offline license file from the activation server (an explicit *site license*: unbound, activates any machine until its expiry, acknowledged at mint time and audit-logged) and point Arc at it:
+
+```toml
+[license]
+file_path = "/etc/arc/license.json"   # or ARC_LICENSE_FILE_PATH
+```
+
+`/health` now also carries a `license` field — tier, status, source (`server` / `cache` / `file`), and expiry, with status derived at read time so an expiring license goes visibly non-`active` within a probe interval. A pod whose configured license failed reports `tier: oss, status: unlicensed` instead of being indistinguishable from a healthy one — the silently-degraded state behind the crash-loop incident above. No key material, customer identity, or feature list is exposed. Deployments with no license configured omit the field.
+
+The file is the same signed payload the online activation emits, verified from disk against the pinned public key — **no network calls, ever**: no activation, no periodic validation, no cache. `file_path` wins over `license.key`, and it fails closed: a rejected file means OSS mode, never a silent fallback to online licensing. A file bound to a specific machine (an online activation response) still enforces its binding, and expiry is checked at every boot — a file that expires while a process is running is rejected at the next restart. Verified end-to-end: a production-signed site file boots a fully licensed Arc in a container with **no network attached**.
 
 ### Azure managed-identity credentials on the query path now refresh — and no longer die an hour in ([#605](https://github.com/Basekick-Labs/arc/issues/605))
 

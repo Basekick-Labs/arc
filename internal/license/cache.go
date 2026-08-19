@@ -167,6 +167,7 @@ func (c *Client) LoadCachedLicense() (*License, error) {
 	lic := signed.ToRuntimeLicense(now)
 	c.mu.Lock()
 	c.license = lic
+	c.source = SourceCache
 	c.mu.Unlock()
 	return lic, nil
 }
@@ -224,4 +225,54 @@ func (c *Client) ActivateOrVerifyResilient(ctx context.Context) (*License, Licen
 		return nil, SourceServer, fmt.Errorf("license server unreachable and no usable cache: %w", lastErr)
 	}
 	return lic, SourceCache, nil
+}
+
+// SourceFile marks an offline license file (NewOfflineClient).
+const SourceFile LicenseSource = "file"
+
+// LicenseHealth is the /health "license" payload: enough for monitoring to
+// catch "running but unlicensed/expiring", nothing more. Deliberately
+// excludes the license key, customer identity, and the feature list — /health
+// is unauthenticated (see the decision comments in internal/api/server.go).
+type LicenseHealth struct {
+	Tier          string     `json:"tier"`
+	Status        string     `json:"status"`
+	Source        string     `json:"source"`
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+	DaysRemaining int        `json:"days_remaining,omitempty"`
+	SiteLicense   bool       `json:"site_license,omitempty"`
+}
+
+// HealthStatus reports the current license for /health. Status is derived at
+// READ time against the clock (the #603 lesson): enforcement stays boot-time,
+// but health tells the truth — a license that expires mid-process shows
+// "expired" here within a probe interval, even though features remain enabled
+// until the next restart rejects it.
+func (c *Client) HealthStatus() LicenseHealth {
+	c.mu.RLock()
+	lic := c.license
+	src := c.source
+	c.mu.RUnlock()
+	if lic == nil {
+		return LicenseHealth{Tier: "oss", Status: "unlicensed", Source: string(src)}
+	}
+	status := lic.Status
+	now := time.Now().UTC()
+	days := 0
+	if !lic.ExpiresAt.IsZero() {
+		if !now.Before(lic.ExpiresAt) {
+			status = "expired"
+		} else {
+			days = int(time.Until(lic.ExpiresAt).Hours() / 24)
+		}
+	}
+	exp := lic.ExpiresAt.UTC()
+	return LicenseHealth{
+		Tier:          string(lic.Tier),
+		Status:        status,
+		Source:        string(src),
+		ExpiresAt:     &exp,
+		DaysRemaining: days,
+		SiteLicense:   c.offline && c.fingerprint == "",
+	}
 }

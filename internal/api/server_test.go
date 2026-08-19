@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/database"
+	"github.com/basekick-labs/arc/internal/license"
 
 	"github.com/rs/zerolog"
 )
@@ -349,6 +350,56 @@ func TestReadyStorageCredentialsKnob(t *testing.T) {
 		s.SetStorageStatus(statusFn("ok"), true)
 		if code := get(s); code != 503 {
 			t.Fatalf("code = %d, want 503 (startup gating untouched)", code)
+		}
+	})
+}
+
+// TestHealthLicenseField: /health carries the license field when wired
+// (including the configured-but-failed "unlicensed" state — the silently
+// degraded mode behind the 27-restart field incident), and omits it when no
+// license is configured.
+func TestHealthLicenseField(t *testing.T) {
+	get := func(s *Server) map[string]any {
+		t.Helper()
+		s.RegisterRoutes()
+		resp, err := s.app.Test(httptest.NewRequest("GET", "/health", nil), 2000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+
+	t.Run("absent when not wired", func(t *testing.T) {
+		s := NewServer(DefaultServerConfig(), zerolog.Nop())
+		if _, ok := get(s)["license"]; ok {
+			t.Fatal("license field must be absent when no license is configured")
+		}
+	})
+
+	t.Run("licensed", func(t *testing.T) {
+		s := NewServer(DefaultServerConfig(), zerolog.Nop())
+		exp := time.Now().UTC().Add(24 * time.Hour)
+		s.SetLicenseStatus(func() license.LicenseHealth {
+			return license.LicenseHealth{Tier: "enterprise", Status: "active", Source: "file", ExpiresAt: &exp, SiteLicense: true}
+		})
+		lic := get(s)["license"].(map[string]any)
+		if lic["tier"] != "enterprise" || lic["status"] != "active" || lic["source"] != "file" || lic["site_license"] != true {
+			t.Fatalf("license = %v", lic)
+		}
+	})
+
+	t.Run("configured but unlicensed is visible", func(t *testing.T) {
+		s := NewServer(DefaultServerConfig(), zerolog.Nop())
+		s.SetLicenseStatus(func() license.LicenseHealth {
+			return license.LicenseHealth{Tier: "oss", Status: "unlicensed", Source: "none"}
+		})
+		lic := get(s)["license"].(map[string]any)
+		if lic["status"] != "unlicensed" {
+			t.Fatalf("license = %v", lic)
 		}
 	})
 }
