@@ -64,13 +64,14 @@ const (
 	// StateFailed — exhausted retries. Terminal until an operator intervenes.
 	StateFailed SyncState = "failed"
 
-	// StateSkipped — the source file vanished from local storage (compaction
-	// or retention deleted it) before it could be delivered. Terminal: the
-	// content no longer exists to send. Without this state a vanished pending
-	// file wedged air-gap export forever (the export failed wholesale and
-	// re-selected the same entry every time) and burned the network path's
-	// full retry budget per pass. Counted in Stats and reported in /status;
-	// reclaimed by PruneSkipped.
+	// StateSkipped — deliberately not (or no longer) deliverable. Three
+	// classes, told apart by last_error: the source file VANISHED before
+	// delivery (compaction/retention got it first); a COMPACTED OUTPUT whose
+	// contents were already delivered (NoteCompactedOutput — must never
+	// sync); or an OPERATOR-DISMISSED failure (NoteOperatorDismissed —
+	// reversible via requeue while its file survives). Counted in Stats and
+	// /status. Vanished rows prune normally; the two file-backed classes are
+	// prune-exempt and reclaimed by SweepSkippedRows once their file is gone.
 	StateSkipped SyncState = "skipped"
 )
 
@@ -79,7 +80,7 @@ const (
 // state synced, so the output must never sync — it would duplicate rows on
 // the hub. Rows carrying this note are EXEMPT from PruneSkipped while their
 // file exists (a pruned row would let discovery rediscover and sync the
-// output) and are instead reclaimed by SweepCompactedOutputRows once the
+// output) and are instead reclaimed by SweepSkippedRows once the
 // file is gone. They are also ELIGIBLE compaction inputs (daily consumes
 // hourly outputs).
 const NoteCompactedOutput = "compaction output; contents already delivered"
@@ -761,6 +762,80 @@ func (l *Ledger) EnsureMetaOnce(ctx context.Context, key, value string) (string,
 	return out, nil
 }
 
+// NoteOperatorDismissed marks a skipped row an operator deliberately
+// dismissed via POST /api/v1/spoke-sync/ledger/dismiss. Distinct from the
+// vanished-file and compacted-output notes: dismissed rows are the only
+// skipped class Requeue may resurrect, and they prune normally.
+const NoteOperatorDismissed = "dismissed by an operator"
+
+// RequeueFailed returns failed rows — and operator-dismissed rows, so a
+// dismissal is reversible — to pending for a fresh delivery attempt.
+// path == "" requeues every eligible row for the hub. Attempts reset to 0:
+// the operator is explicitly granting a new retry budget. bytes_sent is
+// kept so a partial transfer resumes; a checkpoint the hub no longer holds
+// already restarts from zero via the stale-checkpoint path.
+//
+// The state predicate lives in SQL so only legal sources transition:
+// vanished-file and compacted-output skips have nothing to deliver (or
+// would duplicate) and must never re-enter the queue.
+func (l *Ledger) RequeueFailed(ctx context.Context, hubID, path string) (int64, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	query := `
+		UPDATE sync_ledger
+		SET state = ?, attempts = 0, last_error = NULL
+		WHERE hub_id = ?
+		  AND (state = ? OR (state = ? AND last_error = ?))`
+	args := []any{string(StatePending), hubID,
+		string(StateFailed), string(StateSkipped), NoteOperatorDismissed}
+	if path != "" {
+		query += ` AND path = ?`
+		args = append(args, path)
+	}
+	res, err := l.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("edgesync: requeue failed rows: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("edgesync: count requeued rows: %w", err)
+	}
+	return n, nil
+}
+
+// DismissFailed moves failed rows to skipped with the operator note —
+// terminal, pruned after retention, and reversible via RequeueFailed.
+// path == "" dismisses every failed row for the hub.
+//
+// Skipped, not deleted: a deleted row whose file still exists would be
+// re-tracked by the next discovery pass and resurrect as pending — the
+// exact noise the operator asked to silence.
+func (l *Ledger) DismissFailed(ctx context.Context, hubID, path string) (int64, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	query := `
+		UPDATE sync_ledger
+		SET state = ?, last_error = ?, last_attempt = ?
+		WHERE hub_id = ? AND state = ?`
+	args := []any{string(StateSkipped), NoteOperatorDismissed, time.Now().UTC(),
+		hubID, string(StateFailed)}
+	if path != "" {
+		query += ` AND path = ?`
+		args = append(args, path)
+	}
+	res, err := l.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("edgesync: dismiss failed rows: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("edgesync: count dismissed rows: %w", err)
+	}
+	return n, nil
+}
+
 // ClearMeta removes a sync_meta key. Used when the compaction defer gate is
 // INACTIVE while compaction may run (issue #610): the epoch's meaning is
 // "the gate has been continuously active since this instant", so any ungated
@@ -856,22 +931,24 @@ func (l *Ledger) DeliveryStates(ctx context.Context, hubID string, paths []strin
 	return out, nil
 }
 
-// SweepCompactedOutputRows deletes compacted-output rows whose file no
-// longer exists (consumed by a later compaction tier, or removed by
-// retention). These rows are exempt from PruneSkipped — pruning one whose
-// file still exists would let discovery re-sync the output — so this sweep
-// is their only reclamation path and must run regardless of the retention
-// setting. exists is consulted per row; an exists ERROR keeps the row
-// (fail-safe: never delete bookkeeping on an uncertain answer).
-func (l *Ledger) SweepCompactedOutputRows(ctx context.Context, hubID string, exists func(context.Context, string) (bool, error)) (int64, error) {
+// SweepSkippedRows deletes the FILE-BACKED skipped rows — compacted outputs
+// and operator-dismissed entries — whose file no longer exists (consumed by
+// compaction, or removed by retention). These two classes are exempt from
+// PruneSkipped: pruning one whose file still exists would let discovery
+// re-track the file (re-syncing a compacted output, or resurrecting a
+// dismissed failure as pending). This sweep is their only reclamation path
+// and runs regardless of the retention setting. exists is consulted per
+// row; an exists ERROR keeps the row (fail-safe: never delete bookkeeping
+// on an uncertain answer).
+func (l *Ledger) SweepSkippedRows(ctx context.Context, hubID string, exists func(context.Context, string) (bool, error)) (int64, error) {
 	if hubID == "" {
 		hubID = DefaultHubID
 	}
 	rows, err := l.db.QueryContext(ctx, `
 		SELECT id, path FROM sync_ledger
-		WHERE hub_id = ? AND state = ? AND last_error = ?
+		WHERE hub_id = ? AND state = ? AND last_error IN (?, ?)
 		ORDER BY id ASC`,
-		hubID, string(StateSkipped), NoteCompactedOutput)
+		hubID, string(StateSkipped), NoteCompactedOutput, NoteOperatorDismissed)
 	if err != nil {
 		return 0, fmt.Errorf("edgesync: list compacted-output rows: %w", err)
 	}
@@ -904,9 +981,9 @@ func (l *Ledger) SweepCompactedOutputRows(ctx context.Context, hubID string, exi
 			continue
 		}
 		if _, err := l.db.ExecContext(ctx,
-			`DELETE FROM sync_ledger WHERE id = ? AND state = ? AND last_error = ?`,
-			r.id, string(StateSkipped), NoteCompactedOutput); err != nil {
-			return deleted, fmt.Errorf("edgesync: sweep compacted-output row %q: %w", r.path, err)
+			`DELETE FROM sync_ledger WHERE id = ? AND state = ? AND last_error IN (?, ?)`,
+			r.id, string(StateSkipped), NoteCompactedOutput, NoteOperatorDismissed); err != nil {
+			return deleted, fmt.Errorf("edgesync: sweep skipped row %q: %w", r.path, err)
 		}
 		deleted++
 	}
@@ -1156,16 +1233,20 @@ func (l *Ledger) PruneSkipped(ctx context.Context, retentionDays int) (int64, er
 
 	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays)
 
-	// Compacted-output rows are excluded (NULL-safe: last_error is nullable):
-	// pruning one whose file still exists lets discovery rediscover and SYNC
-	// the output — duplicates returning after retention days. They are
-	// reclaimed by SweepCompactedOutputRows once the file is gone instead.
+	// Rows whose local FILE may still exist are excluded (NULL-safe:
+	// last_error is nullable): pruning a compacted-output row lets discovery
+	// rediscover and SYNC the output (duplicates return), and pruning an
+	// operator-dismissed row lets discovery re-track the file as pending
+	// (the dismissed failure resurrects — the exact noise the operator
+	// silenced). Both classes are reclaimed by SweepSkippedRows once their
+	// file is actually gone. Vanished-file rows have no file by definition
+	// and prune normally.
 	var maxID int64
 	err := l.db.QueryRowContext(ctx, `
 		SELECT COALESCE(MAX(id), 0) FROM sync_ledger
 		WHERE state = ? AND last_attempt IS NOT NULL AND last_attempt < ?
-		  AND (last_error IS NULL OR last_error <> ?)`,
-		string(StateSkipped), cutoff, NoteCompactedOutput).Scan(&maxID)
+		  AND (last_error IS NULL OR last_error NOT IN (?, ?))`,
+		string(StateSkipped), cutoff, NoteCompactedOutput, NoteOperatorDismissed).Scan(&maxID)
 	if err != nil {
 		return 0, fmt.Errorf("edgesync: find skipped prune cutoff: %w", err)
 	}
@@ -1185,9 +1266,9 @@ func (l *Ledger) PruneSkipped(ctx context.Context, retentionDays int) (int64, er
 			DELETE FROM sync_ledger WHERE id IN (
 				SELECT id FROM sync_ledger
 				WHERE id <= ? AND state = ? AND last_attempt IS NOT NULL AND last_attempt < ?
-				  AND (last_error IS NULL OR last_error <> ?)
+				  AND (last_error IS NULL OR last_error NOT IN (?, ?))
 				ORDER BY id ASC LIMIT ?
-			)`, maxID, string(StateSkipped), cutoff, NoteCompactedOutput, batchSize)
+			)`, maxID, string(StateSkipped), cutoff, NoteCompactedOutput, NoteOperatorDismissed, batchSize)
 		if err != nil {
 			return total, fmt.Errorf("edgesync: prune skipped entries: %w", err)
 		}

@@ -2626,13 +2626,13 @@ func main() {
 						}
 					}
 					if sweepOutputs {
-						swept, err := spokeLedger.SweepCompactedOutputRows(pruneCtx,
+						swept, err := spokeLedger.SweepSkippedRows(pruneCtx,
 							cfg.EdgeSync.Spoke.HubID, storageBackend.Exists)
 						if err != nil {
-							pruneLogger.Warn().Err(err).Msg("Edge sync compacted-output row sweep failed")
+							pruneLogger.Warn().Err(err).Msg("Edge sync skipped-row sweep failed")
 						} else if swept > 0 {
 							pruneLogger.Info().Int64("rows", swept).
-								Msg("Swept compacted-output ledger rows whose file is gone")
+								Msg("Swept file-backed skipped ledger rows whose file is gone")
 						}
 					}
 				}

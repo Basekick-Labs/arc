@@ -255,17 +255,17 @@ func TestCompactedOutputRows_PruneExemptUntilFileGone(t *testing.T) {
 	}
 
 	// Sweep with the file "existing" keeps the row; gone deletes it.
-	kept, err := l.SweepCompactedOutputRows(ctx, DefaultHubID,
+	kept, err := l.SweepSkippedRows(ctx, DefaultHubID,
 		func(context.Context, string) (bool, error) { return true, nil })
 	if err != nil || kept != 0 {
 		t.Fatalf("sweep(existing) = %d, %v; want 0, nil", kept, err)
 	}
 	// An exists ERROR must keep the row (fail-safe).
-	if n, err := l.SweepCompactedOutputRows(ctx, DefaultHubID,
+	if n, err := l.SweepSkippedRows(ctx, DefaultHubID,
 		func(context.Context, string) (bool, error) { return false, errors.New("storage down") }); err != nil || n != 0 {
 		t.Fatalf("sweep(error) = %d, %v; want 0, nil", n, err)
 	}
-	swept, err := l.SweepCompactedOutputRows(ctx, DefaultHubID,
+	swept, err := l.SweepSkippedRows(ctx, DefaultHubID,
 		func(context.Context, string) (bool, error) { return false, nil })
 	if err != nil || swept != 1 {
 		t.Fatalf("sweep(gone) = %d, %v; want 1, nil", swept, err)
@@ -422,5 +422,74 @@ func TestClearMeta_UngatedPeriodOutputsClassifyAsLegacy(t *testing.T) {
 	NewCompactedOutputObserver(l, DefaultHubID, epoch, zerolog.Nop())(ungatedOutput)
 	if _, err := l.Get(ctx, DefaultHubID, ungatedOutput); err == nil {
 		t.Error("ungated-period output tracked as delivered; must stay legacy so it syncs once")
+	}
+}
+
+// An operator-dismissed file is compaction-eligible: delivery was explicitly
+// renounced, so local compaction destroys nothing the hub is owed — and
+// ineligibility would wedge the partition forever on a written-off file.
+func TestCompactionEligibility_DismissedFilesAreEligible(t *testing.T) {
+	ctx := context.Background()
+	l := setupTestLedger(t)
+
+	p := "metrics/cpu/2026/08/07/14/junk.parquet"
+	gateAdd(t, l, p, func(c context.Context) error {
+		if err := l.MarkInFlight(c, DefaultHubID, p); err != nil {
+			return err
+		}
+		if err := l.MarkFailed(c, DefaultHubID, p, "boom", 1); err != nil {
+			return err
+		}
+		_, err := l.DismissFailed(c, DefaultHubID, p)
+		return err
+	})
+
+	gate := NewCompactionEligibility(l, DefaultHubID, time.Now().UTC(), zerolog.Nop())
+	got, err := gate(ctx, []string{p})
+	if err != nil {
+		t.Fatalf("gate: %v", err)
+	}
+	if !got[p] {
+		t.Error("operator-dismissed file must be compaction-eligible")
+	}
+}
+
+// Deep-review H1 (#612): an operator-dismissed row must survive the blind
+// retention prune while its file exists — pruning it would let discovery
+// re-track the file and resurrect the dismissed failure — and is reclaimed
+// by the existence-gated sweep once the file is gone.
+func TestDismissedRows_PruneExemptUntilFileGone(t *testing.T) {
+	ctx := context.Background()
+	l := setupTestLedger(t)
+
+	p := "metrics/cpu/2026/08/07/14/junk.parquet"
+	gateAdd(t, l, p, func(c context.Context) error {
+		if err := l.MarkInFlight(c, DefaultHubID, p); err != nil {
+			return err
+		}
+		if err := l.MarkFailed(c, DefaultHubID, p, "boom", 1); err != nil {
+			return err
+		}
+		_, err := l.DismissFailed(c, DefaultHubID, p)
+		return err
+	})
+
+	if _, err := l.db.ExecContext(ctx,
+		`UPDATE sync_ledger SET last_attempt = ? WHERE state = 'skipped'`,
+		time.Now().UTC().AddDate(0, 0, -100)); err != nil {
+		t.Fatalf("age: %v", err)
+	}
+	pruned, err := l.PruneSkipped(ctx, 90)
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if pruned != 0 {
+		t.Errorf("prune deleted %d dismissed rows; they must be exempt while the file may exist", pruned)
+	}
+
+	swept, err := l.SweepSkippedRows(ctx, DefaultHubID,
+		func(context.Context, string) (bool, error) { return false, nil })
+	if err != nil || swept != 1 {
+		t.Fatalf("sweep(gone) = %d, %v; want 1", swept, err)
 	}
 }

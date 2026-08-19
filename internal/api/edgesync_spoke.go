@@ -78,6 +78,8 @@ func (h *EdgeSyncSpokeHandler) RegisterRoutes(app fiber.Router) {
 	group.Post("/run", h.run)
 	group.Get("/status", h.status)
 	group.Get("/ledger", h.ledger)
+	group.Post("/ledger/requeue", h.requeueFailed)
+	group.Post("/ledger/dismiss", h.dismissFailed)
 	group.Post("/export", h.export)
 	group.Post("/export/:bundle_id/revert", h.revertExport)
 	group.Post("/ack", h.applyAck)
@@ -192,8 +194,9 @@ func (h *EdgeSyncSpokeHandler) status(c *fiber.Ctx) error {
 		"exported": st.Exported,
 		"synced":   st.Synced,
 		"failed":   st.Failed,
-		// Source files that vanished (compaction/retention) before delivery.
-		// Terminal bookkeeping, excluded from pending_bytes.
+		// Deliberately-not-delivered entries: vanished source files,
+		// compacted outputs, and operator-dismissed failures. Terminal
+		// bookkeeping, excluded from pending_bytes.
 		"skipped":       st.Skipped,
 		"pending_bytes": st.PendingBytes,
 	}
@@ -205,6 +208,104 @@ func (h *EdgeSyncSpokeHandler) status(c *fiber.Ctx) error {
 		out["seconds_since_last_sync"] = int64(time.Since(*st.LastSyncedAt).Seconds())
 	}
 	return c.JSON(out)
+}
+
+// ledgerSelector is the body both remediation endpoints accept: exactly one
+// of a single path or the whole failed set.
+type ledgerSelector struct {
+	Path string `json:"path"`
+	All  bool   `json:"all"`
+}
+
+func parseLedgerSelector(c *fiber.Ctx) (*ledgerSelector, error) {
+	var sel ledgerSelector
+	if err := c.BodyParser(&sel); err != nil {
+		return nil, errors.New("invalid JSON body")
+	}
+	if (sel.Path == "") == !sel.All {
+		return nil, errors.New(`provide exactly one of "path" or "all": true`)
+	}
+	return &sel, nil
+}
+
+// remediate runs one ledger remediation op through whichever transport
+// exists, mirroring the /ledger read path.
+func (h *EdgeSyncSpokeHandler) remediate(c *fiber.Ctx, verb string,
+	viaAgent func(context.Context, string) (int64, error),
+	viaExporter func(context.Context, string) (int64, error)) error {
+
+	sel, err := parseLedgerSelector(c)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
+	defer cancel()
+
+	var n int64
+	switch {
+	case viaAgent != nil:
+		n, err = viaAgent(ctx, sel.Path)
+	case viaExporter != nil:
+		n, err = viaExporter(ctx, sel.Path)
+	default:
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "no edge sync transport is enabled",
+		})
+	}
+	if err != nil {
+		h.logger.Error().Err(err).Str("op", verb).Msg("Ledger remediation failed")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "ledger remediation failed",
+		})
+	}
+
+	// A named path that matched nothing is a miss the operator should hear
+	// about — they typed it expecting a row. all:true with zero eligible rows
+	// is a clean no-op. The message is per-verb: dismiss only matches failed
+	// rows, and its most common miss is re-dismissing an already-dismissed
+	// path — the generic wording would deny an entry that is sitting right
+	// there.
+	if n == 0 && sel.Path != "" {
+		msg := "no failed or operator-dismissed entry at that path"
+		if verb == "dismissed" {
+			msg = "no failed entry at that path (an already-dismissed entry stays dismissed)"
+		}
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": msg})
+	}
+
+	h.logger.Info().Str("op", verb).Str("path", sel.Path).Bool("all", sel.All).
+		Int64("rows", n).Msg("Ledger remediation applied")
+	return c.JSON(fiber.Map{verb: n})
+}
+
+// requeueFailed handles POST /api/v1/spoke-sync/ledger/requeue: failed (and
+// operator-dismissed) rows return to pending with a fresh retry budget. The
+// usual reason is a fixed transient cause — hub reachable again, token
+// rotated, a conflict resolved on the hub side.
+func (h *EdgeSyncSpokeHandler) requeueFailed(c *fiber.Ctx) error {
+	var viaAgent, viaExporter func(context.Context, string) (int64, error)
+	if h.agent != nil {
+		viaAgent = h.agent.RequeueFailed
+	}
+	if h.exporter != nil {
+		viaExporter = h.exporter.RequeueFailed
+	}
+	return h.remediate(c, "requeued", viaAgent, viaExporter)
+}
+
+// dismissFailed handles POST /api/v1/spoke-sync/ledger/dismiss: failed rows
+// become operator-dismissed (skipped) — out of the troubleshooting view,
+// pruned after retention, reversible via /ledger/requeue.
+func (h *EdgeSyncSpokeHandler) dismissFailed(c *fiber.Ctx) error {
+	var viaAgent, viaExporter func(context.Context, string) (int64, error)
+	if h.agent != nil {
+		viaAgent = h.agent.DismissFailed
+	}
+	if h.exporter != nil {
+		viaExporter = h.exporter.DismissFailed
+	}
+	return h.remediate(c, "dismissed", viaAgent, viaExporter)
 }
 
 // ledger handles GET /api/v1/spoke-sync/ledger.

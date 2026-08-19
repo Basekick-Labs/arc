@@ -273,6 +273,16 @@ func (e *Exporter) UnfinishedEntries(ctx context.Context, limit int) ([]*LedgerE
 	return e.ledger.Unfinished(ctx, e.hubID, limit)
 }
 
+// RequeueFailed returns failed (and operator-dismissed) rows to pending.
+func (e *Exporter) RequeueFailed(ctx context.Context, path string) (int64, error) {
+	return e.ledger.RequeueFailed(ctx, e.hubID, path)
+}
+
+// DismissFailed moves failed rows to operator-dismissed skipped.
+func (e *Exporter) DismissFailed(ctx context.Context, path string) (int64, error) {
+	return e.ledger.DismissFailed(ctx, e.hubID, path)
+}
+
 // ApplyAck reads an acknowledgment from a returned bundle directory and
 // advances the ledger.
 //

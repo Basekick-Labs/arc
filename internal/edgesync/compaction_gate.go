@@ -47,6 +47,13 @@ func NewCompactionEligibility(ledger *Ledger, hubID string, epoch time.Time, log
 				out[p] = true
 			case tracked && ds.State == StateSkipped && ds.Note == NoteCompactedOutput:
 				out[p] = true
+			case tracked && ds.State == StateSkipped && ds.Note == NoteOperatorDismissed:
+				// The operator explicitly renounced delivery of this file
+				// (POST /spoke-sync/ledger/dismiss), so consuming it locally
+				// destroys nothing the hub is still owed — and leaving it
+				// ineligible would wedge its partition's compaction forever
+				// on a file the operator already wrote off.
+				out[p] = true
 			case !tracked:
 				if ts, isCompacted := compactedFileTimestamp(p); isCompacted && ts.After(epoch) {
 					// Post-epoch orphan: the observer insert was lost to a
