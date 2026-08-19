@@ -150,6 +150,11 @@ func TestSpokeConfig_DefaultsAreDeclared(t *testing.T) {
 	if got := cfg.EdgeSync.Spoke.BatchSize; got != 1000 {
 		t.Errorf("batch_size = %d, want 1000", got)
 	}
+	// Default TRUE: a syncing spoke must not silently double-count on the
+	// hub; opting out is the explicit choice (issue #610).
+	if !cfg.EdgeSync.Spoke.DeferCompactionUntilSynced {
+		t.Error("defer_compaction_until_synced should default to true")
+	}
 }
 
 // A fully air-gapped spoke exports bundles and never runs the network path, so

@@ -191,6 +191,10 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 		FilesCompacted: job.FilesCompacted,
 		BytesBefore:    job.BytesBefore,
 		BytesAfter:     job.BytesAfter,
+		// The storage key of the output (empty when the job produced none).
+		// The parent's compacted-output observer keys the edge sync ledger
+		// on this; the temp path would never match a storage listing.
+		OutputFile: job.OutputStorageKey,
 	}
 	if err != nil {
 		result.Error = err.Error()

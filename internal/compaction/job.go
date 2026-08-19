@@ -142,6 +142,11 @@ type Job struct {
 	BytesAfter      int64
 	DurationSeconds float64
 
+	// OutputStorageKey is the storage-relative key of the compacted output,
+	// set once the output name is fixed (before upload). Empty for jobs that
+	// produce no output (all sources vanished, or no time column).
+	OutputStorageKey string
+
 	// Phase 4: cluster-mode completion manifest. When CompletionDir is
 	// non-empty, the job writes a local-disk CompletionManifest at each
 	// state transition so the parent-side CompletionWatcher can apply
@@ -355,6 +360,10 @@ func (j *Job) Run(ctx context.Context) error {
 
 	// Upload compacted file
 	compactedKey := filepath.Join(j.PartitionPath, filepath.Base(compactedFile))
+	// Recorded on the Job so the subprocess result can carry the STORAGE key
+	// to the parent (compactFiles returns the local temp path, which no
+	// parent-side consumer can match against storage listings).
+	j.OutputStorageKey = compactedKey
 
 	// Write manifest BEFORE upload to enable crash recovery
 	// If we crash after upload but before deletion, the manifest allows recovery

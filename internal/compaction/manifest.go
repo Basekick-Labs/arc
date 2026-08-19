@@ -175,7 +175,14 @@ func (m *ManifestManager) ListManifests(ctx context.Context) ([]string, error) {
 
 // RecoverOrphanedManifests finds and processes orphaned manifests from interrupted compactions.
 // Returns the number of manifests recovered and any error encountered.
-func (m *ManifestManager) RecoverOrphanedManifests(ctx context.Context) (int, error) {
+// onKeptOutput, when non-nil, receives the storage key of every compacted
+// output recovery decides to KEEP (issue #610): recovery completes
+// compactions outside CompactPartition, so without it the edge sync ledger
+// would never learn about the output. Passed as an argument rather than
+// stored on the struct — the caller (Manager) copies it under its own mutex,
+// which keeps the scheduler-goroutine read free of the wiring race a stored
+// field would have (main.go wires observers after the schedulers start).
+func (m *ManifestManager) RecoverOrphanedManifests(ctx context.Context, onKeptOutput func(storageKey string)) (int, error) {
 	manifests, err := m.ListManifests(ctx)
 	if err != nil {
 		// ListManifests already describes the failure.
@@ -196,7 +203,7 @@ func (m *ManifestManager) RecoverOrphanedManifests(ctx context.Context) (int, er
 		default:
 		}
 
-		if err := m.recoverManifest(ctx, manifestPath); err != nil {
+		if err := m.recoverManifest(ctx, manifestPath, onKeptOutput); err != nil {
 			m.logger.Error().Err(err).Str("manifest", manifestPath).Msg("Failed to recover manifest")
 			continue
 		}
@@ -214,7 +221,7 @@ func (m *ManifestManager) RecoverOrphanedManifests(ctx context.Context) (int, er
 }
 
 // recoverManifest processes a single orphaned manifest
-func (m *ManifestManager) recoverManifest(ctx context.Context, manifestPath string) error {
+func (m *ManifestManager) recoverManifest(ctx context.Context, manifestPath string, onKeptOutput func(storageKey string)) error {
 	manifest, err := m.ReadManifest(ctx, manifestPath)
 	if err != nil {
 		// If we can't read the manifest, delete it and let compaction retry
@@ -274,6 +281,15 @@ func (m *ManifestManager) recoverManifest(ctx context.Context, manifestPath stri
 				return m.DeleteManifest(ctx, manifestPath)
 			}
 		}
+	}
+
+	// Output file exists and is valid — the output is being KEPT, so tell
+	// the edge sync observer now, before input deletion: a partial deletion
+	// failure retries this manifest next cycle, and the consumer is
+	// idempotent, so firing early is safe while firing late risks a window
+	// where discovery syncs the output.
+	if onKeptOutput != nil {
+		onKeptOutput(manifest.OutputPath)
 	}
 
 	// Output file exists and is valid - complete the deletion of input files

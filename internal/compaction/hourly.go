@@ -71,6 +71,10 @@ func (t *HourlyTier) GetTierName() string {
 }
 
 // GetPartitionLevel returns the partition level
+func (t *HourlyTier) GetMinFiles() int {
+	return t.MinFiles
+}
+
 func (t *HourlyTier) GetPartitionLevel() string {
 	return "hour"
 }
