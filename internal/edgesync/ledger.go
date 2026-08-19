@@ -217,27 +217,11 @@ func (l *Ledger) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_sync_ledger_synced
 		ON sync_ledger(state, synced_at, hub_id);
 
-	-- One row per contact session (connectivity acquired -> lost), which is
-	-- the unit an operator reasons about. A session may span many agent ticks.
-	--
-	-- TODO(#569): created here but not yet written. The session lifecycle
-	-- belongs to the sync agent (PR 8). Defined now so the schema lands in one
-	-- migration rather than altering a live edge database later — on a
-	-- disconnected box that is a site visit, not a config push. If PR 8 ships
-	-- without using it, delete the table rather than leaving it dead.
-	CREATE TABLE IF NOT EXISTS sync_history (
-		id           INTEGER PRIMARY KEY AUTOINCREMENT,
-		hub_id       TEXT NOT NULL,
-		started_at   TIMESTAMP NOT NULL,
-		completed_at TIMESTAMP,
-		files_synced INTEGER NOT NULL DEFAULT 0,
-		bytes_synced INTEGER NOT NULL DEFAULT 0,
-		transport    TEXT NOT NULL,
-		status       TEXT NOT NULL DEFAULT 'in_progress'
-	);
-
-	CREATE INDEX IF NOT EXISTS idx_sync_history_started
-		ON sync_history(hub_id, started_at);
+	-- sync_history was defined pre-emptively for a session-lifecycle feature
+	-- (TODO(#569) PR 8) that shipped without using it. Its own comment said
+	-- to delete it in that case rather than leave dead schema; the DROP
+	-- below retires it on existing spokes too. Nothing ever wrote a row.
+	DROP TABLE IF EXISTS sync_history;
 
 	-- Spoke-local key/value facts that must survive restarts. First user:
 	-- the compaction-defer enablement epoch (issue #610), which lets
@@ -1329,20 +1313,6 @@ func scanEntry(s rowScanner) (*LedgerEntry, error) {
 		e.ExportedAt = &t
 	}
 	return &e, nil
-}
-
-// checkAffected turns a zero-row UPDATE into ErrNotFound. Without this a state
-// transition against a path that isn't tracked would silently succeed, and the
-// agent would believe it had advanced an entry that does not exist.
-func checkAffected(res sql.Result, path string) error {
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("edgesync: rows affected for %q: %w", path, err)
-	}
-	if n == 0 {
-		return fmt.Errorf("edgesync: %q: %w", path, ErrNotFound)
-	}
-	return nil
 }
 
 // checkTransition reports the outcome of a guarded state transition. A guarded

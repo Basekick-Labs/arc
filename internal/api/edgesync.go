@@ -212,14 +212,6 @@ func (h *EdgeSyncHandler) receiveFile(c *fiber.Ctx) error {
 		})
 	}
 
-	// The hub ID must match this hub. A MAC minted for a different hub that
-	// shares the spoke's secret is not valid here.
-	if hubID != h.hubID {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "hub ID mismatch",
-		})
-	}
-
 	size, err := strconv.ParseInt(c.Get(headerSize), 10, 64)
 	if err != nil || size < 0 {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -272,6 +264,20 @@ func (h *EdgeSyncHandler) receiveFile(c *fiber.Ctx) error {
 		security.HMACTimestampTolerance,
 	); err != nil {
 		return h.authFailure(c, spokeID, err)
+	}
+
+	// The hub ID must match this hub — a MAC minted for a different hub that
+	// shares the spoke's secret is not valid here. Checked AFTER the MAC:
+	// answered early it let an unauthenticated caller confirm this hub's ID
+	// by iterating candidates (400 mismatch vs 401 anything-else). Now the
+	// difference is visible only to a caller holding a valid spoke secret
+	// (the misconfigured spoke this 400 exists to help) or replaying a
+	// captured in-window request signed for another hub — which reveals
+	// secret reuse across hubs, never this hub's ID (the ID is MAC-bound).
+	if hubID != h.hubID {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "hub ID mismatch",
+		})
 	}
 
 	// The body is fully buffered, not streamed: the Fiber app is constructed
@@ -351,10 +357,6 @@ func (h *EdgeSyncHandler) reconcile(c *fiber.Ctx) error {
 			"error": "missing required sync headers",
 		})
 	}
-	if hubID != h.hubID {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "hub ID mismatch"})
-	}
-
 	ts, err := strconv.ParseInt(c.Get(headerTS), 10, 64)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -381,6 +383,12 @@ func (h *EdgeSyncHandler) reconcile(c *fiber.Ctx) error {
 		security.HMACTimestampTolerance,
 	); err != nil {
 		return h.authFailure(c, spokeID, err)
+	}
+
+	// Post-MAC for the same reason as receiveFile: the early 400 disclosed
+	// the hub ID to unauthenticated callers.
+	if hubID != h.hubID {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "hub ID mismatch"})
 	}
 
 	var req reconcileRequest

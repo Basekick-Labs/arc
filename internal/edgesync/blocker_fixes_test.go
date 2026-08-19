@@ -10,6 +10,7 @@ package edgesync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -429,5 +430,52 @@ func TestLedger_RequeueAndDismissFailedRows(t *testing.T) {
 	}
 	if n, err := ledger.DismissFailed(ctx, DefaultHubID, ""); err != nil || n != 0 {
 		t.Errorf("dismiss all with none failed = %d, %v; want 0, nil", n, err)
+	}
+}
+
+// Dual-role nodes (#616 audit M2): a hub that is also a spoke must not
+// re-discover OTHER spokes' received data and forward it upstream. Received
+// namespaces are excluded from discovery; an excluder error aborts the pass
+// (proceeding without the set would silently start relaying).
+func TestDiscovery_ExcludesReceivedSpokeNamespaces(t *testing.T) {
+	ctx := context.Background()
+	rig := newAgentRig(t)
+
+	rig.writeFile(t, "metrics/cpu/2026/08/07/14/own.parquet", []byte("own telemetry"))
+	rig.writeFile(t, "rocket-02/metrics/cpu/2026/08/07/14/theirs.parquet", []byte("received from another spoke"))
+	// Two-segment shape: a root-level file another spoke synced, stored as
+	// {spokeID}/x.parquet — the deep-review edge that escaped splitFirstTwo.
+	rig.writeFile(t, "rocket-02/shallow.parquet", []byte("shallow received file"))
+
+	d, err := NewDiscoverer(rig.ledger, rig.backend, DefaultHubID, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("discoverer: %v", err)
+	}
+	d.SetNamespaceExcluder(func(context.Context) (map[string]struct{}, error) {
+		return map[string]struct{}{"rocket-02": {}}, nil
+	})
+
+	n, err := d.Discover(ctx)
+	if err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("discovered = %d, want 1 (own file only)", n)
+	}
+	for _, p := range []string{
+		"rocket-02/metrics/cpu/2026/08/07/14/theirs.parquet",
+		"rocket-02/shallow.parquet",
+	} {
+		if _, err := rig.ledger.Get(ctx, DefaultHubID, p); err == nil {
+			t.Errorf("%s entered the ledger; it would relay upstream", p)
+		}
+	}
+
+	// Excluder failure aborts rather than relaying.
+	d.SetNamespaceExcluder(func(context.Context) (map[string]struct{}, error) {
+		return nil, errors.New("registry unavailable")
+	})
+	if _, err := d.Discover(ctx); err == nil {
+		t.Error("discovery proceeded without the exclusion set; must abort on excluder error")
 	}
 }
