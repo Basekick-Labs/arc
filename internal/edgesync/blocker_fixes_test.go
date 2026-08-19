@@ -329,3 +329,105 @@ func TestHTTPTransport_SendsTheHubAPIToken(t *testing.T) {
 		t.Errorf("tokenless Authorization = %q, want empty", gotAuth[1])
 	}
 }
+
+// Operator remediation (#612): failed rows can be requeued (fresh retry
+// budget) or dismissed (terminal, prunable, reversible); the other two
+// skipped classes — vanished files and compacted outputs — must never
+// re-enter the queue through either op.
+func TestLedger_RequeueAndDismissFailedRows(t *testing.T) {
+	ctx := context.Background()
+	ledger := setupTestLedger(t)
+
+	add := func(path string) {
+		t.Helper()
+		if err := ledger.Track(ctx, &LedgerEntry{
+			HubID: DefaultHubID, Path: path, SHA256: "aa", SizeBytes: 2,
+			Database: "metrics", Measurement: "cpu",
+			PartitionTime: time.Date(2026, 8, 7, 14, 0, 0, 0, time.UTC),
+			DiscoveredAt:  time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("add %s: %v", path, err)
+		}
+	}
+	fail := func(path string) {
+		t.Helper()
+		if err := ledger.MarkInFlight(ctx, DefaultHubID, path); err != nil {
+			t.Fatalf("inflight %s: %v", path, err)
+		}
+		if err := ledger.MarkFailed(ctx, DefaultHubID, path, "boom", 1); err != nil {
+			t.Fatalf("fail %s: %v", path, err)
+		}
+	}
+	state := func(path string) SyncState {
+		t.Helper()
+		e, err := ledger.Get(ctx, DefaultHubID, path)
+		if err != nil {
+			t.Fatalf("get %s: %v", path, err)
+		}
+		return e.State
+	}
+
+	f1 := "metrics/cpu/2026/08/07/14/f1.parquet"
+	f2 := "metrics/cpu/2026/08/07/14/f2.parquet"
+	add(f1)
+	add(f2)
+	fail(f1)
+	fail(f2)
+
+	// Vanished-skip and compacted-output rows: untouchable by both ops.
+	vanished := "metrics/cpu/2026/08/07/14/vanished.parquet"
+	add(vanished)
+	if err := ledger.MarkSkipped(ctx, DefaultHubID, vanished, "source file removed before delivery (compaction or retention)"); err != nil {
+		t.Fatalf("skip vanished: %v", err)
+	}
+	output := "metrics/cpu/2026/08/07/14/cpu_20260807_140000_1754575200000000000_b1_compacted.parquet"
+	if err := ledger.TrackCompactedOutput(ctx, DefaultHubID, output); err != nil {
+		t.Fatalf("track output: %v", err)
+	}
+
+	// Requeue one by path: pending again, attempts reset.
+	n, err := ledger.RequeueFailed(ctx, DefaultHubID, f1)
+	if err != nil || n != 1 {
+		t.Fatalf("requeue f1 = %d, %v", n, err)
+	}
+	e, _ := ledger.Get(ctx, DefaultHubID, f1)
+	if e.State != StatePending || e.Attempts != 0 {
+		t.Errorf("f1 = %s attempts=%d, want pending/0", e.State, e.Attempts)
+	}
+
+	// Dismiss the other: skipped with the operator note, prune-eligible.
+	n, err = ledger.DismissFailed(ctx, DefaultHubID, f2)
+	if err != nil || n != 1 {
+		t.Fatalf("dismiss f2 = %d, %v", n, err)
+	}
+	e, _ = ledger.Get(ctx, DefaultHubID, f2)
+	if e.State != StateSkipped || e.LastError != NoteOperatorDismissed {
+		t.Errorf("f2 = %s/%q, want skipped/operator-dismissed", e.State, e.LastError)
+	}
+
+	// Dismissal is reversible; the OTHER skip classes are not.
+	n, err = ledger.RequeueFailed(ctx, DefaultHubID, "")
+	if err != nil {
+		t.Fatalf("requeue all: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("requeue all touched %d rows, want 1 (only the dismissed row)", n)
+	}
+	if got := state(f2); got != StatePending {
+		t.Errorf("dismissed row after requeue = %s, want pending", got)
+	}
+	if got := state(vanished); got != StateSkipped {
+		t.Errorf("vanished row = %s; must stay skipped", got)
+	}
+	if got := state(output); got != StateSkipped {
+		t.Errorf("compacted-output row = %s; must stay skipped", got)
+	}
+
+	// Misses and empty-alls report honestly.
+	if n, err := ledger.RequeueFailed(ctx, DefaultHubID, "metrics/cpu/nope.parquet"); err != nil || n != 0 {
+		t.Errorf("requeue miss = %d, %v; want 0, nil", n, err)
+	}
+	if n, err := ledger.DismissFailed(ctx, DefaultHubID, ""); err != nil || n != 0 {
+		t.Errorf("dismiss all with none failed = %d, %v; want 0, nil", n, err)
+	}
+}

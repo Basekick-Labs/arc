@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/basekick-labs/arc/internal/edgesync"
@@ -338,5 +339,73 @@ func TestEdgeSyncSpoke_LedgerShowsExhaustedFiles(t *testing.T) {
 	}
 	if row["last_error"] == nil {
 		t.Error("the exhausted file does not say why it failed")
+	}
+}
+
+func (r *spokeRig) doJSON(t *testing.T, method, path, body string) (*http.Response, map[string]any) {
+	t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := r.app.Test(req, 30_000)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var out map[string]any
+	if len(raw) > 0 {
+		json.Unmarshal(raw, &out)
+	}
+	return resp, out
+}
+
+// Operator remediation endpoints (#612): selector validation, honest misses,
+// and the requeue/dismiss round trip through the HTTP layer.
+func TestEdgeSyncSpoke_LedgerRemediation(t *testing.T) {
+	ctx := context.Background()
+	rig := newSpokeRig(t)
+
+	// A file that fails delivery terminally: transport closed, one attempt.
+	if err := rig.backend.Write(ctx, "metrics/cpu/2026/08/07/14/f.parquet", []byte("x")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Keep failing it until the agent gives up (the exhausted-files idiom).
+	for i := 0; i < edgesync.DefaultMaxAttempts+2; i++ {
+		rig.transport.ScriptPut("ground-station", "metrics/cpu/2026/08/07/14/f.parquet",
+			&edgesync.PutResult{Outcome: edgesync.OutcomeChecksumMismatch})
+		rig.do(t, "POST", "/api/v1/spoke-sync/run")
+	}
+	resp, out := rig.do(t, "GET", "/api/v1/spoke-sync/status")
+	if resp.StatusCode != 200 || out["failed"].(float64) < 1 {
+		t.Fatalf("setup did not produce a failed row: %v %v", resp.StatusCode, out)
+	}
+
+	// Selector validation.
+	if resp, _ := rig.doJSON(t, "POST", "/api/v1/spoke-sync/ledger/requeue", `{}`); resp.StatusCode != 400 {
+		t.Errorf("empty selector = %d, want 400", resp.StatusCode)
+	}
+	if resp, _ := rig.doJSON(t, "POST", "/api/v1/spoke-sync/ledger/requeue", `{"path":"x","all":true}`); resp.StatusCode != 400 {
+		t.Errorf("both selectors = %d, want 400", resp.StatusCode)
+	}
+	if resp, _ := rig.doJSON(t, "POST", "/api/v1/spoke-sync/ledger/dismiss", `{"path":"metrics/cpu/nope.parquet"}`); resp.StatusCode != 404 {
+		t.Errorf("dismiss miss = %d, want 404", resp.StatusCode)
+	}
+
+	// Dismiss all, then requeue all (reversibility through HTTP).
+	resp, out = rig.doJSON(t, "POST", "/api/v1/spoke-sync/ledger/dismiss", `{"all":true}`)
+	if resp.StatusCode != 200 || out["dismissed"].(float64) < 1 {
+		t.Fatalf("dismiss all = %d %v", resp.StatusCode, out)
+	}
+	_, st := rig.do(t, "GET", "/api/v1/spoke-sync/status")
+	if st["failed"].(float64) != 0 {
+		t.Errorf("failed = %v after dismissing all", st["failed"])
+	}
+	resp, out = rig.doJSON(t, "POST", "/api/v1/spoke-sync/ledger/requeue", `{"all":true}`)
+	if resp.StatusCode != 200 || out["requeued"].(float64) < 1 {
+		t.Fatalf("requeue all = %d %v", resp.StatusCode, out)
+	}
+	_, st = rig.do(t, "GET", "/api/v1/spoke-sync/status")
+	if st["pending"].(float64) < 1 {
+		t.Errorf("pending = %v after requeue; dismissal must be reversible", st["pending"])
 	}
 }

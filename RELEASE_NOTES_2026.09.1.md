@@ -281,6 +281,10 @@ Three admin endpoints drive it:
 | `POST /api/v1/spoke-sync/run` | Run one sync pass and return what it did. |
 | `GET /api/v1/spoke-sync/status` | Pending/synced/failed counts and sync lag. |
 | `GET /api/v1/spoke-sync/ledger` | Per-file state, attempts, and last error. |
+| `POST /api/v1/spoke-sync/ledger/requeue` | Return failed (or dismissed) entries to pending with a fresh retry budget. |
+| `POST /api/v1/spoke-sync/ledger/dismiss` | Mark failed entries operator-dismissed: out of the view, reversible while the file survives. |
+
+A file that exhausts its retries — or hits a content conflict — used to sit in `failed` forever with no exit: stale failures buried live problems in the ledger view, and (with delivery-deferred compaction) held their partition's compaction hostage. Both remediation endpoints take `{"path": "..."}` for one entry or `{"all": true}` for the lot; a dismissal is deliberately *skipped-not-deleted*, because a deleted row whose file still exists would be re-tracked by the next discovery pass and resurrect as pending — the exact noise the operator asked to silence. Requeue a conflict only after resolving the divergence on the hub, or it will simply conflict again. A dismissal is reversible via requeue **while the file survives**: dismissing also makes the file eligible for local compaction (delivery was renounced, so the partition must not stay wedged on it), and once compaction or retention consumes it there is nothing left to requeue — on a spoke with delivery-deferred compaction that can be the next compaction cycle.
 
 A pass recovers transfers interrupted by a crash, discovers new files, reconciles the backlog, and streams what the hub lacks — **newest first**, so a contact window that closes mid-backlog has already delivered the freshest telemetry. It **pages until the backlog drains**, so one pass on a spoke returning from a long outage moves everything, not just the first batch. Conflicts are reported in full rather than counted and are not retried: the same path holding different content means a spoke-ID collision or corruption, and re-sending would either be refused or destroy evidence.
 

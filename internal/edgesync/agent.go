@@ -633,6 +633,16 @@ func (a *Agent) UnfinishedEntries(ctx context.Context, limit int) ([]*LedgerEntr
 	return a.ledger.Unfinished(ctx, a.hubID, limit)
 }
 
+// RequeueFailed returns failed (and operator-dismissed) rows to pending.
+func (a *Agent) RequeueFailed(ctx context.Context, path string) (int64, error) {
+	return a.ledger.RequeueFailed(ctx, a.hubID, path)
+}
+
+// DismissFailed moves failed rows to operator-dismissed skipped.
+func (a *Agent) DismissFailed(ctx context.Context, path string) (int64, error) {
+	return a.ledger.DismissFailed(ctx, a.hubID, path)
+}
+
 // Status reports what the spoke still has to send.
 func (a *Agent) Status(ctx context.Context) (*Stats, error) {
 	return a.ledger.Stats(ctx, a.hubID)
