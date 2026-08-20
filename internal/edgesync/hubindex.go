@@ -240,16 +240,25 @@ func (h *HubIndex) MarkCompacted(ctx context.Context, spokeID string, sourcePath
 
 // Forget removes a spoke's record for a path.
 //
-// TODO(#569): NOT YET CALLED IN PRODUCTION, and the gap has teeth. If hub-side
-// retention deletes a synced file from storage without calling this, the index
-// keeps claiming the hub holds it, so reconcile reports it `present` and the
-// spoke marks it synced. A spoke configured with delete_after_sync (phase 3)
-// would then be free to delete its only copy of data the hub no longer has.
+// TODO(#611): NOT YET CALLED IN PRODUCTION, and the gap has teeth. If a
+// GENUINE hub-side removal deletes a synced file without calling this, the
+// index keeps claiming the hub holds it, so reconcile reports it `present`
+// and the spoke marks it synced. A spoke configured with delete_after_sync
+// (phase 3) would then be free to delete its only copy of data the hub no
+// longer has.
 //
-// Two things keep that from being a live hazard today: delete_after_sync does
-// not exist yet, and nothing on the hub deletes files inside a spoke namespace
-// — Arc retention operates on its own ingested databases. Whoever adds either
-// MUST call this, and phase 3 must not ship before it is wired.
+// Forget is for genuine removals ONLY — content the hub really no longer
+// holds. Hub-side COMPACTION of spoke namespaces (#619) deletes files too,
+// but it PRESERVES their content inside the compacted output, so it goes
+// through MarkCompacted instead: the receipt stays valid and reconcile
+// keeps vouching, which is correct. Do not "fix" that to Forget.
+//
+// What keeps the Forget gap from being a live hazard today:
+// delete_after_sync does not exist yet, and no hub-side path REMOVES spoke
+// content — retention operates on Arc's own ingested databases (and its
+// partition parsing does not currently reach spoke namespaces). Whoever
+// adds hub retention over spoke prefixes, or ships phase 3, MUST wire this
+// first.
 func (h *HubIndex) Forget(ctx context.Context, spokeID, sourcePath string) error {
 	_, err := h.db.ExecContext(ctx,
 		`DELETE FROM sync_received WHERE spoke_id = ? AND source_path = ?`,
