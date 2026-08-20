@@ -460,6 +460,15 @@ The fix rejects, in `ValidateSQLRequest` (before any transform or RBAC check run
 
 Reachable only when RBAC is enabled (the multi-tenant authorization boundary); no CVE is being filed, as it is a residual of GHSA-93cm scoped to within the allow-list, tracked under the advisory above. Reported by [@arpitjain099](https://github.com/arpitjain099).
 
+### Dependency: gRPC-Go upgraded past GHSA-hrxh-6v49-42gf
+
+`google.golang.org/grpc` is upgraded from v1.80.0 to v1.83.1, past the v1.82.1
+patch floor for [GHSA-hrxh-6v49-42gf](https://github.com/advisories/GHSA-hrxh-6v49-42gf)
+(xDS RBAC and HTTP/2 vulnerabilities). Arc never starts a gRPC server or
+client — the library is linked in transitively via Arrow Flight — so none of
+the vulnerable paths were reachable, but the vulnerable code is no longer in
+the binary and dependency scanners come up clean.
+
 ## Bug fixes
 
 ### Concurrent backup/restore requests are now rejected with 409 instead of silently queuing ([#299](https://github.com/Basekick-Labs/arc/issues/299))
