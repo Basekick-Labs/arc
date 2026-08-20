@@ -104,6 +104,7 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 
 	progress.TotalFiles = int64(len(files))
 	progress.TotalBytes = manifest.TotalSizeBytes
+	m.setProgress(progress)
 
 	for _, srcPath := range files {
 		select {
@@ -127,6 +128,9 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 
 		atomic.AddInt64(&progress.ProcessedFiles, 1)
 		atomic.AddInt64(&progress.ProcessedBytes, bytesWritten)
+		// Republish so /status polling sees live counters — published Progress
+		// values are immutable snapshots, not the struct being mutated here.
+		m.setProgress(progress)
 
 		if atomic.LoadInt64(&progress.ProcessedFiles)%100 == 0 {
 			m.logger.Info().

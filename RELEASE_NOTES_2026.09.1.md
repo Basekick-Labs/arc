@@ -488,6 +488,20 @@ a malformed request never occupies the slot. Contributed by
 [@mvanhorn](https://github.com/mvanhorn) in
 [#622](https://github.com/Basekick-Labs/arc/pull/622).
 
+`DELETE /api/v1/backup/:id` joins the same admission slot
+([#626](https://github.com/Basekick-Labs/arc/issues/626)): deleting a backup
+while a backup or restore is running — including the backup the restore is
+reading — now returns `409 Conflict` instead of tearing files out from under
+the operation. The manager additionally refuses deletes at its own boundary
+while an operation holds it, as a belt for any future non-HTTP caller.
+
+The same review also closed a long-standing data race on the progress object:
+the manager published its live progress struct and kept writing to it (status,
+error, counters) while `/status` polls and the admission check read it
+unsynchronized. Progress is now published as immutable snapshots, republished
+after each file, so pollers see live counters without ever sharing memory with
+the writer.
+
 ### Quoted identifiers in SQL now resolve to storage paths
 
 `SELECT * FROM "my-db".cpu` used to return zero rows, silently. The query

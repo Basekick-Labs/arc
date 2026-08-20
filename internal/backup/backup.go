@@ -170,6 +170,7 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// never exceeds TotalFiles. The manifest inventory (TotalFiles) counts only data files.
 	progress.TotalFiles = manifest.TotalFiles + int64(len(icebergMetaFiles))
 	progress.TotalBytes = manifest.TotalSizeBytes
+	m.setProgress(progress)
 
 	// ── 2. Copy parquet files ───────────────────────────────────────────
 	if err := m.copyDataFiles(ctx, backupID, parquetFiles, progress); err != nil {
@@ -301,6 +302,9 @@ func (m *Manager) copyDataFiles(ctx context.Context, backupID string, files []st
 
 		atomic.AddInt64(&progress.ProcessedFiles, 1)
 		atomic.AddInt64(&progress.ProcessedBytes, written)
+		// Republish so /status polling sees live counters — published Progress
+		// values are immutable snapshots, not the struct being mutated here.
+		m.setProgress(progress)
 
 		if atomic.LoadInt64(&progress.ProcessedFiles)%100 == 0 {
 			m.logger.Info().
@@ -313,6 +317,7 @@ func (m *Manager) copyDataFiles(ctx context.Context, backupID string, files []st
 	// Accumulate rather than overwrite: CreateBackup calls this once per file
 	// group, and a later group must not erase an earlier group's skips.
 	atomic.AddInt64(&progress.SkippedFiles, skipped)
+	m.setProgress(progress)
 
 	if skipped == 0 {
 		return nil
