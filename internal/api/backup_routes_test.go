@@ -234,3 +234,57 @@ func TestBackupHandlerReleasesAdmissionAfterFailure(t *testing.T) {
 	}
 	waitForOperationRelease(t, rig.handler)
 }
+
+func (r *backupRouteRig) delete(t *testing.T, path string) int {
+	t.Helper()
+
+	req := httptest.NewRequest(http.MethodDelete, path, nil)
+	resp, err := r.app.Test(req, 5_000)
+	if err != nil {
+		t.Fatalf("DELETE %s: %v", path, err)
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode
+}
+
+// #626: DELETE shares the backup/restore admission slot. Deleting while a
+// backup runs is refused with 409; once the operation finishes, a real backup
+// deletes cleanly and the slot is free for the next operation.
+func TestDeleteBackupSharesAdmissionSlot(t *testing.T) {
+	rig := newBackupRouteRig(t, nil)
+
+	if status := rig.mustPost(t, "/api/v1/backup/", `{}`); status != fiber.StatusAccepted {
+		t.Fatalf("initial backup status=%d, want %d", status, fiber.StatusAccepted)
+	}
+	select {
+	case <-rig.storage.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("accepted backup did not reach storage discovery")
+	}
+
+	if status := rig.delete(t, "/api/v1/backup/backup-20260820-120000-deadbeef"); status != fiber.StatusConflict {
+		t.Fatalf("delete during running backup status=%d, want %d", status, fiber.StatusConflict)
+	}
+
+	close(rig.storage.release)
+	waitForOperationRelease(t, rig.handler)
+
+	// The backup that just completed is a real, deletable backup.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	backups, err := rig.handler.manager.ListBackups(ctx)
+	if err != nil || len(backups) != 1 {
+		t.Fatalf("ListBackups = %v backups, err %v; want exactly 1", len(backups), err)
+	}
+	if status := rig.delete(t, "/api/v1/backup/"+backups[0].BackupID); status != fiber.StatusOK {
+		t.Fatalf("delete after completion status=%d, want %d", status, fiber.StatusOK)
+	}
+
+	// The delete released the slot: the next operation is admitted.
+	waitForOperationRelease(t, rig.handler)
+	if status := rig.mustPost(t, "/api/v1/backup/", `{}`); status != fiber.StatusAccepted {
+		t.Fatalf("backup after delete status=%d, want %d", status, fiber.StatusAccepted)
+	}
+	waitForListCalls(t, rig.storage, 2)
+	waitForOperationRelease(t, rig.handler)
+}

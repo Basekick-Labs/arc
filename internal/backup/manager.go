@@ -2,6 +2,7 @@ package backup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -103,13 +104,23 @@ func generateBackupID() string {
 }
 
 // GetProgress returns the current active operation progress, or nil if idle.
+// The returned value is an immutable snapshot — the operation goroutine never
+// writes to a published Progress (see setProgress) — so callers may read and
+// marshal it freely, but must not mutate it. It can lag the live operation by
+// up to one file's worth of work.
 func (m *Manager) GetProgress() *Progress {
 	return m.active.Load()
 }
 
-// setProgress stores the current operation progress.
+// setProgress publishes an immutable snapshot of p. The operation goroutine
+// keeps mutating its own private Progress and republishes after each update;
+// readers (GetProgress, the /status handler, the API admission check) only
+// ever see copies, so their unsynchronized field reads cannot race with the
+// writer. Publishing the live pointer instead is a data race: every field
+// write after the initial publish would race the readers.
 func (m *Manager) setProgress(p *Progress) {
-	m.active.Store(p)
+	snapshot := *p
+	m.active.Store(&snapshot)
 }
 
 // ListBackups returns summaries of all available backups in the default backup storage.
@@ -156,8 +167,25 @@ func (m *Manager) GetBackup(ctx context.Context, backupID string) (*Manifest, er
 	return UnmarshalManifest(data)
 }
 
+// ErrOperationInProgress is returned by DeleteBackup when a backup or restore
+// operation holds the manager. The API layer maps it to 409 Conflict.
+var ErrOperationInProgress = errors.New("a backup or restore operation is in progress")
+
 // DeleteBackup removes all files for a backup from the default backup storage.
+//
+// It refuses to run concurrently with a backup or restore (#626): deleting the
+// backup a restore is reading tears files out from under it mid-operation, and
+// deleting the backup being written leaves a half-written/half-deleted
+// directory. TryLock rather than Lock — an operation can hold m.mu for hours,
+// and queuing a synchronous HTTP-driven delete behind it would pin the request
+// goroutine long past its context deadline. Callers get ErrOperationInProgress
+// and retry when the operation finishes.
 func (m *Manager) DeleteBackup(ctx context.Context, backupID string) error {
+	if !m.mu.TryLock() {
+		return ErrOperationInProgress
+	}
+	defer m.mu.Unlock()
+
 	// List all files under this backup ID
 	prefix := backupID + "/"
 	files, err := m.backupStorage.List(ctx, prefix)

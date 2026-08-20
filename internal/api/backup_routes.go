@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"regexp"
 	"sync/atomic"
 	"time"
@@ -164,10 +165,29 @@ func (h *BackupHandler) DeleteBackup(c *fiber.Ctx) error {
 		})
 	}
 
+	// Deletion shares the backup/restore admission slot (#626): deleting the
+	// backup a restore is reading tears files out from under it, and deleting
+	// one mid-write leaves a half-written directory. Unlike backup/restore the
+	// delete is synchronous, so the handler holds the slot for its duration.
+	acquired, err := h.acquireOperation(c, "delete")
+	if !acquired {
+		return err
+	}
+	defer h.activeOperation.Store(nil)
+
 	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
 	defer cancel()
 
 	if err := h.manager.DeleteBackup(ctx, id); err != nil {
+		// Belt for operations started outside this handler: the manager
+		// refuses to delete while its own mutex is held.
+		if errors.Is(err, backup.ErrOperationInProgress) {
+			operation := "unknown"
+			if p := h.manager.GetProgress(); p != nil && p.Status == "running" {
+				operation = p.Operation
+			}
+			return h.operationConflict(c, operation)
+		}
 		h.logger.Error().Err(err).Str("backup_id", id).Msg("Failed to delete backup")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to delete backup",
@@ -255,11 +275,13 @@ func (h *BackupHandler) acquireOperation(c *fiber.Ctx, operation string) (bool, 
 		return false, h.operationConflict(c, p.Operation)
 	}
 	if !h.activeOperation.CompareAndSwap(nil, &operation) {
-		activeOperation := ""
+		// The holder may release between the failed CAS and this Load; report
+		// "unknown" rather than an empty operation in that sliver (#622 review).
+		held := "unknown"
 		if active := h.activeOperation.Load(); active != nil {
-			activeOperation = *active
+			held = *active
 		}
-		return false, h.operationConflict(c, activeOperation)
+		return false, h.operationConflict(c, held)
 	}
 	return true, nil
 }
