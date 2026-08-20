@@ -409,3 +409,45 @@ func TestEdgeSyncSpoke_LedgerRemediation(t *testing.T) {
 		t.Errorf("pending = %v after requeue; dismissal must be reversible", st["pending"])
 	}
 }
+
+// The ?state= filter (#612 follow-up): dismissed rows become enumerable —
+// the prerequisite for selective requeue — and an unknown state is a 400.
+func TestEdgeSyncSpoke_LedgerStateFilter(t *testing.T) {
+	ctx := context.Background()
+	rig := newSpokeRig(t)
+
+	if err := rig.backend.Write(ctx, "metrics/cpu/2026/08/07/14/f.parquet", []byte("x")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	for i := 0; i < edgesync.DefaultMaxAttempts+2; i++ {
+		rig.transport.ScriptPut("ground-station", "metrics/cpu/2026/08/07/14/f.parquet",
+			&edgesync.PutResult{Outcome: edgesync.OutcomeChecksumMismatch})
+		rig.do(t, "POST", "/api/v1/spoke-sync/run")
+	}
+	if resp, out := rig.doJSON(t, "POST", "/api/v1/spoke-sync/ledger/dismiss", `{"all":true}`); resp.StatusCode != 200 || out["dismissed"].(float64) < 1 {
+		t.Fatalf("dismiss setup failed: %d %v", resp.StatusCode, out)
+	}
+
+	resp, out := rig.do(t, "GET", "/api/v1/spoke-sync/ledger?state=skipped")
+	if resp.StatusCode != 200 {
+		t.Fatalf("state filter = %d", resp.StatusCode)
+	}
+	entries, _ := out["entries"].([]any)
+	if len(entries) != 1 {
+		t.Fatalf("skipped entries = %d, want 1", len(entries))
+	}
+	row, _ := entries[0].(map[string]any)
+	if row["state"] != "skipped" || row["last_error"] != edgesync.NoteOperatorDismissed {
+		t.Errorf("row = %v/%v, want skipped/operator-dismissed note", row["state"], row["last_error"])
+	}
+
+	// Unfinished default view still hides it.
+	_, def := rig.do(t, "GET", "/api/v1/spoke-sync/ledger")
+	if defEntries, _ := def["entries"].([]any); len(defEntries) != 0 {
+		t.Errorf("default view shows %d entries; dismissed rows must stay out of it", len(defEntries))
+	}
+
+	if resp, _ := rig.do(t, "GET", "/api/v1/spoke-sync/ledger?state=bogus"); resp.StatusCode != 400 {
+		t.Errorf("bogus state = %d, want 400", resp.StatusCode)
+	}
+}

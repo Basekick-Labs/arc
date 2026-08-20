@@ -96,6 +96,11 @@ func (d *Discoverer) Discover(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("edgesync: list local files: %w", err)
 	}
 
+	tracked, err := d.ledger.TrackedPaths(ctx, d.hubID)
+	if err != nil {
+		return 0, fmt.Errorf("edgesync: load tracked paths: %w", err)
+	}
+
 	var excluded map[string]struct{}
 	if d.namespaceExcluder != nil {
 		excluded, err = d.namespaceExcluder(ctx)
@@ -129,13 +134,11 @@ func (d *Discoverer) Discover(ctx context.Context) (int, error) {
 			}
 		}
 
-		// Skip anything already tracked BEFORE hashing it. Discovery runs
-		// every pass, and re-hashing the whole corpus each time would make the
-		// cheap step the expensive one.
-		if _, err := d.ledger.Get(ctx, d.hubID, obj.Path); err == nil {
+		// Skip anything already tracked BEFORE hashing it. Set membership,
+		// not a per-object SELECT: at a 100k-file corpus the old point
+		// lookups were 100k queries per pass on the shared SQLite handle.
+		if _, isTracked := tracked[obj.Path]; isTracked {
 			continue
-		} else if !errors.Is(err, ErrNotFound) {
-			return 0, fmt.Errorf("edgesync: check ledger for %q: %w", obj.Path, err)
 		}
 
 		// Issue #610: a compacted file not in the ledger is either a crash

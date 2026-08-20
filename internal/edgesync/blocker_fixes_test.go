@@ -479,3 +479,60 @@ func TestDiscovery_ExcludesReceivedSpokeNamespaces(t *testing.T) {
 		t.Error("discovery proceeded without the exclusion set; must abort on excluder error")
 	}
 }
+
+// Keyset paging (#615): pages advance strictly past the cursor — including
+// the same-partition-time tiebreak — and unresolved rows behind the cursor
+// are not re-offered within the pass.
+func TestPendingPage_KeysetAdvancesPastCursor(t *testing.T) {
+	ctx := context.Background()
+	ledger := setupTestLedger(t)
+
+	pt := time.Date(2026, 8, 7, 14, 0, 0, 0, time.UTC)
+	for i := 0; i < 5; i++ {
+		// THREE rows share one partition_time with page size 2, so the
+		// second page can only be produced by the `pt = ? AND id > ?`
+		// tiebreak arm — a test that would fail if that arm were dropped
+		// (deep-review hardening: a boundary at the group's end never
+		// exercises it).
+		rowPT := pt
+		if i >= 3 {
+			rowPT = pt.Add(-time.Duration(i) * time.Hour)
+		}
+		if err := ledger.Track(ctx, &LedgerEntry{
+			HubID: DefaultHubID, Path: fmt.Sprintf("metrics/cpu/2026/08/07/14/p_%d.parquet", i),
+			SHA256: "aa", SizeBytes: 2, Database: "metrics", Measurement: "cpu",
+			PartitionTime: rowPT, DiscoveredAt: time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("track %d: %v", i, err)
+		}
+	}
+
+	seen := map[string]int{}
+	var cursor *LedgerEntry
+	pages := 0
+	for {
+		page, err := ledger.PendingPage(ctx, DefaultHubID, 2, cursor)
+		if err != nil {
+			t.Fatalf("page: %v", err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		pages++
+		for _, e := range page {
+			seen[e.Path]++
+		}
+		cursor = page[len(page)-1]
+	}
+	if len(seen) != 5 {
+		t.Errorf("saw %d distinct rows, want 5", len(seen))
+	}
+	for p, n := range seen {
+		if n != 1 {
+			t.Errorf("%s offered %d times; keyset must not repeat rows", p, n)
+		}
+	}
+	if pages != 3 {
+		t.Errorf("pages = %d, want 3 (2+2+1)", pages)
+	}
+}

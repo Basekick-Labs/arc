@@ -156,13 +156,25 @@ type ImportResult struct {
 	Duration time.Duration
 }
 
+// ErrImportInProgress means another bundle import is already running.
+//
+// One import at a time is the physical reality (one drive in one slot) and a
+// hard requirement (the staging area and result collector are shared), so a
+// concurrent request fails FAST with this sentinel rather than queueing
+// silently behind a run that can legally take hours — the operator whose
+// first request timed out client-side would otherwise re-POST and hang too
+// (2026-08-19 audit M3).
+var ErrImportInProgress = errors.New("edgesync: a bundle import is already in progress")
+
 // Import verifies a bundle and commits its files.
 //
 // Order: open, identity checks, dedup, verify EVERYTHING, then commit. No byte
 // reaches its final path until the whole bundle has been verified — the
 // property that makes an artifact carried on removable media safe to trust.
 func (i *Importer) Import(ctx context.Context, dir string) (*ImportResult, error) {
-	i.mu.Lock()
+	if !i.mu.TryLock() {
+		return nil, ErrImportInProgress
+	}
 	defer i.mu.Unlock()
 
 	start := time.Now()

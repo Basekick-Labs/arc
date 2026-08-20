@@ -411,7 +411,10 @@ func TestImporter_BatchCapHoldsForAlreadyPresentFiles(t *testing.T) {
 // collide in staging — both stage the same path, one promotes, the other fails
 // "file not found" — and Reset truncates the other's buffered registrations,
 // leaving committed files outside the manifest with no error.
-func TestImporter_ConcurrentImportsAreSerialized(t *testing.T) {
+// A concurrent import fails FAST with ErrImportInProgress instead of
+// queueing silently behind a run that can legally take hours (#614) — and
+// the refused bundle imports cleanly afterward, so nothing is lost.
+func TestImporter_ConcurrentImportFailsFast(t *testing.T) {
 	ctx := context.Background()
 	rig := newImportRig(t, true)
 
@@ -430,14 +433,33 @@ func TestImporter_ConcurrentImportsAreSerialized(t *testing.T) {
 	}
 	wg.Wait()
 
+	var okCount, busyCount int
+	refused := ""
 	for i, err := range errs {
-		if err != nil {
-			t.Errorf("concurrent import %d failed: %v", i, err)
+		switch {
+		case err == nil:
+			okCount++
+		case errors.Is(err, ErrImportInProgress):
+			busyCount++
+			refused = []string{a, b}[i]
+		default:
+			t.Fatalf("import %d: unexpected error %v", i, err)
+		}
+	}
+	// Timing-dependent: usually one wins and one is refused, but both may
+	// succeed if the first releases the lock before the second tries. What
+	// must NEVER happen is both refused, or any other error.
+	if okCount == 0 {
+		t.Fatalf("no import succeeded (ok=%d busy=%d)", okCount, busyCount)
+	}
+
+	// The refused drive imports cleanly on retry — refusal loses nothing.
+	if busyCount == 1 {
+		if _, err := rig.importer.Import(ctx, refused); err != nil {
+			t.Fatalf("retry of the refused bundle failed: %v", err)
 		}
 	}
 
-	// Every file from both bundles must reach a manifest batch. A truncated
-	// buffer would silently drop some.
 	total := 0
 	for _, n := range rig.batches {
 		total += n
