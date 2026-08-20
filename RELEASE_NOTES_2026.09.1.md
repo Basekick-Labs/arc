@@ -462,6 +462,23 @@ Reachable only when RBAC is enabled (the multi-tenant authorization boundary); n
 
 ## Bug fixes
 
+### Concurrent backup/restore requests are now rejected with 409 instead of silently queuing ([#299](https://github.com/Basekick-Labs/arc/issues/299))
+
+The backup API checked "is an operation running?" before launching the work in
+a background goroutine — but the running flag was only set *inside* that
+goroutine. Two concurrent `POST /api/v1/backup` requests could both observe an
+idle manager, both receive `202 Accepted`, and the second backup would silently
+queue behind the first instead of being refused. The same window existed on
+`POST /api/v1/backup/restore`.
+
+Backup and restore now share a single atomic admission slot, acquired before
+the goroutine is launched: exactly one request gets `202 Accepted`, every
+concurrent competitor gets `409 Conflict`, and the slot is released on every
+completion and failure path. Request validation still runs before admission, so
+a malformed request never occupies the slot. Contributed by
+[@mvanhorn](https://github.com/mvanhorn) in
+[#622](https://github.com/Basekick-Labs/arc/pull/622).
+
 ### Quoted identifiers in SQL now resolve to storage paths
 
 `SELECT * FROM "my-db".cpu` used to return zero rows, silently. The query
