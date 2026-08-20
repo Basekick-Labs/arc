@@ -78,6 +78,17 @@ func (h *HubIndex) initSchema() error {
 	if _, err := h.db.Exec(schema); err != nil {
 		return fmt.Errorf("create sync_received table: %w", err)
 	}
+
+	// compacted_at marks a receipt whose FILE the hub's own compaction has
+	// consumed (#619): the content still exists inside a compacted output,
+	// so the receipt is not stale — reconcile keeps answering "present" and
+	// receive treats a re-sent copy as already delivered. Tolerant ALTER for
+	// databases created before the column existed (SQLite has no ADD COLUMN
+	// IF NOT EXISTS; the duplicate error is the up-to-date outcome).
+	if _, err := h.db.Exec(`ALTER TABLE sync_received ADD COLUMN compacted_at TIMESTAMP`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column name") {
+		return fmt.Errorf("add compacted_at column: %w", err)
+	}
 	h.logger.Debug().Msg("Sync hub index schema initialized")
 	return nil
 }
@@ -100,10 +111,11 @@ func (h *HubIndex) Record(ctx context.Context, r *ReceivedRecord) error {
 			(spoke_id, source_path, hub_path, sha256, size_bytes, received_at)
 		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(spoke_id, source_path) DO UPDATE SET
-			hub_path    = excluded.hub_path,
-			sha256      = excluded.sha256,
-			size_bytes  = excluded.size_bytes,
-			received_at = excluded.received_at`,
+			hub_path     = excluded.hub_path,
+			sha256       = excluded.sha256,
+			size_bytes   = excluded.size_bytes,
+			received_at  = excluded.received_at,
+			compacted_at = NULL`,
 		r.SpokeID, r.SourcePath, r.HubPath, r.SHA256, r.SizeBytes, receivedAt.UTC())
 	if err != nil {
 		return fmt.Errorf("edgesync: record received %q: %w", r.SourcePath, err)
@@ -111,14 +123,23 @@ func (h *HubIndex) Record(ctx context.Context, r *ReceivedRecord) error {
 	return nil
 }
 
-// Lookup returns the digests the hub holds for the given paths from one spoke.
+// HeldFile is what Lookup reports for one receipt: the delivered content's
+// digest, and whether the hub's own compaction has since consumed the FILE
+// (the content lives on inside a compacted output — the receipt stays valid,
+// but nothing at the original path exists to stat).
+type HeldFile struct {
+	SHA256    string
+	Compacted bool
+}
+
+// Lookup returns the receipts the hub holds for the given paths from one spoke.
 //
 // Batched deliberately: reconcile asks about thousands of paths at once, and
 // issuing one query per path would make the round-trip the design saved on the
-// wire reappear as a query storm against SQLite. The result maps source path
-// to digest; a path absent from the map is one the hub does not hold.
-func (h *HubIndex) Lookup(ctx context.Context, spokeID string, paths []string) (map[string]string, error) {
-	out := make(map[string]string, len(paths))
+// wire reappear as a query storm against SQLite. A path absent from the map
+// is one the hub does not hold.
+func (h *HubIndex) Lookup(ctx context.Context, spokeID string, paths []string) (map[string]HeldFile, error) {
+	out := make(map[string]HeldFile, len(paths))
 	if len(paths) == 0 {
 		return out, nil
 	}
@@ -140,7 +161,7 @@ func (h *HubIndex) Lookup(ctx context.Context, spokeID string, paths []string) (
 		}
 		chunk := paths[start:end]
 
-		query := `SELECT source_path, sha256 FROM sync_received WHERE spoke_id = ? AND source_path IN (?` +
+		query := `SELECT source_path, sha256, compacted_at IS NOT NULL FROM sync_received WHERE spoke_id = ? AND source_path IN (?` +
 			strings.Repeat(",?", len(chunk)-1) + `)`
 
 		args := make([]any, 0, len(chunk)+1)
@@ -162,11 +183,14 @@ func (h *HubIndex) Lookup(ctx context.Context, spokeID string, paths []string) (
 			defer rows.Close()
 
 			for rows.Next() {
-				var p, sha string
-				if err := rows.Scan(&p, &sha); err != nil {
+				var (
+					p, sha    string
+					compacted bool
+				)
+				if err := rows.Scan(&p, &sha, &compacted); err != nil {
 					return fmt.Errorf("edgesync: scan received: %w", err)
 				}
-				out[p] = sha
+				out[p] = HeldFile{SHA256: sha, Compacted: compacted}
 			}
 			if err := rows.Err(); err != nil {
 				return fmt.Errorf("edgesync: iterate received: %w", err)
@@ -178,6 +202,40 @@ func (h *HubIndex) Lookup(ctx context.Context, spokeID string, paths []string) (
 	}
 
 	return out, nil
+}
+
+// MarkCompacted stamps compacted_at on the receipts for source paths whose
+// files the hub's own compaction consumed (#619). Idempotent — recovery can
+// re-fire it — and deliberately an UPDATE, never an INSERT: a path with no
+// receipt was not received from this spoke and gets no bookkeeping. Chunked
+// like Lookup.
+func (h *HubIndex) MarkCompacted(ctx context.Context, spokeID string, sourcePaths []string) error {
+	if len(sourcePaths) == 0 {
+		return nil
+	}
+	const chunkSize = 900
+	now := time.Now().UTC()
+	for start := 0; start < len(sourcePaths); start += chunkSize {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		end := start + chunkSize
+		if end > len(sourcePaths) {
+			end = len(sourcePaths)
+		}
+		chunk := sourcePaths[start:end]
+		query := `UPDATE sync_received SET compacted_at = ? WHERE spoke_id = ? AND source_path IN (?` +
+			strings.Repeat(",?", len(chunk)-1) + `)`
+		args := make([]any, 0, len(chunk)+2)
+		args = append(args, now, spokeID)
+		for _, p := range chunk {
+			args = append(args, p)
+		}
+		if _, err := h.db.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("edgesync: mark receipts compacted: %w", err)
+		}
+	}
+	return nil
 }
 
 // Forget removes a spoke's record for a path.

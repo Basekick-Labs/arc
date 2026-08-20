@@ -142,6 +142,19 @@ type Job struct {
 	BytesAfter      int64
 	DurationSeconds float64
 
+	// sourcesDeleted records that deleteOldFiles fully succeeded. Under
+	// ParentFinalizesManifest, the manifest may be handed to the parent for
+	// finalization ONLY in that case: on a partial deletion failure the
+	// manifest is the surviving raws' only recovery path, and the parent
+	// deleting it would let them be re-compacted into a duplicate output
+	// (deep-review B2).
+	sourcesDeleted bool
+
+	// ParentFinalizesManifest: on full success, leave the crash-recovery
+	// storage manifest for the PARENT to delete after edge-sync receipt
+	// marking commits (#619). See SubprocessJobConfig.ParentFinalizesManifest.
+	ParentFinalizesManifest bool
+
 	// OutputStorageKey is the storage-relative key of the compacted output,
 	// set once the output name is fixed (before upload). Empty for jobs that
 	// produce no output (all sources vanished, or no time column).
@@ -191,6 +204,9 @@ type JobConfig struct {
 	// is written and the job is byte-compatible with pre-Phase-4 behavior.
 	CompletionDir string
 
+	// ParentFinalizesManifest — see Job.ParentFinalizesManifest (#619).
+	ParentFinalizesManifest bool
+
 	// JobID, if set, overrides the auto-generated JobID. Phase 4 uses this
 	// so the parent (which spawns the subprocess) and the subprocess agree
 	// on the completion-manifest filename. Empty means auto-generate.
@@ -230,22 +246,23 @@ func NewJob(cfg *JobConfig) *Job {
 	}
 
 	return &Job{
-		Measurement:     cfg.Measurement,
-		PartitionPath:   cfg.PartitionPath,
-		Files:           cfg.Files,
-		StorageBackend:  cfg.StorageBackend,
-		Database:        cfg.Database,
-		Tier:            cfg.Tier,
-		BatchNumber:     cfg.BatchNumber,
-		TempDirectory:   tempDir,
-		SortKeys:        sortKeys,
-		JobID:           jobID,
-		Status:          JobStatusPending,
-		CompletionDir:   cfg.CompletionDir,
-		PartitionTime:   cfg.PartitionTime,
-		logger:          cfg.Logger.With().Str("job_id", jobID).Logger(),
-		db:              cfg.DB,
-		manifestManager: cfg.ManifestManager,
+		Measurement:             cfg.Measurement,
+		PartitionPath:           cfg.PartitionPath,
+		Files:                   cfg.Files,
+		StorageBackend:          cfg.StorageBackend,
+		Database:                cfg.Database,
+		Tier:                    cfg.Tier,
+		BatchNumber:             cfg.BatchNumber,
+		TempDirectory:           tempDir,
+		SortKeys:                sortKeys,
+		JobID:                   jobID,
+		Status:                  JobStatusPending,
+		CompletionDir:           cfg.CompletionDir,
+		ParentFinalizesManifest: cfg.ParentFinalizesManifest,
+		PartitionTime:           cfg.PartitionTime,
+		logger:                  cfg.Logger.With().Str("job_id", jobID).Logger(),
+		db:                      cfg.DB,
+		manifestManager:         cfg.ManifestManager,
 	}
 }
 
@@ -421,8 +438,15 @@ func (j *Job) Run(ctx context.Context) error {
 		// Don't fail the job - manifest will enable recovery on next cycle
 		// The manifest remains so recovery can retry deletion
 	} else {
-		// Deletion succeeded - delete the manifest
-		if j.manifestManager != nil && j.manifestPath != "" {
+		// Deletion succeeded - delete the manifest, UNLESS the parent asked
+		// to finalize: it marks edge-sync receipts for the consumed inputs
+		// first and deletes the manifest itself, so a crash in between
+		// re-fires the marks via recovery instead of silently losing them.
+		j.sourcesDeleted = true
+		if j.ParentFinalizesManifest {
+			j.logger.Debug().Str("manifest", j.manifestPath).
+				Msg("Leaving manifest for the parent to finalize after receipt marking")
+		} else if j.manifestManager != nil && j.manifestPath != "" {
 			if delErr := j.manifestManager.DeleteManifest(ctx, j.manifestPath); delErr != nil {
 				j.logger.Warn().Err(delErr).Msg("Failed to delete manifest after successful deletion")
 				// Non-fatal - manifest will be cleaned up during recovery
@@ -927,18 +951,30 @@ func (j *Job) writeOutputWrittenManifest(_ context.Context, localPath, storageKe
 
 	now := time.Now().UTC()
 	m := &CompletionManifest{
-		JobID:         j.JobID,
-		Database:      j.Database,
+		JobID: j.JobID,
+		// For a spoke-namespace pseudo-database ("rocket-01/telemetry") the
+		// Raft manifest entry must carry the spoke's OWN database — the same
+		// labeling the received raws got at receive time — or the watcher
+		// would register the output under one scheme while DeleteFile
+		// removes sources labeled under the other (#619 review F8). Routing
+		// never keys on this field; paths remain authoritative.
+		Database:      canonicalManifestDatabase(j.Database),
 		Measurement:   j.Measurement,
 		PartitionPath: j.PartitionPath,
 		Tier:          j.Tier,
 		State:         CompletionStateOutputWritten,
 		Outputs: []CompactedOutput{
 			{
-				Path:          storageKey,
-				SHA256:        sum,
-				SizeBytes:     j.BytesAfter,
-				Database:      j.Database,
+				Path:      storageKey,
+				SHA256:    sum,
+				SizeBytes: j.BytesAfter,
+				// THIS is the field the watcher reads into the Raft
+				// FileEntry (watcher.go builds CompactedFile from Outputs),
+				// so it must carry the canonical database like the top-level
+				// field above — the received raws were registered under the
+				// spoke's own database, and a pseudo-database here would
+				// split the manifest's database index (#619 review H1).
+				Database:      canonicalManifestDatabase(j.Database),
 				Measurement:   j.Measurement,
 				PartitionTime: j.PartitionTime,
 				Tier:          j.Tier,
@@ -1182,4 +1218,34 @@ func (j *Job) removeDirectoryTree(ctx context.Context, remover storage.Directory
 	// Try parent directory
 	parent := filepath.Dir(dir)
 	return 1 + j.removeDirectoryTree(ctx, remover, parent)
+}
+
+// CompactedInputKeys returns the storage keys of the sources this job
+// actually consumed and deleted — the validated set only. Nil until the job
+// has run.
+func (j *Job) CompactedInputKeys() []string {
+	return j.compactedFiles
+}
+
+// RetainedManifestPath returns the crash-recovery manifest path the job
+// deliberately left in place under ParentFinalizesManifest, or "" when the
+// manifest was deleted (or never written).
+func (j *Job) RetainedManifestPath() string {
+	if !j.ParentFinalizesManifest || !j.sourcesDeleted {
+		// A partial source-deletion failure keeps the manifest as the
+		// surviving raws' ONLY recovery path; the parent must not delete it
+		// (B2). Recovery both retries the deletes and re-fires the marks.
+		return ""
+	}
+	return j.manifestPath
+}
+
+// canonicalManifestDatabase maps a spoke-namespace pseudo-database
+// ("{spoke}/{db}") to the database name its files were registered under at
+// receive time ({db}); plain names pass through.
+func canonicalManifestDatabase(database string) string {
+	if _, rest, found := strings.Cut(database, "/"); found && rest != "" {
+		return rest
+	}
+	return database
 }

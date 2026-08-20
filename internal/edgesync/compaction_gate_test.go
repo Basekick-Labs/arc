@@ -493,3 +493,31 @@ func TestDismissedRows_PruneExemptUntilFileGone(t *testing.T) {
 		t.Fatalf("sweep(gone) = %d, %v; want 1", swept, err)
 	}
 }
+
+// Dual-role interplay (#619 review M2): the spoke-side compacted-output
+// observer also fires for the node's HUB-compaction outputs in received
+// namespaces. The resulting ledger row is inert: skipped, never offered
+// (its namespace is excluded from discovery anyway), and prunable.
+func TestTrackCompactedOutput_SpokeNamespacePathIsInert(t *testing.T) {
+	ctx := context.Background()
+	l := setupTestLedger(t)
+
+	p := "child-01/factory/temps/2026/08/19/10/temps_20260819_100000_1787240000000000000_b1_compacted.parquet"
+	if err := l.TrackCompactedOutput(ctx, DefaultHubID, p); err != nil {
+		t.Fatalf("track: %v", err)
+	}
+	row, err := l.Get(ctx, DefaultHubID, p)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if row.State != StateSkipped || row.LastError != NoteCompactedOutput {
+		t.Errorf("row = %s/%q, want skipped/compacted-output", row.State, row.LastError)
+	}
+	pending, err := l.Pending(ctx, DefaultHubID, 0)
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Errorf("spoke-namespace output offered for sync: %v", pending)
+	}
+}

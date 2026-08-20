@@ -182,7 +182,13 @@ func (m *ManifestManager) ListManifests(ctx context.Context) ([]string, error) {
 // stored on the struct — the caller (Manager) copies it under its own mutex,
 // which keeps the scheduler-goroutine read free of the wiring race a stored
 // field would have (main.go wires observers after the schedulers start).
-func (m *ManifestManager) RecoverOrphanedManifests(ctx context.Context, onKeptOutput func(storageKey string)) (int, error) {
+// onConsumedInputs, when non-nil, receives manifest.InputFiles once their
+// deletion has fully succeeded on the KEPT-output branch — never on the
+// output-missing branch, whose inputs were not consumed (#619 review F5).
+// Fired BEFORE the manifest is deleted; a returned ERROR keeps the manifest
+// so the next recovery pass re-fires the marks (consumers are idempotent) —
+// deleting it despite a failed mark would silently lose them (B1).
+func (m *ManifestManager) RecoverOrphanedManifests(ctx context.Context, onKeptOutput func(storageKey string), onConsumedInputs func(inputs []string) error) (int, error) {
 	manifests, err := m.ListManifests(ctx)
 	if err != nil {
 		// ListManifests already describes the failure.
@@ -203,7 +209,7 @@ func (m *ManifestManager) RecoverOrphanedManifests(ctx context.Context, onKeptOu
 		default:
 		}
 
-		if err := m.recoverManifest(ctx, manifestPath, onKeptOutput); err != nil {
+		if err := m.recoverManifest(ctx, manifestPath, onKeptOutput, onConsumedInputs); err != nil {
 			m.logger.Error().Err(err).Str("manifest", manifestPath).Msg("Failed to recover manifest")
 			continue
 		}
@@ -221,7 +227,7 @@ func (m *ManifestManager) RecoverOrphanedManifests(ctx context.Context, onKeptOu
 }
 
 // recoverManifest processes a single orphaned manifest
-func (m *ManifestManager) recoverManifest(ctx context.Context, manifestPath string, onKeptOutput func(storageKey string)) error {
+func (m *ManifestManager) recoverManifest(ctx context.Context, manifestPath string, onKeptOutput func(storageKey string), onConsumedInputs func(inputs []string) error) error {
 	manifest, err := m.ReadManifest(ctx, manifestPath)
 	if err != nil {
 		// If we can't read the manifest, delete it and let compaction retry
@@ -318,6 +324,16 @@ func (m *ManifestManager) recoverManifest(ctx context.Context, manifestPath stri
 			Int("total", len(manifest.InputFiles)).
 			Msg("Some input files could not be deleted during recovery, keeping manifest for retry")
 		return fmt.Errorf("failed to delete %d of %d input files", deleteErrors, len(manifest.InputFiles))
+	}
+
+	// All input files deleted. Fire the consumed-inputs observer BEFORE
+	// removing the manifest: if the marks (or this process) die here, the
+	// surviving manifest re-runs this branch and re-fires them (#619). A
+	// mark failure KEEPS the manifest for the same reason (B1).
+	if onConsumedInputs != nil {
+		if err := onConsumedInputs(manifest.InputFiles); err != nil {
+			return fmt.Errorf("receipt marking incomplete; keeping manifest for re-fire: %w", err)
+		}
 	}
 
 	// All input files deleted — safe to remove manifest

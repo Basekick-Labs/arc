@@ -357,8 +357,8 @@ func TestHubIndex_RecordIsIdempotentAndUpdates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lookup: %v", err)
 	}
-	if held[p] != sha256Hex([]byte("v2")) {
-		t.Errorf("digest = %q, want the updated one", held[p])
+	if held[p].SHA256 != sha256Hex([]byte("v2")) {
+		t.Errorf("digest = %q, want the updated one", held[p].SHA256)
 	}
 }
 
@@ -539,5 +539,112 @@ func TestReconcile_ExistenceFailureRejectsTheWholeBatch(t *testing.T) {
 	}
 	if !errors.Is(err, ErrReceiveInternal) {
 		t.Errorf("err = %v, want ErrReceiveInternal so the handler answers 503 and the spoke retries", err)
+	}
+}
+
+// #619 receipt integrity: a receipt whose FILE the hub's own compaction
+// consumed is exempt from the existence check — reconcile keeps answering
+// present (the content lives inside a compacted output), and the receipt is
+// never forgotten. Without the exemption, the stale-sweep would forget it
+// and the spoke would re-upload the raw next to the compacted output.
+func TestReconcile_CompactedReceiptsStayPresent(t *testing.T) {
+	ctx := context.Background()
+	rec, idx, backend := newTestReconcilerWithBackend(t)
+
+	const p = "metrics/cpu/2026/08/07/14/f.parquet"
+	sha := sha256Hex([]byte("payload"))
+	if err := backend.Write(ctx, "rocket-01/"+p, []byte("payload")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := idx.Record(ctx, &ReceivedRecord{
+		SpokeID: "rocket-01", SourcePath: p, HubPath: "rocket-01/" + p,
+		SHA256: sha, SizeBytes: 7,
+	}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+
+	// Compaction consumes the file: mark, then delete.
+	if err := idx.MarkCompacted(ctx, "rocket-01", []string{p}); err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+	if err := backend.Delete(ctx, "rocket-01/"+p); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	res, err := rec.Reconcile(ctx, "rocket-01", []ReconcileEntry{{Path: p, SHA256: sha, SizeBytes: 7}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(res.Present) != 1 || res.Present[0] != p {
+		t.Fatalf("present = %v; a compacted receipt must stay present", res.Present)
+	}
+	if len(res.Missing) != 0 || len(res.Conflicts) != 0 {
+		t.Fatalf("missing=%v conflicts=%v, want none", res.Missing, res.Conflicts)
+	}
+
+	// The receipt survived (was not forgotten by the stale sweep).
+	held, err := idx.Lookup(ctx, "rocket-01", []string{p})
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if hf, ok := held[p]; !ok || !hf.Compacted {
+		t.Fatalf("receipt = %+v, want present and compacted", held)
+	}
+
+	// Different content at a compacted path is still a conflict.
+	res, err = rec.Reconcile(ctx, "rocket-01", []ReconcileEntry{{Path: p, SHA256: sha256Hex([]byte("other")), SizeBytes: 5}})
+	if err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	if len(res.Conflicts) != 1 {
+		t.Fatalf("conflicts = %v, want 1", res.Conflicts)
+	}
+}
+
+// MarkCompacted is an UPDATE, never an INSERT: unknown paths and foreign
+// namespaces no-op, and a verified re-receive (legitimate replacement)
+// clears the mark.
+func TestMarkCompacted_UpdateOnlyAndClearedByRecord(t *testing.T) {
+	ctx := context.Background()
+	idx := newTestHubIndex(t)
+
+	// Unknown path: no receipt appears.
+	if err := idx.MarkCompacted(ctx, "rocket-01", []string{"metrics/cpu/none.parquet"}); err != nil {
+		t.Fatalf("mark unknown: %v", err)
+	}
+	held, err := idx.Lookup(ctx, "rocket-01", []string{"metrics/cpu/none.parquet"})
+	if err != nil || len(held) != 0 {
+		t.Fatalf("phantom receipt: %v %v", held, err)
+	}
+
+	const p = "metrics/cpu/2026/08/07/14/f.parquet"
+	if err := idx.Record(ctx, &ReceivedRecord{
+		SpokeID: "rocket-01", SourcePath: p, HubPath: "rocket-01/" + p,
+		SHA256: "aa", SizeBytes: 2,
+	}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	if err := idx.MarkCompacted(ctx, "rocket-01", []string{p}); err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+	// Idempotent re-fire (recovery path).
+	if err := idx.MarkCompacted(ctx, "rocket-01", []string{p}); err != nil {
+		t.Fatalf("re-mark: %v", err)
+	}
+	held, _ = idx.Lookup(ctx, "rocket-01", []string{p})
+	if !held[p].Compacted {
+		t.Fatal("mark did not stick")
+	}
+
+	// A verified replacement clears the mark: the path holds a real file again.
+	if err := idx.Record(ctx, &ReceivedRecord{
+		SpokeID: "rocket-01", SourcePath: p, HubPath: "rocket-01/" + p,
+		SHA256: "bb", SizeBytes: 2,
+	}); err != nil {
+		t.Fatalf("re-record: %v", err)
+	}
+	held, _ = idx.Lookup(ctx, "rocket-01", []string{p})
+	if held[p].Compacted {
+		t.Fatal("re-record left the compacted mark in place")
 	}
 }

@@ -155,7 +155,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, spokeID string, entries []Re
 		switch {
 		case !ok:
 			res.Missing = append(res.Missing, e.Path)
-		case existing == e.SHA256:
+		case existing.SHA256 == e.SHA256:
 			res.Present = append(res.Present, e.Path)
 		default:
 			// Same path, different content. Surfaced here for the whole
@@ -163,7 +163,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, spokeID string, entries []Re
 			// transfer — which is the point of doing this proactively.
 			res.Conflicts = append(res.Conflicts, Conflict{
 				Path:        e.Path,
-				TheirSHA256: existing,
+				TheirSHA256: existing.SHA256,
 			})
 		}
 	}
@@ -191,12 +191,23 @@ const confirmExistenceConcurrency = 32
 
 // confirmPresent checks that every file the index claims is still in storage,
 // and returns the paths that are not.
-func (r *Reconciler) confirmPresent(ctx context.Context, spokeID string, entries []ReconcileEntry, held map[string]string) ([]string, error) {
+func (r *Reconciler) confirmPresent(ctx context.Context, spokeID string, entries []ReconcileEntry, held map[string]HeldFile) ([]string, error) {
 	candidates := make([]string, 0, len(held))
 	for _, e := range entries {
-		if _, ok := held[e.Path]; ok {
-			candidates = append(candidates, e.Path)
+		hf, ok := held[e.Path]
+		if !ok {
+			continue
 		}
+		if hf.Compacted {
+			// The FILE is gone — the hub's own compaction consumed it — but
+			// the CONTENT is delivered and lives inside a compacted output,
+			// so the receipt is not stale. Running the existence check here
+			// would forget the receipt and make the sync protocol re-accept
+			// a re-uploaded raw next to the compacted output: the #611
+			// hazard this marking exists to prevent (#619).
+			continue
+		}
+		candidates = append(candidates, e.Path)
 	}
 	if len(candidates) == 0 {
 		return nil, nil

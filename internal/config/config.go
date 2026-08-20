@@ -258,6 +258,14 @@ type EdgeSyncConfig struct {
 	// O(files) — while bounding the exposure. Default 10,000 entries (~2MB).
 	MaxReconcileEntries int
 
+	// CompactReceivedNamespaces lets the hub's own compaction process the
+	// spoke namespaces it received (#619): registered spoke IDs expand into
+	// {spoke}/{db} pseudo-databases in every compaction cycle, and consumed
+	// receipts are marked so the sync protocol keeps answering "present".
+	// Default true. False preserves the raw per-file layout (forensics,
+	// external tooling over the received files).
+	CompactReceivedNamespaces bool
+
 	// StagingSweepMaxAgeHours is how old an abandoned staged partial upload
 	// must be before the hourly sweep reclaims it. A staged prefix is also a
 	// spoke's RESUME CHECKPOINT, so this must be comfortably longer than a
@@ -840,11 +848,12 @@ func Load() (*Config, error) {
 			ForceBootstrap: v.GetBool("auth.force_bootstrap"),
 		},
 		EdgeSync: EdgeSyncConfig{
-			Enabled:                 v.GetBool("edge_sync.enabled"),
-			HubID:                   v.GetString("edge_sync.hub_id"),
-			MaxFileBytes:            int64(v.GetInt64("edge_sync.max_file_bytes")),
-			MaxReconcileEntries:     v.GetInt("edge_sync.max_reconcile_entries"),
-			StagingSweepMaxAgeHours: v.GetInt("edge_sync.staging_sweep_max_age_hours"),
+			Enabled:                   v.GetBool("edge_sync.enabled"),
+			HubID:                     v.GetString("edge_sync.hub_id"),
+			MaxFileBytes:              int64(v.GetInt64("edge_sync.max_file_bytes")),
+			MaxReconcileEntries:       v.GetInt("edge_sync.max_reconcile_entries"),
+			StagingSweepMaxAgeHours:   v.GetInt("edge_sync.staging_sweep_max_age_hours"),
+			CompactReceivedNamespaces: v.GetBool("edge_sync.compact_received_namespaces"),
 			Import: EdgeSyncImportConfig{
 				Enabled:     v.GetBool("edge_sync.import.enabled"),
 				AllowedDirs: v.GetStringSlice("edge_sync.import.allowed_dirs"),
@@ -1502,6 +1511,9 @@ func setDefaults(v *viper.Viper) {
 	// and sweeping inside a plausible contact gap forces full re-sends on
 	// exactly the intermittent links resume exists for.
 	v.SetDefault("edge_sync.staging_sweep_max_age_hours", 72)
+	// Hub compaction of received spoke namespaces (#619); false keeps
+	// received data as the raw per-file layout.
+	v.SetDefault("edge_sync.compact_received_namespaces", true)
 
 	// Spoke side. Declared here rather than relying only on the agent's
 	// zero-value fallbacks so the defaults are visible to an operator reading

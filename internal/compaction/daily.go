@@ -130,12 +130,7 @@ func (t *DailyTier) ShouldCompact(files []string, partitionTime time.Time) bool 
 	return t.ShouldCompactByFileSuffix(
 		files,
 		"_daily.parquet",
-		func(f string) bool {
-			// Hourly files have 7 path parts: database/measurement/year/month/day/hour/file.parquet
-			// These are valid input for daily compaction
-			parts := strings.Split(f, "/")
-			return len(parts) == 7
-		},
+		isHourLevelFile,
 	)
 }
 
@@ -168,18 +163,22 @@ func (t *DailyTier) listDayPartitions(ctx context.Context, database, measurement
 	partitions := make(map[string]*Candidate)
 
 	for _, obj := range objects {
-		// Parse path: database/measurement/year/month/day/[hour/]file.parquet
-		parts := strings.Split(obj, "/")
-		if len(parts) < 6 {
+		// Parse partition components RELATIVE to the database/measurement
+		// prefix, not at fixed indices: a spoke-namespace pseudo-database
+		// ("rocket-01/telemetry") carries a slash, which would shift every
+		// fixed offset by one (#619). The List prefix already scopes the
+		// objects.
+		rel, ok := strings.CutPrefix(obj, prefix)
+		if !ok {
+			continue
+		}
+		parts := strings.Split(rel, "/")
+		if len(parts) < 4 {
+			// year/month/day/[hour/]file.parquet
 			continue
 		}
 
-		db, meas, year, month, day := parts[0], parts[1], parts[2], parts[3], parts[4]
-
-		// Validate database and measurement
-		if db != database || meas != measurement {
-			continue
-		}
+		year, month, day := parts[0], parts[1], parts[2]
 
 		// Parse partition time (day level)
 		yearInt, err := strconv.Atoi(year)
@@ -324,4 +323,33 @@ func extractNewestFileTime(files []string) time.Time {
 	}
 
 	return newest
+}
+
+// isHourLevelFile reports whether a storage path names an HOUR-level file —
+// the valid input for daily compaction — by the shape of its TAIL:
+// …/year/month/day/hour/file.parquet. Absolute segment counts cannot work
+// here since #619: a spoke-namespace pseudo-database adds a path level, so
+// hour-level spoke files have 8 parts where plain ones have 7. The tail is
+// unambiguous instead — a DAY-level file has the measurement name where the
+// year would be, and measurements are never four-digit-numeric-with-numeric
+// children all the way down.
+func isHourLevelFile(f string) bool {
+	parts := strings.Split(f, "/")
+	if len(parts) < 5 {
+		return false
+	}
+	hour, day, month, year := parts[len(parts)-2], parts[len(parts)-3], parts[len(parts)-4], parts[len(parts)-5]
+	if n, err := strconv.Atoi(hour); err != nil || n < 0 || n > 23 {
+		return false
+	}
+	if n, err := strconv.Atoi(day); err != nil || n < 1 || n > 31 {
+		return false
+	}
+	if n, err := strconv.Atoi(month); err != nil || n < 1 || n > 12 {
+		return false
+	}
+	if n, err := strconv.Atoi(year); err != nil || n < 1970 {
+		return false
+	}
+	return true
 }

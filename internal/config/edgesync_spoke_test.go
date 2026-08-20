@@ -155,6 +155,11 @@ func TestSpokeConfig_DefaultsAreDeclared(t *testing.T) {
 	if !cfg.EdgeSync.Spoke.DeferCompactionUntilSynced {
 		t.Error("defer_compaction_until_synced should default to true")
 	}
+	// Default TRUE: a hub compacts what it received; keeping the raw
+	// per-file layout is the explicit choice (issue #619).
+	if !cfg.EdgeSync.CompactReceivedNamespaces {
+		t.Error("compact_received_namespaces should default to true")
+	}
 }
 
 // A fully air-gapped spoke exports bundles and never runs the network path, so
