@@ -65,6 +65,14 @@ func New(interval time.Duration) *Debouncer {
 // false — exactly one caller wins per interval.
 func (d *Debouncer) TryAcquire() bool {
 	now := time.Since(d.processStart).Nanoseconds()
+	// The monotonic clock's resolution is coarser than a function call: a
+	// TryAcquire in the same tick as construction sees now==0, and storing 0
+	// would record the firing AS the "never fired" sentinel — re-arming the
+	// throttle immediately. Nudge to 1ns; the window is off by a nanosecond,
+	// the sentinel stays unambiguous.
+	if now == 0 {
+		now = 1
+	}
 	last := d.lastNanos.Load()
 	// last==0 means "never fired" — the first call always proceeds. See the
 	// package comment for why this sentinel is required with monotonic time.
