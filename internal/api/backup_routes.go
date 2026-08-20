@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"regexp"
+	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -16,9 +17,10 @@ var validBackupID = regexp.MustCompile(`^backup-\d{8}-\d{6}-[a-f0-9]{8}$`)
 
 // BackupHandler handles backup and restore API operations.
 type BackupHandler struct {
-	manager     *backup.Manager
-	authManager *auth.AuthManager
-	logger      zerolog.Logger
+	manager         *backup.Manager
+	authManager     *auth.AuthManager
+	logger          zerolog.Logger
+	activeOperation atomic.Pointer[string]
 }
 
 // NewBackupHandler creates a new backup handler.
@@ -54,15 +56,6 @@ type CreateBackupRequest struct {
 // CreateBackup triggers a new backup.
 // POST /api/v1/backup
 func (h *BackupHandler) CreateBackup(c *fiber.Ctx) error {
-	// Check if a backup is already running
-	if p := h.manager.GetProgress(); p != nil && p.Status == "running" {
-		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
-			"error":     "A backup or restore operation is already in progress",
-			"status":    p.Status,
-			"operation": p.Operation,
-		})
-	}
-
 	var req CreateBackupRequest
 	if err := c.BodyParser(&req); err != nil {
 		// Empty body is fine — use defaults
@@ -79,9 +72,15 @@ func (h *BackupHandler) CreateBackup(c *fiber.Ctx) error {
 		opts.IncludeConfig = *req.IncludeConfig
 	}
 
+	acquired, err := h.acquireOperation(c, "backup")
+	if !acquired {
+		return err
+	}
+
 	// Run backup asynchronously — Fiber recycles c.Context() after the handler
 	// returns, so we must use a detached context.
 	go func() {
+		defer h.activeOperation.Store(nil)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 		defer cancel()
 		if _, err := h.manager.CreateBackup(ctx, opts); err != nil {
@@ -193,15 +192,6 @@ type RestoreRequest struct {
 // RestoreBackup triggers a restore from a backup.
 // POST /api/v1/backup/restore
 func (h *BackupHandler) RestoreBackup(c *fiber.Ctx) error {
-	// Check if an operation is already running
-	if p := h.manager.GetProgress(); p != nil && p.Status == "running" {
-		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
-			"error":     "A backup or restore operation is already in progress",
-			"status":    p.Status,
-			"operation": p.Operation,
-		})
-	}
-
 	var req RestoreRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -237,8 +227,14 @@ func (h *BackupHandler) RestoreBackup(c *fiber.Ctx) error {
 		opts.RestoreConfig = *req.RestoreConfig
 	}
 
+	acquired, err := h.acquireOperation(c, "restore")
+	if !acquired {
+		return err
+	}
+
 	// Run restore asynchronously — detached context (Fiber recycles c.Context()).
 	go func() {
+		defer h.activeOperation.Store(nil)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 		defer cancel()
 		if _, err := h.manager.RestoreBackup(ctx, opts); err != nil {
@@ -250,5 +246,28 @@ func (h *BackupHandler) RestoreBackup(c *fiber.Ctx) error {
 		"message":   "Restore started",
 		"backup_id": req.BackupID,
 		"status":    "running",
+	})
+}
+
+// acquireOperation atomically reserves the handler's shared backup/restore slot.
+func (h *BackupHandler) acquireOperation(c *fiber.Ctx, operation string) (bool, error) {
+	if p := h.manager.GetProgress(); p != nil && p.Status == "running" {
+		return false, h.operationConflict(c, p.Operation)
+	}
+	if !h.activeOperation.CompareAndSwap(nil, &operation) {
+		activeOperation := ""
+		if active := h.activeOperation.Load(); active != nil {
+			activeOperation = *active
+		}
+		return false, h.operationConflict(c, activeOperation)
+	}
+	return true, nil
+}
+
+func (h *BackupHandler) operationConflict(c *fiber.Ctx, operation string) error {
+	return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+		"error":     "A backup or restore operation is already in progress",
+		"status":    "running",
+		"operation": operation,
 	})
 }
