@@ -70,7 +70,7 @@ func TestGetFilesInManifests_PropagatesStorageErrors(t *testing.T) {
 func TestRecoverOrphanedManifests_PropagatesStorageErrors(t *testing.T) {
 	m := newListFailingManager(t, errors.New("AccessDenied"))
 
-	recovered, err := m.RecoverOrphanedManifests(context.Background(), nil)
+	recovered, err := m.RecoverOrphanedManifests(context.Background(), nil, nil)
 	if err == nil {
 		t.Fatalf("expected the storage error to propagate; got nil with recovered=%d", recovered)
 	}

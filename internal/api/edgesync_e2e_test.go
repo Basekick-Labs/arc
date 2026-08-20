@@ -167,8 +167,8 @@ func TestEdgeSync_SpokeToHubEndToEnd(t *testing.T) {
 		held, err := hubIndex.Lookup(ctx, spokeID, []string{p})
 		if err != nil {
 			t.Errorf("%s: index lookup: %v", p, err)
-		} else if held[p] != hex.EncodeToString(wantSHA[:]) {
-			t.Errorf("%s: hub indexed digest %q, want %q", p, held[p], hex.EncodeToString(wantSHA[:]))
+		} else if held[p].SHA256 != hex.EncodeToString(wantSHA[:]) {
+			t.Errorf("%s: hub indexed digest %q, want %q", p, held[p].SHA256, hex.EncodeToString(wantSHA[:]))
 		}
 	}
 

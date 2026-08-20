@@ -2170,6 +2170,47 @@ func main() {
 			log.Fatal().Err(err).Msg("Failed to create the edge sync spoke registry; refusing to start")
 		}
 
+		// #619: hub compaction of received spoke namespaces. Wiring ORDER is
+		// load-bearing (review F9): the consumed-inputs observer goes in
+		// BEFORE the namespace expander, so no scheduler tick can compact
+		// received raws without marking their receipts. compactionManager
+		// may be nil independently (CLAUDE.md nil rule).
+		if compactionManager != nil && cfg.EdgeSync.CompactReceivedNamespaces {
+			markLogger := logger.Get("edgesync")
+			compactionManager.SetOnConsumedInputs(func(inputs []string) error {
+				// Group by first path segment and attempt the receipt mark.
+				// No registry consultation: MarkCompacted is an UPDATE, so
+				// inputs from ordinary databases match no receipts and
+				// no-op — which also makes this immune to a registration
+				// deleted mid-cycle (review N1b). Any failure is RETURNED:
+				// the caller then keeps the crash-recovery manifest so
+				// recovery re-fires the marks (deep-review B1).
+				byNamespace := make(map[string][]string)
+				for _, in := range inputs {
+					first, rest, found := strings.Cut(in, "/")
+					if !found || first == "" || rest == "" {
+						continue
+					}
+					byNamespace[first] = append(byNamespace[first], rest)
+				}
+				markCtx, markCancel := context.WithTimeout(context.Background(), 60*time.Second)
+				defer markCancel()
+				var firstErr error
+				for ns, paths := range byNamespace {
+					if err := hubIndex.MarkCompacted(markCtx, ns, paths); err != nil {
+						markLogger.Warn().Err(err).Str("namespace", ns).Int("paths", len(paths)).
+							Msg("Could not mark consumed receipts compacted; the retained manifest re-fires them via recovery")
+						if firstErr == nil {
+							firstErr = err
+						}
+					}
+				}
+				return firstErr
+			})
+			compactionManager.SetNamespaceExpander(receivedNamespaces(spokeRegistry))
+			log.Info().Msg("Hub compaction of received spoke namespaces enabled (edge_sync.compact_received_namespaces)")
+		}
+
 		receiver, err := edgesync.NewReceiver(edgesync.ReceiverConfig{
 			Backend:      storageBackend,
 			Index:        hubIndex,

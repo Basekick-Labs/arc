@@ -36,9 +36,18 @@ type SubprocessJobConfig struct {
 	// Carried through so the subprocess can disambiguate the output filename
 	// between sibling batches (see Job.compactFiles). Zero means the job was
 	// not produced by SplitCandidateIntoBatches.
-	BatchNumber int      `json:"batch_number,omitempty"`
-	SortKeys    []string `json:"sort_keys"`    // Sort keys for ORDER BY in compaction
-	MemoryLimit string   `json:"memory_limit"` // DuckDB memory limit (e.g., "8GB")
+	BatchNumber int `json:"batch_number,omitempty"`
+	// ParentFinalizesManifest makes the subprocess LEAVE the crash-recovery
+	// storage manifest in place on full success, so the parent can mark
+	// edge-sync receipts for the consumed inputs and only then delete the
+	// manifest itself (#619). Without this a parent crash between subprocess
+	// success and receipt marking silently loses the marks: the sync
+	// protocol later forgets the "stale" receipts and re-accepts re-uploaded
+	// raws next to the compacted output — permanent duplication. With it, a
+	// surviving manifest re-fires the marks through recovery (idempotent).
+	ParentFinalizesManifest bool     `json:"parent_finalizes_manifest,omitempty"`
+	SortKeys                []string `json:"sort_keys"`    // Sort keys for ORDER BY in compaction
+	MemoryLimit             string   `json:"memory_limit"` // DuckDB memory limit (e.g., "8GB")
 	// Threads is the DuckDB thread count for this subprocess. 0 means leave
 	// DuckDB at its default (all cores) — the parent normally sends the
 	// resolved compaction.threads value, so 0 only occurs for callers that
@@ -75,6 +84,15 @@ type SubprocessJobResult struct {
 	BytesBefore    int64  `json:"bytes_before"`
 	BytesAfter     int64  `json:"bytes_after"`
 	OutputFile     string `json:"output_file,omitempty"`
+	// CompactedInputs is the set of source files the job actually consumed
+	// and deleted (validated inputs only — corrupted files are skipped and
+	// LEFT in storage, and must keep their normal edge-sync receipts). The
+	// parent's consumed-inputs observer marks the matching receipts (#619).
+	CompactedInputs []string `json:"compacted_inputs,omitempty"`
+	// ManifestPath is the crash-recovery storage manifest the subprocess
+	// left in place under ParentFinalizesManifest; empty otherwise. The
+	// parent deletes it after receipt marking commits.
+	ManifestPath string `json:"manifest_path,omitempty"`
 }
 
 // RunSubprocessJob is called from the subprocess to execute compaction.
@@ -175,9 +193,10 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 		// Phase 4: thread cluster-mode fields through to the job. When
 		// CompletionDir is empty (OSS / standalone), clusterMode() is
 		// false and the completion-manifest writes are no-ops.
-		JobID:         config.JobID,
-		CompletionDir: config.CompletionDir,
-		PartitionTime: config.PartitionTime,
+		JobID:                   config.JobID,
+		CompletionDir:           config.CompletionDir,
+		PartitionTime:           config.PartitionTime,
+		ParentFinalizesManifest: config.ParentFinalizesManifest,
 	})
 
 	// Use signal-aware context so the subprocess can cancel DuckDB queries
@@ -194,7 +213,9 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 		// The storage key of the output (empty when the job produced none).
 		// The parent's compacted-output observer keys the edge sync ledger
 		// on this; the temp path would never match a storage listing.
-		OutputFile: job.OutputStorageKey,
+		OutputFile:      job.OutputStorageKey,
+		CompactedInputs: job.CompactedInputKeys(),
+		ManifestPath:    job.RetainedManifestPath(),
 	}
 	if err != nil {
 		result.Error = err.Error()

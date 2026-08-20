@@ -925,3 +925,65 @@ func TestReceiver_ActivityFailureDoesNotFailTheTransfer(t *testing.T) {
 		t.Error("the file was not committed")
 	}
 }
+
+// #619 receipt pre-check: a re-sent raw whose receipt is marked compacted is
+// answered already-present WITHOUT touching storage — re-accepting it would
+// place a duplicate raw next to the compacted output. Different content at
+// the same path answers the conflict from the receipt's digest.
+func TestReceiver_CompactedReceiptAnswersAlreadyPresent(t *testing.T) {
+	ctx := context.Background()
+
+	dir, err := os.MkdirTemp("", "sync-receive-compacted-*")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	backend, err := storage.NewLocalBackend(dir, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+	t.Cleanup(func() { backend.Close() })
+
+	idx := newTestHubIndex(t)
+	r, err := NewReceiver(ReceiverConfig{Backend: backend, Index: idx, Logger: zerolog.Nop()})
+	if err != nil {
+		t.Fatalf("receiver: %v", err)
+	}
+
+	content := []byte("payload")
+	digest := sha256Hex(content)
+
+	// Delivered once, then compacted away: receipt marked, file gone.
+	res, err := r.Receive(ctx, "rocket-01", testPath, digest, int64(len(content)), 0, bytes.NewReader(content))
+	if err != nil || res.Outcome != OutcomeCommitted {
+		t.Fatalf("first receive: %v %v", res, err)
+	}
+	if err := idx.MarkCompacted(ctx, "rocket-01", []string{testPath}); err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+	if err := backend.Delete(ctx, "rocket-01/"+testPath); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	// Same content again: already-present, and NOTHING lands in storage.
+	res, err = r.Receive(ctx, "rocket-01", testPath, digest, int64(len(content)), 0, bytes.NewReader(content))
+	if err != nil {
+		t.Fatalf("re-receive: %v", err)
+	}
+	if res.Outcome != OutcomeAlreadyPresent {
+		t.Fatalf("outcome = %v, want already-present", res.Outcome)
+	}
+	if present, _ := backend.Exists(ctx, "rocket-01/"+testPath); present {
+		t.Fatal("re-sent raw landed next to the compacted output")
+	}
+
+	// Different content: conflict, answered from the receipt.
+	other := []byte("different")
+	res, err = r.Receive(ctx, "rocket-01", testPath, sha256Hex(other), int64(len(other)), 0, bytes.NewReader(other))
+	if err != nil {
+		t.Fatalf("conflict receive: %v", err)
+	}
+	if res.Outcome != OutcomeConflict || res.TheirSHA256 != digest {
+		t.Fatalf("outcome = %v/%q, want conflict with the delivered digest", res.Outcome, res.TheirSHA256)
+	}
+}

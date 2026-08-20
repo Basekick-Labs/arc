@@ -228,6 +228,31 @@ func (r *Receiver) Receive(ctx context.Context, spokeID, sourcePath, declaredSHA
 	// branch would then fail forever because ReadTo is NOT .part-aware. That
 	// wedges the path permanently — no retry could ever clear it. Exists()
 	// checks only the real file.
+	// Receipt pre-check BEFORE the storage existence branch (#619): a file
+	// the hub's own compaction consumed no longer exists at finalPath, but
+	// its content was delivered and lives inside a compacted output. Without
+	// this, a re-sent copy (a spoke's pruned-ledger rediscovery, or a stale
+	// air-gap bundle) would be re-accepted NEXT TO the compacted output —
+	// duplicate rows via the delivery machinery itself. Same-content answers
+	// already-present with no writes at all (deliberately no re-record: a
+	// Record upsert would clear compacted_at and bump received_at);
+	// different content is the usual conflict, answered from the receipt's
+	// digest. A receipt that is marked compacted while the file ALSO still
+	// exists (a partially failed source deletion) takes this same branch —
+	// the content is delivered either way.
+	if r.index != nil {
+		held, err := r.index.Lookup(ctx, spokeID, []string{sourcePath})
+		if err != nil {
+			return nil, fmt.Errorf("%w: receipt lookup %q: %w", ErrReceiveInternal, sourcePath, err)
+		}
+		if hf, ok := held[sourcePath]; ok && hf.Compacted {
+			if hf.SHA256 == declaredSHA256 {
+				return &PutResult{Outcome: OutcomeAlreadyPresent, BytesAccepted: declaredSize}, nil
+			}
+			return &PutResult{Outcome: OutcomeConflict, TheirSHA256: hf.SHA256}, nil
+		}
+	}
+
 	exists, err := r.backend.Exists(ctx, finalPath)
 	if err != nil {
 		return nil, fmt.Errorf("%w: stat %q: %w", ErrReceiveInternal, finalPath, err)
