@@ -430,6 +430,137 @@ func (l *Ledger) Unfinished(ctx context.Context, hubID string, limit int) ([]*Le
 	return out, nil
 }
 
+// TrackedPaths returns every path the ledger knows for a hub, as a set.
+//
+// Discovery used to point-SELECT each stored object against the ledger —
+// 100k files meant 100k queries per pass on the SQLite handle shared with
+// auth and ingest (2026-08-19 audit M4). One scan into a set costs one query
+// and O(corpus) transient memory on a box that already listed the same
+// corpus to discover it.
+func (l *Ledger) TrackedPaths(ctx context.Context, hubID string) (map[string]struct{}, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	rows, err := l.db.QueryContext(ctx,
+		`SELECT path FROM sync_ledger WHERE hub_id = ?`, hubID)
+	if err != nil {
+		return nil, fmt.Errorf("edgesync: list tracked paths: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]struct{}, 1024)
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, fmt.Errorf("edgesync: scan tracked path: %w", err)
+		}
+		out[p] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("edgesync: tracked paths: %w", err)
+	}
+	return out, nil
+}
+
+// PendingPage returns one page of pending entries strictly AFTER the cursor
+// row, in Pending's order (partition_time DESC, id ASC). A nil cursor starts
+// from the top. Keyset pagination: the agent's old offered-map approach
+// re-fetched every previously-offered row on every page — O(pages²) row
+// scans across a large backlog (2026-08-19 audit M5). Rows the pass leaves
+// unresolved (conflicts, exhausted retries) sit BEFORE the cursor and are
+// naturally not re-offered within the pass, which is the same property the
+// offered map bought, at the cost of one range-bounded scan (plus the same
+// ORDER BY sort Pending already pays) per page.
+//
+// Time comparison stays in the Go time.Time domain on both sides —
+// partition_time is written as a Go time.Time parameter (see the domain note
+// on PruneSynced).
+func (l *Ledger) PendingPage(ctx context.Context, hubID string, limit int, after *LedgerEntry) ([]*LedgerEntry, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	if after == nil {
+		return l.Pending(ctx, hubID, limit)
+	}
+
+	query := `
+		SELECT id, hub_id, path, sha256, size_bytes, database, measurement,
+		       partition_time, discovered_at, state, attempts, last_attempt,
+		       synced_at, bytes_sent, COALESCE(last_error, ''),
+		       exported_at, COALESCE(exported_bundle_id, '')
+		FROM sync_ledger
+		WHERE hub_id = ? AND state = ?
+		  AND (partition_time < ? OR (partition_time = ? AND id > ?))
+		ORDER BY partition_time DESC, id ASC`
+	args := []any{hubID, string(StatePending),
+		after.PartitionTime, after.PartitionTime, after.ID}
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+
+	rows, err := l.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("edgesync: query pending page: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*LedgerEntry
+	for rows.Next() {
+		e, err := scanEntry(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("edgesync: iterate pending page: %w", err)
+	}
+	return out, nil
+}
+
+// EntriesByState lists rows in one explicit state, newest partition first.
+// The troubleshooting view for states Unfinished hides — above all
+// `skipped`, whose rows (with their notes) are otherwise invisible: an
+// operator cannot selectively requeue a dismissed entry they cannot list
+// (#612 follow-up).
+func (l *Ledger) EntriesByState(ctx context.Context, hubID string, state SyncState, limit int) ([]*LedgerEntry, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	query := `
+		SELECT id, hub_id, path, sha256, size_bytes, database, measurement,
+		       partition_time, discovered_at, state, attempts, last_attempt,
+		       synced_at, bytes_sent, COALESCE(last_error, ''),
+		       exported_at, COALESCE(exported_bundle_id, '')
+		FROM sync_ledger
+		WHERE hub_id = ? AND state = ?
+		ORDER BY partition_time DESC, id ASC`
+	args := []any{hubID, string(state)}
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := l.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("edgesync: query entries by state: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*LedgerEntry
+	for rows.Next() {
+		e, err := scanEntry(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("edgesync: iterate entries by state: %w", err)
+	}
+	return out, nil
+}
+
 func (l *Ledger) Pending(ctx context.Context, hubID string, limit int) ([]*LedgerEntry, error) {
 	if hubID == "" {
 		hubID = DefaultHubID

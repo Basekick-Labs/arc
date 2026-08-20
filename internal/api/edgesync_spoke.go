@@ -336,14 +336,36 @@ func (h *EdgeSyncSpokeHandler) ledger(c *fiber.Ctx) error {
 		limit = n
 	}
 
+	// ?state= lists one explicit state instead of the unfinished view — the
+	// way to enumerate `skipped` rows (vanished, compacted-output, and
+	// operator-dismissed, told apart by last_error), which Unfinished hides:
+	// an operator cannot selectively requeue a dismissed entry they cannot
+	// list.
+	var stateFilter edgesync.SyncState
+	if raw := c.Query("state"); raw != "" {
+		switch edgesync.SyncState(raw) {
+		case edgesync.StatePending, edgesync.StateInFlight, edgesync.StateSynced,
+			edgesync.StateExported, edgesync.StateFailed, edgesync.StateSkipped:
+			stateFilter = edgesync.SyncState(raw)
+		default:
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "unknown state; one of pending, in_flight, synced, exported, failed, skipped",
+			})
+		}
+	}
+
 	// Same reasoning as status: a pure ledger read, served by either side.
 	var (
 		entries []*edgesync.LedgerEntry
 		err     error
 	)
 	switch {
+	case h.agent != nil && stateFilter != "":
+		entries, err = h.agent.EntriesByState(ctx, stateFilter, limit)
 	case h.agent != nil:
 		entries, err = h.agent.UnfinishedEntries(ctx, limit)
+	case h.exporter != nil && stateFilter != "":
+		entries, err = h.exporter.EntriesByState(ctx, stateFilter, limit)
 	case h.exporter != nil:
 		entries, err = h.exporter.UnfinishedEntries(ctx, limit)
 	default:

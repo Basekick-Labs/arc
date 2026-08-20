@@ -116,6 +116,18 @@ func (h *EdgeSyncImportHandler) importBundle(c *fiber.Ctx) error {
 
 	res, err := h.importer.Import(ctx, resolved)
 	switch {
+	case errors.Is(err, edgesync.ErrImportInProgress):
+		// Fail fast, not queue: an import can legally run for hours, and a
+		// second request hanging behind it looks like a dead hub to the
+		// operator (whose FIRST request may be the one still running after a
+		// client-side timeout). 409 tells them exactly what is happening.
+		h.logger.Info().Str("dir", resolved).Msg("Bundle import refused: another import is running")
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"imported": false,
+			"reason":   "import in progress",
+			"detail":   "another bundle import is already running on this hub; retry when it completes",
+		})
+
 	case errors.Is(err, edgesync.ErrBundleAlreadyImported):
 		// 409, not an error: the hub already holds this bundle's contents, so
 		// the operator's goal is met. The message carries when it arrived, so

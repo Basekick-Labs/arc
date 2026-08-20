@@ -283,6 +283,11 @@ func (e *Exporter) DismissFailed(ctx context.Context, path string) (int64, error
 	return e.ledger.DismissFailed(ctx, e.hubID, path)
 }
 
+// EntriesByState lists ledger rows in one explicit state.
+func (e *Exporter) EntriesByState(ctx context.Context, state SyncState, limit int) ([]*LedgerEntry, error) {
+	return e.ledger.EntriesByState(ctx, e.hubID, state, limit)
+}
+
 // ApplyAck reads an acknowledgment from a returned bundle directory and
 // advances the ledger.
 //

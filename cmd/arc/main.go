@@ -2106,9 +2106,15 @@ func main() {
 					// infinitely old to the migrator and exclude it from
 					// time-ranged queries.
 					PartitionTime: f.PartitionTime(),
-					OriginNodeID:  f.SpokeID,
-					Tier:          "hot",
-					CreatedAt:     time.Now().UTC(),
+					// The RECEIVING node, per the field's contract ("node that
+					// first wrote the file") — the compaction bridge sets it
+					// the same way. A spoke ID here (#613) only worked through
+					// the resolver's all-healthy-peers fallback and would
+					// break any future routing keyed on this field; the spoke
+					// identity is already the path's first segment.
+					OriginNodeID: coord.LocalNodeID(),
+					Tier:         "hot",
+					CreatedAt:    time.Now().UTC(),
 				})
 			}
 		}
@@ -2315,9 +2321,11 @@ func main() {
 								// infinitely old to the tiering migrator and
 								// drop it from time-ranged queries.
 								PartitionTime: f.PartitionTime(),
-								OriginNodeID:  f.SpokeID,
-								Tier:          "hot",
-								CreatedAt:     time.Now().UTC(),
+								// The receiving node, as on the online path
+								// (#613); spoke identity lives in the path.
+								OriginNodeID: coord.LocalNodeID(),
+								Tier:         "hot",
+								CreatedAt:    time.Now().UTC(),
 							},
 						})
 						if err != nil {

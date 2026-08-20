@@ -223,43 +223,30 @@ func (a *Agent) Run(ctx context.Context) (*RunResult, error) {
 	// matters most, a spoke returning from a long outage, is exactly the one
 	// with more pending files than a batch holds.
 	//
-	// Paging is by "have I already offered this path?", not by counting
-	// progress: Pending returns state='pending' in a stable order, and the
-	// states a pass does not resolve — a conflict, an exhausted retry, a
-	// partial transfer — stay pending. A page is therefore fetched wider than
-	// it is used, skipping what this pass already handled, so unresolved rows
-	// at the head cannot hide the fresh ones behind them.
-	offered := make(map[string]struct{})
+	// Keyset pagination on Pending's stable order (partition_time DESC, id
+	// ASC): each page starts strictly after the previous page's last row, so
+	// rows the pass leaves unresolved — a conflict, an exhausted retry, a
+	// partial transfer — sit behind the cursor and cannot hide fresh rows or
+	// be re-offered within the pass. The old offered-map approach bought the
+	// same property by re-fetching every previously-offered row on every
+	// page: O(pages²) row scans across a large backlog.
+	var cursor *LedgerEntry
 	for {
-		// Fetch past what has already been offered. Without the growing
-		// window, a backlog whose first rows all stay pending — every one a
-		// conflict, say — would return the same page forever.
-		limit := 0
-		if a.batchSize > 0 {
-			limit = a.batchSize + len(offered)
-		}
-		pending, err := a.ledger.Pending(ctx, a.hubID, limit)
+		pending, err := a.ledger.PendingPage(ctx, a.hubID, a.batchSize, cursor)
 		if err != nil {
 			return nil, fmt.Errorf("edgesync: read pending: %w", err)
 		}
-
-		fresh := make([]*LedgerEntry, 0, a.batchSize)
-		for _, e := range pending {
-			if _, seen := offered[e.Path]; seen {
-				continue
-			}
-			offered[e.Path] = struct{}{}
-			fresh = append(fresh, e)
-			if a.batchSize > 0 && len(fresh) == a.batchSize {
-				break
-			}
-		}
-		if len(fresh) == 0 {
+		if len(pending) == 0 {
 			break
 		}
+		cursor = pending[len(pending)-1]
 
-		if err := a.runBatch(ctx, fresh, res); err != nil {
+		if err := a.runBatch(ctx, pending, res); err != nil {
 			return nil, err
+		}
+		if a.batchSize <= 0 {
+			// No page size means the whole backlog came in one page.
+			break
 		}
 	}
 
@@ -641,6 +628,11 @@ func (a *Agent) RequeueFailed(ctx context.Context, path string) (int64, error) {
 // DismissFailed moves failed rows to operator-dismissed skipped.
 func (a *Agent) DismissFailed(ctx context.Context, path string) (int64, error) {
 	return a.ledger.DismissFailed(ctx, a.hubID, path)
+}
+
+// EntriesByState lists ledger rows in one explicit state.
+func (a *Agent) EntriesByState(ctx context.Context, state SyncState, limit int) ([]*LedgerEntry, error) {
+	return a.ledger.EntriesByState(ctx, a.hubID, state, limit)
 }
 
 // Status reports what the spoke still has to send.
