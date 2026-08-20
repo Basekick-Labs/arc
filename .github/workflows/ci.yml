@@ -1,0 +1,46 @@
+# PR test gate. Until this existed, PRs had no build/test CI at all — only
+# CodeQL default setup, which does not run for fork PRs — so external
+# contributions (e.g. #622) arrived with zero checks and review relied
+# entirely on local runs.
+#
+# Mirrors `make test`: build tag duckdb_arrow is mandatory (Arc fails closed
+# without it, #598) and the suite runs under -race.
+#
+# gofmt is deliberately NOT gated yet: a handful of pre-existing files
+# (compaction/reconciliation/scheduler) are gofmt-dirty on main. Gate it once
+# that debt is cleared.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build -tags=duckdb_arrow ./...
+
+      - name: Vet
+        run: go vet -tags=duckdb_arrow ./...
+
+      - name: Test (race)
+        run: go test -tags=duckdb_arrow -race ./...
