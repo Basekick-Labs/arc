@@ -460,6 +460,12 @@ The fix rejects, in `ValidateSQLRequest` (before any transform or RBAC check run
 
 Reachable only when RBAC is enabled (the multi-tenant authorization boundary); no CVE is being filed, as it is a residual of GHSA-93cm scoped to within the allow-list, tracked under the advisory above. Reported by [@arpitjain099](https://github.com/arpitjain099).
 
+### Query-authorization hardening on the measurement query endpoint
+
+Closed a query-authorization gap on the `GET /api/v1/query/:measurement` endpoint and tightened the shared SQL validator that guards every user-SQL path. The measurement endpoint now routes its request through the same validation as the raw-query API, and the continuous-query and delete endpoints received the same input-validation pass so the whole surface is consistent. On RBAC-enabled multi-tenant instances this removes an authorization gap; standalone single-tenant deployments were not exposed to a cross-tenant boundary. No configuration changes are required.
+
+Full technical detail will accompany the corresponding security advisory once it is published. Responsibly reported by **zx (Jace)** ([@manus-use](https://github.com/manus-use)).
+
 ### Dependency: gRPC-Go upgraded past GHSA-hrxh-6v49-42gf
 
 `google.golang.org/grpc` is upgraded from v1.80.0 to v1.83.1, past the v1.82.1
