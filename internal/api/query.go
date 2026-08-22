@@ -550,7 +550,11 @@ func scanSQLFeatures(sql string) sqlFeatures {
 	var f sqlFeatures
 	for i := 0; i < len(sql); i++ {
 		ch := sql[i]
-		if ch == '\'' || ch == '"' {
+		// `$` is treated as a quote opener: a dollar-quoted string ($tag$…$tag$)
+		// contains no ' or ", so gating masking on those alone left the construct
+		// unmasked and a replacement scan visible to DuckDB but not to the
+		// table-position scanner (GHSA-wmjj-g8xc-6hwr).
+		if ch == '\'' || ch == '"' || ch == '$' {
 			f.hasQuotes = true
 		} else if ch == '-' && i+1 < len(sql) && sql[i+1] == '-' {
 			f.hasDashComment = true
@@ -4281,6 +4285,37 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	sql += " ORDER BY " + orderBy
 	sql += fmt.Sprintf(" LIMIT %d", limit)
 	sql += fmt.Sprintf(" OFFSET %d", offset)
+
+	// SECURITY (GHSA-wmjj-g8xc-6hwr): run the SHARED validator over the fully
+	// assembled statement.
+	//
+	// validateWhereClauseQuery above is a substring blocklist that blocks
+	// neither SELECT nor any DuckDB I/O table function, so a `where` fragment
+	// could smuggle a cross-tenant read through a scalar subquery
+	// (`time > (SELECT max(v) FROM parquet_scan('/other-tenant/d.parquet'))`).
+	// RBAC only inspects the path params, and the DuckDB sandbox allowlists the
+	// whole storage root, so nothing downstream caught it. This endpoint was the
+	// only user-SQL path that never reached ValidateSQLRequest — which is where
+	// the I/O denylist, replacement-scan, and quoted-identifier checks live.
+	//
+	// Validating the ASSEMBLED statement (rather than bolting the denylist onto
+	// the fragment) is deliberate: the fragment blocklist cannot see the
+	// replacement-scan class, which has no function name to key on, and keeping
+	// one validator means future hardening lands here automatically instead of
+	// having to be mirrored into a second code path.
+	//
+	// Ordering matters: this MUST run before getTransformedSQL, which emits
+	// Arc's own read_parquet() and would self-trip the denylist. It is also why
+	// the bug was so clean to exploit — an injected read_parquet hits the
+	// fast-path at getTransformedSQL and is returned verbatim, untransformed.
+	if err := ValidateSQLRequest(sql); err != nil {
+		m.IncQueryErrors()
+		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
+			Success:   false,
+			Error:     "Invalid query: " + err.Error(),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+	}
 
 	// Convert SQL to storage paths (with caching)
 	// Note: This endpoint builds its own db.measurement SQL, so no header optimization
