@@ -189,7 +189,7 @@ curl -X POST "http://localhost:8000/api/v1/query" \
 | `non-leader-crash` | Same as base, but `docker kill` a non-leader writer mid-ingest. Asserts: every HTTP-success record is queryable (durability invariant). In-flight buffer on the killed writer may be lost. |
 | `leader-crash` | Same as base, but kill the current Raft leader mid-ingest. Asserts: Raft elects a new leader within seconds; writes continue via LB to surviving writers; durability invariant holds. |
 
-The smoke uses `docker-compose.override.smoke.yml` to build Arc **from source** rather than pulling `basekick/arc:latest`, so you can run it against branch under review.
+The smoke uses `docker-compose.override.smoke.yml` to build Arc **from source** rather than pulling `ghcr.io/basekick-labs/arc:latest`, so you can run it against branch under review.
 
 ```bash
 export ARC_LICENSE_KEY="ARC-ENT-..."           # dev key (NOT the customer .env key)
