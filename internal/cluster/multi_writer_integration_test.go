@@ -95,6 +95,7 @@ func startRaftNode(t *testing.T, nodeID, bindAddr string, bootstrap bool) *raft.
 	fsm := raft.NewClusterFSM(zerolog.Nop())
 	cfg := &raft.NodeConfig{
 		NodeID:        nodeID,
+		SharedSecret:  "test-cluster-secret-32-bytes-long!",
 		DataDir:       filepath.Join(t.TempDir(), nodeID),
 		BindAddr:      bindAddr,
 		AdvertiseAddr: bindAddr,

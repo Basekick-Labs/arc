@@ -46,6 +46,18 @@ type NodeConfig struct {
 
 	// TLSConfig for encrypted Raft transport (nil = plain TCP)
 	TLSConfig *tls.Config
+
+	// SharedSecret authenticates the Raft transport connection via a mutual
+	// HMAC handshake (GHSA-wwfh-qrfq-6f8g). Required whenever a Raft node is
+	// built: the transport is fail-closed if this is empty. In production the
+	// coordinator only reaches NewNode after main.go has already refused to
+	// start clustering without cluster.shared_secret, so this is always set;
+	// the empty-secret guard in Start() is belt-and-suspenders (and forces
+	// tests to exercise the authenticated path).
+	SharedSecret string
+	// ClusterName is bound into the handshake HMAC for domain separation, so a
+	// MAC minted for one cluster cannot authenticate to another.
+	ClusterName string
 }
 
 // DefaultNodeConfig returns a NodeConfig with sensible defaults.
@@ -168,21 +180,37 @@ func (n *Node) Start() error {
 		return fmt.Errorf("failed to resolve advertise address: %w", err)
 	}
 
-	var transport *raft.NetworkTransport
+	// SECURITY (GHSA-wwfh-qrfq-6f8g): the Raft transport MUST authenticate its
+	// peers with the cluster shared secret. Fail closed rather than stand up an
+	// unauthenticated consensus port on which any reachable peer could inject a
+	// forged AppendEntries minting an admin token. This mirrors the coordinator
+	// channels, which already fail closed on an empty secret (main.go). The
+	// guard is keyed on the transport being built here — not a "clustering
+	// enabled" flag NodeConfig cannot see — so every code path that constructs
+	// a Raft node is covered.
+	if n.cfg.SharedSecret == "" {
+		return fmt.Errorf("raft transport requires a cluster shared secret (cluster.shared_secret) for peer authentication; refusing to start an unauthenticated Raft port")
+	}
+
+	// Both branches wrap the base stream layer in AuthenticatedStreamLayer so
+	// the mutual HMAC handshake runs at connection establishment, over
+	// plaintext and TLS alike.
+	var baseStream raft.StreamLayer
 	if n.cfg.TLSConfig != nil {
 		stream, tlsErr := security.NewTLSStreamLayer(n.cfg.BindAddr, addr, n.cfg.TLSConfig)
 		if tlsErr != nil {
 			return fmt.Errorf("failed to create TLS stream layer: %w", tlsErr)
 		}
-		transport = raft.NewNetworkTransport(stream, 3, 10*time.Second, os.Stderr)
+		baseStream = stream
 	} else {
-		var tcpErr error
-		transport, tcpErr = raft.NewTCPTransport(n.cfg.BindAddr, addr, 3, 10*time.Second, os.Stderr)
+		stream, tcpErr := security.NewPlainTCPStreamLayer(n.cfg.BindAddr, addr)
 		if tcpErr != nil {
-			return fmt.Errorf("failed to create transport: %w", tcpErr)
+			return fmt.Errorf("failed to create TCP stream layer: %w", tcpErr)
 		}
+		baseStream = stream
 	}
-	n.transport = transport
+	authStream := security.NewAuthenticatedStreamLayer(baseStream, n.cfg.SharedSecret, n.cfg.ClusterName)
+	n.transport = raft.NewNetworkTransport(authStream, 3, 10*time.Second, os.Stderr)
 
 	// Create log store
 	logStorePath := filepath.Join(n.cfg.DataDir, "raft-log.db")
@@ -217,7 +245,7 @@ func (n *Node) Start() error {
 	// the entry doesn't land in f.files and the counter still
 	// increments — see GHSA-f85q-mvg8-qf37 design notes on
 	// rejectManifestPath).
-	ra, err := raft.NewRaft(raftConfig, n.fsm, logStore, stableStore, snapStore, transport)
+	ra, err := raft.NewRaft(raftConfig, n.fsm, logStore, stableStore, snapStore, n.transport)
 	if err != nil {
 		return fmt.Errorf("failed to create raft instance: %w", err)
 	}

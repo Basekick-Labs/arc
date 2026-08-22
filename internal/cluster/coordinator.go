@@ -208,6 +208,19 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		logger.Warn().Msg("Cluster shared_secret configured without TLS — HMAC tokens are visible on the network. Enable cluster.tls_enabled for full security.")
 	}
 
+	// Warn when cluster TLS is enabled but no CA is configured
+	// (GHSA-wwfh-qrfq-6f8g defense-in-depth). Without a CA, client-cert
+	// verification is off (RequireAndVerifyClientCert is only set when
+	// tls_ca_file is non-empty), so TLS provides encryption but not peer
+	// identity — inter-node connections are not mutually authenticated at the
+	// TLS layer. Peer identity in that mode rests on the shared-secret HMAC
+	// (the Raft handshake and the coordinator channels). This is a warning, not
+	// a hard error: TLS-for-encryption + HMAC-for-identity is a supported
+	// posture, but operators should know mTLS is not in effect.
+	if cfg.Config.TLSEnabled && cfg.Config.TLSCAFile == "" {
+		logger.Warn().Msg("Cluster TLS enabled without tls_ca_file — peer certificates are NOT verified (no mTLS); inter-node identity rests on the shared-secret HMAC. Set cluster.tls_ca_file to enable mutual TLS authentication.")
+	}
+
 	// Warn when the public Fiber listener serves HTTPS but cluster TLS
 	// is off: the cache-invalidate fan-out and the request router will
 	// dial https:// against peers using SYSTEM ROOT CAs (no cluster CA
@@ -278,6 +291,8 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 			SnapshotThreshold: uint64(cfg.Config.RaftSnapshotThreshold),
 			Logger:            cfg.Logger,
 			TLSConfig:         tlsCfg,
+			SharedSecret:      cfg.Config.SharedSecret,
+			ClusterName:       cfg.Config.ClusterName,
 		}
 
 		var err error

@@ -21,6 +21,7 @@ func TestNodeStartStop(t *testing.T) {
 
 	cfg := &NodeConfig{
 		NodeID:           "test-node-1",
+		SharedSecret:     "test-cluster-secret-32-bytes-long!",
 		DataDir:          tmpDir,
 		BindAddr:         "127.0.0.1:0", // Use port 0 for random available port
 		Bootstrap:        true,
@@ -85,6 +86,7 @@ func TestNodeAddNodeViaRaft(t *testing.T) {
 
 	cfg := &NodeConfig{
 		NodeID:           "test-node-1",
+		SharedSecret:     "test-cluster-secret-32-bytes-long!",
 		DataDir:          tmpDir,
 		BindAddr:         "127.0.0.1:0",
 		Bootstrap:        true,
@@ -152,6 +154,7 @@ func TestNodeUpdateNodeStateViaRaft(t *testing.T) {
 
 	cfg := &NodeConfig{
 		NodeID:           "test-node-1",
+		SharedSecret:     "test-cluster-secret-32-bytes-long!",
 		DataDir:          tmpDir,
 		BindAddr:         "127.0.0.1:0",
 		Bootstrap:        true,
@@ -208,6 +211,7 @@ func TestNodeRemoveNodeViaRaft(t *testing.T) {
 
 	cfg := &NodeConfig{
 		NodeID:           "test-node-1",
+		SharedSecret:     "test-cluster-secret-32-bytes-long!",
 		DataDir:          tmpDir,
 		BindAddr:         "127.0.0.1:0",
 		Bootstrap:        true,
@@ -263,6 +267,7 @@ func TestNodeStats(t *testing.T) {
 
 	cfg := &NodeConfig{
 		NodeID:           "test-node-1",
+		SharedSecret:     "test-cluster-secret-32-bytes-long!",
 		DataDir:          tmpDir,
 		BindAddr:         "127.0.0.1:0",
 		Bootstrap:        true,
@@ -313,6 +318,7 @@ func TestNodeDataDirCreated(t *testing.T) {
 	fsm := NewClusterFSM(zerolog.Nop())
 	cfg := &NodeConfig{
 		NodeID:           "test-node-1",
+		SharedSecret:     "test-cluster-secret-32-bytes-long!",
 		DataDir:          dataDir,
 		BindAddr:         "127.0.0.1:0",
 		Bootstrap:        true,
