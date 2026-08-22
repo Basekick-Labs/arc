@@ -10,7 +10,7 @@
 
 services:
   arc:
-    image: basekick/arc:latest
+    image: ghcr.io/basekick-labs/arc:latest
     container_name: arc
     hostname: arc
     ports:

@@ -2,7 +2,7 @@
 #
 # - Builds the Arc image FROM SOURCE in this checkout (Dockerfile at the
 #   repo root). The smoke needs to test the actual branch under review,
-#   not whatever is at basekick/arc:latest. Per
+#   not whatever is at ghcr.io/basekick-labs/arc:latest. Per
 #   memory/feedback_compose_build_from_source.md — pre-tagging a local
 #   image is brittle across docker contexts; `build:` is the path that
 #   reliably picks up the working tree.

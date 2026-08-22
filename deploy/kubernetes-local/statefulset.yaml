@@ -30,7 +30,7 @@ spec:
     spec:
       containers:
         - name: arc
-          image: basekick/arc:latest
+          image: ghcr.io/basekick-labs/arc:latest
           ports:
             - containerPort: 8000
               name: http
@@ -134,7 +134,7 @@ spec:
     spec:
       containers:
         - name: arc
-          image: basekick/arc:latest
+          image: ghcr.io/basekick-labs/arc:latest
           ports:
             - containerPort: 8000
               name: http

@@ -8,7 +8,7 @@
 # =============================================================================
 
 x-arc-common: &arc-common
-  image: basekick/arc:latest
+  image: ghcr.io/basekick-labs/arc:latest
   networks:
     - arc-cluster
   depends_on:
