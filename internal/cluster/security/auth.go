@@ -30,6 +30,13 @@ const (
 	MsgTypeJoin      MsgType = "join"
 	MsgTypeLeave     MsgType = "leave"
 	MsgTypeHeartbeat MsgType = "heartbeat"
+	// Raft transport connection-handshake labels (GHSA-wwfh-qrfq-6f8g). The
+	// two directions carry distinct labels so a response captured in one
+	// direction cannot be replayed as the other: the server proves the secret
+	// with MsgTypeRaftAuthResp over the client's nonce, the client with
+	// MsgTypeRaftAuth over the server's nonce.
+	MsgTypeRaftAuth     MsgType = "raft-auth"
+	MsgTypeRaftAuthResp MsgType = "raft-auth-resp"
 )
 
 // ComputeHMAC computes HMAC-SHA256 over the parameters of a coordinator

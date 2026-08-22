@@ -466,6 +466,39 @@ Closed a query-authorization gap on the `GET /api/v1/query/:measurement` endpoin
 
 Full technical detail will accompany the corresponding security advisory once it is published. Responsibly reported by **zx (Jace)** ([@manus-use](https://github.com/manus-use)).
 
+### Cluster hardening: authenticated Raft consensus transport (Enterprise)
+
+The Raft consensus transport now authenticates every peer connection with the
+cluster `shared_secret` via a mutual HMAC handshake performed at connection
+establishment. Previously the Raft transport was the one cluster channel that
+did not consult the shared secret — every other channel (join, heartbeat, leave,
+replication, sync, file-fetch, cache-invalidate) already did. The handshake works
+over both plaintext and TLS transports, matching Arc's existing "authenticated
+even without TLS" posture. A node now refuses to start its Raft port without a
+configured `cluster.shared_secret` (this was already mandatory to start
+clustering, so no operator action is needed for that guard).
+
+As additional defense-in-depth, a node running `cluster.tls_enabled=true` without
+`cluster.tls_ca_file` now logs a warning that peer certificates are not being
+verified (no mutual TLS) and that inter-node identity rests on the shared-secret
+HMAC. Set `cluster.tls_ca_file` to enable mTLS. This is a warning only — no
+existing deployment stops working.
+
+> **Upgrade note (clustered Enterprise deployments):** because the Raft transport
+> now requires the authenticated handshake, a node on this version will not form
+> consensus with a node on an older version — the interconnect is a hard cutover.
+> Upgrade the cluster as a coordinated restart: **stop all cluster nodes, upgrade
+> the binary on every node, then restart all nodes.** A rolling restart will cause
+> repeated leader elections until the last node is upgraded. Single-node and
+> non-clustered deployments are unaffected.
+>
+> The HMAC handshake authenticates connection *establishment*; for protection
+> against an on-path attacker on a plaintext interconnect, enable
+> `cluster.tls_enabled`.
+
+Full technical detail will accompany the corresponding security advisory once it
+is published. Responsibly reported by **zx (Jace)** ([@manus-use](https://github.com/manus-use)).
+
 ### Dependency: gRPC-Go upgraded past GHSA-hrxh-6v49-42gf
 
 `google.golang.org/grpc` is upgraded from v1.80.0 to v1.83.1, past the v1.82.1
