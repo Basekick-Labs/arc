@@ -17,7 +17,12 @@ func TestResolveMeasurementToken(t *testing.T) {
 		{"bare no header defaults", "cpu", "", "default", "cpu", true},
 		{"dotted uses own db", "mydb.cpu", "prod", "mydb", "cpu", true},
 		{"dotted ignores header", "mydb.cpu", "prod", "mydb", "cpu", true},
-		{"hyphen ok", "my-db.my-meas", "", "my-db", "my-meas", true},
+		// Hyphens DECLINE: Arc's RBAC patterns are `[a-zA-Z0-9_]` with no hyphen, so RBAC
+		// would read `my-db.cpu` as database `default`, measurement `my`. Accepting a
+		// hyphen here would let the router read one database while RBAC authorized
+		// another. Decline instead — the shape falls back to DuckDB. (Unreachable today:
+		// the tokenizer already rejects `-` in an identifier; this is defense in depth.)
+		{"hyphen declines (RBAC cannot parse it)", "my-db.my-meas", "", "", "", false},
 		{"underscore ok", "my_db.my_meas", "", "my_db", "my_meas", true},
 		{"three parts declines", "a.b.c", "", "", "", false},
 		{"invalid char declines", "cpu$", "prod", "", "", false},

@@ -7,7 +7,13 @@
 
 package arcxrouter
 
-import "github.com/gofiber/fiber/v2"
+import (
+	"context"
+	"time"
+
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/gofiber/fiber/v2"
+)
 
 // Handler is the subset of the query handler the router needs. In the stub build
 // it is unconstrained (any type) since Decide/Run ignore it — declared as `any`
@@ -23,4 +29,15 @@ type Decision struct {
 func Decide(sql, headerDB string, h Handler) Decision { return Decision{} }
 
 // Run never handles in the stub build; the caller falls through to DuckDB.
-func Run(c *fiber.Ctx, d Decision, h Handler, mode Mode) (handled bool) { return false }
+//
+// The signature MUST track the tagged build's exactly. It had drifted (missing
+// `start`) and compiled only because nothing in the untagged build calls it — so the
+// break would have surfaced whenever someone first wired the stub, far from the cause.
+func Run(c *fiber.Ctx, d Decision, h Handler, mode Mode, start time.Time) (handled bool) {
+	return false
+}
+
+// RunArrow never serves in the stub build. Was missing entirely; same drift risk as Run.
+func RunArrow(ctx context.Context, d Decision, h Handler, mode Mode) (reader array.RecordReader, served bool) {
+	return nil, false
+}
