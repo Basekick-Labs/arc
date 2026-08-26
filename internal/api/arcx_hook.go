@@ -245,7 +245,11 @@ func (h *QueryHandler) serveArcxResult(
 		// path's contract). drainArrowBatches enforces the governance cap and Retains
 		// each batch (defending the reader's auto-release-on-Next). KeepAlive holds the
 		// FFI buffers alive across the drain.
-		batches, rowCount, derr := drainArrowBatches(streamCtx, reader, governanceMaxRows)
+		// `nil` decimalCastInfo: main added decimal->int64/float64 normalization for the
+		// DuckDB path, but arcx can never produce a Decimal column -- it DECLINES the type
+		// at bind (arcx/src/bind.rs) and at scan (arcx/src/scan.rs), so such a query never
+		// reaches this hook. Nothing to normalize.
+		batches, rowCount, derr := drainArrowBatches(streamCtx, reader, governanceMaxRows, nil)
 		runtime.KeepAlive(reader)
 		if derr != nil {
 			for _, b := range batches {
