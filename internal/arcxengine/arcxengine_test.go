@@ -5,6 +5,7 @@ package arcxengine
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -14,6 +15,21 @@ import (
 // arcx-side FFI test and the differential harness.
 const fixture243 = "/Users/nacho/dev/basekick-labs/arc/data/arc/agent_memory/agent_events/2026/02/03/agent_events_20260209_184547_daily.parquet"
 
+// fixtureCtx is a Context whose sandbox actually contains the fixture.
+//
+// `Context{}` means NO allowed directories, which the engine treats as deny-all
+// (fail-closed by design — an empty allowlist must never mean "allow everything").
+// These tests used to pass with an empty Context only because the single-quoted
+// `read_parquet('<path>')` form DECLINED at parse before the sandbox was ever
+// consulted. That form now SERVES (arcx #54), so the deny-all sandbox correctly
+// rejects it and the tests must supply the root they actually read from.
+//
+// The two negative tests below deliberately keep `Context{}` — they assert a
+// decline and a missing-file error, neither of which should depend on a sandbox.
+func fixtureCtx(path string) Context {
+	return Context{AllowedDirs: []string{filepath.Dir(path)}}
+}
+
 func TestBridgeCountStar(t *testing.T) {
 	if _, err := os.Stat(fixture243); err != nil {
 		t.Skipf("fixture not present: %v", err)
@@ -22,7 +38,7 @@ func TestBridgeCountStar(t *testing.T) {
 		t.Fatal("engine should be available in the tagged build")
 	}
 
-	rec, err := Query("SELECT count(*) FROM read_parquet('"+fixture243+"')", Context{})
+	rec, err := Query("SELECT count(*) FROM read_parquet('"+fixture243+"')", fixtureCtx(fixture243))
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
 	}
@@ -79,7 +95,7 @@ func TestBridgeRepeatedCallsNoCrash(t *testing.T) {
 		t.Skipf("fixture not present: %v", err)
 	}
 	for i := 0; i < 200; i++ {
-		rec, err := Query("SELECT count(*) FROM read_parquet('"+fixture243+"')", Context{})
+		rec, err := Query("SELECT count(*) FROM read_parquet('"+fixture243+"')", fixtureCtx(fixture243))
 		if err != nil {
 			t.Fatalf("iter %d: %v", i, err)
 		}

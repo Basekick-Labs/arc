@@ -39,7 +39,7 @@ func stressFixture(t *testing.T) string {
 // buffers would be freed and this read would corrupt or crash.
 func TestBridgeStressUseAfterFree(t *testing.T) {
 	f := stressFixture(t)
-	rec, err := Query("SELECT count(*) FROM read_parquet('"+f+"')", Context{})
+	rec, err := Query("SELECT count(*) FROM read_parquet('"+f+"')", fixtureCtx(f))
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestBridgeStressConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < iters; i++ {
-				rec, err := Query("SELECT count(*) FROM read_parquet('"+f+"')", Context{})
+				rec, err := Query("SELECT count(*) FROM read_parquet('"+f+"')", fixtureCtx(f))
 				if err != nil {
 					errs <- err
 					return
