@@ -918,9 +918,12 @@ func (h *QueryHandler) logSlowQuery(sql string, start time.Time, rowCount int, t
 		return
 	}
 	metrics.Get().IncSlowQueries()
-	maskedSQL, _ := sqlutil.MaskStringLiterals(sql, sqlutil.HasQuotes(sql))
+	// ForLog (DuckDB-exact literal scanner) supersedes the older
+	// MaskStringLiterals here: the round-trip masker treats backslash as an
+	// escape in plain strings, which DuckDB does not — a value ending in `\`
+	// would shift literal boundaries and log the NEXT literal in the clear.
 	h.logger.Warn().
-		Str("sql", maskedSQL).
+		Str("sql", sqlutil.ForLog(sql)).
 		Float64("execution_time_ms", float64(elapsed.Milliseconds())).
 		Int("row_count", rowCount).
 		Str("token_name", tokenName).
@@ -1307,7 +1310,7 @@ func (h *QueryHandler) checkQueryPermissions(c *fiber.Ctx, sql, permission strin
 
 	if h.debugEnabled {
 		h.logger.Debug().
-			Str("sql", sql).
+			Str("sql", sqlutil.ForLog(sql)).
 			Int("table_count", len(tableRefs)).
 			Msg("Checking RBAC permissions for query")
 	}
@@ -1624,8 +1627,8 @@ localProcessing:
 
 	if h.debugEnabled {
 		h.logger.Debug().
-			Str("original_sql", req.SQL).
-			Str("converted_sql", convertedSQL).
+			Str("original_sql", sqlutil.ForLog(req.SQL)).
+			Str("converted_sql", sqlutil.ForLog(convertedSQL)).
 			Bool("cache_hit", cached).
 			Bool("parallel", parallelInfo != nil).
 			Str("header_db", headerDB).
@@ -1702,7 +1705,7 @@ localProcessing:
 					h.queryRegistry.Fail(queryID, "Parallel query execution failed")
 				}
 			}
-			h.logger.Error().Err(err).Str("sql", req.SQL).Msg("Parallel query execution failed")
+			h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(req.SQL)).Msg("Parallel query execution failed")
 			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 				Success:         false,
 				Error:           err.Error(),
@@ -1744,8 +1747,9 @@ localProcessing:
 				if execCtx.Err() == context.DeadlineExceeded {
 					h.queryRegistry.TimedOut(queryID)
 				} else {
-					h.queryRegistry.Fail(queryID, fmt.Sprintf("%d/%d partitions failed: %v",
-						len(erroredPaths), len(results), firstPartitionErr))
+					h.queryRegistry.Fail(queryID, fmt.Sprintf("%d/%d partitions failed: %s",
+						len(erroredPaths), len(results),
+						sqlutil.SanitizeErrText(firstPartitionErr.Error())))
 				}
 			}
 			// Sample paths at log level — full list could be hundreds.
@@ -1758,7 +1762,7 @@ localProcessing:
 				Int("errored_partitions", len(erroredPaths)).
 				Int("total_partitions", len(results)).
 				Strs("sample_paths", samplePaths).
-				Str("sql", req.SQL).
+				Str("sql", sqlutil.ForLog(req.SQL)).
 				Msg("Parallel query: partition error(s) — failing whole request to avoid silent partial result")
 			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 				Success: false,
@@ -1840,7 +1844,7 @@ localProcessing:
 					if errors.Is(streamErr, context.DeadlineExceeded) {
 						h.queryRegistry.TimedOut(queryID)
 					} else {
-						h.queryRegistry.Fail(queryID, streamErr.Error())
+						h.queryRegistry.Fail(queryID, sqlutil.SanitizeErrText(streamErr.Error()))
 					}
 				}
 				// Per-handler client-disconnect counter (#426).
@@ -1984,7 +1988,7 @@ localProcessing:
 			// This happens when querying a measurement that has no data on storage yet
 			// (e.g., new measurement, or DuckDB's httpfs cache is stale).
 			if isNoFilesFoundError(err) {
-				h.logger.Info().Str("sql", req.SQL).Msg("No files found for measurement, returning empty result")
+				h.logger.Info().Str("sql", sqlutil.ForLog(req.SQL)).Msg("No files found for measurement, returning empty result")
 				m.IncQuerySuccess()
 				if h.queryRegistry != nil && queryID != "" {
 					h.queryRegistry.Complete(queryID, 0)
@@ -2006,7 +2010,7 @@ localProcessing:
 				if h.queryRegistry != nil && queryID != "" {
 					h.queryRegistry.TimedOut(queryID)
 				}
-				h.logger.Error().Err(err).Str("sql", req.SQL).Dur("timeout", effectiveTimeout).Msg("Query timed out")
+				h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(req.SQL)).Dur("timeout", effectiveTimeout).Msg("Query timed out")
 				return c.Status(fiber.StatusGatewayTimeout).JSON(QueryResponse{
 					Success:         false,
 					Error:           "Query timed out",
@@ -2021,7 +2025,7 @@ localProcessing:
 					h.queryRegistry.Fail(queryID, "Query execution failed")
 				}
 			}
-			h.logger.Error().Err(err).Str("sql", req.SQL).Msg("Query execution failed")
+			h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(req.SQL)).Msg("Query execution failed")
 			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 				Success:         false,
 				Error:           err.Error(),
@@ -2090,7 +2094,7 @@ localProcessing:
 					if errors.Is(streamErr, context.DeadlineExceeded) {
 						h.queryRegistry.TimedOut(queryID)
 					} else {
-						h.queryRegistry.Fail(queryID, streamErr.Error())
+						h.queryRegistry.Fail(queryID, sqlutil.SanitizeErrText(streamErr.Error()))
 					}
 				}
 				// Per-handler client-disconnect counter (#426).
@@ -3964,8 +3968,8 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	countSQL := "SELECT COUNT(*) FROM (" + convertedSQL + ") AS t"
 
 	h.logger.Debug().
-		Str("original_sql", req.SQL).
-		Str("count_sql", countSQL).
+		Str("original_sql", sqlutil.ForLog(req.SQL)).
+		Str("count_sql", sqlutil.ForLog(countSQL)).
 		Msg("Estimating query")
 
 	m := metrics.Get()
@@ -3984,7 +3988,7 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 		// Check if it was a timeout
 		if h.queryTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
 			m.IncQueryTimeouts()
-			h.logger.Error().Err(err).Str("sql", countSQL).Dur("timeout", h.queryTimeout).Msg("Estimate query timed out")
+			h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(countSQL)).Dur("timeout", h.queryTimeout).Msg("Estimate query timed out")
 			return c.Status(fiber.StatusGatewayTimeout).JSON(EstimateResponse{
 				Success:         false,
 				Error:           "Query timed out",
@@ -3992,7 +3996,7 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 			})
 		}
-		h.logger.Error().Err(err).Str("sql", countSQL).Msg("Estimate query failed")
+		h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(countSQL)).Msg("Estimate query failed")
 		return c.JSON(EstimateResponse{
 			Success:         false,
 			Error:           "Cannot estimate query: " + err.Error(),
@@ -4354,7 +4358,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	h.logger.Debug().
 		Str("measurement", measurement).
 		Str("database", database).
-		Str("sql", convertedSQL).
+		Str("sql", sqlutil.ForLog(convertedSQL)).
 		Msg("Querying measurement")
 
 	timestamp := time.Now().UTC().Format(time.RFC3339)
@@ -4373,7 +4377,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	rows, err := h.db.Query(convertedSQL)
 	if err != nil {
 		m.IncQueryErrors()
-		h.logger.Error().Err(err).Str("sql", sql).Msg("Measurement query failed")
+		h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(sql)).Msg("Measurement query failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
 			Error:           err.Error(),

@@ -464,7 +464,10 @@ func (p *PartitionPruner) ExtractTimeRange(sqlStr string) *TimeRange {
 	// Get the masked WHERE clause, then unmask it to get actual time values
 	maskedWhereClause := matches[1]
 	whereClause := sql.UnmaskStringLiterals(maskedWhereClause, masks)
-	p.logger.Debug().Str("where_clause", whereClause[:min(100, len(whereClause))]).Msg("Analyzing WHERE clause")
+	// The clause was just deliberately UNMASKED for analysis, so mask it for the
+	// log. Truncating before masking is safe: a cut mid-literal leaves it
+	// unterminated, and ForLog masks unterminated literals to the end.
+	p.logger.Debug().Str("where_clause", sql.ForLog(whereClause[:min(200, len(whereClause))])).Msg("Analyzing WHERE clause")
 
 	var startTime, endTime *time.Time
 

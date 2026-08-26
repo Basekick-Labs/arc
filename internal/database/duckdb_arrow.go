@@ -8,6 +8,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"fmt"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"os"
 	"path/filepath"
 	"time"
@@ -59,7 +60,7 @@ func (d *DuckDB) ArrowQueryContext(ctx context.Context, query string) (array.Rec
 	}
 
 	d.logger.Debug().
-		Str("query", query).
+		Str("query", sqlutil.ForLog(query)).
 		Msg("Arrow query executed")
 
 	return reader, conn, nil

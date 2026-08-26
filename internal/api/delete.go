@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"io"
 	"os"
 	"path/filepath"
@@ -310,7 +311,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	h.logger.Info().
 		Str("database", req.Database).
 		Str("measurement", req.Measurement).
-		Str("where", req.Where).
+		Str("where", sqlutil.ForLog(req.Where)).
 		Bool("dry_run", req.DryRun).
 		Msg("Processing delete request")
 

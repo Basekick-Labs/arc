@@ -16,6 +16,10 @@ func Setup(level, format string) {
 	logLevel := parseLevel(level)
 	zerolog.SetGlobalLevel(logLevel)
 
+	// Sanitize every Err(err) field process-wide BEFORE any logger exists —
+	// engine error strings echo user query text (see errsanitize.go).
+	installErrSanitizer()
+
 	// Set output format
 	var baseOutput io.Writer = os.Stdout
 	if strings.ToLower(format) == "console" {
