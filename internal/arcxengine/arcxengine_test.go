@@ -13,7 +13,20 @@ import (
 
 // A real Arc parquet fixture with a known row count (243 rows), matching the
 // arcx-side FFI test and the differential harness.
-const fixture243 = "/Users/nacho/dev/basekick-labs/arc/data/arc/agent_memory/agent_events/2026/02/03/agent_events_20260209_184547_daily.parquet"
+// Fixture path: ARCX_TEST_FIXTURE, else the repo-relative default below. It was a
+// hardcoded absolute developer path, which meant these tests SILENTLY SKIPPED on every
+// other machine (and in CI) — so the FFI bridge appeared covered while it was not.
+var fixture243 = func() string {
+	if p := os.Getenv("ARCX_TEST_FIXTURE"); p != "" {
+		return p
+	}
+	// MUST be absolute: the engine sandbox rejects any `..` component outright (it
+	// refuses the traversal *intent*, before resolving), so a repo-relative path would
+	// be declined rather than read.
+	abs, _ := filepath.Abs(filepath.Join("..", "..", "data", "arc", "agent_memory",
+		"agent_events", "2026", "02", "03", "agent_events_20260209_184547_daily.parquet"))
+	return abs
+}()
 
 // fixtureCtx is a Context whose sandbox actually contains the fixture.
 //

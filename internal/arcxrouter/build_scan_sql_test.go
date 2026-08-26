@@ -96,8 +96,8 @@ func TestBuildScanSQL_DeclinesUnsafe(t *testing.T) {
 		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "LIKE", num: "1"}}},                // bad op
 		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "=", num: "1x"}}},                  // bad int literal
 		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "=", num: "1.2x", isFloat: true}}}, // bad float literal
-		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "=", num: "0.0", isFloat: true}}}, // ±0.0 float (declines defense-in-depth)
-		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "<", num: "0.0", isFloat: true}}}, // ±0.0 inequality still declines (2b-4)
+		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "=", num: "0.0", isFloat: true}}},  // ±0.0 float (declines defense-in-depth)
+		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "<", num: "0.0", isFloat: true}}},  // ±0.0 inequality still declines (2b-4)
 	}
 	for i, d := range bad {
 		if _, ok := buildScanSQL(d, "['/a.parquet']"); ok {

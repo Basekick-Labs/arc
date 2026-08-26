@@ -6,7 +6,10 @@
 
 package arcxengine
 
-import "github.com/apache/arrow-go/v18/arrow"
+import (
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+)
 
 // Available reports whether the arcx engine is linked in. False in this build.
 func Available() bool { return false }
@@ -26,6 +29,13 @@ func (e ErrUnsupported) Error() string { return "arcx: unsupported: " + e.msg }
 
 // Query always declines in the stub build — the caller falls back to DuckDB.
 func Query(sql string, ctx Context) (arrow.Record, error) {
+	return nil, ErrUnsupported{msg: "arcx engine not built into this binary"}
+}
+
+// QueryStream always declines in the stub build. Was missing entirely — the untagged
+// build never calls it, so its absence compiled fine and would only have broken the
+// first time someone referenced it from shared (non-tagged) code.
+func QueryStream(sql string, ctx Context) (array.RecordReader, error) {
 	return nil, ErrUnsupported{msg: "arcx engine not built into this binary"}
 }
 

@@ -10,11 +10,19 @@ import (
 	arcsql "github.com/basekick-labs/arc/internal/sql"
 )
 
-// validIdent mirrors Arc's validateIdentifier charset (query.go:746): alphanumeric,
-// underscore, hyphen. Database and measurement names must match, or we decline —
-// a name outside this set would be a path-injection risk and isn't a real Arc
-// measurement anyway.
-var validIdent = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+// validIdent is DELIBERATELY stricter than Arc's validateIdentifier (query.go), which
+// also permits a hyphen. It must match what Arc's RBAC patterns can actually parse:
+// patternDBTable / patternSimpleTable / patternJoinDBTable (query.go) are all
+// `[a-zA-Z0-9_]` with NO hyphen, so RBAC reads `FROM my-db.cpu` as database `default`,
+// measurement `my`. If a hyphenated name reached the router, the router and RBAC would
+// disagree about which database is being read — a permission check against one name and
+// a read against another.
+//
+// That is unreachable today (the tokenizer rejects `-` inside an identifier), so this is
+// defense in depth: the router must never be the component that widens what RBAC believes
+// it authorized. Decline instead — the shape falls back to DuckDB, which does its own
+// checks.
+var validIdent = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 
 // resolveMeasurementToken splits a FROM token (as written) into (database,
 // measurement) and folds headerDB for the bare form, mirroring
@@ -60,7 +68,7 @@ func isBareIdent(col string) bool {
 // and `starts_with(host, 'web')` / `ends_with`/`contains` (2f-2). The function name and
 // column arg are bare identifiers; the remaining args are EITHER (optionally `-`-signed)
 // integers (substr) OR a single properly-escaped single-quoted string literal (the 2f-2
-// needle, `'([^']|'')*'` — every embedded `'` is DOUBLED, so no unescaped quote can break
+// needle, `'([^']|”)*'` — every embedded `'` is DOUBLED, so no unescaped quote can break
 // out). Injection-safe. `isProjFuncItem` is the SQL-boundary defensive re-check that the
 // item came from matchProjFunc.
 var projFuncItem = regexp.MustCompile(

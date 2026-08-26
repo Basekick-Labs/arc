@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/basekick-labs/arc/internal/arcxengine"
@@ -23,7 +24,16 @@ import (
 // (Y/M/D, no hour dir) — perfect for exercising the day accept AND the hour
 // decline. Root the backend at data/arc so the List prefix is
 // agent_memory/agent_events/.
-const dataRoot = "/Users/nacho/dev/basekick-labs/arc/data"
+// ARCX_TEST_DATA_ROOT, else repo-relative. See the note in
+// arcxengine/arcxengine_test.go — a hardcoded absolute path made this skip everywhere
+// but one machine, so the e2e coverage was effectively developer-local.
+var dataRoot = func() string {
+	if p := os.Getenv("ARCX_TEST_DATA_ROOT"); p != "" {
+		return filepath.Dir(p)
+	}
+	abs, _ := filepath.Abs(filepath.Join("..", "..", "data"))
+	return abs
+}()
 
 func smokeDepsRootedAtArc(t *testing.T) (Deps, bool) {
 	t.Helper()

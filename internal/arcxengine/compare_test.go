@@ -37,7 +37,15 @@ import (
 	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
-const arcDataRoot = "/Users/nacho/dev/basekick-labs/arc/data/arc"
+// ARCX_TEST_DATA_ROOT, else repo-relative. See the note in arcxengine_test.go —
+// a hardcoded absolute path made this skip everywhere but one machine.
+var arcDataRoot = func() string {
+	if p := os.Getenv("ARCX_TEST_DATA_ROOT"); p != "" {
+		return p
+	}
+	abs, _ := filepath.Abs(filepath.Join("..", "..", "data", "arc"))
+	return abs
+}()
 
 // --- embedded DuckDB (Arc's real in-process engine) ------------------------
 
