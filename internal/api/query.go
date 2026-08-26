@@ -1879,6 +1879,30 @@ localProcessing:
 			// because SetBodyStreamWriter runs asynchronously after this function returns.
 		}
 
+		// arcx router hook. Decides eligibility on the RAW req.SQL (date_trunc
+		// still intact, before rewriteDateTrunc's epoch rewrite) and, in serve
+		// mode, may serve the response from the arcx engine. In shadow mode (the
+		// default when built with -tags=arcx_engine) it compares arcx vs DuckDB
+		// off to the side and returns false, so the DuckDB dispatch below serves
+		// untouched. Without the tag this is a no-op stub — stock Arc is
+		// unaffected. See internal/arcxrouter + docs 2026-07-05-router-phase1.
+		// Build the governance/registry callbacks the arcx serve path needs to record the
+		// same success/rows/latency + registry completion as the DuckDB path (else arcx-served
+		// queries vanish from metrics and leak registry entries). Same closures as the DuckDB
+		// dispatch below (queryID is set above, before this hook).
+		var arcxOnComplete func(int)
+		var arcxOnFail func(string)
+		if h.queryRegistry != nil && queryID != "" {
+			arcxOnComplete = func(rc int) { h.queryRegistry.Complete(queryID, rc) }
+			arcxOnFail = func(msg string) { h.queryRegistry.Fail(queryID, msg) }
+		}
+		if h.tryArcxRouter(c, ctx, cancel, start, req.SQL, headerDB, convertedSQL,
+			governanceMaxRows, arcxOnComplete, arcxOnFail) {
+			// The arcx serve path owns `cancel` (called inside its async stream writer),
+			// so do NOT cancel here — that would cancel the in-flight stream.
+			return nil
+		}
+
 		// Arrow-native path: bypasses database/sql row scanning entirely — reads typed
 		// values directly from DuckDB's internal Arrow columnar chunks.
 		//

@@ -1,10 +1,18 @@
-.PHONY: help build build-fips test test-fips run clean install deps fmt lint fips-check
+.PHONY: help build build-fips build-arcx test test-fips test-arcx run clean install deps fmt lint fips-check arcx-lib
 
 # Variables
 BINARY_NAME=arc
 GO=go
 GOFLAGS=-v -tags=duckdb_arrow
 MAIN_PATH=./cmd/arc
+
+# arcx engine (standalone Rust query engine, in-process via cgo/FFI). Opt-in: the
+# default build stays pure-Go(+duckdb) and needs no Rust toolchain. `build-arcx`
+# compiles libarcx.a from the sibling arcx repo, then links it via the arcx_engine
+# build tag. ARCX_DIR points at the arcx checkout (sibling by default). See
+# arcx/docs/2026-07-05-ffi-bridge-design.md.
+ARCX_DIR ?= ../arcx
+ARCX_GOFLAGS=-v -tags=duckdb_arrow,arcx_engine
 
 # FIPS build variant. Same source/commit/version as the standard build — only
 # the build tag and the GOFIPS140 module selection differ. GOFIPS140=v1.0.0 is
@@ -33,6 +41,17 @@ build: ## Build the binary
 
 build-fips: ## Build the FIPS 140-3 variant (arc-fips) against the certified Go module
 	GOFIPS140=$(GOFIPS140_VERSION) CGO_ENABLED=1 $(GO) build $(FIPS_GOFLAGS) -o $(FIPS_BINARY_NAME) $(MAIN_PATH)
+
+arcx-lib: ## Build the arcx engine static lib (libarcx.a) from $(ARCX_DIR)
+	@command -v cargo >/dev/null || { echo "ERROR: cargo (Rust) required for the arcx build; install rustup"; exit 1; }
+	@test -d "$(ARCX_DIR)" || { echo "ERROR: arcx repo not found at ARCX_DIR=$(ARCX_DIR)"; exit 1; }
+	cargo build --release --manifest-path $(ARCX_DIR)/Cargo.toml
+
+build-arcx: arcx-lib ## Build arc with the arcx engine linked in (in-process FFI)
+	CGO_ENABLED=1 $(GO) build $(ARCX_GOFLAGS) -o $(BINARY_NAME) $(MAIN_PATH)
+
+test-arcx: arcx-lib ## Run tests with the arcx engine linked in (exercises the FFI bridge)
+	CGO_ENABLED=1 $(GO) test $(ARCX_GOFLAGS) ./...
 
 fips-check: ## Verify the fips build links no non-FIPS crypto (x/crypto/bcrypt, x/crypto/hkdf)
 	@echo "Checking fips build import graph for non-approved crypto..."
