@@ -1616,6 +1616,12 @@ localProcessing:
 	// Convert SQL to storage paths and check for parallel execution opportunity
 	convertedSQL, parallelInfo, cached := h.getTransformedSQLForParallel(c.Context(), req.SQL, headerDB)
 
+	// arcx decline census (no-op stub in stock builds; no query text is emitted).
+	// MUST sit before the parallel dispatch below: parallel takes exactly the
+	// simple single-table queries arcx targets, so counting at the arcx hook in
+	// the else-branch would bias the census against the shapes worth building.
+	h.recordArcxShapeCensus(req.SQL, headerDB)
+
 	if h.debugEnabled {
 		h.logger.Debug().
 			Str("original_sql", req.SQL).
