@@ -6,7 +6,11 @@
 
 package arcxrouter
 
-import "testing"
+import (
+	"context"
+	"testing"
+	"time"
+)
 
 func TestStubDecideAlwaysDeclines(t *testing.T) {
 	// Even for a query that WOULD be eligible in the tagged build, the stub
@@ -17,8 +21,17 @@ func TestStubDecideAlwaysDeclines(t *testing.T) {
 	}
 }
 
+func TestStubRunArrowNeverServes(t *testing.T) {
+	// RunArrow was added to the stub in the signature-drift fix; pin it here so the
+	// untagged build keeps a compile-time check on it (the drift this test file itself
+	// failed to catch was that nothing referenced the stub's signature).
+	if r, served := RunArrow(context.Background(), Decision{Eligible: true}, nil, ModeServe); r != nil || served {
+		t.Fatal("stub RunArrow served; stock Arc must fall through to DuckDB")
+	}
+}
+
 func TestStubRunNeverHandles(t *testing.T) {
-	if Run(nil, Decision{Eligible: true}, nil, ModeServe) {
+	if Run(nil, Decision{Eligible: true}, nil, ModeServe, time.Now()) {
 		t.Fatal("stub Run returned handled=true; stock Arc must fall through to DuckDB")
 	}
 }
