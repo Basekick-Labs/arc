@@ -619,6 +619,94 @@ func matchProjFunc(c *cursor, fnLower string) (string, bool) {
 	}
 }
 
+// matchScanAgg matches the agg-1 ungrouped-aggregation shape (Phase 3 slice 1):
+//
+//	select <agg> [, <agg>]* from <measurement> [where <pred tree>]
+//
+// where <agg> is `count(*)` or `{count|sum|min|max|avg}(<bare column>)`. Each item
+// is re-serialized from its VALIDATED tokens as `fn(colAsWritten)` — the function
+// name lowercased (both engines lowercase it in the derived output name anyway),
+// the argument's typed spelling preserved (DuckDB and arcx both echo it verbatim
+// in the derived name, so canonicalizing the arg would change the client-visible
+// column name). The WHERE reuses the scan's boolean-tree re-serialization — the
+// same injection-proof construction, the engine is the tree authority. Anything
+// after the WHERE (GROUP BY / ORDER BY / LIMIT / aliases) declines: those are
+// later slices and the engine declines them too.
+//
+// Tried AFTER the footer matchers (count(*)/scalar agg get first refusal — the
+// engine routes footer-first for those) and BEFORE matchScan.
+func matchScanAgg(toks []token) (items []string, whereText string, meas string, ok bool) {
+	c := &cursor{toks: toks}
+	if !c.ident("select") {
+		return nil, "", "", false
+	}
+	fail := func() ([]string, string, string, bool) { return nil, "", "", false }
+
+	for {
+		f, ok := c.next()
+		if !ok || f.kind != tokIdent {
+			return fail()
+		}
+		switch f.lower {
+		case "count", "sum", "min", "max", "avg":
+		default:
+			return fail()
+		}
+		if !c.punct('(') {
+			return fail()
+		}
+		// `count(*)` — the only star form. `sum(*)` etc. fall through to the
+		// bare-column requirement and decline.
+		if f.lower == "count" && c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '*' {
+			c.i++
+			if !c.punct(')') {
+				return fail()
+			}
+			items = append(items, "count(*)")
+		} else {
+			arg, ok := c.next()
+			if !ok || arg.kind != tokIdent || isScanKeyword(arg.lower) || arg.lower == "distinct" {
+				return fail()
+			}
+			// The immediately-following `)` requirement declines expressions
+			// (`sum(a*b)`) and DISTINCT — mirroring the engine's matcher.
+			if !c.punct(')') {
+				return fail()
+			}
+			items = append(items, f.lower+"("+arg.orig+")")
+		}
+		if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == ',' {
+			c.i++
+			continue
+		}
+		break
+	}
+
+	if !c.ident("from") {
+		return fail()
+	}
+	mt, ok := c.next()
+	if !ok || mt.kind != tokIdent {
+		return fail()
+	}
+	meas = mt.orig
+
+	// Optional WHERE — ALWAYS the boolean-tree re-serialization (a flat AND is a
+	// tree too; the agg path has no flat-preds representation to maintain).
+	if c.peekIdentLower() == "where" {
+		c.next()
+		wt, ok := reserializeWhere(c)
+		if !ok {
+			return fail()
+		}
+		whereText = wt
+	}
+	if !c.atEnd() {
+		return fail()
+	}
+	return items, whereText, meas, true
+}
+
 func matchScan(toks []token) (cols []string, preds []scanPred, whereText string, orderBy []scanOrderKey, limit int, meas string, ok bool) {
 	c := &cursor{toks: toks}
 	if !c.ident("select") {

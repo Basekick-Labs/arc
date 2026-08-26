@@ -107,6 +107,7 @@ type Decision struct {
 	WhereText string         // re-serialized WHERE: boolean tree for scan (2b-2), or a time-range filter for date_trunc agg (PR-A)
 	OrderBy   []scanOrderKey // scan only: ORDER BY keys
 	Limit     int            // scan only: LIMIT n (0 = none)
+	AggItems  []string       // scan_agg only: re-serialized aggregate items, select-list order
 }
 
 // Decide is the cheap per-query pre-filter. It never calls the engine; it only
@@ -147,6 +148,7 @@ func Decide(sql, headerDB string, h Handler) Decision {
 		WhereText: m.whereText,
 		OrderBy:   m.orderBy,
 		Limit:     m.limit,
+		AggItems:  m.aggItems,
 	}
 }
 
@@ -285,9 +287,63 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 		return "SELECT " + fn + "(" + d.Col + ") FROM read_parquet(" + arr.String() + ")", true
 	case ShapeScan:
 		return buildScanSQL(d, arr.String())
+	case ShapeScanAgg:
+		return buildScanAggSQL(d, arr.String())
 	default:
 		return "", false
 	}
+}
+
+// buildScanAggSQL constructs the engine SQL for an ungrouped aggregation (agg-1):
+//
+//	SELECT <agg items> FROM read_parquet([<paths>]) [WHERE <tree>]
+//
+// Every item came from matchScanAgg's token-validated re-serialization; re-validate
+// the exact form here anyway (defense in depth vs a hand-built Decision) — decline
+// rather than emit unsafe SQL. The WHERE text was built by reserializeWhere (every
+// token re-validated, strings re-escaped), same as the scan's tree path.
+func buildScanAggSQL(d Decision, pathArray string) (string, bool) {
+	if len(d.AggItems) == 0 {
+		return "", false
+	}
+	var b strings.Builder
+	b.WriteString("SELECT ")
+	for i, item := range d.AggItems {
+		if !isAggItem(item) {
+			return "", false
+		}
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(item)
+	}
+	b.WriteString(" FROM read_parquet(")
+	b.WriteString(pathArray)
+	b.WriteByte(')')
+	if d.WhereText != "" {
+		b.WriteString(" WHERE ")
+		b.WriteString(d.WhereText)
+	}
+	return b.String(), true
+}
+
+// isAggItem re-validates one re-serialized aggregate item: `count(*)`, or
+// `{count|sum|min|max|avg}(<bare ident>)` with the fn lowercased — exactly what
+// matchScanAgg emits.
+func isAggItem(item string) bool {
+	if item == "count(*)" {
+		return true
+	}
+	open := strings.IndexByte(item, '(')
+	if open < 0 || !strings.HasSuffix(item, ")") {
+		return false
+	}
+	switch item[:open] {
+	case "count", "sum", "min", "max", "avg":
+	default:
+		return false
+	}
+	return isBareIdent(item[open+1 : len(item)-1])
 }
 
 // buildScanSQL constructs the engine SQL for a general single-table scan:
@@ -609,6 +665,13 @@ func (h Deps) compareToOracle(ctx context.Context, d Decision, rec arrow.Record)
 			return "", err
 		}
 		return compareScan(rec, oracle), nil
+	}
+	if d.Shape == ShapeScanAgg {
+		oracle, err := aggFromRows(rows)
+		if err != nil {
+			return "", err
+		}
+		return compareAgg(rec, oracle, d.AggItems), nil
 	}
 	if isScalarShape(d.Shape) {
 		oracle, err := scalarFromRows(rows)

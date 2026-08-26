@@ -34,6 +34,8 @@ const (
 	ShapeCountCol = "count_col"
 	// Phase 2a general single-table scan: SELECT <cols> FROM m [WHERE <preds>].
 	ShapeScan = "scan"
+	// Phase 3 agg-1 ungrouped aggregation: SELECT <agg list> FROM m [WHERE ...].
+	ShapeScanAgg = "scan_agg"
 )
 
 // scanPred is one WHERE predicate `<col> <op> <literal>` from a scan. Exactly one
@@ -141,6 +143,9 @@ type matchResult struct {
 	// the tree authority.
 	orderBy []scanOrderKey // scan only: ORDER BY keys
 	limit   int            // scan only: LIMIT n (0 = none)
+	// scan_agg only: re-serialized aggregate items ("count(*)", "sum(colAsWritten)"),
+	// in select-list order — validated token-by-token in matchScanAgg.
+	aggItems []string
 }
 
 // eligibleShape recognizes the arcx shapes on the raw user SQL. ok=false means
@@ -186,6 +191,13 @@ func eligibleShape(sql string) (matchResult, bool) {
 	if fn, col, meas, ok := matchScalarAgg(toks); ok {
 		shape := map[string]string{"min": ShapeMinCol, "max": ShapeMaxCol, "count": ShapeCountCol}[fn]
 		return matchResult{shape: shape, col: col, measurement: meas}, true
+	}
+	// Agg-1 ungrouped aggregation: tried after the footer shapes (they keep first
+	// refusal — the engine itself routes footer-first) and before the scan. Catches
+	// the shapes the footer matchers just declined (a WHERE, a multi-agg list,
+	// sum/avg) — the engine's parse-level fall-through, mirrored.
+	if items, whereText, meas, ok := matchScanAgg(toks); ok {
+		return matchResult{shape: ShapeScanAgg, aggItems: items, whereText: whereText, measurement: meas}, true
 	}
 	// Scan is tried LAST: it's the broadest shape (a bare column list matches many
 	// SELECTs), so the specific aggregate shapes get first refusal.
