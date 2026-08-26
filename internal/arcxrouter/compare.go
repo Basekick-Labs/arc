@@ -159,8 +159,17 @@ func compareResults(rec arrow.Record, oracle canonicalResult) string {
 	sortRows(b)
 	for i := range a {
 		if a[i] != b[i] {
-			return fmt.Sprintf("row %d differs: arcx=(bucket=%d,count=%d) duckdb=(bucket=%d,count=%d)",
-				i, a[i].bucketMicros, a[i].count, b[i].bucketMicros, b[i].count)
+			// NO VALUES in the diff: bucket timestamps and counts are result
+			// DATA, and this string lands in an ERROR log. What a responder
+			// actually needs is WHICH KIND of divergence — a missing bucket
+			// (pruning/path bug) vs a differing count (aggregation bug) — plus
+			// where; the values themselves come from re-running the comparison
+			// locally, a deliberate act.
+			kind := "count_differs"
+			if a[i].bucketMicros != b[i].bucketMicros {
+				kind = "bucket_differs"
+			}
+			return fmt.Sprintf("canonical row %d of %d differs (%s)", i, len(a), kind)
 		}
 	}
 	return ""
@@ -289,7 +298,11 @@ func compareScalar(rec arrow.Record, oracle scalarValue) string {
 		return "arcx scalar decode error: " + err.Error()
 	}
 	if got.isNull != oracle.isNull || (!got.isNull && got.v != oracle.v) {
-		return fmt.Sprintf("scalar differs: arcx=%s duckdb=%s", got, oracle)
+		// NO VALUES (see compareCanonical): report the divergence CLASS only.
+		if got.isNull != oracle.isNull {
+			return fmt.Sprintf("scalar differs (null-ness: arcx_null=%t duckdb_null=%t)", got.isNull, oracle.isNull)
+		}
+		return "scalar differs (both non-null, values withheld from log)"
 	}
 	return ""
 }

@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"strconv"
 	"strings"
 	"sync"
@@ -163,8 +164,8 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	convertedSQL, _ := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
 
 	h.logger.Debug().
-		Str("original_sql", req.SQL).
-		Str("converted_sql", convertedSQL).
+		Str("original_sql", sqlutil.ForLog(req.SQL)).
+		Str("converted_sql", sqlutil.ForLog(convertedSQL)).
 		Str("header_db", headerDB).
 		Msg("Executing Arrow query")
 
@@ -200,14 +201,14 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		}
 		if h.queryTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
 			m.IncQueryTimeouts()
-			h.logger.Error().Err(err).Str("sql", req.SQL).Dur("timeout", h.queryTimeout).Msg("Arrow query timed out")
+			h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(req.SQL)).Dur("timeout", h.queryTimeout).Msg("Arrow query timed out")
 			return c.Status(fiber.StatusGatewayTimeout).JSON(fiber.Map{
 				"success": false,
 				"error":   "Query timed out",
 			})
 		}
 		m.IncQueryErrors()
-		h.logger.Error().Err(err).Str("sql", req.SQL).Msg("Arrow query execution failed")
+		h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(req.SQL)).Msg("Arrow query execution failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
 			"error":   err.Error(),

@@ -25,6 +25,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"runtime"
 	"strconv"
 	"strings"
@@ -197,7 +198,7 @@ func RunArrow(ctx context.Context, d Decision, h Handler, mode Mode) (reader arr
 		r, err := arcxengine.QueryStream(engineSQL, d.Ctx)
 		if err != nil {
 			if _, unsupported := err.(arcxengine.ErrUnsupported); !unsupported {
-				h.Logger.Error().Err(err).Str("shape", d.Shape).Str("sql", engineSQL).
+				h.Logger.Error().Err(err).Str("shape", d.Shape).Str("sql", sqlutil.ForLog(engineSQL)).
 					Msg("arcx serve (arrow): engine ERROR; falling back to DuckDB")
 				h.Metrics.ArcxShadowError(d.Shape)
 			}
@@ -533,13 +534,13 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 		if _, unsupported := err.(arcxengine.ErrUnsupported); unsupported {
 			// Expected engine decline (e.g. hour-over-daily, F2). Not an alarm —
 			// eligibility over-claimed; a tightening signal.
-			h.Logger.Warn().Str("shape", d.Shape).Str("sql", engineSQL).
+			h.Logger.Warn().Str("shape", d.Shape).Str("sql", sqlutil.ForLog(engineSQL)).
 				Msg("arcx shadow: engine declined an eligible shape")
 			h.Metrics.ArcxShadowDeclined(d.Shape)
 			return
 		}
 		// Real engine error — alarm.
-		h.Logger.Error().Err(err).Str("shape", d.Shape).Str("sql", engineSQL).
+		h.Logger.Error().Err(err).Str("shape", d.Shape).Str("sql", sqlutil.ForLog(engineSQL)).
 			Msg("arcx shadow: engine ERROR")
 		h.Metrics.ArcxShadowError(d.Shape)
 		return
@@ -559,7 +560,7 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 		return
 	}
 	if err != nil {
-		h.Logger.Error().Err(err).Str("shape", d.Shape).Str("sql", engineSQL).
+		h.Logger.Error().Err(err).Str("shape", d.Shape).Str("sql", sqlutil.ForLog(engineSQL)).
 			Msg("arcx shadow: stream drain ERROR")
 		h.Metrics.ArcxShadowError(d.Shape)
 		return
@@ -581,8 +582,8 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 	if diff != "" {
 		h.Logger.Error().
 			Str("shape", d.Shape).
-			Str("engine_sql", engineSQL).
-			Str("oracle_sql", h.ConvertedSQL).
+			Str("engine_sql", sqlutil.ForLog(engineSQL)).
+			Str("oracle_sql", sqlutil.ForLog(h.ConvertedSQL)).
 			Str("diff", diff).
 			Msg("arcx shadow: MISMATCH vs DuckDB")
 		h.Metrics.ArcxShadowMismatch(d.Shape)
@@ -632,7 +633,7 @@ func (h Deps) runServe(c *fiber.Ctx, ctx context.Context, d Decision, engineSQL 
 		if _, unsupported := err.(arcxengine.ErrUnsupported); unsupported {
 			return false // silent fallback — normal router contract
 		}
-		h.Logger.Error().Err(err).Str("shape", d.Shape).Str("sql", engineSQL).
+		h.Logger.Error().Err(err).Str("shape", d.Shape).Str("sql", sqlutil.ForLog(engineSQL)).
 			Msg("arcx serve: engine ERROR; falling back to DuckDB")
 		h.Metrics.ArcxShadowError(d.Shape)
 		return false

@@ -805,7 +805,7 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 		wrappedQuery = wrapSourceMeasurement(query, cq.Database, cq.SourceMeasurement, readParquetExpr)
 	}
 
-	h.logger.Debug().Str("query", wrappedQuery).Msg("Executing wrapped query")
+	h.logger.Debug().Str("query", sqlutil.ForLog(wrappedQuery)).Msg("Executing wrapped query")
 
 	// Execute query using DuckDB
 	rows, err := h.db.Query(wrappedQuery)

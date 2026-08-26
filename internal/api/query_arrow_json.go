@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"math"
 	"strconv"
 	"strings"
@@ -118,7 +119,7 @@ func executeArrowJSONQuery(
 		if onFail != nil {
 			onFail(err.Error())
 		}
-		h.logger.Error().Err(err).Str("sql", convertedSQL).Msg("Arrow JSON query failed")
+		h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(convertedSQL)).Msg("Arrow JSON query failed")
 		c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
 			Error:           err.Error(),

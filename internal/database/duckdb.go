@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1668,14 +1669,14 @@ func (d *DuckDB) Query(query string, args ...interface{}) (*sql.Rows, error) {
 	if err != nil {
 		d.logger.Error().
 			Err(err).
-			Str("query", query).
+			Str("query", sqlutil.ForLog(query)).
 			Dur("elapsed", elapsed).
 			Msg("Query failed")
 		return nil, fmt.Errorf("query failed: %w", err)
 	}
 
 	d.logger.Debug().
-		Str("query", query).
+		Str("query", sqlutil.ForLog(query)).
 		Dur("elapsed", elapsed).
 		Msg("Query executed")
 
@@ -1691,14 +1692,14 @@ func (d *DuckDB) QueryContext(ctx context.Context, query string, args ...interfa
 	if err != nil {
 		d.logger.Error().
 			Err(err).
-			Str("query", query).
+			Str("query", sqlutil.ForLog(query)).
 			Dur("elapsed", elapsed).
 			Msg("Query failed")
 		return nil, fmt.Errorf("query failed: %w", err)
 	}
 
 	d.logger.Debug().
-		Str("query", query).
+		Str("query", sqlutil.ForLog(query)).
 		Dur("elapsed", elapsed).
 		Msg("Query executed")
 
@@ -1714,14 +1715,14 @@ func (d *DuckDB) Exec(query string, args ...interface{}) (sql.Result, error) {
 	if err != nil {
 		d.logger.Error().
 			Err(err).
-			Str("query", query).
+			Str("query", sqlutil.ForLog(query)).
 			Dur("elapsed", elapsed).
 			Msg("Exec failed")
 		return nil, fmt.Errorf("exec failed: %w", err)
 	}
 
 	d.logger.Debug().
-		Str("query", query).
+		Str("query", sqlutil.ForLog(query)).
 		Dur("elapsed", elapsed).
 		Msg("Exec completed")
 
@@ -1855,7 +1856,7 @@ func (d *DuckDB) QueryWithProfileContext(ctx context.Context, query string) (*sq
 	profile := d.parseProfileOutput(profilePath, totalTime)
 
 	d.logger.Debug().
-		Str("query", query).
+		Str("query", sqlutil.ForLog(query)).
 		Float64("total_ms", profile.TotalMs).
 		Float64("planner_ms", profile.PlannerMs).
 		Float64("execution_ms", profile.ExecutionMs).
@@ -1892,12 +1893,12 @@ func (d *DuckDB) parseProfileOutput(path string, totalTime time.Duration) *Query
 		return profile
 	}
 
-	// Debug: log raw JSON to understand structure
-	d.logger.Debug().Str("raw_json", string(data[:min(500, len(data))])).Msg("DuckDB profile JSON")
-
+	// NOTE: no raw-JSON debug dump here. The profile JSON embeds the full query
+	// text ("query_name": <sql>) within its first bytes, so even a truncated dump
+	// leaks query content into logs. Log sizes/errors, never the payload.
 	var output duckdbProfileOutput
 	if err := json.Unmarshal(data, &output); err != nil {
-		d.logger.Debug().Err(err).Str("raw", string(data[:min(200, len(data))])).Msg("Failed to parse profile JSON")
+		d.logger.Debug().Err(err).Int("profile_bytes", len(data)).Msg("Failed to parse profile JSON")
 		return profile
 	}
 

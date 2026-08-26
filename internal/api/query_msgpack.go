@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"strings"
 	"time"
 
@@ -130,7 +131,7 @@ func executeArrowMsgPackQuery(
 		if onFail != nil {
 			onFail(err.Error())
 		}
-		h.logger.Error().Err(err).Str("format", "msgpack").Str("sql", convertedSQL).Msg("Arrow MsgPack query failed")
+		h.logger.Error().Err(err).Str("format", "msgpack").Str("sql", sqlutil.ForLog(convertedSQL)).Msg("Arrow MsgPack query failed")
 		_ = respondError(c, fiber.StatusInternalServerError, err.Error(), timestamp, start)
 		return -1, true
 	}
@@ -197,7 +198,7 @@ func executeArrowMsgPackQuery(
 			onFail(drainErr.Error())
 		}
 		h.logger.Error().Err(drainErr).Str("format", "msgpack").
-			Str("sql", convertedSQL).Msg("Arrow MsgPack drain failed")
+			Str("sql", sqlutil.ForLog(convertedSQL)).Msg("Arrow MsgPack drain failed")
 		_ = respondError(c, fiber.StatusInternalServerError, drainErr.Error(), timestamp, start)
 		return -1, true
 	}
