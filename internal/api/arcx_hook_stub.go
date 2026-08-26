@@ -30,3 +30,8 @@ func (h *QueryHandler) tryArcxRouter(
 func (h *QueryHandler) tryArcxRouterArrow(c *fiber.Ctx, execCtx context.Context, cancel context.CancelFunc, rawSQL, headerDB, convertedSQL string) (handled bool) {
 	return false
 }
+
+// recordArcxShapeCensus is a no-op in the stub build. Deliberately EMPTY — a
+// stub that counted would newly link the recognizer into stock Arc, undoing
+// the zero-arcx-symbols property the stubs exist to preserve.
+func (h *QueryHandler) recordArcxShapeCensus(rawSQL, headerDB string) {}

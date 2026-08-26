@@ -383,3 +383,20 @@ func (m arcxMetrics) ArcxShadowDeclined(shape string) {
 func (m arcxMetrics) ArcxLatency(engine, shape string, micros int64) {
 	m.logger.Debug().Str("engine", engine).Str("shape", shape).Int64("micros", micros).Msg("arcx latency")
 }
+
+// recordArcxShapeCensus classifies one query for the decline census and bumps
+// the closed-set counter. Called from handleQuery BEFORE the parallel/single
+// dispatch — placement is load-bearing (see CensusClassify): the parallel
+// executor takes exactly the simple single-table population arcx targets, so a
+// census taken at the arcx hook would systematically miss it.
+//
+// Emits NO query text anywhere — reason is a compile-time constant, tokens an
+// integer. `off` keeps its zero-cost kill-switch meaning: no census either.
+func (h *QueryHandler) recordArcxShapeCensus(rawSQL, headerDB string) {
+	if arcxMode() == arcxrouter.ModeOff {
+		return
+	}
+	reason, tokens := arcxrouter.CensusClassify(rawSQL, headerDB)
+	metrics.Get().IncArcxShapeCensus(reason)
+	h.logger.Debug().Str("reason", reason).Int("tokens", tokens).Msg("arcx census")
+}

@@ -447,10 +447,14 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 	return map[string]interface{}{
 		// Process info
 		"uptime_seconds": time.Since(m.startTime).Seconds(),
-		"goroutines":     runtime.NumGoroutine(),
-		"go_version":     runtime.Version(),
-		"num_cpu":        runtime.NumCPU(),
-		"gomaxprocs":     runtime.GOMAXPROCS(0),
+
+		// arcx decline census (closed label set; all-zero in stock builds —
+		// only the arcx_engine-tagged census path increments these).
+		"arcx_shape_census": m.arcxCensusSnapshot(),
+		"goroutines":        runtime.NumGoroutine(),
+		"go_version":        runtime.Version(),
+		"num_cpu":           runtime.NumCPU(),
+		"gomaxprocs":        runtime.GOMAXPROCS(0),
 
 		// Memory (Go runtime)
 		"memory_alloc_bytes":       memStats.Alloc,
