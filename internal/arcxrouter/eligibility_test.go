@@ -76,14 +76,13 @@ func TestEligibleShape_ScalarAggregates(t *testing.T) {
 
 func TestEligibleShape_ScalarDeclines(t *testing.T) {
 	for _, sql := range []string{
-		"SELECT min(time) FROM cpu WHERE x > 1",
 		"SELECT max(time) FROM cpu GROUP BY 1",
 		"SELECT min(time) AS m FROM cpu",
 		"SELECT min(time + 1) FROM cpu",
 		"SELECT min(*) FROM cpu",
-		"SELECT sum(value) FROM cpu",        // sum not supported (footers lack sums)
-		"SELECT avg(value) FROM cpu",        // avg not supported
-		"SELECT min(a), max(b) FROM cpu",    // two aggregates
+		// NOTE: `sum(value)`, `avg(value)`, `min(a), max(b)`, and WHERE-bearing
+		// scalar aggs are now ELIGIBLE (ShapeScanAgg, agg-1) — covered by
+		// TestScanAggRecognized. Only the still-declined forms remain here.
 		"SELECT min(time) FROM cpu, mem",    // two tables
 		"SELECT min(time) FROM cpu LIMIT 1", // trailing clause
 	} {
@@ -115,7 +114,8 @@ func TestEligibleShape_Declines(t *testing.T) {
 		{"date_trunc suffix", "SELECT date_truncx('day', time), count(*) FROM cpu GROUP BY 1"},
 
 		// --- count(*) declines ---
-		{"count with where", "SELECT count(*) FROM cpu WHERE x > 1"},
+		// NOTE: `count(*) ... WHERE` is now ELIGIBLE (ShapeScanAgg, agg-1) —
+		// the headline filtered-aggregation shape.
 		{"count with groupby", "SELECT count(*) FROM cpu GROUP BY host"},
 		{"count with limit", "SELECT count(*) FROM cpu LIMIT 10"},
 		{"count with join", "SELECT count(*) FROM cpu JOIN mem ON cpu.time = mem.time"},
@@ -123,7 +123,8 @@ func TestEligibleShape_Declines(t *testing.T) {
 		// decline. Its acceptance is covered by TestEligibleShape_ScalarAggregates.
 		{"count alias", "SELECT count(*) AS n FROM cpu"},
 		{"count two tables", "SELECT count(*) FROM cpu, mem"},
-		{"not count", "SELECT sum(x) FROM cpu"},
+		// NOTE: `sum(x)` is now ELIGIBLE (ShapeScanAgg, agg-1) — no longer a
+		// decline. Its acceptance is covered by TestScanAggRecognized.
 		{"select star", "SELECT * FROM cpu"},
 
 		// --- agg declines ---
