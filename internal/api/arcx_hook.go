@@ -22,6 +22,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/basekick-labs/arc/internal/arcxrouter"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
@@ -72,7 +73,7 @@ func (h *QueryHandler) tryArcxRouter(
 		// cap/timeout and records the SAME metrics as the DuckDB path (a hardcoded 0
 		// cap + missing metrics were a governance escape + a registry leak).
 		ServeStream: func(fc *fiber.Ctx, reader array.RecordReader, s time.Time) bool {
-			return h.serveArcxResult(fc, ctx, cancel, reader, s, governanceMaxRows, onComplete, onFail)
+			return h.serveArcxResult(fc, ctx, cancel, reader, s, governanceMaxRows, convertedSQL, onComplete, onFail)
 		},
 		AllowedDirs: h.db.AllowedDirectories(),
 	}
@@ -92,6 +93,9 @@ func (h *QueryHandler) tryArcxRouter(
 // background-derived context (NOT the pooled Fiber ctx — used inside the async
 // stream writer).
 func (h *QueryHandler) tryArcxRouterArrow(c *fiber.Ctx, execCtx context.Context, cancel context.CancelFunc, rawSQL, headerDB, convertedSQL string) (handled bool) {
+	// Captured for RecordQueryLatency (F1): this path previously recorded no latency at
+	// all, so arcx-served Arrow-IPC queries were invisible in the latency histogram.
+	start := time.Now()
 	mode := arcxMode()
 	if mode == arcxrouter.ModeOff {
 		return false
@@ -133,6 +137,9 @@ func (h *QueryHandler) tryArcxRouterArrow(c *fiber.Ctx, execCtx context.Context,
 			}
 			runtime.KeepAlive(reader) // LAST: hold the FFI buffers past the final read.
 		}()
+		m := metrics.Get()
+		rows := 0
+		var ipcErr error
 		ipcWriter := ipc.NewWriter(w, ipc.WithSchema(schema))
 	batchLoop:
 		for reader.Next() {
@@ -150,16 +157,43 @@ func (h *QueryHandler) tryArcxRouterArrow(c *fiber.Ctx, execCtx context.Context,
 			}
 			if err := ipcWriter.Write(batch); err != nil {
 				h.logger.Warn().Err(err).Msg("arcx serve (arrow): IPC write failed after headers committed")
+				ipcErr = err
+				break
+			}
+			rows += int(batch.NumRows())
+			// F3: flush PER BATCH, matching the DuckDB arrow path (query_arrow.go).
+			// Without this the bufio buffer hides a closed connection, so a client that
+			// disconnects mid-stream is never noticed and the server keeps decoding and
+			// encoding a result nobody is reading.
+			if err := w.Flush(); err != nil {
+				h.logger.Warn().Err(err).Int("rows_sent", rows).
+					Msg("arcx serve (arrow): client disconnected mid-stream")
+				ipcErr = err
+				m.IncQueryClientDisconnect(metrics.DisconnectPathArrowIPC)
 				break
 			}
 		}
 		if rerr := reader.Err(); rerr != nil {
-			h.logger.Error().Err(rerr).Msg("arcx serve (arrow): stream engine error mid-drain (partial IPC served)")
+			h.logger.Error().Err(rerr).Int("rows_sent", rows).
+				Msg("arcx serve (arrow): stream engine error mid-drain (partial IPC served)")
+			ipcErr = rerr
 		}
 		if err := ipcWriter.Close(); err != nil {
 			h.logger.Warn().Err(err).Msg("arcx serve (arrow): IPC close failed")
+			if ipcErr == nil {
+				ipcErr = err
+			}
 		}
 		w.Flush()
+		// F1/F3: the DuckDB arrow path's completion metrics. A mid-stream failure is an
+		// error metric, not a success — but the rows already on the wire still count.
+		if ipcErr != nil {
+			m.IncQueryErrors()
+		} else {
+			m.IncQuerySuccess()
+			m.IncQueryRows(int64(rows))
+			m.RecordQueryLatency(time.Since(start).Microseconds())
+		}
 	})
 	return true
 }
@@ -194,6 +228,9 @@ func (h *QueryHandler) serveArcxResult(
 	reader array.RecordReader,
 	start time.Time,
 	governanceMaxRows int,
+	// convertedSQL is carried for logSlowQuery only — the same slow-query record the
+	// DuckDB wire paths emit (F1). It is the already-rewritten SQL, never re-executed.
+	convertedSQL string,
 	onComplete func(int),
 	onFail func(string),
 ) (handled bool) {
@@ -240,9 +277,18 @@ func (h *QueryHandler) serveArcxResult(
 			}
 			bw.Flush()
 			w.Flush()
+			// F1: emit the SAME metrics the DuckDB msgpack path does
+			// (query_msgpack.go). Without these, flipping to serve makes served
+			// queries vanish from dashboards — you cannot tell whether arcx is
+			// working, which is disqualifying for a production flip.
+			m := metrics.Get()
+			m.IncQuerySuccess()
+			m.IncQueryRows(int64(rowCount))
+			m.RecordQueryLatency(time.Since(start).Microseconds())
 			if onComplete != nil {
 				onComplete(rowCount)
 			}
+			h.logSlowQuery(convertedSQL, start, rowCount, getTokenName(c))
 		})
 		return true
 	}
@@ -262,21 +308,42 @@ func (h *QueryHandler) serveArcxResult(
 			runtime.KeepAlive(reader)
 		}()
 		rc, serr := streamArrowJSON(streamCtx, w, reader, governanceMaxRows, nil, start, timestamp)
+		m := metrics.Get()
 		if serr != nil {
-			h.logger.Warn().Err(serr).Msg("arcx serve: json stream error after headers committed")
-			if onFail != nil {
-				onFail(serr.Error())
+			// F4: headers (and `"success":true`) are already committed, so the CLIENT
+			// has been told this succeeded. Marking the registry Fail here would make
+			// the two disagree. Record it as a truncated stream — the same shape the
+			// DuckDB path uses (query_arrow_json.go) — so the alarm is honest without
+			// contradicting what the client was sent.
+			m.IncQueryErrors()
+			h.streamErrEvent(serr).Err(serr).
+				Int("rows_sent", rc).
+				Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
+				Msg("arcx serve: json stream truncated after headers committed; client received partial result")
+			if onComplete != nil {
+				onComplete(rc)
 			}
 		} else if rerr := reader.Err(); rerr != nil {
 			// A mid-stream engine error surfaced via the stream errno: Next() ended early,
 			// indistinguishable from clean EOF at the transcoder. Alarm — never serve
-			// partial-as-success silently.
-			h.logger.Error().Err(rerr).Msg("arcx serve: json stream engine error mid-drain (partial result served)")
-			if onFail != nil {
-				onFail(rerr.Error())
+			// partial-as-success silently. Same reasoning as above: the success envelope
+			// is already on the wire, so this is a truncation, not a request failure.
+			m.IncQueryErrors()
+			h.logger.Error().Err(rerr).
+				Int("rows_sent", rc).
+				Msg("arcx serve: json stream engine error mid-drain (partial result served)")
+			if onComplete != nil {
+				onComplete(rc)
 			}
-		} else if onComplete != nil {
-			onComplete(rc)
+		} else {
+			// F1: the DuckDB path's completion metrics.
+			m.IncQuerySuccess()
+			m.IncQueryRows(int64(rc))
+			m.RecordQueryLatency(time.Since(start).Microseconds())
+			if onComplete != nil {
+				onComplete(rc)
+			}
+			h.logSlowQuery(convertedSQL, start, rc, getTokenName(c))
 		}
 		w.Flush()
 	})
@@ -300,6 +367,11 @@ func (m arcxMetrics) ArcxShadowMismatch(shape string) {
 }
 func (m arcxMetrics) ArcxShadowError(shape string) {
 	m.logger.Warn().Str("shape", shape).Msg("arcx shadow: error metric")
+}
+func (m arcxMetrics) ArcxShadowSkipped(shape string) {
+	// Debug, not Warn: a skipped sample is expected under load or on a huge result —
+	// it is not evidence that arcx is wrong.
+	m.logger.Debug().Str("shape", shape).Msg("arcx shadow: sample skipped")
 }
 func (m arcxMetrics) ArcxShadowDeclined(shape string) {
 	m.logger.Debug().Str("shape", shape).Msg("arcx shadow: declined")

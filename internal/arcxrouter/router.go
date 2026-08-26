@@ -24,6 +24,7 @@ package arcxrouter
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"runtime"
 	"strconv"
 	"strings"
@@ -83,6 +84,11 @@ type Metrics interface {
 	ArcxShadowMatch(shape string)
 	ArcxShadowMismatch(shape string)
 	ArcxShadowError(shape string)
+	// ArcxShadowSkipped: a shadow sample was deliberately not taken (at the concurrency
+	// cap, or the result exceeded ShadowMaxRows). NOT an error and NOT a mismatch —
+	// conflating a skipped sample with a wrong answer would train operators to ignore
+	// shadow alarms, which is the one thing shadow mode exists to provide.
+	ArcxShadowSkipped(shape string)
 	ArcxShadowDeclined(shape string)
 	ArcxLatency(engine, shape string, micros int64)
 }
@@ -159,7 +165,7 @@ func Run(c *fiber.Ctx, d Decision, h Handler, mode Mode, start time.Time) (handl
 
 	switch mode {
 	case ModeShadow:
-		h.runShadow(ctx, d, engineSQL)
+		h.runShadowAsync(ctx, d, engineSQL)
 		return false // DuckDB always serves in shadow
 	case ModeServe:
 		return h.runServe(c, ctx, d, engineSQL, start)
@@ -185,7 +191,7 @@ func RunArrow(ctx context.Context, d Decision, h Handler, mode Mode) (reader arr
 	}
 	switch mode {
 	case ModeShadow:
-		h.runShadow(ctx, d, engineSQL)
+		h.runShadowAsync(ctx, d, engineSQL)
 		return nil, false // DuckDB serves in shadow
 	case ModeServe:
 		r, err := arcxengine.QueryStream(engineSQL, d.Ctx)
@@ -399,14 +405,27 @@ func buildScanSQL(d Decision, pathArray string) (string, bool) {
 // arrow-go C-stream reader contract). The caller MUST runtime.KeepAlive(reader) until after
 // this returns — the batches are FFI-backed and free on the reader's GC finalizer. Returns
 // an empty-but-schema'd record for a zero-batch result.
-func drainReaderToRecord(reader array.RecordReader) (arrow.Record, error) {
+// `maxRows` bounds the drain: shadow materializes the WHOLE result into one record, and
+// an eligible shape need carry no LIMIT (`SELECT host FROM cpu` is eligible), so an
+// unbounded drain on a large measurement is an OOM in Arc's own address space. Stopping
+// early is safe here — shadow never serves, and a truncated compare is reported as a
+// skip, never as a mismatch (a false mismatch alarm would be worse than no signal).
+func drainReaderToRecord(reader array.RecordReader, maxRows int) (arrow.Record, error) {
 	schema := reader.Schema()
 	var batches []arrow.Record
+	rows := 0
 	for reader.Next() {
 		b := reader.Record()
 		if b == nil {
 			break
 		}
+		if maxRows > 0 && rows+int(b.NumRows()) > maxRows {
+			for _, x := range batches {
+				x.Release()
+			}
+			return nil, errShadowTruncated
+		}
+		rows += int(b.NumRows())
 		b.Retain()
 		batches = append(batches, b)
 	}
@@ -459,9 +478,50 @@ func emptyRecord(schema *arrow.Schema) arrow.Record {
 	return rec
 }
 
+// errShadowTruncated marks a shadow run abandoned because the result exceeded
+// `ShadowMaxRows`. Reported as a SKIP, never a mismatch — see drainReaderToRecord.
+var errShadowTruncated = errors.New("arcx shadow: result exceeded the shadow row cap")
+
+// ShadowMaxRows bounds what shadow will materialize. Shadow holds the entire result in
+// memory at once, so this is a memory ceiling, not a fairness knob.
+const ShadowMaxRows = 1_000_000
+
+// shadowSlots bounds CONCURRENT shadow runs. Shadow costs a second full DuckDB query on
+// the same bounded `*sql.DB` pool plus a full arcx run, so unbounded concurrency doubles
+// pool pressure exactly when the server is busiest. A shadow run that cannot get a slot is
+// DROPPED (non-blocking send): shadow is a sampling signal, and shedding it under load is
+// strictly better than adding latency to real queries.
+var shadowSlots = make(chan struct{}, 2)
+
 // runShadow runs arcx and a cheap DuckDB oracle, compares, and records metrics.
 // It never serves — the caller's DuckDB dispatch does. Synchronous for the first
 // cut (immediate, deterministic correctness signal).
+// runShadowAsync launches runShadow OFF the request path. It was synchronous, which put a
+// second full DuckDB query plus a full arcx run inside every request in the DEFAULT mode —
+// doubling latency and pool pressure on a path that never serves. The context is DETACHED
+// (context.WithoutCancel) because the request's ctx is cancelled the moment the handler
+// returns, which would cancel the oracle query we just launched.
+func (h Deps) runShadowAsync(ctx context.Context, d Decision, engineSQL string) {
+	select {
+	case shadowSlots <- struct{}{}:
+	default:
+		h.Metrics.ArcxShadowSkipped(d.Shape)
+		return // at capacity: shed this sample rather than slow the request
+	}
+	detached := context.WithoutCancel(ctx)
+	go func() {
+		defer func() { <-shadowSlots }()
+		// Shadow must never take Arc down: it runs off-request, so a panic here would
+		// otherwise be an unrecovered goroutine panic = process exit.
+		defer func() {
+			if r := recover(); r != nil {
+				h.Logger.Error().Interface("panic", r).Msg("arcx shadow: recovered panic")
+			}
+		}()
+		h.runShadow(detached, d, engineSQL)
+	}()
+}
+
 func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 	arcxStart := time.Now()
 	// Drive the STREAMING path in shadow (the default mode) so the FFI-import + reader
@@ -484,11 +544,20 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 		h.Metrics.ArcxShadowError(d.Shape)
 		return
 	}
-	rec, err := drainReaderToRecord(reader)
+	rec, err := drainReaderToRecord(reader, ShadowMaxRows)
 	// KeepAlive: the reader (holding FFI-backed arcx buffers) must stay reachable until
 	// AFTER the drain reads the last batch — Release is a no-op; the stream frees on a GC
 	// finalizer, so an early finalize is a use-after-free.
 	runtime.KeepAlive(reader)
+	if errors.Is(err, errShadowTruncated) {
+		// Too big to compare in memory. A SKIP, not an error and not a mismatch — arcx
+		// may well be correct here; we simply declined to hold the result. Alarming would
+		// train the operator to ignore shadow alarms.
+		h.Logger.Debug().Str("shape", d.Shape).Int("cap", ShadowMaxRows).
+			Msg("arcx shadow: skipped, result exceeds the shadow row cap")
+		h.Metrics.ArcxShadowSkipped(d.Shape)
+		return
+	}
 	if err != nil {
 		h.Logger.Error().Err(err).Str("shape", d.Shape).Str("sql", engineSQL).
 			Msg("arcx shadow: stream drain ERROR")
