@@ -36,9 +36,10 @@ const (
 	ShapeScan = "scan"
 	// Phase 3 agg-1 ungrouped aggregation: SELECT <agg list> FROM m [WHERE ...].
 	ShapeScanAgg = "scan_agg"
-	// Phase 3 agg-2b: the ONE grouped shape past the perf gate — single key,
-	// count(*)-only, no WHERE. Wider grouped shapes stay ineligible (DuckDB).
-	ShapeScanAggGroupedCount = "scan_agg_grouped_count"
+	// Phase 3 agg-2b/2c: the grouped class past the perf gate — single key,
+	// agg-1's aggregate set, NO WHERE. WHERE-bearing grouped shapes stay
+	// ineligible (blocked by the broad-predicate bench; they share a shape).
+	ShapeScanAggGrouped = "scan_agg_grouped"
 )
 
 // scanPred is one WHERE predicate `<col> <op> <literal>` from a scan. Exactly one
@@ -208,9 +209,9 @@ func eligibleShape(sql string) (matchResult, bool) {
 	// The allow-listed grouped shape (agg-2b): single key + count(*)-only, no
 	// WHERE. Tried before the scan (a bare-column-led grouped select would fail
 	// the scan anyway; count-led ones fall through the agg matchers above).
-	if items, key, meas, ok := matchGroupedCountOnly(toks); ok {
+	if items, key, meas, ok := matchGroupedNoWhere(toks); ok {
 		return matchResult{
-			shape:       ShapeScanAggGroupedCount,
+			shape:       ShapeScanAggGrouped,
 			aggItems:    items,
 			groupKey:    key,
 			measurement: meas,
