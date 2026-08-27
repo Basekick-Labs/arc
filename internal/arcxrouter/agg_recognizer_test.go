@@ -105,7 +105,7 @@ func TestScanAggDeclines(t *testing.T) {
 	}
 }
 
-func TestGroupedCountOnlyRecognized(t *testing.T) {
+func TestGroupedNoWhereRecognized(t *testing.T) {
 	cases := []struct {
 		sql   string
 		items []string
@@ -116,10 +116,14 @@ func TestGroupedCountOnlyRecognized(t *testing.T) {
 		{"SELECT host, count(*) FROM cpu GROUP BY 1", []string{"host", "count(*)"}, "host"},
 		{"SELECT count(*), host FROM cpu GROUP BY 2", []string{"count(*)", "host"}, "host"},
 		{"SELECT host, count(*), count(*) FROM cpu GROUP BY host", []string{"host", "count(*)", "count(*)"}, "host"},
+		// agg-2c widened the class to agg-1's full aggregate set (no WHERE).
+		{"SELECT host, sum(x), avg(x) FROM cpu GROUP BY host", []string{"host", "sum(x)", "avg(x)"}, "host"},
+		{"SELECT host, count(*), avg(Usage), max(Usage) FROM cpu GROUP BY host", []string{"host", "count(*)", "avg(Usage)", "max(Usage)"}, "host"},
+		{"SELECT min(time), host FROM cpu GROUP BY 2", []string{"min(time)", "host"}, "host"},
 	}
 	for _, c := range cases {
 		m, ok := eligibleShape(c.sql)
-		if !ok || m.shape != ShapeScanAggGroupedCount {
+		if !ok || m.shape != ShapeScanAggGrouped {
 			t.Fatalf("should be scan_agg_grouped_count: %s (got %q, %t)", c.sql, m.shape, ok)
 		}
 		if !reflect.DeepEqual(m.aggItems, c.items) || m.groupKey != c.key {
@@ -128,13 +132,14 @@ func TestGroupedCountOnlyRecognized(t *testing.T) {
 	}
 }
 
-func TestGroupedCountOnlyDeclines(t *testing.T) {
+func TestGroupedNoWhereDeclines(t *testing.T) {
 	for _, sql := range []string{
 		// Outside the allow-listed subclass — the engine serves wider grouped
 		// shapes but they have NOT cleared the perf gate (agg-2b record).
 		"SELECT host, count(*) FROM cpu WHERE x > 1 GROUP BY host", // WHERE-bearing
-		"SELECT host, sum(x) FROM cpu GROUP BY host",               // value aggregate
-		"SELECT host, count(x) FROM cpu GROUP BY host",             // count(col)
+		"SELECT host, sum(x) FROM cpu WHERE x > 1 GROUP BY host",   // WHERE-bearing value agg
+		"SELECT host, sum(a * b) FROM cpu GROUP BY host",           // expression arg
+		"SELECT host, count(DISTINCT x) FROM cpu GROUP BY host",    // DISTINCT
 		"SELECT host, region, count(*) FROM cpu GROUP BY host, region", // multi-key
 		"SELECT host FROM cpu GROUP BY host",                       // no count
 		"SELECT count(*) FROM cpu GROUP BY host",                   // key not projected
@@ -143,7 +148,7 @@ func TestGroupedCountOnlyDeclines(t *testing.T) {
 		"SELECT host, count(*) FROM cpu GROUP BY host ORDER BY 1",  // trailing
 		"SELECT host, count(*) FROM cpu GROUP BY host LIMIT 5",
 	} {
-		if m, ok := eligibleShape(sql); ok && m.shape == ShapeScanAggGroupedCount {
+		if m, ok := eligibleShape(sql); ok && m.shape == ShapeScanAggGrouped {
 			t.Fatalf("must not match scan_agg_grouped_count: %s", sql)
 		}
 	}

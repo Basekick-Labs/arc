@@ -53,9 +53,9 @@ func TestBuildScanAggSQLDeclinesUnsafeItems(t *testing.T) {
 	}
 }
 
-func TestBuildGroupedCountSQL(t *testing.T) {
+func TestBuildGroupedSQL(t *testing.T) {
 	paths := "['/p.parquet']"
-	got, ok := buildGroupedCountSQL(Decision{
+	got, ok := buildGroupedSQL(Decision{
 		AggItems: []string{"count(*)", "host"},
 		GroupKey: "host",
 	}, paths)
@@ -66,10 +66,10 @@ func TestBuildGroupedCountSQL(t *testing.T) {
 	for _, d := range []Decision{
 		{AggItems: []string{"count(*)"}, GroupKey: "host"},              // no key item
 		{AggItems: []string{"host", "count(*)"}, GroupKey: "h; DROP"},   // unsafe key
-		{AggItems: []string{"host", "sum(x)"}, GroupKey: "host"},        // non-count item
+		{AggItems: []string{"host", "median(x)"}, GroupKey: "host"},     // unknown fn item
 		{AggItems: []string{"host", "host", "count(*)"}, GroupKey: "host"}, // repeated key
 	} {
-		if got, ok := buildGroupedCountSQL(d, paths); ok {
+		if got, ok := buildGroupedSQL(d, paths); ok {
 			t.Fatalf("must decline unsafe decision %v, got %q", d, got)
 		}
 	}

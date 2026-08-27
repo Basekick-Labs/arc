@@ -707,17 +707,19 @@ func matchScanAgg(toks []token) (items []string, whereText string, meas string, 
 	return items, whereText, meas, true
 }
 
-// matchGroupedCountOnly matches the ONE grouped shape the engine's perf gate has
-// cleared (agg-2b: parity at 7-run medians on the 1.47B-row corpus):
+// matchGroupedNoWhere matches the grouped class the engine's perf gate has
+// cleared (agg-2c: every no-WHERE single-key grouped bench shape beats DuckDB
+// v1.5.5 on the 1.47B-row corpus):
 //
-//	select {count(*) | <key>} [, ...]* from <measurement> group by {<key> | <pos>}
+//	select {<agg>|<key>} [, ...]* from <measurement> group by {<key> | <pos>}
 //
-// EXACTLY one bare key column, ≥1 count(*), any item order, NO WHERE (the
-// WHERE-bearing grouped shapes are indistinguishable from the still-losing
-// broad-predicate class and stay on DuckDB), nothing after the GROUP BY. The
-// items are re-serialized from validated tokens; the key's spelling is
-// preserved (catalog naming happens engine-side).
-func matchGroupedCountOnly(toks []token) (items []string, key string, meas string, ok bool) {
+// EXACTLY one bare key column, ≥1 aggregate from agg-1's set (`count(*)` or
+// `count|sum|min|max|avg(<bare col>)`), any item order, NO WHERE (WHERE-bearing
+// grouped shapes share a recognizer shape with the still-losing broad-predicate
+// class and stay on DuckDB), nothing after the GROUP BY. Items are re-serialized
+// from validated tokens (fn lowercased, ARG spelling preserved — derived-name
+// parity); the key's spelling is preserved.
+func matchGroupedNoWhere(toks []token) (items []string, key string, meas string, ok bool) {
 	c := &cursor{toks: toks}
 	if !c.ident("select") {
 		return nil, "", "", false
@@ -725,20 +727,40 @@ func matchGroupedCountOnly(toks []token) (items []string, key string, meas strin
 	fail := func() ([]string, string, string, bool) { return nil, "", "", false }
 
 	keyItem := -1
+	nAggs := 0
 	for {
 		t, tok := c.next()
 		if !tok || t.kind != tokIdent || isScanKeyword(t.lower) {
 			return fail()
 		}
-		if t.lower == "count" && c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '(' {
-			c.i++
-			if !c.punct('*') || !c.punct(')') {
+		isCall := c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '('
+		if isCall {
+			switch t.lower {
+			case "count", "sum", "min", "max", "avg":
+			default:
 				return fail()
 			}
-			items = append(items, "count(*)")
+			c.i++ // consume '('
+			if t.lower == "count" && c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '*' {
+				c.i++
+				if !c.punct(')') {
+					return fail()
+				}
+				items = append(items, "count(*)")
+			} else {
+				arg, tok := c.next()
+				if !tok || arg.kind != tokIdent || isScanKeyword(arg.lower) {
+					return fail()
+				}
+				if !c.punct(')') {
+					return fail() // expression / DISTINCT / arity → decline
+				}
+				items = append(items, t.lower+"("+arg.orig+")")
+			}
+			nAggs++
 		} else {
-			// A bare column — the group key. A second distinct bare column (or a
-			// repeat) is outside the allow-listed shape.
+			// A bare column — the single group key; a second (or repeated) bare
+			// column is outside the allow-listed class.
 			if keyItem >= 0 {
 				return fail()
 			}
@@ -752,8 +774,7 @@ func matchGroupedCountOnly(toks []token) (items []string, key string, meas strin
 		}
 		break
 	}
-	if keyItem < 0 || len(items) < 2 {
-		// No key, or no count(*) beside it.
+	if keyItem < 0 || nAggs == 0 {
 		return fail()
 	}
 	if !c.ident("from") {
@@ -765,7 +786,7 @@ func matchGroupedCountOnly(toks []token) (items []string, key string, meas strin
 	}
 	meas = mt.orig
 
-	// NO WHERE in the allow-listed shape.
+	// NO WHERE in the allow-listed class.
 	if !c.ident("group") || !c.ident("by") {
 		return fail()
 	}

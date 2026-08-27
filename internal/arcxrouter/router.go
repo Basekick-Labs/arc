@@ -291,8 +291,8 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 		return buildScanSQL(d, arr.String())
 	case ShapeScanAgg:
 		return buildScanAggSQL(d, arr.String())
-	case ShapeScanAggGroupedCount:
-		return buildGroupedCountSQL(d, arr.String())
+	case ShapeScanAggGrouped:
+		return buildGroupedSQL(d, arr.String())
 	default:
 		return "", false
 	}
@@ -331,21 +331,21 @@ func buildScanAggSQL(d Decision, pathArray string) (string, bool) {
 	return b.String(), true
 }
 
-// buildGroupedCountSQL constructs the engine SQL for the allow-listed grouped
-// shape: `SELECT <items> FROM read_parquet([...]) GROUP BY <key>`. Items are
-// re-validated (each is `count(*)` or exactly the bare key); decline rather
+// buildGroupedSQL constructs the engine SQL for the allow-listed grouped class:
+// `SELECT <items> FROM read_parquet([...]) GROUP BY <key>`. Items re-validate as
+// agg-1 aggregate items (`isAggItem`) or exactly the bare key; decline rather
 // than emit unsafe SQL — same defense-in-depth as the other builders.
-func buildGroupedCountSQL(d Decision, pathArray string) (string, bool) {
+func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 	if len(d.AggItems) < 2 || !isBareIdent(d.GroupKey) {
 		return "", false
 	}
-	sawKey, sawCount := false, false
+	sawKey, sawAgg := false, false
 	var b strings.Builder
 	b.WriteString("SELECT ")
 	for i, item := range d.AggItems {
 		switch {
-		case item == "count(*)":
-			sawCount = true
+		case isAggItem(item):
+			sawAgg = true
 		case item == d.GroupKey && !sawKey:
 			sawKey = true
 		default:
@@ -356,7 +356,7 @@ func buildGroupedCountSQL(d Decision, pathArray string) (string, bool) {
 		}
 		b.WriteString(item)
 	}
-	if !sawKey || !sawCount {
+	if !sawKey || !sawAgg {
 		return "", false
 	}
 	b.WriteString(" FROM read_parquet(")
@@ -712,10 +712,10 @@ func (h Deps) compareToOracle(ctx context.Context, d Decision, rec arrow.Record)
 		}
 		return compareAgg(rec, oracle, d.AggItems), nil
 	}
-	if d.Shape == ShapeScanAggGroupedCount {
+	if d.Shape == ShapeScanAggGrouped {
 		keyCol := 0
 		for i, item := range d.AggItems {
-			if item != "count(*)" {
+			if item == d.GroupKey {
 				keyCol = i
 				break
 			}
@@ -724,7 +724,7 @@ func (h Deps) compareToOracle(ctx context.Context, d Decision, rec arrow.Record)
 		if err != nil {
 			return "", err
 		}
-		return compareGroupedCount(rec, oracle, keyCol), nil
+		return compareGrouped(rec, oracle, d.AggItems, keyCol), nil
 	}
 	if isScalarShape(d.Shape) {
 		oracle, err := scalarFromRows(rows)
