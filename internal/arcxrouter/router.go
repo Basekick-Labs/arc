@@ -108,6 +108,7 @@ type Decision struct {
 	OrderBy   []scanOrderKey // scan only: ORDER BY keys
 	Limit     int            // scan only: LIMIT n (0 = none)
 	AggItems  []string       // scan_agg only: re-serialized aggregate items, select-list order
+	GroupKey  string         // scan_agg_grouped_count only: the single group-key column
 }
 
 // Decide is the cheap per-query pre-filter. It never calls the engine; it only
@@ -149,6 +150,7 @@ func Decide(sql, headerDB string, h Handler) Decision {
 		OrderBy:   m.orderBy,
 		Limit:     m.limit,
 		AggItems:  m.aggItems,
+		GroupKey:  m.groupKey,
 	}
 }
 
@@ -289,6 +291,8 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 		return buildScanSQL(d, arr.String())
 	case ShapeScanAgg:
 		return buildScanAggSQL(d, arr.String())
+	case ShapeScanAggGroupedCount:
+		return buildGroupedCountSQL(d, arr.String())
 	default:
 		return "", false
 	}
@@ -324,6 +328,41 @@ func buildScanAggSQL(d Decision, pathArray string) (string, bool) {
 		b.WriteString(" WHERE ")
 		b.WriteString(d.WhereText)
 	}
+	return b.String(), true
+}
+
+// buildGroupedCountSQL constructs the engine SQL for the allow-listed grouped
+// shape: `SELECT <items> FROM read_parquet([...]) GROUP BY <key>`. Items are
+// re-validated (each is `count(*)` or exactly the bare key); decline rather
+// than emit unsafe SQL — same defense-in-depth as the other builders.
+func buildGroupedCountSQL(d Decision, pathArray string) (string, bool) {
+	if len(d.AggItems) < 2 || !isBareIdent(d.GroupKey) {
+		return "", false
+	}
+	sawKey, sawCount := false, false
+	var b strings.Builder
+	b.WriteString("SELECT ")
+	for i, item := range d.AggItems {
+		switch {
+		case item == "count(*)":
+			sawCount = true
+		case item == d.GroupKey && !sawKey:
+			sawKey = true
+		default:
+			return "", false
+		}
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(item)
+	}
+	if !sawKey || !sawCount {
+		return "", false
+	}
+	b.WriteString(" FROM read_parquet(")
+	b.WriteString(pathArray)
+	b.WriteString(") GROUP BY ")
+	b.WriteString(d.GroupKey)
 	return b.String(), true
 }
 
@@ -672,6 +711,20 @@ func (h Deps) compareToOracle(ctx context.Context, d Decision, rec arrow.Record)
 			return "", err
 		}
 		return compareAgg(rec, oracle, d.AggItems), nil
+	}
+	if d.Shape == ShapeScanAggGroupedCount {
+		keyCol := 0
+		for i, item := range d.AggItems {
+			if item != "count(*)" {
+				keyCol = i
+				break
+			}
+		}
+		oracle, err := groupedFromRows(rows, keyCol)
+		if err != nil {
+			return "", err
+		}
+		return compareGroupedCount(rec, oracle, keyCol), nil
 	}
 	if isScalarShape(d.Shape) {
 		oracle, err := scalarFromRows(rows)

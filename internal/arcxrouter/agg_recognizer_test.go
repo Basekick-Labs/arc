@@ -104,3 +104,47 @@ func TestScanAggDeclines(t *testing.T) {
 		}
 	}
 }
+
+func TestGroupedCountOnlyRecognized(t *testing.T) {
+	cases := []struct {
+		sql   string
+		items []string
+		key   string
+	}{
+		{"SELECT host, count(*) FROM cpu GROUP BY host", []string{"host", "count(*)"}, "host"},
+		{"SELECT count(*), host FROM cpu GROUP BY host", []string{"count(*)", "host"}, "host"},
+		{"SELECT host, count(*) FROM cpu GROUP BY 1", []string{"host", "count(*)"}, "host"},
+		{"SELECT count(*), host FROM cpu GROUP BY 2", []string{"count(*)", "host"}, "host"},
+		{"SELECT host, count(*), count(*) FROM cpu GROUP BY host", []string{"host", "count(*)", "count(*)"}, "host"},
+	}
+	for _, c := range cases {
+		m, ok := eligibleShape(c.sql)
+		if !ok || m.shape != ShapeScanAggGroupedCount {
+			t.Fatalf("should be scan_agg_grouped_count: %s (got %q, %t)", c.sql, m.shape, ok)
+		}
+		if !reflect.DeepEqual(m.aggItems, c.items) || m.groupKey != c.key {
+			t.Fatalf("items/key = %v/%q, want %v/%q: %s", m.aggItems, m.groupKey, c.items, c.key, c.sql)
+		}
+	}
+}
+
+func TestGroupedCountOnlyDeclines(t *testing.T) {
+	for _, sql := range []string{
+		// Outside the allow-listed subclass — the engine serves wider grouped
+		// shapes but they have NOT cleared the perf gate (agg-2b record).
+		"SELECT host, count(*) FROM cpu WHERE x > 1 GROUP BY host", // WHERE-bearing
+		"SELECT host, sum(x) FROM cpu GROUP BY host",               // value aggregate
+		"SELECT host, count(x) FROM cpu GROUP BY host",             // count(col)
+		"SELECT host, region, count(*) FROM cpu GROUP BY host, region", // multi-key
+		"SELECT host FROM cpu GROUP BY host",                       // no count
+		"SELECT count(*) FROM cpu GROUP BY host",                   // key not projected
+		"SELECT host, count(*) FROM cpu GROUP BY region",           // wrong key
+		"SELECT host, count(*) FROM cpu GROUP BY 2",                // position at count
+		"SELECT host, count(*) FROM cpu GROUP BY host ORDER BY 1",  // trailing
+		"SELECT host, count(*) FROM cpu GROUP BY host LIMIT 5",
+	} {
+		if m, ok := eligibleShape(sql); ok && m.shape == ShapeScanAggGroupedCount {
+			t.Fatalf("must not match scan_agg_grouped_count: %s", sql)
+		}
+	}
+}

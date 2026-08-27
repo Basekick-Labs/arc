@@ -707,6 +707,90 @@ func matchScanAgg(toks []token) (items []string, whereText string, meas string, 
 	return items, whereText, meas, true
 }
 
+// matchGroupedCountOnly matches the ONE grouped shape the engine's perf gate has
+// cleared (agg-2b: parity at 7-run medians on the 1.47B-row corpus):
+//
+//	select {count(*) | <key>} [, ...]* from <measurement> group by {<key> | <pos>}
+//
+// EXACTLY one bare key column, ≥1 count(*), any item order, NO WHERE (the
+// WHERE-bearing grouped shapes are indistinguishable from the still-losing
+// broad-predicate class and stay on DuckDB), nothing after the GROUP BY. The
+// items are re-serialized from validated tokens; the key's spelling is
+// preserved (catalog naming happens engine-side).
+func matchGroupedCountOnly(toks []token) (items []string, key string, meas string, ok bool) {
+	c := &cursor{toks: toks}
+	if !c.ident("select") {
+		return nil, "", "", false
+	}
+	fail := func() ([]string, string, string, bool) { return nil, "", "", false }
+
+	keyItem := -1
+	for {
+		t, tok := c.next()
+		if !tok || t.kind != tokIdent || isScanKeyword(t.lower) {
+			return fail()
+		}
+		if t.lower == "count" && c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '(' {
+			c.i++
+			if !c.punct('*') || !c.punct(')') {
+				return fail()
+			}
+			items = append(items, "count(*)")
+		} else {
+			// A bare column — the group key. A second distinct bare column (or a
+			// repeat) is outside the allow-listed shape.
+			if keyItem >= 0 {
+				return fail()
+			}
+			keyItem = len(items)
+			key = t.orig
+			items = append(items, t.orig)
+		}
+		if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == ',' {
+			c.i++
+			continue
+		}
+		break
+	}
+	if keyItem < 0 || len(items) < 2 {
+		// No key, or no count(*) beside it.
+		return fail()
+	}
+	if !c.ident("from") {
+		return fail()
+	}
+	mt, tok := c.next()
+	if !tok || mt.kind != tokIdent {
+		return fail()
+	}
+	meas = mt.orig
+
+	// NO WHERE in the allow-listed shape.
+	if !c.ident("group") || !c.ident("by") {
+		return fail()
+	}
+	kt, tok := c.next()
+	if !tok {
+		return fail()
+	}
+	switch kt.kind {
+	case tokIdent:
+		if !strings.EqualFold(kt.orig, key) {
+			return fail()
+		}
+	case tokNum:
+		if kt.orig != strconv.Itoa(keyItem+1) {
+			return fail()
+		}
+	default:
+		return fail()
+	}
+	if !c.atEnd() {
+		return fail()
+	}
+	return items, key, meas, true
+}
+
 func matchScan(toks []token) (cols []string, preds []scanPred, whereText string, orderBy []scanOrderKey, limit int, meas string, ok bool) {
 	c := &cursor{toks: toks}
 	if !c.ident("select") {
