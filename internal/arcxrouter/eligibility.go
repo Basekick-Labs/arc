@@ -36,6 +36,9 @@ const (
 	ShapeScan = "scan"
 	// Phase 3 agg-1 ungrouped aggregation: SELECT <agg list> FROM m [WHERE ...].
 	ShapeScanAgg = "scan_agg"
+	// Phase 3 agg-2b: the ONE grouped shape past the perf gate — single key,
+	// count(*)-only, no WHERE. Wider grouped shapes stay ineligible (DuckDB).
+	ShapeScanAggGroupedCount = "scan_agg_grouped_count"
 )
 
 // scanPred is one WHERE predicate `<col> <op> <literal>` from a scan. Exactly one
@@ -146,6 +149,9 @@ type matchResult struct {
 	// scan_agg only: re-serialized aggregate items ("count(*)", "sum(colAsWritten)"),
 	// in select-list order — validated token-by-token in matchScanAgg.
 	aggItems []string
+	// scan_agg_grouped_count only: the single group-key column (as written).
+	// aggItems then holds the select list ("count(*)" or the key), in order.
+	groupKey string
 }
 
 // eligibleShape recognizes the arcx shapes on the raw user SQL. ok=false means
@@ -198,6 +204,17 @@ func eligibleShape(sql string) (matchResult, bool) {
 	// sum/avg) — the engine's parse-level fall-through, mirrored.
 	if items, whereText, meas, ok := matchScanAgg(toks); ok {
 		return matchResult{shape: ShapeScanAgg, aggItems: items, whereText: whereText, measurement: meas}, true
+	}
+	// The allow-listed grouped shape (agg-2b): single key + count(*)-only, no
+	// WHERE. Tried before the scan (a bare-column-led grouped select would fail
+	// the scan anyway; count-led ones fall through the agg matchers above).
+	if items, key, meas, ok := matchGroupedCountOnly(toks); ok {
+		return matchResult{
+			shape:       ShapeScanAggGroupedCount,
+			aggItems:    items,
+			groupKey:    key,
+			measurement: meas,
+		}, true
 	}
 	// Scan is tried LAST: it's the broadest shape (a bare column list matches many
 	// SELECTs), so the specific aggregate shapes get first refusal.
