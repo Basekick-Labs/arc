@@ -16,7 +16,9 @@ func TestCensusClassifySeparatesShapes(t *testing.T) {
 	cases := []struct {
 		sql, want string
 	}{
-		{"SELECT host, avg(usage_idle) FROM cpu WHERE usage_idle > 1.0 GROUP BY host", "group_by"},
+		// A WHERE-bearing single-key grouped agg became ELIGIBLE at the mimalloc
+		// slice; multi-key grouping remains the census representative.
+		{"SELECT host, core, avg(usage_idle) FROM cpu WHERE usage_idle > 1.0 GROUP BY host, core", "group_by"},
 		{"SELECT a.host FROM cpu a JOIN meta b ON a.host = b.host", "join"},
 		{"WITH t AS (SELECT host FROM cpu) SELECT host FROM t", "cte"},
 		{"SELECT host FROM cpu UNION SELECT host FROM mem", "set_op"},

@@ -707,24 +707,27 @@ func matchScanAgg(toks []token) (items []string, whereText string, meas string, 
 	return items, whereText, meas, true
 }
 
-// matchGroupedNoWhere matches the grouped class the engine's perf gate has
-// cleared (agg-2c: every no-WHERE single-key grouped bench shape beats DuckDB
-// v1.5.5 on the 1.47B-row corpus):
+// matchGroupedAgg matches the grouped class the engine's perf gate has cleared
+// (agg-2c: every no-WHERE single-key grouped bench shape beats DuckDB v1.5.5 on
+// the 1.47B-row corpus; mimalloc slice 2026-08-27: the WHERE-bearing shapes —
+// selective AND broad, incl. the masked dashboard pair — flipped to wins too,
+// so the optional WHERE joined the class):
 //
-//	select {<agg>|<key>} [, ...]* from <measurement> group by {<key> | <pos>}
+//	select {<agg>|<key>} [, ...]* from <measurement> [where <tree>] group by {<key> | <pos>}
 //
 // EXACTLY one bare key column, ≥1 aggregate from agg-1's set (`count(*)` or
-// `count|sum|min|max|avg(<bare col>)`), any item order, NO WHERE (WHERE-bearing
-// grouped shapes share a recognizer shape with the still-losing broad-predicate
-// class and stay on DuckDB), nothing after the GROUP BY. Items are re-serialized
+// `count|sum|min|max|avg(<bare col>)`), any item order, an optional WHERE
+// through the same `reserializeWhere` boolean-tree surface the scan/agg shapes
+// use (injection-proof: emitted text is rebuilt from validated tokens, never
+// sliced from the source), nothing after the GROUP BY. Items are re-serialized
 // from validated tokens (fn lowercased, ARG spelling preserved — derived-name
 // parity); the key's spelling is preserved.
-func matchGroupedNoWhere(toks []token) (items []string, key string, meas string, ok bool) {
+func matchGroupedAgg(toks []token) (items []string, key string, whereText string, meas string, ok bool) {
 	c := &cursor{toks: toks}
 	if !c.ident("select") {
-		return nil, "", "", false
+		return nil, "", "", "", false
 	}
-	fail := func() ([]string, string, string, bool) { return nil, "", "", false }
+	fail := func() ([]string, string, string, string, bool) { return nil, "", "", "", false }
 
 	keyItem := -1
 	nAggs := 0
@@ -786,7 +789,16 @@ func matchGroupedNoWhere(toks []token) (items []string, key string, meas string,
 	}
 	meas = mt.orig
 
-	// NO WHERE in the allow-listed class.
+	// Optional WHERE — the same boolean-tree re-serialization the scan and
+	// ungrouped-agg shapes route through (one shared surface, one shared review).
+	if c.peekIdentLower() == "where" {
+		c.next()
+		wt, wok := reserializeWhere(c)
+		if !wok {
+			return fail()
+		}
+		whereText = wt
+	}
 	if !c.ident("group") || !c.ident("by") {
 		return fail()
 	}
@@ -809,7 +821,7 @@ func matchGroupedNoWhere(toks []token) (items []string, key string, meas string,
 	if !c.atEnd() {
 		return fail()
 	}
-	return items, key, meas, true
+	return items, key, whereText, meas, true
 }
 
 func matchScan(toks []token) (cols []string, preds []scanPred, whereText string, orderBy []scanOrderKey, limit int, meas string, ok bool) {

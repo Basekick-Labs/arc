@@ -75,7 +75,11 @@ func TestBridgeCountStar(t *testing.T) {
 
 func TestBridgeUnsupportedDeclines(t *testing.T) {
 	// A shape the engine doesn't handle → ErrUnsupported (caller falls back).
-	_, err := Query("SELECT sum(x) FROM read_parquet('/x.parquet')", Context{})
+	// A JOIN is safely outside the engine's surface for the foreseeable phases;
+	// the original `sum(x)` probe became a SUPPORTED shape at Phase 3 agg-1 and
+	// started returning a sandbox Execution error instead (stale-test find,
+	// 2026-08-27 mimalloc adversarial).
+	_, err := Query("SELECT a.x FROM read_parquet('/x.parquet') a JOIN read_parquet('/y.parquet') b ON a.x = b.x", Context{})
 	var un ErrUnsupported
 	if !errors.As(err, &un) {
 		t.Fatalf("expected ErrUnsupported, got %v", err)

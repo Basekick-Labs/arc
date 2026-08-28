@@ -238,6 +238,12 @@ func (h *QueryHandler) serveArcxResult(
 	// `start` is the query's true start (captured BEFORE the engine ran) so
 	// execution_time_ms covers engine work, not just serialization.
 	timestamp := time.Now().UTC().Format(time.RFC3339)
+	// UAF trap (same class the Arrow-IPC path below documents): the pooled Fiber
+	// *Ctx is recycled once this handler returns, but SetBodyStreamWriter runs
+	// AFTER that — reading `c` inside the closure (getTokenName → UserValue on
+	// the released RequestCtx) segfaults the process. Capture every ctx-derived
+	// value the async writers need BEFORE committing the stream writer.
+	tokenName := getTokenName(c)
 
 	if isMsgPackWire(c) {
 		// MAJOR-4: msgpack must drain SYNCHRONOUSLY here — BEFORE committing headers —
@@ -292,7 +298,7 @@ func (h *QueryHandler) serveArcxResult(
 			if onComplete != nil {
 				onComplete(rowCount)
 			}
-			h.logSlowQuery(convertedSQL, start, rowCount, getTokenName(c))
+			h.logSlowQuery(convertedSQL, start, rowCount, tokenName)
 		})
 		return true
 	}
@@ -347,7 +353,7 @@ func (h *QueryHandler) serveArcxResult(
 			if onComplete != nil {
 				onComplete(rc)
 			}
-			h.logSlowQuery(convertedSQL, start, rc, getTokenName(c))
+			h.logSlowQuery(convertedSQL, start, rc, tokenName)
 		}
 		w.Flush()
 	})
