@@ -372,6 +372,9 @@ type arcxMetrics struct {
 func (m arcxMetrics) ArcxShadowMatch(shape string) {
 	m.logger.Debug().Str("shape", shape).Msg("arcx shadow: match")
 }
+func (m arcxMetrics) ArcxShadowArgDivergence(shape string) {
+	m.logger.Warn().Str("shape", shape).Msg("arcx shadow: arg-item divergence metric (tie candidate)")
+}
 func (m arcxMetrics) ArcxShadowMismatch(shape string) {
 	m.logger.Warn().Str("shape", shape).Msg("arcx shadow: mismatch metric")
 }

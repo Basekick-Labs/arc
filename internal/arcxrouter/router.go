@@ -84,6 +84,9 @@ type OracleDB interface {
 type Metrics interface {
 	ArcxShadowMatch(shape string)
 	ArcxShadowMismatch(shape string)
+	// agg-4: a shadow diff confined to arg_max/arg_min cells (tie-divergence
+	// candidate — WARN-class, never the mismatch alarm).
+	ArcxShadowArgDivergence(shape string)
 	ArcxShadowError(shape string)
 	// ArcxShadowSkipped: a shadow sample was deliberately not taken (at the concurrency
 	// cap, or the result exceeded ShadowMaxRows). NOT an error and NOT a mismatch —
@@ -458,12 +461,33 @@ func isAggItem(item string) bool {
 	if open < 0 || !strings.HasSuffix(item, ")") {
 		return false
 	}
+	inner := item[open+1 : len(item)-1]
 	switch item[:open] {
 	case "count", "sum", "min", "max", "avg":
-	default:
-		return false
+		return isBareIdent(inner)
+	// agg-4: the two-arg by-time aggregates — EXACTLY two bare idents,
+	// re-serialized as `fn(a, b)`. The 3-arg top-N form, arg_max_null, and
+	// no-underscore argmax/argmin exist on DuckDB and must NOT match.
+	case "arg_max", "arg_min", "max_by", "min_by":
+		a, b, ok := strings.Cut(inner, ", ")
+		return ok && isBareIdent(a) && isBareIdent(b)
 	}
-	return isBareIdent(item[open+1 : len(item)-1])
+	return false
+}
+
+// isArgItem reports whether a re-serialized item is an agg-4 by-time aggregate
+// — the shadow compare treats a mismatch confined to these cells as an
+// arg-tie divergence candidate (WARN), never the ERROR alarm: DuckDB's tie
+// choice is run-to-run nondeterministic at high thread counts (oracle-probed)
+// while arcx is pinned deterministic, so ambiguous ties diverge legitimately
+// (~0.1% of groups on real data).
+func isArgItem(item string) bool {
+	for _, p := range []string{"arg_max(", "arg_min(", "max_by(", "min_by("} {
+		if strings.HasPrefix(item, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // buildScanSQL constructs the engine SQL for a general single-table scan:
@@ -756,6 +780,22 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 	h.Metrics.ArcxLatency("duckdb", d.Shape, oracleMicros)
 
 	if diff != "" {
+		// agg-4 tie policy: a mismatch confined to arg_max/arg_min CELLS is a
+		// tie-divergence CANDIDATE (DuckDB nondeterministic, arcx pinned) —
+		// WARN + its own metric, never the ERROR alarm. The comparators tag
+		// such diffs with the "argdiff:" prefix after verifying no non-arg
+		// cell differs. Residual risk (a real arg bug on tie-free data lands
+		// here too) is recorded in the agg-4 plan doc; a WARN-rate spike is
+		// itself the signal, and the differential harness carries the strict
+		// membership checks.
+		if strings.HasPrefix(diff, "argdiff:") {
+			h.Logger.Warn().
+				Str("shape", d.Shape).
+				Str("diff", strings.TrimPrefix(diff, "argdiff:")).
+				Msg("arcx shadow: arg-item divergence (tie candidate, values withheld)")
+			h.Metrics.ArcxShadowArgDivergence(d.Shape)
+			return
+		}
 		h.Logger.Error().
 			Str("shape", d.Shape).
 			Str("engine_sql", sqlutil.ForLog(engineSQL)).

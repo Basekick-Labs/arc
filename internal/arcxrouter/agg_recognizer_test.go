@@ -289,3 +289,58 @@ func TestCompositeKeyDeclines(t *testing.T) {
 		}
 	}
 }
+
+func TestArgMinMaxRecognized(t *testing.T) {
+	// agg-4: the two-arg by-time aggregates, ungrouped and grouped.
+	cases := []struct {
+		sql   string
+		shape string
+		items []string
+	}{
+		{
+			"SELECT arg_max(cpu_user, time) FROM cpu WHERE host = 'a'",
+			ShapeScanAgg, []string{"arg_max(cpu_user, time)"},
+		},
+		{
+			"SELECT count(*), max_by(Value, Time) FROM cpu",
+			ShapeScanAgg, []string{"count(*)", "max_by(Value, Time)"},
+		},
+		{
+			"SELECT host, arg_max(cpu_user, time) FROM cpu GROUP BY host",
+			ShapeScanAggGrouped, []string{"host", "arg_max(cpu_user, time)"},
+		},
+		{
+			"SELECT date_trunc('hour', time), host, arg_min(cpu_user, time) FROM cpu GROUP BY 1, 2",
+			ShapeScanAggGrouped,
+			[]string{"date_trunc('hour', time)", "host", "arg_min(cpu_user, time)"},
+		},
+	}
+	for _, c := range cases {
+		m, ok := eligibleShape(c.sql)
+		if !ok || m.shape != c.shape {
+			t.Fatalf("shape = (%q, %t), want %q: %s", m.shape, ok, c.shape, c.sql)
+		}
+		if !reflect.DeepEqual(m.aggItems, c.items) {
+			t.Fatalf("items = %v, want %v: %s", m.aggItems, c.items, c.sql)
+		}
+	}
+}
+
+func TestArgMinMaxDeclines(t *testing.T) {
+	for _, sql := range []string{
+		// The 3-arg top-N form EXISTS on DuckDB (returns LIST) — must not match.
+		"SELECT arg_max(cpu_user, time, 2) FROM cpu",
+		// NULL-keeping variant and no-underscore spellings exist too.
+		"SELECT arg_max_null(cpu_user, time) FROM cpu",
+		"SELECT argmax(cpu_user, time) FROM cpu",
+		"SELECT argmin(cpu_user, time) FROM cpu",
+		// One arg / expression args decline.
+		"SELECT arg_max(cpu_user) FROM cpu",
+		"SELECT arg_max(cpu_user * 2, time) FROM cpu",
+		"SELECT host, arg_max(cpu_user, time, 3) FROM cpu GROUP BY host",
+	} {
+		if m, ok := eligibleShape(sql); ok && (m.shape == ShapeScanAgg || m.shape == ShapeScanAggGrouped) {
+			t.Fatalf("must not match: %s", sql)
+		}
+	}
+}

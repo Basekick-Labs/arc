@@ -158,3 +158,19 @@ func TestBuildGroupedSQLComposite(t *testing.T) {
 		t.Fatal("ORDER BY on an aggregate position must decline")
 	}
 }
+
+func TestIsAggItemTwoArg(t *testing.T) {
+	for item, want := range map[string]bool{
+		"arg_max(v, time)":    true,
+		"min_by(Value, Time)": true,
+		"arg_max(v, time, 2)": false, // 3-arg re-serialization can't exist, but the validator must still reject
+		"arg_max(v)":          false,
+		"argmax(v, time)":     false,
+		"arg_max(a b, time)":  false,
+		"arg_max(v; DROP, t)": false,
+	} {
+		if got := isAggItem(item); got != want {
+			t.Fatalf("isAggItem(%q) = %t, want %t", item, got, want)
+		}
+	}
+}

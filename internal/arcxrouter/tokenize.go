@@ -659,31 +659,42 @@ func matchScanAgg(toks []token) (items []string, whereText string, meas string, 
 		}
 		switch f.lower {
 		case "count", "sum", "min", "max", "avg":
+			if !c.punct('(') {
+				return fail()
+			}
+			// `count(*)` — the only star form. `sum(*)` etc. fall through to the
+			// bare-column requirement and decline.
+			if f.lower == "count" && c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '*' {
+				c.i++
+				if !c.punct(')') {
+					return fail()
+				}
+				items = append(items, "count(*)")
+			} else {
+				arg, ok := c.next()
+				if !ok || arg.kind != tokIdent || isScanKeyword(arg.lower) || arg.lower == "distinct" {
+					return fail()
+				}
+				// The immediately-following `)` requirement declines expressions
+				// (`sum(a*b)`) and DISTINCT — mirroring the engine's matcher.
+				if !c.punct(')') {
+					return fail()
+				}
+				items = append(items, f.lower+"("+arg.orig+")")
+			}
+		case "arg_max", "arg_min", "max_by", "min_by":
+			// agg-4 two-arg by-time aggregates: `fn(payload, orderkey)` — both
+			// bare idents, re-serialized `fn(a, b)` (fn lowercased, spellings
+			// preserved). The 3-arg top-N form and any other arg-shape fall to
+			// the `)` requirement and decline; `arg_max_null`/`argmax` are
+			// unknown fn names and decline in the default arm.
+			item, ok := parseTwoArgAggItem(c, f.lower)
+			if !ok {
+				return fail()
+			}
+			items = append(items, item)
 		default:
 			return fail()
-		}
-		if !c.punct('(') {
-			return fail()
-		}
-		// `count(*)` — the only star form. `sum(*)` etc. fall through to the
-		// bare-column requirement and decline.
-		if f.lower == "count" && c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '*' {
-			c.i++
-			if !c.punct(')') {
-				return fail()
-			}
-			items = append(items, "count(*)")
-		} else {
-			arg, ok := c.next()
-			if !ok || arg.kind != tokIdent || isScanKeyword(arg.lower) || arg.lower == "distinct" {
-				return fail()
-			}
-			// The immediately-following `)` requirement declines expressions
-			// (`sum(a*b)`) and DISTINCT — mirroring the engine's matcher.
-			if !c.punct(')') {
-				return fail()
-			}
-			items = append(items, f.lower+"("+arg.orig+")")
 		}
 		if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == ',' {
 			c.i++
@@ -850,6 +861,14 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 			bucketItem = len(items)
 			bucketText = "date_trunc('" + ut.str + "', " + bc.orig + ")"
 			items = append(items, bucketText)
+		} else if isCall && (t.lower == "arg_max" || t.lower == "arg_min" || t.lower == "max_by" || t.lower == "min_by") {
+			// agg-4 two-arg by-time aggregates (see matchScanAgg's arm).
+			item, iok := parseTwoArgAggItem(c, t.lower)
+			if !iok {
+				return fail()
+			}
+			items = append(items, item)
+			nAggs++
 		} else if isCall {
 			switch t.lower {
 			case "count", "sum", "min", "max", "avg":
@@ -1026,6 +1045,30 @@ type groupedMatch struct {
 	// the MANDATORY alias — validated parts the builder re-emits.
 	epochWidthSecs int
 	bucketAlias    string
+}
+
+// parseTwoArgAggItem consumes `( <bare ident> , <bare ident> )` after an agg-4
+// function name and re-serializes it as `fn(a, b)` — validated tokens only,
+// never source text. Anything else (star, expression, a third argument) fails.
+func parseTwoArgAggItem(c *cursor, fnLower string) (string, bool) {
+	if !c.punct('(') {
+		return "", false
+	}
+	a1, ok := c.next()
+	if !ok || a1.kind != tokIdent || isScanKeyword(a1.lower) || !isBareIdent(a1.orig) {
+		return "", false
+	}
+	if !c.punct(',') {
+		return "", false
+	}
+	a2, ok := c.next()
+	if !ok || a2.kind != tokIdent || isScanKeyword(a2.lower) || !isBareIdent(a2.orig) {
+		return "", false
+	}
+	if !c.punct(')') {
+		return "", false
+	}
+	return fnLower + "(" + a1.orig + ", " + a2.orig + ")", true
 }
 
 // fixedWidthUnits is the engine's agg-3 bucket set — pure UTC epoch division
