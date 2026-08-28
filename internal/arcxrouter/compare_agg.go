@@ -141,6 +141,21 @@ func compareAgg(rec arrow.Record, oracle []aggCell, items []string) string {
 	if len(got) != len(oracle) {
 		return fmt.Sprintf("agg column count differs (arcx=%d duckdb=%d)", len(got), len(oracle))
 	}
+	// agg-4 tie policy: a VALUE diff on an arg_max/arg_min cell is deferred —
+	// only if NO non-arg cell differs does it surface, tagged "argdiff:" so
+	// the caller WARNs instead of alarming (DuckDB's tie pick is
+	// nondeterministic; arcx's is pinned). Structural diffs (null-ness/kind)
+	// on arg cells still alarm: ties can't change a cell's type.
+	argDiff := ""
+	deferArg := func(c int, msg string) bool {
+		if c < len(items) && isArgItem(items[c]) {
+			if argDiff == "" {
+				argDiff = msg
+			}
+			return true
+		}
+		return false
+	}
 	for c := range got {
 		a, d := got[c], oracle[c]
 		if a.isNull != d.isNull {
@@ -156,16 +171,26 @@ func compareAgg(rec arrow.Record, oracle []aggCell, items []string) string {
 		}
 		if a.isInt {
 			if a.i.Cmp(d.i) != 0 {
-				return fmt.Sprintf("agg col %d differs (int values withheld from log)", c)
+				msg := fmt.Sprintf("agg col %d differs (int values withheld from log)", c)
+				if deferArg(c, msg) {
+					continue
+				}
+				return msg
 			}
 			continue
 		}
-		// Float cell. Two NaNs agree; one-sided NaN is a real divergence.
+		// Float cell. Two NaNs agree; one-sided NaN is a real divergence —
+		// EXCEPT on an arg cell, where a tie between a NaN payload and a real
+		// one legitimately diverges (defer like a value diff).
 		if math.IsNaN(a.f) || math.IsNaN(d.f) {
 			if math.IsNaN(a.f) && math.IsNaN(d.f) {
 				continue
 			}
-			return fmt.Sprintf("agg col %d differs (NaN-ness: arcx_nan=%t duckdb_nan=%t)", c, math.IsNaN(a.f), math.IsNaN(d.f))
+			msg := fmt.Sprintf("agg col %d differs (NaN-ness: arcx_nan=%t duckdb_nan=%t)", c, math.IsNaN(a.f), math.IsNaN(d.f))
+			if deferArg(c, msg) {
+				continue
+			}
+			return msg
 		}
 		tolerant := c < len(items) && aggItemTolerant(items[c])
 		if tolerant {
@@ -174,8 +199,15 @@ func compareAgg(rec arrow.Record, oracle []aggCell, items []string) string {
 				return fmt.Sprintf("agg col %d differs (float beyond 1e-9 tolerance, values withheld)", c)
 			}
 		} else if a.f != d.f {
-			return fmt.Sprintf("agg col %d differs (float values withheld from log)", c)
+			msg := fmt.Sprintf("agg col %d differs (float values withheld from log)", c)
+			if deferArg(c, msg) {
+				continue
+			}
+			return msg
 		}
+	}
+	if argDiff != "" {
+		return "argdiff:" + argDiff
 	}
 	return ""
 }

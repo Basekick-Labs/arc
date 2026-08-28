@@ -256,12 +256,30 @@ func compareGrouped(rec arrow.Record, oracle []groupedRow, items []string, keyCo
 		return fmt.Sprintf("grouped row count differs (arcx=%d duckdb=%d)", len(got), len(oracle))
 	}
 	// Cell policies in CELL order (items minus the keys, order preserved).
+	// cellItems carries the item text per cell for the agg-4 arg-tie deferral.
 	var tolerant []bool
+	var cellItems []string
 	for i, item := range items {
 		if isKeyCol(keyCols, i) {
 			continue
 		}
 		tolerant = append(tolerant, aggItemTolerant(item))
+		cellItems = append(cellItems, item)
+	}
+	// agg-4 tie policy: VALUE (and NaN-ness) diffs on arg cells are deferred —
+	// surfaced tagged "argdiff:" only when nothing else differs, so the caller
+	// WARNs instead of alarming. Structural diffs (row count, keys, null-ness,
+	// kind) always alarm: ties cannot cause them (a NULL payload never wins in
+	// either engine — the both-non-NULL participation rule).
+	argDiff := ""
+	deferArg := func(c int, msg string) bool {
+		if c < len(cellItems) && isArgItem(cellItems[c]) {
+			if argDiff == "" {
+				argDiff = msg
+			}
+			return true
+		}
+		return false
 	}
 	normalizeNullParts(got)
 	normalizeNullParts(oracle)
@@ -288,7 +306,11 @@ func compareGrouped(rec arrow.Record, oracle []groupedRow, items []string, keyCo
 			}
 			if ac.isInt {
 				if ac.i.Cmp(dc.i) != 0 {
-					return fmt.Sprintf("grouped row %d of %d differs (agg col %d, values withheld)", i, len(got), c)
+					msg := fmt.Sprintf("grouped row %d of %d differs (agg col %d, values withheld)", i, len(got), c)
+					if deferArg(c, msg) {
+						continue
+					}
+					return msg
 				}
 				continue
 			}
@@ -296,7 +318,11 @@ func compareGrouped(rec arrow.Record, oracle []groupedRow, items []string, keyCo
 				if math.IsNaN(ac.f) && math.IsNaN(dc.f) {
 					continue
 				}
-				return fmt.Sprintf("grouped row %d differs (agg col %d NaN-ness)", i, c)
+				msg := fmt.Sprintf("grouped row %d differs (agg col %d NaN-ness)", i, c)
+				if deferArg(c, msg) {
+					continue
+				}
+				return msg
 			}
 			if tolerant[c] {
 				scale := math.Max(math.Abs(ac.f), math.Abs(dc.f))
@@ -304,9 +330,16 @@ func compareGrouped(rec arrow.Record, oracle []groupedRow, items []string, keyCo
 					return fmt.Sprintf("grouped row %d differs (agg col %d beyond 1e-9 tolerance, values withheld)", i, c)
 				}
 			} else if ac.f != dc.f {
-				return fmt.Sprintf("grouped row %d of %d differs (agg col %d float, values withheld)", i, len(got), c)
+				msg := fmt.Sprintf("grouped row %d of %d differs (agg col %d float, values withheld)", i, len(got), c)
+				if deferArg(c, msg) {
+					continue
+				}
+				return msg
 			}
 		}
+	}
+	if argDiff != "" {
+		return "argdiff:" + argDiff
 	}
 	return ""
 }
