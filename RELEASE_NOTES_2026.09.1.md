@@ -407,6 +407,18 @@ The spoke recomputes the path digest rather than trusting the one in the file �
 
 Like the bundle it answers, the ack carries **no freshness window**: it rides the same drive back and is subject to the same weeks-long latency.
 
+## New: Arch Linux package (`.pkg.tar.zst`)
+
+Each release now ships a native **pacman package** for Arch Linux and Arch-based distros (including Omarchy), in `x86_64` and `aarch64`, alongside the existing `.deb` and `.rpm`:
+
+```bash
+wget https://github.com/basekick-labs/arc/releases/download/v26.09.1/arc-26.09.1-1-x86_64.pkg.tar.zst
+sudo pacman -U arc-26.09.1-1-x86_64.pkg.tar.zst
+sudo systemctl enable --now arc
+```
+
+Same layout as the other system packages — `/usr/bin/arc`, `/etc/arc/arc.toml`, a systemd `arc.service` running as a dedicated `arc` system user with data in `/var/lib/arc` — but done the Arch-native way: the service user and state directory are managed via `sysusers.d`/`tmpfiles.d` (no `useradd`/`mkdir` install scripting), and `arc.toml` is registered as a `backup=` file so pacman preserves your edits across upgrades (`.pacnew` on conflict). The package wraps the exact same cosign-signed binary the release publishes standalone, and the release CI installs and boots the built x86_64 package on an Arch userland before publishing (the aarch64 package is assembled from the same release binary that is built and tested on native arm64 runners). Standard build only (no FIPS variant — that story remains RHEL/Ubuntu-focused).
+
 ## Security hardening
 
 ### Strip client-controlled forwarding headers at the inter-node boundary (CVE-2026-45045 class)

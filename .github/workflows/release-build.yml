@@ -832,6 +832,216 @@ jobs:
             *.rpm.sha256
           retention-days: 7
 
+  # Build Arch Linux packages (pacman .pkg.tar.zst) — covers Arch and
+  # Arch-based distros such as Omarchy.
+  #
+  # Standard variant only: the FIPS story is RHEL/Ubuntu (CMVP) focused; Arch
+  # is a rolling distro where the standard build is what users want.
+  #
+  # Both target architectures run makepkg inside the official
+  # archlinux:base-devel container on the amd64 runner: this job only wraps a
+  # prebuilt binary (no compilation), so the aarch64 package is produced by
+  # overriding CARCH in makepkg.conf — makepkg just assembles the tarball with
+  # the right .PKGINFO arch. (The official archlinux image publishes no arm64
+  # manifest, so this is also the only way to build the aarch64 leg without a
+  # third-party base image in the release pipeline.) The x86_64 leg
+  # additionally installs the built package in the container and boots the
+  # binary against /health — a real "Ubuntu-built binary runs on Arch
+  # userland" smoke test, which QEMU-emulated aarch64 can't do reliably.
+  arch-build:
+    name: Build Arch Package
+    runs-on: ubuntu-latest
+    needs: [prepare, build-binaries]
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            binary_suffix: linux-amd64
+          - arch: aarch64
+            binary_suffix: linux-arm64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Download binary
+        uses: actions/download-artifact@v7
+        with:
+          name: arc-binary-standard-${{ matrix.binary_suffix }}
+
+      - name: Prepare PKGBUILD tree
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+          ARCH=${{ matrix.arch }}
+          SRC_BIN="arc-${{ matrix.binary_suffix }}"
+
+          mkdir -p pkgbuild
+          cp "${SRC_BIN}" pkgbuild/arc-bin
+          chmod +x pkgbuild/arc-bin
+          cp arc.toml pkgbuild/arc.toml
+
+          # systemd unit — same content as the deb/rpm service, but installed
+          # under /usr/lib/systemd/system (Arch does not use /lib).
+          cat > pkgbuild/arc.service << 'SERVICE'
+          [Unit]
+          Description=Arc Time-Series Database
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=arc
+          Group=arc
+          ExecStart=/usr/bin/arc
+          WorkingDirectory=/var/lib/arc
+          Restart=on-failure
+          RestartSec=5
+          LimitNOFILE=65535
+          Environment="ARC_STORAGE_LOCAL_PATH=/var/lib/arc/data"
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+
+          # Arch-native user/dir management: sysusers.d creates the arc system
+          # user, tmpfiles.d creates /var/lib/arc owned by it. pacman's stock
+          # systemd hooks run systemd-sysusers / systemd-tmpfiles on install,
+          # so no postinst useradd script is needed (unlike deb/rpm).
+          cat > pkgbuild/arc.sysusers << 'EOF'
+          u arc - "Arc Database" /var/lib/arc
+          EOF
+
+          cat > pkgbuild/arc.tmpfiles << 'EOF'
+          d /var/lib/arc 0750 arc arc -
+          EOF
+
+          # Post-install quickstart message and pre-remove service stop —
+          # parity with the deb postinst/prerm and rpm %post/%preun.
+          cat > pkgbuild/arc.install << 'EOF'
+          post_install() {
+            echo ""
+            echo "Arc installed successfully!"
+            echo "  Start:  sudo systemctl start arc"
+            echo "  Enable: sudo systemctl enable arc"
+            echo "  Logs:   sudo journalctl -u arc -f"
+          }
+
+          pre_remove() {
+            if command -v systemctl >/dev/null 2>&1; then
+              systemctl stop arc.service || true
+              systemctl disable arc.service || true
+            fi
+          }
+          EOF
+
+          # PKGBUILD: wraps the prebuilt binary. !strip/!debug because the
+          # binary is already stripped (-ldflags "-s -w") and makepkg's
+          # debug-package split must not mutate a cosign-signed artifact.
+          # backup= marks arc.toml as config so pacman preserves edits on
+          # upgrade (the .deb/.rpm equivalents of conffiles/%config).
+          cat > pkgbuild/PKGBUILD << EOF
+          pkgname=arc
+          pkgver=${VERSION}
+          pkgrel=1
+          pkgdesc="High-performance columnar analytical database built on DuckDB (Parquet storage, S3/MinIO support)"
+          arch=('${ARCH}')
+          url="https://github.com/basekick-labs/arc"
+          license=('AGPL-3.0-only')
+          depends=('glibc' 'gcc-libs')
+          backup=('etc/arc/arc.toml')
+          install=arc.install
+          options=('!strip' '!debug')
+          source=('arc-bin' 'arc.toml' 'arc.service' 'arc.sysusers' 'arc.tmpfiles')
+          sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
+
+          package() {
+            install -Dm755 arc-bin "\${pkgdir}/usr/bin/arc"
+            install -Dm644 arc.toml "\${pkgdir}/etc/arc/arc.toml"
+            install -Dm644 arc.service "\${pkgdir}/usr/lib/systemd/system/arc.service"
+            install -Dm644 arc.sysusers "\${pkgdir}/usr/lib/sysusers.d/arc.conf"
+            install -Dm644 arc.tmpfiles "\${pkgdir}/usr/lib/tmpfiles.d/arc.conf"
+          }
+          EOF
+
+          # Inner script executed inside the archlinux container. makepkg
+          # refuses to run as root, so build as an unprivileged user; the
+          # container ships everything needed (base-devel, zstd, systemd
+          # tools, curl) — no pacman -Sy, the job stays hermetic.
+          cat > pkgbuild/ci-build.sh << 'SCRIPT'
+          #!/bin/bash
+          set -euxo pipefail
+          TARGET_ARCH="$1"
+
+          # Cross-assemble for aarch64: CARCH only names the package arch in
+          # .PKGINFO; nothing is compiled here.
+          if [ "$(uname -m)" != "${TARGET_ARCH}" ]; then
+            sed -i "s/^CARCH=.*/CARCH=\"${TARGET_ARCH}\"/" /etc/makepkg.conf
+          fi
+
+          # Build in a container-local directory, not the bind mount: makepkg's
+          # fakeroot stage chmod/chowns its pkg/ tree, which fails on mounts
+          # with host-mapped ownership. Only the finished package is copied
+          # back out.
+          WORK=/tmp/arcpkg
+          cp -r /build "${WORK}"
+          useradd -m builder
+          chown -R builder:builder "${WORK}"
+          su builder -c "cd ${WORK} && makepkg --noconfirm"
+
+          PKG=$(ls ${WORK}/arc-*.pkg.tar.zst)
+          pacman -Qip "${PKG}"
+          cp "${PKG}" /build/
+
+          # Native-arch leg only: install the package and boot the binary to
+          # prove the glibc-linked build runs on Arch userland.
+          if [ "$(uname -m)" = "${TARGET_ARCH}" ]; then
+            pacman -U --noconfirm "${PKG}"
+            id arc   # sysusers hook must have created the service user
+            test -d /var/lib/arc   # tmpfiles hook must have created the state dir
+            cd /tmp
+            /usr/bin/arc > /tmp/arc-boot.log 2>&1 &
+            ARC_PID=$!
+            for i in $(seq 1 20); do
+              if curl -sf http://localhost:8000/health; then
+                echo ""
+                echo "arch package smoke test passed"
+                kill ${ARC_PID} || true
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "arch package smoke test FAILED"
+            cat /tmp/arc-boot.log
+            kill ${ARC_PID} || true
+            exit 1
+          fi
+          SCRIPT
+          chmod +x pkgbuild/ci-build.sh
+
+      - name: Build package in Arch container
+        # Pinned by digest: archlinux is a rolling tag, and this is the release
+        # pipeline's one non-action external input — pin it like everything
+        # else and bump deliberately. (Digest is the multi-arch index; the job
+        # is hermetic after pull — no pacman -Sy — so a dated pin is fine.)
+        run: |
+          docker run --rm -v "$PWD/pkgbuild:/build" \
+            archlinux:base-devel@sha256:68bfc3b0d277b08a99101dc9b94aaa03e5ae70cf1b4fb965c03b2b87b915760d \
+            /build/ci-build.sh ${{ matrix.arch }}
+
+      - name: Collect package and checksum
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+          ARCH=${{ matrix.arch }}
+          cp pkgbuild/arc-${VERSION}-1-${ARCH}.pkg.tar.zst .
+          sha256sum arc-${VERSION}-1-${ARCH}.pkg.tar.zst > arc-${VERSION}-1-${ARCH}.pkg.tar.zst.sha256
+
+      - name: Upload Arch package
+        uses: actions/upload-artifact@v6
+        with:
+          name: arc-arch-standard-${{ matrix.arch }}-${{ needs.prepare.outputs.version }}
+          path: |
+            *.pkg.tar.zst
+            *.pkg.tar.zst.sha256
+          retention-days: 7
+
   # Merge multi-arch manifests
   docker-merge:
     name: Merge Docker Manifests
@@ -1310,7 +1520,7 @@ jobs:
   create-draft-release:
     name: Create Draft Release
     runs-on: ubuntu-latest
-    needs: [prepare, docker-merge, docker-build-dockerhub, test-docker, test-binary, helm-package, test-helm, debian-build, rpm-build, sbom, vuln-scan, provenance]
+    needs: [prepare, docker-merge, docker-build-dockerhub, test-docker, test-binary, helm-package, test-helm, debian-build, rpm-build, arch-build, sbom, vuln-scan, provenance]
     permissions:
       contents: write
     steps:
@@ -1411,6 +1621,18 @@ jobs:
           sudo systemctl start arc
           ```
 
+          ### Arch Linux / Omarchy (x86_64, aarch64)
+
+          ```bash
+          # Download and install
+          wget https://github.com/basekick-labs/arc/releases/download/v${{ needs.prepare.outputs.version }}/arc-${{ needs.prepare.outputs.version }}-1-x86_64.pkg.tar.zst
+          sudo pacman -U arc-${{ needs.prepare.outputs.version }}-1-x86_64.pkg.tar.zst
+
+          # Start and enable
+          sudo systemctl enable arc
+          sudo systemctl start arc
+          ```
+
           ### Kubernetes (Helm)
 
           ```bash
@@ -1426,6 +1648,8 @@ jobs:
           | Debian/Ubuntu | arm64 | `arc_${{ needs.prepare.outputs.version }}_arm64.deb` |
           | RHEL/Fedora | x86_64 | `arc-${{ needs.prepare.outputs.version }}-1.x86_64.rpm` |
           | RHEL/Fedora | aarch64 | `arc-${{ needs.prepare.outputs.version }}-1.aarch64.rpm` |
+          | Arch Linux / Omarchy | x86_64 | `arc-${{ needs.prepare.outputs.version }}-1-x86_64.pkg.tar.zst` |
+          | Arch Linux / Omarchy | aarch64 | `arc-${{ needs.prepare.outputs.version }}-1-aarch64.pkg.tar.zst` |
           | Kubernetes | - | `arc-${{ needs.prepare.outputs.version }}.tgz` (Helm) |
 
           ## Breaking Changes
@@ -1468,6 +1692,8 @@ jobs:
             release-artifacts/**/*.deb.sha256
             release-artifacts/**/*.rpm
             release-artifacts/**/*.rpm.sha256
+            release-artifacts/**/*.pkg.tar.zst
+            release-artifacts/**/*.pkg.tar.zst.sha256
             release-artifacts/**/*.spdx.json
             release-artifacts/**/*.cyclonedx.json
             release-artifacts/**/*-trivy-report.json
@@ -1497,6 +1723,8 @@ jobs:
           echo "| Debian arm64 | \`arc_${VERSION}_arm64.deb\` |" >> $GITHUB_STEP_SUMMARY
           echo "| RPM x86_64 | \`arc-${VERSION}-1.x86_64.rpm\` |" >> $GITHUB_STEP_SUMMARY
           echo "| RPM aarch64 | \`arc-${VERSION}-1.aarch64.rpm\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Arch x86_64 | \`arc-${VERSION}-1-x86_64.pkg.tar.zst\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Arch aarch64 | \`arc-${VERSION}-1-aarch64.pkg.tar.zst\` |" >> $GITHUB_STEP_SUMMARY
           echo "| SBOM (container, SPDX) | \`arc-${VERSION}-sbom-container.spdx.json\` |" >> $GITHUB_STEP_SUMMARY
           echo "| SBOM (source, CycloneDX) | \`arc-${VERSION}-sbom-source.cyclonedx.json\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Vulnerability scan | \`arc-${VERSION}-trivy-report.json\` |" >> $GITHUB_STEP_SUMMARY
