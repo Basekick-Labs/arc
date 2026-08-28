@@ -170,11 +170,15 @@ var (
 	betweenPattern = regexp.MustCompile(`(?i)time\s+BETWEEN\s+'([^']+)'\s+AND\s+'([^']+)'`)
 
 	// Patterns for relative time expressions (NOW() +/- INTERVAL)
-	// These capture: (1) the numeric amount, (2) the time unit, and detect +/- via separate patterns
-	relativeStartSubtractPattern = regexp.MustCompile(`(?i)time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
-	relativeStartAddPattern      = regexp.MustCompile(`(?i)time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
-	relativeEndSubtractPattern   = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
-	relativeEndAddPattern        = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
+	// These capture: (1) the numeric amount, (2) the time unit, and detect +/- via separate patterns.
+	// Quotes are optional: SQL-standard `INTERVAL '300 seconds'` and DuckDB's
+	// unquoted `INTERVAL 300 SECOND` both prune — the unquoted form previously
+	// extracted no range at all, silently disabling pruning for every client
+	// that emits DuckDB-native syntax.
+	relativeStartSubtractPattern = regexp.MustCompile(`(?i)time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s*'?(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'?`)
+	relativeStartAddPattern      = regexp.MustCompile(`(?i)time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s*'?(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'?`)
+	relativeEndSubtractPattern   = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s*'?(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'?`)
+	relativeEndAddPattern        = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s*'?(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'?`)
 
 	// Pattern to parse storage paths
 	storagePathPattern = regexp.MustCompile(`(.+)/([^/]+)/([^/]+)/\*\*/\*\.parquet$`)
@@ -363,6 +367,12 @@ type PartitionPruner struct {
 	partitionCache *partitionCache
 	storage        storage.Backend // Optional storage backend for S3/Azure path validation
 
+	// File-level time pruning (see file_time_pruning.go). nowFn is
+	// injectable for tests; production always uses time.Now.
+	fileTimePruning bool
+	fileTimeMargin  time.Duration
+	nowFn           func() time.Time
+
 	// cleanupStarted ensures StartCleanup spawns at most one janitor
 	// goroutine per pruner. Idempotent on repeat calls — second and
 	// later invocations log a warn and return without spawning. Guards
@@ -426,6 +436,7 @@ func NewPartitionPruner(logger zerolog.Logger) *PartitionPruner {
 		stats:          PrunerStats{},
 		globCache:      newGlobCache(GlobCacheTTL),
 		partitionCache: newPartitionCache(PartitionCacheTTL),
+		nowFn:          time.Now,
 	}
 }
 
@@ -739,6 +750,12 @@ func (p *PartitionPruner) OptimizeTablePath(ctx context.Context, originalPath, s
 		return originalPath, false
 	}
 
+	// File-level time pruning of the live-hour boundary glob. When it
+	// modifies the set, the result is volatile (an explicit file list goes
+	// stale the moment the next flush lands) and must not be cached here
+	// or by the SQL transform cache (the context flag carries that).
+	partitionPaths, fileExpanded := p.applyFileTimePruning(ctx, partitionPaths, timeRange)
+
 	var result interface{}
 	if len(partitionPaths) == 1 {
 		p.logger.Info().
@@ -752,8 +769,12 @@ func (p *PartitionPruner) OptimizeTablePath(ctx context.Context, originalPath, s
 		result = partitionPaths
 	}
 
-	// Cache the result
-	p.partitionCache.set(cacheKey, result, true)
+	// Cache the result — except when file-level expansion happened: an
+	// explicit file list is stale the moment the next flush lands, and the
+	// per-query re-glob it forces instead is a few ms.
+	if !fileExpanded {
+		p.partitionCache.set(cacheKey, result, true)
+	}
 	return result, true
 }
 
