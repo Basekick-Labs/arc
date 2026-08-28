@@ -159,6 +159,9 @@ type matchResult struct {
 	bucketCol  string
 	// agg-3: emit `ORDER BY <key position>` (ascending) in the engine SQL.
 	orderByKey bool
+	// agg-3b epoch-math bucket: width secs (0 = not this form) + mandatory alias.
+	epochWidthSecs int
+	bucketAlias    string
 }
 
 // eligibleShape recognizes the arcx shapes on the raw user SQL. ok=false means
@@ -218,14 +221,16 @@ func eligibleShape(sql string) (matchResult, bool) {
 	// matchers above).
 	if gm, ok := matchGroupedAgg(toks); ok {
 		return matchResult{
-			shape:       ShapeScanAggGrouped,
-			aggItems:    gm.items,
-			groupKey:    gm.key,
-			bucketUnit:  gm.bucketUnit,
-			bucketCol:   gm.bucketCol,
-			orderByKey:  gm.orderByKey,
-			whereText:   gm.whereText,
-			measurement: gm.meas,
+			shape:          ShapeScanAggGrouped,
+			aggItems:       gm.items,
+			groupKey:       gm.key,
+			bucketUnit:     gm.bucketUnit,
+			bucketCol:      gm.bucketCol,
+			epochWidthSecs: gm.epochWidthSecs,
+			bucketAlias:    gm.bucketAlias,
+			orderByKey:     gm.orderByKey,
+			whereText:      gm.whereText,
+			measurement:    gm.meas,
 		}, true
 	}
 	// Scan is tried LAST: it's the broadest shape (a bare column list matches many

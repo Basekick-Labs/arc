@@ -90,7 +90,30 @@ func TestBuildGroupedSQL(t *testing.T) {
 	if !ok || got != want {
 		t.Fatalf("got (%q, %t), want %q", got, ok, want)
 	}
+	// agg-3b epoch-math bucket: rebuilt from validated parts, alias included.
+	got, ok = buildGroupedSQL(Decision{
+		AggItems:       []string{"to_timestamp((epoch_ns(time) // 1000000000 // 300) * 300) AS time", "avg(cpu_user)"},
+		GroupKey:       "to_timestamp((epoch_ns(time) // 1000000000 // 300) * 300) AS time",
+		EpochWidthSecs: 300,
+		BucketCol:      "time",
+		BucketAlias:    "time",
+		OrderByKey:     true,
+	}, paths)
+	want = "SELECT to_timestamp((epoch_ns(time) // 1000000000 // 300) * 300) AS time, avg(cpu_user) FROM read_parquet(['/p.parquet']) GROUP BY 1 ORDER BY 1"
+	if !ok || got != want {
+		t.Fatalf("got (%q, %t), want %q", got, ok, want)
+	}
 	for _, d := range []Decision{
+		{ // epoch-math with unsafe parts must never be emitted
+			AggItems:       []string{"to_timestamp((epoch_ns(t; DROP) // 1000000000 // 300) * 300) AS time", "count(*)"},
+			GroupKey:       "to_timestamp((epoch_ns(t; DROP) // 1000000000 // 300) * 300) AS time",
+			EpochWidthSecs: 300, BucketCol: "t; DROP", BucketAlias: "time",
+		},
+		{
+			AggItems:       []string{"to_timestamp((epoch_ns(time) // 1000000000 // 300) * 300) AS x; DROP", "count(*)"},
+			GroupKey:       "to_timestamp((epoch_ns(time) // 1000000000 // 300) * 300) AS x; DROP",
+			EpochWidthSecs: 300, BucketCol: "time", BucketAlias: "x; DROP",
+		},
 		{ // unsafe bucket parts must never be emitted
 			AggItems:   []string{"date_trunc('week', time)", "count(*)"},
 			GroupKey:   "date_trunc('week', time)",
