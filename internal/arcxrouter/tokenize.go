@@ -20,12 +20,13 @@ import (
 type tokKind int
 
 const (
-	tokIdent tokKind = iota // keyword or identifier, incl. dotted db.measurement
-	tokStr                  // single-quoted string literal (date_trunc unit, WHERE string literal)
-	tokNum                  // integer literal (GROUP BY 1, WHERE numeric literal, optional leading -)
-	tokFloat                // decimal float literal `digit.digit` (WHERE DOUBLE eq, optional leading -)
-	tokPunct                // one of ( ) * ,
-	tokOp                   // comparison operator: = != <> < <= > >= (scan WHERE)
+	tokIdent  tokKind = iota // keyword or identifier, incl. dotted db.measurement
+	tokStr                   // single-quoted string literal (date_trunc unit, WHERE string literal)
+	tokNum                   // integer literal (GROUP BY 1, WHERE numeric literal, optional leading -)
+	tokFloat                 // decimal float literal `digit.digit` (WHERE DOUBLE eq, optional leading -)
+	tokPunct                 // one of ( ) * ,
+	tokOp                    // comparison operator: = != <> < <= > >= (scan WHERE)
+	tokIntDiv                // `//` — DuckDB integer (trunc) division, lexed GREEDILY (agg-3b)
 )
 
 type token struct {
@@ -59,6 +60,15 @@ func tokenize(sql string) ([]token, bool) {
 				return nil, false
 			}
 			i = n
+		case c == '/' && i+1 < n && b[i+1] == '/':
+			// `//` (ADJACENT) is DuckDB's integer-trunc division — one token
+			// (agg-3b). A spaced `/ /` is a DuckDB Parser Error (oracle-probed),
+			// and whitespace is otherwise discarded here, so greedy lexing is the
+			// only place adjacency can be enforced — the same lesson as the 2e
+			// `--` comment CRITICAL. The spaced form stays two Puncts and no
+			// shape consumes them, so it declines.
+			toks = append(toks, token{kind: tokIntDiv})
+			i += 2
 		case c == '(' || c == ')' || c == '*' || c == ',' || c == '+' || c == '/':
 			// `+`/`/` for 2e DOUBLE arith in WHERE (`*` was already here for SELECT *
 			// / count(*) AND doubles as arith-multiply by position, same as the engine).
@@ -747,7 +757,73 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 			return fail()
 		}
 		isCall := c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '('
-		if isCall && t.lower == "date_trunc" {
+		if isCall && t.lower == "to_timestamp" {
+			// The epoch-math time-bucket KEY item (agg-3b) — EXACTLY the Grafana
+			// `$__timeGroup` emission, token for token:
+			//   to_timestamp((epoch_ns(<col>) // 1000000000 // N) * N) AS <alias>
+			// Both N literals must match, N ∈ [1, 31_622_400]; the alias is
+			// MANDATORY (Grafana's time-series frame needs a column named `time`;
+			// the unaliased form would need DuckDB's mangled derived name
+			// reproduced). The builder re-emits from the validated parts.
+			if keyItem >= 0 {
+				return fail()
+			}
+			c.i++ // consume '('
+			if !c.punct('(') || !c.ident("epoch_ns") || !c.punct('(') {
+				return fail()
+			}
+			bc, tok := c.next()
+			if !tok || bc.kind != tokIdent || isScanKeyword(bc.lower) || !isBareIdent(bc.orig) {
+				return fail()
+			}
+			if !c.punct(')') {
+				return fail()
+			}
+			if c.i >= len(c.toks) || c.toks[c.i].kind != tokIntDiv {
+				return fail()
+			}
+			c.i++
+			nt, tok := c.next()
+			if !tok || nt.kind != tokNum || nt.orig != "1000000000" {
+				return fail()
+			}
+			if c.i >= len(c.toks) || c.toks[c.i].kind != tokIntDiv {
+				return fail()
+			}
+			c.i++
+			wt, tok := c.next()
+			if !tok || wt.kind != tokNum {
+				return fail()
+			}
+			secs, err := strconv.Atoi(wt.orig)
+			if err != nil || secs < 1 || secs > 31_622_400 {
+				return fail()
+			}
+			if !c.punct(')') {
+				return fail()
+			}
+			if c.i >= len(c.toks) || c.toks[c.i].kind != tokPunct || c.toks[c.i].punct != '*' {
+				return fail()
+			}
+			c.i++
+			wt2, tok := c.next()
+			if !tok || wt2.kind != tokNum || wt2.orig != wt.orig {
+				return fail() // width literals must MATCH — else a different expression
+			}
+			if !c.punct(')') || !c.ident("as") {
+				return fail()
+			}
+			al, tok := c.next()
+			if !tok || al.kind != tokIdent || isScanKeyword(al.lower) || !isBareIdent(al.orig) {
+				return fail()
+			}
+			m.epochWidthSecs = secs
+			m.bucketCol = bc.orig
+			m.bucketAlias = al.orig
+			keyItem = len(items)
+			key = "to_timestamp((epoch_ns(" + bc.orig + ") // 1000000000 // " + wt.orig + ") * " + wt.orig + ") AS " + al.orig
+			items = append(items, key)
+		} else if isCall && t.lower == "date_trunc" {
 			// The time-bucket KEY item (agg-3). One per query; fixed-width units
 			// only (the engine declines calendar units).
 			if keyItem >= 0 {
@@ -838,19 +914,26 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 	if !c.ident("group") || !c.ident("by") {
 		return fail()
 	}
-	// A key reference: the key's position, or (bare keys only — a bucket's text
-	// is not an identifier) its name.
-	keyRef := func(kt token) bool {
+	// Key references are ASYMMETRIC (oracle-probed at agg-3b): in GROUP BY,
+	// DuckDB binds a bare ident to the RAW COLUMN (so an alias never resolves
+	// there — position or bare-key name only); in ORDER BY it binds the ALIAS.
+	groupRef := func(kt token) bool {
 		switch kt.kind {
 		case tokIdent:
-			return m.bucketUnit == "" && strings.EqualFold(kt.orig, key)
+			return m.bucketUnit == "" && m.epochWidthSecs == 0 && strings.EqualFold(kt.orig, key)
 		case tokNum:
 			return kt.orig == strconv.Itoa(keyItem+1)
 		}
 		return false
 	}
+	orderRef := func(kt token) bool {
+		if kt.kind == tokIdent && m.bucketAlias != "" {
+			return strings.EqualFold(kt.orig, m.bucketAlias)
+		}
+		return groupRef(kt)
+	}
 	kt, tok := c.next()
-	if !tok || !keyRef(kt) {
+	if !tok || !groupRef(kt) {
 		return fail()
 	}
 	// Optional `ORDER BY <key ref> [ASC]` (agg-3): the engine sorts the single
@@ -861,7 +944,7 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 			return fail()
 		}
 		ot, tok := c.next()
-		if !tok || !keyRef(ot) {
+		if !tok || !orderRef(ot) {
 			return fail()
 		}
 		if c.peekIdentLower() == "asc" {
@@ -893,6 +976,10 @@ type groupedMatch struct {
 	bucketUnit string
 	bucketCol  string
 	orderByKey bool
+	// agg-3b epoch-math bucket: width in whole seconds (0 = not this form) and
+	// the MANDATORY alias — validated parts the builder re-emits.
+	epochWidthSecs int
+	bucketAlias    string
 }
 
 // fixedWidthUnits is the engine's agg-3 bucket set — pure UTC epoch division

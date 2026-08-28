@@ -114,6 +114,10 @@ type Decision struct {
 	BucketUnit string
 	BucketCol  string
 	OrderByKey bool // agg-3: append `ORDER BY <key position>` (ascending)
+	// agg-3b epoch-math bucket: width in whole seconds (0 = not this form) and
+	// the mandatory alias — the builder re-emits from these validated parts.
+	EpochWidthSecs int
+	BucketAlias    string
 }
 
 // Decide is the cheap per-query pre-filter. It never calls the engine; it only
@@ -146,19 +150,21 @@ func Decide(sql, headerDB string, h Handler) Decision {
 			// would be a bypass around Arc's CVE fix.
 			AllowedDirs: h.AllowedDirs,
 		},
-		Shape:      m.shape,
-		Unit:       m.unit,
-		Col:        m.col,
-		Cols:       m.cols,
-		Preds:      m.preds,
-		WhereText:  m.whereText,
-		OrderBy:    m.orderBy,
-		Limit:      m.limit,
-		AggItems:   m.aggItems,
-		GroupKey:   m.groupKey,
-		BucketUnit: m.bucketUnit,
-		BucketCol:  m.bucketCol,
-		OrderByKey: m.orderByKey,
+		Shape:          m.shape,
+		Unit:           m.unit,
+		Col:            m.col,
+		Cols:           m.cols,
+		Preds:          m.preds,
+		WhereText:      m.whereText,
+		OrderBy:        m.orderBy,
+		Limit:          m.limit,
+		AggItems:       m.aggItems,
+		GroupKey:       m.groupKey,
+		BucketUnit:     m.bucketUnit,
+		BucketCol:      m.bucketCol,
+		OrderByKey:     m.orderByKey,
+		EpochWidthSecs: m.epochWidthSecs,
+		BucketAlias:    m.bucketAlias,
 	}
 }
 
@@ -352,6 +358,15 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 	var keyText string
 	var keyPos int
 	switch {
+	case d.EpochWidthSecs != 0:
+		// agg-3b: rebuild the exact Grafana emission + alias from validated
+		// parts (width in range, bare-ident col and alias) — never source text.
+		if d.EpochWidthSecs < 1 || d.EpochWidthSecs > 31_622_400 ||
+			!isBareIdent(d.BucketCol) || !isBareIdent(d.BucketAlias) {
+			return "", false
+		}
+		w := strconv.Itoa(d.EpochWidthSecs)
+		keyText = "to_timestamp((epoch_ns(" + d.BucketCol + ") // 1000000000 // " + w + ") * " + w + ") AS " + d.BucketAlias
 	case d.BucketUnit != "":
 		if !fixedWidthUnits[strings.ToLower(d.BucketUnit)] || !isBareIdent(d.BucketCol) {
 			return "", false

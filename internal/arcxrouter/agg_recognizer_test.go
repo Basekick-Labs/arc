@@ -191,3 +191,59 @@ func TestGroupedAggDeclines(t *testing.T) {
 		}
 	}
 }
+
+func TestEpochMathBucketRecognized(t *testing.T) {
+	// agg-3b: the exact Grafana $__timeGroup emission (mandatory alias; the
+	// time-series frame needs a column named `time`).
+	em := "to_timestamp((epoch_ns(time) // 1000000000 // 300) * 300) AS time"
+	cases := []struct {
+		sql        string
+		orderByKey bool
+	}{
+		{"SELECT " + em + ", avg(cpu_user) FROM cpu WHERE time >= '2026-08-13T00:00:00Z' AND time < '2026-08-14T00:00:00Z' GROUP BY 1 ORDER BY time", true},
+		{"SELECT " + em + ", count(*), avg(cpu_user) FROM cpu GROUP BY 1 ORDER BY 1", true},
+		{"SELECT " + em + ", avg(cpu_user) FROM cpu GROUP BY 1 ORDER BY time ASC", true},
+		{"SELECT " + em + ", avg(cpu_user) FROM cpu GROUP BY 1", false},
+	}
+	for _, c := range cases {
+		m, ok := eligibleShape(c.sql)
+		if !ok || m.shape != ShapeScanAggGrouped {
+			t.Fatalf("should be scan_agg_grouped: %s (got %q, %t)", c.sql, m.shape, ok)
+		}
+		if m.epochWidthSecs != 300 || m.bucketCol != "time" || m.bucketAlias != "time" {
+			t.Fatalf("parts = %d/%q/%q: %s", m.epochWidthSecs, m.bucketCol, m.bucketAlias, c.sql)
+		}
+		if m.orderByKey != c.orderByKey {
+			t.Fatalf("orderByKey = %t, want %t: %s", m.orderByKey, c.orderByKey, c.sql)
+		}
+	}
+}
+
+func TestEpochMathBucketDeclines(t *testing.T) {
+	for _, sql := range []string{
+		// A SPACED `/ /` is a DuckDB Parser Error — must never lex as `//` (the
+		// 2e `--` comment adjacency class; greedy lexer pin).
+		"SELECT to_timestamp((epoch_ns(time) / / 1000000000 // 300) * 300) AS time, avg(x) FROM cpu GROUP BY 1",
+		"SELECT to_timestamp((epoch_ns(time) // 1000000000 / / 300) * 300) AS time, avg(x) FROM cpu GROUP BY 1",
+		// Width literals must match (a different, legal expression otherwise).
+		"SELECT to_timestamp((epoch_ns(time) // 1000000000 // 300) * 600) AS time, avg(x) FROM cpu GROUP BY 1",
+		// Unaliased form declines (derived-name reproduction not worth it).
+		"SELECT to_timestamp((epoch_ns(time) // 1000000000 // 300) * 300), avg(x) FROM cpu GROUP BY 1",
+		// GROUP BY <alias>: DuckDB binds the RAW column there (oracle-probed) —
+		// only positional GROUP BY is safe.
+		"SELECT to_timestamp((epoch_ns(time) // 1000000000 // 300) * 300) AS b, avg(x) FROM cpu GROUP BY b",
+		// Width out of range / zero.
+		"SELECT to_timestamp((epoch_ns(time) // 1000000000 // 0) * 0) AS time, avg(x) FROM cpu GROUP BY 1",
+		"SELECT to_timestamp((epoch_ns(time) // 1000000000 // 99999999) * 99999999) AS time, avg(x) FROM cpu GROUP BY 1",
+		// Wrong ns divisor.
+		"SELECT to_timestamp((epoch_ns(time) // 1000000 // 300) * 300) AS time, avg(x) FROM cpu GROUP BY 1",
+		// Two bucket items.
+		"SELECT to_timestamp((epoch_ns(time) // 1000000000 // 300) * 300) AS a, date_trunc('minute', time), avg(x) FROM cpu GROUP BY 1, 2",
+		// ORDER BY DESC still declines.
+		"SELECT to_timestamp((epoch_ns(time) // 1000000000 // 300) * 300) AS time, avg(x) FROM cpu GROUP BY 1 ORDER BY time DESC",
+	} {
+		if m, ok := eligibleShape(sql); ok && m.shape == ShapeScanAggGrouped {
+			t.Fatalf("must not match scan_agg_grouped: %s", sql)
+		}
+	}
+}
