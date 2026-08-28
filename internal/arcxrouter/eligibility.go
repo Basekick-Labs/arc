@@ -153,6 +153,12 @@ type matchResult struct {
 	// scan_agg_grouped_count only: the single group-key column (as written).
 	// aggItems then holds the select list ("count(*)" or the key), in order.
 	groupKey string
+	// agg-3 bucket key: the validated date_trunc parts (empty = a bare tag key).
+	// The SQL builder re-emits from THESE, never from groupKey's text.
+	bucketUnit string
+	bucketCol  string
+	// agg-3: emit `ORDER BY <key position>` (ascending) in the engine SQL.
+	orderByKey bool
 }
 
 // eligibleShape recognizes the arcx shapes on the raw user SQL. ok=false means
@@ -210,13 +216,16 @@ func eligibleShape(sql string) (matchResult, bool) {
 	// slice optional WHERE). Tried before the scan (a bare-column-led grouped
 	// select would fail the scan anyway; count-led ones fall through the agg
 	// matchers above).
-	if items, key, whereText, meas, ok := matchGroupedAgg(toks); ok {
+	if gm, ok := matchGroupedAgg(toks); ok {
 		return matchResult{
 			shape:       ShapeScanAggGrouped,
-			aggItems:    items,
-			groupKey:    key,
-			whereText:   whereText,
-			measurement: meas,
+			aggItems:    gm.items,
+			groupKey:    gm.key,
+			bucketUnit:  gm.bucketUnit,
+			bucketCol:   gm.bucketCol,
+			orderByKey:  gm.orderByKey,
+			whereText:   gm.whereText,
+			measurement: gm.meas,
 		}, true
 	}
 	// Scan is tried LAST: it's the broadest shape (a bare column list matches many

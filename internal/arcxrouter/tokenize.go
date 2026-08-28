@@ -719,15 +719,25 @@ func matchScanAgg(toks []token) (items []string, whereText string, meas string, 
 // `count|sum|min|max|avg(<bare col>)`), any item order, an optional WHERE
 // through the same `reserializeWhere` boolean-tree surface the scan/agg shapes
 // use (injection-proof: emitted text is rebuilt from validated tokens, never
-// sliced from the source), nothing after the GROUP BY. Items are re-serialized
-// from validated tokens (fn lowercased, ARG spelling preserved — derived-name
-// parity); the key's spelling is preserved.
-func matchGroupedAgg(toks []token) (items []string, key string, whereText string, meas string, ok bool) {
+// sliced from the source). Items are re-serialized from validated tokens (fn
+// lowercased, ARG spelling preserved — derived-name parity); the key's spelling
+// is preserved.
+//
+// agg-3 widened the key: EITHER a bare tag column OR one time-bucket item
+// `date_trunc('<unit>', <bare col>)` with unit in the engine's fixed-width set
+// (second/minute/hour/day — bucketUnit/bucketCol return the validated parts and
+// the builder re-emits them, never the source text). An optional trailing
+// `ORDER BY <key pos|key name> [ASC]` is accepted (the engine sorts ascending,
+// NULLS LAST); DESC/LIMIT/multi-key ORDER decline. Non-UTC sessions never get
+// here — the M3 tz-injection gate runs before shape matching (gotcha #3).
+func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 	c := &cursor{toks: toks}
 	if !c.ident("select") {
-		return nil, "", "", "", false
+		return groupedMatch{}, false
 	}
-	fail := func() ([]string, string, string, string, bool) { return nil, "", "", "", false }
+	fail := func() (groupedMatch, bool) { return groupedMatch{}, false }
+	var items []string
+	var key, whereText, meas string
 
 	keyItem := -1
 	nAggs := 0
@@ -737,7 +747,33 @@ func matchGroupedAgg(toks []token) (items []string, key string, whereText string
 			return fail()
 		}
 		isCall := c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == '('
-		if isCall {
+		if isCall && t.lower == "date_trunc" {
+			// The time-bucket KEY item (agg-3). One per query; fixed-width units
+			// only (the engine declines calendar units).
+			if keyItem >= 0 {
+				return fail()
+			}
+			c.i++ // consume '('
+			ut, tok := c.next()
+			if !tok || ut.kind != tokStr || !fixedWidthUnits[strings.ToLower(ut.str)] {
+				return fail()
+			}
+			if !c.punct(',') {
+				return fail()
+			}
+			bc, tok := c.next()
+			if !tok || bc.kind != tokIdent || isScanKeyword(bc.lower) || !isBareIdent(bc.orig) {
+				return fail()
+			}
+			if !c.punct(')') {
+				return fail()
+			}
+			m.bucketUnit = ut.str
+			m.bucketCol = bc.orig
+			keyItem = len(items)
+			key = "date_trunc('" + ut.str + "', " + bc.orig + ")"
+			items = append(items, key)
+		} else if isCall {
 			switch t.lower {
 			case "count", "sum", "min", "max", "avg":
 			default:
@@ -802,26 +838,71 @@ func matchGroupedAgg(toks []token) (items []string, key string, whereText string
 	if !c.ident("group") || !c.ident("by") {
 		return fail()
 	}
+	// A key reference: the key's position, or (bare keys only — a bucket's text
+	// is not an identifier) its name.
+	keyRef := func(kt token) bool {
+		switch kt.kind {
+		case tokIdent:
+			return m.bucketUnit == "" && strings.EqualFold(kt.orig, key)
+		case tokNum:
+			return kt.orig == strconv.Itoa(keyItem+1)
+		}
+		return false
+	}
 	kt, tok := c.next()
-	if !tok {
+	if !tok || !keyRef(kt) {
 		return fail()
 	}
-	switch kt.kind {
-	case tokIdent:
-		if !strings.EqualFold(kt.orig, key) {
+	// Optional `ORDER BY <key ref> [ASC]` (agg-3): the engine sorts the single
+	// key ascending, NULLS LAST. DESC / LIMIT / anything else after declines.
+	if c.peekIdentLower() == "order" {
+		c.next()
+		if !c.ident("by") {
 			return fail()
 		}
-	case tokNum:
-		if kt.orig != strconv.Itoa(keyItem+1) {
+		ot, tok := c.next()
+		if !tok || !keyRef(ot) {
 			return fail()
 		}
-	default:
-		return fail()
+		if c.peekIdentLower() == "asc" {
+			c.next()
+		}
+		m.orderByKey = true
 	}
 	if !c.atEnd() {
 		return fail()
 	}
-	return items, key, whereText, meas, true
+	m.items = items
+	m.key = key
+	m.keyItem = keyItem
+	m.whereText = whereText
+	m.meas = meas
+	return m, true
+}
+
+// groupedMatch is matchGroupedAgg's result: the re-serialized select items, the
+// key (a bare column, or the rebuilt bucket text when bucketUnit != ""), the
+// key's select-list index, and the validated bucket parts the SQL builder
+// re-emits (never source text).
+type groupedMatch struct {
+	items      []string
+	key        string
+	keyItem    int
+	whereText  string
+	meas       string
+	bucketUnit string
+	bucketCol  string
+	orderByKey bool
+}
+
+// fixedWidthUnits is the engine's agg-3 bucket set — pure UTC epoch division
+// (day = 86,400s; no DST in UTC). Calendar units (week/month/year) decline;
+// count-only month/year stays on the footer date_trunc_count shape.
+var fixedWidthUnits = map[string]bool{
+	"second": true,
+	"minute": true,
+	"hour":   true,
+	"day":    true,
 }
 
 func matchScan(toks []token) (cols []string, preds []scanPred, whereText string, orderBy []scanOrderKey, limit int, meas string, ok bool) {
