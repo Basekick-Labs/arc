@@ -137,9 +137,17 @@ type Puller struct {
 	mu      sync.Mutex
 	started bool
 
+	// reconciliationMu serializes manifest walks. The startup catch-up and
+	// periodic reconciliation share the same walker, so a periodic pass can
+	// never overlap another pass even if it is triggered concurrently.
+	reconciliationMu      sync.Mutex
+	reconciliationStarted bool
+	catchupFinished       chan struct{}
+
 	// inflight tracks paths currently enqueued or being processed. Enqueue
-	// consults it to dedup reactive callbacks against the Phase 3 catch-up
-	// walker (both can enqueue the same path during a race), and workers
+	// consults it to dedup reactive callbacks against manifest walkers (both
+	// startup and periodic passes can enqueue the same path during a race).
+	// Workers
 	// remove the entry via defer in processEntry so the set stays bounded
 	// even on panic.
 	//
@@ -256,6 +264,7 @@ func New(cfg Config) (*Puller, error) {
 		catchupPaths:        make(map[string]struct{}),
 		catchupFailedPaths:  make(map[string]struct{}),
 		catchupDroppedPaths: make(map[string]struct{}),
+		catchupFinished:     make(chan struct{}),
 		logger:              cfg.Logger.With().Str("component", "file-puller").Logger(),
 	}, nil
 }
@@ -426,9 +435,56 @@ func (p *Puller) Start(parentCtx context.Context) {
 		Msg("File puller started")
 }
 
+// StartPeriodicReconciliation starts the repeatable manifest reconciliation
+// loop. The loop waits for the one-shot startup catch-up attempt to finish,
+// then runs once per interval. It is owned by the puller so Stop waits for a
+// pass that is already walking the manifest before returning.
+func (p *Puller) StartPeriodicReconciliation(fetch func(cursor string, limit int) ([]*raft.FileEntry, string, error)) {
+	p.startPeriodicReconciliation(fetch, 5*time.Minute)
+}
+
+// startPeriodicReconciliation is split out so tests can use a short interval
+// without adding a public configuration surface for a fixed lifecycle timer.
+func (p *Puller) startPeriodicReconciliation(fetch func(cursor string, limit int) ([]*raft.FileEntry, string, error), interval time.Duration) {
+	p.mu.Lock()
+	if !p.started || p.reconciliationStarted {
+		p.mu.Unlock()
+		return
+	}
+	p.reconciliationStarted = true
+	ctx := p.ctx
+	p.wg.Add(1)
+	p.mu.Unlock()
+
+	go func() {
+		defer p.wg.Done()
+		select {
+		case <-p.catchupFinished:
+		case <-ctx.Done():
+			return
+		}
+
+		if interval <= 0 {
+			interval = 5 * time.Minute
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if !p.RunReconciliation(ctx, fetch) {
+					p.logger.Debug().Msg("File puller reconciliation already running, skipping periodic pass")
+				}
+			}
+		}
+	}()
+}
+
 // Stop signals all workers to exit and waits for them to finish. In-flight
 // pulls are cancelled via the shared context. Pending queue entries are
-// dropped (Phase 3 catch-up or a later FSM callback will re-discover them).
+// dropped (a later manifest pass or FSM callback will re-discover them).
 func (p *Puller) Stop() {
 	p.mu.Lock()
 	if !p.started {

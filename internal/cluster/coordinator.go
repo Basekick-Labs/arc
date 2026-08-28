@@ -2356,14 +2356,19 @@ func (c *Coordinator) startFilePullerLocked() error {
 		Int("delete_queue_size", deleteQueueSize).
 		Msg("Peer file replication puller started")
 
-	// Phase 3: kick off the catch-up walker in a background goroutine so
-	// Start() doesn't block on a potentially slow manifest walk. Queries can
+	// Phase 3: kick off the one-shot catch-up walker in a background goroutine
+	// so Start() doesn't block on a potentially slow manifest walk. Queries can
 	// hit the node during catch-up — they see eventually-consistent results
-	// and operators read /api/v1/cluster/status for progress. The walker is
-	// gated on cluster.replication_catchup_enabled so operators can disable
-	// it as an emergency kill-switch on pathologically large manifests.
+	// and operators read /api/v1/cluster/status for progress. The startup walk
+	// and the periodic walk share the same paginated feeder, but only the
+	// startup walk participates in the #392 readiness bookkeeping.
+	// Both are gated on cluster.replication_catchup_enabled so operators can
+	// disable the replication safety net as an emergency kill-switch.
 	if c.cfg.ReplicationCatchUpEnabled {
 		go c.runCatchUpOnce()
+		puller.StartPeriodicReconciliation(func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
+			return fsm.GetFilesPaginated(cursor, limit)
+		})
 	} else {
 		c.logger.Warn().Msg("Peer file replication catch-up disabled via config (replication_catchup_enabled=false)")
 	}
@@ -2389,7 +2394,8 @@ func (c *Coordinator) startFilePullerLocked() error {
 // any entries the walker missed as they apply.
 func (c *Coordinator) runCatchUpOnce() {
 	c.catchupOnce.Do(func() {
-		if c.puller == nil || c.raftNode == nil {
+		puller := c.puller
+		if puller == nil || c.raftNode == nil {
 			return
 		}
 
@@ -2436,7 +2442,7 @@ func (c *Coordinator) runCatchUpOnce() {
 		// stable for the lifetime of the node — hashicorp/raft never
 		// replaces the FSM instance once set. The nil guard above ensures
 		// the capture is safe even if the puller outlives the coordinator.
-		c.puller.RunCatchUp(ctx, func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
+		puller.RunCatchUp(ctx, func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
 			return fsm.GetFilesPaginated(cursor, limit)
 		})
 	})

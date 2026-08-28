@@ -2,6 +2,17 @@
 
 > **Status:** Released 2026-08-31.
 
+## New: periodic peer file replication reconciliation
+
+Cluster nodes now re-walk the Raft file manifest every five minutes after the
+startup catch-up attempt. The pass uses the existing paginated manifest walk,
+pull queue, deduplication, retries, checksum verification, and local-file
+checks, so a missed reactive callback can be repaired without restarting the
+node. Startup catch-up remains a one-shot operation and keeps its existing
+`catchup_*` readiness and query-gate semantics. The existing
+`cluster.replication_catchup_enabled` switch disables both startup and
+periodic reconciliation.
+
 ## New: Apache Iceberg export (opt-in)
 
 Arc can now publish its data as **Apache Iceberg tables** so any Iceberg-aware engine — Spark, Trino, DuckDB, Snowflake, PyIceberg — can query Arc's data directly, without going through Arc's API. This is the strongest form of the "your data, no lock-in" promise: Arc already writes open Parquet files you own; now those same files are also a standard Iceberg lakehouse table.
