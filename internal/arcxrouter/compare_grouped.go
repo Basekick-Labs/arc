@@ -1,10 +1,11 @@
-// Shadow comparison for the allow-listed grouped class (agg-2b/2c): N rows of
-// (single group key, agg-1 aggregate columns). Both sides sort by the TYPED key
-// part (plan F5: never a joined string; a single key makes this one part — Utf8
-// or Int64, NULL ordered first), then compare row-wise with the per-item agg
-// policy: keys and counts/min/max exact (float min/max ±0.0-equal, two NaNs
-// equal), float sum/avg within the documented 1e-9 tolerance, integer sums via
-// big.Int. Diffs stay value-free.
+// Shadow comparison for the allow-listed grouped class (agg-2b/2c → agg-3c
+// multi-key): N rows of (key part(s), agg-1 aggregate columns). Both sides sort
+// by the TYPED key-part TUPLE (plan F5: never a joined string; parts compare
+// element-wise in key-column order, NULL parts ordered first), then compare
+// row-wise with the per-item agg policy: keys and counts/min/max exact (float
+// min/max ±0.0-equal, two NaNs equal), float sum/avg within the documented
+// 1e-9 tolerance, integer sums via big.Int. Timestamp key parts (agg-3 buckets)
+// compare as typed epoch-µs on both sides. Diffs stay value-free.
 
 //go:build cgo && arcx_engine
 
@@ -22,75 +23,123 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 )
 
-// groupedRow is one comparable row: the key part (typed) plus the aggregate
-// cells in column order (reusing compare_agg's aggCell + policies).
+// keyPart is one typed component of a group key tuple: a Utf8 tag value or an
+// Int64/epoch-µs bucket. NULL is distinct from ”/0 (isNull); NULL parts are
+// normalized to isI=false on BOTH sides before comparison (the DuckDB side
+// cannot observe a NULL's column type).
+type keyPart struct {
+	isNull bool
+	isI    bool
+	s      string
+	i      int64
+}
+
+// groupedRow is one comparable row: the key parts in KEY-COLUMN order plus the
+// aggregate cells in column order (reusing compare_agg's aggCell + policies).
 type groupedRow struct {
-	keyNull bool
-	keyStr  string
-	keyInt  int64
-	keyIsI  bool
-	cells   []aggCell
+	keys  []keyPart
+	cells []aggCell
+}
+
+func keyPartLess(a, b *keyPart) bool {
+	if a.isNull != b.isNull {
+		return a.isNull
+	}
+	if a.isNull {
+		return false
+	}
+	if a.isI {
+		return a.i < b.i
+	}
+	return a.s < b.s
+}
+
+func keyPartEq(a, b *keyPart) bool {
+	if a.isNull != b.isNull || a.isI != b.isI {
+		return false
+	}
+	if a.isNull {
+		return true
+	}
+	if a.isI {
+		return a.i == b.i
+	}
+	return a.s == b.s
 }
 
 func groupedLess(a, b *groupedRow) bool {
-	if a.keyNull != b.keyNull {
-		return a.keyNull
+	for k := range a.keys {
+		if k >= len(b.keys) {
+			return false
+		}
+		if !keyPartEq(&a.keys[k], &b.keys[k]) {
+			return keyPartLess(&a.keys[k], &b.keys[k])
+		}
 	}
-	if a.keyIsI {
-		return a.keyInt < b.keyInt
-	}
-	return a.keyStr < b.keyStr
+	return false
 }
 
 func groupedKeyEq(a, b *groupedRow) bool {
-	if a.keyNull != b.keyNull || a.keyIsI != b.keyIsI {
+	if len(a.keys) != len(b.keys) {
 		return false
 	}
-	if a.keyNull {
-		return true
+	for k := range a.keys {
+		if !keyPartEq(&a.keys[k], &b.keys[k]) {
+			return false
+		}
 	}
-	if a.keyIsI {
-		return a.keyInt == b.keyInt
-	}
-	return a.keyStr == b.keyStr
+	return true
 }
 
-func groupedFromArcx(rec arrow.Record, keyCol int) ([]groupedRow, error) {
+func isKeyCol(keyCols []int, c int) bool {
+	for _, k := range keyCols {
+		if k == c {
+			return true
+		}
+	}
+	return false
+}
+
+func groupedFromArcx(rec arrow.Record, keyCols []int) ([]groupedRow, error) {
 	ncols := int(rec.NumCols())
-	if keyCol >= ncols {
-		return nil, fmt.Errorf("arcx grouped: key col %d out of %d", keyCol, ncols)
+	for _, k := range keyCols {
+		if k >= ncols {
+			return nil, fmt.Errorf("arcx grouped: key col %d out of %d", k, ncols)
+		}
 	}
 	out := make([]groupedRow, rec.NumRows())
 	for r := range out {
 		row := &out[r]
 		for c := 0; c < ncols; c++ {
-			if c == keyCol {
+			if isKeyCol(keyCols, c) {
+				var p keyPart
 				switch col := rec.Column(c).(type) {
 				case *array.String:
 					if col.IsNull(r) {
-						row.keyNull = true
+						p.isNull = true
 					} else {
-						row.keyStr = col.Value(r)
+						p.s = col.Value(r)
 					}
 				case *array.Int64:
-					row.keyIsI = true
+					p.isI = true
 					if col.IsNull(r) {
-						row.keyNull = true
+						p.isNull = true
 					} else {
-						row.keyInt = col.Value(r)
+						p.i = col.Value(r)
 					}
 				// agg-3 bucket key: compare as epoch µs (typed, never a string).
 				case *array.Timestamp:
-					row.keyIsI = true
+					p.isI = true
 					if col.IsNull(r) {
-						row.keyNull = true
+						p.isNull = true
 					} else {
 						unit := col.DataType().(*arrow.TimestampType).Unit
-						row.keyInt = toMicros(int64(col.Value(r)), unit)
+						p.i = toMicros(int64(col.Value(r)), unit)
 					}
 				default:
 					return nil, fmt.Errorf("arcx grouped key: unexpected type %T", rec.Column(c))
 				}
+				row.keys = append(row.keys, p)
 				continue
 			}
 			switch col := rec.Column(c).(type) {
@@ -124,7 +173,7 @@ func groupedFromArcx(rec arrow.Record, keyCol int) ([]groupedRow, error) {
 	return out, nil
 }
 
-func groupedFromRows(rows *sql.Rows, keyCol int) ([]groupedRow, error) {
+func groupedFromRows(rows *sql.Rows, keyCols []int) ([]groupedRow, error) {
 	cols, err := rows.Columns()
 	if err != nil {
 		return nil, err
@@ -141,23 +190,25 @@ func groupedFromRows(rows *sql.Rows, keyCol int) ([]groupedRow, error) {
 		}
 		var row groupedRow
 		for c, v := range raw {
-			if c == keyCol {
+			if isKeyCol(keyCols, c) {
+				var p keyPart
 				switch x := v.(type) {
 				case nil:
-					row.keyNull = true
+					p.isNull = true
 				case string:
-					row.keyStr = x
+					p.s = x
 				case []byte:
-					row.keyStr = string(x)
+					p.s = string(x)
 				case int64:
-					row.keyIsI = true
-					row.keyInt = x
+					p.isI = true
+					p.i = x
 				case time.Time:
-					row.keyIsI = true
-					row.keyInt = x.UnixMicro()
+					p.isI = true
+					p.i = x.UnixMicro()
 				default:
 					return nil, fmt.Errorf("duckdb grouped key: unexpected type %T", v)
 				}
+				row.keys = append(row.keys, p)
 				continue
 			}
 			switch x := v.(type) {
@@ -180,25 +231,40 @@ func groupedFromRows(rows *sql.Rows, keyCol int) ([]groupedRow, error) {
 	return out, rows.Err()
 }
 
+// normalizeNullParts forces every NULL key part's isI to false on BOTH sides so
+// keyPartEq/Less never see a type mismatch on NULLs (the DuckDB side cannot
+// observe a NULL's column type; the arcx side can — align them).
+func normalizeNullParts(rows []groupedRow) {
+	for i := range rows {
+		for k := range rows[i].keys {
+			if rows[i].keys[k].isNull {
+				rows[i].keys[k].isI = false
+			}
+		}
+	}
+}
+
 // compareGrouped returns "" on match, else a short VALUE-FREE diff. `items` is
-// the select list in column order (the key item marks the key column; the rest
-// pick the per-cell policy — tolerance only for float sum/avg).
-func compareGrouped(rec arrow.Record, oracle []groupedRow, items []string, keyCol int) string {
-	got, err := groupedFromArcx(rec, keyCol)
+// the select list in column order (keyCols mark the key columns; the rest pick
+// the per-cell policy — tolerance only for float sum/avg).
+func compareGrouped(rec arrow.Record, oracle []groupedRow, items []string, keyCols []int) string {
+	got, err := groupedFromArcx(rec, keyCols)
 	if err != nil {
 		return "arcx grouped decode error: " + err.Error()
 	}
 	if len(got) != len(oracle) {
 		return fmt.Sprintf("grouped row count differs (arcx=%d duckdb=%d)", len(got), len(oracle))
 	}
-	// Cell policies in CELL order (items minus the key, order preserved).
+	// Cell policies in CELL order (items minus the keys, order preserved).
 	var tolerant []bool
 	for i, item := range items {
-		if i == keyCol {
+		if isKeyCol(keyCols, i) {
 			continue
 		}
 		tolerant = append(tolerant, aggItemTolerant(item))
 	}
+	normalizeNullParts(got)
+	normalizeNullParts(oracle)
 	sort.Slice(got, func(i, j int) bool { return groupedLess(&got[i], &got[j]) })
 	sort.Slice(oracle, func(i, j int) bool { return groupedLess(&oracle[i], &oracle[j]) })
 	for i := range got {

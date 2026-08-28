@@ -747,9 +747,10 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 	}
 	fail := func() (groupedMatch, bool) { return groupedMatch{}, false }
 	var items []string
-	var key, whereText, meas string
+	var bucketText, tagKey, whereText, meas string
 
-	keyItem := -1
+	bucketItem := -1
+	tagItem := -1
 	nAggs := 0
 	for {
 		t, tok := c.next()
@@ -765,7 +766,7 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 			// MANDATORY (Grafana's time-series frame needs a column named `time`;
 			// the unaliased form would need DuckDB's mangled derived name
 			// reproduced). The builder re-emits from the validated parts.
-			if keyItem >= 0 {
+			if bucketItem >= 0 {
 				return fail()
 			}
 			c.i++ // consume '('
@@ -820,13 +821,13 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 			m.epochWidthSecs = secs
 			m.bucketCol = bc.orig
 			m.bucketAlias = al.orig
-			keyItem = len(items)
-			key = "to_timestamp((epoch_ns(" + bc.orig + ") // 1000000000 // " + wt.orig + ") * " + wt.orig + ") AS " + al.orig
-			items = append(items, key)
+			bucketItem = len(items)
+			bucketText = "to_timestamp((epoch_ns(" + bc.orig + ") // 1000000000 // " + wt.orig + ") * " + wt.orig + ") AS " + al.orig
+			items = append(items, bucketText)
 		} else if isCall && t.lower == "date_trunc" {
 			// The time-bucket KEY item (agg-3). One per query; fixed-width units
 			// only (the engine declines calendar units).
-			if keyItem >= 0 {
+			if bucketItem >= 0 {
 				return fail()
 			}
 			c.i++ // consume '('
@@ -846,9 +847,9 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 			}
 			m.bucketUnit = ut.str
 			m.bucketCol = bc.orig
-			keyItem = len(items)
-			key = "date_trunc('" + ut.str + "', " + bc.orig + ")"
-			items = append(items, key)
+			bucketItem = len(items)
+			bucketText = "date_trunc('" + ut.str + "', " + bc.orig + ")"
+			items = append(items, bucketText)
 		} else if isCall {
 			switch t.lower {
 			case "count", "sum", "min", "max", "avg":
@@ -874,13 +875,15 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 			}
 			nAggs++
 		} else {
-			// A bare column — the single group key; a second (or repeated) bare
-			// column is outside the allow-listed class.
-			if keyItem >= 0 {
+			// A bare column — the TAG key. agg-3c allows at most ONE tag key
+			// (alongside an optional bucket): a second tag would ride the
+			// generic engine path that measured 1.4-2.4x BEHIND at corpus
+			// scale — allow-listing it routes a known loss (gotcha #5).
+			if tagItem >= 0 {
 				return fail()
 			}
-			keyItem = len(items)
-			key = t.orig
+			tagItem = len(items)
+			tagKey = t.orig
 			items = append(items, t.orig)
 		}
 		if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == ',' {
@@ -889,7 +892,8 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 		}
 		break
 	}
-	if keyItem < 0 || nAggs == 0 {
+	// At least one key of either kind + at least one aggregate.
+	if (bucketItem < 0 && tagItem < 0) || nAggs == 0 {
 		return fail()
 	}
 	if !c.ident("from") {
@@ -916,66 +920,108 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 	}
 	// Key references are ASYMMETRIC (oracle-probed at agg-3b): in GROUP BY,
 	// DuckDB binds a bare ident to the RAW COLUMN (so an alias never resolves
-	// there — position or bare-key name only); in ORDER BY it binds the ALIAS.
-	groupRef := func(kt token) bool {
+	// there — position, or the TAG key's bare name only); in ORDER BY it binds
+	// the ALIAS. Each ref resolves to a key ITEM index, or -1.
+	groupRef := func(kt token) int {
 		switch kt.kind {
 		case tokIdent:
-			return m.bucketUnit == "" && m.epochWidthSecs == 0 && strings.EqualFold(kt.orig, key)
+			if tagItem >= 0 && strings.EqualFold(kt.orig, tagKey) {
+				return tagItem
+			}
 		case tokNum:
-			return kt.orig == strconv.Itoa(keyItem+1)
+			if bucketItem >= 0 && kt.orig == strconv.Itoa(bucketItem+1) {
+				return bucketItem
+			}
+			if tagItem >= 0 && kt.orig == strconv.Itoa(tagItem+1) {
+				return tagItem
+			}
 		}
-		return false
+		return -1
 	}
-	orderRef := func(kt token) bool {
-		if kt.kind == tokIdent && m.bucketAlias != "" {
-			return strings.EqualFold(kt.orig, m.bucketAlias)
+	orderRef := func(kt token) int {
+		if kt.kind == tokIdent && m.bucketAlias != "" && strings.EqualFold(kt.orig, m.bucketAlias) {
+			return bucketItem
 		}
 		return groupRef(kt)
 	}
-	kt, tok := c.next()
-	if !tok || !groupRef(kt) {
-		return fail()
+	// GROUP BY: a comma-list of key refs covering EVERY key exactly once
+	// (agg-3c: bucket + tag panels say `GROUP BY 1, 2` or `GROUP BY 1, host`).
+	seen := map[int]bool{}
+	for {
+		kt, tok := c.next()
+		if !tok {
+			return fail()
+		}
+		ki := groupRef(kt)
+		if ki < 0 || seen[ki] {
+			return fail()
+		}
+		seen[ki] = true
+		if c.i < len(c.toks) && c.toks[c.i].kind == tokPunct && c.toks[c.i].punct == ',' {
+			c.i++
+			continue
+		}
+		break
 	}
-	// Optional `ORDER BY <key ref> [ASC]` (agg-3): the engine sorts the single
-	// key ascending, NULLS LAST. DESC / LIMIT / anything else after declines.
+	nKeys := 0
+	if bucketItem >= 0 {
+		nKeys++
+	}
+	if tagItem >= 0 {
+		nKeys++
+	}
+	if len(seen) != nKeys {
+		return fail() // every projected key must be grouped exactly once
+	}
+	// Optional `ORDER BY <key ref> [ASC]` (agg-3): the engine sorts that single
+	// key ascending, NULLS LAST. DESC / LIMIT / multi-key ORDER decline.
 	if c.peekIdentLower() == "order" {
 		c.next()
 		if !c.ident("by") {
 			return fail()
 		}
 		ot, tok := c.next()
-		if !tok || !orderRef(ot) {
+		if !tok {
+			return fail()
+		}
+		oi := orderRef(ot)
+		if oi < 0 {
 			return fail()
 		}
 		if c.peekIdentLower() == "asc" {
 			c.next()
 		}
-		m.orderByKey = true
+		m.orderByItem = oi + 1 // 1-based select-list position
 	}
 	if !c.atEnd() {
 		return fail()
 	}
 	m.items = items
-	m.key = key
-	m.keyItem = keyItem
+	m.bucketText = bucketText
+	m.bucketItem = bucketItem
+	m.tagKey = tagKey
+	m.tagItem = tagItem
 	m.whereText = whereText
 	m.meas = meas
 	return m, true
 }
 
 // groupedMatch is matchGroupedAgg's result: the re-serialized select items, the
-// key (a bare column, or the rebuilt bucket text when bucketUnit != ""), the
-// key's select-list index, and the validated bucket parts the SQL builder
-// re-emits (never source text).
+// key set (agg-3c: at most one BUCKET — date_trunc or epoch-math — and at most
+// one bare TAG key, at least one of either), their select-list indices, and the
+// validated bucket parts the SQL builder re-emits (never source text).
 type groupedMatch struct {
 	items      []string
-	key        string
-	keyItem    int
+	bucketText string // rebuilt bucket item text ("" = no bucket key)
+	bucketItem int    // select-list index of the bucket (-1 = none)
+	tagKey     string // the bare tag key's spelling ("" = no tag key)
+	tagItem    int    // select-list index of the tag key (-1 = none)
 	whereText  string
 	meas       string
 	bucketUnit string
 	bucketCol  string
-	orderByKey bool
+	// ORDER BY: the ordered KEY's 1-based select-list position (0 = none).
+	orderByItem int
 	// agg-3b epoch-math bucket: width in whole seconds (0 = not this form) and
 	// the MANDATORY alias — validated parts the builder re-emits.
 	epochWidthSecs int

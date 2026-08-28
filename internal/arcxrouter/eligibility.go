@@ -157,8 +157,12 @@ type matchResult struct {
 	// The SQL builder re-emits from THESE, never from groupKey's text.
 	bucketUnit string
 	bucketCol  string
-	// agg-3: emit `ORDER BY <key position>` (ascending) in the engine SQL.
-	orderByKey bool
+	// agg-3c: the ordered KEY's 1-based select position (0 = no ORDER BY);
+	// the builder emits `ORDER BY <this position>` ascending.
+	orderByItem int
+	// agg-3c: rebuilt bucket item text ("" = no bucket key). groupKey holds
+	// the TAG key's spelling ("" = no tag key); at least one is set.
+	bucketText string
 	// agg-3b epoch-math bucket: width secs (0 = not this form) + mandatory alias.
 	epochWidthSecs int
 	bucketAlias    string
@@ -223,12 +227,13 @@ func eligibleShape(sql string) (matchResult, bool) {
 		return matchResult{
 			shape:          ShapeScanAggGrouped,
 			aggItems:       gm.items,
-			groupKey:       gm.key,
+			groupKey:       gm.tagKey,
+			bucketText:     gm.bucketText,
 			bucketUnit:     gm.bucketUnit,
 			bucketCol:      gm.bucketCol,
 			epochWidthSecs: gm.epochWidthSecs,
 			bucketAlias:    gm.bucketAlias,
-			orderByKey:     gm.orderByKey,
+			orderByItem:    gm.orderByItem,
 			whereText:      gm.whereText,
 			measurement:    gm.meas,
 		}, true
