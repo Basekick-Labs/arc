@@ -108,7 +108,12 @@ type Decision struct {
 	OrderBy   []scanOrderKey // scan only: ORDER BY keys
 	Limit     int            // scan only: LIMIT n (0 = none)
 	AggItems  []string       // scan_agg only: re-serialized aggregate items, select-list order
-	GroupKey  string         // scan_agg_grouped_count only: the single group-key column
+	GroupKey  string         // scan_agg_grouped only: the single group-key column (or the rebuilt bucket text)
+	// agg-3 bucket key parts (empty = bare tag key) — the builder re-emits from
+	// these validated parts, never from GroupKey's text.
+	BucketUnit string
+	BucketCol  string
+	OrderByKey bool // agg-3: append `ORDER BY <key position>` (ascending)
 }
 
 // Decide is the cheap per-query pre-filter. It never calls the engine; it only
@@ -141,16 +146,19 @@ func Decide(sql, headerDB string, h Handler) Decision {
 			// would be a bypass around Arc's CVE fix.
 			AllowedDirs: h.AllowedDirs,
 		},
-		Shape:     m.shape,
-		Unit:      m.unit,
-		Col:       m.col,
-		Cols:      m.cols,
-		Preds:     m.preds,
-		WhereText: m.whereText,
-		OrderBy:   m.orderBy,
-		Limit:     m.limit,
-		AggItems:  m.aggItems,
-		GroupKey:  m.groupKey,
+		Shape:      m.shape,
+		Unit:       m.unit,
+		Col:        m.col,
+		Cols:       m.cols,
+		Preds:      m.preds,
+		WhereText:  m.whereText,
+		OrderBy:    m.orderBy,
+		Limit:      m.limit,
+		AggItems:   m.aggItems,
+		GroupKey:   m.groupKey,
+		BucketUnit: m.bucketUnit,
+		BucketCol:  m.bucketCol,
+		OrderByKey: m.orderByKey,
 	}
 }
 
@@ -338,7 +346,23 @@ func buildScanAggSQL(d Decision, pathArray string) (string, bool) {
 // builders. WhereText is reserializeWhere's rebuilt-from-validated-tokens text,
 // the same already-reviewed injection surface the scan/agg builders emit.
 func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
-	if len(d.AggItems) < 2 || !isBareIdent(d.GroupKey) {
+	// The key is either a bare tag column, or (agg-3) a time bucket REBUILT here
+	// from the validated parts — unit from the fixed-width allow-set, column via
+	// isBareIdent — never from GroupKey's text.
+	var keyText string
+	var keyPos int
+	switch {
+	case d.BucketUnit != "":
+		if !fixedWidthUnits[strings.ToLower(d.BucketUnit)] || !isBareIdent(d.BucketCol) {
+			return "", false
+		}
+		keyText = "date_trunc('" + d.BucketUnit + "', " + d.BucketCol + ")"
+	case isBareIdent(d.GroupKey):
+		keyText = d.GroupKey
+	default:
+		return "", false
+	}
+	if len(d.AggItems) < 2 {
 		return "", false
 	}
 	sawKey, sawAgg := false, false
@@ -348,8 +372,9 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 		switch {
 		case isAggItem(item):
 			sawAgg = true
-		case item == d.GroupKey && !sawKey:
+		case item == keyText && !sawKey:
 			sawKey = true
+			keyPos = i + 1
 		default:
 			return "", false
 		}
@@ -368,8 +393,14 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 		b.WriteString(" WHERE ")
 		b.WriteString(d.WhereText)
 	}
+	// GROUP BY / ORDER BY by POSITION: valid for both key forms and emits no
+	// identifier text at all.
 	b.WriteString(" GROUP BY ")
-	b.WriteString(d.GroupKey)
+	b.WriteString(strconv.Itoa(keyPos))
+	if d.OrderByKey {
+		b.WriteString(" ORDER BY ")
+		b.WriteString(strconv.Itoa(keyPos))
+	}
 	return b.String(), true
 }
 

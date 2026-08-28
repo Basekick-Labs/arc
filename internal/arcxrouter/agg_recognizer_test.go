@@ -135,6 +135,21 @@ func TestGroupedAggRecognized(t *testing.T) {
 			"SELECT host, sum(f), min(f) FROM cpu WHERE f > 1.5 OR host = 'b' GROUP BY 1",
 			[]string{"host", "sum(f)", "min(f)"}, "host", "f > 1.5 OR host = 'b'",
 		},
+		// agg-3: the time-bucket key + ORDER BY on the key.
+		{
+			"SELECT date_trunc('minute', time), count(*), avg(cpu_user) FROM cpu WHERE time >= '2026-01-01T00:00:00Z' GROUP BY 1 ORDER BY 1",
+			[]string{"date_trunc('minute', time)", "count(*)", "avg(cpu_user)"},
+			"date_trunc('minute', time)", "time >= '2026-01-01T00:00:00Z'",
+		},
+		{
+			"SELECT count(*), date_trunc('hour', Time) FROM cpu GROUP BY 2",
+			[]string{"count(*)", "date_trunc('hour', Time)"},
+			"date_trunc('hour', Time)", "",
+		},
+		{
+			"SELECT host, count(*) FROM cpu GROUP BY host ORDER BY host ASC",
+			[]string{"host", "count(*)"}, "host", "",
+		},
 	}
 	for _, c := range cases {
 		m, ok := eligibleShape(c.sql)
@@ -159,7 +174,10 @@ func TestGroupedAggDeclines(t *testing.T) {
 		"SELECT count(*) FROM cpu GROUP BY host",                       // key not projected
 		"SELECT host, count(*) FROM cpu GROUP BY region",               // wrong key
 		"SELECT host, count(*) FROM cpu GROUP BY 2",                    // position at count
-		"SELECT host, count(*) FROM cpu GROUP BY host ORDER BY 1",      // trailing
+		// `ORDER BY 1` on the key became eligible at agg-3 (see the Recognized
+		// test); DESC and ORDER on an aggregate still decline.
+		"SELECT host, count(*) FROM cpu GROUP BY host ORDER BY 1 DESC",
+		"SELECT host, count(*) FROM cpu GROUP BY host ORDER BY 2",
 		"SELECT host, count(*) FROM cpu GROUP BY host LIMIT 5",
 		// WHERE joined the class (mimalloc slice) — but ONLY through the shared
 		// reserializeWhere vocabulary; anything it declines stays declined here.

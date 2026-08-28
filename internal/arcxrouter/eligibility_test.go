@@ -128,21 +128,24 @@ func TestEligibleShape_Declines(t *testing.T) {
 		{"select star", "SELECT * FROM cpu"},
 
 		// --- agg declines ---
-		{"agg wrong column", "SELECT date_trunc('day', ts), count(*) FROM cpu GROUP BY 1"},
+		// "agg wrong column" (ts instead of time): since agg-3 this routes via the
+		// grouped bucket path; the ENGINE settles it (FooterAgg col-mismatch →
+		// Unsupported → silent fallback). Covered in TestGroupedAggRecognized.
 		{"agg column expr", "SELECT date_trunc('day', time + 1), count(*) FROM cpu GROUP BY 1"},
 		{"agg unsupported unit", "SELECT date_trunc('week', time), count(*) FROM cpu GROUP BY 1"},
 		// minute/second ARE supported, but ONLY with a time-range WHERE — unfiltered
 		// sub-hour declines (would miss DuckDB's NULL bucket). Covered in detail by
 		// TestEligibleShape_FilteredDateTrunc.
-		{"agg minute no where declines", "SELECT date_trunc('minute', time), count(*) FROM cpu GROUP BY 1"},
-		{"agg second no where declines", "SELECT date_trunc('second', time), count(*) FROM cpu GROUP BY 1"},
+		// minute/second count-only WITHOUT a WHERE: since agg-3 these route via the
+		// grouped bucket path (the engine's footer path keeps first refusal and
+		// declines them; the fallback contract handles it). Moved to eligible.
 		{"agg group by expr", "SELECT date_trunc('day', time), count(*) FROM cpu GROUP BY date_trunc('day', time)"},
 		{"agg group by 2", "SELECT date_trunc('day', time), count(*) FROM cpu GROUP BY 2"},
 		{"agg no group by", "SELECT date_trunc('day', time), count(*) FROM cpu"},
 		{"agg extra projection", "SELECT date_trunc('day', time), host, count(*) FROM cpu GROUP BY 1"},
 		{"agg having", "SELECT date_trunc('day', time), count(*) FROM cpu GROUP BY 1 HAVING count(*) > 1"},
 		{"agg order by 2", "SELECT date_trunc('day', time), count(*) FROM cpu GROUP BY 1 ORDER BY 2"},
-		{"agg sum not count", "SELECT date_trunc('day', time), sum(x) FROM cpu GROUP BY 1"},
+		// "agg sum not count": the agg-3 surface itself — now eligible (grouped).
 
 		// --- TZ-injection declines (M3) ---
 		{"set timezone", "SET TimeZone='America/New_York'; SELECT count(*) FROM cpu"},
@@ -213,22 +216,35 @@ func TestEligibleShape_FilteredDateTrunc(t *testing.T) {
 		})
 	}
 
-	declines := []struct{ name, sql string }{
-		{"= on time (not a range)", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time = '2024-01-01T00:00:00Z' GROUP BY 1"},
+	// Since agg-3, the non-footer WHERE forms route via the GROUPED bucket path
+	// (ShapeScanAggGrouped) instead of declining outright — the engine serves the
+	// forms its differential fixtures pinned (=, !=, OR, IS NULL trees,
+	// data-column atoms) and Unsupported-declines the rest (BETWEEN, numeric RHS
+	// vs timestamp) with a silent fallback (unsupported ≠ error).
+	regrouped := []struct{ name, sql string }{
+		{"= on time", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time = '2024-01-01T00:00:00Z' GROUP BY 1"},
 		{"!= on time", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time != '2024-01-01T00:00:00Z' GROUP BY 1"},
 		{"OR", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time >= '2024-01-01T00:00:00Z' OR time < '2024-01-02T00:00:00Z' GROUP BY 1"},
 		{"non-time column", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE host = 'web1' GROUP BY 1"},
-		{"BETWEEN", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time BETWEEN '2024-01-01T00:00:00Z' AND '2024-01-02T00:00:00Z' GROUP BY 1"},
-		{"numeric RHS", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time >= 5 GROUP BY 1"},
 		{"IS NULL", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time IS NULL GROUP BY 1"},
-		{"in-query default_null_order", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time >= '2024-01-01T00:00:00Z' GROUP BY 1 /* default_null_order */"},
-		// Sub-hour units REQUIRE a time range: unfiltered would miss DuckDB's NULL
-		// bucket (the engine's per-row decode counts only non-null in-range rows).
 		{"minute no where", "SELECT date_trunc('minute', time), count(*) FROM cpu GROUP BY 1"},
 		{"second no where", "SELECT date_trunc('second', time), count(*) FROM cpu GROUP BY 1"},
-		// A sub-hour WHERE that isn't a pure time range still declines (same as hour).
-		{"minute IS NULL OR range (grammar guardrail)", "SELECT date_trunc('minute', time), count(*) FROM cpu WHERE time IS NULL OR time >= '2024-01-01T00:00:00Z' GROUP BY 1"},
+		{"minute IS NULL OR range", "SELECT date_trunc('minute', time), count(*) FROM cpu WHERE time IS NULL OR time >= '2024-01-01T00:00:00Z' GROUP BY 1"},
 		{"minute non-time predicate", "SELECT date_trunc('minute', time), count(*) FROM cpu WHERE host = 'web1' GROUP BY 1"},
+		{"BETWEEN", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time BETWEEN '2024-01-01T00:00:00Z' AND '2024-01-02T00:00:00Z' GROUP BY 1"},
+		{"numeric RHS", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time >= 5 GROUP BY 1"},
+	}
+	for _, tc := range regrouped {
+		t.Run("regrouped/"+tc.name, func(t *testing.T) {
+			m, ok := eligibleShape(tc.sql)
+			if !ok || m.shape != ShapeScanAggGrouped {
+				t.Fatalf("expected grouped-bucket eligibility, got (%q, %t) for %q", m.shape, ok, tc.sql)
+			}
+		})
+	}
+	declines := []struct{ name, sql string }{
+		// Comments never pass the tokenizer (the 2e `--` CRITICAL class).
+		{"in-query default_null_order", "SELECT date_trunc('hour', time), count(*) FROM cpu WHERE time >= '2024-01-01T00:00:00Z' GROUP BY 1 /* default_null_order */"},
 	}
 	for _, tc := range declines {
 		t.Run("decline/"+tc.name, func(t *testing.T) {

@@ -59,7 +59,9 @@ func TestBuildGroupedSQL(t *testing.T) {
 		AggItems: []string{"count(*)", "host"},
 		GroupKey: "host",
 	}, paths)
-	want := "SELECT count(*), host FROM read_parquet(['/p.parquet']) GROUP BY host"
+	// agg-3: GROUP BY (and ORDER BY) emit by POSITION — valid for bare keys and
+	// bucket keys alike, and no identifier text reaches the emitted clause.
+	want := "SELECT count(*), host FROM read_parquet(['/p.parquet']) GROUP BY 2"
 	if !ok || got != want {
 		t.Fatalf("got (%q, %t), want %q", got, ok, want)
 	}
@@ -70,11 +72,35 @@ func TestBuildGroupedSQL(t *testing.T) {
 		GroupKey:  "host",
 		WhereText: "cpu_user > 90",
 	}, paths)
-	want = "SELECT host, count(*), avg(cpu_user) FROM read_parquet(['/p.parquet']) WHERE cpu_user > 90 GROUP BY host"
+	want = "SELECT host, count(*), avg(cpu_user) FROM read_parquet(['/p.parquet']) WHERE cpu_user > 90 GROUP BY 1"
+	if !ok || got != want {
+		t.Fatalf("got (%q, %t), want %q", got, ok, want)
+	}
+	// agg-3 bucket key + ORDER BY: the bucket text is REBUILT from the validated
+	// parts (BucketUnit/BucketCol), never taken from GroupKey.
+	got, ok = buildGroupedSQL(Decision{
+		AggItems:   []string{"date_trunc('minute', time)", "count(*)", "avg(cpu_user)"},
+		GroupKey:   "date_trunc('minute', time)",
+		BucketUnit: "minute",
+		BucketCol:  "time",
+		WhereText:  "time >= '2026-01-01T00:00:00Z'",
+		OrderByKey: true,
+	}, paths)
+	want = "SELECT date_trunc('minute', time), count(*), avg(cpu_user) FROM read_parquet(['/p.parquet']) WHERE time >= '2026-01-01T00:00:00Z' GROUP BY 1 ORDER BY 1"
 	if !ok || got != want {
 		t.Fatalf("got (%q, %t), want %q", got, ok, want)
 	}
 	for _, d := range []Decision{
+		{ // unsafe bucket parts must never be emitted
+			AggItems:   []string{"date_trunc('week', time)", "count(*)"},
+			GroupKey:   "date_trunc('week', time)",
+			BucketUnit: "week", BucketCol: "time",
+		},
+		{
+			AggItems:   []string{"date_trunc('minute', x)", "count(*)"},
+			GroupKey:   "date_trunc('minute', x)",
+			BucketUnit: "minute", BucketCol: "x; DROP",
+		},
 		{AggItems: []string{"count(*)"}, GroupKey: "host"},                 // no key item
 		{AggItems: []string{"host", "count(*)"}, GroupKey: "h; DROP"},      // unsafe key
 		{AggItems: []string{"host", "median(x)"}, GroupKey: "host"},        // unknown fn item

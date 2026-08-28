@@ -79,6 +79,15 @@ func groupedFromArcx(rec arrow.Record, keyCol int) ([]groupedRow, error) {
 					} else {
 						row.keyInt = col.Value(r)
 					}
+				// agg-3 bucket key: compare as epoch µs (typed, never a string).
+				case *array.Timestamp:
+					row.keyIsI = true
+					if col.IsNull(r) {
+						row.keyNull = true
+					} else {
+						unit := col.DataType().(*arrow.TimestampType).Unit
+						row.keyInt = toMicros(int64(col.Value(r)), unit)
+					}
 				default:
 					return nil, fmt.Errorf("arcx grouped key: unexpected type %T", rec.Column(c))
 				}
@@ -143,6 +152,9 @@ func groupedFromRows(rows *sql.Rows, keyCol int) ([]groupedRow, error) {
 				case int64:
 					row.keyIsI = true
 					row.keyInt = x
+				case time.Time:
+					row.keyIsI = true
+					row.keyInt = x.UnixMicro()
 				default:
 					return nil, fmt.Errorf("duckdb grouped key: unexpected type %T", v)
 				}
