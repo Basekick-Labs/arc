@@ -467,16 +467,20 @@ func (p *Puller) startPeriodicReconciliation(fetch func(cursor string, limit int
 		if interval <= 0 {
 			interval = 5 * time.Minute
 		}
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
+		timer := time.NewTimer(interval)
+		defer timer.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
+			case <-timer.C:
 				if !p.RunReconciliation(ctx, fetch) {
 					p.logger.Debug().Msg("File puller reconciliation already running, skipping periodic pass")
 				}
+				if ctx.Err() != nil {
+					return
+				}
+				timer.Reset(interval)
 			}
 		}
 	}()

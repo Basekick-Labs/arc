@@ -2,6 +2,7 @@ package filereplication
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -59,6 +60,58 @@ func TestPeriodicReconciliationWaitsForStartupAndRepeats(t *testing.T) {
 		t.Fatalf("periodic reconciliation did not repeat: calls=%d", got)
 	}
 	p.Stop()
+}
+
+// TestPeriodicReconciliationResetsIntervalAfterSlowPass verifies that the
+// next pass is scheduled after a slow pass completes, not from the original
+// tick and not from a buffered ticker event.
+func TestPeriodicReconciliationResetsIntervalAfterSlowPass(t *testing.T) {
+	p := newTestPuller(t, newFakeBackend(),
+		newFakeFetcher(fakeFetchResult{body: []byte("unused")}),
+		staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+	p.Start(context.Background())
+	defer p.Stop()
+	p.RunCatchUp(context.Background(), emptyManifest)
+
+	const interval = 20 * time.Millisecond
+	firstStarted := make(chan struct{})
+	secondStarted := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer func() { releaseOnce.Do(func() { close(release) }) }()
+	var calls atomic.Int64
+	p.startPeriodicReconciliation(func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
+		switch calls.Add(1) {
+		case 1:
+			close(firstStarted)
+			<-release
+		case 2:
+			close(secondStarted)
+		}
+		return nil, "", nil
+	}, interval)
+
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first periodic reconciliation did not start")
+	}
+	// Keep the first pass running well beyond its interval. A ticker-based
+	// loop would have a follow-up tick waiting by the time this is released.
+	time.Sleep(5 * interval)
+	releasedAt := time.Now()
+	releaseOnce.Do(func() { close(release) })
+
+	select {
+	case <-secondStarted:
+		t.Fatalf("second reconciliation started immediately after slow pass: elapsed=%v", time.Since(releasedAt))
+	case <-time.After(interval / 2):
+	}
+	select {
+	case <-secondStarted:
+	case <-time.After(2 * interval):
+		t.Fatal("second periodic reconciliation did not start after reset interval")
+	}
 }
 
 // TestRunReconciliationPullsManifestEntryMissedAtStartup verifies the core
