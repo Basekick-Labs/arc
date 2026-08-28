@@ -1135,12 +1135,10 @@ func matchScan(toks []token) (cols []string, preds []scanPred, whereText string,
 				if !ok || (hiT.kind != tokNum && hiT.kind != tokStr && hiT.kind != tokFloat) {
 					return fail()
 				}
-				// A `±0.0` float bound declines for the same signed-zero reason as a bare
-				// float inequality (the desugared `>= 0.0` / `<= 0.0` diverges) — 2b-4.
-				if (loT.kind == tokFloat && isZeroFloatLiteral(loT.orig)) ||
-					(hiT.kind == tokFloat && isZeroFloatLiteral(hiT.orig)) {
-					return fail()
-				}
+				// A `±0.0` float bound SERVES since the int-coercion slice: the
+				// engine binds any zero spelling as the normalized compare
+				// `(col + 0.0) <op> +0.0` (the 2e machinery), oracle-matched on
+				// the full specials matrix — the 2b-4 decline is lifted.
 				lo := scanPred{col: colT.orig, op: ">="}
 				hi := scanPred{col: colT.orig, op: "<="}
 				switch loT.kind {
@@ -1174,13 +1172,9 @@ func matchScan(toks []token) (cols []string, preds []scanPred, whereText string,
 					preds = append(preds, scanPred{col: colT.orig, op: opStr, num: litT.orig, isStr: false})
 				case tokFloat:
 					// DOUBLE comparison. As of 2b-4 the engine serves all six ops on a
-					// finite float (arrow total_cmp == DuckDB ordering), so the flat path
-					// no longer restricts to Eq/Ne. The one guard that stays: a `±0.0`
-					// literal declines (arrow total_cmp separates -0.0/0.0, DuckDB treats
-					// them equal — diverges for `< 0.0`/`>= 0.0` too, not just equality).
-					if isZeroFloatLiteral(litT.orig) {
-						return fail()
-					}
+					// finite float (arrow total_cmp == DuckDB ordering). Since the
+					// int-coercion slice the `±0.0` literal also serves (the engine
+					// normalizes both operands — the signed-zero divergence is gone).
 					preds = append(preds, scanPred{col: colT.orig, op: opStr, num: litT.orig, isFloat: true})
 				case tokStr:
 					preds = append(preds, scanPred{col: colT.orig, op: opStr, str: litT.str, isStr: true})
