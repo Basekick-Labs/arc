@@ -1,6 +1,6 @@
 # Arc v2026.09.1 Release Notes
 
-> **Status:** Feature-complete — development sprint closed 2026-08-20. In stabilization testing ahead of release.
+> **Status:** Released 2026-08-31.
 
 ## New: Apache Iceberg export (opt-in)
 
