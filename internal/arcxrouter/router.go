@@ -113,7 +113,13 @@ type Decision struct {
 	// these validated parts, never from GroupKey's text.
 	BucketUnit string
 	BucketCol  string
-	OrderByKey bool // agg-3: append `ORDER BY <key position>` (ascending)
+	// agg-3c: the ordered KEY's 1-based select position (0 = no ORDER BY);
+	// the builder emits `ORDER BY <this position>` ascending after validating
+	// it points at a key item.
+	OrderByItem int
+	// agg-3c: the rebuilt bucket item text is NOT carried — the builder
+	// rebuilds it from the validated parts below; GroupKey holds the TAG key
+	// ("" = no tag key).
 	// agg-3b epoch-math bucket: width in whole seconds (0 = not this form) and
 	// the mandatory alias — the builder re-emits from these validated parts.
 	EpochWidthSecs int
@@ -162,7 +168,7 @@ func Decide(sql, headerDB string, h Handler) Decision {
 		GroupKey:       m.groupKey,
 		BucketUnit:     m.bucketUnit,
 		BucketCol:      m.bucketCol,
-		OrderByKey:     m.orderByKey,
+		OrderByItem:    m.orderByItem,
 		EpochWidthSecs: m.epochWidthSecs,
 		BucketAlias:    m.bucketAlias,
 	}
@@ -352,44 +358,52 @@ func buildScanAggSQL(d Decision, pathArray string) (string, bool) {
 // builders. WhereText is reserializeWhere's rebuilt-from-validated-tokens text,
 // the same already-reviewed injection surface the scan/agg builders emit.
 func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
-	// The key is either a bare tag column, or (agg-3) a time bucket REBUILT here
-	// from the validated parts — unit from the fixed-width allow-set, column via
-	// isBareIdent — never from GroupKey's text.
-	var keyText string
-	var keyPos int
+	// agg-3c key set: at most one BUCKET (rebuilt here from validated parts —
+	// unit/width allow-set, bare-ident col/alias — never from source text) and
+	// at most one bare TAG key; at least one of either. Per-key matched flags
+	// (the single-flag logic breaks at two keys — adversarial #7).
+	var bucketText string
 	switch {
 	case d.EpochWidthSecs != 0:
-		// agg-3b: rebuild the exact Grafana emission + alias from validated
-		// parts (width in range, bare-ident col and alias) — never source text.
 		if d.EpochWidthSecs < 1 || d.EpochWidthSecs > 31_622_400 ||
 			!isBareIdent(d.BucketCol) || !isBareIdent(d.BucketAlias) {
 			return "", false
 		}
 		w := strconv.Itoa(d.EpochWidthSecs)
-		keyText = "to_timestamp((epoch_ns(" + d.BucketCol + ") // 1000000000 // " + w + ") * " + w + ") AS " + d.BucketAlias
+		bucketText = "to_timestamp((epoch_ns(" + d.BucketCol + ") // 1000000000 // " + w + ") * " + w + ") AS " + d.BucketAlias
 	case d.BucketUnit != "":
 		if !fixedWidthUnits[strings.ToLower(d.BucketUnit)] || !isBareIdent(d.BucketCol) {
 			return "", false
 		}
-		keyText = "date_trunc('" + d.BucketUnit + "', " + d.BucketCol + ")"
-	case isBareIdent(d.GroupKey):
-		keyText = d.GroupKey
-	default:
+		bucketText = "date_trunc('" + d.BucketUnit + "', " + d.BucketCol + ")"
+	}
+	tagText := ""
+	if d.GroupKey != "" {
+		if !isBareIdent(d.GroupKey) {
+			return "", false
+		}
+		tagText = d.GroupKey
+	}
+	if bucketText == "" && tagText == "" {
 		return "", false
 	}
 	if len(d.AggItems) < 2 {
 		return "", false
 	}
-	sawKey, sawAgg := false, false
+	sawBucket, sawTag, sawAgg := false, false, false
+	keyPositions := []int{}
 	var b strings.Builder
 	b.WriteString("SELECT ")
 	for i, item := range d.AggItems {
 		switch {
 		case isAggItem(item):
 			sawAgg = true
-		case item == keyText && !sawKey:
-			sawKey = true
-			keyPos = i + 1
+		case bucketText != "" && item == bucketText && !sawBucket:
+			sawBucket = true
+			keyPositions = append(keyPositions, i+1)
+		case tagText != "" && item == tagText && !sawTag:
+			sawTag = true
+			keyPositions = append(keyPositions, i+1)
 		default:
 			return "", false
 		}
@@ -398,7 +412,7 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 		}
 		b.WriteString(item)
 	}
-	if !sawKey || !sawAgg {
+	if !sawAgg || (bucketText != "" && !sawBucket) || (tagText != "" && !sawTag) {
 		return "", false
 	}
 	b.WriteString(" FROM read_parquet(")
@@ -408,13 +422,27 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 		b.WriteString(" WHERE ")
 		b.WriteString(d.WhereText)
 	}
-	// GROUP BY / ORDER BY by POSITION: valid for both key forms and emits no
-	// identifier text at all.
+	// GROUP BY / ORDER BY by POSITION: valid for every key form and emits no
+	// identifier text at all. ORDER BY must point at a KEY position.
 	b.WriteString(" GROUP BY ")
-	b.WriteString(strconv.Itoa(keyPos))
-	if d.OrderByKey {
+	for i, kp := range keyPositions {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(strconv.Itoa(kp))
+	}
+	if d.OrderByItem != 0 {
+		ok := false
+		for _, kp := range keyPositions {
+			if d.OrderByItem == kp {
+				ok = true
+			}
+		}
+		if !ok {
+			return "", false
+		}
 		b.WriteString(" ORDER BY ")
-		b.WriteString(strconv.Itoa(keyPos))
+		b.WriteString(strconv.Itoa(d.OrderByItem))
 	}
 	return b.String(), true
 }
@@ -766,18 +794,20 @@ func (h Deps) compareToOracle(ctx context.Context, d Decision, rec arrow.Record)
 		return compareAgg(rec, oracle, d.AggItems), nil
 	}
 	if d.Shape == ShapeScanAggGrouped {
-		keyCol := 0
+		// agg-3c: keys are every NON-aggregate item (a bare tag and/or a bucket
+		// — the item texts were re-serialized by the recognizer, so isAggItem
+		// is the robust discriminator; no bucket-text reconstruction needed).
+		var keyCols []int
 		for i, item := range d.AggItems {
-			if item == d.GroupKey {
-				keyCol = i
-				break
+			if !isAggItem(item) {
+				keyCols = append(keyCols, i)
 			}
 		}
-		oracle, err := groupedFromRows(rows, keyCol)
+		oracle, err := groupedFromRows(rows, keyCols)
 		if err != nil {
 			return "", err
 		}
-		return compareGrouped(rec, oracle, d.AggItems, keyCol), nil
+		return compareGrouped(rec, oracle, d.AggItems, keyCols), nil
 	}
 	if isScalarShape(d.Shape) {
 		oracle, err := scalarFromRows(rows)

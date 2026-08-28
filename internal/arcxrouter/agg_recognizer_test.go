@@ -135,16 +135,34 @@ func TestGroupedAggRecognized(t *testing.T) {
 			"SELECT host, sum(f), min(f) FROM cpu WHERE f > 1.5 OR host = 'b' GROUP BY 1",
 			[]string{"host", "sum(f)", "min(f)"}, "host", "f > 1.5 OR host = 'b'",
 		},
-		// agg-3: the time-bucket key + ORDER BY on the key.
+		// agg-3: the time-bucket key + ORDER BY on the key. Since agg-3c,
+		// groupKey carries only the TAG key — "" for bucket-only queries (the
+		// bucket travels as validated parts).
 		{
 			"SELECT date_trunc('minute', time), count(*), avg(cpu_user) FROM cpu WHERE time >= '2026-01-01T00:00:00Z' GROUP BY 1 ORDER BY 1",
 			[]string{"date_trunc('minute', time)", "count(*)", "avg(cpu_user)"},
-			"date_trunc('minute', time)", "time >= '2026-01-01T00:00:00Z'",
+			"", "time >= '2026-01-01T00:00:00Z'",
 		},
 		{
 			"SELECT count(*), date_trunc('hour', Time) FROM cpu GROUP BY 2",
 			[]string{"count(*)", "date_trunc('hour', Time)"},
-			"date_trunc('hour', Time)", "",
+			"", "",
+		},
+		// agg-3c: the per-host panel — bucket + tag composite key.
+		{
+			"SELECT date_trunc('hour', time), host, count(*), avg(cpu_user) FROM cpu GROUP BY 1, 2",
+			[]string{"date_trunc('hour', time)", "host", "count(*)", "avg(cpu_user)"},
+			"host", "",
+		},
+		{
+			"SELECT host, date_trunc('hour', time), avg(cpu_user) FROM cpu GROUP BY 1, 2 ORDER BY 2",
+			[]string{"host", "date_trunc('hour', time)", "avg(cpu_user)"},
+			"host", "",
+		},
+		{
+			"SELECT date_trunc('hour', time), host, count(*) FROM cpu GROUP BY 1, host",
+			[]string{"date_trunc('hour', time)", "host", "count(*)"},
+			"host", "",
 		},
 		{
 			"SELECT host, count(*) FROM cpu GROUP BY host ORDER BY host ASC",
@@ -197,13 +215,13 @@ func TestEpochMathBucketRecognized(t *testing.T) {
 	// time-series frame needs a column named `time`).
 	em := "to_timestamp((epoch_ns(time) // 1000000000 // 300) * 300) AS time"
 	cases := []struct {
-		sql        string
-		orderByKey bool
+		sql         string
+		orderByItem int
 	}{
-		{"SELECT " + em + ", avg(cpu_user) FROM cpu WHERE time >= '2026-08-13T00:00:00Z' AND time < '2026-08-14T00:00:00Z' GROUP BY 1 ORDER BY time", true},
-		{"SELECT " + em + ", count(*), avg(cpu_user) FROM cpu GROUP BY 1 ORDER BY 1", true},
-		{"SELECT " + em + ", avg(cpu_user) FROM cpu GROUP BY 1 ORDER BY time ASC", true},
-		{"SELECT " + em + ", avg(cpu_user) FROM cpu GROUP BY 1", false},
+		{"SELECT " + em + ", avg(cpu_user) FROM cpu WHERE time >= '2026-08-13T00:00:00Z' AND time < '2026-08-14T00:00:00Z' GROUP BY 1 ORDER BY time", 1},
+		{"SELECT " + em + ", count(*), avg(cpu_user) FROM cpu GROUP BY 1 ORDER BY 1", 1},
+		{"SELECT " + em + ", avg(cpu_user) FROM cpu GROUP BY 1 ORDER BY time ASC", 1},
+		{"SELECT " + em + ", avg(cpu_user) FROM cpu GROUP BY 1", 0},
 	}
 	for _, c := range cases {
 		m, ok := eligibleShape(c.sql)
@@ -213,8 +231,8 @@ func TestEpochMathBucketRecognized(t *testing.T) {
 		if m.epochWidthSecs != 300 || m.bucketCol != "time" || m.bucketAlias != "time" {
 			t.Fatalf("parts = %d/%q/%q: %s", m.epochWidthSecs, m.bucketCol, m.bucketAlias, c.sql)
 		}
-		if m.orderByKey != c.orderByKey {
-			t.Fatalf("orderByKey = %t, want %t: %s", m.orderByKey, c.orderByKey, c.sql)
+		if m.orderByItem != c.orderByItem {
+			t.Fatalf("orderByItem = %d, want %d: %s", m.orderByItem, c.orderByItem, c.sql)
 		}
 	}
 }
@@ -241,6 +259,30 @@ func TestEpochMathBucketDeclines(t *testing.T) {
 		"SELECT to_timestamp((epoch_ns(time) // 1000000000 // 300) * 300) AS a, date_trunc('minute', time), avg(x) FROM cpu GROUP BY 1, 2",
 		// ORDER BY DESC still declines.
 		"SELECT to_timestamp((epoch_ns(time) // 1000000000 // 300) * 300) AS time, avg(x) FROM cpu GROUP BY 1 ORDER BY time DESC",
+	} {
+		if m, ok := eligibleShape(sql); ok && m.shape == ShapeScanAggGrouped {
+			t.Fatalf("must not match scan_agg_grouped: %s", sql)
+		}
+	}
+}
+
+func TestCompositeKeyDeclines(t *testing.T) {
+	for _, sql := range []string{
+		// Two TAG keys ride the generic engine path that measured 1.4-2.4x
+		// BEHIND at corpus scale — off the list until its own bench (agg-3c).
+		"SELECT host, region, count(*) FROM cpu GROUP BY 1, 2",
+		"SELECT date_trunc('hour', time), host, region, count(*) FROM cpu GROUP BY 1, 2, 3",
+		// Two buckets.
+		"SELECT date_trunc('hour', time), date_trunc('minute', time), count(*) FROM cpu GROUP BY 1, 2",
+		// A projected key missing from GROUP BY (closure both ways).
+		"SELECT date_trunc('hour', time), host, count(*) FROM cpu GROUP BY 1",
+		"SELECT date_trunc('hour', time), host, count(*) FROM cpu GROUP BY 2",
+		// Duplicate refs.
+		"SELECT date_trunc('hour', time), host, count(*) FROM cpu GROUP BY 1, 1",
+		// GROUP BY naming the bucket ALIAS (binds the raw column in DuckDB).
+		"SELECT to_timestamp((epoch_ns(time) // 1000000000 // 300) * 300) AS b, host, count(*) FROM cpu GROUP BY b, host",
+		// ORDER BY an aggregate position.
+		"SELECT date_trunc('hour', time), host, count(*) FROM cpu GROUP BY 1, 2 ORDER BY 3",
 	} {
 		if m, ok := eligibleShape(sql); ok && m.shape == ShapeScanAggGrouped {
 			t.Fatalf("must not match scan_agg_grouped: %s", sql)
