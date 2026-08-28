@@ -332,9 +332,11 @@ func buildScanAggSQL(d Decision, pathArray string) (string, bool) {
 }
 
 // buildGroupedSQL constructs the engine SQL for the allow-listed grouped class:
-// `SELECT <items> FROM read_parquet([...]) GROUP BY <key>`. Items re-validate as
-// agg-1 aggregate items (`isAggItem`) or exactly the bare key; decline rather
-// than emit unsafe SQL — same defense-in-depth as the other builders.
+// `SELECT <items> FROM read_parquet([...]) [WHERE <tree>] GROUP BY <key>`. Items
+// re-validate as agg-1 aggregate items (`isAggItem`) or exactly the bare key;
+// decline rather than emit unsafe SQL — same defense-in-depth as the other
+// builders. WhereText is reserializeWhere's rebuilt-from-validated-tokens text,
+// the same already-reviewed injection surface the scan/agg builders emit.
 func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 	if len(d.AggItems) < 2 || !isBareIdent(d.GroupKey) {
 		return "", false
@@ -361,7 +363,12 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 	}
 	b.WriteString(" FROM read_parquet(")
 	b.WriteString(pathArray)
-	b.WriteString(") GROUP BY ")
+	b.WriteString(")")
+	if d.WhereText != "" {
+		b.WriteString(" WHERE ")
+		b.WriteString(d.WhereText)
+	}
+	b.WriteString(" GROUP BY ")
 	b.WriteString(d.GroupKey)
 	return b.String(), true
 }

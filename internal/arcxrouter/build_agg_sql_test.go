@@ -63,10 +63,21 @@ func TestBuildGroupedSQL(t *testing.T) {
 	if !ok || got != want {
 		t.Fatalf("got (%q, %t), want %q", got, ok, want)
 	}
+	// WHERE-bearing (mimalloc slice): the reserialized tree lands between the
+	// path array and GROUP BY, mirroring buildScanAggSQL.
+	got, ok = buildGroupedSQL(Decision{
+		AggItems:  []string{"host", "count(*)", "avg(cpu_user)"},
+		GroupKey:  "host",
+		WhereText: "cpu_user > 90",
+	}, paths)
+	want = "SELECT host, count(*), avg(cpu_user) FROM read_parquet(['/p.parquet']) WHERE cpu_user > 90 GROUP BY host"
+	if !ok || got != want {
+		t.Fatalf("got (%q, %t), want %q", got, ok, want)
+	}
 	for _, d := range []Decision{
-		{AggItems: []string{"count(*)"}, GroupKey: "host"},              // no key item
-		{AggItems: []string{"host", "count(*)"}, GroupKey: "h; DROP"},   // unsafe key
-		{AggItems: []string{"host", "median(x)"}, GroupKey: "host"},     // unknown fn item
+		{AggItems: []string{"count(*)"}, GroupKey: "host"},                 // no key item
+		{AggItems: []string{"host", "count(*)"}, GroupKey: "h; DROP"},      // unsafe key
+		{AggItems: []string{"host", "median(x)"}, GroupKey: "host"},        // unknown fn item
 		{AggItems: []string{"host", "host", "count(*)"}, GroupKey: "host"}, // repeated key
 	} {
 		if got, ok := buildGroupedSQL(d, paths); ok {

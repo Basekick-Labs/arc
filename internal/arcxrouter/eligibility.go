@@ -206,14 +206,16 @@ func eligibleShape(sql string) (matchResult, bool) {
 	if items, whereText, meas, ok := matchScanAgg(toks); ok {
 		return matchResult{shape: ShapeScanAgg, aggItems: items, whereText: whereText, measurement: meas}, true
 	}
-	// The allow-listed grouped shape (agg-2b): single key + count(*)-only, no
-	// WHERE. Tried before the scan (a bare-column-led grouped select would fail
-	// the scan anyway; count-led ones fall through the agg matchers above).
-	if items, key, meas, ok := matchGroupedNoWhere(toks); ok {
+	// The allow-listed grouped shape (agg-2b → agg-2c full agg set → mimalloc
+	// slice optional WHERE). Tried before the scan (a bare-column-led grouped
+	// select would fail the scan anyway; count-led ones fall through the agg
+	// matchers above).
+	if items, key, whereText, meas, ok := matchGroupedAgg(toks); ok {
 		return matchResult{
 			shape:       ShapeScanAggGrouped,
 			aggItems:    items,
 			groupKey:    key,
+			whereText:   whereText,
 			measurement: meas,
 		}, true
 	}

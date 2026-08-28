@@ -105,51 +105,71 @@ func TestScanAggDeclines(t *testing.T) {
 	}
 }
 
-func TestGroupedNoWhereRecognized(t *testing.T) {
+func TestGroupedAggRecognized(t *testing.T) {
 	cases := []struct {
-		sql   string
-		items []string
-		key   string
+		sql       string
+		items     []string
+		key       string
+		whereText string
 	}{
-		{"SELECT host, count(*) FROM cpu GROUP BY host", []string{"host", "count(*)"}, "host"},
-		{"SELECT count(*), host FROM cpu GROUP BY host", []string{"count(*)", "host"}, "host"},
-		{"SELECT host, count(*) FROM cpu GROUP BY 1", []string{"host", "count(*)"}, "host"},
-		{"SELECT count(*), host FROM cpu GROUP BY 2", []string{"count(*)", "host"}, "host"},
-		{"SELECT host, count(*), count(*) FROM cpu GROUP BY host", []string{"host", "count(*)", "count(*)"}, "host"},
+		{"SELECT host, count(*) FROM cpu GROUP BY host", []string{"host", "count(*)"}, "host", ""},
+		{"SELECT count(*), host FROM cpu GROUP BY host", []string{"count(*)", "host"}, "host", ""},
+		{"SELECT host, count(*) FROM cpu GROUP BY 1", []string{"host", "count(*)"}, "host", ""},
+		{"SELECT count(*), host FROM cpu GROUP BY 2", []string{"count(*)", "host"}, "host", ""},
+		{"SELECT host, count(*), count(*) FROM cpu GROUP BY host", []string{"host", "count(*)", "count(*)"}, "host", ""},
 		// agg-2c widened the class to agg-1's full aggregate set (no WHERE).
-		{"SELECT host, sum(x), avg(x) FROM cpu GROUP BY host", []string{"host", "sum(x)", "avg(x)"}, "host"},
-		{"SELECT host, count(*), avg(Usage), max(Usage) FROM cpu GROUP BY host", []string{"host", "count(*)", "avg(Usage)", "max(Usage)"}, "host"},
-		{"SELECT min(time), host FROM cpu GROUP BY 2", []string{"min(time)", "host"}, "host"},
+		{"SELECT host, sum(x), avg(x) FROM cpu GROUP BY host", []string{"host", "sum(x)", "avg(x)"}, "host", ""},
+		{"SELECT host, count(*), avg(Usage), max(Usage) FROM cpu GROUP BY host", []string{"host", "count(*)", "avg(Usage)", "max(Usage)"}, "host", ""},
+		{"SELECT min(time), host FROM cpu GROUP BY 2", []string{"min(time)", "host"}, "host", ""},
+		// mimalloc slice: the WHERE-bearing shapes cleared the perf gate (both the
+		// selective and broad arms + the masked dashboard pair win vs v1.5.5).
+		{
+			"SELECT host, count(*), avg(cpu_user) FROM cpu WHERE cpu_user > 90 GROUP BY host",
+			[]string{"host", "count(*)", "avg(cpu_user)"}, "host", "cpu_user > 90",
+		},
+		{
+			"SELECT host, sum(x) FROM cpu WHERE host = 'a' GROUP BY host",
+			[]string{"host", "sum(x)"}, "host", "host = 'a'",
+		},
+		{
+			"SELECT host, sum(f), min(f) FROM cpu WHERE f > 1.5 OR host = 'b' GROUP BY 1",
+			[]string{"host", "sum(f)", "min(f)"}, "host", "f > 1.5 OR host = 'b'",
+		},
 	}
 	for _, c := range cases {
 		m, ok := eligibleShape(c.sql)
 		if !ok || m.shape != ShapeScanAggGrouped {
-			t.Fatalf("should be scan_agg_grouped_count: %s (got %q, %t)", c.sql, m.shape, ok)
+			t.Fatalf("should be scan_agg_grouped: %s (got %q, %t)", c.sql, m.shape, ok)
 		}
-		if !reflect.DeepEqual(m.aggItems, c.items) || m.groupKey != c.key {
-			t.Fatalf("items/key = %v/%q, want %v/%q: %s", m.aggItems, m.groupKey, c.items, c.key, c.sql)
+		if !reflect.DeepEqual(m.aggItems, c.items) || m.groupKey != c.key || m.whereText != c.whereText {
+			t.Fatalf("items/key/where = %v/%q/%q, want %v/%q/%q: %s",
+				m.aggItems, m.groupKey, m.whereText, c.items, c.key, c.whereText, c.sql)
 		}
 	}
 }
 
-func TestGroupedNoWhereDeclines(t *testing.T) {
+func TestGroupedAggDeclines(t *testing.T) {
 	for _, sql := range []string{
 		// Outside the allow-listed subclass — the engine serves wider grouped
-		// shapes but they have NOT cleared the perf gate (agg-2b record).
-		"SELECT host, count(*) FROM cpu WHERE x > 1 GROUP BY host", // WHERE-bearing
-		"SELECT host, sum(x) FROM cpu WHERE x > 1 GROUP BY host",   // WHERE-bearing value agg
-		"SELECT host, sum(a * b) FROM cpu GROUP BY host",           // expression arg
-		"SELECT host, count(DISTINCT x) FROM cpu GROUP BY host",    // DISTINCT
+		// shapes but they have NOT cleared the perf gate.
+		"SELECT host, sum(a * b) FROM cpu GROUP BY host",               // expression arg
+		"SELECT host, count(DISTINCT x) FROM cpu GROUP BY host",        // DISTINCT
 		"SELECT host, region, count(*) FROM cpu GROUP BY host, region", // multi-key
-		"SELECT host FROM cpu GROUP BY host",                       // no count
-		"SELECT count(*) FROM cpu GROUP BY host",                   // key not projected
-		"SELECT host, count(*) FROM cpu GROUP BY region",           // wrong key
-		"SELECT host, count(*) FROM cpu GROUP BY 2",                // position at count
-		"SELECT host, count(*) FROM cpu GROUP BY host ORDER BY 1",  // trailing
+		"SELECT host FROM cpu GROUP BY host",                           // no count
+		"SELECT count(*) FROM cpu GROUP BY host",                       // key not projected
+		"SELECT host, count(*) FROM cpu GROUP BY region",               // wrong key
+		"SELECT host, count(*) FROM cpu GROUP BY 2",                    // position at count
+		"SELECT host, count(*) FROM cpu GROUP BY host ORDER BY 1",      // trailing
 		"SELECT host, count(*) FROM cpu GROUP BY host LIMIT 5",
+		// WHERE joined the class (mimalloc slice) — but ONLY through the shared
+		// reserializeWhere vocabulary; anything it declines stays declined here.
+		"SELECT host, count(*) FROM cpu WHERE GROUP BY host",                   // empty WHERE
+		"SELECT host, count(*) FROM cpu WHERE x > GROUP BY host",               // dangling atom
+		"SELECT host, count(*) FROM cpu WHERE lower(host) = 'a' GROUP BY host", // fn call in WHERE
+		"SELECT host, count(*) FROM cpu WHERE x > 1 GROUP BY host LIMIT 5",     // trailing after GROUP BY
 	} {
 		if m, ok := eligibleShape(sql); ok && m.shape == ShapeScanAggGrouped {
-			t.Fatalf("must not match scan_agg_grouped_count: %s", sql)
+			t.Fatalf("must not match scan_agg_grouped: %s", sql)
 		}
 	}
 }
