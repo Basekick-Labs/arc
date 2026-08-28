@@ -3027,10 +3027,13 @@ func (h *QueryHandler) buildReadParquetExprForMeasurement(ctx context.Context, d
 func (h *QueryHandler) buildReadParquetExprForParallel(ctx context.Context, path, originalSQL, keyword string) (string, *ParallelQueryInfo) {
 	options := buildReadParquetOptions()
 
-	// Attach a local volatility flag (in addition to any outer one): a
-	// file-time-expanded list must NOT be fanned out one-DuckDB-query-per
-	// -file by the parallel executor — its elements are individual small
-	// files, not hour partitions.
+	// Attach a local volatility flag. NOTE: this SHADOWS any outer flag for
+	// the subtree (ctx.Value returns the innermost) — safe here only because
+	// this fast path's output is never stored in the SQL transform cache
+	// (the sole queryCache.Set lives in getTransformedSQL, which this path
+	// does not reach). The local flag's job: a file-time-expanded list must
+	// NOT be fanned out one-DuckDB-query-per-file by the parallel executor —
+	// its elements are individual small files, not hour partitions.
 	ctx, volatile := pruning.WithVolatileResult(ctx)
 
 	// Apply partition pruning

@@ -171,14 +171,26 @@ var (
 
 	// Patterns for relative time expressions (NOW() +/- INTERVAL)
 	// These capture: (1) the numeric amount, (2) the time unit, and detect +/- via separate patterns.
-	// Quotes are optional: SQL-standard `INTERVAL '300 seconds'` and DuckDB's
-	// unquoted `INTERVAL 300 SECOND` both prune — the unquoted form previously
-	// extracted no range at all, silently disabling pruning for every client
-	// that emits DuckDB-native syntax.
-	relativeStartSubtractPattern = regexp.MustCompile(`(?i)time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s*'?(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'?`)
-	relativeStartAddPattern      = regexp.MustCompile(`(?i)time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s*'?(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'?`)
-	relativeEndSubtractPattern   = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s*'?(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'?`)
-	relativeEndAddPattern        = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s*'?(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'?`)
+	//
+	// Two branches per direction, deliberately NOT one pattern with optional
+	// quotes (that widening shipped two silent wrong-pruning bugs in review:
+	// a compound interval like '1 day 12 hours' matched its '1 day' prefix,
+	// and interval-looking text inside string literals matched):
+	//   - quoted branch: SQL-standard INTERVAL '300 seconds' — closing quote
+	//     REQUIRED right after the unit, so compound intervals cannot match a
+	//     prefix; runs against the unmasked clause (unchanged from before).
+	//   - unquoted branch: DuckDB-native INTERVAL 300 SECOND — \s+ after
+	//     INTERVAL and \b after the unit (no interval2/identifier matches);
+	//     runs against the MASKED clause, so literal contents can never match.
+	relativeStartSubtractPattern = regexp.MustCompile(`(?i)time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
+	relativeStartAddPattern      = regexp.MustCompile(`(?i)time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
+	relativeEndSubtractPattern   = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
+	relativeEndAddPattern        = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
+
+	relativeStartSubtractUnquotedPattern = regexp.MustCompile(`(?i)time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)\b`)
+	relativeStartAddUnquotedPattern      = regexp.MustCompile(`(?i)time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)\b`)
+	relativeEndSubtractUnquotedPattern   = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)\b`)
+	relativeEndAddUnquotedPattern        = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)\b`)
 
 	// Pattern to parse storage paths
 	storagePathPattern = regexp.MustCompile(`(.+)/([^/]+)/([^/]+)/\*\*/\*\.parquet$`)
@@ -518,44 +530,44 @@ func (p *PartitionPruner) ExtractTimeRange(sqlStr string) *TimeRange {
 		}
 	}
 
-	// Try relative time patterns for start time if not found yet
+	// Try relative time patterns if not found yet. Quoted patterns run
+	// against the unmasked clause (a quoted interval IS a string literal);
+	// unquoted patterns run against the MASKED clause so interval-looking
+	// text inside string literals (e.g. a log-search LIKE) can never match.
+	// matchRelative tries one (pattern, clause, isAddition) combination.
+	matchRelative := func(re *regexp.Regexp, clause string, isAddition bool, kind string) *time.Time {
+		if match := re.FindStringSubmatch(clause); match != nil {
+			if t, err := evaluateRelativeTime(match[1], match[2], isAddition); err == nil {
+				p.logger.Debug().Time("time", t).Str("expression", kind).Msg("Found relative time bound")
+				return &t
+			}
+		}
+		return nil
+	}
 	if startTime == nil {
-		// Try NOW() - INTERVAL pattern (subtraction)
-		if match := relativeStartSubtractPattern.FindStringSubmatch(whereClause); match != nil {
-			if t, err := evaluateRelativeTime(match[1], match[2], false); err == nil {
-				startTime = &t
-				p.logger.Debug().Time("start_time", t).Str("expression", "NOW() - INTERVAL").Msg("Found relative start time")
-			}
-		}
-		// Try NOW() + INTERVAL pattern (addition)
-		if startTime == nil {
-			if match := relativeStartAddPattern.FindStringSubmatch(whereClause); match != nil {
-				if t, err := evaluateRelativeTime(match[1], match[2], true); err == nil {
-					startTime = &t
-					p.logger.Debug().Time("start_time", t).Str("expression", "NOW() + INTERVAL").Msg("Found relative start time")
-				}
-			}
-		}
+		startTime = matchRelative(relativeStartSubtractPattern, whereClause, false, "NOW() - INTERVAL")
+	}
+	if startTime == nil {
+		startTime = matchRelative(relativeStartAddPattern, whereClause, true, "NOW() + INTERVAL")
+	}
+	if startTime == nil {
+		startTime = matchRelative(relativeStartSubtractUnquotedPattern, maskedWhereClause, false, "NOW() - INTERVAL (unquoted)")
+	}
+	if startTime == nil {
+		startTime = matchRelative(relativeStartAddUnquotedPattern, maskedWhereClause, true, "NOW() + INTERVAL (unquoted)")
 	}
 
-	// Try relative time patterns for end time if not found yet
 	if endTime == nil {
-		// Try NOW() - INTERVAL pattern (subtraction)
-		if match := relativeEndSubtractPattern.FindStringSubmatch(whereClause); match != nil {
-			if t, err := evaluateRelativeTime(match[1], match[2], false); err == nil {
-				endTime = &t
-				p.logger.Debug().Time("end_time", t).Str("expression", "NOW() - INTERVAL").Msg("Found relative end time")
-			}
-		}
-		// Try NOW() + INTERVAL pattern (addition)
-		if endTime == nil {
-			if match := relativeEndAddPattern.FindStringSubmatch(whereClause); match != nil {
-				if t, err := evaluateRelativeTime(match[1], match[2], true); err == nil {
-					endTime = &t
-					p.logger.Debug().Time("end_time", t).Str("expression", "NOW() + INTERVAL").Msg("Found relative end time")
-				}
-			}
-		}
+		endTime = matchRelative(relativeEndSubtractPattern, whereClause, false, "NOW() - INTERVAL")
+	}
+	if endTime == nil {
+		endTime = matchRelative(relativeEndAddPattern, whereClause, true, "NOW() + INTERVAL")
+	}
+	if endTime == nil {
+		endTime = matchRelative(relativeEndSubtractUnquotedPattern, maskedWhereClause, false, "NOW() - INTERVAL (unquoted)")
+	}
+	if endTime == nil {
+		endTime = matchRelative(relativeEndAddUnquotedPattern, maskedWhereClause, true, "NOW() + INTERVAL (unquoted)")
 	}
 
 	// Build time range

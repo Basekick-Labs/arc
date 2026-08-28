@@ -195,3 +195,24 @@ func TestExtractTimeRangeUnquotedInterval(t *testing.T) {
 		}
 	}
 }
+
+// Regression tests for the widened INTERVAL patterns (review findings B1/B2).
+// A wrong extracted range silently drops rows via partition pruning, so every
+// ambiguous shape must extract NOTHING (nil = no pruning = correct results).
+func TestExtractTimeRangeNoFalsePositives(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+	for _, q := range []string{
+		// B1: compound quoted interval — must not match its "1 day" prefix.
+		"SELECT * FROM t WHERE time > now() - INTERVAL '1 day 12 hours'",
+		// B2: interval text inside a string literal on another column.
+		"SELECT * FROM t WHERE msg LIKE '%time > now() - INTERVAL 5 MINUTE%'",
+		// Identifier that starts with "interval" — must not match.
+		"SELECT * FROM t WHERE time > now() - interval2 hours_col",
+		// Mixed quoting DuckDB rejects/means differently — no pruning.
+		"SELECT * FROM t WHERE time > now() - INTERVAL '90' SECOND",
+	} {
+		if tr := p.ExtractTimeRange(q); tr != nil {
+			t.Errorf("false-positive range %v..%v extracted from: %s", tr.Start, tr.End, q)
+		}
+	}
+}

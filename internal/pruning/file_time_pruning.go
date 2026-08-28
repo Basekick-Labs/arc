@@ -27,10 +27,15 @@ import (
 //   - Backfill is safe by construction: old data arriving now lands in a new
 //     file, whose flush time always passes the predicate; the WHERE clause
 //     filters the rows.
-//   - Future-stamped data lands in a directory AHEAD of its flush time, so in
-//     the boundary directory for hour H it appears as a file whose parsed
-//     time is BEFORE H — impossible for normal ingest. Such anomalous files
-//     are always kept.
+//   - Future-stamped data whose data-hour is AHEAD of its flush hour lands in
+//     a directory ahead of its flush time, so in the boundary directory for
+//     hour H it appears as a file whose parsed time is BEFORE H — impossible
+//     for normal ingest. Such anomalous files are always kept. The residual
+//     contract: rows stamped ahead of the server clock by more than the
+//     margin but still WITHIN the same hour are indistinguishable from
+//     normal ingest and may be invisible until their hour closes (the hour
+//     rollover self-heals; plain partition pruning has no such window).
+//     Size the margin to the worst writer clock skew you expect.
 //
 // Restricting expansion to the current UTC hour has two purposes: it is the
 // only hour that accumulates uncompacted per-flush files (older hours fold at
@@ -74,7 +79,17 @@ func markVolatile(ctx context.Context) {
 // SetFileTimePruning enables or disables file-level time pruning.
 // margin widens the keep-window below the query's lower bound to absorb
 // writer clock skew (rows stamped slightly ahead of the server clock).
+// Startup-only: the fields are read unlocked by concurrent queries, so this
+// must not be called while the handler is serving.
 func (p *PartitionPruner) SetFileTimePruning(enabled bool, margin time.Duration) {
+	if margin < 0 {
+		// A negative margin would move the cutoff ABOVE the query's lower
+		// bound and prune files that certainly contain in-range rows.
+		p.logger.Warn().
+			Dur("configured_margin", margin).
+			Msg("file_time_pruning margin is negative; clamping to 0")
+		margin = 0
+	}
 	p.fileTimePruning = enabled
 	p.fileTimeMargin = margin
 	if enabled {
