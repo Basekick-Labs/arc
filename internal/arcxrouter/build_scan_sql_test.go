@@ -96,8 +96,9 @@ func TestBuildScanSQL_DeclinesUnsafe(t *testing.T) {
 		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "LIKE", num: "1"}}},                // bad op
 		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "=", num: "1x"}}},                  // bad int literal
 		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "=", num: "1.2x", isFloat: true}}}, // bad float literal
-		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "=", num: "0.0", isFloat: true}}},  // ±0.0 float (declines defense-in-depth)
-		{Shape: ShapeScan, Cols: []string{"code"}, Preds: []scanPred{{col: "a", op: "<", num: "0.0", isFloat: true}}},  // ±0.0 inequality still declines (2b-4)
+		// ±0.0 emit-time rejection LIFTED (int-coercion slice: the engine
+		// normalizes both operands) — the ±0.0 Decisions now emit; covered by
+		// the routing pins in scan_recognizer_test.
 	}
 	for i, d := range bad {
 		if _, ok := buildScanSQL(d, "['/a.parquet']"); ok {

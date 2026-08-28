@@ -314,21 +314,27 @@ func TestMatchScan_DoubleEquality(t *testing.T) {
 		!m.preds[1].isFloat || m.preds[1].op != "<=" || m.preds[1].num != "2.0" {
 		t.Fatalf("float BETWEEN should desugar to 2 float preds (2b-4): ok=%v %+v", ok, m.preds)
 	}
-	// A ±0.0 float BETWEEN bound declines (the desugared `>= 0.0` fires the guard).
-	if m, ok := eligibleShape("SELECT a FROM cpu WHERE value BETWEEN 0.0 AND 2.0"); ok && m.shape == ShapeScan {
-		t.Fatalf("±0.0 float BETWEEN bound should decline: %+v", m.preds)
+	// ±0.0 bounds and literals ROUTE since the int-coercion slice — the engine
+	// binds any zero spelling as the normalized compare (oracle-matched on the
+	// full specials matrix), so the 2b-4 router mirror is lifted.
+	for _, sql := range []string{
+		"SELECT a FROM cpu WHERE value BETWEEN 0.0 AND 2.0",
+		"SELECT a FROM cpu WHERE value = 0.0",
+		"SELECT a FROM cpu WHERE value = -0.0",
+		"SELECT a FROM cpu WHERE value != 0.0",
+		"SELECT a FROM cpu WHERE value < 0.0",
+		"SELECT a FROM cpu WHERE value >= -0.0",
+		"SELECT a FROM cpu WHERE value = 00.000",
+	} {
+		if m, ok := eligibleShape(sql); !ok || m.shape != ShapeScan {
+			t.Fatalf("±0.0 should route since the coercion slice: %q (ok=%v)", sql, ok)
+		}
 	}
 
 	// Declines the router must STILL make (mirror the engine so it never routes a decline):
 	decline := []string{
-		"SELECT a FROM cpu WHERE value = 0.0",    // ±0.0 (signed-zero divergence) — all ops
-		"SELECT a FROM cpu WHERE value = -0.0",   // "
-		"SELECT a FROM cpu WHERE value != 0.0",   // "
-		"SELECT a FROM cpu WHERE value < 0.0",    // ±0.0 inequality (2b-4 widened the guard)
-		"SELECT a FROM cpu WHERE value >= -0.0",  // "
-		"SELECT a FROM cpu WHERE value = 00.000", // ±0.0 alt spelling
-		"SELECT a FROM cpu WHERE value = 5.",     // `digit.` not a float token → junk
-		"SELECT a FROM cpu WHERE value = .5",     // `.digit` not a float token → junk
+		"SELECT a FROM cpu WHERE value = 5.", // `digit.` not a float token → junk
+		"SELECT a FROM cpu WHERE value = .5", // `.digit` not a float token → junk
 	}
 	for _, sql := range decline {
 		if m, ok := eligibleShape(sql); ok && m.shape == ShapeScan {
