@@ -52,3 +52,11 @@ require a word boundary after the unit, so interval-lookalike text inside string
 literals (e.g. a log-search `LIKE '%INTERVAL 5 MINUTE%'`) and identifiers such as
 `interval2` can never be misread as time bounds; compound quoted intervals like
 `'1 day 12 hours'` remain unpruned (never mis-pruned as their first component).
+
+## Bug fixes
+
+### Invalid Iceberg reconcile intervals now fail at config load
+
+When Iceberg export is enabled, `iceberg.reconcile_interval` must be positive.
+Zero and negative values are rejected instead of silently falling back to the
+five-minute scheduler interval.
