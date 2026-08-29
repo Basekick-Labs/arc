@@ -140,8 +140,21 @@ type ArcField struct {
 // latter must NOT mint a zero-column table via EnsureTable. A catalog error reads as false: the
 // caller's only action on true is an empty-out, so failing closed just defers to the next pass.
 func (e *Exporter) TableExists(ctx context.Context, database, measurement string) bool {
+	exists, _ := e.tableExists(ctx, database, measurement)
+	return exists
+}
+
+// tableExists distinguishes a missing table from a catalog failure so callers that cache the
+// negative result do not hide a transient catalog outage.
+func (e *Exporter) tableExists(ctx context.Context, database, measurement string) (bool, error) {
 	_, err := e.catalog.LoadTable(ctx, e.tableIdent(database, measurement))
-	return err == nil
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, icecatalog.ErrNoSuchTable) {
+		return false, nil
+	}
+	return false, err
 }
 
 // EnsureTable creates the Iceberg table for (database, measurement) if absent, using the

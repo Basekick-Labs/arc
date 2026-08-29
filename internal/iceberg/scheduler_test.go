@@ -327,6 +327,41 @@ func TestScheduler_EmptyDirNeverCreatesTable(t *testing.T) {
 	if exp.TableExists(ctx, "mydb", "ghost") {
 		t.Error("an empty measurement directory created an Iceberg table; want none")
 	}
+	key := "mydb\x00ghost"
+	if _, cached := sched.state[key]; !cached {
+		t.Fatal("an empty measurement with no table should cache its negative catalog result")
+	}
+
+	// An unchanged empty directory should remain cached and still must not create a table.
+	sched.runPass(ctx)
+	if exp.TableExists(ctx, "mydb", "ghost") {
+		t.Error("a cached empty measurement created an Iceberg table; want none")
+	}
+	if _, cached := sched.state[key]; !cached {
+		t.Fatal("the unchanged empty measurement cache entry was lost")
+	}
+
+	// Re-ingest changes the fingerprint, so the cached negative must not block normal creation.
+	writeArcStyleParquet(t, filepath.Join(root, "mydb/ghost/2023/11/14/22/reingested.parquet"), 1_700_000_000_000_000, 20)
+	sched.runPass(ctx)
+	lt, err := exp.EnsureTable(ctx, "mydb", "ghost", ArcSchema{})
+	if err != nil {
+		t.Fatalf("load re-ingested table: %v", err)
+	}
+	if files, err := exp.tableDataFiles(ctx, lt); err != nil {
+		t.Fatal(err)
+	} else if len(files) != 1 {
+		t.Fatalf("re-ingest after cached empty: want 1 file, got %d", len(files))
+	}
+
+	// runPass already drops cache entries for measurements that disappear from discovery.
+	if err := os.RemoveAll(filepath.Join(root, "mydb", "ghost")); err != nil {
+		t.Fatal(err)
+	}
+	sched.runPass(ctx)
+	if _, cached := sched.state[key]; cached {
+		t.Fatal("cache entry for a disappeared measurement was not removed")
+	}
 }
 
 // TestUnionSchema_ParallelDeterministic proves the parallelized UnionSchema still folds columns

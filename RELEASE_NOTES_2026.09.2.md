@@ -52,3 +52,11 @@ require a word boundary after the unit, so interval-lookalike text inside string
 literals (e.g. a log-search `LIKE '%INTERVAL 5 MINUTE%'`) and identifiers such as
 `interval2` can never be misread as time bounds; compound quoted intervals like
 `'1 day 12 hours'` remain unpruned (never mis-pruned as their first component).
+
+## Bug fixes
+
+### Empty Iceberg measurements cache their negative catalog result
+
+Permanently empty measurement directories with no Iceberg table now cache that
+negative state, avoiding repeated catalog lookups while preserving normal table
+creation after re-ingest and cache cleanup when the measurement disappears.
