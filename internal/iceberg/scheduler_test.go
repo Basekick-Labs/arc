@@ -364,6 +364,45 @@ func TestScheduler_EmptyDirNeverCreatesTable(t *testing.T) {
 	}
 }
 
+// TestScheduler_CatalogLookupFailureIsRetryable ensures a catalog outage is a measurement
+// failure, not an empty-table result that gets fingerprint-cached and hidden from later passes.
+func TestScheduler_CatalogLookupFailureIsRetryable(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "mydb/ghost/2023/11/14/22"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite3", filepath.Join(root, "arc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp, err := NewExporter(db, backend, "file://"+root, "arc", 0, zerolog.Nop())
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc"), Logger: zerolog.Nop()})
+
+	// Closing the catalog DB simulates an unavailable catalog while storage discovery remains
+	// healthy. The lookup must reach the scheduler's failure path and remain uncached.
+	if err := db.Close(); err != nil {
+		t.Fatalf("close catalog DB: %v", err)
+	}
+	m := Measurement{Database: "mydb", Measurement: "ghost"}
+	key := m.Database + "\x00" + m.Measurement
+	if _, err := sched.reconcileOne(ctx, m, key); err == nil {
+		t.Fatal("catalog lookup failure was swallowed; want reconcileOne error")
+	}
+	if _, cached := sched.state[key]; cached {
+		t.Fatal("catalog lookup failure was cached; next pass must retry")
+	}
+}
+
 // TestUnionSchema_ParallelDeterministic proves the parallelized UnionSchema still folds columns
 // in first-seen order regardless of which footer read finishes first, and surfaces a per-file
 // error. Uses a mix of narrow (3-col) and wide (4-col) files so cpu_idle must land last.

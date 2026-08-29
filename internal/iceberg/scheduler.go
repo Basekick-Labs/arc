@@ -202,9 +202,7 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		// spec). Schema is irrelevant when emptying — the existing table's schema is preserved.
 		exists, err := s.exporter.tableExists(ctx, m.Database, m.Measurement)
 		if err != nil {
-			s.logger.Warn().Err(err).Str("database", m.Database).Str("measurement", m.Measurement).
-				Msg("Iceberg reconcile: catalog lookup failed; will retry next pass")
-			return false, nil
+			return false, err
 		}
 		if !exists {
 			// Cache the negative result too: an empty directory with no table has no
