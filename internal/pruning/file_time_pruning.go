@@ -7,7 +7,9 @@ import (
 	"time"
 )
 
-// File-level time pruning.
+// File-level time pruning. EXPERIMENTAL in 26.09.2 (opt-in via
+// query.file_time_pruning); promotion to stable + default-on is tracked in
+// #659, targeting 27.01.1.
 //
 // Partition pruning stops at hour-directory globs; the current (live) hour of
 // a high-frequency ingest workload can accumulate thousands of small parquet

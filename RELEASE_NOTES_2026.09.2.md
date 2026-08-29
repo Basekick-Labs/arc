@@ -1,8 +1,14 @@
-# Arc v2026.12.1 Release Notes
+# Arc v2026.09.2 Release Notes
 
-> **Status:** In development.
+> **Status:** Planned — October 2026 patch release.
 
-## New: file-level time pruning for high-frequency ingest (`query.file_time_pruning`)
+## New (experimental): file-level time pruning for high-frequency ingest (`query.file_time_pruning`)
+
+**This feature is experimental in 26.09.2**: it ships disabled by default behind
+`query.file_time_pruning` and is being soaked continuously in our own dev environment
+(a one-second-ingest workload querying it around the clock). Tracking issue for
+promotion: [#659](https://github.com/Basekick-Labs/arc/issues/659) — if the multi-week
+soak and field feedback hold up, it becomes **stable and enabled by default in 27.01.1**.
 
 Arc's partition pruning narrows queries to hour directories — but a high-frequency
 ingest workload (one flush per second) accumulates thousands of small Parquet files in
