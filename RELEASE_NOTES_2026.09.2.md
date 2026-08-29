@@ -52,3 +52,15 @@ require a word boundary after the unit, so interval-lookalike text inside string
 literals (e.g. a log-search `LIKE '%INTERVAL 5 MINUTE%'`) and identifiers such as
 `interval2` can never be misread as time bounds; compound quoted intervals like
 `'1 day 12 hours'` remain unpruned (never mis-pruned as their first component).
+
+## Bug fixes
+
+### Iceberg version hints no longer advance before metadata copies publish ([#636](https://github.com/Basekick-Labs/arc/issues/636))
+
+Directory-based Iceberg readers fetch `version-hint.text` before opening the matching
+`v<N>.metadata.json` copy. A transient metadata read or copy failure could previously
+still advance the hint, leaving those readers pointed at an unavailable snapshot.
+
+Arc now publishes the hint only after the matching metadata copy succeeds. The previous
+hint remains valid during the failure, and the existing reconciliation retry path
+self-heals once storage recovers.
