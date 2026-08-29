@@ -52,3 +52,11 @@ require a word boundary after the unit, so interval-lookalike text inside string
 literals (e.g. a log-search `LIKE '%INTERVAL 5 MINUTE%'`) and identifiers such as
 `interval2` can never be misread as time bounds; compound quoted intervals like
 `'1 day 12 hours'` remain unpruned (never mis-pruned as their first component).
+
+## Bug fixes
+
+### Dedicated SQLite WAL and SHM sidecars are owner-only
+
+Dedicated SQLite handles now apply 0600 permissions to the database and its
+WAL/SHM sidecars, including when the database path uses a symlink. Missing
+sidecars remain harmless, and auth-owned handles are not reopened or modified.

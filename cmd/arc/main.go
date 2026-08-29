@@ -3710,6 +3710,27 @@ func sharedSQLiteHandle(authManager *auth.AuthManager, dbPath string) (db *sql.D
 		return nil, false, fmt.Errorf("failed to open database %s: %w", dbPath, err)
 	}
 
+	// Tighten the main database and SQLite's WAL/SHM siblings even when the
+	// files predate this handle. Resolve symlinks before addressing the
+	// sidecars: SQLite creates them beside the real database path.
+	if err := os.Chmod(dbPath, 0600); err != nil {
+		db.Close()
+		return nil, false, fmt.Errorf("failed to set database file permissions: %w", err)
+	}
+	walBase := dbPath
+	if resolved, err := filepath.EvalSymlinks(dbPath); err == nil {
+		walBase = resolved
+	} else {
+		log.Warn().Err(err).Str("db_path", dbPath).
+			Msg("Could not resolve SQLite DB symlinks; WAL/SHM permissions may not be hardened if the path is a symlink")
+	}
+	for _, ext := range []string{"-wal", "-shm"} {
+		if err := os.Chmod(walBase+ext, 0600); err != nil && !os.IsNotExist(err) {
+			db.Close()
+			return nil, false, fmt.Errorf("failed to set database %s permissions: %w", ext, err)
+		}
+	}
+
 	db.SetMaxOpenConns(1) // SQLite has a single writer
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(time.Hour)
