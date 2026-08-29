@@ -11,7 +11,7 @@ func assertSQLitePermissions(t *testing.T, paths ...string) {
 	for _, p := range paths {
 		info, err := os.Stat(p)
 		if os.IsNotExist(err) {
-			continue
+			t.Fatalf("%s does not exist", filepath.Base(p))
 		}
 		if err != nil {
 			t.Fatalf("stat %s: %v", p, err)
@@ -32,6 +32,22 @@ func TestSharedSQLiteHandle_LocksDedicatedDBAndSidecars(t *testing.T) {
 		t.Fatal("dedicated handle reports owned=false")
 	}
 	t.Cleanup(func() { db.Close() })
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin sidecar materialization transaction: %v", err)
+	}
+	if _, err := tx.Exec(`CREATE TABLE sidecar_permission_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL)`); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("create sidecar materialization table: %v", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO sidecar_permission_probe (value) VALUES ('probe')`); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("write sidecar materialization row: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit sidecar materialization transaction: %v", err)
+	}
 
 	assertSQLitePermissions(t, dbPath, dbPath+"-wal", dbPath+"-shm")
 }
