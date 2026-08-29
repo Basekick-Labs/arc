@@ -466,6 +466,16 @@ type QueryConfig struct {
 	EnableS3Cache        bool  // Enable S3 file caching for faster repeated reads (useful for CTEs/subqueries)
 	S3CacheSize          int64 // Cache size in bytes (parsed from "128MB", "256MB", etc.)
 	S3CacheTTLSeconds    int   // Cache entry TTL in seconds (default: 3600 = 1 hour)
+	// FileTimePruning (EXPERIMENTAL, 26.09.2) expands the current-hour
+	// partition glob and drops files whose filename flush-timestamp proves
+	// they cannot contain rows in the query's time range. Big win for
+	// high-frequency ingest where the live hour holds thousands of small
+	// files (local backend only). Opt-in while experimental; planned to
+	// become the default in 27.01.1 (#659).
+	FileTimePruning bool
+	// FileTimePruningMarginSeconds widens the keep-window below the query's
+	// lower bound to absorb writer clock skew (default 300).
+	FileTimePruningMarginSeconds int
 }
 
 // LicenseConfig holds configuration for enterprise license validation
@@ -947,11 +957,13 @@ func Load() (*Config, error) {
 			Enabled: v.GetBool("mqtt.enabled"),
 		},
 		Query: QueryConfig{
-			Timeout:              v.GetInt("query.timeout"),
-			SlowQueryThresholdMs: v.GetInt("query.slow_query_threshold_ms"),
-			EnableS3Cache:        v.GetBool("query.enable_s3_cache"),
-			S3CacheSize:          s3CacheSize,
-			S3CacheTTLSeconds:    v.GetInt("query.s3_cache_ttl_seconds"),
+			Timeout:                      v.GetInt("query.timeout"),
+			SlowQueryThresholdMs:         v.GetInt("query.slow_query_threshold_ms"),
+			FileTimePruning:              v.GetBool("query.file_time_pruning"),
+			FileTimePruningMarginSeconds: v.GetInt("query.file_time_pruning_margin_seconds"),
+			EnableS3Cache:                v.GetBool("query.enable_s3_cache"),
+			S3CacheSize:                  s3CacheSize,
+			S3CacheTTLSeconds:            v.GetInt("query.s3_cache_ttl_seconds"),
 		},
 		License: LicenseConfig{
 			Enabled:  v.GetBool("license.enabled"),
@@ -1614,11 +1626,13 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("mqtt.enabled", false) // Feature toggle only - disabled by default
 
 	// Query defaults
-	v.SetDefault("query.timeout", 300)               // 5 minute query timeout (0 = no timeout)
-	v.SetDefault("query.slow_query_threshold_ms", 0) // Disabled by default (0 = no slow query logging)
-	v.SetDefault("query.enable_s3_cache", false)     // Disabled by default (opt-in feature)
-	v.SetDefault("query.s3_cache_size", "128MB")     // 128MB cache (256 blocks × 512KB)
-	v.SetDefault("query.s3_cache_ttl_seconds", 3600) // 1 hour
+	v.SetDefault("query.timeout", 300)                          // 5 minute query timeout (0 = no timeout)
+	v.SetDefault("query.slow_query_threshold_ms", 0)            // Disabled by default (0 = no slow query logging)
+	v.SetDefault("query.file_time_pruning", false)              // EXPERIMENTAL (26.09.2), opt-in; planned default-on in 27.01.1 (#659)
+	v.SetDefault("query.file_time_pruning_margin_seconds", 300) // Writer clock-skew allowance
+	v.SetDefault("query.enable_s3_cache", false)                // Disabled by default (opt-in feature)
+	v.SetDefault("query.s3_cache_size", "128MB")                // 128MB cache (256 blocks × 512KB)
+	v.SetDefault("query.s3_cache_ttl_seconds", 3600)            // 1 hour
 
 	// License defaults (Enterprise features)
 	// Note: Server URL and validation interval are hardcoded in internal/license/client.go

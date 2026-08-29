@@ -1072,6 +1072,13 @@ func (h *QueryHandler) SetQueryRegistry(registry *queryregistry.Registry) {
 	h.queryRegistry = registry
 }
 
+// SetFileTimePruning enables file-level time pruning on the partition pruner
+// (see internal/pruning/file_time_pruning.go). Called from main.go after
+// construction, like SetStorageBackend.
+func (h *QueryHandler) SetFileTimePruning(enabled bool, margin time.Duration) {
+	h.pruner.SetFileTimePruning(enabled, margin)
+}
+
 // InvalidateCaches clears all internal caches (partition pruner and SQL transform cache).
 // This should be called after compaction to prevent stale file references.
 func (h *QueryHandler) InvalidateCaches() {
@@ -2569,6 +2576,11 @@ func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, header
 		return transformed, true
 	}
 
+	// Attach the volatility flag: file-level time pruning may embed an
+	// explicit live-hour file list into the transformed SQL, and caching
+	// that would hide every file flushed within the cache TTL.
+	ctx, volatile := pruning.WithVolatileResult(ctx)
+
 	// Transform using appropriate method
 	var transformed string
 	if headerDB != "" {
@@ -2577,7 +2589,9 @@ func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, header
 		transformed = h.convertSQLToStoragePaths(ctx, sql)
 	}
 
-	h.queryCache.Set(cacheKey, transformed)
+	if !volatile.Volatile {
+		h.queryCache.Set(cacheKey, transformed)
+	}
 	return transformed, false
 }
 
@@ -3013,13 +3027,22 @@ func (h *QueryHandler) buildReadParquetExprForMeasurement(ctx context.Context, d
 func (h *QueryHandler) buildReadParquetExprForParallel(ctx context.Context, path, originalSQL, keyword string) (string, *ParallelQueryInfo) {
 	options := buildReadParquetOptions()
 
+	// Attach a local volatility flag. NOTE: this SHADOWS any outer flag for
+	// the subtree (ctx.Value returns the innermost) — safe here only because
+	// this fast path's output is never stored in the SQL transform cache
+	// (the sole queryCache.Set lives in getTransformedSQL, which this path
+	// does not reach). The local flag's job: a file-time-expanded list must
+	// NOT be fanned out one-DuckDB-query-per-file by the parallel executor —
+	// its elements are individual small files, not hour partitions.
+	ctx, volatile := pruning.WithVolatileResult(ctx)
+
 	// Apply partition pruning
 	optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(ctx, path, originalSQL)
 
 	if wasOptimized {
 		if pathList, ok := optimizedPath.([]string); ok {
 			// Check if parallel execution is recommended
-			if h.parallelExecutor != nil && h.parallelExecutor.ShouldUseParallel(len(pathList)) {
+			if !volatile.Volatile && h.parallelExecutor != nil && h.parallelExecutor.ShouldUseParallel(len(pathList)) {
 				h.logger.Info().
 					Int("partition_count", len(pathList)).
 					Str("keyword", keyword).

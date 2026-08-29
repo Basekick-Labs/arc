@@ -170,11 +170,27 @@ var (
 	betweenPattern = regexp.MustCompile(`(?i)time\s+BETWEEN\s+'([^']+)'\s+AND\s+'([^']+)'`)
 
 	// Patterns for relative time expressions (NOW() +/- INTERVAL)
-	// These capture: (1) the numeric amount, (2) the time unit, and detect +/- via separate patterns
+	// These capture: (1) the numeric amount, (2) the time unit, and detect +/- via separate patterns.
+	//
+	// Two branches per direction, deliberately NOT one pattern with optional
+	// quotes (that widening shipped two silent wrong-pruning bugs in review:
+	// a compound interval like '1 day 12 hours' matched its '1 day' prefix,
+	// and interval-looking text inside string literals matched):
+	//   - quoted branch: SQL-standard INTERVAL '300 seconds' — closing quote
+	//     REQUIRED right after the unit, so compound intervals cannot match a
+	//     prefix; runs against the unmasked clause (unchanged from before).
+	//   - unquoted branch: DuckDB-native INTERVAL 300 SECOND — \s+ after
+	//     INTERVAL and \b after the unit (no interval2/identifier matches);
+	//     runs against the MASKED clause, so literal contents can never match.
 	relativeStartSubtractPattern = regexp.MustCompile(`(?i)time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
 	relativeStartAddPattern      = regexp.MustCompile(`(?i)time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
 	relativeEndSubtractPattern   = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
 	relativeEndAddPattern        = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
+
+	relativeStartSubtractUnquotedPattern = regexp.MustCompile(`(?i)time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)\b`)
+	relativeStartAddUnquotedPattern      = regexp.MustCompile(`(?i)time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)\b`)
+	relativeEndSubtractUnquotedPattern   = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)\b`)
+	relativeEndAddUnquotedPattern        = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)\b`)
 
 	// Pattern to parse storage paths
 	storagePathPattern = regexp.MustCompile(`(.+)/([^/]+)/([^/]+)/\*\*/\*\.parquet$`)
@@ -363,6 +379,12 @@ type PartitionPruner struct {
 	partitionCache *partitionCache
 	storage        storage.Backend // Optional storage backend for S3/Azure path validation
 
+	// File-level time pruning (see file_time_pruning.go). nowFn is
+	// injectable for tests; production always uses time.Now.
+	fileTimePruning bool
+	fileTimeMargin  time.Duration
+	nowFn           func() time.Time
+
 	// cleanupStarted ensures StartCleanup spawns at most one janitor
 	// goroutine per pruner. Idempotent on repeat calls — second and
 	// later invocations log a warn and return without spawning. Guards
@@ -426,6 +448,7 @@ func NewPartitionPruner(logger zerolog.Logger) *PartitionPruner {
 		stats:          PrunerStats{},
 		globCache:      newGlobCache(GlobCacheTTL),
 		partitionCache: newPartitionCache(PartitionCacheTTL),
+		nowFn:          time.Now,
 	}
 }
 
@@ -507,44 +530,44 @@ func (p *PartitionPruner) ExtractTimeRange(sqlStr string) *TimeRange {
 		}
 	}
 
-	// Try relative time patterns for start time if not found yet
+	// Try relative time patterns if not found yet. Quoted patterns run
+	// against the unmasked clause (a quoted interval IS a string literal);
+	// unquoted patterns run against the MASKED clause so interval-looking
+	// text inside string literals (e.g. a log-search LIKE) can never match.
+	// matchRelative tries one (pattern, clause, isAddition) combination.
+	matchRelative := func(re *regexp.Regexp, clause string, isAddition bool, kind string) *time.Time {
+		if match := re.FindStringSubmatch(clause); match != nil {
+			if t, err := evaluateRelativeTime(match[1], match[2], isAddition); err == nil {
+				p.logger.Debug().Time("time", t).Str("expression", kind).Msg("Found relative time bound")
+				return &t
+			}
+		}
+		return nil
+	}
 	if startTime == nil {
-		// Try NOW() - INTERVAL pattern (subtraction)
-		if match := relativeStartSubtractPattern.FindStringSubmatch(whereClause); match != nil {
-			if t, err := evaluateRelativeTime(match[1], match[2], false); err == nil {
-				startTime = &t
-				p.logger.Debug().Time("start_time", t).Str("expression", "NOW() - INTERVAL").Msg("Found relative start time")
-			}
-		}
-		// Try NOW() + INTERVAL pattern (addition)
-		if startTime == nil {
-			if match := relativeStartAddPattern.FindStringSubmatch(whereClause); match != nil {
-				if t, err := evaluateRelativeTime(match[1], match[2], true); err == nil {
-					startTime = &t
-					p.logger.Debug().Time("start_time", t).Str("expression", "NOW() + INTERVAL").Msg("Found relative start time")
-				}
-			}
-		}
+		startTime = matchRelative(relativeStartSubtractPattern, whereClause, false, "NOW() - INTERVAL")
+	}
+	if startTime == nil {
+		startTime = matchRelative(relativeStartAddPattern, whereClause, true, "NOW() + INTERVAL")
+	}
+	if startTime == nil {
+		startTime = matchRelative(relativeStartSubtractUnquotedPattern, maskedWhereClause, false, "NOW() - INTERVAL (unquoted)")
+	}
+	if startTime == nil {
+		startTime = matchRelative(relativeStartAddUnquotedPattern, maskedWhereClause, true, "NOW() + INTERVAL (unquoted)")
 	}
 
-	// Try relative time patterns for end time if not found yet
 	if endTime == nil {
-		// Try NOW() - INTERVAL pattern (subtraction)
-		if match := relativeEndSubtractPattern.FindStringSubmatch(whereClause); match != nil {
-			if t, err := evaluateRelativeTime(match[1], match[2], false); err == nil {
-				endTime = &t
-				p.logger.Debug().Time("end_time", t).Str("expression", "NOW() - INTERVAL").Msg("Found relative end time")
-			}
-		}
-		// Try NOW() + INTERVAL pattern (addition)
-		if endTime == nil {
-			if match := relativeEndAddPattern.FindStringSubmatch(whereClause); match != nil {
-				if t, err := evaluateRelativeTime(match[1], match[2], true); err == nil {
-					endTime = &t
-					p.logger.Debug().Time("end_time", t).Str("expression", "NOW() + INTERVAL").Msg("Found relative end time")
-				}
-			}
-		}
+		endTime = matchRelative(relativeEndSubtractPattern, whereClause, false, "NOW() - INTERVAL")
+	}
+	if endTime == nil {
+		endTime = matchRelative(relativeEndAddPattern, whereClause, true, "NOW() + INTERVAL")
+	}
+	if endTime == nil {
+		endTime = matchRelative(relativeEndSubtractUnquotedPattern, maskedWhereClause, false, "NOW() - INTERVAL (unquoted)")
+	}
+	if endTime == nil {
+		endTime = matchRelative(relativeEndAddUnquotedPattern, maskedWhereClause, true, "NOW() + INTERVAL (unquoted)")
 	}
 
 	// Build time range
@@ -739,6 +762,12 @@ func (p *PartitionPruner) OptimizeTablePath(ctx context.Context, originalPath, s
 		return originalPath, false
 	}
 
+	// File-level time pruning of the live-hour boundary glob. When it
+	// modifies the set, the result is volatile (an explicit file list goes
+	// stale the moment the next flush lands) and must not be cached here
+	// or by the SQL transform cache (the context flag carries that).
+	partitionPaths, fileExpanded := p.applyFileTimePruning(ctx, partitionPaths, timeRange)
+
 	var result interface{}
 	if len(partitionPaths) == 1 {
 		p.logger.Info().
@@ -752,8 +781,12 @@ func (p *PartitionPruner) OptimizeTablePath(ctx context.Context, originalPath, s
 		result = partitionPaths
 	}
 
-	// Cache the result
-	p.partitionCache.set(cacheKey, result, true)
+	// Cache the result — except when file-level expansion happened: an
+	// explicit file list is stale the moment the next flush lands, and the
+	// per-query re-glob it forces instead is a few ms.
+	if !fileExpanded {
+		p.partitionCache.set(cacheKey, result, true)
+	}
 	return result, true
 }
 
