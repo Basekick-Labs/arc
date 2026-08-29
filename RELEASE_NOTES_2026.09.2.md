@@ -52,3 +52,11 @@ require a word boundary after the unit, so interval-lookalike text inside string
 literals (e.g. a log-search `LIKE '%INTERVAL 5 MINUTE%'`) and identifiers such as
 `interval2` can never be misread as time bounds; compound quoted intervals like
 `'1 day 12 hours'` remain unpruned (never mis-pruned as their first component).
+
+## Bug fixes
+
+### Iceberg skips unreadable databases during reconciliation
+
+An unreadable database no longer aborts the entire Iceberg reconcile pass. Arc
+logs the database and continues reconciling the remaining databases, while a
+failure enumerating the top-level database list remains fatal for that pass.

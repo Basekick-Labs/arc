@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/rs/zerolog"
+
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
@@ -77,7 +79,9 @@ func (s *StorageWalkSource) Measurements(ctx context.Context) ([]Measurement, er
 		}
 		measurements, err := dl.ListDirectories(ctx, db+"/")
 		if err != nil {
-			return nil, fmt.Errorf("list measurements for %q: %w", db, err)
+			zerolog.Ctx(ctx).Error().Err(err).Str("database", db).
+				Msg("Iceberg reconcile: failed to enumerate database measurements; skipping database")
+			continue
 		}
 		for _, m := range measurements {
 			m = strings.Trim(m, "/")

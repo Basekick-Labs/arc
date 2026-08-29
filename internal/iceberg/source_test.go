@@ -1,14 +1,79 @@
 package iceberg
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/rs/zerolog"
 
 	"github.com/basekick-labs/arc/internal/storage"
 )
+
+type failingDirectoryBackend struct {
+	storage.Backend
+	failedPrefix string
+}
+
+func (b *failingDirectoryBackend) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
+	if prefix == b.failedPrefix {
+		return nil, errors.New("injected database listing failure")
+	}
+	return b.Backend.(storage.DirectoryLister).ListDirectories(ctx, prefix)
+}
+
+func TestMeasurements_SkipsUnreadableDatabase(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.Write(ctx, "gooddb/cpu/2026/07/14/15/good.parquet", []byte("PAR1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.Write(ctx, "baddb/cpu/2026/07/14/15/bad.parquet", []byte("PAR1")); err != nil {
+		t.Fatal(err)
+	}
+
+	var logs bytes.Buffer
+	logCtx := zerolog.New(&logs).WithContext(ctx)
+	src := NewStorageWalkSource(&failingDirectoryBackend{
+		Backend:      backend,
+		failedPrefix: "baddb/",
+	}, "arc")
+	ms, err := src.Measurements(logCtx)
+	if err != nil {
+		t.Fatalf("Measurements: %v", err)
+	}
+	if len(ms) != 1 || ms[0].Database != "gooddb" || ms[0].Measurement != "cpu" {
+		t.Fatalf("Measurements = %+v, want [gooddb/cpu]", ms)
+	}
+	if !strings.Contains(logs.String(), "baddb") || !strings.Contains(logs.String(), "skipping database") {
+		t.Errorf("log = %q, want skipped database and name", logs.String())
+	}
+}
+
+func TestMeasurements_ReturnsTopLevelEnumerationError(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := NewStorageWalkSource(&failingDirectoryBackend{
+		Backend:      backend,
+		failedPrefix: "",
+	}, "arc")
+	if _, err := src.Measurements(ctx); err == nil {
+		t.Fatal("expected top-level database enumeration error")
+	} else if !strings.Contains(err.Error(), "list databases") {
+		t.Errorf("Measurements() error = %v, want top-level database listing context", err)
+	}
+}
 
 // TestMeasurements_ExcludesWarehouseDirs is the H1 regression: the reconciler writes its
 // Iceberg warehouse ("<nsPrefix>_<db>.db/…") under the same storage root as the data, so the
