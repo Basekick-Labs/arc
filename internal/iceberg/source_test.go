@@ -40,12 +40,11 @@ func TestMeasurements_SkipsUnreadableDatabase(t *testing.T) {
 	}
 
 	var logs bytes.Buffer
-	logCtx := zerolog.New(&logs).WithContext(ctx)
 	src := NewStorageWalkSource(&failingDirectoryBackend{
 		Backend:      backend,
 		failedPrefix: "baddb/",
-	}, "arc")
-	ms, err := src.Measurements(logCtx)
+	}, "arc", zerolog.New(&logs))
+	ms, err := src.Measurements(ctx)
 	if err != nil {
 		t.Fatalf("Measurements: %v", err)
 	}
@@ -67,7 +66,7 @@ func TestMeasurements_ReturnsTopLevelEnumerationError(t *testing.T) {
 	src := NewStorageWalkSource(&failingDirectoryBackend{
 		Backend:      backend,
 		failedPrefix: "",
-	}, "arc")
+	}, "arc", zerolog.Nop())
 	if _, err := src.Measurements(ctx); err == nil {
 		t.Fatal("expected top-level database enumeration error")
 	} else if !strings.Contains(err.Error(), "list databases") {
@@ -99,7 +98,7 @@ func TestMeasurements_ExcludesWarehouseDirs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	src := NewStorageWalkSource(backend, "arc")
+	src := NewStorageWalkSource(backend, "arc", zerolog.Nop())
 	ms, err := src.Measurements(ctx)
 	if err != nil {
 		t.Fatalf("Measurements: %v", err)
@@ -138,7 +137,7 @@ func TestFiles_RecursesNestedPartitions(t *testing.T) {
 		}
 	}
 
-	src := NewStorageWalkSource(backend, "arc")
+	src := NewStorageWalkSource(backend, "arc", zerolog.Nop())
 	files, err := src.Files(ctx, Measurement{Database: "mydb", Measurement: "cpu"})
 	if err != nil {
 		t.Fatalf("Files: %v", err)

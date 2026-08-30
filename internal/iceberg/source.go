@@ -35,17 +35,23 @@ type StorageWalkSource struct {
 	backend  storage.Backend
 	resolver *PathResolver
 	nsPrefix string // Iceberg namespace prefix; warehouse dirs "<nsPrefix>_*.db" are excluded
+	logger   zerolog.Logger
 }
 
 // NewStorageWalkSource builds a storage-walking file-set source. nsPrefix is the exporter's
 // namespace prefix (e.g. "arc"); it must match so the walk skips the Iceberg warehouse
 // directories the exporter writes under the same storage root ("<nsPrefix>_<db>.db/…") — those
 // are Arc's own table metadata, NOT user databases, and must never be enumerated as tables.
-func NewStorageWalkSource(backend storage.Backend, nsPrefix string) *StorageWalkSource {
+func NewStorageWalkSource(backend storage.Backend, nsPrefix string, logger zerolog.Logger) *StorageWalkSource {
 	if nsPrefix == "" {
 		nsPrefix = "arc"
 	}
-	return &StorageWalkSource{backend: backend, resolver: NewPathResolver(backend), nsPrefix: nsPrefix}
+	return &StorageWalkSource{
+		backend:  backend,
+		resolver: NewPathResolver(backend),
+		nsPrefix: nsPrefix,
+		logger:   logger,
+	}
 }
 
 // isWarehouseDir reports whether a top-level directory is an Iceberg warehouse namespace
@@ -79,7 +85,7 @@ func (s *StorageWalkSource) Measurements(ctx context.Context) ([]Measurement, er
 		}
 		measurements, err := dl.ListDirectories(ctx, db+"/")
 		if err != nil {
-			zerolog.Ctx(ctx).Error().Err(err).Str("database", db).
+			s.logger.Error().Err(err).Str("database", db).
 				Msg("Iceberg reconcile: failed to enumerate database measurements; skipping database")
 			continue
 		}

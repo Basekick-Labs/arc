@@ -133,7 +133,7 @@ func (s *Scheduler) runPass(ctx context.Context) {
 		s.logger.Debug().Msg("Iceberg reconcile skipped: node is not the active writer")
 		return
 	}
-	measurements, err := s.source.Measurements(s.logger.WithContext(ctx))
+	measurements, err := s.source.Measurements(ctx)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("Iceberg reconcile: failed to enumerate measurements")
 		return
