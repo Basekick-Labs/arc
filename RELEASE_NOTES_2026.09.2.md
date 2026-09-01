@@ -121,3 +121,12 @@ Contributed by [@atirna](https://github.com/atirna) in [#678](https://github.com
 When compaction history trims to its newest 100 jobs, the retained map references are now copied into fresh slice backing storage. This prevents an older history slice from sharing the manager's current array and retaining evicted pointer-containing entries; the retained maps are intentionally not deep-copied.
 
 Contributed by [@bferanmi806-sketch](https://github.com/bferanmi806-sketch) in [#679](https://github.com/Basekick-Labs/arc/pull/679).
+
+### Local storage directory cache is bounded ([#318](https://github.com/Basekick-Labs/arc/issues/318))
+
+The local backend's directory cache, which avoids redundant `MkdirAll` calls under
+sustained ingest load, previously grew without bound as new partition directories
+were created. It is now capped at 1,024 entries with eviction on insert; a cache
+miss just repeats an idempotent directory creation.
+
+Contributed by [@mah1104ahm](https://github.com/mah1104ahm) in [#674](https://github.com/Basekick-Labs/arc/pull/674).
