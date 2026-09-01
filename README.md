@@ -438,6 +438,8 @@ For commercial licensing, contact: **enterprise@basekick.net**
 
 ## Contributors
 
+Want to join this list? See [CONTRIBUTING.md](CONTRIBUTING.md) and the [`good first issue`](https://github.com/Basekick-Labs/arc/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) queue.
+
 Thanks to everyone who has contributed code to Arc:
 
 - [@schotime](https://github.com/schotime) (Adam Schroder) — Data-time partitioning, compaction API triggers, UTC fixes, bare-JOIN SQL rewriting fix
