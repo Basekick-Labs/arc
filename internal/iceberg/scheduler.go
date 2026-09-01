@@ -200,7 +200,14 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		// Only for a table that already exists: an empty directory that never held data must not
 		// mint a zero-column table (EnsureTable would create one with no fields and no partition
 		// spec). Schema is irrelevant when emptying — the existing table's schema is preserved.
-		if !s.exporter.TableExists(ctx, m.Database, m.Measurement) {
+		exists, err := s.exporter.tableExists(ctx, m.Database, m.Measurement)
+		if err != nil {
+			return false, err
+		}
+		if !exists {
+			// Cache the negative result too: an empty directory with no table has no
+			// catalog state to reconcile, so unchanged passes need no catalog lookup.
+			s.state[key] = measurementState{fingerprint: fp}
 			return false, nil
 		}
 		hintOK, err := s.exporter.ReconcileMeasurementWithHint(ctx, m.Database, m.Measurement, ArcSchema{}, nil)
