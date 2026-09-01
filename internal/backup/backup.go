@@ -458,6 +458,10 @@ func snapshotSQLite(ctx context.Context, dbPath string) (string, error) {
 		os.RemoveAll(dir)
 		return "", fmt.Errorf("SQLite snapshot failed: %w", err)
 	}
+	if err := os.Chmod(snapshotPath, 0600); err != nil {
+		os.RemoveAll(dir)
+		return "", fmt.Errorf("failed to restrict SQLite snapshot: %w", err)
+	}
 	return snapshotPath, nil
 }
 

@@ -247,10 +247,10 @@ func (m *Manager) restoreSQLiteFile(ctx context.Context, backupID, srcName, dest
 		}
 	}
 
-	// Swap the file in by rename rather than overwriting the live inode: an
-	// open connection keeps reading and writing the old (now unlinked) inode,
-	// so pre-restore writers cannot tear or corrupt the restored file itself.
-	// They still see the pre-restore content until restart.
+	// Swap the file in by rename rather than overwriting the live inode. Existing
+	// connections keep reading and writing the old (now unlinked) inode, while a
+	// pool may open new connections against the restored file, so restart before
+	// further writes to avoid splitting state across both files.
 	staging, err := os.CreateTemp(filepath.Dir(destPath), ".restore-staging-*")
 	if err != nil {
 		return fmt.Errorf("failed to create restore staging file: %w", err)
