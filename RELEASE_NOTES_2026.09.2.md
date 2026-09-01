@@ -52,3 +52,8 @@ require a word boundary after the unit, so interval-lookalike text inside string
 literals (e.g. a log-search `LIKE '%INTERVAL 5 MINUTE%'`) and identifiers such as
 `interval2` can never be misread as time bounds; compound quoted intervals like
 `'1 day 12 hours'` remain unpruned (never mis-pruned as their first component).
+
+## Fixed: Azure not-found error detection handling joined multi-errors
+
+Azure not-found error detection (`isAzureNotFoundError`) now uses `errors.As` instead of a custom single-Unwrap loop, ensuring `azcore.ResponseError` is correctly identified even when wrapped inside joined multi-errors (`errors.Join`). ([#319](https://github.com/Basekick-Labs/arc/issues/319))
+
