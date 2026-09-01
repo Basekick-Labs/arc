@@ -154,7 +154,7 @@ UTC-hour partition layout, arcxrouter, and JSON output all assume UTC. On a
 non-UTC host, a naive timestamp literal (`WHERE time >= '2024-03-15 14:00:00'`)
 meant one instant to the pruner and a different one to the engine, so pruned
 queries could silently miss matching rows. Every Arc session now runs with
-`TimeZone='UTC'`.
+`TimeZone='UTC'` — the query engine and the compaction subprocess alike.
 
 What changes on non-UTC hosts: naive timestamp literals are always UTC;
 `date_trunc`, `time_bucket`, and `::DATE` casts on `TIMESTAMPTZ` bucket at UTC

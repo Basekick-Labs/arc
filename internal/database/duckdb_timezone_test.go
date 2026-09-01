@@ -31,6 +31,10 @@ func naiveLiteralIsUTC(t *testing.T, q interface {
 }
 
 func TestNew_PinsTimeZoneToUTC(t *testing.T) {
+	// Force a non-UTC host zone so this test guards the pin even on UTC CI
+	// runners: without it, deleting the SET still passes under TZ=UTC.
+	// DuckDB reads TZ at instance open, so Setenv before New is effective.
+	t.Setenv("TZ", "America/Costa_Rica")
 	tmp := t.TempDir()
 	storageRoot := filepath.Join(tmp, "data")
 	if err := os.MkdirAll(storageRoot, 0o700); err != nil {
@@ -68,6 +72,9 @@ func TestNaiveLiteral_MismatchWithoutPin(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	defer raw.Close()
+	// SET TimeZone is session-scoped; force a single pooled connection so
+	// the probe below runs on the session that executed the SET.
+	raw.SetMaxOpenConns(1)
 	if _, err := raw.Exec("SET TimeZone='America/Costa_Rica'"); err != nil {
 		t.Skipf("cannot set named zone (ICU unavailable?): %v", err)
 	}
