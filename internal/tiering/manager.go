@@ -435,6 +435,19 @@ func (m *Manager) ScanAndRegisterFiles(ctx context.Context) (*ScanResult, error)
 		return nil, fmt.Errorf("failed to list objects: %w", err)
 	}
 
+	// One query for the cold path set instead of a point lookup per scanned
+	// file: the scan walks every hot file, while the cold set holds only
+	// migrated daily files. Fail the scan on error rather than risk the
+	// downgrade the check exists to prevent.
+	coldFiles, err := m.metadata.GetFilesInTier(ctx, TierCold)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load cold tier paths: %w", err)
+	}
+	coldPaths := make(map[string]bool, len(coldFiles))
+	for _, f := range coldFiles {
+		coldPaths[f.Path] = true
+	}
+
 	for _, obj := range objects {
 		// Only process parquet files
 		if !strings.HasSuffix(obj.Path, ".parquet") {
@@ -458,9 +471,10 @@ func (m *Manager) ScanAndRegisterFiles(ctx context.Context) (*ScanResult, error)
 		// Never downgrade a cold row back to hot (#683): the scan lists the
 		// HOT backend, and a hot file whose row already says cold is exactly
 		// the orphan that ReconcileOrphanedFiles deletes after a failed
-		// post-migration cleanup. Re-registering it as hot would hide it from
-		// reconciliation and re-upload it to cold every cycle.
-		if existing, err := m.metadata.GetFile(ctx, obj.Path); err == nil && existing != nil && existing.Tier == TierCold {
+		// post-migration cleanup. Re-registering it as hot would reset
+		// migrated_at, hide it from reconciliation, and re-upload it to cold
+		// every cycle.
+		if coldPaths[obj.Path] {
 			result.FilesSkipped++
 			continue
 		}
@@ -524,9 +538,9 @@ func (m *Manager) parseFilePath(path string) (*filePathInfo, error) {
 	// Two accepted shapes (#683):
 	//   hour-level:  database/measurement/year/month/day/hour/filename.parquet (7 parts)
 	//   day-level:   database/measurement/year/month/day/filename.parquet      (6 parts)
-	// Day-level is where daily compaction writes its {measurement}_{date}_daily.parquet
-	// output — the only files the migrator will move to cold, so the scanner
-	// must be able to register them.
+	// Day-level is where daily compaction writes its *_daily.parquet output,
+	// the only files the migrator will move to cold, so the scanner must be
+	// able to register them.
 	if len(parts) < 6 {
 		return nil, fmt.Errorf("path too short: %s", path)
 	}

@@ -14,7 +14,7 @@ import (
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
-// ListObjects makes mockBackend an storage.ObjectLister so
+// ListObjects makes mockBackend a storage.ObjectLister so
 // ScanAndRegisterFiles can walk it.
 func (m *mockBackend) ListObjects(_ context.Context, prefix string) ([]storage.ObjectInfo, error) {
 	m.mu.RLock()
@@ -136,5 +136,31 @@ func TestScanDoesNotDowngradeColdRows(t *testing.T) {
 	meta, err := m.metadata.GetFile(ctx, dailyPath)
 	if err != nil || meta.Tier != TierCold {
 		t.Fatalf("row after rescan = (%+v, %v), want tier still cold", meta, err)
+	}
+}
+
+// Current compaction output names embed timestamp, nanos, and batch index
+// (job.go), so a regenerated daily file for a re-compacted day gets a NEW
+// path and registers as a fresh hot row; only the legacy date-only name could
+// ever collide with its migrated predecessor. Pin the modern shape.
+func TestScanRegistersModernDailyFilename(t *testing.T) {
+	m, hot, _, cleanup := setupIntegrationTest(t, true)
+	defer cleanup()
+	ctx := context.Background()
+
+	modern := "db1/cpu/2024/03/15/cpu_20240315_231459_123456789_b1_daily.parquet"
+	if err := hot.Write(ctx, modern, []byte("daily")); err != nil {
+		t.Fatal(err)
+	}
+	res, err := m.ScanAndRegisterFiles(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Errors != 0 || res.FilesRegistered != 1 {
+		t.Fatalf("scan result = %+v, want the modern-named daily file registered", res)
+	}
+	candidates, err := m.migrator.FindCandidates(ctx, TierHot, TierCold)
+	if err != nil || len(candidates) != 1 || candidates[0].Path != modern {
+		t.Fatalf("candidates = (%+v, %v), want the modern-named daily file", candidates, err)
 	}
 }
