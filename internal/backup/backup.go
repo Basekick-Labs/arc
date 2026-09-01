@@ -433,33 +433,55 @@ func (m *Manager) backupSQLite(ctx context.Context, backupID string) error {
 	return m.backupSQLiteFile(ctx, backupID, m.sqliteDBPath, "arc.db")
 }
 
-// backupSQLiteFile copies one SQLite database file into the backup under
-// metadata/<destName>. It performs a WAL checkpoint first so the copy is
-// consistent, and streams via the storage backend rather than reading the whole
-// database into memory.
-func (m *Manager) backupSQLiteFile(ctx context.Context, backupID, dbPath, destName string) error {
-	// Checkpoint WAL to ensure all data is flushed to the main DB file.
+// snapshotSQLite writes a consistent snapshot of the live database at dbPath to
+// a fresh temporary file and returns its path. The caller must remove it.
+//
+// VACUUM INTO reads the database (including un-checkpointed WAL frames) under
+// one read transaction, so concurrently committing writers cannot interleave
+// pages into the snapshot — the failure mode of checkpoint-then-copy, where a
+// checkpoint between the copy's start and end rewrites the main file mid-read
+// once the WAL passes the auto-checkpoint threshold.
+func snapshotSQLite(ctx context.Context, dbPath string) (string, error) {
+	dir, err := os.MkdirTemp(filepath.Dir(dbPath), ".arc-snapshot-*")
+	if err != nil {
+		return "", fmt.Errorf("failed to create snapshot directory: %w", err)
+	}
+	snapshotPath := filepath.Join(dir, "snapshot.db")
+
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
-		return fmt.Errorf("failed to open SQLite for checkpoint: %w", err)
+		os.RemoveAll(dir)
+		return "", fmt.Errorf("failed to open SQLite for snapshot: %w", err)
 	}
-	if _, err := db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
-		db.Close()
-		return fmt.Errorf("WAL checkpoint failed: %w", err)
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, "VACUUM INTO ?", snapshotPath); err != nil {
+		os.RemoveAll(dir)
+		return "", fmt.Errorf("SQLite snapshot failed: %w", err)
 	}
-	db.Close()
+	return snapshotPath, nil
+}
+
+// backupSQLiteFile copies one SQLite database file into the backup under
+// metadata/<destName>, as a consistent snapshot of the live database streamed
+// via the storage backend rather than a file read of the live path.
+func (m *Manager) backupSQLiteFile(ctx context.Context, backupID, dbPath, destName string) error {
+	snapshotPath, err := snapshotSQLite(ctx, dbPath)
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(filepath.Dir(snapshotPath))
 
 	// Get file size for WriteReader
-	info, err := os.Stat(dbPath)
+	info, err := os.Stat(snapshotPath)
 	if err != nil {
-		return fmt.Errorf("failed to stat SQLite database: %w", err)
+		return fmt.Errorf("failed to stat SQLite snapshot: %w", err)
 	}
 	size := info.Size()
 
-	// Stream via temp file to avoid loading entire DB into memory
-	f, err := os.Open(dbPath)
+	// Stream via temp file to avoid loading entire DB in memory
+	f, err := os.Open(snapshotPath)
 	if err != nil {
-		return fmt.Errorf("failed to open SQLite database: %w", err)
+		return fmt.Errorf("failed to open SQLite snapshot: %w", err)
 	}
 	defer f.Close()
 

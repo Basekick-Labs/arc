@@ -262,11 +262,17 @@ func (h *BackupHandler) RestoreBackup(c *fiber.Ctx) error {
 		}
 	}()
 
-	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
+	resp := fiber.Map{
 		"message":   "Restore started",
 		"backup_id": req.BackupID,
 		"status":    "running",
-	})
+	}
+	if opts.RestoreMetadata {
+		// Restored databases replace the live files by rename; open
+		// connections keep the pre-restore content until the server restarts.
+		resp["restart_required"] = true
+	}
+	return c.Status(fiber.StatusAccepted).JSON(resp)
 }
 
 // acquireOperation atomically reserves the handler's shared backup/restore slot.
