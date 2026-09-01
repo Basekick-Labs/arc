@@ -273,7 +273,7 @@ func TestScheduler_DoesNotCacheAfterHintFailure(t *testing.T) {
 
 	s := &Scheduler{
 		exporter: exp,
-		source:   NewStorageWalkSource(backend, "arc"),
+		source:   NewStorageWalkSource(backend, "arc", zerolog.Nop()),
 		logger:   zerolog.Nop(),
 		state:    make(map[string]measurementState),
 	}

@@ -70,3 +70,9 @@ self-heals once storage recovers.
 When Iceberg export is enabled, `iceberg.reconcile_interval` must be positive.
 Zero and negative values are rejected instead of silently falling back to the
 five-minute scheduler interval.
+
+### Iceberg skips unreadable databases during reconciliation
+
+An unreadable database no longer aborts the entire Iceberg reconcile pass. Arc
+logs the database and continues reconciling the remaining databases, while a
+failure enumerating the top-level database list remains fatal for that pass.
