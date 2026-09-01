@@ -3472,6 +3472,10 @@ func main() {
 
 		// Wire tiering manager to query handler for multi-tier query routing
 		queryHandler.SetTieringManager(tieringManager)
+		// A completed migration moves files between tiers, so cached pruned
+		// partition paths (pruner + SQL transform caches) go stale and must
+		// be dropped — same reason compaction invalidates them (#662).
+		tieringManager.SetOnMigrationComplete(queryHandler.InvalidateCaches)
 		log.Info().Msg("Tiering manager wired to query handler for multi-tier queries")
 
 		// Wire tiering manager to databases handler for cold-tier database/measurement listing

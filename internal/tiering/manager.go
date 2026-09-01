@@ -23,6 +23,13 @@ type Manager struct {
 	hotBackend  storage.Backend
 	coldBackend storage.Backend
 
+	// onMigrationComplete, when set, runs after a migration cycle that moved
+	// at least one file. The query layer uses it to invalidate pruner and SQL
+	// transform caches, whose cached partition paths go stale the moment a
+	// file changes tier (a cached hot hour glob that no longer matches any
+	// file makes DuckDB error on the next query within the cache TTL).
+	onMigrationComplete func()
+
 	// Data stores
 	metadata *MetadataStore
 	policies *PolicyStore
@@ -239,7 +246,18 @@ func (m *Manager) RunMigrationCycle(ctx context.Context) error {
 		Dur("duration", duration).
 		Msg("Migration cycle completed")
 
+	if totalMigrated > 0 && m.onMigrationComplete != nil {
+		m.onMigrationComplete()
+	}
+
 	return nil
+}
+
+// SetOnMigrationComplete registers a callback invoked after any migration
+// cycle that moved files between tiers. See the field comment for why the
+// query caches need it.
+func (m *Manager) SetOnMigrationComplete(fn func()) {
+	m.onMigrationComplete = fn
 }
 
 // cleanupOldMigrations deletes migration history records older than the configured retention.
