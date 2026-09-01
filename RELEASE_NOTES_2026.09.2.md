@@ -105,3 +105,11 @@ negative state, avoiding repeated catalog lookups while preserving normal table
 creation after re-ingest and cache cleanup when the measurement disappears.
 
 Contributed by [@bferanmi806-sketch](https://github.com/bferanmi806-sketch) in [#667](https://github.com/Basekick-Labs/arc/pull/667).
+
+### Azure not-found error detection handles joined multi-errors ([#319](https://github.com/Basekick-Labs/arc/issues/319))
+
+Azure not-found error detection (`isAzureNotFoundError`) now uses `errors.As` instead
+of a custom single-Unwrap loop, so an `azcore.ResponseError` is correctly identified
+even when wrapped inside joined multi-errors (`errors.Join`).
+
+Contributed by [@Thundercloud12](https://github.com/Thundercloud12) in [#670](https://github.com/Basekick-Labs/arc/pull/670).
