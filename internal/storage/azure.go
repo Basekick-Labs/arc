@@ -573,9 +573,9 @@ func isAzureNotFoundError(err error) bool {
 		return false
 	}
 
-	// Check for Azure-specific error response
+	// Check for Azure-specific error response using standard errors.As (handles multi-errors/errors.Join)
 	var respErr *azcore.ResponseError
-	if ok := isResponseError(err, &respErr); ok {
+	if errors.As(err, &respErr) {
 		return respErr.StatusCode == 404
 	}
 
@@ -586,23 +586,3 @@ func isAzureNotFoundError(err error) bool {
 		strings.Contains(errStr, "NotFound")
 }
 
-// isResponseError checks if err is an azcore.ResponseError
-func isResponseError(err error, target **azcore.ResponseError) bool {
-	if err == nil {
-		return false
-	}
-	// Use errors.As pattern
-	for err != nil {
-		if re, ok := err.(*azcore.ResponseError); ok {
-			*target = re
-			return true
-		}
-		// Try to unwrap
-		if unwrapper, ok := err.(interface{ Unwrap() error }); ok {
-			err = unwrapper.Unwrap()
-		} else {
-			break
-		}
-	}
-	return false
-}

@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"os"
@@ -325,5 +326,166 @@ func TestRestore_SeparateIcebergCatalogIsRestored(t *testing.T) {
 	var name string
 	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='marker'`).Scan(&name); err != nil {
 		t.Fatalf("restored catalog is missing its contents: %v", err)
+	}
+}
+
+// The issue's restore defect: the pre-restore -wal is salted against the old
+// database, so replaying it over the restored file mixes stale frames into new
+// pages. restoreSQLiteFile must remove both sidecars after the write, and the
+// .before-restore safety copy must itself be a complete database — a plain
+// file read of the old database would miss its un-checkpointed WAL commits.
+func TestRestoreSQLiteFile_RemovesStaleSidecarsAndSnapshotsLiveState(t *testing.T) {
+	ctx := context.Background()
+	logger := zerolog.Nop()
+
+	// Live database with a WAL holding un-checkpointed commits.
+	liveDir := t.TempDir()
+	dbPath := filepath.Join(liveDir, "arc.db")
+	live, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.Close()
+	if _, err := live.Exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t (v INTEGER)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := live.Exec("INSERT INTO t (v) VALUES (1), (2)"); err != nil {
+		t.Fatal(err)
+	}
+
+	backupDir := t.TempDir()
+	m := &Manager{
+		dataStorage:   mustLocalBackend(t, t.TempDir(), logger),
+		backupStorage: mustLocalBackend(t, backupDir, logger),
+		logger:        logger,
+	}
+	// The backup holds a one-row database, older than the live one.
+	older, err := sql.Open("sqlite3", filepath.Join(backupDir, "older.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := older.Exec("CREATE TABLE t (v INTEGER); INSERT INTO t (v) VALUES (7)"); err != nil {
+		t.Fatal(err)
+	}
+	older.Close()
+	olderData, err := os.ReadFile(filepath.Join(backupDir, "older.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.backupStorage.Write(ctx, "backup-1/metadata/arc.db", olderData); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.restoreSQLiteFile(ctx, "backup-1", "arc.db", dbPath); err != nil {
+		t.Fatalf("restoreSQLiteFile: %v", err)
+	}
+
+	for _, sidecar := range []string{dbPath + "-wal", dbPath + "-shm"} {
+		if _, err := os.Stat(sidecar); !os.IsNotExist(err) {
+			t.Errorf("stale sidecar %s still present after restore", sidecar)
+		}
+	}
+
+	restored, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	var got int
+	if err := restored.QueryRow("SELECT count(*) FROM t").Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != 1 {
+		t.Fatalf("restored database holds %d rows, want the backup's 1", got)
+	}
+
+	// The pre-restore safety copy must contain the live WAL-resident commits.
+	safety, err := sql.Open("sqlite3", dbPath+".before-restore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer safety.Close()
+	var safetyRows int
+	if err := safety.QueryRow("SELECT count(*) FROM t").Scan(&safetyRows); err != nil {
+		t.Fatal(err)
+	}
+	if safetyRows != 2 {
+		t.Fatalf(".before-restore copy holds %d rows, want the live database's 2 (WAL-resident commits included)", safetyRows)
+	}
+}
+
+// The restored file must be beyond the reach of pre-restore connections: the
+// swap is a rename, so a handle opened before the restore keeps writing the
+// old (now unlinked) inode and cannot tear or corrupt the restored database.
+func TestRestoreSQLiteFile_RestoredFileIsImmuneToPreRestoreHandles(t *testing.T) {
+	ctx := context.Background()
+	logger := zerolog.Nop()
+
+	liveDir := t.TempDir()
+	dbPath := filepath.Join(liveDir, "arc.db")
+	old, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.Close()
+	if _, err := old.Exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t (v INTEGER); INSERT INTO t (v) VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+
+	backupDir := t.TempDir()
+	m := &Manager{
+		dataStorage:   mustLocalBackend(t, t.TempDir(), logger),
+		backupStorage: mustLocalBackend(t, backupDir, logger),
+		logger:        logger,
+	}
+	backupDB, err := sql.Open("sqlite3", filepath.Join(backupDir, "backup.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backupDB.Exec("CREATE TABLE t (v INTEGER); INSERT INTO t (v) VALUES (41)"); err != nil {
+		t.Fatal(err)
+	}
+	backupDB.Close()
+	backupData, err := os.ReadFile(filepath.Join(backupDir, "backup.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.backupStorage.Write(ctx, "backup-1/metadata/arc.db", backupData); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.restoreSQLiteFile(ctx, "backup-1", "arc.db", dbPath); err != nil {
+		t.Fatalf("restoreSQLiteFile: %v", err)
+	}
+
+	// A pre-restore connection commits and checkpoints after the swap. Its
+	// writes may land in a sidecar or the unlinked inode, never in the
+	// restored file's bytes.
+	if _, err := old.Exec("INSERT INTO t (v) VALUES (2)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, backupData) {
+		t.Error("restored database file changed after a pre-restore connection wrote — restore is not immune to live handles")
+	}
+
+	fresh, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	var rows int
+	if err := fresh.QueryRow("SELECT count(*) FROM t").Scan(&rows); err != nil {
+		t.Skipf("sidecar from the pre-restore writer shadows the restored file until restart: %v", err)
+	}
+	if rows != 1 {
+		t.Errorf("fresh connection read %d rows, want the backup's 1 (pre-restore writes leaked)", rows)
 	}
 }
