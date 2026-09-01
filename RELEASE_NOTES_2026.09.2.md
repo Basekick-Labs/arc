@@ -139,7 +139,7 @@ every query, including S3/Azure LIST and GET calls on the cold archive. The
 multi-tier path now prunes each tier against its own backend: hour and day
 partitions are generated per tier, existence-filtered with backend-relative
 listings, and a tier verified to hold no data for the query's time range is
-dropped from the query outright — a recent-range dashboard query no longer
+dropped from the query outright, so a recent-range dashboard query no longer
 touches cold object storage at all. File-level time pruning (26.09.2's
 `query.file_time_pruning`) applies to the hot tier inside tiered queries too.
 Listing failures fail open to the tier's full glob, end-only time predicates
@@ -154,12 +154,23 @@ UTC-hour partition layout, arcxrouter, and JSON output all assume UTC. On a
 non-UTC host, a naive timestamp literal (`WHERE time >= '2024-03-15 14:00:00'`)
 meant one instant to the pruner and a different one to the engine, so pruned
 queries could silently miss matching rows. Every Arc session now runs with
-`TimeZone='UTC'` — the query engine and the compaction subprocess alike.
+`TimeZone='UTC'`, in the query engine and the compaction subprocess alike.
 
 What changes on non-UTC hosts: naive timestamp literals are always UTC;
 `date_trunc`, `time_bucket`, and `::DATE` casts on `TIMESTAMPTZ` bucket at UTC
-boundaries — continuous queries with daily or weekly buckets will align to UTC
+boundaries, so continuous queries with daily or weekly buckets will align to UTC
 midnight from this release onward. Zone-aware predicates remain available via
 offset literals (`'2024-03-15 14:00:00+02:00'`) or `AT TIME ZONE`. Query JSON
 output is unchanged (it was already normalized to UTC), and hosts already
 running in UTC see no change at all.
+
+### Daily-compacted files now register with tiering and migrate to cold ([#683](https://github.com/Basekick-Labs/arc/issues/683))
+
+The tiering scanner only accepted hour-level paths, while the migrator only
+moves daily-compacted `*_daily.parquet` files, which daily compaction writes
+at day level. On deployments relying on the scan for registration, scheduled
+hot-to-cold migration could therefore never find a candidate. The scanner now
+registers day-level files (partition time = start of day), and it no longer
+re-registers a file as hot when its metadata row already says cold, so a
+failed post-migration cleanup stays visible to orphan reconciliation instead
+of being re-uploaded every cycle.

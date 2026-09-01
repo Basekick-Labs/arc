@@ -435,6 +435,19 @@ func (m *Manager) ScanAndRegisterFiles(ctx context.Context) (*ScanResult, error)
 		return nil, fmt.Errorf("failed to list objects: %w", err)
 	}
 
+	// One query for the cold path set instead of a point lookup per scanned
+	// file: the scan walks every hot file, while the cold set holds only
+	// migrated daily files. Fail the scan on error rather than risk the
+	// downgrade the check exists to prevent.
+	coldFiles, err := m.metadata.GetFilesInTier(ctx, TierCold)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load cold tier paths: %w", err)
+	}
+	coldPaths := make(map[string]bool, len(coldFiles))
+	for _, f := range coldFiles {
+		coldPaths[f.Path] = true
+	}
+
 	for _, obj := range objects {
 		// Only process parquet files
 		if !strings.HasSuffix(obj.Path, ".parquet") {
@@ -452,6 +465,17 @@ func (m *Manager) ScanAndRegisterFiles(ctx context.Context) (*ScanResult, error)
 				Err(err).
 				Msg("Failed to parse file path, skipping")
 			result.Errors++
+			continue
+		}
+
+		// Never downgrade a cold row back to hot (#683): the scan lists the
+		// HOT backend, and a hot file whose row already says cold is exactly
+		// the orphan that ReconcileOrphanedFiles deletes after a failed
+		// post-migration cleanup. Re-registering it as hot would reset
+		// migrated_at, hide it from reconciliation, and re-upload it to cold
+		// every cycle.
+		if coldPaths[obj.Path] {
+			result.FilesSkipped++
 			continue
 		}
 
@@ -511,10 +535,16 @@ func (m *Manager) parseFilePath(path string) (*filePathInfo, error) {
 	path = filepath.ToSlash(path)
 	parts := strings.Split(path, "/")
 
-	// Need at least: database/measurement/year/month/day/hour/filename.parquet
-	if len(parts) < 7 {
+	// Two accepted shapes (#683):
+	//   hour-level:  database/measurement/year/month/day/hour/filename.parquet (7 parts)
+	//   day-level:   database/measurement/year/month/day/filename.parquet      (6 parts)
+	// Day-level is where daily compaction writes its *_daily.parquet output,
+	// the only files the migrator will move to cold, so the scanner must be
+	// able to register them.
+	if len(parts) < 6 {
 		return nil, fmt.Errorf("path too short: %s", path)
 	}
+	dayLevel := len(parts) == 6
 
 	database := parts[0]
 	measurement := parts[1]
@@ -543,9 +573,14 @@ func (m *Manager) parseFilePath(path string) (*filePathInfo, error) {
 		return nil, fmt.Errorf("invalid day in path: %s", parts[4])
 	}
 
-	hour, err := strconv.Atoi(parts[5])
-	if err != nil {
-		return nil, fmt.Errorf("invalid hour in path: %s", parts[5])
+	// Day-level files carry no hour segment; their partition time is the
+	// start of the day, matching the hour-start convention of hourly rows.
+	hour := 0
+	if !dayLevel {
+		hour, err = strconv.Atoi(parts[5])
+		if err != nil {
+			return nil, fmt.Errorf("invalid hour in path: %s", parts[5])
+		}
 	}
 
 	// Construct partition time (UTC)
