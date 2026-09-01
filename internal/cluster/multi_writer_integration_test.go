@@ -198,6 +198,28 @@ func TestMultiWriter_SharedStorageMode_LeaderElection_And_RoleGate(t *testing.T)
 		return raftC.LeaderID() == "writer-A"
 	}, "writer-C to recognise writer-A as leader")
 
+	// Both followers must have RECEIVED the full 3-server configuration
+	// before property 3 stops the leader. AddVoter's future resolving only
+	// proves the membership entry committed on a quorum — which can be A+C,
+	// leaving writer-B's local configuration at {A, B}. Stop A in that state
+	// and the cluster deadlocks unelectable: B needs dead A's vote, and B
+	// rejects C's vote requests as "not in configuration" (#671 — this exact
+	// race produced the CI failures with both followers seeing no leader).
+	serverCount := func(n *raft.Node) int {
+		ids, err := n.ConfigurationServerIDs()
+		if err != nil {
+			return 0
+		}
+		return len(ids)
+	}
+	waitFor(t, 10*time.Second, func() bool {
+		return serverCount(raftB) == 3 && serverCount(raftC) == 3
+	}, "writer-B and writer-C to receive the 3-server configuration", func() string {
+		bIDs, _ := raftB.ConfigurationServerIDs()
+		cIDs, _ := raftC.ConfigurationServerIDs()
+		return fmt.Sprintf("writer-B knows %v, writer-C knows %v", bIDs, cIDs)
+	})
+
 	if raftB.IsLeader() || raftC.IsLeader() {
 		t.Fatal("only writer-A should be leader at this point")
 	}
