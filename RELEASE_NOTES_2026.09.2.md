@@ -82,3 +82,9 @@ failure enumerating the top-level database list remains fatal for that pass.
 Dedicated SQLite handles now apply 0600 permissions to the database and its
 WAL/SHM sidecars, including when the database path uses a symlink. Missing
 sidecars remain harmless, and auth-owned handles are not reopened or modified.
+
+### Empty Iceberg measurements cache their negative catalog result
+
+Permanently empty measurement directories with no Iceberg table now cache that
+negative state, avoiding repeated catalog lookups while preserving normal table
+creation after re-ingest and cache cleanup when the measurement disappears.
