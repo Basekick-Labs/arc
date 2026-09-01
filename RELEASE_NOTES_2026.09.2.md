@@ -106,3 +106,12 @@ of a custom single-Unwrap loop, so an `azcore.ResponseError` is correctly identi
 even when wrapped inside joined multi-errors (`errors.Join`).
 
 Contributed by [@Thundercloud12](https://github.com/Thundercloud12) in [#670](https://github.com/Basekick-Labs/arc/pull/670).
+
+### Live SQLite backups and restores no longer risk torn database state ([#635](https://github.com/Basekick-Labs/arc/issues/635))
+
+Backups now snapshot live SQLite databases before copying them, so concurrent
+WAL writers cannot interleave pages into a backup. Restores replace the database
+by rename, remove stale WAL/SHM sidecars, and report that a restart is required
+before further writes. Temporary snapshots are restricted to the owner.
+
+Contributed by [@atirna](https://github.com/atirna) in [#678](https://github.com/Basekick-Labs/arc/pull/678).
