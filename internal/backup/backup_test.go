@@ -3,12 +3,15 @@ package backup
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
@@ -637,4 +640,106 @@ func mustLocalBackend(t *testing.T, dir string, logger zerolog.Logger) storage.B
 		t.Fatalf("failed to create local backend at %s: %v", dir, err)
 	}
 	return b
+}
+
+// The issue's backup defect: between the pre-copy checkpoint and the end of
+// the file copy, live writers keep committing, and once their WAL passes the
+// auto-checkpoint threshold a checkpoint rewrites the main file mid-copy,
+// leaving a torn backup. The test drives that race deterministically: the
+// storage backend commits and checkpoints the live database partway through
+// reading the backup source. Against the live file the backup is torn; against
+// the VACUUM INTO snapshot it cannot be, because the snapshot is frozen before
+// the copy starts.
+func TestBackupSQLiteFile_SnapshotIsImmuneToMidCopyWriters(t *testing.T) {
+	ctx := context.Background()
+	logger := zerolog.Nop()
+
+	dbPath := filepath.Join(t.TempDir(), "arc.db")
+	writer, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if _, err := writer.Exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t (v TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 500; i++ {
+		if _, err := writer.Exec("INSERT INTO t (v) VALUES (?)", fmt.Sprintf("row-%03d-padding-padding-padding", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The racing backend commits and checkpoints the live database after the
+	// backup has streamed past the first page — the mid-copy writer.
+	hook := func() {
+		if _, err := writer.Exec("UPDATE t SET v = 'overwritten-' || v"); err != nil {
+			t.Error(err)
+		}
+		if _, err := writer.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+			t.Error(err)
+		}
+	}
+	backupDir := t.TempDir()
+	real, err := storage.NewLocalBackend(backupDir, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{
+		dataStorage:   mustLocalBackend(t, t.TempDir(), logger),
+		backupStorage: &hookAfterFirstPage{Backend: real, hook: hook},
+		logger:        logger,
+	}
+	if err := m.backupSQLiteFile(ctx, "backup-1", dbPath, "arc.db"); err != nil {
+		t.Fatalf("backupSQLiteFile: %v", err)
+	}
+
+	backup, err := sql.Open("sqlite3", filepath.Join(backupDir, "backup-1", "metadata", "arc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
+	var integrity string
+	if err := backup.QueryRow("PRAGMA integrity_check").Scan(&integrity); err != nil {
+		t.Fatalf("backup is not a readable database (torn copy): %v", err)
+	}
+	if integrity != "ok" {
+		t.Fatalf("backup integrity_check = %q, want ok (torn copy)", integrity)
+	}
+	var overwritten int
+	if err := backup.QueryRow("SELECT count(*) FROM t WHERE v LIKE 'overwritten-%'").Scan(&overwritten); err != nil {
+		t.Fatal(err)
+	}
+	if overwritten != 0 {
+		t.Fatalf("mid-copy write leaked into backup: %d rows", overwritten)
+	}
+	var rows int
+	if err := backup.QueryRow("SELECT count(*) FROM t").Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 500 {
+		t.Fatalf("backup holds %d rows, want 500", rows)
+	}
+}
+
+// hookAfterFirstPage wraps a storage backend and runs hook once the backup has
+// streamed past the first pages of the source, simulating a concurrent writer
+// checkpointing mid-copy.
+type hookAfterFirstPage struct {
+	storage.Backend
+	hook  func()
+	fired bool
+}
+
+func (b *hookAfterFirstPage) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) error {
+	if b.fired {
+		return b.Backend.WriteReader(ctx, path, reader, size)
+	}
+	b.fired = true
+	first := make([]byte, 8192+2048)
+	n, err := io.ReadFull(reader, first)
+	if err != nil && err != io.ErrUnexpectedEOF {
+		return err
+	}
+	b.hook()
+	return b.Backend.WriteReader(ctx, path, io.MultiReader(bytes.NewReader(first[:n]), reader), size)
 }

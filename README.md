@@ -444,6 +444,9 @@ Thanks to everyone who has contributed code to Arc:
 - [@khalid244](https://github.com/khalid244) — S3 partition pruning improvements, multi-line SQL query support
 - [@SAY-5](https://github.com/SAY-5) (Sai Asish Y) — MQTT nil-guard hardening (handlers + manager) with regression coverage
 - [@mvanhorn](https://github.com/mvanhorn) (Matt Van Horn) — backup/restore concurrency fix: atomic admission guard so competing operations get 409 instead of silently queuing
+- [@bferanmi806-sketch](https://github.com/bferanmi806-sketch) (Enoch) — Iceberg reliability series (#663–#667): version hints published only after metadata copies land, reconcile-interval validation at config load, unreadable-database skip during reconciliation, SQLite WAL/SHM 0600 hardening, empty-measurement negative caching; compaction job-history retention fix (#679)
+- [@Thundercloud12](https://github.com/Thundercloud12) (Keerthan Poojary) — Azure not-found error detection via errors.As, covering joined multi-errors (#670)
+- [@atirna](https://github.com/atirna) (Atirna) — live SQLite backup/restore safety: VACUUM INTO snapshots for backups, rename-swap restores with stale sidecar removal, restart-required signaling (#678)
 
 And a thank-you to community members whose bug reports drove fixes:
 

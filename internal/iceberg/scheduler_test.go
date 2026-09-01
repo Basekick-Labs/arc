@@ -49,7 +49,7 @@ func TestStorageWalkSourceAndReconcile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	src := NewStorageWalkSource(backend, "arc")
+	src := NewStorageWalkSource(backend, "arc", zerolog.Nop())
 	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: src, Logger: zerolog.Nop()})
 
 	// Enumerate: should find exactly mydb/cpu.
@@ -146,7 +146,7 @@ func TestScheduler_IncrementalSkip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc"), Logger: zerolog.Nop()})
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc", zerolog.Nop()), Logger: zerolog.Nop()})
 
 	snapOf := func() int64 {
 		lt, err := exp.EnsureTable(ctx, "mydb", "cpu", ArcSchema{})
@@ -203,7 +203,7 @@ func TestScheduler_IncrementalSchemaEvolution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc"), Logger: zerolog.Nop()})
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc", zerolog.Nop()), Logger: zerolog.Nop()})
 
 	sched.runPass(ctx) // caches narrow schema
 	lt, _ := exp.EnsureTable(ctx, "mydb", "cpu", ArcSchema{})
@@ -250,7 +250,7 @@ func TestScheduler_AllFilesDeletedEmptiesTable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc"), Logger: zerolog.Nop()})
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc", zerolog.Nop()), Logger: zerolog.Nop()})
 
 	sched.runPass(ctx)
 	lt, _ := exp.EnsureTable(ctx, "mydb", "cpu", ArcSchema{})
@@ -263,7 +263,7 @@ func TestScheduler_AllFilesDeletedEmptiesTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Precondition for the bug: the measurement is still enumerated.
-	if ms, _ := NewStorageWalkSource(backend, "arc").Measurements(ctx); len(ms) != 1 {
+	if ms, _ := NewStorageWalkSource(backend, "arc", zerolog.Nop()).Measurements(ctx); len(ms) != 1 {
 		t.Fatalf("precondition: measurement should still be enumerated, got %v", ms)
 	}
 
@@ -320,12 +320,86 @@ func TestScheduler_EmptyDirNeverCreatesTable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc"), Logger: zerolog.Nop()})
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc", zerolog.Nop()), Logger: zerolog.Nop()})
 
 	sched.runPass(ctx)
 
 	if exp.TableExists(ctx, "mydb", "ghost") {
 		t.Error("an empty measurement directory created an Iceberg table; want none")
+	}
+	key := "mydb\x00ghost"
+	if _, cached := sched.state[key]; !cached {
+		t.Fatal("an empty measurement with no table should cache its negative catalog result")
+	}
+
+	// An unchanged empty directory should remain cached and still must not create a table.
+	sched.runPass(ctx)
+	if exp.TableExists(ctx, "mydb", "ghost") {
+		t.Error("a cached empty measurement created an Iceberg table; want none")
+	}
+	if _, cached := sched.state[key]; !cached {
+		t.Fatal("the unchanged empty measurement cache entry was lost")
+	}
+
+	// Re-ingest changes the fingerprint, so the cached negative must not block normal creation.
+	writeArcStyleParquet(t, filepath.Join(root, "mydb/ghost/2023/11/14/22/reingested.parquet"), 1_700_000_000_000_000, 20)
+	sched.runPass(ctx)
+	lt, err := exp.EnsureTable(ctx, "mydb", "ghost", ArcSchema{})
+	if err != nil {
+		t.Fatalf("load re-ingested table: %v", err)
+	}
+	if files, err := exp.tableDataFiles(ctx, lt); err != nil {
+		t.Fatal(err)
+	} else if len(files) != 1 {
+		t.Fatalf("re-ingest after cached empty: want 1 file, got %d", len(files))
+	}
+
+	// runPass already drops cache entries for measurements that disappear from discovery.
+	if err := os.RemoveAll(filepath.Join(root, "mydb", "ghost")); err != nil {
+		t.Fatal(err)
+	}
+	sched.runPass(ctx)
+	if _, cached := sched.state[key]; cached {
+		t.Fatal("cache entry for a disappeared measurement was not removed")
+	}
+}
+
+// TestScheduler_CatalogLookupFailureIsRetryable ensures a catalog outage is a measurement
+// failure, not an empty-table result that gets fingerprint-cached and hidden from later passes.
+func TestScheduler_CatalogLookupFailureIsRetryable(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "mydb/ghost/2023/11/14/22"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite3", filepath.Join(root, "arc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp, err := NewExporter(db, backend, "file://"+root, "arc", 0, zerolog.Nop())
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc", zerolog.Nop()), Logger: zerolog.Nop()})
+
+	// Closing the catalog DB simulates an unavailable catalog while storage discovery remains
+	// healthy. The lookup must reach the scheduler's failure path and remain uncached.
+	if err := db.Close(); err != nil {
+		t.Fatalf("close catalog DB: %v", err)
+	}
+	m := Measurement{Database: "mydb", Measurement: "ghost"}
+	key := m.Database + "\x00" + m.Measurement
+	if _, err := sched.reconcileOne(ctx, m, key); err == nil {
+		t.Fatal("catalog lookup failure was swallowed; want reconcileOne error")
+	}
+	if _, cached := sched.state[key]; cached {
+		t.Fatal("catalog lookup failure was cached; next pass must retry")
 	}
 }
 
@@ -527,7 +601,7 @@ func TestCustomWarehouseSubdir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc"), Logger: zerolog.Nop()})
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc", zerolog.Nop()), Logger: zerolog.Nop()})
 	sched.runPass(ctx)
 
 	// version-hint.text must live INSIDE the configured warehouse.
