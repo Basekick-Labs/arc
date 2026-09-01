@@ -163,3 +163,14 @@ midnight from this release onward. Zone-aware predicates remain available via
 offset literals (`'2024-03-15 14:00:00+02:00'`) or `AT TIME ZONE`. Query JSON
 output is unchanged (it was already normalized to UTC), and hosts already
 running in UTC see no change at all.
+
+### Daily-compacted files now register with tiering and migrate to cold ([#683](https://github.com/Basekick-Labs/arc/issues/683))
+
+The tiering scanner only accepted hour-level paths, while the migrator only
+moves daily-compacted `*_daily.parquet` files — which daily compaction writes
+at day level. On deployments relying on the scan for registration, scheduled
+hot-to-cold migration could therefore never find a candidate. The scanner now
+registers day-level files (partition time = start of day), and it no longer
+re-registers a file as hot when its metadata row already says cold, so a
+failed post-migration cleanup stays visible to orphan reconciliation instead
+of being re-uploaded every cycle.
