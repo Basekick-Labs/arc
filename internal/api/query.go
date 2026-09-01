@@ -1084,7 +1084,7 @@ func (h *QueryHandler) SetFileTimePruning(enabled bool, margin time.Duration) {
 func (h *QueryHandler) InvalidateCaches() {
 	h.pruner.InvalidateAllCaches()
 	h.queryCache.Invalidate()
-	h.logger.Info().Msg("Query caches invalidated after compaction")
+	h.logger.Info().Msg("Query caches invalidated (compaction or tier migration)")
 }
 
 // StartBackgroundWorkers spawns the long-lived goroutines the handler
