@@ -65,11 +65,15 @@ Arc now publishes the hint only after the matching metadata copy succeeds. The p
 hint remains valid during the failure, and the existing reconciliation retry path
 self-heals once storage recovers.
 
+Contributed by [@bferanmi806-sketch](https://github.com/bferanmi806-sketch) in [#663](https://github.com/Basekick-Labs/arc/pull/663).
+
 ### Invalid Iceberg reconcile intervals now fail at config load
 
 When Iceberg export is enabled, `iceberg.reconcile_interval` must be positive.
 Zero and negative values are rejected instead of silently falling back to the
 five-minute scheduler interval.
+
+Contributed by [@bferanmi806-sketch](https://github.com/bferanmi806-sketch) in [#664](https://github.com/Basekick-Labs/arc/pull/664).
 
 ### Iceberg skips unreadable databases during reconciliation
 
@@ -77,14 +81,20 @@ An unreadable database no longer aborts the entire Iceberg reconcile pass. Arc
 logs the database and continues reconciling the remaining databases, while a
 failure enumerating the top-level database list remains fatal for that pass.
 
+Contributed by [@bferanmi806-sketch](https://github.com/bferanmi806-sketch) in [#665](https://github.com/Basekick-Labs/arc/pull/665).
+
 ### Dedicated SQLite WAL and SHM sidecars are owner-only
 
 Dedicated SQLite handles now apply 0600 permissions to the database and its
 WAL/SHM sidecars, including when the database path uses a symlink. Missing
 sidecars remain harmless, and auth-owned handles are not reopened or modified.
 
+Contributed by [@bferanmi806-sketch](https://github.com/bferanmi806-sketch) in [#666](https://github.com/Basekick-Labs/arc/pull/666).
+
 ### Empty Iceberg measurements cache their negative catalog result
 
 Permanently empty measurement directories with no Iceberg table now cache that
 negative state, avoiding repeated catalog lookups while preserving normal table
 creation after re-ingest and cache cleanup when the measurement disappears.
+
+Contributed by [@bferanmi806-sketch](https://github.com/bferanmi806-sketch) in [#667](https://github.com/Basekick-Labs/arc/pull/667).
