@@ -145,3 +145,21 @@ touches cold object storage at all. File-level time pruning (26.09.2's
 Listing failures fail open to the tier's full glob, end-only time predicates
 never exclude cold data older than the assumed range start, and completed
 tier migrations now invalidate the query caches the same way compaction does.
+
+### Query time zone is now pinned to UTC ([#682](https://github.com/Basekick-Labs/arc/issues/682))
+
+**Behavior change on servers whose host time zone is not UTC.** DuckDB
+defaulted its session zone to the host's zone, while Arc's partition pruner,
+UTC-hour partition layout, arcxrouter, and JSON output all assume UTC. On a
+non-UTC host, a naive timestamp literal (`WHERE time >= '2024-03-15 14:00:00'`)
+meant one instant to the pruner and a different one to the engine, so pruned
+queries could silently miss matching rows. Every Arc session now runs with
+`TimeZone='UTC'`.
+
+What changes on non-UTC hosts: naive timestamp literals are always UTC;
+`date_trunc`, `time_bucket`, and `::DATE` casts on `TIMESTAMPTZ` bucket at UTC
+boundaries — continuous queries with daily or weekly buckets will align to UTC
+midnight from this release onward. Zone-aware predicates remain available via
+offset literals (`'2024-03-15 14:00:00+02:00'`) or `AT TIME ZONE`. Query JSON
+output is unchanged (it was already normalized to UTC), and hosts already
+running in UTC see no change at all.
