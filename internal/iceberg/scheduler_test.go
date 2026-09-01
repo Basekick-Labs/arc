@@ -49,7 +49,7 @@ func TestStorageWalkSourceAndReconcile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	src := NewStorageWalkSource(backend, "arc")
+	src := NewStorageWalkSource(backend, "arc", zerolog.Nop())
 	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: src, Logger: zerolog.Nop()})
 
 	// Enumerate: should find exactly mydb/cpu.
@@ -146,7 +146,7 @@ func TestScheduler_IncrementalSkip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc"), Logger: zerolog.Nop()})
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc", zerolog.Nop()), Logger: zerolog.Nop()})
 
 	snapOf := func() int64 {
 		lt, err := exp.EnsureTable(ctx, "mydb", "cpu", ArcSchema{})
@@ -203,7 +203,7 @@ func TestScheduler_IncrementalSchemaEvolution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc"), Logger: zerolog.Nop()})
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc", zerolog.Nop()), Logger: zerolog.Nop()})
 
 	sched.runPass(ctx) // caches narrow schema
 	lt, _ := exp.EnsureTable(ctx, "mydb", "cpu", ArcSchema{})
@@ -250,7 +250,7 @@ func TestScheduler_AllFilesDeletedEmptiesTable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc"), Logger: zerolog.Nop()})
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc", zerolog.Nop()), Logger: zerolog.Nop()})
 
 	sched.runPass(ctx)
 	lt, _ := exp.EnsureTable(ctx, "mydb", "cpu", ArcSchema{})
@@ -263,7 +263,7 @@ func TestScheduler_AllFilesDeletedEmptiesTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Precondition for the bug: the measurement is still enumerated.
-	if ms, _ := NewStorageWalkSource(backend, "arc").Measurements(ctx); len(ms) != 1 {
+	if ms, _ := NewStorageWalkSource(backend, "arc", zerolog.Nop()).Measurements(ctx); len(ms) != 1 {
 		t.Fatalf("precondition: measurement should still be enumerated, got %v", ms)
 	}
 
@@ -320,7 +320,7 @@ func TestScheduler_EmptyDirNeverCreatesTable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc"), Logger: zerolog.Nop()})
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc", zerolog.Nop()), Logger: zerolog.Nop()})
 
 	sched.runPass(ctx)
 
@@ -601,7 +601,7 @@ func TestCustomWarehouseSubdir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc"), Logger: zerolog.Nop()})
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc", zerolog.Nop()), Logger: zerolog.Nop()})
 	sched.runPass(ctx)
 
 	// version-hint.text must live INSIDE the configured warehouse.

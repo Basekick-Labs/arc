@@ -621,7 +621,9 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 	}()
 	// Copy the current metadata to v<N>.metadata.json (Hadoop-convention name).
 	metaKey, kOK := e.warehouseRelKey(metaLoc)
-	if kOK {
+	if !kOK {
+		okAll = false
+	} else {
 		if body, err := e.backend.Read(ctx, metaKey); err != nil {
 			e.logger.Warn().Err(err).Str("key", metaKey).Msg("Failed to read current metadata for v<N> copy (will retry next pass)")
 			okAll = false
@@ -632,6 +634,9 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 				okAll = false
 			}
 		}
+	}
+	if !okAll {
+		return false
 	}
 	// Write the version-hint pointer — just the integer, NO trailing newline (DuckDB reads the
 	// file verbatim and would look for "v<N>\n.metadata.json" otherwise; verified empirically).

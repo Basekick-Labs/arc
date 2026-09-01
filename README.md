@@ -118,10 +118,10 @@ All rows measured over a 60-second sustained run. The MessagePack Columnar row i
 a memory buffer: every record was received over HTTP, decoded, time-sorted, and
 durably written to disk as queryable Parquet, at 0.29ms median latency, on a laptop.
 
-Measured on a development build; these improvements ship in **26.09.1**: ingest no
-longer dictionary-encodes Parquet (compaction re-encodes files anyway) and the
-msgpack columnar path now decodes payloads directly into typed column arrays,
-eliminating per-value allocations — see the 26.09.1 release notes.
+These numbers ship in **26.09.1**: ingest no longer dictionary-encodes Parquet
+(compaction re-encodes files anyway) and the msgpack columnar path now decodes
+payloads directly into typed column arrays, eliminating per-value allocations —
+see the 26.09.1 release notes.
 
 ### Compaction
 
@@ -139,7 +139,7 @@ Benefits:
 
 ### Query (May 2026)
 
-Arc speaks three wire formats from the same query engine. **Arrow IPC** is the throughput leader for analytical clients (Grafana, pyarrow, polars) that can take an Arrow dependency — zero-copy from the engine's internal columnar buffers. **MessagePack** (experimental, columnar) is the choice for clients that don't speak Arrow but want smaller bytes and faster decode than JSON — same envelope shape as JSON, native binary types for timestamps and binary columns. **JSON** stays the default for ergonomic compatibility.
+Arc speaks three wire formats from the same query engine. **Arrow IPC** is the throughput leader for analytical clients (Grafana, pyarrow, polars) that can take an Arrow dependency — zero-copy from the engine's internal columnar buffers. **MessagePack** (columnar, stable as of 26.09.1) is the choice for clients that don't speak Arrow but want smaller bytes and faster decode than JSON — same envelope shape as JSON, native binary types for timestamps and binary columns. **JSON** stays the default for ergonomic compatibility.
 
 Benchmark: 393.7M-row `cpu` measurement, 5 iterations per query, M3 Max. Latency is p50 in milliseconds. The five SELECT-LIMIT rows were measured back-to-back in the same session so the three columns are apples-to-apples; the DuckDB-bound rows (Time Bucket, Date Trunc, GROUP BY) are dominated by query execution and converge across wire formats.
 
@@ -164,7 +164,7 @@ Benchmark: 393.7M-row `cpu` measurement, 5 iterations per query, M3 Max. Latency
 
 **Notes on the table:** the wire-format speedups manifest on response-heavy queries (≥100k rows) where encoding dominates the per-request wall time. For aggregations (Time Bucket, Date Trunc, GROUP BY) the response is tiny — a few rows — and DuckDB execution is 99%+ of the wall time; all three formats converge. The Arrow IPC win comes from a memcpy of the column buffer; the MessagePack endpoint walks each cell through a typed columnar encoder (one type-switch per column, not per row) and lands at ~78% of Arrow IPC's throughput while remaining decodable by any msgpack client without an Arrow dependency.
 
-The MessagePack endpoint is **experimental** (gated behind the `duckdb_arrow` build tag, no operator-tunable row cap yet) — see the 26.06.1 release notes for the wire-format spec, operational constraints, and the columnar-redesign story.
+The MessagePack endpoint is **stable** as of 26.09.1: its response shape and type vocabulary are a published contract pinned by a golden test, so clients can bind to them. It's the best general-purpose format for a client not using Arrow directly — columnar, typed, and it accepts SHOW statements, which the Arrow endpoint doesn't. See the 26.09.1 release notes for the wire-format contract.
 
 ---
 
@@ -224,23 +224,33 @@ Apple Silicon. DuckDB is statically linked, so there are no runtime dependencies
 ### Debian/Ubuntu
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v26.06.3/arc_26.06.3_amd64.deb
-sudo dpkg -i arc_26.06.3_amd64.deb
+wget https://github.com/basekick-labs/arc/releases/download/v26.09.1/arc_26.09.1_amd64.deb
+sudo dpkg -i arc_26.09.1_amd64.deb
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
 ### RHEL/Fedora
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v26.06.3/arc-26.06.3-1.x86_64.rpm
-sudo rpm -i arc-26.06.3-1.x86_64.rpm
+wget https://github.com/basekick-labs/arc/releases/download/v26.09.1/arc-26.09.1-1.x86_64.rpm
+sudo rpm -i arc-26.09.1-1.x86_64.rpm
+sudo systemctl enable arc && sudo systemctl start arc
+```
+
+### Arch Linux
+
+Works on Arch Linux and Arch-based distros such as Omarchy (x86_64 and aarch64).
+
+```bash
+wget https://github.com/basekick-labs/arc/releases/download/v26.09.1/arc-26.09.1-1-x86_64.pkg.tar.zst
+sudo pacman -U arc-26.09.1-1-x86_64.pkg.tar.zst
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
 ### Kubernetes (Helm)
 
 ```bash
-helm install arc https://github.com/basekick-labs/arc/releases/download/v26.06.3/arc-26.06.3.tgz
+helm install arc https://github.com/basekick-labs/arc/releases/download/v26.09.1/arc-26.09.1.tgz
 ```
 
 ### Build from Source
@@ -307,7 +317,7 @@ CMVP-certified; Arc itself is not a CMVP-listed module. See the
 - **Workloads**: Industrial IoT, manufacturing, energy, fleet telemetry, aerospace, observability, and event analytics
 
 - **Ingestion**: MessagePack columnar (fastest), InfluxDB Line Protocol, MQTT, TLE (satellite telemetry)
-- **Query**: Full analytical SQL; JSON, columnar MessagePack (experimental), and Apache Arrow IPC responses
+- **Query**: Full analytical SQL; JSON, columnar MessagePack, and Apache Arrow IPC responses
 - **Compaction**: Tiered (hourly/daily) automatic Parquet file merging — 10x storage reduction
 - **Data Lifecycle**: Retention policies, continuous queries, tiered storage (hot/cold)
 - **Durability**: Optional write-ahead log (WAL), backup and restore
@@ -319,7 +329,7 @@ CMVP-certified; Arc itself is not a CMVP-listed module. See the
 - **Reliability**: Circuit breakers, retry with exponential backoff
 - **Supply chain**: SBOM (SPDX + CycloneDX), Trivy scans, cosign-signed releases, SLSA L3 provenance
 - **FIPS 140-3**: Optional `arc-fips` build against the CMVP-certified Go Cryptographic Module — see [Installation](#fips-140-3-build)
-- **Edge Sync** (coming 26.09.1): Spoke-to-hub data transport for disconnected operations
+- **Edge Sync** (new in 26.09.1): Spoke-to-hub data transport for disconnected operations, over the network or via signed air-gap bundles
 
 ---
 
