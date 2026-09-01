@@ -64,3 +64,9 @@ still advance the hint, leaving those readers pointed at an unavailable snapshot
 Arc now publishes the hint only after the matching metadata copy succeeds. The previous
 hint remains valid during the failure, and the existing reconciliation retry path
 self-heals once storage recovers.
+
+### Invalid Iceberg reconcile intervals now fail at config load
+
+When Iceberg export is enabled, `iceberg.reconcile_interval` must be positive.
+Zero and negative values are rejected instead of silently falling back to the
+five-minute scheduler interval.
