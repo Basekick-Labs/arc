@@ -76,3 +76,9 @@ five-minute scheduler interval.
 An unreadable database no longer aborts the entire Iceberg reconcile pass. Arc
 logs the database and continues reconciling the remaining databases, while a
 failure enumerating the top-level database list remains fatal for that pass.
+
+### Dedicated SQLite WAL and SHM sidecars are owner-only
+
+Dedicated SQLite handles now apply 0600 permissions to the database and its
+WAL/SHM sidecars, including when the database path uses a symlink. Missing
+sidecars remain harmless, and auth-owned handles are not reopened or modified.

@@ -3698,6 +3698,30 @@ func sharedSQLiteHandle(authManager *auth.AuthManager, dbPath string) (db *sql.D
 	}
 	f.Close()
 
+	walBase := dbPath
+	if resolved, err := filepath.EvalSymlinks(dbPath); err == nil {
+		walBase = resolved
+	} else {
+		log.Warn().Err(err).Str("db_path", dbPath).
+			Msg("Could not resolve SQLite DB symlinks; WAL/SHM permissions may not be hardened if the path is a symlink")
+	}
+	// SQLite creates these siblings lazily on the first write. Pre-create them
+	// so a later write cannot create world-readable files under the process
+	// umask.
+	for _, ext := range []string{"-wal", "-shm"} {
+		sidecar := walBase + ext
+		sf, err := os.OpenFile(sidecar, os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to create database %s: %w", ext, err)
+		}
+		if err := sf.Close(); err != nil {
+			return nil, false, fmt.Errorf("failed to close database %s: %w", ext, err)
+		}
+		if err := os.Chmod(sidecar, 0600); err != nil {
+			return nil, false, fmt.Errorf("failed to set database %s permissions: %w", ext, err)
+		}
+	}
+
 	db, err = sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, false, err
@@ -3708,6 +3732,13 @@ func sharedSQLiteHandle(authManager *auth.AuthManager, dbPath string) (db *sql.D
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, false, fmt.Errorf("failed to open database %s: %w", dbPath, err)
+	}
+
+	// Tighten the main database even when it predates this handle. The sidecars
+	// were pre-created and their modes tightened above, including existing files.
+	if err := os.Chmod(dbPath, 0600); err != nil {
+		db.Close()
+		return nil, false, fmt.Errorf("failed to set database file permissions: %w", err)
 	}
 
 	db.SetMaxOpenConns(1) // SQLite has a single writer
