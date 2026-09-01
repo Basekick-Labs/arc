@@ -386,7 +386,7 @@ func TestScheduler_CatalogLookupFailureIsRetryable(t *testing.T) {
 		db.Close()
 		t.Fatal(err)
 	}
-	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc"), Logger: zerolog.Nop()})
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc", zerolog.Nop()), Logger: zerolog.Nop()})
 
 	// Closing the catalog DB simulates an unavailable catalog while storage discovery remains
 	// healthy. The lookup must reach the scheduler's failure path and remain uncached.
