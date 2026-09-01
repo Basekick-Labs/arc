@@ -186,3 +186,26 @@ func TestExtractTimeRange_MarksAssumedStart(t *testing.T) {
 		t.Fatalf("two-sided range = %+v, want StartAssumed=false", twoSided)
 	}
 }
+
+// A day with only a daily-compacted file (no hour subdirectories) must keep
+// its day-level glob and drop the hour globs, and vice versa.
+func TestPruneTierPaths_MixedHourAndDayExistence(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+	backend := &tierMock{
+		mockS3Backend: &mockS3Backend{existingDirs: map[string][]string{}},
+		files: map[string][]string{
+			"db/cpu/2024/03/15/": {"db/cpu/2024/03/15/cpu_daily.parquet"},
+		},
+	}
+	glob := "s3://bucket/db/cpu/**/*.parquet"
+
+	paths, outcome := p.PruneTierPaths(context.Background(), glob, "db", "cpu",
+		tierRange(t, "2024-03-15T14:00:00Z", "2024-03-15T16:00:00Z"), backend, false)
+
+	if outcome != TierPrunePruned {
+		t.Fatalf("outcome = %v, want TierPrunePruned", outcome)
+	}
+	if len(paths) != 1 || paths[0] != "s3://bucket/db/cpu/2024/03/15/*.parquet" {
+		t.Fatalf("paths = %v, want only the day-level glob", paths)
+	}
+}
