@@ -55,6 +55,16 @@ literals (e.g. a log-search `LIKE '%INTERVAL 5 MINUTE%'`) and identifiers such a
 
 ## Bug fixes
 
+### Iceberg version hints no longer advance before metadata copies publish ([#636](https://github.com/Basekick-Labs/arc/issues/636))
+
+Directory-based Iceberg readers fetch `version-hint.text` before opening the matching
+`v<N>.metadata.json` copy. A transient metadata read or copy failure could previously
+still advance the hint, leaving those readers pointed at an unavailable snapshot.
+
+Arc now publishes the hint only after the matching metadata copy succeeds. The previous
+hint remains valid during the failure, and the existing reconciliation retry path
+self-heals once storage recovers.
+
 ### Invalid Iceberg reconcile intervals now fail at config load
 
 When Iceberg export is enabled, `iceberg.reconcile_interval` must be positive.
