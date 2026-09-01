@@ -70,6 +70,13 @@ resources: {}
 
 # Arc-specific configuration
 arc:
+  # Optional arc.toml override. When enabled, `contents` (the full arc.toml
+  # text) is rendered into a ConfigMap and mounted at /app/arc.toml (subPath),
+  # replacing the arc.toml baked into the image. ARC_* environment variables
+  # still take precedence over the file.
+  config:
+    enabled: false
+    contents: ""
   # Storage backend: local, s3, minio
   storageBackend: local
   # Additional environment variables
