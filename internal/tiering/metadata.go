@@ -16,6 +16,14 @@ type tierCacheEntry struct {
 	expiresAt time.Time
 }
 
+func (s *MetadataStore) pruneExpiredTierCache(now time.Time) {
+	for key, entry := range s.tierCache {
+		if !now.Before(entry.expiresAt) {
+			delete(s.tierCache, key)
+		}
+	}
+}
+
 // tierCacheTTL is how long tier lookups are cached (30 seconds)
 const tierCacheTTL = 30 * time.Second
 
@@ -545,6 +553,7 @@ func (s *MetadataStore) GetTiersForMeasurement(ctx context.Context, database, me
 
 	// Update cache
 	s.tierCacheMu.Lock()
+	s.pruneExpiredTierCache(time.Now())
 	s.tierCache[cacheKey] = &tierCacheEntry{
 		tiers:     tiers,
 		expiresAt: time.Now().Add(tierCacheTTL),
