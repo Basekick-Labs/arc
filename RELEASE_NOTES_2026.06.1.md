@@ -619,6 +619,21 @@ Before 26.06.1, every Arc Enterprise cluster node carried its **own** SQLite aut
 
 **No migration of pre-existing tokens.** Tokens created on a pre-26.06.1 node by the local-only API path remain valid **only on that node** after upgrade. Operators are expected to re-issue API tokens through the new replicated path so they take effect cluster-wide. Bootstrap tokens set via `ARC_AUTH_BOOTSTRAP_TOKEN` are unaffected if the same value was used on every node (which the previous workaround required).
 
+#### Upgrade runbook for pre-26.06.1 API tokens
+
+Use this procedure during the maintenance window for every Arc Enterprise cluster that has API-created tokens from before 26.06.1:
+
+1. **Inventory before the upgrade.** On every node, record each active token's name, permissions, owner, and downstream consumers. The local databases can differ, so do not treat any one node as authoritative. Do not copy bcrypt hashes or plaintext token values into the inventory.
+2. **Back up each local auth database.** Stop Arc on the node before copying the file configured by `auth.db_path`; include its SQLite `-wal` and `-shm` sidecars when present.
+3. **Upgrade every node to 26.06.1 or later** and wait for the Raft cluster to regain a stable leader and full membership.
+4. **Verify the replicated write path.** Create one short-lived validation token through `POST /api/v1/auth/tokens`, then confirm that `arc_cluster_auth_apply_create_total` advances by the same amount on every node and that the token authenticates against every node. Revoke the validation token when the check passes.
+5. **Re-issue each inventoried token.** Create a replacement through `POST /api/v1/auth/tokens` on any node, using the original scope and permissions. Capture the returned plaintext once; Arc cannot display it again.
+6. **Rotate downstream consumers.** Update CI secrets, SDK configuration, dashboards, and other clients to the replacement value. Verify each consumer against more than one cluster node before continuing.
+7. **Revoke the old per-node token** through `POST /api/v1/auth/tokens/:id/revoke`, then verify that it fails on every node. Repeat steps 5-7 one token at a time to keep rollback scope small.
+8. **Resolve divergence alerts before rejoining a node.** If `arc_cluster_auth_rejected_total` grows or the logs report an ID collision, stop the affected node, preserve its auth database backup, and remove only the conflicting legacy rows (or rebuild the local auth database from the FSM) before rejoining. Never delete an auth database while Arc is running.
+
+The migration is complete when every active consumer uses a replacement token, the apply counters converge across nodes, the rejected counter is stable, and every legacy token fails against every node.
+
 **Divergence detection on upgrade.** Pre-26.06.1 tokens were stamped with `AUTOINCREMENT` IDs (1, 2, 3…). Cluster-replicated tokens land at `ID = Raft log index`, which can be 5+ for a freshly-bootstrapped cluster. An operator with many pre-existing tokens may have a pre-existing AUTOINCREMENT row whose ID happens to match the new cluster row's ID — silent `INSERT OR IGNORE` would mask the new row on that node while applying on every other node, leaving `VerifyToken` results divergent across the cluster. 26.06.1 detects this at materialise time: if a row at the same ID exists with a DIFFERENT token hash or name, `ApplyCreateToken` returns an error rather than overwriting silently, the `arc_cluster_auth_rejected_total` counter increments, and the cluster Apply path logs the divergence at `Error` level. Operator action: drop the diverging local `auth.db` rows (or the whole local auth DB and let the FSM repopulate) before re-joining. Identical hash + name is treated as idempotent log replay (no-op, no error), so a restart of a healthy cluster does not surface this.
 
 **Operator-facing changes.**
