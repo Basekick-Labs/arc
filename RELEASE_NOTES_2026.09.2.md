@@ -130,3 +130,18 @@ were created. It is now capped at 1,024 entries with eviction on insert; a cache
 miss just repeats an idempotent directory creation.
 
 Contributed by [@mah1104ahm](https://github.com/mah1104ahm) in [#674](https://github.com/Basekick-Labs/arc/pull/674).
+
+### Tiered queries now prune partitions per tier ([#662](https://github.com/Basekick-Labs/arc/issues/662))
+
+Since tiering shipped, a query over a measurement with an active cold tier
+bypassed partition pruning entirely: both tiers' full globs were scanned on
+every query, including S3/Azure LIST and GET calls on the cold archive. The
+multi-tier path now prunes each tier against its own backend: hour and day
+partitions are generated per tier, existence-filtered with backend-relative
+listings, and a tier verified to hold no data for the query's time range is
+dropped from the query outright — a recent-range dashboard query no longer
+touches cold object storage at all. File-level time pruning (26.09.2's
+`query.file_time_pruning`) applies to the hot tier inside tiered queries too.
+Listing failures fail open to the tier's full glob, end-only time predicates
+never exclude cold data older than the assumed range start, and completed
+tier migrations now invalidate the query caches the same way compaction does.

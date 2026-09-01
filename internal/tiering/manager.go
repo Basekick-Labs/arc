@@ -23,6 +23,16 @@ type Manager struct {
 	hotBackend  storage.Backend
 	coldBackend storage.Backend
 
+	// onMigrationComplete, when set, runs after a migration cycle that moved
+	// or deleted at least one tier file. The query layer uses it to invalidate
+	// pruner and SQL transform caches, whose cached partition paths go stale
+	// the moment a file changes tier (a cached hot hour glob that no longer
+	// matches any file makes DuckDB error on the next query within the cache
+	// TTL). Guarded by callbackMu: it is wired from main after the scheduler
+	// goroutine already runs.
+	callbackMu          sync.Mutex
+	onMigrationComplete func()
+
 	// Data stores
 	metadata *MetadataStore
 	policies *PolicyStore
@@ -239,7 +249,35 @@ func (m *Manager) RunMigrationCycle(ctx context.Context) error {
 		Dur("duration", duration).
 		Msg("Migration cycle completed")
 
+	m.notifyMigrationComplete(totalMigrated, orphansDeleted)
+
 	return nil
+}
+
+// notifyMigrationComplete fires the registered callback when a cycle changed
+// which files live on which tier. Orphan deletions count: crash-recovery
+// reconciliation can delete hot files in a cycle that migrated nothing, and a
+// cached pruned hot glob matching zero files makes DuckDB error until TTL.
+func (m *Manager) notifyMigrationComplete(migrated, orphansDeleted int) {
+	if migrated <= 0 && orphansDeleted <= 0 {
+		return
+	}
+	m.callbackMu.Lock()
+	fn := m.onMigrationComplete
+	m.callbackMu.Unlock()
+	if fn != nil {
+		fn()
+	}
+}
+
+// SetOnMigrationComplete registers a callback invoked after any migration
+// cycle that moved or deleted tier files. See the field comment for why the
+// query caches need it. Safe to call after Start: the scheduler goroutine
+// reads the callback under the same lock.
+func (m *Manager) SetOnMigrationComplete(fn func()) {
+	m.callbackMu.Lock()
+	m.onMigrationComplete = fn
+	m.callbackMu.Unlock()
 }
 
 // cleanupOldMigrations deletes migration history records older than the configured retention.
