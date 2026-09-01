@@ -211,6 +211,21 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	return m
 }
 
+// appendJobHistory keeps the newest 100 job-stat maps. When trimming is
+// required, copy the retained map references into fresh slice storage so the
+// current history does not keep an older backing array that may retain evicted
+// pointer-containing entries. The maps themselves are intentionally shared.
+func appendJobHistory(history []map[string]interface{}, jobStats map[string]interface{}) []map[string]interface{} {
+	history = append(history, jobStats)
+	if len(history) <= 100 {
+		return history
+	}
+
+	retained := make([]map[string]interface{}, 100)
+	copy(retained, history[len(history)-100:])
+	return retained
+}
+
 // SetOnCompactionComplete sets the callback invoked after each successful compaction job.
 // This is used to invalidate DuckDB and query caches in the parent process after
 // the compaction subprocess deletes old parquet files.
@@ -595,12 +610,8 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 		jobStats["success"] = false
 	}
 
-	// Add to history
-	m.jobHistory = append(m.jobHistory, jobStats)
-	// Keep last 100 jobs
-	if len(m.jobHistory) > 100 {
-		m.jobHistory = m.jobHistory[len(m.jobHistory)-100:]
-	}
+	// Add to history while holding m.mu so Stats sees a consistent history.
+	m.jobHistory = appendJobHistory(m.jobHistory, jobStats)
 	// Copy the callback while still holding the lock — main.go wires it via
 	// SetOnCompactionComplete after the schedulers have started (#351).
 	onComplete := m.onCompactionComplete

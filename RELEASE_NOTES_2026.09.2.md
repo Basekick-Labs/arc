@@ -115,3 +115,9 @@ by rename, remove stale WAL/SHM sidecars, and report that a restart is required
 before further writes. Temporary snapshots are restricted to the owner.
 
 Contributed by [@atirna](https://github.com/atirna) in [#678](https://github.com/Basekick-Labs/arc/pull/678).
+
+### Compaction job history no longer retains evicted entries ([#315](https://github.com/Basekick-Labs/arc/issues/315))
+
+When compaction history trims to its newest 100 jobs, the retained map references are now copied into fresh slice backing storage. This prevents an older history slice from sharing the manager's current array and retaining evicted pointer-containing entries; the retained maps are intentionally not deep-copied.
+
+Contributed by [@bferanmi806-sketch](https://github.com/bferanmi806-sketch) in [#679](https://github.com/Basekick-Labs/arc/pull/679).
