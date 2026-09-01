@@ -262,6 +262,47 @@ func TestLoad_IcebergRequiresLocalBackend(t *testing.T) {
 	}
 }
 
+func TestLoad_IcebergReconcileInterval(t *testing.T) {
+	tests := []struct {
+		name     string
+		interval string
+		want     int
+		wantErr  bool
+	}{
+		{name: "default", want: 300},
+		{name: "one second", interval: "1", want: 1},
+		{name: "five minutes", interval: "300", want: 300},
+		{name: "one hour", interval: "3600", want: 3600},
+		{name: "zero", interval: "0", wantErr: true},
+		{name: "negative", interval: "-1", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("ARC_ICEBERG_ENABLED", "true")
+			t.Setenv("ARC_ICEBERG_RECONCILE_INTERVAL", tt.interval)
+			t.Chdir(t.TempDir())
+
+			cfg, err := Load()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected invalid reconcile interval to fail config loading")
+				}
+				if !strings.Contains(err.Error(), "iceberg.reconcile_interval") {
+					t.Errorf("Load() error = %v, want reconcile interval validation error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Iceberg.ReconcileInterval != tt.want {
+				t.Errorf("Iceberg.ReconcileInterval = %d, want %d", cfg.Iceberg.ReconcileInterval, tt.want)
+			}
+		})
+	}
+}
+
 func TestLoad_EnvOverride(t *testing.T) {
 	// Create a temp dir without config file
 	tmpDir, err := os.MkdirTemp("", "arc-config-test")

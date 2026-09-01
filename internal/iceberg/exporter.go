@@ -134,14 +134,25 @@ type ArcField struct {
 	Type iceberg.Type
 }
 
-// TableExists reports whether the Iceberg table for (database, measurement) is already in the
-// catalog. Used by the reconciler to distinguish "this measurement's files were all deleted, so
-// empty its existing table" from "this is a stray empty directory that never held data" — the
-// latter must NOT mint a zero-column table via EnsureTable. A catalog error reads as false: the
-// caller's only action on true is an empty-out, so failing closed just defers to the next pass.
+// TableExists reports whether the Iceberg table for (database, measurement) exists, swallowing
+// catalog lookup errors and returning false.
 func (e *Exporter) TableExists(ctx context.Context, database, measurement string) bool {
+	exists, _ := e.tableExists(ctx, database, measurement)
+	return exists
+}
+
+// tableExists distinguishes a missing table from a catalog failure. Callers such as the reconciler
+// need the (bool, error) form so a transient catalog error is not interpreted and cached as a
+// confirmed missing table.
+func (e *Exporter) tableExists(ctx context.Context, database, measurement string) (bool, error) {
 	_, err := e.catalog.LoadTable(ctx, e.tableIdent(database, measurement))
-	return err == nil
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, icecatalog.ErrNoSuchTable) {
+		return false, nil
+	}
+	return false, err
 }
 
 // EnsureTable creates the Iceberg table for (database, measurement) if absent, using the
@@ -610,7 +621,9 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 	}()
 	// Copy the current metadata to v<N>.metadata.json (Hadoop-convention name).
 	metaKey, kOK := e.warehouseRelKey(metaLoc)
-	if kOK {
+	if !kOK {
+		okAll = false
+	} else {
 		if body, err := e.backend.Read(ctx, metaKey); err != nil {
 			e.logger.Warn().Err(err).Str("key", metaKey).Msg("Failed to read current metadata for v<N> copy (will retry next pass)")
 			okAll = false
@@ -621,6 +634,9 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 				okAll = false
 			}
 		}
+	}
+	if !okAll {
+		return false
 	}
 	// Write the version-hint pointer — just the integer, NO trailing newline (DuckDB reads the
 	// file verbatim and would look for "v<N>\n.metadata.json" otherwise; verified empirically).

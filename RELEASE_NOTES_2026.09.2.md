@@ -53,7 +53,56 @@ literals (e.g. a log-search `LIKE '%INTERVAL 5 MINUTE%'`) and identifiers such a
 `interval2` can never be misread as time bounds; compound quoted intervals like
 `'1 day 12 hours'` remain unpruned (never mis-pruned as their first component).
 
-## Fixed: Azure not-found error detection handling joined multi-errors
+## Bug fixes
 
-Azure not-found error detection (`isAzureNotFoundError`) now uses `errors.As` instead of a custom single-Unwrap loop, ensuring `azcore.ResponseError` is correctly identified even when wrapped inside joined multi-errors (`errors.Join`). ([#319](https://github.com/Basekick-Labs/arc/issues/319))
+### Iceberg version hints no longer advance before metadata copies publish ([#636](https://github.com/Basekick-Labs/arc/issues/636))
 
+Directory-based Iceberg readers fetch `version-hint.text` before opening the matching
+`v<N>.metadata.json` copy. A transient metadata read or copy failure could previously
+still advance the hint, leaving those readers pointed at an unavailable snapshot.
+
+Arc now publishes the hint only after the matching metadata copy succeeds. The previous
+hint remains valid during the failure, and the existing reconciliation retry path
+self-heals once storage recovers.
+
+Contributed by [@bferanmi806-sketch](https://github.com/bferanmi806-sketch) in [#663](https://github.com/Basekick-Labs/arc/pull/663).
+
+### Invalid Iceberg reconcile intervals now fail at config load
+
+When Iceberg export is enabled, `iceberg.reconcile_interval` must be positive.
+Zero and negative values are rejected instead of silently falling back to the
+five-minute scheduler interval.
+
+Contributed by [@bferanmi806-sketch](https://github.com/bferanmi806-sketch) in [#664](https://github.com/Basekick-Labs/arc/pull/664).
+
+### Iceberg skips unreadable databases during reconciliation
+
+An unreadable database no longer aborts the entire Iceberg reconcile pass. Arc
+logs the database and continues reconciling the remaining databases, while a
+failure enumerating the top-level database list remains fatal for that pass.
+
+Contributed by [@bferanmi806-sketch](https://github.com/bferanmi806-sketch) in [#665](https://github.com/Basekick-Labs/arc/pull/665).
+
+### Dedicated SQLite WAL and SHM sidecars are owner-only
+
+Dedicated SQLite handles now apply 0600 permissions to the database and its
+WAL/SHM sidecars, including when the database path uses a symlink. Missing
+sidecars remain harmless, and auth-owned handles are not reopened or modified.
+
+Contributed by [@bferanmi806-sketch](https://github.com/bferanmi806-sketch) in [#666](https://github.com/Basekick-Labs/arc/pull/666).
+
+### Empty Iceberg measurements cache their negative catalog result
+
+Permanently empty measurement directories with no Iceberg table now cache that
+negative state, avoiding repeated catalog lookups while preserving normal table
+creation after re-ingest and cache cleanup when the measurement disappears.
+
+Contributed by [@bferanmi806-sketch](https://github.com/bferanmi806-sketch) in [#667](https://github.com/Basekick-Labs/arc/pull/667).
+
+### Azure not-found error detection handles joined multi-errors ([#319](https://github.com/Basekick-Labs/arc/issues/319))
+
+Azure not-found error detection (`isAzureNotFoundError`) now uses `errors.As` instead
+of a custom single-Unwrap loop, so an `azcore.ResponseError` is correctly identified
+even when wrapped inside joined multi-errors (`errors.Join`).
+
+Contributed by [@Thundercloud12](https://github.com/Thundercloud12) in [#670](https://github.com/Basekick-Labs/arc/pull/670).
