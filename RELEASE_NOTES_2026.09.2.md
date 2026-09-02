@@ -200,3 +200,15 @@ The marking runs before tier metadata flips and before any delete, and a
 marking failure aborts the migration batch, so a sync-index outage can never
 strand an unmarked deletion. On deployments without an edge-sync hub, spoke
 files (if any exist) remain registered but excluded from migration.
+
+### Config-only restores now report `restart_required` (follow-up to [#678](https://github.com/Basekick-Labs/arc/pull/678))
+
+`POST /api/v1/backup/restore` returned `restart_required: true` only when
+metadata (SQLite databases) was restored. A config-only restore needs the same
+restart — the restored `arc.toml` only takes effect on reload, which
+`restoreConfig` already logs — but the response did not say so. The flag now
+covers both restore kinds; a data-only restore still omits it. The restored-
+database immunity test also fails instead of skipping when a fresh connection
+cannot read the restored file.
+
+Contributed by [@atirna](https://github.com/atirna) in [#689](https://github.com/Basekick-Labs/arc/pull/689).

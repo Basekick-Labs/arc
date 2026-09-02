@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -287,4 +288,46 @@ func TestDeleteBackupSharesAdmissionSlot(t *testing.T) {
 	}
 	waitForListCalls(t, rig.storage, 2)
 	waitForOperationRelease(t, rig.handler)
+}
+
+// The restore response must tell operators when a restart is needed: restored
+// databases replace the live files by rename and a restored config only takes
+// effect on reload. A config-only restore is explicitly restart-required too,
+// and a data-only restore is not.
+func TestRestoreBackupReportsRestartRequired(t *testing.T) {
+	rig := newBackupRouteRig(t, nil)
+	close(rig.storage.release)
+
+	restore := func(t *testing.T, body string) map[string]any {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/backup/restore", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := rig.app.Test(req, 5_000)
+		if err != nil {
+			t.Fatalf("POST restore: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != fiber.StatusAccepted {
+			t.Fatalf("restore status = %d, want 202", resp.StatusCode)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode restore response: %v", err)
+		}
+		waitForOperationRelease(t, rig.handler)
+		return payload
+	}
+
+	meta := restore(t, `{"backup_id":"backup-20260901-000000-00000000","confirm":true,"restore_data":false,"restore_metadata":true}`)
+	if meta["restart_required"] != true {
+		t.Errorf("metadata restore: restart_required = %v, want true", meta["restart_required"])
+	}
+	cfg := restore(t, `{"backup_id":"backup-20260901-000000-00000000","confirm":true,"restore_data":false,"restore_metadata":false,"restore_config":true}`)
+	if cfg["restart_required"] != true {
+		t.Errorf("config-only restore: restart_required = %v, want true", cfg["restart_required"])
+	}
+	data := restore(t, `{"backup_id":"backup-20260901-000000-00000000","confirm":true,"restore_data":true,"restore_metadata":false,"restore_config":false}`)
+	if _, present := data["restart_required"]; present {
+		t.Errorf("data-only restore: restart_required = %v, want absent", data["restart_required"])
+	}
 }

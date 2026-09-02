@@ -483,7 +483,7 @@ func TestRestoreSQLiteFile_RestoredFileIsImmuneToPreRestoreHandles(t *testing.T)
 	defer fresh.Close()
 	var rows int
 	if err := fresh.QueryRow("SELECT count(*) FROM t").Scan(&rows); err != nil {
-		t.Skipf("sidecar from the pre-restore writer shadows the restored file until restart: %v", err)
+		t.Fatalf("restored database is not readable by a fresh connection: %v", err)
 	}
 	if rows != 1 {
 		t.Errorf("fresh connection read %d rows, want the backup's 1 (pre-restore writes leaked)", rows)
