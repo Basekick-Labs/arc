@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -312,8 +311,8 @@ func TestRestoreBackupReportsRestartRequired(t *testing.T) {
 			t.Fatalf("restore status = %d, want 202", resp.StatusCode)
 		}
 		var payload map[string]any
-		if err := json.Unmarshal([]byte(readAll(t, resp.Body)), &payload); err != nil {
-			t.Fatalf("unmarshal restore response: %v", err)
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode restore response: %v", err)
 		}
 		waitForOperationRelease(t, rig.handler)
 		return payload
@@ -331,13 +330,4 @@ func TestRestoreBackupReportsRestartRequired(t *testing.T) {
 	if _, present := data["restart_required"]; present {
 		t.Errorf("data-only restore: restart_required = %v, want absent", data["restart_required"])
 	}
-}
-
-func readAll(t *testing.T, r io.Reader) []byte {
-	t.Helper()
-	b, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatalf("read response body: %v", err)
-	}
-	return b
 }

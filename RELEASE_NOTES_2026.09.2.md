@@ -65,7 +65,7 @@ covers both restore kinds; a data-only restore still omits it. The restored-
 database immunity test also fails instead of skipping when a fresh connection
 cannot read the restored file.
 
-Contributed by [@atirna](https://github.com/atirna).
+Contributed by [@atirna](https://github.com/atirna) in [#689](https://github.com/Basekick-Labs/arc/pull/689).
 
 ### Iceberg version hints no longer advance before metadata copies publish ([#636](https://github.com/Basekick-Labs/arc/issues/636))
 
