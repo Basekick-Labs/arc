@@ -57,9 +57,10 @@ literals (e.g. a log-search `LIKE '%INTERVAL 5 MINUTE%'`) and identifiers such a
 
 ### S3 query paths now follow calendar days across DST ([#321](https://github.com/Basekick-Labs/arc/issues/321))
 
-S3 time-range pruning now builds one inclusive partition path per calendar day in
-the range's starting time zone. Non-UTC offsets and daylight-saving transitions
-no longer shift the first or last date or skip a local day.
+S3 time-range path generation now builds one inclusive partition path per UTC
+calendar day covering the range, matching Arc's UTC partition layout. Non-UTC
+inputs are normalized to UTC, and daylight-saving transitions can no longer
+shift, skip, or duplicate a date.
 
 Contributed by [@copacabanaservice01](https://github.com/copacabanaservice01) in [#690](https://github.com/Basekick-Labs/arc/pull/690).
 

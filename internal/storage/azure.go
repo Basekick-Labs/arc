@@ -585,4 +585,3 @@ func isAzureNotFoundError(err error) bool {
 		strings.Contains(errStr, "404") ||
 		strings.Contains(errStr, "NotFound")
 }
-

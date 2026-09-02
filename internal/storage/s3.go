@@ -685,14 +685,17 @@ func (b *S3Backend) GetQueryPath(database, measurement string, year, month, day,
 func (b *S3Backend) GetQueryPathRange(database, measurement string, startTime, endTime time.Time) []string {
 	var paths []string
 
-	// Generate paths for each calendar day in the range. Truncate(24h) and
-	// Add(24h) operate on elapsed time, so they shift local dates across UTC
-	// offsets and daylight-saving transitions.
-	location := startTime.Location()
-	startYear, startMonth, startDay := startTime.Date()
-	current := time.Date(startYear, startMonth, startDay, 0, 0, 0, 0, location)
-	endYear, endMonth, endDay := endTime.In(location).Date()
-	end := time.Date(endYear, endMonth, endDay, 0, 0, 0, 0, location).AddDate(0, 0, 1)
+	// Generate one path per UTC calendar day covering the range. Arc's
+	// partition directories are UTC dates (ingestion, pruning, and the query
+	// engine's pinned session zone all agree), so the inputs are normalized
+	// to UTC first: anchoring to a caller's local zone would skip the
+	// trailing UTC partition for west-of-UTC ranges and add a spurious
+	// leading one (#690 follow-up). AddDate keeps day-stepping calendar-
+	// correct, which in UTC is also DST-proof (#321).
+	startYear, startMonth, startDay := startTime.UTC().Date()
+	current := time.Date(startYear, startMonth, startDay, 0, 0, 0, 0, time.UTC)
+	endYear, endMonth, endDay := endTime.UTC().Date()
+	end := time.Date(endYear, endMonth, endDay, 0, 0, 0, 0, time.UTC).AddDate(0, 0, 1)
 
 	for current.Before(end) {
 		path := fmt.Sprintf("s3://%s/%s%s/%s/%04d/%02d/%02d/*/*.parquet",
