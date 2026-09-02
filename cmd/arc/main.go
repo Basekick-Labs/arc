@@ -3162,6 +3162,8 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize Iceberg exporter")
 		}
+		// #639 item 3: database deletion clears the Iceberg catalog too.
+		databasesHandler.SetIcebergDropper(exporter)
 		icebergSource := iceberg.NewStorageWalkSource(storageBackend, cfg.Iceberg.NamespacePrefix, logger.Get("iceberg"))
 		// Writer gate: in cluster mode reuse the compaction gate; nil in OSS (single node, always
 		// runs). SINGLE-WRITER REQUIREMENT: the reconciler writes version-hint.text / v<N>.json
