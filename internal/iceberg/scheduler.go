@@ -43,6 +43,13 @@ type Scheduler struct {
 	// without re-reading footers. Accessed only from the single loop() goroutine — no lock.
 	state map[string]measurementState
 
+	// gatedWarnOnce fires the first-gated WARN a single time per process
+	// (#639 item 2): the per-tick Debug is invisible at default log levels,
+	// so a cluster with no compactor-role node silently never exported.
+	// Only the loop() goroutine touches it. A node demoted after having run
+	// does not re-warn; the startup case is the observability gap.
+	gatedWarnOnce bool
+
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -130,6 +137,10 @@ func (s *Scheduler) loop(ctx context.Context) {
 // takes effect without a restart (nil gate = always run).
 func (s *Scheduler) runPass(ctx context.Context) {
 	if s.gate != nil && !s.gate.CanRun() {
+		if !s.gatedWarnOnce {
+			s.gatedWarnOnce = true
+			s.logger.Warn().Msg("Iceberg reconcile is gated off on this node (not the active compactor). If no node in the cluster holds a compactor role, Iceberg export never runs; assign one to enable it")
+		}
 		s.logger.Debug().Msg("Iceberg reconcile skipped: node is not the active writer")
 		return
 	}

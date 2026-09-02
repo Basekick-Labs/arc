@@ -218,3 +218,15 @@ restores additionally report `staged: true`, since the restored databases are
 applied at the next start rather than swapped live.
 
 Contributed by [@atirna](https://github.com/atirna) in [#689](https://github.com/Basekick-Labs/arc/pull/689).
+
+### Iceberg audit sweep completion, part 1 ([#639](https://github.com/Basekick-Labs/arc/issues/639) items 2, 5, 7, 8)
+
+Four small hardenings from the Iceberg audit. A cluster node whose reconciler
+is gated off (no compactor role) now warns once at first occurrence instead of
+only logging at debug level every tick, so an export that silently never runs
+becomes visible. `warehouseRelKey` resolves symlinks before comparing paths,
+so a symlinked storage root no longer lands every commit in "hint
+unaddressable" mode. Local warehouse metadata written by the embedded Iceberg
+library is tightened to owner-only permissions after each commit (tighten
+only; deliberately restrictive modes are never loosened). Restore staging
+streams from backup storage instead of buffering entire databases in memory.

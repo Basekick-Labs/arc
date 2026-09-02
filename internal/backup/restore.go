@@ -229,20 +229,21 @@ func (m *Manager) restoreSQLite(ctx context.Context, backupID string) error {
 // cancel by deleting the .pending-restore file before restarting.
 func (m *Manager) restoreSQLiteFile(ctx context.Context, backupID, srcName, destPath string) error {
 	srcPath := fmt.Sprintf("%s/metadata/%s", backupID, srcName)
-	data, err := m.backupStorage.Read(ctx, srcPath)
-	if err != nil {
-		return fmt.Errorf("failed to read SQLite backup: %w", err)
-	}
 
+	// Stream from backup storage into the staging file (#639 item 8): the
+	// shared database can be multi-GB on audit-heavy deployments, and
+	// buffering it in memory violates the streaming rule everywhere else in
+	// this package. CreateTemp creates 0600 before any byte lands, and the
+	// staging file is renamed into the pending path only on full success.
 	staging, err := os.CreateTemp(filepath.Dir(destPath), ".restore-staging-*")
 	if err != nil {
 		return fmt.Errorf("failed to create restore staging file: %w", err)
 	}
 	stagingPath := staging.Name()
-	if _, err := staging.Write(data); err != nil {
+	if err := m.backupStorage.ReadTo(ctx, srcPath, staging); err != nil {
 		staging.Close()
 		os.Remove(stagingPath)
-		return fmt.Errorf("failed to write staged restore: %w", err)
+		return fmt.Errorf("failed to stream SQLite backup into staging: %w", err)
 	}
 	if err := staging.Close(); err != nil {
 		os.Remove(stagingPath)
