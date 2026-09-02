@@ -134,6 +134,23 @@ func (m *Migrator) FindCandidates(ctx context.Context, fromTier, toTier Tier) ([
 			continue
 		}
 
+		// Spoke-namespace files register for visibility but do NOT migrate
+		// yet: legacy spoke-side compacted files sync once and carry
+		// sync_received receipts, and deleting their hot copy would make
+		// confirmPresent forget the receipt — the spoke then re-offers the
+		// file and the hub re-accepts a duplicate next to the cold copy (the
+		// #611 hazard class, #687). The path shape decides, via the same
+		// parser that registers files: content-based heuristics (numeric
+		// spoke measurement names) and metadata-based reconstruction
+		// (synthetic or legacy PartitionTime values) both misclassify.
+		// An unparseable path is skipped conservatively.
+		info, err := m.manager.parseFilePath(file.Path)
+		if err != nil || info.SpokeNamespaced {
+			m.manager.logger.Debug().Str("path", file.Path).
+				Msg("Skipping spoke-namespace or unrecognized file for cold migration (#687)")
+			continue
+		}
+
 		candidates = append(candidates, MigrationCandidate{
 			Path:          file.Path,
 			Database:      file.Database,

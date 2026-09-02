@@ -209,3 +209,27 @@ func TestPruneTierPaths_MixedHourAndDayExistence(t *testing.T) {
 		t.Fatalf("paths = %v, want only the day-level glob", paths)
 	}
 }
+
+// A spoke-namespace query reaches the pruner with the query layer's
+// (spoke, spoke-db) split, so generated partition paths sit one level too
+// shallow and existence-filter to verified-empty. Pin that outcome: the
+// query layer's combine rules rely on it (an Empty without any Pruned tier
+// keeps the full glob, so spoke queries stay correct, just unpruned).
+func TestPruneTierPaths_SpokeShapedLayoutIsEmptyNotPruned(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+	base := t.TempDir()
+	deep := filepath.Join(base, "rocket-01", "telemetry", "engine_temp", "2024", "03", "15", "14")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(deep, "f.parquet"), []byte("p"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	glob := base + "/rocket-01/telemetry/**/*.parquet"
+
+	paths, outcome := p.PruneTierPaths(context.Background(), glob, "rocket-01", "telemetry",
+		tierRange(t, "2024-03-15T14:00:00Z", "2024-03-15T15:00:00Z"), nil, false)
+	if outcome != TierPruneEmpty {
+		t.Fatalf("spoke-shaped outcome = %v (paths=%v), want TierPruneEmpty — pruned paths would miss the extra namespace level", outcome, paths)
+	}
+}

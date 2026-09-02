@@ -174,3 +174,17 @@ registers day-level files (partition time = start of day), and it no longer
 re-registers a file as hot when its metadata row already says cold, so a
 failed post-migration cleanup stays visible to orphan reconciliation instead
 of being re-uploaded every cycle.
+
+### Spoke-namespace files now register with tiering ([#686](https://github.com/Basekick-Labs/arc/pull/686) follow-up)
+
+On an edge-sync hub, spoke data lives one path level deeper than the standard
+layout, and the tiering scanner errored on every spoke file. The scanner now
+parses partition paths by their date tail (the same approach hub compaction
+adopted in #619) and registers spoke files under the query-visible naming
+(database = spoke ID). Spoke files are deliberately excluded from hot-to-cold
+migration for now: legacy spoke-synced daily files carry sync receipts that a
+migration delete would forget, re-introducing upload duplicates; cold
+migration of spoke data ships separately with receipt-aware handling. Tiered
+queries touching spoke namespaces stay correct and unpruned: a tier may only
+be dropped from a query on the strength of a positive pruning result from
+another tier.

@@ -3147,6 +3147,53 @@ func (h *QueryHandler) extractDBMeasurementFromPath(path string) (database, meas
 	return "", ""
 }
 
+// tierPruneResult pairs one tier's full glob with its pruning outcome.
+type tierPruneResult struct {
+	glob    string
+	paths   []string
+	outcome pruning.TierPruneOutcome
+}
+
+// combineTierPruneResults assembles the final read_parquet path list from
+// per-tier pruning outcomes. Rules:
+//   - Pruned tiers contribute their pruned paths; Fallback tiers contribute
+//     their full glob.
+//   - A verified-Empty tier is DROPPED only when at least one other tier is
+//     Pruned: a positive pruning result is evidence the pruner's view of the
+//     layout matches this query. Without one (an Empty/Fallback mix, e.g. a
+//     spoke-namespace query where generated paths sit one level shallow, plus
+//     a listing error on the other tier), the Empty verdict is not trusted to
+//     hide a tier and its full glob is kept.
+//   - All tiers Empty therefore also yields the full globs, mirroring the
+//     single-tier zero-survivor fallback, counted as unpruned.
+func combineTierPruneResults(results []tierPruneResult) ([]string, int) {
+	anyPruned := false
+	for _, r := range results {
+		if r.outcome == pruning.TierPrunePruned {
+			anyPruned = true
+			break
+		}
+	}
+	var paths []string
+	prunedTiers := 0
+	for _, r := range results {
+		switch r.outcome {
+		case pruning.TierPrunePruned:
+			paths = append(paths, r.paths...)
+			prunedTiers++
+		case pruning.TierPruneEmpty:
+			if anyPruned {
+				prunedTiers++
+			} else {
+				paths = append(paths, r.glob)
+			}
+		default:
+			paths = append(paths, r.glob)
+		}
+	}
+	return paths, prunedTiers
+}
+
 // buildMultiTierReadParquet builds a read_parquet expression that queries tiers with actual data.
 // Queries the tiering metadata to determine which tiers have files for this database/measurement,
 // then only includes paths for tiers that actually have data.
@@ -3204,36 +3251,19 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 	// entirely (a recent-range dashboard query never lists or reads cold
 	// object storage beyond the cached parent listings).
 	timeRange := h.pruner.ExtractTimeRange(originalSQL)
-	var paths []string
-	prunedTiers := 0
+	results := make([]tierPruneResult, 0, len(sources))
 	for _, src := range sources {
 		if src.tier == tiering.TierCold && timeRange != nil && timeRange.StartAssumed {
 			// An end-only predicate's assumed start (2020-01-01) must not
 			// exclude cold-archive data that can legitimately be older; scan
 			// the full cold glob instead.
-			paths = append(paths, src.glob)
+			results = append(results, tierPruneResult{glob: src.glob, outcome: pruning.TierPruneFallback})
 			continue
 		}
 		tierPaths, outcome := h.pruner.PruneTierPaths(ctx, src.glob, database, measurement, timeRange, src.backend, src.tier == tiering.TierHot)
-		switch outcome {
-		case pruning.TierPrunePruned:
-			paths = append(paths, tierPaths...)
-			prunedTiers++
-		case pruning.TierPruneEmpty:
-			prunedTiers++
-		default:
-			paths = append(paths, src.glob)
-		}
+		results = append(results, tierPruneResult{glob: src.glob, paths: tierPaths, outcome: outcome})
 	}
-	if len(paths) == 0 && len(sources) > 0 {
-		// Every tier pruned to verified-empty. Mirror the single-tier
-		// zero-survivor behavior and fall back to the full tier globs rather
-		// than fabricating an empty relation.
-		for _, src := range sources {
-			paths = append(paths, src.glob)
-		}
-		prunedTiers = 0
-	}
+	paths, prunedTiers := combineTierPruneResults(results)
 	if prunedTiers > 0 {
 		h.logger.Info().
 			Str("database", database).

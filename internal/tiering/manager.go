@@ -526,69 +526,97 @@ type filePathInfo struct {
 	Database      string
 	Measurement   string
 	PartitionTime time.Time
+	// SpokeNamespaced marks a path with an extra edge-sync namespace level
+	// ({spoke}/{db}/{meas}/...). Such files register for visibility but are
+	// gated out of cold migration until receipt-aware handling exists (#687).
+	SpokeNamespaced bool
 }
 
-// parseFilePath parses a storage path to extract database, measurement, and partition time
-// Expected format: {database}/{measurement}/{year}/{month}/{day}/{hour}/{filename}.parquet
+// parseFilePath parses a storage path to extract database, measurement, and
+// partition time. Accepted shapes (hour- and day-level, plain and
+// spoke-namespaced): {db}/{meas}/Y/M/D[/H]/{file}.parquet and
+// {spoke}/{db}/{meas}/Y/M/D[/H]/{file}.parquet.
 func (m *Manager) parseFilePath(path string) (*filePathInfo, error) {
 	// Normalize path separators
 	path = filepath.ToSlash(path)
 	parts := strings.Split(path, "/")
 
-	// Two accepted shapes (#683):
-	//   hour-level:  database/measurement/year/month/day/hour/filename.parquet (7 parts)
-	//   day-level:   database/measurement/year/month/day/filename.parquet      (6 parts)
-	// Day-level is where daily compaction writes its *_daily.parquet output,
-	// the only files the migrator will move to cold, so the scanner must be
-	// able to register them.
-	if len(parts) < 6 {
-		return nil, fmt.Errorf("path too short: %s", path)
+	// Parse by TAIL shape, not absolute segment counts (#619 precedent:
+	// compaction's isHourLevelFile) — a spoke-namespace pseudo-database adds
+	// a path level, so hour-level files have 7 parts plain and 8 under a
+	// spoke, day-level 6 and 7. Validation thresholds mirror
+	// internal/compaction/daily.go isHourLevelFile; keep them in sync.
+	//   hour-level tail: {year}/{month}/{day}/{hour}/{file}.parquet
+	//   day-level tail:  {year}/{month}/{day}/{file}.parquet
+	validDate := func(y, mo, d string) (time.Time, bool) {
+		yn, err := strconv.Atoi(y)
+		if err != nil || len(y) != 4 || yn < 1970 {
+			return time.Time{}, false
+		}
+		mn, err := strconv.Atoi(mo)
+		if err != nil || mn < 1 || mn > 12 {
+			return time.Time{}, false
+		}
+		dn, err := strconv.Atoi(d)
+		if err != nil || dn < 1 || dn > 31 {
+			return time.Time{}, false
+		}
+		return time.Date(yn, time.Month(mn), dn, 0, 0, 0, 0, time.UTC), true
 	}
-	dayLevel := len(parts) == 6
 
-	database := parts[0]
-	measurement := parts[1]
+	var partitionTime time.Time
+	var prefix []string
+	n := len(parts)
+	if n >= 7 {
+		if day, ok := validDate(parts[n-5], parts[n-4], parts[n-3]); ok {
+			if hn, err := strconv.Atoi(parts[n-2]); err == nil && hn >= 0 && hn <= 23 {
+				partitionTime = day.Add(time.Duration(hn) * time.Hour)
+				prefix = parts[:n-5]
+			}
+		}
+	}
+	if prefix == nil && n >= 6 {
+		if day, ok := validDate(parts[n-4], parts[n-3], parts[n-2]); ok {
+			// Day-level files carry no hour segment; their partition time is
+			// the start of the day, matching hourly rows' hour-start convention.
+			partitionTime = day
+			prefix = parts[:n-4]
+		}
+	}
+	if prefix == nil {
+		return nil, fmt.Errorf("no year/month/day[/hour] partition tail in path: %s", path)
+	}
+
+	// The prefix is {database}/{measurement} (2 parts) or a spoke namespace
+	// {spoke}/{db}/{measurement} (3 parts). For spoke files, register
+	// (database=spoke, measurement=spoke-db): that is the split the QUERY
+	// layer produces for spoke data (FROM "rocket-01".telemetry globs
+	// rocket-01/telemetry/**), so tier metadata stays query-visible. Deeper
+	// nesting is not a feature (edge-sync forbids relaying); reject it.
+	var database, measurement string
+	spokeNamespaced := false
+	switch len(prefix) {
+	case 2:
+		database, measurement = prefix[0], prefix[1]
+	case 3:
+		database, measurement = prefix[0], prefix[1]
+		spokeNamespaced = true
+	default:
+		return nil, fmt.Errorf("unsupported path depth (%d prefix segments): %s", len(prefix), path)
+	}
 
 	// Validate no path traversal in database or measurement names
-	if strings.Contains(database, "..") || strings.ContainsAny(database, "/\\") {
+	if strings.Contains(database, "..") || strings.ContainsAny(database, "\\") {
 		return nil, fmt.Errorf("invalid database name in path: %s", database)
 	}
-	if strings.Contains(measurement, "..") || strings.ContainsAny(measurement, "/\\") {
+	if strings.Contains(measurement, "..") || strings.ContainsAny(measurement, "\\") {
 		return nil, fmt.Errorf("invalid measurement name in path: %s", measurement)
 	}
 
-	// Parse year, month, day, hour
-	year, err := strconv.Atoi(parts[2])
-	if err != nil {
-		return nil, fmt.Errorf("invalid year in path: %s", parts[2])
-	}
-
-	month, err := strconv.Atoi(parts[3])
-	if err != nil {
-		return nil, fmt.Errorf("invalid month in path: %s", parts[3])
-	}
-
-	day, err := strconv.Atoi(parts[4])
-	if err != nil {
-		return nil, fmt.Errorf("invalid day in path: %s", parts[4])
-	}
-
-	// Day-level files carry no hour segment; their partition time is the
-	// start of the day, matching the hour-start convention of hourly rows.
-	hour := 0
-	if !dayLevel {
-		hour, err = strconv.Atoi(parts[5])
-		if err != nil {
-			return nil, fmt.Errorf("invalid hour in path: %s", parts[5])
-		}
-	}
-
-	// Construct partition time (UTC)
-	partitionTime := time.Date(year, time.Month(month), day, hour, 0, 0, 0, time.UTC)
-
 	return &filePathInfo{
-		Database:      database,
-		Measurement:   measurement,
-		PartitionTime: partitionTime,
+		Database:        database,
+		Measurement:     measurement,
+		PartitionTime:   partitionTime,
+		SpokeNamespaced: spokeNamespaced,
 	}, nil
 }
