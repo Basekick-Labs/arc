@@ -1735,6 +1735,36 @@ func (c *Coordinator) IsRunning() bool {
 	return c.running
 }
 
+// canRunFileReconciliation reports whether this coordinator is currently
+// eligible to perform a periodic manifest recheck. File replication is a
+// per-node concern, so every clustered role may run it; only lifecycle and
+// health state gate the work.
+func (c *Coordinator) canRunFileReconciliation() bool {
+	// Stop holds c.mu while it waits for the puller scheduler to exit. Do not
+	// block on that lock from the scheduler's gate check, or shutdown can
+	// deadlock waiting for this goroutine.
+	if !c.mu.TryRLock() {
+		return false
+	}
+	running := c.running
+	localNode := c.localNode
+	c.mu.RUnlock()
+	if !running || localNode == nil {
+		return false
+	}
+
+	node := localNode.Clone()
+	if node.State != StateHealthy {
+		return false
+	}
+	switch node.Role {
+	case RoleWriter, RoleReader, RoleCompactor:
+		return true
+	default:
+		return false
+	}
+}
+
 // GetRole returns the role of the local node.
 func (c *Coordinator) GetRole() NodeRole {
 	return c.localNode.Role
@@ -1824,6 +1854,7 @@ func (c *Coordinator) GetCapabilities() RoleCapabilities {
 func (c *Coordinator) Status() map[string]interface{} {
 	c.mu.RLock()
 	running := c.running
+	puller := c.puller
 	c.mu.RUnlock()
 
 	nodes := c.registry.GetAll()
@@ -1855,6 +1886,9 @@ func (c *Coordinator) Status() map[string]interface{} {
 		"writers":       summary["writers"],
 		"readers":       summary["readers"],
 		"compactors":    summary["compactors"],
+	}
+	if puller != nil {
+		status["replication_catchup_status"] = puller.CatchUpStatus()
 	}
 
 	// Add Raft status if configured (Phase 3)
@@ -2254,17 +2288,19 @@ func (c *Coordinator) startFilePullerLocked() error {
 	})
 
 	pullerCfg := filereplication.Config{
-		SelfNodeID:            c.localNode.ID,
-		Backend:               c.storage,
-		Fetcher:               fetchClient,
-		PeerResolver:          resolver,
-		Workers:               c.cfg.ReplicationPullWorkers,
-		QueueSize:             c.cfg.ReplicationQueueSize,
-		RetryMaxAttempts:      c.cfg.ReplicationRetryMaxAttempts,
-		FetchTimeout:          time.Duration(c.cfg.ReplicationFetchTimeoutMs) * time.Millisecond,
-		RetryInitialBackoff:   500 * time.Millisecond,
-		CatchUpQueueHighWater: c.cfg.ReplicationCatchUpQueueHighWater,
-		Logger:                c.logger,
+		SelfNodeID:             c.localNode.ID,
+		Backend:                c.storage,
+		Fetcher:                fetchClient,
+		PeerResolver:           resolver,
+		Workers:                c.cfg.ReplicationPullWorkers,
+		QueueSize:              c.cfg.ReplicationQueueSize,
+		RetryMaxAttempts:       c.cfg.ReplicationRetryMaxAttempts,
+		FetchTimeout:           time.Duration(c.cfg.ReplicationFetchTimeoutMs) * time.Millisecond,
+		RetryInitialBackoff:    500 * time.Millisecond,
+		CatchUpQueueHighWater:  c.cfg.ReplicationCatchUpQueueHighWater,
+		ReconciliationInterval: time.Duration(c.cfg.ReplicationReconciliationIntervalSeconds) * time.Second,
+		ReconciliationGate:     c.canRunFileReconciliation,
+		Logger:                 c.logger,
 	}
 
 	puller, err := filereplication.New(pullerCfg)
@@ -2394,15 +2430,19 @@ func (c *Coordinator) startFilePullerLocked() error {
 // any entries the walker missed as they apply.
 func (c *Coordinator) runCatchUpOnce() {
 	c.catchupOnce.Do(func() {
+		c.mu.RLock()
 		puller := c.puller
-		if puller == nil || c.raftNode == nil {
+		raftNode := c.raftNode
+		ctx := c.ctx
+		c.mu.RUnlock()
+		if puller == nil || raftNode == nil {
 			return
 		}
 
 		// Wait for a leader. On failure we still proceed — a follower with a
 		// non-empty FSM is a valid catch-up candidate against cluster state
 		// it already has locally, even if no leader is currently elected.
-		if err := c.raftNode.WaitForLeader(30 * time.Second); err != nil {
+		if err := raftNode.WaitForLeader(30 * time.Second); err != nil {
 			c.logger.Warn().
 				Err(err).
 				Msg("Catch-up: no leader after 30s, proceeding against possibly-stale manifest")
@@ -2417,14 +2457,14 @@ func (c *Coordinator) runCatchUpOnce() {
 		if barrierTimeout <= 0 {
 			barrierTimeout = 10 * time.Second
 		}
-		if err := c.raftNode.Barrier(barrierTimeout); err != nil {
+		if err := raftNode.Barrier(barrierTimeout); err != nil {
 			c.logger.Warn().
 				Err(err).
 				Dur("timeout", barrierTimeout).
 				Msg("Catch-up: Raft barrier timed out, proceeding against possibly-stale manifest")
 		}
 
-		fsm := c.raftNode.FSM()
+		fsm := raftNode.FSM()
 		if fsm == nil {
 			c.logger.Error().Msg("Catch-up: Raft FSM not available, skipping")
 			return
@@ -2434,7 +2474,6 @@ func (c *Coordinator) runCatchUpOnce() {
 		// Derive a context from c.ctx (or Background if c.ctx is nil, which
 		// happens in tests that bypass Start). The walker honors cancellation
 		// so shutdown doesn't block on a large catch-up.
-		ctx := c.ctx
 		if ctx == nil {
 			ctx = context.Background()
 		}
@@ -2448,14 +2487,16 @@ func (c *Coordinator) runCatchUpOnce() {
 	})
 }
 
-// ReplicationCatchUpStatus returns the puller's catch-up-specific stats as a
+// ReplicationCatchUpStatus returns the puller's replication and catch-up stats as a
 // JSON-serializable map, or nil when the puller is not running. Consumed by
 // /api/v1/cluster/status (operator visibility) and the query gate's 503 body
 // (so clients can implement bounded retry without a separate probe). The
-// queue_depth, inflight_count, failed, and dropped keys are the live signals
-// — non-zero on any means the gate will keep firing.
+// catchup_inflight, catchup_failed, and catchup_dropped keys are the startup
+// readiness signals; replication_recheck_* keys describe periodic passes.
 func (c *Coordinator) ReplicationCatchUpStatus() map[string]int64 {
+	c.mu.RLock()
 	puller := c.puller
+	c.mu.RUnlock()
 	if puller == nil {
 		return nil
 	}
@@ -2486,7 +2527,9 @@ func (c *Coordinator) ReplicationCatchUpStatus() map[string]int64 {
 // Snapshot puller into a local before nil-checking to close the
 // shutdown-time TOCTOU window where Stop() nils c.puller.
 func (c *Coordinator) ReplicationReady() bool {
+	c.mu.RLock()
 	puller := c.puller
+	c.mu.RUnlock()
 	if puller == nil {
 		// No puller means peer replication is off — treat as always ready
 		// so the gate is a no-op for OSS / standalone paths.

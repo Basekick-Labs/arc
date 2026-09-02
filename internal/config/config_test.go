@@ -812,6 +812,36 @@ func TestLoad_ClusterSeedsEnvOverride(t *testing.T) {
 	}
 }
 
+func TestLoad_ClusterReplicationReconciliationInterval(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cluster.ReplicationReconciliationIntervalSeconds != 300 {
+		t.Errorf("default reconciliation interval = %d, want 300", cfg.Cluster.ReplicationReconciliationIntervalSeconds)
+	}
+
+	os.Setenv("ARC_CLUSTER_REPLICATION_RECONCILIATION_INTERVAL_SECONDS", "17")
+	defer os.Unsetenv("ARC_CLUSTER_REPLICATION_RECONCILIATION_INTERVAL_SECONDS")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() with env override error = %v", err)
+	}
+	if cfg.Cluster.ReplicationReconciliationIntervalSeconds != 17 {
+		t.Errorf("env reconciliation interval = %d, want 17", cfg.Cluster.ReplicationReconciliationIntervalSeconds)
+	}
+}
+
 // QueryConfig Tests
 
 func TestQueryConfig_Defaults(t *testing.T) {

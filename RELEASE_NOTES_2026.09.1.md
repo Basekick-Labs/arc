@@ -4,14 +4,18 @@
 
 ## New: periodic peer file replication reconciliation
 
-Cluster nodes now re-walk the Raft file manifest every five minutes after the
-startup catch-up attempt. The pass uses the existing paginated manifest walk,
-pull queue, deduplication, retries, checksum verification, and local-file
-checks, so a missed reactive callback can be repaired without restarting the
-node. Startup catch-up remains a one-shot operation and keeps its existing
+Cluster nodes now re-walk the Raft file manifest every five minutes by default
+after the startup catch-up attempt. The interval is configurable with
+`cluster.replication_reconciliation_interval_seconds`. The pass uses the
+existing paginated manifest walk, pull queue, deduplication, retries, checksum
+verification, and local-file checks, so a missed reactive callback can be
+repaired without restarting the node. Healthy writer, reader, and compactor
+nodes may run the pass; joining, leaving, unhealthy, and standalone nodes are
+gated. Startup catch-up remains a one-shot operation and keeps its existing
 `catchup_*` readiness and query-gate semantics. The existing
 `cluster.replication_catchup_enabled` switch disables both startup and
-periodic reconciliation.
+periodic reconciliation. Recheck outcomes are exposed under
+`replication_catchup_status` as `replication_recheck_*` counters.
 
 ## New: Apache Iceberg export (opt-in)
 

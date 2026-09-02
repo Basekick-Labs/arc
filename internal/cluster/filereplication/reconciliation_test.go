@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
+	"github.com/rs/zerolog"
 )
 
 func emptyManifest(cursor string, limit int) ([]*raft.FileEntry, string, error) {
@@ -152,6 +153,200 @@ func TestRunReconciliationPullsManifestEntryMissedAtStartup(t *testing.T) {
 	}
 }
 
+// TestRunReconciliationContinuesAfterEmptyPage verifies that a page with no
+// entries does not terminate the walk when the manifest supplies another
+// cursor. This can happen when entries disappear between page snapshots.
+func TestRunReconciliationContinuesAfterEmptyPage(t *testing.T) {
+	body := []byte("empty page continuation")
+	p := newTestPuller(t, newFakeBackend(), newRepeatingFetcher(body),
+		staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+	p.Start(context.Background())
+	defer p.Stop()
+	p.RunCatchUp(context.Background(), emptyManifest)
+
+	entry := makeEntry("testdb/cpu/after-empty-page.parquet", "writer-1", int64(len(body)))
+	var calls atomic.Int64
+	if !p.RunReconciliation(context.Background(), func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
+		switch calls.Add(1) {
+		case 1:
+			return nil, "after-empty-page", nil
+		case 2:
+			if cursor != "after-empty-page" {
+				t.Errorf("second page cursor: got %q, want %q", cursor, "after-empty-page")
+			}
+			return []*raft.FileEntry{entry}, "", nil
+		default:
+			return nil, "", nil
+		}
+	}) {
+		t.Fatal("reconciliation was unexpectedly skipped")
+	}
+
+	stats := waitStats(t, p, func(s map[string]int64) bool { return s["pulled"] == 1 })
+	if got := calls.Load(); got != 2 {
+		t.Errorf("manifest fetch calls: got %d, want 2", got)
+	}
+	if stats["replication_recheck_entries_walked"] != 1 {
+		t.Errorf("recheck entries walked: got %d, want 1", stats["replication_recheck_entries_walked"])
+	}
+	if stats["replication_recheck_enqueued"] != 1 {
+		t.Errorf("recheck enqueued: got %d, want 1", stats["replication_recheck_enqueued"])
+	}
+}
+
+// TestRunReconciliationAbortsOnCursorStall verifies that a non-empty page
+// cannot make the walker spin forever by returning the same continuation
+// cursor repeatedly.
+func TestRunReconciliationAbortsOnCursorStall(t *testing.T) {
+	p := newTestPuller(t, newFakeBackend(),
+		newFakeFetcher(fakeFetchResult{body: []byte("unused")}),
+		staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+	p.Start(context.Background())
+	defer p.Stop()
+	p.RunCatchUp(context.Background(), emptyManifest)
+
+	entry := makeEntry("testdb/cpu/stalled-cursor.parquet", "writer-1", 1)
+	var calls atomic.Int64
+	if !p.RunReconciliation(context.Background(), func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
+		switch calls.Add(1) {
+		case 1:
+			return []*raft.FileEntry{entry}, "stalled-cursor", nil
+		case 2:
+			if cursor != "stalled-cursor" {
+				t.Errorf("stalled page cursor: got %q, want %q", cursor, "stalled-cursor")
+			}
+			return []*raft.FileEntry{entry}, "stalled-cursor", nil
+		default:
+			return nil, "", nil
+		}
+	}) {
+		t.Fatal("reconciliation was unexpectedly skipped")
+	}
+
+	stats := p.Stats()
+	if calls.Load() != 2 {
+		t.Errorf("manifest fetch calls: got %d, want 2", calls.Load())
+	}
+	if stats["replication_recheck_aborted"] != 1 {
+		t.Errorf("aborted rechecks: got %d, want 1", stats["replication_recheck_aborted"])
+	}
+	if stats["replication_recheck_completed"] != 0 {
+		t.Errorf("completed rechecks: got %d, want 0", stats["replication_recheck_completed"])
+	}
+}
+
+// TestPeriodicReconciliationSchedulerRestoresDeletedManifestFile exercises
+// the actual periodic scheduler rather than calling RunReconciliation
+// directly. A local file is deleted without an FSM callback, then the next
+// scheduled manifest pass must restore it through the normal pull path.
+func TestPeriodicReconciliationSchedulerRestoresDeletedManifestFile(t *testing.T) {
+	body := []byte("scheduled periodic body")
+	backend := newFakeBackend()
+	p, err := New(Config{
+		SelfNodeID:             "reader-1",
+		Backend:                backend,
+		Fetcher:                newRepeatingFetcher(body),
+		PeerResolver:           staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true},
+		Workers:                1,
+		QueueSize:              8,
+		RetryMaxAttempts:       1,
+		RetryInitialBackoff:    time.Millisecond,
+		FetchTimeout:           2 * time.Second,
+		ReconciliationInterval: 10 * time.Millisecond,
+		Logger:                 zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p.Start(context.Background())
+	defer p.Stop()
+
+	entry := makeEntry("testdb/cpu/deleted-without-callback.parquet", "writer-1", int64(len(body)))
+	manifest := func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
+		if cursor == "" {
+			return []*raft.FileEntry{entry}, "", nil
+		}
+		return nil, "", nil
+	}
+	p.RunCatchUp(context.Background(), manifest)
+	waitStats(t, p, func(s map[string]int64) bool { return s["pulled"] == 1 })
+
+	if err := backend.Delete(context.Background(), entry.Path); err != nil {
+		t.Fatalf("delete local file: %v", err)
+	}
+	before := p.Stats()
+	p.StartPeriodicReconciliation(manifest)
+	stats := waitStats(t, p, func(s map[string]int64) bool {
+		return s["replication_recheck_completed"] >= 1 && s["pulled"] == 2
+	})
+
+	if _, err := backend.Read(context.Background(), entry.Path); err != nil {
+		t.Fatalf("periodic reconciliation did not restore file: %v", err)
+	}
+	if stats["replication_recheck_enqueued"] < 1 {
+		t.Errorf("recheck enqueued: got %d, want at least 1", stats["replication_recheck_enqueued"])
+	}
+	for _, key := range []string{
+		"catchup_started_at", "catchup_completed_at", "catchup_entries_walked",
+		"catchup_enqueued", "catchup_skipped_local", "catchup_inflight",
+		"catchup_failed", "catchup_dropped",
+	} {
+		if stats[key] != before[key] {
+			t.Errorf("scheduled periodic pass changed startup metric %s: before=%d after=%d", key, before[key], stats[key])
+		}
+	}
+}
+
+// TestRunReconciliationGatesAndAbortsOnEligibilityChange verifies that a
+// gated tick does not fetch and that a pass already in progress aborts when
+// the node becomes ineligible before the next page.
+func TestRunReconciliationGatesAndAbortsOnEligibilityChange(t *testing.T) {
+	var eligible atomic.Bool
+	eligible.Store(true)
+	p := newTestPuller(t, newFakeBackend(), newRepeatingFetcher([]byte("gated body")),
+		staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+	p.cfg.ReconciliationGate = eligible.Load
+	p.Start(context.Background())
+	defer p.Stop()
+	p.RunCatchUp(context.Background(), emptyManifest)
+
+	eligible.Store(false)
+	var calls atomic.Int64
+	if !p.RunReconciliation(context.Background(), func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
+		calls.Add(1)
+		return nil, "", nil
+	}) {
+		t.Fatal("gated reconciliation was unexpectedly skipped")
+	}
+	stats := p.Stats()
+	if calls.Load() != 0 {
+		t.Errorf("gated reconciliation fetched manifest %d times, want 0", calls.Load())
+	}
+	if stats["replication_recheck_gated"] != 1 {
+		t.Errorf("gated rechecks: got %d, want 1", stats["replication_recheck_gated"])
+	}
+	if stats["replication_recheck_completed"] != 0 {
+		t.Errorf("gated rechecks completed: got %d, want 0", stats["replication_recheck_completed"])
+	}
+
+	eligible.Store(true)
+	entry := makeEntry("testdb/cpu/gate-changed-mid-pass.parquet", "writer-1", int64(len("gated body")))
+	if !p.RunReconciliation(context.Background(), func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
+		calls.Add(1)
+		eligible.Store(false)
+		return []*raft.FileEntry{entry}, "next-page", nil
+	}) {
+		t.Fatal("eligible reconciliation was unexpectedly skipped")
+	}
+	stats = p.Stats()
+	if stats["replication_recheck_aborted"] != 1 {
+		t.Errorf("aborted rechecks: got %d, want 1", stats["replication_recheck_aborted"])
+	}
+	if stats["replication_recheck_gated"] != 2 {
+		t.Errorf("gated rechecks after mid-pass change: got %d, want 2", stats["replication_recheck_gated"])
+	}
+}
+
 // TestPeriodicReconciliationDoesNotReopenStartupReadiness verifies that a
 // periodic pull is not added to the startup catch-up scope. A healthy reader
 // therefore remains ready while a later drift repair is in flight.
@@ -192,10 +387,10 @@ func TestPeriodicReconciliationDoesNotReopenStartupReadiness(t *testing.T) {
 	}
 }
 
-// TestPeriodicReconciliationSelfHealsCatchUpBookkeeping verifies that a later
-// successful periodic pull clears startup failures and drops for the same
-// path, without making periodic work part of the startup scope.
-func TestPeriodicReconciliationSelfHealsCatchUpBookkeeping(t *testing.T) {
+// TestPeriodicReconciliationDoesNotModifyCatchUpBookkeeping verifies that a
+// later periodic pull does not clear or reopen startup readiness state for the
+// same path. Startup bookkeeping is healed only by startup/reactive work.
+func TestPeriodicReconciliationDoesNotModifyCatchUpBookkeeping(t *testing.T) {
 	body := []byte("recovered periodic body")
 	p := newTestPuller(t, newFakeBackend(), newRepeatingFetcher(body),
 		staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
@@ -206,6 +401,8 @@ func TestPeriodicReconciliationSelfHealsCatchUpBookkeeping(t *testing.T) {
 	entry := makeEntry("testdb/cpu/periodic-self-heal.parquet", "writer-1", int64(len(body)))
 	p.recordCatchUpFailure(entry.Path)
 	p.recordCatchUpDrop(entry.Path)
+	p.markCatchUp(entry.Path)
+	before := p.Stats()
 	if p.FullyCaughtUp() {
 		t.Fatal("precondition failed: catch-up bookkeeping should close readiness")
 	}
@@ -217,11 +414,13 @@ func TestPeriodicReconciliationSelfHealsCatchUpBookkeeping(t *testing.T) {
 	}
 	waitStats(t, p, func(s map[string]int64) bool { return s["pulled"] == 1 })
 	stats := p.Stats()
-	if stats["catchup_failed"] != 0 || stats["catchup_dropped"] != 0 {
-		t.Errorf("periodic success did not self-heal startup bookkeeping: failed=%d dropped=%d", stats["catchup_failed"], stats["catchup_dropped"])
+	for _, key := range []string{"catchup_failed", "catchup_dropped", "catchup_inflight", "catchup_completed_at"} {
+		if stats[key] != before[key] {
+			t.Errorf("periodic success changed startup bookkeeping %s: before=%d after=%d", key, before[key], stats[key])
+		}
 	}
-	if !p.FullyCaughtUp() {
-		t.Error("FullyCaughtUp remained false after successful periodic self-heal")
+	if p.FullyCaughtUp() {
+		t.Error("periodic success unexpectedly reopened startup readiness")
 	}
 }
 

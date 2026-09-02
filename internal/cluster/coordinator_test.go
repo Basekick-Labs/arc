@@ -247,3 +247,51 @@ func TestIsPrimaryWriter_SharedStorageMode_NonWriterLeaderRejected(t *testing.T)
 		})
 	}
 }
+
+func TestCanRunFileReconciliation(t *testing.T) {
+	tests := []struct {
+		name    string
+		role    NodeRole
+		state   NodeState
+		running bool
+		want    bool
+	}{
+		{name: "healthy writer", role: RoleWriter, state: StateHealthy, running: true, want: true},
+		{name: "healthy reader", role: RoleReader, state: StateHealthy, running: true, want: true},
+		{name: "healthy compactor", role: RoleCompactor, state: StateHealthy, running: true, want: true},
+		{name: "standalone", role: RoleStandalone, state: StateHealthy, running: true, want: false},
+		{name: "joining", role: RoleReader, state: StateJoining, running: true, want: false},
+		{name: "leaving", role: RoleReader, state: StateLeaving, running: true, want: false},
+		{name: "unhealthy", role: RoleWriter, state: StateUnhealthy, running: true, want: false},
+		{name: "stopped", role: RoleReader, state: StateHealthy, running: false, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Coordinator{
+				localNode: NewNode("test-node", "test-node", tt.role, "test-cluster"),
+				running:   tt.running,
+				logger:    zerolog.Nop(),
+			}
+			c.localNode.UpdateState(tt.state)
+			if got := c.canRunFileReconciliation(); got != tt.want {
+				t.Errorf("canRunFileReconciliation() = %v, want %v (role=%s state=%s running=%v)", got, tt.want, tt.role, tt.state, tt.running)
+			}
+		})
+	}
+}
+
+func TestCanRunFileReconciliationDoesNotBlockOnCoordinatorLock(t *testing.T) {
+	c := &Coordinator{
+		localNode: NewNode("test-node", "test-node", RoleReader, "test-cluster"),
+		running:   true,
+		logger:    zerolog.Nop(),
+	}
+	c.localNode.UpdateState(StateHealthy)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if got := c.canRunFileReconciliation(); got {
+		t.Error("canRunFileReconciliation() = true while coordinator lock is held, want false")
+	}
+}
