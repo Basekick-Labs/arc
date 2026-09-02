@@ -55,6 +55,14 @@ literals (e.g. a log-search `LIKE '%INTERVAL 5 MINUTE%'`) and identifiers such a
 
 ## Bug fixes
 
+### S3 query paths now follow calendar days across DST ([#321](https://github.com/Basekick-Labs/arc/issues/321))
+
+S3 time-range pruning now builds one inclusive partition path per calendar day in
+the range's starting time zone. Non-UTC offsets and daylight-saving transitions
+no longer shift the first or last date or skip a local day.
+
+Contributed by [@copacabanaservice01](https://github.com/copacabanaservice01) in [#690](https://github.com/Basekick-Labs/arc/pull/690).
+
 ### Iceberg version hints no longer advance before metadata copies publish ([#636](https://github.com/Basekick-Labs/arc/issues/636))
 
 Directory-based Iceberg readers fetch `version-hint.text` before opening the matching
