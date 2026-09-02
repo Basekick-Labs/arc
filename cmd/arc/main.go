@@ -2091,10 +2091,11 @@ func main() {
 	// the registry to exclude received namespaces from its own discovery.
 	var spokeRegistry *edgesync.Registry
 	// hubReceiptMarker marks sync_received receipts for hub-consumed spoke
-	// files (grouped by namespace). Built when the edge-sync hub is enabled;
-	// shared by compaction's consumed-inputs observer (#619) and tiering's
-	// hot-file-removal hook (#687). Remains nil otherwise, which keeps
-	// tiering's spoke-migration gate closed.
+	// files (grouped by namespace). Built whenever the edge-sync receive or
+	// import side is enabled (both write receipts); shared by compaction's
+	// consumed-inputs observer (#619) and tiering's hot-file-removal hook
+	// (#687). Remains nil otherwise, which keeps tiering's spoke-migration
+	// gate closed.
 	var hubReceiptMarker func(paths []string) error
 	if cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Enabled {
 		var registerFile func(context.Context, *edgesync.ReceivedFile) error

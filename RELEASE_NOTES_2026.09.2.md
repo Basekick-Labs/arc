@@ -196,7 +196,7 @@ hot-to-cold migration. Before a hot copy is removed (by migration or by
 orphan reconciliation), its sync receipt is marked the same way hub
 compaction marks consumed inputs, so a spoke re-offering the file gets
 "already present" instead of re-uploading a duplicate next to the cold copy.
-The marking runs before any state changes and a marking failure aborts the
-migration with the cold copy rolled back, so a sync-index outage can never
+The marking runs before tier metadata flips and before any delete, and a
+marking failure aborts the migration batch, so a sync-index outage can never
 strand an unmarked deletion. On deployments without an edge-sync hub, spoke
 files (if any exist) remain registered but excluded from migration.

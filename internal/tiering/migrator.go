@@ -179,6 +179,26 @@ func (m *Migrator) MigrateBatch(ctx context.Context, candidates []MigrationCandi
 	if len(candidates) == 0 {
 		return 0, 0
 	}
+	// Mark sync receipts for the WHOLE batch before any file work (#687):
+	// one chunked UPDATE on the shared sync DB instead of per-file calls
+	// from concurrent goroutines. Ordering is load-bearing — marking must
+	// precede each file's tier flip and delete, and pre-marking the batch
+	// satisfies that for every member; a marked receipt whose file does not
+	// migrate (later copy failure) is documented harmless. A mark failure
+	// aborts the batch so no file's hot copy can be removed unmarked.
+	paths := make([]string, len(candidates))
+	for i, c := range candidates {
+		paths[i] = c.Path
+	}
+	if err := m.manager.notifyHotFilesRemoved(paths); err != nil {
+		m.logger.Warn().Err(err).Int("candidates", len(candidates)).
+			Msg("Could not mark sync receipts; aborting migration batch")
+		return 0, len(candidates)
+	}
+
+	if len(candidates) == 0 {
+		return 0, 0
+	}
 
 	sem := semaphore.NewWeighted(int64(m.maxConcurrent))
 	var wg sync.WaitGroup
@@ -263,27 +283,17 @@ func (m *Migrator) MigrateFile(ctx context.Context, candidate MigrationCandidate
 		return migrationErr
 	}
 
-	// Mark sync receipts BEFORE the metadata flips to cold (#687). Ordering
-	// is load-bearing: marking after UpdateTier leaves a window where a
-	// persistent mark failure plus an expired reconcile window strands an
-	// unmarked hot duplicate forever. A marked receipt on an aborted
-	// migration is harmless (the receive path documents marked-but-present),
-	// so abort-and-rollback on failure is strictly safe.
-	if err := m.manager.notifyHotFilesRemoved([]string{candidate.Path}); err != nil {
+	// Update tier metadata. Sync receipts were already marked for the whole
+	// batch by MigrateBatch before any file work began (#687) — marking must
+	// precede this flip, and a marked receipt for a file that ends up not
+	// migrating is documented harmless by the receive path.
+	if err := m.manager.metadata.UpdateTier(ctx, candidate.Path, candidate.TargetTier); err != nil {
+		// Rollback: delete from destination
 		if delErr := dstBackend.Delete(ctx, candidate.Path); delErr != nil {
 			m.logger.Error().Err(delErr).Str("path", candidate.Path).Msg("Failed to rollback destination file")
 		}
 		if migrationID > 0 {
 			m.manager.metadata.CompleteMigration(ctx, migrationID, err)
-		}
-		return fmt.Errorf("failed to mark sync receipts before migration: %w", err)
-	}
-
-	// Update tier metadata
-	if err := m.manager.metadata.UpdateTier(ctx, candidate.Path, candidate.TargetTier); err != nil {
-		// Rollback: delete from destination
-		if delErr := dstBackend.Delete(ctx, candidate.Path); delErr != nil {
-			m.logger.Error().Err(delErr).Str("path", candidate.Path).Msg("Failed to rollback destination file")
 		}
 		return fmt.Errorf("failed to update tier metadata: %w", err)
 	}
