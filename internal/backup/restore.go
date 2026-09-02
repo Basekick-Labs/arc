@@ -2,9 +2,7 @@ package backup
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -219,8 +217,16 @@ func (m *Manager) restoreSQLite(ctx context.Context, backupID string) error {
 	return nil
 }
 
-// restoreSQLiteFile restores one SQLite database from metadata/<srcName> in the
-// backup to destPath, preserving the previous file as .before-restore.
+// restoreSQLiteFile STAGES one SQLite database from metadata/<srcName> in the
+// backup as <destPath>.pending-restore. The live database is never touched:
+// applying a restore over a running server's database — even by atomic
+// rename — leaves existing connections on the old inode while new pool
+// connections open the restored file, splitting state across both (#635).
+// ApplyPendingRestores applies the staged file at the next boot, before any
+// subsystem opens the database, and takes the .before-restore safety copy at
+// that point (when it can be made complete and cheaply). Restaging overwrites
+// a previous staging: the last restore before restart wins. An operator can
+// cancel by deleting the .pending-restore file before restarting.
 func (m *Manager) restoreSQLiteFile(ctx context.Context, backupID, srcName, destPath string) error {
 	srcPath := fmt.Sprintf("%s/metadata/%s", backupID, srcName)
 	data, err := m.backupStorage.Read(ctx, srcPath)
@@ -228,29 +234,6 @@ func (m *Manager) restoreSQLiteFile(ctx context.Context, backupID, srcName, dest
 		return fmt.Errorf("failed to read SQLite backup: %w", err)
 	}
 
-	// Safety: snapshot the current database before overwriting. A plain file
-	// read would miss un-checkpointed WAL commits; the snapshot reads through
-	// the WAL, so the pre-restore copy is itself a usable database.
-	if _, statErr := os.Stat(destPath); statErr == nil {
-		if snapshotPath, snapErr := snapshotSQLite(ctx, destPath); snapErr == nil {
-			if currentData, readErr := os.ReadFile(snapshotPath); readErr == nil {
-				preRestorePath := destPath + ".before-restore"
-				if err := os.WriteFile(preRestorePath, currentData, 0600); err != nil {
-					m.logger.Warn().Err(err).Msg("Failed to create pre-restore backup of SQLite database")
-				} else {
-					m.logger.Info().Str("path", preRestorePath).Msg("Created pre-restore backup of SQLite database")
-				}
-			}
-			os.RemoveAll(filepath.Dir(snapshotPath))
-		} else {
-			m.logger.Warn().Err(snapErr).Msg("Failed to snapshot database before restore")
-		}
-	}
-
-	// Swap the file in by rename rather than overwriting the live inode. Existing
-	// connections keep reading and writing the old (now unlinked) inode, while a
-	// pool may open new connections against the restored file, so restart before
-	// further writes to avoid splitting state across both files.
 	staging, err := os.CreateTemp(filepath.Dir(destPath), ".restore-staging-*")
 	if err != nil {
 		return fmt.Errorf("failed to create restore staging file: %w", err)
@@ -259,34 +242,27 @@ func (m *Manager) restoreSQLiteFile(ctx context.Context, backupID, srcName, dest
 	if _, err := staging.Write(data); err != nil {
 		staging.Close()
 		os.Remove(stagingPath)
-		return fmt.Errorf("failed to write SQLite database: %w", err)
+		return fmt.Errorf("failed to write staged restore: %w", err)
 	}
 	if err := staging.Close(); err != nil {
 		os.Remove(stagingPath)
-		return fmt.Errorf("failed to close restore staging file: %w", err)
+		return fmt.Errorf("failed to close staged restore: %w", err)
 	}
 	if err := os.Chmod(stagingPath, 0600); err != nil {
 		os.Remove(stagingPath)
-		return fmt.Errorf("failed to restrict restore staging file: %w", err)
+		return fmt.Errorf("failed to restrict staged restore: %w", err)
 	}
-	if err := os.Rename(stagingPath, destPath); err != nil {
+	pendingPath := StagePath(destPath)
+	if err := os.Rename(stagingPath, pendingPath); err != nil {
 		os.Remove(stagingPath)
-		return fmt.Errorf("failed to move restored SQLite database into place: %w", err)
-	}
-
-	// A pre-restore -wal is salted against the old database: SQLite replaying
-	// it over the restored file would mix old frames into new pages, and -shm
-	// is the index for exactly that WAL. Neither belongs to the restored file.
-	for _, sidecar := range []string{destPath + "-wal", destPath + "-shm"} {
-		if err := os.Remove(sidecar); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("failed to remove stale SQLite sidecar %s: %w", sidecar, err)
-		}
+		return fmt.Errorf("failed to stage restored SQLite database: %w", err)
 	}
 
 	m.logger.Warn().
 		Str("backup_id", backupID).
 		Str("database", srcName).
-		Msg("SQLite database restored; restart required — open connections still hold the pre-restore database")
+		Str("staged_at", pendingPath).
+		Msg("SQLite restore staged; it is applied at the next server start")
 	return nil
 }
 

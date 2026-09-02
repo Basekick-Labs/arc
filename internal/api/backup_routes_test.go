@@ -322,9 +322,15 @@ func TestRestoreBackupReportsRestartRequired(t *testing.T) {
 	if meta["restart_required"] != true {
 		t.Errorf("metadata restore: restart_required = %v, want true", meta["restart_required"])
 	}
+	if meta["staged"] != true {
+		t.Errorf("metadata restore: staged = %v, want true (#635 apply-at-boot)", meta["staged"])
+	}
 	cfg := restore(t, `{"backup_id":"backup-20260901-000000-00000000","confirm":true,"restore_data":false,"restore_metadata":false,"restore_config":true}`)
 	if cfg["restart_required"] != true {
 		t.Errorf("config-only restore: restart_required = %v, want true", cfg["restart_required"])
+	}
+	if _, present := cfg["staged"]; present {
+		t.Errorf("config-only restore: staged = %v, want absent (config is not staged)", cfg["staged"])
 	}
 	data := restore(t, `{"backup_id":"backup-20260901-000000-00000000","confirm":true,"restore_data":true,"restore_metadata":false,"restore_config":false}`)
 	if _, present := data["restart_required"]; present {

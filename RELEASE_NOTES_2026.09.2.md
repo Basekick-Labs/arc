@@ -110,9 +110,15 @@ Contributed by [@Thundercloud12](https://github.com/Thundercloud12) in [#670](ht
 ### Live SQLite backups and restores no longer risk torn database state ([#635](https://github.com/Basekick-Labs/arc/issues/635))
 
 Backups now snapshot live SQLite databases before copying them, so concurrent
-WAL writers cannot interleave pages into a backup. Restores replace the database
-by rename, remove stale WAL/SHM sidecars, and report that a restart is required
-before further writes. Temporary snapshots are restricted to the owner.
+WAL writers cannot interleave pages into a backup. Restores no longer touch the
+live database at all: the restored database is STAGED next to the live one and
+applied at the next server start, before anything opens it — the running server
+keeps serving consistent pre-restore data, and the swap (with a complete
+`.before-restore` safety copy and stale-sidecar cleanup) happens where no
+connection can observe a half-applied state. A staged restore that fails
+integrity validation at boot is quarantined instead of applied, and deleting
+the `.pending-restore` file before restarting cancels the restore. Temporary
+staging files are restricted to the owner.
 
 Contributed by [@atirna](https://github.com/atirna) in [#678](https://github.com/Basekick-Labs/arc/pull/678).
 
@@ -205,10 +211,10 @@ files (if any exist) remain registered but excluded from migration.
 
 `POST /api/v1/backup/restore` returned `restart_required: true` only when
 metadata (SQLite databases) was restored. A config-only restore needs the same
-restart — the restored `arc.toml` only takes effect on reload, which
-`restoreConfig` already logs — but the response did not say so. The flag now
-covers both restore kinds; a data-only restore still omits it. The restored-
-database immunity test also fails instead of skipping when a fresh connection
-cannot read the restored file.
+restart, the restored `arc.toml` only takes effect on reload, which
+`restoreConfig` already logs, but the response did not say so. The flag now
+covers both restore kinds and a data-only restore still omits it; metadata
+restores additionally report `staged: true`, since the restored databases are
+applied at the next start rather than swapped live.
 
 Contributed by [@atirna](https://github.com/atirna) in [#689](https://github.com/Basekick-Labs/arc/pull/689).
