@@ -33,6 +33,15 @@ type Manager struct {
 	callbackMu          sync.Mutex
 	onMigrationComplete func()
 
+	// onHotFilesRemoved, when set, runs with the storage paths of hot files
+	// the tiering subsystem is about to permanently remove (migration source
+	// deletes, orphan reconciliation). The edge-sync hub wires it to receipt
+	// marking (#687): a spoke-synced file's receipt must be marked before its
+	// hot copy disappears, or confirmPresent forgets the receipt and the
+	// spoke re-uploads a duplicate. An error return means the caller MUST NOT
+	// delete the files. Guarded by callbackMu.
+	onHotFilesRemoved func(paths []string) error
+
 	// Data stores
 	metadata *MetadataStore
 	policies *PolicyStore
@@ -268,6 +277,34 @@ func (m *Manager) notifyMigrationComplete(migrated, orphansDeleted int) {
 	if fn != nil {
 		fn()
 	}
+}
+
+// SetOnHotFilesRemoved registers a callback invoked BEFORE tiering deletes
+// hot files (see the field comment). Safe to call after Start.
+func (m *Manager) SetOnHotFilesRemoved(fn func(paths []string) error) {
+	m.callbackMu.Lock()
+	m.onHotFilesRemoved = fn
+	m.callbackMu.Unlock()
+}
+
+// notifyHotFilesRemoved invokes the removal callback; a nil callback allows
+// the removal (non-hub deployments have no receipts to protect).
+func (m *Manager) notifyHotFilesRemoved(paths []string) error {
+	m.callbackMu.Lock()
+	fn := m.onHotFilesRemoved
+	m.callbackMu.Unlock()
+	if fn == nil {
+		return nil
+	}
+	return fn(paths)
+}
+
+// hasHotFileRemovalHook reports whether a removal callback is wired; the
+// migrator only admits spoke-namespace candidates when it is (#687).
+func (m *Manager) hasHotFileRemovalHook() bool {
+	m.callbackMu.Lock()
+	defer m.callbackMu.Unlock()
+	return m.onHotFilesRemoved != nil
 }
 
 // SetOnMigrationComplete registers a callback invoked after any migration

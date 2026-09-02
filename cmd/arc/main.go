@@ -2090,6 +2090,13 @@ func main() {
 	// Hoisted: on a dual-role (hub+spoke) node the spoke block below needs
 	// the registry to exclude received namespaces from its own discovery.
 	var spokeRegistry *edgesync.Registry
+	// hubReceiptMarker marks sync_received receipts for hub-consumed spoke
+	// files (grouped by namespace). Built whenever the edge-sync receive or
+	// import side is enabled (both write receipts); shared by compaction's
+	// consumed-inputs observer (#619) and tiering's hot-file-removal hook
+	// (#687). Remains nil otherwise, which keeps tiering's spoke-migration
+	// gate closed.
+	var hubReceiptMarker func(paths []string) error
 	if cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Enabled {
 		var registerFile func(context.Context, *edgesync.ReceivedFile) error
 		if clusterCoordinator != nil {
@@ -2170,43 +2177,47 @@ func main() {
 			log.Fatal().Err(err).Msg("Failed to create the edge sync spoke registry; refusing to start")
 		}
 
+		// Receipt marker shared by hub compaction (#619) and tiering's
+		// hot-file-removal hook (#687). Group by first path segment and
+		// attempt the receipt mark. No registry consultation: MarkCompacted
+		// is an UPDATE, so inputs from ordinary databases match no receipts
+		// and no-op — which also makes this immune to a registration deleted
+		// mid-cycle (review N1b). Any failure is RETURNED: compaction then
+		// keeps the crash-recovery manifest so recovery re-fires the marks
+		// (deep-review B1), and tiering aborts the migration before any
+		// delete.
+		markLogger := logger.Get("edgesync")
+		hubReceiptMarker = func(inputs []string) error {
+			byNamespace := make(map[string][]string)
+			for _, in := range inputs {
+				first, rest, found := strings.Cut(in, "/")
+				if !found || first == "" || rest == "" {
+					continue
+				}
+				byNamespace[first] = append(byNamespace[first], rest)
+			}
+			markCtx, markCancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer markCancel()
+			var firstErr error
+			for ns, paths := range byNamespace {
+				if err := hubIndex.MarkCompacted(markCtx, ns, paths); err != nil {
+					markLogger.Warn().Err(err).Str("namespace", ns).Int("paths", len(paths)).
+						Msg("Could not mark consumed receipts; the caller retries or aborts")
+					if firstErr == nil {
+						firstErr = err
+					}
+				}
+			}
+			return firstErr
+		}
+
 		// #619: hub compaction of received spoke namespaces. Wiring ORDER is
 		// load-bearing (review F9): the consumed-inputs observer goes in
 		// BEFORE the namespace expander, so no scheduler tick can compact
 		// received raws without marking their receipts. compactionManager
 		// may be nil independently (CLAUDE.md nil rule).
 		if compactionManager != nil && cfg.EdgeSync.CompactReceivedNamespaces {
-			markLogger := logger.Get("edgesync")
-			compactionManager.SetOnConsumedInputs(func(inputs []string) error {
-				// Group by first path segment and attempt the receipt mark.
-				// No registry consultation: MarkCompacted is an UPDATE, so
-				// inputs from ordinary databases match no receipts and
-				// no-op — which also makes this immune to a registration
-				// deleted mid-cycle (review N1b). Any failure is RETURNED:
-				// the caller then keeps the crash-recovery manifest so
-				// recovery re-fires the marks (deep-review B1).
-				byNamespace := make(map[string][]string)
-				for _, in := range inputs {
-					first, rest, found := strings.Cut(in, "/")
-					if !found || first == "" || rest == "" {
-						continue
-					}
-					byNamespace[first] = append(byNamespace[first], rest)
-				}
-				markCtx, markCancel := context.WithTimeout(context.Background(), 60*time.Second)
-				defer markCancel()
-				var firstErr error
-				for ns, paths := range byNamespace {
-					if err := hubIndex.MarkCompacted(markCtx, ns, paths); err != nil {
-						markLogger.Warn().Err(err).Str("namespace", ns).Int("paths", len(paths)).
-							Msg("Could not mark consumed receipts compacted; the retained manifest re-fires them via recovery")
-						if firstErr == nil {
-							firstErr = err
-						}
-					}
-				}
-				return firstErr
-			})
+			compactionManager.SetOnConsumedInputs(hubReceiptMarker)
 			compactionManager.SetNamespaceExpander(receivedNamespaces(spokeRegistry))
 			log.Info().Msg("Hub compaction of received spoke namespaces enabled (edge_sync.compact_received_namespaces)")
 		}
@@ -3476,6 +3487,13 @@ func main() {
 		// partition paths (pruner + SQL transform caches) go stale and must
 		// be dropped — same reason compaction invalidates them (#662).
 		tieringManager.SetOnMigrationComplete(queryHandler.InvalidateCaches)
+		// #687: on an edge-sync hub, tiering deletes of hot spoke files must
+		// mark their sync receipts first, or the spoke re-uploads duplicates.
+		// Wiring this also lifts the migrator's spoke-namespace gate.
+		if hubReceiptMarker != nil {
+			tieringManager.SetOnHotFilesRemoved(hubReceiptMarker)
+			log.Info().Msg("Tiering hot-file removals wired to edge-sync receipt marking; spoke cold migration enabled")
+		}
 		log.Info().Msg("Tiering manager wired to query handler for multi-tier queries")
 
 		// Wire tiering manager to databases handler for cold-tier database/measurement listing
