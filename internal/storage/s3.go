@@ -685,16 +685,21 @@ func (b *S3Backend) GetQueryPath(database, measurement string, year, month, day,
 func (b *S3Backend) GetQueryPathRange(database, measurement string, startTime, endTime time.Time) []string {
 	var paths []string
 
-	// Generate paths for each day in the range
-	current := startTime.Truncate(24 * time.Hour)
-	end := endTime.Truncate(24 * time.Hour).Add(24 * time.Hour)
+	// Generate paths for each calendar day in the range. Truncate(24h) and
+	// Add(24h) operate on elapsed time, so they shift local dates across UTC
+	// offsets and daylight-saving transitions.
+	location := startTime.Location()
+	startYear, startMonth, startDay := startTime.Date()
+	current := time.Date(startYear, startMonth, startDay, 0, 0, 0, 0, location)
+	endYear, endMonth, endDay := endTime.In(location).Date()
+	end := time.Date(endYear, endMonth, endDay, 0, 0, 0, 0, location).AddDate(0, 0, 1)
 
 	for current.Before(end) {
 		path := fmt.Sprintf("s3://%s/%s%s/%s/%04d/%02d/%02d/*/*.parquet",
 			b.bucket, b.prefix, database, measurement,
 			current.Year(), int(current.Month()), current.Day())
 		paths = append(paths, path)
-		current = current.Add(24 * time.Hour)
+		current = current.AddDate(0, 0, 1)
 	}
 
 	return paths
