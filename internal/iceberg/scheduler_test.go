@@ -636,7 +636,7 @@ func TestIsUnderDir(t *testing.T) {
 	}{
 		{"file:///data/wh", true}, // the dir itself
 		{"file:///data/wh/arc_db.db/cpu/metadata/v1.metadata.json", true}, // beneath it
-		{"file:///data/wh/", true},                                        // trailing slash
+		{"file:///data/wh/", true}, // trailing slash
 		// Siblings that share a name prefix must NOT match.
 		{"file:///data/wh-other/arc_db.db/cpu/metadata/v1.metadata.json", false},
 		{"file:///data/wharf/x.json", false},

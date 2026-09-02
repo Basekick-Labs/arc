@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path"
 	"path/filepath"
 	"sort"
@@ -57,6 +58,13 @@ type Exporter struct {
 	// property is reported once per table rather than every reconcile pass.
 	hintWarnMu sync.Mutex
 	hintWarned map[string]struct{}
+
+	// resolveOnce caches the symlink-resolved warehouse and storage-root
+	// URIs for warehouseRelKey (#639 item 5); resolved lazily because the
+	// directories may not exist at construction.
+	resolveOnce       sync.Once
+	resolvedWarehouse string
+	resolvedRoot      string
 
 	// hintFailure records that a discovery-file write failed anywhere during the
 	// current ReconcileMeasurementWithHint call, including inside EnsureTable
@@ -110,9 +118,11 @@ func NewExporter(db *sql.DB, backend storage.Backend, warehouse, nsPrefix string
 		catalog:   cat,
 		backend:   backend,
 		warehouse: strings.TrimSuffix(warehouse, "/"),
-		nsPrefix:  nsPrefix,
-		retain:    retain,
-		logger:    logger.With().Str("component", "iceberg-exporter").Logger(),
+		// resolvedWarehouse/resolvedRoot are computed lazily on first
+		// warehouseRelKey call (the directories may not exist yet here).
+		nsPrefix: nsPrefix,
+		retain:   retain,
+		logger:   logger.With().Str("component", "iceberg-exporter").Logger(),
 	}, nil
 }
 
@@ -601,6 +611,12 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 		return true
 	}
 	metaLoc := tbl.MetadataLocation() // e.g. file:///…/metadata/00004-<uuid>.metadata.json
+	// iceberg-go writes metadata files and directories at umask permissions
+	// (its LocalFS uses 0o777-masked creates), while every Arc-written file
+	// is 0600 (#639 item 7). Harden the freshly committed table's metadata
+	// tree after each commit; bounded by the retain cap and snapshot expiry,
+	// so this walk is O(retained versions), not O(history).
+	e.hardenLocalMetadataPerms(metaLoc)
 	version, dirKey, ok := e.parseVersionAndMetaDir(metaLoc)
 	if !ok {
 		// Reachable when iceberg.warehouse points outside the storage root: the
@@ -687,19 +703,93 @@ func (e *Exporter) warnHintUnaddressableOnce(metaLoc string) {
 //	metaLoc "file:///data/wh/arc_db.db/cpu/metadata/00004-<uuid>.metadata.json"
 //	-> "wh/arc_db.db/cpu/metadata/00004-<uuid>.metadata.json"
 func (e *Exporter) warehouseRelKey(metaLoc string) (string, bool) {
-	if !isUnderDir(metaLoc, e.warehouse) {
+	// Resolve symlinks before comparing (#639 item 5): the warehouse config,
+	// the storage root, and the metadata location can each render the same
+	// physical directory through different spellings (a symlinked data dir,
+	// an unclean path), and raw string comparison then lands every commit in
+	// warn-once "hint unaddressable" mode. Resolution must be SYMMETRIC —
+	// all three values or none — and the two constant sides are cached.
+	e.resolveOnce.Do(func() {
+		e.resolvedWarehouse = resolveFileURI(e.warehouse)
+		if e.backend != nil {
+			e.resolvedRoot = resolveFileURI(DefaultWarehouse(e.backend))
+		}
+	})
+	loc := resolveFileURI(metaLoc)
+	if !isUnderDir(loc, e.resolvedWarehouse) {
 		return "", false
 	}
 	// No backend (tests/no-op mode): warehouse is the only base we have.
 	if e.backend == nil {
-		return strings.TrimPrefix(strings.TrimPrefix(metaLoc, e.warehouse), "/"), true
+		return strings.TrimPrefix(strings.TrimPrefix(loc, e.resolvedWarehouse), "/"), true
 	}
-	root := DefaultWarehouse(e.backend)
-	if !isUnderDir(metaLoc, root) {
+	if !isUnderDir(loc, e.resolvedRoot) {
 		// Warehouse is outside the storage root entirely — the backend cannot address it.
 		return "", false
 	}
-	return strings.TrimPrefix(strings.TrimPrefix(metaLoc, root), "/"), true
+	return strings.TrimPrefix(strings.TrimPrefix(loc, e.resolvedRoot), "/"), true
+}
+
+// hardenLocalMetadataPerms chmods a local warehouse table's metadata files to
+// 0600 and its directories to 0700, matching Arc's own writes. Local
+// warehouses only; object stores have no modes. Best-effort: a chmod failure
+// is a consistency nit, never a commit failure.
+func (e *Exporter) hardenLocalMetadataPerms(metaLoc string) {
+	const scheme = "file://"
+	if !strings.HasPrefix(metaLoc, scheme) {
+		return
+	}
+	metaDir := filepath.Dir(filepath.FromSlash(strings.TrimPrefix(metaLoc, scheme)))
+	entries, err := os.ReadDir(metaDir)
+	if err != nil {
+		return
+	}
+	// Tighten ONLY: clear group/other bits, never add owner bits. An
+	// operator's deliberately restrictive mode (or a test's read-only
+	// directory) must stay restrictive; the target is iceberg-go's
+	// umask-wide 0644/0755 creates, not modes someone chose.
+	tighten := func(path string, info os.FileMode) {
+		hardened := info &^ 0o077
+		if hardened != info {
+			if err := os.Chmod(path, hardened); err != nil {
+				e.logger.Debug().Err(err).Str("path", path).Msg("Could not harden metadata permissions")
+			}
+		}
+	}
+	for _, ent := range entries {
+		if info, err := ent.Info(); err == nil {
+			tighten(filepath.Join(metaDir, ent.Name()), info.Mode().Perm())
+		}
+	}
+	// The metadata dir, its table dir, and the namespace dir are all created
+	// by iceberg-go at umask permissions; the warehouse root itself is left
+	// alone (it may be shared or externally managed).
+	for _, dir := range []string{metaDir, filepath.Dir(metaDir), filepath.Dir(filepath.Dir(metaDir))} {
+		if info, err := os.Stat(dir); err == nil {
+			tighten(dir, info.Mode().Perm())
+		}
+	}
+}
+
+// resolveFileURI canonicalizes a file:// URI for path comparison: scheme
+// stripped, symlinks resolved, re-URI'd via localFileURI. When the full path
+// does not exist yet, its parent directory is resolved and the base rejoined,
+// so a not-yet-written metadata location still canonicalizes consistently
+// with its directory. Non-file schemes (s3://, azure://) return unchanged:
+// object keys have no symlinks and must keep exact string semantics.
+func resolveFileURI(uri string) string {
+	const scheme = "file://"
+	if !strings.HasPrefix(uri, scheme) {
+		return uri
+	}
+	p := filepath.FromSlash(strings.TrimPrefix(uri, scheme))
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return localFileURI(resolved)
+	}
+	if resolvedDir, err := filepath.EvalSymlinks(filepath.Dir(p)); err == nil {
+		return localFileURI(filepath.Join(resolvedDir, filepath.Base(p)))
+	}
+	return uri
 }
 
 // isUnderDir reports whether p is dir itself or lies beneath it, matching only at a path
