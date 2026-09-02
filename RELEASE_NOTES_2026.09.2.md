@@ -189,6 +189,18 @@ queries touching spoke namespaces stay correct and unpruned: a tier may only
 be dropped from a query on the strength of a positive pruning result from
 another tier.
 
+### Spoke-namespace files now migrate to cold storage ([#687](https://github.com/Basekick-Labs/arc/issues/687))
+
+On an edge-sync hub, spoke daily-compacted files now participate in
+hot-to-cold migration. Before a hot copy is removed (by migration or by
+orphan reconciliation), its sync receipt is marked the same way hub
+compaction marks consumed inputs, so a spoke re-offering the file gets
+"already present" instead of re-uploading a duplicate next to the cold copy.
+The marking runs before tier metadata flips and before any delete, and a
+marking failure aborts the migration batch, so a sync-index outage can never
+strand an unmarked deletion. On deployments without an edge-sync hub, spoke
+files (if any exist) remain registered but excluded from migration.
+
 ### Config-only restores now report `restart_required` (follow-up to [#678](https://github.com/Basekick-Labs/arc/pull/678))
 
 `POST /api/v1/backup/restore` returned `restart_required: true` only when
