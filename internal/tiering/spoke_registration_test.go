@@ -36,6 +36,18 @@ func TestParseFilePath_SpokeNamespace(t *testing.T) {
 	if _, err := m.parseFilePath("a/b/c/d/2024/03/15/14/f.parquet"); err == nil {
 		t.Fatal("4-segment prefix (double namespacing) unexpectedly accepted")
 	}
+
+	// A NUMERIC spoke measurement name must still classify as spoke: the
+	// migration gate keys on SpokeNamespaced, and a content-based heuristic
+	// here would let such files migrate and trip the #687 receipt hazard.
+	numeric, err := m.parseFilePath("rocket-01/telemetry/2024/2024/03/15/f_daily.parquet")
+	if err != nil || !numeric.SpokeNamespaced {
+		t.Fatalf("numeric spoke measurement = (%+v, %v), want SpokeNamespaced=true", numeric, err)
+	}
+	plain, err := m.parseFilePath("db1/cpu/2024/03/15/14/f.parquet")
+	if err != nil || plain.SpokeNamespaced {
+		t.Fatalf("plain path = (%+v, %v), want SpokeNamespaced=false", plain, err)
+	}
 }
 
 func TestSpokeFilesRegisterButDoNotMigrate(t *testing.T) {

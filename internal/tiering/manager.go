@@ -526,6 +526,10 @@ type filePathInfo struct {
 	Database      string
 	Measurement   string
 	PartitionTime time.Time
+	// SpokeNamespaced marks a path with an extra edge-sync namespace level
+	// ({spoke}/{db}/{meas}/...). Such files register for visibility but are
+	// gated out of cold migration until receipt-aware handling exists (#687).
+	SpokeNamespaced bool
 }
 
 // parseFilePath parses a storage path to extract database, measurement, and
@@ -546,7 +550,7 @@ func (m *Manager) parseFilePath(path string) (*filePathInfo, error) {
 	//   day-level tail:  {year}/{month}/{day}/{file}.parquet
 	validDate := func(y, mo, d string) (time.Time, bool) {
 		yn, err := strconv.Atoi(y)
-		if err != nil || len(y) != 4 {
+		if err != nil || len(y) != 4 || yn < 1970 {
 			return time.Time{}, false
 		}
 		mn, err := strconv.Atoi(mo)
@@ -590,11 +594,13 @@ func (m *Manager) parseFilePath(path string) (*filePathInfo, error) {
 	// rocket-01/telemetry/**), so tier metadata stays query-visible. Deeper
 	// nesting is not a feature (edge-sync forbids relaying); reject it.
 	var database, measurement string
+	spokeNamespaced := false
 	switch len(prefix) {
 	case 2:
 		database, measurement = prefix[0], prefix[1]
 	case 3:
 		database, measurement = prefix[0], prefix[1]
+		spokeNamespaced = true
 	default:
 		return nil, fmt.Errorf("unsupported path depth (%d prefix segments): %s", len(prefix), path)
 	}
@@ -608,8 +614,9 @@ func (m *Manager) parseFilePath(path string) (*filePathInfo, error) {
 	}
 
 	return &filePathInfo{
-		Database:      database,
-		Measurement:   measurement,
-		PartitionTime: partitionTime,
+		Database:        database,
+		Measurement:     measurement,
+		PartitionTime:   partitionTime,
+		SpokeNamespaced: spokeNamespaced,
 	}, nil
 }
