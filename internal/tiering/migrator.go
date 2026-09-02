@@ -145,9 +145,17 @@ func (m *Migrator) FindCandidates(ctx context.Context, fromTier, toTier Tier) ([
 		// (synthetic or legacy PartitionTime values) both misclassify.
 		// An unparseable path is skipped conservatively.
 		info, err := m.manager.parseFilePath(file.Path)
-		if err != nil || info.SpokeNamespaced {
+		if err != nil {
 			m.manager.logger.Debug().Str("path", file.Path).
-				Msg("Skipping spoke-namespace or unrecognized file for cold migration (#687)")
+				Msg("Skipping unrecognized file path for cold migration")
+			continue
+		}
+		if info.SpokeNamespaced && !m.manager.hasHotFileRemovalHook() {
+			// Without receipt marking wired, deleting a spoke file's hot copy
+			// would make confirmPresent forget its sync receipt and re-accept
+			// a duplicate upload (#687).
+			m.manager.logger.Debug().Str("path", file.Path).
+				Msg("Skipping spoke-namespace file for cold migration (receipt marking not wired, #687)")
 			continue
 		}
 
@@ -253,6 +261,22 @@ func (m *Migrator) MigrateFile(ctx context.Context, candidate MigrationCandidate
 			m.manager.metadata.CompleteMigration(ctx, migrationID, migrationErr)
 		}
 		return migrationErr
+	}
+
+	// Mark sync receipts BEFORE the metadata flips to cold (#687). Ordering
+	// is load-bearing: marking after UpdateTier leaves a window where a
+	// persistent mark failure plus an expired reconcile window strands an
+	// unmarked hot duplicate forever. A marked receipt on an aborted
+	// migration is harmless (the receive path documents marked-but-present),
+	// so abort-and-rollback on failure is strictly safe.
+	if err := m.manager.notifyHotFilesRemoved([]string{candidate.Path}); err != nil {
+		if delErr := dstBackend.Delete(ctx, candidate.Path); delErr != nil {
+			m.logger.Error().Err(delErr).Str("path", candidate.Path).Msg("Failed to rollback destination file")
+		}
+		if migrationID > 0 {
+			m.manager.metadata.CompleteMigration(ctx, migrationID, err)
+		}
+		return fmt.Errorf("failed to mark sync receipts before migration: %w", err)
 	}
 
 	// Update tier metadata
@@ -407,6 +431,16 @@ func (m *Migrator) ReconcileOrphanedFiles(ctx context.Context) (orphansFound, de
 			Str("measurement", file.Measurement).
 			Int64("size_bytes", file.SizeBytes).
 			Msg("Found orphaned hot file (metadata says cold), deleting from hot")
+
+		// Mark sync receipts before this delete too (#687). Normally a no-op
+		// (MigrateFile marked before flipping the tier), but reconciliation
+		// is the crash-recovery path and must uphold the same invariant.
+		if err := m.manager.notifyHotFilesRemoved([]string{file.Path}); err != nil {
+			m.logger.Warn().Err(err).Str("path", file.Path).
+				Msg("Could not mark sync receipts; keeping orphaned hot file for the next cycle")
+			errors++
+			continue
+		}
 
 		if err := hotBackend.Delete(ctx, file.Path); err != nil {
 			m.logger.Warn().Err(err).Str("path", file.Path).Msg("Failed to delete orphaned hot file")
