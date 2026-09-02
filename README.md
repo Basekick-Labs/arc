@@ -450,6 +450,7 @@ Thanks to everyone who has contributed code to Arc:
 - [@Thundercloud12](https://github.com/Thundercloud12) (Keerthan Poojary) — Azure not-found error detection via errors.As, covering joined multi-errors (#670)
 - [@atirna](https://github.com/atirna) (Atirna) — live SQLite backup/restore safety: VACUUM INTO snapshots for backups, rename-swap restores with stale sidecar removal, restart-required signaling (#678, #689)
 - [@mah1104ahm](https://github.com/mah1104ahm) (M Ahmed) — bounded local storage directory cache (#674)
+- [@copacabanaservice01](https://github.com/copacabanaservice01) — calendar-day S3 range path generation across DST transitions (#690)
 
 And a thank-you to community members whose bug reports drove fixes:
 
