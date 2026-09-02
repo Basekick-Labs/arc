@@ -853,3 +853,77 @@ func isAlreadyExists(err error) bool {
 	return errors.Is(err, icecatalog.ErrNamespaceAlreadyExists) ||
 		errors.Is(err, icecatalog.ErrTableAlreadyExists)
 }
+
+// DropDatabase removes every Iceberg catalog artifact for an Arc database
+// (#639 item 3): each table in its namespace, the namespace itself, and the
+// warehouse metadata files under the namespace directory. Called from the
+// database-delete API after the data files are gone; that ordering is
+// load-bearing — with no files left, a racing reconcile pass can only empty
+// tables, never recreate them, whereas catalog-first would let EnsureTable
+// resurrect residue mid-cleanup. Idempotent: a database that was never
+// exported (or already cleaned) returns nil, so a re-run of the delete
+// converges.
+//
+// Spoke-namespace pseudo-databases contain a path separator and are refused:
+// their namespace naming does not follow this mapping, and their lifecycle is
+// owned by edge-sync.
+func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
+	if strings.ContainsAny(database, "/\\") {
+		return fmt.Errorf("refusing to drop namespaced database %q from the Iceberg catalog", database)
+	}
+	ns := icetable.Identifier{e.nsPrefix + "_" + database}
+
+	// The SQL catalog's DropNamespace refuses non-empty namespaces, so drop
+	// every table first. Collect the first error but keep going: partial
+	// cleanup converges on the next delete attempt.
+	var firstErr error
+	for ident, err := range e.catalog.ListTables(ctx, ns) {
+		if err != nil {
+			if errors.Is(err, icecatalog.ErrNoSuchNamespace) {
+				return nil // never exported; nothing to clean
+			}
+			return fmt.Errorf("list tables for drop: %w", err)
+		}
+		if err := e.catalog.DropTable(ctx, ident); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("drop table %v: %w", ident, err)
+		}
+	}
+	if err := e.catalog.DropNamespace(ctx, ns); err != nil && !errors.Is(err, icecatalog.ErrNoSuchNamespace) && firstErr == nil {
+		firstErr = fmt.Errorf("drop namespace: %w", err)
+	}
+
+	// Warehouse holds ONLY metadata (data files are Arc's own tree, already
+	// deleted by the caller); remove the namespace directory's objects via
+	// the backend so local and object-store warehouses behave alike.
+	if e.backend != nil {
+		nsDirURI := e.warehouse + "/" + e.nsPrefix + "_" + database + ".db"
+		if relDir, ok := e.warehouseRelKey(nsDirURI); ok {
+			keys, err := e.backend.List(ctx, relDir+"/")
+			if err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("list warehouse metadata: %w", err)
+			}
+			dirs := map[string]bool{relDir: true}
+			for _, key := range keys {
+				if err := e.backend.Delete(ctx, key); err != nil && firstErr == nil {
+					firstErr = fmt.Errorf("delete warehouse object %s: %w", key, err)
+				}
+				for d := path.Dir(key); len(d) > len(relDir); d = path.Dir(d) {
+					dirs[d] = true
+				}
+			}
+			// RemoveDirectory is non-recursive, so sweep the now-empty
+			// directory tree deepest-first (object stores no-op here).
+			if remover, ok := e.backend.(storage.DirectoryRemover); ok {
+				ordered := make([]string, 0, len(dirs))
+				for d := range dirs {
+					ordered = append(ordered, d)
+				}
+				sort.Slice(ordered, func(i, j int) bool { return len(ordered[i]) > len(ordered[j]) })
+				for _, d := range ordered {
+					_ = remover.RemoveDirectory(ctx, d)
+				}
+			}
+		}
+	}
+	return firstErr
+}

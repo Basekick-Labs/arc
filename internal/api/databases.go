@@ -21,6 +21,7 @@ type DatabasesHandler struct {
 	tieringManager *tiering.Manager
 	authManager    *auth.AuthManager
 	logger         zerolog.Logger
+	icebergDropper IcebergCatalogDropper
 }
 
 // CreateDatabaseRequest represents a request to create a new database
@@ -62,6 +63,18 @@ var reservedDatabaseNames = map[string]bool{
 }
 
 // NewDatabasesHandler creates a new databases handler
+// IcebergCatalogDropper removes a dropped database's Iceberg catalog
+// artifacts (#639 item 3). Implemented by iceberg.Exporter; nil when Iceberg
+// export is disabled.
+type IcebergCatalogDropper interface {
+	DropDatabase(ctx context.Context, database string) error
+}
+
+// SetIcebergDropper wires catalog cleanup into database deletion.
+func (h *DatabasesHandler) SetIcebergDropper(d IcebergCatalogDropper) {
+	h.icebergDropper = d
+}
+
 func NewDatabasesHandler(storage storage.Backend, deleteConfig *config.DeleteConfig, authManager *auth.AuthManager, logger zerolog.Logger) *DatabasesHandler {
 	return &DatabasesHandler{
 		storage:      storage,
@@ -330,6 +343,10 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	}
 
 	if !exists {
+		// Converge re-runs (#639 item 3): a previous DELETE may have removed
+		// the files then crashed before catalog cleanup. Best-effort here so
+		// repeating the DELETE clears the residue; the 404 contract stands.
+		h.dropIcebergCatalog(ctx, name)
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "Database '" + name + "' not found",
 		})
@@ -384,6 +401,13 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			h.logger.Debug().Err(err).Str("database", name).Msg("Could not remove database directory (may not be empty)")
 		}
 	}
+
+	// Iceberg catalog cleanup AFTER file deletion (#639 item 3): with the
+	// files gone, a racing reconcile pass can only empty tables, never
+	// recreate them. Failures are logged, not returned: the files are
+	// already deleted, catalog residue equals the pre-fix status quo, and
+	// re-running the DELETE retries the cleanup.
+	h.dropIcebergCatalog(ctx, name)
 
 	if len(deleteErrors) > 0 {
 		h.logger.Error().
@@ -678,4 +702,18 @@ func extractSubdirectories(files []string, prefix string) []string {
 		dirs = append(dirs, dir)
 	}
 	return dirs
+}
+
+// dropIcebergCatalog is the nil-safe, logged wrapper around the wired
+// catalog dropper.
+func (h *DatabasesHandler) dropIcebergCatalog(ctx context.Context, name string) {
+	if h.icebergDropper == nil {
+		return
+	}
+	if err := h.icebergDropper.DropDatabase(ctx, name); err != nil {
+		h.logger.Warn().Err(err).Str("database", name).
+			Msg("Iceberg catalog cleanup after database drop failed; re-running the DELETE retries it")
+	} else {
+		h.logger.Info().Str("database", name).Msg("Iceberg catalog artifacts removed for dropped database")
+	}
 }

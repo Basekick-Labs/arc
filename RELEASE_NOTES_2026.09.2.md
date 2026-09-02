@@ -230,3 +230,13 @@ unaddressable" mode. Local warehouse metadata written by the embedded Iceberg
 library is tightened to owner-only permissions after each commit (tighten
 only; deliberately restrictive modes are never loosened). Restore staging
 streams from backup storage instead of buffering entire databases in memory.
+
+### Dropping a database now clears its Iceberg catalog artifacts ([#639](https://github.com/Basekick-Labs/arc/issues/639) item 3)
+
+`DELETE /api/v1/databases/{name}` previously deleted the data files but left
+the database's Iceberg namespace, table rows, and warehouse metadata behind
+forever. The delete now also drops each catalog table, the namespace, and the
+warehouse metadata directory, after the files are removed, so a racing
+reconcile pass can only empty tables rather than recreate them. Cleanup
+failures are logged and re-running the DELETE retries them, including when the
+files are already gone.
