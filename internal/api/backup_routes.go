@@ -267,11 +267,14 @@ func (h *BackupHandler) RestoreBackup(c *fiber.Ctx) error {
 		"backup_id": req.BackupID,
 		"status":    "running",
 	}
-	// Restored databases replace the live files by rename (open connections
-	// keep the pre-restore content) and a restored config only takes effect
-	// on reload — both need a server restart.
+	// Restored databases are STAGED and applied at the next boot (#635), and
+	// a restored config only takes effect on reload — both need a server
+	// restart to take effect.
 	if opts.RestoreMetadata || opts.RestoreConfig {
 		resp["restart_required"] = true
+	}
+	if opts.RestoreMetadata {
+		resp["staged"] = true
 	}
 	return c.Status(fiber.StatusAccepted).JSON(resp)
 }

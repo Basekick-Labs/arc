@@ -154,6 +154,21 @@ func main() {
 		log.Fatal().Msg("Arc was built without -tags=duckdb_arrow; refusing to start. The Arrow query path is required: rebuild with `make build` (or `go build -tags=duckdb_arrow ./cmd/arc`).")
 	}
 
+	// Apply staged metadata restores BEFORE anything opens the SQLite
+	// databases (#635): the restore API only stages; the swap happens here,
+	// where no connection, pool, or sidecar can be live. The same paths are
+	// derived again for backup.NewManager later; keep the two in sync.
+	{
+		bootIcebergCatalog := ""
+		if cfg.Iceberg.Enabled {
+			bootIcebergCatalog = cfg.Iceberg.CatalogDBPath
+			if bootIcebergCatalog == "" {
+				bootIcebergCatalog = cfg.Auth.DBPath
+			}
+		}
+		backup.ApplyPendingRestores(logger.Get("backup"), cfg.Auth.DBPath, bootIcebergCatalog)
+	}
+
 	// Validate Enterprise License early (before component initialization)
 	// This allows us to apply core limits to DuckDB and ingestion workers
 	var licenseClient *license.Client
