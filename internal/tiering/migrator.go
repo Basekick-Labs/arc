@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -132,6 +133,27 @@ func (m *Migrator) FindCandidates(ctx context.Context, fromTier, toTier Tier) ([
 		// Only migrate daily-compacted files to cold tier
 		if !strings.HasSuffix(file.Path, "_daily.parquet") {
 			continue
+		}
+
+		// Spoke-namespace files register for visibility but do NOT migrate
+		// yet: legacy spoke-side compacted files sync once and carry
+		// sync_received receipts, and deleting their hot copy would make
+		// confirmPresent forget the receipt — the spoke then re-offers the
+		// file and the hub re-accepts a duplicate next to the cold copy (the
+		// #611 hazard class). Cold migration of spoke data needs
+		// migrated-receipt marking first (follow-up issue). A spoke path has
+		// an extra namespace level, so the segment after {db}/{meas}/ is the
+		// spoke's measurement rather than a year.
+		if rest, ok := strings.CutPrefix(file.Path, file.Database+"/"+file.Measurement+"/"); ok {
+			if first, _, _ := strings.Cut(rest, "/"); len(first) != 4 {
+				m.manager.logger.Debug().Str("path", file.Path).
+					Msg("Skipping spoke-namespace file for cold migration (receipt handling not implemented)")
+				continue
+			} else if _, err := strconv.Atoi(first); err != nil {
+				m.manager.logger.Debug().Str("path", file.Path).
+					Msg("Skipping spoke-namespace file for cold migration (receipt handling not implemented)")
+				continue
+			}
 		}
 
 		candidates = append(candidates, MigrationCandidate{
