@@ -112,7 +112,7 @@ Contributed by [@Thundercloud12](https://github.com/Thundercloud12) in [#670](ht
 Backups now snapshot live SQLite databases before copying them, so concurrent
 WAL writers cannot interleave pages into a backup. Restores no longer touch the
 live database at all: the restored database is STAGED next to the live one and
-applied at the next server start, before anything opens it — the running server
+applied at the next server start, before anything opens it. The running server
 keeps serving consistent pre-restore data, and the swap (with a complete
 `.before-restore` safety copy and stale-sidecar cleanup) happens where no
 connection can observe a half-applied state. A staged restore that fails

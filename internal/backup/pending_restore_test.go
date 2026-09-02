@@ -177,3 +177,46 @@ func TestApply_ConvergesFromPartialStates(t *testing.T) {
 		t.Fatalf("safety copy rows = %d, want the first restore's 4 (overwritten in order)", got)
 	}
 }
+
+// The checkpoint-failure branch: a held read transaction makes
+// wal_checkpoint(TRUNCATE) fail busy, so the apply must move the WAL
+// sidecars ALONGSIDE the safety copy (keeping it recoverable) instead of
+// deleting them, and still apply the staged restore.
+func TestApply_CheckpointFailureKeepsSafetyCopyRecoverable(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "arc.db")
+
+	live, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.Close()
+	if _, err := live.Exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t (v INTEGER); INSERT INTO t (v) VALUES (1), (2), (3)"); err != nil {
+		t.Fatal(err)
+	}
+	// Hold a read transaction so TRUNCATE checkpointing cannot complete.
+	tx, err := live.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := tx.QueryRow("SELECT count(*) FROM t").Scan(&n); err != nil || n != 3 {
+		t.Fatalf("read txn: (%d, %v)", n, err)
+	}
+
+	makeSQLite(t, StagePath(dbPath), 7)
+	ApplyPendingRestores(zerolog.Nop(), dbPath)
+	tx.Rollback()
+	live.Close()
+
+	if got := rowCount(t, dbPath); got != 7 {
+		t.Fatalf("applied rows = %d, want the staged restore's 7", got)
+	}
+	if _, err := os.Stat(dbPath + ".before-restore-wal"); err != nil {
+		t.Fatalf("WAL not moved alongside the safety copy on checkpoint failure: %v", err)
+	}
+	// The safety copy with its moved WAL must recover every live commit.
+	if got := rowCount(t, dbPath+".before-restore"); got != 3 {
+		t.Fatalf("safety copy rows = %d, want 3 (WAL replayed on open)", got)
+	}
+}

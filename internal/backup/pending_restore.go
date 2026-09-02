@@ -12,7 +12,7 @@ package backup
 // Crash convergence: every step below is a remove or rename, ordered so a
 // crash at ANY point converges on the next boot. The one non-obvious rule is
 // resume-on-missing-destination: a crash between the safety rename and the
-// final rename leaves no live database with the pending file still staged —
+// final rename leaves no live database with the pending file still staged;
 // the next boot MUST apply the pending file rather than skip, or the server
 // would boot onto a fresh empty database and the restore (and, for auth.db,
 // every credential) would be silently lost.
@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"database/sql"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/rs/zerolog"
@@ -41,7 +42,7 @@ func StagePath(dbPath string) string { return dbPath + PendingRestoreSuffix }
 // empty paths are tolerated (the shared-database layout passes the same file
 // for several roles). Errors are contained per path: a failure to apply one
 // staged restore quarantines or leaves it and lets the boot continue on the
-// current database, logged loudly — a staged restore must never boot-loop the
+// current database, logged loudly. A staged restore must never boot-loop the
 // server or apply garbage over a working database.
 func ApplyPendingRestores(logger zerolog.Logger, dbPaths ...string) {
 	seen := make(map[string]bool, len(dbPaths))
@@ -66,10 +67,10 @@ func applyPendingRestore(logger zerolog.Logger, dbPath string) {
 	if err := validatePendingSQLite(pending); err != nil {
 		rejected := pending + ".rejected"
 		if renameErr := os.Rename(pending, rejected); renameErr != nil {
-			log.Error().Err(renameErr).Msg("Staged restore is invalid and could not be quarantined; leaving it — it will be re-checked next boot")
+			log.Error().Err(renameErr).Msg("Staged restore is invalid and could not be quarantined; leaving it for re-check at next boot")
 		} else {
 			log.Error().Err(err).Str("quarantined_to", rejected).
-				Msg("Staged restore failed validation; quarantined — booting with the current database")
+				Msg("Staged restore failed validation; quarantined, booting with the current database")
 		}
 		return
 	}
@@ -82,7 +83,7 @@ func applyPendingRestore(logger zerolog.Logger, dbPath string) {
 
 		// Remove an OLDER restore's safety sidecars: after this run the
 		// safety copy is either checkpointed (no sidecars) or gets this run's
-		// sidecars moved in below — stale ones from a previous restore beside
+		// sidecars moved in below; stale ones from a previous restore beside
 		// it are exactly the mismatched-WAL hazard #635 documented.
 		removeIgnoreMissing(log, before+"-wal")
 		removeIgnoreMissing(log, before+"-shm")
@@ -99,13 +100,22 @@ func applyPendingRestore(logger zerolog.Logger, dbPath string) {
 		}
 
 		if err := os.Rename(dbPath, before); err != nil {
-			log.Error().Err(err).Msg("Could not move the current database aside; staged restore NOT applied — booting with the current database")
+			log.Error().Err(err).Msg("Could not move the current database aside; staged restore NOT applied, booting with the current database")
 			return
 		}
 		log.Info().Str("safety_copy", before).Msg("Current database moved aside before restore apply")
 	}
-	// else: no current database — either a fresh node, or the
-	// resume-on-missing-destination case after a crash mid-apply.
+	// else: no current database. A fresh node, the resume case after a
+	// crash mid-apply, or an operator-deleted database.
+
+	// Unconditionally clear sidecars at the destination path before the
+	// final rename. The apply's own flow already handled them, but an
+	// operator who deleted the database while a -wal remained (plus a
+	// forgotten staged restore) would otherwise have that stale WAL,
+	// salted against the DELETED database, replayed over the restored one
+	// on first open: the exact corruption class this design eliminates.
+	removeIgnoreMissing(log, dbPath+"-wal")
+	removeIgnoreMissing(log, dbPath+"-shm")
 
 	if err := os.Rename(pending, dbPath); err != nil {
 		log.Error().Err(err).Msg("Could not move the staged restore into place; it remains staged for the next boot")
@@ -123,7 +133,7 @@ func validatePendingSQLite(path string) error {
 		return err
 	}
 	header := make([]byte, len(sqliteMagic))
-	_, readErr := f.Read(header)
+	_, readErr := io.ReadFull(f, header)
 	info, statErr := f.Stat()
 	f.Close()
 	if readErr != nil {
@@ -151,15 +161,24 @@ func validatePendingSQLite(path string) error {
 	return nil
 }
 
-// checkpointSQLite folds the WAL into the main database file.
+// checkpointSQLite folds the WAL into the main database file. The pragma
+// does NOT error when it cannot complete: it reports busy=1 in its result
+// row, so the row must be inspected — treating a blocked checkpoint as
+// success would delete a WAL whose commits were never folded in.
 func checkpointSQLite(path string) error {
 	db, err := sql.Open("sqlite3", path)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	_, err = db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
-	return err
+	var busy, logFrames, checkpointed int
+	if err := db.QueryRow("PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logFrames, &checkpointed); err != nil {
+		return err
+	}
+	if busy != 0 {
+		return fmt.Errorf("wal_checkpoint blocked (busy=1, %d frames in log)", logFrames)
+	}
+	return nil
 }
 
 func removeIgnoreMissing(log zerolog.Logger, path string) {
