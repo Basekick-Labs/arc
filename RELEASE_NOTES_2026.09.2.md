@@ -55,6 +55,18 @@ literals (e.g. a log-search `LIKE '%INTERVAL 5 MINUTE%'`) and identifiers such a
 
 ## Bug fixes
 
+### Config-only restores now report `restart_required` (follow-up to [#678](https://github.com/Basekick-Labs/arc/pull/678))
+
+`POST /api/v1/backup/restore` returned `restart_required: true` only when
+metadata (SQLite databases) was restored. A config-only restore needs the same
+restart — the restored `arc.toml` only takes effect on reload, which
+`restoreConfig` already logs — but the response did not say so. The flag now
+covers both restore kinds; a data-only restore still omits it. The restored-
+database immunity test also fails instead of skipping when a fresh connection
+cannot read the restored file.
+
+Contributed by [@atirna](https://github.com/atirna).
+
 ### Iceberg version hints no longer advance before metadata copies publish ([#636](https://github.com/Basekick-Labs/arc/issues/636))
 
 Directory-based Iceberg readers fetch `version-hint.text` before opening the matching
