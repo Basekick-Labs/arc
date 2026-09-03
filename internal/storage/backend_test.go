@@ -127,6 +127,23 @@ func TestLocalBackend_BasicOperations(t *testing.T) {
 	})
 }
 
+func TestLocalBackend_DirectoryCacheIsBounded(t *testing.T) {
+	backend, err := NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewLocalBackend() error = %v", err)
+	}
+
+	for i := 0; i < maxDirCacheEntries+25; i++ {
+		if err := backend.ensureDir(filepath.Join(backend.basePath, fmt.Sprintf("dir-%d", i))); err != nil {
+			t.Fatalf("ensureDir() error = %v", err)
+		}
+	}
+
+	if got := len(backend.dirCache); got > maxDirCacheEntries {
+		t.Fatalf("directory cache size = %d, want at most %d", got, maxDirCacheEntries)
+	}
+}
+
 // TestLocalBackend_DirectoryLister tests the DirectoryLister interface
 func TestLocalBackend_DirectoryLister(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "arc-storage-test-*")

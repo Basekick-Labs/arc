@@ -402,6 +402,11 @@ type PrunerStats struct {
 type TimeRange struct {
 	Start time.Time
 	End   time.Time
+	// StartAssumed marks a range whose Start was not extracted from the query
+	// but assumed (an end-only predicate defaults Start to 2020-01-01). A
+	// consumer pruning storage that can legitimately hold data older than the
+	// assumption (a cold archive tier) must not trust Start for exclusion.
+	StartAssumed bool
 }
 
 // evaluateRelativeTime converts a relative time expression to an absolute time.
@@ -580,7 +585,7 @@ func (p *PartitionPruner) ExtractTimeRange(sqlStr string) *TimeRange {
 	} else if endTime != nil {
 		// Only end time - assume from beginning of data
 		start := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
-		return &TimeRange{Start: start, End: *endTime}
+		return &TimeRange{Start: start, End: *endTime, StartAssumed: true}
 	}
 
 	return nil

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -216,33 +217,53 @@ func (m *Manager) restoreSQLite(ctx context.Context, backupID string) error {
 	return nil
 }
 
-// restoreSQLiteFile restores one SQLite database from metadata/<srcName> in the
-// backup to destPath, preserving the previous file as .before-restore.
+// restoreSQLiteFile STAGES one SQLite database from metadata/<srcName> in the
+// backup as <destPath>.pending-restore. The live database is never touched:
+// applying a restore over a running server's database — even by atomic
+// rename — leaves existing connections on the old inode while new pool
+// connections open the restored file, splitting state across both (#635).
+// ApplyPendingRestores applies the staged file at the next boot, before any
+// subsystem opens the database, and takes the .before-restore safety copy at
+// that point (when it can be made complete and cheaply). Restaging overwrites
+// a previous staging: the last restore before restart wins. An operator can
+// cancel by deleting the .pending-restore file before restarting.
 func (m *Manager) restoreSQLiteFile(ctx context.Context, backupID, srcName, destPath string) error {
 	srcPath := fmt.Sprintf("%s/metadata/%s", backupID, srcName)
-	data, err := m.backupStorage.Read(ctx, srcPath)
+
+	// Stream from backup storage into the staging file (#639 item 8): the
+	// shared database can be multi-GB on audit-heavy deployments, and
+	// buffering it in memory violates the streaming rule everywhere else in
+	// this package. CreateTemp creates 0600 before any byte lands, and the
+	// staging file is renamed into the pending path only on full success.
+	staging, err := os.CreateTemp(filepath.Dir(destPath), ".restore-staging-*")
 	if err != nil {
-		return fmt.Errorf("failed to read SQLite backup: %w", err)
+		return fmt.Errorf("failed to create restore staging file: %w", err)
+	}
+	stagingPath := staging.Name()
+	if err := m.backupStorage.ReadTo(ctx, srcPath, staging); err != nil {
+		staging.Close()
+		os.Remove(stagingPath)
+		return fmt.Errorf("failed to stream SQLite backup into staging: %w", err)
+	}
+	if err := staging.Close(); err != nil {
+		os.Remove(stagingPath)
+		return fmt.Errorf("failed to close staged restore: %w", err)
+	}
+	if err := os.Chmod(stagingPath, 0600); err != nil {
+		os.Remove(stagingPath)
+		return fmt.Errorf("failed to restrict staged restore: %w", err)
+	}
+	pendingPath := StagePath(destPath)
+	if err := os.Rename(stagingPath, pendingPath); err != nil {
+		os.Remove(stagingPath)
+		return fmt.Errorf("failed to stage restored SQLite database: %w", err)
 	}
 
-	// Safety: backup the current database before overwriting
-	if _, statErr := os.Stat(destPath); statErr == nil {
-		preRestorePath := destPath + ".before-restore"
-		currentData, err := os.ReadFile(destPath)
-		if err == nil {
-			if err := os.WriteFile(preRestorePath, currentData, 0600); err != nil {
-				m.logger.Warn().Err(err).Msg("Failed to create pre-restore backup of SQLite database")
-			} else {
-				m.logger.Info().Str("path", preRestorePath).Msg("Created pre-restore backup of SQLite database")
-			}
-		}
-	}
-
-	if err := os.WriteFile(destPath, data, 0600); err != nil {
-		return fmt.Errorf("failed to write SQLite database: %w", err)
-	}
-
-	m.logger.Info().Str("backup_id", backupID).Str("database", srcName).Msg("SQLite database restored")
+	m.logger.Warn().
+		Str("backup_id", backupID).
+		Str("database", srcName).
+		Str("staged_at", pendingPath).
+		Msg("SQLite restore staged; it is applied at the next server start")
 	return nil
 }
 

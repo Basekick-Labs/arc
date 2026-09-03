@@ -910,6 +910,21 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		}
 	}
 
+	// Pin the session time zone to UTC for every connection (#682). Arc's
+	// contract is UTC end to end: partitions are UTC hour directories, the
+	// partition pruner parses naive timestamp literals as UTC, arcxrouter
+	// accepts only UTC literals, and the JSON writer renders UTC. DuckDB,
+	// however, defaults the session zone to the HOST's zone, and compares a
+	// naive literal against a TIMESTAMPTZ column in the session zone — so on
+	// a non-UTC host the pruner and the engine disagree about which instant
+	// 'YYYY-MM-DD HH:MM:SS' denotes, and pruning can silently drop matching
+	// rows. Hard-fail like memory_limit: booting without the pin means
+	// silently wrong query results. Users who want zone-aware predicates
+	// keep them via offset literals ('… +02:00') or AT TIME ZONE.
+	if _, err := db.Exec("SET GLOBAL TimeZone='UTC'"); err != nil {
+		return fmt.Errorf("failed to pin DuckDB TimeZone to UTC: %w", err)
+	}
+
 	// Cache Parquet file metadata (schema, row group info) to reduce I/O on repeated access
 	if _, err := db.Exec("SET GLOBAL parquet_metadata_cache=true"); err != nil {
 		logger.Warn().Err(err).Msg("Failed to enable parquet metadata cache (continuing without it)")

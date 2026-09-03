@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path"
 	"path/filepath"
 	"sort"
@@ -57,6 +58,13 @@ type Exporter struct {
 	// property is reported once per table rather than every reconcile pass.
 	hintWarnMu sync.Mutex
 	hintWarned map[string]struct{}
+
+	// resolveOnce caches the symlink-resolved warehouse and storage-root
+	// URIs for warehouseRelKey (#639 item 5); resolved lazily because the
+	// directories may not exist at construction.
+	resolveOnce       sync.Once
+	resolvedWarehouse string
+	resolvedRoot      string
 
 	// hintFailure records that a discovery-file write failed anywhere during the
 	// current ReconcileMeasurementWithHint call, including inside EnsureTable
@@ -110,9 +118,11 @@ func NewExporter(db *sql.DB, backend storage.Backend, warehouse, nsPrefix string
 		catalog:   cat,
 		backend:   backend,
 		warehouse: strings.TrimSuffix(warehouse, "/"),
-		nsPrefix:  nsPrefix,
-		retain:    retain,
-		logger:    logger.With().Str("component", "iceberg-exporter").Logger(),
+		// resolvedWarehouse/resolvedRoot are computed lazily on first
+		// warehouseRelKey call (the directories may not exist yet here).
+		nsPrefix: nsPrefix,
+		retain:   retain,
+		logger:   logger.With().Str("component", "iceberg-exporter").Logger(),
 	}, nil
 }
 
@@ -134,14 +144,25 @@ type ArcField struct {
 	Type iceberg.Type
 }
 
-// TableExists reports whether the Iceberg table for (database, measurement) is already in the
-// catalog. Used by the reconciler to distinguish "this measurement's files were all deleted, so
-// empty its existing table" from "this is a stray empty directory that never held data" — the
-// latter must NOT mint a zero-column table via EnsureTable. A catalog error reads as false: the
-// caller's only action on true is an empty-out, so failing closed just defers to the next pass.
+// TableExists reports whether the Iceberg table for (database, measurement) exists, swallowing
+// catalog lookup errors and returning false.
 func (e *Exporter) TableExists(ctx context.Context, database, measurement string) bool {
+	exists, _ := e.tableExists(ctx, database, measurement)
+	return exists
+}
+
+// tableExists distinguishes a missing table from a catalog failure. Callers such as the reconciler
+// need the (bool, error) form so a transient catalog error is not interpreted and cached as a
+// confirmed missing table.
+func (e *Exporter) tableExists(ctx context.Context, database, measurement string) (bool, error) {
 	_, err := e.catalog.LoadTable(ctx, e.tableIdent(database, measurement))
-	return err == nil
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, icecatalog.ErrNoSuchTable) {
+		return false, nil
+	}
+	return false, err
 }
 
 // EnsureTable creates the Iceberg table for (database, measurement) if absent, using the
@@ -590,6 +611,12 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 		return true
 	}
 	metaLoc := tbl.MetadataLocation() // e.g. file:///…/metadata/00004-<uuid>.metadata.json
+	// iceberg-go writes metadata files and directories at umask permissions
+	// (its LocalFS uses 0o777-masked creates), while every Arc-written file
+	// is 0600 (#639 item 7). Harden the freshly committed table's metadata
+	// tree after each commit; bounded by the retain cap and snapshot expiry,
+	// so this walk is O(retained versions), not O(history).
+	e.hardenLocalMetadataPerms(metaLoc)
 	version, dirKey, ok := e.parseVersionAndMetaDir(metaLoc)
 	if !ok {
 		// Reachable when iceberg.warehouse points outside the storage root: the
@@ -610,7 +637,9 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 	}()
 	// Copy the current metadata to v<N>.metadata.json (Hadoop-convention name).
 	metaKey, kOK := e.warehouseRelKey(metaLoc)
-	if kOK {
+	if !kOK {
+		okAll = false
+	} else {
 		if body, err := e.backend.Read(ctx, metaKey); err != nil {
 			e.logger.Warn().Err(err).Str("key", metaKey).Msg("Failed to read current metadata for v<N> copy (will retry next pass)")
 			okAll = false
@@ -621,6 +650,9 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 				okAll = false
 			}
 		}
+	}
+	if !okAll {
+		return false
 	}
 	// Write the version-hint pointer — just the integer, NO trailing newline (DuckDB reads the
 	// file verbatim and would look for "v<N>\n.metadata.json" otherwise; verified empirically).
@@ -671,19 +703,93 @@ func (e *Exporter) warnHintUnaddressableOnce(metaLoc string) {
 //	metaLoc "file:///data/wh/arc_db.db/cpu/metadata/00004-<uuid>.metadata.json"
 //	-> "wh/arc_db.db/cpu/metadata/00004-<uuid>.metadata.json"
 func (e *Exporter) warehouseRelKey(metaLoc string) (string, bool) {
-	if !isUnderDir(metaLoc, e.warehouse) {
+	// Resolve symlinks before comparing (#639 item 5): the warehouse config,
+	// the storage root, and the metadata location can each render the same
+	// physical directory through different spellings (a symlinked data dir,
+	// an unclean path), and raw string comparison then lands every commit in
+	// warn-once "hint unaddressable" mode. Resolution must be SYMMETRIC —
+	// all three values or none — and the two constant sides are cached.
+	e.resolveOnce.Do(func() {
+		e.resolvedWarehouse = resolveFileURI(e.warehouse)
+		if e.backend != nil {
+			e.resolvedRoot = resolveFileURI(DefaultWarehouse(e.backend))
+		}
+	})
+	loc := resolveFileURI(metaLoc)
+	if !isUnderDir(loc, e.resolvedWarehouse) {
 		return "", false
 	}
 	// No backend (tests/no-op mode): warehouse is the only base we have.
 	if e.backend == nil {
-		return strings.TrimPrefix(strings.TrimPrefix(metaLoc, e.warehouse), "/"), true
+		return strings.TrimPrefix(strings.TrimPrefix(loc, e.resolvedWarehouse), "/"), true
 	}
-	root := DefaultWarehouse(e.backend)
-	if !isUnderDir(metaLoc, root) {
+	if !isUnderDir(loc, e.resolvedRoot) {
 		// Warehouse is outside the storage root entirely — the backend cannot address it.
 		return "", false
 	}
-	return strings.TrimPrefix(strings.TrimPrefix(metaLoc, root), "/"), true
+	return strings.TrimPrefix(strings.TrimPrefix(loc, e.resolvedRoot), "/"), true
+}
+
+// hardenLocalMetadataPerms chmods a local warehouse table's metadata files to
+// 0600 and its directories to 0700, matching Arc's own writes. Local
+// warehouses only; object stores have no modes. Best-effort: a chmod failure
+// is a consistency nit, never a commit failure.
+func (e *Exporter) hardenLocalMetadataPerms(metaLoc string) {
+	const scheme = "file://"
+	if !strings.HasPrefix(metaLoc, scheme) {
+		return
+	}
+	metaDir := filepath.Dir(filepath.FromSlash(strings.TrimPrefix(metaLoc, scheme)))
+	entries, err := os.ReadDir(metaDir)
+	if err != nil {
+		return
+	}
+	// Tighten ONLY: clear group/other bits, never add owner bits. An
+	// operator's deliberately restrictive mode (or a test's read-only
+	// directory) must stay restrictive; the target is iceberg-go's
+	// umask-wide 0644/0755 creates, not modes someone chose.
+	tighten := func(path string, info os.FileMode) {
+		hardened := info &^ 0o077
+		if hardened != info {
+			if err := os.Chmod(path, hardened); err != nil {
+				e.logger.Debug().Err(err).Str("path", path).Msg("Could not harden metadata permissions")
+			}
+		}
+	}
+	for _, ent := range entries {
+		if info, err := ent.Info(); err == nil {
+			tighten(filepath.Join(metaDir, ent.Name()), info.Mode().Perm())
+		}
+	}
+	// The metadata dir, its table dir, and the namespace dir are all created
+	// by iceberg-go at umask permissions; the warehouse root itself is left
+	// alone (it may be shared or externally managed).
+	for _, dir := range []string{metaDir, filepath.Dir(metaDir), filepath.Dir(filepath.Dir(metaDir))} {
+		if info, err := os.Stat(dir); err == nil {
+			tighten(dir, info.Mode().Perm())
+		}
+	}
+}
+
+// resolveFileURI canonicalizes a file:// URI for path comparison: scheme
+// stripped, symlinks resolved, re-URI'd via localFileURI. When the full path
+// does not exist yet, its parent directory is resolved and the base rejoined,
+// so a not-yet-written metadata location still canonicalizes consistently
+// with its directory. Non-file schemes (s3://, azure://) return unchanged:
+// object keys have no symlinks and must keep exact string semantics.
+func resolveFileURI(uri string) string {
+	const scheme = "file://"
+	if !strings.HasPrefix(uri, scheme) {
+		return uri
+	}
+	p := filepath.FromSlash(strings.TrimPrefix(uri, scheme))
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return localFileURI(resolved)
+	}
+	if resolvedDir, err := filepath.EvalSymlinks(filepath.Dir(p)); err == nil {
+		return localFileURI(filepath.Join(resolvedDir, filepath.Base(p)))
+	}
+	return uri
 }
 
 // isUnderDir reports whether p is dir itself or lies beneath it, matching only at a path
@@ -746,4 +852,78 @@ func (e *Exporter) tableDataFiles(ctx context.Context, tbl *icetable.Table) (map
 func isAlreadyExists(err error) bool {
 	return errors.Is(err, icecatalog.ErrNamespaceAlreadyExists) ||
 		errors.Is(err, icecatalog.ErrTableAlreadyExists)
+}
+
+// DropDatabase removes every Iceberg catalog artifact for an Arc database
+// (#639 item 3): each table in its namespace, the namespace itself, and the
+// warehouse metadata files under the namespace directory. Called from the
+// database-delete API after the data files are gone; that ordering is
+// load-bearing — with no files left, a racing reconcile pass can only empty
+// tables, never recreate them, whereas catalog-first would let EnsureTable
+// resurrect residue mid-cleanup. Idempotent: a database that was never
+// exported (or already cleaned) returns nil, so a re-run of the delete
+// converges.
+//
+// Spoke-namespace pseudo-databases contain a path separator and are refused:
+// their namespace naming does not follow this mapping, and their lifecycle is
+// owned by edge-sync.
+func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
+	if strings.ContainsAny(database, "/\\") {
+		return fmt.Errorf("refusing to drop namespaced database %q from the Iceberg catalog", database)
+	}
+	ns := icetable.Identifier{e.nsPrefix + "_" + database}
+
+	// The SQL catalog's DropNamespace refuses non-empty namespaces, so drop
+	// every table first. Collect the first error but keep going: partial
+	// cleanup converges on the next delete attempt.
+	var firstErr error
+	for ident, err := range e.catalog.ListTables(ctx, ns) {
+		if err != nil {
+			if errors.Is(err, icecatalog.ErrNoSuchNamespace) {
+				return nil // never exported; nothing to clean
+			}
+			return fmt.Errorf("list tables for drop: %w", err)
+		}
+		if err := e.catalog.DropTable(ctx, ident); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("drop table %v: %w", ident, err)
+		}
+	}
+	if err := e.catalog.DropNamespace(ctx, ns); err != nil && !errors.Is(err, icecatalog.ErrNoSuchNamespace) && firstErr == nil {
+		firstErr = fmt.Errorf("drop namespace: %w", err)
+	}
+
+	// Warehouse holds ONLY metadata (data files are Arc's own tree, already
+	// deleted by the caller); remove the namespace directory's objects via
+	// the backend so local and object-store warehouses behave alike.
+	if e.backend != nil {
+		nsDirURI := e.warehouse + "/" + e.nsPrefix + "_" + database + ".db"
+		if relDir, ok := e.warehouseRelKey(nsDirURI); ok {
+			keys, err := e.backend.List(ctx, relDir+"/")
+			if err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("list warehouse metadata: %w", err)
+			}
+			dirs := map[string]bool{relDir: true}
+			for _, key := range keys {
+				if err := e.backend.Delete(ctx, key); err != nil && firstErr == nil {
+					firstErr = fmt.Errorf("delete warehouse object %s: %w", key, err)
+				}
+				for d := path.Dir(key); len(d) > len(relDir); d = path.Dir(d) {
+					dirs[d] = true
+				}
+			}
+			// RemoveDirectory is non-recursive, so sweep the now-empty
+			// directory tree deepest-first (object stores no-op here).
+			if remover, ok := e.backend.(storage.DirectoryRemover); ok {
+				ordered := make([]string, 0, len(dirs))
+				for d := range dirs {
+					ordered = append(ordered, d)
+				}
+				sort.Slice(ordered, func(i, j int) bool { return len(ordered[i]) > len(ordered[j]) })
+				for _, d := range ordered {
+					_ = remover.RemoveDirectory(ctx, d)
+				}
+			}
+		}
+	}
+	return firstErr
 }

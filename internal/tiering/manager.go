@@ -23,6 +23,25 @@ type Manager struct {
 	hotBackend  storage.Backend
 	coldBackend storage.Backend
 
+	// onMigrationComplete, when set, runs after a migration cycle that moved
+	// or deleted at least one tier file. The query layer uses it to invalidate
+	// pruner and SQL transform caches, whose cached partition paths go stale
+	// the moment a file changes tier (a cached hot hour glob that no longer
+	// matches any file makes DuckDB error on the next query within the cache
+	// TTL). Guarded by callbackMu: it is wired from main after the scheduler
+	// goroutine already runs.
+	callbackMu          sync.Mutex
+	onMigrationComplete func()
+
+	// onHotFilesRemoved, when set, runs with the storage paths of hot files
+	// the tiering subsystem is about to permanently remove (migration source
+	// deletes, orphan reconciliation). The edge-sync hub wires it to receipt
+	// marking (#687): a spoke-synced file's receipt must be marked before its
+	// hot copy disappears, or confirmPresent forgets the receipt and the
+	// spoke re-uploads a duplicate. An error return means the caller MUST NOT
+	// delete the files. Guarded by callbackMu.
+	onHotFilesRemoved func(paths []string) error
+
 	// Data stores
 	metadata *MetadataStore
 	policies *PolicyStore
@@ -239,7 +258,63 @@ func (m *Manager) RunMigrationCycle(ctx context.Context) error {
 		Dur("duration", duration).
 		Msg("Migration cycle completed")
 
+	m.notifyMigrationComplete(totalMigrated, orphansDeleted)
+
 	return nil
+}
+
+// notifyMigrationComplete fires the registered callback when a cycle changed
+// which files live on which tier. Orphan deletions count: crash-recovery
+// reconciliation can delete hot files in a cycle that migrated nothing, and a
+// cached pruned hot glob matching zero files makes DuckDB error until TTL.
+func (m *Manager) notifyMigrationComplete(migrated, orphansDeleted int) {
+	if migrated <= 0 && orphansDeleted <= 0 {
+		return
+	}
+	m.callbackMu.Lock()
+	fn := m.onMigrationComplete
+	m.callbackMu.Unlock()
+	if fn != nil {
+		fn()
+	}
+}
+
+// SetOnHotFilesRemoved registers a callback invoked BEFORE tiering deletes
+// hot files (see the field comment). Safe to call after Start.
+func (m *Manager) SetOnHotFilesRemoved(fn func(paths []string) error) {
+	m.callbackMu.Lock()
+	m.onHotFilesRemoved = fn
+	m.callbackMu.Unlock()
+}
+
+// notifyHotFilesRemoved invokes the removal callback; a nil callback allows
+// the removal (non-hub deployments have no receipts to protect).
+func (m *Manager) notifyHotFilesRemoved(paths []string) error {
+	m.callbackMu.Lock()
+	fn := m.onHotFilesRemoved
+	m.callbackMu.Unlock()
+	if fn == nil {
+		return nil
+	}
+	return fn(paths)
+}
+
+// hasHotFileRemovalHook reports whether a removal callback is wired; the
+// migrator only admits spoke-namespace candidates when it is (#687).
+func (m *Manager) hasHotFileRemovalHook() bool {
+	m.callbackMu.Lock()
+	defer m.callbackMu.Unlock()
+	return m.onHotFilesRemoved != nil
+}
+
+// SetOnMigrationComplete registers a callback invoked after any migration
+// cycle that moved or deleted tier files. See the field comment for why the
+// query caches need it. Safe to call after Start: the scheduler goroutine
+// reads the callback under the same lock.
+func (m *Manager) SetOnMigrationComplete(fn func()) {
+	m.callbackMu.Lock()
+	m.onMigrationComplete = fn
+	m.callbackMu.Unlock()
 }
 
 // cleanupOldMigrations deletes migration history records older than the configured retention.
@@ -397,6 +472,19 @@ func (m *Manager) ScanAndRegisterFiles(ctx context.Context) (*ScanResult, error)
 		return nil, fmt.Errorf("failed to list objects: %w", err)
 	}
 
+	// One query for the cold path set instead of a point lookup per scanned
+	// file: the scan walks every hot file, while the cold set holds only
+	// migrated daily files. Fail the scan on error rather than risk the
+	// downgrade the check exists to prevent.
+	coldFiles, err := m.metadata.GetFilesInTier(ctx, TierCold)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load cold tier paths: %w", err)
+	}
+	coldPaths := make(map[string]bool, len(coldFiles))
+	for _, f := range coldFiles {
+		coldPaths[f.Path] = true
+	}
+
 	for _, obj := range objects {
 		// Only process parquet files
 		if !strings.HasSuffix(obj.Path, ".parquet") {
@@ -414,6 +502,17 @@ func (m *Manager) ScanAndRegisterFiles(ctx context.Context) (*ScanResult, error)
 				Err(err).
 				Msg("Failed to parse file path, skipping")
 			result.Errors++
+			continue
+		}
+
+		// Never downgrade a cold row back to hot (#683): the scan lists the
+		// HOT backend, and a hot file whose row already says cold is exactly
+		// the orphan that ReconcileOrphanedFiles deletes after a failed
+		// post-migration cleanup. Re-registering it as hot would reset
+		// migrated_at, hide it from reconciliation, and re-upload it to cold
+		// every cycle.
+		if coldPaths[obj.Path] {
+			result.FilesSkipped++
 			continue
 		}
 
@@ -464,58 +563,97 @@ type filePathInfo struct {
 	Database      string
 	Measurement   string
 	PartitionTime time.Time
+	// SpokeNamespaced marks a path with an extra edge-sync namespace level
+	// ({spoke}/{db}/{meas}/...). Such files register for visibility but are
+	// gated out of cold migration until receipt-aware handling exists (#687).
+	SpokeNamespaced bool
 }
 
-// parseFilePath parses a storage path to extract database, measurement, and partition time
-// Expected format: {database}/{measurement}/{year}/{month}/{day}/{hour}/{filename}.parquet
+// parseFilePath parses a storage path to extract database, measurement, and
+// partition time. Accepted shapes (hour- and day-level, plain and
+// spoke-namespaced): {db}/{meas}/Y/M/D[/H]/{file}.parquet and
+// {spoke}/{db}/{meas}/Y/M/D[/H]/{file}.parquet.
 func (m *Manager) parseFilePath(path string) (*filePathInfo, error) {
 	// Normalize path separators
 	path = filepath.ToSlash(path)
 	parts := strings.Split(path, "/")
 
-	// Need at least: database/measurement/year/month/day/hour/filename.parquet
-	if len(parts) < 7 {
-		return nil, fmt.Errorf("path too short: %s", path)
+	// Parse by TAIL shape, not absolute segment counts (#619 precedent:
+	// compaction's isHourLevelFile) — a spoke-namespace pseudo-database adds
+	// a path level, so hour-level files have 7 parts plain and 8 under a
+	// spoke, day-level 6 and 7. Validation thresholds mirror
+	// internal/compaction/daily.go isHourLevelFile; keep them in sync.
+	//   hour-level tail: {year}/{month}/{day}/{hour}/{file}.parquet
+	//   day-level tail:  {year}/{month}/{day}/{file}.parquet
+	validDate := func(y, mo, d string) (time.Time, bool) {
+		yn, err := strconv.Atoi(y)
+		if err != nil || len(y) != 4 || yn < 1970 {
+			return time.Time{}, false
+		}
+		mn, err := strconv.Atoi(mo)
+		if err != nil || mn < 1 || mn > 12 {
+			return time.Time{}, false
+		}
+		dn, err := strconv.Atoi(d)
+		if err != nil || dn < 1 || dn > 31 {
+			return time.Time{}, false
+		}
+		return time.Date(yn, time.Month(mn), dn, 0, 0, 0, 0, time.UTC), true
 	}
 
-	database := parts[0]
-	measurement := parts[1]
+	var partitionTime time.Time
+	var prefix []string
+	n := len(parts)
+	if n >= 7 {
+		if day, ok := validDate(parts[n-5], parts[n-4], parts[n-3]); ok {
+			if hn, err := strconv.Atoi(parts[n-2]); err == nil && hn >= 0 && hn <= 23 {
+				partitionTime = day.Add(time.Duration(hn) * time.Hour)
+				prefix = parts[:n-5]
+			}
+		}
+	}
+	if prefix == nil && n >= 6 {
+		if day, ok := validDate(parts[n-4], parts[n-3], parts[n-2]); ok {
+			// Day-level files carry no hour segment; their partition time is
+			// the start of the day, matching hourly rows' hour-start convention.
+			partitionTime = day
+			prefix = parts[:n-4]
+		}
+	}
+	if prefix == nil {
+		return nil, fmt.Errorf("no year/month/day[/hour] partition tail in path: %s", path)
+	}
+
+	// The prefix is {database}/{measurement} (2 parts) or a spoke namespace
+	// {spoke}/{db}/{measurement} (3 parts). For spoke files, register
+	// (database=spoke, measurement=spoke-db): that is the split the QUERY
+	// layer produces for spoke data (FROM "rocket-01".telemetry globs
+	// rocket-01/telemetry/**), so tier metadata stays query-visible. Deeper
+	// nesting is not a feature (edge-sync forbids relaying); reject it.
+	var database, measurement string
+	spokeNamespaced := false
+	switch len(prefix) {
+	case 2:
+		database, measurement = prefix[0], prefix[1]
+	case 3:
+		database, measurement = prefix[0], prefix[1]
+		spokeNamespaced = true
+	default:
+		return nil, fmt.Errorf("unsupported path depth (%d prefix segments): %s", len(prefix), path)
+	}
 
 	// Validate no path traversal in database or measurement names
-	if strings.Contains(database, "..") || strings.ContainsAny(database, "/\\") {
+	if strings.Contains(database, "..") || strings.ContainsAny(database, "\\") {
 		return nil, fmt.Errorf("invalid database name in path: %s", database)
 	}
-	if strings.Contains(measurement, "..") || strings.ContainsAny(measurement, "/\\") {
+	if strings.Contains(measurement, "..") || strings.ContainsAny(measurement, "\\") {
 		return nil, fmt.Errorf("invalid measurement name in path: %s", measurement)
 	}
 
-	// Parse year, month, day, hour
-	year, err := strconv.Atoi(parts[2])
-	if err != nil {
-		return nil, fmt.Errorf("invalid year in path: %s", parts[2])
-	}
-
-	month, err := strconv.Atoi(parts[3])
-	if err != nil {
-		return nil, fmt.Errorf("invalid month in path: %s", parts[3])
-	}
-
-	day, err := strconv.Atoi(parts[4])
-	if err != nil {
-		return nil, fmt.Errorf("invalid day in path: %s", parts[4])
-	}
-
-	hour, err := strconv.Atoi(parts[5])
-	if err != nil {
-		return nil, fmt.Errorf("invalid hour in path: %s", parts[5])
-	}
-
-	// Construct partition time (UTC)
-	partitionTime := time.Date(year, time.Month(month), day, hour, 0, 0, 0, time.UTC)
-
 	return &filePathInfo{
-		Database:      database,
-		Measurement:   measurement,
-		PartitionTime: partitionTime,
+		Database:        database,
+		Measurement:     measurement,
+		PartitionTime:   partitionTime,
+		SpokeNamespaced: spokeNamespaced,
 	}, nil
 }

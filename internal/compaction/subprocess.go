@@ -132,6 +132,15 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 	}
 	defer db.Close()
 
+	// Pin the session time zone to UTC (#682), mirroring the query engine's
+	// pin: the dedup path TRY_CASTs naive time strings to TIMESTAMPTZ, and
+	// under a host-zone session a non-UTC host would permanently rewrite
+	// those instants shifted by the UTC offset during compaction. Hard-fail:
+	// compacting with a wrong zone corrupts data, not just query results.
+	if _, err := db.Exec("SET TimeZone='UTC'"); err != nil {
+		return nil, fmt.Errorf("failed to pin compaction DuckDB TimeZone to UTC: %w", err)
+	}
+
 	// Set DuckDB memory limit from config. Exceeding it makes DuckDB spill to
 	// its temp_directory (configured below) instead of OOMing the process.
 	if config.MemoryLimit != "" {

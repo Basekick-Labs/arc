@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"os"
@@ -316,6 +317,11 @@ func TestRestore_SeparateIcebergCatalogIsRestored(t *testing.T) {
 	if err := m.restoreSQLite(ctx, res.Manifest.BackupID); err != nil {
 		t.Fatalf("restoreSQLite: %v", err)
 	}
+	// Restores are STAGED (#635); the boot apply performs the swap.
+	if _, err := os.Stat(StagePath(catalogDB)); err != nil {
+		t.Fatalf("catalog restore not staged: %v", err)
+	}
+	ApplyPendingRestores(logger, sharedDB, catalogDB)
 
 	db, err := sql.Open("sqlite3", catalogDB)
 	if err != nil {
@@ -325,5 +331,110 @@ func TestRestore_SeparateIcebergCatalogIsRestored(t *testing.T) {
 	var name string
 	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='marker'`).Scan(&name); err != nil {
 		t.Fatalf("restored catalog is missing its contents: %v", err)
+	}
+}
+
+// Restore semantics (#635, apply-at-boot): the API path STAGES and must not
+// touch the live database, its sidecars, or create safety copies; the boot
+// apply does the swap. Replaces the #678-era live-swap tests.
+func TestRestoreSQLiteFile_StagesWithoutTouchingLive(t *testing.T) {
+	ctx := context.Background()
+	logger := zerolog.Nop()
+
+	liveDir := t.TempDir()
+	dbPath := filepath.Join(liveDir, "arc.db")
+	live, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.Close()
+	if _, err := live.Exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t (v INTEGER); INSERT INTO t (v) VALUES (1), (2)"); err != nil {
+		t.Fatal(err)
+	}
+	preBytes, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	backupDir := t.TempDir()
+	m := &Manager{
+		dataStorage:   mustLocalBackend(t, t.TempDir(), logger),
+		backupStorage: mustLocalBackend(t, backupDir, logger),
+		logger:        logger,
+	}
+	older, err := sql.Open("sqlite3", filepath.Join(backupDir, "older.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := older.Exec("CREATE TABLE t (v INTEGER); INSERT INTO t (v) VALUES (7)"); err != nil {
+		t.Fatal(err)
+	}
+	older.Close()
+	olderData, err := os.ReadFile(filepath.Join(backupDir, "older.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.backupStorage.Write(ctx, "backup-1/metadata/arc.db", olderData); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.restoreSQLiteFile(ctx, "backup-1", "arc.db", dbPath); err != nil {
+		t.Fatalf("restoreSQLiteFile: %v", err)
+	}
+
+	// Live database and sidecars untouched, byte for byte.
+	postBytes, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(preBytes, postBytes) {
+		t.Fatal("staging modified the live database file")
+	}
+	if _, err := os.Stat(dbPath + "-wal"); err != nil {
+		t.Fatal("staging removed the live WAL sidecar")
+	}
+	if _, err := os.Stat(dbPath + ".before-restore"); !os.IsNotExist(err) {
+		t.Fatal("staging created a safety copy; that belongs to boot apply")
+	}
+
+	// The staged file holds exactly the backup bytes.
+	staged, err := os.ReadFile(StagePath(dbPath))
+	if err != nil {
+		t.Fatalf("staged restore missing: %v", err)
+	}
+	if !bytes.Equal(staged, olderData) {
+		t.Fatal("staged restore does not match the backup contents")
+	}
+
+	// Boot apply: live becomes the backup, safety copy holds the live
+	// database's WAL-resident commits, no sidecars remain anywhere.
+	live.Close()
+	ApplyPendingRestores(logger, dbPath)
+
+	// Filesystem assertions FIRST: opening the WAL-mode safety copy below
+	// recreates its sidecars, so any handle open before these checks would
+	// fabricate the very files the apply must have removed.
+	for _, sidecar := range []string{dbPath + "-wal", dbPath + "-shm", dbPath + ".before-restore-wal", dbPath + ".before-restore-shm", StagePath(dbPath)} {
+		if _, err := os.Stat(sidecar); !os.IsNotExist(err) {
+			t.Errorf("%s still present after boot apply", sidecar)
+		}
+	}
+
+	restored, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	var got int
+	if err := restored.QueryRow("SELECT count(*) FROM t").Scan(&got); err != nil || got != 1 {
+		t.Fatalf("applied database rows = (%d, %v), want the backup's 1", got, err)
+	}
+	safety, err := sql.Open("sqlite3", dbPath+".before-restore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer safety.Close()
+	if err := safety.QueryRow("SELECT count(*) FROM t").Scan(&got); err != nil || got != 2 {
+		t.Fatalf("safety copy rows = (%d, %v), want the live database's 2 (WAL folded in)", got, err)
 	}
 }
