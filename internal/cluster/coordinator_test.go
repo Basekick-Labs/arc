@@ -268,14 +268,94 @@ func TestCanRunFileReconciliation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			localNode := NewNode("test-node", "test-node", tt.role, "test-cluster")
+			localNode.UpdateState(tt.state)
+			registry := NewRegistry(&RegistryConfig{LocalNode: localNode})
 			c := &Coordinator{
-				localNode: NewNode("test-node", "test-node", tt.role, "test-cluster"),
+				localNode: localNode,
+				registry:  registry,
 				running:   tt.running,
 				logger:    zerolog.Nop(),
 			}
-			c.localNode.UpdateState(tt.state)
 			if got := c.canRunFileReconciliation(); got != tt.want {
 				t.Errorf("canRunFileReconciliation() = %v, want %v (role=%s state=%s running=%v)", got, tt.want, tt.role, tt.state, tt.running)
+			}
+		})
+	}
+}
+
+func TestCanRunFileReconciliationRejectsUnregisteredLocalNode(t *testing.T) {
+	localNode := NewNode("test-node", "test-node", RoleReader, "test-cluster")
+	localNode.UpdateState(StateHealthy)
+	registry := NewRegistry(&RegistryConfig{LocalNode: localNode})
+	c := &Coordinator{
+		localNode: localNode,
+		registry:  registry,
+		running:   true,
+		logger:    zerolog.Nop(),
+	}
+
+	registry.Unregister(localNode.ID)
+	if got := c.canRunFileReconciliation(); got {
+		t.Error("canRunFileReconciliation() = true after local node was unregistered, want false")
+	}
+}
+
+func TestCanRunFileReconciliationUsesCurrentRegistryNode(t *testing.T) {
+	tests := []struct {
+		name         string
+		staleRole    NodeRole
+		staleState   NodeState
+		currentRole  NodeRole
+		currentState NodeState
+		wantEligible bool
+	}{
+		{
+			name:         "current state overrides stale healthy state",
+			staleRole:    RoleReader,
+			staleState:   StateHealthy,
+			currentRole:  RoleReader,
+			currentState: StateJoining,
+			wantEligible: false,
+		},
+		{
+			name:         "current role overrides stale clustered role",
+			staleRole:    RoleReader,
+			staleState:   StateHealthy,
+			currentRole:  RoleStandalone,
+			currentState: StateHealthy,
+			wantEligible: false,
+		},
+		{
+			name:         "current healthy role overrides stale unhealthy state",
+			staleRole:    RoleReader,
+			staleState:   StateUnhealthy,
+			currentRole:  RoleCompactor,
+			currentState: StateHealthy,
+			wantEligible: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			staleNode := NewNode("test-node", "test-node", tt.staleRole, "test-cluster")
+			staleNode.UpdateState(tt.staleState)
+			registry := NewRegistry(&RegistryConfig{LocalNode: staleNode})
+
+			currentNode := NewNode("test-node", "test-node", tt.currentRole, "test-cluster")
+			currentNode.UpdateState(tt.currentState)
+			if err := registry.Register(currentNode); err != nil {
+				t.Fatalf("registry.Register: %v", err)
+			}
+
+			c := &Coordinator{
+				localNode: staleNode,
+				registry:  registry,
+				running:   true,
+				logger:    zerolog.Nop(),
+			}
+			if got := c.canRunFileReconciliation(); got != tt.wantEligible {
+				t.Errorf("canRunFileReconciliation() = %v, want %v (stale role/state=%s/%s current=%s/%s)", got, tt.wantEligible, tt.staleRole, tt.staleState, tt.currentRole, tt.currentState)
 			}
 		})
 	}

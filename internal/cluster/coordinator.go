@@ -1737,8 +1737,8 @@ func (c *Coordinator) IsRunning() bool {
 
 // canRunFileReconciliation reports whether this coordinator is currently
 // eligible to perform a periodic manifest recheck. File replication is a
-// per-node concern, so every clustered role may run it; only lifecycle and
-// health state gate the work.
+// per-node concern, so every clustered role may run it; current membership,
+// lifecycle, and health state gate the work.
 func (c *Coordinator) canRunFileReconciliation() bool {
 	// Stop holds c.mu while it waits for the puller scheduler to exit. Do not
 	// block on that lock from the scheduler's gate check, or shutdown can
@@ -1747,13 +1747,24 @@ func (c *Coordinator) canRunFileReconciliation() bool {
 		return false
 	}
 	running := c.running
+	registry := c.registry
 	localNode := c.localNode
+	localNodeID := ""
+	if localNode != nil {
+		localNodeID = localNode.ID
+	}
 	c.mu.RUnlock()
-	if !running || localNode == nil {
+	if !running || registry == nil || localNodeID == "" {
 		return false
 	}
 
-	node := localNode.Clone()
+	// c.localNode is an identity/lifecycle pointer and can outlive registry
+	// membership. Registry.Get is the canonical current-membership snapshot;
+	// it returns false after a Raft leave/removal callback unregisters the ID.
+	node, exists := registry.Get(localNodeID)
+	if !exists {
+		return false
+	}
 	if node.State != StateHealthy {
 		return false
 	}
