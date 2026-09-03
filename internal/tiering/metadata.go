@@ -16,6 +16,7 @@ type tierCacheEntry struct {
 	expiresAt time.Time
 }
 
+// pruneExpiredTierCache removes expired entries. The caller must hold tierCacheMu.
 func (s *MetadataStore) pruneExpiredTierCache(now time.Time) {
 	for key, entry := range s.tierCache {
 		if !now.Before(entry.expiresAt) {

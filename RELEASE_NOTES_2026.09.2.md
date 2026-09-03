@@ -55,6 +55,14 @@ literals (e.g. a log-search `LIKE '%INTERVAL 5 MINUTE%'`) and identifiers such a
 
 ## Bug fixes
 
+### Expired tier-cache entries are pruned on store
+
+Each tier-cache insertion removes expired entries while holding the cache lock,
+preventing entries for old partitions from accumulating indefinitely. Expiry
+uses the same boundary as the read path and requires no background goroutine.
+
+Contributed by [@mah1104ahm](https://github.com/mah1104ahm) in [#675](https://github.com/Basekick-Labs/arc/pull/675).
+
 ### S3 query paths now follow calendar days across DST ([#321](https://github.com/Basekick-Labs/arc/issues/321))
 
 S3 time-range path generation now builds one inclusive partition path per UTC
