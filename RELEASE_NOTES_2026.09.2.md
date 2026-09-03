@@ -65,6 +65,23 @@ The ingest, API, query, and Iceberg test suites were verified against 0.24.0.
 
 ## Bug fixes
 
+### Wide-row ingest requests no longer silently bypass the WAL ([#677](https://github.com/Basekick-Labs/arc/issues/677))
+
+A single ingest request larger than the WAL's 100MB per-entry payload cap
+(wide rows make this easy to hit well under the 1GB request limit) was
+rejected wholesale by the WAL, so ingest kept reporting healthy while the
+WAL directory held only a 7-byte header file: writes were durable in
+Parquet flushes alone and nothing on the metrics endpoint said so. The WAL
+now splits an oversized payload into multiple entries at msgpack element
+boundaries (row-format requests between records, columnar requests by row
+range), each under the cap and independently replayable with no format
+change. A payload that still cannot be split, a single record or row above
+the cap, keeps the loud rejection, now also counted in the new
+`arc_wal_oversized_payloads_total` metric so a WAL that records nothing
+never looks healthy again.
+
+Contributed by [@atirna](https://github.com/atirna) in [#696](https://github.com/Basekick-Labs/arc/pull/696).
+
 ### Expired tier-cache entries are pruned on store
 
 Each tier-cache insertion removes expired entries while holding the cache lock,
