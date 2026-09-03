@@ -91,6 +91,13 @@ type ReaderConnection struct {
 	cumulativeHash         hash.Hash
 	entriesSinceCheckpoint int
 
+	// binaryEntries is set (via EnableBinaryEntries, before
+	// ActivateReader publishes the connection) when the reader's
+	// handshake advertised MsgReplicateEntryBin support (#698).
+	// Never mutated after activation, so sendToReader reads it
+	// without synchronization beyond writeMu.
+	binaryEntries bool
+
 	// Stats
 	entriesSent  atomic.Int64
 	bytesSent    atomic.Int64
@@ -256,6 +263,13 @@ func (s *Sender) PrepareReader(conn net.Conn, readerID, handshakeNonce string, l
 	reader.lastAck.Store(lastKnownSeq)
 	reader.lastSendTime.Store(time.Now().UnixNano())
 	return reader, nil
+}
+
+// EnableBinaryEntries marks a prepared reader as speaking the binary
+// entry framing (#698). Must be called between PrepareReader and
+// ActivateReader — the flag is read lock-free once the reader is live.
+func (r *ReaderConnection) EnableBinaryEntries() {
+	r.binaryEntries = true
 }
 
 // ActivateReader publishes a prepared reader to the sender's active
@@ -458,8 +472,14 @@ func (s *Sender) sendToReader(reader *ReaderConnection, entry *ReplicateEntry, p
 		return err
 	}
 
-	// Write entry
-	if err := WriteEntry(reader.conn, &entryCopy); err != nil {
+	// Write entry. Binary framing when the reader negotiated it (#698):
+	// raw payload bytes instead of JSON + base64, so entries above ~75MB
+	// stay sendable. JSON framing is the mixed-version fallback.
+	writeEntry := WriteEntry
+	if reader.binaryEntries {
+		writeEntry = WriteEntryBinary
+	}
+	if err := writeEntry(reader.conn, &entryCopy); err != nil {
 		return err
 	}
 

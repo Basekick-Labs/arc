@@ -34,6 +34,22 @@ const (
 	// checkpoint. See GHSA-wfgr-8x84-22q7.
 	MsgReplicateCheckpoint byte = 0x14
 
+	// MsgReplicateEntryBin is a WAL entry in binary framing (#698).
+	// Same logical content as MsgReplicateEntry, but the payload rides
+	// the wire as raw bytes instead of JSON + base64, so a WAL entry
+	// near MaxWALPayloadSize still fits a frame (base64 inflates 4/3,
+	// which made every JSON-framed entry above ~75MB unsendable while
+	// the WAL happily stored it — a deterministic replication stall).
+	// Sent only to readers that advertised support in their handshake
+	// (protocol.ReplicateSync.SupportsBinaryEntries), so mixed-version
+	// pairs keep speaking JSON.
+	//
+	// Frame layout after the [4-byte length][1-byte type] header:
+	//   [8-byte sequence BE][8-byte timestampUS BE]
+	//   [1-byte tag length][tag bytes (hex string, as in JSON framing)]
+	//   [payload bytes to end of frame]
+	MsgReplicateEntryBin byte = 0x15
+
 	// MsgReplicateError indicates a replication error
 	MsgReplicateError byte = 0x1F
 )
@@ -126,6 +142,11 @@ type ReplicateSync struct {
 	// MsgReplicateSync. Used to derive the HKDF session key. Not
 	// serialized — internal hand-off only.
 	HandshakeNonce string `json:"-"`
+
+	// SupportsBinaryEntries carries the reader's MsgReplicateEntryBin
+	// capability from the protocol-level handshake (#698). Internal
+	// hand-off only, like HandshakeNonce.
+	SupportsBinaryEntries bool `json:"-"`
 }
 
 // ReplicateSyncAck responds with the writer's current position.
@@ -171,6 +192,19 @@ const (
 
 	// MaxMessageSize is the maximum allowed message size (100MB)
 	MaxMessageSize = 100 * 1024 * 1024
+
+	// binaryEntryHeaderSize is the fixed prefix of a MsgReplicateEntryBin
+	// frame body: sequence (8) + timestamp (8) + tag length (1).
+	binaryEntryHeaderSize = 8 + 8 + 1
+
+	// MaxEntryFrameSize bounds a MsgReplicateEntryBin frame. A WAL payload
+	// can legally reach MaxWALPayloadSize == MaxMessageSize exactly, and the
+	// binary frame adds the type byte plus binaryEntryHeaderSize plus the
+	// tag — so the frame cap gets 1KB of headroom over the message cap.
+	// JSON-framed messages keep the plain MaxMessageSize bound at write
+	// time; ReadMessage accepts up to this larger bound for every type,
+	// which admits at most 1KB extra on the legacy frames.
+	MaxEntryFrameSize = MaxMessageSize + 1024
 )
 
 // WriteMessage writes a typed message to the writer.
@@ -218,9 +252,11 @@ func ReadMessage(r io.Reader) (byte, []byte, error) {
 	}
 	length := binary.BigEndian.Uint32(lenBuf)
 
-	// Validate length
-	if length > MaxMessageSize {
-		return 0, nil, fmt.Errorf("message too large: %d > %d", length, MaxMessageSize)
+	// Validate length. MaxEntryFrameSize (not MaxMessageSize) so a
+	// binary entry frame carrying a payload at the WAL cap still fits;
+	// see the constant's doc for why the two bounds differ.
+	if length > MaxEntryFrameSize {
+		return 0, nil, fmt.Errorf("message too large: %d > %d", length, MaxEntryFrameSize)
 	}
 	if length < 1 {
 		return 0, nil, fmt.Errorf("message too small: %d", length)
@@ -248,6 +284,62 @@ func ReadMessage(r io.Reader) (byte, []byte, error) {
 // WriteEntry writes a ReplicateEntry to the writer.
 func WriteEntry(w io.Writer, entry *ReplicateEntry) error {
 	return WriteMessage(w, MsgReplicateEntry, entry)
+}
+
+// WriteEntryBinary writes a ReplicateEntry as a MsgReplicateEntryBin
+// frame: the payload goes on the wire as raw bytes instead of JSON +
+// base64, so an entry near the WAL payload cap remains sendable (#698).
+// Callers must only use this for readers that advertised
+// SupportsBinaryEntries in their handshake.
+func WriteEntryBinary(w io.Writer, entry *ReplicateEntry) error {
+	if len(entry.Tag) > 255 {
+		return fmt.Errorf("entry tag too long: %d > 255", len(entry.Tag))
+	}
+	totalSize := 1 + binaryEntryHeaderSize + len(entry.Tag) + len(entry.Payload)
+	if totalSize > MaxEntryFrameSize {
+		return fmt.Errorf("message too large: %d > %d", totalSize, MaxEntryFrameSize)
+	}
+
+	// Build the frame header (length + type + fixed fields + tag) in one
+	// buffer, then write the payload from its own slice — no copy of the
+	// payload bytes.
+	header := make([]byte, 4+1+binaryEntryHeaderSize+len(entry.Tag))
+	binary.BigEndian.PutUint32(header[0:4], uint32(totalSize))
+	header[4] = MsgReplicateEntryBin
+	binary.BigEndian.PutUint64(header[5:13], entry.Sequence)
+	binary.BigEndian.PutUint64(header[13:21], entry.TimestampUS)
+	header[21] = byte(len(entry.Tag))
+	copy(header[22:], entry.Tag)
+	if _, err := w.Write(header); err != nil {
+		return fmt.Errorf("write entry header: %w", err)
+	}
+	if len(entry.Payload) > 0 {
+		if _, err := w.Write(entry.Payload); err != nil {
+			return fmt.Errorf("write entry payload: %w", err)
+		}
+	}
+	return nil
+}
+
+// ParseEntryBinary parses a MsgReplicateEntryBin frame body (the bytes
+// after the length+type header) into a ReplicateEntry. Every length is
+// bounds-checked against the frame; the payload slice aliases the frame
+// buffer (ReadMessage allocates a fresh buffer per message, so the alias
+// never outlives its message).
+func ParseEntryBinary(body []byte) (*ReplicateEntry, error) {
+	if len(body) < binaryEntryHeaderSize {
+		return nil, fmt.Errorf("binary entry too short: %d < %d", len(body), binaryEntryHeaderSize)
+	}
+	tagLen := int(body[16])
+	if len(body) < binaryEntryHeaderSize+tagLen {
+		return nil, fmt.Errorf("binary entry tag truncated: need %d bytes, have %d", binaryEntryHeaderSize+tagLen, len(body))
+	}
+	return &ReplicateEntry{
+		Sequence:    binary.BigEndian.Uint64(body[0:8]),
+		TimestampUS: binary.BigEndian.Uint64(body[8:16]),
+		Tag:         string(body[17 : 17+tagLen]),
+		Payload:     body[binaryEntryHeaderSize+tagLen:],
+	}, nil
 }
 
 // WriteAck writes a ReplicateAck to the writer.

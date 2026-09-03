@@ -65,6 +65,20 @@ The ingest, API, query, and Iceberg test suites were verified against 0.24.0.
 
 ## Bug fixes
 
+### Replication can now carry WAL entries up to the full payload cap ([#698](https://github.com/Basekick-Labs/arc/issues/698))
+
+The replication wire format JSON-encoded every entry, and base64 inflates the
+payload by 4/3 — so a WAL entry above roughly 75MB could never be framed under
+the 100MB message cap even though the WAL stored it happily. The failed entry
+tore down the stream, and the resume hit the same entry again: a deterministic
+stall for that follower. Entries now travel in a binary frame
+(`MsgReplicateEntryBin`) that carries the payload as raw bytes, negotiated per
+connection: readers advertise support in the replication handshake, writers
+fall back to the JSON framing for readers that predate it, and the per-entry
+MAC tags and full-HMAC checkpoints are unchanged by the framing. Mixed-version
+pairs keep working exactly as before, including the old limitation, until both
+sides run this release.
+
 ### Wide-row ingest requests no longer silently bypass the WAL ([#677](https://github.com/Basekick-Labs/arc/issues/677))
 
 A single ingest request larger than the WAL's 100MB per-entry payload cap

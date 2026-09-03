@@ -1439,9 +1439,10 @@ func (c *Coordinator) handleReplicateSync(conn net.Conn, syncReq *protocol.Repli
 	// Carry the handshake nonce through so the sender can derive the
 	// same HKDF session key the receiver derived (GHSA-wfgr-8x84-22q7).
 	replSyncReq := &replication.ReplicateSync{
-		ReaderID:          syncReq.ReaderID,
-		LastKnownSequence: syncReq.LastKnownSequence,
-		HandshakeNonce:    syncReq.Nonce,
+		ReaderID:              syncReq.ReaderID,
+		LastKnownSequence:     syncReq.LastKnownSequence,
+		HandshakeNonce:        syncReq.Nonce,
+		SupportsBinaryEntries: syncReq.SupportsBinaryEntries,
 	}
 
 	if err := c.AcceptReplicationConnection(conn, replSyncReq); err != nil {
@@ -2827,6 +2828,13 @@ func (c *Coordinator) AcceptReplicationConnection(conn net.Conn, syncReq *replic
 	reader, err := sender.PrepareReader(conn, syncReq.ReaderID, syncReq.HandshakeNonce, syncReq.LastKnownSequence)
 	if err != nil {
 		return err
+	}
+	if syncReq.SupportsBinaryEntries {
+		// The reader understands MsgReplicateEntryBin (#698): stream
+		// entry payloads as raw bytes so entries above ~75MB clear the
+		// frame cap. Must happen before ActivateReader publishes the
+		// connection to the broadcast path.
+		reader.EnableBinaryEntries()
 	}
 
 	currentSeq, canResume := sender.CurrentSequenceAndCanResume(syncReq.LastKnownSequence)
