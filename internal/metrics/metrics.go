@@ -112,11 +112,12 @@ type Metrics struct {
 	auditWriteErrors atomic.Int64
 
 	// WAL metrics
-	walRecordsPreserved atomic.Int64 // Records preserved in WAL for recovery (flush failures)
-	walRecoveryTotal    atomic.Int64 // Successful WAL recovery operations
-	walRecoveryRecords  atomic.Int64 // Total records recovered from WAL
-	walDroppedEntries   atomic.Int64 // Entries dropped due to full WAL buffer
-	walFailedWrites     atomic.Int64 // Write failures to WAL file
+	walRecordsPreserved  atomic.Int64 // Records preserved in WAL for recovery (flush failures)
+	walRecoveryTotal     atomic.Int64 // Successful WAL recovery operations
+	walRecoveryRecords   atomic.Int64 // Total records recovered from WAL
+	walDroppedEntries    atomic.Int64 // Entries dropped due to full WAL buffer
+	walFailedWrites      atomic.Int64 // Write failures to WAL file
+	walOversizedPayloads atomic.Int64 // Payloads rejected for exceeding the single-entry cap even after chunking (#677)
 
 	// Decompression pool metrics
 	decompBufferDiscards atomic.Int64 // Oversized buffers not returned to pool
@@ -372,6 +373,7 @@ func (m *Metrics) IncWALRecoveryTotal()               { m.walRecoveryTotal.Add(1
 func (m *Metrics) IncWALRecoveryRecords(count int64)  { m.walRecoveryRecords.Add(count) }
 func (m *Metrics) IncWALDroppedEntries()              { m.walDroppedEntries.Add(1) }
 func (m *Metrics) IncWALFailedWrites()                { m.walFailedWrites.Add(1) }
+func (m *Metrics) IncWALOversizedPayloads()           { m.walOversizedPayloads.Add(1) }
 
 // Decompression Pool Metrics
 func (m *Metrics) IncDecompBufferDiscards() { m.decompBufferDiscards.Add(1) }
@@ -555,11 +557,12 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"mqtt_reconnects":        m.mqttReconnects.Load(),
 
 		// WAL
-		"wal_records_preserved": m.walRecordsPreserved.Load(),
-		"wal_recovery_total":    m.walRecoveryTotal.Load(),
-		"wal_recovery_records":  m.walRecoveryRecords.Load(),
-		"wal_dropped_entries":   m.walDroppedEntries.Load(),
-		"wal_failed_writes":     m.walFailedWrites.Load(),
+		"wal_records_preserved":  m.walRecordsPreserved.Load(),
+		"wal_recovery_total":     m.walRecoveryTotal.Load(),
+		"wal_recovery_records":   m.walRecoveryRecords.Load(),
+		"wal_dropped_entries":    m.walDroppedEntries.Load(),
+		"wal_failed_writes":      m.walFailedWrites.Load(),
+		"wal_oversized_payloads": m.walOversizedPayloads.Load(),
 
 		// Decompression Pool
 		"decomp_buffer_discards": m.decompBufferDiscards.Load(),
@@ -882,6 +885,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_failed_writes_total WAL write failures\n"...)
 	b = append(b, "# TYPE arc_wal_failed_writes_total counter\n"...)
 	b = appendMetric(b, "arc_wal_failed_writes_total", float64(m.walFailedWrites.Load()))
+
+	b = append(b, "# HELP arc_wal_oversized_payloads_total Payloads rejected for exceeding the single-entry cap even after chunking\n"...)
+	b = append(b, "# TYPE arc_wal_oversized_payloads_total counter\n"...)
+	b = appendMetric(b, "arc_wal_oversized_payloads_total", float64(m.walOversizedPayloads.Load()))
 
 	// Decompression pool metrics
 	b = append(b, "# HELP arc_decomp_buffer_discards_total Oversized decompression buffers not returned to pool\n"...)
