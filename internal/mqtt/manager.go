@@ -2,6 +2,7 @@ package mqtt
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -367,14 +368,11 @@ func (m *SubscriptionManager) StopSubscription(ctx context.Context, id string) e
 	delete(m.subscribers, id)
 	m.mu.Unlock()
 
-	if err := subscriber.Stop(); err != nil {
-		return err
-	}
-
-	m.repo.UpdateStatus(ctx, id, StatusStopped, "")
+	stopErr := subscriber.Stop()
+	statusErr := m.repo.UpdateStatus(ctx, id, StatusStopped, "")
 	m.logger.Info().Str("id", id).Msg("Stopped MQTT subscription")
 
-	return nil
+	return errors.Join(stopErr, statusErr)
 }
 
 // PauseSubscription pauses a subscription (stops without clearing error state)
@@ -388,14 +386,11 @@ func (m *SubscriptionManager) PauseSubscription(ctx context.Context, id string) 
 	delete(m.subscribers, id)
 	m.mu.Unlock()
 
-	if err := subscriber.Stop(); err != nil {
-		return err
-	}
-
-	m.repo.UpdateStatus(ctx, id, StatusPaused, "")
+	stopErr := subscriber.Stop()
+	statusErr := m.repo.UpdateStatus(ctx, id, StatusPaused, "")
 	m.logger.Info().Str("id", id).Msg("Paused MQTT subscription")
 
-	return nil
+	return errors.Join(stopErr, statusErr)
 }
 
 // RestartSubscription stops and starts a subscription
