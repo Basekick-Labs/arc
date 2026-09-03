@@ -619,6 +619,10 @@ Before 26.06.1, every Arc Enterprise cluster node carried its **own** SQLite aut
 
 **No migration of pre-existing tokens.** Tokens created on a pre-26.06.1 node by the local-only API path remain valid **only on that node** after upgrade. Operators are expected to re-issue API tokens through the new replicated path so they take effect cluster-wide. Bootstrap tokens set via `ARC_AUTH_BOOTSTRAP_TOKEN` are unaffected if the same value was used on every node (which the previous workaround required).
 
+For the durable operator procedure, see [Upgrading pre-26.06.1 API tokens](operations/pre-26.06.1-token-upgrade.md).
+Legacy tokens require offline cleanup on each node; the replicated revoke API
+must only be used for tokens created through the replicated path after upgrade.
+
 **Divergence detection on upgrade.** Pre-26.06.1 tokens were stamped with `AUTOINCREMENT` IDs (1, 2, 3…). Cluster-replicated tokens land at `ID = Raft log index`, which can be 5+ for a freshly-bootstrapped cluster. An operator with many pre-existing tokens may have a pre-existing AUTOINCREMENT row whose ID happens to match the new cluster row's ID — silent `INSERT OR IGNORE` would mask the new row on that node while applying on every other node, leaving `VerifyToken` results divergent across the cluster. 26.06.1 detects this at materialise time: if a row at the same ID exists with a DIFFERENT token hash or name, `ApplyCreateToken` returns an error rather than overwriting silently, the `arc_cluster_auth_rejected_total` counter increments, and the cluster Apply path logs the divergence at `Error` level. Operator action: drop the diverging local `auth.db` rows (or the whole local auth DB and let the FSM repopulate) before re-joining. Identical hash + name is treated as idempotent log replay (no-op, no error), so a restart of a healthy cluster does not surface this.
 
 **Operator-facing changes.**

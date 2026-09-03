@@ -81,7 +81,8 @@ func ParseEnvelope(payload []byte, defaultDB string) (database string, msgpackDa
 // A payload whose top-level shape cannot be split without inventing a new
 // record format (including a map without "columns", or a single element
 // larger than the cap) is returned as the sole chunk for the caller to
-// reject.
+// reject. A crash between chunk writes replays the completed prefix, which is
+// safe because rows are independent.
 func splitOversizedPayload(payload []byte) ([][]byte, error) {
 	dec := msgpack.NewDecoder(bytes.NewReader(payload))
 	code, err := dec.PeekCode()
@@ -167,27 +168,19 @@ func splitOversizedPayload(payload []byte) ([][]byte, error) {
 			return [][]byte{payload}, nil
 		}
 
-		var columnsMap map[string]msgpack.RawMessage
-		if err := msgpack.Unmarshal(vals[colIdx], &columnsMap); err != nil {
-			return nil, fmt.Errorf("failed to read columns map: %w", err)
+		columns, err := decodeColumnarColumns(vals[colIdx])
+		if err != nil {
+			return nil, err
 		}
-		if len(columnsMap) == 0 {
+		if len(columns) == 0 {
 			return [][]byte{payload}, nil
 		}
 
-		decoded := make(map[string][]interface{}, len(columnsMap))
-		for name, v := range columnsMap {
-			var arr []interface{}
-			if err := msgpack.Unmarshal(v, &arr); err != nil {
-				return nil, fmt.Errorf("failed to decode column %q: %w", name, err)
+		rows := len(columns[0].values)
+		for _, column := range columns[1:] {
+			if len(column.values) != rows {
+				return nil, fmt.Errorf("column %q has %d values, want %d", column.name, len(column.values), rows)
 			}
-			decoded[name] = arr
-		}
-
-		rows := 0
-		for _, arr := range decoded {
-			rows = len(arr)
-			break
 		}
 		if rows == 0 {
 			return [][]byte{payload}, nil
@@ -212,7 +205,7 @@ func splitOversizedPayload(payload []byte) ([][]byte, error) {
 			if hi > rows {
 				hi = rows
 			}
-			out, err := encodeColumnarRange(keys, vals, colIdx, decoded, lo, hi)
+			out, err := encodeColumnarRange(keys, vals, colIdx, columns, lo, hi)
 			if err != nil {
 				return nil, err
 			}
@@ -224,21 +217,77 @@ func splitOversizedPayload(payload []byte) ([][]byte, error) {
 	return [][]byte{payload}, nil
 }
 
+type rawColumn struct {
+	name   string
+	key    msgpack.RawMessage
+	values []msgpack.RawMessage
+}
+
+func decodeColumnarColumns(raw msgpack.RawMessage) ([]rawColumn, error) {
+	dec := msgpack.NewDecoder(bytes.NewReader(raw))
+	n, err := dec.DecodeMapLen()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read columns map: %w", err)
+	}
+	columns := make([]rawColumn, 0, n)
+	for i := 0; i < n; i++ {
+		key, err := dec.DecodeRaw()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read column key: %w", err)
+		}
+		var name string
+		if err := msgpack.Unmarshal(key, &name); err != nil {
+			return nil, fmt.Errorf("failed to decode column name: %w", err)
+		}
+		value, err := dec.DecodeRaw()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read column %q: %w", name, err)
+		}
+		values, err := decodeArrayElements(value)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode column %q: %w", name, err)
+		}
+		columns = append(columns, rawColumn{name: name, key: key, values: values})
+	}
+	return columns, nil
+}
+
+func decodeArrayElements(raw msgpack.RawMessage) ([]msgpack.RawMessage, error) {
+	dec := msgpack.NewDecoder(bytes.NewReader(raw))
+	n, err := dec.DecodeArrayLen()
+	if err != nil {
+		return nil, err
+	}
+	values := make([]msgpack.RawMessage, n)
+	for i := range values {
+		values[i], err = dec.DecodeRaw()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return values, nil
+}
+
 // encodeColumnarRange re-emits the columnar record with every column sliced
 // to rows [lo, hi). Keys other than "columns" (e.g. "m") carry over unchanged
 // through their raw bytes.
-func encodeColumnarRange(keys, vals []msgpack.RawMessage, colIdx int, decoded map[string][]interface{}, lo, hi int) ([]byte, error) {
+func encodeColumnarRange(keys, vals []msgpack.RawMessage, colIdx int, columns []rawColumn, lo, hi int) ([]byte, error) {
 	var cols bytes.Buffer
 	cenc := msgpack.NewEncoder(&cols)
-	if err := cenc.EncodeMapLen(len(decoded)); err != nil {
+	if err := cenc.EncodeMapLen(len(columns)); err != nil {
 		return nil, err
 	}
-	for name, arr := range decoded {
-		if err := cenc.Encode(name); err != nil {
+	for _, column := range columns {
+		if err := cenc.Encode(msgpack.RawMessage(column.key)); err != nil {
 			return nil, err
 		}
-		if err := cenc.Encode(arr[lo:hi]); err != nil {
+		if err := cenc.EncodeArrayLen(hi - lo); err != nil {
 			return nil, err
+		}
+		for _, value := range column.values[lo:hi] {
+			if err := cenc.Encode(msgpack.RawMessage(value)); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -273,6 +322,11 @@ const (
 
 // ErrPayloadTooLarge indicates the payload exceeds MaxWALPayloadSize.
 var ErrPayloadTooLarge = errors.New("WAL payload exceeds maximum allowed size")
+
+func oversizedPayloadError(err error) error {
+	metrics.Get().IncWALOversizedPayloads()
+	return fmt.Errorf("%w: %v", ErrPayloadTooLarge, err)
+}
 
 // ErrWALDropped is returned by Append/AppendRaw/AppendRawWithMeta when the
 // async entry channel is full and the entry is dropped. Previous behavior
@@ -612,12 +666,11 @@ func (w *Writer) AppendRawWithMeta(database string, payload []byte) error {
 	// single record or row larger than the limit) keeps the loud rejection.
 	chunks, err := splitOversizedPayload(payload)
 	if err != nil {
-		return err
+		return oversizedPayloadError(err)
 	}
 	for _, chunk := range chunks {
 		if chunkLen := envelopeHeaderLen + len(chunk); chunkLen > MaxWALPayloadSize {
-			metrics.Get().IncWALOversizedPayloads()
-			return fmt.Errorf("%w: size %d exceeds limit %d", ErrPayloadTooLarge, chunkLen, MaxWALPayloadSize)
+			return oversizedPayloadError(fmt.Errorf("size %d exceeds limit %d", chunkLen, MaxWALPayloadSize))
 		}
 	}
 	for _, chunk := range chunks {
@@ -700,12 +753,11 @@ func (w *Writer) AppendRaw(payload []byte) error {
 	if len(payload) > MaxWALPayloadSize {
 		chunks, err := splitOversizedPayload(payload)
 		if err != nil {
-			return err
+			return oversizedPayloadError(err)
 		}
 		for _, chunk := range chunks {
 			if len(chunk) > MaxWALPayloadSize {
-				metrics.Get().IncWALOversizedPayloads()
-				return fmt.Errorf("%w: size %d exceeds limit %d", ErrPayloadTooLarge, len(chunk), MaxWALPayloadSize)
+				return oversizedPayloadError(fmt.Errorf("size %d exceeds limit %d", len(chunk), MaxWALPayloadSize))
 			}
 		}
 		for _, chunk := range chunks {

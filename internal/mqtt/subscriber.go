@@ -21,6 +21,8 @@ import (
 	"github.com/basekick-labs/arc/pkg/models"
 )
 
+const unsubscribeTimeout = time.Second
+
 // Subscriber handles MQTT connection and message processing for a single subscription
 type Subscriber struct {
 	id             string
@@ -125,11 +127,14 @@ func (s *Subscriber) Stop() error {
 	s.mu.Unlock()
 
 	s.cancel()
+	var unsubscribeErr error
 
 	if s.client != nil && s.client.IsConnected() {
 		// Unsubscribe from topics
 		for _, topic := range s.config.Topics {
-			s.client.Unsubscribe(topic)
+			if err := waitForUnsubscribe(topic, s.client.Unsubscribe(topic)); err != nil && unsubscribeErr == nil {
+				unsubscribeErr = err
+			}
 		}
 
 		// Disconnect with 1 second timeout
@@ -139,6 +144,16 @@ func (s *Subscriber) Stop() error {
 	s.logger.Info().Msg("Disconnected from MQTT broker")
 	s.updateStatus(StatusStopped, "")
 
+	return unsubscribeErr
+}
+
+func waitForUnsubscribe(topic string, token pahomqtt.Token) error {
+	if !token.WaitTimeout(unsubscribeTimeout) {
+		return fmt.Errorf("unsubscribe from %q timed out after %s", topic, unsubscribeTimeout)
+	}
+	if err := token.Error(); err != nil {
+		return fmt.Errorf("unsubscribe from %q failed: %w", topic, err)
+	}
 	return nil
 }
 

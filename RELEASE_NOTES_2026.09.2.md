@@ -70,6 +70,25 @@ the cap, keeps the loud rejection, now also counted in the new
 `arc_wal_oversized_payloads_total` metric so a WAL that records nothing
 never looks healthy again.
 
+Contributed by [@atirna](https://github.com/atirna) in [#696](https://github.com/Basekick-Labs/arc/pull/696).
+
+### Expired tier-cache entries are pruned on store
+
+Each tier-cache insertion removes expired entries while holding the cache lock,
+preventing entries for old partitions from accumulating indefinitely. Expiry
+uses the same boundary as the read path and requires no background goroutine.
+
+Contributed by [@mah1104ahm](https://github.com/mah1104ahm) in [#675](https://github.com/Basekick-Labs/arc/pull/675).
+
+### MQTT shutdown waits for unsubscribe acknowledgements
+
+Stop and pause now wait for each unsubscribe token with a bounded timeout and
+always disconnect. The manager persists the stopped or paused status even if
+the broker rejects an unsubscribe or times out, and returns the shutdown error
+after attempting the status update.
+
+Contributed by [@mah1104ahm](https://github.com/mah1104ahm) in [#673](https://github.com/Basekick-Labs/arc/pull/673).
+
 ### S3 query paths now follow calendar days across DST ([#321](https://github.com/Basekick-Labs/arc/issues/321))
 
 S3 time-range path generation now builds one inclusive partition path per UTC
@@ -264,5 +283,3 @@ warehouse metadata directory, after the files are removed, so a racing
 reconcile pass can only empty tables rather than recreate them. Cleanup
 failures are logged and re-running the DELETE retries them, including when the
 files are already gone.
-
-Contributed by [@atirna](https://github.com/atirna) in [#696](https://github.com/Basekick-Labs/arc/pull/696).

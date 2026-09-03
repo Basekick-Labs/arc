@@ -90,6 +90,32 @@ func TestMetadataStore_RecordFile(t *testing.T) {
 	}
 }
 
+func TestMetadataStore_GetTiersForMeasurementPrunesExpiredCacheEntries(t *testing.T) {
+	store, cleanup := setupTestMetadataStore(t)
+	defer cleanup()
+
+	now := time.Now()
+	store.tierCache["expired/measurement"] = &tierCacheEntry{
+		tiers:     map[Tier]bool{TierHot: true},
+		expiresAt: now.Add(-time.Second),
+	}
+	store.tierCache["live/measurement"] = &tierCacheEntry{
+		tiers:     map[Tier]bool{TierCold: true},
+		expiresAt: now.Add(time.Minute),
+	}
+
+	if _, err := store.GetTiersForMeasurement(context.Background(), "new", "measurement"); err != nil {
+		t.Fatalf("GetTiersForMeasurement() error = %v", err)
+	}
+
+	if _, ok := store.tierCache["expired/measurement"]; ok {
+		t.Fatal("expired cache entry was not pruned")
+	}
+	if _, ok := store.tierCache["live/measurement"]; !ok {
+		t.Fatal("live cache entry was pruned")
+	}
+}
+
 func TestMetadataStore_UpdateTier(t *testing.T) {
 	store, cleanup := setupTestMetadataStore(t)
 	defer cleanup()

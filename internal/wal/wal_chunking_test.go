@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -8,10 +9,6 @@ import (
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
-
-// Writer-level boundaries of #677 payload chunking; the columnar half is
-// covered end to end by internal/ingest's TestWideRequestReachesWALAndReplays,
-// and the at-cap fast path stays pinned by TestWriter_AppendRaw_PayloadAtLimit.
 
 func newChunkTestWriter(t *testing.T) *Writer {
 	t.Helper()
@@ -28,13 +25,8 @@ func newChunkTestWriter(t *testing.T) *Writer {
 	return writer
 }
 
-// TestWriter_AppendRaw_ChunksOversizedRowPayload: a top-level msgpack array
-// of records above the cap is written as multiple entries, each a decodable
-// array whose record union equals the original payload.
 func TestWriter_AppendRaw_ChunksOversizedRowPayload(t *testing.T) {
 	writer := newChunkTestWriter(t)
-
-	// 2000 records of ~64 KB each: ~128 MB, above the 100MB cap.
 	record := map[string]interface{}{"_measurement": "cpu", "time": int64(1), "field": strings.Repeat("r", 64*1024)}
 	records := make([]interface{}, 2000)
 	for i := range records {
@@ -73,12 +65,9 @@ func TestWriter_AppendRaw_ChunksOversizedRowPayload(t *testing.T) {
 	}
 }
 
-// TestWriter_AppendRaw_SingleOversizedElementStillRejected: a payload with no
-// element boundary to split at keeps the loud error and bumps the metric.
 func TestWriter_AppendRaw_SingleOversizedElementStillRejected(t *testing.T) {
 	writer := newChunkTestWriter(t)
 	defer writer.Close()
-
 	payload, err := msgpack.Marshal(strings.Repeat("x", MaxWALPayloadSize+1000))
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -87,6 +76,23 @@ func TestWriter_AppendRaw_SingleOversizedElementStillRejected(t *testing.T) {
 	err = writer.AppendRaw(payload)
 	if err == nil || !strings.Contains(err.Error(), "104857600") {
 		t.Fatalf("want ErrPayloadTooLarge naming the limit, got: %v", err)
+	}
+	if after := metrics.Get().Snapshot()["wal_oversized_payloads"].(int64); after != before+1 {
+		t.Fatalf("oversized metric should bump by 1, got %d -> %d", before, after)
+	}
+}
+
+func TestWriter_AppendRaw_RejectsOversizedRaggedColumns(t *testing.T) {
+	payload, err := msgpack.Marshal(map[string]interface{}{"columns": map[string]interface{}{"a": []int{1, 2}, "b": []int{1}}, "padding": strings.Repeat("p", MaxWALPayloadSize+1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := newChunkTestWriter(t)
+	defer writer.Close()
+	before := metrics.Get().Snapshot()["wal_oversized_payloads"].(int64)
+	err = writer.AppendRaw(payload)
+	if !errors.Is(err, ErrPayloadTooLarge) || !strings.Contains(err.Error(), "column") {
+		t.Fatalf("AppendRaw error = %v, want ErrPayloadTooLarge", err)
 	}
 	if after := metrics.Get().Snapshot()["wal_oversized_payloads"].(int64); after != before+1 {
 		t.Fatalf("oversized metric should bump by 1, got %d -> %d", before, after)
