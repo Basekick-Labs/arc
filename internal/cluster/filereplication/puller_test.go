@@ -191,9 +191,9 @@ func (f *fakeBackend) Exists(ctx context.Context, path string) (bool, error) {
 	return ok, nil
 }
 
-func (f *fakeBackend) Close() error         { return nil }
-func (f *fakeBackend) Type() string         { return "fake" }
-func (f *fakeBackend) ConfigJSON() string   { return "{}" }
+func (f *fakeBackend) Close() error       { return nil }
+func (f *fakeBackend) Type() string       { return "fake" }
+func (f *fakeBackend) ConfigJSON() string { return "{}" }
 func (f *fakeBackend) deleteCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1023,11 +1023,11 @@ func contains(haystack, needle string) bool {
 // This lets puller resume tests verify that pullOnce passes the right offset
 // on the second attempt.
 type resumeAwareFetcher struct {
-	mu          sync.Mutex
-	body        []byte // full file bytes
-	offsets     []int64
-	errors      []error // per-call scripted errors; nil = success
-	callCount   atomic.Int64
+	mu        sync.Mutex
+	body      []byte // full file bytes
+	offsets   []int64
+	errors    []error // per-call scripted errors; nil = success
+	callCount atomic.Int64
 }
 
 func newResumeAwareFetcher(body []byte, errs ...error) *resumeAwareFetcher {
