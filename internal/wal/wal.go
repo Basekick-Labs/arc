@@ -84,7 +84,8 @@ func ParseEnvelope(payload []byte, defaultDB string) (database string, msgpackDa
 // reject. A crash between chunk writes replays the completed prefix, which is
 // safe because rows are independent.
 func splitOversizedPayload(payload []byte) ([][]byte, error) {
-	dec := msgpack.NewDecoder(bytes.NewReader(payload))
+	reader := bytes.NewReader(payload)
+	dec := msgpack.NewDecoder(reader)
 	code, err := dec.PeekCode()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read msgpack header: %w", err)
@@ -141,46 +142,35 @@ func splitOversizedPayload(payload []byte) ([][]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to read map header: %w", err)
 		}
-		keys := make([]msgpack.RawMessage, 0, n)
-		vals := make([]msgpack.RawMessage, 0, n)
+		fields := make([]rawField, 0, n)
+		colIdx := -1
 		for i := 0; i < n; i++ {
-			k, err := dec.DecodeRaw()
-			if err != nil {
+			key := rawSpan{start: len(payload) - reader.Len()}
+			if err := dec.Skip(); err != nil {
 				return nil, fmt.Errorf("failed to read map key: %w", err)
 			}
-			v, err := dec.DecodeRaw()
-			if err != nil {
+			key.end = len(payload) - reader.Len()
+			value := rawSpan{start: len(payload) - reader.Len()}
+			if err := dec.Skip(); err != nil {
 				return nil, fmt.Errorf("failed to read map value: %w", err)
 			}
-			keys = append(keys, k)
-			vals = append(vals, v)
-		}
-
-		colIdx := -1
-		for i, k := range keys {
+			value.end = len(payload) - reader.Len()
+			fields = append(fields, rawField{key: key, value: value})
 			var name string
-			if err := msgpack.Unmarshal(k, &name); err == nil && name == "columns" {
+			if err := msgpack.Unmarshal(payload[key.start:key.end], &name); err == nil && name == "columns" {
 				colIdx = i
-				break
 			}
 		}
 		if colIdx < 0 {
 			return [][]byte{payload}, nil
 		}
 
-		columns, err := decodeColumnarColumns(vals[colIdx])
+		columns, rows, err := decodeColumnarColumns(payload, fields[colIdx].value)
 		if err != nil {
 			return nil, err
 		}
 		if len(columns) == 0 {
 			return [][]byte{payload}, nil
-		}
-
-		rows := len(columns[0].values)
-		for _, column := range columns[1:] {
-			if len(column.values) != rows {
-				return nil, fmt.Errorf("column %q has %d values, want %d", column.name, len(column.values), rows)
-			}
 		}
 		if rows == 0 {
 			return [][]byte{payload}, nil
@@ -190,13 +180,17 @@ func splitOversizedPayload(payload []byte) ([][]byte, error) {
 		// walChunkTarget. Sizes vary per column; the target only picks the
 		// range length, and the hard cap check on the final entry rejects a
 		// range that still does not fit.
-		bytesPerRow := len(vals[colIdx]) / rows
+		bytesPerRow := fields[colIdx].value.end - fields[colIdx].value.start
+		bytesPerRow /= rows
 		if bytesPerRow < 1 {
 			bytesPerRow = 1
 		}
 		rowsPerChunk := walChunkTarget / bytesPerRow
 		if rowsPerChunk < 1 {
 			rowsPerChunk = 1
+		}
+		if err := recordColumnOffsets(payload, columns, rows, rowsPerChunk); err != nil {
+			return nil, err
 		}
 
 		var chunks [][]byte
@@ -205,7 +199,7 @@ func splitOversizedPayload(payload []byte) ([][]byte, error) {
 			if hi > rows {
 				hi = rows
 			}
-			out, err := encodeColumnarRange(keys, vals, colIdx, columns, lo, hi)
+			out, err := encodeColumnarRange(payload, fields, colIdx, columns, lo/rowsPerChunk, hi-lo)
 			if err != nil {
 				return nil, err
 			}
@@ -217,95 +211,125 @@ func splitOversizedPayload(payload []byte) ([][]byte, error) {
 	return [][]byte{payload}, nil
 }
 
-type rawColumn struct {
-	name   string
-	key    msgpack.RawMessage
-	values []msgpack.RawMessage
+type rawSpan struct {
+	start int
+	end   int
 }
 
-func decodeColumnarColumns(raw msgpack.RawMessage) ([]rawColumn, error) {
-	dec := msgpack.NewDecoder(bytes.NewReader(raw))
+type rawField struct {
+	key   rawSpan
+	value rawSpan
+}
+
+type rawColumn struct {
+	name    string
+	key     rawSpan
+	values  rawSpan
+	offsets []int
+}
+
+func decodeColumnarColumns(payload []byte, raw rawSpan) ([]rawColumn, int, error) {
+	reader := bytes.NewReader(payload[raw.start:raw.end])
+	dec := msgpack.NewDecoder(reader)
+	rawLen := raw.end - raw.start
 	n, err := dec.DecodeMapLen()
 	if err != nil {
-		return nil, fmt.Errorf("failed to read columns map: %w", err)
+		return nil, 0, fmt.Errorf("failed to read columns map: %w", err)
 	}
 	columns := make([]rawColumn, 0, n)
+	rows := -1
 	for i := 0; i < n; i++ {
-		key, err := dec.DecodeRaw()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read column key: %w", err)
+		key := rawSpan{start: raw.start + rawLen - reader.Len()}
+		if err := dec.Skip(); err != nil {
+			return nil, 0, fmt.Errorf("failed to read column key: %w", err)
 		}
+		key.end = raw.start + rawLen - reader.Len()
 		var name string
-		if err := msgpack.Unmarshal(key, &name); err != nil {
-			return nil, fmt.Errorf("failed to decode column name: %w", err)
+		if err := msgpack.Unmarshal(payload[key.start:key.end], &name); err != nil {
+			return nil, 0, fmt.Errorf("failed to decode column name: %w", err)
 		}
-		value, err := dec.DecodeRaw()
+		values := rawSpan{start: raw.start + rawLen - reader.Len()}
+		valueLen, err := dec.DecodeArrayLen()
 		if err != nil {
-			return nil, fmt.Errorf("failed to read column %q: %w", name, err)
+			return nil, 0, fmt.Errorf("failed to read column %q array: %w", name, err)
 		}
-		values, err := decodeArrayElements(value)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decode column %q: %w", name, err)
+		if valueLen < 0 {
+			return nil, 0, fmt.Errorf("column %q is nil, want an array", name)
+		}
+		for j := 0; j < valueLen; j++ {
+			if err := dec.Skip(); err != nil {
+				return nil, 0, fmt.Errorf("failed to read column %q value %d: %w", name, j, err)
+			}
+		}
+		values.end = raw.start + rawLen - reader.Len()
+		if rows == -1 {
+			rows = valueLen
+		} else if valueLen != rows {
+			return nil, 0, fmt.Errorf("column %q has %d values, want %d", name, valueLen, rows)
 		}
 		columns = append(columns, rawColumn{name: name, key: key, values: values})
 	}
-	return columns, nil
+	return columns, rows, nil
 }
 
-func decodeArrayElements(raw msgpack.RawMessage) ([]msgpack.RawMessage, error) {
-	dec := msgpack.NewDecoder(bytes.NewReader(raw))
-	n, err := dec.DecodeArrayLen()
-	if err != nil {
-		return nil, err
-	}
-	values := make([]msgpack.RawMessage, n)
-	for i := range values {
-		values[i], err = dec.DecodeRaw()
+func recordColumnOffsets(payload []byte, columns []rawColumn, rows, rowsPerChunk int) error {
+	for i := range columns {
+		column := &columns[i]
+		reader := bytes.NewReader(payload[column.values.start:column.values.end])
+		dec := msgpack.NewDecoder(reader)
+		valueLen, err := dec.DecodeArrayLen()
 		if err != nil {
-			return nil, err
+			return fmt.Errorf("failed to reread column %q array: %w", column.name, err)
+		}
+		if valueLen != rows {
+			return fmt.Errorf("column %q has %d values, want %d", column.name, valueLen, rows)
+		}
+		column.offsets = make([]int, 0, (rows+rowsPerChunk-1)/rowsPerChunk+1)
+		column.offsets = append(column.offsets, column.values.start+len(payload[column.values.start:column.values.end])-reader.Len())
+		for lo := 0; lo < rows; lo += rowsPerChunk {
+			hi := lo + rowsPerChunk
+			if hi > rows {
+				hi = rows
+			}
+			for row := lo; row < hi; row++ {
+				if err := dec.Skip(); err != nil {
+					return fmt.Errorf("failed to read column %q value %d: %w", column.name, row, err)
+				}
+			}
+			column.offsets = append(column.offsets, column.values.start+len(payload[column.values.start:column.values.end])-reader.Len())
 		}
 	}
-	return values, nil
+	return nil
 }
 
 // encodeColumnarRange re-emits the columnar record with every column sliced
 // to rows [lo, hi). Keys other than "columns" (e.g. "m") carry over unchanged
 // through their raw bytes.
-func encodeColumnarRange(keys, vals []msgpack.RawMessage, colIdx int, columns []rawColumn, lo, hi int) ([]byte, error) {
+func encodeColumnarRange(payload []byte, fields []rawField, colIdx int, columns []rawColumn, chunk, rowCount int) ([]byte, error) {
 	var cols bytes.Buffer
 	cenc := msgpack.NewEncoder(&cols)
 	if err := cenc.EncodeMapLen(len(columns)); err != nil {
 		return nil, err
 	}
 	for _, column := range columns {
-		if err := cenc.Encode(msgpack.RawMessage(column.key)); err != nil {
+		cols.Write(payload[column.key.start:column.key.end])
+		if err := cenc.EncodeArrayLen(rowCount); err != nil {
 			return nil, err
 		}
-		if err := cenc.EncodeArrayLen(hi - lo); err != nil {
-			return nil, err
-		}
-		for _, value := range column.values[lo:hi] {
-			if err := cenc.Encode(msgpack.RawMessage(value)); err != nil {
-				return nil, err
-			}
-		}
+		cols.Write(payload[column.offsets[chunk]:column.offsets[chunk+1]])
 	}
 
 	var out bytes.Buffer
 	enc := msgpack.NewEncoder(&out)
-	if err := enc.EncodeMapLen(len(keys)); err != nil {
+	if err := enc.EncodeMapLen(len(fields)); err != nil {
 		return nil, err
 	}
-	for i := range keys {
-		if err := enc.Encode(msgpack.RawMessage(keys[i])); err != nil {
-			return nil, err
-		}
+	for i := range fields {
+		out.Write(payload[fields[i].key.start:fields[i].key.end])
 		if i == colIdx {
-			if _, err := out.Write(cols.Bytes()); err != nil {
-				return nil, err
-			}
-		} else if err := enc.Encode(msgpack.RawMessage(vals[i])); err != nil {
-			return nil, err
+			out.Write(cols.Bytes())
+		} else {
+			out.Write(payload[fields[i].value.start:fields[i].value.end])
 		}
 	}
 	return out.Bytes(), nil
