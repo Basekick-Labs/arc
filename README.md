@@ -449,7 +449,7 @@ Thanks to everyone who has contributed code to Arc:
 - [@bferanmi806-sketch](https://github.com/bferanmi806-sketch) (Enoch) — Iceberg reliability series (#663–#667): version hints published only after metadata copies land, reconcile-interval validation at config load, unreadable-database skip during reconciliation, SQLite WAL/SHM 0600 hardening, empty-measurement negative caching; compaction job-history retention fix (#679)
 - [@Thundercloud12](https://github.com/Thundercloud12) (Keerthan Poojary) — Azure not-found error detection via errors.As, covering joined multi-errors (#670)
 - [@atirna](https://github.com/atirna) (Atirna) — live SQLite backup/restore safety: VACUUM INTO snapshots for backups, rename-swap restores with stale sidecar removal, restart-required signaling (#678, #689)
-- [@mah1104ahm](https://github.com/mah1104ahm) (M Ahmed) — bounded local storage directory cache (#674)
+- [@mah1104ahm](https://github.com/mah1104ahm) (M Ahmed) — bounded local storage directory cache (#674), tier-cache expiry pruning (#675), MQTT shutdown unsubscribe awaits with persisted subscription status (#673), pre-26.06.1 token upgrade runbook (#672)
 - [@copacabanaservice01](https://github.com/copacabanaservice01) — calendar-day S3 range path generation across DST transitions (#690)
 
 And a thank-you to community members whose bug reports drove fixes:
