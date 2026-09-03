@@ -264,3 +264,5 @@ warehouse metadata directory, after the files are removed, so a racing
 reconcile pass can only empty tables rather than recreate them. Cleanup
 failures are logged and re-running the DELETE retries them, including when the
 files are already gone.
+
+Contributed by [@atirna](https://github.com/atirna) in [#696](https://github.com/Basekick-Labs/arc/pull/696).
