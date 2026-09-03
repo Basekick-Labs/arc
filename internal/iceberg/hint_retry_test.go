@@ -1,11 +1,13 @@
 package iceberg
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/basekick-labs/arc/internal/storage"
@@ -153,6 +155,99 @@ func TestReconcile_ConvergedPassRepublishesHint(t *testing.T) {
 	}
 }
 
+// A metadata copy failure must not advance version-hint.text. Directory-based readers fetch the
+// hint first and then v<N>.metadata.json, so advancing the hint before that copy succeeds would
+// point them at a file that does not exist yet (or at stale data after a failed read).
+func TestWriteVersionHint_MetadataFailurePreservesOldHint(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: unreadable metadata would still be readable")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("file permissions do not block reads the same way on Windows")
+	}
+
+	ctx := context.Background()
+	root := t.TempDir()
+	exp := newHintTestExporter(t, root, 3)
+
+	f1 := filepath.Join(root, "mydb", "cpu", "2023", "11", "14", "22", "a.parquet")
+	f2 := filepath.Join(root, "mydb", "cpu", "2023", "11", "14", "22", "b.parquet")
+	writeArcStyleParquet(t, f1, 1_700_000_000_000_000, 5)
+	writeArcStyleParquet(t, f2, 1_700_000_100_000_000, 5)
+	sc, err := SchemaFromParquet(f1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if hintOK, err := exp.ReconcileMeasurementWithHint(ctx, "mydb", "cpu", sc, []FileRef{{PhysicalPath: fileURI(f1)}}); err != nil || !hintOK {
+		t.Fatalf("first reconcile: hintOK=%v err=%v", hintOK, err)
+	}
+	hintPath := filepath.Join(root, "arc_mydb.db", "cpu", "metadata", "version-hint.text")
+	oldHint, err := os.ReadFile(hintPath)
+	if err != nil {
+		t.Fatalf("read old hint: %v", err)
+	}
+
+	tbl, err := exp.EnsureTable(ctx, "mydb", "cpu", sc)
+	if err != nil {
+		t.Fatalf("load current table: %v", err)
+	}
+	txn := tbl.NewTransaction()
+	if err := txn.ReplaceDataFiles(ctx, []string{fileURI(f1)}, []string{fileURI(f2)}, nil); err != nil {
+		t.Fatalf("prepare newer metadata version: %v", err)
+	}
+	tbl, err = txn.Commit(ctx)
+	if err != nil {
+		t.Fatalf("commit newer metadata version: %v", err)
+	}
+	newVersion, _, ok := exp.parseVersionAndMetaDir(tbl.MetadataLocation())
+	if !ok {
+		t.Fatalf("parse current metadata location %q", tbl.MetadataLocation())
+	}
+	if bytes.Equal(oldHint, []byte(newVersion)) {
+		t.Fatalf("reconcile did not create a newer metadata version: old hint=%q", oldHint)
+	}
+	if err := os.WriteFile(hintPath, oldHint, 0o600); err != nil {
+		t.Fatalf("restore old hint: %v", err)
+	}
+
+	metaPath := strings.TrimPrefix(tbl.MetadataLocation(), "file://")
+	metaInfo, err := os.Stat(metaPath)
+	if err != nil {
+		t.Fatalf("stat current metadata: %v", err)
+	}
+	origMode := metaInfo.Mode().Perm()
+	if err := os.Chmod(metaPath, 0); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(metaPath, origMode)
+
+	if hintOK := exp.writeVersionHint(ctx, tbl); hintOK {
+		t.Fatal("metadata read failure should not publish discovery files")
+	}
+	gotHint, err := os.ReadFile(hintPath)
+	if err != nil {
+		t.Fatalf("read hint after metadata failure: %v", err)
+	}
+	if !bytes.Equal(gotHint, oldHint) {
+		t.Fatalf("hint changed after metadata failure: got %q, want %q", gotHint, oldHint)
+	}
+
+	if err := os.Chmod(metaPath, origMode); err != nil {
+		t.Fatal(err)
+	}
+	if hintOK := exp.writeVersionHint(ctx, tbl); !hintOK {
+		t.Fatal("discovery files should publish after metadata recovery")
+	}
+	gotHint, err = os.ReadFile(hintPath)
+	if err != nil {
+		t.Fatalf("read recovered hint: %v", err)
+	}
+	if !bytes.Equal(gotHint, []byte(newVersion)) {
+		t.Fatalf("recovered hint = %q, want %q", gotHint, newVersion)
+	}
+}
+
 // The scheduler must not cache a measurement's fingerprint when the discovery
 // files failed to publish, so the next tick reconciles again rather than
 // skipping on an unchanged file set.
@@ -178,7 +273,7 @@ func TestScheduler_DoesNotCacheAfterHintFailure(t *testing.T) {
 
 	s := &Scheduler{
 		exporter: exp,
-		source:   NewStorageWalkSource(backend, "arc"),
+		source:   NewStorageWalkSource(backend, "arc", zerolog.Nop()),
 		logger:   zerolog.Nop(),
 		state:    make(map[string]measurementState),
 	}

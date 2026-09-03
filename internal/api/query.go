@@ -1084,7 +1084,7 @@ func (h *QueryHandler) SetFileTimePruning(enabled bool, margin time.Duration) {
 func (h *QueryHandler) InvalidateCaches() {
 	h.pruner.InvalidateAllCaches()
 	h.queryCache.Invalidate()
-	h.logger.Info().Msg("Query caches invalidated after compaction")
+	h.logger.Info().Msg("Query caches invalidated (compaction or tier migration)")
 }
 
 // StartBackgroundWorkers spawns the long-lived goroutines the handler
@@ -2958,7 +2958,7 @@ func (h *QueryHandler) buildReadParquetExpr(ctx context.Context, path, originalS
 						Str("database", database).
 						Str("measurement", measurement).
 						Msg("Tiering enabled: building multi-tier query")
-					return h.buildMultiTierReadParquet(database, measurement, tieredPaths, keyword)
+					return h.buildMultiTierReadParquet(ctx, database, measurement, originalSQL, tieredPaths, keyword)
 				}
 			}
 		}
@@ -3011,7 +3011,7 @@ func (h *QueryHandler) buildReadParquetExprForMeasurement(ctx context.Context, d
 					Str("database", database).
 					Str("measurement", measurement).
 					Msg("Tiering enabled: building multi-tier query (fast path)")
-				return h.buildMultiTierReadParquet(database, measurement, tieredPaths, keyword)
+				return h.buildMultiTierReadParquet(ctx, database, measurement, originalSQL, tieredPaths, keyword)
 			}
 		}
 	}
@@ -3147,14 +3147,60 @@ func (h *QueryHandler) extractDBMeasurementFromPath(path string) (database, meas
 	return "", ""
 }
 
+// tierPruneResult pairs one tier's full glob with its pruning outcome.
+type tierPruneResult struct {
+	glob    string
+	paths   []string
+	outcome pruning.TierPruneOutcome
+}
+
+// combineTierPruneResults assembles the final read_parquet path list from
+// per-tier pruning outcomes. Rules:
+//   - Pruned tiers contribute their pruned paths; Fallback tiers contribute
+//     their full glob.
+//   - A verified-Empty tier is DROPPED only when at least one other tier is
+//     Pruned: a positive pruning result is evidence the pruner's view of the
+//     layout matches this query. Without one (an Empty/Fallback mix, e.g. a
+//     spoke-namespace query where generated paths sit one level shallow, plus
+//     a listing error on the other tier), the Empty verdict is not trusted to
+//     hide a tier and its full glob is kept.
+//   - All tiers Empty therefore also yields the full globs, mirroring the
+//     single-tier zero-survivor fallback, counted as unpruned.
+func combineTierPruneResults(results []tierPruneResult) ([]string, int) {
+	anyPruned := false
+	for _, r := range results {
+		if r.outcome == pruning.TierPrunePruned {
+			anyPruned = true
+			break
+		}
+	}
+	var paths []string
+	prunedTiers := 0
+	for _, r := range results {
+		switch r.outcome {
+		case pruning.TierPrunePruned:
+			paths = append(paths, r.paths...)
+			prunedTiers++
+		case pruning.TierPruneEmpty:
+			if anyPruned {
+				prunedTiers++
+			} else {
+				paths = append(paths, r.glob)
+			}
+		default:
+			paths = append(paths, r.glob)
+		}
+	}
+	return paths, prunedTiers
+}
+
 // buildMultiTierReadParquet builds a read_parquet expression that queries tiers with actual data.
 // Queries the tiering metadata to determine which tiers have files for this database/measurement,
 // then only includes paths for tiers that actually have data.
-func (h *QueryHandler) buildMultiTierReadParquet(database, measurement string, tieredPaths map[tiering.Tier]string, keyword string) string {
+func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, measurement, originalSQL string, tieredPaths map[tiering.Tier]string, keyword string) string {
 	options := buildReadParquetOptions()
 
 	// Query metadata to find which tiers actually have data for this measurement
-	ctx := context.Background()
 	actualTiers, err := h.tieringManager.GetMetadata().GetTiersForMeasurement(ctx, database, measurement)
 	if err != nil {
 		h.logger.Warn().Err(err).
@@ -3174,14 +3220,18 @@ func (h *QueryHandler) buildMultiTierReadParquet(database, measurement string, t
 		return keyword + " read_parquet(" + quotePath(h.getStoragePath(database, measurement)) + ", " + options + ")"
 	}
 
-	// Collect paths only for tiers that actually have data
-	var paths []string
+	// Collect the full glob and backend for each tier that actually has data
+	type tierSource struct {
+		tier    tiering.Tier
+		glob    string
+		backend storage.Backend
+	}
+	var sources []tierSource
 
 	// Hot tier (local) - only if metadata says there's hot data
 	if actualTiers[tiering.TierHot] {
 		if _, ok := tieredPaths[tiering.TierHot]; ok {
-			fullHotPath := h.getStoragePath(database, measurement)
-			paths = append(paths, fullHotPath)
+			sources = append(sources, tierSource{tiering.TierHot, h.getStoragePath(database, measurement), h.storage})
 		}
 	}
 
@@ -3190,10 +3240,38 @@ func (h *QueryHandler) buildMultiTierReadParquet(database, measurement string, t
 		if _, ok := tieredPaths[tiering.TierCold]; ok {
 			coldBackend := h.tieringManager.GetBackendForTier(tiering.TierCold)
 			if coldBackend != nil {
-				coldPath := storage.GetStoragePath(coldBackend, database, measurement)
-				paths = append(paths, coldPath)
+				sources = append(sources, tierSource{tiering.TierCold, storage.GetStoragePath(coldBackend, database, measurement), coldBackend})
 			}
 		}
+	}
+
+	// Per-tier partition pruning (#662). Each tier's hour/day paths are
+	// generated against its own base and existence-filtered against its own
+	// backend; a tier verified to hold no data for the time range is dropped
+	// entirely (a recent-range dashboard query never lists or reads cold
+	// object storage beyond the cached parent listings).
+	timeRange := h.pruner.ExtractTimeRange(originalSQL)
+	results := make([]tierPruneResult, 0, len(sources))
+	for _, src := range sources {
+		if src.tier == tiering.TierCold && timeRange != nil && timeRange.StartAssumed {
+			// An end-only predicate's assumed start (2020-01-01) must not
+			// exclude cold-archive data that can legitimately be older; scan
+			// the full cold glob instead.
+			results = append(results, tierPruneResult{glob: src.glob, outcome: pruning.TierPruneFallback})
+			continue
+		}
+		tierPaths, outcome := h.pruner.PruneTierPaths(ctx, src.glob, database, measurement, timeRange, src.backend, src.tier == tiering.TierHot)
+		results = append(results, tierPruneResult{glob: src.glob, paths: tierPaths, outcome: outcome})
+	}
+	paths, prunedTiers := combineTierPruneResults(results)
+	if prunedTiers > 0 {
+		h.logger.Info().
+			Str("database", database).
+			Str("measurement", measurement).
+			Int("tiers", len(sources)).
+			Int("pruned_tiers", prunedTiers).
+			Int("path_count", len(paths)).
+			Msg("Multi-tier partition pruning applied")
 	}
 
 	if len(paths) == 0 {
@@ -3316,7 +3394,7 @@ func (h *QueryHandler) convertSingleTableQueryForParallel(ctx context.Context, s
 			tieredPaths := router.GetGlobPathsForQuery(database, tableName)
 			if _, hasCold := tieredPaths[tiering.TierCold]; hasCold {
 				// Use tiering-aware method - parallel not supported for multi-tier queries
-				replacement := h.buildMultiTierReadParquet(database, tableName, tieredPaths, "FROM")
+				replacement := h.buildMultiTierReadParquet(ctx, database, tableName, sql, tieredPaths, "FROM")
 				return sql[:idx] + replacement + sql[end:], nil
 			}
 		}

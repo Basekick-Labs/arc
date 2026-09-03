@@ -43,6 +43,13 @@ type Scheduler struct {
 	// without re-reading footers. Accessed only from the single loop() goroutine — no lock.
 	state map[string]measurementState
 
+	// gatedWarnOnce fires the first-gated WARN a single time per process
+	// (#639 item 2): the per-tick Debug is invisible at default log levels,
+	// so a cluster with no compactor-role node silently never exported.
+	// Only the loop() goroutine touches it. A node demoted after having run
+	// does not re-warn; the startup case is the observability gap.
+	gatedWarnOnce bool
+
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -130,6 +137,10 @@ func (s *Scheduler) loop(ctx context.Context) {
 // takes effect without a restart (nil gate = always run).
 func (s *Scheduler) runPass(ctx context.Context) {
 	if s.gate != nil && !s.gate.CanRun() {
+		if !s.gatedWarnOnce {
+			s.gatedWarnOnce = true
+			s.logger.Warn().Msg("Iceberg reconcile is gated off on this node (not the active compactor). If no node in the cluster holds a compactor role, Iceberg export never runs; assign one to enable it")
+		}
 		s.logger.Debug().Msg("Iceberg reconcile skipped: node is not the active writer")
 		return
 	}
@@ -200,7 +211,14 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		// Only for a table that already exists: an empty directory that never held data must not
 		// mint a zero-column table (EnsureTable would create one with no fields and no partition
 		// spec). Schema is irrelevant when emptying — the existing table's schema is preserved.
-		if !s.exporter.TableExists(ctx, m.Database, m.Measurement) {
+		exists, err := s.exporter.tableExists(ctx, m.Database, m.Measurement)
+		if err != nil {
+			return false, err
+		}
+		if !exists {
+			// Cache the negative result too: an empty directory with no table has no
+			// catalog state to reconcile, so unchanged passes need no catalog lookup.
+			s.state[key] = measurementState{fingerprint: fp}
 			return false, nil
 		}
 		hintOK, err := s.exporter.ReconcileMeasurementWithHint(ctx, m.Database, m.Measurement, ArcSchema{}, nil)

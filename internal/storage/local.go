@@ -15,6 +15,8 @@ import (
 	"github.com/rs/zerolog"
 )
 
+const maxDirCacheEntries = 1024
+
 // LocalBackend implements the Backend interface for local filesystem storage
 type LocalBackend struct {
 	basePath string
@@ -68,6 +70,12 @@ func (b *LocalBackend) ensureDir(dir string) error {
 		// Use 0700 for owner-only access (security best practice)
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			return fmt.Errorf("failed to create directory: %w", err)
+		}
+		if len(b.dirCache) >= maxDirCacheEntries {
+			for cachedDir := range b.dirCache {
+				delete(b.dirCache, cachedDir)
+				break
+			}
 		}
 		b.dirCache[dir] = true
 	}
