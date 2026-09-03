@@ -234,10 +234,9 @@ type Puller struct {
 	// catchupFailedPaths holds catch-up paths whose pull permanently gave up
 	// after retries. catchupDroppedPaths holds catch-up paths the walker
 	// could not enqueue because the queue was full. Both are tracked so a
-	// later successful startup or reactive pull after the underlying issue
-	// clears can decrement the
-	// corresponding scoped counter and let the gate self-heal without a
-	// process restart. All three sets share inflightMu with the in-flight map,
+	// later successful pull after the underlying issue clears can decrement the
+	// corresponding scoped counter and let the gate self-heal without a process
+	// restart. All three sets share inflightMu with the in-flight map,
 	// which keeps finish/tag bookkeeping atomic.
 	catchupPaths        map[string]struct{}
 	catchupFailedPaths  map[string]struct{}
@@ -247,9 +246,9 @@ type Puller struct {
 	// catchupFailed / catchupDropped count failures and drops scoped to the
 	// catch-up batch only. FullyCaughtUp uses these (not the cumulative
 	// totalFailed / totalDropped) so transient steady-state failures don't
-	// keep the gate red forever. Both self-heal when a later startup or
-	// reactive pull succeeds for the affected path — see clearCatchUpFailure /
-	// clearCatchUpDrop.
+	// keep the gate red forever. Both self-heal when a later startup, reactive,
+	// or reconciliation pull succeeds for the affected path — see
+	// clearCatchUpFailure / clearCatchUpDrop.
 	catchupFailed  atomic.Int64
 	catchupDropped atomic.Int64
 
@@ -368,19 +367,19 @@ func (p *Puller) removeCatchUpTagLocked(path string) {
 // finishEntry records a worker outcome and removes its in-flight state while
 // holding the same lock used by markCatchUp. This closes the race where a
 // startup walker adds a catch-up tag after a worker checks the tag but before
-// the worker removes its in-flight entry.
+// the worker removes its in-flight entry. Reconciliation failures stay outside
+// startup bookkeeping, while any successful pull can heal a prior path failure
+// or drop.
 func (p *Puller) finishEntry(path string, source enqueueSource, failed, succeeded bool) {
 	p.inflightMu.Lock()
 	defer p.inflightMu.Unlock()
 
-	if source != enqueueSourceReconciliation {
-		switch {
-		case failed && p.isCatchUpPathLocked(path):
-			p.recordCatchUpFailureLocked(path)
-		case succeeded:
-			p.clearCatchUpFailureLocked(path)
-			p.clearCatchUpDropLocked(path)
-		}
+	if failed && source != enqueueSourceReconciliation && p.isCatchUpPathLocked(path) {
+		p.recordCatchUpFailureLocked(path)
+	}
+	if succeeded {
+		p.clearCatchUpFailureLocked(path)
+		p.clearCatchUpDropLocked(path)
 	}
 	if source != enqueueSourceReconciliation {
 		p.removeCatchUpTagLocked(path)
@@ -460,9 +459,9 @@ func (p *Puller) recordCatchUpFailureLocked(path string) {
 }
 
 // clearCatchUpFailure decrements the catch-up failure counter if the given
-// path was previously recorded as failed. Called from processEntry's
-// success path so a startup or reactive pull can heal the gate without a
-// process restart. No-op if the path was not previously failed.
+// path was previously recorded as failed. Called from processEntry's success
+// path so any successful pull, including reconciliation, can heal the gate
+// without a process restart. No-op if the path was not previously failed.
 func (p *Puller) clearCatchUpFailure(path string) {
 	p.inflightMu.Lock()
 	defer p.inflightMu.Unlock()
@@ -496,11 +495,10 @@ func (p *Puller) recordCatchUpDropLocked(path string) {
 	p.catchupDropped.Add(1)
 }
 
-// clearCatchUpDrop decrements the catch-up drop counter if the given path
-// was previously recorded as dropped. Called from processEntry's success
-// path so a reactive FSM callback succeeding for a previously-dropped
-// path can heal the gate without a process restart. No-op if the path was not
-// previously dropped.
+// clearCatchUpDrop decrements the catch-up drop counter if the given path was
+// previously recorded as dropped. Called from processEntry's success path so
+// any successful pull, including reconciliation, can heal the gate without a
+// process restart. No-op if the path was not previously dropped.
 func (p *Puller) clearCatchUpDrop(path string) {
 	p.inflightMu.Lock()
 	defer p.inflightMu.Unlock()
@@ -737,13 +735,14 @@ func (p *Puller) CatchUpCompleted() bool {
 // "no pulls are happening anywhere right now."
 //
 // Self-heal: catchupFailed and catchupDropped both decrement when a later
-// startup or reactive pull succeeds for a previously-affected path, so
-// transient peer outages or queue-saturation events during catch-up don't
-// require a process restart to clear the gate. Periodic reconciliation is
-// deliberately excluded so it cannot reopen startup readiness. The puller
-// tracks the affected paths in catchupFailedPaths and catchupDroppedPaths;
-// startup/reactive worker success calls clearCatchUpFailure and
-// clearCatchUpDrop (both are no-ops when the path was never recorded).
+// successful pull resolves a previously-affected path, so transient peer
+// outages or queue-saturation events during catch-up don't require a process
+// restart to clear the gate. Periodic reconciliation cannot create or remove
+// startup tags, and its failures cannot reopen readiness, but its successful
+// pulls can heal existing path state. The puller tracks affected paths in
+// catchupFailedPaths and catchupDroppedPaths; worker success calls
+// clearCatchUpFailure and clearCatchUpDrop (both are no-ops when the path was
+// never recorded).
 //
 // Returns false (not ready) if:
 //   - the catch-up walker never ran or hasn't completed, OR

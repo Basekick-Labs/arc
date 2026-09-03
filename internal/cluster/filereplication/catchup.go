@@ -67,9 +67,11 @@ func (p *Puller) RunCatchUp(ctx context.Context, fetch func(cursor string, limit
 }
 
 // RunReconciliation walks the current manifest and enqueues entries through
-// the normal pull path. Unlike RunCatchUp, it is repeatable and deliberately
-// does not participate in startup catch-up bookkeeping or query readiness.
-// It returns false when another manifest walk is already in progress.
+// the normal pull path. Unlike RunCatchUp, it is repeatable and does not
+// create startup catch-up state or remove startup tags. Its failures do not
+// reopen readiness, while successful pulls may heal existing path-scoped
+// catch-up failure/drop state. It returns false when another manifest walk is
+// already in progress.
 func (p *Puller) RunReconciliation(ctx context.Context, fetch func(cursor string, limit int) ([]*raft.FileEntry, string, error)) bool {
 	if !p.reconciliationMu.TryLock() {
 		p.recheckBusy.Add(1)
@@ -105,8 +107,9 @@ func lifecycleDone(ctx context.Context) <-chan struct{} {
 }
 
 // walkManifest is the shared paginated manifest feeder. Startup walks retain
-// the #392 metrics and path bookkeeping; periodic walks only reuse the
-// backpressure and Enqueue behavior so they cannot re-open the startup gate.
+// the #392 metrics and path bookkeeping; periodic walks use separate metrics,
+// never create or remove startup tags, and can heal existing path-scoped
+// failure/drop state only when their pull succeeds.
 func (p *Puller) walkManifest(ctx context.Context, fetch func(cursor string, limit int) ([]*raft.FileEntry, string, error), startup bool) manifestWalkResult {
 	result := manifestWalkResult{status: manifestWalkCompleted}
 	if startup {

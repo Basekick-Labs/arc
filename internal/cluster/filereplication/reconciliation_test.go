@@ -387,10 +387,10 @@ func TestPeriodicReconciliationDoesNotReopenStartupReadiness(t *testing.T) {
 	}
 }
 
-// TestPeriodicReconciliationDoesNotModifyCatchUpBookkeeping verifies that a
-// later periodic pull does not clear or reopen startup readiness state for the
-// same path. Startup bookkeeping is healed only by startup/reactive work.
-func TestPeriodicReconciliationDoesNotModifyCatchUpBookkeeping(t *testing.T) {
+// TestPeriodicReconciliationHealsCatchUpBookkeeping verifies that a successful
+// periodic pull clears pre-existing path-scoped catch-up failure and drop
+// state without changing the rest of the startup bookkeeping.
+func TestPeriodicReconciliationHealsCatchUpBookkeeping(t *testing.T) {
 	body := []byte("recovered periodic body")
 	p := newTestPuller(t, newFakeBackend(), newRepeatingFetcher(body),
 		staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
@@ -401,8 +401,11 @@ func TestPeriodicReconciliationDoesNotModifyCatchUpBookkeeping(t *testing.T) {
 	entry := makeEntry("testdb/cpu/periodic-self-heal.parquet", "writer-1", int64(len(body)))
 	p.recordCatchUpFailure(entry.Path)
 	p.recordCatchUpDrop(entry.Path)
-	p.markCatchUp(entry.Path)
 	before := p.Stats()
+	beforeCatchUpCompleted := p.CatchUpCompleted()
+	if before["catchup_failed"] != 1 || before["catchup_dropped"] != 1 {
+		t.Fatalf("precondition failed: catch-up bookkeeping = failed=%d dropped=%d, want 1/1", before["catchup_failed"], before["catchup_dropped"])
+	}
 	if p.FullyCaughtUp() {
 		t.Fatal("precondition failed: catch-up bookkeeping should close readiness")
 	}
@@ -412,15 +415,28 @@ func TestPeriodicReconciliationDoesNotModifyCatchUpBookkeeping(t *testing.T) {
 	}) {
 		t.Fatal("reconciliation was unexpectedly skipped")
 	}
-	waitStats(t, p, func(s map[string]int64) bool { return s["pulled"] == 1 })
-	stats := p.Stats()
-	for _, key := range []string{"catchup_failed", "catchup_dropped", "catchup_inflight", "catchup_completed_at"} {
+	stats := waitStats(t, p, func(s map[string]int64) bool {
+		return s["pulled"] == 1 && s["catchup_failed"] == 0 && s["catchup_dropped"] == 0
+	})
+	if stats["catchup_failed"] != 0 {
+		t.Errorf("catchup_failed after periodic recovery: got %d, want 0", stats["catchup_failed"])
+	}
+	if stats["catchup_dropped"] != 0 {
+		t.Errorf("catchup_dropped after periodic recovery: got %d, want 0", stats["catchup_dropped"])
+	}
+	for _, key := range []string{
+		"catchup_started_at", "catchup_completed_at", "catchup_entries_walked",
+		"catchup_enqueued", "catchup_skipped_local", "catchup_inflight",
+	} {
 		if stats[key] != before[key] {
 			t.Errorf("periodic success changed startup bookkeeping %s: before=%d after=%d", key, before[key], stats[key])
 		}
 	}
-	if p.FullyCaughtUp() {
-		t.Error("periodic success unexpectedly reopened startup readiness")
+	if p.CatchUpCompleted() != beforeCatchUpCompleted {
+		t.Error("periodic success changed startup completion state")
+	}
+	if !p.FullyCaughtUp() {
+		t.Error("periodic success did not heal startup readiness")
 	}
 }
 
