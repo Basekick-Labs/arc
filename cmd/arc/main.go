@@ -154,6 +154,21 @@ func main() {
 		log.Fatal().Msg("Arc was built without -tags=duckdb_arrow; refusing to start. The Arrow query path is required: rebuild with `make build` (or `go build -tags=duckdb_arrow ./cmd/arc`).")
 	}
 
+	// Apply staged metadata restores BEFORE anything opens the SQLite
+	// databases (#635): the restore API only stages; the swap happens here,
+	// where no connection, pool, or sidecar can be live. The same paths are
+	// derived again for backup.NewManager later; keep the two in sync.
+	{
+		bootIcebergCatalog := ""
+		if cfg.Iceberg.Enabled {
+			bootIcebergCatalog = cfg.Iceberg.CatalogDBPath
+			if bootIcebergCatalog == "" {
+				bootIcebergCatalog = cfg.Auth.DBPath
+			}
+		}
+		backup.ApplyPendingRestores(logger.Get("backup"), cfg.Auth.DBPath, bootIcebergCatalog)
+	}
+
 	// Validate Enterprise License early (before component initialization)
 	// This allows us to apply core limits to DuckDB and ingestion workers
 	var licenseClient *license.Client
@@ -2090,6 +2105,13 @@ func main() {
 	// Hoisted: on a dual-role (hub+spoke) node the spoke block below needs
 	// the registry to exclude received namespaces from its own discovery.
 	var spokeRegistry *edgesync.Registry
+	// hubReceiptMarker marks sync_received receipts for hub-consumed spoke
+	// files (grouped by namespace). Built whenever the edge-sync receive or
+	// import side is enabled (both write receipts); shared by compaction's
+	// consumed-inputs observer (#619) and tiering's hot-file-removal hook
+	// (#687). Remains nil otherwise, which keeps tiering's spoke-migration
+	// gate closed.
+	var hubReceiptMarker func(paths []string) error
 	if cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Enabled {
 		var registerFile func(context.Context, *edgesync.ReceivedFile) error
 		if clusterCoordinator != nil {
@@ -2170,43 +2192,47 @@ func main() {
 			log.Fatal().Err(err).Msg("Failed to create the edge sync spoke registry; refusing to start")
 		}
 
+		// Receipt marker shared by hub compaction (#619) and tiering's
+		// hot-file-removal hook (#687). Group by first path segment and
+		// attempt the receipt mark. No registry consultation: MarkCompacted
+		// is an UPDATE, so inputs from ordinary databases match no receipts
+		// and no-op — which also makes this immune to a registration deleted
+		// mid-cycle (review N1b). Any failure is RETURNED: compaction then
+		// keeps the crash-recovery manifest so recovery re-fires the marks
+		// (deep-review B1), and tiering aborts the migration before any
+		// delete.
+		markLogger := logger.Get("edgesync")
+		hubReceiptMarker = func(inputs []string) error {
+			byNamespace := make(map[string][]string)
+			for _, in := range inputs {
+				first, rest, found := strings.Cut(in, "/")
+				if !found || first == "" || rest == "" {
+					continue
+				}
+				byNamespace[first] = append(byNamespace[first], rest)
+			}
+			markCtx, markCancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer markCancel()
+			var firstErr error
+			for ns, paths := range byNamespace {
+				if err := hubIndex.MarkCompacted(markCtx, ns, paths); err != nil {
+					markLogger.Warn().Err(err).Str("namespace", ns).Int("paths", len(paths)).
+						Msg("Could not mark consumed receipts; the caller retries or aborts")
+					if firstErr == nil {
+						firstErr = err
+					}
+				}
+			}
+			return firstErr
+		}
+
 		// #619: hub compaction of received spoke namespaces. Wiring ORDER is
 		// load-bearing (review F9): the consumed-inputs observer goes in
 		// BEFORE the namespace expander, so no scheduler tick can compact
 		// received raws without marking their receipts. compactionManager
 		// may be nil independently (CLAUDE.md nil rule).
 		if compactionManager != nil && cfg.EdgeSync.CompactReceivedNamespaces {
-			markLogger := logger.Get("edgesync")
-			compactionManager.SetOnConsumedInputs(func(inputs []string) error {
-				// Group by first path segment and attempt the receipt mark.
-				// No registry consultation: MarkCompacted is an UPDATE, so
-				// inputs from ordinary databases match no receipts and
-				// no-op — which also makes this immune to a registration
-				// deleted mid-cycle (review N1b). Any failure is RETURNED:
-				// the caller then keeps the crash-recovery manifest so
-				// recovery re-fires the marks (deep-review B1).
-				byNamespace := make(map[string][]string)
-				for _, in := range inputs {
-					first, rest, found := strings.Cut(in, "/")
-					if !found || first == "" || rest == "" {
-						continue
-					}
-					byNamespace[first] = append(byNamespace[first], rest)
-				}
-				markCtx, markCancel := context.WithTimeout(context.Background(), 60*time.Second)
-				defer markCancel()
-				var firstErr error
-				for ns, paths := range byNamespace {
-					if err := hubIndex.MarkCompacted(markCtx, ns, paths); err != nil {
-						markLogger.Warn().Err(err).Str("namespace", ns).Int("paths", len(paths)).
-							Msg("Could not mark consumed receipts compacted; the retained manifest re-fires them via recovery")
-						if firstErr == nil {
-							firstErr = err
-						}
-					}
-				}
-				return firstErr
-			})
+			compactionManager.SetOnConsumedInputs(hubReceiptMarker)
 			compactionManager.SetNamespaceExpander(receivedNamespaces(spokeRegistry))
 			log.Info().Msg("Hub compaction of received spoke namespaces enabled (edge_sync.compact_received_namespaces)")
 		}
@@ -3136,7 +3162,9 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize Iceberg exporter")
 		}
-		icebergSource := iceberg.NewStorageWalkSource(storageBackend, cfg.Iceberg.NamespacePrefix)
+		// #639 item 3: database deletion clears the Iceberg catalog too.
+		databasesHandler.SetIcebergDropper(exporter)
+		icebergSource := iceberg.NewStorageWalkSource(storageBackend, cfg.Iceberg.NamespacePrefix, logger.Get("iceberg"))
 		// Writer gate: in cluster mode reuse the compaction gate; nil in OSS (single node, always
 		// runs). SINGLE-WRITER REQUIREMENT: the reconciler writes version-hint.text / v<N>.json
 		// to the shared warehouse non-transactionally, so exactly one node must run it. The
@@ -3472,6 +3500,17 @@ func main() {
 
 		// Wire tiering manager to query handler for multi-tier query routing
 		queryHandler.SetTieringManager(tieringManager)
+		// A completed migration moves files between tiers, so cached pruned
+		// partition paths (pruner + SQL transform caches) go stale and must
+		// be dropped — same reason compaction invalidates them (#662).
+		tieringManager.SetOnMigrationComplete(queryHandler.InvalidateCaches)
+		// #687: on an edge-sync hub, tiering deletes of hot spoke files must
+		// mark their sync receipts first, or the spoke re-uploads duplicates.
+		// Wiring this also lifts the migrator's spoke-namespace gate.
+		if hubReceiptMarker != nil {
+			tieringManager.SetOnHotFilesRemoved(hubReceiptMarker)
+			log.Info().Msg("Tiering hot-file removals wired to edge-sync receipt marking; spoke cold migration enabled")
+		}
 		log.Info().Msg("Tiering manager wired to query handler for multi-tier queries")
 
 		// Wire tiering manager to databases handler for cold-tier database/measurement listing
@@ -3698,6 +3737,30 @@ func sharedSQLiteHandle(authManager *auth.AuthManager, dbPath string) (db *sql.D
 	}
 	f.Close()
 
+	walBase := dbPath
+	if resolved, err := filepath.EvalSymlinks(dbPath); err == nil {
+		walBase = resolved
+	} else {
+		log.Warn().Err(err).Str("db_path", dbPath).
+			Msg("Could not resolve SQLite DB symlinks; WAL/SHM permissions may not be hardened if the path is a symlink")
+	}
+	// SQLite creates these siblings lazily on the first write. Pre-create them
+	// so a later write cannot create world-readable files under the process
+	// umask.
+	for _, ext := range []string{"-wal", "-shm"} {
+		sidecar := walBase + ext
+		sf, err := os.OpenFile(sidecar, os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to create database %s: %w", ext, err)
+		}
+		if err := sf.Close(); err != nil {
+			return nil, false, fmt.Errorf("failed to close database %s: %w", ext, err)
+		}
+		if err := os.Chmod(sidecar, 0600); err != nil {
+			return nil, false, fmt.Errorf("failed to set database %s permissions: %w", ext, err)
+		}
+	}
+
 	db, err = sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, false, err
@@ -3708,6 +3771,13 @@ func sharedSQLiteHandle(authManager *auth.AuthManager, dbPath string) (db *sql.D
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, false, fmt.Errorf("failed to open database %s: %w", dbPath, err)
+	}
+
+	// Tighten the main database even when it predates this handle. The sidecars
+	// were pre-created and their modes tightened above, including existing files.
+	if err := os.Chmod(dbPath, 0600); err != nil {
+		db.Close()
+		return nil, false, fmt.Errorf("failed to set database file permissions: %w", err)
 	}
 
 	db.SetMaxOpenConns(1) // SQLite has a single writer

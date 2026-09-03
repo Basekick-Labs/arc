@@ -262,11 +262,21 @@ func (h *BackupHandler) RestoreBackup(c *fiber.Ctx) error {
 		}
 	}()
 
-	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
+	resp := fiber.Map{
 		"message":   "Restore started",
 		"backup_id": req.BackupID,
 		"status":    "running",
-	})
+	}
+	// Restored databases are STAGED and applied at the next boot (#635), and
+	// a restored config only takes effect on reload — both need a server
+	// restart to take effect.
+	if opts.RestoreMetadata || opts.RestoreConfig {
+		resp["restart_required"] = true
+	}
+	if opts.RestoreMetadata {
+		resp["staged"] = true
+	}
+	return c.Status(fiber.StatusAccepted).JSON(resp)
 }
 
 // acquireOperation atomically reserves the handler's shared backup/restore slot.

@@ -664,3 +664,22 @@ func (n *Node) LeaderCh() <-chan bool {
 	}
 	return n.raft.LeaderCh()
 }
+
+// ConfigurationServerIDs returns the server IDs in this node's current,
+// locally-known Raft configuration. A joiner has not necessarily received
+// the latest membership entry the leader committed (a config change commits
+// on a quorum that may exclude this node), so callers coordinating
+// membership-dependent actions — a test stopping the leader, an operator
+// draining a node — must check every node's own view, not the leader's.
+func (n *Node) ConfigurationServerIDs() ([]string, error) {
+	future := n.raft.GetConfiguration()
+	if err := future.Error(); err != nil {
+		return nil, err
+	}
+	servers := future.Configuration().Servers
+	ids := make([]string, 0, len(servers))
+	for _, s := range servers {
+		ids = append(ids, string(s.ID))
+	}
+	return ids, nil
+}

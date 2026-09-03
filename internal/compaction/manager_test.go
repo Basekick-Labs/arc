@@ -426,6 +426,36 @@ func TestManager_JobHistory(t *testing.T) {
 	}
 }
 
+func TestAppendJobHistory_TrimsWithFreshBackingArray(t *testing.T) {
+	// Leave one spare slot so append uses the pre-trim backing array. A reslice-only
+	// trim would then make preTrim[1] and trimmed[0] the same storage.
+	history := make([]map[string]interface{}, 100, 101)
+	for i := range history {
+		history[i] = map[string]interface{}{"id": i}
+	}
+	preTrim := history
+
+	trimmed := appendJobHistory(history, map[string]interface{}{"id": 100})
+
+	if len(trimmed) != 100 {
+		t.Fatalf("trimmed history length = %d, want 100", len(trimmed))
+	}
+	for i, job := range trimmed {
+		if got, want := job["id"], i+1; got != want {
+			t.Fatalf("trimmed history[%d] = %v, want %d", i, got, want)
+		}
+	}
+	if &preTrim[1] == &trimmed[0] {
+		t.Fatal("trimmed history shares backing-array storage with the pre-trim slice")
+	}
+
+	// Retain the map references without deep-copying the individual maps.
+	history[1]["marker"] = "shared"
+	if got := trimmed[0]["marker"]; got != "shared" {
+		t.Fatalf("trimmed history copied a job map instead of retaining its reference: got %v", got)
+	}
+}
+
 // TestCandidate tests the Candidate struct
 func TestCandidate(t *testing.T) {
 	candidate := Candidate{
