@@ -53,6 +53,16 @@ literals (e.g. a log-search `LIKE '%INTERVAL 5 MINUTE%'`) and identifiers such a
 `interval2` can never be misread as time bounds; compound quoted intervals like
 `'1 day 12 hours'` remain unpruned (never mis-pruned as their first component).
 
+## Security fixes
+
+### Dependency bump: Apache Thrift 0.23.0 → 0.24.0 ([GHSA-8wv5-x4w7-5gww](https://github.com/advisories/GHSA-8wv5-x4w7-5gww))
+
+`github.com/apache/thrift` is bumped to 0.24.0, which patches a high-severity
+infinite loop in the Go bindings when parsing malformed Thrift input. Thrift is
+an indirect dependency reached through arrow-go's Parquet metadata decoding
+(Parquet footers are Thrift-encoded), so the vulnerable code is in Arc's build.
+The ingest, API, query, and Iceberg test suites were verified against 0.24.0.
+
 ## Bug fixes
 
 ### Expired tier-cache entries are pruned on store
