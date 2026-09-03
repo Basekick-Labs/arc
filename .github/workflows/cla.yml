@@ -1,0 +1,55 @@
+# Contributor License Agreement gate.
+#
+# Arc is AGPL-3.0, and Basekick Labs also ships commercially licensed builds.
+# Distributing a contribution under both requires the contributor to grant the
+# relicensing right in CLA.md section 4 — without it, external code can only
+# ever be AGPL, which permanently constrains where that code can live.
+#
+# Signatures are stored in a private repo (Basekick-Labs/cla-signatures), not in
+# this one, so signature churn stays out of the Arc history and contributor
+# emails are not published.
+#
+# Bot-authored PRs (dependabot, claude) are allow-listed: they are not legal
+# persons and cannot sign.
+name: CLA
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: write
+  statuses: write
+
+jobs:
+  cla:
+    name: CLA signed
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check CLA signature
+        if: (github.event.issue.pull_request && contains(github.event.comment.body, 'I have read the CLA Document and I hereby sign the CLA')) || github.event_name == 'pull_request_target'
+        uses: contributor-assistant/github-action@v2.6.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_SIGNATURES_TOKEN }}
+        with:
+          path-to-document: https://github.com/Basekick-Labs/arc/blob/main/CLA.md
+          path-to-signatures: signatures/arc.json
+          remote-organization-name: Basekick-Labs
+          remote-repository-name: cla-signatures
+          branch: main
+          allowlist: xe-nvdk,dependabot[bot],claude[bot],*[bot]
+          custom-notsigned-prcomment: |
+            Thanks for the contribution!
+
+            Before this can be merged, please sign the [Contributor License Agreement](https://github.com/Basekick-Labs/arc/blob/main/CLA.md).
+            Arc is AGPL-3.0 and Basekick Labs also ships commercially licensed builds; the CLA is what lets your contribution be included in both. You keep full ownership of your work.
+
+            To sign, reply to this thread with exactly:
+          custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'
+          custom-allsigned-prcomment: 'All contributors have signed the CLA. Thanks!'
+          lock-pullrequest-aftermerge: false

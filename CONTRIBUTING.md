@@ -22,6 +22,7 @@ Thanks for your interest in improving Arc. Contributions of all sizes are welcom
    Merged contributions are also credited in the README and in the release blog post.
 5. **Match the house style.** Run `gofmt` and `go vet`. Reuse the patterns the surrounding code already uses (for example struct logger fields, not context-carried loggers) rather than introducing new ones.
 6. **Leave "Allow edits by maintainers" enabled.** We often resolve release-notes conflicts and small fixups directly on your branch so your PR can merge without another round trip.
+7. **Sign the CLA.** A bot comments on your first PR with a one-line reply to post. See [Contributor License Agreement](#contributor-license-agreement) below for what it covers and why it exists. You sign once, not per PR.
 
 ## AI-assisted contributions
 
@@ -31,6 +32,33 @@ AI patches and contributions are welcome. Two conditions:
 - **Review it yourself first.** Read the whole diff, run the tests, and cut anything you cannot defend before submitting. We review every PR the same way regardless of how it was written, and unverified AI output wastes the review cycle that could have gone to your next contribution.
 
 The same size rule applies double here: AI tools make it easy to generate large diffs, and we will ask you to split them.
+
+## Contributor License Agreement
+
+Arc is licensed under AGPL-3.0, and Basekick Labs also ships commercially
+licensed builds of Arc. Including a contribution in both requires your explicit
+permission, which is what the [CLA](CLA.md) grants.
+
+In short:
+
+- **You keep ownership of your contribution.** The CLA is a license grant, not a
+  copyright assignment. You can use, relicense, or redistribute your own work
+  anywhere else, with no restriction.
+- **You grant Basekick Labs the right to license your contribution under other
+  terms**, including in commercial and closed-source builds of Arc.
+- **You confirm the work is yours to give** — that it is your original creation,
+  and that if your employer owns your work output, you have permission to submit
+  it.
+
+Signing takes one comment. On your first PR a bot posts instructions; you reply
+with the sign-off line it gives you, and your signature is recorded against your
+GitHub username. You will not be asked again on later PRs.
+
+If you cannot sign (for example, your employer will not permit it), say so on the
+issue before writing code and we will find another way to get the fix in —
+usually by reimplementing it from the described behavior rather than the patch.
+
+Read the full text in [CLA.md](CLA.md).
 
 ## Building and testing
 
