@@ -55,6 +55,15 @@ literals (e.g. a log-search `LIKE '%INTERVAL 5 MINUTE%'`) and identifiers such a
 
 ## Bug fixes
 
+### MQTT shutdown waits for unsubscribe acknowledgements
+
+Stop and pause now wait for each unsubscribe token with a bounded timeout and
+always disconnect. The manager persists the stopped or paused status even if
+the broker rejects an unsubscribe or times out, and returns the shutdown error
+after attempting the status update.
+
+Contributed by [@mah1104ahm](https://github.com/mah1104ahm) in [#673](https://github.com/Basekick-Labs/arc/pull/673).
+
 ### S3 query paths now follow calendar days across DST ([#321](https://github.com/Basekick-Labs/arc/issues/321))
 
 S3 time-range path generation now builds one inclusive partition path per UTC
