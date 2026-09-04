@@ -159,6 +159,18 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		})
 	}
 
+	// Enterprise query governance (#702): rate limits, quotas, the MaxRows
+	// row cap, and the policy timeout apply here the same as on
+	// POST /api/v1/query. The 429 uses this endpoint's fiber.Map error
+	// shape, matching every other error it returns.
+	governanceMaxRows, governanceTimeout, governanceRejection := h.checkQueryGovernance(c)
+	if governanceRejection != nil {
+		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
+			"success": false,
+			"error":   governanceRejection.reason,
+		})
+	}
+
 	// Convert SQL to storage paths (with caching)
 	// If headerDB is set, uses optimized path that skips db.table regex patterns
 	convertedSQL, _ := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
@@ -174,10 +186,15 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// runs asynchronously after the handler returns, and c.UserContext() would be cancelled
 	// Note: We don't use defer cancel() here because the streaming callback runs after
 	// this handler returns - cancel is called inside the callback after rows are consumed
+	// A governance policy's MaxDuration overrides the global timeout (#702).
+	effectiveTimeout := h.queryTimeout
+	if governanceTimeout > 0 {
+		effectiveTimeout = governanceTimeout
+	}
 	ctx := context.Background()
 	var cancel context.CancelFunc
-	if h.queryTimeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, h.queryTimeout)
+	if effectiveTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, effectiveTimeout)
 	}
 
 	// arcx router hook (Arrow-IPC variant). In serve mode a green shape is
@@ -188,6 +205,10 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// Pass `cancel` INTO the hook — the arcx serve path streams asynchronously in
 	// SetBodyStreamWriter (after this returns), so it owns calling cancel when the stream
 	// finishes. Calling cancel() here would cancel execCtx mid-stream → truncate to schema-only.
+	// Governance note (#702): rate limit, quota, and the policy timeout
+	// (via ctx) apply to an arcx-served response, but the MaxRows cap is
+	// enforced only by the DuckDB IPC loop below — the experimental arcx
+	// serve path streams uncapped until it learns to take a row cap.
 	if h.tryArcxRouterArrow(c, ctx, cancel, req.SQL, headerDB, convertedSQL) {
 		return nil
 	}
@@ -199,9 +220,9 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		if cancel != nil {
 			cancel()
 		}
-		if h.queryTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
+		if effectiveTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
 			m.IncQueryTimeouts()
-			h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(req.SQL)).Dur("timeout", h.queryTimeout).Msg("Arrow query timed out")
+			h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(req.SQL)).Dur("timeout", effectiveTimeout).Msg("Arrow query timed out")
 			return c.Status(fiber.StatusGatewayTimeout).JSON(fiber.Map{
 				"success": false,
 				"error":   "Query timed out",
@@ -305,6 +326,23 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			if batch == nil {
 				break
 			}
+
+			// Governance row cap (#702): slice the final batch at the cap
+			// and stop draining, the same truncation semantics as
+			// drainArrowBatches on the msgpack path. slicedBatch is a new
+			// record this closure owns; it is released with the other
+			// per-iteration records after Write (or on the error paths).
+			var slicedBatch arrow.Record
+			if governanceMaxRows > 0 {
+				remaining := int64(governanceMaxRows) - totalRows
+				if remaining <= 0 {
+					break
+				}
+				if batch.NumRows() > remaining {
+					slicedBatch = batch.NewSlice(0, remaining)
+					batch = slicedBatch
+				}
+			}
 			totalRows += batch.NumRows()
 
 			// CRITICAL: when castInfo!=nil we replace `batch` with a new
@@ -321,6 +359,9 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 				var castErr error
 				castedBatch, castErr = castDecimalBatch(batch, castInfo)
 				if castErr != nil {
+					if slicedBatch != nil {
+						slicedBatch.Release()
+					}
 					streamErr = fmt.Errorf("failed to cast decimal columns at row %d: %w", totalRows, castErr)
 					break streamLoop
 				}
@@ -351,6 +392,9 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 					if castedBatch != nil {
 						castedBatch.Release()
 					}
+					if slicedBatch != nil {
+						slicedBatch.Release()
+					}
 					streamErr = fmt.Errorf("failed to dictionary-encode batch at row %d: %w", totalRows, encErr)
 					break streamLoop
 				}
@@ -364,6 +408,9 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			if castedBatch != nil {
 				castedBatch.Release()
 			}
+			if slicedBatch != nil {
+				slicedBatch.Release()
+			}
 			if err != nil {
 				streamErr = fmt.Errorf("failed to write arrow batch at row %d: %w", totalRows, err)
 				break streamLoop
@@ -376,6 +423,12 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			if err := w.Flush(); err != nil {
 				streamErr = fmt.Errorf("stream flush failed at row %d: %w: %w", totalRows, errClientDisconnected, err)
 				break streamLoop
+			}
+			// Cap reached: stop before reader.Next() materializes another
+			// DuckDB batch that would only be discarded (same early break
+			// as drainArrowBatches).
+			if governanceMaxRows > 0 && totalRows >= int64(governanceMaxRows) {
+				break
 			}
 		}
 

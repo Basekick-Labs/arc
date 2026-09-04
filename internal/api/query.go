@@ -121,6 +121,15 @@ var (
 // Returns (rowCount, handled). If handled is false, the caller falls back to database/sql.
 var arrowJSONQueryFunc func(h *QueryHandler, c *fiber.Ctx, ctx context.Context, cancel context.CancelFunc, convertedSQL string, profileMode bool, governanceMaxRows int, start time.Time, timestamp string, onComplete func(int), onFail func(string), onTimeout func()) (int, bool)
 
+// queryGovernanceLicensed reports whether the Enterprise query-governance
+// gate is open for this handler. Package-level indirection (same seam style
+// as arrowJSONQueryFunc) because license.Client carries no injectable
+// license, so handler tests could otherwise never exercise the licensed
+// path of enforceQueryGovernance.
+var queryGovernanceLicensed = func(h *QueryHandler) bool {
+	return h.governanceManager != nil && h.licenseClient != nil && h.licenseClient.CanUseQueryGovernance()
+}
+
 // arrowMsgPackQueryFunc is set by query_msgpack.go init() when compiled with duckdb_arrow tag.
 // It executes a query via DuckDB's native Arrow API and streams a MessagePack response.
 // Returns (rowCount, handled). If handled is false, the caller MUST treat the request as
@@ -1512,36 +1521,9 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 localProcessing:
 
 	// Query governance enforcement (Enterprise feature - rate limiting and quotas)
-	var governanceMaxRows int
-	var governanceTimeout time.Duration
-	if h.governanceManager != nil && h.licenseClient != nil && h.licenseClient.CanUseQueryGovernance() {
-		if tokenInfo := auth.GetTokenInfo(c); tokenInfo != nil {
-			if result := h.governanceManager.CheckRateLimit(tokenInfo.ID); !result.Allowed {
-				c.Set("Retry-After", strconv.Itoa(result.RetryAfterSec))
-				m.IncQueryErrors()
-				metrics.Get().IncGovernanceRateLimited()
-				h.logger.Warn().
-					Int64("token_id", tokenInfo.ID).
-					Str("token_name", tokenInfo.Name).
-					Str("reason", result.Reason).
-					Int("retry_after_sec", result.RetryAfterSec).
-					Msg("Query rejected: rate limit exceeded")
-				return respondError(c, fiber.StatusTooManyRequests, result.Reason, timestamp, start)
-			}
-			if result := h.governanceManager.CheckQuota(tokenInfo.ID); !result.Allowed {
-				m.IncQueryErrors()
-				metrics.Get().IncGovernanceQuotaExhausted()
-				h.logger.Warn().
-					Int64("token_id", tokenInfo.ID).
-					Str("token_name", tokenInfo.Name).
-					Str("reason", result.Reason).
-					Msg("Query rejected: quota exhausted")
-				return respondError(c, fiber.StatusTooManyRequests, result.Reason, timestamp, start)
-			} else {
-				governanceMaxRows = result.MaxRows
-				governanceTimeout = result.MaxDuration
-			}
-		}
+	governanceMaxRows, governanceTimeout, governanceRejection := h.checkQueryGovernance(c)
+	if governanceRejection != nil {
+		return respondError(c, fiber.StatusTooManyRequests, governanceRejection.reason, timestamp, start)
 	}
 
 	// Parse request body
@@ -4062,6 +4044,23 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 		})
 	}
 
+	// Enterprise query governance (#702): the COUNT(*) wrapper below forces
+	// full execution of the user's subquery, so this is real scan cost that
+	// must be rate-limited, charged against quota, and bounded by the
+	// policy timeout like any other user-SQL endpoint. MaxRows is
+	// irrelevant here (the response is a single count row). The 429 uses
+	// this endpoint's EstimateResponse shape so warning_level stays the
+	// severity channel for every error class.
+	_, governanceTimeout, governanceRejection := h.checkQueryGovernance(c)
+	if governanceRejection != nil {
+		return c.Status(fiber.StatusTooManyRequests).JSON(EstimateResponse{
+			Success:         false,
+			Error:           governanceRejection.reason,
+			WarningLevel:    "error",
+			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+		})
+	}
+
 	// Convert SQL to storage paths (with caching)
 	convertedSQL, _ := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
 
@@ -4075,11 +4074,16 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 
 	m := metrics.Get()
 
-	// Create context with timeout if configured
+	// Create context with timeout if configured; a governance policy's
+	// MaxDuration overrides the global timeout (#702).
+	effectiveTimeout := h.queryTimeout
+	if governanceTimeout > 0 {
+		effectiveTimeout = governanceTimeout
+	}
 	ctx := c.UserContext()
 	var cancel context.CancelFunc
-	if h.queryTimeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, h.queryTimeout)
+	if effectiveTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, effectiveTimeout)
 		defer cancel()
 	}
 
@@ -4087,9 +4091,9 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	rows, err := h.db.QueryContext(ctx, countSQL)
 	if err != nil {
 		// Check if it was a timeout
-		if h.queryTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
+		if effectiveTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
 			m.IncQueryTimeouts()
-			h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(countSQL)).Dur("timeout", h.queryTimeout).Msg("Estimate query timed out")
+			h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(countSQL)).Dur("timeout", effectiveTimeout).Msg("Estimate query timed out")
 			return c.Status(fiber.StatusGatewayTimeout).JSON(EstimateResponse{
 				Success:         false,
 				Error:           "Query timed out",
@@ -4319,6 +4323,64 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 	})
 }
 
+// governanceRejection describes a request rejected by query governance.
+// When it is returned, metrics and logging are already recorded and the
+// Retry-After header (rate limits only) is already set on the response;
+// the caller renders the 429 body in its endpoint's own error shape.
+type governanceRejection struct {
+	reason string
+}
+
+// checkQueryGovernance runs the Enterprise query-governance checks (rate
+// limit, then quota) for the request's token. A non-nil rejection means the
+// request must be answered with 429 and the returned reason; otherwise the
+// returned policy limits apply to the query: maxRows caps streamed rows and
+// timeout overrides the global query timeout (zero values mean no policy
+// limit, including when governance is unlicensed, unconfigured, or the
+// request carries no token, as on internal paths).
+//
+// Shared by every user-SQL endpoint (#702): POST /api/v1/query, POST
+// /api/v1/query/arrow, POST /api/v1/query/estimate, and GET
+// /api/v1/query/:measurement. Call-site placement differs deliberately:
+// POST /api/v1/query charges the budget before body parsing (pre-existing
+// order, kept for compatibility), the other three charge after their
+// validation and RBAC checks, so a malformed or forbidden request does not
+// burn a quota slot there.
+func (h *QueryHandler) checkQueryGovernance(c *fiber.Ctx) (maxRows int, timeout time.Duration, rejection *governanceRejection) {
+	if !queryGovernanceLicensed(h) {
+		return 0, 0, nil
+	}
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
+		return 0, 0, nil
+	}
+	m := metrics.Get()
+	if result := h.governanceManager.CheckRateLimit(tokenInfo.ID); !result.Allowed {
+		c.Set("Retry-After", strconv.Itoa(result.RetryAfterSec))
+		m.IncQueryErrors()
+		m.IncGovernanceRateLimited()
+		h.logger.Warn().
+			Int64("token_id", tokenInfo.ID).
+			Str("token_name", tokenInfo.Name).
+			Str("reason", result.Reason).
+			Int("retry_after_sec", result.RetryAfterSec).
+			Msg("Query rejected: rate limit exceeded")
+		return 0, 0, &governanceRejection{reason: result.Reason}
+	}
+	result := h.governanceManager.CheckQuota(tokenInfo.ID)
+	if !result.Allowed {
+		m.IncQueryErrors()
+		m.IncGovernanceQuotaExhausted()
+		h.logger.Warn().
+			Int64("token_id", tokenInfo.ID).
+			Str("token_name", tokenInfo.Name).
+			Str("reason", result.Reason).
+			Msg("Query rejected: quota exhausted")
+		return 0, 0, &governanceRejection{reason: result.Reason}
+	}
+	return result.MaxRows, result.MaxDuration, nil
+}
+
 // queryMeasurement handles GET /api/v1/query/:measurement - query a specific measurement
 func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	start := time.Now()
@@ -4412,6 +4474,15 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		})
 	}
 
+	// Enterprise query governance (#702): rate limits, quotas, row caps, and
+	// the per-token timeout apply here the same as on POST /api/v1/query.
+	// This endpoint accepts a user-supplied where fragment, so these are
+	// real queries with real cost, not point lookups.
+	governanceMaxRows, governanceTimeout, governanceRejection := h.checkQueryGovernance(c)
+	if governanceRejection != nil {
+		return respondError(c, fiber.StatusTooManyRequests, governanceRejection.reason, time.Now().UTC().Format(time.RFC3339), start)
+	}
+
 	// Build SQL query with validated parameters
 	sql := fmt.Sprintf("SELECT * FROM %s.%s", database, measurement)
 	if where != "" {
@@ -4467,10 +4538,16 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	// Create context with timeout if configured (0 = no timeout).
 	// Same pattern as POST /api/v1/query: start from UserContext so client
 	// disconnects cancel the query, then wrap with queryTimeout (#308).
+	// A governance policy's MaxDuration overrides the global timeout (#702),
+	// matching the POST handler's effectiveTimeout semantics.
+	effectiveTimeout := h.queryTimeout
+	if governanceTimeout > 0 {
+		effectiveTimeout = governanceTimeout
+	}
 	ctx := c.UserContext()
 	var cancel context.CancelFunc
-	if h.queryTimeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, h.queryTimeout)
+	if effectiveTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, effectiveTimeout)
 		// cancel is invoked inside the stream writer callback (or on error
 		// paths below), not deferred here, because SetBodyStreamWriter runs
 		// asynchronously after this function returns.
@@ -4478,7 +4555,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 
 	// Arrow-native path: bypasses database/sql row scanning entirely.
 	if arrowJSONQueryFunc != nil {
-		_, handled := arrowJSONQueryFunc(h, c, ctx, cancel, convertedSQL, false, 0, start, timestamp, nil, nil, nil)
+		_, handled := arrowJSONQueryFunc(h, c, ctx, cancel, convertedSQL, false, governanceMaxRows, start, timestamp, nil, nil, nil)
 		if handled {
 			// Metrics are recorded inside the async stream callback — not here.
 			// cancel is owned by executeArrowJSONQuery when handled=true.
@@ -4493,9 +4570,9 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 			cancel()
 		}
 		m.IncQueryErrors()
-		if h.queryTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
+		if effectiveTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
 			m.IncQueryTimeouts()
-			h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(sql)).Dur("timeout", h.queryTimeout).Msg("Measurement query timed out")
+			h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(sql)).Dur("timeout", effectiveTimeout).Msg("Measurement query timed out")
 			return c.Status(fiber.StatusGatewayTimeout).JSON(QueryResponse{
 				Success:         false,
 				Error:           "Query timed out",
@@ -4546,7 +4623,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	streamCtx := ctx
 	c.Set("Content-Type", "application/json")
 	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
-		rowCount, streamErr := streamTypedJSON(streamCtx, w, columns, colTypes, rows, 0, nil, start, timestamp)
+		rowCount, streamErr := streamTypedJSON(streamCtx, w, columns, colTypes, rows, governanceMaxRows, nil, start, timestamp)
 		w.Flush()
 
 		rows.Close()

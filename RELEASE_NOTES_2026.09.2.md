@@ -65,6 +65,21 @@ The ingest, API, query, and Iceberg test suites were verified against 0.24.0.
 
 ## Bug fixes
 
+### Every query endpoint now enforces query governance ([#702](https://github.com/Basekick-Labs/arc/issues/702))
+
+Enterprise query governance was enforced only on `POST /api/v1/query`, so
+a token with governance limits could bypass rate limits, quotas, the
+per-query row cap, and the per-token execution timeout through the three
+other user-SQL endpoints: `GET /api/v1/query/:measurement`,
+`POST /api/v1/query/arrow`, and `POST /api/v1/query/estimate` (whose
+`COUNT(*)` wrapper executes the full subquery, so it carries real scan
+cost). All four now share one enforcement path: rejected requests get 429
+(with `Retry-After` for rate limits), the policy's `max_rows_per_query`
+caps streamed rows on the row-returning endpoints (JSON, Arrow IPC, and
+the database/sql fallback), and `max_scan_duration_sec` overrides the
+global `query.timeout` everywhere. RBAC was never affected; this closes a
+limits and accounting gap, not an authorization hole.
+
 ### Periodic peer file replication reconciliation repairs missed FSM callbacks ([#393](https://github.com/Basekick-Labs/arc/issues/393))
 
 Cluster nodes now re-walk the Raft file manifest every five minutes by default
