@@ -1,6 +1,7 @@
 package mqtt
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -118,4 +119,52 @@ func BenchmarkOnMessageStatUpdate(b *testing.B) {
 			s.lastMessageAtNanos.Store(time.Now().UnixNano())
 		}
 	})
+}
+
+type unsubscribeToken struct {
+	err      error
+	finished bool
+	done     chan struct{}
+}
+
+func (t *unsubscribeToken) Wait() bool {
+	return t.finished
+}
+
+func (t *unsubscribeToken) WaitTimeout(time.Duration) bool {
+	return t.finished
+}
+
+func (t *unsubscribeToken) Done() <-chan struct{} {
+	return t.done
+}
+
+func (t *unsubscribeToken) Error() error {
+	return t.err
+}
+
+func TestWaitForUnsubscribe(t *testing.T) {
+	sentinel := errors.New("broker rejected unsubscribe")
+	tests := []struct {
+		name        string
+		token       *unsubscribeToken
+		wantWrapped error
+		wantErr     bool
+	}{
+		{name: "completed", token: &unsubscribeToken{finished: true, done: make(chan struct{})}},
+		{name: "broker error", token: &unsubscribeToken{finished: true, err: sentinel, done: make(chan struct{})}, wantWrapped: sentinel, wantErr: true},
+		{name: "timeout", token: &unsubscribeToken{done: make(chan struct{})}, wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := waitForUnsubscribe("events", test.token)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("waitForUnsubscribe() error = %v, wantErr %v", err, test.wantErr)
+			}
+			if test.wantWrapped != nil && !errors.Is(err, test.wantWrapped) {
+				t.Fatalf("waitForUnsubscribe() error = %v, want wrapped %v", err, test.wantWrapped)
+			}
+		})
+	}
 }

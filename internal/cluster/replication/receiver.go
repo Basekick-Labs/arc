@@ -280,6 +280,12 @@ func (r *Receiver) connect() error {
 		Nonce:             nonce,
 		ClusterName:       r.cfg.ClusterName,
 		Timestamp:         timestamp,
+		// Advertise MsgReplicateEntryBin support (#698). Outside the
+		// HMAC tuple by design — see the field's doc in
+		// protocol/messages.go. An old writer ignores the field and
+		// keeps sending JSON entries, which this receiver still
+		// handles.
+		SupportsBinaryEntries: true,
 		HMAC: security.ComputeReplicateSyncHMAC(
 			r.cfg.SharedSecret, nonce, r.cfg.ReaderID, r.cfg.ClusterName,
 			lastKnownSeq, timestamp,
@@ -427,8 +433,19 @@ func (r *Receiver) receiveLoop() {
 		}
 
 		switch msgType {
-		case MsgReplicateEntry:
-			entry, err := ParseEntry(payload)
+		case MsgReplicateEntry, MsgReplicateEntryBin:
+			// Two framings, one logical message (#698): JSON from
+			// pre-binary writers, binary from writers that honored
+			// our handshake capability. Everything after the parse
+			// — tag validation, cumulative hash, dedup, apply — is
+			// framing-agnostic.
+			var entry *ReplicateEntry
+			var err error
+			if msgType == MsgReplicateEntryBin {
+				entry, err = ParseEntryBinary(payload)
+			} else {
+				entry, err = ParseEntry(payload)
+			}
 			if err != nil {
 				r.totalErrors.Add(1)
 				llog.Error().Err(err).Msg("Failed to parse entry")

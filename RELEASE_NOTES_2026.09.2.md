@@ -53,6 +53,16 @@ literals (e.g. a log-search `LIKE '%INTERVAL 5 MINUTE%'`) and identifiers such a
 `interval2` can never be misread as time bounds; compound quoted intervals like
 `'1 day 12 hours'` remain unpruned (never mis-pruned as their first component).
 
+## Security fixes
+
+### Dependency bump: Apache Thrift 0.23.0 → 0.24.0 ([GHSA-8wv5-x4w7-5gww](https://github.com/advisories/GHSA-8wv5-x4w7-5gww))
+
+`github.com/apache/thrift` is bumped to 0.24.0, which patches a high-severity
+infinite loop in the Go bindings when parsing malformed Thrift input. Thrift is
+an indirect dependency reached through arrow-go's Parquet metadata decoding
+(Parquet footers are Thrift-encoded), so the vulnerable code is in Arc's build.
+The ingest, API, query, and Iceberg test suites were verified against 0.24.0.
+
 ## Bug fixes
 
 ### Periodic peer file replication reconciliation repairs missed FSM callbacks ([#393](https://github.com/Basekick-Labs/arc/issues/393))
@@ -72,6 +82,54 @@ periodic reconciliation. Recheck outcomes are exposed under
 `replication_catchup_status` as `replication_recheck_*` counters.
 
 Contributed by [@bferanmi806-sketch](https://github.com/bferanmi806-sketch) in [#697](https://github.com/Basekick-Labs/arc/pull/697).
+
+### Replication can now carry WAL entries up to the full payload cap ([#698](https://github.com/Basekick-Labs/arc/issues/698))
+
+The replication wire format JSON-encoded every entry, and base64 inflates the
+payload by 4/3 — so a WAL entry above roughly 75MB could never be framed under
+the 100MB message cap even though the WAL stored it happily. The failed entry
+tore down the stream, and the resume hit the same entry again: a deterministic
+stall for that follower. Entries now travel in a binary frame
+(`MsgReplicateEntryBin`) that carries the payload as raw bytes, negotiated per
+connection: readers advertise support in the replication handshake, writers
+fall back to the JSON framing for readers that predate it, and the per-entry
+MAC tags and full-HMAC checkpoints are unchanged by the framing. Mixed-version
+pairs keep working exactly as before, including the old limitation, until both
+sides run this release.
+
+### Wide-row ingest requests no longer silently bypass the WAL ([#677](https://github.com/Basekick-Labs/arc/issues/677))
+
+A single ingest request larger than the WAL's 100MB per-entry payload cap
+(wide rows make this easy to hit well under the 1GB request limit) was
+rejected wholesale by the WAL, so ingest kept reporting healthy while the
+WAL directory held only a 7-byte header file: writes were durable in
+Parquet flushes alone and nothing on the metrics endpoint said so. The WAL
+now splits an oversized payload into multiple entries at msgpack element
+boundaries (row-format requests between records, columnar requests by row
+range), each under the cap and independently replayable with no format
+change. A payload that still cannot be split, a single record or row above
+the cap, keeps the loud rejection, now also counted in the new
+`arc_wal_oversized_payloads_total` metric so a WAL that records nothing
+never looks healthy again.
+
+Contributed by [@atirna](https://github.com/atirna) in [#696](https://github.com/Basekick-Labs/arc/pull/696).
+
+### Expired tier-cache entries are pruned on store
+
+Each tier-cache insertion removes expired entries while holding the cache lock,
+preventing entries for old partitions from accumulating indefinitely. Expiry
+uses the same boundary as the read path and requires no background goroutine.
+
+Contributed by [@mah1104ahm](https://github.com/mah1104ahm) in [#675](https://github.com/Basekick-Labs/arc/pull/675).
+
+### MQTT shutdown waits for unsubscribe acknowledgements
+
+Stop and pause now wait for each unsubscribe token with a bounded timeout and
+always disconnect. The manager persists the stopped or paused status even if
+the broker rejects an unsubscribe or times out, and returns the shutdown error
+after attempting the status update.
+
+Contributed by [@mah1104ahm](https://github.com/mah1104ahm) in [#673](https://github.com/Basekick-Labs/arc/pull/673).
 
 ### S3 query paths now follow calendar days across DST ([#321](https://github.com/Basekick-Labs/arc/issues/321))
 

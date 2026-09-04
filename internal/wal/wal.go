@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Basekick-Labs/msgpack/v6"
+	"github.com/Basekick-Labs/msgpack/v6/msgpcode"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
@@ -34,6 +36,13 @@ const (
 	// aligns with the replication protocol limit (100MB).
 	MaxWALPayloadSize = 100 * 1024 * 1024 // 100MB
 
+	// walChunkTarget is the payload size an oversized payload is chunked down
+	// to (#677). It sits well below MaxWALPayloadSize so a chunk still clears
+	// the single-entry cap after its msgpack container headers, and stays under
+	// the replication protocol's own 100MB message limit once the JSON + base64
+	// envelope (bytes expand 4/3) is accounted for.
+	walChunkTarget = 32 * 1024 * 1024 // 32MB
+
 	// WALEnvelopeMarker is the first byte of an enveloped WAL payload.
 	// Enveloped format: [0x01][2-byte db name length][db name][original msgpack]
 	// Since msgpack maps/arrays always start with bytes >= 0x80, 0x01 is unambiguous.
@@ -54,6 +63,278 @@ func ParseEnvelope(payload []byte, defaultDB string) (database string, msgpackDa
 	return defaultDB, payload
 }
 
+// splitOversizedPayload divides a payload larger than MaxWALPayloadSize into
+// chunks that each fit the cap (#677). It never operates on arbitrary byte
+// ranges: WAL payloads are replayed as whole msgpack values, and a bare byte
+// tail of an array is not one — it decodes as the first value only and
+// silently drops the rest. Chunks are re-emitted as self-contained msgpack
+// values instead:
+//
+//   - a top-level array (the row format Append marshals) is split between
+//     elements; each chunk is a shorter array holding a contiguous run of
+//     the same records
+//   - a top-level map whose "columns" value is a map of arrays (the columnar
+//     format the zero-copy path stores) is split by row range: every other
+//     key carries over unchanged and each column array is sliced to the same
+//     [lo, hi) rows
+//
+// A payload whose top-level shape cannot be split without inventing a new
+// record format (including a map without "columns", or a single element
+// larger than the cap) is returned as the sole chunk for the caller to
+// reject. A crash between chunk writes replays the completed prefix, which is
+// safe because rows are independent.
+func splitOversizedPayload(payload []byte) ([][]byte, error) {
+	reader := bytes.NewReader(payload)
+	dec := msgpack.NewDecoder(reader)
+	code, err := dec.PeekCode()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read msgpack header: %w", err)
+	}
+
+	if msgpcode.IsFixedArray(code) || code == msgpcode.Array16 || code == msgpcode.Array32 {
+		n, err := dec.DecodeArrayLen()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read array header: %w", err)
+		}
+		var chunks [][]byte
+		var elem bytes.Buffer
+		count := 0
+		flush := func() error {
+			if count == 0 {
+				return nil
+			}
+			var out bytes.Buffer
+			enc := msgpack.NewEncoder(&out)
+			if err := enc.EncodeArrayLen(count); err != nil {
+				return err
+			}
+			out.Write(elem.Bytes())
+			chunks = append(chunks, out.Bytes())
+			elem.Reset()
+			count = 0
+			return nil
+		}
+		for i := 0; i < n; i++ {
+			raw, err := dec.DecodeRaw()
+			if err != nil {
+				return nil, fmt.Errorf("failed to read element %d: %w", i, err)
+			}
+			elem.Write(raw)
+			count++
+			if elem.Len() >= walChunkTarget {
+				if err := flush(); err != nil {
+					return nil, err
+				}
+			}
+		}
+		if err := flush(); err != nil {
+			return nil, err
+		}
+		if len(chunks) == 0 {
+			// An empty array cannot be oversized; return it unchanged.
+			chunks = append(chunks, payload)
+		}
+		return chunks, nil
+	}
+
+	if msgpcode.IsFixedMap(code) || code == msgpcode.Map16 || code == msgpcode.Map32 {
+		n, err := dec.DecodeMapLen()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read map header: %w", err)
+		}
+		fields := make([]rawField, 0, n)
+		colIdx := -1
+		for i := 0; i < n; i++ {
+			key := rawSpan{start: len(payload) - reader.Len()}
+			if err := dec.Skip(); err != nil {
+				return nil, fmt.Errorf("failed to read map key: %w", err)
+			}
+			key.end = len(payload) - reader.Len()
+			value := rawSpan{start: len(payload) - reader.Len()}
+			if err := dec.Skip(); err != nil {
+				return nil, fmt.Errorf("failed to read map value: %w", err)
+			}
+			value.end = len(payload) - reader.Len()
+			fields = append(fields, rawField{key: key, value: value})
+			var name string
+			if err := msgpack.Unmarshal(payload[key.start:key.end], &name); err == nil && name == "columns" {
+				colIdx = i
+			}
+		}
+		if colIdx < 0 {
+			return [][]byte{payload}, nil
+		}
+
+		columns, rows, err := decodeColumnarColumns(payload, fields[colIdx].value)
+		if err != nil {
+			return nil, err
+		}
+		if len(columns) == 0 {
+			return [][]byte{payload}, nil
+		}
+		if rows == 0 {
+			return [][]byte{payload}, nil
+		}
+
+		// Slice columns by row range, sized so a chunk's columns stay near
+		// walChunkTarget. Sizes vary per column; the target only picks the
+		// range length, and the hard cap check on the final entry rejects a
+		// range that still does not fit.
+		bytesPerRow := fields[colIdx].value.end - fields[colIdx].value.start
+		bytesPerRow /= rows
+		if bytesPerRow < 1 {
+			bytesPerRow = 1
+		}
+		rowsPerChunk := walChunkTarget / bytesPerRow
+		if rowsPerChunk < 1 {
+			rowsPerChunk = 1
+		}
+		if err := recordColumnOffsets(payload, columns, rows, rowsPerChunk); err != nil {
+			return nil, err
+		}
+
+		var chunks [][]byte
+		for lo := 0; lo < rows; lo += rowsPerChunk {
+			hi := lo + rowsPerChunk
+			if hi > rows {
+				hi = rows
+			}
+			out, err := encodeColumnarRange(payload, fields, colIdx, columns, lo/rowsPerChunk, hi-lo)
+			if err != nil {
+				return nil, err
+			}
+			chunks = append(chunks, out)
+		}
+		return chunks, nil
+	}
+
+	return [][]byte{payload}, nil
+}
+
+type rawSpan struct {
+	start int
+	end   int
+}
+
+type rawField struct {
+	key   rawSpan
+	value rawSpan
+}
+
+type rawColumn struct {
+	name    string
+	key     rawSpan
+	values  rawSpan
+	offsets []int
+}
+
+func decodeColumnarColumns(payload []byte, raw rawSpan) ([]rawColumn, int, error) {
+	reader := bytes.NewReader(payload[raw.start:raw.end])
+	dec := msgpack.NewDecoder(reader)
+	rawLen := raw.end - raw.start
+	n, err := dec.DecodeMapLen()
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to read columns map: %w", err)
+	}
+	columns := make([]rawColumn, 0, n)
+	rows := -1
+	for i := 0; i < n; i++ {
+		key := rawSpan{start: raw.start + rawLen - reader.Len()}
+		if err := dec.Skip(); err != nil {
+			return nil, 0, fmt.Errorf("failed to read column key: %w", err)
+		}
+		key.end = raw.start + rawLen - reader.Len()
+		var name string
+		if err := msgpack.Unmarshal(payload[key.start:key.end], &name); err != nil {
+			return nil, 0, fmt.Errorf("failed to decode column name: %w", err)
+		}
+		values := rawSpan{start: raw.start + rawLen - reader.Len()}
+		valueLen, err := dec.DecodeArrayLen()
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to read column %q array: %w", name, err)
+		}
+		if valueLen < 0 {
+			return nil, 0, fmt.Errorf("column %q is nil, want an array", name)
+		}
+		for j := 0; j < valueLen; j++ {
+			if err := dec.Skip(); err != nil {
+				return nil, 0, fmt.Errorf("failed to read column %q value %d: %w", name, j, err)
+			}
+		}
+		values.end = raw.start + rawLen - reader.Len()
+		if rows == -1 {
+			rows = valueLen
+		} else if valueLen != rows {
+			return nil, 0, fmt.Errorf("column %q has %d values, want %d", name, valueLen, rows)
+		}
+		columns = append(columns, rawColumn{name: name, key: key, values: values})
+	}
+	return columns, rows, nil
+}
+
+func recordColumnOffsets(payload []byte, columns []rawColumn, rows, rowsPerChunk int) error {
+	for i := range columns {
+		column := &columns[i]
+		reader := bytes.NewReader(payload[column.values.start:column.values.end])
+		dec := msgpack.NewDecoder(reader)
+		valueLen, err := dec.DecodeArrayLen()
+		if err != nil {
+			return fmt.Errorf("failed to reread column %q array: %w", column.name, err)
+		}
+		if valueLen != rows {
+			return fmt.Errorf("column %q has %d values, want %d", column.name, valueLen, rows)
+		}
+		column.offsets = make([]int, 0, (rows+rowsPerChunk-1)/rowsPerChunk+1)
+		column.offsets = append(column.offsets, column.values.start+len(payload[column.values.start:column.values.end])-reader.Len())
+		for lo := 0; lo < rows; lo += rowsPerChunk {
+			hi := lo + rowsPerChunk
+			if hi > rows {
+				hi = rows
+			}
+			for row := lo; row < hi; row++ {
+				if err := dec.Skip(); err != nil {
+					return fmt.Errorf("failed to read column %q value %d: %w", column.name, row, err)
+				}
+			}
+			column.offsets = append(column.offsets, column.values.start+len(payload[column.values.start:column.values.end])-reader.Len())
+		}
+	}
+	return nil
+}
+
+// encodeColumnarRange re-emits the columnar record with every column sliced
+// to rows [lo, hi). Keys other than "columns" (e.g. "m") carry over unchanged
+// through their raw bytes.
+func encodeColumnarRange(payload []byte, fields []rawField, colIdx int, columns []rawColumn, chunk, rowCount int) ([]byte, error) {
+	var cols bytes.Buffer
+	cenc := msgpack.NewEncoder(&cols)
+	if err := cenc.EncodeMapLen(len(columns)); err != nil {
+		return nil, err
+	}
+	for _, column := range columns {
+		cols.Write(payload[column.key.start:column.key.end])
+		if err := cenc.EncodeArrayLen(rowCount); err != nil {
+			return nil, err
+		}
+		cols.Write(payload[column.offsets[chunk]:column.offsets[chunk+1]])
+	}
+
+	var out bytes.Buffer
+	enc := msgpack.NewEncoder(&out)
+	if err := enc.EncodeMapLen(len(fields)); err != nil {
+		return nil, err
+	}
+	for i := range fields {
+		out.Write(payload[fields[i].key.start:fields[i].key.end])
+		if i == colIdx {
+			out.Write(cols.Bytes())
+		} else {
+			out.Write(payload[fields[i].value.start:fields[i].value.end])
+		}
+	}
+	return out.Bytes(), nil
+}
+
 // SyncMode defines how WAL syncs to disk
 type SyncMode string
 
@@ -65,6 +346,11 @@ const (
 
 // ErrPayloadTooLarge indicates the payload exceeds MaxWALPayloadSize.
 var ErrPayloadTooLarge = errors.New("WAL payload exceeds maximum allowed size")
+
+func oversizedPayloadError(err error) error {
+	metrics.Get().IncWALOversizedPayloads()
+	return fmt.Errorf("%w: %v", ErrPayloadTooLarge, err)
+}
 
 // ErrWALDropped is returned by Append/AppendRaw/AppendRawWithMeta when the
 // async entry channel is full and the entry is dropped. Previous behavior
@@ -384,15 +670,44 @@ func (w *Writer) Append(records []map[string]interface{}) error {
 //
 // Unlike calling AppendRaw with a pre-built envelope, this method builds the
 // WAL entry in a single allocation to avoid copying the payload twice.
+//
+// A payload whose logical entry exceeds MaxWALPayloadSize is split into
+// multiple entries, each carrying the same database envelope (#677) — a wide
+// ingest request previously landed here as a wholesale ErrPayloadTooLarge
+// rejection, so the WAL silently recorded nothing while ingest reported
+// healthy.
 func (w *Writer) AppendRawWithMeta(database string, payload []byte) error {
 	dbBytes := []byte(database)
 	envelopeHeaderLen := 1 + 2 + len(dbBytes) // marker + dbLen + dbName
 	totalPayloadLen := envelopeHeaderLen + len(payload)
 
-	if totalPayloadLen > MaxWALPayloadSize {
-		return fmt.Errorf("%w: size %d exceeds limit %d", ErrPayloadTooLarge, totalPayloadLen, MaxWALPayloadSize)
+	if totalPayloadLen <= MaxWALPayloadSize {
+		return w.appendEnvelopedEntry(dbBytes, envelopeHeaderLen, payload, totalPayloadLen)
 	}
 
+	// Oversized: split the msgpack payload into size-valid chunks and write
+	// each as its own enveloped entry. A chunk that still exceeds the cap (a
+	// single record or row larger than the limit) keeps the loud rejection.
+	chunks, err := splitOversizedPayload(payload)
+	if err != nil {
+		return oversizedPayloadError(err)
+	}
+	for _, chunk := range chunks {
+		if chunkLen := envelopeHeaderLen + len(chunk); chunkLen > MaxWALPayloadSize {
+			return oversizedPayloadError(fmt.Errorf("size %d exceeds limit %d", chunkLen, MaxWALPayloadSize))
+		}
+	}
+	for _, chunk := range chunks {
+		if err := w.appendEnvelopedEntry(dbBytes, envelopeHeaderLen, chunk, envelopeHeaderLen+len(chunk)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// appendEnvelopedEntry is AppendRawWithMeta's single-entry fast path: CRC,
+// replication hook, and entry assembly for one size-validated payload.
+func (w *Writer) appendEnvelopedEntry(dbBytes []byte, envelopeHeaderLen int, payload []byte, totalPayloadLen int) error {
 	// Compute CRC32 over the logical payload (envelope header + msgpack) without copying
 	crc := crc32.NewIEEE()
 	var envHeader [1 + 2 + 255]byte // envelope header (db name max 255 bytes)
@@ -455,11 +770,34 @@ func (w *Writer) tryEnqueue(entryData []byte) error {
 // AppendRaw writes raw (already serialized) msgpack bytes to the WAL asynchronously
 // This is a zero-copy optimization - use this when you already have msgpack bytes
 func (w *Writer) AppendRaw(payload []byte) error {
-	// Validate payload size to prevent integer overflow during allocation (CWE-190)
+	// Validate payload size to prevent integer overflow during allocation (CWE-190).
+	// An oversized payload is split into size-valid entries (#677) instead of
+	// being rejected wholesale; a payload that cannot be split (a single
+	// element larger than the limit) keeps the loud rejection.
 	if len(payload) > MaxWALPayloadSize {
-		return fmt.Errorf("%w: size %d exceeds limit %d", ErrPayloadTooLarge, len(payload), MaxWALPayloadSize)
+		chunks, err := splitOversizedPayload(payload)
+		if err != nil {
+			return oversizedPayloadError(err)
+		}
+		for _, chunk := range chunks {
+			if len(chunk) > MaxWALPayloadSize {
+				return oversizedPayloadError(fmt.Errorf("size %d exceeds limit %d", len(chunk), MaxWALPayloadSize))
+			}
+		}
+		for _, chunk := range chunks {
+			if err := w.appendRawEntry(chunk); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 
+	return w.appendRawEntry(payload)
+}
+
+// appendRawEntry is AppendRaw's single-entry path: checksum, replication
+// hook, and entry assembly for one size-validated payload.
+func (w *Writer) appendRawEntry(payload []byte) error {
 	// Calculate checksum (CRC32)
 	checksum := crc32.ChecksumIEEE(payload)
 
