@@ -124,4 +124,4 @@ I have read the CLA Document and I hereby sign the CLA
 Your signature is recorded against Your GitHub username, and You will not be
 asked again for subsequent pull requests unless this Agreement changes.
 
-Questions about this Agreement: **ignacio@vandroogenbroeck.net**
+Questions about this Agreement: **support@basekick.net**
