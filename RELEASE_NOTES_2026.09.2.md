@@ -73,7 +73,7 @@ The default 10Gi PVC is documented as development-scale; object-storage
 deployments should size it for peak ingest, WAL flush lag, cache, and recovery
 headroom.
 
-Contributed by [@atirna](https://github.com/atirna) in [#676](https://github.com/Basekick-Labs/arc/issues/676).
+Contributed by [@atirna](https://github.com/atirna) in [#700](https://github.com/Basekick-Labs/arc/pull/700).
 
 ### Periodic peer file replication reconciliation repairs missed FSM callbacks ([#393](https://github.com/Basekick-Labs/arc/issues/393))
 
