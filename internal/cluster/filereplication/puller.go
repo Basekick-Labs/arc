@@ -25,6 +25,8 @@ import (
 	"github.com/rs/zerolog"
 )
 
+const defaultReconciliationInterval = 5 * time.Minute
+
 // Fetcher is the contract the puller uses to download a single file from a
 // peer. It's an interface rather than a concrete type so the puller can be
 // unit-tested with a fake that returns deterministic bytes/errors without
@@ -62,6 +64,29 @@ type Fetcher interface {
 // known peers" and is treated as a transient failure the puller can retry.
 type PeerResolver interface {
 	ResolvePeers(originNodeID, path string) []string
+}
+
+type enqueueSource uint8
+
+const (
+	enqueueSourceReactive enqueueSource = iota
+	enqueueSourceCatchUp
+	enqueueSourceReconciliation
+)
+
+type enqueueResult uint8
+
+const (
+	enqueueResultInvalid enqueueResult = iota
+	enqueueResultEnqueued
+	enqueueResultSkippedSelf
+	enqueueResultSkippedDuplicate
+	enqueueResultDropped
+)
+
+type pullRequest struct {
+	entry  *raft.FileEntry
+	source enqueueSource
 }
 
 // Config bundles the puller's dependencies and tunables.
@@ -106,6 +131,14 @@ type Config struct {
 	// Default: 0.8 (sleep when > 80% full).
 	CatchUpQueueHighWater float64
 
+	// ReconciliationInterval controls the delay between periodic manifest
+	// rechecks. Default: 5 minutes.
+	ReconciliationInterval time.Duration
+
+	// ReconciliationGate is evaluated before and during each periodic manifest
+	// walk. A nil gate allows reconciliation unconditionally.
+	ReconciliationGate func() bool
+
 	// Logger receives structured log output.
 	Logger zerolog.Logger
 }
@@ -114,12 +147,13 @@ type Config struct {
 // the dependencies (Backend, Fetcher, PeerResolver, SelfNodeID, Logger).
 func DefaultConfig() Config {
 	return Config{
-		Workers:               4,
-		QueueSize:             1024,
-		RetryMaxAttempts:      3,
-		RetryInitialBackoff:   500 * time.Millisecond,
-		FetchTimeout:          60 * time.Second,
-		CatchUpQueueHighWater: 0.8,
+		Workers:                4,
+		QueueSize:              1024,
+		RetryMaxAttempts:       3,
+		RetryInitialBackoff:    500 * time.Millisecond,
+		FetchTimeout:           60 * time.Second,
+		CatchUpQueueHighWater:  0.8,
+		ReconciliationInterval: defaultReconciliationInterval,
 	}
 }
 
@@ -127,7 +161,7 @@ func DefaultConfig() Config {
 // callbacks and pulls missing files from their origin peers.
 type Puller struct {
 	cfg    Config
-	queue  chan *raft.FileEntry
+	queue  chan *pullRequest
 	logger zerolog.Logger
 
 	// Lifecycle
@@ -137,9 +171,17 @@ type Puller struct {
 	mu      sync.Mutex
 	started bool
 
+	// reconciliationMu serializes manifest walks. The startup catch-up and
+	// periodic reconciliation share the same walker, so a periodic pass can
+	// never overlap another pass even if it is triggered concurrently.
+	reconciliationMu      sync.Mutex
+	reconciliationStarted bool
+	catchupFinished       chan struct{}
+
 	// inflight tracks paths currently enqueued or being processed. Enqueue
-	// consults it to dedup reactive callbacks against the Phase 3 catch-up
-	// walker (both can enqueue the same path during a race), and workers
+	// consults it to dedup reactive callbacks against manifest walkers (both
+	// startup and periodic passes can enqueue the same path during a race).
+	// Workers
 	// remove the entry via defer in processEntry so the set stays bounded
 	// even on panic.
 	//
@@ -147,7 +189,9 @@ type Puller struct {
 	// (FullyCaughtUp, Stats during a 503 storm) don't take inflightMu and
 	// contend with the workers. The map is the source of truth for dedup;
 	// the counter is updated under inflightMu in the same critical section
-	// so they cannot diverge.
+	// so they cannot diverge. The same lock protects catch-up path tags so a
+	// worker finishing while the startup walker marks a path cannot lose the
+	// catch-up failure signal.
 	inflightMu    sync.Mutex
 	inflight      map[string]struct{}
 	inflightCount atomic.Int64
@@ -190,13 +234,10 @@ type Puller struct {
 	// catchupFailedPaths holds catch-up paths whose pull permanently gave up
 	// after retries. catchupDroppedPaths holds catch-up paths the walker
 	// could not enqueue because the queue was full. Both are tracked so a
-	// later successful pull (reactive FSM callback after the underlying
-	// issue clears, or a subsequent catch-up scan) can decrement the
-	// corresponding scoped counter and let the gate self-heal without a
-	// process restart. All three sets share catchupPathsMu — they're all
-	// catch-up bookkeeping and the lock is only ever held for tiny critical
-	// sections.
-	catchupPathsMu      sync.Mutex
+	// later successful pull after the underlying issue clears can decrement the
+	// corresponding scoped counter and let the gate self-heal without a process
+	// restart. All three sets share inflightMu with the in-flight map,
+	// which keeps finish/tag bookkeeping atomic.
 	catchupPaths        map[string]struct{}
 	catchupFailedPaths  map[string]struct{}
 	catchupDroppedPaths map[string]struct{}
@@ -205,10 +246,24 @@ type Puller struct {
 	// catchupFailed / catchupDropped count failures and drops scoped to the
 	// catch-up batch only. FullyCaughtUp uses these (not the cumulative
 	// totalFailed / totalDropped) so transient steady-state failures don't
-	// keep the gate red forever. Both self-heal when a later pull succeeds
-	// for the affected path — see clearCatchUpFailure / clearCatchUpDrop.
+	// keep the gate red forever. Both self-heal when a later startup, reactive,
+	// or reconciliation pull succeeds for the affected path — see
+	// clearCatchUpFailure / clearCatchUpDrop.
 	catchupFailed  atomic.Int64
 	catchupDropped atomic.Int64
+
+	// Periodic reconciliation metrics. These are intentionally separate from
+	// the startup catch-up counters because a recheck must never reopen or
+	// otherwise change the #392 readiness scope.
+	recheckStarted       atomic.Int64
+	recheckCompleted     atomic.Int64
+	recheckAborted       atomic.Int64
+	recheckGated         atomic.Int64
+	recheckBusy          atomic.Int64
+	recheckEntriesWalked atomic.Int64
+	recheckEnqueued      atomic.Int64
+	recheckSkipped       atomic.Int64
+	recheckDropped       atomic.Int64
 }
 
 // New constructs a Puller. Does not start background workers — call Start.
@@ -248,14 +303,18 @@ func New(cfg Config) (*Puller, error) {
 	if cfg.CatchUpQueueHighWater <= 0 || cfg.CatchUpQueueHighWater >= 1 {
 		cfg.CatchUpQueueHighWater = defaults.CatchUpQueueHighWater
 	}
+	if cfg.ReconciliationInterval <= 0 {
+		cfg.ReconciliationInterval = defaults.ReconciliationInterval
+	}
 
 	return &Puller{
 		cfg:                 cfg,
-		queue:               make(chan *raft.FileEntry, cfg.QueueSize),
+		queue:               make(chan *pullRequest, cfg.QueueSize),
 		inflight:            make(map[string]struct{}),
 		catchupPaths:        make(map[string]struct{}),
 		catchupFailedPaths:  make(map[string]struct{}),
 		catchupDroppedPaths: make(map[string]struct{}),
+		catchupFinished:     make(chan struct{}),
 		logger:              cfg.Logger.With().Str("component", "file-puller").Logger(),
 	}, nil
 }
@@ -276,26 +335,56 @@ func (p *Puller) inflightAdd(path string) bool {
 	return true
 }
 
-// inflightRemove clears a path from the in-flight set. Safe to call on a
-// path that's not in the set (no-op). Called from processEntry via defer so
-// it runs on panic unwind too. Updates inflightCount only when an entry is
-// actually deleted to keep the counter exact. Also clears the catch-up tag
-// if the path was specifically enqueued by RunCatchUp, so FullyCaughtUp can
-// distinguish "cold-start batch still draining" from "steady-state ingest."
+// inflightRemove clears a path from the in-flight set and any catch-up tag.
+// Safe to call on a path that's not in either set (no-op). Updates
+// inflightCount only when an entry is actually deleted to keep the counter
+// exact.
 func (p *Puller) inflightRemove(path string) {
 	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
+	p.removeInflightLocked(path)
+}
+
+func (p *Puller) removeInflightLocked(path string) {
+	p.removeInflightOnlyLocked(path)
+	p.removeCatchUpTagLocked(path)
+}
+
+func (p *Puller) removeInflightOnlyLocked(path string) {
 	if _, ok := p.inflight[path]; ok {
 		delete(p.inflight, path)
 		p.inflightCount.Add(-1)
 	}
-	p.inflightMu.Unlock()
+}
 
-	p.catchupPathsMu.Lock()
+func (p *Puller) removeCatchUpTagLocked(path string) {
 	if _, ok := p.catchupPaths[path]; ok {
 		delete(p.catchupPaths, path)
 		p.catchupInflight.Add(-1)
 	}
-	p.catchupPathsMu.Unlock()
+}
+
+// finishEntry records a worker outcome and removes its in-flight state while
+// holding the same lock used by markCatchUp. This closes the race where a
+// startup walker adds a catch-up tag after a worker checks the tag but before
+// the worker removes its in-flight entry. Reconciliation failures stay outside
+// startup bookkeeping, while any successful pull can heal a prior path failure
+// or drop.
+func (p *Puller) finishEntry(path string, source enqueueSource, failed, succeeded bool) {
+	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
+
+	if failed && source != enqueueSourceReconciliation && p.isCatchUpPathLocked(path) {
+		p.recordCatchUpFailureLocked(path)
+	}
+	if succeeded {
+		p.clearCatchUpFailureLocked(path)
+		p.clearCatchUpDropLocked(path)
+	}
+	if source != enqueueSourceReconciliation {
+		p.removeCatchUpTagLocked(path)
+	}
+	p.removeInflightOnlyLocked(path)
 }
 
 // markCatchUp records that a path is being enqueued by the catch-up walker
@@ -310,8 +399,8 @@ func (p *Puller) inflightRemove(path string) {
 // (idempotent re-mark). RunCatchUp uses the return value to compensate
 // the increment if Enqueue ends up dropping the entry.
 func (p *Puller) markCatchUp(path string) bool {
-	p.catchupPathsMu.Lock()
-	defer p.catchupPathsMu.Unlock()
+	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
 	if _, ok := p.catchupPaths[path]; ok {
 		return false
 	}
@@ -325,8 +414,8 @@ func (p *Puller) markCatchUp(path string) bool {
 // pre-marked: with no inflight slot taken, no future inflightRemove will
 // run for this path, so the tag would otherwise leak.
 func (p *Puller) unmarkCatchUp(path string) {
-	p.catchupPathsMu.Lock()
-	defer p.catchupPathsMu.Unlock()
+	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
 	if _, ok := p.catchupPaths[path]; !ok {
 		return
 	}
@@ -339,8 +428,12 @@ func (p *Puller) unmarkCatchUp(path string) {
 // should bump catchupFailed (and therefore keep the query gate red until
 // a successful retry resolves the missing file).
 func (p *Puller) isCatchUpPath(path string) bool {
-	p.catchupPathsMu.Lock()
-	defer p.catchupPathsMu.Unlock()
+	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
+	return p.isCatchUpPathLocked(path)
+}
+
+func (p *Puller) isCatchUpPathLocked(path string) bool {
 	_, ok := p.catchupPaths[path]
 	return ok
 }
@@ -352,8 +445,12 @@ func (p *Puller) isCatchUpPath(path string) bool {
 // re-failure) does not double-count, so the gate's self-heal accounting
 // stays correct.
 func (p *Puller) recordCatchUpFailure(path string) {
-	p.catchupPathsMu.Lock()
-	defer p.catchupPathsMu.Unlock()
+	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
+	p.recordCatchUpFailureLocked(path)
+}
+
+func (p *Puller) recordCatchUpFailureLocked(path string) {
 	if _, ok := p.catchupFailedPaths[path]; ok {
 		return
 	}
@@ -362,13 +459,16 @@ func (p *Puller) recordCatchUpFailure(path string) {
 }
 
 // clearCatchUpFailure decrements the catch-up failure counter if the given
-// path was previously recorded as failed. Called from processEntry's
-// success path so a reactive FSM callback (or any later successful pull)
-// can heal the gate without a process restart. No-op if the path was not
-// previously failed.
+// path was previously recorded as failed. Called from processEntry's success
+// path so any successful pull, including reconciliation, can heal the gate
+// without a process restart. No-op if the path was not previously failed.
 func (p *Puller) clearCatchUpFailure(path string) {
-	p.catchupPathsMu.Lock()
-	defer p.catchupPathsMu.Unlock()
+	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
+	p.clearCatchUpFailureLocked(path)
+}
+
+func (p *Puller) clearCatchUpFailureLocked(path string) {
 	if _, ok := p.catchupFailedPaths[path]; !ok {
 		return
 	}
@@ -380,10 +480,14 @@ func (p *Puller) clearCatchUpFailure(path string) {
 // the catch-up drop counter. Called from RunCatchUp when the queue is full
 // and the walker can't enqueue an entry — there's no inflight slot to
 // later decrement, so we track the path here and rely on a reactive FSM
-// callback (or subsequent catch-up scan) to eventually pull it. Idempotent.
+// callback to eventually pull it. Idempotent.
 func (p *Puller) recordCatchUpDrop(path string) {
-	p.catchupPathsMu.Lock()
-	defer p.catchupPathsMu.Unlock()
+	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
+	p.recordCatchUpDropLocked(path)
+}
+
+func (p *Puller) recordCatchUpDropLocked(path string) {
 	if _, ok := p.catchupDroppedPaths[path]; ok {
 		return
 	}
@@ -391,14 +495,17 @@ func (p *Puller) recordCatchUpDrop(path string) {
 	p.catchupDropped.Add(1)
 }
 
-// clearCatchUpDrop decrements the catch-up drop counter if the given path
-// was previously recorded as dropped. Called from processEntry's success
-// path so a reactive FSM callback succeeding for a previously-dropped
-// path can heal the gate without a process restart. No-op if the path
-// was not previously dropped.
+// clearCatchUpDrop decrements the catch-up drop counter if the given path was
+// previously recorded as dropped. Called from processEntry's success path so
+// any successful pull, including reconciliation, can heal the gate without a
+// process restart. No-op if the path was not previously dropped.
 func (p *Puller) clearCatchUpDrop(path string) {
-	p.catchupPathsMu.Lock()
-	defer p.catchupPathsMu.Unlock()
+	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
+	p.clearCatchUpDropLocked(path)
+}
+
+func (p *Puller) clearCatchUpDropLocked(path string) {
 	if _, ok := p.catchupDroppedPaths[path]; !ok {
 		return
 	}
@@ -426,9 +533,69 @@ func (p *Puller) Start(parentCtx context.Context) {
 		Msg("File puller started")
 }
 
+func (p *Puller) reconciliationAllowed() bool {
+	return p.cfg.ReconciliationGate == nil || p.cfg.ReconciliationGate()
+}
+
+// StartPeriodicReconciliation starts the repeatable manifest reconciliation
+// loop. The loop waits for the one-shot startup catch-up attempt to finish,
+// then runs once per interval. It is owned by the puller so Stop waits for a
+// pass that is already walking the manifest before returning.
+func (p *Puller) StartPeriodicReconciliation(fetch func(cursor string, limit int) ([]*raft.FileEntry, string, error)) {
+	p.startPeriodicReconciliation(fetch, p.cfg.ReconciliationInterval)
+}
+
+// startPeriodicReconciliation is split out so tests can use a short interval
+// without adding a public configuration surface for a fixed lifecycle timer.
+func (p *Puller) startPeriodicReconciliation(fetch func(cursor string, limit int) ([]*raft.FileEntry, string, error), interval time.Duration) {
+	p.mu.Lock()
+	if !p.started || p.reconciliationStarted {
+		p.mu.Unlock()
+		return
+	}
+	p.reconciliationStarted = true
+	ctx := p.ctx
+	p.wg.Add(1)
+	p.mu.Unlock()
+
+	go func() {
+		defer p.wg.Done()
+		select {
+		case <-p.catchupFinished:
+		case <-ctx.Done():
+			return
+		}
+
+		if interval <= 0 {
+			interval = defaultReconciliationInterval
+		}
+		timer := time.NewTimer(interval)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				if !p.reconciliationAllowed() {
+					p.recheckGated.Add(1)
+					p.logger.Info().
+						Str("replication_recheck_status", "gated").
+						Msg("Periodic file reconciliation gated")
+				} else if !p.RunReconciliation(ctx, fetch) {
+					p.logger.Debug().Msg("File puller reconciliation already running, skipping periodic pass")
+				}
+				if ctx.Err() != nil {
+					return
+				}
+				timer.Reset(interval)
+			}
+		}
+	}()
+}
+
 // Stop signals all workers to exit and waits for them to finish. In-flight
 // pulls are cancelled via the shared context. Pending queue entries are
-// dropped (Phase 3 catch-up or a later FSM callback will re-discover them).
+// dropped (a later manifest pass or FSM callback will re-discover them).
 func (p *Puller) Stop() {
 	p.mu.Lock()
 	if !p.started {
@@ -458,29 +625,40 @@ func (p *Puller) Stop() {
 // is also safe to call from the Phase 3 catch-up walker concurrently with
 // reactive callbacks — the inflight set dedups cross-path races.
 func (p *Puller) Enqueue(entry *raft.FileEntry) {
+	p.enqueue(entry, enqueueSourceReactive)
+}
+
+func (p *Puller) enqueue(entry *raft.FileEntry, source enqueueSource) enqueueResult {
 	if entry == nil {
-		return
+		return enqueueResultInvalid
 	}
 	// Fast-path: if origin is self there's nothing to pull.
 	if entry.OriginNodeID == p.cfg.SelfNodeID {
 		p.totalSkippedSelf.Add(1)
-		return
+		return enqueueResultSkippedSelf
 	}
 	// Dedup: if the path is already enqueued or being processed, don't add
 	// it again. The inflight slot is released by processEntry via defer.
 	if !p.inflightAdd(entry.Path) {
 		p.totalSkippedDup.Add(1)
-		return
+		return enqueueResultSkippedDuplicate
 	}
 	// Copy so the caller can't mutate the entry out from under the worker.
 	entryCopy := *entry
 	select {
-	case p.queue <- &entryCopy:
+	case p.queue <- &pullRequest{entry: &entryCopy, source: source}:
 		p.totalEnqueued.Add(1)
+		return enqueueResultEnqueued
 	default:
 		// Queue full — release the inflight slot so a future retry can
-		// re-enqueue this path, and count the drop.
-		p.inflightRemove(entry.Path)
+		// re-enqueue this path, and count the drop. A periodic request must
+		// not clear startup catch-up tags while releasing its own slot.
+		p.inflightMu.Lock()
+		p.removeInflightOnlyLocked(entry.Path)
+		if source != enqueueSourceReconciliation {
+			p.removeCatchUpTagLocked(entry.Path)
+		}
+		p.inflightMu.Unlock()
 		dropped := p.totalDropped.Add(1)
 		// Power-of-2 rate limiting, same pattern as CoordinatorFileRegistrar.
 		if dropped&(dropped-1) == 0 {
@@ -489,6 +667,7 @@ func (p *Puller) Enqueue(entry *raft.FileEntry) {
 				Int64("total_dropped", dropped).
 				Msg("File puller queue full, dropping entry (will be recovered by catch-up scanner)")
 		}
+		return enqueueResultDropped
 	}
 }
 
@@ -498,27 +677,36 @@ func (p *Puller) Enqueue(entry *raft.FileEntry) {
 // inflightCount, queue depth from len() on the buffered channel.
 func (p *Puller) Stats() map[string]int64 {
 	return map[string]int64{
-		"enqueued":               p.totalEnqueued.Load(),
-		"skipped_self":           p.totalSkippedSelf.Load(),
-		"skipped_local":          p.totalSkippedLocal.Load(),
-		"skipped_dup":            p.totalSkippedDup.Load(),
-		"pulled":                 p.totalPulled.Load(),
-		"failed":                 p.totalFailed.Load(),
-		"dropped":                p.totalDropped.Load(),
-		"checksum_mismatch":      p.totalChecksumMismatch.Load(),
-		"peer_lookup_failure":    p.totalPeerLookupFailure.Load(),
-		"bad_offset_server":      p.totalBadOffsetServer.Load(),
-		"bad_offset_backend":     p.totalBadOffsetBackend.Load(),
-		"queue_depth":            int64(len(p.queue)),
-		"inflight_count":         p.inflightCount.Load(),
-		"catchup_started_at":     p.catchupStartedAt.Load(),
-		"catchup_completed_at":   p.catchupCompletedAt.Load(),
-		"catchup_entries_walked": p.catchupEntriesWalked.Load(),
-		"catchup_enqueued":       p.catchupEnqueued.Load(),
-		"catchup_skipped_local":  p.catchupSkippedLocal.Load(),
-		"catchup_inflight":       p.catchupInflight.Load(),
-		"catchup_failed":         p.catchupFailed.Load(),
-		"catchup_dropped":        p.catchupDropped.Load(),
+		"enqueued":                           p.totalEnqueued.Load(),
+		"skipped_self":                       p.totalSkippedSelf.Load(),
+		"skipped_local":                      p.totalSkippedLocal.Load(),
+		"skipped_dup":                        p.totalSkippedDup.Load(),
+		"pulled":                             p.totalPulled.Load(),
+		"failed":                             p.totalFailed.Load(),
+		"dropped":                            p.totalDropped.Load(),
+		"checksum_mismatch":                  p.totalChecksumMismatch.Load(),
+		"peer_lookup_failure":                p.totalPeerLookupFailure.Load(),
+		"bad_offset_server":                  p.totalBadOffsetServer.Load(),
+		"bad_offset_backend":                 p.totalBadOffsetBackend.Load(),
+		"queue_depth":                        int64(len(p.queue)),
+		"inflight_count":                     p.inflightCount.Load(),
+		"catchup_started_at":                 p.catchupStartedAt.Load(),
+		"catchup_completed_at":               p.catchupCompletedAt.Load(),
+		"catchup_entries_walked":             p.catchupEntriesWalked.Load(),
+		"catchup_enqueued":                   p.catchupEnqueued.Load(),
+		"catchup_skipped_local":              p.catchupSkippedLocal.Load(),
+		"catchup_inflight":                   p.catchupInflight.Load(),
+		"catchup_failed":                     p.catchupFailed.Load(),
+		"catchup_dropped":                    p.catchupDropped.Load(),
+		"replication_recheck_started":        p.recheckStarted.Load(),
+		"replication_recheck_completed":      p.recheckCompleted.Load(),
+		"replication_recheck_aborted":        p.recheckAborted.Load(),
+		"replication_recheck_gated":          p.recheckGated.Load(),
+		"replication_recheck_busy":           p.recheckBusy.Load(),
+		"replication_recheck_entries_walked": p.recheckEntriesWalked.Load(),
+		"replication_recheck_enqueued":       p.recheckEnqueued.Load(),
+		"replication_recheck_skipped":        p.recheckSkipped.Load(),
+		"replication_recheck_dropped":        p.recheckDropped.Load(),
 	}
 }
 
@@ -547,14 +735,14 @@ func (p *Puller) CatchUpCompleted() bool {
 // "no pulls are happening anywhere right now."
 //
 // Self-heal: catchupFailed and catchupDropped both decrement when a later
-// pull (reactive FSM callback or otherwise) succeeds for a previously-
-// affected path, so transient peer outages or queue-saturation events
-// during catch-up don't require a process restart to clear the gate. The
-// puller tracks the affected paths in catchupFailedPaths and
-// catchupDroppedPaths respectively; processEntry's success path calls
-// clearCatchUpFailure and clearCatchUpDrop unconditionally (both are no-
-// ops when the path was never recorded), so any successful pull is a
-// recovery event regardless of the original failure mode.
+// successful pull resolves a previously-affected path, so transient peer
+// outages or queue-saturation events during catch-up don't require a process
+// restart to clear the gate. Periodic reconciliation cannot create or remove
+// startup tags, and its failures cannot reopen readiness, but its successful
+// pulls can heal existing path state. The puller tracks affected paths in
+// catchupFailedPaths and catchupDroppedPaths; worker success calls
+// clearCatchUpFailure and clearCatchUpDrop (both are no-ops when the path was
+// never recorded).
 //
 // Returns false (not ready) if:
 //   - the catch-up walker never ran or hasn't completed, OR
@@ -627,6 +815,18 @@ func (p *Puller) CatchUpStatus() map[string]int64 {
 		// Live queue/inflight depth.
 		"queue_depth":    int64(len(p.queue)),
 		"inflight_count": p.inflightCount.Load(),
+
+		// Periodic reconciliation counters. These are prefixed so callers can
+		// distinguish them from the startup catch-up contract above.
+		"replication_recheck_started":        p.recheckStarted.Load(),
+		"replication_recheck_completed":      p.recheckCompleted.Load(),
+		"replication_recheck_aborted":        p.recheckAborted.Load(),
+		"replication_recheck_gated":          p.recheckGated.Load(),
+		"replication_recheck_busy":           p.recheckBusy.Load(),
+		"replication_recheck_entries_walked": p.recheckEntriesWalked.Load(),
+		"replication_recheck_enqueued":       p.recheckEnqueued.Load(),
+		"replication_recheck_skipped":        p.recheckSkipped.Load(),
+		"replication_recheck_dropped":        p.recheckDropped.Load(),
 	}
 }
 
@@ -640,11 +840,11 @@ func (p *Puller) worker(id int) {
 		case <-p.ctx.Done():
 			workerLog.Debug().Msg("File puller worker exiting")
 			return
-		case entry, ok := <-p.queue:
+		case request, ok := <-p.queue:
 			if !ok {
 				return
 			}
-			p.processEntry(workerLog, entry)
+			p.processEntry(workerLog, request)
 		}
 	}
 }
@@ -657,7 +857,8 @@ func (p *Puller) worker(id int) {
 // EXCEPT checksum mismatch — a corrupt body from one peer is a real data
 // integrity problem and shouldn't trigger pull-and-corrupt from every other
 // healthy peer in turn.
-func (p *Puller) processEntry(log zerolog.Logger, entry *raft.FileEntry) {
+func (p *Puller) processEntry(log zerolog.Logger, request *pullRequest) {
+	entry := request.entry
 	// failed and succeeded are local to this worker so a concurrent worker
 	// processing a different entry doesn't trip our defer — using a global
 	// counter delta would cross-pollinate outcomes across workers. Set by
@@ -670,30 +871,11 @@ func (p *Puller) processEntry(log zerolog.Logger, entry *raft.FileEntry) {
 	// panic unwind — and makes repeated catch-up walks idempotent with the
 	// reactive enqueue path.
 	//
-	// The catch-up tag check happens INSIDE the defer (not snapshotted at
-	// function entry) to close a race: a reactive pull may already be in
-	// flight when RunCatchUp starts, in which case the walker tags the
-	// path AFTER this worker began processing it. Reading isCatchUpPath
-	// at entry would miss that late tag and we'd silently drop the
-	// catch-up-failure signal — opening the gate while the file is
-	// missing. Reading it inside the defer (before inflightRemove clears
-	// the tag) sees whatever state the walker has converged on.
+	// finishEntry checks the catch-up tag and removes the in-flight state under
+	// one lock. A reactive pull may already be in flight when RunCatchUp starts,
+	// so the walker can add the tag after this worker began processing it.
 	defer func() {
-		switch {
-		case failed && p.isCatchUpPath(entry.Path):
-			// Catch-up-tagged pull gave up after all retries. Record the
-			// failure; the gate stays red until a later successful pull
-			// (reactive or otherwise) calls clearCatchUpFailure.
-			p.recordCatchUpFailure(entry.Path)
-		case succeeded:
-			// Pull succeeded. If this path had a prior catch-up failure or
-			// drop, heal it so the gate can clear without a process restart.
-			// Both are no-ops when the path was never in the corresponding
-			// set, so safe to call on every success regardless of history.
-			p.clearCatchUpFailure(entry.Path)
-			p.clearCatchUpDrop(entry.Path)
-		}
-		p.inflightRemove(entry.Path)
+		p.finishEntry(entry.Path, request.source, failed, succeeded)
 	}()
 
 	for attempt := 1; attempt <= p.cfg.RetryMaxAttempts; attempt++ {

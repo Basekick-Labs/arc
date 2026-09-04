@@ -65,6 +65,24 @@ The ingest, API, query, and Iceberg test suites were verified against 0.24.0.
 
 ## Bug fixes
 
+### Periodic peer file replication reconciliation repairs missed FSM callbacks ([#393](https://github.com/Basekick-Labs/arc/issues/393))
+
+Cluster nodes now re-walk the Raft file manifest every five minutes by default
+after the startup catch-up attempt. The interval is configurable with
+`cluster.replication_reconciliation_interval_seconds`. The pass uses the
+existing paginated manifest walk, pull queue, deduplication, retries, checksum
+verification, and local-file checks, so a missed reactive callback can be
+repaired without restarting the node. Healthy writer, reader, and compactor
+nodes may run the pass; joining, leaving, unhealthy, and standalone nodes are
+gated. Startup catch-up remains a one-shot operation: periodic failures never
+reopen readiness, while a successful reconciliation pull may heal previously
+recorded startup failure or drop state for that path. The existing
+`cluster.replication_catchup_enabled` switch disables both startup and
+periodic reconciliation. Recheck outcomes are exposed under
+`replication_catchup_status` as `replication_recheck_*` counters.
+
+Contributed by [@bferanmi806-sketch](https://github.com/bferanmi806-sketch) in [#697](https://github.com/Basekick-Labs/arc/pull/697).
+
 ### Replication can now carry WAL entries up to the full payload cap ([#698](https://github.com/Basekick-Labs/arc/issues/698))
 
 The replication wire format JSON-encoded every entry, and base64 inflates the
