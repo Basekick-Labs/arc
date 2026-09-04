@@ -1491,6 +1491,8 @@ jobs:
             --set persistence.enabled=false \
             --wait --timeout=2m
 
+          bash scripts/test_startup_probe.sh helm/arc
+
           # Check if deployment is ready
           kubectl rollout status deployment/arc-test --timeout=2m
 
