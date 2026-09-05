@@ -68,6 +68,10 @@ resources: {}
   #   cpu: 1000m
   #   memory: 2Gi
 
+# startupProbe allowance: failureThreshold x 10 seconds of boot grace before
+# liveness arms. Raise this when WAL recovery needs more than five minutes.
+startupProbeFailureThreshold: 30
+
 # Arc-specific configuration
 arc:
   # Optional arc.toml override. When enabled, `contents` (the full arc.toml
@@ -89,6 +93,8 @@ persistence:
   enabled: true
   # storageClass: "-"
   accessMode: ReadWriteOnce
+  # 10Gi is a dev-scale default. For object storage, size this PVC for peak
+  # ingest rate x worst-case WAL flush lag, plus cache and recovery headroom.
   size: 10Gi
   # existingClaim: ""
 
