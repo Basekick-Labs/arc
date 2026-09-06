@@ -72,7 +72,7 @@ for client disconnects, cancelled contexts, deferred reader failures, and decima
 cast cleanup. This protects the existing behavior that stops consuming results as
 soon as the output connection fails.
 
-Contributed by [@be-student](https://github.com/be-student) in [#PR](https://github.com/Basekick-Labs/arc/pull/PR).
+Contributed by [@be-student](https://github.com/be-student) in [#706](https://github.com/Basekick-Labs/arc/pull/706).
 
 ### Periodic peer file replication reconciliation repairs missed FSM callbacks ([#393](https://github.com/Basekick-Labs/arc/issues/393))
 
