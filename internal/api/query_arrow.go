@@ -19,6 +19,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/gofiber/fiber/v2"
+	"github.com/rs/zerolog"
 )
 
 // arrowTrailerWarnOnce gates the AddTrailer failure log so a fasthttp
@@ -35,6 +36,162 @@ const arrowExecutionTimeTrailer = "Arc-Execution-Time-Ms"
 // Smaller batches reduce peak memory usage and enable streaming.
 // 10K rows is a good balance between overhead and memory efficiency.
 const arrowBatchSize = 10000
+
+// streamArrowIPC writes Arrow record batches as IPC frames to w. It returns
+// the number of rows consumed and the error that stopped the stream, if any.
+// The caller retains ownership of reader and performs request-level cleanup.
+func streamArrowIPC(
+	ctx context.Context,
+	w *bufio.Writer,
+	reader array.RecordReader,
+	schema *arrow.Schema,
+	castInfo *decimalCastInfo,
+	dictEnabled bool,
+	ipcCompression string,
+	logger zerolog.Logger,
+) (int64, error) {
+	// The IPC writer is created lazily on the first batch: when
+	// dictionary encoding is requested, the output schema depends on a
+	// cardinality analysis of that batch (see newArrowDictTransformer).
+	var ipcWriter *ipc.Writer
+	var dictXform *arrowDictTransformer
+	// Dictionary columns use REPLACEMENT dictionaries (arrow-go's
+	// default): the writer skips re-sending an unchanged dictionary and
+	// re-sends the full dictionary when it grows. Deliberately NOT
+	// WithDictionaryDeltas — polars cannot read delta batches (verified
+	// against polars 1.43; pyarrow reads both).
+	newIPCWriter := func(outSchema *arrow.Schema) *ipc.Writer {
+		opts := []ipc.Option{ipc.WithSchema(outSchema)}
+		switch ipcCompression {
+		case "zstd":
+			opts = append(opts, ipc.WithZstd())
+		case "lz4":
+			opts = append(opts, ipc.WithLZ4())
+		}
+		return ipc.NewWriter(w, opts...)
+	}
+
+	var totalRows int64
+	var streamErr error
+streamLoop:
+	for reader.Next() {
+		// Per-batch ctx check: a timeout firing or client disconnect
+		// must short-circuit instead of draining DuckDB into a
+		// buffer the client is no longer reading. See review/
+		// query-path-criticals C5. Non-blocking select with labeled
+		// break is the idiomatic Go cancellation pattern (gemini r1).
+		select {
+		case <-ctx.Done():
+			streamErr = fmt.Errorf("stream cancelled at row %d: %w", totalRows, ctx.Err())
+			break streamLoop
+		default:
+		}
+
+		batch := reader.Record()
+		if batch == nil {
+			break
+		}
+		totalRows += batch.NumRows()
+
+		// CRITICAL: when castInfo!=nil we replace `batch` with a new
+		// arrow.Record that we own and must Release before the next
+		// iteration. The previous code used `defer batch.Release()`
+		// inside the loop, which holds every casted batch alive
+		// until the closure exits — pinning all Arrow buffers and
+		// defeating the streaming contract. Explicit release after
+		// Write is the right pattern for per-iteration ownership.
+		// The original reader.Record() does NOT need releasing here:
+		// reader.Next() releases the prior record automatically.
+		var castedBatch arrow.Record
+		if castInfo != nil {
+			var castErr error
+			castedBatch, castErr = castDecimalBatch(batch, castInfo)
+			if castErr != nil {
+				streamErr = fmt.Errorf("failed to cast decimal columns at row %d: %w", totalRows, castErr)
+				break streamLoop
+			}
+			batch = castedBatch
+		}
+
+		// First batch: decide dictionary columns (if requested) and
+		// create the writer with the final output schema.
+		if ipcWriter == nil {
+			outSchema := schema
+			if dictEnabled {
+				// Analysis runs on the (possibly decimal-casted) batch so
+				// the transformer's schema matches what it will receive.
+				dictXform = newArrowDictTransformer(batch, &logger)
+				if dictXform != nil {
+					outSchema = dictXform.schema
+				}
+			}
+			ipcWriter = newIPCWriter(outSchema)
+		}
+
+		writeBatch := batch
+		var encodedBatch arrow.Record
+		if dictXform != nil {
+			var encErr error
+			encodedBatch, encErr = dictXform.transform(batch)
+			if encErr != nil {
+				if castedBatch != nil {
+					castedBatch.Release()
+				}
+				streamErr = fmt.Errorf("failed to dictionary-encode batch at row %d: %w", totalRows, encErr)
+				break streamLoop
+			}
+			writeBatch = encodedBatch
+		}
+
+		err := ipcWriter.Write(writeBatch)
+		if encodedBatch != nil {
+			encodedBatch.Release()
+		}
+		if castedBatch != nil {
+			castedBatch.Release()
+		}
+		if err != nil {
+			streamErr = fmt.Errorf("failed to write arrow batch at row %d: %w", totalRows, err)
+			break streamLoop
+		}
+		// Capture Flush error: fasthttp's RequestCtx.Done() only fires on
+		// server shutdown (not per-request client disconnect), so the
+		// underlying bufio.Writer's error on the closed connection is our
+		// signal that the client has gone away. Wrap with the sentinel so
+		// the caller logs at Warn (not Error) for this expected ops noise.
+		if err := w.Flush(); err != nil {
+			streamErr = fmt.Errorf("stream flush failed at row %d: %w: %w", totalRows, errClientDisconnected, err)
+			break streamLoop
+		}
+	}
+
+	if streamErr == nil {
+		if err := reader.Err(); err != nil {
+			streamErr = fmt.Errorf("arrow reader error after %d rows: %w", totalRows, err)
+		}
+	}
+
+	// Zero-batch result: no writer was created in the loop. Emit an
+	// empty stream with the base schema so clients still get a valid
+	// Arrow IPC response.
+	if ipcWriter == nil {
+		ipcWriter = newIPCWriter(schema)
+	}
+	if dictXform != nil {
+		defer dictXform.release()
+	}
+
+	if err := ipcWriter.Close(); err != nil {
+		// Warn (not Error): when the loop broke because the client
+		// disconnected, ipcWriter.Close is guaranteed to fail flushing
+		// trailing IPC metadata over the already-closed connection.
+		// That's the same client-disconnect event already captured in
+		// streamErr — emitting Error here would defeat the ops-noise
+		// reduction.
+		logger.Warn().Err(err).Msg("Failed to close Arrow IPC writer")
+	}
+	return totalRows, streamErr
+}
 
 // executeQueryArrow handles POST /api/v1/query/arrow - returns Arrow IPC stream
 // Optimized to stream rows directly into Arrow batches without intermediate buffering.
@@ -264,146 +421,9 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 					Msg("Arrow IPC stream writer panicked; stream truncated")
 			}
 		}()
-		// The IPC writer is created lazily on the first batch: when
-		// dictionary encoding is requested, the output schema depends on a
-		// cardinality analysis of that batch (see newArrowDictTransformer).
-		var ipcWriter *ipc.Writer
-		var dictXform *arrowDictTransformer
-		// Dictionary columns use REPLACEMENT dictionaries (arrow-go's
-		// default): the writer skips re-sending an unchanged dictionary and
-		// re-sends the full dictionary when it grows. Deliberately NOT
-		// WithDictionaryDeltas — polars cannot read delta batches (verified
-		// against polars 1.43; pyarrow reads both).
-		newIPCWriter := func(outSchema *arrow.Schema) *ipc.Writer {
-			opts := []ipc.Option{ipc.WithSchema(outSchema)}
-			switch ipcCompression {
-			case "zstd":
-				opts = append(opts, ipc.WithZstd())
-			case "lz4":
-				opts = append(opts, ipc.WithLZ4())
-			}
-			return ipc.NewWriter(w, opts...)
-		}
-
-		var totalRows int64
-		var streamErr error
-	streamLoop:
-		for reader.Next() {
-			// Per-batch ctx check: a timeout firing or client disconnect
-			// must short-circuit instead of draining DuckDB into a
-			// buffer the client is no longer reading. See review/
-			// query-path-criticals C5. Non-blocking select with labeled
-			// break is the idiomatic Go cancellation pattern (gemini r1).
-			select {
-			case <-streamCtx.Done():
-				streamErr = fmt.Errorf("stream cancelled at row %d: %w", totalRows, streamCtx.Err())
-				break streamLoop
-			default:
-			}
-
-			batch := reader.Record()
-			if batch == nil {
-				break
-			}
-			totalRows += batch.NumRows()
-
-			// CRITICAL: when castInfo!=nil we replace `batch` with a new
-			// arrow.Record that we own and must Release before the next
-			// iteration. The previous code used `defer batch.Release()`
-			// inside the loop, which holds every casted batch alive
-			// until the closure exits — pinning all Arrow buffers and
-			// defeating the streaming contract. Explicit release after
-			// Write is the right pattern for per-iteration ownership.
-			// The original reader.Record() does NOT need releasing here:
-			// reader.Next() releases the prior record automatically.
-			var castedBatch arrow.Record
-			if castInfo != nil {
-				var castErr error
-				castedBatch, castErr = castDecimalBatch(batch, castInfo)
-				if castErr != nil {
-					streamErr = fmt.Errorf("failed to cast decimal columns at row %d: %w", totalRows, castErr)
-					break streamLoop
-				}
-				batch = castedBatch
-			}
-
-			// First batch: decide dictionary columns (if requested) and
-			// create the writer with the final output schema.
-			if ipcWriter == nil {
-				outSchema := schema
-				if dictEnabled {
-					// Analysis runs on the (possibly decimal-casted) batch so
-					// the transformer's schema matches what it will receive.
-					dictXform = newArrowDictTransformer(batch, &h.logger)
-					if dictXform != nil {
-						outSchema = dictXform.schema
-					}
-				}
-				ipcWriter = newIPCWriter(outSchema)
-			}
-
-			writeBatch := batch
-			var encodedBatch arrow.Record
-			if dictXform != nil {
-				var encErr error
-				encodedBatch, encErr = dictXform.transform(batch)
-				if encErr != nil {
-					if castedBatch != nil {
-						castedBatch.Release()
-					}
-					streamErr = fmt.Errorf("failed to dictionary-encode batch at row %d: %w", totalRows, encErr)
-					break streamLoop
-				}
-				writeBatch = encodedBatch
-			}
-
-			err := ipcWriter.Write(writeBatch)
-			if encodedBatch != nil {
-				encodedBatch.Release()
-			}
-			if castedBatch != nil {
-				castedBatch.Release()
-			}
-			if err != nil {
-				streamErr = fmt.Errorf("failed to write arrow batch at row %d: %w", totalRows, err)
-				break streamLoop
-			}
-			// Capture Flush error: fasthttp's RequestCtx.Done() only fires on
-			// server shutdown (not per-request client disconnect), so the
-			// underlying bufio.Writer's error on the closed connection is our
-			// signal that the client has gone away. Wrap with the sentinel so
-			// the caller logs at Warn (not Error) for this expected ops noise.
-			if err := w.Flush(); err != nil {
-				streamErr = fmt.Errorf("stream flush failed at row %d: %w: %w", totalRows, errClientDisconnected, err)
-				break streamLoop
-			}
-		}
-
-		if streamErr == nil {
-			if err := reader.Err(); err != nil {
-				streamErr = fmt.Errorf("arrow reader error after %d rows: %w", totalRows, err)
-			}
-		}
-
-		// Zero-batch result: no writer was created in the loop. Emit an
-		// empty stream with the base schema so clients still get a valid
-		// Arrow IPC response.
-		if ipcWriter == nil {
-			ipcWriter = newIPCWriter(schema)
-		}
-		if dictXform != nil {
-			defer dictXform.release()
-		}
-
-		if err := ipcWriter.Close(); err != nil {
-			// Warn (not Error): when the loop broke because the client
-			// disconnected, ipcWriter.Close is guaranteed to fail flushing
-			// trailing IPC metadata over the already-closed connection.
-			// That's the same client-disconnect event already captured in
-			// streamErr — emitting Error here would defeat the ops-noise
-			// reduction.
-			h.logger.Warn().Err(err).Msg("Failed to close Arrow IPC writer")
-		}
+		totalRows, streamErr := streamArrowIPC(
+			streamCtx, w, reader, schema, castInfo, dictEnabled, ipcCompression, h.logger,
+		)
 		reader.Release()
 		conn.Close()
 		if cancel != nil {

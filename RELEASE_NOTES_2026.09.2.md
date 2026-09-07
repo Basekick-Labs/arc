@@ -65,6 +65,15 @@ The ingest, API, query, and Iceberg test suites were verified against 0.24.0.
 
 ## Bug fixes
 
+### Arrow IPC streaming has direct disconnect regression coverage ([#425](https://github.com/Basekick-Labs/arc/issues/425))
+
+The Arrow IPC batch loop is now independently testable, with regression checks
+for client disconnects, cancelled contexts, deferred reader failures, and decimal
+cast cleanup. This protects the existing behavior that stops consuming results as
+soon as the output connection fails.
+
+Contributed by [@be-student](https://github.com/be-student) in [#706](https://github.com/Basekick-Labs/arc/pull/706).
+
 ### Helm recovery no longer crash-loops during long WAL replay ([#676](https://github.com/Basekick-Labs/arc/issues/676))
 
 The OSS Helm chart now uses a five-minute startup probe before liveness starts,
