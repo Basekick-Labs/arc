@@ -451,6 +451,7 @@ Thanks to everyone who has contributed code to Arc:
 - [@atirna](https://github.com/atirna) (Atirna) — live SQLite backup/restore safety: VACUUM INTO snapshots for backups, rename-swap restores with stale sidecar removal, restart-required signaling (#678, #689); WAL chunking for oversized wide-row payloads with offset-based zero-copy splitting (#696); Helm startup probe protecting long WAL replay from liveness crash loops (#700)
 - [@mah1104ahm](https://github.com/mah1104ahm) (M Ahmed) — bounded local storage directory cache (#674), tier-cache expiry pruning (#675), MQTT shutdown unsubscribe awaits with persisted subscription status (#673), pre-26.06.1 token upgrade runbook (#672)
 - [@copacabanaservice01](https://github.com/copacabanaservice01) — calendar-day S3 range path generation across DST transitions (#690)
+- [@be-student](https://github.com/be-student) — extracted the Arrow IPC stream loop into a testable helper with leak-checked regression coverage for disconnects, cancellation, and decimal-cast cleanup (#706)
 
 And a thank-you to community members whose bug reports drove fixes:
 
