@@ -124,6 +124,17 @@ offset *variance*; it does not make the column text-comparable with
 fractional seconds. `expires_at` is still compared as a parsed instant, never as
 a string. Existing rows are left as they are — they parse back to the correct
 instant, so no token's lifetime changes.
+### Tiered query routing filters file metadata in SQL ([#346](https://github.com/Basekick-Labs/arc/issues/346))
+
+`GetStoragePathsForQuery` fetched every file recorded for a database from the
+tiering metadata store and filtered by measurement and time range in Go,
+pulling every unrelated row out of SQLite per query. The measurement and
+partition-time filters are now pushed into the SQL WHERE clause, so SQLite's
+indexes prune rows before they cross the query boundary. Returned paths are
+unchanged; a busy tiering database just holds far less metadata in memory
+per query.
+
+Contributed by [@pujitha24](https://github.com/pujitha24) in [#707](https://github.com/Basekick-Labs/arc/pull/707).
 
 ### Arrow IPC streaming has direct disconnect regression coverage ([#425](https://github.com/Basekick-Labs/arc/issues/425))
 
