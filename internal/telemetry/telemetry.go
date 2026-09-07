@@ -58,6 +58,8 @@ type Collector struct {
 
 	client *http.Client
 	logger zerolog.Logger
+
+	clients *clientRegistry
 }
 
 // TelemetryPayload represents the data sent to the telemetry endpoint
@@ -69,6 +71,10 @@ type TelemetryPayload struct {
 	OS         OSInfo  `json:"os"`
 	CPU        CPUInfo `json:"cpu"`
 	Memory     MemInfo `json:"memory"`
+
+	// Clients lists the arcli installations seen since the last
+	// successful report (see clients.go). Omitted when none.
+	Clients *ClientsInfo `json:"clients,omitempty"`
 }
 
 // OSInfo contains operating system information
@@ -115,7 +121,8 @@ func New(cfg *Config, version string, logger zerolog.Logger) (*Collector, error)
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		logger: logger.With().Str("component", "telemetry").Logger(),
+		logger:  logger.With().Str("component", "telemetry").Logger(),
+		clients: newClientRegistry(),
 	}
 
 	return c, nil
@@ -142,6 +149,7 @@ func (c *Collector) Start() {
 func (c *Collector) Stop() {
 	c.cancel()
 	c.wg.Wait()
+	c.flushClients(5 * time.Second)
 	c.logger.Info().Msg("Telemetry collector stopped")
 }
 
@@ -172,8 +180,21 @@ func (c *Collector) run() {
 	}
 }
 
-func (c *Collector) sendTelemetry() {
+func (c *Collector) sendTelemetry() { c.sendTelemetryCtx(c.ctx) }
+
+// sendTelemetryCtx builds and posts one report. The client window is
+// taken before marshalling and restored if the post fails, so a
+// transient outage loses nothing and a success starts a fresh window.
+func (c *Collector) sendTelemetryCtx(ctx context.Context) {
 	payload := c.collectPayload()
+	clients, window := c.clients.take()
+	payload.Clients = clients
+	ok := false
+	defer func() {
+		if !ok {
+			c.clients.restore(window)
+		}
+	}()
 
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -186,7 +207,7 @@ func (c *Collector) sendTelemetry() {
 		Str("instance_id", c.instanceID).
 		Msg("Sending telemetry")
 
-	req, err := http.NewRequestWithContext(c.ctx, "POST", c.config.Endpoint, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, "POST", c.config.Endpoint, bytes.NewReader(data))
 	if err != nil {
 		c.logger.Error().Err(err).Msg("Failed to create telemetry request")
 		return
@@ -208,6 +229,7 @@ func (c *Collector) sendTelemetry() {
 	}
 
 	c.logger.Info().Int("status", resp.StatusCode).Msg("Telemetry sent successfully")
+	ok = true
 }
 
 func (c *Collector) collectPayload() *TelemetryPayload {
