@@ -50,6 +50,14 @@ spec:
             {{- with .Values.arc.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          startupProbe:
+            # WAL replay runs before the listener binds. Keep liveness from
+            # turning a long recovery into a crash loop.
+            httpGet:
+              path: /health
+              port: http
+            failureThreshold: {{ .Values.startupProbeFailureThreshold | default 30 }}
+            periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /health
