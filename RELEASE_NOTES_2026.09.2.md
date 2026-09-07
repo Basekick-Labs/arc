@@ -65,6 +65,18 @@ The ingest, API, query, and Iceberg test suites were verified against 0.24.0.
 
 ## Bug fixes
 
+### The measurement endpoint now honors the configured query timeout ([#308](https://github.com/Basekick-Labs/arc/issues/308))
+
+`GET /api/v1/query/:measurement` executed against `context.Background()` with
+no deadline, so a configured `query.timeout` never applied to it and a slow
+measurement query could run indefinitely. The handler now derives its context
+from the request (so client disconnects cancel the query) and wraps it with
+the configured timeout, matching `POST /api/v1/query`: a query that exceeds
+the timeout returns 504 `"Query timed out"` and increments the timeout
+metrics, on both the Arrow and database/sql paths.
+
+Contributed by [@MrBeldum](https://github.com/MrBeldum) in [#701](https://github.com/Basekick-Labs/arc/pull/701).
+
 ### Arrow IPC streaming has direct disconnect regression coverage ([#425](https://github.com/Basekick-Labs/arc/issues/425))
 
 The Arrow IPC batch loop is now independently testable, with regression checks
