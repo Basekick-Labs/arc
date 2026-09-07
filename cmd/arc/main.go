@@ -1781,6 +1781,11 @@ func main() {
 		TLSCertFile:     cfg.Server.TLSCertFile,
 		TLSKeyFile:      cfg.Server.TLSKeyFile,
 	}
+	if telemetryCollector != nil {
+		// Only a live collector (typed nil would be a non-nil interface).
+		serverConfig.ClientRecorder = telemetryCollector
+		serverConfig.AuthRequired = authManager != nil
+	}
 
 	server := api.NewServer(serverConfig, logger.Get("server"))
 

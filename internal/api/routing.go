@@ -57,6 +57,10 @@ var clientForwardingHeaders = map[string]bool{
 	"Forwarded":           true, // RFC 7239
 	"X-Arc-Forwarded-By":  true, // internal loop marker; only the peer may set it
 	"X-Arc-Original-Host": true,
+	// arcli's installation id is recorded by the node that received the
+	// request (telemetry, client_identity.go); stripped here so a
+	// forwarded request is not counted a second time on the peer.
+	"Arcli-Installation-Id": true,
 	// CDN / proxy client-IP headers. Not read by Arc today (identity is
 	// socket-only), stripped defensively so they cannot be trusted later.
 	"True-Client-Ip":   true, // canonical form of True-Client-IP (Akamai/Cloudflare)
