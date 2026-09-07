@@ -27,29 +27,18 @@ func NewRouter(manager *Manager, logger zerolog.Logger) *Router {
 func (r *Router) GetStoragePathsForQuery(ctx context.Context, database, measurement string, startTime, endTime *time.Time) ([]TieredPath, error) {
 	var paths []TieredPath
 
-	// Get all files for this database/measurement from metadata
-	files, err := r.manager.metadata.GetFilesByDatabase(ctx, database)
+	// Get files for this database/measurement/time range directly from
+	// metadata; the SQL WHERE clause does the filtering so we never pull
+	// unrelated measurements or out-of-range partitions into memory.
+	files, err := r.manager.metadata.GetFilesForQuery(ctx, database, measurement, startTime, endTime)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get files: %w", err)
 	}
 
-	// Filter by measurement and time range, group by tier
+	// Group by tier
 	tierFiles := make(map[Tier][]string)
 
 	for _, file := range files {
-		// Filter by measurement if specified
-		if measurement != "" && file.Measurement != measurement {
-			continue
-		}
-
-		// Filter by time range if specified
-		if startTime != nil && file.PartitionTime.Before(*startTime) {
-			continue
-		}
-		if endTime != nil && file.PartitionTime.After(*endTime) {
-			continue
-		}
-
 		tierFiles[file.Tier] = append(tierFiles[file.Tier], file.Path)
 	}
 

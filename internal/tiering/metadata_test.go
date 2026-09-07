@@ -90,6 +90,59 @@ func TestMetadataStore_RecordFile(t *testing.T) {
 	}
 }
 
+func TestMetadataStore_GetFilesForQuery(t *testing.T) {
+	store, cleanup := setupTestMetadataStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	files := []FileMetadata{
+		{Path: "cpu-jan.parquet", Database: "testdb", Measurement: "cpu", PartitionTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), Tier: TierHot, SizeBytes: 100},
+		{Path: "cpu-feb.parquet", Database: "testdb", Measurement: "cpu", PartitionTime: time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC), Tier: TierHot, SizeBytes: 100},
+		{Path: "mem-jan.parquet", Database: "testdb", Measurement: "mem", PartitionTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), Tier: TierHot, SizeBytes: 100},
+		{Path: "cpu-other-db.parquet", Database: "otherdb", Measurement: "cpu", PartitionTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), Tier: TierHot, SizeBytes: 100},
+	}
+	for i := range files {
+		if err := store.RecordFile(ctx, &files[i]); err != nil {
+			t.Fatalf("RecordFile() error = %v", err)
+		}
+	}
+
+	// Measurement filter should exclude other measurements and other databases.
+	got, err := store.GetFilesForQuery(ctx, "testdb", "cpu", nil, nil)
+	if err != nil {
+		t.Fatalf("GetFilesForQuery() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("GetFilesForQuery() returned %d files, want 2", len(got))
+	}
+	for _, f := range got {
+		if f.Database != "testdb" || f.Measurement != "cpu" {
+			t.Errorf("unexpected file in result: %+v", f)
+		}
+	}
+
+	// Time range filter should exclude files outside the window.
+	start := time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2025, 2, 28, 0, 0, 0, 0, time.UTC)
+	got, err = store.GetFilesForQuery(ctx, "testdb", "cpu", &start, &end)
+	if err != nil {
+		t.Fatalf("GetFilesForQuery() error = %v", err)
+	}
+	if len(got) != 1 || got[0].Path != "cpu-feb.parquet" {
+		t.Fatalf("GetFilesForQuery() with time range = %+v, want only cpu-feb.parquet", got)
+	}
+
+	// No measurement filter returns all measurements for the database.
+	got, err = store.GetFilesForQuery(ctx, "testdb", "", nil, nil)
+	if err != nil {
+		t.Fatalf("GetFilesForQuery() error = %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("GetFilesForQuery() with no measurement = %d files, want 3", len(got))
+	}
+}
+
 func TestMetadataStore_GetTiersForMeasurementPrunesExpiredCacheEntries(t *testing.T) {
 	store, cleanup := setupTestMetadataStore(t)
 	defer cleanup()
