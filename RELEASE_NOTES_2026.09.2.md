@@ -65,6 +65,16 @@ The ingest, API, query, and Iceberg test suites were verified against 0.24.0.
 
 ## Bug fixes
 
+### Helm recovery no longer crash-loops during long WAL replay ([#676](https://github.com/Basekick-Labs/arc/issues/676))
+
+The OSS Helm chart now uses a five-minute startup probe before liveness starts,
+so a pod replaying its WAL can recover without Kubernetes repeatedly killing it.
+The default 10Gi PVC is documented as development-scale; object-storage
+deployments should size it for peak ingest, WAL flush lag, cache, and recovery
+headroom.
+
+Contributed by [@atirna](https://github.com/atirna) in [#700](https://github.com/Basekick-Labs/arc/pull/700).
+
 ### Periodic peer file replication reconciliation repairs missed FSM callbacks ([#393](https://github.com/Basekick-Labs/arc/issues/393))
 
 Cluster nodes now re-walk the Raft file manifest every five minutes by default
