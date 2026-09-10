@@ -106,21 +106,24 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
 
 ### Token `expires_at` is now stored in UTC
 
-`api_tokens.created_at` is filled by SQLite's `CURRENT_TIMESTAMP` and is always
-UTC, but `expires_at` was bound as a Go `time.Time` and text-encoded using the
-caller's own location — so an Arc running in a non-UTC zone stored
-`2026-09-10 15:32:45.958903-06:00` in one column and `2026-09-10 21:32:41` in
-the other. Both denote the same instant and expiry enforcement compares parsed
-values in Go, so no token was ever accepted or rejected incorrectly; the effect
-was two timezone domains in one table and the two columns rendering in
-different zones over the token API.
+`api_tokens.expires_at` is written as a Go `time.Time`, and go-sqlite3
+text-encodes those using the value's own location. An Arc running in a non-UTC
+zone therefore stored `2026-09-10 15:32:45.958903-06:00` where a UTC one stored
+`2026-09-10 21:32:45.958903+00:00` for the very same instant. Both parse back
+correctly and expiry is compared as a parsed instant in Go, so no token was ever
+accepted or rejected incorrectly — but two rows holding the same moment sorted
+differently as text, so any future SQL comparison on the column would have
+disagreed with itself depending on which node wrote the row.
 
-Writes now normalize to UTC on both the create and update paths, matching the
+Writes now normalize to UTC on the create and update paths, matching the
 clustered apply path, which already did this ([#459](https://github.com/Basekick-Labs/arc/pull/459) /
 [#460](https://github.com/Basekick-Labs/arc/issues/460)), and the "Arc-stamped timestamps are
-UTC" rule from [#546](https://github.com/Basekick-Labs/arc/issues/546). Existing rows are left as
-they are — they parse back correctly and are compared as instants, never as
-strings.
+UTC" rule from [#546](https://github.com/Basekick-Labs/arc/issues/546). Note this removes the
+offset *variance*; it does not make the column text-comparable with
+`created_at`, which SQLite's `CURRENT_TIMESTAMP` writes without an offset or
+fractional seconds. `expires_at` is still compared as a parsed instant, never as
+a string. Existing rows are left as they are — they parse back to the correct
+instant, so no token's lifetime changes.
 
 ### Arrow IPC streaming has direct disconnect regression coverage ([#425](https://github.com/Basekick-Labs/arc/issues/425))
 

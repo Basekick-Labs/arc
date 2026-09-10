@@ -733,15 +733,20 @@ func generateToken() (string, error) {
 func (am *AuthManager) insertToken(hash, prefix, name, description, permissions string, expiresAt *time.Time) error {
 
 	// .UTC(): go-sqlite3 text-encodes a time.Time using the value's own
-	// location, so a caller in a non-UTC zone would store
-	// "2026-09-10 15:32:45.958903-06:00" here while the sibling created_at,
-	// filled by SQLite's CURRENT_TIMESTAMP, is always UTC ("2026-09-10
-	// 21:32:41"). Both denote the same instant and Go parses either back
-	// correctly, but storing two formats in one table invites a future
-	// string-domain comparison to silently disagree, and the API then renders
-	// the two columns in different zones. Normalize on write, matching the
-	// cluster apply path (ApplyCreateToken, #459/#460) and the "Arc-stamped
-	// timestamps are UTC" rule from #546.
+	// location, so without this a caller in a non-UTC zone stores
+	// "2026-09-10 15:32:45.958903-06:00" while the same instant from a UTC
+	// caller stores "2026-09-10 21:32:45.958903+00:00". Go parses either back
+	// to the correct instant, but the varying offset means two rows holding
+	// the same moment sort differently as text — so a future
+	// `WHERE expires_at > ?` would silently disagree with itself depending on
+	// which node wrote the row. Normalizing on write removes that variance,
+	// matching the cluster apply path (ApplyCreateToken, #459/#460) and the
+	// "Arc-stamped timestamps are UTC" rule from #546.
+	//
+	// This does NOT make the column string-comparable with created_at, which
+	// SQLite's CURRENT_TIMESTAMP writes without an offset or fractional
+	// seconds ("2026-09-10 21:32:45"). expires_at must keep being compared as
+	// a parsed instant (see VerifyToken), never as text.
 	var expiresAtVal interface{}
 	if expiresAt != nil {
 		expiresAtVal = expiresAt.UTC()

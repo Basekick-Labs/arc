@@ -193,8 +193,7 @@ func TestVerifyToken_CacheDeadlineCappedAtTokenExpiry(t *testing.T) {
 }
 
 // TestVerifyToken_ExpiresWhileCached_EndToEnd is the real-path proof: no
-// planted state, a token that genuinely expires between two verifications
-// while its cache entry is still live.
+// planted state, a token that genuinely expires between two verifications.
 //
 // The window is seconds rather than milliseconds because CreateToken and the
 // first VerifyToken each run PBKDF2 at pbkdf2Iterations, which is materially
@@ -216,9 +215,16 @@ func TestVerifyToken_ExpiresWhileCached_EndToEnd(t *testing.T) {
 
 	missesBefore := am.cacheMisses.Load()
 
-	// Wait for the credential to expire. The cache entry is capped at the
-	// token expiry, so this also proves the entry is not simply gone: the
-	// assertions below distinguish the two paths.
+	// Wait for the credential to expire.
+	//
+	// Note which half of the fix this exercises: because cache entries are
+	// capped at the token's expiry, the entry is still in the map but its
+	// deadline has passed, so this second call takes a natural cache miss and
+	// is rejected by the database path. That makes this an end-to-end proof of
+	// the CAP, not of the cache-hit expiry check — the deterministic
+	// TestVerifyToken_CachedTokenRejectedAfterExpiry and
+	// TestMiddleware_CachedExpiredToken cover that branch, where the entry's
+	// own deadline is still live.
 	time.Sleep(time.Until(expiresAt) + 250*time.Millisecond)
 
 	if info := am.VerifyToken(token); info != nil {
@@ -260,16 +266,30 @@ func TestCreateToken_ExpiresAtStoredInUTC(t *testing.T) {
 
 	assertStoredUTC := func(stage string) {
 		t.Helper()
-		var stored string
-		if err := am.db.QueryRow("SELECT expires_at FROM api_tokens WHERE name = ?", "utc-storage").Scan(&stored); err != nil {
+
+		// Assert on the parsed value's zone offset, not on any text form.
+		// Scanning into a string would show the driver's RFC3339
+		// re-rendering ("...Z" / "...-06:00") rather than the bytes on
+		// disk, so a string assertion tests the driver, not the write.
+		// The offset is what actually matters and is encoding-independent.
+		var parsed time.Time
+		if err := am.db.QueryRow("SELECT expires_at FROM api_tokens WHERE name = ?", "utc-storage").Scan(&parsed); err != nil {
 			t.Fatalf("%s: read expires_at: %v", stage, err)
 		}
-		// go-sqlite3 appends the zone offset for non-UTC values ("-06:00")
-		// and writes a bare "...Z"-less UTC string otherwise. Either an
-		// explicit offset or a trailing zone name means the value did not
-		// land in UTC.
-		if strings.Contains(stored, "+") || strings.Contains(stored, "-06:00") {
-			t.Errorf("%s: expires_at stored with a zone offset, expected UTC: %q", stage, stored)
+		if _, offset := parsed.Zone(); offset != 0 {
+			t.Errorf("%s: expires_at stored with a non-zero zone offset (%+d seconds), expected UTC: %v", stage, offset, parsed)
+		}
+
+		// Belt and braces: pin the bytes actually on disk. go-sqlite3
+		// text-encodes using the value's own location, so a UTC write
+		// lands as "2026-09-10 21:32:45.958903+00:00" — space-separated,
+		// with an explicit +00:00 rather than a bare Z.
+		var raw string
+		if err := am.db.QueryRow("SELECT CAST(expires_at AS TEXT) FROM api_tokens WHERE name = ?", "utc-storage").Scan(&raw); err != nil {
+			t.Fatalf("%s: read raw expires_at: %v", stage, err)
+		}
+		if !strings.HasSuffix(raw, "+00:00") {
+			t.Errorf("%s: expires_at not stored with a +00:00 offset: %q", stage, raw)
 		}
 	}
 
