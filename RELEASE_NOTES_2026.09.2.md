@@ -82,7 +82,48 @@ and errgroup primitives used by tiering and Iceberg. The auth, cluster-security,
 tiering, and Iceberg suites were verified against the new versions, the latter
 two under `-race`.
 
+### Expired API tokens are now rejected on cache hits
+
+Arc caches successful token verifications in memory for `auth.cache_ttl`
+seconds (default 300) so that ingestion does not pay a SQLite lookup per
+request. That cache checked only its own entry deadline, not the token's
+`expires_at`, so a token that expired *while cached* kept authorizing requests
+until the entry aged out — up to one cache TTL past the expiry an operator
+configured. The same token was correctly rejected whenever the lookup reached
+the database, so the behaviour depended on cache state rather than on the
+credential.
+
+Token expiry is now enforced on every request regardless of cache state: an
+entry whose token has expired is evicted and re-validated against the database,
+which rejects it. Cache entries are additionally never held past the token's own
+expiry. Revoking, deleting, updating, or rotating a token already invalidated
+the cache immediately and was never affected; only passive expiry was.
+
+Full technical detail will accompany the corresponding security advisory once it
+is published. Responsibly reported by **[@rexpository](https://github.com/rexpository)**.
+
 ## Bug fixes
+
+### Token `expires_at` is now stored in UTC
+
+`api_tokens.expires_at` is written as a Go `time.Time`, and go-sqlite3
+text-encodes those using the value's own location. An Arc running in a non-UTC
+zone therefore stored `2026-09-10 15:32:45.958903-06:00` where a UTC one stored
+`2026-09-10 21:32:45.958903+00:00` for the very same instant. Both parse back
+correctly and expiry is compared as a parsed instant in Go, so no token was ever
+accepted or rejected incorrectly — but two rows holding the same moment sorted
+differently as text, so any future SQL comparison on the column would have
+disagreed with itself depending on which node wrote the row.
+
+Writes now normalize to UTC on the create and update paths, matching the
+clustered apply path, which already did this ([#459](https://github.com/Basekick-Labs/arc/pull/459) /
+[#460](https://github.com/Basekick-Labs/arc/issues/460)), and the "Arc-stamped timestamps are
+UTC" rule from [#546](https://github.com/Basekick-Labs/arc/issues/546). Note this removes the
+offset *variance*; it does not make the column text-comparable with
+`created_at`, which SQLite's `CURRENT_TIMESTAMP` writes without an offset or
+fractional seconds. `expires_at` is still compared as a parsed instant, never as
+a string. Existing rows are left as they are — they parse back to the correct
+instant, so no token's lifetime changes.
 
 ### Arrow IPC streaming has direct disconnect regression coverage ([#425](https://github.com/Basekick-Labs/arc/issues/425))
 
