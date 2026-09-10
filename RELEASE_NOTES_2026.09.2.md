@@ -63,6 +63,25 @@ an indirect dependency reached through arrow-go's Parquet metadata decoding
 (Parquet footers are Thrift-encoded), so the vulnerable code is in Arc's build.
 The ingest, API, query, and Iceberg test suites were verified against 0.24.0.
 
+### Dependency bump: gRPC-Go 1.83.1 → 1.83.2 ([#710](https://github.com/Basekick-Labs/arc/pull/710))
+
+`google.golang.org/grpc` is bumped to 1.83.2, which rejects requests missing
+both the `:authority` and `Host` headers instead of serving them. The fix is
+server-side, and Arc never starts a gRPC server or client — the library is
+linked in transitively through arrow-go's Flight package — so the vulnerable
+path was not reachable, but the code is no longer in the binary and dependency
+scanners come up clean.
+
+The upgrade carries gRPC's own minimum-version requirements with it, so the
+same bump moves `golang.org/x/net` (0.55.0 → 0.58.0), `golang.org/x/crypto`
+(0.53.0 → 0.55.0), `golang.org/x/text` (0.39.0 → 0.41.0), `golang.org/x/sync`
+(0.21.0 → 0.22.0), `golang.org/x/sys` (0.46.0 → 0.47.0), plus `golang.org/x/mod`
+and `golang.org/x/term`. Two of those are load-bearing for Arc: `x/crypto`
+supplies bcrypt for auth password hashing, and `x/sync` supplies the semaphore
+and errgroup primitives used by tiering and Iceberg. The auth, cluster-security,
+tiering, and Iceberg suites were verified against the new versions, the latter
+two under `-race`.
+
 ## Bug fixes
 
 ### Arrow IPC streaming has direct disconnect regression coverage ([#425](https://github.com/Basekick-Labs/arc/issues/425))
