@@ -63,6 +63,17 @@ This rides on the existing telemetry channel and the existing switch: `telemetry
 
 ## Security fixes
 
+### Read-SQL validator hardening ([GHSA-w6w2-x8xv-q8x2](https://github.com/Basekick-Labs/arc/security/advisories/GHSA-w6w2-x8xv-q8x2))
+
+Closes a read-path validator bypass on RBAC-enabled multi-tenant deployments, in
+the same family as the earlier quoted-name and replacement-scan hardening. The
+sandbox storage-root allowlist bounded impact throughout, and single-tenant and
+OSS deployments were not exposed to a new risk.
+
+Full technical detail will accompany the corresponding security advisory once it
+is published. Responsibly reported by **[@rexpository](https://github.com/rexpository)**.
+
+
 ### Dependency bump: Apache Thrift 0.23.0 → 0.24.0 ([GHSA-8wv5-x4w7-5gww](https://github.com/advisories/GHSA-8wv5-x4w7-5gww))
 
 `github.com/apache/thrift` is bumped to 0.24.0, which patches a high-severity
