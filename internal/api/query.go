@@ -4667,7 +4667,50 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	if governanceTimeout > 0 {
 		effectiveTimeout = governanceTimeout
 	}
-	ctx := c.UserContext()
+
+	// Register with the query registry so this endpoint appears in
+	// /api/v1/queries and can be cancelled (#731). The registered statement is
+	// the one built above, not the transformed SQL below: the transform
+	// resolves storage globs, and /active truncates SQL for display, so the
+	// converted form would show as unreadable noise.
+	//
+	// HEAD is excluded. Fiber routes HEAD to the same GET handler, and
+	// fasthttp discards the body while still running the stream writer, so a
+	// HEAD would otherwise leave a history entry whose only outcome is a
+	// spurious "connection closed" failure.
+	baseCtx := c.UserContext()
+	var queryID string
+	if h.queryRegistry != nil && c.Method() != fiber.MethodHead {
+		var queryCtx context.Context
+		queryID, queryCtx = h.queryRegistry.Register(
+			baseCtx, sql, getTokenID(c), getTokenName(c), c.IP(), false, 0,
+		)
+		baseCtx = queryCtx
+		c.Set("X-Arc-Query-ID", queryID)
+	}
+
+	// A panic in the handler itself unwinds past every disposition below.
+	// Fiber's recover middleware keeps the process alive, so without this the
+	// entry would sit in "running" forever with nothing to reap it. Dispose
+	// and re-panic so the middleware still sees it.
+	//
+	// streamStarted guards the one case where disposing would be wrong: once
+	// an asynchronous writer owns the response, it owns the disposition too,
+	// and marking the entry here would overwrite the outcome of a query that
+	// is still streaming.
+	streamStarted := false
+	if queryID != "" {
+		defer func() {
+			if r := recover(); r != nil {
+				if !streamStarted {
+					h.queryRegistry.Fail(queryID, "handler panicked")
+				}
+				panic(r)
+			}
+		}()
+	}
+
+	ctx := baseCtx
 	var cancel context.CancelFunc
 	if effectiveTimeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, effectiveTimeout)
@@ -4676,10 +4719,28 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		// asynchronously after this function returns.
 	}
 
+	// Dispositions for the Arrow JSON path, which owns the response once it
+	// reports handled=true and streams asynchronously. Passing these rather
+	// than nil is what keeps an entry from sitting in "running" forever; the
+	// writer fires exactly one of them on every outcome it distinguishes,
+	// including its panic path.
+	var onComplete func(int)
+	var onFail func(string)
+	var onTimeout func()
+	if queryID != "" {
+		onComplete = func(rc int) {
+			h.queryRegistry.RecordRowCap(queryID, reachedRowCap(governanceMaxRows, int64(rc)))
+			h.queryRegistry.Complete(queryID, rc)
+		}
+		onFail = func(msg string) { h.queryRegistry.Fail(queryID, msg) }
+		onTimeout = func() { h.queryRegistry.TimedOut(queryID) }
+	}
+
 	// Arrow-native path: bypasses database/sql row scanning entirely.
 	if arrowJSONQueryFunc != nil {
-		_, handled := arrowJSONQueryFunc(h, c, ctx, cancel, convertedSQL, false, governanceMaxRows, start, timestamp, nil, nil, nil)
+		_, handled := arrowJSONQueryFunc(h, c, ctx, cancel, convertedSQL, false, governanceMaxRows, start, timestamp, onComplete, onFail, onTimeout)
 		if handled {
+			streamStarted = true
 			// Metrics are recorded inside the async stream callback — not here.
 			// cancel is owned by executeArrowJSONQuery when handled=true.
 			return nil
@@ -4695,6 +4756,9 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		m.IncQueryErrors()
 		if effectiveTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
 			m.IncQueryTimeouts()
+			if onTimeout != nil {
+				onTimeout()
+			}
 			h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(sql)).Dur("timeout", effectiveTimeout).Msg("Measurement query timed out")
 			return c.Status(fiber.StatusGatewayTimeout).JSON(QueryResponse{
 				Success:         false,
@@ -4702,6 +4766,9 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 				Timestamp:       timestamp,
 			})
+		}
+		if onFail != nil {
+			onFail(sqlutil.SanitizeErrText(err.Error()))
 		}
 		h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(sql)).Msg("Measurement query failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
@@ -4720,6 +4787,9 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 			cancel()
 		}
 		m.IncQueryErrors()
+		if onFail != nil {
+			onFail(sqlutil.SanitizeErrText(err.Error()))
+		}
 		h.logger.Error().Err(err).Msg("Failed to get column names in measurement query")
 		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
@@ -4746,9 +4816,15 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	// fires inside the streaming callback (#308).
 	streamCtx := ctx
 	c.Set("Content-Type", "application/json")
-	c.Context().SetBodyStreamWriter(h.safeStream("query_measurement", nil, func(w *bufio.Writer) {
-		// The measurement endpoint never registers with the query registry,
-		// so there is nothing to dispose of on the panic path.
+	streamStarted = true
+	c.Context().SetBodyStreamWriter(h.safeStream("query_measurement", func() {
+		// A recovered panic skips the dispositions below, which would leave
+		// the entry listed as running forever with nothing to reap it (#731,
+		// the shape #717 found elsewhere).
+		if onFail != nil {
+			onFail("stream writer panicked")
+		}
+	}, func(w *bufio.Writer) {
 		defer func() {
 			rows.Close()
 			if cancel != nil {
@@ -4780,6 +4856,15 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 				Str("measurement", measurement).
 				Int("rows_sent", rowCount).
 				Msg("queryMeasurement stream truncated after headers committed")
+			// Split timeout from failure so this endpoint reports the same
+			// disposition POST /api/v1/query does for the same event.
+			if errors.Is(streamErr, context.DeadlineExceeded) {
+				if onTimeout != nil {
+					onTimeout()
+				}
+			} else if onFail != nil {
+				onFail(sqlutil.SanitizeErrText(streamErr.Error()))
+			}
 			return
 		}
 
@@ -4794,6 +4879,9 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 			Msg("Measurement query completed")
 		h.logSlowQuery(convertedSQL, start, rowCount, tokenName)
+		if onComplete != nil {
+			onComplete(rowCount)
+		}
 	}))
 	return nil
 }

@@ -222,6 +222,32 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
 
 ## Bug fixes
 
+### The measurement endpoint now appears in query management ([#731](https://github.com/Basekick-Labs/arc/issues/731))
+
+`GET /api/v1/query/:measurement` never registered with the query registry, so
+it was missing from `GET /api/v1/queries/active` and `/history` and could not be
+stopped through `DELETE /api/v1/queries/:id`. An operator watching queries could
+not see it, and an expensive one could not be stopped.
+
+It now registers like `POST /api/v1/query`: the response carries
+`X-Arc-Query-ID`, the query shows up while running and lands in history with the
+right disposition, including `timed_out` rather than a generic failure, and a
+capped result carries `row_cap` as it does elsewhere.
+
+**These queries are now cancellable**, which they were not before. Cancelling
+stops the stream at the next chunk boundary; a single long-running sort or
+aggregate is not interrupted mid-chunk, so a cancel can take until that chunk
+materialises. A cancelled stream is marked truncated by the same signalling as
+any other interrupted response, so a client never reads a cancelled result as
+complete.
+
+`HEAD` on this route is deliberately not registered. Fiber routes `HEAD` to the
+same handler while the response body is discarded, so registering would leave a
+history entry whose only outcome is a spurious connection failure.
+
+`POST /api/v1/query/arrow` is unchanged and still creates no history entry;
+#731 stays open for it.
+
 ### Arrow IPC responses no longer write trailers from the wrong goroutine ([#729](https://github.com/Basekick-Labs/arc/issues/729))
 
 `POST /api/v1/query/arrow` set its HTTP trailers from inside the body-stream
@@ -273,10 +299,10 @@ incomplete. It does not prove rows were dropped: a query whose own `LIMIT`
 equals the cap reaches it on every run with nothing lost. The entry's SQL sits
 alongside, which is what tells the two apart.
 
-Note that `/api/v1/query/arrow` and `/api/v1/query/:measurement` do not create
-history entries at all, so a capped result on those endpoints is still absent
-from history rather than misreported
+Note that `/api/v1/query/arrow` does not create history entries at all, so a
+capped result there is still absent from history rather than misreported
 ([#731](https://github.com/Basekick-Labs/arc/issues/731)).
+`/api/v1/query/:measurement` is covered, see below.
 
 ### A governance row cap no longer looks like a complete result ([#724](https://github.com/Basekick-Labs/arc/issues/724))
 
