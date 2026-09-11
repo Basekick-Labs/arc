@@ -27,6 +27,10 @@ import (
 // response writer's panic path (#716). Production always uses the real one.
 var streamArrowIPCFunc = streamArrowIPC
 
+// releaseArrowStreamResourcesFunc indirects the cleanup so tests can count how
+// many times it runs (#733). Production always uses the real one.
+var releaseArrowStreamResourcesFunc = releaseArrowStreamResources
+
 // arrowTrailerWarnOnce gates the AddTrailer failure log so a fasthttp
 // upgrade that ever rejects the trailer name does not produce a Warn per
 // request.
@@ -119,11 +123,13 @@ func poisonArrowStream(w *bufio.Writer, logger zerolog.Logger) {
 // and statement that live on this connection, so returning the connection to
 // the pool first would hand another query a connection with an open result.
 //
-// It recovers on its own behalf (#716). It is called from the panic path,
-// where it runs on a bare fasthttp goroutine while a panic is already in
-// flight: a second panic raised here would either kill the process or, if
-// caught by the caller's recover, replace the root-cause panic value, since
-// recover() only ever yields the most recent one.
+// It recovers on its own behalf (#716). Its single caller is a defer inside the
+// Arrow IPC stream writer, so it runs on a bare fasthttp goroutine and, on the
+// panic path, during the unwind with a panic already in flight: a second panic
+// raised here would either kill the process or, if caught by the caller's
+// recover, replace the root-cause panic value, since recover() only ever yields
+// the most recent one. Do not remove the recover on the grounds that the happy
+// path cannot panic; the unwind is the case it exists for.
 func releaseArrowStreamResources(
 	reader array.RecordReader,
 	conn interface{ Close() error },
@@ -631,20 +637,28 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	trailers := newResponseTrailers()
 
 	streamCtx := ctx
-	// Cleanup runs from safeStream's panic path rather than an ordinary defer
-	// inside the writer, so the resources are freed on both paths (#716).
 	// streamW lets the panic path reach the same writer the body used, so it
 	// can mark the stream truncated. safeStream's onPanic takes no arguments,
 	// and widening it would churn five other call sites that have no writer to
 	// mark.
 	//
-	// The ordering constraint this comment used to carry, that the release had
-	// to stay ahead of the trailer set because both goroutines touched the
-	// response header, is gone: trailer values now go into `trailers` and are
-	// published by the connection goroutine (#729). What remains is that a
-	// panic after the straight-line release below runs it a second time, which
-	// over-releases the reader and logs a spurious cleanup panic (#733). A
-	// plain defer would be strictly better and is left to that issue.
+	// Cleanup is an ordinary defer inside the writer, which is what every other
+	// stream writer in this package already does (#733). It used to run from
+	// onPanic as well as straight-line at the end of the writer, so a panic
+	// after the straight-line call ran it twice. That was harmless only because
+	// all three resources tolerate a second call, which no test pinned and the
+	// array.RecordReader interface does not promise.
+	//
+	// It also covers a panic inside onPanic ahead of where the release used to
+	// sit, which skipped it and stranded the pooled connection. That one is
+	// reasoned, not tested: nothing in onPanic can be made to panic from a test
+	// without adding a seam for it.
+	//
+	// One thing the old shape did that this does not: releaseArrowStreamResources
+	// installs its recover first, so a panic in reader.Release skipped the
+	// conn.Close and cancel below it, and a later panic then retried them
+	// through onPanic. That retry is gone. It is not worth restoring, but the
+	// change is not strictly better on every panic path.
 	var streamW *bufio.Writer
 	h.setBodyStreamWithTrailers(fctx, "query_arrow_ipc", trailers, func() {
 		// A recovered panic leaves a stream the client would otherwise read as
@@ -652,9 +666,9 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		// a batch boundary decodes without error (#721).
 		//
 		// The body marker is the signal a client acts on, and it is always
-		// written: streamW is assigned as the writer closure's first statement,
-		// so it is never nil by the time a recovered panic reaches here. The
-		// trailer adds the reason, which this path carried not at all until
+		// written: streamW is assigned before anything in the writer that can
+		// panic, so it is never nil by the time a recovered panic reaches here.
+		// The trailer adds the reason, which this path carried not at all until
 		// #729 made setting one from this goroutine safe, and which the error
 		// path has always carried.
 		//
@@ -662,13 +676,14 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		// panicked on its way out still reports the error.
 		poisonArrowStream(streamW, h.logger)
 		trailers.setIfAbsent(arrowStreamTruncatedTrailer, "stream writer panicked")
-		releaseArrowStreamResources(reader, conn, cancel, h.logger)
 	}, func(w *bufio.Writer) {
+		// Registered before anything that can panic, so it runs exactly once
+		// whether the writer returns normally or unwinds (#733).
+		defer releaseArrowStreamResourcesFunc(reader, conn, cancel, h.logger)
 		streamW = w
 		totalRows, streamErr := streamArrowIPCFunc(
 			streamCtx, w, reader, schema, castInfo, dictEnabled, ipcCompression, governanceMaxRows, h.logger,
 		)
-		releaseArrowStreamResources(reader, conn, cancel, h.logger)
 
 		// Publish authoritative server-side timing as a chunked-transfer
 		// trailer. Set even on the error path so partial results carry

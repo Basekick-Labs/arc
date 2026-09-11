@@ -83,8 +83,10 @@ func TestReleaseArrowStreamResources(t *testing.T) {
 
 // TestExecuteQueryArrowReturnsConnectionOnPanic is the #716 regression proper.
 // It runs the real handler against a real DuckDB, forces the stream writer to
-// panic, and asserts the pooled connection goes back to the pool. Reverting the
-// cleanup to straight-line code leaves InUse at 1 and fails this test.
+// panic, and asserts the pooled connection goes back to the pool. Deleting the
+// deferred releaseArrowStreamResourcesFunc call at the top of the writer leaves
+// InUse at 1 and fails this test. It says nothing about how many times cleanup
+// runs; TestExecuteQueryArrowReleasesExactlyOnce covers that (#733).
 func TestExecuteQueryArrowReturnsConnectionOnPanic(t *testing.T) {
 	metrics.Init(zerolog.Nop())
 
