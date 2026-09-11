@@ -191,12 +191,16 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
 ## Upgrade notes
 
 1. **Clustered Enterprise deployments require a coordinated restart.** The
-   coordinator handshake wire format changed (see *Cluster hardening* above):
-   stop all cluster nodes, upgrade the binary on every node, then restart all
-   nodes. A rolling restart causes cross-version nodes to mark each other
-   unhealthy, can trigger an automatic writer failover, and can remove a
-   gracefully-restarted follower from the Raft configuration until its leader
-   is upgraded. Single-node, non-clustered and OSS deployments need no action.
+   coordinator handshake **and the replicate-sync handshake** wire formats
+   changed (see *Cluster hardening* and *Replicate-sync now authenticates
+   `SupportsBinaryEntries`* above): stop all cluster nodes, upgrade the binary
+   on every node, then restart all nodes. A rolling restart causes
+   cross-version nodes to mark each other unhealthy, can trigger an automatic
+   writer failover, and can remove a gracefully-restarted follower from the
+   Raft configuration until its leader is upgraded. A cross-version reader
+   additionally cannot establish WAL replication with a writer and will fall
+   behind until both ends are upgraded. Single-node, non-clustered and OSS
+   deployments need no action.
 2. **No configuration change is required.** Existing `arc.toml` files and
    license keys work as-is; no new keys were added.
 
