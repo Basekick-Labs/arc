@@ -624,28 +624,44 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		})
 	}
 
+	// Trailer values are collected here and published from the connection
+	// goroutine when the body ends (#729). Setting them directly on respHeader
+	// from the stream writer is a data race against fasthttp serialising the
+	// response head.
+	trailers := newResponseTrailers()
+
 	streamCtx := ctx
-	// Cleanup runs from safeStream's panic path rather than an ordinary
-	// defer inside the writer: on the success path the release must stay
-	// ahead of the trailer set below, because the stream-writer goroutine
-	// and the connection goroutine both touch the response header (#716).
+	// Cleanup runs from safeStream's panic path rather than an ordinary defer
+	// inside the writer, so the resources are freed on both paths (#716).
 	// streamW lets the panic path reach the same writer the body used, so it
 	// can mark the stream truncated. safeStream's onPanic takes no arguments,
 	// and widening it would churn five other call sites that have no writer to
 	// mark.
+	//
+	// The ordering constraint this comment used to carry, that the release had
+	// to stay ahead of the trailer set because both goroutines touched the
+	// response header, is gone: trailer values now go into `trailers` and are
+	// published by the connection goroutine (#729). What remains is that a
+	// panic after the straight-line release below runs it a second time, which
+	// over-releases the reader and logs a spurious cleanup panic (#733). A
+	// plain defer would be strictly better and is left to that issue.
 	var streamW *bufio.Writer
-	fctx.SetBodyStreamWriter(h.safeStream("query_arrow_ipc", func() {
+	h.setBodyStreamWithTrailers(fctx, "query_arrow_ipc", trailers, func() {
 		// A recovered panic leaves a stream the client would otherwise read as
 		// complete: fasthttp still writes the terminating chunk, and a cut on
 		// a batch boundary decodes without error (#721).
 		//
-		// Only the body is marked here, not the trailer. By this point
-		// fasthttp's connection goroutine may already be serialising the
-		// response header, and writing a trailer from this goroutine races
-		// with it (caught by the race detector). The marker in the body is
-		// what every client detects anyway; the trailer only ever carried the
-		// reason, and the panic is logged with far more detail than it could.
+		// The body marker is the signal a client acts on, and it is always
+		// written: streamW is assigned as the writer closure's first statement,
+		// so it is never nil by the time a recovered panic reaches here. The
+		// trailer adds the reason, which this path carried not at all until
+		// #729 made setting one from this goroutine safe, and which the error
+		// path has always carried.
+		//
+		// setIfAbsent, so a stream that failed with a real error and then
+		// panicked on its way out still reports the error.
 		poisonArrowStream(streamW, h.logger)
+		trailers.setIfAbsent(arrowStreamTruncatedTrailer, "stream writer panicked")
 		releaseArrowStreamResources(reader, conn, cancel, h.logger)
 	}, func(w *bufio.Writer) {
 		streamW = w
@@ -659,10 +675,13 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		// time-until-failure. On a hard client disconnect the trailer is
 		// silently dropped, same as any other post-body byte.
 		//
-		// Use the captured respHeader, NOT c.Context().Response.Header —
-		// fiber.Ctx is pooled and reset before this closure runs.
+		// Recorded on `trailers`, not on the response header: this closure
+		// runs on the stream-writer goroutine, which must not touch the header
+		// at all (#729). The connection goroutine publishes them when the body
+		// ends. fiber.Ctx is pooled and reset before this closure runs, so it
+		// is equally off limits.
 		execMs := time.Since(start).Milliseconds()
-		respHeader.Set(arrowExecutionTimeTrailer, strconv.FormatInt(execMs, 10))
+		trailers.set(arrowExecutionTimeTrailer, strconv.FormatInt(execMs, 10))
 
 		// Reported before the error branch below: a stream can reach the cap
 		// and then fail on the way out, so the operator-side record has to
@@ -690,7 +709,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			// marker has to precede the end-of-stream bytes, so it cannot
 			// be written from out here.
 			if !errors.Is(streamErr, errClientDisconnected) {
-				respHeader.Set(arrowStreamTruncatedTrailer, sqlutil.SanitizeErrText(streamErr.Error()))
+				trailers.set(arrowStreamTruncatedTrailer, sqlutil.SanitizeErrText(streamErr.Error()))
 			}
 			// Warn for client-disconnect / timeout (expected ops noise);
 			// Error for everything else (real server-side problem worth
@@ -709,14 +728,14 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		// arrowStreamTruncatedTrailer, which tells the client the opposite
 		// thing (do not trust this body at all).
 		if rowCapReached(governanceMaxRows, totalRows) {
-			respHeader.Set(arrowRowsCappedTrailer, strconv.Itoa(governanceMaxRows))
+			trailers.set(arrowRowsCappedTrailer, strconv.Itoa(governanceMaxRows))
 		}
 
 		h.logger.Info().
 			Int64("row_count", totalRows).
 			Int64("execution_time_ms", execMs).
 			Msg("Arrow streaming query completed")
-	}))
+	})
 
 	return nil
 }

@@ -51,11 +51,18 @@ jobs:
       # is excluded because it builds only under the arcx_engine tag, which no
       # CI or release build uses, so it cannot be compile-checked here; it is
       # tracked separately.
+      #
+      # NewStreamReader is matched as well as the two setters (#729): it is what
+      # actually spawns the bare goroutine, so SetBodyStream around a raw
+      # NewStreamReader would bypass safeStream while satisfying a setter-only
+      # pattern. Comment lines are dropped so prose describing the API does not
+      # trip the check.
       - name: Body-stream writers are panic-safe
         run: |
-          unwrapped=$(grep -rn "SetBodyStreamWriter(" internal/api/*.go \
+          unwrapped=$(grep -rnE "SetBodyStream(Writer)?\(|NewStreamReader\(" internal/api/*.go \
             | grep -v "_test.go" \
             | grep -v "internal/api/arcx_hook.go" \
+            | grep -vE ":[0-9]+:[[:space:]]*//" \
             | grep -v "safeStream(" || true)
           if [ -n "$unwrapped" ]; then
             echo "These body-stream writers bypass safeStream, so a panic in them would crash the process:"
