@@ -206,6 +206,21 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
 
 ## Bug fixes
 
+### A panic while streaming Arrow IPC no longer leaks a database connection ([#716](https://github.com/Basekick-Labs/arc/issues/716))
+
+`POST /api/v1/query/arrow` streams its response from a callback that fasthttp
+runs on its own goroutine, where an unrecovered panic would take down the
+process, so the callback recovers. The cleanup that released the DuckDB result
+reader, returned the pooled connection and stopped the query timeout timer ran
+as ordinary statements after the streaming call, and a panic unwound straight
+past them. The connection was the costly one: it was never returned to the
+pool, so each occurrence permanently shrank the pool and repeated occurrences
+would starve the endpoint until a restart. Cleanup now also runs on the
+recovery path, and the per-batch records the stream owns (row-cap slices,
+decimal casts, dictionary-encoded batches) are released through a defer so a
+panic mid-batch cannot strand their buffers either, which for DuckDB-backed
+records are C-allocated and not reclaimed by the garbage collector.
+
 ### Every query endpoint now enforces query governance ([#702](https://github.com/Basekick-Labs/arc/issues/702))
 
 Enterprise query governance was enforced only on `POST /api/v1/query`, so
