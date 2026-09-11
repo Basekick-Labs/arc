@@ -211,9 +211,106 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
    deployments need no action.
 2. **No configuration change is required.** Existing `arc.toml` files and
    license keys work as-is; no new keys were added.
+3. **Query response envelopes gained two optional keys** (`rows_capped`,
+   `row_cap`), emitted only when an Enterprise governance row cap truncated
+   the result. Conforming JSON and msgpack decoders are unaffected: the keys
+   are absent from every uncapped response, and a capped msgpack envelope
+   declares its own map length. A client that hardcodes the msgpack envelope
+   at seven or eight keys should read the length instead. Only deployments
+   with `governance.enabled = true` and a `max_rows_per_query` policy can see
+   them at all.
 
 ## Bug fixes
 
+### A governance row cap no longer looks like a complete result ([#724](https://github.com/Basekick-Labs/arc/issues/724))
+
+When an Enterprise governance policy capped a query with `max_rows_per_query`,
+the response was byte-identical to a complete one. The cap path returned no
+error, logged the ordinary "query completed" line, and emitted a normal
+end-of-stream marker and trailer on every wire format. Nothing said the result
+had been cut. Unlike the Arrow IPC truncation described below, this is reachable on
+purpose and by configuration, so an operator could hit it every day without
+knowing, and a dashboard quietly capped at 10,000 rows drew conclusions from
+truncated data.
+
+The 2026.02.2 notes that introduced the feature described the cap as returning
+"partial results with a warning". No warning existed. This release makes that
+claim true rather than correcting it.
+
+A capped result now says so on all four wire formats:
+
+- The JSON envelope carries `"rows_capped": true` and `"row_cap": <N>`. This
+  covers both JSON writers: the Arrow-backed one behind `POST /api/v1/query`
+  and the `database/sql` fallback that also serves the parallel-partition and
+  measurement paths.
+- The msgpack envelope carries the same two keys.
+- Both keys are present together or not at all, so an uncapped response is
+  unchanged on the wire and the msgpack envelope keeps its historical seven or
+  eight keys.
+- Arrow IPC carries an `Arc-Rows-Capped` response trailer holding the cap. A
+  trailer for the same reason `Arc-Execution-Time-Ms` is one: whether the cap
+  was reached is only known once the last batch is written, long after the
+  status line went out. Like every registered trailer it is emitted on every
+  response, empty when it does not apply, so the client contract is "non-empty
+  means capped".
+
+A plain response header was the first choice and does not work. Headers are
+committed before the body streams, so a header can announce that a cap applies
+but never that the result reached it, which is the fact a client needs.
+
+Read `Arc-Rows-Capped` alongside `Arc-Stream-Truncated`, which means close to
+the opposite. `Arc-Stream-Truncated` says the body is short because the stream
+failed and must not be trusted. `Arc-Rows-Capped` says the body is short
+because policy said so, and is a valid, complete result up to the cap.
+
+This pairs with `truncated` / `truncation_reason` from the JSON fix below, and
+the two answer different questions. `truncated` means the stream failed and the
+result is short by accident. `rows_capped` means policy stopped it on purpose
+and the rows delivered are a valid result up to the cap. A response can carry
+both, when a stream reaches the cap and then fails on the way out; each field
+still means exactly what it means alone.
+
+Server side, a capped query now emits a WARN naming the responsible token
+(`token_id`, `token_name`, `row_cap`, `row_count`) and increments the new
+`arc_governance_queries_capped_total` counter. The "query completed" line stays
+at Info, so existing log filters keep working. Only queries that actually reach
+a cap log or count, so a token that merely has a policy adds no log volume.
+
+One consequence worth knowing before you alert on the counter: a query whose own
+`LIMIT` equals the policy cap reaches the cap on every run, so it is marked, and
+logged, and counted every time, even though nothing was ever dropped. If a
+dashboard issues `LIMIT 10000` against a `max_rows_per_query` of 10000, raise
+the cap above the limit and the noise goes away. Arc cannot tell the two apart
+without fetching a row past the cap, and that fetch is not free:
+
+The marker means "this result reached the cap and may be incomplete", not "rows
+were definitely dropped". A stream that stops exactly at the cap cannot know
+whether another row was waiting without fetching one, and fetching one is worse
+than the ambiguity: on the Arrow IPC path it would let a policy timeout firing
+during that extra fetch poison a result that was complete at the cap, turning a
+readable response into an undecodable one. Reaching the cap is what the client
+needs in order to stop trusting the row count, and it is always known for
+certain.
+
+Two related gaps are unchanged. The experimental arcx Arrow IPC serve path
+applies no row cap at all, and returns before any trailer is registered, so an
+arcx-served Arrow IPC response carries none of the three trailers
+([#727](https://github.com/Basekick-Labs/arc/issues/727)); clients should read a
+missing trailer as "unknown", never as "not capped". And
+`/api/v1/queries/history` still records a capped query as an ordinary success
+([#728](https://github.com/Basekick-Labs/arc/issues/728)).
+
+Adding end-to-end coverage for the Arrow IPC trailer also turned up a data race
+that predates it ([#729](https://github.com/Basekick-Labs/arc/issues/729)): all
+three trailers on that endpoint are set from the stream-writer goroutine while
+fasthttp serialises the response head on the connection goroutine, and the two
+mutate the same buffer. It fires on `Arc-Execution-Time-Ms` alone, so it arrived
+with the trailers in this release rather than with the row cap. No test had ever
+driven that handler to success over a real HTTP response, which is why it went
+unseen.
+
+`[governance]` is also now documented in the reference `arc.toml`, which
+shipped with none of its keys.
 ### JSON query responses now say when the result was cut short ([#723](https://github.com/Basekick-Labs/arc/issues/723))
 
 A JSON response opens with `{"success":true,...,"data":[` before the first row
@@ -307,7 +404,9 @@ cost). All four now share one enforcement path: rejected requests get 429
 (with `Retry-After` for rate limits), the policy's `max_rows_per_query`
 caps streamed rows on the row-returning endpoints (JSON, Arrow IPC, and
 the database/sql fallback), and `max_scan_duration_sec` overrides the
-global `query.timeout` everywhere. RBAC was never affected; this closes a
+global `query.timeout` everywhere. That cap was silent when this landed;
+see *A governance row cap no longer looks like a complete result* above
+for the marker that now accompanies it. RBAC was never affected; this closes a
 limits and accounting gap, not an authorization hole.
 
 ### The measurement endpoint now honors the configured query timeout ([#308](https://github.com/Basekick-Labs/arc/issues/308))

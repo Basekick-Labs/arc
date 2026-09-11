@@ -244,6 +244,7 @@ func (h *QueryHandler) serveArcxResult(
 	// the released RequestCtx) segfaults the process. Capture every ctx-derived
 	// value the async writers need BEFORE committing the stream writer.
 	tokenName := getTokenName(c)
+	tokenID := getTokenID(c)
 
 	if isMsgPackWire(c) {
 		// MAJOR-4: msgpack must drain SYNCHRONOUSLY here — BEFORE committing headers —
@@ -282,7 +283,7 @@ func (h *QueryHandler) serveArcxResult(
 				}
 			}()
 			bw := bufio.NewWriterSize(w, 256*1024)
-			if _, serr := streamMsgPackFromBatches(streamCtx, bw, schema, batches, rowCount, nil, start, timestamp); serr != nil {
+			if _, serr := streamMsgPackFromBatches(streamCtx, bw, schema, batches, rowCount, governanceMaxRows, nil, start, timestamp); serr != nil {
 				h.logger.Warn().Err(serr).Msg("arcx serve: msgpack stream error after headers committed")
 			}
 			bw.Flush()
@@ -298,6 +299,7 @@ func (h *QueryHandler) serveArcxResult(
 			if onComplete != nil {
 				onComplete(rowCount)
 			}
+			h.logGovernanceRowCap("msgpack", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rowCount))
 			h.logSlowQuery(convertedSQL, start, rowCount, tokenName)
 		})
 		return true
@@ -319,6 +321,10 @@ func (h *QueryHandler) serveArcxResult(
 		}()
 		rc, serr := streamArrowJSON(streamCtx, w, reader, governanceMaxRows, nil, start, timestamp)
 		m := metrics.Get()
+		// Reported before the branch below: a stream can reach the cap and
+		// then fail on the way out, and the envelope marks it capped either
+		// way, so the operator-side record has to fire on both paths (#724).
+		h.logGovernanceRowCap("arrow_json", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rc))
 		if serr != nil {
 			// F4: headers (and `"success":true`) are already committed, so the CLIENT
 			// has been told this succeeded. Marking the registry Fail here would make

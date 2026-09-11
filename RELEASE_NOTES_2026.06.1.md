@@ -351,17 +351,26 @@ The columnar redesign was the single change that mattered. Everything else was d
 **Wire format spec.** Single msgpack map per response; `data` is columnar:
 
 ```
-map(7 or 8) {
+map(7, 8, 9 or 10) {
   "success":           bool                                    // true on success
   "columns":           [string, ...]                           // column names (numCols entries)
   "types":             [string, ...]                           // arrow.DataType.String() per column, parallel to columns
   "data":              [[col0_v, col0_v, ...], [col1_v, ...]]  // numCols outer entries, numRows inner
   "row_count":         uint                                    // = inner length, redundant for client convenience
+  "rows_capped":       bool                                    // only when a governance row cap was reached (26.09.2+)
+  "row_cap":           uint                                    // paired with rows_capped, never sent alone
   "execution_time_ms": uint                                    // millisecond integer (JSON sends a float)
   "timestamp":         string                                  // RFC3339
   "profile":           map                                     // only when ?profile=true (json-tagged QueryProfile struct)
 }
 ```
+
+> **Updated in 26.09.2.** `rows_capped` / `row_cap` were added by
+> [#724](https://github.com/Basekick-Labs/arc/issues/724) so a result truncated
+> by an Enterprise governance row cap stops being indistinguishable from a
+> complete one. They are emitted as a pair and only when a cap was reached, so
+> an uncapped response still has exactly the 7 or 8 keys documented above. Read
+> the declared map length rather than assuming it.
 
 Per-column primitive encoding:
 - **Int8/16/32/64, Uint8/16/32/64**: msgpack int / uint. `Int64`/`Uint64` use `EncodeInt64`/`EncodeUint64` (always 9 bytes) to skip the library's size-class branching.
@@ -374,7 +383,7 @@ Per-column primitive encoding:
 
 **Important operational constraints.**
 
-- **Buffered, not streamed.** msgpack arrays require an explicit length prefix, so the endpoint drains every Arrow batch into memory before emitting the data array. The only row ceiling is `governance.max_rows` (Enterprise token policy); without it, the response is unbounded — same hazard the JSON `database/sql` fallback carries, just sharper because msgpack materializes the whole result before sending the first byte. If msgpack graduates we'll re-introduce an operator-configurable ceiling.
+- **Buffered, not streamed.** msgpack arrays require an explicit length prefix, so the endpoint drains every Arrow batch into memory before emitting the data array. The only row ceiling is `governance.default_max_rows_per_query`, or a per-token `max_rows_per_query` policy (Enterprise); without one, the response is unbounded, the same hazard the JSON `database/sql` fallback carries, just sharper because msgpack materializes the whole result before sending the first byte. If msgpack graduates we'll re-introduce an operator-configurable ceiling.
 - **Parallel-partition execution is bypassed.** The msgpack endpoint forces the standard Arrow dispatch even when the query would otherwise be eligible for the parallel-partition executor. Parallel queries route through the JSON-streaming merge iterator and don't share the msgpack encode path; coupling them would multiply the experimental surface area.
 - **No `database/sql` fallback.** The Arrow path is the entire reason for the endpoint; falling back to `Scan`-based row iteration would defeat the contract. When the Arrow driver is unavailable (build without `duckdb_arrow`, or driver capability mismatch), the route returns `501 Not Implemented` rather than silently downgrading.
 - **Errors, `SHOW DATABASES`, `SHOW TABLES`** are also encoded as columnar msgpack. The same `wire_format` request-local that routes the streaming hot path also drives a `respondError` / `respondSuccessRows` / `respondEmptySuccess` helper trio so every response from the shared `executeQuery` pipeline matches the content type the caller asked for.

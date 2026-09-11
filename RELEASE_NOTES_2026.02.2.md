@@ -78,6 +78,12 @@ Arc Enterprise now includes per-token query governance with sliding window rate 
 - **Default policies** via config — apply limits to all tokens without explicit policies
 - **Hot-reconfigurable** — policy changes take effect immediately without restart
 
+> **Correction (2026.09.2).** The "max rows per query" bullet above promised a
+> warning alongside the partial result. No warning was implemented: a capped
+> response was byte-identical to a complete one on every wire format until
+> [#724](https://github.com/Basekick-Labs/arc/issues/724) shipped in v2026.09.2.
+> The bullet is left as published; treat it as accurate only from 2026.09.2 on.
+
 **Configuration:**
 ```toml
 [governance]

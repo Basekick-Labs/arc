@@ -146,6 +146,27 @@ s3_cache_size = "128MB"
 s3_cache_ttl_seconds = 3600
 
 # -----------------------------------------------------------------------------
+# Query Governance (Enterprise)
+# -----------------------------------------------------------------------------
+# Per-token rate limits, quotas and row caps. Defaults here apply to every token
+# without an explicit policy; per-token policies are managed through
+# /api/v1/governance/policies. 0 means unlimited. The per-query timeout override
+# (max_scan_duration_sec) is per-policy only and has no default key here.
+[governance]
+enabled = false
+# default_rate_limit_per_min = 0
+# default_rate_limit_per_hour = 0
+# default_max_queries_per_hour = 0
+# default_max_queries_per_day = 0
+
+# Caps the rows any single query returns. A capped response is a valid,
+# complete-up-to-the-cap result, and says so: JSON and msgpack carry
+# "rows_capped": true and "row_cap", Arrow IPC carries the Arc-Rows-Capped
+# response trailer, and the server logs a WARN naming the token and counts
+# arc_governance_queries_capped_total.
+# default_max_rows_per_query = 0
+
+# -----------------------------------------------------------------------------
 # Telemetry
 # -----------------------------------------------------------------------------
 [telemetry]

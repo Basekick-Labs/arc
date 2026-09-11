@@ -211,6 +211,17 @@ scanLoop:
 	scratch = strconv.AppendInt(scratch[:0], int64(rowCount), 10)
 	w.Write(scratch)
 
+	// Governance row cap (#724): a capped result was otherwise byte-identical
+	// to a complete one, so a dashboard quietly cut at 10,000 rows drew
+	// conclusions from truncated data. Both keys are omitted entirely when no
+	// cap applied or the result did not reach it, so an uncapped response is
+	// unchanged on the wire.
+	if rowCapReached(governanceMaxRows, int64(rowCount)) {
+		w.WriteString(`,"rows_capped":true,"row_cap":`)
+		scratch = strconv.AppendInt(scratch[:0], int64(governanceMaxRows), 10)
+		w.Write(scratch)
+	}
+
 	executionTime := float64(time.Since(start).Milliseconds())
 	w.WriteString(`,"execution_time_ms":`)
 	scratch = strconv.AppendFloat(scratch[:0], executionTime, 'f', -1, 64)

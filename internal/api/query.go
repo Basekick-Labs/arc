@@ -939,6 +939,43 @@ func (h *QueryHandler) logSlowQuery(sql string, start time.Time, rowCount int, t
 		Msg("Slow query detected")
 }
 
+// getTokenID extracts the token id from the Fiber context, or 0 if auth is
+// not configured or no token is present. Governance policies are keyed by
+// token id, so it is the field an operator needs in order to find the policy
+// behind a capped result; it is captured before the async stream writers run,
+// for the same reason getTokenName is.
+func getTokenID(c *fiber.Ctx) int64 {
+	if ti := auth.GetTokenInfo(c); ti != nil {
+		return ti.ID
+	}
+	return 0
+}
+
+// logGovernanceRowCap emits the operator-side half of the #724 signal. The
+// wire marker tells the client its result may be incomplete; this tells the
+// operator which policy did it, and feeds the counter they can alert on.
+//
+// It is a separate Warn record rather than a promotion of the per-format
+// "query completed" line, matching logSlowQuery: the completion line stays at
+// Info so existing log filters on it keep working, and one record does not
+// change severity depending on its fields. It fires only for queries that
+// actually reached a cap, so a token that merely has a policy generates no
+// extra log volume.
+func (h *QueryHandler) logGovernanceRowCap(format, sql string, tokenID int64, tokenName string, rowCap int, rowCount int64) {
+	if !rowCapReached(rowCap, rowCount) {
+		return
+	}
+	metrics.Get().IncGovernanceQueriesCapped()
+	h.logger.Warn().
+		Str("format", format).
+		Str("sql", sqlutil.ForLog(sql)).
+		Int64("token_id", tokenID).
+		Str("token_name", tokenName).
+		Int("row_cap", rowCap).
+		Int64("row_count", rowCount).
+		Msg("Query result reached the governance row cap; client received a partial result")
+}
+
 // getTokenName extracts the token name from the Fiber context, or returns
 // empty string if auth is not configured or no token is present.
 func getTokenName(c *fiber.Ctx) string {
@@ -1806,6 +1843,7 @@ localProcessing:
 
 		// Capture token name before async callback (Fiber context not safe in callbacks)
 		tokenName := getTokenName(c)
+		tokenID := getTokenID(c)
 
 		// Stream typed JSON response directly to HTTP — no full-response buffering.
 		// streamCtx captures the timeout-aware context for per-row cancellation
@@ -1833,6 +1871,13 @@ localProcessing:
 			}()
 			rowCount, streamErr := streamTypedJSONFunc(streamCtx, w, columns, colTypes, iter, governanceMaxRows, profile, start, timestamp)
 			w.Flush()
+
+			// Reported before the error branch below: a stream can reach the
+			// cap and then fail on the way out, and the envelope marks it
+			// capped either way, so the operator-side record has to fire on
+			// both paths or it would go missing in the one case where the
+			// result is both capped and truncated (#724).
+			h.logGovernanceRowCap("json", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rowCount))
 
 			// Record metrics after streaming completes. If the stream
 			// terminated mid-flight (Scan / Err / ctx cancel), record as
@@ -2066,6 +2111,7 @@ localProcessing:
 
 		// Capture token name before async callback (Fiber context not safe in callbacks)
 		tokenName := getTokenName(c)
+		tokenID := getTokenID(c)
 
 		// Stream typed JSON response directly to HTTP — no full-response buffering.
 		// streamCtx captures the timeout-aware context so per-row cancellation
@@ -2090,6 +2136,13 @@ localProcessing:
 			}()
 			rowCount, streamErr := streamTypedJSONFunc(streamCtx, w, columns, colTypes, rows, governanceMaxRows, profile, start, timestamp)
 			w.Flush()
+
+			// Reported before the error branch below: a stream can reach the
+			// cap and then fail on the way out, and the envelope marks it
+			// capped either way, so the operator-side record has to fire on
+			// both paths or it would go missing in the one case where the
+			// result is both capped and truncated (#724).
+			h.logGovernanceRowCap("json", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rowCount))
 
 			// If the stream terminated mid-flight (Scan / Err / ctx
 			// cancel) record as failure even though the JSON envelope
@@ -4399,6 +4452,27 @@ func (h *QueryHandler) checkQueryGovernance(c *fiber.Ctx) (maxRows int, timeout 
 	return result.MaxRows, result.MaxDuration, nil
 }
 
+// rowCapReached reports whether a result reached the governance row cap, which
+// is the single definition of the #724 signal. It deliberately answers "reached
+// the cap", not "rows were dropped": a stream that stops exactly at the cap
+// cannot know whether another row was waiting without fetching one, and the one
+// design that fetched it turned a complete-at-cap Arrow IPC result into a
+// poisoned, undecodable stream whenever the policy timeout fired during the
+// extra fetch. "Reached the cap, so this may be incomplete" is always true here
+// and is what a client needs in order to stop trusting the result.
+//
+// The known cost of those semantics: a query whose own LIMIT equals the policy
+// cap reaches the cap on every run, so it is marked, logged and counted every
+// time without a row ever being dropped. Operators hitting that raise the cap
+// above the limit. Distinguishing the two requires fetching a row past the cap,
+// which is the fetch described above.
+//
+// maxRows <= 0 means no policy cap applies, including when governance is
+// unlicensed, unconfigured, or the request carries no token.
+func rowCapReached(maxRows int, rowCount int64) bool {
+	return maxRows > 0 && rowCount >= int64(maxRows)
+}
+
 // queryMeasurement handles GET /api/v1/query/:measurement - query a specific measurement
 func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	start := time.Now()
@@ -4635,6 +4709,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 
 	// Capture token name before async callback (Fiber context not safe in callbacks)
 	tokenName := getTokenName(c)
+	tokenID := getTokenID(c)
 
 	// Stream typed JSON with the timeout-aware context so per-row cancellation
 	// fires inside the streaming callback (#308).
@@ -4651,6 +4726,13 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		}()
 		rowCount, streamErr := streamTypedJSONFunc(streamCtx, w, columns, colTypes, rows, governanceMaxRows, nil, start, timestamp)
 		w.Flush()
+
+		// Reported before the error branch below: a stream can reach the cap
+		// and then fail on the way out, and the envelope marks it capped
+		// either way, so the operator-side record has to fire on both paths
+		// or it would go missing in the one case where the result is both
+		// capped and truncated (#724).
+		h.logGovernanceRowCap("json", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rowCount))
 
 		if streamErr != nil {
 			m.IncQueryErrors()
