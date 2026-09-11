@@ -1878,6 +1878,13 @@ localProcessing:
 			// both paths or it would go missing in the one case where the
 			// result is both capped and truncated (#724).
 			h.logGovernanceRowCap("json", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rowCount))
+			// Same reasoning for the history entry (#728): recorded here,
+			// before the disposition below, so a result that reached the cap
+			// and then failed keeps the cap instead of losing it on the
+			// Fail/TimedOut path.
+			if h.queryRegistry != nil && queryID != "" {
+				h.queryRegistry.RecordRowCap(queryID, reachedRowCap(governanceMaxRows, int64(rowCount)))
+			}
 
 			// Record metrics after streaming completes. If the stream
 			// terminated mid-flight (Scan / Err / ctx cancel), record as
@@ -1948,7 +1955,10 @@ localProcessing:
 		var arcxOnComplete func(int)
 		var arcxOnFail func(string)
 		if h.queryRegistry != nil && queryID != "" {
-			arcxOnComplete = func(rc int) { h.queryRegistry.Complete(queryID, rc) }
+			arcxOnComplete = func(rc int) {
+				h.queryRegistry.RecordRowCap(queryID, reachedRowCap(governanceMaxRows, int64(rc)))
+				h.queryRegistry.Complete(queryID, rc)
+			}
 			arcxOnFail = func(msg string) { h.queryRegistry.Fail(queryID, msg) }
 		}
 		if h.tryArcxRouter(c, ctx, cancel, start, req.SQL, headerDB, convertedSQL,
@@ -1991,7 +2001,10 @@ localProcessing:
 			var onFail func(string)
 			var onTimeout func()
 			if h.queryRegistry != nil && queryID != "" {
-				onComplete = func(rc int) { h.queryRegistry.Complete(queryID, rc) }
+				onComplete = func(rc int) {
+					h.queryRegistry.RecordRowCap(queryID, reachedRowCap(governanceMaxRows, int64(rc)))
+					h.queryRegistry.Complete(queryID, rc)
+				}
 				onFail = func(msg string) { h.queryRegistry.Fail(queryID, msg) }
 				onTimeout = func() { h.queryRegistry.TimedOut(queryID) }
 			}
@@ -2143,6 +2156,13 @@ localProcessing:
 			// both paths or it would go missing in the one case where the
 			// result is both capped and truncated (#724).
 			h.logGovernanceRowCap("json", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rowCount))
+			// Same reasoning for the history entry (#728): recorded here,
+			// before the disposition below, so a result that reached the cap
+			// and then failed keeps the cap instead of losing it on the
+			// Fail/TimedOut path.
+			if h.queryRegistry != nil && queryID != "" {
+				h.queryRegistry.RecordRowCap(queryID, reachedRowCap(governanceMaxRows, int64(rowCount)))
+			}
 
 			// If the stream terminated mid-flight (Scan / Err / ctx
 			// cancel) record as failure even though the JSON envelope
@@ -4450,6 +4470,17 @@ func (h *QueryHandler) checkQueryGovernance(c *fiber.Ctx) (maxRows int, timeout 
 		return 0, 0, &governanceRejection{reason: result.Reason}
 	}
 	return result.MaxRows, result.MaxDuration, nil
+}
+
+// reachedRowCap returns the governance cap when a result reached it, and 0
+// otherwise, so callers can hand it straight to Registry.RecordRowCap without
+// branching. It wraps rowCapReached rather than re-deriving the condition, so
+// the wire markers, the operator log and the history entry cannot drift apart.
+func reachedRowCap(rowCap int, rowCount int64) int {
+	if rowCapReached(rowCap, rowCount) {
+		return rowCap
+	}
+	return 0
 }
 
 // rowCapReached reports whether a result reached the governance row cap, which
