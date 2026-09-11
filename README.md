@@ -456,6 +456,7 @@ Thanks to everyone who has contributed code to Arc:
 - [@copacabanaservice01](https://github.com/copacabanaservice01) — calendar-day S3 range path generation across DST transitions (#690)
 - [@be-student](https://github.com/be-student) — extracted the Arrow IPC stream loop into a testable helper with leak-checked regression coverage for disconnects, cancellation, and decimal-cast cleanup (#706)
 - [@MrBeldum](https://github.com/MrBeldum) (Daniel) — configured query timeout applied to the measurement endpoint, with request-scoped cancellation and 504 handling on both query paths (#701)
+- [@pujitha24](https://github.com/pujitha24) (Pujitha Paladugu) — tiered query routing pushed into SQL instead of filtering file metadata in Go (#707), replicate-sync handshake now authenticating the binary-framing capability flag (#715)
 
 And a thank-you to community members whose bug reports drove fixes:
 
