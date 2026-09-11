@@ -222,6 +222,37 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
 
 ## Bug fixes
 
+### Arrow IPC responses no longer write trailers from the wrong goroutine ([#729](https://github.com/Basekick-Labs/arc/issues/729))
+
+`POST /api/v1/query/arrow` set its HTTP trailers from inside the body-stream
+writer. fasthttp runs that writer on a goroutine of its own while the connection
+goroutine serialises the response head, and both mutate the same response-header
+buffer. fasthttp states the rule this broke: "Response instance MUST NOT be used
+from concurrently running goroutines."
+
+**Affects v26.06.1 through v26.09.1.** The `Arc-Execution-Time-Ms` trailer
+arrived in v26.06.1 and is set on every Arrow IPC response, so every such
+response carried the defect. The two trailers added earlier in this release
+cycle, `Arc-Stream-Truncated` and `Arc-Rows-Capped`, inherited it.
+
+Two ways it could surface. The mild one is a torn status line or a garbled
+trailer on a single response. The serious one needs a client disconnect: Arc
+abandons the body stream when the write fails, resets the response, and reuses
+it for the next request on a keep-alive connection, while the stream writer is
+still running and still sets its trailer. That write lands on a response that
+now belongs to a different request.
+
+Both are timing-dependent and neither corrupts stored data. Nothing needs to be
+re-run or repaired after upgrading, and no configuration changes.
+
+Trailer values are now collected by the writer and published by the connection
+goroutine, in the window fasthttp guarantees between the body ending and the
+trailers being written. A contract test pins that ordering, so a future fasthttp
+upgrade that changes it fails a test rather than silently emitting empty
+trailers.
+
+It went unseen because no test had ever driven that handler to a successful
+response over real HTTP. Adding one for #724 is what surfaced it.
 ### Query history records when a governance row cap truncated a result ([#728](https://github.com/Basekick-Labs/arc/issues/728))
 
 An Enterprise governance row cap was visible to the client and in the operator
@@ -323,15 +354,6 @@ arcx-served Arrow IPC response carries none of the three trailers
 ([#727](https://github.com/Basekick-Labs/arc/issues/727)); clients should read a
 missing trailer as "unknown", never as "not capped".
 
-Adding end-to-end coverage for the Arrow IPC trailer also turned up a data race
-that predates it ([#729](https://github.com/Basekick-Labs/arc/issues/729)): all
-three trailers on that endpoint are set from the stream-writer goroutine while
-fasthttp serialises the response head on the connection goroutine, and the two
-mutate the same buffer. It fires on `Arc-Execution-Time-Ms` alone, so it arrived
-with the trailers in this release rather than with the row cap. No test had ever
-driven that handler to success over a real HTTP response, which is why it went
-unseen.
-
 `[governance]` is also now documented in the reference `arc.toml`, which
 shipped with none of its keys.
 ### JSON query responses now say when the result was cut short ([#723](https://github.com/Basekick-Labs/arc/issues/723))
@@ -375,6 +397,12 @@ result, which a dashboard shows as no data rather than as an error.
 A failed stream is now marked so the client's decode fails instead. Complete
 responses are unchanged, and a client that has already disconnected is not
 written to, since there is nobody left to inform.
+
+A stream cut short by a panic now also carries a reason in the
+`Arc-Stream-Truncated` trailer. The in-body marker was already there, so clients
+could always tell such a stream apart from a complete one; what they could not
+see was why. The error path has always named its cause, and the panic path named
+nothing, because setting a trailer from that goroutine was unsafe until #729.
 
 Arc also now distinguishes a dropped connection from an encoder failure on this
 path. Both previously surfaced the same way, so a client hanging up mid-stream

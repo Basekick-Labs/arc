@@ -26,7 +26,15 @@ import (
 // Resources that can simply be freed at the end of sw belong in an ordinary
 // defer inside sw instead, not here.
 //
-// Every SetBodyStreamWriter call in this package goes through this wrapper.
+// Every body stream in this package goes through this wrapper, whether it is
+// installed with SetBodyStreamWriter directly or through
+// setBodyStreamWithTrailers (#729). CI greps for both, plus the underlying
+// NewStreamReader, and fails on any that does not mention safeStream.
+//
+// One exception, deliberate and excluded from that grep: the three writers in
+// arcx_hook.go. They build only under the arcx_engine tag, which no CI or
+// release build uses, so they cannot be compile-checked here. They are
+// genuinely unwrapped, and tracked separately.
 func (h *QueryHandler) safeStream(stream string, onPanic func(), sw func(*bufio.Writer)) func(*bufio.Writer) {
 	return func(w *bufio.Writer) {
 		defer func() {
