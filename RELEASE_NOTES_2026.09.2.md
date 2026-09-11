@@ -222,6 +222,35 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
 
 ## Bug fixes
 
+### Arrow IPC cleanup no longer runs twice on the panic path ([#733](https://github.com/Basekick-Labs/arc/issues/733))
+
+No behaviour changes for anyone running Arc. This is recorded because the code
+was correct for a reason nothing in the repo could check.
+
+`POST /api/v1/query/arrow` freed its DuckDB reader, pooled connection and query
+timeout from two places: an ordinary statement at the end of the stream writer,
+and again from the panic handler. A panic raised after the first one, in the
+trailer or logging statements that follow it, ran the whole cleanup a second
+time.
+
+That was harmless, and it is worth being precise about why, because the first
+version of this report claimed otherwise. The DuckDB reader's `Release` has an
+explicit "already at zero" guard, `*sql.Conn.Close` returns
+`sql.ErrConnDone` rather than failing, and cancelling a context twice is
+allowed. Nothing was over-released and nothing leaked.
+
+The problem was that none of those three properties is promised by the
+interfaces Arc codes against, and none was pinned by a test. Arrow's own readers
+guard over-release behind an assertion that is compiled out unless the build
+sets `-tags assert`, which no Arc build does, so losing the invariant would not
+have failed anything anywhere. It would have gone unnoticed rather than
+corrupted anything, which is the point: there was no signal to rely on.
+
+Cleanup is now a single deferred call, which runs exactly once whether the
+writer returns normally or unwinds, and matches what every other stream writer
+in Arc already did. It also covers a panic raised inside the panic handler
+itself, ahead of where the release used to sit, which would have stranded a
+pooled connection.
 ### The measurement endpoint now appears in query management ([#731](https://github.com/Basekick-Labs/arc/issues/731))
 
 `GET /api/v1/query/:measurement` never registered with the query registry, so
@@ -448,7 +477,9 @@ service.
 Recovering also exposed what the unwind had been skipping. Those writers
 released their result set, pooled connection and query timeout in ordinary
 statements after the streaming call, so the fix moves each into a deferred block
-that keeps the original release order. Six of the writers also disposed of their
+that keeps the original release order. The Arrow IPC writer was the exception
+and kept a split between an inline release and the panic handler until the #733
+entry above, later in this same release, brought it into line. Six of the writers also disposed of their
 query-registry entry only on the normal path, which meant a panicking query would
 have sat in `GET /api/v1/queries/active` as `running` forever, holding its SQL
 text and inflating the active-query gauge, with no reaper to clear it; those
@@ -463,8 +494,11 @@ reader, returned the pooled connection and stopped the query timeout timer ran
 as ordinary statements after the streaming call, and a panic unwound straight
 past them. The connection was the costly one: it was never returned to the
 pool, so each occurrence permanently shrank the pool and repeated occurrences
-would starve the endpoint until a restart. Cleanup now also runs on the
-recovery path, and the per-batch records the stream owns (row-cap slices,
+would starve the endpoint until a restart. Cleanup now runs on the recovery
+path too, from a single deferred call that covers both paths (the original fix
+ran it from the panic handler as well as inline, which the #733 entry above
+replaced later in this same release). The per-batch records the stream owns
+(row-cap slices,
 decimal casts, dictionary-encoded batches) are released through a defer so a
 panic mid-batch cannot strand their buffers either, which for DuckDB-backed
 records are C-allocated and not reclaimed by the garbage collector.

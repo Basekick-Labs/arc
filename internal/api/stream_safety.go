@@ -16,16 +16,21 @@ import (
 // is a process crash, not a failed request.
 //
 // onPanic runs only on the panic path, after the root cause has been logged,
-// and is for work the unwind skipped that a plain defer inside sw cannot do:
-// releasing resources whose release must not move relative to the rest of the
-// happy path, and disposing of a query-registry entry that would otherwise sit
-// in "running" forever. It runs inside its own recover, because it executes
-// while a panic is already in flight: a second panic here would either kill the
-// process or, being the most recent value, replace the root cause in the log.
+// and is for work that has no meaning on the happy path: disposing of a
+// query-registry entry that would otherwise sit in "running" forever, and
+// marking a response the client would otherwise read as complete.
 //
-// Resources that can simply be freed at the end of sw belong in an ordinary
-// defer inside sw instead, not here.
+// Freeing resources is NOT its job. That belongs in an ordinary defer inside
+// sw, which every caller now uses, and which covers strictly more than onPanic
+// does: a runtime.Goexit runs defers but leaves recover returning nil, so
+// onPanic never fires, and a panic inside onPanic ahead of a release would
+// strand whatever it had not freed yet (#733).
 //
+// It runs inside its own recover, because it executes while a panic is already
+// in flight: a second panic here would either kill the process or, being the
+// most recent value, replace the root cause in the log.
+//
+
 // Every body stream in this package goes through this wrapper, whether it is
 // installed with SetBodyStreamWriter directly or through
 // setBodyStreamWithTrailers (#729). CI greps for both, plus the underlying
