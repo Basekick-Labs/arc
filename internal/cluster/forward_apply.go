@@ -171,6 +171,22 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 		c.closeForwardConn()
 		return fmt.Errorf("forward apply: ack payload has wrong type: %T", ackMsg.Payload)
 	}
+	// Authenticate the ack BEFORE reading anything it says.
+	//
+	// Order is load-bearing. Status and Code drive caller behaviour: an
+	// unsigned {Status:"error", Code:"not_leader"} maps to ErrNoLeaderKnown
+	// and is retried as a transient leadership change, and an
+	// {Code:"apply_failed", Error:"... already exists"} is read by
+	// ensureFirstToken as "bootstrap already done". Branching first would let
+	// an on-path attacker pick either outcome.
+	if err := c.checkForwardAck(ack, req.Nonce); err != nil {
+		// Unlike a protocol-level rejection below, a bad MAC means the peer
+		// on the other end of this pooled connection is not trusted — drop it
+		// rather than reuse it for the next command.
+		c.closeForwardConn()
+		return fmt.Errorf("forward apply: %w", err)
+	}
+
 	if ack.Status != "ok" {
 		// Protocol-level rejection — connection is still valid, don't close.
 		// Map ForwardCodeNotLeader to ErrNoLeaderKnown so callers
@@ -182,6 +198,42 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 		return fmt.Errorf("forward apply: leader rejected (code=%s): %s", ack.Code, ack.Error)
 	}
 	return nil
+}
+
+// checkForwardAck verifies a forward-apply ack against the nonce this node
+// put in the corresponding request.
+//
+// Pure apart from reading c.cfg, so the auth decision is unit-testable without
+// a leader, a connection, or Raft.
+func (c *Coordinator) checkForwardAck(ack *protocol.ForwardApplyAck, reqNonce string) error {
+	if c.cfg.SharedSecret == "" {
+		return nil
+	}
+	return security.ValidateForwardAckHMAC(
+		c.cfg.SharedSecret, reqNonce, ack.AuthTimestamp,
+		security.ForwardAckAuthFields{
+			Status: ack.Status,
+			Code:   string(ack.Code),
+			Error:  ack.Error,
+		},
+		ack.AuthHMAC, security.HMACTimestampTolerance,
+	)
+}
+
+// signForwardAck signs an ack over the request's nonce, in place.
+func (c *Coordinator) signForwardAck(ack *protocol.ForwardApplyAck, reqNonce string) {
+	if c.cfg.SharedSecret == "" {
+		return
+	}
+	ack.AuthTimestamp = time.Now().Unix()
+	ack.AuthHMAC = security.ComputeForwardAckHMAC(
+		c.cfg.SharedSecret, reqNonce, ack.AuthTimestamp,
+		security.ForwardAckAuthFields{
+			Status: ack.Status,
+			Code:   string(ack.Code),
+			Error:  ack.Error,
+		},
+	)
 }
 
 // getOrDialLeader returns the cached leader connection if it's still open
@@ -267,7 +319,14 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	// prevents an on-wire attacker from swapping the command payload while
 	// keeping the same MAC, even without TLS.
 	if c.cfg.SharedSecret == "" {
-		c.sendForwardApplyError(conn, protocol.ForwardCodeAuth, "leader has no shared_secret configured")
+		// Log on this side too: once acks are signed, a follower that
+		// rejects this response only sees "ack failed authentication" and
+		// cannot tell a misconfigured leader from a forged reply.
+		c.logger.Warn().
+			Str("peer", remoteAddr).
+			Str("requesting_node", req.NodeID).
+			Msg("ForwardApply rejected: this node has no cluster.shared_secret configured")
+		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "leader has no shared_secret configured")
 		return
 	}
 	if err := security.ValidateForwardHMAC(
@@ -279,7 +338,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 			Str("peer", remoteAddr).
 			Str("requesting_node", req.NodeID).
 			Msg("ForwardApply rejected: HMAC validation failed")
-		c.sendForwardApplyError(conn, protocol.ForwardCodeAuth, "authentication failed")
+		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "authentication failed")
 		return
 	}
 
@@ -291,12 +350,12 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 			Str("peer", remoteAddr).
 			Str("requesting_node", req.NodeID).
 			Msg("ForwardApply rejected: nonce replay detected")
-		c.sendForwardApplyError(conn, protocol.ForwardCodeAuth, "nonce replay")
+		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "nonce replay")
 		return
 	}
 
 	if c.raftNode == nil {
-		c.sendForwardApplyError(conn, protocol.ForwardCodeRaftUnavailable, "raft not initialized")
+		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeRaftUnavailable, "raft not initialized")
 		return
 	}
 
@@ -312,7 +371,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 			Str("peer", remoteAddr).
 			Str("requesting_node", req.NodeID).
 			Msg("ForwardApply rejected: node not found in registry")
-		c.sendForwardApplyError(conn, protocol.ForwardCodeAuth, "unknown node")
+		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "unknown node")
 		return
 	}
 	// Role gate is split between manifest commands and auth commands.
@@ -335,7 +394,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		c.logger.Debug().
 			Str("requesting_node", req.NodeID).
 			Msg("ForwardApply rejected: no longer leader")
-		c.sendForwardApplyError(conn, protocol.ForwardCodeNotLeader, "not the current leader")
+		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeNotLeader, "not the current leader")
 		return
 	}
 
@@ -349,7 +408,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 			Err(err).
 			Str("requesting_node", req.NodeID).
 			Msg("ForwardApply rejected: invalid command JSON")
-		c.sendForwardApplyError(conn, protocol.ForwardCodeInvalidCommand, "invalid command")
+		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeInvalidCommand, "invalid command")
 		return
 	}
 
@@ -404,7 +463,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 			Str("requesting_node", req.NodeID).
 			Int("cmd_type", int(cmd.Type)).
 			Msg("ForwardApply rejected: command type not allowed via forwarding")
-		c.sendForwardApplyError(conn, protocol.ForwardCodeInvalidCommand, "command type not allowed via forwarding")
+		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeInvalidCommand, "command type not allowed via forwarding")
 		return
 	}
 	if isManifest && !caps.CanIngest && !caps.CanCompact {
@@ -413,7 +472,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 			Str("requesting_node", req.NodeID).
 			Str("role", string(peerNode.Role)).
 			Msg("ForwardApply rejected: node role not authorized for manifest mutations")
-		c.sendForwardApplyError(conn, protocol.ForwardCodeAuth, "unauthorized role")
+		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "unauthorized role")
 		return
 	}
 
@@ -432,14 +491,16 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		// this, every follower would see the same canned "raft apply
 		// failed" string and fail to recognise legitimate idempotency
 		// signals. PR #451 round-3 internal review.
-		c.sendForwardApplyError(conn, protocol.ForwardCodeApplyFailed, err.Error())
+		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeApplyFailed, err.Error())
 		return
 	}
 
-	// Success ack.
+	// Success ack, signed over the request's nonce.
+	successAck := &protocol.ForwardApplyAck{Status: "ok"}
+	c.signForwardAck(successAck, req.Nonce)
 	if err := protocol.SendMessage(conn, &protocol.Message{
 		Type:    protocol.MsgForwardApplyAck,
-		Payload: &protocol.ForwardApplyAck{Status: "ok"},
+		Payload: successAck,
 	}, forwardApplyTimeout); err != nil {
 		c.logger.Debug().Err(err).Msg("ForwardApply: failed to send success ack")
 		return
@@ -490,12 +551,13 @@ func (c *Coordinator) handleForwardApplyLoop(conn net.Conn, firstReq *protocol.F
 // sendForwardApplyError is a small helper to send an error ack. Best-effort:
 // any write error is logged at debug because the connection is about to
 // close anyway via the caller's defer.
-func (c *Coordinator) sendForwardApplyError(conn net.Conn, code protocol.ForwardApplyCode, reason string) {
+func (c *Coordinator) sendForwardApplyError(conn net.Conn, reqNonce string, code protocol.ForwardApplyCode, reason string) {
 	ack := &protocol.ForwardApplyAck{
 		Status: "error",
 		Code:   code,
 		Error:  reason,
 	}
+	c.signForwardAck(ack, reqNonce)
 	if err := protocol.SendMessage(conn, &protocol.Message{
 		Type:    protocol.MsgForwardApplyAck,
 		Payload: ack,

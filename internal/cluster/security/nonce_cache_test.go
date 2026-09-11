@@ -31,11 +31,35 @@ func TestNonceCache_SameNonceDifferentNode(t *testing.T) {
 }
 
 func TestNonceCache_ExpiredNonceReusable(t *testing.T) {
-	nc := NewNonceCache(1 * time.Millisecond)
+	// The cache lifetime is 2*tolerance + 1s (see NewNonceCache), not the
+	// tolerance itself, so the sleep has to clear that whole window. With a
+	// 1ms tolerance the entry lives ~1.002s; sleeping 5ms as this test
+	// originally did would now assert the opposite of the truth.
+	const tolerance = 10 * time.Millisecond
+	lifetime := 2*tolerance + time.Second
+
+	nc := NewNonceCache(tolerance)
 	nc.Track("node-1", "abc123")
-	time.Sleep(5 * time.Millisecond)
+	time.Sleep(lifetime + 100*time.Millisecond)
 	if !nc.Track("node-1", "abc123") {
 		t.Fatal("expired nonce should be reusable")
+	}
+}
+
+// TestNonceCache_SurvivesFreshnessWindow is the property the lifetime exists
+// for: a nonce must still be rejected at the last instant its MAC could be
+// accepted. A message may be stamped up to one tolerance in the future, so a
+// cache holding entries for only `tolerance` would evict this one while a
+// replay of it was still fresh.
+func TestNonceCache_SurvivesFreshnessWindow(t *testing.T) {
+	const tolerance = 200 * time.Millisecond
+	nc := NewNonceCache(tolerance)
+	nc.Track("node-1", "abc123")
+
+	// Past the tolerance, where a naive TTL would already have evicted.
+	time.Sleep(tolerance + 50*time.Millisecond)
+	if nc.Track("node-1", "abc123") {
+		t.Fatal("nonce was reusable while a MAC bearing it could still be accepted — replay window open")
 	}
 }
 

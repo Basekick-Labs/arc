@@ -19,8 +19,8 @@ import (
 // a compile-time error.
 type MsgType string
 
-// Message-type labels bound into the join-family HMAC (ComputeHMAC /
-// ValidateHMAC) for domain separation (#504). Using shared typed constants —
+// Message-type labels bound into the coordinator-handshake HMACs
+// (handshake_auth.go) for domain separation (#504). Using shared typed constants —
 // rather than bare string literals at each call site — guarantees the sign and
 // validate sides agree. Using a bare string literal instead of these constants
 // at a single call site would reject every message of that message type
@@ -38,31 +38,6 @@ const (
 	MsgTypeRaftAuth     MsgType = "raft-auth"
 	MsgTypeRaftAuthResp MsgType = "raft-auth-resp"
 )
-
-// ComputeHMAC computes HMAC-SHA256 over the parameters of a coordinator
-// handshake message (join, leave, or heartbeat). msgType is a per-message-type
-// label ("join"/"leave"/"heartbeat") bound as the FIRST field of the canonical
-// input, distinct per handler, so a MAC captured for one message type cannot be
-// replayed against another within the freshness window (#504) — the same
-// label-based domain-separation discipline ComputeCacheInvalidateHMAC uses
-// (ComputeFetchHMAC and ComputeForwardHMAC achieve domain separation via
-// payload-binding — different field layouts — rather than labels). A heartbeat
-// MAC replayed as a node-evicting leave is the concrete attack this closes.
-//
-// Fields are delimited by NUL (\x00) so a field containing a delimiter cannot
-// be smuggled to collide with a different (msgType, nonce, nodeID, clusterName,
-// timestamp) arrangement. NUL is forbidden in HTTP header values by net/http
-// (httpguts), so the sender side cannot produce a NUL-containing field even via
-// malicious config.
-// Message format: msgType \x00 nonce \x00 nodeID \x00 clusterName \x00 timestamp
-func ComputeHMAC(sharedSecret string, msgType MsgType, nonce, nodeID, clusterName string, timestamp int64) string {
-	return hex.EncodeToString(computeJoinFamilyHMACRaw(sharedSecret, msgType, nonce, nodeID, clusterName, timestamp))
-}
-
-func computeJoinFamilyHMACRaw(sharedSecret string, msgType MsgType, nonce, nodeID, clusterName string, timestamp int64) []byte {
-	message := fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%d", msgType, nonce, nodeID, clusterName, timestamp)
-	return computeRawHMAC(sharedSecret, message)
-}
 
 // constantTimeHexEqual reports whether two hex-encoded MAC strings
 // represent the same byte sequence, in constant time over the
@@ -100,32 +75,15 @@ func GenerateNonce() (string, error) {
 	return hex.EncodeToString(nonce), nil
 }
 
-// ValidateHMAC validates the HMAC and checks timestamp freshness to prevent
-// replay attacks. msgType MUST match the label the sender used (see
-// ComputeHMAC) — a "leave" message validated as "join" fails, which is exactly
-// the cross-message-type replay this binding prevents (#504).
-func ValidateHMAC(sharedSecret string, msgType MsgType, nonce, nodeID, clusterName string, timestamp int64, receivedMAC string, tolerance time.Duration) error {
-	now := time.Now().Unix()
-	drift := now - timestamp
-	if drift < 0 {
-		drift = -drift
-	}
-	if drift > int64(tolerance.Seconds()) {
-		return fmt.Errorf("auth timestamp expired (drift: %ds, tolerance: %ds)", drift, int64(tolerance.Seconds()))
-	}
-
-	expected := computeJoinFamilyHMACRaw(sharedSecret, msgType, nonce, nodeID, clusterName, timestamp)
-	if !constantTimeHexEqual(expected, receivedMAC) {
-		return fmt.Errorf("HMAC validation failed: shared secret mismatch or malformed MAC")
-	}
-	return nil
-}
-
 // ComputeFetchHMAC computes HMAC-SHA256 for a peer file-fetch request. The
 // message format binds the requested path into the signed payload so a stolen
 // MAC for file A cannot be replayed within the freshness window to fetch a
 // different file B.
-// Fields are NUL-delimited (see ComputeHMAC for rationale).
+// Fields are NUL-delimited. (The coordinator handshake family moved to
+// length-prefixed canonicalization in 26.09.2 — see handshake_auth.go and
+// canonicalSyncInput. These families keep the NUL format: their field sets
+// are fixed-arity and their trailing timestamp makes re-partitioning
+// inert. Do not add a variable-length field to one without moving it.)
 // Format: nonce \x00 nodeID \x00 clusterName \x00 path \x00 timestamp
 func ComputeFetchHMAC(sharedSecret, nonce, nodeID, clusterName, path string, timestamp int64) string {
 	return hex.EncodeToString(computeFetchHMACRaw(sharedSecret, nonce, nodeID, clusterName, path, timestamp))
@@ -164,7 +122,11 @@ func ValidateFetchHMAC(sharedSecret, nonce, nodeID, clusterName, path string, ti
 // rather than including the raw bytes, so the HMAC input remains a
 // fixed-length string regardless of command size.
 //
-// Fields are NUL-delimited (see ComputeHMAC for rationale).
+// Fields are NUL-delimited. (The coordinator handshake family moved to
+// length-prefixed canonicalization in 26.09.2 — see handshake_auth.go and
+// canonicalSyncInput. These families keep the NUL format: their field sets
+// are fixed-arity and their trailing timestamp makes re-partitioning
+// inert. Do not add a variable-length field to one without moving it.)
 // Format: nonce \x00 nodeID \x00 clusterName \x00 payloadSHA256 \x00 timestamp
 func ComputeForwardHMAC(sharedSecret, nonce, nodeID, clusterName string, payload []byte, timestamp int64) string {
 	return hex.EncodeToString(computeForwardHMACRaw(sharedSecret, nonce, nodeID, clusterName, payload, timestamp))
@@ -205,7 +167,7 @@ func ValidateForwardHMAC(sharedSecret, nonce, nodeID, clusterName string, payloa
 // The "cache-invalidate" label is the first field of the canonical input,
 // distinct from Forward/Fetch/Join so a leaked MAC for one endpoint cannot
 // be replayed against another even within the freshness window. Fields are
-// NUL-delimited (see ComputeHMAC for rationale).
+// NUL-delimited (see ComputeFetchHMAC for the caveat on that format).
 // Format: "cache-invalidate" \x00 nonce \x00 nodeID \x00 clusterName \x00 timestamp
 func ComputeCacheInvalidateHMAC(sharedSecret, nonce, nodeID, clusterName string, timestamp int64) string {
 	return hex.EncodeToString(computeCacheInvalidateHMACRaw(sharedSecret, nonce, nodeID, clusterName, timestamp))
@@ -218,7 +180,7 @@ func computeCacheInvalidateHMACRaw(sharedSecret, nonce, nodeID, clusterName stri
 
 // ValidateCacheInvalidateHMAC validates a cache-invalidate HMAC and checks
 // freshness. The message format is intentionally label-distinct from
-// ComputeForwardHMAC / ComputeFetchHMAC / ComputeHMAC so cross-endpoint
+// ComputeForwardHMAC / ComputeFetchHMAC / the handshake family so cross-endpoint
 // replay is impossible even if a MAC leaks within the freshness window.
 func ValidateCacheInvalidateHMAC(sharedSecret, nonce, nodeID, clusterName string, timestamp int64, receivedMAC string, tolerance time.Duration) error {
 	now := time.Now().Unix()
@@ -351,13 +313,17 @@ const ReplicationEntryTagLen = 8
 // HMACTimestampTolerance is the symmetric window (past and future) the
 // cluster HMAC validators accept on a signed timestamp. Five minutes
 // is the same window enforced by every Compute*HMAC consumer in this
-// package (join, leave, fetch, forward-apply, cache-invalidate,
-// replicate-sync, replicate-checkpoint) AND the NonceCache TTL the
-// coordinator constructs at startup — keep them aligned so a replayed
-// HMAC can never outlive its nonce-cache slot. Centralized here so a
-// future operator can tune all sites in one place; Gemini round 1 on
-// PR #449 flagged the hardcoded 5*time.Minute scattered across
-// coordinator.go.
+// package (join, leave, heartbeat, the handshake responses, fetch,
+// forward-apply, cache-invalidate, replicate-sync,
+// replicate-checkpoint). Centralized here so a future operator can tune
+// all sites in one place; Gemini round 1 on PR #449 flagged the
+// hardcoded 5*time.Minute scattered across coordinator.go.
+//
+// NOTE: a NonceCache built for this tolerance does NOT use it as its own
+// TTL — it must outlive the window by more than the window, because a
+// message may be stamped up to one tolerance in the FUTURE and is still
+// accepted. NewNonceCache derives the right lifetime itself; pass it the
+// tolerance, not a TTL.
 const HMACTimestampTolerance = 5 * time.Minute
 
 // ComputeReplicationEntryTag returns the 8-byte per-entry MAC tag

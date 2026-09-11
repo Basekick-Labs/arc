@@ -173,6 +173,12 @@ type JoinResponse struct {
 	RaftLeader string     `json:"raft_leader"` // Leader's Raft address
 	Nodes      []NodeInfo `json:"nodes"`       // Current cluster members
 	Error      string     `json:"error,omitempty"`
+	// Authentication (present when shared_secret is configured). Signed by
+	// the responder over the REQUEST's nonce plus every field above, so the
+	// requester validates with the nonce it generated and needs no nonce
+	// cache of its own. See security/handshake_auth.go.
+	AuthTimestamp int64  `json:"auth_timestamp,omitempty"`
+	AuthHMAC      string `json:"auth_hmac,omitempty"`
 }
 
 // LeaderInfo is sent when a non-leader receives a join request,
@@ -181,6 +187,12 @@ type LeaderInfo struct {
 	LeaderID        string `json:"leader_id"`
 	LeaderCoordAddr string `json:"leader_coord_addr"` // Leader's coordinator address
 	LeaderRaftAddr  string `json:"leader_raft_addr"`  // Leader's Raft address
+	// Authentication (present when shared_secret is configured). Signed by
+	// the responder over the REQUEST's nonce plus every field above, so the
+	// requester validates with the nonce it generated and needs no nonce
+	// cache of its own. See security/handshake_auth.go.
+	AuthTimestamp int64  `json:"auth_timestamp,omitempty"`
+	AuthHMAC      string `json:"auth_hmac,omitempty"`
 }
 
 // Heartbeat is sent periodically to maintain connection and share state.
@@ -302,11 +314,12 @@ type FetchFileAckHeader struct {
 // as a raw json.RawMessage avoids re-marshalling and lets the protocol
 // package stay free of any raft.* imports.
 //
-// HMAC auth headers use the same {nonce, nodeID, clusterName, timestamp}
-// signature as the join handshake (security.ComputeHMAC, NOT the
-// path-bound ComputeFetchHMAC). The forwarded command's content is
-// trusted because cluster peers are mutually authenticated; the HMAC's
-// only job is to prove "I am a known peer in this cluster".
+// HMAC auth headers are payload-bound: security.ComputeForwardHMAC signs
+// {nonce, nodeID, clusterName, sha256(CommandJSON), timestamp}, so the
+// forwarded command cannot be altered in flight by a peer that merely
+// knows the shared secret's MAC for some other command. The ack is
+// likewise signed over this request's nonce (26.09.2) — see
+// security/handshake_auth.go.
 //
 // Phase 4 only sends this for RegisterFile and DeleteFile commands, but
 // the wire format accepts any Command type so future Phase 5+ commands
@@ -331,6 +344,12 @@ type ForwardApplyAck struct {
 	Status string           `json:"status"`          // "ok" or "error"
 	Code   ForwardApplyCode `json:"code,omitempty"`  // machine-readable error category
 	Error  string           `json:"error,omitempty"` // human-readable detail
+	// Authentication (present when shared_secret is configured). Signed by
+	// the responder over the REQUEST's nonce plus every field above, so the
+	// requester validates with the nonce it generated and needs no nonce
+	// cache of its own. See security/handshake_auth.go.
+	AuthTimestamp int64  `json:"auth_timestamp,omitempty"`
+	AuthHMAC      string `json:"auth_hmac,omitempty"`
 }
 
 // ForwardApplyCode is the typed error category for ForwardApplyAck. Same
