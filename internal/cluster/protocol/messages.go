@@ -94,12 +94,12 @@ func (m MessageType) String() string {
 
 // ReplicateSync is sent by a reader node to request WAL replication.
 //
-// The five auth fields (Nonce / Timestamp / HMAC / ClusterName / and
-// the existing ReaderID acting as senderID) carry the application-layer
-// HMAC over the handshake. Computed by security.ComputeReplicateSyncHMAC
-// at the reader, validated by security.ValidateReplicateSyncHMAC at
-// the writer before the connection is accepted. See GHSA-wfgr-8x84-22q7
-// / CVE-2026-48106.
+// The six auth-bound fields (Nonce / Timestamp / HMAC / ClusterName /
+// the existing ReaderID acting as senderID / and SupportsBinaryEntries)
+// carry the application-layer HMAC over the handshake. Computed by
+// security.ComputeReplicateSyncHMAC at the reader, validated by
+// security.ValidateReplicateSyncHMAC at the writer before the
+// connection is accepted. See GHSA-wfgr-8x84-22q7 / CVE-2026-48106.
 //
 // The auth fields are required when cluster.shared_secret is configured;
 // when it's empty the receiver refuses every request (refuse-when-
@@ -121,16 +121,11 @@ type ReplicateSync struct {
 	// entry payloads as raw bytes instead of JSON + base64 (whose 4/3
 	// inflation made entries above ~75MB unsendable).
 	//
-	// NOT covered by the replicate-sync HMAC. The original reason — that
-	// folding it in would break mixed-version handshakes — no longer
-	// applies as stated: 26.09.2 made the coordinator handshake a hard
-	// cutover anyway. It is still unsigned because replicate-sync is a
-	// separate message and validator from the handshake family, and
-	// widening that cutover was out of scope for the security fix that
-	// forced it. The worst an on-path tamperer gains by flipping this is a
-	// framing downgrade or a dropped connection, both already available to
-	// anyone who can modify the stream; TLS covers integrity where
-	// configured. Tracked as a follow-up.
+	// Covered by the replicate-sync HMAC (#714). Originally left out
+	// because folding it in would break mixed-version handshakes —
+	// that no longer applies since 26.09.2 made the coordinator
+	// handshake a hard cutover anyway, so this rides along with the
+	// same coordinated-restart release.
 	SupportsBinaryEntries bool `json:"bin_entries,omitempty"`
 }
 

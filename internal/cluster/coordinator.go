@@ -1582,7 +1582,7 @@ func (c *Coordinator) handleReplicateSync(conn net.Conn, syncReq *protocol.Repli
 	}
 	if err := security.ValidateReplicateSyncHMAC(
 		c.cfg.SharedSecret, syncReq.Nonce, syncReq.ReaderID, syncReq.ClusterName,
-		syncReq.LastKnownSequence, syncReq.Timestamp, syncReq.HMAC, security.HMACTimestampTolerance,
+		syncReq.LastKnownSequence, syncReq.SupportsBinaryEntries, syncReq.Timestamp, syncReq.HMAC, security.HMACTimestampTolerance,
 	); err != nil {
 		c.logger.Warn().
 			Err(err).

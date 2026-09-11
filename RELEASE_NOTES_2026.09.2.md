@@ -148,6 +148,26 @@ OSS deployments are unaffected.
 Full technical detail will accompany the corresponding security advisory once
 it is published. Responsibly reported by **[@rexpository](https://github.com/rexpository)**.
 
+### Replicate-sync now authenticates `SupportsBinaryEntries` ([#714](https://github.com/Basekick-Labs/arc/issues/714))
+
+The replicate-sync handshake (a reader requesting WAL replication from a
+writer) authenticates `{reader_id, last_known_seq, nonce, cluster_name,
+timestamp}`, but the `SupportsBinaryEntries` flag that negotiates binary-framed
+WAL entries (see *Replication can now carry WAL entries up to the full
+payload cap* below) rode outside the MAC. It was left unsigned on the
+reasoning that folding it in would break mixed-version handshakes; that
+reasoning no longer holds once the coordinator handshake above became a hard
+cutover regardless, so the flag is now bound into `ComputeReplicateSyncHMAC`
+and `ValidateReplicateSyncHMAC` alongside the rest of the message. An
+on-path tamperer who flipped the previously-unsigned flag could only force a
+framing downgrade or a dropped connection — both already available to anyone
+who can modify the stream — so this closes a completeness gap rather than a
+previously exploitable one. It carries the same replicate-sync wire format
+change and coordinated-restart requirement as the handshake hardening above,
+so it ships in the same release rather than forcing a second cutover.
+
+Contributed by [@pujitha24](https://github.com/pujitha24).
+
 ### Expired API tokens are now rejected on cache hits
 
 Arc caches successful token verifications in memory for `auth.cache_ttl`
