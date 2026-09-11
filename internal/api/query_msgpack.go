@@ -137,6 +137,7 @@ func executeArrowMsgPackQuery(
 	}
 
 	tokenName := getTokenName(c)
+	tokenID := getTokenID(c)
 
 	// Materialize all Arrow batches synchronously BEFORE committing
 	// HTTP headers. The columnar msgpack wire format buffers every
@@ -244,12 +245,19 @@ func executeArrowMsgPackQuery(
 		// negotiated, the pooled encoder sits between that buffer and w.
 		sink, finishCompression := compressedSink(w, respEncoding)
 		bw := bufio.NewWriterSize(sink, 256*1024)
-		rc, streamErr := streamMsgPackFromBatches(ctx, bw, schema, batches, rowCount, profile, start, timestamp)
+		rc, streamErr := streamMsgPackFromBatches(ctx, bw, schema, batches, rowCount, governanceMaxRows, profile, start, timestamp)
 		bw.Flush()
 		if err := finishCompression(); err != nil && streamErr == nil {
 			streamErr = err
 		}
 		w.Flush()
+
+		// Reported before the error branch below: a stream can reach the cap
+		// and then fail on the way out, and the marker is emitted either way,
+		// so the operator-side record has to fire on both paths or it would
+		// go missing in the one case where the result is both capped and
+		// truncated (#724).
+		h.logGovernanceRowCap("msgpack", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rc))
 
 		if streamErr != nil {
 			m.IncQueryErrors()
@@ -394,12 +402,14 @@ func wrapMsgPackWriteErr(err error) error {
 // streamMsgPackFromBatches writes the query response as a single
 // msgpack map over a pre-drained slice of Arrow record batches. Shape:
 //
-//	map(7 or 8) {
+//	map(7, 8, 9 or 10) {
 //	  "success":           bool
 //	  "columns":           [string...]            // column names
 //	  "types":             [string...]            // Arc wire type names, parallel to columns
 //	  "data":              [[v...], [v...], ...]  // numCols arrays, each with N values
 //	  "row_count":         uint
+//	  "rows_capped":       bool                   (optional, #724; always true when present)
+//	  "row_cap":           uint                   (optional, #724; paired with rows_capped)
 //	  "execution_time_ms": uint                   (milliseconds)
 //	  "timestamp":         string                 (RFC3339)
 //	  "profile":           map (optional)
@@ -425,6 +435,7 @@ func streamMsgPackFromBatches(
 	schema *arrow.Schema,
 	batches []arrow.Record,
 	rowCount int,
+	governanceMaxRows int,
 	profile *database.QueryProfile,
 	start time.Time,
 	timestamp string,
@@ -453,10 +464,16 @@ func streamMsgPackFromBatches(
 	fields := schema.Fields()
 	numCols := len(fields)
 
-	// Decide map size up front: 7 base keys + 1 if profile attached.
+	// Decide map size up front: 7 base keys, +1 if profile attached, +2 for
+	// the governance row-cap pair (#724). Both cap keys are present or both
+	// absent, so an uncapped response keeps its historical 7/8 shape.
+	capped := rowCapReached(governanceMaxRows, int64(rowCount))
 	mapLen := 7
 	if profile != nil {
-		mapLen = 8
+		mapLen++
+	}
+	if capped {
+		mapLen += 2
 	}
 	if err := enc.EncodeMapLen(mapLen); err != nil {
 		return 0, fmt.Errorf("encode map header: %w", err)
@@ -550,6 +567,25 @@ func streamMsgPackFromBatches(
 	}
 	if err := enc.EncodeUint(uint64(rowCount)); err != nil {
 		return rowCount, err
+	}
+
+	// "rows_capped" / "row_cap" (#724): emitted as a pair, and only when the
+	// result reached a governance cap, so an uncapped response keeps its
+	// historical shape. Same two keys as the JSON envelope, which keeps the
+	// documented JSON/msgpack parity true.
+	if capped {
+		if err := enc.EncodeString("rows_capped"); err != nil {
+			return rowCount, err
+		}
+		if err := enc.EncodeBool(true); err != nil {
+			return rowCount, err
+		}
+		if err := enc.EncodeString("row_cap"); err != nil {
+			return rowCount, err
+		}
+		if err := enc.EncodeUint(uint64(governanceMaxRows)); err != nil {
+			return rowCount, err
+		}
 	}
 
 	// "execution_time_ms": uint (milliseconds, integer — JSON sends

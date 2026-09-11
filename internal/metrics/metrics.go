@@ -125,6 +125,7 @@ type Metrics struct {
 	// Governance metrics
 	governanceRateLimited    atomic.Int64 // Queries rejected by rate limiting
 	governanceQuotaExhausted atomic.Int64 // Queries rejected by quota exhaustion
+	governanceQueriesCapped  atomic.Int64 // Queries whose results reached a policy row cap (#724)
 	governancePoliciesActive atomic.Int64 // Number of active governance policies
 
 	// Query Management metrics
@@ -381,6 +382,7 @@ func (m *Metrics) IncDecompBufferDiscards() { m.decompBufferDiscards.Add(1) }
 // Governance Metrics
 func (m *Metrics) IncGovernanceRateLimited()           { m.governanceRateLimited.Add(1) }
 func (m *Metrics) IncGovernanceQuotaExhausted()        { m.governanceQuotaExhausted.Add(1) }
+func (m *Metrics) IncGovernanceQueriesCapped()         { m.governanceQueriesCapped.Add(1) }
 func (m *Metrics) SetGovernancePoliciesActive(n int64) { m.governancePoliciesActive.Store(n) }
 
 // Query Management Metrics
@@ -570,6 +572,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		// Governance
 		"governance_rate_limited_total":    m.governanceRateLimited.Load(),
 		"governance_quota_exhausted_total": m.governanceQuotaExhausted.Load(),
+		"governance_queries_capped_total":  m.governanceQueriesCapped.Load(),
 		"governance_policies_active":       m.governancePoliciesActive.Load(),
 
 		// Query Management
@@ -903,6 +906,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_governance_quota_exhausted_total Queries rejected by quota exhaustion\n"...)
 	b = append(b, "# TYPE arc_governance_quota_exhausted_total counter\n"...)
 	b = appendMetric(b, "arc_governance_quota_exhausted_total", float64(m.governanceQuotaExhausted.Load()))
+
+	b = append(b, "# HELP arc_governance_queries_capped_total Queries whose results reached a policy row cap and may be incomplete\n"...)
+	b = append(b, "# TYPE arc_governance_queries_capped_total counter\n"...)
+	b = appendMetric(b, "arc_governance_queries_capped_total", float64(m.governanceQueriesCapped.Load()))
 
 	b = append(b, "# HELP arc_governance_policies_active Number of active governance policies\n"...)
 	b = append(b, "# TYPE arc_governance_policies_active gauge\n"...)

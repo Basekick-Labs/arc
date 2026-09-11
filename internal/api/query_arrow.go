@@ -47,6 +47,22 @@ const arrowBatchSize = 10000
 // by the time a stream fails.
 const arrowStreamTruncatedTrailer = "Arc-Stream-Truncated"
 
+// arrowRowsCappedTrailer tells the client the Arrow IPC body it received
+// stopped at an Enterprise governance row cap and may therefore be missing
+// rows the query matched (#724). The value is the cap.
+//
+// Read it alongside arrowStreamTruncatedTrailer, which means nearly the
+// opposite: that trailer says the body is short because the stream FAILED and
+// must not be trusted, while this one says the body is short because policy
+// said so, and is a complete, valid result up to the cap.
+//
+// A trailer for the same reason the other two are: the cap is only known to
+// have been reached once the last batch has been written, long after the
+// status line and headers went out. Like every fasthttp trailer it is emitted
+// on every response once registered, carrying an empty value when never Set,
+// so the client contract is "non-empty means capped".
+const arrowRowsCappedTrailer = "Arc-Rows-Capped"
+
 // transportWriter distinguishes "the socket went away" from "the encoder
 // failed". Both surface as an error out of ipc.Writer.Write, and only the
 // former means nobody is listening. Wrapping the sink is the only way to tell:
@@ -574,6 +590,12 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	fctx := c.Context()
 	respHeader := &fctx.Response.Header
 
+	// Captured before the stream writer commits: the pooled fiber.Ctx is
+	// recycled by the time the closure runs, so reading the token out of it
+	// there is the same use-after-free the comment above describes.
+	tokenName := getTokenName(c)
+	tokenID := getTokenID(c)
+
 	// Declare the execution-time trailer in the response head before
 	// SetBodyStreamWriter runs so the `Trailer:` response header is
 	// emitted before the chunked body starts. Clients that don't read
@@ -590,6 +612,15 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		arrowTrailerWarnOnce.Do(func() {
 			h.logger.Warn().Err(err).Str("trailer", arrowExecutionTimeTrailer).
 				Msg("Failed to register Arrow execution-time trailer; clients will not see server-side timing")
+		})
+	}
+	// Registered unconditionally rather than only when a cap applies: the
+	// registration has to happen here, before the body streams, and whether
+	// the cap is reached is not known until the stream ends.
+	if err := respHeader.AddTrailer(arrowRowsCappedTrailer); err != nil {
+		arrowTrailerWarnOnce.Do(func() {
+			h.logger.Warn().Err(err).Str("trailer", arrowRowsCappedTrailer).
+				Msg("Failed to register Arrow row-cap trailer; clients will not see that a governance cap truncated the result")
 		})
 	}
 
@@ -633,6 +664,14 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		execMs := time.Since(start).Milliseconds()
 		respHeader.Set(arrowExecutionTimeTrailer, strconv.FormatInt(execMs, 10))
 
+		// Reported before the error branch below: a stream can reach the cap
+		// and then fail on the way out, so the operator-side record has to
+		// fire on both paths or it would go missing in the one case where the
+		// result is both capped and truncated (#724). The trailer below stays
+		// on the success path only, because a failed body is poisoned and
+		// must not be advertised as valid up to the cap.
+		h.logGovernanceRowCap("arrow_ipc", convertedSQL, tokenID, tokenName, governanceMaxRows, totalRows)
+
 		if streamErr != nil {
 			m.IncQueryErrors()
 			// Per-handler client-disconnect counter (#426). Lets operators
@@ -661,6 +700,16 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 				Int64("execution_time_ms", execMs).
 				Msg("Arrow IPC stream truncated after headers committed; client received partial result")
 			return
+		}
+
+		// Governance row cap (#724): an Arrow IPC stream that stopped at the
+		// cap is a valid, cleanly terminated stream, so nothing in the body
+		// distinguishes it from a complete result. Set on the success path
+		// only: a failed stream is already poisoned and carries
+		// arrowStreamTruncatedTrailer, which tells the client the opposite
+		// thing (do not trust this body at all).
+		if rowCapReached(governanceMaxRows, totalRows) {
+			respHeader.Set(arrowRowsCappedTrailer, strconv.Itoa(governanceMaxRows))
 		}
 
 		h.logger.Info().

@@ -131,6 +131,7 @@ func executeArrowJSONQuery(
 
 	// Capture token name before async callback (Fiber context not safe in callbacks)
 	tokenName := getTokenName(c)
+	tokenID := getTokenID(c)
 
 	// Stream Arrow JSON response.
 	// SetBodyStreamWriter runs asynchronously — metrics are recorded in the callback.
@@ -181,6 +182,13 @@ func executeArrowJSONQuery(
 			}
 		}
 		w.Flush()
+
+		// Reported before the error branch below: a stream can reach the cap
+		// and then fail on the way out, and the marker is emitted either way,
+		// so the operator-side record has to fire on both paths or it would
+		// go missing in the one case where the result is both capped and
+		// truncated (#724).
+		h.logGovernanceRowCap("arrow_json", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rc))
 
 		if streamErr != nil {
 			m.IncQueryErrors()
@@ -346,6 +354,15 @@ done:
 	w.WriteString(`],"row_count":`)
 	scratch = strconv.AppendInt(scratch[:0], int64(rowCount), 10)
 	w.Write(scratch)
+
+	// Governance row cap (#724): see streamTypedJSON. Same two keys, same
+	// omit-when-absent rule, so the JSON and Arrow-JSON envelopes stay
+	// identical in shape.
+	if rowCapReached(governanceMaxRows, int64(rowCount)) {
+		w.WriteString(`,"rows_capped":true,"row_cap":`)
+		scratch = strconv.AppendInt(scratch[:0], int64(governanceMaxRows), 10)
+		w.Write(scratch)
+	}
 
 	executionTime := float64(time.Since(start).Milliseconds())
 	w.WriteString(`,"execution_time_ms":`)

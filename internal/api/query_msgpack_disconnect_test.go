@@ -73,7 +73,7 @@ func TestMsgPackStream_DisconnectIsClientError(t *testing.T) {
 
 	_, streamErr := streamMsgPackFromBatches(
 		context.Background(), bw, schema, []arrow.Record{rec}, rows,
-		nil, time.Now(), time.Now().UTC().Format(time.RFC3339),
+		0, nil, time.Now(), time.Now().UTC().Format(time.RFC3339),
 	)
 
 	if streamErr == nil {
@@ -117,7 +117,7 @@ func TestMsgPackStream_CtxCancelStaysCtxError(t *testing.T) {
 
 	_, streamErr := streamMsgPackFromBatches(
 		ctx, bw, schema, []arrow.Record{rec}, rows,
-		nil, time.Now(), time.Now().UTC().Format(time.RFC3339),
+		0, nil, time.Now(), time.Now().UTC().Format(time.RFC3339),
 	)
 
 	if streamErr == nil {

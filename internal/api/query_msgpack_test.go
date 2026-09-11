@@ -56,7 +56,7 @@ func msgpackStreamToBytes(
 		w.Flush()
 		return buf.Bytes(), rowCount
 	}
-	rc, _ := streamMsgPackFromBatches(ctx, w, schema, batches, rowCount, nil, start, "2024-01-15T12:00:00Z")
+	rc, _ := streamMsgPackFromBatches(ctx, w, schema, batches, rowCount, governanceMaxRows, nil, start, "2024-01-15T12:00:00Z")
 	w.Flush()
 	return buf.Bytes(), rc
 }
