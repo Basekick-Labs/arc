@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -647,4 +648,50 @@ func containsHelper(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// TestMiddleware_CachedExpiredToken rejects a token that expired while its
+// cache entry was still live. TestMiddleware_ExpiredToken above covers the
+// token that was already expired on first use, which reaches the database
+// path; this covers the cache-hit path, which used to skip the expiry check.
+func TestMiddleware_CachedExpiredToken(t *testing.T) {
+	config := DefaultMiddlewareConfig()
+	am, app, cleanup := setupMiddlewareTest(t, config)
+	defer cleanup()
+
+	expiresAt := time.Now().Add(time.Hour)
+	token, err := am.CreateToken(context.Background(), "cached-expiry", "Expires while cached", "read", &expiresAt)
+	if err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+
+	newRequest := func() *http.Request {
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		return req
+	}
+
+	// First request succeeds and populates the token cache.
+	resp, err := app.Test(newRequest(), testTimeoutMS)
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("Expected status 200 before expiry, got %d", resp.StatusCode)
+	}
+
+	// The token expires while the cache entry is still within its TTL. The
+	// database row and the cached copy move together (see expireToken in
+	// cache_expiry_test.go): moving only the cached copy would leave the
+	// database saying the token is still valid, so it would simply be
+	// re-validated and re-cached.
+	expireToken(t, am, token, time.Now().Add(-time.Second))
+
+	resp, err = app.Test(newRequest(), testTimeoutMS)
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusUnauthorized {
+		t.Errorf("Expected status 401 for a token that expired while cached, got %d", resp.StatusCode)
+	}
 }

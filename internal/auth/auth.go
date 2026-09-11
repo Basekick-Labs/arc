@@ -72,7 +72,19 @@ type TokenInfo struct {
 	ExpiresAt  *time.Time `json:"expires_at"`
 }
 
-// cacheEntry represents a cached token
+// cacheEntry represents a cached token.
+//
+// Two distinct expiries are in play and must not be confused:
+//
+//   - expiresAt (this struct) is the CACHE deadline — how long this memoized
+//     lookup may be reused before it must be re-read from SQLite. Derived from
+//     cacheTTL, capped at the token's own expiry (see VerifyToken).
+//   - info.ExpiresAt is the TOKEN's credential expiry — the point past which
+//     the token is no longer a valid credential at all, regardless of caching.
+//
+// VerifyToken enforces info.ExpiresAt on the cache-hit path as well as the
+// database path. Checking only the cache deadline let a token that expired
+// while cached stay authorized for up to cacheTTL.
 type cacheEntry struct {
 	info      *TokenInfo
 	expiresAt time.Time
@@ -720,9 +732,24 @@ func generateToken() (string, error) {
 // sentinel is never double-resolved.
 func (am *AuthManager) insertToken(hash, prefix, name, description, permissions string, expiresAt *time.Time) error {
 
+	// .UTC(): go-sqlite3 text-encodes a time.Time using the value's own
+	// location, so without this a caller in a non-UTC zone stores
+	// "2026-09-10 15:32:45.958903-06:00" while the same instant from a UTC
+	// caller stores "2026-09-10 21:32:45.958903+00:00". Go parses either back
+	// to the correct instant, but the varying offset means two rows holding
+	// the same moment sort differently as text — so a future
+	// `WHERE expires_at > ?` would silently disagree with itself depending on
+	// which node wrote the row. Normalizing on write removes that variance,
+	// matching the cluster apply path (ApplyCreateToken, #459/#460) and the
+	// "Arc-stamped timestamps are UTC" rule from #546.
+	//
+	// This does NOT make the column string-comparable with created_at, which
+	// SQLite's CURRENT_TIMESTAMP writes without an offset or fractional
+	// seconds ("2026-09-10 21:32:45"). expires_at must keep being compared as
+	// a parsed instant (see VerifyToken), never as text.
 	var expiresAtVal interface{}
 	if expiresAt != nil {
-		expiresAtVal = *expiresAt
+		expiresAtVal = expiresAt.UTC()
 	}
 
 	_, err := am.db.Exec(`
@@ -830,13 +857,31 @@ func (am *AuthManager) VerifyToken(token string) *TokenInfo {
 
 	// Check cache first
 	am.cacheMu.RLock()
-	if entry, ok := am.cache[key]; ok && now.Before(entry.expiresAt) {
-		am.cacheMu.RUnlock()
-		am.cacheHits.Add(1)
-		metrics.Get().IncAuthCacheHit()
-		return entry.info
-	}
+	entry, cached := am.cache[key]
 	am.cacheMu.RUnlock()
+
+	if cached && now.Before(entry.expiresAt) {
+		if entry.info.ExpiresAt != nil && now.After(*entry.info.ExpiresAt) {
+			// The token expired while this entry was still within its cache
+			// TTL. The cache deadline alone does not imply the credential is
+			// still valid, so evict and fall through to the database path,
+			// which owns the "token has expired" decision and its log line.
+			//
+			// The pointer comparison keeps this safe against a concurrent
+			// refill: the map holds cacheEntry by value and every insert below
+			// allocates a fresh *TokenInfo, so a newer entry for the same key
+			// is never mistaken for the one just read.
+			am.cacheMu.Lock()
+			if cur, still := am.cache[key]; still && cur.info == entry.info {
+				delete(am.cache, key)
+			}
+			am.cacheMu.Unlock()
+		} else {
+			am.cacheHits.Add(1)
+			metrics.Get().IncAuthCacheHit()
+			return entry.info
+		}
+	}
 
 	am.cacheMisses.Add(1)
 	metrics.Get().IncAuthCacheMiss()
@@ -928,9 +973,20 @@ func (am *AuthManager) VerifyToken(token string) *TokenInfo {
 				am.cacheEvictions.Add(1)
 			}
 		}
+		// Cap the cache deadline at the token's own expiry. Defense in depth:
+		// the read path already rejects an entry whose token has expired, and
+		// this additionally keeps cleanupExpiredCache and the size-eviction
+		// scan above (both of which order by the cache deadline) from holding
+		// or preferring entries that can no longer authorize anything. The
+		// expiry is always in the future here — the database path above
+		// rejects an already-expired token before reaching this point.
+		deadline := now.Add(am.cacheTTL)
+		if info.ExpiresAt != nil && info.ExpiresAt.Before(deadline) {
+			deadline = *info.ExpiresAt
+		}
 		am.cache[key] = cacheEntry{
 			info:      info,
-			expiresAt: now.Add(am.cacheTTL),
+			expiresAt: deadline,
 		}
 		am.cacheMu.Unlock()
 
@@ -1114,7 +1170,9 @@ func (am *AuthManager) UpdateToken(ctx context.Context, id int64, name, descript
 	}
 	if expiresAt != nil {
 		updates = append(updates, "expires_at = ?")
-		args = append(args, *expiresAt)
+		// .UTC() for the same reason as insertToken: keep one timezone
+		// domain in the column.
+		args = append(args, expiresAt.UTC())
 	}
 
 	if len(updates) == 0 {

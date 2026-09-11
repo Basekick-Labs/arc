@@ -93,6 +93,15 @@ type ServerConfig struct {
 	TLSEnabled  bool
 	TLSCertFile string
 	TLSKeyFile  string
+
+	// ClientRecorder, when set, receives the installation id + version
+	// of arcli clients (Arcli-Installation-Id header) for telemetry.
+	// nil (telemetry disabled) installs no middleware.
+	ClientRecorder ClientRecorder
+	// AuthRequired tells the client-identity middleware that the auth
+	// middleware runs on this server, so only requests it validated are
+	// recorded. False (auth disabled) trusts every served request.
+	AuthRequired bool
 }
 
 // DefaultServerConfig returns default server configuration
@@ -160,11 +169,16 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: "*",
 		AllowMethods: "GET,POST,PUT,DELETE,OPTIONS",
-		AllowHeaders: "Origin,Content-Type,Accept,Authorization,x-api-key,x-arc-database,Content-Encoding",
+		AllowHeaders: "Origin,Content-Type,Accept,Authorization,x-api-key,x-arc-database,Content-Encoding,Arcli-Installation-Id",
 	}))
 
 	// Security headers middleware (pass TLS flag for HSTS)
 	app.Use(securityHeaders(config.TLSEnabled))
+
+	// arcli installation ids for telemetry (see client_identity.go).
+	if config.ClientRecorder != nil {
+		app.Use(clientIdentity(config.ClientRecorder, config.AuthRequired))
+	}
 
 	// NOTE: Compression middleware is disabled to allow manual decompression in handlers
 	// This prevents double-decompression issues with gzip-compressed MessagePack payloads

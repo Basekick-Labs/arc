@@ -13,6 +13,8 @@
 Open, SQL-native time-series database for telemetry you need to keep. Arc ingests 34M+ records/sec, stores data as standard Parquet on infrastructure you own, and lets you query recent and historical data together. InfluxDB Line Protocol and Telegraf compatible. Single binary. AGPL-3.0.
 
 > **Prefer a UI?** [**Arc Launchpad**](https://github.com/Basekick-Labs/launchpad) is a self-hosted web console for the Arc instances you run — SQL console, schema explorer, logs, monitoring, and management for tokens, retention, alerts, continuous queries, and MQTT ingestion. Deploy it alongside Arc with Docker Compose. [Docs](https://docs.basekick.net/launchpad).
+>
+> **Prefer a terminal?** [**arcli**](https://github.com/Basekick-Labs/arcli) is the Arc command line — named connections, SQL queries with table, JSON, CSV or Arrow output, line-protocol and MessagePack writes, bulk imports, and admin for tokens, retention, continuous queries, backups and compaction. `brew install basekick-labs/tap/arcli`, or deb, rpm, Arch and Docker. [Docs](https://docs.basekick.net/arcli).
 
 ---
 
@@ -301,6 +303,7 @@ CMVP-certified; Arc itself is not a CMVP-listed module. See the
 | Tool | Description | Link |
 |------|-------------|------|
 | **Arc Launchpad** | Self-hosted web UI: SQL console, schema explorer, logs, monitoring, and management for tokens, retention, alerts, continuous queries, MQTT ingestion, and teams | [GitHub](https://github.com/Basekick-Labs/launchpad) · [Docs](https://docs.basekick.net/launchpad) |
+| **arcli** | Command-line client: connection profiles, SQL queries (table, JSON, CSV, Arrow), writes and bulk imports, and admin for tokens, retention, continuous queries, backups, compaction and logs. Homebrew, deb/rpm/Arch, Docker | [GitHub](https://github.com/Basekick-Labs/arcli) · [Docs](https://docs.basekick.net/arcli) |
 | **VS Code Extension** | Browse databases, run queries, visualize results | [Marketplace](https://marketplace.visualstudio.com/items?itemName=basekick-labs.arc-db-manager) |
 | **Grafana Data Source** | Native Grafana plugin for dashboards and alerting | [GitHub](https://github.com/Basekick-Labs/grafana-arc-datasource) |
 | **Telegraf Output Plugin** | Ship data from 300+ Telegraf inputs directly to Arc | [Docs](https://docs.influxdata.com/telegraf/v1/output-plugins/arc/) |
