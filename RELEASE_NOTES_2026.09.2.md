@@ -104,6 +104,18 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
 
 ## Bug fixes
 
+### The measurement endpoint now honors the configured query timeout ([#308](https://github.com/Basekick-Labs/arc/issues/308))
+
+`GET /api/v1/query/:measurement` executed against `context.Background()` with
+no deadline, so a configured `query.timeout` never applied to it and a slow
+measurement query could run indefinitely. The handler now derives its context
+from the request (so client disconnects cancel the query) and wraps it with
+the configured timeout, matching `POST /api/v1/query`: a query that exceeds
+the timeout returns 504 `"Query timed out"` and increments the timeout
+metrics, on both the Arrow and database/sql paths.
+
+Contributed by [@MrBeldum](https://github.com/MrBeldum) in [#701](https://github.com/Basekick-Labs/arc/pull/701).
+
 ### Token `expires_at` is now stored in UTC
 
 `api_tokens.expires_at` is written as a Go `time.Time`, and go-sqlite3

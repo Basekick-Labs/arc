@@ -4464,20 +4464,45 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 
 	timestamp := time.Now().UTC().Format(time.RFC3339)
 
+	// Create context with timeout if configured (0 = no timeout).
+	// Same pattern as POST /api/v1/query: start from UserContext so client
+	// disconnects cancel the query, then wrap with queryTimeout (#308).
+	ctx := c.UserContext()
+	var cancel context.CancelFunc
+	if h.queryTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, h.queryTimeout)
+		// cancel is invoked inside the stream writer callback (or on error
+		// paths below), not deferred here, because SetBodyStreamWriter runs
+		// asynchronously after this function returns.
+	}
+
 	// Arrow-native path: bypasses database/sql row scanning entirely.
 	if arrowJSONQueryFunc != nil {
-		ctx := context.Background()
-		_, handled := arrowJSONQueryFunc(h, c, ctx, nil, convertedSQL, false, 0, start, timestamp, nil, nil, nil)
+		_, handled := arrowJSONQueryFunc(h, c, ctx, cancel, convertedSQL, false, 0, start, timestamp, nil, nil, nil)
 		if handled {
 			// Metrics are recorded inside the async stream callback — not here.
+			// cancel is owned by executeArrowJSONQuery when handled=true.
 			return nil
 		}
 	}
 
 	// Fallback: database/sql path
-	rows, err := h.db.Query(convertedSQL)
+	rows, err := h.db.QueryContext(ctx, convertedSQL)
 	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
 		m.IncQueryErrors()
+		if h.queryTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
+			m.IncQueryTimeouts()
+			h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(sql)).Dur("timeout", h.queryTimeout).Msg("Measurement query timed out")
+			return c.Status(fiber.StatusGatewayTimeout).JSON(QueryResponse{
+				Success:         false,
+				Error:           "Query timed out",
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+				Timestamp:       timestamp,
+			})
+		}
 		h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(sql)).Msg("Measurement query failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
@@ -4491,6 +4516,9 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	columns, err := rows.Columns()
 	if err != nil {
 		rows.Close()
+		if cancel != nil {
+			cancel()
+		}
 		m.IncQueryErrors()
 		h.logger.Error().Err(err).Msg("Failed to get column names in measurement query")
 		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
@@ -4513,18 +4541,18 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	// Capture token name before async callback (Fiber context not safe in callbacks)
 	tokenName := getTokenName(c)
 
-	// Stream typed JSON response directly to HTTP. Use c.UserContext()
-	// so client disconnects propagate to per-row cancellation — fasthttp
-	// keeps c.Context() alive across the SetBodyStreamWriter boundary,
-	// per gemini r1. queryMeasurement has no server-side timeout today
-	// (#308 follow-up); when #308 adds one, derive from this ctx.
-	streamCtx := c.UserContext()
+	// Stream typed JSON with the timeout-aware context so per-row cancellation
+	// fires inside the streaming callback (#308).
+	streamCtx := ctx
 	c.Set("Content-Type", "application/json")
 	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
 		rowCount, streamErr := streamTypedJSON(streamCtx, w, columns, colTypes, rows, 0, nil, start, timestamp)
 		w.Flush()
 
 		rows.Close()
+		if cancel != nil {
+			cancel()
+		}
 
 		if streamErr != nil {
 			m.IncQueryErrors()
