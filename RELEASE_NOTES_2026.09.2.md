@@ -222,6 +222,31 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
 
 ## Bug fixes
 
+### Query history records when a governance row cap truncated a result ([#728](https://github.com/Basekick-Labs/arc/issues/728))
+
+An Enterprise governance row cap was visible to the client and in the operator
+log, but `GET /api/v1/queries/history` still showed a capped query as an
+ordinary success carrying the truncated count. Someone reviewing history to
+work out why a report came back short found no answer on the surface built for
+that question.
+
+History entries now carry `row_cap` when the query reached a cap, alongside the
+existing `row_count`. The status stays `completed`, because the query did
+finish and every other status value means it did not; the cap is a property of
+the result, not a different outcome. The field is recorded before the query is
+dispositioned, so a result that reached the cap and then failed on the way out
+keeps the cap and appears in history as both capped and failed.
+
+As on the wire, the field means the result reached the cap and may therefore be
+incomplete. It does not prove rows were dropped: a query whose own `LIMIT`
+equals the cap reaches it on every run with nothing lost. The entry's SQL sits
+alongside, which is what tells the two apart.
+
+Note that `/api/v1/query/arrow` and `/api/v1/query/:measurement` do not create
+history entries at all, so a capped result on those endpoints is still absent
+from history rather than misreported
+([#731](https://github.com/Basekick-Labs/arc/issues/731)).
+
 ### A governance row cap no longer looks like a complete result ([#724](https://github.com/Basekick-Labs/arc/issues/724))
 
 When an Enterprise governance policy capped a query with `max_rows_per_query`,
@@ -292,13 +317,11 @@ readable response into an undecodable one. Reaching the cap is what the client
 needs in order to stop trusting the row count, and it is always known for
 certain.
 
-Two related gaps are unchanged. The experimental arcx Arrow IPC serve path
+One related gap is unchanged. The experimental arcx Arrow IPC serve path
 applies no row cap at all, and returns before any trailer is registered, so an
 arcx-served Arrow IPC response carries none of the three trailers
 ([#727](https://github.com/Basekick-Labs/arc/issues/727)); clients should read a
-missing trailer as "unknown", never as "not capped". And
-`/api/v1/queries/history` still records a capped query as an ordinary success
-([#728](https://github.com/Basekick-Labs/arc/issues/728)).
+missing trailer as "unknown", never as "not capped".
 
 Adding end-to-end coverage for the Arrow IPC trailer also turned up a data race
 that predates it ([#729](https://github.com/Basekick-Labs/arc/issues/729)): all
