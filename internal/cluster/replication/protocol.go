@@ -41,8 +41,10 @@ const (
 	// which made every JSON-framed entry above ~75MB unsendable while
 	// the WAL happily stored it — a deterministic replication stall).
 	// Sent only to readers that advertised support in their handshake
-	// (protocol.ReplicateSync.SupportsBinaryEntries), so mixed-version
-	// pairs keep speaking JSON.
+	// (protocol.ReplicateSync.SupportsBinaryEntries, bound into the
+	// replicate-sync MAC since #714, so the advertisement cannot be
+	// flipped in transit). A reader that does not advertise it keeps
+	// receiving JSON-framed entries.
 	//
 	// Frame layout after the [4-byte length][1-byte type] header:
 	//   [8-byte sequence BE][8-byte timestampUS BE]

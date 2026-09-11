@@ -274,21 +274,20 @@ func (r *Receiver) connect() error {
 	}
 	lastKnownSeq := r.lastSeq.Load()
 	timestamp := time.Now().Unix()
+	// Advertise MsgReplicateEntryBin support (#698), now bound into the
+	// HMAC (#714): a tamperer flipping this in transit invalidates the
+	// MAC instead of silently downgrading the framing.
+	const supportsBinaryEntries = true
 	syncReq := &protocol.ReplicateSync{
-		ReaderID:          r.cfg.ReaderID,
-		LastKnownSequence: lastKnownSeq,
-		Nonce:             nonce,
-		ClusterName:       r.cfg.ClusterName,
-		Timestamp:         timestamp,
-		// Advertise MsgReplicateEntryBin support (#698). Outside the
-		// HMAC tuple by design — see the field's doc in
-		// protocol/messages.go. An old writer ignores the field and
-		// keeps sending JSON entries, which this receiver still
-		// handles.
-		SupportsBinaryEntries: true,
+		ReaderID:              r.cfg.ReaderID,
+		LastKnownSequence:     lastKnownSeq,
+		Nonce:                 nonce,
+		ClusterName:           r.cfg.ClusterName,
+		Timestamp:             timestamp,
+		SupportsBinaryEntries: supportsBinaryEntries,
 		HMAC: security.ComputeReplicateSyncHMAC(
 			r.cfg.SharedSecret, nonce, r.cfg.ReaderID, r.cfg.ClusterName,
-			lastKnownSeq, timestamp,
+			lastKnownSeq, supportsBinaryEntries, timestamp,
 		),
 	}
 

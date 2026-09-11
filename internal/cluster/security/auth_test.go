@@ -369,8 +369,8 @@ func TestValidateCacheInvalidateHMAC_FieldBinding(t *testing.T) {
 // constant.
 func TestComputeReplicateSyncHMAC_Determinism(t *testing.T) {
 	t.Parallel()
-	got := ComputeReplicateSyncHMAC("secret", "nonce-abc", "reader-1", "cluster-A", 42, 1700000000)
-	const want = "3fd418a80d9d94b8b36765a1026f3cabc360a5be2e4eb27c0f6ea6b190119d8c"
+	got := ComputeReplicateSyncHMAC("secret", "nonce-abc", "reader-1", "cluster-A", 42, true, 1700000000)
+	const want = "6da169ffe1cecd86dd6ab08faf641ac0276b85933480d7dde756a2f26b741c5b"
 	if got != want {
 		t.Errorf("replicate-sync MAC drift detected:\n  got  %s\n  want %s\nIf this fails, the handshake message format changed — coordinate with the deployed-version matrix before merging.", got, want)
 	}
@@ -495,7 +495,7 @@ func TestReplicationHMAC_LabelBinding_NoCrossEndpointReplay(t *testing.T) {
 		cumHash[i] = byte(i)
 	}
 
-	syncMAC := ComputeReplicateSyncHMAC(secret, nonce, nodeID, clusterName, lastSeq, ts)
+	syncMAC := ComputeReplicateSyncHMAC(secret, nonce, nodeID, clusterName, lastSeq, true, ts)
 	checkpointMAC := ComputeReplicationCheckpointHMAC(secret, nonce, nodeID, clusterName, cumHash, lastSeq, ts)
 	cacheMAC := ComputeCacheInvalidateHMAC(secret, nonce, nodeID, clusterName, ts)
 	forwardMAC := ComputeForwardHMAC(secret, nonce, nodeID, clusterName, []byte{}, ts)
@@ -523,7 +523,7 @@ func TestReplicationHMAC_LabelBinding_NoCrossEndpointReplay(t *testing.T) {
 		if name == "sync" {
 			continue
 		}
-		if err := ValidateReplicateSyncHMAC(secret, nonce, nodeID, clusterName, lastSeq, ts, mac, 5*time.Minute); err == nil {
+		if err := ValidateReplicateSyncHMAC(secret, nonce, nodeID, clusterName, lastSeq, true, ts, mac, 5*time.Minute); err == nil {
 			t.Errorf("%s MAC accepted by replicate-sync validator — label binding broken", name)
 		}
 	}
@@ -572,15 +572,46 @@ func TestValidateReplicateSyncHMAC_StaleAndFuture(t *testing.T) {
 	)
 
 	staleTS := time.Now().Add(-10 * time.Minute).Unix()
-	mac := ComputeReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, staleTS)
-	if err := ValidateReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, staleTS, mac, 5*time.Minute); err == nil {
+	mac := ComputeReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, true, staleTS)
+	if err := ValidateReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, true, staleTS, mac, 5*time.Minute); err == nil {
 		t.Error("stale timestamp accepted by replicate-sync validator")
 	}
 
 	futureTS := time.Now().Add(10 * time.Minute).Unix()
-	mac = ComputeReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, futureTS)
-	if err := ValidateReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, futureTS, mac, 5*time.Minute); err == nil {
+	mac = ComputeReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, true, futureTS)
+	if err := ValidateReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, true, futureTS, mac, 5*time.Minute); err == nil {
 		t.Error("future timestamp accepted by replicate-sync validator")
+	}
+}
+
+// TestValidateReplicateSyncHMAC_RejectsFlippedSupportsBinaryEntries pins
+// that SupportsBinaryEntries is bound into the replicate-sync MAC
+// (https://github.com/Basekick-Labs/arc/issues/714): a MAC computed with
+// one value must not validate once the field is flipped, since an
+// on-path tamperer who could flip it undetected would force either a
+// silent framing downgrade or a writer/reader mismatch.
+func TestValidateReplicateSyncHMAC_RejectsFlippedSupportsBinaryEntries(t *testing.T) {
+	t.Parallel()
+	const (
+		secret      = "secret"
+		nonce       = "nonce-abc"
+		readerID    = "reader-1"
+		clusterName = "cluster-A"
+		lastSeq     = uint64(42)
+	)
+	ts := time.Now().Unix()
+
+	mac := ComputeReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, true, ts)
+	if err := ValidateReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, true, ts, mac, 5*time.Minute); err != nil {
+		t.Fatalf("untampered MAC rejected: %v", err)
+	}
+	if err := ValidateReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, false, ts, mac, 5*time.Minute); err == nil {
+		t.Error("MAC computed with supportsBinaryEntries=true validated after the field was flipped to false")
+	}
+
+	mac = ComputeReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, false, ts)
+	if err := ValidateReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, true, ts, mac, 5*time.Minute); err == nil {
+		t.Error("MAC computed with supportsBinaryEntries=false validated after the field was flipped to true")
 	}
 }
 
