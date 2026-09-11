@@ -31,7 +31,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check CLA signature
-        if: (github.event.issue.pull_request && contains(github.event.comment.body, 'I have read the CLA Document and I hereby sign the CLA')) || github.event_name == 'pull_request_target'
+        # Gate loosely and let the action decide: it re-reads every comment
+        # on the PR and applies the real signature check. Matching the full
+        # sentence here would re-introduce the strictness we just removed,
+        # since a signature with different internal spacing would never even
+        # start the job. "recheck" re-runs the check after someone signs on
+        # another PR, which is otherwise only possible by re-running the
+        # workflow by hand.
+        if: (github.event.issue.pull_request && (contains(github.event.comment.body, 'sign the CLA') || contains(github.event.comment.body, 'recheck'))) || github.event_name == 'pull_request_target'
         uses: contributor-assistant/github-action@v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -43,13 +50,24 @@ jobs:
           remote-repository-name: cla-signatures
           branch: main
           allowlist: xe-nvdk,dependabot[bot],claude[bot],*[bot]
+          # custom-pr-sign-comment is deliberately NOT set. Setting it
+          # switches the action from regex matching to exact string equality
+          # against the whole comment body (isCommentSignedByUser in
+          # src/pullrequest/signatureComment.ts), so a signature with any
+          # extra character is silently rejected. Unset, the action falls back
+          # to a tolerant regex, and its built-in default phrase is identical
+          # to the one we were passing, so contributors type exactly the same
+          # sentence with far more room for error. use-dco-flag defaults to
+          # "false", which is the branch that selects the CLA regex.
           custom-notsigned-prcomment: |
             Thanks for the contribution!
 
             Before this can be merged, please sign the [Contributor License Agreement](https://github.com/Basekick-Labs/arc/blob/main/CLA.md).
             Arc is AGPL-3.0 and Basekick Labs also ships commercially licensed builds; the CLA is what lets your contribution be included in both. You keep full ownership of your work.
 
-            To sign, reply to this thread with exactly:
-          custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'
+            To sign, post a new comment on this pull request containing the
+            sentence below. Copy the sentence only: the dashed lines around it
+            are formatting, and including them stops the signature from
+            registering.
           custom-allsigned-prcomment: 'All contributors have signed the CLA. Thanks!'
           lock-pullrequest-aftermerge: false

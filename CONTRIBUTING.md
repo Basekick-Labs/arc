@@ -22,7 +22,7 @@ Thanks for your interest in improving Arc. Contributions of all sizes are welcom
    Merged contributions are also credited in the README and in the release blog post.
 5. **Match the house style.** Run `gofmt` and `go vet`. Reuse the patterns the surrounding code already uses (for example struct logger fields, not context-carried loggers) rather than introducing new ones.
 6. **Leave "Allow edits by maintainers" enabled.** We often resolve release-notes conflicts and small fixups directly on your branch so your PR can merge without another round trip.
-7. **Sign the CLA.** A bot comments on your first PR with a one-line reply to post. See [Contributor License Agreement](#contributor-license-agreement) below for what it covers and why it exists. You sign once, not per PR.
+7. **Sign the CLA.** A bot comments on your first PR with a one-line reply to post. Post that sentence as its own comment; the dashed lines the bot draws around it are formatting, not part of the signature. See [Contributor License Agreement](#contributor-license-agreement) below for what it covers and why it exists. You sign once, not per PR, and the signature carries across every Arc repository PR you open afterwards.
 
 ## AI-assisted contributions
 
