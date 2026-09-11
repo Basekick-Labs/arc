@@ -166,7 +166,7 @@ previously exploitable one. It carries the same replicate-sync wire format
 change and coordinated-restart requirement as the handshake hardening above,
 so it ships in the same release rather than forcing a second cutover.
 
-Contributed by [@pujitha24](https://github.com/pujitha24).
+Contributed by [@pujitha24](https://github.com/pujitha24) in [#715](https://github.com/Basekick-Labs/arc/pull/715).
 
 ### Expired API tokens are now rejected on cache hits
 
