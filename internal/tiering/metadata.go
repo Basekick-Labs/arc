@@ -256,6 +256,45 @@ func (s *MetadataStore) GetFilesByDatabase(ctx context.Context, database string)
 	return s.scanFiles(rows)
 }
 
+// GetFilesForQuery retrieves files for a database, optionally filtered by
+// measurement and/or time range. Filters are pushed into the SQL WHERE
+// clause instead of being applied client-side, so SQLite's indexes on
+// database/tier/partition_time can prune rows before they reach Go.
+func (s *MetadataStore) GetFilesForQuery(ctx context.Context, database, measurement string, startTime, endTime *time.Time) ([]FileMetadata, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	query := `
+		SELECT id, path, database, measurement, partition_time, tier, size_bytes, created_at, migrated_at
+		FROM tier_files
+		WHERE database = ?
+	`
+	args := []any{database}
+
+	if measurement != "" {
+		query += " AND measurement = ?"
+		args = append(args, measurement)
+	}
+	if startTime != nil {
+		query += " AND partition_time >= ?"
+		args = append(args, startTime.UTC())
+	}
+	if endTime != nil {
+		query += " AND partition_time <= ?"
+		args = append(args, endTime.UTC())
+	}
+
+	query += " ORDER BY partition_time DESC"
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query files: %w", err)
+	}
+	defer rows.Close()
+
+	return s.scanFiles(rows)
+}
+
 // GetAllDatabases returns all unique database names from the tier metadata.
 // This includes databases that may only have data in cold storage.
 func (s *MetadataStore) GetAllDatabases(ctx context.Context) ([]string, error) {
