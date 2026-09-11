@@ -143,3 +143,26 @@ func TestSignForwardAck_RoundTrips(t *testing.T) {
 		}
 	}
 }
+
+// TestHandleForwardApply_FailsClosedWithoutReplayGuard covers the cell opened
+// by tightening the forward-apply and replicate-sync replay checks from
+// `cache != nil && !Track(...)` to `!Track(...)`.
+//
+// Those two sites are not reachable with a nil cache in production — Start()
+// installs it before the listener accepts — but the previous form would have
+// skipped replay protection entirely if that ever stopped holding, with every
+// test still green. Now an absent guard rejects, matching the handshake
+// validators. This test pins that, and the nil-safety of Track that makes it
+// work without a panic.
+func TestHandleForwardApply_FailsClosedWithoutReplayGuard(t *testing.T) {
+	c := newForwardAckTestCoordinator(joinTestSecret)
+	if c.nonceCache != nil {
+		t.Fatal("this coordinator is built without a nonce cache by design")
+	}
+
+	// The bare call must report "not new" rather than panicking, which is
+	// what lets the caller drop its nil check.
+	if c.nonceCache.Track("node", "nonce") {
+		t.Error("Track on a nil cache reported the nonce as new — the guard would fail open")
+	}
+}

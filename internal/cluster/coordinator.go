@@ -107,8 +107,11 @@ type Coordinator struct {
 	deleteWg    sync.WaitGroup
 
 	// nonceCache tracks recently seen nonces for replay protection on
-	// HMAC-authenticated messages (leader forwarding, and extensible to
-	// join/leave in the future). Initialized in Start().
+	// HMAC-authenticated messages: the join/heartbeat/leave handshake,
+	// leader forwarding, and replicate-sync. Initialized in Start() before
+	// the listener accepts, which is what lets the handshake validators
+	// treat a nil cache as a construction error rather than a reason to skip
+	// the check.
 	nonceCache *security.NonceCache
 
 	// forwardConn caches a single TCP connection to the current Raft
@@ -443,8 +446,12 @@ func (c *Coordinator) Start() error {
 	// parent context (Phase 4 integration-test discovery).
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 
-	// Initialize the nonce cache for HMAC replay protection. The 5-minute
-	// TTL matches the HMAC timestamp tolerance in ValidateForwardHMAC.
+	// Initialize the nonce cache for HMAC replay protection.
+	//
+	// NewNonceCache takes the freshness TOLERANCE and derives a longer
+	// retention from it (2T+1s), because a message may be stamped up to one
+	// tolerance in the future and must not outlive its cache slot. Do not
+	// "simplify" this by passing a TTL.
 	c.nonceCache = security.NewNonceCache(security.HMACTimestampTolerance)
 
 	// Start Raft node if configured (Phase 3)
@@ -1442,9 +1449,9 @@ func (c *Coordinator) handleHeartbeat(conn net.Conn, hb *protocol.Heartbeat) {
 	// Validate shared secret if configured. A heartbeat mutates the sender's
 	// recorded liveness and self-reported state, so it is authenticated like
 	// join/leave — otherwise a network attacker could spoof any node's health
-	// (GHSA-p378-jp5r-gpgw). Mirrors handleLeaveNotify; freshness is bounded by
-	// the HMAC timestamp tolerance (consistent with join/leave, which likewise
-	// do not nonce-replay-check).
+	// (GHSA-p378-jp5r-gpgw). Mirrors handleLeaveNotify: the MAC covers every
+	// field of the message and the nonce is consumed on receipt, so a captured
+	// heartbeat cannot be replayed inside the freshness window.
 	if c.cfg.SharedSecret != "" {
 		if hb.AuthHMAC == "" {
 			c.logger.Warn().Str("node_id", hb.NodeID).Msg("Heartbeat rejected: shared secret required but not provided")
@@ -1587,7 +1594,13 @@ func (c *Coordinator) handleReplicateSync(conn net.Conn, syncReq *protocol.Repli
 	}
 	// Replay check AFTER HMAC validation: don't burn a nonce-cache slot
 	// on an attacker who can't even produce a valid MAC.
-	if c.nonceCache != nil && !c.nonceCache.Track(syncReq.ReaderID, syncReq.Nonce) {
+	// Fail closed on a nil cache: Track returns false when the receiver is
+	// nil, so an absent replay guard rejects rather than silently skipping
+	// the check. (The handshake validators enforce the same contract via
+	// validateWithReplay; keeping these two consistent matters because a
+	// future change that registers either handler earlier than Start() would
+	// otherwise reopen a replay hole with every test still passing.)
+	if !c.nonceCache.Track(syncReq.ReaderID, syncReq.Nonce) {
 		c.logger.Warn().
 			Str("peer", remoteAddr).
 			Str("reader_id", syncReq.ReaderID).

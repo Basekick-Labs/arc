@@ -119,13 +119,18 @@ type ReplicateSync struct {
 	// SupportsBinaryEntries advertises that this reader understands
 	// MsgReplicateEntryBin frames (#698), letting the writer send WAL
 	// entry payloads as raw bytes instead of JSON + base64 (whose 4/3
-	// inflation made entries above ~75MB unsendable). Deliberately NOT
-	// covered by the handshake HMAC: old writers compute and validate
-	// the MAC over the original field tuple, so folding this flag in
-	// would break every mixed-version handshake. The worst an on-path
-	// tamperer gains by flipping it is a framing downgrade or a dropped
-	// connection, both already available to anyone who can modify the
-	// stream; TLS covers integrity where configured.
+	// inflation made entries above ~75MB unsendable).
+	//
+	// NOT covered by the replicate-sync HMAC. The original reason — that
+	// folding it in would break mixed-version handshakes — no longer
+	// applies as stated: 26.09.2 made the coordinator handshake a hard
+	// cutover anyway. It is still unsigned because replicate-sync is a
+	// separate message and validator from the handshake family, and
+	// widening that cutover was out of scope for the security fix that
+	// forced it. The worst an on-path tamperer gains by flipping this is a
+	// framing downgrade or a dropped connection, both already available to
+	// anyone who can modify the stream; TLS covers integrity where
+	// configured. Tracked as a follow-up.
 	SupportsBinaryEntries bool `json:"bin_entries,omitempty"`
 }
 

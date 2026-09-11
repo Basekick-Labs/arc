@@ -345,7 +345,13 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	// Replay protection: reject duplicate (nodeID, nonce) pairs within
 	// the TTL window. The nonce cache is initialized in Start() and
 	// shared across all handleForwardApply invocations.
-	if c.nonceCache != nil && !c.nonceCache.Track(req.NodeID, req.Nonce) {
+	// Fail closed on a nil cache: Track returns false when the receiver is
+	// nil, so an absent replay guard rejects rather than silently skipping
+	// the check. (The handshake validators enforce the same contract via
+	// validateWithReplay; keeping these two consistent matters because a
+	// future change that registers either handler earlier than Start() would
+	// otherwise reopen a replay hole with every test still passing.)
+	if !c.nonceCache.Track(req.NodeID, req.Nonce) {
 		c.logger.Warn().
 			Str("peer", remoteAddr).
 			Str("requesting_node", req.NodeID).

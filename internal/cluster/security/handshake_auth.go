@@ -3,6 +3,7 @@ package security
 import (
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 )
@@ -160,6 +161,14 @@ func validateHandshakeMAC(sharedSecret string, label MsgType, timestamp int64, t
 // separate so every handshake validator shares one definition of "fresh" —
 // and so NewNonceCache's doc can reason about the exact same inequality.
 func checkHandshakeFreshness(timestamp int64, tolerance time.Duration) error {
+	// Timestamps are second-granularity, so a sub-second tolerance truncates
+	// to zero and rejects everything — fail-closed, but a confusing footgun
+	// for a future caller who passes 500ms. Refuse it explicitly, matching
+	// checkSyncFreshness.
+	if tolerance < time.Second {
+		return fmt.Errorf("security: handshake auth tolerance %v is below the one-second timestamp granularity", tolerance)
+	}
+
 	now := time.Now().Unix()
 	drift := now - timestamp
 	if drift < 0 {
@@ -241,8 +250,11 @@ func validateWithReplay(guard ReplayGuard, nodeID, nonce string, validate func()
 	// Both nil shapes must be caught: a nil interface, and a non-nil
 	// interface holding a nil *NonceCache (which a caller passing a nil
 	// struct pointer produces, and which `guard == nil` does NOT match).
-	// NonceCache.Track is additionally nil-safe and returns false, so even a
-	// guard type this package does not know about fails closed here.
+	// NonceCache.Track is additionally nil-safe, so the one production
+	// implementation fails closed rather than panicking even if it reaches
+	// Track. A different ReplayGuard implementation whose Track is not
+	// nil-safe would still panic on a typed nil — there is exactly one today,
+	// and a new one must keep that property.
 	if guard == nil {
 		return errors.New("security: handshake replay guard is required")
 	}
