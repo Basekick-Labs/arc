@@ -220,8 +220,13 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
    additionally cannot establish WAL replication with a writer and will fall
    behind until both ends are upgraded. Single-node, non-clustered and OSS
    deployments need no action.
-2. **No configuration change is required.** Existing `arc.toml` files and
-   license keys work as-is; no new keys were added.
+2. **No configuration change is required, with one edge-sync exception.**
+   Existing `arc.toml` files and license keys work as-is and no new keys were
+   added. The exception: a spoke whose `spoke_id` contains `..`, is longer than
+   128 bytes, or has leading or trailing whitespace is now refused, so such a
+   spoke fails to start until its ID is changed. See *Edge-sync spoke IDs can
+   no longer collide with another spoke's namespace* below. The hub names any
+   stored ID in that state at startup.
 3. **Query response envelopes gained two optional keys** (`rows_capped`,
    `row_cap`), emitted only when an Enterprise governance row cap truncated
    the result. Conforming JSON and msgpack decoders are unaffected: the keys
@@ -232,6 +237,41 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
    them at all.
 
 ## Bug fixes
+
+### Edge-sync spoke IDs can no longer collide with another spoke's namespace ([#737](https://github.com/Basekick-Labs/arc/issues/737))
+
+A spoke identifier containing an embedded `..`, such as `rocket..01`, passed
+validation. The local storage backend then folded every `..` to `_` while
+resolving the path, so that identifier and the legitimate `rocket_01` landed in
+one directory, and a spoke authenticated as one could write into the other's
+namespace. The HMAC proves which spoke is asking; the namespace mapping is what
+decides where it may write, and that mapping was not injective.
+
+`validateSpokeID` now rejects the sequence anywhere in the identifier, closing
+both the receive path and registration. This is the same rule
+[#574](https://github.com/Basekick-Labs/arc/pull/574) applied to the source
+path, which left the identity that prefixes it open. The validator also gained
+the bounds it was missing next to a field it shares a table with: a 128-byte
+cap, no control characters, and no leading or trailing whitespace. An over-long
+ID used to register successfully and then fail every write with
+`ENAMETOOLONG`, wedging the spoke with nothing said at registration.
+
+Reaching the collision required an administrator to create a spoke ID
+containing `..` in the first place: registration is admin-only, secrets are
+generated server-side, and there is no self-registration, so no advisory was
+issued. It affects the local filesystem backend only, since S3 and Azure
+preserve key spelling, and edge sync is opt-in.
+
+**If you already run a spoke whose ID is now refused**, the hub says so at
+startup, naming each stored ID and why, so you do not have to wait for an edge
+box to fail. Re-registering is not simply a rename: for an ID like
+`rocket..01`, the data it already synced is on disk under `rocket_01/`, which
+is the other spoke's namespace, and the hub's file index is keyed on the spoke
+ID, so a spoke re-pointed at a fresh ID finds no index rows and re-uploads its
+whole backlog into the new namespace. Plan the move deliberately, deciding what
+happens to the files already written under the folded name.
+
+Reported by **[@rexpository](https://github.com/rexpository)**.
 
 ### Arrow IPC cleanup no longer runs twice on the panic path ([#733](https://github.com/Basekick-Labs/arc/issues/733))
 

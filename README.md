@@ -461,3 +461,4 @@ Thanks to everyone who has contributed code to Arc:
 And a thank-you to community members whose bug reports drove fixes:
 
 - [@bjarneksat](https://github.com/bjarneksat) — reported the line-protocol null-field handling bug fixed in 26.03.1
+- [@rexpository](https://github.com/rexpository) — reported the edge-sync spoke-ID namespace collision fixed in 26.09.2 (#737), and ongoing security research across the cluster, auth and edge-sync boundaries

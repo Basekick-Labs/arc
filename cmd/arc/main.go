@@ -2466,6 +2466,22 @@ func main() {
 		if countErr != nil {
 			log.Fatal().Err(countErr).Msg("Edge sync spoke registry is unusable; refusing to start")
 		}
+		// Spoke IDs registered before the validator tightened are still in the
+		// table and still enabled, and the only signal an operator would
+		// otherwise get is an edge box failing at the far end (#737).
+		idCtx, cancelIDs := context.WithTimeout(context.Background(), 10*time.Second)
+		badIDs, idErr := spokeRegistry.InvalidStoredIDs(idCtx)
+		cancelIDs()
+		if idErr != nil {
+			syncLogger.Warn().Err(idErr).Msg("Could not check registered spoke IDs against the current rules")
+		}
+		for id, reason := range badIDs {
+			syncLogger.Warn().
+				Str("spoke_id", id).
+				Err(reason).
+				Msg("Registered spoke ID is no longer accepted; this spoke can no longer sync and must be re-registered under a valid ID")
+		}
+
 		if spokeCount == 0 {
 			syncLogger.Warn().
 				Str("hub_id", cfg.EdgeSync.HubID).

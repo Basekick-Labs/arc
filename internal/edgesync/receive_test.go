@@ -331,6 +331,15 @@ func TestReceiver_RejectsMaliciousSpokeIDs(t *testing.T) {
 		{"backslash", "rocket\\other"},
 		{"dot prefix", ".sync-staging"},
 		{"NUL byte", "rocket\x00-01"},
+		// #737: accepted by every other check, but the local backend folds
+		// ".." to "_", so this lands in rocket_01's namespace.
+		{"embedded traversal", "rocket..01"},
+		{"embedded traversal, trailing", "rocket01.."},
+		{"embedded traversal, only dots", "a..b"},
+		{"over-long", strings.Repeat("r", MaxSpokeIDLen+1)},
+		{"trailing space", "rocket_01 "},
+		{"leading space", " rocket_01"},
+		{"control character", "rocket\n01"},
 	}
 
 	for _, tt := range ids {
@@ -985,5 +994,66 @@ func TestReceiver_CompactedReceiptAnswersAlreadyPresent(t *testing.T) {
 	}
 	if res.Outcome != OutcomeConflict || res.TheirSHA256 != digest {
 		t.Fatalf("outcome = %v/%q, want conflict with the delivered digest", res.Outcome, res.TheirSHA256)
+	}
+}
+
+// TestSpokeNamespacesAreInjective is the invariant #737 actually violated, and
+// the one worth keeping: every spoke ID validateSpokeID accepts must resolve to
+// a namespace no other accepted ID can reach.
+//
+// It asserts through the real local backend rather than by reasoning about
+// validateSpokeID's rules, because the collision came from the gap between what
+// the validator allows and what the backend does to a path afterwards
+// (storage/local.go folds every ".." to "_"). Checking the validator alone
+// would have missed it exactly as the original review did.
+//
+// Every candidate is written FIRST and read back only afterwards. Reading each
+// one straight after its own write proves nothing: the read is sanitized by the
+// same rule as the write, so a colliding pair still returns the bytes it just
+// stored. The collision only shows up as an earlier spoke's payload having been
+// replaced.
+func TestSpokeNamespacesAreInjective(t *testing.T) {
+	ctx := context.Background()
+	_, backend := newTestReceiver(t)
+
+	// Candidates that differ as strings but are plausible collisions under a
+	// sanitizer that rewrites rather than rejects. Whatever validateSpokeID
+	// accepts here must stay distinct on disk.
+	// Deliberately all-lowercase. "ROCKET_01" and "rocket_01" are both
+	// accepted and collide on a case-insensitive filesystem, which is the same
+	// bug on a different fold, but it is not the one this change closes and
+	// rejecting uppercase would break existing deployments. Including it here
+	// would make this test pass on Linux CI and fail on a macOS dev machine.
+	// Tracked separately (#740).
+	candidates := []string{
+		"rocket_01", "rocket..01", "rocket-01", "rocket01..", "a..b", "a_b",
+		"rocket.01", "rocket__01",
+	}
+
+	const sourcePath = "default/cpu/2026/09/02/00/collision.parquet"
+	accepted := make([]string, 0, len(candidates))
+
+	for _, id := range candidates {
+		if err := validateSpokeID(id); err != nil {
+			continue // rejected, so it can never reach storage
+		}
+		accepted = append(accepted, id)
+		if err := backend.Write(ctx, NamespacedPath(id, sourcePath), []byte("payload-from-"+id)); err != nil {
+			t.Fatalf("writing as %q: %v", id, err)
+		}
+	}
+
+	if len(accepted) < 2 {
+		t.Fatalf("only %d spoke IDs were accepted; the test asserts nothing", len(accepted))
+	}
+
+	for _, id := range accepted {
+		got, err := backend.Read(ctx, NamespacedPath(id, sourcePath))
+		if err != nil {
+			t.Fatalf("reading back as %q: %v", id, err)
+		}
+		if want := "payload-from-" + id; string(got) != want {
+			t.Errorf("spoke %q reads back %q, so another accepted spoke ID resolves to its namespace", id, got)
+		}
 	}
 }

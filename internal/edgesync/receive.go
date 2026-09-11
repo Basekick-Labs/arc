@@ -607,6 +607,10 @@ func stagingPathFor(spokeID, sourcePath string) string {
 	return path.Join(StagingPrefix, spokeID, sourcePath)
 }
 
+// MaxSpokeIDLen bounds a spoke identifier. It becomes a filesystem path
+// component, and 128 matches the cap the registry applies to the spoke name.
+const MaxSpokeIDLen = 128
+
 // validateSpokeID rejects identifiers that could escape their namespace.
 //
 // The spoke ID becomes the first path segment of everything that spoke writes,
@@ -624,8 +628,40 @@ func validateSpokeID(spokeID string) error {
 	if spokeID == "." || spokeID == ".." || strings.HasPrefix(spokeID, ".") {
 		return fmt.Errorf("edgesync: spoke ID %q may not start with a dot", spokeID)
 	}
+	// Reject ".." ANYWHERE, for the same reason validateSyncPath does: the
+	// local backend sanitizes by replacing every ".." substring with "_"
+	// (storage/local.go), which is many-to-one. The spoke ID is the first
+	// path segment of everything a spoke writes, so "rocket..01" and
+	// "rocket_01" resolve to one directory and either spoke can write into
+	// the other's namespace. #574 closed this for the source path and left
+	// the identity that prefixes it open (#737).
+	if strings.Contains(spokeID, "..") {
+		return fmt.Errorf("edgesync: spoke ID %q contains a parent-directory sequence", spokeID)
+	}
 	if strings.ContainsRune(spokeID, 0) {
 		return fmt.Errorf("edgesync: spoke ID contains a NUL byte")
+	}
+	// The ID is a filesystem path component, so an over-long one registers
+	// fine and then fails every write with ENAMETOOLONG (255 bytes per
+	// component on ext4), wedging the spoke with no signal at registration.
+	// 128 matches the cap the registry already applies to the spoke name,
+	// which is the field with no security role.
+	if len(spokeID) > MaxSpokeIDLen {
+		return fmt.Errorf("edgesync: spoke ID is %d bytes; the maximum is %d", len(spokeID), MaxSpokeIDLen)
+	}
+	// Leading or trailing whitespace is invisible in a config file and in
+	// every listing, so two IDs that differ only by it are indistinguishable
+	// to an operator. Windows strips trailing dots and spaces outright, which
+	// would collide them for real.
+	if strings.TrimSpace(spokeID) != spokeID {
+		return fmt.Errorf("edgesync: spoke ID %q has leading or trailing whitespace", spokeID)
+	}
+	// Echoed into logs and API responses, so an embedded newline forges log
+	// lines against whatever reads them.
+	for _, r := range spokeID {
+		if r < 0x20 || r == 0x7f {
+			return errors.New("edgesync: spoke ID contains a control character")
+		}
 	}
 	return nil
 }

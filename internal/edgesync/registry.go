@@ -379,6 +379,30 @@ func (r *Registry) Count(ctx context.Context) (int64, error) {
 	return n, nil
 }
 
+// InvalidStoredIDs returns the registered spoke IDs that today's validator
+// rejects, so an upgrade that tightens the rules can say so at startup instead
+// of letting an edge box fail later with no explanation on the hub (#737).
+//
+// It reports rather than deletes: the rows still hold a live secret and the
+// data those spokes already synced is still on disk, so removing them is an
+// operator decision.
+func (r *Registry) InvalidStoredIDs(ctx context.Context) (map[string]error, error) {
+	spokes, err := r.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var bad map[string]error
+	for _, s := range spokes {
+		if err := validateSpokeID(s.SpokeID); err != nil {
+			if bad == nil {
+				bad = make(map[string]error, 1)
+			}
+			bad[s.SpokeID] = err
+		}
+	}
+	return bad, nil
+}
+
 // VerifyStoredSecrets checks that the configured key can still decrypt what is
 // already stored, and reports how many spokes are registered.
 //

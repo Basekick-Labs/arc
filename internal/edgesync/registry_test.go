@@ -669,3 +669,55 @@ func TestRegistry_VerifyStoredSecretsChecksDisabledSpokesToo(t *testing.T) {
 		t.Error("a corrupt secret on a disabled spoke was not detected")
 	}
 }
+
+// TestRegistry_RejectsCollidingSpokeIDs closes the other half of #737. The
+// receive path validating the ID is not enough on its own: if a colliding ID
+// can be registered, an operator hands out a credential that resolves into
+// somebody else's namespace, and the receive-side rejection only surfaces it
+// later as an unexplained refusal.
+func TestRegistry_RejectsCollidingSpokeIDs(t *testing.T) {
+	ctx := context.Background()
+	reg, _ := newTestRegistry(t)
+
+	if _, err := reg.Register(ctx, "rocket_01", "Rocket 01"); err != nil {
+		t.Fatalf("registering the legitimate spoke: %v", err)
+	}
+
+	// Accepted by every other rule, and folds onto rocket_01 in local storage.
+	if _, err := reg.Register(ctx, "rocket..01", "Impostor"); err == nil {
+		t.Error("a spoke ID containing \"..\" was registered; it collides with rocket_01 on the local backend")
+	}
+}
+
+// TestRegistry_InvalidStoredIDs covers the migration half of #737. Tightening
+// the validator does nothing for rows registered under the old rules, and the
+// only signal an operator would otherwise get is an edge box failing at the far
+// end with no matching entry in the hub's log.
+func TestRegistry_InvalidStoredIDs(t *testing.T) {
+	ctx := context.Background()
+	reg, db := newTestRegistry(t)
+
+	if _, err := reg.Register(ctx, "rocket-01", "Rocket 01"); err != nil {
+		t.Fatalf("registering a valid spoke: %v", err)
+	}
+
+	// Register refuses this now, so a legacy row goes in behind its back. That
+	// is exactly the state an upgraded hub is in.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO sync_spokes (spoke_id, name, secret_encrypted, enabled, registered_at)
+		 VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)`,
+		"rocket..01", "Legacy", "x"); err != nil {
+		t.Fatalf("inserting the legacy row: %v", err)
+	}
+
+	bad, err := reg.InvalidStoredIDs(ctx)
+	if err != nil {
+		t.Fatalf("InvalidStoredIDs: %v", err)
+	}
+	if _, found := bad["rocket..01"]; !found {
+		t.Errorf("the legacy colliding ID was not reported: %v", bad)
+	}
+	if _, found := bad["rocket-01"]; found {
+		t.Errorf("a valid spoke ID was reported as invalid: %v", bad)
+	}
+}
