@@ -5,6 +5,7 @@ package api
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"strconv"
@@ -40,6 +41,61 @@ const arrowExecutionTimeTrailer = "Arc-Execution-Time-Ms"
 // Smaller batches reduce peak memory usage and enable streaming.
 // 10K rows is a good balance between overhead and memory efficiency.
 const arrowBatchSize = 10000
+
+// arrowStreamTruncatedTrailer tells the client the Arrow IPC body it received
+// is short. It is a trailer because the status line and headers are long gone
+// by the time a stream fails.
+const arrowStreamTruncatedTrailer = "Arc-Stream-Truncated"
+
+// transportWriter distinguishes "the socket went away" from "the encoder
+// failed". Both surface as an error out of ipc.Writer.Write, and only the
+// former means nobody is listening. Wrapping the sink is the only way to tell:
+// a real Arrow batch is far larger than the 4KB bufio fasthttp hands the
+// stream callback, so writes go straight through and a hangup lands on Write
+// rather than on the later Flush that used to be the only place it was tagged.
+type transportWriter struct {
+	w   *bufio.Writer
+	err error
+}
+
+func (t *transportWriter) Write(p []byte) (int, error) {
+	n, err := t.w.Write(p)
+	if err != nil {
+		t.err = err
+	}
+	return n, err
+}
+
+// poisonArrowStream writes an Arrow IPC message header that can never be
+// satisfied, so a client decoding the stream fails instead of accepting a
+// short read as a complete result (#721).
+//
+// A truncated Arrow stream is otherwise indistinguishable from a complete one:
+// cut on a record-batch boundary it decodes with no error, and the paths that
+// still reach ipcWriter.Close() emit a valid end-of-stream marker on top. The
+// eight bytes here are the encapsulated-message format from the Arrow spec, a
+// 0xFFFFFFFF continuation token followed by a metadata length, so a reader hits
+// EOF partway through a message it was promised.
+//
+// The length must be non-zero, since zero after the continuation token is
+// itself the end-of-stream marker, and small, because readers allocate it
+// before reading.
+func poisonArrowStream(w *bufio.Writer, logger zerolog.Logger) {
+	if w == nil {
+		return
+	}
+	// The trailing byte matters: io.ReadFull returns a plain io.EOF when it
+	// reads nothing at all, and arrow-go treats that as a clean end of stream.
+	// One byte of the promised metadata makes the read genuinely short, which
+	// surfaces as an unexpected EOF the reader reports.
+	if _, err := w.Write([]byte{0xFF, 0xFF, 0xFF, 0xFF, 0x40, 0x00, 0x00, 0x00, 0x00}); err != nil {
+		logger.Debug().Err(err).Msg("Could not mark the Arrow IPC stream truncated; the client is already gone")
+		return
+	}
+	if err := w.Flush(); err != nil {
+		logger.Debug().Err(err).Msg("Could not flush the Arrow IPC truncation marker")
+	}
+}
 
 // releaseArrowStreamResources frees everything the Arrow IPC response owns:
 // the DuckDB-backed reader, the pooled connection behind it, and the query
@@ -105,6 +161,9 @@ func streamArrowIPC(
 	// re-sends the full dictionary when it grows. Deliberately NOT
 	// WithDictionaryDeltas — polars cannot read delta batches (verified
 	// against polars 1.43; pyarrow reads both).
+	// Everything the encoder writes goes through tw, so a socket failure can
+	// be told apart from an encoder failure when classifying the error below.
+	tw := &transportWriter{w: w}
 	newIPCWriter := func(outSchema *arrow.Schema) *ipc.Writer {
 		opts := []ipc.Option{ipc.WithSchema(outSchema)}
 		switch ipcCompression {
@@ -113,7 +172,7 @@ func streamArrowIPC(
 		case "lz4":
 			opts = append(opts, ipc.WithLZ4())
 		}
-		return ipc.NewWriter(w, opts...)
+		return ipc.NewWriter(tw, opts...)
 	}
 
 	var totalRows int64
@@ -218,7 +277,15 @@ streamLoop:
 			}
 
 			if err := ipcWriter.Write(writeBatch); err != nil {
-				streamErr = fmt.Errorf("failed to write arrow batch at row %d: %w", totalRows, err)
+				// A hangup surfaces here, not at the Flush below, because a
+				// batch overflows the 4KB bufio and writes straight through.
+				// Tag it so the caller treats it as a client disconnect
+				// rather than a server-side failure worth alerting on.
+				if tw.err != nil {
+					streamErr = fmt.Errorf("stream write failed at row %d: %w: %w", totalRows, errClientDisconnected, err)
+				} else {
+					streamErr = fmt.Errorf("failed to write arrow batch at row %d: %w", totalRows, err)
+				}
 				return true
 			}
 			// Capture Flush error: fasthttp's RequestCtx.Done() only fires
@@ -255,6 +322,22 @@ streamLoop:
 	}
 	if dictXform != nil {
 		defer dictXform.release()
+	}
+
+	// A failed stream must not be closed cleanly (#721). ipc.Writer.Close
+	// emits the end-of-stream marker, which would make a short result read as
+	// a complete one: an Arrow stream cut on a batch boundary decodes without
+	// error, and this path is always on a boundary because every batch is
+	// flushed. Mark the body unsatisfiable instead, so the client's decode
+	// fails rather than quietly returning fewer rows than the query matched.
+	// This covers the zero-batch case too, where the schema-only stream would
+	// otherwise read as a legitimate empty result.
+	//
+	// A client that has already gone is skipped: there is nobody to tell, and
+	// writing to a dead socket only produces noise.
+	if streamErr != nil && !errors.Is(streamErr, errClientDisconnected) {
+		poisonArrowStream(w, logger)
+		return totalRows, streamErr
 	}
 
 	if err := ipcWriter.Close(); err != nil {
@@ -497,6 +580,12 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// trailers degrade gracefully to wall-clock timing. The Warn is
 	// sync.Once-gated against per-request log spam if a future fasthttp
 	// release ever rejects the trailer name.
+	if err := respHeader.AddTrailer(arrowStreamTruncatedTrailer); err != nil {
+		arrowTrailerWarnOnce.Do(func() {
+			h.logger.Warn().Err(err).Str("trailer", arrowStreamTruncatedTrailer).
+				Msg("Failed to register Arrow truncation trailer; clients will not see the reason a stream was cut")
+		})
+	}
 	if err := respHeader.AddTrailer(arrowExecutionTimeTrailer); err != nil {
 		arrowTrailerWarnOnce.Do(func() {
 			h.logger.Warn().Err(err).Str("trailer", arrowExecutionTimeTrailer).
@@ -509,9 +598,26 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// defer inside the writer: on the success path the release must stay
 	// ahead of the trailer set below, because the stream-writer goroutine
 	// and the connection goroutine both touch the response header (#716).
+	// streamW lets the panic path reach the same writer the body used, so it
+	// can mark the stream truncated. safeStream's onPanic takes no arguments,
+	// and widening it would churn five other call sites that have no writer to
+	// mark.
+	var streamW *bufio.Writer
 	fctx.SetBodyStreamWriter(h.safeStream("query_arrow_ipc", func() {
+		// A recovered panic leaves a stream the client would otherwise read as
+		// complete: fasthttp still writes the terminating chunk, and a cut on
+		// a batch boundary decodes without error (#721).
+		//
+		// Only the body is marked here, not the trailer. By this point
+		// fasthttp's connection goroutine may already be serialising the
+		// response header, and writing a trailer from this goroutine races
+		// with it (caught by the race detector). The marker in the body is
+		// what every client detects anyway; the trailer only ever carried the
+		// reason, and the panic is logged with far more detail than it could.
+		poisonArrowStream(streamW, h.logger)
 		releaseArrowStreamResources(reader, conn, cancel, h.logger)
 	}, func(w *bufio.Writer) {
+		streamW = w
 		totalRows, streamErr := streamArrowIPCFunc(
 			streamCtx, w, reader, schema, castInfo, dictEnabled, ipcCompression, governanceMaxRows, h.logger,
 		)
@@ -535,6 +641,17 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			// — server-side stream failures stay in IncQueryErrors only.
 			if isClientError(streamErr) {
 				m.IncQueryClientDisconnect(metrics.DisconnectPathArrowIPC)
+			}
+			// Tell the client its Arrow stream is short (#721). Skipped only
+			// when the socket is already gone: a server-side timeout is a
+			// client-side error class here but the caller is still waiting,
+			// so it must be told, which is why this keys off the disconnect
+			// sentinel rather than isClientError.
+			// streamArrowIPC has already marked the body itself; the
+			// marker has to precede the end-of-stream bytes, so it cannot
+			// be written from out here.
+			if !errors.Is(streamErr, errClientDisconnected) {
+				respHeader.Set(arrowStreamTruncatedTrailer, sqlutil.SanitizeErrText(streamErr.Error()))
 			}
 			// Warn for client-disconnect / timeout (expected ops noise);
 			// Error for everything else (real server-side problem worth

@@ -214,6 +214,26 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
 
 ## Bug fixes
 
+### A truncated Arrow IPC response is no longer readable as a complete one ([#721](https://github.com/Basekick-Labs/arc/issues/721))
+
+When an Arrow IPC stream was cut short, the client could not tell. Arc flushes
+after every record batch, so a stream that stopped early stopped on a batch
+boundary, and an Arrow reader treats that as a clean end. The paths that still
+closed the writer went further and appended a valid end-of-stream marker. The
+result was HTTP 200, a well-formed Arrow stream, and silently fewer rows than
+the query matched. A query that exceeded `query.timeout` partway through
+delivering its results was the most likely way to hit it; a failure before the
+first batch produced a schema-only stream that read as a legitimate empty
+result, which a dashboard shows as no data rather than as an error.
+
+A failed stream is now marked so the client's decode fails instead. Complete
+responses are unchanged, and a client that has already disconnected is not
+written to, since there is nobody left to inform.
+
+Arc also now distinguishes a dropped connection from an encoder failure on this
+path. Both previously surfaced the same way, so a client hanging up mid-stream
+was logged as a server-side error and missed the client-disconnect metric.
+
 ### A panic while streaming a response no longer crashes the server ([#717](https://github.com/Basekick-Labs/arc/issues/717))
 
 Query responses are streamed from a callback that fasthttp runs on its own
