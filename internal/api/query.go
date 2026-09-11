@@ -2319,6 +2319,13 @@ func ValidateSQLRequest(sql string) error {
 		return &SQLValidationError{Message: "File I/O function not allowed in user SQL: " + m[1] + "()"}
 	}
 
+	// Dynamic-SQL table functions execute a nested SQL string that neither the
+	// I/O denylist above nor RBAC table extraction can see (GHSA-w6w2-x8xv-q8x2),
+	// checked on the same normalised form.
+	if m := dynamicSQLFunctionPattern.FindStringSubmatch(ioCheckNormalised); m != nil {
+		return &SQLValidationError{Message: "Dynamic SQL function not allowed in user SQL: " + m[1] + "()"}
+	}
+
 	// SECURITY: reject a bare single-quoted string in table position — a
 	// DuckDB replacement scan (GHSA-w8x2-cccw-25f7, incomplete-fix residual of
 	// GHSA-93cm-2v4m-c56c).
@@ -2621,6 +2628,33 @@ var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join([]strin
 	"iceberg_snapshots",
 	"arc_partition_agg",
 }, "|") + `)\s*\(`)
+
+// dynamicSQLFunctionPattern matches DuckDB table functions that evaluate a
+// string as SQL (or resolve a string to a relation). They are the I/O
+// denylist's blind spot: the dangerous inner SQL rides as a string argument,
+// so literal masking hides it and neither ioTableFunctionPattern nor RBAC's
+// extractTableReferences (which skips `name(` as a table-valued function) ever
+// sees the read_parquet, replacement scan, or cross-tenant reference inside it.
+// A read token scoped to one database could call
+// `query('SELECT * FROM read_parquet(”/other-tenant/…”)')` and read across
+// the tenant boundary inside the storage root — confirmed live returning
+// another database's rows on /api/v1/query and /api/v1/query/estimate
+// (GHSA-w6w2-x8xv-q8x2). Same class as the quoted-name (GHSA-93cm-2v4m-c56c)
+// and replacement-scan (GHSA-w8x2-cccw-25f7) evasions of the I/O denylist.
+//
+// Arc's read API has no user-facing need for dynamic SQL, so these are rejected
+// outright rather than recursively validated (a far larger, riskier surface).
+// Matched against the quote-stripped, literal-masked, comment-stripped form
+// (ioDenylistNormalise) so `"query"(…)`, comment/spacing/case variants, and
+// schema-qualified `main.query(…)` cannot evade it.
+//
+// Maintenance: this set was enumerated from duckdb_functions() against the
+// pinned DuckDB release (see duckdb-go/v2 in go.mod) plus the extensions Arc
+// autoloads (json). json_execute_serialized_sql is the json-extension member
+// and is the reason this is not just {query, query_table}. When DuckDB or a
+// loaded extension adds another string-executing table function, add it here;
+// TestDynamicSQLFunctionPattern_Family pins the set.
+var dynamicSQLFunctionPattern = regexp.MustCompile(`(?i)\b(query|query_table|json_execute_serialized_sql)\s*\(`)
 
 // getTransformedSQL returns the transformed SQL with caching.
 // If headerDB is non-empty, uses the optimized path with that database for all tables.
