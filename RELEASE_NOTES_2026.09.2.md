@@ -214,6 +214,32 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
 
 ## Bug fixes
 
+### JSON query responses now say when the result was cut short ([#723](https://github.com/Basekick-Labs/arc/issues/723))
+
+A JSON response opens with `{"success":true,...,"data":[` before the first row
+is known, and both streaming writers closed the document whether or not the
+stream had failed. A client that was still connected therefore received HTTP
+200, valid JSON, `success: true`, and silently fewer rows than its query
+matched, with `row_count` reporting the rows delivered rather than the rows
+found. A query that exceeded `query.timeout` partway through delivering a large
+result was the likeliest way to hit it.
+
+A failed stream now adds `"truncated": true` and a `truncation_reason` to the
+closing envelope. **Clients that need to distinguish a complete result from a
+partial one should check `truncated`.** The document still parses, and the rows
+already delivered are still there, so a client that ignores the field behaves
+exactly as before.
+
+`success` is deliberately left as-is. It is written before the first row and, on
+any result large enough to have flushed, has already reached the client and
+cannot be revised. Emitting a different shape for small results would make the
+response depend on whether the result happened to fit in a buffer.
+
+This is the JSON counterpart to the Arrow IPC fix in the same release. Failures
+that happen before streaming begins are unaffected: those still return a real
+error status, as they always have. MessagePack responses were never affected,
+because they commit their counts up front and a cut is a hard decode error.
+
 ### A truncated Arrow IPC response is no longer readable as a complete one ([#721](https://github.com/Basekick-Labs/arc/issues/721))
 
 When an Arrow IPC stream was cut short, the client could not tell. Arc flushes
