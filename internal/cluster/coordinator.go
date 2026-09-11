@@ -107,8 +107,11 @@ type Coordinator struct {
 	deleteWg    sync.WaitGroup
 
 	// nonceCache tracks recently seen nonces for replay protection on
-	// HMAC-authenticated messages (leader forwarding, and extensible to
-	// join/leave in the future). Initialized in Start().
+	// HMAC-authenticated messages: the join/heartbeat/leave handshake,
+	// leader forwarding, and replicate-sync. Initialized in Start() before
+	// the listener accepts, which is what lets the handshake validators
+	// treat a nil cache as a construction error rather than a reason to skip
+	// the check.
 	nonceCache *security.NonceCache
 
 	// forwardConn caches a single TCP connection to the current Raft
@@ -443,8 +446,12 @@ func (c *Coordinator) Start() error {
 	// parent context (Phase 4 integration-test discovery).
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 
-	// Initialize the nonce cache for HMAC replay protection. The 5-minute
-	// TTL matches the HMAC timestamp tolerance in ValidateForwardHMAC.
+	// Initialize the nonce cache for HMAC replay protection.
+	//
+	// NewNonceCache takes the freshness TOLERANCE and derives a longer
+	// retention from it (2T+1s), because a message may be stamped up to one
+	// tolerance in the future and must not outlive its cache slot. Do not
+	// "simplify" this by passing a TTL.
 	c.nonceCache = security.NewNonceCache(security.HMACTimestampTolerance)
 
 	// Start Raft node if configured (Phase 3)
@@ -549,31 +556,35 @@ func (c *Coordinator) broadcastLeave() {
 		Reason: "graceful shutdown",
 	}
 
-	// Sign the leave message if shared secret is configured. As with the
-	// heartbeat path, an unsigned leave (nonce failure) is rejected by the
-	// peer — log the error rather than swallow it silently.
-	if c.cfg.SharedSecret != "" {
-		nonce, err := security.GenerateNonce()
-		if err != nil {
-			c.logger.Error().Err(err).Msg("Failed to generate nonce for leave signing; leave notification will be unsigned and rejected by peers")
-		} else {
-			leave.AuthTimestamp = time.Now().Unix()
-			leave.AuthNonce = nonce
-			leave.AuthHMAC = security.ComputeHMAC(c.cfg.SharedSecret, security.MsgTypeLeave, nonce, leave.NodeID, c.cfg.ClusterName, leave.AuthTimestamp)
-		}
-	}
-
-	msg := protocol.NewLeaveNotify(leave)
 	var notified atomic.Int32
 	var wg sync.WaitGroup
 
+	// Sign per destination, on a per-peer copy — same reasoning as
+	// sendHeartbeats: the receiver consumes the nonce, duplicate-address
+	// registry entries would otherwise look like replays, and the message is
+	// marshalled concurrently by every goroutine. An unsigned leave (nonce
+	// failure) is rejected by the peer — log rather than swallow.
 	peers := c.registry.GetAll()
 	for _, peer := range peers {
 		if peer.ID == c.localNode.ID || peer.Address == "" {
 			continue
 		}
+
+		peerLeave := *leave
+		if c.cfg.SharedSecret != "" {
+			nonce, err := security.GenerateNonce()
+			if err != nil {
+				c.logger.Error().Err(err).Msg("Failed to generate nonce for leave signing; leave notification will be unsigned and rejected by peers")
+			} else {
+				peerLeave.AuthTimestamp = time.Now().Unix()
+				peerLeave.AuthNonce = nonce
+				peerLeave.AuthHMAC = security.ComputeLeaveHMAC(c.cfg.SharedSecret, nonce, peerLeave.AuthTimestamp, leaveAuthFields(&peerLeave, c.cfg.ClusterName))
+			}
+		}
+		msg := protocol.NewLeaveNotify(&peerLeave)
+
 		wg.Add(1)
-		go func(addr string) {
+		go func(addr string, msg *protocol.Message) {
 			defer wg.Done()
 			conn, err := security.Dial("tcp", addr, 2*time.Second, c.tlsConfig)
 			if err != nil {
@@ -583,7 +594,7 @@ func (c *Coordinator) broadcastLeave() {
 			_ = protocol.SendMessage(conn, msg, 2*time.Second)
 			conn.Close()
 			notified.Add(1)
-		}(peer.Address)
+		}(peer.Address, msg)
 	}
 	wg.Wait()
 
@@ -789,24 +800,22 @@ func (c *Coordinator) sendHeartbeats() {
 		Timestamp: time.Now(),
 	}
 
-	// Sign the heartbeat if a shared secret is configured. Mirrors the
-	// join/leave signing path. The HMAC binds NodeID + ClusterName +
-	// timestamp, so it is the same for every peer this tick — compute once.
+	// Sign per destination, on a per-peer copy.
+	//
+	// Two reasons it cannot be one signature per tick. (1) Correctness: the
+	// receiver now consumes the nonce in a replay cache, and two registry
+	// entries can share an address — node IDs are hostname+PID, so a
+	// bare-metal restart leaves the old entry behind and it is never evicted.
+	// A shared nonce would make the second delivery look like a replay every
+	// single tick, training operators to ignore the one log line that is
+	// supposed to mean "attack". (2) Safety: hb is handed to N goroutines
+	// that each json.Marshal it, so writing the auth fields in place would be
+	// a data race.
+	//
 	// On a nonce-generation failure the heartbeat ships unsigned and peers
 	// reject it (fail-safe), so this node would trend unhealthy — log the
 	// error loudly so an operator can diagnose entropy/system failure rather
 	// than chase a silently-flapping node.
-	if c.cfg.SharedSecret != "" {
-		nonce, err := security.GenerateNonce()
-		if err != nil {
-			c.logger.Error().Err(err).Msg("Failed to generate nonce for heartbeat signing; heartbeat will be unsigned and rejected by peers")
-		} else {
-			hb.AuthTimestamp = time.Now().Unix()
-			hb.AuthNonce = nonce
-			hb.AuthHMAC = security.ComputeHMAC(c.cfg.SharedSecret, security.MsgTypeHeartbeat, nonce, hb.NodeID, c.cfg.ClusterName, hb.AuthTimestamp)
-		}
-	}
-
 	for _, node := range nodes {
 		if local != nil && node.ID == local.ID {
 			continue
@@ -814,7 +823,19 @@ func (c *Coordinator) sendHeartbeats() {
 		if node.Address == "" {
 			continue
 		}
-		go c.sendHeartbeatToNode(node.Address, hb)
+
+		peerHB := *hb
+		if c.cfg.SharedSecret != "" {
+			nonce, err := security.GenerateNonce()
+			if err != nil {
+				c.logger.Error().Err(err).Msg("Failed to generate nonce for heartbeat signing; heartbeat will be unsigned and rejected by peers")
+			} else {
+				peerHB.AuthTimestamp = time.Now().Unix()
+				peerHB.AuthNonce = nonce
+				peerHB.AuthHMAC = security.ComputeHeartbeatHMAC(c.cfg.SharedSecret, nonce, peerHB.AuthTimestamp, heartbeatAuthFields(&peerHB, c.cfg.ClusterName))
+			}
+		}
+		go c.sendHeartbeatToNode(node.Address, &peerHB)
 	}
 }
 
@@ -901,6 +922,107 @@ func (c *Coordinator) discoverPeers() {
 	}
 }
 
+// joinAuthFields projects a JoinRequest onto the fields the join MAC covers.
+//
+// Every non-auth field of the message, deliberately: see
+// security/handshake_auth.go for why "the fields the handler reads today" is
+// the wrong rule. The sender and both validators all go through here, so the
+// three sites cannot drift apart.
+func joinAuthFields(req *protocol.JoinRequest) security.JoinAuthFields {
+	return security.JoinAuthFields{
+		NodeID:      req.NodeID,
+		NodeName:    req.NodeName,
+		Role:        req.Role,
+		ClusterName: req.ClusterName,
+		RaftAddr:    req.RaftAddr,
+		APIAddr:     req.APIAddr,
+		CoordAddr:   req.CoordAddr,
+		Version:     req.Version,
+		CoreCount:   req.CoreCount,
+	}
+}
+
+// heartbeatAuthFields projects a Heartbeat onto its MAC fields. clusterName
+// comes from the receiver's own config, not the wire — see
+// security.HeartbeatAuthFields.
+func heartbeatAuthFields(hb *protocol.Heartbeat, clusterName string) security.HeartbeatAuthFields {
+	return security.HeartbeatAuthFields{
+		NodeID:            hb.NodeID,
+		ClusterName:       clusterName,
+		State:             hb.State,
+		IsLeader:          hb.IsLeader,
+		TimestampUnixNano: hb.Timestamp.UnixNano(),
+	}
+}
+
+// leaveAuthFields projects a LeaveNotify onto its MAC fields.
+func leaveAuthFields(leave *protocol.LeaveNotify, clusterName string) security.LeaveAuthFields {
+	return security.LeaveAuthFields{
+		NodeID:      leave.NodeID,
+		ClusterName: clusterName,
+		Reason:      leave.Reason,
+	}
+}
+
+// joinResponseAuthFields projects a JoinResponse onto its MAC fields,
+// converting protocol.NodeInfo to the security package's mirror type so that
+// package need not import the wire protocol.
+func joinResponseAuthFields(resp *protocol.JoinResponse) security.JoinResponseAuthFields {
+	nodes := make([]security.NodeAuthFields, 0, len(resp.Nodes))
+	for _, n := range resp.Nodes {
+		nodes = append(nodes, security.NodeAuthFields{
+			ID:        n.ID,
+			Name:      n.Name,
+			Role:      n.Role,
+			State:     n.State,
+			RaftAddr:  n.RaftAddr,
+			APIAddr:   n.APIAddr,
+			CoordAddr: n.CoordAddr,
+			CoreCount: n.CoreCount,
+		})
+	}
+	return security.JoinResponseAuthFields{
+		Success:    resp.Success,
+		LeaderID:   resp.LeaderID,
+		LeaderAddr: resp.LeaderAddr,
+		RaftLeader: resp.RaftLeader,
+		Error:      resp.Error,
+		Nodes:      nodes,
+	}
+}
+
+// leaderInfoAuthFields projects a LeaderInfo onto its MAC fields.
+func leaderInfoAuthFields(info *protocol.LeaderInfo) security.LeaderInfoAuthFields {
+	return security.LeaderInfoAuthFields{
+		LeaderID:        info.LeaderID,
+		LeaderCoordAddr: info.LeaderCoordAddr,
+		LeaderRaftAddr:  info.LeaderRaftAddr,
+	}
+}
+
+// signJoinResponse signs resp over the request's nonce, in place.
+//
+// reqNonce is whatever the request carried — possibly empty, if an
+// unauthenticated peer sent one and we are answering with a pre-auth error.
+// Signing over an attacker-chosen nonce is not an oracle; see the response
+// section of security/handshake_auth.go.
+func (c *Coordinator) signJoinResponse(resp *protocol.JoinResponse, reqNonce string) {
+	if c.cfg.SharedSecret == "" {
+		return
+	}
+	resp.AuthTimestamp = time.Now().Unix()
+	resp.AuthHMAC = security.ComputeJoinResponseHMAC(c.cfg.SharedSecret, reqNonce, resp.AuthTimestamp, joinResponseAuthFields(resp))
+}
+
+// signLeaderInfo signs info over the request's nonce, in place.
+func (c *Coordinator) signLeaderInfo(info *protocol.LeaderInfo, reqNonce string) {
+	if c.cfg.SharedSecret == "" {
+		return
+	}
+	info.AuthTimestamp = time.Now().Unix()
+	info.AuthHMAC = security.ComputeLeaderInfoHMAC(c.cfg.SharedSecret, reqNonce, info.AuthTimestamp, leaderInfoAuthFields(info))
+}
+
 // tryJoinViaSeed attempts to join the cluster via a seed node.
 func (c *Coordinator) tryJoinViaSeed(seedAddr string) error {
 	conn, err := security.Dial("tcp", seedAddr, 5*time.Second, c.tlsConfig)
@@ -922,6 +1044,18 @@ func (c *Coordinator) tryJoinViaSeed(seedAddr string) error {
 		CoreCount:   runtime.GOMAXPROCS(0), // Report current GOMAXPROCS as core count
 	}
 
+	// If RaftAdvertiseAddr is empty, use RaftBindAddr.
+	//
+	// MUST stay above the signing block: RaftAddr is bound into the join
+	// MAC, so mutating it afterwards would ship a request whose MAC covers
+	// the pre-fallback value and every leader would reject it. That is the
+	// default configuration — cluster.raft_advertise_addr is unset unless an
+	// operator sets it — so getting this order wrong breaks all joins, not
+	// an edge case.
+	if req.RaftAddr == "" {
+		req.RaftAddr = c.cfg.RaftBindAddr
+	}
+
 	// Sign join request if shared secret is configured
 	if c.cfg.SharedSecret != "" {
 		nonce, err := security.GenerateNonce()
@@ -930,12 +1064,7 @@ func (c *Coordinator) tryJoinViaSeed(seedAddr string) error {
 		}
 		req.AuthTimestamp = time.Now().Unix()
 		req.AuthNonce = nonce
-		req.AuthHMAC = security.ComputeHMAC(c.cfg.SharedSecret, security.MsgTypeJoin, nonce, req.NodeID, req.ClusterName, req.AuthTimestamp)
-	}
-
-	// If RaftAdvertiseAddr is empty, use RaftBindAddr
-	if req.RaftAddr == "" {
-		req.RaftAddr = c.cfg.RaftBindAddr
+		req.AuthHMAC = security.ComputeJoinHMAC(c.cfg.SharedSecret, nonce, req.AuthTimestamp, joinAuthFields(req))
 	}
 
 	// Send join request
@@ -950,14 +1079,36 @@ func (c *Coordinator) tryJoinViaSeed(seedAddr string) error {
 		return fmt.Errorf("failed to receive response: %w", err)
 	}
 
-	return c.handleJoinResponse(resp, seedAddr)
+	// req.AuthNonce is what the response MAC is bound to; empty when no
+	// shared secret is configured, in which case the response is accepted
+	// unsigned (same gate as the request direction).
+	return c.handleJoinResponse(resp, seedAddr, req.AuthNonce)
 }
 
 // handleJoinResponse processes a response to a join request.
-func (c *Coordinator) handleJoinResponse(msg *protocol.Message, seedAddr string) error {
+//
+// reqNonce is the nonce this node put in the request; the responder signs over
+// it, so validating here needs no nonce cache — a response captured from an
+// earlier exchange is bound to a different nonce and fails. Empty when no
+// shared secret is configured, in which case responses are accepted unsigned
+// (the same gate as the request direction).
+//
+// The MAC is checked BEFORE any field is read. Validating after branching on
+// Success would let an unauthenticated peer inject a rejection (denial) or,
+// worse, a success carrying an attacker-chosen peer list that this node then
+// writes into its registry.
+func (c *Coordinator) handleJoinResponse(msg *protocol.Message, seedAddr string, reqNonce string) error {
 	switch msg.Type {
 	case protocol.MsgJoinResponse:
 		resp := msg.Payload.(*protocol.JoinResponse)
+		if c.cfg.SharedSecret != "" {
+			if err := security.ValidateJoinResponseHMAC(
+				c.cfg.SharedSecret, reqNonce, resp.AuthTimestamp,
+				joinResponseAuthFields(resp), resp.AuthHMAC, security.HMACTimestampTolerance,
+			); err != nil {
+				return fmt.Errorf("join response failed authentication (peer on an older version, or shared secret mismatch): %w", err)
+			}
+		}
 		if !resp.Success {
 			return fmt.Errorf("join rejected: %s", resp.Error)
 		}
@@ -985,6 +1136,14 @@ func (c *Coordinator) handleJoinResponse(msg *protocol.Message, seedAddr string)
 	case protocol.MsgLeaderInfo:
 		// Redirect to leader
 		info := msg.Payload.(*protocol.LeaderInfo)
+		if c.cfg.SharedSecret != "" {
+			if err := security.ValidateLeaderInfoHMAC(
+				c.cfg.SharedSecret, reqNonce, info.AuthTimestamp,
+				leaderInfoAuthFields(info), info.AuthHMAC, security.HMACTimestampTolerance,
+			); err != nil {
+				return fmt.Errorf("leader redirect failed authentication (peer on an older version, or shared secret mismatch): %w", err)
+			}
+		}
 		c.logger.Debug().
 			Str("leader_id", info.LeaderID).
 			Str("leader_addr", info.LeaderCoordAddr).
@@ -1094,9 +1253,22 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 		Int("core_count", req.CoreCount).
 		Msg("Received join request")
 
-	// Validate cluster name
+	// Every pre-authentication rejection returns the SAME opaque string.
+	//
+	// The cluster-name check in particular used to echo the expected name
+	// back to an unauthenticated caller, and the three failure modes were
+	// individually distinguishable, which together let an unauthenticated
+	// peer map the cluster's configuration. The specific cause stays in the
+	// server-side log, where an operator can see it and an attacker cannot.
+	// Post-authentication errors below keep their detail — by then the peer
+	// has proven it holds the shared secret.
 	if req.ClusterName != c.cfg.ClusterName {
-		c.sendJoinError(conn, fmt.Sprintf("cluster name mismatch: expected %s, got %s", c.cfg.ClusterName, req.ClusterName))
+		c.logger.Warn().
+			Str("node_id", req.NodeID).
+			Str("expected_cluster", c.cfg.ClusterName).
+			Str("got_cluster", req.ClusterName).
+			Msg("Join rejected: cluster name mismatch")
+		c.sendJoinError(conn, req, joinAuthFailedMsg)
 		return
 	}
 
@@ -1104,15 +1276,22 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 	if c.cfg.SharedSecret != "" {
 		if req.AuthHMAC == "" {
 			c.logger.Warn().Str("node_id", req.NodeID).Msg("Join rejected: shared secret required but not provided")
-			c.sendJoinError(conn, "shared secret authentication required")
+			c.sendJoinError(conn, req, joinAuthFailedMsg)
 			return
 		}
-		if err := security.ValidateHMAC(
-			c.cfg.SharedSecret, security.MsgTypeJoin, req.AuthNonce, req.NodeID, req.ClusterName,
-			req.AuthTimestamp, req.AuthHMAC, security.HMACTimestampTolerance,
+		// Validates the MAC over every field of the request, then consumes
+		// the nonce. Fail-closed on a nil cache: in production Start()
+		// installs it before the listener accepts, so nil here means a
+		// misconstructed Coordinator, not a supported configuration.
+		if err := security.ValidateJoinHMACWithReplay(
+			c.nonceCache, c.cfg.SharedSecret, req.AuthNonce, req.AuthTimestamp,
+			joinAuthFields(req), req.AuthHMAC, security.HMACTimestampTolerance,
 		); err != nil {
-			c.logger.Warn().Err(err).Str("node_id", req.NodeID).Msg("Join rejected: authentication failed")
-			c.sendJoinError(conn, "authentication failed: invalid shared secret")
+			c.logger.Warn().Err(err).
+				Str("node_id", req.NodeID).
+				Bool("replay", errors.Is(err, security.ErrHandshakeReplay)).
+				Msg("Join rejected: authentication failed")
+			c.sendJoinError(conn, req, joinAuthFailedMsg)
 			return
 		}
 	}
@@ -1120,7 +1299,7 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 	// Check if we're the leader
 	if c.raftNode != nil && !c.raftNode.IsLeader() {
 		// Redirect to leader
-		c.sendLeaderRedirect(conn)
+		c.sendLeaderRedirect(conn, req)
 		return
 	}
 
@@ -1131,7 +1310,7 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 			Str("node_id", req.NodeID).
 			Int("core_count", req.CoreCount).
 			Msg("Join rejected: core limit exceeded")
-		c.sendJoinError(conn, err.Error())
+		c.sendJoinError(conn, req, err.Error())
 		return
 	}
 
@@ -1147,7 +1326,7 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 		// First add as a Raft voter
 		if err := c.raftNode.AddVoter(req.NodeID, req.RaftAddr, 10*time.Second); err != nil {
 			c.logger.Error().Err(err).Str("node_id", req.NodeID).Msg("Failed to add voter to Raft")
-			c.sendJoinError(conn, fmt.Sprintf("failed to add to Raft cluster: %v", err))
+			c.sendJoinError(conn, req, fmt.Sprintf("failed to add to Raft cluster: %v", err))
 			return
 		}
 
@@ -1170,7 +1349,7 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 	} else {
 		// No Raft, just register locally
 		if err := c.registry.Register(node); err != nil {
-			c.sendJoinError(conn, fmt.Sprintf("failed to register node: %v", err))
+			c.sendJoinError(conn, req, fmt.Sprintf("failed to register node: %v", err))
 			return
 		}
 	}
@@ -1181,22 +1360,28 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 		Msg("Node successfully joined cluster")
 
 	// Send success response with cluster info
-	c.sendJoinSuccess(conn)
+	c.sendJoinSuccess(conn, req)
 }
 
-// sendJoinError sends a join failure response.
-func (c *Coordinator) sendJoinError(conn net.Conn, errMsg string) {
-	resp := protocol.NewJoinResponse(&protocol.JoinResponse{
+// joinAuthFailedMsg is the single opaque rejection every pre-authentication
+// join failure returns. See handleJoinRequest for why they are uniform.
+const joinAuthFailedMsg = "authentication failed"
+
+// sendJoinError sends a join failure response, signed over the request's
+// nonce so a joiner can tell a real rejection from an injected one.
+func (c *Coordinator) sendJoinError(conn net.Conn, req *protocol.JoinRequest, errMsg string) {
+	payload := &protocol.JoinResponse{
 		Success: false,
 		Error:   errMsg,
-	})
-	if err := protocol.SendMessage(conn, resp, 5*time.Second); err != nil {
+	}
+	c.signJoinResponse(payload, req.AuthNonce)
+	if err := protocol.SendMessage(conn, protocol.NewJoinResponse(payload), 5*time.Second); err != nil {
 		c.logger.Debug().Err(err).Msg("Failed to send join error response")
 	}
 }
 
 // sendLeaderRedirect sends a redirect to the current leader.
-func (c *Coordinator) sendLeaderRedirect(conn net.Conn) {
+func (c *Coordinator) sendLeaderRedirect(conn net.Conn, req *protocol.JoinRequest) {
 	leaderID := c.raftNode.LeaderID()
 	leaderRaftAddr := c.raftNode.LeaderAddr()
 
@@ -1206,19 +1391,23 @@ func (c *Coordinator) sendLeaderRedirect(conn net.Conn) {
 		leaderCoordAddr = leaderNode.Address
 	}
 
-	info := protocol.NewLeaderInfo(&protocol.LeaderInfo{
+	// Signed over the request's nonce: this names the address the joiner
+	// dials next and hands its next signed join request to, so an
+	// unauthenticated redirect is a free relay for an on-path attacker.
+	payload := &protocol.LeaderInfo{
 		LeaderID:        leaderID,
 		LeaderCoordAddr: leaderCoordAddr,
 		LeaderRaftAddr:  leaderRaftAddr,
-	})
+	}
+	c.signLeaderInfo(payload, req.AuthNonce)
 
-	if err := protocol.SendMessage(conn, info, 5*time.Second); err != nil {
+	if err := protocol.SendMessage(conn, protocol.NewLeaderInfo(payload), 5*time.Second); err != nil {
 		c.logger.Debug().Err(err).Msg("Failed to send leader redirect")
 	}
 }
 
 // sendJoinSuccess sends a successful join response with cluster info.
-func (c *Coordinator) sendJoinSuccess(conn net.Conn) {
+func (c *Coordinator) sendJoinSuccess(conn net.Conn, req *protocol.JoinRequest) {
 	// Gather all nodes in the cluster
 	nodes := c.registry.GetAll()
 	nodeInfos := make([]protocol.NodeInfo, 0, len(nodes))
@@ -1241,15 +1430,16 @@ func (c *Coordinator) sendJoinSuccess(conn net.Conn) {
 		leaderRaftAddr = c.raftNode.LeaderAddr()
 	}
 
-	resp := protocol.NewJoinResponse(&protocol.JoinResponse{
+	payload := &protocol.JoinResponse{
 		Success:    true,
 		LeaderID:   leaderID,
 		LeaderAddr: c.cfg.AdvertiseAddr,
 		RaftLeader: leaderRaftAddr,
 		Nodes:      nodeInfos,
-	})
+	}
+	c.signJoinResponse(payload, req.AuthNonce)
 
-	if err := protocol.SendMessage(conn, resp, 5*time.Second); err != nil {
+	if err := protocol.SendMessage(conn, protocol.NewJoinResponse(payload), 5*time.Second); err != nil {
 		c.logger.Debug().Err(err).Msg("Failed to send join success response")
 	}
 }
@@ -1259,19 +1449,22 @@ func (c *Coordinator) handleHeartbeat(conn net.Conn, hb *protocol.Heartbeat) {
 	// Validate shared secret if configured. A heartbeat mutates the sender's
 	// recorded liveness and self-reported state, so it is authenticated like
 	// join/leave — otherwise a network attacker could spoof any node's health
-	// (GHSA-p378-jp5r-gpgw). Mirrors handleLeaveNotify; freshness is bounded by
-	// the HMAC timestamp tolerance (consistent with join/leave, which likewise
-	// do not nonce-replay-check).
+	// (GHSA-p378-jp5r-gpgw). Mirrors handleLeaveNotify: the MAC covers every
+	// field of the message and the nonce is consumed on receipt, so a captured
+	// heartbeat cannot be replayed inside the freshness window.
 	if c.cfg.SharedSecret != "" {
 		if hb.AuthHMAC == "" {
 			c.logger.Warn().Str("node_id", hb.NodeID).Msg("Heartbeat rejected: shared secret required but not provided")
 			return
 		}
-		if err := security.ValidateHMAC(
-			c.cfg.SharedSecret, security.MsgTypeHeartbeat, hb.AuthNonce, hb.NodeID, c.cfg.ClusterName,
-			hb.AuthTimestamp, hb.AuthHMAC, security.HMACTimestampTolerance,
+		if err := security.ValidateHeartbeatHMACWithReplay(
+			c.nonceCache, c.cfg.SharedSecret, hb.AuthNonce, hb.AuthTimestamp,
+			heartbeatAuthFields(hb, c.cfg.ClusterName), hb.AuthHMAC, security.HMACTimestampTolerance,
 		); err != nil {
-			c.logger.Warn().Err(err).Str("node_id", hb.NodeID).Msg("Heartbeat rejected: authentication failed")
+			c.logger.Warn().Err(err).
+				Str("node_id", hb.NodeID).
+				Bool("replay", errors.Is(err, security.ErrHandshakeReplay)).
+				Msg("Heartbeat rejected: authentication failed")
 			return
 		}
 	}
@@ -1297,11 +1490,14 @@ func (c *Coordinator) handleLeaveNotify(leave *protocol.LeaveNotify) {
 			c.logger.Warn().Str("node_id", leave.NodeID).Msg("Leave rejected: shared secret required but not provided")
 			return
 		}
-		if err := security.ValidateHMAC(
-			c.cfg.SharedSecret, security.MsgTypeLeave, leave.AuthNonce, leave.NodeID, c.cfg.ClusterName,
-			leave.AuthTimestamp, leave.AuthHMAC, security.HMACTimestampTolerance,
+		if err := security.ValidateLeaveHMACWithReplay(
+			c.nonceCache, c.cfg.SharedSecret, leave.AuthNonce, leave.AuthTimestamp,
+			leaveAuthFields(leave, c.cfg.ClusterName), leave.AuthHMAC, security.HMACTimestampTolerance,
 		); err != nil {
-			c.logger.Warn().Err(err).Str("node_id", leave.NodeID).Msg("Leave rejected: authentication failed")
+			c.logger.Warn().Err(err).
+				Str("node_id", leave.NodeID).
+				Bool("replay", errors.Is(err, security.ErrHandshakeReplay)).
+				Msg("Leave rejected: authentication failed")
 			return
 		}
 	}
@@ -1398,7 +1594,13 @@ func (c *Coordinator) handleReplicateSync(conn net.Conn, syncReq *protocol.Repli
 	}
 	// Replay check AFTER HMAC validation: don't burn a nonce-cache slot
 	// on an attacker who can't even produce a valid MAC.
-	if c.nonceCache != nil && !c.nonceCache.Track(syncReq.ReaderID, syncReq.Nonce) {
+	// Fail closed on a nil cache: Track returns false when the receiver is
+	// nil, so an absent replay guard rejects rather than silently skipping
+	// the check. (The handshake validators enforce the same contract via
+	// validateWithReplay; keeping these two consistent matters because a
+	// future change that registers either handler earlier than Start() would
+	// otherwise reopen a replay hole with every test still passing.)
+	if !c.nonceCache.Track(syncReq.ReaderID, syncReq.Nonce) {
 		c.logger.Warn().
 			Str("peer", remoteAddr).
 			Str("reader_id", syncReq.ReaderID).

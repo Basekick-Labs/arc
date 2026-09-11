@@ -29,6 +29,10 @@ func newHeartbeatTestCoordinator(t *testing.T, secret string) (*Coordinator, *No
 		registry:  reg,
 		localNode: local,
 		logger:    zerolog.Nop(),
+		// Required: the handshake validators fail closed without a replay
+		// guard. Production installs this in Start() before the listener
+		// accepts, so nil means a misconstructed Coordinator.
+		nonceCache: security.NewNonceCache(security.HMACTimestampTolerance),
 	}
 	return c, peer
 }
@@ -61,7 +65,7 @@ func signedHeartbeat(secret, nodeID, cluster string) *protocol.Heartbeat {
 		nonce, _ := security.GenerateNonce()
 		hb.AuthTimestamp = time.Now().Unix()
 		hb.AuthNonce = nonce
-		hb.AuthHMAC = security.ComputeHMAC(secret, security.MsgTypeHeartbeat, nonce, nodeID, cluster, hb.AuthTimestamp)
+		hb.AuthHMAC = security.ComputeHeartbeatHMAC(secret, nonce, hb.AuthTimestamp, heartbeatAuthFields(hb, cluster))
 	}
 	return hb
 }
@@ -117,5 +121,89 @@ func TestHandleHeartbeat_NoSecretAcceptsUnsigned(t *testing.T) {
 
 	if got := peer.GetState(); got != StateHealthy {
 		t.Errorf("no-secret heartbeat: peer state = %v; want %v", got, StateHealthy)
+	}
+}
+
+// TestHandleHeartbeat_RejectsMutatedState is the regression test for the
+// heartbeat half of GHSA-p2rx, found while verifying the reported join issue.
+//
+// State was outside the MAC while the handler wrote it straight into the
+// registry, so an on-path attacker could flip any node to unhealthy — which
+// withdraws it from query routing and, with failover enabled, can trigger a
+// writer promotion — using a heartbeat whose tag still verified.
+func TestHandleHeartbeat_RejectsMutatedState(t *testing.T) {
+	c, peer := newHeartbeatTestCoordinator(t, "s3cret")
+	hb := signedHeartbeat("s3cret", peer.ID, "test-cluster")
+
+	// On-path mutation: flip the self-reported state, keep the valid tag.
+	hb.State = string(StateUnhealthy)
+
+	deliverHeartbeat(c, hb)
+
+	got, ok := c.registry.Get(peer.ID)
+	if !ok {
+		t.Fatal("peer vanished from registry")
+	}
+	if got.State != StateUnhealthy {
+		t.Fatalf("peer state = %v; the test peer starts unhealthy so this should be unchanged", got.State)
+	}
+	// The mutated heartbeat must have been rejected outright: had it been
+	// accepted, the handler would have recorded a heartbeat for the peer.
+	if !c.registry.GetLastHeartbeat(peer.ID).IsZero() {
+		t.Error("a heartbeat with a mutated State was accepted — State is outside the MAC")
+	}
+}
+
+// TestHandleHeartbeat_RejectsMutatedIsLeader: IsLeader is not consumed by the
+// current handler, but it is bound anyway (every field of the message is), so
+// a mutation must still be rejected. This is the test that will fail if
+// somebody later starts trusting the field without re-checking coverage.
+func TestHandleHeartbeat_RejectsMutatedIsLeader(t *testing.T) {
+	c, peer := newHeartbeatTestCoordinator(t, "s3cret")
+	hb := signedHeartbeat("s3cret", peer.ID, "test-cluster")
+	hb.IsLeader = !hb.IsLeader
+
+	deliverHeartbeat(c, hb)
+
+	if !c.registry.GetLastHeartbeat(peer.ID).IsZero() {
+		t.Error("a heartbeat with a mutated IsLeader was accepted — the field is outside the MAC")
+	}
+}
+
+// TestHandleHeartbeat_RejectsReplay: a captured heartbeat must not be
+// replayable inside the freshness window.
+func TestHandleHeartbeat_RejectsReplay(t *testing.T) {
+	c, peer := newHeartbeatTestCoordinator(t, "s3cret")
+	hb := signedHeartbeat("s3cret", peer.ID, "test-cluster")
+
+	deliverHeartbeat(c, hb)
+	first := c.registry.GetLastHeartbeat(peer.ID)
+	if first.IsZero() {
+		t.Fatal("legitimate heartbeat was rejected")
+	}
+
+	// Re-deliver the identical message, as a network attacker would.
+	peer.UpdateState(StateUnhealthy)
+	deliverHeartbeat(c, hb)
+
+	got, _ := c.registry.Get(peer.ID)
+	if got.State == StateHealthy {
+		t.Error("a replayed heartbeat was accepted — the nonce was not consumed")
+	}
+}
+
+// TestHandleHeartbeat_FailsClosedWithoutReplayGuard: a Coordinator with a
+// shared secret but no nonce cache must reject rather than silently skip
+// replay protection. Production always installs the cache before the listener
+// accepts, so this only fires on a misconstructed Coordinator — but failing
+// open there is how the check would get quietly lost.
+func TestHandleHeartbeat_FailsClosedWithoutReplayGuard(t *testing.T) {
+	c, peer := newHeartbeatTestCoordinator(t, "s3cret")
+	c.nonceCache = nil
+
+	deliverHeartbeat(c, signedHeartbeat("s3cret", peer.ID, "test-cluster"))
+
+	if !c.registry.GetLastHeartbeat(peer.ID).IsZero() {
+		t.Error("a heartbeat was accepted with no replay guard installed")
 	}
 }

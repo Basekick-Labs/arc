@@ -82,6 +82,72 @@ and errgroup primitives used by tiering and Iceberg. The auth, cluster-security,
 tiering, and Iceberg suites were verified against the new versions, the latter
 two under `-race`.
 
+### Cluster hardening: fully authenticated coordinator handshake (Enterprise)
+
+Every field of every coordinator-handshake message is now covered by its
+HMAC, in both directions. Previously the join, heartbeat and leave messages
+authenticated only `{message type, nonce, node ID, cluster name, timestamp}`
+while the handlers went on to consume other fields from the same message — a
+joining node's role and its advertised Raft, API and coordinator addresses; a
+heartbeat's self-reported state. On a cluster with `cluster.tls_enabled`
+unset (the default), an attacker positioned on the inter-node network could
+rewrite any of those and the signature still verified. The responses —
+join result, leader redirect, and the forward-apply acknowledgement — carried
+no authentication at all, so the same position allowed feeding a joining node
+a fabricated cluster membership list, redirecting it to an attacker-chosen
+coordinator, or telling a follower its replicated write had failed (or
+succeeded) when it had not.
+
+Three further changes close the same class of gap:
+
+- **Replay protection** on join, heartbeat and leave. These messages were
+  previously bounded only by the five-minute freshness window, inside which a
+  captured message could be resent verbatim. Nonces are now consumed on
+  receipt. The nonce cache's lifetime was also corrected — it must outlive the
+  freshness window by more than the window itself, because a message may be
+  stamped up to one tolerance in the future — which likewise tightens the
+  existing cache-invalidate and edge-sync replay guards.
+- **Uniform pre-authentication join errors.** A rejection that happens before
+  the peer proves it holds the shared secret now returns one opaque string;
+  previously the cluster-name mismatch echoed the expected cluster name back
+  to an unauthenticated caller and the three failure modes were individually
+  distinguishable. The specific cause is still logged server-side.
+- **Canonical encoding.** The signed payload is length-prefixed rather than
+  NUL-delimited. The coordinator protocol is raw TCP carrying JSON, which
+  passes NUL through, so a delimiter-joined encoding let an attacker who
+  controlled a field's contents re-partition the signed input.
+
+Clustering is an Enterprise feature and is off by default; single-node and
+OSS deployments are unaffected.
+
+> **Upgrade note (clustered Enterprise deployments):** the handshake wire
+> format has changed, so a node on this version cannot authenticate with a
+> node on an older one. Upgrade the cluster as a coordinated restart: **stop
+> all cluster nodes, upgrade the binary on every node, then restart all
+> nodes.**
+>
+> A rolling restart does not degrade gracefully. Across a mixed-version
+> window: cross-version nodes fail each other's heartbeats and are marked
+> unhealthy within roughly three health-check intervals (~15s by default),
+> withdrawing them from query routing; with `cluster.failover_enabled` set, an
+> automatic writer or compactor failover is committed through Raft about 30
+> seconds in, while the original primary is still alive, and that promotion
+> persists after the upgrade completes. A follower that is restarted
+> *gracefully* under a not-yet-upgraded leader is removed from the Raft
+> configuration by its own leave notification and cannot rejoin until the
+> leader is upgraded. Writes forwarded from an upgraded follower to an
+> older leader are applied by that leader but reported to the follower as
+> failed, because the acknowledgement is unsigned — file registrations are
+> retried by anti-entropy, compaction retries on its next tick, and an
+> upgraded node may log `Failed to create initial admin token` at startup
+> (non-fatal).
+>
+> The handshake authenticates inter-node messages; for confidentiality on the
+> interconnect, enable `cluster.tls_enabled`.
+
+Full technical detail will accompany the corresponding security advisory once
+it is published. Responsibly reported by **[@rexpository](https://github.com/rexpository)**.
+
 ### Expired API tokens are now rejected on cache hits
 
 Arc caches successful token verifications in memory for `auth.cache_ttl`
@@ -101,6 +167,18 @@ the cache immediately and was never affected; only passive expiry was.
 
 Full technical detail will accompany the corresponding security advisory once it
 is published. Responsibly reported by **[@rexpository](https://github.com/rexpository)**.
+
+## Upgrade notes
+
+1. **Clustered Enterprise deployments require a coordinated restart.** The
+   coordinator handshake wire format changed (see *Cluster hardening* above):
+   stop all cluster nodes, upgrade the binary on every node, then restart all
+   nodes. A rolling restart causes cross-version nodes to mark each other
+   unhealthy, can trigger an automatic writer failover, and can remove a
+   gracefully-restarted follower from the Raft configuration until its leader
+   is upgraded. Single-node, non-clustered and OSS deployments need no action.
+2. **No configuration change is required.** Existing `arc.toml` files and
+   license keys work as-is; no new keys were added.
 
 ## Bug fixes
 
