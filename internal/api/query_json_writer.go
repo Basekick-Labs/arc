@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"math"
 	"strconv"
 	"strings"
@@ -226,6 +227,25 @@ scanLoop:
 		} else {
 			w.WriteString("null")
 		}
+	}
+
+	// A stream that failed part way still emits a valid JSON document, but it
+	// must not look complete (#723). success was written before the first row
+	// and, once the buffer has flushed, cannot be revised; even while it is
+	// still buffered, revising it would make the response shape depend on
+	// whether the result happened to exceed the buffer, so the marker is
+	// emitted uniformly instead.
+	//
+	// The reason is a separate field rather than "error": that key means
+	// "the request failed and there is no data" everywhere else in the API,
+	// and clients key off it. Here there IS data, just not all of it.
+	//
+	// writeJSONString, not WriteString: the sanitizer masks the contents of
+	// quoted spans but leaves the quote characters in place, so concatenating
+	// it raw would emit a document that does not parse.
+	if streamErr != nil {
+		w.WriteString(`,"truncated":true,"truncation_reason":`)
+		writeJSONString(w, scratch, sqlutil.SanitizeErrText(streamErr.Error()))
 	}
 
 	w.WriteByte('}')
