@@ -1814,14 +1814,25 @@ localProcessing:
 		// is fired inside the callback after streaming completes.
 		streamCtx := execCtx
 		c.Set("Content-Type", "application/json")
-		c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
-			rowCount, streamErr := streamTypedJSON(streamCtx, w, columns, colTypes, iter, governanceMaxRows, profile, start, timestamp)
-			w.Flush()
-
-			iter.Close()
-			if cancelTimeout != nil {
-				cancelTimeout()
+		c.Context().SetBodyStreamWriter(h.safeStream("query_json_parallel", func() {
+			// A panic leaves the registry entry in "running" forever: the
+			// disposition calls below are skipped by the unwind and nothing
+			// reaps active entries (#717). Fail is a no-op if the normal
+			// path already disposed of it.
+			if h.queryRegistry != nil && queryID != "" {
+				h.queryRegistry.Fail(queryID, "stream writer panicked")
 			}
+		}, func(w *bufio.Writer) {
+			// One defer, in the original order: separate defers would run
+			// LIFO and cancel the timeout before the iterator is closed.
+			defer func() {
+				iter.Close()
+				if cancelTimeout != nil {
+					cancelTimeout()
+				}
+			}()
+			rowCount, streamErr := streamTypedJSONFunc(streamCtx, w, columns, colTypes, iter, governanceMaxRows, profile, start, timestamp)
+			w.Flush()
 
 			// Record metrics after streaming completes. If the stream
 			// terminated mid-flight (Scan / Err / ctx cancel), record as
@@ -1861,7 +1872,7 @@ localProcessing:
 				Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 				Msg("Query completed")
 			h.logSlowQuery(convertedSQL, start, rowCount, tokenName)
-		})
+		}))
 		return nil
 	} else {
 		// Standard single-query execution
@@ -2061,17 +2072,24 @@ localProcessing:
 		// can fire inside the streaming callback. See C5.
 		streamCtx := ctx
 		c.Set("Content-Type", "application/json")
-		c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
-			rowCount, streamErr := streamTypedJSON(streamCtx, w, columns, colTypes, rows, governanceMaxRows, profile, start, timestamp)
+		c.Context().SetBodyStreamWriter(h.safeStream("query_json", func() {
+			if h.queryRegistry != nil && queryID != "" {
+				h.queryRegistry.Fail(queryID, "stream writer panicked")
+			}
+		}, func(w *bufio.Writer) {
+			// One defer preserving the original order: rows first, then the
+			// pinned profiling connection, then the timeout context.
+			defer func() {
+				rows.Close()
+				if profileConn != nil {
+					profileConn.Close()
+				}
+				if cancel != nil {
+					cancel()
+				}
+			}()
+			rowCount, streamErr := streamTypedJSONFunc(streamCtx, w, columns, colTypes, rows, governanceMaxRows, profile, start, timestamp)
 			w.Flush()
-
-			rows.Close()
-			if profileConn != nil {
-				profileConn.Close()
-			}
-			if cancel != nil {
-				cancel()
-			}
 
 			// If the stream terminated mid-flight (Scan / Err / ctx
 			// cancel) record as failure even though the JSON envelope
@@ -2112,7 +2130,7 @@ localProcessing:
 				Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 				Msg("Query completed")
 			h.logSlowQuery(convertedSQL, start, rowCount, tokenName)
-		})
+		}))
 		return nil
 	}
 }
@@ -4622,14 +4640,17 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	// fires inside the streaming callback (#308).
 	streamCtx := ctx
 	c.Set("Content-Type", "application/json")
-	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
-		rowCount, streamErr := streamTypedJSON(streamCtx, w, columns, colTypes, rows, governanceMaxRows, nil, start, timestamp)
+	c.Context().SetBodyStreamWriter(h.safeStream("query_measurement", nil, func(w *bufio.Writer) {
+		// The measurement endpoint never registers with the query registry,
+		// so there is nothing to dispose of on the panic path.
+		defer func() {
+			rows.Close()
+			if cancel != nil {
+				cancel()
+			}
+		}()
+		rowCount, streamErr := streamTypedJSONFunc(streamCtx, w, columns, colTypes, rows, governanceMaxRows, nil, start, timestamp)
 		w.Flush()
-
-		rows.Close()
-		if cancel != nil {
-			cancel()
-		}
 
 		if streamErr != nil {
 			m.IncQueryErrors()
@@ -4660,6 +4681,6 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 			Msg("Measurement query completed")
 		h.logSlowQuery(convertedSQL, start, rowCount, tokenName)
-	})
+	}))
 	return nil
 }

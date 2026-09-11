@@ -214,6 +214,26 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
 
 ## Bug fixes
 
+### A panic while streaming a response no longer crashes the server ([#717](https://github.com/Basekick-Labs/arc/issues/717))
+
+Query responses are streamed from a callback that fasthttp runs on its own
+goroutine, where an unrecovered panic takes down the whole process rather than
+failing the one request. Only the Arrow IPC writer recovered; the JSON, msgpack,
+parallel-partition and measurement writers did not, so a panic on any of those
+paths (the DuckDB cgo boundary, a decimal cast, an encoder) would stop the
+server. Every streaming writer now recovers, logs the panic, and counts it as a
+query error, and the client sees a truncated response instead of a dropped
+service.
+
+Recovering also exposed what the unwind had been skipping. Those writers
+released their result set, pooled connection and query timeout in ordinary
+statements after the streaming call, so the fix moves each into a deferred block
+that keeps the original release order. Six of the writers also disposed of their
+query-registry entry only on the normal path, which meant a panicking query would
+have sat in `GET /api/v1/queries/active` as `running` forever, holding its SQL
+text and inflating the active-query gauge, with no reaper to clear it; those
+entries are now failed on the panic path.
+
 ### A panic while streaming Arrow IPC no longer leaks a database connection ([#716](https://github.com/Basekick-Labs/arc/issues/716))
 
 `POST /api/v1/query/arrow` streams its response from a callback that fasthttp
