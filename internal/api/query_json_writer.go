@@ -99,6 +99,11 @@ func mapColumnType(dbType string) colType {
 //     stream stops. Operator must treat this as a partial-result failure.
 //   - scanner.Err() after the row loop exits cleanly (e.g. underlying
 //     *sql.Rows ran into a deferred error). Same partial-result class.
+//
+// streamTypedJSONFunc indirects streamTypedJSON so tests can drive the
+// stream writers' panic path (#717). Production always uses the real one.
+var streamTypedJSONFunc = streamTypedJSON
+
 func streamTypedJSON(
 	ctx context.Context,
 	w *bufio.Writer,

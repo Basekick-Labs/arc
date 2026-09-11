@@ -505,28 +505,13 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	}
 
 	streamCtx := ctx
-	fctx.SetBodyStreamWriter(func(w *bufio.Writer) {
-		// This closure runs on a bare fasthttp goroutine: an unrecovered
-		// panic here kills the whole process (fiber's recover middleware
-		// only wraps the handler, which has already returned). Convert
-		// panics to a logged error; the connection dies mid-stream, which
-		// the client sees as a truncated Arrow stream.
-		defer func() {
-			if r := recover(); r != nil {
-				m.IncQueryErrors()
-				// Log the root cause BEFORE cleaning up, so this value is
-				// on record even if cleanup then has trouble of its own.
-				h.logger.Error().Interface("panic", r).
-					Msg("Arrow IPC stream writer panicked; stream truncated")
-				// The unwind skipped the straight-line release below, which
-				// stranded the reader, leaked a pooled connection for the
-				// process lifetime, and left the timeout timer running
-				// (#716). Cleanup stays out of a plain defer so the success
-				// path keeps releasing before the trailer is set, rather
-				// than after it.
-				releaseArrowStreamResources(reader, conn, cancel, h.logger)
-			}
-		}()
+	// Cleanup runs from safeStream's panic path rather than an ordinary
+	// defer inside the writer: on the success path the release must stay
+	// ahead of the trailer set below, because the stream-writer goroutine
+	// and the connection goroutine both touch the response header (#716).
+	fctx.SetBodyStreamWriter(h.safeStream("query_arrow_ipc", func() {
+		releaseArrowStreamResources(reader, conn, cancel, h.logger)
+	}, func(w *bufio.Writer) {
 		totalRows, streamErr := streamArrowIPCFunc(
 			streamCtx, w, reader, schema, castInfo, dictEnabled, ipcCompression, governanceMaxRows, h.logger,
 		)
@@ -565,7 +550,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			Int64("row_count", totalRows).
 			Int64("execution_time_ms", execMs).
 			Msg("Arrow streaming query completed")
-	})
+	}))
 
 	return nil
 }

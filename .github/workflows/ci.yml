@@ -44,3 +44,21 @@ jobs:
 
       - name: Test (race)
         run: go test -tags=duckdb_arrow -race ./...
+
+      # fasthttp runs body-stream writers on a bare goroutine with no recovery,
+      # so a panic in one crashes the process rather than failing the request
+      # (#717). Every writer must go through QueryHandler.safeStream. arcx_hook.go
+      # is excluded because it builds only under the arcx_engine tag, which no
+      # CI or release build uses, so it cannot be compile-checked here; it is
+      # tracked separately.
+      - name: Body-stream writers are panic-safe
+        run: |
+          unwrapped=$(grep -rn "SetBodyStreamWriter(" internal/api/*.go \
+            | grep -v "_test.go" \
+            | grep -v "internal/api/arcx_hook.go" \
+            | grep -v "safeStream(" || true)
+          if [ -n "$unwrapped" ]; then
+            echo "These body-stream writers bypass safeStream, so a panic in them would crash the process:"
+            echo "$unwrapped"
+            exit 1
+          fi

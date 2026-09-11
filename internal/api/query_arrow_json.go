@@ -146,7 +146,22 @@ func executeArrowJSONQuery(
 	if respEncoding != "" {
 		c.Set(fiber.HeaderContentEncoding, respEncoding)
 	}
-	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+	c.Context().SetBodyStreamWriter(h.safeStream("query_arrow_json", func() {
+		// A panic skips the onComplete/onFail/onTimeout dispositions below,
+		// which would leave the query registered as running forever (#717).
+		if onFail != nil {
+			onFail("stream writer panicked")
+		}
+	}, func(w *bufio.Writer) {
+		// One defer in the original order; separate defers would run LIFO
+		// and cancel the timeout before the reader and connection are freed.
+		defer func() {
+			reader.Release()
+			conn.Close()
+			if cancel != nil {
+				cancel()
+			}
+		}()
 		// With compression the body is produced into a pooled encoder that
 		// feeds w; a fresh bufio in front batches the per-value writes
 		// before compression. Without it, sink == w and this is the
@@ -166,12 +181,6 @@ func executeArrowJSONQuery(
 			}
 		}
 		w.Flush()
-
-		reader.Release()
-		conn.Close()
-		if cancel != nil {
-			cancel()
-		}
 
 		if streamErr != nil {
 			m.IncQueryErrors()
@@ -213,7 +222,7 @@ func executeArrowJSONQuery(
 			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 			Msg("Arrow JSON query completed")
 		h.logSlowQuery(convertedSQL, start, rc, tokenName)
-	})
+	}))
 
 	// Return 0 — actual row count is only known after async streaming completes.
 	// Metrics are recorded in the callback above.

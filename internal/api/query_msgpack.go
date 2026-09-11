@@ -216,11 +216,22 @@ func executeArrowMsgPackQuery(
 	if respEncoding != "" {
 		c.Set(fiber.HeaderContentEncoding, respEncoding)
 	}
-	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
-		// Release retained batches when the stream finishes (or fails).
+	c.Context().SetBodyStreamWriter(h.safeStream("query_msgpack", func() {
+		// A panic skips the dispositions below, leaving the query registered
+		// as running forever (#717).
+		if onFail != nil {
+			onFail("stream writer panicked")
+		}
+	}, func(w *bufio.Writer) {
+		// Release retained batches and the timeout context when the stream
+		// finishes, fails, or panics. cancel was previously straight-line
+		// below and leaked on the panic path.
 		defer func() {
 			for _, b := range batches {
 				b.Release()
+			}
+			if cancel != nil {
+				cancel()
 			}
 		}()
 
@@ -239,10 +250,6 @@ func executeArrowMsgPackQuery(
 			streamErr = err
 		}
 		w.Flush()
-
-		if cancel != nil {
-			cancel()
-		}
 
 		if streamErr != nil {
 			m.IncQueryErrors()
@@ -276,7 +283,7 @@ func executeArrowMsgPackQuery(
 			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 			Msg("Arrow MsgPack query completed")
 		h.logSlowQuery(convertedSQL, start, rc, tokenName)
-	})
+	}))
 
 	return 0, true
 }
