@@ -146,6 +146,16 @@ type Metrics struct {
 	// Alert on this.
 	clusterManifestRejectedPathsTotal atomic.Int64
 
+	// storageInvalidPathQuarantinedTotal counts entries a cleanup,
+	// reconciliation or replication loop refused to keep retrying because a
+	// storage call returned storage.ErrInvalidPath, which is permanent (#747).
+	// Same operator semantics as clusterManifestRejectedPathsTotal above: the
+	// value should sit at zero, and any growth means a stored key (a compaction
+	// manifest, a Raft manifest entry, an edge-sync ledger row) names something
+	// no backend can address. Those entries are dropped from their work set, so
+	// this counter is the only place the condition is aggregated.
+	storageInvalidPathQuarantinedTotal atomic.Int64
+
 	// Cluster auth metrics (Enterprise only — mutated on every FSM apply
 	// of a token command). clusterAuthApplyTotal increments per applied
 	// command type so operators can see "create vs update vs revoke"
@@ -400,6 +410,12 @@ func (m *Metrics) IncReplicationSequenceGaps(n int64) { m.replicationSequenceGap
 // See GHSA-f85q-mvg8-qf37 for the security context.
 func (m *Metrics) IncClusterManifestRejectedPaths() { m.clusterManifestRejectedPathsTotal.Add(1) }
 
+// IncStorageInvalidPathQuarantined records one entry dropped from a cleanup,
+// reconciliation or replication work set because a storage call returned
+// storage.ErrInvalidPath (#747). That error is permanent, so the alternative
+// to counting it here is a loop that retries the same key forever.
+func (m *Metrics) IncStorageInvalidPathQuarantined() { m.storageInvalidPathQuarantinedTotal.Add(1) }
+
 // Cluster Auth metrics — incremented from the FSM apply path on every
 // Token command. apply_* counts successful applies per type;
 // IncClusterAuthRejected counts applier-side validation refusals.
@@ -585,7 +601,8 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"replication_sequence_gaps_total":   m.replicationSequenceGapsTotal.Load(),
 
 		// Cluster FSM security (Enterprise)
-		"cluster_manifest_rejected_paths_total": m.clusterManifestRejectedPathsTotal.Load(),
+		"cluster_manifest_rejected_paths_total":  m.clusterManifestRejectedPathsTotal.Load(),
+		"storage_invalid_path_quarantined_total": m.storageInvalidPathQuarantinedTotal.Load(),
 
 		// Cluster Auth (Enterprise, Phase A)
 		"cluster_auth_apply_create_total": m.clusterAuthApplyCreateTotal.Load(),
@@ -941,6 +958,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_cluster_manifest_rejected_paths_total Total manifest path proposals refused by the cluster FSM. Non-zero growth indicates a peer/snapshot/log entry proposed a path validation refused (URL scheme, absolute, parent-traversal, NUL, oversize).\n"...)
 	b = append(b, "# TYPE arc_cluster_manifest_rejected_paths_total counter\n"...)
 	b = appendMetric(b, "arc_cluster_manifest_rejected_paths_total", float64(m.clusterManifestRejectedPathsTotal.Load()))
+
+	b = append(b, "# HELP arc_storage_invalid_path_quarantined_total Total entries dropped from a cleanup, reconciliation or replication work set because a storage key was permanently unusable. Non-zero growth means a stored key (compaction manifest, cluster manifest entry, edge-sync ledger row) names something no storage backend can address; the entry is no longer retried and needs operator action.\n"...)
+	b = append(b, "# TYPE arc_storage_invalid_path_quarantined_total counter\n"...)
+	b = appendMetric(b, "arc_storage_invalid_path_quarantined_total", float64(m.storageInvalidPathQuarantinedTotal.Load()))
 
 	// Cluster Auth metrics (Enterprise, Phase A — Cluster Auth Convergence).
 	// apply_* counters increment per applied token command, per node — so

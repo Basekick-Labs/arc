@@ -744,6 +744,20 @@ const MaxKeyLen = 1024
 // syscall.
 const MaxKeySegmentLen = 255
 
+// MaxUsableKeyLen and MaxUsableKeySegmentLen are what ValidateKey actually
+// enforces. They are the raw limits minus PartSuffix, because LocalBackend
+// appends it to build the staging file a write lands in, so a key at the raw
+// limit passes validation and then fails the write with ENAMETOOLONG (#744).
+//
+// Exported because callers that BUILD a key have to bound it by the same
+// number. Computing MaxKeySegmentLen themselves is the mistake: it leaves a
+// five-byte window in which the caller believes the name fits and every write
+// of it is refused. GenerateManifestPath had exactly that window.
+const (
+	MaxUsableKeyLen        = MaxKeyLen - len(PartSuffix)
+	MaxUsableKeySegmentLen = MaxKeySegmentLen - len(PartSuffix)
+)
+
 // ValidateKey reports whether key names exactly one object.
 //
 // This is the contract every Backend implementation enforces, and it exists so
@@ -830,8 +844,8 @@ func validateKeyBody(p string) error {
 	// the staging file. A key at exactly the limit passes the contract and
 	// then fails the write with ENAMETOOLONG, which is the same
 	// blessed-but-unstorable shape the manifest half of #744 fixes.
-	if len(p) > MaxKeyLen-len(PartSuffix) {
-		return fmt.Errorf("%w: key is %d bytes, over the %d-byte limit", ErrInvalidPath, len(p), MaxKeyLen-len(PartSuffix))
+	if len(p) > MaxUsableKeyLen {
+		return fmt.Errorf("%w: key is %d bytes, over the %d-byte limit", ErrInvalidPath, len(p), MaxUsableKeyLen)
 	}
 	if p[0] == '/' {
 		return fmt.Errorf("%w: %q must be relative to the backend root", ErrInvalidPath, p)
@@ -857,8 +871,8 @@ func validateKeyBody(p string) error {
 		case ".", "..":
 			return fmt.Errorf("%w: %q contains a %q segment", ErrInvalidPath, p, seg)
 		}
-		if len(seg) > MaxKeySegmentLen-len(PartSuffix) {
-			return fmt.Errorf("%w: %q has a %d-byte segment, over the %d-byte limit", ErrInvalidPath, p, len(seg), MaxKeySegmentLen-len(PartSuffix))
+		if len(seg) > MaxUsableKeySegmentLen {
+			return fmt.Errorf("%w: %q has a %d-byte segment, over the %d-byte limit", ErrInvalidPath, p, len(seg), MaxUsableKeySegmentLen)
 		}
 		start = i + 1
 	}

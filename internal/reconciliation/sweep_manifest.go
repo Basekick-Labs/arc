@@ -3,11 +3,13 @@ package reconciliation
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"sync"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
+	"github.com/basekick-labs/arc/internal/storage"
 )
 
 // sweepOrphanManifest issues chunked Raft deletes for manifest entries
@@ -109,14 +111,44 @@ func (r *Reconciler) sweepOrphanManifest(
 		// summary Warn at the end of the batch.
 		recheckResults := r.parallelExists(ctx, recheckPaths)
 		existsErrCount := 0
+		invalidPathCount := 0
 		var existsLastErr error
+		var invalidLastErr error
 		for idx, res := range recheckResults {
 			p := recheckPaths[idx]
 			if res.err != nil {
+				if errors.Is(res.err, storage.ErrInvalidPath) {
+					// Permanent (#747). The key names nothing any backend can
+					// address, so no later run can resolve this entry and the
+					// "next run retries" bucket would be a lie about it.
+					//
+					// Reported, not deleted. It is tempting to read "no backend
+					// can address it" as "the file provably does not exist" and
+					// issue the Raft delete, but that does not follow: on the
+					// object stores an object CAN sit under the literal key, and
+					// it is #743's own listing filter that hides it from the
+					// walk, so absence here is unobservable rather than
+					// established. This sweep is the irreversible direction, so
+					// an unevaluable premise does not license it.
+					invalidPathCount++
+					invalidLastErr = res.err
+					if dryRun {
+						// A dry run reports what it would have done. It still
+						// runs this re-check, to produce accurate counts, so
+						// the run report is updated and the process-wide
+						// counter an operator alerts on is not.
+						run.SkippedInvalidPath++
+						run.Errors = appendBounded(run.Errors, fmt.Sprintf("Exists %q: permanently unusable key: %v", p, res.err), 32)
+					} else {
+						r.noteInvalidPath(run, "Exists", p, res.err)
+					}
+					continue
+				}
 				// Treat exists-check failures as "skip and let the
 				// next run retry" — better than risking a wrong delete.
 				existsErrCount++
 				existsLastErr = res.err
+				run.SkippedTransient++
 				run.Errors = appendBounded(run.Errors, fmt.Sprintf("Exists %q: %v", p, res.err), 32)
 				continue
 			}
@@ -142,6 +174,16 @@ func (r *Reconciler) sweepOrphanManifest(
 				Int("batch_failed_exists", existsErrCount).
 				Int("batch_size", len(chunk)).
 				Msg("Reconciliation: storage.Exists failures during manifest sweep — affected files skipped (next run retries)")
+		}
+		// Permanent failures get their own line for the same anti-spam reason,
+		// and because the transient line above promises a retry that does not
+		// apply to them.
+		if invalidPathCount > 0 {
+			r.logger.Error().
+				Err(invalidLastErr).
+				Int("batch_invalid_paths", invalidPathCount).
+				Int("batch_size", len(chunk)).
+				Msg("Reconciliation: manifest entries name permanently unusable storage keys, skipped and NOT retried. Nothing in Arc can remove them: the row-delete path and retention both have to read the file first, and neither can open this key. They stay until the manifest is edited out of band")
 		}
 
 		// If len(ops)==0 we have no Raft work for this chunk (every file

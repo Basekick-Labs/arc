@@ -163,6 +163,33 @@ func (b *AzureBlobBackend) blobKey(key string) (string, error) {
 	return key, nil
 }
 
+// partitionValidKeys splits a batch into the keys that satisfy the storage
+// contract and one error per key that does not.
+//
+// DeleteBatch was the only key-taking method on any backend that reached the
+// service without validating, and on Azure that is not merely a missed
+// rejection: a backslash IS a path separator there, verified against Azurite in
+// #743, so "a\b.parquet" and "a/b.parquet" are ONE blob and a batch carrying
+// the first would delete the second. Nothing else in the codebase can make a
+// delete address a different object than the caller named.
+//
+// Rejections are collected rather than fatal, matching S3: callers such as
+// compaction and the reconciler submit whole batches with no per-file fallback,
+// so failing the batch on one key would leave every other file undeleted
+// forever. Split out as a function because AzureBlobBackend cannot be built
+// without live credentials, and this behaviour deserves a test that needs none.
+func partitionValidKeys(batch []string) (usable []string, rejected []error) {
+	usable = make([]string, 0, len(batch))
+	for _, path := range batch {
+		if err := ValidateKey(path); err != nil {
+			rejected = append(rejected, err)
+			continue
+		}
+		usable = append(usable, path)
+	}
+	return usable, rejected
+}
+
 func (b *AzureBlobBackend) Write(ctx context.Context, path string, data []byte) error {
 	return b.WriteReader(ctx, path, bytes.NewReader(data), int64(len(data)))
 }
@@ -431,10 +458,17 @@ func (b *AzureBlobBackend) DeleteBatch(ctx context.Context, paths []string) erro
 			return fmt.Errorf("failed to create Azure batch builder: %w", err)
 		}
 
-		for _, path := range batch {
-			if err := bb.Delete(path, nil); err != nil {
-				return fmt.Errorf("failed to add delete to Azure batch for %q: %w", path, err)
+		usable, rejected := partitionValidKeys(batch)
+		nonFatalErrs = append(nonFatalErrs, rejected...)
+		for _, key := range usable {
+			if err := bb.Delete(key, nil); err != nil {
+				return fmt.Errorf("failed to add delete to Azure batch for %q: %w", key, err)
 			}
+		}
+		if len(usable) == 0 {
+			// Every key in this batch was refused; there is nothing to submit
+			// and SubmitBatch rejects an empty builder.
+			continue
 		}
 
 		resp, err := containerClient.SubmitBatch(ctx, bb, nil)
