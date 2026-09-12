@@ -244,7 +244,20 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
    that `PUT /api/v1/retention/:id` replaces the whole row, so a request that
    omits `database` is now a 400 rather than silently storing an empty name,
    which used to make that policy enumerate every database.
-5. **Query response envelopes gained two optional keys** (`rows_capped`,
+5. **Retention will delete a backlog on its first run if you use an S3 prefix.**
+   If `storage.s3_prefix` is set, retention has been deleting nothing at all
+   since v26.03.2 (see *Retention deleted nothing on S3 deployments with a
+   configured prefix* below), while reporting every run as completed. After
+   upgrading, the first run of each policy will remove everything already past
+   its cutoff, which on a long-running deployment can be most of the data in the
+   affected measurements. This is the policy doing what it was configured to do,
+   but it is not a small delete and it is not reversible. Before upgrading,
+   check what each policy would remove with a dry run
+   (`POST /api/v1/retention/:id/execute` with `{"dry_run": true}`, which is now
+   accurate where it previously reported zero), and confirm the retention window
+   is still the one you want. Deployments on local storage, on Azure, or on S3
+   without a prefix are unaffected: retention has been working correctly there.
+6. **Query response envelopes gained two optional keys** (`rows_capped`,
    `row_cap`), emitted only when an Enterprise governance row cap truncated
    the result. Conforming JSON and msgpack decoders are unaffected: the keys
    are absent from every uncapped response, and a capped msgpack envelope
@@ -401,6 +414,109 @@ The filename is now the job id alone, which is already unique and already
 carries the partition. Nothing reads these names, so manifests written by an
 earlier version are still found and recovered, and no migration is needed.
 
+### Retention deleted nothing on S3 deployments with a configured prefix ([#746](https://github.com/Basekick-Labs/arc/issues/746))
+
+If `storage.s3_prefix` was set, retention never deleted a single file.
+
+Retention lists the files for a measurement, then asks DuckDB for each file's
+maximum timestamp to decide whether it is past the cutoff. It built that file's
+URL as `s3://{bucket}/{key}` and left the configured prefix out, while every
+write goes under the prefix. So the URL named an object that does not exist,
+the read failed, and the per-file error handler logged a warning and moved on to
+the next file. Every file took that path, so nothing was ever eligible.
+
+Nothing said so. The policy run then recorded itself as `completed` with a
+deleted count of zero, which is also what the API and the execution history
+reported, so an operator checking whether retention was working saw a series of
+successful runs. The only symptom was data that never aged out, and one
+`Failed to read file metadata` line per file per cycle.
+
+Live since **v26.03.2**, when the prefix option was added. That change updated
+the identical URL builder in the delete path and did not update this one.
+Unprefixed S3, Azure and local deployments were never affected.
+
+The root cause was that the same builder existed in several places by hand.
+There is now one, `storage.ObjectURI`, which every component that reads the
+object store directly goes through, so a backend's prefix cannot be honoured in
+one place and forgotten in another. See the upgrade note above before
+upgrading: the first cycle after this fix will delete everything that
+accumulated while retention was doing nothing.
+
+### Partition pruning silently stopped working on S3 deployments with a configured prefix ([#746](https://github.com/Basekick-Labs/arc/issues/746))
+
+Also only with `storage.s3_prefix` set, and from the same cause in the opposite
+direction.
+
+Partition pruning narrows a time-bounded query to the hour and day directories
+it needs, then checks which of them exist before handing the list to DuckDB.
+Converting a directory URL back into something it could list stripped the
+scheme and the bucket but not the configured prefix, and the listing call adds
+the prefix itself. The listing therefore ran against `prefix/prefix/...` and
+came back empty **with no error**, so every partition was judged absent and the
+query fell back to scanning the measurement's full glob.
+
+Results stayed correct throughout; only the optimisation was lost. On a large
+measurement that is the difference between reading one hour and reading
+everything, so affected deployments should see time-bounded queries get faster
+after upgrading.
+
+Tiered queries were not affected: per-tier pruning already trimmed the tier's
+own root and carries a comment describing this exact hazard. Only the
+single-tier path was doing scheme-and-bucket surgery. It now trims the storage
+root it parsed out of the measurement's own glob, the same way the tiered path
+does, and a test pins that the parsed root and the URL builder agree. A URL that
+does not sit under that root no longer falls back to stripping the scheme: that
+produced a prefix the backend would re-prefix and list against some other key
+space, reporting every partition absent with full confidence. Existence
+filtering is skipped instead, so the query falls back to the full glob.
+
+### The query path now validates database and measurement names against the storage key contract ([#746](https://github.com/Basekick-Labs/arc/issues/746))
+
+No operator-visible behaviour changes here for valid names. This closes the
+structural gap the two fixes above came out of.
+
+The previous release made the key rule a property of every storage backend
+(#743). That covers writes. Reads never go through a backend at all: Arc builds
+an `s3://` or `azure://` URL and hands it to DuckDB, which reads the object
+store itself, and the Iceberg exporter hands paths to its own file layer the
+same way. A name that a backend would refuse could therefore still reach the
+object store through a query.
+
+Reads now go through the same contract, plus one rule that writes do not need.
+A key containing `*`, `?`, `[` or `{` names exactly one object to a write, so
+the contract accepts it; interpolated into a query it is a pattern, and
+`cpu*` would read every measurement whose name starts with `cpu`. Read paths
+reject those characters, writes still accept them.
+
+A name that cannot be turned into a path now fails the query with an explicit
+error. The alternative, substituting a path that matches nothing, would have
+been reported to the client as a successful query over an empty table, because
+Arc deliberately treats "no files matched" as an empty result rather than an
+error. Listing endpoints, whose names come from enumerating storage rather than
+from a request, leave the displayed path empty instead of failing the listing.
+
+Also in this change, all of it internal:
+
+- The five separate implementations of "is this name safe as a path" are
+  reconciled. They disagreed with each other: the cluster file-fetch validator
+  was believed to be stricter than the contract and was measurably looser,
+  accepting backslashes and over-long keys the contract refuses, and the delete
+  endpoint refused any name containing `..` anywhere, so a measurement called
+  `a..b` could be written and queried but not deleted from. They now share one
+  rule, with the two deliberate divergences documented and pinned by a test:
+  the Raft manifest validator stays looser because it runs during log replay
+  and tightening it would make different versions of Arc build different state
+  from one log, and the HTTP API additionally hides dot-prefixed names, which is
+  a display rule rather than a storage one.
+- Retention now reports when it had to skip a file whose stored path it cannot
+  read, instead of counting the run as a clean success. Such a file is skipped
+  on every future run too, so its data never ages out, and that is exactly the
+  silent shape of the prefix bug above.
+- The documented list of ways a list prefix is allowed to be looser than an
+  object key was one entry out of date, and is now checked by a test rather
+  than only stated in a comment.
+- Three unused S3 URL builders were removed rather than left as further copies
+  of the builder above.
 
 ### Every storage backend now enforces the same key contract ([#743](https://github.com/Basekick-Labs/arc/issues/743))
 

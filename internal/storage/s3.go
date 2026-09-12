@@ -750,66 +750,6 @@ func (b *S3Backend) GetSecretKey() string {
 	return b.secretKey
 }
 
-// GetS3Path returns the S3 URI for a path
-func (b *S3Backend) GetS3Path(path string) string {
-	return fmt.Sprintf("s3://%s/%s%s", b.bucket, b.prefix, path)
-}
-
-// GetQueryPath generates S3 path patterns for time-based query pruning
-// This enables DuckDB to efficiently scan only relevant partitions
-//
-// Examples:
-//   - GetQueryPath("mydb", "cpu", 2025, 11, 0, 0)   → "s3://bucket/mydb/cpu/2025/11/*/*/*.parquet" (all November)
-//   - GetQueryPath("mydb", "cpu", 2025, 11, 25, 0) → "s3://bucket/mydb/cpu/2025/11/25/*/*.parquet" (specific day)
-//   - GetQueryPath("mydb", "cpu", 2025, 11, 25, 16) → "s3://bucket/mydb/cpu/2025/11/25/16/*.parquet" (specific hour)
-func (b *S3Backend) GetQueryPath(database, measurement string, year, month, day, hour int) string {
-	if hour > 0 {
-		// Specific hour
-		return fmt.Sprintf("s3://%s/%s%s/%s/%04d/%02d/%02d/%02d/*.parquet",
-			b.bucket, b.prefix, database, measurement, year, month, day, hour)
-	} else if day > 0 {
-		// Specific day, all hours
-		return fmt.Sprintf("s3://%s/%s%s/%s/%04d/%02d/%02d/*/*.parquet",
-			b.bucket, b.prefix, database, measurement, year, month, day)
-	} else if month > 0 {
-		// Specific month, all days and hours
-		return fmt.Sprintf("s3://%s/%s%s/%s/%04d/%02d/*/*/*.parquet",
-			b.bucket, b.prefix, database, measurement, year, month)
-	} else {
-		// Entire year
-		return fmt.Sprintf("s3://%s/%s%s/%s/%04d/*/*/*/*.parquet",
-			b.bucket, b.prefix, database, measurement, year)
-	}
-}
-
-// GetQueryPathRange generates S3 path pattern for a time range
-// This is useful for queries like "WHERE time BETWEEN start AND end"
-func (b *S3Backend) GetQueryPathRange(database, measurement string, startTime, endTime time.Time) []string {
-	var paths []string
-
-	// Generate one path per UTC calendar day covering the range. Arc's
-	// partition directories are UTC dates (ingestion, pruning, and the query
-	// engine's pinned session zone all agree), so the inputs are normalized
-	// to UTC first: anchoring to a caller's local zone would skip the
-	// trailing UTC partition for west-of-UTC ranges and add a spurious
-	// leading one (#690 follow-up). AddDate keeps day-stepping calendar-
-	// correct, which in UTC is also DST-proof (#321).
-	startYear, startMonth, startDay := startTime.UTC().Date()
-	current := time.Date(startYear, startMonth, startDay, 0, 0, 0, 0, time.UTC)
-	endYear, endMonth, endDay := endTime.UTC().Date()
-	end := time.Date(endYear, endMonth, endDay, 0, 0, 0, 0, time.UTC).AddDate(0, 0, 1)
-
-	for current.Before(end) {
-		path := fmt.Sprintf("s3://%s/%s%s/%s/%04d/%02d/%02d/*/*.parquet",
-			b.bucket, b.prefix, database, measurement,
-			current.Year(), int(current.Month()), current.Day())
-		paths = append(paths, path)
-		current = current.AddDate(0, 0, 1)
-	}
-
-	return paths
-}
-
 // Type returns the storage type identifier
 func (b *S3Backend) Type() string {
 	return "s3"

@@ -133,7 +133,14 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 		if !isDataFile(p) {
 			continue
 		}
-		files = append(files, FileRef{PhysicalPath: s.resolver.Resolve(p)})
+		uri, err := s.resolver.Resolve(p)
+		if err != nil {
+			// The listing produced a key this backend would itself refuse.
+			// Fail rather than skip: a skipped file is missing from the
+			// exported table with no other signal.
+			return nil, nil, fmt.Errorf("listed file %q has no usable storage path: %w", p, err)
+		}
+		files = append(files, FileRef{PhysicalPath: uri})
 		if lp := s.resolver.LocalPath(p); lp != "" {
 			local = append(local, lp)
 		}

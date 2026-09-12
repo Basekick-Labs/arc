@@ -259,15 +259,26 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
-	// Reject path traversal in database/measurement names — these values are
-	// concatenated directly into storage prefixes and DuckDB paths.
-	if strings.ContainsAny(req.Database, "/\\") || strings.Contains(req.Database, "..") {
+	// These values are concatenated into storage prefixes and DuckDB paths, so
+	// they must be usable as one path segment. isSafeStoragePathSegment is the
+	// same rule the database endpoints apply, rather than a fourth local
+	// spelling of it (#746): the previous check here rejected any ".."
+	// SUBSTRING, so it refused "a..b", which every other layer accepts and
+	// which names exactly one directory. That is the raw-substring shape #737
+	// and #741 were each fixed for.
+	//
+	// ValidateGlobSafe is applied alongside it because these names end up in a
+	// DuckDB read_parquet() path, where "*" and friends are pattern operators
+	// rather than characters. Without it the request is accepted here and dies
+	// several layers down at path resolution, and the query endpoints reject
+	// the same name cleanly: one name, two verdicts at two depths.
+	if !isSafeStoragePathSegment(req.Database) || storage.ValidateGlobSafe(req.Database) != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{
 			Success: false,
 			Error:   "database name contains invalid characters",
 		})
 	}
-	if strings.ContainsAny(req.Measurement, "/\\") || strings.Contains(req.Measurement, "..") {
+	if !isSafeStoragePathSegment(req.Measurement) || storage.ValidateGlobSafe(req.Measurement) != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{
 			Success: false,
 			Error:   "measurement name contains invalid characters",
@@ -545,12 +556,20 @@ func (h *DeleteHandler) findAffectedFiles(ctx context.Context, database, measure
 	// Filter for parquet files and convert to query paths
 	var parquetFiles []fileInfo
 	for _, f := range files {
-		if strings.HasSuffix(strings.ToLower(f), ".parquet") {
-			parquetFiles = append(parquetFiles, fileInfo{
-				queryPath:    h.getQueryPath(f),
-				relativePath: f,
-			})
+		if !strings.HasSuffix(strings.ToLower(f), ".parquet") {
+			continue
 		}
+		queryPath, err := readParquetPath(h.storage, f)
+		if err != nil {
+			// A delete must not silently leave matching rows behind, so an
+			// unusable key aborts rather than being skipped: the caller reports
+			// how many rows it removed, and skipping would make that a lie.
+			return nil, fmt.Errorf("listed file %q has no usable storage path: %w", f, err)
+		}
+		parquetFiles = append(parquetFiles, fileInfo{
+			queryPath:    queryPath,
+			relativePath: f,
+		})
 	}
 
 	if len(parquetFiles) == 0 {
@@ -914,20 +933,6 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 		Msg("Rewrote S3 file")
 
 	return deleted, &s3RewriteResult{sizeBytes: sizeBytes, sha256: sha256hex}, nil
-}
-
-// getQueryPath converts a storage-relative path to a DuckDB-compatible path
-func (h *DeleteHandler) getQueryPath(relativePath string) string {
-	switch backend := h.storage.(type) {
-	case *storage.LocalBackend:
-		return filepath.Join(backend.GetBasePath(), relativePath)
-	case *storage.S3Backend:
-		return fmt.Sprintf("s3://%s/%s%s", backend.GetBucket(), backend.GetPrefix(), relativePath)
-	case *storage.AzureBlobBackend:
-		return fmt.Sprintf("azure://%s/%s", backend.GetContainer(), relativePath)
-	default:
-		return relativePath
-	}
 }
 
 // isRemoteBackend returns true if the storage backend requires a remote rewrite

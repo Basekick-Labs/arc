@@ -816,10 +816,16 @@ func ValidateKey(key string) error {
 
 // ValidateListPrefix reports whether prefix is usable to enumerate keys.
 //
-// Looser than ValidateKey in exactly two ways, both of which callers rely on:
-// "" means "everything", and a single trailing "/" scopes to a directory
-// ("databases/", database+"/"). Neither can name an object, so neither
-// threatens injectivity.
+// Looser than ValidateKey in exactly three ways, all of which callers rely on:
+// "" means "everything"; a single trailing "/" scopes to a directory
+// ("databases/", database+"/"); and PartSuffix is not reserved here. None of
+// the three can name an object, so none threatens injectivity.
+//
+// The PartSuffix relaxation is required rather than incidental: a prefix is a
+// string prefix on S3, so refusing one that happens to end in ".part" would
+// make the staged partials #744 reserved that suffix for unlistable, which is
+// the opposite of the point. TestListPrefixIsLooserThanKeyOnlyWhereDocumented
+// pins this list against the two functions.
 //
 // Note the backends disagree about what a prefix means, and this does not
 // change that: on S3 it is a true string prefix, so "default/cp" is meaningful,
@@ -864,17 +870,87 @@ func validateKeyBody(p string) error {
 				continue
 			}
 		}
-		seg := p[start:i]
-		switch seg {
-		case "":
-			return fmt.Errorf("%w: %q contains an empty segment", ErrInvalidPath, p)
-		case ".", "..":
-			return fmt.Errorf("%w: %q contains a %q segment", ErrInvalidPath, p, seg)
-		}
-		if len(seg) > MaxUsableKeySegmentLen {
-			return fmt.Errorf("%w: %q has a %d-byte segment, over the %d-byte limit", ErrInvalidPath, p, len(seg), MaxUsableKeySegmentLen)
+		if err := checkSegment(p[start:i]); err != nil {
+			return fmt.Errorf("%w (in %q)", err, p)
 		}
 		start = i + 1
+	}
+	return nil
+}
+
+// checkSegment holds the per-component rules shared by validateKeyBody and
+// ValidateKeySegment. Separator and NUL scanning stays in the callers: the
+// whole-key walk already has the bytes in hand, and ValidateKeySegment has to
+// reject a separator outright rather than split on it.
+func checkSegment(seg string) error {
+	switch seg {
+	case "":
+		return fmt.Errorf("%w: contains an empty segment", ErrInvalidPath)
+	case ".", "..":
+		return fmt.Errorf("%w: contains a %q segment", ErrInvalidPath, seg)
+	}
+	if len(seg) > MaxUsableKeySegmentLen {
+		return fmt.Errorf("%w: has a %d-byte segment, over the %d-byte limit", ErrInvalidPath, len(seg), MaxUsableKeySegmentLen)
+	}
+	return nil
+}
+
+// ValidateKeySegment reports whether seg is usable as ONE "/"-separated
+// component of a storage key.
+//
+// This is the same rule ValidateKey applies to each component of a whole key,
+// exported because several callers hold a single name (a database, a
+// measurement, an edge-sync spoke ID) rather than a key, and need to know it
+// will survive being joined into one. Its absence is why there were five
+// spellings of "is this name safe" (#746): every caller that needed a segment
+// rule and found none in this package wrote its own, and they disagreed.
+//
+// A segment may not contain a separator at all, which is the part callers
+// most often get wrong: validating database+"/"+measurement as a KEY accepts a
+// measurement of "a/b" and silently reads from a different directory.
+//
+// Note this is the STORAGE rule, not a name-format rule. It deliberately
+// accepts leading dots (".hidden"), because Arc's own storage root holds
+// dot-prefixed entries and because a create-time name rule is not a property
+// of the storage layer. Callers that additionally want to hide dot-prefixed
+// names apply that on top; see api.isSafeStoragePathSegment.
+func ValidateKeySegment(seg string) error {
+	for i := 0; i < len(seg); i++ {
+		switch seg[i] {
+		case 0:
+			return fmt.Errorf("%w: segment contains a NUL byte", ErrInvalidPath)
+		case '\\':
+			return fmt.Errorf("%w: segment %q contains a backslash, which Azure treats as a separator", ErrInvalidPath, seg)
+		case '/':
+			return fmt.Errorf("%w: segment %q contains a separator, so it names more than one path component", ErrInvalidPath, seg)
+		}
+	}
+	return checkSegment(seg)
+}
+
+// globMetacharacters are the pattern operators DuckDB's read_parquet applies to
+// a path. See ValidateGlobSafe.
+const globMetacharacters = `*?[]{}`
+
+// ValidateGlobSafe reports whether s can be interpolated into a DuckDB path
+// without changing which files that path names.
+//
+// Apply it at the SINK, next to the read_parquet interpolation, not in the
+// location builder: the same key handed to iceberg-go's FileIO or to os.Open is
+// read literally and needs no such rule.
+//
+// This is deliberately NOT part of the key contract, and the distinction is the
+// whole point of #746. ValidateKey guarantees INJECTIVITY: one key names one
+// object, which is what a write needs. The read path needs strictly more,
+// because its argument is a PATTERN, not a key. "cpu*" names exactly one object
+// to Write and every measurement starting with "cpu" to read_parquet.
+//
+// Reachable rather than theoretical: validateSpokeID (internal/edgesync/
+// receive.go) has no character allowlist, and a spoke ID becomes the first path
+// segment of everything that spoke writes into the hub's storage root.
+func ValidateGlobSafe(s string) error {
+	if i := strings.IndexAny(s, globMetacharacters); i >= 0 {
+		return fmt.Errorf("%w: %q contains the glob metacharacter %q, which would match more than one path", ErrInvalidPath, s, s[i])
 	}
 	return nil
 }

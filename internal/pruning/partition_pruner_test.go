@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
 
@@ -756,7 +757,7 @@ func TestFilterExistingPaths(t *testing.T) {
 			filepath.Join(tmpDir, "nonexistent", "*.parquet"),
 		}
 
-		filtered := p.filterExistingPaths(paths)
+		filtered := p.filterExistingPaths(paths, tmpDir)
 
 		if len(filtered) != 1 {
 			t.Errorf("Expected 1 existing path, got %d", len(filtered))
@@ -767,11 +768,11 @@ func TestFilterExistingPaths(t *testing.T) {
 		pattern := filepath.Join(existingDir, "*.parquet")
 
 		// First call - cache miss
-		p.filterExistingPaths([]string{pattern})
+		p.filterExistingPaths([]string{pattern}, existingDir)
 
 		// Second call should use cache
 		hits1, _, _ := p.globCache.stats()
-		p.filterExistingPaths([]string{pattern})
+		p.filterExistingPaths([]string{pattern}, existingDir)
 		hits2, _, _ := p.globCache.stats()
 
 		if hits2 <= hits1 {
@@ -1128,7 +1129,7 @@ func TestFilterExistingRemotePaths(t *testing.T) {
 	}
 
 	// Filter should return only paths that exist
-	result := p.filterExistingPaths(inputPaths)
+	result := p.filterExistingPaths(inputPaths, "s3://mybucket")
 
 	// Should only have 3 paths (hours 10, 11, 12)
 	if len(result) != 3 {
@@ -1160,7 +1161,7 @@ func TestFilterExistingRemotePaths_NoStorageBackend(t *testing.T) {
 	}
 
 	// Without storage backend, all paths should be returned (no filtering possible)
-	result := p.filterExistingPaths(inputPaths)
+	result := p.filterExistingPaths(inputPaths, "s3://mybucket")
 
 	if len(result) != len(inputPaths) {
 		t.Errorf("Expected all %d paths to be returned when no storage backend, got %d", len(inputPaths), len(result))
@@ -1183,7 +1184,7 @@ func TestFilterExistingRemotePaths_AllMissing(t *testing.T) {
 		"s3://mybucket/default/cpu/2025/12/17/11/*.parquet",
 	}
 
-	result := p.filterExistingPaths(inputPaths)
+	result := p.filterExistingPaths(inputPaths, "s3://mybucket")
 
 	// Should return empty slice when all partitions are missing
 	if len(result) != 0 {
@@ -1265,26 +1266,50 @@ func containsAnySubstring(s string, substrings []string) bool {
 	return false
 }
 
-// TestExtractStoragePrefix tests the URL to storage prefix conversion
+// TestExtractStoragePrefix tests the URL to backend-relative prefix conversion.
+//
+// The prefixed rows are the regression for #746: a backend configured with
+// storage.s3_prefix has a root of "s3://bucket/prefix", and List prepends that
+// prefix itself. Stripping only the scheme and bucket left it attached, the
+// listing ran against "tenant/tenant/..." and returned empty with no error, and
+// single-tier partition pruning silently stopped working on every prefixed
+// deployment.
 func TestExtractStoragePrefix(t *testing.T) {
-	logger := zerolog.Nop()
-	p := NewPartitionPruner(logger)
+	p := NewPartitionPruner(zerolog.Nop())
 
 	tests := []struct {
+		name     string
 		url      string
+		basePath string
 		expected string
 	}{
-		{"s3://mybucket/default/cpu/2025/01/15/", "default/cpu/2025/01/15/"},
-		{"s3://bucket-name/db/measurement/", "db/measurement/"},
-		{"azure://mycontainer/default/cpu/2025/", "default/cpu/2025/"},
-		{"azure://container/db/", "db/"},
+		{"s3 no prefix", "s3://mybucket/default/cpu/2025/01/15/", "s3://mybucket", "default/cpu/2025/01/15/"},
+		{"s3 no prefix, root has trailing slash", "s3://mybucket/default/cpu/2025/01/15/", "s3://mybucket/", "default/cpu/2025/01/15/"},
+		{"s3 no prefix, short", "s3://bucket-name/db/measurement/", "s3://bucket-name", "db/measurement/"},
+		{"azure", "azure://mycontainer/default/cpu/2025/", "azure://mycontainer", "default/cpu/2025/"},
+		{"azure short", "azure://container/db/", "azure://container", "db/"},
+
+		{"s3 with prefix", "s3://mybucket/tenant/default/cpu/2025/01/15/", "s3://mybucket/tenant", "default/cpu/2025/01/15/"},
+		{"s3 with nested prefix", "s3://mybucket/a/b/default/cpu/2025/", "s3://mybucket/a/b", "default/cpu/2025/"},
+		{"prefix equal to a path segment name", "s3://mybucket/db/db/cpu/2025/", "s3://mybucket/db", "db/cpu/2025/"},
+
+		// Not under the given root. Returning a scheme-stripped prefix would be
+		// worse than returning nothing: the backend re-prefixes it and the
+		// listing runs against a different key space, reporting every partition
+		// absent with full confidence. "" means "cannot verify", and the caller
+		// falls back to the unpruned glob.
+		{"mismatched root", "s3://other/db/cpu/2025/", "s3://mybucket/tenant", ""},
+		{"root-mounted local backend", "/db/cpu/2025/", "", "db/cpu/2025/"},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.url, func(t *testing.T) {
-			result := p.extractStoragePrefix(tt.url)
+		t.Run(tt.name, func(t *testing.T) {
+			result, ok := p.extractStoragePrefix(tt.url, tt.basePath)
+			if ok != (tt.expected != "") {
+				t.Errorf("extractStoragePrefix(%q, %q) resolved=%v, want %v", tt.url, tt.basePath, ok, tt.expected != "")
+			}
 			if result != tt.expected {
-				t.Errorf("extractStoragePrefix(%q) = %q, want %q", tt.url, result, tt.expected)
+				t.Errorf("extractStoragePrefix(%q, %q) = %q, want %q", tt.url, tt.basePath, result, tt.expected)
 			}
 		})
 	}
@@ -1671,4 +1696,85 @@ func TestPartitionCacheMaxEntries(t *testing.T) {
 	if _, _, size := c.stats(); size > 3 {
 		t.Fatalf("cache exceeded maxEntries: got %d, want <= 3", size)
 	}
+}
+
+// TestGlobParseYieldsTheBackendRoot closes the seam the pruning bug lived in.
+//
+// OptimizeTablePath does not keep the storage root it was given: it parses the
+// root back out of the glob with storagePathPattern, and everything downstream
+// (path generation, and turning a partition URL back into a listing prefix)
+// hangs off that parsed value. So the property that has to hold is that the
+// root the REGEX recovers is the same root the URI builder uses. When the two
+// disagreed, listings ran against a doubled prefix and came back empty with no
+// error, and pruning silently stopped working.
+//
+// storage.GetStoragePath and storage.ObjectURI are checked against each other in
+// the storage package; this pins the third participant, the parse.
+func TestGlobParseYieldsTheBackendRoot(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+
+	for _, tc := range []struct {
+		name    string
+		backend storage.Backend
+	}{
+		{"s3 without prefix", newTestS3Backend(t, "")},
+		{"s3 with prefix", newTestS3Backend(t, "tenant")},
+		{"s3 with nested prefix", newTestS3Backend(t, "a/b")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.backend == nil {
+				t.Skip("no S3 backend available")
+			}
+			const db, msr = "db", "cpu"
+			glob, err := storage.GetStoragePath(tc.backend, db, msr)
+			if err != nil {
+				t.Fatalf("GetStoragePath: %v", err)
+			}
+
+			matches := storagePathPattern.FindStringSubmatch(glob)
+			if len(matches) < 4 {
+				t.Fatalf("the pruner cannot parse its own glob %q", glob)
+			}
+			basePath, gotDB, gotMsr := matches[1], matches[2], matches[3]
+			if gotDB != db || gotMsr != msr {
+				t.Fatalf("parse recovered (%q, %q), want (%q, %q)", gotDB, gotMsr, db, msr)
+			}
+
+			// A partition URL under that measurement, built the way the rest of
+			// Arc builds object URLs.
+			key := db + "/" + msr + "/2026/09/12"
+			uri, err := storage.ObjectURI(tc.backend, key)
+			if err != nil {
+				t.Fatalf("ObjectURI: %v", err)
+			}
+
+			// Trimming the parsed root off it must give a key relative to the
+			// BACKEND, which is what List and ListDirectories expect. If the
+			// configured prefix survives here, the listing doubles it.
+			got, ok := p.extractStoragePrefix(uri, basePath)
+			if !ok {
+				t.Fatalf("extractStoragePrefix(%q, %q) could not resolve the URL against its own glob root", uri, basePath)
+			}
+			if got != key {
+				t.Errorf("extractStoragePrefix(%q, %q) = %q, want the backend-relative key %q",
+					uri, basePath, got, key)
+			}
+		})
+	}
+}
+
+// newTestS3Backend builds an S3 backend for path-shape assertions. It performs
+// no I/O in these tests; a nil return means the constructor could not run and
+// the caller skips.
+func newTestS3Backend(t *testing.T, prefix string) storage.Backend {
+	t.Helper()
+	b, err := storage.NewS3Backend(&storage.S3Config{
+		Bucket: "test-bucket", Region: "us-east-1", Endpoint: "localhost:9000",
+		UseSSL: false, PathStyle: true, AccessKey: "test", SecretKey: "test",
+		Prefix: prefix,
+	}, zerolog.Nop())
+	if err != nil {
+		return nil
+	}
+	return b
 }
