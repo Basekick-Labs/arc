@@ -84,10 +84,15 @@ type ExecuteRetentionRequest struct {
 
 // ExecuteRetentionResponse represents the result of executing a policy
 type ExecuteRetentionResponse struct {
-	PolicyID             int64    `json:"policy_id"`
-	PolicyName           string   `json:"policy_name"`
-	DeletedCount         int64    `json:"deleted_count"`
-	FilesDeleted         int      `json:"files_deleted"`
+	PolicyID     int64  `json:"policy_id"`
+	PolicyName   string `json:"policy_name"`
+	DeletedCount int64  `json:"deleted_count"`
+	FilesDeleted int    `json:"files_deleted"`
+	// SkippedFiles counts files whose stored key could not be resolved to a
+	// readable path, so they were neither examined nor deleted and never will
+	// be. Omitted when zero, which is every healthy deployment.
+	SkippedFiles         int      `json:"skipped_files,omitempty"`
+	SkippedReason        string   `json:"skipped_reason,omitempty"`
 	ExecutionTimeMs      float64  `json:"execution_time_ms"`
 	DryRun               bool     `json:"dry_run"`
 	CutoffDate           string   `json:"cutoff_date"`
@@ -513,13 +518,15 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 	// Execute retention for each measurement
 	var totalDeleted int64
 	var totalFilesDeleted int
+	var totalSkipped int
 
 	for _, measurement := range measurements {
-		deleted, filesDeleted, err := h.deleteOldFiles(ctx, policy.Database, measurement, cutoffDate, false, fmt.Sprintf("retention:%d", policyID))
+		deleted, filesDeleted, skipped, err := h.deleteOldFiles(ctx, policy.Database, measurement, cutoffDate, false, fmt.Sprintf("retention:%d", policyID))
 		// Accumulate before error check: deleteOldFiles returns partial progress
 		// on abort so the execution record reflects all completed work accurately.
 		totalDeleted += deleted
 		totalFilesDeleted += filesDeleted
+		totalSkipped += skipped
 		if err != nil {
 			h.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to process measurement")
 			// Abort on any error — manifest failures are non-transient (Raft quorum loss)
@@ -537,9 +544,19 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 
 	executionTime := float64(time.Since(start).Milliseconds())
 
-	// Record execution completion
+	// Record execution completion. A run that could not resolve some files did
+	// not do what the policy asks, so it must not be recorded as a clean
+	// "completed": the whole failure mode #746 fixed was retention reporting
+	// success while deleting nothing.
 	if executionID > 0 {
-		h.recordExecutionComplete(executionID, "completed", totalDeleted, executionTime, "")
+		status, detail := "completed", ""
+		if totalSkipped > 0 {
+			status = "completed_with_errors"
+			detail = fmt.Sprintf("%d file(s) have a stored path that cannot be read and will never be deleted; see the log for the keys", totalSkipped)
+			h.logger.Error().Int("skipped_files", totalSkipped).Str("database", policy.Database).
+				Msg("Retention could not resolve some files; their data will never age out")
+		}
+		h.recordExecutionComplete(executionID, status, totalDeleted, executionTime, detail)
 	}
 
 	h.logger.Info().
@@ -671,9 +688,11 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 	// Execute retention for each measurement
 	var totalDeleted int64
 	var totalFilesDeleted int
+	var totalSkipped int
 
 	for _, measurement := range measurements {
-		deleted, filesDeleted, err := h.deleteOldFiles(c.Context(), policy.Database, measurement, cutoffDate, req.DryRun, fmt.Sprintf("retention:%d", policyID))
+		deleted, filesDeleted, skipped, err := h.deleteOldFiles(c.Context(), policy.Database, measurement, cutoffDate, req.DryRun, fmt.Sprintf("retention:%d", policyID))
+		totalSkipped += skipped
 		totalDeleted += deleted
 		totalFilesDeleted += filesDeleted
 		if err != nil {
@@ -694,14 +713,26 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 
 	executionTime := float64(time.Since(start).Milliseconds())
 
-	// Record execution completion
+	// Record execution completion. See runPolicy: a run that could not resolve
+	// some files is not a clean "completed".
+	var skipDetail string
+	if totalSkipped > 0 {
+		skipDetail = fmt.Sprintf("%d file(s) have a stored path that cannot be read and will never be deleted; see the log for the keys", totalSkipped)
+		h.logger.Error().Int("skipped_files", totalSkipped).Str("database", policy.Database).
+			Msg("Retention could not resolve some files; their data will never age out")
+	}
 	if !req.DryRun && executionID > 0 {
-		h.recordExecutionComplete(executionID, "completed", totalDeleted, executionTime, "")
+		status := "completed"
+		if totalSkipped > 0 {
+			status = "completed_with_errors"
+		}
+		h.recordExecutionComplete(executionID, status, totalDeleted, executionTime, skipDetail)
 	}
 
 	h.logger.Info().
 		Int64("deleted_count", totalDeleted).
 		Int("files_deleted", totalFilesDeleted).
+		Int("skipped_files", totalSkipped).
 		Float64("execution_time_ms", executionTime).
 		Msg("Retention policy execution completed")
 
@@ -710,6 +741,8 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 		PolicyName:           policy.Name,
 		DeletedCount:         totalDeleted,
 		FilesDeleted:         totalFilesDeleted,
+		SkippedFiles:         totalSkipped,
+		SkippedReason:        skipDetail,
 		ExecutionTimeMs:      executionTime,
 		DryRun:               req.DryRun,
 		CutoffDate:           cutoffDate.Format(time.RFC3339),
@@ -857,12 +890,20 @@ func (h *RetentionHandler) getMeasurementsToProcess(ctx context.Context, policy 
 
 // deleteOldFiles deletes Parquet files where ALL rows are older than cutoffDate
 // Supports all storage backends: local, S3, and Azure
-func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measurement string, cutoffDate time.Time, dryRun bool, reason string) (int64, int, error) {
+// deleteOldFiles removes files older than cutoffDate for one measurement.
+//
+// The third return is the number of files that had to be skipped because their
+// stored key cannot be resolved to a readable path. It is reported separately
+// from an error because the rest of the measurement still processed correctly,
+// and separately from "deleted nothing" because a skip is permanent: the caller
+// surfaces it so a policy that can never fully apply does not keep recording
+// clean runs.
+func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measurement string, cutoffDate time.Time, dryRun bool, reason string) (int64, int, int, error) {
 	// List all files for this measurement using storage backend
 	prefix := database + "/" + measurement + "/"
 	files, err := h.storage.List(ctx, prefix)
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to list files: %w", err)
+		return 0, 0, 0, fmt.Errorf("failed to list files: %w", err)
 	}
 
 	// Filter to only parquet files
@@ -877,11 +918,22 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 
 	var deletedRows int64
 	var deletedFiles int
+	var skipped int            // files whose key cannot be turned into a readable path
 	var eligiblePaths []string // paths eligible for deletion (used for manifest + storage ops)
 	var eligibleRows []int64   // row counts parallel to eligiblePaths
 
 	for _, relativePath := range parquetFiles {
-		fullPath := h.buildParquetPath(relativePath)
+		fullPath, err := readParquetPath(h.storage, relativePath)
+		if err != nil {
+			// Counted, not just logged. A file that can never be resolved is
+			// skipped on every future run too, so its data never ages out; if
+			// only a Warn recorded that, the policy would keep reporting
+			// "completed, 0 deleted" forever, which is precisely the shape of
+			// the bug this function was fixed for (#746).
+			skipped++
+			h.logger.Warn().Err(err).Str("file", relativePath).Msg("Unusable storage path; file can never be processed by retention")
+			continue
+		}
 
 		maxTime, rowCount, err := h.getFileMaxTimeAndRowCount(ctx, fullPath)
 		if err != nil {
@@ -908,7 +960,7 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 	}
 
 	if dryRun || len(eligiblePaths) == 0 {
-		return deletedRows, deletedFiles, nil
+		return deletedRows, deletedFiles, skipped, nil
 	}
 
 	// Process in chunks of 1000: update manifest first, then delete from storage.
@@ -957,7 +1009,7 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 					if len(deletedFilePaths) > 0 {
 						h.cleanupEmptyDirectories(ctx, deletedFilePaths)
 					}
-					return deletedRows, deletedFiles, fmt.Errorf("failed to update cluster manifest: %w", err)
+					return deletedRows, deletedFiles, skipped, fmt.Errorf("failed to update cluster manifest: %w", err)
 				}
 			}
 		}
@@ -979,7 +1031,28 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 		h.cleanupEmptyDirectories(ctx, deletedFilePaths)
 	}
 
-	return deletedRows, deletedFiles, nil
+	return deletedRows, deletedFiles, skipped, nil
+}
+
+// readParquetPath resolves a storage key to a path that can be interpolated
+// into DuckDB's read_parquet().
+//
+// Two rules, and they are separate on purpose. storage.ObjectURI applies the
+// key contract, which is what makes the URI name the object the backend
+// actually wrote (the prefix bug in #746). ValidateGlobSafe is applied HERE
+// rather than inside ObjectURI because it is a property of this sink: DuckDB
+// treats "*", "?", "[" and "{" in a path as pattern operators, so one file's
+// key would silently expand to many, while the same key handed to a literal
+// reader such as iceberg-go or os.Open is fine.
+func readParquetPath(backend storage.Backend, key string) (string, error) {
+	uri, err := storage.ObjectURI(backend, key)
+	if err != nil {
+		return "", err
+	}
+	if err := storage.ValidateGlobSafe(uri); err != nil {
+		return "", err
+	}
+	return uri, nil
 }
 
 // getFileMaxTimeAndRowCount reads a Parquet file to get max time and row count
@@ -1025,21 +1098,6 @@ func (h *RetentionHandler) recordExecutionComplete(executionID int64, status str
 	`, status, deletedCount, durationMs, errorMessage, executionID)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to record execution complete")
-	}
-}
-
-// buildParquetPath returns the full path for DuckDB to read a parquet file
-// based on the storage backend type
-func (h *RetentionHandler) buildParquetPath(relativePath string) string {
-	switch b := h.storage.(type) {
-	case *storage.S3Backend:
-		return "s3://" + b.GetBucket() + "/" + relativePath
-	case *storage.AzureBlobBackend:
-		return "azure://" + b.GetContainer() + "/" + relativePath
-	case *storage.LocalBackend:
-		return filepath.Join(b.GetBasePath(), relativePath)
-	default:
-		return relativePath
 	}
 }
 

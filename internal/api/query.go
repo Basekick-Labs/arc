@@ -1643,7 +1643,11 @@ localProcessing:
 	}
 
 	// Convert SQL to storage paths and check for parallel execution opportunity
-	convertedSQL, parallelInfo, cached := h.getTransformedSQLForParallel(c.Context(), req.SQL, headerDB)
+	convertedSQL, parallelInfo, cached, err := h.getTransformedSQLForParallel(c.Context(), req.SQL, headerDB)
+	if err != nil {
+		m.IncQueryErrors()
+		return respondError(c, fiber.StatusBadRequest, err.Error(), timestamp, start)
+	}
 
 	// arcx decline census (no-op stub in stock builds; no query text is emitted).
 	// MUST sit before the parallel dispatch below: parallel takes exactly the
@@ -2659,17 +2663,17 @@ var dynamicSQLFunctionPattern = regexp.MustCompile(`(?i)\b(query|query_table|jso
 // getTransformedSQL returns the transformed SQL with caching.
 // If headerDB is non-empty, uses the optimized path with that database for all tables.
 // Returns the transformed SQL and whether it was a cache hit.
-func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, headerDB string) (string, bool) {
+func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, headerDB string) (string, bool, error) {
 	// Fast path: queries already using read_parquet don't need transformation
 	sqlLower := strings.ToLower(sql)
 	if strings.Contains(sqlLower, "read_parquet") {
-		return sql, true // Return as "hit" since no work needed
+		return sql, true, nil // Return as "hit" since no work needed
 	}
 
 	// Fast path: queries without FROM or JOIN don't need table transformation
 	// (e.g., SELECT 1+1, SELECT NOW(), SHOW commands handled elsewhere)
 	if !strings.Contains(sqlLower, "from") && !strings.Contains(sqlLower, "join") {
-		return sql, true
+		return sql, true, nil
 	}
 
 	// Build cache key - include header database if provided
@@ -2680,13 +2684,18 @@ func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, header
 
 	// Check cache
 	if transformed, ok := h.queryCache.Get(cacheKey); ok {
-		return transformed, true
+		return transformed, true, nil
 	}
 
 	// Attach the volatility flag: file-level time pruning may embed an
 	// explicit live-hour file list into the transformed SQL, and caching
 	// that would hide every file flushed within the cache TTL.
 	ctx, volatile := pruning.WithVolatileResult(ctx)
+
+	// Attach the storage-path collector. A name that cannot become a path is
+	// reported by the rewriters through ctx, since they run inside regexp
+	// replacement closures that can only return a string.
+	ctx, pathFailure := withStoragePathFailure(ctx)
 
 	// Transform using appropriate method
 	var transformed string
@@ -2696,40 +2705,46 @@ func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, header
 		transformed = h.convertSQLToStoragePaths(ctx, sql)
 	}
 
+	// Never cache, and never execute, SQL built around a rejected name: the
+	// transform leaves an empty path behind, which would read the backend root.
+	if pathFailure.err != nil {
+		return "", false, pathFailure.err
+	}
+
 	if !volatile.Volatile {
 		h.queryCache.Set(cacheKey, transformed)
 	}
-	return transformed, false
+	return transformed, false, nil
 }
 
 // getTransformedSQLForParallel returns the transformed SQL and parallel execution info.
 // This variant checks if the query can benefit from parallel partition scanning.
 // Only simple single-table queries with header DB can use parallel execution.
 // Returns (sql, parallel_info, cache_hit).
-func (h *QueryHandler) getTransformedSQLForParallel(ctx context.Context, sql string, headerDB string) (string, *ParallelQueryInfo, bool) {
+func (h *QueryHandler) getTransformedSQLForParallel(ctx context.Context, sql string, headerDB string) (string, *ParallelQueryInfo, bool, error) {
 	sqlLower := strings.ToLower(sql)
 
 	// Fast paths that don't support parallel execution
 	if strings.Contains(sqlLower, "read_parquet") {
-		return sql, nil, true
+		return sql, nil, true, nil
 	}
 	if !strings.Contains(sqlLower, "from") && !strings.Contains(sqlLower, "join") {
-		return sql, nil, true
+		return sql, nil, true, nil
 	}
 
 	// Parallel execution only supported for simple single-table queries with header DB
 	// Complex queries (JOINs, subqueries, CTEs) fall back to standard execution
 	if headerDB == "" || !isSingleTableQuery(sqlLower) || strings.Contains(sqlLower, "with ") {
-		transformed, cached := h.getTransformedSQL(ctx, sql, headerDB)
-		return transformed, nil, cached
+		transformed, cached, err := h.getTransformedSQL(ctx, sql, headerDB)
+		return transformed, nil, cached, err
 	}
 
 	// Bail to slow path for features the fast path can't handle. EXTRACT/
 	// SUBSTRING/TRIM/OVERLAY need the slow path's FROM-keyword mask.
 	features := scanSQLFeatures(sql)
 	if features.hasQuotes || features.hasDashComment || features.hasBlockComment || sqlutil.ContainsFromKeywordFunction(sql) {
-		transformed, cached := h.getTransformedSQL(ctx, sql, headerDB)
-		return transformed, nil, cached
+		transformed, cached, err := h.getTransformedSQL(ctx, sql, headerDB)
+		return transformed, nil, cached, err
 	}
 
 	// Rewrite time functions if present
@@ -2740,8 +2755,12 @@ func (h *QueryHandler) getTransformedSQLForParallel(ctx context.Context, sql str
 	}
 
 	// Use parallel-aware conversion
+	ctx, pathFailure := withStoragePathFailure(ctx)
 	convertedSQL, parallelInfo := h.convertSingleTableQueryForParallel(ctx, sql, sqlLower, headerDB)
-	return convertedSQL, parallelInfo, false
+	if pathFailure.err != nil {
+		return "", nil, false, pathFailure.err
+	}
+	return convertedSQL, parallelInfo, false, nil
 }
 
 // convertSQLToStoragePaths converts table references to storage paths
@@ -2811,7 +2830,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 		}
 		db, _ := resolveIdent(parts[1])
 		table, _ := resolveIdent(parts[2])
-		path := h.getStoragePath(db, table)
+		path := h.getStoragePath(ctx, db, table)
 		return h.buildReadParquetExpr(ctx, path, originalSQL, "FROM")
 	})
 
@@ -2823,7 +2842,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 		}
 		db, _ := resolveIdent(parts[2])
 		table, _ := resolveIdent(parts[3])
-		path := h.getStoragePath(db, table)
+		path := h.getStoragePath(ctx, db, table)
 		return h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1]))
 	})
 
@@ -2858,7 +2877,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 			return parts[0]
 		}
 
-		path := h.getStoragePath("default", resolved)
+		path := h.getStoragePath(ctx, "default", resolved)
 		return h.buildReadParquetExpr(ctx, path, originalSQL, "FROM")
 	})
 
@@ -2890,7 +2909,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 			return parts[0]
 		}
 
-		path := h.getStoragePath("default", resolved)
+		path := h.getStoragePath(ctx, "default", resolved)
 		return h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1]))
 	})
 
@@ -2935,9 +2954,78 @@ func makeIdentResolver(identNames map[string]string) func(string) (string, bool)
 	}
 }
 
-// getStoragePath returns the storage path for a database.table
-func (h *QueryHandler) getStoragePath(database, table string) string {
-	return storage.GetStoragePath(h.storage, database, table)
+// storagePathFailure carries the first storage-path rejection out of the SQL
+// transform.
+//
+// The transform runs inside regexp.ReplaceAllStringFunc closures, which can
+// only return a string, so a rejection deep inside one has no way back to the
+// handler. This is the same escape hatch pruning.WithVolatileResult uses for
+// the same structural reason, and it is why the transform does not need to be
+// rewritten to thread an error through every rewriter.
+//
+// Failing closed with a glob that matches nothing was the obvious alternative
+// and is wrong here: isNoFilesFoundError turns a no-match glob into
+// `Success: true, RowCount: 0` AND counts m.IncQuerySuccess(), so a rejected
+// name would be reported to the client as a successful query over an empty
+// table. A name Arc cannot turn into a path is an error, not an empty result.
+type storagePathFailure struct {
+	err error
+}
+
+type storagePathCtxKey struct{}
+
+// withStoragePathFailure attaches a collector for storage-path rejections.
+func withStoragePathFailure(ctx context.Context) (context.Context, *storagePathFailure) {
+	f := &storagePathFailure{}
+	return context.WithValue(ctx, storagePathCtxKey{}, f), f
+}
+
+// recordStoragePathFailure keeps the FIRST rejection. One malformed name can
+// match several rewriters, and the first is the one that names the cause.
+func recordStoragePathFailure(ctx context.Context, err error) {
+	if f, ok := ctx.Value(storagePathCtxKey{}).(*storagePathFailure); ok && f.err == nil {
+		f.err = err
+	}
+}
+
+// getStoragePath returns the storage path for a database.table, recording a
+// rejection on ctx for the caller to surface. The returned path is empty on
+// rejection; callers that reach this state discard the transformed SQL.
+func (h *QueryHandler) getStoragePath(ctx context.Context, database, table string) string {
+	return h.storagePathForBackend(ctx, h.storage, database, table)
+}
+
+// storagePathForDisplay returns the glob for a listing response field.
+//
+// Unlike the query path, these names come from enumerating the storage backend
+// rather than from a request, so one unusable directory must not fail the whole
+// listing: the field is left empty and the row still reports its file count and
+// size. Logged at Debug because a listing can hold many rows.
+func (h *QueryHandler) storagePathForDisplay(database, measurement string) string {
+	path, err := storage.GetStoragePath(h.storage, database, measurement)
+	if err != nil {
+		h.logger.Debug().Err(err).
+			Str("database", database).
+			Str("measurement", measurement).
+			Msg("Listing entry has no usable storage path")
+		return ""
+	}
+	return path
+}
+
+// storagePathForBackend is getStoragePath against an explicit backend, for the
+// cold tier, whose glob is built from a different Backend than h.storage.
+func (h *QueryHandler) storagePathForBackend(ctx context.Context, backend storage.Backend, database, table string) string {
+	path, err := storage.GetStoragePath(backend, database, table)
+	if err != nil {
+		h.logger.Warn().Err(err).
+			Str("database", database).
+			Str("measurement", table).
+			Msg("Rejected storage path; query will fail rather than read an unintended location")
+		recordStoragePathFailure(ctx, err)
+		return ""
+	}
+	return path
 }
 
 // quotePath returns a safe single-quoted DuckDB string literal for use
@@ -3124,7 +3212,7 @@ func (h *QueryHandler) buildReadParquetExprForMeasurement(ctx context.Context, d
 	}
 
 	// Fall back to single-tier behavior (hot tier only)
-	path := h.getStoragePath(database, measurement)
+	path := h.getStoragePath(ctx, database, measurement)
 	return h.buildReadParquetExpr(ctx, path, originalSQL, keyword)
 }
 
@@ -3315,7 +3403,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 			Str("measurement", measurement).
 			Msg("Failed to query tier metadata, falling back to hot tier only")
 		// Fall back to hot tier only on error
-		return keyword + " read_parquet(" + quotePath(h.getStoragePath(database, measurement)) + ", " + options + ")"
+		return keyword + " read_parquet(" + quotePath(h.getStoragePath(ctx, database, measurement)) + ", " + options + ")"
 	}
 
 	// If no metadata found, fall back to hot tier (data might not be registered yet)
@@ -3324,7 +3412,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 			Str("database", database).
 			Str("measurement", measurement).
 			Msg("No tier metadata found, using hot tier")
-		return keyword + " read_parquet(" + quotePath(h.getStoragePath(database, measurement)) + ", " + options + ")"
+		return keyword + " read_parquet(" + quotePath(h.getStoragePath(ctx, database, measurement)) + ", " + options + ")"
 	}
 
 	// Collect the full glob and backend for each tier that actually has data
@@ -3338,7 +3426,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 	// Hot tier (local) - only if metadata says there's hot data
 	if actualTiers[tiering.TierHot] {
 		if _, ok := tieredPaths[tiering.TierHot]; ok {
-			sources = append(sources, tierSource{tiering.TierHot, h.getStoragePath(database, measurement), h.storage})
+			sources = append(sources, tierSource{tiering.TierHot, h.getStoragePath(ctx, database, measurement), h.storage})
 		}
 	}
 
@@ -3347,7 +3435,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 		if _, ok := tieredPaths[tiering.TierCold]; ok {
 			coldBackend := h.tieringManager.GetBackendForTier(tiering.TierCold)
 			if coldBackend != nil {
-				sources = append(sources, tierSource{tiering.TierCold, storage.GetStoragePath(coldBackend, database, measurement), coldBackend})
+				sources = append(sources, tierSource{tiering.TierCold, h.storagePathForBackend(ctx, coldBackend, database, measurement), coldBackend})
 			}
 		}
 	}
@@ -3508,7 +3596,7 @@ func (h *QueryHandler) convertSingleTableQueryForParallel(ctx context.Context, s
 	}
 
 	// Build replacement with parallel info (hot tier only)
-	path := h.getStoragePath(database, tableName)
+	path := h.getStoragePath(ctx, database, tableName)
 	replacement, parallelInfo := h.buildReadParquetExprForParallel(ctx, path, sql, "FROM")
 
 	convertedSQL := sql[:idx] + replacement + sql[end:]
@@ -3619,7 +3707,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 		}
 
 		// Use header database instead of "default"
-		path := h.getStoragePath(database, resolved)
+		path := h.getStoragePath(ctx, database, resolved)
 		return h.buildReadParquetExpr(ctx, path, originalSQL, "FROM")
 	})
 
@@ -3652,7 +3740,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 		}
 
 		// Use header database instead of "default"
-		path := h.getStoragePath(database, resolved)
+		path := h.getStoragePath(ctx, database, resolved)
 		return h.buildReadParquetExpr(ctx, path, originalSQL, joinKeyword(parts[1]))
 	})
 
@@ -3923,7 +4011,7 @@ func (h *QueryHandler) handleShowTables(c *fiber.Ctx, start time.Time, database 
 		fileCount, totalSize := h.getTableStats(tablePath)
 
 		// Format storage path for display
-		storagePath := h.getStoragePath(database, table)
+		storagePath := h.storagePathForDisplay(database, table)
 
 		data = append(data, []interface{}{
 			database,
@@ -4187,7 +4275,16 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	}
 
 	// Convert SQL to storage paths (with caching)
-	convertedSQL, _ := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
+	convertedSQL, _, err := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
+	if err != nil {
+		metrics.Get().IncQueryErrors()
+		return c.Status(fiber.StatusBadRequest).JSON(EstimateResponse{
+			Success:         false,
+			Error:           err.Error(),
+			WarningLevel:    "error",
+			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+		})
+	}
 
 	// Create a COUNT(*) version of the query
 	countSQL := "SELECT COUNT(*) FROM (" + convertedSQL + ") AS t"
@@ -4420,7 +4517,7 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 				Measurement: measurementName,
 				FileCount:   fileCount,
 				TotalSizeMB: float64(totalSize) / (1024 * 1024),
-				StoragePath: h.getStoragePath(dbName, measurementName),
+				StoragePath: h.storagePathForDisplay(dbName, measurementName),
 			})
 		}
 	}
@@ -4682,7 +4779,15 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 
 	// Convert SQL to storage paths (with caching)
 	// Note: This endpoint builds its own db.measurement SQL, so no header optimization
-	convertedSQL, _ := h.getTransformedSQL(c.Context(), sql, "")
+	convertedSQL, _, err := h.getTransformedSQL(c.Context(), sql, "")
+	if err != nil {
+		m.IncQueryErrors()
+		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
+			Success:   false,
+			Error:     "Invalid query: " + err.Error(),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+	}
 
 	h.logger.Debug().
 		Str("measurement", measurement).

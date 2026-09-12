@@ -469,7 +469,15 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 // Helper functions
 
 // isSafeStoragePathSegment reports whether name can be used as one segment of a
-// storage key.
+// storage key by an API caller.
+//
+// The storage half is storage.ValidateKeySegment, the contract every Backend
+// enforces, rather than a private re-spelling of it (#746). Only the
+// leading-dot rule is local, and it stays local deliberately: it is an API
+// visibility rule, not a property of the key contract. Arc's own storage root
+// holds dot-prefixed entries (`.arc-database` markers, and the query layer's
+// `.arc-invalid-quoted-identifier` sentinel), so the storage layer must keep
+// accepting them while the API declines to name them.
 //
 // Deliberately looser than isValidDatabaseName, which governs what a NEW
 // database may be called. Directories already in the storage root were not all
@@ -477,16 +485,15 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 // there, and validateSpokeID permits a leading digit, interior dots and up to
 // 128 bytes. Those directories are listed by GET /api/v1/databases, so gating
 // the per-name routes on the create-time rule would return 400 for something
-// the list endpoint just reported. This rule asks only what the storage layer
-// asks: is it one segment, and does it name something inside the root.
+// the list endpoint just reported.
+//
+// Note this carries no glob rule. A caller whose name reaches a DuckDB path
+// needs storage.ValidateGlobSafe as well; see handleDelete.
 func isSafeStoragePathSegment(name string) bool {
-	if name == "" || len(name) > 255 {
+	if strings.HasPrefix(name, ".") {
 		return false
 	}
-	if name == "." || name == ".." || strings.HasPrefix(name, ".") {
-		return false
-	}
-	return !strings.ContainsAny(name, "/\\\x00")
+	return storage.ValidateKeySegment(name) == nil
 }
 
 func isValidDatabaseName(name string) bool {

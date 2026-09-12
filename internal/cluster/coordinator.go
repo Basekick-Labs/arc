@@ -9,9 +9,7 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"path"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1936,35 +1934,29 @@ func (c *Coordinator) sendReplicationSyncError(conn net.Conn, reason string) {
 }
 
 // sanitizeFetchPath validates a path supplied in a MsgFetchFile request.
-// Returns the cleaned path on success or an error describing the violation.
+// Returns the path on success or an error describing the violation.
 //
-// The storage backend treats paths as relative to its base directory. We
-// reject:
-//   - absolute paths ("/etc/passwd")
-//   - path traversal ("..", "foo/../bar")
-//   - null bytes (defense against C-string truncation bugs)
-//   - empty paths
-//   - paths that path.Clean changes (indicates funky input)
+// This is storage.ValidateKey, the contract the backend itself enforces, and
+// not a local re-spelling of it (#746). The previous implementation was
+// believed to be stricter than the contract because it required
+// path.Clean(p) == p. It was the opposite. Clean-idempotence is IMPLIED by the
+// contract, which already rejects "//", "." and ".." segments and a trailing
+// separator, so the check added nothing, while the surrounding code missed a
+// backslash (which Azure treats as a separator, so "a\b" and "a/b" are one
+// blob), the 1024-byte key bound and the 255-byte segment bound. Measured over
+// a corpus, it accepted 289 keys the contract rejects and rejected none that it
+// accepts.
+//
+// The path still flows to backend.Exists and backend.ReadTo below, which
+// enforce the same rule, so this is not the only gate. It is worth keeping as
+// its own step because it rejects before the manifest lookup and answers with
+// AckCodeInvalidPath, which tells a retrying peer the failure is permanent
+// rather than a transient backend error.
 func sanitizeFetchPath(p string) (string, error) {
-	if p == "" {
-		return "", fmt.Errorf("empty path")
+	if err := storage.ValidateKey(p); err != nil {
+		return "", err
 	}
-	if strings.ContainsRune(p, 0) {
-		return "", fmt.Errorf("path contains null byte")
-	}
-	if strings.HasPrefix(p, "/") {
-		return "", fmt.Errorf("absolute path not allowed")
-	}
-	// path.Clean also rejects traversal; verify the cleaned form is unchanged.
-	cleaned := path.Clean(p)
-	if cleaned != p {
-		return "", fmt.Errorf("path must be pre-cleaned (got %q, clean is %q)", p, cleaned)
-	}
-	// After Clean, ".." as a prefix means an attempt to escape.
-	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
-		return "", fmt.Errorf("path traversal not allowed")
-	}
-	return cleaned, nil
+	return p, nil
 }
 
 // GetRegistry returns the node registry.

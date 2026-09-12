@@ -65,71 +65,51 @@ func setupTestRetentionHandler(t *testing.T) (*RetentionHandler, string) {
 	return handler, tmpDir
 }
 
-func TestBuildParquetPath_LocalBackend(t *testing.T) {
-	handler, tmpDir := setupTestRetentionHandler(t)
-
-	path := handler.buildParquetPath("testdb/measurements/2024/01/01/00/data.parquet")
-	expected := filepath.Join(tmpDir, "testdb/measurements/2024/01/01/00/data.parquet")
-
-	if path != expected {
-		t.Errorf("buildParquetPath() = %q, want %q", path, expected)
-	}
-}
-
-func TestBuildParquetPath_S3Backend(t *testing.T) {
+// Retention resolves a listed key to the location the backend actually wrote
+// it to. Before #746 it built "s3://{bucket}/{key}" with no prefix, so on a
+// deployment with storage.s3_prefix set every file 404'd, the per-file read
+// errored, and deleteOldFiles skipped it: retention deleted nothing at all,
+// while still recording the run as "completed".
+//
+// The prefixed case is the one that matters and is exactly the one the old
+// tests here did not cover.
+func TestRetentionResolvesKeysToWrittenLocation(t *testing.T) {
 	logger := zerolog.New(os.Stderr).Level(zerolog.Disabled)
+	const key = "testdb/measurements/2024/01/01/00/data.parquet"
 
-	// Create handler with S3 backend
-	tmpDir, err := os.MkdirTemp("", "arc-retention-s3-test-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
+	t.Run("local", func(t *testing.T) {
+		handler, tmpDir := setupTestRetentionHandler(t)
+		got, err := storage.ObjectURI(handler.storage, key)
+		if err != nil {
+			t.Fatalf("ObjectURI: %v", err)
+		}
+		if want := filepath.Join(tmpDir, key); got != want {
+			t.Errorf("ObjectURI() = %q, want %q", got, want)
+		}
+	})
 
-	retentionCfg := &config.RetentionConfig{
-		Enabled: true,
-		DBPath:  filepath.Join(tmpDir, "retention.db"),
-	}
-
-	duckdb, err := database.New(&database.Config{
-		MemoryLimit:      "256MB",
-		ThreadCount:      2,
-		MaxConnections:   2,
-		LocalStorageRoot: tmpDir,
-	}, logger)
-	if err != nil {
-		t.Fatalf("failed to create DuckDB: %v", err)
-	}
-	defer duckdb.Close()
-
-	// Create a real S3 backend for testing path generation
-	s3Cfg := &storage.S3Config{
-		Bucket:    "test-bucket",
-		Region:    "us-east-1",
-		Endpoint:  "localhost:9000",
-		UseSSL:    false,
-		PathStyle: true,
-		AccessKey: "test",
-		SecretKey: "test",
-	}
-	s3Backend, err := storage.NewS3Backend(s3Cfg, logger)
-	if err != nil {
-		// Skip test if we can't create S3 backend (no MinIO running)
-		t.Skipf("Skipping S3 test - could not create S3 backend: %v", err)
-	}
-
-	handler := &RetentionHandler{
-		storage: s3Backend,
-		config:  retentionCfg,
-		duckdb:  duckdb,
-		logger:  logger,
-	}
-
-	path := handler.buildParquetPath("testdb/measurements/2024/01/01/00/data.parquet")
-	expected := "s3://test-bucket/testdb/measurements/2024/01/01/00/data.parquet"
-
-	if path != expected {
-		t.Errorf("buildParquetPath() = %q, want %q", path, expected)
+	for _, tc := range []struct{ name, prefix, want string }{
+		{"s3 without prefix", "", "s3://test-bucket/" + key},
+		{"s3 with prefix", "tenant", "s3://test-bucket/tenant/" + key},
+		{"s3 with nested prefix", "a/b", "s3://test-bucket/a/b/" + key},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend, err := storage.NewS3Backend(&storage.S3Config{
+				Bucket: "test-bucket", Region: "us-east-1", Endpoint: "localhost:9000",
+				UseSSL: false, PathStyle: true, AccessKey: "test", SecretKey: "test",
+				Prefix: tc.prefix,
+			}, logger)
+			if err != nil {
+				t.Skipf("could not create S3 backend: %v", err)
+			}
+			got, err := storage.ObjectURI(backend, key)
+			if err != nil {
+				t.Fatalf("ObjectURI: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("ObjectURI() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -203,10 +183,13 @@ func TestDeleteOldFiles_NoFiles(t *testing.T) {
 	handler, _ := setupTestRetentionHandler(t)
 
 	cutoff := time.Now().Add(-24 * time.Hour)
-	deletedRows, deletedFiles, err := handler.deleteOldFiles(context.Background(), "testdb", "nonexistent", cutoff, false, "retention:test")
+	deletedRows, deletedFiles, skipped, err := handler.deleteOldFiles(context.Background(), "testdb", "nonexistent", cutoff, false, "retention:test")
 
 	if err != nil {
 		t.Fatalf("deleteOldFiles() error = %v", err)
+	}
+	if skipped != 0 {
+		t.Errorf("deleteOldFiles() skipped = %d, want 0", skipped)
 	}
 
 	if deletedRows != 0 || deletedFiles != 0 {
@@ -246,10 +229,13 @@ func TestDeleteOldFiles_DryRun(t *testing.T) {
 
 	// Run dry-run deletion with a cutoff date after the data
 	cutoff := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
-	deletedRows, deletedFiles, err := handler.deleteOldFiles(context.Background(), "testdb", "logs", cutoff, true, "retention:test")
+	deletedRows, deletedFiles, skipped, err := handler.deleteOldFiles(context.Background(), "testdb", "logs", cutoff, true, "retention:test")
 
 	if err != nil {
 		t.Fatalf("deleteOldFiles() error = %v", err)
+	}
+	if skipped != 0 {
+		t.Errorf("deleteOldFiles() skipped = %d, want 0", skipped)
 	}
 
 	// Should report files eligible for deletion
@@ -299,10 +285,13 @@ func TestDeleteOldFiles_ActualDelete(t *testing.T) {
 
 	// Run actual deletion with a cutoff date after the data
 	cutoff := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
-	deletedRows, deletedFiles, err := handler.deleteOldFiles(context.Background(), "testdb", "logs", cutoff, false, "retention:test")
+	deletedRows, deletedFiles, skipped, err := handler.deleteOldFiles(context.Background(), "testdb", "logs", cutoff, false, "retention:test")
 
 	if err != nil {
 		t.Fatalf("deleteOldFiles() error = %v", err)
+	}
+	if skipped != 0 {
+		t.Errorf("deleteOldFiles() skipped = %d, want 0", skipped)
 	}
 
 	// Should report files deleted
@@ -347,10 +336,13 @@ func TestDeleteOldFiles_KeepsRecentFiles(t *testing.T) {
 
 	// Run deletion with a cutoff date before the data
 	cutoff := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-	deletedRows, deletedFiles, err := handler.deleteOldFiles(context.Background(), "testdb", "logs", cutoff, false, "retention:test")
+	deletedRows, deletedFiles, skipped, err := handler.deleteOldFiles(context.Background(), "testdb", "logs", cutoff, false, "retention:test")
 
 	if err != nil {
 		t.Fatalf("deleteOldFiles() error = %v", err)
+	}
+	if skipped != 0 {
+		t.Errorf("deleteOldFiles() skipped = %d, want 0", skipped)
 	}
 
 	// Should not delete any files
@@ -401,10 +393,13 @@ func TestDeleteOldFiles_CleansUpEmptyDirectories(t *testing.T) {
 
 	// Run actual deletion with a cutoff date after the data
 	cutoff := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
-	_, _, err := handler.deleteOldFiles(context.Background(), "testdb", "logs", cutoff, false, "retention:test")
+	_, _, skipped, err := handler.deleteOldFiles(context.Background(), "testdb", "logs", cutoff, false, "retention:test")
 
 	if err != nil {
 		t.Fatalf("deleteOldFiles() error = %v", err)
+	}
+	if skipped != 0 {
+		t.Errorf("deleteOldFiles() skipped = %d, want 0", skipped)
 	}
 
 	// Hour directory should be deleted (empty after file deletion)
@@ -434,5 +429,53 @@ func TestDeleteOldFiles_CleansUpEmptyDirectories(t *testing.T) {
 	measurementBaseDir := filepath.Join(tmpDir, "testdb", "logs")
 	if _, err := os.Stat(measurementBaseDir); os.IsNotExist(err) {
 		t.Error("deleteOldFiles() should NOT delete measurement directory")
+	}
+}
+
+// TestReadParquetPathRejectsGlobMetacharacters.
+//
+// The read_parquet sink needs a rule the key contract deliberately lacks. A
+// key containing "*" names exactly one object to a write and to any literal
+// reader, so storage.ObjectURI accepts it; interpolated into read_parquet it is
+// a pattern, and one file's key would silently expand to many.
+//
+// Reachable: edgesync.validateSpokeID has no character allowlist, and a spoke
+// ID is the first path segment of everything that spoke writes into the hub's
+// storage root.
+func TestReadParquetPathRejectsGlobMetacharacters(t *testing.T) {
+	logger := zerolog.New(os.Stderr).Level(zerolog.Disabled)
+	backend, err := storage.NewS3Backend(&storage.S3Config{
+		Bucket: "test-bucket", Region: "us-east-1", Endpoint: "localhost:9000",
+		UseSSL: false, PathStyle: true, AccessKey: "test", SecretKey: "test",
+		Prefix: "tenant",
+	}, logger)
+	if err != nil {
+		t.Skipf("could not create S3 backend: %v", err)
+	}
+
+	for _, key := range []string{
+		"rocket*01/cpu/2026/09/12/13/f.parquet",
+		"db/cpu/2026/09/12/13/f?.parquet",
+		"db/cpu/2026/09/12/13/f[0].parquet",
+		"db/cpu/2026/09/12/13/f{1,2}.parquet",
+	} {
+		// ObjectURI itself must keep accepting these: the same key handed to
+		// iceberg-go or os.Open reads exactly one file.
+		if _, err := storage.ObjectURI(backend, key); err != nil {
+			t.Errorf("ObjectURI(%q) must accept a literal location: %v", key, err)
+		}
+		if _, err := readParquetPath(backend, key); err == nil {
+			t.Errorf("readParquetPath(%q) must reject a key that would glob", key)
+		}
+	}
+
+	// And an ordinary key still resolves, with the prefix.
+	const ok = "db/cpu/2026/09/12/13/f.parquet"
+	got, err := readParquetPath(backend, ok)
+	if err != nil {
+		t.Fatalf("readParquetPath(%q): %v", ok, err)
+	}
+	if want := "s3://test-bucket/tenant/" + ok; got != want {
+		t.Errorf("readParquetPath() = %q, want %q", got, want)
 	}
 }
