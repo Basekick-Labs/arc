@@ -468,6 +468,16 @@ func (b *LocalBackend) List(ctx context.Context, prefix string) ([]string, error
 			return err
 		}
 
+		relPath = filepath.ToSlash(relPath)
+		// A listing never returns a key this backend would refuse (#743), and
+		// since #744 that includes write-staging partials: they are not
+		// objects, and returning one gave every List-then-Read caller a key
+		// that fails. StagingInspector.ListStaged is how an abandoned partial
+		// is found.
+		if ValidateKey(relPath) != nil {
+			return nil
+		}
+
 		results = append(results, relPath)
 		return nil
 	})
@@ -490,6 +500,12 @@ func (b *LocalBackend) Delete(ctx context.Context, path string) error {
 	if err != nil {
 		return fmt.Errorf("invalid path: %w", err)
 	}
+
+	// Remove the key's staged partial alongside it. Deleting an object should
+	// not leave its half-written staging file behind, and since #744 that file
+	// is invisible to List, so nothing else would ever find it. Best-effort:
+	// the object is what the caller asked about.
+	_ = os.Remove(partPath(fullPath))
 
 	if err := os.Remove(fullPath); err != nil {
 		if os.IsNotExist(err) {
@@ -568,6 +584,11 @@ func (b *LocalBackend) ListDirectories(ctx context.Context, prefix string) ([]st
 		if entry.IsDir() {
 			// Skip hidden directories
 			if strings.HasPrefix(entry.Name(), ".") {
+				continue
+			}
+			// Callers join this name into a key, so a name the contract would
+			// refuse produces an unusable key. Same rule as List (#743).
+			if ValidateKey(entry.Name()) != nil {
 				continue
 			}
 			dirs = append(dirs, entry.Name())
@@ -661,6 +682,12 @@ func (b *LocalBackend) ListObjects(ctx context.Context, prefix string) ([]Object
 		relPath, err := filepath.Rel(b.basePath, path)
 		if err != nil {
 			return err
+		}
+		relPath = filepath.ToSlash(relPath)
+		// See List: a listing never returns a key this backend would refuse,
+		// which since #744 includes write-staging partials.
+		if ValidateKey(relPath) != nil {
+			return nil
 		}
 
 		// Metadata (size, mod-time) is not on DirEntry — stat the kept file.
@@ -756,6 +783,20 @@ func ValidateKey(key string) error {
 	if key[len(key)-1] == '/' {
 		return fmt.Errorf("%w: %q ends in a separator, which names the same object as %q", ErrInvalidPath, key, key[:len(key)-1])
 	}
+	// PartSuffix is reserved because LocalBackend stages every write at
+	// key+PartSuffix. Without this the staging file of key "x" IS the
+	// committed object "x.part", and the two destroy each other: opening
+	// staging with O_TRUNC wipes a committed object whose write already
+	// returned success, and AppendReader's promote renames it over a third
+	// key (#744). Callers that legitimately need the staged partial use
+	// StagingInspector rather than spelling the suffix themselves.
+	//
+	// Reserved in the shared contract rather than only in LocalBackend so a
+	// key remains portable between backends, which is the property #743
+	// established.
+	if strings.HasSuffix(key, PartSuffix) {
+		return fmt.Errorf("%w: %q ends in %q, which is reserved for write staging", ErrInvalidPath, key, PartSuffix)
+	}
 	return validateKeyBody(key)
 }
 
@@ -785,8 +826,12 @@ func ValidateListPrefix(prefix string) error {
 // validateKeyBody holds the rules common to keys and list prefixes. Callers
 // have already dealt with emptiness and any trailing separator.
 func validateKeyBody(p string) error {
-	if len(p) > MaxKeyLen {
-		return fmt.Errorf("%w: key is %d bytes, over the %d-byte limit", ErrInvalidPath, len(p), MaxKeyLen)
+	// The bounds subtract PartSuffix because LocalBackend appends it to build
+	// the staging file. A key at exactly the limit passes the contract and
+	// then fails the write with ENAMETOOLONG, which is the same
+	// blessed-but-unstorable shape the manifest half of #744 fixes.
+	if len(p) > MaxKeyLen-len(PartSuffix) {
+		return fmt.Errorf("%w: key is %d bytes, over the %d-byte limit", ErrInvalidPath, len(p), MaxKeyLen-len(PartSuffix))
 	}
 	if p[0] == '/' {
 		return fmt.Errorf("%w: %q must be relative to the backend root", ErrInvalidPath, p)
@@ -812,12 +857,137 @@ func validateKeyBody(p string) error {
 		case ".", "..":
 			return fmt.Errorf("%w: %q contains a %q segment", ErrInvalidPath, p, seg)
 		}
-		if len(seg) > MaxKeySegmentLen {
-			return fmt.Errorf("%w: %q has a %d-byte segment, over the %d-byte limit", ErrInvalidPath, p, len(seg), MaxKeySegmentLen)
+		if len(seg) > MaxKeySegmentLen-len(PartSuffix) {
+			return fmt.Errorf("%w: %q has a %d-byte segment, over the %d-byte limit", ErrInvalidPath, p, len(seg), MaxKeySegmentLen-len(PartSuffix))
 		}
 		start = i + 1
 	}
 	return nil
+}
+
+// stagedPath resolves the staging location for a key. Separate from
+// validatePath because the staging suffix is reserved, so the staging path is
+// deliberately not a valid key and cannot be reached through the normal
+// methods.
+func (b *LocalBackend) stagedPath(key string) (string, error) {
+	// Validated WITHOUT the reserved-suffix rule. A partial left by an older
+	// version can belong to a key that the contract now refuses, such as the
+	// staging file of the once-legal key "x.part". Refusing to address it
+	// would leave it hidden from List and unreclaimable forever, which is the
+	// opposite of the point (#744).
+	if key == "" {
+		return "", fmt.Errorf("%w: key is empty", ErrInvalidPath)
+	}
+	if key[len(key)-1] == '/' {
+		return "", fmt.Errorf("%w: %q ends in a separator", ErrInvalidPath, key)
+	}
+	if err := validateKeyBody(key); err != nil {
+		return "", err
+	}
+	return partPath(b.pathPrefix + key), nil
+}
+
+// StagedSize implements StagingInspector.
+func (b *LocalBackend) StagedSize(ctx context.Context, key string) (int64, error) {
+	staged, err := b.stagedPath(key)
+	if err != nil {
+		return 0, err
+	}
+	info, err := os.Stat(staged)
+	if os.IsNotExist(err) {
+		return -1, nil
+	}
+	if err != nil {
+		metrics.Get().IncStorageErrors()
+		return 0, fmt.Errorf("failed to stat staged file: %w", err)
+	}
+	return info.Size(), nil
+}
+
+// ReadStaged implements StagingInspector.
+func (b *LocalBackend) ReadStaged(ctx context.Context, key string, writer io.Writer) error {
+	staged, err := b.stagedPath(key)
+	if err != nil {
+		return err
+	}
+	file, err := os.Open(staged)
+	if err != nil {
+		metrics.Get().IncStorageErrors()
+		if os.IsNotExist(err) {
+			return fmt.Errorf("file not found: %s", key)
+		}
+		return fmt.Errorf("failed to open staged file: %w", err)
+	}
+	defer file.Close()
+	if _, err := io.Copy(writer, file); err != nil {
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to read staged file: %w", err)
+	}
+	metrics.Get().IncStorageReads()
+	return nil
+}
+
+// DeleteStaged implements StagingInspector.
+func (b *LocalBackend) DeleteStaged(ctx context.Context, key string) error {
+	staged, err := b.stagedPath(key)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(staged); err != nil && !os.IsNotExist(err) {
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to delete staged file: %w", err)
+	}
+	return nil
+}
+
+// ListStaged implements StagingInspector.
+//
+// Staged partials are filtered out of List and ListObjects, so this is the only
+// way to find an abandoned one. Without it a spoke that keeps abandoning
+// transfers would fill the disk with files nothing could see.
+func (b *LocalBackend) ListStaged(ctx context.Context, prefix string) ([]ObjectInfo, error) {
+	searchPath, err := b.validateListPath(prefix)
+	if err != nil {
+		return nil, err
+	}
+	var results []ObjectInfo
+	err = filepath.WalkDir(searchPath, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if os.IsNotExist(walkErr) {
+				return nil
+			}
+			return walkErr
+		}
+		// Checked per entry, as List does: with an empty prefix this walks the
+		// whole data root, and the sweep's shutdown hook cancels its context
+		// expecting the walk to stop.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(d.Name(), PartSuffix) {
+			return nil
+		}
+		rel, relErr := filepath.Rel(b.basePath, path)
+		if relErr != nil {
+			return nil
+		}
+		info, infoErr := d.Info()
+		if infoErr != nil {
+			return nil
+		}
+		results = append(results, ObjectInfo{
+			// Reported WITHOUT the suffix: the caller addresses a partial by
+			// the key it belongs to, never by the staging spelling.
+			Path:         strings.TrimSuffix(filepath.ToSlash(rel), PartSuffix),
+			Size:         info.Size(),
+			LastModified: info.ModTime(),
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list staged files: %w", err)
+	}
+	return results, nil
 }
 
 // validatePath resolves a storage key to its absolute location, rejecting any

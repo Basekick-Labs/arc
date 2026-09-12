@@ -296,12 +296,23 @@ func (r *Receiver) Receive(ctx context.Context, spokeID, sourcePath, declaredSHA
 			// rejects, so the spoke would hard-error on the hub's own reply.
 			if staged >= declaredSize {
 				_ = r.backend.Delete(ctx, stagingPath)
-				_ = r.backend.Delete(ctx, partSuffix(stagingPath))
+				if si := r.staging(); si != nil {
+					_ = si.DeleteStaged(ctx, stagingPath)
+				}
 				return &PutResult{Outcome: OutcomePartial, BytesAccepted: 0}, nil
 			}
 			return &PutResult{Outcome: OutcomePartial, BytesAccepted: staged}, nil
 		}
-		if err := r.backend.ReadTo(ctx, partSuffix(stagingPath), hasherWriter{hasher}); err != nil {
+		// Unreachable in practice, and deliberately kept: reaching here means
+		// the backend implements AppendingBackend (SupportsResume short-
+		// circuits otherwise), and LocalBackend is the only one that does and
+		// it also stages. A future appending backend that does not stage would
+		// land here rather than silently resuming from nothing.
+		si := r.staging()
+		if si == nil {
+			return nil, fmt.Errorf("%w: backend supports resume but exposes no staged partial, so %q cannot be rehashed", ErrReceiveInternal, stagingPath)
+		}
+		if err := si.ReadStaged(ctx, stagingPath, hasherWriter{hasher}); err != nil {
 			return nil, fmt.Errorf("%w: rehash staged prefix %q: %w", ErrReceiveInternal, stagingPath, err)
 		}
 	}
@@ -488,18 +499,31 @@ func (r *Receiver) stage(ctx context.Context, stagingPath string, body io.Reader
 // stagedSize reports how many bytes of a staged file the hub holds, whether it
 // sits in the backend's partial (".part") state or was fully written.
 func (r *Receiver) stagedSize(ctx context.Context, stagingPath string) (int64, error) {
-	if n, err := r.backend.StatFile(ctx, partSuffix(stagingPath)); err != nil {
-		return -1, err
-	} else if n >= 0 {
-		return n, nil
+	if si := r.staging(); si != nil {
+		if n, err := si.StagedSize(ctx, stagingPath); err != nil {
+			return -1, err
+		} else if n >= 0 {
+			return n, nil
+		}
 	}
 	return r.backend.StatFile(ctx, stagingPath)
 }
 
-// partSuffix names the backend's in-progress staging file. LocalBackend writes
-// through "{path}.part" and renames on completion; sizing that file is how the
-// hub learns where a dropped transfer stopped.
-func partSuffix(p string) string { return p + ".part" }
+// staging returns the backend's staging inspector, or nil when the backend
+// does not stage writes.
+//
+// The hub used to reach for a partial by appending ".part" to the key itself.
+// That spelling put the staging file in the same namespace as committed
+// objects, so the staging file of key "x" WAS the object "x.part" and the two
+// destroyed each other (#744). The suffix is reserved now and the partial is
+// addressed through the interface. A backend that does not stage (S3, Azure)
+// simply never has one, which is what a nil inspector means here.
+func (r *Receiver) staging() storage.StagingInspector {
+	if si, ok := r.backend.(storage.StagingInspector); ok {
+		return si
+	}
+	return nil
+}
 
 // errShortBody signals that the spoke sent fewer bytes than it declared. It is
 // returned from the reader so the backend abandons its write with the partial
@@ -547,8 +571,10 @@ func (r *Receiver) promote(ctx context.Context, stagingPath, finalPath string, s
 	// rename leaves "{finalPath}.part" behind; left in place it makes
 	// StatFile report the final file as present (see the note in Receive) and
 	// would defeat the Exists() guard for any code that still uses StatFile.
-	if err := r.backend.Delete(ctx, partSuffix(finalPath)); err != nil {
-		r.logger.Debug().Err(err).Str("path", finalPath).Msg("No stale promote staging file to clear")
+	if si := r.staging(); si != nil {
+		if err := si.DeleteStaged(ctx, finalPath); err != nil {
+			r.logger.Debug().Err(err).Str("path", finalPath).Msg("No stale promote staging file to clear")
+		}
 	}
 
 	pr, pw := io.Pipe()
@@ -793,19 +819,47 @@ func (r *Receiver) SweepStaging(ctx context.Context, maxAge time.Duration, now t
 		return 0, fmt.Errorf("%w: list staging: %w", ErrReceiveInternal, err)
 	}
 
+	// Staged partials are invisible to ListObjects by design (#744), so they
+	// are collected separately. Without this an abandoned partial would be
+	// unreachable AND unreclaimable, which is the disk-exhaustion this sweep
+	// exists to prevent.
+	type staleEntry struct {
+		path    string
+		staged  bool
+		modTime time.Time
+	}
+	entries := make([]staleEntry, 0, len(objects)*2)
+	for _, obj := range objects {
+		entries = append(entries, staleEntry{path: obj.Path, modTime: obj.LastModified})
+	}
+	if si := r.staging(); si != nil {
+		staged, err := si.ListStaged(ctx, StagingPrefix+"/")
+		if err != nil {
+			return 0, fmt.Errorf("%w: list staged partials: %w", ErrReceiveInternal, err)
+		}
+		for _, obj := range staged {
+			entries = append(entries, staleEntry{path: obj.Path, staged: true, modTime: obj.LastModified})
+		}
+	}
+
 	cutoff := now.Add(-maxAge)
 	var removed int
-	for _, obj := range objects {
+	for _, obj := range entries {
 		if err := ctx.Err(); err != nil {
 			return removed, err
 		}
-		if !obj.LastModified.Before(cutoff) {
+		if !obj.modTime.Before(cutoff) {
 			continue
 		}
-		if err := r.backend.Delete(ctx, obj.Path); err != nil {
+		del := func() error { return r.backend.Delete(ctx, obj.path) }
+		if obj.staged {
+			si := r.staging()
+			del = func() error { return si.DeleteStaged(ctx, obj.path) }
+		}
+		if err := del(); err != nil {
 			// Keep going: one undeletable orphan must not stop the sweep from
 			// reclaiming the rest.
-			r.logger.Warn().Err(err).Str("path", obj.Path).Msg("Failed to delete abandoned sync staging file")
+			r.logger.Warn().Err(err).Str("path", obj.path).Msg("Failed to delete abandoned sync staging file")
 			continue
 		}
 		removed++

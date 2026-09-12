@@ -763,8 +763,18 @@ func TestReceiver_SweepStagingReclaimsAbandonedPartials(t *testing.T) {
 		if exists, _ := backend.Exists(ctx, staging); exists {
 			t.Errorf("abandoned staging file %d survived the sweep", i)
 		}
-		if exists, _ := backend.Exists(ctx, partSuffix(staging)); exists {
-			t.Errorf("abandoned .part file %d survived the sweep", i)
+		// Asserted through the staging API, not Exists on a hand-built
+		// ".part" key: that key is reserved now, so Exists would return
+		// (false, error) and read as "gone" whether or not the partial
+		// survived (#744).
+		si, ok := backend.(storage.StagingInspector)
+		if !ok {
+			t.Fatal("test backend does not stage; the sweep cannot be exercised")
+		}
+		if n, err := si.StagedSize(ctx, staging); err != nil {
+			t.Errorf("StagedSize(%q): %v", staging, err)
+		} else if n >= 0 {
+			t.Errorf("abandoned staged partial %d survived the sweep (%d bytes)", i, n)
 		}
 	}
 }

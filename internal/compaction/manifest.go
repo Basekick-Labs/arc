@@ -2,6 +2,8 @@ package compaction
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
@@ -75,11 +77,41 @@ func NewManifestManager(backend storage.Backend, logger zerolog.Logger) *Manifes
 	}
 }
 
-// GenerateManifestPath generates a unique manifest path for a compaction job
+// GenerateManifestPath generates a unique manifest path for a compaction job.
+//
+// Path format: _compaction_state/{tier}/{database}/{jobID}.json
+//
+// The partition path is NOT repeated in the filename. jobID already embeds the
+// sanitized database and the folded partition path (manager.go), and the
+// database is a path segment here besides, so the old
+// "{folded_partition}_{jobID}.json" carried the partition twice and the
+// database three times. That pushed ordinary names past the 255-byte segment
+// limit: a 30-character database with a 60-character measurement produced a
+// 270-byte filename, which the storage key contract refuses, so WriteManifest
+// failed and compaction for that partition failed on every cycle (#744).
+//
+// Nothing parses this name. ListManifests filters on the ".json" suffix and
+// recoverManifest drives every decision off the unmarshalled body, so the
+// format is free to change and old manifests stay discoverable.
+//
+// The hash fallback covers the remaining tail: at the maximum permitted
+// database (64) and measurement (128) lengths even the jobID alone exceeds the
+// segment limit. It is deterministic, so a retry of the same job addresses the
+// same manifest.
 func (m *ManifestManager) GenerateManifestPath(tier, database, partitionPath, jobID string) string {
-	// Path format: _compaction_state/{tier}/{database}/{partition_path_sanitized}_{jobID}.json
-	sanitizedPartition := strings.ReplaceAll(partitionPath, "/", "_")
-	return filepath.Join(ManifestBasePath, tier, database, fmt.Sprintf("%s_%s.json", sanitizedPartition, jobID))
+	// An empty jobID would give ".json", which LocalBackend's hidden-file
+	// filter drops from List, so the manifest would be written and then never
+	// discovered or deleted. The old format always had a partition prefix in
+	// front; this one does not, so the guard is explicit.
+	if jobID == "" {
+		jobID = "unidentified-job"
+	}
+	name := jobID + ".json"
+	if len(name) > storage.MaxKeySegmentLen {
+		sum := sha256.Sum256([]byte(jobID))
+		name = hex.EncodeToString(sum[:16]) + ".json"
+	}
+	return filepath.Join(ManifestBasePath, tier, database, name)
 }
 
 // WriteManifest writes a manifest to storage
