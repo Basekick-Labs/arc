@@ -255,6 +255,104 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
 
 ## Bug fixes
 
+### Cleanup and replication loops no longer retry an unusable storage key forever ([#747](https://github.com/Basekick-Labs/arc/issues/747))
+
+[#743](https://github.com/Basekick-Labs/arc/issues/743) made a refused storage
+key report a permanent, identifiable error, and documented that a loop meeting
+one should quarantine the entry rather than retry it. Nothing acted on that yet,
+and the loops the note was written about kept treating it as a passing I/O
+failure.
+
+A key gets into this state by being stored, not by being typed. The cluster
+manifest's own validator is looser than the storage contract on purpose: it runs
+inside Raft `Apply`, which includes log replay, so tightening it would make a
+node refuse an entry an older binary accepted and two versions would build
+different state from one log. The gap that leaves is exactly six spellings, and
+compaction manifests and edge-sync ledger rows are persisted state that can
+carry one written by an earlier version.
+
+What each loop did with such an entry, and does now:
+
+- **Peer file replication** fetched the whole file body from a peer and only
+  then failed writing it, once per candidate peer, once per attempt, on every
+  catch-up walk and every reconciliation pass. The entry is now recognised at
+  the first backend call and no peer is contacted. Its test suite runs in 3
+  seconds where it took 108 before, which is the retry storm made visible.
+
+  The reader's query gate stays **closed** for that entry, deliberately. The
+  file really is absent, the read path is a glob so a query over that partition
+  would just return fewer rows, and `query.gate_on_catchup` exists to turn that
+  silence into a 503. An entry no peer holds is equally unsatisfiable and holds
+  the gate today; this one gets no exemption. Puller stats and the 503 body
+  gained an `invalid_path` key so the reason is legible.
+
+- **Compaction manifest recovery** could not delete the manifest and could not
+  confirm the output, so it reprocessed it every cycle and its input files were
+  held out of compaction indefinitely. The manifest is now parked alongside
+  itself with a `.quarantined` suffix, which takes it out of the recovery work
+  set and releases its inputs while keeping the record of what it described.
+  It is parked rather than deleted because the inputs may already be gone: the
+  only binary that could have written such a manifest is one whose upload and
+  source deletion both succeeded.
+
+- **A compaction job** failed outright when one of its inputs had an unusable
+  key, every cycle, because the "already compacted, skip it" escape hatch is
+  gated on an existence check that fails the same way. That input is now
+  skipped and the rest of the partition is compacted. The skipped file is not
+  deleted and its manifest entry is not dropped.
+
+- **Reconciliation** counted these as transient in a bucket whose log line
+  promises "next run retries". Both sweeps now separate the two, and a run
+  report carries `skipped_transient` and `skipped_invalid_path` as separate
+  numbers, because waiting helps with one and never helps with the other. The
+  entries are reported, not deleted: these sweeps issue the irreversible
+  operations, and on an object store an object can sit under the literal key
+  where the listing filter hides it, so absence is unobservable here rather
+  than established.
+
+- **Air-gap bundle export** kept the entry on an existence-check error, by a
+  rule written for transient failures, and the copy then aborted the entire
+  export rather than one file. Nothing on that path caps attempts, so a single
+  unusable file stopped all telemetry leaving the site permanently, on the
+  deployment least able to receive a visit. It is now marked skipped.
+
+- Serving a peer fetch for such a path answered `backend`, which reads as a
+  transient fault on the peer; it now answers `invalid_path`, which is the code
+  that already meant this. Peer-fallback behaviour is unchanged.
+
+- The Phase 4 local delete worker never retried, so nothing was stuck there, but
+  it logged a permanent condition at the same level as a backend hiccup. It now
+  says plainly that the local copy can never be removed by Arc.
+
+A new counter, `arc_storage_invalid_path_quarantined_total`, aggregates every
+one of these. It matters more than most: after this change there is no retry
+storm, no growing error log and no stuck queue to notice, so the counter and the
+per-site Error lines are the whole signal. It should sit at zero.
+
+**Azure batch deletes were also unsafe** and are fixed here, because the test
+that pins the contract is what exposed it. `DeleteBatch` was the one key-taking
+method on any backend that never validated its input, and on Azure a backslash
+is a path separator, so a batch carrying `a\b.parquet` deleted the unrelated
+blob `a/b.parquet`. Bad keys are now collected and reported the way S3 already
+did, without failing the rest of the batch.
+
+**A five-byte window in this release's own manifest fix is closed here too.**
+The manifest filename fix above generates a hashed name once the filename passes
+255 bytes, but the key validator subtracts the write-staging suffix and refuses
+anything over 250, so a job id of 246 to 250 characters produced a filename the
+generator considered fine and every write refused: the manifest write failed and
+that partition's compaction failed on every cycle, which is exactly the failure
+that fix removed. The limits the validator actually enforces are now exported,
+so a caller that builds a key bounds it by the same number the backend checks.
+Neither the window nor the fix ever appeared in a release.
+
+One asymmetry is left in place and tracked separately: local listings do not
+filter unusable keys the way S3 and Azure have since #743. Filtering them there
+would be consistent, but on local these are real data files rather than the
+object stores' directory markers, and silently omitting them from a backup is
+worse than the listing being inconsistent. That trade-off deserves its own
+decision rather than a drive-by.
+
 ### A write could destroy an already-acknowledged write ([#744](https://github.com/Basekick-Labs/arc/issues/744))
 
 Local storage stages every streamed write at `{key}.part` and renames it into
@@ -302,6 +400,7 @@ names it reached 508 bytes.
 The filename is now the job id alone, which is already unique and already
 carries the partition. Nothing reads these names, so manifests written by an
 earlier version are still found and recovered, and no migration is needed.
+
 
 ### Every storage backend now enforces the same key contract ([#743](https://github.com/Basekick-Labs/arc/issues/743))
 

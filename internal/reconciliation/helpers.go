@@ -1,6 +1,11 @@
 package reconciliation
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+
+	"github.com/basekick-labs/arc/internal/metrics"
+)
 
 // Cap and sample helpers used across the package. All four functions
 // share the same shape (cap a slice to a maximum length) so they live
@@ -71,4 +76,19 @@ func boolStr(b bool) string {
 		return "true"
 	}
 	return "false"
+}
+
+// noteInvalidPath records one entry a sweep refused to keep retrying because
+// its storage key is permanently unusable (#747).
+//
+// Shared by both sweeps so the run report, the bounded error list and the
+// process-wide counter can never drift apart, and so the counter is moved in
+// exactly one place. dryRun is not a parameter: the storage sweep never
+// reaches its delete path in dry-run mode, and the manifest sweep guards the
+// counter itself because it DOES run its re-check in dry-run to produce
+// accurate counts.
+func (r *Reconciler) noteInvalidPath(run *Run, op, path string, err error) {
+	run.SkippedInvalidPath++
+	metrics.Get().IncStorageInvalidPathQuarantined()
+	run.Errors = appendBounded(run.Errors, fmt.Sprintf("%s %q: permanently unusable key: %v", op, path, err), 32)
 }

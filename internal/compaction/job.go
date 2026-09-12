@@ -576,7 +576,7 @@ func (j *Job) downloadFiles(ctx context.Context, tempDir string) ([]downloadedFi
 	j.BytesBefore = totalSize
 
 	if skippedCount > 0 {
-		j.logger.Info().Int("skipped", skippedCount).Msg("Skipped already-compacted files")
+		j.logger.Info().Int("skipped", skippedCount).Msg("Skipped inputs during download (already compacted, or key permanently unusable)")
 	}
 
 	return finalFiles, nil
@@ -607,6 +607,24 @@ func (j *Job) downloadSingleFile(ctx context.Context, tempDir string, index int,
 		file.Close()
 		if removeErr := os.Remove(localPath); removeErr != nil {
 			j.logger.Warn().Err(removeErr).Str("path", localPath).Msg("Failed to clean up partial download file")
+		}
+
+		if errors.Is(err, storage.ErrInvalidPath) {
+			// Permanent: no backend can address this key, so every cycle would
+			// re-select this input and fail the whole job on it (#747). The
+			// Exists call below cannot rescue it either — it fails identically,
+			// leaving checkErr non-nil, which is exactly what makes the
+			// "already compacted, skip" escape hatch unreachable here.
+			//
+			// Skipping is safe: compactedFiles is built from the keys DuckDB
+			// actually read, so a skipped input is never deleted from storage
+			// and its manifest entry is never dropped. The job degrades to a
+			// partial compaction instead of failing outright.
+			metrics.Get().IncStorageInvalidPathQuarantined()
+			j.logger.Error().Err(err).
+				Str("file", fileKey).
+				Msg("Compaction input has a permanently unusable storage key; skipping it and compacting the rest. The file is not deleted and stays in the partition")
+			return downloadResult{index: index, skipped: true}
 		}
 
 		// Check if file doesn't exist (already compacted)

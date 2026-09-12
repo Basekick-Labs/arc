@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -26,6 +27,13 @@ const (
 
 // ManifestBasePath is the base directory for storing compaction manifests
 const ManifestBasePath = "_compaction_state"
+
+// ManifestQuarantineSuffix is appended to a manifest whose contents name a
+// storage key no backend can address (#747). ListManifests selects on a
+// ".json" suffix, so a parked manifest leaves the recovery work set and stops
+// excluding its inputs from compaction, while the record of which output and
+// inputs were involved survives for an operator to act on.
+const ManifestQuarantineSuffix = ".quarantined"
 
 // ManifestMaxAge is the maximum age for manifests before they're considered stale.
 // Manifests older than this are deleted during recovery - they likely indicate
@@ -107,7 +115,11 @@ func (m *ManifestManager) GenerateManifestPath(tier, database, partitionPath, jo
 		jobID = "unidentified-job"
 	}
 	name := jobID + ".json"
-	if len(name) > storage.MaxKeySegmentLen {
+	// MaxUsableKeySegmentLen, not MaxKeySegmentLen: ValidateKey subtracts
+	// PartSuffix from the bound, so comparing against the raw limit left names
+	// of 251 to 255 bytes passing this check and then being refused by every
+	// write, which is the failure #744 set out to remove.
+	if len(name) > storage.MaxUsableKeySegmentLen {
 		sum := sha256.Sum256([]byte(jobID))
 		name = hex.EncodeToString(sum[:16]) + ".json"
 	}
@@ -286,6 +298,32 @@ func (m *ManifestManager) recoverManifest(ctx context.Context, manifestPath stri
 
 	// Check if output file exists
 	exists, err := m.backend.Exists(ctx, manifest.OutputPath)
+	if errors.Is(err, storage.ErrInvalidPath) {
+		// The output key names nothing any backend can address, so Exists,
+		// Delete and Read all fail the same way every cycle and this manifest
+		// would be retried forever (#747). Park it rather than process it.
+		//
+		// Parked rather than deleted, and the difference is narrower than it
+		// looks: the consumed-inputs marks do NOT survive either way, because
+		// this returns before the deletion loop and a parked manifest is
+		// invisible to every later pass. What parking buys is that the record
+		// of which output and which inputs were involved still exists, and an
+		// operator is the only party who can act on it.
+		//
+		// That matters here because the inputs may already be gone. An older
+		// binary that folded the key is the only thing that could have written
+		// this manifest, and that same binary's upload and source deletion both
+		// SUCCEEDED. Job.Run leaves the manifest behind on purpose when the
+		// parent finalizes it (job.go), so a live manifest whose inputs are
+		// already deleted is a designed state, not a corruption.
+		//
+		// Nothing sweeps a parked manifest, which is deliberate rather than an
+		// oversight: it is a small JSON file, each affected manifest parks
+		// exactly once (a later pass cannot see it), so the count is bounded by
+		// how many bad manifests an earlier version wrote and cannot grow from
+		// a loop.
+		return m.quarantineManifest(ctx, manifestPath, manifest.OutputPath, err)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to check output file existence: %w", err)
 	}
@@ -339,6 +377,27 @@ func (m *ManifestManager) recoverManifest(ctx context.Context, manifestPath stri
 	var deleteErrors int
 	for _, inputFile := range manifest.InputFiles {
 		if err := m.backend.Delete(ctx, inputFile); err != nil {
+			if errors.Is(err, storage.ErrInvalidPath) {
+				// Permanent: this input cannot be deleted by this key, now or
+				// ever, so counting it as a delete error would keep the whole
+				// manifest for a retry that can only fail again (#747). Drop it
+				// from the work set and let the rest of the recovery finish.
+				//
+				// The file is NOT reclaimable by anything downstream: the
+				// reconciler's storage sweep addresses files by the same kind of
+				// key and fails identically. It needs operator action, and
+				// urgently, because this is the one site where the undeleted
+				// file's rows are CERTAINLY also in the output: InputFiles holds
+				// the keys DuckDB actually read. Whether the query path serves
+				// both copies depends on the backend, and the log line says so
+				// rather than assuming local.
+				metrics.Get().IncStorageInvalidPathQuarantined()
+				m.logger.Error().Err(err).
+					Str("file", inputFile).
+					Str("manifest", manifestPath).
+					Msg("Compaction input cannot be deleted: its key is permanently unusable. Skipping it so recovery can finish. Its rows are already in the compacted output, so wherever the query path can still reach this file it is now serving them twice: on Azure a backslash key IS the separator-spelled blob, and on local disk the file is a normal filename inside the partition glob. Remove it by hand")
+				continue
+			}
 			// Check if file already deleted
 			exists, checkErr := m.backend.Exists(ctx, inputFile)
 			if checkErr == nil && !exists {
@@ -370,6 +429,93 @@ func (m *ManifestManager) recoverManifest(ctx context.Context, manifestPath stri
 
 	// All input files deleted — safe to remove manifest
 	return m.DeleteManifest(ctx, manifestPath)
+}
+
+// quarantinePathFor derives the parked name for a manifest, alongside it and
+// out of the ".json" suffix ListManifests selects on.
+//
+// Appending can overflow: GenerateManifestPath allows a filename right up to
+// the 255-byte segment limit (#744), and the suffix pushes those past it.
+// Rather than give up on parking for exactly the manifests with the longest
+// names, fall back to the same deterministic hash that function uses, so a
+// record always survives and a repeated pass addresses the same parked object.
+func quarantinePathFor(manifestPath string) (string, error) {
+	parked := manifestPath + ManifestQuarantineSuffix
+	if storage.ValidateKey(parked) == nil {
+		return parked, nil
+	}
+	dir, name := filepath.Split(manifestPath)
+	sum := sha256.Sum256([]byte(name))
+	parked = filepath.Join(dir, hex.EncodeToString(sum[:16])+ManifestQuarantineSuffix)
+	if err := storage.ValidateKey(parked); err != nil {
+		return "", err
+	}
+	return parked, nil
+}
+
+// quarantineManifest parks a manifest whose contents name a permanently
+// unusable storage key, so recovery stops retrying work that cannot succeed
+// (#747) without discarding the record of what the manifest described.
+//
+// Parking is a copy followed by a delete rather than a rename, because the
+// Backend interface has no rename. The copy re-reads the raw bytes instead of
+// re-marshalling the parsed struct so a manifest written by a different version
+// keeps any fields this binary does not know about.
+//
+// Ordering matters and is deliberate: write the parked copy FIRST, and only
+// delete the original once it lands. A crash between the two leaves both, and
+// the next recovery pass re-parks idempotently. The reverse order could lose
+// the manifest entirely.
+//
+// A failure here returns an error, which keeps the manifest for the next cycle.
+// That is right for the transient case (the backend is down). The one way it
+// could loop forever, the parked name being too long to be a valid key itself,
+// is removed by quarantinePathFor falling back to a hashed name.
+func (m *ManifestManager) quarantineManifest(ctx context.Context, manifestPath, badKey string, cause error) error {
+	parkedPath, err := quarantinePathFor(manifestPath)
+	if err != nil {
+		// Unreachable in practice: quarantinePathFor falls back to a fixed-size
+		// hashed name that cannot overflow. Kept because the only alternative
+		// to handling it is a manifest retried forever, which is the bug being
+		// fixed. Delete rather than loop, and let the log line be the record.
+		if delErr := m.DeleteManifest(ctx, manifestPath); delErr != nil {
+			return delErr
+		}
+		metrics.Get().IncStorageInvalidPathQuarantined()
+		m.logger.Error().
+			Err(cause).
+			Str("manifest", manifestPath).
+			Str("output", badKey).
+			AnErr("park_error", err).
+			Msg("Compaction manifest names an unusable output key and could not be parked under any name; deleted it to stop an endless retry. This line is the only surviving record of the paths involved")
+		return nil
+	}
+
+	raw, err := m.backend.Read(ctx, manifestPath)
+	if err != nil {
+		return fmt.Errorf("quarantine manifest %s: read: %w", manifestPath, err)
+	}
+	if err := m.backend.Write(ctx, parkedPath, raw); err != nil {
+		return fmt.Errorf("quarantine manifest %s: park to %s: %w", manifestPath, parkedPath, err)
+	}
+	if err := m.DeleteManifest(ctx, manifestPath); err != nil {
+		return fmt.Errorf("quarantine manifest %s: remove original after parking: %w", manifestPath, err)
+	}
+
+	// Counted here, not on entry: every step above can fail transiently, and
+	// each failure keeps the manifest for the next cycle. Counting earlier
+	// would report a drop from the work set that did not happen, once per
+	// cycle, for an entry still being retried.
+	metrics.Get().IncStorageInvalidPathQuarantined()
+
+	m.logger.Error().
+		Err(cause).
+		Str("manifest", manifestPath).
+		Str("parked_to", parkedPath).
+		Str("output", badKey).
+		Msg("Compaction manifest names an output key no storage backend can address; parked instead of retried. Its inputs are no longer held back from compaction. The output may still exist and still be served by the query path even though storage cannot address it: on Azure a backslash key IS the separator-spelled blob, and on local disk it is a normal filename inside the partition glob. Check that partition for duplicate rows")
+
+	return nil
 }
 
 // GetFilesInManifests returns a set of all input files currently tracked by manifests.
