@@ -227,7 +227,13 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
    spoke fails to start until its ID is changed. See *Edge-sync spoke IDs can
    no longer collide with another spoke's namespace* below. The hub names any
    stored ID in that state at startup.
-3. **A few malformed names are now refused where they were previously
+3. **A misconfigured `storage.s3_prefix` now stops startup instead of silently
+   using the bucket root.** If Arc previously started with a prefix containing
+   `..`, a space, or any character outside `[A-Za-z0-9/._-]`, it was writing to
+   the top of the bucket rather than under that prefix, and it will now refuse
+   to boot until the value is corrected. Check the prefix before upgrading: the
+   data is wherever it was actually being written, not where the config says.
+4. **A few malformed names are now refused where they were previously
    accepted and quietly rewritten** (see *Local storage rejects malformed paths
    instead of rewriting them* below). Three are operator-visible: a retention
    policy whose database or measurement name contains a separator or is empty
@@ -238,7 +244,7 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
    that `PUT /api/v1/retention/:id` replaces the whole row, so a request that
    omits `database` is now a 400 rather than silently storing an empty name,
    which used to make that policy enumerate every database.
-4. **Query response envelopes gained two optional keys** (`rows_capped`,
+5. **Query response envelopes gained two optional keys** (`rows_capped`,
    `row_cap`), emitted only when an Enterprise governance row cap truncated
    the result. Conforming JSON and msgpack decoders are unaffected: the keys
    are absent from every uncapped response, and a capped msgpack envelope
@@ -248,6 +254,59 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
    them at all.
 
 ## Bug fixes
+
+### Every storage backend now enforces the same key contract ([#743](https://github.com/Basekick-Labs/arc/issues/743))
+
+The previous release made local storage refuse malformed keys
+([#741](https://github.com/Basekick-Labs/arc/issues/741)). It was the only
+backend that did, so one key behaved three ways, and the fix's own comment
+claimed a guarantee that held for one implementation out of three.
+
+The rule is now a property of the `Backend` interface, enforced by local, S3 and
+Azure alike. What it guarantees is that two different keys can never name one
+object, which is the property whose absence produced #574, #737 and #741.
+
+**It also fixes a collision #741 introduced.** `"coll"` and `"coll/"` resolved
+to the same local file: two keys, one object, and the first write silently lost.
+The exemption existed because list prefixes legitimately end in a separator, and
+applying a prefix rule to keys is what broke it. Keys and list prefixes are now
+validated separately, so `""` and a trailing separator remain valid for
+enumeration and are refused for a key.
+
+Behaviour on the object stores, all measured against a live MinIO and Azurite
+rather than reasoned about:
+
+- A leading separator is refused. MinIO silently strips it, so `/a/x` and `a/x`
+  were one object there, while S3 and Azure keep them apart. One key, three
+  outcomes.
+- A backslash is refused, because Azure treats it as a separator: `a\b` and
+  `a/b` are **one blob**.
+- `.` and `..` segments and empty interior segments are refused locally now,
+  with a message naming the key. MinIO already rejected all three, but as a
+  remote 400 describing an S3 API error rather than the key at fault. Azure
+  stored them literally.
+- Keys that merely contain dots, such as `a..b` or `..foo`, are accepted
+  everywhere and stored under the name asked for.
+
+**The S3 prefix is validated rather than repaired.** The old sanitiser's damage
+was on its success path: `/` stayed `/`, `a//b` became `a//b/` and `.` became
+`./`, each of which made every write fail against MinIO, while `a/..b` was
+silently replaced with the empty string. That last one is not a safe fallback,
+it is the bucket root, so a typo relocated an entire deployment without a word.
+A prefix that cannot form usable keys now stops the backend from starting.
+
+A listing also never returns a key the backend would then refuse. Object stores
+carry "directory marker" objects whose key ends in a separator, written by
+consoles and sync tools rather than by Arc, and Arc feeds listings straight into
+reads and deletes in a dozen places. Returning one would have been worse than
+the original problem: a restore would skip the file and still report success.
+Those entries are filtered out of listings, so what a listing returns is always
+usable.
+
+A MinIO service is wired into CI for this. Every behaviour above is a property
+of the servers rather than of any mock, no unit test could have found them, and
+the directory-marker case was found only by writing one through the raw S3 API
+and watching a read of it fail.
 
 ### Local storage rejects malformed paths instead of rewriting them ([#741](https://github.com/Basekick-Labs/arc/issues/741))
 

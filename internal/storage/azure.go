@@ -150,12 +150,29 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 }
 
 // Write writes data to Azure Blob Storage
+// blobKey validates a storage key before it becomes a blob name.
+//
+// Azure has no prefix concept, so the key IS the blob name, and it needs the
+// same contract the other backends enforce (#743). One rule matters especially
+// here: Azure treats a backslash as a path separator, so "a\\b" and "a/b" are
+// ONE blob. ValidateKey rejects backslash for that reason.
+func (b *AzureBlobBackend) blobKey(key string) (string, error) {
+	if err := ValidateKey(key); err != nil {
+		return "", err
+	}
+	return key, nil
+}
+
 func (b *AzureBlobBackend) Write(ctx context.Context, path string, data []byte) error {
 	return b.WriteReader(ctx, path, bytes.NewReader(data), int64(len(data)))
 }
 
 // WriteReader writes data from a reader to Azure Blob Storage
 func (b *AzureBlobBackend) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) error {
+	key, err := b.blobKey(path)
+	if err != nil {
+		return err
+	}
 	start := time.Now()
 
 	// Determine content type
@@ -164,9 +181,9 @@ func (b *AzureBlobBackend) WriteReader(ctx context.Context, path string, reader 
 		contentType = "application/vnd.apache.parquet"
 	}
 
-	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlockBlobClient(path)
+	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlockBlobClient(key)
 
-	_, err := blobClient.UploadStream(ctx, reader, &azblob.UploadStreamOptions{
+	_, err = blobClient.UploadStream(ctx, reader, &azblob.UploadStreamOptions{
 		HTTPHeaders: &blob.HTTPHeaders{
 			BlobContentType: &contentType,
 		},
@@ -203,7 +220,11 @@ func (b *AzureBlobBackend) WriteReader(ctx context.Context, path string, reader 
 
 // Read reads data from Azure Blob Storage
 func (b *AzureBlobBackend) Read(ctx context.Context, path string) ([]byte, error) {
-	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(path)
+	key, err := b.blobKey(path)
+	if err != nil {
+		return nil, err
+	}
+	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(key)
 
 	resp, err := blobClient.DownloadStream(ctx, nil)
 	if err != nil {
@@ -232,7 +253,11 @@ func (b *AzureBlobBackend) Read(ctx context.Context, path string) ([]byte, error
 
 // ReadTo reads data from Azure Blob Storage and writes to a writer
 func (b *AzureBlobBackend) ReadTo(ctx context.Context, path string, writer io.Writer) error {
-	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(path)
+	key, err := b.blobKey(path)
+	if err != nil {
+		return err
+	}
+	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(key)
 
 	resp, err := blobClient.DownloadStream(ctx, nil)
 	if err != nil {
@@ -262,7 +287,11 @@ func (b *AzureBlobBackend) ReadTo(ctx context.Context, path string, writer io.Wr
 // offset and writes to writer. Uses blob.HTTPRange to skip already-transferred
 // bytes. offset=0 fetches the full blob without a Range header.
 func (b *AzureBlobBackend) ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error {
-	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(path)
+	key, err := b.blobKey(path)
+	if err != nil {
+		return err
+	}
+	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(key)
 
 	var opts *blob.DownloadStreamOptions
 	if offset > 0 {
@@ -296,7 +325,11 @@ func (b *AzureBlobBackend) ReadToAt(ctx context.Context, path string, writer io.
 
 // StatFile returns the byte size of the Azure blob at path, or -1 if not found.
 func (b *AzureBlobBackend) StatFile(ctx context.Context, path string) (int64, error) {
-	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(path)
+	key, err := b.blobKey(path)
+	if err != nil {
+		return 0, err
+	}
+	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(key)
 
 	resp, err := blobClient.GetProperties(ctx, nil)
 	if err != nil {
@@ -313,6 +346,10 @@ func (b *AzureBlobBackend) StatFile(ctx context.Context, path string) (int64, er
 
 // List lists blobs with the given prefix
 func (b *AzureBlobBackend) List(ctx context.Context, prefix string) ([]string, error) {
+	if err := ValidateListPrefix(prefix); err != nil {
+		return nil, err
+	}
+
 	var blobs []string
 
 	containerClient := b.client.ServiceClient().NewContainerClient(b.containerName)
@@ -332,6 +369,11 @@ func (b *AzureBlobBackend) List(ctx context.Context, prefix string) ([]string, e
 
 		for _, blobItem := range page.Segment.BlobItems {
 			if blobItem.Name != nil {
+				// See S3Backend.List: a listing never returns a key this
+				// backend would refuse (#743).
+				if ValidateKey(*blobItem.Name) != nil {
+					continue
+				}
 				blobs = append(blobs, *blobItem.Name)
 			}
 		}
@@ -342,9 +384,13 @@ func (b *AzureBlobBackend) List(ctx context.Context, prefix string) ([]string, e
 
 // Delete deletes a blob from Azure Blob Storage
 func (b *AzureBlobBackend) Delete(ctx context.Context, path string) error {
-	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(path)
+	key, err := b.blobKey(path)
+	if err != nil {
+		return err
+	}
+	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(key)
 
-	_, err := blobClient.Delete(ctx, nil)
+	_, err = blobClient.Delete(ctx, nil)
 	if err != nil {
 		// Check if it's a "not found" error - that's okay
 		if isAzureNotFoundError(err) {
@@ -428,9 +474,13 @@ func (b *AzureBlobBackend) DeleteBatch(ctx context.Context, paths []string) erro
 
 // Exists checks if a blob exists in Azure Blob Storage
 func (b *AzureBlobBackend) Exists(ctx context.Context, path string) (bool, error) {
-	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(path)
+	key, err := b.blobKey(path)
+	if err != nil {
+		return false, err
+	}
+	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(key)
 
-	_, err := blobClient.GetProperties(ctx, nil)
+	_, err = blobClient.GetProperties(ctx, nil)
 	if err != nil {
 		if isAzureNotFoundError(err) {
 			return false, nil
@@ -548,6 +598,11 @@ func (b *AzureBlobBackend) ListObjects(ctx context.Context, prefix string) ([]Ob
 
 		for _, blobItem := range page.Segment.BlobItems {
 			if blobItem.Name != nil {
+				// See S3Backend.List: a listing never returns a key this
+				// backend would refuse (#743).
+				if ValidateKey(*blobItem.Name) != nil {
+					continue
+				}
 				info := ObjectInfo{
 					Path: *blobItem.Name,
 				}

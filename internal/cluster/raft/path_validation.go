@@ -63,6 +63,19 @@ var (
 //
 // Checks are ordered from cheapest to most expensive so the common
 // "happy path" early-returns at the first emptiness check.
+//
+// DELIBERATELY NOT storage.ValidateKey, even though this is looser than that
+// contract in several ways (#743): it permits a trailing separator, a "."
+// segment, an empty interior segment, a backslash anywhere but index 0, 4096
+// bytes rather than 1024, and has no per-segment bound.
+//
+// This function runs inside FSM Apply, which includes log REPLAY. Tightening it
+// means a node replaying an entry an older binary accepted would now reject it,
+// so two nodes on different versions would build different state from the same
+// log. That is a correctness hazard strictly worse than the looseness, and it
+// is why the gap is closed at the consumer instead: a storage call that returns
+// storage.ErrInvalidPath is permanent, and callers driving replication or
+// cleanup loops must quarantine rather than retry (#747).
 func ValidateManifestPath(path string) error {
 	if path == "" {
 		return ErrPathEmpty

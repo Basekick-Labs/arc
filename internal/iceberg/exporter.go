@@ -544,6 +544,13 @@ func (e *Exporter) pruneOldVersionFiles(ctx context.Context, tbl *icetable.Table
 	if !ok {
 		return
 	}
+	// A metadata location directly under the warehouse root gives dirKey "."
+	// or "", so dirKey+"/" would be "./" or "/". Both listed empty before the
+	// storage key contract existed; both are refused by it now (#743). There
+	// is nothing to prune in that shape, so skip rather than report.
+	if dirKey == "" || dirKey == "." {
+		return
+	}
 	keys, err := e.backend.List(ctx, dirKey+"/")
 	if err != nil {
 		return
@@ -897,7 +904,11 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 	// the backend so local and object-store warehouses behave alike.
 	if e.backend != nil {
 		nsDirURI := e.warehouse + "/" + e.nsPrefix + "_" + database + ".db"
-		if relDir, ok := e.warehouseRelKey(nsDirURI); ok {
+		// relDir == "" means the namespace directory IS the storage root, so
+		// relDir+"/" would be "/", which the storage key contract refuses
+		// (#743). It listed empty before, and enumerating the whole root to
+		// delete it is not what this is for, so skip it.
+		if relDir, ok := e.warehouseRelKey(nsDirURI); ok && relDir != "" {
 			keys, err := e.backend.List(ctx, relDir+"/")
 			if err != nil && firstErr == nil {
 				firstErr = fmt.Errorf("list warehouse metadata: %w", err)
