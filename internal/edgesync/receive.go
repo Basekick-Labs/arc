@@ -710,6 +710,17 @@ func validateSyncPath(p string) error {
 			return fmt.Errorf("edgesync: path %q has a segment starting with a dot", p)
 		}
 	}
+	// Bounded so a spoke cannot send a path that passes here, passes the
+	// storage key contract, and then fails only once the ".part" staging
+	// suffix is appended (#743). The headroom is the suffix length.
+	if len(p) > storage.MaxKeyLen-len(storage.PartSuffix) {
+		return fmt.Errorf("edgesync: path is %d bytes, over the %d-byte limit", len(p), storage.MaxKeyLen-len(storage.PartSuffix))
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if len(seg) > storage.MaxKeySegmentLen-len(storage.PartSuffix) {
+			return fmt.Errorf("edgesync: path %q has a %d-byte segment, over the %d-byte limit", p, len(seg), storage.MaxKeySegmentLen-len(storage.PartSuffix))
+		}
+	}
 	if !strings.HasSuffix(p, ".parquet") {
 		// The sync unit is an immutable Parquet file. Anything else is either
 		// a mistake or an attempt to write something the query layer would

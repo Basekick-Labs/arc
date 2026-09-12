@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"errors"
 	"math/rand"
 	"path/filepath"
@@ -23,13 +24,10 @@ func newPathTestBackend(t *testing.T) *LocalBackend {
 	return b
 }
 
-func TestCheckStoragePath(t *testing.T) {
+func TestValidateKey(t *testing.T) {
 	accepted := []struct{ name, path string }{
-		{"root", ""},
 		{"single segment", "cpu"},
 		{"partition path", "default/cpu/2026/09/12/07/data.parquet"},
-		{"list prefix with trailing slash", "databases/"},
-		{"single segment with trailing slash", "default/"},
 		// Ordinary filenames that merely contain dots. The old fold collapsed
 		// the first onto "_foo", colliding it with an unrelated key.
 		{"leading dots in a segment", "default/..foo/data.parquet"},
@@ -39,8 +37,8 @@ func TestCheckStoragePath(t *testing.T) {
 	}
 	for _, tt := range accepted {
 		t.Run("accept/"+tt.name, func(t *testing.T) {
-			if err := checkStoragePath(tt.path); err != nil {
-				t.Errorf("checkStoragePath(%q) = %v, want accepted", tt.path, err)
+			if err := ValidateKey(tt.path); err != nil {
+				t.Errorf("ValidateKey(%q) = %v, want accepted", tt.path, err)
 			}
 		})
 	}
@@ -63,8 +61,8 @@ func TestCheckStoragePath(t *testing.T) {
 	}
 	for _, tt := range rejected {
 		t.Run("reject/"+tt.name, func(t *testing.T) {
-			if err := checkStoragePath(tt.path); err == nil {
-				t.Errorf("checkStoragePath(%q) was accepted", tt.path)
+			if err := ValidateKey(tt.path); err == nil {
+				t.Errorf("ValidateKey(%q) was accepted", tt.path)
 			}
 		})
 	}
@@ -73,16 +71,16 @@ func TestCheckStoragePath(t *testing.T) {
 // TestValidatePathMatchesFilepathJoin is the regression net for dropping
 // filepath.Join. For every key the validator accepts, the result must be
 // byte-identical to what the previous implementation produced.
-func TestCheckStoragePathErrorsAreIdentifiable(t *testing.T) {
+func TestValidateKeyErrorsAreIdentifiable(t *testing.T) {
 	// Callers driving cleanup loops must be able to tell a permanent rejection
 	// from a transient I/O failure, or they retry the same key forever.
 	for _, p := range []string{"/abs", "a/../b", "a//b", "a\x00b", `a\b`} {
-		err := checkStoragePath(p)
+		err := ValidateKey(p)
 		if err == nil {
-			t.Fatalf("checkStoragePath(%q) was accepted", p)
+			t.Fatalf("ValidateKey(%q) was accepted", p)
 		}
 		if !errors.Is(err, ErrInvalidPath) {
-			t.Errorf("checkStoragePath(%q) = %v, which does not match ErrInvalidPath", p, err)
+			t.Errorf("ValidateKey(%q) = %v, which does not match ErrInvalidPath", p, err)
 		}
 	}
 }
@@ -110,11 +108,8 @@ func TestValidatePathMatchesFilepathJoin(t *testing.T) {
 	b := newPathTestBackend(t)
 
 	paths := []string{
-		"",
 		"cpu",
 		"default/cpu/2026/09/12/07/data.parquet",
-		"databases/",
-		"default/",
 		"default/..foo/data.parquet",
 		"default/a..b/data.parquet",
 		"default/.hidden/data.parquet",
@@ -222,5 +217,67 @@ func TestStorageKeysAreInjective(t *testing.T) {
 	}
 	if len(seen) != len(keys) {
 		t.Errorf("%d keys resolved to %d locations", len(keys), len(seen))
+	}
+}
+
+// TestValidateListPathMatchesFilepathJoin covers the two spellings that are
+// legitimate for a prefix and not for a key.
+func TestValidateListPathMatchesFilepathJoin(t *testing.T) {
+	b := newPathTestBackend(t)
+	for _, p := range []string{"", "databases/", "default/", "default/cpu", "default/cpu/"} {
+		got, err := b.validateListPath(p)
+		if err != nil {
+			t.Fatalf("validateListPath(%q) = %v, want accepted", p, err)
+		}
+		if want := filepath.Join(b.basePath, p); got != want {
+			t.Errorf("validateListPath(%q) = %q, want %q", p, got, want)
+		}
+	}
+	for _, p := range []string{"/", "a//b", "a/../b", "a/./b", `a\b`, "a\x00b"} {
+		if _, err := b.validateListPath(p); err == nil {
+			t.Errorf("validateListPath(%q) was accepted", p)
+		}
+	}
+}
+
+// TestKeysAreInjective is the contract, stated as the property that matters.
+//
+// #741 asserted matching accept/reject sets, which cannot see this: every
+// backend accepted both "coll" and "coll/", and on local they were ONE file.
+// Two keys, one object, first payload silently lost. What differs between a
+// correct and a broken implementation is the mapping, not the verdict, so the
+// mapping is what this asserts.
+func TestKeysAreInjective(t *testing.T) {
+	b := newPathTestBackend(t)
+	ctx := context.Background()
+
+	// Every pair here named one location under some implementation.
+	keys := []string{
+		"coll", "coll/sub",
+		"default/a..b/x.parquet", "default/a_b/x.parquet",
+		"default/..foo/x.parquet", "default/_foo/x.parquet",
+		"rocket..01/x.parquet", "rocket_01/x.parquet",
+	}
+
+	seen := make(map[string]string, len(keys))
+	for _, k := range keys {
+		resolved, err := b.validatePath(k)
+		if err != nil {
+			t.Fatalf("validatePath(%q) = %v; all of these are legitimate keys", k, err)
+		}
+		if prev, clash := seen[resolved]; clash {
+			t.Errorf("keys %q and %q both resolve to %q", prev, k, resolved)
+		}
+		seen[resolved] = k
+	}
+
+	// And the spelling that actually collided: prove it through the backend,
+	// not just the resolver, because the resolver is what was wrong.
+	if err := b.Write(ctx, "coll2", []byte("no-slash")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := b.Write(ctx, "coll2/", []byte("trailing-slash")); err == nil {
+		got, _ := b.Read(ctx, "coll2")
+		t.Fatalf("Write(%q) was accepted and Read(%q) now returns %q; two keys named one object", "coll2/", "coll2", got)
 	}
 }

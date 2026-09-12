@@ -163,7 +163,7 @@ func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) erro
 // is discoverable by StatFile and ReadToAt, enabling the puller to resume from
 // the last committed byte on the next attempt.
 func partPath(fullPath string) string {
-	return fullPath + ".part"
+	return fullPath + PartSuffix
 }
 
 // WriteReader writes data from a reader to the specified path (for large files).
@@ -428,7 +428,7 @@ func (b *LocalBackend) AppendReader(ctx context.Context, path string, reader io.
 // List lists all objects with the given prefix
 func (b *LocalBackend) List(ctx context.Context, prefix string) ([]string, error) {
 	// Reject the prefix unless it names something inside the root
-	searchPath, err := b.validatePath(prefix)
+	searchPath, err := b.validateListPath(prefix)
 	if err != nil {
 		return nil, fmt.Errorf("invalid prefix: %w", err)
 	}
@@ -550,7 +550,7 @@ func (b *LocalBackend) ConfigJSON() string {
 // Implements the DirectoryLister interface.
 func (b *LocalBackend) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
 	// Reject the prefix unless it names something inside the root
-	searchPath, err := b.validatePath(prefix)
+	searchPath, err := b.validateListPath(prefix)
 	if err != nil {
 		return nil, fmt.Errorf("invalid prefix: %w", err)
 	}
@@ -622,7 +622,7 @@ func (b *LocalBackend) RemoveDirectory(ctx context.Context, path string) error {
 // Implements the ObjectLister interface.
 func (b *LocalBackend) ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error) {
 	// Reject the prefix unless it names something inside the root
-	searchPath, err := b.validatePath(prefix)
+	searchPath, err := b.validateListPath(prefix)
 	if err != nil {
 		return nil, fmt.Errorf("invalid prefix: %w", err)
 	}
@@ -692,6 +692,11 @@ func (b *LocalBackend) ListObjects(ctx context.Context, prefix string) ([]Object
 	return results, nil
 }
 
+// PartSuffix is appended to build the staging file a local write lands in
+// before being renamed into place. Exported so validators that bound a key's
+// length can leave headroom for it (#743).
+const PartSuffix = ".part"
+
 // ErrInvalidPath marks a key that names nothing inside the backend root. It is
 // permanent: retrying with the same key can never succeed, so callers driving
 // cleanup or reconciliation loops should quarantine the entry rather than
@@ -702,67 +707,113 @@ var ErrInvalidPath = errors.New("storage: invalid path")
 // "/"-separated by contract on every backend; this is the on-disk separator.
 const storagePathSeparator = string(filepath.Separator)
 
-// checkStoragePath reports whether path is a clean, relative location inside
-// the backend root.
+// MaxKeyLen bounds a storage key. 1024 bytes is the S3 object-key limit, which
+// is the tightest of the three backends at whole-key granularity.
+const MaxKeyLen = 1024
+
+// MaxKeySegmentLen bounds one "/"-separated component. 255 bytes is the POSIX
+// filename limit, so a longer segment cannot be stored locally at all and a key
+// carrying one is refused with a message instead of ENAMETOOLONG from the
+// syscall.
+const MaxKeySegmentLen = 255
+
+// ValidateKey reports whether key names exactly one object.
 //
-// It REJECTS rather than repairs, which is the whole point. The previous
-// implementation rewrote its input, folding every ".." to "_" and stripping NUL
-// bytes, and claimed that prevented traversal. It did not: containment was
-// enforced separately. What the rewrite did do was make the mapping from
-// requested key to stored key many-to-one, so two different keys could name one
-// file. That produced #574 (source paths) and #737 (spoke IDs), each closed by
-// teaching one caller not to send "..", which leaves the next caller to
-// rediscover it. Rejecting makes the mapping injective for every caller at once.
+// This is the contract every Backend implementation enforces, and it exists so
+// the mapping from key to stored object is INJECTIVE: two different keys must
+// never name one object. Non-injective mappings are what produced #574 (source
+// paths), #737 (spoke IDs) and #741 (the local ".."-to-"_" fold), each closed
+// by teaching one caller to behave and each leaving the next caller to
+// rediscover it.
 //
-// Deliberately permitted:
+// Rejected, and why each is two spellings of one location rather than mere
+// tidiness:
 //
-//   - "" means the root. Listing callers pass it to walk everything.
-//   - A single trailing "/", which list prefixes use constantly ("databases/",
-//     database+"/"). validatePath strips it so the result stays canonical.
-//   - Segments that merely contain dots, such as "..foo" or "a..b". They are
-//     ordinary filenames, not traversal. The old fold collapsed "..foo" onto
-//     "_foo", which is the same collision one level down.
+//   - "" and a trailing "/". "coll" and "coll/" resolve to one file on local
+//     storage, and on S3 a trailing slash is a distinct "directory marker"
+//     object, so the two backends disagree about which it even is. Use
+//     ValidateListPrefix for list prefixes, which is where those spellings are
+//     legitimate.
+//   - A leading "/". MinIO strips it, so "/a/x" and "a/x" are one object there,
+//     while S3 and Azure keep them distinct. Same key, three outcomes.
+//   - "." and ".." segments, and an empty interior segment ("a//b"). MinIO
+//     refuses all three with a 400; Azure stores them literally; local resolved
+//     them by folding until #741.
+//   - A backslash. On Azure "a\b" and "a/b" are ONE blob, verified against
+//     Azurite, so this is a live collision rather than a Windows-separator
+//     precaution.
+//   - NUL bytes, and lengths past MaxKeyLen or MaxKeySegmentLen.
+//
+// Deliberately ACCEPTED: segments that merely contain dots, such as "..foo" or
+// "a..b". They name one object on every backend. The old local fold collapsed
+// "..foo" onto "_foo", which was the same collision one level down.
 //
 // One pass, no allocation, no strings.Split.
-func checkStoragePath(path string) error {
-	if path == "" {
+func ValidateKey(key string) error {
+	if key == "" {
+		return fmt.Errorf("%w: key is empty", ErrInvalidPath)
+	}
+	if key[len(key)-1] == '/' {
+		return fmt.Errorf("%w: %q ends in a separator, which names the same object as %q", ErrInvalidPath, key, key[:len(key)-1])
+	}
+	return validateKeyBody(key)
+}
+
+// ValidateListPrefix reports whether prefix is usable to enumerate keys.
+//
+// Looser than ValidateKey in exactly two ways, both of which callers rely on:
+// "" means "everything", and a single trailing "/" scopes to a directory
+// ("databases/", database+"/"). Neither can name an object, so neither
+// threatens injectivity.
+//
+// Note the backends disagree about what a prefix means, and this does not
+// change that: on S3 it is a true string prefix, so "default/cp" is meaningful,
+// while on local it selects a directory to walk.
+func ValidateListPrefix(prefix string) error {
+	if prefix == "" {
 		return nil
 	}
-	if path[0] == '/' {
-		return fmt.Errorf("%w: %q must be relative to the backend root", ErrInvalidPath, path)
+	if prefix == "/" {
+		return fmt.Errorf("%w: %q is not a relative prefix; use \"\" for everything", ErrInvalidPath, prefix)
+	}
+	if prefix[len(prefix)-1] == '/' {
+		prefix = prefix[:len(prefix)-1]
+	}
+	return validateKeyBody(prefix)
+}
+
+// validateKeyBody holds the rules common to keys and list prefixes. Callers
+// have already dealt with emptiness and any trailing separator.
+func validateKeyBody(p string) error {
+	if len(p) > MaxKeyLen {
+		return fmt.Errorf("%w: key is %d bytes, over the %d-byte limit", ErrInvalidPath, len(p), MaxKeyLen)
+	}
+	if p[0] == '/' {
+		return fmt.Errorf("%w: %q must be relative to the backend root", ErrInvalidPath, p)
 	}
 	start := 0
-	for i := 0; i <= len(path); i++ {
-		if i < len(path) {
-			c := path[i]
+	for i := 0; i <= len(p); i++ {
+		if i < len(p) {
+			c := p[i]
 			if c == 0 {
 				return fmt.Errorf("%w: contains a NUL byte", ErrInvalidPath)
 			}
-			// Backslash is rejected rather than treated as an ordinary byte.
-			// Keys are "/"-separated on every backend, and on a platform whose
-			// OS also treats backslash as a separator, a segment built from
-			// them would pass a "/"-only segment scan whole and then escape
-			// once joined. Rejecting here
-			// keeps the validator and the join agreeing about what a separator
-			// is. internal/edgesync/receive.go already rejects it for the same
-			// reason.
 			if c == '\\' {
-				return fmt.Errorf("%w: %q contains a backslash", ErrInvalidPath, path)
+				return fmt.Errorf("%w: %q contains a backslash, which Azure treats as a separator", ErrInvalidPath, p)
 			}
 			if c != '/' {
 				continue
 			}
 		}
-		switch path[start:i] {
+		seg := p[start:i]
+		switch seg {
 		case "":
-			// The only empty segment allowed is the one a trailing slash
-			// produces. An interior one means "a//b", which is two spellings
-			// of one location.
-			if i != len(path) {
-				return fmt.Errorf("%w: %q contains an empty segment", ErrInvalidPath, path)
-			}
+			return fmt.Errorf("%w: %q contains an empty segment", ErrInvalidPath, p)
 		case ".", "..":
-			return fmt.Errorf("%w: %q contains a %q segment", ErrInvalidPath, path, path[start:i])
+			return fmt.Errorf("%w: %q contains a %q segment", ErrInvalidPath, p, seg)
+		}
+		if len(seg) > MaxKeySegmentLen {
+			return fmt.Errorf("%w: %q has a %d-byte segment, over the %d-byte limit", ErrInvalidPath, p, len(seg), MaxKeySegmentLen)
 		}
 		start = i + 1
 	}
@@ -773,8 +824,8 @@ func checkStoragePath(path string) error {
 // key that does not name something inside the backend root.
 //
 // There is no filepath.Join, Abs or Rel here, and that is safe rather than
-// merely fast. checkStoragePath has already established that the key is
-// relative, clean and free of ".." segments, and basePath is absolute and clean
+// merely fast. The validator has already established that the key is relative,
+// clean and free of ".." segments, and basePath is absolute and clean
 // (NewLocalBackend applies filepath.Abs). Join's only contribution was Clean,
 // on input proven not to need it; Abs re-cleaned an already absolute path; and
 // Rel recomputed a containment property that concatenation now guarantees by
@@ -787,17 +838,23 @@ func checkStoragePath(path string) error {
 //
 // Symlinks are not resolved, exactly as before. A symlink inside the root that
 // points outside it escapes, and did under the previous implementation too.
-func (b *LocalBackend) validatePath(path string) (string, error) {
-	if err := checkStoragePath(path); err != nil {
+func (b *LocalBackend) validatePath(key string) (string, error) {
+	if err := ValidateKey(key); err != nil {
 		return "", err
 	}
-	if path == "" {
+	return b.pathPrefix + key, nil
+}
+
+// validateListPath resolves a list prefix to the directory it names.
+func (b *LocalBackend) validateListPath(prefix string) (string, error) {
+	if err := ValidateListPrefix(prefix); err != nil {
+		return "", err
+	}
+	if prefix == "" {
 		return b.basePath, nil
 	}
-	// Match what filepath.Join returned: a trailing slash is accepted on the
-	// way in and absent from the result.
-	if path[len(path)-1] == '/' {
-		path = path[:len(path)-1]
+	if prefix[len(prefix)-1] == '/' {
+		prefix = prefix[:len(prefix)-1]
 	}
-	return b.pathPrefix + path, nil
+	return b.pathPrefix + prefix, nil
 }

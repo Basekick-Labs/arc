@@ -2,38 +2,33 @@ package storage
 
 import "testing"
 
-func TestSanitizeS3Prefix(t *testing.T) {
-	tests := []struct {
-		name   string
-		input  string
-		expect string
-	}{
-		{"empty", "", ""},
-		{"whitespace only", "   ", ""},
-		{"simple path", "instances/abc123", "instances/abc123/"},
-		{"with trailing slash", "instances/abc123/", "instances/abc123/"},
-		{"with leading slash", "/instances/abc123", "instances/abc123/"},
-		{"with both slashes", "/instances/abc123/", "instances/abc123/"},
-		{"single segment", "prefix", "prefix/"},
-		{"path traversal rejected", "instances/../etc", ""},
-		{"double dot in name rejected", "instances/..hidden", ""},
-		{"nested path", "org/tenant/data", "org/tenant/data/"},
-		{"with hyphens and underscores", "my-org/tenant_1", "my-org/tenant_1/"},
-		{"with dots", "org.name/v1.0", "org.name/v1.0/"},
-		{"sql injection rejected", "tenant'; DROP TABLE --", ""},
-		{"single quotes rejected", "tenant's/data", ""},
-		{"semicolon rejected", "tenant;data", ""},
-		{"spaces rejected", "tenant name/data", ""},
-		{"special chars rejected", "tenant@#$/data", ""},
+func TestValidateS3Prefix(t *testing.T) {
+	accepted := []struct{ in, want string }{
+		{"", ""},
+		{"instances/abc123", "instances/abc123/"},
+		{"instances/abc123/", "instances/abc123/"},
+		{"  tenant1  ", "tenant1/"},
+		{"a..b", "a..b/"}, // a legitimate name the old ".." substring check destroyed
+	}
+	for _, tt := range accepted {
+		got, err := ValidateS3Prefix(tt.in)
+		if err != nil {
+			t.Errorf("ValidateS3Prefix(%q) = %v, want %q", tt.in, err, tt.want)
+			continue
+		}
+		if got != tt.want {
+			t.Errorf("ValidateS3Prefix(%q) = %q, want %q", tt.in, got, tt.want)
+		}
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := SanitizeS3Prefix(tt.input)
-			if got != tt.expect {
-				t.Errorf("SanitizeS3Prefix(%q) = %q, want %q", tt.input, got, tt.expect)
-			}
-		})
+	// Every one of these came out of the OLD function's success path and then
+	// broke every write, or silently relocated the deployment to the bucket
+	// root. They must fail at construction instead.
+	rejected := []string{"/", "//", "a//b", ".", "a/./b", "a/../b", "///a///b///", "a b", `a\b`, "a\x00b"}
+	for _, in := range rejected {
+		if got, err := ValidateS3Prefix(in); err == nil {
+			t.Errorf("ValidateS3Prefix(%q) = %q, want an error", in, got)
+		}
 	}
 }
 
@@ -45,19 +40,34 @@ func TestS3BackendPrefixedKey(t *testing.T) {
 		expect string
 	}{
 		{"mydb/cpu/2025/01/file.parquet", "instances/abc123/mydb/cpu/2025/01/file.parquet"},
-		{"", "instances/abc123/"},
 	}
 
 	for _, tt := range tests {
-		got := backend.prefixedKey(tt.input)
+		got, err := backend.prefixedKey(tt.input)
+		if err != nil {
+			t.Fatalf("prefixedKey(%q) = %v", tt.input, err)
+		}
 		if got != tt.expect {
 			t.Errorf("prefixedKey(%q) = %q, want %q", tt.input, got, tt.expect)
 		}
 	}
 
+	// "" is not a key. It named the prefix directory itself, which is an
+	// object nothing can address (#743), and it reaches the SDK as an empty
+	// Key. It remains valid as a LIST prefix.
+	if _, err := backend.prefixedKey(""); err == nil {
+		t.Error(`prefixedKey("") was accepted; an empty key names no object`)
+	}
+	if got, err := backend.prefixedListPrefix(""); err != nil || got != "instances/abc123/" {
+		t.Errorf(`prefixedListPrefix("") = %q, %v; want the configured prefix`, got, err)
+	}
+
 	// No prefix configured
 	noPrefix := &S3Backend{prefix: ""}
-	got := noPrefix.prefixedKey("mydb/cpu/file.parquet")
+	got, err := noPrefix.prefixedKey("mydb/cpu/file.parquet")
+	if err != nil {
+		t.Fatalf("prefixedKey: %v", err)
+	}
 	if got != "mydb/cpu/file.parquet" {
 		t.Errorf("prefixedKey with no prefix = %q, want %q", got, "mydb/cpu/file.parquet")
 	}
