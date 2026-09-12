@@ -74,6 +74,44 @@ type AppendingBackend interface {
 	AppendReader(ctx context.Context, path string, reader io.Reader, appendSize int64) error
 }
 
+// StagingInspector exposes a backend's in-progress write staging area.
+//
+// Backends that stage a write before committing it (only LocalBackend does)
+// leave a partial file behind when a transfer is interrupted, which is what
+// lets the cluster puller and the edge-sync receiver resume from the last
+// committed byte instead of refetching. Those callers need to size, hash and
+// discard that partial.
+//
+// They used to do it by appending ".part" to the key and calling StatFile,
+// ReadTo and Delete, which reached around the abstraction and, worse, put the
+// staging file in the same namespace as committed objects: the staging file of
+// key "x" WAS the committed object "x.part", so writing one destroyed the
+// other (#744). These methods name the staging area explicitly so the key
+// namespace can reserve it.
+//
+// A backend that does not stage does not implement this. Callers type-assert
+// and treat a failed assertion as "there is never a partial", which is exactly
+// true for S3 and Azure.
+type StagingInspector interface {
+	Backend
+
+	// StagedSize returns the byte size of the staged partial for key, or -1
+	// (with a nil error) when there is none.
+	StagedSize(ctx context.Context, key string) (int64, error)
+
+	// ReadStaged writes the staged partial for key to writer.
+	ReadStaged(ctx context.Context, key string, writer io.Writer) error
+
+	// DeleteStaged removes the staged partial for key. Removing one that does
+	// not exist is not an error.
+	DeleteStaged(ctx context.Context, key string) error
+
+	// ListStaged returns metadata for staged partials whose key has the given
+	// prefix, so a caller can reclaim abandoned ones. Staged partials are
+	// invisible to List by design, so this is the only way to find them.
+	ListStaged(ctx context.Context, prefix string) ([]ObjectInfo, error)
+}
+
 // DirectoryLister lists immediate subdirectories at a prefix.
 // This is useful for SHOW DATABASES/TABLES commands.
 type DirectoryLister interface {

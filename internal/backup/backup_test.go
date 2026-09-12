@@ -510,8 +510,12 @@ func TestCopyDataFiles_ProgressUsesActualBytes(t *testing.T) {
 // through, reproducing what LocalBackend does on a transport error: it consumes
 // some of the reader, leaves a "<path>.part" staging file behind, and returns an
 // error. Delete is delegated so cleanup can be observed.
+// Embeds the CONCRETE backend, not the storage.Backend interface. Embedding the
+// interface would drop the optional StagingInspector methods, so the staging
+// cleanup under test would silently no-op and the test would pass while doing
+// nothing (#744).
 type partialWriteBackend struct {
-	storage.Backend
+	*storage.LocalBackend
 	dir           string
 	deleteCalls   []string
 	failWriteWith error
@@ -519,7 +523,7 @@ type partialWriteBackend struct {
 
 func (b *partialWriteBackend) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) error {
 	if b.failWriteWith == nil {
-		return b.Backend.WriteReader(ctx, path, reader, size)
+		return b.LocalBackend.WriteReader(ctx, path, reader, size)
 	}
 	// Mimic LocalBackend: stage partial bytes to "<path>.part", then fail and
 	// deliberately leave the staging file in place.
@@ -538,7 +542,7 @@ func (b *partialWriteBackend) WriteReader(ctx context.Context, path string, read
 
 func (b *partialWriteBackend) Delete(ctx context.Context, path string) error {
 	b.deleteCalls = append(b.deleteCalls, path)
-	return b.Backend.Delete(ctx, path)
+	return b.LocalBackend.Delete(ctx, path)
 }
 
 // A failed backup write must not leave an orphaned ".part" staging file in
@@ -556,7 +560,7 @@ func TestStreamBackupFile_CleansUpPartFileOnWriteFailure(t *testing.T) {
 
 	backupDir := t.TempDir()
 	backupBackend := &partialWriteBackend{
-		Backend:       mustLocalBackend(t, backupDir, logger),
+		LocalBackend:  mustLocalBackend(t, backupDir, logger),
 		dir:           backupDir,
 		failWriteWith: fmt.Errorf("simulated transport failure"),
 	}
@@ -578,9 +582,14 @@ func TestStreamBackupFile_CleansUpPartFileOnWriteFailure(t *testing.T) {
 		t.Errorf("orphaned .part file left in backup storage: %s (stat err: %v)", staging, statErr)
 	}
 
-	// And cleanup must have targeted exactly the staging path.
-	if len(backupBackend.deleteCalls) != 1 || backupBackend.deleteCalls[0] != destPath+".part" {
-		t.Errorf("expected cleanup of %q, got delete calls %v", destPath+".part", backupBackend.deleteCalls)
+	// And the backend must agree there is no staged partial left. Asserted
+	// through the staging API rather than by counting Delete calls on a
+	// hand-built ".part" key: that key is reserved now (#744), so a Delete of
+	// it would be refused rather than performed.
+	if n, err := backupBackend.StagedSize(ctx, destPath); err != nil {
+		t.Errorf("StagedSize(%q): %v", destPath, err)
+	} else if n >= 0 {
+		t.Errorf("staged partial for %q survived cleanup (%d bytes)", destPath, n)
 	}
 }
 
@@ -597,7 +606,7 @@ func TestStreamBackupFile_CleanupFailureDoesNotMaskWriteError(t *testing.T) {
 
 	backupDir := t.TempDir()
 	backupBackend := &deleteFailingBackend{
-		Backend:       mustLocalBackend(t, backupDir, logger),
+		LocalBackend:  mustLocalBackend(t, backupDir, logger),
 		failWriteWith: fmt.Errorf("simulated transport failure"),
 	}
 	m := &Manager{dataStorage: dataStorage, backupStorage: backupBackend, logger: logger}
@@ -620,8 +629,10 @@ func TestStreamBackupFile_CleanupFailureDoesNotMaskWriteError(t *testing.T) {
 	}
 }
 
+// Concrete embed, same reason as partialWriteBackend: the interface would drop
+// StagingInspector and the cleanup under test would no-op.
 type deleteFailingBackend struct {
-	storage.Backend
+	*storage.LocalBackend
 	failWriteWith error
 }
 
@@ -633,7 +644,12 @@ func (b *deleteFailingBackend) Delete(ctx context.Context, path string) error {
 	return fmt.Errorf("simulated cleanup failure")
 }
 
-func mustLocalBackend(t *testing.T, dir string, logger zerolog.Logger) storage.Backend {
+// DeleteStaged fails too, so the test still exercises "cleanup failed".
+func (b *deleteFailingBackend) DeleteStaged(ctx context.Context, key string) error {
+	return fmt.Errorf("simulated cleanup failure")
+}
+
+func mustLocalBackend(t *testing.T, dir string, logger zerolog.Logger) *storage.LocalBackend {
 	t.Helper()
 	b, err := storage.NewLocalBackend(dir, logger)
 	if err != nil {

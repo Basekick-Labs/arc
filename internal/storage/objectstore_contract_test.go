@@ -74,6 +74,11 @@ func TestS3RejectsNonInjectiveKeys(t *testing.T) {
 		// A trailing separator names a directory marker, not this object.
 		{"trailing separator", "db/cpu/"},
 		{"empty", ""},
+		// Reserved for local write staging (#744). Refused on every backend so
+		// a key stays portable, which does mean a pre-existing ".part" object
+		// on S3 or Azure is no longer addressable through Arc. Those backends
+		// never stage, so Arc cannot have written one.
+		{"reserved staging suffix", "contract/x.parquet.part"},
 	}
 	for _, tt := range rejected {
 		t.Run("reject/"+tt.name, func(t *testing.T) {

@@ -255,6 +255,54 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
 
 ## Bug fixes
 
+### A write could destroy an already-acknowledged write ([#744](https://github.com/Basekick-Labs/arc/issues/744))
+
+Local storage stages every streamed write at `{key}.part` and renames it into
+place on success. The staging file of key `x` was therefore the same file as the
+committed object `x.part`, and the two destroyed each other.
+
+Writing `x.parquet.part` returned success. The next write of `x.parquet` opened
+its staging file with truncate, wiped the committed object, and renamed it away,
+so the first key stopped existing. Three further orderings were worse: a
+committed `x.part` with no `x` present made size and range reads report the
+wrong object's bytes while existence checks said it was absent, which could make
+the cluster puller skip replicating a file that is not there; and an append
+could rename a committed object over an unrelated third key.
+
+The staging suffix is now reserved, so no key can name a staging file, and the
+callers that legitimately need a partial (edge-sync resume, backup cleanup)
+address it through an explicit interface rather than by spelling the suffix
+themselves. Staged partials are also hidden from listings, because a listing
+must never return a key the backend would refuse, and a new listing method
+exists so an abandoned partial can still be reclaimed rather than becoming
+invisible and permanent.
+
+This needed a key ending in `.part`, which Arc's own writers never produce, so
+it was reachable only by restoring a backup that contained an orphaned staging
+file.
+
+Two consequences worth knowing. Deleting a database now also reclaims any
+staged partial underneath it, which a failed upload could previously leave
+behind indefinitely, and which also kept the directory from being removed. And
+because the reservation applies to every backend so that a key stays portable,
+an object literally named `something.part` that already exists in an S3 bucket
+or Azure container is no longer readable or deletable through Arc. Arc cannot
+have written one, since only local storage stages; remove it with your provider's
+own tooling if you have one.
+
+### Compaction manifests no longer exceed the storage key limit ([#744](https://github.com/Basekick-Labs/arc/issues/744))
+
+A compaction manifest filename repeated the partition path that its job id
+already contained, and the database three times over. With a 30-character
+database and a 60-character measurement that produced a 270-byte filename, past
+the 255-byte limit a path component can have, so writing the manifest failed and
+compaction for that partition failed on every cycle. At the longest permitted
+names it reached 508 bytes.
+
+The filename is now the job id alone, which is already unique and already
+carries the partition. Nothing reads these names, so manifests written by an
+earlier version are still found and recovered, and no migration is needed.
+
 ### Every storage backend now enforces the same key contract ([#743](https://github.com/Basekick-Labs/arc/issues/743))
 
 The previous release made local storage refuse malformed keys

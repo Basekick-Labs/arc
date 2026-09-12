@@ -411,6 +411,13 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		}
 	}
 
+	// Reclaim staged partials under this prefix. They are invisible to List by
+	// design (#744), so nothing else would find them, and a leftover one also
+	// keeps the directory non-empty so RemoveDirectory below fails. The
+	// common source is an upload that failed after staging bytes, whose final
+	// key never existed, so the loop above never saw it.
+	deletedCount += reclaimStagedPartials(ctx, h.storage, name+"/", h.logger)
+
 	// Also delete the .arc-database marker file (not included in List due to hidden file filter)
 	markerPath := name + "/.arc-database"
 	if err := h.storage.Delete(ctx, markerPath); err == nil {
@@ -762,4 +769,34 @@ func (h *DatabasesHandler) dropIcebergCatalog(ctx context.Context, name string) 
 	} else {
 		h.logger.Info().Str("database", name).Msg("Iceberg catalog artifacts removed for dropped database")
 	}
+}
+
+// reclaimStagedPartials deletes write-staging partials under prefix and returns
+// how many were removed.
+//
+// Staged partials do not appear in List: a listing must never return a key the
+// backend would refuse (#743), and the staging suffix is reserved (#744). That
+// makes them unreachable through the ordinary delete loop, so a prefix-wide
+// delete has to ask for them explicitly or they survive the database that owned
+// them. Backends that do not stage have none, which is why a failed type
+// assertion is simply zero.
+func reclaimStagedPartials(ctx context.Context, backend storage.Backend, prefix string, logger zerolog.Logger) int {
+	si, ok := backend.(storage.StagingInspector)
+	if !ok {
+		return 0
+	}
+	staged, err := si.ListStaged(ctx, prefix)
+	if err != nil {
+		logger.Warn().Err(err).Str("prefix", prefix).Msg("Could not list staged partials to reclaim")
+		return 0
+	}
+	var removed int
+	for _, obj := range staged {
+		if err := si.DeleteStaged(ctx, obj.Path); err != nil {
+			logger.Warn().Err(err).Str("key", obj.Path).Msg("Failed to reclaim staged partial")
+			continue
+		}
+		removed++
+	}
+	return removed
 }

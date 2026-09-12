@@ -402,10 +402,6 @@ func (m *Manager) streamBackupFile(ctx context.Context, srcPath, destPath string
 	return size, nil
 }
 
-// partSuffix mirrors the staging suffix LocalBackend.WriteReader uses for
-// in-progress writes. Kept in sync with internal/storage/local.go#partPath.
-const partSuffix = ".part"
-
 // cleanupPartialWrite removes the staging file a failed WriteReader leaves behind.
 //
 // LocalBackend.WriteReader deliberately preserves "<path>.part" on failure so the
@@ -419,10 +415,17 @@ const partSuffix = ".part"
 // fails too (unwritable volume, storage unreachable). A cleanup failure must not
 // mask the real error, so it is logged at debug and discarded.
 func (m *Manager) cleanupPartialWrite(ctx context.Context, destPath string) {
-	stagingPath := destPath + partSuffix
-	if err := m.backupStorage.Delete(ctx, stagingPath); err != nil {
+	// Addressed through the staging API rather than by appending the suffix to
+	// the key. That suffix is reserved now, because the staging file of key
+	// "x" used to BE the committed object "x.part" (#744). A backend that does
+	// not stage never leaves a partial, so there is nothing to clean up.
+	si, ok := m.backupStorage.(storage.StagingInspector)
+	if !ok {
+		return
+	}
+	if err := si.DeleteStaged(ctx, destPath); err != nil {
 		m.logger.Debug().
-			Str("path", stagingPath).
+			Str("path", destPath).
 			Err(err).
 			Msg("Could not remove partial backup staging file")
 	}
