@@ -191,6 +191,18 @@ func (s *Subscription) Validate() error {
 	if s.Database == "" {
 		return errors.New("database is required")
 	}
+	// Both the subscription database and every topic-mapping target become the
+	// first segment of a storage key. This is the one ingest surface with no
+	// HTTP handler in front of it to validate them, so a mapping value like
+	// "" or "../x" would otherwise reach the writer directly (#741).
+	if !isValidStorageSegment(s.Database) {
+		return fmt.Errorf("database %q must start with a letter and contain only alphanumeric characters, underscores, or hyphens", s.Database)
+	}
+	for topic, db := range s.TopicMapping {
+		if !isValidStorageSegment(db) {
+			return fmt.Errorf("topic mapping %q targets database %q, which must start with a letter and contain only alphanumeric characters, underscores, or hyphens", topic, db)
+		}
+	}
 
 	// Path traversal check for TLS certificate paths
 	for _, path := range []string{s.TLSCertPath, s.TLSKeyPath, s.TLSCAPath} {
@@ -311,4 +323,24 @@ func ValidateCreateRequest(req *CreateSubscriptionRequest) error {
 	}
 	s.SetDefaults()
 	return s.Validate()
+}
+
+// isValidStorageSegment reports whether s is safe as a single path segment in a
+// storage key. Mirrors the rule the HTTP ingest handlers apply to database and
+// measurement names; kept local so internal/mqtt does not depend on internal/api.
+func isValidStorageSegment(s string) bool {
+	if len(s) == 0 || len(s) > 64 {
+		return false
+	}
+	c := s[0]
+	if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		c = s[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
 }

@@ -227,7 +227,18 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
    spoke fails to start until its ID is changed. See *Edge-sync spoke IDs can
    no longer collide with another spoke's namespace* below. The hub names any
    stored ID in that state at startup.
-3. **Query response envelopes gained two optional keys** (`rows_capped`,
+3. **A few malformed names are now refused where they were previously
+   accepted and quietly rewritten** (see *Local storage rejects malformed paths
+   instead of rewriting them* below). Three are operator-visible: a retention
+   policy whose database or measurement name contains a separator or is empty
+   is rejected on create and on update, and existing ones are named in the log
+   at startup; an MQTT subscription whose database or topic-mapping target is
+   not a usable name now fails at startup; and an edge-sync spoke may no longer
+   sync a path with a dot-prefixed segment such as `db/./cpu/x.parquet`. Note
+   that `PUT /api/v1/retention/:id` replaces the whole row, so a request that
+   omits `database` is now a 400 rather than silently storing an empty name,
+   which used to make that policy enumerate every database.
+4. **Query response envelopes gained two optional keys** (`rows_capped`,
    `row_cap`), emitted only when an Enterprise governance row cap truncated
    the result. Conforming JSON and msgpack decoders are unaffected: the keys
    are absent from every uncapped response, and a capped msgpack envelope
@@ -237,6 +248,73 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
    them at all.
 
 ## Bug fixes
+
+### Local storage rejects malformed paths instead of rewriting them ([#741](https://github.com/Basekick-Labs/arc/issues/741))
+
+The local storage backend used to repair the paths it was given: every `..` was
+replaced with `_` and NUL bytes were stripped, with a comment saying this
+prevented directory traversal. It did not. Containment was enforced separately,
+by resolving the path and checking it still sat under the storage root.
+
+What the rewrite did do was make two different keys able to name one file.
+`a..b` and `a_b` were the same location, and so were `..foo` and `_foo`. That
+is the root of two bugs already fixed in this release: the edge-sync source
+path ([#574](https://github.com/Basekick-Labs/arc/pull/574)) and the edge-sync
+spoke ID ([#737](https://github.com/Basekick-Labs/arc/issues/737)). Each was
+closed by teaching one caller not to send `..`, which left the next caller to
+rediscover it.
+
+A malformed path is now refused rather than quietly turned into a different
+one, so the mapping from key to file is one-to-one for every caller at once.
+Refused: absolute paths, any `.` or `..` segment, an empty interior segment
+such as `a//b`, NUL bytes, and backslashes. Still accepted, and now stored under
+the name actually asked for: filenames that merely contain dots, such as `a..b`
+or `..foo`.
+
+The check got cheaper as a side effect. Once a path is known to be clean and
+relative, the three `path/filepath` calls that followed it were redundant: one
+normalised input proven not to need it, one re-resolved an already absolute
+path, and one recomputed a containment property that now holds by construction.
+Validation is a single pass with no allocation, and the containment proof moved
+into a property test rather than being paid for on every call.
+
+```
+                          before      after
+BenchmarkValidatePath      605 ns/op   110 ns/op   1 alloc, unchanged
+BenchmarkValidatePathDeep  757 ns/op   150 ns/op   1 alloc, unchanged
+```
+
+In proportion: about 0.06% of a 4 MiB Parquet write, and roughly half of a bare
+existence check. It matters in the stat-heavy loops that reconciliation and
+tiering run, and is noise on the ingest path. Nothing gets slower and the
+allocation count is unchanged, which is the part that matters under
+concurrency.
+
+Two audits back the change. Instrumenting the backend and running the full test
+suite found no path anywhere in Arc that the rewrite altered, and none that
+normalisation altered either. Both are evidence rather than proof: neither can
+see a path built from stored operator configuration or from an ingest field the
+validators happened to skip, and review found one of each.
+
+So the surfaces that build a storage key from a name now validate it. Retention
+policies reject a malformed database or measurement on create and on update, and
+any already stored that can no longer resolve is named at startup. The per-name
+database routes return 400 rather than letting the storage layer refuse the key
+later. A MessagePack record with an empty measurement name is refused instead of
+being skipped by the validator and reaching the writer, and MQTT does the same,
+including for the database its topic mappings select. An empty measurement used
+to produce `{database}//{year}/...`, which normalisation collapsed so the rows
+landed a level up, under the database itself.
+
+The `mqtt.subscriptions` config is now validated at load: a subscription whose
+database, or whose topic-mapping target, is not a usable name fails at startup
+rather than at the first flush.
+
+If you have a deployment that stored data under a folded name, that file is now
+addressed by its real name and the folded spelling no longer reaches it. The one
+known way to be in that state is an edge-sync spoke registered before
+[#737](https://github.com/Basekick-Labs/arc/issues/737), which the hub already
+names at startup.
 
 ### Edge-sync spoke IDs can no longer collide with another spoke's namespace ([#737](https://github.com/Basekick-Labs/arc/issues/737))
 

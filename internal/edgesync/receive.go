@@ -628,13 +628,14 @@ func validateSpokeID(spokeID string) error {
 	if spokeID == "." || spokeID == ".." || strings.HasPrefix(spokeID, ".") {
 		return fmt.Errorf("edgesync: spoke ID %q may not start with a dot", spokeID)
 	}
-	// Reject ".." ANYWHERE, for the same reason validateSyncPath does: the
-	// local backend sanitizes by replacing every ".." substring with "_"
-	// (storage/local.go), which is many-to-one. The spoke ID is the first
-	// path segment of everything a spoke writes, so "rocket..01" and
-	// "rocket_01" resolve to one directory and either spoke can write into
-	// the other's namespace. #574 closed this for the source path and left
-	// the identity that prefixes it open (#737).
+	// Reject ".." ANYWHERE, for the same reason validateSyncPath does. The
+	// original reason was that the local backend folded every ".." to "_"
+	// (#737): the spoke ID is the first path segment of everything a spoke
+	// writes, so "rocket..01" and "rocket_01" resolved to one directory.
+	// #741 removed that fold, so the collision is gone on local storage, but
+	// the rule stays: S3 and Azure still accept any key spelling with no
+	// validation at all (#743), and a spoke ID is the one component here that
+	// an operator types by hand.
 	if strings.Contains(spokeID, "..") {
 		return fmt.Errorf("edgesync: spoke ID %q contains a parent-directory sequence", spokeID)
 	}
@@ -684,12 +685,12 @@ func validateSyncPath(p string) error {
 	if strings.Contains(p, "\\") {
 		return fmt.Errorf("edgesync: path %q contains a backslash", p)
 	}
-	// Reject ".." ANYWHERE, not only as a whole segment. LocalBackend
-	// sanitizes by replacing every ".." substring with "_" (storage/local.go),
-	// which is many-to-one: "a..b.parquet" and "a_b.parquet" both land on
-	// "a_b.parquet". A spoke sending the former would then collide with an
-	// unrelated file, get an unresolvable 409 naming a digest it never
-	// uploaded, and leave that path permanently unsyncable.
+	// Reject ".." ANYWHERE, not only as a whole segment. This was written when
+	// LocalBackend folded every ".." to "_" (#574), so "a..b.parquet" and
+	// "a_b.parquet" landed on one file and a spoke sending the former got an
+	// unresolvable 409 naming a digest it never uploaded. #741 removed the
+	// fold, so local storage now keeps both spellings apart, but the rule
+	// stays while the key contract is still per-backend (#743).
 	//
 	// Checked before cleaning: path.Clean would resolve "a/../../b" into
 	// "../b", and checking only the cleaned form invites the reader to assume
@@ -701,9 +702,13 @@ func validateSyncPath(p string) error {
 		if seg == "" {
 			return fmt.Errorf("edgesync: path %q contains an empty segment", p)
 		}
-	}
-	if strings.HasPrefix(p, ".") {
-		return fmt.Errorf("edgesync: path %q may not start with a dot", p)
+		// Checked per segment, not on the whole string. "db/./cpu/x.parquet"
+		// used to pass: path.Join cleans it before storage, but Measurement is
+		// derived from the RAW path, so "." reached the Raft manifest and then
+		// reconciliation built the prefix "db/./" from it (#741).
+		if strings.HasPrefix(seg, ".") {
+			return fmt.Errorf("edgesync: path %q has a segment starting with a dot", p)
+		}
 	}
 	if !strings.HasSuffix(p, ".parquet") {
 		// The sync unit is an immutable Parquet file. Anything else is either

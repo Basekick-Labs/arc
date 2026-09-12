@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -211,6 +212,14 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 			"error": "Database name is required",
 		})
 	}
+	// The name becomes a storage path prefix below. Validating it here turns a
+	// malformed one into a 400 at the boundary rather than a 500 from the
+	// storage layer refusing the key it was built into (#741).
+	if !isSafeStoragePathSegment(name) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("invalid database name %q", name),
+		})
+	}
 
 	ctx := context.Background()
 
@@ -248,6 +257,14 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 	if name == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Database name is required",
+		})
+	}
+	// The name becomes a storage path prefix below. Validating it here turns a
+	// malformed one into a 400 at the boundary rather than a 500 from the
+	// storage layer refusing the key it was built into (#741).
+	if !isSafeStoragePathSegment(name) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("invalid database name %q", name),
 		})
 	}
 
@@ -313,6 +330,14 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	if name == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Database name is required",
+		})
+	}
+	// The name becomes a storage path prefix below. Validating it here turns a
+	// malformed one into a 400 at the boundary rather than a 500 from the
+	// storage layer refusing the key it was built into (#741).
+	if !isSafeStoragePathSegment(name) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("invalid database name %q", name),
 		})
 	}
 
@@ -435,6 +460,27 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 }
 
 // Helper functions
+
+// isSafeStoragePathSegment reports whether name can be used as one segment of a
+// storage key.
+//
+// Deliberately looser than isValidDatabaseName, which governs what a NEW
+// database may be called. Directories already in the storage root were not all
+// created through that route: an edge-sync hub writes each spoke's namespace
+// there, and validateSpokeID permits a leading digit, interior dots and up to
+// 128 bytes. Those directories are listed by GET /api/v1/databases, so gating
+// the per-name routes on the create-time rule would return 400 for something
+// the list endpoint just reported. This rule asks only what the storage layer
+// asks: is it one segment, and does it name something inside the root.
+func isSafeStoragePathSegment(name string) bool {
+	if name == "" || len(name) > 255 {
+		return false
+	}
+	if name == "." || name == ".." || strings.HasPrefix(name, ".") {
+		return false
+	}
+	return !strings.ContainsAny(name, "/\\\x00")
+}
 
 func isValidDatabaseName(name string) bool {
 	n := len(name)

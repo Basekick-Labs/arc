@@ -455,10 +455,18 @@ func (s *Subscriber) mapToRecord(m map[string]interface{}) (*models.Record, erro
 		Tags:   make(map[string]string),
 	}
 
-	// Extract measurement
-	if meas, ok := m["m"].(string); ok {
+	// Extract measurement.
+	//
+	// An empty string is treated as absent rather than accepted: it satisfies
+	// the type assertion, so it used to win over the default below and reach
+	// the writer, which builds "{database}//{year}/..." from it. That key is
+	// refused by the storage backend since #741, and a refused flush keeps its
+	// data in the WAL and retries forever, wedging the buffer. MQTT payloads
+	// are unauthenticated relative to the HTTP write path, which validates
+	// measurement names before they reach the buffer.
+	if meas, ok := m["m"].(string); ok && meas != "" {
 		record.Measurement = meas
-	} else if meas, ok := m["measurement"].(string); ok {
+	} else if meas, ok := m["measurement"].(string); ok && meas != "" {
 		record.Measurement = meas
 	} else {
 		record.Measurement = "mqtt" // Default measurement
