@@ -84,6 +84,19 @@ func (t *HourlyTier) FindCandidates(ctx context.Context, database, measurement s
 	if !t.Enabled {
 		return nil, nil
 	}
+	objects, err := t.listObjects(ctx, database, measurement)
+	if err != nil {
+		return nil, err
+	}
+	return t.FindCandidatesFromListing(database, measurement, objects), nil
+}
+
+// FindCandidatesFromListing implements Tier: FindCandidates over a listing
+// the caller already holds.
+func (t *HourlyTier) FindCandidatesFromListing(database, measurement string, objects []string) []Candidate {
+	if !t.Enabled {
+		return nil
+	}
 
 	var candidates []Candidate
 	cutoffTime := time.Now().UTC().Add(-time.Duration(t.MinAgeHours) * time.Hour)
@@ -94,13 +107,7 @@ func (t *HourlyTier) FindCandidates(ctx context.Context, database, measurement s
 		Time("cutoff", cutoffTime).
 		Msg("Scanning for hourly compaction candidates")
 
-	// List all hour partitions
-	partitions, err := t.listHourPartitions(ctx, database, measurement, cutoffTime)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, partition := range partitions {
+	for _, partition := range t.groupHourPartitions(database, measurement, objects, cutoffTime) {
 		if t.ShouldCompact(partition.Files, partition.PartitionTime) {
 			partition.Tier = t.GetTierName()
 			partition.FileCount = len(partition.Files)
@@ -120,7 +127,7 @@ func (t *HourlyTier) FindCandidates(ctx context.Context, database, measurement s
 		Int("candidates", len(candidates)).
 		Msg("Hourly compaction candidate scan complete")
 
-	return candidates, nil
+	return candidates
 }
 
 // ShouldCompact determines if an hourly partition should be compacted
@@ -145,20 +152,10 @@ func (t *HourlyTier) GetStats() map[string]interface{} {
 	return t.GetBaseStats(t.GetTierName())
 }
 
-// listHourPartitions lists all hour partitions for a measurement
-func (t *HourlyTier) listHourPartitions(ctx context.Context, database, measurement string, cutoffTime time.Time) ([]Candidate, error) {
-	// Get all files for this database/measurement
-	prefix := database + "/" + measurement + "/"
-	objects, err := t.StorageBackend.List(ctx, prefix)
-	if err != nil {
-		return nil, err
-	}
-
-	t.Logger.Debug().
-		Str("database", database).
-		Str("measurement", measurement).
-		Int("object_count", len(objects)).
-		Msg("Listed storage objects")
+// groupHourPartitions groups a measurement's objects into hour partitions
+// old enough to compact
+func (t *HourlyTier) groupHourPartitions(database, measurement string, objects []string, cutoffTime time.Time) []Candidate {
+	prefix := measurementPrefix(database, measurement)
 
 	// Group files by hour partition
 	partitions := make(map[string]*Candidate)
@@ -251,5 +248,5 @@ func (t *HourlyTier) listHourPartitions(ctx context.Context, database, measureme
 		Time("cutoff", cutoffTime).
 		Msg("Found hour partitions")
 
-	return result, nil
+	return result
 }
