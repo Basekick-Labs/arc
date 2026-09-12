@@ -153,7 +153,51 @@ func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *
 		return nil, fmt.Errorf("failed to initialize retention tables: %w", err)
 	}
 
+	h.warnUnusablePolicies()
+
 	return h, nil
+}
+
+// warnUnusablePolicies reports stored policies whose database or measurement
+// name cannot form a storage prefix (#741).
+//
+// Create and update validate both fields now, but rows written before that do
+// not disappear, and the scheduler replays them forever. Without this the only
+// signal is a listing error buried in a scheduled run hours later, attributed
+// to storage rather than to the policy.
+func (h *RetentionHandler) warnUnusablePolicies() {
+	// Inactive rows are included: a disabled policy with a broken name is one
+	// toggle away from failing, and the point is to report it before then.
+	rows, err := h.db.Query(`SELECT name, database, measurement FROM retention_policies`)
+	if err != nil {
+		h.logger.Warn().Err(err).Msg("Could not check stored retention policies against the current name rules")
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var name, database string
+		var measurement sql.NullString
+		if err := rows.Scan(&name, &database, &measurement); err != nil {
+			// Skip the row rather than returning: one unreadable row must not
+			// hide every offender after it.
+			h.logger.Warn().Err(err).Msg("Could not read a stored retention policy")
+			continue
+		}
+		// Both fields are reported, not just the first: a policy can be broken
+		// in both and fixing one would leave it still failing.
+		if !isSafeStoragePathSegment(database) {
+			h.logger.Warn().Str("policy", name).Str("database", database).
+				Msg("Retention policy has an unusable database name and will fail every run; update or delete it")
+		}
+		if measurement.Valid && measurement.String != "" && !isSafeStoragePathSegment(measurement.String) {
+			h.logger.Warn().Str("policy", name).Str("measurement", measurement.String).
+				Msg("Retention policy has an unusable measurement name and will fail every run; update or delete it")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		h.logger.Warn().Err(err).Msg("Could not finish checking stored retention policies")
+	}
 }
 
 // SetCoordinator wires the cluster coordinator for manifest updates.
@@ -260,6 +304,20 @@ func (h *RetentionHandler) handleCreate(c *fiber.Ctx) error {
 	if req.Database == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "database is required"})
 	}
+	// Both fields are concatenated into a storage prefix by
+	// getMeasurementsToProcess and deleteOldFiles, and the row is replayed by
+	// the scheduler forever, so an unvalidated one is a policy that fails on
+	// every run long after the request that created it (#741).
+	if !isSafeStoragePathSegment(req.Database) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("invalid database name %q: may not be empty, contain a separator, or start with a dot", req.Database),
+		})
+	}
+	if req.Measurement != nil && *req.Measurement != "" && !isSafeStoragePathSegment(*req.Measurement) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("invalid measurement name %q: may not contain a separator or start with a dot", *req.Measurement),
+		})
+	}
 	if req.RetentionDays <= 0 {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "retention_days must be greater than 0"})
 	}
@@ -341,10 +399,21 @@ func (h *RetentionHandler) handleUpdate(c *fiber.Ctx) error {
 		})
 	}
 
-	// Validate
+	// Validate. Update writes both name fields verbatim, so it can put a row
+	// into exactly the state create now refuses (#741).
 	if req.RetentionDays <= req.BufferDays {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "retention_days must be greater than buffer_days",
+		})
+	}
+	if !isSafeStoragePathSegment(req.Database) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("invalid database name %q: may not be empty, contain a separator, or start with a dot", req.Database),
+		})
+	}
+	if req.Measurement != nil && *req.Measurement != "" && !isSafeStoragePathSegment(*req.Measurement) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("invalid measurement name %q: may not contain a separator or start with a dot", *req.Measurement),
 		})
 	}
 

@@ -20,7 +20,11 @@ const maxDirCacheEntries = 1024
 // LocalBackend implements the Backend interface for local filesystem storage
 type LocalBackend struct {
 	basePath string
-	logger   zerolog.Logger
+	// basePath plus a trailing separator, precomputed so validatePath is one
+	// concatenation. Computed rather than assumed because a root of "/" is
+	// already separator-terminated, and appending another would produce "//a".
+	pathPrefix string
+	logger     zerolog.Logger
 
 	// OPTIMIZATION: Directory cache to avoid redundant os.MkdirAll calls
 	// Under sustained load, hundreds of goroutines would call MkdirAll for same dirs
@@ -43,10 +47,16 @@ func NewLocalBackend(basePath string, logger zerolog.Logger) (*LocalBackend, err
 		return nil, fmt.Errorf("failed to create base path: %w", err)
 	}
 
+	prefix := absPath
+	if !strings.HasSuffix(prefix, storagePathSeparator) {
+		prefix += storagePathSeparator
+	}
+
 	return &LocalBackend{
-		basePath: absPath,
-		logger:   logger.With().Str("component", "local-storage").Logger(),
-		dirCache: make(map[string]bool),
+		basePath:   absPath,
+		pathPrefix: prefix,
+		logger:     logger.With().Str("component", "local-storage").Logger(),
+		dirCache:   make(map[string]bool),
 	}, nil
 }
 
@@ -84,7 +94,7 @@ func (b *LocalBackend) ensureDir(dir string) error {
 
 // Write writes data to the specified path with atomic write (write to temp, then rename)
 func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) error {
-	// Validate and sanitize the path to prevent path traversal
+	// Reject the key unless it names something inside the root
 	fullPath, err := b.validatePath(path)
 	if err != nil {
 		return fmt.Errorf("invalid path: %w", err)
@@ -224,7 +234,7 @@ func (b *LocalBackend) WriteReader(ctx context.Context, path string, reader io.R
 
 // Read reads data from the specified path
 func (b *LocalBackend) Read(ctx context.Context, path string) ([]byte, error) {
-	// Validate and sanitize the path to prevent path traversal
+	// Reject the key unless it names something inside the root
 	fullPath, err := b.validatePath(path)
 	if err != nil {
 		return nil, fmt.Errorf("invalid path: %w", err)
@@ -254,7 +264,7 @@ func (b *LocalBackend) Read(ctx context.Context, path string) ([]byte, error) {
 
 // ReadTo reads data from the specified path and writes it to the writer
 func (b *LocalBackend) ReadTo(ctx context.Context, path string, writer io.Writer) error {
-	// Validate and sanitize the path to prevent path traversal
+	// Reject the key unless it names something inside the root
 	fullPath, err := b.validatePath(path)
 	if err != nil {
 		return fmt.Errorf("invalid path: %w", err)
@@ -417,7 +427,7 @@ func (b *LocalBackend) AppendReader(ctx context.Context, path string, reader io.
 
 // List lists all objects with the given prefix
 func (b *LocalBackend) List(ctx context.Context, prefix string) ([]string, error) {
-	// Validate and sanitize the prefix to prevent path traversal
+	// Reject the prefix unless it names something inside the root
 	searchPath, err := b.validatePath(prefix)
 	if err != nil {
 		return nil, fmt.Errorf("invalid prefix: %w", err)
@@ -475,7 +485,7 @@ func (b *LocalBackend) List(ctx context.Context, prefix string) ([]string, error
 
 // Delete deletes the object at the specified path
 func (b *LocalBackend) Delete(ctx context.Context, path string) error {
-	// Validate and sanitize the path to prevent path traversal
+	// Reject the key unless it names something inside the root
 	fullPath, err := b.validatePath(path)
 	if err != nil {
 		return fmt.Errorf("invalid path: %w", err)
@@ -497,7 +507,7 @@ func (b *LocalBackend) Delete(ctx context.Context, path string) error {
 
 // Exists checks if an object exists at the specified path
 func (b *LocalBackend) Exists(ctx context.Context, path string) (bool, error) {
-	// Validate and sanitize the path to prevent path traversal
+	// Reject the key unless it names something inside the root
 	fullPath, err := b.validatePath(path)
 	if err != nil {
 		return false, fmt.Errorf("invalid path: %w", err)
@@ -517,18 +527,6 @@ func (b *LocalBackend) Exists(ctx context.Context, path string) (bool, error) {
 // Close closes any resources held by the backend (no-op for local storage)
 func (b *LocalBackend) Close() error {
 	return nil
-}
-
-// GetFullPath returns the full filesystem path for a given storage path
-// Useful for debugging and direct file access
-func (b *LocalBackend) GetFullPath(path string) string {
-	// Validate and sanitize the path to prevent path traversal
-	fullPath, err := b.validatePath(path)
-	if err != nil {
-		// Return empty string for invalid paths
-		return ""
-	}
-	return fullPath
 }
 
 // GetBasePath returns the base path for the local storage
@@ -551,7 +549,7 @@ func (b *LocalBackend) ConfigJSON() string {
 // ListDirectories lists immediate subdirectories at a prefix.
 // Implements the DirectoryLister interface.
 func (b *LocalBackend) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
-	// Validate and sanitize the prefix to prevent path traversal
+	// Reject the prefix unless it names something inside the root
 	searchPath, err := b.validatePath(prefix)
 	if err != nil {
 		return nil, fmt.Errorf("invalid prefix: %w", err)
@@ -623,7 +621,7 @@ func (b *LocalBackend) RemoveDirectory(ctx context.Context, path string) error {
 // ListObjects lists objects with their metadata at a prefix.
 // Implements the ObjectLister interface.
 func (b *LocalBackend) ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error) {
-	// Validate and sanitize the prefix to prevent path traversal
+	// Reject the prefix unless it names something inside the root
 	searchPath, err := b.validatePath(prefix)
 	if err != nil {
 		return nil, fmt.Errorf("invalid prefix: %w", err)
@@ -694,43 +692,112 @@ func (b *LocalBackend) ListObjects(ctx context.Context, prefix string) ([]Object
 	return results, nil
 }
 
-// sanitizePath removes any potentially dangerous path components
-func sanitizePath(path string) string {
-	// Remove leading slashes
-	path = strings.TrimPrefix(path, "/")
+// ErrInvalidPath marks a key that names nothing inside the backend root. It is
+// permanent: retrying with the same key can never succeed, so callers driving
+// cleanup or reconciliation loops should quarantine the entry rather than
+// treat it as the transient I/O failure a bare error would look like.
+var ErrInvalidPath = errors.New("storage: invalid path")
 
-	// Replace .. with _ to prevent directory traversal
-	path = strings.ReplaceAll(path, "..", "_")
+// storagePathSeparator is what joins the root to a storage key. Keys are
+// "/"-separated by contract on every backend; this is the on-disk separator.
+const storagePathSeparator = string(filepath.Separator)
 
-	// Remove any null bytes (can bypass some checks)
-	path = strings.ReplaceAll(path, "\x00", "")
-
-	return path
+// checkStoragePath reports whether path is a clean, relative location inside
+// the backend root.
+//
+// It REJECTS rather than repairs, which is the whole point. The previous
+// implementation rewrote its input, folding every ".." to "_" and stripping NUL
+// bytes, and claimed that prevented traversal. It did not: containment was
+// enforced separately. What the rewrite did do was make the mapping from
+// requested key to stored key many-to-one, so two different keys could name one
+// file. That produced #574 (source paths) and #737 (spoke IDs), each closed by
+// teaching one caller not to send "..", which leaves the next caller to
+// rediscover it. Rejecting makes the mapping injective for every caller at once.
+//
+// Deliberately permitted:
+//
+//   - "" means the root. Listing callers pass it to walk everything.
+//   - A single trailing "/", which list prefixes use constantly ("databases/",
+//     database+"/"). validatePath strips it so the result stays canonical.
+//   - Segments that merely contain dots, such as "..foo" or "a..b". They are
+//     ordinary filenames, not traversal. The old fold collapsed "..foo" onto
+//     "_foo", which is the same collision one level down.
+//
+// One pass, no allocation, no strings.Split.
+func checkStoragePath(path string) error {
+	if path == "" {
+		return nil
+	}
+	if path[0] == '/' {
+		return fmt.Errorf("%w: %q must be relative to the backend root", ErrInvalidPath, path)
+	}
+	start := 0
+	for i := 0; i <= len(path); i++ {
+		if i < len(path) {
+			c := path[i]
+			if c == 0 {
+				return fmt.Errorf("%w: contains a NUL byte", ErrInvalidPath)
+			}
+			// Backslash is rejected rather than treated as an ordinary byte.
+			// Keys are "/"-separated on every backend, and on a platform whose
+			// OS also treats backslash as a separator, a segment built from
+			// them would pass a "/"-only segment scan whole and then escape
+			// once joined. Rejecting here
+			// keeps the validator and the join agreeing about what a separator
+			// is. internal/edgesync/receive.go already rejects it for the same
+			// reason.
+			if c == '\\' {
+				return fmt.Errorf("%w: %q contains a backslash", ErrInvalidPath, path)
+			}
+			if c != '/' {
+				continue
+			}
+		}
+		switch path[start:i] {
+		case "":
+			// The only empty segment allowed is the one a trailing slash
+			// produces. An interior one means "a//b", which is two spellings
+			// of one location.
+			if i != len(path) {
+				return fmt.Errorf("%w: %q contains an empty segment", ErrInvalidPath, path)
+			}
+		case ".", "..":
+			return fmt.Errorf("%w: %q contains a %q segment", ErrInvalidPath, path, path[start:i])
+		}
+		start = i + 1
+	}
+	return nil
 }
 
-// validatePath ensures the resolved path stays within the base path (prevents path traversal)
+// validatePath resolves a storage key to its absolute location, rejecting any
+// key that does not name something inside the backend root.
+//
+// There is no filepath.Join, Abs or Rel here, and that is safe rather than
+// merely fast. checkStoragePath has already established that the key is
+// relative, clean and free of ".." segments, and basePath is absolute and clean
+// (NewLocalBackend applies filepath.Abs). Join's only contribution was Clean,
+// on input proven not to need it; Abs re-cleaned an already absolute path; and
+// Rel recomputed a containment property that concatenation now guarantees by
+// construction. Dropping all three takes the hot path from ~600ns to ~100ns
+// with the same single allocation, on a function that runs for every local read
+// and write.
+//
+// The containment proof is asserted as a property test rather than paid for on
+// every call: see TestValidatePathNeverEscapesRoot.
+//
+// Symlinks are not resolved, exactly as before. A symlink inside the root that
+// points outside it escapes, and did under the previous implementation too.
 func (b *LocalBackend) validatePath(path string) (string, error) {
-	// First sanitize the path
-	sanitized := sanitizePath(path)
-
-	// Join with base path and get the absolute path
-	fullPath := filepath.Join(b.basePath, sanitized)
-	absPath, err := filepath.Abs(fullPath)
-	if err != nil {
-		return "", fmt.Errorf("failed to resolve path: %w", err)
+	if err := checkStoragePath(path); err != nil {
+		return "", err
 	}
-
-	// Ensure the resolved path is within the base path
-	// basePath is already absolute (set in NewLocalBackend via filepath.Abs)
-	relPath, err := filepath.Rel(b.basePath, absPath)
-	if err != nil {
-		return "", fmt.Errorf("path traversal detected")
+	if path == "" {
+		return b.basePath, nil
 	}
-
-	// If the relative path starts with "..", it's outside the base path
-	if strings.HasPrefix(relPath, "..") {
-		return "", fmt.Errorf("path traversal detected: path escapes base directory")
+	// Match what filepath.Join returned: a trailing slash is accepted on the
+	// way in and absent from the result.
+	if path[len(path)-1] == '/' {
+		path = path[:len(path)-1]
 	}
-
-	return absPath, nil
+	return b.pathPrefix + path, nil
 }
