@@ -207,6 +207,51 @@ the cache immediately and was never affected; only passive expiry was.
 Full technical detail will accompany the corresponding security advisory once it
 is published. Responsibly reported by **[@rexpository](https://github.com/rexpository)**.
 
+### Investigated: per-tenant scoping of the DuckDB sandbox ([#641](https://github.com/Basekick-Labs/arc/issues/641))
+
+No behaviour change in this release. Recorded here because the investigation
+settled a question that had been open since the sandbox shipped, and the answer
+constrains anything built on top of it.
+
+Arc locks DuckDB down once at startup: it sets `allowed_directories` to every
+prefix the deployment needs, then sets `enable_external_access = false`. The
+allowlist is therefore the union of all tenants' directories for the life of the
+process, so an attacker who got past the read-SQL validator would be bounded by
+the deployment, not by the database their token can read. #641 asked whether the
+allowlist could be narrowed per query to close that gap.
+
+It cannot, on the handle Arc runs queries through. Measured against DuckDB
+1.5.5: `allowed_directories` is GLOBAL-only (there is no session or connection
+scope, so two concurrent queries on one handle cannot see different allowlists),
+it is immutable once external access is off, and the lockdown is deliberately
+one-way. It also cannot be set in the connection string, and no LOCAL-scope
+setting in 1.5.5 affects file access. The only mechanism that gives two queries
+different filesystem scopes is a second DuckDB instance.
+
+Routing queries to per-scope instances was designed and rejected. The decisive
+problem is that the routing key could only come from the same SQL reference
+extractor the threat model assumes has already been defeated: a query written as
+`read_parquet('...')` yields no table references at all, so the queries the
+feature exists to contain are exactly the ones that would produce no key. The
+supporting costs were also severe, since DuckDB's thread count and memory limit
+are both per instance, and Arc's S3 and Azure credential refreshers are keyed by
+secret name in a way that would let a second instance silently stop the first
+one's refresher.
+
+`lock_configuration` was evaluated as cheap hardening in the same pass and
+rejected for a concrete reason: it blocks the `parquet_metadata_cache` toggle
+that Arc performs after every delete, compaction, and retention pass to drop
+cached metadata pointing at deleted files, and DuckDB 1.5.5 offers no
+lock-immune substitute.
+
+The full analysis, including the measurements and the enforcement point that is
+worth building instead (a Go-side assertion that every path literal in the
+rewritten SQL is one Arc emitted, tracked in
+[#764](https://github.com/Basekick-Labs/arc/issues/764)), is in
+`docs/progress/2026-09-12-duckdb-sandbox-scoping.md`. The DuckDB constraints the
+decision rests on are pinned by tests, so a future DuckDB bump that lifts one
+fails the build rather than leaving the note quietly wrong.
+
 ## Upgrade notes
 
 1. **Clustered Enterprise deployments require a coordinated restart.** The
