@@ -20,7 +20,16 @@ type Manifest struct {
 	// incomplete: TotalFiles/TotalSizeBytes describe what was inventoried, not
 	// what was actually stored.
 	SkippedFiles int64 `json:"skipped_files,omitempty"`
-	HasMetadata  bool  `json:"has_metadata"`
+	// UnaddressableFiles counts data files that exist in source storage but
+	// that no listing returns, because their key fails the storage key rules.
+	// They were never inventoried and could not be copied, so when this is
+	// non-zero the backup is incomplete in a way SkippedFiles does not describe:
+	// those were listed and then unreadable, these were never listable at all
+	// (#756). UnaddressableSample names up to 32 of them so an operator can find
+	// and rename them.
+	UnaddressableFiles  int64    `json:"unaddressable_files,omitempty"`
+	UnaddressableSample []string `json:"unaddressable_sample,omitempty"`
+	HasMetadata         bool     `json:"has_metadata"`
 	// HasIcebergCatalog records that the Iceberg SQL catalog was stored as a
 	// separate database (metadata/iceberg-catalog.db) because the operator
 	// configured iceberg.catalog_db_path away from the shared database. When
@@ -56,17 +65,19 @@ type BackupSummary struct {
 
 // Progress tracks the state of a running backup or restore operation.
 type Progress struct {
-	Operation      string     `json:"operation"` // "backup" or "restore"
-	BackupID       string     `json:"backup_id"`
-	Status         string     `json:"status"` // "running", "completed", "failed"
-	TotalFiles     int64      `json:"total_files"`
-	ProcessedFiles int64      `json:"processed_files"`
-	SkippedFiles   int64      `json:"skipped_files"`
-	TotalBytes     int64      `json:"total_bytes"`
-	ProcessedBytes int64      `json:"processed_bytes"`
-	StartedAt      time.Time  `json:"started_at"`
-	CompletedAt    *time.Time `json:"completed_at,omitempty"`
-	Error          string     `json:"error,omitempty"`
+	Operation      string `json:"operation"` // "backup" or "restore"
+	BackupID       string `json:"backup_id"`
+	Status         string `json:"status"` // "running", "completed", "failed"
+	TotalFiles     int64  `json:"total_files"`
+	ProcessedFiles int64  `json:"processed_files"`
+	SkippedFiles   int64  `json:"skipped_files"`
+	// UnaddressableFiles mirrors Manifest.UnaddressableFiles for live progress.
+	UnaddressableFiles int64      `json:"unaddressable_files,omitempty"`
+	TotalBytes         int64      `json:"total_bytes"`
+	ProcessedBytes     int64      `json:"processed_bytes"`
+	StartedAt          time.Time  `json:"started_at"`
+	CompletedAt        *time.Time `json:"completed_at,omitempty"`
+	Error              string     `json:"error,omitempty"`
 }
 
 // MarshalManifest serializes a manifest to JSON.

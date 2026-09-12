@@ -137,6 +137,54 @@ type ObjectLister interface {
 	ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error)
 }
 
+// UnusableObject is an object that exists in the store but that no listing
+// returns, so nothing driven by a listing can see it.
+type UnusableObject struct {
+	Path         string
+	Size         int64
+	LastModified time.Time
+	// Err is why the object is unlistable. It wraps ErrInvalidPath when the
+	// key contract is the reason, so callers can classify with errors.Is the
+	// way the reconciliation sweeps do.
+	Err error
+}
+
+// UnusableLister enumerates objects that ListObjects deliberately hides.
+//
+// Listings drop keys the backend would then refuse, because handing one back
+// turns every List-then-Read caller into a failure (#743, #744). That is the
+// right trade for the caller and the wrong one for the operator: on local
+// storage the dropped entries are real Parquet files holding real rows, the
+// query path still serves them because read_parquet globs the filesystem, and
+// nothing anywhere could name them. A backup would then omit them and report
+// success, which is the failure #743's own commit message called worse than the
+// bug it was fixing.
+//
+// This is the counterpart #744 already established for the case it created:
+// when it hid write-staging partials it added ListStaged to reclaim them. The
+// contract drop had no equivalent (#756).
+//
+// The set is defined by OBSERVATION, not by predicate: it is what a full
+// listing sees and ListObjects does not return. Re-deriving it from ValidateKey
+// would miss the entries a listing skips for other reasons, and would drift
+// again the next time a listing grows a filter.
+//
+// Excluded, because they are provably not data an operator can lose:
+//   - Arc's own in-flight ".arc-*.tmp" writes, which is why listings skip
+//     dot-prefixed names at all.
+//   - On backends that stage, a ".part" staging path for an addressable key.
+//     That covers an in-flight WriteReader and an abandoned partial alike, and
+//     reporting either would be a permanent false alarm carrying advice that
+//     would publish a truncated file. Object stores do not stage, so a ".part"
+//     key there is an ordinary committed object and IS reported.
+type UnusableLister interface {
+	Backend
+
+	// ListUnusable returns objects under prefix that ListObjects omits.
+	// An empty result is the healthy case.
+	ListUnusable(ctx context.Context, prefix string) ([]UnusableObject, error)
+}
+
 // DirectoryRemover removes an empty directory.
 // This is used to clean up database directories after all files are deleted.
 // For object storage (S3, Azure), this is typically a no-op since directories don't exist as objects.

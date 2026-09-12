@@ -875,3 +875,71 @@ func (b *S3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInf
 
 	return objects, nil
 }
+
+// ListUnusable implements UnusableLister.
+//
+// Returns exactly what ListObjects drops, so the two partition the bucket.
+//
+// Unlike the local backend this does NOT exclude ".part" keys. S3 does not
+// stage writes and does not implement StagingInspector, so a ".part" object
+// here is an ordinary committed object that #744's reserved suffix made
+// unaddressable, and this is its only escape hatch.
+func (b *S3Backend) ListUnusable(ctx context.Context, prefix string) ([]UnusableObject, error) {
+	var objects []UnusableObject
+	var continuationToken *string
+
+	fullPrefix, err := b.prefixedListPrefix(prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(b.bucket),
+			Prefix:            aws.String(fullPrefix),
+			ContinuationToken: continuationToken,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to list S3 objects: %w", err)
+		}
+
+		for _, obj := range result.Contents {
+			if obj.Key == nil {
+				continue
+			}
+			key := strings.TrimPrefix(*obj.Key, b.prefix)
+			reason := ValidateKey(key)
+			if reason == nil {
+				continue // ListObjects returns it
+			}
+			var size int64
+			if obj.Size != nil {
+				size = *obj.Size
+			}
+			// A zero-length key ending in a separator is a directory marker,
+			// written by consoles and sync tools rather than by Arc, and holds
+			// no data. This is a heuristic, not a guarantee: a trailing-slash
+			// key CAN hold bytes on S3, which is why the size is part of the
+			// test rather than the suffix alone.
+			if size == 0 && strings.HasSuffix(key, "/") {
+				continue
+			}
+			info := UnusableObject{Path: key, Size: size, Err: reason}
+			if obj.LastModified != nil {
+				info.LastModified = *obj.LastModified
+			}
+			objects = append(objects, info)
+		}
+
+		if result.IsTruncated == nil || !*result.IsTruncated {
+			break
+		}
+		continuationToken = result.NextContinuationToken
+	}
+
+	return objects, nil
+}

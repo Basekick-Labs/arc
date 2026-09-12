@@ -313,6 +313,58 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### A backup no longer reports success while silently omitting files ([#756](https://github.com/Basekick-Labs/arc/issues/756))
+
+A backup could finish, report success, and be missing data files that exist in
+storage, with nothing anywhere saying so.
+
+Listings deliberately hide a file whose key does not follow the storage key
+rules, because handing that key back turns every read that follows into a
+failure. On local storage those hidden files are not debris: they are real
+Parquet files holding real rows, and the query path still returns those rows,
+because it matches files on the filesystem rather than going through the storage
+layer. So the file was queryable and invisible at the same time.
+
+Backup inventories what a listing returns, and everything that exists to make an
+incomplete backup visible (the skipped-file count, the "backup will be
+incomplete" warning, and the guard that fails a backup when too much of it could
+not be read) counts only files that were inventoried and then failed to copy. A
+file the listing never returned reached none of them. Before the listings
+started filtering, the same file failed loudly when the backup tried to read it,
+and was counted.
+
+Two shapes produce such a file, and both are what an older Arc wrote rather than
+anything you can create today: a filename containing a backslash, which is a
+legal filename on Linux and refused because Azure treats it as a separator, and
+a path longer than the key limit, which is reachable by nesting.
+
+What changes:
+
+- A backup now reports these files: a count and a sample of their paths in the
+  backup manifest, a warning naming them, and a metric
+  (`arc_storage_unaddressable_files_total`) so it is visible without reading a
+  manifest. The message says to rename them, which is what actually recovers the
+  data.
+- **A backup whose data files are all unaddressable now fails.** It previously
+  reported success over a backup containing nothing, because the guard that
+  catches a partial backup divides by the number of files it inventoried, and
+  that number was zero.
+- Storage backends gained a way to enumerate what a listing hid, which is what
+  makes any of the above possible. This is the counterpart the previous release
+  already established for write-staging partials, which were hidden from
+  listings and given their own way to be found; the key-rule drop had no
+  equivalent.
+
+The enumeration is defined as what a full listing sees and the ordinary listing
+does not return, rather than by re-checking the key rules. That distinction
+found a second case: a file whose name begins with a dot passes the key rules
+and is writable and readable through the storage layer, yet listings skip it, so
+it was missing from backups too. Checking the rules again would never have
+reported it.
+
+Nothing about which files are queryable changes, and a healthy deployment
+reports nothing.
+
 ### Cleanup and replication loops no longer retry an unusable storage key forever ([#747](https://github.com/Basekick-Labs/arc/issues/747))
 
 [#743](https://github.com/Basekick-Labs/arc/issues/743) made a refused storage

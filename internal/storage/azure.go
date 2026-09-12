@@ -656,6 +656,62 @@ func (b *AzureBlobBackend) ListObjects(ctx context.Context, prefix string) ([]Ob
 	return objects, nil
 }
 
+// ListUnusable implements UnusableLister.
+//
+// Returns exactly what ListObjects drops, so the two partition the container.
+// Like S3 and unlike local, ".part" blobs are reported: Azure does not stage
+// writes and does not implement StagingInspector, so such a blob is an ordinary
+// committed object that #744's reserved suffix made unaddressable.
+func (b *AzureBlobBackend) ListUnusable(ctx context.Context, prefix string) ([]UnusableObject, error) {
+	var objects []UnusableObject
+
+	containerClient := b.client.ServiceClient().NewContainerClient(b.containerName)
+	pager := containerClient.NewListBlobsFlatPager(&container.ListBlobsFlatOptions{
+		Prefix: &prefix,
+	})
+
+	for pager.More() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list Azure blobs: %w", err)
+		}
+
+		for _, blobItem := range page.Segment.BlobItems {
+			if blobItem.Name == nil {
+				continue
+			}
+			reason := ValidateKey(*blobItem.Name)
+			if reason == nil {
+				continue // ListObjects returns it
+			}
+			info := UnusableObject{Path: *blobItem.Name, Err: reason}
+			if blobItem.Properties != nil {
+				if blobItem.Properties.ContentLength != nil {
+					info.Size = *blobItem.Properties.ContentLength
+				}
+				if blobItem.Properties.LastModified != nil {
+					info.LastModified = *blobItem.Properties.LastModified
+				}
+			}
+			// Zero-length directory-marker blob. Heuristic, same as S3: the
+			// suffix alone is not proof, so the size is part of the test.
+			// Note ADLS Gen2 hierarchical-namespace directories do NOT carry a
+			// trailing separator, but they also pass ValidateKey, so they never
+			// reach here.
+			if info.Size == 0 && strings.HasSuffix(info.Path, "/") {
+				continue
+			}
+			objects = append(objects, info)
+		}
+	}
+
+	return objects, nil
+}
+
 // isAzureNotFoundError checks if an error indicates the blob doesn't exist
 func isAzureNotFoundError(err error) bool {
 	if err == nil {
