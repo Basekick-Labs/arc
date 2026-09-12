@@ -457,11 +457,6 @@ func (b *LocalBackend) List(ctx context.Context, prefix string) ([]string, error
 			return nil
 		}
 
-		// Skip hidden files (e.g., .DS_Store on macOS)
-		if strings.HasPrefix(d.Name(), ".") {
-			return nil
-		}
-
 		// Get relative path from base
 		relPath, err := filepath.Rel(b.basePath, path)
 		if err != nil {
@@ -473,8 +468,9 @@ func (b *LocalBackend) List(ctx context.Context, prefix string) ([]string, error
 		// since #744 that includes write-staging partials: they are not
 		// objects, and returning one gave every List-then-Read caller a key
 		// that fails. StagingInspector.ListStaged is how an abandoned partial
-		// is found.
-		if ValidateKey(relPath) != nil {
+		// is found, and ListUnusable is how everything else dropped here is
+		// found (#756).
+		if omittedFromListing(d.Name(), relPath) != nil {
 			return nil
 		}
 
@@ -582,13 +578,12 @@ func (b *LocalBackend) ListDirectories(ctx context.Context, prefix string) ([]st
 	var dirs []string
 	for _, entry := range entries {
 		if entry.IsDir() {
-			// Skip hidden directories
-			if strings.HasPrefix(entry.Name(), ".") {
-				continue
-			}
 			// Callers join this name into a key, so a name the contract would
-			// refuse produces an unusable key. Same rule as List (#743).
-			if ValidateKey(entry.Name()) != nil {
+			// refuse produces an unusable key. Same rule as List (#743), and
+			// the same function, so the four listings cannot drift apart about
+			// what they drop (#756). A directory name is one segment, so it is
+			// both the base name and the relative path here.
+			if omittedFromListing(entry.Name(), entry.Name()) != nil {
 				continue
 			}
 			dirs = append(dirs, entry.Name())
@@ -673,11 +668,6 @@ func (b *LocalBackend) ListObjects(ctx context.Context, prefix string) ([]Object
 			return nil
 		}
 
-		// Skip hidden files
-		if strings.HasPrefix(d.Name(), ".") {
-			return nil
-		}
-
 		// Get relative path from base
 		relPath, err := filepath.Rel(b.basePath, path)
 		if err != nil {
@@ -686,7 +676,7 @@ func (b *LocalBackend) ListObjects(ctx context.Context, prefix string) ([]Object
 		relPath = filepath.ToSlash(relPath)
 		// See List: a listing never returns a key this backend would refuse,
 		// which since #744 includes write-staging partials.
-		if ValidateKey(relPath) != nil {
+		if omittedFromListing(d.Name(), relPath) != nil {
 			return nil
 		}
 
@@ -717,6 +707,39 @@ func (b *LocalBackend) ListObjects(ctx context.Context, prefix string) ([]Object
 	}
 
 	return results, nil
+}
+
+// errHiddenName marks an entry a listing skips because its name is
+// dot-prefixed. Not an ErrInvalidPath: the key contract accepts leading dots
+// (ValidateKeySegment does so deliberately), so this is a listing convention
+// rather than a property of the key.
+var errHiddenName = errors.New("storage: name is dot-prefixed")
+
+// omittedFromListing reports why a walked file is NOT returned by List and
+// ListObjects, or nil when it is returned.
+//
+// List, ListObjects, ListDirectories and ListUnusable all consult this one
+// function, so a listing and the enumeration of what that listing hid cannot
+// disagree about which entries were dropped. Deriving the hidden set from ValidateKey instead
+// would miss everything skipped for another reason, and would drift again the
+// next time a listing grows a filter (#756).
+func omittedFromListing(base, relPath string) error {
+	// Dot-prefixed names cover Arc's own in-flight ".arc-*.tmp" writes and OS
+	// debris such as .DS_Store. Note it also covers dot-prefixed DATA files,
+	// which the key contract accepts, which is why this is part of the
+	// definition rather than a special case of it.
+	if strings.HasPrefix(base, ".") {
+		return errHiddenName
+	}
+	return ValidateKey(relPath)
+}
+
+// isInFlightWrite reports whether base is a temp file an in-progress Write owns.
+// Write creates these with os.CreateTemp(dir, ".arc-*.tmp"), so that is the
+// pattern, not the ".tmp.*" spelling some older comments in the tree use. They
+// are not objects and must never be reported as data an operator lost.
+func isInFlightWrite(base string) bool {
+	return strings.HasPrefix(base, ".arc-") && strings.HasSuffix(base, ".tmp")
 }
 
 // PartSuffix is appended to build the staging file a local write lands in
@@ -1028,6 +1051,108 @@ func (b *LocalBackend) DeleteStaged(ctx context.Context, key string) error {
 		return fmt.Errorf("failed to delete staged file: %w", err)
 	}
 	return nil
+}
+
+// ListUnusable implements UnusableLister.
+//
+// It walks the same tree ListObjects walks and returns exactly what ListObjects
+// drops, so the two partition the store between them. On local these entries
+// are real files holding real rows: the query path still serves them because
+// read_parquet globs the filesystem, but no Backend method can address one and
+// no listing names one, so a backup omits them and reports success (#756).
+func (b *LocalBackend) ListUnusable(ctx context.Context, prefix string) ([]UnusableObject, error) {
+	searchPath, err := b.validateListPath(prefix)
+	if err != nil {
+		return nil, fmt.Errorf("invalid prefix: %w", err)
+	}
+
+	var results []UnusableObject
+
+	err = filepath.WalkDir(searchPath, func(path string, d os.DirEntry, err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		// Directories are not objects. Skipping them also keeps Path from ever
+		// being "" or ".", which for the root would name the data directory.
+		if d.IsDir() {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(b.basePath, path)
+		if err != nil {
+			return err
+		}
+		relPath = filepath.ToSlash(relPath)
+
+		reason := omittedFromListing(d.Name(), relPath)
+		if reason == nil {
+			return nil // ListObjects returns it; not our business
+		}
+		// A write in progress owns this file and will rename it away.
+		if isInFlightWrite(d.Name()) {
+			return nil
+		}
+		// A staging path for an addressable key, which is where WriteReader
+		// parks bytes until the final rename. Excluded, and the test is the
+		// base KEY rather than whether a file currently sits at it: an
+		// in-flight compaction output and an abandoned partial both have no
+		// committed base yet, and reporting either as data an operator lost
+		// would be a permanent false alarm attached to advice ("rename it")
+		// that would publish a truncated Parquet as a committed object.
+		//
+		// The directory case is the exception. If the base name is occupied by
+		// a directory then no write to that key can ever stage here, so this is
+		// not a partial at all: it is a committed object that merely looks like
+		// one, and it is reported.
+		//
+		// Everything else with the suffix IS reported, because the base is not
+		// a key any write could use: "x.part.part" (base still ends in the
+		// reserved suffix) and ".part" alone (base is a directory prefix).
+		//
+		// The trade-off, stated plainly: a committed object written before #744
+		// reserved the suffix, whose real name is "X.part" for some valid key
+		// X, is indistinguishable from a partial for X and is excluded here.
+		// That is deliberate. The alternative reports every in-progress
+		// compaction output as data an operator lost, on every backup, forever,
+		// which is both a constant false alarm and dangerous advice. Such an
+		// object is the staging namespace collision #744 exists to prevent, and
+		// it is reachable through StagingInspector rather than through nothing
+		// (though see #762: no caller enumerates staged partials under the data
+		// root yet, and ListStaged reports them under the base key).
+		if committed, ok := strings.CutSuffix(relPath, PartSuffix); ok && ValidateKey(committed) == nil {
+			if fi, statErr := os.Stat(b.pathPrefix + committed); statErr != nil || !fi.IsDir() {
+				return nil
+			}
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		results = append(results, UnusableObject{
+			Path:         relPath,
+			Size:         info.Size(),
+			LastModified: info.ModTime(),
+			Err:          reason,
+		})
+		return nil
+	})
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []UnusableObject{}, nil
+		}
+		return nil, fmt.Errorf("failed to list unusable objects: %w", err)
+	}
+	return results, nil
 }
 
 // ListStaged implements StagingInspector.

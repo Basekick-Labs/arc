@@ -156,6 +156,16 @@ type Metrics struct {
 	// this counter is the only place the condition is aggregated.
 	storageInvalidPathQuarantinedTotal atomic.Int64
 
+	// storageUnaddressableFiles is how many data files the MOST RECENT backup
+	// found in source storage that no listing returns, so nothing could copy
+	// them (#756).
+	//
+	// A gauge, not a counter, and the distinction is what makes it alertable:
+	// the condition is a property of the store right now, and renaming the
+	// files has to clear it. A counter would keep the alert firing forever
+	// after the first bad file, including after the operator fixed it.
+	storageUnaddressableFiles atomic.Int64
+
 	// Cluster auth metrics (Enterprise only — mutated on every FSM apply
 	// of a token command). clusterAuthApplyTotal increments per applied
 	// command type so operators can see "create vs update vs revoke"
@@ -416,6 +426,13 @@ func (m *Metrics) IncClusterManifestRejectedPaths() { m.clusterManifestRejectedP
 // to counting it here is a loop that retries the same key forever.
 func (m *Metrics) IncStorageInvalidPathQuarantined() { m.storageInvalidPathQuarantinedTotal.Add(1) }
 
+// SetStorageUnaddressableFiles records how many data files the backup that just
+// ran could not copy because no listing returns them (#756). Called on every
+// backup including with 0, so fixing the files clears the gauge.
+func (m *Metrics) SetStorageUnaddressableFiles(n int64) {
+	m.storageUnaddressableFiles.Store(n)
+}
+
 // Cluster Auth metrics — incremented from the FSM apply path on every
 // Token command. apply_* counts successful applies per type;
 // IncClusterAuthRejected counts applier-side validation refusals.
@@ -603,6 +620,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		// Cluster FSM security (Enterprise)
 		"cluster_manifest_rejected_paths_total":  m.clusterManifestRejectedPathsTotal.Load(),
 		"storage_invalid_path_quarantined_total": m.storageInvalidPathQuarantinedTotal.Load(),
+		"storage_unaddressable_files":            m.storageUnaddressableFiles.Load(),
 
 		// Cluster Auth (Enterprise, Phase A)
 		"cluster_auth_apply_create_total": m.clusterAuthApplyCreateTotal.Load(),
@@ -962,6 +980,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_storage_invalid_path_quarantined_total Total entries dropped from a cleanup, reconciliation or replication work set because a storage key was permanently unusable. Non-zero growth means a stored key (compaction manifest, cluster manifest entry, edge-sync ledger row) names something no storage backend can address; the entry is no longer retried and needs operator action.\n"...)
 	b = append(b, "# TYPE arc_storage_invalid_path_quarantined_total counter\n"...)
 	b = appendMetric(b, "arc_storage_invalid_path_quarantined_total", float64(m.storageInvalidPathQuarantinedTotal.Load()))
+
+	b = append(b, "# HELP arc_storage_unaddressable_files Data files the most recent backup found in source storage that no listing returns, so they could not be copied. Non-zero means that backup is incomplete: the files exist and the query path still serves them, but their key does not conform to the storage key rules and no backend method can address one. Rename them and the next backup clears this.\n"...)
+	b = append(b, "# TYPE arc_storage_unaddressable_files gauge\n"...)
+	b = appendMetric(b, "arc_storage_unaddressable_files", float64(m.storageUnaddressableFiles.Load()))
 
 	// Cluster Auth metrics (Enterprise, Phase A — Cluster Auth Convergence).
 	// apply_* counters increment per applied token command, per node — so

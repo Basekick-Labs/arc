@@ -13,6 +13,7 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
@@ -98,6 +99,14 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		return nil, fmt.Errorf("storage backend does not support ListObjects")
 	}
 
+	// Enumerate the hidden set FIRST, and the inventory second. The two are
+	// separate passes, so a file renamed between them is seen by one or the
+	// other depending on the order: this way a key fixed mid-backup is reported
+	// as unaddressable AND copied, which is a spurious warning. The reverse
+	// order loses it from both, which is silently the very bug this guards
+	// against (#756).
+	unaddressable := m.findUnaddressable(ctx, progress)
+
 	objects, err := objectLister.ListObjects(ctx, "")
 	if err != nil {
 		progress.Status = "failed"
@@ -120,6 +129,19 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		case isIcebergMetadata(obj.Path):
 			icebergMetaFiles = append(icebergMetaFiles, obj)
 		}
+	}
+
+	// MEDIUM: decide the fatal case before doing any work. Copying every
+	// Iceberg metadata file and only then failing would leave a half-written
+	// backupID/data/... tree in backup storage with no manifest, which
+	// ListBackups keys on and therefore can neither show nor clean up.
+	if len(unaddressable) > 0 && len(parquetFiles) == 0 {
+		err := fmt.Errorf("backup failed: all %d data file(s) in source storage have a key that cannot be addressed, so the backup would contain no data; rename them to conform to the storage key rules (see the log for paths)", len(unaddressable))
+		m.logger.Error().Int("unaddressable", len(unaddressable)).
+			Strs("sample", sampleUnaddressable(unaddressable)).Msg(err.Error())
+		progress.Status = "failed"
+		progress.Error = err.Error()
+		return nil, err
 	}
 
 	// Build manifest inventory
@@ -198,6 +220,10 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		progress.Error = err.Error()
 		return nil, err
 	}
+
+	// Record files that could never be copied because no listing returns them.
+	// The fatal case was decided before any copying began.
+	m.recordUnaddressable(manifest, unaddressable, len(parquetFiles))
 
 	// ── 3. Copy SQLite metadata ─────────────────────────────────────────
 	if opts.IncludeMetadata && m.sqliteDBPath != "" {
@@ -331,6 +357,113 @@ func (m *Manager) copyDataFiles(ctx context.Context, backupID string, files []st
 		Msg("Files skipped during backup — backup will be incomplete")
 
 	return nil
+}
+
+// findUnaddressable inventories data files that exist in source storage but
+// that no listing returns, so nothing driven by a listing could copy them.
+//
+// Filtered with the same rule the inventory uses, because the storage layer
+// reports everything a listing hid and only what a backup would have carried is
+// the operator's loss: OS debris such as .DS_Store is hidden for good reason and
+// naming it here would cry wolf on every macOS deployment.
+//
+// A backend that cannot enumerate them contributes nothing, which is correct
+// rather than optimistic: it is the same position every caller was in before.
+func (m *Manager) findUnaddressable(ctx context.Context, progress *Progress) []storage.UnusableObject {
+	lister, ok := m.dataStorage.(storage.UnusableLister)
+	if !ok {
+		// Not clean, unchecked. Said out loud so a zero in the manifest is not
+		// read as a guarantee.
+		m.logger.Debug().Msg("Storage backend cannot enumerate hidden files; the backup cannot confirm it is complete")
+		return nil
+	}
+	hidden, err := lister.ListUnusable(ctx, "")
+	if err != nil {
+		// Not fatal: failing the backup because the diagnostic failed would be
+		// worse than the gap it reports. Loud, because the count is now part of
+		// whether the backup can call itself complete.
+		m.logger.Warn().Err(err).Msg("Could not check for unaddressable files; the backup cannot confirm it is complete")
+		return nil
+	}
+	var out []storage.UnusableObject
+	for _, o := range hidden {
+		if isBackupPayload(o.Path) {
+			out = append(out, o)
+		}
+	}
+	// Set unconditionally, including 0: the gauge describes the store as of the
+	// backup that just ran, so a deployment that fixed its keys must see it
+	// fall back to zero rather than stay latched on the first bad file.
+	metrics.Get().SetStorageUnaddressableFiles(int64(len(out)))
+	if len(out) > 0 {
+		atomic.AddInt64(&progress.UnaddressableFiles, int64(len(out)))
+	}
+	return out
+}
+
+// isBackupPayload reports whether a path is something CreateBackup would have
+// copied had it been addressable, and therefore something whose absence is the
+// operator's loss.
+//
+// It mirrors the inventory split above, and deliberately covers more than
+// ".parquet". Iceberg metadata is the reason that split exists at all: losing a
+// metadata.json or .avro loses a whole table even when every Parquet file it
+// references survives, so an unaddressable one is worse than an unaddressable
+// data file, not lesser. And a ".parquet.part" key on an object store is an
+// ordinary committed object there (S3 and Azure do not stage), which the
+// storage layer reports precisely because nothing else can name it.
+func isBackupPayload(p string) bool {
+	if isIcebergMetadata(p) {
+		return true
+	}
+	return strings.HasSuffix(strings.TrimSuffix(p, storage.PartSuffix), ".parquet")
+}
+
+// unaddressableSampleCap bounds how many paths land in the manifest. The
+// manifest is one JSON blob written to storage, and the over-length key shape
+// makes each path up to a kilobyte, so an unbounded list could dwarf the
+// manifest it is reported in.
+const unaddressableSampleCap = 32
+
+// recordUnaddressable puts the finding in the manifest and decides whether the
+// run may still call itself a complete backup.
+//
+// Deliberately NOT folded into checkSkipRatio. That guard exists for a
+// transient race (a file compaction removed between listing and copy), its
+// denominator is the addressable inventory, and it short-circuits when
+// SkippedFiles is zero, which is exactly the case here. Worse, its ratio would
+// hard-fail a nine-file deployment with one legacy file forever, and its
+// message sends the operator to diagnose storage rather than rename a file.
+func (m *Manager) recordUnaddressable(manifest *Manifest, unaddressable []storage.UnusableObject, addressableFiles int) {
+	if len(unaddressable) == 0 {
+		return
+	}
+
+	manifest.UnaddressableFiles = int64(len(unaddressable))
+	for i, o := range unaddressable {
+		if i == unaddressableSampleCap {
+			break
+		}
+		manifest.UnaddressableSample = append(manifest.UnaddressableSample, o.Path)
+	}
+
+	m.logger.Warn().
+		Int("unaddressable", len(unaddressable)).
+		Int("addressable", addressableFiles).
+		Strs("sample", manifest.UnaddressableSample).
+		Msg("Backup is incomplete: these files exist in storage but their key cannot be addressed, so they were not copied; rename them to conform to the storage key rules")
+}
+
+// sampleUnaddressable bounds a path list for logging, same cap as the manifest.
+func sampleUnaddressable(objs []storage.UnusableObject) []string {
+	out := make([]string, 0, unaddressableSampleCap)
+	for i, o := range objs {
+		if i == unaddressableSampleCap {
+			break
+		}
+		out = append(out, o.Path)
+	}
+	return out
 }
 
 // checkSkipRatio fails the backup when too large a fraction of it was unreadable.
