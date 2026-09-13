@@ -15,6 +15,7 @@ import (
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/license"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	_ "github.com/mattn/go-sqlite3"
@@ -1060,10 +1061,7 @@ func (h *RetentionHandler) getFileMaxTimeAndRowCount(ctx context.Context, filePa
 	// Use the shared DuckDB connection to avoid memory retention from temporary connections
 	db := h.duckdb.DB()
 
-	// read_parquet() does not support parameterized queries, so escape single
-	// quotes in the path to prevent SQL injection via crafted file paths.
-	safePath := strings.ReplaceAll(filePath, "'", "''")
-	query := fmt.Sprintf("SELECT MAX(time) as max_time, COUNT(*) as cnt FROM read_parquet('%s')", safePath)
+	query := fmt.Sprintf("SELECT MAX(time) as max_time, COUNT(*) as cnt FROM read_parquet(%s)", sqlutil.QuoteStringLiteral(filePath))
 	row := db.QueryRowContext(ctx, query)
 
 	var maxTime time.Time
