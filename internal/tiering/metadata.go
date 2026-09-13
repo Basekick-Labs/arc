@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -67,7 +68,9 @@ func (s *MetadataStore) initSchema() error {
 		tier TEXT NOT NULL DEFAULT 'hot',
 		size_bytes INTEGER NOT NULL,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		migrated_at TIMESTAMP
+		migrated_at TIMESTAMP,
+		quarantined_at TIMESTAMP,
+		quarantine_reason TEXT
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_tier_files_database ON tier_files(database);
@@ -101,9 +104,28 @@ func (s *MetadataStore) initSchema() error {
 		return fmt.Errorf("failed to create tiering tables: %w", err)
 	}
 
+	// CREATE TABLE IF NOT EXISTS leaves an existing table untouched, so a
+	// tier_files table created before the quarantine columns existed (#758)
+	// keeps its old shape. SQLite has no ADD COLUMN IF NOT EXISTS; a
+	// duplicate-column error is the expected outcome on an up-to-date
+	// database and is not a failure. Rows that predate the column read back
+	// as NULL, which is the not-quarantined state.
+	for _, col := range []string{
+		"ALTER TABLE tier_files ADD COLUMN quarantined_at TIMESTAMP",
+		"ALTER TABLE tier_files ADD COLUMN quarantine_reason TEXT",
+	} {
+		if _, err := s.db.Exec(col); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("add tier_files quarantine columns: %w", err)
+		}
+	}
+
 	s.logger.Info().Msg("Tiering metadata schema initialized")
 	return nil
 }
+
+// tierFileColumns is the SELECT list every tier_files read shares, in the
+// order scanFile and scanFiles consume it.
+const tierFileColumns = "id, path, database, measurement, partition_time, tier, size_bytes, created_at, migrated_at, quarantined_at, quarantine_reason"
 
 // invalidateTierCache removes the cache entry for a database/measurement pair.
 // Call this after any operation that might change which tiers have data.
@@ -158,7 +180,7 @@ func (s *MetadataStore) GetFile(ctx context.Context, path string) (*FileMetadata
 	defer s.mu.RUnlock()
 
 	query := `
-		SELECT id, path, database, measurement, partition_time, tier, size_bytes, created_at, migrated_at
+		SELECT ` + tierFileColumns + `
 		FROM tier_files
 		WHERE path = ?
 	`
@@ -173,7 +195,7 @@ func (s *MetadataStore) GetFilesInTier(ctx context.Context, tier Tier) ([]FileMe
 	defer s.mu.RUnlock()
 
 	query := `
-		SELECT id, path, database, measurement, partition_time, tier, size_bytes, created_at, migrated_at
+		SELECT ` + tierFileColumns + `
 		FROM tier_files
 		WHERE tier = ?
 		ORDER BY partition_time ASC
@@ -188,7 +210,9 @@ func (s *MetadataStore) GetFilesInTier(ctx context.Context, tier Tier) ([]FileMe
 	return s.scanFiles(rows)
 }
 
-// GetFilesOlderThan retrieves files in a tier older than the specified age
+// GetFilesOlderThan retrieves files in a tier older than the specified age.
+// Quarantined rows are excluded: this is the migration candidate query, and a
+// quarantined file is one tiering has established it can never act on (#758).
 func (s *MetadataStore) GetFilesOlderThan(ctx context.Context, tier Tier, maxAge time.Duration) ([]FileMetadata, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -196,9 +220,9 @@ func (s *MetadataStore) GetFilesOlderThan(ctx context.Context, tier Tier, maxAge
 	cutoff := time.Now().UTC().Add(-maxAge)
 
 	query := `
-		SELECT id, path, database, measurement, partition_time, tier, size_bytes, created_at, migrated_at
+		SELECT ` + tierFileColumns + `
 		FROM tier_files
-		WHERE tier = ? AND partition_time < ?
+		WHERE tier = ? AND partition_time < ? AND quarantined_at IS NULL
 		ORDER BY partition_time ASC
 	`
 
@@ -213,6 +237,7 @@ func (s *MetadataStore) GetFilesOlderThan(ctx context.Context, tier Tier, maxAge
 
 // GetRecentlyMigratedFiles retrieves files in a tier that were migrated within the given window.
 // Used by reconciliation to limit the working set to recently-migrated files.
+// Quarantined rows are excluded for the same reason as in GetFilesOlderThan.
 func (s *MetadataStore) GetRecentlyMigratedFiles(ctx context.Context, tier Tier, window time.Duration) ([]FileMetadata, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -220,9 +245,9 @@ func (s *MetadataStore) GetRecentlyMigratedFiles(ctx context.Context, tier Tier,
 	cutoff := time.Now().UTC().Add(-window)
 
 	query := `
-		SELECT id, path, database, measurement, partition_time, tier, size_bytes, created_at, migrated_at
+		SELECT ` + tierFileColumns + `
 		FROM tier_files
-		WHERE tier = ? AND migrated_at IS NOT NULL AND migrated_at >= ?
+		WHERE tier = ? AND migrated_at IS NOT NULL AND migrated_at >= ? AND quarantined_at IS NULL
 		ORDER BY migrated_at DESC
 	`
 
@@ -241,7 +266,7 @@ func (s *MetadataStore) GetFilesByDatabase(ctx context.Context, database string)
 	defer s.mu.RUnlock()
 
 	query := `
-		SELECT id, path, database, measurement, partition_time, tier, size_bytes, created_at, migrated_at
+		SELECT ` + tierFileColumns + `
 		FROM tier_files
 		WHERE database = ?
 		ORDER BY partition_time DESC
@@ -265,7 +290,7 @@ func (s *MetadataStore) GetFilesForQuery(ctx context.Context, database, measurem
 	defer s.mu.RUnlock()
 
 	query := `
-		SELECT id, path, database, measurement, partition_time, tier, size_bytes, created_at, migrated_at
+		SELECT ` + tierFileColumns + `
 		FROM tier_files
 		WHERE database = ?
 	`
@@ -441,6 +466,81 @@ func (s *MetadataStore) DeleteFile(ctx context.Context, path string) error {
 	}
 
 	return nil
+}
+
+// QuarantineFile marks a file index row as one tiering must never act on
+// again (#758). The row stays, with its tier unchanged, so the query path and
+// the status endpoints keep describing what is actually on disk; only the
+// work-set queries (GetFilesOlderThan, GetRecentlyMigratedFiles) exclude it.
+//
+// Persisted rather than held in memory because both work sets are recomputed
+// from this table every cycle, so an in-memory skip list would be forgotten
+// on restart and the retry storm would resume. Nothing clears the mark: the
+// only remedy for a permanently unusable key is renaming the object, and a
+// renamed object has a NEW key that registers as a fresh row.
+//
+// Idempotent on an already quarantined row: the original timestamp and
+// reason are kept, so the record says when tiering first established the
+// condition rather than when it last looked.
+func (s *MetadataStore) QuarantineFile(ctx context.Context, path, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		UPDATE tier_files
+		SET quarantined_at = COALESCE(quarantined_at, ?),
+		    quarantine_reason = COALESCE(quarantine_reason, ?)
+		WHERE path = ?
+	`
+
+	result, err := s.db.ExecContext(ctx, query, time.Now().UTC(), reason, path)
+	if err != nil {
+		return fmt.Errorf("failed to quarantine file: %w", err)
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("file not found: %s", path)
+	}
+
+	return nil
+}
+
+// GetQuarantinedFiles returns every file index row QuarantineFile has marked,
+// oldest mark first. This is the operator's list of files tiering has given
+// up on and that need a rename by hand.
+func (s *MetadataStore) GetQuarantinedFiles(ctx context.Context) ([]FileMetadata, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	query := `
+		SELECT ` + tierFileColumns + `
+		FROM tier_files
+		WHERE quarantined_at IS NOT NULL
+		ORDER BY quarantined_at ASC, id ASC
+	`
+
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query quarantined files: %w", err)
+	}
+	defer rows.Close()
+
+	return s.scanFiles(rows)
+}
+
+// CountQuarantinedFiles returns how many file index rows are quarantined.
+// Reported on the tiering status endpoint so the condition is visible without
+// reading the metrics endpoint; it should be zero.
+func (s *MetadataStore) CountQuarantinedFiles(ctx context.Context) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var n int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tier_files WHERE quarantined_at IS NOT NULL`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("failed to count quarantined files: %w", err)
+	}
+	return n, nil
 }
 
 // RecordMigration records a migration attempt
@@ -752,7 +852,8 @@ func (s *MetadataStore) CleanupOldMigrations(ctx context.Context, retentionDays 
 func (s *MetadataStore) scanFile(row *sql.Row) (*FileMetadata, error) {
 	var file FileMetadata
 	var tierStr string
-	var migratedAt sql.NullTime
+	var migratedAt, quarantinedAt sql.NullTime
+	var quarantineReason sql.NullString
 
 	err := row.Scan(
 		&file.ID,
@@ -764,6 +865,8 @@ func (s *MetadataStore) scanFile(row *sql.Row) (*FileMetadata, error) {
 		&file.SizeBytes,
 		&file.CreatedAt,
 		&migratedAt,
+		&quarantinedAt,
+		&quarantineReason,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -776,6 +879,10 @@ func (s *MetadataStore) scanFile(row *sql.Row) (*FileMetadata, error) {
 	if migratedAt.Valid {
 		file.MigratedAt = &migratedAt.Time
 	}
+	if quarantinedAt.Valid {
+		file.QuarantinedAt = &quarantinedAt.Time
+	}
+	file.QuarantineReason = quarantineReason.String
 
 	return &file, nil
 }
@@ -786,7 +893,8 @@ func (s *MetadataStore) scanFiles(rows *sql.Rows) ([]FileMetadata, error) {
 	for rows.Next() {
 		var file FileMetadata
 		var tierStr string
-		var migratedAt sql.NullTime
+		var migratedAt, quarantinedAt sql.NullTime
+		var quarantineReason sql.NullString
 
 		err := rows.Scan(
 			&file.ID,
@@ -798,6 +906,8 @@ func (s *MetadataStore) scanFiles(rows *sql.Rows) ([]FileMetadata, error) {
 			&file.SizeBytes,
 			&file.CreatedAt,
 			&migratedAt,
+			&quarantinedAt,
+			&quarantineReason,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan file: %w", err)
@@ -807,6 +917,10 @@ func (s *MetadataStore) scanFiles(rows *sql.Rows) ([]FileMetadata, error) {
 		if migratedAt.Valid {
 			file.MigratedAt = &migratedAt.Time
 		}
+		if quarantinedAt.Valid {
+			file.QuarantinedAt = &quarantinedAt.Time
+		}
+		file.QuarantineReason = quarantineReason.String
 
 		files = append(files, file)
 	}

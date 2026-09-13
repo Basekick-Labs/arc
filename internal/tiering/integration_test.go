@@ -10,11 +10,19 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/config"
+	"github.com/basekick-labs/arc/internal/storage"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
 )
 
-// mockBackend implements storage.Backend for testing
+// mockBackend implements storage.Backend for testing.
+//
+// Every key-taking method enforces storage.ValidateKey, as all three
+// production backends do (#743). An untaught double is more permissive than
+// production and would make the ErrInvalidPath branches in the migrator dead
+// code under test (#758). seedRaw exists to plant a key the contract refuses,
+// which is how such a file gets into storage in the field: written by an
+// earlier binary, not by this one.
 type mockBackend struct {
 	files map[string][]byte
 	typ   string
@@ -30,7 +38,18 @@ func newMockBackend(typ string) *mockBackend {
 
 func (m *mockBackend) Type() string       { return m.typ }
 func (m *mockBackend) ConfigJSON() string { return "{}" }
+
+// seedRaw stores data under path without validating the key.
+func (m *mockBackend) seedRaw(path string, data []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.files[path] = data
+}
+
 func (m *mockBackend) Read(_ context.Context, path string) ([]byte, error) {
+	if err := storage.ValidateKey(path); err != nil {
+		return nil, err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if data, ok := m.files[path]; ok {
@@ -39,6 +58,9 @@ func (m *mockBackend) Read(_ context.Context, path string) ([]byte, error) {
 	return nil, os.ErrNotExist
 }
 func (m *mockBackend) ReadTo(_ context.Context, path string, w io.Writer) error {
+	if err := storage.ValidateKey(path); err != nil {
+		return err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if data, ok := m.files[path]; ok {
@@ -48,12 +70,18 @@ func (m *mockBackend) ReadTo(_ context.Context, path string, w io.Writer) error 
 	return os.ErrNotExist
 }
 func (m *mockBackend) Write(_ context.Context, path string, data []byte) error {
+	if err := storage.ValidateKey(path); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.files[path] = data
 	return nil
 }
 func (m *mockBackend) WriteReader(_ context.Context, path string, r io.Reader, _ int64) error {
+	if err := storage.ValidateKey(path); err != nil {
+		return err
+	}
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return err
@@ -64,12 +92,18 @@ func (m *mockBackend) WriteReader(_ context.Context, path string, r io.Reader, _
 	return nil
 }
 func (m *mockBackend) Delete(_ context.Context, path string) error {
+	if err := storage.ValidateKey(path); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.files, path)
 	return nil
 }
 func (m *mockBackend) Exists(_ context.Context, path string) (bool, error) {
+	if err := storage.ValidateKey(path); err != nil {
+		return false, err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	_, ok := m.files[path]

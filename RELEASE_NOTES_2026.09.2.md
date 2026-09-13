@@ -313,6 +313,57 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Tiering no longer retries an unusable storage key every cycle ([#758](https://github.com/Basekick-Labs/arc/issues/758))
+
+[#747](https://github.com/Basekick-Labs/arc/issues/747) taught compaction,
+reconciliation, replication and edge-sync export to quarantine a storage key no
+backend can address instead of retrying it, and left tiering for a follow-up.
+This is that follow-up.
+
+The tiering migration is cron-driven and recomputes its candidate set from the
+SQLite file index on every cycle, with no failure backoff, no skip list and no
+attempt cap. A hot file whose key the storage contract refuses (one written
+under a folded name by a pre-[#741](https://github.com/Basekick-Labs/arc/issues/741)
+Arc, indexed by the pre-migration scan because local listings do not filter
+such keys) failed the copy with the same permanent error every night, stayed in
+the hot tier, was re-selected the next night, and wrote a fresh failed-migration
+row into the history table each time, forever. Reconciliation had the smaller
+version of the same loop: a cold row with such a key failed its hot existence
+check on every pass for the 48 hours the reconcile window covers.
+
+Both sites now recognise the permanent error, log once at Error, count it in
+`arc_storage_invalid_path_quarantined_total`, and **quarantine the file index
+row**. Because the work set is rebuilt from SQLite every cycle, the quarantine
+is persisted on the row (`tier_files.quarantined_at` and `quarantine_reason`,
+added on first open of an existing database) rather than remembered in memory,
+so it survives restarts and the nightly rescan. A quarantined row keeps its tier
+and its file: on local storage the file is a real data file inside the
+partition glob and the query path still serves it, so the index keeps saying it
+exists in hot. Only the two work-set queries, migration candidates and
+recently-migrated reconciliation, stop returning it.
+
+What the operator sees:
+
+- The cycle that discovers the condition reports one failed migration and
+  writes one failed-migration history row, and the next cycle reports none.
+- `GET /api/v1/tiering/status` gains `quarantined_files`, which should be zero.
+- `GET /api/v1/tiering/files` shows `quarantined_at` and `quarantine_reason` on
+  affected rows.
+
+Nothing clears a quarantine, deliberately. The only remedy for a permanently
+unusable key is renaming the object in storage, and a renamed object has a new
+key that the next scan registers as a fresh row and migrates normally.
+
+Quarantine is decided on `storage.ErrInvalidPath` alone. A transient copy or
+existence-check failure keeps the row in the work set and is retried next cycle
+as before, and each site carries a test that pins that, because widening the
+rule to "any failure" would retire a file from tiering on a network blip. The
+streaming copy also now reports the permanent error whichever side of the pipe
+fails first, since which goroutine wins that race is not deterministic and the
+classification must not depend on it. The tiering test double now enforces the
+storage key contract like the production backends, so these branches are not
+dead code under test.
+
 ### A backup no longer reports success while silently omitting files ([#756](https://github.com/Basekick-Labs/arc/issues/756))
 
 A backup could finish, report success, and be missing data files that exist in
