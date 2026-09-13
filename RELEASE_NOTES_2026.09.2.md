@@ -320,6 +320,16 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### TOCTOU race in MQTT subscription restart ([#301](https://github.com/Basekick-Labs/arc/issues/301))
+
+`RestartSubscription` now reserves the subscription slot with a nil-placeholder before
+releasing the manager lock, preventing concurrent start or restart operations from
+launching duplicate subscribers while configuration is loaded and the new subscriber starts.
+A start or restart that lands during an in-flight restart now receives `409 Conflict`,
+and the previous subscriber's disconnect no longer runs under the manager lock.
+
+Contributed by [@Thundercloud12](https://github.com/Thundercloud12) in [#766](https://github.com/Basekick-Labs/arc/pull/766).
+
 ### Tiering no longer retries an unusable storage key every cycle ([#758](https://github.com/Basekick-Labs/arc/issues/758))
 
 [#747](https://github.com/Basekick-Labs/arc/issues/747) taught compaction,
@@ -1449,14 +1459,3 @@ warehouse metadata directory, after the files are removed, so a racing
 reconcile pass can only empty tables rather than recreate them. Cleanup
 failures are logged and re-running the DELETE retries them, including when the
 files are already gone.
-
-### TOCTOU race in MQTT subscription restart ([#301](https://github.com/Basekick-Labs/arc/issues/301))
-
-`RestartSubscription` now reserves the subscription slot with a nil-placeholder before
-releasing the manager lock, preventing concurrent start or restart operations from
-launching duplicate subscribers while configuration is loaded and the new subscriber starts.
-A start or restart that lands during an in-flight restart now receives `409 Conflict`,
-and the previous subscriber's disconnect no longer runs under the manager lock.
-
-Contributed by [@Thundercloud12](https://github.com/Thundercloud12) in [#766](https://github.com/Basekick-Labs/arc/pull/766).
-
