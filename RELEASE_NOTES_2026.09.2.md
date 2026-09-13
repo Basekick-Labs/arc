@@ -342,9 +342,8 @@ fails the build rather than leaving the note quietly wrong.
 
 Parent-side compaction cleanup now removes only the exact JobID-owned temp directory, so it can no longer sweep another concurrent job whose names collapse to the same underscore prefix. If parent cleanup itself fails, the leftover is retained for `CleanupOrphanedTempDirs` to remove on the next startup instead of being hidden by a broad prefix sweep.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#749](https://github.com/Basekick-Labs/arc/pull/749).
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#786](https://github.com/Basekick-Labs/arc/pull/786).
 
-<<<<<<< HEAD
 ### Iceberg export on an edge-sync hub produced one garbage table per spoke ([#634](https://github.com/Basekick-Labs/arc/issues/634))
 
 **Affects hubs only** — a node receiving edge-sync data with `iceberg.enabled = true`.

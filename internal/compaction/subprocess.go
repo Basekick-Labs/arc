@@ -167,8 +167,8 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 	// PARENT's cwd — unmanaged by compaction's cleanup and wrong if the
 	// operator moved compaction.temp_directory to a bigger volume. The job dir
 	// ({TempDirectory}/{JobID}) is already covered by both the subprocess's
-	// deferred cleanup and the parent's crash sweep (CompactPartition's
-	// partition-prefix walk), so spill files can never outlive the job.
+	// deferred cleanup and the parent's exact cleanup; if either process
+	// crashes, CleanupOrphanedTempDirs removes the leftover on startup.
 	// JobID is always set by the parent (CompactPartition); skip on the
 	// defensive empty case and keep DuckDB's default.
 	if config.JobID != "" {
