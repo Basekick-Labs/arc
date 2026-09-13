@@ -112,7 +112,7 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 		// We thought we weren't the leader but we are — caller's IsLeader
 		// check raced with a recent election. Apply locally instead of
 		// dialing ourselves. This is the safe fallback.
-		return c.raftNode.Apply(cmd, forwardApplyTimeout)
+		return c.raftNode.Apply(cmd, manifestApplyTimeout(ctx))
 	}
 
 	leaderAddr := c.leaderCoordinatorAddress(leaderID)

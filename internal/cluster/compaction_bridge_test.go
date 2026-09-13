@@ -34,15 +34,21 @@ type stubBridgeCoordinator struct {
 	registerCalls int
 	deleteCalls   int
 	batchCalls    int
+	registerCtx   context.Context
+	deleteCtx     context.Context
+	batchCtx      context.Context
+	batchFn       func(context.Context) error
 }
 
 func (s *stubBridgeCoordinator) LocalNodeID() string { return s.nodeID }
-func (s *stubBridgeCoordinator) RegisterFileInManifest(file raft.FileEntry) error {
+func (s *stubBridgeCoordinator) RegisterFileInManifest(ctx context.Context, file raft.FileEntry) error {
+	s.registerCtx = ctx
 	s.registerCalls++
 	s.registered = append(s.registered, file)
 	return s.registerErr
 }
-func (s *stubBridgeCoordinator) DeleteFileFromManifest(path, reason string) error {
+func (s *stubBridgeCoordinator) DeleteFileFromManifest(ctx context.Context, path, reason string) error {
+	s.deleteCtx = ctx
 	s.deleteCalls++
 	s.deleted = append(s.deleted, struct{ Path, Reason string }{path, reason})
 	return s.deleteErr
@@ -50,6 +56,15 @@ func (s *stubBridgeCoordinator) DeleteFileFromManifest(path, reason string) erro
 func (s *stubBridgeCoordinator) BatchFileOpsInManifest(ops []raft.BatchFileOp) error {
 	s.batchCalls++
 	s.batched = append(s.batched, ops...)
+	return s.batchErr
+}
+func (s *stubBridgeCoordinator) BatchFileOpsInManifestContext(ctx context.Context, ops []raft.BatchFileOp) error {
+	s.batchCtx = ctx
+	s.batchCalls++
+	s.batched = append(s.batched, ops...)
+	if s.batchFn != nil {
+		return s.batchFn(ctx)
+	}
 	return s.batchErr
 }
 
@@ -186,6 +201,20 @@ func TestCompactionBridge_RegisterRespectsDeadline(t *testing.T) {
 	}
 }
 
+func TestCompactionBridge_RegisterPassesCallerContext(t *testing.T) {
+	stub := &stubBridgeCoordinator{nodeID: "c1"}
+	bridge := NewCompactionBridge(stub)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := bridge.RegisterCompactedFile(ctx, compaction.CompactedFile{Path: "x.parquet"}); err != nil {
+		t.Fatalf("RegisterCompactedFile: %v", err)
+	}
+	if stub.registerCtx != ctx {
+		t.Fatal("register coordinator did not receive the caller context")
+	}
+}
+
 // --- DeleteCompactedSource ---
 
 // Symmetric mapping test for the delete path.
@@ -224,6 +253,20 @@ func TestCompactionBridge_DeleteSuccessAsLeader(t *testing.T) {
 	}
 	if stub.deleted[0].Reason != "compaction:job-42" {
 		t.Errorf("Reason: got %q, want compaction:job-42", stub.deleted[0].Reason)
+	}
+}
+
+func TestCompactionBridge_DeletePassesCallerContext(t *testing.T) {
+	stub := &stubBridgeCoordinator{nodeID: "c1"}
+	bridge := NewCompactionBridge(stub)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := bridge.DeleteCompactedSource(ctx, "src.parquet", "test"); err != nil {
+		t.Fatalf("DeleteCompactedSource: %v", err)
+	}
+	if stub.deleteCtx != ctx {
+		t.Fatal("delete coordinator did not receive the caller context")
 	}
 }
 
@@ -359,6 +402,35 @@ func TestCompactionBridge_BatchFileOps_RespectsDeadline(t *testing.T) {
 	}
 	if stub.batchCalls != 0 {
 		t.Errorf("batchCalls: got %d, want 0 (expired ctx must short-circuit)", stub.batchCalls)
+	}
+}
+
+func TestCompactionBridge_BatchFileOps_PassesCallerContextToBlockingApply(t *testing.T) {
+	stub := &stubBridgeCoordinator{nodeID: "c1"}
+	stub.batchFn = func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	bridge := NewCompactionBridge(stub)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	err := bridge.BatchFileOps(ctx, []compaction.CompactedFile{{Path: "x.parquet"}}, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected caller deadline, got %v", err)
+	}
+	if stub.batchCtx != ctx {
+		t.Fatal("batch coordinator did not receive the caller context")
+	}
+}
+
+func TestManifestApplyTimeoutUsesShorterCallerDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+
+	timeout := manifestApplyTimeout(ctx)
+	if timeout <= 0 || timeout >= forwardApplyTimeout {
+		t.Fatalf("manifest apply timeout: got %v, want positive value below %v", timeout, forwardApplyTimeout)
 	}
 }
 
