@@ -327,6 +327,13 @@ func (h *MQTTSubscriptionHandler) handleRestart(c *fiber.Ctx) error {
 	if err := h.manager.RestartSubscription(c.Context(), id); err != nil {
 		h.logger.Error().Err(err).Str("id", id).Msg("Failed to restart subscription")
 
+		if errors.Is(err, mqtt.ErrSubscriptionAlreadyRunning) {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"success": false,
+				"error":   err.Error(),
+			})
+		}
+
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
 			"error":   "Failed to restart subscription",
