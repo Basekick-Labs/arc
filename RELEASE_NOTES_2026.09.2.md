@@ -320,6 +320,14 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Remaining DuckDB string-literal escaping uses the shared helper ([#781](https://github.com/Basekick-Labs/arc/issues/781))
+
+The remaining compaction and database DuckDB string-literal escaping now uses
+the shared `sqlutil` helper. Compaction no longer incorrectly doubles ordinary
+backslashes in standard DuckDB string literals.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#781](https://github.com/Basekick-Labs/arc/issues/781).
+
 ### Retention reports files hidden by storage listings ([#771](https://github.com/Basekick-Labs/arc/issues/771))
 
 Retention already had a skipped-file counter, but since #744 normal listing no
