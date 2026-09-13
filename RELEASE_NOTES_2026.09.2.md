@@ -326,7 +326,7 @@ The remaining compaction and database DuckDB string-literal escaping now uses
 the shared `sqlutil` helper. Compaction no longer incorrectly doubles ordinary
 backslashes in standard DuckDB string literals.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#781](https://github.com/Basekick-Labs/arc/issues/781).
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#782](https://github.com/Basekick-Labs/arc/pull/782).
 
 ### Retention reports files hidden by storage listings ([#771](https://github.com/Basekick-Labs/arc/issues/771))
 
