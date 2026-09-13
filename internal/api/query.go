@@ -3032,15 +3032,10 @@ func (h *QueryHandler) storagePathForBackend(ctx context.Context, backend storag
 	return path
 }
 
-// quotePath returns a safe single-quoted DuckDB string literal for use
-// inside read_parquet('PATH', ...) interpolations. Single quotes inside
-// the path are doubled per DuckDB's literal-escape rule. This is the
-// single source of truth for path interpolation in the query layer —
-// every `read_parquet('` site goes through this helper to close the
-// SQL-injection vector via the x-arc-database header / measurement
-// names / manifest entries (review/query-path-criticals C2).
+// quotePath returns a single-quoted DuckDB string literal for use inside
+// read_parquet path interpolations.
 func quotePath(path string) string {
-	return "'" + sqlutil.EscapeStringLiteral(path) + "'"
+	return sqlutil.QuoteStringLiteral(path)
 }
 
 // buildReadParquetOptions builds the read_parquet options string.

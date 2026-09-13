@@ -44,12 +44,6 @@ var errManifestFailure = errors.New("cluster manifest update failed")
 // Matches compaction's row group size to limit DuckDB's internal write buffer per group.
 const parquetRowGroupSize = 122880
 
-// escapeDuckDBPath escapes single quotes in a path for safe interpolation into
-// DuckDB read_parquet() calls, which do not support parameterized queries.
-func escapeDuckDBPath(path string) string {
-	return strings.ReplaceAll(path, "'", "''")
-}
-
 // fileMetadata returns the byte size and hex-encoded SHA-256 of the file at path.
 func fileMetadata(path string) (sizeBytes int64, sha256hex string, err error) {
 	f, err := os.Open(path)
@@ -612,9 +606,7 @@ func (h *DeleteHandler) countMatchingRowsInFiles(ctx context.Context, files []fi
 		if i > 0 {
 			pathList.WriteString(", ")
 		}
-		pathList.WriteString("'")
-		pathList.WriteString(escapeDuckDBPath(f.queryPath))
-		pathList.WriteString("'")
+		pathList.WriteString(sqlutil.QuoteStringLiteral(f.queryPath))
 	}
 	pathList.WriteString("]")
 
@@ -684,7 +676,7 @@ func (h *DeleteHandler) countMatchingRowsIndividually(ctx context.Context, files
 	db := h.db.DB()
 
 	for _, f := range files {
-		query := fmt.Sprintf("SELECT COUNT(*) FROM read_parquet('%s') WHERE %s", escapeDuckDBPath(f.queryPath), whereClause)
+		query := fmt.Sprintf("SELECT COUNT(*) FROM read_parquet(%s) WHERE %s", sqlutil.QuoteStringLiteral(f.queryPath), whereClause)
 		var count int64
 		if err := db.QueryRowContext(ctx, query).Scan(&count); err != nil {
 			h.logger.Warn().Err(err).Str("file", f.relativePath).Msg("Failed to count matching rows, skipping file")
@@ -718,8 +710,8 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 		SELECT
 			COUNT(*) as total,
 			COUNT(*) FILTER (WHERE NOT (%s)) as remaining
-		FROM read_parquet('%s')`,
-		whereClause, escapeDuckDBPath(queryPath))
+		FROM read_parquet(%s)`,
+		whereClause, sqlutil.QuoteStringLiteral(queryPath))
 
 	if err := db.QueryRowContext(ctx, countQuery).Scan(&rowsBefore, &rowsAfter); err != nil {
 		return 0, fmt.Errorf("failed to count rows: %w", err)
@@ -801,13 +793,13 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, _, where
 	// database-wide setting is false.
 	copyQuery := fmt.Sprintf(`
 		COPY (
-			SELECT * FROM read_parquet('%s') WHERE NOT (%s)
-		) TO '%s' (
+			SELECT * FROM read_parquet(%s) WHERE NOT (%s)
+		) TO %s (
 			FORMAT PARQUET,
 			COMPRESSION ZSTD,
 			COMPRESSION_LEVEL 3,
 			ROW_GROUP_SIZE %d
-		)`, escapeDuckDBPath(filePath), whereClause, escapeDuckDBPath(tempFile), parquetRowGroupSize)
+		)`, sqlutil.QuoteStringLiteral(filePath), whereClause, sqlutil.QuoteStringLiteral(tempFile), parquetRowGroupSize)
 
 	if err := database.ExecPreservingInsertionOrder(ctx, db, copyQuery); err != nil {
 		os.Remove(tempFile)
@@ -877,13 +869,13 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 	// database-wide setting is false.
 	copyQuery := fmt.Sprintf(`
 		COPY (
-			SELECT * FROM read_parquet('%s') WHERE NOT (%s)
-		) TO '%s' (
+			SELECT * FROM read_parquet(%s) WHERE NOT (%s)
+		) TO %s (
 			FORMAT PARQUET,
 			COMPRESSION ZSTD,
 			COMPRESSION_LEVEL 3,
 			ROW_GROUP_SIZE %d
-		)`, escapeDuckDBPath(s3Path), whereClause, escapeDuckDBPath(tempPath), parquetRowGroupSize)
+		)`, sqlutil.QuoteStringLiteral(s3Path), whereClause, sqlutil.QuoteStringLiteral(tempPath), parquetRowGroupSize)
 
 	if err := database.ExecPreservingInsertionOrder(ctx, db, copyQuery); err != nil {
 		return 0, nil, fmt.Errorf("failed to write filtered data: %w", err)
