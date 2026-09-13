@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -151,6 +152,111 @@ func TestFiles_RecursesNestedPartitions(t *testing.T) {
 		if want := "file://" + filepath.Join(root); f.PhysicalPath[:len(want)] != want {
 			t.Errorf("file path %q not under root %q", f.PhysicalPath, want)
 		}
+	}
+}
+
+func TestFiles_RefusesHiddenDataFile(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const prefix = "mydb/cpu/2026/07/14/15/"
+	writeArcStyleParquet(t, filepath.Join(root, filepath.FromSlash(prefix), "visible.parquet"), 1_700_000_000_000_000, 1)
+	hiddenPath := filepath.Join(root, filepath.FromSlash(prefix), "ba\\d.parquet")
+	writeArcStyleParquet(t, hiddenPath, 1_700_000_000_000_000, 1)
+	// This is hidden by the same listing rule but is not an Iceberg data file.
+	irrelevantPath := filepath.Join(root, filepath.FromSlash(prefix), ".DS_Store")
+	if err := os.WriteFile(irrelevantPath, []byte("junk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	listed, err := backend.List(ctx, prefix)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	for _, path := range listed {
+		if strings.Contains(path, `ba\d.parquet`) || strings.Contains(path, ".DS_Store") {
+			t.Fatalf("List returned hidden path %q", path)
+		}
+	}
+
+	unusable, err := backend.ListUnusable(ctx, prefix)
+	if err != nil {
+		t.Fatalf("ListUnusable: %v", err)
+	}
+	var sawHiddenData, sawIrrelevant bool
+	for _, obj := range unusable {
+		switch {
+		case strings.Contains(obj.Path, `ba\d.parquet`):
+			sawHiddenData = true
+		case strings.Contains(obj.Path, ".DS_Store"):
+			sawIrrelevant = true
+		}
+	}
+	if !sawHiddenData || !sawIrrelevant {
+		t.Fatalf("ListUnusable = %v, want hidden data and irrelevant entries", unusable)
+	}
+
+	src := NewStorageWalkSource(backend, "arc", zerolog.Nop())
+	files, err := src.Files(ctx, Measurement{Database: "mydb", Measurement: "cpu"})
+	if err == nil {
+		t.Fatalf("Files returned %d files, want hidden data-file error", len(files))
+	}
+	if !strings.Contains(err.Error(), "hidden from the normal storage listing") ||
+		!strings.Contains(err.Error(), "publishing the table would be incomplete") {
+		t.Fatalf("Files error = %v, want actionable incomplete-export context", err)
+	}
+}
+
+func TestFiles_IgnoresIrrelevantHiddenFile(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const prefix = "mydb/cpu/2026/07/14/15/"
+	visiblePath := filepath.Join(root, filepath.FromSlash(prefix), "visible.parquet")
+	writeArcStyleParquet(t, visiblePath, 1_700_000_000_000_000, 1)
+	if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(prefix), ".DS_Store"), []byte("junk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	listed, err := backend.List(ctx, prefix)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	for _, path := range listed {
+		if strings.Contains(path, ".DS_Store") {
+			t.Fatalf("List returned irrelevant hidden path %q", path)
+		}
+	}
+	unusable, err := backend.ListUnusable(ctx, prefix)
+	if err != nil {
+		t.Fatalf("ListUnusable: %v", err)
+	}
+	var sawIrrelevant bool
+	for _, obj := range unusable {
+		if strings.Contains(obj.Path, ".DS_Store") {
+			sawIrrelevant = true
+			break
+		}
+	}
+	if !sawIrrelevant {
+		t.Fatalf("ListUnusable = %v, want .DS_Store", unusable)
+	}
+
+	src := NewStorageWalkSource(backend, "arc", zerolog.Nop())
+	files, err := src.Files(ctx, Measurement{Database: "mydb", Measurement: "cpu"})
+	if err != nil {
+		t.Fatalf("Files: %v", err)
+	}
+	if len(files) != 1 || !strings.Contains(files[0].PhysicalPath, "visible.parquet") {
+		t.Fatalf("Files = %+v, want visible.parquet only", files)
 	}
 }
 

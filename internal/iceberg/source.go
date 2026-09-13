@@ -195,6 +195,22 @@ func (s *StorageWalkSource) LocalFiles(ctx context.Context, m Measurement) ([]st
 // is non-local. Files() and LocalFiles() delegate here for callers that need just one view.
 func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([]FileRef, []string, error) {
 	prefix := m.Database + "/" + m.Measurement + "/"
+	if ul, ok := s.backend.(storage.UnusableLister); ok {
+		// Enumerate hidden files first: a hidden-to-usable rename between the
+		// two passes may cause a spurious refusal, but never a silent omission.
+		unusable, err := ul.ListUnusable(ctx, prefix)
+		if err != nil {
+			return nil, nil, fmt.Errorf("check hidden files for %s/%s: %w", m.Database, m.Measurement, err)
+		}
+		for _, obj := range unusable {
+			if isDataFile(obj.Path) {
+				return nil, nil, fmt.Errorf(
+					"refusing Iceberg export for %s/%s: a data file is hidden from the normal storage listing, so publishing the table would be incomplete",
+					m.Database, m.Measurement,
+				)
+			}
+		}
+	}
 	paths, err := s.backend.List(ctx, prefix)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list files for %s/%s: %w", m.Database, m.Measurement, err)
