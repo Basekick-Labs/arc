@@ -352,7 +352,7 @@ measurement per pass to find these hidden files, which is the safe fallback; a
 single combined walk is the future optimization if reconcile time becomes an
 issue.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#785](https://github.com/efegokdemir/arc/pull/785).
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#785](https://github.com/Basekick-Labs/arc/pull/785).
 
 ### Iceberg export on an edge-sync hub produced one garbage table per spoke ([#634](https://github.com/Basekick-Labs/arc/issues/634))
 

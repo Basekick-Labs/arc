@@ -206,8 +206,12 @@ func TestFiles_RefusesHiddenDataFile(t *testing.T) {
 		t.Fatalf("Files returned %d files, want hidden data-file error", len(files))
 	}
 	if !strings.Contains(err.Error(), "hidden from the normal storage listing") ||
-		!strings.Contains(err.Error(), "publishing the table would be incomplete") {
-		t.Fatalf("Files error = %v, want actionable incomplete-export context", err)
+		!strings.Contains(err.Error(), "publishing the table would be incomplete") ||
+		!strings.Contains(err.Error(), "ba\\d.parquet") ||
+		!strings.Contains(err.Error(), "rename the files") ||
+		!strings.Contains(err.Error(), "next reconcile pass will publish") ||
+		!strings.Contains(err.Error(), "invalid path") {
+		t.Fatalf("Files error = %v, want hidden path, reason, and actionable rename context", err)
 	}
 }
 
