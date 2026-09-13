@@ -65,7 +65,7 @@ func pathCorpus() []string {
 // It is reachable: edgesync.validateSpokeID accepts "rocket:01", a spoke ID is
 // the first segment of everything that spoke writes, and storage accepts those
 // keys. Such a file is stored and then cannot be registered in the manifest.
-// Tracked separately; this test pins the divergence so it cannot widen
+// Tracked in #776; this test pins the divergence so it cannot widen
 // silently, and asserts the superset relation holds everywhere else.
 func TestManifestValidatorAcceptsSupersetOfContract(t *testing.T) {
 	checked := 0

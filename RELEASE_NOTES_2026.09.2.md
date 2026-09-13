@@ -922,7 +922,7 @@ Spoke IDs containing a colon, such as `rocket:01`, are now rejected during
 registration and input validation because the resulting storage key would be
 refused by the cluster manifest path validator.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#751](https://github.com/Basekick-Labs/arc/issues/751).
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#776](https://github.com/Basekick-Labs/arc/pull/776).
 
 ### Arrow IPC cleanup no longer runs twice on the panic path ([#733](https://github.com/Basekick-Labs/arc/issues/733))
 
