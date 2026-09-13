@@ -320,6 +320,13 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Backup no longer skips temp-file write failures ([#779](https://github.com/Basekick-Labs/arc/issues/779))
+
+Backup now treats failures writing its temporary file as fatal instead of
+misclassifying them as unreadable source files and counting them as skipped.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#779](https://github.com/Basekick-Labs/arc/issues/779).
+
 ### Retention reports files hidden by storage listings ([#771](https://github.com/Basekick-Labs/arc/issues/771))
 
 Retention already had a skipped-file counter, but since #744 normal listing no
