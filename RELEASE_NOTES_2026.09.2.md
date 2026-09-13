@@ -916,6 +916,14 @@ happens to the files already written under the folded name.
 
 Reported by **[@rexpository](https://github.com/rexpository)**.
 
+### Edge-sync spoke IDs no longer create manifest-invalid keys ([#751](https://github.com/Basekick-Labs/arc/issues/751))
+
+Spoke IDs containing a colon, such as `rocket:01`, are now rejected during
+registration and input validation because the resulting storage key would be
+refused by the cluster manifest path validator.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#751](https://github.com/Basekick-Labs/arc/issues/751).
+
 ### Arrow IPC cleanup no longer runs twice on the panic path ([#733](https://github.com/Basekick-Labs/arc/issues/733))
 
 No behaviour changes for anyone running Arc. This is recorded because the code
