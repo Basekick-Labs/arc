@@ -188,3 +188,28 @@ func TestKeyLengthLeavesRoomForTheStagingSuffix(t *testing.T) {
 		t.Errorf("the contract accepted a key the write path cannot store: %v", err)
 	}
 }
+
+func TestListStagedOmitsKeysRejectedByDeleteStaged(t *testing.T) {
+	dir := t.TempDir()
+	b, _ := NewLocalBackend(dir, zerolog.Nop())
+	ctx := context.Background()
+
+	if err := os.MkdirAll(filepath.Join(dir, "db"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	key := "db/" + strings.Repeat("k", MaxUsableKeySegmentLen+1)
+	if err := os.WriteFile(filepath.Join(dir, key+PartSuffix), []byte("PART"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	staged, err := b.ListStaged(ctx, "db/")
+	if err != nil {
+		t.Fatalf("ListStaged: %v", err)
+	}
+	if len(staged) != 0 {
+		t.Fatalf("ListStaged returned an undeletable key: %+v", staged)
+	}
+	if _, err := b.DeleteStaged(ctx, key); err == nil {
+		t.Fatal("DeleteStaged accepted the invalid key")
+	}
+}
