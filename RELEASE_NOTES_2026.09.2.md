@@ -318,7 +318,23 @@ fails the build rather than leaving the note quietly wrong.
    with `governance.enabled = true` and a `max_rows_per_query` policy can see
    them at all.
 
+7. **Edge-sync spoke IDs containing `:` must be re-registered before upgrade.**
+   See *Edge-sync spoke IDs no longer create manifest-invalid keys* below;
+   existing files remain under the old namespace.
+
 ## Bug fixes
+
+### Edge-sync spoke IDs no longer create manifest-invalid keys ([#751](https://github.com/Basekick-Labs/arc/issues/751))
+
+Spoke IDs containing a colon, such as `rocket:01`, are now rejected during
+registration and input validation because the resulting storage key would be
+refused by the cluster manifest path validator.
+
+A spoke registered with a colon before this version is refused after upgrade:
+the hub rejects its syncs and the spoke will not start. Re-register it under a
+new ID; files already written under the old namespace stay where they are.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#776](https://github.com/Basekick-Labs/arc/pull/776).
 
 ### Retention reports files hidden by storage listings ([#771](https://github.com/Basekick-Labs/arc/issues/771))
 
@@ -915,14 +931,6 @@ whole backlog into the new namespace. Plan the move deliberately, deciding what
 happens to the files already written under the folded name.
 
 Reported by **[@rexpository](https://github.com/rexpository)**.
-
-### Edge-sync spoke IDs no longer create manifest-invalid keys ([#751](https://github.com/Basekick-Labs/arc/issues/751))
-
-Spoke IDs containing a colon, such as `rocket:01`, are now rejected during
-registration and input validation because the resulting storage key would be
-refused by the cluster manifest path validator.
-
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#776](https://github.com/Basekick-Labs/arc/pull/776).
 
 ### Arrow IPC cleanup no longer runs twice on the panic path ([#733](https://github.com/Basekick-Labs/arc/issues/733))
 

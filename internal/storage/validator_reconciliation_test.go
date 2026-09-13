@@ -62,11 +62,9 @@ func pathCorpus() []string {
 // than a corpus artifact: raft rejects any ":" outside a Windows drive prefix,
 // as an anti-worm-primitive guard (a scheme in a manifest path is the
 // "s3://attacker-bucket/..." shape), while the key contract has no colon rule.
-// It is reachable: edgesync.validateSpokeID accepts "rocket:01", a spoke ID is
-// the first segment of everything that spoke writes, and storage accepts those
-// keys. Such a file is stored and then cannot be registered in the manifest.
-// Tracked in #776; this test pins the divergence so it cannot widen
-// silently, and asserts the superset relation holds everywhere else.
+// It was reachable through edgesync.validateSpokeID until #776. The key
+// contract itself still accepts a colon, so the divergence remains pinned
+// here; this test asserts the superset relation holds everywhere else.
 func TestManifestValidatorAcceptsSupersetOfContract(t *testing.T) {
 	checked := 0
 	for _, p := range pathCorpus() {

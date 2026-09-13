@@ -652,7 +652,7 @@ func validateSpokeID(spokeID string) error {
 		return fmt.Errorf("edgesync: spoke ID %q contains a path separator", spokeID)
 	}
 	if strings.ContainsRune(spokeID, ':') {
-		return fmt.Errorf("edgesync: spoke ID %q contains a colon incompatible with the cluster manifest path validator", spokeID)
+		return fmt.Errorf("edgesync: spoke ID %q contains a colon, which the cluster manifest path validator refuses", spokeID)
 	}
 	if spokeID == "." || spokeID == ".." || strings.HasPrefix(spokeID, ".") {
 		return fmt.Errorf("edgesync: spoke ID %q may not start with a dot", spokeID)
