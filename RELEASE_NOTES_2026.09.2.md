@@ -328,7 +328,7 @@ including files whose keys are rejected by the storage contract. These files
 remain untouched, while dry-run and real retention executions report the same
 skipped-file count and reason.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#771](https://github.com/Basekick-Labs/arc/issues/771).
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#775](https://github.com/Basekick-Labs/arc/pull/775).
 
 
 ### Numeric MessagePack host values are logged when coerced ([#768](https://github.com/Basekick-Labs/arc/issues/768))
