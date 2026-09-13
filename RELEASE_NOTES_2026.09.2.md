@@ -1391,3 +1391,7 @@ warehouse metadata directory, after the files are removed, so a racing
 reconcile pass can only empty tables rather than recreate them. Cleanup
 failures are logged and re-running the DELETE retries them, including when the
 files are already gone.
+
+## Fixed
+
+- **msgpack ingest: log numeric host coercion at debug level.** The `extractHost` fallback that coerces a numeric host value into `host_<num>` is preserved, but a debug-level log is now emitted when the fallback fires so operators can spot misconfigured clients without changing ingest behaviour. The `fmt.Sprintf` for the log message reuses the value already built for the return, so the debug-disabled path is not penalised. Contributed by [@lecodev-26](https://github.com/lecodev-26) in [#769](https://github.com/Basekick-Labs/arc/pull/769).

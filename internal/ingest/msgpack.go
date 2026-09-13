@@ -426,7 +426,7 @@ func (d *MessagePackDecoder) extractTimestamp(t interface{}) (time.Time, error) 
 
 // extractHost extracts host identifier.
 //
-// A host is expected to be a string identifier. For backwards compatibility a
+// A host is expected to be a string identifier. A
 // numeric host is coerced into "host_<num>", but that is almost always a sign
 // of a misconfigured client — surface it at debug level so operators can spot
 // it without flooding logs on the hot ingest path.
@@ -439,10 +439,11 @@ func (d *MessagePackDecoder) extractHost(h interface{}) string {
 	case string:
 		return v
 	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		host := fmt.Sprintf("host_%v", v)
 		d.logger.Debug().
-			Str("value", fmt.Sprintf("%v", v)).
+			Str("host", host).
 			Msg("msgpack: numeric host coerced to host_<num>")
-		return fmt.Sprintf("host_%v", v)
+		return host
 	default:
 		return "unknown"
 	}
