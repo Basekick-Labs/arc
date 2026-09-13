@@ -1006,18 +1006,27 @@ func TestValidateSQLRequest_BypassesAndFalsePositives(t *testing.T) {
 		{name: "DROP dash-comment then newline", sql: "DROP --evil\nTABLE users", shouldFail: true},
 		{name: "ATTACH block-comment", sql: "ATTACH /* sneaky */ 'evil' AS x", shouldFail: true},
 		{name: "LOAD block-comment", sql: "LOAD /**/'http://x'", shouldFail: true},
+		{name: "PREPARE statement blocked", sql: "PREPARE p AS SELECT * FROM cpu", shouldFail: true},
+		{name: "EXECUTE statement blocked", sql: "EXECUTE p", shouldFail: true},
+		{name: "EXECUTE with arguments blocked", sql: "EXECUTE p(1, 2)", shouldFail: true},
+		{name: "PREPARE block-comment evasion", sql: "PREPARE/**/p AS SELECT 1", shouldFail: true},
+		{name: "EXECUTE block-comment evasion", sql: "EXECUTE/**/p", shouldFail: true},
 
 		// String-literal false-positives — must NOT be blocked.
 		{name: "literal contains DROP TABLE", sql: "SELECT * FROM logs WHERE msg = 'DROP TABLE users'", shouldFail: false},
 		{name: "literal contains LOAD", sql: "SELECT * FROM logs WHERE event = 'LOAD failed'", shouldFail: false},
 		{name: "literal contains ATTACH", sql: "SELECT 'attach this' AS note FROM t", shouldFail: false},
 		{name: "literal contains SET GLOBAL", sql: "SELECT * FROM t WHERE msg LIKE '%SET GLOBAL foo=%'", shouldFail: false},
+		{name: "literal contains PREPARE", sql: "SELECT * FROM logs WHERE msg = 'PREPARE failed'", shouldFail: false},
+		{name: "literal contains EXECUTE", sql: "SELECT * FROM logs WHERE msg = 'EXECUTE query'", shouldFail: false},
 
 		// Quoted-identifier false-positives — must NOT be blocked
 		// (column literally named COPY/LOAD etc.). MaskStringLiterals
 		// masks both single and double quotes.
 		{name: "double-quoted COPY identifier", sql: `SELECT "COPY" FROM t`, shouldFail: false},
 		{name: "double-quoted LOAD identifier", sql: `SELECT "LOAD", x FROM t`, shouldFail: false},
+		{name: "double-quoted PREPARE identifier", sql: `SELECT "PREPARE" FROM t`, shouldFail: false},
+		{name: "double-quoted EXECUTE identifier", sql: `SELECT "EXECUTE" FROM t`, shouldFail: false},
 
 		// Comment + literal interaction — comment inside literal must NOT be stripped first.
 		{name: "literal containing /* */ keeps inner DROP TABLE blocked? NO -- inside literal", sql: "SELECT 'a /* */ DROP TABLE x' FROM t", shouldFail: false},
@@ -2277,3 +2286,38 @@ func TestValidateSQLRequest_BlocksSecretStatements(t *testing.T) {
 		}
 	}
 }
+
+// TestValidateSQLRequest_BlocksPrepareAndExecute: PREPARE and EXECUTE in user SQL
+// are rejected up front as defense-in-depth against dynamic SQL execution (#739).
+func TestValidateSQLRequest_BlocksPrepareAndExecute(t *testing.T) {
+	blocked := []string{
+		"PREPARE stmt AS SELECT * FROM cpu",
+		"prepare p AS SELECT 1",
+		"PREPARE /* sneaky */ p AS SELECT 1",
+		"EXECUTE stmt",
+		"execute p",
+		"EXECUTE p(1, 2)",
+		"EXECUTE(p)",
+		"EXECUTE/**/p",
+	}
+	for _, q := range blocked {
+		if err := ValidateSQLRequest(q); err == nil {
+			t.Errorf("ValidateSQLRequest(%q): expected rejection for PREPARE/EXECUTE, got nil", q)
+		}
+	}
+
+	// Quoted identifiers and string literals containing the keywords must pass.
+	allowed := []string{
+		`SELECT "PREPARE" FROM cpu`,
+		`SELECT "EXECUTE" FROM cpu`,
+		"SELECT * FROM cpu WHERE msg = 'PREPARE failed'",
+		"SELECT * FROM cpu WHERE msg = 'EXECUTE statement'",
+		"SELECT * FROM cpu WHERE msg = 'EXECUTE(x)'",
+	}
+	for _, q := range allowed {
+		if err := ValidateSQLRequest(q); err != nil {
+			t.Errorf("ValidateSQLRequest(%q): expected allowed, got %v", q, err)
+		}
+	}
+}
+

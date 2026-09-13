@@ -1391,3 +1391,8 @@ warehouse metadata directory, after the files are removed, so a racing
 reconcile pass can only empty tables rather than recreate them. Cleanup
 failures are logged and re-running the DELETE retries them, including when the
 files are already gone.
+
+### PREPARE and EXECUTE statements blocked in query validator ([#739](https://github.com/Basekick-Labs/arc/issues/739))
+
+`ValidateSQLRequest` now rejects `PREPARE` and `EXECUTE` commands up front in `dangerousSQLPattern`, hardening against dynamic SQL execution attempts across all user query endpoints.
+
