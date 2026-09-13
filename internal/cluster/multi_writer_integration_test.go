@@ -39,7 +39,9 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"path/filepath"
 	"testing"
@@ -49,6 +51,81 @@ import (
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/rs/zerolog"
 )
+
+func TestForwardApplyToLeader_UsesCallerDeadline(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires a real Raft follower")
+	}
+
+	raftAddrs := allocFreePorts(t, 2)
+	raftAddrA, raftAddrB := raftAddrs[0], raftAddrs[1]
+	raftA := startRaftNode(t, "forward-leader", raftAddrA, true)
+	defer func() { _ = raftA.Stop() }()
+	if err := raftA.WaitForLeader(10 * time.Second); err != nil {
+		t.Fatalf("leader election: %v", err)
+	}
+	raftB := startRaftNode(t, "forward-follower", raftAddrB, false)
+	defer func() { _ = raftB.Stop() }()
+	if err := raftA.AddVoter("forward-follower", raftAddrB, 10*time.Second); err != nil {
+		t.Fatalf("add follower: %v", err)
+	}
+	waitFor(t, 10*time.Second, func() bool {
+		return raftB.LeaderID() == "forward-leader"
+	}, "follower to recognize leader")
+
+	fakeLeader, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen fake leader: %v", err)
+	}
+	defer fakeLeader.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := fakeLeader.Accept()
+		if acceptErr != nil {
+			return
+		}
+		accepted <- conn
+		_, _ = io.Copy(io.Discard, conn)
+		_ = conn.Close()
+	}()
+
+	local := NewNode("forward-follower", "forward-follower", RoleWriter, "test-cluster")
+	registry := NewRegistry(&RegistryConfig{LocalNode: local, Logger: zerolog.Nop()})
+	leader := NewNode("forward-leader", "forward-leader", RoleWriter, "test-cluster")
+	leader.Address = fakeLeader.Addr().String()
+	if err := registry.Register(leader); err != nil {
+		t.Fatalf("register fake leader: %v", err)
+	}
+	c := &Coordinator{
+		cfg:       &config.ClusterConfig{SharedSecret: "test-cluster-secret-32-bytes-long!", ClusterName: "test-cluster"},
+		registry:  registry,
+		raftNode:  raftB,
+		localNode: local,
+		logger:    zerolog.Nop(),
+		ctx:       context.Background(),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = c.forwardApplyToLeader(ctx, &raft.Command{Type: raft.CommandRegisterFile})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("forwardApplyToLeader() unexpectedly succeeded without an acknowledgement")
+	}
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("caller context error = %v; want context.DeadlineExceeded", ctx.Err())
+	}
+	if elapsed >= time.Second {
+		t.Fatalf("forwardApplyToLeader() took %v; caller's 100ms deadline was not enforced promptly", elapsed)
+	}
+	select {
+	case conn := <-accepted:
+		_ = conn.Close()
+	case <-time.After(time.Second):
+		t.Fatal("fake leader did not accept forwarded connection")
+	}
+}
 
 // allocFreePort grabs a single free TCP port on 127.0.0.1. Convenience
 // wrapper around allocFreePorts for single-port callers.

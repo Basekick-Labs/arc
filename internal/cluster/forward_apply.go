@@ -72,10 +72,9 @@ func (e *ForwardRejectedError) Error() string {
 // Is lets errors.Is(err, ErrForwardRejected) match.
 func (e *ForwardRejectedError) Is(target error) bool { return target == ErrForwardRejected }
 
-// forwardApplyTimeout bounds a single dial+send+recv round-trip to the
-// leader. 5 seconds is generous enough for slow networks and a Raft
-// quorum-commit on the leader side, while short enough that a stuck
-// leader doesn't block the caller's whole shutdown sequence.
+// forwardApplyTimeout is the default timeout for individual manifest
+// apply/forwarding operations when the caller does not provide a shorter
+// deadline; it does not bound the total end-to-end apply duration.
 const forwardApplyTimeout = 5 * time.Second
 
 // forwardApplyToLeader serializes a Raft Command and ships it to the
@@ -156,14 +155,17 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 	// dials fresh (lazy reconnect).
 	conn, err := c.getOrDialLeader(ctx, leaderID, leaderAddr)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("forward apply: %w", errors.Join(err, ctxErr))
+		}
 		return fmt.Errorf("forward apply: %w", err)
 	}
 
 	c.forwardMu.Lock()
 	defer c.forwardMu.Unlock()
 
-	// Set a per-call deadline on the shared connection.
-	roundTripDeadline := time.Now().Add(forwardApplyTimeout)
+	// Keep the shared connection bounded by the caller's remaining budget.
+	roundTripDeadline := time.Now().Add(manifestApplyTimeout(ctx))
 	if deadline, ok := ctx.Deadline(); ok && deadline.Before(roundTripDeadline) {
 		roundTripDeadline = deadline
 	}
@@ -172,14 +174,20 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 	if err := protocol.SendMessage(conn, &protocol.Message{
 		Type:    protocol.MsgForwardApply,
 		Payload: req,
-	}, forwardApplyTimeout); err != nil {
+	}, manifestApplyTimeout(ctx)); err != nil {
 		c.closeForwardConn() // stale — next call redials
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("forward apply: send: %w", errors.Join(err, ctxErr))
+		}
 		return fmt.Errorf("forward apply: send: %w", err)
 	}
 
-	ackMsg, err := protocol.ReceiveMessage(conn, forwardApplyTimeout)
+	ackMsg, err := protocol.ReceiveMessage(conn, manifestApplyTimeout(ctx))
 	if err != nil {
 		c.closeForwardConn()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("forward apply: receive ack: %w", errors.Join(err, ctxErr))
+		}
 		return fmt.Errorf("forward apply: receive ack: %w", err)
 	}
 	if ackMsg.Type != protocol.MsgForwardApplyAck {
@@ -278,12 +286,7 @@ func (c *Coordinator) getOrDialLeader(ctx context.Context, leaderID, leaderAddr 
 	c.forwardConnMu.Unlock()
 
 	// Dial outside the lock.
-	dialTimeout := forwardApplyTimeout
-	if deadline, ok := ctx.Deadline(); ok {
-		if remaining := time.Until(deadline); remaining < dialTimeout {
-			dialTimeout = remaining
-		}
-	}
+	dialTimeout := manifestApplyTimeout(ctx)
 	conn, err := security.Dial("tcp", leaderAddr, dialTimeout, c.tlsConfig)
 	if err != nil {
 		return nil, fmt.Errorf("dial leader %s (%s): %w", leaderID, leaderAddr, err)

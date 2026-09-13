@@ -227,9 +227,8 @@ func TestFollowerBarrier_WaitsForBacklogAfterRestart(t *testing.T) {
 }
 
 // A leader that accepts the connection and never answers must not hang the
-// startup walk. Each forwarded attempt is bounded by the protocol's fixed
-// round-trip deadline (forwardApplyTimeout, 5 s; the open PR #787 proposes
-// honoring the caller's context instead), and the retry loop checks the
+// startup walk. Each forwarded attempt is bounded by the caller's remaining
+// barrier deadline (up to forwardApplyTimeout), and the retry loop checks the
 // barrier deadline between attempts, so the wait ends within one round trip
 // of the configured timeout.
 func TestFollowerBarrier_TimesOutOnSilentLeader(t *testing.T) {

@@ -338,6 +338,16 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Manifest applies respect caller cancellation and deadlines ([#394](https://github.com/Basekick-Labs/arc/issues/394))
+
+Manifest register/delete operations and the current compaction batch apply path
+now preserve caller deadline budgets. The caller deadline bounds the
+pre-apply cancellation check, leader-side enqueue timeout, follower dial, and
+follower send/receive. The Raft `future.Error()` commit wait retains existing
+Raft semantics.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#787](https://github.com/Basekick-Labs/arc/pull/787).
+
 ### Iceberg export on an edge-sync hub produced one garbage table per spoke ([#634](https://github.com/Basekick-Labs/arc/issues/634))
 
 **Affects hubs only** — a node receiving edge-sync data with `iceberg.enabled = true`.

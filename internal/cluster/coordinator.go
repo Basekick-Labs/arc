@@ -3463,8 +3463,9 @@ func (c *Coordinator) UpdateNodeStateViaRaft(nodeID string, state NodeState) err
 //
 // On forwarding failure (no leader known, leader unreachable, or the
 // leader rejects the apply), the error is returned and the caller can
-// retry. The forwarding path is bounded by forwardApplyTimeout so a
-// stuck leader doesn't block the writer flush hot path indefinitely.
+// retry. The caller deadline bounds the pre-apply cancellation check,
+// leader-side enqueue timeout, follower dial, and follower send/receive;
+// the Raft future.Error() commit wait retains existing Raft semantics.
 func (c *Coordinator) RegisterFileInManifest(ctx context.Context, file raft.FileEntry) error {
 	if c.raftNode == nil {
 		// Standalone mode — no manifest needed
@@ -3473,7 +3474,7 @@ func (c *Coordinator) RegisterFileInManifest(ctx context.Context, file raft.File
 	ctx, cancel := c.manifestContext(ctx)
 	defer cancel()
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("register file in manifest: %w", err)
+		return errors.Join(raft.ErrManifestApply, fmt.Errorf("register file in manifest: %w", err))
 	}
 
 	if c.raftNode.IsLeader() {
@@ -3510,7 +3511,7 @@ func (c *Coordinator) DeleteFileFromManifest(ctx context.Context, path, reason s
 	ctx, cancel := c.manifestContext(ctx)
 	defer cancel()
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("delete file from manifest: %w", err)
+		return errors.Join(raft.ErrManifestApply, fmt.Errorf("delete file from manifest: %w", err))
 	}
 
 	if c.raftNode.IsLeader() {
@@ -3545,8 +3546,9 @@ func (c *Coordinator) BatchFileOpsInManifest(ops []raft.BatchFileOp) error {
 }
 
 // BatchFileOpsInManifestContext applies a batch using the caller's context.
-// The context-aware form is used by compaction, whose apply timeout must bound
-// the actual Raft apply or leader-forwarding wait.
+// The context bounds pre-apply cancellation, leader-side enqueue timeout,
+// follower dial, and follower send/receive. The Raft future.Error() commit
+// wait retains existing Raft semantics.
 func (c *Coordinator) BatchFileOpsInManifestContext(ctx context.Context, ops []raft.BatchFileOp) error {
 	if c.raftNode == nil {
 		return nil
@@ -3554,7 +3556,7 @@ func (c *Coordinator) BatchFileOpsInManifestContext(ctx context.Context, ops []r
 	ctx, cancel := c.manifestContext(ctx)
 	defer cancel()
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("batch file ops in manifest: %w", err)
+		return errors.Join(raft.ErrManifestApply, fmt.Errorf("batch file ops in manifest: %w", err))
 	}
 
 	if c.raftNode.IsLeader() {
@@ -3583,6 +3585,9 @@ func (c *Coordinator) manifestContext(ctx context.Context) (context.Context, con
 	}
 	if c.ctx == nil {
 		return ctx, func() {}
+	}
+	if err := c.ctx.Err(); err != nil {
+		return c.ctx, func() {}
 	}
 	merged, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(c.ctx, cancel)
