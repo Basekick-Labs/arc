@@ -335,6 +335,47 @@ func TestCopyDataFiles_TempFileFailureIsFatal(t *testing.T) {
 	}
 }
 
+// A ReadTo failure caused by the temp file after it was created is fatal, not
+// a skipped source file. The temp file is opened read-only so its writes fail.
+func TestCopyDataFiles_TempWriteFailureIsFatalNotSkipped(t *testing.T) {
+	ctx := context.Background()
+	logger := zerolog.Nop()
+
+	dataStorage, err := storage.NewLocalBackend(t.TempDir(), logger)
+	if err != nil {
+		t.Fatalf("failed to create data storage: %v", err)
+	}
+	backupStorage := mustLocalBackend(t, t.TempDir(), logger)
+	m := &Manager{dataStorage: dataStorage, backupStorage: backupStorage, logger: logger}
+
+	srcPath := "db/cpu/2026/07/28/00/a.parquet"
+	if err := dataStorage.Write(ctx, srcPath, bytes.Repeat([]byte("z"), 10)); err != nil {
+		t.Fatalf("failed to write source: %v", err)
+	}
+
+	orig := createTempFile
+	t.Cleanup(func() { createTempFile = orig })
+	createTempFile = func(pattern string) (*os.File, error) {
+		p := filepath.Join(t.TempDir(), "ro.parquet")
+		if err := os.WriteFile(p, nil, 0o600); err != nil {
+			return nil, err
+		}
+		return os.OpenFile(p, os.O_RDONLY, 0)
+	}
+
+	progress := &Progress{Operation: "backup", TotalFiles: 1}
+	err = m.copyDataFiles(ctx, "bkid", []storage.ObjectInfo{{Path: srcPath, Size: 10}}, progress)
+	if err == nil {
+		t.Fatal("expected fatal temp-write failure")
+	}
+	if isSourceReadError(err) {
+		t.Errorf("temp-write failure must not be classified as a source read: %v", err)
+	}
+	if progress.SkippedFiles != 0 {
+		t.Errorf("SkippedFiles = %d, want 0", progress.SkippedFiles)
+	}
+}
+
 // A backup whose every file is unreadable must fail rather than silently
 // producing an empty backup that reports success. (100% skipped also exceeds
 // maxSkipRatio, but this pins the total-loss case explicitly.)
