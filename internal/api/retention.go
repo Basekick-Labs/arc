@@ -100,6 +100,24 @@ type ExecuteRetentionResponse struct {
 }
 
 const retentionSkippedReason = "unaddressable storage files cannot be read or deleted"
+const retentionUnusableSampleCap = 32
+
+type unusableSample struct {
+	key string
+	err error
+}
+
+type unusableByMeasurement struct {
+	counts       map[string]int
+	samples      map[string][]unusableSample
+	orphans      int
+	orphanSample []unusableSample
+}
+
+type retentionDiscovery struct {
+	measurements []string
+	unusable     unusableByMeasurement
+}
 
 // RetentionExecution represents an execution history record
 type RetentionExecution struct {
@@ -507,10 +525,11 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 		Msg("Executing scheduled retention policy")
 
 	// Get measurements to process
-	measurements, err := h.getMeasurementsToProcess(ctx, policy)
+	discovery, err := h.getMeasurementsToProcess(ctx, policy)
 	if err != nil {
 		return nil, fmt.Errorf("failed to discover measurements: %w", err)
 	}
+	measurements := discovery.measurements
 
 	h.logger.Info().Strs("measurements", measurements).Msg("Processing measurements")
 
@@ -529,6 +548,7 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 		totalDeleted += deleted
 		totalFilesDeleted += filesDeleted
 		totalSkipped += skipped
+		totalSkipped += discovery.unusable.counts[measurement]
 		if err != nil {
 			h.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to process measurement")
 			// Abort on any error — manifest failures are non-transient (Raft quorum loss)
@@ -539,6 +559,7 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 			return nil, fmt.Errorf("retention aborted for policy %d: %w", policyID, err)
 		}
 	}
+	totalSkipped += discovery.unusable.orphans
 
 	// Clear DuckDB parquet metadata/data cache and release memory back to OS.
 	h.duckdb.ClearHTTPCache()
@@ -556,6 +577,7 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 			status = "completed_with_errors"
 			detail = fmt.Sprintf("%d %s; see the log for the keys", totalSkipped, retentionSkippedReason)
 			h.logger.Error().Int("skipped_files", totalSkipped).Str("database", policy.Database).
+				Strs("sample", formatUnusableSamples(discovery.unusable)).
 				Msg("Retention could not resolve some files; their data will never age out")
 		}
 		h.recordExecutionComplete(executionID, status, totalDeleted, executionTime, detail)
@@ -674,12 +696,13 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 		Msg("Executing retention policy")
 
 	// Get measurements to process
-	measurements, err := h.getMeasurementsToProcess(c.Context(), policy)
+	discovery, err := h.getMeasurementsToProcess(c.Context(), policy)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to discover measurements: " + err.Error(),
 		})
 	}
+	measurements := discovery.measurements
 
 	h.logger.Info().Strs("measurements", measurements).Msg("Processing measurements")
 
@@ -697,6 +720,7 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 	for _, measurement := range measurements {
 		deleted, filesDeleted, skipped, err := h.deleteOldFiles(c.Context(), policy.Database, measurement, cutoffDate, req.DryRun, fmt.Sprintf("retention:%d", policyID))
 		totalSkipped += skipped
+		totalSkipped += discovery.unusable.counts[measurement]
 		totalDeleted += deleted
 		totalFilesDeleted += filesDeleted
 		if err != nil {
@@ -709,6 +733,7 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 			})
 		}
 	}
+	totalSkipped += discovery.unusable.orphans
 
 	// Clear DuckDB parquet metadata/data cache — dry runs also populate the cache via
 	// read_parquet calls in getFileMaxTimeAndRowCount, so always clear regardless of dry run.
@@ -723,6 +748,7 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 	if totalSkipped > 0 {
 		skipDetail = fmt.Sprintf("%d %s; see the log for the keys", totalSkipped, retentionSkippedReason)
 		h.logger.Error().Int("skipped_files", totalSkipped).Str("database", policy.Database).
+			Strs("sample", formatUnusableSamples(discovery.unusable)).
 			Msg("Retention could not resolve some files; their data will never age out")
 	}
 	if !req.DryRun && executionID > 0 {
@@ -859,33 +885,36 @@ func (h *RetentionHandler) getPolicies() ([]RetentionPolicy, error) {
 
 // getMeasurementsToProcess gets measurements for a policy
 // Supports all storage backends: local, S3, and Azure
-func (h *RetentionHandler) getMeasurementsToProcess(ctx context.Context, policy *RetentionPolicy) ([]string, error) {
-	if policy.Measurement != nil && *policy.Measurement != "" {
-		return []string{*policy.Measurement}, nil
+func (h *RetentionHandler) getMeasurementsToProcess(ctx context.Context, policy *RetentionPolicy) (retentionDiscovery, error) {
+	prefix := policy.Database + "/"
+	pinned := policy.Measurement != nil && *policy.Measurement != ""
+	if pinned {
+		prefix += *policy.Measurement + "/"
 	}
 
-	// Get all measurements in database by listing storage with database prefix
-	prefix := policy.Database + "/"
 	files, err := h.storage.List(ctx, prefix)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list files: %w", err)
+		return retentionDiscovery{}, fmt.Errorf("failed to list files: %w", err)
 	}
 
-	// Extract unique measurement names from file paths
-	// Files are stored as: database/measurement/YYYY/MM/DD/HH/file.parquet
 	measurementSet := make(map[string]struct{})
+	if pinned {
+		measurementSet[*policy.Measurement] = struct{}{}
+	}
 	for _, f := range files {
-		// Remove database prefix
 		relPath := strings.TrimPrefix(f, prefix)
-		// Get first path component (measurement name)
-		parts := strings.SplitN(relPath, "/", 2)
-		if len(parts) > 0 && parts[0] != "" && !strings.HasPrefix(parts[0], ".") {
-			measurementSet[parts[0]] = struct{}{}
+		if !pinned {
+			parts := strings.SplitN(relPath, "/", 2)
+			if len(parts) > 0 && parts[0] != "" && !strings.HasPrefix(parts[0], ".") {
+				measurementSet[parts[0]] = struct{}{}
+			}
 		}
 	}
 
-	// ListUnusable is the counterpart to List: include measurements whose files
-	// were hidden so deleteOldFiles can report them without ever addressing them.
+	accounting := unusableByMeasurement{
+		counts:  make(map[string]int),
+		samples: make(map[string][]unusableSample),
+	}
 	if lister, ok := h.storage.(storage.UnusableLister); ok {
 		unusable, err := lister.ListUnusable(ctx, prefix)
 		if err != nil {
@@ -893,10 +922,31 @@ func (h *RetentionHandler) getMeasurementsToProcess(ctx context.Context, policy 
 				Msg("Could not list unusable files during retention measurement discovery")
 		} else {
 			for _, f := range unusable {
-				relPath := strings.TrimPrefix(f.Path, prefix)
-				parts := strings.SplitN(relPath, "/", 2)
-				if len(parts) > 0 && parts[0] != "" && !strings.HasPrefix(parts[0], ".") {
-					measurementSet[parts[0]] = struct{}{}
+				if !strings.HasSuffix(strings.ToLower(f.Path), ".parquet") {
+					continue
+				}
+				measurement := ""
+				if pinned {
+					measurement = *policy.Measurement
+				}
+				if !pinned {
+					relPath := strings.TrimPrefix(f.Path, prefix)
+					parts := strings.SplitN(relPath, "/", 2)
+					if len(parts) == 0 || parts[0] == "" ||
+						strings.HasPrefix(parts[0], ".") ||
+						storage.ValidateKeySegment(parts[0]) != nil {
+						accounting.orphans++
+						if len(accounting.orphanSample) < retentionUnusableSampleCap {
+							accounting.orphanSample = append(accounting.orphanSample, unusableSample{key: f.Path, err: f.Err})
+						}
+						continue
+					}
+					measurement = parts[0]
+				}
+				measurementSet[measurement] = struct{}{}
+				accounting.counts[measurement]++
+				if len(accounting.samples[measurement]) < retentionUnusableSampleCap {
+					accounting.samples[measurement] = append(accounting.samples[measurement], unusableSample{key: f.Path, err: f.Err})
 				}
 			}
 		}
@@ -907,7 +957,26 @@ func (h *RetentionHandler) getMeasurementsToProcess(ctx context.Context, policy 
 		measurements = append(measurements, m)
 	}
 
-	return measurements, nil
+	return retentionDiscovery{measurements: measurements, unusable: accounting}, nil
+}
+
+func formatUnusableSamples(accounting unusableByMeasurement) []string {
+	samples := make([]string, 0, retentionUnusableSampleCap)
+	appendSample := func(sample unusableSample) {
+		if len(samples) == retentionUnusableSampleCap {
+			return
+		}
+		samples = append(samples, fmt.Sprintf("%s: %v", sample.key, sample.err))
+	}
+	for _, measurementSamples := range accounting.samples {
+		for _, sample := range measurementSamples {
+			appendSample(sample)
+		}
+	}
+	for _, sample := range accounting.orphanSample {
+		appendSample(sample)
+	}
+	return samples
 }
 
 // deleteOldFiles deletes Parquet files where ALL rows are older than cutoffDate
@@ -929,15 +998,6 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 	}
 
 	var skipped int
-	if lister, ok := h.storage.(storage.UnusableLister); ok {
-		unusable, err := lister.ListUnusable(ctx, prefix)
-		if err != nil {
-			h.logger.Warn().Err(err).Str("prefix", prefix).
-				Msg("Could not list unusable files during retention")
-		} else {
-			skipped = len(unusable)
-		}
-	}
 
 	// Filter to only parquet files
 	var parquetFiles []string

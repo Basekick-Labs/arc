@@ -320,16 +320,15 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
-
 ### Retention reports files hidden by storage listings ([#771](https://github.com/Basekick-Labs/arc/issues/771))
 
-Retention now reports files that the storage backend identifies as unusable,
-including files whose keys are rejected by the storage contract. These files
-remain untouched, while dry-run and real retention executions report the same
-skipped-file count and reason.
+Retention already had a skipped-file counter, but since #744 normal listing no
+longer returns a key that `readParquetPath` rejects, the counter stopped being
+fed and remained zero. Retention now reports those files, including keys
+rejected by the storage contract; they remain untouched, while dry-run and real
+executions report the same skipped-file count and reason.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#775](https://github.com/Basekick-Labs/arc/pull/775).
-
 
 ### Numeric MessagePack host values are logged when coerced ([#768](https://github.com/Basekick-Labs/arc/issues/768))
 

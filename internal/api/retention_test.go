@@ -127,13 +127,13 @@ func TestGetMeasurementsToProcess_SpecificMeasurement(t *testing.T) {
 		Measurement: &measurement,
 	}
 
-	measurements, err := handler.getMeasurementsToProcess(context.Background(), policy)
+	discovery, err := handler.getMeasurementsToProcess(context.Background(), policy)
 	if err != nil {
 		t.Fatalf("getMeasurementsToProcess() error = %v", err)
 	}
 
-	if len(measurements) != 1 || measurements[0] != "temperature" {
-		t.Errorf("getMeasurementsToProcess() = %v, want [temperature]", measurements)
+	if len(discovery.measurements) != 1 || discovery.measurements[0] != "temperature" {
+		t.Errorf("getMeasurementsToProcess() = %v, want [temperature]", discovery.measurements)
 	}
 }
 
@@ -149,10 +149,10 @@ func TestGetMeasurementsToProcess_AllMeasurements(t *testing.T) {
 
 	for _, f := range testFiles {
 		fullPath := filepath.Join(tmpDir, f)
-		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0o700); err != nil {
 			t.Fatalf("failed to create directory: %v", err)
 		}
-		if err := os.WriteFile(fullPath, []byte("test"), 0644); err != nil {
+		if err := os.WriteFile(fullPath, []byte("test"), 0o600); err != nil {
 			t.Fatalf("failed to create test file: %v", err)
 		}
 	}
@@ -162,18 +162,18 @@ func TestGetMeasurementsToProcess_AllMeasurements(t *testing.T) {
 		Measurement: nil, // nil means all measurements
 	}
 
-	measurements, err := handler.getMeasurementsToProcess(context.Background(), policy)
+	discovery, err := handler.getMeasurementsToProcess(context.Background(), policy)
 	if err != nil {
 		t.Fatalf("getMeasurementsToProcess() error = %v", err)
 	}
 
-	if len(measurements) != 3 {
-		t.Errorf("getMeasurementsToProcess() returned %d measurements, want 3", len(measurements))
+	if len(discovery.measurements) != 3 {
+		t.Errorf("getMeasurementsToProcess() returned %d measurements, want 3", len(discovery.measurements))
 	}
 
 	// Check all expected measurements are present
 	measurementSet := make(map[string]bool)
-	for _, m := range measurements {
+	for _, m := range discovery.measurements {
 		measurementSet[m] = true
 	}
 
@@ -209,7 +209,7 @@ func TestDeleteOldFiles_DryRun(t *testing.T) {
 	db := handler.duckdb.DB()
 
 	measurementDir := filepath.Join(tmpDir, "testdb", "logs", "2020", "01", "01", "00")
-	if err := os.MkdirAll(measurementDir, 0755); err != nil {
+	if err := os.MkdirAll(measurementDir, 0o700); err != nil {
 		t.Fatalf("failed to create measurement dir: %v", err)
 	}
 
@@ -271,11 +271,14 @@ func TestRetentionReportsUnusableFilesInDryRunAndExecution(t *testing.T) {
 	}
 
 	path := filepath.Join(tmpDir, filepath.FromSlash(key))
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatalf("failed to create unusable file directory: %v", err)
 	}
-	if err := os.WriteFile(path, []byte("not a parquet file"), 0644); err != nil {
+	if err := os.WriteFile(path, []byte("not a parquet file"), 0o600); err != nil {
 		t.Fatalf("failed to create unusable file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, database, measurement, ".DS_Store"), []byte("debris"), 0o600); err != nil {
+		t.Fatalf("failed to create unrelated debris: %v", err)
 	}
 
 	result, err := handler.db.Exec(`
@@ -300,16 +303,6 @@ func TestRetentionReportsUnusableFilesInDryRunAndExecution(t *testing.T) {
 	}
 	if !strings.Contains(execution.SkippedReason, "unaddressable") {
 		t.Errorf("ExecutePolicy() skipped_reason = %q, want it to name unaddressable files", execution.SkippedReason)
-	}
-
-	_, _, skipped, err := handler.deleteOldFiles(
-		context.Background(), database, measurement, time.Now().UTC(), true, "retention:test",
-	)
-	if err != nil {
-		t.Fatalf("deleteOldFiles(dry_run=true) error = %v", err)
-	}
-	if skipped != execution.SkippedFiles {
-		t.Errorf("dry-run skipped_files = %d, want %d", skipped, execution.SkippedFiles)
 	}
 
 	app := fiber.New()
@@ -337,6 +330,58 @@ func TestRetentionReportsUnusableFilesInDryRunAndExecution(t *testing.T) {
 	}
 }
 
+func TestRetentionSkipsInvalidMeasurementSegmentWithoutAborting(t *testing.T) {
+	handler, tmpDir := setupTestRetentionHandler(t)
+	const database = "testdb"
+
+	goodPath := filepath.Join(tmpDir, database, "good", "2020", "01", "01", "00", "data.parquet")
+	if err := os.MkdirAll(filepath.Dir(goodPath), 0o700); err != nil {
+		t.Fatalf("failed to create good measurement directory: %v", err)
+	}
+	if _, err := handler.duckdb.DB().Exec(`COPY (
+		SELECT TIMESTAMP '2020-01-01 00:00:00' AS time, 'good' AS message
+		FROM range(1)
+	) TO '` + goodPath + `' (FORMAT PARQUET)`); err != nil {
+		t.Fatalf("failed to create good parquet file: %v", err)
+	}
+
+	const badKey = database + `/bad\meas/2020/01/01/00/x.parquet`
+	badPath := filepath.Join(tmpDir, filepath.FromSlash(badKey))
+	if err := os.MkdirAll(filepath.Dir(badPath), 0o700); err != nil {
+		t.Fatalf("failed to create invalid measurement directory: %v", err)
+	}
+	if err := os.WriteFile(badPath, []byte("not a parquet file"), 0o600); err != nil {
+		t.Fatalf("failed to create unusable file: %v", err)
+	}
+
+	result, err := handler.db.Exec(`
+		INSERT INTO retention_policies
+			(name, database, retention_days, buffer_days, is_active)
+		VALUES (?, ?, ?, ?, ?)
+	`, "invalid-measurement-policy", database, 0, 0, true)
+	if err != nil {
+		t.Fatalf("failed to create retention policy: %v", err)
+	}
+	policyID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("failed to get retention policy ID: %v", err)
+	}
+
+	execution, err := handler.ExecutePolicy(context.Background(), policyID)
+	if err != nil {
+		t.Fatalf("ExecutePolicy() error = %v", err)
+	}
+	if execution.SkippedFiles != 1 {
+		t.Fatalf("ExecutePolicy() skipped_files = %d, want 1", execution.SkippedFiles)
+	}
+	if _, err := os.Stat(goodPath); !os.IsNotExist(err) {
+		t.Fatalf("good measurement should be processed and deleted, stat error = %v", err)
+	}
+	if _, err := os.Stat(badPath); err != nil {
+		t.Fatalf("invalid measurement file should remain: %v", err)
+	}
+}
+
 func TestDeleteOldFiles_ActualDelete(t *testing.T) {
 	handler, tmpDir := setupTestRetentionHandler(t)
 
@@ -344,7 +389,7 @@ func TestDeleteOldFiles_ActualDelete(t *testing.T) {
 	db := handler.duckdb.DB()
 
 	measurementDir := filepath.Join(tmpDir, "testdb", "logs", "2020", "01", "01", "00")
-	if err := os.MkdirAll(measurementDir, 0755); err != nil {
+	if err := os.MkdirAll(measurementDir, 0o700); err != nil {
 		t.Fatalf("failed to create measurement dir: %v", err)
 	}
 
@@ -400,7 +445,7 @@ func TestDeleteOldFiles_KeepsRecentFiles(t *testing.T) {
 	db := handler.duckdb.DB()
 
 	measurementDir := filepath.Join(tmpDir, "testdb", "logs", "2025", "01", "01", "00")
-	if err := os.MkdirAll(measurementDir, 0755); err != nil {
+	if err := os.MkdirAll(measurementDir, 0o700); err != nil {
 		t.Fatalf("failed to create measurement dir: %v", err)
 	}
 
@@ -451,7 +496,7 @@ func TestDeleteOldFiles_CleansUpEmptyDirectories(t *testing.T) {
 	db := handler.duckdb.DB()
 
 	measurementDir := filepath.Join(tmpDir, "testdb", "logs", "2020", "01", "01", "00")
-	if err := os.MkdirAll(measurementDir, 0755); err != nil {
+	if err := os.MkdirAll(measurementDir, 0o700); err != nil {
 		t.Fatalf("failed to create measurement dir: %v", err)
 	}
 
