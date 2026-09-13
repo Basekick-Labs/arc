@@ -2,14 +2,19 @@ package api
 
 import (
 	"context"
+	"encoding/json"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
 
@@ -250,6 +255,85 @@ func TestDeleteOldFiles_DryRun(t *testing.T) {
 	// File should still exist (dry run)
 	if _, err := os.Stat(parquetPath); os.IsNotExist(err) {
 		t.Error("deleteOldFiles(dry_run=true) should not delete the file")
+	}
+}
+
+func TestRetentionReportsUnusableFilesInDryRunAndExecution(t *testing.T) {
+	handler, tmpDir := setupTestRetentionHandler(t)
+
+	const (
+		database    = "testdb"
+		measurement = "logs"
+		key         = database + "/" + measurement + "/2020/01/01/00/bad\\name.parquet"
+	)
+	if storage.ValidateKey(key) == nil {
+		t.Fatalf("test key %q is accepted by ValidateKey", key)
+	}
+
+	path := filepath.Join(tmpDir, filepath.FromSlash(key))
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatalf("failed to create unusable file directory: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("not a parquet file"), 0644); err != nil {
+		t.Fatalf("failed to create unusable file: %v", err)
+	}
+
+	result, err := handler.db.Exec(`
+		INSERT INTO retention_policies
+			(name, database, measurement, retention_days, buffer_days, is_active)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, "unusable-file-policy", database, measurement, 3650, 0, true)
+	if err != nil {
+		t.Fatalf("failed to create retention policy: %v", err)
+	}
+	policyID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("failed to get retention policy ID: %v", err)
+	}
+
+	execution, err := handler.ExecutePolicy(context.Background(), policyID)
+	if err != nil {
+		t.Fatalf("ExecutePolicy() error = %v", err)
+	}
+	if execution.SkippedFiles != 1 {
+		t.Errorf("ExecutePolicy() skipped_files = %d, want 1", execution.SkippedFiles)
+	}
+	if !strings.Contains(execution.SkippedReason, "unaddressable") {
+		t.Errorf("ExecutePolicy() skipped_reason = %q, want it to name unaddressable files", execution.SkippedReason)
+	}
+
+	_, _, skipped, err := handler.deleteOldFiles(
+		context.Background(), database, measurement, time.Now().UTC(), true, "retention:test",
+	)
+	if err != nil {
+		t.Fatalf("deleteOldFiles(dry_run=true) error = %v", err)
+	}
+	if skipped != execution.SkippedFiles {
+		t.Errorf("dry-run skipped_files = %d, want %d", skipped, execution.SkippedFiles)
+	}
+
+	app := fiber.New()
+	handler.RegisterRoutes(app)
+	req := httptest.NewRequest("POST", "/api/v1/retention/"+strconv.FormatInt(policyID, 10)+"/execute", strings.NewReader(`{"dry_run":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("dry-run request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var dryRun ExecuteRetentionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&dryRun); err != nil {
+		t.Fatalf("failed to decode dry-run response: %v", err)
+	}
+	if dryRun.SkippedFiles != execution.SkippedFiles {
+		t.Errorf("dry-run response skipped_files = %d, want %d", dryRun.SkippedFiles, execution.SkippedFiles)
+	}
+	if !strings.Contains(dryRun.SkippedReason, execution.SkippedReason) {
+		t.Errorf("dry-run response skipped_reason = %q, want it to contain %q", dryRun.SkippedReason, execution.SkippedReason)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("unusable file should remain after retention: %v", err)
 	}
 }
 

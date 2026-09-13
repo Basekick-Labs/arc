@@ -99,6 +99,8 @@ type ExecuteRetentionResponse struct {
 	AffectedMeasurements []string `json:"affected_measurements"`
 }
 
+const retentionSkippedReason = "unaddressable storage files cannot be read or deleted"
+
 // RetentionExecution represents an execution history record
 type RetentionExecution struct {
 	ID                  int64   `json:"id"`
@@ -552,7 +554,7 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 		status, detail := "completed", ""
 		if totalSkipped > 0 {
 			status = "completed_with_errors"
-			detail = fmt.Sprintf("%d file(s) have a stored path that cannot be read and will never be deleted; see the log for the keys", totalSkipped)
+			detail = fmt.Sprintf("%d %s; see the log for the keys", totalSkipped, retentionSkippedReason)
 			h.logger.Error().Int("skipped_files", totalSkipped).Str("database", policy.Database).
 				Msg("Retention could not resolve some files; their data will never age out")
 		}
@@ -570,6 +572,8 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 		PolicyName:           policy.Name,
 		DeletedCount:         totalDeleted,
 		FilesDeleted:         totalFilesDeleted,
+		SkippedFiles:         totalSkipped,
+		SkippedReason:        skippedReason(totalSkipped),
 		ExecutionTimeMs:      executionTime,
 		DryRun:               false,
 		CutoffDate:           cutoffDate.Format(time.RFC3339),
@@ -717,7 +721,7 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 	// some files is not a clean "completed".
 	var skipDetail string
 	if totalSkipped > 0 {
-		skipDetail = fmt.Sprintf("%d file(s) have a stored path that cannot be read and will never be deleted; see the log for the keys", totalSkipped)
+		skipDetail = fmt.Sprintf("%d %s; see the log for the keys", totalSkipped, retentionSkippedReason)
 		h.logger.Error().Int("skipped_files", totalSkipped).Str("database", policy.Database).
 			Msg("Retention could not resolve some files; their data will never age out")
 	}
@@ -880,6 +884,24 @@ func (h *RetentionHandler) getMeasurementsToProcess(ctx context.Context, policy 
 		}
 	}
 
+	// ListUnusable is the counterpart to List: include measurements whose files
+	// were hidden so deleteOldFiles can report them without ever addressing them.
+	if lister, ok := h.storage.(storage.UnusableLister); ok {
+		unusable, err := lister.ListUnusable(ctx, prefix)
+		if err != nil {
+			h.logger.Warn().Err(err).Str("prefix", prefix).
+				Msg("Could not list unusable files during retention measurement discovery")
+		} else {
+			for _, f := range unusable {
+				relPath := strings.TrimPrefix(f.Path, prefix)
+				parts := strings.SplitN(relPath, "/", 2)
+				if len(parts) > 0 && parts[0] != "" && !strings.HasPrefix(parts[0], ".") {
+					measurementSet[parts[0]] = struct{}{}
+				}
+			}
+		}
+	}
+
 	var measurements []string
 	for m := range measurementSet {
 		measurements = append(measurements, m)
@@ -906,6 +928,17 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 		return 0, 0, 0, fmt.Errorf("failed to list files: %w", err)
 	}
 
+	var skipped int
+	if lister, ok := h.storage.(storage.UnusableLister); ok {
+		unusable, err := lister.ListUnusable(ctx, prefix)
+		if err != nil {
+			h.logger.Warn().Err(err).Str("prefix", prefix).
+				Msg("Could not list unusable files during retention")
+		} else {
+			skipped = len(unusable)
+		}
+	}
+
 	// Filter to only parquet files
 	var parquetFiles []string
 	for _, f := range files {
@@ -918,7 +951,6 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 
 	var deletedRows int64
 	var deletedFiles int
-	var skipped int            // files whose key cannot be turned into a readable path
 	var eligiblePaths []string // paths eligible for deletion (used for manifest + storage ops)
 	var eligibleRows []int64   // row counts parallel to eligiblePaths
 
@@ -1032,6 +1064,13 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 	}
 
 	return deletedRows, deletedFiles, skipped, nil
+}
+
+func skippedReason(skipped int) string {
+	if skipped == 0 {
+		return ""
+	}
+	return retentionSkippedReason
 }
 
 // readParquetPath resolves a storage key to a path that can be interpolated
