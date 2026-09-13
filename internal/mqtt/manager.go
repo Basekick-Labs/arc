@@ -395,16 +395,31 @@ func (m *SubscriptionManager) PauseSubscription(ctx context.Context, id string) 
 
 // RestartSubscription stops and starts a subscription
 func (m *SubscriptionManager) RestartSubscription(ctx context.Context, id string) error {
-	// Stop if running
 	m.mu.Lock()
 	subscriber, ok := m.subscribers[id]
-	if ok {
-		if subscriber != nil {
-			subscriber.Stop()
-		}
-		delete(m.subscribers, id)
+	if ok && subscriber == nil {
+		m.mu.Unlock()
+		return ErrSubscriptionAlreadyRunning
 	}
+	// Reserve slot with placeholder to prevent concurrent start/restart (TOCTOU)
+	m.subscribers[id] = nil
 	m.mu.Unlock()
+
+	// If there was an active subscriber, stop it outside the lock
+	if subscriber != nil {
+		subscriber.Stop()
+	}
+
+	success := false
+	defer func() {
+		if !success {
+			m.mu.Lock()
+			if m.subscribers[id] == nil {
+				delete(m.subscribers, id)
+			}
+			m.mu.Unlock()
+		}
+	}()
 
 	// Get subscription from DB
 	sub, err := m.repo.Get(ctx, id)
@@ -421,6 +436,7 @@ func (m *SubscriptionManager) RestartSubscription(ctx context.Context, id string
 		return err
 	}
 
+	success = true
 	m.logger.Info().Str("id", id).Msg("Restarted MQTT subscription")
 	return nil
 }
