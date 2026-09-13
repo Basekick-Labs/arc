@@ -659,6 +659,22 @@ func TestCleanupSubprocessTempDirUsesExactJobID(t *testing.T) {
 	}
 }
 
+func TestCleanupSubprocessTempDirRemovesJobTempDir(t *testing.T) {
+	tempDirectory := t.TempDir()
+	jobID := "database_partition_123_b1"
+	jobDirectory := jobTempDir(tempDirectory, jobID)
+	if err := os.MkdirAll(jobDirectory, 0755); err != nil {
+		t.Fatalf("failed to create job directory: %v", err)
+	}
+
+	if err := cleanupSubprocessTempDir(tempDirectory, jobID); err != nil {
+		t.Fatalf("cleanupSubprocessTempDir failed: %v", err)
+	}
+	if _, err := os.Stat(jobDirectory); !os.IsNotExist(err) {
+		t.Fatalf("job directory still exists or returned an unexpected error: %v", err)
+	}
+}
+
 func TestCleanupSubprocessTempDirRejectsUnsafeJobID(t *testing.T) {
 	tempDirectory := t.TempDir()
 	sentinel := filepath.Join(tempDirectory, "sentinel")

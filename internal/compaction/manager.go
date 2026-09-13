@@ -405,7 +405,7 @@ func cleanupSubprocessTempDir(tempDirectory, jobID string) error {
 	if err := validateJobID(jobID); err != nil {
 		return fmt.Errorf("cannot cleanup subprocess temp directory: %w", err)
 	}
-	return os.RemoveAll(filepath.Join(tempDirectory, jobID))
+	return os.RemoveAll(jobTempDir(tempDirectory, jobID))
 }
 
 // notifyCompactedOutput invokes the compacted-output observer, if any.
@@ -569,11 +569,11 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 	// job-owned directory and never infer identity from partition names.
 	if removeErr := cleanupSubprocessTempDir(config.TempDirectory, config.JobID); removeErr != nil {
 		m.logger.Debug().Err(removeErr).
-			Str("dir", filepath.Join(config.TempDirectory, config.JobID)).
+			Str("dir", jobTempDir(config.TempDirectory, config.JobID)).
 			Msg("Failed to cleanup subprocess temp directory")
 	} else {
 		m.logger.Debug().
-			Str("dir", filepath.Join(config.TempDirectory, config.JobID)).
+			Str("dir", jobTempDir(config.TempDirectory, config.JobID)).
 			Msg("Cleaned up subprocess temp directory")
 	}
 

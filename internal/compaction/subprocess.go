@@ -172,7 +172,7 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 	// JobID is always set by the parent (CompactPartition); skip on the
 	// defensive empty case and keep DuckDB's default.
 	if config.JobID != "" {
-		spillDir := filepath.Join(config.TempDirectory, config.JobID, "duckdb-spill")
+		spillDir := filepath.Join(jobTempDir(config.TempDirectory, config.JobID), "duckdb-spill")
 		if err := os.MkdirAll(spillDir, 0700); err != nil {
 			logger.Warn().Err(err).Str("dir", spillDir).Msg("Failed to create DuckDB spill directory; keeping DuckDB default")
 		} else if _, err := db.Exec(fmt.Sprintf("SET temp_directory='%s'", escapeSQLString(spillDir))); err != nil {
