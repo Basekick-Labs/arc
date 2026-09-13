@@ -15,11 +15,18 @@ type Manifest struct {
 	Databases      []DatabaseInfo `json:"databases"`
 	TotalFiles     int64          `json:"total_files"`
 	TotalSizeBytes int64          `json:"total_size_bytes"`
-	// SkippedFiles counts files that were listed and inventoried above but could
-	// not be read from source storage at copy time. When non-zero the backup is
-	// incomplete: TotalFiles/TotalSizeBytes describe what was inventoried, not
-	// what was actually stored.
+	// SkippedFiles counts data files that were listed and inventoried above but
+	// could not be read from source storage at copy time. When non-zero the
+	// backup is incomplete: TotalFiles/TotalSizeBytes describe what was
+	// inventoried, not what was actually stored. Counts the same population as
+	// TotalFiles, so a restore can compare the two; Iceberg metadata skips are
+	// in SkippedMetadataFiles. (Backups written before that split folded both
+	// into this field.)
 	SkippedFiles int64 `json:"skipped_files,omitempty"`
+	// SkippedMetadataFiles counts Iceberg warehouse metadata files that were
+	// listed but could not be read at copy time. They are copied under data/
+	// but are not part of TotalFiles.
+	SkippedMetadataFiles int64 `json:"skipped_metadata_files,omitempty"`
 	// UnaddressableFiles counts data files that exist in source storage but
 	// that no listing returns, because their key fails the storage key rules.
 	// They were never inventoried and could not be copied, so when this is
@@ -71,13 +78,32 @@ type Progress struct {
 	TotalFiles     int64  `json:"total_files"`
 	ProcessedFiles int64  `json:"processed_files"`
 	SkippedFiles   int64  `json:"skipped_files"`
-	// UnaddressableFiles mirrors Manifest.UnaddressableFiles for live progress.
-	UnaddressableFiles int64      `json:"unaddressable_files,omitempty"`
-	TotalBytes         int64      `json:"total_bytes"`
-	ProcessedBytes     int64      `json:"processed_bytes"`
-	StartedAt          time.Time  `json:"started_at"`
-	CompletedAt        *time.Time `json:"completed_at,omitempty"`
-	Error              string     `json:"error,omitempty"`
+	// UnaddressableFiles: for a backup, mirrors Manifest.UnaddressableFiles for
+	// live progress. For a restore, data files that are present in backup
+	// storage but that no listing returns (a dot-prefixed name an object store
+	// handed back at backup time, a key an older Arc wrote), so the restore
+	// could not copy them; UnaddressableSample names up to 32 of them so the
+	// operator can rename them in the backup and re-run.
+	UnaddressableFiles  int64    `json:"unaddressable_files,omitempty"`
+	UnaddressableSample []string `json:"unaddressable_sample,omitempty"`
+	// SkippedSample names up to unaddressableSampleCap of the backup objects a
+	// restore could not read. Restore only.
+	SkippedSample []string `json:"skipped_sample,omitempty"`
+	// MissingFiles counts data files the backup's manifest inventoried that
+	// are neither listed nor unaddressable in backup storage: they are gone.
+	// Restore only.
+	MissingFiles int64 `json:"missing_files,omitempty"`
+	// BackupSkippedFiles and BackupUnaddressableFiles mirror the restored
+	// backup's own manifest: files it already lacked when it was taken, so the
+	// operator can tell a gap that predates the restore from one it caused.
+	// Restore only.
+	BackupSkippedFiles       int64      `json:"backup_skipped_files,omitempty"`
+	BackupUnaddressableFiles int64      `json:"backup_unaddressable_files,omitempty"`
+	TotalBytes               int64      `json:"total_bytes"`
+	ProcessedBytes           int64      `json:"processed_bytes"`
+	StartedAt                time.Time  `json:"started_at"`
+	CompletedAt              *time.Time `json:"completed_at,omitempty"`
+	Error                    string     `json:"error,omitempty"`
 }
 
 // MarshalManifest serializes a manifest to JSON.

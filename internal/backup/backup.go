@@ -200,6 +200,11 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		progress.Error = err.Error()
 		return nil, err
 	}
+	// Skips so far are data-file skips. copyDataFiles accumulates into one
+	// progress counter across both groups, but the manifest reports the two
+	// apart: SkippedFiles must describe the same population as TotalFiles
+	// (data files) for a restore to compare them.
+	dataSkipped := atomic.LoadInt64(&progress.SkippedFiles)
 
 	// ── 2b. Copy Iceberg warehouse metadata (if any) ────────────────────
 	// Same copy mechanism + path preservation as data files, so restore round-trips them to
@@ -261,8 +266,10 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 
 	// ── 5. Write manifest ───────────────────────────────────────────────
 	// Record files that were inventoried but proved unreadable, so the manifest
-	// does not claim contents the backup does not actually hold.
-	manifest.SkippedFiles = atomic.LoadInt64(&progress.SkippedFiles)
+	// does not claim contents the backup does not actually hold. Data-file and
+	// Iceberg-metadata skips are recorded separately (see dataSkipped above).
+	manifest.SkippedFiles = dataSkipped
+	manifest.SkippedMetadataFiles = atomic.LoadInt64(&progress.SkippedFiles) - dataSkipped
 
 	manifestData, err := MarshalManifest(manifest)
 	if err != nil {
@@ -528,18 +535,20 @@ func (m *Manager) streamBackupFile(ctx context.Context, srcPath, destPath string
 
 	// Stream from temp file to backup storage
 	if err := m.backupStorage.WriteReader(ctx, destPath, tmpFile, size); err != nil {
-		m.cleanupPartialWrite(ctx, destPath)
+		m.cleanupPartialWrite(ctx, m.backupStorage, destPath)
 		return 0, fmt.Errorf("failed to write to backup storage: %w", err)
 	}
 
 	return size, nil
 }
 
-// cleanupPartialWrite removes the staging file a failed WriteReader leaves behind.
+// cleanupPartialWrite removes the staging file a failed WriteReader leaves behind
+// on the given backend (backup storage for a backup, data storage for a restore).
 //
 // LocalBackend.WriteReader deliberately preserves "<path>.part" on failure so the
-// file-replication puller can resume from the last committed byte. Backup has no
-// resume path — a retried backup starts over under a fresh backup ID — so that
+// file-replication puller can resume from the last committed byte. Neither backup
+// nor restore has a resume path — a retried backup starts over under a fresh
+// backup ID, a retried restore rewrites the key from scratch — so that
 // staging file is unreferenced garbage: never read, never listed as a backup
 // (it has no manifest.json), and holding disk equal to the bytes transferred
 // before the failure.
@@ -547,12 +556,12 @@ func (m *Manager) streamBackupFile(ctx context.Context, srcPath, destPath string
 // Best-effort by design: the write already failed, so the cleanup very likely
 // fails too (unwritable volume, storage unreachable). A cleanup failure must not
 // mask the real error, so it is logged at debug and discarded.
-func (m *Manager) cleanupPartialWrite(ctx context.Context, destPath string) {
+func (m *Manager) cleanupPartialWrite(ctx context.Context, backend storage.Backend, destPath string) {
 	// Addressed through the staging API rather than by appending the suffix to
 	// the key. That suffix is reserved now, because the staging file of key
 	// "x" used to BE the committed object "x.part" (#744). A backend that does
 	// not stage never leaves a partial, so there is nothing to clean up.
-	si, ok := m.backupStorage.(storage.StagingInspector)
+	si, ok := backend.(storage.StagingInspector)
 	if !ok {
 		return
 	}
@@ -560,7 +569,7 @@ func (m *Manager) cleanupPartialWrite(ctx context.Context, destPath string) {
 		m.logger.Debug().
 			Str("path", destPath).
 			Err(err).
-			Msg("Could not remove partial backup staging file")
+			Msg("Could not remove partial staging file after a failed write")
 	}
 }
 

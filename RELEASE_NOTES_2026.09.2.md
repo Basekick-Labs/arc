@@ -320,6 +320,55 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### A restore no longer reports success while dropping files ([#762](https://github.com/Basekick-Labs/arc/issues/762))
+
+A restore could finish with `status: completed` while having written only part
+of the backup. Every per-file failure in the data copy was logged and skipped:
+a backup object that could not be read, a temp file that could not be created,
+and a write into the live data store that failed all looked the same and none
+of them was counted. A backup whose objects had gone missing after it was
+written listed short, so every listed file restored and the restore also
+reported success. Backup had the accounting for this (the skipped-file count,
+the "will be incomplete" warning, the guard against too much loss); restore,
+the side where the gap costs data, had none of it.
+
+What changes:
+
+- **A restore that could not restore every data file now ends `failed`**, with
+  an error saying so and, on the status endpoint, `skipped_files` (backup
+  objects that could not be read), `missing_files` (files the manifest
+  inventoried that backup storage no longer holds), and `skipped_sample` (up to
+  32 of the unreadable paths). The files that could be restored are written
+  first and stay in place, so a recovery from a damaged backup still gets
+  everything that can be read. There is no tolerated fraction: backup tolerates
+  a few unreadable files because compaction or retention can remove one between
+  listing and copy, and nothing removes objects under a backup while it is
+  being restored, so every gap on restore is damage.
+- **A failed write into data storage now aborts the restore** instead of being
+  skipped, and the staging partial it leaves behind is removed. A restore onto
+  a full or read-only volume previously reported `completed`.
+- A temp-file failure is told apart from an unreadable backup object even
+  though both surface from the same read call, so a full temp filesystem aborts
+  the restore rather than counting as skipped objects.
+- **Data files the backup holds under names its listing hides are reported,
+  not silently left behind.** An object store returns dot-prefixed keys
+  (`._foo.parquet` debris from a sync tool, for example) and the backup copied
+  them, but the local backup store's listing hides dot-prefixed names, so the
+  restore could never see them. They are now counted as `unaddressable_files`
+  with an `unaddressable_sample`, and the error says to rename them in the
+  backup and re-run, which recovers them. They are told apart from files that
+  are genuinely gone (`missing_files`).
+- **Restoring a backup that was itself incomplete is announced** at the start
+  and reported as `backup_skipped_files` and `backup_unaddressable_files` on the
+  status endpoint, so a gap that predates the restore is not mistaken for one it
+  caused.
+- The backup manifest's `skipped_files` now counts data files only, the same
+  population as `total_files`, so a restore can compare the two; Iceberg
+  warehouse metadata that could not be read at backup time is recorded
+  separately as `skipped_metadata_files`. Previously both were folded together,
+  and a restore comparing them would have let one missing data file per
+  metadata skip go undetected.
+
 ### TOCTOU race in MQTT subscription restart ([#301](https://github.com/Basekick-Labs/arc/issues/301))
 
 `RestartSubscription` now reserves the subscription slot with a nil-placeholder before
