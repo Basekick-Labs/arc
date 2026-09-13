@@ -320,6 +320,14 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### DuckDB path quoting uses one shared escaping helper ([#752](https://github.com/Basekick-Labs/arc/issues/752))
+
+DuckDB path interpolation now uses one shared string-literal quoting helper
+across query, delete, retention, and parallel execution paths, preserving the
+existing escaping behavior for paths containing single quotes.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#752](https://github.com/Basekick-Labs/arc/issues/752).
+
 ### Numeric MessagePack host values are logged when coerced ([#768](https://github.com/Basekick-Labs/arc/issues/768))
 
 The MessagePack decoder accepts a numeric `host` and coerces it to `host_<num>`.
