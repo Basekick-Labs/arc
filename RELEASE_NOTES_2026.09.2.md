@@ -1391,3 +1391,10 @@ warehouse metadata directory, after the files are removed, so a racing
 reconcile pass can only empty tables rather than recreate them. Cleanup
 failures are logged and re-running the DELETE retries them, including when the
 files are already gone.
+
+### TOCTOU race in MQTT subscription restart ([#301](https://github.com/Basekick-Labs/arc/issues/301))
+
+`RestartSubscription` now reserves the subscription slot with a nil-placeholder before
+releasing the manager lock, preventing concurrent start or restart operations from
+launching duplicate subscribers while configuration is loaded and the new subscriber starts.
+

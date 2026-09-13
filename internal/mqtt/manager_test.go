@@ -151,3 +151,56 @@ func TestManager_Create_InvalidQoSIsValidationError(t *testing.T) {
 		t.Errorf("expected ErrValidation, got %v", err)
 	}
 }
+
+// TestManager_RestartSubscription_AlreadyRunning verifies that calling
+// RestartSubscription when a slot is already reserved (in-progress start/restart)
+// returns ErrSubscriptionAlreadyRunning (#301).
+func TestManager_RestartSubscription_AlreadyRunning(t *testing.T) {
+	mgr := newTestManager(t)
+	ctx := context.Background()
+
+	sub := &Subscription{
+		Name:     "test-sub",
+		Broker:   "tcp://localhost:1883",
+		ClientID: "test-client",
+		Topics:   []string{"sensors/#"},
+		QoS:      1,
+		Database: "iot",
+	}
+	sub.SetDefaults()
+	if err := mgr.repo.Create(ctx, sub); err != nil {
+		t.Fatalf("repo.Create: %v", err)
+	}
+
+	// Inject nil placeholder to simulate in-flight start or restart
+	mgr.mu.Lock()
+	mgr.subscribers[sub.ID] = nil
+	mgr.mu.Unlock()
+
+	err := mgr.RestartSubscription(ctx, sub.ID)
+	if !errors.Is(err, ErrSubscriptionAlreadyRunning) {
+		t.Fatalf("expected ErrSubscriptionAlreadyRunning, got %v", err)
+	}
+}
+
+// TestManager_RestartSubscription_PlaceholderCleanedOnNotFound verifies that
+// if the subscription does not exist in the repository, the reserved slot
+// placeholder is cleaned up so future attempts are not locked out (#301).
+func TestManager_RestartSubscription_PlaceholderCleanedOnNotFound(t *testing.T) {
+	mgr := newTestManager(t)
+	ctx := context.Background()
+
+	err := mgr.RestartSubscription(ctx, "nonexistent-id")
+	if err == nil {
+		t.Fatal("expected error for nonexistent subscription, got nil")
+	}
+
+	mgr.mu.RLock()
+	_, exists := mgr.subscribers["nonexistent-id"]
+	mgr.mu.RUnlock()
+
+	if exists {
+		t.Errorf("expected placeholder to be cleaned up from subscribers map, but it exists")
+	}
+}
+
