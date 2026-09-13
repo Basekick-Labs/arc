@@ -326,7 +326,7 @@ DuckDB path interpolation now uses one shared string-literal quoting helper
 across query, delete, retention, and parallel execution paths, preserving the
 existing escaping behavior for paths containing single quotes.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#752](https://github.com/Basekick-Labs/arc/issues/752).
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#780](https://github.com/Basekick-Labs/arc/pull/780).
 
 ### Numeric MessagePack host values are logged when coerced ([#768](https://github.com/Basekick-Labs/arc/issues/768))
 
