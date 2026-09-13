@@ -200,7 +200,7 @@ func (r *Receiver) Receive(ctx context.Context, spokeID, sourcePath, declaredSHA
 	if err := validateSpokeID(spokeID); err != nil {
 		return nil, err
 	}
-	if err := validateSyncPath(sourcePath); err != nil {
+	if err := validateSyncPathForSpoke(spokeID, sourcePath); err != nil {
 		return nil, err
 	}
 	if declaredSize < 0 {
@@ -633,6 +633,19 @@ func stagingPathFor(spokeID, sourcePath string) string {
 	return path.Join(StagingPrefix, spokeID, sourcePath)
 }
 
+// sourcePathMaxLen is the source-path budget for a receiving spoke. Local
+// storage appends PartSuffix to every key, so MaxUsableKeyLen is the budget
+// for the final key before that suffix is added. The staging key is always
+// longer than the namespaced key and therefore determines the source budget.
+func sourcePathMaxLen(spokeID string) int {
+	namespacedOverhead := len(spokeID) + 1
+	stagingOverhead := len(StagingPrefix) + 2 + len(spokeID)
+	if namespacedOverhead > stagingOverhead {
+		stagingOverhead = namespacedOverhead
+	}
+	return storage.MaxUsableKeyLen - stagingOverhead
+}
+
 // MaxSpokeIDLen bounds a spoke identifier. It becomes a filesystem path
 // component, and 128 matches the cap the registry applies to the spoke name.
 const MaxSpokeIDLen = 128
@@ -699,6 +712,14 @@ func validateSpokeID(spokeID string) error {
 // A spoke is a remote, semi-trusted party — it may be a compromised edge box —
 // so its declared path is untrusted input that becomes a filesystem location.
 func validateSyncPath(p string) error {
+	return validateSyncPathWithMaxLen(p, storage.MaxUsableKeyLen)
+}
+
+func validateSyncPathForSpoke(spokeID, p string) error {
+	return validateSyncPathWithMaxLen(p, sourcePathMaxLen(spokeID))
+}
+
+func validateSyncPathWithMaxLen(p string, maxPathLen int) error {
 	if p == "" {
 		return errors.New("edgesync: path is required")
 	}
@@ -736,15 +757,15 @@ func validateSyncPath(p string) error {
 			return fmt.Errorf("edgesync: path %q has a segment starting with a dot", p)
 		}
 	}
-	// Bounded so a spoke cannot send a path that passes here, passes the
-	// storage key contract, and then fails only once the ".part" staging
-	// suffix is appended (#743). The headroom is the suffix length.
-	if len(p) > storage.MaxKeyLen-len(storage.PartSuffix) {
-		return fmt.Errorf("edgesync: path is %d bytes, over the %d-byte limit", len(p), storage.MaxKeyLen-len(storage.PartSuffix))
+	// Bound the source path by the key it becomes on the receiving hub. The
+	// caller supplies the namespace-aware budget for receives; generic callers
+	// use the storage key budget directly.
+	if len(p) > maxPathLen {
+		return fmt.Errorf("edgesync: path is %d bytes, over the %d-byte limit", len(p), maxPathLen)
 	}
 	for _, seg := range strings.Split(p, "/") {
-		if len(seg) > storage.MaxKeySegmentLen-len(storage.PartSuffix) {
-			return fmt.Errorf("edgesync: path %q has a %d-byte segment, over the %d-byte limit", p, len(seg), storage.MaxKeySegmentLen-len(storage.PartSuffix))
+		if len(seg) > storage.MaxUsableKeySegmentLen {
+			return fmt.Errorf("edgesync: path %q has a %d-byte segment, over the %d-byte limit", p, len(seg), storage.MaxUsableKeySegmentLen)
 		}
 	}
 	if !strings.HasSuffix(p, ".parquet") {

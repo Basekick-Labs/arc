@@ -105,7 +105,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, spokeID string, entries []Re
 	paths := make([]string, 0, len(entries))
 	seen := make(map[string]struct{}, len(entries))
 	for i, e := range entries {
-		if err := validateSyncPath(e.Path); err != nil {
+		if err := validateSyncPathForSpoke(spokeID, e.Path); err != nil {
 			return nil, fmt.Errorf("edgesync: reconcile entry %d: %w", i, err)
 		}
 		if !isHexSHA256(e.SHA256) {
