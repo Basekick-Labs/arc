@@ -2320,4 +2320,3 @@ func TestValidateSQLRequest_BlocksPrepareAndExecute(t *testing.T) {
 		}
 	}
 }
-
