@@ -320,6 +320,14 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Metadata reads and writes no longer serialize globally ([#344](https://github.com/Basekick-Labs/arc/issues/344))
+
+Removed the redundant global metadata-store mutex. The database connection pool
+and SQLite continue to provide concurrency and locking for metadata operations,
+while the tier lookup cache remains protected by its dedicated mutex.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#344](https://github.com/Basekick-Labs/arc/issues/344).
+
 ### Retention reports files hidden by storage listings ([#771](https://github.com/Basekick-Labs/arc/issues/771))
 
 Retention already had a skipped-file counter, but since #744 normal listing no
