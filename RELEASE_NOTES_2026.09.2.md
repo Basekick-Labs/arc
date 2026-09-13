@@ -320,6 +320,16 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Retention reports files hidden by storage listings ([#771](https://github.com/Basekick-Labs/arc/issues/771))
+
+Retention already had a skipped-file counter, but since #744 normal listing no
+longer returns a key that `readParquetPath` rejects, the counter stopped being
+fed and remained zero. Retention now reports those files, including keys
+rejected by the storage contract; they remain untouched, while dry-run and real
+executions report the same skipped-file count and reason.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#775](https://github.com/Basekick-Labs/arc/pull/775).
+
 ### DuckDB path quoting uses one shared escaping helper ([#752](https://github.com/Basekick-Labs/arc/issues/752))
 
 DuckDB path interpolation now uses one shared string-literal quoting helper
