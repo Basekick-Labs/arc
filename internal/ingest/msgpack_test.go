@@ -363,6 +363,16 @@ func TestMessagePackDecoder_ExtractHost(t *testing.T) {
 			input: nil,
 			want:  "unknown",
 		},
+		{
+			name:  "float host",
+			input: float64(3.14),
+			want:  "unknown",
+		},
+		{
+			name:  "boolean host",
+			input: true,
+			want:  "unknown",
+		},
 	}
 
 	for _, tt := range tests {
