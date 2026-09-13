@@ -458,7 +458,7 @@ Thanks to everyone who has contributed code to Arc:
 - [@MrBeldum](https://github.com/MrBeldum) (Daniel) — configured query timeout applied to the measurement endpoint, with request-scoped cancellation and 504 handling on both query paths (#701)
 - [@pujitha24](https://github.com/pujitha24) (Pujitha Paladugu) — tiered query routing pushed into SQL instead of filtering file metadata in Go (#707), replicate-sync handshake now authenticating the binary-framing capability flag (#715)
 - [@lecodev-26](https://github.com/lecodev-26) — numeric MessagePack host coercion logged at debug level, with an allocation-free log path verified under parallel ingest (#769)
-- [@efegokdemir](https://github.com/efegokdemir) (Efe) — one shared DuckDB string-literal quoting helper across the query, delete, retention and parallel-executor paths, replacing four drifting copies (#780)
+- [@efegokdemir](https://github.com/efegokdemir) (Efe) — one shared DuckDB string-literal quoting helper across the query, delete, retention and parallel-executor paths, replacing four drifting copies (#780); retention now reports data files its listings hide, with one inventory pass per policy and no abort on an invalid measurement name (#775)
 
 And a thank-you to community members whose bug reports drove fixes:
 
