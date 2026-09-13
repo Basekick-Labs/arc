@@ -764,6 +764,10 @@ var dangerousSQLPattern = regexp.MustCompile(`(?i)(?:` +
 	// bypassable via `CALL(proc)` (no whitespace before paren) — gemini
 	// round 1.
 	`|\bCALL\b` +
+	// PREPARE / EXECUTE match bare keywords as defense-in-depth against
+	// dynamic SQL evaluation (#739).
+	`|\bPREPARE\b` +
+	`|\bEXECUTE\b` +
 	// Secrets manager: CREATE/DROP SECRET lets any authenticated user replace
 	// or delete Arc's S3 credentials (redirecting reads to attacker-controlled
 	// creds, or knocking out S3 access entirely) and probe the secret manager.

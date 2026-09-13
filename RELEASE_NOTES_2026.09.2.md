@@ -73,6 +73,13 @@ OSS deployments were not exposed to a new risk.
 Full technical detail will accompany the corresponding security advisory once it
 is published. Responsibly reported by **[@rexpository](https://github.com/rexpository)**.
 
+### PREPARE and EXECUTE are rejected by the read-SQL validator ([#739](https://github.com/Basekick-Labs/arc/issues/739))
+
+`PREPARE` and `EXECUTE`, DuckDB's indirect-execution statements, are now blocked up front by the read-SQL validator on every user query endpoint. They were not exploitable before this change — the single-statement rule already rejects the two-statement chain — so this is defense-in-depth in case the statement splitter is ever relaxed. As with the other blocked keywords, a column literally named `prepare` or `execute` must be double-quoted.
+
+Contributed by [@Thundercloud12](https://github.com/Thundercloud12) in [#767](https://github.com/Basekick-Labs/arc/pull/767).
+
+
 
 ### Dependency bump: Apache Thrift 0.23.0 → 0.24.0 ([GHSA-8wv5-x4w7-5gww](https://github.com/advisories/GHSA-8wv5-x4w7-5gww))
 
@@ -1391,3 +1398,4 @@ warehouse metadata directory, after the files are removed, so a racing
 reconcile pass can only empty tables rather than recreate them. Cleanup
 failures are logged and re-running the DELETE retries them, including when the
 files are already gone.
+
