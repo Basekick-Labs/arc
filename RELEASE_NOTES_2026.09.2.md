@@ -326,7 +326,7 @@ Removed the redundant global metadata-store mutex. The database connection pool
 and SQLite continue to provide concurrency and locking for metadata operations,
 while the tier lookup cache remains protected by its dedicated mutex.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#344](https://github.com/Basekick-Labs/arc/issues/344).
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#777](https://github.com/Basekick-Labs/arc/pull/777).
 
 ### Retention reports files hidden by storage listings ([#771](https://github.com/Basekick-Labs/arc/issues/771))
 
