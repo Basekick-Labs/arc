@@ -320,11 +320,12 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
-### Metadata reads and writes no longer serialize globally ([#344](https://github.com/Basekick-Labs/arc/issues/344))
+### Metadata cache invalidation is ordered with cache fills ([#344](https://github.com/Basekick-Labs/arc/issues/344))
 
-Removed the redundant global metadata-store mutex. The database connection pool
-and SQLite continue to provide concurrency and locking for metadata operations,
-while the tier lookup cache remains protected by its dedicated mutex.
+Removed the redundant `MetadataStore` mutex that duplicated the serialization
+provided by the SQLite connection pool. Tier-cache fills are now ordered against
+invalidation with a generation counter, preventing stale query results from
+being stored after an invalidation.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#777](https://github.com/Basekick-Labs/arc/pull/777).
 

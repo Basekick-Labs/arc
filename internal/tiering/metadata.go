@@ -35,8 +35,9 @@ type MetadataStore struct {
 	logger zerolog.Logger
 
 	// Cache for GetTiersForMeasurement - keyed by "database/measurement"
-	tierCache   map[string]*tierCacheEntry
-	tierCacheMu sync.RWMutex
+	tierCache    map[string]*tierCacheEntry
+	tierCacheGen uint64
+	tierCacheMu  sync.RWMutex
 }
 
 // NewMetadataStore creates a new metadata store using the provided SQLite connection
@@ -132,6 +133,7 @@ func (s *MetadataStore) invalidateTierCache(database, measurement string) {
 	cacheKey := database + "/" + measurement
 	s.tierCacheMu.Lock()
 	delete(s.tierCache, cacheKey)
+	s.tierCacheGen++
 	s.tierCacheMu.Unlock()
 }
 
@@ -594,7 +596,7 @@ func (s *MetadataStore) GetTierStats(ctx context.Context) (map[Tier]TierStats, e
 func (s *MetadataStore) GetTiersForMeasurement(ctx context.Context, database, measurement string) (map[Tier]bool, error) {
 	cacheKey := database + "/" + measurement
 
-	// Check cache first (with separate lock to avoid blocking other operations)
+	// Check cache first (with separate lock to avoid blocking other operations).
 	s.tierCacheMu.RLock()
 	if entry, ok := s.tierCache[cacheKey]; ok && time.Now().Before(entry.expiresAt) {
 		// Cache hit - return a copy to avoid mutation
@@ -605,6 +607,7 @@ func (s *MetadataStore) GetTiersForMeasurement(ctx context.Context, database, me
 		s.tierCacheMu.RUnlock()
 		return result, nil
 	}
+	cacheGen := s.tierCacheGen
 	s.tierCacheMu.RUnlock()
 
 	// Cache miss - query database
@@ -620,34 +623,45 @@ func (s *MetadataStore) GetTiersForMeasurement(ctx context.Context, database, me
 	}
 	defer rows.Close()
 
-	tiers := make(map[Tier]bool)
+	var tiers []Tier
 	for rows.Next() {
 		var tierStr string
 		if err := rows.Scan(&tierStr); err != nil {
 			return nil, fmt.Errorf("failed to scan tier: %w", err)
 		}
-		tiers[TierFromString(tierStr)] = true
+		tiers = append(tiers, TierFromString(tierStr))
 	}
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating tiers: %w", err)
 	}
 
-	// Update cache
-	s.tierCacheMu.Lock()
-	s.pruneExpiredTierCache(time.Now())
-	s.tierCache[cacheKey] = &tierCacheEntry{
-		tiers:     tiers,
-		expiresAt: time.Now().Add(tierCacheTTL),
-	}
-	s.tierCacheMu.Unlock()
+	s.storeTierCacheIfUnchanged(cacheKey, tiers, cacheGen)
 
 	// Return a copy
 	result := make(map[Tier]bool, len(tiers))
-	for k, v := range tiers {
-		result[k] = v
+	for _, tier := range tiers {
+		result[tier] = true
 	}
 	return result, nil
+}
+
+func (s *MetadataStore) storeTierCacheIfUnchanged(key string, tiers []Tier, gen uint64) {
+	s.tierCacheMu.Lock()
+	defer s.tierCacheMu.Unlock()
+	if s.tierCacheGen != gen {
+		return
+	}
+
+	s.pruneExpiredTierCache(time.Now())
+	cachedTiers := make(map[Tier]bool, len(tiers))
+	for _, tier := range tiers {
+		cachedTiers[tier] = true
+	}
+	s.tierCache[key] = &tierCacheEntry{
+		tiers:     cachedTiers,
+		expiresAt: time.Now().Add(tierCacheTTL),
+	}
 }
 
 // GetRecentMigrations returns recent migration records
@@ -707,8 +721,7 @@ func (s *MetadataStore) GetRecentMigrations(ctx context.Context, limit int) ([]M
 
 // CleanupOldMigrations deletes migration records older than retentionDays.
 // A retentionDays of 0 or less is a no-op (keep all records).
-// Uses the thread-safe s.db directly; SQLite handles its own locking,
-// so concurrent reads (e.g. GetTiersForMeasurement) are not serialized here.
+// Uses s.db directly; SQLite handles locking between concurrent operations.
 //
 // The cutoff is resolved to a single MAX(id) up front, then deletes are batched
 // (1000 rows per transaction) by primary key to avoid re-scanning on the
