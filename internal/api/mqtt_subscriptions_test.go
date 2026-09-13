@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http/httptest"
@@ -9,7 +10,56 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
+
+	"github.com/basekick-labs/arc/internal/mqtt"
 )
+
+type stubMQTTManager struct {
+	mqtt.Manager
+	restartErr error
+}
+
+func (s *stubMQTTManager) RestartSubscription(ctx context.Context, id string) error {
+	return s.restartErr
+}
+
+// TestMQTTSubscriptionHandler_RestartAlreadyRunningConflict verifies that
+// handleRestart maps mqtt.ErrSubscriptionAlreadyRunning to 409 Conflict.
+func TestMQTTSubscriptionHandler_RestartAlreadyRunningConflict(t *testing.T) {
+	h := &MQTTSubscriptionHandler{
+		manager: &stubMQTTManager{restartErr: mqtt.ErrSubscriptionAlreadyRunning},
+		logger:  zerolog.Nop(),
+	}
+
+	app := fiber.New()
+	h.RegisterRoutes(app)
+
+	req := httptest.NewRequest("POST", "/api/v1/mqtt/subscriptions/test-id/restart", nil)
+	resp, err := app.Test(req, testRequestTimeoutMS)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusConflict {
+		t.Errorf("status: got %d, want 409", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("io.ReadAll: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("json.Unmarshal: %v (body=%s)", err, body)
+	}
+	if got["success"] != false {
+		t.Errorf("success: got %v, want false", got["success"])
+	}
+	if got["error"] != mqtt.ErrSubscriptionAlreadyRunning.Error() {
+		t.Errorf("error: got %q, want %q", got["error"], mqtt.ErrSubscriptionAlreadyRunning.Error())
+	}
+}
 
 // TestMQTTSubscriptionHandler_DisabledManager verifies that every CRUD,
 // lifecycle, and stats endpoint short-circuits with 503 when the MQTT subsystem
