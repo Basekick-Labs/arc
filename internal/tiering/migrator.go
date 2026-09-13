@@ -2,6 +2,7 @@ package tiering
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 	"golang.org/x/sync/semaphore"
@@ -29,6 +31,18 @@ type MigratorConfig struct {
 	BatchSize     int
 	Logger        zerolog.Logger
 }
+
+// ErrCandidateQuarantined is returned by MigrateFile when the candidate's
+// storage key turned out to be permanently unusable and the file index row
+// was marked so it is never selected again (#758). It wraps the backend's
+// ErrInvalidPath, so errors.Is works for either. Callers count it as a failed
+// migration for the cycle that discovered it, but it is not a retryable one.
+var ErrCandidateQuarantined = errors.New("tiering: candidate quarantined, its storage key is permanently unusable")
+
+// quarantineReasonInvalidPath is what the file index row records. It is a
+// fixed string rather than the wrapped error so the column stays greppable
+// and does not carry the per-backend spelling of the same condition.
+const quarantineReasonInvalidPath = "storage key is permanently unusable by every storage backend (storage.ErrInvalidPath)"
 
 // NewMigrator creates a new migrator
 func NewMigrator(cfg *MigratorConfig) *Migrator {
@@ -74,7 +88,7 @@ func (m *Migrator) MigrateTier(ctx context.Context, fromTier, toTier Tier) (int,
 
 	// Process in batches
 	migrated := 0
-	errors := 0
+	failed := 0
 
 	for i := 0; i < len(candidates); i += m.batchSize {
 		end := i + m.batchSize
@@ -83,12 +97,12 @@ func (m *Migrator) MigrateTier(ctx context.Context, fromTier, toTier Tier) (int,
 		}
 
 		batch := candidates[i:end]
-		batchMigrated, batchErrors := m.MigrateBatch(ctx, batch)
+		batchMigrated, batchFailed := m.MigrateBatch(ctx, batch)
 		migrated += batchMigrated
-		errors += batchErrors
+		failed += batchFailed
 	}
 
-	return migrated, errors
+	return migrated, failed
 }
 
 // FindCandidates finds files eligible for migration from one tier to another
@@ -202,7 +216,7 @@ func (m *Migrator) MigrateBatch(ctx context.Context, candidates []MigrationCandi
 
 	sem := semaphore.NewWeighted(int64(m.maxConcurrent))
 	var wg sync.WaitGroup
-	var migrated, errors int64
+	var migrated, failed int64
 	var mu sync.Mutex
 
 	for _, candidate := range candidates {
@@ -217,15 +231,22 @@ func (m *Migrator) MigrateBatch(ctx context.Context, candidates []MigrationCandi
 			defer sem.Release(1)
 
 			if err := m.MigrateFile(ctx, c); err != nil {
-				m.logger.Error().
-					Err(err).
-					Str("path", c.Path).
-					Str("from", string(c.CurrentTier)).
-					Str("to", string(c.TargetTier)).
-					Msg("Failed to migrate file")
+				// A quarantined candidate already logged its own, definitive
+				// line at Error; repeating it here would read as a second
+				// failure of the same file. It still counts as failed for this
+				// cycle: nothing was migrated, and the cycle summary should
+				// say so the one time it happens.
+				if !errors.Is(err, ErrCandidateQuarantined) {
+					m.logger.Error().
+						Err(err).
+						Str("path", c.Path).
+						Str("from", string(c.CurrentTier)).
+						Str("to", string(c.TargetTier)).
+						Msg("Failed to migrate file")
+				}
 
 				mu.Lock()
-				errors++
+				failed++
 				mu.Unlock()
 			} else {
 				mu.Lock()
@@ -236,7 +257,7 @@ func (m *Migrator) MigrateBatch(ctx context.Context, candidates []MigrationCandi
 	}
 
 	wg.Wait()
-	return int(migrated), int(errors)
+	return int(migrated), int(failed)
 }
 
 // MigrateFile migrates a single file from one tier to another
@@ -280,6 +301,9 @@ func (m *Migrator) MigrateFile(ctx context.Context, candidate MigrationCandidate
 		if migrationID > 0 {
 			m.manager.metadata.CompleteMigration(ctx, migrationID, migrationErr)
 		}
+		if errors.Is(migrationErr, storage.ErrInvalidPath) {
+			return m.quarantineCandidate(ctx, candidate, migrationErr)
+		}
 		return migrationErr
 	}
 
@@ -322,6 +346,40 @@ func (m *Migrator) MigrateFile(ctx context.Context, candidate MigrationCandidate
 		Msg("File migrated successfully")
 
 	return nil
+}
+
+// quarantineCandidate handles a migration that failed because no backend can
+// address the candidate's key (#758). The failure is permanent: the same key
+// is refused by every backend on every attempt, so leaving the row in the hot
+// tier would make FindCandidates re-select it next cycle, write another
+// failed-migration row, and log the same error, forever.
+//
+// The row is marked rather than deleted or re-tiered. On local storage the
+// file is a real data file inside the partition glob, so the query path still
+// serves it and the index should keep saying it exists in hot. What changes is
+// that the two work-set queries stop returning it. The marked row is the
+// operator's record; the only remedy is renaming the object, after which the
+// next scan registers the new key as a fresh row.
+//
+// If the mark itself cannot be persisted the original error is returned as a
+// plain failure, so the candidate IS retried next cycle. That is right: the
+// persistence failure is the transient one, and a retry of it is a single
+// UPDATE, not a copy.
+func (m *Migrator) quarantineCandidate(ctx context.Context, candidate MigrationCandidate, cause error) error {
+	if err := m.manager.metadata.QuarantineFile(ctx, candidate.Path, quarantineReasonInvalidPath); err != nil {
+		m.logger.Error().Err(err).
+			Str("path", candidate.Path).
+			AnErr("cause", cause).
+			Msg("Migration failed on a permanently unusable storage key and the quarantine mark could not be persisted; the candidate will be re-selected next cycle")
+		return cause
+	}
+	metrics.Get().IncStorageInvalidPathQuarantined()
+	m.logger.Error().Err(cause).
+		Str("path", candidate.Path).
+		Str("from", string(candidate.CurrentTier)).
+		Str("to", string(candidate.TargetTier)).
+		Msg("Migration candidate has a permanently unusable storage key; quarantined so it is never selected again. Its tier is unchanged and the file is not deleted. Rename the object by hand to make it migratable")
+	return fmt.Errorf("%w: %w", ErrCandidateQuarantined, cause)
 }
 
 // copyFile copies a file from source to destination backend
@@ -378,10 +436,19 @@ func (m *Migrator) copyFileStreaming(ctx context.Context, src, dst StreamingBack
 		errCh <- err
 	}()
 
-	// Wait for both operations to complete
+	// Wait for both operations to complete. The first error to arrive is the
+	// one reported, except that a permanent ErrInvalidPath wins over whatever
+	// arrived first: which side fails first is a goroutine race (the pipe
+	// closes with the reader's error, and the writer may report that or its
+	// own), and the caller branches on errors.Is to quarantine the candidate
+	// (#758), so the classification must not depend on the ordering.
 	var firstErr error
 	for i := 0; i < 2; i++ {
-		if err := <-errCh; err != nil && firstErr == nil {
+		err := <-errCh
+		if err == nil {
+			continue
+		}
+		if firstErr == nil || (errors.Is(err, storage.ErrInvalidPath) && !errors.Is(firstErr, storage.ErrInvalidPath)) {
 			firstErr = err
 		}
 	}
@@ -396,7 +463,7 @@ func (m *Migrator) copyFileStreaming(ctx context.Context, src, dst StreamingBack
 // ReconcileOrphanedFiles finds and deletes files that exist in hot storage
 // but are tracked as cold in metadata (orphaned after failed hot deletion during migration).
 // Only checks files migrated within the last 48 hours to limit I/O.
-func (m *Migrator) ReconcileOrphanedFiles(ctx context.Context) (orphansFound, deleted, errors int) {
+func (m *Migrator) ReconcileOrphanedFiles(ctx context.Context) (orphansFound, deleted, failed int) {
 	const reconcileWindow = 48 * time.Hour
 
 	coldFiles, err := m.manager.metadata.GetRecentlyMigratedFiles(ctx, TierCold, reconcileWindow)
@@ -418,14 +485,37 @@ func (m *Migrator) ReconcileOrphanedFiles(ctx context.Context) (orphansFound, de
 	for _, file := range coldFiles {
 		select {
 		case <-ctx.Done():
-			return orphansFound, deleted, errors
+			return orphansFound, deleted, failed
 		default:
 		}
 
 		exists, err := hotBackend.Exists(ctx, file.Path)
+		if errors.Is(err, storage.ErrInvalidPath) {
+			// Permanent: Exists fails identically on every cycle until the
+			// 48-hour window closes, and Delete would fail the same way, so
+			// there is nothing this loop can ever do for the row (#758). Mark
+			// it so GetRecentlyMigratedFiles stops returning it. The cold
+			// row is left as cold: this sweep only ever removes hot copies,
+			// and it cannot even establish whether one exists here.
+			//
+			// A persistence failure is counted and retried next cycle, which
+			// is a retry of one UPDATE, not a storm.
+			qErr := m.manager.metadata.QuarantineFile(ctx, file.Path, quarantineReasonInvalidPath)
+			if qErr != nil {
+				m.logger.Error().Err(qErr).Str("path", file.Path).AnErr("cause", err).
+					Msg("Cold file's storage key is permanently unusable and the quarantine mark could not be persisted; reconciliation will retry it next cycle")
+				failed++
+				continue
+			}
+			metrics.Get().IncStorageInvalidPathQuarantined()
+			m.logger.Error().Err(err).Str("path", file.Path).
+				Msg("Cold file's storage key is permanently unusable, so its hot copy can be neither checked nor removed; quarantined so reconciliation stops retrying it. Remove any hot copy by hand")
+			failed++
+			continue
+		}
 		if err != nil {
 			m.logger.Warn().Err(err).Str("path", file.Path).Msg("Failed to check hot existence during reconciliation")
-			errors++
+			failed++
 			continue
 		}
 
@@ -448,13 +538,13 @@ func (m *Migrator) ReconcileOrphanedFiles(ctx context.Context) (orphansFound, de
 		if err := m.manager.notifyHotFilesRemoved([]string{file.Path}); err != nil {
 			m.logger.Warn().Err(err).Str("path", file.Path).
 				Msg("Could not mark sync receipts; keeping orphaned hot file for the next cycle")
-			errors++
+			failed++
 			continue
 		}
 
 		if err := hotBackend.Delete(ctx, file.Path); err != nil {
 			m.logger.Warn().Err(err).Str("path", file.Path).Msg("Failed to delete orphaned hot file")
-			errors++
+			failed++
 			continue
 		}
 
@@ -462,7 +552,7 @@ func (m *Migrator) ReconcileOrphanedFiles(ctx context.Context) (orphansFound, de
 		m.CleanupEmptyDirectories(ctx, file.Path)
 	}
 
-	return orphansFound, deleted, errors
+	return orphansFound, deleted, failed
 }
 
 // CleanupEmptyDirectories removes empty directories after file migration

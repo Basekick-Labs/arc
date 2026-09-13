@@ -50,6 +50,11 @@ type FileMetadata struct {
 	SizeBytes     int64      `json:"size_bytes"`
 	CreatedAt     time.Time  `json:"created_at"`
 	MigratedAt    *time.Time `json:"migrated_at,omitempty"`
+	// QuarantinedAt is set once tiering has established that the file's
+	// storage key is permanently unusable and stopped selecting it for
+	// migration or reconciliation (#758). The tier is left as it was.
+	QuarantinedAt    *time.Time `json:"quarantined_at,omitempty"`
+	QuarantineReason string     `json:"quarantine_reason,omitempty"`
 }
 
 // MigrationCandidate represents a file that is eligible for tier migration
@@ -99,7 +104,11 @@ type StatusResponse struct {
 	LicenseValid bool                 `json:"license_valid"`
 	Reason       string               `json:"reason,omitempty"`
 	Tiers        map[string]TierStats `json:"tiers,omitempty"`
-	Scheduler    *SchedulerStatus     `json:"scheduler,omitempty"`
+	// QuarantinedFiles counts file index rows tiering will never act on
+	// again because their storage key is permanently unusable (#758). It
+	// should be zero; each one needs a rename by hand.
+	QuarantinedFiles int64            `json:"quarantined_files"`
+	Scheduler        *SchedulerStatus `json:"scheduler,omitempty"`
 }
 
 // SchedulerStatus represents the migration scheduler status
