@@ -1508,3 +1508,15 @@ warehouse metadata directory, after the files are removed, so a racing
 reconcile pass can only empty tables rather than recreate them. Cleanup
 failures are logged and re-running the DELETE retries them, including when the
 files are already gone.
+
+
+### Numeric MessagePack host values are logged when coerced
+
+The MessagePack decoder accepts a numeric `host` and coerces it to `host_<num>`.
+That behaviour is unchanged, but the coercion now emits a debug-level log line
+naming the resulting host, so a misconfigured client can be spotted without
+changing ingest behaviour. The log reuses the string already built for the
+return value, so the cost with debug disabled is not measurable under parallel
+ingest.
+
+Contributed by [@lecodev-26](https://github.com/lecodev-26) in [#769](https://github.com/Basekick-Labs/arc/pull/769).

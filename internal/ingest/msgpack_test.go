@@ -1,6 +1,8 @@
 package ingest
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 	"time"
 
@@ -363,6 +365,16 @@ func TestMessagePackDecoder_ExtractHost(t *testing.T) {
 			input: nil,
 			want:  "unknown",
 		},
+		{
+			name:  "float host",
+			input: float64(3.14),
+			want:  "unknown",
+		},
+		{
+			name:  "boolean host",
+			input: true,
+			want:  "unknown",
+		},
 	}
 
 	for _, tt := range tests {
@@ -372,6 +384,29 @@ func TestMessagePackDecoder_ExtractHost(t *testing.T) {
 				t.Errorf("extractHost() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestMessagePackDecoder_ExtractHost_LogsNumericCoercion(t *testing.T) {
+	var buf bytes.Buffer
+	logger := zerolog.New(&buf).Level(zerolog.DebugLevel)
+	decoder := NewMessagePackDecoder(logger)
+
+	decoder.extractHost(int64(42))
+	if !strings.Contains(buf.String(), "numeric host coerced to host_<num>") {
+		t.Errorf("expected debug log for numeric host, got: %q", buf.String())
+	}
+
+	buf.Reset()
+	decoder.extractHost("server01")
+	if buf.Len() != 0 {
+		t.Errorf("expected no log for string host, got: %q", buf.String())
+	}
+
+	buf.Reset()
+	decoder.extractHost(nil)
+	if buf.Len() != 0 {
+		t.Errorf("expected no log for nil host, got: %q", buf.String())
 	}
 }
 
