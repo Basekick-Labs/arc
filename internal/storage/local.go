@@ -1190,10 +1190,14 @@ func (b *LocalBackend) ListStaged(ctx context.Context, prefix string) ([]ObjectI
 		if infoErr != nil {
 			return nil
 		}
+		key := strings.TrimSuffix(filepath.ToSlash(rel), PartSuffix)
+		if err := validateKeyBody(key); err != nil {
+			return nil
+		}
 		results = append(results, ObjectInfo{
 			// Reported WITHOUT the suffix: the caller addresses a partial by
 			// the key it belongs to, never by the staging spelling.
-			Path:         strings.TrimSuffix(filepath.ToSlash(rel), PartSuffix),
+			Path:         key,
 			Size:         info.Size(),
 			LastModified: info.ModTime(),
 		})

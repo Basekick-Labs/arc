@@ -313,6 +313,14 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Local staged-file listing filters undeletable keys
+
+Local `ListStaged` now applies the same key validation used by `DeleteStaged`, so
+legacy partial files with invalid owning keys are not returned as entries that
+reclamation cannot delete.
+
+Contributed by [@Voyagerroc-Lab](https://github.com/Voyagerroc-Lab) in [#774](https://github.com/Basekick-Labs/arc/pull/774).
+
 ### A backup no longer reports success while silently omitting files ([#756](https://github.com/Basekick-Labs/arc/issues/756))
 
 A backup could finish, report success, and be missing data files that exist in
