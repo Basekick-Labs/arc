@@ -426,10 +426,10 @@ func (d *MessagePackDecoder) extractTimestamp(t interface{}) (time.Time, error) 
 
 // extractHost extracts host identifier.
 //
-// A host is expected to be a string identifier. A
-// numeric host is coerced into "host_<num>", but that is almost always a sign
-// of a misconfigured client — surface it at debug level so operators can spot
-// it without flooding logs on the hot ingest path.
+// A host is expected to be a string identifier. A numeric host is coerced
+// into "host_<num>", which is almost always a sign of a misconfigured client —
+// surface it at debug level so operators can spot it without flooding logs on
+// the hot ingest path.
 func (d *MessagePackDecoder) extractHost(h interface{}) string {
 	if h == nil {
 		return "unknown"

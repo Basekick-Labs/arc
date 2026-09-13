@@ -409,6 +409,7 @@ func TestMessagePackDecoder_ExtractHost_LogsNumericCoercion(t *testing.T) {
 		t.Errorf("expected no log for nil host, got: %q", buf.String())
 	}
 }
+
 func TestMessagePackDecoder_NormalizeTimestamps(t *testing.T) {
 	decoder := newTestDecoder()
 
