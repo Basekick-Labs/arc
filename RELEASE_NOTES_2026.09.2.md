@@ -320,6 +320,12 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Edge-sync rejects source paths that exceed the hub storage budget ([#757](https://github.com/Basekick-Labs/arc/issues/757))
+
+The hub now accounts for spoke namespace and staging prefixes before accepting an edge-sync source path, returning a client error instead of retryable 503 responses for paths it cannot store.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#757](https://github.com/Basekick-Labs/arc/issues/757).
+
 ### Retention reports files hidden by storage listings ([#771](https://github.com/Basekick-Labs/arc/issues/771))
 
 Retention already had a skipped-file counter, but since #744 normal listing no
