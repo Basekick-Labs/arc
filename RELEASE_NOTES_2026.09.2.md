@@ -332,6 +332,20 @@ backslashes in standard DuckDB string literals.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#782](https://github.com/Basekick-Labs/arc/pull/782).
 
+### The compaction candidates preview lists each measurement once ([#316](https://github.com/Basekick-Labs/arc/issues/316))
+
+`GET /api/v1/compaction/candidates` asked every enabled compaction tier for
+its candidates, and each tier listed the same `database/measurement/` prefix
+in the object store itself, so with hourly and daily enabled every measurement
+was listed twice per call. On a bucket with many files the listing is the
+expensive part of the request. The tiers can now scan a listing the caller
+already holds, and the preview lists each measurement once and hands the
+result to every tier. The scheduled compaction cycle is unchanged: it keeps
+one listing per tier on purpose, because hourly deletes its inputs before
+daily runs.
+
+Contributed by [@alexeymoskalev-devops](https://github.com/alexeymoskalev-devops) in [#789](https://github.com/Basekick-Labs/arc/pull/789).
+
 ### Metadata cache invalidation is ordered with cache fills ([#344](https://github.com/Basekick-Labs/arc/issues/344))
 
 Removed the redundant `MetadataStore` mutex that duplicated the serialization
