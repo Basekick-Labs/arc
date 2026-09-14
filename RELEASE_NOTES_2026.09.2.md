@@ -324,6 +324,15 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Metadata cache invalidation is ordered with cache fills ([#344](https://github.com/Basekick-Labs/arc/issues/344))
+
+Removed the redundant `MetadataStore` mutex that duplicated the serialization
+provided by the SQLite connection pool. Tier-cache fills are now ordered against
+invalidation with a generation counter, preventing stale query results from
+being stored after an invalidation.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#777](https://github.com/Basekick-Labs/arc/pull/777).
+
 ### Edge-sync spoke IDs no longer create manifest-invalid keys ([#751](https://github.com/Basekick-Labs/arc/issues/751))
 
 Spoke IDs containing a colon, such as `rocket:01`, are now rejected during
