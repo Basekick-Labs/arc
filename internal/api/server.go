@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"crypto/tls"
+	"database/sql"
 	"fmt"
 	"net"
 	"os"
@@ -54,6 +55,11 @@ type Server struct {
 	// listener only opens after wiring, but the guard keeps tests and future
 	// reorderings safe). In-memory reads only — /health never probes S3.
 	storageStatus func() map[string]database.StorageTierStatus
+
+	// dbStats supplies the DuckDB connection-pool snapshot for the metrics
+	// endpoints (#809). Nil when no database is wired, e.g. a test server or
+	// an OSS standalone that never calls SetDBStats — sampleDBStats guards it.
+	dbStats func() sql.DBStats
 
 	// storageCredsFailReady: when true (server.storage_credentials_fail_ready,
 	// default false), /ready returns 503 while any tier's credential state is
@@ -261,6 +267,31 @@ func (s *Server) SetStorageStatus(fn func() map[string]database.StorageTierStatu
 	s.storageCredsFailReady = failReady
 }
 
+// SetDBStats wires the DuckDB connection-pool stats source
+// (database.DuckDB.Stats) into the metrics endpoints.
+//
+// Sampled when metrics are read rather than pushed on change: sql.DBStats is a
+// point-in-time snapshot that is only meaningful at the instant it is
+// observed, and a background ticker would either sample too coarsely to catch
+// a saturation spike or burn CPU sampling a mutex-guarded struct nobody reads.
+//
+// The server does not otherwise hold the *database.DuckDB handle, which is why
+// this is a setter rather than a constructor field — same shape as
+// SetStorageStatus above (#809).
+func (s *Server) SetDBStats(fn func() sql.DBStats) {
+	s.dbStats = fn
+}
+
+// sampleDBStats refreshes the pool gauges if a source is wired. Safe to call
+// when it is not: an OSS standalone that never calls SetDBStats leaves the
+// gauges at zero rather than panicking.
+func (s *Server) sampleDBStats() {
+	if s.dbStats == nil {
+		return
+	}
+	metrics.Get().SetDBPoolStats(s.dbStats())
+}
+
 // healthHandler returns server health status.
 //
 // The "storage" field is served UNAUTHENTICATED by design, like the rest of
@@ -370,6 +401,10 @@ func (s *Server) MarkNotReady() {
 
 // metricsHandler returns metrics in Prometheus format or JSON
 func (s *Server) metricsHandler(c *fiber.Ctx) error {
+	// Refresh the pool gauges before reading; they are sampled on demand
+	// rather than pushed, so an unsampled read would serve a stale snapshot
+	// (#809).
+	s.sampleDBStats()
 	m := metrics.Get()
 
 	// Check Accept header for format preference
@@ -385,6 +420,10 @@ func (s *Server) metricsHandler(c *fiber.Ctx) error {
 
 // apiMetricsHandler returns all metrics in JSON format (API v1)
 func (s *Server) apiMetricsHandler(c *fiber.Ctx) error {
+	// Refresh the pool gauges before reading; they are sampled on demand
+	// rather than pushed, so an unsampled read would serve a stale snapshot
+	// (#809).
+	s.sampleDBStats()
 	m := metrics.Get()
 	snapshot := m.Snapshot()
 	snapshot["timestamp"] = time.Now().UTC().Format(time.RFC3339)
@@ -451,6 +490,10 @@ func (s *Server) memoryMetricsHandler(c *fiber.Ctx) error {
 
 // queryPoolMetricsHandler returns DuckDB connection pool metrics
 func (s *Server) queryPoolMetricsHandler(c *fiber.Ctx) error {
+	// Refresh the pool gauges before reading; they are sampled on demand
+	// rather than pushed, so an unsampled read would serve a stale snapshot
+	// (#809).
+	s.sampleDBStats()
 	m := metrics.Get()
 	snapshot := m.Snapshot()
 
