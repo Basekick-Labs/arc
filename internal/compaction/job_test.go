@@ -82,6 +82,11 @@ func TestEscapeSQLPath(t *testing.T) {
 			path: "'''",
 			want: "''''''",
 		},
+		{
+			name: "backslash",
+			path: `back\slash`,
+			want: `back\slash`,
+		},
 	}
 
 	for _, tt := range tests {

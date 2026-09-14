@@ -85,6 +85,19 @@ func (t *DailyTier) FindCandidates(ctx context.Context, database, measurement st
 	if !t.Enabled {
 		return nil, nil
 	}
+	objects, err := t.listObjects(ctx, database, measurement)
+	if err != nil {
+		return nil, err
+	}
+	return t.FindCandidatesFromListing(database, measurement, objects), nil
+}
+
+// FindCandidatesFromListing implements Tier: FindCandidates over a listing
+// the caller already holds.
+func (t *DailyTier) FindCandidatesFromListing(database, measurement string, objects []string) []Candidate {
+	if !t.Enabled {
+		return nil
+	}
 
 	var candidates []Candidate
 	cutoffTime := time.Now().UTC().Add(-time.Duration(t.MinAgeHours) * time.Hour)
@@ -95,13 +108,7 @@ func (t *DailyTier) FindCandidates(ctx context.Context, database, measurement st
 		Time("cutoff", cutoffTime).
 		Msg("Scanning for daily compaction candidates")
 
-	// List all day partitions
-	partitions, err := t.listDayPartitions(ctx, database, measurement, cutoffTime)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, partition := range partitions {
+	for _, partition := range t.groupDayPartitions(database, measurement, objects, cutoffTime) {
 		if t.ShouldCompact(partition.Files, partition.PartitionTime) {
 			partition.Tier = t.GetTierName()
 			partition.FileCount = len(partition.Files)
@@ -121,7 +128,7 @@ func (t *DailyTier) FindCandidates(ctx context.Context, database, measurement st
 		Int("candidates", len(candidates)).
 		Msg("Daily compaction candidate scan complete")
 
-	return candidates, nil
+	return candidates
 }
 
 // ShouldCompact determines if a day partition should be compacted
@@ -144,20 +151,10 @@ func (t *DailyTier) GetStats() map[string]interface{} {
 	return t.GetBaseStats(t.GetTierName())
 }
 
-// listDayPartitions lists all day partitions for a measurement
-func (t *DailyTier) listDayPartitions(ctx context.Context, database, measurement string, cutoffTime time.Time) ([]Candidate, error) {
-	// Get all files for this database/measurement
-	prefix := database + "/" + measurement + "/"
-	objects, err := t.StorageBackend.List(ctx, prefix)
-	if err != nil {
-		return nil, err
-	}
-
-	t.Logger.Debug().
-		Str("database", database).
-		Str("measurement", measurement).
-		Int("object_count", len(objects)).
-		Msg("Listed storage objects")
+// groupDayPartitions groups a measurement's objects into day partitions old
+// enough to compact
+func (t *DailyTier) groupDayPartitions(database, measurement string, objects []string, cutoffTime time.Time) []Candidate {
+	prefix := measurementPrefix(database, measurement)
 
 	// Group files by day partition
 	partitions := make(map[string]*Candidate)
@@ -252,7 +249,7 @@ func (t *DailyTier) listDayPartitions(ctx context.Context, database, measurement
 		Time("cutoff", cutoffTime).
 		Msg("Found day partitions")
 
-	return result, nil
+	return result
 }
 
 // extractNewestFileTime extracts the newest file creation time from a list of file paths.

@@ -218,10 +218,8 @@ func (d *DuckDB) AllowedDirectories() []string {
 	return buildAllowedDirectories(d.config)
 }
 
-// escapeSQLString escapes single quotes for safe use in DuckDB SQL strings.
-// This prevents SQL injection when interpolating configuration values.
 func escapeSQLString(s string) string {
-	return strings.ReplaceAll(s, "'", "''")
+	return sqlutil.EscapeStringLiteral(s)
 }
 
 // quoteDuckDBIdent quotes a DuckDB identifier (table, column, setting name)

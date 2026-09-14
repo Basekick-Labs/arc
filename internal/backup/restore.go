@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,46 +46,9 @@ func isRestoreReadError(err error) bool {
 	return errors.Is(err, errRestoreRead)
 }
 
-// trackingWriter records the first error the destination returned.
-//
-// Every backend's ReadTo is an io.Copy into the caller's writer, so a full temp
-// filesystem surfaces as a ReadTo error that is indistinguishable, by the error
-// alone, from the source being unreadable. The recorded error lets
-// classifyReadTo attribute the failure to the right side.
-//
-// Wrapping the temp file costs the backup→temp hop io.Copy's zero-copy fast
-// path (copy_file_range needs an *os.File destination), so that hop runs
-// through a buffered loop. Deliberate: a restore is rare and disk-bound, and
-// the alternative is not knowing which side failed. The temp→data hop is
-// unaffected.
-type trackingWriter struct {
-	w   io.Writer
-	err error
-}
-
-func (t *trackingWriter) Write(p []byte) (int, error) {
-	n, err := t.w.Write(p)
-	if err != nil && t.err == nil {
-		t.err = err
-	}
-	return n, err
-}
-
-// createRestoreTemp creates the per-file staging temp file. A variable so tests
-// can hand streamRestoreFile a file that refuses writes, which is the only
-// portable way to drive the destination-side ReadTo failure end to end.
-var createRestoreTemp = func() (*os.File, error) {
-	return os.CreateTemp("", "arc-restore-*.parquet")
-}
-
-// classifyReadTo turns a ReadTo failure into the restore's two error classes: a
-// destination error recorded by the tracking writer is fatal; anything else is
-// a source read, wrapped with errRestoreRead so the caller can skip it.
+// classifyReadTo preserves restore's source-read and destination error wording.
 func classifyReadTo(srcPath string, readErr, writeErr error) error {
-	if writeErr != nil {
-		return fmt.Errorf("failed to write temp file while reading %s from backup: %w", srcPath, writeErr)
-	}
-	return fmt.Errorf("failed to read from backup: %w: %w", errRestoreRead, readErr)
+	return classifyReadToFailure(srcPath, readErr, writeErr, errRestoreRead, "backup")
 }
 
 // RestoreBackup restores data from a backup. It runs synchronously; the API
@@ -359,7 +321,7 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 // returned unwrapped and are fatal to the restore. A ReadTo failure caused by
 // the temp file itself (see trackingWriter) is fatal, not a read.
 func (m *Manager) streamRestoreFile(ctx context.Context, srcPath, destPath string) (int64, error) {
-	tmpFile, err := createRestoreTemp()
+	tmpFile, err := createTempFile("arc-restore-*.parquet")
 	if err != nil {
 		return 0, fmt.Errorf("failed to create temp file: %w", err)
 	}

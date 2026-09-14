@@ -500,12 +500,8 @@ func (m *Manager) checkSkipRatio(progress *Progress, totalFiles int) error {
 // streamBackupFile streams a file from data storage to backup storage via a temp file,
 // avoiding loading the entire file into memory (important for large Parquet files).
 // It returns the number of bytes actually copied.
-//
-// Only a source-read failure is wrapped with errBackupRead (making it skippable by
-// the caller); temp file, seek, and write failures are returned unwrapped and are
-// fatal to the backup.
 func (m *Manager) streamBackupFile(ctx context.Context, srcPath, destPath string) (int64, error) {
-	tmpFile, err := os.CreateTemp("", "arc-backup-*.parquet")
+	tmpFile, err := createTempFile("arc-backup-*.parquet")
 	if err != nil {
 		return 0, fmt.Errorf("failed to create temp file: %w", err)
 	}
@@ -514,8 +510,9 @@ func (m *Manager) streamBackupFile(ctx context.Context, srcPath, destPath string
 	defer tmpFile.Close()
 
 	// Stream from data storage to temp file
-	if err := m.dataStorage.ReadTo(ctx, srcPath, tmpFile); err != nil {
-		return 0, fmt.Errorf("failed to read from data storage: %w: %w", errBackupRead, err)
+	tw := &trackingWriter{w: tmpFile}
+	if err := m.dataStorage.ReadTo(ctx, srcPath, tw); err != nil {
+		return 0, classifyReadToFailure(srcPath, err, tw.err, errBackupRead, "data storage")
 	}
 
 	// Size the upload from the temp file rather than the listing: the listing is a

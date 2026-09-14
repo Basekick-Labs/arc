@@ -385,6 +385,8 @@ func TestReceiver_RejectsMaliciousSpokeIDs(t *testing.T) {
 		{"traversal", ".."},
 		{"separator", "rocket/../other"},
 		{"backslash", "rocket\\other"},
+		{"colon", "rocket:01"},
+		{"colon in short ID", "a:b"},
 		{"dot prefix", ".sync-staging"},
 		{"NUL byte", "rocket\x00-01"},
 		// #737: accepted by every other check, but the local backend folds
@@ -402,6 +404,16 @@ func TestReceiver_RejectsMaliciousSpokeIDs(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if _, err := r.Receive(ctx, tt.id, testPath, sha256Hex(content), int64(len(content)), 0, bytes.NewReader(content)); err == nil {
 				t.Errorf("spoke ID %q was accepted", tt.id)
+			}
+		})
+	}
+}
+
+func TestValidateSpokeIDAcceptsExistingIDs(t *testing.T) {
+	for _, id := range []string{"rocket-01", "rocket_01", "edge01", "Rocket East"} {
+		t.Run(id, func(t *testing.T) {
+			if err := validateSpokeID(id); err != nil {
+				t.Errorf("spoke ID %q was rejected: %v", id, err)
 			}
 		})
 	}
