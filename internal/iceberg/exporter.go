@@ -516,7 +516,30 @@ func (e *Exporter) expireSnapshots(ctx context.Context, tbl *icetable.Table, dat
 	// always satisfied and retain-last becomes the effective cap ("keep the last N, expire the
 	// rest"). Cluster-mode note: this is fine because the reconciler is writer-gated (single
 	// writer), so no concurrent reader-vs-expire race beyond Iceberg's own snapshot isolation.
-	if err := txn.ExpireSnapshots(icetable.WithRetainLast(e.retain), icetable.WithOlderThan(0)); err != nil {
+	//
+	// WithPostCommit(false) is load-bearing (#632). iceberg-go defaults it to true,
+	// which makes Commit run orphan deletion as a post-commit hook: it os.Removes the
+	// expiring snapshots' manifest lists, manifests AND the data files they reference,
+	// joining every failure into the error Commit returns.
+	//
+	// That is wrong for Arc twice over. First, files leave an Arc table precisely
+	// BECAUSE Arc already deleted them (compaction, retention, the delete API), so the
+	// hook reports ENOENT for a commit that actually succeeded — and the list grows
+	// every pass, because each expiring manifest carries entries for every file ever
+	// removed. Second, and worse, postCommit=true hands iceberg-go physical delete
+	// authority over Arc's primary data files: any future listing bug that transiently
+	// omits live files for `retain` generations would turn into silent deletion of
+	// customer data by the exporter. Arc owns the data-file lifecycle; the exporter
+	// must never delete data files.
+	//
+	// The residue is expired metadata files (manifest lists, manifests) that are no
+	// longer referenced. pruneOldVersionFiles already bounds the v<N>.metadata.json
+	// copies; the rest is small and bounded by `retain`.
+	if err := txn.ExpireSnapshots(
+		icetable.WithRetainLast(e.retain),
+		icetable.WithOlderThan(0),
+		icetable.WithPostCommit(false),
+	); err != nil {
 		e.logger.Error().Err(err).Str("database", database).Str("measurement", measurement).
 			Msg("Iceberg ExpireSnapshots failed (non-fatal) — snapshot history grows until it recovers")
 		return tbl

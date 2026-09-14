@@ -338,6 +338,31 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Iceberg export reported successful snapshot expiry as failure, and published dangling metadata ([#632](https://github.com/Basekick-Labs/arc/issues/632))
+
+**Anyone running `iceberg.enabled = true` should upgrade.** Once a table's history exceeded `iceberg.retain_snapshots`, every reconcile pass logged
+
+```
+Iceberg ExpireSnapshots commit failed (non-fatal) — snapshot history grows until it recovers
+```
+
+from a commit that had actually **succeeded**, and published a `version-hint.text` pointing at metadata that still listed snapshots whose manifest-list files had just been deleted. A directory reader doing snapshot listing or time travel then failed on the missing files, and a measurement that went quiet kept that partially-dangling hint indefinitely.
+
+iceberg-go runs orphan deletion for an expiry as a **post-commit hook**: the catalog commit lands, then it removes the expiring snapshots' manifest lists, manifests, and any data files they referenced, joining every failure into the error `Commit` returns. In Arc, files leave a table precisely *because Arc already deleted them* — compaction, retention, the delete API — so the hook reported `ENOENT` for files that were supposed to be gone, and the error list grew every pass as each expiring manifest carried entries for every file ever removed.
+
+Arc now passes `WithPostCommit(false)`, so the exporter expires snapshots in the catalog and leaves file deletion to Arc.
+
+<Callout type="warn" title="The exporter no longer holds delete authority over your data files">
+This is the more important half of the fix. With the previous default, iceberg-go could physically `os.Remove` Arc's **primary Parquet data files** during expiry. Any future listing bug that transiently omitted live files for `retain` generations would have turned into silent deletion of customer data by the export subsystem.
+
+Arc owns the data-file lifecycle. The exporter must never delete data files, and now cannot.
+</Callout>
+
+The residue is expired metadata files no longer referenced by any snapshot. `pruneOldVersionFiles` already bounds the `v<N>.metadata.json` copies; the rest is small and bounded by `retain`.
+
+The existing expiry test could not catch this because it left every Parquet file on disk, so the post-commit hook always succeeded. The regression test added here deletes each superseded file **before** the pass that expires the snapshot referencing it — the production order — and asserts both symptoms: no false "commit failed" log, and no published snapshot whose manifest list is missing from disk.
+
+
 ### Removed: `arc_replication_sequence_gaps_total` ([#810](https://github.com/Basekick-Labs/arc/issues/810))
 
 **This metric has been removed.** If you scrape it, drop it from your dashboards and alerts — it has read `0` on every Arc since it was introduced.
